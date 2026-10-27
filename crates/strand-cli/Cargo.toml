@@ -1,0 +1,20 @@
+[package]
+name = "strand-cli"
+description = "Command-line interface for strand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "strand"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+strand.workspace = true
+strand-core.workspace = true
+strand-sync.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
