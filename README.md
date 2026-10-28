@@ -1,6 +1,6 @@
-# strand
+# 0ndb
 
-Tracked, attributed, syncable worktrees. strand records every change to a
+Tracked, attributed, syncable worktrees. 0ndb records every change to a
 directory — whoever or whatever makes it — as operations in a causal history,
 credits each change to the actor and scope (agent turn, tool call, shell
 command) that produced it, and replicates the history between devices through
@@ -15,11 +15,11 @@ change can be credited.
 
 | crate | what it is |
 |---|---|
-| `strand-core` | Pure data model: Lamport-stamped batches in a causal DAG, a sequence CRDT for text, an inode-based file-tree CRDT, line diffing, codecs. No I/O. |
-| `strand-store` | SQLite persistence: append-only batches (LZ4), interned actors, snapshots, outbox, blobs, mount state. |
-| `strand` | `Workspace` (history + store + events), `Mount` (filesystem watcher, ingestion, materialization, fences), attribution `Recorder`, change reports, blame, selective revert. |
-| `strand-sync` | Sans-IO replication: `Replica` trait, `Client` and `Relay` state machines, memory and TCP transports. |
-| `strand-cli` | The `strand` binary. |
+| `ondb-core` | Pure data model: Lamport-stamped batches in a causal DAG, a persistent summarized B-tree, a sequence CRDT for text built on it, an inode-based file-tree CRDT, line diffing, codecs. No I/O. |
+| `ondb-store` | SQLite persistence: append-only batches, refcounted copy-on-write tree nodes, per-inode state rows, lazily read blobs, outbox, mount state. |
+| `ondb` | `Workspace` (history + store + events), `Mount` (filesystem watcher, ingestion, materialization, fences), attribution `Recorder`, change reports, blame, selective revert. |
+| `ondb-sync` | Sans-IO replication: `Replica` trait, `Client` and `Relay` state machines, memory and TCP transports. |
+| `ondb-cli` | The `0ndb` binary. |
 
 ## Model
 
@@ -55,6 +55,47 @@ edit commute. Name collisions get deterministic conflict names. Rename cycles
 are broken by reverting the most recent move. Removing a directory removes
 what its author could see; entries created concurrently inside it survive,
 and keep the directory present.
+
+**Storage engine.** Text and durable state are built for large files and
+large histories:
+
+* *Summarized B-tree.* Each file's fragments live in a copy-on-write
+  B-tree (leaves of 48 fragments, branches of 32 children). Branches keep
+  child summaries and item counts in arrays separate from the child
+  pointers, so a seek scans dense arrays. A summary holds visible bytes,
+  total bytes and the newest timestamp of any insertion or deletion below
+  it. Seeking by visible offset costs O(log n).
+* *Seeks in past versions.* Each view reports the oldest timestamp it does
+  not observe. A subtree whose newest op is older than that looks the same in
+  the view as it does now, so its summary is used as is. Edits against a
+  stale parent only descend where concurrent work actually happened.
+  Splices of one op are applied independently, each with its own seek.
+* *Copy-on-write snapshots.* Mutating a tree copies only the root-to-leaf
+  path when the tree is shared; cloning is O(1). Readers of a snapshot need
+  no latches.
+* *Incremental, refcounted persistence.* Tree nodes are LZ4-compressed rows
+  with refcounts and packed child ids. A commit writes only nodes created
+  since the last commit. When an inode's root changes, the old root is
+  released and nodes reaching zero are deleted along with what they
+  reference. Batch, blobs, inode rows, insertions, meta and tree nodes are
+  written in **one SQLite transaction**, so stored state always equals
+  replaying stored batches. There are no snapshots, no replay on open and
+  nothing to recover after a crash.
+* *Lazy content.* Text larger than 4 KiB is a content-addressed blob. Ops
+  reference it, batches carry it as an attachment, and readers load it
+  through a separate read connection and a bounded LRU cache (64 MiB). A
+  large file that is never read costs its fragment tree, not its bytes.
+
+Measured on an 8 MiB, 200k-line file (`cargo run --release -p ondb-core
+--example bigfile`, `-p ondb --example durable`):
+
+| | flat fragment list | 0ndb |
+|---|---:|---:|
+| local edit | 231 µs | 1.4 µs |
+| edit against a stale parent (200 scattered concurrent edits) | 6.4 ms | 0.25 ms |
+| durable commit (SQLite transaction incl. tree nodes) | — | 190 µs |
+| store size after 2000 edits | — | 1 MiB |
+| reopen | — | 2.4 ms |
 
 **Views.** Any version, or "everything except these batches", can be read
 exactly. That one mechanism powers historical reads, ingestion against stale
@@ -128,7 +169,7 @@ What you can do with that:
 
 ## Sync
 
-`strand-sync` depends on local state only through the `Replica` trait
+`ondb-sync` depends on local state only through the `Replica` trait
 (`heads`, `unpushed`, `mark_pushed`, `integrate`, `batches_missing_from`), and
 `Client` and `Relay` are pure state machines. Batches are immutable and
 integration is idempotent and order-independent once causally complete. A
@@ -151,20 +192,20 @@ instead of continuing with partial state.
 ## CLI
 
 ```sh
-strand init                                   # adopt the current directory
-strand watch [--sync host:port]               # ingest live, optionally replicate
-strand run --agent codex -- python fix.py     # run and attribute a command
-strand log                                    # batches with authors and scopes
-strand blame src/main.rs                      # per-line provenance
-strand changes --agent codex                  # what codex hasn't seen
-strand scopes                                 # attribution scopes
-strand revert <scope-prefix> --agent codex    # selective undo
-strand relay --listen 0.0.0.0:7420 --validate # relay server
-strand status
+0ndb init                                   # adopt the current directory
+0ndb watch [--sync host:port]               # ingest live, optionally replicate
+0ndb run --agent codex -- python fix.py     # run and attribute a command
+0ndb log                                    # batches with authors and scopes
+0ndb blame src/main.rs                      # per-line provenance
+0ndb changes --agent codex                  # what codex hasn't seen
+0ndb scopes                                 # attribution scopes
+0ndb revert <scope-prefix> --agent codex    # selective undo
+0ndb relay --listen 0.0.0.0:7420 --validate # relay server
+0ndb status
 ```
 
-State lives in `<root>/.strand/` (excluded from git automatically). Only one
-process may mount a directory at a time. While `strand watch` runs, commands
+State lives in `<root>/.0ndb/` (excluded from git automatically). Only one
+process may mount a directory at a time. While `0ndb watch` runs, commands
 that need the mount (`run`, `revert`) refuse rather than race it; read-only
 commands read the store.
 
@@ -175,8 +216,20 @@ commands read the store.
   attribution is exact only for edit-tool writes.
 * Relay storage in the CLI is in-memory; implement `RelayStore` for
   durability.
-* Text fragments live in a vector: edits cost linear time in the fragment
-  count. This is fine for source files; a sum-tree is the next step for
-  very large documents.
+* Resolving an anchor scans the file's fragments (creating one is
+  O(log n)). With copy-on-write nodes there are no parent pointers. An
+  O(log n) resolve needs a secondary index from insertion id to position
+  (ordered locators), which is not built yet.
+* Stale-parent seeks degrade toward linear when concurrent edits are
+  scattered across a whole file, because pruning is by timestamp.
+* Text trees load eagerly on open (they hold no bytes, only fragments).
+  Loading per file on first access would make opening huge repositories
+  O(1).
 * Case-insensitive name collisions are not specially handled. The watcher and
   file modes assume a Unix platform.
+
+## Naming
+
+The project, repository, binary (`0ndb`) and state directory (`.0ndb/`)
+are called `0ndb`. Cargo package names cannot start with a digit, so the
+crates are `ondb-*`.

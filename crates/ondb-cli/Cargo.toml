@@ -1,0 +1,20 @@
+[package]
+name = "ondb-cli"
+description = "Command-line interface for 0ndb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "0ndb"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ondb.workspace = true
+ondb-core.workspace = true
+ondb-sync.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

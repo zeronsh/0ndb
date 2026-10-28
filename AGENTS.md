@@ -6,19 +6,20 @@
 - Test (use release; the convergence fuzz is slow in debug): `cargo test --workspace --release`
 - Lint: `cargo clippy --workspace --all-targets` (keep it warning-free)
 - Format: `cargo fmt --all` (`rustfmt.toml`: width 130)
-- CLI: `cargo run -p strand-cli -- <command>`
+- CLI: `cargo run -p ondb-cli -- <command>` (binary `0ndb`)
+- Benchmarks: `cargo run --release -p ondb-core --example bigfile`, `cargo run --release -p ondb --example durable`
 
 ## Layout
 
-- `crates/strand-core`: pure CRDT/DAG model. No I/O. Any change here must keep
+- `crates/ondb-core`: pure CRDT/DAG model. No I/O. Any change here must keep
   `tests/convergence.rs` passing.
-- `crates/strand-store`: SQLite schema and persistence.
-- `crates/strand`: workspace, mount (`src/mount/`), attribution, reports,
+- `crates/ondb-store`: SQLite schema and persistence.
+- `crates/ondb`: workspace, mount (`src/mount/`), attribution, reports,
   blame, revert. Mount tests in `tests/mount.rs` use real directories and
   processes.
-- `crates/strand-sync`: sans-IO client/relay plus transports; local state is
+- `crates/ondb-sync`: sans-IO client/relay plus transports; local state is
   accessed only through the `Replica` trait.
-- `crates/strand-cli`: the `strand` binary.
+- `crates/ondb-cli`: the `0ndb` binary.
 
 ## Invariants
 
@@ -30,3 +31,12 @@
   shadow; it ingests first.
 - Batches are immutable; integration must stay idempotent and independent of
   delivery order.
+- `Store::append` writes the batch and all dirty state (inode rows, tree
+  nodes, insertions, meta) in one transaction; never persist state outside it.
+- Sum-tree nodes are immutable once shared: mutate only via `Arc::make_mut`,
+  which resets the node's persisted id. Tree node refcounts count parent
+  nodes plus inode rows.
+- `View::min_unobserved` must be a true lower bound on unobserved op
+  timestamps (subtrees newer than it are pruned from view-relative seeks).
+- Background mount passes defer files younger than `settle`; fences, tool
+  writes and shutdown must ingest everything.

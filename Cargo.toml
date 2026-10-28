@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/strand-core", "crates/strand-store", "crates/strand", "crates/strand-sync", "crates/strand-cli"]
+members = ["crates/ondb-core", "crates/ondb-store", "crates/ondb", "crates/ondb-sync", "crates/ondb-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,10 +10,10 @@ publish = false
 rust-version = "1.88"
 
 [workspace.dependencies]
-strand-core = { path = "crates/strand-core" }
-strand-store = { path = "crates/strand-store" }
-strand = { path = "crates/strand" }
-strand-sync = { path = "crates/strand-sync" }
+ondb-core = { path = "crates/ondb-core" }
+ondb-store = { path = "crates/ondb-store" }
+ondb = { path = "crates/ondb" }
+ondb-sync = { path = "crates/ondb-sync" }
 
 anyhow = "=1.0.104"
 clap = { version = "=4.6.7", features = ["derive"] }

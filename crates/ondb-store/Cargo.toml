@@ -1,0 +1,19 @@
+[package]
+name = "ondb-store"
+description = "Durable SQLite storage for 0ndb histories"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+lz4_flex.workspace = true
+postcard.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+ondb-core.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

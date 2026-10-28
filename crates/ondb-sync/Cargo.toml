@@ -1,0 +1,19 @@
+[package]
+name = "ondb-sync"
+description = "Transport-agnostic replication for 0ndb histories"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+postcard.workspace = true
+serde.workspace = true
+ondb.workspace = true
+ondb-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

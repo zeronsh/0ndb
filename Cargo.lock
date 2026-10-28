@@ -607,6 +607,76 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "ondb"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "ignore",
+ "notify",
+ "ondb-core",
+ "ondb-store",
+ "postcard",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ondb-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ondb",
+ "ondb-core",
+ "ondb-sync",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ondb-core"
+version = "0.1.0"
+dependencies = [
+ "imara-diff",
+ "postcard",
+ "serde",
+ "sha1_smol",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "ondb-store"
+version = "0.1.0"
+dependencies = [
+ "lz4_flex",
+ "ondb-core",
+ "postcard",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "ondb-sync"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "ondb",
+ "ondb-core",
+ "postcard",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -835,76 +905,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "strand"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "ignore",
- "notify",
- "postcard",
- "serde",
- "strand-core",
- "strand-store",
- "tempfile",
- "thiserror",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "strand-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "strand",
- "strand-core",
- "strand-sync",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "strand-core"
-version = "0.1.0"
-dependencies = [
- "imara-diff",
- "postcard",
- "serde",
- "sha1_smol",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "strand-store"
-version = "0.1.0"
-dependencies = [
- "lz4_flex",
- "postcard",
- "rusqlite",
- "serde",
- "strand-core",
- "tempfile",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "strand-sync"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "postcard",
- "serde",
- "strand",
- "strand-core",
- "tempfile",
- "thiserror",
- "tracing",
-]
 
 [[package]]
 name = "strsim"
