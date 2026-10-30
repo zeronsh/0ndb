@@ -42,6 +42,14 @@
   `.0ndb/mount-<history>.lock`. Different histories may share a directory;
   anything a mount writes into the watched tree (fence markers, temp files)
   must be unique per mount and internal to every mount.
+- Memory must scale with active worktrees: anything a mount or workspace
+  keeps per file must be dropped by hibernation (`MountState::hibernate`,
+  `Workspace::hibernate`) and reloadable on demand. Content bytes live in the
+  shared, budgeted cache (`ondb_core::contents`); only unpersisted content is
+  pinned.
+- Every mount entry point that touches the shadow calls `wake()` first.
+- Linux watching (`mount/watch.rs`, Dirs mode) shares one inotify instance;
+  never create a watcher per mount there.
 - Background mount passes defer files younger than `settle`; fences, tool
   writes and shutdown must ingest everything.
 - Files git wrote (decided from HEAD's reflog and the index, see
@@ -50,4 +58,7 @@
   scopes. Commits move HEAD but write nothing.
 - Real-repo check: `0ndb verify -C <dir>` must report no mismatches after any
   git operation.
+- Resource checks: `cargo run --release -p ondb --example many -- <repo> <n>`
+  (memory, threads, files, idle CPU across many worktrees) and
+  `cargo run --release -p ondb --example soak` (must print `ok: flat`).
 - Real git end-to-end (clone + linked worktrees, pushes to a scratch repo): `scripts/git-e2e.sh`

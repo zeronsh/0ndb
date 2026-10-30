@@ -202,6 +202,42 @@ Rejected batches are reported to the author. A replica that receives a batch
 that is causally valid but doesn't apply rebuilds its state from storage
 instead of continuing with partial state.
 
+## Resource use
+
+0ndb is meant to watch many worktrees from one long-running process.
+
+* **Memory scales with active worktrees.** A mount with no activity for
+  `MountOptions::idle_unload` (30 s) hibernates: its shadow, the history's
+  in-memory state and its SQLite connections are released, and reloaded on
+  the next relevant event (about 20 ms for a 2.7k-file worktree).
+* **One bounded content cache per process.** File text is read from the store
+  on demand into a shared LRU (`ondb_core::set_cache_budget`, 32 MiB by
+  default). Blobs are content-addressed, so worktrees of one repository share
+  cached bytes. Only not-yet-persisted content is pinned in memory.
+* **Bounded adoption.** A first mount commits in 32 MiB chunks, so adopting a
+  large repository never holds it in memory at once.
+* **No idle CPU.** Mount threads sleep until an event, command or timer.
+  Events under ignored paths (build output, `node_modules`) are dropped before
+  they can schedule a pass or wake a hibernating mount.
+* **Watching.** macOS and Windows use one recursive OS watch per mount. On
+  Linux every mount in the process shares one inotify instance and watches
+  only tracked directories, so the default limit of 128 instances per user and
+  ignored trees don't constrain how many worktrees can be mounted.
+
+Measured with `cargo run --release -p ondb --example many -- <repo> <n>` on 60
+worktrees of a 2.7k-file, 74 MB repository in one process (Apple M-series):
+
+| | per worktree |
+|---|---|
+| hibernated | 0.12 MiB heap, 1 open file, 2 threads |
+| awake | about 3.5 MiB heap (about 1.3 KB per tracked file), 6 open files |
+| shared content cache | 32 MiB total |
+| idle CPU | none |
+| 30,000 writes into ignored `target/` dirs | 1.8 s CPU total, no mount woken |
+
+`examples/soak.rs` runs edit, scope, branch switch, hibernate and wake cycles
+and fails if heap, open files or threads grow.
+
 ## CLI
 
 ```sh
