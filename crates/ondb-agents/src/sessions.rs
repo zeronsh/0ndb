@@ -176,6 +176,10 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
+/// Characters of one replayed message, and of one replayed tool output.
+const HISTORY_MESSAGE_CHARS: usize = 8_000;
+const HISTORY_TOOL_OUTPUT_CHARS: usize = 600;
+
 fn clip(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),
@@ -447,6 +451,7 @@ impl Sessions {
             status: Status::Done,
             error: None,
             created_ms: now_ms(),
+            switched_from: None,
         };
         self.inner.store.insert_message(&user)?;
         self.inner.store.set_leaf(&t.id, &user.id)?;
@@ -591,7 +596,9 @@ impl TurnJob {
                 continue;
             }
             let Some(s) = m.session.as_ref().and_then(|id| sessions.iter().find(|s| &s.id == id)) else { continue };
-            if s.native.is_none() || !caps.resume {
+            // Owner-gated (above) and cwd-gated: provider session stores are
+            // keyed by directory, so one made elsewhere is never resumed.
+            if s.native.is_none() || !caps.resume || s.cwd != self.cwd.to_string_lossy() {
                 continue;
             }
             if s.seen.as_deref() == Some(m.id.as_str()) {
@@ -606,31 +613,58 @@ impl TurnJob {
         Ok(Plan::Fresh)
     }
 
-    fn history_prompt(&self, history: &[Message], prompt: &str) -> String {
-        if history.is_empty() {
+    /// `prompt` with what the chosen session hasn't seen in front of it
+    /// (zeron's replay rules): nothing for native commands (`/name`) or when
+    /// it has seen everything; otherwise the missing messages, tool calls
+    /// included with clipped output, newest first within the budget, under
+    /// an intro saying why they're there.
+    fn history_prompt(&self, history: &[Message], prompt: &str, continued: bool) -> String {
+        if history.is_empty() || prompt.trim_start().starts_with('/') {
             return prompt.to_string();
         }
-        let mut lines: Vec<String> = Vec::new();
+        let me = self.provider.id();
+        let entries: Vec<String> = history
+            .iter()
+            .filter_map(|m| {
+                let mut text = m.text.clone();
+                if m.role == Role::Assistant {
+                    for tc in self.inner.store.tool_calls(&m.id).unwrap_or_default() {
+                        let out = tc.output.as_deref().unwrap_or("");
+                        text.push_str(&format!("\nTool: {} {}\n{}", tc.name, tc.input, clip(out, HISTORY_TOOL_OUTPUT_CHARS)));
+                    }
+                }
+                let text = clip(text.trim(), HISTORY_MESSAGE_CHARS);
+                (!text.is_empty()).then(|| {
+                    let role = if m.role == Role::User { "user" } else { "assistant" };
+                    serde_json::json!({ "role": role, "provider": m.provider, "text": text }).to_string()
+                })
+            })
+            .collect();
         let mut budget = self.inner.opts.history_chars;
-        for m in history.iter().rev() {
-            let who = match (m.role, &m.provider) {
-                (Role::User, _) => "User".to_string(),
-                (Role::Assistant, Some(p)) => format!("Assistant ({p})"),
-                (Role::Assistant, None) => "Assistant".to_string(),
-            };
-            let entry = format!("{who}: {}", clip(&m.text, 8_000));
-            if entry.len() > budget {
-                lines.push("[earlier messages omitted]".into());
-                break;
-            }
-            budget -= entry.len();
-            lines.push(entry);
+        let kept = entries
+            .iter()
+            .rev()
+            .take_while(|e| {
+                let fits = e.len() <= budget;
+                budget = budget.saturating_sub(e.len());
+                fits
+            })
+            .count()
+            .max(1.min(entries.len()));
+        let omitted = entries.len() - kept;
+        if kept == 0 {
+            return prompt.to_string();
         }
-        lines.reverse();
-        format!(
-            "<previous-conversation>\nThe conversation so far (from another agent session or branch); use it as context.\n\n{}\n</previous-conversation>\n\n{prompt}",
-            lines.join("\n\n")
-        )
+        let other = history.iter().any(|m| m.role == Role::Assistant && m.provider.as_deref().is_some_and(|p| p != me));
+        let intro = if continued && other {
+            "While you were away, this conversation continued with a different AI provider. The messages you missed are below; answer the final request as the continuation of the whole conversation. Tool calls listed below ran on the other provider; do not assume their state is still live."
+        } else if other {
+            "This conversation was started with a different AI provider and you are now taking over. The earlier messages are below as context; answer the final request as the continuation of that conversation. Tool calls listed below ran on the previous provider; do not assume their state is still live."
+        } else {
+            "This conversation continues in a new session (a branch, or a session that could not be resumed). The earlier messages are below as context; answer the final request as the continuation of that conversation."
+        };
+        let note = if omitted > 0 { format!("({omitted} earlier messages omitted for length.)\n") } else { String::new() };
+        format!("{intro}\n{note}<conversation>\n{}\n</conversation>\n\n{prompt}", entries[omitted..].join("\n"))
     }
 
     fn run(self) -> Result<Message, Error> {
@@ -677,7 +711,15 @@ impl TurnJob {
                 (s, StartRequest { cwd: self.cwd.clone(), model: self.model.clone(), ..Default::default() }, 0, None)
             }
         };
-        let mut full_prompt = self.history_prompt(&history[from.min(history.len())..], &self.user.text);
+        let continued = from > 0;
+        let mut full_prompt = self.history_prompt(&history[from.min(history.len())..], &self.user.text, continued);
+        // The seam: the provider this reply takes over from, if it changed.
+        let switched_from = history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| m.provider.clone())
+            .filter(|p| p != self.provider.id());
         store.insert_message(&Message {
             id: self.assistant.clone(),
             thread: self.thread.clone(),
@@ -693,6 +735,7 @@ impl TurnJob {
             status: Status::Running,
             error: None,
             created_ms: now_ms(),
+            switched_from,
         })?;
 
         let actor = self.ws.actor(self.provider.id(), ActorKind::Agent)?;
@@ -863,7 +906,7 @@ impl TurnJob {
                 session = fresh_session(None);
                 store.insert_session(&session, now_ms())?;
                 req = StartRequest { cwd: self.cwd.clone(), model: self.model.clone(), ..Default::default() };
-                full_prompt = self.history_prompt(history, &self.user.text);
+                full_prompt = self.history_prompt(history, &self.user.text, false);
                 continue;
             }
             break run;

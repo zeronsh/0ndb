@@ -19,7 +19,7 @@ change can be credited.
 | `ondb-store` | SQLite persistence: append-only batches, refcounted copy-on-write tree nodes, per-inode state rows, lazily read blobs, outbox, mount state. |
 | `ondb` | `Workspace` (history + store + events), `Mount` (filesystem watcher, ingestion, materialization, fences), attribution `Recorder`, change reports, blame, selective revert, managed `Worktrees`. |
 | `ondb-git` | Git through `git` itself (repositories, branches, worktrees, status) and git hosting providers behind one `Forge` interface (GitHub today), chosen per remote host. |
-| `ondb-agents` | Provider sessions: agent providers behind one `Provider` interface (Claude Code, scripted mock), threads as message trees with editing and branch switching, recorded provider events, tool calls and CLI output. |
+| `ondb-agents` | Provider sessions: agent providers behind one `Provider` interface (Claude Code, Codex, scripted mock), threads as message trees with editing and branch switching, recorded provider events, tool calls and CLI output. |
 | `ondb-sync` | Sans-IO replication: `Replica` trait, `Client` and `Relay` state machines, memory and TCP transports. |
 | `ondb-cli` | The `0ndb` binary. |
 
@@ -238,6 +238,17 @@ registering it. Nothing polls: provider calls happen on request.
   start fresh. Whatever the chosen session hasn't seen (another provider's
   turns, another branch) is replayed in front of the prompt, so switching
   providers mid-thread and back keeps each provider's own native history.
+* **Switching follows zeron's rules.** The reply that takes over records the
+  seam (`switched_from`). A provider's earlier session is resumed only if it
+  is that provider's own (owner gate) and was made in the same directory (cwd
+  gate). Replayed history gets zeron's intros ("taking over" for a fresh
+  session, "while you were away" for a resumed one, a branch note
+  otherwise), includes tool calls with clipped output (600 characters, 8,000
+  per message), keeps the newest messages within the budget, and is never
+  put in front of native commands (`/name`).
+* **Providers.** Claude Code (stream-json, persistent, native fork at a
+  message) and Codex (`codex exec --json`, one process per turn, resume by
+  thread id; forks at a message are replayed).
 * **Everything is recorded.** Each provider event is stored verbatim
   (compressed), tool calls with inputs, outputs, stdout/stderr and their
   attribution scope, the provider's stderr, and any CLI output attached with

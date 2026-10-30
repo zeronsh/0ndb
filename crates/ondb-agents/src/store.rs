@@ -133,6 +133,8 @@ pub struct Message {
     pub status: Status,
     pub error: Option<String>,
     pub created_ms: u64,
+    /// The provider this reply took over from (a provider switch seam).
+    pub switched_from: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,11 +218,12 @@ fn message_row(r: &Row<'_>) -> rusqlite::Result<Message> {
         },
         error: r.get(12)?,
         created_ms: r.get::<_, i64>(13)? as u64,
+        switched_from: r.get(14)?,
     })
 }
 
 const MESSAGE_COLS: &str =
-    "id, thread, parent, role, provider, model, text, version, scope, session, native, status, error, created_ms";
+    "id, thread, parent, role, provider, model, text, version, scope, session, native, status, error, created_ms, switched_from";
 
 fn session_row(r: &Row<'_>) -> rusqlite::Result<ProviderSession> {
     Ok(ProviderSession {
@@ -253,6 +256,12 @@ impl Store {
         conn.pragma_update(None, "cache_size", -512)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // Added after the first release of this schema.
+        let has_seam: bool =
+            conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'switched_from'")?.exists([])?;
+        if !has_seam {
+            conn.execute("ALTER TABLE messages ADD COLUMN switched_from TEXT", [])?;
+        }
         // A crash mid-turn leaves messages running; nothing is running now.
         conn.execute("UPDATE messages SET status = 'interrupted' WHERE status = 'running'", [])?;
         Ok(Store { conn: Mutex::new(conn) })
@@ -308,7 +317,7 @@ impl Store {
     pub fn insert_message(&self, m: &Message) -> Result<(), Error> {
         self.c().execute(
             &format!(
-                "INSERT INTO messages ({MESSAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                "INSERT INTO messages ({MESSAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             ),
             params![
                 m.id,
@@ -324,7 +333,8 @@ impl Store {
                 m.native,
                 status_str(m.status),
                 m.error,
-                m.created_ms as i64
+                m.created_ms as i64,
+                m.switched_from
             ],
         )?;
         Ok(())

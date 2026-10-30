@@ -9,6 +9,7 @@
 //!   Providers can be switched mid-thread; idle processes are bounded.
 
 pub mod claude;
+pub mod codex;
 pub mod mock;
 pub mod provider;
 pub mod sessions;

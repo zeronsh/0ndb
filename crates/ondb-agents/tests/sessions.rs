@@ -92,19 +92,25 @@ fn records_turns_switches_providers_and_edits_with_worktree_restore() {
     // Turn 2 (alpha): reuses the warm process, no replayed history.
     let a2 = s.send(&t.id, "write b.txt second", "alpha", None).unwrap().wait().unwrap();
     assert_eq!(e.alpha.spawned(), 1);
-    assert!(!e.alpha.calls()[1].prompt.contains("previous-conversation"));
+    assert!(!e.alpha.calls()[1].prompt.contains("<conversation>"));
 
     // Turn 3 (beta): switching provider replays the conversation into a fresh session.
     let b3 = s.send(&t.id, "write c.txt from beta", "beta", None).unwrap().wait().unwrap();
     let beta_prompt = &e.beta.calls()[0].prompt;
-    assert!(beta_prompt.contains("User: write a.txt from alpha") && beta_prompt.contains("Assistant (alpha): ok: write b.txt"));
+    assert!(
+        beta_prompt.contains("taking over")
+            && beta_prompt.contains("write a.txt from alpha")
+            && beta_prompt.contains("ok: write b.txt")
+    );
     assert_eq!(e.beta.live(), 0, "beta's process ends with its turn");
+    assert_eq!(b3.switched_from.as_deref(), Some("alpha"), "the seam is recorded");
+    assert_eq!(a2.switched_from, None);
 
     // Turn 4 (back to alpha): continues alpha's own session, catching up only on beta's turn.
     s.send(&t.id, "say hi", "alpha", None).unwrap().wait().unwrap();
     let back = e.alpha.calls().last().unwrap().clone();
     assert_eq!(back.native_session, e.alpha.calls()[0].native_session, "same native session");
-    assert!(back.prompt.contains("Assistant (beta): ok: write c.txt"));
+    assert!(back.prompt.contains("While you were away") && back.prompt.contains("ok: write c.txt"));
     assert!(!back.prompt.contains("write a.txt from alpha"), "alpha already saw its own turns");
 
     // A person edits a file meanwhile.
@@ -118,7 +124,7 @@ fn records_turns_switches_providers_and_edits_with_worktree_restore() {
     assert_eq!(edited.status, Status::Done);
     let fork = e.alpha.calls().last().unwrap().clone();
     assert_eq!(fork.forked_at.as_deref(), a1.native.as_deref(), "native fork at the branch point");
-    assert!(!fork.prompt.contains("previous-conversation"), "the fork already has turn 1");
+    assert!(!fork.prompt.contains("<conversation>"), "the fork already has turn 1");
     for gone in ["b.txt", "c.txt"] {
         assert!(!e.wt.path.join(gone).exists(), "{gone} survived the restore");
     }
@@ -139,7 +145,9 @@ fn records_turns_switches_providers_and_edits_with_worktree_restore() {
     }
     assert!(!e.wt.path.join("d.txt").exists());
     assert_eq!(text(&ws, "c.txt").as_deref(), Some("from beta\n"));
-    let _ = b3;
+    // Native commands go out as-is, never wrapped in replayed history.
+    s.send(&t.id, "/compact", "beta", None).unwrap().wait().unwrap();
+    assert_eq!(e.beta.calls().last().unwrap().prompt, "/compact");
 }
 
 #[test]
@@ -166,7 +174,7 @@ fn failures_are_recorded_and_processes_are_bounded() {
     s.send(&t1.id, "again", "alpha", None).unwrap().wait().unwrap();
     let last = e.alpha.calls().last().unwrap().clone();
     assert!(last.resumed.is_some());
-    assert!(!last.prompt.contains("previous-conversation"));
+    assert!(!last.prompt.contains("<conversation>"));
     // One turn per thread at a time.
     let running = s.send(&t2.id, "hello", "beta", None).unwrap();
     let _ = s.send(&t2.id, "again", "beta", None).map(|t| t.wait());
@@ -328,6 +336,67 @@ fn rejected_forks_fall_back_to_replay() {
     let calls = e.alpha.calls();
     let fallback = calls.last().unwrap();
     assert!(fallback.forked_at.is_none() && fallback.resumed.is_none(), "fresh session");
-    assert!(fallback.prompt.contains("User: first") && !fallback.prompt.contains("User: second\n"), "replays the branch only");
+    assert!(
+        fallback.prompt.contains(r#""text":"first""#) && !fallback.prompt.contains(r#""text":"second""#),
+        "replays the branch only"
+    );
     assert!(calls[calls.len() - 2].forked_at.is_some(), "the fork was tried first");
+}
+
+/// `ONDB_LIVE_SWITCH=1`: Claude Code -> Codex -> Claude Code in one thread.
+#[test]
+fn live_provider_switch() {
+    if std::env::var("ONDB_LIVE_SWITCH").is_err() {
+        return;
+    }
+    use ondb_agents::claude::{Access, ClaudeCode};
+    use ondb_agents::codex::Codex;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    sh(
+        d,
+        "git -c user.name=t -c user.email=t@t -c init.defaultBranch=main init -q app && cd app && echo hi > a.txt && git add -A && git -c user.name=t -c user.email=t@t commit -qm init",
+    );
+    let worktrees = Worktrees::open(d.join("state"), d.join("checkouts"), MountOptions::default(), Forges::default()).unwrap();
+    let wt = worktrees.create(d.join("app"), "switch", Some("main")).unwrap();
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(ClaudeCode::new(Access::Full)), Arc::new(Codex::new(Access::Full))];
+    let s = Sessions::open(d.join("state/sessions.db"), worktrees.clone(), providers, SessionOptions::default()).unwrap();
+    let t = s.create_thread(&wt.id, "switch").unwrap();
+    let c1 = s
+        .send(&t.id, "Remember the code word: PELICAN. Reply with just: ok", "claude-code", Some("haiku"))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(c1.status, Status::Done, "{:?}", c1.error);
+    let x1 = s
+        .send(
+            &t.id,
+            "Create a file named codex.txt containing the code word I told you, then reply with just the code word.",
+            "codex",
+            None,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(x1.status, Status::Done, "{:?}", x1.error);
+    assert_eq!(x1.switched_from.as_deref(), Some("claude-code"));
+    assert!(x1.text.to_uppercase().contains("PELICAN"), "codex got the history: {}", x1.text);
+    assert_eq!(fs::read_to_string(wt.path.join("codex.txt")).unwrap().trim().to_uppercase(), "PELICAN");
+    assert!(!s.tool_calls(&x1.id).unwrap().is_empty(), "codex's tool calls are recorded");
+    let c2 = s
+        .send(
+            &t.id,
+            "What file did the other assistant create while you were away? Reply with just the file name.",
+            "claude-code",
+            Some("haiku"),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(c2.status, Status::Done, "{:?}", c2.error);
+    assert!(c2.text.contains("codex.txt"), "claude caught up: {}", c2.text);
+    let sessions = s.provider_sessions(&t.id).unwrap();
+    assert_eq!(sessions.len(), 2, "claude resumed its own session: {sessions:?}");
+    println!("codex: {} | claude after switching back: {}", x1.text.trim(), c2.text.trim());
+    s.close_idle();
 }
