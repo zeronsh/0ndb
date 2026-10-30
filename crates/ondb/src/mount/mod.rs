@@ -20,8 +20,9 @@ mod ignore;
 mod ingest;
 mod materialize;
 mod shadow;
+mod watch;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,9 +30,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, never, select, unbounded};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use ondb_core::{ActorId, BatchId, Version};
 use ondb_store::{MountRecord, Origin};
+use watch::Watch;
 
 use crate::Error;
 use crate::workspace::{ActorKind, Event, Workspace};
@@ -59,6 +60,11 @@ pub struct MountOptions {
     /// program's temp files and half-written output are never recorded.
     /// Fences, tool writes and shutdown ingest everything regardless.
     pub settle: Duration,
+    /// After this long without activity the mount hibernates: its in-memory
+    /// state and the history's are dropped and reloaded on the next change.
+    /// Memory then scales with active worktrees, not mounted ones. `None`
+    /// keeps everything resident.
+    pub idle_unload: Option<Duration>,
 }
 
 impl Default for MountOptions {
@@ -70,6 +76,7 @@ impl Default for MountOptions {
             git_settle: Duration::from_secs(2),
             fence_timeout: Duration::from_secs(2),
             settle: Duration::from_millis(100),
+            idle_unload: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -210,21 +217,13 @@ impl Mount {
         };
 
         let (fs_tx, fs_rx) = unbounded();
-        let mut watcher = notify::recommended_watcher(move |res| {
-            let _ = fs_tx.send(res);
-        })?;
-        watcher.watch(&root, RecursiveMode::Recursive)?;
-        // A linked worktree's HEAD lives outside the mount.
-        for (dir, recursive) in git.iter().flat_map(|g| g.external_watches(&root)) {
-            let mode = if recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
-            if let Err(e) = watcher.watch(&dir, mode) {
-                tracing::warn!(dir = %dir.display(), "can't watch git dir: {e}");
-            }
-        }
+        let ignore = Ignore::load(&root, git.as_ref());
+        // A linked worktree's HEAD lives outside the mount; Watch covers it.
+        let watcher = Watch::start(&root, git.as_ref(), &ignore, fs_tx)?;
 
         let mut state = MountState {
             ws: ws.clone(),
-            ignore: Ignore::load(&root, git.as_ref()),
+            ignore,
             git,
             root: root.clone(),
             opts,
@@ -237,6 +236,9 @@ impl Mount {
             fence_seq: 0,
             settling: false,
             deferred: BTreeSet::new(),
+            hibernating: false,
+            ignored_tracked: HashSet::new(),
+            ignore_changed: false,
             _lock: lock,
         };
         // Resume from the HEAD this folder was last reconciled against, so
@@ -324,7 +326,7 @@ pub(crate) struct MountState {
     git: Option<GitDirs>,
     git_head: Option<String>,
     /// The index as of the last pass, to tell which files git just wrote.
-    git_index: Option<git::Index>,
+    git_index: Option<git::CompactIndex>,
     index_stamp: Option<(std::time::SystemTime, u64)>,
     /// HEAD reflog length as of the last pass.
     reflog_pos: u64,
@@ -333,11 +335,59 @@ pub(crate) struct MountState {
     settling: bool,
     /// Paths deferred by the last settling pass.
     deferred: BTreeSet<String>,
+    /// The shadow is unloaded (see `MountOptions::idle_unload`).
+    hibernating: bool,
+    /// While hibernating: tracked paths that ignore rules match, whose events
+    /// must still wake the mount.
+    ignored_tracked: HashSet<String>,
+    /// Set when ignore rules were reloaded, so watches can follow.
+    ignore_changed: bool,
     /// Held for the mount's lifetime; one live mount per directory.
     _lock: fs::File,
 }
 
 impl MountState {
+    /// Drops the shadow and the history's in-memory state. The git index
+    /// baseline (compact) and ignore rules stay, so events can still be
+    /// filtered and git operations classified without waking.
+    fn hibernate(&mut self) -> Result<(), Error> {
+        if self.hibernating {
+            return Ok(());
+        }
+        self.persist()?;
+        self.ignored_tracked =
+            self.shadow.paths().filter(|p| self.ignore.is_ignored(p, self.shadow.is_dir(p))).cloned().collect();
+        self.shadow = Shadow::default();
+        self.hibernating = true;
+        self.ws.hibernate();
+        tracing::debug!(root = %self.root.display(), "mount hibernating");
+        Ok(())
+    }
+
+    /// Reloads what `hibernate` dropped.
+    pub(super) fn wake(&mut self) -> Result<(), Error> {
+        if !self.hibernating {
+            return Ok(());
+        }
+        let root = self.record.root.clone();
+        let rows = self.ws.with(|c| c.store().0.mount_entries(&root))?;
+        self.shadow = Shadow::from_rows(rows);
+        self.ignored_tracked = HashSet::new();
+        self.hibernating = false;
+        Ok(())
+    }
+
+    /// Whether an event at `rel` can matter: ignored paths that aren't
+    /// tracked are dropped here, so build output never costs a pass.
+    fn relevant(&self, rel: &str) -> bool {
+        // Directory-only rules (`target/`) need the entry's kind; stat only
+        // when the two answers differ.
+        if !self.ignore.is_ignored(rel, false) && (!self.ignore.is_ignored(rel, true) || !self.root.join(rel).is_dir()) {
+            return true;
+        }
+        if self.hibernating { self.ignored_tracked.contains(rel) } else { self.shadow.get(rel).is_some() }
+    }
+
     fn persist(&mut self) -> Result<(), Error> {
         let (upserts, removals) = self.shadow.take_changes();
         self.record.git_head = self.git_head.clone();
@@ -361,13 +411,13 @@ impl MountState {
         self.reflog_pos = g.reflog_len();
         let stamp = g.index_stamp();
         if stamp != self.index_stamp || self.git_index.is_none() {
-            self.git_index = git::read_index(&self.root);
+            self.git_index = git::read_index(&self.root).as_ref().map(git::compact);
             self.index_stamp = stamp;
         }
     }
 
     /// Like `snapshot_git`, with an index the caller just read.
-    fn adopt_git_index(&mut self, index: Option<git::Index>) {
+    fn adopt_git_index(&mut self, index: Option<git::CompactIndex>) {
         let Some(g) = &self.git else { return };
         self.reflog_pos = g.reflog_len();
         self.index_stamp = g.index_stamp();
@@ -416,33 +466,41 @@ struct PendingFence {
     reply: Reply<FenceOutcome>,
 }
 
+/// Folds an event into the pending work. Returns whether anything relevant
+/// happened (filtered events neither schedule a pass nor count as activity).
 fn absorb(
     st: &MountState,
     event: &notify::Event,
     pending: &mut BTreeSet<String>,
     rescan: &mut bool,
     fences: &mut [PendingFence],
-) {
+) -> bool {
+    let mut relevant = false;
     if event.need_rescan() {
         *rescan = true;
+        relevant = true;
     }
     for p in &event.paths {
         if st.git.as_ref().is_some_and(|g| g.signals(p)) {
             pending.insert(String::new());
+            relevant = true;
             continue;
         }
         let Some(rel) = st.rel(p) else { continue };
         if let Some(f) = fences.iter_mut().find(|f| f.marker == rel) {
             f.arrived = true;
-        } else if !disk::is_internal(&rel) {
+            relevant = true;
+        } else if !disk::is_internal(&rel) && st.relevant(&rel) {
             pending.insert(rel);
+            relevant = true;
         }
     }
+    relevant
 }
 
 fn run(
     mut st: MountState,
-    _watcher: RecommendedWatcher,
+    mut watcher: Watch,
     fs_rx: Receiver<notify::Result<notify::Event>>,
     ws_rx: Receiver<Event>,
     cmd_rx: Receiver<Cmd>,
@@ -455,10 +513,14 @@ fn run(
     let mut fences: Vec<PendingFence> = Vec::new();
     let ingestion = st.record.ingestion_actor;
     let mut fs_rx = Some(fs_rx);
+    let mut last_activity = Instant::now();
 
     loop {
         let now = Instant::now();
         let mut wake = now + Duration::from_secs(3600);
+        if let Some(idle) = st.opts.idle_unload.filter(|_| !st.hibernating) {
+            wake = wake.min(last_activity + idle);
+        }
         if let (Some(first), Some(last)) = (first_event, last_event) {
             wake = wake.min((last + st.opts.debounce).min(first + st.opts.max_latency));
         }
@@ -473,15 +535,20 @@ fn run(
         select! {
             recv(fs_chan) -> msg => match msg {
                 Ok(Ok(event)) => {
-                    absorb(&st, &event, &mut pending, &mut rescan, &mut fences);
+                    watcher.follow(&st.root, &st.ignore, &event);
+                    let mut relevant = absorb(&st, &event, &mut pending, &mut rescan, &mut fences);
                     // Take everything already delivered, so a fence never
                     // overtakes events queued just behind its marker.
                     while let Ok(Ok(more)) = fs_chan.try_recv() {
-                        absorb(&st, &more, &mut pending, &mut rescan, &mut fences);
+                        watcher.follow(&st.root, &st.ignore, &more);
+                        relevant |= absorb(&st, &more, &mut pending, &mut rescan, &mut fences);
                     }
-                    let t = Instant::now();
-                    first_event.get_or_insert(t);
-                    last_event = Some(t);
+                    if relevant {
+                        let t = Instant::now();
+                        first_event.get_or_insert(t);
+                        last_event = Some(t);
+                        last_activity = t;
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "watcher error; scheduling rescan");
@@ -492,7 +559,9 @@ fn run(
                 Err(_) => fs_rx = None,
             },
             recv(ws_rx) -> ev => match ev {
+                Ok(Event::Committed(c)) if st.hibernating && c.actor == ingestion && c.origin == Origin::Local => {}
                 Ok(Event::Committed(c)) => {
+                    last_activity = Instant::now();
                     if c.actor != ingestion || c.origin == Origin::Remote {
                         need_sync = true;
                     }
@@ -500,7 +569,7 @@ fn run(
                 Ok(Event::Reloaded) => need_sync = true,
                 Err(_) => return,
             },
-            recv(cmd_rx) -> cmd => match cmd {
+            recv(cmd_rx) -> cmd => match cmd.inspect(|_| last_activity = Instant::now()) {
                 Ok(Cmd::Stop { reply }) => {
                     let _ = st.flush(&mut pending, &mut rescan);
                     let _ = st.persist();
@@ -542,6 +611,9 @@ fn run(
                 tracing::error!(error = %e, "reconcile failed");
             }
             st.settling = false;
+            if std::mem::take(&mut st.ignore_changed) {
+                watcher.resync(&st.root, &st.ignore);
+            }
             if !st.deferred.is_empty() {
                 pending.append(&mut st.deferred);
                 let t = Instant::now();
@@ -555,6 +627,19 @@ fn run(
             if let Err(e) = st.materialize() {
                 tracing::error!(error = %e, "materialize failed");
             }
+        }
+        if let Some(idle) = st.opts.idle_unload
+            && !st.hibernating
+            && fences.is_empty()
+            && pending.is_empty()
+            && !rescan
+            && first_event.is_none()
+            && !need_sync
+            && Instant::now() >= last_activity + idle
+            && let Err(e) = st.hibernate()
+        {
+            tracing::error!(error = %e, "hibernate failed");
+            last_activity = Instant::now();
         }
         if fence_ready {
             let (ready, rest): (Vec<_>, Vec<_>) = fences.drain(..).partition(|f| f.arrived || now >= f.deadline);

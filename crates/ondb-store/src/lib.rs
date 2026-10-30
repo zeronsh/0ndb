@@ -10,7 +10,7 @@ use std::sync::Arc;
 use ondb_core::codec::{self, CodecError};
 use ondb_core::{
     ActorId, Batch, BatchHeader, BatchId, Blob, BlobSource, Content, Contents, Dag, Dirty, History, HistoryId, Inode, InodeId,
-    MetaEntry, NodeStore, Oid, Op, OpId, Status, StoreResult, StoredInode, Text, Version,
+    Insertion, InsertionKey, MetaEntry, NodeStore, Oid, Op, OpId, Status, StoreResult, StoredInode, Text, Version,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -123,6 +123,11 @@ CREATE TABLE IF NOT EXISTS local_kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 "#;
 
 const SCHEMA_VERSION: &str = "3";
+/// SQLite page cache per connection, in KiB. Many stores can be open in one
+/// process (one per worktree), so these stay small; the shared content cache
+/// in `ondb_core::contents` is what keeps hot text in memory.
+const WRITER_CACHE_KIB: i64 = -1024;
+const READER_CACHE_KIB: i64 = -256;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HistoryKey(i64);
@@ -194,18 +199,30 @@ impl Reopen {
     }
 }
 
-/// Reads blobs over its own connection, so lazily stored text can be loaded
-/// while the writer connection is in use.
+/// Reads blobs and insertions over its own connection, so stored text can be
+/// loaded on demand while the writer connection is in use.
 pub struct BlobReader {
     conn: std::sync::Mutex<Connection>,
+    key: HistoryKey,
 }
 
 impl BlobSource for BlobReader {
     fn blob(&self, oid: &Oid) -> Option<Vec<u8>> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let data: Vec<u8> =
-            conn.query_row("SELECT data FROM blobs WHERE oid = ?1", [oid.0.to_vec()], |r| r.get(0)).optional().ok()??;
+        let mut stmt = conn.prepare_cached("SELECT data FROM blobs WHERE oid = ?1").ok()?;
+        let data: Vec<u8> = stmt.query_row([oid.0.to_vec()], |r| r.get(0)).optional().ok()??;
         decompress(&data).ok()
+    }
+
+    fn insertion(&self, key: &InsertionKey) -> Option<Insertion> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn.prepare_cached("SELECT data FROM insertions WHERE history_key = ?1 AND insertion = ?2").ok()?;
+        let data: Vec<u8> = stmt.query_row(params![self.key.0, enc(key).ok()?], |r| r.get(0)).optional().ok()??;
+        dec(&decompress(&data).ok()?).ok()
+    }
+
+    fn serves_insertions(&self) -> bool {
+        true
     }
 }
 
@@ -340,16 +357,23 @@ impl Store {
         Self::init(reopen.open()?, reopen)
     }
 
-    pub fn blob_reader(&self) -> Result<BlobReader> {
+    /// Releases SQLite's cached pages and other freeable memory.
+    pub fn shrink_memory(&self) {
+        let _ = self.conn.execute_batch("PRAGMA shrink_memory");
+    }
+
+    pub fn blob_reader(&self, key: HistoryKey) -> Result<BlobReader> {
         let conn = self.reopen.open()?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(BlobReader { conn: std::sync::Mutex::new(conn) })
+        conn.pragma_update(None, "cache_size", READER_CACHE_KIB)?;
+        Ok(BlobReader { conn: std::sync::Mutex::new(conn), key })
     }
 
     fn init(conn: Connection, reopen: Reopen) -> Result<Store> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", WRITER_CACHE_KIB)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         let version: Option<String> =
@@ -518,6 +542,8 @@ impl Store {
         let dirty = history.take_dirty();
         write_state(&tx, key, history, &dirty)?;
         tx.commit()?;
+        let blobs: Vec<Oid> = batch.blobs.iter().map(|b| b.oid).collect();
+        history.persisted(&dirty.insertions, &blobs);
         Ok(())
     }
 
@@ -645,15 +671,8 @@ impl Store {
             let text = root.map(|r| Text::load(r as u64, &mut nodes)).transpose().map_err(StoreError::Corrupt)?;
             inodes.push(Inode::from_stored(stored, text));
         }
-        let mut contents = Contents::default();
-        {
-            let mut stmt = self.conn.prepare("SELECT insertion, data FROM insertions WHERE history_key = ?1")?;
-            let rows = stmt.query_map([key.0], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
-            for row in rows {
-                let (k, v) = row?;
-                contents.insert(dec(&k)?, dec(&decompress(&v)?)?);
-            }
-        }
+        // Insertions stay in the store; the blob reader serves them on demand.
+        let contents = Contents::default();
         let mut meta = BTreeMap::new();
         {
             let mut stmt = self.conn.prepare("SELECT key, entry FROM meta WHERE history_key = ?1")?;
@@ -667,7 +686,7 @@ impl Store {
             self.conn.query_row("SELECT status FROM histories WHERE history_key = ?1", [key.0], |r| r.get(0))?;
         let status = status.map(|s| dec(&s)).transpose()?.unwrap_or(Status::Healthy);
         let mut history = History::from_parts(id, dag, inodes, contents, meta, status);
-        history.set_blob_source(Arc::new(self.blob_reader()?));
+        history.set_blob_source(Arc::new(self.blob_reader(key)?));
         Ok((key, history))
     }
 

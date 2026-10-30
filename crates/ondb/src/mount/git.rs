@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -149,6 +150,31 @@ pub(crate) fn dirty_paths(root: &Path) -> Option<HashSet<String>> {
 
 pub(crate) fn unmerged(entries: &[String]) -> bool {
     entries.iter().any(|e| !e.ends_with(" 0"))
+}
+
+/// The index reduced to what change detection needs, about 20 bytes per
+/// path: path hash -> hash of its entries, low bit set when unmerged.
+pub(crate) type CompactIndex = HashMap<u64, u64>;
+
+pub(crate) fn path_hash(path: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    path.hash(&mut h);
+    h.finish()
+}
+
+pub(crate) fn compact(index: &Index) -> CompactIndex {
+    index
+        .iter()
+        .map(|(p, entries)| {
+            let mut h = DefaultHasher::new();
+            entries.hash(&mut h);
+            (path_hash(p), (h.finish() & !1) | unmerged(entries) as u64)
+        })
+        .collect()
+}
+
+pub(crate) fn compact_unmerged(entry: u64) -> bool {
+    entry & 1 == 1
 }
 
 /// Paths that differ between two `ref@commit` heads, per git.

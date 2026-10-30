@@ -464,3 +464,108 @@ fn git_writes_are_told_apart_from_edits() {
     assert!(!co[0].touched().contains(&b_inode), "the offline edit isn't git's");
     assert!(new.iter().any(|b| !co.contains(&b) && b.touched().contains(&b_inode)));
 }
+
+/// An idle mount drops its in-memory state; ignored build output doesn't
+/// wake it, and anything relevant (edits, tool writes, git switches) wakes it
+/// and is handled exactly as if it had stayed resident.
+#[test]
+fn idle_mounts_hibernate_and_wake_transparently() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let git = |args: &str| sh(&root, &format!("git -c user.name=t -c user.email=t@t {args}"));
+    git("init -q -b main");
+    fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    fs::write(root.join("a.txt"), "main a\n").unwrap();
+    git("add -A && git -c user.name=t -c user.email=t@t commit -qm main");
+    git(
+        "checkout -qb feature && echo 'feature a' > a.txt && git -c user.name=t -c user.email=t@t commit -qam f && git checkout -q main",
+    );
+
+    let ws = Workspace::open(dir.path().join("0ndb.db"), None).unwrap();
+    let opts = MountOptions { idle_unload: Some(Duration::from_millis(300)), ..MountOptions::default() };
+    let mount = Mount::start(&ws, &root, opts).unwrap();
+    let wait_hibernating = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ws.is_hibernating() {
+            assert!(Instant::now() < deadline, "never hibernated");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_hibernating();
+
+    // Build output in an ignored directory doesn't wake it.
+    fs::create_dir_all(root.join("target/debug")).unwrap();
+    for i in 0..200 {
+        fs::write(root.join(format!("target/debug/obj{i}.o")), "x").unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(ws.is_hibernating(), "ignored churn woke the mount");
+
+    // An edit wakes it and is ingested against the reloaded shadow.
+    fs::write(root.join("a.txt"), "main a\nedited\n").unwrap();
+    mount.fence().unwrap();
+    assert_eq!(text(&ws, "a.txt").as_deref(), Some("main a\nedited\n"));
+    git("checkout -q -- .");
+    mount.fence().unwrap();
+    wait_hibernating();
+
+    // A tool write while hibernating.
+    let agent = ws.actor("codex", ActorKind::Agent).unwrap();
+    wait_hibernating();
+    mount.write_file(agent, "b.txt", b"from tool\n".to_vec()).unwrap();
+    assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "from tool\n");
+    fs::remove_file(root.join("b.txt")).unwrap();
+    mount.fence().unwrap();
+    wait_hibernating();
+
+    // A branch switch while hibernating is still recognized as git's.
+    let before = ws.heads();
+    git("checkout -q feature");
+    mount.fence().unwrap();
+    assert_eq!(text(&ws, "a.txt").as_deref(), Some("feature a\n"));
+    let new = ws.batches_missing_from(&before).unwrap();
+    assert!(new.iter().any(|b| b.ops.iter().any(|op| matches!(op, ondb_core::Op::GitCheckout { .. }))));
+    assert!(new.iter().all(|b| ws.summary(&b.id()).unwrap().git_checkout || b.touched().is_empty()), "switch split into edits");
+    assert!(inode(&ws, "target/debug/obj1.o").is_none());
+}
+
+/// Adopting a directory larger than one chunk commits several batches whose
+/// directories and files still line up, and everything round-trips.
+#[test]
+fn large_adoption_commits_in_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("big");
+    fs::create_dir_all(root.join("data")).unwrap();
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    for i in 0..40 {
+        let bytes: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        fs::write(root.join(format!("data/blob{i:02}.bin")), bytes).unwrap();
+    }
+    fs::create_dir_all(root.join("data/zz/deeper")).unwrap();
+    fs::write(root.join("data/zz/deeper/note.txt"), "after the chunk boundary\n").unwrap();
+    let ws = Workspace::open(dir.path().join("0ndb.db"), None).unwrap();
+    let mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    let batches = ws.batches_missing_from(&Version::root()).unwrap();
+    assert!(batches.iter().filter(|b| !b.touched().is_empty()).count() > 1, "adoption wasn't chunked");
+    assert_eq!(text(&ws, "data/zz/deeper/note.txt").as_deref(), Some("after the chunk boundary\n"));
+    for i in [0, 20, 39] {
+        let p = format!("data/blob{i:02}.bin");
+        let state = ws.read(|h| h.lookup(&p).and_then(|id| h.file_state(&h.current(), &id))).expect("tracked");
+        let ondb_core::FileState::Binary { blob, .. } = state else { panic!("{p} not binary") };
+        assert_eq!(ws.blob(&blob.oid).unwrap().unwrap(), fs::read(root.join(&p)).unwrap());
+    }
+    drop(mount);
+    // A restart finds nothing to re-ingest.
+    let heads = ws.heads();
+    let _mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    assert_eq!(ws.heads(), heads);
+}

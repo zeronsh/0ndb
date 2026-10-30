@@ -15,6 +15,9 @@ use super::ignore::walker;
 use super::shadow::{Entry, Kind, Shadow};
 use crate::Error;
 
+/// Content held in memory per adoption batch.
+const ADOPT_CHUNK_BYTES: usize = 32 << 20;
+
 pub enum Scope {
     Full,
     Paths(BTreeSet<String>),
@@ -224,11 +227,13 @@ impl MountState {
     /// Compares disk with the shadow for `scope` and records the difference
     /// as one batch by the ingestion actor, parented on the synced version.
     pub(super) fn reconcile(&mut self, scope: Scope) -> Result<Option<BatchId>, Error> {
+        self.wake()?;
         let git_busy = self.settle_git();
         if let Scope::Paths(p) = &scope
             && p.iter().any(|p| name_of(p) == ".gitignore")
         {
             self.ignore = super::Ignore::load(&self.root, self.git.as_ref());
+            self.ignore_changed = true;
         }
         // Did git write files in this window? A HEAD move whose new reflog
         // entries are all commits didn't (the files being committed are
@@ -261,7 +266,16 @@ impl MountState {
         let young_before = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
             - self.opts.settle)
             .as_nanos() as i64;
+        // Adopting a directory reads every file; commit in bounded chunks so
+        // a large repository never has to fit in memory at once. Paths come
+        // in order, so each chunk's directories exist before the next.
+        let adopting = self.shadow.is_empty() && !git_wrote;
+        let mut chunk_bytes = 0usize;
         for path in &cands {
+            if adopting && chunk_bytes >= ADOPT_CHUNK_BYTES {
+                self.commit_pass(std::mem::take(&mut created), BTreeMap::new(), BTreeMap::new(), None, git_busy)?;
+                chunk_bytes = 0;
+            }
             let disk_entry = probe(&root, path);
             if defer_young
                 && let DiskEntry::File { stat, .. } = &disk_entry
@@ -287,6 +301,7 @@ impl MountState {
                         }
                         DiskEntry::File { stat, exec } => match disk::read_limited(&root, path, self.opts.max_file_size) {
                             Ok(Some(bytes)) => {
+                                chunk_bytes += bytes.len();
                                 created.insert(path.clone(), Found::File { bytes, exec, stat });
                             }
                             Ok(None) => tracing::warn!(path, "file exceeds the size limit; not tracked"),
@@ -372,12 +387,19 @@ impl MountState {
         // everything is git's.
         let new_index = git::read_index(&root);
         let dirty = git::dirty_paths(&root);
-        let written: Option<BTreeSet<String>> = match (&self.git_index, &new_index) {
+        let new_compact = new_index.as_ref().map(git::compact);
+        let written: Option<BTreeSet<String>> = match (&self.git_index, &new_compact) {
             (Some(old), Some(new)) => Some(
-                old.iter()
-                    .filter(|(p, e)| new.get(*p) != Some(e) && !git::unmerged(e))
-                    .map(|(p, _)| p.clone())
-                    .chain(new.keys().filter(|p| !old.contains_key(*p)).cloned())
+                created
+                    .keys()
+                    .chain(removed.keys())
+                    .chain(changed.keys())
+                    .filter(|p| {
+                        let h = git::path_hash(p);
+                        let before = old.get(&h);
+                        before != new.get(&h) && !before.is_some_and(|e| git::compact_unmerged(*e))
+                    })
+                    .cloned()
                     .collect(),
             ),
             _ => git::changed_between(&root, self.git_head.as_deref(), head.as_deref()).map(|v| v.into_iter().collect()),
@@ -443,7 +465,8 @@ impl MountState {
             _ => Some(Op::GitWrite { operation: operation.unwrap_or("git").to_string(), head: head.clone() }),
         };
         self.git_head = head;
-        self.adopt_git_index(new_index);
+        drop(new_index);
+        self.adopt_git_index(new_compact);
         let by_git = self.commit_pass(co_created, co_removed, co_changed, marker, git_busy)?;
         for (p, bytes, exec, stat) in followups {
             if let Some(e) = self.shadow.get(&p).cloned() {
@@ -791,6 +814,7 @@ impl MountState {
         bytes: Vec<u8>,
         exec: Option<bool>,
     ) -> Result<Option<BatchId>, Error> {
+        self.wake()?;
         let path = normalize(path)?;
         self.materialize()?;
         let (batch, _) = self.ws.commit(actor, None, |txn| -> Result<(), Error> {
@@ -826,6 +850,7 @@ impl MountState {
     }
 
     pub(super) fn tool_remove(&mut self, actor: ActorId, path: &str) -> Result<Option<BatchId>, Error> {
+        self.wake()?;
         let path = normalize(path)?;
         self.materialize()?;
         let (batch, _) = self.ws.commit(actor, None, |txn| -> Result<(), Error> {
@@ -842,6 +867,7 @@ impl MountState {
     }
 
     pub(super) fn tool_rename(&mut self, actor: ActorId, from: &str, to: &str) -> Result<Option<BatchId>, Error> {
+        self.wake()?;
         let (from, to) = (normalize(from)?, normalize(to)?);
         self.materialize()?;
         let (batch, _) = self.ws.commit(actor, None, |txn| -> Result<(), Error> {

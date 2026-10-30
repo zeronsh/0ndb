@@ -103,10 +103,22 @@ pub fn actor_key(actor: &ActorId) -> String {
     format!("actor/{}", actor.0)
 }
 
+const OPEN: &str = "the store is open while awake";
+
+/// Batch summaries kept in memory; older ones are re-derived from the store.
+const SUMMARY_CACHE: usize = 4096;
+
 struct Inner {
-    store: Store,
+    /// Closed while hibernating (file-backed stores only).
+    db: Option<Store>,
+    /// Where to reopen `db` after hibernating; `None` for in-memory stores,
+    /// which stay open (closing would discard them).
+    db_path: Option<std::path::PathBuf>,
     key: HistoryKey,
     history: History,
+    /// Set while hibernating: the in-memory state was dropped and `history`
+    /// is an empty placeholder. Holds the heads, which stay readable.
+    hibernated: Option<Version>,
     summaries: HashMap<BatchId, BatchSummary>,
     /// Remote batches waiting for parents, by id.
     waiting: HashMap<BatchId, Batch>,
@@ -119,23 +131,72 @@ impl Inner {
         if let Some(s) = self.summaries.get(id) {
             return Ok(s.clone());
         }
-        let batch = self.store.batch(self.key, id)?.ok_or_else(|| Error::Invalid(format!("unknown batch {id:?}")))?;
+        let key = self.key;
+        let batch = self.store().batch(key, id)?.ok_or_else(|| Error::Invalid(format!("unknown batch {id:?}")))?;
         let s = BatchSummary::of(&batch);
-        self.summaries.insert(*id, s.clone());
+        self.remember(s.clone());
         Ok(s)
+    }
+
+    fn store(&mut self) -> &mut Store {
+        self.db.as_mut().expect(OPEN)
+    }
+
+    fn remember(&mut self, s: BatchSummary) {
+        if self.summaries.len() >= SUMMARY_CACHE {
+            self.summaries.clear();
+        }
+        self.summaries.insert(s.id, s);
+    }
+
+    /// Reloads the state dropped by hibernation.
+    fn wake(&mut self) {
+        if self.hibernated.is_none() {
+            return;
+        }
+        let id = self.history.id();
+        let mut attempt = 0;
+        loop {
+            let reopened = match (&self.db, &self.db_path) {
+                (None, Some(path)) => Store::open(path).map(Some),
+                _ => Ok(None),
+            };
+            let loaded = reopened.map_err(Error::from).and_then(|db| {
+                if let Some(db) = db {
+                    self.db = Some(db);
+                }
+                Ok(self.store().load(id)?)
+            });
+            match loaded {
+                Ok((_, h)) => {
+                    self.history = h;
+                    self.hibernated = None;
+                    return;
+                }
+                // The store was readable moments ago; a failure here means it
+                // is broken, and continuing with an empty history would
+                // corrupt it.
+                Err(e) if attempt >= 3 => panic!("0ndb: reloading history {id} failed: {e}"),
+                Err(e) => {
+                    tracing::warn!(%id, error = %e, "reloading history failed; retrying");
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50 << attempt));
+                }
+            }
+        }
     }
 
     /// Writes the batch and the state it changed in one transaction. If
     /// that fails, memory is rebuilt from storage so the two never diverge.
     fn persist(&mut self, batch: &Batch, origin: Origin) -> Result<(), Error> {
-        if let Err(e) = self.store.append(self.key, batch, origin, &mut self.history) {
+        if let Err(e) = self.db.as_mut().expect(OPEN).append(self.key, batch, origin, &mut self.history) {
             let id = self.history.id();
-            if let Ok((_, h)) = self.store.load(id) {
+            if let Ok((_, h)) = self.store().load(id) {
                 self.history = h;
             }
             return Err(e.into());
         }
-        self.summaries.insert(batch.id(), BatchSummary::of(batch));
+        self.remember(BatchSummary::of(batch));
         Ok(())
     }
 }
@@ -171,11 +232,12 @@ impl ReadCtx<'_> {
     }
 
     pub fn store(&mut self) -> (&mut Store, HistoryKey) {
-        (&mut self.inner.store, self.inner.key)
+        let key = self.inner.key;
+        (self.inner.store(), key)
     }
 
     pub fn blob(&self, oid: &Oid) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.inner.store.blob(oid)?)
+        Ok(self.inner.db.as_ref().expect(OPEN).blob(oid)?)
     }
 }
 
@@ -190,14 +252,14 @@ impl Workspace {
     /// Opens the store at `path`. Uses the given history, the store's only
     /// history, or creates a new one.
     pub fn open(path: impl AsRef<Path>, history: Option<HistoryId>) -> Result<Self, Error> {
-        Self::from_store(Store::open(path)?, history)
+        Self::from_store(Store::open(path.as_ref())?, Some(path.as_ref().to_path_buf()), history)
     }
 
     pub fn in_memory(history: Option<HistoryId>) -> Result<Self, Error> {
-        Self::from_store(Store::open_in_memory()?, history)
+        Self::from_store(Store::open_in_memory()?, None, history)
     }
 
-    fn from_store(mut store: Store, history: Option<HistoryId>) -> Result<Self, Error> {
+    fn from_store(mut store: Store, db_path: Option<std::path::PathBuf>, history: Option<HistoryId>) -> Result<Self, Error> {
         let id = match history {
             Some(id) => id,
             None => match store.histories()?.as_slice() {
@@ -216,13 +278,53 @@ impl Workspace {
                 r
             }
         };
-        let inner =
-            Inner { store, key, history, summaries: HashMap::new(), waiting: HashMap::new(), rejected: HashSet::new(), replica };
+        let inner = Inner {
+            db: Some(store),
+            db_path,
+            key,
+            history,
+            hibernated: None,
+            summaries: HashMap::new(),
+            waiting: HashMap::new(),
+            rejected: HashSet::new(),
+            replica,
+        };
         Ok(Workspace { inner: Arc::new(Mutex::new(inner)), subscribers: Arc::new(Mutex::new(Vec::new())), id })
     }
 
+    /// The state, reloaded first if hibernating.
     fn lock(&self) -> MutexGuard<'_, Inner> {
+        let mut guard = self.raw_lock();
+        guard.wake();
+        guard
+    }
+
+    fn raw_lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Drops the in-memory state (history, summaries, SQLite caches); the
+    /// next use reloads it from the store. Cheap to call; meant for idle
+    /// worktrees so memory scales with active ones.
+    pub fn hibernate(&self) {
+        let mut inner = self.raw_lock();
+        if inner.hibernated.is_some() {
+            return;
+        }
+        let id = inner.history.id();
+        let heads = inner.history.heads().clone();
+        inner.history = History::new(id);
+        inner.hibernated = Some(heads);
+        inner.summaries = HashMap::new();
+        if inner.db_path.is_some() {
+            inner.db = None;
+        } else {
+            inner.store().shrink_memory();
+        }
+    }
+
+    pub fn is_hibernating(&self) -> bool {
+        self.raw_lock().hibernated.is_some()
     }
 
     pub fn id(&self) -> HistoryId {
@@ -234,7 +336,11 @@ impl Workspace {
     }
 
     pub fn heads(&self) -> Version {
-        self.lock().history.heads().clone()
+        let inner = self.raw_lock();
+        match &inner.hibernated {
+            Some(heads) => heads.clone(),
+            None => inner.history.heads().clone(),
+        }
     }
 
     pub fn subscribe(&self) -> Receiver<Event> {
@@ -342,7 +448,7 @@ impl Workspace {
                             tracing::warn!(batch = ?id, %error, "rejecting batch that does not apply; reloading");
                             inner.rejected.insert(id);
                             report.rejected.push((id, error.to_string()));
-                            let (_, reloaded) = inner.store.load(self.id)?;
+                            let (_, reloaded) = inner.store().load(self.id)?;
                             inner.history = reloaded;
                             events.push(Event::Reloaded);
                         }
@@ -376,13 +482,13 @@ impl Workspace {
     pub fn unpushed(&self) -> Result<Vec<Batch>, Error> {
         let mut inner = self.lock();
         let key = inner.key;
-        Ok(inner.store.unpushed(key)?)
+        Ok(inner.store().unpushed(key)?)
     }
 
     pub fn mark_pushed(&self, ids: &[BatchId]) -> Result<(), Error> {
         let mut inner = self.lock();
         let key = inner.key;
-        Ok(inner.store.mark_pushed(key, ids)?)
+        Ok(inner.store().mark_pushed(key, ids)?)
     }
 
     /// Every batch not included by `have` (unknown heads are ignored), in
@@ -395,7 +501,7 @@ impl Workspace {
         let key = inner.key;
         let mut out = Vec::with_capacity(ordered.len());
         for id in ordered {
-            out.push(inner.store.batch(key, &id)?.ok_or_else(|| Error::Invalid(format!("missing batch {id:?}")))?);
+            out.push(inner.store().batch(key, &id)?.ok_or_else(|| Error::Invalid(format!("missing batch {id:?}")))?);
         }
         Ok(out)
     }
@@ -403,7 +509,7 @@ impl Workspace {
     pub fn batch(&self, id: &BatchId) -> Result<Option<Batch>, Error> {
         let mut inner = self.lock();
         let key = inner.key;
-        Ok(inner.store.batch(key, id)?)
+        Ok(inner.store().batch(key, id)?)
     }
 
     pub fn summary(&self, id: &BatchId) -> Result<BatchSummary, Error> {
@@ -411,7 +517,7 @@ impl Workspace {
     }
 
     pub fn blob(&self, oid: &Oid) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.lock().store.blob(oid)?)
+        Ok(self.lock().store().blob(oid)?)
     }
 
     /// The local actor for `(kind, name)`, created and registered on first
@@ -419,8 +525,8 @@ impl Workspace {
     pub fn actor(&self, name: &str, kind: ActorKind) -> Result<ActorId, Error> {
         let local_key = format!("actor:{kind:?}:{name}");
         let (existing, replica) = {
-            let inner = self.lock();
-            (inner.store.local_get(&local_key)?, inner.replica)
+            let mut inner = self.lock();
+            (inner.store().local_get(&local_key)?, inner.replica)
         };
         if let Some(bytes) = existing {
             return Ok(ActorId(Uuid::from_slice(&bytes).map_err(|e| Error::Invalid(e.to_string()))?));
@@ -429,7 +535,7 @@ impl Workspace {
         let info = ActorInfo { name: name.to_string(), kind, replica, created_ms: ondb_core::now_ms() };
         let value = postcard::to_stdvec(&info).map_err(|e| Error::Invalid(e.to_string()))?;
         self.commit(actor, None, |txn| Ok(txn.push(Op::Meta { key: actor_key(&actor), value: Some(value) })?))?;
-        self.lock().store.local_set(&local_key, actor.0.as_bytes())?;
+        self.lock().store().local_set(&local_key, actor.0.as_bytes())?;
         Ok(actor)
     }
 
@@ -449,10 +555,10 @@ impl Workspace {
     }
 
     pub fn local_get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.lock().store.local_get(key)?)
+        Ok(self.lock().store().local_get(key)?)
     }
 
     pub fn local_set(&self, key: &str, value: &[u8]) -> Result<(), Error> {
-        Ok(self.lock().store.local_set(key, value)?)
+        Ok(self.lock().store().local_set(key, value)?)
     }
 }

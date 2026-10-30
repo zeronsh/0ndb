@@ -115,6 +115,10 @@ impl MountState {
     }
 
     fn materialize_inner(&mut self, all: bool) -> Result<(), Error> {
+        if !all && self.hibernating && self.ws.heads() == self.record.synced_version {
+            return Ok(());
+        }
+        self.wake()?;
         for _ in 0..8 {
             let (heads, plan) = self.plan(all)?;
             if plan.is_empty() {

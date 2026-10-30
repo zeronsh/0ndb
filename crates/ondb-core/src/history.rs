@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contents::{BlobSource, Contents, Insertion, InsertionKey};
 use crate::dag::{BatchHeader, Dag, DagError};
-use crate::id::{ActorId, BatchId, HistoryId, InodeId, Lamport, OpId};
+use crate::id::{ActorId, BatchId, HistoryId, InodeId, Lamport, Oid, OpId};
 use crate::op::{Batch, Blob, BlobRef, Content, FileMode, ImportNode, ImportParent, LineEnding, Op, Splice};
 use crate::text::{Text, TextError, View};
 use crate::tree::{ContentKind, FileNode, Inode, Lww, NodeKind, Placement, Tree};
@@ -495,6 +495,12 @@ impl History {
     }
 
     /// Changes since the last call (what a store must write).
+    /// The store durably holds these insertions and blobs; memory may drop
+    /// them (they are read back on demand).
+    pub fn persisted(&mut self, insertions: &[InsertionKey], blobs: &[Oid]) {
+        self.contents.persisted(insertions, blobs);
+    }
+
     pub fn take_dirty(&mut self) -> Dirty {
         std::mem::take(&mut self.dirty)
     }
