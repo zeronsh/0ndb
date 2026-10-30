@@ -4,6 +4,9 @@
 set -u
 B="${ONDB:-$(cd "$(dirname "$0")/.." && pwd)/target/release/0ndb}"
 E="${E2E_DIR:-/tmp/ondb-e2e}"; mkdir -p "$E"
+# Everything below runs git; never let a failed step fall back to the caller's
+# directory (which may be a real repository).
+cd "$E" || exit 2
 export GIT_AUTHOR_NAME=e2e GIT_AUTHOR_EMAIL=e2e@example.com GIT_COMMITTER_NAME=e2e GIT_COMMITTER_EMAIL=e2e@example.com
 export GH_TOKEN="${GH_TOKEN:-$(gh auth token)}"
 GITC=(-c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f')
@@ -21,7 +24,7 @@ last() { $B log -C "$E/$1" -n "${2:-1}" 2>&1 | sed "s/^/  [$1] /"; }
 
 rm -rf $E/a $E/a-feature $E/a-hotfix $E/a-new $E/b $E/*.log
 git "${GITC[@]}" clone -q $URL $E/a && git "${GITC[@]}" clone -q $URL $E/b || { echo "can't clone $URL (set GH_TOKEN for an account with access)"; exit 2; }
-cd $E/a
+cd $E/a || exit 2
 git worktree add -q ../a-feature feature
 git worktree add -q -b hotfix ../a-hotfix main
 for d in a a-feature a-hotfix; do $B init -C $E/$d | sed "s/^/  /"; done
@@ -74,7 +77,7 @@ step "stopping watchers"
 kill %1 %2 %3 2>/dev/null; wait 2>/dev/null
 
 step "phase 2: attributed agent commands (0ndb run)"
-cd $E/a
+cd $E/a || exit 2
 step "11. agent scope: real edit + branch switch in one command"
 git -C $E/a switch -q release
 $B run --agent claude --label "edit+switch" -- sh -c 'echo "# agent" >> scripts/build.sh && git switch -q feature2' 2>&1 | sed 's/^/  /'
