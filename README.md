@@ -229,9 +229,11 @@ registering it. Nothing polls: provider calls happen on request.
 * **Threads are message trees.** Editing a user message adds a sibling
   (`siblings()` gives the `<i/n>` switcher); `switch_branch` selects another.
 * **Every message is pinned to a worktree version**, and every turn and every
-  tool call is an attribution scope. Editing or switching can restore the
-  files fully or undo only what agents changed (people's edits stay); git
-  checkouts are never undone.
+  tool call is an attribution scope. Branching follows one fixed rule, not
+  an option: editing a message or switching branches makes the files exactly
+  what they were at that point (everything since is undone, people's edits
+  included), except git checkouts, which are never undone. Undoing only an
+  agent's work is a separate, explicit action (reverting its scope).
 * **Provider sessions are chosen per turn.** Continue the native session that
   last saw this branch; else fork a native session at the branch point if the
   provider can (Claude Code: `--resume-session-at` + `--fork-session`); else
@@ -312,7 +314,7 @@ and fails if heap, open files or threads grow.
 0ndb worktree list | rm <id> | pr <id> | pr-open <id> "title"
 0ndb thread new <worktree-id> "title"
 0ndb thread send <thread> "prompt" [--model haiku] [--access plan|edits|full]
-0ndb thread edit <message> "new prompt" [--restore agent|full|keep]
+0ndb thread edit <message> "new prompt"
 0ndb thread show <thread> | switch <message> | events <message>
 ```
 

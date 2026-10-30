@@ -9,7 +9,7 @@ use clap::{Subcommand, ValueEnum};
 use ondb::git::Forges;
 use ondb::{MountOptions, Worktrees};
 use ondb_agents::claude::{Access, ClaudeCode};
-use ondb_agents::{Provider, Restore, Role, SessionOptions, Sessions};
+use ondb_agents::{Provider, Role, SessionOptions, Sessions};
 
 #[derive(Subcommand)]
 pub enum WorktreeCmd {
@@ -49,23 +49,6 @@ pub enum WorktreeCmd {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-pub enum RestoreArg {
-    Keep,
-    Full,
-    Agent,
-}
-
-impl From<RestoreArg> for Restore {
-    fn from(r: RestoreArg) -> Restore {
-        match r {
-            RestoreArg::Keep => Restore::Keep,
-            RestoreArg::Full => Restore::Full,
-            RestoreArg::Agent => Restore::AgentOnly,
-        }
-    }
-}
-
-#[derive(Clone, Copy, ValueEnum)]
 pub enum AccessArg {
     Plan,
     Edits,
@@ -95,8 +78,6 @@ pub enum ThreadCmd {
     Edit {
         message: String,
         prompt: String,
-        #[arg(long, value_enum, default_value = "agent")]
-        restore: RestoreArg,
         #[arg(long, default_value = "claude-code")]
         provider: String,
         #[arg(long)]
@@ -104,11 +85,9 @@ pub enum ThreadCmd {
         #[arg(long, value_enum, default_value = "edits")]
         access: AccessArg,
     },
-    /// Select the branch through MESSAGE.
+    /// Select the branch through MESSAGE (files follow).
     Switch {
         message: String,
-        #[arg(long, value_enum, default_value = "agent")]
-        restore: RestoreArg,
     },
     /// The selected branch with tool calls and `<i/n>` alternatives.
     Show {
@@ -200,12 +179,12 @@ pub fn thread(cmd: ThreadCmd) -> Result<()> {
             let m = s.send(&thread, &prompt, &provider, model.as_deref())?.wait()?;
             print_reply(&s, &m)?;
         }
-        ThreadCmd::Edit { message, prompt, restore, provider, model, .. } => {
-            let m = s.edit(&message, &prompt, &provider, model.as_deref(), restore.into())?.wait()?;
+        ThreadCmd::Edit { message, prompt, provider, model, .. } => {
+            let m = s.edit(&message, &prompt, &provider, model.as_deref())?.wait()?;
             print_reply(&s, &m)?;
         }
-        ThreadCmd::Switch { message, restore } => {
-            let leaf = s.switch_branch(&message, restore.into())?;
+        ThreadCmd::Switch { message } => {
+            let leaf = s.switch_branch(&message)?;
             println!("now at {}", leaf.id);
         }
         ThreadCmd::Show { thread } => {

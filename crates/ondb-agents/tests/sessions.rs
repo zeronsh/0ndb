@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use ondb::git::Forges;
 use ondb::{MountOptions, Worktrees};
 use ondb_agents::mock::{Mock, Step};
-use ondb_agents::{Capabilities, Provider, Restore, Role, SessionOptions, Sessions, Status};
+use ondb_agents::{Capabilities, Provider, Role, SessionOptions, Sessions, Status};
 
 fn sh(dir: &Path, script: &str) {
     let ok = Command::new("sh").arg("-c").arg(script).current_dir(dir).status().unwrap().success();
@@ -117,10 +117,11 @@ fn records_turns_switches_providers_and_edits_with_worktree_restore() {
     fs::write(e.wt.path.join("human.txt"), "mine\n").unwrap();
     mount.fence().unwrap();
 
-    // Edit turn 2's prompt: a sibling branch; agent changes since are undone, the human's kept;
-    // alpha forks its native session at turn 1's last message.
+    // Edit turn 2's prompt: a sibling branch whose files are exactly as they were when turn 2
+    // was sent (the human's later edit included in what's undone); alpha forks its native
+    // session at turn 1's last message.
     let u2 = s.message(&a2.parent.clone().unwrap()).unwrap();
-    let edited = s.edit(&u2.id, "write d.txt instead", "alpha", None, Restore::AgentOnly).unwrap().wait().unwrap();
+    let edited = s.edit(&u2.id, "write d.txt instead", "alpha", None).unwrap().wait().unwrap();
     assert_eq!(edited.status, Status::Done);
     let fork = e.alpha.calls().last().unwrap().clone();
     assert_eq!(fork.forked_at.as_deref(), a1.native.as_deref(), "native fork at the branch point");
@@ -129,7 +130,7 @@ fn records_turns_switches_providers_and_edits_with_worktree_restore() {
         assert!(!e.wt.path.join(gone).exists(), "{gone} survived the restore");
     }
     assert_eq!(fs::read_to_string(e.wt.path.join("a.txt")).unwrap(), "from alpha\n", "turn 1 predates the edit");
-    assert_eq!(fs::read_to_string(e.wt.path.join("human.txt")).unwrap(), "mine\n", "people's edits stay");
+    assert!(!e.wt.path.join("human.txt").exists(), "one fixed rule: everything since the message is undone");
     assert!(e.wt.path.join("d.txt").exists());
     let sibs = s.siblings(&u2.id).unwrap();
     assert_eq!(sibs.len(), 2, "<1/2>");
@@ -137,7 +138,7 @@ fn records_turns_switches_providers_and_edits_with_worktree_restore() {
     assert_eq!(path, ["write a.txt from alpha", "ok: write a.txt from alpha", "write d.txt instead", "ok: write d.txt instead"]);
 
     // Switch back to the original branch: its files come back exactly.
-    let leaf = s.switch_branch(&u2.id, Restore::Full).unwrap();
+    let leaf = s.switch_branch(&u2.id).unwrap();
     assert_eq!(leaf.role, Role::Assistant);
     assert_eq!(leaf.text, "ok: say hi");
     for (f, want) in [("b.txt", "second\n"), ("c.txt", "from beta\n"), ("a.txt", "from alpha\n")] {
@@ -246,7 +247,6 @@ fn live_claude_code() {
             "Reply with just the number of messages you have received from me so far in this conversation.",
             "claude-code",
             model,
-            Restore::AgentOnly,
         )
         .unwrap()
         .wait()
@@ -331,7 +331,7 @@ fn rejected_forks_fall_back_to_replay() {
     s.send(&t.id, "first", "alpha", None).unwrap().wait().unwrap();
     let a2 = s.send(&t.id, "second", "alpha", None).unwrap().wait().unwrap();
     e.alpha.reject_forks(true);
-    let edited = s.edit(a2.parent.as_ref().unwrap(), "second, edited", "alpha", None, Restore::Keep).unwrap().wait().unwrap();
+    let edited = s.edit(a2.parent.as_ref().unwrap(), "second, edited", "alpha", None).unwrap().wait().unwrap();
     assert_eq!(edited.status, Status::Done, "{:?}", edited.error);
     let calls = e.alpha.calls();
     let fallback = calls.last().unwrap();

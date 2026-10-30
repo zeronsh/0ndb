@@ -81,3 +81,6 @@
   tool calls are attribution scopes nested in the turn's scope.
 - Sessions keep nothing per thread in memory between turns; warm provider
   processes are bounded by `SessionOptions`.
+- Branch navigation has one fixed file rule (exact restore to the message's
+  version, git checkouts excepted). Don't add user-selectable branching
+  behaviour; partial undo belongs to explicit scope reverts.

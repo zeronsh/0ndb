@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use ondb::{ActorKind, Recorder, ScopeKind, Worktrees};
-use ondb_core::{BatchId, Version};
+use ondb_core::Version;
 
 use crate::Error;
 use crate::provider::{EventKind, Interrupter, Provider, Run, StartRequest};
@@ -45,18 +45,6 @@ impl Default for SessionOptions {
     fn default() -> Self {
         SessionOptions { warm_limit: 2, warm_idle: Duration::from_secs(90), history_chars: 60_000 }
     }
-}
-
-/// What happens to the worktree's files when editing a message or
-/// switching branches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Restore {
-    /// Leave the files alone.
-    Keep,
-    /// Files exactly as they were at the message (git checkouts excepted).
-    Full,
-    /// Undo only what agents changed since; edits made by people stay.
-    AgentOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -338,36 +326,29 @@ impl Sessions {
     }
 
     /// Replaces a user message: a sibling with `prompt` becomes the selected
-    /// branch, the worktree is restored per `restore` to how it was when the
+    /// branch, the worktree's files become exactly what they were when the
     /// original was sent, and the agent runs from there.
-    pub fn edit(
-        &self,
-        message: &str,
-        prompt: &str,
-        provider: &str,
-        model: Option<&str>,
-        restore: Restore,
-    ) -> Result<Turn, Error> {
+    pub fn edit(&self, message: &str, prompt: &str, provider: &str, model: Option<&str>) -> Result<Turn, Error> {
         let m = self.message(message)?;
         if m.role != Role::User {
             return Err(Error::Invalid("only user messages can be edited".into()));
         }
         let t = self.thread(&m.thread)?;
         self.check_idle(&t.id)?;
-        self.restore(&t.worktree, m.version.as_ref(), restore)?;
+        self.restore(&t.worktree, m.version.as_ref())?;
         self.start_turn(&t.id, m.parent.clone(), prompt, provider, model)
     }
 
-    /// Selects the branch through `message` (its most recent continuation)
-    /// and restores the worktree to that branch's last state per `restore`.
-    pub fn switch_branch(&self, message: &str, restore: Restore) -> Result<Message, Error> {
+    /// Selects the branch through `message` (its most recent continuation);
+    /// the worktree's files become exactly that branch's last state.
+    pub fn switch_branch(&self, message: &str) -> Result<Message, Error> {
         let mut leaf = self.message(message)?;
         let t = self.thread(&leaf.thread)?;
         self.check_idle(&t.id)?;
         while let Some(next) = self.inner.store.children(&t.id, Some(&leaf.id))?.pop() {
             leaf = next;
         }
-        self.restore(&t.worktree, leaf.version.as_ref(), restore)?;
+        self.restore(&t.worktree, leaf.version.as_ref())?;
         self.inner.store.set_leaf(&t.id, &leaf.id)?;
         Ok(leaf)
     }
@@ -379,10 +360,11 @@ impl Sessions {
         Ok(())
     }
 
-    /// Makes the worktree's files match `target` (all of it, or only what
-    /// agents changed), never undoing git checkouts.
-    fn restore(&self, worktree: &str, target: Option<&Version>, mode: Restore) -> Result<(), Error> {
-        let Some(target) = target.filter(|_| mode != Restore::Keep) else { return Ok(()) };
+    /// Makes the worktree's files exactly what they were at `target`. One
+    /// fixed rule, so branches are predictable: everything since is undone
+    /// (people's edits included), except git checkouts.
+    fn restore(&self, worktree: &str, target: Option<&Version>) -> Result<(), Error> {
+        let Some(target) = target else { return Ok(()) };
         let (ws, mount) = self
             .inner
             .worktrees
@@ -390,11 +372,6 @@ impl Sessions {
             .ok_or_else(|| Error::Invalid(format!("worktree {worktree} isn't mounted")))?;
         mount.fence()?;
         let restorer = ws.actor("restore", ActorKind::Agent)?;
-        let agent_scoped: HashSet<BatchId> = if mode == Restore::AgentOnly {
-            ondb::attrib::scopes(&ws).into_iter().filter(|s| s.agent.is_some()).flat_map(|s| s.batches).collect()
-        } else {
-            HashSet::new()
-        };
         let mut undo = HashSet::new();
         for b in ws.batches_missing_from(target)? {
             let id = b.id();
@@ -402,14 +379,7 @@ impl Sessions {
             if s.git_checkout || s.is_annotation_only() {
                 continue;
             }
-            let by_agent = || {
-                s.actor == restorer
-                    || agent_scoped.contains(&id)
-                    || ws.actor_info(&s.actor).is_some_and(|i| i.kind == ActorKind::Agent)
-            };
-            if mode == Restore::Full || by_agent() {
-                undo.insert(id);
-            }
+            undo.insert(id);
         }
         if ondb::revert::revert_batches(&ws, restorer, &undo)?.is_some() {
             mount.fence()?;
