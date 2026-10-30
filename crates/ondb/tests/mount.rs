@@ -222,6 +222,67 @@ fn one_live_mount_per_directory() {
     Mount::start(&other, &root, MountOptions::default()).unwrap();
 }
 
+/// Separate databases (say, production and a test build) can track the same
+/// directory at once. Each records the other's writes once, as an external
+/// change, and nothing is duplicated.
+#[test]
+fn separate_histories_share_a_directory() {
+    let (dir, prod) = setup();
+    let root = dir.path().join("wt");
+    let test = Workspace::open(dir.path().join("test.db"), None).unwrap();
+    let prod_mount = Mount::start(&prod, &root, MountOptions::default()).unwrap();
+    let test_mount = Mount::start(&test, &root, MountOptions::default()).unwrap();
+    assert_ne!(prod.id(), test.id());
+    assert_eq!(text(&test, "README.md").as_deref(), Some("# demo\n"));
+
+    // Any process's write lands once in each history.
+    fs::write(root.join("README.md"), "# demo\nline two\n").unwrap();
+    prod_mount.fence().unwrap();
+    test_mount.fence().unwrap();
+    for ws in [&prod, &test] {
+        assert_eq!(text(ws, "README.md").as_deref(), Some("# demo\nline two\n"));
+    }
+
+    // An agent attributed in the test history: its edit is credited there,
+    // and production sees it as an ordinary disk change, exactly once.
+    let agent = test.actor("codex", ActorKind::Agent).unwrap();
+    let recorder = Recorder::new(&test, vec![test_mount.handle()]).unwrap();
+    let (_, record) =
+        recorder.scoped(ScopeKind::Command, "append", Some(agent), None, |_| sh(&root, "echo 'from test' >> README.md")).unwrap();
+    assert_eq!(record.batches.len(), 1);
+    prod_mount.fence().unwrap();
+    let expected = "# demo\nline two\nfrom test\n";
+    assert_eq!(text(&prod, "README.md").as_deref(), Some(expected));
+    assert_eq!(text(&test, "README.md").as_deref(), Some(expected));
+
+    // Tool writes and reverts in one history reach disk; the other ingests
+    // them without echoing anything back.
+    let tool = prod.actor("claude", ActorKind::Agent).unwrap();
+    prod_mount.write_file(tool, "src/new.rs", b"pub fn x() {}\n".to_vec()).unwrap();
+    test_mount.fence().unwrap();
+    assert_eq!(text(&test, "src/new.rs").as_deref(), Some("pub fn x() {}\n"));
+    recorder.revert(&record.id, agent, true).unwrap();
+    test_mount.fence().unwrap();
+    prod_mount.fence().unwrap();
+    let expected = "# demo\nline two\n";
+    assert_eq!(fs::read_to_string(root.join("README.md")).unwrap(), expected);
+    assert_eq!(text(&prod, "README.md").as_deref(), Some(expected));
+    assert_eq!(text(&test, "README.md").as_deref(), Some(expected));
+
+    // Quiet afterwards: neither keeps re-ingesting the other's writes.
+    let (p, t) = (prod.heads(), test.heads());
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    prod_mount.fence().unwrap();
+    test_mount.fence().unwrap();
+    assert_eq!((prod.heads(), test.heads()), (p, t), "the mounts echo each other");
+
+    // Same history twice is still refused.
+    let again = Workspace::open(dir.path().join("test.db"), None).unwrap();
+    assert!(
+        matches!(Mount::start(&again, &root, MountOptions::default()), Err(ondb::Error::Invalid(m)) if m.contains("already mounted"))
+    );
+}
+
 /// A program writing a temp file and renaming it into place (`sed -i`,
 /// editors) must not leave the temp file in history, even when it lives
 /// longer than the debounce window.

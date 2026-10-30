@@ -20,6 +20,11 @@ struct Cli {
     /// Worktree root (default: nearest ancestor with a .0ndb directory, else the current directory).
     #[arg(long, short = 'C', global = true)]
     dir: Option<PathBuf>,
+    /// Database to use (default: <root>/.0ndb/0ndb.db). Separate databases
+    /// can track the same directory side by side, e.g. a test build next to
+    /// production.
+    #[arg(long, global = true, env = "ONDB_DB")]
+    db: Option<PathBuf>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -95,14 +100,16 @@ enum Cmd {
     Verify,
 }
 
-fn find_root(dir: Option<PathBuf>) -> Result<PathBuf> {
+fn find_root(dir: Option<PathBuf>, external_db: bool) -> Result<PathBuf> {
     if let Some(d) = dir {
         return std::fs::canonicalize(&d).with_context(|| format!("no such directory {}", d.display()));
     }
     let cwd = std::env::current_dir()?;
     let mut cur = cwd.as_path();
+    // With an external database the folder holds only mount state.
+    let marker = if external_db { ".0ndb" } else { ".0ndb/0ndb.db" };
     loop {
-        if cur.join(".0ndb/0ndb.db").exists() {
+        if cur.join(marker).exists() {
             return Ok(cur.to_path_buf());
         }
         match cur.parent() {
@@ -112,9 +119,15 @@ fn find_root(dir: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn open(root: &Path) -> Result<Workspace> {
-    std::fs::create_dir_all(root.join(".0ndb"))?;
-    Ok(Workspace::open(root.join(".0ndb/0ndb.db"), None)?)
+fn open(root: &Path, db: Option<PathBuf>) -> Result<Workspace> {
+    let db = match db {
+        Some(db) => db,
+        None => root.join(".0ndb/0ndb.db"),
+    };
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Workspace::open(&db, None).with_context(|| format!("opening {}", db.display()))
 }
 
 /// Brings the store up to date with the disk unless a `0ndb watch` is
@@ -241,8 +254,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         serve_tcp(listener, Arc::new(Mutex::new(Relay::in_memory(config))), Arc::new(AtomicBool::new(false)))?;
         return Ok(ExitCode::SUCCESS);
     }
-    let root = find_root(cli.dir)?;
-    let ws = open(&root)?;
+    let root = find_root(cli.dir, cli.db.is_some())?;
+    let ws = open(&root, cli.db)?;
     match cli.command {
         Cmd::Relay { .. } => unreachable!(),
         Cmd::Init => {

@@ -38,6 +38,10 @@
   nodes plus inode rows.
 - `View::min_unobserved` must be a true lower bound on unobserved op
   timestamps (subtrees newer than it are pruned from view-relative seeks).
+- One live mount per (history, directory), enforced by
+  `.0ndb/mount-<history>.lock`. Different histories may share a directory;
+  anything a mount writes into the watched tree (fence markers, temp files)
+  must be unique per mount and internal to every mount.
 - Background mount passes defer files younger than `settle`; fences, tool
   writes and shutdown must ingest everything.
 - Files git wrote (decided from HEAD's reflog and the index, see

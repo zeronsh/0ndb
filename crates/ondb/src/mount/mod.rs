@@ -163,14 +163,21 @@ impl Mount {
         fs::create_dir_all(root.join(STATE_DIR).join("fences"))?;
         let git = GitDirs::locate(&root);
         exclude_state_dir(git.as_ref());
-        let lock =
-            fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(STATE_DIR).join("mount.lock"))?;
+        // One live mount per (history, directory): a second mount of the same
+        // history would ingest every disk change twice, which the CRDT keeps
+        // as two concurrent inserts. Other histories may share the directory;
+        // each sees the other's writes as an ordinary external process.
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(STATE_DIR).join(format!("mount-{}.lock", ws.id())))?;
         // A just-released lock can linger for a moment while a forked child
         // that inherited the descriptor is still exec'ing, so retry briefly.
         let deadline = Instant::now() + Duration::from_millis(500);
         while lock.try_lock().is_err() {
             if Instant::now() >= deadline {
-                return Err(Error::Invalid(format!("{root_key} is already mounted by another process")));
+                return Err(Error::Invalid(format!("{root_key} is already mounted for history {}", ws.id())));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -384,7 +391,9 @@ impl MountState {
 
     fn write_fence_marker(&mut self) -> std::io::Result<String> {
         self.fence_seq += 1;
-        let rel = format!("{STATE_DIR}/fences/{}-{}", std::process::id(), self.fence_seq);
+        // Unique per mount: other mounts of this directory (other histories,
+        // possibly in this process) must not mistake it for their own.
+        let rel = format!("{STATE_DIR}/fences/{}-{}-{}", self.record.history, std::process::id(), self.fence_seq);
         fs::create_dir_all(self.root.join(STATE_DIR).join("fences"))?;
         fs::write(self.root.join(&rel), b"")?;
         Ok(rel)

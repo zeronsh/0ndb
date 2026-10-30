@@ -215,12 +215,21 @@ instead of continuing with partial state.
 0ndb revert <scope-prefix> --agent codex    # selective undo
 0ndb relay --listen 0.0.0.0:7420 --validate # relay server
 0ndb status
+0ndb verify                                 # history matches disk exactly?
 ```
 
-State lives in `<root>/.0ndb/` (excluded from git automatically). Only one
-process may mount a directory at a time. While `0ndb watch` runs, commands
-that need the mount (`run`, `revert`) refuse rather than race it; read-only
-commands read the store.
+State lives in `<root>/.0ndb/` (excluded from git automatically). The
+database defaults to `<root>/.0ndb/0ndb.db`; `--db <path>` or `ONDB_DB` picks
+another, so separate databases can track the same directory side by side (a
+test build next to production, say). Each records the other's writes once, as
+an ordinary external change. A history may be mounted on a directory by only
+one live process at a time: two mounts of the same history would ingest every
+change twice. While `0ndb watch` runs, commands that need the mount (`run`,
+`revert`) refuse rather than race it; read-only commands read the store.
+
+```sh
+ONDB_DB=~/.0ndb-test/0ndb.db 0ndb watch    # alongside a production `0ndb watch`
+```
 
 ## Known limits
 
