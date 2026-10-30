@@ -15,6 +15,7 @@
 //!   attribute a command's disk effects to exactly that command.
 
 mod disk;
+mod git;
 mod ignore;
 mod ingest;
 mod materialize;
@@ -35,7 +36,8 @@ use ondb_store::{MountRecord, Origin};
 use crate::Error;
 use crate::workspace::{ActorKind, Event, Workspace};
 
-pub use disk::{STATE_DIR, TEMP_PREFIX};
+pub use disk::{STATE_DIR, TEMP_PREFIX, smudge};
+use git::GitDirs;
 use ignore::Ignore;
 use shadow::Shadow;
 
@@ -159,7 +161,8 @@ impl Mount {
         let root = fs::canonicalize(root.as_ref())?;
         let root_key = root.to_string_lossy().into_owned();
         fs::create_dir_all(root.join(STATE_DIR).join("fences"))?;
-        exclude_state_dir(&root);
+        let git = GitDirs::locate(&root);
+        exclude_state_dir(git.as_ref());
         let lock =
             fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(STATE_DIR).join("mount.lock"))?;
         // A just-released lock can linger for a moment while a forked child
@@ -183,8 +186,14 @@ impl Mount {
             }
             None => {
                 let actor = ws.actor(&format!("disk:{root_key}"), ActorKind::Ingestion)?;
-                let record =
-                    MountRecord { root: root_key.clone(), history: ws.id(), ingestion_actor: actor, synced_version: ws.heads() };
+                let record = MountRecord {
+                    root: root_key.clone(),
+                    history: ws.id(),
+                    ingestion_actor: actor,
+                    synced_version: ws.heads(),
+                    git_head: None,
+                    git_reflog: None,
+                };
                 ws.with(|c| {
                     let (store, key) = c.store();
                     store.save_mount_record(key, &record)
@@ -198,21 +207,40 @@ impl Mount {
             let _ = fs_tx.send(res);
         })?;
         watcher.watch(&root, RecursiveMode::Recursive)?;
+        // A linked worktree's HEAD lives outside the mount.
+        for (dir, recursive) in git.iter().flat_map(|g| g.external_watches(&root)) {
+            let mode = if recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+            if let Err(e) = watcher.watch(&dir, mode) {
+                tracing::warn!(dir = %dir.display(), "can't watch git dir: {e}");
+            }
+        }
 
         let mut state = MountState {
             ws: ws.clone(),
-            ignore: Ignore::load(&root),
+            ignore: Ignore::load(&root, git.as_ref()),
+            git,
             root: root.clone(),
             opts,
             record,
             shadow,
             git_head: None,
+            git_index: None,
+            index_stamp: None,
+            reflog_pos: 0,
             fence_seq: 0,
             settling: false,
             deferred: BTreeSet::new(),
             _lock: lock,
         };
-        state.git_head = state.read_git_head();
+        // Resume from the HEAD this folder was last reconciled against, so
+        // git work done while unmounted is still recognized as git's.
+        state.git_head = state.record.git_head.clone().or_else(|| state.read_git_head());
+        if state.git_head == state.read_git_head() {
+            state.snapshot_git();
+        }
+        if let Some(pos) = state.record.git_reflog {
+            state.reflog_pos = pos;
+        }
         if adopting {
             state.adopt()?;
         } else {
@@ -266,17 +294,14 @@ impl Drop for Mount {
 }
 
 /// Keeps the state directory out of git without touching tracked files.
-fn exclude_state_dir(root: &Path) {
-    let info = root.join(".git/info");
-    if !root.join(".git").is_dir() {
-        return;
-    }
-    let exclude = info.join("exclude");
+fn exclude_state_dir(git: Option<&GitDirs>) {
+    let Some(git) = git else { return };
+    let exclude = git.exclude();
     let line = format!("/{STATE_DIR}/");
     if fs::read_to_string(&exclude).is_ok_and(|s| s.lines().any(|l| l.trim() == line)) {
         return;
     }
-    let _ = fs::create_dir_all(&info);
+    let _ = fs::create_dir_all(git.common.join("info"));
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&exclude) {
         let _ = writeln!(f, "{line}");
     }
@@ -289,7 +314,13 @@ pub(crate) struct MountState {
     record: MountRecord,
     shadow: Shadow,
     ignore: Ignore,
+    git: Option<GitDirs>,
     git_head: Option<String>,
+    /// The index as of the last pass, to tell which files git just wrote.
+    git_index: Option<git::Index>,
+    index_stamp: Option<(std::time::SystemTime, u64)>,
+    /// HEAD reflog length as of the last pass.
+    reflog_pos: u64,
     fence_seq: u64,
     /// Set during background passes: young files are deferred.
     settling: bool,
@@ -302,6 +333,8 @@ pub(crate) struct MountState {
 impl MountState {
     fn persist(&mut self) -> Result<(), Error> {
         let (upserts, removals) = self.shadow.take_changes();
+        self.record.git_head = self.git_head.clone();
+        self.record.git_reflog = self.git.as_ref().map(|_| self.reflog_pos);
         let record = self.record.clone();
         self.ws.with(|c| {
             let (store, key) = c.store();
@@ -311,26 +344,35 @@ impl MountState {
     }
 
     fn read_git_head(&self) -> Option<String> {
-        let git = self.root.join(".git");
-        let head = fs::read_to_string(git.join("HEAD")).ok()?;
-        let head = head.trim();
-        let Some(reference) = head.strip_prefix("ref: ") else { return Some(head.to_string()) };
-        let commit = fs::read_to_string(git.join(reference)).ok().map(|s| s.trim().to_string()).or_else(|| {
-            fs::read_to_string(git.join("packed-refs"))
-                .ok()?
-                .lines()
-                .find_map(|l| l.strip_suffix(reference).map(|c| c.trim().to_string()))
-        });
-        Some(format!("{reference}@{}", commit.unwrap_or_default()))
+        self.git.as_ref()?.head()
+    }
+
+    /// Records the index and reflog position as the baseline for the next
+    /// pass.
+    fn snapshot_git(&mut self) {
+        let Some(g) = &self.git else { return };
+        self.reflog_pos = g.reflog_len();
+        let stamp = g.index_stamp();
+        if stamp != self.index_stamp || self.git_index.is_none() {
+            self.git_index = git::read_index(&self.root);
+            self.index_stamp = stamp;
+        }
+    }
+
+    /// Like `snapshot_git`, with an index the caller just read.
+    fn adopt_git_index(&mut self, index: Option<git::Index>) {
+        let Some(g) = &self.git else { return };
+        self.reflog_pos = g.reflog_len();
+        self.index_stamp = g.index_stamp();
+        self.git_index = index;
     }
 
     /// Waits (bounded) for git to finish an operation. Returns whether git
     /// is still busy.
     fn settle_git(&self) -> bool {
-        let git = self.root.join(".git");
-        let busy = || ["index.lock", "HEAD.lock"].iter().any(|l| git.join(l).exists());
+        let Some(git) = &self.git else { return false };
         let deadline = Instant::now() + self.opts.git_settle;
-        while busy() {
+        while git.busy() {
             if Instant::now() >= deadline {
                 tracing::warn!(root = %self.root.display(), "git did not settle; reconciling anyway");
                 return true;
@@ -376,16 +418,13 @@ fn absorb(
         *rescan = true;
     }
     for p in &event.paths {
+        if st.git.as_ref().is_some_and(|g| g.signals(p)) {
+            pending.insert(String::new());
+            continue;
+        }
         let Some(rel) = st.rel(p) else { continue };
         if let Some(f) = fences.iter_mut().find(|f| f.marker == rel) {
             f.arrived = true;
-        } else if rel == ".git/HEAD"
-            || rel.starts_with(".git/refs/")
-            || rel == ".git/index.lock"
-            || rel == ".git/HEAD.lock"
-            || rel == ".git/packed-refs"
-        {
-            pending.insert(String::new());
         } else if !disk::is_internal(&rel) {
             pending.insert(rel);
         }

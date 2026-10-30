@@ -133,14 +133,19 @@ A mount binds a workspace to a directory:
 5. **Edit tools.** `write_file/rename/remove(actor, …)` record the change
    under the agent's own actor, then materialize it. The watcher doesn't
    re-ingest it.
-6. **Git checkouts are not edits.** When `HEAD` moves (branch switch, pull,
-   rebase, reset), the mount waits for git's locks to clear, rescans the whole
-   tree in one pass, and records the files git's own diff between the two
-   commits explains as one batch marked `GitCheckout`. Anything else that
-   changed in the same window goes in a separate, ordinary batch. Checkout
-   batches are never credited to an attribution scope, are summarized in
-   change reports as a head move with counts, and are left alone by revert.
-   Files keep their identity across the switch.
+6. **Git's writes are not edits.** Mounts work in plain clones and linked
+   worktrees (whose `HEAD` lives outside the folder). When git writes files
+   (branch switch, pull, rebase, reset, or a merge/cherry-pick/revert paused
+   on conflicts), the mount waits for git's locks to clear, rescans in one
+   pass, and uses git's own records to decide what git wrote. HEAD's reflog
+   tells checkouts from commits, which write nothing. The index tells which
+   files git wrote: their entry changed and the file matches it. Those go in
+   one batch marked `GitCheckout` (or `GitWrite` for a paused operation). A
+   file edited right after git wrote it is split into git's version plus the
+   edit. Everything else stays an ordinary edit. Git batches are never
+   credited to a scope, are summarized in change reports, and are left alone
+   by revert. The last `HEAD` is persisted, so switches made while unmounted
+   are recognized too. `0ndb verify` checks the history against the disk.
 7. **Offline changes.** On restart, edits made while nothing was watching are
    ingested against the persisted synced version. Changes that arrived from
    elsewhere meanwhile are merged and materialized.
@@ -241,3 +246,5 @@ commands read the store.
 The project, repository, binary (`0ndb`) and state directory (`.0ndb/`)
 are called `0ndb`. Cargo package names cannot start with a digit, so the
 crates are `ondb-*`.
+offline
+agent line

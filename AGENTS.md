@@ -40,6 +40,10 @@
   timestamps (subtrees newer than it are pruned from view-relative seeks).
 - Background mount passes defer files younger than `settle`; fences, tool
   writes and shutdown must ingest everything.
-- When git moves `HEAD`, the paths git's own diff explains go in one batch
-  carrying `Op::GitCheckout`; never split a checkout across batches, and
-  never credit checkout batches to scopes.
+- Files git wrote (decided from HEAD's reflog and the index, see
+  `mount/git.rs`) go in one batch carrying `Op::GitCheckout` or
+  `Op::GitWrite`; never split them across batches, never credit them to
+  scopes. Commits move HEAD but write nothing.
+- Real-repo check: `0ndb verify -C <dir>` must report no mismatches after any
+  git operation.
+- Real git end-to-end (clone + linked worktrees, pushes to a scratch repo): `scripts/git-e2e.sh`

@@ -21,8 +21,11 @@ pub struct BatchSummary {
     pub wall_ms: u64,
     pub touched: Arc<[InodeId]>,
     pub meta_keys: Arc<[String]>,
-    /// The batch's file changes came from git moving the checkout.
+    /// The batch's file changes came from git (a checkout, or files git
+    /// wrote mid-operation), not from anyone editing.
     pub git_checkout: bool,
+    /// The in-progress git operation that wrote them, if HEAD didn't move.
+    pub git_operation: Option<String>,
 }
 
 impl BatchSummary {
@@ -41,7 +44,11 @@ impl BatchSummary {
             wall_ms: batch.header.wall_ms,
             touched: batch.touched().into(),
             meta_keys: meta_keys.into(),
-            git_checkout: batch.ops.iter().any(|op| matches!(op, Op::GitCheckout { .. })),
+            git_checkout: batch.ops.iter().any(|op| matches!(op, Op::GitCheckout { .. } | Op::GitWrite { .. })),
+            git_operation: batch.ops.iter().find_map(|op| match op {
+                Op::GitWrite { operation, .. } => Some(operation.clone()),
+                _ => None,
+            }),
         }
     }
 

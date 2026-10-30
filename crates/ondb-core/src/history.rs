@@ -353,6 +353,7 @@ impl State<'_> {
                 }
                 Ok(vec![])
             }
+            Op::GitWrite { .. } => Ok(vec![]),
             Op::Meta { key, value } => {
                 let replace = self.meta.get(key).is_none_or(|(o, _)| *o < id);
                 if replace {

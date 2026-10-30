@@ -311,3 +311,95 @@ fn git_branch_switches_are_not_edits() {
     assert_eq!(text(&ws, "a.txt").as_deref(), Some("main a\n"));
     assert!(inode(&ws, "shared.txt").is_some());
 }
+
+/// What git wrote is told apart from what anyone edited using git's own
+/// records: commits write nothing, an edit right after a switch is still an
+/// edit, a conflicted merge's writes are git's, and a switch made while
+/// unmounted is still recognized as one.
+#[test]
+fn git_writes_are_told_apart_from_edits() {
+    use ondb_core::Op;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let git = |args: &str| sh(&root, &format!("git -c user.name=t -c user.email=t@t {args}"));
+    git("init -q -b main");
+    fs::write(root.join("a.txt"), "main a\n").unwrap();
+    fs::write(root.join("b.txt"), "b\n").unwrap();
+    git("add -A && git -c user.name=t -c user.email=t@t commit -qm main");
+    git("checkout -qb feature");
+    fs::write(root.join("a.txt"), "feature a\n").unwrap();
+    git("commit -qam feature && git checkout -q main");
+
+    let ws = Workspace::open(dir.path().join("0ndb.db"), None).unwrap();
+    let mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    let agent = ws.actor("codex", ActorKind::Agent).unwrap();
+    let recorder = Recorder::new(&ws, vec![mount.handle()]).unwrap();
+    let marked = |id: &ondb_core::BatchId| ws.summary(id).unwrap().git_checkout;
+
+    // Edit + commit in one command: the commit moves HEAD but writes
+    // nothing, so the edit is the agent's.
+    let (_, rec) = recorder
+        .scoped(ScopeKind::Command, "edit and commit", Some(agent), None, |_| {
+            fs::write(root.join("b.txt"), "b by agent\n").unwrap();
+            git("commit -qam agent");
+        })
+        .unwrap();
+    let credited: Vec<_> = rec.batches.iter().filter(|b| !marked(b)).collect();
+    assert_eq!(credited.len(), 1, "the committed edit is credited");
+
+    // Switch, then edit a file the switch wrote, in the same window: git's
+    // version lands in the checkout batch, the edit on top of it is credited.
+    let (_, rec) = recorder
+        .scoped(ScopeKind::Command, "switch and edit", Some(agent), None, |_| {
+            git("checkout -q feature");
+            fs::write(root.join("a.txt"), "feature a\nagent line\n").unwrap();
+        })
+        .unwrap();
+    assert_eq!(text(&ws, "a.txt").as_deref(), Some("feature a\nagent line\n"));
+    let all = ws.batches_missing_from(&Version::root()).unwrap();
+    let checkout = all.iter().rev().find(|b| b.ops.iter().any(|op| matches!(op, Op::GitCheckout { .. }))).unwrap();
+    assert!(!rec.batches.contains(&checkout.id()));
+    assert!(rec.batches.iter().any(|b| !marked(b)), "the edit on top of the switch is credited");
+    recorder.revert(&rec.id, agent, true).unwrap();
+    mount.fence().unwrap();
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "feature a\n", "revert keeps git's version");
+    git("checkout -q -- . && git checkout -q main");
+    mount.fence().unwrap();
+
+    // A conflicted merge: HEAD doesn't move, but the conflict markers are
+    // git's. The resolution is the agent's.
+    git("checkout -qb clash && echo 'clash a' > a.txt && git -c user.name=t -c user.email=t@t commit -qam clash");
+    mount.fence().unwrap();
+    let (_, rec) = recorder
+        .scoped(ScopeKind::Command, "merge", Some(agent), None, |_| {
+            let _ = Command::new("git").args(["merge", "-q", "feature"]).current_dir(&root).output();
+        })
+        .unwrap();
+    assert!(fs::read_to_string(root.join("a.txt")).unwrap().contains("<<<<<<<"));
+    assert!(rec.batches.iter().all(&marked), "conflict markers credited to the agent");
+    let all = ws.batches_missing_from(&Version::root()).unwrap();
+    assert!(all.iter().any(|b| b.ops.iter().any(|op| matches!(op, Op::GitWrite { operation, .. } if operation == "merge"))));
+    let (_, rec) = recorder
+        .scoped(ScopeKind::Command, "resolve", Some(agent), None, |_| {
+            fs::write(root.join("a.txt"), "resolved a\n").unwrap();
+            git("add -A && git -c user.name=t -c user.email=t@t commit -qm merged");
+        })
+        .unwrap();
+    assert!(rec.batches.iter().any(|b| !marked(b)), "the resolution is credited");
+    drop(recorder);
+    mount.stop();
+
+    // While unmounted: a switch plus an unrelated edit.
+    git("checkout -q main");
+    fs::write(root.join("b.txt"), "offline\n").unwrap();
+    let before = ws.heads();
+    let mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    mount.fence().unwrap();
+    let new = ws.batches_missing_from(&before).unwrap();
+    let co: Vec<_> = new.iter().filter(|b| b.ops.iter().any(|op| matches!(op, Op::GitCheckout { .. }))).collect();
+    assert_eq!(co.len(), 1, "offline switch recognized");
+    let b_inode = inode(&ws, "b.txt").unwrap();
+    assert!(!co[0].touched().contains(&b_inode), "the offline edit isn't git's");
+    assert!(new.iter().any(|b| !co.contains(&b) && b.touched().contains(&b_inode)));
+}

@@ -10,26 +10,10 @@ use super::MountState;
 use super::disk::{
     self, Classified, DiskEntry, Stat, abs, classify, is_under, join, name_of, oid_of, parent_of, probe, symlink_oid,
 };
+use super::git;
 use super::ignore::walker;
 use super::shadow::{Entry, Kind, Shadow};
 use crate::Error;
-
-/// Paths that differ between two `ref@commit` heads, per git. `None` when
-/// git can't tell (unknown commits, not a repository): callers then treat
-/// every change as part of the checkout.
-fn git_changed_paths(root: &std::path::Path, from: Option<&str>, to: Option<&str>) -> Option<Vec<String>> {
-    let commit = |h: &str| h.rsplit('@').next().unwrap_or(h).to_string();
-    let (from, to) = (commit(from?), commit(to?));
-    let out = std::process::Command::new("git")
-        .args(["diff", "--name-only", "--no-renames", "-z", &from, &to])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).into_owned()).collect())
-}
 
 pub enum Scope {
     Full,
@@ -40,6 +24,14 @@ enum Found {
     Dir,
     File { bytes: Vec<u8>, exec: bool, stat: Stat },
     Symlink { target: String },
+}
+
+/// Whether git wrote a path in the current window.
+enum Verdict {
+    Git,
+    Edit,
+    /// Git wrote these bytes (and exec bit), then someone edited them.
+    Split(Vec<u8>, bool),
 }
 
 enum Change {
@@ -236,16 +228,29 @@ impl MountState {
         if let Scope::Paths(p) = &scope
             && p.iter().any(|p| name_of(p) == ".gitignore")
         {
-            self.ignore = super::Ignore::load(&self.root);
+            self.ignore = super::Ignore::load(&self.root, self.git.as_ref());
         }
-        // A moved HEAD means git rewrote the checkout. Capture all of it in
-        // this pass (full stat scan, no young-file deferral) so the whole
-        // switch lands in one batch marked as a checkout, never split into
-        // pieces that would look like edits.
+        // Did git write files in this window? A HEAD move whose new reflog
+        // entries are all commits didn't (the files being committed are
+        // someone's edits); any other HEAD move (checkout, pull, reset,
+        // rebase, merge) did, as does a paused merge/cherry-pick/revert/
+        // rebase that rewrote the index. Git's writes are captured in one
+        // full pass (no young-file deferral) so they land in one batch
+        // marked as git's, never split into pieces that look like edits.
         let head = self.read_git_head();
         let head_moved = head != self.git_head;
-        let scope = if head_moved { Scope::Full } else { scope };
-        let defer_young = self.settling && !head_moved;
+        let (operation, git_wrote) = match &self.git {
+            None => (None, false),
+            Some(g) => {
+                let commits_only =
+                    g.reflog_actions(self.reflog_pos).is_some_and(|a| !a.is_empty() && a.iter().all(|x| x.starts_with("commit")));
+                let operation = g.operation();
+                let index_moved = g.index_stamp() != self.index_stamp;
+                (operation, (head_moved && !commits_only) || (operation.is_some() && index_moved))
+            }
+        };
+        let scope = if git_wrote { Scope::Full } else { scope };
+        let defer_young = self.settling && !git_wrote;
         let cands = self.candidates(scope);
         let root = self.root.clone();
 
@@ -346,53 +351,120 @@ impl MountState {
             self.shadow.set_stat(&path, Some(stat));
         }
 
-        if !head_moved {
-            return self.commit_pass(created, removed, changed, None, git_busy);
+        if !git_wrote {
+            // A commit moved HEAD without writing files: note it on its own.
+            let marker = head.clone().filter(|_| head_moved).map(|to| Op::GitCheckout { from: self.git_head.clone(), to });
+            self.git_head = head;
+            self.snapshot_git();
+            let edits = self.commit_pass(created, removed, changed, None, git_busy)?;
+            let moved = match marker {
+                Some(m) => self.commit_pass(BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), Some(m), git_busy)?,
+                None => None,
+            };
+            return Ok(moved.or(edits));
         }
-        // Split what git's own diff between the two commits explains (the
-        // checkout) from anything else that changed in the same window
-        // (someone's real edit), so only the former is marked as git's.
-        let to = head.clone().unwrap_or_default();
-        let explained = git_changed_paths(&self.root, self.git_head.as_deref(), head.as_deref());
+        // Which paths did git write? Those whose index entry changed in this
+        // window (except conflicts being resolved, which are someone's work).
+        // With no baseline index (first pass after remounting), those git's
+        // diff between the two commits names. A written file that no longer
+        // matches its index entry was edited right after: git's version and
+        // the edit are recorded separately. Without git's view at all,
+        // everything is git's.
+        let new_index = git::read_index(&root);
+        let dirty = git::dirty_paths(&root);
+        let written: Option<BTreeSet<String>> = match (&self.git_index, &new_index) {
+            (Some(old), Some(new)) => Some(
+                old.iter()
+                    .filter(|(p, e)| new.get(*p) != Some(e) && !git::unmerged(e))
+                    .map(|(p, _)| p.clone())
+                    .chain(new.keys().filter(|p| !old.contains_key(*p)).cloned())
+                    .collect(),
+            ),
+            _ => git::changed_between(&root, self.git_head.as_deref(), head.as_deref()).map(|v| v.into_iter().collect()),
+        };
+        let verdict = |p: &String, dir: bool| -> Verdict {
+            let Some(w) = &written else { return Verdict::Git };
+            if dir {
+                let under = w.range(format!("{p}/")..).next().is_some_and(|q| is_under(q, p));
+                return if under { Verdict::Git } else { Verdict::Edit };
+            }
+            if !w.contains(p) {
+                return Verdict::Edit;
+            }
+            let entry = new_index.as_ref().and_then(|n| n.get(p));
+            if entry.is_some_and(|e| git::unmerged(e)) || dirty.as_ref().is_none_or(|d| !d.contains(p)) {
+                return Verdict::Git;
+            }
+            match entry.and_then(|e| git::checked_out(&root, p, &e[0])) {
+                Some((bytes, exec)) => Verdict::Split(bytes, exec),
+                None => Verdict::Edit,
+            }
+        };
         let (mut co_created, mut co_removed, mut co_changed) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
-        let in_git = |p: &String| explained.as_ref().is_none_or(|set| set.iter().any(|g| g == p || is_under(g, p)));
+        let mut followups: Vec<(String, Vec<u8>, bool, disk::Stat)> = Vec::new();
         for (p, f) in std::mem::take(&mut created) {
-            if in_git(&p) {
-                co_created.insert(p, f);
-            } else {
-                created.insert(p, f);
+            match (verdict(&p, matches!(f, Found::Dir)), f) {
+                (Verdict::Git, f) => {
+                    co_created.insert(p, f);
+                }
+                (Verdict::Split(git_bytes, git_exec), Found::File { bytes, exec, stat }) => {
+                    followups.push((p.clone(), bytes, exec, stat));
+                    co_created.insert(p, Found::File { bytes: git_bytes, exec: git_exec, stat });
+                }
+                (_, f) => {
+                    created.insert(p, f);
+                }
             }
         }
         for (p, e) in std::mem::take(&mut removed) {
-            if in_git(&p) {
+            if matches!(verdict(&p, e.kind == Kind::Dir), Verdict::Git) {
                 co_removed.insert(p, e);
             } else {
                 removed.insert(p, e);
             }
         }
-        for (p, c) in std::mem::take(&mut changed) {
-            if in_git(&p) {
-                co_changed.insert(p, c);
-            } else {
-                changed.insert(p, c);
+        for (p, (e, c)) in std::mem::take(&mut changed) {
+            match (verdict(&p, false), c) {
+                (Verdict::Git, c) => {
+                    co_changed.insert(p, (e, c));
+                }
+                (Verdict::Split(git_bytes, git_exec), Change::Edit { bytes, exec, stat }) => {
+                    followups.push((p.clone(), bytes, exec, stat));
+                    co_changed.insert(p, (e, Change::Edit { bytes: git_bytes, exec: git_exec, stat }));
+                }
+                (_, c) => {
+                    changed.insert(p, (e, c));
+                }
             }
         }
-        let checkout = self.commit_pass(co_created, co_removed, co_changed, Some(to), git_busy)?;
-        let rest = self.commit_pass(created, removed, changed, None, git_busy)?;
-        Ok(rest.or(checkout))
+        let marker = match &head {
+            Some(to) if head_moved => Some(Op::GitCheckout { from: self.git_head.clone(), to: to.clone() }),
+            _ if co_created.is_empty() && co_removed.is_empty() && co_changed.is_empty() => None,
+            _ => Some(Op::GitWrite { operation: operation.unwrap_or("git").to_string(), head: head.clone() }),
+        };
+        self.git_head = head;
+        self.adopt_git_index(new_index);
+        let by_git = self.commit_pass(co_created, co_removed, co_changed, marker, git_busy)?;
+        for (p, bytes, exec, stat) in followups {
+            if let Some(e) = self.shadow.get(&p).cloned() {
+                changed.insert(p, (e, Change::Edit { bytes, exec, stat }));
+            }
+        }
+        let edits = self.commit_pass(created, removed, changed, None, git_busy)?;
+        Ok(edits.or(by_git))
     }
 
     /// Records one set of disk changes as a batch by the ingestion actor,
-    /// parented on the synced version. `checkout` marks it as git's doing.
+    /// parented on the synced version. `marker` marks it as git's doing.
     fn commit_pass(
         &mut self,
         created: BTreeMap<String, Found>,
         removed: BTreeMap<String, Entry>,
         changed: BTreeMap<String, (Entry, Change)>,
-        checkout: Option<String>,
+        marker: Option<Op>,
         git_busy: bool,
     ) -> Result<Option<BatchId>, Error> {
-        if created.is_empty() && removed.is_empty() && changed.is_empty() && checkout.is_none() {
+        if created.is_empty() && removed.is_empty() && changed.is_empty() && marker.is_none() {
             self.persist()?;
             return Ok(None);
         }
@@ -420,7 +492,6 @@ impl MountState {
         // Moves inside a moved directory ride along with it.
         file_moves.retain(|new, _| !dir_moves.iter().any(|(_, to)| is_under(new, to)));
 
-        let prev_head = self.git_head.clone();
         let ws = self.ws.clone();
         let parents = self.record.synced_version.clone();
         let actor = self.record.ingestion_actor;
@@ -428,8 +499,8 @@ impl MountState {
         let bulk = shadow.is_empty() && removed.is_empty() && ws.read(|h| h.tree().is_empty()) && created.len() > 1;
         let (batch, updates) = ws.commit(actor, Some(parents), |txn| -> Result<Vec<Update>, Error> {
             let mut updates = Vec::new();
-            if let Some(to) = &checkout {
-                txn.push(Op::GitCheckout { from: prev_head.clone(), to: to.clone() })?;
+            if let Some(op) = marker {
+                txn.push(op)?;
             }
             if bulk {
                 import(txn, &created, &mut updates)?;
@@ -450,9 +521,6 @@ impl MountState {
                 }
                 Update::RenameTree(from, to) => self.shadow.rename_tree(&from, &to),
             }
-        }
-        if let Some(to) = checkout {
-            self.git_head = Some(to);
         }
         if let Some(id) = batch {
             // The disk now reflects exactly this batch's causal past.

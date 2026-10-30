@@ -148,6 +148,12 @@ pub enum Op {
         key: String,
         value: Option<Vec<u8>>,
     },
+    /// Marks a batch as files git wrote mid-operation without moving HEAD
+    /// (a merge, cherry-pick, revert or rebase stopped for conflicts).
+    GitWrite {
+        operation: String,
+        head: Option<String>,
+    },
 }
 
 impl Op {
@@ -165,7 +171,7 @@ impl Op {
             | Op::SetMode { inode, .. }
             | Op::SetLineEnding { inode, .. }
             | Op::SetSymlinkTarget { inode, .. } => vec![*inode],
-            Op::Meta { .. } | Op::GitCheckout { .. } => vec![],
+            Op::Meta { .. } | Op::GitCheckout { .. } | Op::GitWrite { .. } => vec![],
         }
     }
 }

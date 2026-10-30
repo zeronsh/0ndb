@@ -91,6 +91,8 @@ enum Cmd {
     },
     /// Summary of the local history.
     Status,
+    /// Checks that the history's current state matches the disk exactly.
+    Verify,
 }
 
 fn find_root(dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -193,6 +195,7 @@ fn describe(h: &History, batch: &Batch) -> Vec<String> {
                 format!("m {}", any_path(h, *inode))
             }
             Op::GitCheckout { to, .. } => format!("H git checkout {to}"),
+            Op::GitWrite { operation, .. } => format!("H git {operation} wrote files"),
             Op::Meta { .. } => continue,
         };
         if seen.insert(line.clone()) {
@@ -390,6 +393,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             mount.stop();
         }
+        Cmd::Verify => {
+            refresh(&ws, &root)?;
+            let problems = verify(&ws, &root)?;
+            for p in &problems {
+                println!("{p}");
+            }
+            let entries = ws.read(|h| h.walk().len());
+            if !problems.is_empty() {
+                println!("{} mismatches across {entries} entries", problems.len());
+                return Ok(ExitCode::from(1));
+            }
+            println!("ok: {entries} entries match disk");
+        }
         Cmd::Status => {
             refresh(&ws, &root)?;
             let (heads, batches, entries) = ws.read(|h| (h.heads().clone(), h.dag().len(), h.walk().len()));
@@ -406,4 +422,73 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Every difference between the current history state and the disk: content,
+/// mode, symlink targets, and (in git checkouts) unignored files the history
+/// doesn't know about.
+fn verify(ws: &Workspace, root: &Path) -> Result<Vec<String>> {
+    use ondb_core::{FileMode, FileState};
+    use std::os::unix::fs::PermissionsExt;
+    let entries = ws.read(|h| {
+        let view = h.current();
+        h.walk()
+            .into_iter()
+            .map(|(path, id)| {
+                let file = h.file_state(&view, &id);
+                let link = h.symlink_target(&view, &id);
+                (path, file, link)
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut problems = Vec::new();
+    let mut known = HashSet::new();
+    for (path, file, link) in entries {
+        let abs = root.join(&path);
+        let meta = std::fs::symlink_metadata(&abs);
+        known.insert(path.clone());
+        match (file, link, meta) {
+            (_, _, Err(_)) => problems.push(format!("missing   {path}")),
+            (Some(state), _, Ok(meta)) => {
+                let (expected, mode) = match state {
+                    FileState::Text { bytes, ending, mode } => (ondb::mount::smudge(&bytes, ending), mode),
+                    FileState::Binary { blob, mode } => match ws.blob(&blob.oid)? {
+                        Some(b) => (b, mode),
+                        None => {
+                            problems.push(format!("no blob   {path}"));
+                            continue;
+                        }
+                    },
+                };
+                if !meta.is_file() {
+                    problems.push(format!("not file  {path}"));
+                } else if std::fs::read(&abs)? != expected {
+                    problems.push(format!("content   {path}"));
+                } else if (meta.permissions().mode() & 0o111 != 0) != (mode == FileMode::Executable) {
+                    problems.push(format!("mode      {path}"));
+                }
+            }
+            (None, Some(target), Ok(_)) => {
+                if std::fs::read_link(&abs).ok().map(|t| t.to_string_lossy().into_owned()) != Some(target) {
+                    problems.push(format!("symlink   {path}"));
+                }
+            }
+            (None, None, Ok(meta)) if !meta.is_dir() => problems.push(format!("not dir   {path}")),
+            _ => {}
+        }
+    }
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .current_dir(root)
+        .output()?;
+    if listed.status.success() {
+        for p in listed.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let p = String::from_utf8_lossy(p).into_owned();
+            if !known.contains(&p) && !p.starts_with(".0ndb/") && root.join(&p).exists() {
+                problems.push(format!("untracked {p}"));
+            }
+        }
+    }
+    problems.sort();
+    Ok(problems)
 }

@@ -4,9 +4,10 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{Match, WalkBuilder};
 
 use super::disk::{self, STATE_DIR};
+use super::git::GitDirs;
 
 /// Gitignore rules for a root: every `.gitignore` (deeper files win) plus
-/// `.git/info/exclude`. Entries already tracked stay tracked even if a rule
+/// git's `info/exclude`. Entries already tracked stay tracked even if a rule
 /// later ignores them, matching git's behavior.
 pub struct Ignore {
     root: PathBuf,
@@ -15,10 +16,11 @@ pub struct Ignore {
 }
 
 impl Ignore {
-    pub fn load(root: &Path) -> Ignore {
+    pub fn load(root: &Path, git: Option<&GitDirs>) -> Ignore {
         let mut rules = Vec::new();
-        let exclude = root.join(".git/info/exclude");
-        if exclude.is_file() {
+        if let Some(exclude) = git.map(GitDirs::exclude)
+            && exclude.is_file()
+        {
             let mut b = GitignoreBuilder::new(root);
             b.add(exclude);
             if let Ok(g) = b.build() {

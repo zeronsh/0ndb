@@ -64,6 +64,8 @@ pub enum FileChange {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeadMove {
     pub to: String,
+    /// Set when the files came from a git operation still in progress.
+    pub operation: Option<String>,
     pub edited: usize,
     pub created: usize,
     pub removed: usize,
@@ -91,8 +93,12 @@ impl ChangeReport {
         if let Some(h) = &self.git_head {
             let _ = writeln!(
                 out,
-                "<head-moved to=\"{}\" edited=\"{}\" created=\"{}\" removed=\"{}\"/>",
-                h.to, h.edited, h.created, h.removed
+                "<head-moved to=\"{}\"{} edited=\"{}\" created=\"{}\" removed=\"{}\"/>",
+                h.to,
+                h.operation.as_ref().map(|o| format!(" operation=\"{o}\"")).unwrap_or_default(),
+                h.edited,
+                h.created,
+                h.removed
             );
         }
         let mut lists: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -136,10 +142,12 @@ pub fn foreign_changes(ws: &Workspace, since: &Version, agent: ActorId) -> Resul
         let diff = ctx.history().dag().difference(&heads, &known);
         let mut foreign = HashSet::new();
         let mut checkouts = HashSet::new();
+        let mut operation = None;
         for id in &diff {
             let s = ctx.summary(id)?;
             if s.git_checkout {
                 checkouts.insert(*id);
+                operation = operation.or(s.git_operation.clone());
             } else if s.actor != agent && !own.contains(id) && !s.is_annotation_only() {
                 foreign.insert(*id);
             }
@@ -187,6 +195,7 @@ pub fn foreign_changes(ws: &Workspace, since: &Version, agent: ActorId) -> Resul
         } else {
             let before = h.excluding(&checkouts);
             let mut m = HeadMove {
+                operation,
                 to: h.meta(ondb_core::GIT_HEAD_KEY).map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default(),
                 ..Default::default()
             };

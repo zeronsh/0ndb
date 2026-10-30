@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS mounts (
     history_key INTEGER NOT NULL,
     ingestion_actor BLOB NOT NULL,
     synced_version TEXT NOT NULL,
+    git_head TEXT,
+    git_reflog INTEGER,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL
 );
@@ -120,7 +122,7 @@ CREATE TABLE IF NOT EXISTS mount_entries (
 CREATE TABLE IF NOT EXISTS local_kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 "#;
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HistoryKey(i64);
@@ -139,6 +141,10 @@ pub struct MountRecord {
     pub history: HistoryId,
     pub ingestion_actor: ActorId,
     pub synced_version: Version,
+    /// Git HEAD (`ref@commit`) the disk was last reconciled against.
+    pub git_head: Option<String>,
+    /// Length of HEAD's reflog at that point.
+    pub git_reflog: Option<u64>,
 }
 
 /// Cached stat/content identity of one materialized path.
@@ -353,6 +359,13 @@ impl Store {
                 conn.execute("INSERT INTO store_meta (key, value) VALUES ('schema_version', ?1)", [SCHEMA_VERSION])?;
             }
             Some(SCHEMA_VERSION) => {}
+            Some("2") => {
+                conn.execute_batch(
+                    "ALTER TABLE mounts ADD COLUMN git_head TEXT;
+                     ALTER TABLE mounts ADD COLUMN git_reflog INTEGER;
+                     UPDATE store_meta SET value = '3' WHERE key = 'schema_version';",
+                )?;
+            }
             Some(other) => return Err(StoreError::Corrupt(format!("unsupported schema version {other}"))),
         }
         Ok(Store { conn, reopen, actors: HashMap::new(), ordinals: HashMap::new() })
@@ -666,13 +679,16 @@ impl Store {
     // ----- mounts ----------------------------------------------------------
 
     pub fn mount_record(&mut self, root: &str) -> Result<Option<MountRecord>> {
-        let row: Option<(i64, Vec<u8>, String)> = self
+        type Row = (i64, Vec<u8>, String, Option<String>, Option<i64>);
+        let row: Option<Row> = self
             .conn
-            .query_row("SELECT history_key, ingestion_actor, synced_version FROM mounts WHERE root = ?1", [root], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
+            .query_row(
+                "SELECT history_key, ingestion_actor, synced_version, git_head, git_reflog FROM mounts WHERE root = ?1",
+                [root],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
             .optional()?;
-        let Some((hk, actor, synced)) = row else { return Ok(None) };
+        let Some((hk, actor, synced, git_head, git_reflog)) = row else { return Ok(None) };
         let key = HistoryKey(hk);
         let uuid: Vec<u8> =
             self.conn.query_row("SELECT history_uuid FROM histories WHERE history_key = ?1", [hk], |r| r.get(0))?;
@@ -681,6 +697,8 @@ impl Store {
             history: HistoryId(uuid_from(&uuid)?),
             ingestion_actor: ActorId(uuid_from(&actor)?),
             synced_version: self.decode_version(key, &synced)?,
+            git_head,
+            git_reflog: git_reflog.map(|n| n as u64),
         }))
     }
 
@@ -688,10 +706,19 @@ impl Store {
         let synced = self.encode_version(key, &record.synced_version)?;
         let now = ondb_core::now_ms() as i64;
         self.conn.execute(
-            "INSERT INTO mounts (root, history_key, ingestion_actor, synced_version, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-             ON CONFLICT (root) DO UPDATE SET synced_version = excluded.synced_version, updated_ms = excluded.updated_ms",
-            params![record.root, key.0, uuid_bytes(&record.ingestion_actor.0), synced, now],
+            "INSERT INTO mounts (root, history_key, ingestion_actor, synced_version, git_head, git_reflog, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT (root) DO UPDATE SET synced_version = excluded.synced_version, git_head = excluded.git_head,
+               git_reflog = excluded.git_reflog, updated_ms = excluded.updated_ms",
+            params![
+                record.root,
+                key.0,
+                uuid_bytes(&record.ingestion_actor.0),
+                synced,
+                record.git_head,
+                record.git_reflog.map(|n| n as i64),
+                now
+            ],
         )?;
         Ok(())
     }
@@ -758,8 +785,8 @@ impl Store {
             )?;
         }
         tx.execute(
-            "UPDATE mounts SET synced_version = ?2, updated_ms = ?3 WHERE root = ?1",
-            params![record.root, synced, ondb_core::now_ms() as i64],
+            "UPDATE mounts SET synced_version = ?2, git_head = ?3, git_reflog = ?4, updated_ms = ?5 WHERE root = ?1",
+            params![record.root, synced, record.git_head, record.git_reflog.map(|n| n as i64), ondb_core::now_ms() as i64],
         )?;
         tx.commit()?;
         Ok(())
