@@ -192,7 +192,7 @@ fn describe(h: &History, batch: &Batch) -> Vec<String> {
             Op::SetMode { inode, .. } | Op::SetLineEnding { inode, .. } | Op::SetSymlinkTarget { inode, .. } => {
                 format!("m {}", any_path(h, *inode))
             }
-            Op::Meta { key, .. } if key == "git/head" => "H git HEAD moved".to_string(),
+            Op::GitCheckout { to, .. } => format!("H git checkout {to}"),
             Op::Meta { .. } => continue,
         };
         if seen.insert(line.clone()) {

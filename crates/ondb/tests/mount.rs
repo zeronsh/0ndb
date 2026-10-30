@@ -246,3 +246,68 @@ fn transient_temp_files_are_not_recorded() {
         .any(|op| matches!(op, ondb_core::Op::CreateFile { name, .. } if name.starts_with(".!123!")));
     assert!(!created_temp, "temp file was recorded");
 }
+
+/// `git checkout` rewrites files, but it is git moving the checkout, not an
+/// edit: one batch marked as a checkout, never credited to the scope that
+/// ran it, summarized (not diffed) in reports, and untouched by revert.
+#[test]
+fn git_branch_switches_are_not_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let git = |args: &str| sh(&root, &format!("git -c user.name=t -c user.email=t@t {args}"));
+    git("init -q -b main");
+    fs::write(root.join("a.txt"), "main a\n").unwrap();
+    fs::write(root.join("shared.txt"), (0..200).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+    git("add -A && git -c user.name=t -c user.email=t@t commit -qm main");
+    git("checkout -qb feature");
+    fs::write(root.join("a.txt"), "feature a\n").unwrap();
+    fs::write(root.join("only-feature.txt"), "f\n").unwrap();
+    fs::remove_file(root.join("shared.txt")).unwrap();
+    git("add -A && git -c user.name=t -c user.email=t@t commit -qm feature");
+    git("checkout -q main");
+
+    let ws = Workspace::open(dir.path().join("0ndb.db"), None).unwrap();
+    let mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    let agent = ws.actor("codex", ActorKind::Agent).unwrap();
+    let recorder = Recorder::new(&ws, vec![mount.handle()]).unwrap();
+    let a_inode = inode(&ws, "a.txt").unwrap();
+
+    let (_, record) = recorder
+        .scoped(ScopeKind::Command, "git checkout feature", Some(agent), None, |_| {
+            git("checkout -q feature");
+            fs::write(root.join("note.md"), "agent note\n").unwrap();
+        })
+        .unwrap();
+    assert_eq!(text(&ws, "a.txt").as_deref(), Some("feature a\n"));
+    assert!(inode(&ws, "shared.txt").is_none());
+    assert_eq!(inode(&ws, "a.txt"), Some(a_inode), "files keep identity across a checkout");
+
+    // The checkout batch exists, is marked, and is not credited to the scope.
+    let all = ws.batches_missing_from(&Version::root()).unwrap();
+    let checkouts: Vec<_> =
+        all.iter().filter(|b| b.ops.iter().any(|op| matches!(op, ondb_core::Op::GitCheckout { .. }))).collect();
+    assert_eq!(checkouts.len(), 1, "one checkout batch, not split into edits");
+    assert!(!record.batches.contains(&checkouts[0].id()), "checkout credited to the scope");
+    assert!(!record.batches.is_empty(), "the agent's real edit is still credited");
+
+    // Reports summarize the switch instead of diffing every file.
+    let user = ws.actor("someone-else", ActorKind::Agent).unwrap();
+    let report = foreign_changes(&ws, &record.start_version, user).unwrap();
+    let head = report.git_head.as_ref().expect("head move reported");
+    assert!(head.to.starts_with("refs/heads/feature@"), "{head:?}");
+    assert_eq!((head.edited, head.created, head.removed), (1, 1, 1));
+    assert!(report.changes.iter().all(|c| !matches!(c, FileChange::Edited { path, .. } if path == "a.txt")));
+
+    // Reverting the scope undoes the agent's edit, not the branch switch.
+    recorder.revert(&record.id, agent, true).unwrap();
+    mount.fence().unwrap();
+    assert!(!root.join("note.md").exists());
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "feature a\n");
+
+    // Switching back is another checkout, also not an edit.
+    git("checkout -q main");
+    mount.fence().unwrap();
+    assert_eq!(text(&ws, "a.txt").as_deref(), Some("main a\n"));
+    assert!(inode(&ws, "shared.txt").is_some());
+}

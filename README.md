@@ -133,7 +133,15 @@ A mount binds a workspace to a directory:
 5. **Edit tools.** `write_file/rename/remove(actor, …)` record the change
    under the agent's own actor, then materialize it. The watcher doesn't
    re-ingest it.
-6. **Offline changes.** On restart, edits made while nothing was watching are
+6. **Git checkouts are not edits.** When `HEAD` moves (branch switch, pull,
+   rebase, reset), the mount waits for git's locks to clear, rescans the whole
+   tree in one pass, and records the files git's own diff between the two
+   commits explains as one batch marked `GitCheckout`. Anything else that
+   changed in the same window goes in a separate, ordinary batch. Checkout
+   batches are never credited to an attribution scope, are summarized in
+   change reports as a head move with counts, and are left alone by revert.
+   Files keep their identity across the switch.
+7. **Offline changes.** On restart, edits made while nothing was watching are
    ingested against the persisted synced version. Changes that arrived from
    elsewhere meanwhile are merged and materialized.
 

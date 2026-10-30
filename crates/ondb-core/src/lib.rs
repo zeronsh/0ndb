@@ -16,7 +16,7 @@ pub mod version;
 pub use contents::{BlobSource, Contents, INLINE_TEXT_MAX, Insertion, InsertionKey};
 pub use dag::{BatchHeader, Dag, DagError};
 pub use history::{
-    ApplyError, Dirty, FileState, History, HistoryView, IntegrateError, Integrated, MetaEntry, Status, Txn, now_ms,
+    ApplyError, Dirty, FileState, GIT_HEAD_KEY, History, HistoryView, IntegrateError, Integrated, MetaEntry, Status, Txn, now_ms,
 };
 pub use id::{ActorId, BatchId, HistoryId, InodeId, Lamport, Oid, OpId};
 pub use op::{Batch, Blob, BlobRef, Content, FileMode, ImportEntry, ImportNode, ImportParent, LineEnding, Op, Splice};

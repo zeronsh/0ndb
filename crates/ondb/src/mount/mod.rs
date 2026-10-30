@@ -327,9 +327,10 @@ impl MountState {
     /// Waits (bounded) for git to finish an operation. Returns whether git
     /// is still busy.
     fn settle_git(&self) -> bool {
-        let lock = self.root.join(".git/index.lock");
+        let git = self.root.join(".git");
+        let busy = || ["index.lock", "HEAD.lock"].iter().any(|l| git.join(l).exists());
         let deadline = Instant::now() + self.opts.git_settle;
-        while lock.exists() {
+        while busy() {
             if Instant::now() >= deadline {
                 tracing::warn!(root = %self.root.display(), "git did not settle; reconciling anyway");
                 return true;
@@ -378,7 +379,12 @@ fn absorb(
         let Some(rel) = st.rel(p) else { continue };
         if let Some(f) = fences.iter_mut().find(|f| f.marker == rel) {
             f.arrived = true;
-        } else if rel == ".git/HEAD" || rel.starts_with(".git/refs/") || rel == ".git/index.lock" {
+        } else if rel == ".git/HEAD"
+            || rel.starts_with(".git/refs/")
+            || rel == ".git/index.lock"
+            || rel == ".git/HEAD.lock"
+            || rel == ".git/packed-refs"
+        {
             pending.insert(String::new());
         } else if !disk::is_internal(&rel) {
             pending.insert(rel);

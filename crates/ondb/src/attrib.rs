@@ -136,9 +136,13 @@ impl Recorder {
         let settled = self.fence_all()?;
         let Scope { mut record, events, credit } = scope;
         for ev in events.try_iter() {
+            // A branch switch inside a scope is git's doing, not the
+            // scope's edit: crediting it would make blame and revert treat
+            // the whole checkout as the agent's work.
             if let Event::Committed(c) = ev
                 && c.origin == Origin::Local
                 && credit.contains(&c.actor)
+                && !self.ws.summary(&c.batch).is_ok_and(|s| s.git_checkout)
             {
                 record.batches.push(c.batch);
             }

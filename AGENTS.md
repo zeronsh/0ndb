@@ -40,3 +40,6 @@
   timestamps (subtrees newer than it are pruned from view-relative seeks).
 - Background mount passes defer files younger than `settle`; fences, tool
   writes and shutdown must ingest everything.
+- When git moves `HEAD`, the paths git's own diff explains go in one batch
+  carrying `Op::GitCheckout`; never split a checkout across batches, and
+  never credit checkout batches to scopes.

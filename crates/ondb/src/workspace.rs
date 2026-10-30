@@ -21,6 +21,8 @@ pub struct BatchSummary {
     pub wall_ms: u64,
     pub touched: Arc<[InodeId]>,
     pub meta_keys: Arc<[String]>,
+    /// The batch's file changes came from git moving the checkout.
+    pub git_checkout: bool,
 }
 
 impl BatchSummary {
@@ -39,6 +41,7 @@ impl BatchSummary {
             wall_ms: batch.header.wall_ms,
             touched: batch.touched().into(),
             meta_keys: meta_keys.into(),
+            git_checkout: batch.ops.iter().any(|op| matches!(op, Op::GitCheckout { .. })),
         }
     }
 

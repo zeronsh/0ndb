@@ -145,6 +145,9 @@ impl Dirty {
 
 pub type MetaEntry = (OpId, Option<Vec<u8>>);
 
+/// Meta key holding the checkout's current git HEAD (`ref@commit`).
+pub const GIT_HEAD_KEY: &str = "git/head";
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
@@ -341,6 +344,14 @@ impl State<'_> {
                     _ => return Err(ApplyError::NotASymlink(*inode)),
                 }
                 Ok(vec![*inode])
+            }
+            Op::GitCheckout { to, .. } => {
+                let key = GIT_HEAD_KEY.to_string();
+                if self.meta.get(&key).is_none_or(|(o, _)| *o < id) {
+                    self.meta.insert(key.clone(), (id, Some(to.as_bytes().to_vec())));
+                    self.dirty.meta.insert(key);
+                }
+                Ok(vec![])
             }
             Op::Meta { key, value } => {
                 let replace = self.meta.get(key).is_none_or(|(o, _)| *o < id);

@@ -62,12 +62,21 @@ pub enum FileChange {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeadMove {
+    pub to: String,
+    pub edited: usize,
+    pub created: usize,
+    pub removed: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChangeReport {
     pub since: Version,
     pub until: Version,
     pub batches: Vec<BatchId>,
     pub changes: Vec<FileChange>,
-    pub git_head: Option<String>,
+    /// Git moved the checkout: summarized, never listed as file edits.
+    pub git_head: Option<HeadMove>,
 }
 
 impl ChangeReport {
@@ -80,7 +89,11 @@ impl ChangeReport {
         let mut out = String::new();
         let _ = writeln!(out, "<workspace-changes worktree=\"{worktree}\">");
         if let Some(h) = &self.git_head {
-            let _ = writeln!(out, "<head-moved to=\"{h}\"/>");
+            let _ = writeln!(
+                out,
+                "<head-moved to=\"{}\" edited=\"{}\" created=\"{}\" removed=\"{}\"/>",
+                h.to, h.edited, h.created, h.removed
+            );
         }
         let mut lists: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for c in &self.changes {
@@ -122,19 +135,16 @@ pub fn foreign_changes(ws: &Workspace, since: &Version, agent: ActorId) -> Resul
         let known: Version = since.heads().filter(|b| ctx.history().dag().contains_batch_id(b)).copied().collect();
         let diff = ctx.history().dag().difference(&heads, &known);
         let mut foreign = HashSet::new();
-        let mut git_head = None;
+        let mut checkouts = HashSet::new();
         for id in &diff {
             let s = ctx.summary(id)?;
-            if s.actor == agent || own.contains(id) {
-                continue;
-            }
-            if s.meta_keys.iter().any(|k| k == "git/head") {
-                git_head = Some(());
-            }
-            if !s.is_annotation_only() {
+            if s.git_checkout {
+                checkouts.insert(*id);
+            } else if s.actor != agent && !own.contains(id) && !s.is_annotation_only() {
                 foreign.insert(*id);
             }
         }
+        let checkout_touched: Vec<InodeId> = ctx.touched_by(checkouts.iter().copied())?.into_iter().collect();
         let touched: Vec<InodeId> = {
             let mut t: Vec<InodeId> = ctx.touched_by(foreign.iter().copied())?.into_iter().collect();
             t.sort();
@@ -172,7 +182,27 @@ pub fn foreign_changes(ws: &Workspace, since: &Version, agent: ActorId) -> Resul
                 _ => {}
             }
         }
-        let git_head = git_head.and_then(|_| h.meta("git/head").map(|v| String::from_utf8_lossy(v).into_owned()));
+        let git_head = if checkouts.is_empty() {
+            None
+        } else {
+            let before = h.excluding(&checkouts);
+            let mut m = HeadMove {
+                to: h.meta(ondb_core::GIT_HEAD_KEY).map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default(),
+                ..Default::default()
+            };
+            for inode in &checkout_touched {
+                if h.inode(inode).is_none_or(|n| n.is_dir()) {
+                    continue;
+                }
+                match (tree.is_present(&before, inode), tree.is_present(&now, inode)) {
+                    (false, true) => m.created += 1,
+                    (true, false) => m.removed += 1,
+                    (true, true) if h.file_state(&before, inode) != h.file_state(&now, inode) => m.edited += 1,
+                    _ => {}
+                }
+            }
+            Some(m)
+        };
         let mut batches: Vec<BatchId> = foreign.into_iter().collect();
         batches.sort();
         Ok(ChangeReport { since: known, until: heads, batches, changes, git_head })

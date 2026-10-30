@@ -14,6 +14,23 @@ use super::ignore::walker;
 use super::shadow::{Entry, Kind, Shadow};
 use crate::Error;
 
+/// Paths that differ between two `ref@commit` heads, per git. `None` when
+/// git can't tell (unknown commits, not a repository): callers then treat
+/// every change as part of the checkout.
+fn git_changed_paths(root: &std::path::Path, from: Option<&str>, to: Option<&str>) -> Option<Vec<String>> {
+    let commit = |h: &str| h.rsplit('@').next().unwrap_or(h).to_string();
+    let (from, to) = (commit(from?), commit(to?));
+    let out = std::process::Command::new("git")
+        .args(["diff", "--name-only", "--no-renames", "-z", &from, &to])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).into_owned()).collect())
+}
+
 pub enum Scope {
     Full,
     Paths(BTreeSet<String>),
@@ -221,6 +238,14 @@ impl MountState {
         {
             self.ignore = super::Ignore::load(&self.root);
         }
+        // A moved HEAD means git rewrote the checkout. Capture all of it in
+        // this pass (full stat scan, no young-file deferral) so the whole
+        // switch lands in one batch marked as a checkout, never split into
+        // pieces that would look like edits.
+        let head = self.read_git_head();
+        let head_moved = head != self.git_head;
+        let scope = if head_moved { Scope::Full } else { scope };
+        let defer_young = self.settling && !head_moved;
         let cands = self.candidates(scope);
         let root = self.root.clone();
 
@@ -233,7 +258,7 @@ impl MountState {
             .as_nanos() as i64;
         for path in &cands {
             let disk_entry = probe(&root, path);
-            if self.settling
+            if defer_young
                 && let DiskEntry::File { stat, .. } = &disk_entry
                 && stat.mtime_ns > young_before
             {
@@ -321,13 +346,56 @@ impl MountState {
             self.shadow.set_stat(&path, Some(stat));
         }
 
-        let head = self.read_git_head();
-        let head_moved = head != self.git_head;
-        if created.is_empty() && removed.is_empty() && changed.is_empty() && !head_moved {
+        if !head_moved {
+            return self.commit_pass(created, removed, changed, None, git_busy);
+        }
+        // Split what git's own diff between the two commits explains (the
+        // checkout) from anything else that changed in the same window
+        // (someone's real edit), so only the former is marked as git's.
+        let to = head.clone().unwrap_or_default();
+        let explained = git_changed_paths(&self.root, self.git_head.as_deref(), head.as_deref());
+        let (mut co_created, mut co_removed, mut co_changed) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let in_git = |p: &String| explained.as_ref().is_none_or(|set| set.iter().any(|g| g == p || is_under(g, p)));
+        for (p, f) in std::mem::take(&mut created) {
+            if in_git(&p) {
+                co_created.insert(p, f);
+            } else {
+                created.insert(p, f);
+            }
+        }
+        for (p, e) in std::mem::take(&mut removed) {
+            if in_git(&p) {
+                co_removed.insert(p, e);
+            } else {
+                removed.insert(p, e);
+            }
+        }
+        for (p, c) in std::mem::take(&mut changed) {
+            if in_git(&p) {
+                co_changed.insert(p, c);
+            } else {
+                changed.insert(p, c);
+            }
+        }
+        let checkout = self.commit_pass(co_created, co_removed, co_changed, Some(to), git_busy)?;
+        let rest = self.commit_pass(created, removed, changed, None, git_busy)?;
+        Ok(rest.or(checkout))
+    }
+
+    /// Records one set of disk changes as a batch by the ingestion actor,
+    /// parented on the synced version. `checkout` marks it as git's doing.
+    fn commit_pass(
+        &mut self,
+        created: BTreeMap<String, Found>,
+        removed: BTreeMap<String, Entry>,
+        changed: BTreeMap<String, (Entry, Change)>,
+        checkout: Option<String>,
+        git_busy: bool,
+    ) -> Result<Option<BatchId>, Error> {
+        if created.is_empty() && removed.is_empty() && changed.is_empty() && checkout.is_none() {
             self.persist()?;
             return Ok(None);
         }
-
         // Renames: a removed file whose exact bytes reappear elsewhere keeps
         // its inode (and so its history, anchors and attribution).
         let mut by_oid: HashMap<ondb_core::Oid, Vec<String>> = HashMap::new();
@@ -352,6 +420,7 @@ impl MountState {
         // Moves inside a moved directory ride along with it.
         file_moves.retain(|new, _| !dir_moves.iter().any(|(_, to)| is_under(new, to)));
 
+        let prev_head = self.git_head.clone();
         let ws = self.ws.clone();
         let parents = self.record.synced_version.clone();
         let actor = self.record.ingestion_actor;
@@ -359,14 +428,15 @@ impl MountState {
         let bulk = shadow.is_empty() && removed.is_empty() && ws.read(|h| h.tree().is_empty()) && created.len() > 1;
         let (batch, updates) = ws.commit(actor, Some(parents), |txn| -> Result<Vec<Update>, Error> {
             let mut updates = Vec::new();
+            if let Some(to) = &checkout {
+                txn.push(Op::GitCheckout { from: prev_head.clone(), to: to.clone() })?;
+            }
             if bulk {
                 import(txn, &created, &mut updates)?;
             } else {
                 apply_changes(txn, shadow, &created, &removed, &changed, &file_moves, &dir_moves, &mut updates)?;
             }
-            if head_moved && let Some(h) = &head {
-                txn.push(Op::Meta { key: "git/head".into(), value: Some(h.as_bytes().to_vec()) })?;
-            }
+
             Ok(updates)
         })?;
         for u in updates {
@@ -381,7 +451,9 @@ impl MountState {
                 Update::RenameTree(from, to) => self.shadow.rename_tree(&from, &to),
             }
         }
-        self.git_head = head;
+        if let Some(to) = checkout {
+            self.git_head = Some(to);
+        }
         if let Some(id) = batch {
             // The disk now reflects exactly this batch's causal past.
             self.record.synced_version = Version::single(id);

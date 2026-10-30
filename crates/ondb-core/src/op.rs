@@ -135,6 +135,13 @@ pub enum Op {
         inode: InodeId,
         target: String,
     },
+    /// Marks a batch as git moving the checkout (branch switch, pull,
+    /// rebase, reset): the batch's file changes came from git, not from
+    /// anyone editing. `to` is `ref@commit` (or a bare commit when detached).
+    GitCheckout {
+        from: Option<String>,
+        to: String,
+    },
     /// Last-writer-wins key/value annotation (actor registry, attribution
     /// records, report cursors). `None` deletes.
     Meta {
@@ -158,7 +165,7 @@ impl Op {
             | Op::SetMode { inode, .. }
             | Op::SetLineEnding { inode, .. }
             | Op::SetSymlinkTarget { inode, .. } => vec![*inode],
-            Op::Meta { .. } => vec![],
+            Op::Meta { .. } | Op::GitCheckout { .. } => vec![],
         }
     }
 }
