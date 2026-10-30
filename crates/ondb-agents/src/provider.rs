@@ -81,10 +81,18 @@ pub enum EventKind {
     SessionStarted {
         native_id: String,
     },
+    /// A complete text block of the reply.
     Text {
         text: String,
     },
+    /// Streamed text ahead of the complete block (the block is authoritative).
+    TextDelta {
+        text: String,
+    },
     Reasoning {
+        text: String,
+    },
+    ReasoningDelta {
         text: String,
     },
     ToolStarted {
@@ -120,7 +128,9 @@ impl EventKind {
         match self {
             EventKind::SessionStarted { .. } => "session_started",
             EventKind::Text { .. } => "text",
+            EventKind::TextDelta { .. } => "text_delta",
             EventKind::Reasoning { .. } => "reasoning",
+            EventKind::ReasoningDelta { .. } => "reasoning_delta",
             EventKind::ToolStarted { .. } => "tool_started",
             EventKind::ToolFinished { .. } => "tool_finished",
             EventKind::Usage { .. } => "usage",

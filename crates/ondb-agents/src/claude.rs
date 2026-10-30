@@ -57,19 +57,27 @@ impl Provider for ClaudeCode {
 
     fn start(&self, req: StartRequest) -> Result<Box<dyn Run>, Error> {
         let mut cmd = Command::new(&self.program);
-        cmd.args(["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
-            .args([
-                "--permission-mode",
-                match self.access {
-                    Access::Plan => "plan",
-                    Access::AcceptEdits => "acceptEdits",
-                    Access::Full => "bypassPermissions",
-                },
-            ])
-            .current_dir(&req.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ])
+        .args([
+            "--permission-mode",
+            match self.access {
+                Access::Plan => "plan",
+                Access::AcceptEdits => "acceptEdits",
+                Access::Full => "bypassPermissions",
+            },
+        ])
+        .current_dir(&req.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         if let Some(m) = &req.model {
             cmd.args(["--model", m]);
         }
@@ -210,10 +218,25 @@ pub fn parse_line(line: &[u8]) -> Vec<Event> {
     let Ok(v) = serde_json::from_slice::<Value>(line) else {
         return vec![Event { kind: EventKind::Other { kind: "unparsed".into() }, raw, native_message: None }];
     };
-    let native = v["uuid"].as_str().map(str::to_string);
     let ty = v["type"].as_str().unwrap_or("");
+    // Only transcript messages are fork points (`--resume-session-at`);
+    // results, partial-message and system events carry other ids.
+    let native = matches!(ty, "assistant" | "user").then(|| v["uuid"].as_str().map(str::to_string)).flatten();
     let mut kinds = Vec::new();
     match ty {
+        "stream_event" => {
+            let e = &v["event"];
+            match (e["type"].as_str(), e["delta"]["type"].as_str()) {
+                (Some("content_block_delta"), Some("text_delta")) => {
+                    kinds.push(EventKind::TextDelta { text: e["delta"]["text"].as_str().unwrap_or("").to_string() })
+                }
+                (Some("content_block_delta"), Some("thinking_delta")) => {
+                    kinds.push(EventKind::ReasoningDelta { text: e["delta"]["thinking"].as_str().unwrap_or("").to_string() })
+                }
+                (Some(t), _) => kinds.push(EventKind::Other { kind: format!("stream/{t}") }),
+                _ => {}
+            }
+        }
         "system" if v["subtype"] == "init" => {
             if let Some(id) = v["session_id"].as_str() {
                 kinds.push(EventKind::SessionStarted { native_id: id.to_string() });
@@ -291,6 +314,8 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{},"uuid":"r1","session_id":"d4d5f2c0-1"}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cat a.txt"}}]},"uuid":"u1","session_id":"d4d5f2c0-1"}"#,
             r#"{"type":"user","message":{"content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"hello","is_error":false}]},"uuid":"u2","tool_use_result":{"stdout":"hello","stderr":""}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"do"}},"uuid":"s1"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"},"uuid":"s2"}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]},"uuid":"u3"}"#,
             r#"{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":10,"output_tokens":3},"total_cost_usd":0.001}"#,
         ];
@@ -298,12 +323,23 @@ mod tests {
         let kinds: Vec<&str> = evs.iter().map(|e| e.kind.name()).collect();
         assert_eq!(
             kinds,
-            ["session_started", "rate_limit_event", "tool_started", "tool_finished", "text", "usage", "turn_ended"]
+            [
+                "session_started",
+                "rate_limit_event",
+                "tool_started",
+                "tool_finished",
+                "text_delta",
+                "stream/message_stop",
+                "text",
+                "usage",
+                "turn_ended"
+            ]
         );
+        assert_eq!(evs[4].native_message, None, "stream events aren't fork points");
         assert!(matches!(&evs[0].kind, EventKind::SessionStarted { native_id } if native_id == "d4d5f2c0-1"));
         assert!(matches!(&evs[3].kind, EventKind::ToolFinished { stdout: Some(s), .. } if s == "hello"));
-        assert_eq!(evs[4].native_message.as_deref(), Some("u3"));
-        assert!(matches!(&evs[6].kind, EventKind::TurnEnded { ok: true, .. }));
+        assert_eq!(evs[6].native_message.as_deref(), Some("u3"));
+        assert!(matches!(&evs[8].kind, EventKind::TurnEnded { ok: true, .. }));
         assert!(evs.iter().filter(|e| e.raw.is_some()).count() == lines.len(), "every line recorded once");
     }
 }

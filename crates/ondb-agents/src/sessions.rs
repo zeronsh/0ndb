@@ -59,12 +59,49 @@ pub enum Restore {
     AgentOnly,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
-    Text { thread: String, message: String, text: String },
-    ToolStarted { thread: String, message: String, id: String, name: String },
-    ToolFinished { thread: String, message: String, id: String, is_error: bool },
-    TurnEnded { thread: String, message: String, status: Status },
+    /// The user message of a turn that just started (and its assistant id).
+    TurnStarted {
+        thread: String,
+        user: String,
+        message: String,
+    },
+    /// Streamed text.
+    TextDelta {
+        thread: String,
+        message: String,
+        text: String,
+    },
+    ReasoningDelta {
+        thread: String,
+        message: String,
+        text: String,
+    },
+    /// A complete text block.
+    Text {
+        thread: String,
+        message: String,
+        text: String,
+    },
+    ToolStarted {
+        thread: String,
+        message: String,
+        id: String,
+        name: String,
+    },
+    ToolFinished {
+        thread: String,
+        message: String,
+        id: String,
+        is_error: bool,
+    },
+    TurnEnded {
+        thread: String,
+        message: String,
+        status: Status,
+    },
 }
 
 /// A turn in progress.
@@ -111,7 +148,19 @@ struct Inner {
     warm: Mutex<Vec<Warm>>,
     reaper: Sender<()>,
     busy: Mutex<HashSet<String>>,
+    /// Running turns by thread, for interrupting.
+    active: Mutex<HashMap<String, Arc<TurnControl>>>,
+    /// Text streamed so far for running assistant messages.
+    live: Mutex<HashMap<String, String>>,
     subs: Mutex<Vec<Sender<Update>>>,
+}
+
+/// One page of a thread's selected branch, oldest first.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Page {
+    pub messages: Vec<Message>,
+    /// Older messages exist before the first one.
+    pub has_more: bool,
 }
 
 #[derive(Clone)]
@@ -150,6 +199,8 @@ impl Sessions {
             warm: Mutex::default(),
             reaper: tx,
             busy: Mutex::default(),
+            active: Mutex::default(),
+            live: Mutex::default(),
             subs: Mutex::default(),
         });
         let weak = Arc::downgrade(&inner);
@@ -214,6 +265,47 @@ impl Sessions {
     /// against a message, optionally one of its tool calls.
     pub fn record_output(&self, message: &str, tool_call: Option<&str>, stream: &str, data: &[u8]) -> Result<(), Error> {
         self.inner.store.append_output(message, tool_call, stream, now_ms(), data)
+    }
+
+    /// Up to `limit` messages of the selected branch ending just before
+    /// `before` (default: the leaf, inclusive).
+    pub fn page(&self, thread: &str, before: Option<&str>, limit: usize) -> Result<Page, Error> {
+        let end = match before {
+            Some(b) => self.message(b)?.parent,
+            None => self.thread(thread)?.leaf,
+        };
+        let Some(end) = end else { return Ok(Page { messages: Vec::new(), has_more: false }) };
+        let mut messages = self.inner.store.path_tail(&end, limit + 1)?;
+        let has_more = messages.len() > limit;
+        if has_more {
+            messages.remove(0);
+        }
+        Ok(Page { messages, has_more })
+    }
+
+    /// A page of a message's recorded events after sequence `after`.
+    pub fn events_page(&self, message: &str, after: i64, limit: usize) -> Result<Vec<RecordedEvent>, Error> {
+        self.inner.store.events_after(message, after, limit)
+    }
+
+    /// Text streamed so far by a running assistant message.
+    pub fn live_text(&self, message: &str) -> Option<String> {
+        self.inner.live.lock().unwrap_or_else(|p| p.into_inner()).get(message).cloned()
+    }
+
+    /// Stops the thread's running turn, if any.
+    pub fn interrupt(&self, thread: &str) -> bool {
+        let control = self.inner.active.lock().unwrap_or_else(|p| p.into_inner()).get(thread).cloned();
+        match control {
+            Some(c) => {
+                c.interrupted.store(true, Ordering::SeqCst);
+                if let Some(i) = c.interrupter.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                    i();
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn subscribe(&self) -> Receiver<Update> {
@@ -360,6 +452,8 @@ impl Sessions {
         self.inner.store.set_leaf(&t.id, &user.id)?;
         let assistant = new_id();
         let control = Arc::new(TurnControl::default());
+        self.inner.active.lock().unwrap_or_else(|p| p.into_inner()).insert(t.id.clone(), control.clone());
+        self.inner.emit(Update::TurnStarted { thread: t.id.clone(), user: user.id.clone(), message: assistant.clone() });
         let (tx, rx) = bounded(1);
         let job = TurnJob {
             inner: self.inner.clone(),
@@ -390,6 +484,7 @@ struct BusyGuard {
 impl Drop for BusyGuard {
     fn drop(&mut self) {
         self.inner.busy.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.thread);
+        self.inner.active.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.thread);
     }
 }
 
@@ -553,7 +648,7 @@ impl TurnJob {
             seen: None,
             forked_from,
         };
-        let (session, req, from, warm) = match plan {
+        let (mut session, mut req, from, warm) = match plan {
             Plan::Continue { session, from } => {
                 let warm = self.inner.take_warm(&session.id, &self.model);
                 let req = StartRequest {
@@ -582,7 +677,7 @@ impl TurnJob {
                 (s, StartRequest { cwd: self.cwd.clone(), model: self.model.clone(), ..Default::default() }, 0, None)
             }
         };
-        let full_prompt = self.history_prompt(&history[from.min(history.len())..], &self.user.text);
+        let mut full_prompt = self.history_prompt(&history[from.min(history.len())..], &self.user.text);
         store.insert_message(&Message {
             id: self.assistant.clone(),
             thread: self.thread.clone(),
@@ -604,123 +699,183 @@ impl TurnJob {
         let recorder = Recorder::new(&self.ws, vec![self.mount.clone()])?;
         let turn_scope = recorder.begin(ScopeKind::Turn, &clip(&self.user.text, 80), Some(actor), None)?;
         let turn_scope_id = turn_scope.id();
-        let mut run = match warm {
-            Some(r) => r,
-            None => match self.provider.start(req) {
-                Ok(r) => r,
-                Err(e) => {
-                    let rec = recorder.end(turn_scope)?;
-                    self.finish(&session, "", Status::Failed, Some(&e.to_string()), Some(rec.id.to_string()), None)?;
-                    return Err(e);
-                }
-            },
-        };
-        *self.control.interrupter.lock().unwrap_or_else(|p| p.into_inner()) = Some(run.interrupter());
-
+        let mut warm = warm;
+        let mut forking = req.fork_at.is_some();
         let mut text = String::new();
         let mut native: Option<String> = None;
         let mut open_tools: HashMap<String, ondb::Scope> = HashMap::new();
-        let mut status = Status::Failed;
-        let mut error: Option<String> = None;
-        let mut alive = true;
-        if let Err(e) = run.send(&full_prompt) {
-            error = Some(e.to_string());
-            alive = false;
-        }
-        while alive {
-            let Some(ev) = run.next() else {
-                alive = false;
-                if self.control.interrupted.load(Ordering::SeqCst) {
-                    status = Status::Interrupted;
-                } else {
-                    error.get_or_insert_with(|| "the provider process exited".into());
-                }
-                break;
-            };
-            store.record_event(
-                &session.id,
-                Some(&self.assistant),
-                now_ms(),
-                ev.kind.name(),
-                ev.native_message.as_deref(),
-                ev.raw.as_deref(),
-            )?;
-            if let Some(n) = &ev.native_message
-                && !matches!(&ev.kind, EventKind::Other { kind } if kind == "stderr")
-            {
-                native = Some(n.clone());
-            }
-            match ev.kind {
-                EventKind::SessionStarted { native_id } => store.update_session(&session.id, Some(&native_id), None, now_ms())?,
-                EventKind::Text { text: t } => {
-                    if !text.is_empty() {
-                        text.push_str("\n\n");
+        let mut status: Status;
+        let mut error: Option<String>;
+        let mut alive: bool;
+        let mut run = loop {
+            let mut run = match warm.take() {
+                Some(r) => r,
+                None => match self.provider.start(req) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let rec = recorder.end(turn_scope)?;
+                        self.finish(&session, "", Status::Failed, Some(&e.to_string()), Some(rec.id.to_string()), None)?;
+                        return Err(e);
                     }
-                    text.push_str(&t);
-                    self.inner.emit(Update::Text { thread: self.thread.clone(), message: self.assistant.clone(), text: t });
-                }
-                EventKind::ToolStarted { id, name, input } => {
-                    let scope = recorder.begin(ScopeKind::ToolCall, &name, Some(actor), Some(turn_scope_id))?;
-                    store.start_tool(&ToolCall {
-                        message: self.assistant.clone(),
-                        id: id.clone(),
-                        session: session.id.clone(),
-                        name: name.clone(),
-                        input: input.to_string(),
-                        output: None,
-                        stdout: None,
-                        stderr: None,
-                        is_error: None,
-                        scope: Some(scope.id().to_string()),
-                        started_ms: now_ms(),
-                        ended_ms: None,
-                    })?;
-                    open_tools.insert(id.clone(), scope);
-                    self.inner.emit(Update::ToolStarted {
-                        thread: self.thread.clone(),
-                        message: self.assistant.clone(),
-                        id,
-                        name,
-                    });
-                }
-                EventKind::ToolFinished { id, output, is_error, stdout, stderr } => {
-                    let scope = match open_tools.remove(&id) {
-                        Some(s) => Some(recorder.end(s)?.id.to_string()),
-                        None => None,
-                    };
-                    store.finish_tool(
-                        &self.assistant,
-                        &id,
-                        &output,
-                        stdout.as_deref(),
-                        stderr.as_deref(),
-                        is_error,
-                        scope.as_deref(),
-                        now_ms(),
-                    )?;
-                    self.inner.emit(Update::ToolFinished {
-                        thread: self.thread.clone(),
-                        message: self.assistant.clone(),
-                        id,
-                        is_error,
-                    });
-                }
-                EventKind::TurnEnded { ok, error: e } => {
-                    status = if self.control.interrupted.load(Ordering::SeqCst) {
-                        Status::Interrupted
-                    } else if ok {
-                        Status::Done
-                    } else {
-                        Status::Failed
-                    };
-                    error = e;
-                    break;
-                }
-                _ => {}
+                },
+            };
+            *self.control.interrupter.lock().unwrap_or_else(|p| p.into_inner()) = Some(run.interrupter());
+
+            status = Status::Failed;
+            error = None;
+            alive = true;
+            let mut started = false;
+            let mut tools_seen = false;
+            if let Err(e) = run.send(&full_prompt) {
+                error = Some(e.to_string());
+                alive = false;
             }
-        }
+            while alive {
+                let Some(ev) = run.next() else {
+                    alive = false;
+                    if self.control.interrupted.load(Ordering::SeqCst) {
+                        status = Status::Interrupted;
+                    } else {
+                        error.get_or_insert_with(|| "the provider process exited".into());
+                    }
+                    break;
+                };
+                store.record_event(
+                    &session.id,
+                    Some(&self.assistant),
+                    now_ms(),
+                    ev.kind.name(),
+                    ev.native_message.as_deref(),
+                    ev.raw.as_deref(),
+                )?;
+                if let Some(n) = &ev.native_message
+                    && !matches!(&ev.kind, EventKind::Other { kind } if kind == "stderr")
+                {
+                    native = Some(n.clone());
+                }
+                match ev.kind {
+                    EventKind::SessionStarted { native_id } => {
+                        started = true;
+                        store.update_session(&session.id, Some(&native_id), None, now_ms())?
+                    }
+                    EventKind::TextDelta { text: t } => {
+                        self.inner
+                            .live
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .entry(self.assistant.clone())
+                            .or_default()
+                            .push_str(&t);
+                        self.inner.emit(Update::TextDelta {
+                            thread: self.thread.clone(),
+                            message: self.assistant.clone(),
+                            text: t,
+                        });
+                    }
+                    EventKind::ReasoningDelta { text: t } => {
+                        self.inner.emit(Update::ReasoningDelta {
+                            thread: self.thread.clone(),
+                            message: self.assistant.clone(),
+                            text: t,
+                        });
+                    }
+                    EventKind::Text { text: t } => {
+                        if !text.is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(&t);
+                        // The complete block replaces what was streamed of it.
+                        self.inner
+                            .live
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(self.assistant.clone(), format!("{text}\n\n"));
+                        self.inner.emit(Update::Text { thread: self.thread.clone(), message: self.assistant.clone(), text: t });
+                    }
+                    EventKind::ToolStarted { id, name, input } => {
+                        tools_seen = true;
+                        let scope = recorder.begin(ScopeKind::ToolCall, &name, Some(actor), Some(turn_scope_id))?;
+                        store.start_tool(&ToolCall {
+                            message: self.assistant.clone(),
+                            id: id.clone(),
+                            session: session.id.clone(),
+                            name: name.clone(),
+                            input: input.to_string(),
+                            output: None,
+                            stdout: None,
+                            stderr: None,
+                            is_error: None,
+                            scope: Some(scope.id().to_string()),
+                            started_ms: now_ms(),
+                            ended_ms: None,
+                        })?;
+                        open_tools.insert(id.clone(), scope);
+                        self.inner.emit(Update::ToolStarted {
+                            thread: self.thread.clone(),
+                            message: self.assistant.clone(),
+                            id,
+                            name,
+                        });
+                    }
+                    EventKind::ToolFinished { id, output, is_error, stdout, stderr } => {
+                        let scope = match open_tools.remove(&id) {
+                            Some(s) => Some(recorder.end(s)?.id.to_string()),
+                            None => None,
+                        };
+                        store.finish_tool(
+                            &self.assistant,
+                            &id,
+                            &output,
+                            stdout.as_deref(),
+                            stderr.as_deref(),
+                            is_error,
+                            scope.as_deref(),
+                            now_ms(),
+                        )?;
+                        self.inner.emit(Update::ToolFinished {
+                            thread: self.thread.clone(),
+                            message: self.assistant.clone(),
+                            id,
+                            is_error,
+                        });
+                    }
+                    EventKind::TurnEnded { ok, error: e } => {
+                        status = if self.control.interrupted.load(Ordering::SeqCst) {
+                            Status::Interrupted
+                        } else if ok {
+                            Status::Done
+                        } else {
+                            Status::Failed
+                        };
+                        error = e;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // A native fork the provider refused before starting (e.g. it no
+            // longer has the fork point): fall back to a fresh session with the
+            // branch's history replayed, once.
+            if forking && !started && !tools_seen && status == Status::Failed && text.is_empty() {
+                tracing::warn!(error = ?error, "native fork failed; starting a fresh session");
+                run.close();
+                forking = false;
+                session = fresh_session(None);
+                store.insert_session(&session, now_ms())?;
+                req = StartRequest { cwd: self.cwd.clone(), model: self.model.clone(), ..Default::default() };
+                full_prompt = self.history_prompt(history, &self.user.text);
+                continue;
+            }
+            break run;
+        };
         for (_, s) in open_tools.drain() {
             recorder.end(s)?;
+        }
+        let streamed = self.inner.live.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.assistant);
+        if text.is_empty()
+            && let Some(s) = streamed
+        {
+            text = s.trim_end().to_string();
         }
         // Providers often explain a failure in the turn's text (limits,
         // auth); keep that with the error code.

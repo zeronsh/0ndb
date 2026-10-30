@@ -15,7 +15,7 @@ pub mod sessions;
 pub mod store;
 
 pub use provider::{Capabilities, Event, EventKind, Interrupter, Provider, Run, StartRequest};
-pub use sessions::{Restore, SessionOptions, Sessions, Turn, Update};
+pub use sessions::{Page, Restore, SessionOptions, Sessions, Turn, Update};
 pub use store::{Message, ProviderSession, RecordedEvent, Role, Status, Thread, ToolCall};
 
 #[derive(Debug, thiserror::Error)]

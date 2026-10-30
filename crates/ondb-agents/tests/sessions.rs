@@ -255,3 +255,79 @@ fn live_claude_code() {
     println!("turn 1: {} events, {} tool calls; fork reply: {}", raw.len(), tools.len(), a3.text);
     s.close_idle();
 }
+
+#[test]
+fn streams_pages_and_interrupts() {
+    use ondb_agents::Update;
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let streamer = Mock::new("streamer", Capabilities { resume: true, fork_at_message: true, persistent: true }, |p| {
+        vec![Step::Stream {
+            text: format!("streamed reply to {}", p.lines().last().unwrap_or("")),
+            chunk: 4,
+            delay: Duration::from_millis(5),
+        }]
+    });
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(streamer)];
+    let s2 =
+        Sessions::open(e._dir.path().join("state/s2.db"), e.worktrees.clone(), providers, SessionOptions::default()).unwrap();
+    let _ = s;
+    let t = s2.create_thread(&e.wt.id, "stream").unwrap();
+    let updates = s2.subscribe();
+    let m = s2.send(&t.id, "hello there", "streamer", None).unwrap().wait().unwrap();
+    assert_eq!(m.text, "streamed reply to hello there");
+    let deltas: String = updates
+        .try_iter()
+        .filter_map(|u| match u {
+            Update::TextDelta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, m.text, "deltas add up to the reply");
+    assert_eq!(s2.live_text(&m.id), None, "live text is dropped once the turn ends");
+    // Event pages.
+    let first = s2.events_page(&m.id, 0, 3).unwrap();
+    assert_eq!(first.len(), 3);
+    let rest = s2.events_page(&m.id, first.last().unwrap().seq, 1000).unwrap();
+    assert_eq!(first.len() + rest.len(), s2.events(&m.id).unwrap().len());
+
+    for i in 0..3 {
+        s2.send(&t.id, &format!("message {i}"), "streamer", None).unwrap().wait().unwrap();
+    }
+    // 8 messages; page backwards 3 at a time.
+    let p1 = s2.page(&t.id, None, 3).unwrap();
+    assert!(p1.has_more);
+    assert_eq!(p1.messages.last().unwrap().text, "streamed reply to message 2");
+    let p2 = s2.page(&t.id, Some(&p1.messages[0].id), 3).unwrap();
+    let p3 = s2.page(&t.id, Some(&p2.messages[0].id), 3).unwrap();
+    assert!(!p3.has_more);
+    assert_eq!(p3.messages.len(), 2);
+    assert_eq!(p3.messages[0].text, "hello there");
+
+    // Interrupting a long stream.
+    let slow = s2.send(&t.id, &"x".repeat(400), "streamer", None).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(s2.live_text(&slow.assistant).is_some_and(|t| !t.is_empty()), "partial text is readable mid-turn");
+    assert!(s2.interrupt(&t.id));
+    assert_eq!(slow.wait().unwrap().status, Status::Interrupted);
+    assert!(!s2.interrupt(&t.id));
+}
+
+/// A provider refusing a native fork (its fork point is unknown) falls back
+/// to a fresh session with the branch's history replayed.
+#[test]
+fn rejected_forks_fall_back_to_replay() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let t = s.create_thread(&e.wt.id, "fork").unwrap();
+    s.send(&t.id, "first", "alpha", None).unwrap().wait().unwrap();
+    let a2 = s.send(&t.id, "second", "alpha", None).unwrap().wait().unwrap();
+    e.alpha.reject_forks(true);
+    let edited = s.edit(a2.parent.as_ref().unwrap(), "second, edited", "alpha", None, Restore::Keep).unwrap().wait().unwrap();
+    assert_eq!(edited.status, Status::Done, "{:?}", edited.error);
+    let calls = e.alpha.calls();
+    let fallback = calls.last().unwrap();
+    assert!(fallback.forked_at.is_none() && fallback.resumed.is_none(), "fresh session");
+    assert!(fallback.prompt.contains("User: first") && !fallback.prompt.contains("User: second\n"), "replays the branch only");
+    assert!(calls[calls.len() - 2].forked_at.is_some(), "the fork was tried first");
+}

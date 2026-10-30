@@ -13,6 +13,13 @@ use crate::provider::{Capabilities, Event, EventKind, Interrupter, Provider, Run
 #[derive(Clone, Debug)]
 pub enum Step {
     Text(String),
+    /// Text streamed in `chunk`-character deltas `delay` apart, then the
+    /// complete block.
+    Stream {
+        text: String,
+        chunk: usize,
+        delay: std::time::Duration,
+    },
     /// A tool call that writes `content` to `path` (relative to the cwd).
     Write {
         path: String,
@@ -41,12 +48,27 @@ pub struct Mock {
     calls: Arc<Mutex<Vec<Call>>>,
     live: Arc<AtomicUsize>,
     spawned: Arc<AtomicUsize>,
+    reject_forks: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Mock {
+    /// Makes forks fail the way Claude Code does for an unknown fork point:
+    /// an error result before the session starts.
+    pub fn reject_forks(&self, on: bool) {
+        self.reject_forks.store(on, Ordering::SeqCst);
+    }
+
     /// `script` maps each prompt to the turn's steps.
     pub fn new(id: &'static str, caps: Capabilities, script: impl Fn(&str) -> Vec<Step> + Send + Sync + 'static) -> Self {
-        Mock { id, caps, script: Arc::new(script), calls: Arc::default(), live: Arc::default(), spawned: Arc::default() }
+        Mock {
+            id,
+            caps,
+            script: Arc::new(script),
+            calls: Arc::default(),
+            live: Arc::default(),
+            spawned: Arc::default(),
+            reject_forks: Arc::default(),
+        }
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -99,6 +121,7 @@ impl Provider for Mock {
 
 enum Pending {
     Event(Event),
+    Delayed(Event, std::time::Duration),
     WriteThenFinish { path: String, content: String, id: String },
 }
 
@@ -133,6 +156,11 @@ impl Run for MockRun {
             forked_at: self.forked_at.clone(),
             prompt: prompt.to_string(),
         });
+        if self.forked_at.is_some() && self.mock.reject_forks.load(Ordering::SeqCst) {
+            let e = self.ev(EventKind::TurnEnded { ok: false, error: Some("No message found".into()) });
+            self.queue.push_back(e);
+            return Ok(());
+        }
         if !std::mem::replace(&mut self.started, true) {
             let e = self.ev(EventKind::SessionStarted { native_id: self.native.clone() });
             self.queue.push_back(e);
@@ -143,6 +171,18 @@ impl Run for MockRun {
         for (i, step) in steps.into_iter().enumerate() {
             match step {
                 Step::Text(text) => {
+                    let e = self.ev(EventKind::Text { text });
+                    self.queue.push_back(e);
+                }
+                Step::Stream { text, chunk, delay } => {
+                    let chars: Vec<char> = text.chars().collect();
+                    for piece in chars.chunks(chunk.max(1)) {
+                        let mut e = self.ev(EventKind::TextDelta { text: piece.iter().collect() });
+                        if let Pending::Event(ev) = &mut e {
+                            ev.native_message = None;
+                            self.queue.push_back(Pending::Delayed(ev.clone(), delay));
+                        }
+                    }
                     let e = self.ev(EventKind::Text { text });
                     self.queue.push_back(e);
                 }
@@ -168,6 +208,10 @@ impl Run for MockRun {
     fn next(&mut self) -> Option<Event> {
         match self.queue.pop_front()? {
             Pending::Event(e) => Some(e),
+            Pending::Delayed(e, d) => {
+                std::thread::sleep(d);
+                Some(e)
+            }
             // The write happens only when the turn loop asks for the result,
             // i.e. after it has seen the tool start: like a real tool.
             Pending::WriteThenFinish { path, content, id } => {

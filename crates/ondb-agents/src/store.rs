@@ -377,6 +377,45 @@ impl Store {
         Ok(out)
     }
 
+    /// The last `limit` messages of the root-to-`leaf` path, oldest first.
+    pub fn path_tail(&self, leaf: &str, limit: usize) -> Result<Vec<Message>, Error> {
+        let c = self.c();
+        let cols = MESSAGE_COLS.split(", ").map(|col| format!("m.{col}")).collect::<Vec<_>>().join(", ");
+        let mut st = c.prepare(&format!(
+            "WITH RECURSIVE up(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT m.parent, up.depth + 1 FROM messages m JOIN up ON m.id = up.id
+                 WHERE m.parent IS NOT NULL AND up.depth + 1 < ?2
+             )
+             SELECT {cols} FROM up JOIN messages m ON m.id = up.id ORDER BY up.depth DESC"
+        ))?;
+        let rows = st.query_map(params![leaf, limit as i64], message_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Events of a message with sequence above `after`, up to `limit`.
+    pub fn events_after(&self, message: &str, after: i64, limit: usize) -> Result<Vec<RecordedEvent>, Error> {
+        let c = self.c();
+        let mut st = c.prepare(
+            "SELECT seq, session, message, ts_ms, kind, native, raw FROM events
+             WHERE message = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![message, after, limit as i64], |r| {
+            let raw: Option<Vec<u8>> = r.get(6)?;
+            Ok(RecordedEvent {
+                seq: r.get(0)?,
+                session: r.get(1)?,
+                message: r.get(2)?,
+                ts_ms: r.get::<_, i64>(3)? as u64,
+                kind: r.get(4)?,
+                native: r.get(5)?,
+                raw: raw.and_then(|b| lz4_flex::decompress_size_prepended(&b).ok()),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn insert_session(&self, s: &ProviderSession, now: u64) -> Result<(), Error> {
         self.c().execute(
             "INSERT INTO sessions (id, thread, provider, native, cwd, seen, forked_from, created_ms, updated_ms)
