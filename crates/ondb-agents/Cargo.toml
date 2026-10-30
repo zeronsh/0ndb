@@ -1,0 +1,22 @@
+[package]
+name = "ondb-agents"
+description = "Provider sessions for 0ndb: agent threads as message trees, recorded events and tool calls, switching and editing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+lz4_flex.workspace = true
+ondb.workspace = true
+ondb-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,257 @@
+//! Provider sessions end to end: real git worktree, real mount, scripted
+//! providers that write files inside tool calls.
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ondb::git::Forges;
+use ondb::{MountOptions, Worktrees};
+use ondb_agents::mock::{Mock, Step};
+use ondb_agents::{Capabilities, Provider, Restore, Role, SessionOptions, Sessions, Status};
+
+fn sh(dir: &Path, script: &str) {
+    let ok = Command::new("sh").arg("-c").arg(script).current_dir(dir).status().unwrap().success();
+    assert!(ok, "{script}");
+}
+
+/// `write <path> <content>` on the prompt's last line writes a file; the
+/// reply echoes that line.
+fn script(prompt: &str) -> Vec<Step> {
+    let last = prompt.lines().last().unwrap_or("").to_string();
+    let mut steps = Vec::new();
+    let words: Vec<&str> = last.split_whitespace().collect();
+    if words.first() == Some(&"write") && words.len() >= 3 {
+        steps.push(Step::Write { path: words[1].into(), content: format!("{}\n", words[2..].join(" ")) });
+    }
+    if words.first() == Some(&"fail") {
+        steps.push(Step::Fail("scripted failure".into()));
+    }
+    steps.push(Step::Text(format!("ok: {last}")));
+    steps
+}
+
+struct Env {
+    _dir: tempfile::TempDir,
+    sessions: Sessions,
+    worktrees: Worktrees,
+    wt: ondb::WorktreeInfo,
+    alpha: Mock,
+    beta: Mock,
+}
+
+fn env(opts: SessionOptions) -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let git = "git -c user.name=t -c user.email=t@t -c init.defaultBranch=main";
+    sh(d, &format!("{git} init -q app && cd app && echo base > base.txt && {git} add -A && {git} commit -qm init"));
+    let worktrees = Worktrees::open(d.join("state"), d.join("checkouts"), MountOptions::default(), Forges::default()).unwrap();
+    let wt = worktrees.create(d.join("app"), "agent work", Some("main")).unwrap();
+    // alpha: resumable, forkable, persistent (like Claude Code); beta: resume only, one process per turn.
+    let alpha = Mock::new("alpha", Capabilities { resume: true, fork_at_message: true, persistent: true }, script);
+    let beta = Mock::new("beta", Capabilities { resume: true, fork_at_message: false, persistent: false }, script);
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(alpha.clone()), Arc::new(beta.clone())];
+    let sessions = Sessions::open(d.join("state/sessions.db"), worktrees.clone(), providers, opts).unwrap();
+    Env { _dir: dir, sessions, worktrees, wt, alpha, beta }
+}
+
+fn text(ws: &ondb::Workspace, path: &str) -> Option<String> {
+    ws.read(|h| h.lookup(path).and_then(|i| h.text(&i))).map(|b| String::from_utf8(b).unwrap())
+}
+
+#[test]
+fn records_turns_switches_providers_and_edits_with_worktree_restore() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let t = s.create_thread(&e.wt.id, "demo").unwrap();
+    let (ws, mount) = e.worktrees.workspace(&e.wt.id).unwrap();
+
+    // Turn 1 (alpha): a tool call writes a file.
+    let a1 = s.send(&t.id, "write a.txt from alpha", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(a1.status, Status::Done);
+    assert_eq!(a1.text, "ok: write a.txt from alpha");
+    assert_eq!(fs::read_to_string(e.wt.path.join("a.txt")).unwrap(), "from alpha\n");
+    let tools = s.tool_calls(&a1.id).unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "Write");
+    assert_eq!(tools[0].output.as_deref(), Some("wrote a.txt"));
+    // The tool call's scope holds exactly the batch that wrote a.txt.
+    let scope = ondb::attrib::scopes(&ws).into_iter().find(|sc| Some(sc.id.to_string()) == tools[0].scope).unwrap();
+    assert_eq!(scope.batches.len(), 1);
+    let a_inode = ws.read(|h| h.lookup("a.txt")).unwrap();
+    assert!(ws.summary(&scope.batches[0]).unwrap().touched.contains(&a_inode));
+    // Every provider event is on record, verbatim.
+    let events = s.events(&a1.id).unwrap();
+    let kinds: Vec<&str> = events.iter().map(|ev| ev.kind.as_str()).collect();
+    assert_eq!(kinds, ["session_started", "tool_started", "tool_finished", "text", "turn_ended"]);
+    assert!(events.iter().all(|ev| ev.raw.as_ref().is_some_and(|r| serde_json::from_slice::<serde_json::Value>(r).is_ok())));
+    assert_eq!(s.warm_processes(), 1, "alpha stays warm");
+
+    // Turn 2 (alpha): reuses the warm process, no replayed history.
+    let a2 = s.send(&t.id, "write b.txt second", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(e.alpha.spawned(), 1);
+    assert!(!e.alpha.calls()[1].prompt.contains("previous-conversation"));
+
+    // Turn 3 (beta): switching provider replays the conversation into a fresh session.
+    let b3 = s.send(&t.id, "write c.txt from beta", "beta", None).unwrap().wait().unwrap();
+    let beta_prompt = &e.beta.calls()[0].prompt;
+    assert!(beta_prompt.contains("User: write a.txt from alpha") && beta_prompt.contains("Assistant (alpha): ok: write b.txt"));
+    assert_eq!(e.beta.live(), 0, "beta's process ends with its turn");
+
+    // Turn 4 (back to alpha): continues alpha's own session, catching up only on beta's turn.
+    s.send(&t.id, "say hi", "alpha", None).unwrap().wait().unwrap();
+    let back = e.alpha.calls().last().unwrap().clone();
+    assert_eq!(back.native_session, e.alpha.calls()[0].native_session, "same native session");
+    assert!(back.prompt.contains("Assistant (beta): ok: write c.txt"));
+    assert!(!back.prompt.contains("write a.txt from alpha"), "alpha already saw its own turns");
+
+    // A person edits a file meanwhile.
+    fs::write(e.wt.path.join("human.txt"), "mine\n").unwrap();
+    mount.fence().unwrap();
+
+    // Edit turn 2's prompt: a sibling branch; agent changes since are undone, the human's kept;
+    // alpha forks its native session at turn 1's last message.
+    let u2 = s.message(&a2.parent.clone().unwrap()).unwrap();
+    let edited = s.edit(&u2.id, "write d.txt instead", "alpha", None, Restore::AgentOnly).unwrap().wait().unwrap();
+    assert_eq!(edited.status, Status::Done);
+    let fork = e.alpha.calls().last().unwrap().clone();
+    assert_eq!(fork.forked_at.as_deref(), a1.native.as_deref(), "native fork at the branch point");
+    assert!(!fork.prompt.contains("previous-conversation"), "the fork already has turn 1");
+    for gone in ["b.txt", "c.txt"] {
+        assert!(!e.wt.path.join(gone).exists(), "{gone} survived the restore");
+    }
+    assert_eq!(fs::read_to_string(e.wt.path.join("a.txt")).unwrap(), "from alpha\n", "turn 1 predates the edit");
+    assert_eq!(fs::read_to_string(e.wt.path.join("human.txt")).unwrap(), "mine\n", "people's edits stay");
+    assert!(e.wt.path.join("d.txt").exists());
+    let sibs = s.siblings(&u2.id).unwrap();
+    assert_eq!(sibs.len(), 2, "<1/2>");
+    let path: Vec<String> = s.path(&t.id).unwrap().iter().map(|m| m.text.clone()).collect();
+    assert_eq!(path, ["write a.txt from alpha", "ok: write a.txt from alpha", "write d.txt instead", "ok: write d.txt instead"]);
+
+    // Switch back to the original branch: its files come back exactly.
+    let leaf = s.switch_branch(&u2.id, Restore::Full).unwrap();
+    assert_eq!(leaf.role, Role::Assistant);
+    assert_eq!(leaf.text, "ok: say hi");
+    for (f, want) in [("b.txt", "second\n"), ("c.txt", "from beta\n"), ("a.txt", "from alpha\n")] {
+        assert_eq!(fs::read_to_string(e.wt.path.join(f)).unwrap(), want);
+    }
+    assert!(!e.wt.path.join("d.txt").exists());
+    assert_eq!(text(&ws, "c.txt").as_deref(), Some("from beta\n"));
+    let _ = b3;
+}
+
+#[test]
+fn failures_are_recorded_and_processes_are_bounded() {
+    let e = env(SessionOptions { warm_limit: 1, warm_idle: Duration::from_millis(300), ..SessionOptions::default() });
+    let s = &e.sessions;
+    let t1 = s.create_thread(&e.wt.id, "one").unwrap();
+    let t2 = s.create_thread(&e.wt.id, "two").unwrap();
+    let failed = s.send(&t1.id, "fail please", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(failed.status, Status::Failed);
+    assert_eq!(failed.error.as_deref(), Some("scripted failure"));
+    assert_eq!(s.warm_processes(), 0, "failed turns don't park");
+
+    s.send(&t1.id, "hello", "alpha", None).unwrap().wait().unwrap();
+    s.send(&t2.id, "hello", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(s.warm_processes(), 1, "warm limit");
+    assert_eq!(e.alpha.live(), 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while e.alpha.live() > 0 {
+        assert!(Instant::now() < deadline, "idle process never reaped");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A parked-then-reaped session resumes natively.
+    s.send(&t1.id, "again", "alpha", None).unwrap().wait().unwrap();
+    let last = e.alpha.calls().last().unwrap().clone();
+    assert!(last.resumed.is_some());
+    assert!(!last.prompt.contains("previous-conversation"));
+    // One turn per thread at a time.
+    let running = s.send(&t2.id, "hello", "beta", None).unwrap();
+    let _ = s.send(&t2.id, "again", "beta", None).map(|t| t.wait());
+    running.wait().unwrap();
+    // CLI output can be attached to a message.
+    let m = s.path(&t2.id).unwrap().last().unwrap().clone();
+    s.record_output(&m.id, None, "stdout", b"line 1\n").unwrap();
+    s.record_output(&m.id, None, "stdout", b"line 2\n").unwrap();
+    assert_eq!(s.store().output(&m.id, None, "stdout").unwrap(), b"line 1\nline 2\n");
+}
+
+/// `ONDB_LIVE_CLAUDE=1`: real Claude Code (Haiku): a tool call, a resumed
+/// turn, then an edit that forks the native session at the branch point.
+#[test]
+fn live_claude_code() {
+    if std::env::var("ONDB_LIVE_CLAUDE").is_err() {
+        return;
+    }
+    use ondb_agents::claude::{Access, ClaudeCode};
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    sh(
+        d,
+        "git -c user.name=t -c user.email=t@t -c init.defaultBranch=main init -q app && cd app && echo hello > a.txt && git add -A && git -c user.name=t -c user.email=t@t commit -qm init",
+    );
+    let worktrees = Worktrees::open(d.join("state"), d.join("checkouts"), MountOptions::default(), Forges::default()).unwrap();
+    let wt = worktrees.create(d.join("app"), "live", Some("main")).unwrap();
+    let claude: Arc<dyn Provider> = Arc::new(ClaudeCode::new(Access::Full));
+    let s = Sessions::open(d.join("state/sessions.db"), worktrees.clone(), vec![claude], SessionOptions::default()).unwrap();
+    let t = s.create_thread(&wt.id, "live").unwrap();
+    let model = Some("haiku");
+    let a1 = s
+        .send(
+            &t.id,
+            "Create a file named note.txt containing exactly the word apple. Then reply with just: done",
+            "claude-code",
+            model,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+    if a1.status != Status::Done {
+        for ev in s.events(&a1.id).unwrap() {
+            println!(
+                "EV {} {}",
+                ev.kind,
+                String::from_utf8_lossy(&ev.raw.unwrap_or_default()).chars().take(700).collect::<String>()
+            );
+        }
+    }
+    assert_eq!(a1.status, Status::Done, "{:?}", a1.error);
+    assert_eq!(fs::read_to_string(wt.path.join("note.txt")).unwrap().trim(), "apple");
+    let tools = s.tool_calls(&a1.id).unwrap();
+    assert!(!tools.is_empty(), "the write was a recorded tool call");
+    assert!(tools.iter().all(|tc| tc.scope.is_some() && tc.ended_ms.is_some()));
+    assert!(a1.native.is_some());
+    let a2 = s
+        .send(&t.id, "What word did you write into note.txt? Reply with just the word.", "claude-code", model)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(a2.text.to_lowercase().contains("apple"), "resumed session remembers: {}", a2.text);
+    assert_eq!(s.warm_processes(), 1);
+    // Edit turn 2: forks claude's native session at turn 1's last message.
+    let u2 = a2.parent.clone().unwrap();
+    let a3 = s
+        .edit(
+            &u2,
+            "Reply with just the number of messages you have received from me so far in this conversation.",
+            "claude-code",
+            model,
+            Restore::AgentOnly,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(a3.status, Status::Done, "{:?}", a3.error);
+    let sessions = s.provider_sessions(&t.id).unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions[1].forked_from.is_some() && sessions[1].native != sessions[0].native, "native fork");
+    assert!(a3.text.contains('2'), "the fork saw turn 1 but not the replaced turn 2: {}", a3.text);
+    // The first turn's file predates the edited message, so it stays.
+    assert!(wt.path.join("note.txt").exists());
+    let raw = s.events(&a1.id).unwrap();
+    assert!(raw.iter().any(|ev| ev.kind == "session_started") && raw.iter().any(|ev| ev.kind == "tool_finished"));
+    println!("turn 1: {} events, {} tool calls; fork reply: {}", raw.len(), tools.len(), a3.text);
+    s.close_idle();
+}

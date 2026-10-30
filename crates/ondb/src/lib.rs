@@ -17,11 +17,14 @@ pub mod mount;
 pub mod report;
 pub mod revert;
 pub mod workspace;
+pub mod worktrees;
 
 pub use attrib::{Recorder, Scope, ScopeId, ScopeKind, ScopeRecord};
 pub use mount::{FenceOutcome, Mount, MountHandle, MountOptions};
 pub use ondb_core as core;
+pub use ondb_git as git;
 pub use workspace::{ActorInfo, ActorKind, BatchSummary, Committed, Event, IntegrateReport, Workspace};
+pub use worktrees::{WorktreeInfo, Worktrees};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -35,6 +38,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Watch(#[from] notify::Error),
+    #[error(transparent)]
+    Git(#[from] ondb_git::Error),
+    #[error(transparent)]
+    Forge(#[from] ondb_git::ForgeError),
     #[error("the mount has stopped")]
     MountStopped,
     #[error("{0}")]

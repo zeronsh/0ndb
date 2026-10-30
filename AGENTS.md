@@ -19,7 +19,15 @@
   processes.
 - `crates/ondb-sync`: sans-IO client/relay plus transports; local state is
   accessed only through the `Replica` trait.
-- `crates/ondb-cli`: the `0ndb` binary.
+- `crates/ondb-git`: git via subprocess (`cmd.rs`: timeouts, caps, no
+  prompts, `GIT_OPTIONAL_LOCKS=0`), remotes, repos/worktrees, and `forge/`
+  (provider-agnostic hosting; GitHub via `gh`). No 0ndb dependencies.
+- `crates/ondb-agents`: provider sessions. `provider.rs` (trait + normalized
+  events), `claude.rs` (stream-json driver), `mock.rs` (scripted provider
+  for tests), `store.rs` (SQLite: threads, messages, sessions, raw events,
+  tool calls, outputs), `sessions.rs` (turns, switching, edit/branch, warm
+  process pool).
+- `crates/ondb-cli`: the `0ndb` binary (`src/agents.rs`: `worktree`/`thread`).
 
 ## Invariants
 
@@ -61,4 +69,12 @@
 - Resource checks: `cargo run --release -p ondb --example many -- <repo> <n>`
   (memory, threads, files, idle CPU across many worktrees) and
   `cargo run --release -p ondb --example soak` (must print `ok: flat`).
+- Live checks (opt-in): `ONDB_LIVE_GITHUB=owner/repo cargo test -p ondb-git`
+  and `ONDB_LIVE_CLAUDE=1 cargo test -p ondb-agents --test sessions live`.
 - Real git end-to-end (clone + linked worktrees, pushes to a scratch repo): `scripts/git-e2e.sh`
+- Provider wiring stays behind `Provider`/`Forge`: nothing outside
+  `claude.rs` or `forge/github.rs` may know a provider's wire format or CLI.
+- Every provider event is recorded raw before it is interpreted; a turn's
+  tool calls are attribution scopes nested in the turn's scope.
+- Sessions keep nothing per thread in memory between turns; warm provider
+  processes are bounded by `SessionOptions`.

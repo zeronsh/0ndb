@@ -17,7 +17,9 @@ change can be credited.
 |---|---|
 | `ondb-core` | Pure data model: Lamport-stamped batches in a causal DAG, a persistent summarized B-tree, a sequence CRDT for text built on it, an inode-based file-tree CRDT, line diffing, codecs. No I/O. |
 | `ondb-store` | SQLite persistence: append-only batches, refcounted copy-on-write tree nodes, per-inode state rows, lazily read blobs, outbox, mount state. |
-| `ondb` | `Workspace` (history + store + events), `Mount` (filesystem watcher, ingestion, materialization, fences), attribution `Recorder`, change reports, blame, selective revert. |
+| `ondb` | `Workspace` (history + store + events), `Mount` (filesystem watcher, ingestion, materialization, fences), attribution `Recorder`, change reports, blame, selective revert, managed `Worktrees`. |
+| `ondb-git` | Git through `git` itself (repositories, branches, worktrees, status) and git hosting providers behind one `Forge` interface (GitHub today), chosen per remote host. |
+| `ondb-agents` | Provider sessions: agent providers behind one `Provider` interface (Claude Code, scripted mock), threads as message trees with editing and branch switching, recorded provider events, tool calls and CLI output. |
 | `ondb-sync` | Sans-IO replication: `Replica` trait, `Client` and `Relay` state machines, memory and TCP transports. |
 | `ondb-cli` | The `0ndb` binary. |
 
@@ -202,6 +204,49 @@ Rejected batches are reported to the author. A replica that receives a batch
 that is causally valid but doesn't apply rebuilds its state from storage
 instead of continuing with partial state.
 
+## Worktrees and git
+
+`Worktrees` creates git worktrees on fresh `ondb/<title>` branches (or adopts
+existing folders), mounts them with their histories kept in a state directory,
+remounts them on start, and removes them (refusing uncommitted work unless
+forced). Everything git goes through `ondb_git::Repo`, which runs `git` with
+timeouts, output caps, no prompts and no optional locks, so it never contends
+with a user's own git or a mount.
+
+Hosting is provider-agnostic. A remote URL in any spelling (https, ssh,
+scp-like, nested namespaces) parses to one `RemoteUrl`; `Forges` maps its host
+to a `Forge` implementation (`github.com` to GitHub by default; self-hosted
+hosts via `map_host`). A `Forge` reads repositories and change requests (state,
+draft, checks, review, mergeability) and opens new ones. The GitHub provider
+uses the `gh` CLI, so the user's own sign-in applies and no token passes
+through 0ndb. Adding GitLab or another host means implementing `Forge` and
+registering it. Nothing polls: provider calls happen on request.
+
+## Provider sessions
+
+`ondb_agents::Sessions` runs agent turns in managed worktrees.
+
+* **Threads are message trees.** Editing a user message adds a sibling
+  (`siblings()` gives the `<i/n>` switcher); `switch_branch` selects another.
+* **Every message is pinned to a worktree version**, and every turn and every
+  tool call is an attribution scope. Editing or switching can restore the
+  files fully or undo only what agents changed (people's edits stay); git
+  checkouts are never undone.
+* **Provider sessions are chosen per turn.** Continue the native session that
+  last saw this branch; else fork a native session at the branch point if the
+  provider can (Claude Code: `--resume-session-at` + `--fork-session`); else
+  start fresh. Whatever the chosen session hasn't seen (another provider's
+  turns, another branch) is replayed in front of the prompt, so switching
+  providers mid-thread and back keeps each provider's own native history.
+* **Everything is recorded.** Each provider event is stored verbatim
+  (compressed), tool calls with inputs, outputs, stdout/stderr and their
+  attribution scope, the provider's stderr, and any CLI output attached with
+  `record_output`.
+* **Bounded processes.** At most `warm_limit` provider processes (2) stay alive
+  between turns, each for `warm_idle` (90 s); a parked session resumes
+  natively. The reaper sleeps without wakeups while nothing is warm. Nothing
+  about a thread is held in memory between turns.
+
 ## Resource use
 
 0ndb is meant to watch many worktrees from one long-running process.
@@ -252,6 +297,12 @@ and fails if heap, open files or threads grow.
 0ndb relay --listen 0.0.0.0:7420 --validate # relay server
 0ndb status
 0ndb verify                                 # history matches disk exactly?
+0ndb worktree new <repo> "title"            # git worktree on ondb/<title>, mounted
+0ndb worktree list | rm <id> | pr <id> | pr-open <id> "title"
+0ndb thread new <worktree-id> "title"
+0ndb thread send <thread> "prompt" [--model haiku] [--access plan|edits|full]
+0ndb thread edit <message> "new prompt" [--restore agent|full|keep]
+0ndb thread show <thread> | switch <message> | events <message>
 ```
 
 State lives in `<root>/.0ndb/` (excluded from git automatically). The

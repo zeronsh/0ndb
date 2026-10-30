@@ -1,3 +1,5 @@
+mod agents;
+
 use std::collections::HashSet;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -38,6 +40,12 @@ enum Kind {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Managed git worktrees (create, adopt, remove, change requests).
+    #[command(subcommand)]
+    Worktree(agents::WorktreeCmd),
+    /// Agent threads: send, edit (branch), switch branches, inspect events.
+    #[command(subcommand)]
+    Thread(agents::ThreadCmd),
     /// Start tracking a directory (adopts everything not gitignored).
     Init,
     /// Watch the directory and ingest changes live; optionally sync with a relay.
@@ -247,6 +255,11 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    match cli.command {
+        Cmd::Worktree(c) => return agents::worktree(c).map(|_| ExitCode::SUCCESS),
+        Cmd::Thread(c) => return agents::thread(c).map(|_| ExitCode::SUCCESS),
+        _ => {}
+    }
     if let Cmd::Relay { listen, validate, cutoff_after } = &cli.command {
         let listener = TcpListener::bind(listen)?;
         eprintln!("relay listening on {}", listener.local_addr()?);
@@ -257,7 +270,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let root = find_root(cli.dir, cli.db.is_some())?;
     let ws = open(&root, cli.db)?;
     match cli.command {
-        Cmd::Relay { .. } => unreachable!(),
+        Cmd::Relay { .. } | Cmd::Worktree(_) | Cmd::Thread(_) => unreachable!(),
         Cmd::Init => {
             exclusive_mount(&ws, &root)?.stop();
             let files = ws.read(|h| h.walk().len());
