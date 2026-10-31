@@ -146,6 +146,9 @@ fn main() {
     let t = Instant::now();
     let mount = Mount::start(&ws, &wt, opts.clone()).unwrap();
     line("remount, nothing changed", Some(t.elapsed()), cpu0);
+    if std::env::var_os("ONDB_TIMING").is_some() {
+        println!("  phases: {}", ondb::timing::dump());
+    }
 
     // Hibernate + wake.
     let t = Instant::now();
@@ -176,6 +179,9 @@ fn main() {
         sh(&wt, &format!("git switch -q --detach {target} 2>/dev/null || git switch -q {target}"));
         mount.fence().unwrap();
         line(&format!("branch switch {} (2000 files)", i + 1), Some(t.elapsed()), cpu0);
+        if std::env::var_os("ONDB_TIMING").is_some() {
+            println!("  phases: {}", ondb::timing::dump());
+        }
     }
 
     // One small edit.

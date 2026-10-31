@@ -37,12 +37,29 @@ enum Found {
     },
 }
 
+/// Threads walking a tree for a full pass.
+const WALK_THREADS: usize = 6;
+
 /// Paths probed per window; their files are then read and hashed in parallel.
 const WINDOW_PATHS: usize = 2048;
 /// Upper bound on the bytes a window reads at once.
 const WINDOW_BYTES: i64 = 32 << 20;
 
 type Read = std::io::Result<Option<(Vec<u8>, ondb_core::Oid)>>;
+
+/// `lstat`s `paths` across a few threads.
+fn probe_parallel(root: &std::path::Path, paths: &[String]) -> Vec<DiskEntry> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if paths.len() < 256 || threads == 1 {
+        return paths.iter().map(|p| probe(root, p)).collect();
+    }
+    let per = paths.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let parts: Vec<_> =
+            paths.chunks(per).map(|c| s.spawn(move || c.iter().map(|p| probe(root, p)).collect::<Vec<_>>())).collect();
+        parts.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
+}
 
 fn with_oid(bytes: Vec<u8>) -> (Vec<u8>, ondb_core::Oid) {
     let oid = oid_of(&bytes);
@@ -234,12 +251,23 @@ impl MountState {
 
     fn candidates(&self, scope: Scope) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
+        // Walked in parallel: on large trees the walk is a pass's largest
+        // fixed cost.
         let walk_into = |dir: &str, out: &mut BTreeSet<String>| {
-            for e in walker(&abs(&self.root, dir)).build().flatten() {
-                if let Ok(rel) = e.path().strip_prefix(&self.root) {
-                    out.insert(rel.to_string_lossy().into_owned());
-                }
-            }
+            let found = std::sync::Mutex::new(Vec::new());
+            walker(&abs(&self.root, dir)).threads(WALK_THREADS).build_parallel().run(|| {
+                let found = &found;
+                let root = &self.root;
+                Box::new(move |e| {
+                    if let Ok(e) = e
+                        && let Ok(rel) = e.path().strip_prefix(root)
+                    {
+                        found.lock().unwrap_or_else(|p| p.into_inner()).push(rel.to_string_lossy().into_owned());
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+            out.extend(found.into_inner().unwrap_or_else(|p| p.into_inner()));
         };
         match scope {
             Scope::Full => {
@@ -337,17 +365,20 @@ impl MountState {
         // a large repository never has to fit in memory at once. Paths come
         // in order, so each chunk's directories exist before the next.
         let adopting = self.shadow.is_empty() && !git_wrote;
+        let t_scan = std::time::Instant::now();
         let mut chunk_bytes = 0usize;
         let cands: Vec<String> = cands.into_iter().collect();
         let max = self.opts.max_file_size;
         let mut start = 0;
         while start < cands.len() {
             // Probe a window, then read and hash the files it needs in parallel.
+            let ahead = &cands[start..(start + WINDOW_PATHS).min(cands.len())];
+            let mut probed = probe_parallel(&root, ahead).into_iter();
             let mut probes = Vec::new();
             let (mut wanted, mut want_bytes) = (Vec::new(), 0i64);
             while start + probes.len() < cands.len() && probes.len() < WINDOW_PATHS && want_bytes < WINDOW_BYTES {
                 let path = &cands[start + probes.len()];
-                let d = probe(&root, path);
+                let d = probed.next().unwrap_or_else(|| probe(&root, path));
                 if let DiskEntry::File { stat, exec } = &d
                     && !(defer_young && stat.mtime_ns > young_before)
                     && match self.shadow.get(path) {
@@ -460,6 +491,7 @@ impl MountState {
         for (path, stat) in stat_only {
             self.shadow.set_stat(&path, Some(stat));
         }
+        crate::timing::add("scan", t_scan.elapsed());
 
         if !git_wrote {
             // A commit moved HEAD without writing files: note it on its own.
@@ -480,9 +512,11 @@ impl MountState {
         // matches its index entry was edited right after: git's version and
         // the edit are recorded separately. Without git's view at all,
         // everything is git's.
-        let new_index = git::read_index(&root);
-        let dirty = git::dirty_paths(&root);
-        let new_compact = new_index.as_ref().map(git::compact);
+        let t = std::time::Instant::now();
+        let raw = git::read_index_raw(&root, self.git.as_ref());
+        let new_index = raw.as_deref().map(git::index_of);
+        crate::timing::add("git.read_index", t.elapsed());
+        let new_compact = raw.as_deref().map(git::compact);
         let written: Option<BTreeSet<String>> = match (&self.git_index, &new_compact) {
             (Some(old), Some(new)) => Some(
                 created
@@ -499,6 +533,10 @@ impl MountState {
             ),
             _ => git::changed_between(&root, self.git_head.as_deref(), head.as_deref()).map(|v| v.into_iter().collect()),
         };
+        // Only written paths are ever checked against the worktree.
+        let t = std::time::Instant::now();
+        let dirty = git::dirty_paths(&root, written.as_ref());
+        crate::timing::add("git.dirty_paths", t.elapsed());
         let verdict = |p: &String, dir: bool| -> Verdict {
             let Some(w) = &written else { return Verdict::Git };
             if dir {

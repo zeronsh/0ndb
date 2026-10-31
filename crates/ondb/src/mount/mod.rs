@@ -445,7 +445,7 @@ impl MountState {
         self.reflog_pos = g.reflog_len();
         let stamp = g.index_stamp();
         if stamp != self.index_stamp || self.git_index.is_none() {
-            self.git_index = git::read_index(&self.root).as_ref().map(git::compact);
+            self.git_index = git::read_index_raw(&self.root, self.git.as_ref()).as_deref().map(git::compact);
             self.index_stamp = stamp;
         }
     }
