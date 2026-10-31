@@ -444,13 +444,14 @@ impl Sessions {
         self.start_turn(&t.id, m.parent.clone(), prompt, provider, model)
     }
 
-    /// Selects the branch through `message` (its most recent continuation);
-    /// the worktree's files become exactly that branch's last state.
+    /// Selects the branch through `message`, remembering the last choice at
+    /// each nested fork (newest for forks never visited). The worktree's
+    /// files become exactly that selected continuation's last state.
     pub fn switch_branch(&self, message: &str) -> Result<Message, Error> {
         let mut leaf = self.message(message)?;
         let t = self.thread(&leaf.thread)?;
         self.check_idle(&t.id)?;
-        while let Some(next) = self.inner.store.children(&t.id, Some(&leaf.id))?.pop() {
+        while let Some(next) = self.inner.store.selected_child(&t.id, &leaf.id)? {
             leaf = next;
         }
         self.restore(&t, &leaf)?;

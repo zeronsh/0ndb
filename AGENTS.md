@@ -118,6 +118,10 @@
   tool calls are attribution scopes nested in the turn's scope.
 - Sessions keep nothing per thread in memory between turns; warm provider
   processes are bounded by `SessionOptions`.
+- Branch choices are durable per parent message (`branch_choices`). Updating
+  a thread's leaf remembers its path in the same transaction; switching
+  follows remembered children, falling back to newest only for unseen forks.
+  Never overwrite choices in sibling subtrees when navigating away.
 - Crash recovery: `Store::open` marks replies left running as interrupted
   and remembers them; `Sessions::resume_interrupted` (call once at startup
   from long-running hosts, never from one-shot CLI commands) re-runs each

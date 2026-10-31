@@ -244,6 +244,9 @@ registering it. Nothing polls: provider calls happen on request.
 
 * **Threads are message trees.** Editing a user message adds a sibling
   (`siblings()` gives the `<i/n>` switcher); `switch_branch` selects another.
+  Each fork remembers its last selected continuation in the database, so
+  returning to an earlier branch restores all nested choices, even after a
+  restart. Forks never visited default to their newest continuation.
 * **Every message is pinned to a worktree version**, and every turn and every
   tool call is an attribution scope. Branching follows one fixed rule, not
   an option: editing a message or switching branches makes the files exactly

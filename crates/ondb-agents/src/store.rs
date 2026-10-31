@@ -257,6 +257,23 @@ fn cap(s: &str) -> String {
     format!("{}… [{} bytes total]", &s[..end], s.len())
 }
 
+/// Remember every edge of the selected path without loading message bodies.
+/// Choices in sibling subtrees are left alone, ready for the next visit.
+fn remember_path(conn: &Connection, thread: &str, leaf: &str, previous_leaf: Option<&str>) -> Result<(), Error> {
+    conn.execute(
+        "WITH RECURSIVE path(id, parent) AS (
+             SELECT id, parent FROM messages WHERE thread = ?1 AND id = ?2 AND id IS NOT ?3
+             UNION ALL
+             SELECT m.id, m.parent FROM messages m JOIN path ON m.id = path.parent WHERE m.thread = ?1 AND m.id IS NOT ?3
+         )
+         INSERT INTO branch_choices (parent, child)
+         SELECT parent, id FROM path WHERE parent IS NOT NULL
+         ON CONFLICT(parent) DO UPDATE SET child = excluded.child WHERE child != excluded.child",
+        params![thread, leaf, previous_leaf],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Store, Error> {
         let conn = Connection::open(path)?;
@@ -276,6 +293,23 @@ impl Store {
             conn.execute_batch(
                 "ALTER TABLE messages ADD COLUMN git_branch TEXT; ALTER TABLE messages ADD COLUMN git_commit TEXT;",
             )?;
+        }
+        // Keep the currently selected paths when upgrading an existing DB.
+        // Older choices outside those paths were never recorded; until first
+        // visited they keep the previous newest-continuation default.
+        let has_choices =
+            conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'branch_choices'")?.exists([])?;
+        if !has_choices {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("CREATE TABLE branch_choices (parent TEXT PRIMARY KEY, child TEXT NOT NULL) WITHOUT ROWID;")?;
+            {
+                let mut stmt = tx.prepare("SELECT id, leaf FROM threads WHERE leaf IS NOT NULL")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    remember_path(&tx, &row.get::<_, String>(0)?, &row.get::<_, String>(1)?, None)?;
+                }
+            }
+            tx.commit()?;
         }
         // A crash mid-turn leaves messages running; nothing is running now.
         let interrupted: Vec<String> = {
@@ -342,7 +376,21 @@ impl Store {
     }
 
     pub fn set_leaf(&self, thread: &str, leaf: &str) -> Result<(), Error> {
-        self.c().execute("UPDATE threads SET leaf = ?2 WHERE id = ?1", params![thread, leaf])?;
+        let mut conn = self.c();
+        let tx = conn.transaction()?;
+        let previous_leaf: Option<String> =
+            tx.query_row("SELECT leaf FROM threads WHERE id = ?1", [thread], |r| r.get(0)).optional()?.flatten();
+        let changed = tx.execute(
+            "UPDATE threads SET leaf = ?2 WHERE id = ?1 AND EXISTS (SELECT 1 FROM messages WHERE id = ?2 AND thread = ?1)",
+            params![thread, leaf],
+        )?;
+        if changed == 0 {
+            return Err(Error::Invalid(format!("no message {leaf} in thread {thread}")));
+        }
+        // Appending a turn reaches the old leaf immediately: its ancestors
+        // are already selected, so ordinary sends don't walk all history.
+        remember_path(&tx, thread, leaf, previous_leaf.as_deref())?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -411,6 +459,25 @@ impl Store {
         ))?;
         let rows = st.query_map(params![thread, parent], message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The last selected continuation of a message; newest for a fork that
+    /// has never been visited. Fetch only that child, not all its siblings.
+    pub(crate) fn selected_child(&self, thread: &str, parent: &str) -> Result<Option<Message>, Error> {
+        Ok(self
+            .c()
+            .query_row(
+                &format!(
+                    "SELECT {MESSAGE_COLS} FROM messages WHERE id = (
+                         SELECT id FROM messages WHERE thread = ?1 AND parent = ?2
+                         ORDER BY CASE WHEN id = (SELECT child FROM branch_choices WHERE parent = ?2) THEN 0 ELSE 1 END,
+                                  created_ms DESC, rowid DESC LIMIT 1
+                     )"
+                ),
+                params![thread, parent],
+                message_row,
+            )
+            .optional()?)
     }
 
     /// Root-to-`leaf` path.

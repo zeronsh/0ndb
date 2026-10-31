@@ -152,6 +152,82 @@ fn records_turns_switches_providers_and_edits_with_worktree_restore() {
 }
 
 #[test]
+fn branch_switches_remember_nested_choices_after_restart() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let t = s.create_thread(&e.wt.id, "nested branches").unwrap();
+    let root = s.send(&t.id, "write root.txt original", "alpha", None).unwrap().wait().unwrap();
+    let middle = s.send(&t.id, "write middle.txt original", "alpha", None).unwrap().wait().unwrap();
+    let end = s.send(&t.id, "write end.txt original", "alpha", None).unwrap().wait().unwrap();
+    let end_user = end.parent.as_deref().unwrap();
+    let middle_user = middle.parent.as_deref().unwrap();
+    let root_user = root.parent.as_deref().unwrap();
+
+    // Choose an older reply, continue it, then leave at an earlier fork.
+    let end_alt = s.edit(end_user, "write end.txt alternate", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(s.switch_branch(end_user).unwrap().id, end.id);
+    let tail = s.send(&t.id, "write tail.txt chosen", "alpha", None).unwrap().wait().unwrap();
+    let chosen_path: Vec<_> = s.path(&t.id).unwrap().iter().map(|m| m.id.clone()).collect();
+    let middle_alt = s.edit(middle_user, "write middle.txt alternate", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(
+        s.switch_branch(middle_user).unwrap().id,
+        tail.id,
+        "return to the selected older continuation, not the newest edit"
+    );
+
+    // The same choice survives leaving at the root and closing the sessions.
+    let root_alt = s.edit(root_user, "write root.txt alternate", "alpha", None).unwrap().wait().unwrap();
+    s.close_idle();
+    let restarted = Sessions::open(
+        e._dir.path().join("state/sessions.db"),
+        e.worktrees.clone(),
+        vec![Arc::new(e.alpha.clone())],
+        SessionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(restarted.switch_branch(root_user).unwrap().id, tail.id);
+    assert_eq!(restarted.path(&t.id).unwrap().iter().map(|m| m.id.clone()).collect::<Vec<_>>(), chosen_path);
+    for file in ["root.txt", "middle.txt", "end.txt"] {
+        assert_eq!(fs::read_to_string(e.wt.path.join(file)).unwrap(), "original\n", "{file}");
+    }
+    assert_eq!(fs::read_to_string(e.wt.path.join("tail.txt")).unwrap(), "chosen\n");
+
+    // Selecting a different nested alternative updates its ancestors too,
+    // without forgetting the choices inside the sibling we just left.
+    restarted.switch_branch(middle_alt.parent.as_deref().unwrap()).unwrap();
+    restarted.switch_branch(root_alt.parent.as_deref().unwrap()).unwrap();
+    assert_eq!(restarted.switch_branch(root_user).unwrap().id, middle_alt.id);
+    assert_eq!(restarted.switch_branch(middle_user).unwrap().id, tail.id);
+    restarted.switch_branch(end_alt.parent.as_deref().unwrap()).unwrap();
+    restarted.switch_branch(root_alt.parent.as_deref().unwrap()).unwrap();
+    assert_eq!(restarted.switch_branch(root_user).unwrap().id, end_alt.id);
+    assert_eq!(fs::read_to_string(e.wt.path.join("end.txt")).unwrap(), "alternate\n");
+    assert!(!e.wt.path.join("tail.txt").exists());
+}
+
+#[test]
+fn upgrading_branch_choices_preserves_the_current_path() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let t = s.create_thread(&e.wt.id, "upgrade").unwrap();
+    let root = s.send(&t.id, "write root.txt original", "alpha", None).unwrap().wait().unwrap();
+    let end = s.send(&t.id, "write end.txt original", "alpha", None).unwrap().wait().unwrap();
+    s.edit(end.parent.as_deref().unwrap(), "write end.txt alternate", "alpha", None).unwrap().wait().unwrap();
+    let root_alt = s.edit(root.parent.as_deref().unwrap(), "write root.txt alternate", "alpha", None).unwrap().wait().unwrap();
+    s.switch_branch(end.parent.as_deref().unwrap()).unwrap();
+    let db = e._dir.path().join("state/sessions.db");
+    s.close_idle();
+
+    // Simulate a pre-upgrade database with an older continuation selected.
+    // The new table must seed that path, not silently choose newer edits.
+    rusqlite::Connection::open(&db).unwrap().execute_batch("DROP TABLE branch_choices").unwrap();
+    let restarted = Sessions::open(&db, e.worktrees.clone(), vec![Arc::new(e.alpha.clone())], SessionOptions::default()).unwrap();
+    restarted.switch_branch(root_alt.parent.as_deref().unwrap()).unwrap();
+    assert_eq!(restarted.switch_branch(root.parent.as_deref().unwrap()).unwrap().id, end.id);
+    assert_eq!(fs::read_to_string(e.wt.path.join("end.txt")).unwrap(), "original\n");
+}
+
+#[test]
 fn failures_are_recorded_and_processes_are_bounded() {
     let e = env(SessionOptions { warm_limit: 1, warm_idle: Duration::from_millis(300), ..SessionOptions::default() });
     let s = &e.sessions;
