@@ -276,6 +276,19 @@ registering it. Nothing polls: provider calls happen on request.
   natively. The reaper sleeps without wakeups while nothing is warm. Nothing
   about a thread is held in memory between turns.
 
+## Retention
+
+Batches keep their ops for 30 days (`Workspace::set_retention`); after that,
+hibernation prunes the ops of batches that every head, mount and retained
+version (`Workspace::retain`, used by threads for their first message)
+already includes, keeping their headers so the causal graph, sync dedup and
+current state are untouched. What goes is the per-batch detail older than
+the window: summaries, reports and reverts of those batches. A history that
+has synced never prunes what it hasn't uploaded; one that never synced can
+prune everything old, and then refuses to start syncing rather than upload
+holes. CRDT tombstones are not collected: that needs every replica to have
+seen the cutoff, which the sync layer doesn't track yet.
+
 ## Resource use
 
 0ndb is meant to watch many worktrees from one long-running process.

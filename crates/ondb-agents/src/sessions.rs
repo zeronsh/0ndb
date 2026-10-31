@@ -425,6 +425,11 @@ impl Sessions {
         };
         self.inner.store.insert_message(&user)?;
         self.inner.store.set_leaf(&t.id, &user.id)?;
+        // A thread's first message (on each root branch) is the oldest
+        // version it can navigate back to; keep it from being pruned.
+        if user.parent.is_none() {
+            ws.retain(&format!("thread:{}:{}", t.id, user.id), user.version.as_ref())?;
+        }
         let assistant = new_id();
         let control = Arc::new(TurnControl::default());
         self.inner.active.lock().unwrap_or_else(|p| p.into_inner()).insert(t.id.clone(), control.clone());

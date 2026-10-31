@@ -77,6 +77,13 @@
 - Materialization plans only inodes touched since the synced version (plus,
   on first mount, ones the shadow lacks); never read every file back out of
   the history to compare.
+- Pruning (`Workspace::prune`, run on hibernation after 30 days) drops
+  batch ops but keeps headers, and only for batches every head, mount
+  synced version and retained version (`Workspace::retain`) includes.
+  Anything a client may diff against or navigate back to must be retained
+  (sessions retain each thread's root messages). Once a history has synced,
+  un-uploaded batches are never pruned; `touched_by` refuses pruned batches
+  rather than treating them as empty.
 - Large-repo check: `cargo run --release -p ondb --example bigrepo -- <repo>`
   (`ONDB_TIMING=1` prints first-mount phases).
 - Linux watching (`mount/watch.rs`, Dirs mode) shares one inotify instance;

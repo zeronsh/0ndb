@@ -98,6 +98,12 @@ CREATE TABLE IF NOT EXISTS blobs (
     len INTEGER NOT NULL,
     data BLOB NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS retained_versions (
+    history_key INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    PRIMARY KEY (history_key, name)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS pending_pins (
     history_key INTEGER NOT NULL,
     oid BLOB NOT NULL,
@@ -641,13 +647,82 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        payload.map(|p| self.decode_row(&p, true)).transpose()
+        // An empty payload was pruned (see `prune_payloads`).
+        payload.filter(|p| !p.is_empty()).map(|p| self.decode_row(&p, true)).transpose()
+    }
+
+    // ----- retention and pruning -------------------------------------------
+
+    /// Keeps `version` viewable (diffable against the present) under
+    /// `name`, or forgets it with `None`. Clients pin what they may still
+    /// navigate to, e.g. a thread's oldest message.
+    pub fn set_retained(&mut self, key: HistoryKey, name: &str, version: Option<&Version>) -> Result<()> {
+        match version {
+            Some(v) => {
+                let enc = self.encode_version(key, v)?;
+                self.conn.execute(
+                    "INSERT INTO retained_versions (history_key, name, version) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (history_key, name) DO UPDATE SET version = excluded.version",
+                    params![key.0, name, enc],
+                )?;
+            }
+            None => {
+                self.conn.execute("DELETE FROM retained_versions WHERE history_key = ?1 AND name = ?2", params![key.0, name])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every version that must stay diffable: retained ones and each
+    /// mount's synced version.
+    pub fn retained_versions(&mut self, key: HistoryKey) -> Result<Vec<Version>> {
+        let encoded: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT version FROM retained_versions WHERE history_key = ?1
+                 UNION ALL SELECT synced_version FROM mounts WHERE history_key = ?1",
+            )?;
+            stmt.query_map([key.0], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        encoded.iter().map(|e| self.decode_version(key, e)).collect()
+    }
+
+    /// Whether this history has ever uploaded a batch (`mark_pushed`).
+    pub fn ever_synced(&self, key: HistoryKey) -> Result<bool> {
+        Ok(self.local_get(&format!("synced:{}", key.0))?.is_some())
+    }
+
+    /// Drops the ops of `ids`, keeping their headers (the DAG, dedup and
+    /// ordering stay intact). Once the history has synced, batches not yet
+    /// uploaded are kept; a history that never synced prunes them too, and
+    /// can then no longer start syncing (`unpushed` refuses). Returns how
+    /// many were pruned. Their summaries, and diffs that include them, are
+    /// no longer available.
+    pub fn prune_payloads(&mut self, key: HistoryKey, ids: &[BatchId]) -> Result<usize> {
+        let keep_unuploaded = self.ever_synced(key)?;
+        let mut ords = Vec::with_capacity(ids.len());
+        for id in ids {
+            ords.push((self.ordinal(key, id.actor)?, id.ts as i64));
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE batches SET payload = X'' WHERE history_key = ?1 AND actor = ?2 AND end_ts = ?3 AND length(payload) > 0
+                   AND NOT (?4 AND EXISTS (SELECT 1 FROM outbox o WHERE o.history_key = ?1 AND o.actor = ?2 AND o.end_ts = ?3))",
+            )?;
+            for (actor, ts) in ords {
+                n += stmt.execute(params![key.0, actor, ts, keep_unuploaded])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     /// All batches in arrival (topological) order.
     pub fn all_batches(&mut self, key: HistoryKey, with_blobs: bool) -> Result<Vec<Batch>> {
         let payloads: Vec<Vec<u8>> = {
-            let mut stmt = self.conn.prepare("SELECT payload FROM batches WHERE history_key = ?1 ORDER BY seq")?;
+            let mut stmt =
+                self.conn.prepare("SELECT payload FROM batches WHERE history_key = ?1 AND length(payload) > 0 ORDER BY seq")?;
             stmt.query_map([key.0], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         payloads.iter().map(|p| self.decode_row(p, with_blobs)).collect()
@@ -684,6 +759,11 @@ impl Store {
             )?;
             stmt.query_map([key.0], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
+        if payloads.iter().any(|p| p.is_empty()) {
+            return Err(StoreError::Corrupt(
+                "this history was pruned before it ever synced; its oldest batches can't be uploaded".into(),
+            ));
+        }
         payloads.iter().map(|p| self.decode_row(p, true)).collect()
     }
 
@@ -696,6 +776,10 @@ impl Store {
         for (actor, ts) in resolved {
             tx.execute("DELETE FROM outbox WHERE history_key = ?1 AND actor = ?2 AND end_ts = ?3", params![key.0, actor, ts])?;
         }
+        tx.execute(
+            "INSERT INTO local_kv (key, value) VALUES (?1, X'01') ON CONFLICT (key) DO NOTHING",
+            [format!("synced:{}", key.0)],
+        )?;
         tx.commit()?;
         Ok(())
     }

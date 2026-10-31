@@ -676,3 +676,53 @@ fn files_over_the_size_limit_are_tracked_through_git() {
     mount.fence().unwrap();
     assert_eq!(fs::read_to_string(root.join("untracked.bin")).unwrap(), big("untracked"));
 }
+
+#[test]
+fn old_batches_are_pruned_without_losing_state_or_retained_versions() {
+    let (dir, ws) = setup();
+    let root = dir.path().join("wt");
+    let mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    let mut versions = Vec::new();
+    for i in 0..6 {
+        fs::write(root.join("README.md"), format!("# demo {i}\n")).unwrap();
+        mount.fence().unwrap();
+        versions.push(ws.heads());
+    }
+    // A client (e.g. a thread) can still go back to version 3.
+    ws.retain("thread:t", Some(&versions[3])).unwrap();
+    let all = ws.read(|h| h.dag().len());
+    let pruned = ws.prune(std::time::Duration::ZERO).unwrap();
+    assert!(pruned > 0 && pruned < all, "{pruned} of {all}: only what version 3 already includes");
+
+    // Diffing against the retained version still works: undo back to it.
+    let undo: std::collections::HashSet<_> = ws.read(|h| h.dag().difference(h.heads(), &versions[3])).into_iter().collect();
+    ondb::revert::revert_batches(&ws, ws.actor("t", ActorKind::Human).unwrap(), &undo).unwrap();
+    mount.fence().unwrap();
+    assert_eq!(fs::read_to_string(root.join("README.md")).unwrap(), "# demo 3\n");
+    // Older batches are gone: their summaries say so and reverting refuses.
+    let old: std::collections::HashSet<_> = ws.read(|h| h.dag().difference(&versions[1], &versions[0])).into_iter().collect();
+    assert!(old.iter().all(|id| ws.summary(id).unwrap().pruned));
+    assert!(ondb::revert::revert_batches(&ws, ws.actor("t", ActorKind::Human).unwrap(), &old).is_err());
+
+    // Releasing the retained version lets the rest go; state survives reload.
+    ws.retain("thread:t", None).unwrap();
+    assert!(ws.prune(std::time::Duration::ZERO).unwrap() > 0);
+    drop(mount);
+    let db = dir.path().join("0ndb.db");
+    drop(ws);
+    let ws = Workspace::open(&db, None).unwrap();
+    assert_eq!(text(&ws, "README.md").as_deref(), Some("# demo 3\n"));
+    assert_eq!(text(&ws, "src/main.rs").as_deref(), Some("fn main() {\n    println!(\"hi\");\n}\n"));
+    let mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    fs::write(root.join("README.md"), "# after\n").unwrap();
+    mount.fence().unwrap();
+    assert_eq!(text(&ws, "README.md").as_deref(), Some("# after\n"));
+    // Never synced, then pruned: uploading would leave holes, so it refuses.
+    assert!(
+        ws.with(|c| {
+            let (s, k) = c.store();
+            s.unpushed(k)
+        })
+        .is_err()
+    );
+}

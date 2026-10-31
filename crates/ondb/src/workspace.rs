@@ -28,6 +28,9 @@ pub struct BatchSummary {
     pub git_checkout: bool,
     /// The in-progress git operation that wrote them, if HEAD didn't move.
     pub git_operation: Option<String>,
+    /// The batch's ops were pruned (`Workspace::prune`): only its header
+    /// is known, so `touched` and `meta_keys` are empty.
+    pub pruned: bool,
 }
 
 impl BatchSummary {
@@ -51,6 +54,20 @@ impl BatchSummary {
                 Op::GitWrite { operation, .. } => Some(operation.clone()),
                 _ => None,
             }),
+            pruned: false,
+        }
+    }
+
+    fn pruned(id: BatchId, actor: ActorId, wall_ms: u64) -> Self {
+        BatchSummary {
+            id,
+            actor,
+            wall_ms,
+            touched: Arc::new([]),
+            meta_keys: Arc::new([]),
+            git_checkout: false,
+            git_operation: None,
+            pruned: true,
         }
     }
 
@@ -112,6 +129,9 @@ const SUMMARY_CACHE: usize = 4096;
 /// Inodes kept loaded once persisted; beyond this they are unloaded and
 /// reloaded from the store on use (`History::trim`).
 const LOADED_INODES: usize = 16384;
+/// Batches older than this lose their ops when hibernating (see
+/// `Workspace::prune`).
+const DEFAULT_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
 
 struct Inner {
     /// Closed while hibernating (file-backed stores only).
@@ -131,6 +151,8 @@ struct Inner {
     replica: Uuid,
     /// Content kept outside the store (the repository's git objects).
     external: Option<Arc<dyn ObjectStore>>,
+    /// Batches older than this are pruned when hibernating.
+    retention: Option<std::time::Duration>,
 }
 
 impl Inner {
@@ -139,8 +161,13 @@ impl Inner {
             return Ok(s.clone());
         }
         let key = self.key;
-        let batch = self.store().batch(key, id)?.ok_or_else(|| Error::Invalid(format!("unknown batch {id:?}")))?;
-        let s = BatchSummary::of(&batch);
+        let s = match self.store().batch(key, id)? {
+            Some(batch) => BatchSummary::of(&batch),
+            None => match self.history.dag().header(id) {
+                Some(h) => BatchSummary::pruned(*id, h.actor, h.wall_ms),
+                None => return Err(Error::Invalid(format!("unknown batch {id:?}"))),
+            },
+        };
         self.remember(s.clone());
         Ok(s)
     }
@@ -194,6 +221,25 @@ impl Inner {
         }
     }
 
+    fn prune(&mut self, older_than: std::time::Duration) -> Result<usize, Error> {
+        let key = self.key;
+        let mut versions = self.store().retained_versions(key)?;
+        versions.push(self.history.heads().clone());
+        let cutoff = ondb_core::now_ms().saturating_sub(older_than.as_millis() as u64);
+        let dag = self.history.dag();
+        let common = dag.common_frontier(&versions);
+        let old: Vec<BatchId> =
+            dag.closure(&common).into_iter().filter(|id| dag.header(id).is_some_and(|h| h.wall_ms < cutoff)).collect();
+        if old.is_empty() {
+            return Ok(0);
+        }
+        let n = self.store().prune_payloads(key, &old)?;
+        for id in &old {
+            self.summaries.remove(id);
+        }
+        Ok(n)
+    }
+
     /// Writes the batch and the state it changed in one transaction. If
     /// that fails, memory is rebuilt from storage so the two never diverge.
     fn persist(&mut self, batch: &Batch, origin: Origin) -> Result<(), Error> {
@@ -229,7 +275,11 @@ impl ReadCtx<'_> {
     pub fn touched_by(&mut self, ids: impl IntoIterator<Item = BatchId>) -> Result<HashSet<InodeId>, Error> {
         let mut out = HashSet::new();
         for id in ids {
-            out.extend(self.inner.summary(&id)?.touched.iter().copied());
+            let s = self.inner.summary(&id)?;
+            if s.pruned {
+                return Err(Error::Invalid(format!("batch {id:?} is older than the retained history (pruned)")));
+            }
+            out.extend(s.touched.iter().copied());
         }
         let h = &self.inner.history;
         let view = h.current();
@@ -311,6 +361,7 @@ impl Workspace {
             rejected: HashSet::new(),
             replica,
             external: None,
+            retention: Some(DEFAULT_RETENTION),
         };
         Ok(Workspace { inner: Arc::new(Mutex::new(inner)), subscribers: Arc::new(Mutex::new(Vec::new())), id })
     }
@@ -333,6 +384,11 @@ impl Workspace {
         let mut inner = self.raw_lock();
         if inner.hibernated.is_some() {
             return;
+        }
+        if let Some(retention) = inner.retention
+            && let Err(e) = inner.prune(retention)
+        {
+            tracing::warn!(error = %e, "pruning old batches failed");
         }
         let id = inner.history.id();
         let heads = inner.history.heads().clone();
@@ -395,6 +451,30 @@ impl Workspace {
         if inner.hibernated.is_none() {
             inner.history.trim(LOADED_INODES);
         }
+    }
+
+    /// Keeps `version` diffable against the present under `name` (or stops
+    /// with `None`); pruning never removes what it needs.
+    pub fn retain(&self, name: &str, version: Option<&Version>) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let key = inner.key;
+        Ok(inner.store().set_retained(key, name, version)?)
+    }
+
+    /// Prunes the ops of batches older than `older_than` that every
+    /// retained version, mount and head already includes, and that are
+    /// uploaded. Headers stay, so the history and its sync are unaffected;
+    /// only summaries, reports and reverts of those old batches go.
+    /// Returns how many were pruned. Also runs when hibernating, with the
+    /// retention set by `set_retention` (30 days by default).
+    pub fn prune(&self, older_than: std::time::Duration) -> Result<usize, Error> {
+        self.lock().prune(older_than)
+    }
+
+    /// How old batches must be before hibernation prunes them; `None`
+    /// keeps everything.
+    pub fn set_retention(&self, retention: Option<std::time::Duration>) {
+        self.raw_lock().retention = retention;
     }
 
     pub fn is_hibernating(&self) -> bool {
