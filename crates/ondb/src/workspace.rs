@@ -344,6 +344,10 @@ impl Workspace {
         if let Some(ext) = &inner.external {
             ext.release();
         }
+        // Idle is a good time to give freed pages back (bounded: 4096 pages).
+        if let Err(e) = inner.store().reclaim_space(4096) {
+            tracing::warn!(error = %e, "reclaiming free pages failed");
+        }
         if inner.db_path.is_some() {
             inner.db = None;
         } else {

@@ -370,6 +370,16 @@ impl Store {
         Self::init(reopen.open()?, reopen)
     }
 
+    /// Returns up to `pages` free pages to the filesystem (stores created
+    /// with incremental auto-vacuum; a no-op otherwise).
+    pub fn reclaim_space(&self, pages: u32) -> Result<()> {
+        // The pragma frees pages as it is stepped; step it to completion.
+        let mut stmt = self.conn.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        Ok(())
+    }
+
     /// Releases SQLite's cached pages and other freeable memory.
     pub fn shrink_memory(&self) {
         let _ = self.conn.execute_batch("PRAGMA shrink_memory");
@@ -389,6 +399,10 @@ impl Store {
     }
 
     fn init(conn: Connection, reopen: Reopen) -> Result<Store> {
+        // Pages freed by reclaimed tree nodes and blobs are returned to the
+        // filesystem (`reclaim_space`). Only takes effect before the first
+        // table exists, so it applies to new stores.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // Every commit is on disk before append returns (NORMAL can lose the
         // latest commits on power loss), and checkpoints use a full barrier
@@ -1143,5 +1157,30 @@ mod tests {
             ext.blobs.lock().unwrap().clear();
             assert_eq!(s.blob(&blob.oid).unwrap().is_some(), !pin_ok);
         }
+    }
+
+    #[test]
+    fn new_stores_give_freed_space_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let s = Store::open(&path).unwrap();
+        let mode: i64 = s.conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, 2, "incremental auto-vacuum");
+        let sync: i64 = s.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 2, "every commit durable");
+        s.conn
+            .execute_batch("CREATE TABLE junk (b BLOB); INSERT INTO junk SELECT randomblob(4096) FROM generate_series(1, 2000);")
+            .ok();
+        if s.conn.query_row("SELECT COUNT(*) FROM junk", [], |r| r.get::<_, i64>(0)).unwrap_or(0) == 0 {
+            // No generate_series in this SQLite build: insert directly.
+            for _ in 0..2000 {
+                s.conn.execute("INSERT INTO junk VALUES (randomblob(4096))", []).unwrap();
+            }
+        }
+        s.conn.execute_batch("DELETE FROM junk").unwrap();
+        let free = |s: &Store| s.conn.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert!(free(&s) > 1000);
+        s.reclaim_space(100_000).unwrap();
+        assert_eq!(free(&s), 0);
     }
 }
