@@ -68,8 +68,8 @@ impl MountState {
                 // in `touched`). Checking them would read every file back
                 // out of the history.
                 h.tree()
-                    .inodes()
-                    .map(|i| i.id)
+                    .ids()
+                    .copied()
                     .filter(|i| !i.is_root())
                     .filter(|i| touched.contains(i) || self.shadow.path_of(i).is_none())
                     .collect()

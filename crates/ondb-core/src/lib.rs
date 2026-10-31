@@ -22,5 +22,5 @@ pub use id::{ActorId, BatchId, HistoryId, InodeId, Lamport, Oid, OpId};
 pub use op::{Batch, Blob, BlobRef, Content, FileMode, ImportEntry, ImportNode, ImportParent, LineEnding, Op, Splice};
 pub use sumtree::{NodeStore, StoreResult, SumTree};
 pub use text::{Anchor, Bias, Everything, Fragment, NodeSource, Text, View};
-pub use tree::{ContentKind, Inode, NodeKind, Placement, StoredInode, StoredKind, Tree};
+pub use tree::{ContentKind, Inode, InodeSource, NodeKind, Placement, StoredInode, StoredKind, Tree};
 pub use version::Version;

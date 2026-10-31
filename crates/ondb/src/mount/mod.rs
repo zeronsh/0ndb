@@ -390,7 +390,7 @@ impl MountState {
         }
         self.persist()?;
         self.ignored_tracked =
-            self.shadow.paths().filter(|p| self.ignore.is_ignored(p, self.shadow.is_dir(p))).cloned().collect();
+            self.shadow.paths().filter(|p| self.ignore.is_ignored(p, self.shadow.is_dir(p))).map(str::to_string).collect();
         self.shadow = Shadow::default();
         self.hibernating = true;
         self.ws.hibernate();

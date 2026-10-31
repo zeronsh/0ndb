@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ondb_core::codec::{self, CodecError};
 use ondb_core::{
-    ActorId, Batch, BatchHeader, BatchId, Blob, BlobSource, Content, Contents, Dag, Dirty, History, HistoryId, Inode, InodeId,
+    ActorId, Batch, BatchHeader, BatchId, Blob, BlobSource, Content, Dag, Dirty, History, HistoryId, Inode, InodeId, InodeSource,
     Insertion, InsertionKey, MetaEntry, NodeSource, NodeStore, ObjectStore, Oid, Op, OpId, Status, StoreResult, StoredInode,
     Text, Version,
 };
@@ -242,6 +242,24 @@ impl BlobSource for BlobReader {
 
     fn serves_insertions(&self) -> bool {
         true
+    }
+}
+
+/// Inodes for lazily loaded histories: rows are read by id on first use,
+/// their texts lazily too.
+struct StoredInodes(Arc<BlobReader>);
+
+impl InodeSource for StoredInodes {
+    fn inode(&self, id: &InodeId) -> Option<Inode> {
+        let (data, root): (Vec<u8>, Option<i64>) = {
+            let conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let mut stmt =
+                conn.prepare_cached("SELECT data, text_root FROM inodes WHERE history_key = ?1 AND inode = ?2").ok()?;
+            stmt.query_row(params![self.0.key.0, enc(id).ok()?], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()??
+        };
+        let stored: StoredInode = dec(&decompress(&data).ok()?).ok()?;
+        let source: Arc<dyn NodeSource> = self.0.clone();
+        Some(Inode::from_stored(stored, root.map(|r| Text::lazy(r as u64, source))))
     }
 }
 
@@ -715,21 +733,21 @@ impl Store {
         for h in self.headers(key)? {
             dag.insert(h).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         }
-        let rows: Vec<(Vec<u8>, Option<i64>)> = {
-            let mut stmt = self.conn.prepare("SELECT data, text_root FROM inodes WHERE history_key = ?1")?;
-            stmt.query_map([key.0], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-        };
-        // Texts load their fragment trees on first use, so memory and wake
-        // time follow the files actually touched, not the tree's size.
+        // Inodes (and their texts) load on first use, so memory follows the
+        // files actually touched, not the tree's size. Only each inode's id
+        // and the directories it was placed under are read now.
         let reader = Arc::new(self.blob_reader(key)?);
-        let mut inodes = Vec::with_capacity(rows.len());
-        for (data, root) in rows {
-            let stored: StoredInode = dec(&decompress(&data)?)?;
-            let text = root.map(|r| Text::lazy(r as u64, reader.clone()));
-            inodes.push(Inode::from_stored(stored, text));
+        let mut inodes = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT data FROM inodes WHERE history_key = ?1")?;
+            let mut rows = stmt.query([key.0])?;
+            while let Some(row) = rows.next()? {
+                let data: Vec<u8> = row.get(0)?;
+                let stored: StoredInode = dec(&decompress(&data)?)?;
+                let parents: Vec<InodeId> = stored.placement.history().iter().map(|(_, p)| p.parent).collect();
+                inodes.push((stored.id, parents));
+            }
         }
-        // Insertions stay in the store; the blob reader serves them on demand.
-        let contents = Contents::default();
         let mut meta = BTreeMap::new();
         {
             let mut stmt = self.conn.prepare("SELECT key, entry FROM meta WHERE history_key = ?1")?;
@@ -742,7 +760,8 @@ impl Store {
         let status: Option<Vec<u8>> =
             self.conn.query_row("SELECT status FROM histories WHERE history_key = ?1", [key.0], |r| r.get(0))?;
         let status = status.map(|s| dec(&s)).transpose()?.unwrap_or(Status::Healthy);
-        let mut history = History::from_parts(id, dag, inodes, contents, meta, status);
+        let mut history = History::from_stored(id, dag, inodes, Arc::new(StoredInodes(reader.clone())), meta, status);
+        // Insertions stay in the store; the blob reader serves them on demand.
         history.set_blob_source(reader);
         Ok((key, history))
     }
@@ -1182,5 +1201,44 @@ mod tests {
         assert!(free(&s) > 1000);
         s.reclaim_space(100_000).unwrap();
         assert_eq!(free(&s), 0);
+    }
+
+    #[test]
+    fn inodes_load_on_use_and_unload_once_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = HistoryId::random();
+        let actor = ActorId::random();
+        let mut s = Store::open(dir.path().join("s.db")).unwrap();
+        let key = s.create_history(id).unwrap();
+        let mut h = History::new(id);
+        let mut files = Vec::new();
+        for i in 0..50 {
+            let b = write(&mut h, actor, &format!("f{i}"), &format!("file {i}\n"));
+            files.push(InodeId::new(b.header.op_id(0), 0));
+            s.append(key, &b, Origin::Local, &mut h).unwrap();
+        }
+        let (_, mut loaded) = s.load(id).unwrap();
+        assert_eq!(loaded.tree().loaded_count(), 1, "only the root is resident after loading");
+        assert_eq!(loaded.text(&files[7]).unwrap(), b"file 7\n");
+        assert_eq!(loaded.lookup("f9"), Some(files[9]));
+        assert!(loaded.tree().loaded_count() > 1);
+        // Edit an inode that was never loaded, persist, then drop everything.
+        let (b, r) = loaded
+            .transact(actor, None, |t| {
+                t.push(Op::EditText {
+                    inode: files[3],
+                    text: b"FILE".to_vec(),
+                    splices: vec![ondb_core::Splice { at: 0, del: 4, ins: 4 }],
+                })
+            })
+            .unwrap();
+        r.unwrap();
+        s.append(key, &b.unwrap(), Origin::Local, &mut loaded).unwrap();
+        loaded.trim(0);
+        assert_eq!(loaded.tree().loaded_count(), 1);
+        assert_eq!(loaded.text(&files[3]).unwrap(), b"FILE 3\n", "unloaded edits read back from the store");
+        assert_eq!(loaded.walk().len(), 50);
+        let (_, again) = s.load(id).unwrap();
+        assert_eq!(again.text(&files[3]).unwrap(), b"FILE 3\n");
     }
 }

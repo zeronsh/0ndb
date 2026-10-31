@@ -64,9 +64,11 @@
   them into the store if pinning fails. Never skip storing a blob without
   queueing its pin. `external_objects` records the repository so workspaces
   opened without a mount can still read the content.
-- Stored texts load lazily (`Text::lazy`): loading a history reads no text
-  nodes, and a text reads its tree on first use. Never walk every file's
-  text on load or wake.
+- Inodes and texts load lazily (`Tree::insert_unloaded`, `Text::lazy`):
+  loading a history keeps only ids and the children index; a row is read on
+  first use. Once persisted, loaded inodes past `LOADED_INODES` are dropped
+  (`History::trim`). Use `Tree::ids`/`History::has_inode` when you don't
+  need the inode itself; never walk every inode on load, wake or remount.
 - Materialization plans only inodes touched since the synced version (plus,
   on first mount, ones the shadow lacks); never read every file back out of
   the history to compare.

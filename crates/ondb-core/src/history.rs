@@ -509,6 +509,33 @@ impl History {
         self.meta.get(key)
     }
 
+    /// Reassembles a history whose inodes stay in the store until used:
+    /// `inodes` lists each id with the directories it was placed under.
+    pub fn from_stored(
+        id: HistoryId,
+        dag: Dag,
+        inodes: Vec<(InodeId, Vec<InodeId>)>,
+        source: Arc<dyn crate::tree::InodeSource>,
+        meta: BTreeMap<String, MetaEntry>,
+        status: Status,
+    ) -> Self {
+        let mut tree = Tree::new();
+        for (i, parents) in inodes {
+            tree.insert_unloaded(i, parents);
+        }
+        tree.set_source(source);
+        History { id, dag, tree, contents: Contents::default(), meta, status, dirty: Dirty::default() }
+    }
+
+    /// Unloads inodes beyond `budget` once everything is persisted (they
+    /// reload from the store on use), so a long-running active history's
+    /// memory follows what it is working on, not everything it has touched.
+    pub fn trim(&mut self, budget: usize) {
+        if self.dirty.inodes.is_empty() && self.tree.loaded_count() > budget {
+            self.tree.unload_except(&HashSet::new());
+        }
+    }
+
     /// Reassembles a history from durably stored parts.
     pub fn from_parts(
         id: HistoryId,
@@ -523,6 +550,11 @@ impl History {
             tree.insert(i);
         }
         History { id, dag, tree, contents, meta, status, dirty: Dirty::default() }
+    }
+
+    /// Whether the inode exists, without loading it.
+    pub fn has_inode(&self, id: &InodeId) -> bool {
+        self.tree.contains(id)
     }
 
     pub fn heads(&self) -> &Version {

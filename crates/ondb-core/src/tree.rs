@@ -110,11 +110,59 @@ impl Inode {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Where stored inodes are read from when first used (see
+/// [`Tree::insert_unloaded`]).
+pub trait InodeSource: Send + Sync {
+    fn inode(&self, id: &InodeId) -> Option<Inode>;
+}
+
+/// An inode, possibly not loaded yet. Unloaded slots cost their key and a
+/// pointer, so a large tree's untouched entries stay out of memory.
+#[derive(Clone, Default)]
+struct Slot(std::sync::OnceLock<Box<Inode>>);
+
+impl Slot {
+    fn loaded(inode: Inode) -> Slot {
+        Slot(std::sync::OnceLock::from(Box::new(inode)))
+    }
+}
+
+#[derive(Clone)]
 pub struct Tree {
-    inodes: HashMap<InodeId, Inode>,
+    inodes: HashMap<InodeId, Slot>,
     /// Every inode that has ever been placed under a directory.
     children: HashMap<InodeId, BTreeSet<InodeId>>,
+    source: Option<std::sync::Arc<dyn InodeSource>>,
+}
+
+impl std::fmt::Debug for Tree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tree").field("inodes", &self.inodes.len()).field("loaded", &self.loaded_count()).finish()
+    }
+}
+
+/// Serialized with every inode loaded.
+#[derive(Serialize, Deserialize)]
+struct TreeRepr {
+    inodes: Vec<Inode>,
+}
+
+impl Serialize for Tree {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut inodes: Vec<Inode> = self.inodes().cloned().collect();
+        inodes.sort_by_key(|i| i.id);
+        TreeRepr { inodes }.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tree {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut tree = Tree::new();
+        for i in TreeRepr::deserialize(d)?.inodes {
+            tree.insert(i);
+        }
+        Ok(tree)
+    }
 }
 
 impl Default for Tree {
@@ -131,15 +179,72 @@ pub fn conflict_name(name: &str, winner_loser_op: OpId) -> String {
 impl Tree {
     pub fn new() -> Self {
         let root = Inode { id: InodeId::ROOT, kind: NodeKind::Dir, placement: Lww::default(), alive: Lww::new(OpId::ZERO, true) };
-        Tree { inodes: HashMap::from([(InodeId::ROOT, root)]), children: HashMap::new() }
+        Tree { inodes: HashMap::from([(InodeId::ROOT, Slot::loaded(root))]), children: HashMap::new(), source: None }
+    }
+
+    fn read(source: &Option<std::sync::Arc<dyn InodeSource>>, id: &InodeId) -> Box<Inode> {
+        // The row was readable when the history loaded and stays while the
+        // inode exists; failing now means the store is broken, and carrying
+        // on without the inode would corrupt it.
+        Box::new(source.as_ref().and_then(|s| s.inode(id)).unwrap_or_else(|| panic!("0ndb: loading stored inode {id:?} failed")))
     }
 
     pub fn get(&self, id: &InodeId) -> Option<&Inode> {
-        self.inodes.get(id)
+        let slot = self.inodes.get(id)?;
+        Some(slot.0.get_or_init(|| Self::read(&self.source, id)))
+    }
+
+    fn at(&self, id: &InodeId) -> &Inode {
+        self.get(id).expect("inode is in the tree")
     }
 
     pub fn get_mut(&mut self, id: &InodeId) -> Option<&mut Inode> {
-        self.inodes.get_mut(id)
+        let slot = self.inodes.get_mut(id)?;
+        if slot.0.get().is_none() {
+            let _ = slot.0.set(Self::read(&self.source, id));
+        }
+        slot.0.get_mut().map(|b| &mut **b)
+    }
+
+    /// Whether the inode exists, without loading it.
+    pub fn contains(&self, id: &InodeId) -> bool {
+        self.inodes.contains_key(id)
+    }
+
+    /// Every inode id, without loading any.
+    pub fn ids(&self) -> impl Iterator<Item = &InodeId> {
+        self.inodes.keys()
+    }
+
+    /// Adds a stored inode without loading it: only its id and the
+    /// directories it has been placed under are kept until first use.
+    pub fn insert_unloaded(&mut self, id: InodeId, parents: impl IntoIterator<Item = InodeId>) {
+        for p in parents {
+            self.children.entry(p).or_default().insert(id);
+        }
+        self.inodes.insert(id, Slot::default());
+    }
+
+    pub fn set_source(&mut self, source: std::sync::Arc<dyn InodeSource>) {
+        self.source = Some(source);
+    }
+
+    pub fn loaded_count(&self) -> usize {
+        self.inodes.values().filter(|s| s.0.get().is_some()).count()
+    }
+
+    /// Drops loaded inodes not in `keep` (they reload from the source on
+    /// next use). Callers must only drop inodes whose state is persisted.
+    /// No-op without a source.
+    pub fn unload_except(&mut self, keep: &std::collections::HashSet<InodeId>) {
+        if self.source.is_none() {
+            return;
+        }
+        for (id, slot) in self.inodes.iter_mut() {
+            if !id.is_root() && !keep.contains(id) {
+                *slot = Slot::default();
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -150,26 +255,27 @@ impl Tree {
         self.inodes.len() <= 1
     }
 
+    /// Every inode, loading each. Prefer [`Tree::ids`] when ids suffice.
     pub fn inodes(&self) -> impl Iterator<Item = &Inode> {
-        self.inodes.values()
+        self.inodes.keys().map(|id| self.at(id))
     }
 
     pub fn insert(&mut self, inode: Inode) {
         for (_, p) in inode.placement.history() {
             self.children.entry(p.parent).or_default().insert(inode.id);
         }
-        self.inodes.insert(inode.id, inode);
+        self.inodes.insert(inode.id, Slot::loaded(inode));
     }
 
     pub fn place(&mut self, id: InodeId, op: OpId, placement: Placement) {
         self.children.entry(placement.parent).or_default().insert(id);
-        if let Some(inode) = self.inodes.get_mut(&id) {
+        if let Some(inode) = self.get_mut(&id) {
             inode.placement.set(op, placement);
         }
     }
 
     fn alive_in(&self, view: &dyn View, id: &InodeId) -> bool {
-        self.inodes.get(id).and_then(|i| i.alive.get_in(view)).copied().unwrap_or(false)
+        self.get(id).and_then(|i| i.alive.get_in(view)).copied().unwrap_or(false)
     }
 
     /// Effective placement after breaking rename cycles. Cycles (two
@@ -187,7 +293,7 @@ impl Tree {
             loop {
                 if cur.is_root() {
                     let n = demoted.get(id).copied().unwrap_or(0);
-                    return self.inodes.get(id)?.placement.nth_in(view, n).map(|(_, p)| p);
+                    return self.get(id)?.placement.nth_in(view, n).map(|(_, p)| p);
                 }
                 if let Some(pos) = chain.iter().position(|c| *c == cur) {
                     let cycle = &chain[pos..];
@@ -195,7 +301,7 @@ impl Tree {
                         .iter()
                         .max_by_key(|c| {
                             let n = demoted.get(*c).copied().unwrap_or(0);
-                            self.inodes[*c].placement.nth_in(view, n).map(|(o, _)| o)
+                            self.at(c).placement.nth_in(view, n).map(|(o, _)| o)
                         })
                         .copied()?;
                     *demoted.entry(victim).or_default() += 1;
@@ -203,7 +309,7 @@ impl Tree {
                 }
                 chain.push(cur);
                 let n = demoted.get(&cur).copied().unwrap_or(0);
-                let (_, p) = self.inodes.get(&cur)?.placement.nth_in(view, n)?;
+                let (_, p) = self.get(&cur)?.placement.nth_in(view, n)?;
                 cur = p.parent;
             }
         }
@@ -216,7 +322,7 @@ impl Tree {
         if id.is_root() {
             return true;
         }
-        let Some(inode) = self.inodes.get(id) else { return false };
+        let Some(inode) = self.get(id) else { return false };
         if inode.placement.get_in(view).is_none() {
             return false;
         }
@@ -239,7 +345,7 @@ impl Tree {
             if !self.is_present(view, &c) {
                 continue;
             }
-            let inode = &self.inodes[&c];
+            let inode = self.at(&c);
             if let Some((op, p)) = inode.placement.nth_in(view, 0) {
                 by_name.entry(p.name.clone()).or_default().push((op, c));
             }
@@ -298,7 +404,7 @@ impl Tree {
         while let Some(d) = stack.pop() {
             for c in self.child_ids(view, &d) {
                 out.push(c);
-                if self.inodes[&c].is_dir() {
+                if self.at(&c).is_dir() {
                     stack.push(c);
                 }
             }
@@ -318,7 +424,7 @@ impl Tree {
         for (name, id) in self.list(view, dir) {
             let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
             out.push((path.clone(), id));
-            if self.inodes[&id].is_dir() {
+            if self.at(&id).is_dir() {
                 self.walk_into(view, &id, &path, out);
             }
         }

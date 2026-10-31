@@ -241,9 +241,9 @@ impl MountState {
     /// Drops cached entries whose inodes the history doesn't know (e.g. the
     /// store was rebuilt), so they're treated as new rather than corrupting.
     pub(super) fn validate_shadow(&mut self) {
-        let stale: Vec<String> = self
-            .ws
-            .read(|h| self.shadow.paths().filter(|p| h.inode(&self.shadow.get(p).unwrap().inode).is_none()).cloned().collect());
+        let stale: Vec<String> = self.ws.read(|h| {
+            self.shadow.paths().filter(|p| !h.has_inode(&self.shadow.get(p).unwrap().inode)).map(str::to_string).collect()
+        });
         for p in stale {
             self.shadow.remove(&p);
         }
@@ -271,7 +271,7 @@ impl MountState {
         };
         match scope {
             Scope::Full => {
-                out.extend(self.shadow.paths().cloned());
+                out.extend(self.shadow.paths().map(str::to_string));
                 walk_into("", &mut out);
             }
             Scope::Paths(paths) => {
@@ -309,6 +309,7 @@ impl MountState {
     /// as one batch by the ingestion actor, parented on the synced version.
     pub(super) fn reconcile(&mut self, scope: Scope) -> Result<Option<BatchId>, Error> {
         let out = self.reconcile_pass(scope)?;
+        self.ws.trim();
         // Content referenced in git's objects is pinned in bulk, once per
         // pass rather than once per batch.
         if self.objects.is_some() {

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use ondb_core::{InodeId, Oid};
 use ondb_store::MountEntryRow;
@@ -46,8 +47,9 @@ pub struct Entry {
 /// they can be persisted incrementally.
 #[derive(Default)]
 pub struct Shadow {
-    by_path: BTreeMap<String, Entry>,
-    by_inode: HashMap<InodeId, String>,
+    /// Each path is stored once, shared by both maps.
+    by_path: BTreeMap<Arc<str>, Entry>,
+    by_inode: HashMap<InodeId, Arc<str>>,
     dirty: HashSet<String>,
     removed: HashSet<String>,
 }
@@ -61,8 +63,9 @@ impl Shadow {
                 _ => None,
             };
             let e = Entry { inode: r.inode, kind: Kind::from_code(r.kind), oid: r.oid, exec: r.mode == 1, stat };
-            s.by_inode.insert(e.inode, r.path.clone());
-            s.by_path.insert(r.path, e);
+            let path: Arc<str> = r.path.into();
+            s.by_inode.insert(e.inode, path.clone());
+            s.by_path.insert(path, e);
         }
         s
     }
@@ -76,39 +79,44 @@ impl Shadow {
     }
 
     pub fn path_of(&self, inode: &InodeId) -> Option<&str> {
-        self.by_inode.get(inode).map(|s| s.as_str())
+        self.by_inode.get(inode).map(|s| &**s)
     }
 
-    pub fn paths(&self) -> impl Iterator<Item = &String> {
-        self.by_path.keys()
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.by_path.keys().map(|p| &**p)
     }
 
     /// Paths strictly under `dir`.
     pub fn under(&self, dir: &str) -> Vec<String> {
         let start = format!("{dir}/");
-        self.by_path.range(start.clone()..).take_while(|(p, _)| p.starts_with(&start)).map(|(p, _)| p.clone()).collect()
+        self.by_path
+            .range::<str, _>((std::ops::Bound::Included(start.as_str()), std::ops::Bound::Unbounded))
+            .take_while(|(p, _)| p.starts_with(&start))
+            .map(|(p, _)| p.to_string())
+            .collect()
     }
 
     pub fn insert(&mut self, path: String, entry: Entry) {
         if let Some(old) = self.by_inode.get(&entry.inode).cloned()
-            && old != path
+            && *old != *path
         {
             self.remove(&old);
         }
-        if let Some(prev) = self.by_path.get(&path)
+        if let Some(prev) = self.by_path.get(path.as_str())
             && prev.inode != entry.inode
         {
             self.by_inode.remove(&prev.inode);
         }
-        self.by_inode.insert(entry.inode, path.clone());
         self.removed.remove(&path);
         self.dirty.insert(path.clone());
+        let path: Arc<str> = path.into();
+        self.by_inode.insert(entry.inode, path.clone());
         self.by_path.insert(path, entry);
     }
 
     pub fn remove(&mut self, path: &str) -> Option<Entry> {
         let e = self.by_path.remove(path)?;
-        if self.by_inode.get(&e.inode).is_some_and(|p| p == path) {
+        if self.by_inode.get(&e.inode).is_some_and(|p| &**p == path) {
             self.by_inode.remove(&e.inode);
         }
         self.dirty.remove(path);
@@ -144,7 +152,7 @@ impl Shadow {
             .dirty
             .drain()
             .filter_map(|p| {
-                let e = self.by_path.get(&p)?;
+                let e = self.by_path.get(p.as_str())?;
                 Some(MountEntryRow {
                     path: p,
                     inode: e.inode,

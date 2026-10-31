@@ -109,6 +109,9 @@ const OPEN: &str = "the store is open while awake";
 
 /// Batch summaries kept in memory; older ones are re-derived from the store.
 const SUMMARY_CACHE: usize = 4096;
+/// Inodes kept loaded once persisted; beyond this they are unloaded and
+/// reloaded from the store on use (`History::trim`).
+const LOADED_INODES: usize = 16384;
 
 struct Inner {
     /// Closed while hibernating (file-backed stores only).
@@ -202,6 +205,7 @@ impl Inner {
             return Err(e.into());
         }
         self.remember(BatchSummary::of(batch));
+        self.history.trim(LOADED_INODES);
         Ok(())
     }
 }
@@ -381,6 +385,15 @@ impl Workspace {
         match inner.db.as_mut() {
             Some(db) if external => Ok(db.flush_pins(key)?),
             _ => Ok(0),
+        }
+    }
+
+    /// Unloads persisted inodes beyond the resident budget (after
+    /// read-heavy work such as validating a mount).
+    pub fn trim(&self) {
+        let mut inner = self.raw_lock();
+        if inner.hibernated.is_none() {
+            inner.history.trim(LOADED_INODES);
         }
     }
 

@@ -155,8 +155,8 @@ fn main() {
     ws.hibernate();
     line("hibernate", Some(t.elapsed()), cpu0);
     let t = Instant::now();
-    let _ = ws.read(|h| h.walk().len());
-    line("wake (reload history)", Some(t.elapsed()), cpu0);
+    let _ = ws.read(|h| h.lookup("drivers/net/Makefile"));
+    line("wake + one lookup", Some(t.elapsed()), cpu0);
 
     // Editors run `git status` constantly; each may rewrite the index.
     let c = cpu_and_rss().0;
