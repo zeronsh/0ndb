@@ -248,8 +248,13 @@ registering it. Nothing polls: provider calls happen on request.
   tool call is an attribution scope. Branching follows one fixed rule, not
   an option: editing a message or switching branches makes the files exactly
   what they were at that point (everything since is undone, people's edits
-  included), except git checkouts, which are never undone. Undoing only an
-  agent's work is a separate, explicit action (reverting its scope).
+  included), and git goes back too. Each message records git's branch and
+  commit. If git has moved since (a branch switch, or new commits), HEAD
+  returns to that commit: on its branch if the branch still points there,
+  otherwise on a new `ondb/<thread>` branch made at it, so existing branches
+  are never moved or rewritten. A merge or rebase in progress blocks the
+  restore. Undoing only an agent's work is a separate, explicit action
+  (reverting its scope).
 * **Provider sessions are chosen per turn.** Continue the native session that
   last saw this branch; else fork a native session at the branch point if the
   provider can (Claude Code: `--resume-session-at` + `--fork-session`); else

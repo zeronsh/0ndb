@@ -425,6 +425,8 @@ fn turns_cut_short_by_a_crash_resume_at_startup() {
         error: None,
         created_ms: ondb_core::now_ms(),
         switched_from: None,
+        git_branch: None,
+        git_commit: None,
     };
     store.insert_message(&msg("u2", &first.id, Role::User, "write b.txt two", Status::Done)).unwrap();
     store.insert_message(&msg("a2", "u2", Role::Assistant, "partial", Status::Running)).unwrap();
@@ -454,4 +456,72 @@ fn turns_cut_short_by_a_crash_resume_at_startup() {
     let (ws, _) = e.worktrees.workspace(&e.wt.id).unwrap();
     assert_eq!(text(&ws, "b.txt").as_deref(), Some("two\n"));
     assert!(restarted.resume_interrupted().is_empty(), "resumes once per startup");
+}
+
+#[test]
+fn restoring_a_message_returns_git_to_where_it_was() {
+    use ondb_agents::Update;
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let wt = e.wt.path.clone();
+    let git = "git -c user.name=t -c user.email=t@t";
+    let out = |cmd: &str| -> String {
+        String::from_utf8(Command::new("sh").arg("-c").arg(cmd).current_dir(&wt).output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let (ws, mount) = e.worktrees.workspace(&e.wt.id).unwrap();
+    let start_branch = out("git symbolic-ref --short HEAD");
+    let start_commit = out("git rev-parse HEAD");
+    let t = s.create_thread(&e.wt.id, "git moves").unwrap();
+    let first = s.send(&t.id, "write a.txt one", "alpha", None).unwrap().wait().unwrap();
+    let u1 = first.parent.clone().unwrap();
+
+    // Mid-conversation, someone switches to a new branch and commits there.
+    sh(&wt, &format!("{git} switch -qc feature && echo feat > feat.txt && {git} add feat.txt && {git} commit -qm feat"));
+    mount.fence().unwrap();
+    let feature_commit = out("git rev-parse HEAD");
+    let second = s.send(&t.id, "write b.txt two", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(s.store().message(second.parent.as_ref().unwrap()).unwrap().unwrap().git_branch.as_deref(), Some("feature"));
+
+    // Editing the first message goes back to the first branch and its files.
+    let updates = s.subscribe();
+    let edited = s.edit(&u1, "write c.txt three", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(out("git symbolic-ref --short HEAD"), start_branch);
+    assert_eq!(out("git rev-parse HEAD"), start_commit);
+    assert!(!wt.join("feat.txt").exists() && !wt.join("a.txt").exists() && !wt.join("b.txt").exists());
+    assert_eq!(fs::read_to_string(wt.join("c.txt")).unwrap(), "three\n");
+    assert!(updates.try_iter().any(|u| matches!(u, Update::GitMoved { created: false, .. })));
+    assert_eq!(out("git status --porcelain"), "?? c.txt", "git agrees with the files: only the new reply's work is uncommitted");
+
+    // Switching back to the other conversation branch returns to `feature`.
+    s.switch_branch(&second.id).unwrap();
+    assert_eq!(out("git symbolic-ref --short HEAD"), "feature");
+    assert_eq!(out("git rev-parse HEAD"), feature_commit);
+    for (f, body) in [("feat.txt", "feat\n"), ("a.txt", "one\n"), ("b.txt", "two\n")] {
+        assert_eq!(fs::read_to_string(wt.join(f)).unwrap(), body);
+    }
+    assert!(!wt.join("c.txt").exists());
+
+    // `feature` moves on; going back to that message must not move it, so a
+    // new branch is made at the commit the message was on.
+    s.switch_branch(&edited.id).unwrap();
+    assert_eq!(out("git symbolic-ref --short HEAD"), start_branch);
+    sh(
+        &wt,
+        &format!(
+            "{git} switch -q feature && echo more > more.txt && {git} add more.txt && {git} commit -qm more && {git} switch -q {start_branch}"
+        ),
+    );
+    mount.fence().unwrap();
+    let feature_tip = out("git rev-parse feature");
+    s.switch_branch(&second.id).unwrap();
+    let now = out("git symbolic-ref --short HEAD");
+    assert!(now.starts_with("ondb/"), "on a new branch, not {now}");
+    assert_eq!(out("git rev-parse HEAD"), feature_commit);
+    assert_eq!(out("git rev-parse feature"), feature_tip, "existing branches are never moved");
+    assert_eq!(fs::read_to_string(wt.join("b.txt")).unwrap(), "two\n");
+    assert!(!wt.join("more.txt").exists());
+    let _ = ws;
 }

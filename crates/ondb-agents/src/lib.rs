@@ -27,6 +27,8 @@ pub enum Error {
     Ondb(#[from] ondb::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Git(#[from] ondb::git::Error),
     #[error("provider: {0}")]
     Provider(String),
     #[error("thread {0} already has a turn running")]

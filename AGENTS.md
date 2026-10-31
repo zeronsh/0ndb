@@ -124,6 +124,11 @@
   recent one (12 h, at most 3 revivals in a row) with its prompt against the
   same provider session, the new reply parented on the interrupted one so
   the transcript stays linear.
-- Branch navigation has one fixed file rule (exact restore to the message's
-  version, git checkouts excepted). Don't add user-selectable branching
+- Branch navigation has one fixed rule: files and git both return to where
+  they were at the message. Messages record git's branch and commit; if git
+  has moved since, HEAD goes back to that commit on its branch when the
+  branch still points there and isn't checked out elsewhere, otherwise on a
+  new `ondb/<thread>` branch made at it (`Sessions::git_move`). Never move,
+  reset or delete an existing branch. Git checkouts in between are undone
+  only when git moves back with them. Don't add user-selectable branching
   behaviour; partial undo belongs to explicit scope reverts.

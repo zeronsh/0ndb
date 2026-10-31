@@ -228,6 +228,58 @@ impl Repo {
             .collect())
     }
 
+    /// Whether `oid` names a commit this repository has.
+    pub fn commit_exists(&self, oid: &str) -> Result<bool, Error> {
+        Ok(self.git().args(["cat-file", "-e", &format!("{oid}^{{commit}}")]).output()?.success())
+    }
+
+    /// The commit `refs/heads/<name>` points at.
+    pub fn branch_tip(&self, name: &str) -> Result<Option<String>, Error> {
+        let out = self.git().args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}^{{commit}}")]).output()?;
+        Ok(out.success().then(|| out.text().trim().to_string()))
+    }
+
+    /// Whether another worktree of this repository has `name` checked out.
+    pub fn branch_checked_out_elsewhere(&self, name: &str) -> Result<bool, Error> {
+        let here = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        Ok(self.worktrees()?.iter().any(|w| {
+            w.branch.as_deref() == Some(name) && std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) != here
+        }))
+    }
+
+    /// A merge, rebase, cherry-pick, revert or bisect in progress here.
+    pub fn operation(&self) -> Option<&'static str> {
+        [
+            ("MERGE_HEAD", "merge"),
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+            ("BISECT_LOG", "bisect"),
+        ]
+        .into_iter()
+        .find(|(f, _)| self.git_dir.join(f).exists())
+        .map(|(_, op)| op)
+    }
+
+    pub fn create_branch(&self, name: &str, at: &str) -> Result<(), Error> {
+        self.git().args(["branch", "--no-track", name, at]).ok()?;
+        Ok(())
+    }
+
+    /// Points HEAD at `branch` (or, with `None`, detaches it at `commit`)
+    /// and resets the index to it, leaving the working tree untouched: the
+    /// caller owns the files. Logged in HEAD's reflog as a checkout.
+    pub fn move_head(&self, branch: Option<&str>, commit: &str, reason: &str) -> Result<(), Error> {
+        let msg = format!("checkout: {reason}");
+        match branch {
+            Some(b) => self.git().args(["symbolic-ref", "-m", &msg, "HEAD", &format!("refs/heads/{b}")]).ok()?,
+            None => self.git().args(["update-ref", "--no-deref", "-m", &msg, "HEAD", commit]).ok()?,
+        };
+        self.git().args(["reset", "--quiet", "--mixed"]).ok()?;
+        Ok(())
+    }
+
     pub fn branch_exists(&self, name: &str) -> Result<bool, Error> {
         Ok(self.git().args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{name}")]).output()?.success())
     }

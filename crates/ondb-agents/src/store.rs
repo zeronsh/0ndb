@@ -135,6 +135,11 @@ pub struct Message {
     pub created_ms: u64,
     /// The provider this reply took over from (a provider switch seam).
     pub switched_from: Option<String>,
+    /// Where git was (branch, `None` if detached, and commit): before the
+    /// turn for user messages, after it for replies. Restoring a message
+    /// returns git there too.
+    pub git_branch: Option<String>,
+    pub git_commit: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,11 +227,12 @@ fn message_row(r: &Row<'_>) -> rusqlite::Result<Message> {
         error: r.get(12)?,
         created_ms: r.get::<_, i64>(13)? as u64,
         switched_from: r.get(14)?,
+        git_branch: r.get(15)?,
+        git_commit: r.get(16)?,
     })
 }
 
-const MESSAGE_COLS: &str =
-    "id, thread, parent, role, provider, model, text, version, scope, session, native, status, error, created_ms, switched_from";
+const MESSAGE_COLS: &str = "id, thread, parent, role, provider, model, text, version, scope, session, native, status, error, created_ms, switched_from, git_branch, git_commit";
 
 fn session_row(r: &Row<'_>) -> rusqlite::Result<ProviderSession> {
     Ok(ProviderSession {
@@ -264,6 +270,12 @@ impl Store {
             conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'switched_from'")?.exists([])?;
         if !has_seam {
             conn.execute("ALTER TABLE messages ADD COLUMN switched_from TEXT", [])?;
+        }
+        let has_git: bool = conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'git_commit'")?.exists([])?;
+        if !has_git {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN git_branch TEXT; ALTER TABLE messages ADD COLUMN git_commit TEXT;",
+            )?;
         }
         // A crash mid-turn leaves messages running; nothing is running now.
         let interrupted: Vec<String> = {
@@ -337,7 +349,7 @@ impl Store {
     pub fn insert_message(&self, m: &Message) -> Result<(), Error> {
         self.c().execute(
             &format!(
-                "INSERT INTO messages ({MESSAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+                "INSERT INTO messages ({MESSAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
             ),
             params![
                 m.id,
@@ -354,9 +366,16 @@ impl Store {
                 status_str(m.status),
                 m.error,
                 m.created_ms as i64,
-                m.switched_from
+                m.switched_from,
+                m.git_branch,
+                m.git_commit
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn set_git(&self, id: &str, branch: Option<&str>, commit: Option<&str>) -> Result<(), Error> {
+        self.c().execute("UPDATE messages SET git_branch = ?2, git_commit = ?3 WHERE id = ?1", params![id, branch, commit])?;
         Ok(())
     }
 

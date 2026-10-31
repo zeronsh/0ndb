@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use ondb::{ActorKind, Recorder, ScopeKind, Worktrees};
-use ondb_core::Version;
 
 use crate::Error;
 use crate::provider::{EventKind, Interrupter, Provider, Run, StartRequest};
@@ -50,6 +49,14 @@ impl Default for SessionOptions {
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
+    /// Restoring a message moved git back to where it was then: onto
+    /// `branch` (`created` when 0ndb had to make it), or detached.
+    GitMoved {
+        thread: String,
+        branch: Option<String>,
+        commit: String,
+        created: bool,
+    },
     /// The user message of a turn that just started (and its assistant id).
     TurnStarted {
         thread: String,
@@ -387,7 +394,7 @@ impl Sessions {
         }
         let t = self.thread(&m.thread)?;
         self.check_idle(&t.id)?;
-        self.restore(&t.worktree, m.version.as_ref())?;
+        self.restore(&t, &m)?;
         self.start_turn(&t.id, m.parent.clone(), prompt, provider, model)
     }
 
@@ -400,7 +407,7 @@ impl Sessions {
         while let Some(next) = self.inner.store.children(&t.id, Some(&leaf.id))?.pop() {
             leaf = next;
         }
-        self.restore(&t.worktree, leaf.version.as_ref())?;
+        self.restore(&t, &leaf)?;
         self.inner.store.set_leaf(&t.id, &leaf.id)?;
         Ok(leaf)
     }
@@ -412,23 +419,35 @@ impl Sessions {
         Ok(())
     }
 
-    /// Makes the worktree's files exactly what they were at `target`. One
-    /// fixed rule, so branches are predictable: everything since is undone
-    /// (people's edits included), except git checkouts.
-    fn restore(&self, worktree: &str, target: Option<&Version>) -> Result<(), Error> {
-        let Some(target) = target else { return Ok(()) };
+    /// Makes the worktree exactly what it was at `target`: its files, and
+    /// git's position. One fixed rule, so branches are predictable:
+    /// everything since is undone, people's edits included. When git has
+    /// moved since (another branch, or commits), HEAD goes back to that
+    /// commit on its branch if the branch still points there, otherwise on
+    /// a new `ondb/<thread>` branch made at it; existing branches are never
+    /// moved or deleted. If git is where it was, git checkouts in between
+    /// are kept (as before).
+    fn restore(&self, thread: &Thread, target: &Message) -> Result<(), Error> {
+        let Some(version) = target.version.as_ref() else { return Ok(()) };
+        let wt = self
+            .inner
+            .worktrees
+            .get(&thread.worktree)
+            .ok_or_else(|| Error::Invalid(format!("no worktree {}", thread.worktree)))?;
         let (ws, mount) = self
             .inner
             .worktrees
-            .workspace(worktree)
-            .ok_or_else(|| Error::Invalid(format!("worktree {worktree} isn't mounted")))?;
+            .workspace(&thread.worktree)
+            .ok_or_else(|| Error::Invalid(format!("worktree {} isn't mounted", thread.worktree)))?;
         mount.fence()?;
+        // Decide (and check) the git move before touching any file.
+        let git_move = self.git_move(&wt.path, thread, target)?;
         let restorer = ws.actor("restore", ActorKind::Agent)?;
         let mut undo = HashSet::new();
-        for b in ws.batches_missing_from(target)? {
+        for b in ws.batches_missing_from(version)? {
             let id = b.id();
             let s = ws.summary(&id)?;
-            if s.git_checkout || s.is_annotation_only() {
+            if s.is_annotation_only() || (s.git_checkout && git_move.is_none()) {
                 continue;
             }
             undo.insert(id);
@@ -436,7 +455,49 @@ impl Sessions {
         if ondb::revert::revert_batches(&ws, restorer, &undo)?.is_some() {
             mount.fence()?;
         }
+        if let Some(m) = git_move {
+            let repo = ondb::git::Repo::open(&wt.path)?;
+            if m.create {
+                repo.create_branch(m.branch.as_deref().expect("created branches have names"), &m.commit)?;
+            }
+            let reason = format!("moving to {} (0ndb restored a message)", m.branch.as_deref().unwrap_or(&m.commit));
+            repo.move_head(m.branch.as_deref(), &m.commit, &reason)?;
+            mount.fence()?;
+            self.inner.emit(Update::GitMoved {
+                thread: thread.id.clone(),
+                branch: m.branch,
+                commit: m.commit,
+                created: m.create,
+            });
+        }
         Ok(())
+    }
+
+    /// Where git must go to be where it was at `target`, or `None` if it is
+    /// already there (or the message predates git tracking).
+    fn git_move(&self, path: &std::path::Path, thread: &Thread, target: &Message) -> Result<Option<GitMove>, Error> {
+        let Some(commit) = target.git_commit.clone() else { return Ok(None) };
+        let Ok(repo) = ondb::git::Repo::open(path) else { return Ok(None) };
+        let head = repo.head()?;
+        if head.oid.as_deref() == Some(commit.as_str()) && head.branch == target.git_branch {
+            return Ok(None);
+        }
+        if let Some(op) = repo.operation() {
+            return Err(Error::Invalid(format!("a git {op} is in progress; finish or abort it first")));
+        }
+        if !repo.commit_exists(&commit)? {
+            return Err(Error::Invalid(format!(
+                "the commit this message was on ({}) no longer exists",
+                &commit[..commit.len().min(12)]
+            )));
+        }
+        Ok(Some(match &target.git_branch {
+            None => GitMove { branch: None, commit, create: false },
+            Some(b) if repo.branch_tip(b)?.as_deref() == Some(commit.as_str()) && !repo.branch_checked_out_elsewhere(b)? => {
+                GitMove { branch: Some(b.clone()), commit, create: false }
+            }
+            Some(_) => GitMove { branch: Some(repo.unique_branch("ondb/", &thread.title)?), commit, create: true },
+        }))
     }
 
     fn start_turn(
@@ -458,6 +519,7 @@ impl Sessions {
         let (ws, mount) =
             self.inner.worktrees.workspace(&wt.id).ok_or_else(|| Error::Invalid(format!("worktree {} isn't mounted", wt.id)))?;
         mount.fence()?;
+        let git_at = git_head(&wt.path);
         let user = Message {
             id: new_id(),
             thread: t.id.clone(),
@@ -467,6 +529,8 @@ impl Sessions {
             model: None,
             text: prompt.to_string(),
             version: Some(ws.heads()),
+            git_branch: git_at.branch,
+            git_commit: git_at.oid,
             scope: None,
             session: None,
             native: None,
@@ -527,6 +591,18 @@ impl Sessions {
         })?;
         Ok(Turn { thread: t.id, user: user.id, assistant, done: rx, control })
     }
+}
+
+/// How `restore` moves git (see `Sessions::git_move`).
+struct GitMove {
+    branch: Option<String>,
+    commit: String,
+    create: bool,
+}
+
+/// Where git is in `path` (nothing outside a repository).
+fn git_head(path: &std::path::Path) -> ondb::git::Head {
+    ondb::git::Repo::open(path).and_then(|r| r.head()).unwrap_or(ondb::git::Head { branch: None, oid: None })
 }
 
 struct BusyGuard {
@@ -777,6 +853,8 @@ impl TurnJob {
             role: Role::Assistant,
             provider: Some(self.provider.id().to_string()),
             model: self.model.clone(),
+            git_branch: None,
+            git_commit: None,
             text: String::new(),
             version: None,
             scope: None,
@@ -1000,6 +1078,8 @@ impl TurnJob {
         let store = &self.inner.store;
         let version = self.ws.heads();
         store.finish_message(&self.assistant, text, status, error, Some(&version), scope.as_deref(), native, &session.id)?;
+        let git_at = git_head(&self.cwd);
+        store.set_git(&self.assistant, git_at.branch.as_deref(), git_at.oid.as_deref())?;
         if status == Status::Done {
             store.update_session(&session.id, None, Some(&self.assistant), now_ms())?;
         }
