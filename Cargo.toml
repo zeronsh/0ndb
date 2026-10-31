@@ -5,7 +5,7 @@ members = ["crates/ondb-core", "crates/ondb-store", "crates/ondb", "crates/ondb-
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "UNLICENSED"
+license = "MIT"
 publish = false
 rust-version = "1.88"
 
