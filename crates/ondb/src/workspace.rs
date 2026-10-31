@@ -6,7 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use ondb_core::{ActorId, Batch, BatchId, History, HistoryId, InodeId, IntegrateError, Integrated, Oid, Op, Txn, Version};
+use ondb_core::{
+    ActorId, Batch, BatchId, History, HistoryId, InodeId, IntegrateError, Integrated, ObjectStore, Oid, Op, Txn, Version,
+};
 use ondb_store::{HistoryKey, Origin, Store};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -124,6 +126,8 @@ struct Inner {
     waiting: HashMap<BatchId, Batch>,
     rejected: HashSet<BatchId>,
     replica: Uuid,
+    /// Content kept outside the store (the repository's git objects).
+    external: Option<Arc<dyn ObjectStore>>,
 }
 
 impl Inner {
@@ -162,7 +166,8 @@ impl Inner {
                 _ => Ok(None),
             };
             let loaded = reopened.map_err(Error::from).and_then(|db| {
-                if let Some(db) = db {
+                if let Some(mut db) = db {
+                    db.set_external(self.external.clone());
                     self.db = Some(db);
                 }
                 Ok(self.store().load(id)?)
@@ -252,7 +257,20 @@ impl Workspace {
     /// Opens the store at `path`. Uses the given history, the store's only
     /// history, or creates a new one.
     pub fn open(path: impl AsRef<Path>, history: Option<HistoryId>) -> Result<Self, Error> {
-        Self::from_store(Store::open(path.as_ref())?, Some(path.as_ref().to_path_buf()), history)
+        let ws = Self::from_store(Store::open(path.as_ref())?, Some(path.as_ref().to_path_buf()), history)?;
+        // Content referenced in a repository's objects (see `set_objects`)
+        // stays readable without a mount.
+        let record = ws.with(|c| {
+            let (store, key) = c.store();
+            store.external_record(key)
+        })?;
+        if let Some((kind, location, pin_ref)) = record
+            && kind == "git"
+        {
+            let objects = ondb_git::Objects::open(location).pin_to(pin_ref);
+            ws.set_objects(Some(Arc::new(crate::mount::GitObjects(objects))))?;
+        }
+        Ok(ws)
     }
 
     pub fn in_memory(history: Option<HistoryId>) -> Result<Self, Error> {
@@ -288,6 +306,7 @@ impl Workspace {
             waiting: HashMap::new(),
             rejected: HashSet::new(),
             replica,
+            external: None,
         };
         Ok(Workspace { inner: Arc::new(Mutex::new(inner)), subscribers: Arc::new(Mutex::new(Vec::new())), id })
     }
@@ -316,10 +335,48 @@ impl Workspace {
         inner.history = History::new(id);
         inner.hibernated = Some(heads);
         inner.summaries = HashMap::new();
+        if inner.external.is_some() {
+            let key = inner.key;
+            if let Err(e) = inner.store().flush_pins(key) {
+                tracing::warn!(error = %e, "pinning content before hibernating failed");
+            }
+        }
+        if let Some(ext) = &inner.external {
+            ext.release();
+        }
         if inner.db_path.is_some() {
             inner.db = None;
         } else {
             inner.store().shrink_memory();
+        }
+    }
+
+    /// Where content outside the store is found (and pinned): for a git
+    /// checkout, the repository's object database, so files git already
+    /// holds are referenced instead of copied.
+    pub fn set_objects(&self, objects: Option<Arc<dyn ObjectStore>>) -> Result<(), Error> {
+        let mut inner = self.raw_lock();
+        inner.external = objects.clone();
+        let key = inner.key;
+        if let Some(db) = inner.db.as_mut() {
+            db.set_external(objects);
+            if inner.hibernated.is_none() {
+                let reader = inner.db.as_ref().expect(OPEN).blob_reader(key)?;
+                inner.history.set_blob_source(Arc::new(reader));
+            }
+        }
+        Ok(())
+    }
+
+    /// Pins content queued for the external object store (see
+    /// `Store::flush_pins`).
+    pub fn flush_pins(&self) -> Result<usize, Error> {
+        let mut inner = self.raw_lock();
+        let key = inner.key;
+        let external = inner.external.is_some();
+        match inner.db.as_mut() {
+            Some(db) if external => Ok(db.flush_pins(key)?),
+            _ => Ok(0),
         }
     }
 
@@ -382,7 +439,9 @@ impl Workspace {
             let (batch, result) = inner.history.transact(actor, parents, f)?;
             let event = match &batch {
                 Some(b) => {
+                    let t = std::time::Instant::now();
                     inner.persist(b, Origin::Local)?;
+                    crate::timing::add("persist", t.elapsed());
                     Some(Event::Committed(Committed {
                         batch: b.id(),
                         actor,

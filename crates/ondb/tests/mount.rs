@@ -569,3 +569,64 @@ fn large_adoption_commits_in_chunks() {
     let _mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
     assert_eq!(ws.heads(), heads);
 }
+
+#[test]
+fn git_content_is_referenced_pinned_and_survives_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let big: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+    fs::write(root.join("big.txt"), &big).unwrap();
+    fs::write(root.join("small.txt"), "small\n").unwrap();
+    fs::write(root.join("bin.dat"), [0u8, 1, 2, 3, 255]).unwrap();
+    let git = "git -c user.name=t -c user.email=t@t -c init.defaultBranch=main";
+    sh(&root, &format!("{git} init -q && {git} add -A && {git} commit -qm base"));
+    sh(&root, &format!("{git} switch -qc side && echo only-on-side > side.txt && {git} add side.txt && {git} commit -qm side"));
+
+    let db = dir.path().join("0ndb.db");
+    let ws = Workspace::open(&db, None).unwrap();
+    let mount = Mount::start(&ws, &root, MountOptions::default()).unwrap();
+    let side = inode(&ws, "side.txt").unwrap();
+    let stored = ws.with(|c| c.store().0.stored_blob_count()).unwrap();
+    assert_eq!(stored, 0, "everything git holds is referenced, not copied");
+    let pin = format!("refs/0ndb/{}", ws.id());
+    sh(&root, &format!("git rev-parse -q --verify {pin} >/dev/null"));
+
+    // The only commit holding side.txt goes away and git collects garbage.
+    let before = ws.heads();
+    sh(&root, &format!("{git} switch -q main && {git} branch -qD side"));
+    mount.fence().unwrap();
+    assert!(inode(&ws, "side.txt").is_none());
+    sh(&root, "git reflog expire --expire=now --all && git gc -q --prune=now");
+    let side_oid = String::from_utf8(
+        Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .current_dir(&root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(b"only-on-side\n")?;
+                c.wait_with_output()
+            })
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    sh(&root, &format!("git cat-file -e {}", side_oid.trim()));
+
+    // Restoring the deleted file reads it back out of git.
+    let undo: std::collections::HashSet<_> = ws.read(|h| h.dag().difference(h.heads(), &before)).into_iter().collect();
+    ondb::revert::revert_batches(&ws, ws.actor("t", ActorKind::Human).unwrap(), &undo).unwrap();
+    mount.fence().unwrap();
+    assert_eq!(fs::read_to_string(root.join("side.txt")).unwrap(), "only-on-side\n");
+    assert_eq!(inode(&ws, "side.txt"), Some(side), "same file, same identity");
+    drop(mount);
+
+    // Without a mount, a fresh workspace still reads git-held content.
+    drop(ws);
+    let ws = Workspace::open(&db, None).unwrap();
+    assert_eq!(text(&ws, "big.txt").as_deref(), Some(big.as_str()));
+    assert_eq!(text(&ws, "small.txt").as_deref(), Some("small\n"));
+}

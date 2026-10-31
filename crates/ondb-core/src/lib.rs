@@ -13,7 +13,7 @@ pub mod text;
 pub mod tree;
 pub mod version;
 
-pub use contents::{BlobSource, Contents, INLINE_TEXT_MAX, Insertion, InsertionKey, cache_bytes, set_cache_budget};
+pub use contents::{BlobSource, Contents, INLINE_TEXT_MAX, Insertion, InsertionKey, ObjectStore, cache_bytes, set_cache_budget};
 pub use dag::{BatchHeader, Dag, DagError};
 pub use history::{
     ApplyError, Dirty, FileState, GIT_HEAD_KEY, History, HistoryView, IntegrateError, Integrated, MetaEntry, Status, Txn, now_ms,

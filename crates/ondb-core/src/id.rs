@@ -128,10 +128,11 @@ pub struct Oid(pub [u8; 20]);
 
 impl Oid {
     pub fn of_blob(bytes: &[u8]) -> Self {
-        let mut h = sha1_smol::Sha1::new();
+        use sha1::Digest;
+        let mut h = sha1::Sha1::new();
         h.update(format!("blob {}\0", bytes.len()).as_bytes());
         h.update(bytes);
-        Oid(h.digest().bytes())
+        Oid(h.finalize().into())
     }
 
     pub fn hex(&self) -> String {
@@ -161,5 +162,17 @@ mod tests {
         let b = ActorId(Uuid::from_u128(2));
         assert!(OpId::new(1, b) < OpId::new(2, a));
         assert!(OpId::new(2, a) < OpId::new(2, b));
+    }
+}
+
+#[cfg(test)]
+mod oid_tests {
+    use super::Oid;
+
+    #[test]
+    fn blob_ids_match_git() {
+        // `printf 'hello\n' | git hash-object --stdin`
+        assert_eq!(Oid::of_blob(b"hello\n").hex(), "ce013625030ba8dba906f756967f9e9ca394464a");
+        assert_eq!(Oid::of_blob(b"").hex(), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
     }
 }

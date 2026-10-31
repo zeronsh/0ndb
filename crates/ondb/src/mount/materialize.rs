@@ -53,17 +53,32 @@ impl MountState {
         let synced = self.record.synced_version.clone();
         self.ws.with(|ctx| {
             let heads = ctx.history().heads().clone();
+            let touched: std::collections::HashSet<InodeId> = if heads == synced {
+                Default::default()
+            } else {
+                let diff = ctx.history().dag().difference(&heads, &synced);
+                ctx.touched_by(diff)?
+            };
+            let h = ctx.history();
+            let view = h.current();
             let inodes: Vec<InodeId> = if all {
-                ctx.history().tree().inodes().map(|i| i.id).filter(|i| !i.is_root()).collect()
+                // Entries the shadow holds that no batch since the synced
+                // version touched match disk by construction (the shadow is
+                // the synced version on disk; any move or edit since would be
+                // in `touched`). Checking them would read every file back
+                // out of the history.
+                h.tree()
+                    .inodes()
+                    .map(|i| i.id)
+                    .filter(|i| !i.is_root())
+                    .filter(|i| touched.contains(i) || self.shadow.path_of(i).is_none())
+                    .collect()
             } else {
                 if heads == synced {
                     return Ok((heads, Vec::new()));
                 }
-                let diff = ctx.history().dag().difference(&heads, &synced);
-                ctx.touched_by(diff)?.into_iter().collect()
+                touched.into_iter().collect()
             };
-            let h = ctx.history();
-            let view = h.current();
             let mut out: Vec<Desired> = inodes
                 .into_iter()
                 .filter(|i| !i.is_root())
@@ -114,7 +129,9 @@ impl MountState {
         }
         self.wake()?;
         for _ in 0..8 {
+            let t = std::time::Instant::now();
             let (heads, plan) = self.plan(all)?;
+            crate::timing::add("mat.plan", t.elapsed());
             if plan.is_empty() {
                 self.record.synced_version = heads;
                 return self.persist();

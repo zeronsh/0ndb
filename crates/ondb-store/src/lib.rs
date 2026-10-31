@@ -3,14 +3,14 @@
 //! CRDT state only speed up loading. Actor UUIDs are interned per history so
 //! versions and batch keys stay small.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use ondb_core::codec::{self, CodecError};
 use ondb_core::{
     ActorId, Batch, BatchHeader, BatchId, Blob, BlobSource, Content, Contents, Dag, Dirty, History, HistoryId, Inode, InodeId,
-    Insertion, InsertionKey, MetaEntry, NodeStore, Oid, Op, OpId, Status, StoreResult, StoredInode, Text, Version,
+    Insertion, InsertionKey, MetaEntry, NodeStore, ObjectStore, Oid, Op, OpId, Status, StoreResult, StoredInode, Text, Version,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -97,6 +97,17 @@ CREATE TABLE IF NOT EXISTS blobs (
     len INTEGER NOT NULL,
     data BLOB NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS pending_pins (
+    history_key INTEGER NOT NULL,
+    oid BLOB NOT NULL,
+    PRIMARY KEY (history_key, oid)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS external_objects (
+    history_key INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    location TEXT NOT NULL,
+    pin_ref TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS mounts (
     root TEXT PRIMARY KEY,
     history_key INTEGER NOT NULL,
@@ -169,6 +180,9 @@ pub struct Store {
     conn: Connection,
     /// How to open more connections to the same database (blob reader).
     reopen: Reopen,
+    /// Objects held outside the store (the repository's git objects): blobs
+    /// found there are pinned rather than copied, and read back from there.
+    external: Option<Arc<dyn ObjectStore>>,
     actors: HashMap<(i64, ActorId), i64>,
     ordinals: HashMap<(i64, i64), ActorId>,
 }
@@ -204,14 +218,18 @@ impl Reopen {
 pub struct BlobReader {
     conn: std::sync::Mutex<Connection>,
     key: HistoryKey,
+    external: Option<Arc<dyn ObjectStore>>,
 }
 
 impl BlobSource for BlobReader {
     fn blob(&self, oid: &Oid) -> Option<Vec<u8>> {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = conn.prepare_cached("SELECT data FROM blobs WHERE oid = ?1").ok()?;
-        let data: Vec<u8> = stmt.query_row([oid.0.to_vec()], |r| r.get(0)).optional().ok()??;
-        decompress(&data).ok()
+        let stored = (|| {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let mut stmt = conn.prepare_cached("SELECT data FROM blobs WHERE oid = ?1").ok()?;
+            let data: Vec<u8> = stmt.query_row([oid.0.to_vec()], |r| r.get(0)).optional().ok()??;
+            decompress(&data).ok()
+        })();
+        stored.or_else(|| self.external.as_ref()?.read(oid))
     }
 
     fn insertion(&self, key: &InsertionKey) -> Option<Insertion> {
@@ -366,7 +384,13 @@ impl Store {
         let conn = self.reopen.open()?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "cache_size", READER_CACHE_KIB)?;
-        Ok(BlobReader { conn: std::sync::Mutex::new(conn), key })
+        Ok(BlobReader { conn: std::sync::Mutex::new(conn), key, external: self.external.clone() })
+    }
+
+    /// Sets where blobs outside the store are found (see [`ObjectStore`]).
+    /// Blob readers made afterwards use it too.
+    pub fn set_external(&mut self, external: Option<Arc<dyn ObjectStore>>) {
+        self.external = external;
     }
 
     fn init(conn: Connection, reopen: Reopen) -> Result<Store> {
@@ -392,7 +416,7 @@ impl Store {
             }
             Some(other) => return Err(StoreError::Corrupt(format!("unsupported schema version {other}"))),
         }
-        Ok(Store { conn, reopen, actors: HashMap::new(), ordinals: HashMap::new() })
+        Ok(Store { conn, reopen, external: None, actors: HashMap::new(), ordinals: HashMap::new() })
     }
 
     // ----- histories -------------------------------------------------------
@@ -503,6 +527,14 @@ impl Store {
         }
         let stripped = Batch { header: batch.header.clone(), ops: batch.ops.clone(), blobs: Vec::new() };
         let payload = compress(&codec::encode_batch(&stripped));
+        // Blobs the external object store already holds are not copied. They
+        // are queued, in this transaction, to be pinned there in bulk (see
+        // `flush_pins`); until then git keeps them, since they came from
+        // its index or a commit.
+        let external: HashSet<Oid> = match &self.external {
+            Some(ext) => batch.blobs.iter().map(|b| b.oid).filter(|o| ext.contains(o)).collect(),
+            None => HashSet::new(),
+        };
         let tx = self.conn.transaction()?;
         let seq: i64 =
             tx.query_row("SELECT COALESCE(MAX(seq) + 1, 0) FROM batches WHERE history_key = ?1", [key.0], |r| r.get(0))?;
@@ -522,7 +554,13 @@ impl Store {
             ],
         )?;
         if inserted > 0 {
-            for blob in &batch.blobs {
+            for oid in &external {
+                tx.execute(
+                    "INSERT OR IGNORE INTO pending_pins (history_key, oid) VALUES (?1, ?2)",
+                    params![key.0, oid.0.to_vec()],
+                )?;
+            }
+            for blob in batch.blobs.iter().filter(|b| !external.contains(&b.oid)) {
                 tx.execute(
                     "INSERT OR IGNORE INTO blobs (oid, len, data) VALUES (?1, ?2, ?3)",
                     params![blob.oid.0.to_vec(), blob.data.len() as i64, compress(&blob.data)],
@@ -639,7 +677,10 @@ impl Store {
     pub fn blob(&self, oid: &Oid) -> Result<Option<Vec<u8>>> {
         let data: Option<Vec<u8>> =
             self.conn.query_row("SELECT data FROM blobs WHERE oid = ?1", [oid.0.to_vec()], |r| r.get(0)).optional()?;
-        data.map(|d| decompress(&d)).transpose()
+        match data {
+            Some(d) => Ok(Some(decompress(&d)?)),
+            None => Ok(self.external.as_ref().and_then(|e| e.read(oid))),
+        }
     }
 
     pub fn set_status(&mut self, key: HistoryKey, status: &Status) -> Result<()> {
@@ -691,8 +732,69 @@ impl Store {
     }
 
     /// Number of stored tree nodes (diagnostics, tests).
+    /// Blobs whose bytes are in the store (not held externally).
+    pub fn stored_blob_count(&self) -> Result<u64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
     pub fn node_count(&self) -> Result<u64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    // ----- external objects ------------------------------------------------
+
+    /// Pins queued blobs in the external store. Any it can't pin are copied
+    /// into the store instead, so content is never left unprotected.
+    /// Returns how many were handled.
+    pub fn flush_pins(&mut self, key: HistoryKey) -> Result<usize> {
+        let Some(ext) = self.external.clone() else { return Ok(0) };
+        let mut done = 0;
+        loop {
+            let oids: Vec<Oid> = {
+                let mut stmt = self.conn.prepare_cached("SELECT oid FROM pending_pins WHERE history_key = ?1 LIMIT 50000")?;
+                let rows = stmt.query_map([key.0], |r| r.get::<_, Vec<u8>>(0))?;
+                rows.filter_map(|r| r.ok()).filter_map(|b| <[u8; 20]>::try_from(b.as_slice()).ok()).map(Oid).collect()
+            };
+            if oids.is_empty() {
+                return Ok(done);
+            }
+            let pinned = ext.pin(&oids);
+            let tx = self.conn.transaction()?;
+            for oid in &oids {
+                if !pinned {
+                    let data = ext.read(oid).ok_or_else(|| {
+                        StoreError::Corrupt(format!("blob {} is neither pinned nor readable from the repository", oid.hex()))
+                    })?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO blobs (oid, len, data) VALUES (?1, ?2, ?3)",
+                        params![oid.0.to_vec(), data.len() as i64, compress(&data)],
+                    )?;
+                }
+                tx.execute("DELETE FROM pending_pins WHERE history_key = ?1 AND oid = ?2", params![key.0, oid.0.to_vec()])?;
+            }
+            tx.commit()?;
+            done += oids.len();
+        }
+    }
+
+    /// Where this history's externally held content lives: `(kind,
+    /// location, pin_ref)`, e.g. `("git", <common git dir>, "refs/0ndb/<id>")`.
+    pub fn external_record(&self, key: HistoryKey) -> Result<Option<(String, String, String)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT kind, location, pin_ref FROM external_objects WHERE history_key = ?1", [key.0], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
+    }
+
+    pub fn set_external_record(&mut self, key: HistoryKey, kind: &str, location: &str, pin_ref: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO external_objects (history_key, kind, location, pin_ref) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (history_key) DO UPDATE SET kind = excluded.kind, location = excluded.location, pin_ref = excluded.pin_ref",
+            params![key.0, kind, location, pin_ref],
+        )?;
+        Ok(())
     }
 
     // ----- mounts ----------------------------------------------------------
@@ -968,5 +1070,76 @@ mod tests {
         assert!(nodes <= frags / 8 + 16, "{nodes} stored nodes for {frags} fragments: old paths not reclaimed");
         let (_, loaded) = s.load(id).unwrap();
         assert_eq!(loaded.text(&inode).unwrap(), expected, "blob-backed base text is read lazily after reload");
+    }
+
+    /// An external object store whose pinning can be made to fail.
+    struct FakeObjects {
+        blobs: std::sync::Mutex<HashMap<Oid, Vec<u8>>>,
+        pins: std::sync::Mutex<Vec<Oid>>,
+        pin_ok: bool,
+    }
+
+    impl ObjectStore for FakeObjects {
+        fn contains(&self, oid: &Oid) -> bool {
+            self.blobs.lock().unwrap().contains_key(oid)
+        }
+        fn read(&self, oid: &Oid) -> Option<Vec<u8>> {
+            self.blobs.lock().unwrap().get(oid).cloned()
+        }
+        fn pin(&self, oids: &[Oid]) -> bool {
+            self.pins.lock().unwrap().extend_from_slice(oids);
+            self.pin_ok
+        }
+    }
+
+    #[test]
+    fn externally_held_blobs_are_referenced_pinned_or_copied_in() {
+        for pin_ok in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let id = HistoryId::random();
+            let actor = ActorId::random();
+            let body: Vec<u8> = (0..2_000).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+            let (content, blob) = Content::text(body.clone());
+            let blob = blob.unwrap();
+            let ext = Arc::new(FakeObjects {
+                blobs: std::sync::Mutex::new(HashMap::from([(blob.oid, body.clone())])),
+                pins: Default::default(),
+                pin_ok,
+            });
+            let mut s = Store::open(dir.path().join("s.db")).unwrap();
+            s.set_external(Some(ext.clone()));
+            let key = s.create_history(id).unwrap();
+            let mut h = History::new(id);
+            let (b, r) = h
+                .transact(actor, None, |t| {
+                    t.attach_blob(blob.clone());
+                    t.push(Op::CreateFile {
+                        parent: InodeId::ROOT,
+                        name: "big".into(),
+                        mode: FileMode::Regular,
+                        line_ending: LineEnding::Lf,
+                        content,
+                    })
+                })
+                .unwrap();
+            r.unwrap();
+            let b = b.unwrap();
+            s.append(key, &b, Origin::Local, &mut h).unwrap();
+            let inode = InodeId::new(b.header.op_id(0), 0);
+            assert_eq!(s.stored_blob_count().unwrap(), 0, "held externally: not copied");
+            assert!(ext.pins.lock().unwrap().is_empty(), "pins are flushed in bulk, not per batch");
+            assert_eq!(s.flush_pins(key).unwrap(), 1);
+            assert_eq!(*ext.pins.lock().unwrap(), vec![blob.oid]);
+            assert_eq!(s.flush_pins(key).unwrap(), 0, "nothing left queued");
+            assert_eq!(s.stored_blob_count().unwrap(), if pin_ok { 0 } else { 1 }, "an unpinnable blob is copied in");
+            // Readable after reload, through the external store or the copy.
+            let (_, loaded) = s.load(id).unwrap();
+            assert_eq!(loaded.text(&inode).unwrap(), body);
+            assert_eq!(s.blob(&blob.oid).unwrap().unwrap(), body);
+            // Unpinned content survives losing the external copy only when it
+            // was copied in.
+            ext.blobs.lock().unwrap().clear();
+            assert_eq!(s.blob(&blob.oid).unwrap().is_some(), !pin_ok);
+        }
     }
 }

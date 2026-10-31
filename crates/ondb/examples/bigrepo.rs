@@ -1,6 +1,7 @@
 //! Massive-repository benchmark: one mount of a large git checkout.
 //!
 //! `cargo run --release -p ondb --example bigrepo -- <repo> [scratch]`
+//! (`ONDB_TIMING=1` also prints where first-mount time went)
 //!
 //! Works on a throwaway `git worktree` of `<repo>` (the repo itself is not
 //! touched). Reports first-mount time, store size, heap and RSS, hibernate
@@ -93,6 +94,7 @@ fn main() {
     fs::create_dir_all(&scratch).unwrap();
     let wt = scratch.join("wt");
     let git = "git -c user.name=b -c user.email=b@b";
+    sh(&repo, "git worktree prune && (git branch -D bench-a >/dev/null 2>&1; true)");
     sh(&repo, &format!("git worktree add -q --detach {}", wt.display()));
     let files: usize = sh(&wt, "git ls-files | wc -l").trim().parse().unwrap();
     let bytes: u64 = sh(&wt, "git ls-files -z | xargs -0 stat -f %z | awk '{s+=$1} END {print s}'").trim().parse().unwrap_or(0);
@@ -125,6 +127,9 @@ fn main() {
     let first = t.elapsed();
     sampling.store(false, Ordering::Relaxed);
     line("first mount (adopt)", Some(first), cpu0);
+    if std::env::var_os("ONDB_TIMING").is_some() {
+        println!("  phases: {}", ondb::timing::dump());
+    }
     println!(
         "{:<34} {:.1} MiB on disk ({:.2}x the checkout)",
         "store",

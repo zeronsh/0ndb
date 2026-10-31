@@ -9,6 +9,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+/// The repository's object database as content 0ndb references instead of
+/// copying (see `Workspace::set_objects`).
+pub(crate) struct GitObjects(pub ondb_git::Objects);
+
+impl ondb_core::ObjectStore for GitObjects {
+    fn contains(&self, oid: &ondb_core::Oid) -> bool {
+        self.0.contains(&oid.0)
+    }
+    fn read(&self, oid: &ondb_core::Oid) -> Option<Vec<u8>> {
+        self.0.read(&oid.0)
+    }
+    fn pin(&self, oids: &[ondb_core::Oid]) -> bool {
+        self.0.pin(&oids.iter().map(|o| o.0).collect::<Vec<_>>())
+    }
+    fn release(&self) {
+        self.0.release()
+    }
+}
+
 pub(crate) struct GitDirs {
     /// Per-worktree state: `HEAD`, `index`, their locks.
     pub dir: PathBuf,

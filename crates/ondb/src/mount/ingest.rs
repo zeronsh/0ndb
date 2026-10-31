@@ -25,8 +25,43 @@ pub enum Scope {
 
 enum Found {
     Dir,
-    File { bytes: Vec<u8>, exec: bool, stat: Stat },
-    Symlink { target: String },
+    /// `oid` is the blob id of `bytes`, computed once when read.
+    File {
+        bytes: Vec<u8>,
+        oid: ondb_core::Oid,
+        exec: bool,
+        stat: Stat,
+    },
+    Symlink {
+        target: String,
+    },
+}
+
+/// Paths probed per window; their files are then read and hashed in parallel.
+const WINDOW_PATHS: usize = 2048;
+/// Upper bound on the bytes a window reads at once.
+const WINDOW_BYTES: i64 = 32 << 20;
+
+type Read = std::io::Result<Option<(Vec<u8>, ondb_core::Oid)>>;
+
+fn with_oid(bytes: Vec<u8>) -> (Vec<u8>, ondb_core::Oid) {
+    let oid = oid_of(&bytes);
+    (bytes, oid)
+}
+
+/// Reads and hashes `paths` across a few threads (file reads and hashing
+/// dominate adopting and rescanning large trees).
+fn read_parallel(root: &std::path::Path, paths: &[&str], max: u64) -> Vec<Read> {
+    let read = |p: &str| -> Read { Ok(disk::read_limited(root, p, max)?.map(with_oid)) };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if paths.len() < 16 || threads == 1 {
+        return paths.iter().map(|p| read(p)).collect();
+    }
+    let per = paths.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = paths.chunks(per).map(|c| s.spawn(move || c.iter().map(|p| read(p)).collect::<Vec<_>>())).collect();
+        parts.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
 }
 
 /// Whether git wrote a path in the current window.
@@ -53,15 +88,33 @@ fn mode(exec: bool) -> FileMode {
     if exec { FileMode::Executable } else { FileMode::Regular }
 }
 
+/// Whether the repository's object database holds a blob (see
+/// `Workspace::set_objects`); such content is referenced, never copied.
+type Held<'a> = &'a dyn Fn(&ondb_core::Oid) -> bool;
+
 /// Content op payload for freshly read bytes, plus the blob to attach.
-fn content_of(bytes: &[u8]) -> (Content, LineEnding, Option<Blob>) {
+/// `oid` is the blob id of `bytes`.
+fn content_of(bytes: &[u8], oid: ondb_core::Oid, held: Held<'_>) -> (Content, LineEnding, Option<Blob>) {
     match classify(bytes) {
         Classified::Text { clean, ending } => {
-            let (content, blob) = Content::text(clean);
+            // Normalizing only ever drops bytes; same length, same bytes.
+            let same = clean.len() == bytes.len();
+            // Small text git already holds is referenced like a large file,
+            // so adopting a checkout copies nothing git has.
+            if !clean.is_empty() && clean.len() <= ondb_core::INLINE_TEXT_MAX {
+                let oid = if same { oid } else { oid_of(&clean) };
+                if held(&oid) {
+                    return (
+                        Content::TextBlob(BlobRef { oid, len: clean.len() as u64 }),
+                        ending,
+                        Some(Blob { oid, data: clean }),
+                    );
+                }
+            }
+            let (content, blob) = Content::text_hashed(clean, same.then_some(oid));
             (content, ending, blob)
         }
         Classified::Binary => {
-            let oid = oid_of(bytes);
             (Content::Binary(BlobRef { oid, len: bytes.len() as u64 }), LineEnding::Lf, Some(Blob { oid, data: bytes.to_vec() }))
         }
     }
@@ -97,7 +150,7 @@ fn edit_ops(txn: &Txn<'_>, inode: InodeId, bytes: &[u8], exec: Option<bool>) -> 
         }
         (Classified::Binary, Some(FileState::Binary { blob: b, .. })) if b.oid == oid_of(bytes) => {}
         (Classified::Binary, _) => {
-            let (content, _, b) = content_of(bytes);
+            let (content, _, b) = content_of(bytes, oid_of(bytes), &|_| false);
             ops.push(Op::SetContent { inode, content });
             blob = b;
         }
@@ -227,6 +280,18 @@ impl MountState {
     /// Compares disk with the shadow for `scope` and records the difference
     /// as one batch by the ingestion actor, parented on the synced version.
     pub(super) fn reconcile(&mut self, scope: Scope) -> Result<Option<BatchId>, Error> {
+        let out = self.reconcile_pass(scope)?;
+        // Content referenced in git's objects is pinned in bulk, once per
+        // pass rather than once per batch.
+        if self.objects.is_some() {
+            let t = std::time::Instant::now();
+            self.ws.flush_pins()?;
+            crate::timing::add("flush_pins", t.elapsed());
+        }
+        Ok(out)
+    }
+
+    fn reconcile_pass(&mut self, scope: Scope) -> Result<Option<BatchId>, Error> {
         self.wake()?;
         let git_busy = self.settle_git();
         if let Scope::Paths(p) = &scope
@@ -256,7 +321,9 @@ impl MountState {
         };
         let scope = if git_wrote { Scope::Full } else { scope };
         let defer_young = self.settling && !git_wrote;
+        let t = std::time::Instant::now();
         let cands = self.candidates(scope);
+        crate::timing::add("candidates", t.elapsed());
         let root = self.root.clone();
 
         let mut created: BTreeMap<String, Found> = BTreeMap::new();
@@ -271,93 +338,121 @@ impl MountState {
         // in order, so each chunk's directories exist before the next.
         let adopting = self.shadow.is_empty() && !git_wrote;
         let mut chunk_bytes = 0usize;
-        for path in &cands {
-            if adopting && chunk_bytes >= ADOPT_CHUNK_BYTES {
-                self.commit_pass(std::mem::take(&mut created), BTreeMap::new(), BTreeMap::new(), None, git_busy)?;
-                chunk_bytes = 0;
-            }
-            let disk_entry = probe(&root, path);
-            if defer_young
-                && let DiskEntry::File { stat, .. } = &disk_entry
-                && stat.mtime_ns > young_before
-            {
-                self.deferred.insert(path.clone());
-                continue;
-            }
-            let shadow = self.shadow.get(path).cloned();
-            let parent_ok = |created: &BTreeMap<String, Found>| {
-                let p = parent_of(path);
-                p.is_empty() || self.shadow.is_dir(p) || matches!(created.get(p), Some(Found::Dir))
-            };
-            match (shadow, disk_entry) {
-                (None, DiskEntry::Missing | DiskEntry::Other) => {}
-                (None, d) => {
-                    if self.ignore.is_ignored(path, d == DiskEntry::Dir) || !parent_ok(&created) {
-                        continue;
+        let cands: Vec<String> = cands.into_iter().collect();
+        let max = self.opts.max_file_size;
+        let mut start = 0;
+        while start < cands.len() {
+            // Probe a window, then read and hash the files it needs in parallel.
+            let mut probes = Vec::new();
+            let (mut wanted, mut want_bytes) = (Vec::new(), 0i64);
+            while start + probes.len() < cands.len() && probes.len() < WINDOW_PATHS && want_bytes < WINDOW_BYTES {
+                let path = &cands[start + probes.len()];
+                let d = probe(&root, path);
+                if let DiskEntry::File { stat, exec } = &d
+                    && !(defer_young && stat.mtime_ns > young_before)
+                    && match self.shadow.get(path) {
+                        None => !self.ignore.is_ignored(path, false),
+                        Some(s) => s.kind != Kind::File || s.stat != Some(*stat) || s.exec != *exec,
                     }
-                    match d {
-                        DiskEntry::Dir => {
-                            created.insert(path.clone(), Found::Dir);
+                {
+                    wanted.push(path.as_str());
+                    want_bytes += stat.size;
+                }
+                probes.push(d);
+            }
+            let t_read = std::time::Instant::now();
+            let mut reads: HashMap<&str, Read> = wanted.iter().copied().zip(read_parallel(&root, &wanted, max)).collect();
+            crate::timing::add("read", t_read.elapsed());
+            let window = &cands[start..start + probes.len()];
+            start += probes.len();
+            for (path, disk_entry) in window.iter().zip(probes) {
+                let mut read = |p: &str| reads.remove(p).unwrap_or_else(|| Ok(disk::read_limited(&root, p, max)?.map(with_oid)));
+                if adopting && chunk_bytes >= ADOPT_CHUNK_BYTES {
+                    self.commit_pass(std::mem::take(&mut created), BTreeMap::new(), BTreeMap::new(), None, git_busy)?;
+                    chunk_bytes = 0;
+                }
+                if defer_young
+                    && let DiskEntry::File { stat, .. } = &disk_entry
+                    && stat.mtime_ns > young_before
+                {
+                    self.deferred.insert(path.clone());
+                    continue;
+                }
+                let shadow = self.shadow.get(path).cloned();
+                let parent_ok = |created: &BTreeMap<String, Found>| {
+                    let p = parent_of(path);
+                    p.is_empty() || self.shadow.is_dir(p) || matches!(created.get(p), Some(Found::Dir))
+                };
+                match (shadow, disk_entry) {
+                    (None, DiskEntry::Missing | DiskEntry::Other) => {}
+                    (None, d) => {
+                        if self.ignore.is_ignored(path, d == DiskEntry::Dir) || !parent_ok(&created) {
+                            continue;
                         }
-                        DiskEntry::File { stat, exec } => match disk::read_limited(&root, path, self.opts.max_file_size) {
-                            Ok(Some(bytes)) => {
-                                chunk_bytes += bytes.len();
-                                created.insert(path.clone(), Found::File { bytes, exec, stat });
+                        match d {
+                            DiskEntry::Dir => {
+                                created.insert(path.clone(), Found::Dir);
                             }
-                            Ok(None) => tracing::warn!(path, "file exceeds the size limit; not tracked"),
-                            Err(e) => tracing::warn!(path, error = %e, "unreadable file skipped"),
-                        },
-                        DiskEntry::Symlink { target } => {
-                            created.insert(path.clone(), Found::Symlink { target });
-                        }
-                        DiskEntry::Missing | DiskEntry::Other => {}
-                    }
-                }
-                (Some(s), DiskEntry::Missing | DiskEntry::Other) => {
-                    removed.insert(path.clone(), s);
-                }
-                (Some(s), DiskEntry::Dir) if s.kind == Kind::Dir => {}
-                (Some(s), DiskEntry::File { stat, exec }) if s.kind == Kind::File => {
-                    if s.stat == Some(stat) && s.exec == exec {
-                        continue;
-                    }
-                    match disk::read_limited(&root, path, self.opts.max_file_size) {
-                        Ok(Some(bytes)) => {
-                            if s.oid == Some(oid_of(&bytes)) {
-                                if s.exec == exec {
-                                    stat_only.push((path.clone(), stat));
-                                } else {
-                                    changed.insert(path.clone(), (s, Change::Exec { exec, stat }));
+                            DiskEntry::File { stat, exec } => match read(path) {
+                                Ok(Some((bytes, oid))) => {
+                                    chunk_bytes += bytes.len();
+                                    created.insert(path.clone(), Found::File { bytes, oid, exec, stat });
                                 }
-                            } else {
-                                changed.insert(path.clone(), (s, Change::Edit { bytes, exec, stat }));
+                                Ok(None) => tracing::warn!(path, "file exceeds the size limit; not tracked"),
+                                Err(e) => tracing::warn!(path, error = %e, "unreadable file skipped"),
+                            },
+                            DiskEntry::Symlink { target } => {
+                                created.insert(path.clone(), Found::Symlink { target });
                             }
+                            DiskEntry::Missing | DiskEntry::Other => {}
                         }
-                        Ok(None) => tracing::warn!(path, "file grew past the size limit; changes not tracked"),
-                        Err(e) => tracing::warn!(path, error = %e, "unreadable file skipped"),
                     }
-                }
-                (Some(s), DiskEntry::Symlink { target }) if s.kind == Kind::Symlink => {
-                    if s.oid != Some(symlink_oid(&target)) {
-                        changed.insert(path.clone(), (s, Change::Link { target }));
+                    (Some(s), DiskEntry::Missing | DiskEntry::Other) => {
+                        removed.insert(path.clone(), s);
                     }
-                }
-                (Some(s), d) => {
-                    // Kind changed (file <-> dir <-> symlink): replace.
-                    removed.insert(path.clone(), s);
-                    match d {
-                        DiskEntry::Dir => {
-                            created.insert(path.clone(), Found::Dir);
+                    (Some(s), DiskEntry::Dir) if s.kind == Kind::Dir => {}
+                    (Some(s), DiskEntry::File { stat, exec }) if s.kind == Kind::File => {
+                        if s.stat == Some(stat) && s.exec == exec {
+                            continue;
                         }
-                        DiskEntry::File { stat, exec } => {
-                            if let Ok(Some(bytes)) = disk::read_limited(&root, path, self.opts.max_file_size) {
-                                created.insert(path.clone(), Found::File { bytes, exec, stat });
+                        match read(path) {
+                            Ok(Some((bytes, oid))) => {
+                                if s.oid == Some(oid) {
+                                    if s.exec == exec {
+                                        stat_only.push((path.clone(), stat));
+                                    } else {
+                                        changed.insert(path.clone(), (s, Change::Exec { exec, stat }));
+                                    }
+                                } else {
+                                    changed.insert(path.clone(), (s, Change::Edit { bytes, exec, stat }));
+                                }
                             }
+                            Ok(None) => tracing::warn!(path, "file grew past the size limit; changes not tracked"),
+                            Err(e) => tracing::warn!(path, error = %e, "unreadable file skipped"),
                         }
-                        DiskEntry::Symlink { target } => {
-                            created.insert(path.clone(), Found::Symlink { target });
+                    }
+                    (Some(s), DiskEntry::Symlink { target }) if s.kind == Kind::Symlink => {
+                        if s.oid != Some(symlink_oid(&target)) {
+                            changed.insert(path.clone(), (s, Change::Link { target }));
                         }
-                        DiskEntry::Missing | DiskEntry::Other => {}
+                    }
+                    (Some(s), d) => {
+                        // Kind changed (file <-> dir <-> symlink): replace.
+                        removed.insert(path.clone(), s);
+                        match d {
+                            DiskEntry::Dir => {
+                                created.insert(path.clone(), Found::Dir);
+                            }
+                            DiskEntry::File { stat, exec } => {
+                                if let Ok(Some((bytes, oid))) = read(path) {
+                                    created.insert(path.clone(), Found::File { bytes, oid, exec, stat });
+                                }
+                            }
+                            DiskEntry::Symlink { target } => {
+                                created.insert(path.clone(), Found::Symlink { target });
+                            }
+                            DiskEntry::Missing | DiskEntry::Other => {}
+                        }
                     }
                 }
             }
@@ -429,9 +524,10 @@ impl MountState {
                 (Verdict::Git, f) => {
                     co_created.insert(p, f);
                 }
-                (Verdict::Split(git_bytes, git_exec), Found::File { bytes, exec, stat }) => {
+                (Verdict::Split(git_bytes, git_exec), Found::File { bytes, exec, stat, .. }) => {
                     followups.push((p.clone(), bytes, exec, stat));
-                    co_created.insert(p, Found::File { bytes: git_bytes, exec: git_exec, stat });
+                    let oid = oid_of(&git_bytes);
+                    co_created.insert(p, Found::File { bytes: git_bytes, oid, exec: git_exec, stat });
                 }
                 (_, f) => {
                     created.insert(p, f);
@@ -504,8 +600,8 @@ impl MountState {
         }
         let mut file_moves: BTreeMap<String, String> = BTreeMap::new(); // new -> old
         for (p, f) in &created {
-            if let Found::File { bytes, .. } = f
-                && let Some(olds) = by_oid.get_mut(&oid_of(bytes))
+            if let Found::File { oid, .. } = f
+                && let Some(olds) = by_oid.get_mut(oid)
                 && !olds.is_empty()
             {
                 file_moves.insert(p.clone(), olds.remove(0));
@@ -519,20 +615,26 @@ impl MountState {
         let parents = self.record.synced_version.clone();
         let actor = self.record.ingestion_actor;
         let shadow = &self.shadow;
+        let objects = self.objects.clone();
+        let held = |oid: &ondb_core::Oid| objects.as_ref().is_some_and(|o| o.0.contains(&oid.0));
         let bulk = shadow.is_empty() && removed.is_empty() && ws.read(|h| h.tree().is_empty()) && created.len() > 1;
+        let t_commit = std::time::Instant::now();
         let (batch, updates) = ws.commit(actor, Some(parents), |txn| -> Result<Vec<Update>, Error> {
+            let t_ops = std::time::Instant::now();
             let mut updates = Vec::new();
             if let Some(op) = marker {
                 txn.push(op)?;
             }
             if bulk {
-                import(txn, &created, &mut updates)?;
+                import(txn, &created, &held, &mut updates)?;
             } else {
-                apply_changes(txn, shadow, &created, &removed, &changed, &file_moves, &dir_moves, &mut updates)?;
+                apply_changes(txn, shadow, &created, &removed, &changed, &file_moves, &dir_moves, &held, &mut updates)?;
             }
+            crate::timing::add("ops", t_ops.elapsed());
 
             Ok(updates)
         })?;
+        crate::timing::add("ws.commit", t_commit.elapsed());
         for u in updates {
             match u {
                 Update::Insert(p, e) => self.shadow.insert(p, e),
@@ -595,7 +697,7 @@ impl MountState {
     }
 }
 
-fn import(txn: &mut Txn<'_>, created: &BTreeMap<String, Found>, updates: &mut Vec<Update>) -> Result<(), Error> {
+fn import(txn: &mut Txn<'_>, created: &BTreeMap<String, Found>, held: Held<'_>, updates: &mut Vec<Update>) -> Result<(), Error> {
     let mut index: HashMap<&str, u32> = HashMap::new();
     let mut entries = Vec::new();
     let mut blobs = Vec::new();
@@ -613,16 +715,10 @@ fn import(txn: &mut Txn<'_>, created: &BTreeMap<String, Found>, updates: &mut Ve
             Found::Symlink { target } => {
                 (ImportNode::Symlink { target: target.clone() }, Kind::Symlink, Some(symlink_oid(target)), false, None)
             }
-            Found::File { bytes, exec, stat } => {
-                let (content, line_ending, blob) = content_of(bytes);
+            Found::File { bytes, oid, exec, stat } => {
+                let (content, line_ending, blob) = content_of(bytes, *oid, held);
                 blobs.extend(blob);
-                (
-                    ImportNode::File { mode: mode(*exec), line_ending, content },
-                    Kind::File,
-                    Some(oid_of(bytes)),
-                    *exec,
-                    Some(*stat),
-                )
+                (ImportNode::File { mode: mode(*exec), line_ending, content }, Kind::File, Some(*oid), *exec, Some(*stat))
             }
         };
         let i = entries.len() as u32;
@@ -651,6 +747,7 @@ fn apply_changes(
     changed: &BTreeMap<String, (Entry, Change)>,
     file_moves: &BTreeMap<String, String>,
     dir_moves: &[(String, String)],
+    held: Held<'_>,
     updates: &mut Vec<Update>,
 ) -> Result<(), Error> {
     // Directory inodes created or moved by this batch, by destination path.
@@ -742,21 +839,15 @@ fn apply_changes(
         let name = name_of(path).to_string();
         match found {
             Found::Dir => {}
-            Found::File { bytes, exec, stat } => {
-                let (content, line_ending, blob) = content_of(bytes);
+            Found::File { bytes, oid, exec, stat } => {
+                let (content, line_ending, blob) = content_of(bytes, *oid, held);
                 if let Some(b) = blob {
                     txn.attach_blob(b);
                 }
                 let op = txn.push(Op::CreateFile { parent, name, mode: mode(*exec), line_ending, content })?;
                 updates.push(Update::Insert(
                     path.clone(),
-                    Entry {
-                        inode: InodeId::new(op, 0),
-                        kind: Kind::File,
-                        oid: Some(oid_of(bytes)),
-                        exec: *exec,
-                        stat: Some(*stat),
-                    },
+                    Entry { inode: InodeId::new(op, 0), kind: Kind::File, oid: Some(*oid), exec: *exec, stat: Some(*stat) },
                 ));
             }
             Found::Symlink { target } => {
@@ -835,7 +926,7 @@ impl MountState {
                 Some(_) => return Err(Error::Invalid(format!("{path} exists and is not a file"))),
                 None => {
                     let parent = ensure_dirs(txn, parent_of(&path))?;
-                    let (content, line_ending, blob) = content_of(&bytes);
+                    let (content, line_ending, blob) = content_of(&bytes, oid_of(&bytes), &|_| false);
                     if let Some(b) = blob {
                         txn.attach_blob(b);
                     }

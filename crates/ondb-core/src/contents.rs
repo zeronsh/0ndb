@@ -58,6 +58,20 @@ pub trait BlobSource: Send + Sync {
     }
 }
 
+/// Content-addressed bytes kept outside 0ndb's store, addressed by the same
+/// object ids (git's blob ids): typically the repository's own object
+/// database, so content git already holds is never copied.
+pub trait ObjectStore: Send + Sync {
+    fn contains(&self, oid: &Oid) -> bool;
+    fn read(&self, oid: &Oid) -> Option<Vec<u8>>;
+    /// Makes sure the objects stay available (e.g. reachable from a ref so
+    /// git's garbage collection keeps them). `false` means they can't be
+    /// relied on and must be stored by 0ndb.
+    fn pin(&self, oids: &[Oid]) -> bool;
+    /// Drops caches and helper processes while the history is idle.
+    fn release(&self) {}
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Key {
     Blob(Oid),

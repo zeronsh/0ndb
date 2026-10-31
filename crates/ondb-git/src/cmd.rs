@@ -177,8 +177,9 @@ fn read_capped(mut r: impl Read, limit: usize) -> Vec<u8> {
     buf
 }
 
-/// Waits with a deadline; kills the child when it passes. Polls with
-/// backoff only while a command runs.
+/// Waits with a deadline; kills the child when it passes. Polls with a
+/// short backoff only while a command runs (git commands mostly finish in a
+/// few milliseconds, so a long nap would dominate their latency).
 fn wait(child: &mut Child, timeout: Duration) -> Option<Option<i32>> {
     let deadline = Instant::now() + timeout;
     let mut nap = Duration::from_millis(1);
@@ -192,7 +193,7 @@ fn wait(child: &mut Child, timeout: Duration) -> Option<Option<i32>> {
             }
             Ok(None) => {
                 thread::sleep(nap);
-                nap = (nap * 2).min(Duration::from_millis(50));
+                nap = (nap * 2).min(Duration::from_millis(5));
             }
             Err(_) => return Some(None),
         }

@@ -16,6 +16,8 @@ pub mod blame;
 pub mod mount;
 pub mod report;
 pub mod revert;
+#[doc(hidden)]
+pub mod timing;
 pub mod workspace;
 pub mod worktrees;
 

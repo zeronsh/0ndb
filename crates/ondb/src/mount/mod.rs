@@ -16,6 +16,7 @@
 
 mod disk;
 mod git;
+pub(crate) use git::GitObjects;
 mod ignore;
 mod ingest;
 mod materialize;
@@ -26,6 +27,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -65,6 +67,10 @@ pub struct MountOptions {
     /// Memory then scales with active worktrees, not mounted ones. `None`
     /// keeps everything resident.
     pub idle_unload: Option<Duration>,
+    /// In a git checkout, reference content the repository's object database
+    /// already holds instead of copying it into the store (pinned under
+    /// `refs/0ndb/<history>` so git never garbage-collects it).
+    pub git_objects: bool,
 }
 
 impl Default for MountOptions {
@@ -77,6 +83,7 @@ impl Default for MountOptions {
             fence_timeout: Duration::from_secs(2),
             settle: Duration::from_millis(100),
             idle_unload: Some(Duration::from_secs(30)),
+            git_objects: true,
         }
     }
 }
@@ -216,6 +223,22 @@ impl Mount {
             }
         };
 
+        let objects = match &git {
+            Some(g) if opts.git_objects => {
+                let pin_ref = format!("refs/0ndb/{}", ws.id());
+                let objects = Arc::new(git::GitObjects(ondb_git::Objects::open(&g.dir).pin_to(&pin_ref)));
+                // The common dir outlives linked worktrees, so workspaces
+                // opened later (without a mount) still find the content.
+                let common = g.common.to_string_lossy().into_owned();
+                ws.with(|c| {
+                    let (store, key) = c.store();
+                    store.set_external_record(key, "git", &common, &pin_ref)
+                })?;
+                ws.set_objects(Some(objects.clone()))?;
+                Some(objects)
+            }
+            _ => None,
+        };
         let (fs_tx, fs_rx) = unbounded();
         let ignore = Ignore::load(&root, git.as_ref());
         // A linked worktree's HEAD lives outside the mount; Watch covers it.
@@ -225,6 +248,7 @@ impl Mount {
             ws: ws.clone(),
             ignore,
             git,
+            objects,
             root: root.clone(),
             opts,
             record,
@@ -244,23 +268,31 @@ impl Mount {
         // Resume from the HEAD this folder was last reconciled against, so
         // git work done while unmounted is still recognized as git's.
         state.git_head = state.record.git_head.clone().or_else(|| state.read_git_head());
+        let t = Instant::now();
         if state.git_head == state.read_git_head() {
             state.snapshot_git();
         }
+        crate::timing::add("start.snapshot_git", t.elapsed());
         if let Some(pos) = state.record.git_reflog {
             state.reflog_pos = pos;
         }
+        let t = Instant::now();
         if adopting {
             state.adopt()?;
         } else {
             state.validate_shadow();
         }
+        crate::timing::add("start.adopt/validate", t.elapsed());
+        let t = Instant::now();
         state.reconcile(ingest::Scope::Full)?;
+        crate::timing::add("start.reconcile", t.elapsed());
+        let t = Instant::now();
         if adopting {
             state.materialize_all()?;
         } else {
             state.materialize()?;
         }
+        crate::timing::add("start.materialize", t.elapsed());
 
         let ws_rx = ws.subscribe();
         let (cmd_tx, cmd_rx) = unbounded();
@@ -324,6 +356,8 @@ pub(crate) struct MountState {
     shadow: Shadow,
     ignore: Ignore,
     git: Option<GitDirs>,
+    /// The repository's object database, when content is referenced there.
+    objects: Option<Arc<git::GitObjects>>,
     git_head: Option<String>,
     /// The index as of the last pass, to tell which files git just wrote.
     git_index: Option<git::CompactIndex>,

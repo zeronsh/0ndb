@@ -49,10 +49,16 @@ impl Content {
     /// Text content, inline when small and as a blob (to attach to the
     /// batch) when large.
     pub fn text(bytes: Vec<u8>) -> (Content, Option<Blob>) {
+        Self::text_hashed(bytes, None)
+    }
+
+    /// As [`Content::text`], reusing `oid` (the blob id of `bytes`) when the
+    /// caller already has it.
+    pub fn text_hashed(bytes: Vec<u8>, oid: Option<Oid>) -> (Content, Option<Blob>) {
         if bytes.len() <= crate::contents::INLINE_TEXT_MAX {
             return (Content::Text(bytes), None);
         }
-        let oid = Oid::of_blob(&bytes);
+        let oid = oid.unwrap_or_else(|| Oid::of_blob(&bytes));
         (Content::TextBlob(BlobRef { oid, len: bytes.len() as u64 }), Some(Blob { oid, data: bytes }))
     }
 }

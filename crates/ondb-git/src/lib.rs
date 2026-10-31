@@ -8,12 +8,14 @@
 
 pub mod cmd;
 pub mod forge;
+pub mod objects;
 pub mod remote;
 pub mod repo;
 
 use std::path::PathBuf;
 
 pub use forge::{ChangeRequest, ChangeState, ChecksState, Forge, ForgeError, ForgeRepo, Forges, NewChangeRequest, ReviewState};
+pub use objects::Objects;
 pub use remote::RemoteUrl;
 pub use repo::{Branch, Checkout, Head, Remote, Repo, RepoId, Status, Worktree, slugify};
 

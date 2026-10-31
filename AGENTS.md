@@ -56,6 +56,19 @@
   shared, budgeted cache (`ondb_core::contents`); only unpersisted content is
   pinned.
 - Every mount entry point that touches the shadow calls `wake()` first.
+- In a git checkout, content git already holds is referenced, never copied
+  (`ObjectStore`, `mount/git.rs::GitObjects`, `ondb-git/src/objects.rs`).
+  `Store::append` queues such blobs in `pending_pins` inside its
+  transaction; `flush_pins` (end of each reconcile pass, and before
+  hibernating) makes them reachable from `refs/0ndb/<history>`, or copies
+  them into the store if pinning fails. Never skip storing a blob without
+  queueing its pin. `external_objects` records the repository so workspaces
+  opened without a mount can still read the content.
+- Materialization plans only inodes touched since the synced version (plus,
+  on first mount, ones the shadow lacks); never read every file back out of
+  the history to compare.
+- Large-repo check: `cargo run --release -p ondb --example bigrepo -- <repo>`
+  (`ONDB_TIMING=1` prints first-mount phases).
 - Linux watching (`mount/watch.rs`, Dirs mode) shares one inotify instance;
   never create a watcher per mount there.
 - Background mount passes defer files younger than `settle`; fences, tool

@@ -85,8 +85,19 @@ large histories:
   nothing to recover after a crash.
 * *Lazy content.* Text larger than 4 KiB is a content-addressed blob. Ops
   reference it, batches carry it as an attachment, and readers load it
-  through a separate read connection and a bounded LRU cache (64 MiB). A
+  through a separate read connection and a bounded LRU cache (32 MiB). A
   large file that is never read costs its fragment tree, not its bytes.
+* *Content git already has is not copied.* Blob ids are git's blob ids, so
+  in a git checkout any file content the repository's object database holds
+  (every clean tracked file, and anything git checks out later) is
+  referenced there instead of stored, small files included. Referenced blobs
+  are pinned by a chain of commits under `refs/0ndb/<history>` (never pushed
+  by default), so `git gc` can't collect content history still relies on,
+  even after its branch is deleted. Pins are queued in the same transaction
+  as the batch and flushed in bulk; if pinning fails the bytes are copied
+  into the store instead. Content is read through one long-lived
+  `git cat-file --batch-command` per active worktree, stopped while it
+  hibernates.
 
 Measured on an 8 MiB, 200k-line file (`cargo run --release -p ondb-core
 --example bigfile`, `-p ondb --example durable`):
@@ -273,7 +284,8 @@ registering it. Nothing polls: provider calls happen on request.
   default). Blobs are content-addressed, so worktrees of one repository share
   cached bytes. Only not-yet-persisted content is pinned in memory.
 * **Bounded adoption.** A first mount commits in 32 MiB chunks, so adopting a
-  large repository never holds it in memory at once.
+  large repository never holds it in memory at once. Files are read and
+  hashed in parallel (hardware SHA-1), each once.
 * **No idle CPU.** Mount threads sleep until an event, command or timer.
   Events under ignored paths (build output, `node_modules`) are dropped before
   they can schedule a pass or wake a hibernating mount.
@@ -281,6 +293,14 @@ registering it. Nothing polls: provider calls happen on request.
   Linux every mount in the process shares one inotify instance and watches
   only tracked directories, so the default limit of 128 instances per user and
   ignored trees don't constrain how many worktrees can be mounted.
+
+Measured with `cargo run --release -p ondb --example bigrepo -- <repo>` on a
+shallow Linux kernel checkout (97,372 files, 1.6 GB, Apple M-series):
+
+| | before | now |
+|---|---|---|
+| first mount | 49.3 s, 1.76 GB heap peak | 7.8 s, 281 MiB heap peak |
+| store on disk | 741 MiB | 53 MiB |
 
 Measured with `cargo run --release -p ondb --example many -- <repo> <n>` on 60
 worktrees of a 2.7k-file, 74 MB repository in one process (Apple M-series):
