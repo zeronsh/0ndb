@@ -51,6 +51,23 @@ impl Provider for ClaudeCode {
         "claude-code"
     }
 
+    fn name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn available(&self) -> bool {
+        crate::provider::on_path(&self.program)
+    }
+
+    /// Claude Code takes model aliases that always track the latest model
+    /// of each tier; it has no listing command.
+    fn models(&self) -> Result<Vec<crate::provider::ModelInfo>, Error> {
+        Ok([("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+            .into_iter()
+            .map(|(id, name)| crate::provider::ModelInfo { id: id.into(), name: name.into(), default: false })
+            .collect())
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities { resume: true, fork_at_message: true, persistent: true }
     }

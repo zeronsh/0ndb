@@ -148,6 +148,18 @@ struct Inner {
     /// Text streamed so far for running assistant messages.
     live: Mutex<HashMap<String, String>>,
     subs: Mutex<Vec<Sender<Update>>>,
+    /// Model catalogs, asked of each provider once per process.
+    models: Mutex<HashMap<String, Vec<crate::provider::ModelInfo>>>,
+}
+
+/// A provider as a picker shows it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProviderInfo {
+    pub id: String,
+    pub name: String,
+    /// Its CLI is installed.
+    pub available: bool,
+    pub capabilities: crate::provider::Capabilities,
 }
 
 /// One page of a thread's selected branch, oldest first.
@@ -201,6 +213,7 @@ impl Sessions {
             active: Mutex::default(),
             live: Mutex::default(),
             subs: Mutex::default(),
+            models: Mutex::default(),
         });
         let weak = Arc::downgrade(&inner);
         thread::Builder::new().name("ondb-reaper".into()).spawn(move || reap(weak, rx))?;
@@ -261,6 +274,39 @@ impl Sessions {
             }
         }
         out
+    }
+
+    /// Every configured provider, installed ones first.
+    pub fn providers(&self) -> Vec<ProviderInfo> {
+        let mut out: Vec<ProviderInfo> = self
+            .inner
+            .providers
+            .values()
+            .map(|p| ProviderInfo {
+                id: p.id().to_string(),
+                name: p.name().to_string(),
+                available: p.available(),
+                capabilities: p.capabilities(),
+            })
+            .collect();
+        out.sort_by(|a, b| b.available.cmp(&a.available).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        out
+    }
+
+    /// The models `provider` offers, asked of it on first use and cached
+    /// (`refresh` asks again). Asking may start the provider's CLI.
+    pub fn models(&self, provider: &str, refresh: bool) -> Result<Vec<crate::provider::ModelInfo>, Error> {
+        if !refresh && let Some(m) = self.inner.models.lock().unwrap_or_else(|p| p.into_inner()).get(provider) {
+            return Ok(m.clone());
+        }
+        let p =
+            self.inner.providers.get(provider).cloned().ok_or_else(|| Error::Invalid(format!("unknown provider {provider}")))?;
+        if !p.available() {
+            return Err(Error::Provider(format!("{} is not installed", p.name())));
+        }
+        let models = p.models()?;
+        self.inner.models.lock().unwrap_or_else(|p| p.into_inner()).insert(provider.to_string(), models.clone());
+        Ok(models)
     }
 
     pub fn create_thread(&self, worktree: &str, title: &str) -> Result<Thread, Error> {

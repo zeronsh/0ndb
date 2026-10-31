@@ -8,15 +8,17 @@
 //!   provider event is recorded verbatim with tool calls and CLI output.
 //!   Providers can be switched mid-thread; idle processes are bounded.
 
+pub mod acp;
 pub mod claude;
 pub mod codex;
 pub mod mock;
+pub mod pi;
 pub mod provider;
 pub mod sessions;
 pub mod store;
 
-pub use provider::{Capabilities, Event, EventKind, Interrupter, Provider, Run, StartRequest};
-pub use sessions::{Page, SessionOptions, Sessions, Turn, Update};
+pub use provider::{Capabilities, Event, EventKind, Interrupter, ModelInfo, Provider, Run, StartRequest};
+pub use sessions::{Page, ProviderInfo, SessionOptions, Sessions, Turn, Update};
 pub use store::{Message, ProviderSession, RecordedEvent, Role, Status, Thread, ToolCall};
 
 #[derive(Debug, thiserror::Error)]

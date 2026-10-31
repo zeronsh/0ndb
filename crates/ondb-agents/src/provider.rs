@@ -53,8 +53,40 @@ pub trait Run: Send {
 pub trait Provider: Send + Sync {
     /// Stable id (`"claude-code"`, `"codex"`, ...).
     fn id(&self) -> &'static str;
+    /// Human-readable name (`"Claude Code"`).
+    fn name(&self) -> &'static str {
+        self.id()
+    }
     fn capabilities(&self) -> Capabilities;
     fn start(&self, req: StartRequest) -> Result<Box<dyn Run>, Error>;
+    /// Whether the provider's CLI is installed.
+    fn available(&self) -> bool {
+        true
+    }
+    /// The models this provider offers the signed-in account, asked of the
+    /// provider itself where it can say (may spawn it; callers cache).
+    /// Empty means "only the provider's default".
+    fn models(&self) -> Result<Vec<ModelInfo>, Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// One selectable model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// What to pass as `StartRequest::model`.
+    pub id: String,
+    pub name: String,
+    /// The provider's own default.
+    pub default: bool,
+}
+
+/// Whether `program` resolves on PATH (or is a path that exists).
+pub fn on_path(program: &std::path::Path) -> bool {
+    if program.components().count() > 1 {
+        return program.exists();
+    }
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(program).is_file()))
 }
 
 /// One event from a provider: its normalized meaning plus the provider's

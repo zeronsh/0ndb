@@ -38,6 +38,63 @@ impl Provider for Codex {
         "codex"
     }
 
+    fn name(&self) -> &'static str {
+        "Codex"
+    }
+
+    fn available(&self) -> bool {
+        crate::provider::on_path(&self.program)
+    }
+
+    /// The account's models, from `codex app-server`'s `model/list` (it
+    /// applies the account's visibility rules; hidden ones are skipped).
+    fn models(&self) -> Result<Vec<crate::provider::ModelInfo>, Error> {
+        let mut child = Command::new(&self.program)
+            .arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Error::Provider(format!("{}: {e}", self.program.display())))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| Error::Provider("no stdin".into()))?;
+        let stdout = child.stdout.take().ok_or_else(|| Error::Provider("no stdout".into()))?;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(v) = serde_json::from_str::<Value>(&line)
+                    && v["id"] == 2
+                {
+                    let _ = tx.send(v);
+                    return;
+                }
+            }
+        });
+        let mut send = |v: Value| -> std::io::Result<()> { writeln!(stdin, "{v}") };
+        send(
+            json!({ "id": 1, "method": "initialize", "params": { "clientInfo": { "name": "0ndb", "version": env!("CARGO_PKG_VERSION") } } }),
+        )?;
+        send(json!({ "method": "initialized" }))?;
+        send(json!({ "id": 2, "method": "model/list", "params": {} }))?;
+        let reply = rx.recv_timeout(std::time::Duration::from_secs(30));
+        let _ = child.kill();
+        let _ = child.wait();
+        let reply = reply.map_err(|_| Error::Provider("codex model/list: no answer".into()))?;
+        Ok(reply["result"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["hidden"] != true)
+            .filter_map(|m| {
+                let id = m["model"].as_str().or(m["id"].as_str())?.to_string();
+                Some(crate::provider::ModelInfo {
+                    name: m["displayName"].as_str().unwrap_or(&id).to_string(),
+                    default: m["isDefault"] == true,
+                    id,
+                })
+            })
+            .collect())
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities { resume: true, fork_at_message: false, persistent: false }
     }
