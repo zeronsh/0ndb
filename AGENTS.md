@@ -9,6 +9,18 @@
 - CLI: `cargo run -p ondb-cli -- <command>` (binary `0ndb`)
 - Benchmarks: `cargo run --release -p ondb-core --example bigfile`, `cargo run --release -p ondb --example durable`
 
+## Commits
+
+- Commit only as `wingleeio <44917547+wingleeio@users.noreply.github.com>`,
+  author and committer both. Never use another identity (the global git
+  identity here is a work one). The repo's local `user.name`/`user.email`
+  are set to it, and `.git/hooks/pre-commit`, `pre-merge-commit` and
+  `pre-push` refuse anything else; don't bypass them (`--no-verify`).
+- Push with the `wingleeio` GitHub login
+  (`GH_TOKEN=$(gh auth token --user wingleeio)` with
+  `credential.helper='!gh auth git-credential'`); the other account can't
+  see `zeronsh/0ndb`. Only `wingleeio` may push or merge to `main`.
+
 ## Layout
 
 - `crates/ondb-core`: pure CRDT/DAG model. No I/O. Any change here must keep
