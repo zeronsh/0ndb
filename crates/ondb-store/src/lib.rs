@@ -390,7 +390,12 @@ impl Store {
 
     fn init(conn: Connection, reopen: Reopen) -> Result<Store> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Every commit is on disk before append returns (NORMAL can lose the
+        // latest commits on power loss), and checkpoints use a full barrier
+        // (F_FULLFSYNC on macOS, where plain fsync leaves data in the
+        // drive's cache).
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "checkpoint_fullfsync", "ON")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "cache_size", WRITER_CACHE_KIB)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
