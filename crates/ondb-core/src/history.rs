@@ -510,19 +510,15 @@ impl History {
     }
 
     /// Reassembles a history whose inodes stay in the store until used:
-    /// `inodes` lists each id with the directories it was placed under.
+    /// nothing per inode is read until it is touched.
     pub fn from_stored(
         id: HistoryId,
         dag: Dag,
-        inodes: Vec<(InodeId, Vec<InodeId>)>,
         source: Arc<dyn crate::tree::InodeSource>,
         meta: BTreeMap<String, MetaEntry>,
         status: Status,
     ) -> Self {
         let mut tree = Tree::new();
-        for (i, parents) in inodes {
-            tree.insert_unloaded(i, parents);
-        }
         tree.set_source(source);
         History { id, dag, tree, contents: Contents::default(), meta, status, dirty: Dirty::default() }
     }

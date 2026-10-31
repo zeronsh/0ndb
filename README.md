@@ -299,6 +299,13 @@ seen the cutoff, which the sync layer doesn't track yet.
 
 0ndb is meant to watch many worktrees from one long-running process.
 
+* **Nothing per file is held in memory**, even while a worktree is active.
+  Inodes, texts and directory listings are read from the store on first use
+  and dropped again once persisted (beyond a 16k budget); the mount's record
+  of what is on disk stays in SQLite, with only unpersisted changes in
+  memory; the git index baseline is a hard link to git's index file. On a
+  97k-file Linux checkout an active worktree holds about 6 MiB beyond the
+  shared content cache, and 20 active zeron worktrees about 0.07 MiB each.
 * **Memory scales with active worktrees.** A mount with no activity for
   `MountOptions::idle_unload` (30 s) hibernates: its shadow, the history's
   in-memory state and its SQLite connections are released, and reloaded on
@@ -393,11 +400,6 @@ ONDB_DB=~/.0ndb-test/0ndb.db 0ndb watch    # alongside a production `0ndb watch`
   (ordered locators), which is not built yet.
 * Stale-parent seeks degrade toward linear when concurrent edits are
   scattered across a whole file, because pruning is by timestamp.
-* Opening a history still decodes every inode row once to build the
-  directory index (about 0.3 s for 97k files); inodes and texts themselves
-  load on first use.
-* An active mount keeps its on-disk shadow (about 380 bytes per file) in
-  memory until it hibernates.
 * Case-insensitive name collisions are not specially handled. The watcher and
   file modes assume a Unix platform.
 

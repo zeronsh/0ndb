@@ -110,34 +110,81 @@ impl Inode {
     }
 }
 
-/// Where stored inodes are read from when first used (see
-/// [`Tree::insert_unloaded`]).
+/// Where stored inodes are read from when first used: a history loaded
+/// from a store keeps nothing per inode in memory until it is touched.
 pub trait InodeSource: Send + Sync {
     fn inode(&self, id: &InodeId) -> Option<Inode>;
+    fn exists(&self, id: &InodeId) -> bool;
+    /// Every inode ever placed under `dir`.
+    fn children(&self, dir: &InodeId) -> Vec<InodeId>;
+    /// Every stored inode id.
+    fn ids(&self) -> Vec<InodeId>;
+    fn is_empty(&self) -> bool;
 }
 
-/// An inode, possibly not loaded yet. Unloaded slots cost their key and a
-/// pointer, so a large tree's untouched entries stay out of memory.
-#[derive(Clone, Default)]
-struct Slot(std::sync::OnceLock<Box<Inode>>);
+/// Inodes in memory, added through `&self` as they are loaded. Each lives in
+/// its own box, which is never moved or dropped while `&self` borrows exist:
+/// entries are only added through `&self`, and removing or mutating needs
+/// `&mut self`. So references handed out by `get` stay valid.
+#[derive(Default)]
+struct Loaded(std::sync::Mutex<HashMap<InodeId, Box<Inode>>>);
 
-impl Slot {
-    fn loaded(inode: Inode) -> Slot {
-        Slot(std::sync::OnceLock::from(Box::new(inode)))
+impl Loaded {
+    fn map(&mut self) -> &mut HashMap<InodeId, Box<Inode>> {
+        self.0.get_mut().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn get(&self, id: &InodeId) -> Option<&Inode> {
+        let map = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: see the type's invariant; the box outlives `&self`.
+        map.get(id).map(|b| unsafe { &*(&**b as *const Inode) })
+    }
+
+    fn add(&self, inode: Inode) -> &Inode {
+        let mut map = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let b = map.entry(inode.id).or_insert_with(|| Box::new(inode));
+        // SAFETY: as in `get`.
+        unsafe { &*(&**b as *const Inode) }
+    }
+
+    fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    fn ids(&self) -> Vec<InodeId> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).keys().copied().collect()
     }
 }
 
-#[derive(Clone)]
+impl Clone for Loaded {
+    fn clone(&self) -> Self {
+        Loaded(std::sync::Mutex::new(self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()))
+    }
+}
+
+type Children = HashMap<InodeId, std::sync::Arc<BTreeSet<InodeId>>>;
+
 pub struct Tree {
-    inodes: HashMap<InodeId, Slot>,
-    /// Every inode that has ever been placed under a directory.
-    children: HashMap<InodeId, BTreeSet<InodeId>>,
+    inodes: Loaded,
+    /// Every inode that has ever been placed under a directory, per
+    /// directory, loaded per directory on first use.
+    children: std::sync::Mutex<Children>,
     source: Option<std::sync::Arc<dyn InodeSource>>,
+}
+
+impl Clone for Tree {
+    fn clone(&self) -> Self {
+        Tree {
+            inodes: self.inodes.clone(),
+            children: std::sync::Mutex::new(self.children.lock().unwrap_or_else(|p| p.into_inner()).clone()),
+            source: self.source.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Tree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tree").field("inodes", &self.inodes.len()).field("loaded", &self.loaded_count()).finish()
+        f.debug_struct("Tree").field("loaded", &self.loaded_count()).finish()
     }
 }
 
@@ -179,50 +226,45 @@ pub fn conflict_name(name: &str, winner_loser_op: OpId) -> String {
 impl Tree {
     pub fn new() -> Self {
         let root = Inode { id: InodeId::ROOT, kind: NodeKind::Dir, placement: Lww::default(), alive: Lww::new(OpId::ZERO, true) };
-        Tree { inodes: HashMap::from([(InodeId::ROOT, Slot::loaded(root))]), children: HashMap::new(), source: None }
-    }
-
-    fn read(source: &Option<std::sync::Arc<dyn InodeSource>>, id: &InodeId) -> Box<Inode> {
-        // The row was readable when the history loaded and stays while the
-        // inode exists; failing now means the store is broken, and carrying
-        // on without the inode would corrupt it.
-        Box::new(source.as_ref().and_then(|s| s.inode(id)).unwrap_or_else(|| panic!("0ndb: loading stored inode {id:?} failed")))
+        let inodes = Loaded::default();
+        inodes.add(root);
+        Tree { inodes, children: std::sync::Mutex::default(), source: None }
     }
 
     pub fn get(&self, id: &InodeId) -> Option<&Inode> {
-        let slot = self.inodes.get(id)?;
-        Some(slot.0.get_or_init(|| Self::read(&self.source, id)))
+        if let Some(i) = self.inodes.get(id) {
+            return Some(i);
+        }
+        let inode = self.source.as_ref()?.inode(id)?;
+        Some(self.inodes.add(inode))
     }
 
     fn at(&self, id: &InodeId) -> &Inode {
-        self.get(id).expect("inode is in the tree")
+        // Ids come from the tree itself (children, placements); a missing
+        // one means the store is broken, and carrying on would corrupt it.
+        self.get(id).unwrap_or_else(|| panic!("0ndb: loading stored inode {id:?} failed"))
     }
 
     pub fn get_mut(&mut self, id: &InodeId) -> Option<&mut Inode> {
-        let slot = self.inodes.get_mut(id)?;
-        if slot.0.get().is_none() {
-            let _ = slot.0.set(Self::read(&self.source, id));
+        if self.inodes.get(id).is_none() {
+            let inode = self.source.as_ref()?.inode(id)?;
+            self.inodes.add(inode);
         }
-        slot.0.get_mut().map(|b| &mut **b)
+        self.inodes.map().get_mut(id).map(|b| &mut **b)
     }
 
     /// Whether the inode exists, without loading it.
     pub fn contains(&self, id: &InodeId) -> bool {
-        self.inodes.contains_key(id)
+        self.inodes.get(id).is_some() || self.source.as_ref().is_some_and(|s| s.exists(id))
     }
 
-    /// Every inode id, without loading any.
-    pub fn ids(&self) -> impl Iterator<Item = &InodeId> {
-        self.inodes.keys()
-    }
-
-    /// Adds a stored inode without loading it: only its id and the
-    /// directories it has been placed under are kept until first use.
-    pub fn insert_unloaded(&mut self, id: InodeId, parents: impl IntoIterator<Item = InodeId>) {
-        for p in parents {
-            self.children.entry(p).or_default().insert(id);
+    /// Every inode id, without loading any (from the store when there is one).
+    pub fn ids(&self) -> Vec<InodeId> {
+        let mut ids: std::collections::HashSet<InodeId> = self.inodes.ids().into_iter().collect();
+        if let Some(s) = &self.source {
+            ids.extend(s.ids());
         }
-        self.inodes.insert(id, Slot::default());
+        ids.into_iter().collect()
     }
 
     pub fn set_source(&mut self, source: std::sync::Arc<dyn InodeSource>) {
@@ -230,45 +272,59 @@ impl Tree {
     }
 
     pub fn loaded_count(&self) -> usize {
-        self.inodes.values().filter(|s| s.0.get().is_some()).count()
+        self.inodes.len()
     }
 
-    /// Drops loaded inodes not in `keep` (they reload from the source on
-    /// next use). Callers must only drop inodes whose state is persisted.
-    /// No-op without a source.
+    /// Drops loaded inodes and directory listings not in `keep` (they
+    /// reload from the source on next use). Callers must only drop state
+    /// that is persisted. No-op without a source.
     pub fn unload_except(&mut self, keep: &std::collections::HashSet<InodeId>) {
         if self.source.is_none() {
             return;
         }
-        for (id, slot) in self.inodes.iter_mut() {
-            if !id.is_root() && !keep.contains(id) {
-                *slot = Slot::default();
-            }
-        }
+        self.inodes.map().retain(|id, _| id.is_root() || keep.contains(id));
+        self.children.get_mut().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     pub fn len(&self) -> usize {
-        self.inodes.len()
+        self.ids().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inodes.len() <= 1
+        self.inodes.len() <= 1 && self.source.as_ref().is_none_or(|s| s.is_empty())
     }
 
     /// Every inode, loading each. Prefer [`Tree::ids`] when ids suffice.
     pub fn inodes(&self) -> impl Iterator<Item = &Inode> {
-        self.inodes.keys().map(|id| self.at(id))
+        self.ids().into_iter().map(move |id| self.at(&id))
+    }
+
+    /// The directory's listing, loaded on first use.
+    fn children_of(&self, dir: &InodeId) -> std::sync::Arc<BTreeSet<InodeId>> {
+        let mut map = self.children.lock().unwrap_or_else(|p| p.into_inner());
+        map.entry(*dir)
+            .or_insert_with(|| {
+                std::sync::Arc::new(self.source.as_ref().map(|s| s.children(dir).into_iter().collect()).unwrap_or_default())
+            })
+            .clone()
+    }
+
+    fn add_child(&mut self, dir: InodeId, child: InodeId) {
+        self.children_of(&dir);
+        let map = self.children.get_mut().unwrap_or_else(|p| p.into_inner());
+        std::sync::Arc::make_mut(map.get_mut(&dir).expect("loaded above")).insert(child);
     }
 
     pub fn insert(&mut self, inode: Inode) {
         for (_, p) in inode.placement.history() {
-            self.children.entry(p.parent).or_default().insert(inode.id);
+            self.add_child(p.parent, inode.id);
         }
-        self.inodes.insert(inode.id, Slot::loaded(inode));
+        let id = inode.id;
+        self.inodes.map().insert(id, Box::new(inode));
     }
 
     pub fn place(&mut self, id: InodeId, op: OpId, placement: Placement) {
-        self.children.entry(placement.parent).or_default().insert(id);
+        self.add_child(placement.parent, id);
         if let Some(inode) = self.get_mut(&id) {
             inode.placement.set(op, placement);
         }
@@ -333,7 +389,7 @@ impl Tree {
     }
 
     fn child_ids(&self, view: &dyn View, dir: &InodeId) -> Vec<InodeId> {
-        let Some(set) = self.children.get(dir) else { return Vec::new() };
+        let set = self.children_of(dir);
         set.iter().filter(|c| self.placement_in(view, c).is_some_and(|p| p.parent == *dir)).copied().collect()
     }
 

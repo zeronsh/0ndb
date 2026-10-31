@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS inodes (
     text_root INTEGER,
     PRIMARY KEY (history_key, inode)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS inode_children (
+    history_key INTEGER NOT NULL,
+    parent BLOB NOT NULL,
+    child BLOB NOT NULL,
+    PRIMARY KEY (history_key, parent, child)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS insertions (
     history_key INTEGER NOT NULL,
     insertion BLOB NOT NULL,
@@ -137,6 +143,7 @@ CREATE TABLE IF NOT EXISTS mount_entries (
     ino INTEGER,
     PRIMARY KEY (root, path)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS mount_entries_by_inode ON mount_entries (root, inode);
 CREATE TABLE IF NOT EXISTS local_kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 "#;
 
@@ -255,7 +262,47 @@ impl BlobSource for BlobReader {
 /// their texts lazily too.
 struct StoredInodes(Arc<BlobReader>);
 
+impl StoredInodes {
+    fn ids_where(&self, sql: &str, arg: Option<Vec<u8>>) -> Vec<InodeId> {
+        let conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let run = || -> Result<Vec<InodeId>> {
+            let mut stmt = conn.prepare_cached(sql)?;
+            let rows: Vec<Vec<u8>> = match &arg {
+                Some(a) => stmt.query_map(params![self.0.key.0, a], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?,
+                None => stmt.query_map(params![self.0.key.0], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?,
+            };
+            rows.iter().map(|b| dec(b)).collect()
+        };
+        // An unreadable listing would make entries vanish; the store is broken.
+        run().unwrap_or_else(|e| panic!("0ndb: reading stored inodes failed: {e}"))
+    }
+}
+
 impl InodeSource for StoredInodes {
+    fn exists(&self, id: &InodeId) -> bool {
+        let Ok(k) = enc(id) else { return false };
+        let conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.prepare_cached("SELECT 1 FROM inodes WHERE history_key = ?1 AND inode = ?2")
+            .and_then(|mut s| s.exists(params![self.0.key.0, k]))
+            .unwrap_or_else(|e| panic!("0ndb: reading stored inodes failed: {e}"))
+    }
+
+    fn children(&self, dir: &InodeId) -> Vec<InodeId> {
+        self.ids_where("SELECT child FROM inode_children WHERE history_key = ?1 AND parent = ?2", enc(dir).ok())
+    }
+
+    fn ids(&self) -> Vec<InodeId> {
+        self.ids_where("SELECT inode FROM inodes WHERE history_key = ?1", None)
+    }
+
+    fn is_empty(&self) -> bool {
+        let conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
+        !conn
+            .prepare_cached("SELECT 1 FROM inodes WHERE history_key = ?1 LIMIT 1")
+            .and_then(|mut s| s.exists([self.0.key.0]))
+            .unwrap_or_else(|e| panic!("0ndb: reading stored inodes failed: {e}"))
+    }
+
     fn inode(&self, id: &InodeId) -> Option<Inode> {
         let (data, root): (Vec<u8>, Option<i64>) = {
             let conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -266,6 +313,105 @@ impl InodeSource for StoredInodes {
         let stored: StoredInode = dec(&decompress(&data).ok()?).ok()?;
         let source: Arc<dyn NodeSource> = self.0.clone();
         Some(Inode::from_stored(stored, root.map(|r| Text::lazy(r as u64, source))))
+    }
+}
+
+const MOUNT_COLUMNS: &str = "path, inode, kind, oid, mode, mtime_ns, size, ino";
+
+/// Streams `mount_entries` rows; `tail` follows `FROM mount_entries` (an
+/// index hint and the WHERE clause).
+fn mount_rows(conn: &Connection, tail: &str, args: impl rusqlite::Params, mut f: impl FnMut(MountEntryRow)) -> Result<()> {
+    let mut stmt = conn.prepare_cached(&format!("SELECT {MOUNT_COLUMNS} FROM mount_entries {tail}"))?;
+    let mut rows = stmt.query(args)?;
+    while let Some(r) = rows.next()? {
+        let inode: Vec<u8> = r.get(1)?;
+        let inode: InodeId = postcard::from_bytes(&inode).map_err(CodecError::from)?;
+        let oid = r
+            .get::<_, Option<Vec<u8>>>(3)?
+            .map(|o| <[u8; 20]>::try_from(o.as_slice()).map(Oid).map_err(|_| StoreError::Corrupt("bad oid".into())))
+            .transpose()?;
+        f(MountEntryRow {
+            path: r.get(0)?,
+            inode,
+            kind: r.get::<_, i64>(2)? as u8,
+            oid,
+            mode: r.get::<_, i64>(4)? as u8,
+            mtime_ns: r.get(5)?,
+            size: r.get(6)?,
+            ino: r.get(7)?,
+        });
+    }
+    Ok(())
+}
+
+/// One mount's persisted entries, read on demand over a dedicated
+/// connection (see `Store::mount_reader`).
+pub struct MountReader {
+    conn: std::sync::Mutex<Connection>,
+    root: String,
+}
+
+impl MountReader {
+    fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        f(&self.conn.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn one(&self, filter: &str, arg: &dyn rusqlite::ToSql) -> Result<Option<MountEntryRow>> {
+        let mut out = None;
+        self.with(|c| mount_rows(c, filter, params![self.root, arg], |r| out = Some(r)))?;
+        Ok(out)
+    }
+
+    pub fn get(&self, path: &str) -> Result<Option<MountEntryRow>> {
+        self.one("WHERE root = ?1 AND path = ?2", &path)
+    }
+
+    pub fn by_inode(&self, inode: &InodeId) -> Result<Option<MountEntryRow>> {
+        // Without the hint SQLite picks the primary key's `root` prefix and
+        // scans the whole mount.
+        self.one(
+            "INDEXED BY mount_entries_by_inode WHERE root = ?1 AND inode = ?2 LIMIT 1",
+            &postcard::to_stdvec(inode).map_err(CodecError::from)?,
+        )
+    }
+
+    /// Entries with `lo <= path <= hi`, in path order.
+    pub fn range(&self, lo: &str, hi: &str) -> Result<Vec<MountEntryRow>> {
+        let mut out = Vec::new();
+        self.with(|c| {
+            mount_rows(c, "WHERE root = ?1 AND path >= ?2 AND path <= ?3 ORDER BY path", params![self.root, lo, hi], |r| {
+                out.push(r)
+            })
+        })?;
+        Ok(out)
+    }
+
+    /// Paths strictly under `dir`.
+    pub fn under(&self, dir: &str) -> Result<Vec<String>> {
+        // `0` sorts right after `/`, so this is exactly the `dir/` prefix.
+        let (lo, hi) = (format!("{dir}/"), format!("{dir}0"));
+        let mut out = Vec::new();
+        self.with(|c| {
+            mount_rows(c, "WHERE root = ?1 AND path >= ?2 AND path < ?3 ORDER BY path", params![self.root, lo, hi], |r| {
+                out.push(r.path)
+            })
+        })?;
+        Ok(out)
+    }
+
+    /// Every entry, streamed in path order.
+    pub fn for_each(&self, f: impl FnMut(MountEntryRow)) -> Result<()> {
+        self.with(|c| mount_rows(c, "WHERE root = ?1 ORDER BY path", params![self.root], f))
+    }
+
+    pub fn any(&self) -> Result<bool> {
+        self.with(|c| Ok(c.prepare_cached("SELECT 1 FROM mount_entries WHERE root = ?1 LIMIT 1")?.exists([&self.root])?))
+    }
+
+    pub fn count(&self) -> Result<u64> {
+        self.with(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM mount_entries WHERE root = ?1", [&self.root], |r| r.get::<_, i64>(0))? as u64)
+        })
     }
 }
 
@@ -819,21 +965,10 @@ impl Store {
         for h in self.headers(key)? {
             dag.insert(h).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         }
-        // Inodes (and their texts) load on first use, so memory follows the
-        // files actually touched, not the tree's size. Only each inode's id
-        // and the directories it was placed under are read now.
+        // Inodes, their texts and directory listings load on first use, so
+        // memory follows the files actually touched, not the tree's size.
+        self.backfill_children(key)?;
         let reader = Arc::new(self.blob_reader(key)?);
-        let mut inodes = Vec::new();
-        {
-            let mut stmt = self.conn.prepare("SELECT data FROM inodes WHERE history_key = ?1")?;
-            let mut rows = stmt.query([key.0])?;
-            while let Some(row) = rows.next()? {
-                let data: Vec<u8> = row.get(0)?;
-                let stored: StoredInode = dec(&decompress(&data)?)?;
-                let parents: Vec<InodeId> = stored.placement.history().iter().map(|(_, p)| p.parent).collect();
-                inodes.push((stored.id, parents));
-            }
-        }
         let mut meta = BTreeMap::new();
         {
             let mut stmt = self.conn.prepare("SELECT key, entry FROM meta WHERE history_key = ?1")?;
@@ -846,10 +981,37 @@ impl Store {
         let status: Option<Vec<u8>> =
             self.conn.query_row("SELECT status FROM histories WHERE history_key = ?1", [key.0], |r| r.get(0))?;
         let status = status.map(|s| dec(&s)).transpose()?.unwrap_or(Status::Healthy);
-        let mut history = History::from_stored(id, dag, inodes, Arc::new(StoredInodes(reader.clone())), meta, status);
+        let mut history = History::from_stored(id, dag, Arc::new(StoredInodes(reader.clone())), meta, status);
         // Insertions stay in the store; the blob reader serves them on demand.
         history.set_blob_source(reader);
         Ok((key, history))
+    }
+
+    /// Stores written before directory listings were persisted get them
+    /// once, from the inode rows.
+    fn backfill_children(&mut self, key: HistoryKey) -> Result<()> {
+        let has = |c: &Connection, t: &str| -> Result<bool> {
+            Ok(c.prepare(&format!("SELECT 1 FROM {t} WHERE history_key = ?1 LIMIT 1"))?.exists([key.0])?)
+        };
+        if !has(&self.conn, "inodes")? || has(&self.conn, "inode_children")? {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut read = tx.prepare("SELECT inode, data FROM inodes WHERE history_key = ?1")?;
+            let mut write =
+                tx.prepare("INSERT OR IGNORE INTO inode_children (history_key, parent, child) VALUES (?1, ?2, ?3)")?;
+            let mut rows = read.query([key.0])?;
+            while let Some(row) = rows.next()? {
+                let ikey: Vec<u8> = row.get(0)?;
+                let stored: StoredInode = dec(&decompress(&row.get::<_, Vec<u8>>(1)?)?)?;
+                for (_, p) in stored.placement.history() {
+                    write.execute(params![key.0, enc(&p.parent)?, ikey])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Blobs whose bytes are in the store (not held externally).
@@ -966,31 +1128,18 @@ impl Store {
     }
 
     pub fn mount_entries(&self, root: &str) -> Result<Vec<MountEntryRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, inode, kind, oid, mode, mtime_ns, size, ino FROM mount_entries WHERE root = ?1 ORDER BY path",
-        )?;
-        let rows = stmt.query_map([root], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<Vec<u8>>>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, Option<i64>>(7)?,
-            ))
-        })?;
         let mut out = Vec::new();
-        for row in rows {
-            let (path, inode, kind, oid, mode, mtime_ns, size, ino) = row?;
-            let inode: InodeId = postcard::from_bytes(&inode).map_err(CodecError::from)?;
-            let oid = oid
-                .map(|o| <[u8; 20]>::try_from(o.as_slice()).map(Oid).map_err(|_| StoreError::Corrupt("bad oid".into())))
-                .transpose()?;
-            out.push(MountEntryRow { path, inode, kind: kind as u8, oid, mode: mode as u8, mtime_ns, size, ino });
-        }
+        mount_rows(&self.conn, "WHERE root = ?1 ORDER BY path", params![root], |r| out.push(r))?;
         Ok(out)
+    }
+
+    /// A read connection over one mount's entries, so they can be paged
+    /// in on demand instead of held in memory.
+    pub fn mount_reader(&self, root: &str) -> Result<MountReader> {
+        let conn = self.reopen.open()?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "cache_size", READER_CACHE_KIB)?;
+        Ok(MountReader { conn: std::sync::Mutex::new(conn), root: root.to_string() })
     }
 
     /// Applies a batch of entry upserts and deletions atomically, together
@@ -1066,6 +1215,13 @@ fn write_state(tx: &rusqlite::Transaction<'_>, key: HistoryKey, history: &Histor
              ON CONFLICT (history_key, inode) DO UPDATE SET data = excluded.data, text_root = excluded.text_root",
             params![key.0, ikey, compress(&enc(&stored)?), new_root.map(|r| r as i64)],
         )?;
+        // Directory listings: every directory the inode was ever placed in.
+        for (_, p) in stored.placement.history() {
+            tx.execute(
+                "INSERT OR IGNORE INTO inode_children (history_key, parent, child) VALUES (?1, ?2, ?3)",
+                params![key.0, enc(&p.parent)?, ikey],
+            )?;
+        }
         let old_root = old_root.flatten().map(|r| r as u64);
         if old_root != new_root {
             if let Some(r) = new_root {
@@ -1326,5 +1482,26 @@ mod tests {
         assert_eq!(loaded.walk().len(), 50);
         let (_, again) = s.load(id).unwrap();
         assert_eq!(again.text(&files[3]).unwrap(), b"FILE 3\n");
+    }
+
+    #[test]
+    fn stores_without_directory_listings_are_backfilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = HistoryId::random();
+        let actor = ActorId::random();
+        let mut s = Store::open(dir.path().join("s.db")).unwrap();
+        let key = s.create_history(id).unwrap();
+        let mut h = History::new(id);
+        for i in 0..5 {
+            let b = write(&mut h, actor, &format!("f{i}"), "x\n");
+            s.append(key, &b, Origin::Local, &mut h).unwrap();
+        }
+        // As written by an older version: no listings.
+        s.conn.execute("DELETE FROM inode_children", []).unwrap();
+        let (_, loaded) = s.load(id).unwrap();
+        assert_eq!(loaded.walk().len(), 5);
+        assert_eq!(loaded.tree().loaded_count(), 6, "the walk loaded what it listed, nothing more was resident before");
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM inode_children", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 5);
     }
 }

@@ -202,8 +202,8 @@ impl Mount {
                 return Err(Error::Invalid(format!("{root_key} is mounted by history {}", r.history)));
             }
             Some(r) => {
-                let rows = ws.with(|c| c.store().0.mount_entries(&root_key))?;
-                (r, Shadow::from_rows(rows), false)
+                let reader = ws.with(|c| c.store().0.mount_reader(&root_key))?;
+                (r, Shadow::open(reader), false)
             }
             None => {
                 let actor = ws.actor(&format!("disk:{root_key}"), ActorKind::Ingestion)?;
@@ -219,7 +219,8 @@ impl Mount {
                     let (store, key) = c.store();
                     store.save_mount_record(key, &record)
                 })?;
-                (record, Shadow::default(), true)
+                let reader = ws.with(|c| c.store().0.mount_reader(&root_key))?;
+                (record, Shadow::open(reader), true)
             }
         };
 
@@ -254,7 +255,7 @@ impl Mount {
             record,
             shadow,
             git_head: None,
-            git_index: None,
+            has_index_baseline: false,
             index_stamp: None,
             reflog_pos: 0,
             fence_seq: 0,
@@ -360,7 +361,7 @@ pub(crate) struct MountState {
     objects: Option<Arc<git::GitObjects>>,
     git_head: Option<String>,
     /// The index as of the last pass, to tell which files git just wrote.
-    git_index: Option<git::CompactIndex>,
+    has_index_baseline: bool,
     index_stamp: Option<(std::time::SystemTime, u64)>,
     /// HEAD reflog length as of the last pass.
     reflog_pos: u64,
@@ -389,9 +390,14 @@ impl MountState {
             return Ok(());
         }
         self.persist()?;
-        self.ignored_tracked =
-            self.shadow.paths().filter(|p| self.ignore.is_ignored(p, self.shadow.is_dir(p))).map(str::to_string).collect();
-        self.shadow = Shadow::default();
+        self.ignored_tracked = self
+            .shadow
+            .entries()
+            .into_iter()
+            .filter(|(p, e)| self.ignore.is_ignored(p, e.kind == shadow::Kind::Dir))
+            .map(|(p, _)| p)
+            .collect();
+        self.shadow.release();
         self.hibernating = true;
         self.ws.hibernate();
         tracing::debug!(root = %self.root.display(), "mount hibernating");
@@ -404,8 +410,8 @@ impl MountState {
             return Ok(());
         }
         let root = self.record.root.clone();
-        let rows = self.ws.with(|c| c.store().0.mount_entries(&root))?;
-        self.shadow = Shadow::from_rows(rows);
+        let reader = self.ws.with(|c| c.store().0.mount_reader(&root))?;
+        self.shadow.attach(reader);
         self.ignored_tracked = HashSet::new();
         self.hibernating = false;
         Ok(())
@@ -423,7 +429,7 @@ impl MountState {
     }
 
     fn persist(&mut self) -> Result<(), Error> {
-        let (upserts, removals) = self.shadow.take_changes();
+        let (upserts, removals) = self.shadow.changes();
         self.record.git_head = self.git_head.clone();
         self.record.git_reflog = self.git.as_ref().map(|_| self.reflog_pos);
         let record = self.record.clone();
@@ -431,6 +437,7 @@ impl MountState {
             let (store, key) = c.store();
             store.update_mount(key, &record, &upserts, &removals)
         })?;
+        self.shadow.persisted();
         Ok(())
     }
 
@@ -444,18 +451,35 @@ impl MountState {
         let Some(g) = &self.git else { return };
         self.reflog_pos = g.reflog_len();
         let stamp = g.index_stamp();
-        if stamp != self.index_stamp || self.git_index.is_none() {
-            self.git_index = git::read_index_raw(&self.root, self.git.as_ref()).as_deref().map(git::compact);
+        if stamp != self.index_stamp || !self.has_index_baseline {
+            let base = self.index_file("base");
+            self.has_index_baseline = self.link_index(&base);
             self.index_stamp = stamp;
         }
     }
 
-    /// Like `snapshot_git`, with an index the caller just read.
-    fn adopt_git_index(&mut self, index: Option<git::CompactIndex>) {
+    /// Where the index baseline (or the next one) is kept: a hard link to
+    /// the index file git had then. Git replaces the index by renaming a new
+    /// file over it, so the link keeps the old one for free, and nothing
+    /// per file is held in memory.
+    fn index_file(&self, which: &str) -> PathBuf {
+        self.root.join(STATE_DIR).join(format!("index-{}.{which}", self.ws.id()))
+    }
+
+    /// Links (or, across filesystems, copies) the current index to `dest`.
+    fn link_index(&self, dest: &Path) -> bool {
+        let Some(g) = &self.git else { return false };
+        let src = g.dir.join("index");
+        let _ = fs::remove_file(dest);
+        fs::hard_link(&src, dest).is_ok() || fs::copy(&src, dest).is_ok()
+    }
+
+    /// Makes `next` (linked by the caller before reading it) the baseline.
+    fn adopt_index_baseline(&mut self, linked: bool) {
         let Some(g) = &self.git else { return };
         self.reflog_pos = g.reflog_len();
         self.index_stamp = g.index_stamp();
-        self.git_index = index;
+        self.has_index_baseline = linked && fs::rename(self.index_file("next"), self.index_file("base")).is_ok();
     }
 
     /// Waits (bounded) for git to finish an operation. Returns whether git

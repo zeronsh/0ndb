@@ -265,9 +265,8 @@ impl MountState {
     /// Drops cached entries whose inodes the history doesn't know (e.g. the
     /// store was rebuilt), so they're treated as new rather than corrupting.
     pub(super) fn validate_shadow(&mut self) {
-        let stale: Vec<String> = self.ws.read(|h| {
-            self.shadow.paths().filter(|p| !h.has_inode(&self.shadow.get(p).unwrap().inode)).map(str::to_string).collect()
-        });
+        let stale: Vec<String> =
+            self.ws.read(|h| self.shadow.entries().into_iter().filter(|(_, e)| !h.has_inode(&e.inode)).map(|(p, _)| p).collect());
         for p in stale {
             self.shadow.remove(&p);
         }
@@ -295,7 +294,7 @@ impl MountState {
         };
         match scope {
             Scope::Full => {
-                out.extend(self.shadow.paths().map(str::to_string));
+                out.extend(self.shadow.paths());
                 walk_into("", &mut out);
             }
             Scope::Paths(paths) => {
@@ -317,7 +316,7 @@ impl MountState {
             .flat_map(|p| {
                 let mut ancestors = Vec::new();
                 let mut cur = parent_of(p);
-                while !cur.is_empty() && self.shadow.get(cur).is_none() {
+                while !cur.is_empty() && !out.contains(cur) && self.shadow.get(cur).is_none() {
                     ancestors.push(cur.to_string());
                     cur = parent_of(cur);
                 }
@@ -413,6 +412,8 @@ impl MountState {
         while start < cands.len() {
             // Probe a window, then read and hash the files it needs in parallel.
             let ahead = &cands[start..(start + WINDOW_PATHS).min(cands.len())];
+            // Persisted entries for this sorted run of paths, in one query.
+            self.shadow.window(&ahead[0], &ahead[ahead.len() - 1]);
             let mut probed = probe_parallel(&root, ahead).into_iter();
             let mut probes = Vec::new();
             let (mut wanted, mut want_bytes) = (Vec::new(), 0i64);
@@ -449,7 +450,7 @@ impl MountState {
                     self.deferred.insert(path.clone());
                     continue;
                 }
-                let shadow = self.shadow.get(path).cloned();
+                let shadow = self.shadow.get(path);
                 let parent_ok = |created: &BTreeMap<String, Found>| {
                     let p = parent_of(path);
                     p.is_empty() || self.shadow.is_dir(p) || matches!(created.get(p), Some(Found::Dir))
@@ -542,6 +543,7 @@ impl MountState {
         for (path, stat) in stat_only {
             self.shadow.set_stat(&path, Some(stat));
         }
+        self.shadow.clear_window();
         crate::timing::add("scan", t_scan.elapsed());
 
         if !git_wrote {
@@ -564,11 +566,24 @@ impl MountState {
         // the edit are recorded separately. Without git's view at all,
         // everything is git's.
         let t = std::time::Instant::now();
-        let raw = git::read_index_raw(&root, self.git.as_ref());
+        // Link the index first and read the link, so the next baseline is
+        // exactly what was compared.
+        let next = self.index_file("next");
+        let linked = self.link_index(&next);
+        let raw = linked
+            .then(|| std::fs::read(&next).ok().and_then(|b| git::parse_index(&b)))
+            .flatten()
+            .or_else(|| git::read_index_raw(&root, self.git.as_ref()));
         let new_index = raw.as_deref().map(git::index_of);
         crate::timing::add("git.read_index", t.elapsed());
         let new_compact = raw.as_deref().map(git::compact);
-        let written: Option<BTreeSet<String>> = match (&self.git_index, &new_compact) {
+        drop(raw);
+        let old_compact = self
+            .has_index_baseline
+            .then(|| std::fs::read(self.index_file("base")).ok().and_then(|b| git::parse_index(&b)))
+            .flatten()
+            .map(|raw| git::compact(&raw));
+        let written: Option<BTreeSet<String>> = match (&old_compact, &new_compact) {
             (Some(old), Some(new)) => Some(
                 created
                     .keys()
@@ -651,10 +666,11 @@ impl MountState {
         };
         self.git_head = head;
         drop(new_index);
-        self.adopt_git_index(new_compact);
+        drop((old_compact, new_compact));
+        self.adopt_index_baseline(linked);
         let by_git = self.commit_pass(co_created, co_removed, co_changed, marker, git_busy)?;
         for (p, bytes, exec, stat) in followups {
-            if let Some(e) = self.shadow.get(&p).cloned() {
+            if let Some(e) = self.shadow.get(&p) {
                 changed.insert(p, (e, Change::Edit { bytes, exec, stat }));
             }
         }

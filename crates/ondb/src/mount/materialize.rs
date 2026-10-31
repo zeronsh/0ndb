@@ -62,6 +62,7 @@ impl MountState {
             let h = ctx.history();
             let view = h.current();
             let inodes: Vec<InodeId> = if all {
+                let placed = self.shadow.inodes();
                 // Entries the shadow holds that no batch since the synced
                 // version touched match disk by construction (the shadow is
                 // the synced version on disk; any move or edit since would be
@@ -69,9 +70,9 @@ impl MountState {
                 // out of the history.
                 h.tree()
                     .ids()
-                    .copied()
+                    .into_iter()
                     .filter(|i| !i.is_root())
-                    .filter(|i| touched.contains(i) || self.shadow.path_of(i).is_none())
+                    .filter(|i| touched.contains(i) || !placed.contains(i))
                     .collect()
             } else {
                 if heads == synced {
@@ -97,7 +98,7 @@ impl MountState {
 
     /// Whether the disk at `path` still holds what the shadow says.
     fn disk_matches(&mut self, path: &str) -> bool {
-        let entry = self.shadow.get(path).cloned();
+        let entry = self.shadow.get(path);
         match (entry, probe(&self.root, path)) {
             (None, DiskEntry::Missing) => true,
             (None, _) => false,
@@ -140,7 +141,7 @@ impl MountState {
             // it first (it merges through the CRDT) and plan again.
             let mut stale = BTreeSet::new();
             for d in &plan {
-                let current = self.shadow.path_of(&d.inode).map(str::to_string);
+                let current = self.shadow.path_of(&d.inode);
                 let unchanged = current == d.path
                     && match (&d.path, &d.entry) {
                         (Some(p), Some(want)) => {
@@ -179,7 +180,7 @@ impl MountState {
         let root = self.root.clone();
         // 1. Removals, deepest first.
         let mut removals: Vec<String> =
-            plan.iter().filter(|d| d.path.is_none()).filter_map(|d| self.shadow.path_of(&d.inode).map(str::to_string)).collect();
+            plan.iter().filter(|d| d.path.is_none()).filter_map(|d| self.shadow.path_of(&d.inode)).collect();
         removals.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
         for p in removals {
             disk::remove(&root, &p)?;
@@ -190,7 +191,7 @@ impl MountState {
         let mut aside = 0usize;
         for d in plan.iter().filter(|d| d.path.is_some()) {
             let want = d.path.as_deref().unwrap();
-            let Some(old) = self.shadow.path_of(&d.inode).map(str::to_string) else { continue };
+            let Some(old) = self.shadow.path_of(&d.inode) else { continue };
             if old == want {
                 continue;
             }
@@ -207,7 +208,7 @@ impl MountState {
         // 3. Creation and content, parents first.
         for d in &plan {
             let (Some(path), Some(want)) = (&d.path, &d.entry) else { continue };
-            let have = self.shadow.get(path).cloned();
+            let have = self.shadow.get(path);
             match want.kind {
                 Kind::Dir => {
                     if have.as_ref().is_none_or(|h| h.kind != Kind::Dir) {

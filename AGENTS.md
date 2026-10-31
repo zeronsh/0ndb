@@ -64,11 +64,18 @@
   them into the store if pinning fails. Never skip storing a blob without
   queueing its pin. `external_objects` records the repository so workspaces
   opened without a mount can still read the content.
-- Inodes and texts load lazily (`Tree::insert_unloaded`, `Text::lazy`):
-  loading a history keeps only ids and the children index; a row is read on
-  first use. Once persisted, loaded inodes past `LOADED_INODES` are dropped
-  (`History::trim`). Use `Tree::ids`/`History::has_inode` when you don't
-  need the inode itself; never walk every inode on load, wake or remount.
+- Nothing per file stays in memory while a worktree is active:
+  - Inodes, texts and directory listings load on first use (`InodeSource`,
+    `Text::lazy`, `inode_children`); loading a history reads none. Once
+    persisted, loaded inodes past `LOADED_INODES` are dropped
+    (`History::trim`). Use `History::has_inode` when you don't need the
+    inode; never walk every inode on load, wake or remount.
+  - The mount's shadow lives in `mount_entries`, read through its own
+    connection (`MountReader`); only unpersisted changes are in memory (the
+    overlay, cleared by `Shadow::persisted` after the write succeeds), and
+    full passes load one sorted window at a time (`Shadow::window`).
+  - The git index baseline is a hard link to the index file
+    (`.0ndb/index-<history>.base`), parsed only when git writes.
 - Files over `max_file_size` in a git checkout are tracked as opaque
   content held in git's objects (`Found::Large`, `large_ref`): hashed by
   streaming, written into git if missing (`hash-object -w`), pinned like any
