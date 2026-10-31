@@ -21,7 +21,6 @@ struct Desired {
     /// `None` when the entry should not exist on disk.
     path: Option<String>,
     entry: Option<Entry>,
-    payload: Payload,
 }
 
 fn payload_for(h: &History, view: &dyn View, inode: InodeId) -> Payload {
@@ -71,13 +70,8 @@ impl MountState {
                 .map(|inode| {
                     let path = if h.tree().is_present(&view, &inode) { h.tree().path_of(&view, &inode) } else { None };
                     match &path {
-                        Some(_) => Desired {
-                            inode,
-                            entry: shadow_entry_for(h, &view, inode),
-                            payload: payload_for(h, &view, inode),
-                            path,
-                        },
-                        None => Desired { inode, path: None, entry: None, payload: Payload::None },
+                        Some(_) => Desired { inode, entry: shadow_entry_for(h, &view, inode), path },
+                        None => Desired { inode, path: None, entry: None },
                     }
                 })
                 .collect();
@@ -218,7 +212,10 @@ impl MountState {
                         }
                         continue;
                     }
-                    let bytes = match &d.payload {
+                    // Content is fetched only for files that need writing, so
+                    // planning a large tree never holds every file at once.
+                    let payload = self.ws.read(|h| payload_for(h, &h.current(), d.inode));
+                    let bytes = match &payload {
                         Payload::Text(b) => b.clone(),
                         Payload::Blob(oid) => match self.ws.blob(oid)? {
                             Some(b) => b,
@@ -236,8 +233,8 @@ impl MountState {
                     if have.as_ref().is_some_and(|h| h.kind == Kind::Symlink && h.oid == want.oid) {
                         continue;
                     }
-                    if let Payload::Link(target) = &d.payload {
-                        disk::write_symlink(&root, path, target)?;
+                    if let Payload::Link(target) = self.ws.read(|h| payload_for(h, &h.current(), d.inode)) {
+                        disk::write_symlink(&root, path, &target)?;
                         self.shadow.insert(path.clone(), want.clone());
                     }
                 }
