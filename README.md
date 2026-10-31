@@ -299,8 +299,13 @@ shallow Linux kernel checkout (97,372 files, 1.6 GB, Apple M-series):
 
 | | before | now |
 |---|---|---|
-| first mount | 49.3 s, 1.76 GB heap peak | 7.8 s, 281 MiB heap peak |
-| store on disk | 741 MiB | 53 MiB |
+| first mount | 49.3 s, 1.76 GB heap peak | 8.2 s, 285 MiB heap peak |
+| store on disk | 741 MiB | 54 MiB |
+| remount, nothing changed | 0.80 s | 0.56 s |
+| wake from hibernation | 0.40 s | 0.15 s |
+| branch switch, 2000 files | 1.3-1.6 s | 1.1-1.3 s |
+| 10 `git status` index refreshes | 0.50 s CPU + 10 git processes | 0.21 s CPU, no processes |
+| idle | 0 CPU | 0 CPU |
 
 Measured with `cargo run --release -p ondb --example many -- <repo> <n>` on 60
 worktrees of a 2.7k-file, 74 MB repository in one process (Apple M-series):
