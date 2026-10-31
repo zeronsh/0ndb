@@ -111,6 +111,12 @@
   tool calls are attribution scopes nested in the turn's scope.
 - Sessions keep nothing per thread in memory between turns; warm provider
   processes are bounded by `SessionOptions`.
+- Crash recovery: `Store::open` marks replies left running as interrupted
+  and remembers them; `Sessions::resume_interrupted` (call once at startup
+  from long-running hosts, never from one-shot CLI commands) re-runs each
+  recent one (12 h, at most 3 revivals in a row) with its prompt against the
+  same provider session, the new reply parented on the interrupted one so
+  the transcript stays linear.
 - Branch navigation has one fixed file rule (exact restore to the message's
   version, git checkouts excepted). Don't add user-selectable branching
   behaviour; partial undo belongs to explicit scope reverts.

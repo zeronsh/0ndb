@@ -204,6 +204,58 @@ impl Sessions {
         &self.inner.store
     }
 
+    /// Picks up turns a crash cut short, as zeron does: each reply found
+    /// running when the store opened that is recent (12 h) and hasn't been
+    /// revived 3 times in a row is re-run against the same provider
+    /// session with its prompt, the new reply continuing the interrupted
+    /// one (so the transcript stays linear). Call once at startup from a
+    /// long-running host; returns the resumed turns.
+    pub fn resume_interrupted(&self) -> Vec<Turn> {
+        const MAX_RESUMES: usize = 3;
+        const FRESH_MS: u64 = 12 * 60 * 60 * 1000;
+        let store = &self.inner.store;
+        let mut out = Vec::new();
+        for id in store.take_interrupted() {
+            let resumed = (|| -> Result<Option<Turn>, Error> {
+                let Some(msg) = store.message(&id)? else { return Ok(None) };
+                let path = store.path(&id)?;
+                // Consecutive revivals: interrupted replies directly above.
+                let revivals = path.iter().rev().skip(1).take_while(|m| m.role == Role::Assistant).count();
+                let Some(user) = path.iter().rev().find(|m| m.role == Role::User).cloned() else { return Ok(None) };
+                let fresh = now_ms().saturating_sub(msg.created_ms) < FRESH_MS;
+                let Some(provider) = msg.provider.as_deref().and_then(|p| self.inner.providers.get(p)).cloned() else {
+                    return Ok(None);
+                };
+                if msg.role != Role::Assistant || !fresh || revivals >= MAX_RESUMES {
+                    return Ok(None);
+                }
+                if !self.inner.busy.lock().unwrap_or_else(|p| p.into_inner()).insert(msg.thread.clone()) {
+                    return Ok(None);
+                }
+                let guard = BusyGuard { inner: self.inner.clone(), thread: msg.thread.clone() };
+                let t = self.thread(&msg.thread)?;
+                let wt =
+                    self.inner.worktrees.get(&t.worktree).ok_or_else(|| Error::Invalid(format!("no worktree {}", t.worktree)))?;
+                let (ws, mount) = self
+                    .inner
+                    .worktrees
+                    .workspace(&wt.id)
+                    .ok_or_else(|| Error::Invalid(format!("worktree {} isn't mounted", wt.id)))?;
+                mount.fence()?;
+                store.set_error(&id, "interrupted by a restart; resumed below")?;
+                let turn =
+                    self.launch(&t.id, wt.path.clone(), ws, mount, user, id.clone(), provider, msg.model.as_deref(), guard)?;
+                Ok(Some(turn))
+            })();
+            match resumed {
+                Ok(Some(t)) => out.push(t),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(message = %id, error = %e, "resuming an interrupted turn failed"),
+            }
+        }
+        out
+    }
+
     pub fn create_thread(&self, worktree: &str, title: &str) -> Result<Thread, Error> {
         if self.inner.worktrees.get(worktree).is_none() {
             return Err(Error::Invalid(format!("no managed worktree {worktree}")));
@@ -430,6 +482,26 @@ impl Sessions {
         if user.parent.is_none() {
             ws.retain(&format!("thread:{}:{}", t.id, user.id), user.version.as_ref())?;
         }
+        let reply_to = user.id.clone();
+        self.launch(&t.id, wt.path.clone(), ws, mount, user, reply_to, provider, model, guard)
+    }
+
+    /// Runs a turn for `user`, its reply placed under `reply_to` (the user
+    /// message, or the interrupted reply a resumed turn continues).
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        thread: &str,
+        cwd: std::path::PathBuf,
+        ws: ondb::Workspace,
+        mount: ondb::MountHandle,
+        user: Message,
+        reply_to: String,
+        provider: Arc<dyn Provider>,
+        model: Option<&str>,
+        guard: BusyGuard,
+    ) -> Result<Turn, Error> {
+        let t = self.thread(thread)?;
         let assistant = new_id();
         let control = Arc::new(TurnControl::default());
         self.inner.active.lock().unwrap_or_else(|p| p.into_inner()).insert(t.id.clone(), control.clone());
@@ -438,10 +510,11 @@ impl Sessions {
         let job = TurnJob {
             inner: self.inner.clone(),
             thread: t.id.clone(),
-            cwd: wt.path.clone(),
+            cwd,
             ws,
             mount,
             user: user.clone(),
+            reply_to,
             assistant: assistant.clone(),
             provider,
             model: model.map(str::to_string),
@@ -540,6 +613,8 @@ struct TurnJob {
     ws: ondb::Workspace,
     mount: ondb::MountHandle,
     user: Message,
+    /// The reply's parent: `user`, or the interrupted reply being resumed.
+    reply_to: String,
     assistant: String,
     provider: Arc<dyn Provider>,
     model: Option<String>,
@@ -698,7 +773,7 @@ impl TurnJob {
         store.insert_message(&Message {
             id: self.assistant.clone(),
             thread: self.thread.clone(),
-            parent: Some(self.user.id.clone()),
+            parent: Some(self.reply_to.clone()),
             role: Role::Assistant,
             provider: Some(self.provider.id().to_string()),
             model: self.model.clone(),

@@ -181,6 +181,9 @@ pub struct RecordedEvent {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Replies that were still running when this store was last open (the
+    /// process died mid-turn), for `Sessions::resume_interrupted`.
+    interrupted: Mutex<Vec<String>>,
 }
 
 fn status_str(s: Status) -> &'static str {
@@ -263,12 +266,29 @@ impl Store {
             conn.execute("ALTER TABLE messages ADD COLUMN switched_from TEXT", [])?;
         }
         // A crash mid-turn leaves messages running; nothing is running now.
-        conn.execute("UPDATE messages SET status = 'interrupted' WHERE status = 'running'", [])?;
-        Ok(Store { conn: Mutex::new(conn) })
+        let interrupted: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM messages WHERE status = 'running' ORDER BY created_ms")?;
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        conn.execute(
+            "UPDATE messages SET status = 'interrupted', error = COALESCE(error, 'interrupted by a restart') WHERE status = 'running'",
+            [],
+        )?;
+        Ok(Store { conn: Mutex::new(conn), interrupted: Mutex::new(interrupted) })
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Replies found running at open (see `Store::interrupted`), once.
+    pub fn take_interrupted(&self) -> Vec<String> {
+        std::mem::take(&mut *self.interrupted.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub fn set_error(&self, message: &str, error: &str) -> Result<(), Error> {
+        self.c().execute("UPDATE messages SET error = ?2 WHERE id = ?1", params![message, error])?;
+        Ok(())
     }
 
     pub fn insert_thread(&self, t: &Thread) -> Result<(), Error> {

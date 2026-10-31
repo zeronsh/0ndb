@@ -400,3 +400,58 @@ fn live_provider_switch() {
     println!("codex: {} | claude after switching back: {}", x1.text.trim(), c2.text.trim());
     s.close_idle();
 }
+
+#[test]
+fn turns_cut_short_by_a_crash_resume_at_startup() {
+    let e = env(SessionOptions::default());
+    let t = e.sessions.create_thread(&e.wt.id, "crash").unwrap();
+    let first = e.sessions.send(&t.id, "write a.txt one", "alpha", None).unwrap().wait().unwrap();
+    // The process dies mid-turn: the next prompt and a running reply are on
+    // disk, nothing else.
+    let store = e.sessions.store();
+    let msg = |id: &str, parent: &str, role: Role, text: &str, status: Status| ondb_agents::Message {
+        id: id.into(),
+        thread: t.id.clone(),
+        parent: Some(parent.into()),
+        role,
+        provider: (role == Role::Assistant).then(|| "alpha".to_string()),
+        model: None,
+        text: text.into(),
+        version: None,
+        scope: None,
+        session: first.session.clone(),
+        native: None,
+        status,
+        error: None,
+        created_ms: ondb_core::now_ms(),
+        switched_from: None,
+    };
+    store.insert_message(&msg("u2", &first.id, Role::User, "write b.txt two", Status::Done)).unwrap();
+    store.insert_message(&msg("a2", "u2", Role::Assistant, "partial", Status::Running)).unwrap();
+    store.set_leaf(&t.id, "a2").unwrap();
+    // A reply already revived three times in a row is left alone.
+    store.insert_message(&msg("u9", &first.id, Role::User, "write c.txt three", Status::Done)).unwrap();
+    let mut parent = "u9".to_string();
+    for i in 0..4 {
+        let status = if i == 3 { Status::Running } else { Status::Interrupted };
+        store.insert_message(&msg(&format!("r{i}"), &parent, Role::Assistant, "partial", status)).unwrap();
+        parent = format!("r{i}");
+    }
+
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(e.alpha.clone())];
+    let db = e._dir.path().join("state/sessions.db");
+    let restarted = Sessions::open(&db, e.worktrees.clone(), providers, SessionOptions::default()).unwrap();
+    let resumed = restarted.resume_interrupted();
+    assert_eq!(resumed.len(), 1, "only the fresh crash within its revival budget");
+    let reply = resumed.into_iter().next().unwrap().wait().unwrap();
+    assert_eq!(reply.status, Status::Done);
+    assert_eq!(reply.parent.as_deref(), Some("a2"), "the transcript continues from the interrupted reply");
+    assert_eq!(reply.text, "ok: write b.txt two");
+    let interrupted = restarted.store().message("a2").unwrap().unwrap();
+    assert_eq!(interrupted.status, Status::Interrupted);
+    assert!(interrupted.error.unwrap().contains("resumed"));
+    assert_eq!(restarted.store().message("r3").unwrap().unwrap().status, Status::Interrupted);
+    let (ws, _) = e.worktrees.workspace(&e.wt.id).unwrap();
+    assert_eq!(text(&ws, "b.txt").as_deref(), Some("two\n"));
+    assert!(restarted.resume_interrupted().is_empty(), "resumes once per startup");
+}

@@ -275,6 +275,12 @@ registering it. Nothing polls: provider calls happen on request.
   between turns, each for `warm_idle` (90 s); a parked session resumes
   natively. The reaper sleeps without wakeups while nothing is warm. Nothing
   about a thread is held in memory between turns.
+* **Turns survive crashes.** A reply still running when the process died
+  is marked interrupted on the next start, and `resume_interrupted` (called
+  by long-running hosts at startup) re-runs it against the same provider
+  session, as zeron does: only if it is under 12 hours old and hasn't been
+  revived 3 times in a row. The new reply follows the interrupted one, so
+  the transcript stays linear and the partial reply stays visible.
 
 ## Retention
 
@@ -387,9 +393,11 @@ ONDB_DB=~/.0ndb-test/0ndb.db 0ndb watch    # alongside a production `0ndb watch`
   (ordered locators), which is not built yet.
 * Stale-parent seeks degrade toward linear when concurrent edits are
   scattered across a whole file, because pruning is by timestamp.
-* Text trees load eagerly on open (they hold no bytes, only fragments).
-  Loading per file on first access would make opening huge repositories
-  O(1).
+* Opening a history still decodes every inode row once to build the
+  directory index (about 0.3 s for 97k files); inodes and texts themselves
+  load on first use.
+* An active mount keeps its on-disk shadow (about 380 bytes per file) in
+  memory until it hibernates.
 * Case-insensitive name collisions are not specially handled. The watcher and
   file modes assume a Unix platform.
 
