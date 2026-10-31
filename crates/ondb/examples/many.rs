@@ -193,6 +193,11 @@ fn main() {
     println!("{:<30} {:.3}s cpu over 10s ({:.2}% of one core)", "idle after work", idle.as_secs_f64(), idle.as_secs_f64() * 10.0);
     let asleep = wss.iter().filter(|w| w.is_hibernating()).count();
     report(&format!("hibernated ({asleep}/{n})"), &base, None);
+    // Steady state: everything asleep, nothing happening.
+    let c = usage().cpu;
+    std::thread::sleep(Duration::from_secs(10));
+    let idle = usage().cpu.saturating_sub(c);
+    println!("{:<30} {:.3}s cpu over 10s ({:.2}% of one core)", "idle while hibernated", idle.as_secs_f64(), idle.as_secs_f64() * 10.0);
     println!(
         "{:<30} {:.2} MiB live heap per hibernated worktree (excl. shared cache {:.1} MiB)",
         "",
