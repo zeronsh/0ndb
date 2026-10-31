@@ -98,6 +98,11 @@ large histories:
   into the store instead. Content is read through one long-lived
   `git cat-file --batch-command` per active worktree, stopped while it
   hibernates.
+* *Large files.* Files over `MountOptions::max_file_size` (16 MiB) in a git
+  checkout are tracked as opaque content in git's objects: hashed by
+  streaming, written into git if it doesn't have them, pinned, and streamed
+  back to disk on restore, so they never sit in memory. Outside git they are
+  not tracked.
 
 Measured on an 8 MiB, 200k-line file (`cargo run --release -p ondb-core
 --example bigfile`, `-p ondb --example durable`):

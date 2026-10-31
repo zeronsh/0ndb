@@ -69,6 +69,11 @@
   first use. Once persisted, loaded inodes past `LOADED_INODES` are dropped
   (`History::trim`). Use `Tree::ids`/`History::has_inode` when you don't
   need the inode itself; never walk every inode on load, wake or remount.
+- Files over `max_file_size` in a git checkout are tracked as opaque
+  content held in git's objects (`Found::Large`, `large_ref`): hashed by
+  streaming, written into git if missing (`hash-object -w`), pinned like any
+  other referenced blob, and materialized by streaming from git. Never read
+  them into memory.
 - Materialization plans only inodes touched since the synced version (plus,
   on first mount, ones the shadow lacks); never read every file back out of
   the history to compare.

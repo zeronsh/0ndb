@@ -213,6 +213,39 @@ impl Objects {
         None
     }
 
+    /// Writes the file at `path` (absolute) into the object database as-is
+    /// (no filters), returning its blob id.
+    pub fn write_file(&self, path: &Path) -> Option<[u8; 20]> {
+        let out = self
+            .git()
+            .args(["hash-object", "-w", "--no-filters", "--"])
+            .arg(path.to_string_lossy().into_owned())
+            .timeout(std::time::Duration::from_secs(600))
+            .ok()
+            .ok()?;
+        let oid = unhex(out.text().trim())?;
+        self.known.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashSet::new).insert(oid);
+        Some(oid)
+    }
+
+    /// Streams a blob's bytes into `out` without holding them in memory.
+    pub fn copy_to(&self, oid: &[u8; 20], out: &mut impl std::io::Write) -> std::io::Result<u64> {
+        let mut child = Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .args(["cat-file", "blob", &hex(oid)])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let n = std::io::copy(child.stdout.as_mut().ok_or_else(|| std::io::Error::other("no stdout"))?, out)?;
+        if !child.wait()?.success() {
+            return Err(std::io::Error::other(format!("git cat-file blob {} failed", hex(oid))));
+        }
+        Ok(n)
+    }
+
     /// Whether the object database has this blob.
     pub fn contains(&self, oid: &[u8; 20]) -> bool {
         {

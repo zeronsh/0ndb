@@ -630,3 +630,49 @@ fn git_content_is_referenced_pinned_and_survives_gc() {
     assert_eq!(text(&ws, "big.txt").as_deref(), Some(big.as_str()));
     assert_eq!(text(&ws, "small.txt").as_deref(), Some("small\n"));
 }
+
+#[test]
+fn files_over_the_size_limit_are_tracked_through_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let big = |tag: &str| -> String { (0..400).map(|i| format!("{tag} {i}\n")).collect() };
+    fs::write(root.join("tracked.bin"), big("tracked")).unwrap();
+    let git = "git -c user.name=t -c user.email=t@t -c init.defaultBranch=main";
+    sh(&root, &format!("{git} init -q && {git} add -A && {git} commit -qm base"));
+    // Untracked and over the limit: written into git's objects to be kept.
+    fs::write(root.join("untracked.bin"), big("untracked")).unwrap();
+
+    let opts = MountOptions { max_file_size: 1024, ..MountOptions::default() };
+    let ws = Workspace::open(dir.path().join("0ndb.db"), None).unwrap();
+    let mount = Mount::start(&ws, &root, opts).unwrap();
+    for f in ["tracked.bin", "untracked.bin"] {
+        assert!(inode(&ws, f).is_some(), "{f} is tracked");
+    }
+    assert_eq!(ws.with(|c| c.store().0.stored_blob_count()).unwrap(), 0, "large content lives in git, not the store");
+    let state = |p: &str| ws.read(|h| h.lookup(p).and_then(|i| h.file_state(&h.current(), &i)));
+    assert!(matches!(state("untracked.bin"), Some(ondb_core::FileState::Binary { .. })));
+
+    // An edit to a large file is recorded, and undoing it streams the old
+    // bytes back out of git.
+    let before = ws.heads();
+    fs::write(root.join("untracked.bin"), big("edited")).unwrap();
+    mount.fence().unwrap();
+    assert_ne!(ws.heads(), before);
+    let undo: std::collections::HashSet<_> = ws.read(|h| h.dag().difference(h.heads(), &before)).into_iter().collect();
+    ondb::revert::revert_batches(&ws, ws.actor("t", ActorKind::Human).unwrap(), &undo).unwrap();
+    mount.fence().unwrap();
+    assert_eq!(fs::read_to_string(root.join("untracked.bin")).unwrap(), big("untracked"));
+
+    // The untracked file's blob is referenced by no commit; only the pin
+    // keeps it through garbage collection. Delete the file, then restore it.
+    sh(&root, "git reflog expire --expire=now --all && git gc -q --prune=now");
+    let present = ws.heads();
+    fs::remove_file(root.join("untracked.bin")).unwrap();
+    mount.fence().unwrap();
+    assert!(inode(&ws, "untracked.bin").is_none());
+    let undo: std::collections::HashSet<_> = ws.read(|h| h.dag().difference(h.heads(), &present)).into_iter().collect();
+    ondb::revert::revert_batches(&ws, ws.actor("t", ActorKind::Human).unwrap(), &undo).unwrap();
+    mount.fence().unwrap();
+    assert_eq!(fs::read_to_string(root.join("untracked.bin")).unwrap(), big("untracked"));
+}

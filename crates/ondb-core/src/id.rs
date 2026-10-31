@@ -135,6 +135,27 @@ impl Oid {
         Oid(h.finalize().into())
     }
 
+    /// The blob id of `len` bytes read from `r`, without holding them.
+    pub fn of_reader(len: u64, mut r: impl std::io::Read) -> std::io::Result<Self> {
+        use sha1::Digest;
+        let mut h = sha1::Sha1::new();
+        h.update(format!("blob {len}\0").as_bytes());
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0u64;
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            h.update(&buf[..n]);
+        }
+        if total != len {
+            return Err(std::io::Error::other("changed while hashing"));
+        }
+        Ok(Oid(h.finalize().into()))
+    }
+
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }

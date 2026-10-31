@@ -564,7 +564,9 @@ impl Store {
         // `flush_pins`); until then git keeps them, since they came from
         // its index or a commit.
         let external: HashSet<Oid> = match &self.external {
-            Some(ext) => batch.blobs.iter().map(|b| b.oid).filter(|o| ext.contains(o)).collect(),
+            // Attached blobs, and references to blobs not attached at all
+            // (large files git holds, never read into memory).
+            Some(ext) => batch.blobs.iter().map(|b| b.oid).chain(blob_refs(batch)).filter(|o| ext.contains(o)).collect(),
             None => HashSet::new(),
         };
         let tx = self.conn.transaction()?;

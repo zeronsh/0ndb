@@ -136,13 +136,23 @@ fn temp_path(dir: &Path) -> PathBuf {
 /// Writes through a temp file in the same directory and renames it into
 /// place, so watchers and readers never observe a partial file.
 pub fn write_atomic(root: &Path, rel: &str, bytes: &[u8], exec: bool) -> io::Result<Stat> {
+    write_atomic_with(root, rel, exec, |f| f.write_all(bytes))
+}
+
+/// As [`write_atomic`], with the content written by `fill`.
+pub fn write_atomic_with(
+    root: &Path,
+    rel: &str,
+    exec: bool,
+    fill: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<Stat> {
     let path = abs(root, rel);
     let dir = path.parent().unwrap_or(root);
     fs::create_dir_all(dir)?;
     let tmp = temp_path(dir);
     let result = (|| {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
+        fill(&mut f)?;
         f.sync_data()?;
         let mode = if exec { 0o755 } else { 0o644 };
         fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;

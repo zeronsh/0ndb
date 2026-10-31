@@ -32,6 +32,14 @@ enum Found {
         exec: bool,
         stat: Stat,
     },
+    /// A file over the size limit, held in git's objects and referenced as
+    /// opaque content without being read into memory.
+    Large {
+        oid: ondb_core::Oid,
+        len: u64,
+        exec: bool,
+        stat: Stat,
+    },
     Symlink {
         target: String,
     },
@@ -90,9 +98,25 @@ enum Verdict {
 }
 
 enum Change {
-    Edit { bytes: Vec<u8>, exec: bool, stat: Stat },
-    Exec { exec: bool, stat: Stat },
-    Link { target: String },
+    Edit {
+        bytes: Vec<u8>,
+        exec: bool,
+        stat: Stat,
+    },
+    /// New content for a file over the size limit (see `Found::Large`).
+    Large {
+        oid: ondb_core::Oid,
+        len: u64,
+        exec: bool,
+        stat: Stat,
+    },
+    Exec {
+        exec: bool,
+        stat: Stat,
+    },
+    Link {
+        target: String,
+    },
 }
 
 enum Update {
@@ -307,6 +331,21 @@ impl MountState {
 
     /// Compares disk with the shadow for `scope` and records the difference
     /// as one batch by the ingestion actor, parented on the synced version.
+    /// A file over the size limit, referenced through git's objects: its
+    /// blob id (streamed, never held in memory) once git holds the exact
+    /// bytes, writing them into git's objects if needed (as `git add`
+    /// would). `None` outside git checkouts or if it changed meanwhile.
+    fn large_ref(&self, path: &str) -> Option<(ondb_core::Oid, u64)> {
+        let objects = self.objects.as_ref()?;
+        let file = disk::abs(&self.root, path);
+        let len = std::fs::metadata(&file).ok()?.len();
+        let oid = ondb_core::Oid::of_reader(len, std::fs::File::open(&file).ok()?).ok()?;
+        if objects.0.contains(&oid.0) || objects.0.write_file(&file) == Some(oid.0) {
+            return Some((oid, len));
+        }
+        None
+    }
+
     pub(super) fn reconcile(&mut self, scope: Scope) -> Result<Option<BatchId>, Error> {
         let out = self.reconcile_pass(scope)?;
         self.ws.trim();
@@ -430,7 +469,12 @@ impl MountState {
                                     chunk_bytes += bytes.len();
                                     created.insert(path.clone(), Found::File { bytes, oid, exec, stat });
                                 }
-                                Ok(None) => tracing::warn!(path, "file exceeds the size limit; not tracked"),
+                                Ok(None) => match self.large_ref(path) {
+                                    Some((oid, len)) => {
+                                        created.insert(path.clone(), Found::Large { oid, len, exec, stat });
+                                    }
+                                    None => tracing::warn!(path, "file exceeds the size limit; not tracked"),
+                                },
                                 Err(e) => tracing::warn!(path, error = %e, "unreadable file skipped"),
                             },
                             DiskEntry::Symlink { target } => {
@@ -459,7 +503,13 @@ impl MountState {
                                     changed.insert(path.clone(), (s, Change::Edit { bytes, exec, stat }));
                                 }
                             }
-                            Ok(None) => tracing::warn!(path, "file grew past the size limit; changes not tracked"),
+                            Ok(None) => match self.large_ref(path) {
+                                Some((oid, _)) if s.oid == Some(oid) && s.exec == exec => stat_only.push((path.clone(), stat)),
+                                Some((oid, len)) => {
+                                    changed.insert(path.clone(), (s, Change::Large { oid, len, exec, stat }));
+                                }
+                                None => tracing::warn!(path, "file grew past the size limit; changes not tracked"),
+                            },
                             Err(e) => tracing::warn!(path, error = %e, "unreadable file skipped"),
                         }
                     }
@@ -639,7 +689,7 @@ impl MountState {
         }
         let mut file_moves: BTreeMap<String, String> = BTreeMap::new(); // new -> old
         for (p, f) in &created {
-            if let Found::File { oid, .. } = f
+            if let Found::File { oid, .. } | Found::Large { oid, .. } = f
                 && let Some(olds) = by_oid.get_mut(oid)
                 && !olds.is_empty()
             {
@@ -759,6 +809,17 @@ fn import(txn: &mut Txn<'_>, created: &BTreeMap<String, Found>, held: Held<'_>, 
                 blobs.extend(blob);
                 (ImportNode::File { mode: mode(*exec), line_ending, content }, Kind::File, Some(*oid), *exec, Some(*stat))
             }
+            Found::Large { oid, len, exec, stat } => (
+                ImportNode::File {
+                    mode: mode(*exec),
+                    line_ending: LineEnding::Lf,
+                    content: Content::Binary(BlobRef { oid: *oid, len: *len }),
+                },
+                Kind::File,
+                Some(*oid),
+                *exec,
+                Some(*stat),
+            ),
         };
         let i = entries.len() as u32;
         if matches!(node, ImportNode::Dir) {
@@ -840,7 +901,7 @@ fn apply_changes(
         let entry = shadow.get(old).expect("moved file is shadowed").clone();
         txn.push(Op::Rename { inode: entry.inode, parent, name: name_of(new).to_string() })?;
         let stat = match created.get(new) {
-            Some(Found::File { stat, .. }) => Some(*stat),
+            Some(Found::File { stat, .. } | Found::Large { stat, .. }) => Some(*stat),
             _ => None,
         };
         updates.push(Update::Remove(old.clone()));
@@ -852,6 +913,11 @@ fn apply_changes(
             for op in ops {
                 txn.push(op)?;
             }
+        }
+        if let Some(Found::Large { exec, .. }) = created.get(new)
+            && entry.exec != *exec
+        {
+            txn.push(Op::SetMode { inode: entry.inode, mode: mode(*exec) })?;
         }
     }
 
@@ -889,6 +955,14 @@ fn apply_changes(
                     Entry { inode: InodeId::new(op, 0), kind: Kind::File, oid: Some(*oid), exec: *exec, stat: Some(*stat) },
                 ));
             }
+            Found::Large { oid, len, exec, stat } => {
+                let content = Content::Binary(BlobRef { oid: *oid, len: *len });
+                let op = txn.push(Op::CreateFile { parent, name, mode: mode(*exec), line_ending: LineEnding::Lf, content })?;
+                updates.push(Update::Insert(
+                    path.clone(),
+                    Entry { inode: InodeId::new(op, 0), kind: Kind::File, oid: Some(*oid), exec: *exec, stat: Some(*stat) },
+                ));
+            }
             Found::Symlink { target } => {
                 let op = txn.push(Op::CreateSymlink { parent, name, target: target.clone() })?;
                 updates.push(Update::Insert(
@@ -919,6 +993,16 @@ fn apply_changes(
                 updates.push(Update::Insert(
                     path.clone(),
                     Entry { oid: Some(oid_of(bytes)), exec: *exec, stat: Some(*stat), ..entry.clone() },
+                ));
+            }
+            Change::Large { oid, len, exec, stat } => {
+                txn.push(Op::SetContent { inode: entry.inode, content: Content::Binary(BlobRef { oid: *oid, len: *len }) })?;
+                if *exec != entry.exec {
+                    txn.push(Op::SetMode { inode: entry.inode, mode: mode(*exec) })?;
+                }
+                updates.push(Update::Insert(
+                    path.clone(),
+                    Entry { oid: Some(*oid), exec: *exec, stat: Some(*stat), ..entry.clone() },
                 ));
             }
             Change::Exec { exec, stat } => {

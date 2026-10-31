@@ -11,7 +11,7 @@ use crate::Error;
 
 enum Payload {
     Text(Vec<u8>),
-    Blob(ondb_core::Oid),
+    Blob(ondb_core::BlobRef),
     Link(String),
     None,
 }
@@ -27,7 +27,7 @@ fn payload_for(h: &History, view: &dyn View, inode: InodeId) -> Payload {
     match h.inode(&inode).map(|i| &i.kind) {
         Some(NodeKind::File(_)) => match h.file_state(view, &inode) {
             Some(FileState::Text { bytes, ending, .. }) => Payload::Text(disk::smudge(&bytes, ending)),
-            Some(FileState::Binary { blob, .. }) => Payload::Blob(blob.oid),
+            Some(FileState::Binary { blob, .. }) => Payload::Blob(blob),
             None => Payload::None,
         },
         Some(NodeKind::Symlink { .. }) => h.symlink_target(view, &inode).map(Payload::Link).unwrap_or(Payload::None),
@@ -232,9 +232,21 @@ impl MountState {
                     // Content is fetched only for files that need writing, so
                     // planning a large tree never holds every file at once.
                     let payload = self.ws.read(|h| payload_for(h, &h.current(), d.inode));
+                    // Content over the size limit streams straight from git's
+                    // objects to disk, never held in memory.
+                    if let (Payload::Blob(blob), Some(objects)) = (&payload, &self.objects)
+                        && blob.len > self.opts.max_file_size
+                    {
+                        let stat = disk::write_atomic_with(&root, path, want.exec, |f| {
+                            let n = objects.0.copy_to(&blob.oid.0, f)?;
+                            if n == blob.len { Ok(()) } else { Err(std::io::Error::other("short blob")) }
+                        })?;
+                        self.shadow.insert(path.clone(), Entry { stat: Some(stat), oid: Some(blob.oid), ..want.clone() });
+                        continue;
+                    }
                     let bytes = match &payload {
                         Payload::Text(b) => b.clone(),
-                        Payload::Blob(oid) => match self.ws.blob(oid)? {
+                        Payload::Blob(ondb_core::BlobRef { oid, .. }) => match self.ws.blob(oid)? {
                             Some(b) => b,
                             None => {
                                 tracing::warn!(path, "binary content not available locally yet");
