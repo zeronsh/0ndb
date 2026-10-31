@@ -10,7 +10,8 @@ use std::sync::Arc;
 use ondb_core::codec::{self, CodecError};
 use ondb_core::{
     ActorId, Batch, BatchHeader, BatchId, Blob, BlobSource, Content, Contents, Dag, Dirty, History, HistoryId, Inode, InodeId,
-    Insertion, InsertionKey, MetaEntry, NodeStore, ObjectStore, Oid, Op, OpId, Status, StoreResult, StoredInode, Text, Version,
+    Insertion, InsertionKey, MetaEntry, NodeSource, NodeStore, ObjectStore, Oid, Op, OpId, Status, StoreResult, StoredInode,
+    Text, Version,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -244,6 +245,14 @@ impl BlobSource for BlobReader {
     }
 }
 
+/// Text nodes for lazily loaded texts (see `Text::lazy`).
+impl NodeSource for BlobReader {
+    fn node(&self, id: u64) -> Option<Vec<u8>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        node_data(&conn, id).ok()
+    }
+}
+
 /// Copy-on-write tree nodes inside a transaction. A node's refcount is the
 /// number of parent nodes and inode rows referencing it; nodes reaching zero
 /// are deleted and release their children.
@@ -306,20 +315,6 @@ fn node_data(conn: &Connection, id: u64) -> StoreResult<Vec<u8>> {
     let data: Vec<u8> =
         conn.query_row("SELECT data FROM nodes WHERE id = ?1", [id as i64], |r| r.get(0)).map_err(|e| e.to_string())?;
     decompress(&data).map_err(|e| e.to_string())
-}
-
-struct ReadNodes<'a> {
-    conn: &'a Connection,
-}
-
-impl NodeStore for ReadNodes<'_> {
-    fn put(&mut self, _: &[u8], _: &[u64]) -> StoreResult<u64> {
-        Err("read-only node store".into())
-    }
-
-    fn get(&mut self, id: u64) -> StoreResult<Vec<u8>> {
-        node_data(self.conn, id)
-    }
 }
 
 fn enc<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -705,11 +700,13 @@ impl Store {
             let mut stmt = self.conn.prepare("SELECT data, text_root FROM inodes WHERE history_key = ?1")?;
             stmt.query_map([key.0], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         };
-        let mut nodes = ReadNodes { conn: &self.conn };
+        // Texts load their fragment trees on first use, so memory and wake
+        // time follow the files actually touched, not the tree's size.
+        let reader = Arc::new(self.blob_reader(key)?);
         let mut inodes = Vec::with_capacity(rows.len());
         for (data, root) in rows {
             let stored: StoredInode = dec(&decompress(&data)?)?;
-            let text = root.map(|r| Text::load(r as u64, &mut nodes)).transpose().map_err(StoreError::Corrupt)?;
+            let text = root.map(|r| Text::lazy(r as u64, reader.clone()));
             inodes.push(Inode::from_stored(stored, text));
         }
         // Insertions stay in the store; the blob reader serves them on demand.
@@ -727,16 +724,16 @@ impl Store {
             self.conn.query_row("SELECT status FROM histories WHERE history_key = ?1", [key.0], |r| r.get(0))?;
         let status = status.map(|s| dec(&s)).transpose()?.unwrap_or(Status::Healthy);
         let mut history = History::from_parts(id, dag, inodes, contents, meta, status);
-        history.set_blob_source(Arc::new(self.blob_reader(key)?));
+        history.set_blob_source(reader);
         Ok((key, history))
     }
 
-    /// Number of stored tree nodes (diagnostics, tests).
     /// Blobs whose bytes are in the store (not held externally).
     pub fn stored_blob_count(&self) -> Result<u64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
+    /// Number of stored tree nodes (diagnostics, tests).
     pub fn node_count(&self) -> Result<u64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))? as u64)
     }

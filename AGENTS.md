@@ -64,6 +64,9 @@
   them into the store if pinning fails. Never skip storing a blob without
   queueing its pin. `external_objects` records the repository so workspaces
   opened without a mount can still read the content.
+- Stored texts load lazily (`Text::lazy`): loading a history reads no text
+  nodes, and a text reads its tree on first use. Never walk every file's
+  text on load or wake.
 - Materialization plans only inodes touched since the synced version (plus,
   on first mount, ones the shadow lacks); never read every file back out of
   the history to compare.

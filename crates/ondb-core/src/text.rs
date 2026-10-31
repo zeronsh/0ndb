@@ -186,14 +186,35 @@ impl View for Without<'_> {
     }
 }
 
+/// Where stored text nodes are read from when a text is first used.
+pub trait NodeSource: Send + Sync {
+    fn node(&self, id: u64) -> Option<Vec<u8>>;
+}
+
+struct ReadOnly<'a>(&'a dyn NodeSource);
+
+impl NodeStore for ReadOnly<'_> {
+    fn put(&mut self, _: &[u8], _: &[u64]) -> StoreResult<u64> {
+        Err("read-only node source".into())
+    }
+    fn get(&mut self, id: u64) -> StoreResult<Vec<u8>> {
+        self.0.node(id).ok_or_else(|| format!("text node {id} missing"))
+    }
+}
+
+/// A file's text. Loaded from a store it stays a root id until first used,
+/// so a history's untouched files cost no fragment trees in memory.
 #[derive(Clone, Default)]
 pub struct Text {
-    tree: SumTree<Fragment>,
+    tree: std::sync::OnceLock<SumTree<Fragment>>,
+    /// Root node and source of a stored text not yet loaded (cleared once
+    /// the text is modified).
+    stored: Option<(u64, std::sync::Arc<dyn NodeSource>)>,
 }
 
 impl PartialEq for Text {
     fn eq(&self, other: &Self) -> bool {
-        self.tree.len() == other.tree.len() && self.tree.iter().eq(other.tree.iter())
+        self.tree().len() == other.tree().len() && self.tree().iter().eq(other.tree().iter())
     }
 }
 
@@ -201,15 +222,15 @@ impl Eq for Text {}
 
 impl std::fmt::Debug for Text {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.tree.iter()).finish()
+        f.debug_list().entries(self.tree().iter()).finish()
     }
 }
 
 impl Serialize for Text {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
-        let mut seq = s.serialize_seq(Some(self.tree.len()))?;
-        for f in self.tree.iter() {
+        let mut seq = s.serialize_seq(Some(self.tree().len()))?;
+        for f in self.tree().iter() {
             seq.serialize_element(f)?;
         }
         seq.end()
@@ -218,7 +239,7 @@ impl Serialize for Text {
 
 impl<'de> Deserialize<'de> for Text {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Text { tree: SumTree::from_items(Vec::<Fragment>::deserialize(d)?) })
+        Ok(Text::from_tree(SumTree::from_items(Vec::<Fragment>::deserialize(d)?)))
     }
 }
 
@@ -232,12 +253,12 @@ impl Text {
         if len == 0 {
             return Self::new();
         }
-        Text { tree: SumTree::from_items(vec![Fragment { ins, part, off, len, deleted_by: Vec::new() }]) }
+        Text::from_tree(SumTree::from_items(vec![Fragment { ins, part, off, len, deleted_by: Vec::new() }]))
     }
 
     /// Current visible length.
     pub fn len(&self) -> u64 {
-        self.tree.summary().visible
+        self.tree().summary().visible
     }
 
     pub fn is_empty(&self) -> bool {
@@ -245,21 +266,21 @@ impl Text {
     }
 
     pub fn fragments_len(&self) -> usize {
-        self.tree.len()
+        self.tree().len()
     }
 
     pub fn fragments(&self) -> impl Iterator<Item = &Fragment> {
-        self.tree.iter()
+        self.tree().iter()
     }
 
     pub fn len_in(&self, view: &dyn View) -> u64 {
-        node_width(self.tree.root(), view, view.min_unobserved())
+        node_width(self.tree().root(), view, view.min_unobserved())
     }
 
     /// Index of the fragment holding visible byte `k` of the view, and the
     /// view offset where that fragment starts. Past the end: `(len, total)`.
     fn locate(&self, view: &dyn View, min: Lamport, k: u64) -> (usize, u64) {
-        let mut node = self.tree.root();
+        let mut node = self.tree().root();
         let (mut idx, mut pos) = (0usize, 0u64);
         loop {
             match &node.node {
@@ -297,7 +318,7 @@ impl Text {
     fn read_with(&self, contents: &Contents, mut keep: impl FnMut(&Fragment) -> bool) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         let mut last: Option<(InsertionKey, std::sync::Arc<[u8]>)> = None;
-        for f in self.tree.iter().filter(|f| keep(f)) {
+        for f in self.tree().iter().filter(|f| keep(f)) {
             let key = f.key();
             if last.as_ref().is_none_or(|(k, _)| *k != key) {
                 last = Some((key, contents.bytes(&key)?));
@@ -320,7 +341,7 @@ impl Text {
 
     /// Visible spans `(insertion op, part, offset into insertion, len)` in order.
     pub fn visible_spans(&self) -> impl Iterator<Item = (OpId, u32, u64, u64)> + '_ {
-        self.tree.iter().filter(|f| f.is_visible()).map(|f| (f.ins, f.part, f.off, f.len))
+        self.tree().iter().filter(|f| f.is_visible()).map(|f| (f.ins, f.part, f.off, f.len))
     }
 
     pub fn validate(&self, view: &dyn View, splices: &[Splice], inserted: u64) -> Result<(), TextError> {
@@ -360,7 +381,7 @@ impl Text {
             let mut out: Vec<Fragment> = Vec::new();
             let mut consumed = 0usize;
             {
-                let mut it = self.tree.iter_from(start);
+                let mut it = self.tree().iter_from(start);
                 let mut pull = || {
                     let f = it.next().cloned();
                     consumed += f.is_some() as usize;
@@ -443,7 +464,7 @@ impl Text {
                     _ => merged.push(f),
                 }
             }
-            self.tree.splice(start..start + consumed, merged);
+            self.tree_mut().splice(start..start + consumed, merged);
         }
         Ok(())
     }
@@ -460,7 +481,7 @@ impl Text {
             Bias::Right => offset,
         };
         let (idx, pos) = self.locate(&Everything, Lamport::MAX, k);
-        match self.tree.iter_from(idx).next() {
+        match self.tree().iter_from(idx).next() {
             Some(f) => Anchor::At { ins: f.ins, part: f.part, off: f.off + (offset - pos), bias },
             None => Anchor::End,
         }
@@ -475,7 +496,7 @@ impl Text {
             Anchor::At { ins, part, off, bias } => (ins, part, off, bias),
         };
         let mut pos = 0u64;
-        for f in self.tree.iter() {
+        for f in self.tree().iter() {
             let hit = f.ins == ins
                 && f.part == part
                 && match bias {
@@ -493,11 +514,42 @@ impl Text {
     }
 
     pub fn persist(&self, store: &mut dyn NodeStore) -> StoreResult<u64> {
-        self.tree.persist(store)
+        if self.tree.get().is_none()
+            && let Some((id, _)) = &self.stored
+        {
+            return Ok(*id);
+        }
+        self.tree().persist(store)
     }
 
     pub fn load(id: u64, store: &mut dyn NodeStore) -> StoreResult<Self> {
-        Ok(Text { tree: SumTree::load(id, store)? })
+        Ok(Text::from_tree(SumTree::load(id, store)?))
+    }
+
+    /// A stored text read from `source` when first used.
+    pub fn lazy(id: u64, source: std::sync::Arc<dyn NodeSource>) -> Self {
+        Text { tree: std::sync::OnceLock::new(), stored: Some((id, source)) }
+    }
+
+    fn from_tree(tree: SumTree<Fragment>) -> Self {
+        Text { tree: std::sync::OnceLock::from(tree), stored: None }
+    }
+
+    fn tree(&self) -> &SumTree<Fragment> {
+        self.tree.get_or_init(|| match &self.stored {
+            // The node was readable when the history loaded and is kept
+            // while referenced; failing now means the store is broken, and
+            // continuing with an empty text would corrupt it.
+            Some((id, source)) => SumTree::load(*id, &mut ReadOnly(source.as_ref()))
+                .unwrap_or_else(|e| panic!("0ndb: loading stored text {id} failed: {e}")),
+            None => SumTree::default(),
+        })
+    }
+
+    fn tree_mut(&mut self) -> &mut SumTree<Fragment> {
+        self.tree();
+        self.stored = None;
+        self.tree.get_mut().expect("loaded above")
     }
 }
 
