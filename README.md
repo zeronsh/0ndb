@@ -416,3 +416,5 @@ ONDB_DB=~/.0ndb-test/0ndb.db 0ndb watch    # alongside a production `0ndb watch`
 The project, repository, binary (`0ndb`) and state directory (`.0ndb/`)
 are called `0ndb`. Cargo package names cannot start with a digit, so the
 crates are `ondb-*`.
+
+Licensed under MIT — see [`LICENSE`](LICENSE).
