@@ -34,6 +34,14 @@ impl Codex {
 }
 
 impl Provider for Codex {
+    fn recorded_reasoning(&self, raw: &[u8]) -> Vec<EventKind> {
+        parse_line(raw)
+            .into_iter()
+            .map(|e| e.kind)
+            .filter(|k| matches!(k, EventKind::Reasoning { .. } | EventKind::ReasoningDelta { .. }))
+            .collect()
+    }
+
     fn id(&self) -> &'static str {
         "codex"
     }

@@ -6,6 +6,9 @@
 //! * Every message is pinned to a worktree version, and every turn and tool
 //!   call is an attribution scope, so files can be restored to any message
 //!   and each line traced to the tool call that wrote it.
+//! * Threads can share a worktree, but never rewind each other's files:
+//!   going back where another thread has worked since forks this thread
+//!   into its own worktree instead (`restore`).
 //! * Provider sessions are chosen per turn: continue the session that last
 //!   saw this branch; else fork a native session at the branch point when
 //!   the provider can; else start fresh. Whatever the chosen session hasn't
@@ -28,7 +31,7 @@ use ondb::{ActorKind, Recorder, ScopeKind, Worktrees};
 
 use crate::Error;
 use crate::provider::{EventKind, Interrupter, Provider, Run, StartRequest};
-use crate::store::{Message, ProviderSession, RecordedEvent, Role, Status, Store, Thread, ToolCall};
+use crate::store::{Message, ProviderSession, ReasoningBlock, RecordedEvent, Role, Status, Store, Thread, ToolCall};
 
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
@@ -57,6 +60,32 @@ pub enum Update {
         commit: String,
         created: bool,
     },
+    /// The thread moved to another managed worktree: a fork made because
+    /// going back would have rewound files other chats are using (`forked`),
+    /// or back to one it used before.
+    ThreadMoved {
+        thread: String,
+        from: String,
+        to: String,
+        path: String,
+        branch: Option<String>,
+        forked: bool,
+    },
+    /// A fork took in the work done since in the worktree it came from.
+    Synced {
+        thread: String,
+        worktree: String,
+        brought: usize,
+        /// Paths left with unresolved conflicts.
+        conflicts: Vec<String>,
+    },
+    /// A fork's changes landed in the worktree it came from.
+    Landed {
+        thread: String,
+        from: String,
+        into: String,
+        landed: usize,
+    },
     /// The user message of a turn that just started (and its assistant id).
     TurnStarted {
         thread: String,
@@ -73,6 +102,15 @@ pub enum Update {
         thread: String,
         message: String,
         text: String,
+        block: i64,
+        revision: u64,
+        started_ms: u64,
+    },
+    /// Completed or authoritative reasoning block (also closes its disclosure).
+    Reasoning {
+        thread: String,
+        message: String,
+        block: ReasoningBlock,
     },
     /// A complete text block.
     Text {
@@ -143,6 +181,8 @@ struct Inner {
     warm: Mutex<Vec<Warm>>,
     reaper: Sender<()>,
     busy: Mutex<HashSet<String>>,
+    /// Worktrees being rewound; no turn starts in them meanwhile.
+    rewinding: Mutex<HashSet<String>>,
     /// Running turns by thread, for interrupting.
     active: Mutex<HashMap<String, Arc<TurnControl>>>,
     /// Text streamed so far for running assistant messages.
@@ -210,6 +250,7 @@ impl Sessions {
             warm: Mutex::default(),
             reaper: tx,
             busy: Mutex::default(),
+            rewinding: Mutex::default(),
             active: Mutex::default(),
             live: Mutex::default(),
             subs: Mutex::default(),
@@ -263,8 +304,7 @@ impl Sessions {
                     .ok_or_else(|| Error::Invalid(format!("worktree {} isn't mounted", wt.id)))?;
                 mount.fence()?;
                 store.set_error(&id, "interrupted by a restart; resumed below")?;
-                let turn =
-                    self.launch(&t.id, wt.path.clone(), ws, mount, user, id.clone(), provider, msg.model.as_deref(), guard)?;
+                let turn = self.launch(&t.id, &wt, ws, mount, user, id.clone(), provider, msg.model.as_deref(), guard)?;
                 Ok(Some(turn))
             })();
             match resumed {
@@ -309,6 +349,13 @@ impl Sessions {
         Ok(models)
     }
 
+    /// A chat with no folder of its own: it gets a fresh scratch folder,
+    /// tracked like any other.
+    pub fn create_chat(&self, title: &str) -> Result<Thread, Error> {
+        let wt = self.inner.worktrees.scratch(title)?;
+        self.create_thread(&wt.id, title)
+    }
+
     pub fn create_thread(&self, worktree: &str, title: &str) -> Result<Thread, Error> {
         if self.inner.worktrees.get(worktree).is_none() {
             return Err(Error::Invalid(format!("no managed worktree {worktree}")));
@@ -347,6 +394,23 @@ impl Sessions {
 
     pub fn tool_calls(&self, message: &str) -> Result<Vec<ToolCall>, Error> {
         self.inner.store.tool_calls(message)
+    }
+
+    /// Reasoning shown alongside a reply. Older raw traces are decoded by
+    /// their driver once, then cached as ordinary normalized blocks.
+    pub fn reasoning(&self, message: &str) -> Result<Vec<ReasoningBlock>, Error> {
+        let store = &self.inner.store;
+        if !store.reasoning_indexed(message)? {
+            let m = self.message(message)?;
+            if m.status != Status::Running
+                && let Some(provider) = m.provider.as_deref().and_then(|id| self.inner.providers.get(id))
+            {
+                let events = store.events(Some(message), None)?;
+                let blocks = archived_reasoning(provider.as_ref(), &events);
+                store.import_reasoning(message, &blocks)?;
+            }
+        }
+        store.reasoning_blocks(message)
     }
 
     /// Every provider event of a message, verbatim, in order.
@@ -466,7 +530,146 @@ impl Sessions {
         Ok(())
     }
 
-    /// Makes the worktree exactly what it was at `target`: its files, and
+    /// Puts the thread's files where they were at `target`. The worktree
+    /// `target` ran in is rewound in place (see `rewind`) unless another
+    /// thread in it has worked there since `target` or is running there
+    /// now; then the thread forks instead: it moves to a new worktree made
+    /// at `target` (reusing an unchanged fork of the same point), and the
+    /// shared one is left exactly as it is.
+    fn restore(&self, thread: &Thread, target: &Message) -> Result<(), Error> {
+        let Some(version) = target.version.as_ref() else { return Ok(()) };
+        let home = target.worktree.clone().unwrap_or_else(|| thread.worktree.clone());
+        let shared = self.busy_in(&home, &thread.id)? || self.inner.store.others_since(&home, &thread.id, target.created_ms)?;
+        if shared {
+            return self.fork(thread, &home, target, version);
+        }
+        let _hold = RewindGuard::hold(&self.inner, &home)?;
+        if self.busy_in(&home, &thread.id)? {
+            return self.fork(thread, &home, target, version);
+        }
+        self.rewind(thread, &home, target, version)?;
+        if home != thread.worktree {
+            let info = self.inner.worktrees.get(&home).ok_or_else(|| Error::Invalid(format!("no worktree {home}")))?;
+            self.move_thread(thread, &info, false)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a thread other than `except` that is in `worktree` is running.
+    fn busy_in(&self, worktree: &str, except: &str) -> Result<bool, Error> {
+        let busy: Vec<String> = self.inner.busy.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect();
+        for id in busy.iter().filter(|id| id.as_str() != except) {
+            if self.inner.store.thread(id)?.is_some_and(|t| t.worktree == worktree) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Moves `thread` into a worktree whose files are `home`'s at `target`.
+    /// A previous fork of `home` at the same version is reused while nothing
+    /// has changed in it and no other thread is in it.
+    fn fork(&self, thread: &Thread, home: &str, target: &Message, version: &ondb_core::Version) -> Result<(), Error> {
+        let wts = &self.inner.worktrees;
+        for f in wts.list() {
+            let Some(origin) = f.forked_from.as_ref().filter(|o| o.worktree == home && &o.version == version) else { continue };
+            if self.inner.store.threads_in(&f.id)?.iter().any(|t| t != &thread.id) {
+                continue;
+            }
+            let Some((ws, mount)) = wts.workspace(&f.id) else { continue };
+            mount.fence()?;
+            if ws.heads() == origin.heads {
+                return if f.id == thread.worktree { Ok(()) } else { self.move_thread(thread, &f, true) };
+            }
+        }
+        let src = wts.get(home).ok_or_else(|| Error::Invalid(format!("no worktree {home}")))?;
+        // A git checkout gets a git worktree (with commits, a plain clone);
+        // any other folder is cloned.
+        let checkout = match ondb::git::Repo::open(&src.path) {
+            Ok(repo) => match &target.git_commit {
+                Some(c) if repo.commit_exists(c)? => Some(fork_checkout(&repo, thread, target, c.clone())?),
+                _ => match repo.head()?.oid {
+                    Some(head) => Some(fork_checkout(&repo, thread, target, head)?),
+                    None => None,
+                },
+            },
+            Err(_) => None,
+        };
+        // Named for both: "<original> · <chat>".
+        let info = wts.fork(home, version, &format!("{} · {}", src.title, thread.title), checkout)?;
+        self.move_thread(thread, &info, true)
+    }
+
+    /// Brings the work done since in the worktree this thread forked from
+    /// into its fork, merging files both changed; overlapping edits get
+    /// conflict markers in the fork only (`ondb::land`).
+    pub fn sync(&self, thread: &str) -> Result<ondb::SyncReport, Error> {
+        let t = self.thread(thread)?;
+        self.check_idle(&t.id)?;
+        let report = self.inner.worktrees.sync_fork(&t.worktree)?;
+        self.inner.emit(Update::Synced {
+            thread: t.id.clone(),
+            worktree: t.worktree.clone(),
+            brought: report.brought,
+            conflicts: report.conflicts.iter().map(|c| c.path.clone()).collect(),
+        });
+        Ok(report)
+    }
+
+    /// Lands this thread's fork into the worktree it was forked from: syncs
+    /// first, refuses while conflicts are unresolved, then the source takes
+    /// the fork's changes (with their authorship). The thread stays in its
+    /// fork, which now matches the source.
+    pub fn land(&self, thread: &str) -> Result<ondb::LandReport, Error> {
+        let t = self.thread(thread)?;
+        self.check_idle(&t.id)?;
+        let into = self
+            .inner
+            .worktrees
+            .get(&t.worktree)
+            .and_then(|w| w.forked_from)
+            .map(|o| o.worktree)
+            .ok_or_else(|| Error::Invalid("this chat isn't in a fork, so there's nothing to land".into()))?;
+        if self.busy_in(&into, &t.id)? {
+            return Err(Error::Invalid(
+                "another chat is running in the worktree this would land in; try when it finishes".into(),
+            ));
+        }
+        let report = self.inner.worktrees.land_fork(&t.worktree)?;
+        self.inner.emit(Update::Landed { thread: t.id.clone(), from: t.worktree.clone(), into, landed: report.landed });
+        Ok(report)
+    }
+
+    /// Unresolved conflicts in this thread's fork.
+    pub fn conflicts(&self, thread: &str) -> Result<Vec<ondb::Conflict>, Error> {
+        let t = self.thread(thread)?;
+        if self.inner.worktrees.get(&t.worktree).is_none_or(|w| w.forked_from.is_none()) {
+            return Ok(Vec::new());
+        }
+        Ok(self.inner.worktrees.conflicts(&t.worktree)?)
+    }
+
+    /// Settles one conflict in this thread's fork.
+    pub fn resolve(&self, thread: &str, path: &str, resolution: ondb::Resolution) -> Result<(), Error> {
+        let t = self.thread(thread)?;
+        self.check_idle(&t.id)?;
+        Ok(self.inner.worktrees.resolve_conflict(&t.worktree, path, resolution)?)
+    }
+
+    fn move_thread(&self, thread: &Thread, to: &ondb::WorktreeInfo, forked: bool) -> Result<(), Error> {
+        self.inner.store.set_thread_worktree(&thread.id, &to.id)?;
+        self.inner.emit(Update::ThreadMoved {
+            thread: thread.id.clone(),
+            from: thread.worktree.clone(),
+            to: to.id.clone(),
+            path: to.path.to_string_lossy().into_owned(),
+            branch: to.branch.clone(),
+            forked,
+        });
+        Ok(())
+    }
+
+    /// Makes `worktree` exactly what it was at `target`: its files, and
     /// git's position. One fixed rule, so branches are predictable:
     /// everything since is undone, people's edits included. When git has
     /// moved since (another branch, or commits), HEAD goes back to that
@@ -474,18 +677,13 @@ impl Sessions {
     /// a new `ondb/<thread>` branch made at it; existing branches are never
     /// moved or deleted. If git is where it was, git checkouts in between
     /// are kept (as before).
-    fn restore(&self, thread: &Thread, target: &Message) -> Result<(), Error> {
-        let Some(version) = target.version.as_ref() else { return Ok(()) };
-        let wt = self
-            .inner
-            .worktrees
-            .get(&thread.worktree)
-            .ok_or_else(|| Error::Invalid(format!("no worktree {}", thread.worktree)))?;
+    fn rewind(&self, thread: &Thread, worktree: &str, target: &Message, version: &ondb_core::Version) -> Result<(), Error> {
+        let wt = self.inner.worktrees.get(worktree).ok_or_else(|| Error::Invalid(format!("no worktree {worktree}")))?;
         let (ws, mount) = self
             .inner
             .worktrees
-            .workspace(&thread.worktree)
-            .ok_or_else(|| Error::Invalid(format!("worktree {} isn't mounted", thread.worktree)))?;
+            .workspace(worktree)
+            .ok_or_else(|| Error::Invalid(format!("worktree {worktree} isn't mounted")))?;
         mount.fence()?;
         // Decide (and check) the git move before touching any file.
         let git_move = self.git_move(&wt.path, thread, target)?;
@@ -563,6 +761,9 @@ impl Sessions {
         let guard = BusyGuard { inner: self.inner.clone(), thread: thread.to_string() };
         let t = self.thread(thread)?;
         let wt = self.inner.worktrees.get(&t.worktree).ok_or_else(|| Error::Invalid(format!("no worktree {}", t.worktree)))?;
+        if self.inner.rewinding.lock().unwrap_or_else(|p| p.into_inner()).contains(&wt.id) {
+            return Err(Error::Busy(thread.into()));
+        }
         let (ws, mount) =
             self.inner.worktrees.workspace(&wt.id).ok_or_else(|| Error::Invalid(format!("worktree {} isn't mounted", wt.id)))?;
         mount.fence()?;
@@ -585,6 +786,7 @@ impl Sessions {
             error: None,
             created_ms: now_ms(),
             switched_from: None,
+            worktree: Some(wt.id.clone()),
         };
         self.inner.store.insert_message(&user)?;
         self.inner.store.set_leaf(&t.id, &user.id)?;
@@ -594,7 +796,7 @@ impl Sessions {
             ws.retain(&format!("thread:{}:{}", t.id, user.id), user.version.as_ref())?;
         }
         let reply_to = user.id.clone();
-        self.launch(&t.id, wt.path.clone(), ws, mount, user, reply_to, provider, model, guard)
+        self.launch(&t.id, &wt, ws, mount, user, reply_to, provider, model, guard)
     }
 
     /// Runs a turn for `user`, its reply placed under `reply_to` (the user
@@ -603,7 +805,7 @@ impl Sessions {
     fn launch(
         &self,
         thread: &str,
-        cwd: std::path::PathBuf,
+        worktree: &ondb::WorktreeInfo,
         ws: ondb::Workspace,
         mount: ondb::MountHandle,
         user: Message,
@@ -621,7 +823,8 @@ impl Sessions {
         let job = TurnJob {
             inner: self.inner.clone(),
             thread: t.id.clone(),
-            cwd,
+            worktree: worktree.id.clone(),
+            cwd: worktree.path.clone(),
             ws,
             mount,
             user: user.clone(),
@@ -640,6 +843,61 @@ impl Sessions {
     }
 }
 
+fn archived_reasoning(provider: &dyn Provider, events: &[RecordedEvent]) -> Vec<ReasoningBlock> {
+    let mut blocks: Vec<ReasoningBlock> = Vec::new();
+    let mut active: Option<usize> = None;
+    let mut pending: Option<usize> = None;
+    let mut last_snapshot: Option<&[u8]> = None;
+    for ev in events {
+        if matches!(ev.kind.as_str(), "text_delta" | "text" | "tool_started" | "turn_ended")
+            && let Some(i) = active.take()
+        {
+            blocks[i].ended_ms = Some(ev.ts_ms);
+        }
+        if !matches!(ev.kind.as_str(), "reasoning" | "reasoning_delta") {
+            continue;
+        }
+        let Some(raw) = ev.raw.as_deref() else { continue };
+        if ev.kind == "reasoning" {
+            // One provider packet can produce several normalized records.
+            if last_snapshot == Some(raw) {
+                continue;
+            }
+            last_snapshot = Some(raw);
+        }
+        for kind in provider.recorded_reasoning(raw).into_iter().filter(|k| k.name() == ev.kind) {
+            let (text, complete) = match kind {
+                EventKind::ReasoningDelta { text } => (text, false),
+                EventKind::Reasoning { text } => (text, true),
+                _ => continue,
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let existing = if complete { pending.take() } else { active };
+            let i = existing.unwrap_or_else(|| {
+                blocks.push(ReasoningBlock { id: 0, text: String::new(), started_ms: ev.ts_ms, ended_ms: None, revision: 1 });
+                blocks.len() - 1
+            });
+            if complete {
+                blocks[i].text = text;
+                blocks[i].ended_ms.get_or_insert(ev.ts_ms);
+                if active == Some(i) {
+                    active = None;
+                }
+            } else {
+                blocks[i].text.push_str(&text);
+                active = Some(i);
+                pending = Some(i);
+            }
+        }
+    }
+    if let Some(i) = active {
+        blocks[i].ended_ms = Some(events.last().map_or(blocks[i].started_ms, |e| e.ts_ms));
+    }
+    blocks
+}
+
 /// How `restore` moves git (see `Sessions::git_move`).
 struct GitMove {
     branch: Option<String>,
@@ -652,9 +910,48 @@ fn git_head(path: &std::path::Path) -> ondb::git::Head {
     ondb::git::Repo::open(path).and_then(|r| r.head()).unwrap_or(ondb::git::Head { branch: None, oid: None })
 }
 
+/// How a fork of `repo` checks out `commit`: on the message's branch when
+/// it still points there and nothing has it checked out, else on a new
+/// `ondb/<thread>` branch at it; detached if the message was.
+fn fork_checkout(
+    repo: &ondb::git::Repo,
+    thread: &Thread,
+    target: &Message,
+    commit: String,
+) -> Result<ondb::git::Checkout, Error> {
+    Ok(match &target.git_branch {
+        Some(b) if repo.branch_tip(b)?.as_deref() == Some(commit.as_str()) && !repo.branch_checked_out(b)? => {
+            ondb::git::Checkout::Branch(b.clone())
+        }
+        Some(_) => ondb::git::Checkout::NewBranch { name: repo.unique_branch("ondb/", &thread.title)?, base: commit },
+        None => ondb::git::Checkout::Detached(commit),
+    })
+}
+
 struct BusyGuard {
     inner: Arc<Inner>,
     thread: String,
+}
+
+/// Marks a worktree as being rewound for as long as it lives.
+struct RewindGuard<'a> {
+    inner: &'a Inner,
+    worktree: String,
+}
+
+impl<'a> RewindGuard<'a> {
+    fn hold(inner: &'a Inner, worktree: &str) -> Result<RewindGuard<'a>, Error> {
+        if !inner.rewinding.lock().unwrap_or_else(|p| p.into_inner()).insert(worktree.to_string()) {
+            return Err(Error::Invalid(format!("worktree {worktree} is already being restored")));
+        }
+        Ok(RewindGuard { inner, worktree: worktree.to_string() })
+    }
+}
+
+impl Drop for RewindGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.rewinding.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.worktree);
+    }
 }
 
 impl Drop for BusyGuard {
@@ -732,6 +1029,8 @@ fn reap(inner: Weak<Inner>, wake: Receiver<()>) {
 struct TurnJob {
     inner: Arc<Inner>,
     thread: String,
+    /// The managed worktree the turn runs in.
+    worktree: String,
     cwd: std::path::PathBuf,
     ws: ondb::Workspace,
     mount: ondb::MountHandle,
@@ -911,7 +1210,10 @@ impl TurnJob {
             error: None,
             created_ms: now_ms(),
             switched_from,
+            worktree: Some(self.worktree.clone()),
         })?;
+        // A reload during a turn must see the running reply and its trace.
+        store.set_leaf(&self.thread, &self.assistant)?;
 
         let actor = self.ws.actor(self.provider.id(), ActorKind::Agent)?;
         let recorder = Recorder::new(&self.ws, vec![self.mount.clone()])?;
@@ -920,6 +1222,8 @@ impl TurnJob {
         let mut warm = warm;
         let mut forking = req.fork_at.is_some();
         let mut text = String::new();
+        let mut thinking: Option<(i64, u64)> = None;
+        let mut pending_thinking: Option<i64> = None;
         let mut native: Option<String> = None;
         let mut open_tools: HashMap<String, ondb::Scope> = HashMap::new();
         let mut status: Status;
@@ -958,14 +1262,21 @@ impl TurnJob {
                     }
                     break;
                 };
+                let event_ms = now_ms();
                 store.record_event(
                     &session.id,
                     Some(&self.assistant),
-                    now_ms(),
+                    event_ms,
                     ev.kind.name(),
                     ev.native_message.as_deref(),
                     ev.raw.as_deref(),
                 )?;
+                if matches!(&ev.kind, EventKind::TextDelta { .. } | EventKind::Text { .. } | EventKind::ToolStarted { .. })
+                    && let Some((id, _)) = thinking.take()
+                {
+                    let block = store.end_reasoning(id, event_ms)?;
+                    self.inner.emit(Update::Reasoning { thread: self.thread.clone(), message: self.assistant.clone(), block });
+                }
                 if let Some(n) = &ev.native_message
                     && !matches!(&ev.kind, EventKind::Other { kind } if kind == "stderr")
                 {
@@ -991,10 +1302,45 @@ impl TurnJob {
                         });
                     }
                     EventKind::ReasoningDelta { text: t } => {
+                        if t.is_empty() {
+                            continue;
+                        }
+                        let (id, started_ms) = match thinking {
+                            Some(current) => current,
+                            None => {
+                                let id = store.begin_reasoning(&self.assistant, event_ms)?;
+                                thinking = Some((id, event_ms));
+                                pending_thinking = Some(id);
+                                (id, event_ms)
+                            }
+                        };
+                        let revision = store.write_reasoning(id, &t, false, event_ms)?;
                         self.inner.emit(Update::ReasoningDelta {
                             thread: self.thread.clone(),
                             message: self.assistant.clone(),
                             text: t,
+                            block: id,
+                            revision,
+                            started_ms,
+                        });
+                    }
+                    EventKind::Reasoning { text: t } => {
+                        if t.is_empty() {
+                            continue;
+                        }
+                        let id = match pending_thinking.take() {
+                            Some(id) => id,
+                            None => store.begin_reasoning(&self.assistant, event_ms)?,
+                        };
+                        store.write_reasoning(id, &t, true, event_ms)?;
+                        let block = store.end_reasoning(id, event_ms)?;
+                        if thinking.is_some_and(|(active, _)| active == id) {
+                            thinking = None;
+                        }
+                        self.inner.emit(Update::Reasoning {
+                            thread: self.thread.clone(),
+                            message: self.assistant.clone(),
+                            block,
                         });
                     }
                     EventKind::Text { text: t } => {
@@ -1089,6 +1435,10 @@ impl TurnJob {
         for (_, s) in open_tools.drain() {
             recorder.end(s)?;
         }
+        if let Some((id, _)) = thinking.take() {
+            let block = store.end_reasoning(id, now_ms())?;
+            self.inner.emit(Update::Reasoning { thread: self.thread.clone(), message: self.assistant.clone(), block });
+        }
         let streamed = self.inner.live.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.assistant);
         if text.is_empty()
             && let Some(s) = streamed
@@ -1123,6 +1473,7 @@ impl TurnJob {
         native: Option<&str>,
     ) -> Result<Message, Error> {
         let store = &self.inner.store;
+        store.mark_reasoning_indexed(&self.assistant)?;
         let version = self.ws.heads();
         store.finish_message(&self.assistant, text, status, error, Some(&version), scope.as_deref(), native, &session.id)?;
         let git_at = git_head(&self.cwd);

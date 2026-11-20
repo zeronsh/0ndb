@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use ondb::{ActorKind, Mount, MountOptions, Recorder, ScopeKind, Workspace};
 
+// Global allocator that tracks live heap bytes in LIVE.
 struct Counting;
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 

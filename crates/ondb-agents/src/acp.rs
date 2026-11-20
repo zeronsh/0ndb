@@ -74,6 +74,16 @@ impl Acp {
 }
 
 impl Provider for Acp {
+    fn recorded_reasoning(&self, raw: &[u8]) -> Vec<EventKind> {
+        let Ok(v) = serde_json::from_slice::<Value>(raw) else { return Vec::new() };
+        Mapper::default()
+            .map(&v["params"]["update"])
+            .into_iter()
+            .map(|e| e.kind)
+            .filter(|k| matches!(k, EventKind::Reasoning { .. } | EventKind::ReasoningDelta { .. }))
+            .collect()
+    }
+
     fn id(&self) -> &'static str {
         self.id
     }

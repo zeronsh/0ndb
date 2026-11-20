@@ -47,6 +47,14 @@ impl ClaudeCode {
 }
 
 impl Provider for ClaudeCode {
+    fn recorded_reasoning(&self, raw: &[u8]) -> Vec<EventKind> {
+        parse_line(raw)
+            .into_iter()
+            .map(|e| e.kind)
+            .filter(|k| matches!(k, EventKind::Reasoning { .. } | EventKind::ReasoningDelta { .. }))
+            .collect()
+    }
+
     fn id(&self) -> &'static str {
         "claude-code"
     }

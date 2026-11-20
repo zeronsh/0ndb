@@ -13,20 +13,23 @@
 
 pub mod attrib;
 pub mod blame;
+pub mod land;
 pub mod mount;
 pub mod report;
 pub mod revert;
+pub mod timeline;
 #[doc(hidden)]
 pub mod timing;
 pub mod workspace;
 pub mod worktrees;
 
 pub use attrib::{Recorder, Scope, ScopeId, ScopeKind, ScopeRecord};
+pub use land::{Conflict, ConflictKind, LandReport, Resolution, SyncReport};
 pub use mount::{FenceOutcome, Mount, MountHandle, MountOptions};
 pub use ondb_core as core;
 pub use ondb_git as git;
 pub use workspace::{ActorInfo, ActorKind, BatchSummary, Committed, Event, IntegrateReport, Workspace};
-pub use worktrees::{WorktreeInfo, Worktrees};
+pub use worktrees::{ForkOrigin, WorktreeInfo, Worktrees};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

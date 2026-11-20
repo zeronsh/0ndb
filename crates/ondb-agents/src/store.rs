@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS events (
     raw BLOB
 );
 CREATE INDEX IF NOT EXISTS events_by_message ON events (message, seq);
+CREATE TABLE IF NOT EXISTS reasoning_blocks (
+    id INTEGER PRIMARY KEY,
+    message TEXT NOT NULL,
+    text TEXT NOT NULL,
+    started_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    ended_ms INTEGER,
+    revision INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reasoning_by_message ON reasoning_blocks (message, id);
+CREATE TABLE IF NOT EXISTS reasoning_indexed (message TEXT PRIMARY KEY) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tool_calls (
     message TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -140,6 +151,20 @@ pub struct Message {
     /// returns git there too.
     pub git_branch: Option<String>,
     pub git_commit: Option<String>,
+    /// The managed worktree `version` belongs to. A thread moves to its own
+    /// worktree when it forks, so this can differ from the thread's.
+    pub worktree: Option<String>,
+}
+
+/// A provider's disclosed reasoning, separate from the assistant's answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningBlock {
+    pub id: i64,
+    pub text: String,
+    pub started_ms: u64,
+    pub ended_ms: Option<u64>,
+    /// Monotonic within a block, for reconciling live deltas with page loads.
+    pub revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,10 +254,21 @@ fn message_row(r: &Row<'_>) -> rusqlite::Result<Message> {
         switched_from: r.get(14)?,
         git_branch: r.get(15)?,
         git_commit: r.get(16)?,
+        worktree: r.get(17)?,
     })
 }
 
-const MESSAGE_COLS: &str = "id, thread, parent, role, provider, model, text, version, scope, session, native, status, error, created_ms, switched_from, git_branch, git_commit";
+const MESSAGE_COLS: &str = "id, thread, parent, role, provider, model, text, version, scope, session, native, status, error, created_ms, switched_from, git_branch, git_commit, worktree";
+
+fn reasoning_row(r: &Row<'_>) -> rusqlite::Result<ReasoningBlock> {
+    Ok(ReasoningBlock {
+        id: r.get(0)?,
+        text: r.get(1)?,
+        started_ms: r.get::<_, i64>(2)? as u64,
+        ended_ms: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+        revision: r.get::<_, i64>(4)? as u64,
+    })
+}
 
 fn session_row(r: &Row<'_>) -> rusqlite::Result<ProviderSession> {
     Ok(ProviderSession {
@@ -294,6 +330,19 @@ impl Store {
                 "ALTER TABLE messages ADD COLUMN git_branch TEXT; ALTER TABLE messages ADD COLUMN git_commit TEXT;",
             )?;
         }
+        // Threads never moved before messages recorded their worktree, so
+        // each older message belongs to its thread's.
+        let has_worktree: bool =
+            conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'worktree'")?.exists([])?;
+        if !has_worktree {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE messages ADD COLUMN worktree TEXT;
+                 UPDATE messages SET worktree = (SELECT worktree FROM threads WHERE threads.id = messages.thread);
+                 COMMIT;",
+            )?;
+        }
+        conn.execute("CREATE INDEX IF NOT EXISTS messages_by_worktree ON messages (worktree, created_ms)", [])?;
         // Keep the currently selected paths when upgrading an existing DB.
         // Older choices outside those paths were never recorded; until first
         // visited they keep the previous newest-continuation default.
@@ -318,6 +367,11 @@ impl Store {
         };
         conn.execute(
             "UPDATE messages SET status = 'interrupted', error = COALESCE(error, 'interrupted by a restart') WHERE status = 'running'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE reasoning_blocks SET ended_ms = updated_ms, revision = revision + 1
+             WHERE ended_ms IS NULL AND message IN (SELECT id FROM messages WHERE status != 'running')",
             [],
         )?;
         Ok(Store { conn: Mutex::new(conn), interrupted: Mutex::new(interrupted) })
@@ -397,7 +451,7 @@ impl Store {
     pub fn insert_message(&self, m: &Message) -> Result<(), Error> {
         self.c().execute(
             &format!(
-                "INSERT INTO messages ({MESSAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                "INSERT INTO messages ({MESSAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             ),
             params![
                 m.id,
@@ -416,10 +470,34 @@ impl Store {
                 m.created_ms as i64,
                 m.switched_from,
                 m.git_branch,
-                m.git_commit
+                m.git_commit,
+                m.worktree
             ],
         )?;
         Ok(())
+    }
+
+    /// Moves a thread to another managed worktree (after forking).
+    pub fn set_thread_worktree(&self, thread: &str, worktree: &str) -> Result<(), Error> {
+        self.c().execute("UPDATE threads SET worktree = ?2 WHERE id = ?1", params![thread, worktree])?;
+        Ok(())
+    }
+
+    /// Whether a thread other than `thread` has a message in `worktree`
+    /// created after `after_ms`.
+    pub fn others_since(&self, worktree: &str, thread: &str, after_ms: u64) -> Result<bool, Error> {
+        Ok(self
+            .c()
+            .prepare_cached("SELECT 1 FROM messages WHERE worktree = ?1 AND created_ms > ?3 AND thread != ?2 LIMIT 1")?
+            .exists(params![worktree, thread, after_ms as i64])?)
+    }
+
+    /// Threads currently in `worktree`.
+    pub fn threads_in(&self, worktree: &str) -> Result<Vec<String>, Error> {
+        let c = self.c();
+        let mut st = c.prepare_cached("SELECT id FROM threads WHERE worktree = ?1")?;
+        let rows = st.query_map([worktree], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn set_git(&self, id: &str, branch: Option<&str>, commit: Option<&str>) -> Result<(), Error> {
@@ -449,6 +527,74 @@ impl Store {
 
     pub fn message(&self, id: &str) -> Result<Option<Message>, Error> {
         Ok(self.c().query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id = ?1"), [id], message_row).optional()?)
+    }
+
+    pub fn reasoning_indexed(&self, message: &str) -> Result<bool, Error> {
+        Ok(self.c().prepare("SELECT 1 FROM reasoning_indexed WHERE message = ?1")?.exists([message])?)
+    }
+
+    pub fn reasoning_blocks(&self, message: &str) -> Result<Vec<ReasoningBlock>, Error> {
+        let c = self.c();
+        let mut stmt =
+            c.prepare("SELECT id, text, started_ms, ended_ms, revision FROM reasoning_blocks WHERE message = ?1 ORDER BY id")?;
+        Ok(stmt.query_map([message], reasoning_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn begin_reasoning(&self, message: &str, ts: u64) -> Result<i64, Error> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute("INSERT OR IGNORE INTO reasoning_indexed (message) VALUES (?1)", [message])?;
+        tx.execute(
+            "INSERT INTO reasoning_blocks (message, text, started_ms, updated_ms, revision) VALUES (?1, '', ?2, ?2, 0)",
+            params![message, ts as i64],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Append a delta, or replace it with the authoritative completed block.
+    pub fn write_reasoning(&self, id: i64, text: &str, complete: bool, ts: u64) -> Result<u64, Error> {
+        Ok(self.c().query_row(
+            "UPDATE reasoning_blocks SET text = CASE WHEN ?3 THEN ?2 ELSE text || ?2 END,
+                 updated_ms = ?4, ended_ms = CASE WHEN ?3 THEN COALESCE(ended_ms, ?4) ELSE ended_ms END,
+                 revision = revision + 1 WHERE id = ?1 RETURNING revision",
+            params![id, text, complete, ts as i64],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )?)
+    }
+
+    pub fn end_reasoning(&self, id: i64, ts: u64) -> Result<ReasoningBlock, Error> {
+        Ok(self.c().query_row(
+            "UPDATE reasoning_blocks SET ended_ms = COALESCE(ended_ms, ?2), revision = revision + 1
+             WHERE id = ?1 RETURNING id, text, started_ms, ended_ms, revision",
+            params![id, ts as i64],
+            reasoning_row,
+        )?)
+    }
+
+    pub fn mark_reasoning_indexed(&self, message: &str) -> Result<(), Error> {
+        self.c().execute("INSERT OR IGNORE INTO reasoning_indexed (message) VALUES (?1)", [message])?;
+        Ok(())
+    }
+
+    /// Import an older message's decoded trace once, without partial indexes
+    /// if reading it or writing the database fails.
+    pub fn import_reasoning(&self, message: &str, blocks: &[ReasoningBlock]) -> Result<(), Error> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let inserted = tx.execute("INSERT OR IGNORE INTO reasoning_indexed (message) VALUES (?1)", [message])?;
+        if inserted != 0 {
+            for block in blocks {
+                tx.execute(
+                    "INSERT INTO reasoning_blocks (message, text, started_ms, updated_ms, ended_ms, revision)
+                     VALUES (?1, ?2, ?3, ?4, ?4, 1)",
+                    params![message, block.text, block.started_ms as i64, block.ended_ms.unwrap_or(block.started_ms) as i64],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Messages with this parent (siblings of each other), oldest first.

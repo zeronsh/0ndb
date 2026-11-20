@@ -14,7 +14,7 @@
 //!   before it has been delivered and ingested, which is what lets callers
 //!   attribute a command's disk effects to exactly that command.
 
-mod disk;
+pub(crate) mod disk;
 mod git;
 pub(crate) use git::GitObjects;
 mod ignore;
@@ -226,7 +226,17 @@ impl Mount {
 
         let objects = match &git {
             Some(g) if opts.git_objects => {
-                let pin_ref = format!("refs/0ndb/{}", ws.id());
+                // Keep a ref already chosen for this store: a fork replicates
+                // its source's history and pins under a ref of its own, so
+                // the two never rewrite each other's pin chain.
+                let pin_ref = ws
+                    .with(|c| {
+                        let (store, key) = c.store();
+                        store.external_record(key)
+                    })?
+                    .filter(|(kind, _, _)| kind == "git")
+                    .map(|(_, _, pin)| pin)
+                    .unwrap_or_else(|| format!("refs/0ndb/{}", ws.id()));
                 let objects = Arc::new(git::GitObjects(ondb_git::Objects::open(&g.dir).pin_to(&pin_ref)));
                 // The common dir outlives linked worktrees, so workspaces
                 // opened later (without a mount) still find the content.

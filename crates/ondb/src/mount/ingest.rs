@@ -235,7 +235,7 @@ impl MountState {
         let root = self.root.clone();
         let synced = self.record.synced_version.clone();
         let mut paths = Vec::new();
-        for e in walker(&root).build().flatten() {
+        for e in walker(&root, self.ignore.plain()).build().flatten() {
             if let Ok(rel) = e.path().strip_prefix(&root) {
                 let rel = rel.to_string_lossy().into_owned();
                 if !rel.is_empty() {
@@ -278,7 +278,7 @@ impl MountState {
         // fixed cost.
         let walk_into = |dir: &str, out: &mut BTreeSet<String>| {
             let found = std::sync::Mutex::new(Vec::new());
-            walker(&abs(&self.root, dir)).threads(WALK_THREADS).build_parallel().run(|| {
+            walker(&abs(&self.root, dir), self.ignore.plain()).threads(WALK_THREADS).build_parallel().run(|| {
                 let found = &found;
                 let root = &self.root;
                 Box::new(move |e| {

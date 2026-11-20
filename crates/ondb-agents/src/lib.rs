@@ -19,7 +19,7 @@ pub mod store;
 
 pub use provider::{Capabilities, Event, EventKind, Interrupter, ModelInfo, Provider, Run, StartRequest};
 pub use sessions::{Page, ProviderInfo, SessionOptions, Sessions, Turn, Update};
-pub use store::{Message, ProviderSession, RecordedEvent, Role, Status, Thread, ToolCall};
+pub use store::{Message, ProviderSession, ReasoningBlock, RecordedEvent, Role, Status, Thread, ToolCall};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

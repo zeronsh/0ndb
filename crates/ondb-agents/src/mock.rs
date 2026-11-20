@@ -20,6 +20,12 @@ pub enum Step {
         chunk: usize,
         delay: std::time::Duration,
     },
+    /// Disclosed reasoning, streamed and then confirmed by a full block.
+    Think {
+        text: String,
+        chunk: usize,
+        delay: std::time::Duration,
+    },
     /// A tool call that writes `content` to `path` (relative to the cwd).
     Write {
         path: String,
@@ -184,6 +190,17 @@ impl Run for MockRun {
                         }
                     }
                     let e = self.ev(EventKind::Text { text });
+                    self.queue.push_back(e);
+                }
+                Step::Think { text, chunk, delay } => {
+                    let chars: Vec<char> = text.chars().collect();
+                    for piece in chars.chunks(chunk.max(1)) {
+                        self.queue.push_back(Pending::Delayed(
+                            Event::new(EventKind::ReasoningDelta { text: piece.iter().collect() }),
+                            delay,
+                        ));
+                    }
+                    let e = self.ev(EventKind::Reasoning { text });
                     self.queue.push_back(e);
                 }
                 Step::Write { path, content } => {

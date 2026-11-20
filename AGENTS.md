@@ -148,3 +148,32 @@
   reset or delete an existing branch. Git checkouts in between are undone
   only when git moves back with them. Don't add user-selectable branching
   behaviour; partial undo belongs to explicit scope reverts.
+- One thread never rewinds another's files. Messages record their worktree
+  (`messages.worktree`). Going back rewinds that worktree in place only if no
+  other thread now in it has a message there since, or is running there;
+  otherwise the thread forks (`Sessions::fork`, `Worktrees::fork`): a git
+  checkout gets a git worktree at the message's commit (its branch if free,
+  else a new `ondb/<thread>` branch, detached if it was); any other folder is
+  cloned (`cp -c` / reflink, else a copy; `.0ndb/` dropped). Only paths that
+  can differ are then rewritten to the message's version (git diff to HEAD,
+  dirty paths, inodes touched since). The shared worktree is never touched.
+  An unchanged fork of the same (worktree, version) with no other thread in
+  it is reused. Nothing forks while a thread is alone in its worktree.
+- A fork replicates its source's history cut at the fork version (same
+  history id, `ForkOrigin::shared`), so the two exchange batches directly;
+  if the source's history was pruned past it, the fork starts its own and
+  can't land. A replica pins git content under its own ref
+  (`refs/0ndb/<history>-<fork>`, kept in `external_objects`); mounts reuse a
+  store's recorded pin ref, never recompute it. Landing (`land.rs`): sync
+  first (source batches in; files both sides changed since are merged three
+  ways with diffy, base = neither side's new batches), conflict markers and
+  binary/edit-delete clashes only ever in the fork, conflicts stored in the
+  fork's local KV and settled by `resolve_conflict` or by removing the
+  markers; land refuses while any remain, then the source integrates the
+  fork's batches, so both converge and every line keeps its author.
+- Folders outside git ignore `ignore::PLAIN_DEFAULTS` (dependency trees,
+  caches, OS litter; only unambiguous names) below any `.gitignore`, and the
+  walker skips them. Chats with no folder get `Worktrees::scratch`.
+- `timeline.rs` shows history as it happened: a change set's diff compares
+  just before its batches with just after them, never with the current
+  state.

@@ -239,6 +239,32 @@ impl Repo {
         Ok(out.success().then(|| out.text().trim().to_string()))
     }
 
+    /// The commit `rev` names, if any.
+    pub fn resolve(&self, rev: &str) -> Result<Option<String>, Error> {
+        let out = self.git().args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")]).output()?;
+        Ok(out.success().then(|| out.text().trim().to_string()))
+    }
+
+    /// Paths (relative to the root) whose content differs between two
+    /// commits. A rename counts as a deletion and an addition.
+    pub fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>, Error> {
+        let out = self.git().args(["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", from, to]).ok()?;
+        Ok(nul_fields(&out.stdout).collect())
+    }
+
+    /// Paths (relative to the root) where the working tree differs from
+    /// HEAD: modified, deleted, added and untracked (not ignored) files.
+    pub fn dirty_paths(&self) -> Result<Vec<String>, Error> {
+        let out = self.git().args(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]).ok()?;
+        Ok(nul_fields(&out.stdout).filter_map(|e| e.get(3..).map(str::to_string)).collect())
+    }
+
+    /// Whether any worktree of this repository, this one included, has
+    /// `name` checked out.
+    pub fn branch_checked_out(&self, name: &str) -> Result<bool, Error> {
+        Ok(self.worktrees()?.iter().any(|w| w.branch.as_deref() == Some(name)))
+    }
+
     /// Whether another worktree of this repository has `name` checked out.
     pub fn branch_checked_out_elsewhere(&self, name: &str) -> Result<bool, Error> {
         let here = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
@@ -415,6 +441,11 @@ impl Repo {
         self.git().args(["worktree", "prune"]).ok()?;
         Ok(())
     }
+}
+
+/// Non-empty NUL-terminated fields of `-z` output.
+fn nul_fields(stdout: &[u8]) -> impl Iterator<Item = String> + '_ {
+    stdout.split(|b| *b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned())
 }
 
 fn parse_worktrees(stdout: &[u8]) -> Vec<Worktree> {

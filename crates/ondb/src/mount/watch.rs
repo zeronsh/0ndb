@@ -143,7 +143,7 @@ impl Watch {
     /// `tracked` gives the mount root and rules).
     fn watch_tree(&mut self, dir: &Path, tracked: Option<(&Path, &Ignore)>) {
         let mut dirs = vec![dir.to_path_buf()];
-        let mut w = walker(dir);
+        let mut w = walker(dir, tracked.is_some_and(|(_, ignore)| ignore.plain()));
         if tracked.is_none() {
             w.git_ignore(false).git_exclude(false).ignore(false).filter_entry(|_| true);
         }

@@ -24,7 +24,8 @@ fn script(prompt: &str) -> Vec<Step> {
     let mut steps = Vec::new();
     let words: Vec<&str> = last.split_whitespace().collect();
     if words.first() == Some(&"write") && words.len() >= 3 {
-        steps.push(Step::Write { path: words[1].into(), content: format!("{}\n", words[2..].join(" ")) });
+        // `\n` in the prompt writes a line break, for multi-line files.
+        steps.push(Step::Write { path: words[1].into(), content: format!("{}\n", words[2..].join(" ").replace("\\n", "\n")) });
     }
     if words.first() == Some(&"fail") {
         steps.push(Step::Fail("scripted failure".into()));
@@ -225,6 +226,100 @@ fn upgrading_branch_choices_preserves_the_current_path() {
     restarted.switch_branch(root_alt.parent.as_deref().unwrap()).unwrap();
     assert_eq!(restarted.switch_branch(root.parent.as_deref().unwrap()).unwrap().id, end.id);
     assert_eq!(fs::read_to_string(e.wt.path.join("end.txt")).unwrap(), "original\n");
+}
+
+#[test]
+fn reasoning_streams_separately_and_survives_reloads() {
+    use ondb_agents::Update;
+    let e = env(SessionOptions::default());
+    let trace = "Check **the plan** and preserve café 🚀. ".repeat(4);
+    let expected = trace.clone();
+    let thinker = Mock::new("thinker", Capabilities::default(), move |_| {
+        vec![
+            Step::Think { text: trace.clone(), chunk: 5, delay: Duration::from_millis(5) },
+            Step::Write { path: "checked.txt".into(), content: "checked".into() },
+            Step::Think { text: "Verify the result.".into(), chunk: 4, delay: Duration::from_millis(5) },
+            Step::Text("The answer.".into()),
+        ]
+    });
+    let db = e._dir.path().join("state/sessions.db");
+    let s = Sessions::open(&db, e.worktrees.clone(), vec![Arc::new(thinker.clone())], SessionOptions::default()).unwrap();
+    let t = s.create_thread(&e.wt.id, "thinking").unwrap();
+    let updates = s.subscribe();
+    let turn = s.send(&t.id, "check", "thinker", None).unwrap();
+    loop {
+        if let Update::ReasoningDelta { message, text, .. } = updates.recv_timeout(Duration::from_secs(5)).unwrap() {
+            assert_eq!(message, turn.assistant);
+            assert!(!text.is_empty());
+            let page = s.page(&t.id, None, 40).unwrap();
+            assert_eq!(page.messages.last().unwrap().id, turn.assistant, "a page reload includes the running reply");
+            let blocks = s.reasoning(&turn.assistant).unwrap();
+            assert_eq!(blocks.len(), 1);
+            assert!(expected.starts_with(&blocks[0].text));
+            assert_eq!(blocks[0].ended_ms, None);
+            break;
+        }
+    }
+    let reply = turn.wait().unwrap();
+    assert_eq!(reply.text, "The answer.", "reasoning never becomes answer text");
+    let blocks = s.reasoning(&reply.id).unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].text, expected, "the full snapshot replaces streamed text instead of duplicating it");
+    assert_eq!(blocks[1].text, "Verify the result.");
+    assert!(blocks.iter().all(|b| b.ended_ms.is_some_and(|end| end >= b.started_ms)));
+    let restarted = Sessions::open(&db, e.worktrees.clone(), vec![Arc::new(thinker)], SessionOptions::default()).unwrap();
+    assert_eq!(restarted.reasoning(&reply.id).unwrap(), blocks);
+}
+
+#[test]
+fn archived_reasoning_is_decoded_once_and_crashed_thinking_stops_at_last_chunk() {
+    use ondb_agents::claude::{Access, ClaudeCode};
+    let e = env(SessionOptions::default());
+    let t = e.sessions.create_thread(&e.wt.id, "archive").unwrap();
+    let mut old = e.sessions.send(&t.id, "hello", "alpha", None).unwrap().wait().unwrap();
+    old.id = "archived-thinking".into();
+    old.provider = Some("claude-code".into());
+    let store = e.sessions.store();
+    store.insert_message(&old).unwrap();
+    let session = old.session.as_deref().unwrap();
+    for (ts, kind, raw) in [
+        (
+            1000,
+            "reasoning_delta",
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"Check **"}}}),
+        ),
+        (
+            1200,
+            "reasoning_delta",
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"the plan**."}}}),
+        ),
+        (3000, "text_delta", serde_json::json!({})),
+        (
+            4000,
+            "reasoning",
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Check **the plan**."},{"type":"text","text":"Answer"}]}}),
+        ),
+    ] {
+        store.record_event(session, Some(&old.id), ts, kind, None, Some(&serde_json::to_vec(&raw).unwrap())).unwrap();
+    }
+    let db = e._dir.path().join("state/sessions.db");
+    let s = Sessions::open(&db, e.worktrees.clone(), vec![Arc::new(ClaudeCode::new(Access::Full))], SessionOptions::default())
+        .unwrap();
+    let blocks = s.reasoning(&old.id).unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].text, "Check **the plan**.");
+    assert_eq!(blocks[0].started_ms, 1000);
+    assert_eq!(blocks[0].ended_ms, Some(3000), "late final snapshots don't inflate thinking time");
+    assert_eq!(s.reasoning(&old.id).unwrap(), blocks, "the cached trace keeps its identity");
+
+    // No provider is run here: simulate a crash with a partial persisted trace.
+    old.id = "crashed-thinking".into();
+    old.status = Status::Running;
+    store.insert_message(&old).unwrap();
+    let id = store.begin_reasoning(&old.id, 1000).unwrap();
+    store.write_reasoning(id, "partial", false, 2000).unwrap();
+    let restarted = Sessions::open(&db, e.worktrees.clone(), Vec::new(), SessionOptions::default()).unwrap();
+    assert_eq!(restarted.reasoning(&old.id).unwrap()[0].ended_ms, Some(2000));
 }
 
 #[test]
@@ -503,6 +598,7 @@ fn turns_cut_short_by_a_crash_resume_at_startup() {
         switched_from: None,
         git_branch: None,
         git_commit: None,
+        worktree: Some(e.wt.id.clone()),
     };
     store.insert_message(&msg("u2", &first.id, Role::User, "write b.txt two", Status::Done)).unwrap();
     store.insert_message(&msg("a2", "u2", Role::Assistant, "partial", Status::Running)).unwrap();
@@ -600,4 +696,232 @@ fn restoring_a_message_returns_git_to_where_it_was() {
     assert_eq!(fs::read_to_string(wt.join("b.txt")).unwrap(), "two\n");
     assert!(!wt.join("more.txt").exists());
     let _ = ws;
+}
+
+#[test]
+fn going_back_in_a_shared_worktree_forks_instead_of_rewinding_other_chats() {
+    use ondb_agents::Update;
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let shared = e.wt.path.clone();
+    let out = |dir: &Path, cmd: &str| -> String {
+        String::from_utf8(Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let (_, mount) = e.worktrees.workspace(&e.wt.id).unwrap();
+    // Uncommitted work already in the checkout when the chats start.
+    fs::write(shared.join("base.txt"), "edited base\n").unwrap();
+    fs::write(shared.join("notes.txt"), "untracked\n").unwrap();
+    mount.fence().unwrap();
+    let a = s.create_thread(&e.wt.id, "chat a").unwrap();
+    let b = s.create_thread(&e.wt.id, "chat b").unwrap();
+
+    // Alone in the worktree, going back rewinds it in place, as before.
+    let a1 = s.send(&a.id, "write a.txt one", "alpha", None).unwrap().wait().unwrap();
+    let a1u = a1.parent.clone().unwrap();
+    s.edit(&a1u, "write a.txt redo", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(s.thread(&a.id).unwrap().worktree, e.wt.id);
+    assert_eq!(fs::read_to_string(shared.join("a.txt")).unwrap(), "redo\n");
+
+    // Chat b works in the same checkout.
+    s.send(&b.id, "write b.txt from b", "beta", None).unwrap().wait().unwrap();
+
+    // Chat a goes back to before its first message: rewinding would undo
+    // b's work, so a forks into its own worktree instead.
+    let updates = s.subscribe();
+    let edited = s.edit(&a1u, "write c.txt three", "alpha", None).unwrap().wait().unwrap();
+    let moved = updates.try_iter().find_map(|u| match u {
+        Update::ThreadMoved { thread, to, forked, branch, .. } if thread == a.id => Some((to, forked, branch)),
+        _ => None,
+    });
+    let (fork_id, forked, branch) = moved.expect("a moved");
+    assert!(forked);
+    assert_eq!(s.thread(&a.id).unwrap().worktree, fork_id);
+    assert_eq!(edited.worktree.as_deref(), Some(fork_id.as_str()));
+    let fork = e.worktrees.get(&fork_id).unwrap();
+    assert_ne!(fork.path, shared);
+    // The shared checkout is exactly as b left it.
+    assert_eq!(fs::read_to_string(shared.join("a.txt")).unwrap(), "redo\n");
+    assert_eq!(fs::read_to_string(shared.join("b.txt")).unwrap(), "from b\n");
+    assert!(!shared.join("c.txt").exists());
+    // The fork has the files as they were at the message, uncommitted and
+    // untracked ones included, then the new reply's work.
+    assert_eq!(fs::read_to_string(fork.path.join("base.txt")).unwrap(), "edited base\n");
+    assert_eq!(fs::read_to_string(fork.path.join("notes.txt")).unwrap(), "untracked\n");
+    assert_eq!(fs::read_to_string(fork.path.join("c.txt")).unwrap(), "three\n");
+    assert!(!fork.path.join("a.txt").exists() && !fork.path.join("b.txt").exists());
+    // Its branch can't be the one checked out in the shared worktree, so a
+    // new one is made at the same commit.
+    let branch = branch.expect("forks of a branch are on a branch");
+    assert!(branch.starts_with("ondb/chat-a"), "{branch}");
+    assert_eq!(out(&fork.path, "git symbolic-ref --short HEAD"), branch);
+    assert_eq!(out(&fork.path, "git rev-parse HEAD"), out(&shared, "git rev-parse HEAD"));
+
+    // b carries on in the shared checkout undisturbed.
+    s.send(&b.id, "write b2.txt more", "beta", None).unwrap().wait().unwrap();
+    assert!(shared.join("b2.txt").exists() && !fork.path.join("b2.txt").exists());
+
+    // Switching a back to its original branch: b has worked there since, so
+    // that point gets a fork too, with a's reply as it was.
+    let old_reply = s.siblings(&edited.parent.clone().unwrap()).unwrap()[1].clone();
+    let old_leaf = s.switch_branch(&old_reply.id).unwrap();
+    let back = s.thread(&a.id).unwrap().worktree;
+    assert!(back != e.wt.id && back != fork_id);
+    let back_path = e.worktrees.get(&back).unwrap().path;
+    assert_eq!(fs::read_to_string(back_path.join("a.txt")).unwrap(), "redo\n");
+    assert!(!back_path.join("b.txt").exists() && !back_path.join("c.txt").exists());
+
+    // Back to the edited branch: only a is in its fork, so a returns to it
+    // (rewinding it in place, nothing to undo).
+    s.switch_branch(&edited.id).unwrap();
+    assert_eq!(s.thread(&a.id).unwrap().worktree, fork_id);
+    // And again to the old branch: its fork is unchanged, so it is reused.
+    let count = e.worktrees.list().len();
+    s.switch_branch(&old_leaf.id).unwrap();
+    assert_eq!(s.thread(&a.id).unwrap().worktree, back);
+    assert_eq!(e.worktrees.list().len(), count, "no new fork for the same point");
+}
+
+#[test]
+fn plain_folders_fork_by_cloning_and_land_with_line_merges_and_conflicts() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let dir = e._dir.path().join("notes");
+    fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+    fs::write(dir.join("notes.md"), "intro\nalpha\nbeta\ngap\ngamma\n").unwrap();
+    fs::write(dir.join("node_modules/pkg/index.js"), "dep\n").unwrap();
+    let w = e.worktrees.adopt(&dir, "notes").unwrap();
+    let (ws, mount) = e.worktrees.workspace(&w.id).unwrap();
+    mount.fence().unwrap();
+    assert!(text(&ws, "node_modules/pkg/index.js").is_none(), "dependency folders aren't tracked in plain folders");
+    let read = |p: &Path| fs::read_to_string(p).unwrap();
+
+    let a = s.create_thread(&w.id, "chat a").unwrap();
+    let b = s.create_thread(&w.id, "chat b").unwrap();
+    let a1 = s.send(&a.id, "write notes.md intro\\nalpha-A\\nbeta\\ngap\\ngamma", "alpha", None).unwrap().wait().unwrap();
+    s.send(&b.id, "write other.txt from b", "beta", None).unwrap().wait().unwrap();
+
+    // a goes back before its first turn: b has worked here since, and this
+    // isn't git, so a gets a clone at that point.
+    let edited =
+        s.edit(a1.parent.as_ref().unwrap(), "write notes.md intro\\nalpha\\nbeta\\ngap\\ngamma-A", "alpha", None).unwrap();
+    edited.wait().unwrap();
+    let fork = e.worktrees.get(&s.thread(&a.id).unwrap().worktree).unwrap();
+    assert_ne!(fork.path, dir);
+    let origin = fork.forked_from.clone().unwrap();
+    assert!(origin.shared, "the fork replicates the folder's history");
+    assert_eq!(read(&fork.path.join("notes.md")), "intro\nalpha\nbeta\ngap\ngamma-A\n");
+    assert!(!fork.path.join("other.txt").exists());
+    assert_eq!(read(&fork.path.join("node_modules/pkg/index.js")), "dep\n", "the clone keeps ignored files");
+    assert_eq!(read(&dir.join("notes.md")), "intro\nalpha-A\nbeta\ngap\ngamma\n", "the shared folder is untouched");
+
+    // Meanwhile b edits another line in the shared folder.
+    s.send(&b.id, "write notes.md intro\\nalpha-A\\nbeta-B\\ngap\\ngamma", "beta", None).unwrap().wait().unwrap();
+
+    // Landing merges line by line: everyone's edits survive, in both places.
+    let landed = s.land(&a.id).unwrap();
+    assert!(landed.landed > 0 && landed.sync.conflicts.is_empty(), "{landed:?}");
+    assert_eq!(landed.sync.merged, ["notes.md"]);
+    let merged = "intro\nalpha-A\nbeta-B\ngap\ngamma-A\n";
+    assert_eq!(read(&dir.join("notes.md")), merged);
+    assert_eq!(read(&fork.path.join("notes.md")), merged);
+    assert!(fork.path.join("other.txt").exists());
+
+    // Both change the same line: landing stops, the conflict is marked in
+    // the fork only, and the shared folder keeps its version.
+    fs::write(dir.join("notes.md"), "intro\nalpha-A\nbeta-B\ngap\ngamma-W\n").unwrap();
+    mount.fence().unwrap();
+    s.send(&a.id, "write notes.md intro\\nalpha-A\\nbeta-B\\ngap\\ngamma-A2", "alpha", None).unwrap().wait().unwrap();
+    let err = s.land(&a.id).unwrap_err().to_string();
+    assert!(err.contains("conflicts") && err.contains("notes.md"), "{err}");
+    let conflicts = s.conflicts(&a.id).unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].kind, ondb::ConflictKind::Text);
+    let marked = read(&fork.path.join("notes.md"));
+    assert!(marked.contains("<<<<<<<") && marked.contains("gamma-A2") && marked.contains("gamma-W"), "{marked}");
+    assert_eq!(read(&dir.join("notes.md")), "intro\nalpha-A\nbeta-B\ngap\ngamma-W\n");
+
+    // Resolving (here: keep both lines) lets it land.
+    s.resolve(&a.id, "notes.md", ondb::Resolution::Content(Some(b"intro\nalpha-A\nbeta-B\ngap\ngamma-W\ngamma-A2\n".to_vec())))
+        .unwrap();
+    assert!(s.conflicts(&a.id).unwrap().is_empty());
+    s.land(&a.id).unwrap();
+    assert_eq!(read(&dir.join("notes.md")), "intro\nalpha-A\nbeta-B\ngap\ngamma-W\ngamma-A2\n");
+    assert_eq!(read(&fork.path.join("notes.md")), read(&dir.join("notes.md")));
+}
+
+#[test]
+fn editing_away_conflict_markers_resolves_them_and_git_forks_land_too() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let shared = e.wt.path.clone();
+    let (_, mount) = e.worktrees.workspace(&e.wt.id).unwrap();
+    fs::write(shared.join("doc.txt"), "one\ntwo\n").unwrap();
+    mount.fence().unwrap();
+    let a = s.create_thread(&e.wt.id, "chat a").unwrap();
+    let b = s.create_thread(&e.wt.id, "chat b").unwrap();
+    let a1 = s.send(&a.id, "write a.txt first", "alpha", None).unwrap().wait().unwrap();
+    s.send(&b.id, "write doc.txt one\\ntwo-B", "beta", None).unwrap().wait().unwrap();
+    s.edit(a1.parent.as_ref().unwrap(), "write doc.txt one\\ntwo-A", "alpha", None).unwrap().wait().unwrap();
+    let fork = e.worktrees.get(&s.thread(&a.id).unwrap().worktree).unwrap();
+    assert!(fork.forked_from.as_ref().unwrap().shared);
+    assert!(fork.branch.as_deref().is_some_and(|b| b.starts_with("ondb/")));
+
+    // Syncing marks the clash; editing the markers away (by hand, or by the
+    // agent) is enough to resolve it.
+    let report = s.sync(&a.id).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert!(fs::read_to_string(fork.path.join("doc.txt")).unwrap().contains("<<<<<<<"));
+    s.send(&a.id, "write doc.txt one\\ntwo-A\\ntwo-B", "alpha", None).unwrap().wait().unwrap();
+    assert!(s.conflicts(&a.id).unwrap().is_empty());
+    s.land(&a.id).unwrap();
+    for p in [&shared, &fork.path] {
+        assert_eq!(fs::read_to_string(p.join("doc.txt")).unwrap(), "one\ntwo-A\ntwo-B\n");
+        assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "first\n", "a's earlier turn stays");
+    }
+}
+
+#[test]
+fn chats_without_a_folder_get_a_tracked_scratch_folder() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let t = s.create_chat("just chatting").unwrap();
+    let wt = e.worktrees.get(&t.worktree).unwrap();
+    assert!(wt.path.is_dir() && fs::read_dir(&wt.path).unwrap().flatten().all(|e| e.file_name() == ".0ndb"));
+    s.send(&t.id, "write draft.md hello", "alpha", None).unwrap().wait().unwrap();
+    assert_eq!(fs::read_to_string(wt.path.join("draft.md")).unwrap(), "hello\n");
+    let (ws, _) = e.worktrees.workspace(&wt.id).unwrap();
+    assert_eq!(text(&ws, "draft.md").as_deref(), Some("hello\n"), "tracked like any folder");
+    // Going back undoes it, as anywhere else.
+    let u = s.path(&t.id).unwrap()[0].clone();
+    s.edit(&u.id, "say nothing", "alpha", None).unwrap().wait().unwrap();
+    assert!(!wt.path.join("draft.md").exists());
+}
+
+#[test]
+fn the_timeline_lists_changes_by_turn_and_tool_call_with_diffs() {
+    let e = env(SessionOptions::default());
+    let s = &e.sessions;
+    let t = s.create_thread(&e.wt.id, "history").unwrap();
+    s.send(&t.id, "write notes.md one\\ntwo", "alpha", None).unwrap().wait().unwrap();
+    s.send(&t.id, "write notes.md one\\nTWO\\nthree", "alpha", None).unwrap().wait().unwrap();
+    let (ws, _) = e.worktrees.workspace(&e.wt.id).unwrap();
+    let page = ondb::timeline::entries(&ws, None, 50).unwrap();
+    let edits: Vec<_> = page.entries.iter().filter(|en| en.files.iter().any(|f| f.path == "notes.md")).collect();
+    assert_eq!(edits.len(), 2, "{:#?}", page.entries);
+    let newest = edits[0];
+    assert_eq!(newest.actor, "alpha");
+    assert_eq!(newest.turn.as_ref().unwrap().label, "write notes.md one\\nTWO\\nthree");
+    assert_eq!(newest.scope.as_ref().unwrap().kind, ondb::ScopeKind::ToolCall);
+    let f = &newest.files[0];
+    assert_eq!((f.status, f.added, f.removed), (ondb::timeline::FileStatus::Modified, 2, 1));
+    let id = ondb::timeline::parse_batch_id(&newest.id).unwrap();
+    let diff = ondb::timeline::diff(&ws, &[id]).unwrap();
+    let patch = diff[0].patch.as_deref().unwrap();
+    assert!(patch.contains("-two") && patch.contains("+TWO") && patch.contains("+three"), "{patch}");
+    // Paging continues after the last entry shown.
+    let older = ondb::timeline::entries(&ws, Some(&newest.id), 50).unwrap();
+    assert!(older.entries.iter().all(|en| en.id != newest.id) && older.entries.iter().any(|en| en.id == edits[1].id));
 }

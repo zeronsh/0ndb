@@ -102,7 +102,7 @@ large histories:
   checkout are tracked as opaque content in git's objects: hashed by
   streaming, written into git if it doesn't have them, pinned, and streamed
   back to disk on restore, so they never sit in memory. Outside git they are
-  not tracked.
+  not tracked yet.
 
 Measured on an 8 MiB, 200k-line file (`cargo run --release -p ondb-core
 --example bigfile`, `-p ondb --example durable`):
@@ -247,6 +247,10 @@ registering it. Nothing polls: provider calls happen on request.
   Each fork remembers its last selected continuation in the database, so
   returning to an earlier branch restores all nested choices, even after a
   restart. Forks never visited default to their newest continuation.
+* **Disclosed reasoning stays separate from the answer.** `reasoning()`
+  returns timed blocks that survive reloads and restarts; live updates carry
+  small deltas with revisions so page snapshots cannot duplicate the trace.
+  Older provider logs are decoded by their driver and indexed on first read.
 * **Every message is pinned to a worktree version**, and every turn and every
   tool call is an attribution scope. Branching follows one fixed rule, not
   an option: editing a message or switching branches makes the files exactly
@@ -258,6 +262,30 @@ registering it. Nothing polls: provider calls happen on request.
   are never moved or rewritten. A merge or rebase in progress blocks the
   restore. Undoing only an agent's work is a separate, explicit action
   (reverting its scope).
+* **Chats sharing a worktree never rewind each other.** When another chat in
+  the same worktree has worked there since the message (or is running), going
+  back forks instead and the chat moves into its own copy, with the files
+  exactly as they were at that message. A git checkout gets a git worktree at
+  the message's commit (uncommitted and untracked files carried over,
+  git-ignored ones not), on the message's branch if nothing has it checked
+  out, otherwise a new `ondb/<thread>` branch at the same commit. Any other
+  folder is cloned, copy-on-write where the filesystem can. The shared
+  worktree is left as it is, and `ThreadMoved` says where the chat went. A
+  chat alone in its worktree still rewinds in place, so chatting on `main`
+  creates nothing.
+* **Forks land back.** A fork shares its source's history, so `sync` brings
+  in what changed there since (files both changed are merged line by line;
+  overlapping edits get conflict markers in the fork only) and `land` applies
+  the fork's changes to the source, refusing while conflicts remain. Resolve
+  one with `resolve` (keep mine, take theirs, or exact content) or by editing
+  the markers away. Every landed line keeps the turn and tool call that wrote
+  it.
+* **Any folder, or none.** Folders outside git work like checkouts (minus git
+  itself); dependency and cache folders (`node_modules`, `.venv`, ...) are
+  ignored by default. `create_chat` gives a chat with no folder a scratch one,
+  tracked like any other.
+* **History.** `ondb::timeline` lists every change newest first, credited to
+  its turn and tool call, with diffs of what it changed at the time.
 * **Provider sessions are chosen per turn.** Continue the native session that
   last saw this branch; else fork a native session at the branch point if the
   provider can (Claude Code: `--resume-session-at` + `--fork-session`); else

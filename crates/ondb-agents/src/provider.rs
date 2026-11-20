@@ -63,6 +63,11 @@ pub trait Provider: Send + Sync {
     fn available(&self) -> bool {
         true
     }
+    /// Decode archived reasoning for messages recorded before normalized
+    /// reasoning blocks existed. Provider wire formats stay in the drivers.
+    fn recorded_reasoning(&self, _raw: &[u8]) -> Vec<EventKind> {
+        Vec::new()
+    }
     /// The models this provider offers the signed-in account, asked of the
     /// provider itself where it can say (may spawn it; callers cache).
     /// Empty means "only the provider's default".
