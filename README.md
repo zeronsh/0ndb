@@ -423,6 +423,21 @@ change twice. While `0ndb watch` runs, commands that need the mount (`run`,
 ONDB_DB=~/.0ndb-test/0ndb.db 0ndb watch    # alongside a production `0ndb watch`
 ```
 
+## Playground
+
+`playground/` is a local web UI and API server (`ondb-playground`) for trying
+worktrees, forks, landing, history diffs, branching threads, and live agent
+streaming.
+
+```sh
+cargo run --release -p ondb-playground
+npm --prefix playground/ui install
+npm --prefix playground/ui run dev
+```
+
+The API listens on `http://127.0.0.1:4317` (state in `~/.0ndb-playground`, or
+`$ONDB_PLAYGROUND`) and the UI runs on `http://localhost:5174`.
+
 ## Known limits
 
 * While a turn-level scope is open, a human editing the same files is

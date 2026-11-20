@@ -745,6 +745,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ondb-playground"
+version = "0.1.0"
+dependencies = [
+ "ondb",
+ "ondb-agents",
+ "serde_json",
+]
+
+[[package]]
 name = "ondb-store"
 version = "0.1.0"
 dependencies = [

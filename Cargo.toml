@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ondb-core", "crates/ondb-store", "crates/ondb", "crates/ondb-sync", "crates/ondb-cli", "crates/ondb-git", "crates/ondb-agents"]
+members = ["crates/ondb-core", "crates/ondb-store", "crates/ondb", "crates/ondb-sync", "crates/ondb-cli", "crates/ondb-git", "crates/ondb-agents", "playground/server"]
 
 [workspace.package]
 version = "0.1.0"
