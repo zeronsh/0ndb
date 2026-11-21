@@ -143,6 +143,7 @@ Config :: struct {
 	credentials:     Credentials_Source,
 	transport:       Transport,
 	clock:           Clock,
+	random:          prim.Random,
 	ids:             Id_Source,
 	log:             Log,
 	spawner:         Spawner,
@@ -394,7 +395,11 @@ new_id :: proc(e: ^Engine) -> prim.Id {
 	if e.cfg.ids.next != nil {
 		return e.cfg.ids.next(e.cfg.ids.data)
 	}
-	return prim.id_new()
+	return prim.id_new_with(e.cfg.clock, e.cfg.random)
+}
+
+random_fill :: proc(e: ^Engine, out: []u8) {
+	prim.random_fill(e.cfg.random, out)
 }
 
 step :: proc(e: ^Engine, block := false) -> Error {

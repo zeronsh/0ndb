@@ -76,7 +76,11 @@ _own_tree_get :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind, scope
 		}
 		x.stored = i64(len(data))
 	} else {
-		if kerr := osync.keytree_new(&x.tree, e.allocator); kerr != .None {
+		root: [32]u8
+		random_fill(e, root[:])
+		kerr := osync.keytree_init(&x.tree, root, osync.KEY_TREE_DEPTH, osync.KEY_TREE_SHIFT, e.allocator)
+		crypto.zero_explicit(&root, size_of(root))
+		if kerr != .None {
 			delete(x.path, e.allocator)
 			free(x, e.allocator)
 			return nil, _serr(kerr)

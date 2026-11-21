@@ -73,7 +73,10 @@ Held :: struct {
 }
 
 space_create :: proc(e: ^Engine, name: string, relay := "", relay_public: osync.Public_Key = {}, mode := osync.Encryption_Mode.End_To_End) -> (id: prim.Id, err: Error) {
-	s, serr := osync.space_new()
+	secret: osync.Secret
+	random_fill(e, secret[:])
+	s, serr := osync.space_from_secret(secret)
+	crypto.zero_explicit(&secret, size_of(secret))
 	if serr != .None {
 		return {}, _serr(serr)
 	}
