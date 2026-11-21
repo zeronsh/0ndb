@@ -1,5 +1,6 @@
 package engine
 
+import "core:crypto/blake2b"
 import "../convo"
 import omap "../map"
 import "../obj"
@@ -30,6 +31,66 @@ Catalog_Update :: struct {
 	agent:       prim.Id,
 	usage:       convo.Usage,
 	has_usage:   bool,
+	role:        string,
+}
+
+CATALOG_ROLE :: u32(32)
+
+named_id :: proc(space: prim.Id, name: string, parent: prim.Id = {}) -> (id: prim.Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	blake2b.update(&ctx, transmute([]u8)string("0ndb-named-v1"))
+	s, p := space, parent
+	blake2b.update(&ctx, s[:])
+	blake2b.update(&ctx, p[:])
+	blake2b.update(&ctx, transmute([]u8)name)
+	blake2b.final(&ctx, id[:])
+	id[6] = (id[6] & 0x0f) | 0x80
+	return
+}
+
+map_named :: proc(e: ^Engine, space: prim.Id, name: string, parent: Object = {}, create := true) -> (o: Object, err: Error) {
+	if len(name) == 0 {
+		return o, .Invalid
+	}
+	o = Object{space, named_id(space, name, parent.id)}
+	h := _handle_get(e, o, .Map) or_return
+	if !create || h.own {
+		return o, .None
+	}
+	_handle_create_writer(h) or_return
+	xref: obj.Xref
+	xref.object = parent.id
+	_catalog_created(e, h, name, xref, {}, {})
+	if u := _catalog_q(e, space, o.id, .Map); u != nil {
+		delete(u.role, e.allocator)
+		u.role = _clone(name, e.allocator) or_return
+	}
+	return o, .None
+}
+
+catalog_role :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (role: string, err: Error) {
+	sp := _space_open(e, o.space) or_return
+	h := _catalog_handle(e, sp) or_return
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return "", merr
+	}
+	kb: [16]u8
+	en, found, gerr := omap.table_get(&h.table, omap.catalog_key(o.id, &kb), context.temp_allocator)
+	if gerr != .None {
+		return "", _oerr(gerr)
+	}
+	if !found {
+		if (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+			return "", _wait(e, h, ready)
+		}
+		return "", .Not_Found
+	}
+	if v, ok := omap.entry_register(&en, CATALOG_ROLE); ok {
+		return _clone(string(v), allocator)
+	}
+	return "", .None
 }
 
 map_create :: proc(e: ^Engine, space: prim.Id, title := "", settings: []u8 = nil) -> (o: Object, err: Error) {
@@ -354,7 +415,8 @@ _catalog_flush :: proc(e: ^Engine) {
 	q := e.catalog_q
 	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
 	defer delete(q)
-	for id, u in q {
+	for id in _sorted_keys(q) {
+		u := q[id]
 		err := _catalog_write(e, id, u)
 		if err == .Busy {
 			if _, dup := e.catalog_q[id]; !dup {
@@ -365,6 +427,7 @@ _catalog_flush :: proc(e: ^Engine) {
 			_log(e, .Warn, "catalog update failed")
 		}
 		delete(u.title, e.allocator)
+		delete(u.role, e.allocator)
 		free(u, e.allocator)
 	}
 }
@@ -405,6 +468,9 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	}
 	if u.activity {
 		append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Activity), u64(_wall_ms(e))))
+	}
+	if len(u.role) > 0 {
+		append(&fields, omap.field_str(CATALOG_ROLE, u.role))
 	}
 	if u.status && u.kind == .Conversation {
 		if ch, err := _handle_get(e, Object{u.space, id}, .Conversation); err == .None {

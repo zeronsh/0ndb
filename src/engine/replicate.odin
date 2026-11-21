@@ -57,7 +57,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 	if !sp.keyless {
 		_catalog_follow(e, sp)
 	} else {
-		for id in sp.grants {
+		for id in _sorted_keys(sp.grants) {
 			if rec, found, _ := _rec_get(e, id); found {
 				_shared_follow(e, sp, id, rec.kind)
 			}
@@ -223,7 +223,8 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 
 @(private)
 _repl_events_process :: proc(e: ^Engine) {
-	for _, sp in e.spaces {
+	for sid in _sorted_keys(e.spaces) {
+		sp := e.spaces[sid]
 		if !sp.open || !sp.repl_on {
 			continue
 		}

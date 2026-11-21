@@ -3,6 +3,7 @@ package engine
 import "base:runtime"
 import "core:sync"
 import "core:thread"
+import "../convo"
 import "../fs"
 import "../http"
 import "../obj"
@@ -96,9 +97,11 @@ Credentials_Source :: struct {
 Purge_Request :: struct {
 	object:   Object,
 	msg:      Rid,
+	role:     convo.Role,
 	provider: string,
 	native:   string,
 	ids:      []string,
+	texts:    []string,
 }
 
 Purge_Hook :: struct {
@@ -253,6 +256,7 @@ Engine :: struct {
 	db:           odb.Odb,
 	db_open:      bool,
 	pack_more:    bool,
+	purged:       [dynamic]Rid,
 	plug:         Plug_State,
 	stats:        Stats,
 	fatal:        Error,
@@ -286,6 +290,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, allocator)
 	e.waiters = make([dynamic]^Waiter, allocator)
 	e.held = make([dynamic]^Pending_Cmd, allocator)
+	e.purged = make([dynamic]Rid, allocator)
 	e.subs = make([dynamic]^Sub, allocator)
 	e.posted = make([dynamic]Posted, allocator)
 	e.post_swap = make([dynamic]Posted, allocator)
@@ -317,6 +322,9 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.prev_wake_data = e.loop.wake_data
 	prim.loop_on_wake(e.loop, _on_wake, e)
 	opts := cfg.pack_options if cfg.use_pack_options else pack.DEFAULT_OPTIONS
+	if opts.clock.mono_ns == nil && opts.clock.wall_ns == nil {
+		opts.clock = cfg.clock
+	}
 	if cfg.durability == .Deferred {
 		opts.deferred_sync = true
 		opts.wake = nil
@@ -652,6 +660,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 		return
 	}
 
+	_mounts_settle(e)
 	_index_settle(e)
 	_checkpoints_write(e)
 	_handles_sweep(e, 0)
@@ -661,10 +670,14 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	if e.pack_more {
 		e.settle_timer = prim.timer(e.loop, 0, e, _on_settle)
 	}
+	_curl_settle(e)
 	when !runtime.NO_DEFAULT_TEMP_ALLOCATOR {
 		if context.temp_allocator.data == &runtime.global_default_temp_allocator_data {
 			runtime.default_temp_allocator_destroy(&runtime.global_default_temp_allocator_data)
 		}
+	}
+	if !e.pack_more {
+		_heap_release(e)
 	}
 }
 
@@ -754,6 +767,7 @@ _teardown :: proc(e: ^Engine) {
 		_cmd_fail(e, p, .Closed)
 	}
 	delete(e.held)
+	delete(e.purged)
 	delete(e.waiters)
 	delete(e.subs)
 	delete(e.posted)
@@ -764,6 +778,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.changed)
 	for _, u in e.catalog_q {
 		delete(u.title, e.allocator)
+		delete(u.role, e.allocator)
 		free(u, e.allocator)
 	}
 	delete(e.catalog_q)

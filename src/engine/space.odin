@@ -152,8 +152,8 @@ space_info :: proc(e: ^Engine, id: prim.Id) -> (info: Space_Info, err: Error) {
 
 space_list :: proc(e: ^Engine, allocator := context.allocator) -> []Space_Info {
 	out := make([dynamic]Space_Info, 0, len(e.spaces), allocator)
-	for _, sp in e.spaces {
-		append(&out, _space_info(sp))
+	for id in _sorted_keys(e.spaces) {
+		append(&out, _space_info(e.spaces[id]))
 	}
 	return out[:]
 }
@@ -436,7 +436,7 @@ _card_publish :: proc(e: ^Engine, sp: ^Space) -> Error {
 		path := _card_path(e, sp) or_return
 		_card_publish_in(e, sp, &sp.scope, path) or_return
 	}
-	for id in sp.grants {
+	for id in _sorted_keys(sp.grants) {
 		_card_publish_object(e, sp, id) or_return
 	}
 	sp.card_ok = true
@@ -577,7 +577,7 @@ _card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id, stream: osync.Strea
 	}
 	_touch(e)
 	_held_release(e, sp, device)
-	for _, h in e.handles {
+	for h in e.lru {
 		if h.sp != sp {
 			continue
 		}

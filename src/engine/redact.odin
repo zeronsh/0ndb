@@ -139,17 +139,7 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 		odb.redact(&e.db, oids[:], "refs/0ndb/", nil, true, context.temp_allocator)
 	}
 	_index_purge_message(e, h, msg)
-	if e.cfg.purge.purge != nil && len(m.native) > 0 {
-		ids := make([dynamic]string, context.temp_allocator)
-		if len(m.native_msg) > 0 {
-			append(&ids, m.native_msg)
-		}
-		if len(m.seal_native) > 0 {
-			append(&ids, m.seal_native)
-		}
-		req := Purge_Request{object = Object{h.sp.id, h.id}, msg = msg, provider = m.provider, native = m.native, ids = ids[:]}
-		e.cfg.purge.purge(e.cfg.purge.data, e, &req)
-	}
+	_purge_message(e, h, msg, &m)
 	_handle_mark(h)
 	_object_changed(e, h.sp.id, h.id, .Redacted)
 	return .None
@@ -257,6 +247,15 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 		return
 	}
 	dev := obj.seg_id(&h.view, from)
+	target_rid: Rid
+	if target, terr := obj.resolve(&h.view, vs, r.target); terr == .None && !obj.vref_none(target) && h.kind == .Conversation {
+		target_rid = obj.rid(&h.view, target)
+		if t, tt := convo.view_tail(&h.view, e.self, context.temp_allocator); tt == .None {
+			if m, merr := convo.message(&h.view, &t, convo.Position{msg = target_rid}, context.temp_allocator); merr == .None {
+				_purge_message(e, h, target_rid, &m)
+			}
+		}
+	}
 	if dev == e.self {
 		if !h.w_open {
 			return
@@ -284,13 +283,52 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 		osync.replicator_zero_replica(&h.sp.repl, &h.scope, dev, h.name, 0, from.off, r.to)
 		h.view.segs[from.seg].tail_end = -1
 	}
-	if !obj.vref_none(obj.Vref{vs, 0}) {
-		target, terr := obj.resolve(&h.view, vs, r.target)
-		if terr == .None && !obj.vref_none(target) && h.kind == .Conversation {
-			_index_purge_message(e, h, obj.rid(&h.view, target))
-		}
+	if !obj.rid_none(target_rid) {
+		_index_purge_message(e, h, target_rid)
 	}
 	_object_changed(e, h.sp.id, h.id, .Redacted)
+}
+
+@(private)
+PURGED_KEEP :: 1024
+
+@(private)
+_purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid, m: ^convo.Message) {
+	if e.cfg.purge.purge == nil {
+		return
+	}
+	for x in e.purged {
+		if x == msg {
+			return
+		}
+	}
+	if len(e.purged) >= PURGED_KEEP {
+		ordered_remove(&e.purged, 0)
+	}
+	append(&e.purged, msg)
+	ids := make([dynamic]string, context.temp_allocator)
+	for s in ([]string{m.native_msg, m.seal_native}) {
+		if len(s) > 0 {
+			append(&ids, s)
+		}
+	}
+	texts := make([dynamic]string, context.temp_allocator)
+	for b in m.blocks {
+		if len(b.id) > 0 {
+			append(&ids, b.id)
+		}
+		if len(b.text) > 0 {
+			append(&texts, string(b.text))
+		}
+		if len(b.name) > 0 && b.kind == .Tool_Call {
+			append(&texts, b.name)
+		}
+	}
+	if len(ids) == 0 && len(texts) == 0 && len(m.native) == 0 {
+		return
+	}
+	req := Purge_Request{object = Object{h.sp.id, h.id}, msg = msg, role = m.role, provider = m.provider, native = m.native, ids = ids[:], texts = texts[:]}
+	e.cfg.purge.purge(e.cfg.purge.data, e, &req)
 }
 
 @(private)

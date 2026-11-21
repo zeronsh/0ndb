@@ -1,11 +1,13 @@
 package libcurl
 
 import "core:c"
+import "core:dynlib"
+import "core:sync"
 
-when ODIN_OS == .Linux {
-	foreign import lib "libcurl_runtime.so"
+when ODIN_OS == .Darwin {
+	LIBRARY_NAMES :: [?]string{"libcurl.4.dylib", "/usr/lib/libcurl.4.dylib", "libcurl.dylib"}
 } else {
-	foreign import lib "system:curl"
+	LIBRARY_NAMES :: [?]string{"libcurl.so.4", "libcurl.so"}
 }
 
 CURL :: struct {}
@@ -140,24 +142,202 @@ INFO :: enum c.int {
 	PRIVATE       = 0x100000 + 21,
 }
 
-@(default_calling_convention = "c", link_prefix = "curl_")
-foreign lib {
-	global_init :: proc(flags: c.long) -> code ---
-	easy_init :: proc() -> ^CURL ---
-	easy_cleanup :: proc(curl: ^CURL) ---
-	easy_reset :: proc(curl: ^CURL) ---
-	easy_setopt :: proc(curl: ^CURL, opt: option, #c_vararg args: ..any) -> code ---
-	easy_getinfo :: proc(curl: ^CURL, info: INFO, #c_vararg args: ..any) -> code ---
-	easy_strerror :: proc(c: code) -> cstring ---
-	easy_pause :: proc(curl: ^CURL, bitmask: c.int) -> code ---
-	multi_init :: proc() -> ^CURLM ---
-	multi_cleanup :: proc(m: ^CURLM) -> Mcode ---
-	multi_setopt :: proc(m: ^CURLM, opt: Moption, #c_vararg args: ..any) -> Mcode ---
-	multi_add_handle :: proc(m: ^CURLM, curl: ^CURL) -> Mcode ---
-	multi_remove_handle :: proc(m: ^CURLM, curl: ^CURL) -> Mcode ---
-	multi_socket_action :: proc(m: ^CURLM, s: socket_t, ev_bitmask: c.int, running: ^c.int) -> Mcode ---
-	multi_info_read :: proc(m: ^CURLM, msgs_in_queue: ^c.int) -> ^Msg ---
-	multi_assign :: proc(m: ^CURLM, s: socket_t, sockp: rawptr) -> Mcode ---
-	slist_append :: proc(list: ^slist, data: cstring) -> ^slist ---
-	slist_free_all :: proc(list: ^slist) ---
+@(private)
+Loader :: struct {
+	mu:   sync.Mutex,
+	lib:  dynlib.Library,
+	refs: int,
+}
+
+@(private)
+loader: Loader
+
+global_init: proc "c" (flags: c.long) -> code
+global_cleanup: proc "c" ()
+easy_init: proc "c" () -> ^CURL
+easy_cleanup: proc "c" (curl: ^CURL)
+easy_reset: proc "c" (curl: ^CURL)
+easy_setopt: proc "c" (curl: ^CURL, opt: option, #c_vararg args: ..any) -> code
+easy_getinfo: proc "c" (curl: ^CURL, info: INFO, #c_vararg args: ..any) -> code
+easy_strerror: proc "c" (c: code) -> cstring
+easy_pause: proc "c" (curl: ^CURL, bitmask: c.int) -> code
+multi_init: proc "c" () -> ^CURLM
+multi_cleanup: proc "c" (m: ^CURLM) -> Mcode
+multi_setopt: proc "c" (m: ^CURLM, opt: Moption, #c_vararg args: ..any) -> Mcode
+multi_add_handle: proc "c" (m: ^CURLM, curl: ^CURL) -> Mcode
+multi_remove_handle: proc "c" (m: ^CURLM, curl: ^CURL) -> Mcode
+multi_socket_action: proc "c" (m: ^CURLM, s: socket_t, ev_bitmask: c.int, running: ^c.int) -> Mcode
+multi_info_read: proc "c" (m: ^CURLM, msgs_in_queue: ^c.int) -> ^Msg
+multi_assign: proc "c" (m: ^CURLM, s: socket_t, sockp: rawptr) -> Mcode
+slist_append: proc "c" (list: ^slist, data: cstring) -> ^slist
+slist_free_all: proc "c" (list: ^slist)
+
+load :: proc() -> bool {
+	sync.mutex_lock(&loader.mu)
+	defer sync.mutex_unlock(&loader.mu)
+	if loader.refs > 0 {
+		loader.refs += 1
+		return true
+	}
+	lib: dynlib.Library
+	ok := false
+	for name in LIBRARY_NAMES {
+		if lib, ok = dynlib.load_library(name); ok {
+			break
+		}
+	}
+	if !ok {
+		return false
+	}
+	resolved := true
+	if p, found := dynlib.symbol_address(lib, "curl_global_cleanup"); found {
+		global_cleanup = cast(type_of(global_cleanup))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_global_init"); found {
+		global_init = cast(type_of(global_init))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_easy_init"); found {
+		easy_init = cast(type_of(easy_init))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_easy_cleanup"); found {
+		easy_cleanup = cast(type_of(easy_cleanup))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_easy_reset"); found {
+		easy_reset = cast(type_of(easy_reset))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_easy_setopt"); found {
+		easy_setopt = cast(type_of(easy_setopt))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_easy_getinfo"); found {
+		easy_getinfo = cast(type_of(easy_getinfo))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_easy_strerror"); found {
+		easy_strerror = cast(type_of(easy_strerror))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_easy_pause"); found {
+		easy_pause = cast(type_of(easy_pause))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_init"); found {
+		multi_init = cast(type_of(multi_init))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_cleanup"); found {
+		multi_cleanup = cast(type_of(multi_cleanup))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_setopt"); found {
+		multi_setopt = cast(type_of(multi_setopt))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_add_handle"); found {
+		multi_add_handle = cast(type_of(multi_add_handle))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_remove_handle"); found {
+		multi_remove_handle = cast(type_of(multi_remove_handle))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_socket_action"); found {
+		multi_socket_action = cast(type_of(multi_socket_action))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_info_read"); found {
+		multi_info_read = cast(type_of(multi_info_read))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_multi_assign"); found {
+		multi_assign = cast(type_of(multi_assign))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_slist_append"); found {
+		slist_append = cast(type_of(slist_append))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "curl_slist_free_all"); found {
+		slist_free_all = cast(type_of(slist_free_all))p
+	} else {
+		resolved = false
+	}
+	if !resolved || global_init(GLOBAL_ALL) != .E_OK {
+		dynlib.unload_library(lib)
+		_clear()
+		return false
+	}
+	loader.lib = lib
+	loader.refs = 1
+	return true
+}
+
+unload :: proc() {
+	sync.mutex_lock(&loader.mu)
+	defer sync.mutex_unlock(&loader.mu)
+	if loader.refs == 0 {
+		return
+	}
+	loader.refs -= 1
+	if loader.refs > 0 {
+		return
+	}
+	if global_cleanup != nil {
+		global_cleanup()
+	}
+	dynlib.unload_library(loader.lib)
+	loader.lib = nil
+	_clear()
+}
+
+loaded :: proc() -> bool {
+	sync.mutex_lock(&loader.mu)
+	defer sync.mutex_unlock(&loader.mu)
+	return loader.refs > 0
+}
+
+@(private)
+_clear :: proc() {
+	global_init = nil
+	global_cleanup = nil
+	easy_init = nil
+	easy_cleanup = nil
+	easy_reset = nil
+	easy_setopt = nil
+	easy_getinfo = nil
+	easy_strerror = nil
+	easy_pause = nil
+	multi_init = nil
+	multi_cleanup = nil
+	multi_setopt = nil
+	multi_add_handle = nil
+	multi_remove_handle = nil
+	multi_socket_action = nil
+	multi_info_read = nil
+	multi_assign = nil
+	slist_append = nil
+	slist_free_all = nil
 }

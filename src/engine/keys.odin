@@ -126,7 +126,8 @@ _own_tree_puncture :: proc(e: ^Engine, t: ^Own_Tree, from, to: i64) -> Error {
 
 @(private)
 _trees_persist :: proc(e: ^Engine) {
-	for _, t in e.own_trees {
+	for k in _sorted_keys(e.own_trees) {
+		t := e.own_trees[k]
 		if !t.dirty {
 			continue
 		}

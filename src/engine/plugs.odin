@@ -37,17 +37,46 @@ spawner :: proc(e: ^Engine) -> Spawner {
 }
 
 http_client :: proc(e: ^Engine) -> (c: ^http.Client, err: Error) {
-	if e.cfg.http.start != nil {
-		return &e.cfg.http, .None
-	}
-	if !e.plug.curl_on {
-		if !http.curl_init(&e.plug.curl, e.loop, e.allocator) {
-			return nil, .Unsupported
-		}
-		e.plug.curl_on = true
-		e.cfg.http = http.curl_client(&e.plug.curl)
+	if e.cfg.http.start == nil {
+		e.cfg.http = http.Client{data = e, start = _curl_start, cancel = _curl_cancel, resume = _curl_resume}
 	}
 	return &e.cfg.http, .None
+}
+
+@(private)
+_curl_start :: proc(data: rawptr, req: ^http.Request, sink: http.Sink) -> (http.Id, http.Error) {
+	e := (^Engine)(data)
+	if !e.plug.curl_on {
+		if !http.curl_init(&e.plug.curl, e.loop, e.allocator) {
+			return {}, .Unsupported
+		}
+		e.plug.curl_on = true
+	}
+	return http.curl_start(&e.plug.curl, req, sink)
+}
+
+@(private)
+_curl_cancel :: proc(data: rawptr, id: http.Id) {
+	e := (^Engine)(data)
+	if e.plug.curl_on {
+		http.curl_cancel(&e.plug.curl, id)
+	}
+}
+
+@(private)
+_curl_resume :: proc(data: rawptr, id: http.Id) {
+	e := (^Engine)(data)
+	if e.plug.curl_on {
+		http.curl_resume(&e.plug.curl, id)
+	}
+}
+
+@(private)
+_curl_settle :: proc(e: ^Engine) {
+	if e.plug.curl_on && http.curl_active(&e.plug.curl) == 0 {
+		http.curl_destroy(&e.plug.curl)
+		e.plug.curl_on = false
+	}
 }
 
 registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
@@ -115,11 +144,75 @@ _mount_id :: proc(tree: prim.Id, root: string) -> (id: prim.Id) {
 @(private)
 _on_mount_ready :: proc(m: ^fs.Mount, data: rawptr) {
 	e := (^Engine)(data)
+	if err := fs.mount_run(m); err != .None {
+		_log(e, .Warn, "mount pass failed")
+	}
 	for mt in e.plug.mounts {
 		if &mt.mount == m {
-			touched(e, mt.object)
+			_mount_touched(e, mt)
 			return
 		}
+	}
+}
+
+@(private)
+_mount_touched :: proc(e: ^Engine, mt: ^Mounted) {
+	h, err := _handle_get(e, mt.object, .File_Tree)
+	if err != .None {
+		return
+	}
+	if h.w_open && _own_len(h) > h.published {
+		_handle_mark(h)
+	}
+}
+
+Mount_Done :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, e: ^Engine, m: ^fs.Mount, err: Error),
+}
+
+@(private)
+Fence_Ctx :: struct {
+	e:    ^Engine,
+	done: Mount_Done,
+}
+
+tree_mount_fence :: proc(e: ^Engine, m: ^fs.Mount, done: Mount_Done = {}) -> Error {
+	ctx := new(Fence_Ctx, e.allocator)
+	ctx.e = e
+	ctx.done = done
+	if err := fs.mount_fence(m, _mount_fenced, ctx); err != .None {
+		free(ctx, e.allocator)
+		return _ferr(err)
+	}
+	return .None
+}
+
+@(private)
+_mount_fenced :: proc(m: ^fs.Mount, data: rawptr, err: fs.Error) {
+	ctx := (^Fence_Ctx)(data)
+	e := ctx.e
+	for mt in e.plug.mounts {
+		if &mt.mount == m {
+			_mount_touched(e, mt)
+		}
+	}
+	if ctx.done.call != nil {
+		ctx.done.call(ctx.done.data, e, m, _ferr(err))
+	}
+	free(ctx, e.allocator)
+}
+
+@(private)
+_mounts_settle :: proc(e: ^Engine) {
+	if !e.plug.reg_on {
+		return
+	}
+	for mt in e.plug.mounts {
+		if err := fs.mount_run(&mt.mount); err != .None {
+			_log(e, .Warn, "mount pass failed")
+		}
+		_mount_touched(e, mt)
 	}
 }
 

@@ -1,6 +1,7 @@
 package engine
 
 import "base:runtime"
+import "core:slice"
 import "core:strings"
 import "../fs"
 import "../journal"
@@ -102,21 +103,24 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 	if terr != .None {
 		return _oerr(terr)
 	}
-	for k, v in e.reg.staged {
+	for k in _sorted_keys(e.reg.staged) {
+		v := e.reg.staged[k]
 		key := k
 		if err := omap.txn_put(t, ROOT_OBJECTS, key[:], v); err != .None {
 			omap.txn_abort(t)
 			return _oerr(err)
 		}
 	}
-	for k, v in e.reg.sstaged {
+	for k in _sorted_keys(e.reg.sstaged) {
+		v := e.reg.sstaged[k]
 		key := k
 		if err := omap.txn_put(t, ROOT_SPACES, key[:], v); err != .None {
 			omap.txn_abort(t)
 			return _oerr(err)
 		}
 	}
-	for k, v in e.reg.pending {
+	for k in _sorted_keys(e.reg.pending) {
+		v := e.reg.pending[k]
 		key := k
 		if v < 0 {
 			if _, err := omap.txn_delete(t, ROOT_PENDING, key[:]); err != .None {
@@ -680,4 +684,19 @@ _xerr :: proc "contextless" (e: search.Error) -> Error {
 		return .Io
 	}
 	return .Io
+}
+
+@(private)
+_sorted_keys :: proc(m: map[$K]$V) -> []K {
+	keys := make([]K, len(m), context.temp_allocator)
+	i := 0
+	for k in m {
+		keys[i] = k
+		i += 1
+	}
+	slice.sort_by(keys, proc(a, b: K) -> bool {
+		x, y := a, b
+		return runtime.memory_compare(&x, &y, size_of(K)) < 0
+	})
+	return keys
 }

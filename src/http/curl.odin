@@ -57,11 +57,12 @@ curl_init :: proc(h: ^Curl, l: ^prim.Loop, allocator := context.allocator) -> bo
 	h.pool_max = 16
 	h.recv_buf = 0
 	h.send_buf = 16384
-	if curl.global_init(curl.GLOBAL_ALL) != .E_OK {
+	if !curl.load() {
 		return false
 	}
 	h.multi = curl.multi_init()
 	if h.multi == nil {
+		curl.unload()
 		return false
 	}
 	h.live = make(map[Id]^Curl_Transfer, allocator)
@@ -103,6 +104,7 @@ curl_destroy :: proc(h: ^Curl) {
 		prim.timer_cancel(h.loop, h.timer)
 		h.timer = 0
 	}
+	loaded := h.multi != nil
 	if h.multi != nil {
 		curl.multi_cleanup(h.multi)
 	}
@@ -114,6 +116,9 @@ curl_destroy :: proc(h: ^Curl) {
 		delete(h.ca_file, h.allocator)
 	}
 	h^ = {}
+	if loaded {
+		curl.unload()
+	}
 }
 
 curl_client :: proc(h: ^Curl) -> Client {
