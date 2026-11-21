@@ -1,0 +1,646 @@
+package rt
+
+import "base:runtime"
+import "core:mem/virtual"
+import "../agent"
+import "../convo"
+import eng "../engine"
+import "../journal"
+import "../obj"
+import "../observe"
+import "../odb"
+import "../prim"
+
+Run_State :: enum u8 {
+	Preparing,
+	Running,
+	Stopping,
+	Finished,
+}
+
+Run_Tool :: struct {
+	id:      string,
+	name:    string,
+	parent:  string,
+	index:   u32,
+	input:   string,
+	call:    observe.Tool_Call,
+	has_obs: bool,
+	token:   u64,
+	done:    bool,
+	scope:   int,
+}
+
+Run_Perm :: struct {
+	id:    string,
+	block: Rid,
+}
+
+Run :: struct {
+	r:            ^Runtime,
+	arena:        virtual.Arena,
+	alloc:        runtime.Allocator,
+	o:            Object,
+	ai:           Agent_Info,
+	state:        Run_State,
+	user:         Rid,
+	parent:       Rid,
+	reply:        Rid,
+	claim:        Rid,
+	text:         string,
+	files:        []agent.Attachment,
+	revive:       bool,
+	attempt:      u8,
+	cur:          i64,
+	cur_kind:     convo.Block_Kind,
+	tools:        [dynamic]Run_Tool,
+	perms:        [dynamic]Run_Perm,
+	steered:      [dynamic]Rid,
+	usage:        convo.Usage,
+	cost:         f64,
+	steps:        int,
+	status:       convo.Seal_Status,
+	error:        string,
+	checkpoint:   string,
+	native_items: [dynamic]u8,
+	interrupting: bool,
+	kill_timer:   prim.Timer,
+	budget_timer: prim.Timer,
+	superseded:   bool,
+	by:           Rid,
+	cancelled:    bool,
+	proc_:        ^Proc,
+	native:       ^Native,
+	ws:           ^Worktree,
+	sub:          eng.Sub_Id,
+	raw:          journal.Journal,
+	raw_open:     bool,
+	started_ms:   i64,
+	token:        string,
+	sealed:       bool,
+	pinned:       bool,
+}
+
+@(private)
+RAW_STDOUT :: u8(1)
+@(private)
+RAW_STDERR :: u8(2)
+@(private)
+RAW_STDIN :: u8(3)
+@(private)
+RAW_META :: u8(4)
+@(private)
+RAW_HTTP :: u8(5)
+
+run_find :: proc(r: ^Runtime, o: Object) -> ^Run {
+	for run in r.runs {
+		if run.o == o {
+			return run
+		}
+	}
+	return nil
+}
+
+@(private)
+_run_new :: proc(r: ^Runtime, o: Object) -> ^Run {
+	run := new(Run, r.allocator)
+	run.r = r
+	run.o = o
+	run.cur = -1
+	if !_arena_init(&run.arena) {
+		free(run, r.allocator)
+		return nil
+	}
+	run.alloc = virtual.arena_allocator(&run.arena)
+	run.tools = make([dynamic]Run_Tool, run.alloc)
+	run.perms = make([dynamic]Run_Perm, run.alloc)
+	run.steered = make([dynamic]Rid, run.alloc)
+	run.native_items = make([dynamic]u8, run.alloc)
+	run.started_ms = wall_ms(r)
+	append(&r.runs, run)
+	return run
+}
+
+@(private)
+_run_free :: proc(run: ^Run) {
+	r := run.r
+	l := eng.loop(r.e)
+	if run.kill_timer != 0 {
+		prim.timer_cancel(l, run.kill_timer)
+	}
+	if run.budget_timer != 0 {
+		prim.timer_cancel(l, run.budget_timer)
+	}
+	for &t in run.tools {
+		if t.has_obs {
+			observe.tool_call_destroy(&t.call)
+		}
+	}
+	if run.raw_open {
+		journal.journal_commit(&run.raw)
+		journal.journal_close(&run.raw)
+		run.raw_open = false
+	}
+	if run.sub != 0 {
+		eng.unsubscribe(r.e, run.sub)
+	}
+	if len(run.token) > 0 {
+		serve_revoke(r, run.token)
+	}
+	if run.pinned {
+		eng.unpin(r.e, run.o)
+	}
+	for x, i in r.runs {
+		if x == run {
+			ordered_remove(&r.runs, i)
+			break
+		}
+	}
+	virtual.arena_destroy(&run.arena)
+	free(run, r.allocator)
+}
+
+@(private)
+_writer :: proc(run: ^Run) -> ^convo.Writer {
+	w, err := eng.convo_writer(run.r.e, run.o)
+	if err != .None {
+		return nil
+	}
+	return w
+}
+
+run_raw :: proc(run: ^Run, kind: u8, data: []u8) {
+	r := run.r
+	if !run.raw_open {
+		id := run.o.id
+		path := concat(r.e.pack_root, "/raw/", hex(id))
+		dir := prim.dir_name(path)
+		prim.mkdir_all(eng.vfs(r.e), dir, 0o700)
+		if journal.journal_open(&run.raw, eng.vfs(r.e), path, {}, r.allocator) != .None {
+			return
+		}
+		run.raw_open = true
+		meta := make(Buf, context.temp_allocator)
+		append(&meta, RAW_META)
+		c := rid_bytes(run.claim)
+		append(&meta, ..c)
+		journal.journal_append(&run.raw, meta[:])
+	}
+	body := make([]u8, len(data) + 1, context.temp_allocator)
+	body[0] = kind
+	copy(body[1:], data)
+	journal.journal_append(&run.raw, body)
+	r.stats.raw_lines += 1
+}
+
+run_raw_commit :: proc(run: ^Run) {
+	if run.raw_open {
+		journal.journal_commit(&run.raw)
+	}
+}
+
+run_text :: proc(run: ^Run, kind: convo.Block_Kind, text: string) {
+	if len(text) == 0 || run.sealed {
+		return
+	}
+	w := _writer(run)
+	if w == nil {
+		return
+	}
+	if run.cur >= 0 && run.cur_kind == kind {
+		if convo.writer_chunk(w, run.reply, u32(run.cur), transmute([]u8)text) == .None {
+			return
+		}
+	}
+	idx, err := convo.writer_block(w, run.reply, kind, transmute([]u8)text)
+	if err != .None {
+		return
+	}
+	run.cur = i64(idx)
+	run.cur_kind = kind
+}
+
+run_block :: proc(run: ^Run, kind: convo.Block_Kind, data: []u8, id := "", name := "", failed := false) -> (index: u32, off: i64, ok: bool) {
+	if run.sealed {
+		return 0, 0, false
+	}
+	w := _writer(run)
+	if w == nil {
+		return 0, 0, false
+	}
+	inline_ok := !(kind == .Tool_Result || kind == .Image || kind == .File) || len(data) <= convo.INLINE_MAX
+	if inline_ok {
+		convo.writer_flush(w)
+		before := obj.writer_len(&w.core)
+		idx, err := convo.writer_block(w, run.reply, kind, data, id, name, failed)
+		if err == .Too_Large {
+			return run_blob_block(run, kind, data, id, name, failed)
+		}
+		if err != .None {
+			return 0, 0, false
+		}
+		run.cur = i64(idx)
+		run.cur_kind = kind
+		convo.writer_flush(w)
+		return idx, before, true
+	}
+	return run_blob_block(run, kind, data, id, name, failed)
+}
+
+run_blob_block :: proc(run: ^Run, kind: convo.Block_Kind, data: []u8, id := "", name := "", failed := false) -> (index: u32, off: i64, ok: bool) {
+	r := run.r
+	db, derr := eng.device_odb(r.e)
+	if derr != .None {
+		return 0, 0, false
+	}
+	oid, werr := odb.write(db, .Blob, data)
+	if werr != .None {
+		return 0, 0, false
+	}
+	n := 32 if db.format == .Sha256 else 20
+	preview, _ := utf8_clip(string(data), convo.INLINE_MAX)
+	blob := convo.Blob {
+		oid     = clone_bytes(oid[:n], context.temp_allocator),
+		size    = u64(len(data)),
+		preview = transmute([]u8)preview,
+	}
+	w := _writer(run)
+	if w == nil {
+		return 0, 0, false
+	}
+	convo.writer_flush(w)
+	before := obj.writer_len(&w.core)
+	idx, err := convo.writer_block_ref(w, run.reply, kind, blob, id, name, failed)
+	if err != .None {
+		return 0, 0, false
+	}
+	run.cur = -1
+	return idx, before, true
+}
+
+run_notice :: proc(run: ^Run, text: string) {
+	run_block(run, .Notice, transmute([]u8)text)
+	run.cur = -1
+}
+
+run_error :: proc(run: ^Run, text: string) {
+	if len(text) == 0 {
+		return
+	}
+	run_block(run, .Error, transmute([]u8)text)
+	run.cur = -1
+	if len(run.error) == 0 {
+		run.error = clone(text, run.alloc)
+	}
+}
+
+run_usage :: proc(run: ^Run, u: agent.Usage) {
+	run.usage.input += u.input_tokens
+	run.usage.output += u.output_tokens
+	run.usage.cache_read += u.cache_read_tokens
+	run.usage.cache_write += u.cache_write_tokens
+	run.cost += u.cost_usd
+	_run_budget_check(run)
+}
+
+run_tool_started :: proc(run: ^Run, id, name, input, parent: string) {
+	for t in run.tools {
+		if t.id == id {
+			return
+		}
+	}
+	bid := id
+	if len(parent) > 0 {
+		bid = concat(parent, "/", id)
+	}
+	idx, _, ok := run_block(run, .Tool_Call, transmute([]u8)input, bid, name)
+	if !ok {
+		return
+	}
+	t := Run_Tool {
+		id     = clone(id, run.alloc),
+		name   = clone(name, run.alloc),
+		parent = clone(parent, run.alloc),
+		index  = idx,
+		input  = clone(input, run.alloc),
+		scope  = -1,
+	}
+	if run.ws != nil {
+		observe.tool_call_init(&t.call, id, transmute([]u8)input, run.ws.root, true, run.alloc)
+		t.has_obs = true
+		t.scope = worktree_tool_open(run.ws, run, id)
+	}
+	append(&run.tools, t)
+	run.r.stats.tool_calls += 1
+}
+
+run_tool_input :: proc(run: ^Run, id: string, delta: string) {
+	for &t in run.tools {
+		if t.id != id {
+			continue
+		}
+		if run.cur == i64(t.index) && run.cur_kind == .Tool_Call {
+			if w := _writer(run); w != nil {
+				convo.writer_chunk(w, run.reply, t.index, transmute([]u8)delta)
+			}
+		}
+		t.input = concat(t.input, delta)
+		t.input = clone(t.input, run.alloc)
+		return
+	}
+}
+
+run_tool_finished :: proc(run: ^Run, id: string, output: string, is_error: bool) {
+	name := ""
+	for &t in run.tools {
+		if t.id == id {
+			if t.done {
+				return
+			}
+			t.done = true
+			name = t.name
+			if t.scope >= 0 && run.ws != nil {
+				worktree_tool_close(run.ws, run, t.scope)
+				t.scope = -1
+			}
+			break
+		}
+	}
+	run_block(run, .Tool_Result, transmute([]u8)output, id, name, is_error)
+	run.cur = -1
+}
+
+run_permission :: proc(run: ^Run, id, tool, title, input: string, answered: bool) {
+	b := make(Buf, context.temp_allocator)
+	append(&b, '{')
+	jw_kstr(&b, "tool", tool)
+	jw_kstr(&b, "title", title)
+	jw_kraw(&b, "input", input if len(input) > 0 else "{}")
+	append(&b, '}')
+	_, off, ok := run_block(run, .Permission, b[:], id, tool)
+	run.cur = -1
+	if !ok {
+		return
+	}
+	if answered {
+		run_block(run, .Permission_Answer, transmute([]u8)string("auto"), id, tool)
+		run.cur = -1
+		return
+	}
+	append(&run.perms, Run_Perm{id = clone(id, run.alloc), block = Rid{run.reply.seg, off}})
+}
+
+@(private)
+_run_budget_check :: proc(run: ^Run) {
+	b := run.ai.budget
+	if run.interrupting || run.state != .Running {
+		return
+	}
+	over := false
+	if b.tokens > 0 && run.usage.input + run.usage.output + run.usage.cache_read + run.usage.cache_write >= b.tokens {
+		over = true
+	}
+	if b.usd > 0 && run.cost >= b.usd {
+		over = true
+	}
+	if b.turns > 0 && run.steps >= b.turns {
+		over = true
+	}
+	if over {
+		run_notice(run, "budget exhausted")
+		run_interrupt(run)
+	}
+}
+
+@(private)
+_on_budget_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	run := (^Run)(data)
+	run.budget_timer = 0
+	if run.state == .Running && !run.interrupting {
+		run_notice(run, "time budget exhausted")
+		run_interrupt(run)
+	}
+}
+
+run_interrupt :: proc(run: ^Run) {
+	if run.interrupting || run.state == .Finished {
+		return
+	}
+	run.interrupting = true
+	if run.proc_ != nil {
+		proc_interrupt(run.proc_)
+	} else if run.native != nil {
+		native_interrupt(run.native)
+	} else {
+		run_finish(run, .Interrupted)
+		return
+	}
+	if run.kill_timer == 0 {
+		run.kill_timer = prim.timer(eng.loop(run.r.e), run.r.cfg.interrupt_ms, run, _on_kill_timer)
+	}
+}
+
+@(private)
+_on_kill_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	run := (^Run)(data)
+	run.kill_timer = 0
+	if run.state == .Finished {
+		return
+	}
+	if run.proc_ != nil {
+		run_notice(run, "the agent did not stop in time and was killed")
+		proc_kill(run.proc_)
+		return
+	}
+	run_finish(run, .Interrupted)
+}
+
+run_finish :: proc(run: ^Run, status: convo.Seal_Status) {
+	if run.state == .Finished {
+		return
+	}
+	r := run.r
+	run.state = .Finished
+	run.status = status
+	if run.superseded {
+		run.status = .Cancelled
+	}
+	for &t in run.tools {
+		if !t.done {
+			t.done = true
+			if t.token != 0 {
+				tool_abort(r, t.token)
+			}
+			if t.scope >= 0 && run.ws != nil {
+				worktree_tool_close(run.ws, run, t.scope)
+			}
+			run_block(run, .Tool_Result, transmute([]u8)string("The tool call did not complete before the turn ended."), t.id, t.name, true)
+		}
+	}
+	files: []convo.File_Delta
+	if run.ws != nil {
+		files = worktree_finish(run.ws, run, !run.superseded)
+	}
+	w := _writer(run)
+	if w != nil {
+		native := run.checkpoint
+		if len(run.native_items) > 0 {
+			native = string(run.native_items[:])
+		}
+		convo.writer_seal(w, run.reply, run.status, run.usage, native, run.claim.off)
+		run.sealed = true
+		if run.superseded {
+			convo.writer_superseded(w, run.claim, run.by)
+		} else if run.ws != nil {
+			convo.writer_landed(w, run.claim, files)
+		}
+	}
+	_awaits_settle(r, run.o)
+	run_raw_commit(run)
+	eng.catalog_usage(r.e, run.o, run.usage)
+	usage_rollup(r, run.o, run.usage)
+	state_run_clear(r, run.o)
+	r.stats.runs_finished += 1
+	p := run.proc_
+	if p != nil {
+		proc_turn_done(p, run)
+	}
+	if run.native != nil {
+		native_done(run.native, run)
+	}
+	_reply_hooks(r, run.o, run.reply, run.status)
+	o := run.o
+	kept := false
+	for x in r.procs {
+		kept ||= x == p && x.ws == run.ws
+	}
+	if run.ws != nil && !kept {
+		worktree_close(run.ws)
+	}
+	run.ws = nil
+	_run_free(run)
+	_queue_eval(r, o)
+}
+
+@(private)
+_run_abandon :: proc(run: ^Run) {
+	if run.proc_ != nil {
+		p := run.proc_
+		p.run = nil
+		run.proc_ = nil
+		_proc_free(p, true)
+	}
+	if run.native != nil {
+		native_free(run.native)
+		run.native = nil
+	}
+	if run.ws != nil {
+		worktree_close(run.ws)
+		run.ws = nil
+	}
+	run_raw_commit(run)
+	_run_free(run)
+}
+
+run_steer_accepted :: proc(run: ^Run, id: string) {
+	for s, i in run.steered {
+		if rid_uuid(s) == id {
+			rid := s
+			if w := _writer(run); w != nil {
+				convo.writer_unqueue(w, rid, .Steered, run.reply)
+			}
+			ordered_remove(&run.steered, i)
+			return
+		}
+	}
+}
+
+run_steer_dropped :: proc(run: ^Run, id: string) {
+	for s, i in run.steered {
+		if rid_uuid(s) == id {
+			ordered_remove(&run.steered, i)
+			return
+		}
+	}
+}
+
+run_steered :: proc(run: ^Run, item: Rid) -> bool {
+	for s in run.steered {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+seal_native :: proc(v: ^obj.View, m: ^convo.Message, allocator := context.temp_allocator) -> string {
+	if len(m.seal_native) > 0 {
+		return m.seal_native
+	}
+	if obj.rid_none(m.seal) {
+		return ""
+	}
+	x, xerr := obj.vref(v, m.seal)
+	if xerr != .None {
+		return ""
+	}
+	body, _, gerr := obj.get(v, x.seg, x.off)
+	if gerr != .None || obj.is_redacted(body) {
+		return ""
+	}
+	rec, derr := convo.decode_record(body, x.off, context.temp_allocator)
+	if derr != .None {
+		return ""
+	}
+	if s, ok := rec.body.(convo.Seal); ok {
+		return clone(s.native_msg, allocator)
+	}
+	return ""
+}
+
+usage_rollup :: proc(r: ^Runtime, o: Object, u: convo.Usage) {
+	if u == {} {
+		return
+	}
+	cur := o
+	for _ in 0 ..< 64 {
+		c, found, err := eng.catalog_get(r.e, cur, context.temp_allocator)
+		if err != .None || !found || prim.id_is_zero(c.parent.object) || c.parent.object == cur.id {
+			return
+		}
+		cur = Object{o.space, c.parent.object}
+		eng.catalog_usage(r.e, cur, u)
+	}
+}
+
+@(private)
+_awaits_settle :: proc(r: ^Runtime, o: Object) {
+	items, err := eng.convo_intents(r.e, o, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	for it in items {
+		if it.kind != .Await || it.by != r.self {
+			continue
+		}
+		live := false
+		for w in r.awaits {
+			live ||= w.caller == o && w.item == it.item
+		}
+		if live {
+			continue
+		}
+		if w := _writer_of(r, o); w != nil {
+			convo.writer_unqueue(w, it.item, .Rejected)
+		}
+	}
+}
+
+@(private)
+_writer_of :: proc(r: ^Runtime, o: Object) -> ^convo.Writer {
+	w, err := eng.convo_writer(r.e, o)
+	if err != .None {
+		return nil
+	}
+	return w
+}
