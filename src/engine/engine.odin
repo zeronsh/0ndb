@@ -257,6 +257,7 @@ Engine :: struct {
 	index:        search.Index,
 	index_open:   bool,
 	index_dirty:  [dynamic]Index_Item,
+	index_busy:   bool,
 	db:           odb.Odb,
 	db_open:      bool,
 	pack_more:    bool,

@@ -131,6 +131,15 @@ _index_settle :: proc(e: ^Engine) {
 }
 
 @(private)
+_ix_busy :: proc(e: ^Engine, err: search.Error) -> bool {
+	if err == .Busy {
+		e.index_busy = true
+		return true
+	}
+	return false
+}
+
+@(private)
 _index_durable :: proc(data: rawptr, source: prim.Id) -> i64 {
 	return max(i64)
 }
@@ -184,8 +193,14 @@ _index_step :: proc(e: ^Engine) {
 		if err != .None {
 			continue
 		}
+		e.index_busy = false
 		used, more := _scan_object(e, h, budget)
 		budget -= used
+		if e.index_busy {
+			append(&e.index_dirty, ..items[i:])
+			_touch(e)
+			return
+		}
 		if more {
 			append(&e.index_dirty, it)
 			_touch(e)
@@ -400,7 +415,9 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 					text        = b.text,
 					embed       = e.cfg.embedder.embed != nil && b.kind == .Text,
 				}
-				search.add(&e.index, src, next, &doc)
+				if _ix_busy(e, search.add(&e.index, src, at, &doc)) {
+					return used, true
+				}
 			}
 		} else {
 			env, derr := obj.decode_envelope(body, at)
@@ -419,7 +436,9 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 				if id, iok := omap.value_id(put.key); iok {
 					for f in put.fields {
 						if f.tag == u32(omap.Catalog_Tag.Title) && utf8.valid_string(string(f.value)) {
-							search.set_title(&e.index, src, next, id, device, f.hlc, u8(Kind.Conversation), string(f.value))
+							if _ix_busy(e, search.set_title(&e.index, src, at, id, device, f.hlc, u8(Kind.Conversation), string(f.value))) {
+								return used, true
+							}
 						}
 					}
 				}
@@ -430,7 +449,9 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 				copy(slot, put.key)
 				prim.put_u32le(slot[len(put.key):], f.tag)
 				if len(f.value) == 0 || !utf8.valid_string(string(f.value)) {
-					search.delete_slot(&e.index, src, next, h.id, slot)
+					if _ix_busy(e, search.delete_slot(&e.index, src, at, h.id, slot)) {
+						return used, true
+					}
 					continue
 				}
 				doc := search.Doc {
@@ -443,12 +464,16 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 					hlc         = f.hlc,
 					text        = f.value,
 				}
-				search.add(&e.index, src, next, &doc)
+				if _ix_busy(e, search.add(&e.index, src, at, &doc)) {
+					return used, true
+				}
 			}
 		}
 		e.stats.indexed += 1
 	}
-	search.advance(&e.index, src, pos)
+	if _ix_busy(e, search.advance(&e.index, src, pos)) {
+		return used, true
+	}
 	return used, false
 }
 
@@ -486,7 +511,7 @@ _index_text :: proc(e: ^Engine, h: ^Handle) {
 		text        = data,
 		embed       = e.cfg.embedder.embed != nil,
 	}
-	search.add(&e.index, src, _own_len(h), &doc)
+	_ix_busy(e, search.add(&e.index, src, _own_len(h), &doc))
 }
 
 @(private)
@@ -544,10 +569,12 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 			append(&out, search.Span{byte_lo = u64(lo), byte_hi = u64(hi), line_lo = l0, line_hi = line, scope = s.id.actor})
 			at = hi
 		}
-		search.set_spans(&e.index, src, i64(to), _file_key(h.id, path), out[:])
+		if _ix_busy(e, search.set_spans(&e.index, src, pos, _file_key(h.id, path), out[:])) {
+			return used, true
+		}
 	}
-	if len(ids) == 0 {
-		search.advance(&e.index, src, i64(to))
+	if _ix_busy(e, search.advance(&e.index, src, i64(to))) {
+		return used, true
 	}
 	return max(used, 1), to < end
 }

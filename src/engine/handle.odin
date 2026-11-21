@@ -675,6 +675,14 @@ _handle_want :: proc(h: ^Handle) -> (fetched: bool) {
 @(private)
 _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tries := 0) -> Error {
 	fetched := _handle_want(h)
+	if !fetched && h.sp.repl_on {
+		for sg in h.segs {
+			if !sg.in_view {
+				fetched = true
+				break
+			}
+		}
+	}
 	if !fetched || !h.sp.repl_on {
 		return .Missing
 	}
