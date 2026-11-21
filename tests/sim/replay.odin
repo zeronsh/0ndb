@@ -17,8 +17,14 @@ Image_File :: struct {
 	dsize:   int,
 }
 
+Disk_State :: struct {
+	disk: string,
+	hash: u64,
+}
+
 Disk_Images :: struct {
-	files: [dynamic]Image_File,
+	files:  [dynamic]Image_File,
+	states: [dynamic]Disk_State,
 }
 
 @(private = "file")
@@ -44,8 +50,10 @@ world_disks :: proc(w: ^World) -> []^Disk {
 disk_images_take :: proc(w: ^World, out: ^Disk_Images, label: string) {
 	h := runtime.heap_allocator()
 	out.files = make([dynamic]Image_File, h)
+	out.states = make([dynamic]Disk_State, h)
 	dump, dumping := os.lookup_env("SIM_DISK_DUMP", context.temp_allocator)
 	for d in world_disks(w) {
+		append(&out.states, Disk_State{disk = strings.clone(d.name, h), hash = disk_full_hash(d)})
 		files := make([dynamic]Disk_File, context.temp_allocator)
 		disk_walk(d, &files)
 		for f in files {
@@ -79,6 +87,10 @@ disk_images_free :: proc(im: ^Disk_Images) {
 		delete(f.durable, h)
 	}
 	delete(im.files)
+	for st in im.states {
+		delete(st.disk, h)
+	}
+	delete(im.states)
 }
 
 @(private = "file")
@@ -145,6 +157,14 @@ disk_images_compare :: proc(a, b: ^Disk_Images, out: ^[dynamic]string) -> (same:
 			i += 1
 			j += 1
 		}
+	}
+	for k in 0 ..< max(len(a.states), len(b.states)) {
+		if k < len(a.states) && k < len(b.states) && a.states[k] == b.states[k] {
+			continue
+		}
+		same = false
+		name := a.states[k].disk if k < len(a.states) else b.states[k].disk
+		note(out, &reported, fmt.aprintf("determinism: disk %s state differs between two runs of the same seed (inodes including unlinked ones, pending writes, metadata ops, modes, times, links or directory entries)", name, allocator = h))
 	}
 	if reported > IMAGE_REPORT_MAX {
 		append(out, fmt.aprintf("determinism: %d more differing files not listed", reported - IMAGE_REPORT_MAX, allocator = h))

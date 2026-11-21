@@ -1601,6 +1601,60 @@ disk_digest :: proc(d: ^Disk) -> u64 {
 	return h
 }
 
+disk_full_hash :: proc(d: ^Disk) -> u64 {
+	inos := make([dynamic]u64, context.temp_allocator)
+	for k in d.inodes {
+		append(&inos, k)
+	}
+	slice.sort(inos[:])
+	h := mix64(0x6469736b, d.next_ino)
+	for k in inos {
+		n := d.inodes[k]
+		h = mix64(h, k)
+		h = mix64(h, u64(n.kind) | u64(n.mode) << 8 | u64(n.nlink) << 40)
+		h = mix64(h, u64(n.mtime_ns))
+		h = mix64(h, u64(n.ctime_ns))
+		h = mix_bytes(h, n.data[:])
+		h = mix_bytes(h, n.durable[:])
+		h = mix64(h, u64(len(n.pend)))
+		for p in n.pend {
+			h = mix64(h, u64(p.kind))
+			h = mix64(h, u64(p.off))
+			h = mix64(h, u64(p.size))
+			h = mix_bytes(h, p.bytes)
+		}
+		h = mix_str(h, n.target)
+		h = _mix_entries(h, n.entries)
+		h = _mix_entries(h, n.dentries)
+	}
+	h = mix64(h, u64(len(d.meta)))
+	for m in d.meta {
+		h = mix64(h, u64(m.kind))
+		h = mix64(h, m.dir)
+		h = mix_str(h, m.name)
+		h = mix64(h, m.ino)
+		h = mix64(h, m.dir2)
+		h = mix_str(h, m.name2)
+		h = mix64(h, m.gone)
+	}
+	return h
+}
+
+@(private = "file")
+_mix_entries :: proc(h: u64, entries: map[string]u64) -> u64 {
+	names := make([dynamic]string, context.temp_allocator)
+	for k in entries {
+		append(&names, k)
+	}
+	slice.sort(names[:])
+	x := mix64(h, u64(len(names)))
+	for k in names {
+		x = mix_str(x, k)
+		x = mix64(x, entries[k])
+	}
+	return x
+}
+
 trace_path :: proc(path: string) -> string {
 	out := path
 	for marker in ([]string{"/.tmp_", "/tmp_obj_"}) {

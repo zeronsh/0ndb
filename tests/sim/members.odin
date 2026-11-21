@@ -346,8 +346,7 @@ membership_run :: proc(seed: u64) -> (res: Mem_Result) {
 	cfg.io_rate = 0
 	cfg.byzantine = false
 	cfg.bulk = false
-	cfg.drain_wall_s = 30
-	cfg.rss_max = 3072
+	cfg.mem_max = 3072
 	cfg.storage = .Stored
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
