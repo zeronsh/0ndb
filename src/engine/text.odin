@@ -271,7 +271,7 @@ _hist_read :: proc(data: rawptr, stream: prim.Id, off: i64, out: ^[dynamic]u8) -
 		body, _, err := journal.record_at(&s.jr, off)
 		if err == .Redacted {
 			synth, st := _hist_replacement(h, s, off)
-			if st != .Found {
+			if st == .Missing {
 				return false
 			}
 			clear(out)
@@ -493,12 +493,8 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 		_index_item_add(e, h.sp.id, h.id, h.kind)
 		return
 	}
-	for r in _text_own_records(e, h, own[:]) {
-		if _redact_intent(e, h, e.self, r[0], r[1]) != .None {
-			return
-		}
-	}
-	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator)
+	ctx := Text_Plan{e = e, h = h}
+	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator, _text_plan(&ctx))
 	if err != .None {
 		_log(e, .Warn, "own history redaction failed")
 		return

@@ -39,10 +39,8 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	if len(ops) == 0 {
 		return .None
 	}
-	for r in _text_own_records(e, h, ops[:]) {
-		_redact_intent(e, h, e.self, r[0], r[1]) or_return
-	}
-	res, rerr := fs.history_redact(h.hist, ops[:], context.temp_allocator)
+	ctx := Text_Plan{e = e, h = h}
+	res, rerr := fs.history_redact(h.hist, ops[:], context.temp_allocator, _text_plan(&ctx))
 	_ferr(rerr) or_return
 	for r in res.ranges {
 		_own_redacted(e, h, r.from, r.to)
@@ -300,41 +298,23 @@ _own_puncture :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
 }
 
 @(private)
-_text_own_records :: proc(e: ^Engine, h: ^Handle, spans: []crdt.Op_Span) -> [][2]i64 {
-	out := make([dynamic][2]i64, context.temp_allocator)
-	hist := h.hist
-	if hist == nil || fs.history_wake(hist) != .None {
-		return out[:]
-	}
-	r: journal.Reader
-	journal.journal_reader(&hist.journal, &r, context.temp_allocator)
-	defer journal.reader_close(&r)
-	seen := make(map[u64]bool, context.temp_allocator)
-	for sp in spans {
-		if sp.id.actor != e.self {
-			continue
-		}
-		got := 0
-		for got < sp.len {
-			lv, ok := crdt.graph_lv(&hist.g, crdt.Op_Id{sp.id.actor, sp.id.seq + u64(got)})
-			if !ok {
-				break
-			}
-			first, n, stream, off, found := fs.history_batch_at(hist, lv)
-			if !found {
-				break
-			}
-			got += max(n - int(lv - first), 1)
-			if stream != 0 || seen[off] {
-				continue
-			}
-			seen[off] = true
-			if _, next, je := journal.record_at(&r, i64(off)); je == .None {
-				append(&out, [2]i64{i64(off), next})
+Text_Plan :: struct {
+	e: ^Engine,
+	h: ^Handle,
+}
+
+@(private)
+_text_plan :: proc(ctx: ^Text_Plan) -> fs.Redact_Plan {
+	call :: proc(data: rawptr, ranges: []journal.Range) -> fs.Error {
+		c := (^Text_Plan)(data)
+		for r in ranges {
+			if _redact_intent(c.e, c.h, c.e.self, r.from, r.to) != .None {
+				return .Io
 			}
 		}
+		return .None
 	}
-	return out[:]
+	return fs.Redact_Plan{data = ctx, call = call}
 }
 
 @(private)
