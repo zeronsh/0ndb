@@ -1,4 +1,3 @@
-/target
-.0ndb/
-node_modules/
-playground/ui/dist/
+/bin/
+*.bin
+*.o
