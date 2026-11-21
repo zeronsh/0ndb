@@ -226,10 +226,6 @@ ondb_info :: proc "c" (s: ^Session) -> u32 {
 			o_bool(&o, "keys", sg.tree_ok)
 			o_u64(&o, "epoch", sg.epoch)
 			o_bool(&o, "card", sg.device in s.identities)
-			o_i64(&o, "data", _have_end(sg.data))
-			o_i64(&o, "keys_have", _have_end(sg.keys))
-			o_i64(&o, "keys_relay", sg.keys.relay_len)
-			o_i64(&o, "head_have", _have_end(sg.head) if sg.head != nil else -1)
 			o_end(&o)
 		}
 		o_end(&o)

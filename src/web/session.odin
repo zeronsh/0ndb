@@ -1199,7 +1199,6 @@ _card_want :: proc(s: ^Session, device: prim.Id) {
 		_card_landed(s, rm)
 	}
 	_remote_tail(s, rm, CARD_TAIL)
-	_remote_follow(s, rm, false)
 }
 
 @(private)
