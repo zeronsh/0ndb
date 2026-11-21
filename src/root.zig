@@ -60,6 +60,8 @@ pub const sync = struct {
     pub const wire = @import("sync/wire.zig");
     pub const relay = @import("sync/relay.zig");
     pub const client = @import("sync/client.zig");
+    pub const keyring = @import("sync/keyring.zig");
+    pub const lease = @import("sync/lease.zig");
 };
 
 pub const playground = struct {
