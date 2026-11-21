@@ -138,3 +138,19 @@ export function groupThreadsByHierarchy<T extends V2ThreadSummaryLike>(threads: 
   for (const t of threads) walk(t, t.depth)
   return out
 }
+
+export function mailboxDrainPath(threadId: string): string {
+  return `/api/v2/threads/${threadId}/mailbox/drain`
+}
+
+export function resolveForkActionProjectId(
+  projectId: string,
+  projectSpaceIds: readonly string[],
+  spaces: readonly { space_id: string; origin_space_id: string | null }[],
+  forkByOrigin: Record<string, string>,
+): string {
+  const spaceById = new Map(spaces.map(s => [s.space_id, s]))
+  const hasForkSpace = projectSpaceIds.some(sid => Boolean(spaceById.get(sid)?.origin_space_id))
+  if (hasForkSpace) return projectId
+  return forkByOrigin[projectId] ?? projectId
+}

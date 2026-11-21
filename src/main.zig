@@ -102,6 +102,7 @@ const GlobalOpts = struct {
     target_dir: []u8,
     discovered_repo: bool,
     db_path: []u8,
+    db_explicit: bool,
     home_dir: ?[]u8,
 
     fn deinit(self: *GlobalOpts, allocator: Allocator) void {
@@ -261,10 +262,13 @@ fn runMain(allocator: Allocator, io: Io, raw_args: std.process.Args, out: anytyp
     errdefer if (!opts_owned) allocator.free(target_dir);
 
     var db_path: []u8 = undefined;
+    var db_explicit = false;
     if (db_flag) |dbf| {
         db_path = try allocator.dupe(u8, dbf);
+        db_explicit = true;
     } else if (env_db != null and env_db.?.len > 0) {
         db_path = try allocator.dupe(u8, env_db.?);
+        db_explicit = true;
     } else if (discovered_repo or dir_flag != null) {
         db_path = try std.fmt.allocPrint(allocator, "{s}/.0ndb/v2", .{target_dir});
     } else if (home_dir) |h| {
@@ -277,6 +281,7 @@ fn runMain(allocator: Allocator, io: Io, raw_args: std.process.Args, out: anytyp
         .target_dir = target_dir,
         .discovered_repo = discovered_repo,
         .db_path = db_path,
+        .db_explicit = db_explicit,
         .home_dir = home_dir,
     };
     opts_owned = true;
@@ -354,10 +359,66 @@ fn runMain(allocator: Allocator, io: Io, raw_args: std.process.Args, out: anytyp
     }
 }
 
+fn rejectExtraArgs(args: *ArgSlice) !void {
+    if (args.next() != null) return UsageError.InvalidArgument;
+}
+
+const V2Layout = struct {
+    resources_path: []u8,
+    spaces_path: []u8,
+    checkouts_path: []u8,
+    projects_path: []u8,
+    catalog_path: []u8,
+    leases_path: []u8,
+    threads_path: []u8,
+
+    fn init(allocator: Allocator, io: Io, root: []const u8) !V2Layout {
+        try ensureDir0700(io, root);
+        const resources_path = try std.fmt.allocPrint(allocator, "{s}/resources", .{root});
+        errdefer allocator.free(resources_path);
+        const spaces_path = try std.fmt.allocPrint(allocator, "{s}/spaces", .{root});
+        errdefer allocator.free(spaces_path);
+        const checkouts_path = try std.fmt.allocPrint(allocator, "{s}/checkouts", .{root});
+        errdefer allocator.free(checkouts_path);
+        const projects_path = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+        errdefer allocator.free(projects_path);
+        const catalog_path = try std.fmt.allocPrint(allocator, "{s}/catalog", .{root});
+        errdefer allocator.free(catalog_path);
+        const leases_path = try std.fmt.allocPrint(allocator, "{s}/leases", .{root});
+        errdefer allocator.free(leases_path);
+        const threads_path = try std.fmt.allocPrint(allocator, "{s}/threads", .{root});
+        errdefer allocator.free(threads_path);
+
+        try ensureDir0700(io, checkouts_path);
+        try ensureDir0700(io, catalog_path);
+
+        return .{
+            .resources_path = resources_path,
+            .spaces_path = spaces_path,
+            .checkouts_path = checkouts_path,
+            .projects_path = projects_path,
+            .catalog_path = catalog_path,
+            .leases_path = leases_path,
+            .threads_path = threads_path,
+        };
+    }
+
+    fn deinit(self: *V2Layout, allocator: Allocator) void {
+        allocator.free(self.resources_path);
+        allocator.free(self.spaces_path);
+        allocator.free(self.checkouts_path);
+        allocator.free(self.projects_path);
+        allocator.free(self.catalog_path);
+        allocator.free(self.leases_path);
+        allocator.free(self.threads_path);
+    }
+};
+
 const V2State = struct {
     allocator: Allocator,
     io: Io,
     db_dir: Io.Dir,
+    catalog_dir: Io.Dir,
     resources: *ondb.fs.pool.DaemonResources,
     spaces: ondb.space.manager.SpaceManager,
     projects: ondb.project.ProjectStore,
@@ -369,63 +430,51 @@ const V2State = struct {
     device_id: u128,
 
     fn open(allocator: Allocator, io: Io, db_path: []const u8) !*V2State {
-        try ensureDir0700(io, db_path);
-        const checkouts_path = try std.fmt.allocPrint(allocator, "{s}/checkouts", .{db_path});
-        defer allocator.free(checkouts_path);
-        try ensureDir0700(io, checkouts_path);
+        var layout = try V2Layout.init(allocator, io, db_path);
+        defer layout.deinit(allocator);
 
         var db_dir = try Io.Dir.cwd().openDir(io, db_path, .{ .iterate = true });
         errdefer db_dir.close(io);
 
-        var runner_id: u128 = 0;
-        var device_id: u128 = 0;
-        if (db_dir.openFile(io, "runner.id", .{})) |rf| {
-            defer rf.close(io);
-            var buf: [32]u8 = undefined;
-            if ((rf.readPositionalAll(io, &buf, 0) catch 0) == 32) {
-                runner_id = std.mem.readInt(u128, buf[0..16], .little);
-                device_id = std.mem.readInt(u128, buf[16..32], .little);
-            }
-        } else |_| {}
-        if (runner_id == 0 or device_id == 0) {
-            runner_id = ondb.core.id.newUuidV7(io);
-            device_id = ondb.core.id.newUuidV7(io);
-            var buf: [32]u8 = undefined;
-            std.mem.writeInt(u128, buf[0..16], runner_id, .little);
-            std.mem.writeInt(u128, buf[16..32], device_id, .little);
-            try ondb.store.mmap.atomicWriteFile(io, db_dir, "runner.id", &buf);
-            chmodFile0600(io, db_dir, "runner.id");
-        }
+        var catalog_dir = try Io.Dir.cwd().openDir(io, layout.catalog_path, .{ .iterate = true });
+        errdefer catalog_dir.close(io);
 
         const self = try allocator.create(V2State);
         errdefer allocator.destroy(self);
 
-        const res = try ondb.fs.pool.DaemonResources.init(allocator, io, db_path, .{});
+        const res = try ondb.fs.pool.DaemonResources.init(allocator, io, layout.resources_path, .{});
         errdefer res.deinit();
 
-        var spaces = try ondb.space.manager.SpaceManager.open(allocator, io, db_path, checkouts_path, res);
+        var spaces = try ondb.space.manager.SpaceManager.open(allocator, io, layout.spaces_path, layout.checkouts_path, res);
         errdefer spaces.deinit();
 
-        var projects = try ondb.project.ProjectStore.open(allocator, io, db_path);
+        var projects = try ondb.project.ProjectStore.open(allocator, io, layout.projects_path);
         errdefer projects.deinit();
 
-        var catalog = try ondb.thread.store.CatalogStore.open(allocator, io, db_dir);
+        var catalog = try ondb.thread.store.CatalogStore.open(allocator, io, catalog_dir);
         errdefer catalog.deinit();
 
-        var keyring = ondb.sync.keyring.Keyring.load(allocator, io, db_dir, "keyring.0ndb") catch blk: {
+        var keyring = ondb.sync.keyring.Keyring.load(allocator, io, db_dir, "keyring.bin") catch blk: {
+            const rid = ondb.core.id.newUuidV7(io);
             const root_key = ondb.store.crypto.AccountRootKey.generate(io);
-            const kr = ondb.sync.keyring.Keyring.initAccountDevice(allocator, io, root_key, runner_id);
+            const kr = ondb.sync.keyring.Keyring.initAccountDevice(allocator, io, root_key, rid);
+            try kr.saveAtomic(db_dir, "keyring.bin");
+            chmodFile0600(io, db_dir, "keyring.bin");
             break :blk kr;
         };
         errdefer keyring.deinit();
 
-        var leases = try ondb.sync.lease.LeaseManager.init(allocator, io, db_path, runner_id, null);
+        const runner_id = keyring.runner_id;
+        const device_id = keyring.runner_id;
+
+        var leases = try ondb.sync.lease.LeaseManager.init(allocator, io, layout.leases_path, runner_id, null);
         errdefer leases.deinit();
 
         self.* = .{
             .allocator = allocator,
             .io = io,
             .db_dir = db_dir,
+            .catalog_dir = catalog_dir,
             .resources = res,
             .spaces = spaces,
             .projects = projects,
@@ -443,16 +492,17 @@ const V2State = struct {
             .catalog = &self.catalog,
             .keyring = &self.keyring,
             .leases = &self.leases,
-            .root_dir = db_path,
+            .root_dir = layout.threads_path,
             .runner_id = runner_id,
             .device_id = device_id,
+            .shared_blobs = res.blob_pool,
         });
         return self;
     }
 
     fn persistKeyring(self: *V2State) void {
-        self.keyring.saveAtomic(self.db_dir, "keyring.0ndb") catch {};
-        chmodFile0600(self.io, self.db_dir, "keyring.0ndb");
+        self.keyring.saveAtomic(self.db_dir, "keyring.bin") catch {};
+        chmodFile0600(self.io, self.db_dir, "keyring.bin");
     }
 
     fn deinit(self: *V2State) void {
@@ -461,6 +511,7 @@ const V2State = struct {
         self.leases.deinit();
         self.keyring.deinit();
         self.catalog.deinit();
+        self.catalog_dir.close(self.io);
         self.projects.deinit();
         self.spaces.deinit();
         self.resources.deinit();
@@ -474,6 +525,7 @@ fn parseIdHexOrUsage(s: []const u8) !u128 {
 }
 
 fn resolveSpaceId(mgr: *const ondb.space.manager.SpaceManager, query: []const u8) !u128 {
+    if (query.len == 0) return UsageError.InvalidId;
     if (query.len == 32) {
         if (ondb.core.id.parseIdHex(query)) |sid| {
             if (mgr.get(sid) != null) return sid;
@@ -492,6 +544,7 @@ fn resolveSpaceId(mgr: *const ondb.space.manager.SpaceManager, query: []const u8
 }
 
 fn resolveProjectId(store: *const ondb.project.ProjectStore, query: []const u8) !u128 {
+    if (query.len == 0) return UsageError.InvalidId;
     if (query.len == 32) {
         if (ondb.core.id.parseIdHex(query)) |pid| {
             if (store.get(pid) != null) return pid;
@@ -510,6 +563,7 @@ fn resolveProjectId(store: *const ondb.project.ProjectStore, query: []const u8) 
 }
 
 fn resolveThreadId(allocator: Allocator, rt: *const ondb.thread.runtime.ThreadRuntime, query: []const u8) !u128 {
+    if (query.len == 0) return UsageError.InvalidId;
     if (query.len == 32) {
         return parseIdHexOrUsage(query);
     }
@@ -560,6 +614,7 @@ fn parseSpaceBindingSpec(
 fn parseBatchIdFromEntries(s: []const u8, entries: []const ondb.fs.timeline.TimelineEntry) !ondb.core.id.BatchId {
     const at_pos = std.mem.indexOfScalar(u8, s, '@') orelse return UsageError.InvalidArgument;
     const actor_str = s[0..at_pos];
+    if (actor_str.len == 0) return UsageError.InvalidId;
     const ts_str = s[at_pos + 1 ..];
     const ts = std.fmt.parseInt(u64, ts_str, 10) catch return UsageError.InvalidArgument;
     if (actor_str.len == 32) {
@@ -591,18 +646,17 @@ fn handleSpaceCmd(
     out: anytype,
 ) !void {
     const sub = args.next() orelse return UsageError.MissingArgument;
-    try ensureDir0700(io, opts.db_path);
-    const checkouts_path = try std.fmt.allocPrint(allocator, "{s}/checkouts", .{opts.db_path});
-    defer allocator.free(checkouts_path);
-    try ensureDir0700(io, checkouts_path);
+    var layout = try V2Layout.init(allocator, io, opts.db_path);
+    defer layout.deinit(allocator);
 
-    var res = try ondb.fs.pool.DaemonResources.init(allocator, io, opts.db_path, .{});
+    var res = try ondb.fs.pool.DaemonResources.init(allocator, io, layout.resources_path, .{});
     defer res.deinit();
-    var mgr = try ondb.space.manager.SpaceManager.open(allocator, io, opts.db_path, checkouts_path, res);
+    var mgr = try ondb.space.manager.SpaceManager.open(allocator, io, layout.spaces_path, layout.checkouts_path, res);
     defer mgr.deinit();
 
     if (std.mem.eql(u8, sub, "create-virtual")) {
         const name = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         var rec = try mgr.createVirtual(name);
         defer rec.deinit(allocator);
         var hex: [32]u8 = undefined;
@@ -628,21 +682,28 @@ fn handleSpaceCmd(
                 return UsageError.UnknownFlag;
             }
         }
+        if (path.len == 0 or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) {
+            return UsageError.InvalidArgument;
+        }
+        var probe_dir = Io.Dir.cwd().openDir(io, path, .{}) catch return UsageError.InvalidArgument;
+        probe_dir.close(io);
+        if (kind_req) |kr| {
+            var repo = try ondb.fs.vcs.detect(allocator, io, path);
+            defer repo.deinit(allocator);
+            if (kr == .git_worktree and repo.kind != .git) return UsageError.InvalidArgument;
+            if (kr == .dir and repo.kind == .git) return UsageError.InvalidArgument;
+        }
         const title = name_opt orelse blk: {
             const base = std.fs.path.basename(std.mem.trimEnd(u8, path, "/"));
             break :blk if (base.len > 0) base else "space";
         };
         var rec = try mgr.adoptLocal(path, title);
         defer rec.deinit(allocator);
-        if (kind_req) |kr| {
-            if (kr == .git_worktree and rec.kind != .git_worktree) {
-                return UsageError.InvalidArgument;
-            }
-        }
         var hex: [32]u8 = undefined;
         _ = ondb.core.id.formatIdHex(rec.space_id, &hex);
         try out.print("{s}\t{s}\t{s}\n", .{ hex, @tagName(rec.kind), rec.title });
     } else if (std.mem.eql(u8, sub, "list")) {
+        try rejectExtraArgs(args);
         for (mgr.list()) |rec| {
             var hex: [32]u8 = undefined;
             _ = ondb.core.id.formatIdHex(rec.space_id, &hex);
@@ -655,6 +716,7 @@ fn handleSpaceCmd(
     } else if (std.mem.eql(u8, sub, "read")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const rel = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         if (try mgr.activateProjection(sid)) |p| {
@@ -679,6 +741,7 @@ fn handleSpaceCmd(
             content_owned = try Io.Dir.cwd().readFileAlloc(io, third[1..], allocator, .limited(64 * 1024 * 1024));
             content = content_owned.?;
         }
+        try rejectExtraArgs(args);
         const sp = try mgr.activate(sid);
         const bid = try sp.putFile(sp.actor_id, rel, content);
         if (try mgr.activateProjection(sid)) |p| {
@@ -689,6 +752,7 @@ fn handleSpaceCmd(
     } else if (std.mem.eql(u8, sub, "ls")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const dir_rel = args.next() orelse "";
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         const entries = try sp.listDir(allocator, dir_rel);
@@ -703,6 +767,7 @@ fn handleSpaceCmd(
     } else if (std.mem.eql(u8, sub, "search")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const query = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         const hits = try sp.searchText(allocator, query, null, 200);
@@ -716,6 +781,7 @@ fn handleSpaceCmd(
     } else if (std.mem.eql(u8, sub, "meta-get")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const key = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         if (sp.getMeta(key)) |val| {
@@ -727,6 +793,7 @@ fn handleSpaceCmd(
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const key = args.next() orelse return UsageError.MissingArgument;
         const val = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         const bid = try sp.setMeta(sp.actor_id, key, val);
@@ -735,6 +802,7 @@ fn handleSpaceCmd(
     } else if (std.mem.eql(u8, sub, "meta-ls")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const prefix = args.next() orelse "";
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         const entries = try sp.listMetaPrefix(allocator, prefix);
@@ -764,6 +832,7 @@ fn handleSpaceCmd(
         try out.print("{s}\t{s}\t{s}\n", .{ hex, @tagName(frec.kind), frec.title });
     } else if (std.mem.eql(u8, sub, "sync")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const fork_ids = [_]u128{sid};
         const entries = try ondb.project.SpaceSet.syncSpaceSet(allocator, &mgr, &fork_ids);
@@ -778,6 +847,7 @@ fn handleSpaceCmd(
         }
     } else if (std.mem.eql(u8, sub, "land")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const fork_ids = [_]u128{sid};
         var rep = try ondb.project.SpaceSet.landSpaceSet(allocator, &mgr, &fork_ids);
@@ -799,6 +869,7 @@ fn handleSpaceCmd(
             std.fmt.parseInt(usize, ls, 10) catch return UsageError.InvalidArgument
         else
             30;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         const entries = try ondb.fs.timeline.listEntriesForSpace(allocator, sp, null, limit);
@@ -815,6 +886,7 @@ fn handleSpaceCmd(
     } else if (std.mem.eql(u8, sub, "diff")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const bid_str_opt = args.next();
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         const entries = try ondb.fs.timeline.listEntriesForSpace(allocator, sp, null, 200);
@@ -826,6 +898,7 @@ fn handleSpaceCmd(
         try out.writeAll(diff_bytes);
     } else if (std.mem.eql(u8, sub, "compact")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const sp = try mgr.activate(sid);
         const stats = try sp.compactWithPolicy(.{});
@@ -834,9 +907,9 @@ fn handleSpaceCmd(
         });
     } else if (std.mem.eql(u8, sub, "hibernate")) {
         const sid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const sid = try resolveSpaceId(&mgr, sid_str);
-        const sp = try mgr.activate(sid);
-        sp.hibernate();
+        if (mgr.get(sid) == null) return UsageError.InvalidId;
         const n = mgr.hibernateIdle(ondb.core.id.nowMs(io) + 60_000, 0);
         try out.print("hibernated spaces={d}\n", .{n});
     } else if (std.mem.eql(u8, sub, "remove")) {
@@ -865,16 +938,14 @@ fn handleProjectCmd(
     out: anytype,
 ) !void {
     const sub = args.next() orelse return UsageError.MissingArgument;
-    try ensureDir0700(io, opts.db_path);
-    const checkouts_path = try std.fmt.allocPrint(allocator, "{s}/checkouts", .{opts.db_path});
-    defer allocator.free(checkouts_path);
-    try ensureDir0700(io, checkouts_path);
+    var layout = try V2Layout.init(allocator, io, opts.db_path);
+    defer layout.deinit(allocator);
 
-    var res = try ondb.fs.pool.DaemonResources.init(allocator, io, opts.db_path, .{});
+    var res = try ondb.fs.pool.DaemonResources.init(allocator, io, layout.resources_path, .{});
     defer res.deinit();
-    var mgr = try ondb.space.manager.SpaceManager.open(allocator, io, opts.db_path, checkouts_path, res);
+    var mgr = try ondb.space.manager.SpaceManager.open(allocator, io, layout.spaces_path, layout.checkouts_path, res);
     defer mgr.deinit();
-    var pstore = try ondb.project.ProjectStore.open(allocator, io, opts.db_path);
+    var pstore = try ondb.project.ProjectStore.open(allocator, io, layout.projects_path);
     defer pstore.deinit();
 
     if (std.mem.eql(u8, sub, "create")) {
@@ -898,6 +969,7 @@ fn handleProjectCmd(
         _ = ondb.core.id.formatIdHex(proj.project_id, &hex);
         try out.print("{s}\t{s}\n", .{ hex, proj.title });
     } else if (std.mem.eql(u8, sub, "list")) {
+        try rejectExtraArgs(args);
         for (pstore.list()) |p| {
             var hex: [32]u8 = undefined;
             _ = ondb.core.id.formatIdHex(p.project_id, &hex);
@@ -912,6 +984,7 @@ fn handleProjectCmd(
         const pid_str = args.next() orelse return UsageError.MissingArgument;
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const role = args.next() orelse "default";
+        try rejectExtraArgs(args);
         const pid = try resolveProjectId(&pstore, pid_str);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const rec = mgr.get(sid) orelse return UsageError.InvalidId;
@@ -926,6 +999,7 @@ fn handleProjectCmd(
     } else if (std.mem.eql(u8, sub, "remove-space")) {
         const pid_str = args.next() orelse return UsageError.MissingArgument;
         const sid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const pid = try resolveProjectId(&pstore, pid_str);
         const sid = try resolveSpaceId(&mgr, sid_str);
         const removed = try pstore.removeSpace(pid, sid);
@@ -971,6 +1045,7 @@ fn handleProjectCmd(
         try out.print("{s}\t{s}\tforked_spaces={d}\n", .{ hex, new_proj.title, forked_ids.len });
     } else if (std.mem.eql(u8, sub, "sync")) {
         const pid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const pid = try resolveProjectId(&pstore, pid_str);
         const proj = pstore.get(pid) orelse return UsageError.InvalidId;
         var fork_ids: std.ArrayList(u128) = .empty;
@@ -988,6 +1063,7 @@ fn handleProjectCmd(
         try out.print("synced spaces={d}\n", .{entries.len});
     } else if (std.mem.eql(u8, sub, "land")) {
         const pid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const pid = try resolveProjectId(&pstore, pid_str);
         const proj = pstore.get(pid) orelse return UsageError.InvalidId;
         var fork_ids: std.ArrayList(u128) = .empty;
@@ -1100,6 +1176,7 @@ fn handleThreadCmd(
         const sid_str = args.next() orelse return UsageError.MissingArgument;
         const alias = args.next() orelse return UsageError.MissingArgument;
         const acc_str = args.next() orelse "rw";
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const sid = try resolveSpaceId(&v2.spaces, sid_str);
         const access = try parseSpaceAccess(acc_str);
@@ -1112,6 +1189,7 @@ fn handleThreadCmd(
     } else if (std.mem.eql(u8, sub, "unbind")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
         const sid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const sid = try resolveSpaceId(&v2.spaces, sid_str);
         const removed = try v2.runtime.unbindSpace(tid, sid);
@@ -1119,6 +1197,7 @@ fn handleThreadCmd(
     } else if (std.mem.eql(u8, sub, "send")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
         const prompt = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
 
         var bt = try v2.runtime.beginTurn(tid, prompt, .{});
@@ -1133,6 +1212,7 @@ fn handleThreadCmd(
         try out.print("{s}\tcheckpoints={d}\tepoch={d}\n", .{ mhex, post_cp.entries.len, bt.fencing_epoch });
     } else if (std.mem.eql(u8, sub, "history")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const st = try v2.runtime.openThread(tid);
         const msgs = try st.activeChain(allocator);
@@ -1162,6 +1242,7 @@ fn handleThreadCmd(
     } else if (std.mem.eql(u8, sub, "queue")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
         const prompt = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const qid = try v2.runtime.enqueueMessage(tid, .follow_up, prompt, null, null);
         var qhex: [32]u8 = undefined;
@@ -1170,9 +1251,36 @@ fn handleThreadCmd(
     } else if (std.mem.eql(u8, sub, "branch")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
         const mid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const mid = try parseIdHexOrUsage(mid_str);
-        try v2.runtime.switchBranch(tid, null, mid);
+        const st = try v2.runtime.openThread(tid);
+        var found = false;
+        var parent_id: ?u128 = null;
+        if (st.messages.getPtr(mid)) |msg| {
+            found = true;
+            parent_id = msg.parent_id;
+        } else {
+            var cur_pid: ?ondb.core.id.PageId = st.head_page;
+            var guard: usize = 0;
+            while (cur_pid) |pid| {
+                guard += 1;
+                if (guard > 65536) break;
+                var page = (try st.loadPage(allocator, pid)) orelse break;
+                defer page.deinit(allocator);
+                for (page.messages) |*m| {
+                    if (m.msg_id == mid) {
+                        found = true;
+                        parent_id = m.parent_id;
+                        break;
+                    }
+                }
+                if (found) break;
+                cur_pid = page.prev_page;
+            }
+        }
+        if (!found) return error.MessageNotFound;
+        try v2.runtime.switchBranch(tid, parent_id, mid);
         try out.print("switched branch\n", .{});
     } else {
         return UsageError.UnknownSubcommand;
@@ -1217,7 +1325,7 @@ fn handleCaptainCmd(
             } else if (std.mem.eql(u8, a, "--cents")) {
                 const v = args.next() orelse return UsageError.MissingArgument;
                 const cents = std.fmt.parseInt(u64, v, 10) catch return UsageError.InvalidArgument;
-                max_cost_microusd = cents * 10_000;
+                max_cost_microusd = std.math.mul(u64, cents, 10_000) catch return UsageError.InvalidArgument;
             } else if (std.mem.eql(u8, a, "--space")) {
                 const spec = args.next() orelse return UsageError.MissingArgument;
                 try grants.append(allocator, try parseSpaceBindingSpec(allocator, &v2.spaces, spec));
@@ -1257,6 +1365,7 @@ fn handleCaptainCmd(
         });
     } else if (std.mem.eql(u8, sub, "list")) {
         const parent_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const parent_tid = try resolveThreadId(allocator, &v2.runtime, parent_str);
         const st = try v2.runtime.openThread(parent_tid);
         var it = st.tasks.valueIterator();
@@ -1306,6 +1415,7 @@ fn handleCaptainCmd(
         const task_str = args.next() orelse return UsageError.MissingArgument;
         const status_str = args.next() orelse return UsageError.MissingArgument;
         const summary = args.next() orelse "";
+        try rejectExtraArgs(args);
         const parent_tid = try resolveThreadId(allocator, &v2.runtime, parent_str);
         const task_id = try parseIdHexOrUsage(task_str);
         const status: ondb.thread.model.TaskStatus = if (std.mem.eql(u8, status_str, "completed"))
@@ -1322,6 +1432,7 @@ fn handleCaptainCmd(
     } else if (std.mem.eql(u8, sub, "cancel-tree")) {
         const root_str = args.next() orelse return UsageError.MissingArgument;
         const reason = args.next();
+        try rejectExtraArgs(args);
         const root_tid = try resolveThreadId(allocator, &v2.runtime, root_str);
         const rep = try v2.runtime.cancelTree(root_tid, reason);
         try out.print("canceled threads={d} tasks={d} leases={d}\n", .{
@@ -1330,6 +1441,7 @@ fn handleCaptainCmd(
     } else if (std.mem.eql(u8, sub, "land")) {
         const parent_str = args.next() orelse return UsageError.MissingArgument;
         const task_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const parent_tid = try resolveThreadId(allocator, &v2.runtime, parent_str);
         const task_id = try parseIdHexOrUsage(task_str);
         var rep = try v2.runtime.landSubordinateForks(allocator, parent_tid, task_id);
@@ -1362,6 +1474,7 @@ fn handleTriggerCmd(
         const kind_str = args.next() orelse return UsageError.MissingArgument;
         const spec = args.next() orelse return UsageError.MissingArgument;
         const prompt = args.next() orelse "";
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const now = ondb.core.id.nowMs(io);
 
@@ -1380,13 +1493,14 @@ fn handleTriggerCmd(
             const at_ms: u64 = if (spec.len > 1 and spec[0] == '+') blk: {
                 if (std.mem.endsWith(u8, spec, "ms")) {
                     const d = std.fmt.parseInt(u64, spec[1 .. spec.len - 2], 10) catch return UsageError.InvalidArgument;
-                    break :blk now + d;
+                    break :blk std.math.add(u64, now, d) catch return UsageError.InvalidArgument;
                 } else if (std.mem.endsWith(u8, spec, "s")) {
                     const d = std.fmt.parseInt(u64, spec[1 .. spec.len - 1], 10) catch return UsageError.InvalidArgument;
-                    break :blk now + d * 1000;
+                    const ms = std.math.mul(u64, d, 1000) catch return UsageError.InvalidArgument;
+                    break :blk std.math.add(u64, now, ms) catch return UsageError.InvalidArgument;
                 } else {
                     const d = std.fmt.parseInt(u64, spec[1..], 10) catch return UsageError.InvalidArgument;
-                    break :blk now + d;
+                    break :blk std.math.add(u64, now, d) catch return UsageError.InvalidArgument;
                 }
             } else std.fmt.parseInt(u64, spec, 10) catch return UsageError.InvalidArgument;
             trig.kind = .{ .once = at_ms };
@@ -1423,6 +1537,7 @@ fn handleTriggerCmd(
         try out.print("{s}\t{s}\n", .{ hex, kind_str });
     } else if (std.mem.eql(u8, sub, "list")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const list = try v2.runtime.listTriggers(allocator, tid);
         defer {
@@ -1439,12 +1554,14 @@ fn handleTriggerCmd(
     } else if (std.mem.eql(u8, sub, "disable")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
         const tr_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const tr_id = try parseIdHexOrUsage(tr_str);
         try v2.runtime.disableTrigger(tid, tr_id);
         try out.print("disabled\n", .{});
     } else if (std.mem.eql(u8, sub, "poll")) {
         const tid_str = args.next() orelse return UsageError.MissingArgument;
+        try rejectExtraArgs(args);
         const tid = try resolveThreadId(allocator, &v2.runtime, tid_str);
         const now = ondb.core.id.nowMs(io);
         const due = try v2.runtime.pollDueTriggers(allocator, tid, now);
@@ -1949,6 +2066,7 @@ fn handlePlaygroundCmd(allocator: Allocator, io: Io, opts: *const GlobalOpts, ar
     const port_str = args.next() orelse "4321";
     const port = std.fmt.parseInt(u16, port_str, 10) catch return UsageError.InvalidArgument;
     const dir_arg = args.next();
+    try rejectExtraArgs(args);
 
     var default_dir: ?[]u8 = null;
     defer if (default_dir) |d| allocator.free(d);
@@ -1958,7 +2076,10 @@ fn handlePlaygroundCmd(allocator: Allocator, io: Io, opts: *const GlobalOpts, ar
     };
     try ensureDir0700(io, dir);
 
-    var srv = try ondb.playground.server.PlaygroundServer.start(allocator, io, dir, port);
+    var srv = try ondb.playground.server.PlaygroundServer.startWithConfig(allocator, io, dir, port, .{
+        .default_access = ondb.playground.server.resolveDefaultAccess(allocator, io),
+        .v2_root = if (opts.db_explicit) opts.db_path else null,
+    });
     defer srv.deinit();
 
     installStopSignalHandlers();

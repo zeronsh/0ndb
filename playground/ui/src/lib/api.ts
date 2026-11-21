@@ -1,4 +1,5 @@
 import type { SpliceOp, TextSplice } from './splices'
+import { mailboxDrainPath } from './v2'
 
 export type { SpliceOp, TextSplice }
 
@@ -281,7 +282,8 @@ const q = encodeURIComponent
 
 export const api = {
   info: () => request<Info>('/api/info'),
-  models: (provider: string, refresh = false) => request<Catalog>(`/api/models?provider=${q(provider)}&refresh=${refresh ? 1 : 0}`),
+  models: (provider: string, refresh = false) =>
+    refresh ? post<Catalog>('/api/models/refresh', { provider }) : request<Catalog>(`/api/models?provider=${q(provider)}`),
   allModels: () => request<{ catalogs: Partial<Record<ProviderSlug, Catalog>> }>('/api/models/all'),
   sessions: () => request<{ sessions: Session[] }>('/api/sessions'),
   createThread: (title: string, provider: string, model: string | null, worktreeId?: string | null) =>
@@ -573,7 +575,7 @@ export const apiV2 = {
   removeProjectSpace: (projectId: string, spaceId: string) =>
     del<{ ok: boolean; removed: boolean }>(`/api/v2/projects/${projectId}/spaces/${spaceId}`),
   forkProject: (projectId: string, titlePrefix = 'fork') =>
-    post<{ project_id: string; forked_space_ids: string[] }>(`/api/v2/projects/${projectId}/fork`, { title_prefix: titlePrefix }),
+    post<{ project_id: string; fork_project_id: string; project?: V2Project; forked_space_ids: string[] }>(`/api/v2/projects/${projectId}/fork`, { title_prefix: titlePrefix }),
   syncProject: (projectId: string, forkIds?: string[]) =>
     post<{ synced: { space_id: string; origin_space_id: string; brought: number; merged_count: number; conflict_count: number }[] }>(
       `/api/v2/projects/${projectId}/sync`,
@@ -683,9 +685,14 @@ export const apiV2 = {
       { reason },
     ),
 
-  mailbox: (threadId: string, drain = false) =>
+  mailbox: (threadId: string) =>
     request<{ thread_id: string; unread_count: number; items: V2MailboxItem[] }>(
-      `/api/v2/threads/${threadId}/mailbox${drain ? '?drain=1' : ''}`,
+      `/api/v2/threads/${threadId}/mailbox`,
+    ),
+  drainMailbox: (threadId: string) =>
+    post<{ ok: boolean; thread_id: string; drained: boolean; unread_count: number; items: V2MailboxItem[] }>(
+      mailboxDrainPath(threadId),
+      {},
     ),
   postMailbox: (
     threadId: string,
