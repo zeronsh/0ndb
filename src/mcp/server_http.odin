@@ -19,6 +19,9 @@ Http_Server_Config :: struct {
 	retry_ms:          i64,
 	log_bytes:         int,
 	logs_per_session:  int,
+	sse_path:          string,
+	message_path:      string,
+	no_legacy_sse:     bool,
 }
 
 @(private)
@@ -38,6 +41,7 @@ Hs_Log :: struct {
 	done:   bool,
 	primed: bool,
 	used:   i64,
+	batch_left: int,
 }
 
 @(private)
@@ -46,6 +50,7 @@ Hs_Session :: struct {
 	conn:     Conn_Id,
 	used:     i64,
 	get:      ^Hs_Conn,
+	old_sse:  bool,
 }
 
 @(private)
@@ -76,6 +81,7 @@ Hs_Conn :: struct {
 	closed:      bool,
 	needs_next:  bool,
 	poll_t:      prim.Timer,
+	batch_left:  int,
 }
 
 Http_Server :: struct {
@@ -105,6 +111,12 @@ http_server_open :: proc(hs: ^Http_Server, s: ^Server, loop: ^prim.Loop, cfg: Ht
 	}
 	if hs.cfg.path == "" {
 		hs.cfg.path = "/mcp"
+	}
+	if hs.cfg.sse_path == "" {
+		hs.cfg.sse_path = "/sse"
+	}
+	if hs.cfg.message_path == "" {
+		hs.cfg.message_path = "/message"
 	}
 	if hs.cfg.max_body <= 0 {
 		hs.cfg.max_body = DEFAULT_MAX_BODY
@@ -273,10 +285,17 @@ _hs_close_conn :: proc(tc: ^Hs_Conn) {
 			break
 		}
 	}
-	for &s in hs.sessions {
+	old_session := -1
+	for &s, i in hs.sessions {
 		if s.get == tc {
 			s.get = nil
+			if s.old_sse {
+				old_session = i
+			}
 		}
+	}
+	if old_session >= 0 {
+		_hs_drop_session(hs, old_session)
 	}
 	if tc.w != 0 {
 		prim.unwatch(hs.loop, tc.w)
@@ -532,7 +551,8 @@ _hs_request :: proc(tc: ^Hs_Conn) {
 	if q := strings.index_byte(target, '?'); q >= 0 {
 		target = target[:q]
 	}
-	if target != hs.cfg.path {
+	legacy_sse := !hs.cfg.no_legacy_sse && (target == hs.cfg.sse_path || target == hs.cfg.message_path) && target != hs.cfg.path
+	if target != hs.cfg.path && !legacy_sse {
 		_hs_simple(tc, 404, "")
 		return
 	}
@@ -556,6 +576,10 @@ _hs_request :: proc(tc: ^Hs_Conn) {
 		}
 	}
 	authz, _ := http_header(headers, "authorization")
+	if legacy_sse {
+		_hs_legacy_sse(tc, target, authz)
+		return
+	}
 	sid, has_sid := http_header(headers, "mcp-session-id")
 	switch p.method {
 	case "POST":
@@ -696,6 +720,18 @@ _hs_request :: proc(tc: ^Hs_Conn) {
 		tc.session_hdr = strings.clone(new_session.id, hs.server.allocator)
 	}
 	tc.state = .Waiting
+	tc.batch_left = 0
+	if json_kind(body) == .Array && conn != hs.modern {
+		if count := server_batch_responses(body); count > 0 {
+			tc.batch_left = count
+			log: ^Hs_Log
+			if _hs_resumable(hs, conn) {
+				log = _hs_log(hs, conn, tc.stream, true)
+				log.batch_left = count
+			}
+			_hs_start_sse(tc, log)
+		}
+	}
 	meta := Http_Meta{headers = headers}
 	res := server_feed(hs.server, conn, tc.stream, tc.body[:], &meta if is_modern else nil, authz)
 	if tc.closed {
@@ -716,7 +752,65 @@ _hs_request :: proc(tc: ^Hs_Conn) {
 
 @(private)
 _hs_resumable :: proc(hs: ^Http_Server, conn: Conn_Id) -> bool {
-	return !hs.cfg.no_resume && conn != hs.modern && server_conn_version(hs.server, conn) >= .V2025_03_26
+	if hs.cfg.no_resume || conn == hs.modern || server_conn_version(hs.server, conn) < .V2025_03_26 {
+		return false
+	}
+	for s in hs.sessions {
+		if s.conn == conn {
+			return !s.old_sse
+		}
+	}
+	return false
+}
+
+@(private)
+_hs_legacy_sse :: proc(tc: ^Hs_Conn, target: string, authz: string) {
+	hs := tc.hs
+	p := &tc.parser
+	if target == hs.cfg.sse_path {
+		if p.method != "GET" {
+			_hs_simple(tc, 405, "", true, {{"Allow", "GET"}})
+			return
+		}
+		sess := _hs_new_session(hs)
+		sess.old_sse = true
+		sess.get = tc
+		tc.is_get = true
+		tc.mcp = sess.conn
+		tc.stream = 0
+		tc.state = .Streaming
+		_hs_sse_head(tc)
+		ev := make(Buf, context.temp_allocator)
+		append(&ev, "event: endpoint\ndata: ")
+		append(&ev, hs.cfg.message_path)
+		append(&ev, "?sessionId=")
+		append(&ev, sess.id)
+		append(&ev, "\n\n")
+		frame := make(Buf, context.temp_allocator)
+		http_write_chunk(&frame, ev[:])
+		_hs_write(tc, frame[:])
+		return
+	}
+	if p.method != "POST" {
+		_hs_simple(tc, 405, "", true, {{"Allow", "POST"}})
+		return
+	}
+	sid, ok := query_param(p.target, "sessionId")
+	sess := _hs_session(hs, sid) if ok else nil
+	if sess == nil || !sess.old_sse || sess.get == nil {
+		_hs_simple(tc, 404, _hs_error_body(JSONRPC_INVALID_REQUEST, "session not found"))
+		return
+	}
+	if tc.too_big {
+		_hs_simple(tc, 413, _hs_error_body(JSONRPC_INVALID_REQUEST, "request too large"), false)
+		return
+	}
+	sess.used = prim.mono_ns()
+	conn := sess.conn
+	body := make([]u8, len(tc.body), context.temp_allocator)
+	copy(body, tc.body[:])
+	_hs_simple(tc, 202, "")
+	server_feed(hs.server, conn, 0, body, nil, authz)
 }
 
 @(private)
@@ -974,6 +1068,38 @@ _hs_sink :: proc(data: rawptr, s: ^Server, conn: Conn_Id, stream: Stream_Id, bod
 	tc := _hs_find(hs, conn, stream)
 	if tc != nil && tc.closed {
 		tc = nil
+	}
+	final := final
+	left: ^int
+	if blog := _hs_log(hs, conn, stream, false); blog != nil && blog.batch_left > 0 {
+		left = &blog.batch_left
+	} else if tc != nil && tc.batch_left > 0 {
+		left = &tc.batch_left
+	}
+	if left != nil && final {
+		left^ -= 1
+		if tc != nil && left != &tc.batch_left {
+			tc.batch_left = left^
+		}
+		final = left^ == 0
+		if len(body) == 0 {
+			if final {
+				if l := _hs_log(hs, conn, stream, false); l != nil {
+					l.done = true
+				}
+				if tc != nil {
+					frame := make(Buf, context.temp_allocator)
+					append(&frame, "0\r\n\r\n")
+					_hs_write(tc, frame[:])
+					if !tc.closed {
+						_hs_finish(tc)
+					}
+				}
+			}
+			return
+		}
+	} else if final && len(body) == 0 {
+		return
 	}
 	if _hs_resumable(hs, conn) && !(tc != nil && tc.state == .Waiting && final) {
 		log := _hs_log(hs, conn, stream, true)

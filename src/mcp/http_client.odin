@@ -710,6 +710,10 @@ http_client_close :: proc(hc: ^Http_Client) {
 		http.cancel(&hc.http, hc.oauth.handle)
 		hc.oauth.handle = 0
 	}
+	if hc.oauth != nil && hc.oauth.refresh_t != 0 {
+		prim.timer_cancel(hc.loop, hc.oauth.refresh_t)
+		hc.oauth.refresh_t = 0
+	}
 	for len(hc.streams) > 0 {
 		s := hc.streams[len(hc.streams) - 1]
 		_hc_cancel(hc, s)

@@ -17,6 +17,16 @@ Stdio_Server :: struct {
 	closed:    bool,
 	on_close:  proc(data: rawptr, ss: ^Stdio_Server),
 	data:      rawptr,
+	batches:   [dynamic]Ss_Batch,
+	next_batch: u64,
+}
+
+@(private)
+Ss_Batch :: struct {
+	stream:   Stream_Id,
+	expected: int,
+	got:      int,
+	buf:      Buf,
 }
 
 stdio_server_open :: proc(ss: ^Stdio_Server, s: ^Server, loop: ^prim.Loop, in_fd := prim.Fd(0), out_fd := prim.Fd(1), on_close: proc(data: rawptr, ss: ^Stdio_Server) = nil, data: rawptr = nil, max_line := DEFAULT_MAX_LINE) -> prim.Error {
@@ -27,6 +37,8 @@ stdio_server_open :: proc(ss: ^Stdio_Server, s: ^Server, loop: ^prim.Loop, in_fd
 	ss.out_fd = out_fd
 	ss.on_close = on_close
 	ss.data = data
+	ss.batches = make([dynamic]Ss_Batch, s.allocator)
+	ss.next_batch = 1
 	prim.line_buffer_init(&ss.lb, 64 * 1024, max_line, s.allocator)
 	ss.conn = server_conn_open(s, Server_Sink{data = ss, send = _ss_send}, false)
 	prim.set_nonblocking(in_fd)
@@ -53,6 +65,36 @@ _ss_send :: proc(data: rawptr, s: ^Server, conn: Conn_Id, stream: Stream_Id, bod
 	if ss.closed && ss.out_fd == prim.INVALID_FD {
 		return
 	}
+	if final && stream != 0 {
+		for &bt, i in ss.batches {
+			if bt.stream != stream {
+				continue
+			}
+			bt.got += 1
+			if len(body) > 0 {
+				w_sep(&bt.buf)
+				append(&bt.buf, ..body)
+			}
+			if bt.got < bt.expected {
+				return
+			}
+			out := make(Buf, 0, len(bt.buf) + 2, context.temp_allocator)
+			append(&out, '[')
+			append(&out, ..bt.buf[:])
+			append(&out, ']')
+			delete(bt.buf)
+			ordered_remove(&ss.batches, i)
+			if len(out) > 2 {
+				_ss_write(ss, out[:])
+			}
+			return
+		}
+	}
+	_ss_write(ss, body)
+}
+
+@(private)
+_ss_write :: proc(ss: ^Stdio_Server, body: []u8) {
 	nl := [1]u8{'\n'}
 	if ss.sync_out {
 		prim.write_all(ss.out_fd, body)
@@ -114,7 +156,18 @@ _ss_read :: proc(ss: ^Stdio_Server) {
 			if len(text) == 0 {
 				continue
 			}
-			server_feed(ss.server, ss.conn, 0, transmute([]u8)text)
+			if json_kind(text) == .Array {
+				count := server_batch_responses(text)
+				stream := Stream_Id(0)
+				if count > 0 {
+					stream = Stream_Id(1 << 48 + ss.next_batch)
+					ss.next_batch += 1
+					append(&ss.batches, Ss_Batch{stream = stream, expected = count, buf = make(Buf, ss.server.allocator)})
+				}
+				server_feed(ss.server, ss.conn, stream, transmute([]u8)text)
+			} else {
+				server_feed(ss.server, ss.conn, 0, transmute([]u8)text)
+			}
 			if ss.closed {
 				return
 			}
@@ -166,4 +219,8 @@ stdio_server_destroy :: proc(ss: ^Stdio_Server) {
 	}
 	out_destroy(&ss.outq)
 	prim.line_buffer_destroy(&ss.lb)
+	for bt in ss.batches {
+		delete(bt.buf)
+	}
+	delete(ss.batches)
 }

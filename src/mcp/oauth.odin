@@ -75,6 +75,8 @@ Oauth :: struct {
 	refreshed:        bool,
 	step_ups:         int,
 	authorize_url:    string,
+	refresh_t:        prim.Timer,
+	proactive:        bool,
 }
 
 @(private)
@@ -113,6 +115,9 @@ _oa_destroy :: proc(hc: ^Http_Client) {
 	}
 	if o.handle != 0 {
 		http.cancel(&hc.http, o.handle)
+	}
+	if o.refresh_t != 0 {
+		prim.timer_cancel(hc.loop, o.refresh_t)
 	}
 	delete(o.req_body, hc.allocator)
 	for s in ([]string{o.cfg.redirect_uri, o.cfg.client_name, o.cfg.client_uri, o.cfg.scope, o.cfg.client_id, o.cfg.client_secret, o.cfg.client_issuer, o.cfg.client_metadata_url, o.cfg.application_type, o.challenge_scope, o.resource, o.prm_scopes, o.issuer, o.authorization_ep, o.token_ep, o.registration_ep, o.auth_methods, o.as_scopes, o.client_id, o.client_secret, o.client_auth, o.verifier, o.state, o.requested_scope, o.access_token, o.refresh_token, o.granted_scope, o.authorize_url}) {
@@ -457,6 +462,12 @@ _oa_on_done :: proc(data: rawptr, id: http.Id, err: http.Error, detail: string) 
 			if was_refresh {
 				_oa_set(hc, &o.refresh_token, "")
 				_oa_save_tokens(hc)
+				if o.proactive && len(hc.auth_wait) == 0 {
+					o.proactive = false
+					o.phase = .Idle
+					return
+				}
+				o.proactive = false
 				_oa_discover(hc)
 				return
 			}
@@ -929,10 +940,12 @@ _oa_take_tokens :: proc(hc: ^Http_Client, body: string) {
 		_oa_set(hc, &o.granted_scope, o.requested_scope)
 	}
 	o.refreshed = false
+	o.proactive = false
 	o.step_ups = 0
 	o.phase = .Idle
 	_oa_apply(hc)
 	_oa_save_tokens(hc)
+	_oa_arm_refresh(hc)
 	e := Event{kind = .Authorized, message = o.granted_scope}
 	_hc_event(hc, &hc.client, &e)
 	http_client_retry_auth(hc)
@@ -1002,4 +1015,29 @@ _oa_load_tokens :: proc(hc: ^Http_Client) {
 	o.expires_at, _ = json_get_int(saved, "expires_at")
 	_oa_set(hc, &o.requested_scope, o.granted_scope)
 	_oa_apply(hc)
+	_oa_arm_refresh(hc)
+}
+
+@(private)
+_oa_arm_refresh :: proc(hc: ^Http_Client) {
+	o := hc.oauth
+	if o.refresh_t != 0 {
+		prim.timer_cancel(hc.loop, o.refresh_t)
+		o.refresh_t = 0
+	}
+	if o.refresh_token == "" || o.token_ep == "" || o.expires_at <= 0 || hc.closing {
+		return
+	}
+	remaining := o.expires_at - prim.now_ms()
+	margin := min(i64(30_000), max(remaining / 5, 0))
+	o.refresh_t = prim.timer(hc.loop, max(remaining - margin, 0), hc, proc(l: ^prim.Loop, data: rawptr) {
+		hc := (^Http_Client)(data)
+		o := hc.oauth
+		o.refresh_t = 0
+		if o.phase != .Idle || o.refresh_token == "" || hc.closing {
+			return
+		}
+		o.proactive = true
+		_oa_refresh(hc)
+	})
 }

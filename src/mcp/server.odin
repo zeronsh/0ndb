@@ -135,6 +135,7 @@ Active :: struct {
 	in_handler: bool,
 	done:       bool,
 	task:       ^Server_Task,
+	in_batch:   bool,
 	sub_tasks:  [dynamic]string,
 	tool_input: string,
 }
@@ -176,6 +177,7 @@ Server :: struct {
 	schemas:   jsonschema.Registry,
 	reg_ready: bool,
 	dead:      int,
+	batching:  bool,
 }
 
 Feed_Result :: enum u8 {
@@ -712,10 +714,71 @@ _cancel_active :: proc(s: ^Server, ref: Ref, notify_client: bool) {
 			i += 1
 		}
 	}
+	conn, stream, in_batch := a.conn, a.stream, a.in_batch
 	_remove_active(s, a)
+	if in_batch && stream != 0 {
+		_send(s, conn, stream, nil, true, 200)
+	}
 	if is_call && s.cfg.handlers.cancel != nil {
 		s.cfg.handlers.cancel(s.cfg.handlers.data, s, ref)
 	}
+}
+
+server_batch_responses :: proc(raw: string) -> int {
+	if json_kind(raw) != .Array {
+		return 0
+	}
+	n := 0
+	it, _ := json_array(raw)
+	for item in json_next_item(&it) {
+		m, ok := message_parse(item)
+		if !ok || m.kind == .Request || m.kind == .Invalid {
+			n += 1
+		}
+	}
+	if n == 0 && json_trim(raw) == "[]" {
+		return 1
+	}
+	return n
+}
+
+@(private)
+_feed_batch :: proc(s: ^Server, c: ^Conn, stream: Stream_Id, raw: string, authorization: string) -> Feed_Result {
+	it, _ := json_array(raw)
+	first, has := json_next_item(&it)
+	if !has {
+		_reply_error(s, c.id, stream, "null", JSONRPC_INVALID_REQUEST, "empty batch", "", 400)
+		return .Rejected
+	}
+	_ = first
+	if !c.legacy {
+		_reply_error(s, c.id, stream, "null", JSONRPC_INVALID_REQUEST, "batches are not part of this protocol version", "", 400)
+		return .Rejected
+	}
+	conn := c.id
+	items := make([dynamic]string, context.temp_allocator)
+	it2, _ := json_array(raw)
+	for item in json_next_item(&it2) {
+		append(&items, strings.clone(item, context.temp_allocator))
+	}
+	requests := false
+	for item in items {
+		if _conn(s, conn) == nil {
+			break
+		}
+		m, ok := message_parse(item)
+		if !ok || m.kind == .Request || m.kind == .Invalid {
+			requests = true
+		}
+		if json_kind(item) == .Array {
+			_reply_error(s, conn, stream, "null", JSONRPC_INVALID_REQUEST, "nested batch", "", 400)
+			continue
+		}
+		s.batching = true
+		server_feed(s, conn, stream, transmute([]u8)item, nil, authorization)
+		s.batching = false
+	}
+	return .Request if requests else .Accepted
 }
 
 server_is_live :: proc(s: ^Server, ref: Ref) -> bool {
@@ -762,8 +825,7 @@ server_feed :: proc(s: ^Server, conn: Conn_Id, stream: Stream_Id, raw: []u8, htt
 		return .Rejected
 	}
 	if json_kind(string(raw)) == .Array {
-		_reply_error(s, conn, stream, "null", JSONRPC_INVALID_REQUEST, "batch requests are not supported", "", 400)
-		return .Rejected
+		return _feed_batch(s, c, stream, string(raw), authorization)
 	}
 	switch m.kind {
 	case .Invalid:
@@ -1309,6 +1371,7 @@ _start :: proc(s: ^Server, c: ^Conn, stream: Stream_Id, m: ^Message, req: ^Reque
 	a.handler = handler
 	a.hdata = hdata
 	a.authz = _sclone(s, req.authorization)
+	a.in_batch = s.batching
 	a.sub_uris = make([dynamic]string, s.allocator)
 	if req.progress {
 		tok, _ := json_get(req.meta, "progressToken")
