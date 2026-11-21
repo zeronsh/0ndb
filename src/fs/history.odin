@@ -115,6 +115,7 @@ History :: struct {
 	lvidx:      prim.Fd,
 	lvidx_n:    u64,
 	markers:    [dynamic]Git_Marker,
+	views:      [dynamic]^Text_View,
 }
 
 history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams := Stream_Source{}, allocator := context.allocator, opts := History_Options{}) -> Error {
@@ -392,6 +393,7 @@ history_sleep :: proc(h: ^History) {
 	if !h.awake {
 		return
 	}
+	views_stale(h)
 	history_unload_files(h)
 	fstree.destroy(&h.tree)
 	crdt.graph_destroy(&h.g)
@@ -668,6 +670,7 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 		encode_file_record(&buf, &rec)
 		ino := op_inode(h, op.target)
 		kv_put(&h.kv, inode_key("f", ino), buf[:]) or_return
+		views_stale(h, ino)
 		if f, ok := h.files[ino]; ok {
 			file_free(h, f)
 			delete_key(&h.files, ino)
@@ -1396,6 +1399,7 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 		f.dirty = true
 		note_touched(h, ino)
 		crdt.log_add_batch(&f.log, &h.g, b, t, first, skip)
+		views_feed(h, ino, b, t, first, skip)
 	}
 	lvidx_add(h, first, n - skip, stream, off)
 	apply_tree_ops(h, b, first, skip, stream, off) or_return

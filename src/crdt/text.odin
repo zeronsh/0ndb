@@ -32,6 +32,13 @@ Merge :: struct {
 	conflicts: ^[dynamic]Conflict,
 	first:     int,
 	err:       Error,
+	sink:      Text_Sink,
+}
+
+Text_Sink :: struct {
+	data:   rawptr,
+	insert: proc(data: rawptr, pos: int, bytes: []u8, author: Op_Id),
+	delete: proc(data: rawptr, pos: int, bytes: []u8),
 }
 
 @(private)
@@ -358,6 +365,13 @@ doc_insert :: proc(m: ^Merge, pos: int, data: []u8, actor: u32, seq: u64, red :=
 		override_add(m.t, actor, seq, aactor, aseq, len(data))
 	}
 	conflict_shift(m, true, at, len(data))
+	if m.sink.insert != nil {
+		author := Op_Id{m.g.actors[actor], seq}
+		if aactor != NO_ACTOR {
+			author = Op_Id{m.g.actors[aactor], aseq}
+		}
+		m.sink.insert(m.sink.data, at, data, author)
+	}
 }
 
 @(private)
@@ -417,6 +431,11 @@ doc_delete :: proc(m: ^Merge, pos: int, n: int) {
 	k := min(n, text_len(m.t) - at)
 	if k <= 0 {
 		return
+	}
+	if m.sink.delete != nil {
+		gone := make([]u8, k, context.temp_allocator)
+		rope_read(&m.t.rope, at, gone)
+		m.sink.delete(m.sink.data, at, gone)
 	}
 	rope_delete(&m.t.rope, at, k)
 	run_delete(&m.t.spans, at, k, &m.t.ids if m.t.ids_on else nil)
@@ -481,13 +500,14 @@ apply_direct :: proc(m: ^Merge, p: Piece) {
 	}
 }
 
-text_merge :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv, conflicts: ^[dynamic]Conflict = nil) -> Error {
+text_merge :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv, conflicts: ^[dynamic]Conflict = nil, sink := Text_Sink{}) -> Error {
 	m := Merge {
 		t         = t,
 		g         = g,
 		log       = log,
 		target    = v,
 		conflicts = conflicts,
+		sink      = sink,
 	}
 	if conflicts != nil {
 		m.first = len(conflicts)

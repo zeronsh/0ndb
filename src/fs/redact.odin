@@ -254,6 +254,7 @@ own_records :: proc(h: ^History, spans: []crdt.Op_Span, records: ^[dynamic][2]i6
 
 @(private)
 apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span, targets: ^[dynamic]odb.Oid, protect: ^[dynamic]odb.Oid) -> (files: int, err: Error) {
+	views_stale(h)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	for x in also {
 		touched[op_inode(h, x.id)] = false

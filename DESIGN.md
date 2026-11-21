@@ -308,6 +308,22 @@ Text (Eg-walker with Fugue):
   interleave (Fugue-max).
 - Anchors `(op id, offset, bias)` resolve to positions through the spans or,
   for deleted text, through the transient state.
+- The rope keeps two summed metrics per node: bytes and UTF-16 code units
+  (continuation bytes count 0, four-byte leads 2, every other byte 1), so
+  byte and UTF-16 offsets convert in O(log n) at any char boundary.
+- A merge can report every step it applies through a `Text_Sink`:
+  `insert(pos, bytes, author)` and `delete(pos, bytes)` in the coordinates of
+  the text at that moment, in order. Replayed in order they turn the old text
+  into the new one exactly; nothing compares texts.
+- `Delta` (pure): a `Delta_Builder` composes sink steps into one canonical
+  retain/delete/insert list against the old text (a gap buffer at the last
+  step, so ascending or descending runs cost O(1) per step), regions are
+  widened to whole UTF-8 code points on both sides (at most three bytes per
+  side, reading retained bytes from the new text), and emitted in bytes or
+  UTF-16 units with the author of every inserted run. `delta_transform` is
+  the inclusion transform for two concurrent deltas over the same text (the
+  first argument's inserts win ties), `delta_transform_pos` maps a position,
+  `delta_apply` replays one.
 - Conflict detection: concurrent ops whose ranges overlap in the merged
   result are reported as regions (for review and land), while the merge
   itself still converges.
@@ -392,6 +408,97 @@ equal in both directions.
   exactly that scope's ops, transformed through everything since.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
+- **Text views**: `history_view_open(inode, version)` gives a caller its own
+  text state (rope, spans, op log) at a version, cloned from the loaded file
+  when the versions match, else checkpoint plus replay. Every batch the
+  history applies to that inode is also appended to each open view's log, so
+  `history_view_advance(view, target, sink)` is a plain forward merge that
+  reports its steps. A view goes stale when its history sleeps (lvs are
+  rebuilt), on redaction and on import of its inode; a stale view's next
+  advance reloads at the target and reports a byte diff of its old bytes
+  against the new text through the same sink, so callers have one path.
+
+## Live buffers
+
+A buffer is an editor's live window onto one text: a text object, or a file
+in a tree addressed by `(tree, path)`. Editors (a gpui editor talking to the
+daemon, a browser, an in-process embedder) apply surgical deltas to their own
+buffer; nothing ever reloads a whole file, cursors stay put, and the person's
+concurrent typing is never lost or reverted.
+
+- **Open.** `buffer_open(object, path, line, units, actor)` follows a
+  version: a text object follows its heads; a tree file follows a line
+  (the line of the mount on that tree if one is live, else `main`). Units are
+  `Bytes` (UTF-8 offsets, gpui/Zed ropes) or `Utf16` (code units, web and
+  LSP), fixed per buffer. The engine keeps a text view of the file at the
+  buffer's version and returns `rev` 0, the total length in units and the
+  first page of the snapshot; `buffer_read(buffer, rev, from, len)` serves
+  any range at the current rev, so a 50 MB file opens on its first screen.
+  Open costs one clone of the loaded rope or one checkpoint read plus the
+  ops after it; nothing is diffed.
+- **Revisions.** `rev` counts deltas the engine has sent; the client counts
+  edits it has sent. Each delta carries `rev` and `ack` (client edits the
+  engine had applied when it was made); each edit carries the `rev` the
+  client had seen when it made it. This is Jupiter's two-sided protocol: each
+  side keeps its unacknowledged messages, and transforms an incoming message
+  over them with `delta_transform` (the client's edit is always the first
+  argument, so a client insert precedes an engine insert at the same
+  position on both sides). Clients pipeline any number of edits; nothing
+  stalls on a slow link. The engine keeps unacknowledged deltas only (an edit
+  or `buffer_ack` acknowledges); past 4096 of them or 8 MiB the oldest are
+  dropped and an edit made against a dropped rev is refused with
+  `Conflict`, after which the client reopens.
+- **Deltas.** Changes from anywhere (other devices, agent runs landing on
+  the line, disk edits ingested from a mounted worktree, tree writes, branch
+  switches, rewinds, redaction) mark the object changed; at the end of the
+  tick each buffer whose object changed advances its view to its target
+  version through the sink and emits one canonical delta (minimal ordered
+  retain/delete/insert, widened to code points, every insert carrying its
+  author). Delivery is event driven only. A sink that is not ready (a daemon
+  connection with unsent bytes) leaves the buffer unadvanced; when it drains
+  the buffer advances once to the newest version, so a lagging client gets
+  one combined delta and nothing queues. The delta is computed from the
+  merge itself: O(ops since the last delta), never O(file).
+- **Local edits.** `buffer_edit(buffer, rev, edits, group)` takes ordered
+  `(pos, del, ins)` edits in the client's coordinates at `rev` plus its
+  earlier edits. The engine transforms them over its unacknowledged deltas,
+  converts units at the view, and commits one batch whose author is the
+  buffer's actor (the person; default an editor actor derived from the
+  device), parented on the view's version, so anything the engine has not
+  yet delivered is merged by the CRDT character-wise. The batch is
+  journaled and committed with the normal cadence, moves the followed line
+  (`line_after`, so concurrent line heads stay), and wakes the mounts of the
+  tree; materialization writes the file only after ingesting disk content
+  that differs from the shadow. The view applies the batch linearly, so the
+  edit never comes back to its author as a delta.
+- **Anchors.** An anchor is `(op id, bias)` of a character, plus two
+  sentinels for start and end. `buffer_anchors(buffer, rev, positions,
+  bias)` creates them in bulk (positions are mapped from `rev` through the
+  unacknowledged deltas first, then one span lookup each, O(log n));
+  `buffer_resolve(buffer, anchors)` returns positions at the current rev and
+  the `ack` they include. A deleted character resolves through the transient
+  merge state to where it was. Anchors are values: they live in the client,
+  in diagnostics or in comments, and resolve on any device holding the ops.
+- **Remote cursors.** `buffer_cursors(buffer, ranges)` publishes the
+  person's cursors and selections as anchors through the relay's direct
+  messages to the other online participants of the object, sealed with a key
+  derived from the object key (only members read them). They are never
+  written to history. Received ones are resolved locally and arrive as a
+  `Cursors` delta per buffer of that object; the newest set per
+  (device, actor) replaces the previous one, and leaving drops it.
+- **Undo.** Each buffer keeps an undo stack of its own edits only: inserts
+  as op-id runs, deletes as the deleted op-id runs plus an anchor. Undo of a
+  group deletes whatever of its inserted characters still exist (wherever
+  concurrent work moved them) and re-inserts its deleted characters as
+  `Insert_Copy` of the original ops at their anchors, so authorship of
+  restored text is kept; redo is the inverse. It never touches characters
+  another author inserted, so an agent's or another device's concurrent work
+  survives undo. Groups are the client's `group` ids (equal ids merge).
+- **Large files.** Open is one rope clone or checkpoint read and a first
+  page; deltas, edits and anchors cost O(changes · log n). A file the tree
+  keeps as opaque large content cannot be opened as a buffer (`Too_Large`).
+- **Idle.** Open buffers arm nothing and wake nothing; they cost the view's
+  memory and run only when their object changes.
 
 ## Storage
 
@@ -624,7 +731,10 @@ points `Vfs`, `Keyring`, `Credentials`, `Transport`, `Authorizer`,
 `Relay_Storage`, `Scheduler`, `Spawner`, `Write_Observer`, `Secrets`,
 `Model`, `Http`, `Tools`, `Channels`, `Embedder`, `Providers`, `Clock`,
 `Log`, `Search_Remote`. Any engine instance can be a runner or a full
-indexer. Several engines can share a process to use several cores, each
+indexer. Live buffers (`buffer_open`, `buffer_read`, `buffer_edit`,
+`buffer_ack`, `buffer_undo`, `buffer_redo`, `buffer_anchors`,
+`buffer_resolve`, `buffer_cursors`, `buffer_close`) deliver `Buffer_Delta`s
+through the subscription callback path at the end of each tick. Several engines can share a process to use several cores, each
 owning a shard of objects.
 
 ## capi
@@ -633,7 +743,10 @@ owning a shard of objects.
 C function-pointer tables, binary or JSON payloads, no global state, no
 callbacks on foreign threads except through the embedder's loop. The read
 side (journal, thread, index, crdt, sync client) also builds for
-`js_wasm32` so browsers read and decrypt streams directly.
+`js_wasm32` so browsers read and decrypt streams directly. Buffer ops are
+appended to the op table; deltas and cursors arrive on a buffer
+subscription (daemon frame `Buffer`), with the payload
+`{buffer, rev, ack, base, ops:[{kind, n, text, author}], cursors}`.
 
 ## cli
 
