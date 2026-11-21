@@ -75,7 +75,19 @@ Git_Marker :: struct {
 	commit: string,
 }
 
+Clock :: struct {
+	data:    rawptr,
+	wall_ms: proc(data: rawptr) -> i64,
+}
+
+History_Options :: struct {
+	chain:         Maybe(journal.Chain),
+	keep_at_least: i64,
+	clock:         Clock,
+}
+
 History :: struct {
+	opts:       History_Options,
 	vfs:        prim.Vfs,
 	allocator:  runtime.Allocator,
 	id:         prim.Id,
@@ -106,8 +118,9 @@ History :: struct {
 	markers:    [dynamic]Git_Marker,
 }
 
-history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams := Stream_Source{}, allocator := context.allocator) -> Error {
+history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams := Stream_Source{}, allocator := context.allocator, opts := History_Options{}) -> Error {
 	h^ = {
+		opts      = opts,
 		vfs       = vfs,
 		allocator = allocator,
 		id        = id,
@@ -128,6 +141,13 @@ history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self:
 	return .None
 }
 
+history_wall_ms :: proc(h: ^History) -> i64 {
+	if h.opts.clock.wall_ms != nil {
+		return h.opts.clock.wall_ms(h.opts.clock.data)
+	}
+	return prim.now_ms()
+}
+
 history_close :: proc(h: ^History) {
 	history_sleep(h)
 	delete(h.dir, h.allocator)
@@ -142,7 +162,11 @@ history_wake :: proc(h: ^History) -> Error {
 	from_prim(prim.mkdir_all(h.vfs, h.dir, 0o700)) or_return
 	kv_open(&h.kv, h.vfs, h.dir, "state", h.allocator) or_return
 	jpath, _ := path_join(h.dir, "fs.journal", context.temp_allocator)
-	if jerr := journal.journal_open(&h.journal, h.vfs, jpath, allocator = h.allocator); jerr != .None {
+	jopts := journal.Options{keep_at_least = h.opts.keep_at_least}
+	if _, ok := h.opts.chain.?; ok {
+		jopts.chain = &h.opts.chain.?
+	}
+	if jerr := journal.journal_open(&h.journal, h.vfs, jpath, jopts, h.allocator); jerr != .None {
 		kv_close(&h.kv)
 		return .Io
 	}

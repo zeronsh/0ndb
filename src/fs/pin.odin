@@ -67,7 +67,7 @@ history_pins_flush :: proc(h: ^History, info: Commit_Info) -> Error {
 	rbuf: [128]u8
 	base := history_pin_ref(h, rbuf[:])
 	ref := strings.concatenate({base, ".pins"}, context.temp_allocator)
-	commit_on_ref(h.db, ref, tree, info, "0ndb pins") or_return
+	commit_on_ref(h.db, ref, tree, info, "0ndb pins", history_wall_ms(h) / 1000) or_return
 	clear(&h.pins)
 	return kv_del(&h.kv, transmute([]u8)string("pins"))
 }
@@ -98,7 +98,7 @@ from_odb_v :: proc(oid: odb.Oid, err: odb.Error) -> (odb.Oid, Error) {
 }
 
 @(private)
-commit_on_ref :: proc(db: ^odb.Odb, ref: string, tree: odb.Oid, info: Commit_Info, fallback: string) -> Error {
+commit_on_ref :: proc(db: ^odb.Odb, ref: string, tree: odb.Oid, info: Commit_Info, fallback: string, now_s: i64) -> Error {
 	parent, perr := odb.read_ref(db, ref)
 	parents: []odb.Oid
 	if perr == .None {
@@ -106,7 +106,7 @@ commit_on_ref :: proc(db: ^odb.Odb, ref: string, tree: odb.Oid, info: Commit_Inf
 		ps[0] = parent
 		parents = ps
 	}
-	t := info.time if info.time != 0 else prim.now_ns() / 1_000_000_000
+	t := info.time if info.time != 0 else now_s
 	sig := odb.Signature {
 		name  = info.name if len(info.name) > 0 else "0ndb",
 		email = info.email if len(info.email) > 0 else "0ndb@localhost",
@@ -161,7 +161,7 @@ mount_commit :: proc(m: ^Mount, info: Commit_Info) -> (commit: odb.Oid, err: Err
 	ci.message = msg
 	rbuf: [128]u8
 	ref := history_pin_ref(m.history, rbuf[:])
-	commit_on_ref(m.db, ref, tree, ci, "0ndb snapshot") or_return
+	commit_on_ref(m.db, ref, tree, ci, "0ndb snapshot", history_wall_ms(m.history) / 1000) or_return
 	history_pins_flush(m.history, info) or_return
 	kv_commit(&m.history.kv) or_return
 	c, _ := odb.read_ref(m.db, ref)

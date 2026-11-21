@@ -15,9 +15,10 @@ Redact_Result :: struct {
 	files:     int,
 	rewrites:  int,
 	dropped:   int,
+	ranges:    []journal.Range,
 }
 
-history_redact :: proc(h: ^History, spans: []crdt.Op_Span) -> (res: Redact_Result, err: Error) {
+history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.allocator) -> (res: Redact_Result, err: Error) {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
 		return {}, .No_Memory
@@ -63,12 +64,16 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span) -> (res: Redact_Resul
 		replace_record(h, rec[0], all[:]) or_return
 	}
 	history_persist(h) or_return
+	ranges := make([dynamic]journal.Range, 0, len(records), allocator)
 	for rec in records {
 		if e := journal.journal_redact(&h.journal, rec[0], rec[1]); e != .None {
+			res.ranges = ranges[:]
 			return res, .Io
 		}
+		append(&ranges, journal.Range{rec[0], rec[1]})
 		res.zeroed += rec[1] - rec[0]
 	}
+	res.ranges = ranges[:]
 	h.applied[0] = journal.journal_durable_len(&h.journal)
 	history_persist(h) or_return
 	if h.db != nil && len(targets) > 0 {
@@ -264,7 +269,7 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 	return files, .None
 }
 
-mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: int) -> (res: Redact_Result, err: Error) {
+mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: int, allocator := context.allocator) -> (res: Redact_Result, err: Error) {
 	mount_sync(m) or_return
 	h := m.history
 	e, found := shadow_get(&m.shadow, path) or_return
@@ -287,7 +292,7 @@ mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: 
 		}
 		at += s.len
 	}
-	res = history_redact(h, ids[:]) or_return
+	res = history_redact(h, ids[:], allocator) or_return
 	if mount_wake(m) == .None {
 		m.rescan = false
 	}

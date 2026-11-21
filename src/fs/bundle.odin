@@ -75,7 +75,7 @@ history_bundle_write :: proc(h: ^History, sink: Bundle_Sink) -> Error {
 	return sink.write(sink.data, end[:])
 }
 
-history_bundle_load :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams: Stream_Source, source: Bundle_Source, allocator := context.allocator) -> Error {
+history_bundle_load :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams: Stream_Source, source: Bundle_Source, allocator := context.allocator, opts := History_Options{}) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	from_prim(prim.mkdir_all(vfs, dir, 0o700)) or_return
 	kv: Kv
@@ -139,7 +139,7 @@ history_bundle_load :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id
 	kv_commit(&kv) or_return
 	from_prim(prim.datasync(vfs, lfd)) or_return
 	kv_close(&kv)
-	return history_open(h, vfs, dir, id, self, db, streams, allocator)
+	return history_open(h, vfs, dir, id, self, db, streams, allocator, opts)
 }
 
 history_bundle_objects :: proc(h: ^History, data: rawptr, visit: proc(data: rawptr, oid: odb.Oid)) -> Error {
