@@ -11,6 +11,12 @@ const wire = @import("wire.zig");
 pub const MIN_LEASE_TTL_MS: u64 = 1000;
 pub const MAX_LEASE_TTL_MS: u64 = 300_000;
 
+fn nowAwakeMs(io: Io) u64 {
+    const ts = Io.Clock.awake.now(io);
+    const ms = @divFloor(ts.nanoseconds, std.time.ns_per_ms);
+    return if (ms < 0) 0 else @intCast(ms);
+}
+
 const LOCAL_EPOCH_MAGIC: [8]u8 = .{ '0', 'N', 'D', 'B', 'L', 'E', 'P', '1' };
 const LOCAL_EPOCH_FILE_LEN: usize = 8 + 8 + 1 + 8 + 32;
 
@@ -28,6 +34,7 @@ pub const LeaseHandle = struct {
     lock_fd: ?posix.fd_t = null,
     canceled: bool = false,
     cancel_epoch: u64 = 0,
+    expires_mono_ms: u64 = 0,
 };
 
 pub const TopicToken = struct {
@@ -90,6 +97,7 @@ const LocalLockState = struct {
     fd: posix.fd_t,
     fencing_epoch: u64,
     expires_ms: u64,
+    expires_mono_ms: u64,
     canceled: bool,
     cancel_epoch: u64,
 };
@@ -309,11 +317,13 @@ pub const LeaseManager = struct {
 
     fn acquireLocal(self: *LeaseManager, topic_id: [32]u8, ttl_ms: u64) !LeaseHandle {
         const now_ms = id.nowMs(self.io);
+        const now_mono = nowAwakeMs(self.io);
         const clamped = std.math.clamp(ttl_ms, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
 
         if (self.local_locks.getPtr(topic_id)) |existing| {
-            if (!existing.canceled and now_ms < existing.expires_ms) {
+            if (!existing.canceled and now_mono < existing.expires_mono_ms) {
                 existing.expires_ms = now_ms +| clamped;
+                existing.expires_mono_ms = now_mono +| clamped;
                 return .{
                     .topic_id = topic_id,
                     .runner_id = self.runner_id,
@@ -323,6 +333,7 @@ pub const LeaseManager = struct {
                     .lock_fd = existing.fd,
                     .canceled = existing.canceled,
                     .cancel_epoch = existing.cancel_epoch,
+                    .expires_mono_ms = existing.expires_mono_ms,
                 };
             }
             _ = linux.flock(existing.fd, posix.LOCK.UN);
@@ -358,7 +369,7 @@ pub const LeaseManager = struct {
         errdefer _ = linux.flock(lock_fd, posix.LOCK.UN);
 
         const prev = try self.readLocalEpoch(topic_id);
-        const next_epoch = prev.fencing_epoch + 1;
+        const next_epoch = std.math.add(u64, prev.fencing_epoch, 1) catch return error.EpochOverflow;
         const next_rec = LocalEpochRecord{
             .fencing_epoch = next_epoch,
             .canceled = false,
@@ -367,10 +378,12 @@ pub const LeaseManager = struct {
         try self.writeLocalEpoch(topic_id, next_rec);
 
         const expires_ms = now_ms +| clamped;
+        const expires_mono_ms = now_mono +| clamped;
         try self.local_locks.put(self.allocator, topic_id, .{
             .fd = lock_fd,
             .fencing_epoch = next_epoch,
             .expires_ms = expires_ms,
+            .expires_mono_ms = expires_mono_ms,
             .canceled = false,
             .cancel_epoch = prev.cancel_epoch,
         });
@@ -384,6 +397,7 @@ pub const LeaseManager = struct {
             .lock_fd = lock_fd,
             .canceled = false,
             .cancel_epoch = prev.cancel_epoch,
+            .expires_mono_ms = expires_mono_ms,
         };
     }
 
@@ -399,6 +413,8 @@ pub const LeaseManager = struct {
 
         try self.authorizeTopicLocked(sock, topic_id, wire.PERM_LEASE);
 
+        const clamped = std.math.clamp(ttl_ms, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
+        const req_mono = nowAwakeMs(self.io);
         const req = wire.LeaseAcquireReq{
             .topic = topic_id,
             .runner_id = self.runner_id,
@@ -427,16 +443,22 @@ pub const LeaseManager = struct {
             .lock_fd = null,
             .canceled = lr.canceled,
             .cancel_epoch = lr.cancel_epoch,
+            .expires_mono_ms = if (lr.expires_ms == 0) 0 else req_mono +| clamped,
         };
     }
 
     pub fn isStillValid(self: *const LeaseManager, handle: *const LeaseHandle) bool {
         if (handle.canceled) return false;
-        const now_ms = id.nowMs(self.io);
-        if (now_ms >= handle.expires_ms) return false;
+        const now_mono = nowAwakeMs(self.io);
+        if (handle.expires_mono_ms != 0) {
+            if (now_mono >= handle.expires_mono_ms) return false;
+        } else {
+            const now_ms = id.nowMs(self.io);
+            if (now_ms >= handle.expires_ms) return false;
+        }
         if (handle.mode == .local_offline) {
             const st = self.local_locks.get(handle.topic_id) orelse return false;
-            if (st.fencing_epoch != handle.fencing_epoch or st.canceled or now_ms >= st.expires_ms) return false;
+            if (st.fencing_epoch != handle.fencing_epoch or st.canceled or now_mono >= st.expires_mono_ms) return false;
             const disk = self.readLocalEpoch(handle.topic_id) catch return false;
             if (disk.fencing_epoch != handle.fencing_epoch or disk.canceled) return false;
         }
@@ -447,8 +469,10 @@ pub const LeaseManager = struct {
         switch (handle.mode) {
             .local_offline => {
                 const now_ms = id.nowMs(self.io);
+                const now_mono = nowAwakeMs(self.io);
                 const st = self.local_locks.getPtr(handle.topic_id) orelse return error.Fenced;
-                if (st.fencing_epoch != handle.fencing_epoch or now_ms >= handle.expires_ms or now_ms >= st.expires_ms) {
+                const handle_expired = if (handle.expires_mono_ms != 0) now_mono >= handle.expires_mono_ms else now_ms >= handle.expires_ms;
+                if (st.fencing_epoch != handle.fencing_epoch or handle_expired or now_mono >= st.expires_mono_ms) {
                     return error.Fenced;
                 }
                 const disk = try self.readLocalEpoch(handle.topic_id);
@@ -461,12 +485,17 @@ pub const LeaseManager = struct {
                 }
                 const clamped = std.math.clamp(ttl_ms, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
                 const new_exp = now_ms +| clamped;
+                const new_mono = now_mono +| clamped;
                 st.expires_ms = new_exp;
+                st.expires_mono_ms = new_mono;
                 handle.expires_ms = new_exp;
+                handle.expires_mono_ms = new_mono;
             },
             .relay_fenced => {
                 const sock = try self.ensureConnected();
                 try self.authorizeTopicLocked(sock, handle.topic_id, wire.PERM_LEASE);
+                const clamped = std.math.clamp(ttl_ms, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
+                const req_mono = nowAwakeMs(self.io);
                 const req = wire.LeaseRenewReq{
                     .topic = handle.topic_id,
                     .runner_id = handle.runner_id,
@@ -489,6 +518,7 @@ pub const LeaseManager = struct {
                 const lr = try wire.LeaseResponse.decode(resp_frame.payload);
                 self.last_lease_response = lr;
                 handle.expires_ms = lr.expires_ms;
+                handle.expires_mono_ms = if (lr.expires_ms == 0) 0 else req_mono +| clamped;
                 handle.fencing_epoch = lr.fencing_epoch;
                 handle.canceled = lr.canceled;
                 handle.cancel_epoch = lr.cancel_epoch;
@@ -530,6 +560,7 @@ pub const LeaseManager = struct {
                 _ = self.local_locks.remove(handle.topic_id);
                 handle.lock_fd = null;
                 handle.expires_ms = 0;
+                handle.expires_mono_ms = 0;
             },
             .relay_fenced => {
                 const sock = try self.ensureConnected();
@@ -551,6 +582,7 @@ pub const LeaseManager = struct {
                 const lr = try wire.LeaseResponse.decode(resp_frame.payload);
                 self.last_lease_response = lr;
                 handle.expires_ms = 0;
+                handle.expires_mono_ms = 0;
             },
         }
     }
@@ -651,8 +683,10 @@ pub const LeaseManager = struct {
         switch (handle.mode) {
             .local_offline => {
                 const now_ms = id.nowMs(self.io);
+                const now_mono = nowAwakeMs(self.io);
                 const st = self.local_locks.get(handle.topic_id) orelse return error.Fenced;
-                if (st.fencing_epoch != handle.fencing_epoch or now_ms >= handle.expires_ms or now_ms >= st.expires_ms) {
+                const handle_expired = if (handle.expires_mono_ms != 0) now_mono >= handle.expires_mono_ms else now_ms >= handle.expires_ms;
+                if (st.fencing_epoch != handle.fencing_epoch or handle_expired or now_mono >= st.expires_mono_ms) {
                     return error.Fenced;
                 }
                 const disk = try self.readLocalEpoch(handle.topic_id);

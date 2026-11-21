@@ -3559,6 +3559,7 @@ fn runSyncV3AndLeasesSuite(allocator: std.mem.Allocator, io: std.Io) !void {
                 .topic_id = topic_a,
                 .perms = wire.PERM_READ,
                 .expires_ms = sub_exp,
+                .token = "sub-token-a",
             }},
         );
         defer allocator.free(sealed_to_sub);
@@ -3567,7 +3568,7 @@ fn runSyncV3AndLeasesSuite(allocator: std.mem.Allocator, io: std.Io) !void {
         try testing.expectEqual(@as(usize, 1), imported_n);
         const sub_grant = sub.getTopicGrant(topic_a).?;
         try testing.expectEqual(@as(u32, wire.PERM_READ), sub_grant.perms);
-        try testing.expectEqualStrings("cap-token-a", sub_grant.token);
+        try testing.expectEqualStrings("sub-token-a", sub_grant.token);
 
         try testing.expectError(
             error.PrivilegeEscalation,
@@ -7299,6 +7300,7 @@ test "dumb protected E2EE relay syncs session list, statuses, Merkle paginated m
     }
 
     try runSyncHardeningChecks(allocator, io);
+    try runAuditFixCryptoSyncSuite(allocator, io);
 }
 
 fn testLruSliceSize(s: []u8) usize {
@@ -10321,6 +10323,7 @@ fn runSyncClientV3Suite(allocator: std.mem.Allocator, io: std.Io) !void {
 
         var cli = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr, auth_secret, .workstation);
         defer cli.deinit();
+        cli.setSharedGitRemoteVerified(true);
 
         const st1 = try cli.pushSpace(&sp, sp_topic, null);
         try testing.expect(st1.git_blobs_skipped >= 3);
@@ -12644,5 +12647,519 @@ fn runAuditFixCoreStoreSuite(allocator: std.mem.Allocator, io: std.Io) !void {
             try testing.expectError(error.CorruptLog, al.readAt(0));
             al.index.items[0].offset = saved_off;
         }
+    }
+}
+
+fn runAuditFixCryptoSyncSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const crypto = ondb.store.crypto;
+    const wire = ondb.sync.wire;
+    const keyring_mod = ondb.sync.keyring;
+    const relay_mod = ondb.sync.relay;
+    const client_mod = ondb.sync.client;
+    const id_mod = ondb.core.id;
+    const tm = ondb.thread.model;
+    const ts_mod = ondb.thread.store;
+    const space_mod = ondb.space.space;
+    const projection_mod = ondb.fs.projection;
+    const pool_mod = ondb.fs.pool;
+    const Version = ondb.core.version.Version;
+    const posix = std.posix;
+    const linux = std.os.linux;
+
+    const base_tmp = "/tmp/0ndb-verify-audit-f3";
+    cleanDir(io, base_tmp);
+    try std.Io.Dir.cwd().createDirPath(io, base_tmp);
+    defer cleanDir(io, base_tmp);
+
+    {
+        const key: crypto.Key = @splat(0x42);
+        const env_a = try crypto.sealWithDerivedNonce(allocator, key, "ctx-same", "aad-same", "plaintext-alpha");
+        defer allocator.free(env_a);
+        const env_b = try crypto.sealWithDerivedNonce(allocator, key, "ctx-same", "aad-same", "plaintext-beta!");
+        defer allocator.free(env_b);
+        const env_a2 = try crypto.sealWithDerivedNonce(allocator, key, "ctx-same", "aad-same", "plaintext-alpha");
+        defer allocator.free(env_a2);
+
+        try testing.expect(!std.mem.eql(u8, env_a[1..33], env_b[1..33]));
+        try testing.expectEqualSlices(u8, env_a[1..33], env_a2[1..33]);
+
+        const dec_a = try crypto.open(allocator, key, "aad-same", env_a);
+        defer allocator.free(dec_a);
+        const dec_b = try crypto.open(allocator, key, "aad-same", env_b);
+        defer allocator.free(dec_b);
+        try testing.expectEqualStrings("plaintext-alpha", dec_a);
+        try testing.expectEqualStrings("plaintext-beta!", dec_b);
+    }
+
+    {
+        const root = crypto.AccountRootKey.generate(io);
+        var issuer = keyring_mod.Keyring.initAccountDevice(allocator, io, root, 0xF301);
+        defer issuer.deinit();
+        var rogue = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xF302);
+        defer rogue.deinit();
+        var target = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xF303);
+        defer target.deinit();
+
+        const topic = client_mod.topicIdFor(.thread, id_mod.newUuidV7(io));
+        const ek1 = crypto.EntityKey.generate(io, 1);
+        const now_ms = id_mod.nowMs(io);
+        const exp = now_ms + 300_000;
+        try issuer.setTopicGrant(topic, ek1, @as(u32, wire.PERM_READ) | wire.PERM_WRITE, exp, &.{});
+
+        const valid_sealed = try issuer.createDelegationBundle(
+            allocator,
+            target.runner_id,
+            target.device_keypair.public_key,
+            exp,
+            &.{.{
+                .topic_id = topic,
+                .perms = wire.PERM_READ,
+                .expires_ms = exp,
+            }},
+        );
+        defer allocator.free(valid_sealed);
+
+        const n_ok = try target.importDelegationBundleVerified(valid_sealed, issuer.signing_keypair.public_key);
+        try testing.expectEqual(@as(usize, 1), n_ok);
+        try testing.expectEqual(@as(u32, 1), target.getEntityKey(topic).?.epoch);
+
+        const forged_ek = crypto.EntityKey.generate(io, std.math.maxInt(u32));
+        try rogue.setTopicGrant(topic, forged_ek, wire.PERM_READ, exp, &.{});
+        const rogue_sealed = try rogue.createDelegationBundle(
+            allocator,
+            target.runner_id,
+            target.device_keypair.public_key,
+            exp,
+            &.{.{
+                .topic_id = topic,
+                .perms = wire.PERM_READ,
+                .expires_ms = exp,
+            }},
+        );
+        defer allocator.free(rogue_sealed);
+        try testing.expectError(
+            error.UntrustedIssuer,
+            target.importDelegationBundleVerified(rogue_sealed, issuer.signing_keypair.public_key),
+        );
+
+        var unsigned_grants = [_]crypto.DelegationGrant{.{
+            .topic_id = topic,
+            .entity_key = forged_ek,
+            .perms = wire.PERM_READ,
+            .expires_ms = exp,
+            .token = &.{},
+        }};
+        const unsigned_bundle = crypto.DelegationBundle{
+            .issued_by_runner = issuer.runner_id,
+            .target_runner = target.runner_id,
+            .issued_ms = now_ms,
+            .expires_ms = exp,
+            .grants = &unsigned_grants,
+        };
+        const unsigned_sealed = try unsigned_bundle.sealForDevice(allocator, io, target.device_keypair.public_key);
+        defer allocator.free(unsigned_sealed);
+        try testing.expectError(
+            error.MissingIssuerSignature,
+            target.importDelegationBundleVerified(unsigned_sealed, issuer.signing_keypair.public_key),
+        );
+
+        var tampered_bundle = try issuer.buildDelegationBundle(
+            allocator,
+            target.runner_id,
+            exp,
+            &.{.{
+                .topic_id = topic,
+                .perms = wire.PERM_READ,
+                .expires_ms = exp,
+            }},
+        );
+        defer tampered_bundle.deinit(allocator);
+        tampered_bundle.grants[0].entity_key.epoch = std.math.maxInt(u32);
+        const tampered_sealed = try tampered_bundle.sealForDevice(allocator, io, target.device_keypair.public_key);
+        defer allocator.free(tampered_sealed);
+        try testing.expectError(
+            error.InvalidSignature,
+            target.importDelegationBundleVerified(tampered_sealed, issuer.signing_keypair.public_key),
+        );
+        try testing.expectError(
+            error.InvalidSignature,
+            target.importDelegationBundle(tampered_sealed),
+        );
+        try testing.expectEqual(@as(u32, 1), target.getEntityKey(topic).?.epoch);
+    }
+
+    const relay_dir = try std.fmt.allocPrint(allocator, "{s}/relay", .{base_tmp});
+    defer allocator.free(relay_dir);
+    const auth_secret = crypto.hashBytes("audit-f3-relay-secret");
+
+    var srv = try relay_mod.RelayServer.start(allocator, io, relay_dir, .{ 127, 0, 0, 1 }, 0, auth_secret, true);
+    defer srv.deinit();
+    const port = srv.port;
+
+    const srv_thr = try std.Thread.spawn(.{}, relayThreadMain, .{&srv});
+    defer {
+        srv.stop();
+        srv_thr.join();
+    }
+
+    {
+        const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try testing.expect(linux.errno(s_rc) == .SUCCESS);
+        const fd: posix.fd_t = @intCast(s_rc);
+        defer _ = linux.close(fd);
+        wire.setSocketTimeouts(fd, 2000) catch {};
+        var addr = linux.sockaddr.in{
+            .family = linux.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        };
+        try testing.expect(linux.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+        var dummy_req: [44]u8 = @splat(0);
+        try wire.writeFrameBlocking(allocator, fd, .get_range, 0, &dummy_req);
+        if (wire.readFrameBlocking(allocator, fd)) |f_ok| {
+            var f = f_ok;
+            f.deinit(allocator);
+            return error.ExpectedPreAuthDisconnect;
+        } else |_| {}
+    }
+
+    {
+        const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try testing.expect(linux.errno(s_rc) == .SUCCESS);
+        const fd: posix.fd_t = @intCast(s_rc);
+        defer _ = linux.close(fd);
+        wire.setSocketTimeouts(fd, 2000) catch {};
+        var addr = linux.sockaddr.in{
+            .family = linux.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        };
+        try testing.expect(linux.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+        const big = try allocator.alloc(u8, 2048);
+        defer allocator.free(big);
+        @memset(big, 0xaa);
+        wire.writeFrameBlocking(allocator, fd, .auth, 0, big) catch {};
+        if (wire.readFrameBlocking(allocator, fd)) |f_ok| {
+            var f = f_ok;
+            f.deinit(allocator);
+            return error.ExpectedPreAuthDisconnect;
+        } else |_| {}
+    }
+
+    {
+        const kr_path = try std.fmt.allocPrint(allocator, "{s}/kr_perm", .{base_tmp});
+        defer allocator.free(kr_path);
+        try std.Io.Dir.cwd().createDirPath(io, kr_path);
+        var kr_dir = try std.Io.Dir.cwd().openDir(io, kr_path, .{});
+        defer kr_dir.close(io);
+
+        const root = crypto.AccountRootKey.generate(io);
+        const topic = client_mod.topicIdFor(.space, id_mod.newUuidV7(io));
+        const ek1 = crypto.EntityKey.generate(io, 1);
+
+        var kr = keyring_mod.Keyring.initAccountDevice(allocator, io, root, 0xF310);
+        defer kr.deinit();
+        try kr.setEntityKey(topic, ek1);
+
+        const blob_data = "historical epoch-1 encrypted blob payload";
+        const blob_oid = crypto.hashBytes(blob_data);
+        {
+            var cli1 = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr, auth_secret, .workstation);
+            defer cli1.deinit();
+            _ = try cli1.putEncryptedBlobV3(topic, blob_oid, blob_data);
+        }
+
+        const ek2 = try kr.rotateEntityKey(topic);
+        try testing.expectEqual(@as(u32, 2), ek2.epoch);
+        try testing.expectEqual(@as(usize, 1), kr.getPriorEntityKeys(topic).len);
+
+        try kr.saveAtomic(kr_dir, "keyring.bin");
+        {
+            const f = try kr_dir.openFile(io, "keyring.bin", .{});
+            defer f.close(io);
+            const fstat = try f.stat(io);
+            try testing.expectEqual(@as(u32, 0o600), fstat.permissions.toMode() & 0o777);
+        }
+
+        var loaded = try keyring_mod.Keyring.load(allocator, io, kr_dir, "keyring.bin");
+        defer loaded.deinit();
+        try testing.expectEqual(@as(u32, 2), loaded.getEntityKey(topic).?.epoch);
+        try testing.expect(loaded.getEntityKeyForEpoch(topic, 1) == null);
+        try testing.expect(loaded.getHistoricalEntityKey(topic, 1) != null);
+        try testing.expectEqual(@as(usize, 1), loaded.getPriorEntityKeys(topic).len);
+
+        var cli2 = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &loaded, auth_secret, .workstation);
+        defer cli2.deinit();
+        const got = (try cli2.getEncryptedBlobV3(allocator, topic, blob_oid)).?;
+        defer allocator.free(got);
+        try testing.expectEqualStrings(blob_data, got);
+    }
+
+    {
+        const root = crypto.AccountRootKey.generate(io);
+        const topic = client_mod.topicIdFor(.thread, id_mod.newUuidV7(io));
+        const ek = crypto.EntityKey.generate(io, 1);
+        const now_ms = id_mod.nowMs(io);
+        const parent_exp = now_ms + 300_000;
+        const sub_exp = now_ms + 60_000;
+        const parent_perms: u32 = @as(u32, wire.PERM_READ) | wire.PERM_WRITE | wire.PERM_LEASE;
+        const parent_tok = client_mod.CapabilityTokenV3.mint(auth_secret, topic, parent_perms, parent_exp).encode();
+
+        var captain = keyring_mod.Keyring.initAccountDevice(allocator, io, root, 0xF320);
+        defer captain.deinit();
+        var sub = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xF321);
+        defer sub.deinit();
+        try captain.setTopicGrant(topic, ek, parent_perms, parent_exp, &parent_tok);
+
+        try testing.expectError(
+            error.CapabilityTokenRequired,
+            captain.buildDelegationBundle(allocator, sub.runner_id, parent_exp, &.{.{
+                .topic_id = topic,
+                .perms = wire.PERM_READ,
+                .expires_ms = parent_exp,
+            }}),
+        );
+        try testing.expectError(
+            error.CapabilityTokenRequired,
+            captain.buildDelegationBundle(allocator, sub.runner_id, sub_exp, &.{.{
+                .topic_id = topic,
+                .perms = parent_perms,
+                .expires_ms = sub_exp,
+            }}),
+        );
+        try testing.expectError(
+            error.TokenMismatch,
+            captain.buildDelegationBundle(allocator, sub.runner_id, sub_exp, &.{.{
+                .topic_id = topic,
+                .perms = wire.PERM_READ,
+                .expires_ms = sub_exp,
+                .token = &parent_tok,
+            }}),
+        );
+
+        captain.setRelayMasterSecret(auth_secret);
+        const sealed_attenuated = try captain.createDelegationBundle(
+            allocator,
+            sub.runner_id,
+            sub.device_keypair.public_key,
+            sub_exp,
+            &.{.{
+                .topic_id = topic,
+                .perms = wire.PERM_READ,
+                .expires_ms = sub_exp,
+            }},
+        );
+        defer allocator.free(sealed_attenuated);
+        _ = try sub.importDelegationBundleVerified(sealed_attenuated, captain.signing_keypair.public_key);
+
+        var sub_cli = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &sub, null, .thin_client);
+        defer sub_cli.deinit();
+        try sub_cli.authV3(topic, wire.PERM_READ);
+        try testing.expectError(error.PermissionDenied, sub_cli.putEncryptedFrameV3(topic, "escalate-write", null));
+
+        var bad_kr = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xF322);
+        defer bad_kr.deinit();
+        try bad_kr.setTopicGrant(topic, ek, wire.PERM_READ, sub_exp, &parent_tok);
+        var bad_cli = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &bad_kr, null, .thin_client);
+        defer bad_cli.deinit();
+        try testing.expectError(error.TokenMismatch, bad_cli.authV3(topic, wire.PERM_READ));
+    }
+
+    {
+        const root = crypto.AccountRootKey.generate(io);
+        const runner_a: u128 = 0xF330;
+        const runner_b: u128 = 0xF331;
+        const leased_topic = client_mod.topicIdFor(.thread, id_mod.newUuidV7(io));
+        const ek = crypto.EntityKey.generate(io, 1);
+
+        var kr_a = keyring_mod.Keyring.initAccountDevice(allocator, io, root, runner_a);
+        defer kr_a.deinit();
+        try kr_a.setEntityKey(leased_topic, ek);
+
+        var kr_b = keyring_mod.Keyring.initSubordinateDevice(allocator, io, runner_b);
+        defer kr_b.deinit();
+        try kr_b.setEntityKey(leased_topic, ek);
+
+        var cli_a = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_a, auth_secret, .workstation);
+        defer cli_a.deinit();
+        var cli_b = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_b, null, .thin_client);
+        defer cli_b.deinit();
+        try cli_b.addScopedToken(client_mod.CapabilityTokenV3.mint(auth_secret, leased_topic, wire.PERM_INBOX_APPEND, 0));
+
+        const l1 = try cli_a.leaseAcquire(leased_topic, runner_a, 10_000);
+        try testing.expectEqual(@as(u64, 1), l1.epoch);
+
+        try testing.expectError(error.Fenced, cli_a.putEncryptedFrameV3(leased_topic, "unfenced-on-leased", null));
+        _ = try cli_a.putEncryptedFrameV3(leased_topic, "fenced-on-leased", l1.epoch);
+
+        const mb_ok = tm.MailboxItem{
+            .item_id = id_mod.newUuidV7(io),
+            .from_thread_id = id_mod.newUuidV7(io),
+            .to_thread_id = id_mod.newUuidV7(io),
+            .task_id = id_mod.newUuidV7(io),
+            .kind = .progress,
+            .payload = @constCast("mailbox-append-allowed"),
+            .created_ms = 1000,
+        };
+        const mb_res = try cli_b.pushInbox(leased_topic, &mb_ok);
+        try testing.expectEqual(@as(usize, 1), mb_res.frames_pushed);
+
+        _ = try cli_a.leaseCancel(leased_topic, l1.epoch);
+        try testing.expectError(error.LeaseCancelled, cli_a.putEncryptedFrameV3(leased_topic, "unfenced-on-canceled", null));
+        try testing.expectError(error.LeaseCancelled, cli_b.pushInbox(leased_topic, &mb_ok));
+
+        const handoff_topic = client_mod.topicIdFor(.thread, id_mod.newUuidV7(io));
+        try kr_a.setEntityKey(handoff_topic, crypto.EntityKey.generate(io, 1));
+        const lh1 = try cli_a.leaseAcquire(handoff_topic, runner_a, 10_000);
+        _ = try cli_a.leasePrepareHandoff(handoff_topic, runner_a, runner_b, lh1.epoch);
+        _ = try cli_a.leaseCancel(handoff_topic, lh1.epoch);
+        try testing.expectError(error.LeaseCancelled, cli_a.leaseAcquireExpected(handoff_topic, runner_b, lh1.epoch, 10_000));
+
+        const vacant_topic = client_mod.topicIdFor(.thread, id_mod.newUuidV7(io));
+        try kr_a.setEntityKey(vacant_topic, crypto.EntityKey.generate(io, 1));
+        const lv1 = try cli_a.leaseAcquire(vacant_topic, runner_a, 10_000);
+        _ = try cli_a.leaseRelease(vacant_topic, runner_a, lv1.epoch);
+        try testing.expectError(error.Fenced, cli_a.leaseAcquireExpected(vacant_topic, runner_a, 99, 10_000));
+        const lv2 = try cli_a.leaseAcquireExpected(vacant_topic, runner_a, lv1.epoch, 10_000);
+        try testing.expectEqual(@as(u64, 2), lv2.epoch);
+
+        const sub_topic = client_mod.topicIdFor(.thread, id_mod.newUuidV7(io));
+        const sub_ek = crypto.EntityKey.generate(io, 1);
+        try kr_a.setEntityKey(sub_topic, sub_ek);
+        _ = try cli_a.putEncryptedFrameV3(sub_topic, "history-item", null);
+
+        var kr_sub = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xF332);
+        defer kr_sub.deinit();
+        try kr_sub.setEntityKey(sub_topic, sub_ek);
+        var cli_sub = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_sub, null, .thin_client);
+        defer cli_sub.deinit();
+        try cli_sub.addScopedToken(client_mod.CapabilityTokenV3.mint(auth_secret, sub_topic, wire.PERM_SUB, 0));
+        try testing.expectError(error.PermissionDenied, cli_sub.subscribeV3(sub_topic, 0));
+        const live_only = try cli_sub.subscribeV3(sub_topic, std.math.maxInt(u64));
+        defer {
+            for (live_only) |*f| f.deinit(allocator);
+            allocator.free(live_only);
+        }
+        try testing.expectEqual(@as(usize, 0), live_only.len);
+    }
+
+    {
+        const sender_path = try std.fmt.allocPrint(allocator, "{s}/inbox_sender", .{base_tmp});
+        defer allocator.free(sender_path);
+        const recv_path = try std.fmt.allocPrint(allocator, "{s}/inbox_recv", .{base_tmp});
+        defer allocator.free(recv_path);
+        try std.Io.Dir.cwd().createDirPath(io, sender_path);
+        var sender_dir = try std.Io.Dir.cwd().openDir(io, sender_path, .{});
+        defer sender_dir.close(io);
+        try std.Io.Dir.cwd().createDirPath(io, recv_path);
+        var recv_dir = try std.Io.Dir.cwd().openDir(io, recv_path, .{});
+        defer recv_dir.close(io);
+
+        const root = crypto.AccountRootKey.generate(io);
+        const cap_tid = id_mod.newUuidV7(io);
+        const sub_tid = id_mod.newUuidV7(io);
+        const inbox_topic = client_mod.topicIdFor(.mailbox, cap_tid);
+        const inbox_ek = crypto.EntityKey.generate(io, 1);
+
+        var kr_sender = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xF340);
+        defer kr_sender.deinit();
+        try kr_sender.setEntityKey(inbox_topic, inbox_ek);
+
+        var kr_recv = keyring_mod.Keyring.initAccountDevice(allocator, io, root, 0xF341);
+        defer kr_recv.deinit();
+        try kr_recv.setEntityKey(inbox_topic, inbox_ek);
+
+        var recv_ts = try ts_mod.ThreadStore.open(allocator, io, recv_dir, cap_tid, null);
+        defer recv_ts.deinit();
+        var recv_cli = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_recv, auth_secret, .workstation);
+        defer recv_cli.deinit();
+
+        const mb1_id = id_mod.newUuidV7(io);
+        const mb1 = tm.MailboxItem{
+            .item_id = mb1_id,
+            .from_thread_id = sub_tid,
+            .to_thread_id = cap_tid,
+            .task_id = id_mod.newUuidV7(io),
+            .kind = .progress,
+            .payload = @constCast("before-restart"),
+            .created_ms = 2000,
+        };
+        {
+            var sender_cli1 = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_sender, auth_secret, .thin_client);
+            defer sender_cli1.deinit();
+            sender_cli1.setCursorDir(sender_dir);
+            _ = try sender_cli1.pushInbox(inbox_topic, &mb1);
+        }
+
+        const p1 = try recv_cli.pullInbox(&recv_ts, inbox_topic);
+        try testing.expectEqual(@as(usize, 1), p1.frames_pulled);
+        try testing.expect(recv_ts.mailbox.contains(mb1_id));
+
+        const mb2_id = id_mod.newUuidV7(io);
+        const mb2 = tm.MailboxItem{
+            .item_id = mb2_id,
+            .from_thread_id = sub_tid,
+            .to_thread_id = cap_tid,
+            .task_id = id_mod.newUuidV7(io),
+            .kind = .result,
+            .payload = @constCast("after-restart"),
+            .created_ms = 3000,
+        };
+        {
+            var sender_cli2 = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_sender, auth_secret, .thin_client);
+            defer sender_cli2.deinit();
+            sender_cli2.setCursorDir(sender_dir);
+            _ = try sender_cli2.pushInbox(inbox_topic, &mb2);
+        }
+
+        const p2 = try recv_cli.pullInbox(&recv_ts, inbox_topic);
+        try testing.expectEqual(@as(usize, 1), p2.frames_pulled);
+        try testing.expect(recv_ts.mailbox.contains(mb2_id));
+        try testing.expectEqualStrings("after-restart", recv_ts.mailbox.get(mb2_id).?.payload);
+    }
+
+    {
+        const pool_dir = try std.fmt.allocPrint(allocator, "{s}/git_pool", .{base_tmp});
+        defer allocator.free(pool_dir);
+        const resources = try pool_mod.DaemonResources.init(allocator, io, pool_dir, .{});
+        defer resources.deinit();
+
+        const repo_dir = try std.fmt.allocPrint(allocator, "{s}/git_repo", .{base_tmp});
+        defer allocator.free(repo_dir);
+        try initTestGitRepo(allocator, io, repo_dir, "tracked.txt", "git blob content\n");
+
+        const sp_state = try std.fmt.allocPrint(allocator, "{s}/git_space", .{base_tmp});
+        defer allocator.free(sp_state);
+        const sp_id = id_mod.newUuidV7(io);
+        const sp_topic = client_mod.topicIdFor(.space, sp_id);
+        const sp_ek = crypto.EntityKey.generate(io, 1);
+
+        var sp = try space_mod.Space.open(allocator, io, sp_state, sp_id, .git_worktree, resources);
+        defer sp.deinit();
+        var proj = try projection_mod.Projection.attach(allocator, io, &sp, repo_dir, resources);
+        defer proj.deinit();
+        try proj.adoptInitial();
+
+        var vh = try proj.vcsHead(allocator);
+        defer vh.deinit(allocator);
+        if (vh.rev) |rev| {
+            try sp.setOrigin(.{
+                .origin_space_id = sp_id,
+                .fork_base_version = Version.ROOT,
+                .git_remote_url = @constCast("https://example.invalid/repo.git"),
+                .git_base_rev = @constCast(rev),
+            });
+        }
+
+        const root = crypto.AccountRootKey.generate(io);
+        var kr = keyring_mod.Keyring.initAccountDevice(allocator, io, root, 0xF350);
+        defer kr.deinit();
+        try kr.setEntityKey(sp_topic, sp_ek);
+
+        var cli = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr, auth_secret, .workstation);
+        defer cli.deinit();
+        const st = try cli.pushSpace(&sp, sp_topic, null);
+        try testing.expectEqual(@as(usize, 0), st.git_blobs_skipped);
+        try testing.expect(st.blobs_pushed >= 1);
     }
 }

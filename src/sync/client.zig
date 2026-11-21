@@ -601,8 +601,9 @@ pub const SyncClient = struct {
             var page = try self.getEncryptedRangePage(allocator, topic, cursor, req_limit);
             errdefer page.deinit(allocator);
 
+            try all.ensureUnusedCapacity(allocator, page.frames.len);
             for (page.frames) |f| {
-                try all.append(allocator, f);
+                all.appendAssumeCapacity(f);
             }
             allocator.free(page.frames);
             page.frames = &.{};
@@ -737,6 +738,7 @@ pub const SyncClient = struct {
         var resp = try self.readRpcResponse();
         defer resp.deinit(self.allocator);
         if (resp.op != .blob_data or resp.payload.len < 33) return error.GetBlobFailed;
+        if (!std.mem.eql(u8, resp.payload[0..32], &lookup_id)) return error.GetBlobFailed;
         if (resp.payload[32] == 0) return null;
         var key = crypto.deriveTopicKey(self.master_key, topic);
         defer crypto.zeroize(&key);
@@ -764,6 +766,7 @@ pub const SyncClient = struct {
         var resp = try self.readRpcResponse();
         defer resp.deinit(self.allocator);
         if (resp.op != .blob_data or resp.payload.len < 33) return error.GetBlobFailed;
+        if (!std.mem.eql(u8, resp.payload[0..32], &lookup_id)) return error.GetBlobFailed;
         if (resp.payload[32] == 0) return null;
         var key = crypto.deriveTopicKey(self.master_key, topic);
         defer crypto.zeroize(&key);
@@ -1308,6 +1311,14 @@ pub const SyncClient = struct {
                 last_seq = page.last_seq;
                 dirty = true;
             }
+            if (last_seq > st.last_pulled_seq) {
+                st.last_pulled_seq = last_seq;
+                dirty = true;
+            }
+            if (dirty) {
+                try self.saveWorkspaceCursorFile(ws, st);
+                dirty = false;
+            }
             if (!page.has_more or page.item_count == 0 or last_seq <= prev_seq) break;
         }
 
@@ -1714,6 +1725,7 @@ pub const SyncClientV3 = struct {
     sender_id: u128,
     remote_tag: [32]u8,
     out_seqs: std.AutoHashMapUnmanaged([32]u8, u64),
+    persisted_out_seqs: std.AutoHashMapUnmanaged([32]u8, u64),
     seen_seqs: std.AutoHashMapUnmanaged(SenderKey, u64),
     authorized_topics: std.AutoHashMapUnmanaged([32]u8, AuthGrantCache),
     scoped_tokens: std.AutoHashMapUnmanaged([32]u8, CapabilityTokenV3),
@@ -1722,6 +1734,8 @@ pub const SyncClientV3 = struct {
     quarantined: std.ArrayList(QuarantinedFrame),
     quarantined_count: usize,
     last_lease_result: ?LeaseResult,
+    cursor_dir: ?Io.Dir,
+    shared_git_remote_verified: bool,
 
     fn connectInternal(
         allocator: Allocator,
@@ -1762,6 +1776,7 @@ pub const SyncClientV3 = struct {
             .sender_id = sender,
             .remote_tag = remote_tag,
             .out_seqs = .empty,
+            .persisted_out_seqs = .empty,
             .seen_seqs = .empty,
             .authorized_topics = .empty,
             .scoped_tokens = .empty,
@@ -1770,6 +1785,8 @@ pub const SyncClientV3 = struct {
             .quarantined = .empty,
             .quarantined_count = 0,
             .last_lease_result = null,
+            .cursor_dir = null,
+            .shared_git_remote_verified = false,
         };
     }
 
@@ -1835,6 +1852,7 @@ pub const SyncClientV3 = struct {
         self.pending_lease_cancels.deinit(self.allocator);
         self.quarantined.deinit(self.allocator);
         self.out_seqs.deinit(self.allocator);
+        self.persisted_out_seqs.deinit(self.allocator);
         self.seen_seqs.deinit(self.allocator);
         self.authorized_topics.deinit(self.allocator);
         var tit = self.scoped_tokens.valueIterator();
@@ -1849,6 +1867,14 @@ pub const SyncClientV3 = struct {
 
     pub fn setPolicy(self: *SyncClientV3, policy: HydrationPolicy) void {
         self.policy = policy;
+    }
+
+    pub fn setCursorDir(self: *SyncClientV3, dir: Io.Dir) void {
+        self.cursor_dir = dir;
+    }
+
+    pub fn setSharedGitRemoteVerified(self: *SyncClientV3, verified: bool) void {
+        self.shared_git_remote_verified = verified;
     }
 
     pub fn addScopedToken(self: *SyncClientV3, token: CapabilityTokenV3) !void {
@@ -1948,6 +1974,11 @@ pub const SyncClientV3 = struct {
         while (true) {
             var frame = wire.readFrameBlocking(self.allocator, self.fd) catch return;
             const op = frame.op;
+            if (op == .frame_event or op == wire.EVENT_LEASE_CANCEL) {
+                self.bufferAsyncEvent(&frame) catch {};
+                frame.deinit(self.allocator);
+                continue;
+            }
             frame.deinit(self.allocator);
             if (op == stop_op or op == .err) return;
         }
@@ -1973,9 +2004,10 @@ pub const SyncClientV3 = struct {
             granted_expires = tok.expires_ms;
         } else if (self.keyring.getTopicGrant(topic_id)) |grant| {
             if (grant.token.len == wire.AUTH_V3_LEN) {
+                try keyring_mod.validateAuthV3Token(grant.token, topic_id, grant.perms, grant.expires_ms);
                 @memcpy(&auth_buf, grant.token[0..wire.AUTH_V3_LEN]);
-                granted_perms = std.mem.readInt(u32, auth_buf[32..36], .little);
-                granted_expires = std.mem.readInt(u64, auth_buf[36..44], .little);
+                granted_perms = grant.perms;
+                granted_expires = grant.expires_ms;
             } else if (grant.token.len == 32) {
                 const mac: [32]u8 = grant.token[0..32].*;
                 auth_buf = wire.encodeAuthV3(topic_id, grant.perms, grant.expires_ms, mac);
@@ -2006,10 +2038,13 @@ pub const SyncClientV3 = struct {
         if (resp.op == .err) return self.mapRelayError(resp.payload);
         if (resp.op != .ack) return error.AuthFailed;
 
-        const prev = self.authorized_topics.get(topic_id) orelse AuthGrantCache{ .perms = 0, .expires_ms = 0 };
+        const raw_prev = self.authorized_topics.get(topic_id) orelse AuthGrantCache{ .perms = 0, .expires_ms = 0 };
+        const prev_valid = raw_prev.perms != 0 and (raw_prev.expires_ms == 0 or now_ms < raw_prev.expires_ms);
+        const prev = if (prev_valid) raw_prev else AuthGrantCache{ .perms = 0, .expires_ms = 0 };
         const merged_exp: u64 = blk: {
             if (prev.perms == 0) break :blk granted_expires;
-            if (prev.expires_ms == 0 or granted_expires == 0) break :blk 0;
+            if (prev.expires_ms == 0) break :blk granted_expires;
+            if (granted_expires == 0) break :blk prev.expires_ms;
             break :blk @min(prev.expires_ms, granted_expires);
         };
         try self.authorized_topics.put(self.allocator, topic_id, .{
@@ -2341,7 +2376,11 @@ pub const SyncClientV3 = struct {
     }
 
     pub fn subscribeV3(self: *SyncClientV3, topic_id: [32]u8, after_seq: u64) ![]DecryptedFrame {
-        try self.authV3(topic_id, wire.PERM_SUB);
+        const req_perm: u32 = if (after_seq == std.math.maxInt(u64))
+            wire.PERM_SUB
+        else
+            (@as(u32, wire.PERM_SUB) | wire.PERM_READ);
+        try self.authV3(topic_id, req_perm);
         var req: [32 + 8]u8 = undefined;
         @memcpy(req[0..32], &topic_id);
         std.mem.writeInt(u64, req[32..40], after_seq, .little);
@@ -2353,10 +2392,17 @@ pub const SyncClientV3 = struct {
             backlog.deinit(self.allocator);
         }
 
+        var last_seq = after_seq;
+        var has_more = false;
+        var item_count: usize = 0;
+
         while (true) {
             var frame = try wire.readFrameBlocking(self.allocator, self.fd);
             defer frame.deinit(self.allocator);
-            if (frame.op == .ack) break;
+            if (frame.op == .ack) {
+                has_more = (frame.flags & wire.RANGE_FLAG_HAS_MORE) != 0;
+                break;
+            }
             if (frame.op == .err) return self.mapRelayError(frame.payload);
             if (frame.op == .frame_event or frame.op == wire.EVENT_LEASE_CANCEL) {
                 try self.bufferAsyncEvent(&frame);
@@ -2369,6 +2415,8 @@ pub const SyncClientV3 = struct {
                     return error.BadRelayFrame;
                 }
                 const seq = std.mem.readInt(u64, frame.payload[32..40], .little);
+                if (seq > last_seq) last_seq = seq;
+                item_count += 1;
                 const dec = openFramePayloadV3(self.allocator, self.keyring, topic_id, frame.payload[40..], &self.seen_seqs, self.allocator) catch |err| switch (err) {
                     error.ReplayOrReorder => continue,
                     error.InvalidEnvelope => {
@@ -2394,6 +2442,23 @@ pub const SyncClientV3 = struct {
                 });
             }
         }
+
+        if (has_more and item_count > 0) {
+            var cursor = last_seq;
+            while (true) {
+                var page = try self.getEncryptedRangePageV3(self.allocator, topic_id, cursor, PULL_PAGE_LIMIT);
+                errdefer page.deinit(self.allocator);
+                try backlog.ensureUnusedCapacity(self.allocator, page.frames.len);
+                for (page.frames) |f| {
+                    backlog.appendAssumeCapacity(f);
+                }
+                self.allocator.free(page.frames);
+                page.frames = &.{};
+                if (!page.has_more or page.item_count == 0 or page.last_seq <= cursor) break;
+                cursor = page.last_seq;
+            }
+        }
+
         return try backlog.toOwnedSlice(self.allocator);
     }
 
@@ -2421,15 +2486,14 @@ pub const SyncClientV3 = struct {
         return payload.len;
     }
 
-    pub fn getEncryptedBlobV3(
+    fn fetchEncryptedBlobWithKey(
         self: *SyncClientV3,
         allocator: Allocator,
         topic_id: [32]u8,
+        ek: *const crypto.EntityKey,
         oid: [32]u8,
     ) !?[]u8 {
-        try self.authV3(topic_id, wire.PERM_READ);
-        const ek = self.keyring.getEntityKey(topic_id) orelse return error.PermissionDenied;
-        const lookup_id = crypto.deriveBlobLookupIdV3(&ek, topic_id, oid);
+        const lookup_id = crypto.deriveBlobLookupIdV3(ek, topic_id, oid);
         var req: [64]u8 = undefined;
         @memcpy(req[0..32], &topic_id);
         @memcpy(req[32..64], &lookup_id);
@@ -2439,9 +2503,10 @@ pub const SyncClientV3 = struct {
         defer resp.deinit(self.allocator);
         if (resp.op == .err) return self.mapRelayError(resp.payload);
         if (resp.op != .blob_data or resp.payload.len < 33) return error.GetBlobFailed;
+        if (!std.mem.eql(u8, resp.payload[0..32], &lookup_id)) return error.GetBlobFailed;
         if (resp.payload[32] == 0) return null;
 
-        var key = crypto.deriveStreamKeyV3(&ek, topic_id);
+        var key = crypto.deriveStreamKeyV3(ek, topic_id);
         defer crypto.zeroize(&key);
         const aad = buildBlobAadV3(topic_id, ek.epoch, oid);
         const plain = try crypto.open(allocator, key, &aad, resp.payload[33..]);
@@ -2449,6 +2514,28 @@ pub const SyncClientV3 = struct {
         const actual = crypto.hashBytes(plain);
         if (!std.mem.eql(u8, &actual, &oid)) return error.HashMismatch;
         return plain;
+    }
+
+    pub fn getEncryptedBlobV3(
+        self: *SyncClientV3,
+        allocator: Allocator,
+        topic_id: [32]u8,
+        oid: [32]u8,
+    ) !?[]u8 {
+        try self.authV3(topic_id, wire.PERM_READ);
+        const ek = self.keyring.getEntityKey(topic_id) orelse return error.PermissionDenied;
+        if (try self.fetchEncryptedBlobWithKey(allocator, topic_id, &ek, oid)) |plain| {
+            return plain;
+        }
+        const priors = self.keyring.getPriorEntityKeys(topic_id);
+        var idx = priors.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (try self.fetchEncryptedBlobWithKey(allocator, topic_id, &priors[idx], oid)) |plain| {
+                return plain;
+            }
+        }
+        return null;
     }
 
     pub fn putEncryptedGitBlobV3(
@@ -2461,16 +2548,15 @@ pub const SyncClientV3 = struct {
         return self.putEncryptedBlobV3(topic_id, key_oid, plaintext);
     }
 
-    pub fn getEncryptedGitBlobV3(
+    fn fetchEncryptedGitBlobWithKey(
         self: *SyncClientV3,
         allocator: Allocator,
         topic_id: [32]u8,
+        ek: *const crypto.EntityKey,
         git_oid: git_dirs_mod.GitOid,
+        key_oid: [32]u8,
     ) !?[]u8 {
-        try self.authV3(topic_id, wire.PERM_READ);
-        const ek = self.keyring.getEntityKey(topic_id) orelse return error.PermissionDenied;
-        const key_oid = gitBlobLookupOid(git_oid);
-        const lookup_id = crypto.deriveBlobLookupIdV3(&ek, topic_id, key_oid);
+        const lookup_id = crypto.deriveBlobLookupIdV3(ek, topic_id, key_oid);
         var req: [64]u8 = undefined;
         @memcpy(req[0..32], &topic_id);
         @memcpy(req[32..64], &lookup_id);
@@ -2480,9 +2566,10 @@ pub const SyncClientV3 = struct {
         defer resp.deinit(self.allocator);
         if (resp.op == .err) return self.mapRelayError(resp.payload);
         if (resp.op != .blob_data or resp.payload.len < 33) return error.GetBlobFailed;
+        if (!std.mem.eql(u8, resp.payload[0..32], &lookup_id)) return error.GetBlobFailed;
         if (resp.payload[32] == 0) return null;
 
-        var key = crypto.deriveStreamKeyV3(&ek, topic_id);
+        var key = crypto.deriveStreamKeyV3(ek, topic_id);
         defer crypto.zeroize(&key);
         const aad = buildBlobAadV3(topic_id, ek.epoch, key_oid);
         const plain = try crypto.open(allocator, key, &aad, resp.payload[33..]);
@@ -2491,6 +2578,29 @@ pub const SyncClientV3 = struct {
         const actual = git_dirs_mod.GitOid.ofBlob(fmt, plain);
         if (!actual.eql(git_oid)) return error.HashMismatch;
         return plain;
+    }
+
+    pub fn getEncryptedGitBlobV3(
+        self: *SyncClientV3,
+        allocator: Allocator,
+        topic_id: [32]u8,
+        git_oid: git_dirs_mod.GitOid,
+    ) !?[]u8 {
+        try self.authV3(topic_id, wire.PERM_READ);
+        const ek = self.keyring.getEntityKey(topic_id) orelse return error.PermissionDenied;
+        const key_oid = gitBlobLookupOid(git_oid);
+        if (try self.fetchEncryptedGitBlobWithKey(allocator, topic_id, &ek, git_oid, key_oid)) |plain| {
+            return plain;
+        }
+        const priors = self.keyring.getPriorEntityKeys(topic_id);
+        var idx = priors.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (try self.fetchEncryptedGitBlobWithKey(allocator, topic_id, &priors[idx], git_oid, key_oid)) |plain| {
+                return plain;
+            }
+        }
+        return null;
     }
 
     fn loadSpaceCursor(self: *SyncClientV3, state_dir: Io.Dir, topic_id: [32]u8) !SpaceCursorState {
@@ -2534,6 +2644,10 @@ pub const SyncClientV3 = struct {
         const cur_out = self.out_seqs.get(topic_id) orelse 0;
         if (st.out_seq > cur_out) {
             try self.out_seqs.put(self.allocator, topic_id, st.out_seq);
+        }
+        const cur_persisted = self.persisted_out_seqs.get(topic_id) orelse 0;
+        if (st.out_seq > cur_persisted) {
+            try self.persisted_out_seqs.put(self.allocator, topic_id, st.out_seq);
         }
 
         const pushed_n = r.readVarint() catch return st;
@@ -2582,7 +2696,10 @@ pub const SyncClientV3 = struct {
         var cursors_dir = try state_dir.openDir(self.io, "sync_cursors", .{ .iterate = true });
         defer cursors_dir.close(self.io);
 
-        const out_seq = @max(st.out_seq, self.out_seqs.get(topic_id) orelse 0);
+        const out_seq = @max(
+            st.out_seq,
+            @max(self.out_seqs.get(topic_id) orelse 0, self.persisted_out_seqs.get(topic_id) orelse 0),
+        );
 
         var w = codec.Writer{};
         defer w.deinit(self.allocator);
@@ -2635,6 +2752,32 @@ pub const SyncClientV3 = struct {
         var name_buf: [80]u8 = undefined;
         const fname = cursorFileName(self.remote_tag, topic_id, &name_buf);
         try mmap.atomicWriteFile(self.io, cursors_dir, fname, w.items());
+        const cur_persisted = self.persisted_out_seqs.get(topic_id) orelse 0;
+        if (out_seq > cur_persisted) {
+            self.persisted_out_seqs.put(self.allocator, topic_id, out_seq) catch {};
+        }
+    }
+
+    fn reserveSpaceOutSeq(
+        self: *SyncClientV3,
+        state_dir: Io.Dir,
+        topic_id: [32]u8,
+        st: *const SpaceCursorState,
+    ) !void {
+        const used = self.out_seqs.get(topic_id) orelse 0;
+        const reserved = self.persisted_out_seqs.get(topic_id) orelse 0;
+        if (used + 1 <= reserved) return;
+        const new_reserved = used + SEQ_RESERVE_STRIDE;
+        const prev_opt = self.persisted_out_seqs.get(topic_id);
+        try self.persisted_out_seqs.put(self.allocator, topic_id, new_reserved);
+        errdefer {
+            if (prev_opt) |prev| {
+                self.persisted_out_seqs.put(self.allocator, topic_id, prev) catch {};
+            } else {
+                _ = self.persisted_out_seqs.remove(topic_id);
+            }
+        }
+        try self.saveSpaceCursor(state_dir, topic_id, st);
     }
 
     fn loadLogCursor(self: *SyncClientV3, base_dir: Io.Dir, topic_id: [32]u8) !LogCursorState {
@@ -2675,6 +2818,10 @@ pub const SyncClientV3 = struct {
         if (st.out_seq > cur_out) {
             try self.out_seqs.put(self.allocator, topic_id, st.out_seq);
         }
+        const cur_persisted = self.persisted_out_seqs.get(topic_id) orelse 0;
+        if (st.out_seq > cur_persisted) {
+            try self.persisted_out_seqs.put(self.allocator, topic_id, st.out_seq);
+        }
 
         const ids_n = r.readVarint() catch return st;
         if (ids_n > 2_000_000) return st;
@@ -2701,7 +2848,10 @@ pub const SyncClientV3 = struct {
         var cursors_dir = try base_dir.openDir(self.io, "sync_cursors", .{ .iterate = true });
         defer cursors_dir.close(self.io);
 
-        const out_seq = @max(st.out_seq, self.out_seqs.get(topic_id) orelse 0);
+        const out_seq = @max(
+            st.out_seq,
+            @max(self.out_seqs.get(topic_id) orelse 0, self.persisted_out_seqs.get(topic_id) orelse 0),
+        );
 
         var w = codec.Writer{};
         defer w.deinit(self.allocator);
@@ -2738,16 +2888,49 @@ pub const SyncClientV3 = struct {
         var name_buf: [80]u8 = undefined;
         const fname = cursorFileName(self.remote_tag, topic_id, &name_buf);
         try mmap.atomicWriteFile(self.io, cursors_dir, fname, w.items());
+        const cur_persisted = self.persisted_out_seqs.get(topic_id) orelse 0;
+        if (out_seq > cur_persisted) {
+            self.persisted_out_seqs.put(self.allocator, topic_id, out_seq) catch {};
+        }
     }
 
-    fn isGitBlobReachable(space: *const space_mod.Space, git_oid: git_dirs_mod.GitOid) bool {
-        if (space.origin) |orig| {
-            if (orig.git_base_rev != null) return true;
+    fn reserveLogOutSeq(
+        self: *SyncClientV3,
+        base_dir: Io.Dir,
+        topic_id: [32]u8,
+        st: *const LogCursorState,
+    ) !void {
+        const used = self.out_seqs.get(topic_id) orelse 0;
+        const reserved = self.persisted_out_seqs.get(topic_id) orelse 0;
+        if (used + 1 <= reserved) return;
+        const new_reserved = used + SEQ_RESERVE_STRIDE;
+        const prev_opt = self.persisted_out_seqs.get(topic_id);
+        try self.persisted_out_seqs.put(self.allocator, topic_id, new_reserved);
+        errdefer {
+            if (prev_opt) |prev| {
+                self.persisted_out_seqs.put(self.allocator, topic_id, prev) catch {};
+            } else {
+                _ = self.persisted_out_seqs.remove(topic_id);
+            }
         }
+        try self.saveLogCursor(base_dir, topic_id, st);
+    }
+
+    fn isGitBlobReachableForPull(space: *const space_mod.Space, git_oid: git_dirs_mod.GitOid) bool {
         if (space.external_git_reader) |gr| {
-            if (gr.contains(git_oid)) return true;
+            return gr.contains(git_oid);
         }
-        return space.kind == .git_worktree;
+        return false;
+    }
+
+    fn isGitBlobReachableForPush(self: *const SyncClientV3, space: *const space_mod.Space, git_oid: git_dirs_mod.GitOid) bool {
+        if (!self.shared_git_remote_verified) return false;
+        const orig = space.origin orelse return false;
+        if (orig.git_remote_url == null or orig.git_base_rev == null) return false;
+        if (space.external_git_reader) |gr| {
+            return gr.contains(git_oid);
+        }
+        return false;
     }
 
     fn pushSingleSpaceBatch(
@@ -2792,7 +2975,7 @@ pub const SyncClientV3 = struct {
                         }
                     },
                     .git => |git_oid| {
-                        if (isGitBlobReachable(space, git_oid)) {
+                        if (self.isGitBlobReachableForPush(space, git_oid)) {
                             stats.git_blobs_skipped += 1;
                         } else {
                             const key_oid = gitBlobLookupOid(git_oid);
@@ -2810,6 +2993,8 @@ pub const SyncClientV3 = struct {
                 }
             }
         }
+
+        try self.reserveSpaceOutSeq(space.state_dir, topic_id, cursor);
 
         const res = if (batch.blobs.len > 0) blk: {
             var stripped = batch.*;
@@ -2845,6 +3030,13 @@ pub const SyncClientV3 = struct {
 
         if (cursor.has_pushed_once and space.history.dag.heads.eql(&cursor.last_pushed_heads)) {
             return stats;
+        }
+
+        errdefer {
+            if (stats.frames_pushed > 0 or stats.blobs_pushed > 0) {
+                cursor.out_seq = @max(cursor.out_seq, self.out_seqs.get(topic_id) orelse 0);
+                self.saveSpaceCursor(space.state_dir, topic_id, &cursor) catch {};
+            }
         }
 
         const wal_base = space.manifest.wal_base_seq;
@@ -2931,7 +3123,7 @@ pub const SyncClientV3 = struct {
                         }
                     },
                     .git => |git_oid| {
-                        if (self.policy == .cloud_runner or isGitBlobReachable(space, git_oid)) {
+                        if (isGitBlobReachableForPull(space, git_oid)) {
                             stats.git_blobs_skipped += 1;
                             continue;
                         }
@@ -3088,6 +3280,14 @@ pub const SyncClientV3 = struct {
                 last_seq = page.last_seq;
                 dirty = true;
             }
+            if (last_seq > cursor.last_pulled_seq) {
+                cursor.last_pulled_seq = last_seq;
+                dirty = true;
+            }
+            if (dirty) {
+                try self.saveSpaceCursor(space.state_dir, topic_id, &cursor);
+                dirty = false;
+            }
             if (!page.has_more or page.item_count == 0 or last_seq <= prev_seq) break;
         }
 
@@ -3108,6 +3308,7 @@ pub const SyncClientV3 = struct {
             cursor.last_pushed_heads.deinit(self.allocator);
             cursor.last_pushed_heads = new_heads;
             cursor.last_pushed_wal_seq = @max(space.batch_log.lastSeq(), space.manifest.wal_base_seq);
+            dirty = true;
         }
         if (dirty) {
             try self.saveSpaceCursor(space.state_dir, topic_id, &cursor);
@@ -3176,10 +3377,18 @@ pub const SyncClientV3 = struct {
         const events = try thread_store.eventsSince(self.allocator, cursor.last_pushed_local_seq);
         defer thread_store_mod.ThreadStore.freeEvents(self.allocator, events);
 
+        errdefer {
+            if (stats.frames_pushed > 0) {
+                cursor.out_seq = @max(cursor.out_seq, self.out_seqs.get(topic_id) orelse 0);
+                self.saveLogCursor(thread_store.thread_dir, topic_id, &cursor) catch {};
+            }
+        }
+
         for (events) |ev| {
             if (cursor.pushed_ids.contains(ev.event_id)) continue;
             const raw = try ev.encodeAlloc(self.allocator);
             defer self.allocator.free(raw);
+            try self.reserveLogOutSeq(thread_store.thread_dir, topic_id, &cursor);
             const res = try self.putEncryptedFrameV3(topic_id, raw, lease_epoch);
             try cursor.pushed_ids.put(self.allocator, ev.event_id, {});
             stats.frames_pushed += 1;
@@ -3236,6 +3445,14 @@ pub const SyncClientV3 = struct {
                 last_seq = page.last_seq;
                 dirty = true;
             }
+            if (last_seq > cursor.last_pulled_relay_seq) {
+                cursor.last_pulled_relay_seq = last_seq;
+                dirty = true;
+            }
+            if (dirty) {
+                try self.saveLogCursor(thread_store.thread_dir, topic_id, &cursor);
+                dirty = false;
+            }
             if (!page.has_more or page.item_count == 0 or last_seq <= prev_seq) break;
         }
 
@@ -3250,11 +3467,44 @@ pub const SyncClientV3 = struct {
         return stats;
     }
 
+    pub fn pushInboxWithDir(
+        self: *SyncClientV3,
+        base_dir: Io.Dir,
+        parent_inbox_topic_id: [32]u8,
+        mailbox_item: *const thread_model.MailboxItem,
+    ) !SyncStats {
+        var cursor = try self.loadLogCursor(base_dir, parent_inbox_topic_id);
+        defer cursor.deinit(self.allocator);
+
+        try self.reserveLogOutSeq(base_dir, parent_inbox_topic_id, &cursor);
+
+        var w = codec.Writer{};
+        defer w.deinit(self.allocator);
+        try w.writeByte(self.allocator, INBOX_FRAME_VERSION);
+        try mailbox_item.encode(self.allocator, &w);
+        const res = try self.putEncryptedFrameInternal(
+            parent_inbox_topic_id,
+            w.items(),
+            null,
+            wire.PERM_INBOX_APPEND,
+        );
+        cursor.out_seq = @max(cursor.out_seq, self.out_seqs.get(parent_inbox_topic_id) orelse 0);
+        try self.saveLogCursor(base_dir, parent_inbox_topic_id, &cursor);
+        return .{
+            .frames_pushed = 1,
+            .bytes_transferred = res.wire_bytes,
+            .last_seq = res.seq,
+        };
+    }
+
     pub fn pushInbox(
         self: *SyncClientV3,
         parent_inbox_topic_id: [32]u8,
         mailbox_item: *const thread_model.MailboxItem,
     ) !SyncStats {
+        if (self.cursor_dir) |dir| {
+            return self.pushInboxWithDir(dir, parent_inbox_topic_id, mailbox_item);
+        }
         var w = codec.Writer{};
         defer w.deinit(self.allocator);
         try w.writeByte(self.allocator, INBOX_FRAME_VERSION);
@@ -3330,6 +3580,14 @@ pub const SyncClientV3 = struct {
                 last_seq = page.last_seq;
                 dirty = true;
             }
+            if (last_seq > cursor.last_pulled_relay_seq) {
+                cursor.last_pulled_relay_seq = last_seq;
+                dirty = true;
+            }
+            if (dirty) {
+                try self.saveLogCursor(thread_store.thread_dir, inbox_topic_id, &cursor);
+                dirty = false;
+            }
             if (!page.has_more or page.item_count == 0 or last_seq <= prev_seq) break;
         }
 
@@ -3365,11 +3623,19 @@ pub const SyncClientV3 = struct {
             if (entries.len > 0) self.allocator.free(entries);
         }
 
+        errdefer {
+            if (stats.frames_pushed > 0) {
+                cursor.out_seq = @max(cursor.out_seq, self.out_seqs.get(topic_id) orelse 0);
+                self.saveLogCursor(catalog_store.catalog_dir, topic_id, &cursor) catch {};
+            }
+        }
+
         for (entries) |entry| {
             const raw = try entry.encodeAlloc(self.allocator);
             defer self.allocator.free(raw);
             const eid = hashBytesToU128(raw);
             if (cursor.pushed_ids.contains(eid)) continue;
+            try self.reserveLogOutSeq(catalog_store.catalog_dir, topic_id, &cursor);
             const res = try self.putEncryptedFrameV3(topic_id, raw, null);
             try cursor.pushed_ids.put(self.allocator, eid, {});
             stats.frames_pushed += 1;
@@ -3426,6 +3692,14 @@ pub const SyncClientV3 = struct {
             if (page.last_seq > last_seq) {
                 last_seq = page.last_seq;
                 dirty = true;
+            }
+            if (last_seq > cursor.last_pulled_relay_seq) {
+                cursor.last_pulled_relay_seq = last_seq;
+                dirty = true;
+            }
+            if (dirty) {
+                try self.saveLogCursor(catalog_store.catalog_dir, topic_id, &cursor);
+                dirty = false;
             }
             if (!page.has_more or page.item_count == 0 or last_seq <= prev_seq) break;
         }
