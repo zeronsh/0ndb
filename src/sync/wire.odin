@@ -68,6 +68,22 @@ FEED_META_TAG :: 2
 FEED_ENTRY :: 40
 FEED_BATCH :: 1500
 FEED_DROPPED :: max(u64)
+FEED_PATTERNS_MAX :: 16384
+FEED_PATTERNS_FRAME :: 1900
+FEED_SKIP_REPORT :: 16 * FEED_BATCH * FEED_ENTRY
+FEED_FILTERED :: 1
+FEED_ADD :: 2
+
+Feed_Pattern_Kind :: enum u8 {
+	Prefix = 1,
+	Suffix = 2,
+	Exact  = 3,
+}
+
+Feed_Pattern :: struct {
+	kind:  Feed_Pattern_Kind,
+	bytes: [32]u8,
+}
 
 HELLO_LEN :: 1 + 32 + 32 + 64 + 64
 APPEND_FIXED :: 32 + 8

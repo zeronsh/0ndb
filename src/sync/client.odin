@@ -327,12 +327,32 @@ client_redact :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
 	return frame_end(b, start, &w)
 }
 
-client_feed_follow :: proc(c: ^Client, from: u64) -> Error {
-	b := _client_buf(c)
-	start := frame_begin(b, .Feed) or_return
-	w := prim.writer(b)
-	prim.write_u64le(&w, from)
-	return frame_end(b, start, &w)
+client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil, filtered := false) -> Error {
+	if len(patterns) > FEED_PATTERNS_MAX {
+		return .Too_Large
+	}
+	rest := patterns
+	first := true
+	for first || len(rest) > 0 {
+		n := min(len(rest), FEED_PATTERNS_FRAME)
+		b := _client_buf(c)
+		start := frame_begin(b, .Feed) or_return
+		w := prim.writer(b)
+		prim.write_u64le(&w, from)
+		if filtered || len(patterns) > 0 {
+			prim.write_u8(&w, FEED_FILTERED | (0 if first else FEED_ADD))
+			prim.write_u16le(&w, u16(n))
+			for p in rest[:n] {
+				prim.write_u8(&w, u8(p.kind))
+				k := p.bytes
+				prim.write_raw(&w, k[:32] if p.kind == .Exact else k[:16])
+			}
+		}
+		frame_end(b, start, &w) or_return
+		rest = rest[n:]
+		first = false
+	}
+	return .None
 }
 
 client_forget :: proc(c: ^Client, keys: []Object_Key) -> Error {

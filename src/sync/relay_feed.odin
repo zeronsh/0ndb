@@ -186,7 +186,61 @@ _feed_release :: proc(r: ^Relay, sp: ^Space_State) {
 _on_feed :: proc(c: ^Conn, rd: ^prim.Reader) {
 	r := c.relay
 	from := prim.read_u64le(rd)
-	if !prim.reader_done(rd) {
+	if !prim.reader_ok(rd) {
+		_fail(c, .Protocol)
+		return
+	}
+	flags: u8
+	if prim.reader_remaining(rd) > 0 {
+		flags = prim.read_u8(rd)
+	}
+	if flags & FEED_ADD == 0 {
+		_filter_free(c)
+	}
+	if flags & FEED_FILTERED != 0 {
+		count := int(prim.read_u16le(rd))
+		f := c.filter
+		if f == nil {
+			nf, aerr := new(Feed_Filter, r.allocator)
+			if aerr != nil {
+				_conn_close(c)
+				return
+			}
+			nf.prefix = make(map[[16]u8]bool, r.allocator)
+			nf.suffix = make(map[[16]u8]bool, r.allocator)
+			nf.exact = make(map[[32]u8]bool, r.allocator)
+			c.filter = nf
+			f = nf
+		}
+		for _ in 0 ..< count {
+			kind := Feed_Pattern_Kind(prim.read_u8(rd))
+			#partial switch kind {
+			case .Prefix, .Suffix:
+				k: [16]u8
+				prim.read_fixed(rd, k[:])
+				if kind == .Prefix {
+					f.prefix[k] = true
+				} else {
+					f.suffix[k] = true
+				}
+			case .Exact:
+				k: [32]u8
+				prim.read_fixed(rd, k[:])
+				f.exact[k] = true
+			case:
+				_fail(c, .Protocol)
+				return
+			}
+		}
+		if !prim.reader_done(rd) || len(f.prefix) + len(f.suffix) + len(f.exact) > FEED_PATTERNS_MAX {
+			_fail(c, .Protocol)
+			return
+		}
+		if flags & FEED_ADD != 0 && c.feed_on {
+			c.feed_hint = true
+			return
+		}
+	} else if !prim.reader_done(rd) {
 		_fail(c, .Protocol)
 		return
 	}
@@ -213,6 +267,7 @@ _on_feed :: proc(c: ^Conn, rd: ^prim.Reader) {
 	}
 	c.feed_on = true
 	c.feed_off = off
+	c.feed_told = off
 	c.feed_hint = true
 	_announce(c, off, off, nil)
 }
@@ -271,15 +326,19 @@ _produce_feed :: proc(c: ^Conn) -> bool {
 	for i := 0; i + FEED_ENTRY <= len(raw); i += FEED_ENTRY {
 		id: [32]u8
 		copy(id[:], raw[i:i + 32])
-		if !_reserved(id) && principal_allows(&c.principal, .Read, id) {
+		if !_reserved(id) && _filter_match(c.filter, id) && principal_allows(&c.principal, .Read, id) {
 			if keep != i {
 				copy(raw[keep:], raw[i:i + FEED_ENTRY])
 			}
 			keep += FEED_ENTRY
 		}
 	}
-	from := c.feed_off
 	c.feed_off += i64(len(raw))
+	if keep == 0 && c.feed_off - c.feed_told < FEED_SKIP_REPORT {
+		return true
+	}
+	from := c.feed_told
+	c.feed_told = c.feed_off
 	_announce(c, from, c.feed_off, raw[:keep])
 	return true
 }
@@ -613,6 +672,7 @@ _compact_switch :: proc(r: ^Relay, sp: ^Space_State) {
 		} else {
 			f.feed_off = sp.feed_base
 		}
+		f.feed_told = f.feed_off
 		f.feed_hint = true
 		_conn_kick(f)
 	}
@@ -636,4 +696,40 @@ _compact_switch :: proc(r: ^Relay, sp: ^Space_State) {
 		}
 	}
 	_stream_maybe_release(r, old)
+}
+
+Feed_Filter :: struct {
+	prefix: map[[16]u8]bool,
+	suffix: map[[16]u8]bool,
+	exact:  map[[32]u8]bool,
+}
+
+@(private)
+_filter_free :: proc(c: ^Conn) {
+	if c.filter == nil {
+		return
+	}
+	delete(c.filter.prefix)
+	delete(c.filter.suffix)
+	delete(c.filter.exact)
+	free(c.filter, c.relay.allocator)
+	c.filter = nil
+}
+
+@(private)
+_filter_match :: proc(f: ^Feed_Filter, id: [32]u8) -> bool {
+	if f == nil {
+		return true
+	}
+	v := id
+	if id in f.exact {
+		return true
+	}
+	p: [16]u8
+	copy(p[:], v[:16])
+	if p in f.prefix {
+		return true
+	}
+	copy(p[:], v[16:])
+	return p in f.suffix
 }

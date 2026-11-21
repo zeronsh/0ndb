@@ -227,7 +227,9 @@ Conn :: struct {
 	blocked:   bool,
 	feed_on:   bool,
 	feed_off:  i64,
+	feed_told: i64,
 	feed_hint: bool,
+	filter:    ^Feed_Filter,
 	source:    [16]u8,
 	sourced:   bool,
 	pkey:      [32]u8,
@@ -859,6 +861,7 @@ _conn_close :: proc(c: ^Conn) {
 		if c.feed_on {
 			_remove_conn(&sp.feeders, c)
 		}
+		_filter_free(c)
 		sp.conns -= 1
 		c.space = nil
 		_space_release(r, sp)
@@ -1657,11 +1660,6 @@ _on_redact :: proc(c: ^Conn, rd: ^prim.Reader) {
 		_stream_maybe_release(r, st)
 		return
 	}
-	if st.busy {
-		_reply_refused(c, .Busy, cast([32]u8)id)
-		_stream_maybe_release(r, st)
-		return
-	}
 	p := _pending_new(c, .Redact, st, hi, cast([32]u8)id)
 	if p == nil {
 		_reply_refused(c, .Io, cast([32]u8)id)
@@ -1669,7 +1667,6 @@ _on_redact :: proc(c: ^Conn, rd: ^prim.Reader) {
 		return
 	}
 	p.from = lo
-	st.busy = true
 	r.store.redact(r.store.data, st.h, lo, hi, _relay_done, p)
 }
 
@@ -1896,7 +1893,6 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			_reply_refused(c, .Quota if result == .No_Space else .Io, p.id)
 		}
 	case .Redact:
-		p.stream.busy = false
 		if c != nil {
 			if result == .None {
 				_reply_redacted(c, p.id, p.from, p.total)

@@ -45,6 +45,7 @@ Verify_Request :: struct {
 	to:      i64,
 	span:    ^journal.Sig_Info,
 	span_ok: ^bool,
+	done:    i64,
 }
 
 Repl_Event :: struct {
@@ -77,6 +78,7 @@ Replicator_Config :: struct {
 	credentials:  Credentials,
 	link:         Client_Link,
 	verify:       proc(user: rawptr, req: ^Verify_Request) -> Verdict,
+	filtered:     bool,
 	padding:      bool,
 	kernel_tls:   bool,
 	on_event:     Repl_Handler,
@@ -147,6 +149,7 @@ Remote :: struct {
 	held:      i64,
 	pulled:    i64,
 	pulling:   bool,
+	verified:  [dynamic]journal.Range,
 	span:      journal.Sig_Info,
 	span_ok:   bool,
 	span_fd:   prim.Fd,
@@ -401,6 +404,9 @@ replicator_follow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name
 	rm.follow = true
 	rm.full = rm.full || full
 	if !was && r.phase == .Ready {
+		if r.cfg.filtered {
+			_feed_subscribe(r, false)
+		}
 		_remote_follow_send(r, rm)
 		_repl_flush(r)
 	}
@@ -416,8 +422,12 @@ replicator_unfollow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, na
 	rm.follow = false
 	rm.full = false
 	if r.phase == .Ready {
-		ids := [1]Stream_Id{id}
-		client_unfollow(&r.client, ids[:])
+		if r.cfg.filtered {
+			_feed_subscribe(r, false)
+		} else {
+			ids := [1]Stream_Id{id}
+			client_unfollow(&r.client, ids[:])
+		}
 		_repl_flush(r)
 	}
 	_remote_maybe_free(r, rm)
@@ -864,6 +874,7 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 	_span_load(r, rm, path)
 	rm.wants = make([dynamic]journal.Range, r.allocator)
 	rm.inflight = make([dynamic]journal.Range, r.allocator)
+	rm.verified = make([dynamic]journal.Range, r.allocator)
 	nerr, perr: Error
 	rm.name, nerr = _clone_string(name, r.allocator)
 	rm.path, perr = _clone_string(path, r.allocator)
@@ -896,6 +907,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 	}
 	delete(rm.wants)
 	delete(rm.inflight)
+	delete(rm.verified)
 	delete(rm.name, r.allocator)
 	delete(rm.path, r.allocator)
 	free(rm, r.allocator)
@@ -966,6 +978,20 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 }
 
 @(private)
+_fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
+	if r.phase != .Ready || _covered_inflight(rm, gap) {
+		return
+	}
+	fetch := gap
+	if fetch.to - fetch.from < MIN_FETCH {
+		fetch.from = max(fetch.to - MIN_FETCH, 0)
+	}
+	if client_read(&r.client, rm.id, fetch.from, fetch.to) == .None {
+		append(&rm.inflight, fetch)
+	}
+}
+
+@(private)
 _covered_inflight :: proc(rm: ^Remote, g: journal.Range) -> bool {
 	for f in rm.inflight {
 		if f.from < 0 || (f.from <= g.from && f.to >= g.to) {
@@ -994,7 +1020,7 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 		}
 		gap, missing := journal.replica_missing(&rm.rep, w.from, to)
 		if !missing {
-			v := _verdict(r, rm, w.from, to)
+			v, _, _ := _verdict(r, rm, w.from, to)
 			if v == .Hold {
 				i += 1
 				continue
@@ -1007,15 +1033,7 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = to, length = rm.relay_len})
 			continue
 		}
-		if r.phase == .Ready && !_covered_inflight(rm, gap) {
-			fetch := gap
-			if fetch.to - fetch.from < MIN_FETCH {
-				fetch.from = max(fetch.to - MIN_FETCH, 0)
-			}
-			if client_read(&r.client, rm.id, fetch.from, fetch.to) == .None {
-				append(&rm.inflight, fetch)
-			}
-		}
+		_fetch_gap(r, rm, gap)
 		i += 1
 	}
 	_remote_maybe_free(r, rm)
@@ -1126,10 +1144,15 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	r.rx_remote = nil
 	_remote_landed(r, rm, r.rx_start, r.rx_at, ev.length)
 	if rm.follow && r.rx_at > r.rx_start && !rm.quarantined {
-		switch _verdict(r, rm, r.rx_start, r.rx_at) {
+		v, vlo, vhi := _verdict(r, rm, r.rx_start, r.rx_at)
+		switch v {
 		case .Accept:
-			_emit(r, Repl_Event{kind = .Grew, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = r.rx_start, to = r.rx_at, length = rm.relay_len})
+			from := min(r.rx_start, vlo) if vhi > vlo else r.rx_start
+			_emit(r, Repl_Event{kind = .Grew, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = from, to = r.rx_at, length = rm.relay_len})
 		case .Hold:
+			if vhi > vlo {
+				_emit(r, Repl_Event{kind = .Grew, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = vlo, to = vhi, length = rm.relay_len})
+			}
 		case .Equivocation:
 			_quarantine(r, rm, r.rx_start)
 			return
@@ -1279,13 +1302,17 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 
 @(private)
 _repl_on_ready :: proc(r: ^Replicator) {
-	if client_list(&r.client, r.cursor if r.listed else 0) == .None {
-		r.lists_out += 1
-	}
-	if r.feed_cursor >= 0 {
-		client_feed_follow(&r.client, u64(r.feed_cursor))
+	if r.cfg.filtered {
+		_feed_subscribe(r, r.feed_cursor < 0)
 	} else {
-		client_feed_follow(&r.client, FEED_DROPPED)
+		if client_list(&r.client, r.cursor if r.listed else 0) == .None {
+			r.lists_out += 1
+		}
+		if r.feed_cursor >= 0 {
+			client_feed_follow(&r.client, u64(r.feed_cursor))
+		} else {
+			client_feed_follow(&r.client, FEED_DROPPED)
+		}
 	}
 	_fetches_ready(r)
 	for _, rm in r.remotes {

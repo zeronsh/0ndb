@@ -75,9 +75,16 @@ chain_verify :: proc(cv: ^Chain_Verifier, req: ^Verify_Request) -> Verdict {
 		#partial switch c.err {
 		case .None:
 			return .Accept
+		case .Missing:
+			if c.pos >= req.to {
+				return .Accept
+			}
+			req.done = c.pos
+			return .Hold
 		case .Equivocation, .Forged, .Corrupt:
 			return .Equivocation
 		case:
+			req.done = c.pos
 			return .Hold
 		}
 	}

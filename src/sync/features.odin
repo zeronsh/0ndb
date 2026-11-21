@@ -108,12 +108,26 @@ _keys_path :: proc(r: ^Replicator, buf: ^prim.Path_Buf, id: Stream_Id) -> string
 }
 
 @(private)
-_verdict :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> Verdict {
+_verdict :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> (v: Verdict, lo, hi: i64) {
 	if rm.quarantined {
-		return .Equivocation
+		return .Equivocation, 0, 0
 	}
 	if r.cfg.verify == nil {
-		return .Accept
+		return .Accept, 0, 0
+	}
+	need: journal.Range
+	state: _Align
+	lo, hi, need, state = _aligned_range(r, rm, from, to)
+	switch state {
+	case .Bad:
+		return .Equivocation, 0, 0
+	case .Need:
+		_fetch_gap(r, rm, need)
+		return .Hold, 0, 0
+	case .Ready:
+	}
+	if hi <= lo {
+		return .Accept, 0, 0
 	}
 	before := rm.span
 	req := Verify_Request {
@@ -122,16 +136,155 @@ _verdict :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> Verdict {
 		epoch   = rm.epoch,
 		stream  = rm.id,
 		replica = &rm.rep,
-		from    = from,
-		to      = to,
+		from    = lo,
+		to      = hi,
 		span    = &rm.span,
 		span_ok = &rm.span_ok,
 	}
-	v := r.cfg.verify(r.cfg.user, &req)
-	if v == .Accept && rm.span_ok && (rm.span.off != before.off || rm.span.head != before.head) {
+	v = r.cfg.verify(r.cfg.user, &req)
+	switch v {
+	case .Accept:
+		_verified_add(rm, lo, hi)
+	case .Hold:
+		hi = req.done if req.done > lo && req.done <= hi else lo
+		_verified_add(rm, lo, hi)
+	case .Equivocation:
+		return v, 0, 0
+	}
+	if rm.span_ok && (rm.span.off != before.off || rm.span.head != before.head) {
 		_span_save(r, rm)
 	}
-	return v
+	return v, lo, hi
+}
+
+@(private)
+_verified_add :: proc(rm: ^Remote, lo, hi: i64) {
+	if hi <= lo {
+		return
+	}
+	i := 0
+	for i < len(rm.verified) && rm.verified[i].to < lo {
+		i += 1
+	}
+	j := i
+	g := journal.Range{lo, hi}
+	for j < len(rm.verified) && rm.verified[j].from <= hi {
+		g.from = min(g.from, rm.verified[j].from)
+		g.to = max(g.to, rm.verified[j].to)
+		j += 1
+	}
+	if j > i {
+		remove_range(&rm.verified, i + 1, j)
+		rm.verified[i] = g
+		return
+	}
+	inject_at(&rm.verified, i, g)
+}
+
+@(private)
+_frame_u32 :: proc(r: ^Replicator, rm: ^Remote, at: i64) -> (v: i64, have: bool, valid: bool) {
+	if at < 0 || !journal.replica_covers(&rm.rep, at, at + 4) {
+		return
+	}
+	b: [4]u8
+	if n, err := prim.read_at(r.vfs, rm.rep.fd, b[:], at); err != .None || n != 4 {
+		return
+	}
+	v = i64(prim.get_u32le(b[:]))
+	return v, true, v <= journal.MAX_BODY
+}
+
+@(private)
+_Align :: enum u8 {
+	Ready,
+	Need,
+	Bad,
+}
+
+@(private)
+_aligned_range :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> (lo, hi: i64, need: journal.Range, state: _Align) {
+	f, t := from, to
+	for v in rm.verified {
+		if v.from <= f && v.to > f {
+			f = v.to
+		}
+		if v.from < t && v.to >= t {
+			t = v.from
+		}
+	}
+	if t <= f {
+		return
+	}
+	lower := i64(0)
+	upper := i64(-1)
+	if rm.relay_len >= t {
+		upper = rm.relay_len
+	}
+	for v in rm.verified {
+		for b in ([2]i64{v.from, v.to}) {
+			if b <= f {
+				lower = max(lower, b)
+			}
+			if b >= t && (upper < 0 || b < upper) {
+				upper = b
+			}
+		}
+	}
+	gap_below, miss_below := journal.replica_missing(&rm.rep, lower, f)
+	gap_above := journal.Range{}
+	miss_above := true
+	if upper >= 0 {
+		gap_above, miss_above = journal.replica_missing(&rm.rep, t, upper)
+	}
+	forward := !miss_below
+	backward := !miss_above
+	if forward && backward {
+		forward = t - lower <= upper - f
+		backward = !forward
+	}
+	switch {
+	case forward:
+		pos := lower
+		for pos < t {
+			n, have, valid := _frame_u32(r, rm, pos)
+			if !have {
+				break
+			}
+			if !valid {
+				return lower, t, {}, .Ready
+			}
+			next := pos + n + journal.OVERHEAD
+			if !journal.replica_covers(&rm.rep, pos, next) {
+				break
+			}
+			pos = next
+		}
+		return lower, pos, {}, .Ready
+	case backward:
+		pos := upper
+		for pos > f {
+			n, have, valid := _frame_u32(r, rm, pos - 4)
+			if !have {
+				break
+			}
+			start := pos - n - journal.OVERHEAD
+			if !valid || start < 0 {
+				return 0, 0, {}, .Bad
+			}
+			if !journal.replica_covers(&rm.rep, start, pos) {
+				break
+			}
+			if head, _, _ := _frame_u32(r, rm, start); head != n {
+				return 0, 0, {}, .Bad
+			}
+			pos = start
+		}
+		return pos, upper, {}, .Ready
+	}
+	if upper >= 0 && gap_above.to - gap_above.from <= gap_below.to - gap_below.from {
+		return 0, 0, gap_above, .Need
+	}
+	return 0, 0, gap_below, .Need
 }
 
 @(private)
@@ -321,4 +474,22 @@ _span_save :: proc(r: ^Replicator, rm: ^Remote) {
 	if prim.write_at(r.vfs, rm.span_fd, rec[:], i64(rm.span_seq & 1) * SPAN_REC) == .None {
 		prim.datasync(r.vfs, rm.span_fd)
 	}
+}
+
+@(private)
+_feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
+	pats := make([dynamic]Feed_Pattern, context.temp_allocator)
+	for id, rm in r.remotes {
+		if rm.follow && !rm.grouped {
+			append(&pats, Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
+		}
+	}
+	for suffix in r.groups {
+		p := Feed_Pattern{kind = .Suffix}
+		sfx := suffix
+		copy(p.bytes[:16], sfx[:])
+		append(&pats, p)
+	}
+	from := u64(0) if from_start || r.feed_cursor < 0 else u64(r.feed_cursor)
+	client_feed_follow(&r.client, from, pats[:], true)
 }

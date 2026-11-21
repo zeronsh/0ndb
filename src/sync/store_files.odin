@@ -29,7 +29,18 @@ _Fns :: struct {
 }
 
 @(private)
+_Deferred :: struct {
+	append: ^_Fappend,
+	from:   i64,
+	to:     i64,
+	done:   Storage_Done,
+	ctx:    rawptr,
+}
+
+@(private)
 _Fstream :: struct {
+	busy:   bool,
+	queue:  [dynamic]_Deferred,
 	ns:     ^_Fns,
 	id:     Stream_Id,
 	fd:     prim.Fd,
@@ -194,6 +205,7 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 		return nil, 0, .No_Memory
 	}
 	st^ = {
+		queue  = make([dynamic]_Deferred, fs.allocator),
 		ns     = ns,
 		id     = id,
 		fd     = f.fd,
@@ -208,6 +220,7 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 _fs_stream_close :: proc(data: rawptr, s: rawptr) {
 	fs := cast(^File_Store)data
 	st := cast(^_Fstream)s
+	delete(st.queue)
 	prim.close_file(fs.vfs, st.fd)
 	free(st, fs.allocator)
 }
@@ -315,6 +328,13 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 	fs := cast(^File_Store)data
 	a := cast(^_Fappend)w
 	st := a.st
+	if st.busy {
+		if _, e := append(&st.queue, _Deferred{append = a, done = done, ctx = ctx}); e != nil {
+			_fs_append_free(fs, a)
+			done(ctx, .No_Memory, 0)
+		}
+		return
+	}
 	err := a.failed
 	if err == .None && a.pos != a.at + a.total {
 		err = .Invalid
@@ -333,6 +353,7 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 		done(ctx, .No_Memory, 0)
 		return
 	}
+	st.busy = true
 	job^ = {
 		vfs    = fs.vfs,
 		lay    = fs.lay,
@@ -393,6 +414,12 @@ _fs_drop :: proc(data: rawptr, h: rawptr, id: Stream_Id, done: Storage_Done, ctx
 _fs_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, ctx: rawptr) {
 	fs := cast(^File_Store)data
 	st := cast(^_Fstream)s
+	if st.busy {
+		if _, e := append(&st.queue, _Deferred{from = from, to = to, done = done, ctx = ctx}); e != nil {
+			done(ctx, .No_Memory, 0)
+		}
+		return
+	}
 	lo := clamp(from, 0, st.length)
 	hi := clamp(to, lo, st.length)
 	if hi <= lo {
@@ -404,6 +431,7 @@ _fs_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, c
 		done(ctx, .No_Memory, 0)
 		return
 	}
+	st.busy = true
 	job^ = {
 		vfs    = fs.vfs,
 		lay    = fs.lay,
@@ -665,6 +693,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	switch job.kind {
 	case .Stream_Sync:
 		st := cast(^_Fstream)job.target
+		st.busy = false
 		if job.result == .None {
 			_usage_add(fs, st.ns, job.value - st.length)
 			st.length = job.value
@@ -680,6 +709,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 		}
 	case .Redact:
 		st := cast(^_Fstream)job.target
+		st.busy = false
 		if job.result == .None {
 			st.seq = job.seq
 		}
@@ -697,8 +727,29 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	if len(job.final) > 0 {
 		delete(job.final, fs.allocator)
 	}
+	target := job.target if job.kind == .Stream_Sync || job.kind == .Redact else nil
 	free(job, fs.allocator)
 	done(ctx, result, value)
+	if target != nil {
+		_fs_next(fs, cast(^_Fstream)target)
+	}
+}
+
+@(private)
+_fs_next :: proc(fs: ^File_Store, st: ^_Fstream) {
+	if st.busy || len(st.queue) == 0 {
+		return
+	}
+	d := st.queue[0]
+	ordered_remove(&st.queue, 0)
+	if d.append != nil {
+		_fs_append_commit(fs, d.append, d.done, d.ctx)
+	} else {
+		_fs_redact(fs, st, d.from, d.to, d.done, d.ctx)
+	}
+	if !st.busy {
+		_fs_next(fs, st)
+	}
 }
 
 @(private)

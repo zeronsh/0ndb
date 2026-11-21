@@ -56,7 +56,11 @@ replicator_follow_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, 
 	}
 	r.groups[suffix] = g
 	if r.phase == .Ready {
-		_list_all(r)
+		if r.cfg.filtered {
+			_feed_subscribe(r, true)
+		} else {
+			_list_all(r)
+		}
 		_repl_flush(r)
 	}
 	return .None
@@ -73,6 +77,10 @@ replicator_unfollow_segments :: proc(r: ^Replicator, scope: ^Scope, name: string
 	}
 	delete_key(&r.groups, suffix)
 	_group_free(r, g)
+	if r.cfg.filtered && r.phase == .Ready {
+		_feed_subscribe(r, false)
+		_repl_flush(r)
+	}
 }
 
 replicator_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64) -> []Device_Id {
