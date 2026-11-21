@@ -4,17 +4,17 @@ import "base:runtime"
 import "core:slice"
 import "../prim"
 
-Graph_Entry :: struct {
-	lv:        Lv,
-	parents:   u32,
-	n_parents: u32,
-}
+LINEAR :: max(u32)
+NO_ACTOR :: max(u32)
 
-Assign :: struct {
+Rec :: struct {
 	lv:      Lv,
 	seq:     u64,
 	lamport: u64,
+	chain:   Lv,
 	actor:   u32,
+	np:      u32,
+	pi:      u32,
 }
 
 Seq_Run :: struct {
@@ -41,34 +41,41 @@ Heap_Item :: struct {
 
 Graph :: struct {
 	allocator:   runtime.Allocator,
+	source:      Graph_Source,
+	page_size:   int,
+	window:      int,
+	pages:       [dynamic]Rec_Page,
 	actors:      [dynamic]prim.Id,
+	seqs:        [dynamic]Actor_Seqs,
 	actor_index: map[prim.Id]u32,
-	seqs:        [dynamic][dynamic]Seq_Run,
-	entries:     [dynamic]Graph_Entry,
-	parent_pool: [dynamic]Lv,
-	assign:      [dynamic]Assign,
 	heads:       [dynamic]Lv,
 	next:        Lv,
+	failed:      bool,
 	heap:        [dynamic]Heap_Item,
 	tmp:         [dynamic]Lv,
 	walk:        [dynamic]Walk_Span,
 	only_a:      [dynamic]Lv_Span,
 	only_b:      [dynamic]Lv_Span,
 	pieces:      [dynamic]Piece,
+	io:          [dynamic]u8,
 	last_actor:  prim.Id,
 	last_ix:     u32,
 	has_last:    bool,
 }
 
-graph_init :: proc(g: ^Graph, allocator := context.allocator) {
+DEFAULT_PAGE :: 512
+DEFAULT_WINDOW :: 8
+
+graph_init :: proc(g: ^Graph, allocator := context.allocator, source := Graph_Source{}, page_size := DEFAULT_PAGE, window := DEFAULT_WINDOW) {
 	g^ = {}
 	g.allocator = allocator
+	g.source = source
+	g.page_size = clamp(page_size, 2, 1 << 16)
+	g.window = max(window, 1)
+	g.pages = make([dynamic]Rec_Page, allocator)
 	g.actors = make([dynamic]prim.Id, allocator)
+	g.seqs = make([dynamic]Actor_Seqs, allocator)
 	g.actor_index = make(map[prim.Id]u32, allocator)
-	g.seqs = make([dynamic][dynamic]Seq_Run, allocator)
-	g.entries = make([dynamic]Graph_Entry, allocator)
-	g.parent_pool = make([dynamic]Lv, allocator)
-	g.assign = make([dynamic]Assign, allocator)
 	g.heads = make([dynamic]Lv, allocator)
 	g.heap = make([dynamic]Heap_Item, allocator)
 	g.tmp = make([dynamic]Lv, allocator)
@@ -76,18 +83,24 @@ graph_init :: proc(g: ^Graph, allocator := context.allocator) {
 	g.only_a = make([dynamic]Lv_Span, allocator)
 	g.only_b = make([dynamic]Lv_Span, allocator)
 	g.pieces = make([dynamic]Piece, allocator)
+	g.io = make([dynamic]u8, allocator)
 }
 
 graph_destroy :: proc(g: ^Graph) {
-	for &s in g.seqs {
-		delete(s)
+	for &p in g.pages {
+		delete(p.recs)
+		delete(p.parents)
 	}
+	for &s in g.seqs {
+		for &p in s.pages {
+			delete(p.runs)
+		}
+		delete(s.pages)
+	}
+	delete(g.pages)
 	delete(g.actors)
-	delete(g.actor_index)
 	delete(g.seqs)
-	delete(g.entries)
-	delete(g.parent_pool)
-	delete(g.assign)
+	delete(g.actor_index)
 	delete(g.heads)
 	delete(g.heap)
 	delete(g.tmp)
@@ -95,6 +108,7 @@ graph_destroy :: proc(g: ^Graph) {
 	delete(g.only_a)
 	delete(g.only_b)
 	delete(g.pieces)
+	delete(g.io)
 	g^ = {}
 }
 
@@ -117,7 +131,7 @@ graph_intern :: proc(g: ^Graph, actor: prim.Id) -> u32 {
 	}
 	ix := u32(len(g.actors))
 	append(&g.actors, actor)
-	append(&g.seqs, make([dynamic]Seq_Run, g.allocator))
+	append(&g.seqs, Actor_Seqs{pages = make([dynamic]Seq_Page, g.allocator)})
 	g.actor_index[actor] = ix
 	return ix
 }
@@ -127,16 +141,7 @@ graph_known :: proc(g: ^Graph, actor: prim.Id) -> u64 {
 	if !ok {
 		return 0
 	}
-	return graph_known_ix(g, ix)
-}
-
-graph_known_ix :: proc "contextless" (g: ^Graph, ix: u32) -> u64 {
-	runs := g.seqs[ix][:]
-	if len(runs) == 0 {
-		return 0
-	}
-	last := runs[len(runs) - 1]
-	return last.seq + u64(last.len)
+	return g.seqs[ix].known
 }
 
 graph_lv :: proc(g: ^Graph, id: Op_Id) -> (Lv, bool) {
@@ -147,14 +152,11 @@ graph_lv :: proc(g: ^Graph, id: Op_Id) -> (Lv, bool) {
 	return graph_lv_ix(g, ix, id.seq)
 }
 
-graph_lv_ix :: proc "contextless" (g: ^Graph, actor: u32, seq: u64) -> (Lv, bool) {
-	runs := g.seqs[actor][:]
-	if n := len(runs); n > 0 && runs[n - 1].seq <= seq {
-		if seq < runs[n - 1].seq + u64(runs[n - 1].len) {
-			return runs[n - 1].lv + int(seq - runs[n - 1].seq), true
-		}
+graph_lv_ix :: proc(g: ^Graph, actor: u32, seq: u64) -> (Lv, bool) {
+	if int(actor) >= len(g.seqs) || seq >= g.seqs[actor].known {
 		return 0, false
 	}
+	runs := seq_page_runs(g, actor, seq)
 	lo, hi := 0, len(runs)
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -170,107 +172,48 @@ graph_lv_ix :: proc "contextless" (g: ^Graph, actor: u32, seq: u64) -> (Lv, bool
 	return 0, false
 }
 
-@(private)
-assign_index :: proc "contextless" (g: ^Graph, lv: Lv) -> int {
-	a := g.assign[:]
-	n := len(a)
-	if n > 0 && a[n - 1].lv <= lv {
-		return n - 1
-	}
-	lo, hi := 0, n
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if a[mid].lv <= lv {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo - 1
+graph_op :: proc(g: ^Graph, lv: Lv) -> (actor: u32, seq: u64) {
+	r := rec_at(g, lv)
+	return r.actor, r.seq + u64(lv - r.lv)
 }
 
-@(private)
-entry_index :: proc "contextless" (g: ^Graph, lv: Lv) -> int {
-	e := g.entries[:]
-	n := len(e)
-	if n > 0 && e[n - 1].lv <= lv {
-		return n - 1
-	}
-	lo, hi := 0, n
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if e[mid].lv <= lv {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo - 1
-}
-
-graph_op :: proc "contextless" (g: ^Graph, lv: Lv) -> (actor: u32, seq: u64) {
-	a := g.assign[assign_index(g, lv)]
-	return a.actor, a.seq + u64(lv - a.lv)
-}
-
-graph_id :: proc "contextless" (g: ^Graph, lv: Lv) -> Op_Id {
+graph_id :: proc(g: ^Graph, lv: Lv) -> Op_Id {
 	actor, seq := graph_op(g, lv)
+	if int(actor) >= len(g.actors) {
+		return {}
+	}
 	return Op_Id{g.actors[actor], seq}
 }
 
-graph_lamport :: proc "contextless" (g: ^Graph, lv: Lv) -> u64 {
-	a := g.assign[assign_index(g, lv)]
-	return a.lamport + u64(lv - a.lv)
+graph_lamport :: proc(g: ^Graph, lv: Lv) -> u64 {
+	r := rec_at(g, lv)
+	return r.lamport + u64(lv - r.lv)
 }
 
-graph_run_end :: proc "contextless" (g: ^Graph, lv: Lv) -> Lv {
-	i := assign_index(g, lv)
-	end := g.next
-	if i + 1 < len(g.assign) {
-		end = g.assign[i + 1].lv
-	}
-	e := entry_index(g, lv)
-	if e + 1 < len(g.entries) {
-		end = min(end, g.entries[e + 1].lv)
-	}
-	return end
-}
-
-graph_continues :: proc "contextless" (g: ^Graph, lv: Lv) -> bool {
+graph_continues :: proc(g: ^Graph, lv: Lv) -> bool {
 	if lv <= 0 || lv >= g.next {
 		return false
 	}
-	e := entry_index(g, lv)
-	if g.entries[e].lv == lv {
-		return false
-	}
-	return g.assign[assign_index(g, lv)].lv != lv
+	return rec_at(g, lv).lv != lv
 }
 
-graph_parents :: proc "contextless" (g: ^Graph, lv: Lv, buf: ^[1]Lv) -> []Lv {
-	e := g.entries[entry_index(g, lv)]
-	if e.lv != lv {
+graph_parents :: proc(g: ^Graph, lv: Lv, buf: ^[1]Lv) -> []Lv {
+	r, page := rec_page_at(g, lv)
+	if r.lv != lv || r.np == LINEAR {
 		buf[0] = lv - 1
 		return buf[:]
 	}
-	return g.parent_pool[e.parents:][:e.n_parents]
+	if page == nil || int(r.pi) + int(r.np) > len(page.parents) {
+		return nil
+	}
+	return page.parents[r.pi:][:r.np]
 }
 
-graph_add :: proc(g: ^Graph, b: ^Batch) -> (first: Lv, skip: int, err: Error) {
-	n := 0
-	for &op in b.ops {
-		if op.len <= 0 || op.len > MAX_RUN || op.pos < -MAX_RUN || op.pos > MAX_POS {
-			return 0, 0, .Invalid
-		}
-		if op.kind == .Insert && len(op.content) != op.len {
-			return 0, 0, .Invalid
-		}
-		n += op.len
-		if n > MAX_RUN {
-			return 0, 0, .Invalid
-		}
-	}
-	return graph_add_header(g, b.actor, b.seq, b.lamport, b.parents, n)
+@(private)
+chain_parents :: proc(g: ^Graph, v: Lv, buf: ^[1]Lv) -> (start: Lv, ps: []Lv) {
+	r := rec_at(g, v)
+	start = clamp(r.chain, 0, v)
+	return start, graph_parents(g, start, buf)
 }
 
 graph_valid :: proc "contextless" (g: ^Graph, v: []Lv) -> bool {
@@ -282,7 +225,51 @@ graph_valid :: proc "contextless" (g: ^Graph, v: []Lv) -> bool {
 	return true
 }
 
-graph_add_header :: proc(g: ^Graph, actor: prim.Id, seq: u64, lamport: u64, parents: []Op_Id, n: int) -> (first: Lv, skip: int, err: Error) {
+graph_records :: proc "contextless" (g: ^Graph) -> int {
+	n := 0
+	for &p in g.pages {
+		n += int(p.count)
+	}
+	return n
+}
+
+graph_add :: proc(g: ^Graph, b: ^Batch) -> (first: Lv, skip: int, err: Error) {
+	n := batch_check_ops(b) or_return
+	return graph_add_header(g, b.actor, b.seq, b.lamport, b.parents, n)
+}
+
+@(private)
+batch_check_ops :: proc(b: ^Batch) -> (int, Error) {
+	n := 0
+	for &op in b.ops {
+		if op.len <= 0 || op.len > MAX_RUN || op.pos < -MAX_RUN || op.pos > MAX_POS {
+			return 0, .Invalid
+		}
+		if op.kind == .Insert && len(op.content) != op.len || op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS) {
+			return 0, .Invalid
+		}
+		n += op.len
+		if n > MAX_RUN {
+			return 0, .Invalid
+		}
+	}
+	return n, .None
+}
+
+graph_check :: proc(g: ^Graph, b: ^Batch, parents: ^[dynamic]Lv) -> (skip: int, err: Error) {
+	n := batch_check_ops(b) or_return
+	skip, _, err = check_header(g, b.actor, b.seq, b.lamport, b.parents, n)
+	clear(parents)
+	append(parents, ..g.tmp[:])
+	if g.failed {
+		return 0, .Corrupt
+	}
+	return
+}
+
+@(private)
+check_header :: proc(g: ^Graph, actor: prim.Id, seq: u64, lamport: u64, parents: []Op_Id, n: int) -> (skip: int, ts: u64, err: Error) {
+	clear(&g.tmp)
 	if n <= 0 || n > MAX_RUN || seq >= MAX_COUNTER - u64(n) || lamport == 0 || lamport >= MAX_COUNTER - u64(n) {
 		return 0, 0, .Invalid
 	}
@@ -290,20 +277,19 @@ graph_add_header :: proc(g: ^Graph, actor: prim.Id, seq: u64, lamport: u64, pare
 		return 0, 0, .Too_Large
 	}
 	aix, have := graph_actor(g, actor)
-	known := graph_known_ix(g, aix) if have else 0
+	known := g.seqs[aix].known if have else 0
 	if seq + u64(n) <= known {
 		lv, _ := graph_lv_ix(g, aix, seq)
 		if graph_lamport(g, lv) != lamport {
 			return 0, 0, .Mismatch
 		}
-		return lv + n, n, .None
+		return n, lamport, .None
 	}
 	if seq > known {
 		return 0, 0, .Missing
 	}
 	ps := &g.tmp
-	clear(ps)
-	ts := lamport
+	ts = lamport
 	if seq < known {
 		skip = int(known - seq)
 		lv, _ := graph_lv_ix(g, aix, known - 1)
@@ -311,63 +297,74 @@ graph_add_header :: proc(g: ^Graph, actor: prim.Id, seq: u64, lamport: u64, pare
 			return 0, 0, .Mismatch
 		}
 		append(ps, lv)
-		ts = lamport + u64(skip)
-	} else {
-		max_ts: u64
-		for p in parents {
-			lv, ok := graph_lv(g, p)
-			if !ok {
-				return 0, 0, .Missing
-			}
-			append(ps, lv)
-			max_ts = max(max_ts, graph_lamport(g, lv))
+		return skip, lamport + u64(skip), .None
+	}
+	max_ts: u64
+	for p in parents {
+		lv, ok := graph_lv(g, p)
+		if !ok {
+			return 0, 0, .Missing
 		}
-		if ts <= max_ts {
+		append(ps, lv)
+		max_ts = max(max_ts, graph_lamport(g, lv))
+	}
+	if ts <= max_ts {
+		return 0, 0, .Invalid
+	}
+	if len(ps) > 1 {
+		slice.sort(ps[:])
+		w := 0
+		for i in 0 ..< len(ps) {
+			if i == 0 || ps[i] != ps[w - 1] {
+				ps[w] = ps[i]
+				w += 1
+			}
+		}
+		resize(ps, w)
+		graph_reduce(g, ps)
+	}
+	if seq > 0 {
+		prev, _ := graph_lv_ix(g, aix, seq - 1)
+		if !graph_contains(g, ps[:], prev) {
 			return 0, 0, .Invalid
 		}
-		if len(ps) > 1 {
-			slice.sort(ps[:])
-			w := 0
-			for i in 0 ..< len(ps) {
-				if i == 0 || ps[i] != ps[w - 1] {
-					ps[w] = ps[i]
-					w += 1
-				}
-			}
-			resize(ps, w)
-			graph_reduce(g, ps)
-		}
-		if seq > 0 {
-			prev, _ := graph_lv_ix(g, aix, seq - 1)
-			if !graph_contains(g, ps[:], prev) {
-				return 0, 0, .Invalid
-			}
-		}
+	}
+	return 0, ts, .None
+}
+
+graph_add_header :: proc(g: ^Graph, actor: prim.Id, seq: u64, lamport: u64, parents: []Op_Id, n: int) -> (first: Lv, skip: int, err: Error) {
+	ts: u64
+	skip, ts, err = check_header(g, actor, seq, lamport, parents, n)
+	if err == .None && g.failed {
+		err = .Corrupt
+	}
+	if err != .None {
+		return 0, 0, err
+	}
+	if skip >= n {
+		return g.next, n, .None
 	}
 	first = g.next
 	count := n - skip
 	ix := graph_intern(g, actor)
 	nseq := seq + u64(skip)
-	if !(len(ps) == 1 && ps[0] == first - 1 && len(g.entries) > 0) {
-		append(&g.entries, Graph_Entry{lv = first, parents = u32(len(g.parent_pool)), n_parents = u32(len(ps))})
-		append(&g.parent_pool, ..ps[:])
-	}
+	ps := g.tmp[:]
+	linear := len(ps) == 1 && ps[0] == first - 1
 	extend := false
-	if na := len(g.assign); na > 0 {
-		last := g.assign[na - 1]
-		l := Lv(first - last.lv)
-		extend = last.actor == ix && last.seq + u64(l) == nseq && last.lamport + u64(l) == ts
+	chain := first
+	if np := len(g.pages); np > 0 {
+		last := rec_last(g)
+		l := u64(first - last.lv)
+		extend = linear && last.actor == ix && last.seq + l == nseq && last.lamport + l == ts
+		if linear {
+			chain = last.chain
+		}
 	}
 	if !extend {
-		append(&g.assign, Assign{lv = first, seq = nseq, lamport = ts, actor = ix})
+		rec_append(g, Rec{lv = first, seq = nseq, lamport = ts, chain = chain, actor = ix, np = LINEAR if linear else u32(len(ps))}, ps if !linear else nil)
 	}
-	runs := &g.seqs[ix]
-	if nr := len(runs); nr > 0 && runs[nr - 1].lv + runs[nr - 1].len == first && runs[nr - 1].seq + u64(runs[nr - 1].len) == nseq {
-		runs[nr - 1].len += count
-	} else {
-		append(runs, Seq_Run{seq = nseq, lv = first, len = count})
-	}
-	frontier_advance(&g.heads, ps[:], first + count - 1)
+	seq_append(g, ix, nseq, first, count)
+	frontier_advance(&g.heads, ps, first + count - 1)
 	g.next = first + count
 	return first, skip, .None
 }
@@ -407,259 +404,6 @@ frontier_eq :: proc "contextless" (a, b: []Lv) -> bool {
 		}
 	}
 	return true
-}
-
-@(private)
-heap_push :: proc(g: ^Graph, lv: Lv, flag: u8) {
-	append(&g.heap, Heap_Item{lv, flag})
-	h := g.heap[:]
-	i := len(h) - 1
-	for i > 0 {
-		p := (i - 1) / 2
-		if h[p].lv >= h[i].lv {
-			break
-		}
-		h[p], h[i] = h[i], h[p]
-		i = p
-	}
-}
-
-@(private)
-heap_pop :: proc(g: ^Graph) -> Heap_Item {
-	h := g.heap[:]
-	top := h[0]
-	n := len(h) - 1
-	h[0] = h[n]
-	pop(&g.heap)
-	h = h[:n]
-	i := 0
-	for {
-		l := 2 * i + 1
-		if l >= n {
-			break
-		}
-		c := l
-		if l + 1 < n && h[l + 1].lv > h[l].lv {
-			c = l + 1
-		}
-		if h[i].lv >= h[c].lv {
-			break
-		}
-		h[i], h[c] = h[c], h[i]
-		i = c
-	}
-	return top
-}
-
-graph_contains :: proc(g: ^Graph, version: []Lv, lv: Lv) -> bool {
-	if lv < 0 || lv >= g.next {
-		return false
-	}
-	for v in version {
-		if v == lv {
-			return true
-		}
-	}
-	clear(&g.heap)
-	for v in version {
-		if v >= lv {
-			heap_push(g, v, 0)
-		}
-	}
-	for len(g.heap) > 0 {
-		v := heap_pop(g).lv
-		if v == lv {
-			return true
-		}
-		if v < lv {
-			return false
-		}
-		e := g.entries[entry_index(g, v)]
-		if e.lv <= lv {
-			return true
-		}
-		for len(g.heap) > 0 && g.heap[0].lv >= e.lv {
-			heap_pop(g)
-		}
-		for p in g.parent_pool[e.parents:][:e.n_parents] {
-			if p >= lv {
-				heap_push(g, p, 0)
-			}
-		}
-	}
-	return false
-}
-
-graph_contains_all :: proc(g: ^Graph, version: []Lv, lvs: []Lv) -> bool {
-	for v in lvs {
-		if !graph_contains(g, version, v) {
-			return false
-		}
-	}
-	return true
-}
-
-@(private)
-graph_reduce :: proc(g: ^Graph, f: ^[dynamic]Lv) {
-	if len(f) < 2 {
-		return
-	}
-	keep := make([dynamic]Lv, 0, len(f), g.allocator)
-	defer delete(keep)
-	others := make([dynamic]Lv, 0, len(f), g.allocator)
-	defer delete(others)
-	for v, i in f {
-		clear(&others)
-		for u, j in f {
-			if j != i {
-				append(&others, u)
-			}
-		}
-		if !graph_contains(g, others[:], v) {
-			append(&keep, v)
-		}
-	}
-	clear(f)
-	append(f, ..keep[:])
-}
-
-version_union :: proc(g: ^Graph, a, b: []Lv, out: ^[dynamic]Lv) {
-	clear(out)
-	append(out, ..a)
-	append(out, ..b)
-	slice.sort(out[:])
-	w := 0
-	for i in 0 ..< len(out) {
-		if i == 0 || out[i] != out[w - 1] {
-			out[w] = out[i]
-			w += 1
-		}
-	}
-	resize(out, w)
-	graph_reduce(g, out)
-}
-
-@(private)
-heap_pop_merged :: proc(g: ^Graph, nonshared: ^int) -> (Lv, u8) {
-	top := heap_pop(g)
-	if top.flag != FLAG_BOTH {
-		nonshared^ -= 1
-	}
-	f := top.flag
-	for len(g.heap) > 0 && g.heap[0].lv == top.lv {
-		x := heap_pop(g)
-		if x.flag != FLAG_BOTH {
-			nonshared^ -= 1
-		}
-		f |= x.flag
-	}
-	return top.lv, f
-}
-
-@(private)
-walk_emit :: proc(out: ^[dynamic]Walk_Span, lv: Lv, n: int, flag: u8, shared: bool) {
-	if n <= 0 || (flag == FLAG_BOTH && !shared) {
-		return
-	}
-	if k := len(out); k > 0 && out[k - 1].flag == flag && out[k - 1].lv == lv + n {
-		out[k - 1].lv = lv
-		out[k - 1].len += n
-		return
-	}
-	append(out, Walk_Span{lv, n, flag})
-}
-
-graph_walk :: proc(g: ^Graph, a, b: []Lv, out: ^[dynamic]Walk_Span, conflicting: bool, common: ^[dynamic]Lv) {
-	clear(out)
-	if common != nil {
-		clear(common)
-	}
-	clear(&g.heap)
-	nonshared := 0
-	for v in a {
-		heap_push(g, v, FLAG_A)
-		nonshared += 1
-	}
-	for v in b {
-		heap_push(g, v, FLAG_B)
-		nonshared += 1
-	}
-	stop :: proc(conflicting: bool, f: u8, heap_len: int, nonshared: int) -> bool {
-		if f != FLAG_BOTH {
-			return false
-		}
-		return heap_len == 0 if conflicting else nonshared == 0
-	}
-	outer: for len(g.heap) > 0 {
-		v, f := heap_pop_merged(g, &nonshared)
-		if v < 0 {
-			break
-		}
-		if stop(conflicting, f, len(g.heap), nonshared) {
-			if conflicting && common != nil {
-				append(common, v)
-			}
-			break
-		}
-		e := g.entries[entry_index(g, v)]
-		hi := v
-		for len(g.heap) > 0 && g.heap[0].lv >= e.lv {
-			u, f2 := heap_pop_merged(g, &nonshared)
-			walk_emit(out, u + 1, hi - u, f, conflicting)
-			hi = u
-			f |= f2
-			if stop(conflicting, f, len(g.heap), nonshared) {
-				if conflicting && common != nil {
-					append(common, u)
-				}
-				break outer
-			}
-		}
-		walk_emit(out, e.lv, hi - e.lv + 1, f, conflicting)
-		if e.n_parents == 0 {
-			heap_push(g, -1, f)
-			if f != FLAG_BOTH {
-				nonshared += 1
-			}
-		}
-		for p in g.parent_pool[e.parents:][:e.n_parents] {
-			heap_push(g, p, f)
-			if f != FLAG_BOTH {
-				nonshared += 1
-			}
-		}
-	}
-	slice.reverse(out[:])
-}
-
-graph_diff :: proc(g: ^Graph, a, b: []Lv, only_a, only_b: ^[dynamic]Lv_Span) {
-	clear(only_a)
-	clear(only_b)
-	if len(a) <= 1 && len(b) <= 1 {
-		x := a[0] if len(a) == 1 else -1
-		y := b[0] if len(b) == 1 else -1
-		if x == y {
-			return
-		}
-		hi, lo := max(x, y), min(x, y)
-		e := g.entries[entry_index(g, hi)]
-		if e.lv <= lo || (lo < 0 && e.lv == 0) {
-			append(only_b if y > x else only_a, Lv_Span{lo + 1, hi - lo})
-			return
-		}
-	}
-	graph_walk(g, a, b, &g.walk, false, nil)
-	for s in g.walk {
-		if s.flag == FLAG_A {
-			append(only_a, Lv_Span{s.lv, s.len})
-		} else if s.flag == FLAG_B {
-			append(only_b, Lv_Span{s.lv, s.len})
-		}
-	}
-}
-
-graph_conflicting :: proc(g: ^Graph, a, b: []Lv, spans: ^[dynamic]Walk_Span, common: ^[dynamic]Lv) {
-	graph_walk(g, a, b, spans, true, common)
 }
 
 graph_version_ids :: proc(g: ^Graph, v: []Lv, allocator := context.allocator) -> []Op_Id {

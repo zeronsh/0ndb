@@ -462,7 +462,7 @@ tr_move :: proc(tr: ^Tracker, g: ^Graph, log: ^Text_Log, to: []Lv) {
 		_ = log_pieces(log, spans, &tr.pieces)
 		for p in tr.pieces {
 			e := log.entries[p.entry]
-			if e.kind == .Insert {
+			if is_insert(e.kind) {
 				tr_state(tr, PH + p.lv, p.len, delta)
 			} else {
 				tr_del_targets(tr, p.lv, p.lv + p.len, delta)

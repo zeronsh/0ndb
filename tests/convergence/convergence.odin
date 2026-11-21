@@ -60,7 +60,33 @@ Snapshot :: struct {
 	has:     bool,
 }
 
+Store :: struct {
+	pages: map[crdt.Page_Key][dynamic]u8,
+}
+
+store_load :: proc(data: rawptr, key: crdt.Page_Key, out: ^[dynamic]u8) -> bool {
+	s := (^Store)(data)
+	p, ok := s.pages[key]
+	if !ok {
+		return false
+	}
+	append(out, ..p[:])
+	return true
+}
+
+blob_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> bool {
+	for &b, i in dst {
+		b = u8('0' + (int(oid[0]) + offset + i) % 10)
+	}
+	return true
+}
+
 Replica :: struct {
+	dict:      ^crdt.Actor_Dict,
+	store:     Store,
+	paged:     bool,
+	keys:      [dynamic]crdt.Page_Key,
+	history:   [dynamic][]crdt.Op_Id,
 	g:         crdt.Graph,
 	files:     [FILES]File,
 	actor:     prim.Id,
@@ -71,11 +97,19 @@ Replica :: struct {
 	conflicts: [dynamic]crdt.Conflict,
 }
 
-replica_init :: proc(r: ^Replica, n: int) {
-	crdt.graph_init(&r.g)
+replica_init :: proc(r: ^Replica, n: int, paged := false) {
+	r.paged = paged
+	r.store.pages = make(map[crdt.Page_Key][dynamic]u8)
+	r.keys = make([dynamic]crdt.Page_Key)
+	r.history = make([dynamic][]crdt.Op_Id)
+	if paged {
+		crdt.graph_init(&r.g, source = crdt.Graph_Source{&r.store, store_load}, page_size = 4, window = 1)
+	} else {
+		crdt.graph_init(&r.g)
+	}
 	for &f in r.files {
 		crdt.text_init(&f.text)
-		crdt.log_init(&f.log)
+		crdt.log_init(&f.log, content = crdt.Content_Source{nil, blob_read})
 	}
 	r.actor = actor_of(n)
 	r.inbox = make([dynamic][]u8)
@@ -92,7 +126,33 @@ conflicts_clear :: proc(list: ^[dynamic]crdt.Conflict) {
 	clear(list)
 }
 
+flush :: proc(r: ^Replica) {
+	if !r.paged {
+		return
+	}
+	crdt.graph_dirty(&r.g, &r.keys)
+	for k in r.keys {
+		buf := make([dynamic]u8)
+		assert(crdt.graph_page_encode(&r.g, k, &buf) == .None)
+		if old, ok := r.store.pages[k]; ok {
+			delete(old)
+		}
+		r.store.pages[k] = buf
+		crdt.graph_page_clean(&r.g, k)
+	}
+	crdt.graph_trim(&r.g)
+}
+
 replica_destroy :: proc(r: ^Replica) {
+	for _, v in r.store.pages {
+		delete(v)
+	}
+	delete(r.store.pages)
+	delete(r.keys)
+	for h in r.history {
+		delete(h)
+	}
+	delete(r.history)
 	crdt.graph_destroy(&r.g)
 	for &f in r.files {
 		crdt.text_destroy(&f.text)
@@ -117,15 +177,40 @@ replica_destroy :: proc(r: ^Replica) {
 }
 
 apply_batch :: proc(t: ^testing.T, r: ^Replica, b: ^crdt.Batch, collect: bool) -> crdt.Error {
-	first, skip, err := crdt.graph_add(&r.g, b)
+	parents := make([dynamic]crdt.Lv)
+	defer delete(parents)
+	skip, err := crdt.graph_check(&r.g, b, &parents)
 	if err != .None {
 		return err
 	}
-	if skip >= crdt.batch_len(b) {
+	n := crdt.batch_len(b)
+	if skip >= n {
 		return .None
 	}
+	valid := n - skip
 	for f in 0 ..< FILES {
-		crdt.log_add_batch(&r.files[f].log, &r.g, b, target_of(f), first, skip)
+		file := &r.files[f]
+		v, e := crdt.text_check(&file.text, &r.g, &file.log, b, target_of(f), skip, parents[:])
+		testing.expect_value(t, e, crdt.Error.None)
+		valid = min(valid, v)
+	}
+	if valid == 0 {
+		return .Invalid
+	}
+	use := b
+	cut: crdt.Batch
+	if skip + valid < n {
+		cut, _ = crdt.batch_slice(b, 0, skip + valid)
+		use = &cut
+	}
+	defer if use == &cut {
+		crdt.batch_destroy(&cut)
+	}
+	first, skip2, err2 := crdt.graph_add(&r.g, use)
+	testing.expect_value(t, err2, crdt.Error.None)
+	testing.expect_value(t, skip2, skip)
+	for f in 0 ..< FILES {
+		crdt.log_add_batch(&r.files[f].log, &r.g, use, target_of(f), first, skip)
 	}
 	for f in 0 ..< FILES {
 		file := &r.files[f]
@@ -138,11 +223,16 @@ apply_batch :: proc(t: ^testing.T, r: ^Replica, b: ^crdt.Batch, collect: bool) -
 		}
 		conflicts_clear(&r.conflicts)
 	}
-	return .None
+	flush(r)
+	return .None if skip + valid == n else .Invalid
+}
+
+hostile :: proc(id: prim.Id) -> bool {
+	return id[1] == 0xad
 }
 
 deliver :: proc(t: ^testing.T, r: ^Replica, msg: []u8, rng: ^Rng) -> bool {
-	b, err := crdt.batch_decode(msg)
+	b, err := crdt.batch_decode(msg, dict = r.dict)
 	testing.expect_value(t, err, crdt.Error.None)
 	if err != .None {
 		return true
@@ -152,7 +242,9 @@ deliver :: proc(t: ^testing.T, r: ^Replica, msg: []u8, rng: ^Rng) -> bool {
 	if e == .Missing {
 		return false
 	}
-	testing.expect_value(t, e, crdt.Error.None)
+	if !hostile(b.actor) {
+		testing.expect_value(t, e, crdt.Error.None)
+	}
 	return true
 }
 
@@ -189,9 +281,9 @@ deliver_one :: proc(t: ^testing.T, r: ^Replica, rng: ^Rng) {
 	}
 }
 
-encode :: proc(b: ^crdt.Batch) -> []u8 {
+encode :: proc(b: ^crdt.Batch, dict: ^crdt.Actor_Dict = nil) -> []u8 {
 	buf := make([dynamic]u8)
-	err := crdt.batch_encode(b, &buf)
+	err := crdt.batch_encode(b, &buf, dict)
 	assert(err == .None)
 	return buf[:]
 }
@@ -218,9 +310,9 @@ send :: proc(rs: []Replica, from: int, b: ^crdt.Batch, rng: ^Rng) {
 			}
 			part, err := crdt.batch_slice(b, cuts[k], cuts[k + 1])
 			assert(err == .None)
-			append(&r.inbox, encode(&part))
+			append(&r.inbox, encode(&part, r.dict if chance(rng, 50) else nil))
 			if chance(rng, 10) {
-				append(&r.inbox, encode(&part))
+				append(&r.inbox, encode(&part, r.dict))
 			}
 			crdt.batch_destroy(&part)
 		}
@@ -278,6 +370,12 @@ local_edit :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng) {
 			op.pos = pick_pos(rng, size)
 			op.len = n
 			op.content = buf
+			if chance(rng, 20) {
+				op.kind = .Insert_Ref
+				op.content = nil
+				op.ref.oid[0] = u8(below(rng, 256))
+				op.ref.offset = below(rng, 1 << 20)
+			}
 			sizes[f] += n
 		} else if roll < 85 {
 			op.kind = .Delete
@@ -313,6 +411,72 @@ local_edit :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng) {
 		testing.expect_value(t, crdt.text_len(&r.files[f].text), sizes[f])
 	}
 	send(rs, who, &b, rng)
+	if len(r.history) < 24 {
+		append(&r.history, crdt.graph_version_ids(&r.g, r.g.heads[:]))
+	}
+}
+
+attack :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng, counter: ^u64) {
+	r := &rs[who]
+	counter^ += 1
+	actor: prim.Id
+	actor[0] = 0xee
+	actor[1] = 0xad
+	for i in 0 ..< 8 {
+		actor[2 + i] = u8(counter^ >> (8 * u64(i)))
+	}
+	heads := crdt.graph_version_ids(&r.g, r.g.heads[:])
+	defer delete(heads)
+	parents := heads
+	if len(r.history) > 0 && chance(rng, 50) {
+		parents = r.history[below(rng, len(r.history))]
+	}
+	lamport: u64 = 0
+	for p in parents {
+		lv, _ := crdt.graph_lv(&r.g, p)
+		lamport = max(lamport, crdt.graph_lamport(&r.g, lv))
+	}
+	ops := make([dynamic]crdt.Op_Run)
+	defer delete(ops)
+	content := make([dynamic]u8)
+	defer delete(content)
+	for _ in 0 ..< 32 {
+		append(&content, 'Z')
+	}
+	for _ in 0 ..< 1 + below(rng, 3) {
+		f := below(rng, FILES)
+		size := crdt.text_len(&r.files[f].text)
+		op := crdt.Op_Run {
+			target = target_of(f),
+			pos    = below(rng, 2 * size + 4),
+			len    = 1 + below(rng, 12),
+		}
+		switch below(rng, 3) {
+		case 0:
+			op.kind = .Insert
+			op.content = content[:op.len]
+		case 1:
+			op.kind = .Delete
+		case:
+			op.kind = .Delete_Back
+		}
+		append(&ops, op)
+	}
+	b := crdt.Batch {
+		actor   = actor,
+		seq     = 0,
+		lamport = lamport + 1,
+		parents = parents,
+		ops     = ops[:],
+	}
+	zero := b
+	bad := [1]crdt.Op_Run{{target = target_of(0), kind = .Delete, pos = 0, len = 0}}
+	zero.ops = bad[:]
+	scratch := make([dynamic]crdt.Lv)
+	defer delete(scratch)
+	_, zerr := crdt.graph_check(&r.g, &zero, &scratch)
+	testing.expect_value(t, zerr, crdt.Error.Invalid)
+	send(rs, -1, &b, rng)
 }
 
 snapshot :: proc(r: ^Replica, rng: ^Rng) {
@@ -359,14 +523,27 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 		}
 		delete(rs)
 	}
+	dict: crdt.Actor_Dict
+	crdt.dict_init(&dict)
+	defer crdt.dict_destroy(&dict)
+	crdt.dict_add(&dict, target_of(0).actor)
 	for &r, i in rs {
-		replica_init(&r, i)
+		replica_init(&r, i, seed % 2 == 1)
+		r.dict = &dict
+		if i % 2 == 0 {
+			crdt.dict_add(&dict, r.actor)
+		}
 	}
+	attacks: u64
 	for _ in 0 ..< rounds {
 		who := below(&rng, replicas)
 		switch below(&rng, 10) {
 		case 0 ..= 3:
-			local_edit(t, rs, who, &rng)
+			if chance(&rng, 12) {
+				attack(t, rs, who, &rng, &attacks)
+			} else {
+				local_edit(t, rs, who, &rng)
+			}
 		case 4 ..= 8:
 			for _ in 0 ..< 1 + below(&rng, 4) {
 				deliver_one(t, &rs[who], &rng)
@@ -388,7 +565,11 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 		}
 	}
 	for &r in rs {
-		testing.expect_value(t, len(r.pending), 0)
+		for m in r.pending {
+			b, err := crdt.batch_decode(m, dict = r.dict)
+			testing.expect(t, err == .None && hostile(b.actor), "honest batch left pending")
+			crdt.batch_destroy(&b)
+		}
 	}
 	v0 := crdt.graph_version_ids(&rs[0].g, rs[0].g.heads[:])
 	defer delete(v0)
@@ -434,6 +615,15 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 				p0, e0 := crdt.anchor_resolve(&rs[0].files[s.file].text, &rs[0].g, &rs[0].files[s.file].log, s.anchor)
 				testing.expect_value(t, e0, crdt.Error.None)
 				testing.expect(t, p0 >= 0 && p0 <= crdt.text_len(&rs[0].files[s.file].text), "anchor out of range")
+				live := crdt.text_spans(&rs[0].files[s.file].text, &rs[0].g)
+				at := 0
+				for sp in live {
+					if sp.id.actor == s.anchor.id.actor && s.anchor.id.seq >= sp.id.seq && s.anchor.id.seq < sp.id.seq + u64(sp.len) {
+						testing.expect_value(t, p0, at + int(s.anchor.id.seq - sp.id.seq))
+					}
+					at += sp.len
+				}
+				delete(live)
 				for &o in rs[1:] {
 					pi, ei := crdt.anchor_resolve(&o.files[s.file].text, &o.g, &o.files[s.file].log, s.anchor)
 					testing.expect_value(t, ei, crdt.Error.None)
@@ -441,6 +631,34 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 				}
 			}
 		}
+	}
+	for &r in rs {
+		if !r.paged {
+			continue
+		}
+		meta := make([dynamic]u8)
+		defer delete(meta)
+		testing.expect_value(t, crdt.graph_meta_encode(&r.g, &meta), crdt.Error.None)
+		g2: crdt.Graph
+		testing.expect_value(t, crdt.graph_open(&g2, meta[:], crdt.Graph_Source{&r.store, store_load}, window = 1), crdt.Error.None)
+		defer crdt.graph_destroy(&g2)
+		testing.expect(t, slice.equal(g2.heads[:], r.g.heads[:]), "reopened heads")
+		for s in r.snapshots {
+			lvs := make([dynamic]crdt.Lv)
+			defer delete(lvs)
+			testing.expect_value(t, crdt.graph_version_lvs(&g2, s.version, &lvs), crdt.Error.None)
+			empty: crdt.Text
+			crdt.text_init(&empty)
+			out, err := crdt.text_checkout(&empty, &g2, &r.files[s.file].log, lvs[:])
+			crdt.text_destroy(&empty)
+			testing.expect_value(t, err, crdt.Error.None)
+			got := crdt.text_bytes(&out)
+			testing.expect(t, slice.equal(got, s.bytes), "checkout through reopened graph")
+			delete(got)
+			crdt.text_destroy(&out)
+			crdt.graph_trim(&g2)
+		}
+		testing.expect(t, !g2.failed, "reopened graph failed to load a page")
 	}
 	for f in 0 ..< FILES {
 		buf := make([dynamic]u8)
@@ -815,7 +1033,7 @@ throughput :: proc(t: ^testing.T) {
 
 	spans := crdt.text_spans(&a.files[0].text, &a.g)
 	defer delete(spans)
-	fmt.printfln("trace: %v ops, %v runs, final %v bytes, %v graph entries, %v spans", ops, len(runs), len(final), len(a.g.entries), len(spans))
+	fmt.printfln("trace: %v ops, %v runs, final %v bytes, %v graph entries, %v spans", ops, len(runs), len(final), crdt.graph_records(&a.g), len(spans))
 	fmt.printfln("local apply (runs):   %.1f Mops/s (%v)", rate(ops, local), local)
 	fmt.printfln("remote decode+apply:  %.1f Mops/s (%v), %v bytes encoded", rate(ops, remote), remote, bytes)
 	fmt.printfln("local apply (per op): %.1f Mops/s (%v)", rate(ops, per_op), per_op)
@@ -848,6 +1066,88 @@ throughput :: proc(t: ^testing.T) {
 	_ = crdt.text_merge(&z.files[0].text, &z.g, &z.files[0].log, z.g.heads[:])
 	small := time.tick_since(start)
 	fmt.printfln("merge 5-op branch into %v-op history (40 concurrent runs): %v", ops, small)
+
+	anchors := make([dynamic]crdt.Anchor)
+	defer delete(anchors)
+	arng := Rng{5}
+	for _ in 0 ..< 10_000 {
+		an, _ := crdt.anchor_at(&a.files[0].text, &a.g, below(&arng, len(final)), .Before)
+		append(&anchors, an)
+	}
+	start = time.tick_now()
+	for an in anchors {
+		_, _ = crdt.anchor_resolve(&a.files[0].text, &a.g, &a.files[0].log, an)
+	}
+	fmt.printfln("resolve 10k anchors (incl. index build): %v", time.tick_since(start))
+
+	dict: crdt.Actor_Dict
+	crdt.dict_init(&dict)
+	defer crdt.dict_destroy(&dict)
+	crdt.dict_add(&dict, a.actor)
+	crdt.dict_add(&dict, target_of(0).actor)
+	dict_bytes := 0
+	for m in encoded {
+		bt, _ := crdt.decode(&dec, m)
+		out := make([dynamic]u8)
+		_ = crdt.batch_encode(&bt, &out, &dict)
+		dict_bytes += len(out)
+		delete(out)
+	}
+	fmt.printfln("encoded with actor dictionary: %v bytes (%.1f bytes/batch, was %.1f)", dict_bytes, f64(dict_bytes) / f64(len(encoded)), f64(bytes) / f64(len(encoded)))
+
+	for paged in ([2]bool{false, true}) {
+		h: Replica
+		replica_init(&h, 8)
+		defer replica_destroy(&h)
+		if paged {
+			crdt.graph_destroy(&h.g)
+			crdt.graph_init(&h.g, source = crdt.Graph_Source{&h.store, store_load})
+			h.paged = true
+		}
+		actors := [4]prim.Id{actor_of(20), actor_of(21), actor_of(22), actor_of(23)}
+		seqs: [4]u64
+		prev: crdt.Op_Id
+		batches := 100_000
+		mops := [1]crdt.Op_Run{{target = target_of(1), kind = .Delete, pos = 0, len = 10}}
+		start = time.tick_now()
+		for i in 0 ..< batches {
+			k := i % 4
+			pb := [1]crdt.Op_Id{prev}
+			bt := crdt.Batch {
+				actor   = actors[k],
+				seq     = seqs[k],
+				lamport = u64(i * 10 + 1),
+				ops     = mops[:],
+			}
+			if i > 0 {
+				bt.parents = pb[:]
+			}
+			_, _, e := crdt.graph_add(&h.g, &bt)
+			assert(e == .None)
+			seqs[k] += 10
+			prev = crdt.Op_Id{actors[k], seqs[k] - 1}
+			if paged && i % 4096 == 0 {
+				flush(&h)
+			}
+		}
+		flush(&h)
+		build := time.tick_since(start)
+		stored := 0
+		for _, v in h.store.pages {
+			stored += len(v)
+		}
+		mem := crdt.graph_memory(&h.g)
+		start = time.tick_now()
+		hit := 0
+		for i in 0 ..< 1000 {
+			lv, _ := crdt.graph_lv(&h.g, crdt.Op_Id{actors[i % 4], u64(i * 997 % 250_000)})
+			buf: [1]crdt.Lv
+			hit += len(crdt.graph_parents(&h.g, lv, &buf))
+		}
+		random := time.tick_since(start)
+		crdt.graph_trim(&h.g)
+		fmt.printfln("graph 1M ops / %v records, paged=%v: resident %.2f MiB, persisted %.2f MiB, build %v, 1000 random old lookups %v", crdt.graph_records(&h.g), paged, f64(mem) / (1 << 20), f64(stored) / (1 << 20), build, random)
+	}
 }
 
 @(test)

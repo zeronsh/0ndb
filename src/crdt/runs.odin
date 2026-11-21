@@ -63,8 +63,27 @@ run_split :: proc {
 	ix_split,
 }
 
+ID_KEY_ACTORS :: 1 << 20
+ID_KEY_SEQS :: 1 << 40
+ID_SPACE_KEYS :: ID_KEY_ACTORS * ID_KEY_SEQS
+
 @(private)
-run_leaf_split :: proc(t: ^Tree(Run_Leaf($E), 1), leaf: u32) {
+span_key :: #force_inline proc "contextless" (actor: u32, seq: u64, n: int) -> (int, bool) {
+	if actor >= ID_KEY_ACTORS || seq + u64(n) > ID_KEY_SEQS {
+		return 0, false
+	}
+	return int(actor) * ID_KEY_SEQS + int(seq), true
+}
+
+@(private)
+span_index :: proc(ids: ^Index, s: Span, leaf: u32) {
+	if key, ok := span_key(s.actor, s.seq, s.len); ok {
+		run_assign(ids, key, Ix{s.len, leaf})
+	}
+}
+
+@(private)
+run_leaf_split :: proc(t: ^Tree(Run_Leaf($E), 1), leaf: u32, ids: ^Index = nil) {
 	id := tree_new_leaf(t)
 	l := &t.leaves[leaf]
 	r := &t.leaves[id]
@@ -78,9 +97,16 @@ run_leaf_split :: proc(t: ^Tree(Run_Leaf($E), 1), leaf: u32) {
 	l.n = u8(h)
 	tree_add(t, leaf, {-moved})
 	tree_insert_after(t, leaf, true, id, {moved})
+	when E == Span {
+		if ids != nil {
+			for k in 0 ..< int(t.leaves[id].n) {
+				span_index(ids, t.leaves[id].items[k], id)
+			}
+		}
+	}
 }
 
-run_insert :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E) {
+run_insert :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E, ids: ^Index = nil) {
 	if e.len <= 0 {
 		return
 	}
@@ -97,6 +123,7 @@ run_insert :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E) {
 		if i < n && off == l.items[i].len {
 			if run_merge(&l.items[i], e) {
 				tree_add(t, leaf, {e.len})
+				run_indexed(ids, e, leaf)
 				return
 			}
 			if i + 1 < n {
@@ -104,6 +131,7 @@ run_insert :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E) {
 				if run_merge(&x, l.items[i + 1]) {
 					l.items[i + 1] = x
 					tree_add(t, leaf, {e.len})
+					run_indexed(ids, e, leaf)
 					return
 				}
 			}
@@ -114,12 +142,13 @@ run_insert :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E) {
 			if run_merge(&x, l.items[i]) {
 				l.items[i] = x
 				tree_add(t, leaf, {e.len})
+				run_indexed(ids, e, leaf)
 				return
 			}
 		}
 		need := 1 if off == 0 else 2
 		if n + need > RUN_CAP {
-			run_leaf_split(t, leaf)
+			run_leaf_split(t, leaf, ids)
 			continue
 		}
 		if off == 0 {
@@ -135,11 +164,21 @@ run_insert :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E) {
 			l.n += 2
 		}
 		tree_add(t, leaf, {e.len})
+		run_indexed(ids, e, leaf)
 		return
 	}
 }
 
-run_delete :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, count: int) {
+@(private)
+run_indexed :: #force_inline proc(ids: ^Index, e: $E, leaf: u32) {
+	when E == Span {
+		if ids != nil {
+			span_index(ids, e, leaf)
+		}
+	}
+}
+
+run_delete :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, count: int, ids: ^Index = nil) {
 	at := clamp(pos, 0, t.total[0])
 	rem := min(max(count, 0), t.total[0] - at)
 	for rem > 0 {
@@ -167,7 +206,7 @@ run_delete :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, count: int) {
 			l.items[i] = a
 		} else {
 			if n + 1 > RUN_CAP {
-				run_leaf_split(t, leaf)
+				run_leaf_split(t, leaf, ids)
 				continue
 			}
 			a, _ := run_split(it, off)

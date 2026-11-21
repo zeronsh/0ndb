@@ -19,6 +19,7 @@ Error :: enum u8 {
 	Not_Ancestor,
 	Corrupt,
 	Too_Large,
+	Missing_Content,
 }
 
 Op_Kind :: enum u8 {
@@ -26,6 +27,19 @@ Op_Kind :: enum u8 {
 	Delete,
 	Delete_Back,
 	Opaque,
+	Insert_Ref,
+}
+
+Oid :: [20]u8
+
+Content_Ref :: struct {
+	oid:    Oid,
+	offset: int,
+}
+
+Content_Source :: struct {
+	data: rawptr,
+	read: proc(data: rawptr, oid: Oid, offset: int, dst: []u8) -> bool,
 }
 
 Op_Run :: struct {
@@ -34,6 +48,7 @@ Op_Run :: struct {
 	pos:     int,
 	len:     int,
 	content: []u8,
+	ref:     Content_Ref,
 }
 
 Batch :: struct {
@@ -80,6 +95,10 @@ Conflict :: struct {
 MAX_COUNTER :: u64(1) << 62
 MAX_LV :: 1 << 52
 MAX_RUN :: 1 << 40
+
+is_insert :: #force_inline proc "contextless" (k: Op_Kind) -> bool {
+	return k == .Insert || k == .Insert_Ref
+}
 
 batch_len :: proc "contextless" (b: ^Batch) -> int {
 	n := 0

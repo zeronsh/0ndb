@@ -8,6 +8,8 @@ Text :: struct {
 	rope:      Rope,
 	spans:     Spans,
 	version:   [dynamic]Lv,
+	ids:       Index,
+	ids_on:    bool,
 }
 
 @(private)
@@ -18,6 +20,7 @@ Merge :: struct {
 	target:    []Lv,
 	conflicts: ^[dynamic]Conflict,
 	first:     int,
+	err:       Error,
 }
 
 @(private)
@@ -37,6 +40,9 @@ text_init :: proc(t: ^Text, allocator := context.allocator) {
 text_destroy :: proc(t: ^Text) {
 	tree_destroy(&t.rope)
 	tree_destroy(&t.spans)
+	if t.ids_on {
+		tree_destroy(&t.ids)
+	}
 	delete(t.version)
 	t^ = {}
 }
@@ -161,8 +167,33 @@ shift_point :: proc "contextless" (x, pos, n: int) -> int {
 doc_insert :: proc(m: ^Merge, pos: int, data: []u8, actor: u32, seq: u64) {
 	at := clamp(pos, 0, text_len(m.t))
 	rope_insert(&m.t.rope, at, data)
-	run_insert(&m.t.spans, at, Span{len(data), seq, actor})
+	run_insert(&m.t.spans, at, Span{len(data), seq, actor}, &m.t.ids if m.t.ids_on else nil)
 	conflict_shift(m, true, at, len(data))
+}
+
+@(private)
+doc_insert_piece :: proc(m: ^Merge, at: int, e: Log_Entry, k: int, n: int, lv: Lv) {
+	actor, seq := graph_op(m.g, lv)
+	if e.kind == .Insert {
+		doc_insert(m, at, m.log.bytes[e.at + k:][:n], actor, seq)
+		return
+	}
+	ref := m.log.refs[e.at]
+	buf: [4096]u8
+	done := 0
+	for done < n {
+		c := min(len(buf), n - done)
+		chunk := buf[:c]
+		src := m.log.content
+		if src.read == nil || !src.read(src.data, ref.oid, ref.offset + k + done, chunk) {
+			for &b in chunk {
+				b = 0
+			}
+			m.err = .Missing_Content
+		}
+		doc_insert(m, at + done, chunk, actor, seq + u64(done))
+		done += c
+	}
 }
 
 @(private)
@@ -173,7 +204,7 @@ doc_delete :: proc(m: ^Merge, pos: int, n: int) {
 		return
 	}
 	rope_delete(&m.t.rope, at, k)
-	run_delete(&m.t.spans, at, k)
+	run_delete(&m.t.spans, at, k, &m.t.ids if m.t.ids_on else nil)
 	conflict_shift(m, false, at, k)
 }
 
@@ -190,7 +221,7 @@ heads_within :: proc(g: ^Graph, heads: []Lv, ps: []Lv) -> bool {
 @(private)
 effect :: proc "contextless" (kind: Op_Kind, pos: int, n: int, size: int) -> (at: int, s: int, cnt: int) {
 	switch kind {
-	case .Insert:
+	case .Insert, .Insert_Ref:
 		return clamp(pos, 0, size), 0, n
 	case .Delete:
 		if pos < 0 || pos >= size {
@@ -212,7 +243,7 @@ effect :: proc "contextless" (kind: Op_Kind, pos: int, n: int, size: int) -> (at
 @(private)
 piece_pos :: proc "contextless" (e: Log_Entry, k: int) -> int {
 	#partial switch e.kind {
-	case .Insert:
+	case .Insert, .Insert_Ref:
 		return e.pos + k
 	case .Delete_Back:
 		return e.pos - k
@@ -228,9 +259,8 @@ apply_direct :: proc(m: ^Merge, p: Piece) {
 	if cnt == 0 {
 		return
 	}
-	if e.kind == .Insert {
-		actor, seq := graph_op(m.g, p.lv)
-		doc_insert(m, at, m.log.bytes[e.at + k:][:p.len], actor, seq)
+	if is_insert(e.kind) {
+		doc_insert_piece(m, at, e, k, p.len, p.lv)
 	} else {
 		doc_delete(m, at, cnt)
 	}
@@ -267,7 +297,7 @@ text_merge :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv, conflicts: ^[dy
 		}
 		i = session(&m, i) or_return
 	}
-	return .None
+	return m.err
 }
 
 text_checkout :: proc(base: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv, allocator := context.allocator) -> (out: Text, err: Error) {
@@ -298,11 +328,10 @@ walk_piece :: proc(m: ^Merge, tr: ^Tracker, heads: ^[dynamic]Lv, p: Piece, side:
 	at, s, cnt := effect(e.kind, piece_pos(e, k), p.len, size)
 	if cnt > 0 {
 		switch e.kind {
-		case .Insert:
+		case .Insert, .Insert_Ref:
 			ep := tr_insert(tr, g, at, PH + p.lv, p.len)
 			if emit {
-				actor, seq := graph_op(g, p.lv)
-				doc_insert(m, ep, m.log.bytes[e.at + k:][:p.len], actor, seq)
+				doc_insert_piece(m, ep, e, k, p.len, p.lv)
 			}
 		case .Delete:
 			tr_delete(tr, at, cnt, p.lv, false, 0, side, out)
@@ -426,7 +455,7 @@ mark_ids :: proc(tr: ^Tracker, marks: ^[dynamic]Mark, id: int, n: int, side: int
 @(private)
 mark_piece :: proc(m: ^Merge, tr: ^Tracker, marks: ^[dynamic]Mark, p: Piece, side: int) {
 	e := m.log.entries[p.entry]
-	if e.kind == .Insert {
+	if is_insert(e.kind) {
 		mark_ids(tr, marks, PH + p.lv, p.len, side, p, false)
 		return
 	}
@@ -501,6 +530,55 @@ collect_conflicts :: proc(m: ^Merge, tr: ^Tracker, walked: []Walked, theirs: []P
 	}
 }
 
+text_index_ids :: proc(t: ^Text) {
+	if t.ids_on {
+		return
+	}
+	tree_init(&t.ids, t.allocator)
+	run_insert(&t.ids, 0, Ix{ID_SPACE_KEYS, NIL})
+	t.ids_on = true
+	for leaf := tree_first_leaf(&t.spans); leaf != NIL; leaf = tree_next_leaf(&t.spans, leaf) {
+		l := &t.spans.leaves[leaf]
+		for i in 0 ..< int(l.n) {
+			span_index(&t.ids, l.items[i], leaf)
+		}
+	}
+}
+
+@(private)
+span_position :: proc(t: ^Text, actor: u32, seq: u64) -> (int, bool) {
+	key, keyed := span_key(actor, seq, 1)
+	if !keyed {
+		pos := 0
+		for leaf := tree_first_leaf(&t.spans); leaf != NIL; leaf = tree_next_leaf(&t.spans, leaf) {
+			l := &t.spans.leaves[leaf]
+			for i in 0 ..< int(l.n) {
+				s := l.items[i]
+				if s.actor == actor && seq >= s.seq && seq < s.seq + u64(s.len) {
+					return pos + int(seq - s.seq), true
+				}
+				pos += s.len
+			}
+		}
+		return 0, false
+	}
+	text_index_ids(t)
+	e, _, ok := run_get(&t.ids, key)
+	if !ok || e.leaf == NIL || int(e.leaf) >= len(t.spans.leaves) {
+		return 0, false
+	}
+	l := &t.spans.leaves[e.leaf]
+	pos := 0
+	for i in 0 ..< int(l.n) {
+		s := l.items[i]
+		if s.actor == actor && seq >= s.seq && seq < s.seq + u64(s.len) {
+			return tree_leaf_pos(&t.spans, e.leaf)[0] + pos + int(seq - s.seq), true
+		}
+		pos += s.len
+	}
+	return 0, false
+}
+
 anchor_at :: proc(t: ^Text, g: ^Graph, pos: int, bias: Bias) -> (Anchor, bool) {
 	p := pos if bias == .Before else pos - 1
 	s, off, ok := run_get(&t.spans, p)
@@ -516,23 +594,15 @@ anchor_resolve :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, a: Anchor) -> (int, 
 		return 0, .Unknown
 	}
 	seq := a.id.seq + u64(a.offset)
-	pos := 0
-	for leaf := tree_first_leaf(&t.spans); leaf != NIL; leaf = tree_next_leaf(&t.spans, leaf) {
-		l := &t.spans.leaves[leaf]
-		for i in 0 ..< int(l.n) {
-			s := l.items[i]
-			if s.actor == ix && seq >= s.seq && seq < s.seq + u64(s.len) {
-				return pos + int(seq - s.seq) + (1 if a.bias == .After else 0), .None
-			}
-			pos += s.len
-		}
+	if p, found := span_position(t, ix, seq); found {
+		return p + (1 if a.bias == .After else 0), .None
 	}
 	lv, ok := graph_lv_ix(g, ix, seq)
 	if !ok || !graph_contains(g, t.version[:], lv) {
 		return 0, .Unknown
 	}
 	i := log_find(log, lv)
-	if i >= len(log.entries) || log.entries[i].lv > lv || log.entries[i].kind != .Insert {
+	if i >= len(log.entries) || log.entries[i].lv > lv || !is_insert(log.entries[i].kind) {
 		return 0, .Unknown
 	}
 	m := Merge {
@@ -561,4 +631,74 @@ anchor_resolve :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, a: Anchor) -> (int, 
 		p += off
 	}
 	return p, .None
+}
+
+text_length_at :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv) -> (int, Error) {
+	if !graph_valid(g, v) || !graph_valid(g, t.version[:]) {
+		return 0, .Unknown
+	}
+	if heads_within(g, t.version[:], v) {
+		return text_len(t), .None
+	}
+	m := Merge {
+		t   = t,
+		g   = g,
+		log = log,
+	}
+	tr: Tracker
+	heads := make([dynamic]Lv, t.allocator)
+	defer delete(heads)
+	walked := make([dynamic]Walked, t.allocator)
+	defer delete(walked)
+	if err := build_tracker(&m, &tr, &heads, &walked, v); err != .None {
+		tracker_destroy(&tr)
+		return 0, err
+	}
+	defer tracker_destroy(&tr)
+	tr_move(&tr, g, log, v)
+	return tr.items.total[CUR] - tr.tail, .None
+}
+
+@(private)
+run_valid :: proc "contextless" (r: Op_Run, size: int) -> int {
+	switch r.kind {
+	case .Insert, .Insert_Ref:
+		return r.len if r.pos >= 0 && r.pos <= size else 0
+	case .Delete:
+		return clamp(size - r.pos, 0, r.len) if r.pos >= 0 else 0
+	case .Delete_Back:
+		return min(r.len, r.pos + 1) if r.pos >= 0 && r.pos < size else 0
+	case .Opaque:
+		return r.len
+	}
+	return 0
+}
+
+text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id, skip: int, parents: []Lv) -> (valid: int, err: Error) {
+	size: int
+	have := false
+	rest := skip
+	for op in b.ops {
+		if rest >= op.len {
+			rest -= op.len
+			continue
+		}
+		r := run_tail(op, rest)
+		rest = 0
+		if op.target != target || op.kind == .Opaque {
+			valid += r.len
+			continue
+		}
+		if !have {
+			size = text_length_at(t, g, log, parents) or_return
+			have = true
+		}
+		ok := run_valid(r, size)
+		valid += ok
+		if ok < r.len {
+			return valid, .None
+		}
+		size += r.len if is_insert(r.kind) else -r.len
+	}
+	return valid, .None
 }

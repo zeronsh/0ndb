@@ -11,7 +11,9 @@ Log_Entry :: struct {
 Text_Log :: struct {
 	entries: [dynamic]Log_Entry,
 	bytes:   [dynamic]u8,
+	refs:    [dynamic]Content_Ref,
 	floor:   Lv,
+	content: Content_Source,
 }
 
 Piece :: struct {
@@ -20,16 +22,33 @@ Piece :: struct {
 	entry: int,
 }
 
-log_init :: proc(log: ^Text_Log, allocator := context.allocator) {
+log_init :: proc(log: ^Text_Log, allocator := context.allocator, content := Content_Source{}) {
 	log^ = {}
 	log.entries = make([dynamic]Log_Entry, allocator)
 	log.bytes = make([dynamic]u8, allocator)
+	log.refs = make([dynamic]Content_Ref, allocator)
+	log.content = content
 }
 
 log_destroy :: proc(log: ^Text_Log) {
 	delete(log.entries)
 	delete(log.bytes)
+	delete(log.refs)
 	log^ = {}
+}
+
+@(private)
+log_store :: proc(log: ^Text_Log, run: Op_Run) -> int {
+	#partial switch run.kind {
+	case .Insert:
+		at := len(log.bytes)
+		append(&log.bytes, ..run.content[:run.len])
+		return at
+	case .Insert_Ref:
+		append(&log.refs, run.ref)
+		return len(log.refs) - 1
+	}
+	return -1
 }
 
 @(private)
@@ -60,12 +79,7 @@ log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) {
 		if i < n && log.entries[i].lv < lv + run.len {
 			return
 		}
-		at := -1
-		if run.kind == .Insert {
-			at = len(log.bytes)
-			append(&log.bytes, ..run.content[:run.len])
-		}
-		inject_at(&log.entries, i, Log_Entry{lv = lv, len = run.len, pos = run.pos, at = at, kind = run.kind})
+		inject_at(&log.entries, i, Log_Entry{lv = lv, len = run.len, pos = run.pos, at = log_store(log, run), kind = run.kind})
 		return
 	}
 	if n > 0 {
@@ -75,6 +89,12 @@ log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) {
 			case .Insert:
 				if run.pos == last.pos + last.len && last.at + last.len == len(log.bytes) {
 					append(&log.bytes, ..run.content[:run.len])
+					last.len += run.len
+					return
+				}
+			case .Insert_Ref:
+				r := log.refs[last.at]
+				if run.pos == last.pos + last.len && run.ref.oid == r.oid && run.ref.offset == r.offset + last.len {
 					last.len += run.len
 					return
 				}
@@ -92,12 +112,7 @@ log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) {
 			}
 		}
 	}
-	at := -1
-	if run.kind == .Insert {
-		at = len(log.bytes)
-		append(&log.bytes, ..run.content[:run.len])
-	}
-	append(&log.entries, Log_Entry{lv = lv, len = run.len, pos = run.pos, at = at, kind = run.kind})
+	append(&log.entries, Log_Entry{lv = lv, len = run.len, pos = run.pos, at = log_store(log, run), kind = run.kind})
 }
 
 log_add_batch :: proc(log: ^Text_Log, g: ^Graph, b: ^Batch, target: Op_Id, first: Lv, skip: int) {
@@ -126,6 +141,9 @@ run_tail :: proc "contextless" (op: Op_Run, k: int) -> Op_Run {
 	case .Insert:
 		r.pos = op.pos + k
 		r.content = op.content[k:]
+	case .Insert_Ref:
+		r.pos = op.pos + k
+		r.ref.offset = op.ref.offset + k
 	case .Delete:
 	case .Delete_Back:
 		r.pos = op.pos - k
@@ -154,21 +172,30 @@ log_trim :: proc(log: ^Text_Log, floor: Lv) {
 	}
 	log.floor = max(log.floor, floor)
 	keep := 0
+	nrefs := 0
 	for &e in log.entries {
 		if e.kind == .Insert {
 			keep += e.len
+		} else if e.kind == .Insert_Ref {
+			nrefs += 1
 		}
 	}
 	bytes := make([dynamic]u8, 0, keep, log.bytes.allocator)
+	refs := make([dynamic]Content_Ref, 0, nrefs, log.refs.allocator)
 	for &e in log.entries {
 		if e.kind == .Insert {
 			at := len(bytes)
 			append(&bytes, ..log.bytes[e.at:e.at + e.len])
 			e.at = at
+		} else if e.kind == .Insert_Ref {
+			append(&refs, log.refs[e.at])
+			e.at = len(refs) - 1
 		}
 	}
 	delete(log.bytes)
+	delete(log.refs)
 	log.bytes = bytes
+	log.refs = refs
 }
 
 log_pieces :: proc(log: ^Text_Log, spans: []Lv_Span, out: ^[dynamic]Piece) -> Error {

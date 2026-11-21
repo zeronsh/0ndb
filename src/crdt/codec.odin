@@ -22,7 +22,40 @@ actor_slot :: proc(t: ^Actor_Table, id: prim.Id) -> u64 {
 	return u64(len(t.ids) - 1)
 }
 
-batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8) -> Error {
+BATCH_DICT_FORMAT :: u8(2)
+
+Actor_Dict :: struct {
+	ids:   [dynamic]prim.Id,
+	index: map[prim.Id]u32,
+}
+
+dict_init :: proc(d: ^Actor_Dict, allocator := context.allocator) {
+	d.ids = make([dynamic]prim.Id, allocator)
+	d.index = make(map[prim.Id]u32, allocator)
+}
+
+dict_destroy :: proc(d: ^Actor_Dict) {
+	delete(d.ids)
+	delete(d.index)
+	d^ = {}
+}
+
+dict_add :: proc(d: ^Actor_Dict, id: prim.Id) -> u32 {
+	if ix, ok := d.index[id]; ok {
+		return ix
+	}
+	ix := u32(len(d.ids))
+	append(&d.ids, id)
+	d.index[id] = ix
+	return ix
+}
+
+dict_find :: proc(d: ^Actor_Dict, id: prim.Id) -> (u32, bool) {
+	ix, ok := d.index[id]
+	return ix, ok
+}
+
+batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8, dict: ^Actor_Dict = nil) -> Error {
 	table := Actor_Table {
 		ids = make([dynamic]prim.Id, 0, 8, buf.allocator),
 	}
@@ -38,17 +71,26 @@ batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8) -> Error {
 		if op.kind == .Insert && len(op.content) != op.len {
 			return .Invalid
 		}
+		if op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS) {
+			return .Invalid
+		}
 		actor_slot(&table, op.target.actor)
 	}
 	w := prim.writer(buf)
-	prim.write_u8(&w, BATCH_FORMAT)
-	prim.write_id(&w, b.actor)
+	prim.write_u8(&w, BATCH_FORMAT if dict == nil else BATCH_DICT_FORMAT)
+	prim.write_uvarint(&w, u64(len(table.ids)))
+	for id in table.ids {
+		if dict == nil {
+			prim.write_id(&w, id)
+		} else if ix, ok := dict_find(dict, id); ok {
+			prim.write_uvarint(&w, u64(ix) + 1)
+		} else {
+			prim.write_uvarint(&w, 0)
+			prim.write_id(&w, id)
+		}
+	}
 	prim.write_uvarint(&w, b.seq)
 	prim.write_uvarint(&w, b.lamport)
-	prim.write_uvarint(&w, u64(len(table.ids) - 1))
-	for id in table.ids[1:] {
-		prim.write_id(&w, id)
-	}
 	prim.write_uvarint(&w, u64(len(b.parents)))
 	for p in b.parents {
 		prim.write_uvarint(&w, actor_slot(&table, p.actor))
@@ -59,7 +101,7 @@ batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8) -> Error {
 	pred := 0
 	for &op, i in b.ops {
 		same := i > 0 && op.target == prev
-		prim.write_u8(&w, u8(op.kind) | (4 if same else 0))
+		prim.write_u8(&w, u8(op.kind) | (8 if same else 0))
 		if !same {
 			prim.write_uvarint(&w, actor_slot(&table, op.target.actor))
 			prim.write_uvarint(&w, op.target.seq)
@@ -73,6 +115,11 @@ batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8) -> Error {
 		switch op.kind {
 		case .Insert:
 			prim.write_raw(&w, op.content)
+			pred = op.pos + op.len
+		case .Insert_Ref:
+			oid := op.ref.oid
+			prim.write_raw(&w, oid[:])
+			prim.write_uvarint(&w, u64(op.ref.offset))
 			pred = op.pos + op.len
 		case .Delete:
 			pred = op.pos
@@ -107,26 +154,40 @@ decoder_destroy :: proc(d: ^Decoder) {
 	d^ = {}
 }
 
-decode :: proc(d: ^Decoder, data: []u8) -> (b: Batch, err: Error) {
+decode :: proc(d: ^Decoder, data: []u8, dict: ^Actor_Dict = nil) -> (b: Batch, err: Error) {
 	clear(&d.actors)
 	clear(&d.parents)
 	clear(&d.ops)
 	r := prim.reader(data)
-	if prim.read_u8(&r) != BATCH_FORMAT {
+	format := prim.read_u8(&r)
+	if format != BATCH_FORMAT && (format != BATCH_DICT_FORMAT || dict == nil) {
 		return {}, .Corrupt
 	}
-	b.actor = prim.read_id(&r)
-	b.seq = prim.read_uvarint(&r)
-	b.lamport = prim.read_uvarint(&r)
 	na := prim.read_uvarint(&r)
-	if r.err != .None || na > u64(prim.reader_remaining(&r) / 16) {
+	if r.err != .None || na == 0 || na > u64(prim.reader_remaining(&r)) {
 		return {}, .Corrupt
 	}
-	append(&d.actors, b.actor)
 	for _ in 0 ..< int(na) {
-		append(&d.actors, prim.read_id(&r))
+		if format == BATCH_FORMAT {
+			append(&d.actors, prim.read_id(&r))
+			continue
+		}
+		ref := prim.read_uvarint(&r)
+		if ref == 0 {
+			append(&d.actors, prim.read_id(&r))
+		} else if ref - 1 < u64(len(dict.ids)) {
+			append(&d.actors, dict.ids[ref - 1])
+		} else {
+			return {}, .Corrupt
+		}
+	}
+	if r.err != .None {
+		return {}, .Corrupt
 	}
 	actors := d.actors[:]
+	b.actor = actors[0]
+	b.seq = prim.read_uvarint(&r)
+	b.lamport = prim.read_uvarint(&r)
 	np := prim.read_uvarint(&r)
 	if r.err != .None || np > u64(prim.reader_remaining(&r) / 2) {
 		return {}, .Corrupt
@@ -148,11 +209,11 @@ decode :: proc(d: ^Decoder, data: []u8) -> (b: Batch, err: Error) {
 	pred := 0
 	for i in 0 ..< int(nr) {
 		tag := prim.read_u8(&r)
-		if tag & ~u8(7) != 0 || (i == 0 && tag & 4 != 0) {
+		if tag & ~u8(15) != 0 || tag & 7 > u8(max(Op_Kind)) || (i == 0 && tag & 8 != 0) {
 			return {}, .Corrupt
 		}
-		kind := Op_Kind(tag & 3)
-		if tag & 4 == 0 {
+		kind := Op_Kind(tag & 7)
+		if tag & 8 == 0 {
 			ix := prim.read_uvarint(&r)
 			seq := prim.read_uvarint(&r)
 			if ix >= u64(len(actors)) {
@@ -184,6 +245,14 @@ decode :: proc(d: ^Decoder, data: []u8) -> (b: Batch, err: Error) {
 		case .Insert:
 			op.content = prim.read_raw(&r, op.len)
 			pred = op.pos + op.len
+		case .Insert_Ref:
+			prim.read_fixed(&r, op.ref.oid[:])
+			off := prim.read_uvarint(&r)
+			if off > MAX_POS {
+				return {}, .Corrupt
+			}
+			op.ref.offset = int(off)
+			pred = op.pos + op.len
 		case .Delete:
 			pred = op.pos
 		case .Delete_Back:
@@ -208,11 +277,11 @@ decode :: proc(d: ^Decoder, data: []u8) -> (b: Batch, err: Error) {
 	return b, .None
 }
 
-batch_decode :: proc(data: []u8, allocator := context.allocator) -> (b: Batch, err: Error) {
+batch_decode :: proc(data: []u8, allocator := context.allocator, dict: ^Actor_Dict = nil) -> (b: Batch, err: Error) {
 	d: Decoder
 	decoder_init(&d, allocator)
 	defer decoder_destroy(&d)
-	b = decode(&d, data) or_return
+	b = decode(&d, data, dict) or_return
 	b.parents = make([]Op_Id, len(d.parents), allocator)
 	copy(b.parents, d.parents[:])
 	b.ops = make([]Op_Run, len(d.ops), allocator)
