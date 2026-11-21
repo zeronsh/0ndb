@@ -22,6 +22,7 @@ C_Model_Config :: struct {
 	max_tokens:     u64,
 	context_window: u64,
 	max_output:     u64,
+	wire:           ^C_Wire,
 }
 
 C_Model :: struct {
@@ -120,6 +121,7 @@ Rt_Plugs :: struct {
 	scheduler: C_Scheduler,
 	secrets:   C_Secrets,
 	interned:  map[string]string,
+	wires:     [dynamic]^Wire_Ctx,
 }
 
 @(private)
@@ -139,6 +141,7 @@ runtime_config :: proc(h: ^Handle, c: ^C_Runtime) -> (opts: api.Stack_Options, s
 	runtime.mem_copy(&x, c, n)
 	p := &h.rt
 	p.interned = make(map[string]string, h.allocator)
+	p.wires = make([dynamic]^Wire_Ctx, h.allocator)
 	opts.runtime = true
 	opts.observe = x.flags & RT_OBSERVE != 0
 	opts.attach = x.flags & RT_NO_ATTACH == 0
@@ -198,6 +201,10 @@ runtime_destroy :: proc(h: ^Handle) {
 		delete(v, h.allocator)
 	}
 	delete(h.rt.interned)
+	for w in h.rt.wires {
+		free(w, h.allocator)
+	}
+	delete(h.rt.wires)
 }
 
 @(private)
@@ -246,6 +253,14 @@ _model_resolve :: proc(data: rawptr, r: ^rt.Runtime, provider: string, model_id:
 		api_key    = _intern(h, _cslice(out.api_key, out.api_key_len)),
 		bearer     = out.bearer != 0,
 		max_tokens = out.max_tokens,
+	}
+	if out.wire != nil {
+		wm, wok := wire_model(h, out.wire, a)
+		if !wok {
+			return false
+		}
+		m^ = wm
+		return true
 	}
 	m^ = model.model_for(a)
 	return true

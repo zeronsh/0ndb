@@ -6,7 +6,7 @@ import "./api"
 import eng "../engine"
 
 ABI_MAJOR :: 1
-ABI_MINOR :: 0
+ABI_MINOR :: 1
 
 FLAG_JSON :: u32(1)
 
@@ -16,6 +16,7 @@ CFG_PADDING :: u32(1 << 2)
 CFG_NO_SEARCH :: u32(1 << 3)
 CFG_DEFERRED :: u32(1 << 4)
 CFG_EVENTS_JSON :: u32(1 << 5)
+CFG_IDLE_PAGEOUT :: u32(1 << 6)
 
 Done_Fn :: #type proc "c" (ud: rawptr, call: u64, status: i32, payload: [^]u8, len: uint)
 Sub_Fn :: #type proc "c" (ud: rawptr, sub: u64, payload: [^]u8, len: uint)
@@ -175,6 +176,7 @@ ondb_open :: proc "c" (cfg: ^Config, out: ^^Handle) -> i32 {
 	ec.padding = cfg.flags & CFG_PADDING != 0
 	ec.search = cfg.flags & CFG_NO_SEARCH == 0
 	ec.durability = .Deferred if cfg.flags & CFG_DEFERRED != 0 else .Async
+	ec.idle_pageout = cfg.flags & CFG_IDLE_PAGEOUT != 0
 	if cfg.handle_cache > 0 {
 		ec.handle_cache = int(cfg.handle_cache)
 	}

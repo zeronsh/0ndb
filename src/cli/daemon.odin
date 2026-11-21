@@ -116,6 +116,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	_state_load(d)
 	ec := eng.default_config(d.engine_dir)
 	ec.credentials = eng.Credentials_Source{data = d, produce = _cred_produce}
+	ec.idle_pageout = true
 	ec.events = eng.Event_Hook{data = d, event = _on_event}
 	opts := api.Stack_Options {
 		runtime = true,

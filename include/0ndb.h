@@ -218,7 +218,7 @@ extern "C" {
 #endif
 
 #define ONDB_ABI_MAJOR 1u
-#define ONDB_ABI_MINOR 0u
+#define ONDB_ABI_MINOR 1u
 #define ONDB_ABI_VERSION ((ONDB_ABI_MAJOR << 16) | ONDB_ABI_MINOR)
 
 typedef struct ondb ondb;
@@ -287,6 +287,7 @@ enum ondb_io_error {
 #define ONDB_NO_SEARCH (1u << 3)   /* no derived search indexes */
 #define ONDB_DEFERRED (1u << 4)    /* the embedder makes writes durable (ondb "flush" op) */
 #define ONDB_EVENTS_JSON (1u << 5) /* deliver Event payloads as JSON */
+#define ONDB_IDLE_PAGEOUT (1u << 6) /* when idle, return heap and page out clean code pages (since 1.1) */
 
 /* ---- plug points (every table: size = sizeof(table), ud passed back) ---- */
 
@@ -536,8 +537,76 @@ typedef struct ondb_events {
 
 /* ---- runtime (runs, runners, triggers, channels, orchestration) ---- */
 
-/* Resolve a provider/model for the native model loop to an endpoint served
-   by a reference wire adapter. Return 0 when resolved; strings are copied. */
+/* A model wire format implemented by the embedder (since 1.1). The request
+   body is head + messages joined with ',' + tail; each callback appends bytes
+   with ondb_sink_write. head receives {model, max_tokens, kind, system,
+   tools: [{name, description, schema}]} as JSON; message receives
+   {role: "user"|"assistant", blocks: [...]} where a block is one of
+   {type:"text",text}, {type:"image",mime,data(base64),url},
+   {type:"document",mime,title,text,data,url}, {type:"tool_use",id,name,input},
+   {type:"tool_result",id,is_error,content:[blocks]},
+   {type:"thinking",text,signature}; tail receives the request kind
+   (0 normal, 1 compact, 2 keepalive). headers writes "Name: value" lines.
+   The response must be text/event-stream: parse is called once per SSE event
+   and reports what it saw with ondb_wire_emit. classify (optional) maps an
+   error response to a failure class (return 0 for the default mapping).
+   Every callback returns 0 on success. */
+typedef struct ondb_sink ondb_sink;
+typedef struct ondb_emit ondb_emit;
+
+enum ondb_wire_kind {
+	ONDB_WIRE_START = 0,       /* id: message id */
+	ONDB_WIRE_BLOCK_START = 1, /* index, block, id/name for tool calls */
+	ONDB_WIRE_TEXT = 2,        /* index, text */
+	ONDB_WIRE_THINKING = 3,    /* index, text */
+	ONDB_WIRE_TOOL_INPUT = 4,  /* index, text: a fragment of the JSON input */
+	ONDB_WIRE_BLOCK_STOP = 5,  /* index */
+	ONDB_WIRE_USAGE = 6,       /* token counts (cumulative) */
+	ONDB_WIRE_STOP = 7,        /* stop */
+	ONDB_WIRE_ERROR = 8        /* failure, text, retry_after */
+};
+/* block: 0 text, 1 thinking, 2 tool_call, 3 other
+   stop: 0 none, 1 end_turn, 2 tool_use, 3 max_tokens, 4 stop_sequence,
+         5 pause_turn, 6 refusal, 7 context_exceeded, 8 compaction, 9 other
+   failure: 1 network, 2 server, 3 overloaded, 4 rate_limited, 5 too_long,
+            6 auth, 7 invalid, 8 quota, 9 malformed, 10 fatal */
+typedef struct ondb_wire_event {
+	uint32_t kind;
+	uint32_t block;
+	int32_t index;
+	const char *id;
+	size_t id_len;
+	const char *name;
+	size_t name_len;
+	const char *text;
+	size_t text_len;
+	uint64_t input_tokens;
+	uint64_t output_tokens;
+	uint64_t cache_read_tokens;
+	uint64_t cache_write_tokens;
+	uint64_t reasoning_tokens;
+	uint32_t stop;
+	uint32_t failure;
+	int64_t retry_after_ms;
+} ondb_wire_event;
+
+typedef struct ondb_wire {
+	uint32_t size;
+	void *ud;
+	int (*head)(void *ud, const uint8_t *request, size_t len, ondb_sink *out);
+	int (*message)(void *ud, const uint8_t *message, size_t len, ondb_sink *out);
+	int (*tail)(void *ud, uint32_t kind, ondb_sink *out);
+	int (*headers)(void *ud, const char *api_key, size_t key_len, ondb_sink *out);
+	int (*parse)(void *ud, uint64_t stream, const char *event, size_t event_len, const uint8_t *data, size_t data_len, ondb_emit *emit);
+	int (*classify)(void *ud, int32_t status, const uint8_t *body, size_t len, int64_t *retry_after_ms);
+} ondb_wire;
+
+int ondb_sink_write(ondb_sink *sink, const uint8_t *data, size_t len);
+int ondb_wire_emit(ondb_emit *emit, const ondb_wire_event *ev);
+
+/* Resolve a provider/model for the native model loop. Return 0 when
+   resolved; strings are copied. With wire NULL the request is built by the
+   reference adapter for api; with wire set (since 1.1) by the embedder. */
 typedef struct ondb_model_config {
 	uint32_t api; /* 0 anthropic, 1 openai_responses, 2 openai_chat */
 	const char *url;
@@ -548,6 +617,7 @@ typedef struct ondb_model_config {
 	uint64_t max_tokens;
 	uint64_t context_window; /* for models unknown to the engine */
 	uint64_t max_output;
+	const ondb_wire *wire;
 } ondb_model_config;
 
 typedef struct ondb_model {

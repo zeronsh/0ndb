@@ -116,6 +116,7 @@ Api :: struct {
 	subs:      [dynamic]^Sub,
 	next_sub:  u64,
 	mounts:    [dynamic]^Mounted,
+	models:    Models_Cache,
 	closing:   bool,
 }
 
@@ -165,6 +166,7 @@ destroy :: proc(a: ^Api) {
 		unsubscribe(a, a.subs[len(a.subs) - 1].id)
 	}
 	_mounts_close_all(a)
+	models_destroy(a)
 	delete(a.calls)
 	delete(a.subs)
 	delete(a.mounts)

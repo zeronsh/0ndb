@@ -8,6 +8,7 @@ foreign import libc "system:System"
 
 @(default_calling_convention = "c")
 foreign libc {
+	malloc_zone_pressure_relief :: proc(zone: rawptr, goal: uint) -> uint ---
 	getpeereid :: proc(fd: posix.FD, uid: ^posix.uid_t, gid: ^posix.gid_t) -> i32 ---
 }
 
@@ -66,4 +67,8 @@ rss_bytes :: proc() -> i64 {
 		return 0
 	}
 	return i64(ru.ru_maxrss)
+}
+
+idle_release :: proc() {
+	malloc_zone_pressure_relief(nil, 0)
 }

@@ -19,7 +19,7 @@ RUNTIME_OPS := []Op {
 	{200, "runtime.attach", {SPACE}, "", op_runtime_attach},
 	{201, "runtime.detach", {SPACE}, "", op_runtime_detach},
 	{202, "runtime.stats", {}, "RuntimeStats", op_runtime_stats},
-	{203, "models", {}, "Models", op_models},
+	{203, "models", {{"live", .Bool, nil}, {"refresh", .Bool, nil}}, "Models", op_models},
 	{204, "agent.resolve", {OBJ, {"provider", .Str, nil}, {"model", .Str, nil}}, "AgentInfo", op_agent_resolve},
 	{205, "record", {OBJ, {"source", .Str, nil}, {"external_id", .Str, nil}, {"sequence", .U64, nil}, {"role", .Enum, ROLE_NAMES[:]}, {"parent", .Rid, nil}, {"blocks", .Blocks, nil}, {"status", .Enum, SEAL_NAMES[:]}, {"input", .U64, nil}, {"output", .U64, nil}, {"cache_read", .U64, nil}, {"cache_write", .U64, nil}, {"provider", .Str, nil}, {"model", .Str, nil}, {"native", .Str, nil}}, "receipt:enum msg:rid", op_record},
 	{206, "task.status", {OBJ}, "TaskStatus", op_task_status},
@@ -140,6 +140,20 @@ op_models :: proc(c: ^Call, o: ^Out) -> Status {
 	if r == nil {
 		return .Unsupported
 	}
+	a := c.api
+	live := a_bool(c, "live") if has(c, "live") else true
+	if live && !c.final && (!_models_fresh(a) || (a_bool(c, "refresh") && c.stage == 0)) {
+		c.stage = 1
+		if len(a.models.probes) == 0 {
+			a.models.at_ms = 0
+			_models_start(a, r)
+		}
+		if len(a.models.probes) > 0 {
+			append(&a.models.waiters, c.id)
+			c.waiting = true
+			return .Pending
+		}
+	}
 	list := r.registry.list[:]
 	o_arr(o, "providers", len(list))
 	for &d in list {
@@ -149,6 +163,25 @@ op_models :: proc(c: ^Call, o: ^Out) -> Status {
 		o_str(o, "command", d.argv[0] if len(d.argv) > 0 else "")
 		o_enum(o, "protocol", u64(d.protocol), PROTOCOL_NAMES[:])
 		o_bool(o, "available", len(d.argv) > 0 && _on_path(d.argv[0]))
+		lp: ^Live_Provider
+		for &x in a.models.providers {
+			if x.id == d.id {
+				lp = &x
+			}
+		}
+		o_bool(o, "listed", lp != nil && lp.ok)
+		o_str(o, "error", lp.error if lp != nil else "")
+		n := len(lp.models) if lp != nil else 0
+		o_arr(o, "models", n)
+		for i in 0 ..< n {
+			mm := lp.models[i]
+			o_obj(o, "")
+			o_str(o, "id", mm.id)
+			o_str(o, "name", mm.name)
+			o_bool(o, "default", mm.is_default)
+			o_end(o)
+		}
+		o_end(o)
 		o_end(o)
 	}
 	o_end(o)
@@ -163,6 +196,7 @@ op_models :: proc(c: ^Call, o: ^Out) -> Status {
 	o_end(o)
 	o_str(o, "default_provider", r.cfg.default_provider)
 	o_str(o, "default_model", r.cfg.default_model)
+	o_i64(o, "listed_at", a.models.at_ms)
 	return .Ok
 }
 

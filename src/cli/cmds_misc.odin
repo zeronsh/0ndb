@@ -223,16 +223,31 @@ parse_int_flag :: proc(a: ^Args, name: string, default_value: i64) -> i64 {
 
 cmd_models :: proc(a: ^Args) -> int {
 	s := session(a)
-	v := must(s, `{"op":"models"}`, "cannot list models")
+	if _, ok := flag_value(a, "timeout"); !ok {
+		s.timeout = 30_000
+	}
+	r := req_begin("models")
+	req_bool(&r, "refresh", flag_bool(a, "refresh"))
+	v := must(s, req_end(&r), "cannot list models")
 	if a.json {
 		print_json(v)
 		return 0
 	}
 	fmt.println("harness providers:")
 	tbl := make([dynamic][]string, context.temp_allocator)
-	append(&tbl, row("  ID", "NAME", "COMMAND", "PROTOCOL", "INSTALLED"))
+	append(&tbl, row("  ID", "NAME", "COMMAND", "PROTOCOL", "INSTALLED", "MODELS"))
 	for p in jarr(v, "providers") {
-		append(&tbl, row(fmt.tprintf("  %s", jstr(p, "id")), jstr(p, "name"), jstr(p, "command"), jstr(p, "protocol"), "yes" if jbool(p, "available") else "no"))
+		models := ""
+		if jbool(p, "listed") {
+			names := make([dynamic]string, context.temp_allocator)
+			for m in jarr(p, "models") {
+				append(&names, fmt.tprintf("%s%s", jstr(m, "id"), " (default)" if jbool(m, "default") else ""))
+			}
+			models = strings.join(names[:], ", ", context.temp_allocator) if len(names) > 0 else "none listed"
+		} else if e := jstr(p, "error"); len(e) > 0 {
+			models = fmt.tprintf("? %s", e)
+		}
+		append(&tbl, row(fmt.tprintf("  %s", jstr(p, "id")), jstr(p, "name"), jstr(p, "command"), jstr(p, "protocol"), "yes" if jbool(p, "available") else "no", models))
 	}
 	table(tbl[:])
 	fmt.println("\nnative models (provider native, keys from ANTHROPIC_API_KEY / OPENAI_API_KEY):")

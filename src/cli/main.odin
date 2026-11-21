@@ -26,7 +26,7 @@ Args :: struct {
 	json:  bool,
 }
 
-BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write"}
+BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh"}
 
 Command :: struct {
 	name:  string,
@@ -56,7 +56,7 @@ COMMANDS := []Command {
 	{"show", cmd_show, "show OBJECT|MSG [CONVO]", "show an object or a message"},
 	{"search", cmd_search, "search QUERY [--limit N] [--semantic] [--newest]", "search everything indexed on this device"},
 	{"interrupt", cmd_interrupt, "interrupt [CONVO]", "interrupt the running turn"},
-	{"models", cmd_models, "models", "list harness providers and native models"},
+	{"models", cmd_models, "models [--refresh]", "list harness providers with their live model lists, and native models"},
 	{"agent", cmd_agent, "agent new NAME [--driver D] [--provider P] [--model M] [--instructions TEXT] | ls | show AGENT", "manage agents"},
 	{"task", cmd_task, "task spawn|send|wait|ls|cancel|result|merge|status ... [--from CONVO]", "orchestrate tasks (the MCP catalog tools)"},
 	{"workspace", cmd_workspace, "workspace new NAME | ls | show W | add W TREE [--mount NAME] [--path P]", "manage workspaces"},

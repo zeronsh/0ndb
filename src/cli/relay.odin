@@ -17,7 +17,11 @@ Relay_Main :: struct {
 	ca:       eng.Cap_Authorizer,
 	sig:      Signals,
 	stopping: bool,
+	settle:   prim.Timer,
+	settling: bool,
 }
+
+RELAY_SETTLE_MS :: 2000
 
 cmd_relay :: proc(a: ^Args) -> int {
 	home := home_dir(context.temp_allocator)
@@ -127,6 +131,19 @@ cmd_relay :: proc(a: ^Args) -> int {
 		if prim.loop_step(&m.loop, true) != .None {
 			break
 		}
+		if m.settling {
+			m.settling = false
+			continue
+		}
+		if m.settle != 0 {
+			prim.timer_cancel(&m.loop, m.settle)
+		}
+		m.settle = prim.timer(&m.loop, RELAY_SETTLE_MS, m, proc(l: ^prim.Loop, data: rawptr) {
+			x := (^Relay_Main)(data)
+			x.settle = 0
+			x.settling = true
+			idle_release()
+		})
 	}
 	st := osync.relay_stats(&m.relay)
 	osync.relay_destroy(&m.relay)

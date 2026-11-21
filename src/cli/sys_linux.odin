@@ -83,3 +83,54 @@ rss_bytes :: proc() -> i64 {
 	}
 	return pages * i64(posix.sysconf(._PAGESIZE))
 }
+
+foreign import libc "system:c"
+
+@(default_calling_convention = "c")
+foreign libc {
+	malloc_trim :: proc(pad: uint) -> i32 ---
+}
+
+idle_release :: proc() {
+	malloc_trim(0)
+	fd, oerr := linux.open("/proc/self/maps", {})
+	if oerr != .NONE {
+		return
+	}
+	defer linux.close(fd)
+	buf := make([dynamic]u8, context.temp_allocator)
+	chunk: [16384]u8
+	for {
+		n, rerr := linux.read(fd, chunk[:])
+		if rerr == .EINTR {
+			continue
+		}
+		if rerr != .NONE || n <= 0 {
+			break
+		}
+		append(&buf, ..chunk[:n])
+	}
+	advice := linux.MAdvice.PAGEOUT
+	text := string(buf[:])
+	for line in strings.split_lines_iterator(&text) {
+		sp := strings.index_byte(line, ' ')
+		dash := strings.index_byte(line, '-')
+		slash := strings.index_byte(line, '/')
+		if dash <= 0 || sp <= dash || slash < 0 || len(line) < sp + 5 {
+			continue
+		}
+		perms := line[sp + 1:sp + 5]
+		if perms[1] == 'w' || (perms[0] != 'r' && perms[2] != 'x') {
+			continue
+		}
+		lo, lok := strconv.parse_u64_of_base(line[:dash], 16)
+		hi, hok := strconv.parse_u64_of_base(line[dash + 1:sp], 16)
+		if !lok || !hok || hi <= lo {
+			continue
+		}
+		if linux.madvise(rawptr(uintptr(lo)), uint(hi - lo), advice) == .EINVAL && advice == .PAGEOUT {
+			advice = .COLD
+			linux.madvise(rawptr(uintptr(lo)), uint(hi - lo), advice)
+		}
+	}
+}
