@@ -3,6 +3,7 @@ package http
 
 import "base:runtime"
 import "core:c"
+import "core:slice"
 import "core:strings"
 import curl "libcurl"
 import "../prim"
@@ -93,6 +94,7 @@ curl_destroy :: proc(h: ^Curl) {
 	for id in h.live {
 		append(&ids, id)
 	}
+	slice.sort(ids[:])
 	for id in ids {
 		curl_cancel(h, id)
 	}

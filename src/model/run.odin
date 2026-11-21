@@ -792,7 +792,7 @@ fail_call :: proc(r: ^Run, f: Failure, now: i64, out: ^Output) {
 	}
 	if failure_retryable(f) && r.attempt < max_attempts && f.retry_after <= max_wait {
 		r.attempt += 1
-		delay := backoff_ms(retry, r.attempt, f.retry_after)
+		delay := backoff_ms(retry, r.attempt, f.retry_after, r.cfg.random)
 		if r.deadline > 0 && now + delay * 1_000_000 >= r.deadline {
 			emit(out, Budget_Exceeded{kind = .Wall})
 			finish(r, .Interrupted, out)

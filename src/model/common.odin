@@ -1,7 +1,7 @@
 package model
 
 import "base:runtime"
-import "core:math/rand"
+import "../prim"
 
 stream_init :: proc(s: ^Stream, allocator := context.allocator) {
 	s^ = {}
@@ -289,7 +289,7 @@ failure_retryable :: proc(f: Failure) -> bool {
 	return false
 }
 
-backoff_ms :: proc(r: Retry, attempt: int, retry_after: i64) -> i64 {
+backoff_ms :: proc(r: Retry, attempt: int, retry_after: i64, rnd: prim.Random) -> i64 {
 	base := r.base_ms > 0 ? r.base_ms : 500
 	cap_ms := r.max_ms > 0 ? r.max_ms : 32_000
 	d := base
@@ -301,7 +301,10 @@ backoff_ms :: proc(r: Retry, attempt: int, retry_after: i64) -> i64 {
 		}
 	}
 	d = min(d, cap_ms)
-	jittered := d / 2 + i64(rand.int63_max(max(d / 2, 1)))
+	b: [8]u8
+	prim.random_fill(rnd, b[:])
+	x := transmute(u64)b
+	jittered := d / 2 + i64(x % u64(max(d / 2, 1)))
 	return max(jittered, retry_after)
 }
 

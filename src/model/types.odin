@@ -2,6 +2,7 @@ package model
 
 import "base:runtime"
 import "../agent"
+import "../prim"
 
 Role :: enum u8 {
 	User,
@@ -130,6 +131,7 @@ Config :: struct {
 	connect_ms:       i64,
 	stall_ms:         i64,
 	server_state:     Server_State_Policy,
+	random:           prim.Random,
 	client_compact:   bool,
 	keepalive:        Keepalive,
 }
