@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    branches: [main, zig-rewrite]
+  pull_request:
+
+jobs:
+  zig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Check zero comments in Zig sources
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+
+          def find_comments(path: pathlib.Path):
+              src = path.read_text(encoding="utf-8")
+              hits = []
+              i = 0
+              n = len(src)
+              line = 1
+              while i < n:
+                  c = src[i]
+                  if c == "\n":
+                      line += 1
+                      i += 1
+                  elif c == '"':
+                      i += 1
+                      while i < n and src[i] != '"':
+                          if src[i] == "\\" and i + 1 < n:
+                              i += 2
+                          else:
+                              if src[i] == "\n":
+                                  line += 1
+                              i += 1
+                      i += 1
+                  elif c == "'":
+                      i += 1
+                      while i < n and src[i] != "'":
+                          if src[i] == "\\" and i + 1 < n:
+                              i += 2
+                          else:
+                              i += 1
+                      i += 1
+                  elif c == "\\" and i + 1 < n and src[i + 1] == "\\":
+                      while i < n and src[i] != "\n":
+                          i += 1
+                  elif c == "/" and i + 1 < n and src[i + 1] == "/":
+                      hits.append(line)
+                      while i < n and src[i] != "\n":
+                          i += 1
+                  else:
+                      i += 1
+              return hits
+
+          files = sorted(pathlib.Path("src").rglob("*.zig"))
+          build_zig = pathlib.Path("build.zig")
+          if build_zig.exists():
+              files.append(build_zig)
+
+          failed = False
+          for f in files:
+              hits = find_comments(f)
+              if hits:
+                  failed = True
+                  print(f"Comment found in {f} on lines: {hits}", file=sys.stderr)
+
+          if failed:
+              sys.exit(1)
+          print(f"Verified 0 comments across {len(files)} Zig files.")
+          PY
+      - name: Format check
+        run: zig fmt --check src build.zig
+      - name: Run tests
+        run: zig build test --summary all
+      - name: ReleaseFast build
+        run: zig build -Doptimize=ReleaseFast --summary all
+
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: playground/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: playground/ui/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run UI tests
+        run: npm test
+      - name: Build UI
+        run: npm run build

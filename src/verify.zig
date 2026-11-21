@@ -1284,6 +1284,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
     try runPagedStorePrimitivesSuite(allocator, io);
     try runNativeGitLayerSuite(allocator, io);
     try runDaemonPoolAndShadowSuite(allocator, io);
+    try runTimelineAndRemoteSuite(allocator, io);
 }
 
 fn countOpenFds(io: std.Io) !usize {
@@ -7177,5 +7178,269 @@ fn runDaemonPoolAndShadowSuite(allocator: std.mem.Allocator, io: std.Io) !void {
 
         res.releaseGitOdb(main_dirs.common_dir);
         try testing.expectEqual(@as(usize, 0), res.gitOdbCount());
+    }
+}
+
+fn runTimelineAndRemoteSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const timeline = ondb.fs.timeline;
+    const git_remote = ondb.fs.git_remote;
+
+    {
+        const gh_urls = [_][]const u8{
+            "https://github.com/zeronsh/0ndb.git",
+            "https://github.com/zeronsh/0ndb",
+            "https://user:token@github.com/zeronsh/0ndb/",
+            "https://github.com/zeronsh/0ndb.git/",
+            "ssh://git@github.com/zeronsh/0ndb.git",
+            "ssh://git@github.com:22/zeronsh/0ndb",
+            "git@github.com:zeronsh/0ndb.git",
+            "GitHub.com:zeronsh/0ndb",
+        };
+        for (gh_urls) |u| {
+            var parsed = (try git_remote.RemoteUrl.parse(allocator, u)).?;
+            defer parsed.deinit(allocator);
+            try testing.expectEqualStrings("github.com", parsed.host);
+            try testing.expectEqualStrings("zeronsh", parsed.owner);
+            try testing.expectEqualStrings("0ndb", parsed.repo);
+            try testing.expect(parsed.is_github);
+            const sl = try parsed.slug(allocator);
+            defer allocator.free(sl);
+            try testing.expectEqualStrings("zeronsh/0ndb", sl);
+            const wu = try parsed.webUrl(allocator);
+            defer allocator.free(wu);
+            try testing.expectEqualStrings("https://github.com/zeronsh/0ndb", wu);
+        }
+
+        var ent1 = (try git_remote.RemoteUrl.parse(allocator, "https://git.enterprise.internal:8443/team/sub/project.git")).?;
+        defer ent1.deinit(allocator);
+        try testing.expectEqualStrings("git.enterprise.internal", ent1.host);
+        try testing.expectEqualStrings("team/sub", ent1.owner);
+        try testing.expectEqualStrings("project", ent1.repo);
+        try testing.expect(!ent1.is_github);
+
+        var ent2 = (try git_remote.RemoteUrl.parse(allocator, "git@ghe.corp.example:org/app.git")).?;
+        defer ent2.deinit(allocator);
+        try testing.expectEqualStrings("ghe.corp.example", ent2.host);
+        try testing.expectEqualStrings("org", ent2.owner);
+        try testing.expectEqualStrings("app", ent2.repo);
+        try testing.expect(!ent2.is_github);
+
+        const bad_urls = [_][]const u8{
+            "",
+            "/srv/git/repo.git",
+            "file:///srv/git/repo.git",
+            "C:\\repos\\x",
+            "https://github.com/onlyname",
+            "../relative/repo",
+            "https://github.com/owner/.git",
+        };
+        for (bad_urls) |u| {
+            try testing.expect((try git_remote.RemoteUrl.parse(allocator, u)) == null);
+        }
+
+        const sample_json =
+            "{\"number\":42,\"url\":\"https://github.com/zeronsh/0ndb/pull/42\"," ++
+            "\"title\":\"Add timeline\",\"state\":\"OPEN\",\"headRefName\":\"feat/timeline-ci\",\"baseRefName\":\"main\"}";
+        var pr = try git_remote.parsePrJson(allocator, sample_json);
+        defer pr.deinit(allocator);
+        try testing.expectEqual(@as(u64, 42), pr.number);
+        try testing.expectEqualStrings("https://github.com/zeronsh/0ndb/pull/42", pr.url);
+        try testing.expectEqualStrings("Add timeline", pr.title);
+        try testing.expectEqualStrings("OPEN", pr.state);
+        try testing.expectEqualStrings("feat/timeline-ci", pr.head_branch);
+        try testing.expectEqualStrings("main", pr.base_branch);
+    }
+
+    {
+        const root = "/tmp/0ndb-verify-timeline-remote";
+        cleanDir(io, root);
+        defer cleanDir(io, root);
+
+        const repo_dir = "/tmp/0ndb-verify-timeline-remote/gitrepo";
+        const non_git = "/tmp/0ndb-verify-timeline-remote/nongit";
+        try std.Io.Dir.cwd().createDirPath(io, repo_dir);
+        try std.Io.Dir.cwd().createDirPath(io, non_git);
+
+        try testing.expect((try git_remote.originRemoteUrl(allocator, io, non_git)) == null);
+
+        const o_init = try runGitTestCmd(allocator, io, repo_dir, &.{ "init", "-b", "main" });
+        allocator.free(o_init);
+        try testing.expect((try git_remote.originRemoteUrl(allocator, io, repo_dir)) == null);
+
+        const o_add = try runGitTestCmd(allocator, io, repo_dir, &.{ "remote", "add", "origin", "git@github.com:zeronsh/0ndb.git" });
+        allocator.free(o_add);
+        var r1 = (try git_remote.originRemoteUrl(allocator, io, repo_dir)).?;
+        defer r1.deinit(allocator);
+        try testing.expectEqualStrings("github.com", r1.host);
+        try testing.expectEqualStrings("zeronsh", r1.owner);
+        try testing.expectEqualStrings("0ndb", r1.repo);
+        try testing.expect(r1.is_github);
+
+        const o_set = try runGitTestCmd(allocator, io, repo_dir, &.{ "remote", "set-url", "origin", "https://ghe.acme.corp/infra/core.git" });
+        allocator.free(o_set);
+        var r2 = (try git_remote.originRemoteUrl(allocator, io, repo_dir)).?;
+        defer r2.deinit(allocator);
+        try testing.expectEqualStrings("ghe.acme.corp", r2.host);
+        try testing.expectEqualStrings("infra", r2.owner);
+        try testing.expectEqualStrings("core", r2.repo);
+        try testing.expect(!r2.is_github);
+    }
+
+    {
+        const empty_d = try timeline.formatUnifiedDiffText(allocator, "same.txt", "a\nb\n", "a\nb\n", 3);
+        defer allocator.free(empty_d);
+        try testing.expectEqual(@as(usize, 0), empty_d.len);
+
+        const join_d = try timeline.formatUnifiedDiffText(allocator, "join.txt", "foo\nbar\n", "foobar\n", 3);
+        defer allocator.free(join_d);
+        try testing.expect(std.mem.indexOf(u8, join_d, "--- a/join.txt\n+++ b/join.txt\n") != null);
+        try testing.expect(std.mem.indexOf(u8, join_d, "-foo\n-bar\n+foobar\n") != null);
+
+        const add_d = try timeline.formatUnifiedDiffText(allocator, "new.txt", "", "one\ntwo\n", 3);
+        defer allocator.free(add_d);
+        try testing.expect(std.mem.indexOf(u8, add_d, "@@ -0,0 +1,2 @@\n+one\n+two\n") != null);
+
+        const big_before = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n";
+        const big_after = "l1\nL2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nL11\nl12\n";
+        const multi_d = try timeline.formatUnifiedDiffText(allocator, "multi.txt", big_before, big_after, 1);
+        defer allocator.free(multi_d);
+        var hunk_count: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, multi_d, pos, "@@ ")) |idx| {
+            hunk_count += 1;
+            pos = idx + 3;
+        }
+        try testing.expectEqual(@as(usize, 2), hunk_count);
+    }
+
+    {
+        const ws_root = "/tmp/0ndb-verify-timeline-ws";
+        const ws_state = "/tmp/0ndb-verify-timeline-ws-state";
+        cleanDir(io, ws_root);
+        cleanDir(io, ws_state);
+        defer cleanDir(io, ws_root);
+        defer cleanDir(io, ws_state);
+
+        var ws = try ondb.fs.workspace.Workspace.open(allocator, io, ws_root, ws_state, 777);
+        defer ws.deinit();
+
+        const actor_a: ondb.core.id.ActorId = 0xAA01;
+        const actor_b: ondb.core.id.ActorId = 0xBB02;
+
+        const b1 = try ws.writeFileDirect(actor_a, "hello.txt", "line1\nline2\nline3\nline4\n");
+
+        {
+            var parents = try ws.history.headsClone();
+            var owned = false;
+            errdefer if (!owned) parents.deinit(allocator);
+            const ts = ws.history.nextStartTs(&parents);
+            const ops = try allocator.alloc(ondb.core.op.Op, 1);
+            ops[0] = .{ .meta = .{
+                .key = try allocator.dupe(u8, "annotation-key"),
+                .value = try allocator.dupe(u8, "annotation-val"),
+            } };
+            const blobs_empty = try allocator.alloc(ondb.core.op.BlobAttachment, 0);
+            var meta_batch = ondb.core.op.Batch{
+                .header = .{
+                    .actor = actor_b,
+                    .start = ts,
+                    .end = ts,
+                    .parents = parents,
+                    .wall_ms = ondb.core.id.nowMs(io),
+                },
+                .ops = ops,
+                .blobs = blobs_empty,
+            };
+            owned = true;
+            defer meta_batch.deinit(allocator);
+            _ = try ws.commitBatch(&meta_batch);
+        }
+
+        var v_after_b1 = try ws.history.headsClone();
+        defer v_after_b1.deinit(allocator);
+
+        const sid = try ws.beginScope(.tool_call, actor_b, "edit-hello");
+        const b2 = try ws.writeFileDirect(actor_b, "hello.txt", "line1\nLINE2\nline3\nline4\nline5\n");
+        const b3 = try ws.writeFileDirect(actor_b, "other.txt", "alpha\nbeta\n");
+        try ws.endScope(sid);
+
+        const b4 = (try ws.deleteFileDirect(actor_a, "other.txt")).?;
+
+        const entries = try timeline.listEntries(allocator, &ws, null, 10);
+        defer timeline.freeTimelineEntries(allocator, entries);
+        try testing.expectEqual(@as(usize, 4), entries.len);
+
+        try testing.expect(entries[0].batch_id.eql(b4));
+        try testing.expectEqual(@as(usize, 1), entries[0].files.len);
+        try testing.expectEqualStrings("other.txt", entries[0].files[0].path);
+        try testing.expectEqual(timeline.ChangeKind.deleted, entries[0].files[0].kind);
+        try testing.expectEqual(@as(u32, 0), entries[0].total_added);
+        try testing.expectEqual(@as(u32, 2), entries[0].total_removed);
+
+        try testing.expect(entries[1].batch_id.eql(b3));
+        try testing.expect(entries[1].scope_id != null);
+        try testing.expectEqualStrings("edit-hello", entries[1].scope_label.?);
+        try testing.expectEqual(timeline.ChangeKind.added, entries[1].files[0].kind);
+        try testing.expectEqual(@as(u32, 2), entries[1].total_added);
+
+        try testing.expect(entries[2].batch_id.eql(b2));
+        try testing.expect(entries[2].scope_id != null);
+        try testing.expectEqualStrings("edit-hello", entries[2].scope_label.?);
+        try testing.expectEqual(timeline.ChangeKind.modified, entries[2].files[0].kind);
+        try testing.expectEqual(@as(u32, 2), entries[2].total_added);
+        try testing.expectEqual(@as(u32, 1), entries[2].total_removed);
+
+        try testing.expect(entries[3].batch_id.eql(b1));
+        try testing.expect(entries[3].scope_id == null);
+        try testing.expectEqual(timeline.ChangeKind.added, entries[3].files[0].kind);
+        try testing.expectEqual(@as(u32, 4), entries[3].total_added);
+
+        const page2 = try timeline.listEntries(allocator, &ws, b3, 2);
+        defer timeline.freeTimelineEntries(allocator, page2);
+        try testing.expectEqual(@as(usize, 2), page2.len);
+        try testing.expect(page2[0].batch_id.eql(b2));
+        try testing.expect(page2[1].batch_id.eql(b1));
+
+        const udiff = try timeline.unifiedDiff(allocator, &ws, &.{b2});
+        defer allocator.free(udiff);
+        try testing.expect(std.mem.indexOf(u8, udiff, "--- a/hello.txt\n+++ b/hello.txt\n") != null);
+        try testing.expect(std.mem.indexOf(u8, udiff, "@@ ") != null);
+        try testing.expect(std.mem.indexOf(u8, udiff, "-line2\n") != null);
+        try testing.expect(std.mem.indexOf(u8, udiff, "+LINE2\n") != null);
+        try testing.expect(std.mem.indexOf(u8, udiff, "+line5\n") != null);
+        try testing.expect(std.mem.indexOf(u8, udiff, "other.txt") == null);
+
+        const foreign = try timeline.foreignChanges(allocator, &ws, v_after_b1, actor_a);
+        defer timeline.freeForeignChanges(allocator, foreign);
+        try testing.expectEqual(@as(usize, 2), foreign.len);
+        try testing.expectEqualStrings("hello.txt", foreign[0].path);
+        try testing.expectEqual(actor_b, foreign[0].actor);
+        try testing.expect(foreign[0].batch_id.eql(b2));
+        try testing.expectEqual(@as(u32, 2), foreign[0].added_lines);
+        try testing.expectEqual(@as(u32, 1), foreign[0].removed_lines);
+        try testing.expectEqualStrings("other.txt", foreign[1].path);
+        try testing.expect(foreign[1].batch_id.eql(b3));
+        try testing.expectEqual(@as(u32, 2), foreign[1].added_lines);
+        try testing.expectEqual(@as(u32, 0), foreign[1].removed_lines);
+
+        const xml = try timeline.formatWorkspaceChangesXml(allocator, foreign);
+        defer allocator.free(xml);
+        try testing.expect(std.mem.startsWith(u8, xml, "<workspace-changes>\n"));
+        try testing.expect(std.mem.endsWith(u8, xml, "</workspace-changes>\n"));
+        try testing.expect(std.mem.indexOf(u8, xml, "path=\"hello.txt\"") != null);
+        try testing.expect(std.mem.indexOf(u8, xml, "path=\"other.txt\"") != null);
+        try testing.expect(std.mem.indexOf(u8, xml, "added=\"2\" removed=\"1\"") != null);
+
+        var escaped_arr = [_]timeline.ForeignChange{.{
+            .path = try allocator.dupe(u8, "a&b<c>\"d.txt"),
+            .actor = actor_b,
+            .batch_id = b2,
+            .added_lines = 1,
+            .removed_lines = 0,
+        }};
+        defer escaped_arr[0].deinit(allocator);
+        const xml_esc = try timeline.formatWorkspaceChangesXml(allocator, &escaped_arr);
+        defer allocator.free(xml_esc);
+        try testing.expect(std.mem.indexOf(u8, xml_esc, "path=\"a&amp;b&lt;c&gt;&quot;d.txt\"") != null);
     }
 }
