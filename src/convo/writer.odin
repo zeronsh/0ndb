@@ -770,6 +770,11 @@ writer_redact :: proc(w: ^Writer, msg: Rid) -> (ranges: []obj.Redaction, err: Er
 	return ranges, .None
 }
 
+writer_redact_plan :: proc(w: ^Writer, msg: Rid, allocator := context.allocator) -> (ranges: []obj.Redaction, err: Error) {
+	_prepare(w, false) or_return
+	return redact_ranges(w.core.v, msg, allocator)
+}
+
 writer_redact_range :: proc(w: ^Writer, from: Vref, to: i64, target: Vref) -> Error {
 	_prepare(w, false) or_return
 	return _redact_record(w, from, to, target)
