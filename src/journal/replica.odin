@@ -5,11 +5,14 @@ import "core:hash/xxhash"
 import "../prim"
 
 Replica :: struct {
+	vfs:       prim.Vfs,
 	fd:        prim.Fd,
 	have:      [dynamic]Range,
 	length:    i64,
 	version:   u64,
 	have_path: string,
+	redact:    string,
+	missing:   Range,
 	allocator: runtime.Allocator,
 }
 
@@ -18,17 +21,18 @@ HAVE_MAGIC :: 0x6576_6168_6264_6e30
 @(private)
 HAVE_SEED :: 0x6861_7665
 
-replica_open :: proc(rep: ^Replica, path: string, allocator := context.allocator) -> Error {
+replica_open :: proc(rep: ^Replica, vfs: prim.Vfs, path: string, allocator := context.allocator) -> Error {
 	rep^ = {
+		vfs       = vfs,
 		fd        = prim.INVALID_FD,
 		allocator = allocator,
 	}
-	fd, oerr := prim.open_file(path, {.Write}, 0o600)
+	fd, oerr := prim.open_file(vfs, path, {.Write}, 0o600)
 	if oerr == .Not_Found {
-		fd, oerr = prim.open_file(path, {.Write, .Create, .Exclusive}, 0o600)
+		fd, oerr = prim.open_file(vfs, path, {.Write, .Create, .Exclusive}, 0o600)
 		if oerr == .None {
-			if serr := prim.sync_dir(prim.dir_name(path)); serr != .None {
-				prim.close(fd)
+			if serr := prim.sync_dir(vfs, prim.dir_name(path)); serr != .None {
+				prim.close_file(vfs, fd)
 				return _err(serr)
 			}
 		}
@@ -36,41 +40,67 @@ replica_open :: proc(rep: ^Replica, path: string, allocator := context.allocator
 	if oerr != .None {
 		return _err(oerr)
 	}
+	rep.fd = fd
 	have_path, herr := _sidecar(path, ".have", allocator)
 	if herr != .None {
-		prim.close(fd)
+		replica_close(rep)
 		return herr
 	}
-	rep.fd = fd
 	rep.have_path = have_path
+	redact, rerr := _sidecar(path, ".redact", allocator)
+	if rerr != .None {
+		replica_close(rep)
+		return rerr
+	}
+	rep.redact = redact
 	rep.have = make([dynamic]Range, allocator)
 	if err := _load_have(rep); err != .None {
+		replica_close(rep)
+		return err
+	}
+	t := _target(rep)
+	if err := _redact_replay(&t, rep.redact); err != .None {
 		replica_close(rep)
 		return err
 	}
 	return .None
 }
 
+replica_redact :: proc(rep: ^Replica, from, to: i64) -> Error {
+	t := _target(rep)
+	err := _redact(&t, rep.redact, from, to)
+	if err == .Missing {
+		rep.missing = t.missing
+	}
+	rep.version += 1
+	return err
+}
+
+@(private)
+_target :: proc(rep: ^Replica) -> _Redact_Target {
+	return _Redact_Target{vfs = rep.vfs, fd = rep.fd, end = rep.length, have = &rep.have, sealed = true}
+}
+
 replica_close :: proc(rep: ^Replica) {
 	if rep.fd >= 0 {
-		prim.close(rep.fd)
+		prim.close_file(rep.vfs, rep.fd)
 	}
 	delete(rep.have)
 	if len(rep.have_path) > 0 {
 		delete(rep.have_path, rep.allocator)
+	}
+	if len(rep.redact) > 0 {
+		delete(rep.redact, rep.allocator)
 	}
 	rep^ = {
 		fd = prim.INVALID_FD,
 	}
 }
 
-replica_reader :: proc(rep: ^Replica, r: ^Reader, key: ^Key = nil, allocator := context.allocator) {
-	reader_init(r, rep.fd, 0, allocator)
+replica_reader :: proc(rep: ^Replica, r: ^Reader, allocator := context.allocator) {
+	reader_init(r, rep.vfs, rep.fd, 0, allocator)
 	r.replica = rep
 	r.version = rep.version
-	if key != nil {
-		reader_set_key(r, key)
-	}
 }
 
 replica_have :: proc "contextless" (rep: ^Replica) -> []Range {
@@ -88,10 +118,10 @@ replica_write :: proc(rep: ^Replica, off: i64, data: []u8) -> Error {
 	if len(data) == 0 {
 		return .None
 	}
-	if err := prim.write_at(rep.fd, data, off); err != .None {
+	if err := prim.write_at(rep.vfs, rep.fd, data, off); err != .None {
 		return _err(err)
 	}
-	if err := prim.datasync(rep.fd); err != .None {
+	if err := prim.datasync(rep.vfs, rep.fd); err != .None {
 		return _err(err)
 	}
 	if err := _add_range(&rep.have, {off, off + i64(len(data))}); err != .None {
@@ -117,10 +147,14 @@ replica_covers :: proc "contextless" (rep: ^Replica, from, to: i64) -> bool {
 }
 
 replica_missing :: proc "contextless" (rep: ^Replica, from, to: i64) -> (gap: Range, missing: bool) {
+	return _have_missing(rep.have[:], from, to)
+}
+
+@(private)
+_have_missing :: proc "contextless" (have: []Range, from, to: i64) -> (gap: Range, missing: bool) {
 	if to <= from {
 		return
 	}
-	have := rep.have[:]
 	lo, hi := 0, len(have)
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -205,12 +239,12 @@ _save_have :: proc(rep: ^Replica) -> Error {
 	if w.err != .None {
 		return .No_Memory
 	}
-	return _err(prim.replace_atomic(rep.have_path, buf[:]))
+	return _err(prim.replace_atomic(rep.vfs, rep.have_path, buf[:]))
 }
 
 @(private)
 _load_have :: proc(rep: ^Replica) -> Error {
-	data, err := prim.read_file(rep.have_path, context.temp_allocator)
+	data, err := prim.read_file(rep.vfs, rep.have_path, context.temp_allocator)
 	if err == .Not_Found {
 		return .None
 	}

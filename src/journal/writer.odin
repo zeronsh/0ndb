@@ -4,18 +4,32 @@ import "base:runtime"
 import "core:hash/xxhash"
 import "../prim"
 
-Journal :: struct {
-	fd:         prim.Fd,
-	ck_fd:      prim.Fd,
-	durable:    i64,
-	checkpoint: i64,
-	pending:    [dynamic]u8,
-	open_at:    int,
-	allocator:  runtime.Allocator,
+Options :: struct {
+	keep_at_least: i64,
+	chain:         ^Chain,
 }
 
-journal_open :: proc(j: ^Journal, path: string, allocator := context.allocator, keep_at_least: i64 = 0) -> Error {
+Journal :: struct {
+	vfs:         prim.Vfs,
+	fd:          prim.Fd,
+	ck_fd:       prim.Fd,
+	durable:     i64,
+	checkpoint:  i64,
+	version:     u64,
+	pending:     [dynamic]u8,
+	open_at:     int,
+	chained:     bool,
+	chain:       Chain,
+	head:        Hash,
+	range_start: i64,
+	links:       [dynamic]Link,
+	redact_path: string,
+	allocator:   runtime.Allocator,
+}
+
+journal_open :: proc(j: ^Journal, vfs: prim.Vfs, path: string, opts := Options{}, allocator := context.allocator) -> Error {
 	j^ = {
+		vfs       = vfs,
 		fd        = prim.INVALID_FD,
 		ck_fd     = prim.INVALID_FD,
 		open_at   = -1,
@@ -25,36 +39,72 @@ journal_open :: proc(j: ^Journal, path: string, allocator := context.allocator, 
 	if cerr != .None {
 		return cerr
 	}
-	fd, oerr := prim.open_file(path, {.Write}, 0o600)
+	redact_path, rerr := _sidecar(path, ".redact", allocator)
+	if rerr != .None {
+		return rerr
+	}
+	j.redact_path = redact_path
+	fd, oerr := prim.open_file(vfs, path, {.Write}, 0o600)
 	if oerr == .Not_Found {
-		if keep_at_least > 0 {
+		if opts.keep_at_least > 0 {
+			_release(j)
 			return .Corrupt
 		}
-		if rerr := prim.remove(ck_path); rerr != .None && rerr != .Not_Found {
-			return _err(rerr)
+		for stale in ([]string{ck_path, redact_path}) {
+			if e := prim.remove(vfs, stale); e != .None && e != .Not_Found {
+				_release(j)
+				return _err(e)
+			}
 		}
-		fd, oerr = prim.open_file(path, {.Write, .Create, .Exclusive}, 0o600)
+		fd, oerr = prim.open_file(vfs, path, {.Write, .Create, .Exclusive}, 0o600)
 		if oerr == .None {
-			if serr := prim.sync_dir(prim.dir_name(path)); serr != .None {
-				prim.close(fd)
+			if serr := prim.sync_dir(vfs, prim.dir_name(path)); serr != .None {
+				prim.close_file(vfs, fd)
+				_release(j)
 				return _err(serr)
 			}
 		}
 	}
 	if oerr != .None {
+		_release(j)
 		return _err(oerr)
 	}
 	j.fd = fd
-	ck_fd, kerr := prim.open_file(ck_path, {.Write, .Create}, 0o600)
+	ck_fd, kerr := prim.open_file(vfs, ck_path, {.Write, .Create}, 0o600)
 	if kerr != .None {
 		_release(j)
 		return _err(kerr)
 	}
 	j.ck_fd = ck_fd
 	j.pending = make([dynamic]u8, allocator)
-	if err := _recover(j, keep_at_least); err != .None {
+	j.links = make([dynamic]Link, allocator)
+	if opts.chain != nil {
+		j.chained = true
+		j.chain = opts.chain^
+	}
+	size, serr := prim.file_size(vfs, fd)
+	if serr != .None {
+		_release(j)
+		return _err(serr)
+	}
+	t := _Redact_Target {
+		vfs = vfs,
+		fd  = fd,
+		end = size,
+	}
+	if err := _redact_replay(&t, redact_path); err != .None {
 		_release(j)
 		return err
+	}
+	if err := _recover(j, size, opts.keep_at_least); err != .None {
+		_release(j)
+		return err
+	}
+	if j.chained {
+		if err := _recover_chain(j); err != .None {
+			_release(j)
+			return err
+		}
 	}
 	return .None
 }
@@ -87,21 +137,15 @@ journal_pending :: proc "contextless" (j: ^Journal) -> int {
 	return len(j.pending)
 }
 
+journal_head :: proc "contextless" (j: ^Journal) -> Hash {
+	return j.head
+}
+
 journal_append :: proc(j: ^Journal, body: []u8) -> (off: i64, err: Error) {
-	if j.open_at >= 0 || j.fd < 0 {
+	if j.open_at >= 0 || j.fd < 0 || is_sig(body) {
 		return 0, .Invalid
 	}
-	if len(body) > MAX_BODY {
-		return 0, .Too_Large
-	}
-	off = journal_len(j)
-	start := len(j.pending)
-	if rerr := resize(&j.pending, start + len(body) + OVERHEAD); rerr != nil {
-		resize(&j.pending, start)
-		return 0, .No_Memory
-	}
-	encode_record(j.pending[start:], body, off)
-	return off, .None
+	return _append(j, body, true)
 }
 
 journal_begin :: proc(j: ^Journal) -> (w: prim.Writer, err: Error) {
@@ -109,7 +153,7 @@ journal_begin :: proc(j: ^Journal) -> (w: prim.Writer, err: Error) {
 		return {}, .Invalid
 	}
 	start := len(j.pending)
-	if rerr := resize(&j.pending, start + HEADER); rerr != nil {
+	if resize(&j.pending, start + HEADER) != nil {
 		resize(&j.pending, start)
 		return {}, .No_Memory
 	}
@@ -128,17 +172,20 @@ journal_end :: proc(j: ^Journal, w: ^prim.Writer) -> (off: i64, err: Error) {
 		err = .No_Memory
 	case n > MAX_BODY:
 		err = .Too_Large
+	case n > 0 && j.pending[start + HEADER] == SIG_KIND:
+		err = .Invalid
 	}
-	if err == .None {
-		if rerr := resize(&j.pending, len(j.pending) + TRAILER); rerr != nil {
-			err = .No_Memory
-		}
+	if err == .None && resize(&j.pending, len(j.pending) + TRAILER) != nil {
+		err = .No_Memory
+	}
+	off = j.durable + i64(start)
+	if err == .None && j.chained {
+		err = _link(j, j.pending[start + HEADER:][:n], off)
 	}
 	if err != .None {
 		journal_abort(j)
 		return 0, err
 	}
-	off = j.durable + i64(start)
 	rec := j.pending[start:]
 	body := rec[HEADER:][:n]
 	prim.put_u32le(rec[0:4], u32(n))
@@ -160,17 +207,33 @@ journal_commit :: proc(j: ^Journal) -> Error {
 	if j.fd < 0 {
 		return .Invalid
 	}
+	if j.chained && j.open_at >= 0 {
+		return .Invalid
+	}
+	sig_at := -1
+	next_head: Hash
+	if j.chained && len(j.links) > 0 {
+		at, head, err := _append_sig(j)
+		if err != .None {
+			return err
+		}
+		sig_at = at
+		next_head = head
+	}
 	n := journal_pending(j)
 	if n == 0 {
 		return .None
 	}
-	if err := prim.write_at(j.fd, j.pending[:n], j.durable); err != .None {
-		prim.truncate(j.fd, j.durable)
-		return _err(err)
+	werr := prim.write_at(j.vfs, j.fd, j.pending[:n], j.durable)
+	if werr == .None {
+		werr = prim.datasync(j.vfs, j.fd)
 	}
-	if err := prim.datasync(j.fd); err != .None {
-		prim.truncate(j.fd, j.durable)
-		return _err(err)
+	if werr != .None {
+		prim.truncate(j.vfs, j.fd, j.durable)
+		if sig_at >= 0 {
+			resize(&j.pending, sig_at)
+		}
+		return _err(werr)
 	}
 	j.durable += i64(n)
 	rest := len(j.pending) - n
@@ -185,24 +248,131 @@ journal_commit :: proc(j: ^Journal) -> Error {
 		delete(j.pending)
 		j.pending = make([dynamic]u8, j.allocator)
 	}
+	if sig_at >= 0 {
+		j.head = next_head
+		j.range_start = j.durable
+		clear(&j.links)
+	}
 	_write_checkpoint(j)
 	return .None
 }
 
+journal_redact :: proc(j: ^Journal, from, to: i64) -> Error {
+	if j.fd < 0 || j.open_at >= 0 {
+		return .Invalid
+	}
+	if err := journal_commit(j); err != .None {
+		return err
+	}
+	t := _Redact_Target {
+		vfs = j.vfs,
+		fd  = j.fd,
+		end = j.durable,
+	}
+	err := _redact(&t, j.redact_path, from, to)
+	j.version += 1
+	return err
+}
+
 journal_reader :: proc(j: ^Journal, r: ^Reader, allocator := context.allocator) {
-	reader_init(r, j.fd, 0, allocator)
+	reader_init(r, j.vfs, j.fd, 0, allocator)
 	r.journal = j
+	r.version = j.version
+}
+
+@(private)
+_append :: proc(j: ^Journal, body: []u8, link: bool) -> (off: i64, err: Error) {
+	if len(body) > MAX_BODY {
+		return 0, .Too_Large
+	}
+	off = journal_len(j)
+	if link && j.chained {
+		_link(j, body, off) or_return
+	}
+	start := len(j.pending)
+	if resize(&j.pending, start + len(body) + OVERHEAD) != nil {
+		resize(&j.pending, start)
+		if link && j.chained {
+			pop(&j.links)
+		}
+		return 0, .No_Memory
+	}
+	encode_record(j.pending[start:], body, off)
+	return off, .None
+}
+
+@(private)
+_link :: proc(j: ^Journal, body: []u8, off: i64) -> Error {
+	c, err := commitment(&j.chain, body, off)
+	if err != .None {
+		return err
+	}
+	if _, aerr := append(&j.links, Link{len = u32(len(body)), commit = c}); aerr != nil {
+		return .No_Memory
+	}
+	return .None
+}
+
+@(private)
+_append_sig :: proc(j: ^Journal) -> (at: int, head: Hash, err: Error) {
+	if j.chain.signer.sign == nil {
+		return -1, {}, .No_Key
+	}
+	head = j.head
+	pos := j.range_start
+	for l in j.links {
+		head = chain_fold(head, pos, l)
+		pos += i64(l.len) + OVERHEAD
+	}
+	info := Sig_Info {
+		off         = journal_len(j),
+		range_start = j.range_start,
+		prev_head   = j.head,
+		head        = head,
+	}
+	msg_buf: [SIG_MESSAGE_MAX]u8
+	msg := sig_message(msg_buf[:], j.chain.seed, info)
+	sig := make([dynamic]u8, context.temp_allocator)
+	if !j.chain.signer.sign(j.chain.signer.data, msg, &sig) {
+		return -1, {}, .No_Key
+	}
+	body := make([dynamic]u8, context.temp_allocator)
+	w := prim.writer(&body)
+	prim.write_u8(&w, SIG_KIND)
+	prim.write_u8(&w, 1)
+	prim.write_uvarint(&w, u64(j.range_start))
+	prim.write_uvarint(&w, u64(len(j.links)))
+	for l in j.links {
+		prim.write_uvarint(&w, u64(l.len))
+		c := l.commit
+		prim.write_raw(&w, c[:])
+	}
+	prim.write_raw(&w, info.prev_head[:])
+	prim.write_raw(&w, info.head[:])
+	prim.write_bytes(&w, sig[:])
+	if w.err != .None {
+		return -1, {}, .No_Memory
+	}
+	at = len(j.pending)
+	if _, aerr := _append(j, body[:], false); aerr != .None {
+		return -1, {}, aerr
+	}
+	return at, head, .None
 }
 
 @(private)
 _release :: proc(j: ^Journal) {
 	if j.fd >= 0 {
-		prim.close(j.fd)
+		prim.close_file(j.vfs, j.fd)
 	}
 	if j.ck_fd >= 0 {
-		prim.close(j.ck_fd)
+		prim.close_file(j.vfs, j.ck_fd)
 	}
 	delete(j.pending)
+	delete(j.links)
+	if len(j.redact_path) > 0 {
+		delete(j.redact_path, j.allocator)
+	}
 	j^ = {
 		fd      = prim.INVALID_FD,
 		ck_fd   = prim.INVALID_FD,
@@ -211,26 +381,22 @@ _release :: proc(j: ^Journal) {
 }
 
 @(private)
-_recover :: proc(j: ^Journal, keep_at_least: i64) -> Error {
-	size, serr := prim.file_size(j.fd)
-	if serr != .None {
-		return _err(serr)
-	}
+_recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 	if size < keep_at_least {
 		return .Corrupt
 	}
-	ck := _read_checkpoint(j.ck_fd)
+	ck := _read_checkpoint(j.vfs, j.ck_fd)
 	if ck > size {
 		return .Corrupt
 	}
 	end := ck
 	if ck < size {
 		r: Reader
-		reader_init(&r, j.fd, size, context.temp_allocator)
+		reader_init(&r, j.vfs, j.fd, size, context.temp_allocator)
 		defer reader_close(&r)
 		for {
 			_, nxt, err := record_at(&r, end)
-			if err != .None {
+			if err != .None && err != .Redacted {
 				break
 			}
 			end = nxt
@@ -240,17 +406,18 @@ _recover :: proc(j: ^Journal, keep_at_least: i64) -> Error {
 		}
 	}
 	if end < size {
-		if err := prim.truncate(j.fd, end); err != .None {
+		if err := prim.truncate(j.vfs, j.fd, end); err != .None {
 			return _err(err)
 		}
 	}
 	if end != ck || end < size {
-		if err := prim.datasync(j.fd); err != .None {
+		if err := prim.datasync(j.vfs, j.fd); err != .None {
 			return _err(err)
 		}
 	}
 	j.durable = end
 	j.checkpoint = ck
+	j.range_start = 0
 	if ck != end {
 		_write_checkpoint(j)
 	}
@@ -258,9 +425,53 @@ _recover :: proc(j: ^Journal, keep_at_least: i64) -> Error {
 }
 
 @(private)
-_read_checkpoint :: proc(fd: prim.Fd) -> i64 {
+_recover_chain :: proc(j: ^Journal) -> Error {
+	j.head = chain_genesis(j.chain.seed)
+	j.range_start = 0
+	clear(&j.links)
+	r: Reader
+	reader_init(&r, j.vfs, j.fd, j.durable, context.temp_allocator)
+	defer reader_close(&r)
+	links := make([dynamic]Link, context.temp_allocator)
+	pos := j.durable
+	for pos > 0 {
+		body, off, err := record_before(&r, pos)
+		if err == .Redacted {
+			pos = off
+			continue
+		}
+		if err != .None {
+			return .Corrupt
+		}
+		if is_sig(body) {
+			info, _, perr := parse_sig(body, off, &links)
+			if perr != .None {
+				return .Corrupt
+			}
+			j.head = info.head
+			j.range_start = info.end
+			break
+		}
+		pos = off
+	}
+	pos = j.range_start
+	for pos < j.durable {
+		body, nxt, err := record_at(&r, pos)
+		if err != .None {
+			return .Corrupt
+		}
+		if lerr := _link(j, body, pos); lerr != .None {
+			return lerr
+		}
+		pos = nxt
+	}
+	return .None
+}
+
+@(private)
+_read_checkpoint :: proc(vfs: prim.Vfs, fd: prim.Fd) -> i64 {
 	b: [16]u8
-	n, rerr := prim.read_at(fd, b[:], 0)
+	n, rerr := prim.read_at(vfs, fd, b[:], 0)
 	if rerr != .None || n != 16 {
 		return 0
 	}
@@ -282,7 +493,7 @@ _write_checkpoint :: proc(j: ^Journal) {
 	b: [16]u8
 	prim.put_u64le(b[0:8], u64(j.durable))
 	prim.put_u64le(b[8:16], xxhash.XXH3_64_with_seed(b[0:8], CHECKPOINT_SEED))
-	if prim.write_at(j.ck_fd, b[:], 0) == .None {
+	if prim.write_at(j.vfs, j.ck_fd, b[:], 0) == .None {
 		j.checkpoint = j.durable
 	}
 }

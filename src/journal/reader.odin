@@ -5,20 +5,26 @@ import "core:crypto/chacha20poly1305"
 import "../prim"
 
 Reader :: struct {
-	fd:        prim.Fd,
-	end:       i64,
-	owns_fd:   bool,
-	journal:   ^Journal,
-	replica:   ^Replica,
-	version:   u64,
-	sealed:    bool,
-	aead:      chacha20poly1305.Context,
-	win:       []u8,
-	win_len:   int,
-	win_off:   i64,
-	out:       []u8,
-	missing:   Range,
-	allocator: runtime.Allocator,
+	vfs:        prim.Vfs,
+	fd:         prim.Fd,
+	end:        i64,
+	owns_fd:    bool,
+	journal:    ^Journal,
+	replica:    ^Replica,
+	version:    u64,
+	keys:       Key_Provider,
+	chained:    bool,
+	chain:      Chain,
+	span:       Sig_Info,
+	span_ok:    bool,
+	span_links: [dynamic]Link,
+	span_offs:  [dynamic]i64,
+	win:        []u8,
+	win_len:    int,
+	win_off:    i64,
+	out:        []u8,
+	missing:    Range,
+	allocator:  runtime.Allocator,
 }
 
 Cursor :: struct {
@@ -27,31 +33,29 @@ Cursor :: struct {
 	err: Error,
 }
 
-reader_init :: proc(r: ^Reader, fd: prim.Fd, end: i64, allocator := context.allocator) {
+reader_init :: proc(r: ^Reader, vfs: prim.Vfs, fd: prim.Fd, end: i64, allocator := context.allocator) {
 	r^ = {
+		vfs       = vfs,
 		fd        = fd,
 		end       = end,
 		allocator = allocator,
 	}
 }
 
-reader_open :: proc(r: ^Reader, path: string, allocator := context.allocator) -> Error {
-	fd, err := prim.open_file(path)
+reader_open :: proc(r: ^Reader, vfs: prim.Vfs, path: string, allocator := context.allocator) -> Error {
+	r^ = {
+		fd = prim.INVALID_FD,
+	}
+	fd, err := prim.open_file(vfs, path)
 	if err != .None {
-		r^ = {
-			fd = prim.INVALID_FD,
-		}
 		return _err(err)
 	}
-	size, serr := prim.file_size(fd)
+	size, serr := prim.file_size(vfs, fd)
 	if serr != .None {
-		prim.close(fd)
-		r^ = {
-			fd = prim.INVALID_FD,
-		}
+		prim.close_file(vfs, fd)
 		return _err(serr)
 	}
-	reader_init(r, fd, size, allocator)
+	reader_init(r, vfs, fd, size, allocator)
 	r.owns_fd = true
 	return .None
 }
@@ -60,7 +64,7 @@ reader_refresh :: proc(r: ^Reader) -> Error {
 	if !r.owns_fd {
 		return .None
 	}
-	size, err := prim.file_size(r.fd)
+	size, err := prim.file_size(r.vfs, r.fd)
 	if err != .None {
 		return _err(err)
 	}
@@ -68,24 +72,35 @@ reader_refresh :: proc(r: ^Reader) -> Error {
 	return .None
 }
 
-reader_set_key :: proc(r: ^Reader, key: ^Key) {
-	chacha20poly1305.init(&r.aead, key[:])
-	r.sealed = true
+reader_set_keys :: proc(r: ^Reader, keys: Key_Provider) {
+	r.keys = keys
+}
+
+reader_set_chain :: proc(r: ^Reader, chain: ^Chain) {
+	r.chained = chain != nil
+	if chain != nil {
+		r.chain = chain^
+	}
+	r.span_ok = false
+}
+
+reader_span :: proc "contextless" (r: ^Reader) -> (Sig_Info, bool) {
+	return r.span, r.span_ok
 }
 
 reader_close :: proc(r: ^Reader) {
 	if r.owns_fd {
-		prim.close(r.fd)
+		prim.close_file(r.vfs, r.fd)
 	}
 	if r.win != nil {
 		delete(r.win, r.allocator)
 	}
 	if r.out != nil {
+		_zero(r.out)
 		delete(r.out, r.allocator)
 	}
-	if r.sealed {
-		chacha20poly1305.reset(&r.aead)
-	}
+	delete(r.span_links)
+	delete(r.span_offs)
 	r^ = {
 		fd = prim.INVALID_FD,
 	}
@@ -118,9 +133,8 @@ record_at :: proc(r: ^Reader, off: i64) -> (body: []u8, next: i64, err: Error) {
 		return nil, off, .Corrupt
 	}
 	next = off + n + OVERHEAD
-	rec := _fetch(r, off, next, true) or_return
-	body = _verify(r, rec, off) or_return
-	return body, next, .None
+	body, err = _read(r, off, next, true)
+	return body, next, err
 }
 
 record_before :: proc(r: ^Reader, end_off: i64) -> (body: []u8, off: i64, err: Error) {
@@ -140,9 +154,8 @@ record_before :: proc(r: ^Reader, end_off: i64) -> (body: []u8, off: i64, err: E
 		return nil, end_off, .Corrupt
 	}
 	off = end_off - n - OVERHEAD
-	rec := _fetch(r, off, end_off, false) or_return
-	body = _verify(r, rec, off) or_return
-	return body, off, .None
+	body, err = _read(r, off, end_off, false)
+	return body, off, err
 }
 
 cursor :: proc "contextless" (r: ^Reader, pos: i64) -> Cursor {
@@ -154,73 +167,264 @@ cursor_tail :: proc "contextless" (r: ^Reader) -> Cursor {
 }
 
 next :: proc(c: ^Cursor) -> (body: []u8, off: i64, ok: bool) {
-	if c.err != .None {
-		return
-	}
-	b, nxt, err := record_at(c.r, c.pos)
-	if err != .None {
-		if err != .Eof {
+	for c.err == .None {
+		b, nxt, err := record_at(c.r, c.pos)
+		at := c.pos
+		switch err {
+		case .None:
+			c.pos = nxt
+			if is_sig(b) {
+				continue
+			}
+			return b, at, true
+		case .Redacted:
+			c.pos = nxt
+			continue
+		case .Eof:
+			return
+		case .Corrupt, .Missing, .No_Key, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
 			c.err = err
 		}
-		return
 	}
-	off = c.pos
-	c.pos = nxt
-	return b, off, true
+	return
 }
 
 prev :: proc(c: ^Cursor) -> (body: []u8, off: i64, ok: bool) {
-	if c.err != .None {
-		return
-	}
-	b, start, err := record_before(c.r, c.pos)
-	if err != .None {
-		if err != .Eof {
+	for c.err == .None {
+		b, start, err := record_before(c.r, c.pos)
+		switch err {
+		case .None:
+			c.pos = start
+			if is_sig(b) {
+				continue
+			}
+			return b, start, true
+		case .Redacted:
+			c.pos = start
+			continue
+		case .Eof:
+			return
+		case .Corrupt, .Missing, .No_Key, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
 			c.err = err
 		}
-		return
 	}
-	c.pos = start
-	return b, start, true
+	return
 }
 
 @(private)
-_verify :: proc(r: ^Reader, rec: []u8, off: i64) -> ([]u8, Error) {
-	body, err := record_body(rec)
-	if err != .None {
-		return nil, err
-	}
-	tag := rec[4:HEADER]
-	if !r.sealed {
-		local := local_tag(body, off)
-		if !_tag_eq(local[:], tag) {
-			return nil, .Corrupt
+_read :: proc(r: ^Reader, off, end: i64, forward: bool) -> (body: []u8, err: Error) {
+	rec := _fetch(r, off, end, forward) or_return
+	b, kind := _decode(r, rec, off) or_return
+	if r.chained {
+		if kind == .Plain && is_sig(b) {
+			return b, _check_sig_record(r, b, off)
 		}
-		return body, .None
+		if err = _check_chain(r, off, end, b, kind == .Redacted); err != .None {
+			return nil, err
+		}
+		if kind == .Plain {
+			rec = _fetch(r, off, end, forward) or_return
+			b, _ = record_body(rec)
+		}
 	}
-	if len(r.out) < len(body) {
+	if kind == .Redacted {
+		return nil, .Redacted
+	}
+	return b, .None
+}
+
+@(private)
+_decode :: proc(r: ^Reader, rec: []u8, off: i64) -> (body: []u8, kind: Record_Kind, err: Error) {
+	kind = classify(rec, off)
+	b, _ := record_body(rec)
+	switch kind {
+	case .Invalid:
+		return nil, kind, .Corrupt
+	case .Redacted:
+		return nil, kind, .None
+	case .Plain:
+		if r.keys.key != nil && !is_sig(b) {
+			return nil, kind, .Corrupt
+		}
+		return b, kind, .None
+	case .Sealed:
+		if r.keys.key == nil {
+			return nil, kind, .Corrupt
+		}
+	}
+	k: Key
+	if !r.keys.key(r.keys.data, off, &k) {
+		return nil, .Redacted, .None
+	}
+	if len(r.out) < len(b) {
 		if r.out != nil {
+			_zero(r.out)
 			delete(r.out, r.allocator)
 			r.out = nil
 		}
-		out, aerr := make([]u8, max(len(body), 256), r.allocator)
+		out, aerr := make([]u8, max(len(b), 256), r.allocator)
 		if aerr != nil {
-			return nil, .No_Memory
+			_zero(k[:])
+			return nil, kind, .No_Memory
 		}
 		r.out = out
 	}
+	ctx: chacha20poly1305.Context
+	chacha20poly1305.init(&ctx, k[:])
+	_zero(k[:])
 	iv := nonce(off)
-	plain := r.out[:len(body)]
-	if !chacha20poly1305.open(&r.aead, plain, iv[:], nil, body, tag) {
-		return nil, .Corrupt
+	plain := r.out[:len(b)]
+	ok := chacha20poly1305.open(&ctx, plain, iv[:], nil, b, rec[4:HEADER])
+	chacha20poly1305.reset(&ctx)
+	if !ok {
+		return nil, kind, .Corrupt
 	}
-	return plain, .None
+	return plain, kind, .None
+}
+
+@(private)
+_check_chain :: proc(r: ^Reader, off, end: i64, body: []u8, redacted: bool) -> Error {
+	c: Hash
+	have_commit := false
+	if !redacted {
+		cerr: Error
+		c, cerr = commitment(&r.chain, body, off)
+		switch cerr {
+		case .None:
+			have_commit = true
+		case .No_Key:
+			return .Redacted
+		case .Eof, .Corrupt, .Missing, .Redacted, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
+			return cerr
+		}
+	}
+	if !(r.span_ok && off >= r.span.range_start && off < r.span.off) {
+		if err := _find_span(r, end); err != .None {
+			return err
+		}
+		if !(off >= r.span.range_start && off < r.span.off) {
+			return .Forged
+		}
+	}
+	lo, hi := 0, len(r.span_offs)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if r.span_offs[mid] < off {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo >= len(r.span_offs) || r.span_offs[lo] != off {
+		return .Forged
+	}
+	link := r.span_links[lo]
+	if i64(link.len) != end - off - OVERHEAD {
+		return .Forged
+	}
+	if have_commit && !_tag_eq(c[:], link.commit[:]) {
+		return .Forged
+	}
+	return .None
+}
+
+@(private)
+_find_span :: proc(r: ^Reader, from: i64) -> Error {
+	limit := reader_end(r)
+	pos := from
+	for pos < limit {
+		head := _fetch(r, pos, pos + HEADER, true) or_return
+		n := i64(prim.get_u32le(head[0:4]))
+		if n > MAX_BODY || n + OVERHEAD > limit - pos {
+			return .Corrupt
+		}
+		end := pos + n + OVERHEAD
+		if n > 0 {
+			first := _fetch(r, pos + HEADER, pos + HEADER + 1, true) or_return
+			if first[0] == SIG_KIND {
+				rec := _fetch(r, pos, end, true) or_return
+				if classify(rec, pos) == .Plain {
+					b, _ := record_body(rec)
+					return _check_sig_record(r, b, pos)
+				}
+			}
+		}
+		pos = end
+	}
+	return .Unverified
+}
+
+@(private)
+_check_sig_record :: proc(r: ^Reader, body: []u8, off: i64) -> Error {
+	if r.span_ok && r.span.off == off {
+		return .None
+	}
+	links := make([dynamic]Link, r.allocator)
+	info, sig, err := parse_sig(body, off, &links)
+	if err != .None {
+		delete(links)
+		return .Forged if err == .Corrupt else err
+	}
+	verdict := _verify_span(r, info, sig, links[:])
+	if verdict != .None {
+		delete(links)
+		return verdict
+	}
+	if r.span_ok {
+		old := r.span
+		if (info.range_start == old.end && info.prev_head != old.head) || (old.range_start == info.end && old.prev_head != info.head) {
+			delete(links)
+			return .Equivocation
+		}
+	}
+	offs := make([dynamic]i64, 0, len(links), r.allocator)
+	pos := info.range_start
+	for l in links {
+		append(&offs, pos)
+		pos += i64(l.len) + OVERHEAD
+	}
+	delete(r.span_links)
+	delete(r.span_offs)
+	r.span_links = links
+	r.span_offs = offs
+	r.span = info
+	r.span_ok = true
+	return .None
+}
+
+@(private)
+_verify_span :: proc(r: ^Reader, info: Sig_Info, sig: []u8, links: []Link) -> Error {
+	if r.chain.verifier.verify == nil {
+		return .Unverified
+	}
+	if info.range_start == 0 && info.prev_head != chain_genesis(r.chain.seed) {
+		return .Forged
+	}
+	head := info.prev_head
+	pos := info.range_start
+	for l in links {
+		head = chain_fold(head, pos, l)
+		pos += i64(l.len) + OVERHEAD
+	}
+	if pos != info.off || head != info.head {
+		return .Forged
+	}
+	msg_buf: [SIG_MESSAGE_MAX]u8
+	msg := sig_message(msg_buf[:], r.chain.seed, info)
+	if !r.chain.verifier.verify(r.chain.verifier.data, msg, sig) {
+		return .Forged
+	}
+	return .None
 }
 
 @(private)
 _fetch :: proc(r: ^Reader, from, to: i64, forward: bool) -> ([]u8, Error) {
 	file_end := reader_end(r)
 	if j := r.journal; j != nil {
+		if r.version != j.version {
+			r.version = j.version
+			r.win_len = 0
+		}
 		if from >= j.durable {
 			return j.pending[from - j.durable:to - j.durable], .None
 		}
@@ -234,7 +438,7 @@ _fetch :: proc(r: ^Reader, from, to: i64, forward: bool) -> ([]u8, Error) {
 			r.version = rep.version
 			r.win_len = 0
 		}
-		if gap, missing := replica_missing(rep, from, to); missing {
+		if gap, missing := _have_missing(rep.have[:], from, to); missing {
 			r.missing = gap
 			return nil, .Missing
 		}
@@ -255,7 +459,7 @@ _fetch :: proc(r: ^Reader, from, to: i64, forward: bool) -> ([]u8, Error) {
 	if err := _window(r, int(stop - start)); err != .None {
 		return nil, err
 	}
-	n, err := prim.read_at(r.fd, r.win[:stop - start], start)
+	n, err := prim.read_at(r.vfs, r.fd, r.win[:stop - start], start)
 	if err != .None {
 		r.win_len = 0
 		return nil, _err(err)

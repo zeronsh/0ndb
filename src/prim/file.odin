@@ -66,10 +66,10 @@ read_full :: proc(fd: Fd, buf: []u8) -> (int, Error) {
 	return n, .None
 }
 
-read_file :: proc(path: string, allocator := context.allocator) -> (data: []u8, err: Error) {
-	fd := open_file(path) or_return
-	defer close(fd)
-	size := file_size(fd) or_return
+read_file :: proc(vfs: Vfs, path: string, allocator := context.allocator) -> (data: []u8, err: Error) {
+	fd := open_file(vfs, path) or_return
+	defer close_file(vfs, fd)
+	size := file_size(vfs, fd) or_return
 	if size > i64(max(int)) {
 		return nil, .Too_Large
 	}
@@ -78,7 +78,7 @@ read_file :: proc(path: string, allocator := context.allocator) -> (data: []u8, 
 		return nil, .No_Memory
 	}
 	n: int
-	n, err = read_at(fd, buf, 0)
+	n, err = read_at(vfs, fd, buf, 0)
 	if err != .None {
 		delete(buf, allocator)
 		return nil, err
@@ -86,7 +86,7 @@ read_file :: proc(path: string, allocator := context.allocator) -> (data: []u8, 
 	return buf[:n], .None
 }
 
-replace_atomic :: proc(path: string, data: []u8) -> Error {
+replace_atomic :: proc(vfs: Vfs, path: string, data: []u8) -> Error {
 	if len(path) + 4 >= PATH_MAX {
 		return .Name_Too_Long
 	}
@@ -94,33 +94,33 @@ replace_atomic :: proc(path: string, data: []u8) -> Error {
 	copy(tmp_buf[:], path)
 	copy(tmp_buf[len(path):], ".tmp")
 	tmp := string(tmp_buf[:len(path) + 4])
-	fd := open_file(tmp, {.Write, .Create, .Truncate}) or_return
-	err := write_at(fd, data, 0)
+	fd := open_file(vfs, tmp, {.Write, .Create, .Truncate}) or_return
+	err := write_at(vfs, fd, data, 0)
 	if err == .None {
-		err = datasync(fd)
+		err = datasync(vfs, fd)
 	}
-	close_err := close(fd)
+	close_err := close_file(vfs, fd)
 	if err == .None {
 		err = close_err
 	}
 	if err == .None {
-		err = rename(tmp, path)
+		err = rename(vfs, tmp, path)
 	}
 	if err != .None {
-		_ = remove(tmp)
+		_ = remove(vfs, tmp)
 		return err
 	}
-	return sync_dir(dir_name(path))
+	return sync_dir(vfs, dir_name(path))
 }
 
-mkdir_all :: proc(path: string, mode: u32 = 0o755) -> Error {
+mkdir_all :: proc(vfs: Vfs, path: string, mode: u32 = 0o755) -> Error {
 	if len(path) == 0 {
 		return .Not_Found
 	}
 	if len(path) >= PATH_MAX {
 		return .Name_Too_Long
 	}
-	if is_dir(path) {
+	if is_dir(vfs, path) {
 		return .None
 	}
 	i := 0
@@ -133,14 +133,14 @@ mkdir_all :: proc(path: string, mode: u32 = 0o755) -> Error {
 			j += 1
 		}
 		if j > 0 && path[j - 1] != '/' {
-			err := mkdir(path[:j], mode)
+			err := mkdir(vfs, path[:j], mode)
 			if err != .None && err != .Exists {
 				return err
 			}
 		}
 		i = j
 	}
-	if !is_dir(path) {
+	if !is_dir(vfs, path) {
 		return .Not_Dir
 	}
 	return .None
