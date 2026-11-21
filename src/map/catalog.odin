@@ -16,6 +16,7 @@ Catalog_Tag :: enum u32 {
 	Usage        = 9,
 	Archived     = 10,
 	Pinned       = 11,
+	Storage      = 12,
 }
 
 Catalog_Entry :: struct {
@@ -31,6 +32,7 @@ Catalog_Entry :: struct {
 	usage:        []u8,
 	archived:     bool,
 	pinned:       bool,
+	storage:      u8,
 }
 
 CATALOG_BY_ACTIVITY :: 0
@@ -132,6 +134,9 @@ catalog_decode :: proc(e: ^Entry, allocator := context.allocator) -> (c: Catalog
 		#partial switch Catalog_Tag(r.tag) {
 		case .Usage:
 			c.usage = obj.clone_bytes(r.value, allocator) or_return
+		case .Storage:
+			x, _ := value_u64(r.value)
+			c.storage = u8(min(x, 255))
 		}
 	}
 	c.kind = row.kind

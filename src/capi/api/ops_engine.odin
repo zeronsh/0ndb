@@ -1,6 +1,5 @@
 package api
 
-import "core:crypto"
 import "../../convo"
 import eng "../../engine"
 import omap "../../map"
@@ -81,43 +80,6 @@ op_space_create :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	_attach(c, id)
 	o_id(o, "space", id)
-	return .Ok
-}
-
-op_space_join :: proc(c: ^Call, o: ^Out) -> Status {
-	id, err := eng.space_join_pairing(c.api.e, a_str(c, "code"), a_str(c, "name"))
-	if err != .None && err != .Exists {
-		return status_of(err)
-	}
-	_attach(c, id)
-	o_id(o, "space", id)
-	return .Ok
-}
-
-op_space_join_secret :: proc(c: ^Call, o: ^Out) -> Status {
-	rk, ok := _relay_key(c)
-	b := a_bytes(c, "secret")
-	if !ok || len(b) != 32 {
-		return .Invalid
-	}
-	secret: osync.Secret
-	copy(secret[:], b)
-	defer crypto.zero_explicit(&secret, size_of(secret))
-	id, err := eng.space_join(c.api.e, secret, a_str(c, "name"), a_str(c, "relay"), rk, osync.Encryption_Mode(min(a_u64(c, "mode"), 1)))
-	if err != .None && err != .Exists {
-		return status_of(err)
-	}
-	_attach(c, id)
-	o_id(o, "space", id)
-	return .Ok
-}
-
-op_space_pairing :: proc(c: ^Call, o: ^Out) -> Status {
-	code, err := eng.space_pairing(c.api.e, a_id(c, "space"), context.temp_allocator)
-	if err != .None {
-		return status_of(err)
-	}
-	o_str(o, "code", code)
 	return .Ok
 }
 
@@ -623,6 +585,7 @@ CATALOG_SET_ARGS := [eng.Catalog_Field]string {
 	.Parent    = "parent",
 	.Workspace = "workspace",
 	.Agent     = "agent",
+	.Storage   = "storage",
 }
 
 op_catalog_set :: proc(c: ^Call, o: ^Out) -> Status {
@@ -643,6 +606,7 @@ op_catalog_set :: proc(c: ^Call, o: ^Out) -> Status {
 		parent    = obj.Xref{object = a_object(c, "parent").id, rid = a_rid(c, "parent_msg")},
 		workspace = a_id(c, "workspace"),
 		agent     = a_id(c, "agent"),
+		storage   = eng.Storage_Class(min(a_u64(c, "storage"), u64(max(eng.Storage_Class)))),
 	}
 	return exec(c, o, cmd)
 }
@@ -660,11 +624,41 @@ op_search :: proc(c: ^Call, o: ^Out) -> Status {
 		collapse = a_bool(c, "collapse"),
 		now      = eng.hlc_now(c.api.e),
 	}
-	res, err := eng.search_query(c.api.e, a_str(c, "query"), req, context.temp_allocator)
-	if err != .None {
-		return status_of(err)
+	space := a_id(c, "space")
+	if space == {} || req.semantic || req.collapse {
+		res, err := eng.search_query(c.api.e, a_str(c, "query"), req, context.temp_allocator)
+		if err != .None {
+			return status_of(err)
+		}
+		emit_results(o, &res)
+		return .Ok
 	}
-	emit_results(o, &res)
+	if c.stage == 0 {
+		scope := eng.Search_Scope(min(a_u64(c, "scope"), 2))
+		id, err := eng.search_everywhere(c.api.e, space, a_str(c, "query"), req, scope, done(c))
+		if err != .None {
+			return status_of(err)
+		}
+		c.scratch[0] = id
+		c.in_exec = true
+		return .Pending
+	}
+	r := eng.search_result(c.api.e, c.scratch[0])
+	if r == nil {
+		return status_of(c.err) if c.err != .None else .Io
+	}
+	emit_search(o, r)
+	return .Ok
+}
+
+op_search_mode :: proc(c: ^Call, o: ^Out) -> Status {
+	space := a_id(c, "space")
+	if has(c, "mode") {
+		if err := eng.space_search_set(c.api.e, space, eng.Search_Mode(min(a_u64(c, "mode"), 2))); err != .None {
+			return status_of(err)
+		}
+	}
+	o_enum(o, "mode", u64(eng.space_search_mode(c.api.e, space)), SEARCH_MODE_NAMES[:])
 	return .Ok
 }
 
@@ -689,8 +683,6 @@ op_search_wrote :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
-SHARE_VERSION :: 1
-
 op_share_object :: proc(c: ^Call, o: ^Out) -> Status {
 	recipient, cerr := osync.card_verify(a_bytes(c, "card"))
 	if cerr != .None {
@@ -701,32 +693,18 @@ op_share_object :: proc(c: ^Call, o: ^Out) -> Status {
 		return status_of(err)
 	}
 	buf := make([dynamic]u8, context.temp_allocator)
-	w := prim.writer(&buf)
-	prim.write_u8(&w, SHARE_VERSION)
-	prim.write_id(&w, s.from)
-	prim.write_id(&w, s.space)
-	prim.write_id(&w, s.object)
-	prim.write_u8(&w, u8(s.kind))
-	prim.write_raw(&w, s.wrapped[:])
+	if eng.share_encode(&s, &buf) != .None {
+		return .No_Memory
+	}
 	o_bytes(o, "share", buf[:])
 	return .Ok
 }
 
 op_share_accept :: proc(c: ^Call, o: ^Out) -> Status {
-	r := prim.reader(a_bytes(c, "share"))
 	s: eng.Share
-	if prim.read_u8(&r) != SHARE_VERSION {
+	if eng.share_decode(a_bytes(c, "share"), &s) != .None {
 		return .Invalid
 	}
-	s.from = prim.read_id(&r)
-	s.space = prim.read_id(&r)
-	s.object = prim.read_id(&r)
-	k := prim.read_u8(&r)
-	prim.read_fixed(&r, s.wrapped[:])
-	if !prim.reader_done(&r) || k < 1 || k > 4 {
-		return .Invalid
-	}
-	s.kind = eng.Kind(k)
 	if err := eng.accept_share(c.api.e, s); err != .None {
 		return status_of(err)
 	}
@@ -907,4 +885,31 @@ _attach :: proc(c: ^Call, space: prim.Id) {
 	if c.api.r != nil {
 		rt.attach(c.api.r, space)
 	}
+}
+
+op_storage_availability :: proc(c: ^Call, o: ^Out) -> Status {
+	ob := a_object(c, "object")
+	holders, unavailable := eng.availability(c.api.e, ob, context.temp_allocator)
+	class, _ := eng.storage_class(c.api.e, ob)
+	o_bool(o, "unavailable", unavailable)
+	o_arr(o, "holders", len(holders))
+	for h in holders {
+		o_id(o, "", h)
+	}
+	o_end(o)
+	o_u64(o, "class", u64(class))
+	return .Ok
+}
+
+op_storage_stats :: proc(c: ^Call, o: ^Out) -> Status {
+	st := eng.storage_stats(c.api.e)
+	o_u64(o, "promotions", u64(st.promotions))
+	o_u64(o, "promoted", u64(max(st.promoted, 0)))
+	o_u64(o, "served", u64(max(st.served_bytes, 0)))
+	o_u64(o, "unavailable", u64(st.unavailable))
+	return .Ok
+}
+
+op_object_promote :: proc(c: ^Call, o: ^Out) -> Status {
+	return status_of(eng.object_promote(c.api.e, a_object(c, "object"), i64(min(a_u64(c, "from"), u64(max(i64))))))
 }

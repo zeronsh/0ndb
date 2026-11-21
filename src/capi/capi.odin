@@ -6,8 +6,8 @@ import "./api"
 import eng "../engine"
 import rt "../runtime"
 
-ABI_MAJOR :: 1
-ABI_MINOR :: 5
+ABI_MAJOR :: 2
+ABI_MINOR :: 0
 
 FLAG_JSON :: u32(1)
 
@@ -18,6 +18,8 @@ CFG_NO_SEARCH :: u32(1 << 3)
 CFG_DEFERRED :: u32(1 << 4)
 CFG_EVENTS_JSON :: u32(1 << 5)
 CFG_IDLE_PAGEOUT :: u32(1 << 6)
+CFG_SEARCH_FULL :: u32(1 << 7)
+CFG_STORAGE_SHIFT :: 8
 
 Done_Fn :: #type proc "c" (ud: rawptr, call: u64, status: i32, payload: [^]u8, len: uint)
 Sub_Fn :: #type proc "c" (ud: rawptr, sub: u64, payload: [^]u8, len: uint)
@@ -50,6 +52,11 @@ Config :: struct {
 	log:            ^C_Log,
 	events:         ^Events,
 	runtime:        ^C_Runtime,
+	search_remote:  ^C_Search_Remote,
+	unlock:         ^C_Unlock,
+	sealed_store:   ^C_Sealed_Store,
+	runner_pool:    ^C_Runner_Pool,
+	approver:       u32,
 }
 
 Post_Item :: struct {
@@ -168,16 +175,18 @@ ondb_open :: proc "c" (cfg: ^Config, out: ^^Handle) -> i32 {
 	h.allocator = context.allocator
 	h.flags = cfg.flags
 	h.posts = make([dynamic]^Post_Item)
-	if cfg.size >= u32(size_of(Config)) && cfg.events != nil && cfg.events.event != nil {
+	if _has(cfg, offset_of(Config, events)) && cfg.events != nil && cfg.events.event != nil {
 		h.events = cfg.events^
 	}
 	ec := eng.default_config(string(cfg.dir))
 	ec.verify_chains = cfg.flags & CFG_NO_VERIFY == 0
+	ec.storage = eng.Storage_Mode((cfg.flags >> CFG_STORAGE_SHIFT) & 3)
 	ec.kernel_tls = cfg.flags & CFG_NO_KTLS == 0
 	ec.padding = cfg.flags & CFG_PADDING != 0
 	ec.search = cfg.flags & CFG_NO_SEARCH == 0
 	ec.durability = .Deferred if cfg.flags & CFG_DEFERRED != 0 else .Async
 	ec.idle_pageout = cfg.flags & CFG_IDLE_PAGEOUT != 0
+	ec.search_full = cfg.flags & CFG_SEARCH_FULL != 0
 	if cfg.handle_cache > 0 {
 		ec.handle_cache = int(cfg.handle_cache)
 	}
@@ -193,7 +202,7 @@ ondb_open :: proc "c" (cfg: ^Config, out: ^^Handle) -> i32 {
 	}
 	ec.events = eng.Event_Hook{data = h, event = _on_event}
 	opts: api.Stack_Options
-	if cfg.size >= u32(size_of(Config)) && cfg.runtime != nil {
+	if _has(cfg, offset_of(Config, runtime)) && cfg.runtime != nil {
 		o, st := runtime_config(h, cfg.runtime)
 		if st != .Ok {
 			_handle_free(h)
@@ -347,6 +356,16 @@ Call_Ctx :: struct {
 	h:  ^Handle,
 	fn: Done_Fn,
 	ud: rawptr,
+}
+
+@(export, link_name = "ondb_search_answer")
+ondb_search_answer :: proc "c" (h: ^Handle, id: u64, payload: [^]u8, len: uint) -> i32 {
+	if h == nil || (payload == nil && len > 0) {
+		return i32(api.Status.Invalid)
+	}
+	context = _ctx()
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	return i32(api.status_of(eng.search_remote_answer_bytes(&h.s.e, id, payload[:len])))
 }
 
 @(export, link_name = "ondb_call")

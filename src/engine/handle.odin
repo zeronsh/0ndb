@@ -274,6 +274,7 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 		h.published = journal.journal_durable_len(&h.hist.journal)
 	}
 	h.w_open = true
+	_own_tree_epoch(e, h)
 	return .None
 }
 
@@ -762,6 +763,9 @@ _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tri
 	}
 	if tries >= MAX_TRIES {
 		return .Missing
+	}
+	if h.sp.mem.revoked || h.sp.mem.removed {
+		return .Permission
 	}
 	w := new(Waiter, e.allocator)
 	w.space = h.sp.id

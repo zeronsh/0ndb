@@ -37,6 +37,9 @@ Repl_Event_Kind :: enum u8 {
 	Undelivered,
 	Object_Shredded,
 	Caught_Up,
+	Unavailable,
+	Peer_Misbehaving,
+	Promoted,
 }
 
 Repl_Event :: struct {
@@ -75,6 +78,7 @@ Replicator_Config :: struct {
 	relays:       []Relay_Address,
 	keys:         proc(user: rawptr, device: Device_Id, name: string, epoch: u64, stream: Stream_Id) -> (sealing: Stream_Sealing, tree: journal.Key_Provider),
 	kernel_tls:   bool,
+	seal:         proc(user: rawptr, name: string, id: Stream_Id, data: []u8, off: i64) -> Error,
 	on_event:     Repl_Handler,
 	user:         rawptr,
 }
@@ -83,6 +87,7 @@ Stream_Sealing :: enum u8 {
 	Unknown,
 	Stream_Key,
 	Key_Tree,
+	Key_Tree_Stale,
 }
 
 Presence_State :: struct {
@@ -140,6 +145,8 @@ Local :: struct {
 	superseded: bool,
 	reaping:   bool,
 	verify:    [dynamic]u8,
+	hollow:    bool,
+	noting:    bool,
 }
 
 Remote :: struct {
@@ -185,6 +192,14 @@ Remote :: struct {
 	span_ok:   bool,
 	span_fd:   prim.Fd,
 	span_seq:  u64,
+	base:      i64,
+	suspect:   Device_Id,
+	base_checked: bool,
+	unavail:   bool,
+	pulls:     [dynamic]Pull_Flight,
+	refused:   [dynamic]Device_Id,
+	carry:     [dynamic]u8,
+	carry_at:  i64,
 }
 
 Group :: struct {
@@ -255,6 +270,14 @@ Replicator :: struct {
 	usage:      i64,
 	quota:      i64,
 	pumping:    bool,
+	serves:     [dynamic]Serve_Req,
+	pull_tag:   u64,
+	rx_holder:  Device_Id,
+	rx_tag:     u64,
+	rx_skip:    bool,
+	served_bytes: i64,
+	peer_tampered: int,
+	promos:     [dynamic]^Promotion,
 	allocator:  runtime.Allocator,
 }
 
@@ -342,6 +365,8 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.reap = make([dynamic]^Remote, allocator)
 	r.presence = make(map[Device_Id]Presence_State, allocator)
 	r.reap_local = make([dynamic]^Local, allocator)
+	r.serves = make([dynamic]Serve_Req, allocator)
+	r.promos = make([dynamic]^Promotion, allocator)
 	r.tr.fd = prim.INVALID_FD
 	return .None
 }
@@ -380,6 +405,11 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.reap)
 	delete(r.reap_local)
 	delete(r.presence)
+	delete(r.serves)
+	for pr in r.promos {
+		_promotion_free(r, pr)
+	}
+	delete(r.promos)
 	delete(r.endpoints)
 	delete(r.publics)
 	if r.deadline != 0 {
@@ -448,7 +478,7 @@ replicator_floor :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64
 	return newest.value, .None
 }
 
-replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil) -> Error {
+replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil, hollow := false) -> Error {
 	_enter(r)
 	defer _leave(r)
 	id := stream_id(scope, r.cfg.self, name, epoch)
@@ -458,6 +488,9 @@ replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u
 	}
 	if tree != nil {
 		l.tree = tree
+	}
+	if !l.noting {
+		l.hollow = hollow
 	}
 	l.durable = max(l.durable, durable)
 	l.blocked = false
@@ -654,6 +687,7 @@ _local_open :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, id:
 	if oerr == .Not_Found {
 		ffd, oerr = prim.open_file(r.vfs, fpath, {.Write, .Create, .Exclusive}, 0o600)
 		if oerr == .None {
+			_floor_meta_write(r, ffd, name, path)
 			if serr := prim.sync_dir(r.vfs, prim.dir_name(fpath)); serr != .None {
 				prim.close_file(r.vfs, ffd)
 				return nil, _from_prim(serr)
@@ -754,6 +788,10 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	if r.uploading >= MAX_UPLOADS || client_queued(&r.client) >= OUT_HIGH {
+		return
+	}
+	if l.hollow {
+		_local_note(r, l)
 		return
 	}
 	if l.fd < 0 {
@@ -1106,6 +1144,9 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 	rm.inflight = make([dynamic]journal.Range, r.allocator)
 	rm.verified = make([dynamic]journal.Range, r.allocator)
 	rm.claims = make([dynamic]i64, r.allocator)
+	rm.pulls = make([dynamic]Pull_Flight, r.allocator)
+	rm.refused = make([dynamic]Device_Id, r.allocator)
+	rm.carry = make([dynamic]u8, r.allocator)
 	nerr, perr: Error
 	rm.name, nerr = _clone_string(name, r.allocator)
 	rm.path, perr = _clone_string(path, r.allocator)
@@ -1147,6 +1188,9 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 	delete(rm.inflight)
 	delete(rm.verified)
 	delete(rm.claims)
+	delete(rm.pulls)
+	delete(rm.refused)
+	delete(rm.carry)
 	delete(rm.name, r.allocator)
 	delete(rm.path, r.allocator)
 	free(rm, r.allocator)
@@ -1154,7 +1198,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
-	if rm.follow || rm.refs > 0 || len(rm.wants) > 0 || len(rm.inflight) > 0 || rm.tail > 0 || r.rx_remote == rm {
+	if rm.follow || rm.refs > 0 || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm {
 		return
 	}
 	if r.hold > 0 {
@@ -1214,6 +1258,7 @@ _on_presence :: proc(r: ^Replicator, ev: ^Event) {
 			p.up = false
 			r.presence[d] = p
 			_emit(r, Repl_Event{kind = .Presence, device = d, from = 0, length = p.since})
+			_peers_presence(r, d, false)
 		}
 		return
 	}
@@ -1227,6 +1272,7 @@ _on_presence :: proc(r: ^Replicator, ev: ^Event) {
 	r.presence[d] = Presence_State{up = up, since = ev.length, seen = true}
 	if !had || old.up != up || old.since != ev.length {
 		_emit(r, Repl_Event{kind = .Presence, device = d, from = 1 if up else 0, length = ev.length})
+		_peers_presence(r, d, up)
 	}
 }
 
@@ -1313,7 +1359,7 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 			return
 		}
 		if rm.relay_len > from {
-			client_read(&r.client, rm.id, from, rm.relay_len)
+			_read_range(r, rm, from, rm.relay_len)
 			rm.pulled = rm.relay_len
 		}
 		return
@@ -1333,7 +1379,7 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 		return
 	}
 	if rm.relay_len > rm.pulled {
-		client_read(&r.client, rm.id, rm.pulled, rm.relay_len)
+		_read_range(r, rm, rm.pulled, rm.relay_len)
 		rm.pulled = rm.relay_len
 	}
 }
@@ -1376,6 +1422,14 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 		} else {
 			fetch.to = fetch.from + STAGE_MAX
 		}
+	}
+	if fetch.from < rm.base {
+		_pull_range(r, rm, fetch.from, min(fetch.to, rm.base))
+		if fetch.to <= rm.base {
+			_pull_ahead(r, rm, fetch.to, min(gap.to, rm.base))
+			return
+		}
+		fetch.from = rm.base
 	}
 	if client_read(&r.client, rm.id, fetch.from, fetch.to) == .None {
 		append(&rm.inflight, fetch)
@@ -1420,6 +1474,11 @@ _unclaim :: proc(rm: ^Remote, x: i64) {
 _covered_inflight :: proc(rm: ^Remote, g: journal.Range) -> bool {
 	for f in rm.inflight {
 		if f.from < 0 || (f.from <= g.from && f.to >= g.to) {
+			return true
+		}
+	}
+	for p in rm.pulls {
+		if g.from >= 0 && p.from <= g.from && p.to >= g.to {
 			return true
 		}
 	}
@@ -1678,6 +1737,9 @@ _held_apply :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _tamper :: proc(r: ^Replicator, rm: ^Remote) {
+	if _peer_tampered(r, rm) {
+		return
+	}
 	r.tamper_run += 1
 	if r.tamper_run == TAMPER_REPORT {
 		_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
@@ -1724,8 +1786,16 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 			if rm.id == id && ev.at == r.rx_at {
 				return
 			}
-			_stage_flush(r, true, -1)
-			_remote_landed(r, rm, r.rx_start, r.rx_at, -1)
+			if len(r.stage) > 0 && !rm.quarantined && len(r.stage) <= STAGE_MAX {
+				clear(&rm.carry)
+				append(&rm.carry, ..r.stage[:])
+				rm.carry_at = r.stage_at
+				clear(&r.stage)
+				_remote_landed(r, rm, r.rx_start, rm.carry_at, -1)
+			} else {
+				_stage_flush(r, true, -1)
+				_remote_landed(r, rm, r.rx_start, r.rx_at, -1)
+			}
 		}
 		r.rx_remote = nil
 		r.rx_local = nil
@@ -1742,6 +1812,17 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 			return
 		}
 		r.rx_remote = rm
+		if ev.kind == .Data && ev.at < rm.base && r.rx_holder == {} {
+			rm.base = ev.at
+		}
+		if len(rm.carry) > 0 {
+			if rm.carry_at + i64(len(rm.carry)) == ev.at {
+				append(&r.stage, ..rm.carry[:])
+				r.stage_at = rm.carry_at
+				r.rx_start = rm.carry_at
+			}
+			clear(&rm.carry)
+		}
 		if ev.length > rm.relay_len {
 			rm.relay_len = ev.length
 		}
@@ -1898,6 +1979,16 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_on_presence(r, ev)
 	case .Direct, .Undelivered:
 		_on_direct_event(r, ev)
+	case .Noted:
+		_on_noted(r, ev)
+	case .Hollow:
+		_on_hollow(r, ev)
+	case .Pulled:
+		_on_pulled(r, ev)
+	case .Served:
+		_on_served(r, ev)
+	case .Unserved:
+		_on_unserved(r, ev)
 	case .Probed:
 		if Stream_Id(ev.id) == reserved_id(FEED_TAG, 0) {
 			r.feed_target = ev.length
@@ -1914,6 +2005,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 			_remote_pull(r, rm)
 			_remote_settle(r, rm)
 		}
+		_promote_on_probed(r, Stream_Id(ev.id), ev.length)
 		if _, known := r.remotes[Stream_Id(ev.id)]; known || ev.length > 0 {
 			_seen_stream(r, Stream_Id(ev.id), ev.length)
 		}
@@ -1963,7 +2055,11 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		_emit(r, rv)
 		return
 	}
+	if _promote_on_refused(r, id, ev.code) {
+		return
+	}
 	if l, ok := r.locals[id]; ok {
+		l.noting = false
 		if l.inflight > 0 {
 			r.uploading -= 1
 			l.inflight = 0
@@ -2051,6 +2147,8 @@ _repl_pump :: proc(r: ^Replicator) {
 			}
 		}
 		_objs_pump(r)
+		_serves_pump(r)
+		_promotions_pump(r)
 	}
 	_repl_flush(r)
 }
@@ -2066,15 +2164,22 @@ _repl_reset_state :: proc(r: ^Replicator) {
 	r.uploading = 0
 	for _, l in r.locals {
 		l.inflight = 0
+		l.noting = false
 		l.verifying = false
 		l.ahead = 0
 		clear(&l.verify)
 	}
 	for _, rm in r.remotes {
 		clear(&rm.inflight)
+		clear(&rm.pulls)
+		clear(&rm.carry)
 		rm.pulling = false
 		rm.probing = false
 	}
+	clear(&r.serves)
+	r.rx_holder = {}
+	r.rx_skip = false
+	_promotions_reset(r)
 	_objs_reset(r)
 	_fetches_reset(r)
 }

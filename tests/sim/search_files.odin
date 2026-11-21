@@ -100,6 +100,20 @@ check_search_models :: proc(w: ^World, secrets: []string, owners: []int) {
 				}
 			}
 		}
+		if n.e.index_open {
+			ix := &n.e.index
+			settled := false
+			for _ in 0 ..< 64 {
+				more, merr := search.merge_step(ix, 1 << 30)
+				if merr != .None || !more {
+					settled = merr == .None
+					break
+				}
+			}
+			if !settled {
+				world_fail(w, "search: index maintenance on %s does not terminate (models pending %v)", n.name, search.models_pending(ix))
+			}
+		}
 		if n.e.index_open && len(names) > 0 {
 			ix := &n.e.index
 			ix.taint_check = true

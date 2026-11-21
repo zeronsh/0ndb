@@ -80,9 +80,17 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.durability = .Deferred
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
+	cfg.search_full = n.idx % 2 == 0
+	cfg.search_hedge_ms = 200
+	cfg.search_deadline_ms = 2000
+	cfg.search_snapshot_min = 512
 	cfg.pack_options = pack.DEFAULT_OPTIONS
 	cfg.pack_options.clock = node_clock(&n.clock)
 	cfg.use_pack_options = true
+	cfg.storage = w.cfg.storage
+	if w.node_cfg != nil {
+		w.node_cfg(n, &cfg)
+	}
 	n.alive = true
 	err := eng.open(&n.e, cfg, context.allocator)
 	if n.disk.dead {
@@ -322,6 +330,8 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		world_note(w, "%s connected %s", n.name, id_short(ev.space))
 	case .Disconnected:
 		world_note(w, "%s disconnected %s", n.name, id_short(ev.space))
+	case .Unavailable, .Available, .Promoted, .Peer_Misbehaving:
+		world_note(w, "%s %v %s device %s length %d %v", n.name, ev.kind, id_short(ev.object), id_short(ev.device), ev.length, ev.err)
 	}
 }
 
@@ -348,15 +358,22 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	cfg.kernel_tls = false
 	cfg.random = rng_random(&rn.rng)
 	cfg.clock = node_clock(&rn.clock)
-	if serr := osync.space_authorizer_init(&rn.sauth, cfg.vfs, RELAY_DIR + "/allow", true, cfg.default_quota); serr != .None {
+	if serr := osync.member_authorizer_init(&rn.mauth, cfg.vfs, RELAY_DIR + "/members", {}, true, cfg.default_quota, node_clock(&rn.clock)); serr != .None {
 		world_fail(w, "relay authorizer init failed: %v", serr)
 		instance_kill(&rn.inst)
 		return false
 	}
-	eng.cap_authorizer_init(&rn.cauth, osync.space_authorizer(&rn.sauth), cfg.default_quota, node_clock(&rn.clock))
+	eng.cap_authorizer_init(&rn.cauth, osync.member_authorizer(&rn.mauth), cfg.default_quota, node_clock(&rn.clock))
+	rn.cauth.issuer_data = &rn.mauth
+	rn.cauth.issuer_ok = proc(data: rawptr, space: prim.Id, issuer: osync.Public_Key) -> bool {
+		return osync.member_authorizer_active((^osync.Member_Authorizer)(data), osync.Space_Id(space), issuer)
+	}
 	cfg.authorizer = eng.cap_authorizer(&rn.cauth)
 	rn.alive = true
 	err := osync.relay_init(&rn.r, &rn.inst.loop, cfg)
+	if err == .None {
+		osync.member_authorizer_set_storage(&rn.mauth, osync.relay_storage(&rn.r))
+	}
 	if rn.disk.dead {
 		relay_crashed(rn)
 		return false
@@ -380,7 +397,7 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.r_on = false
 	instance_kill(&rn.inst)
 	rn.r = {}
-	rn.sauth = {}
+	rn.mauth = {}
 	rn.cauth = {}
 }
 

@@ -377,10 +377,19 @@ equal in both directions.
   at the time of the write (or the writer pid's scope). Background passes
   defer files younger than a settle delay; scope ends, fences and shutdown
   ingest everything.
+- **Commit protocol**: each batch a mount commits carries one opaque
+  mount-mark op (tag 18 plus a random per-mount nonce) and, unless the line
+  is held, the mount's line record, in the same journal commit. Nothing is
+  written before the commit; the mount state records the journal position
+  it reflects, and after a crash the mount finds its own committed batches
+  by scanning its stream from there for its mark. The mount state alternates
+  between two checksummed in-place slots carrying a sequence number. A pass
+  costs four flushes: journal, store, shadow and mount state.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
-  shadow is ingested first, never overwritten. Writes are temp + rename,
-  with modes and symlinks.
+  shadow is ingested first, never overwritten. Only durable history is
+  materialized, so a crash never leaves disk content the history lacks.
+  Writes are temp + rename, with modes and symlinks.
 - **Large files** (over a size limit) are opaque content referenced by git
   oid, hashed and written by streaming, never read into memory.
 - **Ignore**: full `.gitignore` semantics (negation, anchoring, `**`,
@@ -528,7 +537,8 @@ concurrent typing is never lost or reverted.
 - Every kind supports: paging from any tail with batched missing-range
   reporting, per-participant signed hash chains, per-record keys from the
   object's puncturable key tree, and redaction.
-- A space is a key hierarchy and a relay namespace. Its catalog is a map
+- A space is a membership log, a sequence of key epochs and a relay
+  namespace (see Membership and key epochs). Its catalog is a map
   object with one entry per object (kind, title, parent, workspace, agent,
   participants, status, activity, usage, archived, pinned), materialized
   locally into ordered views so any listing is a paged range read.
@@ -651,7 +661,10 @@ Indexes are never durable ahead of their sources: a flush that would persist
 a source position past that source's durable end is deferred, and on open an
 index whose recorded position is beyond a source's durable end is rebuilt.
 Dictionaries and codebooks record the documents they were trained on and
-retrain when any of them is deleted.
+retrain when any of them is deleted. Stored text frames are zstd level 6,
+with trained dictionaries, through one pinned zstd (`src/zstd`, 1.5.7)
+linked statically on every platform, so index bytes are identical across
+hosts.
 
 **Cross-device search.** Partial replication means a device can only index
 what it holds, so search reaches across devices:
@@ -670,7 +683,7 @@ what it holds, so search reaches across devices:
   gets one reply: refs only, `(object, record ref, part, score, hlc, match
   spans)`, a cursor, and a freshness vector, never content. The request
   carries the requester's card and a signature, plus a proof derived from
-  the space secret when the requester is a member; a non-member is answered
+  the current epoch's content key when the requester is a member; a non-member is answered
   only from objects it participates in.
 - *Verification.* The requester fetches every hit itself through normal
   paged reads, verifying chains and decrypting with its own keys, re-checks
@@ -721,7 +734,518 @@ checkpoint bundles, as before, plus:
   participant of the same space by device id. The relay delivers it to one
   live connection of that device or answers `Undelivered` at once; it keeps
   no state beyond delivery and cannot read the payload, which the endpoints
-  encrypt end to end. Cross-device search is its only user.
+  encrypt end to end. Cross-device search and sign-in approvals use it.
+
+### Membership and key epochs
+
+No device holds a permanent space root. A space is a signed membership log
+plus a sequence of key epochs sealed to the current members; the relay
+enforces the log, holds no keys, and stays dumb.
+
+**Membership log** (`sync/members.odin`, `roster.odin`). Every member keeps a
+transparent (unencrypted, signed) single-writer stream `members` whose stream
+id is `device ‖ BLAKE2b-MAC(BLAKE2b("0ndb members name" ‖ space), epoch 0 ‖
+"members")[:16]`, computable by the relay. A record is
+
+```
+MEMBER_RECORD(0x4d) | version 1 | op u8 | space [16] | author sign pub [32]
+| lamport uvarint | nparents uvarint (<= 64) | parents [32]* | time_ms u64le
+| payload bytes | sig [64]
+id  = BLAKE2b-256("0ndb member id" ‖ whole record)
+sig = Ed25519(author, "0ndb member v1\0" ‖ record without sig)
+space id = BLAKE2b-128("0ndb space" ‖ genesis id), UUID-v8 nibble set
+```
+
+Ops: `Genesis` (founder's `Add` body, no parents, space field is a nonce),
+`Add{sign, box, kind, role, method, person, expires, lease_ms, history,
+scope[], label, attestation, seal}`, `Remove{subject}`, `Commit` (below),
+`Update{box}` (own leaf key rotation), `Renew{expires}` (runner lease),
+`Seal{subject, epoch, wrap}` (epoch keys for a non-leaf runner), `Revoke{grant}`.
+Kinds: device, account, recovery, custodian, pool, runner, guest, directory. Roles: owner,
+admin, member, reader. Methods: genesis, approval, recovery, account,
+custodian, pool, grant, directory. Records are carried by any member's stream (a device
+appends the Add that enrolled it), deduplicated by id.
+
+Resolution is a pure function of the record set, so every holder (devices,
+relay) computes the same roster:
+
+- Records whose parents are not all present are held, not applied.
+- Records apply in a topological order; among ready records the order is
+  (author role rank, author seniority = position of its Add, lamport, id).
+- An author must be an active member at the record's position. Owners add
+  and remove anyone; admins anything but owners; members add devices and
+  guests; pools add only `runner` members with `method pool` and a lease, and
+  remove their own runners; anyone removes itself.
+- **Removal wins.** Given the applied removals R, a record by X is void
+  unless it is in the causal past of X's removal. The pass repeats with the
+  new R until it is stable (at most `#removals + 2` passes; if a cycle
+  persists the union of all removals seen is applied, which only removes
+  more). So an add, commit or removal made by a party concurrently with its
+  own removal never takes effect, and its descendants (a device it added)
+  fall with it. Of two mutually concurrent removals the one ordered first
+  (higher role, then senior) applies and voids the other.
+- Expiry and leases are wall-clock checks against `expires`; a runner's
+  `Renew` extends to at most `record time + lease_ms`.
+
+**Ratchet tree** (`sync/ratchet.odin`). Epoch keys use a TreeKEM-style
+left-balanced binary tree (RFC 9420 array indexing, width a power of two)
+whose leaves are the leaf-capable members (device, account, recovery,
+custodian, pool) and whose leaf keys are the members' own X25519 identity
+keys. Why this and not the alternatives: pairwise sealing costs O(n)
+ciphertexts per change (84 KB and ~80 ms at 1000 members); LKH needs a
+central key server; MLS proper needs a total order of commits, which a
+relay that only forwards bytes cannot provide. TreeKEM gives O(log n) per
+change on a filled tree and works with concurrent commits once leaf keys are
+fixed identity keys: a commit never invalidates anyone's ability to open a
+sibling commit, so concurrency only produces sibling epochs, never lockout.
+Leaf keys rotate only through `Update` followed by a commit.
+
+```
+Commit := base epoch id [32] (zero for epoch 0) | number u32 | history bool
+        | width u32 | nblanks uvarint, leaf uvarint* | nsets uvarint,
+          (leaf uvarint, sign [32], box [32])* | committer leaf uvarint
+        | npath uvarint, (node uvarint, pub [32], ncts uvarint,
+          (target node uvarint, wrap [84])*)*
+        | naming [48] | nbacks uvarint, (epoch id [32], sealed [48])*
+```
+
+- The committer applies the delta (blank leaves of removed, expired or
+  rekeyed members, set leaves of new members, which enter the unmerged lists
+  of their non-blank ancestors), then walks its direct path: `ps_0` random,
+  `ps_{i+1} = HKDF(ps_i, "0ndb path")`, node key = X25519 of
+  `HKDF(ps_i, "0ndb node")`, and `ps_i` sealed (`seal_key_to`, ephemeral
+  X25519 + ChaCha20-Poly1305, epoch field = node index) to every key in the
+  resolution of the copath child. A leaf ciphertext is opened through the
+  `Keyring` plug, so HSM and enclave keyrings work unchanged.
+- `epoch_secret = HKDF(ps_root, "0ndb epoch" ‖ space ‖ base ‖ number)`;
+  content key `HKDF(epoch_secret, "0ndb epoch content" ‖ number)`; object
+  epoch key `HKDF(content, "0ndb object epoch" ‖ object id)`.
+- `naming` seals the space's stable naming secret N (32 random bytes made at
+  genesis) under the epoch; `backs` seal the base and other head epochs'
+  secrets (history access; `history = false` breaks it), so a member holding
+  the newest epoch walks back to every older one.
+- Epoch number is base + 1. The **effective epoch** is the highest number,
+  ties to the latest in resolution order. It is *eligible* when every leaf in
+  its tree is still an active member. A member writes only under an eligible
+  epoch it holds; if the newest epoch is ineligible (a pending removal) or
+  the member's own leaf is missing, it commits, but only once its membership
+  log has caught up (relay caught-up and every announced members stream read)
+  so joiners do not fork the epoch chain needlessly. Members keep path
+  secrets for the newest 64 epoch numbers so late concurrent commits still
+  open; older ones are reached through back links.
+- Remove is always followed by a commit by the remover, so the new epoch is
+  sealed only to the remaining members. `0ndb rotate` / `space_rotate`
+  commits with no membership change (suspected compromise).
+
+**What is encrypted under what.** N derives the space's stream naming scope
+(`HKDF(N, "0ndb space names")`) and, through it, every object's naming and
+static stream keys, so stream ids never change across epochs. N reveals only
+stream names; a removed member that kept N learns no content and the relay
+refuses it anyway. Content keys come from epochs:
+
+- Segment records keep per-record keys from the writer's GGM key tree. The
+  tree record a writer publishes in `keys/<seg>` is
+  `KEYS_SEALED(4) | epoch tag [12] | ChaCha20-Poly1305(HKDF(object epoch
+  key, "0ndb keys record" ‖ stream id ‖ version), tree)`, with tag =
+  `number u32le ‖ epoch id[:8]`. The key tree encoding (version 3) carries the
+  tag of its last reseed.
+- **Reseed.** When a writer first appends in a new epoch (writer open, or an
+  epoch change while open), it punctures its tree from the current write end
+  to the last cell and fills that range with fresh random aligned subtrees
+  (at most 44 seeds), tags it with the epoch and republishes it under the new
+  object epoch key. Records below the boundary keep their keys, so every
+  existing id, offset and redaction is untouched, and puncturing for
+  redaction works the same across epochs. A removed member holds only the
+  old seeds, which give wrong keys for every record past the boundary.
+- A reader whose copy of a writer's tree is tagged with an older epoch than
+  the newest it knows treats a failed record or chain tag as "keys needed",
+  refreshes the writer's keys head, and holds; it never reports tampering
+  from a tree that may be stale. Data that arrives before the epoch secret it
+  needs (any author, any partition) leaves that tree locked and the data held;
+  every new epoch secret unlocks locked trees and releases held data.
+
+**Relay authorizer** (`sync/member_auth.odin`, default in `relay_init`).
+Credentials:
+
+```
+member  := 4 | space [16] | device sign [32] | hello sig [64]
+           | nproofs uvarint (<= 8) | proof bytes*
+request := 5 | account sign [32] | device sign [32] | hello sig [64]
+account := 6 | account sign [32] | device cert [64] | device sign [32]
+           | hello sig [64]
+device cert = Ed25519(account, "0ndb device cert\0" ‖ device sign)
+```
+
+A member hello carries the records that admit it (the genesis for a founder;
+the `Add` that enrolled it), so a joiner never races its approver's upload. A
+proof is ingested only if it is the space's genesis or its author is an
+active member. The authorizer keeps, per space, the record set (a derived
+file of records under the relay dir, reconciled against the members streams
+in relay storage when the space is loaded) and the resolved roster. Every
+access (`List`, `Read`, `Append` own streams, `Redact`, `Put`, `Get`,
+`Fill`, presence, follow, direct messages) checks the roster live, so a
+removed or expired principal is refused at its next request. When an append
+to a members stream lands, the relay hands the bytes to the authorizer
+(`Authorizer.observe`); principals that stop being active are failed with
+`Auth` on every connection (`relay_revoke`). The engine marks the space
+revoked on an `Auth` failure, fails pending reads with `Permission`, stops
+reconnecting and emits `Access_Revoked`. Request principals may only send
+direct messages and see presence in the account namespace
+`BLAKE2b-128("0ndb account namespace" ‖ account sign)`; account principals
+(devices with a cert) likewise. Third-party capability tokens are signed by
+an active member device (`issuer_ok` checks the roster), not by a space key.
+
+### Accounts, sign-in and devices
+
+The product is always end to end encrypted. A user has one **account key**
+(an Ed25519 + X25519 identity from a 32-byte seed), which is a leaf member
+(owner) of every space of the account. Devices never keep it: it is held in
+memory only while enrolling or approving and is cleared afterwards.
+
+- **Account record** (`sync/account.odin`), stored through the
+  `Sealed_Store` plug (`get/put/add`; the embedder's account server, keyed by
+  its login subject; `File_Sealed_Store` is the reference):
+
+  ```
+  0x41 | version 1 | account sign [32] | account box [32] | seq u64
+  | home relay str | relay pub [32] | pool access u8 | pool sign [32]
+  | pool box [32] | nwrappers uvarint (<= 64),
+    (credential bytes | label str | ecosystem u8 | salt [32]
+     | sealed seed [48] | added_by [32] | added_at u64)*
+  | Ed25519(account, "0ndb account v1\0" ‖ all of the above)
+  ```
+
+  Each registered passkey is a **wrapper**: the account seed sealed with
+  `HKDF(PRF output, "0ndb account wrap" ‖ credential ‖ salt)`. Any wrapper
+  unlocks the key, so passkeys from different ecosystems coexist. Adding or
+  removing a wrapper is a new signed record (CAS on `seq`); removing one never
+  rotates the account key; at least one non-recovery wrapper must remain.
+- **Recovery key** (settings only): 20 random bytes, base32 with a 16-bit
+  check, shown in groups of four. Its wrapper uses
+  `Argon2id(m = 64 MiB, t = 3, p = 1, salt)` before the same HKDF; with 160
+  bits of entropy offline guessing is infeasible regardless of stretching.
+- **Manifest.** When a device creates or joins a space for the account it
+  appends a manifest entry through `Sealed_Store.add`: `device sign | device
+  cert | sealed bundle | device sig`, the bundle sealed to the account box and
+  holding `(space id, name, relay, relay pub, anchor id, anchor lamport)`,
+  where the anchor is the account's own `Add` in that space.
+- **Sign-in, chosen automatically in this order** (`account_login`):
+  1. a registered passkey on this device unlocks the account through the
+     `Unlock` plug (PRF over a per-wrapper salt; `Local`);
+  2. else **approve on another device**: the new device connects to the
+     account namespace as a requester and sends
+     `REQUEST | card | nonce [16] | label` to every present device; both
+     screens show the 8-character code `base32(BLAKE2b-64("0ndb approval
+     code" ‖ card ‖ nonce))` (a relay that substitutes the card must find a
+     40-bit second preimage within the request's lifetime). The approver
+     unlocks with one biometric and answers `GRANT | seal(account seed →
+     requester box, ctx = "0ndb approval" ‖ nonce)` or `DENY`. If presence
+     shows no approver online, `Login_Failed("no approver online")` is
+     emitted at once;
+  3. else WebAuthn cross-device (hybrid/QR), which is the same `Unlock` call
+     with `Cross_Device` and needs nothing else from the engine.
+
+  With the account key in hand the device appends, for every manifest space,
+  `Add{device, admin, method account, person = account}` signed by the
+  account with parents `[anchor]`, presents it as its hello proof, reads the
+  log, opens every epoch as the account leaf (replaying commits from the
+  account's leaf), commits itself into the tree once caught up, drops the
+  account key, and, after paths 2 and 3, registers this device's platform
+  passkey as another wrapper so the next sign-in is path 1. One account-key
+  holder enrolls a device into any number of spaces in one step. `0ndb
+  login` is the CLI device-code flow (approval code, or a browser passkey
+  acting as approver).
+- **Devices** keep their own device key behind a `Keystore` plug
+  (`src/keystore`: Secure Enclave on macOS, TPM via the Platform Crypto
+  Provider on Windows, TPM 2.0 via `/dev/tpmrm0` on Linux, a 0600 file
+  otherwise) and never need the passkey again. A lost device is
+  `device_remove`: every space removes it and starts a new epoch.
+- **Fallbacks** (settings only): `0ndb join` prints the device's card;
+  `0ndb pair CARD` on a member adds it (`Add` with a seal of the current
+  epoch) and prints a ticket; `0ndb join TICKET` enrolls with that proof.
+- **Custodian** remains a mechanism, not a default: a custodian is a leaf
+  member whose key lives in the embedder's service (KMS, HSM, enclave) and
+  which signs `Add`s for devices it authenticates. Switching a space between
+  custodian and pure E2EE is adding or removing that member, which is a new
+  epoch sealed or not sealed to it; no data moves.
+
+- **Identity providers are the embedder's.** Subjects are opaque bytes; the
+  engine has no org or user model, and which spaces belong to which subject
+  is whatever the embedder records. When the provider runs WebAuthn with PRF
+  itself (one ceremony for sign-in and unlock), it evaluates PRF with
+  `account_idp_salt(subject) = BLAKE2b-256("0ndb idp prf salt" ‖ subject)`
+  and passes the credential and output to `account_login_prf`;
+  `account_passkey_add_prf` registers such a credential as a wrapper.
+- **Org-managed membership.** An embedder backend may hold an admin member
+  for an org's spaces (`kind directory`, a leaf, its key behind the host's
+  keyring the way the pool key is), added once by an owner. Directory events
+  then call `directory_add(space, person, role, devices)` (an account-kind
+  member plus devices with `method directory`, each `Add` carrying a seal of
+  the current epoch) and `directory_remove(space, person)`, which removes the
+  person and every device whose `person` is it in one commit, forcing a new
+  epoch. This admin reads whatever its role covers, the same trust trade-off
+  as the pool; spaces without it stay strictly device-only end to end.
+
+**PRF support** (WebAuthn `prf` / CTAP2 `hmac-secret`, November 2026; checked
+on macOS 26.4 with the Xcode 26.5 SDK headers, and on Windows 11 25H2 build
+26200, `webauthn.dll` API version 9):
+
+| Provider | PRF create / get | Synced | Same output on every device | Since |
+|---|---|---|---|---|
+| iCloud Keychain (Safari, Chrome, native AuthenticationServices) | yes / yes | yes | intended; mismatches reported across OS versions and over hybrid in 2026 | macOS 15 / iOS 18, hybrid fixed 18.4 / 15.4 |
+| Google Password Manager (Chrome desktop, Android) | yes / yes | yes | yes (`hmac_secret` synced) | Chrome 116 |
+| Windows Hello (Chrome/Edge 147+, Firefox 148+) | yes / yes | no, device-bound | n/a | build 26100/26200.7840 |
+| Microsoft Password Manager | yes / no | yes | n/a | — |
+| 1Password (extension, Android, iOS 18+) | yes / yes | yes | yes | 2024-07 / 2025-04 |
+| Bitwarden | partial / partial | yes | no | — |
+| Security keys (YubiKey 5) | via hmac-secret | no | n/a | Safari 26.4 |
+| Firefox desktop | yes / yes | provider | provider | 139 |
+
+Consequences: decryption success (the AEAD tag) is the only proof of PRF
+support; each credential gets its own salt and wrapper; user verification is
+always required (hmac-secret keeps separate with/without-UV secrets); and
+because Apple outputs are not reliably identical across devices, path 2 is a
+working default, not a rarity.
+
+### Local-only mode and the transitions
+
+With no account, relay or passkey a device still creates spaces (a genesis
+and epoch 0 held by the device), and every feature that needs no other device
+works: conversations, agents, queue and steer, branches, file trees, search,
+catalog. Every write is recorded as pending upload exactly as when online.
+
+- **Local to synced.** On sign-in (or when an embedder attaches an account)
+  every local space gets the account's home relay, an account `Add` and a
+  commit (epoch 1, with a back link to epoch 0), a manifest entry, and the
+  pool if the account has one. Pending segments upload from their existing
+  offsets; nothing is rewritten, and history written before sign-in stays
+  verifiable (same signed chains, keys sealed under epoch 0, reachable from
+  epoch 1).
+- **Synced to local.** `account_sign_out` / `0ndb logout` drops the account
+  state, closes the approval link and detaches the relay; every space keeps
+  its local copy and keeps working local-only. Objects this device never
+  fetched remain remote-only until it signs in again.
+
+### Runner pools
+
+A runner pool is one member (`kind pool`, leaf) per account, added on the
+first sign-in with one consent and included in every epoch of every space
+whose access level is *Everything* (default) or added to a workspace scope;
+*Off* never includes it. The pool key lives with the embedder's host behind
+the `Runner_Pool` plug (`identity`, `verify(token, runner) -> lease`,
+optional `attest`, `joined`); the host's engine keyring may be a KMS that
+signs and unwraps on request, so the backend never holds raw key bytes.
+
+- **Enrollment.** The host launches a runner with a short-lived token. The
+  runner makes its own device key and sends its card and the token; the host
+  (`pool_enroll`) verifies the token, and for every space where the pool is a
+  member appends `Add{runner, kind runner, method pool, lease_ms, seal =
+  epoch id ‖ epoch secret ‖ N sealed to the runner}` and returns those
+  records; the runner presents them as hello proofs (`runner_enroll`).
+  Enrollment is idempotent (an active runner gets its existing `Add` back)
+  and crash-safe (the proof is carried until the runner's own stream holds
+  it). The runner renews with `Renew` records on one timer (its only armed
+  timer); a lapsed lease is refused by the relay. Runners are not leaves: no
+  epoch rotation per runner. On a rotation the host `Seal`s the new epoch to
+  its live runners.
+- Runners never authorize runners: devices and runners only write placement
+  requests; the host launches and enrolls. Per-run scoped grants (capability
+  tokens plus `Share`s carrying object epoch keys) remain only for
+  third-party runners outside a pool, with no re-delegation.
+- Every device sees runner enrollments (`Runner_Enrolled`) and gets
+  `Runner_Anomaly` when more than `Config.runner_alarm` enroll in a minute.
+  Attestation is a future `attest` plug in enrollment, not part of the
+  default path.
+- **Threat model.** Relay or storage compromise reads nothing (content keys
+  never reach them; the log they see is identities and roles). Compromise of
+  the host plus the pool key reads what the pool can read (spaces with access
+  Everything or its scope) and nothing else, and can enroll runners, which
+  every device sees. Nobody can forge device-signed history (segments are
+  hash-chained and signed by their writers; the pool key signs only pool
+  records). The model provider sees what is sent to it.
+
+**Device-only storage.** The membership log and keys streams are relay-stored
+metadata even for device-only objects.
+
+**Costs** (measured, x86-64, `-o:speed`): a normal append is unchanged (same
+per-record key derivation, nothing added per record); a writer's first append
+in a new epoch republishes its key tree once (~1.5 KB). Membership change on
+a filled tree: removal commit 129 B / 571 B / 1.8 KB and 0.03 / 0.36 / 1.3 ms
+to create at 2 / 10 / 1000 members (0 / 4 / 16 ciphertexts); each receiver
+opens one ciphertext. Resolving a 1000-member log (~2000 records) takes
+~1.4 ms. Bulk-adding 1000 members into an unfilled tree in one commit is
+O(n) (152 KB) by nature; joiners commit their own path, which fills the tree.
+Sign-in by recovery key with every other device offline: 148 ms for the call
+(Argon2id dominates), first history page about 1 s later; approval sign-in
+completes within one round trip of the approve.
+
+### Relay storage: store small, deduplicate big
+
+Relay cost tracks the reachable information, not the activity. Items marked
+(planned) are designed here but not yet built.
+
+- **Default policy.** Conversations, maps and all metadata are relay-stored,
+  so any conversation can move to a new runner with every original device
+  offline. (planned) Record bodies are zstd-compressed before sealing, with
+  per-space dictionaries trained and versioned like search dictionaries,
+  where that measurably helps. Measured on a real tool-heavy agent
+  transcript (2769 messages, 4.4 MB of text): zstd alone gives 0.75 MB
+  (level 3) to 0.60 MB (level 19); recording it today grows the pack-backed
+  relay by about 32 MB (record framing, catalog activity churn and pack
+  garbage before compaction), which is what compaction, thinning and
+  compression must close. A 12-message chat is 3.8 KB of text, 1.6 KB
+  compressed. File trees of git repositories store on the
+  relay only what the git remote lacks (below). Large unique content that is
+  in no git remote is relay-stored up to a per-space budget
+  (`Config.content_budget`, the `Storage_Policy` plug); beyond it it stays on
+  devices, is replicated to the account's always-on devices (which advertise
+  themselves as holders), and is served by the peer pipe. Only reads of those
+  exact files can then be unavailable; everything else materializes.
+- **Git-backed trees** (planned). A blob is *remote-backed* when it is
+  reachable from a remote-tracking ref of a remote the workspace shares; tree
+  history records reference it (`Insert_Ref`) and its bytes are never
+  uploaded. Anything else (uncommitted and unpushed content) is uploaded as
+  today, so a later push strands nothing. A device or runner materializing
+  the tree fetches remote-backed objects from the remote itself (credentials
+  from the `Credentials` plug) and the rest from the relay. When a remote
+  rewrites history, blobs that became unreachable and were never uploaded
+  are uploaded on demand while a holder is online and reported otherwise.
+- **Storage classes and modes.** Each object has a class: `stored` (segments
+  on the relay) or `device` (the relay keeps only segment lengths). The class
+  is the catalog field `storage` (tag 12: 1 device, 2 stored, absent: policy),
+  so every device agrees and session lists can show it. `Config.storage`
+  selects the reference policy: `auto` (default: everything stored as above),
+  `stored` (everything, no deduplication; pool runners), `until_run`
+  (conversations, texts and trees device-only until a pool runner is
+  assigned, then promoted) and `device` (strict device-only, for privacy,
+  never promoted). A `Storage_Policy` plug overrides per space and object.
+  Maps, keys streams, cards, the feed, presence, the redaction log and the
+  membership log are always stored.
+- **Hollow segments.** On the relay a segment has a `base` and a `length`;
+  content is stored for exactly the contiguous suffix `[base, length)`. A
+  device-only segment is fully hollow (`base == length`): its writer
+  advances the length with `Note` instead of `Append`, and the relay persists
+  only the length (a based storage slot). Appending to a hollow segment
+  stores content from the old length on; `Fill` stores ciphertext backward
+  from `base`, so stored content stays one suffix, uploads resume from the
+  relay's `base` and nothing is uploaded twice. Offsets are the writer's, so
+  ids never change. The relay never reads below `base`: reads, tails and
+  follows are clamped and preceded by a `Hollow` frame with `base` and
+  `length`. Feed compaction keeps the hollow flag.
+- **Peer serving.** A reader that needs a range below `base` pulls it from a
+  holder: the segment's writer or another device with segments in the same
+  object, filtered by presence. Up to four 1 MiB pulls per segment are in
+  flight, each to the least-loaded holder, so a large fetch spreads across
+  every online holder. A holder down in presence, or an `Unserved` answer,
+  re-pulls elsewhere at once. The holder answers from its journal (sealing
+  each whole record exactly as an upload would, serving only durable bytes;
+  it finds the first record boundary at or after the range start from its
+  length, trailer and offset-keyed checksum, or walks back from the end) or
+  from its replica (already wire form), in frames of at most 256 KiB cut at
+  record boundaries, with at most 4096 pulls queued. The reader
+  verifies the bytes exactly as relay-served data (AEAD per record, chains,
+  signatures); a frame interleaved mid-record with another stream's frame is
+  carried per segment, not refetched. A holder can withhold but cannot
+  alter: bytes that fail verification are dropped, the holder is skipped for
+  that segment until its presence changes, `Peer_Misbehaving` is reported
+  and the relay is not blamed.
+- **Unavailable.** When no holder of a hollow range is online the reader
+  re-probes the relay once (a promotion may have stored it), then reports
+  `Unavailable{segment, from, to, holders}`; the engine emits
+  `Unavailable{object, device}` per holder and keeps the read pending, never
+  failing it. A presence `up` re-pulls at once, the read completes by itself
+  and `Available{object}` follows; nothing polls and no timer is armed.
+- **Promotion** (`until_run`). When the runtime assigns a run to a pool
+  runner (its advert in the runners map carries field 3 `pool`), the
+  assigning device promotes the conversation and every mounted tree: it
+  records `storage = stored` in the catalog, switches its own segment to
+  appends, and fills every segment it holds backward from the relay's
+  `base`, tail first, down to the requested offset (today the start of what
+  it holds; (planned) the oldest record on the answered message's path and,
+  for a tree, the newest checkpoint). Pending promotions are durable in the
+  registry and resume after a restart. A writer that still notes a filled
+  segment gets `Noted` with `base < length` and switches to appends.
+- **Redaction** is metadata: it is applied to the stored suffix (if any) and
+  always appended to the redaction log and the feed, so every device
+  zero-fills its device-only copies when it follows the feed.
+- **Measured** (reference relay, loopback, one Linux host, holder and
+  reader replicators sharing one thread, kernel TLS off). A device-only
+  segment costs the pack-backed relay about 840 bytes on disk (its length
+  slot, one feed entry and container overhead; 200 segments of 20 KiB:
+  168 KB versus 4.3 MB stored) and 40 bytes per further note until feed
+  compaction folds them; the file-store relay keeps a 576-byte slot file per
+  segment. 64 MiB through the peer pipe took 1.3 to 1.5 s against 0.6 to
+  0.8 s relay-served; a 64 KiB tail 3 to 8 ms. Forwarding cost the relay
+  1.25 to 1.6 ms of CPU per MiB, relay-served reads 1.9 to 2.5 ms per MiB
+  with user-space TLS. A read waiting on an offline holder completed 15 to
+  110 ms after the holder reconnected. A 64 MiB promotion was then read by a
+  new device with the writer offline in 0.5 to 0.7 s.
+- **Cost tracks reachable information** (planned). File edits stay CRDT
+  deltas (a full-file rewrite with a small change stores the change). After
+  a seal, a conversation's streaming chunks are compacted into the final
+  block through a new stream epoch; refs into the old epoch resolve through
+  a recorded mapping, and the old epoch is dropped after the new one is
+  uploaded. Every version reachable from a message is kept; intermediate
+  states between message boundaries are merged after a window, keeping
+  per-author spans. Superseded run lines and runs, deleted forks and redacted
+  content are collected. Cold-tier movement is a `Relay_Storage` hint.
+- **Relay writes** are host-chosen and never protocol-visible: an append is
+  acknowledged once durable in the host's durable buffer (group-committed
+  local files for the reference relay, Durable Object storage for a DO host)
+  and any object-store flush is coalesced per space and asynchronous. The
+  relay counts per space stored bytes, notes, fills, pulls and forwarded
+  bytes (`Relay_Stats`); (planned) object-store writes and bytes per day
+  through a relay query and the C API.
+
+### Relay messages for storage classes
+
+All integers little endian; `segment` is a 32-byte stream id, `device` a
+16-byte device id. Frames are `len:u32 kind:u8 payload`; bulk frames carry a
+fixed part then `len - fixed` content bytes. None of this depends on the
+host: a relay core needs per-space state only (stream lengths and bases, and
+open pipes), and `sendfile` remains an optimization of relay-served `Data`.
+
+Client to relay:
+
+- `Note` (0x11, 40 bytes): `segment, length:u64`. Owner only (`Append`
+  access). If the segment is new or fully hollow and `length` exceeds its
+  length, the relay persists the new length (`base = length`) and appends
+  the feed entry `(segment, length | 1<<61)`. Reply `Noted`. A segment with
+  stored content is not changed; the reply shows `base < length`.
+- `Fill` (0x12, bulk, fixed 40): `segment, at:u64`, then ciphertext for
+  `[at, at + n)` where `at + n` must equal the segment's `base` and
+  `n <= APPEND_MAX`. Members only (`Fill` access: the space credential, not a
+  share grant). On success `base = at`; reply `Noted`. A mismatched `at`
+  answers `Noted` with the current `base` and stores nothing (the uploader
+  resumes from there); quota applies as for appends.
+- `Pull` (0x13, 72 bytes): `holder:device, tag:u64, segment, from:u64,
+  to:u64`. Requires `Read` access to `segment`. If `holder` has no live
+  connection in the space the relay answers `Unserved` at once; otherwise it
+  records a pipe `(requester, tag, holder, segment)` and sends `Pulled` to
+  one live connection of the holder. At most 64 pipes per requester.
+- `Serve` (0x14, bulk, fixed 64): `requester:device, tag:u64, segment,
+  at:u64, word:u64`, then at most 256 KiB of wire-form bytes for
+  `[at, at + n)`. `word` bit 63 is `final` (last frame of the answer), bit 62
+  `none` (the holder lacks the range; no bytes), the low 62 bits the
+  holder's length of the segment. The relay forwards it as `Served` only if
+  it matches an open pipe from this holder; it closes the pipe on `final`
+  or `none` (answering `Unserved` for `none`) and drops unmatched frames.
+
+Relay to client:
+
+- `Noted` (0x95, 48): `segment, base:u64, length:u64`, the reply to `Note`
+  and `Fill`.
+- `Hollow` (0x96, 48): `segment, base:u64, length:u64`, sent before any
+  `Probed`, `Length` or `Data` answer about a segment whose `base > 0`.
+- `Pulled` (0x97, 72): `requester:device, tag:u64, segment, from:u64,
+  to:u64`, to the holder.
+- `Served` (0x98, bulk, fixed 64): `holder:device, tag:u64, segment, at:u64,
+  word:u64` and the holder's bytes, unchanged, to the requester. The relay
+  buffers one frame at a time per pipe and stops reading a holder while its
+  requester has more than 1 MiB of served bytes queued.
+- `Unserved` (0x99, 56): `holder:device, tag:u64, segment`: the pull ended
+  without (complete) data because the holder lacks it, left, or was never
+  connected. A requester that disconnects simply closes its pipes.
 
 ## engine
 
@@ -730,7 +1254,7 @@ orchestration, attribution, recording and change events, over the plug
 points `Vfs`, `Keyring`, `Credentials`, `Transport`, `Authorizer`,
 `Relay_Storage`, `Scheduler`, `Spawner`, `Write_Observer`, `Secrets`,
 `Model`, `Http`, `Tools`, `Channels`, `Embedder`, `Providers`, `Clock`,
-`Log`, `Search_Remote`. Any engine instance can be a runner or a full
+`Log`, `Search_Remote`, `Storage_Policy`. Any engine instance can be a runner or a full
 indexer. Live buffers (`buffer_open`, `buffer_read`, `buffer_edit`,
 `buffer_ack`, `buffer_undo`, `buffer_redo`, `buffer_anchors`,
 `buffer_resolve`, `buffer_cursors`, `buffer_close`) deliver `Buffer_Delta`s
@@ -738,6 +1262,11 @@ through the subscription callback path at the end of each tick. Several engines 
 owning a shard of objects.
 
 ## capi
+
+ABI 2.0: ops are numbered contiguously from 1 in table order (the header op
+list is generated from the capi tables); account sign-in, sealed-store and
+runner-pool plugs are C callback tables (`ondb_unlock`, `ondb_sealed_store`,
+`ondb_runner_pool`) at the tail of `ondb_config`.
 
 `lib0ndb` (shared and static) with `0ndb.h`: opaque handles, plug points as
 C function-pointer tables, binary or JSON payloads, no global state, no
@@ -751,7 +1280,8 @@ subscription (daemon frame `Buffer`), with the payload
 ## cli
 
 The reference consumer, assembled from the default plug implementations:
-`0ndb daemon | relay | runner | record | mcp | pair | join | status | ls |
+`0ndb daemon | relay | runner | record | mcp | login | approve | devices |
+members | remove | rotate | recovery-key | pool | pair | join | status | ls |
 new | send | queue | steer | edit | switch | back | log | show | search |
 interrupt | models | agent | task | workspace | mount | schedule | blame |
 revert | land | share | redact | verify`.

@@ -23,6 +23,8 @@ Job :: struct {
 	result:  Error,
 	existed: bool,
 	value:   i64,
+	base:    i64,
+	delta:   i64,
 	seq:     u64,
 	from:    i64,
 	to:      i64,
@@ -237,7 +239,7 @@ _job_run :: proc(job: ^Job) {
 			job.result = _from_prim(prim.sync_dir(job.vfs, prim.dir_name(final)))
 		}
 	case .Redact:
-		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value}, job.lay.spacing)
+		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value, base = job.base}, job.lay.spacing)
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
 		}

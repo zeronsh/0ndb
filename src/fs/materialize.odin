@@ -56,7 +56,10 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	if !mount_durable_now(m) {
 		return .None
 	}
-	materialize_to(m, target, false) or_return
+	m.mat_ingest = true
+	merr := materialize_to(m, target, false)
+	m.mat_ingest = false
+	merr or_return
 	return mount_settle(m)
 }
 
@@ -124,6 +127,26 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			continue
 		}
 		append(&items, it)
+	}
+	if m.mat_ingest && !merge {
+		stale := false
+		for it in items {
+			if it.has_old && it.entry.kind == .File && !disk_matches(m, it.old, it.entry) {
+				mount_mark(m, it.old)
+				stale = true
+			}
+		}
+		if stale {
+			m.mat_ingest = false
+			mount_pass(m, false) or_return
+			one := make([dynamic]crdt.Lv, context.temp_allocator)
+			if crdt.graph_version_lvs(&h.g, m.synced[:], &one) != .None {
+				return .Corrupt
+			}
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, tl[:], one[:], &both)
+			return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), false)
+		}
 	}
 	slice.sort_by(items[:], proc(a, b: Mat_Item) -> bool {
 		if a.present != b.present {

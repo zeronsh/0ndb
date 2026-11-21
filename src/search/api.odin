@@ -22,22 +22,7 @@ pending :: proc "contextless" (ix: ^Index) -> int {
 TITLE_SLOT :: "\x00title"
 
 add :: proc(ix: ^Index, source: prim.Id, pos: i64, doc: ^Doc) -> Error {
-	_admit(ix) or_return
-	if len(doc.slot) > 0 {
-		_kill_slot(ix, doc.object, doc.slot) or_return
-	}
-	id := mem_add(ix, doc) or_return
-	if len(doc.slot) > 0 {
-		key: [MAX_KEY]u8
-		n := slot_key(doc.object, doc.slot, &key)
-		if v, found := &ix.mem.slots[string(key[:n])]; found {
-			v^ = id
-		} else {
-			k := make([]u8, n, ix.mem.allocator)
-			copy(k, key[:n])
-			ix.mem.slots[string(k)] = id
-		}
-	}
+	_put(ix, doc) or_return
 	ix.mem.sources[source] = pos
 	return _maybe_flush(ix)
 }
@@ -291,8 +276,44 @@ _reconcile :: proc(ix: ^Index) -> (reset_needed: bool, err: Error) {
 	return false, .None
 }
 
+redact_span :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, device: prim.Id, lo, hi: u64) -> Error {
+	_admit(ix) or_return
+	m := &ix.mem
+	dev := device
+	if oi, ok := m.id_map[object]; ok {
+		for d, i in m.docs {
+			if d.object == oi && _ref_in(m.refs[d.ref_off:][:d.ref_len], dev[:], lo, hi) {
+				mem_kill(m, u32(m.base) + u32(i))
+			}
+		}
+	}
+	key: [17]u8
+	key[0] = NS_OBJECT
+	o := object
+	copy(key[1:], o[:])
+	_kill_term(ix, key[:], nil, false, Span_Match{prefix = dev[:], lo = lo, hi = hi}) or_return
+	m.sources[source] = max(pos, position(ix, source) or_return)
+	return erase(ix)
+}
+
 @(private)
-_kill_term :: proc(ix: ^Index, key: []u8, ref: []u8, keep_titles := false) -> Error {
+Span_Match :: struct {
+	prefix: []u8,
+	lo:     u64,
+	hi:     u64,
+}
+
+@(private)
+_ref_in :: proc(ref: []u8, prefix: []u8, lo, hi: u64) -> bool {
+	if len(ref) != len(prefix) + 8 || string(ref[:len(prefix)]) != string(prefix) {
+		return false
+	}
+	off := prim.get_u64le(ref[len(prefix):])
+	return off >= lo && off < hi
+}
+
+@(private)
+_kill_term :: proc(ix: ^Index, key: []u8, ref: []u8, keep_titles := false, span: Span_Match = {}) -> Error {
 	ix.taint_check = true
 	blk: Doc_Block
 	db_init(&blk, context.temp_allocator)
@@ -313,10 +334,10 @@ _kill_term :: proc(ix: ^Index, key: []u8, ref: []u8, keep_titles := false) -> Er
 				break
 			}
 			kill := true
-			if ref != nil || keep_titles {
+			if ref != nil || keep_titles || span.prefix != nil {
 				doc_load(&ix.cache, &s, &blk, u64(v) / DOC_BLOCK) or_return
 				dm := blk.docs[v - blk.first]
-				kill = (ref == nil || string(dm.ref) == string(ref)) && (!keep_titles || dm.flags & DF_TITLE == 0)
+				kill = (ref == nil || string(dm.ref) == string(ref)) && (!keep_titles || dm.flags & DF_TITLE == 0) && (span.prefix == nil || _ref_in(dm.ref, span.prefix, span.lo, span.hi))
 			}
 			if kill {
 				mem_kill(&ix.mem, v)

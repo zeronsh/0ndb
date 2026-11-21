@@ -687,13 +687,16 @@ history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = 
 	}
 	n := crdt.batch_len(b)
 	valid := n
-	for t in text_targets(b, context.temp_allocator) {
-		f := batch_file(h, op_inode(h, t), b) or_return
-		v, terr := crdt.text_check(&f.text, &h.g, &f.log, b, t, 0, parents[:])
+	for sp in target_spans(b, context.temp_allocator) {
+		f := batch_file(h, op_inode(h, sp.target), b) or_return
+		view, vskip, lead := span_view(b, sp, 0)
+		v, terr := crdt.text_check(&f.text, &h.g, &f.log, &view, sp.target, vskip, parents[:])
 		if terr != .None {
 			return 0, .Corrupt
 		}
-		valid = min(valid, v)
+		if v < crdt.batch_len(&view) - vskip {
+			valid = min(valid, lead + v)
+		}
 	}
 	if valid != n {
 		return 0, .Invalid
@@ -946,13 +949,16 @@ history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (ad
 		return 0, .None
 	}
 	valid := n - skip
-	for t in text_targets(&b, context.temp_allocator) {
-		f := batch_file(h, op_inode(h, t), &b) or_return
-		v, terr := crdt.text_check(&f.text, &h.g, &f.log, &b, t, skip, parents[:])
+	for sp in target_spans(&b, context.temp_allocator) {
+		f := batch_file(h, op_inode(h, sp.target), &b) or_return
+		view, vskip, lead := span_view(&b, sp, skip)
+		v, terr := crdt.text_check(&f.text, &h.g, &f.log, &view, sp.target, vskip, parents[:])
 		if terr != .None {
 			return 0, .Corrupt
 		}
-		valid = min(valid, v)
+		if v < crdt.batch_len(&view) - vskip {
+			valid = min(valid, lead + v)
+		}
 	}
 	if valid == 0 {
 		return 0, .Invalid
@@ -1375,16 +1381,47 @@ stream_index :: proc(h: ^History, id: prim.Id) -> u32 {
 }
 
 @(private)
-text_targets :: proc(b: ^crdt.Batch, allocator: runtime.Allocator) -> []crdt.Op_Id {
-	return fshist.text_targets(b, allocator)
+Target_Span :: struct {
+	target: crdt.Op_Id,
+	lo:     int,
+	hi:     int,
+	prefix: int,
+}
+
+@(private)
+target_spans :: proc(b: ^crdt.Batch, allocator: runtime.Allocator) -> []Target_Span {
+	out := make([dynamic]Target_Span, allocator)
+	at := make(map[crdt.Op_Id]int, allocator)
+	pos := 0
+	for op, i in b.ops {
+		if op.kind != .Opaque {
+			if k, ok := at[op.target]; ok {
+				out[k].hi = i + 1
+			} else {
+				at[op.target] = len(out)
+				append(&out, Target_Span{op.target, i, i + 1, pos})
+			}
+		}
+		pos += op.len
+	}
+	return out[:]
+}
+
+@(private)
+span_view :: proc(b: ^crdt.Batch, sp: Target_Span, skip: int) -> (view: crdt.Batch, vskip: int, lead: int) {
+	lead = max(0, sp.prefix - skip)
+	view = b^
+	view.ops = b.ops[sp.lo:sp.hi]
+	view.seq = b.seq + u64(lead)
+	return view, max(0, skip - sp.prefix), lead
 }
 
 @(private)
 apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error {
-	targets := text_targets(b, context.temp_allocator)
-	files := make([]^File_State, len(targets), context.temp_allocator)
-	for t, i in targets {
-		f := history_file(h, op_inode(h, t)) or_return
+	spans := target_spans(b, context.temp_allocator)
+	files := make([]^File_State, len(spans), context.temp_allocator)
+	for sp, i in spans {
+		f := history_file(h, op_inode(h, sp.target)) or_return
 		if f.from_cp && !descends_from_cp(h, f, b) {
 			prev := make([dynamic]crdt.Lv, context.temp_allocator)
 			append(&prev, ..f.text.version[:])
@@ -1397,19 +1434,20 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 		return .Corrupt
 	}
 	n := crdt.batch_len(b)
-	for t, i in targets {
-		ino := op_inode(h, t)
+	for sp, i in spans {
+		ino := op_inode(h, sp.target)
 		f := files[i]
 		append(&f.new_refs, Op_Ref{stream, off, u32(skip), u32(n)})
 		f.dirty = true
 		note_touched(h, ino)
-		crdt.log_add_batch(&f.log, &h.g, b, t, first, skip)
-		views_feed(h, ino, b, t, first, skip)
+		view, vskip, lead := span_view(b, sp, skip)
+		crdt.log_add_batch(&f.log, &h.g, &view, sp.target, first + crdt.Lv(lead), vskip)
+		views_feed(h, ino, &view, sp.target, first + crdt.Lv(lead), vskip)
 	}
 	lvidx_add(h, first, n - skip, stream, off)
 	apply_tree_ops(h, b, first, skip, stream, off) or_return
-	for t, i in targets {
-		ino := op_inode(h, t)
+	for sp, i in spans {
+		ino := op_inode(h, sp.target)
 		f := files[i]
 		found := make([dynamic]crdt.Conflict, context.temp_allocator)
 		if e := crdt.text_merge(&f.text, &h.g, &f.log, h.g.heads[:], &found); e != .None {

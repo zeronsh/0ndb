@@ -33,6 +33,11 @@ Event_Kind :: enum u8 {
 	Presence,
 	Direct,
 	Undelivered,
+	Noted,
+	Hollow,
+	Pulled,
+	Served,
+	Unserved,
 }
 
 Event :: struct {
@@ -52,6 +57,9 @@ Event :: struct {
 	cursor:  i64,
 	more:    bool,
 	entries: []u8,
+	device:  Device_Id,
+	tag:     u64,
+	base:    i64,
 }
 
 Client_Handler :: #type proc(user: rawptr, ev: ^Event) -> Error
@@ -670,7 +678,9 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 			first = true,
 			total = i64(it.total),
 		}
-		ev.id = get_id32(&r)
+		if it.frame != .Served {
+			ev.id = get_id32(&r)
+		}
 		#partial switch it.frame {
 		case .Data:
 			ev.kind = .Data
@@ -680,6 +690,15 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 			ev.length = i64(raw & ~DATA_FINAL)
 		case .Object:
 			ev.kind = .Object
+		case .Served:
+			ev.kind = .Served
+			prim.read_fixed(&r, ev.device[:])
+			ev.tag = prim.read_u64le(&r)
+			ev.id = get_id32(&r)
+			ev.at = get_i64(&r)
+			raw := prim.read_u64le(&r)
+			ev.final = raw & SERVE_FINAL != 0
+			ev.length = i64(raw & SERVE_LEN_MASK)
 		case:
 			return .Protocol
 		}
@@ -688,7 +707,9 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		}
 		c.bulk = ev
 		c.bulk.first = false
-		_await_progress(c, ev.id)
+		if ev.kind != .Served {
+			_await_progress(c, ev.id)
+		}
 		return handler(user, &ev)
 	case .Bulk_Data:
 		ev := c.bulk
@@ -699,6 +720,9 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		ev := c.bulk
 		ev.last = true
 		c.bulk = {}
+		if ev.kind == .Served {
+			return handler(user, &ev)
+		}
 		if ev.kind == .Object || ev.final {
 			_await_done(c, ev.id)
 		} else {
@@ -770,6 +794,26 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.length = get_i64(&r)
 	case .Directed, .Undelivered:
 		return _client_direct_event(it, handler, user)
+	case .Noted, .Hollow:
+		ev.kind = .Noted if it.frame == .Noted else .Hollow
+		ev.id = get_id32(&r)
+		ev.base = get_i64(&r)
+		ev.length = get_i64(&r)
+		if it.frame == .Noted {
+			_await_done(c, ev.id)
+		}
+	case .Pulled:
+		ev.kind = .Pulled
+		prim.read_fixed(&r, ev.device[:])
+		ev.tag = prim.read_u64le(&r)
+		ev.id = get_id32(&r)
+		ev.at = get_i64(&r)
+		ev.length = get_i64(&r)
+	case .Unserved:
+		ev.kind = .Unserved
+		prim.read_fixed(&r, ev.device[:])
+		ev.tag = prim.read_u64le(&r)
+		ev.id = get_id32(&r)
 	case .Presence:
 		flags := prim.read_u8(&r)
 		n := int(prim.read_u16le(&r))

@@ -653,6 +653,7 @@ crdt_span :: struct {
 }
 
 check_redaction :: proc(w: ^World) {
+	check_snapshot_restore(w)
 	m := &w.model
 	secrets := make([dynamic]string, context.temp_allocator)
 	owners := make([dynamic]int, context.temp_allocator)
@@ -672,7 +673,7 @@ check_redaction :: proc(w: ^World) {
 				append(&secrets, d)
 				append(&owners, op.obj)
 			}
-		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Read_Live:
+		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
 		}
 	}
 	for s, si in secrets {
@@ -700,6 +701,7 @@ check_redaction :: proc(w: ^World) {
 		}
 	}
 	check_search_models(w, secrets[:], owners[:])
+	check_peer_redaction(w, secrets[:], owners[:])
 }
 
 @(private = "file")
@@ -761,6 +763,12 @@ check_idle :: proc(w: ^World) {
 }
 
 dump_replication :: proc(w: ^World) {
+	for c in w.relay.r.conns {
+		if c == nil {
+			continue
+		}
+		world_note(w, "  relay conn %s state=%v paused=%v closing=%v pipe_wait=%v piped=%d inflight=%d out=%d stash=%d feed_on=%v", id_short(c.principal.participant), c.state, c.paused, c.closing, c.pipe_wait, c.piped, c.inflight, len(c.out) - c.out_head, len(c.stash), c.feed_on)
+	}
 	for n in w.nodes {
 		if !n.alive {
 			continue
@@ -776,7 +784,7 @@ dump_replication :: proc(w: ^World) {
 				continue
 			}
 			r := &sp.repl
-			world_note(w, "dump %s space %s phase=%v connected=%v locals=%d remotes=%d uploading=%d hold=%d", n.name, id_short(id), r.phase, sp.connected, len(r.locals), len(r.remotes), r.uploading, r.hold)
+			world_note(w, "dump %s space %s phase=%v connected=%v locals=%d remotes=%d uploading=%d hold=%d queued=%d streaming=%v serves=%d promos=%d", n.name, id_short(id), r.phase, sp.connected, len(r.locals), len(r.remotes), r.uploading, r.hold, osync.client_queued(&r.client), r.client.streaming, len(r.serves), len(r.promos))
 			rms := make([dynamic]^osync.Remote, context.temp_allocator)
 			for _, rm in r.remotes {
 				append(&rms, rm)
@@ -785,7 +793,7 @@ dump_replication :: proc(w: ^World) {
 				return a.name < b.name || (a.name == b.name && id_less(a.device, b.device))
 			})
 			for rm in rms {
-				world_note(w, "  remote dev=%s %s relay_len=%d tail=%d rep_len=%d have=%v wants=%v inflight=%v follow=%v full=%v quar=%v held=%d pulled=%d pulling=%v refs=%d", id_short(rm.device), rm.name, rm.relay_len, rm.tail, rm.rep.length, rm.rep.have[:], rm.wants[:], rm.inflight[:], rm.follow, rm.full, rm.quarantined, rm.held, rm.pulled, rm.pulling, rm.refs)
+				world_note(w, "  remote dev=%s %s relay_len=%d tail=%d rep_len=%d have=%v wants=%v inflight=%v follow=%v full=%v quar=%v held=%d pulled=%d pulling=%v refs=%d probing=%v keys_wait=%v base=%d pulls=%v unavail=%v", id_short(rm.device), rm.name, rm.relay_len, rm.tail, rm.rep.length, rm.rep.have[:], rm.wants[:], rm.inflight[:], rm.follow, rm.full, rm.quarantined, rm.held, rm.pulled, rm.pulling, rm.refs, rm.probing, rm.keys_wait, rm.base, rm.pulls[:], rm.unavail)
 			}
 			lls := make([dynamic]^osync.Local, context.temp_allocator)
 			for _, l in r.locals {
@@ -907,7 +915,7 @@ _relay_records :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id, out: ^map
 	}
 	defer st.stream_close(st.data, sh)
 	hdr: [20]u8
-	pos: i64
+	pos := st.stream_base(st.data, sh)
 	for pos + 24 <= length {
 		got, rerr := st.stream_read(st.data, sh, pos, hdr[:])
 		if rerr != .None || got != len(hdr) {

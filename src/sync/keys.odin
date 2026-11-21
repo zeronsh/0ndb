@@ -324,6 +324,10 @@ pairing_load :: proc(vfs: prim.Vfs, dir: string) -> (p: Pairing, err: Error) {
 	return p, .None
 }
 
+derive_key :: proc(ikm: []u8, label: string, ctx_bytes: []u8, dst: []u8) {
+	_derive(ikm, label, ctx_bytes, dst)
+}
+
 @(private)
 _derive :: proc(ikm: []u8, label: string, ctx_bytes: []u8, dst: []u8) {
 	info: [128]u8

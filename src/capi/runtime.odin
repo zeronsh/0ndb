@@ -11,6 +11,7 @@ RT_RUNNER :: u32(1 << 0)
 RT_OBSERVE :: u32(1 << 1)
 RT_MCP_HTTP :: u32(1 << 2)
 RT_NO_ATTACH :: u32(1 << 3)
+RT_POOL :: u32(1 << 4)
 
 C_Model_Config :: struct {
 	api:            u32,
@@ -148,6 +149,7 @@ runtime_config :: proc(h: ^Handle, c: ^C_Runtime) -> (opts: api.Stack_Options, s
 	rc := &opts.rt_cfg
 	rc.runner = x.flags & RT_RUNNER != 0
 	rc.mcp_http = x.flags & RT_MCP_HTTP != 0
+	rc.pool = x.flags & RT_POOL != 0
 	rc.work_root = _str(x.work_root)
 	rc.default_provider = _str(x.default_provider)
 	rc.default_model = _str(x.default_model)

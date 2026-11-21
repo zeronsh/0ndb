@@ -18,9 +18,12 @@ CONDITION_NAMES := [3]string{"", "any", "all"}
 MODE_NAMES := [2]string{"end_to_end", "transparent"}
 UNIT_NAMES := [2]string{"lines", "bytes"}
 SORT_NAMES := [2]string{"relevance", "newest"}
+SCOPE_NAMES := [3]string{"auto", "local", "everywhere"}
+SEARCH_MODE_NAMES := [3]string{"default", "full", "local"}
+SEARCH_STATE_NAMES := [7]string{"ok", "partial", "offline", "timeout", "denied", "failed", "cancelled"}
 DIR_NAMES := [2]string{"older", "newer"}
 EVENT_PLACEMENT :: u64(10)
-EVENT_NAMES := [14]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up"}
+EVENT_NAMES := [27]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed"}
 
 event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 	switch kind {
@@ -32,6 +35,32 @@ event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 		return 12
 	case .Caught_Up:
 		return 13
+	case .Indexer_Wanted:
+		return 14
+	case .Unavailable:
+		return 15
+	case .Available:
+		return 16
+	case .Promoted:
+		return 17
+	case .Peer_Misbehaving:
+		return 18
+	case .Members_Changed:
+		return 19
+	case .Epoch_Changed:
+		return 20
+	case .Access_Revoked:
+		return 21
+	case .Runner_Enrolled:
+		return 22
+	case .Runner_Anomaly:
+		return 23
+	case .Approval_Requested:
+		return 24
+	case .Login_Done:
+		return 25
+	case .Login_Failed:
+		return 26
 	}
 	return u64(len(EVENT_NAMES))
 }
@@ -396,6 +425,8 @@ emit_space :: proc(o: ^Out, s: ^eng.Space_Info) {
 	o_bool(o, "open", s.open)
 	o_bool(o, "connected", s.connected)
 	o_id(o, "catalog", s.catalog)
+	o_u64(o, "relay_usage", u64(max(s.relay_usage, 0)))
+	o_u64(o, "relay_quota", u64(max(s.relay_quota, 0)))
 	o_end(o)
 }
 
@@ -441,6 +472,25 @@ emit_results :: proc(o: ^Out, r: ^search.Results) {
 	o_bytes(o, "cursor", r.cursor)
 	o_bool(o, "incomplete", r.incomplete)
 	o_int(o, "verified", r.verified)
+}
+
+emit_search :: proc(o: ^Out, r: ^eng.Search_Result) {
+	res := search.Results{hits = r.hits, cursor = r.cursor, verified = len(r.hits)}
+	emit_results(o, &res)
+	o_bool(o, "partial", r.partial)
+	o_int(o, "behind", r.behind)
+	o_arr(o, "sources", len(r.sources))
+	for s in r.sources {
+		o_obj(o, "")
+		o_id(o, "device", s.device)
+		o_bool(o, "local", s.local)
+		o_enum(o, "state", u64(s.state), SEARCH_STATE_NAMES[:])
+		o_int(o, "behind", s.behind)
+		o_int(o, "hits", s.hits)
+		o_int(o, "rejected", s.rejected)
+		o_end(o)
+	}
+	o_end(o)
 }
 
 valid_utf8 :: proc(b: []u8) -> bool {

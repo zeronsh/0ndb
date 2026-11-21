@@ -93,7 +93,7 @@ Relay_Node :: struct {
 	r_on:   bool,
 	rng:    Rng,
 	public: osync.Public_Key,
-	sauth:  osync.Space_Authorizer,
+	mauth:  osync.Member_Authorizer,
 	cauth:  eng.Cap_Authorizer,
 }
 
@@ -153,6 +153,7 @@ Config :: struct {
 	rss_max:     u64,
 	keep_ops:    Filter,
 	keep_faults: Filter,
+	storage:     eng.Storage_Mode,
 }
 
 World :: struct {
@@ -184,7 +185,9 @@ World :: struct {
 	cipher:    Cipher_Watch,
 	mem_checks: u64,
 	quarantines: [dynamic]Quarantine,
+	promos:    [dynamic]Promo_Rec,
 	live:      [dynamic]^Live_Read,
+	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
 }
 
 Quarantine :: struct {
@@ -343,6 +346,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	w.log = make([dynamic]string, w.allocator)
 	w.quarantines = make([dynamic]Quarantine, w.allocator)
 	cipher_init(w)
+	w.promos = make([dynamic]Promo_Rec, w.allocator)
 	w.live = make([dynamic]^Live_Read, w.allocator)
 	rng_init(&w.rng, cfg.seed, 1)
 	rng_init(&w.net_rng, cfg.seed, 2)

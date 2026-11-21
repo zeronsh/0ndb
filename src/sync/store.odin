@@ -23,6 +23,7 @@ Allow :: struct {
 Stream_File :: struct {
 	fd:     prim.Fd,
 	length: i64,
+	base:   i64,
 	seq:    u64,
 	fresh:  bool,
 }
@@ -159,7 +160,7 @@ stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u
 	if f.fresh {
 		return f, .None
 	}
-	f.length, f.seq, err = stream_file_recover(vfs, fd, scratch, lay)
+	f.length, f.base, f.seq, err = stream_file_recover(vfs, fd, scratch, lay)
 	if err != .None {
 		prim.close_file(vfs, fd)
 		f.fd = prim.INVALID_FD
@@ -173,44 +174,45 @@ stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u
 	return f, .None
 }
 
-stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, seq: u64, err: Error) {
+stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, seq: u64, err: Error) {
 	newest, older, count := slots_read(vfs, fd, lay.spacing) or_return
 	if count == 0 {
-		return 0, 0, .None
+		return 0, 0, 0, .None
 	}
 	ok := _chunk_verify(vfs, fd, newest, scratch, lay.base) or_return
 	if ok {
-		return newest.value, newest.seq, .None
+		return newest.value, newest.base, newest.seq, .None
 	}
 	if count == 2 && older.seq + 1 == newest.seq {
-		return older.value, older.seq, .None
+		return older.value, older.base, older.seq, .None
 	}
-	return 0, 0, .None
+	return 0, 0, 0, .None
 }
 
-stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, exists: bool, err: Error) {
+stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, exists: bool, err: Error) {
 	fd, oerr := prim.open_file(vfs, path)
 	if oerr == .Not_Found {
-		return 0, false, .None
+		return 0, 0, false, .None
 	}
 	if oerr != .None {
-		return 0, false, _from_prim(oerr)
+		return 0, 0, false, _from_prim(oerr)
 	}
 	defer prim.close_file(vfs, fd)
-	length, _, err = stream_file_recover(vfs, fd, scratch, lay)
-	return length, err == .None, err
+	length, base, _, err = stream_file_recover(vfs, fd, scratch, lay)
+	return length, base, err == .None, err
 }
 
 @(private)
 _chunk_verify :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot, scratch: []u8, base: i64) -> (bool, Error) {
-	if s.value == s.start {
+	end := slot_end(s)
+	if end == s.start {
 		return true, .None
 	}
 	state: xxhash.XXH64_state
 	xxhash.XXH64_reset_state(&state, u64(s.start))
 	pos := s.start
-	for pos < s.value {
-		n := int(min(i64(len(scratch)), s.value - pos))
+	for pos < end {
+		n := int(min(i64(len(scratch)), end - pos))
 		got, rerr := prim.read_at(vfs, fd, scratch[:n], base + pos)
 		if rerr != .None {
 			return false, _from_prim(rerr)

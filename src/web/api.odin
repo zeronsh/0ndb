@@ -62,14 +62,83 @@ ondb_close :: proc "c" (s: ^Session) {
 ondb_join :: proc "c" (s: ^Session, code: [^]u8, n: u32) -> u32 {
 	context = _ctx()
 	defer free_all(context.temp_allocator)
-	str := string(code[:n])
-	err: osync.Error
-	if len(str) > len(SHARE_PREFIX) && str[:len(SHARE_PREFIX)] == SHARE_PREFIX {
-		err = session_open_share(s, str)
-	} else {
-		err = session_open_pairing(s, str)
+	return u32(session_open_share(s, string(code[:n])))
+}
+
+@(export)
+ondb_account_options :: proc "c" (s: ^Session, record: [^]u8, n: u32) -> u32 {
+	context = _ctx()
+	defer free_all(context.temp_allocator)
+	rec: osync.Account_Record
+	if err := osync.account_record_decode(record[:n], &rec, context.temp_allocator); err != .None {
+		return u32(err)
 	}
+	clear(&s.result)
+	opts := osync.account_unlock_options(&rec)
+	b: [4]u8
+	prim.put_u32le(b[:], u32(len(opts)))
+	append(&s.result, ..b[:])
+	for o in opts {
+		prim.put_u32le(b[:], u32(len(o.credential)))
+		append(&s.result, ..b[:])
+		append(&s.result, ..o.credential)
+		x := o.salt
+		append(&s.result, ..x[:])
+	}
+	return 0
+}
+
+@(export)
+ondb_account_open :: proc "c" (s: ^Session, record: [^]u8, rn: u32, entries: [^]u8, en: u32, credential: [^]u8, cn: u32, prf: [^]u8, space: [^]u8) -> u32 {
+	context = _ctx()
+	defer free_all(context.temp_allocator)
+	p: [32]u8
+	copy(p[:], prf[:32])
+	sp: prim.Id
+	if space != nil {
+		copy(sp[:], space[:16])
+	}
+	ents: []u8
+	if entries != nil {
+		ents = entries[:en]
+	}
+	err := session_open_account(s, record[:rn], ents, credential[:cn], p, sp)
 	return u32(err)
+}
+
+@(export)
+ondb_approver_open :: proc "c" (s: ^Session, record: [^]u8, rn: u32, credential: [^]u8, cn: u32, prf: [^]u8) -> u32 {
+	context = _ctx()
+	defer free_all(context.temp_allocator)
+	p: [32]u8
+	copy(p[:], prf[:32])
+	return u32(session_open_approver(s, record[:rn], credential[:cn], p))
+}
+
+@(export)
+ondb_approve :: proc "c" (s: ^Session, code: [^]u8, n: u32, approve: u32) -> u32 {
+	context = _ctx()
+	defer free_all(context.temp_allocator)
+	return u32(session_approve(s, string(code[:n]), approve != 0))
+}
+
+@(export)
+ondb_idp_salt :: proc "c" (s: ^Session, subject: [^]u8, n: u32) -> u32 {
+	context = _ctx()
+	salt := osync.idp_salt(subject[:n])
+	clear(&s.result)
+	append(&s.result, ..salt[:])
+	return 0
+}
+
+@(export)
+ondb_result_ptr :: proc "c" (s: ^Session) -> [^]u8 {
+	return raw_data(s.result)
+}
+
+@(export)
+ondb_result_len :: proc "c" (s: ^Session) -> u32 {
+	return u32(len(s.result))
 }
 
 @(export)

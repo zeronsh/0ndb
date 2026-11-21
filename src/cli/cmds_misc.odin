@@ -32,51 +32,11 @@ cmd_daemon :: proc(a: ^Args) -> int {
 
 cmd_runner :: proc(a: ^Args) -> int {
 	delete_key(&a.flags, "no-runner")
+	a.flags["pool"] = "1"
+	if _, ok := a.flags["storage"]; !ok {
+		a.flags["storage"] = "stored"
+	}
 	return daemon_main(a)
-}
-
-cmd_pair :: proc(a: ^Args) -> int {
-	s := session(a)
-	space := default_space(s, true)
-	if relay, ok := flag_value(a, "relay"); ok {
-		r := req_begin("space.set_relay")
-		req_str(&r, "space", hex(space))
-		req_str(&r, "relay", relay)
-		req_opt(&r, "relay_key", flag_string(a, "relay-key"))
-		must(s, req_end(&r), "cannot set the relay")
-	}
-	r := req_begin("space.pairing")
-	req_str(&r, "space", hex(space))
-	v := must(s, req_end(&r), "cannot make a pairing code")
-	if a.json {
-		print_json(v)
-	} else {
-		fmt.println(jstr(v, "code"))
-	}
-	return 0
-}
-
-cmd_join :: proc(a: ^Args) -> int {
-	if len(a.pos) != 1 {
-		return usage_error("usage: 0ndb join CODE")
-	}
-	s := session(a)
-	r := req_begin("space.join")
-	req_str(&r, "code", a.pos[0])
-	req_opt(&r, "name", flag_string(a, "name"))
-	v := must(s, req_end(&r), "cannot join")
-	st := must(s, `{"op":"state.get"}`)
-	if len(jstr(st, "default_space")) == 0 {
-		sr := req_begin("state.set")
-		req_str(&sr, "default_space", jstr(v, "space"))
-		must(s, req_end(&sr))
-	}
-	if a.json {
-		print_json(v)
-	} else {
-		fmt.printfln("joined space %s", short(jstr(v, "space")))
-	}
-	return 0
 }
 
 cmd_status :: proc(a: ^Args) -> int {
@@ -120,7 +80,7 @@ cmd_status :: proc(a: ^Args) -> int {
 					state = fmt.tprintf("offline: %s", why)
 				}
 			}
-			conn = fmt.tprintf("%s %s", jstr(x, "relay"), state)
+			conn = fmt.tprintf("%s %s · relay stores %s", jstr(x, "relay"), state, bytes_human(jint(x, "relay_usage")))
 		}
 		mark := " (default)" if jstr(x, "id") == def else ""
 		fmt.printfln("space    %s %q · %s%s", short(jstr(x, "id")), jstr(x, "name"), conn, mark)
@@ -206,8 +166,15 @@ cmd_search :: proc(a: ^Args) -> int {
 		return usage_error("usage: 0ndb search QUERY")
 	}
 	s := session(a)
+	space := default_space(s)
 	r := req_begin("search")
 	req_str(&r, "query", strings.join(a.pos[:], " ", context.temp_allocator))
+	req_str(&r, "space", hex(space))
+	if flag_bool(a, "local") {
+		req_str(&r, "scope", "local")
+	} else if flag_bool(a, "everywhere") {
+		req_str(&r, "scope", "everywhere")
+	}
 	req_int(&r, "limit", i64(max(1, int(parse_int_flag(a, "limit", 20)))))
 	req_bool(&r, "semantic", flag_bool(a, "semantic"))
 	if flag_bool(a, "newest") {
@@ -228,6 +195,22 @@ cmd_search :: proc(a: ^Args) -> int {
 			where_ = fmt.tprintf("%s %s", where_, short_rid(m))
 		}
 		fmt.printfln("%s  %s  %s", where_, jstr(h, "kind"), one_line(jstr(h, "snippet"), 100))
+	}
+	if jbool(v, "partial") {
+		behind := jint(v, "behind")
+		states := make([dynamic]string, context.temp_allocator)
+		for src in jarr(v, "sources") {
+			if !jbool(src, "local") && jstr(src, "state") != "ok" {
+				append(&states, jstr(src, "state"))
+			}
+		}
+		if behind > 0 {
+			fmt.printfln("partial: %d objects behind", behind)
+		} else if len(states) > 0 {
+			fmt.printfln("partial: local results only (%s)", strings.join(states[:], ", ", context.temp_allocator))
+		} else {
+			fmt.println("partial: local results only (no indexer online)")
+		}
 	}
 	return 0
 }

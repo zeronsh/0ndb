@@ -50,6 +50,7 @@ _Fstream :: struct {
 	id:     Stream_Id,
 	fd:     prim.Fd,
 	length: i64,
+	base:   i64,
 	seq:    u64,
 	fresh:  bool,
 }
@@ -62,6 +63,8 @@ _Fappend :: struct {
 	total:  i64,
 	hash:   xxhash.XXH64_state,
 	failed: Error,
+	fill:   bool,
+	note:   bool,
 }
 
 @(private)
@@ -132,6 +135,7 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		stream_open = _fs_stream_open,
 		stream_close = _fs_stream_close,
 		stream_probe = _fs_stream_probe,
+		stream_base = _fs_stream_base,
 		stream_read = _fs_stream_read,
 		stream_extent = _fs_stream_extent,
 		stream_hint = _fs_stream_hint,
@@ -139,6 +143,8 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		append_write = _fs_append_write,
 		append_commit = _fs_append_commit,
 		append_abort = _fs_append_abort,
+		fill_begin = _fs_fill_begin,
+		note = _fs_note,
 		drop = _fs_drop,
 		redact = _fs_redact,
 		list_begin = _fs_list_begin,
@@ -217,10 +223,16 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 		id     = id,
 		fd     = f.fd,
 		length = f.length,
+		base   = f.base,
 		seq    = f.seq,
 		fresh  = f.fresh,
 	}
 	return st, f.length, .None
+}
+
+@(private)
+_fs_stream_base :: proc(data: rawptr, s: rawptr) -> i64 {
+	return (cast(^_Fstream)s).base
 }
 
 @(private)
@@ -242,7 +254,7 @@ _fs_stream_reap :: proc(fs: ^File_Store, st: ^_Fstream) {
 }
 
 @(private)
-_fs_stream_probe :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64, exists: bool, err: Error) {
+_fs_stream_probe :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64, base: i64, exists: bool, err: Error) {
 	fs := cast(^File_Store)data
 	ns := cast(^_Fns)h
 	pbuf: prim.Path_Buf = ---
@@ -276,20 +288,20 @@ _fs_extent :: proc(fs: ^File_Store, fd: prim.Fd, off: i64, n: i64) -> (prim.Fd, 
 }
 
 @(private)
-_fs_stream_hint :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64, exists: bool) {
+_fs_stream_hint :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64, base: i64, exists: bool) {
 	fs := cast(^File_Store)data
 	ns := cast(^_Fns)h
 	pbuf: prim.Path_Buf = ---
 	fd, err := prim.open_file(fs.vfs, stream_path(&pbuf, ns.dir, id))
 	if err != .None {
-		return 0, false
+		return 0, 0, false
 	}
 	defer prim.close_file(fs.vfs, fd)
 	newest, _, count, serr := slots_read(fs.vfs, fd, fs.lay.spacing)
 	if serr != .None || count == 0 {
-		return 0, true
+		return 0, 0, true
 	}
-	return newest.value, true
+	return newest.value, newest.base, true
 }
 
 
@@ -312,6 +324,46 @@ _fs_append_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: ra
 	}
 	xxhash.XXH64_reset_state(&a.hash, u64(at))
 	return a, .None
+}
+
+@(private)
+_fs_fill_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawptr, err: Error) {
+	fs := cast(^File_Store)data
+	st := cast(^_Fstream)s
+	if at < 0 || total <= 0 || at + total != st.base {
+		return nil, .Conflict
+	}
+	a, aerr := new(_Fappend, fs.allocator)
+	if aerr != nil {
+		return nil, .No_Memory
+	}
+	a^ = {
+		st    = st,
+		at    = at,
+		pos   = at,
+		total = total,
+		fill  = true,
+	}
+	xxhash.XXH64_reset_state(&a.hash, u64(at))
+	return a, .None
+}
+
+@(private)
+_fs_note :: proc(data: rawptr, s: rawptr, length: i64, done: Storage_Done, ctx: rawptr) {
+	fs := cast(^File_Store)data
+	st := cast(^_Fstream)s
+	a, aerr := new(_Fappend, fs.allocator)
+	if aerr != nil {
+		done(ctx, .No_Memory, 0)
+		return
+	}
+	a^ = {
+		st    = st,
+		at    = length,
+		pos   = length,
+		note  = true,
+	}
+	_fs_append_commit(fs, a, done, ctx)
 }
 
 @(private)
@@ -356,8 +408,35 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 		err = .Invalid
 	}
 	new_len := a.at + a.total
+	new_base := st.base
+	slot := Slot{seq = st.seq + 1, value = new_len, start = a.at, hash = xxhash.XXH64_digest(&a.hash), base = st.base}
+	switch {
+	case a.note:
+		if st.base != st.length || a.at < st.length {
+			err = .Conflict
+		}
+		new_base = a.at
+		slot = Slot{seq = st.seq + 1, value = a.at, start = a.at, base = a.at}
+	case a.fill:
+		if a.at + a.total != st.base {
+			err = .Conflict
+		}
+		new_len = st.length
+		new_base = a.at
+		slot.value = st.length
+		slot.base = a.at
+		slot.end = a.at + a.total
+	case:
+		if a.at != st.length {
+			err = .Conflict
+		}
+	}
+	delta := a.total
+	if a.note {
+		new_len = a.at
+	}
 	if err == .None {
-		err = slot_write(fs.vfs, st.fd, Slot{seq = st.seq + 1, value = new_len, start = a.at, hash = xxhash.XXH64_digest(&a.hash)}, fs.lay.spacing)
+		err = slot_write(fs.vfs, st.fd, slot, fs.lay.spacing)
 	}
 	_fs_append_free(fs, a)
 	if err != .None {
@@ -376,6 +455,8 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 		kind   = .Stream_Sync,
 		fd     = st.fd,
 		value  = new_len,
+		base   = new_base,
+		delta  = delta,
 		seq    = st.seq + 1,
 		target = st,
 		done   = done,
@@ -404,6 +485,10 @@ _fs_drop :: proc(data: rawptr, h: rawptr, id: Stream_Id, done: Storage_Done, ctx
 		done(ctx, .None, 0)
 		return
 	}
+	stored := max(size - fs.lay.base, 0)
+	if length, base, exists, perr := stream_file_size(fs.vfs, path, fs.scratch, fs.lay); perr == .None && exists {
+		stored = min(stored, max(length - base, 0))
+	}
 	job, jerr := new(Job, fs.allocator)
 	if jerr != nil {
 		done(ctx, .No_Memory, 0)
@@ -415,7 +500,7 @@ _fs_drop :: proc(data: rawptr, h: rawptr, id: Stream_Id, done: Storage_Done, ctx
 		kind  = .Remove,
 		ns    = h,
 		fd    = prim.INVALID_FD,
-		value = max(size - fs.lay.base, 0),
+		value = stored,
 		done  = done,
 		ctx   = ctx,
 	}
@@ -436,7 +521,7 @@ _fs_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, c
 		}
 		return
 	}
-	lo := clamp(from, 0, st.length)
+	lo := clamp(from, st.base, st.length)
 	hi := clamp(to, lo, st.length)
 	if hi <= lo {
 		done(ctx, .None, 0)
@@ -454,6 +539,7 @@ _fs_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, c
 		kind   = .Redact,
 		fd     = st.fd,
 		value  = st.length,
+		base   = st.base,
 		seq    = st.seq + 1,
 		from   = lo,
 		to     = hi,
@@ -711,8 +797,9 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 		st := cast(^_Fstream)job.target
 		st.busy = false
 		if job.result == .None {
-			_usage_add(fs, st.ns, job.value - st.length)
+			_usage_add(fs, st.ns, job.delta)
 			st.length = job.value
+			st.base = job.base
 			st.seq = job.seq
 			st.fresh = false
 		}

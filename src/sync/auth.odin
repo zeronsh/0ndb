@@ -20,6 +20,7 @@ Access :: enum u8 {
 	Get,
 	Redact,
 	Forget,
+	Fill,
 }
 
 Principal :: struct {
@@ -37,6 +38,7 @@ Principal :: struct {
 Authorizer :: struct {
 	data:      rawptr,
 	authorize: proc(data: rawptr, credential: []u8, binding: []u8, local: bool, p: ^Principal) -> Code,
+	observe:   proc(data: rawptr, space: Space_Id, id: Stream_Id, bytes: []u8, revoked: ^[dynamic]Device_Id),
 }
 
 Space_Credentials :: struct {
@@ -54,7 +56,7 @@ principal_allows :: proc(p: ^Principal, access: Access, id: [32]u8) -> bool {
 		if p.read_all {
 			return true
 		}
-	case .Redact:
+	case .Redact, .Fill:
 		if p.append_own {
 			return true
 		}

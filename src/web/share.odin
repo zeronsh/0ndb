@@ -7,14 +7,31 @@ import "../prim"
 import osync "../sync"
 
 SHARE_PREFIX :: "0ndbshare1"
-SHARE_VERSION :: 1
+SHARE_VERSION :: 2
+SHARE_EPOCHS :: 32
 CAP_CREDENTIAL :: u8(2)
 CAPABILITY_LEN :: 1 + 16 * 3 + 1 + 1 + 8 + 32 + 32 + 64
 
 Share_Grant :: struct {
-	object: prim.Id,
-	kind:   obj.Kind,
-	key:    osync.Content_Key,
+	object:  prim.Id,
+	kind:    obj.Kind,
+	key:     osync.Content_Key,
+	epochs:  [SHARE_EPOCHS]Share_Epoch,
+	nepochs: int,
+}
+
+Share_Epoch :: struct {
+	tag: osync.Epoch_Tag,
+	key: [32]u8,
+}
+
+share_epoch_key :: proc(s: ^Session, tag: osync.Epoch_Tag) -> (key: [32]u8, ok: bool) {
+	for i in 0 ..< s.share.nepochs {
+		if s.share.epochs[i].tag == tag {
+			return s.share.epochs[i].key, true
+		}
+	}
+	return
 }
 
 Cap_Credentials :: struct {
@@ -50,7 +67,17 @@ session_open_share :: proc(s: ^Session, code: string) -> osync.Error {
 	kind := prim.read_u8(&sr)
 	wrapped: [osync.WRAP_LEN]u8
 	prim.read_fixed(&sr, wrapped[:])
-	if !prim.reader_done(&sr) || sspace != space || kind < 1 || kind > 4 {
+	ne := prim.read_uvarint(&sr)
+	if !prim.reader_ok(&sr) || ne > SHARE_EPOCHS || sspace != space || kind < 1 || kind > 4 {
+		return .Invalid
+	}
+	tags: [SHARE_EPOCHS]osync.Epoch_Tag
+	wraps: [SHARE_EPOCHS][osync.WRAP_LEN]u8
+	for i in 0 ..< int(ne) {
+		prim.read_fixed(&sr, tags[i][:])
+		prim.read_fixed(&sr, wraps[i][:])
+	}
+	if !prim.reader_done(&sr) {
 		return .Invalid
 	}
 	self := osync.device_identity(&s.device)
@@ -60,6 +87,14 @@ session_open_share :: proc(s: ^Session, code: string) -> osync.Error {
 	s.space_id = space
 	s.share = Share_Grant{object = object, kind = obj.Kind(kind), key = key}
 	crypto.zero_explicit(&key, size_of(key))
+	for i in 0 ..< int(ne) {
+		ek: osync.Content_Key
+		if osync.open_key_from(&self, &s.device.noise, wraps[i][:], &ek) == .None {
+			s.share.epochs[s.share.nepochs] = Share_Epoch{tag = tags[i], key = ek.key}
+			s.share.nepochs += 1
+		}
+		crypto.zero_explicit(&ek, size_of(ek))
+	}
 	copy(s.relay_pub[:], rkey)
 	s.relay_addr = _clone(relay, s.allocator)
 	s.cap_creds.s = s

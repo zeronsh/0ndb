@@ -267,9 +267,11 @@ vec_maybe_train :: proc(ix: ^Index) -> (started: bool, err: Error) {
 	dead := _dead_sorted(ix, ix.allocator) or_return
 	t, aerr := new(Vtrain, ix.allocator)
 	if aerr != nil {
+		delete(dead, ix.allocator)
 		return false, .No_Memory
 	}
 	if runtime.arena_init(&t.arena, 1 << 20, ix.allocator) != nil {
+		delete(dead, ix.allocator)
 		free(t, ix.allocator)
 		return false, .No_Memory
 	}
@@ -358,7 +360,7 @@ _vtrain_work :: proc(ix: ^Index, t: ^Vtrain) -> (work: i64, done: bool, err: Err
 							return 0, false, .Corrupt
 						}
 						doc_load(&ix.cache, &s, &t.blk, u64(id) / DOC_BLOCK) or_return
-						if t.blk.docs[id - t.blk.first].flags & DF_UNSTABLE != 0 {
+						if t.blk.docs[id - t.blk.first].flags & (DF_UNSTABLE | DF_DELETED) != 0 {
 							break
 						}
 						dst := slice.to_bytes(t.sample[i * dim:][:dim])
@@ -534,6 +536,12 @@ cb_gc :: proc(ix: ^Index) {
 			append(&drop, _clone_str(name, context.temp_allocator))
 			if name[:3] == "zd-" {
 				zstd_forget(&ix.zstd, g)
+				for x, k in ix.zd.stale {
+					if x == g {
+						unordered_remove(&ix.zd.stale, k)
+						break
+					}
+				}
 			}
 		}
 	}

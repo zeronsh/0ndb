@@ -155,6 +155,20 @@ Index :: struct {
 	cb_tainted: bool,
 	train_futile: bool,
 	futile_gen: u64,
+	bare:      bool,
+	zd:        Zd_State,
+}
+
+Zd_State :: struct {
+	eligible:  u64,
+	retry:     u64,
+	trained:   u64,
+	raw:       u64,
+	comp:      u64,
+	base_raw:  u64,
+	base_comp: u64,
+	degraded:  bool,
+	stale:     [dynamic]u64,
 }
 
 @(private)
@@ -310,6 +324,7 @@ open :: proc(ix: ^Index, dir: string, opts: Options, allocator := context.alloca
 		_remove_gen(ix, g)
 	}
 	mem_reset(&ix.mem, ix.man.next_doc)
+	ix.zd.eligible = ix.man.total_len
 	ix.taint_check = true
 	cb_gc(ix)
 	ahead, rerr := _reconcile(ix)
@@ -341,6 +356,7 @@ close :: proc(ix: ^Index) {
 	mem_destroy(&ix.mem)
 	cache_destroy(&ix.cache)
 	zstd_destroy(&ix.zstd)
+	delete(ix.zd.stale)
 	if ix.lock != prim.INVALID_FD {
 		prim.close_file(ix.vfs, ix.lock)
 	}
@@ -385,6 +401,8 @@ reset :: proc(ix: ^Index) -> Error {
 	ix.man.cb_n = 0
 	ix.man.zd_gen = 0
 	zstd_destroy(&ix.zstd)
+	clear(&ix.zd.stale)
+	ix.zd = {stale = ix.zd.stale}
 	ix.broken = false
 	cache_clear(&ix.cache)
 	mem_reset(&ix.mem, 0)

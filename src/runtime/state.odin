@@ -498,14 +498,42 @@ _exe_found :: proc(r: ^Runtime, name: string) -> bool {
 _advertise :: proc(r: ^Runtime, space: prim.Id, capacity: int) {
 	me := r.self
 	provs := _providers_local(r)
+	pool := u64(1) if r.cfg.pool else 0
 	en, ok := map_read(r, runners_object(space), me[:])
-	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs {
+	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs && entry_u64(&en, 3) == pool {
 		return
 	}
 	if !ok && capacity == 0 {
 		return
 	}
-	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(capacity)), field_bytes(2, transmute([]u8)provs))
+	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(capacity)), field_bytes(2, transmute([]u8)provs), omap.field_u64(3, pool))
+}
+
+runner_pool :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
+	if device == r.self {
+		return r.cfg.pool
+	}
+	d := device
+	en, ok := map_read(r, runners_object(space), d[:])
+	return ok && entry_u64(&en, 3) != 0
+}
+
+@(private)
+_promote_for_run :: proc(r: ^Runtime, o: Object, runner: prim.Id) {
+	if !runner_pool(r, o.space, runner) {
+		return
+	}
+	if c, err := eng.storage_class(r.e, o); err != .None || c != .Device {
+		return
+	}
+	eng.object_promote(r.e, o)
+	if ms, err := eng.convo_mounts(r.e, o, context.temp_allocator); err == .None {
+		for m in ms {
+			if !m.removed {
+				eng.object_promote(r.e, Object{o.space, m.tree})
+			}
+		}
+	}
 }
 
 pending_named :: proc(space: prim.Id) -> Named {

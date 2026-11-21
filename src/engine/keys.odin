@@ -29,6 +29,7 @@ Remote_Tree :: struct {
 	loaded:    bool,
 	requested: bool,
 	absent:    bool,
+	locked:    bool,
 	refs:      int,
 }
 
@@ -78,6 +79,16 @@ _own_tree_get :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind, scope
 			delete(x.path, e.allocator)
 			free(x, e.allocator)
 			return nil, _serr(kerr)
+		}
+		if tag, ok := space_epoch_tag(sp); ok {
+			x.tree.epoch = tag
+		} else if g, found := sp.grant_epochs[object]; found && len(g) > 0 {
+			x.tree.epoch = g[len(g) - 1].tag
+		} else if sp.mode == .End_To_End {
+			osync.keytree_destroy(&x.tree)
+			delete(x.path, e.allocator)
+			free(x, e.allocator)
+			return nil, .Permission
 		}
 		x.dirty = true
 		_touch(e)
@@ -284,7 +295,24 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if rerr != .None {
 		return
 	}
-	if osync.keys_record_decode(&rt.tree, body, e.allocator) != .None {
+	if tag, sealed := osync.keys_record_tag(body); sealed {
+		oid, _, ok := _object_of_name(rt.name)
+		if !ok {
+			return
+		}
+		ok_key: bool
+		okey: [32]u8
+		okey, ok_key = _object_epoch_key(sp, oid, tag)
+		defer crypto.zero_explicit(&okey, size_of(okey))
+		if !ok_key {
+			rt.locked = true
+			return
+		}
+		if osync.keys_record_open(&rt.tree, body, &okey, sid, rt.epoch, e.allocator) != .None {
+			return
+		}
+		rt.locked = false
+	} else if osync.keys_record_decode(&rt.tree, body, e.allocator) != .None {
 		return
 	}
 	rt.loaded = true

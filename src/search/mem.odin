@@ -517,7 +517,7 @@ mem_add :: proc(ix: ^Index, d: ^Doc) -> (first: u32, err: Error) {
 		}
 	}
 	vec: []f32
-	if d.vector != nil || d.embed {
+	if (d.vector != nil || d.embed) && !ix.bare {
 		dim := ix.opts.embedder.dim
 		if dim <= 0 || (d.vector != nil && len(d.vector) != dim) {
 			return 0, .Invalid
@@ -550,6 +550,9 @@ mem_add :: proc(ix: ^Index, d: ^Doc) -> (first: u32, err: Error) {
 			}
 			start = end - MAX_TERM
 		}
+	}
+	if d.embed || d.vector != nil {
+		m.docs[u64(first) - m.base].flags |= DF_EMBED
 	}
 	if vec != nil {
 		if _, e := append(&m.vids, first); e != nil {
@@ -636,7 +639,9 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 	}
 	if d.title {
 		md.flags |= DF_TITLE
-		_post_fix(m, key64(NS_TITLE, 1), id) or_return
+		if !ix.bare {
+			_post_fix(m, key64(NS_TITLE, 1), id) or_return
+		}
 	}
 	if len(d.fields) > 0 {
 		md.flags |= DF_FIELDS
@@ -648,6 +653,9 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 			ni := _intern_bytes(m, nm) or_return
 			vi := _intern_bytes(m, transmute([]u8)f.value) or_return
 			append(&m.fidx, [2]u32{ni, vi})
+			if ix.bare {
+				continue
+			}
 			key: [MAX_KEY]u8
 			if n, ok := field_key(NS_FIELD, nm, transmute([]u8)f.value, &key); ok {
 				_post_long(m, key[:n], id) or_return
@@ -666,12 +674,15 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 			}
 		}
 	}
-	if len(d.slot) > 0 {
+	if len(d.slot) > 0 && !ix.bare {
 		key: [MAX_KEY]u8
 		n := slot_key(d.object, d.slot, &key)
 		_post_long(m, key[:n], id) or_return
 	}
 	if ix.opts.store_text {
+		if len(text) >= 8 && md.flags & DF_UNSTABLE == 0 {
+			ix.zd.eligible += u64(min(len(text), DICT_SAMPLE_PIECE))
+		}
 		md.flags |= DF_TEXT
 		cur := len(m.frames) - 1
 		if cur < 0 || (len(m.raw) > int(m.frames[cur]) && len(m.raw) - int(m.frames[cur]) + len(text) > FRAME) {
@@ -684,17 +695,19 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 			return .No_Memory
 		}
 	}
-	idkey: [17]u8
-	idkey[0] = NS_OBJECT
-	ob := d.object
-	copy(idkey[1:], ob[:])
-	_post_long(m, idkey[:], id) or_return
-	idkey[0] = NS_FROM
-	pa := d.participant
-	copy(idkey[1:], pa[:])
-	_post_long(m, idkey[:], id) or_return
-	_post_fix(m, key64(NS_KIND, u64(d.kind)), id) or_return
-	_index_text(m, text, id) or_return
+	if !ix.bare {
+		idkey: [17]u8
+		idkey[0] = NS_OBJECT
+		ob := d.object
+		copy(idkey[1:], ob[:])
+		_post_long(m, idkey[:], id) or_return
+		idkey[0] = NS_FROM
+		pa := d.participant
+		copy(idkey[1:], pa[:])
+		_post_long(m, idkey[:], id) or_return
+		_post_fix(m, key64(NS_KIND, u64(d.kind)), id) or_return
+		_index_text(m, text, id) or_return
+	}
 	if _, e := append(&m.docs, md); e != nil {
 		return .No_Memory
 	}

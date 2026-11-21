@@ -32,7 +32,7 @@ padding_filler :: proc "contextless" (pending: i64) -> int {
 	return int(target - pending - journal.OVERHEAD)
 }
 
-replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, tree: ^Key_Tree) -> Error {
+replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, tree: ^Key_Tree, seal: ^[32]u8 = nil) -> Error {
 	_enter(r)
 	defer _leave(r)
 	name := keys_stream_name(segment) or_return
@@ -41,8 +41,12 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 	pbuf: prim.Path_Buf = ---
 	path := _keys_path(r, &pbuf, id)
 	body := make([dynamic]u8, context.temp_allocator)
-	append(&body, KEYS_RECORD)
-	keytree_encode(tree, &body) or_return
+	if seal != nil {
+		keys_record_seal(tree, seal, id, &body) or_return
+	} else {
+		append(&body, KEYS_RECORD)
+		keytree_encode(tree, &body) or_return
+	}
 	defer crypto.zero_explicit(raw_data(body), len(body))
 	floor := replicator_floor(r, scope, name, epoch) or_return
 	if floor > 0 {
@@ -162,7 +166,7 @@ _remote_keys :: proc(r: ^Replicator, rm: ^Remote) -> (keys: journal.Key_Provider
 		switch sealing {
 		case .Unknown:
 			return {}, false
-		case .Key_Tree:
+		case .Key_Tree, .Key_Tree_Stale:
 			return tree, true
 		case .Stream_Key:
 		}
@@ -501,7 +505,7 @@ _feed_cursor_load :: proc(r: ^Replicator) {
 	newest, _, count, serr := slots_read(r.vfs, fd)
 	if serr == .None && count > 0 {
 		r.feed_seq = newest.seq
-		if newest.start == _relay_tag(r) {
+		if newest.hash == u64(_relay_tag(r)) {
 			r.feed_cursor = newest.value
 		}
 	}
@@ -538,10 +542,14 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 			}
 			continue
 		}
-		if length > u64(max(i64)) {
+		n, hollow, lok := feed_length(length)
+		if !lok {
 			continue
 		}
-		_seen_stream(r, id, i64(length))
+		if hollow {
+			_remote_hollow_seen(r, id, n)
+		}
+		_seen_stream(r, id, n)
 		if rm, ok := r.remotes[id]; ok {
 			_remote_pull(r, rm)
 		}
@@ -550,7 +558,7 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 		r.feed_cursor = ev.length
 		if r.feed_fd >= 0 {
 			r.feed_seq += 1
-			slot_write(r.vfs, r.feed_fd, Slot{seq = r.feed_seq, value = r.feed_cursor, start = _relay_tag(r)})
+			slot_write(r.vfs, r.feed_fd, Slot{seq = r.feed_seq, value = r.feed_cursor, hash = u64(_relay_tag(r))})
 		}
 	}
 	_fetch_check(r)
@@ -798,6 +806,9 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 		case .Stream_Key:
 		case .Key_Tree:
 			k.tree = tree
+		case .Key_Tree_Stale:
+			k.tree = tree
+			k.known = false
 		}
 	}
 	held := false

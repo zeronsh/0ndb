@@ -87,12 +87,16 @@
  *                 10 question, 11 file
  *   seal          0 open, 1 done, 2 interrupted, 3 failed, 4 cancelled
  *   convo_status  0 idle, 1 running, 2 queued, 3 awaiting_permission,
- *                 4 failed, 5 interrupted, 6 waiting, 7 reviving (since 1.5)
+ *                 4 failed, 5 interrupted, 6 waiting, 7 reviving
  *   open_state    0 running, 1 revive
  *   condition     1 any, 2 all
  *   mode          0 end_to_end, 1 transparent
  *   unit          0 lines, 1 bytes
  *   sort          0 relevance, 1 newest
+ *   scope         0 auto, 1 local, 2 everywhere
+ *   search_mode   0 default, 1 full, 2 local
+ *   search_state  0 ok, 1 partial, 2 offline, 3 timeout, 4 denied,
+ *                 5 failed, 6 cancelled
  *   dir           0 older, 1 newer
  *   member_role   1 tree, 2 document, 3 memory
  *   intent        23 assign, 25 queue, 26 steer, 27 edit_queued, 28 cancel,
@@ -103,8 +107,22 @@
  *                 17 members, 18 quarantined
  *   event         0 connected, 1 disconnected, 2 durable, 3 uploaded,
  *                 4 quarantined, 5 refused, 6 fatal, 7 space_joined,
- *                 8 object_seen, 9 failure, 10 placement (since 1.4),
- *                 11 relay_misbehaving, 12 presence, 13 caught_up (since 1.5)
+ *                 8 object_seen, 9 failure, 10 placement,
+ *                 11 relay_misbehaving, 12 presence, 13 caught_up,
+ *                 14 indexer_wanted, 15 unavailable,
+ *                 16 available, 17 promoted, 18 peer_misbehaving,
+ *                 19 members_changed, 20 epoch_changed, 21 access_revoked,
+ *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
+ *                 25 login_done, 26 login_failed
+ *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
+ *                 5 runner, 6 guest, 7 directory
+ *   member_role   0 owner, 1 admin, 2 member, 3 reader
+ *   enroll        0 genesis, 1 approval, 2 recovery, 3 account, 4 custodian,
+ *                 5 pool, 6 grant, 7 directory
+ *   login_path    0 created, 1 passkey, 2 approval, 3 cross_device,
+ *                 4 recovery
+ *   login_status  0 done, 1 waiting, 2 no_approver
+ *   pool_access   0 off, 1 everything, 2 workspace, 3 only_sent
  *   placement     0 none, 1 assigned, 2 running, 3 waiting_runner
  *
  * Shared payload structures
@@ -129,13 +147,13 @@
  *                 claim: rid, files: [File], lines: [Line], blocks: [Block]
  *   Position   := msg: rid, seal: rid, seal_known: bool
  *   Page       := messages: [Message], next: Edge, more: bool,
- *                 cursor: bytes (since 1.3)
+ *                 cursor: bytes
  *                 (dir older: newest first, toward the root; dir newer:
  *                 oldest first, toward leaf or the reader's position)
  *   Window     := messages: [Message] (oldest first), anchor: uvarint (index
  *                 of the anchor in messages), older: Edge, newer: Edge,
  *                 more_older: bool, more_newer: bool, leaf: rid,
- *                 older_cursor: bytes, newer_cursor: bytes (since 1.3)
+ *                 older_cursor: bytes, newer_cursor: bytes
  *   Edge       := Position when there is more in that direction; otherwise
  *                 JSON null (binary: an all-zero Position). An absent from
  *                 means "start at the reader's position", so never page from
@@ -170,7 +188,10 @@
  *                 status: enum convo_status, activity: uvarint,
  *                 archived: bool, pinned: bool
  *   Space      := id: id, name: str, relay: str, relay_key: bytes,
- *                 mode: enum mode, open: bool, connected: bool, catalog: id
+ *                 mode: enum mode, open: bool, connected: bool, catalog: id,
+ *                 relay_usage: uvarint, relay_quota: uvarint (
+ *                 the bytes the relay stores for the space and its quota,
+ *                 as of the last connect)
  *   Identity   := id: id, sign: bytes, box: bytes
  *   Span       := lo: uvarint, hi: uvarint, line_lo: uvarint,
  *                 line_hi: uvarint, actor: id, seq: uvarint, op_actor: id,
@@ -181,7 +202,11 @@
  *                 score: f64, snippet: str, snippet_at: uvarint,
  *                 matches: [ {start: uvarint, len: uvarint} ]
  *   Results    := hits: [Hit], cursor: bytes, incomplete: bool,
- *                 verified: uvarint
+ *                 verified: uvarint, partial: bool, behind: uvarint,
+ *                 sources: [Source] (filled when search is
+ *                 given a space)
+ *   Source     := device: id, local: bool, state: enum search_state,
+ *                 behind: uvarint, hits: uvarint, rejected: uvarint
  *   Wrote      := scope: id, object: id, ref: bytes, hlc: uvarint,
  *                 lo: uvarint, hi: uvarint, known: bool
  *   Stats      := ticks, commits, durable, handles, opened, evicted, pending,
@@ -204,12 +229,21 @@
  *   Deltas     := deltas: [Delta]
  *   Event      := kind: enum event, space: id, object: id, device: id,
  *                 tick: uvarint, length: ivarint, status: enum status,
- *                 detail: str, Placement (since 1.4; zero unless kind is
+ *                 detail: str, Placement (zero unless kind is
  *                 placement, delivered whenever a conversation's placement
  *                 changes when the runtime is enabled); presence carries
  *                 device, tick 1 up or 0 down and length the relay's time;
  *                 caught_up carries space and length the relay feed
- *                 position the device has read up to
+ *                 position the device has read up to; indexer_wanted
+ *                 carries the space a search wanted a full indexer in
+ *                 while none was online; unavailable carries object and
+ *                 one holder device per event when a device-only range of
+ *                 object has no holder online (reads stay pending and
+ *                 complete when a holder returns, followed by available);
+ *                 promoted carries object, a segment's writer as device
+ *                 and length the bytes filled into the relay;
+ *                 peer_misbehaving carries the device whose served bytes
+ *                 failed verification
  *   Placement  := state: enum placement, msg: rid, runner: id, provider: str,
  *                 since_ms: ivarint (waiting_runner: no live runner for the
  *                 provider has claimed msg since since_ms)
@@ -250,8 +284,8 @@
 extern "C" {
 #endif
 
-#define ONDB_ABI_MAJOR 1u
-#define ONDB_ABI_MINOR 5u
+#define ONDB_ABI_MAJOR 2u
+#define ONDB_ABI_MINOR 0u
 #define ONDB_ABI_VERSION ((ONDB_ABI_MAJOR << 16) | ONDB_ABI_MINOR)
 
 typedef struct ondb ondb;
@@ -320,7 +354,13 @@ enum ondb_io_error {
 #define ONDB_NO_SEARCH (1u << 3)   /* no derived search indexes */
 #define ONDB_DEFERRED (1u << 4)    /* the embedder makes writes durable (ondb "flush" op) */
 #define ONDB_EVENTS_JSON (1u << 5) /* deliver Event payloads as JSON */
-#define ONDB_IDLE_PAGEOUT (1u << 6) /* when idle, return heap and page out clean code pages (since 1.1) */
+#define ONDB_IDLE_PAGEOUT (1u << 6) /* when idle, return heap and page out clean code pages */
+#define ONDB_SEARCH_FULL (1u << 7) /* keep a full search index of every space and serve peer queries */
+#define ONDB_STORAGE_SHIFT 8       /* bits 8-9: storage mode: */
+#define ONDB_STORAGE_AUTO 0u       /*   relay stores conversations and metadata (default) */
+#define ONDB_STORAGE_STORED 1u     /*   relay stores everything (pool runners) */
+#define ONDB_STORAGE_UNTIL_RUN 2u  /*   device-only until a pool runner is assigned */
+#define ONDB_STORAGE_DEVICE 3u     /*   strict device-only, peers serve through the relay pipe */
 
 /* ---- plug points (every table: size = sizeof(table), ud passed back) ---- */
 
@@ -560,6 +600,28 @@ typedef struct ondb_log {
 	void (*write)(void *ud, int level, const char *msg, size_t len);
 } ondb_log;
 
+/* Routes cross-device search queries to the embedder's own indexer instead
+   of a full indexer reached through the relay. query is called
+   on the engine loop with id and a RemoteQuery payload; answer later on the
+   loop with ondb_search_answer(h, id, RemoteAnswer). The answer is verified
+   like any peer's: every ref is fetched, chain-verified, decrypted and
+   re-matched locally, so a hosted indexer can hide results but not inject
+   them. cancel tells the indexer the search ended without its answer.
+     RemoteQuery  := u8 version(=1), id space, u16 limit, u16 skip,
+                     u8 sort, u64 now (hlc), u16 n + cursor, u16 n + query
+     RemoteAnswer := u8 version(=1), u8 kind(=2), u8 state, u32 behind,
+                     u16 n + cursor, u16 count, count * RemoteRef,
+                     u16 marks, marks * (id object, id device, u64 indexed)
+     RemoteRef    := id object, u8 n + ref, u32 part, u8 kind, u64 hlc,
+                     f64 score, u8 spans, spans * (u32 start, u32 len)
+   All integers little endian; state uses the search_state enum. */
+typedef struct ondb_search_remote {
+	uint32_t size;
+	void *ud;
+	int (*query)(void *ud, ondb *h, uint64_t id, const uint8_t *payload, size_t len);
+	void (*cancel)(void *ud, ondb *h, uint64_t id);
+} ondb_search_remote;
+
 /* Engine events (connectivity, durability, uploads, quarantine...), as an
    Event payload. */
 typedef struct ondb_events {
@@ -570,7 +632,7 @@ typedef struct ondb_events {
 
 /* ---- runtime (runs, runners, triggers, channels, orchestration) ---- */
 
-/* A model wire format implemented by the embedder (since 1.1). The request
+/* A model wire format implemented by the embedder. The request
    body is head + messages joined with ',' + tail; each callback appends bytes
    with ondb_sink_write. head receives {model, max_tokens, kind, system,
    tools: [{name, description, schema}]} as JSON; message receives
@@ -639,7 +701,7 @@ int ondb_wire_emit(ondb_emit *emit, const ondb_wire_event *ev);
 
 /* Resolve a provider/model for the native model loop. Return 0 when
    resolved; strings are copied. With wire NULL the request is built by the
-   reference adapter for api; with wire set (since 1.1) by the embedder. */
+   reference adapter for api; with wire set by the embedder. */
 typedef struct ondb_model_config {
 	uint32_t api; /* 0 anthropic, 1 openai_responses, 2 openai_chat */
 	const char *url;
@@ -735,6 +797,7 @@ typedef struct ondb_secrets {
 #define ONDB_RT_OBSERVE (1u << 1)   /* attribute writes with the reference observer */
 #define ONDB_RT_MCP_HTTP (1u << 2)  /* serve the catalog to harnesses over local HTTP */
 #define ONDB_RT_NO_ATTACH (1u << 3) /* do not attach existing spaces at open */
+#define ONDB_RT_POOL (1u << 4)      /* advertise this runner as a pool runner with an ephemeral sandbox */
 
 typedef struct ondb_runtime {
 	uint32_t size; /* sizeof(ondb_runtime) */
@@ -758,6 +821,59 @@ typedef struct ondb_runtime {
 } ondb_runtime;
 
 /* Any plug pointer may be NULL to use the reference implementation. */
+/* Account sign-in plugs. Return 0 on success, 1 not found, 2 conflict,
+   3 permission, 4 unsupported, anything else an I/O error.
+
+   unlock: the platform passkey (WebAuthn PRF / CTAP2 hmac-secret). unlock
+   evaluates PRF with the given per-credential salts and writes the chosen
+   credential id and the 32-byte output; mode 0 is this device, 1 is a
+   passkey on another device (hybrid/QR). enroll registers a new platform
+   passkey for rp_user and returns its credential id, PRF output for salt and
+   ecosystem (0 unknown, 1 apple, 2 google, 3 microsoft, 4 1password,
+   5 bitwarden, 6 security_key, 7 recovery, 8 test). User verification must
+   always be required. */
+typedef struct ondb_unlock_option {
+	const uint8_t *credential;
+	size_t credential_len;
+	uint8_t salt[32];
+} ondb_unlock_option;
+
+typedef struct ondb_unlock {
+	uint32_t size;
+	void *ud;
+	int (*unlock)(void *ud, const uint8_t *rp_user, size_t rp_user_len, const ondb_unlock_option *options, size_t count, int mode, uint8_t *credential, size_t cap, size_t *len, uint8_t prf[32]);
+	int (*enroll)(void *ud, const uint8_t *rp_user, size_t rp_user_len, const char *label, size_t label_len, const uint8_t salt[32], uint8_t *credential, size_t cap, size_t *len, uint8_t prf[32], int *ecosystem);
+} ondb_unlock;
+
+/* The embedder's account server, keyed by its opaque login subject. get
+   writes the newest account record (at most 64 KiB) and the manifest
+   entries, each as a u32le length followed by the entry (at most 4 MiB in
+   all); put stores a record only if the stored one has seq prev_seq
+   (otherwise 2); add appends one manifest entry. */
+typedef struct ondb_sealed_store {
+	uint32_t size;
+	void *ud;
+	int (*get)(void *ud, const uint8_t *subject, size_t subject_len, uint8_t *record, size_t record_cap, size_t *record_len, uint8_t *entries, size_t entries_cap, size_t *entries_len);
+	int (*put)(void *ud, const uint8_t *subject, size_t subject_len, const uint8_t *record, size_t record_len, uint64_t prev_seq);
+	int (*add)(void *ud, const uint8_t *subject, size_t subject_len, const uint8_t *entry, size_t entry_len);
+} ondb_sealed_store;
+
+/* Runner pool host. identity returns the pool member's public identity
+   (its private key lives with the host, e.g. a KMS behind the keyring plug
+   of the host's engine). verify checks a launch token for a runner and
+   returns its lease; attest optionally checks evidence; joined tells the
+   host that a user device added the pool to a space (proof is the pool's
+   Add record, to pass to space.join_enrollment on the host). A host-held
+   directory admin uses the same keyring and the directory.* ops. */
+typedef struct ondb_runner_pool {
+	uint32_t size;
+	void *ud;
+	int (*identity)(void *ud, ondb_identity *out);
+	int (*verify)(void *ud, const uint8_t *token, size_t token_len, const ondb_identity *runner, uint64_t *lease_ms);
+	int (*attest)(void *ud, const uint8_t *evidence, size_t evidence_len, const ondb_identity *runner);
+	void (*joined)(void *ud, const uint8_t space[16], const char *name, size_t name_len, const char *relay, size_t relay_len, const uint8_t relay_key[32], const uint8_t *proof, size_t proof_len);
+} ondb_runner_pool;
+
 typedef struct ondb_config {
 	uint32_t size;        /* sizeof(ondb_config) */
 	uint32_t flags;       /* ONDB_NO_VERIFY ... */
@@ -778,6 +894,11 @@ typedef struct ondb_config {
 	const ondb_log *log;
 	const ondb_events *events;
 	const ondb_runtime *runtime; /* NULL: engine only, runtime ops return ONDB_UNSUPPORTED */
+	const ondb_search_remote *search_remote; /* NULL: peer queries go to full indexers through the relay */
+	const ondb_unlock *unlock;               /* NULL: no passkey sign-in on this device */
+	const ondb_sealed_store *sealed_store;   /* NULL: no account sign-in */
+	const ondb_runner_pool *runner_pool;     /* NULL: no cloud runner pool */
+	uint32_t approver;                       /* nonzero: listen for sign-in approval requests */
 } ondb_config;
 
 typedef void (*ondb_done_fn)(void *ud, uint64_t call, int status, const uint8_t *payload, size_t len);
@@ -800,6 +921,10 @@ int64_t ondb_timeout_ms(ondb *h); /* -1 = sleep until ondb_fd is readable */
 int ondb_step(ondb *h, int block);
 
 /* ---- requests ---- */
+/* Delivers a Search_Remote answer for query id. Call on the
+   engine loop. */
+int ondb_search_answer(ondb *h, uint64_t id, const uint8_t *payload, size_t len);
+
 int ondb_call(ondb *h, const uint8_t *req, size_t len, uint32_t flags, int64_t timeout_ms,
               uint8_t **out, size_t *out_len, ondb_done_fn done, void *ud, uint64_t *call);
 void ondb_cancel(ondb *h, uint64_t call);
@@ -825,7 +950,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
  * Ops (generated from ondb_describe). code name(arg: type, ...) -> result
  * enum arguments list their accepted names after the type.
  */
-#define ONDB_OPS_VERSION 1u
+#define ONDB_OPS_VERSION 2u
 /* identity() -> Identity */
 #define ONDB_OP_IDENTITY 1u
 /* stats() -> Stats */
@@ -839,209 +964,271 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 /* describe() -> Description */
 #define ONDB_OP_DESCRIBE 6u
 /* space.create(name: str, relay: str, relay_key: bytes, mode: enum{end_to_end,transparent}) -> space:id */
-#define ONDB_OP_SPACE_CREATE 10u
-/* space.join(code: str, name: str) -> space:id */
-#define ONDB_OP_SPACE_JOIN 11u
-/* space.join_secret(secret: bytes, name: str, relay: str, relay_key: bytes, mode: enum{end_to_end,transparent}) -> space:id */
-#define ONDB_OP_SPACE_JOIN_SECRET 12u
-/* space.pairing(space: id) -> code:str */
-#define ONDB_OP_SPACE_PAIRING 13u
+#define ONDB_OP_SPACE_CREATE 7u
+/* account.login(subject: str, label: str, relay: str, relay_key: bytes) -> path:enum login_path status:enum login_status code:str spaces:uvarint */
+#define ONDB_OP_ACCOUNT_LOGIN 8u
+/* account.login_cross_device(subject: str) -> path:enum login_path status:enum login_status spaces:uvarint */
+#define ONDB_OP_ACCOUNT_LOGIN_CROSS_DEVICE 9u
+/* account.login_recovery(subject: str, key: str) -> path:enum login_path status:enum login_status spaces:uvarint */
+#define ONDB_OP_ACCOUNT_LOGIN_RECOVERY 10u
+/* account.state() -> AccountState */
+#define ONDB_OP_ACCOUNT_STATE 11u
+/* account.listen() -> {} */
+#define ONDB_OP_ACCOUNT_LISTEN 12u
+/* approval.list() -> approvals:[Approval] */
+#define ONDB_OP_APPROVAL_LIST 13u
+/* approval.respond(code: str, approve: bool) -> {} */
+#define ONDB_OP_APPROVAL_RESPOND 14u
+/* account.passkeys() -> passkeys:[Passkey] */
+#define ONDB_OP_ACCOUNT_PASSKEYS 15u
+/* account.passkey_remove(credential: bytes) -> {} */
+#define ONDB_OP_ACCOUNT_PASSKEY_REMOVE 16u
+/* account.recovery_key() -> key:str */
+#define ONDB_OP_ACCOUNT_RECOVERY_KEY 17u
+/* account.devices() -> devices:[Device] */
+#define ONDB_OP_ACCOUNT_DEVICES 18u
+/* account.pool(access: enum{off,everything,workspace,only_sent}) -> {} */
+#define ONDB_OP_ACCOUNT_POOL 19u
+/* device.remove(device: id) -> spaces:uvarint */
+#define ONDB_OP_DEVICE_REMOVE 20u
+/* space.members(space: id) -> members:[Member] */
+#define ONDB_OP_SPACE_MEMBERS 21u
+/* space.members_status(space: id) -> MembersStatus */
+#define ONDB_OP_SPACE_MEMBERS_STATUS 22u
+/* member.remove(space: id, device: id) -> {} */
+#define ONDB_OP_MEMBER_REMOVE 23u
+/* member.add(space: id, card: bytes, kind: enum{device,account,recovery,custodian,pool,runner,guest,directory}, role: enum{owner,admin,member,reader}, lease_ms: uvarint) -> proof:bytes */
+#define ONDB_OP_MEMBER_ADD 24u
+/* space.rotate(space: id) -> {} */
+#define ONDB_OP_SPACE_ROTATE 25u
+/* space.pool(space: id, on: bool) -> {} */
+#define ONDB_OP_SPACE_POOL 26u
+/* space.join_enrollment(space: id, proof: bytes, name: str, relay: str, relay_key: bytes) -> space:id */
+#define ONDB_OP_SPACE_JOIN_ENROLLMENT 27u
+/* account.join_space(space: id) -> {} */
+#define ONDB_OP_ACCOUNT_JOIN_SPACE 28u
+/* pool.enroll(token: bytes, card: bytes, evidence: bytes) -> enrollment:bytes */
+#define ONDB_OP_POOL_ENROLL 29u
+/* runner.enroll(enrollment: bytes) -> spaces:uvarint */
+#define ONDB_OP_RUNNER_ENROLL 30u
+/* lease.renew() -> renewed:uvarint */
+#define ONDB_OP_LEASE_RENEW 31u
+/* account.login_prf(subject: str, credential: bytes, prf: bytes, label: str, relay: str, relay_key: bytes) -> path:enum login_path status:enum login_status code:str spaces:uvarint */
+#define ONDB_OP_ACCOUNT_LOGIN_PRF 32u
+/* account.passkey_add(label: str, credential: bytes, prf: bytes) -> {} */
+#define ONDB_OP_ACCOUNT_PASSKEY_ADD 33u
+/* account.idp_salt(subject: str) -> salt:bytes */
+#define ONDB_OP_ACCOUNT_IDP_SALT 34u
+/* directory.add(space: id, person: bytes, role: enum{owner,admin,member,reader}, devices: [str]) -> {} */
+#define ONDB_OP_DIRECTORY_ADD 35u
+/* directory.remove(space: id, person: bytes) -> {} */
+#define ONDB_OP_DIRECTORY_REMOVE 36u
+/* account.sign_out(keep_relay: bool) -> spaces:uvarint */
+#define ONDB_OP_ACCOUNT_SIGN_OUT 37u
+/* storage.availability(object: object) -> unavailable:bool holders:[id] class:uvarint */
+#define ONDB_OP_STORAGE_AVAILABILITY 38u
+/* storage.stats() -> promotions:uvarint promoted:uvarint served:uvarint unavailable:uvarint */
+#define ONDB_OP_STORAGE_STATS 39u
+/* object.promote(object: object, from: uvarint) -> {} */
+#define ONDB_OP_OBJECT_PROMOTE 40u
 /* space.list() -> spaces:[Space] */
-#define ONDB_OP_SPACE_LIST 14u
+#define ONDB_OP_SPACE_LIST 41u
 /* space.info(space: id) -> space:Space */
-#define ONDB_OP_SPACE_INFO 15u
+#define ONDB_OP_SPACE_INFO 42u
 /* space.set_relay(space: id, relay: str, relay_key: bytes) -> {} */
-#define ONDB_OP_SPACE_SET_RELAY 16u
+#define ONDB_OP_SPACE_SET_RELAY 43u
 /* space.open(space: id) -> {} */
-#define ONDB_OP_SPACE_OPEN 17u
+#define ONDB_OP_SPACE_OPEN 44u
 /* space.close(space: id) -> {} */
-#define ONDB_OP_SPACE_CLOSE 18u
+#define ONDB_OP_SPACE_CLOSE 45u
 /* space.join_shared(space: id, name: str, relay: str, relay_key: bytes) -> {} */
-#define ONDB_OP_SPACE_JOIN_SHARED 19u
+#define ONDB_OP_SPACE_JOIN_SHARED 46u
 /* convo.create(space: id, title: str, agent: id, workspace: id, parent: object, parent_msg: rid, provider: str, model: str) -> object:object */
-#define ONDB_OP_CONVO_CREATE 30u
+#define ONDB_OP_CONVO_CREATE 47u
 /* convo.status(object: object) -> Status */
-#define ONDB_OP_CONVO_STATUS 31u
+#define ONDB_OP_CONVO_STATUS 48u
 /* convo.page(object: object, from: rid, from_seal: rid, from_known: bool, limit: uvarint, dir: enum{older,newer}, leaf: rid, cursor: bytes) -> Page */
-#define ONDB_OP_CONVO_PAGE 32u
+#define ONDB_OP_CONVO_PAGE 49u
 /* convo.message(object: object, msg: rid) -> message:Message */
-#define ONDB_OP_CONVO_MESSAGE 33u
+#define ONDB_OP_CONVO_MESSAGE 50u
 /* convo.siblings(object: object, msg: rid) -> siblings:[rid] at:uvarint */
-#define ONDB_OP_CONVO_SIBLINGS 34u
+#define ONDB_OP_CONVO_SIBLINGS 51u
 /* convo.intents(object: object) -> intents:[Intent] */
-#define ONDB_OP_CONVO_INTENTS 35u
+#define ONDB_OP_CONVO_INTENTS 52u
 /* convo.mounts(object: object) -> mounts:[Mount] */
-#define ONDB_OP_CONVO_MOUNTS 36u
+#define ONDB_OP_CONVO_MOUNTS 53u
 /* convo.settings(object: object) -> Settings */
-#define ONDB_OP_CONVO_SETTINGS 37u
+#define ONDB_OP_CONVO_SETTINGS 54u
 /* convo.files_at(object: object, msg: rid) -> files:[File] */
-#define ONDB_OP_CONVO_FILES_AT 38u
+#define ONDB_OP_CONVO_FILES_AT 55u
 /* convo.compactions(object: object, floor: uvarint) -> compactions:[Compaction] */
-#define ONDB_OP_CONVO_COMPACTIONS 39u
+#define ONDB_OP_CONVO_COMPACTIONS 56u
 /* convo.unsealed(object: object) -> unsealed:[Unsealed] */
-#define ONDB_OP_CONVO_UNSEALED 40u
+#define ONDB_OP_CONVO_UNSEALED 57u
 /* convo.window(object: object, anchor: rid, before: uvarint, after: uvarint, leaf: rid) -> Window */
-#define ONDB_OP_CONVO_WINDOW 41u
+#define ONDB_OP_CONVO_WINDOW 58u
 /* convo.peek_switch(object: object, sibling: rid, before: uvarint, after: uvarint) -> Window */
-#define ONDB_OP_CONVO_PEEK_SWITCH 42u
-/* send(object: object, text: str, parent: rid, role: enum{user,assistant,system,tool}, provider: str, model: str, attachments: attachments) -> Result */
-#define ONDB_OP_SEND 50u
-/* queue(object: object, text: str, attachments: attachments) -> Result */
-#define ONDB_OP_QUEUE 51u
-/* steer(object: object, text: str, msg: rid, attachments: attachments) -> Result */
-#define ONDB_OP_STEER 52u
-/* edit(object: object, item: rid, text: str, attachments: attachments) -> Result */
-#define ONDB_OP_EDIT 53u
+#define ONDB_OP_CONVO_PEEK_SWITCH 59u
+/* send(object: object, text: str, parent: rid, role: enum{user,assistant,system,tool}, provider: str, model: str, attachments: [Attachment]) -> Result */
+#define ONDB_OP_SEND 60u
+/* queue(object: object, text: str, attachments: [Attachment]) -> Result */
+#define ONDB_OP_QUEUE 61u
+/* steer(object: object, text: str, msg: rid, attachments: [Attachment]) -> Result */
+#define ONDB_OP_STEER 62u
+/* edit(object: object, item: rid, text: str, attachments: [Attachment]) -> Result */
+#define ONDB_OP_EDIT 63u
 /* cancel(object: object, item: rid) -> Result */
-#define ONDB_OP_CANCEL 54u
+#define ONDB_OP_CANCEL 64u
 /* interrupt(object: object, msg: rid) -> Result */
-#define ONDB_OP_INTERRUPT 55u
+#define ONDB_OP_INTERRUPT 65u
 /* answer(object: object, request: rid, allow: bool, text: str) -> Result */
-#define ONDB_OP_ANSWER 56u
+#define ONDB_OP_ANSWER 66u
 /* switch(object: object, sibling: rid) -> Result */
-#define ONDB_OP_SWITCH 57u
+#define ONDB_OP_SWITCH 67u
 /* back(object: object, msg: rid) -> Result */
-#define ONDB_OP_BACK 58u
+#define ONDB_OP_BACK 68u
 /* follow(object: object) -> Result */
-#define ONDB_OP_FOLLOW 59u
+#define ONDB_OP_FOLLOW 69u
 /* mount(object: object, name: str, tree: id, line: id, path: str) -> Result */
-#define ONDB_OP_MOUNT 60u
+#define ONDB_OP_MOUNT 70u
 /* unmount(object: object, name: str) -> Result */
-#define ONDB_OP_UNMOUNT 61u
-/* await(object: object, tasks: ids, condition: enum{any,all}, deadline: uvarint, expr: str) -> Result */
-#define ONDB_OP_AWAIT 62u
+#define ONDB_OP_UNMOUNT 71u
+/* await(object: object, tasks: [id], condition: enum{any,all}, deadline: uvarint, expr: str) -> Result */
+#define ONDB_OP_AWAIT 72u
 /* assign(object: object, msg: rid, runner: id) -> Result */
-#define ONDB_OP_ASSIGN 63u
+#define ONDB_OP_ASSIGN 73u
 /* redact(object: object, msg: rid) -> Result */
-#define ONDB_OP_REDACT 64u
+#define ONDB_OP_REDACT 74u
 /* map.create(space: id, title: str, settings: bytes) -> object:object */
-#define ONDB_OP_MAP_CREATE 70u
+#define ONDB_OP_MAP_CREATE 75u
 /* map.get(object: object, key: bytes) -> found:bool entry:Entry */
-#define ONDB_OP_MAP_GET 71u
+#define ONDB_OP_MAP_GET 76u
 /* map.scan(object: object, prefix: bytes, after: bytes, limit: uvarint) -> rows:[Entry] more:bool next:bytes */
-#define ONDB_OP_MAP_SCAN 72u
-/* map.set(object: object, key: bytes, fields: fields) -> Result */
-#define ONDB_OP_MAP_SET 73u
-/* map.delete(object: object, key: bytes, tags: uvarints) -> Result */
-#define ONDB_OP_MAP_DELETE 74u
+#define ONDB_OP_MAP_SCAN 77u
+/* map.set(object: object, key: bytes, fields: [Field]) -> Result */
+#define ONDB_OP_MAP_SET 78u
+/* map.delete(object: object, key: bytes, tags: [uvarint]) -> Result */
+#define ONDB_OP_MAP_DELETE 79u
 /* map.add(object: object, key: bytes, tag: uvarint, element: bytes) -> Result */
-#define ONDB_OP_MAP_ADD 75u
+#define ONDB_OP_MAP_ADD 80u
 /* map.remove(object: object, key: bytes, tag: uvarint, element: bytes) -> Result */
-#define ONDB_OP_MAP_REMOVE 76u
+#define ONDB_OP_MAP_REMOVE 81u
 /* map.redact(object: object, key: bytes) -> {} */
-#define ONDB_OP_MAP_REDACT 77u
+#define ONDB_OP_MAP_REDACT 82u
 /* text.create(space: id, title: str, initial: str) -> object:object */
-#define ONDB_OP_TEXT_CREATE 80u
+#define ONDB_OP_TEXT_CREATE 83u
 /* text.read(object: object) -> text:str */
-#define ONDB_OP_TEXT_READ 81u
+#define ONDB_OP_TEXT_READ 84u
 /* text.spans(object: object) -> spans:[Span] */
-#define ONDB_OP_TEXT_SPANS 82u
+#define ONDB_OP_TEXT_SPANS 85u
 /* text.edit(object: object, pos: uvarint, remove: uvarint, insert: str) -> Result */
-#define ONDB_OP_TEXT_EDIT 83u
+#define ONDB_OP_TEXT_EDIT 86u
 /* text.redact(object: object, pos: uvarint, len: uvarint) -> {} */
-#define ONDB_OP_TEXT_REDACT 84u
+#define ONDB_OP_TEXT_REDACT 87u
 /* tree.create(space: id, title: str) -> object:object */
-#define ONDB_OP_TREE_CREATE 90u
+#define ONDB_OP_TREE_CREATE 88u
 /* tree.read(object: object, path: str) -> text:str */
-#define ONDB_OP_TREE_READ 91u
+#define ONDB_OP_TREE_READ 89u
 /* tree.list(object: object, path: str) -> names:[str] */
-#define ONDB_OP_TREE_LIST 92u
+#define ONDB_OP_TREE_LIST 90u
 /* tree.write(object: object, path: str, text: str) -> {} */
-#define ONDB_OP_TREE_WRITE 93u
+#define ONDB_OP_TREE_WRITE 91u
 /* tree.remove(object: object, path: str) -> {} */
-#define ONDB_OP_TREE_REMOVE 94u
+#define ONDB_OP_TREE_REMOVE 92u
 /* tree.mount(object: object, root: str) -> {} */
-#define ONDB_OP_TREE_MOUNT 95u
+#define ONDB_OP_TREE_MOUNT 93u
 /* tree.unmount(object: object, root: str) -> {} */
-#define ONDB_OP_TREE_UNMOUNT 96u
+#define ONDB_OP_TREE_UNMOUNT 94u
 /* tree.mounts() -> mounts:[Mounted] */
-#define ONDB_OP_TREE_MOUNTS 97u
+#define ONDB_OP_TREE_MOUNTS 95u
 /* tree.blame(object: object, path: str) -> text:str spans:[Span] */
-#define ONDB_OP_TREE_BLAME 98u
+#define ONDB_OP_TREE_BLAME 96u
 /* tree.sync(object: object, root: str) -> {} */
-#define ONDB_OP_TREE_SYNC 99u
+#define ONDB_OP_TREE_SYNC 97u
 /* tree.find(path: str) -> object:object root:str rel:str */
-#define ONDB_OP_TREE_FIND 100u
+#define ONDB_OP_TREE_FIND 98u
 /* catalog.get(object: object) -> found:bool entry:CatalogEntry */
-#define ONDB_OP_CATALOG_GET 110u
+#define ONDB_OP_CATALOG_GET 99u
 /* catalog.list(space: id, archived: bool, after: bytes, limit: uvarint) -> rows:[CatalogRow] more:bool next:bytes */
-#define ONDB_OP_CATALOG_LIST 111u
+#define ONDB_OP_CATALOG_LIST 100u
 /* catalog.usage(object: object) -> Usage */
-#define ONDB_OP_CATALOG_USAGE 112u
+#define ONDB_OP_CATALOG_USAGE 101u
 /* catalog.set(object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id) -> Result */
-#define ONDB_OP_CATALOG_SET 113u
-/* search(query: str, limit: uvarint, cursor: bytes, sort: enum{relevance,newest}, semantic: bool, collapse: bool) -> Results */
-#define ONDB_OP_SEARCH 120u
+#define ONDB_OP_CATALOG_SET 102u
+/* search(query: str, limit: uvarint, cursor: bytes, sort: enum{relevance,newest}, semantic: bool, collapse: bool, space: id, scope: enum{auto,local,everywhere}) -> Results */
+#define ONDB_OP_SEARCH 103u
+/* search.mode(space: id, mode: enum{default,full,local}) -> mode:enum */
+#define ONDB_OP_SEARCH_MODE 104u
 /* search.wrote(tree: id, path: str, unit: enum{lines,bytes}, lo: uvarint, hi: uvarint) -> hits:[Wrote] */
-#define ONDB_OP_SEARCH_WROTE 121u
+#define ONDB_OP_SEARCH_WROTE 105u
 /* share.object(object: object, card: bytes) -> share:bytes */
-#define ONDB_OP_SHARE_OBJECT 130u
+#define ONDB_OP_SHARE_OBJECT 106u
 /* share.accept(share: bytes) -> object:object */
-#define ONDB_OP_SHARE_ACCEPT 131u
+#define ONDB_OP_SHARE_ACCEPT 107u
 /* capability.issue(object: object, grantee: id, access: uvarint, expires: ivarint) -> token:bytes */
-#define ONDB_OP_CAPABILITY_ISSUE 132u
+#define ONDB_OP_CAPABILITY_ISSUE 108u
 /* card() -> card:bytes */
-#define ONDB_OP_CARD 133u
+#define ONDB_OP_CARD 109u
 /* workspace.create(space: id, name: str, agent: id, provider: str, model: str, setup: str) -> object:object */
-#define ONDB_OP_WORKSPACE_CREATE 140u
+#define ONDB_OP_WORKSPACE_CREATE 110u
 /* workspace.get(object: object) -> Workspace */
-#define ONDB_OP_WORKSPACE_GET 141u
+#define ONDB_OP_WORKSPACE_GET 111u
 /* workspace.add_member(object: object, member: id, kind: enum{conversation,map,text,tree}, role: enum{tree,document,memory}, mount: str, path: str) -> {} */
-#define ONDB_OP_WORKSPACE_ADD_MEMBER 142u
+#define ONDB_OP_WORKSPACE_ADD_MEMBER 112u
 /* workspace.remove_member(object: object, member: id, kind: enum{conversation,map,text,tree}, role: enum{tree,document,memory}, mount: str, path: str) -> {} */
-#define ONDB_OP_WORKSPACE_REMOVE_MEMBER 143u
+#define ONDB_OP_WORKSPACE_REMOVE_MEMBER 113u
 /* agent.create(space: id, name: str, instructions: str, driver: str, provider: str, model: str, workspace: id, options: bytes, budget: bytes) -> object:object */
-#define ONDB_OP_AGENT_CREATE 144u
+#define ONDB_OP_AGENT_CREATE 114u
 /* agent.get(object: object) -> Agent */
-#define ONDB_OP_AGENT_GET 145u
+#define ONDB_OP_AGENT_GET 115u
 /* agent.set(object: object, name: str, instructions: str, driver: str, provider: str, model: str, workspace: id, options: bytes, budget: bytes) -> {} */
-#define ONDB_OP_AGENT_SET 146u
+#define ONDB_OP_AGENT_SET 116u
 /* agent.add(object: object, tag: uvarint, element: bytes) -> {} */
-#define ONDB_OP_AGENT_ADD 147u
+#define ONDB_OP_AGENT_ADD 117u
 /* agent.remove(object: object, tag: uvarint, element: bytes) -> {} */
-#define ONDB_OP_AGENT_REMOVE 148u
+#define ONDB_OP_AGENT_REMOVE 118u
 /* runtime.attach(space: id) -> {} */
-#define ONDB_OP_RUNTIME_ATTACH 200u
+#define ONDB_OP_RUNTIME_ATTACH 119u
 /* runtime.detach(space: id) -> {} */
-#define ONDB_OP_RUNTIME_DETACH 201u
+#define ONDB_OP_RUNTIME_DETACH 120u
 /* runtime.stats() -> RuntimeStats */
-#define ONDB_OP_RUNTIME_STATS 202u
+#define ONDB_OP_RUNTIME_STATS 121u
 /* models(live: bool, refresh: bool) -> Models */
-#define ONDB_OP_MODELS 203u
+#define ONDB_OP_MODELS 122u
 /* agent.resolve(object: object, provider: str, model: str) -> AgentInfo */
-#define ONDB_OP_AGENT_RESOLVE 204u
-/* record(object: object, source: str, external_id: str, sequence: uvarint, role: enum{user,assistant,system,tool}, parent: rid, blocks: blocks, status: enum{open,done,interrupted,failed,cancelled}, input: uvarint, output: uvarint, cache_read: uvarint, cache_write: uvarint, provider: str, model: str, native: str) -> receipt:enum msg:rid */
-#define ONDB_OP_RECORD 205u
+#define ONDB_OP_AGENT_RESOLVE 123u
+/* record(object: object, source: str, external_id: str, sequence: uvarint, role: enum{user,assistant,system,tool}, parent: rid, blocks: [Block], status: enum{open,done,interrupted,failed,cancelled}, input: uvarint, output: uvarint, cache_read: uvarint, cache_write: uvarint, provider: str, model: str, native: str) -> receipt:enum msg:rid */
+#define ONDB_OP_RECORD 124u
 /* task.status(object: object) -> TaskStatus */
-#define ONDB_OP_TASK_STATUS 206u
+#define ONDB_OP_TASK_STATUS 125u
 /* task.children(object: object, limit: uvarint) -> children:[CatalogRow] */
-#define ONDB_OP_TASK_CHILDREN 207u
+#define ONDB_OP_TASK_CHILDREN 126u
 /* task.changes(object: object, caller: object, diff: bool, max_chars: uvarint) -> changes:[Change] diff:str */
-#define ONDB_OP_TASK_CHANGES 208u
+#define ONDB_OP_TASK_CHANGES 127u
 /* schedule.create(owner: object, id: str, prompt: str, cron: str, at: ivarint, tz: str, conversation: object, fresh: bool) -> {} */
-#define ONDB_OP_SCHEDULE_CREATE 210u
+#define ONDB_OP_SCHEDULE_CREATE 128u
 /* schedule.list(space: id) -> schedules:[Schedule] */
-#define ONDB_OP_SCHEDULE_LIST 211u
+#define ONDB_OP_SCHEDULE_LIST 129u
 /* schedule.remove(owner: object, id: str) -> found:bool */
-#define ONDB_OP_SCHEDULE_REMOVE 212u
+#define ONDB_OP_SCHEDULE_REMOVE 130u
 /* land(tree: object, from: str, into: str, dry: bool) -> landed:bool files:uvarint conflicts:strs */
-#define ONDB_OP_LAND 213u
+#define ONDB_OP_LAND 131u
 /* go_back(object: object, msg: rid) -> {} */
-#define ONDB_OP_GO_BACK 214u
+#define ONDB_OP_GO_BACK 132u
 /* revert(object: object, msg: rid) -> reverted:[str] */
-#define ONDB_OP_REVERT 215u
+#define ONDB_OP_REVERT 133u
 /* channel.deliver(space: id, channel: str, key: str, text: str, sender: str, title: str, agent: id, workspace: id) -> object:object */
-#define ONDB_OP_CHANNEL_DELIVER 216u
+#define ONDB_OP_CHANNEL_DELIVER 134u
 /* event.deliver(space: id, agent: id, name: str, payload: str) -> {} */
-#define ONDB_OP_EVENT_DELIVER 217u
+#define ONDB_OP_EVENT_DELIVER 135u
 /* trigger.watch(object: object) -> {} */
-#define ONDB_OP_TRIGGER_WATCH 218u
+#define ONDB_OP_TRIGGER_WATCH 136u
 /* agent.actor(agent: id) -> actor:id */
-#define ONDB_OP_AGENT_ACTOR 219u
+#define ONDB_OP_AGENT_ACTOR 137u
 /* wake(object: object) -> {} */
-#define ONDB_OP_WAKE 220u
+#define ONDB_OP_WAKE 138u
 /* placement(object: object) -> Placement */
-#define ONDB_OP_PLACEMENT 221u
+#define ONDB_OP_PLACEMENT 139u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

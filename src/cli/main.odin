@@ -25,7 +25,7 @@ Args :: struct {
 	json:  bool,
 }
 
-BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview"}
+BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview", "local", "everywhere", "no-full-index"}
 
 Command :: struct {
 	name:  string,
@@ -35,13 +35,22 @@ Command :: struct {
 }
 
 COMMANDS := []Command {
-	{"daemon", cmd_daemon, "daemon [stop] [--no-runner] [--capacity N] [--provider P] [--model M] [--join CODE]", "run the device daemon in the foreground (engine, runtime, local socket); --no-runner keeps this device from executing runs, so its messages wait for another runner"},
+	{"daemon", cmd_daemon, "daemon [stop] [--no-runner] [--no-full-index] [--storage auto|stored|until-run|device] [--capacity N] [--provider P] [--model M] [--pool-host]", "run the device daemon in the foreground (engine, runtime, local socket); --no-runner keeps this device from executing runs, so its messages wait for another runner; --no-full-index keeps it from indexing every conversation of its spaces and answering other devices' searches"},
 	{"relay", cmd_relay, "relay [--listen ADDR]... [--dir DIR] [--open] [--quota BYTES]", "run a relay on files/pack, serving TCP with kernel TLS and Unix sockets"},
-	{"runner", cmd_runner, "runner [--join CODE] [--capacity N]", "run a dedicated runner engine in the foreground"},
+	{"runner", cmd_runner, "runner [--pool-token TOKEN] [--capacity N]", "run a dedicated runner engine in the foreground; with a launch token from a pool host (ONDB_POOL_HOST_SOCK) it enrolls through the pool"},
 	{"record", cmd_record, "record [CONVO] --source S --id EXTERNAL_ID [--seq N] [--role R] [--status S] [--model M] [TEXT|--stdin]", "record a message from an external harness (idempotent)"},
 	{"mcp", cmd_mcp, "mcp [CONVO]", "serve the 0ndb orchestration catalog over stdio MCP"},
-	{"pair", cmd_pair, "pair [--relay ADDR --relay-key HEX] [--name NAME]", "print a pairing code for the default space (creating it if needed)"},
-	{"join", cmd_join, "join CODE [--name NAME]", "join a space from a pairing code"},
+	{"login", cmd_login, "login [--subject ID] [--relay ADDR --relay-key HEX] [--cross-device] [--recovery KEY] [--wait SECONDS]", "sign this device in (optional: without it 0ndb runs local-only, every feature that needs no other device works): a passkey on this device, else approval from a signed-in device (0ndb approve), else a passkey from another device; enrolls the device into every account space and brings existing local spaces into the account with their history"},
+	{"logout", cmd_logout, "logout [--keep-relay]", "sign this device out; every space stays complete on this device and keeps working local-only"},
+	{"approve", cmd_approve, "approve [CODE] [--deny]", "list devices waiting to sign in, or approve one by its code"},
+	{"devices", cmd_devices, "devices [remove DEVICE | forget-passkey CREDENTIAL]", "list this account's devices, runners and passkeys; remove a device (every space starts a new key epoch without it)"},
+	{"members", cmd_members, "members [--space S]", "list a space's members, how each enrolled, and the current key epoch"},
+	{"remove", cmd_remove, "remove DEVICE [--space S]", "remove a device from every space (or one space) and start a new key epoch"},
+	{"rotate", cmd_rotate, "rotate [--space S]", "start a new key epoch now (after a suspected compromise)"},
+	{"recovery-key", cmd_recovery_key, "recovery-key", "create the account recovery key (settings; login --recovery uses it with no other device online)"},
+	{"pool", cmd_pool, "pool token | on | off [--space S]", "print a runner launch token (pool host), or include or remove cloud runners for a space"},
+	{"pair", cmd_pair, "pair DEVICE-CODE [--space S] [--relay ADDR --relay-key HEX]", "fallback: add a device by the code its 0ndb join prints, and print a join ticket for it"},
+	{"join", cmd_join, "join [TICKET] [--name NAME]", "fallback: print this device's code, or join a space from a ticket printed by 0ndb pair"},
 	{"status", cmd_status, "status", "show the daemon, device, spaces and mounts"},
 	{"ls", cmd_ls, "ls [--all] [--archived] [--kind K] [--limit N]", "list objects in the default space"},
 	{"new", cmd_new, "new [TITLE] [--agent A] [--workspace W] [--parent P] [--provider P] [--model M] [-m TEXT]", "create a conversation and make it current"},
@@ -53,7 +62,7 @@ COMMANDS := []Command {
 	{"back", cmd_back, "back [CONVO] MSG", "go back to a message (restores mounted files)"},
 	{"log", cmd_log, "log [CONVO] [-n N] [--follow] [--around MSG [--leaf MSG]] [--older CURSOR | --newer CURSOR]", "print a conversation, a window around a message, or one page from a cursor"},
 	{"show", cmd_show, "show OBJECT|MSG [CONVO]", "show an object or a message"},
-	{"search", cmd_search, "search QUERY [--limit N] [--semantic] [--newest]", "search everything indexed on this device"},
+	{"search", cmd_search, "search QUERY [--limit N] [--semantic] [--newest] [--local | --everywhere]", "search this device's index and, by default when another device keeps a full index of the space, that index too; hits from other devices are fetched and verified locally"},
 	{"interrupt", cmd_interrupt, "interrupt [CONVO]", "interrupt the running turn"},
 	{"models", cmd_models, "models [--refresh]", "list harness providers with their live model lists, and native models"},
 	{"agent", cmd_agent, "agent new NAME [--driver D] [--provider P] [--model M] [--instructions TEXT] | ls | show AGENT", "manage agents"},

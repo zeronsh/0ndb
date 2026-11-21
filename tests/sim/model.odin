@@ -6,7 +6,6 @@ import "../../src/convo"
 import eng "../../src/engine"
 import "../../src/obj"
 import "../../src/prim"
-import osync "../../src/sync"
 
 Op_Status :: enum u8 {
 	Issued,
@@ -60,12 +59,13 @@ Op_Kind :: enum u8 {
 	Disk_Agent,
 	Disk_Person,
 	Git_Mount,
+	Search_Peer,
+	Promote,
 	Read_Live,
 }
 
 M_Space :: struct {
 	id:      prim.Id,
-	secret:  osync.Secret,
 	members: [dynamic]int,
 	guests:  [dynamic]int,
 }

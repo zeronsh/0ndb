@@ -13,7 +13,7 @@ ROOT_PENDING :: 2
 @(private)
 ROOT_CARDS :: 3
 @(private)
-SPACE_VERSION :: 1
+SPACE_VERSION :: 2
 @(private)
 CARD_STREAM :: "card"
 
@@ -26,6 +26,8 @@ Space_Info :: struct {
 	open:         bool,
 	connected:    bool,
 	catalog:      prim.Id,
+	relay_usage:  i64,
+	relay_quota:  i64,
 }
 
 Space :: struct {
@@ -36,8 +38,9 @@ Space :: struct {
 	relay:        string,
 	relay_public: osync.Public_Key,
 	mode:         osync.Encryption_Mode,
-	wrapped:      [osync.WRAP_LEN]u8,
 	keys:         osync.Space,
+	mem:          Space_Members,
+	grant_epochs: map[prim.Id][dynamic]Space_Epoch,
 	scope:        osync.Scope,
 	open:         bool,
 	repl:         osync.Replicator,
@@ -73,51 +76,77 @@ Held :: struct {
 
 space_create :: proc(e: ^Engine, name: string, relay := "", relay_public: osync.Public_Key = {}, mode := osync.Encryption_Mode.End_To_End) -> (id: prim.Id, err: Error) {
 	context = context_for(e)
-	s, serr := osync.space_new(e.cfg.random)
-	if serr != .None {
-		return {}, _serr(serr)
+	relay, relay_public := relay, relay_public
+	if len(relay) == 0 && e.account.have {
+		relay = e.account.relay
+		relay_public = e.account.relay_public
 	}
-	defer osync.space_clear(&s)
-	return _space_add(e, s.secret, name, relay, relay_public, mode)
-}
-
-space_join :: proc(e: ^Engine, secret: osync.Secret, name := "", relay := "", relay_public: osync.Public_Key = {}, mode := osync.Encryption_Mode.End_To_End) -> (id: prim.Id, err: Error) {
-	context = context_for(e)
-	return _space_add(e, secret, name, relay, relay_public, mode)
-}
-
-space_join_pairing :: proc(e: ^Engine, code: string, name := "") -> (id: prim.Id, err: Error) {
-	context = context_for(e)
-	p, perr := osync.pairing_decode(code)
-	if perr != .None {
-		return {}, _serr(perr)
+	now := _now_ms(e)
+	m: osync.Membership
+	signer := osync.keyring_member_signer(&e.keyring)
+	self := osync.Add_Body{box = e.identity.box, kind = .Device, person = e.account.sign, history = true}
+	_, sid, gerr := osync.genesis_create(&m, signer, self, now, e.cfg.random, context.temp_allocator)
+	if gerr != .None {
+		return {}, _serr(gerr)
 	}
-	defer crypto.zero_explicit(&p.secret, size_of(p.secret))
-	return _space_add(e, p.secret, name, osync.pairing_addr(&p), p.relay_public, .End_To_End)
+	defer osync.membership_destroy(&m)
+	zero: osync.Public_Key
+	if e.account.sign != zero {
+		b := osync.Add_Body{sign = e.account.sign, box = e.account.box, kind = .Account, role = .Owner, method = .Account, person = e.account.sign, history = true}
+		if _, aerr := osync.membership_add(&m, signer, b, now); aerr != .None {
+			return {}, _serr(aerr)
+		}
+		if e.account.pool != .Off && e.account.pool_sign != zero {
+			pb := osync.Add_Body{sign = e.account.pool_sign, box = e.account.pool_box, kind = .Pool, role = .Member, method = .Pool, person = e.account.sign, history = true}
+			if _, perr := osync.membership_add(&m, signer, pb, now); perr != .None {
+				return {}, _serr(perr)
+			}
+		}
+	}
+	if _, cerr := osync.membership_commit(&m, signer, e.identity, now, now, true, e.cfg.random); cerr != .None {
+		return {}, _serr(cerr)
+	}
+	if existing, ok := e.spaces[osync.Space_Id(sid)]; ok {
+		return existing.id, .Exists
+	}
+	sp := _space_register(e, prim.Id(sid), name, relay, relay_public, mode, false) or_return
+	raws := make([][]u8, len(m.raws), context.temp_allocator)
+	copy(raws, m.raws[:])
+	_members_emit(e, sp, &m, raws) or_return
+	_members_secrets_store(e, sp, &m) or_return
+	_proof_stage(e, sp, m.raws[0])
+	_account_manifest_add(e, sp)
+	_pool_notify(e, sp)
+	_emit(e, Event{kind = .Space_Joined, space = sp.id})
+	return sp.id, .None
 }
 
-space_pairing :: proc(e: ^Engine, id: prim.Id, allocator := context.allocator) -> (code: string, err: Error) {
+space_join_enrollment :: proc(e: ^Engine, space: prim.Id, proof: []u8, name := "", relay := "", relay_public: osync.Public_Key = {}, mode := osync.Encryption_Mode.End_To_End) -> (id: prim.Id, err: Error) {
+	context = context_for(e)
+	sp, ok := e.spaces[space]
+	if !ok {
+		sp = _space_register(e, space, name, relay, relay_public, mode, false) or_return
+		_emit(e, Event{kind = .Space_Joined, space = sp.id})
+	}
+	if len(proof) > 0 {
+		_members_log_append(e, sp, proof) or_return
+		_members_stream_append(e, sp, [][]u8{proof}) or_return
+		_proof_stage(e, sp, proof)
+		if sp.open {
+			_members_proof(e, sp, proof)
+			_members_ingest(e, sp, [][]u8{proof})
+		}
+	}
+	return sp.id, .None
+}
+
+space_secret_naming :: proc(e: ^Engine, id: prim.Id) -> (naming: [32]u8, err: Error) {
 	context = context_for(e)
 	sp := _space_open(e, id) or_return
-	if sp.keyless {
-		return "", .Permission
+	if !sp.mem.have_naming {
+		return naming, .Permission
 	}
-	p, perr := osync.pairing_make(&sp.keys, sp.relay, sp.relay_public)
-	if perr != .None {
-		return "", _serr(perr)
-	}
-	defer crypto.zero_explicit(&p.secret, size_of(p.secret))
-	c, cerr := osync.pairing_encode(&p, allocator)
-	return c, _serr(cerr)
-}
-
-space_secret :: proc(e: ^Engine, id: prim.Id) -> (secret: osync.Secret, err: Error) {
-	context = context_for(e)
-	sp := _space_open(e, id) or_return
-	if sp.keyless {
-		return {}, .Permission
-	}
-	return sp.keys.secret, .None
+	return sp.mem.naming, .None
 }
 
 space_open :: proc(e: ^Engine, id: prim.Id) -> Error {
@@ -181,7 +210,12 @@ space_catalog :: proc(e: ^Engine, id: prim.Id) -> Object {
 
 @(private)
 _space_info :: proc(sp: ^Space) -> Space_Info {
-	return Space_Info{id = sp.id, name = sp.name, relay = sp.relay, relay_public = sp.relay_public, mode = sp.mode, open = sp.open, connected = sp.connected, catalog = sp.catalog}
+	info := Space_Info{id = sp.id, name = sp.name, relay = sp.relay, relay_public = sp.relay_public, mode = sp.mode, open = sp.open, connected = sp.connected, catalog = sp.catalog}
+	if sp.repl_on {
+		info.relay_usage = sp.repl.usage
+		info.relay_quota = sp.repl.quota
+	}
+	return info
 }
 
 @(private)
@@ -197,38 +231,60 @@ _catalog_id :: proc(space: prim.Id) -> (id: prim.Id) {
 }
 
 @(private)
-_space_add :: proc(e: ^Engine, secret: osync.Secret, name: string, relay: string, relay_public: osync.Public_Key, mode: osync.Encryption_Mode) -> (id: prim.Id, err: Error) {
-	s, serr := osync.space_from_secret(secret)
-	if serr != .None {
-		return {}, _serr(serr)
-	}
-	defer osync.space_clear(&s)
-	if existing, ok := e.spaces[s.id]; ok {
-		return existing.id, .Exists
-	}
-	sp := new(Space, e.allocator)
+_space_register :: proc(e: ^Engine, id: prim.Id, name: string, relay: string, relay_public: osync.Public_Key, mode: osync.Encryption_Mode, keyless: bool) -> (sp: ^Space, err: Error) {
+	sp = new(Space, e.allocator)
 	sp.e = e
-	sp.id = s.id
+	sp.id = id
 	sp.mode = mode
-	sp.catalog = _catalog_id(s.id)
+	sp.keyless = keyless
+	sp.catalog = _catalog_id(id)
 	sp.name = _clone(name, e.allocator) or_return
 	sp.relay = _clone(relay, e.allocator) or_return
 	sp.relay_public = relay_public
-	ck := osync.Content_Key{key = s.secret}
-	if werr := e.keyring.wrap(e.keyring.data, &e.identity, &ck, &sp.wrapped); werr != .None {
-		crypto.zero_explicit(&ck, size_of(ck))
-		_space_free(e, sp)
-		return {}, _serr(werr)
-	}
-	crypto.zero_explicit(&ck, size_of(ck))
 	e.spaces[sp.id] = sp
 	if err = _space_store(e, sp); err != .None {
 		delete_key(&e.spaces, sp.id)
 		_space_free(e, sp)
-		return {}, err
+		return nil, err
 	}
-	_emit(e, Event{kind = .Space_Joined, space = sp.id})
-	return sp.id, .None
+	return sp, .None
+}
+
+@(private)
+_proof_stage :: proc(e: ^Engine, sp: ^Space, proof: []u8) {
+	path, perr := _members_file(e, sp.id, "proofs")
+	if perr != .None {
+		return
+	}
+	old, _ := prim.read_file(e.vfs, path, context.temp_allocator)
+	buf := make([dynamic]u8, context.temp_allocator)
+	append(&buf, ..old)
+	hdr: [4]u8
+	prim.put_u32le(hdr[:], u32(len(proof)))
+	append(&buf, ..hdr[:])
+	append(&buf, ..proof)
+	prim.replace_atomic(e.vfs, path, buf[:])
+}
+
+@(private)
+_proofs_load :: proc(e: ^Engine, sp: ^Space) {
+	path, perr := _members_file(e, sp.id, "proofs")
+	if perr != .None {
+		return
+	}
+	data, err := prim.read_file(e.vfs, path, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	pos := 0
+	for pos + 4 <= len(data) {
+		n := int(prim.get_u32le(data[pos:]))
+		if pos + 4 + n > len(data) {
+			break
+		}
+		_members_proof(e, sp, data[pos + 4:][:n])
+		pos += 4 + n
+	}
 }
 
 @(private)
@@ -237,7 +293,6 @@ _space_store :: proc(e: ^Engine, sp: ^Space) -> Error {
 	w := prim.writer(&buf)
 	prim.write_u8(&w, SPACE_VERSION)
 	prim.write_bool(&w, sp.keyless)
-	prim.write_raw(&w, sp.wrapped[:])
 	prim.write_u8(&w, u8(sp.mode))
 	prim.write_str(&w, sp.name)
 	prim.write_str(&w, sp.relay)
@@ -271,7 +326,6 @@ _spaces_load :: proc(e: ^Engine) -> Error {
 		sp.e = a.e
 		copy(sp.id[:], key)
 		sp.keyless = prim.read_bool(&r)
-		prim.read_fixed(&r, sp.wrapped[:])
 		m := prim.read_u8(&r)
 		name := prim.read_str(&r)
 		relay := prim.read_str(&r)
@@ -303,25 +357,15 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	if sp.open {
 		return sp, .None
 	}
-	if !sp.keyless {
-		ck: osync.Content_Key
-		if uerr := e.keyring.unwrap(e.keyring.data, sp.wrapped[:], &ck); uerr != .None {
-			return nil, _serr(uerr)
-		}
-		s, serr := osync.space_from_secret(ck.key)
-		crypto.zero_explicit(&ck, size_of(ck))
-		if serr != .None {
-			return nil, _serr(serr)
-		}
-		if s.id != sp.id {
-			osync.space_clear(&s)
-			return nil, .Corrupt
-		}
-		sp.keys = s
-		sp.scope = osync.space_scope(&sp.keys, sp.mode)
-	} else if e.cfg.credentials.produce == nil {
+	if sp.keyless && e.cfg.credentials.produce == nil {
 		return nil, .Permission
 	}
+	_members_init(e, sp)
+	_proofs_load(e, sp)
+	if !sp.keyless {
+		_members_restore(e, sp)
+	}
+	sp.grant_epochs = make(map[prim.Id][dynamic]Space_Epoch, e.allocator)
 	sp.grants = make(map[prim.Id]osync.Content_Key, e.allocator)
 	sp.grant_access = make(map[prim.Id]Access_Set, e.allocator)
 	_grants_load(e, sp)
@@ -392,6 +436,14 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 	}
 	delete(sp.grants)
 	delete(sp.grant_access)
+	for _, g in sp.grant_epochs {
+		for &x in g {
+			crypto.zero_explicit(&x.secret, size_of(x.secret))
+		}
+		delete(g)
+	}
+	delete(sp.grant_epochs)
+	_members_free(e, sp)
 	osync.space_clear(&sp.keys)
 	osync.scope_clear(&sp.scope)
 	sp.open = false

@@ -14,7 +14,8 @@ import osync "../sync"
 Relay_Main :: struct {
 	loop:     prim.Loop,
 	relay:    osync.Relay,
-	sa:       osync.Space_Authorizer,
+	al:       osync.Allow,
+	ma:       osync.Member_Authorizer,
 	ca:       eng.Cap_Authorizer,
 	sig:      Signals,
 	stopping: bool,
@@ -82,22 +83,29 @@ cmd_relay :: proc(a: ^Args) -> int {
 		return report_error(.Io, "cannot create %s", dir)
 	}
 	allow, _ := prim.path_join(context.temp_allocator, dir, "allow")
-	if err := osync.space_authorizer_init(&m.sa, prim.os_vfs(), allow, flag_bool(a, "open"), quota); err != .None {
-		return report_error(.Io, "cannot read %s", allow)
+	osync.allow_init(&m.al, prim.os_vfs(), strings.clone(allow))
+	mdir, _ := prim.path_join(context.temp_allocator, dir, "members")
+	if err := osync.member_authorizer_init(&m.ma, prim.os_vfs(), mdir, {}, flag_bool(a, "open"), quota, {}, &m.al); err != .None {
+		return report_error(.Io, "cannot open %s", mdir)
 	}
-	eng.cap_authorizer_init(&m.ca, osync.space_authorizer(&m.sa), quota)
+	eng.cap_authorizer_init(&m.ca, osync.member_authorizer(&m.ma), quota)
+	m.ca.issuer_data = &m.ma
+	m.ca.issuer_ok = proc(data: rawptr, space: prim.Id, issuer: osync.Public_Key) -> bool {
+		return osync.member_authorizer_active((^osync.Member_Authorizer)(data), osync.Space_Id(space), issuer)
+	}
 	cfg := osync.relay_config(dir)
 	cfg.pack = true
 	cfg.kernel_tls = ODIN_OS == .Linux
 	cfg.open = flag_bool(a, "open")
 	cfg.default_quota = quota
 	cfg.authorizer = eng.cap_authorizer(&m.ca)
-	if err := osync.relay_init(&m.relay, &m.loop, cfg); err != .None {
-		if err == .Busy {
+	if ierr := osync.relay_init(&m.relay, &m.loop, cfg); ierr != .None {
+		if ierr == .Busy {
 			return report_error(.Busy, "another relay is running in %s", dir)
 		}
-		return report_error(.Io, "cannot open the relay in %s (%v)", dir, err)
+		return report_error(.Io, "cannot open the relay in %s (%v)", dir, ierr)
 	}
+	osync.member_authorizer_set_storage(&m.ma, osync.relay_storage(&m.relay))
 	listens := strings.split(flag_string(a, "listen", "127.0.0.1:7420"), ",", context.temp_allocator)
 	sock, _ := prim.path_join(context.temp_allocator, dir, "relay.sock")
 	all := make([dynamic]string, context.temp_allocator)
@@ -149,7 +157,8 @@ cmd_relay :: proc(a: ^Args) -> int {
 	st := osync.relay_stats(&m.relay)
 	osync.relay_destroy(&m.relay)
 	eng.cap_authorizer_destroy(&m.ca)
-	osync.space_authorizer_destroy(&m.sa)
+	osync.member_authorizer_destroy(&m.ma)
+	osync.allow_destroy(&m.al)
 	signals_close(&m.sig)
 	prim.loop_destroy(&m.loop)
 	fmt.printfln("relay stopped (%d appends, %s in, %s out)", st.appends, bytes_human(i64(st.bytes_in)), bytes_human(i64(st.bytes_out)))

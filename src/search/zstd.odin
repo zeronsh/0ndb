@@ -126,26 +126,35 @@ _zstd_dict :: proc(ix: ^Index, gen: u64) -> (sl: ^Zd_Slot, err: Error) {
 	return v, .None
 }
 
+ZD_GROWTH :: 4
+ZD_WINDOW :: 1 << 20
+
 zstd_train :: proc(ix: ^Index) -> Error {
-	if !ix.man.store || ix.man.zd_gen != 0 {
+	if !ix.man.store {
+		return .None
+	}
+	z := &ix.zd
+	if ix.man.zd_gen != 0 {
+		if z.degraded || (z.trained > 0 && z.trained < DICT_SAMPLE_MAX && z.eligible >= ZD_GROWTH * z.trained) {
+			z.degraded = false
+			_, err := _zd_rebuild(ix)
+			return err
+		}
+		return .None
+	}
+	if z.eligible < max(u64(ix.opts.dict_sample_min), z.retry) {
 		return .None
 	}
 	m := &ix.mem
 	total := 0
 	for d in m.docs {
-		if d.flags & DF_TEXT != 0 && d.flags & (DF_DELETED | DF_UNSTABLE) == 0 {
+		if d.flags & DF_TEXT != 0 && d.flags & (DF_DELETED | DF_UNSTABLE) == 0 && d.len >= 8 {
 			total += min(int(d.len), DICT_SAMPLE_PIECE)
 		}
 	}
 	if total < ix.opts.dict_sample_min {
-		stored := u64(total)
-		for s in ix.segs {
-			stored += s.f.total_len
-		}
-		if stored >= u64(ix.opts.dict_sample_min) {
-			return zd_retrain(ix)
-		}
-		return .None
+		_, err := _zd_rebuild(ix)
+		return err
 	}
 	zs := zd_samples_init(context.temp_allocator)
 	for d, i in m.docs {
@@ -158,7 +167,68 @@ zstd_train :: proc(ix: ^Index) -> Error {
 		at := int(m.frames[d.frame]) + int(d.frame_off)
 		zd_sample_add(&zs, u32(m.base) + u32(i), m.raw[at:][:d.len])
 	}
-	return zd_install(ix, &zs)
+	return _zd_settle(ix, &zs, true)
+}
+
+@(private)
+_zd_settle :: proc(ix: ^Index, zs: ^Zd_Samples, complete: bool) -> Error {
+	got := u64(len(zs.bytes))
+	zd_install(ix, zs) or_return
+	z := &ix.zd
+	if ix.man.zd_gen == 0 {
+		if complete {
+			z.eligible = got
+		}
+		z.retry = max(u64(ix.opts.dict_sample_min), ZD_GROWTH * max(got, 1))
+		z.trained = 0
+	} else {
+		z.retry = 0
+		z.trained = max(got, 1)
+	}
+	z.raw, z.comp, z.base_raw, z.base_comp = 0, 0, 0, 0
+	return .None
+}
+
+@(private)
+_zd_ratio :: proc(ix: ^Index, raw, comp: int) {
+	z := &ix.zd
+	if z.base_raw < ZD_WINDOW {
+		z.base_raw += u64(raw)
+		z.base_comp += u64(comp)
+		return
+	}
+	z.raw += u64(raw)
+	z.comp += u64(comp)
+	if z.raw < ZD_WINDOW {
+		return
+	}
+	if z.comp * 4 * z.base_raw > z.base_comp * 5 * z.raw {
+		z.degraded = true
+	}
+	z.raw, z.comp = 0, 0
+}
+
+@(private)
+_zd_stale :: proc(ix: ^Index, gen: u64) -> bool {
+	if gen == 0 || !ix.man.store {
+		return false
+	}
+	for g in ix.zd.stale {
+		if g == gen {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_zd_retire :: proc(ix: ^Index, gen: u64) {
+	if gen != 0 && !_zd_stale(ix, gen) {
+		if ix.zd.stale == nil {
+			ix.zd.stale = make([dynamic]u64, ix.allocator)
+		}
+		append(&ix.zd.stale, gen)
+	}
 }
 
 Zd_Samples :: struct {
@@ -245,6 +315,9 @@ frame_write :: proc(ix: ^Index, w: ^prim.Writer, raw: []u8, scratch: ^[dynamic]u
 	if sl != nil {
 		mode = FRAME_DICT
 		got = zstd.ZSTD_compress_usingCDict(z.cctx, raw_data(scratch[:]), c.size_t(bound), raw_data(raw), c.size_t(len(raw)), sl.cdict)
+		if zstd.ZSTD_isError(got) == 0 {
+			_zd_ratio(ix, len(raw), int(got))
+		}
 	} else {
 		got = zstd.ZSTD_compressCCtx(z.cctx, raw_data(scratch[:]), c.size_t(bound), raw_data(raw), c.size_t(len(raw)), ZSTD_LEVEL)
 	}

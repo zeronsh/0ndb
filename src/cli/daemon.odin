@@ -57,6 +57,7 @@ Daemon :: struct {
 	started:    i64,
 	stopping:   bool,
 	runner:     bool,
+	acct:       ^Acct,
 }
 
 Pending :: struct {
@@ -94,6 +95,7 @@ HOST_OPS := []api.Op {
 	{1005, "mount.remove", {{"root", .Str, nil}}, "", op_mount_remove},
 	{1006, "credentials.add", {{"space", .Id, nil}, {"token", .Bytes, nil}}, "", op_credentials_add},
 	{1007, "verify", {{"root", .Str, nil}}, "files:uvarint mismatches:[str]", op_verify},
+	{1008, "pool.token", {}, "token:str", op_pool_token},
 }
 
 daemon_main :: proc(args: ^Args) -> int {
@@ -118,7 +120,11 @@ daemon_main :: proc(args: ^Args) -> int {
 	ec := eng.default_config(d.engine_dir)
 	ec.credentials = eng.Credentials_Source{data = d, produce = _cred_produce}
 	ec.idle_pageout = true
+	ec.search_full = !flag_bool(args, "no-full-index")
 	ec.events = eng.Event_Hook{data = d, event = _on_event}
+	if !acct_setup(d, &ec, args) {
+		return report_error(.Io, "cannot open the account store")
+	}
 	opts := api.Stack_Options {
 		runtime = true,
 		observe = true,
@@ -127,6 +133,21 @@ daemon_main :: proc(args: ^Args) -> int {
 	}
 	opts.placement = api.Placement_Hook{data = d, call = _on_placement}
 	opts.rt_cfg.runner = d.runner
+	opts.rt_cfg.pool = flag_bool(args, "pool")
+	if v, ok := flag_value(args, "storage"); ok {
+		switch v {
+		case "auto":
+			ec.storage = .Auto
+		case "stored":
+			ec.storage = .Stored
+		case "until-run":
+			ec.storage = .Device_Until_Run
+		case "device":
+			ec.storage = .Device
+		case:
+			return usage_error("--storage takes auto, stored, until-run or device")
+		}
+	}
 	if v, ok := flag_value(args, "capacity"); ok {
 		n, nok := strconv.parse_int(v)
 		if !nok || n <= 0 {
@@ -155,16 +176,7 @@ daemon_main :: proc(args: ^Args) -> int {
 			fmt.eprintfln("0ndb: cannot remount %s: %s", m.root, api.STATUS_NAMES[int(st)])
 		}
 	}
-	if code, ok := flag_value(args, "join"); ok {
-		_, err := eng.space_join_pairing(&d.s.e, code)
-		if err != .None && err != .Exists {
-			api.stack_close(&d.s)
-			return report_error(api.status_of(err), "cannot join with that pairing code")
-		}
-		for sp in eng.space_list(&d.s.e, context.temp_allocator) {
-			rt.attach(&d.s.r, sp.id)
-		}
-	}
+	acct_started(d, args)
 	if !_listen(d) {
 		api.stack_close(&d.s)
 		return report_error(.Io, "cannot listen on %s", d.sock)
@@ -465,6 +477,28 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		}
 	case .Quarantined, .Refused, .Fatal, .Failure:
 		fmt.eprintfln("0ndb daemon: %s space %s object %s (%s)", api.EVENT_NAMES[int(ev.kind)], hex(ev.space), hex(ev.object), api.STATUS_NAMES[int(api.status_of(ev.err))])
+	case .Unavailable:
+		fmt.eprintfln("0ndb daemon: %s available when %s is online", hex(ev.object), hex(ev.device))
+	case .Available:
+		fmt.eprintfln("0ndb daemon: %s available", hex(ev.object))
+	case .Access_Revoked:
+		fmt.eprintfln("0ndb daemon: access to space %s was revoked: this device was removed", hex(ev.space))
+	case .Epoch_Changed:
+		fmt.eprintfln("0ndb daemon: space %s key epoch %d", hex(ev.space), ev.length)
+	case .Runner_Enrolled:
+		fmt.eprintfln("0ndb daemon: runner %s enrolled in space %s through the pool", hex(ev.device), hex(ev.space))
+	case .Runner_Anomaly:
+		fmt.eprintfln("0ndb daemon: %d runner enrollments in the last minute in space %s", ev.length, hex(ev.space))
+	case .Approval_Requested:
+		fmt.eprintfln("0ndb daemon: device %s asks to sign in (0ndb approve %s)", hex(ev.device), ev.detail)
+	case .Login_Done:
+		fmt.eprintfln("0ndb daemon: signed in")
+	case .Login_Failed:
+		fmt.eprintfln("0ndb daemon: sign-in did not complete: %s", ev.detail)
+	case .Promoted:
+		fmt.eprintfln("0ndb daemon: %s promoted segment of %s (%d bytes uploaded)", hex(ev.object), hex(ev.device), ev.length)
+	case .Peer_Misbehaving:
+		fmt.eprintfln("0ndb daemon: device %s served bytes of %s that failed verification", hex(ev.device), hex(ev.object))
 	}
 	if len(d.conns) == 0 {
 		return

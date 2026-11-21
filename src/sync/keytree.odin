@@ -40,8 +40,14 @@ Tree_Node :: struct {
 	seed:  [32]u8,
 }
 
+EPOCH_TAG_LEN :: 12
+KEYS_SEALED :: 4
+
+Epoch_Tag :: [EPOCH_TAG_LEN]u8
+
 Key_Tree :: struct {
 	version:   u64,
+	epoch:     Epoch_Tag,
 	depth:     u8,
 	shift:     u8,
 	nodes:     [dynamic]Tree_Node,
@@ -235,7 +241,8 @@ keytree_apply :: proc(t: ^Key_Tree, other: ^Key_Tree) -> Error {
 
 keytree_encode :: proc(t: ^Key_Tree, out: ^[dynamic]u8) -> Error {
 	w := prim.writer(out)
-	prim.write_u8(&w, 2)
+	prim.write_u8(&w, 3)
+	prim.write_raw(&w, t.epoch[:])
 	prim.write_u8(&w, t.depth)
 	prim.write_u8(&w, t.shift)
 	prim.write_uvarint(&w, t.version)
@@ -251,9 +258,11 @@ keytree_encode :: proc(t: ^Key_Tree, out: ^[dynamic]u8) -> Error {
 
 keytree_decode :: proc(t: ^Key_Tree, data: []u8, allocator := context.allocator) -> Error {
 	r := prim.reader(data)
-	if prim.read_u8(&r) != 2 {
+	if prim.read_u8(&r) != 3 {
 		return .Corrupt
 	}
+	tag: Epoch_Tag
+	prim.read_fixed(&r, tag[:])
 	depth := prim.read_u8(&r)
 	shift := prim.read_u8(&r)
 	version := prim.read_uvarint(&r)
@@ -264,6 +273,7 @@ keytree_decode :: proc(t: ^Key_Tree, data: []u8, allocator := context.allocator)
 	t^ = {
 		allocator = allocator,
 		version   = version,
+		epoch     = tag,
 		depth     = depth,
 		shift     = shift,
 	}
@@ -289,6 +299,128 @@ keytree_decode :: proc(t: ^Key_Tree, data: []u8, allocator := context.allocator)
 		return .Corrupt
 	}
 	return .None
+}
+
+keytree_reseed :: proc(t: ^Key_Tree, from: i64, epoch: Epoch_Tag, random := prim.Random{}) -> Error {
+	if from < 0 {
+		return .Invalid
+	}
+	lo := u64(from) >> t.shift
+	limit := _cell_limit(t)
+	if t.epoch == epoch {
+		return .None
+	}
+	if t.depth < 64 && lo >= limit {
+		t.epoch = epoch
+		t.version += 1
+		return .None
+	}
+	last := limit - 1 if t.depth < 64 else max(u64)
+	keytree_puncture_cells(t, lo, last) or_return
+	pos := lo
+	for {
+		level := u8(0)
+		for l := u8(0); l <= t.depth; l += 1 {
+			bits := u64(t.depth) - u64(l)
+			size := u64(1) << bits if bits < 64 else 0
+			if bits >= 64 {
+				if pos == 0 {
+					level = l
+					break
+				}
+				continue
+			}
+			if pos & (size - 1) == 0 && (t.depth == 64 || pos + size <= limit) {
+				level = l
+				break
+			}
+		}
+		n := Tree_Node{start = pos, level = level}
+		prim.random_fill(random, n.seed[:])
+		if _, e := append(&t.nodes, n); e != nil {
+			crypto.zero_explicit(&n.seed, size_of(n.seed))
+			return .No_Memory
+		}
+		crypto.zero_explicit(&n.seed, size_of(n.seed))
+		next := _node_last(t, n) + 1
+		if next == 0 || (t.depth < 64 && next >= limit) {
+			break
+		}
+		pos = next
+	}
+	slice.sort_by(t.nodes[:], proc(a, b: Tree_Node) -> bool {
+		return a.start < b.start
+	})
+	t.version += 1
+	t.epoch = epoch
+	t.path_ok = false
+	crypto.zero_explicit(&t.path, size_of(t.path))
+	return .None
+}
+
+keys_record_seal :: proc(t: ^Key_Tree, key: ^[32]u8, stream: Stream_Id, out: ^[dynamic]u8) -> Error {
+	plain := make([dynamic]u8, context.temp_allocator)
+	defer crypto.zero_explicit(raw_data(plain), len(plain))
+	keytree_encode(t, &plain) or_return
+	append(out, KEYS_SEALED)
+	append(out, ..t.epoch[:])
+	k := _keys_record_key(key, stream, t.version)
+	defer crypto.zero_explicit(&k, size_of(k))
+	start := len(out)
+	resize(out, start + len(plain) + 16)
+	aead_seal(k[:], t.epoch[:], plain[:], out[start:])
+	return .None
+}
+
+keys_record_tag :: proc(body: []u8) -> (tag: Epoch_Tag, sealed: bool) {
+	if len(body) >= 1 + EPOCH_TAG_LEN + 16 && body[0] == KEYS_SEALED {
+		copy(tag[:], body[1:][:EPOCH_TAG_LEN])
+		return tag, true
+	}
+	return
+}
+
+keys_record_open :: proc(t: ^Key_Tree, body: []u8, key: ^[32]u8, stream: Stream_Id, version: u64, allocator := context.allocator) -> Error {
+	tag, sealed := keys_record_tag(body)
+	if !sealed {
+		return keys_record_decode(t, body, allocator)
+	}
+	ct := body[1 + EPOCH_TAG_LEN:]
+	plain := make([]u8, len(ct) - 16, context.temp_allocator)
+	defer crypto.zero_explicit(raw_data(plain), len(plain))
+	k := _keys_record_key(key, stream, version)
+	defer crypto.zero_explicit(&k, size_of(k))
+	if !aead_open(k[:], tag[:], ct, plain) {
+		return .Auth
+	}
+	keytree_decode(t, plain, allocator) or_return
+	if t.epoch != tag || t.version != version {
+		keytree_destroy(t)
+		return .Corrupt
+	}
+	return .None
+}
+
+@(private)
+_keys_record_key :: proc(key: ^[32]u8, stream: Stream_Id, version: u64) -> (k: [32]u8) {
+	ctx: [32 + 8]u8
+	s := stream
+	copy(ctx[:32], s[:])
+	prim.put_u64le(ctx[32:], version)
+	_derive(key[:], "0ndb keys record", ctx[:], k[:])
+	return
+}
+
+epoch_tag :: proc(number: u32, id: Record_Id) -> (t: Epoch_Tag) {
+	prim.put_u32le(t[:4], number)
+	x := id
+	copy(t[4:], x[:8])
+	return
+}
+
+epoch_tag_number :: proc(t: Epoch_Tag) -> u32 {
+	x := t
+	return prim.get_u32le(x[:4])
 }
 
 keytree_seal_range :: proc(t: ^Key_Tree, data: []u8, off: i64) -> Error {

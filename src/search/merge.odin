@@ -372,7 +372,7 @@ merge_pick :: proc(ix: ^Index, idle: bool) -> (from, to: int, ok: bool) {
 		if s.f.vec_m > 0 && s.f.cb_gen != ix.man.cb_gen && (ix.man.cb_gen == 0 || s.f.vec_n >= GRAPH_MIN) {
 			return i, i + 1, true
 		}
-		if ix.man.store && s.f.zd_gen != 0 && s.f.zd_gen != ix.man.zd_gen {
+		if _zd_stale(ix, s.f.zd_gen) {
 			return i, i + 1, true
 		}
 	}

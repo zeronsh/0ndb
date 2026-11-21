@@ -35,8 +35,19 @@ taint_refresh :: proc(ix: ^Index) -> Error {
 	ix.zd_tainted = false
 	ix.cb_tainted = false
 	buf: Name_Buf
-	if ix.man.zd_gen != 0 {
-		data, rerr := prim.read_file(ix.vfs, zd_path(ix, ix.man.zd_gen, &buf), context.temp_allocator)
+	gens := make([dynamic]u64, context.temp_allocator)
+	if ix.man.store {
+		if ix.man.zd_gen != 0 {
+			append(&gens, ix.man.zd_gen)
+		}
+		for s in ix.segs {
+			if s.f.zd_gen != 0 && !slice.contains(gens[:], s.f.zd_gen) {
+				append(&gens, s.f.zd_gen)
+			}
+		}
+	}
+	for g in gens {
+		data, rerr := prim.read_file(ix.vfs, zd_path(ix, g, &buf), context.temp_allocator)
 		if rerr != .None {
 			return _perr(rerr)
 		}
@@ -44,7 +55,13 @@ taint_refresh :: proc(ix: ^Index) -> Error {
 		if !ok {
 			return .Corrupt
 		}
-		ix.zd_tainted = _ids_hit(ids, dead)
+		if _ids_hit(ids, dead) {
+			if g == ix.man.zd_gen {
+				ix.zd_tainted = true
+			} else {
+				_zd_retire(ix, g)
+			}
+		}
 		slice.zero(data)
 	}
 	if ix.man.cb_gen != 0 {
@@ -65,6 +82,18 @@ taint_refresh :: proc(ix: ^Index) -> Error {
 }
 
 zd_retrain :: proc(ix: ^Index) -> Error {
+	old := ix.man.zd_gen
+	if _, err := _zd_rebuild(ix); err != .None {
+		return err
+	}
+	if ix.man.zd_gen != old {
+		_zd_retire(ix, old)
+	}
+	return .None
+}
+
+@(private)
+_zd_rebuild :: proc(ix: ^Index) -> (got: u64, err: Error) {
 	dead := _dead_sorted(ix, context.temp_allocator) or_return
 	zs := zd_samples_init(context.temp_allocator)
 	m := &ix.mem
@@ -107,7 +136,7 @@ zd_retrain :: proc(ix: ^Index) -> Error {
 					frame_at = dm.frame
 				}
 				if int(dm.frame_off) + int(dm.len) > len(frame) {
-					return .Corrupt
+					return 0, .Corrupt
 				}
 				zd_sample_add(&zs, dm.id, frame[dm.frame_off:][:dm.len])
 			}
@@ -117,7 +146,8 @@ zd_retrain :: proc(ix: ^Index) -> Error {
 		}
 		frame_at = -1
 	}
-	return zd_install(ix, &zs)
+	got = u64(len(zs.bytes))
+	return got, _zd_settle(ix, &zs, got < DICT_SAMPLE_MAX)
 }
 
 secure_remove :: proc(ix: ^Index, name: string) {
@@ -150,7 +180,7 @@ _stale_model :: proc(ix: ^Index) -> bool {
 		if s.f.vec_m > 0 && s.f.cb_gen != ix.man.cb_gen {
 			return true
 		}
-		if ix.man.store && s.f.zd_gen != 0 && s.f.zd_gen != ix.man.zd_gen {
+		if _zd_stale(ix, s.f.zd_gen) {
 			return true
 		}
 	}

@@ -126,6 +126,19 @@ Event_Kind :: enum u8 {
 	Relay_Misbehaving,
 	Presence,
 	Caught_Up,
+	Indexer_Wanted,
+	Members_Changed,
+	Epoch_Changed,
+	Access_Revoked,
+	Runner_Enrolled,
+	Runner_Anomaly,
+	Approval_Requested,
+	Login_Done,
+	Login_Failed,
+	Unavailable,
+	Available,
+	Promoted,
+	Peer_Misbehaving,
 }
 
 Event :: struct {
@@ -177,6 +190,20 @@ Config :: struct {
 	pack_options:    pack.Options,
 	use_pack_options: bool,
 	search_budget:   int,
+	search_full:     bool,
+	search_trees:    bool,
+	search_remote:   Search_Remote,
+	search_hedge_ms: i64,
+	search_deadline_ms: i64,
+	search_snapshot_min: int,
+	unlock:          osync.Unlock,
+	sealed_store:    osync.Sealed_Store,
+	runner_pool:     Runner_Pool,
+	runner_alarm:    int,
+	approver:        bool,
+	seed_guard:      osync.Seed_Guard,
+	storage:         Storage_Mode,
+	storage_policy:  Storage_Policy,
 	user:            rawptr,
 }
 
@@ -217,6 +244,7 @@ Stats :: struct {
 
 Engine :: struct {
 	cfg:          Config,
+	unavailable:  map[prim.Id][dynamic]prim.Id,
 	allocator:    runtime.Allocator,
 	dir:          string,
 	pack_root:    string,
@@ -240,6 +268,8 @@ Engine :: struct {
 	owns_keyring: bool,
 	keyring:      osync.Keyring,
 	identity:     osync.Identity,
+	account:      Account_State,
+	approvals:    Approvals,
 	self:         prim.Id,
 	hlc:          prim.Hlc,
 	reg:          Registry,
@@ -262,6 +292,7 @@ Engine :: struct {
 	durable_tick: u64,
 	changed:      map[prim.Id]Change,
 	catalog_q:    map[prim.Id]^Catalog_Update,
+	remote:       Remote_State,
 	index:        search.Index,
 	index_open:   bool,
 	index_dirty:  [dynamic]Index_Item,
@@ -310,6 +341,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.dir = _clone(cfg.dir, e.allocator) or_return
 	e.pack_root = _join(e.allocator, e.dir, "pack") or_return
 	e.spaces = make(map[prim.Id]^Space, e.allocator)
+	e.unavailable = make(map[prim.Id][dynamic]prim.Id, e.allocator)
 	e.links = make([dynamic]^Space, e.allocator)
 	e.handles = make(map[prim.Id]^Handle, e.allocator)
 	e.lru = make([dynamic]^Handle, e.allocator)
@@ -371,7 +403,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	} else {
 		kdir := _join(context.temp_allocator, e.dir, "device") or_return
 		_perr(prim.mkdir_all(e.base, kdir, 0o700)) or_return
-		_serr(osync.file_keyring_open(&e.file_keyring, e.base, kdir, e.cfg.random)) or_return
+		_serr(osync.file_keyring_open_guarded(&e.file_keyring, e.base, kdir, e.cfg.seed_guard, e.cfg.random)) or_return
 		e.owns_keyring = true
 		e.keyring = osync.file_keyring(&e.file_keyring)
 	}
@@ -379,6 +411,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.self = e.identity.id
 	_registry_open(e) or_return
 	_spaces_load(e) or_return
+	_account_load(e)
 	_redact_recover(e)
 	return .None
 }
@@ -675,13 +708,16 @@ _tick_end :: proc(e: ^Engine) {
 	e.tick += 1
 	e.stats.ticks += 1
 	_repl_events_process(e)
+	_approvals_step(e)
 	_content_events_process(e)
 	_waiters_run(e)
+	_remote_step(e)
 	_catalog_flush(e)
 	_mounts_commit(e)
 	_handles_commit(e)
 	_mounts_changed(e)
 	_subs_deliver(e)
+	_full_step(e)
 	_index_step(e)
 	_handles_commit(e)
 	_index_durable_advanced(e)
@@ -699,7 +735,7 @@ _tick_end :: proc(e: ^Engine) {
 
 @(private)
 _tick_pending :: proc(e: ^Engine) -> bool {
-	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 {
+	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || _remote_pending(e) {
 		return true
 	}
 	for _, sp in e.spaces {
@@ -738,6 +774,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 
 	_redact_settle(e)
 	_mounts_settle(e)
+	_full_settle(e)
 	_index_settle(e)
 	_checkpoints_write(e)
 	_handles_sweep(e, 0)
@@ -799,6 +836,7 @@ _teardown :: proc(e: ^Engine) {
 	e.closing = true
 	_subs_free_all(e)
 	_waiters_fail_all(e, .Closed)
+	_remote_close(e)
 	_plugs_close(e)
 	_handles_sweep(e, -1)
 	_index_close(e)
@@ -811,6 +849,7 @@ _teardown :: proc(e: ^Engine) {
 		_batches_done(e, .None)
 	}
 	_dirty_drop(e)
+	_account_close(e)
 	_spaces_close_all(e)
 	_trees_free_all(e)
 	if e.db_open {
@@ -849,6 +888,7 @@ _teardown :: proc(e: ^Engine) {
 		e.lock_fd = prim.INVALID_FD
 	}
 	delete(e.spaces)
+	_unavailable_destroy(e)
 	delete(e.links)
 	delete(e.handles)
 	delete(e.lru)

@@ -188,3 +188,49 @@ _fk_unwrap :: proc(data: rawptr, wrapped: []u8, key: ^Content_Key) -> Error {
 	self := device_identity(&k.device)
 	return open_key_from(&self, &k.device.noise, wrapped, key)
 }
+
+DEVICE_SEALED_FILE :: "device.sealed"
+
+Seed_Guard :: struct {
+	data:   rawptr,
+	seal:   proc(data: rawptr, secret: []u8, out: ^[dynamic]u8) -> Error,
+	unseal: proc(data: rawptr, sealed: []u8, out: []u8) -> Error,
+}
+
+file_keyring_open_guarded :: proc(k: ^File_Keyring, vfs: prim.Vfs, dir: string, guard: Seed_Guard, random := prim.Random{}) -> Error {
+	if guard.seal == nil || guard.unseal == nil {
+		return file_keyring_open(k, vfs, dir, random)
+	}
+	sealed_path, perr := prim.path_join(context.temp_allocator, dir, DEVICE_SEALED_FILE)
+	if perr != .None {
+		return _from_prim(perr)
+	}
+	seed: [32]u8
+	defer crypto.zero_explicit(&seed, size_of(seed))
+	if data, err := prim.read_file(vfs, sealed_path, context.temp_allocator); err == .None {
+		guard.unseal(guard.data, data, seed[:]) or_return
+	} else if err != .Not_Found {
+		return _from_prim(err)
+	} else {
+		plain, _ := prim.path_join(context.temp_allocator, dir, DEVICE_KEY_FILE)
+		_key_load_or_create(vfs, dir, DEVICE_KEY_FILE, KIND_DEVICE, seed[:], random) or_return
+		blob := make([dynamic]u8, context.temp_allocator)
+		guard.seal(guard.data, seed[:], &blob) or_return
+		if merr := prim.mkdir_all(vfs, dir, 0o700); merr != .None {
+			return _from_prim(merr)
+		}
+		_write_private(vfs, sealed_path, blob[:], true, random) or_return
+		if fd, oerr := prim.open_file(vfs, plain, {.Write}); oerr == .None {
+			if size, serr := prim.file_size(vfs, fd); serr == .None && size > 0 {
+				prim.zero_range(vfs, fd, 0, size)
+				prim.datasync(vfs, fd)
+			}
+			prim.close_file(vfs, fd)
+		}
+		prim.remove(vfs, plain)
+	}
+	d := device_from_seed(seed[:]) or_return
+	k.device = d
+	k.random = random
+	return .None
+}

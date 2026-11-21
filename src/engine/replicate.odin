@@ -33,12 +33,12 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		if sp.keyless {
 			return .Permission
 		}
-		sp.creds = osync.Space_Credentials{space = &sp.keys, keyring = e.keyring}
-		cfg.credentials = osync.space_credentials(&sp.creds)
+		cfg.credentials = _member_credentials(sp)
 	}
 	if e.cfg.verify_chains {
 		cfg.verify = _verify
 	}
+	cfg.seal = _repl_seal
 	if e.cfg.transport.open != nil {
 		cfg.link = osync.Client_Link{data = sp, send = _link_send, close = _link_close}
 	}
@@ -59,6 +59,12 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 	} else {
 		osync.replicator_start(&sp.repl)
 	}
+	if !sp.keyless {
+		_members_follow(e, sp)
+		if !sp.mem.have_naming {
+			return .None
+		}
+	}
 	_card_publish(e, sp)
 	_owned_follow(e, sp)
 	_content_resume(e, sp)
@@ -72,6 +78,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		}
 	}
 	_pending_republish(e, sp)
+	_promo_resume(e, sp)
 	return .None
 }
 
@@ -149,7 +156,7 @@ LINK_BACKOFF_MAX :: 30_000
 
 @(private)
 _link_schedule :: proc(e: ^Engine, sp: ^Space) {
-	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.reopen != 0 {
+	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.reopen != 0 || sp.mem.revoked {
 		return
 	}
 	base := max(sp.backoff, LINK_BACKOFF_MIN)
@@ -253,6 +260,7 @@ Repl_Ev :: struct {
 	from:   i64,
 	to:     i64,
 	length: i64,
+	holders: []prim.Id,
 }
 
 @(private)
@@ -275,13 +283,29 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	context = context_for(e)
 	#partial switch ev.kind {
 	case .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed:
-		_content_on_event(e, sp, ev)
+		if !_snap_object_event(e, sp, ev) {
+			_content_on_event(e, sp, ev)
+		}
 		return
+	case .Checkpoint, .Checkpoint_Missing:
+		if _snap_checkpoint_event(e, sp, ev) {
+			return
+		}
 	case .Device_Seen, .Dropped, .Object_Shredded:
+		return
+	case .Direct, .Undelivered:
+		_remote_on_repl(e, sp, ev)
 		return
 	}
 	name, _ := _clone(ev.name, e.allocator)
-	append(&sp.events, Repl_Ev{kind = ev.kind, err = ev.err, device = ev.device, name = name, epoch = ev.epoch, stream = ev.stream, from = ev.from, to = ev.to, length = ev.length})
+	holders: []prim.Id
+	if ev.kind == .Unavailable && len(ev.meta) >= 16 {
+		holders = make([]prim.Id, len(ev.meta) / 16, e.allocator)
+		for &h, i in holders {
+			copy(h[:], ev.meta[i * 16:][:16])
+		}
+	}
+	append(&sp.events, Repl_Ev{kind = ev.kind, err = ev.err, device = ev.device, name = name, epoch = ev.epoch, stream = ev.stream, from = ev.from, to = ev.to, length = ev.length, holders = holders})
 	_touch(e)
 }
 
@@ -320,6 +344,7 @@ _repl_events_process :: proc(e: ^Engine) {
 			for &ev in evs {
 				_repl_event_apply(e, sp, &ev)
 				delete(ev.name, e.allocator)
+				delete(ev.holders, e.allocator)
 			}
 			delete(evs)
 		}
@@ -346,8 +371,14 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_emit(e, Event{kind = .Connected, space = sp.id})
 		_pending_republish(e, sp)
 		_relay_redact_resend(e, sp)
+		_full_kick(e, sp)
 	case .Disconnected:
 		sp.connected = false
+		if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked {
+			sp.mem.revoked = true
+			_emit(e, Event{kind = .Access_Revoked, space = sp.id, device = e.self, err = .Permission})
+			_waiters_fail_space(e, sp.id, .Permission)
+		}
 		_probes_settle(e, sp)
 		_emit(e, Event{kind = .Disconnected, space = sp.id, err = _serr(ev.err)})
 	case .Uploaded:
@@ -357,8 +388,16 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 			_emit(e, Event{kind = .Uploaded, space = sp.id, object = id, length = ev.length})
 		}
 	case .Grew, .Present:
+		if ev.name == osync.MEMBERS_STREAM {
+			_members_remote(e, sp, ev.device, ev.length)
+			return
+		}
 		_remote_changed(e, sp, ev.device, ev.name, ev.epoch, ev.length, ev.stream)
 	case .Segment_Seen:
+		if ev.name == osync.MEMBERS_STREAM {
+			_members_seen(e, sp, ev.device, ev.length)
+			return
+		}
 		if id, kind, ok := _object_of_name(ev.name); ok {
 			_member_seen(e, sp, id, kind, ev.device)
 		}
@@ -396,8 +435,21 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_emit(e, Event{kind = .Relay_Misbehaving, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err)})
 	case .Presence:
 		_emit(e, Event{kind = .Presence, space = sp.id, device = ev.device, tick = u64(ev.from), length = ev.length})
+		_remote_presence(e, sp, ev.device, ev.from != 0)
 	case .Caught_Up:
+		if !sp.keyless {
+			_members_caught_up(e, sp)
+		}
 		_emit(e, Event{kind = .Caught_Up, space = sp.id, length = ev.length})
+	case .Unavailable:
+		_unavailable_note(e, sp, ev)
+	case .Promoted:
+		obj_id, kind, _ := _object_of_name(ev.name)
+		_promo_settled(e, sp, obj_id, kind)
+		_emit(e, Event{kind = .Promoted, space = sp.id, object = obj_id, device = ev.device, length = ev.length, err = _serr(ev.err)})
+	case .Peer_Misbehaving:
+		obj_id, _, _ := _object_of_name(ev.name)
+		_emit(e, Event{kind = .Peer_Misbehaving, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err)})
 	}
 }
 
@@ -451,6 +503,7 @@ _remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, e
 	if h, hok := e.handles[id]; hok {
 		_handle_remote_grew(h, device)
 	}
+	_unavailable_clear(e, sp, id)
 	_content_data_arrived(e, id)
 	_object_changed(e, sp.id, id, .Data)
 	_index_item_add(e, sp.id, id, kind)
@@ -534,6 +587,9 @@ _repl_keys :: proc(user: rawptr, device: prim.Id, name: string, epoch: u64, stre
 	if !found || !rt.loaded {
 		return .Unknown, {}
 	}
+	if _tree_maybe_stale(sp, rt) {
+		return .Key_Tree_Stale, osync.keytree_provider(&rt.tree)
+	}
 	return .Key_Tree, osync.keytree_provider(&rt.tree)
 }
 
@@ -577,6 +633,10 @@ _verify :: proc(user: rawptr, req: ^osync.Verify_Request) -> osync.Verdict {
 		keyring = e.keyring,
 	}
 	verdict := osync.chain_verify(&cv, req)
+	if verdict == .Tampered && _tree_maybe_stale(sp, rt) {
+		osync.replicator_keys_refresh(&sp.repl, &rt.scope, rt.device, rt.name, rt.epoch)
+		verdict = .Hold
+	}
 	if verdict == .Hold {
 		_held_add(e, sp, req.device, req.name)
 	}

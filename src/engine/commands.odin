@@ -141,6 +141,7 @@ Catalog_Field :: enum u8 {
 	Parent,
 	Workspace,
 	Agent,
+	Storage,
 }
 
 Catalog_Fields :: bit_set[Catalog_Field;u8]
@@ -154,6 +155,7 @@ Cmd_Catalog_Set :: struct {
 	parent:    obj.Xref,
 	workspace: prim.Id,
 	agent:     prim.Id,
+	storage:   Storage_Class,
 }
 
 Command :: union {

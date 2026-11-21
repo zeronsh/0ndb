@@ -23,13 +23,8 @@ setup_spaces :: proc(w: ^World) -> bool {
 			world_fail(w, "space_open failed: %v", oerr)
 			return false
 		}
-		secret, serr := eng.space_secret(&n0.e, id)
-		if serr != .None {
-			world_fail(w, "space_secret failed: %v", serr)
-			return false
-		}
 		node_after(n0)
-		sp := M_Space{id = id, secret = secret}
+		sp := M_Space{id = id}
 		sp.members = make([dynamic]int, w.allocator)
 		sp.guests = make([dynamic]int, w.allocator)
 		append(&sp.members, 0)
@@ -41,10 +36,21 @@ setup_spaces :: proc(w: ^World) -> bool {
 			if !(s == i % len(m.spaces) || rng_chance(&w.rng, 1, 2)) {
 				continue
 			}
+			proof: []u8
+			{
+				context = instance_context(&n0.inst)
+				p, aerr := eng.member_add(&n0.e, sp.id, n.identity, .Device, .Admin, .Approval, 0, w.allocator)
+				if aerr != .None {
+					world_fail(w, "%s member_add for %s failed: %v", n0.name, n.name, aerr)
+					return false
+				}
+				proof = p
+				node_after(n0)
+			}
 			context = instance_context(&n.inst)
-			_, err := eng.space_join(&n.e, sp.secret, fmt.tprintf("space%d", s))
+			_, err := eng.space_join_enrollment(&n.e, sp.id, proof, fmt.tprintf("space%d", s))
 			if err != .None {
-				world_fail(w, "%s space_join failed: %v", n.name, err)
+				world_fail(w, "%s space_join_enrollment failed: %v", n.name, err)
 				return false
 			}
 			if oerr := eng.space_open(&n.e, sp.id); oerr != .None {
@@ -241,6 +247,8 @@ workload_step :: proc(w: ^World) {
 		6,
 		6,
 		2,
+		3,
+		3 if w.cfg.storage == .Device_Until_Run else 0,
 		6,
 	}
 	#assert(len(weights) == len(Op_Kind))
@@ -269,6 +277,10 @@ workload_step :: proc(w: ^World) {
 		op_disk_edit(w, n, k == .Disk_Agent)
 	case .Git_Mount:
 		op_git_mount(w, n)
+	case .Search_Peer:
+		op_search_peer(w, n)
+	case .Promote:
+		op_promote(w, n)
 	case .Read_Live:
 		op_live_read(w, n)
 	}
@@ -456,7 +468,7 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
 		world_note(w, "%s redact message %s -> %v", n.name, t.token, err)
 		op_result(op, n, err)
-	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Read_Live:
+	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
 	}
 }
 
@@ -539,7 +551,7 @@ _op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.map_redact(&n.e, o, transmute([]u8)t.key)
 		world_note(w, "%s redact map key %s -> %v", n.name, t.key, err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Read_Live:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
 	}
 }
 
@@ -596,7 +608,7 @@ _op_text :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.text_edit(&n.e, o, t.pos, len(t.text), "", op_done_handle(op))
 		world_note(w, "%s text %s delete %s at %d of %q -> %v", n.name, id_short(o.id), t.text, t.pos, string(data), err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Read_Live:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
 	}
 }
 
@@ -663,7 +675,7 @@ _op_tree :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.tree_remove(&n.e, o, path)
 		world_note(w, "%s tree_remove %s/%s saw %v -> %v", n.name, id_short(o.id), path, op.deletes[:], err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Read_Live:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
 	}
 }
 

@@ -47,6 +47,11 @@ Relay_Stats :: struct {
 	appends:    u64,
 	bytes_in:   u64,
 	bytes_out:  u64,
+	notes:      u64,
+	fills:      u64,
+	pulls:      u64,
+	served:     u64,
+	piped_bytes: u64,
 }
 
 Conn_Ref :: struct {
@@ -74,7 +79,7 @@ Relay :: struct {
 	own_store:  ^File_Store,
 	own_pack:   ^pack.Pack,
 	auth:       Authorizer,
-	own_auth:   ^Space_Authorizer,
+	own_auth:   ^Relay_Auth,
 	listeners:  [dynamic]^Listener,
 	conns:      [dynamic]^Conn,
 	gens:       [dynamic]u32,
@@ -138,6 +143,8 @@ Space_State :: struct {
 	compact_red: i64,
 	compact_red_end: i64,
 	present:  map[Device_Id]Presence_Entry,
+	pipes:    [dynamic]Pipe,
+	live:     [dynamic]^Conn,
 }
 
 @(private)
@@ -151,6 +158,7 @@ Stream_State :: struct {
 	id:        Stream_Id,
 	h:         rawptr,
 	length:    i64,
+	base:      i64,
 	refs:      int,
 	followers: [dynamic]^Conn,
 	busy:      bool,
@@ -175,6 +183,8 @@ Op_Kind :: enum u8 {
 	Append,
 	Put,
 	Discard,
+	Fill,
+	Serve,
 }
 
 Op :: struct {
@@ -188,6 +198,10 @@ Op :: struct {
 	code:   Code,
 	id:     [32]u8,
 	len:    i64,
+	base:   i64,
+	buf:    []u8,
+	pos:    int,
+	pipe:   Pipe,
 }
 
 Out_Kind :: enum u8 {
@@ -210,6 +224,7 @@ Out :: struct {
 	reply:   bool,
 	key:     Object_Key,
 	obj:     rawptr,
+	piped:   bool,
 }
 
 
@@ -260,6 +275,9 @@ Conn :: struct {
 	sourced:   bool,
 	pkey:      [32]u8,
 	pcounted:  bool,
+	piped:     i64,
+	pipe_wait: bool,
+	pipe_on:   Conn_Ref,
 }
 
 @(private)
@@ -273,6 +291,8 @@ Pending_Kind :: enum u8 {
 	Compact,
 	Meta,
 	Redlog,
+	Note,
+	Fill,
 }
 
 @(private)
@@ -442,20 +462,12 @@ relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := con
 	if cfg.authorizer.authorize != nil {
 		r.auth = cfg.authorizer
 	} else {
-		sa, aerr := new(Space_Authorizer, allocator)
-		if aerr != nil {
-			return .No_Memory
+		ra, rerr := relay_auth_new(r.vfs, r.root, cfg, r.store, allocator)
+		if rerr != .None {
+			return rerr
 		}
-		allow_path := cfg.allow_file
-		if len(allow_path) == 0 && len(r.root) > 0 {
-			allow_path, _ = prim.path_join(context.temp_allocator, r.root, "allow")
-		}
-		if aerr2 := space_authorizer_init(sa, r.vfs, allow_path, cfg.open, cfg.default_quota, allocator); aerr2 != .None {
-			free(sa, allocator)
-			return aerr2
-		}
-		r.own_auth = sa
-		r.auth = space_authorizer(sa)
+		r.own_auth = ra
+		r.auth = member_authorizer(&ra.members)
 	}
 	_raise_nofile()
 	return .None
@@ -514,8 +526,7 @@ relay_destroy :: proc(r: ^Relay) {
 		free(r.own_pack, r.allocator)
 	}
 	if r.own_auth != nil {
-		space_authorizer_destroy(r.own_auth)
-		free(r.own_auth, r.allocator)
+		relay_auth_free(r.own_auth, r.allocator)
 	}
 	if r.rscratch != nil {
 		delete(r.rscratch, r.allocator)
@@ -904,6 +915,8 @@ _conn_close :: proc(c: ^Conn) {
 	}
 	sp := c.space
 	if sp != nil {
+		_pipes_conn_closed(r, sp, c)
+		_remove_conn(&sp.live, c)
 		_presence_leave(r, sp, c)
 		if c.watching {
 			_remove_conn(&sp.watchers, c)
@@ -1144,7 +1157,7 @@ _conn_read :: proc(c: ^Conn) {
 
 @(private)
 _should_pause :: proc "contextless" (c: ^Conn) -> bool {
-	return c.inflight >= MAX_INFLIGHT || len(c.out) - c.out_head >= MAX_OUT || c.listing != nil
+	return c.inflight >= MAX_INFLIGHT || len(c.out) - c.out_head >= MAX_OUT || c.listing != nil || c.pipe_wait
 }
 
 @(private)
@@ -1239,6 +1252,10 @@ _handle :: proc(c: ^Conn, it: ^Item) {
 			_on_probe(c, &rd)
 		case .Direct:
 			_on_direct(c, &rd)
+		case .Note:
+			_on_note(c, &rd)
+		case .Pull:
+			_on_pull(c, &rd)
 		case:
 			_fail(c, .Protocol)
 		}
@@ -1249,6 +1266,10 @@ _handle :: proc(c: ^Conn, it: ^Item) {
 			_on_append_begin(c, &rd, i64(it.total))
 		case .Put:
 			_on_put_begin(c, &rd, i64(it.total))
+		case .Fill:
+			_on_fill_begin(c, &rd, i64(it.total))
+		case .Serve:
+			_on_serve_begin(c, &rd, i64(it.total))
 		case:
 			_fail(c, .Protocol)
 		}
@@ -1303,6 +1324,7 @@ _on_hello :: proc(c: ^Conn, payload: []u8) {
 	c.pcounted = true
 	c.principal = p
 	_conn_ready(c)
+	append(&sp.live, c)
 	_presence_join(r, sp, c)
 	b: [FRAME_HEADER + 25]u8
 	frame_header(b[:], .Welcome, 25)
@@ -1349,13 +1371,15 @@ _space_get :: proc(r: ^Relay, id: Space_Id) -> (sp: ^Space_State, err: Error) {
 	sp.redlog_flight = make([dynamic]u8, r.allocator)
 	sp.redlog_fp = make([dynamic]^Pending, r.allocator)
 	sp.present = make(map[Device_Id]Presence_Entry, r.allocator)
+	sp.pipes = make([dynamic]Pipe, r.allocator)
+	sp.live = make([dynamic]^Conn, r.allocator)
 	r.spaces[id] = sp
 	return sp, .None
 }
 
 @(private)
 _space_release :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || sp.redlog_busy || sp.phase != .Idle || len(sp.feed_q) > 0 || len(sp.feed_wait) > 0 || len(sp.redlog_q) > 0 || len(sp.streams) > _owned_streams(sp) {
+	if sp.conns > 0 || len(sp.pipes) > 0 || sp.jobs > 0 || sp.feed_busy || sp.redlog_busy || sp.phase != .Idle || len(sp.feed_q) > 0 || len(sp.feed_wait) > 0 || len(sp.redlog_q) > 0 || len(sp.streams) > _owned_streams(sp) {
 		return
 	}
 	for st in ([]^Stream_State{sp.feed, sp.meta, sp.redlog}) {
@@ -1386,6 +1410,8 @@ _space_release :: proc(r: ^Relay, sp: ^Space_State) {
 	delete(sp.redlog_flight)
 	delete(sp.redlog_fp)
 	delete(sp.present)
+	delete(sp.pipes)
+	delete(sp.live)
 	r.store.namespace_close(r.store.data, sp.ns)
 	free(sp, r.allocator)
 }
@@ -1405,6 +1431,7 @@ _stream_get :: proc(r: ^Relay, sp: ^Space_State, id: Stream_Id, create: bool) ->
 			}
 			st.h = h if err == .None else nil
 			st.length = length if err == .None else 0
+			st.base = r.store.stream_base(r.store.data, h) if err == .None else 0
 			st.poisoned = false
 		}
 		if create && st.h == nil {
@@ -1414,6 +1441,7 @@ _stream_get :: proc(r: ^Relay, sp: ^Space_State, id: Stream_Id, create: bool) ->
 			}
 			st.h = h
 			st.length = length
+			st.base = r.store.stream_base(r.store.data, h)
 		}
 		return st, .None
 	}
@@ -1433,6 +1461,7 @@ _stream_get :: proc(r: ^Relay, sp: ^Space_State, id: Stream_Id, create: bool) ->
 	if err == .None {
 		nst.h = h
 		nst.length = length
+		nst.base = r.store.stream_base(r.store.data, h)
 	}
 	nst.followers = make([dynamic]^Conn, r.allocator)
 	sp.streams[id] = nst
@@ -1548,7 +1577,11 @@ _reply_refused :: proc(c: ^Conn, code: Code, id: [32]u8) {
 }
 
 @(private)
-_out_release :: proc(r: ^Relay, o: ^Out) {
+_out_release :: proc(r: ^Relay, o: ^Out, c: ^Conn = nil) {
+	if o.piped && c != nil {
+		o.piped = false
+		_pipe_drained(c, len(o.buf))
+	}
 	if o.buf != nil {
 		delete(o.buf, r.allocator)
 		o.buf = nil
@@ -1600,6 +1633,13 @@ _on_read :: proc(c: ^Conn, rd: ^prim.Reader, tail: bool) {
 			to = from
 		}
 	}
+	if st.base > 0 && st.h != nil && !st.dropped {
+		_reply_hollow(c, .Hollow, cast([32]u8)id, st.base, length)
+		if from < st.base {
+			from = min(st.base, length)
+			to = max(to, from)
+		}
+	}
 	o: Out
 	o.kind = .Data
 	o.stream = st
@@ -1638,13 +1678,19 @@ _on_probe :: proc(c: ^Conn, rd: ^prim.Reader) {
 			length = 0
 		} else if st, ok := sp.streams[id]; ok && st.h != nil && !st.poisoned {
 			length = _live_len(st)
+			if st.base > 0 && !st.dropped {
+				_reply_hollow(c, .Hollow, cast([32]u8)id, st.base, length)
+			}
 		} else {
-			l, exists, err := r.store.stream_probe(r.store.data, sp.ns, id)
+			l, base, exists, err := r.store.stream_probe(r.store.data, sp.ns, id)
 			if err != .None {
 				_reply_refused(c, .Io, cast([32]u8)id)
 				continue
 			}
 			length = l if exists else 0
+			if exists && base > 0 {
+				_reply_hollow(c, .Hollow, cast([32]u8)id, base, length)
+			}
 		}
 		e := buf[FRAME_HEADER + 2 + n * 40:]
 		v := id
@@ -1694,6 +1740,10 @@ _on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
 		}
 		length := _live_len(st)
 		offset := length if off == FOLLOW_END else i64(min(off, u64(max(i64))))
+		if st.base > 0 && st.h != nil && !st.dropped {
+			_reply_hollow(c, .Hollow, cast([32]u8)id, st.base, length)
+			offset = max(offset, st.base)
+		}
 		found := false
 		for &s in c.subs {
 			if s.stream == st {
@@ -1989,6 +2039,14 @@ _on_bulk_data :: proc(c: ^Conn, data: []u8) {
 		if op.failed == .None {
 			op.failed = r.store.put_write(r.store.data, op.w, data)
 		}
+	case .Fill:
+		if op.failed == .None {
+			op.failed = r.store.append_write(r.store.data, op.w, data)
+		}
+	case .Serve:
+		if op.buf != nil {
+			op.pos += copy(op.buf[op.pos:], data)
+		}
 	}
 }
 
@@ -2007,7 +2065,9 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_len(c, op.reply, op.id, op.len)
 		case .Stored:
 			_reply_id(c, .Stored, op.id)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered:
+		case .Noted:
+			_reply_hollow(c, .Noted, op.id, op.base, op.len)
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered, .Note, .Fill, .Pull, .Serve, .Hollow, .Pulled, .Served, .Unserved:
 		}
 	case .Append:
 		st := op.stream
@@ -2033,6 +2093,10 @@ _on_bulk_end :: proc(c: ^Conn) {
 			return
 		}
 		r.store.put_commit(r.store.data, op.w, _relay_done, p)
+	case .Fill:
+		_fill_end(c, &op)
+	case .Serve:
+		_serve_end(c, &op)
 	}
 }
 
@@ -2051,6 +2115,16 @@ _op_abort :: proc(c: ^Conn) {
 	case .Put:
 		r.store.put_abort(r.store.data, op.w)
 		c.space.reserved -= op.total
+	case .Fill:
+		r.store.append_abort(r.store.data, op.w)
+		c.space.reserved -= op.total
+		op.stream.busy = false
+		op.stream.poisoned = true
+		_stream_unref(r, op.stream)
+	case .Serve:
+		if op.buf != nil {
+			delete(op.buf, r.allocator)
+		}
 	}
 	c.op = {}
 	parser_reset(&c.parser)
@@ -2084,6 +2158,7 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 				f.scan = true
 				_conn_kick(f)
 			}
+			_relay_observe(r, sp, st, was, value)
 			_feed_wait(r, sp, p, u64(st.length))
 			_reap(r)
 			return
@@ -2163,6 +2238,11 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 		}
 	case .Feed, .Compact, .Meta:
 		_feed_done(r, sp, p.kind, result, value)
+	case .Note, .Fill:
+		if _hollow_done(r, sp, c, p, result, value) {
+			_reap(r)
+			return
+		}
 	}
 	if p.stream != nil {
 		_stream_unref(r, p.stream)
@@ -2295,7 +2375,7 @@ _conn_write :: proc(c: ^Conn) {
 			return
 		}
 		if done {
-			_out_release(r, o)
+			_out_release(r, o, c)
 			c.out_head += 1
 		}
 	}
@@ -2312,7 +2392,13 @@ _produce :: proc(c: ^Conn) -> bool {
 			i := (c.rr + k) % n
 			s := &c.subs[i]
 			st := s.stream
-			if st.dropped || st.h == nil || st.length <= s.offset {
+			if st.dropped || st.h == nil {
+				continue
+			}
+			if s.offset < st.base {
+				s.offset = st.base
+			}
+			if st.length <= s.offset {
 				continue
 			}
 			o: Out

@@ -3,7 +3,7 @@ package osync
 import "../journal"
 import "../prim"
 
-PROTOCOL_VERSION :: 2
+PROTOCOL_VERSION :: 3
 DATA_FINAL :: u64(1) << 63
 
 FRAME_HEADER :: 5
@@ -38,6 +38,10 @@ Kind :: enum u8 {
 	Forget    = 0x0d,
 	Probe     = 0x0e,
 	Direct    = 0x10,
+	Note      = 0x11,
+	Fill      = 0x12,
+	Pull      = 0x13,
+	Serve     = 0x14,
 	Welcome   = 0x81,
 	Listing   = 0x82,
 	Appended  = 0x83,
@@ -58,6 +62,11 @@ Kind :: enum u8 {
 	Presence  = 0x92,
 	Directed  = 0x93,
 	Undelivered = 0x94,
+	Noted     = 0x95,
+	Hollow    = 0x96,
+	Pulled    = 0x97,
+	Served    = 0x98,
+	Unserved  = 0x99,
 }
 
 Code :: enum u8 {
@@ -96,6 +105,20 @@ PRESENCE_ENTRY :: 16 + 1 + 8
 PRESENCE_SNAPSHOT :: 1
 DIRECT_FIXED :: 16 + 8
 DIRECT_MAX :: CONTROL_MAX - FRAME_HEADER - DIRECT_FIXED
+FEED_HOLLOW :: u64(1) << 61
+NOTE_LEN :: 32 + 8
+FILL_FIXED :: 32 + 8
+NOTED_LEN :: 32 + 8 + 8
+PULL_LEN :: 16 + 8 + 32 + 8 + 8
+SERVE_FIXED :: 16 + 8 + 32 + 8 + 8
+UNSERVED_LEN :: 16 + 8 + 32
+SERVE_MAX :: 256 * 1024
+SERVE_FINAL :: u64(1) << 63
+SERVE_NONE :: u64(1) << 62
+SERVE_LEN_MASK :: SERVE_NONE - 1
+PIPES_MAX :: 64
+PIPE_HIGH :: 4 * SERVE_MAX
+BULK_FIXED_MAX :: SERVE_FIXED
 
 Feed_Pattern_Kind :: enum u8 {
 	Prefix = 1,
@@ -135,7 +158,7 @@ Item :: struct {
 }
 
 Parser :: struct {
-	head:      [FRAME_HEADER + DATA_FIXED]u8,
+	head:      [FRAME_HEADER + BULK_FIXED_MAX]u8,
 	have:      int,
 	need:      int,
 	frame:     Kind,
@@ -255,9 +278,13 @@ _parser_header :: proc(p: ^Parser) -> Error {
 	bulk := false
 	if p.relay {
 		#partial switch k {
-		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget, .Probe:
+		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Direct, .Note, .Pull:
 		case .Append:
 			bulk, fixed, limit = true, APPEND_FIXED, APPEND_MAX
+		case .Fill:
+			bulk, fixed, limit = true, FILL_FIXED, APPEND_MAX
+		case .Serve:
+			bulk, fixed, limit = true, SERVE_FIXED, SERVE_MAX
 		case .Put:
 			bulk, fixed, limit = true, PUT_FIXED, OBJECT_MAX
 		case:
@@ -265,9 +292,11 @@ _parser_header :: proc(p: ^Parser) -> Error {
 		}
 	} else {
 		#partial switch k {
-		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence:
+		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Directed, .Undelivered, .Noted, .Hollow, .Pulled, .Unserved:
 		case .Data:
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
+		case .Served:
+			bulk, fixed, limit = true, SERVE_FIXED, SERVE_MAX
 		case .Object:
 			bulk, fixed, limit = true, OBJECT_FIXED, OBJECT_MAX
 		case:
@@ -336,6 +365,13 @@ reserved_id :: proc "contextless" (tag: u8, epoch: u64) -> (id: Stream_Id) {
 	id[16] = tag
 	prim.put_u64le(id[24:], epoch)
 	return
+}
+
+feed_length :: proc "contextless" (word: u64) -> (length: i64, hollow: bool, ok: bool) {
+	if word & (FEED_REDACT | FEED_REDACT_END) != 0 {
+		return
+	}
+	return i64(word & (FEED_HOLLOW - 1)), word & FEED_HOLLOW != 0, true
 }
 
 feed_redaction :: proc "contextless" (length: u64) -> (at: i64, end: bool, ok: bool) {

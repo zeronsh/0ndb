@@ -24,6 +24,7 @@ Remote_Kind :: enum u8 {
 	Keys,
 	Card,
 	Head,
+	Members,
 }
 
 Remote :: struct {
@@ -104,6 +105,7 @@ Event_Kind :: enum u8 {
 	Connected = 3,
 	Closed    = 4,
 	Info      = 5,
+	Approval  = 6,
 }
 
 Session :: struct {
@@ -111,7 +113,6 @@ Session :: struct {
 	mem:         Mem_Vfs,
 	vfs:         prim.Vfs,
 	device:      osync.Device,
-	space:       osync.Space,
 	shared:      bool,
 	space_id:    prim.Id,
 	catalog_id:  prim.Id,
@@ -120,7 +121,7 @@ Session :: struct {
 	relay_pub:   osync.Public_Key,
 	relay_addr:  string,
 	keyring:     osync.Keyring,
-	space_creds: osync.Space_Credentials,
+	result:      [dynamic]u8,
 	cap_creds:   Cap_Credentials,
 	creds:       osync.Credentials,
 	link:        Link,
@@ -145,6 +146,7 @@ Session :: struct {
 	stage_at:    i64,
 	bytes_in:    u64,
 	err:         osync.Error,
+	member:      Member_State,
 }
 
 session_init :: proc(s: ^Session, allocator := context.allocator) {
@@ -164,6 +166,7 @@ session_init :: proc(s: ^Session, allocator := context.allocator) {
 	s.subs = make([dynamic]^Sub, allocator)
 	s.events = make([dynamic]u8, allocator)
 	s.stage = make([dynamic]u8, allocator)
+	s.result = make([dynamic]u8, allocator)
 	s.keyring = osync.Keyring{data = s, identity = _kr_identity, sign = _kr_sign}
 }
 
@@ -195,7 +198,8 @@ session_destroy :: proc(s: ^Session) {
 	link_destroy(&s.link)
 	mem_vfs_destroy(&s.mem)
 	osync.device_clear(&s.device)
-	osync.space_clear(&s.space)
+	_member_free(s)
+	delete(s.result)
 	osync.scope_clear(&s.scope)
 	crypto.zero_explicit(&s.share, size_of(Share_Grant))
 	crypto.zero_explicit(&s.cap_creds, size_of(Cap_Credentials))
@@ -217,21 +221,6 @@ session_device :: proc(s: ^Session, seed: []u8) -> osync.Error {
 	return .None
 }
 
-session_open_pairing :: proc(s: ^Session, code: string) -> osync.Error {
-	p := osync.pairing_decode(code) or_return
-	defer crypto.zero_explicit(&p, size_of(p))
-	s.space = osync.space_from_secret(p.secret) or_return
-	s.space_id = s.space.id
-	s.catalog_id = catalog_id(s.space_id)
-	s.scope = osync.space_scope(&s.space)
-	s.relay_pub = p.relay_public
-	s.relay_addr = _clone(osync.pairing_addr(&p), s.allocator)
-	s.space_creds = osync.Space_Credentials{space = &s.space, keyring = s.keyring}
-	s.creds = osync.space_credentials(&s.space_creds)
-	c := _object_get(s, s.catalog_id, .Map)
-	c.catalog = true
-	return .None
-}
 
 catalog_id :: proc(space: prim.Id) -> (id: prim.Id) {
 	ctx: blake2b.Context
@@ -374,10 +363,18 @@ _on_event :: proc(user: rawptr, ev: ^osync.Event) -> osync.Error {
 			}
 			_mark(rm)
 		}
+	case .Direct:
+		approver_direct(s, _ev_device(ev), ev.data)
 	case .Error:
 		return .Refused
 	}
 	return .None
+}
+
+@(private)
+_ev_device :: proc(ev: ^osync.Event) -> (d: prim.Id) {
+	copy(d[:], ev.id[:16])
+	return
 }
 
 @(private)
@@ -423,6 +420,9 @@ _feed_subscribe :: proc(s: ^Session, from: i64) {
 	append(&pats, p)
 	for id in s.probes {
 		append(&pats, osync.Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
+	}
+	if mp, ok := members_pattern(s); ok {
+		append(&pats, mp)
 	}
 	for _, o in s.objects {
 		for sg in o.segs {
@@ -650,6 +650,9 @@ _seen :: proc(s: ^Session, id: osync.Stream_Id, length: i64) {
 	if length <= 0 {
 		return
 	}
+	if members_seen(s, id, length) {
+		return
+	}
 	if o, ok := s.groups[osync.stream_id_suffix(id)]; ok {
 		dev := osync.stream_device(id)
 		if _seg_find(o, dev) == nil {
@@ -717,6 +720,8 @@ _on_data :: proc(s: ^Session, ev: ^osync.Event) {
 		_card_landed(s, rm)
 	case .Head:
 		_head_landed(s, rm)
+	case .Members:
+		members_landed(s, rm)
 	}
 }
 
@@ -1179,7 +1184,13 @@ _keys_landed :: proc(s: ^Session, rm: ^Remote) {
 		return
 	}
 	t: osync.Key_Tree
-	if osync.keys_record_decode(&t, body, s.allocator) != .None {
+	if tag, sealed := osync.keys_record_tag(body); sealed {
+		okey, ok := epoch_key_for(s, o.id, tag)
+		defer crypto.zero_explicit(&okey, size_of(okey))
+		if !ok || osync.keys_record_open(&t, body, &okey, rm.id, rm.epoch, s.allocator) != .None {
+			return
+		}
+	} else if osync.keys_record_decode(&t, body, s.allocator) != .None {
 		return
 	}
 	if rm == sg.next {

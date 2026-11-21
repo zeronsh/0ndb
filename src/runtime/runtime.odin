@@ -138,6 +138,7 @@ Hooks :: struct {
 
 Config :: struct {
 	runner:           bool,
+	pool:             bool,
 	work_root:        string,
 	scheduler:        Scheduler,
 	spawner:          Spawner,

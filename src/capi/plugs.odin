@@ -185,6 +185,13 @@ C_Embedder :: struct {
 	embed: proc "c" (ud: rawptr, kind: u32, text: [^]u8, len: uint, out: [^]f32, dim: uint) -> i32,
 }
 
+C_Search_Remote :: struct {
+	size:   u32,
+	ud:     rawptr,
+	query:  proc "c" (ud: rawptr, h: ^Handle, id: u64, payload: [^]u8, len: uint) -> i32,
+	cancel: proc "c" (ud: rawptr, h: ^Handle, id: u64),
+}
+
 C_Log :: struct {
 	size:  u32,
 	ud:    rawptr,
@@ -219,6 +226,8 @@ Plugs :: struct {
 	registry:    ^fs.Registry,
 	embedder:    C_Embedder,
 	log:         C_Log,
+	remote:      C_Search_Remote,
+	account:     Account_Plugs,
 }
 
 @(private)
@@ -305,6 +314,15 @@ plugs_install :: proc(h: ^Handle, cfg: ^Config, ec: ^eng.Config) -> api.Status {
 			return .Invalid
 		}
 		ec.embedder = search.Embedder{dim = int(p.embedder.dim), embed = _embed, data = &p.embedder}
+	}
+	if !account_plugs_setup(&p.account, cfg, ec) {
+		return .Invalid
+	}
+	if _has(cfg, offset_of(Config, search_remote)) && cfg.search_remote != nil {
+		if !_copy_table(&p.remote, cfg.search_remote) || p.remote.query == nil {
+			return .Invalid
+		}
+		ec.search_remote = eng.Search_Remote{data = h, query = _remote_query, cancel = _remote_cancel}
 	}
 	if _has(cfg, offset_of(Config, log)) && cfg.log != nil {
 		if !_copy_table(&p.log, cfg.log) || p.log.write == nil {
@@ -999,4 +1017,22 @@ _log_write :: proc(data: rawptr, level: eng.Log_Level, msg: string) {
 	l := (^C_Log)(data)
 	c, n := _cstr(msg)
 	l.write(l.ud, i32(level), c, n)
+}
+
+@(private)
+_remote_query :: proc(data: rawptr, e: ^eng.Engine, q: ^eng.Remote_Query) -> eng.Error {
+	h := (^Handle)(data)
+	b := eng.remote_query_encode(q, context.temp_allocator)
+	if h.plugs.remote.query(h.plugs.remote.ud, h, q.id, raw_data(b), uint(len(b))) != 0 {
+		return .Unsupported
+	}
+	return .None
+}
+
+@(private)
+_remote_cancel :: proc(data: rawptr, e: ^eng.Engine, id: u64) {
+	h := (^Handle)(data)
+	if h.plugs.remote.cancel != nil {
+		h.plugs.remote.cancel(h.plugs.remote.ud, h, id)
+	}
 }

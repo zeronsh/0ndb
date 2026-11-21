@@ -1,5 +1,5 @@
 const OP = { catalog: 1, status: 2, page: 3, message: 4, siblings: 5, mapGet: 6, mapScan: 7, subscribe: 8, unsubscribe: 9, text: 10, catalogEntry: 11, close: 12, window: 13, switch: 14 };
-const EV_RESULT = 1, EV_DELTAS = 2, EV_CONNECTED = 3, EV_CLOSED = 4, EV_INFO = 5;
+const EV_RESULT = 1, EV_DELTAS = 2, EV_CONNECTED = 3, EV_CLOSED = 4, EV_INFO = 5, EV_APPROVAL = 6;
 const STATUS = ['ok', 'missing', 'corrupt', 'invalid', 'not_found', 'exists', 'busy', 'limit', 'too_large', 'unsupported', 'not_assigned', 'unknown_segment', 'forged', 'permission', 'no_space', 'no_memory', 'io'];
 const SYNC_ERRORS = ['none', 'invalid', 'corrupt', 'auth', 'protocol', 'closed', 'would_block', 'not_found', 'exists', 'permission', 'no_space', 'no_memory', 'too_large', 'busy', 'quota', 'conflict', 'unsupported', 'timeout', 'resolve', 'refused', 'io'];
 const KINDS = { conversation: 1, map: 2 };
@@ -18,6 +18,12 @@ function statusName(s) {
   if (s === 253) return 'bad_args';
   if (s === 254) return 'unsupported';
   return STATUS[s] || 'status_' + s;
+}
+
+function b64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function hexToBytes(hex, out, at) {
@@ -113,6 +119,88 @@ export class Ondb {
     return sp;
   }
 
+  _result() {
+    const n = this.x.ondb_result_len(this._probe);
+    return new Uint8Array(this.x.memory.buffer, this.x.ondb_result_ptr(this._probe), n).slice();
+  }
+
+  _scratch() {
+    if (!this._probe) {
+      this._probe = this._with(new Uint8Array(0), () => this.x.ondb_new(0, 0));
+      if (!this._probe) throw new OndbError('no_memory');
+    }
+    return this._probe;
+  }
+
+  unlockOptions(record) {
+    const s = this._scratch();
+    const err = this._with(toBytes(record), (p, n) => this.x.ondb_account_options(s, p, n));
+    if (err) throw new OndbError(SYNC_ERRORS[err] || 'corrupt', 'account record is damaged');
+    const r = this._result();
+    const dv = new DataView(r.buffer);
+    const out = [];
+    let at = 4;
+    for (let i = 0, count = dv.getUint32(0, true); i < count; i++) {
+      const len = dv.getUint32(at, true);
+      at += 4;
+      out.push({ credential: r.slice(at, at + len), salt: r.slice(at + len, at + len + 32) });
+      at += len + 32;
+    }
+    return out;
+  }
+
+  idpSalt(subject) {
+    const s = this._scratch();
+    this._with(enc.encode(String(subject)), (p, n) => this.x.ondb_idp_salt(s, p, n));
+    return this._result();
+  }
+
+  async unlock(record, { rpId, mediation } = {}) {
+    const options = this.unlockOptions(record);
+    if (!options.length) throw new OndbError('not_found', 'no passkey is registered for this account');
+    const evalByCredential = {};
+    for (const o of options) evalByCredential[b64url(o.credential)] = { first: o.salt };
+    const cred = await navigator.credentials.get({
+      mediation,
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        rpId,
+        userVerification: 'required',
+        allowCredentials: options.map((o) => ({ type: 'public-key', id: o.credential })),
+        extensions: { prf: { evalByCredential } },
+      },
+    });
+    const prf = cred && cred.getClientExtensionResults().prf;
+    const first = prf && prf.results && prf.results.first;
+    if (!first) throw new OndbError('unsupported', 'this passkey provider does not return PRF output');
+    return { credential: new Uint8Array(cred.rawId), prf: new Uint8Array(first) };
+  }
+
+  async signIn({ record, entries, space, rpId, seed, store, compactRatio = 4, credential, prf } = {}) {
+    if (!credential || !prf) ({ credential, prf } = await this.unlock(record, { rpId }));
+    const sp = this.session({ seed });
+    try {
+      if (store) await sp.restore(store, { compactRatio });
+      sp.openAccount({ record, entries, credential, prf, space });
+    } catch (e) {
+      sp.close();
+      throw e;
+    }
+    return sp;
+  }
+
+  async approver({ record, rpId, seed, credential, prf } = {}) {
+    if (!credential || !prf) ({ credential, prf } = await this.unlock(record, { rpId }));
+    const sp = this.session({ seed });
+    const rec = toBytes(record);
+    const err = this._with(rec, (rp, rn) => this._with(toBytes(credential), (cp, cn) => this._with(toBytes(prf), (pp) => this.x.ondb_approver_open(sp.s, rp, rn, cp, cn, pp))));
+    if (err) {
+      sp.close();
+      throw new OndbError(SYNC_ERRORS[err] || 'auth', 'cannot unlock the account');
+    }
+    return sp;
+  }
+
   get memoryBytes() {
     return this.x.memory.buffer.byteLength;
   }
@@ -131,6 +219,14 @@ export class Space {
     this.listeners = new Set();
     this.closed = false;
     this._info = null;
+  }
+
+  openAccount({ record, entries, credential, prf, space }) {
+    const L = this.lib;
+    const sp = space ? (() => { const b = new Uint8Array(16); hexToBytes(space, b, 0); return b; })() : new Uint8Array(0);
+    const err = L._with(toBytes(record), (rp, rn) => L._with(toBytes(entries), (ep, en) => L._with(toBytes(credential), (cp, cn) => L._with(toBytes(prf), (pp) => L._with(sp, (sp2) => this.x.ondb_account_open(this.s, rp, rn, ep, en, cp, cn, pp, sp2))))));
+    if (err) throw new OndbError(SYNC_ERRORS[err] || 'auth', 'cannot sign in with that passkey');
+    return this;
   }
 
   join(credential) {
@@ -297,7 +393,20 @@ export class Space {
       case EV_INFO:
         this._info = JSON.parse(dec.decode(body));
         return;
+      case EV_APPROVAL: {
+        const code = dec.decode(body.subarray(0, 8));
+        const label = dec.decode(body.subarray(8));
+        for (const fn of this.listeners) fn({ type: 'approval', code, label });
+        return;
+      }
     }
+  }
+
+  approve(code, ok = true) {
+    const norm = String(code).replace(/[-\s]/g, '').toLowerCase();
+    const err = this.lib._with(enc.encode(norm), (p, n) => this.x.ondb_approve(this.s, p, n, ok ? 1 : 0));
+    if (err) throw new OndbError(SYNC_ERRORS[err] || 'error', 'cannot answer that approval');
+    this._pump();
   }
 
   _request(op, args) {

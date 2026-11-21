@@ -305,6 +305,7 @@ Mount :: struct {
 	intents:     [dynamic]Intent,
 	nonce:       prim.Id,
 	mat_wait:    bool,
+	mat_ingest:  bool,
 	jpos:        i64,
 	jpend:       i64,
 	imported:    bool,

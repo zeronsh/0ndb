@@ -44,6 +44,7 @@ default_config :: proc(seed: u64) -> Config {
 		dict_sample_min = 64 + rng_int(&r, 960),
 		settle_ms = 200 + rng_range(&r, 0, 1500),
 		trace_limit = 4000,
+		storage = .Device if rng_chance(&r, 1, 3) else .Device_Until_Run if rng_chance(&r, 1, 3) else .Auto,
 	}
 }
 
@@ -284,6 +285,11 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	region_configure(env_u64("SIM_REGION_MB", 256), env_u64("SIM_TEMP_MB", 96))
 	cfg.rss_max = env_u64("SIM_RSS_MAX", 1500)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
+	if v, ok := os.lookup_env("SIM_STORAGE", context.temp_allocator); ok {
+		if mode, mok := storage_mode_of(v); mok {
+			cfg.storage = mode
+		}
+	}
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
 	cfg.keep_faults = filter_parse("SIM_KEEP_FAULTS")
 	if f, ok := os.lookup_env("SIM_FAULTS", context.temp_allocator); ok && f == "0" {
@@ -299,7 +305,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		world_destroy(w)
 		free(w, runtime.heap_allocator())
 	}
-	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk)
+	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v storage=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk, cfg.storage)
 	ok := relay_start(&w.relay)
 	for n in w.nodes {
 		ok = ok && node_start(n)
@@ -429,6 +435,7 @@ finish :: proc(w: ^World) {
 	cipher_resolve(w)
 	check_relay_redaction(w)
 	check_relay_plaintext(w)
+	check_relay_storage(w)
 	check_mounts(w)
 	if w.aborted {
 		return

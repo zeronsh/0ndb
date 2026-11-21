@@ -89,6 +89,11 @@ _index_open :: proc(e: ^Engine) -> Error {
 	}
 	e.index_open = true
 	if rebuilt {
+		_remote(e).rebuilt = true
+		_snap_forget_all(e)
+		k := [1]u8{SEARCH_KEY_REBUILT}
+		v := [1]u8{1}
+		_reg_put(e, ROOT_SEARCH, k[:], v[:])
 		_index_all(e)
 	}
 	return .None
@@ -199,7 +204,7 @@ _index_step :: proc(e: ^Engine) {
 			return
 		}
 		sp, ok := e.spaces[it.space]
-		if !ok || !sp.open {
+		if !ok || !sp.open || _snap_park(e, it) {
 			continue
 		}
 		h, err := _handle_get(e, Object{it.space, it.object}, it.kind)
@@ -271,6 +276,8 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 						pos = at
 						break
 					}
+				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Put) {
+					_full_catalog_record(e, h.sp, body, at)
 				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Add) {
 					env, derr := obj.decode_envelope(body, at)
 					if derr == .None {
@@ -356,6 +363,9 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 	pos, perr := search.position(&e.index, src)
 	if perr != .None {
 		return
+	}
+	if pos == 0 {
+		_snap_source(e, h, device)
 	}
 	end := journal.reader_end(r)
 	tail_ok := false

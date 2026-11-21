@@ -1,6 +1,7 @@
 package engine
 
 import "base:runtime"
+import "core:crypto"
 import "core:slice"
 import "core:strings"
 import "../fs"
@@ -483,9 +484,18 @@ _publish :: proc(e: ^Engine, d: ^Dirty_Seg) {
 		return
 	}
 	if d.keys && d.tree != nil {
-		if err := osync.replicator_publish_keys(&sp.repl, &d.scope, d.name, &d.tree.tree); err != .None {
+		okey, sealed := _object_epoch_key(sp, d.object, d.tree.tree.epoch)
+		seal: ^[32]u8 = &okey if sealed else nil
+		if sp.mode == .End_To_End && !sealed {
+			_log(e, .Warn, "keys publish without epoch key")
+		} else if err := osync.replicator_publish_keys(&sp.repl, &d.scope, d.name, &d.tree.tree, seal); err == .Conflict {
+			d.tree.tree.version += 1
+			d.tree.dirty = true
+			_dirty_keys(e, sp, d.object, d.kind, d.scope, d.tree)
+		} else if err != .None {
 			_log(e, .Warn, "keys publish failed")
 		}
+		crypto.zero_explicit(&okey, size_of(okey))
 	}
 	if d.length > 0 && len(d.path) > 0 {
 		var_tree: ^osync.Key_Tree = nil
@@ -495,7 +505,8 @@ _publish :: proc(e: ^Engine, d: ^Dirty_Seg) {
 			d.tree.upload_refs += 1
 			d.tree.refs += 1
 		}
-		err := osync.replicator_publish(&sp.repl, &d.scope, d.name, 0, d.path, d.length, var_tree)
+		hollow := _storage_class(e, sp, d.object, d.kind) == .Device
+		err := osync.replicator_publish(&sp.repl, &d.scope, d.name, 0, d.path, d.length, var_tree, hollow)
 		if err != .None {
 			if d.tree != nil {
 				d.tree.upload_refs -= 1

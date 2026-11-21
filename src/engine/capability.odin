@@ -2,7 +2,6 @@ package engine
 
 import "base:runtime"
 import "core:crypto/blake2b"
-import "core:crypto/ed25519"
 import "../prim"
 import osync "../sync"
 
@@ -34,6 +33,7 @@ Capability :: struct {
 	access:   Access_Set,
 	expires:  i64,
 	name_key: [32]u8,
+	issuer:   osync.Public_Key,
 }
 
 CAPABILITY_LEN :: 1 + 16 * 3 + 1 + 1 + 8 + 32 + 32 + 64
@@ -42,7 +42,7 @@ CAP_CREDENTIAL_LEN :: 1 + CAPABILITY_LEN + 32 + 64
 capability_issue :: proc(e: ^Engine, c: Capability, allocator := context.allocator) -> (token: []u8, err: Error) {
 	context = context_for(e)
 	sp := _space_open(e, c.space) or_return
-	if sp.keyless {
+	if sp.keyless || !sp.mem.have_naming || sp.mem.removed {
 		return nil, .Permission
 	}
 	x := c
@@ -51,9 +51,14 @@ capability_issue :: proc(e: ^Engine, c: Capability, allocator := context.allocat
 	osync.scope_clear(&sc)
 	token = make([]u8, CAPABILITY_LEN, allocator)
 	n := _cap_body(x, token)
-	copy(token[n:], sp.keys.auth_public[:])
+	copy(token[n:], e.identity.sign[:])
 	n += 32
-	ed25519.sign(&sp.keys.auth, token[:n], token[n:])
+	sig: [64]u8
+	if serr := e.keyring.sign(e.keyring.data, token[:n], &sig); serr != .None {
+		delete(token, allocator)
+		return nil, _serr(serr)
+	}
+	copy(token[n:], sig[:])
 	return token, .None
 }
 
@@ -76,9 +81,7 @@ capability_verify :: proc(token: []u8, now_ms: i64) -> (c: Capability, ok: bool)
 	}
 	c.kind = Kind(k)
 	c.access = transmute(Access_Set)a
-	if osync.space_id(pub) != c.space {
-		return {}, false
-	}
+	c.issuer = pub
 	if !osync.signature_verify(pub, token[:CAPABILITY_LEN - 64], token[CAPABILITY_LEN - 64:]) {
 		return {}, false
 	}
@@ -155,6 +158,8 @@ Cap_Grant :: struct {
 
 Cap_Authorizer :: struct {
 	inner:         osync.Authorizer,
+	issuer_ok:     proc(data: rawptr, space: prim.Id, issuer: osync.Public_Key) -> bool,
+	issuer_data:   rawptr,
 	default_quota: i64,
 	clock:         prim.Clock,
 	grants:        map[[32]u8]^Cap_Grant,
@@ -181,7 +186,14 @@ cap_authorizer_destroy :: proc(a: ^Cap_Authorizer) {
 }
 
 cap_authorizer :: proc(a: ^Cap_Authorizer) -> osync.Authorizer {
-	return osync.Authorizer{data = a, authorize = _cap_authorize}
+	return osync.Authorizer{data = a, authorize = _cap_authorize, observe = cap_authorizer_observe}
+}
+
+cap_authorizer_observe :: proc(data: rawptr, space: osync.Space_Id, id: osync.Stream_Id, bytes: []u8, revoked: ^[dynamic]osync.Device_Id) {
+	a := (^Cap_Authorizer)(data)
+	if a.inner.observe != nil {
+		a.inner.observe(a.inner.data, space, id, bytes, revoked)
+	}
 }
 
 @(private)
@@ -208,6 +220,9 @@ _cap_authorize :: proc(data: rawptr, credential: []u8, binding: []u8, local: boo
 	sig := credential[1 + CAPABILITY_LEN + 32:]
 	c, ok := capability_verify(token, prim.clock_wall_ms(a.clock))
 	if !ok || osync.device_id(pub) != c.grantee {
+		return .Auth
+	}
+	if a.issuer_ok == nil || !a.issuer_ok(a.issuer_data, c.space, c.issuer) {
 		return .Auth
 	}
 	if !local && (len(binding) == 0 || !osync.hello_verify(pub, sig, binding)) {
@@ -299,6 +314,8 @@ _cap_check :: proc(data: rawptr, p: ^osync.Principal, access: osync.Access, id: 
 		return .Write in c.access
 	case .Get:
 		return .Read in c.access
+	case .Fill:
+		return false
 	case .List, .Read, .Append, .Drop, .Redact:
 	}
 	if access == .List && id == {} {

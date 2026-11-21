@@ -289,6 +289,8 @@ _feed_release :: proc(r: ^Relay, sp: ^Space_State) {
 				_reply_id(c, .Dropped, p.id)
 			case .Redact:
 				_reply_redacted(c, p.id, p.from, p.total)
+			case .Note:
+				_reply_hollow(c, .Noted, p.id, p.from, p.length)
 			case:
 				_reply_len(c, .Appended, p.id, p.length)
 			}
@@ -551,7 +553,7 @@ _produce_listing :: proc(c: ^Conn) -> bool {
 			if st, sok := sp.streams[id]; sok && st.h != nil && !st.dropped && !st.poisoned {
 				length = st.length
 			} else {
-				l, exists, perr := r.store.stream_probe(r.store.data, sp.ns, id)
+				l, _, exists, perr := r.store.stream_probe(r.store.data, sp.ns, id)
 				if perr != .None || !exists {
 					continue
 				}
@@ -713,20 +715,20 @@ _compact_step :: proc(r: ^Relay, sp: ^Space_State) {
 				if _reserved(cast([32]u8)id) {
 					continue
 				}
-				length: i64
+				length, base: i64
 				if st, sok := sp.streams[id]; sok && st.h != nil && !st.dropped {
-					length = st.length
+					length, base = st.length, st.base
 				} else {
-					l, exists := r.store.stream_hint(r.store.data, sp.ns, id)
+					l, b, exists := r.store.stream_hint(r.store.data, sp.ns, id)
 					if !exists || l <= 0 {
 						continue
 					}
-					length = l
+					length, base = l, b
 				}
 				e: [FEED_ENTRY]u8
 				v := id
 				copy(e[:32], v[:])
-				prim.put_u64le(e[32:], u64(length))
+				prim.put_u64le(e[32:], u64(length) | (FEED_HOLLOW if base == length else 0))
 				append(&sp.compact_buf, ..e[:])
 			}
 			if len(sp.compact_buf) > 0 {
