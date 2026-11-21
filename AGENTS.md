@@ -28,7 +28,9 @@
   and put it on `PATH`.
 - Set `git config user.name wingleeio` and
   `git config user.email 44917547+wingleeio@users.noreply.github.com` before
-  the first commit.
+  the first commit, and export `GIT_AUTHOR_NAME=wingleeio` and
+  `GIT_COMMITTER_NAME=wingleeio`: the environment sets both to another name,
+  which overrides git config.
 - Odin on the test machines is not on the Zeron shell's `PATH`: on `WING-PC`
   use `C:\Users\wing_\dev-tools\odin\dist\odin.exe`, on `home-laptop`
   `~/.local/bin/odin`. Work only in `~/dev/0ndb-odin` and `~/dev/0ndb-scratch`
