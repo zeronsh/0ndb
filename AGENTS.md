@@ -12,6 +12,10 @@
 ## Rules
 
 - No code comments.
+- Run every scratch program, benchmark and test under a memory cap in the
+  same shell (`ulimit -v 4000000; <cmd>`, raise only with a reason) and a
+  `timeout`. The machine has 16 GB shared with the agent host; an uncapped
+  runaway gets the whole session killed.
 - Minimal tests: `tests/convergence`, `tests/fstree` and `tests/sim` (the
   deterministic whole-system simulator). Everything else is verified with throwaway programs, real git and
   real provider CLIs, not committed tests.
