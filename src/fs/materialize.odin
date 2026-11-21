@@ -80,6 +80,8 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	spans_touched(h, only_b[:], &touched) or_return
 	snap := version_snapshot(h, tl[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
+	prev_snap, prev_version := attr_set_checkout(m, new_clone(snap, context.temp_allocator), tl[:])
+	defer attr_set_checkout(m, prev_snap, prev_version)
 	displaced_touch(m, &snap, &touched) or_return
 	for c in m.collided {
 		if ino, ok, lerr := fstree.lookup(&snap, c); lerr == nil && ok {
@@ -528,9 +530,18 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		ensure_parent(m, abs) or_return
 		tmp := temp_name(m, abs, context.temp_allocator)
 		prim.remove(m.vfs, tmp)
+		linked := false
 		if mount_symlinks(m) {
-			from_prim(prim.symlink(m.vfs, it.target, tmp)) or_return
-		} else {
+			#partial switch serr := prim.symlink(m.vfs, it.target, tmp); serr {
+			case .None:
+				linked = true
+			case .Permission, .Unsupported, .Invalid:
+				m.link_mode = .Emulated
+			case:
+				return from_prim(serr)
+			}
+		}
+		if !linked {
 			fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, 0o644)
 			from_prim(oerr) or_return
 			werr := prim.write_at(m.vfs, fd, transmute([]u8)it.target, 0)
@@ -580,11 +591,22 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 		sink := Fd_Sink{m.vfs, fd, 0, .None}
 		out := io.Stream{procedure = fd_sink_proc, data = &sink}
 		smudge: Smudge_Sink
-		if eol_smudge_large(m, it.path, odb.Oid(reg.oid)) {
-			smudge = Smudge_Sink{inner = out, buf = make([]u8, 1 << 16, context.temp_allocator)}
-			out = io.Stream{procedure = smudge_sink_proc, data = &smudge}
+		serr: odb.Error
+		if cv := conv_attrs(m, it.path); cv.driver != nil || cv.ident || cv.encoding != .None {
+			t, blob, rerr := odb.read(m.db, odb.Oid(reg.oid), context.temp_allocator)
+			serr = rerr
+			if rerr == .None && t == .Blob && !eol_smudge_to(m, it.path, blob, out) {
+				prim.close_file(m.vfs, fd)
+				prim.remove(m.vfs, tmp)
+				return .Io
+			}
+		} else {
+			if eol_smudge_large(m, it.path, odb.Oid(reg.oid)) {
+				smudge = Smudge_Sink{inner = out, buf = make([]u8, 1 << 16, context.temp_allocator)}
+				out = io.Stream{procedure = smudge_sink_proc, data = &smudge}
+			}
+			_, _, serr = odb.stream(m.db, odb.Oid(reg.oid), out)
 		}
-		_, _, serr := odb.stream(m.db, odb.Oid(reg.oid), out)
 		prim.fchmod(m.vfs, fd, mode)
 		prim.close_file(m.vfs, fd)
 		if serr != .None || sink.err != .None {
@@ -606,17 +628,17 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 			return set_mode(m, abs, mode)
 		}
 	}
-	disk := eol_smudge(m, it.path, data)
 	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
 	if oerr != .None {
 		return from_prim(oerr)
 	}
-	werr := prim.write_at(m.vfs, fd, disk, 0)
+	sink := Fd_Sink{m.vfs, fd, 0, .None}
+	sok := eol_smudge_to(m, it.path, data, io.Stream{procedure = fd_sink_proc, data = &sink})
 	prim.fchmod(m.vfs, fd, mode)
 	prim.close_file(m.vfs, fd)
-	if werr != .None {
+	if !sok || sink.err != .None {
 		prim.remove(m.vfs, tmp)
-		return from_prim(werr)
+		return sink.err if sink.err != .None else .Io
 	}
 	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
 	mat_file(m, abs)
@@ -634,8 +656,8 @@ merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if rerr != .None {
 		return .None
 	}
-	ours := eol_clean(m, it.path, raw, it.inode, true)
-	if textdiff.is_binary(ours) {
+	ours, cok := eol_clean(m, it.path, raw, it.inode, true)
+	if !cok || textdiff.is_binary(ours) {
 		return .None
 	}
 	base, berr := history_text_at(h, it.inode, m.merge_base, context.temp_allocator)

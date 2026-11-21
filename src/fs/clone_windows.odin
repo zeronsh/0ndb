@@ -3,6 +3,15 @@ package fs
 import win "core:sys/windows"
 import "../prim"
 
+foreign import kernel32_clone "system:Kernel32.lib"
+
+@(private)
+@(default_calling_convention = "system")
+foreign kernel32_clone {
+	GetVolumePathNameW :: proc(name: cstring16, out: [^]u16, size: u32) -> win.BOOL ---
+	GetVolumeInformationW :: proc(root: cstring16, name: [^]u16, name_size: u32, serial: ^u32, max_component: ^u32, flags: ^u32, fs_name: [^]u16, fs_name_size: u32) -> win.BOOL ---
+}
+
 @(private)
 FILE_SUPPORTS_BLOCK_REFCOUNTING :: u32(0x0800_0000)
 @(private)
@@ -36,31 +45,67 @@ clone_file :: proc(vfs: prim.Vfs, src, dst: string, mode: u32) -> Error {
 	if vfs.procs != prim.os_vfs().procs {
 		return copy_file_vfs(vfs, src, dst, mode)
 	}
-	in_fd, ierr := prim.open_file(vfs, src)
-	if ierr != .None {
-		return from_prim(ierr)
-	}
-	cloned := block_clone(vfs, in_fd, dst, mode)
-	size: i64
-	if st, serr := prim.fstat(vfs, in_fd); serr == .None {
-		size = st.size
-	}
-	prim.close_file(vfs, in_fd)
-	if cloned {
-		return .None
-	}
 	sw, dw: [prim.PATH_MAX + 8]u16
-	if abs_wide(src, sw[:]) && abs_wide(dst, dw[:]) {
-		flags: u32 = win.COPY_FILE_NO_BUFFERING if size >= COPY_UNBUFFERED_MIN else 0
-		if win.CopyFileExW(cstring16(&sw[0]), cstring16(&dw[0]), nil, nil, nil, flags) {
-			attrs := win.GetFileAttributesW(cstring16(&dw[0]))
-			if attrs != win.INVALID_FILE_ATTRIBUTES && (attrs & ATTR_READONLY != 0) != (mode & 0o222 == 0) {
-				win.SetFileAttributesW(cstring16(&dw[0]), attrs ~ ATTR_READONLY)
+	if !abs_wide(src, sw[:]) || !abs_wide(dst, dw[:]) {
+		return copy_file_vfs(vfs, src, dst, mode)
+	}
+	info: win.WIN32_FILE_ATTRIBUTE_DATA
+	if !win.GetFileAttributesExW(cstring16(&sw[0]), win.GetFileExInfoStandard, &info) {
+		return copy_file_vfs(vfs, src, dst, mode)
+	}
+	if volume_block_clone(sw[:]) {
+		if in_fd, ierr := prim.open_file(vfs, src); ierr == .None {
+			cloned := block_clone(vfs, in_fd, dst, mode)
+			prim.close_file(vfs, in_fd)
+			if cloned {
+				return .None
 			}
-			return .None
 		}
 	}
+	size := i64(info.nFileSizeHigh) << 32 | i64(info.nFileSizeLow)
+	flags: u32 = win.COPY_FILE_NO_BUFFERING if size >= COPY_UNBUFFERED_MIN else 0
+	if win.CopyFileExW(cstring16(&sw[0]), cstring16(&dw[0]), nil, nil, nil, flags) {
+		if (info.dwFileAttributes & ATTR_READONLY != 0) != (mode & 0o222 == 0) {
+			win.SetFileAttributesW(cstring16(&dw[0]), info.dwFileAttributes ~ ATTR_READONLY)
+		}
+		return .None
+	}
 	return copy_file_vfs(vfs, src, dst, mode)
+}
+
+@(private)
+@(thread_local)
+clone_vol_key: u64
+
+@(private)
+@(thread_local)
+clone_vol_ok: bool
+
+@(private)
+volume_block_clone :: proc(path: []u16) -> bool {
+	parent := 0
+	for i := 0; i < len(path) && path[i] != 0; i += 1 {
+		if path[i] == '\\' {
+			parent = i
+		}
+	}
+	key := u64(14695981039346656037)
+	for c in path[:parent] {
+		key = (key ~ u64(c)) * 1099511628211
+	}
+	key |= 1
+	if key == clone_vol_key {
+		return clone_vol_ok
+	}
+	ok := false
+	root: [prim.PATH_MAX + 8]u16
+	flags: u32
+	if GetVolumePathNameW(cstring16(&path[0]), &root[0], u32(len(root))) && GetVolumeInformationW(cstring16(&root[0]), nil, 0, nil, nil, &flags, nil, 0) {
+		ok = flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0
+	}
+	clone_vol_key = key
+	clone_vol_ok = ok
+	return ok
 }
 
 @(private)

@@ -1173,6 +1173,7 @@ ignore_load :: proc(ig: ^Ignore, git_dir, common_dir: string, plain: bool) -> Er
 		attributes_file = p
 	}
 	git_settings_attributes(&ig.git, ig.vfs, attributes_file, ig.allocator)
+	ig.git.filters = c.filters
 	excludes_file := ""
 	if c.has_excludes {
 		excludes_file = string(c.excludes[:c.excludes_len])
@@ -1270,6 +1271,7 @@ Git_Config :: struct {
 	attributes:      [prim.PATH_MAX]u8,
 	attributes_len:  int,
 	has_attributes:  bool,
+	filters:         [dynamic]Filter_Driver,
 }
 
 @(private = "file")
@@ -1583,6 +1585,10 @@ config_entry :: proc(c: ^Git_Config, key, val: string, has_value: bool, from: st
 			return config_include(c, val, from)
 		}
 	case:
+		if len(key) > 7 && ignore_has_prefix(key, "filter.") {
+			config_filter(c, key[7:], val, has_value)
+			return .None
+		}
 		if has_value && len(key) >= 15 && ignore_has_prefix(key, "includeif.") && key[len(key) - 5:] == ".path" {
 			if config_condition(c, key[10:len(key) - 5], from) {
 				return config_include(c, val, from)
@@ -1590,6 +1596,57 @@ config_entry :: proc(c: ^Git_Config, key, val: string, has_value: bool, from: st
 		}
 	}
 	return .None
+}
+
+@(private = "file")
+config_filter :: proc(c: ^Git_Config, rest, val: string, has_value: bool) {
+	dot := -1
+	for i := len(rest) - 1; i >= 0; i -= 1 {
+		if rest[i] == '.' {
+			dot = i
+			break
+		}
+	}
+	if dot <= 0 {
+		return
+	}
+	name, field := rest[:dot], rest[dot + 1:]
+	if field != "clean" && field != "smudge" && field != "process" && field != "required" {
+		return
+	}
+	if c.filters == nil {
+		c.filters = make([dynamic]Filter_Driver, c.allocator)
+	}
+	d: ^Filter_Driver
+	for &f in c.filters {
+		if f.name == name {
+			d = &f
+		}
+	}
+	if d == nil {
+		n, _ := clone_string(name, c.allocator)
+		append(&c.filters, Filter_Driver{name = n})
+		d = &c.filters[len(c.filters) - 1]
+	}
+	switch field {
+	case "required":
+		if b, ok := config_bool(val, has_value); ok {
+			d.required = b
+		}
+	case:
+		if !has_value {
+			return
+		}
+		v, _ := clone_string(val, c.allocator)
+		switch field {
+		case "clean":
+			d.clean = v
+		case "smudge":
+			d.smudge = v
+		case "process":
+			d.process = v
+		}
+	}
 }
 
 @(private = "file")
@@ -1606,7 +1663,7 @@ config_include :: proc(c: ^Git_Config, val, from: string) -> Error {
 }
 
 @(private = "file")
-config_path :: proc "contextless" (buf: []u8, val, from: string) -> (string, bool) {
+config_path :: proc(buf: []u8, val, from: string) -> (string, bool) {
 	n := 0
 	rest := val
 	if len(val) > 0 && val[0] == '~' {
@@ -1621,7 +1678,13 @@ config_path :: proc "contextless" (buf: []u8, val, from: string) -> (string, boo
 		n = copy(buf, home)
 		rest = val[1:]
 	} else if ignore_has_prefix(val, "%(prefix)/") {
-		return "", false
+		pbuf: [prim.PATH_MAX]u8
+		prefix, ok := git_prefix(pbuf[:])
+		if !ok || len(prefix) > len(buf) {
+			return "", false
+		}
+		n = copy(buf, prefix)
+		rest = val[len("%(prefix)"):]
 	} else if len(val) > 0 && !path_is_abs(val) && len(from) > 0 {
 		slash := len(from) - 1
 		for slash >= 0 && from[slash] != '/' {

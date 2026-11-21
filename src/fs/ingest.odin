@@ -726,7 +726,7 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	if !clean {
 		mark_dirty_dirs(st, it.path)
 	}
-	if clean && m.has_git && m.db != nil && eol_action(m, it.path) != .Binary {
+	if clean && m.has_git && m.db != nil && conv_needed(m, it.path) {
 		if _, hsize, herr := odb.read_header(m.db, e.oid); herr == .None {
 			size = hsize
 		} else {
@@ -745,12 +745,16 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 				return .None
 			}
 			oid = o
-		} else if m.has_git && m.db != nil && stat.size <= m.opts.large_limit && eol_action(m, it.path) != .Binary {
+		} else if m.has_git && m.db != nil && stat.size <= m.opts.large_limit && conv_needed(m, it.path) {
 			d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
 			if rerr != .None {
 				return .None
 			}
-			d = eol_clean(m, it.path, d)
+			cd, cok := eol_clean(m, it.path, d)
+			if !cok {
+				return .None
+			}
+			d = cd
 			binary = textdiff.is_binary(d)
 			o, werr := odb.write(m.db, .Blob, d)
 			if werr != .None {
@@ -2192,7 +2196,11 @@ read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{
 	if rerr != .None {
 		return nil, {}, false, false, .None
 	}
-	d = eol_clean(m, rel, d, old, has_old)
+	cd, cok := eol_clean(m, rel, d, old, has_old)
+	if !cok {
+		return nil, {}, false, false, .None
+	}
+	d = cd
 	binary = textdiff.is_binary(d)
 	if m.db != nil {
 		o, herr := odb.hash(m.db.format, .Blob, d)

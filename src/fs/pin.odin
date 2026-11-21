@@ -146,6 +146,8 @@ mount_commit :: proc(m: ^Mount, info: Commit_Info) -> (commit: odb.Oid, err: Err
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
 	mount_wake(m) or_return
+	m.gitlinks = gitlinks_refresh(m) or_return
+	defer m.gitlinks = nil
 	tree, nonempty := dir_tree(m, "") or_return
 	if !nonempty {
 		tree = from_odb_v(odb.write_tree(m.db, nil)) or_return
@@ -220,6 +222,45 @@ dir_tree :: proc(m: ^Mount, dir: string, pack: ^odb.Pack_Builder = nil) -> (oid:
 		n, _ := clone_string(k.name, heap)
 		append(&names, n)
 		append(&entries, odb.Tree_Entry{name = n, oid = e.oid, mode = mode})
+	}
+	for gl in m.gitlinks {
+		if !path_under(gl.path, dir) && len(dir) > 0 {
+			continue
+		}
+		sub := gl.path[len(dir) + 1:] if len(dir) > 0 else gl.path
+		slash := -1
+		for c, i in transmute([]u8)sub {
+			if c == '/' {
+				slash = i
+				break
+			}
+		}
+		name := sub if slash < 0 else sub[:slash]
+		exists := false
+		for en in entries {
+			if en.name == name {
+				exists = true
+				break
+			}
+		}
+		if exists {
+			continue
+		}
+		if slash < 0 {
+			n, _ := clone_string(name, heap)
+			append(&names, n)
+			append(&entries, odb.Tree_Entry{name = n, oid = gl.oid, mode = odb.MODE_GITLINK})
+			continue
+		}
+		child, _ := path_join(dir, name, heap)
+		sub_oid, any, serr := dir_tree(m, child, pack)
+		delete(child, heap)
+		serr or_return
+		if any {
+			n, _ := clone_string(name, heap)
+			append(&names, n)
+			append(&entries, odb.Tree_Entry{name = n, oid = sub_oid, mode = odb.MODE_TREE})
+		}
 	}
 	if len(entries) == 0 {
 		return {}, false, .None

@@ -3,6 +3,7 @@ package fs
 import "base:runtime"
 import "core:io"
 import "core:mem/virtual"
+import "../crdt"
 import "../fstree"
 import "../odb"
 import "../prim"
@@ -20,7 +21,16 @@ Core_Eol :: enum u8 {
 	Native,
 }
 
+Filter_Driver :: struct {
+	name:     string,
+	clean:    string,
+	smudge:   string,
+	process:  string,
+	required: bool,
+}
+
 Git_Settings :: struct {
+	filters:      [dynamic]Filter_Driver,
 	autocrlf:     Autocrlf,
 	core_eol:     Core_Eol,
 	trust_exec:   bool,
@@ -80,6 +90,17 @@ Attr_Ctx :: struct {
 	system: ^Attr_File,
 	macros: map[string][]Attr_Assign,
 	depth:  int,
+	procs:  [dynamic]^Filter_Proc,
+	index:  map[string]odb.Oid,
+	indexed: bool,
+	ix:      Index_Reader,
+	ix_open: bool,
+	ix_cur:  Index_Entry,
+	ix_have: bool,
+	ix_key:  string,
+	ix_runs: int,
+	snap:   ^fstree.Snapshot,
+	version: []crdt.Lv,
 }
 
 @(private)
@@ -114,49 +135,70 @@ git_program_data_config :: proc(buf: []u8) -> (string, bool) {
 }
 
 @(private)
+git_prefix :: proc(buf: []u8) -> (string, bool) {
+	path, ok := prim.getenv("PATH")
+	if !ok {
+		return "", false
+	}
+	sep: u8 = ';' if ODIN_OS == .Windows else ':'
+	exe_name := "git.exe" if ODIN_OS == .Windows else "git"
+	rest := path
+	for len(rest) > 0 {
+		i := 0
+		for i < len(rest) && rest[i] != sep {
+			i += 1
+		}
+		dir := rest[:i]
+		rest = rest[i + 1:] if i < len(rest) else ""
+		for len(dir) > 1 && (dir[len(dir) - 1] == '\\' || dir[len(dir) - 1] == '/') {
+			dir = dir[:len(dir) - 1]
+		}
+		if len(dir) == 0 {
+			continue
+		}
+		pbuf: prim.Path_Buf
+		exe, eok := path_join_buf(pbuf[:], dir, exe_name)
+		if !eok || !prim.exists(prim.os_vfs(), exe) {
+			continue
+		}
+		prefix := prim.dir_name(dir)
+		leaf := path_leaf(dir, prefix)
+		if ascii_fold_eq(leaf, "bin") || ascii_fold_eq(leaf, "cmd") || ascii_fold_eq(leaf, "libexec") {
+			parent := prim.dir_name(prefix)
+			pleaf := path_leaf(prefix, parent)
+			if ODIN_OS == .Windows && (ascii_fold_eq(pleaf, "mingw64") || ascii_fold_eq(pleaf, "mingw32") || ascii_fold_eq(pleaf, "clangarm64") || ascii_fold_eq(pleaf, "usr")) {
+				prefix = parent
+			}
+		} else {
+			prefix = dir
+		}
+		if len(prefix) > len(buf) {
+			return "", false
+		}
+		n := copy(buf, prefix)
+		return string(buf[:n]), true
+	}
+	return "", false
+}
+
+@(private)
+path_leaf :: proc "contextless" (dir, parent: string) -> string {
+	leaf := dir[len(parent):]
+	for len(leaf) > 0 && (leaf[0] == '\\' || leaf[0] == '/') {
+		leaf = leaf[1:]
+	}
+	return leaf
+}
+
+@(private)
 git_system_file :: proc(buf: []u8, rel: string) -> (string, bool) {
 	when ODIN_OS == .Windows {
-		path, ok := prim.getenv("PATH")
+		pbuf: [prim.PATH_MAX]u8
+		prefix, ok := git_prefix(pbuf[:])
 		if !ok {
 			return "", false
 		}
-		rest := path
-		for len(rest) > 0 {
-			i := 0
-			for i < len(rest) && rest[i] != ';' {
-				i += 1
-			}
-			dir := rest[:i]
-			rest = rest[i + 1:] if i < len(rest) else ""
-			for len(dir) > 0 && (dir[len(dir) - 1] == '\\' || dir[len(dir) - 1] == '/') {
-				dir = dir[:len(dir) - 1]
-			}
-			if len(dir) == 0 {
-				continue
-			}
-			pbuf: prim.Path_Buf
-			exe, eok := path_join_buf(pbuf[:], dir, "git.exe")
-			if !eok || !prim.exists(prim.os_vfs(), exe) {
-				continue
-			}
-			prefix := prim.dir_name(dir)
-			leaf := dir[len(prefix):]
-			for len(leaf) > 0 && (leaf[0] == '\\' || leaf[0] == '/') {
-				leaf = leaf[1:]
-			}
-			if ascii_fold_eq(leaf, "bin") || ascii_fold_eq(leaf, "cmd") {
-				parent := prim.dir_name(prefix)
-				pleaf := prefix[len(parent):]
-				for len(pleaf) > 0 && (pleaf[0] == '\\' || pleaf[0] == '/') {
-					pleaf = pleaf[1:]
-				}
-				if ascii_fold_eq(pleaf, "mingw64") || ascii_fold_eq(pleaf, "mingw32") || ascii_fold_eq(pleaf, "clangarm64") || ascii_fold_eq(pleaf, "usr") {
-					prefix = parent
-				}
-				return path_join_buf(buf, prefix, rel)
-			}
-		}
-		return "", false
+		return path_join_buf(buf, prefix, rel)
 	} else {
 		return path_join_buf(buf, "/", rel)
 	}
@@ -204,6 +246,14 @@ git_settings_attributes :: proc(g: ^Git_Settings, vfs: prim.Vfs, global: string,
 }
 
 git_settings_destroy :: proc(g: ^Git_Settings, allocator: runtime.Allocator) {
+	for f in g.filters {
+		delete(f.name, allocator)
+		delete(f.clean, allocator)
+		delete(f.smudge, allocator)
+		delete(f.process, allocator)
+	}
+	delete(g.filters)
+	g.filters = nil
 	if g.global_attrs != nil {
 		delete(g.global_attrs, allocator)
 	}
@@ -228,7 +278,34 @@ mount_trust_exec :: proc(m: ^Mount) -> bool {
 }
 
 mount_symlinks :: proc(m: ^Mount) -> bool {
-	return !m.has_git || m.ignore.git.symlinks
+	if m.link_mode == .Emulated || (m.has_git && !m.ignore.git.symlinks) {
+		return false
+	}
+	when ODIN_OS == .Windows {
+		if m.link_mode == .Unknown {
+			probe_path, _ := path_join(m.root, "x", context.temp_allocator)
+			tmp := temp_name(m, probe_path, context.temp_allocator)
+			prim.remove(m.vfs, tmp)
+			#partial switch prim.symlink(m.vfs, "x", tmp) {
+			case .None:
+				prim.remove(m.vfs, tmp)
+				m.link_mode = .Native
+			case .Permission, .Unsupported, .Invalid:
+				m.link_mode = .Emulated
+			}
+		}
+	}
+	return m.link_mode != .Emulated
+}
+
+mount_symlinks_emulated :: proc(m: ^Mount) -> bool {
+	return m.link_mode == .Emulated || (m.has_git && !m.ignore.git.symlinks)
+}
+
+Link_Mode :: enum u8 {
+	Unknown,
+	Native,
+	Emulated,
 }
 
 exec_bit :: proc(m: ^Mount, stat: Stat, prev: bool) -> bool {
@@ -269,8 +346,140 @@ attr_end :: proc(m: ^Mount) {
 		return
 	}
 	m.attrs = nil
+	if c.ix_open {
+		index_close(&c.ix)
+	}
+	for fp in c.procs {
+		filter_proc_stop(fp)
+		free(fp, runtime.heap_allocator())
+	}
+	delete(c.procs)
 	virtual.arena_destroy(&c.arena)
 	free(c, runtime.heap_allocator())
+}
+
+@(private)
+attr_filter_proc :: proc(m: ^Mount, driver: ^Filter_Driver) -> ^Filter_Proc {
+	c := m.attrs
+	for fp in c.procs {
+		if fp.driver == driver {
+			return fp
+		}
+	}
+	fp := new(Filter_Proc, runtime.heap_allocator())
+	fp.driver = driver
+	if c.procs == nil {
+		c.procs = make([dynamic]^Filter_Proc, runtime.heap_allocator())
+	}
+	append(&c.procs, fp)
+	return fp
+}
+
+attr_set_checkout :: proc(m: ^Mount, snap: ^fstree.Snapshot, version: []crdt.Lv) -> (prev: ^fstree.Snapshot, prev_version: []crdt.Lv) {
+	c := m.attrs
+	if c == nil {
+		return
+	}
+	prev, prev_version = c.snap, c.version
+	c.snap = snap
+	c.version = version
+	clear(&c.files)
+	attr_load_globals(m, c)
+	return
+}
+
+@(private)
+attr_history_text :: proc(m: ^Mount, c: ^Attr_Ctx, rel: string) -> ([]u8, bool) {
+	if c.snap == nil || m.history == nil {
+		return nil, false
+	}
+	ino, found, lerr := fstree.lookup(c.snap, rel)
+	if lerr != nil || !found {
+		return nil, false
+	}
+	info, ok, ierr := fstree.info(c.snap, ino, c.alloc)
+	if ierr != nil || !ok || !info.present || info.kind != .File {
+		return nil, false
+	}
+	ids := crdt.graph_version_ids(&m.history.g, c.version, c.alloc)
+	data, err := history_text_at(m.history, ino, ids, c.alloc)
+	if err != .None {
+		return nil, false
+	}
+	return data, true
+}
+
+@(private)
+INDEX_SCAN_RUNS :: 2
+
+@(private)
+index_blob :: proc(m: ^Mount, rel: string) -> (oid: odb.Oid, found: bool) {
+	c := m.attrs
+	if c == nil || !m.has_git || m.db == nil {
+		return
+	}
+	if !c.indexed && c.ix_open && rel < c.ix_key {
+		index_close(&c.ix)
+		c.ix_open = false
+	}
+	if !c.indexed && !c.ix_open {
+		if c.ix_runs >= INDEX_SCAN_RUNS {
+			index_fill(m, c)
+		} else {
+			c.ix_runs += 1
+			c.ix_have = false
+			if index_open(&c.ix, m.vfs, m.git.dir, m.git_format, c.alloc) != .None {
+				c.indexed = true
+				c.index = make(map[string]odb.Oid, c.alloc)
+				return
+			}
+			c.ix_open = true
+		}
+	}
+	if c.indexed {
+		oid, found = c.index[rel]
+		return
+	}
+	c.ix_key, _ = clone_string(rel, c.alloc)
+	for {
+		if !c.ix_have {
+			e, ok, err := index_next(&c.ix)
+			if err != .None || !ok {
+				return
+			}
+			c.ix_cur = e
+			c.ix_have = true
+		}
+		e := c.ix_cur
+		if e.path > rel {
+			return
+		}
+		if e.path == rel {
+			return e.oid, e.stage == 0 && e.mode & 0o170000 == 0o100000
+		}
+		c.ix_have = false
+	}
+}
+
+@(private)
+index_fill :: proc(m: ^Mount, c: ^Attr_Ctx) {
+	c.indexed = true
+	c.index = make(map[string]odb.Oid, c.alloc)
+	r: Index_Reader
+	if index_open(&r, m.vfs, m.git.dir, m.git_format, c.alloc) != .None {
+		return
+	}
+	for {
+		e, ok, err := index_next(&r)
+		if err != .None || !ok {
+			break
+		}
+		if e.stage == 0 && e.mode & 0o170000 == 0o100000 {
+			k, _ := clone_string(e.path, c.alloc)
+			c.index[k] = e.oid
+		}
+	}
+	index_close(&r)
 }
 
 attr_invalidate :: proc(m: ^Mount, rel: string) {
@@ -328,18 +537,23 @@ attr_dir_file :: proc(m: ^Mount, c: ^Attr_Ctx, dir: string) -> ^Attr_File {
 	}
 	key, _ := clone_string(dir, c.alloc)
 	c.files[key] = nil
-	buf: prim.Path_Buf
-	p, ok := path_join_buf(buf[:], m.root, dir, ".gitattributes")
-	if !ok {
-		return nil
-	}
-	st, serr := prim.lstat(m.vfs, p)
-	if serr != .None || st.kind != .File {
-		return nil
-	}
-	data, err := ignore_read(m.vfs, p, ATTR_FILE_MAX, c.alloc)
-	if err != .None {
-		return nil
+	rel, _ := path_join(dir, ".gitattributes", c.alloc)
+	data, have := attr_history_text(m, c, rel)
+	if !have {
+		buf: prim.Path_Buf
+		p, ok := path_join_buf(buf[:], m.root, rel)
+		if !ok {
+			return nil
+		}
+		st, serr := prim.lstat(m.vfs, p)
+		if serr != .None || st.kind != .File {
+			return nil
+		}
+		d, err := ignore_read(m.vfs, p, ATTR_FILE_MAX, c.alloc)
+		if err != .None {
+			return nil
+		}
+		data = d
 	}
 	f := attr_parse(data, key, len(dir) == 0, c.alloc)
 	c.files[key] = f
@@ -559,7 +773,10 @@ Attr_Want :: struct {
 	text:  Attr_Assign,
 	eol:   Attr_Assign,
 	crlf:  Attr_Assign,
-	have:  bit_set[0 ..< 3],
+	ident: Attr_Assign,
+	filter: Attr_Assign,
+	encoding: Attr_Assign,
+	have:  bit_set[0 ..< 6],
 	seen:  map[string]bool,
 }
 
@@ -573,6 +790,12 @@ attr_apply :: proc(c: ^Attr_Ctx, w: ^Attr_Want, a: Attr_Assign) {
 		slot = 1
 	case "crlf":
 		slot = 2
+	case "ident":
+		slot = 3
+	case "filter":
+		slot = 4
+	case "working-tree-encoding":
+		slot = 5
 	}
 	if slot >= 0 {
 		if slot in w.have {
@@ -586,6 +809,12 @@ attr_apply :: proc(c: ^Attr_Ctx, w: ^Attr_Want, a: Attr_Assign) {
 			w.eol = a
 		case 2:
 			w.crlf = a
+		case 3:
+			w.ident = a
+		case 4:
+			w.filter = a
+		case 5:
+			w.encoding = a
 		}
 		return
 	}
@@ -615,7 +844,7 @@ attr_fill :: proc(c: ^Attr_Ctx, w: ^Attr_Want, f: ^Attr_File, rel: string, fold:
 		for j := len(l.assigns) - 1; j >= 0; j -= 1 {
 			attr_apply(c, w, l.assigns[j])
 		}
-		if card(w.have) == 3 {
+		if card(w.have) == 6 {
 			return
 		}
 	}
@@ -630,7 +859,7 @@ attr_lookup :: proc(m: ^Mount, rel: string) -> Attr_Want {
 	fold := mount_git_settings(m).ignore_case
 	attr_fill(c, &w, c.info, rel, fold)
 	dir := path_parent(rel)
-	for card(w.have) < 3 {
+	for card(w.have) < 6 {
 		attr_fill(c, &w, attr_dir_file(m, c, dir), rel, fold)
 		if len(dir) == 0 {
 			break
@@ -686,15 +915,77 @@ text_eol_is_crlf :: proc "contextless" (g: ^Git_Settings) -> bool {
 	return false
 }
 
-eol_action :: proc(m: ^Mount, rel: string) -> Crlf_Action {
+Conv :: struct {
+	action:   Crlf_Action,
+	ident:    bool,
+	encoding: Encoding,
+	driver:   ^Filter_Driver,
+}
+
+Encoding :: enum u8 {
+	None,
+	Utf16,
+	Utf16le,
+	Utf16be,
+	Utf16le_Bom,
+	Utf32,
+	Utf32le,
+	Utf32be,
+	Utf32le_Bom,
+	Unsupported,
+}
+
+@(private)
+encoding_from :: proc(a: Attr_Assign) -> Encoding {
+	if a.state != .Value || len(a.value) == 0 {
+		return .None
+	}
+	buf: [64]u8
+	n := 0
+	v := a.value
+	for c, i in transmute([]u8)v {
+		if n >= len(buf) {
+			return .Unsupported
+		}
+		if c == '-' && n == 3 && i == 3 {
+			continue
+		}
+		buf[n] = c - 32 if c >= 'a' && c <= 'z' else c
+		n += 1
+	}
+	switch string(buf[:n]) {
+	case "UTF8":
+		return .None
+	case "UTF16":
+		return .Utf16
+	case "UTF16LE":
+		return .Utf16le
+	case "UTF16BE":
+		return .Utf16be
+	case "UTF16LE-BOM":
+		return .Utf16le_Bom
+	case "UTF32":
+		return .Utf32
+	case "UTF32LE":
+		return .Utf32le
+	case "UTF32BE":
+		return .Utf32be
+	case "UTF32LE-BOM":
+		return .Utf32le_Bom
+	}
+	return .Unsupported
+}
+
+conv_attrs :: proc(m: ^Mount, rel: string) -> (cv: Conv) {
+	cv.action = .Binary
 	if !m.has_git {
-		return .Binary
+		return
 	}
 	owned := m.attrs == nil
 	if owned {
 		attr_begin(m)
 		if m.attrs == nil {
-			return .Binary
+			return
 		}
 	}
 	defer if owned {
@@ -733,7 +1024,24 @@ eol_action :: proc(m: ^Mount, rel: string) -> Crlf_Action {
 			action = .Auto_Input
 		}
 	}
-	return action
+	cv.action = action
+	cv.ident = 3 in w.have && w.ident.state == .Set
+	if 4 in w.have && w.filter.state == .Value {
+		cv.driver = filter_find(m, w.filter.value)
+	}
+	if 5 in w.have {
+		cv.encoding = encoding_from(w.encoding)
+	}
+	return
+}
+
+conv_needed :: proc(m: ^Mount, rel: string) -> bool {
+	cv := conv_attrs(m, rel)
+	return cv.action != .Binary || cv.ident || cv.encoding != .None || cv.driver != nil
+}
+
+eol_action :: proc(m: ^Mount, rel: string) -> Crlf_Action {
+	return conv_attrs(m, rel).action
 }
 
 @(private)
@@ -864,43 +1172,424 @@ eol_smudge_action :: proc(m: ^Mount, action: Crlf_Action, data: []u8, allocator 
 }
 
 @(private)
-Old_Text :: struct {
-	m:     ^Mount,
-	inode: fstree.Inode_Id,
+index_has_crlf :: proc(m: ^Mount, rel: string) -> bool {
+	oid, found := index_blob(m, rel)
+	if !found || m.db == nil {
+		return false
+	}
+	t, data, err := odb.read(m.db, oid, context.temp_allocator)
+	if err != .None || t != .Blob {
+		return false
+	}
+	has := false
+	for c in data {
+		if c == '\r' {
+			has = true
+			break
+		}
+	}
+	if !has {
+		return false
+	}
+	st := text_stat(data)
+	return !text_is_binary(st) && st.crlf > 0
 }
 
-eol_clean :: proc(m: ^Mount, rel: string, data: []u8, inode := fstree.Inode_Id{}, has_old := false, allocator := context.temp_allocator) -> []u8 {
-	if !m.has_git || len(data) == 0 {
-		return data
+@(private)
+Cr_Probe :: struct {
+	m:   ^Mount,
+	rel: string,
+}
+
+eol_clean :: proc(m: ^Mount, rel: string, data: []u8, inode := fstree.Inode_Id{}, has_old := false, allocator := context.temp_allocator) -> ([]u8, bool) {
+	if !m.has_git {
+		return data, true
 	}
-	action := eol_action(m, rel)
-	if action == .Binary {
-		return data
+	cv := conv_attrs(m, rel)
+	out := data
+	if cv.driver != nil {
+		sink := Buf_Sink{buf = make([dynamic]u8, 0, len(data), allocator)}
+		if filter_apply(m, cv.driver, .Clean, rel, Filter_Input{data = out, fd = prim.INVALID_FD}, io.Stream{procedure = buf_sink_proc, data = &sink}) {
+			out = sink.buf[:]
+		} else if cv.driver.required {
+			return nil, false
+		}
 	}
-	ot := Old_Text{m, inode}
-	return eol_clean_action(action, data, proc(p: rawptr) -> bool {
-		o := (^Old_Text)(p)
-		if o.m.history == nil {
-			return false
+	return clean_stages(m, rel, cv, out, allocator)
+}
+
+@(private)
+clean_stages :: proc(m: ^Mount, rel: string, cv: Conv, data: []u8, allocator: runtime.Allocator) -> ([]u8, bool) {
+	out := data
+	if cv.encoding != .None {
+		enc, ok := encode_to_git(cv.encoding, out, allocator)
+		if !ok {
+			return nil, false
 		}
-		old, err := history_text_at(o.m.history, o.inode, o.m.synced[:], context.temp_allocator)
-		if err != .None {
-			return false
+		out = enc
+	}
+	if cv.action != .Binary && len(out) > 0 {
+		pr := Cr_Probe{m, rel}
+		out = eol_clean_action(cv.action, out, proc(p: rawptr) -> bool {
+			x := (^Cr_Probe)(p)
+			return index_has_crlf(x.m, x.rel)
+		}, &pr, allocator)
+	}
+	if cv.ident {
+		out = ident_to_git(out, allocator)
+	}
+	return out, true
+}
+
+eol_smudge_to :: proc(m: ^Mount, rel: string, data: []u8, out: io.Stream) -> bool {
+	work := data
+	cv: Conv
+	if m.has_git {
+		cv = conv_attrs(m, rel)
+		if cv.ident {
+			oid, _ := odb.hash(m.db.format if m.db != nil else .Sha1, .Blob, work)
+			work = ident_to_worktree(work, oid, m.db.format if m.db != nil else .Sha1, context.temp_allocator)
 		}
-		for c in old {
-			if c == '\r' {
-				return true
+		if cv.action != .Binary && len(work) > 0 {
+			work = eol_smudge_action(m, cv.action, work, context.temp_allocator)
+		}
+		if cv.encoding != .None {
+			if enc, ok := encode_to_worktree(cv.encoding, work, context.temp_allocator); ok {
+				work = enc
 			}
 		}
-		return false
-	} if has_old else nil, &ot, allocator)
+		if cv.driver != nil {
+			if filter_apply(m, cv.driver, .Smudge, rel, Filter_Input{data = work, fd = prim.INVALID_FD}, out) {
+				return true
+			}
+			if cv.driver.required {
+				return false
+			}
+		}
+	}
+	_, err := io.write(out, work)
+	return err == nil
 }
 
 eol_smudge :: proc(m: ^Mount, rel: string, data: []u8, allocator := context.temp_allocator) -> []u8 {
 	if !m.has_git || len(data) == 0 {
 		return data
 	}
-	return eol_smudge_action(m, eol_action(m, rel), data, allocator)
+	sink := Buf_Sink{buf = make([dynamic]u8, 0, len(data), allocator)}
+	if !eol_smudge_to(m, rel, data, io.Stream{procedure = buf_sink_proc, data = &sink}) {
+		return data
+	}
+	return sink.buf[:]
+}
+
+@(private)
+ident_count :: proc(data: []u8) -> bool {
+	for i in 0 ..< len(data) {
+		if data[i] != '$' || i + 3 > len(data) || string(data[i + 1:i + 3]) != "Id" {
+			continue
+		}
+		if i + 3 < len(data) && data[i + 3] == '$' {
+			return true
+		}
+		if i + 3 < len(data) && data[i + 3] == ':' {
+			for k in i + 4 ..< len(data) {
+				if data[k] == '\n' {
+					break
+				}
+				if data[k] == '$' {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+ident_to_git :: proc(data: []u8, allocator := context.temp_allocator) -> []u8 {
+	if !ident_count(data) {
+		return data
+	}
+	out := make([dynamic]u8, 0, len(data), allocator)
+	src := data
+	for {
+		d := -1
+		for c, i in src {
+			if c == '$' {
+				d = i
+				break
+			}
+		}
+		if d < 0 {
+			break
+		}
+		append(&out, ..src[:d + 1])
+		src = src[d + 1:]
+		if len(src) > 3 && string(src[:3]) == "Id:" {
+			e := -1
+			for c, i in src[3:] {
+				if c == '$' {
+					e = i + 3
+					break
+				}
+			}
+			if e < 0 {
+				break
+			}
+			nl := false
+			for c in src[3:e] {
+				if c == '\n' {
+					nl = true
+					break
+				}
+			}
+			if nl {
+				continue
+			}
+			append(&out, "Id$")
+			src = src[e + 1:]
+		}
+	}
+	append(&out, ..src)
+	return out[:]
+}
+
+ident_to_worktree :: proc(data: []u8, oid: odb.Oid, format: odb.Hash_Format, allocator := context.temp_allocator) -> []u8 {
+	if !ident_count(data) {
+		return data
+	}
+	hexbuf: [odb.MAX_HEX]u8
+	o := oid
+	hex := odb.oid_to_string(o, format, &hexbuf)
+	out := make([dynamic]u8, 0, len(data) + 64, allocator)
+	src := data
+	for {
+		d := -1
+		for c, i in src {
+			if c == '$' {
+				d = i
+				break
+			}
+		}
+		if d < 0 {
+			break
+		}
+		append(&out, ..src[:d + 1])
+		src = src[d + 1:]
+		if len(src) < 3 || string(src[:2]) != "Id" {
+			continue
+		}
+		if src[2] == '$' {
+			src = src[3:]
+		} else if src[2] == ':' {
+			e := -1
+			for c, i in src[3:] {
+				if c == '$' {
+					e = i + 3
+					break
+				}
+			}
+			if e < 0 {
+				break
+			}
+			skip := false
+			for c in src[3:e] {
+				if c == '\n' {
+					skip = true
+					break
+				}
+			}
+			if skip {
+				continue
+			}
+			if e > 4 {
+				for c, i in src[4:e] {
+					if c == ' ' && 4 + i < e - 1 {
+						skip = true
+						break
+					}
+				}
+			}
+			if skip {
+				continue
+			}
+			src = src[e + 1:]
+		} else {
+			continue
+		}
+		append(&out, "Id: ")
+		append(&out, hex)
+		append(&out, " $")
+	}
+	append(&out, ..src)
+	return out[:]
+}
+
+@(private)
+utf16_native_le :: proc "contextless" () -> bool {
+	return ODIN_OS == .Linux
+}
+
+@(private)
+enc_unit :: proc "contextless" (e: Encoding) -> (width: int, le: bool, bom_in: int, bom_out: bool) {
+	#partial switch e {
+	case .Utf16:
+		return 2, utf16_native_le(), 1, true
+	case .Utf16le:
+		return 2, true, -1, false
+	case .Utf16be:
+		return 2, false, -1, false
+	case .Utf16le_Bom:
+		return 2, true, 1, true
+	case .Utf32:
+		return 4, utf16_native_le(), 1, true
+	case .Utf32le:
+		return 4, true, -1, false
+	case .Utf32be:
+		return 4, false, -1, false
+	case .Utf32le_Bom:
+		return 4, true, 1, true
+	}
+	return 0, false, 0, false
+}
+
+@(private)
+get_unit :: proc "contextless" (b: []u8, width: int, le: bool) -> u32 {
+	if width == 2 {
+		return u32(b[0]) | u32(b[1]) << 8 if le else u32(b[1]) | u32(b[0]) << 8
+	}
+	if le {
+		return u32(b[0]) | u32(b[1]) << 8 | u32(b[2]) << 16 | u32(b[3]) << 24
+	}
+	return u32(b[3]) | u32(b[2]) << 8 | u32(b[1]) << 16 | u32(b[0]) << 24
+}
+
+@(private)
+put_unit :: proc(out: ^[dynamic]u8, v: u32, width: int, le: bool) {
+	if width == 2 {
+		if le {
+			append(out, u8(v), u8(v >> 8))
+		} else {
+			append(out, u8(v >> 8), u8(v))
+		}
+		return
+	}
+	if le {
+		append(out, u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24))
+	} else {
+		append(out, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+	}
+}
+
+encode_to_git :: proc(e: Encoding, data: []u8, allocator := context.temp_allocator) -> ([]u8, bool) {
+	if e == .None {
+		return data, true
+	}
+	if e == .Unsupported {
+		return nil, false
+	}
+	width, le, bom, _ := enc_unit(e)
+	src := data
+	has_bom := false
+	bom_le := false
+	if len(src) >= width {
+		first := get_unit(src, width, true)
+		if (width == 2 && (first == 0xFEFF || first == 0xFFFE)) || (width == 4 && (first == 0xFEFF || first == 0xFFFE0000)) {
+			has_bom = true
+			bom_le = first == 0xFEFF
+		}
+	}
+	if bom < 0 && has_bom {
+		return nil, false
+	}
+	if bom > 0 {
+		if !has_bom {
+			if e == .Utf16 || e == .Utf32 {
+				return nil, false
+			}
+		} else {
+			le = bom_le
+			src = src[width:]
+		}
+	}
+	if len(src) % width != 0 {
+		return nil, false
+	}
+	out := make([dynamic]u8, 0, len(src), allocator)
+	i := 0
+	for i < len(src) {
+		cp := get_unit(src[i:], width, le)
+		i += width
+		if width == 2 && cp >= 0xD800 && cp < 0xDC00 {
+			if i + 2 > len(src) {
+				return nil, false
+			}
+			lo := get_unit(src[i:], 2, le)
+			if lo < 0xDC00 || lo >= 0xE000 {
+				return nil, false
+			}
+			cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+			i += 2
+		} else if (cp >= 0xD800 && cp < 0xE000) || cp > 0x10FFFF {
+			return nil, false
+		}
+		switch {
+		case cp < 0x80:
+			append(&out, u8(cp))
+		case cp < 0x800:
+			append(&out, u8(0xC0 | cp >> 6), u8(0x80 | cp & 0x3F))
+		case cp < 0x10000:
+			append(&out, u8(0xE0 | cp >> 12), u8(0x80 | (cp >> 6) & 0x3F), u8(0x80 | cp & 0x3F))
+		case:
+			append(&out, u8(0xF0 | cp >> 18), u8(0x80 | (cp >> 12) & 0x3F), u8(0x80 | (cp >> 6) & 0x3F), u8(0x80 | cp & 0x3F))
+		}
+	}
+	return out[:], true
+}
+
+encode_to_worktree :: proc(e: Encoding, data: []u8, allocator := context.temp_allocator) -> ([]u8, bool) {
+	if e == .None {
+		return data, true
+	}
+	if e == .Unsupported {
+		return nil, false
+	}
+	width, le, _, bom_out := enc_unit(e)
+	out := make([dynamic]u8, 0, len(data) * width + width, allocator)
+	if bom_out {
+		put_unit(&out, 0xFEFF, width, le)
+	}
+	i := 0
+	for i < len(data) {
+		c := u32(data[i])
+		cp: u32
+		size: int
+		switch {
+		case c < 0x80:
+			cp, size = c, 1
+		case c & 0xE0 == 0xC0 && i + 1 < len(data):
+			cp, size = (c & 0x1F) << 6 | u32(data[i + 1] & 0x3F), 2
+		case c & 0xF0 == 0xE0 && i + 2 < len(data):
+			cp, size = (c & 0x0F) << 12 | u32(data[i + 1] & 0x3F) << 6 | u32(data[i + 2] & 0x3F), 3
+		case c & 0xF8 == 0xF0 && i + 3 < len(data):
+			cp, size = (c & 0x07) << 18 | u32(data[i + 1] & 0x3F) << 12 | u32(data[i + 2] & 0x3F) << 6 | u32(data[i + 3] & 0x3F), 4
+		case:
+			return nil, false
+		}
+		for k in 1 ..< size {
+			if data[i + k] & 0xC0 != 0x80 {
+				return nil, false
+			}
+		}
+		i += size
+		if width == 2 && cp >= 0x10000 {
+			v := cp - 0x10000
+			put_unit(&out, 0xD800 + (v >> 10), 2, le)
+			put_unit(&out, 0xDC00 + (v & 0x3FF), 2, le)
+		} else {
+			put_unit(&out, cp, width, le)
+		}
+	}
+	return out[:], true
 }
 
 @(private)
@@ -964,54 +1653,52 @@ eol_stream_finish :: proc "contextless" (es: ^Eol_Stream) -> Text_Stat {
 @(private)
 LARGE_CHUNK :: 1 << 20
 
-@(private)
-blob_has_cr :: proc(m: ^Mount, inode: fstree.Inode_Id) -> bool {
-	if m.history == nil || m.db == nil {
-		return false
-	}
-	reg, has, err := history_blob(m.history, inode)
-	if err != .None || !has {
-		old, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
-		if terr != .None {
-			return false
-		}
-		for c in old {
-			if c == '\r' {
-				return true
-			}
-		}
-		return false
-	}
-	Cr_Sink :: struct {
-		found: bool,
-	}
-	sink := Cr_Sink{}
-	odb.stream(m.db, odb.Oid(reg.oid), io.Stream{procedure = proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
-		#partial switch mode {
-		case .Write:
-			s := (^Cr_Sink)(data)
-			if !s.found {
-				for c in p {
-					if c == '\r' {
-						s.found = true
-						break
-					}
-				}
-			}
-			return i64(len(p)), nil
-		case .Query:
-			return io.query_utility({.Write, .Query})
-		}
-		return 0, .Unsupported
-	}, data = &sink})
-	return sink.found
-}
-
 store_large_clean :: proc(m: ^Mount, rel: string, abs: string, old := fstree.Inode_Id{}, has_old := false) -> (oid: odb.Oid, size: i64, ok: bool) {
 	if !m.has_git || m.db == nil {
 		return
 	}
-	action := eol_action(m, rel)
+	cv := conv_attrs(m, rel)
+	if cv.driver != nil || cv.encoding != .None || cv.ident {
+		data: []u8
+		if cv.driver != nil {
+			fd, oerr := prim.open_file(m.vfs, abs)
+			if oerr != .None {
+				return
+			}
+			sink := Buf_Sink{buf = make([dynamic]u8, context.temp_allocator)}
+			fok := filter_apply(m, cv.driver, .Clean, rel, Filter_Input{fd = fd, vfs = m.vfs}, io.Stream{procedure = buf_sink_proc, data = &sink})
+			prim.close_file(m.vfs, fd)
+			if !fok {
+				if cv.driver.required {
+					return
+				}
+				d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+				if rerr != .None {
+					return
+				}
+				data = d
+			} else {
+				data = sink.buf[:]
+			}
+		} else {
+			d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+			if rerr != .None {
+				return
+			}
+			data = d
+		}
+		cleaned, cok := clean_stages(m, rel, cv, data, context.temp_allocator)
+		if !cok {
+			return
+		}
+		o, werr := odb.write(m.db, .Blob, cleaned)
+		if werr != .None {
+			return
+		}
+		history_note_blob(m.history, o)
+		return o, i64(len(cleaned)), true
+	}
+	action := cv.action
 	if action == .Binary || action == .Undefined {
 		return
 	}
@@ -1042,7 +1729,7 @@ store_large_clean :: proc(m: ^Mount, rel: string, abs: string, old := fstree.Ino
 		if text_is_binary(s) {
 			return
 		}
-		if has_old && blob_has_cr(m, old) {
+		if index_has_crlf(m, rel) {
 			return
 		}
 	}

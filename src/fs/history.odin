@@ -56,12 +56,25 @@ Clock :: struct {
 	wall_ms: proc(data: rawptr) -> i64,
 }
 
+Hold :: struct {
+	data: rawptr,
+	drop: proc(data: rawptr),
+}
+
 History_Options :: struct {
 	chain:         Maybe(journal.Chain),
 	keep_at_least: i64,
 	clock:         Clock,
 	random:        prim.Random,
 	deferred:      bool,
+	hold:          Hold,
+}
+
+@(private)
+hold_drop :: proc(x: Hold) {
+	if x.drop != nil {
+		x.drop(x.data)
+	}
 }
 
 History :: struct {
@@ -227,6 +240,7 @@ history_create :: proc(vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, d
 	}
 	if err = history_open(h, vfs, dir, id, self, db, streams, allocator, opts); err != .None {
 		free(h, allocator)
+		hold_drop(opts.hold)
 		return nil, err
 	}
 	h.owned = true
@@ -258,10 +272,25 @@ history_release :: proc(h: ^History) {
 history_reconfigure :: proc(h: ^History, opts: History_Options) -> Error {
 	awake := h.awake
 	history_sleep(h)
+	old := h.opts.hold
 	h.opts = opts
+	hold_drop(old)
 	if awake || len(h.mounts) > 0 {
 		return history_wake(h)
 	}
+	return .None
+}
+
+history_rebind :: proc(h: ^History, streams: Stream_Source, opts: History_Options) -> Error {
+	h.streams = streams
+	a, aok := h.opts.chain.?
+	b, bok := opts.chain.?
+	if aok != bok || (aok && a != b) || h.opts.keep_at_least != opts.keep_at_least || h.opts.deferred != opts.deferred {
+		return history_reconfigure(h, opts)
+	}
+	old := h.opts.hold
+	h.opts = opts
+	hold_drop(old)
 	return .None
 }
 
@@ -303,6 +332,9 @@ history_close :: proc(h: ^History) {
 	h.staged = nil
 	delete(h.dir, h.allocator)
 	h.dir = ""
+	hold := h.opts.hold
+	h.opts.hold = {}
+	hold_drop(hold)
 }
 
 history_wake :: proc(h: ^History) -> Error {

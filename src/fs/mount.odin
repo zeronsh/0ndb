@@ -287,6 +287,7 @@ Mount :: struct {
 	log_fd:      prim.Fd,
 	log_len:     i64,
 	lost:        bool,
+	retained:    bool,
 	window:      bool,
 	override:    map[string]odb.Oid,
 	clean:       bool,
@@ -299,6 +300,8 @@ Mount :: struct {
 	unwatched:   [dynamic]string,
 	attrs:       ^Attr_Ctx,
 	collided:    [dynamic]string,
+	link_mode:   Link_Mode,
+	gitlinks:    []Gitlink,
 }
 
 Intent :: struct {
@@ -427,6 +430,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.attrib = make(map[string]Attrib, allocator)
 	if h != nil {
 		history_retain(h)
+		m.retained = true
 	}
 	fresh := load_mount_state(m) or_return
 	attrib_log_open(m) or_return
@@ -564,7 +568,7 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.fences)
 	delete(m.intents)
-	held := m.history if m.attrib != nil else nil
+	held := m.history if m.retained else nil
 	if m.history != nil {
 		for x, i in m.history.mounts {
 			if x == m {
@@ -903,7 +907,11 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 		return
 	}
 	prev, has_prev, _ := shadow_get(&m.shadow, rel)
-	data = eol_clean(m, rel, data, prev.inode, has_prev && prev.kind == .File)
+	cleaned, cok := eol_clean(m, rel, data, prev.inode, has_prev && prev.kind == .File)
+	if !cok {
+		return
+	}
+	data = cleaned
 	oid, werr := odb.write(m.db, .Blob, data)
 	if werr != .None || oid == a.oid {
 		return

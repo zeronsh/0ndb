@@ -97,6 +97,7 @@ history_bundle_create :: proc(vfs: prim.Vfs, dir: string, id: prim.Id, self: pri
 	}
 	if err = history_bundle_load(h, vfs, dir, id, self, db, streams, source, allocator, opts); err != .None {
 		free(h, allocator)
+		hold_drop(opts.hold)
 		return nil, err
 	}
 	h.owned = true
