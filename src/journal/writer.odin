@@ -13,6 +13,7 @@ Journal :: struct {
 	vfs:         prim.Vfs,
 	fd:          prim.Fd,
 	ck_fd:       prim.Fd,
+	atomic:      bool,
 	durable:     i64,
 	checkpoint:  i64,
 	version:     u64,
@@ -57,7 +58,7 @@ journal_open :: proc(j: ^Journal, vfs: prim.Vfs, path: string, opts := Options{}
 			}
 		}
 		fd, oerr = prim.open_file(vfs, path, {.Write, .Create, .Exclusive}, 0o600)
-		if oerr == .None {
+		if oerr == .None && .Durable_Dir_Ops_With_Data not_in prim.file_caps(vfs, fd) {
 			if serr := prim.sync_dir(vfs, prim.dir_name(path)); serr != .None {
 				prim.close_file(vfs, fd)
 				_release(j)
@@ -70,12 +71,15 @@ journal_open :: proc(j: ^Journal, vfs: prim.Vfs, path: string, opts := Options{}
 		return _err(oerr)
 	}
 	j.fd = fd
-	ck_fd, kerr := prim.open_file(vfs, ck_path, {.Write, .Create}, 0o600)
-	if kerr != .None {
-		_release(j)
-		return _err(kerr)
+	j.atomic = .Atomic_Group_Commit in prim.file_caps(vfs, fd)
+	if !j.atomic {
+		ck_fd, kerr := prim.open_file(vfs, ck_path, {.Write, .Create}, 0o600)
+		if kerr != .None {
+			_release(j)
+			return _err(kerr)
+		}
+		j.ck_fd = ck_fd
 	}
-	j.ck_fd = ck_fd
 	j.pending = make([dynamic]u8, allocator)
 	j.links = make([dynamic]Link, allocator)
 	if opts.chain != nil {
@@ -385,7 +389,7 @@ _recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 	if size < keep_at_least {
 		return .Corrupt
 	}
-	ck := _read_checkpoint(j.vfs, j.ck_fd)
+	ck := size if j.atomic else _read_checkpoint(j.vfs, j.ck_fd)
 	if ck > size {
 		return .Corrupt
 	}
@@ -490,6 +494,10 @@ CHECKPOINT_SEED :: 0x306e_6462_636b
 
 @(private)
 _write_checkpoint :: proc(j: ^Journal) {
+	if j.ck_fd < 0 {
+		j.checkpoint = j.durable
+		return
+	}
 	b: [16]u8
 	prim.put_u64le(b[0:8], u64(j.durable))
 	prim.put_u64le(b[8:16], xxhash.XXH3_64_with_seed(b[0:8], CHECKPOINT_SEED))

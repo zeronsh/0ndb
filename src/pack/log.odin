@@ -160,7 +160,7 @@ _emit_dirty :: proc(p: ^Pack) -> Error {
 }
 
 @(private)
-_new_container :: proc(p: ^Pack) -> (idx: int, err: Error) {
+_new_container :: proc(p: ^Pack, deferred := false) -> (idx: int, err: Error) {
 	id := p.next_cont
 	p.next_cont += 1
 	pb: prim.Path_Buf
@@ -175,13 +175,15 @@ _new_container :: proc(p: ^Pack) -> (idx: int, err: Error) {
 		prim.close_file(p.base, fd)
 		return -1, e
 	}
-	if e := _sync(p, fd); e != .None {
-		prim.close_file(p.base, fd)
-		return -1, e
-	}
-	if e := _sync_root(p); e != .None {
-		prim.close_file(p.base, fd)
-		return -1, e
+	if !deferred {
+		if e := _sync(p, fd); e != .None {
+			prim.close_file(p.base, fd)
+			return -1, e
+		}
+		if e := _sync_root(p); e != .None {
+			prim.close_file(p.base, fd)
+			return -1, e
+		}
 	}
 	append(&p.conts, Cont{id = id, fd = fd, size = CONT_HDR, used = p.tick})
 	return len(p.conts) - 1, .None
@@ -191,9 +193,10 @@ Sync_Done :: proc(data: rawptr, err: Error)
 
 @(private)
 Waiter :: struct {
-	seq:  u64,
-	done: Sync_Done,
-	data: rawptr,
+	seq:    u64,
+	done:   Sync_Done,
+	data:   rawptr,
+	urgent: bool,
 }
 
 @(private)
@@ -202,29 +205,46 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 		return false, .Io
 	}
 	_emit_dirty(p) or_return
+	_collect_externals(p) or_return
+	if len(p.fl.fds) > 0 || p.dirsync_pending {
+		p.force = true
+	}
 	if p.nrec == 0 && !p.force {
 		return false, .None
 	}
 	p.force = false
+	if p.dirsync_pending {
+		p.fl.dirsync = true
+		p.dirsync_pending = false
+	}
 	next := -1
 	if _log_tail(p) + 64 >= p.opts.container_size {
-		idx, nerr := _new_container(p)
+		idx, nerr := _new_container(p, true)
 		if nerr != .None {
 			return false, _poison(p, nerr)
 		}
 		next = idx
+		p.fl.newc_fd = p.conts[idx].fd
+		p.fl.dirsync = true
 		nb: [4]u8
 		prim.put_u32le(nb[:], p.conts[idx].id)
 		_log_raw(p, R_NEXT, nb[:]) or_return
 	}
 	pos := _log_alloc(p, REC_HDR + COMMIT_BODY) or_return
 	_commit_record(p.buf[pos:], p.seq, p.nrec, p.hh, p.dh)
+	copy(p.fl.crec[:], p.buf[pos:][:REC_HDR + COMMIT_BODY])
+	p.fl.crec_off = p.buf_base + i64(pos)
+	resize(&p.buf, pos)
 	start := p.group_start
 	_log_spill(p) or_return
+	p.buf_base = p.fl.crec_off + REC_HDR + COMMIT_BODY
+	p.conts[p.active].size = p.buf_base
 	c := &p.conts[p.active]
 	c.busy = true
 	append(&p.fl.busy, c.id)
 	p.fl.wrote = true
+	p.fl.ccont = p.compact.cont if p.compact.on else 0
+	p.fl.cpos = p.compact.pos
 	p.fl.seq = p.seq
 	p.fl.cont = c.id
 	p.fl.start = start
@@ -255,19 +275,37 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 			_unpin_real(p, j.fd)
 		}
 	}
-	clear(&fl.fds)
-	clear(&fl.zjobs)
-	clear(&fl.syncs)
 	for id in fl.busy {
 		ci := _cont_index(p, id)
 		if ci >= 0 {
 			p.conts[ci].busy = false
-			if err == .None {
+		}
+	}
+	if err == .None {
+		if fl.wrote {
+			if ci := _cont_index(p, fl.cont); ci >= 0 {
+				p.conts[ci].dirty = false
+			}
+		}
+		for z in fl.zjobs {
+			if ci := _cont_index(p, z.cont); ci >= 0 {
+				p.conts[ci].dirty = true
+			}
+		}
+		for c in fl.syncs {
+			if ci := _cont_index(p, c.cont); ci >= 0 {
 				p.conts[ci].dirty = false
 			}
 		}
 	}
+	clear(&fl.fds)
+	clear(&fl.zjobs)
+	clear(&fl.syncs)
 	clear(&fl.busy)
+	fl.newc_fd = prim.INVALID_FD
+	fl.dirsync = false
+	del_id := fl.del_id
+	fl.del_id = 0
 	p.stats.fsyncs += fl.nsync
 	fl.on = false
 	kind := fl.kind
@@ -306,6 +344,9 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 		p.last_cont = fl.cont
 		p.last_start = fl.start
 		p.durable_seq = fl.seq
+		if fl.ccont != 0 && fl.ccont == p.compacting {
+			p.compact_resume = max(p.compact_resume, fl.cpos)
+		}
 	}
 	switch kind {
 	case .Commit:
@@ -324,6 +365,8 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 				return _poison(p, e)
 			}
 			append(&p.runs, nr)
+			p.stats.index_written += u64(nr.nblocks) * BLOCK
+			_filters_rebalance(p) or_return
 		} else if fl.run_fd >= 0 {
 			prim.close_file(p.base, fl.run_fd)
 			pb: prim.Path_Buf
@@ -333,10 +376,122 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 		p.stats.flushes += 1
 	case .Merge:
 		_merge_installed(p, m) or_return
+	case .Super:
+	case .Delete:
+		_cont_deleted(p, del_id)
 	}
-	_apply_zeros(p) or_return
 	_apply_unlinks(p) or_return
 	return .None
+}
+
+@(private)
+_cont_deleted :: proc(p: ^Pack, id: u32) {
+	i := _cont_index(p, id)
+	if i >= 0 && i != p.active {
+		if p.conts[i].fd >= 0 {
+			if p.conts[i].lent {
+				append(&p.graveyard, p.conts[i].fd)
+			} else {
+				prim.close_file(p.base, p.conts[i].fd)
+			}
+		}
+		active_id := _active_id(p)
+		ordered_remove(&p.conts, i)
+		p.active = _cont_index(p, active_id)
+		p.stats.compact_conts += 1
+	}
+	j := 0
+	for j < len(p.zeros) {
+		if p.zeros[j].phys.cont == id {
+			unordered_remove(&p.zeros, j)
+		} else {
+			j += 1
+		}
+	}
+	if p.compacting == id {
+		p.compacting = 0
+		p.compact_resume = 0
+	}
+}
+
+@(private)
+_collect_externals :: proc(p: ^Pack) -> Error {
+	for _, oi in p.open_inodes {
+		if oi.dirty && oi.real_fd >= 0 {
+			append(&p.fl.fds, Job_Fd{fd = oi.real_fd})
+			oi.dirty = false
+			oi.pinned += 1
+		}
+	}
+	for inum in p.ext_dirty {
+		pb: prim.Path_Buf
+		fd, err := prim.open_file(p.base, _phys_path(p, &pb, 'x', inum), {.Write})
+		if err == .Not_Found {
+			continue
+		}
+		if err != .None {
+			return _poison(p, err)
+		}
+		append(&p.fl.fds, Job_Fd{fd = fd, owned = true})
+	}
+	clear(&p.ext_dirty)
+	return .None
+}
+
+@(private)
+_collect_zeros :: proc(p: ^Pack, upto: u64) -> Error {
+	fl := &p.fl
+	i := 0
+	for i < len(p.zeros) {
+		z := p.zeros[i]
+		if z.need > upto {
+			i += 1
+			continue
+		}
+		fd, err := _cont_fd(p, z.phys.cont)
+		if err == .None {
+			append(&fl.zjobs, Zero_Job{fd = fd, cont = z.phys.cont, off = z.phys.off, len = z.phys.len, urgent = z.urgent})
+			ci := _cont_index(p, z.phys.cont)
+			if !p.conts[ci].busy {
+				p.conts[ci].busy = true
+				append(&fl.busy, z.phys.cont)
+			}
+			if z.urgent {
+				dup := false
+				for c in fl.syncs {
+					if c.cont == z.phys.cont {
+						dup = true
+					}
+				}
+				if !dup {
+					append(&fl.syncs, Cont_Fd{fd = fd, cont = z.phys.cont})
+				}
+			}
+			p.stats.zeroed_bytes += u64(z.phys.len)
+		} else if err != .Not_Found {
+			return _poison(p, err)
+		}
+		unordered_remove(&p.zeros, i)
+	}
+	return .None
+}
+
+@(private)
+_zeros_waiting :: proc "contextless" (p: ^Pack) -> bool {
+	return len(p.zeros) > 0
+}
+
+@(private)
+_urgent_inflight :: proc "contextless" (p: ^Pack) -> bool {
+	if !p.fl.on {
+		return false
+	}
+	for z in p.fl.zjobs {
+		if z.urgent {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -352,7 +507,8 @@ _drain :: proc(p: ^Pack) -> Error {
 _commit :: proc(p: ^Pack) -> Error {
 	_drain(p) or_return
 	wrote := _commit_write(p) or_return
-	if !wrote {
+	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
+	if !wrote && len(p.fl.zjobs) == 0 {
 		return .None
 	}
 	p.fl.kind = .Commit
@@ -484,34 +640,6 @@ _apply_unlinks :: proc(p: ^Pack) -> Error {
 	return .None
 }
 
-@(private)
-_sync_externals :: proc(p: ^Pack) -> Error {
-	for _, oi in p.open_inodes {
-		if oi.dirty && oi.real_fd >= 0 {
-			if e := _sync(p, oi.real_fd); e != .None {
-				return _poison(p, e)
-			}
-			oi.dirty = false
-		}
-	}
-	for inum in p.ext_dirty {
-		pb: prim.Path_Buf
-		fd, err := prim.open_file(p.base, _phys_path(p, &pb, 'x', inum), {.Write})
-		if err == .Not_Found {
-			continue
-		}
-		if err != .None {
-			return _poison(p, err)
-		}
-		e := _sync(p, fd)
-		prim.close_file(p.base, fd)
-		if e != .None {
-			return _poison(p, e)
-		}
-	}
-	clear(&p.ext_dirty)
-	return .None
-}
 
 sync :: proc(p: ^Pack) -> Error {
 	if p.batch > 0 {
@@ -523,23 +651,16 @@ sync :: proc(p: ^Pack) -> Error {
 @(private)
 _sync_all :: proc(p: ^Pack) -> Error {
 	_drain(p) or_return
-	_sync_externals(p) or_return
 	_commit(p) or_return
 	if _has_urgent(p) {
 		for p.compacting != 0 {
 			_compact_work(p, max(i64), false) or_return
+			_drain(p) or_return
 		}
+	}
+	for _zeros_waiting(p) {
 		p.force = true
 		_commit(p) or_return
-		_apply_zeros(p) or_return
-	} else {
-		for z in p.zeros {
-			if z.need > p.durable_seq {
-				p.force = true
-				_commit(p) or_return
-				break
-			}
-		}
 	}
 	if p.log_since_ck >= p.opts.log_window || _mem_bytes(&p.mem) >= p.opts.mem_budget {
 		_flush(p) or_return
@@ -552,26 +673,46 @@ sync_async :: proc(p: ^Pack, done: Sync_Done, data: rawptr) -> Error {
 	if p.poisoned {
 		return .Io
 	}
-	if (p.opts.wake == nil && !p.opts.deferred_sync) || _has_urgent(p) {
+	if !_async(p) {
 		err := _sync_all(p)
 		if done != nil {
 			done(data, err)
 		}
 		return .None
 	}
-	pending := p.nrec > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p)
+	urgent := _has_urgent(p) || _urgent_inflight(p)
+	pending := p.nrec > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending
 	target := p.seq if pending else (p.fl.seq if p.fl.on else 0)
-	if target == 0 || target <= p.durable_seq {
+	if !urgent && (target == 0 || target <= p.durable_seq) {
 		if done != nil {
 			done(data, .None)
 		}
 		return .None
 	}
-	append(&p.waiters, Waiter{seq = target, done = done, data = data})
+	append(&p.waiters, Waiter{seq = target, done = done, data = data, urgent = urgent})
 	if !p.fl.on {
-		_start_async(p) or_return
+		_advance(p) or_return
 	}
 	return .None
+}
+
+@(private)
+_advance :: proc(p: ^Pack) -> Error {
+	if p.fl.on {
+		return .None
+	}
+	if _has_urgent(p) && p.compacting != 0 {
+		_compact_work(p, 4 * 1024 * 1024, false) or_return
+		if p.fl.on {
+			return .None
+		}
+		p.force = true
+		return _start_async(p)
+	}
+	if _zeros_waiting(p) {
+		p.force = true
+	}
+	return _start_async(p)
 }
 
 @(private)
@@ -589,50 +730,11 @@ _start_async :: proc(p: ^Pack) -> Error {
 	if p.fl.on {
 		return .None
 	}
-	clear(&p.fl.fds)
-	exts := make([dynamic]Job_Fd, context.temp_allocator)
-	for _, oi in p.open_inodes {
-		if oi.dirty && oi.real_fd >= 0 {
-			append(&exts, Job_Fd{fd = oi.real_fd})
-			oi.dirty = false
-			oi.pinned += 1
-		}
-	}
-	for inum in p.ext_dirty {
-		pb: prim.Path_Buf
-		fd, err := prim.open_file(p.base, _phys_path(p, &pb, 'x', inum), {.Write})
-		if err == .Not_Found {
-			continue
-		}
-		if err != .None {
-			return _poison(p, err)
-		}
-		append(&exts, Job_Fd{fd = fd, owned = true})
-	}
-	clear(&p.ext_dirty)
-	if len(exts) > 0 {
-		p.force = true
-	}
-	wrote, err := _commit_write(p)
-	if err != .None {
-		for j in exts {
-			if j.owned {
-				prim.close_file(p.base, j.fd)
-			}
-		}
-		return err
-	}
-	if !wrote {
-		for j in exts {
-			if j.owned {
-				prim.close_file(p.base, j.fd)
-			} else {
-				_unpin_real(p, j.fd)
-			}
-		}
+	wrote := _commit_write(p) or_return
+	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
+	if !wrote && len(p.fl.zjobs) == 0 {
 		return .None
 	}
-	append(&p.fl.fds, ..exts[:])
 	p.fl.kind = .Commit
 	return _submit(p)
 }
@@ -657,7 +759,7 @@ poll :: proc(p: ^Pack) -> Error {
 		}
 		return .None
 	}
-	if len(p.runs) > p.opts.max_runs || (p.merge != nil && len(p.runs) > p.opts.max_runs / 2) {
+	if _, _, mok := _merge_pick(p); mok || p.merge != nil {
 		if _, e := _merge_step(p, i64(p.opts.mem_budget) / 8); e != .None {
 			_fail_waiters(p, e)
 			return e
@@ -666,13 +768,13 @@ poll :: proc(p: ^Pack) -> Error {
 			return .None
 		}
 	}
-	for w in p.waiters {
-		if w.seq > p.durable_seq {
-			if e := _start_async(p); e != .None {
-				_fail_waiters(p, e)
-				return e
-			}
-			break
+	if p.pressure && !_over_budget(p, 1) {
+		p.pressure = false
+	}
+	if len(p.waiters) > 0 {
+		if e := _advance(p); e != .None {
+			_fail_waiters(p, e)
+			return e
 		}
 	}
 	return .None
@@ -690,10 +792,11 @@ _async :: #force_inline proc "contextless" (p: ^Pack) -> bool {
 
 @(private)
 _fire_waiters :: proc(p: ^Pack) {
+	urgent := _has_urgent(p) || _urgent_inflight(p) || (p.compacting != 0 && _has_urgent(p))
 	i := 0
 	for i < len(p.waiters) {
 		w := p.waiters[i]
-		if w.seq <= p.durable_seq {
+		if w.seq <= p.durable_seq && !(w.urgent && urgent) {
 			ordered_remove(&p.waiters, i)
 			if w.done != nil {
 				w.done(w.data, .None)
@@ -747,8 +850,8 @@ batch_end :: proc(p: ^Pack) -> Error {
 _flush :: proc(p: ^Pack) -> Error {
 	_flush_start(p) or_return
 	_drain(p) or_return
-	if len(p.runs) > p.opts.max_runs || (p.merge != nil && len(p.runs) > p.opts.max_runs / 2) {
-		_merge_step(p, i64(p.opts.mem_budget) * i64(p.opts.merge_fanout) * 2) or_return
+	if _, _, ok := _merge_pick(p); ok || p.merge != nil {
+		_merge_step(p, i64(p.opts.mem_budget) * 6) or_return
 		_drain(p) or_return
 	}
 	return .None
@@ -777,66 +880,35 @@ _flush_start :: proc(p: ^Pack) -> Error {
 		}
 	}
 	fl := &p.fl
-	i := 0
-	for i < len(p.zeros) {
-		z := p.zeros[i]
-		if z.need > fl_seq {
-			i += 1
-			continue
-		}
-		fd, err := _cont_fd(p, z.phys.cont)
-		if err == .None {
-			append(&fl.zjobs, Zero_Job{fd = fd, off = z.phys.off, len = z.phys.len})
-			ci := _cont_index(p, z.phys.cont)
-			if !p.conts[ci].busy {
-				p.conts[ci].busy = true
-				append(&fl.busy, z.phys.cont)
-			}
-			p.stats.zeroed_bytes += u64(z.phys.len)
-		} else if err != .Not_Found {
-			return _poison(p, err)
-		}
-		unordered_remove(&p.zeros, i)
-	}
+	_collect_zeros(p, fl_seq) or_return
 	for &c in p.conts {
 		if c.dirty && c.fd >= 0 {
-			append(&fl.syncs, c.fd)
+			dup := false
+			for x in fl.syncs {
+				if x.cont == c.id {
+					dup = true
+				}
+			}
+			if !dup {
+				append(&fl.syncs, Cont_Fd{fd = c.fd, cont = c.id})
+			}
 			if !c.busy {
 				c.busy = true
 				append(&fl.busy, c.id)
 			}
 		}
 	}
-	for zj in fl.zjobs {
+	for z in fl.zjobs {
 		dup := false
-		for fd in fl.syncs {
-			if fd == zj.fd {
+		for x in fl.syncs {
+			if x.cont == z.cont {
 				dup = true
 			}
 		}
 		if !dup {
-			append(&fl.syncs, zj.fd)
+			append(&fl.syncs, Cont_Fd{fd = z.fd, cont = z.cont})
 		}
 	}
-	for _, oi in p.open_inodes {
-		if oi.dirty && oi.real_fd >= 0 {
-			append(&fl.fds, Job_Fd{fd = oi.real_fd})
-			oi.dirty = false
-			oi.pinned += 1
-		}
-	}
-	for inum in p.ext_dirty {
-		pb: prim.Path_Buf
-		fd, err := prim.open_file(p.base, _phys_path(p, &pb, 'x', inum), {.Write})
-		if err == .Not_Found {
-			continue
-		}
-		if err != .None {
-			return _poison(p, err)
-		}
-		append(&fl.fds, Job_Fd{fd = fd, owned = true})
-	}
-	clear(&p.ext_dirty)
 	fl.run_fd = prim.INVALID_FD
 	if p.mem.count > 0 {
 		imm := new(Mem, p.allocator)

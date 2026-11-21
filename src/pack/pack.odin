@@ -16,6 +16,7 @@ Options :: struct {
 	merge_fanout:   int,
 	max_runs:       int,
 	compact_ratio:  f64,
+	filter_budget:  int,
 	now:            proc() -> i64,
 	wake:           proc(data: rawptr),
 	wake_data:      rawptr,
@@ -28,9 +29,10 @@ DEFAULT_OPTIONS :: Options {
 	mem_budget     = 2 * 1024 * 1024,
 	log_window     = 64 * 1024 * 1024,
 	spill          = 256 * 1024,
-	merge_fanout   = 4,
-	max_runs       = 12,
+	merge_fanout   = 16,
+	max_runs       = 48,
 	compact_ratio  = 0.5,
+	filter_budget  = 16 * 1024 * 1024,
 }
 
 Stats :: struct {
@@ -42,6 +44,12 @@ Stats :: struct {
 	log_bytes:     u64,
 	run_reads:     u64,
 	cache_hits:    u64,
+	filter_reads:  u64,
+	index_written: u64,
+	index_size:    u64,
+	filter_skips:  u64,
+	filter_bytes:  int,
+	findex_bytes:  int,
 	zeroed_bytes:  u64,
 	compact_moved: u64,
 	compact_conts: u64,
@@ -140,6 +148,7 @@ Pack :: struct {
 	merge:         ^Merge,
 	compact:       Compact,
 	compacting:    u32,
+	compact_resume: i64,
 	horizon:       u32,
 	handles:       [dynamic]Handle,
 	free_handles:  [dynamic]int,
@@ -149,6 +158,9 @@ Pack :: struct {
 	recovering:    bool,
 	batch:         int,
 	stats:         Stats,
+	filters_cold:  bool,
+	dirsync_pending: bool,
+	pressure:      bool,
 	bcache:        []Bc_Entry,
 	tick:          u64,
 	scratch:       [dynamic]u8,
@@ -185,7 +197,7 @@ SUPER_MAGIC :: u64(0x7265_7075_736b_6370)
 CONT_MAGIC :: u64(0x746e_6f63_6b63_6170)
 CONT_HDR :: 64
 @(private)
-VERSION :: u32(3)
+VERSION :: u32(4)
 ROOT_INO :: u64(1)
 
 @(private)
@@ -391,7 +403,16 @@ _get :: proc(p: ^Pack, key: []u8, out: ^[dynamic]u8) -> (found: bool, err: Error
 			return true, .None
 		}
 	}
+	if p.filters_cold {
+		p.filters_cold = false
+		_filters_rebalance(p) or_return
+	}
 	for i := len(p.runs) - 1; i >= 0; i -= 1 {
+		maybe := _run_may_contain(p, p.runs[i], key) or_return
+		if !maybe {
+			p.stats.filter_skips += 1
+			continue
+		}
 		f, tomb := _run_get(p, p.runs[i], key, out) or_return
 		if f {
 			return !tomb, .None
@@ -590,6 +611,7 @@ Super :: struct {
 	next_cont: u32,
 	next_run:  u32,
 	compacting: u32,
+	cpos:      i64,
 	runs:      [dynamic]Run,
 	lives:     [dynamic]Cont,
 }
@@ -622,6 +644,7 @@ _super_decode :: proc(b: []u8, s: ^Super) -> bool {
 	s.next_cont = prim.read_u32le(&r)
 	s.next_run = prim.read_u32le(&r)
 	s.compacting = prim.read_u32le(&r)
+	s.cpos = i64(prim.read_u64le(&r))
 	nr := prim.read_uvarint(&r)
 	if r.err != .None || nr > 4096 {
 		return false
@@ -702,6 +725,7 @@ _super_read :: proc(p: ^Pack, s: ^Super) -> bool {
 			s.next_cont = tmp.next_cont
 			s.next_run = tmp.next_run
 			s.compacting = tmp.compacting
+			s.cpos = tmp.cpos
 			clear(&s.runs)
 			append(&s.runs, ..tmp.runs[:])
 			clear(&s.lives)
@@ -727,5 +751,36 @@ stats :: proc(p: ^Pack) -> Stats {
 		}
 	}
 	s.open_handles = n
+	for r in p.runs {
+		s.index_size += u64(r.nblocks) * BLOCK
+		s.filter_bytes += len(r.fres)
+		s.findex_bytes += len(r.fkeys) + len(r.fents) * size_of(Fpart)
+	}
 	return s
+}
+
+@(private)
+_filters_rebalance :: proc(p: ^Pack) -> Error {
+	order := make([dynamic]^Run, 0, len(p.runs), context.temp_allocator)
+	for r in p.runs {
+		append(&order, r)
+	}
+	for i in 1 ..< len(order) {
+		j := i
+		for j > 0 && _run_filter_bytes(order[j - 1]) > _run_filter_bytes(order[j]) {
+			order[j - 1], order[j] = order[j], order[j - 1]
+			j -= 1
+		}
+	}
+	used := 0
+	for r in order {
+		need := _run_filter_bytes(r)
+		if used + need <= p.opts.filter_budget {
+			_run_filter_load(p, r) or_return
+			used += need
+		} else {
+			_run_filter_drop(p, r)
+		}
+	}
+	return .None
 }

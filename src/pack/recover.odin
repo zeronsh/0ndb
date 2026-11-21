@@ -37,7 +37,8 @@ open :: proc(p: ^Pack, base: prim.Vfs, root: string, opts := DEFAULT_OPTIONS, al
 	p.waiters = make([dynamic]Waiter, allocator)
 	p.fl.fds = make([dynamic]Job_Fd, allocator)
 	p.fl.zjobs = make([dynamic]Zero_Job, allocator)
-	p.fl.syncs = make([dynamic]prim.Fd, allocator)
+	p.fl.syncs = make([dynamic]Cont_Fd, allocator)
+	p.fl.newc_fd = prim.INVALID_FD
 	p.fl.busy = make([dynamic]u32, allocator)
 	p.fl.run_fd = prim.INVALID_FD
 	p.ext_dirty = make([dynamic]u64, allocator)
@@ -88,6 +89,10 @@ _release :: proc(p: ^Pack) {
 		_merge_abort(p)
 	}
 	_compact_reset(p)
+	if p.bcache != nil {
+		virtual.release(raw_data(p.bcache), uint(BCACHE * size_of(Bc_Entry)))
+		p.bcache = nil
+	}
 	for oi in p.open_inodes {
 		o := p.open_inodes[oi]
 		if o.real_fd >= 0 {
@@ -147,6 +152,11 @@ _run_close :: proc(p: ^Pack, r: ^Run) {
 		delete(r.root_buf, p.allocator)
 		r.root_buf = nil
 	}
+	_run_filter_drop(p, r)
+	delete(r.fkeys)
+	delete(r.fents)
+	r.fkeys = nil
+	r.fents = nil
 }
 
 @(private)
@@ -190,6 +200,7 @@ _open :: proc(p: ^Pack) -> Error {
 	p.next_cont = sb.next_cont
 	p.next_run = sb.next_run
 	p.compacting = sb.compacting
+	p.compact_resume = sb.cpos
 	return _recover(p, &sb)
 }
 
@@ -295,6 +306,7 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 	if _cont_index(p, p.ck_cont) < 0 {
 		return .Io
 	}
+	_filters_rebalance(p) or_return
 	_replay(p) or_return
 	for i := len(p.conts) - 1; i >= 0; i -= 1 {
 		if p.conts[i].id > _active_id(p) {

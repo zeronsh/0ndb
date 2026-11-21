@@ -32,6 +32,23 @@ PACK_PROCS := prim.Vfs_Procs {
 	dir_open   = _v_dir_open,
 	dir_next   = _v_dir_next,
 	dir_close  = _v_dir_close,
+	caps       = _v_caps,
+}
+
+@(private)
+_v_caps :: proc(data: rawptr, fd: prim.Fd) -> prim.Vfs_Caps {
+	p := (^Pack)(data)
+	if fd < VFD_BASE {
+		return prim.file_caps(p.base, fd)
+	}
+	h := _handle(p, fd)
+	if h == nil {
+		return {}
+	}
+	if h.dir || h.oi.ino.kind == .External {
+		return {.Durable_Dir_Ops_With_Data}
+	}
+	return {.Durable_Dir_Ops_With_Data, .Atomic_Group_Commit}
 }
 
 vfs :: proc(p: ^Pack) -> prim.Vfs {
@@ -270,10 +287,18 @@ _maybe_flush :: proc(p: ^Pack) -> Error {
 	if !_async(p) {
 		return _flush(p)
 	}
-	if p.fl.on && !_over_budget(p, 2) {
-		return .None
+	if p.fl.on {
+		if !_over_budget(p, 4) {
+			p.pressure = true
+			return .None
+		}
+		_drain(p) or_return
 	}
 	return _flush_start(p)
+}
+
+pressure :: proc "contextless" (p: ^Pack) -> bool {
+	return p.pressure
 }
 
 @(private)
@@ -538,17 +563,28 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 }
 
 @(private)
-_defrag :: proc(p: ^Pack, oi: ^Open_Inode, keep: int) -> Error {
+_defrag :: proc(p: ^Pack, oi: ^Open_Inode, window: int) -> Error {
 	ino := &oi.ino
-	if keep >= ino.n {
+	w := min(window, ino.n)
+	if w < 2 {
 		return .None
 	}
-	from := ino.ext[keep].off
-	to := ino.ext[ino.n - 1].off + ino.ext[ino.n - 1].len
+	best := 0
+	best_cost := max(i64)
+	for i in 0 ..= ino.n - w {
+		last := ino.ext[i + w - 1]
+		cost := last.off + last.len - ino.ext[i].off
+		if cost < best_cost {
+			best_cost = cost
+			best = i
+		}
+	}
+	from := ino.ext[best].off
+	to := from + best_cost
 	resize(&p.work, int(to - from))
 	buf := p.work[:]
 	pos := from
-	for e in ino.ext[keep:ino.n] {
+	for e in ino.ext[best:best + w] {
 		if e.off > pos {
 			_zero(buf[pos - from:e.off - from])
 		}
@@ -580,14 +616,14 @@ _promote :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
 		prim.write_at(p.base, fd, buf, e.off) or_return
 	}
 	prim.truncate(p.base, fd, oi.ino.size) or_return
-	_sync(p, fd) or_return
-	_sync_root(p) or_return
 	old := oi.ino
 	oi.ino.kind = .External
 	oi.ino.n = 0
 	oi.ino.size = 0
 	_inode_store(p, oi.inum, &old, &oi.ino) or_return
 	oi.real_fd = fd
+	oi.dirty = true
+	p.dirsync_pending = true
 	ok = true
 	p.stats.promotions += 1
 	return .None

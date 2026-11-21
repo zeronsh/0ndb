@@ -1,5 +1,6 @@
 package pack
 
+import "core:mem/virtual"
 import "../prim"
 
 @(private)
@@ -90,8 +91,10 @@ _compact_work :: proc(p: ^Pack, budget: i64, all: bool) -> (more: bool, err: Err
 	if !c.on {
 		id: u32
 		ok: bool
+		resume: i64 = CONT_HDR
 		if p.compacting != 0 && _cont_index(p, p.compacting) >= 0 && p.compacting < p.ck_cont {
 			id, ok = p.compacting, true
+			resume = max(p.compact_resume, CONT_HDR)
 		} else {
 			p.compacting = 0
 			id, ok = _compact_pick(p, all)
@@ -100,19 +103,37 @@ _compact_work :: proc(p: ^Pack, budget: i64, all: bool) -> (more: bool, err: Err
 			return false, .None
 		}
 		if p.compacting != id {
-			p.compacting = id
-			if e := _super_write(p); e != .None {
-				return false, _poison(p, e)
+			if _async(p) {
+				if p.fl.on {
+					return true, .None
+				}
+				p.compacting = id
+				p.compact_resume = resume
+				p.gen += 1
+				_snap_take(p, &p.fl.snap)
+				p.fl.has_snap = true
+				p.fl.kind = .Super
+				_submit(p) or_return
+			} else {
+				p.compacting = id
+				p.compact_resume = resume
+				if e := _super_write(p); e != .None {
+					return false, _poison(p, e)
+				}
 			}
 		}
+		p.compact_resume = resume
 		c.on = true
 		c.cont = id
-		c.pos = CONT_HDR
+		c.pos = resume
 		c.moved = 0
 		c.lr.buf = make([dynamic]u8, p.allocator)
 		if !_open_lr(p, &c.lr, id, true) {
 			_compact_reset(p)
 			return false, .Io
+		}
+		if c.pos > c.lr.size {
+			c.pos = CONT_HDR
 		}
 	}
 	if _cont_index(p, c.cont) < 0 {
@@ -177,38 +198,25 @@ _compact_work :: proc(p: ^Pack, budget: i64, all: bool) -> (more: bool, err: Err
 		_compact_reset(p)
 		return false, .Io
 	}
-	_commit(p) or_return
+	if p.fl.on {
+		if _async(p) {
+			return true, .None
+		}
+		_drain(p) or_return
+	}
 	id := c.cont
 	_compact_reset(p)
-	p.compacting = 0
-	i := _cont_index(p, id)
-	if i >= 0 && i != p.active {
-		if p.conts[i].fd >= 0 {
-			if p.conts[i].lent {
-				append(&p.graveyard, p.conts[i].fd)
-			} else {
-				prim.close_file(p.base, p.conts[i].fd)
-			}
-		}
-		j := 0
-		for j < len(p.zeros) {
-			if p.zeros[j].phys.cont == id {
-				unordered_remove(&p.zeros, j)
-			} else {
-				j += 1
-			}
-		}
-		active_id := _active_id(p)
-		ordered_remove(&p.conts, i)
-		p.active = _cont_index(p, active_id)
-		pb: prim.Path_Buf
-		if e := prim.remove(p.base, _phys_path(p, &pb, 'c', u64(id))); e != .None && e != .Not_Found {
-			return false, _poison(p, e)
-		}
-		if e := _sync_root(p); e != .None {
-			return false, _poison(p, e)
-		}
-		p.stats.compact_conts += 1
+	p.force = true
+	wrote := _commit_write(p) or_return
+	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
+	pb: prim.Path_Buf
+	path := _phys_path(p, &pb, 'c', u64(id))
+	p.fl.del_len = copy(p.fl.del_path[:], path)
+	p.fl.del_id = id
+	p.fl.kind = .Delete
+	_submit(p) or_return
+	if !_async(p) {
+		_drain(p) or_return
 	}
 	return true, .None
 }
@@ -254,7 +262,7 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 		}
 		_sync_all(p) or_return
 	}
-	m := _merge_step(p, budget, true) or_return
+	m := _merge_step(p, budget) or_return
 	if m {
 		return true, .None
 	}
@@ -309,9 +317,13 @@ _shrink :: proc(p: ^Pack) {
 		_mem_reset(&p.mem)
 	}
 	if p.bcache != nil {
-		delete(p.bcache, p.allocator)
+		virtual.release(raw_data(p.bcache), uint(BCACHE * size_of(Bc_Entry)))
 		p.bcache = nil
 	}
+	for r in p.runs {
+		_run_filter_drop(p, r)
+	}
+	p.filters_cold = true
 	for &c, i in p.conts {
 		if i != p.active && c.fd >= 0 && !c.dirty {
 			prim.close_file(p.base, c.fd)

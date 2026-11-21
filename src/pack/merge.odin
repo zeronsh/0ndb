@@ -174,43 +174,37 @@ Merge :: struct {
 }
 
 @(private)
+BASE_LEVEL :: u8(255)
+
+@(private)
 _merge_pick :: proc(p: ^Pack) -> (lo: int, hi: int, ok: bool) {
 	n := len(p.runs)
 	if n < 2 {
 		return
 	}
+	cap_keys := u64(p.opts.filter_budget) * 8 / FBITS_PER_KEY
+	upper: u64
+	for r in p.runs[1:] {
+		upper += r.nentries
+	}
+	if upper >= cap_keys {
+		return 0, n, true
+	}
+	t := max(p.opts.merge_fanout, 2)
 	i := n
-	for i > 0 {
+	for i > 1 {
 		lvl := p.runs[i - 1].level
 		j := i - 1
-		for j > 0 && p.runs[j - 1].level == lvl {
+		for j > 1 && p.runs[j - 1].level == lvl {
 			j -= 1
 		}
-		if i - j >= p.opts.merge_fanout {
-			return i - p.opts.merge_fanout, i, true
+		if i - j >= t {
+			return i - t, i, true
 		}
 		i = j
 	}
 	if n > p.opts.max_runs {
-		return n - p.opts.merge_fanout, n, true
-	}
-	return
-}
-
-@(private)
-_merge_pick_idle :: proc(p: ^Pack) -> (lo: int, hi: int, ok: bool) {
-	n := len(p.runs)
-	if n <= 1 {
-		return
-	}
-	newer := make([]u64, n + 1, context.temp_allocator)
-	for i := n - 1; i >= 0; i -= 1 {
-		newer[i] = newer[i + 1] + u64(p.runs[i].nblocks)
-	}
-	for i in 0 ..< n - 1 {
-		if u64(p.runs[i].nblocks) <= 4 * newer[i + 1] {
-			return i, n, true
-		}
+		return max(n - t, 1), n, true
 	}
 	return
 }
@@ -225,9 +219,11 @@ _merge_start :: proc(p: ^Pack, lo, hi: int) -> Error {
 	m.count = hi - lo
 	lvl: u8
 	for r in p.runs[lo:hi] {
-		lvl = max(lvl, r.level)
+		if r.level != BASE_LEVEL {
+			lvl = max(lvl, r.level)
+		}
 	}
-	m.level = lvl + 1
+	m.level = BASE_LEVEL if lo == 0 else min(lvl + 1, BASE_LEVEL - 1)
 	m.drop = lo == 0
 	m.out_id = p.next_run
 	p.next_run += 1
@@ -367,7 +363,12 @@ _merge_installed :: proc(p: ^Pack, m: ^Merge) -> Error {
 	}
 	remove_range(&p.runs, lo, lo + m.count)
 	inject_at(&p.runs, lo, nr)
+	p.stats.index_written += u64(nr.nblocks) * BLOCK
 	free(m, p.allocator)
+	for r in old {
+		_run_filter_drop(p, r)
+	}
+	_filters_rebalance(p) or_return
 	for r in old {
 		pb: prim.Path_Buf
 		id := r.id
@@ -380,15 +381,12 @@ _merge_installed :: proc(p: ^Pack, m: ^Merge) -> Error {
 }
 
 @(private)
-_merge_step :: proc(p: ^Pack, budget: i64, idle := false) -> (more: bool, err: Error) {
-	if p.fl.on && p.fl.kind == .Merge {
+_merge_step :: proc(p: ^Pack, budget: i64) -> (more: bool, err: Error) {
+	if p.fl.on && (p.fl.kind == .Merge || _async(p)) {
 		return true, .None
 	}
 	if p.merge == nil {
 		lo, hi, ok := _merge_pick(p)
-		if !ok && idle {
-			lo, hi, ok = _merge_pick_idle(p)
-		}
 		if !ok {
 			return false, .None
 		}
@@ -397,9 +395,6 @@ _merge_step :: proc(p: ^Pack, budget: i64, idle := false) -> (more: bool, err: E
 	done := _merge_work(p, budget) or_return
 	if done {
 		_, _, again := _merge_pick(p)
-		if !again && idle {
-			_, _, again = _merge_pick_idle(p)
-		}
 		return again, .None
 	}
 	return true, .None

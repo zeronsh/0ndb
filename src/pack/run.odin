@@ -1,6 +1,7 @@
 package pack
 
 import "core:hash/xxhash"
+import "core:mem/virtual"
 import "../prim"
 
 BLOCK :: 4096
@@ -18,6 +19,20 @@ BT_DATA :: u8(1)
 BT_INDEX :: u8(2)
 @(private)
 BT_FOOTER :: u8(3)
+@(private)
+BT_FILTER :: u8(4)
+@(private)
+BT_FINDEX :: u8(5)
+@(private)
+FLINES :: 63
+@(private)
+FBYTES :: FLINES * 64
+@(private)
+FBITS_PER_KEY :: 10
+@(private)
+FKEYS :: FBYTES * 8 / FBITS_PER_KEY
+@(private)
+FPROBES :: 7
 @(private)
 RUN_MAGIC :: u64(0x6e75_726b_6370_6e30)
 @(private)
@@ -37,6 +52,16 @@ Run :: struct {
 	nentries: u64,
 	fd:       prim.Fd,
 	root_buf: []u8,
+	fkeys:    [dynamic]u8,
+	fents:    [dynamic]Fpart,
+	fres:     []u8,
+}
+
+@(private)
+Fpart :: struct {
+	koff: u32,
+	klen: u32,
+	blk:  u32,
 }
 
 @(private)
@@ -62,6 +87,12 @@ Builder :: struct {
 	nblocks:  u32,
 	nentries: u64,
 	err:      Error,
+	fh:       [FKEYS]u64,
+	fn:       int,
+	flast:    [MAX_KEY]u8,
+	flastlen: int,
+	fparts:   [dynamic]u8,
+	nparts:   u32,
 }
 
 @(private)
@@ -120,6 +151,101 @@ _builder_destroy :: proc(bd: ^Builder) {
 		delete(bd.out)
 		bd.out = nil
 	}
+	delete(bd.fparts)
+	bd.fparts = nil
+}
+
+@(private)
+_fline :: #force_inline proc "contextless" (h: u64) -> int {
+	return int(((h >> 32) * FLINES) >> 32)
+}
+
+@(private)
+_fset :: proc "contextless" (bits: []u8, h: u64) {
+	line := bits[_fline(h) * 64:][:64]
+	h1 := u32(h)
+	h2 := u32(h >> 32) | 1
+	for j in 0 ..< u32(FPROBES) {
+		b := (h1 + j * h2) & 511
+		line[b >> 3] |= 1 << (b & 7)
+	}
+}
+
+@(private)
+_ftest :: proc "contextless" (bits: []u8, h: u64) -> bool {
+	line := bits[_fline(h) * 64:][:64]
+	h1 := u32(h)
+	h2 := u32(h >> 32) | 1
+	for j in 0 ..< u32(FPROBES) {
+		b := (h1 + j * h2) & 511
+		if line[b >> 3] & (1 << (b & 7)) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+_fhash :: #force_inline proc(key: []u8) -> u64 {
+	return xxhash.XXH3_64_with_seed(key, 0x66696c74)
+}
+
+@(private)
+_filter_flush :: proc(bd: ^Builder) {
+	if bd.fn == 0 {
+		return
+	}
+	blk: [BLOCK]u8
+	bits := blk[BLOCK_HDR:][:FBYTES]
+	for h in bd.fh[:bd.fn] {
+		_fset(bits, h)
+	}
+	_block_seal(blk[:], BT_FILTER, bd.fn, BLOCK_HDR + FBYTES, nil)
+	no := _builder_emit(bd, blk[:])
+	vb: [10]u8
+	n := prim.put_uvarint(vb[:], u64(bd.flastlen))
+	append(&bd.fparts, ..vb[:n])
+	append(&bd.fparts, ..bd.flast[:bd.flastlen])
+	n = prim.put_uvarint(vb[:], u64(no))
+	append(&bd.fparts, ..vb[:n])
+	bd.nparts += 1
+	bd.fn = 0
+}
+
+@(private)
+_filter_index :: proc(bd: ^Builder) -> (first: u32, count: u32) {
+	first = bd.nblocks
+	blk: [BLOCK]u8
+	pos := BLOCK_HDR
+	cnt := 0
+	r := prim.reader(bd.fparts[:])
+	for prim.reader_remaining(&r) > 0 {
+		start := r.pos
+		kl := prim.read_uvarint(&r)
+		prim.read_raw(&r, int(kl))
+		prim.read_uvarint(&r)
+		if r.err != .None {
+			bd.err = .Io
+			return
+		}
+		ent := bd.fparts[start:r.pos]
+		if pos + len(ent) > BLOCK_END {
+			_block_seal(blk[:], BT_FINDEX, cnt, pos, nil)
+			_builder_emit(bd, blk[:])
+			count += 1
+			pos = BLOCK_HDR
+			cnt = 0
+		}
+		copy(blk[pos:], ent)
+		pos += len(ent)
+		cnt += 1
+	}
+	if cnt > 0 {
+		_block_seal(blk[:], BT_FINDEX, cnt, pos, nil)
+		_builder_emit(bd, blk[:])
+		count += 1
+	}
+	return
 }
 
 @(private)
@@ -228,6 +354,12 @@ _level_finish :: proc(bd: ^Builder, lvl: int) -> u32 {
 _builder_add :: proc(bd: ^Builder, key: []u8, val: []u8, tomb: bool) {
 	_level_add(bd, 0, key, val, tomb)
 	bd.nentries += 1
+	bd.fh[bd.fn] = _fhash(key)
+	bd.fn += 1
+	bd.flastlen = copy(bd.flast[:], key)
+	if bd.fn == FKEYS {
+		_filter_flush(bd)
+	}
 }
 
 @(private)
@@ -256,6 +388,8 @@ _builder_finish :: proc(bd: ^Builder, level: u8) -> (r: Run, err: Error) {
 	if depth == 0 {
 		return {}, .Io
 	}
+	_filter_flush(bd)
+	ffirst, fcount := _filter_index(bd)
 	footer: [BLOCK]u8
 	p := BLOCK_HDR
 	prim.put_u64le(footer[p:], RUN_MAGIC)
@@ -264,7 +398,10 @@ _builder_finish :: proc(bd: ^Builder, level: u8) -> (r: Run, err: Error) {
 	footer[p + 20] = u8(depth)
 	footer[p + 21] = level
 	prim.put_u32le(footer[p + 22:], VERSION)
-	_block_seal(footer[:], BT_FOOTER, 0, p + 26, nil)
+	prim.put_u32le(footer[p + 26:], ffirst)
+	prim.put_u32le(footer[p + 30:], fcount)
+	prim.put_u32le(footer[p + 34:], bd.nparts)
+	_block_seal(footer[:], BT_FOOTER, 0, p + 38, nil)
 	nb := bd.nblocks + 1
 	_builder_emit(bd, footer[:])
 	_builder_drain(bd)
@@ -288,9 +425,9 @@ _run_read_block :: proc(p: ^Pack, r: ^Run, blk: u32, buf: []u8) -> (out: []u8, e
 		return nil, .Io
 	}
 	if p.bcache == nil {
-		c, aerr := make([]Bc_Entry, BCACHE, p.allocator)
+		raw, aerr := virtual.reserve_and_commit(uint(BCACHE * size_of(Bc_Entry)))
 		if aerr == nil {
-			p.bcache = c
+			p.bcache = ([^]Bc_Entry)(raw_data(raw))[:BCACHE]
 		}
 	}
 	dst := buf[:BLOCK]
@@ -331,6 +468,9 @@ _run_load :: proc(p: ^Pack, r: ^Run) -> Error {
 		r.root_buf = b
 	}
 	tmp: [BLOCK]u8
+	if r.nblocks < 2 {
+		return .Io
+	}
 	root := _run_read_block(p, r, r.root, tmp[:]) or_return
 	copy(r.root_buf, root)
 	if r.root_buf[0] != BT_INDEX {
@@ -344,7 +484,112 @@ _run_load :: proc(p: ^Pack, r: ^Run) -> Error {
 	if prim.get_u32le(footer[q + 22:]) != VERSION {
 		return .Unsupported
 	}
+	ffirst := prim.get_u32le(footer[q + 26:])
+	fcount := prim.get_u32le(footer[q + 30:])
+	nparts := prim.get_u32le(footer[q + 34:])
+	if u64(ffirst) + u64(fcount) > u64(r.nblocks - 1) || u64(nparts) > r.nentries {
+		return .Io
+	}
+	clear(&r.fkeys)
+	clear(&r.fents)
+	if r.fkeys == nil {
+		r.fkeys = make([dynamic]u8, p.allocator)
+		r.fents = make([dynamic]Fpart, p.allocator)
+	}
+	for b in ffirst ..< ffirst + fcount {
+		blk := _run_read_block(p, r, b, tmp[:]) or_return
+		if blk[0] != BT_FINDEX {
+			return .Io
+		}
+		c: Block_Cursor
+		_cursor_init(&c, blk)
+		pos := BLOCK_HDR
+		for _ in 0 ..< c.left {
+			kl, n1 := prim.get_uvarint(blk[pos:c.end])
+			if n1 <= 0 || kl > MAX_KEY || pos + n1 + int(kl) > c.end {
+				return .Io
+			}
+			key := blk[pos + n1:][:kl]
+			no, n2 := prim.get_uvarint(blk[pos + n1 + int(kl):c.end])
+			if n2 <= 0 || no >= u64(r.nblocks) {
+				return .Io
+			}
+			append(&r.fents, Fpart{koff = u32(len(r.fkeys)), klen = u32(kl), blk = u32(no)})
+			append(&r.fkeys, ..key)
+			pos += n1 + int(kl) + n2
+		}
+	}
+	if u32(len(r.fents)) != nparts {
+		return .Io
+	}
 	return .None
+}
+
+@(private)
+_run_filter_bytes :: proc "contextless" (r: ^Run) -> int {
+	return len(r.fents) * FBYTES
+}
+
+@(private)
+_run_filter_load :: proc(p: ^Pack, r: ^Run) -> Error {
+	if r.fres != nil || len(r.fents) == 0 {
+		return .None
+	}
+	res, aerr := virtual.reserve_and_commit(uint(len(r.fents) * FBYTES))
+	if aerr != nil {
+		return .No_Memory
+	}
+	tmp: [BLOCK]u8
+	for f, i in r.fents {
+		n, err := prim.read_at(p.base, r.fd, tmp[:], i64(f.blk) * BLOCK)
+		if err != .None || n != BLOCK || !_block_ok(tmp[:]) || tmp[0] != BT_FILTER {
+			virtual.release(raw_data(res), uint(len(res)))
+			return .Io if err == .None else err
+		}
+		copy(res[i * FBYTES:], tmp[BLOCK_HDR:][:FBYTES])
+	}
+	r.fres = res
+	return .None
+}
+
+@(private)
+_run_filter_drop :: proc(p: ^Pack, r: ^Run) {
+	if r.fres != nil {
+		virtual.release(raw_data(r.fres), uint(len(r.fres)))
+		r.fres = nil
+	}
+}
+
+@(private)
+_run_may_contain :: proc(p: ^Pack, r: ^Run, key: []u8) -> (maybe: bool, err: Error) {
+	n := len(r.fents)
+	if n == 0 {
+		return true, .None
+	}
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		f := r.fents[mid]
+		if _key_cmp(r.fkeys[f.koff:][:f.klen], key) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == n {
+		return false, .None
+	}
+	h := _fhash(key)
+	if r.fres != nil {
+		return _ftest(r.fres[lo * FBYTES:][:FBYTES], h), .None
+	}
+	tmp: [BLOCK]u8
+	blk := _run_read_block(p, r, r.fents[lo].blk, tmp[:]) or_return
+	if blk[0] != BT_FILTER {
+		return false, .Io
+	}
+	p.stats.filter_reads += 1
+	return _ftest(blk[BLOCK_HDR:][:FBYTES], h), .None
 }
 
 @(private)

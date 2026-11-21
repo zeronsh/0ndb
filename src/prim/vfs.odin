@@ -42,6 +42,13 @@ Dir_Entry :: struct {
 	kind: File_Kind,
 }
 
+Vfs_Cap :: enum u8 {
+	Durable_Dir_Ops_With_Data,
+	Atomic_Group_Commit,
+}
+
+Vfs_Caps :: bit_set[Vfs_Cap;u8]
+
 Vfs_Procs :: struct {
 	open:       proc(data: rawptr, path: string, flags: Open_Flags, mode: u32) -> (Fd, Error),
 	close:      proc(data: rawptr, fd: Fd) -> Error,
@@ -65,6 +72,7 @@ Vfs_Procs :: struct {
 	dir_open:   proc(data: rawptr, d: ^Dir, path: string) -> Error,
 	dir_next:   proc(data: rawptr, d: ^Dir) -> (Dir_Entry, bool, Error),
 	dir_close:  proc(data: rawptr, d: ^Dir),
+	caps:       proc(data: rawptr, fd: Fd) -> Vfs_Caps,
 }
 
 os_vfs :: proc "contextless" () -> Vfs {
@@ -161,6 +169,13 @@ dir_next :: #force_inline proc(vfs: Vfs, d: ^Dir) -> (Dir_Entry, bool, Error) {
 
 dir_close :: #force_inline proc(vfs: Vfs, d: ^Dir) {
 	vfs.procs.dir_close(vfs.data, d)
+}
+
+file_caps :: proc(vfs: Vfs, fd: Fd) -> Vfs_Caps {
+	if vfs.procs == nil || vfs.procs.caps == nil {
+		return {}
+	}
+	return vfs.procs.caps(vfs.data, fd)
 }
 
 file_size :: proc(vfs: Vfs, fd: Fd) -> (i64, Error) {

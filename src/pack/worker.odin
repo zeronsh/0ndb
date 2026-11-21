@@ -11,13 +11,23 @@ Job_Kind :: enum u8 {
 	Commit,
 	Flush,
 	Merge,
+	Super,
+	Delete,
 }
 
 @(private)
 Zero_Job :: struct {
-	fd:  prim.Fd,
-	off: i64,
-	len: i64,
+	fd:     prim.Fd,
+	cont:   u32,
+	off:    i64,
+	len:    i64,
+	urgent: bool,
+}
+
+@(private)
+Cont_Fd :: struct {
+	fd:   prim.Fd,
+	cont: u32,
 }
 
 @(private)
@@ -30,6 +40,7 @@ Snap :: struct {
 	next_cont:  u32,
 	next_run:   u32,
 	compacting: u32,
+	cpos:       i64,
 	runs:       [dynamic]Run,
 	conts:      [dynamic]Cont,
 }
@@ -46,7 +57,16 @@ Inflight :: struct {
 	fd:       prim.Fd,
 	fds:      [dynamic]Job_Fd,
 	zjobs:    [dynamic]Zero_Job,
-	syncs:    [dynamic]prim.Fd,
+	syncs:    [dynamic]Cont_Fd,
+	newc_fd:  prim.Fd,
+	dirsync:  bool,
+	crec:     [REC_HDR + COMMIT_BODY]u8,
+	crec_off: i64,
+	ccont:    u32,
+	cpos:     i64,
+	del_id:   u32,
+	del_path: prim.Path_Buf,
+	del_len:  int,
 	busy:     [dynamic]u32,
 	imm:      ^Mem,
 	drop:     bool,
@@ -93,6 +113,7 @@ _snap_take :: proc(p: ^Pack, s: ^Snap) {
 		next_cont  = p.next_cont,
 		next_run   = p.next_run,
 		compacting = p.compacting,
+		cpos       = p.compact_resume,
 	}
 	s.runs = make([dynamic]Run, 0, len(p.runs) + 1, p.allocator)
 	for r in p.runs {
@@ -126,6 +147,7 @@ _snap_encode :: proc(s: ^Snap, out: ^[dynamic]u8) -> bool {
 	prim.write_u32le(&w, s.next_cont)
 	prim.write_u32le(&w, s.next_run)
 	prim.write_u32le(&w, s.compacting)
+	prim.write_u64le(&w, u64(max(s.cpos, 0)))
 	prim.write_uvarint(&w, u64(len(s.runs)))
 	for r in s.runs {
 		prim.write_u32le(&w, r.id)
@@ -214,19 +236,36 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 		fl.nsync += 1
 		prim.datasync(base, j.fd) or_return
 	}
+	if fl.newc_fd >= 0 {
+		fl.nsync += 1
+		prim.datasync(base, fl.newc_fd) or_return
+	}
+	if fl.dirsync {
+		fl.nsync += 1
+		prim.sync_dir(base, fl.root) or_return
+	}
 	if fl.wrote {
+		prim.write_at(base, fl.fd, fl.crec[:], fl.crec_off) or_return
 		fl.nsync += 1
 		prim.datasync(base, fl.fd) or_return
 	}
 	for z in fl.zjobs {
 		_zero_range(base, z.fd, z.off, z.len) or_return
 	}
-	for fd in fl.syncs {
+	for c in fl.syncs {
 		fl.nsync += 1
-		prim.datasync(base, fd) or_return
+		prim.datasync(base, c.fd) or_return
 	}
 	switch fl.kind {
 	case .Commit:
+	case .Super:
+		return _snap_write(base, fl.super_fd, &fl.snap, &fl.nsync)
+	case .Delete:
+		if e := prim.remove(base, string(fl.del_path[:fl.del_len])); e != .None && e != .Not_Found {
+			return e
+		}
+		fl.nsync += 1
+		return prim.sync_dir(base, fl.root)
 	case .Flush:
 		if fl.imm != nil && fl.imm.count > 0 {
 			run := _build_run(base, fl.run_fd, fl.imm, fl.drop) or_return
@@ -270,6 +309,8 @@ _submit :: proc(p: ^Pack) -> Error {
 	p.fl.on = true
 	p.fl.base = p.base
 	p.fl.nsync = 0
+	p.fl.root = p.root
+	p.fl.super_fd = p.super_fd
 	if p.opts.wake == nil {
 		return .None
 	}

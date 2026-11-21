@@ -30,7 +30,7 @@ replica_open :: proc(rep: ^Replica, vfs: prim.Vfs, path: string, allocator := co
 	fd, oerr := prim.open_file(vfs, path, {.Write}, 0o600)
 	if oerr == .Not_Found {
 		fd, oerr = prim.open_file(vfs, path, {.Write, .Create, .Exclusive}, 0o600)
-		if oerr == .None {
+		if oerr == .None && .Durable_Dir_Ops_With_Data not_in prim.file_caps(vfs, fd) {
 			if serr := prim.sync_dir(vfs, prim.dir_name(path)); serr != .None {
 				prim.close_file(vfs, fd)
 				return _err(serr)
