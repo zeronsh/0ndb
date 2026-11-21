@@ -2,6 +2,7 @@ package sim
 
 import "base:intrinsics"
 import "base:runtime"
+import "core:fmt"
 import "core:mem"
 
 REGION_BASE :: uintptr(0x6000_0000_0000)
@@ -77,6 +78,7 @@ _alloc :: proc(r: ^Region, size: int, alignment: int, zero: bool) -> ([]byte, me
 		start := mem.align_forward_uintptr(r.top + HEADER, uintptr(align))
 		end := start + uintptr(size)
 		if end > r.base + uintptr(r.size) {
+			region_exhausted(r, size)
 			return nil, .Out_Of_Memory
 		}
 		r.top = end
@@ -99,6 +101,7 @@ _alloc :: proc(r: ^Region, size: int, alignment: int, zero: bool) -> ([]byte, me
 	} else {
 		block = mem.align_forward_uintptr(r.top, HEADER)
 		if block + bsize > r.base + uintptr(r.size) {
+			region_exhausted(r, size)
 			return nil, .Out_Of_Memory
 		}
 		r.top = block + bsize
@@ -216,4 +219,9 @@ _region_proc :: proc(data: rawptr, mode: runtime.Allocator_Mode, size, alignment
 		return nil, .Mode_Not_Implemented
 	}
 	return nil, nil
+}
+
+region_exhausted :: proc(r: ^Region, size: int) {
+	slot := int((r.base - REGION_BASE) / REGION_STRIDE)
+	fmt.eprintf("sim: memory region exhausted: slot %d %s region (%d MiB) cannot satisfy %d bytes; live=%d blocks, %d MiB in use\n", slot, "temp" if r.bump else "main", r.size >> 20, size, r.live, r.bytes >> 20)
 }

@@ -99,6 +99,12 @@ next_time :: proc(w: ^World) -> (t: i64, ok: bool) {
 
 run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
 	for w.phase != .Workload || len(w.failures) < 20 {
+		if w.aborted {
+			return false
+		}
+		if memory_runaway(w) {
+			return false
+		}
 		free_all(w.ctx.temp_allocator)
 		drain_all(w)
 		t, ok := next_time(w)
@@ -270,6 +276,8 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	trace_events = env_u64("SIM_TRACE_EVENTS", 0) != 0
 	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {}
 	cfg.io_rate = env_u64("SIM_IO", cfg.io_rate)
+	cfg.drain_wall_s = int(env_u64("SIM_DRAIN_WALL", 30))
+	cfg.rss_max = env_u64("SIM_RSS_MAX", 1500)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
 	cfg.keep_faults = filter_parse("SIM_KEEP_FAULTS")
@@ -357,6 +365,9 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 }
 
 finish :: proc(w: ^World) {
+	if w.aborted {
+		return
+	}
 	w.phase = .Quiesce
 	world_note(w, "quiesce")
 	for n in w.nodes {
@@ -414,13 +425,16 @@ finish :: proc(w: ^World) {
 	check_relay_redaction(w)
 	check_relay_plaintext(w)
 	check_mounts(w)
+	if w.aborted {
+		return
+	}
 	idle := run_until(w, w.now + 600_000_000_000, true)
 	if !idle {
 		world_fail(w, "idle: world never became idle (timers keep firing)")
 	}
 	check_live_reads(w)
 	check_idle(w)
-	if len(w.failures) == 0 {
+	if len(w.failures) == 0 && !w.aborted {
 		check_close(w)
 	}
 }
@@ -914,4 +928,37 @@ shrink :: proc(seed: u64) -> bool {
 
 got_stats :: proc(st: Wire_Stats) -> bool {
 	return st.ops > 0 || st.faults > 0 || st.disk_ops > 0
+}
+
+rss_mib :: proc() -> int {
+	data, err := os.read_entire_file_from_path("/proc/self/statm", context.temp_allocator)
+	if err != nil {
+		return 0
+	}
+	fields := strings.fields(string(data), context.temp_allocator)
+	if len(fields) < 2 {
+		return 0
+	}
+	pages, _ := strconv.parse_int(fields[1])
+	return pages * 4096 >> 20
+}
+
+memory_runaway :: proc(w: ^World) -> bool {
+	w.mem_checks += 1
+	if w.mem_checks & 255 != 0 {
+		return false
+	}
+	rss := rss_mib()
+	if rss < int(w.cfg.rss_max) {
+		return false
+	}
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprintf(&b, "memory runaway: RSS %d MiB at t=%d ms; queue=%d events", rss, w.now / 1_000_000, len(w.queue))
+	for n in w.nodes {
+		fmt.sbprintf(&b, "; %s region %d MiB live (%d blocks) temp peak %d MiB disk %d MiB unsynced %d MiB", n.name, n.inst.main.bytes >> 20, n.inst.main.live, int(n.inst.temp.peak - n.inst.temp.base) >> 20 if n.inst.temp.peak > 0 else 0, disk_bytes(&n.disk) >> 20, n.disk.pend_bytes >> 20)
+	}
+	fmt.sbprintf(&b, "; relay region %d MiB disk %d MiB", w.relay.inst.main.bytes >> 20, disk_bytes(&w.relay.disk) >> 20)
+	world_fail(w, "%s", strings.to_string(b))
+	w.aborted = true
+	return true
 }

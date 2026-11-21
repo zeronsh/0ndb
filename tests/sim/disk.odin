@@ -56,6 +56,7 @@ Meta_Op :: struct {
 	ino:   u64,
 	dir2:  u64,
 	name2: string,
+	gone:  u64,
 }
 
 Open_File :: struct {
@@ -108,6 +109,10 @@ Disk :: struct {
 	dead:      bool,
 	fail_sync: u64,
 	fail_rate: u64,
+	runaway_size: i64,
+	runaway_ino:  u64,
+	runaway_pend: bool,
+	pend_bytes:   i64,
 	watching:  bool,
 	watch_prefix: string,
 	events:    [dynamic]Watch_Ev,
@@ -212,6 +217,7 @@ _inode_new :: proc(d: ^Disk, kind: Inode_Kind, mode: u32) -> ^Inode {
 
 @(private = "file")
 _inode_free :: proc(d: ^Disk, n: ^Inode) {
+	_pend_drop(d, n)
 	delete(n.data)
 	delete(n.durable)
 	for p in n.pend {
@@ -599,12 +605,21 @@ _d_read_at :: proc(data: rawptr, fd: prim.Fd, buf: []u8, off: i64) -> (int, prim
 	return c, .None
 }
 
+DISK_FILE_MAX :: i64(512) << 20
+
 @(private = "file")
-_write :: proc(d: ^Disk, n: ^Inode, src: []u8, off: i64) {
+_write :: proc(d: ^Disk, n: ^Inode, src: []u8, off: i64) -> prim.Error {
 	end := off + i64(len(src))
 	if end > i64(len(n.data)) {
+		if end > DISK_FILE_MAX {
+			_runaway(d, n, end)
+			return .No_Space
+		}
 		old := len(n.data)
-		resize(&n.data, int(end))
+		if resize(&n.data, int(end)) != nil {
+			_runaway(d, n, end)
+			return .No_Space
+		}
 		for i in old ..< int(off) {
 			n.data[i] = 0
 		}
@@ -613,9 +628,35 @@ _write :: proc(d: ^Disk, n: ^Inode, src: []u8, off: i64) {
 	b := make([]u8, len(src), d.allocator)
 	copy(b, src)
 	append(&n.pend, Pend{kind = .Write, off = off, bytes = b})
+	d.pend_bytes += i64(len(src))
+	if d.pend_bytes > DISK_FILE_MAX && d.runaway_size == 0 {
+		d.runaway_size = d.pend_bytes
+		d.runaway_ino = n.ino
+		d.runaway_pend = true
+	}
 	n.mtime_ns = _now(d)
 	d.stats.writes += 1
 	d.stats.bytes += u64(len(src))
+	return .None
+}
+
+@(private = "file")
+_runaway :: proc(d: ^Disk, n: ^Inode, size: i64) {
+	if d.runaway_size == 0 {
+		d.runaway_size = size
+		d.runaway_ino = n.ino
+	}
+}
+
+disk_runaway :: proc(d: ^Disk) -> (path: string, size: i64, ok: bool) {
+	if d.runaway_size == 0 {
+		return "", 0, false
+	}
+	p := _path_of(d, d.runaway_ino, context.temp_allocator)
+	if d.runaway_pend {
+		p = strings.concatenate({"unsynced writes (latest to ", p, ")"}, context.temp_allocator)
+	}
+	return p, d.runaway_size, true
 }
 
 @(private = "file")
@@ -642,7 +683,9 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 	if len(src) == 0 {
 		return .None
 	}
-	_write(d, n, src, at)
+	if werr := _write(d, n, src, at); werr != .None {
+		return werr
+	}
 	of.wrote = true
 	_event(d, of.path)
 	return .None
@@ -666,6 +709,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 			for p in n.pend {
 				delete(p.bytes, d.allocator)
 			}
+			_pend_drop(d, n)
 			clear(&n.pend)
 		}
 		return .Io
@@ -697,6 +741,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		}
 		delete(p.bytes, d.allocator)
 	}
+	_pend_drop(d, n)
 	clear(&n.pend)
 	return .None
 }
@@ -712,11 +757,18 @@ _commit_dir :: proc(d: ^Disk, dir: u64) {
 	if last < 0 {
 		return
 	}
+	gone := make([dynamic]u64, context.temp_allocator)
 	for i in 0 ..= last {
 		_meta_apply(d, d.meta[i])
+		if d.meta[i].gone != 0 {
+			append(&gone, d.meta[i].gone)
+		}
 		_meta_free(d, d.meta[i])
 	}
 	remove_range(&d.meta, 0, last + 1)
+	for g in gone {
+		_maybe_orphan(d, g)
+	}
 }
 
 @(private = "file")
@@ -775,7 +827,10 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	}
 	d.trace = mix64(d.trace, u64(size))
 	old := len(n.data)
-	resize(&n.data, int(size))
+	if size > DISK_FILE_MAX || resize(&n.data, int(size)) != nil {
+		_runaway(d, n, size)
+		return .No_Space
+	}
 	for i in old ..< int(size) {
 		n.data[i] = 0
 	}
@@ -807,8 +862,7 @@ _d_punch :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> prim.Error {
 		return .None
 	}
 	z := make([]u8, int(end - off), context.temp_allocator)
-	_write(d, n, z, off)
-	return .None
+	return _write(d, n, z, off)
 }
 
 @(private = "file")
@@ -953,7 +1007,7 @@ _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 	moved := _unlink_entry(d, pa, a.name)
 	pb.entries[strings.clone(b.name, d.allocator)] = moved
 	d.inodes[moved].nlink += 1
-	append(&d.meta, Meta_Op{kind = .Rename, dir = a.parent, name = strings.clone(a.name, d.allocator), ino = moved, dir2 = b.parent, name2 = strings.clone(b.name, d.allocator)})
+	append(&d.meta, Meta_Op{kind = .Rename, dir = a.parent, name = strings.clone(a.name, d.allocator), ino = moved, dir2 = b.parent, name2 = strings.clone(b.name, d.allocator), gone = replaced})
 	_event(d, old)
 	_event(d, new)
 	if replaced != 0 {
@@ -985,7 +1039,7 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	}
 	dir := d.inodes[lk.parent]
 	ino := _unlink_entry(d, dir, lk.name)
-	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0})
+	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0, gone = ino})
 	_maybe_orphan(d, ino)
 	_event(d, path)
 	return .None
@@ -1016,7 +1070,7 @@ _d_rmdir :: proc(data: rawptr, path: string) -> prim.Error {
 	}
 	dir := d.inodes[lk.parent]
 	ino := _unlink_entry(d, dir, lk.name)
-	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0})
+	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0, gone = ino})
 	_maybe_orphan(d, ino)
 	return .None
 }
@@ -1333,6 +1387,7 @@ _recover_file :: proc(d: ^Disk, n: ^Inode, keep: u64, r: ^Rng) {
 		}
 		delete(p.bytes, d.allocator)
 	}
+	_pend_drop(d, n)
 	clear(&n.pend)
 	delete(n.data)
 	n.data = content
@@ -1583,4 +1638,13 @@ disk_put_virtual :: proc(d: ^Disk, path: string, data: []u8) {
 	copy(n.data[:], data)
 	resize(&n.durable, len(data))
 	copy(n.durable[:], data)
+}
+
+@(private = "file")
+_pend_drop :: proc(d: ^Disk, n: ^Inode) {
+	for p in n.pend {
+		if p.kind == .Write {
+			d.pend_bytes -= i64(len(p.bytes))
+		}
+	}
 }

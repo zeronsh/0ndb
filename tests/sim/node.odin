@@ -1,6 +1,7 @@
 package sim
 
 import "core:fmt"
+import "core:time"
 import eng "../../src/engine"
 import "../../src/pack"
 import "../../src/prim"
@@ -201,6 +202,10 @@ node_after :: proc(n: ^Node) {
 	if !n.alive {
 		return
 	}
+	if path, size, runaway := disk_runaway(&n.disk); runaway && !n.w.aborted {
+		world_fail(n.w, "%s disk runaway: %s would grow to %d MiB", n.name, path, size >> 20)
+		n.w.aborted = true
+	}
 	if n.disk.dead || n.restart_pending {
 		n.restart_pending = false
 		node_crashed(n)
@@ -225,7 +230,11 @@ node_drain :: proc(n: ^Node) -> bool {
 		return false
 	}
 	did := false
+	if w.aborted {
+		return false
+	}
 	context = instance_context(&n.inst)
+	started := time.tick_now()
 	for i := 0; ; i += 1 {
 		if !n.alive {
 			return did
@@ -233,8 +242,16 @@ node_drain :: proc(n: ^Node) -> bool {
 		if !loop_ready(&n.inst.loop) && !loop_due(&n.inst.loop) {
 			return did
 		}
-		if i > 100_000 {
-			world_fail(w, "%s livelock: loop never settles", n.name)
+		if i > 100_000 || time.duration_seconds(time.tick_since(started)) > f64(w.cfg.drain_wall_s) {
+			cb: rawptr
+			if len(n.inst.loop.heap) > 0 {
+				cb = rawptr(n.inst.loop.timers[n.inst.loop.heap[0]].cb)
+			}
+			world_fail(w, "%s livelock: its loop kept running at t=%d ms for %d steps (%.0f s wall) without settling; next timer callback %p (prim.loop_step at %p)", n.name, w.now / 1_000_000, i, time.duration_seconds(time.tick_since(started)), cb, rawptr(prim.loop_step))
+			w.aborted = true
+			return did
+		}
+		if memory_runaway(w) {
 			return did
 		}
 		did = true

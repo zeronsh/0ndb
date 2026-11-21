@@ -149,6 +149,8 @@ Config :: struct {
 	train_min:   int,
 	bulk:        bool,
 	dict_sample_min: int,
+	drain_wall_s: int,
+	rss_max:     u64,
 	keep_ops:    Filter,
 	keep_faults: Filter,
 }
@@ -178,6 +180,8 @@ World :: struct {
 	allocator: runtime.Allocator,
 	phase:     Phase,
 	ctx:       runtime.Context,
+	aborted:   bool,
+	mem_checks: u64,
 	quarantines: [dynamic]Quarantine,
 	live:      [dynamic]^Live_Read,
 }
