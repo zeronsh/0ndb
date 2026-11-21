@@ -23,6 +23,48 @@ VOCAB_DEFAULT :: Vocabularies{.Core, .Applicator, .Unevaluated, .Validation, .Me
 
 DRAFT_2020_12 :: "https://json-schema.org/draft/2020-12/schema"
 
+Dialect :: enum u8 {
+	Draft_04,
+	Draft_06,
+	Draft_07,
+	Draft_2019_09,
+	Draft_2020_12,
+}
+
+dialect_uri :: proc "contextless" (d: Dialect) -> string {
+	switch d {
+	case .Draft_04:
+		return "http://json-schema.org/draft-04/schema#"
+	case .Draft_06:
+		return "http://json-schema.org/draft-06/schema#"
+	case .Draft_07:
+		return "http://json-schema.org/draft-07/schema#"
+	case .Draft_2019_09:
+		return "https://json-schema.org/draft/2019-09/schema"
+	case .Draft_2020_12:
+		return DRAFT_2020_12
+	}
+	return DRAFT_2020_12
+}
+
+@(private)
+known_dialect :: proc "contextless" (uri: string) -> (Dialect, bool) {
+	u, _ := uri_split(uri)
+	switch u {
+	case "http://json-schema.org/draft-04/schema", "https://json-schema.org/draft-04/schema":
+		return .Draft_04, true
+	case "http://json-schema.org/draft-06/schema", "https://json-schema.org/draft-06/schema":
+		return .Draft_06, true
+	case "http://json-schema.org/draft-07/schema", "https://json-schema.org/draft-07/schema":
+		return .Draft_07, true
+	case "https://json-schema.org/draft/2019-09/schema", "http://json-schema.org/draft/2019-09/schema":
+		return .Draft_2019_09, true
+	case "https://json-schema.org/draft/2020-12/schema", "http://json-schema.org/draft/2020-12/schema":
+		return .Draft_2020_12, true
+	}
+	return .Draft_2020_12, false
+}
+
 Error :: enum u8 {
 	None,
 	Parse,
@@ -39,6 +81,8 @@ Registry :: struct {
 	dynamics:  map[string]^Value,
 	base_of:   map[^Value]string,
 	vocab_of:  map[^Value]Vocabularies,
+	dialect_of: map[^Value]Dialect,
+	dialect:   Dialect,
 	regexes:   map[string]Rx,
 	loader:    Loader,
 	loader_data: rawptr,
@@ -69,6 +113,8 @@ registry_init :: proc(r: ^Registry) -> Error {
 	r.dynamics = make(map[string]^Value, r.allocator)
 	r.base_of = make(map[^Value]string, r.allocator)
 	r.vocab_of = make(map[^Value]Vocabularies, r.allocator)
+	r.dialect_of = make(map[^Value]Dialect, r.allocator)
+	r.dialect = .Draft_2020_12
 	r.regexes = make(map[string]Rx, r.allocator)
 	r.max_depth = 512
 	return .None
@@ -108,7 +154,7 @@ add_value :: proc(r: ^Registry, uri: string, root: ^Value) -> Schema {
 		base = strings.clone(u, r.allocator)
 	}
 	r.docs[base] = root
-	walk(r, root, base, VOCAB_DEFAULT)
+	walk(r, root, base, VOCAB_DEFAULT, r.dialect)
 	return Schema{reg = r, root = root, base = r.base_of[root] if root in r.base_of else base}
 }
 
@@ -133,10 +179,16 @@ itoa :: proc(buf: []u8, n: int) -> string {
 }
 
 @(private)
-walk :: proc(r: ^Registry, node: ^Value, base: string, vocab: Vocabularies) {
+id_key :: proc "contextless" (d: Dialect) -> string {
+	return d == .Draft_04 ? "id" : "$id"
+}
+
+@(private)
+walk :: proc(r: ^Registry, node: ^Value, base: string, vocab: Vocabularies, dialect: Dialect) {
 	if node.kind == .Bool {
 		r.base_of[node] = base
 		r.vocab_of[node] = vocab
+		r.dialect_of[node] = dialect
 		return
 	}
 	if node.kind != .Object {
@@ -144,27 +196,41 @@ walk :: proc(r: ^Registry, node: ^Value, base: string, vocab: Vocabularies) {
 	}
 	b := base
 	v := vocab
-	if id, ok := get_string(node, "$id"); ok {
-		full, _ := uri_split(uri_resolve(base, id))
-		b = strings.clone(full, r.allocator)
-		if b not_in r.docs {
-			r.docs[b] = node
-		}
-	}
+	d := dialect
 	if sch, ok := get_string(node, "$schema"); ok {
-		v = vocab_for(r, sch)
+		d = dialect_for(r, sch, 0)
+		v = vocab_for(r, sch, d)
+	}
+	_, has_ref := get(node, "$ref")
+	legacy := d <= .Draft_07
+	if id, ok := get_string(node, id_key(d)); ok && !(legacy && has_ref) {
+		full, frag := uri_split(uri_resolve(base, id))
+		if full != "" || !legacy {
+			b = strings.clone(full, r.allocator)
+			if b not_in r.docs {
+				r.docs[b] = node
+			}
+		}
+		if legacy && frag != "" {
+			r.anchors[strings.concatenate({b, "#", frag}, r.allocator)] = node
+		}
 	}
 	r.base_of[node] = b
 	r.vocab_of[node] = v
-	if a, ok := get_string(node, "$anchor"); ok {
-		r.anchors[strings.concatenate({b, "#", a}, r.allocator)] = node
-	}
-	if a, ok := get_string(node, "$dynamicAnchor"); ok {
-		key := strings.concatenate({b, "#", a}, r.allocator)
-		if key not_in r.anchors {
-			r.anchors[key] = node
+	r.dialect_of[node] = d
+	if d >= .Draft_2019_09 {
+		if a, ok := get_string(node, "$anchor"); ok {
+			r.anchors[strings.concatenate({b, "#", a}, r.allocator)] = node
 		}
-		r.dynamics[key] = node
+	}
+	if d >= .Draft_2020_12 {
+		if a, ok := get_string(node, "$dynamicAnchor"); ok {
+			key := strings.concatenate({b, "#", a}, r.allocator)
+			if key not_in r.anchors {
+				r.anchors[key] = node
+			}
+			r.dynamics[key] = node
+		}
 	}
 	for k, i in node.keys {
 		child := &node.vals[i]
@@ -172,23 +238,23 @@ walk :: proc(r: ^Registry, node: ^Value, base: string, vocab: Vocabularies) {
 		case "$defs", "definitions", "properties", "patternProperties", "dependentSchemas", "dependencies":
 			if child.kind == .Object {
 				for j in 0 ..< len(child.vals) {
-					walk(r, &child.vals[j], b, v)
+					walk(r, &child.vals[j], b, v, d)
 				}
 			}
 		case "additionalProperties", "propertyNames", "contains", "not", "if", "then", "else", "unevaluatedItems", "unevaluatedProperties", "additionalItems":
-			walk(r, child, b, v)
+			walk(r, child, b, v, d)
 		case "items":
 			if child.kind == .Array {
 				for j in 0 ..< len(child.items) {
-					walk(r, &child.items[j], b, v)
+					walk(r, &child.items[j], b, v, d)
 				}
 			} else {
-				walk(r, child, b, v)
+				walk(r, child, b, v, d)
 			}
 		case "allOf", "anyOf", "oneOf", "prefixItems":
 			if child.kind == .Array {
 				for j in 0 ..< len(child.items) {
-					walk(r, &child.items[j], b, v)
+					walk(r, &child.items[j], b, v, d)
 				}
 			}
 		}
@@ -196,7 +262,32 @@ walk :: proc(r: ^Registry, node: ^Value, base: string, vocab: Vocabularies) {
 }
 
 @(private)
-vocab_for :: proc(r: ^Registry, meta_uri: string) -> Vocabularies {
+dialect_for :: proc(r: ^Registry, meta_uri: string, depth: int) -> Dialect {
+	if d, ok := known_dialect(meta_uri); ok {
+		return d
+	}
+	if depth > 8 {
+		return r.dialect
+	}
+	u, _ := uri_split(meta_uri)
+	doc := lookup_doc(r, u)
+	if doc == nil {
+		return r.dialect
+	}
+	if sch, ok := get_string(doc, "$schema"); ok && sch != meta_uri {
+		return dialect_for(r, sch, depth + 1)
+	}
+	return r.dialect
+}
+
+@(private)
+vocab_for :: proc(r: ^Registry, meta_uri: string, d: Dialect) -> Vocabularies {
+	if d < .Draft_2019_09 {
+		return VOCAB_DEFAULT
+	}
+	if _, known := known_dialect(meta_uri); known {
+		return VOCAB_DEFAULT
+	}
 	u, _ := uri_split(meta_uri)
 	doc := lookup_doc(r, u)
 	if doc == nil {
@@ -211,17 +302,19 @@ vocab_for :: proc(r: ^Registry, meta_uri: string) -> Vocabularies {
 		switch k {
 		case "https://json-schema.org/draft/2020-12/vocab/applicator":
 			out += {.Applicator}
+		case "https://json-schema.org/draft/2019-09/vocab/applicator":
+			out += {.Applicator, .Unevaluated}
 		case "https://json-schema.org/draft/2020-12/vocab/unevaluated":
 			out += {.Unevaluated}
-		case "https://json-schema.org/draft/2020-12/vocab/validation":
+		case "https://json-schema.org/draft/2020-12/vocab/validation", "https://json-schema.org/draft/2019-09/vocab/validation":
 			out += {.Validation}
-		case "https://json-schema.org/draft/2020-12/vocab/meta-data":
+		case "https://json-schema.org/draft/2020-12/vocab/meta-data", "https://json-schema.org/draft/2019-09/vocab/meta-data":
 			out += {.Meta_Data}
-		case "https://json-schema.org/draft/2020-12/vocab/format-annotation":
+		case "https://json-schema.org/draft/2020-12/vocab/format-annotation", "https://json-schema.org/draft/2019-09/vocab/format":
 			out += {.Format_Annotation}
 		case "https://json-schema.org/draft/2020-12/vocab/format-assertion":
 			out += {.Format_Assertion}
-		case "https://json-schema.org/draft/2020-12/vocab/content":
+		case "https://json-schema.org/draft/2020-12/vocab/content", "https://json-schema.org/draft/2019-09/vocab/content":
 			out += {.Content}
 		}
 	}
@@ -419,6 +512,10 @@ eval :: proc(e: ^Eval, s: ^Value, inst: ^Value, base: string, parent: ^Ann) -> b
 	if v, ok := e.r.vocab_of[s]; ok {
 		vocab = v
 	}
+	d := e.r.dialect
+	if dd, ok := e.r.dialect_of[s]; ok {
+		d = dd
+	}
 	pushed := false
 	if len(e.scope) == 0 || e.scope[len(e.scope) - 1] != b {
 		append(&e.scope, b)
@@ -428,16 +525,22 @@ eval :: proc(e: ^Eval, s: ^Value, inst: ^Value, base: string, parent: ^Ann) -> b
 		pop(&e.scope)
 	}
 	my := ann_make(inst)
-	if !eval_core(e, s, inst, b, &my) {
+	if !eval_core(e, s, inst, b, &my, d) {
 		return false
 	}
-	if .Applicator in vocab && !eval_applicators(e, s, inst, b, &my) {
+	if d <= .Draft_07 {
+		if _, has_ref := get(s, "$ref"); has_ref {
+			ann_merge(parent, &my)
+			return true
+		}
+	}
+	if .Applicator in vocab && !eval_applicators(e, s, inst, b, &my, d) {
 		return false
 	}
-	if .Validation in vocab && !eval_validation(e, s, inst) {
+	if .Validation in vocab && !eval_validation(e, s, inst, d) {
 		return false
 	}
-	if .Unevaluated in vocab && !eval_unevaluated(e, s, inst, b, &my) {
+	if d >= .Draft_2019_09 && .Unevaluated in vocab && !eval_unevaluated(e, s, inst, b, &my) {
 		return false
 	}
 	ann_merge(parent, &my)
@@ -445,7 +548,7 @@ eval :: proc(e: ^Eval, s: ^Value, inst: ^Value, base: string, parent: ^Ann) -> b
 }
 
 @(private)
-eval_core :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann) -> bool {
+eval_core :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann, d: Dialect) -> bool {
 	if ref, ok := get_string(s, "$ref"); ok {
 		t, u, _, found := resolve(e.r, b, ref)
 		if !found {
@@ -455,7 +558,30 @@ eval_core :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann) -> boo
 			return false
 		}
 	}
-	if ref, ok := get_string(s, "$dynamicRef"); ok {
+	if ref, ok := get_string(s, "$recursiveRef"); ok && d == .Draft_2019_09 {
+		t, u, _, found := resolve(e.r, b, ref)
+		if !found {
+			return fail(e, "unresolvable $recursiveRef", ref)
+		}
+		if ra, rok := get(t, "$recursiveAnchor"); rok && ra.kind == .Bool && ra.b {
+			for i := len(e.scope) - 1; i >= 0; i -= 1 {
+				root, has := e.r.docs[e.scope[i]]
+				if !has {
+					break
+				}
+				anchor, aok := get(root, "$recursiveAnchor")
+				if !aok || anchor.kind != .Bool || !anchor.b {
+					break
+				}
+				t = root
+				u = e.scope[i]
+			}
+		}
+		if !eval(e, t, inst, u, my) {
+			return false
+		}
+	}
+	if ref, ok := get_string(s, "$dynamicRef"); ok && d == .Draft_2020_12 {
 		t, u, frag, found := resolve(e.r, b, ref)
 		if !found {
 			return fail(e, "unresolvable $dynamicRef", ref)
@@ -479,7 +605,7 @@ eval_core :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann) -> boo
 }
 
 @(private)
-eval_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann) -> bool {
+eval_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann, d: Dialect) -> bool {
 	if all, ok := get(s, "allOf"); ok && all.kind == .Array {
 		for i in 0 ..< len(all.items) {
 			if !eval(e, &all.items[i], inst, b, my) {
@@ -527,7 +653,7 @@ eval_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann)
 			return fail(e, "the value must not match the not schema")
 		}
 	}
-	if cond, ok := get(s, "if"); ok {
+	if cond, ok := get(s, "if"); ok && d >= .Draft_07 {
 		sub := ann_make(inst)
 		e.quiet += 1
 		m := eval(e, cond, inst, b, &sub)
@@ -543,15 +669,15 @@ eval_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann)
 	}
 	#partial switch inst.kind {
 	case .Object:
-		return eval_object_applicators(e, s, inst, b, my)
+		return eval_object_applicators(e, s, inst, b, my, d)
 	case .Array:
-		return eval_array_applicators(e, s, inst, b, my)
+		return eval_array_applicators(e, s, inst, b, my, d)
 	}
 	return true
 }
 
 @(private)
-eval_object_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann) -> bool {
+eval_object_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann, d: Dialect) -> bool {
 	if dep, ok := get(s, "dependencies"); ok && dep.kind == .Object {
 		for k, i in dep.keys {
 			if _, present := get(inst, k); !present {
@@ -571,7 +697,7 @@ eval_object_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my
 			}
 		}
 	}
-	if ds, ok := get(s, "dependentSchemas"); ok && ds.kind == .Object {
+	if ds, ok := get(s, "dependentSchemas"); ok && ds.kind == .Object && d >= .Draft_2019_09 {
 		for k, i in ds.keys {
 			if _, present := get(inst, k); present {
 				if !eval(e, &ds.vals[i], inst, b, my) {
@@ -584,6 +710,9 @@ eval_object_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my
 	pats, has_pats := get(s, "patternProperties")
 	addl, has_addl := get(s, "additionalProperties")
 	names, has_names := get(s, "propertyNames")
+	if d < .Draft_06 {
+		has_names = false
+	}
 	for key, i in inst.keys {
 		mark := push_key(e, key)
 		defer resize(&e.path, mark)
@@ -630,8 +759,11 @@ eval_object_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my
 }
 
 @(private)
-eval_array_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann) -> bool {
+eval_array_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann, d: Dialect) -> bool {
 	prefix, has_prefix := get(s, "prefixItems")
+	if d < .Draft_2020_12 {
+		has_prefix = false
+	}
 	items, has_items := get(s, "items")
 	start := 0
 	if has_prefix && prefix.kind == .Array {
@@ -657,6 +789,17 @@ eval_array_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my:
 				}
 				my.items[i] = true
 			}
+			if addl, aok := get(s, "additionalItems"); aok && d <= .Draft_2019_09 {
+				for i in len(items.items) ..< len(inst.items) {
+					mark := push_index(e, i)
+					ok := eval(e, addl, &inst.items[i], b, nil)
+					resize(&e.path, mark)
+					if !ok {
+						return false
+					}
+					my.items[i] = true
+				}
+			}
 		} else {
 			for i in start ..< len(inst.items) {
 				mark := push_index(e, i)
@@ -669,7 +812,7 @@ eval_array_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my:
 			}
 		}
 	}
-	if contains, ok := get(s, "contains"); ok {
+	if contains, ok := get(s, "contains"); ok && d >= .Draft_06 {
 		hits := 0
 		e.quiet += 1
 		for i in 0 ..< len(inst.items) {
@@ -681,7 +824,7 @@ eval_array_applicators :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my:
 		e.quiet -= 1
 		lo := 1
 		vocab := e.r.vocab_of[s] if s in e.r.vocab_of else VOCAB_DEFAULT
-		if .Validation in vocab {
+		if .Validation in vocab && d >= .Draft_2019_09 {
 			if v, mok := get(s, "minContains"); mok && v.kind == .Number {
 				lo = int(v.n)
 			}
@@ -730,7 +873,7 @@ eval_unevaluated :: proc(e: ^Eval, s: ^Value, inst: ^Value, b: string, my: ^Ann)
 }
 
 @(private)
-type_ok :: proc(name: string, inst: ^Value) -> bool {
+type_ok :: proc(name: string, inst: ^Value, d: Dialect) -> bool {
 	switch name {
 	case "null":
 		return inst.kind == .Null
@@ -745,6 +888,9 @@ type_ok :: proc(name: string, inst: ^Value) -> bool {
 	case "number":
 		return inst.kind == .Number
 	case "integer":
+		if d == .Draft_04 && inst.frac {
+			return false
+		}
 		return inst.kind == .Number && !math.is_inf(inst.n) && inst.n == math.trunc(inst.n)
 	}
 	return false
@@ -760,14 +906,14 @@ num :: proc "contextless" (s: ^Value, key: string) -> (f64, bool) {
 }
 
 @(private)
-eval_validation :: proc(e: ^Eval, s: ^Value, inst: ^Value) -> bool {
+eval_validation :: proc(e: ^Eval, s: ^Value, inst: ^Value, d: Dialect) -> bool {
 	if t, ok := get(s, "type"); ok {
 		good := false
 		if t.kind == .String {
-			good = type_ok(t.s, inst)
+			good = type_ok(t.s, inst, d)
 		} else if t.kind == .Array {
 			for i in 0 ..< len(t.items) {
-				if t.items[i].kind == .String && type_ok(t.items[i].s, inst) {
+				if t.items[i].kind == .String && type_ok(t.items[i].s, inst, d) {
 					good = true
 					break
 				}
@@ -791,7 +937,7 @@ eval_validation :: proc(e: ^Eval, s: ^Value, inst: ^Value) -> bool {
 			return fail(e, "the value is not one of the allowed values")
 		}
 	}
-	if c, ok := get(s, "const"); ok && !equal(c, inst) {
+	if c, ok := get(s, "const"); ok && d >= .Draft_06 && !equal(c, inst) {
 		return fail(e, "the value does not equal the constant")
 	}
 	#partial switch inst.kind {
@@ -805,17 +951,34 @@ eval_validation :: proc(e: ^Eval, s: ^Value, inst: ^Value) -> bool {
 				return fail(e, "the number is not a multiple of multipleOf")
 			}
 		}
-		if m, ok := num(s, "maximum"); ok && x > m {
-			return fail(e, "the number is above maximum")
-		}
-		if m, ok := num(s, "exclusiveMaximum"); ok && x >= m {
-			return fail(e, "the number is not below exclusiveMaximum")
-		}
-		if m, ok := num(s, "minimum"); ok && x < m {
-			return fail(e, "the number is below minimum")
-		}
-		if m, ok := num(s, "exclusiveMinimum"); ok && x <= m {
-			return fail(e, "the number is not above exclusiveMinimum")
+		if d == .Draft_04 {
+			ex_max := false
+			ex_min := false
+			if v, ok := get(s, "exclusiveMaximum"); ok && v.kind == .Bool {
+				ex_max = v.b
+			}
+			if v, ok := get(s, "exclusiveMinimum"); ok && v.kind == .Bool {
+				ex_min = v.b
+			}
+			if m, ok := num(s, "maximum"); ok && (x > m || (ex_max && x == m)) {
+				return fail(e, "the number is above maximum")
+			}
+			if m, ok := num(s, "minimum"); ok && (x < m || (ex_min && x == m)) {
+				return fail(e, "the number is below minimum")
+			}
+		} else {
+			if m, ok := num(s, "maximum"); ok && x > m {
+				return fail(e, "the number is above maximum")
+			}
+			if m, ok := num(s, "exclusiveMaximum"); ok && x >= m {
+				return fail(e, "the number is not below exclusiveMaximum")
+			}
+			if m, ok := num(s, "minimum"); ok && x < m {
+				return fail(e, "the number is below minimum")
+			}
+			if m, ok := num(s, "exclusiveMinimum"); ok && x <= m {
+				return fail(e, "the number is not above exclusiveMinimum")
+			}
 		}
 	case .String:
 		n := f64(utf8.rune_count_in_string(inst.s))
@@ -866,7 +1029,7 @@ eval_validation :: proc(e: ^Eval, s: ^Value, inst: ^Value) -> bool {
 				}
 			}
 		}
-		if dr, ok := get(s, "dependentRequired"); ok && dr.kind == .Object {
+		if dr, ok := get(s, "dependentRequired"); ok && dr.kind == .Object && d >= .Draft_2019_09 {
 			for k, i in dr.keys {
 				if _, present := get(inst, k); !present {
 					continue

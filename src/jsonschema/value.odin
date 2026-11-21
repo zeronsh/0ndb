@@ -16,6 +16,7 @@ Kind :: enum u8 {
 Value :: struct {
 	kind:  Kind,
 	b:     bool,
+	frac:  bool,
 	n:     f64,
 	s:     string,
 	items: []Value,
@@ -131,13 +132,16 @@ number :: proc(p: ^Parser) -> (Value, bool) {
 	} else if digits(p) == 0 {
 		return {}, false
 	}
+	frac := false
 	if p.i < len(p.src) && p.src[p.i] == '.' {
+		frac = true
 		p.i += 1
 		if digits(p) == 0 {
 			return {}, false
 		}
 	}
 	if p.i < len(p.src) && (p.src[p.i] == 'e' || p.src[p.i] == 'E') {
+		frac = true
 		p.i += 1
 		if p.i < len(p.src) && (p.src[p.i] == '+' || p.src[p.i] == '-') {
 			p.i += 1
@@ -147,7 +151,7 @@ number :: proc(p: ^Parser) -> (Value, bool) {
 		}
 	}
 	f, _ := strconv.parse_f64(string(p.src[start:p.i]))
-	return Value{kind = .Number, n = f}, true
+	return Value{kind = .Number, n = f, frac = frac}, true
 }
 
 @(private)

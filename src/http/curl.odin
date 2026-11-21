@@ -4,7 +4,7 @@ package http
 import "base:runtime"
 import "core:c"
 import "core:strings"
-import curl "vendor:curl"
+import curl "libcurl"
 import "../prim"
 
 Curl :: struct {
@@ -57,7 +57,7 @@ curl_init :: proc(h: ^Curl, l: ^prim.Loop, allocator := context.allocator) -> bo
 	h.pool_max = 16
 	h.recv_buf = 0
 	h.send_buf = 16384
-	if curl.global_init(3) != .E_OK {
+	if curl.global_init(curl.GLOBAL_ALL) != .E_OK {
 		return false
 	}
 	h.multi = curl.multi_init()
@@ -149,7 +149,7 @@ curl_resume :: proc(h: ^Curl, id: Id) {
 		return
 	}
 	t.paused = false
-	curl.easy_pause(t.easy, curl.PAUSE_CONT)
+	curl.easy_pause(t.easy, c.int(curl.PAUSE_CONT))
 }
 
 curl_start :: proc(h: ^Curl, req: ^Request, sink: Sink) -> (Id, Error) {
