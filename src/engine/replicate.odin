@@ -16,6 +16,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		self         = e.self,
 		padding      = e.cfg.padding,
 		filtered     = true,
+		random       = e.cfg.random,
 		kernel_tls   = e.cfg.kernel_tls,
 		on_event     = _on_repl_event,
 		user         = sp,

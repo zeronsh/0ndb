@@ -335,7 +335,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	} else {
 		kdir := _join(context.temp_allocator, e.dir, "device") or_return
 		_perr(prim.mkdir_all(e.base, kdir, 0o700)) or_return
-		_serr(osync.file_keyring_open(&e.file_keyring, e.base, kdir)) or_return
+		_serr(osync.file_keyring_open(&e.file_keyring, e.base, kdir, e.cfg.random)) or_return
 		e.owns_keyring = true
 		e.keyring = osync.file_keyring(&e.file_keyring)
 	}

@@ -30,8 +30,6 @@ Remote_Tree :: struct {
 	requested: bool,
 	absent:    bool,
 	refs:      int,
-	holding:   bool,
-	held:      u64,
 }
 
 @(private)
@@ -76,11 +74,7 @@ _own_tree_get :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind, scope
 		}
 		x.stored = i64(len(data))
 	} else {
-		root: [32]u8
-		random_fill(e, root[:])
-		kerr := osync.keytree_init(&x.tree, root, osync.KEY_TREE_DEPTH, osync.KEY_TREE_SHIFT, e.allocator)
-		crypto.zero_explicit(&root, size_of(root))
-		if kerr != .None {
+		if kerr := osync.keytree_new(&x.tree, e.cfg.random, e.allocator); kerr != .None {
 			delete(x.path, e.allocator)
 			free(x, e.allocator)
 			return nil, _serr(kerr)
@@ -247,11 +241,9 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if end == 0 {
 		if rt.requested && osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) == 0 {
 			rt.absent = true
-			_remote_tree_unhold(sp, rt)
 		}
 		if !rt.requested {
 			rt.requested = true
-			_remote_tree_hold(sp, rt)
 			osync.replicator_want_tail(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch, 4096)
 			e.stats.fetches += 1
 		}
@@ -270,7 +262,6 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if rerr == .Missing {
 		if !rt.requested {
 			rt.requested = true
-			_remote_tree_hold(sp, rt)
 			osync.replicator_want_tail(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch, 4096)
 		}
 		return
@@ -283,28 +274,7 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	}
 	rt.loaded = true
 	rt.absent = false
-	_remote_tree_unhold(sp, rt)
 	_held_release(e, sp, rt.device)
-}
-
-@(private)
-_remote_tree_hold :: proc(sp: ^Space, rt: ^Remote_Tree) {
-	if rt.holding && rt.held == rt.epoch {
-		return
-	}
-	_remote_tree_unhold(sp, rt)
-	if _, err := osync.replicator_acquire(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch); err == .None {
-		rt.holding = true
-		rt.held = rt.epoch
-	}
-}
-
-@(private)
-_remote_tree_unhold :: proc(sp: ^Space, rt: ^Remote_Tree) {
-	if rt.holding && sp.repl_on {
-		osync.replicator_release(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.held)
-	}
-	rt.holding = false
 }
 
 @(private)
