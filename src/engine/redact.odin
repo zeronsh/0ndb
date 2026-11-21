@@ -38,8 +38,11 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	if len(ops) == 0 {
 		return .None
 	}
-	_, rerr := fs.history_redact(h.hist, ops[:])
+	res, rerr := fs.history_redact(h.hist, ops[:], context.temp_allocator)
 	_ferr(rerr) or_return
+	for r in res.ranges {
+		_own_redacted(e, h, r.from, r.to)
+	}
 	_handle_mark(h)
 	_object_changed(e, o.space, o.id, .Redacted)
 	_index_purge_object(e, h)
@@ -77,6 +80,8 @@ map_redact :: proc(e: ^Engine, o: Object, key: []u8) -> Error {
 		case omap.Add:
 			k = v.key
 		case omap.Del:
+			k = v.key
+		case omap.Count:
 			k = v.key
 		}
 		if string(k) == string(key) {
@@ -151,16 +156,13 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 }
 
 @(private)
-_own_redacted :: proc(e: ^Engine, h: ^Handle, from, to: i64, immediate := false) {
+_own_redacted :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
 	if h.own_tree != nil {
 		if err := _own_tree_puncture(e, h.own_tree, from, to); err == .None {
 			_dirty_keys(e, h.sp, h.id, h.kind, h.scope, h.own_tree)
 		}
 	}
 	_relay_redact_add(e, h, from, to)
-	if immediate {
-		_relay_redact_resend(e, h.sp, h.id)
-	}
 }
 
 @(private)
@@ -186,6 +188,9 @@ _relay_redact_add :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
 			omap.txn_abort(t)
 		}
 	}
+	if h.sp.repl_on && h.sp.connected {
+		osync.replicator_redact(&h.sp.repl, &h.scope, e.self, h.name, 0, from, to)
+	}
 	_object_changed(e, h.sp.id, h.id, .Redacted)
 }
 
@@ -209,10 +214,6 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 		sc := _object_scope(a.sp, id)
 		defer osync.scope_clear(&sc)
 		name := _seg_name(Kind(value[0]), id)
-		stream := osync.stream_id(&sc, a.e.self, name, 0)
-		if l, ok := a.sp.repl.locals[stream]; ok && (l.inflight > 0 || l.cursor < l.durable || l.verifying) {
-			return true
-		}
 		osync.replicator_redact(&a.sp.repl, &sc, a.e.self, name, 0, from, to)
 		return true
 	}
@@ -277,7 +278,7 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 			return
 		}
 		w.v.segs[w.seg].tail_end = -1
-		_own_redacted(e, h, from.off, r.to, true)
+		_own_redacted(e, h, from.off, r.to)
 		_handle_mark(h)
 	} else if h.sp.repl_on {
 		osync.replicator_zero_replica(&h.sp.repl, &h.scope, dev, h.name, 0, from.off, r.to)

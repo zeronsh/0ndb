@@ -55,6 +55,15 @@ Space :: struct {
 	grants:       map[prim.Id]osync.Content_Key,
 	events:       [dynamic]Repl_Ev,
 	needs:        [dynamic]Need,
+	ckpts:        [dynamic]^Ckpt_Wait,
+	card_scopes:  map[osync.Stream_Id]osync.Scope,
+	card_holds:   map[osync.Stream_Id]Card_Hold,
+}
+
+@(private)
+Card_Hold :: struct {
+	scope:  osync.Scope,
+	device: prim.Id,
 }
 
 @(private)
@@ -310,6 +319,9 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	sp.remote_trees = make(map[osync.Stream_Id]^Remote_Tree, e.allocator)
 	sp.events = make([dynamic]Repl_Ev, e.allocator)
 	sp.needs = make([dynamic]Need, e.allocator)
+	sp.ckpts = make([dynamic]^Ckpt_Wait, e.allocator)
+	sp.card_scopes = make(map[osync.Stream_Id]osync.Scope, e.allocator)
+	sp.card_holds = make(map[osync.Stream_Id]Card_Hold, e.allocator)
 	sp.identities[e.self] = e.identity
 	sp.open = true
 	_cards_load(e, sp)
@@ -334,6 +346,7 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 		_repl_stop(e, sp)
 	}
 	for _, rt in sp.remote_trees {
+		_remote_tree_unhold(sp, rt)
 		_remote_tree_free(e, rt)
 	}
 	delete(sp.remote_trees)
@@ -349,6 +362,21 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 		delete(n.name, e.allocator)
 	}
 	delete(sp.needs)
+	for w in sp.ckpts {
+		_ckpt_wait_free(e, w)
+	}
+	delete(sp.ckpts)
+	for _, &sc in sp.card_scopes {
+		osync.scope_clear(&sc)
+	}
+	delete(sp.card_scopes)
+	for _, &hd in sp.card_holds {
+		if sp.repl_on {
+			osync.replicator_release(&sp.repl, &hd.scope, hd.device, CARD_STREAM, 0)
+		}
+		osync.scope_clear(&hd.scope)
+	}
+	delete(sp.card_holds)
 	delete(sp.identities)
 	for _, &g in sp.grants {
 		crypto.zero_explicit(&g, size_of(g))
@@ -386,7 +414,7 @@ _spaces_settle :: proc(e: ^Engine) {
 		}
 		_catalog_table_close(sp)
 		for k, rt in sp.remote_trees {
-			if rt.refs == 0 {
+			if rt.refs == 0 && !rt.holding {
 				delete_key(&sp.remote_trees, k)
 				_remote_tree_free(e, rt)
 			}
@@ -417,10 +445,35 @@ _card_path :: proc(e: ^Engine, sp: ^Space, allocator := context.temp_allocator) 
 
 @(private)
 _card_publish :: proc(e: ^Engine, sp: ^Space) -> Error {
-	if sp.card_ok || !sp.repl_on || sp.keyless {
+	if sp.card_ok || !sp.repl_on {
 		return .None
 	}
-	path := _card_path(e, sp) or_return
+	if !sp.keyless {
+		path := _card_path(e, sp) or_return
+		_card_publish_in(e, sp, &sp.scope, path) or_return
+	}
+	for id in sp.grants {
+		_card_publish_object(e, sp, id) or_return
+	}
+	sp.card_ok = true
+	return .None
+}
+
+@(private)
+_card_publish_object :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> Error {
+	if !sp.repl_on {
+		return .None
+	}
+	sc := _object_scope(sp, id)
+	defer osync.scope_clear(&sc)
+	base := _card_path(e, sp) or_return
+	oh := prim.id_hex(id)
+	path := _join(context.temp_allocator, prim.dir_name(base), string(oh[:])) or_return
+	return _card_publish_in(e, sp, &sc, path)
+}
+
+@(private)
+_card_publish_in :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, path: string) -> Error {
 	dir := prim.dir_name(path)
 	_perr(prim.mkdir_all(e.vfs, dir, 0o700)) or_return
 	j: journal.Journal
@@ -445,9 +498,51 @@ _card_publish :: proc(e: ^Engine, sp: ^Space) -> Error {
 	}
 	n := journal.journal_durable_len(&j)
 	journal.journal_close(&j)
-	_serr(osync.replicator_publish(&sp.repl, &sp.scope, CARD_STREAM, 0, path, n)) or_return
-	sp.card_ok = true
-	return .None
+	return _serr(osync.replicator_publish(&sp.repl, scope, CARD_STREAM, 0, path, n))
+}
+
+@(private)
+_card_hold :: proc(sp: ^Space, scope: ^osync.Scope, device: prim.Id) {
+	stream := osync.stream_id(scope, device, CARD_STREAM, 0)
+	if stream in sp.card_holds {
+		return
+	}
+	if _, err := osync.replicator_acquire(&sp.repl, scope, device, CARD_STREAM, 0); err == .None {
+		sp.card_holds[stream] = Card_Hold{scope = scope^, device = device}
+	}
+}
+
+@(private)
+_card_unhold :: proc(sp: ^Space, device: prim.Id) {
+	for k, &hd in sp.card_holds {
+		if hd.device != device {
+			continue
+		}
+		if sp.repl_on {
+			osync.replicator_release(&sp.repl, &hd.scope, hd.device, CARD_STREAM, 0)
+		}
+		osync.scope_clear(&hd.scope)
+		delete_key(&sp.card_holds, k)
+	}
+}
+
+@(private)
+_card_want :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string) {
+	if !sp.keyless {
+		_card_hold(sp, &sp.scope, device)
+		osync.replicator_want_tail(&sp.repl, &sp.scope, device, CARD_STREAM, 0, 4096)
+	}
+	id, _, ok := _object_of_name(name)
+	if !ok || id == sp.catalog {
+		return
+	}
+	sc := _object_scope(sp, id)
+	stream := osync.stream_id(&sc, device, CARD_STREAM, 0)
+	if _, have := sp.card_scopes[stream]; !have {
+		sp.card_scopes[stream] = sc
+	}
+	_card_hold(sp, &sc, device)
+	osync.replicator_want_tail(&sp.repl, &sc, device, CARD_STREAM, 0, 4096)
 }
 
 @(private)
@@ -477,23 +572,30 @@ _cards_load :: proc(e: ^Engine, sp: ^Space) {
 }
 
 @(private)
-_card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id) {
+_card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id, stream: osync.Stream_Id) {
 	if device in sp.identities {
 		return
 	}
-	rep, aerr := osync.replicator_acquire(&sp.repl, &sp.scope, device, CARD_STREAM, 0)
+	scope := sp.scope
+	if x, ok := sp.card_scopes[stream]; ok {
+		scope = x
+	} else if sp.keyless {
+		return
+	}
+	defer osync.scope_clear(&scope)
+	rep, aerr := osync.replicator_acquire(&sp.repl, &scope, device, CARD_STREAM, 0)
 	if aerr != .None {
 		return
 	}
-	defer osync.replicator_release(&sp.repl, &sp.scope, device, CARD_STREAM, 0)
+	defer osync.replicator_release(&sp.repl, &scope, device, CARD_STREAM, 0)
 	if journal.replica_length(rep) == 0 {
 		return
 	}
 	rd: journal.Reader
 	journal.replica_reader(rep, &rd, context.temp_allocator)
 	defer journal.reader_close(&rd)
-	sid := osync.stream_id(&sp.scope, device, CARD_STREAM, 0)
-	key := osync.stream_key(&sp.scope, sid)
+	sid := osync.stream_id(&scope, device, CARD_STREAM, 0)
+	key := osync.stream_key(&scope, sid)
 	defer crypto.zero_explicit(&key, size_of(key))
 	if sp.mode == .End_To_End {
 		journal.reader_set_keys(&rd, osync.static_provider(&key))
@@ -507,6 +609,7 @@ _card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id) {
 		return
 	}
 	sp.identities[device] = id
+	_card_unhold(sp, device)
 	k := _card_key(sp, device)
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr == .None {

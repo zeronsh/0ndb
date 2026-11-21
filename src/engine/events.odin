@@ -20,6 +20,7 @@ Delta_Kind :: enum u8 {
 	Status,
 	Field,
 	Element,
+	Counter,
 	Catalog,
 	Text,
 	Files,
@@ -106,6 +107,10 @@ unsubscribe :: proc(e: ^Engine, id: Sub_Id) {
 		ordered_remove(&e.subs, i)
 		if !_subscribed(e, s.object.id) && !s.catalog {
 			if h, err := _handle_get(e, s.object, s.kind); err == .None && h.sp.repl_on && h.kind == .Conversation {
+				if h.grouped {
+					osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
+					h.grouped = false
+				}
 				for sg in h.segs {
 					osync.replicator_unfollow(&h.sp.repl, &h.scope, sg.device, h.name, 0)
 					sg.follow = false
@@ -154,6 +159,7 @@ _sub_cursor :: proc(s: ^Sub, device: prim.Id) -> ^Sub_Cursor {
 @(private)
 _sub_prime :: proc(e: ^Engine, s: ^Sub, h: ^Handle) {
 	_handle_refresh(h)
+	_group_follow(h, h.kind != .Conversation)
 	if h.w_open {
 		append(&s.cursors, Sub_Cursor{e.self, _own_reader_end(h)})
 	}
@@ -232,6 +238,7 @@ _sub_collect :: proc(e: ^Engine, s: ^Sub, kinds: Change_Kinds, out: ^[dynamic]De
 		return
 	}
 	_handle_refresh(h)
+	_group_follow(h, h.kind != .Conversation)
 	if .Members in kinds {
 		for sg in h.segs {
 			if _sub_cursor(s, sg.device) == nil {
@@ -482,6 +489,9 @@ _delta_map :: proc(e: ^Engine, s: ^Sub, h: ^Handle, device: prim.Id, at: i64, bo
 	case omap.Del:
 		k := Delta_Kind.Catalog if s.catalog else .Element
 		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, text = _tmp_bytes(v.element), removed = true, record = env.kind})
+	case omap.Count:
+		k := Delta_Kind.Catalog if s.catalog else .Counter
+		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, length = v.delta, record = env.kind})
 	}
 }
 

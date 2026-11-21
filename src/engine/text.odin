@@ -12,7 +12,7 @@ import osync "../sync"
 TEXT_NAME :: "text"
 
 text_create :: proc(e: ^Engine, space: prim.Id, title := "", initial := "") -> (o: Object, err: Error) {
-	o = Object{space, prim.id_new()}
+	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Text) or_return
 	_handle_create_writer(h) or_return
 	_hist_tree_op(e, h, fstree.Op_Create{parent = fstree.ROOT, name = TEXT_NAME, kind = .File}, initial) or_return
@@ -22,7 +22,7 @@ text_create :: proc(e: ^Engine, space: prim.Id, title := "", initial := "") -> (
 }
 
 tree_create :: proc(e: ^Engine, space: prim.Id, title := "") -> (o: Object, err: Error) {
-	o = Object{space, prim.id_new()}
+	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_handle_mark(h)
@@ -32,7 +32,9 @@ tree_create :: proc(e: ^Engine, space: prim.Id, title := "") -> (o: Object, err:
 
 text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
 	h := _handle_get(e, o, .Text) or_return
-	_hist_ready(e, h) or_return
+	if rerr := _hist_ready(e, h); rerr != .None {
+		return nil, _pending_result(e, h, rerr, ready)
+	}
 	_hist_catch_up(e, h)
 	inode, found := _text_inode(h) or_return
 	if !found {
@@ -44,7 +46,9 @@ text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: 
 
 text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (spans: []crdt.Author_Span, err: Error) {
 	h := _handle_get(e, o, .Text) or_return
-	_hist_ready(e, h) or_return
+	if rerr := _hist_ready(e, h); rerr != .None {
+		return nil, _pending_result(e, h, rerr, ready)
+	}
 	_hist_catch_up(e, h)
 	inode, found := _text_inode(h) or_return
 	if !found {
@@ -56,7 +60,9 @@ text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 
 tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
 	h := _handle_get(e, o, .File_Tree) or_return
-	_hist_ready(e, h) or_return
+	if rerr := _hist_ready(e, h); rerr != .None {
+		return nil, _pending_result(e, h, rerr, ready)
+	}
 	_hist_catch_up(e, h)
 	snap := fstree.current(&h.hist.tree)
 	id, ok, lerr := fstree.lookup(&snap, path)
@@ -72,7 +78,9 @@ tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 
 tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}) -> (names: []string, err: Error) {
 	h := _handle_get(e, o, .File_Tree) or_return
-	_hist_ready(e, h) or_return
+	if rerr := _hist_ready(e, h); rerr != .None {
+		return nil, _pending_result(e, h, rerr, ready)
+	}
 	_hist_catch_up(e, h)
 	snap := fstree.current(&h.hist.tree)
 	dir := fstree.ROOT
@@ -202,17 +210,43 @@ _hist_open :: proc(h: ^Handle) -> Error {
 		return .None
 	}
 	e := h.e
+	if _ckpt_waiting(h) || _ckpt_fetch_start(e, h) {
+		return .Missing
+	}
 	dir := _obj_dir(e, h.id) or_return
 	hdir := _join(context.temp_allocator, dir, "hist") or_return
 	db := device_odb(e) or_return
 	hist := new(fs.History, e.allocator)
 	src := fs.Stream_Source{data = h, read = _hist_read}
-	if err := fs.history_open(hist, e.vfs, hdir, h.id, e.self, db, src, e.allocator); err != .None {
+	if h.own_tree == nil {
+		if t, terr := _own_tree_get(e, h.sp, h.id, h.kind, &h.scope, false); terr == .None {
+			h.own_tree = t
+		}
+	}
+	if err := fs.history_open(hist, e.vfs, hdir, h.id, e.self, db, src, e.allocator, _hist_options(h)); err != .None {
 		free(hist, e.allocator)
 		return _ferr(err)
 	}
 	h.hist = hist
+	h.hist_chain = h.own_tree != nil
 	return .None
+}
+
+@(private)
+_hist_options :: proc(h: ^Handle) -> fs.History_Options {
+	e := h.e
+	o := fs.History_Options{clock = _fs_clock(e)}
+	if h.sp.repl_on {
+		o.keep_at_least, _ = osync.replicator_floor(&h.sp.repl, &h.scope, h.name, 0)
+	}
+	if h.own_tree != nil {
+		o.chain = journal.Chain {
+			seed   = osync.chain_seed(osync.stream_id(&h.scope, e.self, h.name, 0)),
+			keys   = osync.keytree_provider(&h.own_tree.tree),
+			signer = osync.keyring_signer(&e.keyring),
+		}
+	}
+	return o
 }
 
 @(private)
@@ -336,31 +370,40 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 	for s in h.segs {
 		_follow(e, h, s, true)
 	}
+	positions := make(map[prim.Id]i64, 8, context.temp_allocator)
+	for s in h.segs {
+		if !s.in_view {
+			continue
+		}
+		applied: i64
+		for id, i in hist.stream_ids {
+			if id == s.device && i < len(hist.applied) {
+				applied = hist.applied[i]
+			}
+		}
+		pos: i64
+		if applied > 0 {
+			_, next, rerr := journal.record_at(&s.jr, applied - 1)
+			if rerr != .None && rerr != .Redacted {
+				continue
+			}
+			pos = next
+		}
+		positions[s.device] = pos
+	}
 	for {
 		progress := false
 		for s in h.segs {
-			if !s.in_view {
+			pos, ok := positions[s.device]
+			if !ok {
 				continue
-			}
-			applied: i64
-			for id, i in hist.stream_ids {
-				if id == s.device && i < len(hist.applied) {
-					applied = hist.applied[i]
-				}
-			}
-			pos: i64
-			if applied > 0 {
-				_, next, rerr := journal.record_at(&s.jr, applied - 1)
-				if rerr != .None && rerr != .Redacted {
-					continue
-				}
-				pos = next
 			}
 			end := journal.reader_end(&s.jr)
 			for pos < end {
 				body, next, rerr := journal.record_at(&s.jr, pos)
 				if rerr == .Redacted {
 					pos = next
+					progress = true
 					continue
 				}
 				if rerr == .Missing {
@@ -373,6 +416,11 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 				if rerr != .None {
 					break
 				}
+				if journal.is_sig(body) {
+					pos = next
+					progress = true
+					continue
+				}
 				_, aerr := fs.history_admit(hist, s.device, pos, body)
 				if aerr == .Not_Found {
 					break
@@ -384,6 +432,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 				progress = true
 				pos = next
 			}
+			positions[s.device] = pos
 		}
 		if !progress {
 			break

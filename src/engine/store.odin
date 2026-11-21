@@ -337,7 +337,7 @@ _durable_begin :: proc(e: ^Engine) {
 	if !e.pk_open {
 		return
 	}
-	if err := _registry_flush(e); err != .None {
+	if err := _registry_flush(e); err != .None && err != .Busy {
 		_fatal(e, err)
 	}
 	_trees_persist(e)
@@ -357,6 +357,22 @@ _durable_begin :: proc(e: ^Engine) {
 	append(&e.batches, b)
 	e.stats.commits += 1
 	if err := pack.sync_async(&e.pk, _batch_cb, b); err != .None {
+		if err == .Would_Block {
+			for i := len(e.batches) - 1; i >= 0; i -= 1 {
+				if e.batches[i] == b {
+					ordered_remove(&e.batches, i)
+					break
+				}
+			}
+			for d in e.dirty {
+				append(&b.segs, d)
+			}
+			delete(e.dirty)
+			e.dirty = b.segs
+			e.reg.meta ||= b.meta
+			free(b, e.allocator)
+			return
+		}
 		_batch_complete(e, b, _perr(err))
 		return
 	}

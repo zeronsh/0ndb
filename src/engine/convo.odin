@@ -22,7 +22,7 @@ Convo_Status :: struct {
 }
 
 convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}) -> (o: Object, err: Error) {
-	o = Object{space, prim.id_new()}
+	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_create_writer(h, settings) or_return
 	_catalog_created(e, h, settings.title, settings.parent, settings.workspace, settings.agent)

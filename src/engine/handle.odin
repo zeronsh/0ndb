@@ -78,6 +78,7 @@ Handle :: struct {
 	cw:         convo.Writer,
 	mw:         omap.Writer,
 	hist:       ^fs.History,
+	hist_chain: bool,
 	own_tree:   ^Own_Tree,
 	chain:      journal.Chain,
 	published:  i64,
@@ -86,6 +87,17 @@ Handle :: struct {
 	table:      omap.Table,
 	table_open: bool,
 	local:      bool,
+	grouped:    bool,
+}
+
+@(private)
+_group_follow :: proc(h: ^Handle, full: bool) {
+	if h.grouped || !h.sp.repl_on || h.id == h.sp.catalog {
+		return
+	}
+	if osync.replicator_follow_segments(&h.sp.repl, &h.scope, h.name, 0, full) == .None {
+		h.grouped = true
+	}
 }
 
 @(private)
@@ -135,7 +147,10 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 		_settle_arm(e)
 	}
 	defer if err != .None {
+		was := e.closing
+		e.closing = true
 		_handle_close(e, h)
+		e.closing = was
 		h = nil
 	}
 	if found {
@@ -152,6 +167,7 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 		_catalog_members(e, h)
 	}
 	if kind != .Conversation {
+		_group_follow(h, true)
 		for s in h.segs {
 			_follow(e, h, s, true)
 		}
@@ -230,13 +246,13 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 	case .Conversation:
 		path := _seg_path(e, h.id) or_return
 		opts := _journal_opts(h)
-		_, err := convo.writer_open(&h.cw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator)
+		_, err := convo.writer_open(&h.cw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator, _obj_clock(e))
 		_oerr(err) or_return
 		h.published = obj.writer_durable(&h.cw.core)
 	case .Map:
 		path := _seg_path(e, h.id) or_return
 		opts := _journal_opts(h)
-		_, err := omap.writer_open(&h.mw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator)
+		_, err := omap.writer_open(&h.mw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator, _obj_clock(e))
 		_oerr(err) or_return
 		h.published = obj.writer_durable(&h.mw.core)
 	case .Text, .File_Tree:
@@ -274,12 +290,21 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	case .Conversation:
 		path := _seg_path(e, h.id) or_return
 		opts := _journal_opts(h)
-		_oerr(convo.writer_create(&h.cw, &h.view, e.vfs, path, h.id, e.self, created, convo_settings, opts, e.allocator)) or_return
+		_oerr(convo.writer_create(&h.cw, &h.view, e.vfs, path, h.id, e.self, created, convo_settings, opts, e.allocator, _obj_clock(e))) or_return
 	case .Map:
 		path := _seg_path(e, h.id) or_return
 		opts := _journal_opts(h)
-		_oerr(omap.writer_create(&h.mw, &h.view, e.vfs, path, h.id, e.self, created, settings, opts, e.allocator)) or_return
+		_oerr(omap.writer_create(&h.mw, &h.view, e.vfs, path, h.id, e.self, created, settings, opts, e.allocator, _obj_clock(e))) or_return
 	case .Text, .File_Tree:
+		if _ckpt_waiting(h) {
+			return .Missing
+		}
+		if h.hist != nil && !h.hist_chain {
+			fs.history_close(h.hist)
+			free(h.hist, e.allocator)
+			h.hist = nil
+		}
+		h.own = true
 		_hist_open(h) or_return
 	}
 	h.w_open = true
@@ -344,12 +369,11 @@ _seg_enter :: proc(h: ^Handle, seg: ^Seg) {
 		return
 	}
 	e := h.e
-	signed := h.kind == .Conversation || h.kind == .Map
-	if signed && e.cfg.verify_chains {
+	if e.cfg.verify_chains {
 		id, known := h.sp.identities[seg.device]
 		if !known {
 			if h.sp.repl_on {
-				_need_add(e, h.sp, .Card, seg.device, CARD_STREAM)
+				_need_add(e, h.sp, .Card, seg.device, h.name)
 			}
 			return
 		}
@@ -441,9 +465,9 @@ _handle_waiting :: proc(h: ^Handle) -> bool {
 }
 
 @(private)
-_handle_commit :: proc(e: ^Engine, h: ^Handle) {
+_handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 	if !h.w_open {
-		return
+		return .None
 	}
 	err: Error
 	switch h.kind {
@@ -456,9 +480,13 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) {
 			err = _jerr(journal.journal_commit(&h.hist.journal))
 		}
 	}
+	if err == .Busy {
+		h.local = true
+		return .Busy
+	}
 	if err != .None {
 		_fatal(e, err)
-		return
+		return err
 	}
 	n := _own_len(h)
 	if n > h.published {
@@ -470,21 +498,26 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) {
 			h.published = n
 		}
 	}
+	return .None
 }
 
 @(private)
 _handles_commit :: proc(e: ^Engine) {
 	for h in e.lru {
 		if h.local {
-			_handle_commit(e, h)
 			h.local = false
+			if _handle_commit(e, h) == .Busy {
+				h.local = true
+			}
 		}
 	}
 }
 
 @(private)
-_handle_close :: proc(e: ^Engine, h: ^Handle) {
-	_handle_commit(e, h)
+_handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
+	if err := _handle_commit(e, h); err == .Busy && !e.closing {
+		return err
+	}
 	if h.w_open {
 		switch h.kind {
 		case .Conversation:
@@ -509,6 +542,9 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) {
 		h.view_init = false
 	}
 	keep_follow := h.id == h.sp.catalog || _subscribed(e, h.id)
+	if !keep_follow && h.grouped && h.sp.repl_on {
+		osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
+	}
 	for s in h.segs {
 		journal.reader_close(&s.jr)
 		if h.sp.repl_on {
@@ -540,6 +576,7 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) {
 	delete(h.name, e.allocator)
 	free(h, e.allocator)
 	e.stats.evicted += 1
+	return .None
 }
 
 @(private)
@@ -551,7 +588,9 @@ _handles_sweep :: proc(e: ^Engine, keep: int) {
 			i += 1
 			continue
 		}
-		_handle_close(e, h)
+		if _handle_close(e, h) != .None {
+			i += 1
+		}
 	}
 }
 
@@ -564,7 +603,9 @@ _handles_sweep_space :: proc(e: ^Engine, sp: ^Space) {
 			i += 1
 			continue
 		}
-		_handle_close(e, h)
+		if _handle_close(e, h) != .None {
+			i += 1
+		}
 	}
 }
 
@@ -596,6 +637,9 @@ _handle_want :: proc(h: ^Handle) -> (fetched: bool) {
 		if s.waiting || (!s.in_view && s.tree != nil && !s.tree.absent) {
 			fetched = true
 		}
+	}
+	if _ckpt_waiting(h) {
+		fetched = true
 	}
 	return
 }

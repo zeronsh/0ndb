@@ -30,6 +30,8 @@ Remote_Tree :: struct {
 	requested: bool,
 	absent:    bool,
 	refs:      int,
+	holding:   bool,
+	held:      u64,
 }
 
 @(private)
@@ -47,36 +49,42 @@ _own_tree_get :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind, scope
 	}
 	path := _keys_path(e, object) or_return
 	data, rerr := prim.read_file(e.vfs, path, context.temp_allocator)
-	t = new(Own_Tree, e.allocator)
-	t.space = sp.id
-	t.object = object
-	t.kind = kind
-	t.stream = stream
-	t.path = _clone(path, e.allocator) or_return
-	defer if err != .None {
-		delete(t.path, e.allocator)
-		free(t, e.allocator)
-		t = nil
-	}
-	#partial switch rerr {
-	case .None:
-		defer crypto.zero_explicit(raw_data(data), len(data))
-		if derr := osync.keytree_decode(&t.tree, data, e.allocator); derr != .None {
-			return nil, .Corrupt
-		}
-		t.stored = i64(len(data))
-	case .Not_Found:
-		if !create {
-			return nil, .Not_Found
-		}
-		if kerr := osync.keytree_new(&t.tree, e.allocator); kerr != .None {
-			return nil, _serr(kerr)
-		}
-		t.dirty = true
-		_touch(e)
-	case:
+	if rerr != .None && rerr != .Not_Found {
 		return nil, _perr(rerr)
 	}
+	if rerr == .Not_Found && !create {
+		return nil, .Not_Found
+	}
+	x := new(Own_Tree, e.allocator)
+	x.space = sp.id
+	x.object = object
+	x.kind = kind
+	x.stream = stream
+	pc, cerr := _clone(path, e.allocator)
+	if cerr != .None {
+		free(x, e.allocator)
+		return nil, cerr
+	}
+	x.path = pc
+	if rerr == .None {
+		derr := osync.keytree_decode(&x.tree, data, e.allocator)
+		crypto.zero_explicit(raw_data(data), len(data))
+		if derr != .None {
+			delete(x.path, e.allocator)
+			free(x, e.allocator)
+			return nil, .Corrupt
+		}
+		x.stored = i64(len(data))
+	} else {
+		if kerr := osync.keytree_new(&x.tree, e.allocator); kerr != .None {
+			delete(x.path, e.allocator)
+			free(x, e.allocator)
+			return nil, _serr(kerr)
+		}
+		x.dirty = true
+		_touch(e)
+	}
+	t = x
 	t.refs = 1
 	e.own_trees[stream] = t
 	return t, .None
@@ -125,7 +133,9 @@ _trees_persist :: proc(e: ^Engine) {
 			continue
 		}
 		if err := _own_tree_store(e, t); err != .None {
-			_fatal(e, err)
+			if err != .Busy {
+				_fatal(e, err)
+			}
 			continue
 		}
 		t.dirty = false
@@ -233,9 +243,11 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if end == 0 {
 		if rt.requested && osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) == 0 {
 			rt.absent = true
+			_remote_tree_unhold(sp, rt)
 		}
 		if !rt.requested {
 			rt.requested = true
+			_remote_tree_hold(sp, rt)
 			osync.replicator_want_tail(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch, 4096)
 			e.stats.fetches += 1
 		}
@@ -254,6 +266,7 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if rerr == .Missing {
 		if !rt.requested {
 			rt.requested = true
+			_remote_tree_hold(sp, rt)
 			osync.replicator_want_tail(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch, 4096)
 		}
 		return
@@ -266,7 +279,28 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	}
 	rt.loaded = true
 	rt.absent = false
+	_remote_tree_unhold(sp, rt)
 	_held_release(e, sp, rt.device)
+}
+
+@(private)
+_remote_tree_hold :: proc(sp: ^Space, rt: ^Remote_Tree) {
+	if rt.holding && rt.held == rt.epoch {
+		return
+	}
+	_remote_tree_unhold(sp, rt)
+	if _, err := osync.replicator_acquire(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch); err == .None {
+		rt.holding = true
+		rt.held = rt.epoch
+	}
+}
+
+@(private)
+_remote_tree_unhold :: proc(sp: ^Space, rt: ^Remote_Tree) {
+	if rt.holding && sp.repl_on {
+		osync.replicator_release(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.held)
+	}
+	rt.holding = false
 }
 
 @(private)

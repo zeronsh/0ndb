@@ -61,9 +61,11 @@ Log :: struct {
 	write: proc(data: rawptr, level: Log_Level, msg: string),
 }
 
-Clock :: struct {
-	data:    rawptr,
-	wall_ms: proc(data: rawptr) -> i64,
+Clock :: prim.Clock
+
+Id_Source :: struct {
+	data: rawptr,
+	next: proc(data: rawptr) -> prim.Id,
 }
 
 Spawner :: struct {
@@ -141,6 +143,7 @@ Config :: struct {
 	credentials:     Credentials_Source,
 	transport:       Transport,
 	clock:           Clock,
+	ids:             Id_Source,
 	log:             Log,
 	spawner:         Spawner,
 	embedder:        search.Embedder,
@@ -230,6 +233,7 @@ Engine :: struct {
 	lru:          [dynamic]^Handle,
 	own_trees:    map[osync.Stream_Id]^Own_Tree,
 	waiters:      [dynamic]^Waiter,
+	held:         [dynamic]^Pending_Cmd,
 	subs:         [dynamic]^Sub,
 	next_sub:     u64,
 	tick:         u64,
@@ -279,6 +283,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.lru = make([dynamic]^Handle, allocator)
 	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, allocator)
 	e.waiters = make([dynamic]^Waiter, allocator)
+	e.held = make([dynamic]^Pending_Cmd, allocator)
 	e.subs = make([dynamic]^Sub, allocator)
 	e.posted = make([dynamic]Posted, allocator)
 	e.post_swap = make([dynamic]Posted, allocator)
@@ -304,6 +309,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 		_perr(prim.loop_init(&e.own_loop, allocator)) or_return
 		e.loop = &e.own_loop
 		e.owns_loop = true
+		prim.loop_set_clock(e.loop, cfg.clock)
 	}
 	e.prev_wake = e.loop.wake_cb
 	e.prev_wake_data = e.loop.wake_data
@@ -381,17 +387,14 @@ fd :: proc "contextless" (e: ^Engine) -> prim.Fd {
 }
 
 timeout_ms :: proc(e: ^Engine) -> i64 {
-	if len(e.loop.pending) > 0 {
-		return 0
+	return prim.loop_timeout_ms(e.loop)
+}
+
+new_id :: proc(e: ^Engine) -> prim.Id {
+	if e.cfg.ids.next != nil {
+		return e.cfg.ids.next(e.cfg.ids.data)
 	}
-	if len(e.loop.heap) == 0 {
-		return -1
-	}
-	d := e.loop.timers[e.loop.heap[0]].deadline - prim.mono_ns()
-	if d <= 0 {
-		return 0
-	}
-	return (d + 999_999) / 1_000_000
+	return prim.id_new()
 }
 
 step :: proc(e: ^Engine, block := false) -> Error {
@@ -446,13 +449,21 @@ flush :: proc(e: ^Engine) -> Error {
 	if !e.pk_open {
 		return .Closed
 	}
-	_tick_end(e)
-	_durable_begin(e)
-	err := _perr(pack.batch_end(&e.pk))
-	pack.batch_begin(&e.pk)
-	_batches_done(e, err)
-	if err != .None {
-		return err
+	err: Error
+	for round in 0 ..< 4 {
+		_tick_end(e)
+		_durable_begin(e)
+		err = _perr(pack.batch_end(&e.pk))
+		pack.batch_begin(&e.pk)
+		_batches_done(e, err)
+		if err != .None {
+			return err
+		}
+		_held_retry(e)
+		if !_tick_pending(e) && len(e.held) == 0 {
+			break
+		}
+		_ = round
 	}
 	return e.fatal
 }
@@ -466,7 +477,7 @@ current_tick :: proc "contextless" (e: ^Engine) -> u64 {
 }
 
 hlc_now :: proc(e: ^Engine) -> prim.Hlc {
-	return prim.hlc_tick(&e.hlc, _wall_ms(e))
+	return prim.hlc_now_with(&e.hlc, e.cfg.clock)
 }
 
 @(private)
@@ -488,10 +499,22 @@ _stop_call :: proc(e: ^Engine, data: rawptr) {
 
 @(private)
 _wall_ms :: proc(e: ^Engine) -> i64 {
-	if e.cfg.clock.wall_ms != nil {
-		return e.cfg.clock.wall_ms(e.cfg.clock.data)
-	}
-	return prim.now_ms()
+	return prim.clock_wall_ms(e.cfg.clock)
+}
+
+@(private)
+_wall_ms_data :: proc(data: rawptr) -> i64 {
+	return _wall_ms((^Engine)(data))
+}
+
+@(private)
+_obj_clock :: proc(e: ^Engine) -> obj.Clock {
+	return obj.Clock{data = e, wall_ms = _wall_ms_data}
+}
+
+@(private)
+_fs_clock :: proc(e: ^Engine) -> fs.Clock {
+	return fs.Clock{data = e, wall_ms = _wall_ms_data}
 }
 
 @(private)
@@ -520,11 +543,18 @@ _on_wake :: proc(l: ^prim.Loop, data: rawptr) {
 
 @(private)
 _pack_poll :: proc(e: ^Engine) {
-	if !e.pk_open || len(e.batches) == 0 {
+	if !e.pk_open {
 		return
 	}
+	was := pack.pressure(&e.pk)
 	if err := pack.poll(&e.pk); err != .None {
 		_fatal(e, _perr(err))
+	}
+	if was && !pack.pressure(&e.pk) {
+		_held_retry(e)
+		if _tick_pending(e) {
+			_touch(e)
+		}
 	}
 }
 
@@ -572,7 +602,7 @@ _tick_end :: proc(e: ^Engine) {
 	_handles_sweep(e, e.cfg.handle_cache)
 	_durable_begin(e)
 	_settle_arm(e)
-	if !_tick_pending(e) && e.tick_timer != 0 {
+	if (!_tick_pending(e) || pack.pressure(&e.pk)) && e.tick_timer != 0 {
 		prim.timer_cancel(e.loop, e.tick_timer)
 		e.tick_timer = 0
 	}
@@ -616,6 +646,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 		return
 	}
 	_index_settle(e)
+	_checkpoints_write(e)
 	_handles_sweep(e, 0)
 	_spaces_settle(e)
 	_trees_release(e)
@@ -709,6 +740,10 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.handles)
 	delete(e.lru)
 	delete(e.own_trees)
+	for p in e.held {
+		_cmd_fail(e, p, .Closed)
+	}
+	delete(e.held)
 	delete(e.waiters)
 	delete(e.subs)
 	delete(e.posted)

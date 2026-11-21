@@ -3,6 +3,7 @@ package engine
 import "base:runtime"
 import "core:mem/virtual"
 import "../convo"
+import "../pack"
 import omap "../map"
 import "../obj"
 import "../prim"
@@ -209,7 +210,8 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 	st: Cmd_State
 	h: ^Handle
 	res, h, err = _cmd_run(e, cmd, &st)
-	if err != .Missing || h == nil {
+	busy := err == .Busy && pack.pressure(&e.pk)
+	if !busy && (err != .Missing || h == nil) {
 		res.tick = current_tick(e)
 		return res, err
 	}
@@ -221,6 +223,10 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 	p.cmd = _cmd_clone(cmd, virtual.arena_allocator(&p.arena))
 	p.state = st
 	p.done = done
+	if busy {
+		append(&e.held, p)
+		return res, .Pending
+	}
 	werr := _wait(e, h, {}, p)
 	if werr != .Pending {
 		_cmd_free(e, p)
@@ -327,6 +333,10 @@ catalog_set :: proc(e: ^Engine, c: Cmd_Catalog_Set, done: Done = {}) -> Error {
 @(private)
 _cmd_retry :: proc(e: ^Engine, p: ^Pending_Cmd, tries: int) {
 	res, h, err := _cmd_run(e, p.cmd, &p.state)
+	if err == .Busy && pack.pressure(&e.pk) {
+		append(&e.held, p)
+		return
+	}
 	if err == .Missing && h != nil {
 		werr := _wait(e, h, {}, p, tries)
 		if werr == .Pending {
@@ -623,4 +633,21 @@ _cmd_clone :: proc(cmd: Command, a: runtime.Allocator) -> Command {
 		return cmd
 	}
 	return cmd
+}
+
+pressured :: proc(e: ^Engine) -> bool {
+	return e.pk_open && pack.pressure(&e.pk)
+}
+
+@(private)
+_held_retry :: proc(e: ^Engine) {
+	if len(e.held) == 0 || pack.pressure(&e.pk) {
+		return
+	}
+	list := e.held
+	e.held = make([dynamic]^Pending_Cmd, e.allocator)
+	for p in list {
+		_cmd_retry(e, p, 0)
+	}
+	delete(list)
 }

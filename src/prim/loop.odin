@@ -36,6 +36,7 @@ Loop :: struct {
 	pending:    [dynamic]u64,
 	wake_cb:    Wake_Proc,
 	wake_data:  rawptr,
+	clock:      Clock,
 	stopped:    bool,
 	allocator:  runtime.Allocator,
 }
@@ -108,6 +109,28 @@ loop_on_wake :: proc(l: ^Loop, cb: Wake_Proc, data: rawptr) {
 	l.wake_data = data
 }
 
+loop_set_clock :: proc(l: ^Loop, c: Clock) {
+	l.clock = c
+}
+
+loop_now_ns :: proc(l: ^Loop) -> i64 {
+	return clock_mono_ns(l.clock)
+}
+
+loop_timeout_ms :: proc(l: ^Loop) -> i64 {
+	if len(l.pending) > 0 {
+		return 0
+	}
+	if len(l.heap) == 0 {
+		return -1
+	}
+	d := l.timers[l.heap[0]].deadline - loop_now_ns(l)
+	if d <= 0 {
+		return 0
+	}
+	return (d + 999_999) / 1_000_000
+}
+
 loop_stop :: proc "contextless" (l: ^Loop) {
 	intrinsics.atomic_store_explicit(&l.stopped, true, .Release)
 	wake(l)
@@ -133,7 +156,7 @@ loop_step :: proc(l: ^Loop, block := true) -> Error {
 	if !block || len(l.pending) > 0 {
 		timeout = 0
 	} else if len(l.heap) > 0 {
-		timeout = max(l.timers[l.heap[0]].deadline - mono_ns(), 0)
+		timeout = max(l.timers[l.heap[0]].deadline - loop_now_ns(l), 0)
 	}
 	err := _os_poll(l, timeout)
 	if err == .Interrupted {
@@ -221,7 +244,7 @@ child_unwatch :: proc(l: ^Loop, cw: Child_Watch) {
 }
 
 timer :: proc(l: ^Loop, ms: i64, data: rawptr, cb: Timer_Proc) -> Timer {
-	return timer_at(l, mono_ns() + max(ms, 0) * 1_000_000, data, cb)
+	return timer_at(l, loop_now_ns(l) + max(ms, 0) * 1_000_000, data, cb)
 }
 
 timer_at :: proc(l: ^Loop, deadline_ns: i64, data: rawptr, cb: Timer_Proc) -> Timer {
@@ -413,7 +436,7 @@ _run_timers :: proc(l: ^Loop) {
 	if len(l.heap) == 0 {
 		return
 	}
-	now := mono_ns()
+	now := loop_now_ns(l)
 	for len(l.heap) > 0 && !loop_stopped(l) {
 		idx := l.heap[0]
 		t := &l.timers[idx]

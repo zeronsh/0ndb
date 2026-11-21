@@ -33,7 +33,7 @@ Catalog_Update :: struct {
 }
 
 map_create :: proc(e: ^Engine, space: prim.Id, title := "", settings: []u8 = nil) -> (o: Object, err: Error) {
-	o = Object{space, prim.id_new()}
+	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Map) or_return
 	_handle_create_writer(h, {}, settings) or_return
 	_catalog_created(e, h, title, {}, {}, {})
@@ -355,7 +355,13 @@ _catalog_flush :: proc(e: ^Engine) {
 	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
 	defer delete(q)
 	for id, u in q {
-		if err := _catalog_write(e, id, u); err != .None {
+		err := _catalog_write(e, id, u)
+		if err == .Busy {
+			if _, dup := e.catalog_q[id]; !dup {
+				e.catalog_q[id] = u
+				continue
+			}
+		} else if err != .None {
 			_log(e, .Warn, "catalog update failed")
 		}
 		delete(u.title, e.allocator)
@@ -411,25 +417,22 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	}
 	cur: omap.Catalog_Entry
 	found := false
-	if u.has_usage || u.participant {
+	if u.participant {
 		_map_sync(e, h)
 		cur, found, _ = omap.catalog_get(&h.table, id, context.temp_allocator)
-	}
-	if u.has_usage {
-		total := _usage_decode(cur.usage) if found else convo.Usage{}
-		total.input += u.usage.input
-		total.output += u.usage.output
-		total.cache_read += u.usage.cache_read
-		total.cache_write += u.usage.cache_write
-		b := make([dynamic]u8, context.temp_allocator)
-		w := prim.writer(&b)
-		convo.encode_usage(&w, total)
-		append(&fields, omap.Field{tag = u32(omap.Catalog_Tag.Usage), value = b[:]})
 	}
 	kb: [16]u8
 	key := omap.catalog_key(id, &kb)
 	if len(fields) > 0 {
 		_oerr2b(omap.put(&h.mw, key, fields[:])) or_return
+	}
+	if u.has_usage {
+		parts := [4]u64{u.usage.input, u.usage.output, u.usage.cache_read, u.usage.cache_write}
+		for v, i in parts {
+			if v > 0 {
+				_oerr2b(omap.count(&h.mw, key, USAGE_TAG + u32(i), i64(min(v, u64(max(i64)))))) or_return
+			}
+		}
 	}
 	if u.participant {
 		present := false
@@ -448,13 +451,29 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	return .None
 }
 
-@(private)
-_usage_decode :: proc(b: []u8) -> convo.Usage {
-	if len(b) == 0 {
-		return {}
+USAGE_TAG :: u32(64)
+
+catalog_usage_get :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (u: convo.Usage, err: Error) {
+	sp := _space_open(e, o.space) or_return
+	h := _catalog_handle(e, sp) or_return
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return u, merr
 	}
-	r := prim.reader(b)
-	return convo.decode_usage(&r)
+	kb: [16]u8
+	en, found, gerr := omap.table_get(&h.table, omap.catalog_key(o.id, &kb), context.temp_allocator)
+	if gerr != .None {
+		return u, _oerr(gerr)
+	}
+	if !found {
+		return u, .Not_Found
+	}
+	vals: [4]u64
+	for i in 0 ..< 4 {
+		v, _ := omap.counter_value(&en, USAGE_TAG + u32(i))
+		vals[i] = u64(max(v, 0))
+	}
+	return convo.Usage{input = vals[0], output = vals[1], cache_read = vals[2], cache_write = vals[3]}, .None
 }
 
 @(private)

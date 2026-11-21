@@ -15,6 +15,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		relay_public = sp.relay_public,
 		self         = e.self,
 		padding      = e.cfg.padding,
+		filtered     = true,
 		kernel_tls   = e.cfg.kernel_tls,
 		on_event     = _on_repl_event,
 		user         = sp,
@@ -54,6 +55,12 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 	_card_publish(e, sp)
 	if !sp.keyless {
 		_catalog_follow(e, sp)
+	} else {
+		for id in sp.grants {
+			if rec, found, _ := _rec_get(e, id); found {
+				_shared_follow(e, sp, id, rec.kind)
+			}
+		}
 	}
 	_pending_republish(e, sp)
 	return .None
@@ -205,7 +212,7 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	sp := (^Space)(user)
 	e := sp.e
 	#partial switch ev.kind {
-	case .Device_Seen, .Dropped, .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed, .Checkpoint, .Checkpoint_Missing, .Object_Shredded:
+	case .Device_Seen, .Dropped, .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed, .Object_Shredded:
 		return
 	}
 	name, _ := _clone(ev.name, e.allocator)
@@ -225,7 +232,7 @@ _repl_events_process :: proc(e: ^Engine) {
 			for n in needs {
 				switch n.kind {
 				case .Card:
-					osync.replicator_want_tail(&sp.repl, &sp.scope, n.device, CARD_STREAM, 0, 4096)
+					_card_want(e, sp, n.device, n.name)
 				case .Keys:
 					if id, _, ok := _object_of_name(n.name); ok {
 						sc := _object_scope(sp, id)
@@ -280,11 +287,10 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_own_tree_uploaded(e, ev.stream, ev.length)
 		if id, _, ok := _object_of_name(ev.name); ok {
 			_pending_clear(e, sp.id, id, ev.length)
-			_relay_redact_resend(e, sp, id)
 			_emit(e, Event{kind = .Uploaded, space = sp.id, object = id, length = ev.length})
 		}
 	case .Grew, .Present:
-		_remote_changed(e, sp, ev.device, ev.name, ev.epoch, ev.length)
+		_remote_changed(e, sp, ev.device, ev.name, ev.epoch, ev.length, ev.stream)
 	case .Segment_Seen:
 		if id, kind, ok := _object_of_name(ev.name); ok {
 			_member_seen(e, sp, id, kind, ev.device)
@@ -295,6 +301,10 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 				_keys_epoch_seen(e, sp, id, ev.device, seg, ev.epoch)
 			}
 		}
+	case .Checkpoint:
+		_ckpt_arrived(e, sp, ev.name, true)
+	case .Checkpoint_Missing:
+		_ckpt_arrived(e, sp, ev.name, false)
 	case .Quarantined:
 		obj_id, _, _ := _object_of_name(ev.name)
 		_emit(e, Event{kind = .Quarantined, space = sp.id, object = obj_id, device = ev.device, length = ev.from})
@@ -317,9 +327,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 }
 
 @(private)
-_remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, epoch: u64, length: i64) {
+_remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, epoch: u64, length: i64, stream: osync.Stream_Id) {
 	if name == CARD_STREAM {
-		_card_learn(e, sp, device)
+		_card_learn(e, sp, device, stream)
 		return
 	}
 	if seg, ok := _keys_target(name); ok {
@@ -402,13 +412,12 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 _verify :: proc(user: rawptr, req: ^osync.Verify_Request) -> osync.Verdict {
 	sp := (^Space)(user)
 	e := sp.e
-	_, kind, ok := _object_of_name(req.name)
-	if !ok || kind == .Text || kind == .File_Tree {
+	if _, _, ok := _object_of_name(req.name); !ok {
 		return .Accept
 	}
 	if !(req.device in sp.identities) {
 		_held_add(e, sp, req.device, req.name)
-		_need_add(e, sp, .Card, req.device, CARD_STREAM)
+		_need_add(e, sp, .Card, req.device, req.name)
 		return .Hold
 	}
 	rt, found := sp.remote_trees[req.stream]
@@ -438,136 +447,9 @@ _verify :: proc(user: rawptr, req: ^osync.Verify_Request) -> osync.Verdict {
 		},
 		keyring = e.keyring,
 	}
-	verdict := _chain_verify(&cv, req)
+	verdict := osync.chain_verify(&cv, req)
 	if verdict == .Hold {
 		_held_add(e, sp, req.device, req.name)
 	}
 	return verdict
-}
-
-@(private)
-Sig_Check :: struct {
-	cv:     ^osync.Chain_Verifier,
-	signer: osync.Identity,
-}
-
-@(private)
-_chain_verify :: proc(cv: ^osync.Chain_Verifier, req: ^osync.Verify_Request) -> osync.Verdict {
-	signer, known := cv.identity(cv.data, req.device)
-	if !known {
-		return .Hold
-	}
-	check := Sig_Check{cv, signer}
-	chain := journal.Chain {
-		seed = cv.seed(cv.data, req.stream),
-		verifier = journal.Verifier{data = &check, verify = proc(data: rawptr, msg: []u8, sig: []u8) -> bool {
-				s := (^Sig_Check)(data)
-				kr := s.cv.keyring
-				if kr.verify != nil {
-					return kr.verify(kr.data, &s.signer, msg, sig)
-				}
-				return osync.signature_verify(s.signer.sign, msg, sig)
-			}},
-	}
-	if cv.keys != nil {
-		chain.keys = cv.keys(cv.data, req.stream)
-	}
-	rd: journal.Reader
-	journal.replica_reader(req.replica, &rd, context.temp_allocator)
-	defer journal.reader_close(&rd)
-	if chain.keys.key != nil {
-		journal.reader_set_keys(&rd, chain.keys)
-	}
-	journal.reader_set_chain(&rd, &chain)
-	pos, aligned := _align(req)
-	if !aligned {
-		return .Accept
-	}
-	last: journal.Sig_Info
-	have_last := false
-	for pos < req.to {
-		_, next, err := journal.record_at(&rd, pos)
-		if span, ok := journal.reader_span(&rd); ok && (!have_last || span.off != last.off) {
-			if v := _span_cross(req, span); v != .Accept {
-				return v
-			}
-			last = span
-			have_last = true
-		}
-		#partial switch err {
-		case .None, .Redacted:
-			pos = next
-			continue
-		case .Eof:
-			return .Accept
-		case .Equivocation, .Forged, .Corrupt:
-			return .Equivocation
-		}
-		return .Hold
-	}
-	return .Accept
-}
-
-@(private)
-_span_cross :: proc(req: ^osync.Verify_Request, span: journal.Sig_Info) -> osync.Verdict {
-	if req.span == nil || req.span_ok == nil {
-		return .Accept
-	}
-	if req.span_ok^ {
-		prev := req.span^
-		if span.off == prev.off && span.head != prev.head {
-			return .Equivocation
-		}
-		if span.off != prev.off && span.range_start < prev.end && span.end > prev.range_start {
-			return .Equivocation
-		}
-		if span.range_start == prev.end && span.prev_head != prev.head {
-			return .Equivocation
-		}
-		if prev.range_start == span.end && prev.prev_head != span.head {
-			return .Equivocation
-		}
-		if span.end <= prev.end {
-			return .Accept
-		}
-	}
-	req.span^ = span
-	req.span_ok^ = true
-	return .Accept
-}
-
-@(private)
-_align :: proc(req: ^osync.Verify_Request) -> (start: i64, ok: bool) {
-	rep := req.replica
-	if req.from == 0 {
-		return 0, true
-	}
-	if req.span != nil && req.span_ok != nil && req.span_ok^ && req.span.end == req.from {
-		return req.from, true
-	}
-	pos := req.to
-	b: [4]u8
-	for pos > req.from {
-		if pos < journal.OVERHEAD || !journal.replica_covers(rep, pos - journal.TRAILER, pos) {
-			break
-		}
-		n, rerr := prim.read_at(rep.vfs, rep.fd, b[:], pos - journal.TRAILER)
-		if rerr != .None || n != 4 {
-			return 0, false
-		}
-		size := i64(prim.get_u32le(b[:]))
-		if size > journal.MAX_BODY {
-			return 0, false
-		}
-		at := pos - size - journal.OVERHEAD
-		if at < req.from || !journal.replica_covers(rep, at, pos) {
-			break
-		}
-		n, rerr = prim.read_at(rep.vfs, rep.fd, b[:], at)
-		if rerr != .None || n != 4 || i64(prim.get_u32le(b[:])) != size {
-			return 0, false
-		}
-		pos = at
-	}
-	return pos, pos < req.to
 }
