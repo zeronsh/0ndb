@@ -51,6 +51,12 @@ node_start :: proc(n: ^Node) -> bool {
 			node_crashed(n)
 			return false
 		}
+		if w.cfg.io_rate > 0 && (kerr == .Io || kerr == .No_Space) {
+			world_note(w, "%s keyring open hit injected %v; supervisor retries", n.name, kerr)
+			_free_partial(n)
+			schedule(w, Sim_Event{at = w.now + 200_000_000, kind = .Restart, node = n.idx})
+			return false
+		}
 		world_fail(w, "%s keyring open failed: %v", n.name, kerr)
 		_free_partial(n)
 		return false
@@ -68,6 +74,7 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.events = eng.Event_Hook{data = n, event = _on_event}
 	cfg.purge = eng.Purge_Hook{data = n, purge = _on_purge}
 	cfg.credentials = eng.Credentials_Source{data = n, produce = node_credentials}
+	cfg.write_observer = sim_observer(n)
 	cfg.durability = .Deferred
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
@@ -78,6 +85,13 @@ node_start :: proc(n: ^Node) -> bool {
 	err := eng.open(&n.e, cfg, context.allocator)
 	if n.disk.dead {
 		node_crashed(n)
+		return false
+	}
+	if err != .None && w.cfg.io_rate > 0 && (err == .Io || err == .No_Space) {
+		world_note(w, "%s engine open hit injected %v; supervisor retries", n.name, err)
+		n.alive = false
+		_free_partial(n)
+		schedule(w, Sim_Event{at = w.now + 200_000_000, kind = .Restart, node = n.idx})
 		return false
 	}
 	if err != .None {
@@ -109,10 +123,18 @@ node_start :: proc(n: ^Node) -> bool {
 				node_crashed(n)
 				return false
 			}
+			if w.cfg.io_rate > 0 && (oerr == .Io || oerr == .No_Space) {
+				n.restart_pending = true
+				node_after(n)
+				return false
+			}
 			world_fail(w, "%s space_open %s failed after restart: %v", n.name, id_short(sp.id), oerr)
 		}
 	}
 	node_after(n)
+	if n.alive {
+		node_remount(w, n)
+	}
 	return n.alive
 }
 
@@ -153,6 +175,7 @@ node_kill :: proc(n: ^Node) {
 	w := n.w
 	context = w.ctx
 	conns_drop_node(w, n)
+	node_mounts_drop(w, n)
 	n.alive = false
 	n.e_open = false
 	n.key_open = false
@@ -165,6 +188,7 @@ node_crashed :: proc(n: ^Node) {
 	w := n.w
 	context = w.ctx
 	mode := Crash_Mode.Power if rng_chance(&w.fault_rng, 2, 3) else Crash_Mode.Process
+	n.disk.dead = false
 	world_note(w, "%s crashed at disk op %d (%v)", n.name, n.disk.stats.ops, mode)
 	w.stats.crashes += 1
 	node_kill(n)
@@ -178,9 +202,14 @@ node_after :: proc(n: ^Node) {
 	if !n.alive {
 		return
 	}
-	if n.disk.dead {
+	if n.disk.dead || n.restart_pending {
+		n.restart_pending = false
 		node_crashed(n)
 		return
+	}
+	if len(n.disk.events) > 0 && !n.watch_scheduled && n.reg != nil {
+		n.watch_scheduled = true
+		schedule(n.w, Sim_Event{at = n.w.now + 1_000_000, kind = .Watch, node = n.idx})
 	}
 	if n.e_open {
 		t := eng.durable_tick(&n.e)
@@ -246,11 +275,28 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	#partial switch ev.kind {
 	case .Durable:
 	case .Quarantined:
+		if w.cfg.byzantine {
+			w.stats.detected += 1
+			world_note(w, "%s quarantined %s from %s (tampering detected)", n.name, id_short(ev.object), id_short(ev.device))
+			return
+		}
 		world_fail(w, "%s quarantined object %s device %s at %d (equivocation or forged chain)", n.name, id_short(ev.object), id_short(ev.device), ev.length)
 	case .Fatal:
-		world_fail(w, "%s fatal replication error on %s: %v %s", n.name, id_short(ev.object), ev.err, ev.detail)
+		if w.cfg.io_rate > 0 && (ev.err == .Io || ev.err == .No_Space) {
+			world_note(w, "%s replication stopped by injected %v; supervisor restarts it", n.name, ev.err)
+			n.restart_pending = true
+		} else if w.cfg.byzantine && (ev.err == .Forged || ev.err == .Corrupt || ev.err == .Quarantined) {
+			w.stats.detected += 1
+			world_note(w, "%s rejected tampered data on %s: %v", n.name, id_short(ev.object), ev.err)
+		} else {
+			world_fail(w, "%s fatal replication error on %s: %v %s", n.name, id_short(ev.object), ev.err, ev.detail)
+		}
 	case .Failure:
-		if !n.disk.dead {
+		if n.disk.dead {
+		} else if w.cfg.io_rate > 0 && (ev.err == .Io || ev.err == .No_Space) {
+			world_note(w, "%s engine failure %v after injected I/O error; supervisor restarts it", n.name, ev.err)
+			n.restart_pending = true
+		} else {
 			world_fail(w, "%s engine failure: %v %s", n.name, ev.err, ev.detail)
 		}
 	case .Refused:

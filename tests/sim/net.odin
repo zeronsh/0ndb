@@ -32,6 +32,8 @@ Conn :: struct {
 	last_node:    i64,
 	backoff:      i64,
 	latency:      i64,
+	byz_buf:      [dynamic]u8,
+	byz_hold:     [dynamic]u8,
 }
 
 @(private = "file")
@@ -59,6 +61,8 @@ _t_open :: proc(data: rawptr, e: ^eng.Engine, link: eng.Link, peer: eng.Peer) ->
 	c.backoff = 50_000_000
 	c.latency = rng_range(&w.net_rng, 200_000, 20_000_000)
 	c.held = make([dynamic][]u8, w.allocator)
+	c.byz_buf = make([dynamic]u8, w.allocator)
+	c.byz_hold = make([dynamic]u8, w.allocator)
 	append(&w.conns, c)
 	append(&n.conns, c)
 	schedule(w, Sim_Event{at = w.now + _delay(c), kind = .Connect, conn = c, gen = c.gen})
@@ -152,9 +156,71 @@ _r_send :: proc(data: rawptr, bytes: []u8, more: bool) -> (int, osync.Error) {
 		c.relay_blocked = true
 		w.stats.backpressure += 1
 	}
+	if w.cfg.byzantine {
+		_byzantine(c, bytes[:k])
+		return k, .None
+	}
 	c.to_node += k
 	_emit_chunks(c, bytes[:k], .To_Node)
 	return k, .None
+}
+
+@(private = "file")
+_byzantine :: proc(c: ^Conn, bytes: []u8) {
+	w := c.w
+	append(&c.byz_buf, ..bytes)
+	out := make([dynamic]u8, context.temp_allocator)
+	pos := 0
+	for len(c.byz_buf) - pos >= 5 {
+		n := int(u32(c.byz_buf[pos]) | u32(c.byz_buf[pos + 1]) << 8 | u32(c.byz_buf[pos + 2]) << 16 | u32(c.byz_buf[pos + 3]) << 24)
+		if len(c.byz_buf) - pos < 5 + n {
+			break
+		}
+		frame := c.byz_buf[pos:pos + 5 + n]
+		kind := frame[4]
+		pos += 5 + n
+		active := w.phase == .Workload && kind != 0x81
+		r := &w.net_rng
+		if active && rng_chance(r, 1, 25) {
+			act := rng_int(r, 4)
+			w.stats.tampered += 1
+			switch act {
+			case 0:
+				world_note(w, "byzantine relay withholds a %x frame (%d bytes) from %s", kind, n, c.node.name)
+				continue
+			case 1:
+				world_note(w, "byzantine relay duplicates a %x frame to %s", kind, c.node.name)
+				append(&out, ..frame)
+			case 2:
+				if len(c.byz_hold) == 0 {
+					world_note(w, "byzantine relay delays a %x frame to %s behind the next one", kind, c.node.name)
+					append(&c.byz_hold, ..frame)
+					continue
+				}
+			case 3:
+				if kind == 0x85 && n > 48 {
+					at := 5 + 48 + rng_int(r, n - 48)
+					bit := u8(1) << u8(rng_int(r, 8))
+					world_note(w, "byzantine relay flips a bit in record bytes of a Data frame to %s", c.node.name)
+					t := make([]u8, len(frame), context.temp_allocator)
+					copy(t, frame)
+					t[at] ~= bit
+					append(&out, ..t)
+					continue
+				}
+			}
+		}
+		append(&out, ..frame)
+		if len(c.byz_hold) > 0 {
+			append(&out, ..c.byz_hold[:])
+			clear(&c.byz_hold)
+		}
+	}
+	remove_range(&c.byz_buf, 0, pos)
+	if len(out) > 0 {
+		c.to_node += len(out)
+		_emit_chunks(c, out[:], .To_Node)
+	}
 }
 
 @(private = "file")
@@ -210,6 +276,8 @@ _relay_side_close :: proc(c: ^Conn) {
 		delete(b, w.allocator)
 	}
 	clear(&c.held)
+	clear(&c.byz_buf)
+	clear(&c.byz_hold)
 	c.relay_paused = false
 }
 
@@ -258,6 +326,8 @@ conns_drop_relay :: proc(w: ^World) {
 			delete(b, w.allocator)
 		}
 		clear(&c.held)
+		clear(&c.byz_buf)
+		clear(&c.byz_hold)
 	}
 	for c in w.conns {
 		if c.state == .Up {
@@ -376,7 +446,7 @@ net_event :: proc(w: ^World, ev: ^Sim_Event) {
 			return
 		}
 		_relay_writable(w, c)
-	case .Op, .Reset, .Fault, .Restart, .Relay_Restart, .Heal:
+	case .Op, .Reset, .Fault, .Restart, .Relay_Restart, .Heal, .Watch:
 	}
 }
 
@@ -439,4 +509,14 @@ _node_input :: proc(n: ^Node, c: ^Conn, bytes: []u8) {
 	context = instance_context(&n.inst)
 	eng.link_input(&n.e, c.link, bytes)
 	node_after(n)
+}
+
+byzantine_flush :: proc(w: ^World) {
+	for c in w.conns {
+		if len(c.byz_hold) > 0 && c.state == .Up && c.attached {
+			c.to_node += len(c.byz_hold)
+			_emit_chunks(c, c.byz_hold[:], .To_Node)
+		}
+		clear(&c.byz_hold)
+	}
 }

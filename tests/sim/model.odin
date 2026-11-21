@@ -56,6 +56,9 @@ Op_Kind :: enum u8 {
 	Catalog,
 	Usage,
 	Share,
+	Mount_Tree,
+	Disk_Agent,
+	Disk_Person,
 }
 
 M_Space :: struct {
@@ -107,6 +110,7 @@ Model :: struct {
 	shares: [dynamic]Pending_Share,
 	accepted: [dynamic]Pending_Share,
 	grants:   [dynamic]Pending_Share,
+	mounts:   [dynamic]M_Mount,
 }
 
 Pending_Share :: struct {
@@ -127,6 +131,7 @@ model_init :: proc(m: ^Model, w: ^World) {
 	m.shares = make([dynamic]Pending_Share, a)
 	m.accepted = make([dynamic]Pending_Share, a)
 	m.grants = make([dynamic]Pending_Share, a)
+	m.mounts = make([dynamic]M_Mount, a)
 }
 
 model_destroy :: proc(m: ^Model) {
@@ -163,6 +168,7 @@ model_destroy :: proc(m: ^Model) {
 	delete(m.shares)
 	delete(m.accepted)
 	delete(m.grants)
+	delete(m.mounts)
 }
 
 new_token :: proc(m: ^Model, n: ^Node, tag: string) -> string {
@@ -201,6 +207,12 @@ op_done :: proc(op: ^M_Op, tick: u64, err: eng.Error) {
 		return
 	}
 	op.err = err
+	if err != .None && w.cfg.io_rate > 0 && (err == .Io || err == .No_Space) {
+		op.status = .Uncertain
+		w.stats.io_errors += 1
+		w.nodes[op.node].restart_pending = true
+		return
+	}
 	if err != .None {
 		op.status = .Failed
 		w.stats.ops_failed += 1

@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:strings"
 import eng "../../src/engine"
+import "../../src/fs"
 import "../../src/prim"
 import osync "../../src/sync"
 
@@ -22,6 +23,7 @@ Ev_Kind :: enum u8 {
 	Restart,
 	Relay_Restart,
 	Heal,
+	Watch,
 }
 
 Sim_Event :: struct {
@@ -70,6 +72,11 @@ Node :: struct {
 	last_wake:   u64,
 	identity:    osync.Identity,
 	caps:        [8]eng.Cap_Credentials,
+	restart_pending: bool,
+	mounts:      [dynamic]Sim_Mount,
+	writers:     map[string]Writer_Info,
+	reg:         ^fs.Registry,
+	watch_scheduled: bool,
 }
 
 Relay_Node :: struct {
@@ -101,6 +108,10 @@ World_Stats :: struct {
 	engine_close: u64,
 	relay_close:  u64,
 	backpressure: u64,
+	detected:     u64,
+	tampered:     u64,
+	io_errors:    u64,
+	stalls:       u64,
 }
 
 Config :: struct {
@@ -119,6 +130,10 @@ Config :: struct {
 	trace_limit: int,
 	disabled:    bit_set[Op_Kind],
 	share_access: eng.Access_Set,
+	io_rate:     u64,
+	byzantine:   bool,
+	keep_ops:    Filter,
+	keep_faults: Filter,
 }
 
 World :: struct {
@@ -129,6 +144,11 @@ World :: struct {
 	rng:       Rng,
 	net_rng:   Rng,
 	fault_rng: Rng,
+	sched_rng: Rng,
+	op_index:  int,
+	fault_index: int,
+	cur_op:    int,
+	cur_fault: int,
 	nodes:     [dynamic]^Node,
 	relay:     Relay_Node,
 	conn_ids:  u64,
@@ -295,6 +315,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	rng_init(&w.rng, cfg.seed, 1)
 	rng_init(&w.net_rng, cfg.seed, 2)
 	rng_init(&w.fault_rng, cfg.seed, 3)
+	rng_init(&w.sched_rng, cfg.seed, 4)
 	model_init(&w.model, w)
 	w.relay.w = w
 	disk_init(&w.relay.disk, "relay", w.allocator)
@@ -309,9 +330,13 @@ world_init :: proc(w: ^World, cfg: Config) {
 		disk_init(&n.disk, n.name, w.allocator)
 		n.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -30_000_000_000, 30_000_000_000)}
 		n.disk.verbose = cfg.verbose
+		n.disk.fail_rate = cfg.io_rate
+		rng_init(&n.disk.fail_rng, cfg.seed, 5000 + u64(i))
 		n.disk.wall = clock_wall
 		n.disk.wall_data = &n.clock
 		n.conns = make([dynamic]^Conn, w.allocator)
+		n.mounts = make([dynamic]Sim_Mount, w.allocator)
+		n.writers = make(map[string]Writer_Info, w.allocator)
 		append(&w.nodes, n)
 	}
 }
@@ -321,6 +346,9 @@ world_destroy :: proc(w: ^World) {
 		if n.alive {
 			node_kill(n)
 		}
+		node_mounts_drop(w, n)
+		delete(n.mounts)
+		delete(n.writers)
 		disk_destroy(&n.disk)
 		delete(n.conns)
 		delete(n.name, w.allocator)
@@ -332,6 +360,12 @@ world_destroy :: proc(w: ^World) {
 	}
 	disk_destroy(&w.relay.disk)
 	for c in w.conns {
+		for b in c.held {
+			delete(b, w.allocator)
+		}
+		delete(c.held)
+		delete(c.byz_buf)
+		delete(c.byz_hold)
 		free(c, w.allocator)
 	}
 	delete(w.conns)

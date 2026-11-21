@@ -62,6 +62,13 @@ Open_File :: struct {
 	ino:      u64,
 	writable: bool,
 	append:   bool,
+	wrote:    bool,
+	path:     string,
+}
+
+Watch_Ev :: struct {
+	path:   string,
+	closed: bool,
 }
 
 Dir_Iter :: struct {
@@ -85,6 +92,7 @@ Disk_Stats :: struct {
 	crashes:  u64,
 	torn:     u64,
 	lost:     u64,
+	injected: u64,
 }
 
 Disk :: struct {
@@ -99,6 +107,12 @@ Disk :: struct {
 	crash_at:  u64,
 	dead:      bool,
 	fail_sync: u64,
+	fail_rate: u64,
+	watching:  bool,
+	watch_prefix: string,
+	events:    [dynamic]Watch_Ev,
+	fail_rng:  Rng,
+	failing:   bool,
 	trace:     u64,
 	verbose:   bool,
 	stats:     Disk_Stats,
@@ -141,6 +155,7 @@ disk_init :: proc(d: ^Disk, name: string, allocator: runtime.Allocator) {
 	d.inodes = make(map[u64]^Inode, allocator)
 	d.fds = make(map[prim.Fd]Open_File, allocator)
 	d.meta = make([dynamic]Meta_Op, allocator)
+	d.events = make([dynamic]Watch_Ev, allocator)
 	d.next_ino = ROOT_INO
 	d.next_fd = 16
 	root := _inode_new(d, .Dir, 0o755)
@@ -152,7 +167,12 @@ disk_destroy :: proc(d: ^Disk) {
 		_inode_free(d, n)
 	}
 	delete(d.inodes)
+	for _, of in d.fds {
+		delete(of.path, d.allocator)
+	}
 	delete(d.fds)
+	disk_events_clear(d)
+	delete(d.events)
 	for m in d.meta {
 		_meta_free(d, m)
 	}
@@ -239,6 +259,39 @@ _enter :: proc(d: ^Disk, op: u64) -> bool {
 		return false
 	}
 	return true
+}
+
+disk_events_clear :: proc(d: ^Disk) {
+	for ev in d.events {
+		delete(ev.path, d.allocator)
+	}
+	clear(&d.events)
+}
+
+@(private = "file")
+_event :: proc(d: ^Disk, path: string, closed := false) {
+	if !d.watching || len(d.watch_prefix) == 0 || !strings.has_prefix(path, d.watch_prefix) {
+		return
+	}
+	if n := len(d.events); n > 0 && d.events[n - 1].path == path && d.events[n - 1].closed == closed {
+		return
+	}
+	append(&d.events, Watch_Ev{path = strings.clone(path, d.allocator), closed = closed})
+}
+
+@(private = "file")
+_inject :: proc(d: ^Disk, space: bool) -> prim.Error {
+	if d.fail_rate == 0 || !d.failing {
+		return .None
+	}
+	if rng_below(&d.fail_rng, 1_000_000) >= d.fail_rate {
+		return .None
+	}
+	d.stats.injected += 1
+	if space && rng_chance(&d.fail_rng, 1, 2) {
+		return .No_Space
+	}
+	return .Io
 }
 
 @(private = "file")
@@ -461,9 +514,13 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 		if len(lk.name) == 0 {
 			return prim.INVALID_FD, .Invalid
 		}
+		if ierr := _inject(d, true); ierr != .None {
+			return prim.INVALID_FD, ierr
+		}
 		n := _inode_new(d, .File, mode)
 		_link(d, parent, lk.name, n.ino)
 		ino = n.ino
+		_event(d, path)
 	} else {
 		if .Create in flags && .Exclusive in flags {
 			return prim.INVALID_FD, .Exists
@@ -480,6 +537,7 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 			return prim.INVALID_FD, .Not_Dir
 		}
 		if n.kind == .File && .Truncate in flags && .Write in flags && len(n.data) > 0 {
+			_event(d, path)
 			resize(&n.data, 0)
 			append(&n.pend, Pend{kind = .Truncate, size = 0})
 			n.mtime_ns = _now(d)
@@ -487,7 +545,7 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 	}
 	fd := d.next_fd
 	d.next_fd += 1
-	d.fds[fd] = Open_File{ino = ino, writable = .Write in flags, append = .Append in flags}
+	d.fds[fd] = Open_File{ino = ino, writable = .Write in flags, append = .Append in flags, path = strings.clone(path, d.allocator)}
 	d.inodes[ino].opens += 1
 	return fd, .None
 }
@@ -500,6 +558,10 @@ _d_close :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return .Invalid
 	}
 	delete_key(&d.fds, fd)
+	if of.wrote && !d.dead {
+		_event(d, of.path, true)
+	}
+	delete(of.path, d.allocator)
 	if n, nok := d.inodes[of.ino]; nok {
 		n.opens -= 1
 		if n.lock_fd == fd {
@@ -562,6 +624,9 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 	if !_enter(d, 3) {
 		return .Io
 	}
+	if ierr := _inject(d, true); ierr != .None {
+		return ierr
+	}
 	of, n, err := _fd_get(d, fd)
 	if err != .None {
 		return err
@@ -578,6 +643,8 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 		return .None
 	}
 	_write(d, n, src, at)
+	of.wrote = true
+	_event(d, of.path)
 	return .None
 }
 
@@ -591,8 +658,16 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	if err != .None {
 		return err
 	}
-	if d.fail_sync > 0 {
-		d.fail_sync -= 1
+	if d.fail_sync > 0 || _inject(d, false) != .None {
+		if d.fail_sync > 0 {
+			d.fail_sync -= 1
+		}
+		if n.kind == .File {
+			for p in n.pend {
+				delete(p.bytes, d.allocator)
+			}
+			clear(&n.pend)
+		}
 		return .Io
 	}
 	if n.kind == .Dir {
@@ -601,9 +676,25 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return .None
 	}
 	d.stats.syncs += 1
-	resize(&n.durable, len(n.data))
-	copy(n.durable[:], n.data[:])
 	for p in n.pend {
+		switch p.kind {
+		case .Write:
+			end := int(p.off) + len(p.bytes)
+			if len(n.durable) < end {
+				old := len(n.durable)
+				resize(&n.durable, end)
+				for i in old ..< int(p.off) {
+					n.durable[i] = 0
+				}
+			}
+			copy(n.durable[p.off:end], p.bytes)
+		case .Truncate:
+			old := len(n.durable)
+			resize(&n.durable, int(p.size))
+			for i in old ..< int(p.size) {
+				n.durable[i] = 0
+			}
+		}
 		delete(p.bytes, d.allocator)
 	}
 	clear(&n.pend)
@@ -672,6 +763,9 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	if !_enter(d, 5) {
 		return .Io
 	}
+	if ierr := _inject(d, true); ierr != .None {
+		return ierr
+	}
 	of, n, err := _fd_get(d, fd)
 	if err != .None {
 		return err
@@ -687,6 +781,8 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	}
 	append(&n.pend, Pend{kind = .Truncate, size = size})
 	n.mtime_ns = _now(d)
+	of.wrote = true
+	_event(d, of.path)
 	return .None
 }
 
@@ -695,6 +791,9 @@ _d_punch :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> prim.Error {
 	d := (^Disk)(data)
 	if !_enter(d, 6) {
 		return .Io
+	}
+	if ierr := _inject(d, false); ierr != .None {
+		return ierr
 	}
 	of, n, err := _fd_get(d, fd)
 	if err != .None {
@@ -801,6 +900,9 @@ _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 	if !_enter(d, 10) {
 		return .Io
 	}
+	if ierr := _inject(d, true); ierr != .None {
+		return ierr
+	}
 	d.trace = mix_str(mix_str(d.trace, trace_path(old)), trace_path(new))
 	if d.verbose {
 		fmt.eprintf("dop %s rename %s %s\n", d.name, old, new)
@@ -852,6 +954,8 @@ _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 	pb.entries[strings.clone(b.name, d.allocator)] = moved
 	d.inodes[moved].nlink += 1
 	append(&d.meta, Meta_Op{kind = .Rename, dir = a.parent, name = strings.clone(a.name, d.allocator), ino = moved, dir2 = b.parent, name2 = strings.clone(b.name, d.allocator)})
+	_event(d, old)
+	_event(d, new)
 	if replaced != 0 {
 		_maybe_orphan(d, replaced)
 	}
@@ -863,6 +967,9 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	d := (^Disk)(data)
 	if !_enter(d, 11) {
 		return .Io
+	}
+	if ierr := _inject(d, false); ierr != .None {
+		return ierr
 	}
 	d.trace = mix_str(d.trace, trace_path(path))
 	lk, err := _lookup(d, path, false)
@@ -880,6 +987,7 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	ino := _unlink_entry(d, dir, lk.name)
 	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0})
 	_maybe_orphan(d, ino)
+	_event(d, path)
 	return .None
 }
 
@@ -919,6 +1027,9 @@ _d_mkdir :: proc(data: rawptr, path: string, mode: u32) -> prim.Error {
 	if !_enter(d, 13) {
 		return .Io
 	}
+	if ierr := _inject(d, true); ierr != .None {
+		return ierr
+	}
 	d.trace = mix_str(d.trace, trace_path(path))
 	lk, err := _lookup(d, path, false)
 	if err != .None {
@@ -934,6 +1045,7 @@ _d_mkdir :: proc(data: rawptr, path: string, mode: u32) -> prim.Error {
 	n := _inode_new(d, .Dir, mode)
 	n.nlink = 1
 	_link(d, parent, lk.name, n.ino)
+	_event(d, path)
 	return .None
 }
 
@@ -1120,7 +1232,12 @@ disk_crash :: proc(d: ^Disk, mode: Crash_Mode, r: ^Rng) {
 		n.lock_fd = prim.INVALID_FD
 		n.opens = 0
 	}
+	for _, of in d.fds {
+		delete(of.path, d.allocator)
+	}
 	clear(&d.fds)
+	disk_events_clear(d)
+	d.watching = false
 	if mode == .Process {
 		_collect(d)
 		return

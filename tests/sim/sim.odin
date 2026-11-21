@@ -14,6 +14,8 @@ import osync "../../src/sync"
 
 Run_Result :: struct {
 	seed:     u64,
+	op_events:    int,
+	fault_events: int,
 	failures: [dynamic]string,
 	trace:    u64,
 	stats:    World_Stats,
@@ -36,6 +38,8 @@ default_config :: proc(seed: u64) -> Config {
 		max_delay = rng_range(&r, 5, 2000) * 1_000_000,
 		window = 2048 + rng_int(&r, 256 * 1024),
 		fault_gap_ms = 2000 + rng_range(&r, 0, 20000),
+		io_rate = u64(rng_range(&r, 200, 5000)) if rng_chance(&r, 1, 5) else 0,
+		byzantine = rng_chance(&r, 1, 6),
 		settle_ms = 200 + rng_range(&r, 0, 1500),
 		trace_limit = 4000,
 	}
@@ -128,10 +132,16 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 			return
 		}
 		if w.phase == .Workload {
-			workload_step(w)
+			k := w.op_index
+			w.op_index += 1
+			if filter_keeps(&w.cfg.keep_ops, k) {
+				rng_init(&w.rng, w.cfg.seed, 1_000_000 + u64(k))
+				w.cur_op = k
+				workload_step(w)
+			}
 			w.cfg.ops -= 1
 			if w.cfg.ops > 0 {
-				gap := rng_range(&w.rng, 0, 2 * w.cfg.op_gap_ms) * 1_000_000 + rng_range(&w.rng, 0, 999_999)
+				gap := rng_range(&w.sched_rng, 0, 2 * w.cfg.op_gap_ms) * 1_000_000 + rng_range(&w.sched_rng, 0, 999_999)
 				schedule(w, Sim_Event{at = w.now + gap, kind = .Op})
 			}
 		}
@@ -140,8 +150,15 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 	case .Reset:
 	case .Fault:
 		if w.phase == .Workload {
-			inject_fault(w)
-			gap := rng_range(&w.fault_rng, 500, w.cfg.fault_gap_ms)  * 1_000_000
+			k := w.fault_index
+			w.fault_index += 1
+			if filter_keeps(&w.cfg.keep_faults, k) {
+				r := rng_fork(&w.sched_rng, 0)
+				rng_init(&r, w.cfg.seed, 2_000_000 + u64(k))
+				w.cur_fault = k
+				inject_fault(w, &r)
+			}
+			gap := rng_range(&w.sched_rng, 500, w.cfg.fault_gap_ms) * 1_000_000
 			schedule(w, Sim_Event{at = w.now + gap, kind = .Fault})
 		}
 	case .Restart:
@@ -156,6 +173,8 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		if !w.relay.alive {
 			relay_start(&w.relay)
 		}
+	case .Watch:
+		watch_event(w, w.nodes[ev.node])
 	case .Heal:
 		n := w.nodes[ev.node]
 		if n.partitioned {
@@ -177,8 +196,7 @@ requeue_shares :: proc(w: ^World, n: ^Node) {
 	}
 }
 
-inject_fault :: proc(w: ^World) {
-	r := &w.fault_rng
+inject_fault :: proc(w: ^World, r: ^Rng) {
 	weights := [?]int{
 		w.cfg.crash_rate * 3,
 		w.cfg.crash_rate * 2,
@@ -244,6 +262,10 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	cfg.disabled = env_disabled()
 	leak_sites = env_u64("SIM_LEAK_SITES", 0) != 0
 	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {.Read, .Write}
+	cfg.io_rate = env_u64("SIM_IO", cfg.io_rate)
+	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
+	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
+	cfg.keep_faults = filter_parse("SIM_KEEP_FAULTS")
 	if f, ok := os.lookup_env("SIM_FAULTS", context.temp_allocator); ok && f == "0" {
 		cfg.crash_rate = 0
 		cfg.fault_rate = 0
@@ -257,7 +279,7 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 		world_destroy(w)
 		free(w, runtime.heap_allocator())
 	}
-	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms)
+	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine)
 	ok := relay_start(&w.relay)
 	for n in w.nodes {
 		ok = ok && node_start(n)
@@ -267,6 +289,9 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	}
 	if ok {
 		run_until(w, w.now + 2_000_000_000, true)
+		for n in w.nodes {
+			n.disk.failing = true
+		}
 		schedule(w, Sim_Event{at = w.now + 1_000_000, kind = .Op})
 		if cfg.crash_rate + cfg.fault_rate > 0 {
 			schedule(w, Sim_Event{at = w.now + rng_range(&w.fault_rng, 10, 1000) * 1_000_000, kind = .Fault})
@@ -280,8 +305,11 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	}
 	res.trace = w.trace
 	res.stats = w.stats
+	res.op_events = w.op_index
+	res.fault_events = w.fault_index
 	res.sim_ns = w.now
 	for n in w.nodes {
+		res.stats.io_errors += n.disk.stats.injected
 		res.disk_ops += n.disk.stats.ops
 		res.trace = mix64(res.trace, disk_digest(&n.disk))
 		res.trace = mix64(res.trace, n.disk.trace)
@@ -313,6 +341,8 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 		}
 	}
 	res.wall_ns = i64(time.tick_since(start))
+	delete(cfg.keep_ops.keep)
+	delete(cfg.keep_faults.keep)
 	return
 }
 
@@ -325,6 +355,10 @@ finish :: proc(w: ^World) {
 		n.partitioned = false
 	}
 	w.relay.disk.crash_at = 0
+	for n in w.nodes {
+		n.disk.failing = false
+	}
+	byzantine_flush(w)
 	if !w.relay.alive {
 		relay_start(&w.relay)
 	}
@@ -367,7 +401,9 @@ finish :: proc(w: ^World) {
 		dump_replication(w)
 	}
 	check_redaction(w)
+	check_relay_redaction(w)
 	check_relay_plaintext(w)
+	check_mounts(w)
 	idle := run_until(w, w.now + 600_000_000_000, true)
 	if !idle {
 		world_fail(w, "idle: world never became idle (timers keep firing)")
@@ -446,6 +482,9 @@ report :: proc(t: ^testing.T, res: ^Run_Result) -> bool {
 	if len(res.failures) == 0 {
 		return true
 	}
+	if env_u64("SIM_QUIET", 0) != 0 {
+		return false
+	}
 	fmt.eprintf("sim: seed %d FAILED (%d failures). Reproduce: SIM_SEED=%d odin test tests/sim -o:speed\n", res.seed, len(res.failures), res.seed)
 	for f in res.failures {
 		fmt.eprintf("  %s\n", f)
@@ -463,6 +502,11 @@ free_result :: proc(res: ^Run_Result) {
 @(test)
 simulate :: proc(t: ^testing.T) {
 	verbose := env_u64("SIM_VERBOSE", 0) != 0
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 && env_u64("SIM_SHRINK", 0) != 0 {
+		seed, _ := strconv.parse_u64(s)
+		testing.expect(t, shrink(seed))
+		return
+	}
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		seed, _ := strconv.parse_u64(s)
 		replay := env_u64("SIM_REPLAY", 1) != 0
@@ -477,7 +521,11 @@ simulate :: proc(t: ^testing.T) {
 			free_result(&b)
 		}
 		if fd := env_u64("SIM_STATS_FD", 0); fd > 0 {
-			st := Wire_Stats{a.stats, a.disk_ops, a.wall_ns, a.sim_ns}
+			st := Wire_Stats{stats = a.stats, disk_ops = a.disk_ops, wall_ns = a.wall_ns, sim_ns = a.sim_ns, ops = a.op_events, faults = a.fault_events}
+			if len(a.failures) > 0 {
+				sg := failure_signature(a.failures[0])
+				st.sig_len = copy(st.sig[:], sg)
+			}
 			b := transmute([size_of(Wire_Stats)]u8)st
 			posix.write(posix.FD(fd), raw_data(b[:]), len(b))
 		} else {
@@ -521,6 +569,10 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.resets += st.stats.resets
 		total.stats.partitions += st.stats.partitions
 		total.stats.engine_close += st.stats.engine_close
+		total.stats.tampered += st.stats.tampered
+		total.stats.detected += st.stats.detected
+		total.stats.io_errors += st.stats.io_errors
+		total.stats.stalls += st.stats.stalls
 		total.disk_ops += st.disk_ops
 		total.sim_ns += st.sim_ns
 	}
@@ -530,14 +582,99 @@ simulate :: proc(t: ^testing.T) {
 	testing.expect(t, len(failed) == 0)
 }
 
+Filter :: struct {
+	active: bool,
+	keep:   [dynamic]int,
+}
+
+filter_keeps :: proc(f: ^Filter, k: int) -> bool {
+	if !f.active {
+		return true
+	}
+	for x in f.keep {
+		if x == k {
+			return true
+		}
+	}
+	return false
+}
+
+filter_parse :: proc(name: string) -> (f: Filter) {
+	v, ok := os.lookup_env(name, context.temp_allocator)
+	if !ok {
+		return
+	}
+	f.active = true
+	f.keep = make([dynamic]int, runtime.heap_allocator())
+	for part in strings.split(v, ",", context.temp_allocator) {
+		p := strings.trim_space(part)
+		if len(p) == 0 {
+			continue
+		}
+		if i := strings.index_byte(p, '-'); i > 0 {
+			lo, _ := strconv.parse_int(p[:i])
+			hi, _ := strconv.parse_int(p[i + 1:])
+			for x in lo ..= hi {
+				append(&f.keep, x)
+			}
+		} else {
+			x, _ := strconv.parse_int(p)
+			append(&f.keep, x)
+		}
+	}
+	return
+}
+
 Wire_Stats :: struct {
 	stats:    World_Stats,
 	disk_ops: u64,
 	wall_ns:  i64,
 	sim_ns:   i64,
+	ops:      int,
+	faults:   int,
+	sig_len:  int,
+	sig:      [240]u8,
 }
 
-run_child :: proc(seed: u64, replay: bool) -> (st: Wire_Stats, ok: bool, why: string) {
+failure_signature :: proc(f: string) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	i := 0
+	for i < len(f) {
+		c := f[i]
+		if c == '<' {
+			j := strings.index_byte(f[i:], '>')
+			if j > 0 {
+				strings.write_string(&b, "<T>")
+				i += j + 1
+				continue
+			}
+		}
+		if c >= '0' && c <= '9' || c >= 'a' && c <= 'f' && i + 1 < len(f) && _hexrun(f[i:]) >= 8 {
+			for i < len(f) && (f[i] >= '0' && f[i] <= '9' || f[i] >= 'a' && f[i] <= 'f') {
+				i += 1
+			}
+			strings.write_byte(&b, '#')
+			continue
+		}
+		if c == '\n' {
+			break
+		}
+		strings.write_byte(&b, c)
+		i += 1
+	}
+	return strings.to_string(b)
+}
+
+@(private = "file")
+_hexrun :: proc(s: string) -> int {
+	n := 0
+	for n < len(s) && (s[n] >= '0' && s[n] <= '9' || s[n] >= 'a' && s[n] <= 'f') {
+		n += 1
+	}
+	return n
+}
+
+run_child :: proc(seed: u64, replay: bool, extra: []string = nil) -> (st: Wire_Stats, ok: bool, why: string) {
 	fds: [2]posix.FD
 	if posix.pipe(&fds) != .OK {
 		return st, false, "pipe failed"
@@ -545,7 +682,7 @@ run_child :: proc(seed: u64, replay: bool) -> (st: Wire_Stats, ok: bool, why: st
 	env := make([dynamic]cstring, context.temp_allocator)
 	environ, _ := os.environ(context.temp_allocator)
 	for kv in environ {
-		if strings.has_prefix(kv, "SIM_SEED=") || strings.has_prefix(kv, "SIM_REPLAY=") || strings.has_prefix(kv, "SIM_STATS_FD=") {
+		if strings.has_prefix(kv, "SIM_SEED=") || strings.has_prefix(kv, "SIM_REPLAY=") || strings.has_prefix(kv, "SIM_STATS_FD=") || strings.has_prefix(kv, "SIM_SHRINK") || (len(extra) > 0 && strings.has_prefix(kv, "SIM_KEEP_")) {
 			continue
 		}
 		append(&env, strings.clone_to_cstring(kv, context.temp_allocator))
@@ -553,6 +690,9 @@ run_child :: proc(seed: u64, replay: bool) -> (st: Wire_Stats, ok: bool, why: st
 	append(&env, strings.clone_to_cstring(fmt.tprintf("SIM_SEED=%d", seed), context.temp_allocator))
 	append(&env, strings.clone_to_cstring(fmt.tprintf("SIM_REPLAY=%d", 1 if replay else 0), context.temp_allocator))
 	append(&env, strings.clone_to_cstring(fmt.tprintf("SIM_STATS_FD=%d", fds[1]), context.temp_allocator))
+	for x in extra {
+		append(&env, strings.clone_to_cstring(x, context.temp_allocator))
+	}
 	append(&env, nil)
 	when ODIN_OS == .Linux {
 		exe := cstring("/proc/self/exe")
@@ -608,5 +748,116 @@ run_child :: proc(seed: u64, replay: bool) -> (st: Wire_Stats, ok: bool, why: st
 print_stats :: proc(r: ^Run_Result) {
 	secs := f64(r.wall_ns) / 1e9
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
-	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
+	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
+}
+
+@(private = "file")
+_ranges :: proc(xs: []int) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	i := 0
+	for i < len(xs) {
+		j := i
+		for j + 1 < len(xs) && xs[j + 1] == xs[j] + 1 {
+			j += 1
+		}
+		if b.buf != nil && len(b.buf) > 0 {
+			strings.write_byte(&b, ',')
+		}
+		if j > i {
+			fmt.sbprintf(&b, "%d-%d", xs[i], xs[j])
+		} else {
+			fmt.sbprintf(&b, "%d", xs[i])
+		}
+		i = j + 1
+	}
+	return strings.to_string(b)
+}
+
+Shrinker :: struct {
+	seed:   u64,
+	sig:    string,
+	runs:   int,
+	budget: int,
+}
+
+@(private = "file")
+_try :: proc(s: ^Shrinker, ops: []int, faults: []int) -> bool {
+	if s.runs >= s.budget {
+		return false
+	}
+	s.runs += 1
+	extra := []string{fmt.tprintf("SIM_KEEP_OPS=%s", _ranges(ops)), fmt.tprintf("SIM_KEEP_FAULTS=%s", _ranges(faults)), "SIM_QUIET=1"}
+	st, ok, why := run_child(s.seed, false, extra)
+	if ok {
+		return false
+	}
+	sig := string(st.sig[:st.sig_len]) if st.sig_len > 0 else why
+	return sig == s.sig
+}
+
+@(private = "file")
+_ddmin :: proc(s: ^Shrinker, set: ^[dynamic]int, other: []int, is_ops: bool) {
+	n := 2
+	for len(set) >= 2 && s.runs < s.budget {
+		chunk := (len(set) + n - 1) / n
+		reduced := false
+		for start := 0; start < len(set); start += chunk {
+			end := min(start + chunk, len(set))
+			rest := make([dynamic]int, context.temp_allocator)
+			append(&rest, ..set[:start])
+			append(&rest, ..set[end:])
+			ok := _try(s, rest[:], other) if is_ops else _try(s, other, rest[:])
+			if ok {
+				clear(set)
+				append(set, ..rest[:])
+				n = max(n - 1, 2)
+				reduced = true
+				fmt.eprintf("sim: shrink %s -> %d still fails (%d runs)\n", "ops" if is_ops else "faults", len(set), s.runs)
+				break
+			}
+		}
+		if !reduced {
+			if n >= len(set) {
+				break
+			}
+			n = min(n * 2, len(set))
+		}
+	}
+	if len(set) == 1 && s.runs < s.budget {
+		ok := _try(s, nil, other) if is_ops else _try(s, other, nil)
+		if ok {
+			clear(set)
+		}
+	}
+}
+
+shrink :: proc(seed: u64) -> bool {
+	st, ok, why := run_child(seed, false)
+	if ok {
+		fmt.eprintf("sim: seed %d passes; nothing to shrink\n", seed)
+		return true
+	}
+	s := Shrinker{seed = seed, budget = int(env_u64("SIM_SHRINK_BUDGET", 300))}
+	s.sig = strings.clone(string(st.sig[:st.sig_len]) if st.sig_len > 0 else why, context.temp_allocator)
+	fmt.eprintf("sim: shrinking seed %d (%d ops, %d faults) for failure: %s\n", seed, st.ops, st.faults, s.sig)
+	ops := make([dynamic]int, context.temp_allocator)
+	faults := make([dynamic]int, context.temp_allocator)
+	for i in 0 ..< st.ops {
+		append(&ops, i)
+	}
+	for i in 0 ..< st.faults {
+		append(&faults, i)
+	}
+	_ddmin(&s, &faults, ops[:], false)
+	_ddmin(&s, &ops, faults[:], true)
+	_ddmin(&s, &faults, ops[:], false)
+	env := make([dynamic]string, context.temp_allocator)
+	environ, _ := os.environ(context.temp_allocator)
+	for kv in environ {
+		if strings.has_prefix(kv, "SIM_") && !strings.has_prefix(kv, "SIM_SEED=") && !strings.has_prefix(kv, "SIM_SHRINK") && !strings.has_prefix(kv, "SIM_KEEP_") {
+			append(&env, kv)
+		}
+	}
+	fmt.eprintf("sim: minimal reproduction after %d runs (%d of %d ops, %d of %d faults):\n  %sSIM_SEED=%d SIM_KEEP_OPS=%s SIM_KEEP_FAULTS=%s odin test tests/sim -o:speed\n", s.runs, len(ops), st.ops, len(faults), st.faults, strings.concatenate({strings.join(env[:], " ", context.temp_allocator), " " if len(env) > 0 else ""}, context.temp_allocator), seed, _ranges(ops[:]), _ranges(faults[:]))
+	return false
 }

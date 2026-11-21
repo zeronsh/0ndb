@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:slice"
 import "core:strings"
 import "../../src/convo"
+import "../../src/journal"
 import eng "../../src/engine"
 import omap "../../src/map"
 import "../../src/obj"
@@ -223,9 +224,40 @@ obj_exists :: proc(m: ^Model, oi: int) -> bool {
 	return cop.status != .Lost && cop.status != .Failed
 }
 
+known_tokens :: proc(m: ^Model) -> map[string]bool {
+	out := make(map[string]bool, context.temp_allocator)
+	for op in m.ops {
+		if len(op.token) > 0 {
+			out[op.token] = true
+		}
+		for t in op.tokens {
+			out[t] = true
+		}
+	}
+	return out
+}
+
+check_integrity :: proc(w: ^World, n: ^Node, oi: int, d: ^Digest, known: ^map[string]bool) {
+	for t in parse_tokens(transmute([]u8)d.text) {
+		if !(t.text in known) {
+			world_fail(w, "integrity: %s presents content no participant wrote in %v %s: %q", n.name, w.model.objs[oi].kind, id_short(w.model.objs[oi].o.id), t.text)
+		}
+	}
+}
+
+stall :: proc(w: ^World, format: string, args: ..any) {
+	if w.cfg.byzantine {
+		w.stats.stalls += 1
+		world_note(w, format, ..args)
+		return
+	}
+	world_fail(w, format, ..args)
+}
+
 check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 	m := &w.model
 	converged = true
+	known := known_tokens(m)
 	for _, oi in m.objs {
 		if !obj_exists(m, oi) {
 			continue
@@ -239,9 +271,12 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 			if !d.complete {
 				converged = false
 				if final {
-					world_fail(w, "convergence: %s could not fully read %v %s (%s)", n.name, m.objs[oi].kind, id_short(m.objs[oi].o.id), d.why)
+					stall(w, "convergence: %s could not fully read %v %s (%s)", n.name, m.objs[oi].kind, id_short(m.objs[oi].o.id), d.why)
 				}
 				continue
+			}
+			if final {
+				check_integrity(w, n, oi, &d, &known)
 			}
 			if refn < 0 {
 				ref = d
@@ -251,13 +286,13 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 			if _strip_catalog(d.text, d.guest || ref.guest) != _strip_catalog(ref.text, d.guest || ref.guest) {
 				converged = false
 				if final {
-					world_fail(w, "convergence: %v %s differs between %s and %s:\n--- %s\n%s--- %s\n%s", m.objs[oi].kind, id_short(m.objs[oi].o.id), w.nodes[refn].name, n.name, w.nodes[refn].name, ref.text, n.name, d.text)
+					stall(w, "convergence: %v %s differs between %s and %s:\n--- %s\n%s--- %s\n%s", m.objs[oi].kind, id_short(m.objs[oi].o.id), w.nodes[refn].name, n.name, w.nodes[refn].name, ref.text, n.name, d.text)
 				}
 			}
 			delete(d.text, w.allocator)
 		}
 		if refn >= 0 {
-			if final {
+			if final && !w.cfg.byzantine {
 				check_object_model(w, oi, w.nodes[refn], ref.text)
 			}
 			delete(ref.text, w.allocator)
@@ -439,23 +474,42 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		names, _ := eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
 		for nm in names {
 			data, _ := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator)
-			collect(&present, data, nil, nm)
+			spans := tree_file_spans(n, ob.o, nm)
+			total := 0
+			for sp in spans {
+				total += sp.len
+			}
+			if total != len(data) {
+				world_fail(w, "attribution: %s/%s on %s has %d bytes but spans cover %d", id_short(ob.o.id), nm, n.name, len(data), total)
+			}
+			collect(&present, data, spans, nm)
 		}
 	}
 	for op in m.ops {
 		if op.obj != oi {
 			continue
 		}
-		if !(op.kind == .Text_Insert || op.kind == .Tree_Write || op.kind == .Create) {
+		if !(op.kind == .Text_Insert || op.kind == .Tree_Write || op.kind == .Create || op.kind == .Disk_Agent || op.kind == .Disk_Person) {
 			continue
 		}
 		for tok in op.tokens {
 			s, is := present[tok]
-			if is && ob.kind == .Text {
+			if is {
+				diffed := (op.kind == .Disk_Agent || op.kind == .Disk_Person) && len(op.deletes) > 0
+				own := false
 				for a in s.actors {
-					if a != op.actor {
-						world_fail(w, "attribution: token %s written by %s is credited to %s on %s", tok, id_short(op.actor), id_short(a), n.name)
+					own ||= a == op.actor
+					if a == op.actor {
+						continue
 					}
+					if !diffed {
+						world_fail(w, "attribution: token %s written by %s is credited to %s on %s", tok, id_short(op.actor), id_short(a), n.name)
+					} else if !_wrote_file(m, oi, s.file, a) {
+						world_fail(w, "attribution: token %s written by %s is partly credited to %s, which never wrote %s, on %s", tok, id_short(op.actor), id_short(a), s.file, n.name)
+					}
+				}
+				if !own && len(s.actors) > 0 {
+					world_fail(w, "attribution: no byte of token %s is credited to its writer %s on %s", tok, id_short(op.actor), n.name)
 				}
 			}
 			deleted := false
@@ -477,7 +531,7 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			removed := false
 			if ob.kind == .Tree {
 				for d in m.ops {
-					if d.obj == oi && d.kind == .Tree_Remove && op_maybe(d) && d.path == op.path {
+					if d.obj == oi && (d.kind == .Tree_Remove || d.kind == .Disk_Person || d.kind == .Disk_Agent || d.kind == .Tree_Write) && op_maybe(d) && d.path == op.path && d.kind == .Tree_Remove {
 						removed = true
 					}
 				}
@@ -538,7 +592,7 @@ check_redaction :: proc(w: ^World) {
 			for d in op.deletes {
 				append(&secrets, d)
 			}
-		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share:
+		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person:
 		}
 	}
 	for s in secrets {
@@ -657,4 +711,235 @@ _strip_catalog :: proc(text: string, strip: bool) -> string {
 	}
 	i := strings.index_byte(text, '\n')
 	return text[i + 1:] if i >= 0 else ""
+}
+
+Rec_State :: enum u8 {
+	Live,
+	Redacted,
+}
+
+Rec_Key :: struct {
+	device: prim.Id,
+	off:    i64,
+}
+
+@(private = "file")
+_kind_prefix :: proc(k: M_Kind) -> u8 {
+	switch k {
+	case .Convo:
+		return 'c'
+	case .Map:
+		return 'm'
+	case .Text:
+		return 't'
+	case .Tree:
+		return 'f'
+	}
+	return 'm'
+}
+
+@(private = "file")
+_open_handle :: proc(n: ^Node, ob: ^M_Obj) -> ^eng.Handle {
+	switch ob.kind {
+	case .Convo:
+		eng.convo_status(&n.e, ob.o)
+	case .Map:
+		eng.map_get(&n.e, ob.o, transmute([]u8)string("?"), context.temp_allocator)
+	case .Text:
+		eng.text_read(&n.e, ob.o, context.temp_allocator)
+	case .Tree:
+		eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
+	}
+	h, ok := n.e.handles[ob.o.id]
+	return h if ok else nil
+}
+
+@(private = "file")
+_node_records :: proc(w: ^World, n: ^Node, ob: ^M_Obj, out: ^map[Rec_Key]Rec_State) {
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	h := _open_handle(n, ob)
+	if h == nil {
+		return
+	}
+	for s in h.segs {
+		end := journal.reader_end(&s.jr)
+		pos: i64
+		for pos < end {
+			_, next, err := journal.record_at(&s.jr, pos)
+			if err == .Redacted {
+				out[Rec_Key{s.device, pos}] = .Redacted
+			} else if err == .None {
+				out[Rec_Key{s.device, pos}] = .Live
+			} else {
+				break
+			}
+			if next <= pos {
+				break
+			}
+			pos = next
+		}
+	}
+}
+
+@(private = "file")
+_relay_records :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id, out: ^map[i64]Rec_State, zeros_bad: ^[dynamic]i64) -> bool {
+	rn := &w.relay
+	context = instance_context(&rn.inst)
+	defer relay_after(rn)
+	r := &rn.r
+	st := r.store
+	ns: rawptr
+	opened_ns := false
+	if sp, ok := r.spaces[space]; ok && sp.ns != nil {
+		ns = sp.ns
+	} else {
+		h, _, err := st.namespace_open(st.data, space)
+		if err != .None {
+			return false
+		}
+		ns = h
+		opened_ns = true
+	}
+	defer if opened_ns {
+		st.namespace_close(st.data, ns)
+	}
+	sh, length, serr := st.stream_open(st.data, ns, id, false)
+	if serr != .None || sh == nil {
+		return false
+	}
+	defer st.stream_close(st.data, sh)
+	hdr: [20]u8
+	pos: i64
+	for pos + 24 <= length {
+		got, rerr := st.stream_read(st.data, sh, pos, hdr[:])
+		if rerr != .None || got != len(hdr) {
+			break
+		}
+		n := i64(prim.get_u32le(hdr[0:4]))
+		if pos + n + 24 > length {
+			break
+		}
+		tag: journal.Tag
+		copy(tag[:], hdr[4:20])
+		if tag == journal.redacted_tag(pos, int(n)) {
+			out[pos] = .Redacted
+			body := make([]u8, n, context.temp_allocator)
+			if bgot, berr := st.stream_read(st.data, sh, pos + 20, body); berr == .None && i64(bgot) == n {
+				for b in body {
+					if b != 0 {
+						append(zeros_bad, pos)
+						break
+					}
+				}
+			}
+		} else {
+			out[pos] = .Live
+		}
+		pos += n + 24
+	}
+	return true
+}
+
+check_relay_redaction :: proc(w: ^World) {
+	m := &w.model
+	if !w.relay.alive {
+		return
+	}
+	for _, oi in m.objs {
+		if !obj_exists(m, oi) {
+			continue
+		}
+		ob := &m.objs[oi]
+		readers := readers_of(w, oi)
+		per_node := make([]map[Rec_Key]Rec_State, len(w.nodes), context.temp_allocator)
+		devices := make([dynamic]prim.Id, context.temp_allocator)
+		keyer := -1
+		for idx in readers {
+			n := w.nodes[idx]
+			if !n.alive || !n.e_open {
+				continue
+			}
+			per_node[idx] = make(map[Rec_Key]Rec_State, context.temp_allocator)
+			_node_records(w, n, ob, &per_node[idx])
+			for k in per_node[idx] {
+				seen := false
+				for d in devices {
+					seen ||= d == k.device
+				}
+				if !seen {
+					append(&devices, k.device)
+				}
+			}
+			si := space_index(m, ob.o.space)
+			if keyer < 0 && si >= 0 && space_member(&m.spaces[si], idx) {
+				keyer = idx
+			}
+		}
+		if keyer < 0 {
+			continue
+		}
+		kn := w.nodes[keyer]
+		scope: osync.Scope
+		{
+			context = instance_context(&kn.inst)
+			key, kerr := eng.object_key(&kn.e, ob.o)
+			info, _ := eng.space_info(&kn.e, ob.o.space)
+			node_after(kn)
+			if kerr != .None {
+				continue
+			}
+			scope = osync.scope_make(key, info.mode)
+		}
+		name := make([]u8, 1 + prim.ID_HEX_LEN, context.temp_allocator)
+		name[0] = _kind_prefix(ob.kind)
+		hx := prim.id_hex(ob.o.id)
+		copy(name[1:], hx[:])
+		slice.sort_by(devices[:], id_less)
+		for d in devices {
+			sid := osync.stream_id(&scope, d, string(name), 0)
+			relay := make(map[i64]Rec_State, context.temp_allocator)
+			bad := make([dynamic]i64, context.temp_allocator)
+			if !_relay_records(w, ob.o.space, sid, &relay, &bad) {
+				continue
+			}
+			for off in bad {
+				world_fail(w, "relay redaction: record %s@%d of %v %s is marked redacted on the relay but its ciphertext is not zero-filled", id_short(d), off, ob.kind, id_short(ob.o.id))
+			}
+			for idx in readers {
+				if per_node[idx] == nil {
+					continue
+				}
+				keys := make([dynamic]i64, context.temp_allocator)
+				for k in per_node[idx] {
+					if k.device == d {
+						append(&keys, k.off)
+					}
+				}
+				slice.sort(keys[:])
+				for off in keys {
+					ns := per_node[idx][Rec_Key{d, off}]
+					rs, has := relay[off]
+					if !has {
+						continue
+					}
+					if ns == .Redacted && rs != .Redacted {
+						world_fail(w, "relay redaction: relay still holds ciphertext of record %s@%d of %v %s, redacted on %s", id_short(d), off, ob.kind, id_short(ob.o.id), w.nodes[idx].name)
+					} else if ns == .Live && rs == .Redacted {
+						world_fail(w, "redaction: %s still holds record %s@%d of %v %s that the relay has redacted", w.nodes[idx].name, id_short(d), off, ob.kind, id_short(ob.o.id))
+					}
+				}
+			}
+		}
+	}
+}
+
+@(private = "file")
+_wrote_file :: proc(m: ^Model, oi: int, file: string, actor: prim.Id) -> bool {
+	for op in m.ops {
+		if op.obj == oi && op.actor == actor && (op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Tree_Write) {
+			return true
+		}
+	}
+	return false
 }
