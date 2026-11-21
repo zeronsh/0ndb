@@ -20,6 +20,11 @@ pub const SealedPageMeta = struct {
     sealed_ms: u64,
 };
 
+const LwwStamp = struct {
+    lamport: u64,
+    actor: u128,
+};
+
 pub const ThreadStore = struct {
     allocator: Allocator,
     io: Io,
@@ -32,8 +37,12 @@ pub const ThreadStore = struct {
     local_blobs: ?blobs_mod.BlobStore,
     lamport: u64 = 0,
     meta: ?model.ThreadMeta = null,
+    meta_updated_actor: u128 = 0,
+    bindings_updated_ms: u64 = 0,
+    bindings_updated_actor: u128 = 0,
     seen_events: std.AutoHashMapUnmanaged(u128, void) = .empty,
     messages: std.AutoHashMapUnmanaged(u128, model.Message) = .empty,
+    msg_actors: std.AutoHashMapUnmanaged(u128, u128) = .empty,
     sealed_msg_ids: std.AutoHashMapUnmanaged(u128, id.PageId) = .empty,
     sealed_pages: std.ArrayList(SealedPageMeta) = .empty,
     head_page: ?id.PageId = null,
@@ -44,15 +53,25 @@ pub const ThreadStore = struct {
     branch_choices: std.AutoHashMapUnmanaged(u128, model.BranchChoice) = .empty,
     tool_calls: std.AutoHashMapUnmanaged(u128, std.ArrayList(model.ToolCallRecord)) = .empty,
     queue_items: std.AutoHashMapUnmanaged(u128, model.QueueItem) = .empty,
+    queue_actors: std.AutoHashMapUnmanaged(u128, u128) = .empty,
     tasks: std.AutoHashMapUnmanaged(u128, model.Task) = .empty,
     mailbox: std.AutoHashMapUnmanaged(u128, model.MailboxItem) = .empty,
     mailbox_order: std.ArrayList(u128) = .empty,
+    acked_mailbox: std.AutoHashMapUnmanaged(u128, u64) = .empty,
     triggers: std.AutoHashMapUnmanaged(u128, model.Trigger) = .empty,
+    trigger_lww: std.AutoHashMapUnmanaged(u128, LwwStamp) = .empty,
     fired_triggers: std.AutoHashMapUnmanaged([32]u8, u64) = .empty,
+    fired_trigger_records: std.AutoHashMapUnmanaged([32]u8, model.TriggerFired) = .empty,
+    trigger_last_fired_ms: std.AutoHashMapUnmanaged(u128, u64) = .empty,
+    trigger_watch_states: std.AutoHashMapUnmanaged(u128, model.TriggerWatchState) = .empty,
+    trigger_watch_actors: std.AutoHashMapUnmanaged(u128, u128) = .empty,
     active_rollback: ?model.RollbackIntent = null,
+    committed_rollbacks: std.AutoHashMapUnmanaged(u128, void) = .empty,
     last_lease: ?model.ExecutionLeaseRef = null,
     canceled: bool = false,
     total_message_count: u32 = 0,
+    active_tip_msg_id: ?u128 = null,
+    active_tip_dirty: bool = false,
 
     pub fn open(
         allocator: Allocator,
@@ -66,9 +85,11 @@ pub const ThreadStore = struct {
         var rel_buf: [64]u8 = undefined;
         const rel_path = try std.fmt.bufPrint(&rel_buf, "threads/{s}", .{tid_hex});
 
+        var transferred = false;
+
         try state_dir.createDirPath(io, rel_path);
         const thread_dir = try state_dir.openDir(io, rel_path, .{ .iterate = true });
-        errdefer thread_dir.close(io);
+        errdefer if (!transferred) thread_dir.close(io);
 
         const loaded_manifest = (try manifest_mod.Manifest.load(io, thread_dir)) orelse manifest_mod.Manifest{
             .history_id = thread_id,
@@ -78,19 +99,23 @@ pub const ThreadStore = struct {
         };
 
         var segs = try segments_mod.SegmentStore.open(allocator, io, thread_dir);
-        errdefer segs.deinit();
+        errdefer if (!transferred) segs.deinit();
 
         var wal = try log_mod.AppendLog.open(allocator, io, thread_dir, "events.wal", true);
-        errdefer wal.deinit();
+        errdefer if (!transferred) wal.deinit();
 
         var local_blobs: ?blobs_mod.BlobStore = null;
-        errdefer if (local_blobs) |*lb| lb.deinit();
+        errdefer if (!transferred) {
+            if (local_blobs) |*lb| lb.deinit();
+        };
         if (shared_blobs) |sb| {
             sb.retain();
         } else {
             local_blobs = try blobs_mod.BlobStore.open(allocator, io, thread_dir, "blobs", 4 * 1024 * 1024);
         }
-        errdefer if (shared_blobs) |sb| sb.release();
+        errdefer if (!transferred) {
+            if (shared_blobs) |sb| sb.release();
+        };
 
         var self = ThreadStore{
             .allocator = allocator,
@@ -103,6 +128,7 @@ pub const ThreadStore = struct {
             .shared_blobs = shared_blobs,
             .local_blobs = local_blobs,
         };
+        transferred = true;
         errdefer self.deinit();
 
         try self.replayPersisted();
@@ -116,6 +142,7 @@ pub const ThreadStore = struct {
         var mit = self.messages.valueIterator();
         while (mit.next()) |m| m.deinit(self.allocator);
         self.messages.deinit(self.allocator);
+        self.msg_actors.deinit(self.allocator);
 
         self.sealed_msg_ids.deinit(self.allocator);
         self.sealed_pages.deinit(self.allocator);
@@ -137,6 +164,7 @@ pub const ThreadStore = struct {
         var qit = self.queue_items.valueIterator();
         while (qit.next()) |q| q.deinit(self.allocator);
         self.queue_items.deinit(self.allocator);
+        self.queue_actors.deinit(self.allocator);
 
         var tkit = self.tasks.valueIterator();
         while (tkit.next()) |t| t.deinit(self.allocator);
@@ -146,14 +174,21 @@ pub const ThreadStore = struct {
         while (mbit.next()) |mb| mb.deinit(self.allocator);
         self.mailbox.deinit(self.allocator);
         self.mailbox_order.deinit(self.allocator);
+        self.acked_mailbox.deinit(self.allocator);
 
         var trit = self.triggers.valueIterator();
         while (trit.next()) |tr| tr.deinit(self.allocator);
         self.triggers.deinit(self.allocator);
+        self.trigger_lww.deinit(self.allocator);
 
         self.fired_triggers.deinit(self.allocator);
+        self.fired_trigger_records.deinit(self.allocator);
+        self.trigger_last_fired_ms.deinit(self.allocator);
+        self.trigger_watch_states.deinit(self.allocator);
+        self.trigger_watch_actors.deinit(self.allocator);
 
         if (self.active_rollback) |*rb| rb.deinit(self.allocator);
+        self.committed_rollbacks.deinit(self.allocator);
 
         if (self.shared_blobs) |sb| sb.release();
         if (self.local_blobs) |*lb| lb.deinit();
@@ -214,22 +249,36 @@ pub const ThreadStore = struct {
         return try self.local_blobs.?.get(allocator, oid);
     }
 
-    fn registerChild(self: *ThreadStore, parent_id: ?u128, child_id: u128) !void {
+    fn reserveChildSlot(self: *ThreadStore, parent_id: ?u128) !void {
         if (parent_id) |pid| {
             const gop = try self.children_index.getOrPut(self.allocator, pid);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .empty;
             }
-            for (gop.value_ptr.items) |existing| {
+            try gop.value_ptr.ensureUnusedCapacity(self.allocator, 1);
+        } else {
+            try self.root_children.ensureUnusedCapacity(self.allocator, 1);
+        }
+    }
+
+    fn registerChildAssumeCapacity(self: *ThreadStore, parent_id: ?u128, child_id: u128) void {
+        if (parent_id) |pid| {
+            const list = self.children_index.getPtr(pid).?;
+            for (list.items) |existing| {
                 if (existing == child_id) return;
             }
-            try gop.value_ptr.append(self.allocator, child_id);
+            list.appendAssumeCapacity(child_id);
         } else {
             for (self.root_children.items) |existing| {
                 if (existing == child_id) return;
             }
-            try self.root_children.append(self.allocator, child_id);
+            self.root_children.appendAssumeCapacity(child_id);
         }
+    }
+
+    fn registerChild(self: *ThreadStore, parent_id: ?u128, child_id: u128) !void {
+        try self.reserveChildSlot(parent_id);
+        self.registerChildAssumeCapacity(parent_id, child_id);
     }
 
     pub fn getChildren(self: *const ThreadStore, parent_id: ?u128) []const u128 {
@@ -240,6 +289,34 @@ pub const ThreadStore = struct {
             return &.{};
         }
         return self.root_children.items;
+    }
+
+    pub fn hasBranchChoice(self: *const ThreadStore, parent_id: ?u128) bool {
+        if (parent_id) |pid| {
+            return self.branch_choices.contains(pid);
+        }
+        return self.root_branch_choice != null;
+    }
+
+    pub fn isSealed(self: *const ThreadStore, msg_id: ?u128) bool {
+        const mid = msg_id orelse return false;
+        return self.sealed_msg_ids.contains(mid);
+    }
+
+    pub fn loadMessageById(self: *ThreadStore, allocator: Allocator, msg_id: u128) !?model.Message {
+        if (self.messages.getPtr(msg_id)) |m| {
+            return try m.clone(allocator);
+        }
+        if (self.sealed_msg_ids.get(msg_id)) |page_id| {
+            var page = (try self.loadPage(allocator, page_id)) orelse return null;
+            defer page.deinit(allocator);
+            for (page.messages) |*m| {
+                if (m.msg_id == msg_id) {
+                    return try m.clone(allocator);
+                }
+            }
+        }
+        return null;
     }
 
     pub fn unsealedMessageCount(self: *const ThreadStore) usize {
@@ -349,9 +426,59 @@ pub const ThreadStore = struct {
         return try self.applyEventInMemory(&ev);
     }
 
+    fn applyMessageUpsert(self: *ThreadStore, ev: *const model.CausalEvent, msg: *const model.Message) !void {
+        if (self.sealed_msg_ids.contains(msg.msg_id)) return;
+        if (self.messages.getPtr(msg.msg_id)) |existing| {
+            const prev_actor = self.msg_actors.get(msg.msg_id) orelse 0;
+            if (model.lwwWins(msg.updated_ms, ev.actor, existing.updated_ms, prev_actor)) {
+                try self.msg_actors.ensureUnusedCapacity(self.allocator, 1);
+                const cloned = try msg.clone(self.allocator);
+                existing.deinit(self.allocator);
+                existing.* = cloned;
+                self.msg_actors.putAssumeCapacity(msg.msg_id, ev.actor);
+            }
+        } else {
+            try self.messages.ensureUnusedCapacity(self.allocator, 1);
+            try self.msg_actors.ensureUnusedCapacity(self.allocator, 1);
+            try self.reserveChildSlot(msg.parent_id);
+            const cloned = try msg.clone(self.allocator);
+            self.messages.putAssumeCapacity(msg.msg_id, cloned);
+            self.msg_actors.putAssumeCapacity(msg.msg_id, ev.actor);
+            self.registerChildAssumeCapacity(msg.parent_id, msg.msg_id);
+            self.total_message_count += 1;
+            if (!self.active_tip_dirty) {
+                if (msg.parent_id == self.active_tip_msg_id and self.getChildren(msg.parent_id).len == 1 and !self.hasBranchChoice(msg.parent_id)) {
+                    self.active_tip_msg_id = msg.msg_id;
+                } else {
+                    self.active_tip_dirty = true;
+                }
+            }
+        }
+    }
+
+    fn applyQueueUpsert(self: *ThreadStore, ev: *const model.CausalEvent, qi: *const model.QueueItem) !void {
+        if (self.queue_items.getPtr(qi.item_id)) |existing| {
+            const prev_actor = self.queue_actors.get(qi.item_id) orelse 0;
+            if (model.lwwWins(qi.updated_ms, ev.actor, existing.updated_ms, prev_actor)) {
+                try self.queue_actors.ensureUnusedCapacity(self.allocator, 1);
+                const cloned = try qi.clone(self.allocator);
+                existing.deinit(self.allocator);
+                existing.* = cloned;
+                self.queue_actors.putAssumeCapacity(qi.item_id, ev.actor);
+            }
+        } else {
+            try self.queue_items.ensureUnusedCapacity(self.allocator, 1);
+            try self.queue_actors.ensureUnusedCapacity(self.allocator, 1);
+            const cloned = try qi.clone(self.allocator);
+            self.queue_items.putAssumeCapacity(qi.item_id, cloned);
+            self.queue_actors.putAssumeCapacity(qi.item_id, ev.actor);
+        }
+    }
+
     fn applyEventInMemory(self: *ThreadStore, ev: *const model.CausalEvent) !bool {
         if (self.seen_events.contains(ev.event_id)) return false;
         try self.seen_events.put(self.allocator, ev.event_id, {});
+        errdefer _ = self.seen_events.remove(ev.event_id);
         if (ev.lamport > self.lamport) {
             self.lamport = ev.lamport;
         }
@@ -359,75 +486,65 @@ pub const ThreadStore = struct {
         switch (ev.event) {
             .thread_created => |*tm| {
                 if (self.meta) |*existing| {
-                    if (tm.updated_ms >= existing.updated_ms) {
-                        var cloned = try tm.clone(self.allocator);
-                        errdefer cloned.deinit(self.allocator);
+                    if (model.lwwWins(tm.updated_ms, ev.actor, existing.updated_ms, self.meta_updated_actor)) {
+                        const cloned = try tm.clone(self.allocator);
                         existing.deinit(self.allocator);
                         existing.* = cloned;
+                        self.meta_updated_actor = ev.actor;
+                        if (model.lwwWins(tm.updated_ms, ev.actor, self.bindings_updated_ms, self.bindings_updated_actor)) {
+                            self.bindings_updated_ms = tm.updated_ms;
+                            self.bindings_updated_actor = ev.actor;
+                        }
                     }
                 } else {
                     self.meta = try tm.clone(self.allocator);
+                    self.meta_updated_actor = ev.actor;
+                    self.bindings_updated_ms = tm.updated_ms;
+                    self.bindings_updated_actor = ev.actor;
                 }
             },
             .thread_updated => |*tu| {
                 if (self.meta) |*m| {
-                    if (tu.title) |t| {
-                        const nt = try self.allocator.dupe(u8, t);
+                    if (!model.lwwWins(tu.updated_ms, ev.actor, m.updated_ms, self.meta_updated_actor)) {
+                        return false;
+                    }
+                    const nt: ?[]u8 = if (tu.title) |t| (if (t.len > 0) try self.allocator.dupe(u8, t) else &.{}) else null;
+                    errdefer if (nt) |s| if (s.len > 0) self.allocator.free(s);
+                    const nm: ?[]u8 = if (tu.default_model) |dm| try self.allocator.dupe(u8, dm) else null;
+
+                    if (nt) |s| {
                         if (m.title.len > 0) self.allocator.free(m.title);
-                        m.title = nt;
+                        m.title = s;
                     }
                     if (tu.default_provider) |p| m.default_provider = p;
-                    if (tu.default_model) |dm| {
-                        const nm = try self.allocator.dupe(u8, dm);
+                    if (nm) |s| {
                         if (m.default_model) |old| self.allocator.free(old);
-                        m.default_model = nm;
+                        m.default_model = s;
                     }
                     if (tu.status) |s| m.status = s;
                     if (tu.budget) |b| m.budget = b;
-                    if (tu.updated_ms > m.updated_ms) m.updated_ms = tu.updated_ms;
+                    m.updated_ms = tu.updated_ms;
+                    self.meta_updated_actor = ev.actor;
                 }
             },
             .bindings_updated => |*bu| {
                 if (self.meta) |*m| {
+                    if (!model.lwwWins(bu.updated_ms, ev.actor, self.bindings_updated_ms, self.bindings_updated_actor)) {
+                        return false;
+                    }
                     const nb = try model.cloneBindings(self.allocator, bu.bindings);
                     model.freeBindings(self.allocator, m.bindings);
                     m.bindings = nb;
+                    self.bindings_updated_ms = bu.updated_ms;
+                    self.bindings_updated_actor = ev.actor;
                     if (bu.updated_ms > m.updated_ms) m.updated_ms = bu.updated_ms;
                 }
             },
             .message_appended => |*msg| {
-                if (self.sealed_msg_ids.contains(msg.msg_id)) return true;
-                if (self.messages.getPtr(msg.msg_id)) |existing| {
-                    if (msg.updated_ms >= existing.updated_ms) {
-                        var cloned = try msg.clone(self.allocator);
-                        errdefer cloned.deinit(self.allocator);
-                        existing.deinit(self.allocator);
-                        existing.* = cloned;
-                    }
-                } else {
-                    var cloned = try msg.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
-                    try self.messages.put(self.allocator, msg.msg_id, cloned);
-                    try self.registerChild(msg.parent_id, msg.msg_id);
-                    self.total_message_count += 1;
-                }
+                try self.applyMessageUpsert(ev, msg);
             },
             .message_updated => |*msg| {
-                if (self.sealed_msg_ids.contains(msg.msg_id)) return true;
-                if (self.messages.getPtr(msg.msg_id)) |existing| {
-                    if (msg.updated_ms >= existing.updated_ms) {
-                        var cloned = try msg.clone(self.allocator);
-                        errdefer cloned.deinit(self.allocator);
-                        existing.deinit(self.allocator);
-                        existing.* = cloned;
-                    }
-                } else {
-                    var cloned = try msg.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
-                    try self.messages.put(self.allocator, msg.msg_id, cloned);
-                    try self.registerChild(msg.parent_id, msg.msg_id);
-                    self.total_message_count += 1;
-                }
+                try self.applyMessageUpsert(ev, msg);
             },
             .tool_call_put => |*tc| {
                 const gop = try self.tool_calls.getOrPut(self.allocator, tc.msg_id);
@@ -436,121 +553,143 @@ pub const ThreadStore = struct {
                 }
                 for (gop.value_ptr.items) |*existing| {
                     if (std.mem.eql(u8, existing.call_id, tc.call_id)) {
-                        var cloned = try tc.clone(self.allocator);
-                        errdefer cloned.deinit(self.allocator);
+                        const cloned = try tc.clone(self.allocator);
                         existing.deinit(self.allocator);
                         existing.* = cloned;
                         return true;
                     }
                 }
-                var cloned = try tc.clone(self.allocator);
-                errdefer cloned.deinit(self.allocator);
-                try gop.value_ptr.append(self.allocator, cloned);
+                try gop.value_ptr.ensureUnusedCapacity(self.allocator, 1);
+                const cloned = try tc.clone(self.allocator);
+                gop.value_ptr.appendAssumeCapacity(cloned);
             },
             .queue_enqueued => |*qi| {
-                if (self.queue_items.getPtr(qi.item_id)) |existing| {
-                    if (qi.updated_ms >= existing.updated_ms) {
-                        var cloned = try qi.clone(self.allocator);
-                        errdefer cloned.deinit(self.allocator);
-                        existing.deinit(self.allocator);
-                        existing.* = cloned;
-                    }
-                } else {
-                    var cloned = try qi.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
-                    try self.queue_items.put(self.allocator, qi.item_id, cloned);
-                }
+                try self.applyQueueUpsert(ev, qi);
             },
             .queue_updated => |*qi| {
-                if (self.queue_items.getPtr(qi.item_id)) |existing| {
-                    if (qi.updated_ms >= existing.updated_ms) {
-                        var cloned = try qi.clone(self.allocator);
-                        errdefer cloned.deinit(self.allocator);
-                        existing.deinit(self.allocator);
-                        existing.* = cloned;
-                    }
-                } else {
-                    var cloned = try qi.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
-                    try self.queue_items.put(self.allocator, qi.item_id, cloned);
-                }
+                try self.applyQueueUpsert(ev, qi);
             },
             .branch_choice_set => |bc| {
                 if (bc.parent_id) |pid| {
                     if (self.branch_choices.getPtr(pid)) |existing| {
                         if (bc.winsOver(existing.*)) {
                             existing.* = bc;
+                            self.active_tip_dirty = true;
                         }
                     } else {
                         try self.branch_choices.put(self.allocator, pid, bc);
+                        self.active_tip_dirty = true;
                     }
                 } else {
                     if (self.root_branch_choice) |existing| {
                         if (bc.winsOver(existing)) {
                             self.root_branch_choice = bc;
+                            self.active_tip_dirty = true;
                         }
                     } else {
                         self.root_branch_choice = bc;
+                        self.active_tip_dirty = true;
                     }
                 }
             },
             .task_created => |*t| {
                 if (self.tasks.getPtr(t.task_id)) |existing| {
                     if (self.canApplyTaskUpdate(t)) {
-                        var cloned = try t.clone(self.allocator);
-                        errdefer cloned.deinit(self.allocator);
+                        const cloned = try t.clone(self.allocator);
                         existing.deinit(self.allocator);
                         existing.* = cloned;
                     }
                 } else {
-                    var cloned = try t.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
-                    try self.tasks.put(self.allocator, t.task_id, cloned);
+                    try self.tasks.ensureUnusedCapacity(self.allocator, 1);
+                    const cloned = try t.clone(self.allocator);
+                    self.tasks.putAssumeCapacity(t.task_id, cloned);
                 }
             },
             .task_updated => |*t| {
                 if (!self.canApplyTaskUpdate(t)) return false;
                 if (self.tasks.getPtr(t.task_id)) |existing| {
-                    var cloned = try t.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
+                    const cloned = try t.clone(self.allocator);
                     existing.deinit(self.allocator);
                     existing.* = cloned;
                 } else {
-                    var cloned = try t.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
-                    try self.tasks.put(self.allocator, t.task_id, cloned);
+                    try self.tasks.ensureUnusedCapacity(self.allocator, 1);
+                    const cloned = try t.clone(self.allocator);
+                    self.tasks.putAssumeCapacity(t.task_id, cloned);
                 }
             },
             .mailbox_received => |*mb| {
                 if (self.mailbox.contains(mb.item_id)) return false;
-                var cloned = try mb.clone(self.allocator);
-                errdefer cloned.deinit(self.allocator);
-                try self.mailbox.put(self.allocator, mb.item_id, cloned);
-                try self.mailbox_order.append(self.allocator, mb.item_id);
+                try self.mailbox.ensureUnusedCapacity(self.allocator, 1);
+                try self.mailbox_order.ensureUnusedCapacity(self.allocator, 1);
+                const cloned = try mb.clone(self.allocator);
+                self.mailbox.putAssumeCapacity(mb.item_id, cloned);
+                self.mailbox_order.appendAssumeCapacity(mb.item_id);
+            },
+            .mailbox_acked => |ack| {
+                if (self.acked_mailbox.getPtr(ack.item_id)) |prev| {
+                    if (ack.acked_ms > prev.*) prev.* = ack.acked_ms;
+                } else {
+                    try self.acked_mailbox.put(self.allocator, ack.item_id, ack.acked_ms);
+                }
             },
             .trigger_put => |*tr| {
+                if (self.trigger_lww.get(tr.trigger_id)) |prev| {
+                    if (!model.lwwWins(ev.lamport, ev.actor, prev.lamport, prev.actor)) {
+                        return false;
+                    }
+                }
+                try self.trigger_lww.ensureUnusedCapacity(self.allocator, 1);
                 if (self.triggers.getPtr(tr.trigger_id)) |existing| {
-                    var cloned = try tr.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
+                    const cloned = try tr.clone(self.allocator);
                     existing.deinit(self.allocator);
                     existing.* = cloned;
                 } else {
-                    var cloned = try tr.clone(self.allocator);
-                    errdefer cloned.deinit(self.allocator);
-                    try self.triggers.put(self.allocator, tr.trigger_id, cloned);
+                    try self.triggers.ensureUnusedCapacity(self.allocator, 1);
+                    const cloned = try tr.clone(self.allocator);
+                    self.triggers.putAssumeCapacity(tr.trigger_id, cloned);
                 }
+                self.trigger_lww.putAssumeCapacity(tr.trigger_id, .{
+                    .lamport = ev.lamport,
+                    .actor = ev.actor,
+                });
             },
             .trigger_fired => |tf| {
                 if (self.fired_triggers.contains(tf.dedup_key)) return false;
-                try self.fired_triggers.put(self.allocator, tf.dedup_key, tf.fired_ms);
+                try self.fired_triggers.ensureUnusedCapacity(self.allocator, 1);
+                try self.fired_trigger_records.ensureUnusedCapacity(self.allocator, 1);
+                try self.trigger_last_fired_ms.ensureUnusedCapacity(self.allocator, 1);
+                self.fired_triggers.putAssumeCapacity(tf.dedup_key, tf.fired_ms);
+                self.fired_trigger_records.putAssumeCapacity(tf.dedup_key, tf);
+                if (self.trigger_last_fired_ms.getPtr(tf.trigger_id)) |prev_ms| {
+                    if (tf.fired_ms > prev_ms.*) prev_ms.* = tf.fired_ms;
+                } else {
+                    self.trigger_last_fired_ms.putAssumeCapacity(tf.trigger_id, tf.fired_ms);
+                }
+            },
+            .trigger_state_put => |ws| {
+                if (self.trigger_watch_states.getPtr(ws.trigger_id)) |existing| {
+                    const prev_actor = self.trigger_watch_actors.get(ws.trigger_id) orelse 0;
+                    if (!model.lwwWins(ws.updated_ms, ev.actor, existing.updated_ms, prev_actor)) {
+                        return false;
+                    }
+                    try self.trigger_watch_actors.ensureUnusedCapacity(self.allocator, 1);
+                    existing.* = ws;
+                    self.trigger_watch_actors.putAssumeCapacity(ws.trigger_id, ev.actor);
+                } else {
+                    try self.trigger_watch_states.ensureUnusedCapacity(self.allocator, 1);
+                    try self.trigger_watch_actors.ensureUnusedCapacity(self.allocator, 1);
+                    self.trigger_watch_states.putAssumeCapacity(ws.trigger_id, ws);
+                    self.trigger_watch_actors.putAssumeCapacity(ws.trigger_id, ev.actor);
+                }
             },
             .rollback_begin => |*rb| {
-                var cloned = try rb.clone(self.allocator);
-                errdefer cloned.deinit(self.allocator);
+                if (self.committed_rollbacks.contains(rb.intent_id)) return false;
+                const cloned = try rb.clone(self.allocator);
                 if (self.active_rollback) |*old| old.deinit(self.allocator);
                 self.active_rollback = cloned;
             },
             .rollback_space_done => |rsd| {
+                if (self.committed_rollbacks.contains(rsd.intent_id)) return false;
                 if (self.active_rollback) |*rb| {
                     if (rb.intent_id == rsd.intent_id) {
                         try rb.markSpaceCompleted(self.allocator, rsd.space_id);
@@ -558,6 +697,7 @@ pub const ThreadStore = struct {
                 }
             },
             .rollback_commit => |rc| {
+                try self.committed_rollbacks.put(self.allocator, rc.intent_id, {});
                 if (self.active_rollback) |*rb| {
                     if (rb.intent_id == rc.intent_id) {
                         rb.deinit(self.allocator);
@@ -635,12 +775,34 @@ pub const ThreadStore = struct {
                 var owned = kv.value;
                 owned.deinit(self.allocator);
             }
-            if (mid != ps.last_msg_id) {
-                if (self.children_index.fetchRemove(mid)) |ckv| {
-                    var list = ckv.value;
-                    list.deinit(self.allocator);
+            _ = self.msg_actors.remove(mid);
+        }
+
+        if (evict_ids.items.len < ps.msg_count) {
+            if (try self.loadPage(self.allocator, ps.page_id)) |loaded_page| {
+                var page = loaded_page;
+                defer page.deinit(self.allocator);
+                for (page.messages) |*m| {
+                    const already_sealed = self.sealed_msg_ids.contains(m.msg_id);
+                    const was_hot = self.messages.contains(m.msg_id);
+                    if (!already_sealed) {
+                        try self.sealed_msg_ids.put(self.allocator, m.msg_id, ps.page_id);
+                        if (!was_hot) {
+                            self.total_message_count += 1;
+                        }
+                    }
+                    try self.registerChild(m.parent_id, m.msg_id);
+                    if (self.messages.fetchRemove(m.msg_id)) |kv| {
+                        var owned = kv.value;
+                        owned.deinit(self.allocator);
+                    }
+                    _ = self.msg_actors.remove(m.msg_id);
                 }
             }
+        }
+
+        if (self.active_tip_msg_id == null and ps.msg_count > 0) {
+            self.active_tip_dirty = true;
         }
     }
 
@@ -710,28 +872,81 @@ pub const ThreadStore = struct {
     }
 
     fn chooseChild(self: *const ThreadStore, parent_id: ?u128, children: []const u128) ?u128 {
-        if (children.len == 0) return null;
-        if (children.len == 1) return children[0];
         const maybe_choice: ?model.BranchChoice = if (parent_id) |pid|
             self.branch_choices.get(pid)
         else
             self.root_branch_choice;
         if (maybe_choice) |bc| {
+            if (bc.selected_child_id == 0) return null;
             for (children) |cid| {
                 if (cid == bc.selected_child_id) return cid;
             }
         }
-        var best = children[0];
+        if (children.len == 0) return null;
+        if (children.len == 1) return children[0];
+        var best: ?u128 = null;
+        var best_hot = false;
         var best_ms: u64 = 0;
-        if (self.messages.getPtr(best)) |bm| best_ms = bm.created_ms;
-        for (children[1..]) |cid| {
-            const cms: u64 = if (self.messages.getPtr(cid)) |cm| cm.created_ms else 0;
-            if (cms > best_ms or (cms == best_ms and cid > best)) {
+        for (children) |cid| {
+            const hot_msg = self.messages.getPtr(cid);
+            const is_hot = hot_msg != null;
+            const cms: u64 = if (hot_msg) |cm| cm.created_ms else 0;
+            if (best == null) {
+                best = cid;
+                best_hot = is_hot;
+                best_ms = cms;
+                continue;
+            }
+            if (is_hot and !best_hot) {
+                best = cid;
+                best_hot = true;
+                best_ms = cms;
+            } else if (is_hot == best_hot and (cms > best_ms or (cms == best_ms and cid > best.?))) {
                 best = cid;
                 best_ms = cms;
             }
         }
         return best;
+    }
+
+    pub fn activeTipMsgId(self: *ThreadStore) !?u128 {
+        if (!self.active_tip_dirty) return self.active_tip_msg_id;
+
+        if (self.head_page != null) {
+            var touches_sealed = self.root_branch_choice != null;
+            if (!touches_sealed) {
+                var bit = self.branch_choices.keyIterator();
+                while (bit.next()) |k| {
+                    if (self.sealed_msg_ids.contains(k.*)) {
+                        touches_sealed = true;
+                        break;
+                    }
+                }
+            }
+            if (touches_sealed) {
+                const chain = try self.activeChain(self.allocator);
+                defer freeMessages(self.allocator, chain);
+                const tip: ?u128 = if (chain.len > 0) chain[chain.len - 1].msg_id else null;
+                self.active_tip_msg_id = tip;
+                self.active_tip_dirty = false;
+                return tip;
+            }
+        }
+
+        var tip: ?u128 = self.sealed_tail_msg_id;
+        var cur_parent: ?u128 = self.sealed_tail_msg_id;
+        var steps: usize = 0;
+        const max_steps = self.messages.count() + 1;
+        while (steps < max_steps) : (steps += 1) {
+            const children = self.getChildren(cur_parent);
+            const next_id = self.chooseChild(cur_parent, children) orelse break;
+            if (!self.messages.contains(next_id)) break;
+            tip = next_id;
+            cur_parent = next_id;
+        }
+        self.active_tip_msg_id = tip;
+        self.active_tip_dirty = false;
+        return tip;
     }
 
     pub fn activeChain(self: *ThreadStore, allocator: Allocator) ![]model.Message {
@@ -743,6 +958,7 @@ pub const ThreadStore = struct {
 
         var start_unsealed_parent: ?u128 = self.sealed_tail_msg_id;
         var diverted = false;
+        var stop_walking = false;
 
         if (self.head_page != null) {
             var pages_rev: std.ArrayList(model.MessagePage) = .empty;
@@ -770,7 +986,9 @@ pub const ThreadStore = struct {
             }
 
             if (self.root_branch_choice) |rbc| {
-                if (first_sealed_id == null or rbc.selected_child_id != first_sealed_id.?) {
+                if (rbc.selected_child_id == 0) {
+                    stop_walking = true;
+                } else if (first_sealed_id == null or rbc.selected_child_id != first_sealed_id.?) {
                     if (self.messages.contains(rbc.selected_child_id)) {
                         start_unsealed_parent = null;
                         diverted = true;
@@ -778,7 +996,7 @@ pub const ThreadStore = struct {
                 }
             }
 
-            if (!diverted) {
+            if (!diverted and !stop_walking) {
                 var pi = pages_rev.items.len;
                 while (pi > 0) {
                     pi -= 1;
@@ -786,6 +1004,10 @@ pub const ThreadStore = struct {
                     for (page.messages) |*m| {
                         try out.append(allocator, try m.clone(allocator));
                         if (self.branch_choices.get(m.msg_id)) |bc| {
+                            if (bc.selected_child_id == 0) {
+                                stop_walking = true;
+                                break;
+                            }
                             if (self.messages.contains(bc.selected_child_id)) {
                                 start_unsealed_parent = m.msg_id;
                                 diverted = true;
@@ -793,20 +1015,22 @@ pub const ThreadStore = struct {
                             }
                         }
                     }
-                    if (diverted) break;
+                    if (diverted or stop_walking) break;
                 }
             }
         }
 
-        var cur_parent: ?u128 = start_unsealed_parent;
-        var steps: usize = 0;
-        const max_steps = self.messages.count() + 1;
-        while (steps < max_steps) : (steps += 1) {
-            const children = self.getChildren(cur_parent);
-            const next_id = self.chooseChild(cur_parent, children) orelse break;
-            const msg = self.messages.getPtr(next_id) orelse break;
-            try out.append(allocator, try msg.clone(allocator));
-            cur_parent = next_id;
+        if (!stop_walking) {
+            var cur_parent: ?u128 = start_unsealed_parent;
+            var steps: usize = 0;
+            const max_steps = self.messages.count() + 1;
+            while (steps < max_steps) : (steps += 1) {
+                const children = self.getChildren(cur_parent);
+                const next_id = self.chooseChild(cur_parent, children) orelse break;
+                const msg = self.messages.getPtr(next_id) orelse break;
+                try out.append(allocator, try msg.clone(allocator));
+                cur_parent = next_id;
+            }
         }
 
         return try out.toOwnedSlice(allocator);
@@ -851,7 +1075,7 @@ pub const ThreadStore = struct {
                 if (m.status == .running) {
                     var ev = try self.appendEvent(local_runner_id, .{ .thread_updated = .{
                         .status = .interrupted,
-                        .updated_ms = now,
+                        .updated_ms = @max(now, m.updated_ms + 1),
                     } });
                     ev.deinit(self.allocator);
                 }
@@ -863,7 +1087,7 @@ pub const ThreadStore = struct {
 
     pub fn taskChildrenReady(self: *const ThreadStore, task_id: u128) bool {
         const task = self.tasks.getPtr(task_id) orelse return false;
-        if (task.depends_on.len == 0) return true;
+        if (task.depends_on.len == 0) return task.join_quorum == 0;
         var completed: usize = 0;
         for (task.depends_on) |dep_id| {
             if (self.tasks.getPtr(dep_id)) |dep| {
@@ -873,8 +1097,29 @@ pub const ThreadStore = struct {
         const required: usize = if (task.join_quorum == 0)
             task.depends_on.len
         else
-            @min(@as(usize, task.join_quorum), task.depends_on.len);
+            @as(usize, task.join_quorum);
         return completed >= required;
+    }
+
+    pub fn taskQuorumUnsatisfiable(self: *const ThreadStore, task_id: u128) bool {
+        const task = self.tasks.getPtr(task_id) orelse return false;
+        const required: usize = if (task.join_quorum == 0)
+            task.depends_on.len
+        else
+            @as(usize, task.join_quorum);
+        if (required == 0) return false;
+        var completed: usize = 0;
+        var non_terminal: usize = 0;
+        for (task.depends_on) |dep_id| {
+            if (self.tasks.getPtr(dep_id)) |dep| {
+                if (dep.status == .completed) {
+                    completed += 1;
+                } else if (!dep.status.isTerminal()) {
+                    non_terminal += 1;
+                }
+            }
+        }
+        return completed + non_terminal < required;
     }
 
     pub fn evaluateReadyTasks(self: *ThreadStore) !usize {
@@ -882,30 +1127,68 @@ pub const ThreadStore = struct {
     }
 
     pub fn evaluateReadyTasksWithActor(self: *ThreadStore, actor: u128) !usize {
+        var total_ready: usize = 0;
         var ready_ids: std.ArrayList(u128) = .empty;
         defer ready_ids.deinit(self.allocator);
+        var fail_ids: std.ArrayList(u128) = .empty;
+        defer fail_ids.deinit(self.allocator);
 
-        var it = self.tasks.iterator();
-        while (it.next()) |entry| {
-            const task = entry.value_ptr;
-            if (task.status != .pending) continue;
-            if (self.taskChildrenReady(task.task_id)) {
-                try ready_ids.append(self.allocator, task.task_id);
+        while (true) {
+            ready_ids.clearRetainingCapacity();
+            fail_ids.clearRetainingCapacity();
+
+            var it = self.tasks.iterator();
+            while (it.next()) |entry| {
+                const task = entry.value_ptr;
+                if (task.status != .pending) continue;
+                if (self.taskChildrenReady(task.task_id)) {
+                    try ready_ids.append(self.allocator, task.task_id);
+                } else if (self.taskQuorumUnsatisfiable(task.task_id)) {
+                    try fail_ids.append(self.allocator, task.task_id);
+                }
             }
+
+            if (ready_ids.items.len == 0 and fail_ids.items.len == 0) break;
+
+            const now = id.nowMs(self.io);
+            for (ready_ids.items) |tid| {
+                const cur = self.tasks.getPtr(tid) orelse continue;
+                var updated = try cur.clone(self.allocator);
+                defer updated.deinit(self.allocator);
+                updated.status = .ready;
+                updated.updated_ms = @max(now, updated.updated_ms + 1);
+                var ev = try self.appendEvent(actor, .{ .task_updated = updated });
+                ev.deinit(self.allocator);
+                total_ready += 1;
+            }
+
+            for (fail_ids.items) |tid| {
+                const cur = self.tasks.getPtr(tid) orelse continue;
+                var updated = try cur.clone(self.allocator);
+                defer updated.deinit(self.allocator);
+                const msg_copy = try self.allocator.dupe(u8, "join quorum unsatisfiable");
+                if (updated.err_msg) |old| self.allocator.free(old);
+                updated.err_msg = msg_copy;
+                updated.status = .failed;
+                updated.updated_ms = @max(now, updated.updated_ms + 1);
+                var ev = try self.appendEvent(actor, .{ .task_updated = updated });
+                ev.deinit(self.allocator);
+
+                if (self.meta) |pm| {
+                    var pbudget = pm.budget;
+                    pbudget.refundChild(updated.budget);
+                    var buev = try self.appendEvent(actor, .{ .thread_updated = .{
+                        .budget = pbudget,
+                        .updated_ms = @max(now, pm.updated_ms + 1),
+                    } });
+                    buev.deinit(self.allocator);
+                }
+            }
+
+            if (fail_ids.items.len == 0) break;
         }
 
-        const now = id.nowMs(self.io);
-        for (ready_ids.items) |tid| {
-            const cur = self.tasks.getPtr(tid) orelse continue;
-            var updated = try cur.clone(self.allocator);
-            defer updated.deinit(self.allocator);
-            updated.status = .ready;
-            updated.updated_ms = @max(now, updated.updated_ms + 1);
-            var ev = try self.appendEvent(actor, .{ .task_updated = updated });
-            ev.deinit(self.allocator);
-        }
-
-        return ready_ids.items.len;
+        return total_ready;
     }
 
     pub fn pendingRollback(self: *const ThreadStore) ?*const model.RollbackIntent {
@@ -913,7 +1196,198 @@ pub const ThreadStore = struct {
         return null;
     }
 
+    pub fn compactWal(self: *ThreadStore) !void {
+        var payloads: std.ArrayList([]u8) = .empty;
+        defer {
+            for (payloads.items) |p| self.allocator.free(p);
+            payloads.deinit(self.allocator);
+        }
+
+        const default_actor: u128 = if (self.meta_updated_actor != 0) self.meta_updated_actor else self.thread_id;
+
+        const appendSnapshotEvent = struct {
+            fn call(
+                allocator: Allocator,
+                io: Io,
+                list: *std.ArrayList([]u8),
+                actor: u128,
+                lamport: u64,
+                event: model.ThreadEvent,
+            ) !void {
+                const ev = model.CausalEvent{
+                    .event_id = id.newUuidV7(io),
+                    .lamport = lamport,
+                    .actor = actor,
+                    .event = event,
+                };
+                const enc = try ev.encodeAlloc(allocator);
+                errdefer allocator.free(enc);
+                try list.append(allocator, enc);
+            }
+        }.call;
+
+        if (self.meta) |*m| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .thread_created = m.* });
+            if (self.bindings_updated_ms != m.updated_ms or self.bindings_updated_actor != default_actor) {
+                try appendSnapshotEvent(self.allocator, self.io, &payloads, self.bindings_updated_actor, self.lamport, .{ .bindings_updated = .{
+                    .bindings = m.bindings,
+                    .updated_ms = self.bindings_updated_ms,
+                } });
+            }
+        }
+
+        for (self.sealed_pages.items) |sp| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .page_sealed = .{
+                .page_id = sp.page_id,
+                .prev_page = sp.prev_page,
+                .first_msg_id = sp.first_msg_id,
+                .last_msg_id = sp.last_msg_id,
+                .msg_count = sp.msg_count,
+                .sealed_ms = sp.sealed_ms,
+            } });
+        }
+
+        var msg_list: std.ArrayList(*const model.Message) = .empty;
+        defer msg_list.deinit(self.allocator);
+        var mit = self.messages.valueIterator();
+        while (mit.next()) |m| try msg_list.append(self.allocator, m);
+        std.mem.sort(*const model.Message, msg_list.items, {}, struct {
+            fn lt(_: void, a: *const model.Message, b: *const model.Message) bool {
+                if (a.created_ms != b.created_ms) return a.created_ms < b.created_ms;
+                return a.msg_id < b.msg_id;
+            }
+        }.lt);
+        for (msg_list.items) |m| {
+            const m_actor = self.msg_actors.get(m.msg_id) orelse default_actor;
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, m_actor, self.lamport, .{ .message_appended = m.* });
+        }
+
+        if (self.root_branch_choice) |rbc| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, rbc.actor, @max(self.lamport, rbc.lamport), .{ .branch_choice_set = rbc });
+        }
+        var bit = self.branch_choices.valueIterator();
+        while (bit.next()) |bc| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, bc.actor, @max(self.lamport, bc.lamport), .{ .branch_choice_set = bc.* });
+        }
+
+        var tcit = self.tool_calls.valueIterator();
+        while (tcit.next()) |list| {
+            for (list.items) |*tc| {
+                try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .tool_call_put = tc.* });
+            }
+        }
+
+        var qit = self.queue_items.valueIterator();
+        while (qit.next()) |qi| {
+            const q_actor = self.queue_actors.get(qi.item_id) orelse default_actor;
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, q_actor, self.lamport, .{ .queue_enqueued = qi.* });
+        }
+
+        var tkit = self.tasks.valueIterator();
+        while (tkit.next()) |t| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .task_created = t.* });
+        }
+
+        for (self.mailbox_order.items) |mid| {
+            if (self.mailbox.getPtr(mid)) |mb| {
+                try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .mailbox_received = mb.* });
+            }
+        }
+
+        var ack_it = self.acked_mailbox.iterator();
+        while (ack_it.next()) |entry| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .mailbox_acked = .{
+                .item_id = entry.key_ptr.*,
+                .acked_ms = entry.value_ptr.*,
+            } });
+        }
+
+        var trit = self.triggers.valueIterator();
+        while (trit.next()) |tr| {
+            const stamp = self.trigger_lww.get(tr.trigger_id) orelse LwwStamp{
+                .lamport = self.lamport,
+                .actor = default_actor,
+            };
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, stamp.actor, stamp.lamport, .{ .trigger_put = tr.* });
+        }
+
+        var ftrit = self.fired_trigger_records.valueIterator();
+        while (ftrit.next()) |tf| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, tf.runner_id, self.lamport, .{ .trigger_fired = tf.* });
+        }
+
+        var wsit = self.trigger_watch_states.valueIterator();
+        while (wsit.next()) |ws| {
+            const ws_actor = self.trigger_watch_actors.get(ws.trigger_id) orelse default_actor;
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, ws_actor, self.lamport, .{ .trigger_state_put = ws.* });
+        }
+
+        if (self.active_rollback) |*rb| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .rollback_begin = rb.* });
+        }
+
+        var cmit = self.committed_rollbacks.keyIterator();
+        while (cmit.next()) |cid| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .rollback_commit = .{
+                .intent_id = cid.*,
+                .committed_ms = id.nowMs(self.io),
+            } });
+        }
+
+        if (self.last_lease) |ll| {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, ll.holder_runner_id, self.lamport, .{ .lease_observed = ll });
+        }
+
+        if (self.canceled) {
+            try appendSnapshotEvent(self.allocator, self.io, &payloads, default_actor, self.lamport, .{ .cancel_tree = .{
+                .root_task_id = null,
+                .reason = null,
+                .canceled_ms = id.nowMs(self.io),
+            } });
+        }
+
+        const tmp_name = "events.wal.compact.tmp";
+        self.thread_dir.deleteFile(self.io, tmp_name) catch {};
+        var tmp_wal = try log_mod.AppendLog.open(self.allocator, self.io, self.thread_dir, tmp_name, false);
+        var tmp_closed = false;
+        var tmp_renamed = false;
+        errdefer {
+            if (!tmp_closed) tmp_wal.deinit();
+            if (!tmp_renamed) self.thread_dir.deleteFile(self.io, tmp_name) catch {};
+        }
+
+        const old_last_seq = self.wal.lastSeq();
+        const n_frames: u64 = @intCast(payloads.items.len);
+        const base_seq: u64 = if (n_frames > 0 and old_last_seq >= n_frames)
+            (old_last_seq - n_frames + 1)
+        else
+            1;
+        for (payloads.items, 0..) |p, idx| {
+            _ = try tmp_wal.appendWithSeq(base_seq + @as(u64, @intCast(idx)), FRAME_KIND_EVENT, 0, 0, p);
+        }
+        try tmp_wal.sync();
+        tmp_wal.deinit();
+        tmp_closed = true;
+
+        try self.thread_dir.rename(tmp_name, self.thread_dir, "events.wal", self.io);
+        tmp_renamed = true;
+
+        var new_wal = try log_mod.AppendLog.open(self.allocator, self.io, self.thread_dir, "events.wal", true);
+        if (new_wal.next_seq <= old_last_seq) {
+            new_wal.next_seq = old_last_seq + 1;
+        }
+        self.wal.deinit();
+        self.wal = new_wal;
+
+        self.manifest.wal_gen += 1;
+        self.manifest.generation += 1;
+        self.manifest.total_batches = @max(self.wal.lastSeq(), old_last_seq);
+        self.manifest.checkpoint_wall_ms = id.nowMs(self.io);
+        try self.manifest.saveAtomic(self.io, self.thread_dir);
+    }
+
     pub fn eventsSince(self: *ThreadStore, allocator: Allocator, after_seq: u64) ![]model.CausalEvent {
+        if (after_seq == std.math.maxInt(u64)) return &.{};
         const start_idx = self.wal.findIndexBySeq(after_seq + 1);
         const total = self.wal.count();
         if (start_idx >= total) return &.{};
@@ -956,9 +1430,11 @@ pub const CatalogStore = struct {
     runners: std.AutoHashMapUnmanaged(u128, model.RunnerInfo) = .empty,
 
     pub fn open(allocator: Allocator, io: Io, state_dir: Io.Dir) !CatalogStore {
+        var transferred = false;
+
         try state_dir.createDirPath(io, "catalog");
         const catalog_dir = try state_dir.openDir(io, "catalog", .{ .iterate = true });
-        errdefer catalog_dir.close(io);
+        errdefer if (!transferred) catalog_dir.close(io);
 
         const loaded_manifest = (try manifest_mod.Manifest.load(io, catalog_dir)) orelse manifest_mod.Manifest{
             .history_id = 0,
@@ -968,7 +1444,7 @@ pub const CatalogStore = struct {
         };
 
         var wal = try log_mod.AppendLog.open(allocator, io, catalog_dir, "catalog.wal", true);
-        errdefer wal.deinit();
+        errdefer if (!transferred) wal.deinit();
 
         var self = CatalogStore{
             .allocator = allocator,
@@ -977,6 +1453,7 @@ pub const CatalogStore = struct {
             .manifest = loaded_manifest,
             .wal = wal,
         };
+        transferred = true;
         errdefer self.deinit();
 
         const n = self.wal.count();
@@ -1179,6 +1656,7 @@ pub const CatalogStore = struct {
     }
 
     pub fn entriesSince(self: *CatalogStore, allocator: Allocator, after_seq: u64) ![]model.CatalogEntry {
+        if (after_seq == std.math.maxInt(u64)) return &.{};
         const start_idx = self.wal.findIndexBySeq(after_seq + 1);
         const total = self.wal.count();
         if (start_idx >= total) return &.{};

@@ -77,25 +77,70 @@ pub const SpaceAccess = enum(u8) {
     }
 };
 
+pub const EncodeError = Allocator.Error || error{RecordTooLarge};
+
 pub const GrantError = error{
     UnauthorizedSpaceGrant,
     AccessEscalation,
 };
 
+pub fn canonicalRelPath(raw: []const u8) error{InvalidMountRel}![]const u8 {
+    if (raw.len == 0) return "";
+    for (raw) |c| {
+        if (c == 0 or c == '\\') return error.InvalidMountRel;
+    }
+    if (raw[0] == '/') return error.InvalidMountRel;
+    const trimmed = if (raw[raw.len - 1] == '/') raw[0 .. raw.len - 1] else raw;
+    if (trimmed.len == 0) return error.InvalidMountRel;
+    var it = std.mem.splitScalar(u8, trimmed, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) return error.InvalidMountRel;
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return error.InvalidMountRel;
+    }
+    return trimmed;
+}
+
+pub fn mountRelWithin(parent_rel: ?[]const u8, child_rel: ?[]const u8) bool {
+    const p: []const u8 = if (parent_rel) |pr| (canonicalRelPath(pr) catch return false) else "";
+    const c: []const u8 = if (child_rel) |cr| (canonicalRelPath(cr) catch return false) else "";
+    if (p.len == 0) return true;
+    if (c.len < p.len) return false;
+    if (!std.mem.startsWith(u8, c, p)) return false;
+    if (c.len == p.len) return true;
+    return c[p.len] == '/';
+}
+
 pub fn validateGrantAttenuation(parent_bindings: []const SpaceBinding, child_grants: []const SpaceBinding) GrantError!void {
     for (child_grants) |cg| {
-        var found: ?SpaceAccess = null;
+        if (cg.mount_rel) |mr| {
+            _ = canonicalRelPath(mr) catch return error.AccessEscalation;
+        }
+        var space_found = false;
+        var allowed = false;
         for (parent_bindings) |pb| {
             if (pb.space_id == cg.space_id) {
-                found = pb.access;
-                break;
+                space_found = true;
+                if (pb.access.allowsChild(cg.access) and mountRelWithin(pb.mount_rel, cg.mount_rel)) {
+                    allowed = true;
+                    break;
+                }
             }
         }
-        const parent_access = found orelse return error.UnauthorizedSpaceGrant;
-        if (!parent_access.allowsChild(cg.access)) {
-            return error.AccessEscalation;
-        }
+        if (!space_found) return error.UnauthorizedSpaceGrant;
+        if (!allowed) return error.AccessEscalation;
     }
+}
+
+fn writeBytesCapped(allocator: Allocator, w: *codec.Writer, bytes: []const u8, max_len: usize) EncodeError!void {
+    if (bytes.len > max_len) return error.RecordTooLarge;
+    try w.writeBytes(allocator, bytes);
+}
+
+fn writeOptBytesCapped(allocator: Allocator, w: *codec.Writer, opt: ?[]const u8, max_len: usize) EncodeError!void {
+    if (opt) |s| {
+        if (s.len > max_len) return error.RecordTooLarge;
+    }
+    try w.writeOptBytes(allocator, opt);
 }
 
 fn decodeEnum(comptime T: type, r: *codec.Reader) !T {
@@ -163,11 +208,11 @@ pub const SpaceBinding = struct {
         };
     }
 
-    pub fn encode(self: *const SpaceBinding, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const SpaceBinding, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.space_id);
-        try w.writeBytes(allocator, self.alias);
-        try w.writeU8(allocator, @intFromEnum(self.access));
-        try w.writeOptBytes(allocator, self.mount_rel);
+        try writeBytesCapped(allocator, w, self.alias, MAX_SHORT_STR);
+        try w.writeU8(allocator, @backingInt(self.access));
+        try writeOptBytesCapped(allocator, w, self.mount_rel, MAX_SHORT_STR);
     }
 
     pub fn decode(allocator: Allocator, r: *codec.Reader) !SpaceBinding {
@@ -214,7 +259,7 @@ pub fn computeBindingsDigest(bindings: []const SpaceBinding) [32]u8 {
         std.mem.writeInt(u64, &len_buf, b.alias.len, .little);
         h.update(&len_buf);
         h.update(b.alias);
-        h.update(&[_]u8{@intFromEnum(b.access)});
+        h.update(&[_]u8{@backingInt(b.access)});
         if (b.mount_rel) |mr| {
             h.update(&[_]u8{1});
             std.mem.writeInt(u64, &len_buf, mr.len, .little);
@@ -269,12 +314,13 @@ pub const SpaceCheckpoint = struct {
         return true;
     }
 
-    pub fn encode(self: *const SpaceCheckpoint, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const SpaceCheckpoint, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        if (self.version.slice().len > MAX_VERSION_HEADS) return error.RecordTooLarge;
         try w.writeU128(allocator, self.space_id);
         try self.version.encode(allocator, w);
-        try w.writeU8(allocator, @intFromEnum(self.vcs_kind));
-        try w.writeOptBytes(allocator, self.vcs_ref);
-        try w.writeOptBytes(allocator, self.vcs_rev);
+        try w.writeU8(allocator, @backingInt(self.vcs_kind));
+        try writeOptBytesCapped(allocator, w, self.vcs_ref, MAX_SHORT_STR);
+        try writeOptBytesCapped(allocator, w, self.vcs_rev, MAX_SHORT_STR);
     }
 
     pub fn decode(allocator: Allocator, r: *codec.Reader) !SpaceCheckpoint {
@@ -405,7 +451,7 @@ pub const CheckpointVector = struct {
                 std.mem.writeInt(u128, &u128_buf, b.actor, .little);
                 h.update(&u128_buf);
             }
-            h.update(&[_]u8{@intFromEnum(e.vcs_kind)});
+            h.update(&[_]u8{@backingInt(e.vcs_kind)});
             if (e.vcs_ref) |r| {
                 h.update(&[_]u8{1});
                 std.mem.writeInt(u64, &u64_buf, r.len, .little);
@@ -428,7 +474,8 @@ pub const CheckpointVector = struct {
         return out;
     }
 
-    pub fn encode(self: *const CheckpointVector, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const CheckpointVector, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        if (self.entries.len > MAX_CHECKPOINTS) return error.RecordTooLarge;
         try w.writeVarint(allocator, self.entries.len);
         for (self.entries) |*e| {
             try e.encode(allocator, w);
@@ -504,12 +551,12 @@ pub const ProviderCursor = struct {
         };
     }
 
-    pub fn encode(self: *const ProviderCursor, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
-        try w.writeU8(allocator, @intFromEnum(self.provider));
+    pub fn encode(self: *const ProviderCursor, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        try w.writeU8(allocator, @backingInt(self.provider));
         try w.writeU128(allocator, self.runner_id);
-        try w.writeU8(allocator, @intFromEnum(self.scope));
-        try w.writeBytes(allocator, self.native_session);
-        try w.writeOptBytes(allocator, self.native_turn);
+        try w.writeU8(allocator, @backingInt(self.scope));
+        try writeBytesCapped(allocator, w, self.native_session, MAX_SHORT_STR);
+        try writeOptBytesCapped(allocator, w, self.native_turn, MAX_SHORT_STR);
         try w.writeRaw(allocator, &self.bindings_digest);
     }
 
@@ -615,9 +662,9 @@ pub const Budget = struct {
             break :blk requested.max_wall_ms;
         };
 
-        self.used_tokens +|= grant_tokens;
-        self.used_cost_microusd +|= grant_cost;
-        self.used_wall_ms +|= grant_wall;
+        if (self.max_tokens > 0) self.used_tokens += grant_tokens;
+        if (self.max_cost_microusd > 0) self.used_cost_microusd += grant_cost;
+        if (self.max_wall_ms > 0) self.used_wall_ms += grant_wall;
         self.active_children += 1;
 
         return .{
@@ -634,9 +681,14 @@ pub const Budget = struct {
     }
 
     pub fn refundChild(self: *Budget, child: Budget) void {
-        if (child.max_tokens > 0) {
+        if (self.max_tokens > 0 and child.max_tokens > 0) {
             if (child.used_tokens <= child.max_tokens) {
-                self.used_tokens -|= (child.max_tokens - child.used_tokens);
+                const unspent = child.max_tokens - child.used_tokens;
+                if (self.used_tokens >= child.max_tokens) {
+                    self.used_tokens -= unspent;
+                } else {
+                    self.used_tokens = @max(self.used_tokens -| unspent, child.used_tokens);
+                }
             } else {
                 self.used_tokens +|= (child.used_tokens - child.max_tokens);
             }
@@ -644,9 +696,14 @@ pub const Budget = struct {
             self.used_tokens +|= child.used_tokens;
         }
 
-        if (child.max_cost_microusd > 0) {
+        if (self.max_cost_microusd > 0 and child.max_cost_microusd > 0) {
             if (child.used_cost_microusd <= child.max_cost_microusd) {
-                self.used_cost_microusd -|= (child.max_cost_microusd - child.used_cost_microusd);
+                const unspent = child.max_cost_microusd - child.used_cost_microusd;
+                if (self.used_cost_microusd >= child.max_cost_microusd) {
+                    self.used_cost_microusd -= unspent;
+                } else {
+                    self.used_cost_microusd = @max(self.used_cost_microusd -| unspent, child.used_cost_microusd);
+                }
             } else {
                 self.used_cost_microusd +|= (child.used_cost_microusd - child.max_cost_microusd);
             }
@@ -654,9 +711,14 @@ pub const Budget = struct {
             self.used_cost_microusd +|= child.used_cost_microusd;
         }
 
-        if (child.max_wall_ms > 0) {
+        if (self.max_wall_ms > 0 and child.max_wall_ms > 0) {
             if (child.used_wall_ms <= child.max_wall_ms) {
-                self.used_wall_ms -|= (child.max_wall_ms - child.used_wall_ms);
+                const unspent = child.max_wall_ms - child.used_wall_ms;
+                if (self.used_wall_ms >= child.max_wall_ms) {
+                    self.used_wall_ms -= unspent;
+                } else {
+                    self.used_wall_ms = @max(self.used_wall_ms -| unspent, child.used_wall_ms);
+                }
             } else {
                 self.used_wall_ms +|= (child.used_wall_ms - child.max_wall_ms);
             }
@@ -731,7 +793,7 @@ pub const PlacementPolicy = union(PlacementTag) {
     pinned: u128,
 
     pub fn encode(self: PlacementPolicy, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
-        try w.writeU8(allocator, @intFromEnum(self));
+        try w.writeU8(allocator, @backingInt(self));
         switch (self) {
             .pinned => |rid| try w.writeU128(allocator, rid),
             else => {},
@@ -765,7 +827,7 @@ pub const TaskStatus = enum(u8) {
     pub fn canTransitionTo(self: TaskStatus, next: TaskStatus) bool {
         if (self == next) return true;
         if (self.isTerminal()) return false;
-        return @intFromEnum(next) >= @intFromEnum(self);
+        return @backingInt(next) >= @backingInt(self);
     }
 };
 
@@ -841,12 +903,13 @@ pub const Task = struct {
         };
     }
 
-    pub fn encode(self: *const Task, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const Task, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        if (self.depends_on.len > MAX_DEPS) return error.RecordTooLarge;
         try w.writeU128(allocator, self.task_id);
         try w.writeU128(allocator, self.parent_thread_id);
         try w.writeU128(allocator, self.child_thread_id);
-        try w.writeBytes(allocator, self.title);
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try writeBytesCapped(allocator, w, self.title, MAX_SHORT_STR);
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeU32(allocator, self.attempt);
         try w.writeVarint(allocator, self.depends_on.len);
         for (self.depends_on) |d| try w.writeU128(allocator, d);
@@ -856,7 +919,7 @@ pub const Task = struct {
         try self.budget.encode(allocator, w);
         try self.start_checkpoint.encode(allocator, w);
         try self.end_checkpoint.encode(allocator, w);
-        try w.writeOptBytes(allocator, self.err_msg);
+        try writeOptBytesCapped(allocator, w, self.err_msg, MAX_CONTENT_BYTES);
         try w.writeU64(allocator, self.created_ms);
         try w.writeU64(allocator, self.updated_ms);
     }
@@ -954,13 +1017,13 @@ pub const MailboxItem = struct {
         };
     }
 
-    pub fn encode(self: *const MailboxItem, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const MailboxItem, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.item_id);
         try w.writeU128(allocator, self.from_thread_id);
         try w.writeU128(allocator, self.to_thread_id);
         try w.writeOptU128(allocator, self.task_id);
-        try w.writeU8(allocator, @intFromEnum(self.kind));
-        try w.writeBytes(allocator, self.payload);
+        try w.writeU8(allocator, @backingInt(self.kind));
+        try writeBytesCapped(allocator, w, self.payload, MAX_CONTENT_BYTES);
         if (self.blob_oid) |oid| {
             try w.writeU8(allocator, 1);
             try w.writeRaw(allocator, &oid);
@@ -1043,18 +1106,18 @@ pub const TriggerKind = union(TriggerKindTag) {
         };
     }
 
-    pub fn encode(self: *const TriggerKind, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
-        try w.writeU8(allocator, @intFromEnum(self.*));
+    pub fn encode(self: *const TriggerKind, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        try w.writeU8(allocator, @backingInt(self.*));
         switch (self.*) {
             .once => |ts| try w.writeU64(allocator, ts),
-            .cron => |s| try w.writeBytes(allocator, s),
+            .cron => |s| try writeBytesCapped(allocator, w, s, MAX_SHORT_STR),
             .space_changed => |sc| {
                 try w.writeU128(allocator, sc.space_id);
-                try w.writeBytes(allocator, sc.path_prefix);
+                try writeBytesCapped(allocator, w, sc.path_prefix, MAX_SHORT_STR);
                 try w.writeU32(allocator, sc.debounce_ms);
             },
             .mailbox => {},
-            .webhook => |s| try w.writeBytes(allocator, s),
+            .webhook => |s| try writeBytesCapped(allocator, w, s, MAX_SHORT_STR),
         }
     }
 
@@ -1133,11 +1196,11 @@ pub const Trigger = struct {
         };
     }
 
-    pub fn encode(self: *const Trigger, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const Trigger, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.trigger_id);
         try w.writeU128(allocator, self.thread_id);
         try self.kind.encode(allocator, w);
-        try w.writeBytes(allocator, self.prompt_template);
+        try writeBytesCapped(allocator, w, self.prompt_template, MAX_CONTENT_BYTES);
         try w.writeBool(allocator, self.enabled);
         try w.writeU64(allocator, self.next_fire_ms);
         try self.placement.encode(allocator, w);
@@ -1220,7 +1283,8 @@ pub const RollbackIntent = struct {
         return true;
     }
 
-    pub fn encode(self: *const RollbackIntent, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const RollbackIntent, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        if (self.completed_spaces.len > MAX_CHECKPOINTS) return error.RecordTooLarge;
         try w.writeU128(allocator, self.intent_id);
         try w.writeOptU128(allocator, self.target_msg_id);
         try self.target_vector.encode(allocator, w);
@@ -1270,7 +1334,8 @@ pub fn freeBindings(allocator: Allocator, bindings: []SpaceBinding) void {
     allocator.free(bindings);
 }
 
-pub fn encodeBindings(allocator: Allocator, w: *codec.Writer, bindings: []const SpaceBinding) Allocator.Error!void {
+pub fn encodeBindings(allocator: Allocator, w: *codec.Writer, bindings: []const SpaceBinding) EncodeError!void {
+    if (bindings.len > MAX_BINDINGS) return error.RecordTooLarge;
     try w.writeVarint(allocator, bindings.len);
     for (bindings) |*b| try b.encode(allocator, w);
 }
@@ -1356,20 +1421,20 @@ pub const ThreadMeta = struct {
         };
     }
 
-    pub fn encode(self: *const ThreadMeta, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const ThreadMeta, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.thread_id);
         try w.writeOptU128(allocator, self.project_id);
         try w.writeOptU128(allocator, self.parent_thread_id);
         try w.writeU128(allocator, self.root_thread_id);
         try w.writeOptU128(allocator, self.task_id);
         try w.writeU8(allocator, self.depth);
-        try w.writeBytes(allocator, self.title);
-        try w.writeU8(allocator, @intFromEnum(self.default_provider));
-        try w.writeOptBytes(allocator, self.default_model);
+        try writeBytesCapped(allocator, w, self.title, MAX_SHORT_STR);
+        try w.writeU8(allocator, @backingInt(self.default_provider));
+        try writeOptBytesCapped(allocator, w, self.default_model, MAX_SHORT_STR);
         try encodeBindings(allocator, w, self.bindings);
         try self.budget.encode(allocator, w);
         try self.root_checkpoint.encode(allocator, w);
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeU64(allocator, self.created_ms);
         try w.writeU64(allocator, self.updated_ms);
     }
@@ -1482,14 +1547,14 @@ pub const Message = struct {
         };
     }
 
-    pub fn encode(self: *const Message, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const Message, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.msg_id);
         try w.writeU128(allocator, self.thread_id);
         try w.writeOptU128(allocator, self.parent_id);
-        try w.writeU8(allocator, @intFromEnum(self.role));
-        try w.writeBytes(allocator, self.content);
-        try w.writeU8(allocator, @intFromEnum(self.provider));
-        try w.writeOptBytes(allocator, self.model);
+        try w.writeU8(allocator, @backingInt(self.role));
+        try writeBytesCapped(allocator, w, self.content, MAX_CONTENT_BYTES);
+        try w.writeU8(allocator, @backingInt(self.provider));
+        try writeOptBytesCapped(allocator, w, self.model, MAX_SHORT_STR);
         if (self.cursor) |*c| {
             try w.writeU8(allocator, 1);
             try c.encode(allocator, w);
@@ -1500,10 +1565,10 @@ pub const Message = struct {
         try w.writeU64(allocator, self.fencing_epoch);
         try self.pre_checkpoint.encode(allocator, w);
         try self.post_checkpoint.encode(allocator, w);
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeOptU128(allocator, self.steer_of);
         try w.writeOptU128(allocator, self.switched_from);
-        try w.writeOptBytes(allocator, self.err_msg);
+        try writeOptBytesCapped(allocator, w, self.err_msg, MAX_CONTENT_BYTES);
         try w.writeU64(allocator, self.created_ms);
         try w.writeU64(allocator, self.updated_ms);
     }
@@ -1597,12 +1662,12 @@ pub const ToolCallRecord = struct {
         };
     }
 
-    pub fn encode(self: *const ToolCallRecord, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const ToolCallRecord, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.msg_id);
-        try w.writeBytes(allocator, self.call_id);
-        try w.writeBytes(allocator, self.name);
-        try w.writeBytes(allocator, self.input_json);
-        try w.writeBytes(allocator, self.output);
+        try writeBytesCapped(allocator, w, self.call_id, MAX_SHORT_STR);
+        try writeBytesCapped(allocator, w, self.name, MAX_SHORT_STR);
+        try writeBytesCapped(allocator, w, self.input_json, MAX_CONTENT_BYTES);
+        try writeBytesCapped(allocator, w, self.output, MAX_CONTENT_BYTES);
         try w.writeBool(allocator, self.is_error);
     }
 
@@ -1669,14 +1734,14 @@ pub const QueueItem = struct {
         };
     }
 
-    pub fn encode(self: *const QueueItem, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const QueueItem, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.item_id);
         try w.writeU128(allocator, self.thread_id);
-        try w.writeU8(allocator, @intFromEnum(self.kind));
-        try w.writeU8(allocator, @intFromEnum(self.status));
-        try w.writeBytes(allocator, self.prompt);
-        try w.writeU8(allocator, @intFromEnum(self.provider));
-        try w.writeOptBytes(allocator, self.model);
+        try w.writeU8(allocator, @backingInt(self.kind));
+        try w.writeU8(allocator, @backingInt(self.status));
+        try writeBytesCapped(allocator, w, self.prompt, MAX_CONTENT_BYTES);
+        try w.writeU8(allocator, @backingInt(self.provider));
+        try writeOptBytesCapped(allocator, w, self.model, MAX_SHORT_STR);
         try w.writeOptU128(allocator, self.target_turn_msg_id);
         try w.writeU64(allocator, self.created_ms);
         try w.writeU64(allocator, self.updated_ms);
@@ -1754,7 +1819,8 @@ pub const MessagePage = struct {
         }
     }
 
-    pub fn encode(self: *const MessagePage, allocator: Allocator) Allocator.Error![]u8 {
+    pub fn encode(self: *const MessagePage, allocator: Allocator) EncodeError![]u8 {
+        if (self.messages.len > MAX_PAGE_MESSAGES) return error.RecordTooLarge;
         var w = codec.Writer{};
         defer w.deinit(allocator);
         try w.writeRaw(allocator, &PAGE_MAGIC);
@@ -1838,18 +1904,18 @@ pub const ThreadUpdate = struct {
         };
     }
 
-    pub fn encode(self: *const ThreadUpdate, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
-        try w.writeOptBytes(allocator, self.title);
+    pub fn encode(self: *const ThreadUpdate, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        try writeOptBytesCapped(allocator, w, self.title, MAX_SHORT_STR);
         if (self.default_provider) |p| {
             try w.writeU8(allocator, 1);
-            try w.writeU8(allocator, @intFromEnum(p));
+            try w.writeU8(allocator, @backingInt(p));
         } else {
             try w.writeU8(allocator, 0);
         }
-        try w.writeOptBytes(allocator, self.default_model);
+        try writeOptBytesCapped(allocator, w, self.default_model, MAX_SHORT_STR);
         if (self.status) |s| {
             try w.writeU8(allocator, 1);
-            try w.writeU8(allocator, @intFromEnum(s));
+            try w.writeU8(allocator, @backingInt(s));
         } else {
             try w.writeU8(allocator, 0);
         }
@@ -1898,7 +1964,7 @@ pub const BindingsUpdate = struct {
         };
     }
 
-    pub fn encode(self: *const BindingsUpdate, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const BindingsUpdate, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try encodeBindings(allocator, w, self.bindings);
         try w.writeU64(allocator, self.updated_ms);
     }
@@ -1995,9 +2061,9 @@ pub const CancelTree = struct {
         };
     }
 
-    pub fn encode(self: *const CancelTree, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const CancelTree, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeOptU128(allocator, self.root_task_id);
-        try w.writeOptBytes(allocator, self.reason);
+        try writeOptBytesCapped(allocator, w, self.reason, MAX_SHORT_STR);
         try w.writeU64(allocator, self.canceled_ms);
     }
 
@@ -2051,6 +2117,43 @@ pub const PageSealed = struct {
     }
 };
 
+pub const MailboxAcked = struct {
+    item_id: u128,
+    acked_ms: u64,
+
+    pub fn encode(self: *const MailboxAcked, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        try w.writeU128(allocator, self.item_id);
+        try w.writeU64(allocator, self.acked_ms);
+    }
+
+    pub fn decode(r: *codec.Reader) !MailboxAcked {
+        return .{
+            .item_id = try r.readU128(),
+            .acked_ms = try r.readU64(),
+        };
+    }
+};
+
+pub const TriggerWatchState = struct {
+    trigger_id: u128,
+    digest: [32]u8,
+    updated_ms: u64,
+
+    pub fn encode(self: *const TriggerWatchState, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        try w.writeU128(allocator, self.trigger_id);
+        try w.writeRaw(allocator, &self.digest);
+        try w.writeU64(allocator, self.updated_ms);
+    }
+
+    pub fn decode(r: *codec.Reader) !TriggerWatchState {
+        return .{
+            .trigger_id = try r.readU128(),
+            .digest = (try r.readFixed(32)).*,
+            .updated_ms = try r.readU64(),
+        };
+    }
+};
+
 pub const ThreadEventTag = enum(u8) {
     thread_created = 1,
     thread_updated = 2,
@@ -2072,6 +2175,8 @@ pub const ThreadEventTag = enum(u8) {
     cancel_tree = 18,
     lease_observed = 19,
     page_sealed = 20,
+    mailbox_acked = 21,
+    trigger_state_put = 22,
 };
 
 pub const ThreadEvent = union(ThreadEventTag) {
@@ -2095,6 +2200,8 @@ pub const ThreadEvent = union(ThreadEventTag) {
     cancel_tree: CancelTree,
     lease_observed: ExecutionLeaseRef,
     page_sealed: PageSealed,
+    mailbox_acked: MailboxAcked,
+    trigger_state_put: TriggerWatchState,
 
     pub fn deinit(self: *ThreadEvent, allocator: Allocator) void {
         switch (self.*) {
@@ -2118,6 +2225,8 @@ pub const ThreadEvent = union(ThreadEventTag) {
             .cancel_tree => |*v| v.deinit(allocator),
             .lease_observed => {},
             .page_sealed => {},
+            .mailbox_acked => {},
+            .trigger_state_put => {},
         }
     }
 
@@ -2143,11 +2252,13 @@ pub const ThreadEvent = union(ThreadEventTag) {
             .cancel_tree => |*v| .{ .cancel_tree = try v.clone(allocator) },
             .lease_observed => |v| .{ .lease_observed = v },
             .page_sealed => |v| .{ .page_sealed = v },
+            .mailbox_acked => |v| .{ .mailbox_acked = v },
+            .trigger_state_put => |v| .{ .trigger_state_put = v },
         };
     }
 
-    pub fn encode(self: *const ThreadEvent, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
-        try w.writeU8(allocator, @intFromEnum(self.*));
+    pub fn encode(self: *const ThreadEvent, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        try w.writeU8(allocator, @backingInt(self.*));
         switch (self.*) {
             .thread_created => |*v| try v.encode(allocator, w),
             .thread_updated => |*v| try v.encode(allocator, w),
@@ -2169,6 +2280,8 @@ pub const ThreadEvent = union(ThreadEventTag) {
             .cancel_tree => |*v| try v.encode(allocator, w),
             .lease_observed => |*v| try v.encode(allocator, w),
             .page_sealed => |*v| try v.encode(allocator, w),
+            .mailbox_acked => |*v| try v.encode(allocator, w),
+            .trigger_state_put => |*v| try v.encode(allocator, w),
         }
     }
 
@@ -2195,6 +2308,8 @@ pub const ThreadEvent = union(ThreadEventTag) {
             .cancel_tree => .{ .cancel_tree = try CancelTree.decode(allocator, r) },
             .lease_observed => .{ .lease_observed = try ExecutionLeaseRef.decode(r) },
             .page_sealed => .{ .page_sealed = try PageSealed.decode(r) },
+            .mailbox_acked => .{ .mailbox_acked = try MailboxAcked.decode(r) },
+            .trigger_state_put => .{ .trigger_state_put = try TriggerWatchState.decode(r) },
         };
     }
 };
@@ -2218,7 +2333,7 @@ pub const CausalEvent = struct {
         };
     }
 
-    pub fn encode(self: *const CausalEvent, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const CausalEvent, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU8(allocator, EVENT_FORMAT_VERSION);
         try w.writeU128(allocator, self.event_id);
         try w.writeU64(allocator, self.lamport);
@@ -2226,7 +2341,7 @@ pub const CausalEvent = struct {
         try self.event.encode(allocator, w);
     }
 
-    pub fn encodeAlloc(self: *const CausalEvent, allocator: Allocator) Allocator.Error![]u8 {
+    pub fn encodeAlloc(self: *const CausalEvent, allocator: Allocator) EncodeError![]u8 {
         var w = codec.Writer{};
         defer w.deinit(allocator);
         try self.encode(allocator, &w);
@@ -2297,12 +2412,13 @@ pub const ProjectSummary = struct {
         };
     }
 
-    pub fn encode(self: *const ProjectSummary, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const ProjectSummary, allocator: Allocator, w: *codec.Writer) EncodeError!void {
+        if (self.space_ids.len > MAX_BINDINGS) return error.RecordTooLarge;
         try w.writeU128(allocator, self.project_id);
-        try w.writeBytes(allocator, self.name);
+        try writeBytesCapped(allocator, w, self.name, MAX_SHORT_STR);
         try w.writeVarint(allocator, self.space_ids.len);
         for (self.space_ids) |sid| try w.writeU128(allocator, sid);
-        try w.writeU8(allocator, @intFromEnum(self.default_provider));
+        try w.writeU8(allocator, @backingInt(self.default_provider));
         try w.writeBool(allocator, self.deleted);
         try w.writeU64(allocator, self.updated_ms);
         try w.writeU128(allocator, self.actor);
@@ -2372,13 +2488,13 @@ pub const SpaceSummary = struct {
         };
     }
 
-    pub fn encode(self: *const SpaceSummary, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const SpaceSummary, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.space_id);
-        try w.writeBytes(allocator, self.name);
-        try w.writeU8(allocator, @intFromEnum(self.kind));
-        try w.writeU8(allocator, @intFromEnum(self.vcs_kind));
-        try w.writeOptBytes(allocator, self.local_path);
-        try w.writeOptBytes(allocator, self.remote_url);
+        try writeBytesCapped(allocator, w, self.name, MAX_SHORT_STR);
+        try w.writeU8(allocator, @backingInt(self.kind));
+        try w.writeU8(allocator, @backingInt(self.vcs_kind));
+        try writeOptBytesCapped(allocator, w, self.local_path, MAX_SHORT_STR);
+        try writeOptBytesCapped(allocator, w, self.remote_url, MAX_SHORT_STR);
         try w.writeBool(allocator, self.deleted);
         try w.writeU64(allocator, self.updated_ms);
         try w.writeU128(allocator, self.actor);
@@ -2457,15 +2573,15 @@ pub const ThreadSummary = struct {
         };
     }
 
-    pub fn encode(self: *const ThreadSummary, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const ThreadSummary, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.thread_id);
         try w.writeOptU128(allocator, self.project_id);
         try w.writeOptU128(allocator, self.parent_thread_id);
         try w.writeU128(allocator, self.root_thread_id);
-        try w.writeBytes(allocator, self.title);
-        try w.writeU8(allocator, @intFromEnum(self.provider));
-        try w.writeOptBytes(allocator, self.model);
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try writeBytesCapped(allocator, w, self.title, MAX_SHORT_STR);
+        try w.writeU8(allocator, @backingInt(self.provider));
+        try writeOptBytesCapped(allocator, w, self.model, MAX_SHORT_STR);
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeU32(allocator, self.message_count);
         try w.writeU32(allocator, self.active_tasks);
         try w.writeU32(allocator, self.unread_mailbox);
@@ -2540,10 +2656,10 @@ pub const RunnerInfo = struct {
         };
     }
 
-    pub fn encode(self: *const RunnerInfo, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const RunnerInfo, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU128(allocator, self.runner_id);
-        try w.writeBytes(allocator, self.name);
-        try w.writeU8(allocator, @intFromEnum(self.kind));
+        try writeBytesCapped(allocator, w, self.name, MAX_SHORT_STR);
+        try w.writeU8(allocator, @backingInt(self.kind));
         try w.writeRaw(allocator, &self.x25519_pub);
         try w.writeU64(allocator, self.last_seen_ms);
         try w.writeU64(allocator, self.capabilities_flags);
@@ -2606,9 +2722,9 @@ pub const CatalogEntry = union(CatalogEntryTag) {
         };
     }
 
-    pub fn encode(self: *const CatalogEntry, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
+    pub fn encode(self: *const CatalogEntry, allocator: Allocator, w: *codec.Writer) EncodeError!void {
         try w.writeU8(allocator, CATALOG_FORMAT_VERSION);
-        try w.writeU8(allocator, @intFromEnum(self.*));
+        try w.writeU8(allocator, @backingInt(self.*));
         switch (self.*) {
             .project => |*v| try v.encode(allocator, w),
             .space => |*v| try v.encode(allocator, w),
@@ -2617,7 +2733,7 @@ pub const CatalogEntry = union(CatalogEntryTag) {
         }
     }
 
-    pub fn encodeAlloc(self: *const CatalogEntry, allocator: Allocator) Allocator.Error![]u8 {
+    pub fn encodeAlloc(self: *const CatalogEntry, allocator: Allocator) EncodeError![]u8 {
         var w = codec.Writer{};
         defer w.deinit(allocator);
         try self.encode(allocator, &w);
