@@ -122,6 +122,7 @@ claude_control :: proc(d: ^Driver, b: ^[dynamic]u8, kind: Request, subtype: stri
 claude_submit :: proc(d: ^Driver, p: ^Prompt, o: ^Output) {
 	claude_write_prompt(&o.bytes, p)
 	p.sent = true
+	wrote(o, p.id)
 }
 
 @(private)

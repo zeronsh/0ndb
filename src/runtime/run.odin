@@ -76,6 +76,7 @@ Run :: struct {
 	sub:          eng.Sub_Id,
 	raw:          journal.Journal,
 	raw_open:     bool,
+	raw_link:     Rid,
 	started_ms:   i64,
 	token:        string,
 	sealed:       bool,
@@ -95,6 +96,10 @@ RAW_STDIN :: u8(3)
 RAW_META :: u8(4)
 @(private)
 RAW_HTTP :: u8(5)
+@(private)
+RAW_OWNER :: u8(6)
+@(private)
+RAW_LINK :: u8(7)
 
 run_find :: proc(r: ^Runtime, o: Object) -> ^Run {
 	for run in r.runs {
@@ -176,7 +181,8 @@ _writer :: proc(run: ^Run) -> ^convo.Writer {
 	return w
 }
 
-run_raw :: proc(run: ^Run, kind: u8, data: []u8) {
+run_raw :: proc(run: ^Run, kind: u8, data: []u8) -> (off: i64) {
+	off = -1
 	r := run.r
 	if !run.raw_open {
 		id := run.o.id
@@ -192,12 +198,17 @@ run_raw :: proc(run: ^Run, kind: u8, data: []u8) {
 		c := rid_bytes(run.claim)
 		append(&meta, ..c)
 		journal.journal_append(&run.raw, meta[:])
+		run_raw_owner(run)
 	}
 	body := make([]u8, len(data) + 1, context.temp_allocator)
 	body[0] = kind
 	copy(body[1:], data)
-	journal.journal_append(&run.raw, body)
+	at, err := journal.journal_append(&run.raw, body)
+	if err == .None {
+		off = at
+	}
 	r.stats.raw_lines += 1
+	return
 }
 
 run_raw_commit :: proc(run: ^Run) {

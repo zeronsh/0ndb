@@ -10,7 +10,7 @@ import "../prim"
 @(private)
 RAW_MATCH_MIN :: 16
 
-raw_purge :: proc(r: ^Runtime, o: Object, claim: Rid, bodies: []string) {
+raw_purge :: proc(r: ^Runtime, o: Object, msg: Rid, claim: Rid, bodies: []string) {
 	needles := make([dynamic]string, context.temp_allocator)
 	for t in bodies {
 		if len(t) == 0 {
@@ -27,9 +27,6 @@ raw_purge :: proc(r: ^Runtime, o: Object, claim: Rid, bodies: []string) {
 				append(&needles, n)
 			}
 		}
-	}
-	if len(needles) == 0 && obj.rid_none(claim) {
-		return
 	}
 	j: ^journal.Journal
 	own: journal.Journal
@@ -55,12 +52,26 @@ raw_purge :: proc(r: ^Runtime, o: Object, claim: Rid, bodies: []string) {
 	if journal.journal_commit(j) != .None {
 		return
 	}
+	Rec :: struct {
+		off:  i64,
+		kind: u8,
+		run:  int,
+	}
+	Seg :: struct {
+		owner: bool,
+		claim: bool,
+		typed: bool,
+	}
+	target := rid_bytes(msg)
 	start := rid_bytes(claim) if !obj.rid_none(claim) else nil
+	recs := make([dynamic]Rec, context.temp_allocator)
+	segs := make([dynamic]Seg, context.temp_allocator)
+	linked := make(map[i64]bool, context.temp_allocator)
+	mine := make(map[i64]bool, context.temp_allocator)
+	hits := make(map[i64]bool, context.temp_allocator)
 	rd: journal.Reader
 	journal.journal_reader(j, &rd, context.temp_allocator)
 	end := journal.journal_durable_len(j)
-	offs := make([dynamic]i64, context.temp_allocator)
-	in_run := false
 	pos: i64
 	for pos < end {
 		body, next, err := journal.record_at(&rd, pos)
@@ -71,29 +82,92 @@ raw_purge :: proc(r: ^Runtime, o: Object, claim: Rid, bodies: []string) {
 		if err != .None || len(body) == 0 {
 			break
 		}
-		hit := false
-		if body[0] == RAW_META && _raw_run_start(body) {
-			in_run = start != nil && string(body[1:]) == string(start)
-		} else if in_run && (body[0] == RAW_STDOUT || body[0] == RAW_STDERR || body[0] == RAW_HTTP) {
-			hit = true
-		}
-		if !hit && body[0] != RAW_META {
-			line := string(body[1:])
-			for n in needles {
-				if strings.contains(line, n) {
-					hit = true
-					break
+		at := pos
+		pos = next
+		switch body[0] {
+		case RAW_META:
+			if _raw_run_start(body) {
+				append(&segs, Seg{claim = start != nil && string(body[1:]) == string(start)})
+			}
+			continue
+		case RAW_OWNER:
+			if len(segs) > 0 && len(body) == 25 {
+				segs[len(segs) - 1].typed = true
+				segs[len(segs) - 1].owner ||= string(body[1:]) == string(target)
+			}
+			continue
+		case RAW_LINK:
+			if len(body) == 33 {
+				x := i64(prim.get_u64le(body[25:33]))
+				linked[x] = true
+				if string(body[1:25]) == string(target) {
+					mine[x] = true
 				}
 			}
+			continue
 		}
-		if hit {
-			append(&offs, pos)
+		append(&recs, Rec{off = at, kind = body[0], run = len(segs) - 1})
+		line := string(body[1:])
+		for n in needles {
+			if strings.contains(line, n) {
+				hits[at] = true
+				break
+			}
 		}
-		pos = next
+	}
+	offs := make([dynamic]i64, context.temp_allocator)
+	for x in recs {
+		take := mine[x.off] || hits[x.off]
+		if !take && x.run >= 0 && !linked[x.off] {
+			sg := segs[x.run]
+			take = sg.owner || (!sg.typed && sg.claim && x.kind != RAW_STDIN)
+		}
+		if take {
+			append(&offs, x.off)
+		}
 	}
 	if len(offs) > 0 {
 		journal.journal_redact_records(j, offs[:])
 	}
+}
+
+run_raw_owner :: proc(run: ^Run) {
+	if !run.raw_open || obj.rid_none(run.reply) {
+		return
+	}
+	b: [25]u8
+	b[0] = RAW_OWNER
+	copy(b[1:], rid_bytes(run.reply))
+	journal.journal_append(&run.raw, b[:])
+}
+
+run_raw_link :: proc(run: ^Run, msg: Rid, off: i64) {
+	if !run.raw_open || obj.rid_none(msg) || off < 0 {
+		return
+	}
+	b: [33]u8
+	b[0] = RAW_LINK
+	copy(b[1:25], rid_bytes(msg))
+	prim.put_u64le(b[25:33], u64(off))
+	journal.journal_append(&run.raw, b[:])
+}
+
+run_prompt_rid :: proc(run: ^Run, id: string) -> (Rid, bool) {
+	if !obj.rid_none(run.user) && rid_uuid(run.user) == id {
+		return run.user, true
+	}
+	if !obj.rid_none(run.reply) && rid_uuid(run.reply) == id {
+		return run.reply, true
+	}
+	for s in run.steered {
+		if rid_uuid(s) == id {
+			return s, true
+		}
+	}
+	if !obj.rid_none(run.raw_link) && rid_uuid(run.raw_link) == id {
+		return run.raw_link, true
+	}
+	return {}, false
 }
 
 @(private)

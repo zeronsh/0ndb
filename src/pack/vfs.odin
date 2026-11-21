@@ -733,6 +733,10 @@ _v_sync :: proc(data: rawptr, fd: prim.Fd) -> Error {
 		if p.poisoned {
 			return .Io
 		}
+		if !h.oi.dirty && h.oi.pinned == 0 {
+			return .None
+		}
+		h.oi.dirty = false
 		if e := _sync(p, h.oi.real_fd); e != .None {
 			_suspect_record(p, []u64{h.oi.inum})
 			return _poison(p, e)

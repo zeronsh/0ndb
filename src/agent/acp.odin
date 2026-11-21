@@ -207,6 +207,7 @@ acp_start :: proc(d: ^Driver, o: ^Output, i: int) {
 	start_turn(d, o, id)
 	d.in_flight += 1
 	acp_write_prompt(d, &o.bytes, .Turn, id, d.prompts[i].text, d.prompts[i].files)
+	wrote(o, id)
 	accept_prompt(d, o, id, id)
 }
 
@@ -225,10 +226,12 @@ acp_submit :: proc(d: ^Driver, p: ^Prompt, o: ^Output) {
 	case .Concurrent, .Supersede:
 		d.in_flight += 1
 		acp_write_prompt(d, &o.bytes, .Steer, id, p.text, p.files)
+		wrote(o, id)
 		accept_prompt(d, o, id, id)
 	case .Command:
 		line := strings.concatenate({"/steer ", p.text}, context.temp_allocator)
 		acp_write_prompt(d, &o.bytes, .Steer_Command, id, line, p.files)
+		wrote(o, id)
 		p.sent = true
 	case .Cancel:
 		waiting := false
@@ -265,6 +268,9 @@ acp_resteer :: proc(d: ^Driver, o: ^Output) -> bool {
 	}
 	d.in_flight += 1
 	acp_write_prompt(d, &o.bytes, .Steer, ids[0], string(b[:]), files[:])
+	for id in ids {
+		wrote(o, id)
+	}
 	for id in ids {
 		accept_prompt(d, o, id, ids[0])
 	}

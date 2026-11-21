@@ -340,6 +340,18 @@ purge_line :: proc(plan: Purge_Plan, w: ^Range_Walker, line: string) -> string {
 			}
 		}
 	}
+	if plan.format == .Claude_Jsonl && len(plan.targets) > 0 {
+		if obj, ok := v.(json.Object); ok {
+			if "lastPrompt" in obj {
+				obj["lastPrompt"] = json.String(REDACTED)
+				changed = true
+			}
+			if strings.has_prefix(get_str(v, "type"), "api-request") && "message" in obj {
+				obj["message"] = redact_tree(obj["message"], "message")
+				changed = true
+			}
+		}
+	}
 	for t in plan.targets {
 		if t.text != "" && strings.contains(trimmed, t.text) {
 			changed = true

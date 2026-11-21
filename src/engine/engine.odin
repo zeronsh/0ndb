@@ -271,6 +271,7 @@ Engine :: struct {
 	pack_more:    bool,
 	purged:       [dynamic]Rid,
 	redact_tick:  u64,
+	rlog:         Rlog,
 	plug:         Plug_State,
 	pages:        Page_Heap,
 	temp:         virtual.Arena,

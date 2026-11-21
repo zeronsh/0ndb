@@ -549,7 +549,8 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 	}
 	if h != nil && err == .None {
 		_handle_mark(h)
-		if h.kind == .Conversation {
+		_, redacting := cmd.(Cmd_Redact)
+		if h.kind == .Conversation && !redacting {
 			_catalog_activity(e, h)
 		}
 	}

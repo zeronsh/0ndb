@@ -131,6 +131,7 @@ muse_submit :: proc(d: ^Driver, p: ^Prompt, o: ^Output) {
 	set(d, &p.cmd, is_uuid7(p.id) ? p.id : new_uuid(d))
 	if d.ready {
 		muse_write_prompt(d, &o.bytes, p)
+		wrote(o, p.id)
 	}
 }
 
@@ -401,6 +402,7 @@ muse_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 				for &q in d.prompts {
 					if !q.sent {
 						muse_write_prompt(d, &o.bytes, &q)
+						wrote(o, q.id)
 					}
 				}
 			} else {
@@ -414,6 +416,7 @@ muse_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 		for &q in d.prompts {
 			if !q.sent {
 				muse_write_prompt(d, &o.bytes, &q)
+				wrote(o, q.id)
 			}
 		}
 	case .Turn, .Steer:

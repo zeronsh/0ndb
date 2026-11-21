@@ -164,6 +164,9 @@ _table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, 
 		return table_consumed(t, seg)
 	}
 	pos = table_consumed(t, seg) or_return
+	if pos >= limit {
+		return pos, .None
+	}
 	scratch: obj.Arena
 	if obj.arena_init(&scratch) != nil {
 		return pos, .No_Memory

@@ -137,6 +137,7 @@ codex_write_prompt :: proc(d: ^Driver, b: ^[dynamic]u8, p: ^Prompt, force_start 
 codex_submit :: proc(d: ^Driver, p: ^Prompt, o: ^Output) {
 	if d.ready {
 		codex_write_prompt(d, &o.bytes, p)
+		wrote(o, p.id)
 	}
 }
 
@@ -145,6 +146,7 @@ codex_flush :: proc(d: ^Driver, o: ^Output) {
 	for &p in d.prompts {
 		if !p.sent {
 			codex_write_prompt(d, &o.bytes, &p)
+			wrote(o, p.id)
 		}
 	}
 }
@@ -347,6 +349,7 @@ codex_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 			notice(o, .Warning, rpc_error_message(v))
 		}
 		codex_write_prompt(d, &o.bytes, &d.prompts[i], true)
+		wrote(o, d.prompts[i].id)
 	case .Models:
 		if failed {
 			notice(o, .Warning, rpc_error_message(v))

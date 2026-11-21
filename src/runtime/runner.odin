@@ -681,6 +681,7 @@ _ensure_reply :: proc(run: ^Run, files: []convo.File_Delta) -> Error {
 		return .Engine
 	}
 	run.reply = reply
+	run_raw_owner(run)
 	state_run_put(r, Run_Entry{object = o, user = run.user, reply = run.reply, claim = run.claim, agent = run.ai.object.id, lines = lines_encode(run.lines)})
 	eng.touched(r.e, o)
 	eng.catalog_usage(r.e, o, {})
@@ -974,7 +975,9 @@ run_steer :: proc(run: ^Run, it: ^convo.Intent) {
 	id := rid_uuid(it.item)
 	ok := false
 	if run.proc_ != nil {
+		run.raw_link = it.item
 		ok = proc_steer(run.proc_, it.text, id, files[:])
+		run.raw_link = {}
 	} else if run.native != nil {
 		ok = native_steer(run.native, it.text, id, files[:])
 	}

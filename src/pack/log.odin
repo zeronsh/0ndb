@@ -737,6 +737,10 @@ sync_async :: proc(p: ^Pack, done: Sync_Done, data: rawptr) -> Error {
 	return .None
 }
 
+pending :: proc(p: ^Pack) -> bool {
+	return p.nrec > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending || len(p.zeros) > 0
+}
+
 @(private)
 _advance :: proc(p: ^Pack) -> Error {
 	if p.fl.on {

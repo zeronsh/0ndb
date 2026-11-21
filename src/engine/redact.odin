@@ -259,26 +259,36 @@ _redact_intent :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64, t
 @(private)
 _redact_intent_at :: proc(e: ^Engine, space: prim.Id, object: prim.Id, kind: Kind, device: prim.Id, from, to: i64, target: i64 = -1) -> Error {
 	k, n := _relay_key(e, space, object, device, from)
-	if _, found, _ := omap.db_get(&e.reg.db, ROOT_REDACT, k[:n], context.temp_allocator); found && target < 0 {
+	if _, found := _rlog_get(e, k[:n]); found && target < 0 {
 		return .None
 	}
-	v: [17]u8
-	v[0] = u8(kind)
-	prim.put_u64le(v[1:9], u64(to))
-	vn := 9
-	if target >= 0 {
-		prim.put_u64le(v[9:17], u64(target))
-		vn = 17
+	return _rlog_intent(e, k[:n], Rlog_Entry{kind = kind, to = to, target = target}, !_zero_atomic(e, object, device))
+}
+
+@(private)
+_zero_atomic :: proc(e: ^Engine, object: prim.Id, device: prim.Id) -> bool {
+	h, ok := e.handles[object]
+	if !ok {
+		return false
 	}
-	t, terr := omap.txn_begin(&e.reg.db)
-	if terr != .None {
-		return _oerr(terr)
+	fd := prim.INVALID_FD
+	if device == e.self {
+		#partial switch h.kind {
+		case .Conversation:
+			fd = h.cw.core.j.fd if h.w_open else prim.INVALID_FD
+		case .Map:
+			fd = h.mw.core.j.fd if h.w_open else prim.INVALID_FD
+		case .Text, .File_Tree:
+			fd = h.hist.journal.fd if h.hist != nil else prim.INVALID_FD
+		}
+	} else {
+		for s in h.segs {
+			if s.device == device && s.rep != nil {
+				fd = s.rep.fd
+			}
+		}
 	}
-	if err := omap.txn_put(t, ROOT_REDACT, k[:n], v[:vn]); err != .None {
-		omap.txn_abort(t)
-		return _oerr(err)
-	}
-	return _oerr(omap.txn_commit(t))
+	return fd >= 0 && .Atomic_Group_Commit in prim.file_caps(e.vfs, fd)
 }
 
 @(private)
@@ -359,21 +369,19 @@ _redact_recover :: proc(e: ^Engine) {
 		target: i64,
 	}
 	list := make([dynamic]Pending, context.temp_allocator)
-	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
-		l := (^[dynamic]Pending)(data)
-		if len(key) != 40 || (len(value) != 9 && len(value) != 17) || value[0] & 0x80 != 0 || value[0] < 1 || value[0] > u8(max(Kind)) {
-			return true
-		}
-		p := Pending{kind = Kind(value[0]), from = i64(prim.get_u64le(key[32:40])), to = i64(prim.get_u64le(value[1:9])), target = -1}
-		copy(p.space[:], key[:16])
-		copy(p.object[:], key[16:32])
-		if len(value) == 17 {
-			p.target = i64(prim.get_u64le(value[9:17]))
-		}
-		append(l, p)
-		return true
+	if !_rlog_ready(e) {
+		return
 	}
-	omap.db_scan(&e.reg.db, ROOT_REDACT, nil, nil, &list, visit)
+	for kk, x in e.rlog.live {
+		k := kk
+		if k[56] != 40 || x.done {
+			continue
+		}
+		p := Pending{kind = x.kind, from = i64(prim.get_u64le(k[32:40])), to = x.to, target = x.target}
+		copy(p.space[:], k[:16])
+		copy(p.object[:], k[16:32])
+		append(&list, p)
+	}
 	for p in list {
 		if _, ok := e.spaces[p.space]; !ok {
 			continue
@@ -397,22 +405,7 @@ _redact_settle :: proc(e: ^Engine) {
 
 @(private)
 _redact_mark_done :: proc(e: ^Engine, key: []u8) {
-	v, found, gerr := omap.db_get(&e.reg.db, ROOT_REDACT, key, context.temp_allocator)
-	if gerr != .None || !found || len(v) < 1 || v[0] & 0x80 != 0 {
-		return
-	}
-	nv := make([]u8, len(v), context.temp_allocator)
-	copy(nv, v)
-	nv[0] |= 0x80
-	t, terr := omap.txn_begin(&e.reg.db)
-	if terr != .None {
-		return
-	}
-	if omap.txn_put(t, ROOT_REDACT, key, nv) != .None {
-		omap.txn_abort(t)
-		return
-	}
-	omap.txn_commit(t)
+	_rlog_done(e, key)
 }
 
 @(private)
@@ -493,7 +486,7 @@ _relay_key :: proc(e: ^Engine, space: prim.Id, object: prim.Id, device: prim.Id,
 @(private)
 _relay_redact_add :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64) {
 	k, n := _relay_key(e, h.sp.id, h.id, device, from)
-	if _, found, _ := omap.db_get(&e.reg.db, ROOT_REDACT, k[:n], context.temp_allocator); !found {
+	if _, found := _rlog_get(e, k[:n]); !found {
 		_redact_intent(e, h, device, from, to)
 	}
 	if device == e.self {
@@ -507,58 +500,37 @@ _relay_redact_add :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64
 
 @(private)
 _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
-	Acc :: struct {
-		e:      ^Engine,
-		sp:     ^Space,
-		object: prim.Id,
-	}
-	acc := Acc{e, sp, object}
-	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
-		a := (^Acc)(data)
-		if (len(key) != 40 && len(key) != 56) || (len(value) != 9 && len(value) != 17) || value[0] & 0x7f < 1 || value[0] & 0x7f > u8(max(Kind)) {
-			return true
-		}
-		if len(key) == 40 && value[0] & 0x80 == 0 {
-			return true
-		}
-		id: prim.Id
-		copy(id[:], key[16:32])
-		device := a.e.self
-		if len(key) == 56 {
-			copy(device[:], key[40:56])
-		}
-		from := i64(prim.get_u64le(key[32:40]))
-		to := i64(prim.get_u64le(value[1:9]))
-		sc := _object_scope(a.sp, id)
-		defer osync.scope_clear(&sc)
-		name := _seg_name(Kind(value[0] & 0x7f), id)
-		osync.replicator_redact(&a.sp.repl, &sc, device, name, 0, from, to)
-		return true
-	}
-	if !sp.repl_on || !sp.connected {
+	if !sp.repl_on || !sp.connected || !_rlog_ready(e) {
 		return
 	}
-	prefix := make([]u8, 32 if !prim.id_is_zero(object) else 16, context.temp_allocator)
 	s := sp.id
-	copy(prefix[:16], s[:])
-	if !prim.id_is_zero(object) {
-		o := object
-		copy(prefix[16:], o[:])
+	o := object
+	for kk, x in e.rlog.live {
+		k := kk
+		n := int(k[56])
+		if (n != 40 && n != 56) || (n == 40 && !x.done) || string(k[:16]) != string(s[:]) {
+			continue
+		}
+		if !prim.id_is_zero(object) && string(k[16:32]) != string(o[:]) {
+			continue
+		}
+		id: prim.Id
+		copy(id[:], k[16:32])
+		device := e.self
+		if n == 56 {
+			copy(device[:], k[40:56])
+		}
+		from := i64(prim.get_u64le(k[32:40]))
+		sc := _object_scope(sp, id)
+		osync.replicator_redact(&sp.repl, &sc, device, _seg_name(x.kind, id), 0, from, x.to)
+		osync.scope_clear(&sc)
 	}
-	omap.db_scan(&e.reg.db, ROOT_REDACT, prefix, prefix, &acc, visit)
 }
 
 @(private)
 _relay_redact_done :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, from: i64) {
 	k, n := _relay_key(e, sp.id, id, device, from)
-	t, terr := omap.txn_begin(&e.reg.db)
-	if terr == .None {
-		if found, derr := omap.txn_delete(t, ROOT_REDACT, k[:n]); derr == .None && found {
-			omap.txn_commit(t)
-		} else {
-			omap.txn_abort(t)
-		}
-	}
+	_rlog_clear(e, k[:n])
 }
 
 @(private)

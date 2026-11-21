@@ -111,6 +111,7 @@ pi_write_prompt :: proc(d: ^Driver, b: ^[dynamic]u8, p: ^Prompt) {
 pi_submit :: proc(d: ^Driver, p: ^Prompt, o: ^Output) {
 	if d.ready {
 		pi_write_prompt(d, &o.bytes, p)
+		wrote(o, p.id)
 	}
 }
 
@@ -120,6 +121,7 @@ pi_ready :: proc(d: ^Driver, o: ^Output) {
 	for &p in d.prompts {
 		if !p.sent {
 			pi_write_prompt(d, &o.bytes, &p)
+			wrote(o, p.id)
 		}
 	}
 }

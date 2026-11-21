@@ -127,11 +127,12 @@ Launch_File :: struct {
 }
 
 Launch :: struct {
-	argv:  []string,
-	env:   []string,
-	cwd:   string,
-	stdin: []u8,
-	files: []Launch_File,
+	argv:    []string,
+	env:     []string,
+	cwd:     string,
+	stdin:   []u8,
+	files:   []Launch_File,
+	prompts: []string,
 }
 
 Model :: struct {
@@ -268,6 +269,7 @@ Event :: union {
 Output :: struct {
 	events:      [dynamic]Event,
 	bytes:       [dynamic]u8,
+	prompts:     [dynamic]string,
 	restart:     bool,
 	close_stdin: bool,
 	allocator:   mem.Allocator,
@@ -567,6 +569,10 @@ launch :: proc(d: ^Driver, allocator := context.temp_allocator) -> Launch {
 	argv := make([dynamic]string, allocator)
 	b := make([dynamic]u8, allocator)
 	files := make([dynamic]Launch_File, allocator)
+	unsent := make([dynamic]bool, 0, len(d.prompts), context.temp_allocator)
+	for p in d.prompts {
+		append(&unsent, !p.sent)
+	}
 	switch d.desc.protocol {
 	case .Claude_Stream_Json:
 		claude_launch(d, &argv, &b)
@@ -582,7 +588,13 @@ launch :: proc(d: ^Driver, allocator := context.temp_allocator) -> Launch {
 	env := make([dynamic]string, allocator)
 	append(&env, ..d.desc.env)
 	append(&env, ..d.req.env)
-	return Launch{argv = argv[:], env = env[:], cwd = d.req.cwd, stdin = b[:], files = files[:]}
+	prompts := make([dynamic]string, allocator)
+	for p, i in d.prompts {
+		if i < len(unsent) && unsent[i] && p.sent {
+			append(&prompts, strings.clone(p.id, allocator))
+		}
+	}
+	return Launch{argv = argv[:], env = env[:], cwd = d.req.cwd, stdin = b[:], files = files[:], prompts = prompts[:]}
 }
 
 feed :: proc(d: ^Driver, line: []u8, allocator := context.temp_allocator) -> Output {
@@ -776,6 +788,7 @@ output :: proc(allocator: mem.Allocator) -> Output {
 	return Output {
 		events = make([dynamic]Event, allocator),
 		bytes = make([dynamic]u8, allocator),
+		prompts = make([dynamic]string, allocator),
 		allocator = allocator,
 	}
 }
@@ -787,6 +800,13 @@ dup :: proc(o: ^Output, s: string) -> string {
 	}
 	r, _ := strings.clone(s, o.allocator)
 	return r
+}
+
+@(private)
+wrote :: proc(o: ^Output, id: string) {
+	if id != "" {
+		append(&o.prompts, dup(o, id))
+	}
 }
 
 @(private)

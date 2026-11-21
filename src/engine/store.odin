@@ -91,6 +91,7 @@ _registry_open :: proc(e: ^Engine) -> Error {
 
 @(private)
 _registry_close :: proc(e: ^Engine) {
+	_rlog_close(e)
 	if !e.reg.open {
 		return
 	}
@@ -359,6 +360,7 @@ _durable_begin :: proc(e: ^Engine) {
 		_fatal(e, err)
 	}
 	_trees_persist(e)
+	_rlog_settle(e, false)
 	if e.db_open {
 		if err := _derr(odb_barrier(e)); err != .None {
 			_fatal(e, err)

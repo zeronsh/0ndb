@@ -293,7 +293,7 @@ _proc_spawn :: proc(p: ^Proc) -> Error {
 		}
 		run_raw(p.run, RAW_META, b[:])
 	}
-	_proc_write(p, l.stdin)
+	_proc_write(p, l.stdin, l.prompts)
 	return .None
 }
 
@@ -301,7 +301,11 @@ _proc_spawn :: proc(p: ^Proc) -> Error {
 _proc_prompt :: proc(p: ^Proc, run: ^Run) {
 	id := rid_uuid(run.reply if run.revive else run.user)
 	out := agent.send(&p.d, run.text, id, run.files)
+	run.raw_link = run.user
 	_proc_output(p, &out)
+	if p.run == run {
+		run.raw_link = {}
+	}
 }
 
 proc_steer :: proc(p: ^Proc, text: string, id: string, files: []agent.Attachment) -> bool {
@@ -336,12 +340,17 @@ proc_kill :: proc(p: ^Proc) {
 }
 
 @(private)
-_proc_write :: proc(p: ^Proc, data: []u8) {
+_proc_write :: proc(p: ^Proc, data: []u8, prompts: []string = nil) {
 	if len(data) == 0 || !p.alive || p.child.stdin < 0 {
 		return
 	}
 	if p.run != nil {
-		run_raw(p.run, RAW_STDIN, data)
+		off := run_raw(p.run, RAW_STDIN, data)
+		for id in prompts {
+			if m, found := run_prompt_rid(p.run, id); found {
+				run_raw_link(p.run, m, off)
+			}
+		}
 	}
 	append(&p.inq, ..data)
 	_proc_flush(p)
@@ -418,10 +427,20 @@ _proc_lines :: proc(p: ^Proc) {
 		if !ok {
 			return
 		}
+		off := i64(-1)
 		if p.run != nil {
-			run_raw(p.run, RAW_STDOUT, line)
+			off = run_raw(p.run, RAW_STDOUT, line)
 		}
 		out := agent.feed(&p.d, line)
+		if p.run != nil && off >= 0 {
+			for ev in out.events {
+				if pa, is_pa := ev.(agent.Prompt_Accepted); is_pa {
+					if m, found := run_prompt_rid(p.run, pa.id); found {
+						run_raw_link(p.run, m, off)
+					}
+				}
+			}
+		}
 		r := p.r
 		_proc_output(p, &out)
 		if !_proc_live(r, p) {
@@ -573,7 +592,7 @@ _proc_live :: proc(r: ^Runtime, p: ^Proc) -> bool {
 _proc_output :: proc(p: ^Proc, out: ^agent.Output) {
 	r := p.r
 	if len(out.bytes) > 0 {
-		_proc_write(p, out.bytes[:])
+		_proc_write(p, out.bytes[:], out.prompts[:])
 	}
 	for e in out.events {
 		_proc_event(p, e)

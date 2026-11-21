@@ -192,16 +192,20 @@ _redact :: proc(t: ^_Redact_Target, intent_path: string, from, to: i64) -> Error
 	if len(offs) == 0 {
 		return result
 	}
-	if err := _intent_write(t.vfs, intent_path, offs[:]); err != .None {
+	if err := _redact_logged(t, intent_path, offs[:]); err != .None {
 		return err
-	}
-	if err := _redact_apply(t, offs[:]); err != .None {
-		return err
-	}
-	if err := prim.remove(t.vfs, intent_path); err != .None {
-		return _err(err)
 	}
 	return result
+}
+
+@(private)
+_redact_logged :: proc(t: ^_Redact_Target, intent_path: string, offs: []i64) -> Error {
+	if .Atomic_Group_Commit in prim.file_caps(t.vfs, t.fd) {
+		return _redact_apply(t, offs)
+	}
+	_intent_write(t.vfs, intent_path, offs) or_return
+	_redact_apply(t, offs) or_return
+	return _err(prim.remove(t.vfs, intent_path))
 }
 
 @(private)
@@ -247,7 +251,5 @@ _redact_records :: proc(t: ^_Redact_Target, intent_path: string, offs: []i64) ->
 	if len(keep) == 0 {
 		return .None
 	}
-	_intent_write(t.vfs, intent_path, keep[:]) or_return
-	_redact_apply(t, keep[:]) or_return
-	return _err(prim.remove(t.vfs, intent_path))
+	return _redact_logged(t, intent_path, keep[:])
 }

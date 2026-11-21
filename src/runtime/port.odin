@@ -279,7 +279,7 @@ _purge :: proc(data: rawptr, e: ^eng.Engine, req: ^eng.Purge_Request) {
 		return
 	}
 	o := req.object
-	raw_purge(r, o, req.claim, req.bodies)
+	raw_purge(r, o, req.msg, req.claim, req.bodies)
 	ni, found := native_get(r, o)
 	if !found || len(ni.session) == 0 {
 		return
