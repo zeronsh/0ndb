@@ -1,0 +1,472 @@
+package engine
+
+import "core:crypto/blake2b"
+import "core:unicode/utf8"
+import "../convo"
+import "../crdt"
+import "../fs"
+import "../fstree"
+import "../journal"
+import omap "../map"
+import "../obj"
+import "../prim"
+import "../search"
+
+@(private)
+SCAN_BUDGET :: 4096
+@(private)
+TEXT_INDEX_MAX :: 4 << 20
+@(private)
+KIND_NAMES := [5]string{"", "conversation", "map", "text", "tree"}
+
+@(private)
+Index_Item :: struct {
+	space:  prim.Id,
+	object: prim.Id,
+	kind:   Kind,
+}
+
+search_query :: proc(e: ^Engine, query: string, req: search.Request, allocator := context.allocator) -> (res: search.Results, err: Error) {
+	if !e.cfg.search {
+		return res, .Unsupported
+	}
+	_index_open(e) or_return
+	r, serr := search.search(&e.index, query, req, allocator)
+	return r, _xerr(serr)
+}
+
+search_wrote :: proc(e: ^Engine, tree: prim.Id, path: string, unit: search.Unit, lo, hi: u64, allocator := context.allocator) -> (hits: []search.Wrote_Hit, err: Error) {
+	if !e.cfg.search {
+		return nil, .Unsupported
+	}
+	_index_open(e) or_return
+	key := _file_key(tree, path)
+	h, werr := search.wrote(&e.index, key, unit, lo, hi, allocator)
+	return h, _xerr(werr)
+}
+
+@(private)
+_file_key :: proc(tree: prim.Id, path: string) -> []u8 {
+	hx := prim.id_hex(tree)
+	out := make([]u8, len(hx) + 1 + len(path), context.temp_allocator)
+	copy(out, hx[:])
+	out[len(hx)] = '/'
+	copy(out[len(hx) + 1:], path)
+	return out
+}
+
+@(private)
+_index_open :: proc(e: ^Engine) -> Error {
+	if e.index_open {
+		return .None
+	}
+	dir := _join(context.temp_allocator, e.pack_root, "search") or_return
+	_perr(prim.mkdir_all(e.vfs, dir, 0o700)) or_return
+	opts := search.Options {
+		vfs         = e.vfs,
+		store_text  = true,
+		embedder    = e.cfg.embedder,
+		kind_names  = KIND_NAMES[:],
+		budget      = e.cfg.search_budget,
+		cache_pages = 32,
+	}
+	rebuilt, err := search.open(&e.index, dir, opts, e.allocator)
+	if err != .None {
+		return _xerr(err)
+	}
+	e.index_open = true
+	if rebuilt {
+		_index_all(e)
+	}
+	return .None
+}
+
+@(private)
+_index_all :: proc(e: ^Engine) {
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		x := (^Engine)(data)
+		if len(key) != 16 {
+			return true
+		}
+		rec, err := _rec_decode(value, context.temp_allocator)
+		if err != .None {
+			return true
+		}
+		id: prim.Id
+		copy(id[:], key)
+		_index_item_add(x, rec.space, id, rec.kind)
+		return true
+	}
+	omap.db_scan(&e.reg.db, ROOT_OBJECTS, nil, nil, e, visit)
+	_touch(e)
+}
+
+@(private)
+_index_close :: proc(e: ^Engine) {
+	if !e.index_open {
+		return
+	}
+	search.flush(&e.index)
+	search.close(&e.index)
+	e.index_open = false
+}
+
+@(private)
+_index_settle :: proc(e: ^Engine) {
+	_index_close(e)
+}
+
+@(private)
+_source_id :: proc(object: prim.Id, device: prim.Id) -> (id: prim.Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	a, b := object, device
+	blake2b.update(&ctx, a[:])
+	blake2b.update(&ctx, b[:])
+	blake2b.final(&ctx, id[:])
+	return
+}
+
+@(private)
+_rid_ref :: proc(r: Rid) -> (out: [24]u8) {
+	s := r.seg
+	copy(out[:16], s[:])
+	prim.put_u64le(out[16:], u64(r.off))
+	return
+}
+
+@(private)
+_index_step :: proc(e: ^Engine) {
+	if len(e.index_dirty) == 0 {
+		return
+	}
+	items := e.index_dirty
+	e.index_dirty = make([dynamic]Index_Item, e.allocator)
+	defer delete(items)
+	budget := SCAN_BUDGET
+	for it, i in items {
+		if budget <= 0 {
+			append(&e.index_dirty, ..items[i:])
+			_touch(e)
+			return
+		}
+		sp, ok := e.spaces[it.space]
+		if !ok || !sp.open {
+			continue
+		}
+		h, err := _handle_get(e, Object{it.space, it.object}, it.kind)
+		if err != .None {
+			continue
+		}
+		used, more := _scan_object(e, h, budget)
+		budget -= used
+		if more {
+			append(&e.index_dirty, it)
+			_touch(e)
+		}
+	}
+}
+
+@(private)
+_scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bool) {
+	_handle_refresh(h)
+	switch h.kind {
+	case .Conversation, .Map:
+		rec, found, rerr := _rec_get(e, h.id)
+		if rerr != .None {
+			return
+		}
+		dirty_rec := false
+		for s in h.segs {
+			if !s.in_view {
+				continue
+			}
+			mi := _rec_member(&rec, s.device) if found else -1
+			if mi < 0 {
+				continue
+			}
+			vs := obj.view_find(&h.view, s.device)
+			pos := rec.members[mi].scanned
+			end := journal.reader_end(&s.jr)
+			n := 0
+			for pos < end && used < budget {
+				body, next, je := journal.record_at(&s.jr, pos)
+				if je == .Redacted {
+					pos = next
+					continue
+				}
+				if je != .None {
+					break
+				}
+				at := pos
+				pos = next
+				used += 1
+				n += 1
+				rk := obj.record_kind(body)
+				if rk == obj.RECORD_REDACT {
+					env, derr := obj.decode_envelope(body, at)
+					if derr == .None {
+						_apply_remote_redact(e, h, vs, &env)
+					}
+				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Add) {
+					env, derr := obj.decode_envelope(body, at)
+					if derr == .None {
+						if b, berr := omap.decode_body(&env, context.temp_allocator); berr == .None {
+							if add, ok := b.(omap.Add); ok && add.tag == u32(omap.Catalog_Tag.Participants) {
+								_catalog_participant_seen(e, h.sp, add.key, add.element)
+							}
+						}
+					}
+				}
+			}
+			if pos != rec.members[mi].scanned {
+				rec.members[mi].scanned = pos
+				dirty_rec = true
+			}
+			if pos < end && used >= budget {
+				more = true
+			}
+		}
+		if dirty_rec {
+			_rec_put(e, h.id, &rec)
+		}
+		if e.cfg.search && _index_open(e) == .None {
+			if r := _own_reader(h); r != nil {
+				u, m := _index_segment(e, h, e.self, r, budget - used)
+				used += u
+				more ||= m
+			}
+			for s in h.segs {
+				if s.in_view {
+					u, m := _index_segment(e, h, s.device, &s.jr, budget - used)
+					used += u
+					more ||= m
+				}
+			}
+		}
+	case .Text:
+		if e.cfg.search && _index_open(e) == .None {
+			_index_text(e, h)
+		}
+		used += 1
+	case .File_Tree:
+		if e.cfg.search && _index_open(e) == .None {
+			used += _index_tree(e, h, budget)
+		}
+	}
+	return
+}
+
+@(private)
+_index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Reader, budget: int) -> (used: int, more: bool) {
+	if budget <= 0 {
+		return 0, true
+	}
+	src := _source_id(h.id, device)
+	pos, perr := search.position(&e.index, src)
+	if perr != .None {
+		return
+	}
+	end := journal.reader_end(r)
+	tail_ok := false
+	t: convo.Tail
+	for pos < end {
+		if used >= budget {
+			return used, true
+		}
+		body, next, je := journal.record_at(r, pos)
+		if je == .Redacted {
+			pos = next
+			continue
+		}
+		if je != .None {
+			break
+		}
+		at := pos
+		pos = next
+		used += 1
+		k := obj.record_kind(body)
+		if obj.is_sig(body) || k < obj.RECORD_KIND_FIRST {
+			continue
+		}
+		if h.kind == .Conversation {
+			if k != u8(convo.Kind.Seal) {
+				continue
+			}
+			rec, derr := convo.decode_record(body, at, context.temp_allocator)
+			if derr != .None {
+				continue
+			}
+			seal, ok := rec.body.(convo.Seal)
+			if !ok {
+				continue
+			}
+			if !tail_ok {
+				tt, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
+				if terr != .None {
+					return used, false
+				}
+				t = tt
+				tail_ok = true
+			}
+			msg := Rid{device, seal.msg}
+			m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator)
+			if merr != .None {
+				continue
+			}
+			ref := _rid_ref(msg)
+			for b in m.blocks {
+				#partial switch b.kind {
+				case .Text, .Reasoning, .Tool_Call, .Tool_Result, .Question, .Notice, .Error:
+				case:
+					continue
+				}
+				if len(b.text) == 0 || !utf8.valid_string(string(b.text)) {
+					continue
+				}
+				doc := search.Doc {
+					object      = h.id,
+					ref         = ref[:],
+					part        = b.index,
+					kind        = u8(Kind.Conversation),
+					participant = m.author,
+					hlc         = m.hlc,
+					text        = b.text,
+					embed       = e.cfg.embedder.embed != nil && b.kind == .Text,
+				}
+				search.add(&e.index, src, next, &doc)
+			}
+		} else {
+			env, derr := obj.decode_envelope(body, at)
+			if derr != .None {
+				continue
+			}
+			b, berr := omap.decode_body(&env, context.temp_allocator)
+			if berr != .None {
+				continue
+			}
+			put, ok := b.(omap.Put)
+			if !ok {
+				continue
+			}
+			if h.id == h.sp.catalog {
+				if id, iok := omap.value_id(put.key); iok {
+					for f in put.fields {
+						if f.tag == u32(omap.Catalog_Tag.Title) && utf8.valid_string(string(f.value)) {
+							search.set_title(&e.index, src, next, id, device, f.hlc, u8(Kind.Conversation), string(f.value))
+						}
+					}
+				}
+				continue
+			}
+			for f in put.fields {
+				slot := make([]u8, len(put.key) + 4, context.temp_allocator)
+				copy(slot, put.key)
+				prim.put_u32le(slot[len(put.key):], f.tag)
+				if len(f.value) == 0 || !utf8.valid_string(string(f.value)) {
+					search.delete_slot(&e.index, src, next, h.id, slot)
+					continue
+				}
+				doc := search.Doc {
+					object      = h.id,
+					ref         = put.key,
+					part        = f.tag,
+					kind        = u8(Kind.Map),
+					slot        = slot,
+					participant = device,
+					hlc         = f.hlc,
+					text        = f.value,
+				}
+				search.add(&e.index, src, next, &doc)
+			}
+		}
+		e.stats.indexed += 1
+	}
+	search.advance(&e.index, src, pos)
+	return used, false
+}
+
+@(private)
+_index_text :: proc(e: ^Engine, h: ^Handle) {
+	_hist_catch_up(e, h)
+	if h.hist == nil {
+		return
+	}
+	inode, found, ierr := _text_inode(h)
+	if ierr != .None || !found {
+		return
+	}
+	f, ferr := fs.history_file(h.hist, inode)
+	if ferr != .None {
+		return
+	}
+	n := crdt.text_len(&f.text)
+	if n > TEXT_INDEX_MAX {
+		return
+	}
+	data := crdt.text_bytes(&f.text, context.temp_allocator)
+	if !utf8.valid_string(string(data)) {
+		return
+	}
+	src := _source_id(h.id, e.self)
+	slot := transmute([]u8)string("text")
+	doc := search.Doc {
+		object      = h.id,
+		ref         = slot,
+		kind        = u8(Kind.Text),
+		slot        = slot,
+		participant = e.self,
+		hlc         = hlc_now(e),
+		text        = data,
+		embed       = e.cfg.embedder.embed != nil,
+	}
+	search.add(&e.index, src, _own_len(h), &doc)
+}
+
+@(private)
+_index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> int {
+	_hist_catch_up(e, h)
+	if h.hist == nil {
+		return 0
+	}
+	touched := fs.history_touched(h.hist)
+	if len(touched) == 0 {
+		return 0
+	}
+	snap := fstree.current(&h.hist.tree)
+	src := _source_id(h.id, e.self)
+	used := 0
+	for id in touched {
+		if used >= budget {
+			break
+		}
+		used += 1
+		path, ok, perr := fstree.path(&snap, id, context.temp_allocator)
+		if perr != nil || !ok {
+			continue
+		}
+		f, ferr := fs.history_file(h.hist, id)
+		if ferr != .None {
+			continue
+		}
+		data := crdt.text_bytes(&f.text, context.temp_allocator)
+		spans := crdt.text_spans(&f.text, &h.hist.g, context.temp_allocator)
+		out := make([dynamic]search.Span, context.temp_allocator)
+		at := 0
+		line: u32 = 1
+		for s in spans {
+			lo := at
+			hi := min(at + s.len, len(data))
+			l0 := line
+			for i in lo ..< hi {
+				if data[i] == '\n' {
+					line += 1
+				}
+			}
+			append(&out, search.Span{byte_lo = u64(lo), byte_hi = u64(hi), line_lo = l0, line_hi = line, scope = s.id.actor})
+			at = hi
+		}
+		search.set_spans(&e.index, src, _own_len(h), _file_key(h.id, path), out[:])
+	}
+	return used
+}

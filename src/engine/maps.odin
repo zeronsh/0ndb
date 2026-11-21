@@ -1,0 +1,481 @@
+package engine
+
+import "../convo"
+import omap "../map"
+import "../obj"
+import "../prim"
+import osync "../sync"
+
+Map_Field :: omap.Field
+Map_Entry :: omap.Entry
+Map_Row :: omap.Row
+Map_Cursor :: omap.Cursor
+Catalog_Entry :: omap.Catalog_Entry
+Catalog_Row :: omap.Catalog_Row
+
+@(private)
+Catalog_Update :: struct {
+	space:       prim.Id,
+	kind:        Kind,
+	set:         Catalog_Fields,
+	created:     bool,
+	activity:    bool,
+	status:      bool,
+	participant: bool,
+	title:       string,
+	archived:    bool,
+	pinned:      bool,
+	parent:      obj.Xref,
+	workspace:   prim.Id,
+	agent:       prim.Id,
+	usage:       convo.Usage,
+	has_usage:   bool,
+}
+
+map_create :: proc(e: ^Engine, space: prim.Id, title := "", settings: []u8 = nil) -> (o: Object, err: Error) {
+	o = Object{space, prim.id_new()}
+	h := _handle_get(e, o, .Map) or_return
+	_handle_create_writer(h, {}, settings) or_return
+	_catalog_created(e, h, title, {}, {}, {})
+	return o, .None
+}
+
+map_open :: proc(e: ^Engine, o: Object) -> Error {
+	_, err := _handle_get(e, o, .Map)
+	return err
+}
+
+map_writer :: proc(e: ^Engine, o: Object) -> (w: ^omap.Writer, err: Error) {
+	h := _map_writable(e, o) or_return
+	_handle_mark(h)
+	return &h.mw, .None
+}
+
+map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator, ready: Ready = {}) -> (entry: Map_Entry, found: bool, err: Error) {
+	h := _handle_get(e, o, .Map) or_return
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return entry, false, merr
+	}
+	entry, found = _oerr2(omap.table_get(&h.table, key, allocator)) or_return
+	if merr == .Missing || _handle_waiting(h) {
+		if ready.call != nil {
+			return entry, found, _wait(e, h, ready)
+		}
+	}
+	return entry, found, .None
+}
+
+map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Map_Row, more: bool, err: Error) {
+	h := _handle_get(e, o, .Map) or_return
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return nil, false, merr
+	}
+	r, m, serr := omap.table_scan(&h.table, -1, prefix, after, limit, allocator)
+	if serr != .None {
+		return nil, false, _oerr(serr)
+	}
+	if (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+		return r, m, _wait(e, h, ready)
+	}
+	return r, m, .None
+}
+
+catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (c: Catalog_Entry, found: bool, err: Error) {
+	sp := _space_open(e, o.space) or_return
+	h := _catalog_handle(e, sp) or_return
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return c, false, merr
+	}
+	c, found = _oerr2(omap.catalog_get(&h.table, o.id, allocator)) or_return
+	if !found && (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+		return c, false, _wait(e, h, ready)
+	}
+	return c, found, .None
+}
+
+catalog_list :: proc(e: ^Engine, space: prim.Id, archived: bool, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Catalog_Row, more: bool, err: Error) {
+	sp := _space_open(e, space) or_return
+	h := _catalog_handle(e, sp) or_return
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return nil, false, merr
+	}
+	r, m, lerr := omap.catalog_list(&h.table, archived, after, limit, allocator)
+	if lerr != .None {
+		return nil, false, _oerr(lerr)
+	}
+	if len(r) == 0 && (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+		return r, m, _wait(e, h, ready)
+	}
+	return r, m, .None
+}
+
+catalog_usage :: proc(e: ^Engine, o: Object, usage: convo.Usage) {
+	u := _catalog_q(e, o.space, o.id, .Conversation)
+	if u == nil {
+		return
+	}
+	u.usage.input += usage.input
+	u.usage.output += usage.output
+	u.usage.cache_read += usage.cache_read
+	u.usage.cache_write += usage.cache_write
+	u.has_usage = true
+	u.activity = true
+}
+
+@(private)
+_oerr2 :: proc(a: $A, b: $B, err: obj.Error) -> (A, B, Error) {
+	return a, b, _oerr(err)
+}
+
+@(private)
+_map_writable :: proc(e: ^Engine, o: Object) -> (h: ^Handle, err: Error) {
+	h = _handle_get(e, o, .Map) or_return
+	_handle_refresh(h)
+	if err = _handle_create_writer(h); err != .None {
+		return h, err
+	}
+	return h, .None
+}
+
+@(private)
+_by_key :: proc(data: rawptr, en: ^omap.Entry, out: ^[dynamic]u8) -> bool {
+	append(out, ..en.key)
+	return true
+}
+
+@(private)
+_map_table :: proc(e: ^Engine, h: ^Handle) -> Error {
+	if h.table_open {
+		return .None
+	}
+	dir := _obj_dir(e, h.id) or_return
+	_perr(prim.mkdir_all(e.vfs, dir, 0o700)) or_return
+	path := _join(context.temp_allocator, dir, "table") or_return
+	if h.id == h.sp.catalog {
+		defs := omap.catalog_defs()
+		_oerr(omap.table_open(&h.table, e.vfs, path, defs[:], e.allocator)) or_return
+	} else {
+		_oerr(omap.table_open(&h.table, e.vfs, path, nil, e.allocator)) or_return
+	}
+	h.table_open = true
+	return .None
+}
+
+@(private)
+_map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
+	_map_table(e, h) or_return
+	_handle_refresh(h)
+	missing := false
+	if h.w_open {
+		if _, err := omap.table_apply(&h.table, e.self, &h.mw.core.jr); err != .None && err != .Missing {
+			return _oerr(err)
+		} else if err == .Missing {
+			missing = true
+		}
+	}
+	for s in h.segs {
+		if !s.in_view {
+			missing = true
+			continue
+		}
+		if _, err := omap.table_apply(&h.table, s.device, &s.jr); err != .None {
+			if err == .Missing {
+				missing = true
+				if h.sp.repl_on {
+					_follow(e, h, s, true)
+				}
+				continue
+			}
+			_log(e, .Warn, "map apply failed")
+		}
+	}
+	return .Missing if missing else .None
+}
+
+@(private)
+_map_observed :: proc(e: ^Engine, h: ^Handle, key: []u8, tag: u32, element: []u8) -> (observed: []Rid, err: Error) {
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return nil, merr
+	}
+	en, found, gerr := omap.table_get(&h.table, key, context.temp_allocator)
+	if gerr != .None {
+		return nil, _oerr(gerr)
+	}
+	if !found {
+		return nil, .None
+	}
+	for el in en.elements {
+		if el.tag == tag && string(el.value) == string(element) {
+			return el.live, .None
+		}
+	}
+	return nil, .None
+}
+
+@(private)
+_follow :: proc(e: ^Engine, h: ^Handle, s: ^Seg, full: bool) {
+	if s.follow || !h.sp.repl_on {
+		return
+	}
+	s.follow = true
+	osync.replicator_follow(&h.sp.repl, &h.scope, s.device, h.name, 0, full)
+}
+
+@(private)
+_catalog_handle :: proc(e: ^Engine, sp: ^Space) -> (h: ^Handle, err: Error) {
+	h = _handle_get(e, Object{sp.id, sp.catalog}, .Map) or_return
+	_map_table(e, h) or_return
+	return h, .None
+}
+
+@(private)
+_catalog_follow :: proc(e: ^Engine, sp: ^Space) {
+	name := _seg_name(.Map, sp.catalog)
+	osync.replicator_follow_segments(&sp.repl, &sp.scope, name, 0, true)
+}
+
+@(private)
+_catalog_table_close :: proc(sp: ^Space) {
+	e := sp.e
+	if h, ok := e.handles[sp.catalog]; ok && h.pins == 0 && h.table_open {
+		omap.table_close(&h.table)
+		h.table_open = false
+	}
+}
+
+@(private)
+_catalog_q :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind) -> ^Catalog_Update {
+	if sp, ok := e.spaces[space]; ok && sp.catalog == id {
+		return nil
+	}
+	if u, ok := e.catalog_q[id]; ok {
+		return u
+	}
+	u := new(Catalog_Update, e.allocator)
+	u.space = space
+	u.kind = kind
+	e.catalog_q[id] = u
+	_touch(e)
+	return u
+}
+
+@(private)
+_catalog_created :: proc(e: ^Engine, h: ^Handle, title: string, parent: obj.Xref, workspace: prim.Id, agent: prim.Id) {
+	u := _catalog_q(e, h.sp.id, h.id, h.kind)
+	if u == nil {
+		return
+	}
+	u.created = true
+	u.activity = true
+	u.participant = true
+	u.status = h.kind == .Conversation
+	if len(title) > 0 {
+		delete(u.title, e.allocator)
+		u.title, _ = _clone(title, e.allocator)
+		u.set += {.Title}
+	}
+	if !prim.id_is_zero(parent.object) {
+		u.parent = parent
+		u.set += {.Parent}
+	}
+	if !prim.id_is_zero(workspace) {
+		u.workspace = workspace
+		u.set += {.Workspace}
+	}
+	if !prim.id_is_zero(agent) {
+		u.agent = agent
+		u.set += {.Agent}
+	}
+}
+
+@(private)
+_catalog_activity :: proc(e: ^Engine, h: ^Handle) {
+	u := _catalog_q(e, h.sp.id, h.id, h.kind)
+	if u == nil {
+		return
+	}
+	u.activity = true
+	u.status = h.kind == .Conversation
+}
+
+@(private)
+_catalog_participant :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
+	u := _catalog_q(e, sp.id, id, kind)
+	if u == nil {
+		return
+	}
+	u.participant = true
+}
+
+@(private)
+_catalog_set :: proc(e: ^Engine, c: Cmd_Catalog_Set) -> Error {
+	_space_open(e, c.object.space) or_return
+	kind := Kind.Conversation
+	if rec, found, _ := _rec_get(e, c.object.id); found {
+		kind = rec.kind
+	}
+	u := _catalog_q(e, c.object.space, c.object.id, kind)
+	if u == nil {
+		return .Invalid
+	}
+	u.set += c.set
+	if .Title in c.set {
+		delete(u.title, e.allocator)
+		u.title = _clone(c.title, e.allocator) or_return
+	}
+	if .Archived in c.set {
+		u.archived = c.archived
+	}
+	if .Pinned in c.set {
+		u.pinned = c.pinned
+	}
+	if .Parent in c.set {
+		u.parent = c.parent
+	}
+	if .Workspace in c.set {
+		u.workspace = c.workspace
+	}
+	if .Agent in c.set {
+		u.agent = c.agent
+	}
+	return .None
+}
+
+@(private)
+_catalog_flush :: proc(e: ^Engine) {
+	if len(e.catalog_q) == 0 {
+		return
+	}
+	q := e.catalog_q
+	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
+	defer delete(q)
+	for id, u in q {
+		if err := _catalog_write(e, id, u); err != .None {
+			_log(e, .Warn, "catalog update failed")
+		}
+		delete(u.title, e.allocator)
+		free(u, e.allocator)
+	}
+}
+
+@(private)
+_catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
+	sp := _space_open(e, u.space) or_return
+	h := _catalog_handle(e, sp) or_return
+	_handle_create_writer(h) or_return
+	fields := make([dynamic]omap.Field, context.temp_allocator)
+	if u.created {
+		append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Kind), u64(u.kind)))
+		append(&fields, omap.field_bool(u32(omap.Catalog_Tag.Archived), false))
+		append(&fields, omap.field_bool(u32(omap.Catalog_Tag.Pinned), false))
+	}
+	if .Title in u.set {
+		append(&fields, omap.field_str(u32(omap.Catalog_Tag.Title), u.title))
+	}
+	if .Parent in u.set {
+		b := make([dynamic]u8, context.temp_allocator)
+		w := prim.writer(&b)
+		prim.write_id(&w, u.parent.object)
+		prim.write_id(&w, u.parent.rid.seg)
+		prim.write_uvarint(&w, u64(max(u.parent.rid.off, 0)))
+		append(&fields, omap.Field{tag = u32(omap.Catalog_Tag.Parent), value = b[:]})
+	}
+	if .Workspace in u.set {
+		append(&fields, omap.field_id(u32(omap.Catalog_Tag.Workspace), u.workspace))
+	}
+	if .Agent in u.set {
+		append(&fields, omap.field_id(u32(omap.Catalog_Tag.Agent), u.agent))
+	}
+	if .Archived in u.set {
+		append(&fields, omap.field_bool(u32(omap.Catalog_Tag.Archived), u.archived))
+	}
+	if .Pinned in u.set {
+		append(&fields, omap.field_bool(u32(omap.Catalog_Tag.Pinned), u.pinned))
+	}
+	if u.activity {
+		append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Activity), u64(_wall_ms(e))))
+	}
+	if u.status && u.kind == .Conversation {
+		if ch, err := _handle_get(e, Object{u.space, id}, .Conversation); err == .None {
+			_handle_refresh(ch)
+			t, terr := convo.view_tail(&ch.view, e.self, context.temp_allocator)
+			if terr == .None {
+				append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Status), u64(t.status)))
+			}
+		}
+	}
+	cur: omap.Catalog_Entry
+	found := false
+	if u.has_usage || u.participant {
+		_map_sync(e, h)
+		cur, found, _ = omap.catalog_get(&h.table, id, context.temp_allocator)
+	}
+	if u.has_usage {
+		total := _usage_decode(cur.usage) if found else convo.Usage{}
+		total.input += u.usage.input
+		total.output += u.usage.output
+		total.cache_read += u.usage.cache_read
+		total.cache_write += u.usage.cache_write
+		b := make([dynamic]u8, context.temp_allocator)
+		w := prim.writer(&b)
+		convo.encode_usage(&w, total)
+		append(&fields, omap.Field{tag = u32(omap.Catalog_Tag.Usage), value = b[:]})
+	}
+	kb: [16]u8
+	key := omap.catalog_key(id, &kb)
+	if len(fields) > 0 {
+		_oerr2b(omap.put(&h.mw, key, fields[:])) or_return
+	}
+	if u.participant {
+		present := false
+		if found {
+			for p in cur.participants {
+				present ||= p == e.self
+			}
+		}
+		if !present {
+			s := e.self
+			_, aerr := omap.add(&h.mw, key, u32(omap.Catalog_Tag.Participants), s[:])
+			_oerr(aerr) or_return
+		}
+	}
+	_handle_mark(h)
+	return .None
+}
+
+@(private)
+_usage_decode :: proc(b: []u8) -> convo.Usage {
+	if len(b) == 0 {
+		return {}
+	}
+	r := prim.reader(b)
+	return convo.decode_usage(&r)
+}
+
+@(private)
+_catalog_members :: proc(e: ^Engine, h: ^Handle) {
+	sp := h.sp
+	if h.id == sp.catalog {
+		return
+	}
+	ch, err := _catalog_handle(e, sp)
+	if err != .None {
+		return
+	}
+	_map_sync(e, ch)
+	c, found, gerr := omap.catalog_get(&ch.table, h.id, context.temp_allocator)
+	if gerr != .None || !found {
+		return
+	}
+	for p in c.participants {
+		if p != e.self {
+			_member_seen(e, sp, h.id, h.kind, p)
+			_handle_add_member(h, p, 0)
+		}
+	}
+}

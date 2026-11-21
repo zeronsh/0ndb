@@ -1,0 +1,730 @@
+package engine
+
+import "base:runtime"
+import "core:sync"
+import "core:thread"
+import "../fs"
+import "../http"
+import "../obj"
+import "../odb"
+import "../pack"
+import "../prim"
+import "../search"
+import osync "../sync"
+
+Error :: enum u8 {
+	None,
+	Pending,
+	Not_Found,
+	Exists,
+	Invalid,
+	Busy,
+	Closed,
+	Offline,
+	Permission,
+	Forged,
+	Quarantined,
+	Missing,
+	Corrupt,
+	Limit,
+	Too_Large,
+	Unsupported,
+	Not_Assigned,
+	No_Space,
+	No_Memory,
+	Io,
+}
+
+Kind :: obj.Kind
+
+Object :: struct {
+	space: prim.Id,
+	id:    prim.Id,
+}
+
+Rid :: obj.Rid
+
+Durability :: enum u8 {
+	Async,
+	Deferred,
+}
+
+Log_Level :: enum u8 {
+	Debug,
+	Info,
+	Warn,
+	Error,
+}
+
+Log :: struct {
+	data:  rawptr,
+	write: proc(data: rawptr, level: Log_Level, msg: string),
+}
+
+Clock :: struct {
+	data:    rawptr,
+	wall_ms: proc(data: rawptr) -> i64,
+}
+
+Spawner :: struct {
+	data:  rawptr,
+	spawn: proc(data: rawptr, argv: []string, cwd: string, env: []string, new_group: bool) -> (prim.Child, prim.Error),
+}
+
+Peer :: struct {
+	space:        prim.Id,
+	relay:        string,
+	relay_public: osync.Public_Key,
+}
+
+Link :: distinct u64
+
+Transport :: struct {
+	data:  rawptr,
+	open:  proc(data: rawptr, e: ^Engine, link: Link, peer: Peer) -> (conn: rawptr, err: Error),
+	send:  proc(data: rawptr, conn: rawptr, bytes: []u8) -> (int, Error),
+	close: proc(data: rawptr, conn: rawptr),
+}
+
+Credentials_Source :: struct {
+	data:    rawptr,
+	produce: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool),
+}
+
+Purge_Request :: struct {
+	object:   Object,
+	msg:      Rid,
+	provider: string,
+	native:   string,
+	ids:      []string,
+}
+
+Purge_Hook :: struct {
+	data:  rawptr,
+	purge: proc(data: rawptr, e: ^Engine, req: ^Purge_Request),
+}
+
+Event_Kind :: enum u8 {
+	Connected,
+	Disconnected,
+	Durable,
+	Uploaded,
+	Quarantined,
+	Refused,
+	Fatal,
+	Space_Joined,
+	Object_Seen,
+	Failure,
+}
+
+Event :: struct {
+	kind:   Event_Kind,
+	space:  prim.Id,
+	object: prim.Id,
+	device: prim.Id,
+	tick:   u64,
+	length: i64,
+	err:    Error,
+	detail: string,
+}
+
+Event_Hook :: struct {
+	data:  rawptr,
+	event: proc(data: rawptr, e: ^Engine, ev: ^Event),
+}
+
+Config :: struct {
+	dir:             string,
+	vfs:             prim.Vfs,
+	loop:            ^prim.Loop,
+	keyring:         osync.Keyring,
+	credentials:     Credentials_Source,
+	transport:       Transport,
+	clock:           Clock,
+	log:             Log,
+	spawner:         Spawner,
+	embedder:        search.Embedder,
+	purge:           Purge_Hook,
+	events:          Event_Hook,
+	http:            http.Client,
+	write_observer:  fs.Write_Observer,
+	durability:      Durability,
+	verify_chains:   bool,
+	kernel_tls:      bool,
+	padding:         bool,
+	search:          bool,
+	handle_cache:    int,
+	settle_ms:       i64,
+	pack_options:    pack.Options,
+	use_pack_options: bool,
+	search_budget:   int,
+	user:            rawptr,
+}
+
+DEFAULT_HANDLE_CACHE :: 64
+DEFAULT_SETTLE_MS :: 1000
+DEFAULT_SEARCH_BUDGET :: 1 << 20
+
+default_config :: proc(dir: string) -> Config {
+	return Config {
+		dir           = dir,
+		verify_chains = true,
+		kernel_tls    = true,
+		search        = true,
+		handle_cache  = DEFAULT_HANDLE_CACHE,
+		settle_ms     = DEFAULT_SETTLE_MS,
+		search_budget = DEFAULT_SEARCH_BUDGET,
+	}
+}
+
+Posted :: struct {
+	call: proc(e: ^Engine, data: rawptr),
+	data: rawptr,
+}
+
+Stats :: struct {
+	ticks:       u64,
+	commits:     u64,
+	durable:     u64,
+	handles:     int,
+	opened:      u64,
+	evicted:     u64,
+	pending:     int,
+	subs:        int,
+	fetches:     u64,
+	indexed:     u64,
+	wakeups:     u64,
+}
+
+Engine :: struct {
+	cfg:          Config,
+	allocator:    runtime.Allocator,
+	dir:          string,
+	pack_root:    string,
+	base:         prim.Vfs,
+	vfs:          prim.Vfs,
+	pk:           pack.Pack,
+	pk_open:      bool,
+	lock_fd:      prim.Fd,
+	loop:         ^prim.Loop,
+	own_loop:     prim.Loop,
+	owns_loop:    bool,
+	prev_wake:    prim.Wake_Proc,
+	prev_wake_data: rawptr,
+	thread:       ^thread.Thread,
+	running:      bool,
+	post_mu:      sync.Mutex,
+	posted:       [dynamic]Posted,
+	post_swap:    [dynamic]Posted,
+	wake_hooks:   [dynamic]Posted,
+	file_keyring: osync.File_Keyring,
+	owns_keyring: bool,
+	keyring:      osync.Keyring,
+	identity:     osync.Identity,
+	self:         prim.Id,
+	hlc:          prim.Hlc,
+	reg:          Registry,
+	spaces:       map[prim.Id]^Space,
+	links:        [dynamic]^Space,
+	handles:      map[prim.Id]^Handle,
+	lru:          [dynamic]^Handle,
+	own_trees:    map[osync.Stream_Id]^Own_Tree,
+	waiters:      [dynamic]^Waiter,
+	subs:         [dynamic]^Sub,
+	next_sub:     u64,
+	tick:         u64,
+	tick_timer:   prim.Timer,
+	settle_timer: prim.Timer,
+	in_tick:      bool,
+	closing:      bool,
+	dirty:        [dynamic]Dirty_Seg,
+	batches:      [dynamic]^Durable_Batch,
+	durable_tick: u64,
+	changed:      map[prim.Id]Change,
+	catalog_q:    map[prim.Id]^Catalog_Update,
+	index:        search.Index,
+	index_open:   bool,
+	index_dirty:  [dynamic]Index_Item,
+	db:           odb.Odb,
+	db_open:      bool,
+	plug:         Plug_State,
+	stats:        Stats,
+	fatal:        Error,
+}
+
+open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: Error) {
+	e^ = {
+		cfg       = cfg,
+		allocator = allocator,
+		lock_fd   = prim.INVALID_FD,
+	}
+	if len(cfg.dir) == 0 {
+		return .Invalid
+	}
+	if e.cfg.handle_cache <= 0 {
+		e.cfg.handle_cache = DEFAULT_HANDLE_CACHE
+	}
+	if e.cfg.settle_ms <= 0 {
+		e.cfg.settle_ms = DEFAULT_SETTLE_MS
+	}
+	if e.cfg.search_budget <= 0 {
+		e.cfg.search_budget = DEFAULT_SEARCH_BUDGET
+	}
+	e.base = cfg.vfs if cfg.vfs.procs != nil else prim.os_vfs()
+	e.dir = _clone(cfg.dir, allocator) or_return
+	e.pack_root = _join(allocator, e.dir, "pack") or_return
+	e.spaces = make(map[prim.Id]^Space, allocator)
+	e.links = make([dynamic]^Space, allocator)
+	e.handles = make(map[prim.Id]^Handle, allocator)
+	e.lru = make([dynamic]^Handle, allocator)
+	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, allocator)
+	e.waiters = make([dynamic]^Waiter, allocator)
+	e.subs = make([dynamic]^Sub, allocator)
+	e.posted = make([dynamic]Posted, allocator)
+	e.post_swap = make([dynamic]Posted, allocator)
+	e.wake_hooks = make([dynamic]Posted, allocator)
+	e.dirty = make([dynamic]Dirty_Seg, allocator)
+	e.batches = make([dynamic]^Durable_Batch, allocator)
+	e.changed = make(map[prim.Id]Change, allocator)
+	e.catalog_q = make(map[prim.Id]^Catalog_Update, allocator)
+	e.index_dirty = make([dynamic]Index_Item, allocator)
+	defer if err != .None {
+		_teardown(e)
+	}
+	_perr(prim.mkdir_all(e.base, e.dir, 0o700)) or_return
+	lock_path := _join(context.temp_allocator, e.dir, "lock") or_return
+	fd, lerr := prim.lock_file(e.base, lock_path)
+	if lerr != .None {
+		return .Busy if lerr == .Busy || lerr == .Would_Block else _perr(lerr)
+	}
+	e.lock_fd = fd
+	if cfg.loop != nil {
+		e.loop = cfg.loop
+	} else {
+		_perr(prim.loop_init(&e.own_loop, allocator)) or_return
+		e.loop = &e.own_loop
+		e.owns_loop = true
+	}
+	e.prev_wake = e.loop.wake_cb
+	e.prev_wake_data = e.loop.wake_data
+	prim.loop_on_wake(e.loop, _on_wake, e)
+	opts := cfg.pack_options if cfg.use_pack_options else pack.DEFAULT_OPTIONS
+	if cfg.durability == .Deferred {
+		opts.deferred_sync = true
+		opts.wake = nil
+		opts.wake_data = nil
+	} else {
+		opts.wake = _pack_wake
+		opts.wake_data = e
+	}
+	_perr(prim.mkdir_all(e.base, e.pack_root, 0o700)) or_return
+	_perr(pack.open(&e.pk, e.base, e.pack_root, opts, allocator)) or_return
+	e.pk_open = true
+	e.vfs = pack.vfs(&e.pk)
+	pack.batch_begin(&e.pk)
+	if cfg.keyring.identity != nil {
+		e.keyring = cfg.keyring
+	} else {
+		kdir := _join(context.temp_allocator, e.dir, "device") or_return
+		_perr(prim.mkdir_all(e.base, kdir, 0o700)) or_return
+		_serr(osync.file_keyring_open(&e.file_keyring, e.base, kdir)) or_return
+		e.owns_keyring = true
+		e.keyring = osync.file_keyring(&e.file_keyring)
+	}
+	e.identity = osync.keyring_identity(&e.keyring)
+	e.self = e.identity.id
+	_registry_open(e) or_return
+	_spaces_load(e) or_return
+	return .None
+}
+
+close :: proc(e: ^Engine) -> Error {
+	if e.running {
+		stop(e)
+	}
+	e.closing = true
+	err := flush(e)
+	_teardown(e)
+	return err
+}
+
+identity :: proc "contextless" (e: ^Engine) -> osync.Identity {
+	return e.identity
+}
+
+self :: proc "contextless" (e: ^Engine) -> prim.Id {
+	return e.self
+}
+
+loop :: proc "contextless" (e: ^Engine) -> ^prim.Loop {
+	return e.loop
+}
+
+vfs :: proc "contextless" (e: ^Engine) -> prim.Vfs {
+	return e.vfs
+}
+
+stats :: proc(e: ^Engine) -> Stats {
+	s := e.stats
+	s.handles = len(e.handles)
+	s.pending = len(e.waiters)
+	s.subs = len(e.subs)
+	return s
+}
+
+fd :: proc "contextless" (e: ^Engine) -> prim.Fd {
+	when ODIN_OS == .Linux {
+		return prim.Fd(e.loop.os.epfd)
+	} else {
+		return prim.Fd(e.loop.os.kq)
+	}
+}
+
+timeout_ms :: proc(e: ^Engine) -> i64 {
+	if len(e.loop.pending) > 0 {
+		return 0
+	}
+	if len(e.loop.heap) == 0 {
+		return -1
+	}
+	d := e.loop.timers[e.loop.heap[0]].deadline - prim.mono_ns()
+	if d <= 0 {
+		return 0
+	}
+	return (d + 999_999) / 1_000_000
+}
+
+step :: proc(e: ^Engine, block := false) -> Error {
+	return _perr(prim.loop_step(e.loop, block))
+}
+
+run :: proc(e: ^Engine) -> Error {
+	return _perr(prim.loop_run(e.loop))
+}
+
+start :: proc(e: ^Engine) -> Error {
+	if e.running {
+		return .Busy
+	}
+	if !e.owns_loop {
+		return .Invalid
+	}
+	t := thread.create(_thread_main)
+	if t == nil {
+		return .No_Memory
+	}
+	t.data = e
+	e.thread = t
+	e.running = true
+	thread.start(t)
+	return .None
+}
+
+stop :: proc(e: ^Engine) {
+	if !e.running {
+		return
+	}
+	post(e, _stop_call, nil)
+	thread.join(e.thread)
+	thread.destroy(e.thread)
+	e.thread = nil
+	e.running = false
+}
+
+post :: proc(e: ^Engine, call: proc(e: ^Engine, data: rawptr), data: rawptr) -> Error {
+	sync.mutex_lock(&e.post_mu)
+	_, aerr := append(&e.posted, Posted{call, data})
+	sync.mutex_unlock(&e.post_mu)
+	if aerr != nil {
+		return .No_Memory
+	}
+	prim.wake(e.loop)
+	return .None
+}
+
+flush :: proc(e: ^Engine) -> Error {
+	if !e.pk_open {
+		return .Closed
+	}
+	_tick_end(e)
+	_durable_begin(e)
+	err := _perr(pack.batch_end(&e.pk))
+	pack.batch_begin(&e.pk)
+	_batches_done(e, err)
+	if err != .None {
+		return err
+	}
+	return e.fatal
+}
+
+durable_tick :: proc "contextless" (e: ^Engine) -> u64 {
+	return e.durable_tick
+}
+
+current_tick :: proc "contextless" (e: ^Engine) -> u64 {
+	return e.tick if e.in_tick else e.tick + 1
+}
+
+hlc_now :: proc(e: ^Engine) -> prim.Hlc {
+	return prim.hlc_tick(&e.hlc, _wall_ms(e))
+}
+
+@(private)
+_thread_main :: proc(t: ^thread.Thread) {
+	e := (^Engine)(t.data)
+	context.allocator = e.allocator
+	for !prim.loop_stopped(e.loop) {
+		if prim.loop_step(e.loop, true) != .None {
+			break
+		}
+	}
+}
+
+@(private)
+_stop_call :: proc(e: ^Engine, data: rawptr) {
+	flush(e)
+	prim.loop_stop(e.loop)
+}
+
+@(private)
+_wall_ms :: proc(e: ^Engine) -> i64 {
+	if e.cfg.clock.wall_ms != nil {
+		return e.cfg.clock.wall_ms(e.cfg.clock.data)
+	}
+	return prim.now_ms()
+}
+
+@(private)
+_pack_wake :: proc(data: rawptr) {
+	e := (^Engine)(data)
+	prim.wake(e.loop)
+}
+
+@(private)
+_on_wake :: proc(l: ^prim.Loop, data: rawptr) {
+	e := (^Engine)(data)
+	e.stats.wakeups += 1
+	if e.prev_wake != nil {
+		e.prev_wake(l, e.prev_wake_data)
+	}
+	sync.mutex_lock(&e.post_mu)
+	e.posted, e.post_swap = e.post_swap, e.posted
+	sync.mutex_unlock(&e.post_mu)
+	for p in e.post_swap {
+		p.call(e, p.data)
+	}
+	clear(&e.post_swap)
+	_pack_poll(e)
+	_loopback_drain(e)
+}
+
+@(private)
+_pack_poll :: proc(e: ^Engine) {
+	if !e.pk_open || len(e.batches) == 0 {
+		return
+	}
+	if err := pack.poll(&e.pk); err != .None {
+		_fatal(e, _perr(err))
+	}
+}
+
+@(private)
+_touch :: proc(e: ^Engine) {
+	if e.closing {
+		return
+	}
+	if e.tick_timer == 0 || !prim.timer_pending(e.loop, e.tick_timer) {
+		e.tick_timer = prim.timer(e.loop, 0, e, _on_tick)
+		if !e.in_tick {
+			prim.wake(e.loop)
+		}
+	}
+}
+
+@(private)
+_on_tick :: proc(l: ^prim.Loop, data: rawptr) {
+	e := (^Engine)(data)
+	e.tick_timer = 0
+	_tick_end(e)
+}
+
+@(private)
+_tick_end :: proc(e: ^Engine) {
+	if e.in_tick {
+		return
+	}
+	e.in_tick = true
+	defer e.in_tick = false
+	if e.tick_timer != 0 {
+		prim.timer_cancel(e.loop, e.tick_timer)
+		e.tick_timer = 0
+	}
+	e.tick += 1
+	e.stats.ticks += 1
+	_repl_events_process(e)
+	_waiters_run(e)
+	_catalog_flush(e)
+	_mounts_commit(e)
+	_handles_commit(e)
+	_subs_deliver(e)
+	_index_step(e)
+	_handles_commit(e)
+	_handles_sweep(e, e.cfg.handle_cache)
+	_durable_begin(e)
+	_settle_arm(e)
+	if !_tick_pending(e) && e.tick_timer != 0 {
+		prim.timer_cancel(e.loop, e.tick_timer)
+		e.tick_timer = 0
+	}
+}
+
+@(private)
+_tick_pending :: proc(e: ^Engine) -> bool {
+	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 {
+		return true
+	}
+	for _, sp in e.spaces {
+		if len(sp.events) > 0 || len(sp.needs) > 0 {
+			return true
+		}
+	}
+	for h in e.lru {
+		if h.local {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_settle_arm :: proc(e: ^Engine) {
+	if e.closing {
+		return
+	}
+	if e.settle_timer != 0 {
+		prim.timer_cancel(e.loop, e.settle_timer)
+	}
+	e.settle_timer = prim.timer(e.loop, e.cfg.settle_ms, e, _on_settle)
+}
+
+@(private)
+_on_settle :: proc(l: ^prim.Loop, data: rawptr) {
+	e := (^Engine)(data)
+	e.settle_timer = 0
+	if len(e.batches) > 0 || len(e.dirty) > 0 || e.in_tick {
+		e.settle_timer = prim.timer(e.loop, e.cfg.settle_ms, e, _on_settle)
+		return
+	}
+	_index_settle(e)
+	_handles_sweep(e, 0)
+	_spaces_settle(e)
+	_trees_release(e)
+	_durable_begin(e)
+	when !runtime.NO_DEFAULT_TEMP_ALLOCATOR {
+		if context.temp_allocator.data == &runtime.global_default_temp_allocator_data {
+			runtime.default_temp_allocator_destroy(&runtime.global_default_temp_allocator_data)
+		}
+	}
+}
+
+@(private)
+_fatal :: proc(e: ^Engine, err: Error) {
+	if e.fatal == .None {
+		e.fatal = err
+	}
+	_emit(e, Event{kind = .Failure, err = err})
+}
+
+@(private)
+_emit :: proc(e: ^Engine, ev: Event) {
+	if e.cfg.events.event != nil {
+		x := ev
+		e.cfg.events.event(e.cfg.events.data, e, &x)
+	}
+}
+
+@(private)
+_log :: proc(e: ^Engine, level: Log_Level, msg: string) {
+	if e.cfg.log.write != nil {
+		e.cfg.log.write(e.cfg.log.data, level, msg)
+	}
+}
+
+@(private)
+_teardown :: proc(e: ^Engine) {
+	e.closing = true
+	_subs_free_all(e)
+	_waiters_fail_all(e, .Closed)
+	_plugs_close(e)
+	_handles_sweep(e, -1)
+	_index_close(e)
+	if e.reg.open {
+		_registry_flush(e)
+	}
+	_trees_persist(e)
+	if e.pk_open {
+		pack.batch_end(&e.pk)
+		_batches_done(e, .None)
+	}
+	_dirty_drop(e)
+	_spaces_close_all(e)
+	_trees_free_all(e)
+	if e.db_open {
+		odb.close(&e.db)
+		e.db_open = false
+	}
+	_registry_close(e)
+	if e.pk_open {
+		pack.close(&e.pk)
+		e.pk_open = false
+	}
+	if e.owns_keyring {
+		osync.file_keyring_close(&e.file_keyring)
+		e.owns_keyring = false
+	}
+	if e.loop != nil {
+		if e.tick_timer != 0 {
+			prim.timer_cancel(e.loop, e.tick_timer)
+			e.tick_timer = 0
+		}
+		if e.settle_timer != 0 {
+			prim.timer_cancel(e.loop, e.settle_timer)
+			e.settle_timer = 0
+		}
+		if e.loop.wake_cb == _on_wake && e.loop.wake_data == rawptr(e) {
+			prim.loop_on_wake(e.loop, e.prev_wake, e.prev_wake_data)
+		}
+	}
+	if e.owns_loop {
+		prim.loop_destroy(&e.own_loop)
+		e.owns_loop = false
+	}
+	e.loop = nil
+	if e.lock_fd >= 0 {
+		prim.close_file(e.base, e.lock_fd)
+		e.lock_fd = prim.INVALID_FD
+	}
+	delete(e.spaces)
+	delete(e.links)
+	delete(e.handles)
+	delete(e.lru)
+	delete(e.own_trees)
+	delete(e.waiters)
+	delete(e.subs)
+	delete(e.posted)
+	delete(e.post_swap)
+	delete(e.wake_hooks)
+	delete(e.dirty)
+	delete(e.batches)
+	delete(e.changed)
+	for _, u in e.catalog_q {
+		delete(u.title, e.allocator)
+		free(u, e.allocator)
+	}
+	delete(e.catalog_q)
+	delete(e.index_dirty)
+	delete(e.pack_root, e.allocator)
+	delete(e.dir, e.allocator)
+	e.pack_root = ""
+	e.dir = ""
+}
