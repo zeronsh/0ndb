@@ -84,6 +84,9 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 		run := _join(context.temp_allocator, e.dir, "run") or_return
 		_ferr(fs.registry_init(&e.plug.reg, e.base, run, e.allocator)) or_return
 		e.plug.reg_on = true
+		if e.cfg.watcher.start != nil {
+			_ferr(fs.registry_set_watcher(&e.plug.reg, e.cfg.watcher)) or_return
+		}
 		if e.cfg.write_observer.start != nil {
 			if oerr := fs.registry_set_observer(&e.plug.reg, e.cfg.write_observer); oerr != .None {
 				_log(e, .Warn, "write observer unavailable")
@@ -213,6 +216,37 @@ _mounts_settle :: proc(e: ^Engine) {
 			_log(e, .Warn, "mount pass failed")
 		}
 		_mount_touched(e, mt)
+	}
+}
+
+@(private)
+_mounts_wake :: proc(e: ^Engine, object: prim.Id) {
+	if !e.plug.reg_on {
+		return
+	}
+	for mt in e.plug.mounts {
+		if mt.object.id == object {
+			fs.mount_schedule(&mt.mount, 0)
+		}
+	}
+}
+
+@(private)
+_mounts_changed :: proc(e: ^Engine) {
+	if !e.plug.reg_on || len(e.changed) == 0 {
+		return
+	}
+	for mt in e.plug.mounts {
+		c, ok := e.changed[mt.object.id]
+		if !ok || c.kinds & {.Data, .Keys, .Members, .Redacted} == {} {
+			continue
+		}
+		h, err := _handle_get(e, mt.object, .File_Tree)
+		if err != .None {
+			continue
+		}
+		_hist_catch_up(e, h)
+		fs.mount_schedule(&mt.mount, 0)
 	}
 }
 

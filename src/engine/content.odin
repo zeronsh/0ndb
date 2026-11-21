@@ -1,0 +1,418 @@
+package engine
+
+import "core:crypto"
+import "core:crypto/blake2b"
+import "../fs"
+import "../journal"
+import omap "../map"
+import "../odb"
+import "../prim"
+import osync "../sync"
+
+@(private)
+CONTENT_RETRY_MIN :: 1_000
+@(private)
+CONTENT_RETRY_MAX :: 60_000
+@(private)
+CONTENT_RETRIES :: 8
+
+@(private)
+Content_State :: struct {
+	waits:  map[odb.Oid]^Content_Wait,
+	ups:    map[odb.Oid]Content_Up,
+	marks:  map[prim.Id]Content_Mark,
+	events: [dynamic]Content_Ev,
+}
+
+@(private)
+Content_Wait :: struct {
+	e:        ^Engine,
+	oid:      odb.Oid,
+	n:        int,
+	space:    prim.Id,
+	object:   prim.Id,
+	inflight: bool,
+	attempts: int,
+	timer:    prim.Timer,
+	path:     string,
+}
+
+@(private)
+Content_Up :: struct {
+	space:  prim.Id,
+	object: prim.Id,
+}
+
+@(private)
+Content_Mark :: struct {
+	space:   prim.Id,
+	target:  i64,
+	pending: int,
+	failed:  bool,
+}
+
+@(private)
+Content_Ev :: struct {
+	space: prim.Id,
+	kind:  osync.Repl_Event_Kind,
+	oid:   odb.Oid,
+	n:     int,
+	path:  string,
+}
+
+@(private)
+_content_init :: proc(e: ^Engine) {
+	e.content.waits = make(map[odb.Oid]^Content_Wait, e.allocator)
+	e.content.ups = make(map[odb.Oid]Content_Up, e.allocator)
+	e.content.marks = make(map[prim.Id]Content_Mark, e.allocator)
+	e.content.events = make([dynamic]Content_Ev, e.allocator)
+}
+
+@(private)
+_content_destroy :: proc(e: ^Engine) {
+	for _, w in e.content.waits {
+		if w.timer != 0 {
+			prim.timer_cancel(e.loop, w.timer)
+		}
+		delete(w.path, e.allocator)
+		free(w, e.allocator)
+	}
+	delete(e.content.waits)
+	delete(e.content.ups)
+	delete(e.content.marks)
+	for ev in e.content.events {
+		delete(ev.path, e.allocator)
+	}
+	delete(e.content.events)
+}
+
+@(private)
+_content_tree :: proc(scope: ^osync.Scope, t: ^osync.Key_Tree) -> Error {
+	root: [32]u8
+	ctx: blake2b.Context
+	blake2b.init_mac(&ctx, scope.content.key[:], 32)
+	blake2b.update(&ctx, transmute([]u8)string("0ndb content tree"))
+	blake2b.final(&ctx, root[:])
+	defer crypto.zero_explicit(&root, size_of(root))
+	return _serr(osync.keytree_init(t, root, osync.OBJECT_TREE_DEPTH, 0, context.temp_allocator))
+}
+
+@(private)
+_content_mark_get :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> i64 {
+	k := _pending_key(sp.id, id)
+	v, found, err := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator)
+	if err != .None || !found || len(v) != 9 {
+		return 0
+	}
+	return i64(prim.get_u64le(v[1:]))
+}
+
+@(private)
+_content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, mark: i64) {
+	k := _pending_key(space, id)
+	v: [9]u8
+	v[0] = u8(kind)
+	prim.put_u64le(v[1:], u64(mark))
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		return
+	}
+	if omap.txn_put(t, ROOT_OWNED, k[:], v[:]) != .None {
+		omap.txn_abort(t)
+		return
+	}
+	omap.txn_commit(t)
+}
+
+@(private)
+_content_publish :: proc(e: ^Engine, h: ^Handle) {
+	if h.kind != .File_Tree || !h.sp.repl_on || h.hist == nil || !h.hist.awake || !h.w_open {
+		return
+	}
+	end := _own_len(h)
+	if m, busy := e.content.marks[h.id]; busy && m.pending > 0 {
+		return
+	}
+	from := _content_mark_get(e, h.sp, h.id)
+	if from >= end {
+		return
+	}
+	db, derr := device_odb(e)
+	if derr != .None {
+		return
+	}
+	r: journal.Reader
+	journal.journal_reader(&h.hist.journal, &r, context.temp_allocator)
+	defer journal.reader_close(&r)
+	refs := make([dynamic]fs.Content_Ref, context.temp_allocator)
+	pos := from
+	for pos < end {
+		body, next, jerr := journal.record_at(&r, pos)
+		if jerr == .Redacted {
+			pos = next
+			continue
+		}
+		if jerr != .None {
+			break
+		}
+		if !journal.is_sig(body) {
+			fs.history_record_oids(h.hist, e.self, body, &refs)
+		}
+		pos = next
+	}
+	tree: osync.Key_Tree
+	if h.scope.mode != .Transparent {
+		if _content_tree(&h.scope, &tree) != .None {
+			return
+		}
+	}
+	defer if h.scope.mode != .Transparent {
+		osync.keytree_destroy(&tree)
+	}
+	mark := Content_Mark{space = h.sp.id, target = pos}
+	for ref in refs {
+		if _, up := e.content.ups[ref.oid]; up {
+			continue
+		}
+		t, data, rerr := odb.read(db, ref.oid, context.temp_allocator)
+		if rerr != .None || t != .Blob {
+			continue
+		}
+		oid := ref.oid
+		tp := &tree if h.scope.mode != .Transparent else nil
+		if osync.replicator_put_object(&h.sp.repl, &h.scope, tp, oid[:ref.len], data) != .None {
+			mark.failed = true
+			continue
+		}
+		e.content.ups[ref.oid] = Content_Up{space = h.sp.id, object = h.id}
+		mark.pending += 1
+	}
+	if mark.pending == 0 {
+		if !mark.failed {
+			_content_mark_put(e, h.sp.id, h.id, h.kind, pos)
+		}
+		return
+	}
+	e.content.marks[h.id] = mark
+}
+
+@(private)
+_content_missing :: proc(e: ^Engine, h: ^Handle, device: prim.Id, body: []u8) -> bool {
+	if len(body) == 0 || body[0] != fs.REC_BATCH && body[0] != fs.REC_IMPORT {
+		return false
+	}
+	db, derr := device_odb(e)
+	if derr != .None {
+		return false
+	}
+	refs := make([dynamic]fs.Content_Ref, context.temp_allocator)
+	if fs.history_record_oids(h.hist, device, body, &refs) != .None {
+		return false
+	}
+	missing := false
+	for ref in refs {
+		if odb.exists(db, ref.oid) {
+			continue
+		}
+		missing = true
+		if h.sp.repl_on {
+			_content_fetch(e, h, ref)
+		}
+	}
+	return missing
+}
+
+@(private)
+_content_fetch :: proc(e: ^Engine, h: ^Handle, ref: fs.Content_Ref) {
+	w, known := e.content.waits[ref.oid]
+	if known && (w.inflight || w.timer != 0 || w.attempts >= CONTENT_RETRIES) {
+		return
+	}
+	if !known {
+		w = new(Content_Wait, e.allocator)
+		w.e = e
+		w.oid = ref.oid
+		w.n = ref.len
+		w.space = h.sp.id
+		w.object = h.id
+		e.content.waits[ref.oid] = w
+	}
+	_content_request(e, w)
+}
+
+@(private)
+_content_request :: proc(e: ^Engine, w: ^Content_Wait) -> bool {
+	sp, ok := e.spaces[w.space]
+	if !ok || !sp.repl_on {
+		return false
+	}
+	h, herr := _handle_get(e, Object{w.space, w.object}, .File_Tree)
+	if herr != .None {
+		return false
+	}
+	if len(w.path) == 0 {
+		hx := prim.id_hex(w.object)
+		ox: [64]u8
+		prim.hex_encode(ox[:], w.oid[:w.n])
+		dir, jerr := _join(context.temp_allocator, e.pack_root, "content", string(hx[:]))
+		if jerr != .None {
+			return false
+		}
+		if prim.mkdir_all(e.vfs, dir, 0o700) != .None {
+			return false
+		}
+		p, perr := _join(e.allocator, dir, string(ox[:2 * w.n]))
+		if perr != .None {
+			return false
+		}
+		w.path = p
+	}
+	tree: osync.Key_Tree
+	tp: ^osync.Key_Tree
+	if h.scope.mode != .Transparent {
+		if _content_tree(&h.scope, &tree) != .None {
+			return false
+		}
+		tp = &tree
+	}
+	defer if tp != nil {
+		osync.keytree_destroy(&tree)
+	}
+	oid := w.oid
+	if osync.replicator_get_object(&sp.repl, &h.scope, tp, oid[:w.n], w.path) != .None {
+		return false
+	}
+	w.inflight = true
+	e.stats.fetches += 1
+	return true
+}
+
+@(private)
+_content_on_event :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
+	if len(ev.oid) != 20 && len(ev.oid) != 32 {
+		return
+	}
+	oid: odb.Oid
+	copy(oid[:], ev.oid)
+	_, waiting := e.content.waits[oid]
+	_, uploading := e.content.ups[oid]
+	if !waiting && !uploading {
+		return
+	}
+	p, _ := _clone(ev.path, e.allocator)
+	append(&e.content.events, Content_Ev{space = sp.id, kind = ev.kind, oid = oid, n = len(ev.oid), path = p})
+	_touch(e)
+}
+
+@(private)
+_content_events_process :: proc(e: ^Engine) {
+	if len(e.content.events) == 0 {
+		return
+	}
+	evs := e.content.events
+	e.content.events = make([dynamic]Content_Ev, e.allocator)
+	defer delete(evs)
+	for ev in evs {
+		#partial switch ev.kind {
+		case .Object_Stored, .Object_Failed:
+			if up, ok := e.content.ups[ev.oid]; ok && (ev.kind == .Object_Stored || !_content_waiting(e, ev.oid)) {
+				delete_key(&e.content.ups, ev.oid)
+				_content_uploaded(e, up, ev.kind == .Object_Stored)
+			}
+		}
+		if w, ok := e.content.waits[ev.oid]; ok {
+			#partial switch ev.kind {
+			case .Object_Fetched:
+				_content_arrived(e, w, ev.path)
+			case .Object_Missing, .Object_Failed:
+				w.inflight = false
+				_content_retry(e, w)
+			}
+		}
+		delete(ev.path, e.allocator)
+	}
+}
+
+@(private)
+_content_waiting :: proc(e: ^Engine, oid: odb.Oid) -> bool {
+	w, ok := e.content.waits[oid]
+	return ok && w.inflight
+}
+
+@(private)
+_content_uploaded :: proc(e: ^Engine, up: Content_Up, stored: bool) {
+	m, ok := &e.content.marks[up.object]
+	if !ok {
+		return
+	}
+	m.pending -= 1
+	m.failed ||= !stored
+	if m.pending > 0 {
+		return
+	}
+	if !m.failed {
+		_content_mark_put(e, m.space, up.object, .File_Tree, m.target)
+	}
+	delete_key(&e.content.marks, up.object)
+}
+
+@(private)
+_content_arrived :: proc(e: ^Engine, w: ^Content_Wait, path: string) {
+	w.inflight = false
+	ok := false
+	if db, derr := device_odb(e); derr == .None {
+		if data, rerr := prim.read_file(e.vfs, path, context.temp_allocator); rerr == .None {
+			if h, herr := odb.hash(db.format, .Blob, data); herr == .None && h == w.oid {
+				if _, werr := odb.write(db, .Blob, data); werr == .None {
+					ok = true
+				}
+			}
+		}
+	}
+	prim.remove(e.vfs, path)
+	if !ok {
+		_content_retry(e, w)
+		return
+	}
+	space, object := w.space, w.object
+	_content_forget(e, w)
+	_object_changed(e, space, object, .Data)
+}
+
+@(private)
+_content_forget :: proc(e: ^Engine, w: ^Content_Wait) {
+	if w.timer != 0 {
+		prim.timer_cancel(e.loop, w.timer)
+	}
+	delete_key(&e.content.waits, w.oid)
+	delete(w.path, e.allocator)
+	free(w, e.allocator)
+}
+
+@(private)
+_content_retry :: proc(e: ^Engine, w: ^Content_Wait) {
+	w.attempts += 1
+	if w.attempts >= CONTENT_RETRIES || w.timer != 0 || e.closing {
+		return
+	}
+	delay := i64(CONTENT_RETRY_MIN)
+	for _ in 1 ..< w.attempts {
+		delay = min(delay * 2, CONTENT_RETRY_MAX)
+	}
+	w.timer = prim.timer(e.loop, delay, w, proc(l: ^prim.Loop, data: rawptr) {
+		w := (^Content_Wait)(data)
+		w.timer = 0
+		if !_content_request(w.e, w) {
+			_content_retry(w.e, w)
+		}
+	})
+}
+
+@(private)
+_content_data_arrived :: proc(e: ^Engine, object: prim.Id) {
+	for _, w in e.content.waits {
+		if w.object == object && !w.inflight && w.timer == 0 {
+			w.attempts = 0
+		}
+	}
+}

@@ -48,12 +48,15 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		conn, err := e.cfg.transport.open(e.cfg.transport.data, e, sp.link, Peer{space = sp.id, relay = sp.relay, relay_public = sp.relay_public})
 		if err != .None {
 			_log(e, .Warn, "transport open failed")
+			_link_schedule(e, sp)
+		} else {
+			sp.conn = conn
 		}
-		sp.conn = conn
 	} else {
 		osync.replicator_start(&sp.repl)
 	}
 	_card_publish(e, sp)
+	_owned_follow(e, sp)
 	if !sp.keyless {
 		_catalog_follow(e, sp)
 	} else {
@@ -76,6 +79,10 @@ _repl_stop :: proc(e: ^Engine, sp: ^Space) {
 		e.cfg.transport.close(e.cfg.transport.data, sp.conn)
 	}
 	sp.conn = nil
+	if sp.reopen != 0 {
+		prim.timer_cancel(e.loop, sp.reopen)
+		sp.reopen = 0
+	}
 	osync.replicator_stop(&sp.repl)
 	osync.replicator_destroy(&sp.repl)
 	sp.repl_on = false
@@ -92,6 +99,7 @@ link_up :: proc(e: ^Engine, link: Link, binding: []u8 = nil) -> Error {
 	if sp == nil {
 		return .Closed
 	}
+	sp.backoff = 0
 	err := _serr(osync.replicator_link_up(&sp.repl, binding))
 	_touch(e)
 	return err
@@ -120,6 +128,40 @@ link_down :: proc(e: ^Engine, link: Link) {
 		sp.connected = false
 		_touch(e)
 	}
+}
+
+@(private)
+LINK_BACKOFF_MIN :: 250
+@(private)
+LINK_BACKOFF_MAX :: 30_000
+
+@(private)
+_link_schedule :: proc(e: ^Engine, sp: ^Space) {
+	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.reopen != 0 {
+		return
+	}
+	base := max(sp.backoff, LINK_BACKOFF_MIN)
+	sp.backoff = min(base * 2, LINK_BACKOFF_MAX)
+	j: [2]u8
+	random_fill(e, j[:])
+	delay := base * 3 / 4 + base * i64(u16(j[0]) | u16(j[1]) << 8) / (2 * 65536)
+	sp.reopen = prim.timer(e.loop, delay, sp, _link_reopen)
+}
+
+@(private)
+_link_reopen :: proc(l: ^prim.Loop, data: rawptr) {
+	sp := (^Space)(data)
+	e := sp.e
+	sp.reopen = 0
+	if e.closing || !sp.repl_on || sp.conn != nil {
+		return
+	}
+	conn, err := e.cfg.transport.open(e.cfg.transport.data, e, sp.link, Peer{space = sp.id, relay = sp.relay, relay_public = sp.relay_public})
+	if err != .None {
+		_link_schedule(e, sp)
+		return
+	}
+	sp.conn = conn
 }
 
 @(private)
@@ -159,6 +201,8 @@ _link_close :: proc(data: rawptr) {
 		e.cfg.transport.close(e.cfg.transport.data, sp.conn)
 	}
 	sp.conn = nil
+	sp.connected = false
+	_link_schedule(e, sp)
 }
 
 @(private)
@@ -213,7 +257,10 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	sp := (^Space)(user)
 	e := sp.e
 	#partial switch ev.kind {
-	case .Device_Seen, .Dropped, .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed, .Object_Shredded:
+	case .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed:
+		_content_on_event(e, sp, ev)
+		return
+	case .Device_Seen, .Dropped, .Object_Shredded:
 		return
 	}
 	name, _ := _clone(ev.name, e.allocator)
@@ -319,11 +366,8 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 	case .Redacted:
 		if osync.stream_device(ev.stream) == e.self {
 			_relay_redact_done(e, sp, ev.stream, ev.from)
-		} else if rm, ok := sp.repl.remotes[ev.stream]; ok {
-			osync.replicator_zero_replica(&sp.repl, &sp.scope, rm.device, rm.name, rm.epoch, ev.from, ev.to)
-			if id, _, ok2 := _object_of_name(rm.name); ok2 {
-				_object_changed(e, sp.id, id, .Redacted)
-			}
+		} else {
+			_relay_zeroed_stream(e, sp, ev.stream, ev.from, ev.to)
 		}
 	}
 }
@@ -336,8 +380,10 @@ _remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, e
 	}
 	if seg, ok := _keys_target(name); ok {
 		if rt := _remote_tree_by_keys(sp, device, name); rt != nil && !rt.loaded && epoch >= rt.epoch {
+			if epoch > rt.epoch || length > 0 {
+				rt.requested = false
+			}
 			rt.epoch = epoch
-			rt.requested = false
 			_remote_tree_load(e, sp, rt)
 			if rt.loaded {
 				_held_release(e, sp, device)
@@ -358,6 +404,7 @@ _remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, e
 	if h, hok := e.handles[id]; hok {
 		_handle_remote_grew(h, device)
 	}
+	_content_data_arrived(e, id)
 	_object_changed(e, sp.id, id, .Data)
 	_index_item_add(e, sp.id, id, kind)
 }
@@ -379,6 +426,7 @@ _member_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, device: pr
 	}
 	append(&rec.members, Member{device = device})
 	_rec_put(e, id, &rec)
+	_card_relay(e, sp, id, device)
 	if h, ok := e.handles[id]; ok {
 		_handle_add_member(h, device, 0)
 	}

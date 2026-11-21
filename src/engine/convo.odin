@@ -1,5 +1,6 @@
 package engine
 
+import "core:slice"
 import "../convo"
 import "../obj"
 import "../prim"
@@ -164,6 +165,12 @@ convo_mounts :: proc(e: ^Engine, o: Object, allocator := context.allocator, read
 	if merr != .None {
 		return nil, _pending_result(e, h, _oerr(merr), ready)
 	}
+	slice.sort_by(m, proc(a, b: convo.Mount_Entry) -> bool {
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		return obj.id_less(a.tree, b.tree)
+	})
 	return m, .None
 }
 

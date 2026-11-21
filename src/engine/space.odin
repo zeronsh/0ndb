@@ -53,10 +53,15 @@ Space :: struct {
 	card_ok:      bool,
 	keyless:      bool,
 	grants:       map[prim.Id]osync.Content_Key,
+	grant_access: map[prim.Id]Access_Set,
 	events:       [dynamic]Repl_Ev,
 	needs:        [dynamic]Need,
 	ckpts:        [dynamic]^Ckpt_Wait,
 	card_scopes:  map[osync.Stream_Id]osync.Scope,
+	card_len:     map[osync.Stream_Id]i64,
+	card_relay:   map[prim.Id][dynamic]prim.Id,
+	reopen:       prim.Timer,
+	backoff:      i64,
 }
 
 @(private)
@@ -306,6 +311,7 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 		return nil, .Permission
 	}
 	sp.grants = make(map[prim.Id]osync.Content_Key, e.allocator)
+	sp.grant_access = make(map[prim.Id]Access_Set, e.allocator)
 	_grants_load(e, sp)
 	sp.identities = make(map[prim.Id]osync.Identity, e.allocator)
 	sp.held = make([dynamic]Held, e.allocator)
@@ -314,6 +320,8 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	sp.needs = make([dynamic]Need, e.allocator)
 	sp.ckpts = make([dynamic]^Ckpt_Wait, e.allocator)
 	sp.card_scopes = make(map[osync.Stream_Id]osync.Scope, e.allocator)
+	sp.card_len = make(map[osync.Stream_Id]i64, e.allocator)
+	sp.card_relay = make(map[prim.Id][dynamic]prim.Id, e.allocator)
 	sp.identities[e.self] = e.identity
 	sp.open = true
 	_cards_load(e, sp)
@@ -361,11 +369,17 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 		osync.scope_clear(&sc)
 	}
 	delete(sp.card_scopes)
+	delete(sp.card_len)
+	for _, l in sp.card_relay {
+		delete(l)
+	}
+	delete(sp.card_relay)
 	delete(sp.identities)
 	for _, &g in sp.grants {
 		crypto.zero_explicit(&g, size_of(g))
 	}
 	delete(sp.grants)
+	delete(sp.grant_access)
 	osync.space_clear(&sp.keys)
 	osync.scope_clear(&sp.scope)
 	sp.open = false
@@ -448,6 +462,11 @@ _card_publish_object :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> Error {
 	if !sp.repl_on {
 		return .None
 	}
+	if sp.keyless {
+		if a, ok := sp.grant_access[id]; !ok || .Write not_in a {
+			return .None
+		}
+	}
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
 	base := _card_path(e, sp) or_return
@@ -495,11 +514,29 @@ _card_want :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string) {
 		return
 	}
 	sc := _object_scope(sp, id)
-	stream := osync.stream_id(&sc, device, CARD_STREAM, 0)
-	if _, have := sp.card_scopes[stream]; !have {
-		sp.card_scopes[stream] = sc
+	defer osync.scope_clear(&sc)
+	_card_watch(e, sp, &sc, device, false)
+	rec, found, _ := _rec_get(e, id)
+	if found {
+		for m in rec.members {
+			if m.device != device && m.device != e.self && m.device in sp.identities {
+				_card_watch(e, sp, &sc, m.device, true)
+			}
+		}
 	}
-	osync.replicator_want_tail(&sp.repl, &sc, device, CARD_STREAM, 0, 4096)
+}
+
+@(private)
+_card_watch :: proc(e: ^Engine, sp: ^Space, sc: ^osync.Scope, device: prim.Id, follow: bool) {
+	stream := osync.stream_id(sc, device, CARD_STREAM, 0)
+	if _, have := sp.card_scopes[stream]; !have {
+		sp.card_scopes[stream] = sc^
+	}
+	if follow {
+		osync.replicator_follow(&sp.repl, sc, device, CARD_STREAM, 0, true)
+	} else {
+		osync.replicator_want_tail(&sp.repl, sc, device, CARD_STREAM, 0, 4096)
+	}
 }
 
 @(private)
@@ -530,13 +567,12 @@ _cards_load :: proc(e: ^Engine, sp: ^Space) {
 
 @(private)
 _card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id, stream: osync.Stream_Id) {
-	if device in sp.identities {
-		return
-	}
 	scope := sp.scope
 	if x, ok := sp.card_scopes[stream]; ok {
 		scope = x
 	} else if sp.keyless {
+		return
+	} else if device in sp.identities {
 		return
 	}
 	defer osync.scope_clear(&scope)
@@ -545,7 +581,8 @@ _card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id, stream: osync.Strea
 		return
 	}
 	defer osync.replicator_release(&sp.repl, &scope, device, CARD_STREAM, 0)
-	if journal.replica_length(rep) == 0 {
+	n := journal.replica_length(rep)
+	if n == 0 || sp.card_len[stream] >= n {
 		return
 	}
 	rd: journal.Reader
@@ -557,24 +594,30 @@ _card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id, stream: osync.Strea
 	if sp.mode == .End_To_End {
 		journal.reader_set_keys(&rd, osync.static_provider(&key))
 	}
-	body, _, rerr := journal.record_at(&rd, 0)
-	if rerr != .None {
-		return
-	}
-	id, cerr := osync.card_verify(body)
-	if cerr != .None || id.id != device {
-		return
-	}
-	sp.identities[device] = id
-	k := _card_key(sp, device)
-	t, terr := omap.txn_begin(&e.reg.db)
-	if terr == .None {
-		if omap.txn_put(t, ROOT_CARDS, k[:], body) == .None {
-			omap.txn_commit(t)
-		} else {
-			omap.txn_abort(t)
+	pos: i64
+	first := true
+	for pos < n {
+		body, next, rerr := journal.record_at(&rd, pos)
+		if rerr != .None {
+			break
 		}
+		id, cerr := osync.card_verify(body)
+		if first && (cerr != .None || id.id != device) {
+			return
+		}
+		first = false
+		pos = next
+		if cerr != .None || id.id in sp.identities {
+			continue
+		}
+		_card_store(e, sp, body)
+		_card_known(e, sp, id.id)
 	}
+	sp.card_len[stream] = pos
+}
+
+@(private)
+_card_known :: proc(e: ^Engine, sp: ^Space, device: prim.Id) {
 	_touch(e)
 	_held_release(e, sp, device)
 	for h in e.lru {
@@ -589,6 +632,108 @@ _card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id, stream: osync.Strea
 			}
 		}
 	}
+	if objs, ok := sp.card_relay[device]; ok {
+		delete_key(&sp.card_relay, device)
+		for id in objs {
+			_card_relay(e, sp, id, device)
+		}
+		delete(objs)
+	}
+}
+
+@(private)
+_card_relay :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id) {
+	if !sp.repl_on || device == e.self || id == sp.catalog {
+		return
+	}
+	base, berr := _card_path(e, sp)
+	if berr != .None {
+		return
+	}
+	oh := prim.id_hex(id)
+	path, perr := _join(context.temp_allocator, prim.dir_name(base), string(oh[:]))
+	if perr != .None || !prim.exists(e.vfs, path) {
+		return
+	}
+	if _, known := sp.identities[device]; !known {
+		list := sp.card_relay[device]
+		for x in list {
+			if x == id {
+				return
+			}
+		}
+		if list == nil {
+			list = make([dynamic]prim.Id, e.allocator)
+		}
+		append(&list, id)
+		sp.card_relay[device] = list
+		if !sp.keyless {
+			_need_add(e, sp, .Card, device, _seg_name(.Map, sp.catalog))
+		}
+		return
+	}
+	k := _card_key(sp, device)
+	card, found, gerr := omap.db_get(&e.reg.db, ROOT_CARDS, k[:], context.temp_allocator)
+	if gerr != .None || !found {
+		return
+	}
+	j: journal.Journal
+	if journal.journal_open(&j, e.vfs, path, {}, context.temp_allocator) != .None {
+		return
+	}
+	r: journal.Reader
+	journal.journal_reader(&j, &r, context.temp_allocator)
+	end := journal.journal_durable_len(&j)
+	pos: i64
+	for pos < end {
+		body, next, rerr := journal.record_at(&r, pos)
+		if rerr != .None {
+			break
+		}
+		if string(body) == string(card) {
+			journal.reader_close(&r)
+			journal.journal_close(&j)
+			return
+		}
+		pos = next
+	}
+	journal.reader_close(&r)
+	_, aerr := journal.journal_append(&j, card)
+	if aerr == .None {
+		aerr = journal.journal_commit(&j)
+	}
+	journal.journal_close(&j)
+	if aerr != .None {
+		return
+	}
+	append(&e.card_pubs, Card_Pub{space = sp.id, object = id})
+	_touch(e)
+}
+
+@(private)
+_card_pub_durable :: proc(e: ^Engine, c: Card_Pub) {
+	sp, ok := e.spaces[c.space]
+	if !ok || !sp.repl_on {
+		return
+	}
+	base, berr := _card_path(e, sp)
+	if berr != .None {
+		return
+	}
+	oh := prim.id_hex(c.object)
+	path, perr := _join(context.temp_allocator, prim.dir_name(base), string(oh[:]))
+	if perr != .None {
+		return
+	}
+	j: journal.Journal
+	if journal.journal_open(&j, e.vfs, path, {}, context.temp_allocator) != .None {
+		return
+	}
+	n := journal.journal_durable_len(&j)
+	journal.journal_close(&j)
+	sc := _object_scope(sp, c.object)
+	defer osync.scope_clear(&sc)
+	osync.replicator_publish(&sp.repl, &sc, CARD_STREAM, 0, path, n)
 }
 
 @(private)
@@ -701,4 +846,71 @@ _pending_republish :: proc(e: ^Engine, sp: ^Space) {
 		}
 		_dirty_keys(e, sp, id, rec.kind, h.scope, h.own_tree)
 	}
+}
+
+@(private)
+_card_store :: proc(e: ^Engine, sp: ^Space, card: []u8) {
+	id, err := osync.card_verify(card)
+	if err != .None {
+		return
+	}
+	if sp.open {
+		sp.identities[id.id] = id
+	}
+	k := _card_key(sp, id.id)
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		return
+	}
+	if omap.txn_put(t, ROOT_CARDS, k[:], card) != .None {
+		omap.txn_abort(t)
+		return
+	}
+	omap.txn_commit(t)
+}
+
+@(private)
+ROOT_OWNED :: 7
+
+@(private)
+_owned_add :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
+	k := _pending_key(sp.id, id)
+	v := [1]u8{u8(kind)}
+	if old, found, gerr := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator); gerr == .None && found && len(old) > 0 && old[0] == u8(kind) {
+		return
+	}
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		return
+	}
+	if omap.txn_put(t, ROOT_OWNED, k[:], v[:]) != .None {
+		omap.txn_abort(t)
+		return
+	}
+	omap.txn_commit(t)
+}
+
+@(private)
+_owned_follow :: proc(e: ^Engine, sp: ^Space) {
+	if !sp.repl_on {
+		return
+	}
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		s := (^Space)(data)
+		if len(key) != 32 || len(value) != 1 && len(value) != 9 || value[0] < 1 || value[0] > u8(max(Kind)) {
+			return true
+		}
+		id: prim.Id
+		copy(id[:], key[16:])
+		if id == s.catalog {
+			return true
+		}
+		kind := Kind(value[0])
+		sc := _object_scope(s, id)
+		defer osync.scope_clear(&sc)
+		osync.replicator_follow_segments(&s.repl, &sc, _seg_name(kind, id), 0, kind != .Conversation)
+		return true
+	}
+	a := sp.id
+	omap.db_scan(&e.reg.db, ROOT_OWNED, a[:], a[:], sp, visit)
 }

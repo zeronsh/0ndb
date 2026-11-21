@@ -107,11 +107,14 @@ unsubscribe :: proc(e: ^Engine, id: Sub_Id) {
 		ordered_remove(&e.subs, i)
 		if !_subscribed(e, s.object.id) && !s.catalog {
 			if h, err := _handle_get(e, s.object, s.kind); err == .None && h.sp.repl_on && h.kind == .Conversation {
-				if h.grouped {
+				if h.grouped && !h.own {
 					osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
 					h.grouped = false
 				}
 				for sg in h.segs {
+					if h.own {
+						break
+					}
 					osync.replicator_unfollow(&h.sp.repl, &h.scope, sg.device, h.name, 0)
 					sg.follow = false
 				}

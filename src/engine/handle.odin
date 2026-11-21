@@ -269,6 +269,11 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 		return .None
 	}
 	e := h.e
+	if h.sp.keyless {
+		if a, ok := h.sp.grant_access[h.id]; !ok || .Write not_in a {
+			return .Permission
+		}
+	}
 	rec, found := _rec_get(e, h.id) or_return
 	if found && rec.own {
 		h.own = true
@@ -311,6 +316,14 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	h.own = true
 	h.published = 0
 	rec.own = true
+	for &m in rec.members {
+		if h.sp.repl_on {
+			n := osync.replicator_relay_length(&h.sp.repl, &h.scope, m.device, h.name, 0)
+			m.scanned = max(m.scanned, n)
+		}
+	}
+	_owned_add(e, h.sp, h.id, h.kind)
+	_group_follow(h, h.kind != .Conversation)
 	if rec.created == 0 {
 		rec.created = h.created
 	}
@@ -493,6 +506,7 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 		path, perr := _own_path(e, h)
 		if perr == .None {
 			_dirty_add(e, h, path, n)
+			_content_publish(e, h)
 			_pending_set(e, h.sp.id, h.id, n)
 			_index_item_add(e, h.sp.id, h.id, h.kind)
 			h.published = n
@@ -541,7 +555,7 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 		obj.view_destroy(&h.view)
 		h.view_init = false
 	}
-	keep_follow := h.id == h.sp.catalog || _subscribed(e, h.id)
+	keep_follow := h.id == h.sp.catalog || _subscribed(e, h.id) || h.own
 	if !keep_follow && h.grouped && h.sp.repl_on {
 		osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
 	}
@@ -628,6 +642,9 @@ _handle_want :: proc(h: ^Handle) -> (fetched: bool) {
 				if osync.replicator_want(&sp.repl, &h.scope, w.seg, h.name, 0, r[:]) == .None {
 					fetched = true
 					e.stats.fetches += 1
+				}
+				if osync.replicator_relay_length(&sp.repl, &h.scope, w.seg, h.name, 0) < 0 {
+					osync.replicator_want_tail(&sp.repl, &h.scope, w.seg, h.name, 0, 1)
 				}
 			}
 		}

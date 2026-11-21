@@ -1,6 +1,7 @@
 package engine
 
 import "core:crypto/blake2b"
+import "core:slice"
 import "core:unicode/utf8"
 import "../convo"
 import "../crdt"
@@ -11,11 +12,16 @@ import omap "../map"
 import "../obj"
 import "../prim"
 import "../search"
+import osync "../sync"
 
 @(private)
 SCAN_BUDGET :: 4096
 @(private)
 TEXT_INDEX_MAX :: 4 << 20
+@(private)
+TREE_LV_CHUNK :: 4096
+@(private)
+TREE_LV_SOURCE :: prim.Id{0x74, 0x72, 0x65, 0x65, 0x2d, 0x6c, 0x76, 0, 0, 0, 0, 0, 0, 0, 0, 1}
 @(private)
 KIND_NAMES := [5]string{"", "conversation", "map", "text", "tree"}
 
@@ -195,6 +201,13 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 					pos = next
 					continue
 				}
+				if je == .Missing && h.sp.repl_on {
+					r := [1]journal.Range{{pos, end}}
+					osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
+					if osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0) < 0 {
+						osync.replicator_want_tail(&h.sp.repl, &h.scope, s.device, h.name, 0, 1)
+					}
+				}
 				if je != .None {
 					break
 				}
@@ -205,8 +218,10 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 				rk := obj.record_kind(body)
 				if rk == obj.RECORD_REDACT {
 					env, derr := obj.decode_envelope(body, at)
-					if derr == .None {
-						_apply_remote_redact(e, h, vs, &env)
+					if derr == .None && _apply_remote_redact(e, h, vs, &env) == .Missing {
+						_handle_want(h)
+						pos = at
+						break
 					}
 				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Add) {
 					env, derr := obj.decode_envelope(body, at)
@@ -251,10 +266,37 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 		used += 1
 	case .File_Tree:
 		if e.cfg.search && _index_open(e) == .None {
-			used += _index_tree(e, h, budget)
+			u, m := _index_tree(e, h, budget)
+			used += u
+			more ||= m
 		}
 	}
 	return
+}
+
+@(private)
+_index_scope :: proc(e: ^Engine, h: ^Handle, device: prim.Id, src: prim.Id, pos: i64, body: []u8, at: i64) {
+	rec, derr := convo.decode_record(body, at, context.temp_allocator)
+	if derr != .None {
+		return
+	}
+	sc, ok := rec.body.(convo.Scope)
+	if !ok {
+		return
+	}
+	vs := obj.view_find(&h.view, device)
+	if vs < 0 {
+		return
+	}
+	vr, rerr := obj.resolve(&h.view, vs, sc.msg)
+	if rerr != .None {
+		return
+	}
+	ref := _rid_ref(Rid{h.view.segs[vr.seg].id, vr.off})
+	search.add_scope(&e.index, src, pos, search.Scope{id = sc.actor, object = h.id, ref = ref[:], hlc = rec.stamp})
+	if sc.id != sc.actor {
+		search.add_scope(&e.index, src, pos, search.Scope{id = sc.id, object = h.id, ref = ref[:], hlc = rec.stamp})
+	}
 }
 
 @(private)
@@ -290,6 +332,10 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 			continue
 		}
 		if h.kind == .Conversation {
+			if k == u8(convo.Kind.Scope) {
+				_index_scope(e, h, device, src, pos, body, at)
+				continue
+			}
 			if k != u8(convo.Kind.Seal) {
 				continue
 			}
@@ -424,25 +470,37 @@ _index_text :: proc(e: ^Engine, h: ^Handle) {
 }
 
 @(private)
-_index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> int {
+_index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bool) {
 	_hist_catch_up(e, h)
-	if h.hist == nil {
-		return 0
+	if h.hist == nil || !h.hist.awake {
+		return 0, false
 	}
-	touched := fs.history_touched(h.hist)
-	if len(touched) == 0 {
-		return 0
+	src := _source_id(h.id, TREE_LV_SOURCE)
+	pos, perr := search.position(&e.index, src)
+	if perr != .None {
+		return 0, false
 	}
-	snap := fstree.current(&h.hist.tree)
-	src := _source_id(h.id, e.self)
-	used := 0
+	end := fs.history_lv_end(h.hist)
+	if i64(end) <= pos {
+		return 0, false
+	}
+	to := min(end, crdt.Lv(pos) + TREE_LV_CHUNK)
+	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	if fs.history_touched_between(h.hist, crdt.Lv(pos), to, &touched) != .None {
+		return 1, false
+	}
+	ids := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
 	for id in touched {
-		if used >= budget {
-			break
-		}
+		append(&ids, id)
+	}
+	slice.sort_by(ids[:], proc(a, b: fstree.Inode_Id) -> bool {
+		return a.actor < b.actor || a.actor == b.actor && a.seq < b.seq
+	})
+	snap := fstree.current(&h.hist.tree)
+	for id in ids {
 		used += 1
-		path, ok, perr := fstree.path(&snap, id, context.temp_allocator)
-		if perr != nil || !ok {
+		path, ok, lerr := fstree.path(&snap, id, context.temp_allocator)
+		if lerr != nil || !ok {
 			continue
 		}
 		f, ferr := fs.history_file(h.hist, id)
@@ -466,7 +524,10 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> int {
 			append(&out, search.Span{byte_lo = u64(lo), byte_hi = u64(hi), line_lo = l0, line_hi = line, scope = s.id.actor})
 			at = hi
 		}
-		search.set_spans(&e.index, src, _own_len(h), _file_key(h.id, path), out[:])
+		search.set_spans(&e.index, src, i64(to), _file_key(h.id, path), out[:])
 	}
-	return used
+	if len(ids) == 0 {
+		search.advance(&e.index, src, i64(to))
+	}
+	return max(used, 1), to < end
 }

@@ -148,23 +148,37 @@ _own_tree_store :: proc(e: ^Engine, t: ^Own_Tree) -> Error {
 	_serr(osync.keytree_encode(&t.tree, &buf)) or_return
 	dir := prim.dir_name(t.path)
 	_perr(prim.mkdir_all(e.vfs, dir, 0o700)) or_return
-	fd, oerr := prim.open_file(e.vfs, t.path, {.Write, .Create}, 0o600)
+	tmp := _join(context.temp_allocator, dir, "keys.tmp") or_return
+	fd, oerr := prim.open_file(e.vfs, tmp, {.Write, .Create}, 0o600)
 	if oerr != .None {
 		return _perr(oerr)
 	}
-	defer prim.close_file(e.vfs, fd)
+	werr := _key_file_write(e, fd, buf[:])
+	cerr := prim.close_file(e.vfs, fd)
+	if werr == .None {
+		werr = _perr(cerr)
+	}
+	if werr == .None {
+		werr = _perr(prim.rename(e.vfs, tmp, t.path))
+	}
+	if werr != .None {
+		return werr
+	}
+	t.stored = i64(len(buf))
+	return _perr(prim.sync_dir(e.vfs, dir))
+}
+
+@(private)
+_key_file_write :: proc(e: ^Engine, fd: prim.Fd, data: []u8) -> Error {
 	size, serr := prim.file_size(e.vfs, fd)
 	if serr != .None {
 		return _perr(serr)
 	}
 	if size > 0 {
 		_perr(prim.zero_range(e.vfs, fd, 0, size)) or_return
+		_perr(prim.truncate(e.vfs, fd, 0)) or_return
 	}
-	_perr(prim.write_at(e.vfs, fd, buf[:], 0)) or_return
-	if size > i64(len(buf)) {
-		_perr(prim.truncate(e.vfs, fd, i64(len(buf)))) or_return
-	}
-	t.stored = i64(len(buf))
+	_perr(prim.write_at(e.vfs, fd, data, 0)) or_return
 	return _perr(prim.datasync(e.vfs, fd))
 }
 
@@ -240,7 +254,7 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	defer osync.replicator_release(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch)
 	end := journal.replica_length(rep)
 	if end == 0 {
-		if rt.requested && osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) == 0 {
+		if rt.requested && osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) <= 0 {
 			rt.absent = true
 		}
 		if !rt.requested {

@@ -94,8 +94,119 @@ map_redact :: proc(e: ^Engine, o: Object, key: []u8) -> Error {
 		_own_redacted(e, h, t[0], t[1])
 	}
 	_handle_mark(h)
+	if len(targets) > 0 {
+		_derived_purge(e, h)
+	}
 	_object_changed(e, o.space, o.id, .Redacted)
 	return .None
+}
+
+@(private)
+_derived_purge :: proc(e: ^Engine, h: ^Handle) {
+	#partial switch h.kind {
+	case .Map:
+		if _map_table(e, h) == .None && omap.table_reset(&h.table) != .None {
+			omap.table_close(&h.table)
+			h.table_open = false
+		}
+		_index_reindex(e, h)
+	case .Conversation:
+		_index_reindex(e, h)
+	}
+}
+
+@(private)
+_relay_zeroed_stream :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, to: i64) {
+	device := osync.stream_device(stream)
+	id: prim.Id
+	kind: Kind
+	epoch: u64
+	found := false
+	if rm, ok := sp.repl.remotes[stream]; ok {
+		id, kind, found = _object_of_name(rm.name)
+		epoch = rm.epoch
+	} else {
+		Acc :: struct {
+			e:      ^Engine,
+			sp:     ^Space,
+			stream: osync.Stream_Id,
+			device: prim.Id,
+			id:     prim.Id,
+			kind:   Kind,
+			found:  bool,
+		}
+		acc := Acc{e = e, sp = sp, stream = stream, device = device}
+		visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+			a := (^Acc)(data)
+			if len(key) != 16 {
+				return true
+			}
+			rec, err := _rec_decode(value, context.temp_allocator)
+			if err != .None || rec.space != a.sp.id || (rec.kind != .Map && rec.kind != .Conversation) || _rec_member(&rec, a.device) < 0 {
+				return true
+			}
+			x: prim.Id
+			copy(x[:], key)
+			sc := _object_scope(a.sp, x)
+			defer osync.scope_clear(&sc)
+			if osync.stream_id(&sc, a.device, _seg_name(rec.kind, x), 0) != a.stream {
+				return true
+			}
+			a.id, a.kind, a.found = x, rec.kind, true
+			return false
+		}
+		for k, v in e.reg.staged {
+			x := k
+			if !visit(&acc, x[:], v) {
+				break
+			}
+		}
+		if !acc.found {
+			omap.db_scan(&e.reg.db, ROOT_OBJECTS, nil, nil, &acc, visit)
+		}
+		id, kind, found = acc.id, acc.kind, acc.found
+	}
+	if !found {
+		return
+	}
+	sc := _object_scope(sp, id)
+	defer osync.scope_clear(&sc)
+	osync.replicator_zero_replica(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to)
+	_relay_zeroed(e, sp, id, kind)
+	_object_changed(e, sp.id, id, .Redacted)
+}
+
+@(private)
+_relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
+	if kind != .Map && kind != .Conversation {
+		return
+	}
+	if _, known := e.handles[id]; !known {
+		if _, found, err := _rec_get(e, id); err != .None || !found {
+			return
+		}
+	}
+	h, err := _handle_get(e, Object{sp.id, id}, kind)
+	if err != .None {
+		return
+	}
+	_derived_purge(e, h)
+}
+
+@(private)
+_index_reindex :: proc(e: ^Engine, h: ^Handle) {
+	if !e.cfg.search {
+		return
+	}
+	if _index_open(e) != .None {
+		return
+	}
+	search.delete_content(&e.index, _source_id(h.id, e.self), 0, h.id)
+	for s in h.segs {
+		search.advance(&e.index, _source_id(h.id, s.device), 0)
+	}
+	search.erase(&e.index)
+	_index_item_add(e, h.sp.id, h.id, h.kind)
 }
 
 @(private)
@@ -237,18 +348,25 @@ _relay_redact_done :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from
 }
 
 @(private)
-_apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope) {
+_apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope) -> Error {
 	r, err := obj.decode_redact(env)
 	if err != .None {
-		return
+		return .None
 	}
 	from, rerr := obj.resolve(&h.view, vs, r.from)
+	if rerr == .Missing || rerr == .Unknown_Segment {
+		return .Missing
+	}
 	if rerr != .None {
-		return
+		return .None
 	}
 	dev := obj.seg_id(&h.view, from)
 	target_rid: Rid
-	if target, terr := obj.resolve(&h.view, vs, r.target); terr == .None && !obj.vref_none(target) && h.kind == .Conversation {
+	target, terr := obj.resolve(&h.view, vs, r.target)
+	if terr != .None {
+		target = {}
+	}
+	if !obj.vref_none(target) && h.kind == .Conversation {
 		target_rid = obj.rid(&h.view, target)
 		if t, tt := convo.view_tail(&h.view, e.self, context.temp_allocator); tt == .None {
 			if m, merr := convo.message(&h.view, &t, convo.Position{msg = target_rid}, context.temp_allocator); merr == .None {
@@ -258,7 +376,7 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 	}
 	if dev == e.self {
 		if !h.w_open {
-			return
+			return .None
 		}
 		w: ^obj.Writer
 		#partial switch h.kind {
@@ -268,15 +386,22 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 			w = &h.mw.core
 		}
 		if w == nil {
-			return
+			return .None
 		}
 		if journal.journal_commit(&w.j) != .None {
-			return
+			return .None
 		}
-		if journal.journal_redact(&w.j, from.off, r.to) != .None {
-			return
+		if _, _, je := journal.record_at(&w.jr, from.off); je != .Redacted {
+			werr: obj.Error
+			if h.kind == .Conversation {
+				werr = convo.writer_redact_range(&h.cw, from, r.to, target)
+			} else {
+				_, werr = obj.writer_redact(w, from, r.to, target)
+			}
+			if werr != .None {
+				return .None
+			}
 		}
-		w.v.segs[w.seg].tail_end = -1
 		_own_redacted(e, h, from.off, r.to)
 		_handle_mark(h)
 	} else if h.sp.repl_on {
@@ -286,7 +411,11 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 	if !obj.rid_none(target_rid) {
 		_index_purge_message(e, h, target_rid)
 	}
+	if h.kind == .Map {
+		_derived_purge(e, h)
+	}
 	_object_changed(e, h.sp.id, h.id, .Redacted)
+	return .None
 }
 
 @(private)
@@ -355,6 +484,68 @@ _index_purge_object :: proc(e: ^Engine, h: ^Handle) {
 	}
 	src := _source_id(h.id, e.self)
 	pos, _ := search.position(&e.index, src)
-	search.delete_object(&e.index, src, pos, h.id)
-	search.flush(&e.index)
+	search.delete_content(&e.index, src, pos, h.id)
+	search.erase(&e.index)
+}
+
+@(private)
+Replacement :: enum u8 {
+	Found,
+	Absent,
+	Missing,
+}
+
+@(private)
+_hist_replacement :: proc(h: ^Handle, s: ^Seg, off: i64) -> (synth: []u8, st: Replacement) {
+	end := journal.reader_end(&s.jr)
+	_, pos, ferr := journal.record_at(&s.jr, off)
+	if ferr != .Redacted {
+		return nil, .Absent
+	}
+	for pos < end {
+		body, next, rerr := journal.record_at(&s.jr, pos)
+		if rerr == .Missing {
+			if h.sp.repl_on {
+				r := [1]journal.Range{{pos, end}}
+				osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
+			}
+			return nil, .Missing
+		}
+		if rerr != .None && rerr != .Redacted {
+			return nil, .Absent
+		}
+		pos = next
+		if rerr == .Redacted || journal.is_sig(body) || len(body) < 3 || body[0] != fs.REC_REPLACE {
+			continue
+		}
+		old, n := prim.get_uvarint(body[1:])
+		if n <= 0 || 1 + n + 1 > len(body) || old != u64(off) {
+			continue
+		}
+		kind := body[1 + n]
+		if kind != fs.REC_BATCH && kind != fs.REC_IMPORT {
+			return nil, .Absent
+		}
+		out := make([]u8, len(body) - n - 1, context.temp_allocator)
+		out[0] = kind
+		copy(out[1:], body[1 + n + 1:])
+		return out, .Found
+	}
+	return nil, .Absent
+}
+
+@(private)
+_hist_admit_redacted :: proc(e: ^Engine, h: ^Handle, s: ^Seg, off: i64) -> fs.Error {
+	synth, st := _hist_replacement(h, s, off)
+	switch st {
+	case .Missing:
+		return .Not_Found
+	case .Absent:
+		return .None
+	case .Found:
+	}
+	if _, err := fs.history_admit(h.hist, s.device, off, synth); err == .Not_Found {
+		return .Not_Found
+	}
+	return .None
 }

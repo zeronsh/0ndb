@@ -58,10 +58,17 @@ Dirty_Seg :: struct {
 
 @(private)
 Durable_Batch :: struct {
-	e:    ^Engine,
-	tick: u64,
-	segs: [dynamic]Dirty_Seg,
-	meta: bool,
+	e:     ^Engine,
+	tick:  u64,
+	segs:  [dynamic]Dirty_Seg,
+	meta:  bool,
+	cards: [dynamic]Card_Pub,
+}
+
+@(private)
+Card_Pub :: struct {
+	space:  prim.Id,
+	object: prim.Id,
 }
 
 @(private)
@@ -357,6 +364,8 @@ _durable_begin :: proc(e: ^Engine) {
 	b.segs = e.dirty
 	b.meta = e.reg.meta
 	e.reg.meta = false
+	b.cards = e.card_pubs
+	e.card_pubs = make([dynamic]Card_Pub, e.allocator)
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
 	append(&e.batches, b)
 	e.stats.commits += 1
@@ -379,6 +388,11 @@ _durable_begin :: proc(e: ^Engine) {
 			delete(e.dirty)
 			e.dirty = b.segs
 			e.reg.meta ||= b.meta
+			for c in e.card_pubs {
+				append(&b.cards, c)
+			}
+			delete(e.card_pubs)
+			e.card_pubs = b.cards
 			free(b, e.allocator)
 			return
 		}
@@ -434,6 +448,9 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		for &d in b.segs {
 			_publish(e, &d)
 		}
+		for c in b.cards {
+			_card_pub_durable(e, c)
+		}
 		if len(b.segs) > 0 || b.meta {
 			_emit(e, Event{kind = .Durable, tick = b.tick})
 		}
@@ -447,6 +464,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		delete(d.path, e.allocator)
 	}
 	delete(b.segs)
+	delete(b.cards)
 	free(b, e.allocator)
 }
 

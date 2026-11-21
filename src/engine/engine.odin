@@ -155,6 +155,7 @@ Config :: struct {
 	events:          Event_Hook,
 	http:            http.Client,
 	write_observer:  fs.Write_Observer,
+	watcher:         fs.Watcher,
 	durability:      Durability,
 	verify_chains:   bool,
 	idle_pageout:    bool,
@@ -259,6 +260,8 @@ Engine :: struct {
 	pack_more:    bool,
 	purged:       [dynamic]Rid,
 	plug:         Plug_State,
+	content:      Content_State,
+	card_pubs:    [dynamic]Card_Pub,
 	stats:        Stats,
 	fatal:        Error,
 }
@@ -299,6 +302,8 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.dirty = make([dynamic]Dirty_Seg, allocator)
 	e.batches = make([dynamic]^Durable_Batch, allocator)
 	e.changed = make(map[prim.Id]Change, allocator)
+	_content_init(e)
+	e.card_pubs = make([dynamic]Card_Pub, allocator)
 	e.catalog_q = make(map[prim.Id]^Catalog_Update, allocator)
 	e.index_dirty = make([dynamic]Index_Item, allocator)
 	defer if err != .None {
@@ -390,11 +395,7 @@ stats :: proc(e: ^Engine) -> Stats {
 }
 
 fd :: proc "contextless" (e: ^Engine) -> prim.Fd {
-	when ODIN_OS == .Linux {
-		return prim.Fd(e.loop.os.epfd)
-	} else {
-		return prim.Fd(e.loop.os.kq)
-	}
+	return prim.loop_fd(e.loop)
 }
 
 timeout_ms :: proc(e: ^Engine) -> i64 {
@@ -518,6 +519,11 @@ _wall_ms :: proc(e: ^Engine) -> i64 {
 }
 
 @(private)
+_wall_ns_data :: proc(data: rawptr) -> i64 {
+	return prim.clock_wall_ns((^Engine)(data).cfg.clock)
+}
+
+@(private)
 _wall_ms_data :: proc(data: rawptr) -> i64 {
 	return _wall_ms((^Engine)(data))
 }
@@ -607,10 +613,12 @@ _tick_end :: proc(e: ^Engine) {
 	e.tick += 1
 	e.stats.ticks += 1
 	_repl_events_process(e)
+	_content_events_process(e)
 	_waiters_run(e)
 	_catalog_flush(e)
 	_mounts_commit(e)
 	_handles_commit(e)
+	_mounts_changed(e)
 	_subs_deliver(e)
 	_index_step(e)
 	_handles_commit(e)
@@ -625,7 +633,7 @@ _tick_end :: proc(e: ^Engine) {
 
 @(private)
 _tick_pending :: proc(e: ^Engine) -> bool {
-	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 {
+	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 {
 		return true
 	}
 	for _, sp in e.spaces {
@@ -780,6 +788,8 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.dirty)
 	delete(e.batches)
 	delete(e.changed)
+	_content_destroy(e)
+	delete(e.card_pubs)
 	for _, u in e.catalog_q {
 		delete(u.title, e.allocator)
 		delete(u.role, e.allocator)

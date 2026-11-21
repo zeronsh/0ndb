@@ -184,6 +184,11 @@ device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
 		if oerr := odb.open_store(&e.db, e.base, dir, nil, .Sha1, e.allocator); oerr != .None {
 			return nil, _derr(oerr)
 		}
+		e.db.clock = _wall_ns_data
+		e.db.clock_data = e
+		seed: [8]u8
+		random_fill(e, seed[:])
+		e.db.temp_seq = transmute(u64)seed
 		e.db_open = true
 	}
 	return &e.db, .None
@@ -268,6 +273,15 @@ _hist_read :: proc(data: rawptr, stream: prim.Id, off: i64, out: ^[dynamic]u8) -
 			continue
 		}
 		body, _, err := journal.record_at(&s.jr, off)
+		if err == .Redacted {
+			synth, st := _hist_replacement(h, s, off)
+			if st != .Found {
+				return false
+			}
+			clear(out)
+			append(out, ..synth)
+			return true
+		}
 		if err != .None {
 			return false
 		}
@@ -299,8 +313,16 @@ _hist_batch :: proc(e: ^Engine, h: ^Handle, ops: []crdt.Op_Run) -> Error {
 		parents = heads,
 		ops     = ops,
 	}
-	_, err := fs.history_commit_local(hist, &b)
-	return _ferr(err)
+	if _, err := fs.history_commit_local(hist, &b); err != .None {
+		return _ferr(err)
+	}
+	if h.kind == .File_Tree {
+		n := crdt.batch_len(&b)
+		head := [1]crdt.Op_Id{{e.self, b.seq + u64(n) - 1}}
+		_ferr(fs.history_set_line(hist, fs.DEFAULT_MOUNT.line, head[:])) or_return
+		_mounts_wake(e, h.id)
+	}
+	return .None
 }
 
 @(private)
@@ -402,6 +424,9 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 			for pos < end {
 				body, next, rerr := journal.record_at(&s.jr, pos)
 				if rerr == .Redacted {
+					if _hist_admit_redacted(e, h, s, pos) == .Not_Found {
+						break
+					}
 					pos = next
 					progress = true
 					continue
@@ -421,7 +446,15 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 					progress = true
 					continue
 				}
-				_, aerr := fs.history_admit(hist, s.device, pos, body)
+				owned := make([]u8, len(body), context.temp_allocator)
+				copy(owned, body)
+				if _content_missing(e, h, s.device, owned) {
+					break
+				}
+				_, aerr := fs.history_admit(hist, s.device, pos, owned)
+				if aerr == .None && len(owned) > 0 && owned[0] == fs.REC_REDACT {
+					_hist_redact_own(e, h, owned)
+				}
 				if aerr == .Not_Found {
 					break
 				}
@@ -438,4 +471,39 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 			break
 		}
 	}
+}
+
+@(private)
+_hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
+	rd := prim.reader(body[1:])
+	n := prim.read_uvarint(&rd)
+	if n > u64(len(body)) {
+		return
+	}
+	own := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	for _ in 0 ..< n {
+		a := prim.read_id(&rd)
+		seq := prim.read_uvarint(&rd)
+		l := prim.read_uvarint(&rd)
+		if !prim.reader_ok(&rd) || l == 0 || l > crdt.MAX_RUN {
+			return
+		}
+		if a == e.self {
+			append(&own, crdt.Op_Span{crdt.Op_Id{a, seq}, int(l)})
+		}
+	}
+	if len(own) == 0 || !h.w_open {
+		return
+	}
+	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator)
+	if err != .None {
+		_log(e, .Warn, "own history redaction failed")
+		return
+	}
+	for r in res.ranges {
+		_own_redacted(e, h, r.from, r.to)
+	}
+	_handle_mark(h)
+	_index_purge_object(e, h)
+	_index_item_add(e, h.sp.id, h.id, h.kind)
 }
