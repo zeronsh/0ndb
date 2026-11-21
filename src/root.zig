@@ -18,6 +18,7 @@ pub const store = struct {
     pub const crypto = @import("store/crypto.zig");
     pub const log = @import("store/log.zig");
     pub const blobs = @import("store/blobs.zig");
+    pub const shadow = @import("store/shadow.zig");
 };
 
 pub const fs = struct {
@@ -29,6 +30,7 @@ pub const fs = struct {
     pub const watch = @import("fs/watch.zig");
     pub const workspace = @import("fs/workspace.zig");
     pub const worktrees = @import("fs/worktrees.zig");
+    pub const pool = @import("fs/pool.zig");
 };
 
 pub const providers = struct {

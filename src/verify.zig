@@ -1282,6 +1282,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
     try runDaemonWatcherSuite(allocator, io);
     try runPagedStorePrimitivesSuite(allocator, io);
     try runNativeGitLayerSuite(allocator, io);
+    try runDaemonPoolAndShadowSuite(allocator, io);
 }
 
 fn countOpenFds(io: std.Io) !usize {
@@ -3700,7 +3701,7 @@ fn runSyncHardeningChecks(allocator: std.mem.Allocator, io: std.Io) !void {
         defer r_poison.deinit(allocator);
         try testing.expectEqual(wire.Op.err, r_poison.op);
         try testing.expect(r_poison.payload.len >= 1);
-        try testing.expectEqual(@intFromEnum(wire.ErrCode.bad_frame), r_poison.payload[0]);
+        try testing.expectEqual(@backingInt(wire.ErrCode.bad_frame), r_poison.payload[0]);
     }
 
     {
@@ -5613,5 +5614,377 @@ fn runNativeGitLayerSuite(allocator: std.mem.Allocator, io: std.Io) !void {
         try odb256.pinOids(&.{ expected_oid256, idx256_v4.find("dir/sub.txt").?.oid });
         const fsck256 = try runGitTestCmd(allocator, io, repo256, &.{ "fsck", "--full", "--strict" });
         allocator.free(fsck256);
+    }
+}
+
+fn makeTestShadowEntry(i: u64) ondb.store.shadow.ShadowEntry {
+    const kind: ondb.store.shadow.EntryKind = switch (i % 10) {
+        0 => .dir,
+        9 => .symlink,
+        else => .file,
+    };
+    var git_oid: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, git_oid[0..8], i +% 0x11223344, .little);
+    std.mem.writeInt(u64, git_oid[8..16], i *% 7, .little);
+    var blob_oid: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, blob_oid[0..8], i +% 0x55667788, .little);
+    std.mem.writeInt(u64, blob_oid[24..32], i *% 13, .little);
+    const mtime_ns: i96 = if (i % 7 == 0)
+        -@as(i96, @intCast(i * 1000 + 1))
+    else
+        @as(i96, @intCast(1_700_000_000_000_000_000 + i * 123));
+    return .{
+        .inode_id = ondb.core.id.InodeId.init(.{ .ts = i + 1, .actor = 0xCAFE_0000 + (i % 17) }, @intCast(i % 5)),
+        .kind = kind,
+        .mode = if (kind == .dir) 0o755 else 0o644,
+        .line_ending = @intCast(i % 3),
+        .has_git_oid = (i % 2 == 0),
+        .git_oid_len = if (i % 2 == 0) 20 else 0,
+        .git_oid = git_oid,
+        .has_blob_oid = (i % 3 != 0),
+        .blob_oid = blob_oid,
+        .size = i * 37 + 12,
+        .mtime_ns = mtime_ns,
+        .ino = 100_000 + i,
+    };
+}
+
+fn formatShadowPath(buf: *[64]u8, i: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "dir_{d:0>3}/sub_{d:0>2}/file_{d:0>5}.zig", .{ i / 200, (i / 20) % 10, i }) catch unreachable;
+}
+
+fn runDaemonPoolAndShadowSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const shadow_mod = ondb.store.shadow;
+    const pool_mod = ondb.fs.pool;
+    const git_dirs = ondb.fs.git_dirs;
+
+    const shadow_root = "/tmp/0ndb-verify-shadow-store";
+    cleanDir(io, shadow_root);
+    defer cleanDir(io, shadow_root);
+    try std.Io.Dir.cwd().createDirPath(io, shadow_root);
+
+    var sdir = try std.Io.Dir.cwd().openDir(io, shadow_root, .{ .iterate = true });
+    defer sdir.close(io);
+
+    const total_n: u64 = 50_000;
+    {
+        var store = try shadow_mod.ShadowStore.open(allocator, io, sdir, "shadow.0ndb");
+        defer store.deinit();
+        try testing.expectEqual(@as(u64, 0), store.count());
+        try testing.expectEqual(@as(usize, 0), store.dirtyCount());
+        try testing.expect((try store.get("missing.txt")) == null);
+        try testing.expect((try store.pathOfInode(allocator, ondb.core.id.InodeId.ROOT)) == null);
+
+        var pbuf: [64]u8 = undefined;
+        var i: u64 = 0;
+        while (i < total_n) : (i += 1) {
+            const p = formatShadowPath(&pbuf, i);
+            try store.put(p, makeTestShadowEntry(i));
+        }
+        try testing.expectEqual(total_n, store.count());
+        try testing.expectEqual(@as(usize, total_n), store.dirtyCount());
+
+        try store.flushAtomic(io, sdir, "shadow.0ndb");
+        try testing.expectEqual(total_n, store.count());
+        try testing.expectEqual(@as(usize, 0), store.dirtyCount());
+    }
+
+    {
+        const t0 = ondb.fs.watch.nowMonotonicMs();
+        var store = try shadow_mod.ShadowStore.open(allocator, io, sdir, "shadow.0ndb");
+        const open_ms = ondb.fs.watch.nowMonotonicMs() - t0;
+        defer store.deinit();
+
+        try testing.expect(open_ms < 50);
+        try testing.expectEqual(total_n, store.count());
+        try testing.expectEqual(@as(usize, 0), store.dirtyCount());
+
+        var prng = std.Random.DefaultPrng.init(0x9E37_79B9_7F4A_7C15);
+        const rng = prng.random();
+        var pbuf: [64]u8 = undefined;
+
+        const boundary_ids = [_]u64{ 0, 1, 25_000, total_n - 2, total_n - 1 };
+        for (boundary_ids) |bi| {
+            const p = formatShadowPath(&pbuf, bi);
+            const expected = makeTestShadowEntry(bi);
+            const got = (try store.get(p)).?;
+            try testing.expect(got.eql(expected));
+            const rpath = (try store.pathOfInode(allocator, expected.inode_id)).?;
+            defer allocator.free(rpath);
+            try testing.expectEqualStrings(p, rpath);
+        }
+
+        var k: usize = 0;
+        while (k < 400) : (k += 1) {
+            const idx = rng.uintLessThan(u64, total_n);
+            const p = formatShadowPath(&pbuf, idx);
+            const expected = makeTestShadowEntry(idx);
+            const got = (try store.get(p)).?;
+            try testing.expect(got.eql(expected));
+            if (k < 150) {
+                const rpath = (try store.pathOfInode(allocator, expected.inode_id)).?;
+                defer allocator.free(rpath);
+                try testing.expectEqualStrings(p, rpath);
+            }
+        }
+
+        try testing.expect((try store.get("aaa_before_first.txt")) == null);
+        try testing.expect((try store.get("dir_125/sub_05/file_99999.zig")) == null);
+        try testing.expect((try store.get("zzz_after_last.txt")) == null);
+        const missing_iid = ondb.core.id.InodeId.init(.{ .ts = 999_999, .actor = 1 }, 0);
+        try testing.expect((try store.pathOfInode(allocator, missing_iid)) == null);
+
+        var removed_idx: u64 = 100;
+        while (removed_idx < 150) : (removed_idx += 1) {
+            const p = formatShadowPath(&pbuf, removed_idx);
+            try store.remove(p);
+        }
+
+        var updated_idx: u64 = 200;
+        while (updated_idx < 250) : (updated_idx += 1) {
+            const p = formatShadowPath(&pbuf, updated_idx);
+            var e = makeTestShadowEntry(updated_idx);
+            e.size += 777;
+            e.mtime_ns += 999;
+            try store.put(p, e);
+        }
+
+        var extra_i: u64 = 0;
+        while (extra_i < 100) : (extra_i += 1) {
+            const ep = std.fmt.bufPrint(&pbuf, "z_extra/new_{d:0>3}.txt", .{extra_i}) catch unreachable;
+            try store.put(ep, makeTestShadowEntry(total_n + extra_i));
+        }
+
+        const renamed_orig_path = formatShadowPath(&pbuf, 500);
+        var renamed_entry = makeTestShadowEntry(500);
+        renamed_entry.size = 424242;
+        try store.remove(renamed_orig_path);
+        try store.put("a_renamed/moved_500.zig", renamed_entry);
+
+        try store.put("temp_only.txt", makeTestShadowEntry(total_n + 999));
+        try store.remove("temp_only.txt");
+
+        try testing.expectEqual(total_n + 50, store.count());
+        try testing.expect(store.dirtyCount() > 0);
+
+        const removed_p = formatShadowPath(&pbuf, 120);
+        try testing.expect((try store.get(removed_p)) == null);
+        try testing.expect((try store.pathOfInode(allocator, makeTestShadowEntry(120).inode_id)) == null);
+
+        const moved_rp = (try store.pathOfInode(allocator, renamed_entry.inode_id)).?;
+        defer allocator.free(moved_rp);
+        try testing.expectEqualStrings("a_renamed/moved_500.zig", moved_rp);
+
+        {
+            var it = try store.iterateAll(allocator);
+            defer it.deinit();
+            var prev_path: std.ArrayList(u8) = .empty;
+            defer prev_path.deinit(allocator);
+            var seen: u64 = 0;
+            var saw_renamed = false;
+            var saw_updated_210 = false;
+            var saw_extra_99 = false;
+            while (try it.next()) |item| {
+                if (seen > 0) {
+                    try testing.expect(std.mem.order(u8, prev_path.items, item.rel_path) == .lt);
+                }
+                prev_path.clearRetainingCapacity();
+                try prev_path.appendSlice(allocator, item.rel_path);
+                if (std.mem.eql(u8, item.rel_path, "a_renamed/moved_500.zig")) {
+                    try testing.expectEqual(@as(u64, 424242), item.entry.size);
+                    saw_renamed = true;
+                }
+                if (std.mem.eql(u8, item.rel_path, formatShadowPath(&pbuf, 210))) {
+                    try testing.expectEqual(makeTestShadowEntry(210).size + 777, item.entry.size);
+                    saw_updated_210 = true;
+                }
+                if (std.mem.eql(u8, item.rel_path, "z_extra/new_099.txt")) {
+                    saw_extra_99 = true;
+                }
+                seen += 1;
+            }
+            try testing.expectEqual(total_n + 50, seen);
+            try testing.expect(saw_renamed);
+            try testing.expect(saw_updated_210);
+            try testing.expect(saw_extra_99);
+        }
+
+        try store.flushAtomic(io, sdir, "shadow.0ndb");
+        try testing.expectEqual(total_n + 50, store.count());
+        try testing.expectEqual(@as(usize, 0), store.dirtyCount());
+
+        store.hibernate();
+        const after_hib = (try store.get("a_renamed/moved_500.zig")).?;
+        try testing.expectEqual(@as(u64, 424242), after_hib.size);
+        const after_hib_rp = (try store.pathOfInode(allocator, renamed_entry.inode_id)).?;
+        defer allocator.free(after_hib_rp);
+        try testing.expectEqualStrings("a_renamed/moved_500.zig", after_hib_rp);
+    }
+
+    {
+        var store2 = try shadow_mod.ShadowStore.open(allocator, io, sdir, "shadow.0ndb");
+        defer store2.deinit();
+        try testing.expectEqual(total_n + 50, store2.count());
+        var pbuf: [64]u8 = undefined;
+        try testing.expect((try store2.get(formatShadowPath(&pbuf, 125))) == null);
+        try testing.expect((try store2.get(formatShadowPath(&pbuf, 500))) == null);
+        const got_upd = (try store2.get(formatShadowPath(&pbuf, 225))).?;
+        try testing.expectEqual(makeTestShadowEntry(225).size + 777, got_upd.size);
+        const got_new = (try store2.get("z_extra/new_042.txt")).?;
+        try testing.expect(got_new.eql(makeTestShadowEntry(total_n + 42)));
+        const got_moved_p = (try store2.pathOfInode(allocator, makeTestShadowEntry(500).inode_id)).?;
+        defer allocator.free(got_moved_p);
+        try testing.expectEqualStrings("a_renamed/moved_500.zig", got_moved_p);
+    }
+
+    {
+        var small = try shadow_mod.ShadowStore.open(allocator, io, sdir, "small.0ndb");
+        defer small.deinit();
+        try small.put("alpha.txt", makeTestShadowEntry(1));
+        try small.put("beta.txt", makeTestShadowEntry(2));
+        try small.flushAtomic(io, sdir, "small.0ndb");
+
+        const raw_file = try sdir.openFile(io, "small.0ndb", .{});
+        const st = try raw_file.stat(io);
+        const raw = try allocator.alloc(u8, @intCast(st.size));
+        defer allocator.free(raw);
+        _ = try raw_file.readPositionalAll(io, raw, 0);
+        raw_file.close(io);
+
+        var bad_page = try allocator.dupe(u8, raw);
+        defer allocator.free(bad_page);
+        bad_page[shadow_mod.HEADER_SIZE + 10] ^= 0xFF;
+        try ondb.store.mmap.atomicWriteFile(io, sdir, "bad_page.0ndb", bad_page);
+        var bp_store = try shadow_mod.ShadowStore.open(allocator, io, sdir, "bad_page.0ndb");
+        defer bp_store.deinit();
+        try testing.expectError(error.CorruptPage, bp_store.get("alpha.txt"));
+
+        var bad_hdr = try allocator.dupe(u8, raw);
+        defer allocator.free(bad_hdr);
+        bad_hdr[12] ^= 0x01;
+        try ondb.store.mmap.atomicWriteFile(io, sdir, "bad_hdr.0ndb", bad_hdr);
+        try testing.expectError(error.CorruptHeader, shadow_mod.ShadowStore.open(allocator, io, sdir, "bad_hdr.0ndb"));
+
+        try small.remove("alpha.txt");
+        try small.remove("beta.txt");
+        try testing.expectEqual(@as(u64, 0), small.count());
+        try small.flushAtomic(io, sdir, "small.0ndb");
+        try testing.expectEqual(@as(u64, 0), small.count());
+        try testing.expectEqual(@as(usize, 0), small.dirtyCount());
+    }
+
+    {
+        var gov = pool_mod.MemoryGovernor.init(.{
+            .shared_blob_bytes = 256 * 1024,
+            .shared_git_delta_bytes = 64 * 1024,
+            .active_workspaces_bytes = 1024,
+            .max_hot_worktrees = 2,
+            .idle_hibernate_ms = 500,
+            .max_inotify_watches = 128,
+        });
+        try testing.expect(!gov.needsWorkspaceEviction(512));
+        try testing.expect(gov.needsWorkspaceEviction(1025));
+
+        gov.addWorkspaceBytes(600);
+        gov.incHot();
+        const s1 = gov.snapshot();
+        try testing.expectEqual(@as(usize, 600), s1.workspace_bytes);
+        try testing.expectEqual(@as(u32, 1), s1.hot_count);
+        try testing.expect(!gov.needsWorkspaceEviction(424));
+        try testing.expect(gov.needsWorkspaceEviction(425));
+
+        gov.incHot();
+        try testing.expect(gov.needsWorkspaceEviction(0));
+
+        gov.decHot();
+        gov.subWorkspaceBytes(600);
+        try testing.expect(!gov.needsWorkspaceEviction(500));
+
+        gov.subWorkspaceBytes(9999);
+        gov.decHot();
+        gov.decHot();
+        const s2 = gov.snapshot();
+        try testing.expectEqual(@as(usize, 0), s2.workspace_bytes);
+        try testing.expectEqual(@as(u32, 0), s2.hot_count);
+    }
+
+    {
+        const pool_root = "/tmp/0ndb-verify-daemon-pool";
+        cleanDir(io, pool_root);
+        defer cleanDir(io, pool_root);
+
+        const state_dir = "/tmp/0ndb-verify-daemon-pool/state";
+        const repo_dir = "/tmp/0ndb-verify-daemon-pool/repo";
+        const wt_dir = "/tmp/0ndb-verify-daemon-pool/wt1";
+        try std.Io.Dir.cwd().createDirPath(io, repo_dir);
+
+        const o_init = try runGitTestCmd(allocator, io, repo_dir, &.{ "init", "-b", "main" });
+        allocator.free(o_init);
+        const payload = "shared git odb payload across linked worktrees\n";
+        try writeTestFile(io, repo_dir, "shared.txt", payload, false);
+        const o_add = try runGitTestCmd(allocator, io, repo_dir, &.{ "add", "-A" });
+        allocator.free(o_add);
+        const o_com = try runGitTestCmd(allocator, io, repo_dir, &.{ "commit", "-m", "init" });
+        allocator.free(o_com);
+        const o_wt = try runGitTestCmd(allocator, io, repo_dir, &.{ "worktree", "add", "-b", "wt-a", wt_dir });
+        allocator.free(o_wt);
+
+        var main_dirs = (try git_dirs.GitDirs.locate(allocator, io, repo_dir)).?;
+        defer main_dirs.deinit(allocator);
+        var linked_dirs = (try git_dirs.GitDirs.locate(allocator, io, wt_dir)).?;
+        defer linked_dirs.deinit(allocator);
+        try testing.expectEqualStrings(main_dirs.common_dir, linked_dirs.common_dir);
+
+        const res = try pool_mod.DaemonResources.init(allocator, io, state_dir, .{
+            .shared_blob_bytes = 1024 * 1024,
+            .shared_git_delta_bytes = 256 * 1024,
+            .active_workspaces_bytes = 8 * 1024 * 1024,
+            .max_hot_worktrees = 4,
+            .idle_hibernate_ms = 1_000,
+            .max_inotify_watches = 256,
+        });
+        defer res.deinit();
+
+        try testing.expect(res.watcher == null);
+
+        const blob_data = "deduplicated blob shared across simulated worktrees";
+        const blob_hash = try res.blob_pool.put(blob_data);
+        try testing.expect(res.blob_pool.isCached(blob_hash));
+        const got_blob = (try res.blob_pool.get(allocator, blob_hash)).?;
+        defer allocator.free(got_blob);
+        try testing.expectEqualStrings(blob_data, got_blob);
+
+        const odb1 = try res.acquireGitOdb(main_dirs.common_dir, .sha1, null);
+        try testing.expectEqual(@as(usize, 1), odb1.ref_count.load(.acquire));
+        try testing.expectEqual(@as(usize, 1), res.gitOdbCount());
+
+        const odb2 = try res.acquireGitOdb(linked_dirs.common_dir, .sha1, null);
+        try testing.expectEqual(odb1, odb2);
+        try testing.expectEqual(@as(usize, 2), odb1.ref_count.load(.acquire));
+        try testing.expectEqual(@as(usize, 1), res.gitOdbCount());
+
+        const expected_oid = git_dirs.GitOid.ofBlob(.sha1, payload);
+        const got_git_blob = (try odb2.readBlobAlloc(allocator, expected_oid)).?;
+        defer allocator.free(got_git_blob);
+        try testing.expectEqualStrings(payload, got_git_blob);
+
+        res.refreshGovernorStats();
+        try testing.expect(res.governor.snapshot().blob_bytes > 0);
+
+        const w1 = try res.ensureWatcher();
+        const w2 = try res.ensureWatcher();
+        try testing.expectEqual(w1, w2);
+
+        res.hibernateAllShared();
+        try testing.expectEqual(@as(usize, 0), res.blob_pool.cacheUsedBytes());
+        try testing.expectEqual(@as(usize, 0), res.governor.snapshot().blob_bytes);
+        try testing.expectEqual(@as(usize, 0), res.governor.snapshot().git_delta_bytes);
+
+        res.releaseGitOdb(linked_dirs.common_dir);
+        try testing.expectEqual(@as(usize, 1), odb1.ref_count.load(.acquire));
+        try testing.expectEqual(@as(usize, 1), res.gitOdbCount());
+
+        res.releaseGitOdb(main_dirs.common_dir);
+        try testing.expectEqual(@as(usize, 0), res.gitOdbCount());
     }
 }
