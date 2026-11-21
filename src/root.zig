@@ -31,6 +31,8 @@ pub const fs = struct {
     pub const workspace = @import("fs/workspace.zig");
     pub const worktrees = @import("fs/worktrees.zig");
     pub const pool = @import("fs/pool.zig");
+    pub const timeline = @import("fs/timeline.zig");
+    pub const git_remote = @import("fs/git_remote.zig");
 };
 
 pub const providers = struct {
