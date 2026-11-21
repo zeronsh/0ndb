@@ -1346,7 +1346,8 @@ _spine_prefetch :: proc(v: ^obj.View, t: ^Tail, lo, hi: i64, floor: prim.Hlc) {
 		for k := (max(a, e.child_depth + 1) - 1) / SPINE_SPAN; k <= (min(hi, b.covered) - 1) / SPINE_SPAN; k += 1 {
 			if k - k0 >= 0 && k - k0 < i64(len(b.blocks)) {
 				rec := b.blocks[k - k0]
-				obj.want(v, b.bseg, rec, min(rec + obj.MSG_GUESS, obj.end(v, b.bseg)))
+				bs := b.bsegs[k - k0]
+				obj.want(v, bs, rec, min(rec + obj.MSG_GUESS, obj.end(v, bs)))
 			}
 		}
 	}

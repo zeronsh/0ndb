@@ -21,6 +21,7 @@ Entry :: struct {
 Branch :: struct {
 	seg:     int,
 	bseg:    int,
+	bsegs:   []int,
 	blocks:  []i64,
 	covered: i64,
 	first:   i64,
@@ -499,6 +500,19 @@ _add_remember :: proc(v: ^obj.View, s: int, st: ^Structure, d: Remember, by: pri
 		if len(d.blocks) > 0 {
 			bs := obj.resolve(v, s, Ref{d.bseg, d.blocks[0]}) or_return
 			b.bseg = bs.seg
+			segs, se := make([]int, len(d.blocks), st.alloc)
+			if se != nil {
+				return .No_Memory
+			}
+			for i in 0 ..< len(segs) {
+				if len(d.bsegs) > 0 {
+					x := obj.resolve(v, s, Ref{d.bsegs[i], d.blocks[i]}) or_return
+					segs[i] = x.seg
+				} else {
+					segs[i] = bs.seg
+				}
+			}
+			b.bsegs = segs
 			list, e := make([]i64, len(d.blocks), st.alloc)
 			if e != nil {
 				return .No_Memory
@@ -525,7 +539,7 @@ _branch_node :: proc(v: ^obj.View, st: ^Structure, e: Entry, d: i64) -> (at: Vre
 		if k < 0 || k >= i64(len(b.blocks)) || b.bseg < 0 {
 			return {}, false, .None
 		}
-		return _record_node(v, st, b.bseg, b.blocks[k], d)
+		return _record_node(v, st, b.bsegs[k], b.blocks[k], d)
 	}
 	if b.nodes == nil {
 		n := int(e.leaf_depth - b.first)

@@ -76,6 +76,7 @@ Remember :: struct {
 	blocks:      []i64,
 	covered:     i64,
 	bseg:        u32,
+	bsegs:       []u32,
 }
 
 Digest_Assign :: struct {
@@ -646,6 +647,14 @@ _put_remember :: proc(w: ^prim.Writer, off: i64, v: Remember) {
 		obj.tw_uv(w, 9, u64(v.covered))
 		obj.tw_bytes(w, 10, _pack_offsets(v.blocks))
 		obj.tw_uv(w, 11, u64(v.bseg))
+		if len(v.bsegs) > 0 {
+			sb := make([dynamic]u8, context.temp_allocator)
+			sw := prim.writer(&sb)
+			for x in v.bsegs {
+				prim.write_uvarint(&sw, u64(x))
+			}
+			obj.tw_bytes(w, 12, sb[:])
+		}
 	}
 }
 
@@ -706,9 +715,18 @@ _get_remember :: proc(d: ^obj.Dec) -> (v: Remember) {
 			x := obj.dec_uv(d)
 			d.bad ||= x > u64(obj.MAX_SEGS)
 			v.bseg = u32(min(x, u64(obj.MAX_SEGS)))
+		case 12:
+			sr := prim.reader(obj.dec_bytes(d))
+			list := make([dynamic]u32, context.temp_allocator)
+			for prim.reader_remaining(&sr) > 0 {
+				x := prim.read_uvarint(&sr)
+				d.bad ||= sr.err != .None || x > u64(obj.MAX_SEGS)
+				append(&list, u32(min(x, u64(obj.MAX_SEGS))))
+			}
+			v.bsegs = list[:]
 		}
 	}
-	d.bad ||= v.covered % SPINE_SPAN != 0 || (len(v.blocks) > 0 && v.covered != (v.child_depth / SPINE_SPAN + i64(len(v.blocks))) * SPINE_SPAN)
+	d.bad ||= (len(v.bsegs) > 0 && len(v.bsegs) != len(v.blocks)) || v.covered % SPINE_SPAN != 0 || (len(v.blocks) > 0 && v.covered != (v.child_depth / SPINE_SPAN + i64(len(v.blocks))) * SPINE_SPAN)
 	return
 }
 

@@ -1454,7 +1454,8 @@ _branch :: proc(w: ^Writer, leaf: Vref, r: ^Remember) -> Error {
 			break
 		}
 		if len(r.blocks) == 0 && n > BRANCH_MAX {
-			return .None
+			_branch_blocks(w, &st, leaf, r) or_return
+			start = max(start, r.covered + 1)
 		}
 	}
 	count := r.leaf_depth - start
@@ -1765,4 +1766,67 @@ _spine_update :: proc(w: ^Writer, anchor: Vref, tdepth: i64) -> (spine: i64, err
 	}
 	tr := obj.local(&w.core, anchor) or_return
 	return _event(w, Spine{target = tr, prev = old, c = cnew, first = keep / SPINE_SPAN, nodes = spine_encode(nodes, v.scratch)})
+}
+
+@(private)
+_branch_blocks :: proc(w: ^Writer, st: ^Structure, leaf: Vref, r: ^Remember) -> Error {
+	v := w.core.v
+	k0 := r.child_depth / SPINE_SPAN
+	kc := (r.leaf_depth - 1) / SPINE_SPAN
+	if kc <= k0 {
+		return .None
+	}
+	best, depth: i64 = -1, 0
+	for s in 0 ..< len(st.spines) {
+		sp := _spine_get(v, st, s) or_return
+		if sp == nil || !sp.ready || obj.vref_none(sp.target) {
+			continue
+		}
+		a := lca(v, leaf, sp.target) or_return
+		if obj.vref_none(a) {
+			continue
+		}
+		na := _node(v, a) or_return
+		if l := min(na.depth, sp.c); l > depth {
+			best, depth = i64(s), l
+		}
+	}
+	blocks := make([dynamic]i64, v.scratch)
+	segs := make([dynamic]u32, v.scratch)
+	k := k0
+	if best >= 0 {
+		sp := &st.spines[best]
+		for ; k < kc && (k + 1) * SPINE_SPAN <= depth && sp.blocks[k] != 0; k += 1 {
+			ref := obj.local(&w.core, Vref{int(best), sp.blocks[k]}) or_return
+			append(&blocks, ref.off)
+			append(&segs, ref.seg)
+		}
+	}
+	if k < kc {
+		nodes := make([]Ref, (kc - k) * SPINE_SPAN, v.scratch)
+		n := level_ancestor(v, leaf, kc * SPINE_SPAN) or_return
+		for i := len(nodes) - 1; i >= 0; i -= 1 {
+			nodes[i] = obj.local(&w.core, n.ref) or_return
+			if i > 0 {
+				n = _node(v, n.parent) or_return
+			}
+		}
+		tr := obj.local(&w.core, leaf) or_return
+		off := _event(w, Spine{target = tr, c = kc * SPINE_SPAN, first = k, nodes = spine_encode(nodes, v.scratch)}) or_return
+		for _ in k ..< kc {
+			append(&blocks, off)
+			append(&segs, 0)
+		}
+	}
+	r.blocks = blocks[:]
+	r.covered = kc * SPINE_SPAN
+	r.bseg = segs[0]
+	mixed := false
+	for x in segs {
+		mixed ||= x != segs[0]
+	}
+	if mixed {
+		r.bsegs = segs[:]
+	}
+	return .None
 }
