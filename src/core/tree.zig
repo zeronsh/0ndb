@@ -4,8 +4,7 @@ const id = @import("id.zig");
 const text_mod = @import("text.zig");
 const Text = text_mod.Text;
 const View = text_mod.View;
-const git_dirs = @import("../fs/git_dirs.zig");
-const lru = @import("../store/lru.zig");
+const lru = @import("lru.zig");
 
 pub const FileMode = enum(u8) {
     regular = 0,
@@ -27,7 +26,7 @@ pub const BlobRef = struct {
 };
 
 pub const GitBlobRef = struct {
-    oid: git_dirs.GitOid,
+    oid: id.GitOid,
     len: u64,
 
     pub fn eql(self: GitBlobRef, other: GitBlobRef) bool {

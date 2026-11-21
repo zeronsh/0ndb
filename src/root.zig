@@ -1,5 +1,7 @@
 pub const core = struct {
     pub const id = @import("core/id.zig");
+    pub const lru = @import("core/lru.zig");
+    pub const codec = @import("core/codec.zig");
     pub const version = @import("core/version.zig");
     pub const dag = @import("core/dag.zig");
     pub const diff = @import("core/diff.zig");
@@ -34,7 +36,15 @@ pub const fs = struct {
     pub const pool = @import("fs/pool.zig");
     pub const timeline = @import("fs/timeline.zig");
     pub const git_remote = @import("fs/git_remote.zig");
+    pub const projection = @import("fs/projection.zig");
 };
+
+pub const space = struct {
+    pub const space = @import("space/space.zig");
+    pub const manager = @import("space/manager.zig");
+};
+
+pub const project = @import("project/project.zig");
 
 pub const providers = struct {
     pub const interface = @import("providers/interface.zig");

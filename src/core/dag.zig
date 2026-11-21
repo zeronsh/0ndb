@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const id = @import("id.zig");
 const version_mod = @import("version.zig");
 const Version = version_mod.Version;
-const codec = @import("../store/codec.zig");
+const codec = @import("codec.zig");
 const text_mod = @import("text.zig");
 
 pub const BatchHeader = struct {

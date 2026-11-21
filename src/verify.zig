@@ -1285,6 +1285,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
     try runNativeGitLayerSuite(allocator, io);
     try runDaemonPoolAndShadowSuite(allocator, io);
     try runTimelineAndRemoteSuite(allocator, io);
+    try runSpaceProjectionProjectSuite(allocator, io);
 }
 
 fn countOpenFds(io: std.Io) !usize {
@@ -9487,5 +9488,590 @@ fn runZeroReplayScaleAndGcSuite(allocator: std.mem.Allocator, io: std.Io) !void 
         defer allocator.free(rb);
         try testing.expectEqualSlices(u8, shared_payload, ra);
         try testing.expectEqualSlices(u8, shared_payload, rb);
+    }
+}
+
+
+fn initTestGitRepo(allocator: std.mem.Allocator, io: std.Io, repo_dir: []const u8, file_name: []const u8, content: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, repo_dir);
+    const out_init = try runGitTestCmd(allocator, io, repo_dir, &.{"init"});
+    allocator.free(out_init);
+    const out_name = try runGitTestCmd(allocator, io, repo_dir, &.{ "config", "user.name", "Test User" });
+    allocator.free(out_name);
+    const out_email = try runGitTestCmd(allocator, io, repo_dir, &.{ "config", "user.email", "test@example.com" });
+    allocator.free(out_email);
+
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_dir, file_name });
+    defer allocator.free(file_path);
+    try writeVerifyFile(io, file_path, content);
+
+    const out_add = try runGitTestCmd(allocator, io, repo_dir, &.{ "add", "." });
+    allocator.free(out_add);
+    const out_ci = try runGitTestCmd(allocator, io, repo_dir, &.{ "commit", "-m", "initial" });
+    allocator.free(out_ci);
+}
+
+fn readDiskPathAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+    const buf = try allocator.alloc(u8, @intCast(st.size));
+    errdefer allocator.free(buf);
+    const n = try f.readPositionalAll(io, buf, 0);
+    return buf[0..n];
+}
+
+fn runSpaceProjectionProjectSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const space_mod = ondb.space.space;
+    const manager_mod = ondb.space.manager;
+    const projection_mod = ondb.fs.projection;
+    const project_mod = ondb.project;
+    const pool_mod = ondb.fs.pool;
+    const id_mod = ondb.core.id;
+    const text_mod = ondb.core.text;
+
+    const base_tmp = "/tmp/0ndb-verify-space-proj-project";
+    cleanDir(io, base_tmp);
+    defer cleanDir(io, base_tmp);
+    try std.Io.Dir.cwd().createDirPath(io, base_tmp);
+
+    {
+        const pool_dir = try std.fmt.allocPrint(allocator, "{s}/p1_pool", .{base_tmp});
+        defer allocator.free(pool_dir);
+        const resources = try pool_mod.DaemonResources.init(allocator, io, pool_dir, .{});
+        defer resources.deinit();
+
+        const sp_state = try std.fmt.allocPrint(allocator, "{s}/p1_virtual_space", .{base_tmp});
+        defer allocator.free(sp_state);
+        const sp_id = id_mod.newUuidV7(io);
+        const actor_a: id_mod.ActorId = 1001;
+        const actor_b: id_mod.ActorId = 1002;
+
+        var sp = try space_mod.Space.open(allocator, io, sp_state, sp_id, .virtual, resources);
+        defer sp.deinit();
+
+        try testing.expect(resources.watcher == null);
+
+        _ = try sp.putFile(actor_a, "notes/plan.md", "line1\nline2\nline3\n");
+        _ = try sp.putFile(actor_a, "notes/todo.txt", "alpha\nbeta needle\ngamma\n");
+        _ = try sp.putFile(actor_a, "docs/guide.md", "other needle here\n");
+
+        var v_after_init = try sp.headsClone(allocator);
+        defer v_after_init.deinit(allocator);
+
+        const splices = [_]text_mod.TextSplice{.{
+            .at = 6,
+            .del = 5,
+            .text = @constCast("LINE_TWO"),
+        }};
+        _ = try sp.editText(actor_a, "notes/plan.md", &splices);
+        {
+            const got = (try sp.readFileAlloc(allocator, "notes/plan.md")).?;
+            defer allocator.free(got);
+            try testing.expectEqualStrings("line1\nLINE_TWO\nline3\n", got);
+        }
+
+        {
+            const entries = try sp.listDir(allocator, "notes");
+            defer {
+                for (entries) |*e| e.deinit(allocator);
+                allocator.free(entries);
+            }
+            try testing.expectEqual(@as(usize, 2), entries.len);
+        }
+
+        {
+            const hits = try sp.searchText(allocator, "needle", "notes/", 10);
+            defer {
+                for (hits) |*h| h.deinit(allocator);
+                allocator.free(hits);
+            }
+            try testing.expectEqual(@as(usize, 1), hits.len);
+            try testing.expectEqualStrings("notes/todo.txt", hits[0].path);
+            try testing.expectEqual(@as(u32, 2), hits[0].line);
+        }
+
+        _ = try sp.setMeta(actor_a, "mem/pref/theme", "dark");
+        _ = try sp.setMeta(actor_a, "mem/pref/lang", "zig");
+        _ = try sp.setMeta(actor_a, "other/k", "v");
+        try testing.expectEqualStrings("dark", sp.getMeta("mem/pref/theme").?);
+        {
+            const meta_list = try sp.listMetaPrefix(allocator, "mem/pref/");
+            defer {
+                for (meta_list) |*m| m.deinit(allocator);
+                allocator.free(meta_list);
+            }
+            try testing.expectEqual(@as(usize, 2), meta_list.len);
+        }
+
+        _ = try sp.movePath(actor_a, "docs/guide.md", "docs/manual.md");
+        try testing.expect((try sp.readFileAlloc(allocator, "docs/guide.md")) == null);
+        {
+            const moved = (try sp.readFileAlloc(allocator, "docs/manual.md")).?;
+            defer allocator.free(moved);
+            try testing.expectEqualStrings("other needle here\n", moved);
+        }
+
+        const rolled = try sp.rollbackToVersion(actor_a, &v_after_init);
+        try testing.expect(rolled);
+        const rolled_again = try sp.rollbackToVersion(actor_a, &v_after_init);
+        try testing.expect(!rolled_again);
+        {
+            const restored = (try sp.readFileAlloc(allocator, "notes/plan.md")).?;
+            defer allocator.free(restored);
+            try testing.expectEqualStrings("line1\nline2\nline3\n", restored);
+        }
+
+        try sp.checkpoint(.major);
+        const fork_state = try std.fmt.allocPrint(allocator, "{s}/p1_virtual_fork", .{base_tmp});
+        defer allocator.free(fork_state);
+        const fork_id = id_mod.newUuidV7(io);
+        var fork_sp = try sp.forkCow(fork_state, fork_id);
+        defer fork_sp.deinit();
+
+        try testing.expect(fork_sp.origin != null);
+        try testing.expectEqual(sp_id, fork_sp.origin.?.origin_space_id);
+
+        _ = try sp.putFile(actor_a, "notes/plan.md", "line1\norigin_edit\nline3\n");
+        _ = try fork_sp.putFile(actor_b, "notes/plan.md", "line1\nfork_edit\nline3\n");
+
+        var sync_rep = try fork_sp.syncFromOrigin(&sp);
+        defer sync_rep.deinit(allocator);
+        try testing.expectEqual(@as(usize, 1), sync_rep.conflicts.len);
+        try testing.expectEqualStrings("notes/plan.md", sync_rep.conflicts[0].path);
+
+        {
+            const marked = (try fork_sp.readFileAlloc(allocator, "notes/plan.md")).?;
+            defer allocator.free(marked);
+            try testing.expect(std.mem.indexOf(u8, marked, "<<<<<<< ours") != null);
+            try testing.expect(std.mem.indexOf(u8, marked, "||||||| base") != null);
+            try testing.expect(std.mem.indexOf(u8, marked, ">>>>>>> theirs") != null);
+            try testing.expect(space_mod.hasConflictMarkers(marked));
+        }
+
+        {
+            const persisted = try fork_sp.conflicts(allocator);
+            defer {
+                for (persisted) |*c| c.deinit(allocator);
+                allocator.free(persisted);
+            }
+            try testing.expectEqual(@as(usize, 1), persisted.len);
+        }
+
+        try testing.expectError(error.UnresolvedConflicts, fork_sp.landToOrigin(&sp));
+
+        try fork_sp.resolveConflict("notes/plan.md", .{ .content = "line1\nmerged_clean\nline3\n" });
+        {
+            const persisted2 = try fork_sp.conflicts(allocator);
+            defer {
+                for (persisted2) |*c| c.deinit(allocator);
+                allocator.free(persisted2);
+            }
+            try testing.expectEqual(@as(usize, 0), persisted2.len);
+        }
+
+        var land_rep = try fork_sp.landToOrigin(&sp);
+        defer land_rep.deinit(allocator);
+        try testing.expect(land_rep.landed > 0);
+
+        {
+            const landed_bytes = (try sp.readFileAlloc(allocator, "notes/plan.md")).?;
+            defer allocator.free(landed_bytes);
+            try testing.expectEqualStrings("line1\nmerged_clean\nline3\n", landed_bytes);
+        }
+
+        sp.hibernate();
+        {
+            const after_hib = (try sp.readFileAlloc(allocator, "notes/plan.md")).?;
+            defer allocator.free(after_hib);
+            try testing.expectEqualStrings("line1\nmerged_clean\nline3\n", after_hib);
+        }
+        _ = try sp.compactWithPolicy(.{});
+        try testing.expect(resources.watcher == null);
+    }
+
+    {
+        const pool_dir = try std.fmt.allocPrint(allocator, "{s}/p2_pool", .{base_tmp});
+        defer allocator.free(pool_dir);
+        const resources = try pool_mod.DaemonResources.init(allocator, io, pool_dir, .{});
+        defer resources.deinit();
+
+        const repo_dir = try std.fmt.allocPrint(allocator, "{s}/p2_git_repo", .{base_tmp});
+        defer allocator.free(repo_dir);
+        try initTestGitRepo(allocator, io, repo_dir, "hello.txt", "hello git world\n");
+
+        const sh_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{repo_dir});
+        defer allocator.free(sh_path);
+        try writeVerifyFile(io, sh_path, "#!/bin/sh\necho ok\n");
+        {
+            const shf = try std.Io.Dir.cwd().openFile(io, sh_path, .{ .mode = .read_write });
+            defer shf.close(io);
+            try shf.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+        }
+        const gi_path = try std.fmt.allocPrint(allocator, "{s}/.gitignore", .{repo_dir});
+        defer allocator.free(gi_path);
+        try writeVerifyFile(io, gi_path, "*.log\n");
+        const out_add = try runGitTestCmd(allocator, io, repo_dir, &.{ "add", "run.sh", ".gitignore" });
+        allocator.free(out_add);
+        const out_ci = try runGitTestCmd(allocator, io, repo_dir, &.{ "commit", "-m", "add script" });
+        allocator.free(out_ci);
+
+        const ign_path = try std.fmt.allocPrint(allocator, "{s}/debug.log", .{repo_dir});
+        defer allocator.free(ign_path);
+        try writeVerifyFile(io, ign_path, "ignored log\n");
+
+        const sp_state = try std.fmt.allocPrint(allocator, "{s}/p2_git_space", .{base_tmp});
+        defer allocator.free(sp_state);
+        const sp_id = id_mod.newUuidV7(io);
+
+        var sp = try space_mod.Space.open(allocator, io, sp_state, sp_id, .git_worktree, resources);
+        defer sp.deinit();
+
+        {
+            var proj = try projection_mod.Projection.attach(allocator, io, &sp, repo_dir, resources);
+            defer proj.deinit();
+
+            try proj.adoptInitial();
+
+            {
+                const got = (try sp.readFileAlloc(allocator, "hello.txt")).?;
+                defer allocator.free(got);
+                try testing.expectEqualStrings("hello git world\n", got);
+            }
+            try testing.expect((try sp.readFileAlloc(allocator, "debug.log")) == null);
+
+            try testing.expect((try proj.ingestDirty()) == null);
+
+            var v0 = try sp.headsClone(allocator);
+            defer v0.deinit(allocator);
+
+            const hello_path = try std.fmt.allocPrint(allocator, "{s}/hello.txt", .{repo_dir});
+            defer allocator.free(hello_path);
+            try writeVerifyFile(io, hello_path, "edited on disk\n");
+            proj.markDirty();
+            const b_ing = try proj.ingestDirty();
+            try testing.expect(b_ing != null);
+            {
+                const got = (try sp.readFileAlloc(allocator, "hello.txt")).?;
+                defer allocator.free(got);
+                try testing.expectEqualStrings("edited on disk\n", got);
+            }
+
+            const untracked_path = try std.fmt.allocPrint(allocator, "{s}/keep_me.txt", .{repo_dir});
+            defer allocator.free(untracked_path);
+            try writeVerifyFile(io, untracked_path, "user untracked\n");
+
+            try testing.expect(try sp.rollbackToVersion(sp.actor_id, &v0));
+            try proj.materializeChanged();
+
+            {
+                const disk_hello = try readDiskPathAlloc(allocator, io, hello_path);
+                defer allocator.free(disk_hello);
+                try testing.expectEqualStrings("hello git world\n", disk_hello);
+            }
+            {
+                const disk_keep = try readDiskPathAlloc(allocator, io, untracked_path);
+                defer allocator.free(disk_keep);
+                try testing.expectEqualStrings("user untracked\n", disk_keep);
+            }
+
+            const sh_st = try std.Io.Dir.cwd().statFile(io, sh_path, .{});
+            try testing.expect((sh_st.permissions.toMode() & 0o111) != 0);
+
+            var vh = try proj.vcsHead(allocator);
+            defer vh.deinit(allocator);
+            try testing.expectEqual(ondb.fs.vcs.VcsKind.git, vh.kind);
+            try testing.expect(vh.rev != null);
+
+            proj.hibernate();
+            try testing.expect(proj.hibernated);
+        }
+
+        try testing.expectEqual(@as(usize, 0), resources.gitOdbCount());
+        if (resources.watcher) |w| {
+            try testing.expectEqual(@as(usize, 0), w.mountCount());
+            try testing.expectEqual(@as(usize, 4), w.fdCount());
+        }
+        {
+            const still_there = (try sp.readFileAlloc(allocator, "hello.txt"));
+            if (still_there) |b| allocator.free(b);
+        }
+    }
+
+    {
+        const pool_dir = try std.fmt.allocPrint(allocator, "{s}/p3_pool", .{base_tmp});
+        defer allocator.free(pool_dir);
+        const mgr_state = try std.fmt.allocPrint(allocator, "{s}/p3_mgr_state", .{base_tmp});
+        defer allocator.free(mgr_state);
+        const mgr_checkouts = try std.fmt.allocPrint(allocator, "{s}/p3_checkouts", .{base_tmp});
+        defer allocator.free(mgr_checkouts);
+
+        const budget = pool_mod.MemoryBudget{
+            .max_hot_worktrees = 4,
+            .active_workspaces_bytes = 64 * 1024 * 1024,
+        };
+        const resources = try pool_mod.DaemonResources.init(allocator, io, pool_dir, budget);
+        defer resources.deinit();
+
+        var virtual_ids: [10]u128 = undefined;
+        var dir_ids: [10]u128 = undefined;
+        var git_ids: [9]u128 = undefined;
+        var remote_id: u128 = 0;
+
+        {
+            var mgr = try manager_mod.SpaceManager.open(allocator, io, mgr_state, mgr_checkouts, resources);
+            defer mgr.deinit();
+
+            for (0..10) |i| {
+                const t = try std.fmt.allocPrint(allocator, "virt-{d}", .{i});
+                defer allocator.free(t);
+                var rec = try mgr.createVirtual(t);
+                virtual_ids[i] = rec.space_id;
+                rec.deinit(allocator);
+            }
+
+            for (0..10) |i| {
+                const dpath = try std.fmt.allocPrint(allocator, "{s}/p3_dir_{d}", .{ base_tmp, i });
+                defer allocator.free(dpath);
+                try std.Io.Dir.cwd().createDirPath(io, dpath);
+                const fpath = try std.fmt.allocPrint(allocator, "{s}/f.txt", .{dpath});
+                defer allocator.free(fpath);
+                try writeVerifyFile(io, fpath, "dir content\n");
+                const t = try std.fmt.allocPrint(allocator, "dir-{d}", .{i});
+                defer allocator.free(t);
+                var rec = try mgr.adoptLocal(dpath, t);
+                dir_ids[i] = rec.space_id;
+                rec.deinit(allocator);
+            }
+
+            const git_base = try std.fmt.allocPrint(allocator, "{s}/p3_git_base", .{base_tmp});
+            defer allocator.free(git_base);
+            try initTestGitRepo(allocator, io, git_base, "src.zig", "pub const x = 1;\n");
+            var base_rec = try mgr.adoptLocal(git_base, "git-0");
+            git_ids[0] = base_rec.space_id;
+            base_rec.deinit(allocator);
+
+            for (1..9) |i| {
+                const t = try std.fmt.allocPrint(allocator, "git-{d}", .{i});
+                defer allocator.free(t);
+                var rec = try mgr.forkSpace(git_ids[0], t, true);
+                git_ids[i] = rec.space_id;
+                rec.deinit(allocator);
+            }
+
+            var rrec = try mgr.registerRemoteSpace(null, "remote-unhydrated", .git_worktree, "git@example.invalid:org/repo.git");
+            remote_id = rrec.space_id;
+            rrec.deinit(allocator);
+            const missing_path = try std.fmt.allocPrint(allocator, "{s}/does_not_exist_anywhere", .{base_tmp});
+            defer allocator.free(missing_path);
+            try mgr.attachProjection(remote_id, missing_path);
+
+            try testing.expectEqual(@as(usize, 30), mgr.spaceCount());
+        }
+
+        {
+            const t0 = id_mod.nowMs(io);
+            var mgr = try manager_mod.SpaceManager.open(allocator, io, mgr_state, mgr_checkouts, resources);
+            defer mgr.deinit();
+            const elapsed_ms = id_mod.nowMs(io) -| t0;
+
+            try testing.expectEqual(@as(usize, 30), mgr.spaceCount());
+            try testing.expectEqual(@as(u32, 0), mgr.hotCount());
+            try testing.expectEqual(@as(u32, 0), mgr.warmCount());
+            try testing.expectEqual(@as(u32, 30), mgr.coldCount());
+            try testing.expect(elapsed_ms < 500);
+
+            try testing.expect(mgr.get(remote_id) != null);
+            try testing.expect((try mgr.activateProjection(remote_id)) == null);
+            try testing.expect(mgr.get(remote_id) != null);
+            try testing.expect((try mgr.activateProjection(virtual_ids[0])) == null);
+
+            _ = try mgr.activateProjection(dir_ids[0]);
+            try mgr.pin(dir_ids[0]);
+
+            for (1..8) |i| {
+                const p = try mgr.activateProjection(dir_ids[i]);
+                try testing.expect(p != null);
+            }
+
+            try testing.expect(mgr.hotCount() <= budget.max_hot_worktrees);
+            try testing.expectEqual(manager_mod.SlotState.hot, mgr.slotState(dir_ids[0]).?);
+            try testing.expectEqual(manager_mod.SlotState.warm, mgr.slotState(dir_ids[1]).?);
+
+            if (resources.watcher) |w| {
+                try testing.expectEqual(@as(usize, 4), w.fdCount());
+            }
+
+            mgr.unpin(dir_ids[0]);
+            const now = id_mod.nowMs(io);
+            _ = mgr.hibernateIdle(now + 60_000, 1_000);
+            try testing.expectEqual(@as(u32, 0), mgr.hotCount());
+
+            try mgr.detachProjection(dir_ids[0]);
+            try testing.expect(mgr.get(dir_ids[0]) != null);
+            try testing.expect(mgr.getProjectionRecord(dir_ids[0]) == null);
+            const sp0 = try mgr.activate(dir_ids[0]);
+            const c0 = (try sp0.readFileAlloc(allocator, "f.txt")).?;
+            defer allocator.free(c0);
+            try testing.expectEqualStrings("dir content\n", c0);
+
+            try mgr.removeSpace(git_ids[8], true);
+            try testing.expectEqual(@as(usize, 29), mgr.spaceCount());
+        }
+    }
+
+    {
+        const pool_dir = try std.fmt.allocPrint(allocator, "{s}/p4_pool", .{base_tmp});
+        defer allocator.free(pool_dir);
+        const mgr_state = try std.fmt.allocPrint(allocator, "{s}/p4_mgr_state", .{base_tmp});
+        defer allocator.free(mgr_state);
+        const mgr_checkouts = try std.fmt.allocPrint(allocator, "{s}/p4_checkouts", .{base_tmp});
+        defer allocator.free(mgr_checkouts);
+        const proj_state = try std.fmt.allocPrint(allocator, "{s}/p4_proj_state", .{base_tmp});
+        defer allocator.free(proj_state);
+
+        const resources = try pool_mod.DaemonResources.init(allocator, io, pool_dir, .{});
+        defer resources.deinit();
+
+        var mgr = try manager_mod.SpaceManager.open(allocator, io, mgr_state, mgr_checkouts, resources);
+        defer mgr.deinit();
+
+        const repo_a_dir = try std.fmt.allocPrint(allocator, "{s}/p4_repo_a", .{base_tmp});
+        defer allocator.free(repo_a_dir);
+        const repo_b_dir = try std.fmt.allocPrint(allocator, "{s}/p4_repo_b", .{base_tmp});
+        defer allocator.free(repo_b_dir);
+        try initTestGitRepo(allocator, io, repo_a_dir, "a.txt", "a-line1\na-line2\n");
+        try initTestGitRepo(allocator, io, repo_b_dir, "b.txt", "b-line1\nb-line2\n");
+
+        var rec_a = try mgr.adoptLocal(repo_a_dir, "repo-a");
+        const id_a = rec_a.space_id;
+        rec_a.deinit(allocator);
+
+        var rec_b = try mgr.adoptLocal(repo_b_dir, "repo-b");
+        const id_b = rec_b.space_id;
+        rec_b.deinit(allocator);
+
+        var rec_m = try mgr.createVirtual("memory-space");
+        const id_m = rec_m.space_id;
+        rec_m.deinit(allocator);
+        {
+            const sp_m = try mgr.activate(id_m);
+            _ = try sp_m.putFile(5001, "notes.md", "memory-base\n");
+            _ = try sp_m.setMeta(5001, "project/role", "memory");
+        }
+
+        var proj_id: u128 = 0;
+        {
+            var pstore = try project_mod.ProjectStore.open(allocator, io, proj_state);
+            defer pstore.deinit();
+            var p = try pstore.create("Multi-Repo App", "Always run tests.", 1, "model-v1");
+            proj_id = p.project_id;
+            p.deinit(allocator);
+
+            try pstore.addSpace(proj_id, .{ .space_id = id_a, .alias = @constCast("backend"), .kind = .git_worktree, .default_access = 2 });
+            try pstore.addSpace(proj_id, .{ .space_id = id_b, .alias = @constCast("frontend"), .kind = .git_worktree, .default_access = 2 });
+            try pstore.addSpace(proj_id, .{ .space_id = id_m, .alias = @constCast("memory"), .kind = .virtual, .default_access = 2 });
+            try pstore.update(proj_id, null, "Updated instructions.", null, null);
+        }
+        {
+            var pstore = try project_mod.ProjectStore.open(allocator, io, proj_state);
+            defer pstore.deinit();
+            const p = pstore.get(proj_id).?;
+            try testing.expectEqualStrings("Multi-Repo App", p.title);
+            try testing.expectEqualStrings("Updated instructions.", p.instructions);
+            try testing.expectEqual(@as(usize, 3), p.spaces.len);
+        }
+
+        const before_count = mgr.spaceCount();
+        try testing.expectError(
+            error.SpaceNotFound,
+            project_mod.SpaceSet.forkSpaceSet(allocator, &mgr, &.{ id_a, 999999999999 }, "bad", true),
+        );
+        try testing.expectEqual(before_count, mgr.spaceCount());
+
+        const fork_ids = try project_mod.SpaceSet.forkSpaceSet(allocator, &mgr, &.{ id_a, id_b, id_m }, "feat", true);
+        defer allocator.free(fork_ids);
+        try testing.expectEqual(@as(usize, 3), fork_ids.len);
+        try testing.expect(mgr.getProjectionRecord(fork_ids[0]) != null);
+        try testing.expect(mgr.getProjectionRecord(fork_ids[1]) != null);
+        try testing.expect(mgr.getProjectionRecord(fork_ids[2]) == null);
+
+        {
+            const fa = try mgr.activate(fork_ids[0]);
+            _ = try fa.putFile(6001, "a.txt", "a-line1\na-fork-change\n");
+            if (try mgr.activateProjection(fork_ids[0])) |pa| try pa.materializeChanged();
+
+            const fb = try mgr.activate(fork_ids[1]);
+            _ = try fb.putFile(6002, "b.txt", "b-line1\nb-fork-conflict\n");
+            if (try mgr.activateProjection(fork_ids[1])) |pb| try pb.materializeChanged();
+
+            const fm = try mgr.activate(fork_ids[2]);
+            _ = try fm.putFile(6003, "notes.md", "memory-base\nmemory-fork-note\n");
+        }
+
+        {
+            const ob = try mgr.activate(id_b);
+            _ = try ob.putFile(7001, "b.txt", "b-line1\nb-origin-conflict\n");
+            if (try mgr.activateProjection(id_b)) |pb| try pb.materializeChanged();
+        }
+
+        {
+            var land_abort = try project_mod.SpaceSet.landSpaceSet(allocator, &mgr, fork_ids);
+            defer land_abort.deinit(allocator);
+            try testing.expect(land_abort.aborted);
+            try testing.expectEqual(@as(usize, 0), land_abort.entries.len);
+            try testing.expectEqual(@as(usize, 1), land_abort.failures.len);
+            try testing.expectEqual(fork_ids[1], land_abort.failures[0].space_id);
+            try testing.expectEqual(project_mod.FailureReason.would_conflict, land_abort.failures[0].reason);
+
+            const oa = try mgr.activate(id_a);
+            const oa_bytes = (try oa.readFileAlloc(allocator, "a.txt")).?;
+            defer allocator.free(oa_bytes);
+            try testing.expectEqualStrings("a-line1\na-line2\n", oa_bytes);
+
+            const om = try mgr.activate(id_m);
+            const om_bytes = (try om.readFileAlloc(allocator, "notes.md")).?;
+            defer allocator.free(om_bytes);
+            try testing.expectEqualStrings("memory-base\n", om_bytes);
+        }
+
+        {
+            const sync_entries = try project_mod.SpaceSet.syncSpaceSet(allocator, &mgr, fork_ids);
+            defer {
+                for (sync_entries) |*e| e.deinit(allocator);
+                allocator.free(sync_entries);
+            }
+            try testing.expectEqual(@as(usize, 3), sync_entries.len);
+            try testing.expectEqual(@as(usize, 1), sync_entries[1].report.conflicts.len);
+
+            const fb = try mgr.activate(fork_ids[1]);
+            try fb.resolveConflict("b.txt", .{ .content = "b-line1\nb-resolved-together\n" });
+            if (try mgr.activateProjection(fork_ids[1])) |pb| try pb.materializeChanged();
+        }
+
+        {
+            var land_ok = try project_mod.SpaceSet.landSpaceSet(allocator, &mgr, fork_ids);
+            defer land_ok.deinit(allocator);
+            try testing.expect(!land_ok.aborted);
+            try testing.expectEqual(@as(usize, 3), land_ok.entries.len);
+            try testing.expectEqual(@as(usize, 0), land_ok.failures.len);
+
+            const oa_path = try std.fmt.allocPrint(allocator, "{s}/a.txt", .{repo_a_dir});
+            defer allocator.free(oa_path);
+            const oa_disk = try readDiskPathAlloc(allocator, io, oa_path);
+            defer allocator.free(oa_disk);
+            try testing.expectEqualStrings("a-line1\na-fork-change\n", oa_disk);
+
+            const ob_path = try std.fmt.allocPrint(allocator, "{s}/b.txt", .{repo_b_dir});
+            defer allocator.free(ob_path);
+            const ob_disk = try readDiskPathAlloc(allocator, io, ob_path);
+            defer allocator.free(ob_disk);
+            try testing.expectEqualStrings("b-line1\nb-resolved-together\n", ob_disk);
+
+            const om = try mgr.activate(id_m);
+            const om_bytes = (try om.readFileAlloc(allocator, "notes.md")).?;
+            defer allocator.free(om_bytes);
+            try testing.expectEqualStrings("memory-base\nmemory-fork-note\n", om_bytes);
+        }
     }
 }

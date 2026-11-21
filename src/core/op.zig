@@ -4,9 +4,7 @@ const id = @import("id.zig");
 const dag = @import("dag.zig");
 const diff = @import("diff.zig");
 const tree = @import("tree.zig");
-const git_dirs = @import("../fs/git_dirs.zig");
-const codec = @import("../store/codec.zig");
-const crypto = @import("../store/crypto.zig");
+const codec = @import("codec.zig");
 
 pub const INLINE_TEXT_MAX: usize = 4096;
 pub const MAX_OPS_PER_BATCH: usize = 1 << 20;
@@ -22,8 +20,8 @@ fn encodeGitBlobRef(allocator: Allocator, w: *codec.Writer, r: tree.GitBlobRef) 
 fn decodeGitBlobRef(r: *codec.Reader) codec.DecodeError!tree.GitBlobRef {
     const oid_len = try r.readByte();
     const oid = switch (oid_len) {
-        20 => git_dirs.GitOid.fromSlice(try r.readFixed(20)) catch return error.InvalidData,
-        32 => git_dirs.GitOid.fromSlice(try r.readFixed(32)) catch return error.InvalidData,
+        20 => id.GitOid.fromSlice(try r.readFixed(20)) catch return error.InvalidData,
+        32 => id.GitOid.fromSlice(try r.readFixed(32)) catch return error.InvalidData,
         else => return error.InvalidData,
     };
     const len = try r.readVarint();
@@ -583,7 +581,7 @@ pub fn makeTextContent(allocator: Allocator, bytes: []const u8) Allocator.Error!
     if (bytes.len <= INLINE_TEXT_MAX) {
         return .{ .{ .text_inline = try allocator.dupe(u8, bytes) }, null };
     }
-    const oid = crypto.hashBytes(bytes);
+    const oid = id.hashBytes(bytes);
     const data = try allocator.dupe(u8, bytes);
     return .{
         .{ .text_blob = .{ .oid = oid, .len = bytes.len } },

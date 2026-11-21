@@ -12,8 +12,7 @@ const tree_mod = @import("tree.zig");
 const Tree = tree_mod.Tree;
 const op_mod = @import("op.zig");
 const diff = @import("diff.zig");
-const git_dirs = @import("../fs/git_dirs.zig");
-const lru = @import("../store/lru.zig");
+const lru = @import("lru.zig");
 
 pub const IntegrateError = error{
     MissingParents,
@@ -69,19 +68,19 @@ pub const LogSliceReader = struct {
 
 pub const ExternalGitReader = struct {
     ptr: *anyopaque,
-    readAllocFn: *const fn (ptr: *anyopaque, allocator: Allocator, oid: git_dirs.GitOid) Allocator.Error!?[]u8,
-    readCachedFn: *const fn (ptr: *anyopaque, oid: git_dirs.GitOid) ?[]const u8,
-    containsFn: *const fn (ptr: *anyopaque, oid: git_dirs.GitOid) bool,
+    readAllocFn: *const fn (ptr: *anyopaque, allocator: Allocator, oid: id.GitOid) Allocator.Error!?[]u8,
+    readCachedFn: *const fn (ptr: *anyopaque, oid: id.GitOid) ?[]const u8,
+    containsFn: *const fn (ptr: *anyopaque, oid: id.GitOid) bool,
 
-    pub fn readAlloc(self: ExternalGitReader, allocator: Allocator, oid: git_dirs.GitOid) Allocator.Error!?[]u8 {
+    pub fn readAlloc(self: ExternalGitReader, allocator: Allocator, oid: id.GitOid) Allocator.Error!?[]u8 {
         return self.readAllocFn(self.ptr, allocator, oid);
     }
 
-    pub fn readCached(self: ExternalGitReader, oid: git_dirs.GitOid) ?[]const u8 {
+    pub fn readCached(self: ExternalGitReader, oid: id.GitOid) ?[]const u8 {
         return self.readCachedFn(self.ptr, oid);
     }
 
-    pub fn contains(self: ExternalGitReader, oid: git_dirs.GitOid) bool {
+    pub fn contains(self: ExternalGitReader, oid: id.GitOid) bool {
         return self.containsFn(self.ptr, oid);
     }
 };
@@ -103,7 +102,7 @@ pub const ExternalBlobReader = struct {
 pub const InsertionLookup = union(enum) {
     inline_bytes: []const u8,
     blob_oid: id.Oid,
-    git_oid: git_dirs.GitOid,
+    git_oid: id.GitOid,
 };
 
 pub const InsertionSource = struct {
@@ -122,7 +121,7 @@ pub const InsertionStorage = union(enum) {
         len: u32,
     },
     blob_ref: id.Oid,
-    git_blob: git_dirs.GitOid,
+    git_blob: id.GitOid,
 
     pub fn deinit(self: *InsertionStorage, allocator: Allocator) void {
         switch (self.*) {
@@ -141,7 +140,7 @@ const ReadCacheKey = struct {
         return .{ .kind = 1, .len = 32, .bytes = oid };
     }
 
-    fn forGit(oid: git_dirs.GitOid) ReadCacheKey {
+    fn forGit(oid: id.GitOid) ReadCacheKey {
         return .{ .kind = 2, .len = oid.len, .bytes = oid.bytes };
     }
 };
@@ -524,7 +523,7 @@ pub const History = struct {
         return null;
     }
 
-    pub fn resolveGitBlob(self: *const History, goid: git_dirs.GitOid) ?[]const u8 {
+    pub fn resolveGitBlob(self: *const History, goid: id.GitOid) ?[]const u8 {
         if (self.read_cache_box) |box| {
             const ckey = ReadCacheKey.forGit(goid);
             if (box.cache.get(ckey)) |slot| return slot.*;
@@ -553,7 +552,7 @@ pub const History = struct {
         return null;
     }
 
-    pub fn readGitBlobAlloc(self: *const History, allocator: Allocator, goid: git_dirs.GitOid) Allocator.Error!?[]u8 {
+    pub fn readGitBlobAlloc(self: *const History, allocator: Allocator, goid: id.GitOid) Allocator.Error!?[]u8 {
         if (self.git_reader) |gr| {
             return try gr.readAlloc(allocator, goid);
         }
@@ -1160,22 +1159,8 @@ pub const History = struct {
             .edit_text => |v| {
                 const inode = try self.requireKnown(view, v.inode);
                 const f = inode.filePtr() orelse return error.NotAFile;
-                if (f.content.nthIn(view, 0)) |ck_entry| {
-                    if (ck_entry.value == .git_lazy) {
-                        const ref = ck_entry.value.git_lazy;
-                        mutated.* = true;
-                        if (ref.len > 0) {
-                            const lazy_key = id.InsertionKey{ .op = ck_entry.op, .part = 0 };
-                            if (try self.insertions.fetchPut(self.allocator, lazy_key, .{ .git_blob = ref.oid })) |prev| {
-                                var old = prev.value;
-                                old.deinit(self.allocator);
-                            }
-                            f.text.deinit(self.allocator);
-                            f.text = try Text.fromInsertion(self.allocator, ck_entry.op, 0, 0, ref.len, null);
-                            f.text.node_source = self.node_source;
-                        }
-                        try f.content.set(self.allocator, op_id, .text);
-                    }
+                if (try self.promoteGitLazy(f, view, mutated)) {
+                    try f.content.set(self.allocator, op_id, .text);
                 }
                 f.text.apply(self.allocator, op_id, view, v.splices, v.text, self.resolver()) catch |err| switch (err) {
                     error.Unordered => return error.Unordered,
@@ -1279,6 +1264,31 @@ pub const History = struct {
         }
     }
 
+    fn promoteGitLazy(
+        self: *History,
+        f: *tree_mod.FileNode,
+        view: View,
+        mutated: *bool,
+    ) Allocator.Error!bool {
+        if (f.content.nthIn(view, 0)) |ck_entry| {
+            if (ck_entry.value == .git_lazy) {
+                const ref = ck_entry.value.git_lazy;
+                mutated.* = true;
+                if (ref.len > 0 and f.text.root == null and f.text.disk_root == null) {
+                    const lazy_key = id.InsertionKey{ .op = ck_entry.op, .part = 0 };
+                    if (try self.insertions.fetchPut(self.allocator, lazy_key, .{ .git_blob = ref.oid })) |prev| {
+                        var old = prev.value;
+                        old.deinit(self.allocator);
+                    }
+                    f.text = try Text.fromInsertion(self.allocator, ck_entry.op, 0, 0, ref.len, null);
+                    f.text.node_source = self.node_source;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn applySetContent(
         self: *History,
         f: *tree_mod.FileNode,
@@ -1290,18 +1300,21 @@ pub const History = struct {
         switch (content.*) {
             .text_inline => |bytes| {
                 mutated.* = true;
+                _ = try self.promoteGitLazy(f, view, mutated);
                 try f.content.set(self.allocator, op_id, .text);
                 try self.applySetTextBytes(f, op_id, view, bytes, null);
             },
             .text_blob => |ref| {
                 if (ref.len == 0) {
                     mutated.* = true;
+                    _ = try self.promoteGitLazy(f, view, mutated);
                     try f.content.set(self.allocator, op_id, .text);
                     try self.applySetTextBytes(f, op_id, view, "", ref.oid);
                 } else if (self.resolveBlob(ref.oid)) |raw_bytes| {
                     const copy = try self.allocator.dupe(u8, raw_bytes);
                     defer self.allocator.free(copy);
                     mutated.* = true;
+                    _ = try self.promoteGitLazy(f, view, mutated);
                     try f.content.set(self.allocator, op_id, .text);
                     try self.applySetTextBytes(f, op_id, view, copy, ref.oid);
                 } else {
@@ -1314,6 +1327,7 @@ pub const History = struct {
             },
             .git_text_blob => |ref| {
                 mutated.* = true;
+                _ = try self.promoteGitLazy(f, view, mutated);
                 try f.content.set(self.allocator, op_id, .text);
                 if (ref.len > 0) {
                     const key = id.InsertionKey{ .op = op_id, .part = 0 };
@@ -1610,6 +1624,12 @@ pub const History = struct {
         var vd = try f.text.diffViews(allocator, res, View.EVERYTHING, target_view);
         defer vd.deinit(allocator);
         if (vd.splices.len == 0) return;
+
+        const now_bytes = (try f.text.readIn(allocator, res, View.EVERYTHING)) orelse return error.MissingBlob;
+        defer allocator.free(now_bytes);
+        const tgt_bytes = (try f.text.readIn(allocator, res, target_view)) orelse return error.MissingBlob;
+        defer allocator.free(tgt_bytes);
+        if (std.mem.eql(u8, now_bytes, tgt_bytes)) return;
 
         var total_ins: usize = 0;
         for (vd.splices) |s| total_ins += s.text.len;
