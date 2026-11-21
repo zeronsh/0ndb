@@ -295,6 +295,20 @@ emit_position :: proc(o: ^Out, name: string, p: convo.Position) {
 	o_end(o)
 }
 
+emit_window :: proc(o: ^Out, w: ^convo.Window, leaf: obj.Rid) {
+	o_arr(o, "messages")
+	for &m in w.messages {
+		emit_message(o, "", &m)
+	}
+	o_end(o)
+	o_int(o, "anchor", w.anchor)
+	emit_position(o, "older", w.older)
+	emit_position(o, "newer", w.newer)
+	o_bool(o, "more_older", w.more_older)
+	o_bool(o, "more_newer", w.more_newer)
+	o_rid(o, "leaf", leaf)
+}
+
 emit_tail :: proc(o: ^Out, v: ^obj.View, t: ^convo.Tail) {
 	o_enum(o, "status", u64(t.status), CONVO_STATUS_NAMES[:])
 	o_rid(o, "head", convo.tail_head(v, t))

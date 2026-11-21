@@ -589,15 +589,36 @@ _remote_fetch :: proc(s: ^Session, rm: ^Remote, from, to: i64) -> bool {
 			return true
 		}
 	}
-	a := from
-	if to - a < MIN_FETCH {
-		a = max(to - MIN_FETCH, 0)
-	}
-	if osync.client_read(&s.link.client, rm.id, a, to) != .None {
+	a, b := _fetch_window(rm, from, to)
+	if osync.client_read(&s.link.client, rm.id, a, b) != .None {
 		return false
 	}
-	append(&rm.inflight, journal.Range{a, to})
+	append(&rm.inflight, journal.Range{a, b})
 	return true
+}
+
+@(private)
+_fetch_window :: proc(rm: ^Remote, from, to: i64) -> (a, b: i64) {
+	lo: i64 = 0
+	hi := rm.relay_len if rm.relay_len > to else max(i64)
+	for h in journal.replica_have(&rm.rep) {
+		if h.to <= from {
+			lo = max(lo, h.to)
+		} else if h.from >= to {
+			hi = min(hi, h.from)
+			break
+		}
+	}
+	a, b = from, to
+	room := MIN_FETCH - (b - a)
+	if room <= 0 {
+		return
+	}
+	up := min(room, hi - b) if hi != max(i64) else 0
+	b += up
+	room -= up
+	a = max(a - room, lo)
+	return
 }
 
 @(private)

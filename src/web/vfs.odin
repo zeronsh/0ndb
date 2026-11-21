@@ -243,6 +243,9 @@ _write :: proc(m: ^Mem_Vfs, n: ^Mem_Node, src: []u8, off: i64) -> prim.Error {
 			continue
 		}
 		if e.off > end {
+			if last < 0 {
+				first = i
+			}
 			break
 		}
 		if i < first {

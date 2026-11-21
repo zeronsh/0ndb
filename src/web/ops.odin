@@ -21,6 +21,8 @@ Op :: enum u8 {
 	Text        = 10,
 	Catalog_Get = 11,
 	Close       = 12,
+	Window      = 13,
+	Switch      = 14,
 }
 
 STATUS_UNSUPPORTED :: 254
@@ -76,11 +78,15 @@ _request_bind :: proc(s: ^Session, r: ^Request) -> u8 {
 			return STATUS_BAD_ARGS
 		}
 		r.object = s.objects[s.catalog_id]
-	case .Status, .Page, .Message, .Siblings:
+	case .Status, .Page, .Message, .Siblings, .Window, .Switch:
 		need := 16
 		#partial switch r.op {
 		case .Page:
-			need = 16 + 24 + 24 + 1 + 4
+			need = 16 + 24 + 24 + 1 + 4 + 1 + 24
+		case .Window:
+			need = 16 + 24 + 4 + 4 + 24
+		case .Switch:
+			need = 16 + 24 + 4 + 4
 		case .Message, .Siblings:
 			need = 16 + 24
 		}
@@ -318,8 +324,9 @@ _exec :: proc(s: ^Session, r: ^Request, out: ^Out) -> obj.Error {
 			seal_known = a[64] != 0,
 		}
 		limit := int(prim.get_u32le(a[65:69]))
+		dir := convo.Direction.Newer if a[69] != 0 else .Older
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
-		p := convo.page(&o.view, &t, from, max(limit, 1), context.temp_allocator) or_return
+		p := convo.page(&o.view, &t, from, max(limit, 1), context.temp_allocator, dir, _rid_arg(a[70:94])) or_return
 		emit_tail(out, &o.view, &t)
 		o_arr(out, "messages")
 		for &m in p.messages {
@@ -328,6 +335,20 @@ _exec :: proc(s: ^Session, r: ^Request, out: ^Out) -> obj.Error {
 		o_end(out)
 		emit_position(out, "next", p.next)
 		o_bool(out, "more", p.more)
+	case .Window:
+		before := int(prim.get_u32le(a[40:44]))
+		after := int(prim.get_u32le(a[44:48]))
+		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
+		w := convo.page_around(&o.view, &t, _rid_arg(a[16:40]), before, after, _rid_arg(a[48:72]), context.temp_allocator) or_return
+		emit_tail(out, &o.view, &t)
+		emit_window(out, &w, w.leaf)
+	case .Switch:
+		before := int(prim.get_u32le(a[40:44]))
+		after := int(prim.get_u32le(a[44:48]))
+		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
+		leaf, w := convo.switch_window(&o.view, &t, _rid_arg(a[16:40]), before, after, context.temp_allocator) or_return
+		emit_tail(out, &o.view, &t)
+		emit_window(out, &w, leaf)
 	case .Message:
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
 		m := convo.message(&o.view, &t, convo.Position{msg = _rid_arg(a[16:40])}, context.temp_allocator) or_return

@@ -1,4 +1,4 @@
-const OP = { catalog: 1, status: 2, page: 3, message: 4, siblings: 5, mapGet: 6, mapScan: 7, subscribe: 8, unsubscribe: 9, text: 10, catalogEntry: 11, close: 12 };
+const OP = { catalog: 1, status: 2, page: 3, message: 4, siblings: 5, mapGet: 6, mapScan: 7, subscribe: 8, unsubscribe: 9, text: 10, catalogEntry: 11, close: 12, window: 13, switch: 14 };
 const EV_RESULT = 1, EV_DELTAS = 2, EV_CONNECTED = 3, EV_CLOSED = 4, EV_INFO = 5;
 const STATUS = ['ok', 'missing', 'corrupt', 'invalid', 'not_found', 'exists', 'busy', 'limit', 'too_large', 'unsupported', 'not_assigned', 'unknown_segment', 'forged', 'permission', 'no_space', 'no_memory', 'io'];
 const SYNC_ERRORS = ['none', 'invalid', 'corrupt', 'auth', 'protocol', 'closed', 'would_block', 'not_found', 'exists', 'permission', 'no_space', 'no_memory', 'too_large', 'busy', 'quota', 'conflict', 'unsupported', 'timeout', 'resolve', 'refused', 'io'];
@@ -330,8 +330,8 @@ export class Space {
     return this._request(OP.status, a);
   }
 
-  page(object, { from = null, limit = 32 } = {}) {
-    const a = new Uint8Array(69);
+  page(object, { from = null, limit = 32, dir = 'older', leaf = null } = {}) {
+    const a = new Uint8Array(94);
     const dv = new DataView(a.buffer);
     hexToBytes(object, a, 0);
     if (from) {
@@ -340,7 +340,30 @@ export class Space {
       a[64] = from.seal_known ? 1 : 0;
     }
     dv.setUint32(65, limit, true);
+    a[69] = dir === 'newer' ? 1 : 0;
+    putRid(dv, a, 70, leaf);
     return this._request(OP.page, a);
+  }
+
+  window(object, anchor, { before = 16, after = 16, leaf = null } = {}) {
+    const a = new Uint8Array(72);
+    const dv = new DataView(a.buffer);
+    hexToBytes(object, a, 0);
+    putRid(dv, a, 16, anchor);
+    dv.setUint32(40, before, true);
+    dv.setUint32(44, after, true);
+    putRid(dv, a, 48, leaf);
+    return this._request(OP.window, a);
+  }
+
+  peekSwitch(object, sibling, { before = 16, after = 16 } = {}) {
+    const a = new Uint8Array(48);
+    const dv = new DataView(a.buffer);
+    hexToBytes(object, a, 0);
+    putRid(dv, a, 16, sibling);
+    dv.setUint32(40, before, true);
+    dv.setUint32(44, after, true);
+    return this._request(OP.switch, a);
   }
 
   message(object, rid) {
