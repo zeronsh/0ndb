@@ -869,6 +869,13 @@ batch_end :: proc(p: ^Pack) -> Error {
 	return _sync_all(p)
 }
 
+batch_end_async :: proc(p: ^Pack, done: Sync_Done, data: rawptr) -> Error {
+	if p.batch > 0 {
+		p.batch -= 1
+	}
+	return sync_async(p, done, data)
+}
+
 @(private)
 _flush :: proc(p: ^Pack) -> Error {
 	_flush_start(p) or_return
