@@ -75,6 +75,7 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.purge = eng.Purge_Hook{data = n, purge = _on_purge}
 	cfg.credentials = eng.Credentials_Source{data = n, produce = node_credentials}
 	cfg.write_observer = sim_observer(n)
+	cfg.watcher = sim_watcher(n)
 	cfg.durability = .Deferred
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms

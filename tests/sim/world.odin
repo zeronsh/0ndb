@@ -112,6 +112,7 @@ World_Stats :: struct {
 	tampered:     u64,
 	io_errors:    u64,
 	stalls:       u64,
+	conflict_pairs: u64,
 }
 
 Config :: struct {

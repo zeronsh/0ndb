@@ -1546,13 +1546,17 @@ disk_digest :: proc(d: ^Disk) -> u64 {
 }
 
 trace_path :: proc(path: string) -> string {
-	i := strings.index(path, "/.tmp_")
-	if i < 0 {
-		return path
+	out := path
+	for marker in ([]string{"/.tmp_", "/tmp_obj_"}) {
+		i := strings.index(out, marker)
+		if i < 0 {
+			continue
+		}
+		j := i + len(marker)
+		for j < len(out) && out[j] != '/' {
+			j += 1
+		}
+		out = strings.concatenate({out[:i], marker, "*", out[j:]}, context.temp_allocator)
 	}
-	j := i + 6
-	for j < len(path) && path[j] != '/' {
-		j += 1
-	}
-	return strings.concatenate({path[:i], "/.tmp_*", path[j:]}, context.temp_allocator)
+	return out
 }

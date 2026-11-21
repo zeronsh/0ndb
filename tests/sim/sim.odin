@@ -96,7 +96,7 @@ next_time :: proc(w: ^World) -> (t: i64, ok: bool) {
 }
 
 run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
-	for len(w.failures) < 20 {
+	for w.phase != .Workload || len(w.failures) < 20 {
 		free_all(w.ctx.temp_allocator)
 		drain_all(w)
 		t, ok := next_time(w)
@@ -116,7 +116,7 @@ run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
 			handle_event(w, &ev)
 			delete(ev.bytes, w.allocator)
 			drain_all(w)
-			if len(w.failures) >= 20 {
+			if w.phase == .Workload && len(w.failures) >= 20 {
 				return false
 			}
 		}
@@ -261,7 +261,7 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	cfg.verbose = verbose
 	cfg.disabled = env_disabled()
 	leak_sites = env_u64("SIM_LEAK_SITES", 0) != 0
-	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {.Read, .Write}
+	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {}
 	cfg.io_rate = env_u64("SIM_IO", cfg.io_rate)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
@@ -523,8 +523,20 @@ simulate :: proc(t: ^testing.T) {
 		if fd := env_u64("SIM_STATS_FD", 0); fd > 0 {
 			st := Wire_Stats{stats = a.stats, disk_ops = a.disk_ops, wall_ns = a.wall_ns, sim_ns = a.sim_ns, ops = a.op_events, faults = a.fault_events}
 			if len(a.failures) > 0 {
-				sg := failure_signature(a.failures[0])
-				st.sig_len = copy(st.sig[:], sg)
+				pick := a.failures[0]
+				if want, wok := os.lookup_env("SIM_MATCH", context.temp_allocator); wok && len(want) > 0 {
+					pick = ""
+					for f in a.failures {
+						if strings.contains(f, want) && !strings.has_prefix(strings.trim_space(f), "trace:") {
+							pick = f
+							break
+						}
+					}
+				}
+				if len(pick) > 0 {
+					sg := failure_signature(pick)
+					st.sig_len = copy(st.sig[:], sg)
+				}
 			}
 			b := transmute([size_of(Wire_Stats)]u8)st
 			posix.write(posix.FD(fd), raw_data(b[:]), len(b))
@@ -573,6 +585,7 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.detected += st.stats.detected
 		total.stats.io_errors += st.stats.io_errors
 		total.stats.stalls += st.stats.stalls
+		total.stats.conflict_pairs += st.stats.conflict_pairs
 		total.disk_ops += st.disk_ops
 		total.sim_ns += st.sim_ns
 	}
@@ -739,6 +752,9 @@ run_child :: proc(seed: u64, replay: bool, extra: []string = nil) -> (st: Wire_S
 	if sig != 0 {
 		return st, false, fmt.tprintf("killed by signal %d", sig)
 	}
+	if got != len(buf) {
+		return st, false, fmt.tprintf("CRASHED before reporting (exit status %d, signal caught by the test runner)", code)
+	}
 	if code != 0 {
 		return st, false, fmt.tprintf("exit status %d", code)
 	}
@@ -748,7 +764,7 @@ run_child :: proc(seed: u64, replay: bool, extra: []string = nil) -> (st: Wire_S
 print_stats :: proc(r: ^Run_Result) {
 	secs := f64(r.wall_ns) / 1e9
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
-	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
+	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d expected_conflicts=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, r.stats.conflict_pairs, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
 }
 
 @(private = "file")
@@ -789,6 +805,9 @@ _try :: proc(s: ^Shrinker, ops: []int, faults: []int) -> bool {
 	extra := []string{fmt.tprintf("SIM_KEEP_OPS=%s", _ranges(ops)), fmt.tprintf("SIM_KEEP_FAULTS=%s", _ranges(faults)), "SIM_QUIET=1"}
 	st, ok, why := run_child(s.seed, false, extra)
 	if ok {
+		return false
+	}
+	if st.sig_len == 0 && got_stats(st) {
 		return false
 	}
 	sig := string(st.sig[:st.sig_len]) if st.sig_len > 0 else why
@@ -838,6 +857,10 @@ shrink :: proc(seed: u64) -> bool {
 		return true
 	}
 	s := Shrinker{seed = seed, budget = int(env_u64("SIM_SHRINK_BUDGET", 300))}
+	if st.ops == 0 && st.faults == 0 {
+		st.ops = default_config(seed).ops
+		st.faults = 64
+	}
 	s.sig = strings.clone(string(st.sig[:st.sig_len]) if st.sig_len > 0 else why, context.temp_allocator)
 	fmt.eprintf("sim: shrinking seed %d (%d ops, %d faults) for failure: %s\n", seed, st.ops, st.faults, s.sig)
 	ops := make([dynamic]int, context.temp_allocator)
@@ -860,4 +883,8 @@ shrink :: proc(seed: u64) -> bool {
 	}
 	fmt.eprintf("sim: minimal reproduction after %d runs (%d of %d ops, %d of %d faults):\n  %sSIM_SEED=%d SIM_KEEP_OPS=%s SIM_KEEP_FAULTS=%s odin test tests/sim -o:speed\n", s.runs, len(ops), st.ops, len(faults), st.faults, strings.concatenate({strings.join(env[:], " ", context.temp_allocator), " " if len(env) > 0 else ""}, context.temp_allocator), seed, _ranges(ops[:]), _ranges(faults[:]))
 	return false
+}
+
+got_stats :: proc(st: Wire_Stats) -> bool {
+	return st.ops > 0 || st.faults > 0 || st.disk_ops > 0
 }

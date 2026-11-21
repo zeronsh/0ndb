@@ -59,6 +59,7 @@ Op_Kind :: enum u8 {
 	Mount_Tree,
 	Disk_Agent,
 	Disk_Person,
+	Git_Mount,
 }
 
 M_Space :: struct {
@@ -98,6 +99,7 @@ M_Op :: struct {
 	target:  int,
 	err:     eng.Error,
 	at:      i64,
+	overwrite: bool,
 }
 
 Model :: struct {

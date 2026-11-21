@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:slice"
 import "core:strings"
 import "../../src/convo"
+import "../../src/crdt"
 import "../../src/journal"
 import eng "../../src/engine"
 import omap "../../src/map"
@@ -238,7 +239,20 @@ known_tokens :: proc(m: ^Model) -> map[string]bool {
 }
 
 check_integrity :: proc(w: ^World, n: ^Node, oi: int, d: ^Digest, known: ^map[string]bool) {
-	for t in parse_tokens(transmute([]u8)d.text) {
+	merged := merged_files(w, oi) if w.model.objs[oi].kind == .Tree else nil
+	for line in strings.split_lines(d.text, context.temp_allocator) {
+		if merged != nil && strings.has_prefix(line, "file ") {
+			rest := line[5:]
+			if sp := strings.index_byte(rest, ' '); sp > 0 && file_base(rest[:sp]) in merged {
+				continue
+			}
+		}
+		check_integrity_line(w, n, oi, line, known)
+	}
+}
+
+check_integrity_line :: proc(w: ^World, n: ^Node, oi: int, line: string, known: ^map[string]bool) {
+	for t in parse_tokens(transmute([]u8)line) {
 		if !(t.text in known) {
 			world_fail(w, "integrity: %s presents content no participant wrote in %v %s: %q", n.name, w.model.objs[oi].kind, id_short(w.model.objs[oi].o.id), t.text)
 		}
@@ -294,6 +308,7 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 		if refn >= 0 {
 			if final && !w.cfg.byzantine {
 				check_object_model(w, oi, w.nodes[refn], ref.text)
+				check_conflicts(w, oi)
 			}
 			delete(ref.text, w.allocator)
 		}
@@ -485,11 +500,15 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			collect(&present, data, spans, nm)
 		}
 	}
+	merged := merged_files(w, oi, true) if ob.kind == .Tree else nil
 	for op in m.ops {
 		if op.obj != oi {
 			continue
 		}
-		if !(op.kind == .Text_Insert || op.kind == .Tree_Write || op.kind == .Create || op.kind == .Disk_Agent || op.kind == .Disk_Person) {
+		if merged != nil && op.path in merged {
+			continue
+		}
+		if !(op.kind == .Text_Insert || op.kind == .Tree_Write || op.kind == .Create || op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Git_Mount) {
 			continue
 		}
 		for tok in op.tokens {
@@ -564,6 +583,9 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 	}
 	slice.sort(keys[:])
 	for tok in keys {
+		if merged != nil && file_base(present[tok].file) in merged {
+			continue
+		}
 		if _token_op(m, oi, tok) == nil {
 			world_fail(w, "model: unknown token %s present in %s on %s", tok, id_short(ob.o.id), n.name)
 		}
@@ -592,7 +614,7 @@ check_redaction :: proc(w: ^World) {
 			for d in op.deletes {
 				append(&secrets, d)
 			}
-		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person:
+		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount:
 		}
 	}
 	for s in secrets {
@@ -607,7 +629,7 @@ check_redaction :: proc(w: ^World) {
 				res, err := eng.search_query(&n.e, s[1:len(s) - 1], req, context.temp_allocator)
 				if err == .None {
 					for h in res.hits {
-						if strings.contains(h.snippet, s[1:len(s) - 1]) {
+						if _snippet_leaks(h.snippet, s[1:len(s) - 1]) {
 							world_fail(w, "redaction: search on %s still returns %s in a snippet (object %s): %q", n.name, s, id_short(h.object), h.snippet)
 						}
 					}
@@ -618,6 +640,22 @@ check_redaction :: proc(w: ^World) {
 		if p, found := disk_contains(&w.relay.disk, needle); found {
 			world_fail(w, "redaction: %s still on relay disk in %s", s, p)
 		}
+	}
+}
+
+@(private = "file")
+_snippet_leaks :: proc(snippet: string, tok: string) -> bool {
+	rest := snippet
+	for {
+		i := strings.index(rest, tok)
+		if i < 0 {
+			return false
+		}
+		after := i + len(tok)
+		if after >= len(rest) || rest[after] < '0' || rest[after] > '9' {
+			return true
+		}
+		rest = rest[i + 1:]
 	}
 }
 
@@ -937,9 +975,157 @@ check_relay_redaction :: proc(w: ^World) {
 @(private = "file")
 _wrote_file :: proc(m: ^Model, oi: int, file: string, actor: prim.Id) -> bool {
 	for op in m.ops {
-		if op.obj == oi && op.actor == actor && (op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Tree_Write) {
+		if op.obj == oi && op.actor == actor && (op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Tree_Write || op.kind == .Git_Mount) {
 			return true
 		}
 	}
 	return false
+}
+
+token_in :: proc(text: string, tok: string) -> bool {
+	inner := tok[1:len(tok) - 1]
+	at := 0
+	for at < len(text) {
+		i := strings.index(text[at:], inner)
+		if i < 0 {
+			return false
+		}
+		start := at + i
+		end := start + len(inner)
+		before_ok := start == 0 || !_tok_char(text[start - 1]) || text[start - 1] == '<'
+		after_ok := end == len(text) || !_tok_char(text[end]) || text[end] == '>'
+		if before_ok && after_ok {
+			return true
+		}
+		at = start + 1
+	}
+	return false
+}
+
+@(private = "file")
+_tok_char :: proc(c: u8) -> bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '.'
+}
+
+@(private = "file")
+_rewrites :: proc(op: ^M_Op) -> bool {
+	return op.kind == .Tree_Write || ((op.kind == .Disk_Agent || op.kind == .Disk_Person) && op.overwrite)
+}
+
+@(private = "file")
+_has_any :: proc(set: []string, xs: []string) -> bool {
+	for a in set {
+		for b in xs {
+			if a == b {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+Pair :: struct {
+	a: ^M_Op,
+	b: ^M_Op,
+}
+
+concurrent_pairs :: proc(w: ^World, oi: int) -> []Pair {
+	m := &w.model
+	out := make([dynamic]Pair, context.temp_allocator)
+	ops := make([dynamic]^M_Op, context.temp_allocator)
+	for op in m.ops {
+		if op.obj == oi && _rewrites(op) && op_maybe(op) {
+			append(&ops, op)
+		}
+	}
+	for a in ops {
+		for b in ops {
+			if a.node == b.node || a.path != b.path || a.at > b.at || (a.at == b.at && a.idx >= b.idx) {
+				continue
+			}
+			live := true
+			for d in m.ops {
+				if d.obj == oi && d.at < b.at && d.idx != a.idx && op_maybe(d) && _has_any(d.deletes[:], a.tokens[:]) {
+					live = false
+					break
+				}
+			}
+			if live && !_has_any(b.deletes[:], a.tokens[:]) {
+				append(&out, Pair{a, b})
+			}
+		}
+	}
+	return out[:]
+}
+
+merged_files :: proc(w: ^World, oi: int, count := false) -> map[string]bool {
+	m := &w.model
+	out := make(map[string]bool, context.temp_allocator)
+	for p in concurrent_pairs(w, oi) {
+		if count {
+			w.stats.conflict_pairs += 1
+			world_note(w, "live merge: %s and %s rewrote %s/%s concurrently (ops %d, %d)", w.nodes[p.a.node].name, w.nodes[p.b.node].name, id_short(m.objs[oi].o.id), p.a.path, p.a.idx, p.b.idx)
+		}
+		out[p.a.path] = true
+	}
+	return out
+}
+
+@(private = "file")
+_side_has :: proc(spans: []crdt.Op_Span, actor: prim.Id) -> bool {
+	for s in spans {
+		if s.id.actor == actor {
+			return true
+		}
+	}
+	return false
+}
+
+check_conflicts :: proc(w: ^World, oi: int) {
+	m := &w.model
+	ob := &m.objs[oi]
+	if ob.kind != .Tree {
+		return
+	}
+	pairs := concurrent_pairs(w, oi)
+	for idx in readers_of(w, oi) {
+		n := w.nodes[idx]
+		if !n.alive || !n.e_open {
+			continue
+		}
+		context = instance_context(&n.inst)
+		list, err := eng.tree_conflicts(&n.e, ob.o, context.temp_allocator)
+		node_after(n)
+		if err != .None {
+			if len(pairs) > 0 {
+				world_fail(w, "conflict: %s cannot list conflicts of %s: %v", n.name, id_short(ob.o.id), err)
+			}
+			continue
+		}
+		for p in pairs {
+			if !_has_any(p.a.deletes[:], p.b.deletes[:]) {
+				continue
+			}
+			found := false
+			for c in list {
+				if file_base(c.path) != p.a.path {
+					continue
+				}
+				if (_side_has(c.ours, p.a.actor) && _side_has(c.theirs, p.b.actor)) || (_side_has(c.ours, p.b.actor) && _side_has(c.theirs, p.a.actor)) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				world_fail(w, "conflict: concurrent rewrites of %s/%s by %s (op %d) and %s (op %d) are not reported as a conflict region on %s (%d regions listed)", id_short(ob.o.id), p.a.path, id_short(p.a.actor), p.a.idx, id_short(p.b.actor), p.b.idx, n.name, len(list))
+			}
+		}
+	}
+}
+
+file_base :: proc(name: string) -> string {
+	if i := strings.index_byte(name, '~'); i >= 0 {
+		return name[:i]
+	}
+	return name
 }

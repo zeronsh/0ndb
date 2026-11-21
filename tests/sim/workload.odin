@@ -240,6 +240,7 @@ workload_step :: proc(w: ^World) {
 		2,
 		6,
 		6,
+		2,
 	}
 	#assert(len(weights) == len(Op_Kind))
 	for k in w.cfg.disabled {
@@ -265,6 +266,8 @@ workload_step :: proc(w: ^World) {
 		op_mount(w, n)
 	case .Disk_Agent, .Disk_Person:
 		op_disk_edit(w, n, k == .Disk_Agent)
+	case .Git_Mount:
+		op_git_mount(w, n)
 	}
 	node_after(n)
 }
@@ -448,7 +451,7 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
 		world_note(w, "%s redact message %s -> %v", n.name, t.token, err)
 		op_result(op, n, err)
-	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person:
+	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount:
 	}
 }
 
@@ -526,7 +529,7 @@ _op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.map_redact(&n.e, o, transmute([]u8)t.key)
 		world_note(w, "%s redact map key %s -> %v", n.name, t.key, err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount:
 	}
 }
 
@@ -581,7 +584,7 @@ _op_text :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.text_edit(&n.e, o, t.pos, len(t.text), "", op_done_handle(op))
 		world_note(w, "%s text %s delete %s at %d of %q -> %v", n.name, id_short(o.id), t.text, t.pos, string(data), err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount:
 	}
 }
 
@@ -648,7 +651,7 @@ _op_tree :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.tree_remove(&n.e, o, path)
 		world_note(w, "%s tree_remove %s/%s saw %v -> %v", n.name, id_short(o.id), path, op.deletes[:], err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount:
 	}
 }
 
@@ -707,13 +710,17 @@ _op_share :: proc(w: ^World, n: ^Node) {
 	}
 	to := cands[rng_int(&w.rng, len(cands))]
 	context = instance_context(&n.inst)
-	share, err := eng.share_object(&n.e, ob.o, w.nodes[to].identity)
+	access := w.cfg.share_access
+	if access == {} {
+		access = {.Read} if rng_chance(&w.rng, 1, 3) else {.Read, .Write}
+	}
+	share, err := eng.share_object(&n.e, ob.o, w.nodes[to].identity, access)
 	world_note(w, "%s share %s with %s -> %v", n.name, id_short(ob.o.id), w.nodes[to].name, err)
 	if err != .None {
 		return
 	}
 	kinds := [M_Kind]eng.Kind{.Convo = .Conversation, .Map = .Map, .Text = .Text, .Tree = .File_Tree}
-	tok, terr := eng.capability_issue(&n.e, eng.Capability{space = ob.o.space, grantee = w.nodes[to].identity.id, object = ob.o.id, kind = kinds[ob.kind], access = w.cfg.share_access}, context.temp_allocator)
+	tok, terr := eng.capability_issue(&n.e, eng.Capability{space = ob.o.space, grantee = w.nodes[to].identity.id, object = ob.o.id, kind = kinds[ob.kind], access = access}, context.temp_allocator)
 	if terr != .None {
 		world_fail(w, "%s capability_issue failed: %v", n.name, terr)
 		return

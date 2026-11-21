@@ -117,7 +117,6 @@ node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string) -> eng.Error {
 		if rerr != .None {
 			return rerr
 		}
-		fs.registry_set_watcher(reg, sim_watcher(n))
 		n.reg = reg
 	}
 	if err := prim.mkdir_all(disk_vfs(&n.disk), root, 0o755); err != .None {
@@ -259,6 +258,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	op := new_op(m, .Disk_Agent if agent else .Disk_Person, n, sm.oi)
 	op.path = strings.clone(name, w.allocator)
 	overwrite := len(old) == 0 || rng_chance(&w.rng, 1, 3)
+	op.overwrite = overwrite && len(old) > 0
 	b := strings.builder_make(context.temp_allocator)
 	if overwrite {
 		for t in parse_tokens(old) {
@@ -403,4 +403,89 @@ _writer_set :: proc(w: ^World, n: ^Node, path: string, info: Writer_Info) {
 		return
 	}
 	n.writers[strings.clone(path, w.allocator)] = info
+}
+
+op_git_mount :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	cands := make([dynamic]int, context.temp_allocator)
+	for &sp, i in m.spaces {
+		if space_member(&sp, n.idx) {
+			append(&cands, i)
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	space := m.spaces[cands[rng_int(&w.rng, len(cands))]].id
+	cop := new_op(m, .Create, n, len(m.objs))
+	cop.token = new_token(m, n, "t")
+	ob := M_Obj{kind = .Tree, creator = n.idx, op = cop.idx}
+	ob.removed = make(map[string]bool, w.allocator)
+	ob.shared = make([dynamic]int, w.allocator)
+	o: eng.Object
+	err: eng.Error
+	{
+		context = instance_context(&n.inst)
+		o, err = eng.tree_create(&n.e, space, cop.token)
+		op_result(cop, n, err)
+		node_after(n)
+	}
+	ob.o = o
+	append(&m.objs, ob)
+	oi := len(m.objs) - 1
+	if err != .None || !n.alive {
+		return
+	}
+	paths := TREE_PATHS
+	files := make([dynamic]Git_File, context.temp_allocator)
+	for p in paths {
+		if len(files) > 0 && rng_chance(&w.rng, 1, 2) {
+			continue
+		}
+		op := new_op(m, .Git_Mount, n, oi)
+		op.path = strings.clone(p, w.allocator)
+		b := strings.builder_make(context.temp_allocator)
+		for _ in 0 ..< 1 + rng_int(&w.rng, 2) {
+			tok := new_token(m, n, "g")
+			append(&op.tokens, tok)
+			strings.write_string(&b, tok)
+			strings.write_byte(&b, '\n')
+		}
+		append(&files, Git_File{name = p, data = transmute([]u8)strings.to_string(b)})
+	}
+	root := fmt.aprintf("%s%s-%s-git", WORK_PREFIX, id_short(o.id), n.name, allocator = w.allocator)
+	vfs := disk_vfs(&n.disk)
+	gerr := git_checkout_create(vfs, root, files[:], clock_wall(&n.clock) / 1_000_000_000, rng_u64(&w.rng), &n.clock)
+	if n.disk.dead {
+		context = instance_context(&n.inst)
+		node_after(n)
+		return
+	}
+	if gerr != .None {
+		if w.cfg.io_rate > 0 {
+			n.restart_pending = true
+			context = instance_context(&n.inst)
+			node_after(n)
+			return
+		}
+		world_fail(w, "%s could not build git checkout %s: %v", n.name, root, gerr)
+		return
+	}
+	merr := node_mount(w, n, oi, root)
+	world_note(w, "%s git checkout %s mounted at %s -> %v", n.name, id_short(o.id), root, merr)
+	for op in m.ops[cop.idx + 1:] {
+		if op.kind == .Git_Mount && op.obj == oi {
+			if merr == .None {
+				op_done(op, 0, .None)
+				op.status = .Acked
+			} else {
+				op.status = .Failed
+			}
+		}
+	}
+	if merr == .None {
+		append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = root})
+	} else if n.alive && !(w.cfg.io_rate > 0 && (merr == .Io || merr == .No_Space)) {
+		world_fail(w, "%s mounting git checkout failed: %v", n.name, merr)
+	}
 }
