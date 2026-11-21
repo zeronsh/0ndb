@@ -68,9 +68,9 @@ tool_call_init :: proc(c: ^Tool_Call, id: string, input: []u8, cwd: string, cano
 	if err == .None {
 		if obj, ok := v.(json.Object); ok {
 			if s, sok := obj["cwd"].(json.String); sok && len(s) > 0 {
-				base = s if s[0] == '/' else _join(cwd, s, context.temp_allocator)
+				base = _path_native(s) if path_is_abs(s) else _join(cwd, _path_native(s), context.temp_allocator)
 			} else if s2, sok2 := obj["workdir"].(json.String); sok2 && len(s2) > 0 {
-				base = s2 if s2[0] == '/' else _join(cwd, s2, context.temp_allocator)
+				base = _path_native(s2) if path_is_abs(s2) else _join(cwd, _path_native(s2), context.temp_allocator)
 			}
 		}
 	}
@@ -171,7 +171,7 @@ _collect_text :: proc(c: ^Tool_Call, s: string) {
 		_collect_patch(c, s)
 		return
 	}
-	if len(s) > 1 && len(s) < prim.PATH_MAX && (s[0] == '/' || strings.has_prefix(s, "file://")) && strings.index_any(s, "\n\r\t") < 0 {
+	if len(s) > 1 && len(s) < prim.PATH_MAX && (path_is_abs(s) || strings.has_prefix(s, "file://")) && strings.index_any(s, "\n\r\t") < 0 {
 		_add_path(c, s)
 	}
 }
@@ -220,16 +220,20 @@ _add_path :: proc(c: ^Tool_Call, raw: string) {
 	s := raw
 	if strings.has_prefix(s, "file://") {
 		s = s[7:]
+		if len(s) > 3 && s[0] == '/' && path_is_abs(s[1:]) {
+			s = s[1:]
+		}
 	}
+	s = _path_native(s)
 	if len(s) == 0 || len(s) >= prim.PATH_MAX || strings.index_any(s, "\n\r\x00") >= 0 {
 		return
 	}
 	if strings.has_prefix(s, "~/") {
 		if home, ok := prim.getenv("HOME"); ok {
-			s = _join(home, s[2:], context.temp_allocator)
+			s = _join(_path_native(home), s[2:], context.temp_allocator)
 		}
 	}
-	abs := s if s[0] == '/' else _join(c.cwd, s, context.temp_allocator)
+	abs := s if path_is_abs(s) else _join(c.cwd, s, context.temp_allocator)
 	clean := clean_abs(abs, context.temp_allocator)
 	if len(clean) == 0 {
 		return
@@ -254,11 +258,12 @@ _join :: proc(a: string, b: string, allocator: runtime.Allocator) -> string {
 }
 
 clean_abs :: proc(p: string, allocator := context.allocator) -> string {
-	if len(p) == 0 || p[0] != '/' {
+	root := _abs_root_len(p)
+	if root < 0 {
 		return ""
 	}
 	parts := make([dynamic]string, context.temp_allocator)
-	rest := p
+	rest := p[root:]
 	for comp in strings.split_iterator(&rest, "/") {
 		switch comp {
 		case "", ".":
@@ -270,10 +275,11 @@ clean_abs :: proc(p: string, allocator := context.allocator) -> string {
 			append(&parts, comp)
 		}
 	}
-	if len(parts) == 0 {
-		return strings.clone("/", allocator)
-	}
 	b := strings.builder_make(allocator)
+	strings.write_string(&b, p[:root])
+	if len(parts) == 0 {
+		strings.write_byte(&b, '/')
+	}
 	for x in parts {
 		strings.write_byte(&b, '/')
 		strings.write_string(&b, x)
@@ -287,16 +293,17 @@ _canonical :: proc(p: string, allocator: runtime.Allocator) -> (string, bool) {
 		return real, true
 	}
 	dir := p
+	root := _abs_root_len(p)
 	for {
 		i := strings.last_index_byte(dir, '/')
-		if i <= 0 {
+		if i <= root {
 			return "", false
 		}
 		tail := p[i:]
 		dir = dir[:i]
 		if real, _, _, ok := real_path(dir, context.temp_allocator); ok {
-			if real == "/" {
-				return strings.clone(tail, allocator), true
+			if strings.has_suffix(real, "/") {
+				return strings.concatenate({real, tail[1:]}, allocator), true
 			}
 			return strings.concatenate({real, tail}, allocator), true
 		}

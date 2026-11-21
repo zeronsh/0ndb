@@ -3,6 +3,7 @@ package rt
 import "base:runtime"
 import "core:crypto/blake2b"
 import "core:mem/virtual"
+import "core:strings"
 import "../agent"
 import "../convo"
 import eng "../engine"
@@ -266,6 +267,8 @@ Runtime :: struct {
 	revives:     [dynamic]Revive_Wait,
 	lease_timer: prim.Timer,
 	lease_at:    i64,
+	prev_events: eng.Event_Hook,
+	hooked:      bool,
 	stats:       Stats,
 }
 
@@ -299,7 +302,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	r.cfg.work_root = clone(cfg.work_root, allocator)
 	r.cfg.default_provider = clone(cfg.default_provider, allocator)
 	r.cfg.default_model = clone(cfg.default_model, allocator)
-	r.cfg.home_dir = clone(cfg.home_dir, allocator)
+	r.cfg.home_dir = clone(cfg.home_dir if len(cfg.home_dir) > 0 else _home_default(cfg.env), allocator)
 	if len(cfg.env) > 0 {
 		env := make([]string, len(cfg.env), allocator)
 		for s, i in cfg.env {
@@ -335,8 +338,57 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	r.follows = make([dynamic]Follow, allocator)
 	r.revives = make([dynamic]Revive_Wait, allocator)
 	agent.registry_init(&r.registry, allocator)
+	r.prev_events = e.cfg.events
+	e.cfg.events = eng.Event_Hook{data = r, event = _on_engine_event}
+	r.hooked = true
 	r.opened = true
 	return .None
+}
+
+@(private)
+_home_default :: proc(env: []string) -> string {
+	for kv in env {
+		if strings.has_prefix(kv, "HOME=") {
+			return kv[5:]
+		}
+	}
+	h, _ := prim.getenv("HOME")
+	return h
+}
+
+@(private)
+_on_engine_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
+	r := (^Runtime)(data)
+	if !r.closing {
+		#partial switch ev.kind {
+		case .Presence:
+			_presence_changed(r, ev.space, ev.device, ev.tick != 0)
+		case .Connected:
+			_pending_scan(r, ev.space)
+		}
+	}
+	if r.prev_events.event != nil {
+		r.prev_events.event(r.prev_events.data, e, ev)
+	}
+}
+
+@(private)
+_presence_changed :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, up: bool) {
+	attached := false
+	for sw in r.spaces {
+		attached ||= sw.space == space
+	}
+	if !attached {
+		return
+	}
+	if !up {
+		for w in r.leases {
+			if w.object.space == space {
+				_queue_eval(r, w.object)
+			}
+		}
+	}
+	_pending_scan(r, space)
 }
 
 close :: proc(r: ^Runtime) {
@@ -345,6 +397,10 @@ close :: proc(r: ^Runtime) {
 	}
 	r.closing = true
 	l := eng.loop(r.e)
+	if r.hooked && r.e.cfg.events.data == r {
+		r.e.cfg.events = r.prev_events
+		r.hooked = false
+	}
 	for len(r.runs) > 0 {
 		run := r.runs[len(r.runs) - 1]
 		_run_abandon(run)

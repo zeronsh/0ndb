@@ -131,7 +131,8 @@ commit_on_ref :: proc(db: ^odb.Odb, ref: string, tree: odb.Oid, info: Commit_Inf
 	} else {
 		expected = odb.ZERO_OID
 	}
-	return from_odb(odb.update_ref(db, ref, oid, expected))
+	from_odb(odb.update_ref(db, ref, oid, expected)) or_return
+	return from_odb(odb.barrier(db))
 }
 
 mount_commit :: proc(m: ^Mount, info: Commit_Info) -> (commit: odb.Oid, err: Error) {

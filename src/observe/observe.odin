@@ -183,7 +183,7 @@ under :: proc "contextless" (path: string, root: string) -> (rel: string, ok: bo
 }
 
 router_locate :: proc(r: ^Router, path: string) -> (m: ^fs.Mount, rel: string, ok: bool) {
-	if r.reg == nil || len(path) == 0 || path[0] != '/' {
+	if r.reg == nil || !path_is_abs(path) {
 		return
 	}
 	router_refresh(r)

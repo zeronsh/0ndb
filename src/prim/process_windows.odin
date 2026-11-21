@@ -461,6 +461,10 @@ _resolve_exec_windows :: proc(name: string, env: []string, allocator: runtime.Al
 	return "", false, .Not_Found
 }
 
+resolve_executable :: proc(name: string, env: []string = nil, allocator := context.allocator) -> (path: string, batch: bool, err: Error) {
+	return _resolve_exec_windows(name, env, allocator)
+}
+
 @(private)
 _concat :: proc(allocator: runtime.Allocator, a, b: string) -> (string, Error) {
 	out, err := make([]u8, len(a) + len(b), allocator)

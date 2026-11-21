@@ -178,6 +178,9 @@ _lease_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, m: ^convo.Message) -> 
 	if m.runner == r.self {
 		return 0, true
 	}
+	if !runner_present(r, o.space, m.runner) {
+		return 0, false
+	}
 	lease, stamp, ok := _claim_lease(v, m.claim)
 	if !ok || lease <= 0 {
 		return 0, true

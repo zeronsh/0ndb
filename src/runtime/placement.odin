@@ -118,8 +118,11 @@ placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: 
 		return info, .Pending if terr == .Missing else .Engine
 	}
 	if t.running {
-		info.state = .Running
-		return info, .None
+		if runner, live := _open_live(r, o, v, &t); live {
+			info.state = .Running
+			info.runner = runner
+			return info, .None
+		}
 	}
 	if task_cancelled(r, o) {
 		return info, .None
@@ -191,4 +194,32 @@ placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: 
 	}
 	info.state = .Assigned
 	return info, .None
+}
+
+@(private)
+_open_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> (runner: prim.Id, live: bool) {
+	list, err := convo.unsealed(v, context.temp_allocator)
+	if err != .None {
+		return {}, true
+	}
+	for u in list {
+		if u.state != .Running {
+			continue
+		}
+		m, merr := convo.message(v, t, convo.Position{msg = u.msg}, context.temp_allocator)
+		if merr != .None {
+			return u.msg.seg, true
+		}
+		if as, aerr := convo.assignee(v, t, m.parent); aerr == .None && !prim.id_is_zero(as) && as != m.runner {
+			continue
+		}
+		if m.runner != r.self && !runner_present(r, o.space, m.runner) {
+			continue
+		}
+		if m.runner == r.self && run_find(r, o) == nil {
+			continue
+		}
+		return m.runner, true
+	}
+	return {}, false
 }

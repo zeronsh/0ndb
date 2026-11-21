@@ -339,12 +339,23 @@ runner_live :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, provider: stri
 	if device == r.self {
 		return r.cfg.runner && !r.closing && (len(provider) == 0 || _list_has(_providers_local(r), provider))
 	}
+	if !runner_present(r, space, device) {
+		return false
+	}
 	d := device
 	en, ok := map_read(r, runners_object(space), d[:])
 	if !ok {
 		return false
 	}
 	return _advert_ok(&en, provider)
+}
+
+runner_present :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
+	if device == r.self {
+		return true
+	}
+	up, _, known := eng.presence(r.e, space, device)
+	return up || !known
 }
 
 runners_live :: proc(r: ^Runtime, space: prim.Id, provider: string) -> []prim.Id {
@@ -361,7 +372,7 @@ runners_live :: proc(r: ^Runtime, space: prim.Id, provider: string) -> []prim.Id
 			}
 			continue
 		}
-		if _advert_ok(&row.entry, provider) {
+		if _advert_ok(&row.entry, provider) && runner_present(r, space, id) {
 			append(&out, id)
 		}
 	}

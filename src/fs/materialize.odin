@@ -191,6 +191,11 @@ mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 		return .None
 	}
 	os := m.vfs.procs == prim.os_vfs().procs
+	when ODIN_OS == .Windows {
+		if os && len(ms.files) + len(ms.dirs) > 1 && mat_writeout(m, ms) == .None {
+			return .None
+		}
+	}
 	if HAS_SYNCFS && os && len(ms.files) + len(ms.dirs) > MAT_SYNCFS_THRESHOLD {
 		if fd, e := prim.open_file(m.vfs, m.root, {.Directory}); e == .None {
 			ok := os_syncfs(fd)
@@ -242,6 +247,44 @@ mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 		from_prim(prim.datasync(m.vfs, last)) or_return
 	}
 	return .None
+}
+
+@(private)
+mat_writeout :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
+	for f in ms.files {
+		fd, e := prim.open_file(m.vfs, f)
+		if e == .Not_Found {
+			continue
+		}
+		from_prim(e) or_return
+		we := prim.writeout(m.vfs, fd)
+		prim.close_file(m.vfs, fd)
+		from_prim(we) or_return
+	}
+	for d in sorted_strings(ms.dirs) {
+		fd, e := prim.open_file(m.vfs, d, {.Directory})
+		if e == .Not_Found {
+			continue
+		}
+		from_prim(e) or_return
+		we := prim.writeout(m.vfs, fd)
+		prim.close_file(m.vfs, fd)
+		if we != .None && we != .Invalid && we != .Unsupported {
+			return from_prim(we)
+		}
+	}
+	probe_path, _ := path_join(m.root, "x", context.temp_allocator)
+	tmp := temp_name(m, probe_path, context.temp_allocator)
+	fd := from_prim_fd(prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, 0o600)) or_return
+	err := from_prim(prim.fullsync(m.vfs, fd))
+	prim.close_file(m.vfs, fd)
+	prim.remove(m.vfs, tmp)
+	return err
+}
+
+@(private)
+from_prim_fd :: proc "contextless" (fd: prim.Fd, e: prim.Error) -> (prim.Fd, Error) {
+	return fd, from_prim(e)
 }
 
 @(private)

@@ -217,6 +217,7 @@ port_import :: proc(r: ^Runtime, o: Object, desc: agent.Provider_Descriptor, ni:
 	for f in plan.files {
 		prefix := key_of(KEY_FILE, transmute([]u8)f.key)
 		rows := map_rows(r, meta, prefix, 4096)
+		wrote := false
 		for &row in rows {
 			rest := string(row.key[len(prefix):])
 			dst := f.path
@@ -240,6 +241,10 @@ port_import :: proc(r: ^Runtime, o: Object, desc: agent.Provider_Descriptor, ni:
 			if prim.replace_atomic(r.e.base, dst, data) != .None {
 				return "", false
 			}
+			wrote = true
+		}
+		if !wrote && !f.optional {
+			return "", false
 		}
 	}
 	outputs := make([dynamic]string, context.temp_allocator)
