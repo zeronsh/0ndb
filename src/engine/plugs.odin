@@ -110,7 +110,7 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 	context = context_for(e)
 	if !e.plug.reg_on {
 		run := _join(context.temp_allocator, e.dir, "run") or_return
-		_ferr(fs.registry_init(&e.plug.reg, e.base, run, e.allocator)) or_return
+		_ferr(fs.registry_init(&e.plug.reg, e.base, run, e.allocator, e.cfg.random)) or_return
 		e.plug.reg_on = true
 		fs.registry_set_boot(&e.plug.reg, boot_id(e))
 		if e.cfg.watcher.start != nil {

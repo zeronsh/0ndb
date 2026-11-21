@@ -39,6 +39,13 @@ Git_Settings :: struct {
 	system_attrs: []u8,
 	roundtrip:    string,
 	has_roundtrip: bool,
+	safecrlf:     Safe_Crlf,
+}
+
+Safe_Crlf :: enum u8 {
+	Warn,
+	Off,
+	Die,
 }
 
 Crlf_Action :: enum u8 {

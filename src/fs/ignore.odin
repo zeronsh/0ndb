@@ -1176,6 +1176,7 @@ ignore_load :: proc(ig: ^Ignore, git_dir, common_dir: string, plain: bool) -> Er
 	ig.git.filters = c.filters
 	ig.git.roundtrip = c.roundtrip
 	ig.git.has_roundtrip = c.has_roundtrip
+	ig.git.safecrlf = c.safecrlf
 	excludes_file := ""
 	if c.has_excludes {
 		excludes_file = string(c.excludes[:c.excludes_len])
@@ -1276,6 +1277,7 @@ Git_Config :: struct {
 	filters:         [dynamic]Filter_Driver,
 	roundtrip:       string,
 	has_roundtrip:   bool,
+	safecrlf:        Safe_Crlf,
 }
 
 @(private = "file")
@@ -1579,6 +1581,12 @@ config_entry :: proc(c: ^Git_Config, key, val: string, has_value: bool, from: st
 			if p, ok := config_path(c.attributes[:], val, ""); ok {
 				c.attributes_len = len(p)
 			}
+		}
+	case "core.safecrlf":
+		if has_value && ignore_equal(val, "warn", true) {
+			c.safecrlf = .Warn
+		} else if b, ok := config_bool(val, has_value); ok {
+			c.safecrlf = .Die if b else .Off
 		}
 	case "core.checkroundtripencoding":
 		if has_value {

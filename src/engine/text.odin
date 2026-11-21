@@ -223,13 +223,24 @@ _hist_open :: proc(h: ^Handle) -> Error {
 	}
 	e := h.e
 	for mt in e.plug.mounts {
-		if mt.object.id == h.id && mt.mount.history != nil {
-			fs.history_retain(mt.mount.history)
-			fs.history_set_streams(mt.mount.history, fs.Stream_Source{data = h, read = _hist_read})
-			h.hist = mt.mount.history
-			h.hist_chain = h.own_tree != nil
-			return .None
+		if mt.object.id != h.id || mt.mount.history == nil {
+			continue
 		}
+		hist := mt.mount.history
+		if h.own_tree == nil {
+			if t, terr := _own_tree_get(e, h.sp, h.id, h.kind, &h.scope, false); terr == .None {
+				h.own_tree = t
+			}
+		}
+		fs.history_retain(hist)
+		h.hist = hist
+		h.hist_chain = h.own_tree != nil
+		for x in e.plug.mounts {
+			if x.object.id == h.id {
+				h.pins += 1
+			}
+		}
+		return _ferr(fs.history_rebind(hist, fs.Stream_Source{data = h, read = _hist_read}, _hist_options(h)))
 	}
 	if _ckpt_waiting(h) || _ckpt_fetch_start(e, h) {
 		return .Missing
@@ -265,8 +276,18 @@ _hist_options :: proc(h: ^Handle) -> fs.History_Options {
 			keys   = osync.keytree_provider(&h.own_tree.tree),
 			signer = osync.keyring_signer(&e.keyring),
 		}
+		h.own_tree.refs += 1
+		o.hold = fs.Hold{data = h.own_tree, drop = _own_tree_drop}
 	}
 	return o
+}
+
+@(private)
+_own_tree_drop :: proc(data: rawptr) {
+	t := (^Own_Tree)(data)
+	if t.refs > 0 {
+		t.refs -= 1
+	}
 }
 
 @(private)

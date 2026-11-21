@@ -169,14 +169,16 @@ builder_commit :: proc(m: ^Mount, b: ^Builder) -> Error {
 		parents = m.synced[:],
 		ops     = b.ops[:],
 	}
-	append(&m.intents, Intent{b.actor, b.seq0, u64(b.n)})
-	save_mount_state(m) or_return
-	history_commit_local(h, &batch) or_return
+	builder_opaque(b, commit_mark(m))
+	batch.ops = b.ops[:]
+	line: Maybe(string)
+	if !m.hold_line {
+		line = m.line
+	}
+	history_commit_local(h, &batch, line) or_return
+	m.jpend = mount_jlen(m)
 	clear(&m.synced)
 	append(&m.synced, crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1})
-	if !m.hold_line {
-		set_line(m) or_return
-	}
 	builder_reset(b)
 	return .None
 }

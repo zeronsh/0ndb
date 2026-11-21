@@ -676,7 +676,7 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 	return .None
 }
 
-history_commit_local :: proc(h: ^History, b: ^crdt.Batch) -> (off: i64, err: Error) {
+history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, b, &parents)
 	if gerr != .None || skip != 0 {
@@ -695,14 +695,107 @@ history_commit_local :: proc(h: ^History, b: ^crdt.Batch) -> (off: i64, err: Err
 	if valid != n {
 		return 0, .Invalid
 	}
-	o := journal_batch(h, b) or_return
+	lkey, lver: []u8
+	lname, has_line := line.?
+	if has_line {
+		lkey, lver = line_after(h, lname, parents[:], crdt.Op_Id{b.actor, b.seq + u64(n) - 1}) or_return
+	}
+	o := journal_batch(h, b, REC_BATCH, lver == nil) or_return
+	if lver != nil {
+		clear(&h.io)
+		w := prim.writer(&h.io)
+		prim.write_u8(&w, REC_LINE)
+		prim.write_str(&w, lname)
+		prim.write_bytes(&w, lver)
+		if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
+			journal.journal_abort(&h.journal)
+			return 0, .Io
+		}
+		journal_seal(h) or_return
+	}
 	apply_batch(h, b, 0, u64(o)) or_return
 	h.applied[0] = journal.journal_durable_len(&h.journal)
+	if lver != nil {
+		kv_put(&h.kv, lkey, lver) or_return
+	}
 	return o, history_persist(h)
 }
 
+history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent) -> Error {
+	end := journal.journal_durable_len(&h.journal)
+	if from >= end {
+		return .None
+	}
+	r: journal.Reader
+	journal.journal_reader(&h.journal, &r, context.temp_allocator)
+	defer journal.reader_close(&r)
+	off := from
+	for off < end {
+		body, next, jerr := journal.record_at(&r, off)
+		if jerr == .Redacted && next > off {
+			off = next
+			continue
+		}
+		if jerr != .None {
+			return from_journal(jerr)
+		}
+		off = next
+		if len(body) == 0 || body[0] != REC_BATCH {
+			continue
+		}
+		b, derr := crdt.batch_decode(body[1:], context.temp_allocator, &h.dict)
+		if derr != .None {
+			return .Corrupt
+		}
+		for op in b.ops {
+			if op.kind == .Opaque && string(op.content) == string(mark) {
+				append(out, Intent{b.actor, b.seq, u64(crdt.batch_len(&b))})
+				break
+			}
+		}
+	}
+	return .None
+}
+
 @(private)
-journal_batch :: proc(h: ^History, b: ^crdt.Batch, kind := REC_BATCH) -> (off: i64, err: Error) {
+line_after :: proc(h: ^History, name: string, parents: []crdt.Lv, last: crdt.Op_Id) -> (key: []u8, version: []u8, err: Error) {
+	key = line_key(name, context.temp_allocator)
+	out := make([dynamic]crdt.Op_Id, context.temp_allocator)
+	if cur, found := history_line(h, name, context.temp_allocator) or_return; found {
+		for id in cur {
+			if lv, known := crdt.graph_lv(&h.g, id); known && crdt.graph_contains(&h.g, parents, lv) {
+				continue
+			}
+			append(&out, id)
+		}
+	}
+	append(&out, last)
+	slice.sort_by(out[:], crdt.op_id_less)
+	buf := make([dynamic]u8, context.temp_allocator)
+	encode_version(&buf, out[:])
+	return key, buf[:], .None
+}
+
+@(private)
+journal_seal :: proc(h: ^History) -> Error {
+	if h.db != nil {
+		if e := odb.barrier(h.db); e != .None {
+			journal.journal_abort(&h.journal)
+			return from_odb(e)
+		}
+	}
+	if journal.journal_commit(&h.journal) != .None {
+		return .Io
+	}
+	if len(h.applied) == 0 {
+		append(&h.applied, 0)
+		append(&h.stream_ids, h.self)
+	}
+	return .None
+}
+
+@(private)
+journal_batch :: proc(h: ^History, b: ^crdt.Batch, kind := REC_BATCH, commit := true) -> (off: i64, err: Error) {
 	fresh := make([dynamic]prim.Id, context.temp_allocator)
 	note_actor :: proc(h: ^History, fresh: ^[dynamic]prim.Id, id: prim.Id) {
 		if _, ok := crdt.dict_find(&h.dict, id); ok {
@@ -749,17 +842,8 @@ journal_batch :: proc(h: ^History, b: ^crdt.Batch, kind := REC_BATCH) -> (off: i
 	if jerr != .None {
 		return 0, .Io
 	}
-	if h.db != nil {
-		if e := odb.barrier(h.db); e != .None {
-			return 0, from_odb(e)
-		}
-	}
-	if journal.journal_commit(&h.journal) != .None {
-		return 0, .Io
-	}
-	if len(h.applied) == 0 {
-		append(&h.applied, 0)
-		append(&h.stream_ids, h.self)
+	if commit {
+		journal_seal(h) or_return
 	}
 	return o, .None
 }

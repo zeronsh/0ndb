@@ -5,7 +5,9 @@ import "core:hash/xxhash"
 import "core:mem/virtual"
 import "core:strconv"
 import "../crdt"
+import "../fshist"
 import "../fstree"
+import "../journal"
 import "../odb"
 import "../prim"
 
@@ -77,6 +79,8 @@ Registry :: struct {
 	random:    prim.Random,
 	os_ready:  bool,
 	boot:      prim.Id,
+	on_eol:    Eol_Warning_Proc,
+	eol_data:  rawptr,
 }
 
 @(private)
@@ -296,6 +300,9 @@ Mount :: struct {
 	waits:       [dynamic]Mount_Wait,
 	open_scopes: map[string]^Scope,
 	intents:     [dynamic]Intent,
+	nonce:       prim.Id,
+	jpos:        i64,
+	jpend:       i64,
 	imported:    bool,
 	hold_line:   bool,
 	alias:       [dynamic]Version,
@@ -1201,6 +1208,7 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	p, _ := path_join(m.dir, "mount", context.temp_allocator)
 	data, rerr := prim.read_file(m.vfs, p, context.temp_allocator)
 	if rerr == .Not_Found {
+		mount_new_nonce(m)
 		if m.has_git {
 			m.head, _ = git_head(m.vfs, m.git, m.allocator)
 			m.reflog_pos = git_reflog_len(m.vfs, m.git)
@@ -1263,14 +1271,46 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			m.lost = was_lost || (!clean && (boot != now || now == {}))
 		}
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		m.nonce = prim.read_id(&rd)
+		m.jpos = prim.read_ivarint(&rd)
+	} else {
+		mount_new_nonce(m)
+	}
+	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
 	}
 	return false, .None
 }
 
+@(private)
+mount_new_nonce :: proc(m: ^Mount) {
+	prim.random_fill(m.reg.random if m.reg != nil else prim.Random{}, m.nonce[:])
+	m.jpos = 0
+	m.jpend = 0
+}
+
+@(private)
+commit_mark :: proc(m: ^Mount) -> []u8 {
+	out := make([]u8, 17, context.temp_allocator)
+	out[0] = fshist.TOP_MOUNT
+	n := m.nonce
+	copy(out[1:], n[:])
+	return out
+}
+
+@(private)
+mount_jlen :: proc(m: ^Mount) -> i64 {
+	if m.history != nil && m.history.awake {
+		return journal.journal_durable_len(&m.history.journal)
+	}
+	return m.jpend
+}
+
 Mount_Image :: struct {
 	synced:     [dynamic]crdt.Op_Id,
+	jpos:       i64,
 	branch:     string,
 	commit:     string,
 	reflog_pos: i64,
@@ -1293,6 +1333,7 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	img.reflog_pos = m.reflog_pos
 	img.stamp = m.stamp
 	img.imported = m.imported
+	img.jpos = m.jpend
 }
 
 @(private)
@@ -1354,6 +1395,7 @@ mount_settle :: proc(m: ^Mount) -> Error {
 	if !mount_deferred(m) {
 		shadow_flush(m) or_return
 		clear(&m.intents)
+		m.jpos = m.jpend
 		attrib_prune(m)
 		return save_mount_state(m)
 	}
@@ -1363,6 +1405,7 @@ mount_settle :: proc(m: ^Mount) -> Error {
 		image_take(m, &m.img)
 		shadow_flush(m) or_return
 		clear(&m.intents)
+		m.jpos = m.jpend
 		attrib_prune(m)
 		return save_mount_state(m)
 	}
@@ -1400,6 +1443,7 @@ mount_ack :: proc(m: ^Mount) -> Error {
 	if len(m.waits) == 0 && m.awake {
 		shadow_flush(m) or_return
 		clear(&m.intents)
+		m.jpos = m.img.jpos
 		attrib_prune(m)
 	}
 	return save_mount_state(m)
@@ -1452,6 +1496,8 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_id(&w, boot)
 	prim.write_bool(&w, m.clean)
 	prim.write_bool(&w, m.lost)
+	prim.write_id(&w, m.nonce)
+	prim.write_ivarint(&w, m.jpos)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		attrib_log_reset(m)
@@ -1466,17 +1512,27 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 }
 
 mount_recover :: proc(m: ^Mount) -> Error {
+	h := m.history
+	if h != nil {
+		history_marked(h, m.jpos, commit_mark(m), &m.intents) or_return
+	}
 	if len(m.intents) == 0 {
 		return .None
 	}
-	h := m.history
 	last: Maybe(crdt.Op_Id)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	lost := make([dynamic]Lost_Range, context.temp_allocator)
+	have := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &have) != .None {
+		return .Corrupt
+	}
 	for it in m.intents {
 		lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq})
 		if !ok {
 			append(&lost, Lost_Range{crdt.graph_intern(&h.g, it.actor), it.seq, it.seq + it.n})
+			continue
+		}
+		if end, known := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq + it.n - 1}); known && crdt.graph_contains(&h.g, have[:], end) {
 			continue
 		}
 		spans := []crdt.Lv_Span{{lv = lv, len = int(it.n)}}
@@ -1511,10 +1567,19 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
 		shadow_flush(m) or_return
-		clear(&m.synced)
-		append(&m.synced, l)
+		one := [1]crdt.Lv{}
+		if lv, known := crdt.graph_lv(&h.g, l); known {
+			one[0] = lv
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, have[:], one[:], &both)
+			v := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
+			clear(&m.synced)
+			append(&m.synced, ..v)
+		}
 	}
 	clear(&m.intents)
+	m.jpend = mount_jlen(m)
+	m.jpos = m.jpend
 	history_trim(h)
 	image_take(m, &m.img)
 	return save_mount_state(m)

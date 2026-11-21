@@ -261,7 +261,13 @@ shadow_by_inode :: proc(s: ^Shadow, inode: fstree.Inode_Id, allocator := context
 		}
 		if slot.hash == h && slot.off != 0 {
 			r := read_rec(s, slot.off, &s.scratch) or_return
+			cur: Path_Slot
+			live := false
 			if !r.del && r.entry.inode == inode {
+				_, cur, live = find_path(s, r.path, path_hash(r.path)) or_return
+				live = live && cur.off == slot.off
+			}
+			if live {
 				if pi, ok := s.index[r.path]; ok {
 					p := s.pending[pi]
 					if p.del || p.entry.inode != inode {
@@ -719,6 +725,9 @@ apply_rec :: proc(s: ^Shadow, rec: Rec, link := true) -> Error {
 	h := path_hash(r.path)
 	i, slot, found := find_path(s, r.path, h) or_return
 	if found && slot.off >= r.off {
+		if slot.off == r.off && !r.del {
+			inode_set(s, r.entry.inode, r.off) or_return
+		}
 		return link_parent(s, r) if link else .None
 	}
 	prev_inode: Maybe(fstree.Inode_Id)

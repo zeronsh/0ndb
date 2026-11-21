@@ -4,6 +4,7 @@ import "base:intrinsics"
 import "base:runtime"
 import "core:io"
 import "core:strconv"
+import "core:strings"
 import "../fstree"
 import "../odb"
 import "../prim"
@@ -1281,6 +1282,30 @@ source_feed :: proc(m: ^Mount, src: Conv_Source, out: io.Stream) -> bool {
 	return conv_flush(out) == nil
 }
 
+Eol_Warning :: enum u8 {
+	None,
+	Crlf_To_Lf,
+	Lf_To_Crlf,
+}
+
+Eol_Warning_Proc :: #type proc(m: ^Mount, rel: string, kind: Eol_Warning, data: rawptr)
+
+registry_set_eol_warning :: proc(reg: ^Registry, cb: Eol_Warning_Proc, data: rawptr) {
+	reg.on_eol = cb
+	reg.eol_data = data
+}
+
+eol_warning_text :: proc(rel: string, kind: Eol_Warning, allocator := context.allocator) -> string {
+	switch kind {
+	case .Crlf_To_Lf:
+		return strings.concatenate({"in the working copy of '", rel, "', CRLF will be replaced by LF the next time Git touches it"}, allocator)
+	case .Lf_To_Crlf:
+		return strings.concatenate({"in the working copy of '", rel, "', LF will be replaced by CRLF the next time Git touches it"}, allocator)
+	case .None:
+	}
+	return ""
+}
+
 @(private)
 Clean_Result :: enum u8 {
 	Same,
@@ -1338,11 +1363,36 @@ clean_convert :: proc(m: ^Mount, rel: string, cv: Conv, src: Conv_Source, out: ^
 	}
 	convert := false
 	auto := action_auto(cv.action)
-	if eol {
-		st := eol_stream_finish(&stats.es)
-		convert = st.crlf > 0 && stats.es.n > 0
-		if convert && auto && (text_is_binary(st) || index_has_crlf(m, rel)) {
+	st := eol_stream_finish(&stats.es)
+	if eol && stats.es.n > 0 && !(auto && text_is_binary(st)) {
+		convert = st.crlf > 0
+		if convert && auto && index_has_crlf(m, rel) {
 			convert = false
+		}
+		if safe := mount_git_settings(m).safecrlf; safe != .Off {
+			after := st
+			if convert {
+				after.lonelf += after.crlf
+				after.crlf = 0
+			}
+			if output_crlf(m, cv.action) && after.lonelf > 0 && !(auto && (after.lonecr > 0 || after.crlf > 0 || text_is_binary(after))) {
+				after.crlf += after.lonelf
+				after.lonelf = 0
+			}
+			kind := Eol_Warning.None
+			if st.crlf > 0 && after.crlf == 0 {
+				kind = .Crlf_To_Lf
+			} else if st.lonelf > 0 && after.lonelf == 0 {
+				kind = .Lf_To_Crlf
+			}
+			if kind != .None {
+				if safe == .Die {
+					return .Failed
+				}
+				if m.reg != nil && m.reg.on_eol != nil {
+					m.reg.on_eol(m, rel, kind, m.reg.eol_data)
+				}
+			}
 		}
 	}
 	if convert || cv.ident {
