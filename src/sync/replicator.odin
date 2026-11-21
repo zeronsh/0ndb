@@ -34,6 +34,7 @@ Repl_Event_Kind :: enum u8 {
 	Keys_Needed,
 	Presence,
 	Object_Shredded,
+	Caught_Up,
 }
 
 Repl_Event :: struct {
@@ -205,6 +206,7 @@ Replicator :: struct {
 	deadline:   prim.Timer,
 	tampered:   bool,
 	presence:   map[Device_Id]Presence_State,
+	present_ok: bool,
 	read_reqs:  int,
 	read_bytes: i64,
 	tamper_run: int,
@@ -228,6 +230,8 @@ Replicator :: struct {
 	static:     ecdh.Private_Key,
 	groups:     map[[16]u8]^Group,
 	feed_cursor: i64,
+	feed_target: i64,
+	caught:     bool,
 	feed_fd:    prim.Fd,
 	feed_seq:   u64,
 	fetches:    [dynamic]^Ckpt_Fetch,
@@ -327,6 +331,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.stage = make([dynamic]u8, allocator)
 	r.groups = make(map[[16]u8]^Group, allocator)
 	r.feed_cursor = -1
+	r.feed_target = -1
 	r.feed_fd = prim.INVALID_FD
 	_feed_cursor_load(r)
 	r.fetches = make([dynamic]^Ckpt_Fetch, allocator)
@@ -1152,7 +1157,23 @@ _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
 
 replicator_presence :: proc(r: ^Replicator, device: Device_Id) -> (up: bool, since: i64, known: bool) {
 	p, ok := r.presence[device]
+	if !ok && r.present_ok && r.phase == .Ready {
+		return false, 0, true
+	}
 	return p.up, p.since, ok
+}
+
+replicator_caught_up :: proc(r: ^Replicator) -> bool {
+	return r.caught && r.phase == .Ready
+}
+
+@(private)
+_caught_check :: proc(r: ^Replicator) {
+	if r.caught || r.phase != .Ready || r.feed_target < 0 || r.feed_cursor < r.feed_target || r.list_done < r.list_sent {
+		return
+	}
+	r.caught = true
+	_emit(r, Repl_Event{kind = .Caught_Up, length = r.feed_cursor})
 }
 
 @(private)
@@ -1164,6 +1185,7 @@ _on_presence :: proc(r: ^Replicator, ev: ^Event) {
 			}
 			return
 		}
+		r.present_ok = true
 		gone := make([dynamic]Device_Id, context.temp_allocator)
 		for d, p in r.presence {
 			if !p.seen && p.up {
@@ -1793,6 +1815,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 			r.cursor = ev.cursor
 			r.listed = true
 			_lists_finished(r, .None)
+			_caught_check(r)
 		}
 	case .Appended, .Conflict:
 		if l, ok := r.locals[Stream_Id(ev.id)]; ok {
@@ -1811,7 +1834,10 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Presence:
 		_on_presence(r, ev)
 	case .Probed:
-		if rm, ok := r.remotes[Stream_Id(ev.id)]; ok {
+		if Stream_Id(ev.id) == reserved_id(FEED_TAG, 0) {
+			r.feed_target = ev.length
+			_caught_check(r)
+		} else if rm, ok := r.remotes[Stream_Id(ev.id)]; ok {
 			if rm.probing {
 				rm.probing = false
 				rm.fresh_gen = rm.probe_gen
@@ -1842,6 +1868,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_emit(r, Repl_Event{kind = .Redacted, stream = Stream_Id(ev.id), from = ev.at, to = ev.length})
 	case .Announce:
 		_on_announce(r, ev)
+		_caught_check(r)
 	case .Error:
 		err := code_error(ev.code)
 		if err == .None {
@@ -1913,6 +1940,8 @@ _repl_on_ready :: proc(r: ^Replicator) {
 			client_feed_follow(&r.client, FEED_DROPPED, nil, false, false, true)
 		}
 	}
+	feed := [1]Stream_Id{reserved_id(FEED_TAG, 0)}
+	client_probe(&r.client, feed[:])
 	_fetches_ready(r)
 	ids := _sorted_ids(r.remotes)
 	for id in ids {

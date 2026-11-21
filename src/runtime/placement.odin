@@ -31,6 +31,9 @@ _evaluate_sender :: proc(r: ^Runtime, o: Object) {
 	if ierr != .None {
 		return
 	}
+	if !runners_loaded(r, o, true) {
+		return
+	}
 	waiting: Rid
 	defer _claim_prune(r, o, waiting)
 	if t.running {
@@ -108,7 +111,7 @@ _unanswered :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> (ms
 	if as, aerr := convo.assignee(v, t, hm.parent); aerr == .None && !prim.id_is_zero(as) && as != hm.runner {
 		reassigned = true
 	}
-	if !reassigned && runner_present(r, o.space, hm.runner) {
+	if !reassigned && !runner_gone(r, o.space, hm.runner) {
 		return
 	}
 	pm, perr := convo.message(v, t, convo.Position{msg = hm.parent}, context.temp_allocator)
@@ -126,6 +129,9 @@ placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: 
 	t, terr := convo.view_tail(v, r.self, context.temp_allocator)
 	if terr != .None {
 		return info, .Pending if terr == .Missing else .Engine
+	}
+	if !runners_loaded(r, o, false) {
+		return info, .Pending
 	}
 	if t.running {
 		if runner, live := _open_live(r, o, v, &t); live {
@@ -216,7 +222,7 @@ _open_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> (run
 		if as, aerr := convo.assignee(v, t, m.parent); aerr == .None && !prim.id_is_zero(as) && as != m.runner {
 			continue
 		}
-		if m.runner != r.self && !runner_present(r, o.space, m.runner) {
+		if m.runner != r.self && runner_gone(r, o.space, m.runner) {
 			continue
 		}
 		if m.runner == r.self && run_find(r, o) == nil {

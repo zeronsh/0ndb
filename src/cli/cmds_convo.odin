@@ -361,7 +361,7 @@ follow :: proc(s: ^Session, ob: api.Object, until_idle: bool, sent := "") -> int
 		sr := req_begin("convo.status")
 		req_str(&sr, "object", object_str(ob))
 		st := jstr(must(s, req_end(&sr)), "status")
-		seen_running = st == "running" || st == "queued" || st == "awaiting_permission"
+		seen_running = st == "running" || st == "queued" || st == "awaiting_permission" || st == "reviving"
 	}
 	last_place := ""
 	if until_idle {
@@ -461,7 +461,7 @@ follow :: proc(s: ^Session, ob: api.Object, until_idle: bool, sent := "") -> int
 			}
 			if kind == "status" {
 				st := jstr(d, "status")
-				if st == "running" || st == "queued" || st == "awaiting_permission" {
+				if st == "running" || st == "queued" || st == "awaiting_permission" || st == "reviving" {
 					seen_running = true
 				} else if until_idle && (seen_running || seen_seal || st == "failed" || st == "interrupted") {
 					if open_block {

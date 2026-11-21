@@ -91,6 +91,8 @@ History :: struct {
 	touched:    [dynamic]fstree.Inode_Id,
 	touched_set: map[fstree.Inode_Id]struct{},
 	src_err:    Error,
+	refs:       int,
+	owned:      bool,
 	durable:    u64,
 	mark:       u64,
 	mark_fp:    [3]u64,
@@ -216,6 +218,47 @@ from_journal :: proc "contextless" (e: journal.Error) -> Error {
 		return .Redacted
 	}
 	return .Corrupt
+}
+
+history_create :: proc(vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams := Stream_Source{}, allocator := context.allocator, opts := History_Options{}) -> (h: ^History, err: Error) {
+	h = new(History, allocator)
+	if h == nil {
+		return nil, .No_Memory
+	}
+	if err = history_open(h, vfs, dir, id, self, db, streams, allocator, opts); err != .None {
+		free(h, allocator)
+		return nil, err
+	}
+	h.owned = true
+	h.refs = 1
+	return h, .None
+}
+
+history_retain :: proc(h: ^History) {
+	h.refs += 1
+}
+
+history_release :: proc(h: ^History) {
+	if h == nil {
+		return
+	}
+	h.refs -= 1
+	if h.refs > 0 || !h.owned {
+		return
+	}
+	allocator := h.allocator
+	history_close(h)
+	free(h, allocator)
+}
+
+history_reconfigure :: proc(h: ^History, opts: History_Options) -> Error {
+	awake := h.awake
+	history_sleep(h)
+	h.opts = opts
+	if awake || len(h.mounts) > 0 {
+		return history_wake(h)
+	}
+	return .None
 }
 
 history_durable_mark :: proc "contextless" (h: ^History) -> u64 {

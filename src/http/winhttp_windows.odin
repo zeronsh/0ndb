@@ -31,6 +31,8 @@ _Wh_Api :: struct {
 	receive:       proc "system" (h: HINTERNET, reserved: rawptr) -> win.BOOL,
 	query_headers: proc "system" (h: HINTERNET, level: u32, name: win.wstring, buf: rawptr, n: ^u32, index: ^u32) -> win.BOOL,
 	read_data:     proc "system" (h: HINTERNET, buf: rawptr, n: u32, read: ^u32) -> win.BOOL,
+	read_data_ex:  proc "system" (h: HINTERNET, buf: rawptr, n: u32, read: ^u32, flags: u64, prop_n: u32, prop: rawptr) -> u32,
+	query_data:    proc "system" (h: HINTERNET, avail: ^u32) -> win.BOOL,
 }
 
 @(private)
@@ -131,6 +133,8 @@ WH_STATUS_SECURE_FAILURE :: 0x00010000
 @(private)
 WH_STATUS_HEADERS_AVAILABLE :: 0x00020000
 @(private)
+WH_STATUS_DATA_AVAILABLE :: 0x00040000
+@(private)
 WH_STATUS_READ_COMPLETE :: 0x00080000
 @(private)
 WH_STATUS_WRITE_COMPLETE :: 0x00100000
@@ -139,7 +143,7 @@ WH_STATUS_REQUEST_ERROR :: 0x00200000
 @(private)
 WH_STATUS_SENDREQUEST_COMPLETE :: 0x00400000
 @(private)
-WH_CALLBACK_FLAGS :: WH_STATUS_HANDLE_CLOSING | WH_STATUS_SECURE_FAILURE | WH_STATUS_HEADERS_AVAILABLE | WH_STATUS_READ_COMPLETE | WH_STATUS_WRITE_COMPLETE | WH_STATUS_REQUEST_ERROR | WH_STATUS_SENDREQUEST_COMPLETE
+WH_CALLBACK_FLAGS :: WH_STATUS_HANDLE_CLOSING | WH_STATUS_SECURE_FAILURE | WH_STATUS_HEADERS_AVAILABLE | WH_STATUS_DATA_AVAILABLE | WH_STATUS_READ_COMPLETE | WH_STATUS_WRITE_COMPLETE | WH_STATUS_REQUEST_ERROR | WH_STATUS_SENDREQUEST_COMPLETE
 
 @(private)
 WH_OPT_SECURITY_FLAGS :: 31
@@ -231,6 +235,7 @@ Winhttp :: struct {
 	ca_store:   win.HCERTSTORE,
 	ca_engine:  rawptr,
 	ca_retired: [dynamic]rawptr,
+	ca_stores:  [dynamic]win.HCERTSTORE,
 	allocator:  runtime.Allocator,
 	live:       map[Id]^Wh_Transfer,
 	bufs:       [dynamic][]u8,
@@ -328,6 +333,8 @@ _wh_load :: proc(a: ^_Wh_Api) -> bool {
 	ok &&= _wh_sym(m, "WinHttpReceiveResponse", &a.receive)
 	ok &&= _wh_sym(m, "WinHttpQueryHeaders", &a.query_headers)
 	ok &&= _wh_sym(m, "WinHttpReadData", &a.read_data)
+	ok &&= _wh_sym(m, "WinHttpQueryDataAvailable", &a.query_data)
+	_wh_sym(m, "WinHttpReadDataEx", &a.read_data_ex)
 	return ok
 }
 
@@ -395,6 +402,7 @@ winhttp_init :: proc(h: ^Winhttp, l: ^prim.Loop, allocator := context.allocator)
 	h.live = make(map[Id]^Wh_Transfer, allocator)
 	h.bufs = make([dynamic][]u8, allocator)
 	h.ca_retired = make([dynamic]rawptr, allocator)
+	h.ca_stores = make([dynamic]win.HCERTSTORE, allocator)
 	_wh_arm(h)
 	return true
 }
@@ -494,7 +502,7 @@ _wh_on_status :: proc "system" (hi: HINTERNET, ctx: uintptr, status: u32, info: 
 			_wh_ca_check(h, t, hi)
 		}
 		return
-	case WH_STATUS_SECURE_FAILURE, WH_STATUS_WRITE_COMPLETE:
+	case WH_STATUS_SECURE_FAILURE, WH_STATUS_WRITE_COMPLETE, WH_STATUS_DATA_AVAILABLE:
 		if info != nil {
 			ev.a = (^u32)(info)^
 		}
@@ -594,6 +602,10 @@ winhttp_ca_file :: proc(h: ^Winhttp, path: string) {
 		append(&h.ca_retired, h.ca_engine)
 		h.ca_engine = nil
 	}
+	if h.ca_store != nil {
+		append(&h.ca_stores, h.ca_store)
+		h.ca_store = nil
+	}
 	if path == "" {
 		_wh_set_callback(h)
 		return
@@ -605,11 +617,10 @@ winhttp_ca_file :: proc(h: ^Winhttp, path: string) {
 	if err != .None {
 		return
 	}
+	h.ca_store = h.ca.open_store(2, 0, nil, 0, nil)
 	if h.ca_store == nil {
-		h.ca_store = h.ca.open_store(2, 0, nil, 0, nil)
-		if h.ca_store == nil {
-			return
-		}
+		_wh_set_callback(h)
+		return
 	}
 	begin := "-----BEGIN CERTIFICATE-----"
 	end := "-----END CERTIFICATE-----"
@@ -639,6 +650,7 @@ winhttp_ca_file :: proc(h: ^Winhttp, path: string) {
 		}
 	}
 	if added == 0 {
+		_wh_set_callback(h)
 		return
 	}
 	cfg := _Chain_Engine_Config {
@@ -647,6 +659,7 @@ winhttp_ca_file :: proc(h: ^Winhttp, path: string) {
 	}
 	engine: rawptr
 	if !h.ca.create_engine(&cfg, &engine) {
+		_wh_set_callback(h)
 		return
 	}
 	h.ca_engine = engine
@@ -692,7 +705,10 @@ winhttp_destroy :: proc(h: ^Winhttp) {
 		h.ca.free_engine(e)
 	}
 	if h.ca_store != nil {
-		h.ca.close_store(h.ca_store, 0)
+		append(&h.ca_stores, h.ca_store)
+	}
+	for st in h.ca_stores {
+		h.ca.close_store(st, 0)
 	}
 	for b in h.bufs {
 		delete(b, h.allocator)
@@ -700,6 +716,7 @@ winhttp_destroy :: proc(h: ^Winhttp) {
 	delete(h.bufs)
 	delete(h.live)
 	delete(h.ca_retired)
+	delete(h.ca_stores)
 	h^ = {}
 }
 
@@ -1097,6 +1114,13 @@ _wh_event :: proc(h: ^Winhttp, t: ^Wh_Transfer, ev: _Wh_Ev, secure: u32, ca_fail
 		}
 	case WH_STATUS_READ_COMPLETE:
 		_wh_on_read(h, t, int(ev.a))
+	case WH_STATUS_DATA_AVAILABLE:
+		if ev.a == 0 {
+			_wh_on_read(h, t, 0)
+		} else if !h.api.read_data(t.req, raw_data(t.rbuf), min(ev.a, u32(len(t.rbuf))), nil) {
+			code := win.GetLastError()
+			_wh_finish(h, t, _wh_map(code, t.head_sent), _wh_detail(h, code, 0))
+		}
 	case WH_STATUS_REQUEST_ERROR:
 		if ev.a == WH_ERROR_RESEND_REQUEST && t.reader.read == nil {
 			t.seg = 1 if t.optional != nil else 0
@@ -1232,7 +1256,14 @@ _wh_read :: proc(h: ^Winhttp, t: ^Wh_Transfer) {
 			return
 		}
 	}
-	if !h.api.read_data(t.req, raw_data(t.rbuf), u32(len(t.rbuf)), nil) {
+	if h.api.read_data_ex != nil {
+		code := h.api.read_data_ex(t.req, raw_data(t.rbuf), u32(len(t.rbuf)), nil, 0, 0, nil)
+		if code != 0 && code != u32(win.ERROR_IO_PENDING) {
+			_wh_finish(h, t, _wh_map(code, t.head_sent), _wh_detail(h, code, 0))
+		}
+		return
+	}
+	if !h.api.query_data(t.req, nil) {
 		code := win.GetLastError()
 		_wh_finish(h, t, _wh_map(code, t.head_sent), _wh_detail(h, code, 0))
 	}

@@ -7,7 +7,7 @@ import eng "../engine"
 import rt "../runtime"
 
 ABI_MAJOR :: 1
-ABI_MINOR :: 4
+ABI_MINOR :: 5
 
 FLAG_JSON :: u32(1)
 

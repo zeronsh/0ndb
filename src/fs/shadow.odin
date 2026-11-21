@@ -76,6 +76,9 @@ Rec :: struct {
 
 Shadow :: struct {
 	hold:       bool,
+	txn:        bool,
+	txn_len:    int,
+	undo:       [dynamic]Shadow_Undo,
 	vfs:        prim.Vfs,
 	dir:        string,
 	allocator:  runtime.Allocator,
@@ -132,6 +135,7 @@ shadow_attach :: proc(s: ^Shadow) -> Error {
 		return .None
 	}
 	s.pending = make([dynamic]Pending_Rec, s.allocator)
+	s.undo = make([dynamic]Shadow_Undo, s.allocator)
 	s.index = make(map[string]int, s.allocator)
 	s.by_inode = make(map[fstree.Inode_Id]int, s.allocator)
 	s.scratch = make([dynamic]u8, s.allocator)
@@ -157,6 +161,8 @@ shadow_detach :: proc(s: ^Shadow) {
 	s.idx_fd = prim.INVALID_FD
 	pending_clear(s)
 	delete(s.pending)
+	delete(s.undo)
+	s.undo = nil
 	delete(s.index)
 	delete(s.by_inode)
 	delete(s.scratch)
@@ -398,7 +404,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
-	if len(s.pending) == 0 || s.hold {
+	if len(s.pending) == 0 || s.hold || s.txn {
 		return .None
 	}
 	if s.log_fd < 0 {
@@ -607,6 +613,9 @@ find_path_rec :: proc(s: ^Shadow, path: string) -> (index: u64, slot: Path_Slot,
 pending_set :: proc(s: ^Shadow, path: string, del: bool, e: Entry) -> Error {
 	if i, ok := s.index[path]; ok {
 		p := &s.pending[i]
+		if s.txn && i < s.txn_len {
+			append(&s.undo, Shadow_Undo{i, p.del, p.entry})
+		}
 		if !p.del {
 			if j, ok2 := s.by_inode[p.entry.inode]; ok2 && j == i {
 				delete_key(&s.by_inode, p.entry.inode)
@@ -633,6 +642,51 @@ pending_set :: proc(s: ^Shadow, path: string, del: bool, e: Entry) -> Error {
 		s.by_inode[e.inode] = i
 	}
 	return .None
+}
+
+@(private)
+Shadow_Undo :: struct {
+	index: int,
+	del:   bool,
+	entry: Entry,
+}
+
+shadow_txn_begin :: proc(s: ^Shadow) {
+	s.txn = true
+	s.txn_len = len(s.pending)
+	clear(&s.undo)
+}
+
+shadow_txn_end :: proc(s: ^Shadow) {
+	s.txn = false
+	clear(&s.undo)
+}
+
+shadow_txn_rollback :: proc(s: ^Shadow) {
+	if !s.txn {
+		return
+	}
+	for i := len(s.undo) - 1; i >= 0; i -= 1 {
+		u := s.undo[i]
+		s.pending[u.index].del = u.del
+		s.pending[u.index].entry = u.entry
+	}
+	for i := len(s.pending) - 1; i >= s.txn_len; i -= 1 {
+		delete(s.pending[i].path, s.allocator)
+	}
+	resize(&s.pending, s.txn_len)
+	clear(&s.index)
+	clear(&s.by_inode)
+	for p, i in s.pending {
+		if p.fresh {
+			continue
+		}
+		s.index[p.path] = i
+		if !p.del {
+			s.by_inode[p.entry.inode] = i
+		}
+	}
+	shadow_txn_end(s)
 }
 
 @(private = "file")

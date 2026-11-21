@@ -356,6 +356,9 @@ replicator_link_down :: proc(r: ^Replicator, err: Error = .Closed) {
 
 @(private)
 _repl_close :: proc(r: ^Replicator) {
+	r.present_ok = false
+	r.caught = false
+	r.feed_target = -1
 	if r.presence != nil {
 		clear(&r.presence)
 	}

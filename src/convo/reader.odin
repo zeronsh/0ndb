@@ -195,6 +195,15 @@ view_tail :: proc(v: ^obj.View, self: prim.Id = {}, allocator := context.allocat
 			continue
 		}
 		for o in summary_open(&sum) {
+			moved, merr := _open_reassigned(v, s, o.msg)
+			if merr == .Missing {
+				missing = true
+			} else if merr != .None {
+				return t, merr
+			}
+			if moved {
+				continue
+			}
 			if o.state != .Running {
 				t.revive = true
 				continue
@@ -257,6 +266,19 @@ view_tail :: proc(v: ^obj.View, self: prim.Id = {}, allocator := context.allocat
 	return t, .None
 }
 
+@(private)
+_open_reassigned :: proc(v: ^obj.View, s: int, msg: i64) -> (moved: bool, err: Error) {
+	n := _node(v, Vref{s, msg}) or_return
+	if obj.vref_none(n.parent) {
+		return false, .None
+	}
+	p := _node(v, n.parent) or_return
+	st: Structure
+	structure_load(v, nil, p.hlc, &st) or_return
+	winner := assignee_of(&st, n.parent, p.runner)
+	return !prim.id_is_zero(winner) && winner != v.segs[s].id, .None
+}
+
 tail_destroy :: proc(t: ^Tail) {
 	delete(t.virtual)
 	delete(t.tips)
@@ -274,7 +296,7 @@ derive_status :: proc "contextless" (t: ^Tail) -> Status {
 	case t.waiting > 0:
 		return .Waiting
 	case t.revive:
-		return .Interrupted
+		return .Reviving
 	case t.head_status == .Failed:
 		return .Failed
 	case t.head_status == .Interrupted:

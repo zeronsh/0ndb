@@ -121,6 +121,10 @@ op_runtime_stats :: proc(c: ^Call, o: ^Out) -> Status {
 
 @(private)
 _on_path :: proc(name: string) -> bool {
+	when ODIN_OS == .Windows {
+		_, _, err := prim.resolve_executable(name, nil, context.temp_allocator)
+		return err == .None
+	}
 	if strings.contains_rune(name, '/') {
 		return os.exists(name)
 	}

@@ -1628,7 +1628,11 @@ _on_probe :: proc(c: ^Conn, rd: ^prim.Reader) {
 	for _ in 0 ..< count {
 		id := Stream_Id(get_id32(rd))
 		length: i64
-		if !_can(c, .Read, cast([32]u8)id) {
+		if id == reserved_id(FEED_TAG, 0) {
+			if _can(c, .List, {}) && _feed_open(r, sp) == .None {
+				length = _feed_end(sp)
+			}
+		} else if !_can(c, .Read, cast([32]u8)id) {
 			length = 0
 		} else if st, ok := sp.streams[id]; ok && st.h != nil && !st.poisoned {
 			length = _live_len(st)

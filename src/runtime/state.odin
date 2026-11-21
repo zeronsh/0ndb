@@ -358,6 +358,33 @@ runner_present :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
 	return up || !known
 }
 
+runner_gone :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
+	if device == r.self || prim.id_is_zero(device) {
+		return false
+	}
+	if !runner_present(r, space, device) {
+		return true
+	}
+	d := device
+	en, ok := map_read(r, runners_object(space), d[:])
+	return ok && entry_u64(&en, 1) == 0
+}
+
+runners_loaded :: proc(r: ^Runtime, o: Object, wait: bool) -> bool {
+	ready := _wait_ready(r, o) if wait else eng.Ready{}
+	if wait && ready.call == nil {
+		return false
+	}
+	cur: eng.Map_Cursor
+	_, _, err := eng.map_scan(r.e, runners_object(o.space), nil, &cur, 1, context.temp_allocator, ready)
+	delete(cur.key)
+	if err == .Pending {
+		return false
+	}
+	_wait_drop(r, ready)
+	return true
+}
+
 runners_live :: proc(r: ^Runtime, space: prim.Id, provider: string) -> []prim.Id {
 	out := make([dynamic]prim.Id, context.temp_allocator)
 	for &row in map_rows(r, runners_object(space), nil) {
@@ -427,6 +454,16 @@ _providers_local :: proc(r: ^Runtime) -> string {
 
 @(private)
 _exe_found :: proc(r: ^Runtime, name: string) -> bool {
+	when ODIN_OS == .Windows {
+		env: []string
+		for kv in r.cfg.env {
+			if len(kv) > 5 && strings.equal_fold(kv[:5], "PATH=") {
+				env = r.cfg.env
+			}
+		}
+		_, _, err := prim.resolve_executable(name, env, context.temp_allocator)
+		return err == .None
+	}
 	vfs := prim.os_vfs()
 	if strings.index_byte(name, '/') >= 0 {
 		return prim.exists(vfs, name)

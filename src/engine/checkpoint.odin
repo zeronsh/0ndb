@@ -313,14 +313,13 @@ _ckpt_load :: proc(e: ^Engine, sp: ^Space, w: ^Ckpt_Wait) -> Error {
 	hdir := _join(context.temp_allocator, dir, "hist") or_return
 	src := Ckpt_Source{e = e, fd = fd, end = size, db = db}
 	h, hok := e.handles[w.object]
-	hist := new(fs.History, e.allocator)
 	streams := fs.Stream_Source{data = h, read = _hist_read} if hok else fs.Stream_Source{}
 	opts := fs.History_Options{clock = _fs_clock(e)}
 	if hok {
 		opts = _hist_options(h)
 	}
-	if lerr := fs.history_bundle_load(hist, e.vfs, hdir, w.object, e.self, db, streams, fs.Bundle_Source{data = &src, read = _ckpt_source_read}, e.allocator, opts); lerr != .None {
-		free(hist, e.allocator)
+	hist, lerr := fs.history_bundle_create(e.vfs, hdir, w.object, e.self, db, streams, fs.Bundle_Source{data = &src, read = _ckpt_source_read}, e.allocator, opts)
+	if lerr != .None {
 		_ckpt_discard(e, hdir)
 		return _ferr(lerr)
 	}
@@ -328,8 +327,7 @@ _ckpt_load :: proc(e: ^Engine, sp: ^Space, w: ^Ckpt_Wait) -> Error {
 		h.hist = hist
 		h.hist_chain = h.own_tree != nil
 	} else {
-		fs.history_close(hist)
-		free(hist, e.allocator)
+		fs.history_release(hist)
 	}
 	_ckpt_put(e, w.object, 0, {})
 	return .None

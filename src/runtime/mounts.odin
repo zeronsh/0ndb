@@ -29,10 +29,44 @@ Wt_Member :: struct {
 }
 
 Wt_Tool :: struct {
-	id:     string,
-	scopes: []^fs.Scope,
-	before: []u8,
-	open:   bool,
+	id:        string,
+	scopes:    []^fs.Scope,
+	before:    []u8,
+	open:      bool,
+	closing:   bool,
+	closed_ns: i64,
+	grace:     prim.Timer,
+}
+
+@(private)
+TOOL_GRACE_MS :: 250 when ODIN_OS == .Darwin || ODIN_OS == .Windows else 0
+
+@(private)
+Tool_Grace :: struct {
+	ws:  ^Worktree,
+	idx: int,
+}
+
+@(private)
+_tool_scopes_close :: proc(ws: ^Worktree, t: ^Wt_Tool) {
+	if !t.closing {
+		return
+	}
+	t.closing = false
+	r := ws.r
+	if t.grace != 0 {
+		prim.timer_cancel(eng.loop(r.e), t.grace)
+		t.grace = 0
+	}
+	reg, rerr := eng.registry(r.e)
+	if rerr != .None {
+		return
+	}
+	for s in t.scopes {
+		if s != nil {
+			fs.scope_close(reg, s)
+		}
+	}
 }
 
 Worktree :: struct {
@@ -716,11 +750,22 @@ _tool_close_now :: proc(ws: ^Worktree, run: ^Run, idx: int) {
 	}
 	t := &ws.tools[idx]
 	t.open = false
-	for s in t.scopes {
-		if s != nil {
-			fs.scope_close(reg, s)
-		}
+	t.closing = true
+	if TOOL_GRACE_MS > 0 {
+		t.closed_ns = mono_ns(r)
+		g := new(Tool_Grace, ws.alloc)
+		g^ = {ws, idx}
+		t.grace = prim.timer(eng.loop(r.e), TOOL_GRACE_MS, g, proc(l: ^prim.Loop, data: rawptr) {
+			g := (^Tool_Grace)(data)
+			if g.idx < len(g.ws.tools) {
+				g.ws.tools[g.idx].grace = 0
+				_tool_scopes_close(g.ws, &g.ws.tools[g.idx])
+			}
+		})
+	} else {
+		_tool_scopes_close(ws, t)
 	}
+	_ = reg
 	after := _versions_blob(ws, context.temp_allocator)
 	if w := _writer(run); w != nil {
 		convo.writer_scope(w, run.reply, .Tool, _tool_scope_id(ws, t.id), _tool_scope_id(ws, t.id), t.before, after)
@@ -768,12 +813,9 @@ worktree_finish :: proc(ws: ^Worktree, run: ^Run, land: bool) -> []convo.File_De
 	for &t in ws.tools {
 		if t.open && rerr == .None {
 			t.open = false
-			for s in t.scopes {
-				if s != nil {
-					fs.scope_close(reg, s)
-				}
-			}
+			t.closing = true
 		}
+		_tool_scopes_close(ws, &t)
 	}
 	clear(&ws.tools)
 	before := make([dynamic]u8, context.temp_allocator)
@@ -814,6 +856,9 @@ worktree_finish :: proc(ws: ^Worktree, run: ^Run, land: bool) -> []convo.File_De
 
 worktree_close :: proc(ws: ^Worktree) {
 	r := ws.r
+	for &t in ws.tools {
+		_tool_scopes_close(ws, &t)
+	}
 	reg, rerr := eng.registry(r.e)
 	for &mb in ws.members {
 		if mb.turn != nil && rerr == .None {
@@ -953,7 +998,11 @@ _open_calls :: proc(run: ^Run) -> (calls: []observe.Tool_Call, idx: []int) {
 	c := make([dynamic]observe.Tool_Call, context.temp_allocator)
 	x := make([dynamic]int, context.temp_allocator)
 	for &t, i in run.tools {
-		if t.has_obs && t.scope >= 0 && t.scope < len(run.ws.tools) && run.ws.tools[t.scope].open {
+		if !t.has_obs || t.scope < 0 || t.scope >= len(run.ws.tools) {
+			continue
+		}
+		wt := run.ws.tools[t.scope]
+		if wt.open || (wt.closing && mono_ns(run.ws.r) - wt.closed_ns <= TOOL_GRACE_MS * 1_000_000) {
 			append(&c, t.call)
 			append(&x, i)
 		}

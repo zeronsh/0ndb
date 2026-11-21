@@ -211,21 +211,28 @@ _hist_open :: proc(h: ^Handle) -> Error {
 		return .None
 	}
 	e := h.e
+	for mt in e.plug.mounts {
+		if mt.object.id == h.id && mt.mount.history != nil {
+			fs.history_retain(mt.mount.history)
+			h.hist = mt.mount.history
+			h.hist_chain = h.own_tree != nil
+			return .None
+		}
+	}
 	if _ckpt_waiting(h) || _ckpt_fetch_start(e, h) {
 		return .Missing
 	}
 	dir := _obj_dir(e, h.id) or_return
 	hdir := _join(context.temp_allocator, dir, "hist") or_return
 	db := device_odb(e) or_return
-	hist := new(fs.History, e.allocator)
 	src := fs.Stream_Source{data = h, read = _hist_read}
 	if h.own_tree == nil {
 		if t, terr := _own_tree_get(e, h.sp, h.id, h.kind, &h.scope, false); terr == .None {
 			h.own_tree = t
 		}
 	}
-	if err := fs.history_open(hist, e.vfs, hdir, h.id, e.self, db, src, e.allocator, _hist_options(h)); err != .None {
-		free(hist, e.allocator)
+	hist, err := fs.history_create(e.vfs, hdir, h.id, e.self, db, src, e.allocator, _hist_options(h))
+	if err != .None {
 		return _ferr(err)
 	}
 	h.hist = hist

@@ -111,6 +111,12 @@ clone_tree :: proc(src: ^Mount, sh: ^Shadow, root: string, rel: string) -> Error
 				continue
 			}
 		case .Symlink:
+			if !mount_symlinks(src) {
+				if clone_file(src.vfs, s, d, 0o644) != .None {
+					continue
+				}
+				break
+			}
 			tbuf: [prim.PATH_MAX]u8
 			n, lerr := prim.readlink(src.vfs, s, tbuf[:])
 			if lerr != .None {

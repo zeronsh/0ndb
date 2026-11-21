@@ -53,9 +53,9 @@ clone_file :: proc(vfs: prim.Vfs, src, dst: string, mode: u32) -> Error {
 	if abs_wide(src, sw[:]) && abs_wide(dst, dw[:]) {
 		flags: u32 = win.COPY_FILE_NO_BUFFERING if size >= COPY_UNBUFFERED_MIN else 0
 		if win.CopyFileExW(cstring16(&sw[0]), cstring16(&dw[0]), nil, nil, nil, flags) {
-			if fd, oerr := prim.open_file(vfs, dst, {.Write}); oerr == .None {
-				prim.fchmod(vfs, fd, mode & 0o7777)
-				prim.close_file(vfs, fd)
+			attrs := win.GetFileAttributesW(cstring16(&dw[0]))
+			if attrs != win.INVALID_FILE_ATTRIBUTES && (attrs & ATTR_READONLY != 0) != (mode & 0o222 == 0) {
+				win.SetFileAttributesW(cstring16(&dw[0]), attrs ~ ATTR_READONLY)
 			}
 			return .None
 		}

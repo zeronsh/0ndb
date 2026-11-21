@@ -418,6 +418,9 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.git, m.has_git = git_locate(m.vfs, m.root, allocator)
 	m.waits = make([dynamic]Mount_Wait, allocator)
 	m.attrib = make(map[string]Attrib, allocator)
+	if h != nil {
+		history_retain(h)
+	}
 	fresh := load_mount_state(m) or_return
 	attrib_log_open(m) or_return
 	image_take(m, &m.img)
@@ -554,6 +557,7 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.fences)
 	delete(m.intents)
+	held := m.history if m.attrib != nil else nil
 	if m.history != nil {
 		for x, i in m.history.mounts {
 			if x == m {
@@ -600,6 +604,7 @@ mount_close :: proc(m: ^Mount) {
 	delete(m.dir, m.allocator)
 	delete(m.line, m.allocator)
 	m^ = {}
+	history_release(held)
 }
 
 mount_wake :: proc(m: ^Mount) -> Error {
@@ -764,7 +769,7 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 		if o := m.open_scopes[rel]; o != nil && o != scope {
 			m.open_scopes[rel] = nil
 		}
-		mount_mark(m, rel)
+		mount_mark_observed(m, rel, nil)
 		mount_pass(m, false) or_return
 		if b, still := m.attrib[rel]; still && !b.used && b.actor == a.actor {
 			key, _ := delete_key(&m.attrib, rel)

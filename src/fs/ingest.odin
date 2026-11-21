@@ -511,7 +511,10 @@ import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame) -> bo
 		return false
 	}
 	if info.kind != want {
-		return false
+		if !(info.kind == .Symlink && want == .File && !mount_symlinks(m)) {
+			return false
+		}
+		want = .Symlink
 	}
 	st.stack[len(st.stack) - 1].partial = true
 	if want == .Dir {
@@ -979,6 +982,27 @@ catch_up :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
+commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
+	m := p.m
+	shadow_txn_begin(&m.shadow)
+	err: Error
+	for i in indices {
+		if err = emit_change(p, b, &p.changes[i]); err != .None {
+			break
+		}
+	}
+	if err == .None {
+		err = builder_commit(m, b)
+	}
+	if err != .None {
+		shadow_txn_rollback(&m.shadow)
+		return err
+	}
+	shadow_txn_end(&m.shadow)
+	return .None
+}
+
+@(private)
 attribute_changes :: proc(p: ^Pass) -> Error {
 	m := p.m
 	for &c in p.changes {
@@ -1012,11 +1036,18 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		b: Builder
 		builder_init(&b, m.history, a.actor)
 		attrib_set(m, c.path, a.actor, true, a.oid)
+		shadow_txn_begin(&m.shadow)
 		eerr := emit_change(p, &b, &first)
 		key, _ := delete_key(&m.override, k)
 		delete(key, m.allocator)
-		eerr or_return
-		builder_commit(m, &b) or_return
+		if eerr == .None {
+			eerr = builder_commit(m, &b)
+		}
+		if eerr != .None {
+			shadow_txn_rollback(&m.shadow)
+			return eerr
+		}
+		shadow_txn_end(&m.shadow)
 		e, found := shadow_get(&m.shadow, c.path) or_return
 		if !found {
 			continue
@@ -1382,10 +1413,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			append(&all, i)
 		}
 		emit_order(p, all[:])
-		for i in all {
-			emit_change(p, &b, &p.changes[i]) or_return
-		}
-		builder_commit(m, &b) or_return
+		commit_group(p, &b, all[:]) or_return
 	} else {
 		attribute_changes(p) or_return
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
@@ -1414,10 +1442,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 					attrib_set(m, p.changes[i].path, actor, true)
 				}
 			}
-			for i in groups[actor] {
-				emit_change(p, &b, &p.changes[i]) or_return
-			}
-			builder_commit(m, &b) or_return
+			commit_group(p, &b, groups[actor][:]) or_return
 		}
 	}
 	mount_settle(m) or_return

@@ -104,7 +104,7 @@ sock_connect :: proc(path: string) -> (Sock, bool) {
 	if !ok {
 		return NO_SOCK, false
 	}
-	s := _unix_socket(0)
+	s := _unix_socket(win.WSA_FLAG_OVERLAPPED)
 	if s == win.INVALID_SOCKET {
 		return NO_SOCK, false
 	}

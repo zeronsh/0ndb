@@ -124,6 +124,7 @@ _Loop_Os :: struct {
 	ios:         [dynamic]^_Io,
 	writers:     [dynamic]^_Writer,
 	ready:       [dynamic]_Ready,
+	deferred:    [dynamic]win.OVERLAPPED_ENTRY,
 	ops:         [dynamic]^Overlapped_Op,
 	op_cache:    [dynamic]^Overlapped_Op,
 	stash_n:     int,
@@ -147,6 +148,7 @@ _os_init :: proc(l: ^Loop) -> Error {
 	l.os.ios = make([dynamic]^_Io, l.allocator)
 	l.os.writers = make([dynamic]^_Writer, l.allocator)
 	l.os.ready = make([dynamic]_Ready, l.allocator)
+	l.os.deferred = make([dynamic]win.OVERLAPPED_ENTRY, l.allocator)
 	l.os.ops = make([dynamic]^Overlapped_Op, l.allocator)
 	l.os.op_cache = make([dynamic]^Overlapped_Op, l.allocator)
 	l.os.port = win.CreateIoCompletionPort(INVALID_HANDLE, nil, 0, 1)
@@ -203,6 +205,8 @@ _os_destroy :: proc(l: ^Loop) {
 	delete(l.os.ios)
 	delete(l.os.writers)
 	delete(l.os.ready)
+	delete(l.os.deferred)
+	l.os.deferred = nil
 	l.os.ios = nil
 	l.os.writers = nil
 	l.os.ready = nil
@@ -317,6 +321,13 @@ _os_poll :: proc(l: ^Loop, timeout_ns: i64) -> Error {
 			}
 		}
 		remove_range(&l.os.ready, 0, n)
+	}
+	if len(l.os.deferred) > 0 {
+		ready = true
+		for i := 0; i < len(l.os.deferred); i += 1 {
+			_entry(l, l.os.deferred[i])
+		}
+		clear(&l.os.deferred)
 	}
 	n: int
 	if l.os.stash_n > l.os.stash_pos {
@@ -685,6 +696,10 @@ _sock_register :: proc(l: ^Loop, fd: Fd, events: Events, h: u64, op: u8) -> Erro
 		reg.op = SOCK_NOTIFY_OP_DISABLE
 	}
 	code := l.os.psn(l.os.port, 1, &reg, 0, 0, nil, nil)
+	if code == 0 && reg.result == WSAEINVAL && reg.op != SOCK_NOTIFY_OP_REMOVE && _sock_defer_removals(l) {
+		reg.result = 0
+		code = l.os.psn(l.os.port, 1, &reg, 0, 0, nil, nil)
+	}
 	if code != 0 {
 		return _werror(code)
 	}
@@ -695,6 +710,25 @@ _sock_register :: proc(l: ^Loop, fd: Fd, events: Events, h: u64, op: u8) -> Erro
 		_sock_initial(l, fd, events, h)
 	}
 	return .None
+}
+
+@(private)
+_sock_defer_removals :: proc(l: ^Loop) -> bool {
+	buf: [MAX_EVENTS]win.OVERLAPPED_ENTRY
+	moved := false
+	for {
+		got: u32
+		if !win.GetQueuedCompletionStatusEx(l.os.port, &buf[0], MAX_EVENTS, &got, 0, false) || got == 0 {
+			return moved
+		}
+		if _, err := append(&l.os.deferred, ..buf[:got]); err != nil {
+			return moved
+		}
+		moved = true
+		if got < MAX_EVENTS {
+			return true
+		}
+	}
 }
 
 @(private)
@@ -1039,7 +1073,7 @@ _os_fd :: proc "contextless" (l: ^Loop) -> Fd {
 
 @(private)
 _os_has_ready :: proc(l: ^Loop) -> bool {
-	if len(l.os.ready) > 0 || l.os.stash_n > l.os.stash_pos {
+	if len(l.os.ready) > 0 || len(l.os.deferred) > 0 || l.os.stash_n > l.os.stash_pos {
 		return true
 	}
 	got: u32

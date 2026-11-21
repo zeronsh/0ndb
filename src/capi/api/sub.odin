@@ -87,7 +87,7 @@ encode_event :: proc(ev: ^eng.Event, json_form: bool, allocator := context.temp_
 	buf := make([dynamic]u8, allocator)
 	o: Out
 	out_init(&o, &buf, json_form)
-	o_enum(&o, "kind", u64(ev.kind), EVENT_NAMES[:])
+	o_enum(&o, "kind", event_code(ev.kind), EVENT_NAMES[:])
 	o_id(&o, "space", ev.space)
 	o_id(&o, "object", ev.object)
 	o_id(&o, "device", ev.device)

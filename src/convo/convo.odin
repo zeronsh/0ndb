@@ -128,6 +128,7 @@ Status :: enum u8 {
 	Failed              = 4,
 	Interrupted         = 5,
 	Waiting             = 6,
+	Reviving            = 7,
 }
 
 Receipt :: enum u8 {

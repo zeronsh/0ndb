@@ -2,7 +2,7 @@ package capi
 
 import "base:runtime"
 
-when ODIN_BUILD_MODE == .Static {
+when ODIN_BUILD_MODE == .Static || ODIN_BUILD_MODE == .Object {
 	@(private, link_section = ".CRT$XCU", require)
 	_static_ctor := _static_init
 }

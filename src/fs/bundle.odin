@@ -90,6 +90,20 @@ history_checkpoint_meta :: proc(h: ^History, allocator := context.allocator) -> 
 	return out[:], .None
 }
 
+history_bundle_create :: proc(vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams: Stream_Source, source: Bundle_Source, allocator := context.allocator, opts := History_Options{}) -> (h: ^History, err: Error) {
+	h = new(History, allocator)
+	if h == nil {
+		return nil, .No_Memory
+	}
+	if err = history_bundle_load(h, vfs, dir, id, self, db, streams, source, allocator, opts); err != .None {
+		free(h, allocator)
+		return nil, err
+	}
+	h.owned = true
+	h.refs = 1
+	return h, .None
+}
+
 history_bundle_load :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams: Stream_Source, source: Bundle_Source, allocator := context.allocator, opts := History_Options{}) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	from_prim(prim.mkdir_all(vfs, dir, 0o700)) or_return

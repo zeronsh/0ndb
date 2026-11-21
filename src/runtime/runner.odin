@@ -42,6 +42,9 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	if _revive_pending(r, o, v) {
 		return
 	}
+	if !runners_loaded(r, o, true) {
+		return
+	}
 	_lease_prune(r, o, v)
 	items, ierr := convo.intents(v, context.temp_allocator)
 	if ierr == .Missing {
@@ -182,7 +185,7 @@ _lease_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, m: ^convo.Message) -> 
 	if m.runner == r.self {
 		return 0, true
 	}
-	if !runner_present(r, o.space, m.runner) {
+	if runner_gone(r, o.space, m.runner) {
 		return 0, false
 	}
 	lease, stamp, ok := _claim_lease(v, m.claim)
@@ -1006,7 +1009,7 @@ _recover :: proc(r: ^Runtime, space: prim.Id) {
 		convo.writer_interrupt_open(w, now)
 		eng.touched(r.e, ent.object)
 		if _replicated(r, ent.object.space) && _follow_start(r, ent.object) {
-			append(&r.revives, Revive_Wait{object = ent.object, since = now})
+			append(&r.revives, Revive_Wait{object = ent.object})
 			continue
 		}
 		_revive_decide(r, ent)
@@ -1025,8 +1028,7 @@ _revive_pending :: proc(r: ^Runtime, o: Object, v: ^obj.View) -> bool {
 	if idx < 0 {
 		return false
 	}
-	pend := r.revives[idx]
-	if wall_ms(r) - pend.since < min(i64(r.cfg.lease_ms), REVIVE_SYNC_MS) && !_revive_ready(r, o, v) {
+	if !_revive_ready(r, o, v) {
 		_follow_start(r, o)
 		return true
 	}
@@ -1039,14 +1041,19 @@ _revive_pending :: proc(r: ^Runtime, o: Object, v: ^obj.View) -> bool {
 
 @(private)
 _revive_ready :: proc(r: ^Runtime, o: Object, v: ^obj.View) -> bool {
-	if info, err := eng.space_info(r.e, o.space); err == .None && len(info.relay) > 0 && !info.connected {
+	if !eng.space_caught_up(r.e, o.space) {
 		return false
 	}
-	for sw in r.spaces {
-		if sw.space == o.space && !sw.synced {
+	for w in r.waits {
+		if w.object == o {
 			return false
 		}
 	}
+	ready := _wait_ready(r, o)
+	if _, serr := eng.convo_status(r.e, o, ready); serr == .Pending {
+		return false
+	}
+	_wait_drop(r, ready)
 	c, found, err := eng.catalog_get(r.e, o, context.temp_allocator)
 	if err != .None || !found {
 		return false
@@ -1273,7 +1280,7 @@ _follow_stale :: proc(r: ^Runtime, o: Object, v: ^obj.View, c: ^eng.Catalog_Entr
 		}
 	}
 	author := _activity_author(r, o)
-	behind := remote && i64(c.activity) > _view_activity(v) && author != r.self && runner_present(r, o.space, author)
+	behind := remote && i64(c.activity) > _view_activity(v) && author != r.self && !runner_gone(r, o.space, author)
 	if idx < 0 {
 		if !behind || run_find(r, o) != nil {
 			return false
@@ -1358,7 +1365,6 @@ _activity_author :: proc(r: ^Runtime, o: Object) -> prim.Id {
 	return {}
 }
 
-REVIVE_SYNC_MS :: 30_000
 
 @(private)
 _replicated :: proc(r: ^Runtime, space: prim.Id) -> bool {

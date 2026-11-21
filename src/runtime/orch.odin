@@ -87,10 +87,9 @@ task_status :: proc(r: ^Runtime, o: Object) -> (s: Task_Status, summary: string,
 		return .Waiting, "", true
 	case .Failed:
 		return .Failed, _last_reply_text(r, o, 600), true
+	case .Reviving:
+		return .Running, "", true
 	case .Interrupted:
-		if st.revive {
-			return .Running, "", true
-		}
 		return .Failed, _last_reply_text(r, o, 600), true
 	case .Idle:
 	}

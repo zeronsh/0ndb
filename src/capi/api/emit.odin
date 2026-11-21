@@ -12,7 +12,7 @@ KIND_NAMES := [5]string{"", "conversation", "map", "text", "tree"}
 ROLE_NAMES := [5]string{"", "user", "assistant", "system", "tool"}
 BLOCK_NAMES := [12]string{"", "text", "reasoning", "tool_call", "tool_result", "image", "error", "notice", "permission", "permission_answer", "question", "file"}
 SEAL_NAMES := [5]string{"open", "done", "interrupted", "failed", "cancelled"}
-CONVO_STATUS_NAMES := [7]string{"idle", "running", "queued", "awaiting_permission", "failed", "interrupted", "waiting"}
+CONVO_STATUS_NAMES := [8]string{"idle", "running", "queued", "awaiting_permission", "failed", "interrupted", "waiting", "reviving"}
 OPEN_STATE_NAMES := [2]string{"running", "revive"}
 CONDITION_NAMES := [3]string{"", "any", "all"}
 MODE_NAMES := [2]string{"end_to_end", "transparent"}
@@ -20,7 +20,21 @@ UNIT_NAMES := [2]string{"lines", "bytes"}
 SORT_NAMES := [2]string{"relevance", "newest"}
 DIR_NAMES := [2]string{"older", "newer"}
 EVENT_PLACEMENT :: u64(10)
-EVENT_NAMES := [11]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement"}
+EVENT_NAMES := [14]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up"}
+
+event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
+	switch kind {
+	case .Connected, .Disconnected, .Durable, .Uploaded, .Quarantined, .Refused, .Fatal, .Space_Joined, .Object_Seen, .Failure:
+		return u64(kind)
+	case .Relay_Misbehaving:
+		return 11
+	case .Presence:
+		return 12
+	case .Caught_Up:
+		return 13
+	}
+	return u64(len(EVENT_NAMES))
+}
 DELTA_NAMES := [19]string{"message", "block", "chunk", "seal", "leaf", "intent", "run", "mount", "record", "status", "field", "element", "counter", "catalog", "text", "files", "redacted", "members", "quarantined"}
 INTENT_NAMES := [44]string {
 	25 = "queue",

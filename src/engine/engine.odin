@@ -122,6 +122,7 @@ Event_Kind :: enum u8 {
 	Failure,
 	Relay_Misbehaving,
 	Presence,
+	Caught_Up,
 }
 
 Event :: struct {
@@ -163,6 +164,8 @@ Config :: struct {
 	durability:      Durability,
 	verify_chains:   bool,
 	idle_pageout:    bool,
+	page_heap:       bool,
+	system_heap:     bool,
 	kernel_tls:      bool,
 	padding:         bool,
 	search:          bool,
@@ -266,6 +269,7 @@ Engine :: struct {
 	purged:       [dynamic]Rid,
 	redact_tick:  u64,
 	plug:         Plug_State,
+	pages:        Page_Heap,
 	content:      Content_State,
 	card_pubs:    [dynamic]Card_Pub,
 	stats:        Stats,
@@ -277,6 +281,10 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 		cfg       = cfg,
 		allocator = allocator,
 		lock_fd   = prim.INVALID_FD,
+	}
+	if (cfg.page_heap || PAGES_DEFAULT && !cfg.system_heap) && allocator.procedure == runtime.heap_allocator_proc {
+		_pages_init(&e.pages)
+		e.allocator = _pages_allocator(&e.pages)
 	}
 	if len(cfg.dir) == 0 {
 		return .Invalid
@@ -698,6 +706,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 		}
 	}
 	if !e.pack_more {
+		_pages_release(&e.pages)
 		_heap_release(e)
 		if e.cfg.idle_pageout {
 			_pageout(e)
@@ -813,4 +822,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.dir, e.allocator)
 	e.pack_root = ""
 	e.dir = ""
+	if e.pages.on {
+		_pages_destroy(&e.pages)
+	}
 }

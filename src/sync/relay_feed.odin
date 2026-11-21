@@ -448,6 +448,12 @@ _produce_feed :: proc(c: ^Conn) -> bool {
 	}
 	raw, ok := _feed_read(c, c.feed_off, _feed_end(sp))
 	if !ok {
+		if c.feed_told < c.feed_off {
+			from := c.feed_told
+			c.feed_told = c.feed_off
+			_announce(c, from, c.feed_off, nil)
+			return true
+		}
 		return false
 	}
 	if n := len(raw); n >= FEED_ENTRY {

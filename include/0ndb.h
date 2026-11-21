@@ -87,7 +87,7 @@
  *                 10 question, 11 file
  *   seal          0 open, 1 done, 2 interrupted, 3 failed, 4 cancelled
  *   convo_status  0 idle, 1 running, 2 queued, 3 awaiting_permission,
- *                 4 failed, 5 interrupted, 6 waiting
+ *                 4 failed, 5 interrupted, 6 waiting, 7 reviving (since 1.5)
  *   open_state    0 running, 1 revive
  *   condition     1 any, 2 all
  *   mode          0 end_to_end, 1 transparent
@@ -103,7 +103,8 @@
  *                 17 members, 18 quarantined
  *   event         0 connected, 1 disconnected, 2 durable, 3 uploaded,
  *                 4 quarantined, 5 refused, 6 fatal, 7 space_joined,
- *                 8 object_seen, 9 failure, 10 placement (since 1.4)
+ *                 8 object_seen, 9 failure, 10 placement (since 1.4),
+ *                 11 relay_misbehaving, 12 presence, 13 caught_up (since 1.5)
  *   placement     0 none, 1 assigned, 2 running, 3 waiting_runner
  *
  * Shared payload structures
@@ -205,7 +206,10 @@
  *                 tick: uvarint, length: ivarint, status: enum status,
  *                 detail: str, Placement (since 1.4; zero unless kind is
  *                 placement, delivered whenever a conversation's placement
- *                 changes when the runtime is enabled)
+ *                 changes when the runtime is enabled); presence carries
+ *                 device, tick 1 up or 0 down and length the relay's time;
+ *                 caught_up carries space and length the relay feed
+ *                 position the device has read up to
  *   Placement  := state: enum placement, msg: rid, runner: id, provider: str,
  *                 since_ms: ivarint (waiting_runner: no live runner for the
  *                 provider has claimed msg since since_ms)
@@ -247,7 +251,7 @@ extern "C" {
 #endif
 
 #define ONDB_ABI_MAJOR 1u
-#define ONDB_ABI_MINOR 4u
+#define ONDB_ABI_MINOR 5u
 #define ONDB_ABI_VERSION ((ONDB_ABI_MAJOR << 16) | ONDB_ABI_MINOR)
 
 typedef struct ondb ondb;

@@ -315,12 +315,16 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 		if _ckpt_waiting(h) {
 			return .Missing
 		}
-		if h.hist != nil && !h.hist_chain {
-			fs.history_close(h.hist)
-			free(h.hist, e.allocator)
-			h.hist = nil
-		}
 		h.own = true
+		if h.hist != nil && !h.hist_chain {
+			if h.own_tree == nil {
+				if t, terr := _own_tree_get(e, h.sp, h.id, h.kind, &h.scope, false); terr == .None {
+					h.own_tree = t
+				}
+			}
+			_ferr(fs.history_reconfigure(h.hist, _hist_options(h))) or_return
+			h.hist_chain = h.own_tree != nil
+		}
 		_hist_open(h) or_return
 	}
 	h.w_open = true
@@ -554,8 +558,7 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 		h.w_open = false
 	}
 	if h.hist != nil {
-		fs.history_close(h.hist)
-		free(h.hist, e.allocator)
+		fs.history_release(h.hist)
 		h.hist = nil
 	}
 	if h.table_open {
@@ -673,11 +676,28 @@ _handle_want :: proc(h: ^Handle) -> (fetched: bool) {
 }
 
 @(private)
+_replica_covers :: proc(rep: ^journal.Replica, n: i64) -> bool {
+	at: i64
+	for r in journal.replica_have(rep) {
+		if r.from > at {
+			return false
+		}
+		at = max(at, r.to)
+	}
+	return at >= n
+}
+
+@(private)
 _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tries := 0) -> Error {
 	fetched := _handle_want(h)
 	if !fetched && h.sp.repl_on {
 		for sg in h.segs {
 			if !sg.in_view {
+				fetched = true
+				break
+			}
+			n := osync.replicator_relay_length(&h.sp.repl, &h.scope, sg.device, h.name, 0)
+			if n < 0 || !_replica_covers(sg.rep, n) {
 				fetched = true
 				break
 			}

@@ -192,7 +192,6 @@ Space_Watch :: struct {
 	catalog:   eng.Sub_Id,
 	schedules: eng.Sub_Id,
 	runners:   eng.Sub_Id,
-	synced:    bool,
 }
 
 @(private)
@@ -210,7 +209,6 @@ Lease_Watch :: struct {
 @(private)
 Revive_Wait :: struct {
 	object: Object,
-	since:  i64,
 }
 
 @(private)
@@ -364,6 +362,13 @@ _on_engine_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		case .Presence:
 			_presence_changed(r, ev.space, ev.device, ev.tick != 0)
 		case .Connected:
+			_pending_scan(r, ev.space)
+		case .Caught_Up:
+			for w in r.revives {
+				if w.object.space == ev.space {
+					_queue_eval(r, w.object)
+				}
+			}
 			_pending_scan(r, ev.space)
 		}
 	}
@@ -657,16 +662,6 @@ parse_rid :: proc(s: string) -> (rid: Rid, ok: bool) {
 @(private)
 _on_catalog :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
 	r := (^Runtime)(data)
-	for &d in deltas {
-		if !d.local {
-			for &sw in r.spaces {
-				if sw.space == d.object.space {
-					sw.synced = true
-				}
-			}
-			break
-		}
-	}
 	seen := make([dynamic]Object, context.temp_allocator)
 	outer: for &d in deltas {
 		if d.kind != .Catalog || len(d.key) != 16 {
@@ -728,6 +723,21 @@ _wait_ready :: proc(r: ^Runtime, o: Object) -> eng.Ready {
 	w.object = o
 	append(&r.waits, w)
 	return eng.Ready{data = w, call = _on_ready}
+}
+
+@(private)
+_wait_drop :: proc(r: ^Runtime, ready: eng.Ready) {
+	if ready.call != _on_ready || ready.data == nil {
+		return
+	}
+	w := (^Eval_Wait)(ready.data)
+	for x, i in r.waits {
+		if x == w {
+			ordered_remove(&r.waits, i)
+			free(w, r.allocator)
+			return
+		}
+	}
 }
 
 @(private)
