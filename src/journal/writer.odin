@@ -417,8 +417,11 @@ _recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 		defer reader_close(&r)
 		for {
 			_, nxt, err := record_at(&r, end)
-			if err != .None && err != .Redacted {
+			if err == .Eof || err == .Corrupt || err == .Bad_Offset {
 				break
+			}
+			if err != .None && err != .Redacted {
+				return err
 			}
 			end = nxt
 		}
@@ -462,7 +465,7 @@ _recover_chain :: proc(j: ^Journal) -> Error {
 			continue
 		}
 		if err != .None {
-			return .Corrupt
+			return _structural(err)
 		}
 		if is_sig(body) {
 			info, _, perr := parse_sig(body, off, &links)
@@ -479,7 +482,7 @@ _recover_chain :: proc(j: ^Journal) -> Error {
 	for pos < j.durable {
 		body, nxt, err := record_at(&r, pos)
 		if err != .None {
-			return .Corrupt
+			return _structural(err)
 		}
 		if lerr := _link(j, body, pos); lerr != .None {
 			return lerr
@@ -487,6 +490,15 @@ _recover_chain :: proc(j: ^Journal) -> Error {
 		pos = nxt
 	}
 	return .None
+}
+
+@(private)
+_structural :: proc "contextless" (err: Error) -> Error {
+	#partial switch err {
+	case .Eof, .Bad_Offset, .Redacted:
+		return .Corrupt
+	}
+	return err
 }
 
 @(private)

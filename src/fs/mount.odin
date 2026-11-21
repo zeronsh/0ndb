@@ -291,6 +291,7 @@ Mount :: struct {
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
 	log_len:     i64,
+	log_gen:     u64,
 	saved:       u64,
 	lost:        bool,
 	retained:    bool,
@@ -839,7 +840,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 			break
 		}
 		body := data[pos + 8:][:n]
-		if u32(xxhash.XXH3_64_default(body)) != prim.get_u32le(data[pos + 4:]) {
+		if u32(xxhash.XXH3_64_with_seed(body, m.log_gen)) != prim.get_u32le(data[pos + 4:]) {
 			break
 		}
 		rd := prim.reader(body)
@@ -875,7 +876,7 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	}
 	rec := make([]u8, 8 + len(body), context.temp_allocator)
 	prim.put_u32le(rec[0:4], u32(len(body)))
-	prim.put_u32le(rec[4:8], u32(xxhash.XXH3_64_default(body[:])))
+	prim.put_u32le(rec[4:8], u32(xxhash.XXH3_64_with_seed(body[:], m.log_gen)))
 	copy(rec[8:], body[:])
 	first := m.log_len == 0
 	from_prim(prim.write_at(m.vfs, m.log_fd, rec, m.log_len)) or_return
@@ -891,9 +892,8 @@ attrib_log_reset :: proc(m: ^Mount) {
 	if m.log_fd < 0 || m.log_len == 0 {
 		return
 	}
-	if prim.truncate(m.vfs, m.log_fd, 0) == .None {
-		m.log_len = 0
-	}
+	_ = prim.truncate(m.vfs, m.log_fd, 0)
+	m.log_len = 0
 }
 
 mount_closed :: proc(m: ^Mount, rel: string) {
@@ -1277,6 +1277,9 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	} else {
 		mount_new_nonce(m)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		m.log_gen = prim.read_uvarint(&rd)
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1498,6 +1501,8 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_bool(&w, m.lost)
 	prim.write_id(&w, m.nonce)
 	prim.write_ivarint(&w, m.jpos)
+	gen := m.log_gen + 1 if m.log_len > 0 else m.log_gen
+	prim.write_uvarint(&w, gen)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		attrib_log_reset(m)
@@ -1507,6 +1512,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	m.saved = 0
 	from_prim(prim.replace_atomic(m.vfs, p, buf[:])) or_return
 	m.saved = sum
+	m.log_gen = gen
 	attrib_log_reset(m)
 	return .None
 }

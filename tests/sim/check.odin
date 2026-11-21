@@ -1105,6 +1105,25 @@ _side_has :: proc(spans: []crdt.Op_Span, op: ^M_Op) -> bool {
 	return false
 }
 
+@(private = "file")
+_survived :: proc(m: ^Model, op: ^M_Op) -> bool {
+	if op_happened(op) {
+		return true
+	}
+	if op.status != .Uncertain {
+		return false
+	}
+	for d in m.ops {
+		if d == op || d.obj != op.obj || !op_maybe(d) || !_has_any(d.deletes[:], op.tokens[:]) {
+			continue
+		}
+		if d.node != op.node || d.inc != op.inc || op_happened(d) {
+			return true
+		}
+	}
+	return false
+}
+
 check_conflicts :: proc(w: ^World, oi: int) {
 	m := &w.model
 	ob := &m.objs[oi]
@@ -1127,7 +1146,7 @@ check_conflicts :: proc(w: ^World, oi: int) {
 			continue
 		}
 		for p in pairs {
-			if !_has_any(p.a.deletes[:], p.b.deletes[:]) {
+			if !_has_any(p.a.deletes[:], p.b.deletes[:]) || !_survived(m, p.a) || !_survived(m, p.b) {
 				continue
 			}
 			found := false
