@@ -340,7 +340,7 @@ Merge :: struct {
 	alloc:     runtime.Allocator,
 }
 
-merge_pick :: proc(ix: ^Index) -> (from, to: int, ok: bool) {
+merge_pick :: proc(ix: ^Index, idle: bool) -> (from, to: int, ok: bool) {
 	n := len(ix.segs)
 	f := ix.opts.merge_factor
 	if n < 1 {
@@ -386,6 +386,20 @@ merge_pick :: proc(ix: ^Index) -> (from, to: int, ok: bool) {
 			}
 		}
 		return best, best + f, true
+	}
+	if idle {
+		first, last := -1, -1
+		for s, i in ix.segs {
+			if s.f.vec_n > 0 {
+				if first < 0 {
+					first = i
+				}
+				last = i
+			}
+		}
+		if first >= 0 && last > first && last - first < 64 {
+			return first, last + 1, true
+		}
 	}
 	return
 }
@@ -520,15 +534,23 @@ merge_abort :: proc(ix: ^Index) {
 }
 
 merge_step :: proc(ix: ^Index, budget: i64) -> (more: bool, err: Error) {
+	return _merge_step(ix, budget, true)
+}
+
+@(private)
+_merge_step :: proc(ix: ^Index, budget: i64, idle: bool) -> (more: bool, err: Error) {
 	if ix.broken {
 		return false, .Corrupt
+	}
+	if idle && ix.merge == nil {
+		_ = vec_maybe_train(ix) or_return
 	}
 	if ix.vtrain != nil {
 		_ = vtrain_step(ix, budget) or_return
 		return true, .None
 	}
 	if ix.merge == nil {
-		from, to, ok := merge_pick(ix)
+		from, to, ok := merge_pick(ix, idle)
 		if !ok {
 			return false, .None
 		}
@@ -553,7 +575,7 @@ merge_step :: proc(ix: ^Index, budget: i64) -> (more: bool, err: Error) {
 			runtime.arena_destroy(&m.arena)
 			free(m, ix.allocator)
 			ix.merge = nil
-			_, _, again := merge_pick(ix)
+			_, _, again := merge_pick(ix, idle)
 			return again, .None
 		}
 	}
@@ -1233,7 +1255,7 @@ purge_step :: proc(ix: ^Index, budget: i64) -> (more: bool, err: Error) {
 			return false, e
 		}
 	}
-	_ = merge_step(ix, budget) or_return
+	_ = _merge_step(ix, budget, false) or_return
 	if ix.merge != nil {
 		return true, .None
 	}
@@ -1351,6 +1373,6 @@ compact_step :: proc(ix: ^Index, budget: i64) -> (more: bool, err: Error) {
 			return false, e
 		}
 	}
-	_ = merge_step(ix, budget) or_return
+	_ = _merge_step(ix, budget, false) or_return
 	return ix.merge != nil || ix.vtrain != nil || len(ix.segs) > 1, .None
 }

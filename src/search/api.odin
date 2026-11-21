@@ -83,6 +83,24 @@ delete_object :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id) ->
 	return _maybe_flush(ix)
 }
 
+delete_content :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id) -> Error {
+	m := &ix.mem
+	if oi, ok := m.id_map[object]; ok {
+		for d, i in m.docs {
+			if d.object == oi && d.flags & DF_TITLE == 0 {
+				mem_kill(m, u32(m.base) + u32(i))
+			}
+		}
+	}
+	key: [17]u8
+	key[0] = NS_OBJECT
+	o := object
+	copy(key[1:], o[:])
+	_kill_term(ix, key[:], nil, true) or_return
+	m.sources[source] = pos
+	return _maybe_flush(ix)
+}
+
 delete_record :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, ref: []u8) -> Error {
 	m := &ix.mem
 	if oi, ok := m.id_map[object]; ok {
@@ -103,7 +121,17 @@ delete_record :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, re
 
 redact :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, ref: []u8) -> Error {
 	delete_record(ix, source, pos, object, ref) or_return
-	return flush(ix)
+	return erase(ix)
+}
+
+erase :: proc(ix: ^Index) -> Error {
+	flush(ix) or_return
+	for {
+		more := purge_step(ix, max(i64)) or_return
+		if !more {
+			return .None
+		}
+	}
 }
 
 @(private)
@@ -173,7 +201,7 @@ flush :: proc(ix: ^Index) -> Error {
 	vec_maybe_train(ix) or_return
 	if len(ix.segs) > before {
 		size := ix.segs[len(ix.segs) - 1].size
-		_, err := merge_step(ix, size * i64(ix.opts.pace))
+		_, err := _merge_step(ix, size * i64(ix.opts.pace), false)
 		return err
 	}
 	return .None
@@ -188,7 +216,7 @@ _maybe_flush :: proc(ix: ^Index) -> Error {
 }
 
 @(private)
-_kill_term :: proc(ix: ^Index, key: []u8, ref: []u8) -> Error {
+_kill_term :: proc(ix: ^Index, key: []u8, ref: []u8, keep_titles := false) -> Error {
 	blk: Doc_Block
 	db_init(&blk, context.temp_allocator)
 	for &s in ix.segs {
@@ -208,9 +236,10 @@ _kill_term :: proc(ix: ^Index, key: []u8, ref: []u8) -> Error {
 				break
 			}
 			kill := true
-			if ref != nil {
+			if ref != nil || keep_titles {
 				doc_load(&ix.cache, &s, &blk, u64(v) / DOC_BLOCK) or_return
-				kill = string(blk.docs[v - blk.first].ref) == string(ref)
+				dm := blk.docs[v - blk.first]
+				kill = (ref == nil || string(dm.ref) == string(ref)) && (!keep_titles || dm.flags & DF_TITLE == 0)
 			}
 			if kill {
 				mem_kill(&ix.mem, v)
@@ -330,8 +359,7 @@ Wrote_Hit :: struct {
 }
 
 wrote :: proc(ix: ^Index, file: []u8, unit: Unit, lo, hi: u64, allocator := context.allocator) -> (hits: []Wrote_Hit, err: Error) {
-	val: []u8
-	found := false
+	val, found := ix.mem.files[string(file)]
 	for i := len(ix.segs) - 1; i >= 0 && !found; i -= 1 {
 		val, found = kv_get(&ix.segs[i], .Files, file, context.temp_allocator) or_return
 	}
@@ -367,8 +395,15 @@ wrote :: proc(ix: ^Index, file: []u8, unit: Unit, lo, hi: u64, allocator := cont
 	}
 	for &h in out {
 		sid := h.scope
-		for i := len(ix.segs) - 1; i >= 0; i -= 1 {
-			v, ok := kv_get(&ix.segs[i], .Scopes, sid[:], context.temp_allocator) or_return
+		mv, mok := ix.mem.scopes[sid]
+		for i := len(ix.segs); i >= 0; i -= 1 {
+			v: []u8
+			ok: bool
+			if i == len(ix.segs) {
+				v, ok = mv, mok
+			} else {
+				v, ok = kv_get(&ix.segs[i], .Scopes, sid[:], context.temp_allocator) or_return
+			}
 			if !ok {
 				continue
 			}

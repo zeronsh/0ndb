@@ -11,7 +11,7 @@ DEGREE :: 64
 DEG_CAP :: 80
 INIT_DEGREE :: 24
 L_BUILD :: 96
-BUILD_RAM :: 64 * 1024 * 1024
+BUILD_RAM :: 48 * 1024 * 1024
 BUILD_THREADS :: 8
 STEP_NODES :: 4096
 NLOCKS :: 4096
@@ -28,6 +28,11 @@ Gb_Phase :: enum u8 {
 	Build,
 	Spill,
 	Final,
+	ICodes,
+	IWrite,
+	Insert,
+	Patch,
+	Indeg,
 	Repair,
 	Codes,
 	Done,
@@ -49,6 +54,8 @@ Shard :: struct {
 Job :: enum u8 {
 	Encode,
 	Build,
+	Insert,
+	Patch,
 }
 
 Worker :: struct {
@@ -66,6 +73,13 @@ Worker :: struct {
 	c2:     [dynamic]u32,
 	s2:     [dynamic]f32,
 	vec:    []f32,
+	rec:    []u8,
+	rec2:   []u8,
+	lut:    []f32,
+	evec:   [dynamic]f32,
+	rv:     [dynamic]f32,
+	delta:  [dynamic]u64,
+	err:    Error,
 }
 
 Graph_Build :: struct {
@@ -78,7 +92,6 @@ Graph_Build :: struct {
 	rec:      int,
 	k:        int,
 	cap_s:    int,
-	src:      []u64,
 	codes:    []u8,
 	parts:    []f32,
 	assign:   [][2]u16,
@@ -106,6 +119,16 @@ Graph_Build :: struct {
 	nthreads: int,
 	workers:  []Worker,
 	alloc:    runtime.Allocator,
+	merge:    ^Merge,
+	insert:   bool,
+	base:     int,
+	bstart:   int,
+	blive:    int,
+	nnew:     int,
+	perm:     u64,
+	ins:      int,
+	need:     []bool,
+	dl:       [dynamic]u64,
 }
 
 @(private)
@@ -116,10 +139,13 @@ _vm_out :: proc "contextless" (m: ^Merge, i: int, p: u32) -> (o: u32, dead: bool
 
 @(private)
 _gb_read_vec :: proc(m: ^Merge, o: int, out: []f32) -> Error {
-	src := m.gb.src[o]
-	s := &m.segs[int(src >> 32)]
+	si, p, ok := _gb_src(m, o)
+	if !ok {
+		return .Corrupt
+	}
+	s := &m.segs[si]
 	bytes := slice.to_bytes(out)
-	got, e := prim.read_at(s.vfs, s.fd, bytes, rec_vec_off(s, src & 0xffff_ffff))
+	got, e := prim.read_at(s.vfs, s.fd, bytes, rec_vec_off(s, u64(p)))
 	if e != .None {
 		return _perr(e)
 	}
@@ -150,21 +176,12 @@ vmerge_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 		gb.phase = .Done
 		return .None
 	}
-	gb.src = make([]u64, gb.n, a)
-	o := 0
+	gb.merge = m
+	total := 0
 	for s, i in m.segs {
-		for p in 0 ..< int(s.f.vec_n) {
-			_, dead := _vm_out(m, i, u32(p))
-			if !dead {
-				if o >= gb.n {
-					return .Corrupt
-				}
-				gb.src[o] = u64(i) << 32 | u64(p)
-				o += 1
-			}
-		}
+		total += int(s.f.vec_n) - len(m.vdead[i])
 	}
-	if o != gb.n {
+	if total != gb.n {
 		return .Corrupt
 	}
 	if ix.man.cb_gen == 0 || gb.n < GRAPH_MIN {
@@ -181,6 +198,24 @@ vmerge_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 	gb.m = gb.cb.m
 	gb.rec = rec_size(gb.dim, gb.m)
 	gb.codes = make([]u8, gb.n * gb.m, a)
+	if gb.codes == nil {
+		return .No_Memory
+	}
+	gb.nthreads = BUILD_THREADS
+	gb.workers = make([]Worker, gb.nthreads, a)
+	for &w in gb.workers {
+		_worker_init(gb, &w, ix.allocator) or_return
+	}
+	base, blive := -1, 0
+	for s, i in m.segs {
+		live := int(s.f.vec_n) - len(m.vdead[i])
+		if s.f.vec_m == u64(gb.m) && s.f.vrec == i64(gb.rec) && live >= GRAPH_MIN && live > blive {
+			base, blive = i, live
+		}
+	}
+	if base >= 0 {
+		return _gb_insert_init(ix, m, base)
+	}
 	gb.assign = make([][2]u16, gb.n, a)
 	gb.recidx = make([][2]u32, gb.n, a)
 	if gb.codes == nil || gb.assign == nil || gb.recidx == nil {
@@ -192,11 +227,6 @@ vmerge_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 	per := gb.dim + 4 + DEG_CAP * 4 + 1 + 4
 	gb.cap_s = max(GRAPH_MIN, BUILD_RAM / per)
 	gb.k = gb.n <= gb.cap_s ? 1 : min(MAX_PARTS, (2 * gb.n + gb.cap_s - 1) / gb.cap_s + 1)
-	gb.nthreads = BUILD_THREADS
-	gb.workers = make([]Worker, gb.nthreads, a)
-	for &w in gb.workers {
-		_worker_init(gb, &w, ix.allocator) or_return
-	}
 	if gb.k > 1 {
 		_gb_partition(m) or_return
 	}
@@ -255,6 +285,12 @@ _worker_init :: proc(gb: ^Graph_Build, w: ^Worker, backing: runtime.Allocator) -
 	w.c2 = make([dynamic]u32, 0, 4096, a)
 	w.s2 = make([dynamic]f32, 0, 4096, a)
 	w.vec = make([]f32, gb.dim, a)
+	w.rec = make([]u8, gb.rec, a)
+	w.rec2 = make([]u8, gb.rec, a)
+	w.lut = make([]f32, gb.m * KSUB, a)
+	w.evec = make([dynamic]f32, 0, (L_INS + DEGREE) * gb.dim, a)
+	w.rv = make([dynamic]f32, 0, 2 * DEGREE * gb.dim, a)
+	w.delta = make([dynamic]u64, 0, INS_BATCH * INS_DEG / BUILD_THREADS, a)
 	return .None
 }
 
@@ -351,9 +387,15 @@ _worker_run :: proc(w: ^Worker) {
 	case .Encode:
 		d := gb.dim
 		for i in w.from ..< w.to {
+			if gb.need != nil && !gb.need[i] {
+				continue
+			}
 			o := gb.chunk_lo + i
 			v := gb.chunk[i * d:][:d]
 			cb_encode(gb.cb, v, gb.codes[o * gb.m:][:gb.m])
+			if gb.assign == nil {
+				continue
+			}
 			if gb.k > 1 {
 				b0, b1 := 0, -1
 				s0, s1 := max(f32), max(f32)
@@ -375,6 +417,10 @@ _worker_run :: proc(w: ^Worker) {
 		for i in w.from ..< w.to {
 			_sh_update(w, u32(gb.cursor + i))
 		}
+	case .Insert:
+		_ins_job(w)
+	case .Patch:
+		_patch_job(w)
 	}
 }
 
@@ -594,6 +640,16 @@ vmerge_step :: proc(ix: ^Index, m: ^Merge) -> (done: bool, err: Error) {
 		return false, .None
 	case .Final:
 		return false, _gb_final(ix, m)
+	case .ICodes:
+		return false, _gb_icodes(m)
+	case .IWrite:
+		return false, _gb_iwrite(ix, m)
+	case .Insert:
+		return false, _gb_insert_step(m)
+	case .Patch:
+		return false, _gb_patch_step(m)
+	case .Indeg:
+		return false, _gb_indeg(m)
 	case .Repair:
 		return false, _gb_repair(ix, m)
 	case .Codes:
@@ -852,16 +908,23 @@ _gb_final :: proc(ix: ^Index, m: ^Merge) -> Error {
 		m.sw.f.cb_gen = gb.cb.gen
 		m.sw.f.medoid = u64(gb.medoid)
 		out_flush(&m.sw.out)
-		gb.reach = make([]u64, (gb.n + 63) / 64, gb.alloc)
-		gb.queue = make([dynamic]u32, 0, gb.n, gb.alloc)
-		gb.reach[gb.medoid >> 6] |= u64(1) << (gb.medoid & 63)
-		append(&gb.queue, gb.medoid)
-		gb.fallback = gb.medoid
-		gb.phase = .Repair
+		_gb_repair_init(m)
 	} else {
 		gb.phase = .Codes
 	}
 	return m.sw.out.err
+}
+
+@(private)
+_gb_repair_init :: proc(m: ^Merge) {
+	gb := m.gb
+	gb.cursor = 0
+	gb.reach = make([]u64, (gb.n + 63) / 64, gb.alloc)
+	gb.queue = make([dynamic]u32, 0, 1024, gb.alloc)
+	gb.reach[gb.medoid >> 6] |= u64(1) << (gb.medoid & 63)
+	append(&gb.queue, gb.medoid)
+	gb.fallback = gb.medoid
+	gb.phase = .Repair
 }
 
 @(private)
