@@ -519,35 +519,57 @@ files_at :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (out
 @(private)
 _files_walk :: proc(v: ^obj.View, x: Vref, names: []string, allocator: runtime.Allocator) -> (out: []File_Delta, err: Error) {
 	list := make([dynamic]File_Delta, allocator)
-	take :: proc(list: ^[dynamic]File_Delta, names: []string, files: []File_Delta, allocator: runtime.Allocator) -> Error {
+	Walk_Ctx :: struct {
+		list:      ^[dynamic]File_Delta,
+		wanted:    map[string]bool,
+		seen:      map[string]bool,
+		all:       bool,
+		allocator: runtime.Allocator,
+	}
+	c := Walk_Ctx{
+		list      = &list,
+		wanted    = make(map[string]bool, v.scratch),
+		seen      = make(map[string]bool, v.scratch),
+		all       = names == nil,
+		allocator = allocator,
+	}
+	for nm in names {
+		c.wanted[nm] = true
+	}
+	take :: proc(c: ^Walk_Ctx, files: []File_Delta) -> Error {
 		for f in files {
-			wanted := names == nil
-			for nm in names {
-				wanted ||= nm == f.mount
-			}
-			for o in list {
-				wanted &&= o.mount != f.mount
-			}
-			if !wanted {
+			if (!c.all && f.mount not_in c.wanted) || f.mount in c.seen {
 				continue
 			}
-			c := f
-			c.mount = obj.clone_str(f.mount, allocator) or_return
-			c.version = obj.clone_bytes(f.version, allocator) or_return
-			append(list, c)
+			cl := f
+			cl.mount = obj.clone_str(f.mount, c.allocator) or_return
+			cl.version = obj.clone_bytes(f.version, c.allocator) or_return
+			c.seen[cl.mount] = true
+			append(c.list, cl)
 		}
 		return .None
 	}
 	cur := x
 	for !obj.vref_none(cur) {
-		if names != nil && len(list) == len(names) {
+		if !c.all && len(list) == len(c.wanted) {
 			break
 		}
 		body, _ := obj.get(v, cur.seg, cur.off) or_return
 		m := _decode_msg(body, cur.off) or_return
-		take(&list, names, m.files, allocator) or_return
+		take(&c, m.files) or_return
 		if len(m.files) > 0 && m.files_run == 0 {
-			take(&list, names, m.files_base, allocator) or_return
+			take(&c, m.files_base) or_return
+			more := m.files_more
+			for more != 0 && (c.all || len(list) < len(c.wanted)) {
+				fb, _ := obj.get(v, cur.seg, more) or_return
+				fr := decode_record(fb, more, v.scratch) or_return
+				chunk, ok := fr.body.(Files)
+				if !ok || (chunk.next != 0 && chunk.next >= more) {
+					return nil, .Corrupt
+				}
+				take(&c, chunk.files) or_return
+				more = chunk.next
+			}
 			break
 		}
 		cur = obj.resolve(v, cur.seg, m.files_prev) or_return
@@ -1312,6 +1334,22 @@ _spine_prefetch :: proc(v: ^obj.View, t: ^Tail, lo, hi: i64, floor: prim.Hlc) {
 		return
 	}
 	a := max(lo, 1)
+	for e in chains(&st) {
+		if e.branch <= 0 || e.leaf_depth < lo || e.child_depth > hi {
+			continue
+		}
+		b := st.branches[e.branch - 1]
+		if b.bseg < 0 {
+			continue
+		}
+		k0 := e.child_depth / SPINE_SPAN
+		for k := (max(a, e.child_depth + 1) - 1) / SPINE_SPAN; k <= (min(hi, b.covered) - 1) / SPINE_SPAN; k += 1 {
+			if k - k0 >= 0 && k - k0 < i64(len(b.blocks)) {
+				rec := b.blocks[k - k0]
+				obj.want(v, b.bseg, rec, min(rec + obj.MSG_GUESS, obj.end(v, b.bseg)))
+			}
+		}
+	}
 	for s in 0 ..< len(st.spines) {
 		sp, e := _spine_get(v, &st, s)
 		if e != .None || sp == nil || !sp.ready {

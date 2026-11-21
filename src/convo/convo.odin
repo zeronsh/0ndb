@@ -15,6 +15,9 @@ DIGEST_RATIO :: 16
 MAX_FILES :: 1024
 FILES_SNAPSHOT :: 8
 SPINE_SPAN :: 64
+DIGEST_BYTES :: 256 * 1024
+BRANCH_INLINE :: 64
+BRANCH_MAX :: 65536
 NODE_CACHE :: 16384
 
 Error :: obj.Error
@@ -52,6 +55,7 @@ Kind :: enum u8 {
 	Revived     = 40,
 	Recorded    = 41,
 	Spine       = 42,
+	Files       = 43,
 }
 
 Role :: enum u8 {
@@ -186,6 +190,9 @@ Summary :: struct {
 	digest:      i64,
 	digest_hlc:  prim.Hlc,
 	spine:       i64,
+	base:        i64,
+	base_len:    i64,
+	digest_len:  i64,
 	since:       u32,
 	digest_size: u32,
 	pending:     [MAX_PENDING]Pending_Entry,
@@ -254,6 +261,15 @@ encode_summary :: proc(off: i64, s: ^Summary, allocator := context.temp_allocato
 	if s.spine != 0 {
 		obj.tw_ref(&w, 25, off, Ref{0, s.spine})
 	}
+	if s.base != 0 && s.base != s.digest {
+		obj.tw_ref(&w, 26, off, Ref{0, s.base})
+	}
+	if s.base_len != 0 {
+		obj.tw_uv(&w, 27, u64(s.base_len))
+	}
+	if s.digest_len != 0 && s.digest_len != s.base_len {
+		obj.tw_uv(&w, 28, u64(s.digest_len))
+	}
 	for p in summary_pending(s) {
 		f: obj.Fixed
 		obj.fx_ref(&f, off, p.item)
@@ -301,15 +317,26 @@ decode_summary :: proc "contextless" (extra: []u8, off: i64, s: ^Summary) -> boo
 			if fr.err != .None {
 				return false
 			}
-		case 18, 19, 25:
+		case 18, 19, 25, 26:
 			v := obj.field_own(f, off, false) or_return
 			switch f.tag {
 			case 18:
 				s.last_seal = v
 			case 19:
 				s.digest = v
-			case:
+			case 25:
 				s.spine = v
+			case:
+				s.base = v
+			}
+		case 27, 28:
+			if f.ty != obj.F_UV || f.uv > u64(max(i64)) {
+				return false
+			}
+			if f.tag == 27 {
+				s.base_len = i64(f.uv)
+			} else {
+				s.digest_len = i64(f.uv)
 			}
 		case 22, 23:
 			if f.ty != obj.F_UV || f.uv > u64(max(u32)) {
@@ -353,6 +380,12 @@ decode_summary :: proc "contextless" (extra: []u8, off: i64, s: ^Summary) -> boo
 			s.open[s.open_len] = Open{m.off, last.off, u32(blocks), Open_State(st & 3), u8(st >> 2)}
 			s.open_len += 1
 		}
+	}
+	if s.base == 0 {
+		s.base = s.digest
+	}
+	if s.digest_len == 0 && s.base == s.digest {
+		s.digest_len = s.base_len
 	}
 	return r.err == .None
 }

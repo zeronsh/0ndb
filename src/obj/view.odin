@@ -393,7 +393,9 @@ Walk :: struct {
 	above:    i64,
 	floor:    prim.Hlc,
 	base:     i64,
+	base_len: i64,
 	base_hlc: prim.Hlc,
+	extra:    [2]i64,
 	started:  bool,
 	done:     bool,
 }
@@ -423,9 +425,10 @@ walk_resume :: proc(v: ^View, s: int, w: ^Walk, floor: prim.Hlc, data: rawptr, v
 		body, _, ge := get_before(v, s, e, w.above)
 		if ge == .Missing {
 			if w.base > 0 && floor <= w.base_hlc && w.base < w.above {
-				want(v, s, w.base, w.above)
+				want(v, s, w.base, min(w.above, max(e + MSG_GUESS, w.base + w.base_len)))
+				want(v, s, w.extra[0], w.extra[1])
 			} else {
-				want_chain(v, s, w.base, w.above)
+				want_chain(v, s, w.base, min(w.above, e + MSG_GUESS))
 			}
 			return .Missing
 		}

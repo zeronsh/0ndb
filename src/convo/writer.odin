@@ -768,7 +768,7 @@ writer_redact :: proc(w: ^Writer, msg: Rid) -> (ranges: []obj.Redaction, err: Er
 
 writer_digest :: proc(w: ^Writer) -> Error {
 	_flush(w) or_return
-	return _write_digest(w)
+	return _write_digest(w, true)
 }
 
 @(private)
@@ -817,6 +817,13 @@ _recover :: proc(w: ^Writer, path: string) -> Error {
 	sum, ok := _tail(v, w.core.seg) or_return
 	if ok {
 		w.sum = sum
+		if last := v.segs[w.core.seg].last; sum.digest != 0 && sum.digest == last {
+			_, next := obj.get(v, w.core.seg, last) or_return
+			w.sum.digest_len = next - last
+			if sum.base == last {
+				w.sum.base_len = w.sum.digest_len
+			}
+		}
 	}
 	obj.observe(&w.core, w.sum.tip_hlc)
 	obj.observe(&w.core, w.sum.leaf_hlc)
@@ -1001,7 +1008,7 @@ _prep_off :: proc(w: ^Writer, cross: bool) -> (off: i64, err: Error) {
 @(private)
 _cross :: proc "contextless" (k: Kind) -> bool {
 	#partial switch k {
-	case .Block, .Seal, .Interrupted, .Revived:
+	case .Block, .Seal, .Interrupted, .Revived, .Files:
 		return false
 	}
 	return true
@@ -1011,7 +1018,7 @@ _cross :: proc "contextless" (k: Kind) -> bool {
 _append :: proc(w: ^Writer, sum: ^Summary, body: Body) -> (off: i64, err: Error) {
 	k := body_kind(body)
 	#partial switch k {
-	case .Fork, .Remember, .Assign, .Claim, .Superseded, .Landed, .Mount, .Unmount:
+	case .Fork, .Remember, .Assign, .Superseded, .Landed, .Mount, .Unmount:
 		sum.since += 1
 	}
 	rec := obj.begin(&w.core, u8(k), _cross(k), is_event_kind(k)) or_return
@@ -1027,8 +1034,12 @@ _append :: proc(w: ^Writer, sum: ^Summary, body: Body) -> (off: i64, err: Error)
 	}
 	off = obj.finish(&w.core, &rec) or_return
 	w.sum = sum^
-	if k != .Forks && k != .Spine && int(w.sum.since) >= max(DIGEST_EVERY, int(w.sum.digest_size) / DIGEST_RATIO) {
-		_write_digest(w) or_return
+	if k != .Forks && k != .Spine {
+		if int(w.sum.since) >= max(DIGEST_EVERY, int(w.sum.digest_size) / DIGEST_RATIO) {
+			_write_digest(w, true) or_return
+		} else if is_event_kind(k) && journal.journal_len(&w.core.j) - w.sum.digest > DIGEST_BYTES {
+			_write_digest(w, w.sum.digest == 0) or_return
+		}
 	}
 	return off, .None
 }
@@ -1076,27 +1087,33 @@ _redact_record :: proc(w: ^Writer, from: Vref, to: i64, target: Vref) -> Error {
 }
 
 @(private)
-_write_digest :: proc(w: ^Writer) -> Error {
+_write_digest :: proc(w: ^Writer, full: bool) -> Error {
 	v := w.core.v
 	Ctx :: struct {
 		v:          ^obj.View,
+		full:       bool,
 		forks:      [dynamic]Remember,
 		index:      map[[3]Ref]int,
 		assigns:    [dynamic]Digest_Assign,
-		claims:     [dynamic]Digest_Claim,
 		mounts:     [dynamic]Digest_Mount,
 		superseded: [dynamic]Superseded,
 		landed:     [dynamic]Ref,
 		heads:      map[i64]Spine_Head,
 		prior:      Spine_Index,
+		base:       i64,
+		base_len:   i64,
+		base_hlc:   prim.Hlc,
+		need_base:  bool,
+		base_spine: Spine_Index,
+		delta:      bool,
 	}
 	ctx := Ctx{
 		heads      = make(map[i64]Spine_Head, v.scratch),
 		v          = v,
+		full       = full,
 		forks      = make([dynamic]Remember, v.scratch),
 		index      = make(map[[3]Ref]int, v.scratch),
 		assigns    = make([dynamic]Digest_Assign, v.scratch),
-		claims     = make([dynamic]Digest_Claim, v.scratch),
 		mounts     = make([dynamic]Digest_Mount, v.scratch),
 		superseded = make([dynamic]Superseded, v.scratch),
 		landed     = make([dynamic]Ref, v.scratch),
@@ -1105,18 +1122,32 @@ _write_digest :: proc(w: ^Writer) -> Error {
 		key := [3]Ref{d.parent, d.child, d.leaf}
 		if i, ok := c.index[key]; ok {
 			cur := &c.forks[i]
-			if cur.child_hlc == 0 {
-				cur.child_hlc = d.child_hlc
-			}
+			hlc := cur.child_hlc
 			if d.leaf_hlc > cur.leaf_hlc {
-				cur.leaf_hlc = d.leaf_hlc
-				cur.child_depth = d.child_depth
-				cur.leaf_depth = d.leaf_depth
+				cur^ = d
+			}
+			if cur.child_hlc == 0 {
+				cur.child_hlc = hlc if hlc != 0 else d.child_hlc
 			}
 			return
 		}
 		c.index[key] = len(c.forks)
 		append(&c.forks, d)
+	}
+	add_all :: proc(c: ^Ctx, r: Forks) -> Error {
+		for d in r.forks {
+			add(c, d)
+		}
+		append(&c.assigns, ..r.assigns)
+		for mt in r.mounts {
+			x := mt
+			x.name = obj.clone_str(mt.name, c.v.scratch) or_return
+			x.path = obj.clone_str(mt.path, c.v.scratch) or_return
+			append(&c.mounts, x)
+		}
+		append(&c.superseded, ..r.superseded)
+		append(&c.landed, ..r.landed)
+		return .None
 	}
 	visit :: proc(data: rawptr, s: int, off: i64, env: ^obj.Envelope) -> (stop: bool, err: Error) {
 		c := (^Ctx)(data)
@@ -1131,19 +1162,20 @@ _write_digest :: proc(w: ^Writer) -> Error {
 			c.prior = r.spine
 			c.prior.blocks = make([]i64, len(r.spine.blocks), c.v.scratch)
 			copy(c.prior.blocks, r.spine.blocks)
-			for d in r.forks {
-				add(c, d)
+			c.delta = r.base != 0
+			if r.base == 0 {
+				c.base = off
+				c.base_hlc = rec.stamp
+				if c.full {
+					add_all(c, r) or_return
+				}
+				return true, .None
 			}
-			append(&c.assigns, ..r.assigns)
-			append(&c.claims, ..r.claims)
-			for mt in r.mounts {
-				x := mt
-				x.name = obj.clone_str(mt.name, c.v.scratch) or_return
-				x.path = obj.clone_str(mt.path, c.v.scratch) or_return
-				append(&c.mounts, x)
-			}
-			append(&c.superseded, ..r.superseded)
-			append(&c.landed, ..r.landed)
+			add_all(c, r) or_return
+			c.base = r.base
+			c.base_len = r.base_len
+			c.base_hlc = r.base_hlc
+			c.need_base = c.full
 			return true, .None
 		case Fork:
 			add(c, Remember{parent = r.parent, child = r.child, child_hlc = r.child_hlc})
@@ -1151,8 +1183,6 @@ _write_digest :: proc(w: ^Writer) -> Error {
 			add(c, r)
 		case Assign:
 			append(&c.assigns, Digest_Assign{r.msg, r.runner, r.hlc})
-		case Claim:
-			append(&c.claims, Digest_Claim{r.msg, off, r.lease, rec.stamp, r.assign_hlc})
 		case Superseded:
 			append(&c.superseded, r)
 		case Landed:
@@ -1168,6 +1198,17 @@ _write_digest :: proc(w: ^Writer) -> Error {
 		return false, .None
 	}
 	obj.walk_events(v, w.core.seg, 0, &ctx, visit) or_return
+	if ctx.need_base {
+		body, _ := obj.get(v, w.core.seg, ctx.base) or_return
+		rec := decode_record(body, ctx.base, v.scratch) or_return
+		r, ok := rec.body.(Forks)
+		if !ok || r.base != 0 {
+			return .Corrupt
+		}
+		add_all(&ctx, r) or_return
+		ctx.base_spine = r.spine
+	}
+	is_full := full || ctx.base == 0
 	n := 0
 	for a, i in ctx.assigns {
 		keep := true
@@ -1198,18 +1239,50 @@ _write_digest :: proc(w: ^Writer) -> Error {
 		}
 	}
 	resize(&ctx.mounts, n)
-	sc, sb, complete := spine_resolve(ctx.heads, w.sum.spine, &ctx.prior, v.scratch)
+	sc, sb, low, complete := spine_resolve(ctx.heads, w.sum.spine, &ctx.prior, v.scratch)
 	spine := Spine_Index{}
 	if complete {
-		spine = Spine_Index{w.sum.spine, sc, sb}
+		first := low
+		if ctx.delta {
+			first = min(first, ctx.prior.first)
+		} else if ctx.prior.at == 0 && ctx.prior.c == 0 {
+			first = 0
+		}
+		if is_full {
+			for k in 0 ..< len(sb) {
+				if sb[k] == 0 && ctx.base_spine.first == 0 && k < len(ctx.base_spine.blocks) {
+					sb[k] = ctx.base_spine.blocks[k]
+				}
+			}
+			first = 0
+		}
+		ok := true
+		for x in sb[first:] {
+			ok &&= x != 0
+		}
+		if ok {
+			spine = Spine_Index{w.sum.spine, sc, first, sb[first:]}
+		}
 	}
-	digest := Forks{ctx.forks[:], ctx.assigns[:], ctx.claims[:], ctx.mounts[:], ctx.superseded[:], ctx.landed[:], spine}
+	digest := Forks{ctx.forks[:], ctx.assigns[:], ctx.mounts[:], ctx.superseded[:], ctx.landed[:], spine, 0, 0, 0}
 	off := _prep_off(w, false) or_return
 	sum := w.sum
 	sum.digest = off
-	sum.since = 0
-	sum.digest_size = u32(min(len(ctx.forks) + len(ctx.assigns) + len(ctx.claims) + len(ctx.mounts) + len(ctx.superseded) + len(ctx.landed), int(max(u32))))
+	if is_full {
+		sum.since = 0
+		sum.base = off
+		sum.digest_size = u32(min(len(ctx.forks) + len(ctx.assigns) + len(ctx.mounts) + len(ctx.superseded) + len(ctx.landed), int(max(u32))))
+	} else {
+		digest.base = ctx.base
+		digest.base_len = w.sum.base_len
+		digest.base_hlc = ctx.base_hlc
+	}
 	_append(w, &sum, digest) or_return
+	size := journal.journal_len(&w.core.j) - off
+	w.sum.digest_len = size
+	if is_full {
+		w.sum.base_len = size
+	}
 	return .None
 }
 
@@ -1339,8 +1412,63 @@ _keep :: proc(w: ^Writer, at: Pos) -> Error {
 	root := level_ancestor(v, at.at, 1) or_return
 	cr := obj.local(&w.core, root.ref) or_return
 	lr := obj.local(&w.core, at.at) or_return
-	_, err := _event(w, Remember{child = cr, child_hlc = root.hlc, leaf = lr, leaf_hlc = at.hlc, child_depth = 1, leaf_depth = n.depth})
+	rem := Remember{child = cr, child_hlc = root.hlc, leaf = lr, leaf_hlc = at.hlc, child_depth = 1, leaf_depth = n.depth}
+	_branch(w, at.at, &rem) or_return
+	_, err := _event(w, rem)
 	return err
+}
+
+@(private)
+_branch :: proc(w: ^Writer, leaf: Vref, r: ^Remember) -> Error {
+	v := w.core.v
+	n := r.leaf_depth - r.child_depth - 1
+	if n <= 0 {
+		return .None
+	}
+	start := r.child_depth + 1
+	if n > BRANCH_INLINE {
+		st: Structure
+		structure_load(v, nil, 0, &st) or_return
+		for s in 0 ..< len(st.spines) {
+			sp := _spine_get(v, &st, s) or_return
+			if sp == nil || !sp.ready || sp.target != leaf {
+				continue
+			}
+			k0 := r.child_depth / SPINE_SPAN
+			kc := min(sp.c, r.leaf_depth - 1) / SPINE_SPAN
+			if kc <= k0 {
+				break
+			}
+			blocks := sp.blocks[k0:kc]
+			ok := true
+			for b in blocks {
+				ok &&= b != 0
+			}
+			if !ok {
+				break
+			}
+			r.blocks = blocks
+			r.covered = kc * SPINE_SPAN
+			r.bseg = (obj.local(&w.core, Vref{s, blocks[0]}) or_return).seg
+			start = r.covered + 1
+			break
+		}
+		if len(r.blocks) == 0 && n > BRANCH_MAX {
+			return .None
+		}
+	}
+	count := r.leaf_depth - start
+	if count <= 0 {
+		return .None
+	}
+	nodes := make([]Ref, count, v.scratch)
+	cur := _node(v, leaf) or_return
+	for i := count - 1; i >= 0; i -= 1 {
+		cur = _node(v, cur.parent) or_return
+		nodes[i] = obj.local(&w.core, cur.ref) or_return
+	}
+	r.branch = spine_encode(nodes, v.scratch)
+	return .None
 }
 
 @(private)
@@ -1367,7 +1495,9 @@ _leave :: proc(w: ^Writer, from: Pos, to: Vref) -> Error {
 	pr := obj.local(&w.core, a) or_return
 	cr := obj.local(&w.core, c.ref) or_return
 	lr := obj.local(&w.core, x) or_return
-	_event(w, Remember{parent = pr, child = cr, child_hlc = c.hlc, leaf = lr, leaf_hlc = from.hlc, child_depth = adepth + 1, leaf_depth = nx.depth}) or_return
+	rem := Remember{parent = pr, child = cr, child_hlc = c.hlc, leaf = lr, leaf_hlc = from.hlc, child_depth = adepth + 1, leaf_depth = nx.depth}
+	_branch(w, x, &rem) or_return
+	_event(w, rem) or_return
 	if to == a || obj.vref_none(to) {
 		return .None
 	}
@@ -1412,6 +1542,7 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 	}
 	files_run: u32
 	files_base: []File_Delta
+	files_more: i64
 	if len(s.files) > 0 && !obj.vref_none(files_prev) {
 		fp := np if files_prev == p else (_node(v, files_prev) or_return)
 		files_run = fp.files_run + 1
@@ -1427,9 +1558,12 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 					append(&base, f)
 				}
 			}
-			if len(base) <= MAX_FILES {
-				files_run = 0
-				files_base = base[:]
+			files_run = 0
+			files_base = base[:]
+			for len(files_base) > MAX_FILES {
+				chunk := files_base[len(files_base) - MAX_FILES:]
+				files_base = files_base[:len(files_base) - MAX_FILES]
+				files_more = _append(w, &w.sum, Files{files = chunk, next = files_more}) or_return
 			}
 		}
 	}
@@ -1522,6 +1656,7 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 		files_prev  = fr,
 		files_run   = files_run,
 		files_base  = files_base,
+		files_more  = files_more,
 	}
 	got := _append(w, &sum, m) or_return
 	if got != off {

@@ -23,6 +23,12 @@ Msg :: struct {
 	files_prev:  Ref,
 	files_run:   u32,
 	files_base:  []File_Delta,
+	files_more:  i64,
+}
+
+Files :: struct {
+	files: []File_Delta,
+	next:  i64,
 }
 
 Block :: struct {
@@ -66,20 +72,16 @@ Remember :: struct {
 	leaf_hlc:    prim.Hlc,
 	child_depth: i64,
 	leaf_depth:  i64,
+	branch:      []u8,
+	blocks:      []i64,
+	covered:     i64,
+	bseg:        u32,
 }
 
 Digest_Assign :: struct {
 	msg:    Ref,
 	runner: prim.Id,
 	hlc:    prim.Hlc,
-}
-
-Digest_Claim :: struct {
-	msg:        Ref,
-	claim:      i64,
-	lease:      u64,
-	stamp:      prim.Hlc,
-	assign_hlc: prim.Hlc,
 }
 
 Digest_Mount :: struct {
@@ -94,16 +96,19 @@ Digest_Mount :: struct {
 Forks :: struct {
 	forks:      []Remember,
 	assigns:    []Digest_Assign,
-	claims:     []Digest_Claim,
 	mounts:     []Digest_Mount,
 	superseded: []Superseded,
 	landed:     []Ref,
 	spine:      Spine_Index,
+	base:       i64,
+	base_len:   i64,
+	base_hlc:   prim.Hlc,
 }
 
 Spine_Index :: struct {
 	at:     i64,
 	c:      i64,
+	first:  i64,
 	blocks: []i64,
 }
 
@@ -258,6 +263,7 @@ Body :: union {
 	Revived,
 	Recorded,
 	Spine,
+	Files,
 }
 
 Record :: struct {
@@ -323,6 +329,8 @@ body_kind :: proc "contextless" (b: Body) -> Kind {
 		return .Recorded
 	case Spine:
 		return .Spine
+	case Files:
+		return .Files
 	}
 	return Kind(0)
 }
@@ -445,6 +453,7 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		obj.tw_ref(w, 17, off, v.files_prev)
 		obj.tw_uv(w, 18, u64(v.files_run))
 		_put_files(w, 19, v.files_base)
+		obj.tw_ref(w, 20, off, Ref{0, v.files_more})
 	case Block:
 		obj.tw_ref(w, 1, off, Ref{0, v.msg})
 		obj.tw_ref(w, 2, off, Ref{0, v.prev})
@@ -490,16 +499,6 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 			obj.tw_u64(&bw, 3, u64(e.hlc))
 			_nested(w, 2, b[:])
 		}
-		for e in v.claims {
-			b := make([dynamic]u8, context.temp_allocator)
-			bw := prim.writer(&b)
-			obj.tw_ref(&bw, 1, off, e.msg)
-			obj.tw_ref(&bw, 2, off, Ref{0, e.claim})
-			obj.tw_uv(&bw, 3, e.lease)
-			obj.tw_u64(&bw, 4, u64(e.stamp))
-			obj.tw_u64(&bw, 5, u64(e.assign_hlc))
-			_nested(w, 3, b[:])
-		}
 		for e in v.mounts {
 			b := make([dynamic]u8, context.temp_allocator)
 			bw := prim.writer(&b)
@@ -526,6 +525,7 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 			bw := prim.writer(&b)
 			obj.tw_ref(&bw, 1, off, Ref{0, v.spine.at})
 			obj.tw_uv(&bw, 2, u64(v.spine.c))
+			obj.tw_uv(&bw, 4, u64(v.spine.first))
 			pb := make([dynamic]u8, context.temp_allocator)
 			pw := prim.writer(&pb)
 			last: i64
@@ -536,6 +536,14 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 			obj.tw_bytes(&bw, 3, pb[:])
 			_nested(w, 7, b[:])
 		}
+		if v.base != 0 {
+			obj.tw_ref(w, 8, off, Ref{0, v.base})
+			obj.tw_uv(w, 9, u64(v.base_len))
+			obj.tw_u64(w, 10, u64(v.base_hlc))
+		}
+	case Files:
+		_put_files(w, 1, v.files)
+		obj.tw_ref(w, 2, off, Ref{0, v.next})
 	case Spine:
 		obj.tw_ref(w, 1, off, v.target)
 		obj.tw_ref(w, 2, off, Ref{0, v.prev})
@@ -633,6 +641,39 @@ _put_remember :: proc(w: ^prim.Writer, off: i64, v: Remember) {
 	obj.tw_u64(w, 5, u64(v.leaf_hlc))
 	obj.tw_uv(w, 6, u64(v.child_depth))
 	obj.tw_uv(w, 7, u64(v.leaf_depth))
+	obj.tw_bytes(w, 8, v.branch)
+	if len(v.blocks) > 0 {
+		obj.tw_uv(w, 9, u64(v.covered))
+		obj.tw_bytes(w, 10, _pack_offsets(v.blocks))
+		obj.tw_uv(w, 11, u64(v.bseg))
+	}
+}
+
+@(private)
+_pack_offsets :: proc(list: []i64, allocator := context.temp_allocator) -> []u8 {
+	b := make([dynamic]u8, allocator)
+	w := prim.writer(&b)
+	last: i64
+	for x in list {
+		prim.write_uvarint(&w, _zigzag(x - last))
+		last = x
+	}
+	return b[:]
+}
+
+@(private)
+_unpack_offsets :: proc(b: []u8, limit: i64, allocator := context.temp_allocator) -> (list: []i64, ok: bool) {
+	out := make([dynamic]i64, allocator)
+	r := prim.reader(b)
+	last: i64
+	for prim.reader_remaining(&r) > 0 {
+		last += _unzigzag(prim.read_uvarint(&r))
+		if r.err != .None || last <= 0 || last >= limit {
+			return nil, false
+		}
+		append(&out, last)
+	}
+	return out[:], true
 }
 
 @(private)
@@ -653,8 +694,21 @@ _get_remember :: proc(d: ^obj.Dec) -> (v: Remember) {
 			v.child_depth = obj.dec_int(d)
 		case 7:
 			v.leaf_depth = obj.dec_int(d)
+		case 8:
+			v.branch = obj.dec_bytes(d)
+		case 9:
+			v.covered = obj.dec_int(d)
+		case 10:
+			list, ok := _unpack_offsets(obj.dec_bytes(d), max(i64))
+			d.bad ||= !ok
+			v.blocks = list
+		case 11:
+			x := obj.dec_uv(d)
+			d.bad ||= x > u64(obj.MAX_SEGS)
+			v.bseg = u32(min(x, u64(obj.MAX_SEGS)))
 		}
 	}
+	d.bad ||= v.covered % SPINE_SPAN != 0 || (len(v.blocks) > 0 && v.covered != (v.child_depth / SPINE_SPAN + i64(len(v.blocks))) * SPINE_SPAN)
 	return
 }
 
@@ -780,6 +834,8 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				} else {
 					append(&base, _get_file(&d, off))
 				}
+			case 20:
+				v.files_more = obj.dec_own(&d)
 			}
 		}
 		v.files = files[:]
@@ -882,15 +938,28 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		rec.body = v
 	case .Forks:
 		spine: Spine_Index
+		base, base_len: i64
+		base_hlc: prim.Hlc
 		forks := make([dynamic]Remember, allocator)
 		assigns := make([dynamic]Digest_Assign, allocator)
-		claims := make([dynamic]Digest_Claim, allocator)
 		mounts := make([dynamic]Digest_Mount, allocator)
 		sups := make([dynamic]Superseded, allocator)
 		landed := make([dynamic]Ref, allocator)
 		for obj.dec_next(&d) {
 			if d.f.tag == 6 {
 				append(&landed, obj.dec_ref(&d))
+				continue
+			}
+			if d.f.tag == 8 {
+				base = obj.dec_own(&d)
+				continue
+			}
+			if d.f.tag == 9 {
+				base_len = obj.dec_int(&d)
+				continue
+			}
+			if d.f.tag == 10 {
+				base_hlc = obj.dec_hlc(&d)
 				continue
 			}
 			if d.f.tag == 7 {
@@ -904,10 +973,12 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 						spine.c = obj.dec_int(&sub)
 					case 3:
 						packed = obj.dec_bytes(&sub)
+					case 4:
+						spine.first = obj.dec_int(&sub)
 					}
 				}
-				d.bad ||= !obj.dec_ok(&sub) || spine.c % SPINE_SPAN != 0
-				n := spine.c / SPINE_SPAN
+				d.bad ||= !obj.dec_ok(&sub) || spine.c % SPINE_SPAN != 0 || spine.first < 0 || spine.first > spine.c / SPINE_SPAN
+				n := spine.c / SPINE_SPAN - spine.first
 				if !d.bad {
 					blocks := make([]i64, n, allocator)
 					pr := prim.reader(packed)
@@ -942,24 +1013,6 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				}
 				d.bad ||= obj.ref_none(e.msg)
 				append(&assigns, e)
-			case 3:
-				e: Digest_Claim
-				for obj.dec_next(&sub) {
-					switch sub.f.tag {
-					case 1:
-						e.msg = obj.dec_ref(&sub)
-					case 2:
-						e.claim = obj.dec_own(&sub)
-					case 3:
-						e.lease = obj.dec_uv(&sub)
-					case 4:
-						e.stamp = obj.dec_hlc(&sub)
-					case 5:
-						e.assign_hlc = obj.dec_hlc(&sub)
-					}
-				}
-				d.bad ||= obj.ref_none(e.msg)
-				append(&claims, e)
 			case 4:
 				e: Digest_Mount
 				for obj.dec_next(&sub) {
@@ -993,7 +1046,8 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 			}
 			d.bad ||= !obj.dec_ok(&sub)
 		}
-		rec.body = Forks{forks[:], assigns[:], claims[:], mounts[:], sups[:], landed[:], spine}
+		d.bad ||= base_len < 0 || (base != 0 && base_len == 0)
+		rec.body = Forks{forks[:], assigns[:], mounts[:], sups[:], landed[:], spine, base, base_len, base_hlc}
 	case .Assign:
 		v: Assign
 		for obj.dec_next(&d) {
@@ -1253,6 +1307,23 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		}
 		d.bad ||= v.msg == 0
 		rec.body = v
+	case .Files:
+		v: Files
+		files := make([dynamic]File_Delta, allocator)
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				if len(files) >= MAX_FILES {
+					d.bad = true
+				} else {
+					append(&files, _get_file(&d, off))
+				}
+			case 2:
+				v.next = obj.dec_own(&d)
+			}
+		}
+		v.files = files[:]
+		rec.body = v
 	case .Spine:
 		v: Spine
 		for obj.dec_next(&d) {
@@ -1310,32 +1381,47 @@ spine_encode :: proc(nodes: []Ref, allocator := context.temp_allocator) -> []u8 
 	b := make([dynamic]u8, allocator)
 	w := prim.writer(&b)
 	last := make(map[u32]i64, allocator)
+	seg := max(u32)
 	for n in nodes {
-		prim.write_uvarint(&w, u64(n.seg))
-		prev := last[n.seg]
-		prim.write_uvarint(&w, u64(n.off - prev))
+		changed := n.seg != seg
+		d := u64(n.off - last[n.seg])
+		prim.write_uvarint(&w, d << 1 | (1 if changed else 0))
+		if changed {
+			prim.write_uvarint(&w, u64(n.seg))
+			seg = n.seg
+		}
 		last[n.seg] = n.off
 	}
 	return b[:]
 }
 
 spine_decode :: proc(b: []u8, count: int, allocator := context.temp_allocator) -> (nodes: []Ref, ok: bool) {
+	if count < 0 {
+		return nil, false
+	}
 	out := make([]Ref, count, allocator)
 	last := make(map[u32]i64, allocator)
 	r := prim.reader(b)
+	seg := max(u32)
 	for &n in out {
-		seg := prim.read_uvarint(&r)
-		d := prim.read_uvarint(&r)
-		if r.err != .None || seg > u64(obj.MAX_SEGS) || d == 0 || d > u64(max(i64)) {
+		x := prim.read_uvarint(&r)
+		if x & 1 != 0 {
+			sg := prim.read_uvarint(&r)
+			if sg > u64(obj.MAX_SEGS) {
+				return nil, false
+			}
+			seg = u32(sg)
+		}
+		d := x >> 1
+		if r.err != .None || seg == max(u32) || d == 0 || d > u64(max(i64)) {
 			return nil, false
 		}
-		n.seg = u32(seg)
-		prev := last[n.seg]
+		prev := last[seg]
 		if i64(d) > max(i64) - prev {
 			return nil, false
 		}
-		n.off = prev + i64(d)
-		last[n.seg] = n.off
+		n = Ref{seg, prev + i64(d)}
+		last[seg] = n.off
 	}
 	return out, prim.reader_done(&r)
 }
