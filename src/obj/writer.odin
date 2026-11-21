@@ -4,7 +4,13 @@ import "base:runtime"
 import "../journal"
 import "../prim"
 
+Clock :: struct {
+	data:    rawptr,
+	wall_ms: proc(data: rawptr) -> i64,
+}
+
 Writer :: struct {
+	source:    Clock,
 	vfs:       prim.Vfs,
 	j:         journal.Journal,
 	jr:        journal.Reader,
@@ -37,8 +43,9 @@ Redaction :: struct {
 	to:   i64,
 }
 
-writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator) -> Error {
+writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator, clock := Clock{}) -> Error {
 	_zero(w, vfs, allocator)
+	w.source = clock
 	if prim.id_is_zero(id) || prim.id_is_zero(object) {
 		return .Invalid
 	}
@@ -86,8 +93,9 @@ writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object:
 	return .None
 }
 
-writer_open :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, opts := journal.Options{}, allocator := context.allocator) -> (head: Head, err: Error) {
+writer_open :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, opts := journal.Options{}, allocator := context.allocator, clock := Clock{}) -> (head: Head, err: Error) {
 	_zero(w, vfs, allocator)
+	w.source = clock
 	if !prim.exists(vfs, path) {
 		return head, .Not_Found
 	}
@@ -132,14 +140,21 @@ writer_durable :: proc "contextless" (w: ^Writer) -> i64 {
 	return journal.journal_durable_len(&w.j)
 }
 
-observe :: proc "contextless" (w: ^Writer, h: prim.Hlc) {
+wall_ms :: proc(w: ^Writer) -> i64 {
+	if w.source.wall_ms != nil {
+		return w.source.wall_ms(w.source.data)
+	}
+	return prim.now_ms()
+}
+
+observe :: proc(w: ^Writer, h: prim.Hlc) {
 	if h > w.clock {
-		prim.hlc_observe(&w.clock, h)
+		prim.hlc_observe_at(&w.clock, h, wall_ms(w))
 	}
 }
 
-now :: proc "contextless" (w: ^Writer) -> prim.Hlc {
-	return prim.hlc_now(&w.clock)
+now :: proc(w: ^Writer) -> prim.Hlc {
+	return prim.hlc_tick(&w.clock, wall_ms(w))
 }
 
 local :: proc(w: ^Writer, r: Vref) -> (out: Ref, err: Error) {

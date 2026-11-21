@@ -427,6 +427,8 @@ _rebuild_source :: proc(rb: ^Rebuild, i: int, s: Source) -> Error {
 						key = v.key
 					case Del:
 						key = v.key
+					case Count:
+						key = v.key
 					}
 					if _, ae := append(&rb.items, Run_Item{key = key, src = i, off = pos, body = b}); ae != nil {
 						return .No_Memory
@@ -587,7 +589,7 @@ _merge_entries :: proc(rb: ^Rebuild, b: ^Builder) -> Error {
 			}
 		}
 		e.elements = e.elements[:n]
-		if len(e.registers) == 0 && len(e.elements) == 0 {
+		if len(e.registers) == 0 && len(e.elements) == 0 && len(e.counters) == 0 {
 			return .None
 		}
 		enc := vals[0]
@@ -869,6 +871,8 @@ _apply_record :: proc(t: ^Table, txn: ^Txn, seg: prim.Id, off: i64, body: []u8) 
 		key = v.key
 	case Del:
 		key = v.key
+	case Count:
+		key = v.key
 	}
 	root := ROOT_ENTRIES
 	old, found := txn_get(txn, ROOT_ENTRIES, key, context.temp_allocator) or_return
@@ -889,7 +893,7 @@ _apply_record :: proc(t: ^Table, txn: ^Txn, seg: prim.Id, off: i64, body: []u8) 
 	if !changed && !pruned {
 		return .None
 	}
-	gone := len(e.registers) == 0 && len(e.elements) == 0
+	gone := len(e.registers) == 0 && len(e.elements) == 0 && len(e.counters) == 0
 	empty := entry_empty(&e)
 	dest := -1 if gone else (ROOT_PENDING if empty else ROOT_ENTRIES)
 	if found && root != dest {

@@ -17,6 +17,7 @@ Kind :: enum u8 {
 	Put = 16,
 	Add = 17,
 	Del = 18,
+	Count = 19,
 }
 
 Field :: struct {
@@ -43,10 +44,24 @@ Del :: struct {
 	removed: []Rid,
 }
 
+Count :: struct {
+	key:   []u8,
+	tag:   u32,
+	delta: i64,
+}
+
 Body :: union {
 	Put,
 	Add,
 	Del,
+	Count,
+}
+
+Counter :: struct {
+	tag: u32,
+	by:  prim.Id,
+	p:   u64,
+	n:   u64,
 }
 
 Register :: struct {
@@ -67,6 +82,7 @@ Entry :: struct {
 	key:       []u8,
 	registers: []Register,
 	elements:  []Element,
+	counters:  []Counter,
 }
 
 encode_fields :: proc(w: ^prim.Writer, body: Body) {
@@ -97,6 +113,10 @@ encode_fields :: proc(w: ^prim.Writer, body: Body) {
 			obj.fx_uv(&f, u64(max(r.off, 0)))
 			obj.tw_fixed(w, 4, &f)
 		}
+	case Count:
+		obj.tw_bytes(w, 1, v.key)
+		obj.tw_uv(w, 2, u64(v.tag) + 1)
+		obj.tw_uv(w, 3, u64(v.delta << 1) ~ u64(v.delta >> 63))
 	}
 }
 
@@ -177,6 +197,29 @@ decode_body :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> 
 		} else {
 			body = Del{key, tag, elem, removed[:]}
 		}
+	case .Count:
+		v: Count
+		has := false
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				v.key = obj.dec_bytes(&d)
+			case 2:
+				t := obj.dec_uv(&d)
+				if t == 0 || t - 1 > u64(max(u32)) {
+					d.bad = true
+				}
+				v.tag = u32(t - 1)
+				has = true
+			case 3:
+				z := obj.dec_uv(&d)
+				v.delta = i64(z >> 1) ~ -i64(z & 1)
+			}
+		}
+		if len(v.key) == 0 || len(v.key) > MAX_KEY_LEN || !has {
+			d.bad = true
+		}
+		body = v
 	case:
 		return nil, .Unsupported
 	}
@@ -203,7 +246,7 @@ register_wins :: proc "contextless" (a_hlc: prim.Hlc, a_by: prim.Id, a_val: []u8
 }
 
 entry_empty :: proc "contextless" (e: ^Entry) -> bool {
-	if len(e.registers) > 0 {
+	if len(e.registers) > 0 || len(e.counters) > 0 {
 		return false
 	}
 	for el in e.elements {
@@ -233,7 +276,7 @@ entry_elements :: proc(e: ^Entry, tag: u32, allocator := context.temp_allocator)
 	return out[:]
 }
 
-ENTRY_FORMAT :: 2
+ENTRY_FORMAT :: 3
 
 encode_entry :: proc(buf: ^[dynamic]u8, e: ^Entry) -> Error {
 	devs := make([dynamic]prim.Id, context.temp_allocator)
@@ -258,6 +301,9 @@ encode_entry :: proc(buf: ^[dynamic]u8, e: ^Entry) -> Error {
 		for r in el.dead {
 			dev(&devs, r.seg)
 		}
+	}
+	for c in e.counters {
+		dev(&devs, c.by)
 	}
 	w := prim.writer(buf)
 	prim.write_u8(&w, ENTRY_FORMAT)
@@ -286,6 +332,13 @@ encode_entry :: proc(buf: ^[dynamic]u8, e: ^Entry) -> Error {
 				prim.write_uvarint(&w, u64(r.off))
 			}
 		}
+	}
+	prim.write_uvarint(&w, u64(len(e.counters)))
+	for c in e.counters {
+		prim.write_uvarint(&w, u64(c.tag))
+		prim.write_uvarint(&w, dev(&devs, c.by))
+		prim.write_uvarint(&w, c.p)
+		prim.write_uvarint(&w, c.n)
 	}
 	if w.err != .None {
 		return .No_Memory
@@ -365,11 +418,28 @@ decode_entry :: proc(key: []u8, data: []u8, allocator := context.temp_allocator)
 			}
 		}
 	}
-	if r.err != .None {
+	nc := prim.read_uvarint(&r)
+	if r.err != .None || nc * 4 > u64(prim.reader_remaining(&r)) {
+		return e, .Corrupt
+	}
+	cs := make([]Counter, int(nc), allocator)
+	for &c in cs {
+		t := prim.read_uvarint(&r)
+		di := prim.read_uvarint(&r)
+		c.p = prim.read_uvarint(&r)
+		c.n = prim.read_uvarint(&r)
+		if t > u64(max(u32)) || di >= nd {
+			return e, .Corrupt
+		}
+		c.tag = u32(t)
+		c.by = devs[di]
+	}
+	if r.err != .None || !prim.reader_done(&r) {
 		return e, .Corrupt
 	}
 	e.registers = regs
 	e.elements = els
+	e.counters = cs
 	return e, .None
 }
 
@@ -431,6 +501,40 @@ apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.
 		}
 		el.live = live[:]
 		el.dead = dead[:]
+	case Count:
+		k := -1
+		for c, i in e.counters {
+			if c.tag == v.tag && c.by == by {
+				k = i
+				break
+			}
+		}
+		if k < 0 {
+			list := make([dynamic]Counter, 0, len(e.counters) + 1, allocator)
+			append(&list, ..e.counters)
+			append(&list, Counter{tag = v.tag, by = by})
+			slice.sort_by(list[:], _counter_less)
+			e.counters = list[:]
+			for c, i in e.counters {
+				if c.tag == v.tag && c.by == by {
+					k = i
+					break
+				}
+			}
+			changed = true
+		} else {
+			list := make([]Counter, len(e.counters), allocator)
+			copy(list, e.counters)
+			e.counters = list
+		}
+		c := &e.counters[k]
+		if v.delta > 0 {
+			c.p = _sat_add(c.p, u64(v.delta))
+			changed = true
+		} else if v.delta < 0 {
+			c.n = _sat_add(c.n, u64(-(v.delta + 1)) + 1)
+			changed = true
+		}
 	}
 	if changed {
 		n := 0
@@ -484,12 +588,12 @@ Writer :: struct {
 	core: obj.Writer,
 }
 
-writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator) -> Error {
-	return obj.writer_create(&w.core, v, vfs, path, object, .Map, participant, created, settings, opts, allocator)
+writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> Error {
+	return obj.writer_create(&w.core, v, vfs, path, object, .Map, participant, created, settings, opts, allocator, clock)
 }
 
-writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, opts := journal.Options{}, allocator := context.allocator) -> (head: obj.Head, err: Error) {
-	return obj.writer_open(&w.core, v, vfs, path, object, .Map, participant, opts, allocator)
+writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> (head: obj.Head, err: Error) {
+	return obj.writer_open(&w.core, v, vfs, path, object, .Map, participant, opts, allocator, clock)
 }
 
 writer_close :: proc(w: ^Writer) -> Error {
@@ -532,6 +636,39 @@ del :: proc(w: ^Writer, key: []u8, tag: u32, element: []u8, observed: []Rid) -> 
 	return _append(w, Del{key, tag, element, observed})
 }
 
+count :: proc(w: ^Writer, key: []u8, tag: u32, delta: i64) -> (off: i64, err: Error) {
+	if len(key) == 0 || len(key) > MAX_KEY_LEN {
+		return 0, .Invalid
+	}
+	return _append(w, Count{key, tag, delta})
+}
+
+counter_value :: proc "contextless" (e: ^Entry, tag: u32) -> (value: i64, found: bool) {
+	for c in e.counters {
+		if c.tag == tag {
+			value += i64(c.p) - i64(c.n)
+			found = true
+		}
+	}
+	return
+}
+
+@(private)
+_counter_less :: proc(a, b: Counter) -> bool {
+	if a.tag != b.tag {
+		return a.tag < b.tag
+	}
+	return obj.id_less(a.by, b.by)
+}
+
+@(private)
+_sat_add :: proc "contextless" (a, b: u64) -> u64 {
+	if a > max(u64) - b {
+		return max(u64)
+	}
+	return a + b
+}
+
 @(private)
 _append :: proc(w: ^Writer, body: Body) -> (off: i64, err: Error) {
 	k: Kind
@@ -542,6 +679,8 @@ _append :: proc(w: ^Writer, body: Body) -> (off: i64, err: Error) {
 		k = .Add
 	case Del:
 		k = .Del
+	case Count:
+		k = .Count
 	}
 	rec := obj.begin(&w.core, u8(k), false, false) or_return
 	obj.put_links(&rec, nil)
@@ -665,5 +804,24 @@ entry_join :: proc(a, b: ^Entry, allocator := context.temp_allocator) -> (out: E
 		return string(x.value) < string(y.value)
 	})
 	out.elements = els[:n]
+	cs := make([dynamic]Counter, 0, len(a.counters) + len(b.counters), allocator)
+	append(&cs, ..a.counters)
+	for c in b.counters {
+		k := -1
+		for x, i in cs {
+			if x.tag == c.tag && x.by == c.by {
+				k = i
+				break
+			}
+		}
+		if k < 0 {
+			append(&cs, c)
+		} else {
+			cs[k].p = _sat_add(cs[k].p, c.p)
+			cs[k].n = _sat_add(cs[k].n, c.n)
+		}
+	}
+	slice.sort_by(cs[:], _counter_less)
+	out.counters = cs[:]
 	return
 }

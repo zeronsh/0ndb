@@ -108,9 +108,9 @@ decode_settings :: proc(b: []u8) -> (s: Settings, err: Error) {
 	return s, .None
 }
 
-writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, created: prim.Hlc, settings: Settings = {}, opts := journal.Options{}, allocator := context.allocator) -> Error {
+writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, created: prim.Hlc, settings: Settings = {}, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> Error {
 	_zero(w, allocator)
-	obj.writer_create(&w.core, v, vfs, path, object, .Conversation, participant, created, encode_settings(settings), opts, allocator) or_return
+	obj.writer_create(&w.core, v, vfs, path, object, .Conversation, participant, created, encode_settings(settings), opts, allocator, clock) or_return
 	_attach(w)
 	kp := _kids_path(path, context.temp_allocator) or_return
 	if err := obj.slots_create(&w.kids, vfs, kp, participant, allocator); err != .None {
@@ -125,9 +125,9 @@ writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, obj
 	return .None
 }
 
-writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, opts := journal.Options{}, allocator := context.allocator) -> (settings: Settings, err: Error) {
+writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> (settings: Settings, err: Error) {
 	_zero(w, allocator)
-	head := obj.writer_open(&w.core, v, vfs, path, object, .Conversation, participant, opts, allocator) or_return
+	head := obj.writer_open(&w.core, v, vfs, path, object, .Conversation, participant, opts, allocator, clock) or_return
 	_attach(w)
 	settings, err = decode_settings(head.settings)
 	if err == .None {
@@ -193,7 +193,7 @@ writer_summary :: proc "contextless" (w: ^Writer) -> Summary {
 	return w.sum
 }
 
-writer_observe :: proc "contextless" (w: ^Writer, hlc: prim.Hlc) {
+writer_observe :: proc(w: ^Writer, hlc: prim.Hlc) {
 	obj.observe(&w.core, hlc)
 }
 
