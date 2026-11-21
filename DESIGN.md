@@ -17,11 +17,17 @@ The design is built around four ideas:
    every replica, so a remote device can page a transcript by fetching byte
    ranges from the end of a stream and following parent offsets. No index is
    needed anywhere for the common path.
-3. **Worktree history is git's object model.** Snapshots are git trees and
-   commits, written in git's own formats (into the repository's object store
-   for git checkouts, into a device-wide bare object store otherwise). Content
-   git already holds is never hashed or copied again. Diffing two snapshots
-   costs O(changed), rollback costs O(changed), and every snapshot is
+3. **Every byte has an identity and an author, at the cost of plain text.**
+   Worktrees are a causal graph of index-based edits (Eg-walker) ordered by
+   Fugue, with an inode tree CRDT using the replicated-tree move operation.
+   With linear history a file in memory is just its text plus run-length
+   origin spans; CRDT state exists only transiently while merging concurrent
+   branches. Any number of devices and forks edit one history concurrently
+   and converge. Writes are credited to the actor and scope that made them
+   at write time, down to the writing process where the OS allows.
+   Git is the storage substrate, not the model: text checkpoints are git
+   blobs, content git already holds is referenced and never copied, and each
+   scope boundary also emits a real git tree/commit so every version is
    inspectable with plain `git`.
 4. **Sans-IO cores, one event loop.** Provider drivers, the thread writer,
    the sync client and the relay are pure state machines fed bytes and
@@ -35,10 +41,14 @@ The design is built around four ideas:
 - Opening a thread with 100k messages: O(page) reads.
 - Remote first paint of a thread: one round trip to the relay for the tail
   of the stream.
-- Snapshot after an agent tool call in a 1M-file repository: O(changed
-  directories), driven by the watcher; no full walk.
-- Relay: one signature verification per connection, then byte copies
-  (`sendfile`/`splice`); it never parses or decrypts records.
+- Ingesting an agent tool call in a 1M-file repository: O(changed bytes),
+  driven by the watcher; no full walk.
+- Integrating a remote batch: O(ops) when it does not overlap concurrent
+  work, O(concurrent region) otherwise; never O(document) or O(history).
+- Memory per loaded file: text + O(runs of authorship); per unloaded file:
+  nothing.
+- Relay: one handshake per connection, then zero-copy `sendfile` through
+  kernel TLS; it never parses or decrypts records.
 
 ## Layout
 
@@ -47,14 +57,16 @@ src/
   prim/      ids, hybrid logical clock, binary codec, file helpers, event loop, child processes, paths
   journal/   the record log format (local, replica and wire), group commit, sparse replicas
   odb/       git object database: read loose/packed objects, write loose/packs, trees, commits
-  textdiff/  line diff, three-way merge, blame
-  snap/      worktree snapshots: ignore rules, dircache, scanning, watching, materialize, fork, land
+  textdiff/  line and byte diff, three-way merge
+  crdt/      causal graph, Eg-walker text with Fugue ordering, authorship spans (pure, no I/O)
+  fstree/    inode tree CRDT with the replicated-tree move operation (pure, no I/O)
+  fs/        worktree mounts: scanning, ignore rules, watching, ingestion, materialization, git awareness, fork, land
   thread/    thread stream records: messages, blocks, branches, queue, pagination
   agent/     provider drivers (sans-IO) and the normalized event model
   sync/      keys, encryption, relay protocol, replicator client, relay server
   host/      the daemon: registry, commands, runs, attribution, local API
   cli/       the `0ndb` binary
-tests/       a handful of end-to-end tests
+tests/       only: convergence (text), fstree (tree), and one end-to-end
 ```
 
 Packages import each other with relative paths (`import "../journal"`).
@@ -143,7 +155,7 @@ A git object database in git's formats.
   Pack and idx files are opened lazily and mapped read-only.
 - Writing: loose objects and packs, deflated with stored (uncompressed)
   blocks plus Adler-32, so no compressor is needed and CPU is minimal; git's
-  own `gc`/`maintenance` recompresses later. Bulk writes (first snapshot of a
+  own `gc`/`maintenance` recompresses later. Bulk writes (first mount of a
   large folder) go to one pack with its `.idx`; small writes go loose.
 - Streaming: blobs larger than a threshold are hashed and written by streaming
   from the file and read by streaming, never held in memory.
@@ -152,7 +164,7 @@ A git object database in git's formats.
 - `exists(oid)`, `read(oid) -> (type, bytes)`, `stream(oid, writer)`,
   `write(type, bytes) -> oid`, `hash_file(path) -> oid`, `write_file(path)`.
 - Refs: `update_ref(name, new, old)` via lockfile + rename, used to pin
-  snapshot chains so git's gc keeps them.
+  scope commit chains so git's gc keeps them.
 
 ## textdiff
 
@@ -160,57 +172,124 @@ Histogram diff over lines (with Myers fallback), unified-diff rendering,
 three-way merge (diff3 with conflict markers), and a blame walker that maps
 lines through a chain of revisions. Pure functions over byte slices.
 
-## snap
+## crdt
 
-A worktree is any directory registered with the host. Its state is a chain
-of snapshot commits.
+Pure data structures; no I/O, no clocks, no randomness. Determinism is
+tested by a convergence fuzz (`tests/convergence`): random concurrent edits
+over many replicas, delivered in random orders and batch splits, must
+produce byte-identical files, trees and authorship everywhere.
 
-- **Snapshot** = git commit whose tree is the worktree content (respecting
-  ignore rules), parent = previous snapshot, message = scope metadata. The
-  chain is pinned at `refs/0ndb/<worktree-id>` (git checkouts) or in the
-  device store's refs.
-- **Dircache** (per worktree, under `$DATA/worktrees/<id>/`): for each
-  directory path, the tree oid and per-entry stat signatures
-  `(mtime_ns, ctime_ns, size, ino, mode)`. Stored as an append-only record
-  file of directory records plus an on-disk open-addressing hash
-  (path hash -> record offset); compacted when garbage exceeds half. Only the
-  directories touched since the last snapshot are read.
-- **First scan** walks the tree with parallel `getdents64`/`statx` workers
-  (threads that exist only for the scan). In a git checkout the index is read
-  once: entries whose stat matches reuse the index oid and the cache-tree
-  extension supplies tree oids for whole clean directories, so a clean
-  checkout snapshots without hashing a single file.
-- **Watching**: Linux shares one inotify instance across all worktrees
-  (directory watches, overflow triggers a dircache-guided rescan); fanotify
-  with `FAN_REPORT_DFID_NAME` is used when permitted. Darwin uses kqueue/FSEvents.
-  Events only mark directories dirty; no work happens until a snapshot is
-  requested (end of a tool call, end of a turn, or a settle timer for edits
-  by other actors).
-- **Snapshot pass**: for each dirty directory read entries, compare stat
-  signatures, hash only changed files, write blobs and the new tree,
-  propagate new tree oids to the root, write the commit, update the
-  dircache and the ref. Racy entries (mtime not older than the pass start)
-  are always rehashed next time.
+Identity and the graph:
+
+- An actor is an `Id` (one per device role: disk ingestion, each agent, the
+  recorder). An op id is `(actor, seq)`; each actor's seqs are contiguous.
+  Ops also carry a Lamport time for ordering.
+- Ops are stored and transmitted run-length encoded: a batch is
+  `(actor, seq range, lamport start, parents frontier, ops)` where
+  consecutive typing/deleting collapses into one run.
+- A version is a frontier. The graph answers `contains`, `diff(a, b)` (ops in
+  b not in a) and `common ancestor`, walking in descending Lamport order so
+  cost scales with divergence, not history length. The graph is kept as
+  run-length spans with parent edges only at run boundaries.
+- Admission: parents known, actor seqs contiguous, lamport > parents'.
+  Integration is idempotent and independent of delivery order.
+
+Text (Eg-walker with Fugue):
+
+- Ops are `insert(pos, bytes)` and `delete(pos, len)` in the coordinates of
+  their parent version, exactly what a diff of disk produces.
+- A loaded file is a rope of its current text plus authorship spans
+  (op id runs per byte range). Applying ops that extend the current version
+  linearly touches only the rope and spans.
+- Merging concurrent ops: find the critical version (the latest point every
+  branch has seen), build transient Fugue item state for just the ops since
+  then (unseen prior content is a single placeholder run), retreat/advance
+  to replay each op, transform it to current coordinates, apply to the rope,
+  and discard the item state. Concurrent inserts at one position never
+  interleave (Fugue-max).
+- Anchors `(op id, offset, bias)` resolve to positions through the spans or,
+  for deleted text, through the transient state.
+- Conflict detection: concurrent ops whose ranges overlap in the merged
+  result are reported as regions (for review and land), while the merge
+  itself still converges.
+
+Tree:
+
+- Inodes are named by the op that created them. Placement
+  `(parent inode, name)`, mode, kind, symlink target and liveness are
+  registers resolved by Lamport order with full history retained in the
+  graph.
+- Moves use the replicated-tree move operation (Kleppmann et al.): moves are
+  applied in timestamp order with undo/redo, and a move that would create a
+  cycle is skipped. All replicas agree.
+- Concurrent same-name entries get deterministic conflict names. Deleting a
+  directory removes what its author saw; entries created concurrently inside
+  it survive and keep it alive.
+
+Persistence form (used by `fs` and `sync`):
+
+- Batches are journal records in the device's per-history stream
+  `fs/<history>` (single-writer, append-only, synced like every stream).
+- Each loaded file's state can be checkpointed as `(version, text blob oid,
+  spans blob)`; text blobs are git blobs. Loading a file reads the latest
+  checkpoint and replays only later ops.
+
+## fs
+
+A worktree mount binds a directory to a history and keeps disk and history
+equal in both directions.
+
+- **Shadow** (per mount, under `$DATA/worktrees/<id>/`): for each path the
+  inode, stat signature `(mtime_ns, ctime_ns, size, ino, mode)`, content oid
+  and version it was last synced at. An on-disk table (append-only records
+  plus an open-addressing hash file), compacted when garbage exceeds half.
+  Only unpersisted changes live in memory.
+- **First mount** walks with parallel `getdents64`/`statx` workers that exist
+  only for the scan. In a git checkout the index is read once: entries whose
+  stat matches take the index oid (the file text is then referenced from
+  git's objects, never copied or hashed), and the cache-tree extension
+  supplies tree oids for clean directories.
+- **Watching**: Linux shares one inotify instance across all mounts;
+  fanotify (`FAN_REPORT_DFID_NAME`, `FAN_MODIFY`, with the writing pid) is
+  used when permitted, which lets ingestion credit each write to the process
+  tree that made it (a tool call's subprocess vs. an editor). Darwin uses
+  FSEvents/kqueue. Events mark paths dirty; overflow triggers a
+  shadow-guided rescan.
+- **Ingestion**: for each dirty path compare the stat signature, read only
+  changed files, diff against the shadow text (line histogram diff refined
+  to bytes inside changed lines) and append the resulting ops as one batch
+  parented on the mount's synced version, credited to the actor/scope active
+  at the time of the write (or the writer pid's scope). Background passes
+  defer files younger than a settle delay; scope ends, fences and shutdown
+  ingest everything.
+- **Materialization**: remote or merged ops are written to disk only for
+  inodes touched since the synced version; content that differs from the
+  shadow is ingested first, never overwritten. Writes are temp + rename,
+  with modes and symlinks.
+- **Large files** (over a size limit) are opaque content referenced by git
+  oid, hashed and written by streaming, never read into memory.
 - **Ignore**: full `.gitignore` semantics (negation, anchoring, `**`,
-  directory-only), `info/exclude`, core.excludesFile; folders outside git
+  directory-only), `info/exclude`, `core.excludesFile`; folders outside git
   also ignore a fixed list of unambiguous dependency/cache/OS directories.
   `.git` is never tracked.
-- **Diff**: two tree oids -> changed paths, skipping identical subtrees.
-- **Materialize** (rollback, branch switch): take a snapshot first so the
-  current state is recorded, then apply the diff from current to target with
-  temp-file + rename per file, modes and symlinks, removing emptied
-  directories. Disk content that differs from the recorded snapshot is never
-  overwritten without being snapshotted first.
-- **Git awareness**: HEAD branch and commit are recorded with each snapshot.
-  Moving back to a message restores HEAD as described in Threads.
-- **Fork**: git worktree (`git worktree add`) at the message's commit, or a
-  reflink clone (`FICLONE` / `clonefile`, falling back to copy) for plain
-  folders, then only paths that can differ are rewritten.
-- **Land**: three-way merge of snapshot trees (base = fork point), file-level
-  merges via `textdiff`, conflicts written only into the fork; land refuses
-  while conflicts remain.
-- **Blame/revert**: blame lines across the snapshot chain; revert a scope by
-  three-way applying the inverse of its snapshot pair.
+- **Git awareness**: files git writes (checkout, reset, merge, stash),
+  decided from HEAD's reflog and the index, go into one batch carrying a git
+  op and are never credited to scopes. HEAD branch/commit is recorded with
+  each scope boundary. Each scope boundary also writes a git tree/commit
+  chain pinned at `refs/0ndb/<history>` (git checkouts) or in the device
+  store, so content stays reachable and inspectable.
+- **Going back** to a message produces new ops that turn the files into the
+  message's version (history is never rewritten, every line keeps its
+  author), and restores git as described in Threads.
+- **Fork**: same history id cut at the fork version; git worktree for git
+  checkouts, reflink clone (`FICLONE`/`clonefile`, else copy) otherwise; only
+  paths that can differ are rewritten. **Land**: sync both ways, CRDT merge;
+  overlapping concurrent regions are stored as conflicts in the fork and
+  shown with markers there only; land refuses while any remain.
+- **Blame** is a span lookup. **Revert** of a scope creates ops that undo
+  exactly that scope's ops, transformed through everything since.
+- One live mount per (history, directory) via a lock file. Hibernation drops
+  everything per file; any entry point wakes the mount first.
 
 ## thread
 
@@ -222,7 +301,7 @@ Records (kind byte then fields):
 
 - `Head{thread, created, worktree, provider, model, title}`.
 - `Msg{role, parent, depth, jump, prev_sibling, fork_head, prev_leaf_event,
-  cmd, hlc, snapshot, git_branch, git_commit, provider_session,
+  cmd, hlc, version, git_branch, git_commit, provider_session,
   provider_msg}`.
   - `jump` is a skew-binary jump pointer (level-ancestor and ancestry tests
     in O(log depth)).
@@ -244,7 +323,7 @@ Records (kind byte then fields):
 - `Queue{cmd, mode, text, attachments, prev_pending}` and
   `Unqueue{cmd, outcome, msg, prev_pending}`: the durable queue. Each carries
   the head of the pending chain so the pending set is read from the tail.
-- `Scope{msg, kind, id, before, after}` attribution: snapshot commits before
+- `Scope{msg, kind, id, actor, before, after}` attribution: worktree versions before
   and after a tool call or turn.
 - `Interrupted{msg}`, `Revived{msg, attempt}` crash recovery.
 
@@ -260,7 +339,7 @@ Semantics:
   position and never disturbs siblings.
 - Editing message `m`: a new `Msg` with `parent = m.parent`. Regenerating: a
   new assistant `Msg` under the same user message.
-- Going back to a message restores the worktree to its snapshot and git to
+- Going back to a message returns the worktree to its version and git to
   its recorded branch/commit (same branch if it still points there and is not
   checked out elsewhere, else a new `ondb/<thread>` branch; never move, reset
   or delete an existing branch). If another thread has worked in the same
@@ -319,9 +398,17 @@ HLC), `cmd` (commands to hosts), `thread/<id>` (transcripts it hosts).
 
 Relay protocol (length-prefixed frames over TCP or a Unix socket):
 
-- `Hello` challenge: relay nonce, client proves the space auth secret with a
-  keyed MAC and signs with its device key; the relay then accepts appends only
-  to streams prefixed with that device id.
+- Transport: a Noise `IK` handshake (`core:crypto/noise`; the relay's static
+  key is pinned by the pairing code, the client's static key is its device
+  key) authenticates both sides and derives traffic keys, which are then
+  installed into the kernel as TLS 1.3 AES-GCM keys (kTLS, `TCP_ULP "tls"`),
+  so frames are encrypted and integrity-protected on the wire while the relay
+  still serves stored bytes with `sendfile` (zero-copy, NIC offload where
+  available). Without kTLS (macOS, old kernels) the same keys drive a
+  userspace AEAD. Unix-socket connections skip transport encryption.
+- `Hello`: the client proves the space auth secret with a keyed MAC over the
+  handshake hash; the relay then accepts appends only to streams prefixed
+  with that device id.
 - `List(since)` -> stream ids and lengths.
 - `Append(stream, at, bytes)` -> ok(len) or conflict(len). `at` must equal the
   current length.
@@ -341,6 +428,43 @@ and appends commands to the device's `cmd` stream. A command is shown
 optimistically until the host's stream contains a record carrying its `cmd`
 id.
 
+### index stream (one per device)
+
+- `Device{name, platform, hlc}`.
+- `Worktree{id, hlc, fields}` path, host device, git repository, branch,
+  source worktree and fork version for forks, archived.
+- `Thread{id, hlc, fields}` with per-field `(tag, hlc, value)`: title,
+  worktree, provider, model, host device, created, last activity, archived,
+  pinned, leaf offset, stream length, status (idle, running, queued n,
+  awaiting permission, failed, interrupted), pending queue count, usage.
+  Any device may write user-owned fields (title, archived, pinned); only the
+  host writes status, leaf, length and activity.
+- `Cursor{source device, offset}` how far the host has applied another
+  device's `cmd` stream, and `Rejected{cmd, reason}`.
+- Merge: per (entity, field), highest `(hlc, device)` wins. Each device keeps
+  a derived, rebuildable session table on disk (sorted by last activity) so
+  listing sessions is a paged read.
+
+### cmd stream (one per device)
+
+`Cmd{id, hlc, host, thread, kind, payload}` with kinds: new thread, send,
+queue, steer, edit queued, cancel queued, edit message, regenerate, switch
+sibling, back to message, interrupt, answer permission, set model, rename,
+archive, fork, land, want objects. Commands are applied by the thread's
+host; the resulting thread records carry the command id. Until then the
+issuing device shows the command optimistically; a command below the host's
+`Cursor` with no echo and no `Rejected` is dropped from the overlay.
+
+### Objects over sync
+
+Worktree histories replicate as `fs/<history>` streams like any other
+stream, so remote diffs and blame need nothing else. Base content referenced
+from git (never copied into ops) and text checkpoints are objects: uploaded
+encrypted and content-addressed (key = keyed-hash(oid), convergent nonce
+from the key) when a remote first needs them, on a `want objects` command. Remote
+devices keep fetched objects in their device store and browse versions
+lazily.
+
 ## host
 
 `0ndb daemon` owns the loop, the journals, the worktrees, the provider
@@ -349,6 +473,28 @@ other devices' `cmd` streams to the threads it hosts (cursor per source
 stream, persisted), runs turns, records scopes, writes statuses to its
 `index` stream and maintains the merged session list from every device's
 `index` stream.
+
+- One loop thread. Ingestion passes and other long file work run on one
+  worker thread that wakes the loop when done; it exists only while work is
+  queued.
+- Per running thread it holds the driver state, the open journal writer and
+  the current message/block positions; idle threads hold nothing.
+- Scopes open and close around each tool call and turn; the worktree
+  version is recorded at each boundary. Edits from other actors are ingested
+  after a settle delay.
+- Remote replication: index and cmd streams of all devices are followed in
+  full; thread streams are fetched tail-first on demand into sparse replicas
+  and followed while open or recently active.
+
+### Local API
+
+Clients (the CLI, UIs) connect to `$XDG_RUNTIME_DIR/0ndb.sock` and speak
+framed binary requests: session page, thread page (path from leaf or from a
+message, with sibling counts), message blocks, follow thread / follow
+sessions (pushed deltas), read object, diff of a scope, and `command` (which
+appends to the device's `cmd` stream and returns immediately with the command
+id). The same socket also accepts the relay protocol, so a remote UI can be
+served by a local daemon acting as its relay.
 
 ## cli
 

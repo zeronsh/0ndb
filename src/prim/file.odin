@@ -1,0 +1,220 @@
+package prim
+
+import "base:runtime"
+import "core:c/libc"
+import "core:strings"
+
+Open_Flag :: enum u8 {
+	Write,
+	Create,
+	Truncate,
+	Exclusive,
+	Append,
+	Nonblock,
+	Directory,
+}
+
+Open_Flags :: bit_set[Open_Flag;u8]
+
+Path_Buf :: [PATH_MAX]u8
+
+cpath :: proc "contextless" (path: string, buf: ^Path_Buf) -> (cstring, Error) {
+	if len(path) == 0 {
+		return nil, .Not_Found
+	}
+	if len(path) >= PATH_MAX {
+		return nil, .Name_Too_Long
+	}
+	for i in 0 ..< len(path) {
+		if path[i] == 0 {
+			return nil, .Invalid
+		}
+		buf[i] = path[i]
+	}
+	buf[len(path)] = 0
+	return cstring(&buf[0]), .None
+}
+
+dir_name :: proc "contextless" (path: string) -> string {
+	end := len(path)
+	for end > 1 && path[end - 1] == '/' {
+		end -= 1
+	}
+	for i := end - 1; i >= 0; i -= 1 {
+		if path[i] == '/' {
+			if i == 0 {
+				return "/"
+			}
+			return path[:i]
+		}
+	}
+	return "."
+}
+
+read_full :: proc(fd: Fd, buf: []u8) -> (int, Error) {
+	n := 0
+	for n < len(buf) {
+		r, err := read(fd, buf[n:])
+		if err != .None {
+			return n, err
+		}
+		if r == 0 {
+			break
+		}
+		n += r
+	}
+	return n, .None
+}
+
+read_file :: proc(path: string, allocator := context.allocator) -> (data: []u8, err: Error) {
+	fd := open_file(path) or_return
+	defer close(fd)
+	size := file_size(fd) or_return
+	if size > i64(max(int)) {
+		return nil, .Too_Large
+	}
+	buf, alloc_err := make([]u8, int(size), allocator)
+	if alloc_err != nil {
+		return nil, .No_Memory
+	}
+	n: int
+	n, err = read_at(fd, buf, 0)
+	if err != .None {
+		delete(buf, allocator)
+		return nil, err
+	}
+	return buf[:n], .None
+}
+
+replace_atomic :: proc(path: string, data: []u8) -> Error {
+	if len(path) + 4 >= PATH_MAX {
+		return .Name_Too_Long
+	}
+	tmp_buf: Path_Buf
+	copy(tmp_buf[:], path)
+	copy(tmp_buf[len(path):], ".tmp")
+	tmp := string(tmp_buf[:len(path) + 4])
+	fd := open_file(tmp, {.Write, .Create, .Truncate}) or_return
+	err := write_at(fd, data, 0)
+	if err == .None {
+		err = datasync(fd)
+	}
+	close_err := close(fd)
+	if err == .None {
+		err = close_err
+	}
+	if err == .None {
+		err = rename(tmp, path)
+	}
+	if err != .None {
+		_ = remove(tmp)
+		return err
+	}
+	return sync_dir(dir_name(path))
+}
+
+mkdir_all :: proc(path: string, mode: u32 = 0o755) -> Error {
+	if len(path) == 0 {
+		return .Not_Found
+	}
+	if len(path) >= PATH_MAX {
+		return .Name_Too_Long
+	}
+	if is_dir(path) {
+		return .None
+	}
+	i := 0
+	for i < len(path) {
+		j := i
+		for j < len(path) && path[j] == '/' {
+			j += 1
+		}
+		for j < len(path) && path[j] != '/' {
+			j += 1
+		}
+		if j > 0 && path[j - 1] != '/' {
+			err := mkdir(path[:j], mode)
+			if err != .None && err != .Exists {
+				return err
+			}
+		}
+		i = j
+	}
+	if !is_dir(path) {
+		return .Not_Dir
+	}
+	return .None
+}
+
+getenv :: proc "contextless" (key: cstring) -> (string, bool) {
+	v := libc.getenv(key)
+	if v == nil {
+		return "", false
+	}
+	s := string(v)
+	return s, len(s) > 0
+}
+
+data_dir :: proc(allocator := context.allocator) -> (string, Error) {
+	if home, ok := getenv("ONDB_HOME"); ok {
+		return _clone(home, allocator)
+	}
+	return _platform_data_dir(allocator)
+}
+
+runtime_dir :: proc(allocator := context.allocator) -> (dir: string, err: Error) {
+	if explicit, ok := getenv("ONDB_RUNTIME_DIR"); ok {
+		return _clone(explicit, allocator)
+	}
+	if home, ok := getenv("ONDB_HOME"); ok {
+		return path_join(allocator, home, "run")
+	}
+	when ODIN_OS == .Linux {
+		if xdg, ok := getenv("XDG_RUNTIME_DIR"); ok {
+			return path_join(allocator, xdg, "0ndb")
+		}
+	}
+	base := _platform_data_dir(context.temp_allocator) or_return
+	return path_join(allocator, base, "run")
+}
+
+@(private)
+_home :: proc "contextless" () -> (string, Error) {
+	home, ok := getenv("HOME")
+	if !ok {
+		return "", .Not_Found
+	}
+	return home, .None
+}
+
+@(private)
+_clone :: proc(s: string, allocator: runtime.Allocator) -> (string, Error) {
+	out, err := strings.clone(s, allocator)
+	if err != nil {
+		return "", .No_Memory
+	}
+	return out, .None
+}
+
+path_join :: proc(allocator: runtime.Allocator, parts: ..string) -> (string, Error) {
+	n := 0
+	for p, k in parts {
+		if k > 0 && !strings.has_suffix(parts[k - 1], "/") {
+			n += 1
+		}
+		n += len(p)
+	}
+	buf, err := make([]u8, n, allocator)
+	if err != nil {
+		return "", .No_Memory
+	}
+	i := 0
+	for p, k in parts {
+		if k > 0 && !strings.has_suffix(parts[k - 1], "/") {
+			buf[i] = '/'
+			i += 1
+		}
+		i += copy(buf[i:], p)
+	}
+	return string(buf), .None
+}

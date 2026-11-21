@@ -4,16 +4,17 @@
 
 - Toolchain: Odin `dev-2026-11` (`odin version`).
 - Build: `odin build src/cli -out:bin/0ndb -o:speed`
-- Check a package: `odin check src/<pkg> -vet -strict-style` and
-  `odin check src/<pkg> -vet -strict-style -target:darwin_arm64`
+- Check a package: `odin check src/<pkg> -vet -strict-style -no-entry-point` and
+  the same with `-target:darwin_arm64`
 - Tests: `odin test tests -o:speed`
 - Design: `DESIGN.md` is the source of truth for formats and invariants.
 
 ## Rules
 
 - No code comments.
-- Few tests: only end-to-end tests of behaviour that matters (durability,
-  branching, convergence, rollback) in `tests/`.
+- Minimal tests: `tests/convergence`, `tests/fstree` and one end-to-end
+  package. Everything else is verified with throwaway programs, real git and
+  real provider CLIs, not committed tests.
 - Nothing per thread or per file stays in memory between events. Idle means
   no wakeups and no armed timers.
 - Streams are single-writer and append-only. A durable record is never
