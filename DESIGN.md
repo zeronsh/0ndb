@@ -458,8 +458,10 @@ concurrent typing is never lost or reverted.
   `Bytes` (UTF-8 offsets, gpui/Zed ropes) or `Utf16` (code units, web and
   LSP), fixed per buffer. The engine keeps a text view of the file at the
   buffer's version and returns `rev` 0, the total length in units and the
-  first page of the snapshot; `buffer_read(buffer, rev, from, len)` serves
-  any range at the current rev, so a 50 MB file opens on its first screen.
+  first page of the snapshot; `buffer_read(buffer, rev, from, len)` maps
+  `from` from `rev` to the current rev and serves that range there (the
+  reply names the rev and ack it reflects), so a 50 MB file opens on its
+  first screen and the rest fills in while deltas keep arriving.
   Open costs one clone of the loaded rope or one checkpoint read plus the
   ops after it; nothing is diffed.
 - **Revisions.** `rev` counts deltas the engine has sent; the client counts
@@ -487,16 +489,24 @@ concurrent typing is never lost or reverted.
   merge itself: O(ops since the last delta), never O(file).
 - **Local edits.** `buffer_edit(buffer, rev, edits, group)` takes ordered
   `(pos, del, ins)` edits in the client's coordinates at `rev` plus its
-  earlier edits. The engine transforms them over its unacknowledged deltas,
-  converts units at the view, and commits one batch whose author is the
-  buffer's actor (the person; default an editor actor derived from the
-  device), parented on the view's version, so anything the engine has not
-  yet delivered is merged by the CRDT character-wise. The batch is
+  earlier edits. The engine first advances the buffer to its target,
+  delivering any pending delta ahead of the edit's result, then transforms
+  the edit over its unacknowledged deltas, converts units at the view, and
+  commits one batch whose author is the buffer's actor (the person; default
+  an editor actor derived from the device and the followed line), parented
+  on the version the buffer now shows. Local editors therefore never form a
+  permanently concurrent ladder (which would make every merge walk back to
+  the last cut); only other devices' concurrent work is merged by the CRDT,
+  character-wise. The result returns `ack` and the `rev` it reflects. The batch is
   journaled and committed with the normal cadence, moves the followed line
   (`line_after`, so concurrent line heads stay), and wakes the mounts of the
   tree; materialization writes the file only after ingesting disk content
   that differs from the shadow. The view applies the batch linearly, so the
-  edit never comes back to its author as a delta.
+  edit never comes back to its author as a delta. An actor's ops stay
+  causally ordered: a buffer whose version lacks its actor's latest op (two
+  buffers on one line) advances first and transforms the edit over that
+  delta; one explicit actor on two lines at once is refused with
+  `Conflict`.
 - **Anchors.** An anchor is `(op id, bias)` of a character, plus two
   sentinels for start and end. `buffer_anchors(buffer, rev, positions,
   bias)` creates them in bulk (positions are mapped from `rev` through the
@@ -1958,9 +1968,18 @@ C function-pointer tables, binary or JSON payloads, no global state, no
 callbacks on foreign threads except through the embedder's loop. The read
 side (journal, thread, index, crdt, sync client) also builds for
 `js_wasm32` so browsers read and decrypt streams directly. Buffer ops are
-appended to the op table; deltas and cursors arrive on a buffer
-subscription (daemon frame `Buffer`), with the payload
-`{buffer, rev, ack, base, ops:[{kind, n, text, author}], cursors}`.
+appended to the op table. `buffer.open` is a subscription: its result (the
+daemon's subscribe result, or the first callback of `ondb_subscribe`) is the
+`open` record with the first page, and its later payloads are `delta`,
+`cursors` and `closed` records of one `BufferEvent` layout
+`{kind, buffer, rev, ack, length, text, more, actor, line, ops:[{kind, n,
+text, author}], cursors, status}`; unsubscribing closes the buffer. Anchors
+cross the API as strings (`s`, `e`, or `<actor hex>.<seq>[.<offset>].<b|a>`).
+The daemon advances a buffer only while its connection has less than
+256 KiB unsent and kicks it when the socket drains. `web/0ndb.js` exports
+`LiveBuffer` (the client half: pending edits, delta transform, paged
+loading of unread ranges as holes, anchor and cursor mapping) over any
+transport that speaks the JSON form.
 
 ## cli
 
