@@ -1279,6 +1279,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
 
     try runCrdtFuzzSuite(allocator);
     try runDiffAndMerge3PropertyFuzz(allocator);
+    try runPagedStorePrimitivesSuite(allocator, io);
 }
 
 const FuzzFileSnap = struct {
@@ -2880,6 +2881,522 @@ test "dumb protected E2EE relay syncs session list, statuses, Merkle paginated m
             const v2 = try alog.readAt(alog.findIndexBySeq(8));
             try testing.expectEqual(@as(u64, 13), v2.header.seq);
             try testing.expectEqualStrings("rec-13", v2.payload);
+        }
+    }
+}
+
+
+fn testLruSliceSize(s: []u8) usize {
+    return s.len;
+}
+
+fn testLruSliceDeinit(allocator: std.mem.Allocator, s: *[]u8) void {
+    allocator.free(s.*);
+}
+
+fn runPagedStorePrimitivesSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const base_dir_path = "/tmp/0ndb-verify-paged-store";
+    cleanDir(io, base_dir_path);
+    try std.Io.Dir.cwd().createDirPath(io, base_dir_path);
+    defer cleanDir(io, base_dir_path);
+
+    var dir = try std.Io.Dir.cwd().openDir(io, base_dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    {
+        try ondb.store.mmap.atomicWriteFile(io, dir, "hello.bin", "first-version");
+        try ondb.store.mmap.atomicWriteFile(io, dir, "hello.bin", "second-version-longer");
+        try ondb.store.mmap.fsyncDir(io, dir);
+
+        const mf = try ondb.store.mmap.MappedFile.open(allocator, io, dir, "hello.bin");
+        try testing.expectEqual(@as(u32, 1), mf.refCount());
+        try testing.expectEqualStrings("second-version-longer", mf.slice());
+        try testing.expectEqualStrings("version", try mf.sliceChecked(7, 7));
+        try testing.expectError(error.OutOfBounds, mf.sliceChecked(18, 10));
+        try testing.expectError(error.OutOfBounds, mf.sliceChecked(std.math.maxInt(usize), 1));
+
+        mf.retain();
+        try testing.expectEqual(@as(u32, 2), mf.refCount());
+        mf.release(allocator);
+        try testing.expectEqual(@as(u32, 1), mf.refCount());
+        mf.hibernate();
+        try testing.expectEqualStrings("second-version-longer", mf.slice());
+        mf.release(allocator);
+
+        try ondb.store.mmap.atomicWriteFile(io, dir, "empty.bin", "");
+        const empty_mf = try ondb.store.mmap.MappedFile.open(allocator, io, dir, "empty.bin");
+        defer empty_mf.release(allocator);
+        try testing.expectEqual(@as(usize, 0), empty_mf.len());
+        try testing.expectEqualStrings("", empty_mf.slice());
+        try testing.expectEqualStrings("", try empty_mf.sliceChecked(0, 0));
+        try testing.expectError(error.OutOfBounds, empty_mf.sliceChecked(0, 1));
+        empty_mf.hibernate();
+    }
+
+    {
+        const Cache = ondb.store.lru.LruCache(u64, []u8, testLruSliceSize, testLruSliceDeinit);
+        var cache = Cache.init(allocator, .{
+            .budget_bytes = 350,
+            .max_entries = 10,
+            .entry_overhead = 96,
+        });
+        defer cache.deinit();
+
+        const v1 = try allocator.dupe(u8, "01234567890123456789");
+        _ = try cache.put(1, v1);
+        const v2 = try allocator.dupe(u8, "aaaaaaaaaaaaaaaaaaaa");
+        _ = try cache.put(2, v2);
+        const v3 = try allocator.dupe(u8, "bbbbbbbbbbbbbbbbbbbb");
+        _ = try cache.put(3, v3);
+        try testing.expectEqual(@as(usize, 3), cache.count());
+        try testing.expectEqual(@as(usize, 348), cache.used_bytes);
+
+        const v4 = try allocator.dupe(u8, "cccccccccccccccccccc");
+        _ = try cache.put(4, v4);
+        try testing.expect(!cache.contains(1));
+        try testing.expectEqual(@as(usize, 3), cache.count());
+        try testing.expectEqual(@as(usize, 348), cache.used_bytes);
+
+        const c3 = cache.getConst(3).?;
+        try testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbb", c3.*);
+
+        cache.beginPinScope();
+        const pinned = cache.get(2).?;
+        cache.beginPinScope();
+        var k: u64 = 10;
+        while (k < 20) : (k += 1) {
+            const payload = try std.fmt.allocPrint(allocator, "entry-{d:0>14}", .{k});
+            _ = try cache.put(k, payload);
+        }
+        try testing.expectEqual(@as(usize, 13), cache.count());
+        try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaa", pinned.*);
+        cache.endPinScope();
+        try testing.expectEqual(@as(usize, 13), cache.count());
+        try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaa", pinned.*);
+        cache.endPinScope();
+        try testing.expect(cache.used_bytes <= 350);
+        try testing.expectEqual(@as(usize, 3), cache.count());
+
+        try testing.expect(cache.remove(19));
+        try testing.expect(!cache.remove(19));
+        cache.clear();
+        try testing.expectEqual(@as(usize, 0), cache.count());
+        try testing.expectEqual(@as(usize, 0), cache.used_bytes);
+    }
+
+    {
+        try dir.createDirPath(io, "mnf_state/snap");
+        try dir.createDirPath(io, "mnf_state/wal");
+        var mnf_dir = try dir.openDir(io, "mnf_state", .{ .iterate = true });
+        defer mnf_dir.close(io);
+
+        try testing.expect((try ondb.store.manifest.Manifest.load(io, mnf_dir)) == null);
+
+        var m = ondb.store.manifest.Manifest{
+            .flags = ondb.store.manifest.FLAG_PRUNED_BEFORE_SYNC | ondb.store.manifest.FLAG_EVER_SYNCED | ondb.store.manifest.FLAG_HAS_HORIZON,
+            .history_id = 0x0123456789abcdef_fedcba9876543210,
+            .generation = 42,
+            .base_gen = 5,
+            .delta_gen = 3,
+            .wal_gen = 8,
+            .wal_base_seq = 100,
+            .pack_max_id = 7,
+            .seg_max_id = 9,
+            .checkpoint_wall_ms = 1700000000123,
+            .total_inodes = 50000,
+            .total_batches = 12345,
+            .base_blake3 = ondb.store.crypto.hashBytes("base"),
+            .delta_blake3 = ondb.store.crypto.hashBytes("delta"),
+            .pack_idx_blake3 = ondb.store.crypto.hashBytes("packidx"),
+        };
+        const enc = m.encode();
+        try testing.expectEqual(@as(usize, 256), enc.len);
+        const dec = try ondb.store.manifest.Manifest.decode(&enc);
+        try testing.expectEqual(m.flags, dec.flags);
+        try testing.expectEqual(m.history_id, dec.history_id);
+        try testing.expectEqual(m.generation, dec.generation);
+        try testing.expectEqual(m.base_gen, dec.base_gen);
+        try testing.expectEqual(m.delta_gen, dec.delta_gen);
+        try testing.expectEqual(m.wal_gen, dec.wal_gen);
+        try testing.expectEqual(m.wal_base_seq, dec.wal_base_seq);
+        try testing.expectEqual(m.pack_max_id, dec.pack_max_id);
+        try testing.expectEqual(m.seg_max_id, dec.seg_max_id);
+        try testing.expectEqual(m.checkpoint_wall_ms, dec.checkpoint_wall_ms);
+        try testing.expectEqual(m.total_inodes, dec.total_inodes);
+        try testing.expectEqual(m.total_batches, dec.total_batches);
+        try testing.expectEqualSlices(u8, &m.base_blake3, &dec.base_blake3);
+        try testing.expectEqualSlices(u8, &m.delta_blake3, &dec.delta_blake3);
+        try testing.expectEqualSlices(u8, &m.pack_idx_blake3, &dec.pack_idx_blake3);
+
+        var bad_magic = enc;
+        bad_magic[0] ^= 0xff;
+        try testing.expectError(error.InvalidMagic, ondb.store.manifest.Manifest.decode(&bad_magic));
+
+        var bad_ver = enc;
+        std.mem.writeInt(u32, bad_ver[8..12], 99, .little);
+        try testing.expectError(error.UnsupportedVersion, ondb.store.manifest.Manifest.decode(&bad_ver));
+
+        var bad_body = enc;
+        bad_body[32] ^= 0x01;
+        try testing.expectError(error.CorruptManifest, ondb.store.manifest.Manifest.decode(&bad_body));
+
+        var bad_digest = enc;
+        bad_digest[255] ^= 0x80;
+        try testing.expectError(error.CorruptManifest, ondb.store.manifest.Manifest.decode(&bad_digest));
+
+        try m.saveAtomic(io, mnf_dir);
+        const loaded = (try ondb.store.manifest.Manifest.load(io, mnf_dir)).?;
+        try testing.expectEqual(m.generation, loaded.generation);
+        try testing.expectEqualSlices(u8, &dec.manifest_blake3, &loaded.manifest_blake3);
+
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "snap/base-0000000000000004.0ndb", "old-base");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "snap/base-0000000000000005.0ndb", "cur-base");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "snap/delta-0000000000000002.0ndb", "old-delta");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "snap/delta-0000000000000003.0ndb", "cur-delta");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "snap/tmp.orphan", "tmp");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "wal/wal-0000000000000007.0ndb", "old-wal");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "wal/wal-0000000000000008.0ndb", "cur-wal");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "wal/tmp.wal.orphan", "tmp");
+        try ondb.store.mmap.atomicWriteFile(io, mnf_dir, "tmp.manifest.0ndb.99999", "tmp");
+
+        ondb.store.manifest.Manifest.gcOrphanFiles(allocator, io, mnf_dir, loaded);
+
+        try testing.expectError(error.FileNotFound, mnf_dir.statFile(io, "snap/base-0000000000000004.0ndb", .{}));
+        _ = try mnf_dir.statFile(io, "snap/base-0000000000000005.0ndb", .{});
+        try testing.expectError(error.FileNotFound, mnf_dir.statFile(io, "snap/delta-0000000000000002.0ndb", .{}));
+        _ = try mnf_dir.statFile(io, "snap/delta-0000000000000003.0ndb", .{});
+        try testing.expectError(error.FileNotFound, mnf_dir.statFile(io, "snap/tmp.orphan", .{}));
+        try testing.expectError(error.FileNotFound, mnf_dir.statFile(io, "wal/wal-0000000000000007.0ndb", .{}));
+        _ = try mnf_dir.statFile(io, "wal/wal-0000000000000008.0ndb", .{});
+        try testing.expectError(error.FileNotFound, mnf_dir.statFile(io, "wal/tmp.wal.orphan", .{}));
+        try testing.expectError(error.FileNotFound, mnf_dir.statFile(io, "tmp.manifest.0ndb.99999", .{}));
+    }
+
+    {
+        try dir.createDirPath(io, "seg_state");
+        var seg_state = try dir.openDir(io, "seg_state", .{ .iterate = true });
+        defer seg_state.close(io);
+
+        var segs = try ondb.store.segments.SegmentStore.open(allocator, io, seg_state);
+        defer segs.deinit();
+
+        const f1 = [_]ondb.store.segments.FrameInput{
+            .{ .kind = 1, .seq = 1, .payload = "batch-one" },
+            .{ .kind = 1, .seq = 2, .payload = "batch-two-longer" },
+        };
+        const w1 = try segs.writeSegment(1, &f1);
+        defer allocator.free(w1);
+
+        const f2 = [_]ondb.store.segments.FrameInput{
+            .{ .kind = 1, .seq = 3, .payload = "dead-batch-three" },
+            .{ .kind = 1, .seq = 4, .payload = "dead-batch-four" },
+        };
+        const w2 = try segs.writeSegment(2, &f2);
+        defer allocator.free(w2);
+
+        const f3 = [_]ondb.store.segments.FrameInput{
+            .{ .kind = 1, .seq = 5, .payload = "drop-batch-five" },
+            .{ .kind = 1, .seq = 6, .payload = "keep-batch-six!" },
+        };
+        const w3 = try segs.writeSegment(3, &f3);
+        defer allocator.free(w3);
+
+        const p1 = try segs.readFrameAt(1, w1[0].offset, w1[0].payload_len, allocator);
+        defer allocator.free(p1);
+        try testing.expectEqualStrings("batch-one", p1);
+
+        const p2 = try segs.readFrameAt(1, w1[1].offset, w1[1].payload_len, allocator);
+        defer allocator.free(p2);
+        try testing.expectEqualStrings("batch-two-longer", p2);
+
+        {
+            var wal = try ondb.store.log.AppendLog.open(allocator, io, seg_state, "seal_src.0ndb", true);
+            defer wal.deinit();
+            _ = try wal.appendWithSeq(7, 2, 0, 11, "wal-frame-7");
+            _ = try wal.appendWithSeq(8, 2, 0, 12, "wal-frame-8");
+        }
+        {
+            const wf = try seg_state.openFile(io, "seal_src.0ndb", .{ .mode = .read_write });
+            defer wf.close(io);
+            const st = try wf.stat(io);
+            try wf.writePositionalAll(io, "torn-tail!!", st.size);
+        }
+        const w4 = try segs.sealFromWal(seg_state, "seal_src.0ndb", 4);
+        defer allocator.free(w4);
+        try testing.expectEqual(@as(usize, 2), w4.len);
+        const p7 = try segs.readFrameAt(4, w4[0].offset, w4[0].payload_len, allocator);
+        defer allocator.free(p7);
+        try testing.expectEqualStrings("wal-frame-7", p7);
+
+        const KeepFilter = struct {
+            pub fn keep(_: @This(), ref: ondb.store.segments.FrameRef) bool {
+                return ref.seq == 1 or ref.seq == 2 or ref.seq == 6 or ref.seq == 7 or ref.seq == 8;
+            }
+        };
+        var prune_res = try segs.pruneSegments(KeepFilter{});
+        defer prune_res.deinit(allocator);
+
+        try testing.expectEqual(@as(u32, 1), prune_res.removed_segments);
+        try testing.expectEqual(@as(u32, 1), prune_res.rewritten_segments);
+        try testing.expectEqual(@as(usize, 5), prune_res.kept_frames);
+        try testing.expectEqual(@as(usize, 3), prune_res.removed_frames);
+        try testing.expectEqual(@as(usize, 1), prune_res.remaps.items.len);
+
+        const remap = prune_res.remaps.items[0];
+        try testing.expectEqual(@as(u32, 3), remap.old_seg_id);
+        try testing.expectEqual(w3[1].offset, remap.old_offset);
+        try testing.expectEqual(@as(u64, 6), remap.seq);
+        try testing.expect(remap.new_seg_id > 4);
+
+        const p6 = try segs.readFrameAt(remap.new_seg_id, remap.new_offset, remap.payload_len, allocator);
+        defer allocator.free(p6);
+        try testing.expectEqualStrings("keep-batch-six!", p6);
+
+        try testing.expectError(error.FileNotFound, segs.readFrameAt(2, w2[0].offset, w2[0].payload_len, allocator));
+        segs.hibernate();
+        const p1_after = try segs.readFrameAt(1, w1[0].offset, w1[0].payload_len, allocator);
+        defer allocator.free(p1_after);
+        try testing.expectEqualStrings("batch-one", p1_after);
+    }
+
+    {
+        var hashes: [14]ondb.store.crypto.Hash = undefined;
+        var payloads: [14][200]u8 = undefined;
+        for (0..14) |i| {
+            @memset(&payloads[i], @intCast('A' + i));
+            payloads[i][0] = @intCast(i);
+            hashes[i] = ondb.store.crypto.hashBytes(&payloads[i]);
+        }
+
+        const loose_keep_data = "legacy-loose-keep-payload-0123456789";
+        const loose_keep_hash = ondb.store.crypto.hashBytes(loose_keep_data);
+        const loose_dead_data = "legacy-loose-dead-payload-9876543210";
+        const loose_dead_hash = ondb.store.crypto.hashBytes(loose_dead_data);
+
+        {
+            var bs = try ondb.store.blobs.BlobStore.openWithOptions(allocator, io, dir, "pack_blobs", .{
+                .budget_bytes = 1024,
+                .entry_overhead = 0,
+                .pack_seal_bytes = 512,
+            });
+            defer bs.deinit();
+
+            var batch_items: [14]ondb.store.blobs.BlobItem = undefined;
+            for (0..12) |i| {
+                batch_items[i] = .{ .hash = hashes[i], .data = &payloads[i] };
+            }
+            batch_items[12] = .{ .hash = hashes[0], .data = &payloads[0] };
+            batch_items[13] = .{ .hash = hashes[5], .data = &payloads[5] };
+            try bs.putBatch(&batch_items);
+
+            try testing.expect(bs.maxPackId() >= 1);
+            _ = try bs.put(&payloads[12]);
+            _ = try bs.put(&payloads[13]);
+
+            const sha1_oid: [20]u8 = @splat(0xab);
+            const sha256_oid: [32]u8 = @splat(0xcd);
+            try bs.putGitFallback(&sha1_oid, "git-sha1-content");
+            try bs.putGitFallback(&sha256_oid, "git-sha256-content");
+
+            const g1 = (try bs.getGitFallback(allocator, &sha1_oid)).?;
+            defer allocator.free(g1);
+            try testing.expectEqualStrings("git-sha1-content", g1);
+            const g2 = (try bs.getGitFallback(allocator, &sha256_oid)).?;
+            defer allocator.free(g2);
+            try testing.expectEqualStrings("git-sha256-content", g2);
+        }
+
+        {
+            var blob_dir = try dir.openDir(io, "pack_blobs", .{});
+            defer blob_dir.close(io);
+            const lk_hex = std.fmt.bytesToHex(loose_keep_hash, .lower);
+            var lk_path: [67]u8 = undefined;
+            lk_path[0] = lk_hex[0];
+            lk_path[1] = lk_hex[1];
+            lk_path[2] = '/';
+            @memcpy(lk_path[3..67], &lk_hex);
+            try ondb.store.mmap.atomicWriteFile(io, blob_dir, &lk_path, loose_keep_data);
+
+            const ld_hex = std.fmt.bytesToHex(loose_dead_hash, .lower);
+            var ld_path: [67]u8 = undefined;
+            ld_path[0] = ld_hex[0];
+            ld_path[1] = ld_hex[1];
+            ld_path[2] = '/';
+            @memcpy(ld_path[3..67], &ld_hex);
+            try ondb.store.mmap.atomicWriteFile(io, blob_dir, &ld_path, loose_dead_data);
+        }
+
+        {
+            var bs = try ondb.store.blobs.BlobStore.openWithOptions(allocator, io, dir, "pack_blobs", .{
+                .budget_bytes = 1024,
+                .entry_overhead = 0,
+                .pack_seal_bytes = 512,
+            });
+            defer bs.deinit();
+
+            for (0..14) |i| {
+                try testing.expect(bs.exists(hashes[i]));
+                const got = (try bs.get(allocator, hashes[i])).?;
+                defer allocator.free(got);
+                try testing.expectEqualSlices(u8, &payloads[i], got);
+            }
+
+            try testing.expect(bs.exists(loose_keep_hash));
+            const lk = (try bs.get(allocator, loose_keep_hash)).?;
+            defer allocator.free(lk);
+            try testing.expectEqualStrings(loose_keep_data, lk);
+
+            try testing.expect(bs.exists(loose_dead_hash));
+
+            var live: std.AutoHashMapUnmanaged(ondb.store.crypto.Hash, void) = .empty;
+            defer live.deinit(allocator);
+            try live.put(allocator, hashes[0], {});
+            try live.put(allocator, hashes[7], {});
+            try live.put(allocator, hashes[13], {});
+            try live.put(allocator, loose_keep_hash, {});
+
+            const stats = try bs.gc(&live);
+            try testing.expectEqual(@as(usize, 4), stats.kept_blobs);
+            try testing.expectEqual(@as(usize, 12), stats.removed_blobs);
+            try testing.expect(stats.reclaimed_bytes > 0);
+
+            try testing.expect((try bs.get(allocator, hashes[1])) == null);
+            try testing.expect((try bs.get(allocator, loose_dead_hash)) == null);
+        }
+
+        {
+            var bs = try ondb.store.blobs.BlobStore.open(allocator, io, dir, "pack_blobs", 1024);
+            defer bs.deinit();
+
+            const g0 = (try bs.get(allocator, hashes[0])).?;
+            defer allocator.free(g0);
+            try testing.expectEqualSlices(u8, &payloads[0], g0);
+
+            const g7 = (try bs.get(allocator, hashes[7])).?;
+            defer allocator.free(g7);
+            try testing.expectEqualSlices(u8, &payloads[7], g7);
+
+            const g13 = (try bs.get(allocator, hashes[13])).?;
+            defer allocator.free(g13);
+            try testing.expectEqualSlices(u8, &payloads[13], g13);
+
+            const glk = (try bs.get(allocator, loose_keep_hash)).?;
+            defer allocator.free(glk);
+            try testing.expectEqualStrings(loose_keep_data, glk);
+
+            try testing.expect((try bs.get(allocator, hashes[2])) == null);
+            try testing.expect((try bs.get(allocator, loose_dead_hash)) == null);
+        }
+    }
+
+    {
+        const pool = try ondb.store.blobs.SharedBlobPool.open(allocator, io, dir, "shared_pool", 400);
+        defer pool.release();
+
+        const b0: [50]u8 = @splat(0x11);
+        const b1: [50]u8 = @splat(0x22);
+        const b2: [50]u8 = @splat(0x33);
+        const h0 = try pool.put(&b0);
+        const h1 = try pool.put(&b1);
+        try testing.expectEqual(@as(usize, 2 * (50 + ondb.store.blobs.ENTRY_OVERHEAD)), pool.cacheUsedBytes());
+        _ = try pool.put(&b2);
+        try testing.expect(pool.cacheUsedBytes() <= 400);
+        try testing.expect(!pool.isCached(h0));
+        try testing.expect(pool.isCached(h1));
+
+        pool.hibernate();
+        try testing.expectEqual(@as(usize, 0), pool.cacheUsedBytes());
+        const got0 = (try pool.get(allocator, h0)).?;
+        defer allocator.free(got0);
+        try testing.expectEqualSlices(u8, &b0, got0);
+
+        const WorkerCtx = struct {
+            pool: *ondb.store.blobs.SharedBlobPool,
+            alloc: std.mem.Allocator,
+            worker_id: usize,
+            ok: bool = false,
+            hashes: [16]ondb.store.crypto.Hash = undefined,
+
+            fn run(ctx: *@This()) void {
+                defer ctx.pool.release();
+                var data_buf: [64]u8 = undefined;
+                for (0..16) |j| {
+                    @memset(&data_buf, @intCast((ctx.worker_id * 31 + j) & 0xff));
+                    data_buf[0] = @intCast(ctx.worker_id);
+                    data_buf[1] = @intCast(j);
+                    const h = ctx.pool.put(&data_buf) catch return;
+                    ctx.hashes[j] = h;
+                    const back = (ctx.pool.get(ctx.alloc, h) catch return) orelse return;
+                    defer ctx.alloc.free(back);
+                    if (!std.mem.eql(u8, back, &data_buf)) return;
+                }
+                ctx.ok = true;
+            }
+        };
+
+        var ctxs: [4]WorkerCtx = undefined;
+        var threads: [4]std.Thread = undefined;
+        for (0..4) |w| {
+            pool.retain();
+            ctxs[w] = .{
+                .pool = pool,
+                .alloc = allocator,
+                .worker_id = w,
+            };
+            threads[w] = try std.Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[w]});
+        }
+        for (0..4) |w| {
+            threads[w].join();
+            try testing.expect(ctxs[w].ok);
+        }
+        try testing.expectEqual(@as(u32, 1), pool.refCount());
+        for (0..4) |w| {
+            for (0..16) |j| {
+                try testing.expect(pool.exists(ctxs[w].hashes[j]));
+            }
+        }
+    }
+
+    {
+        var fifth_offset: u64 = 0;
+        {
+            var bulk_log = try ondb.store.log.AppendLog.open(allocator, io, dir, "bulk.0ndb", true);
+            defer bulk_log.deinit();
+
+            const bulk_frames = [_]ondb.store.log.BulkFrame{
+                .{ .kind = 1, .aux = 0, .payload = "bulk-0" },
+                .{ .kind = 1, .aux = 1, .payload = "bulk-1" },
+                .{ .kind = 1, .aux = 2, .payload = "bulk-2" },
+                .{ .kind = 1, .aux = 3, .payload = "bulk-3" },
+                .{ .kind = 1, .aux = 4, .payload = "bulk-4" },
+                .{ .kind = 1, .aux = 5, .payload = "bulk-5" },
+                .{ .kind = 1, .aux = 6, .payload = "bulk-6" },
+                .{ .kind = 1, .aux = 7, .payload = "bulk-7" },
+            };
+            const res = try bulk_log.appendFramesBulk(&bulk_frames);
+            defer allocator.free(res);
+            try testing.expectEqual(@as(usize, 8), res.len);
+            try testing.expectEqual(@as(u64, 1), res[0].seq);
+            try testing.expectEqual(@as(u64, 8), res[7].seq);
+            fifth_offset = bulk_log.index.items[4].offset;
+        }
+        {
+            var fast_log = try ondb.store.log.AppendLog.openWithoutFullHash(allocator, io, dir, "bulk.0ndb", true);
+            defer fast_log.deinit();
+            try testing.expectEqual(@as(usize, 8), fast_log.count());
+            const v7 = try fast_log.readAt(7);
+            try testing.expectEqualStrings("bulk-7", v7.payload);
+        }
+        {
+            var tail_log = try ondb.store.log.AppendLog.openTailRecover(allocator, io, dir, "bulk.0ndb", true, fifth_offset);
+            defer tail_log.deinit();
+            try testing.expectEqual(@as(usize, 4), tail_log.count());
+            const v0 = try tail_log.readAt(0);
+            try testing.expectEqual(@as(u64, 5), v0.header.seq);
+            try testing.expectEqualStrings("bulk-4", v0.payload);
+            const v3 = try tail_log.readAt(3);
+            try testing.expectEqual(@as(u64, 8), v3.header.seq);
+            try testing.expectEqualStrings("bulk-7", v3.payload);
         }
     }
 }
