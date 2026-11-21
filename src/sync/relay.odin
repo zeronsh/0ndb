@@ -198,6 +198,7 @@ Out :: struct {
 	to:      i64,
 	left:    i64,
 	started: bool,
+	reply:   bool,
 	key:     Object_Key,
 	obj:     rawptr,
 }
@@ -1501,6 +1502,7 @@ _on_read :: proc(c: ^Conn, rd: ^prim.Reader, tail: bool) {
 	o.stream = st
 	o.at = from
 	o.to = to
+	o.reply = true
 	_stream_ref(st)
 	if !_push(c, o) {
 		_stream_unref(r, st)
@@ -1750,7 +1752,7 @@ _on_redact :: proc(c: ^Conn, rd: ^prim.Reader) {
 		_fail(c, .Protocol)
 		return
 	}
-	if !_can(c, .Redact, cast([32]u8)id) {
+	if _reserved(cast([32]u8)id) || !_can(c, .Redact, cast([32]u8)id) {
 		_reply_refused(c, .Not_Owner, cast([32]u8)id)
 		return
 	}
@@ -2260,7 +2262,11 @@ _out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
 				v := st.id
 				copy(o.small[FRAME_HEADER:], v[:])
 				prim.put_u64le(o.small[FRAME_HEADER + 32:], u64(o.at))
-				prim.put_u64le(o.small[FRAME_HEADER + 40:], u64(max(_live_len(st), o.to)))
+				length := u64(max(_live_len(st), o.to))
+				if o.reply && o.at + n >= o.to {
+					length |= DATA_FINAL
+				}
+				prim.put_u64le(o.small[FRAME_HEADER + 40:], length)
 				o.hlen = FRAME_HEADER + DATA_FIXED
 				o.hpos = 0
 				o.left = n

@@ -54,7 +54,11 @@ principal_allows :: proc(p: ^Principal, access: Access, id: [32]u8) -> bool {
 		if p.read_all {
 			return true
 		}
-	case .Append, .Drop, .Redact:
+	case .Redact:
+		if p.append_own {
+			return true
+		}
+	case .Append, .Drop:
 		if p.append_own {
 			v := id
 			pid := p.participant

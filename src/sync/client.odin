@@ -41,6 +41,7 @@ Event :: struct {
 	data:    []u8,
 	first:   bool,
 	last:    bool,
+	final:   bool,
 	code:    Code,
 	time:    i64,
 	usage:   i64,
@@ -72,8 +73,23 @@ Client :: struct {
 	streaming: bool,
 	parser:    Parser,
 	bulk:      Event,
+	awaiting:  map[[32]u8]_Await,
+	await_n:   int,
+	epoch:     u64,
+	sent_mark: u64,
+	feed_on:   bool,
+	put_key:   [32]u8,
 	allocator: runtime.Allocator,
 }
+
+@(private)
+_Await :: struct {
+	count: int,
+	mark:  u64,
+}
+
+@(private)
+AWAIT_HELLO :: [32]u8{0 = 0xff, 1 = 0xfe}
 
 client_init :: proc(c: ^Client, allocator := context.allocator) {
 	c^ = {
@@ -81,6 +97,7 @@ client_init :: proc(c: ^Client, allocator := context.allocator) {
 	}
 	c.out = make([dynamic]u8, allocator)
 	c.held = make([dynamic]u8, allocator)
+	c.awaiting = make(map[[32]u8]_Await, allocator)
 	parser_init(&c.parser, false, allocator)
 }
 
@@ -88,6 +105,7 @@ client_destroy :: proc(c: ^Client) {
 	client_reset(c)
 	delete(c.out)
 	delete(c.held)
+	delete(c.awaiting)
 	parser_destroy(&c.parser)
 	c^ = {}
 }
@@ -108,6 +126,9 @@ client_reset :: proc(c: ^Client) {
 	c.streaming = false
 	c.hs_have = 0
 	c.state = .Idle
+	clear(&c.awaiting)
+	c.await_n = 0
+	c.feed_on = false
 	c.bulk = {}
 	parser_reset(&c.parser)
 	parser_release(&c.parser)
@@ -199,7 +220,58 @@ client_hello :: proc(c: ^Client, creds: ^Credentials) -> Error {
 	session_keys_clear(&c.keys)
 	frame_end(&c.out, start, &w) or_return
 	c.state = .Ready
+	_await_add(c, AWAIT_HELLO)
 	return .None
+}
+
+client_awaiting :: proc "contextless" (c: ^Client) -> int {
+	return c.await_n
+}
+
+client_deadline_tick :: proc(c: ^Client) -> (stalled: bool) {
+	moving := client_queued(c) > 0 && c.sent_mark + 1 >= c.epoch
+	if !moving {
+		for _, a in c.awaiting {
+			if a.count > 0 && a.mark + 1 < c.epoch {
+				stalled = true
+				break
+			}
+		}
+	}
+	c.epoch += 1
+	return
+}
+
+@(private)
+_await_add :: proc(c: ^Client, id: [32]u8, n := 1) {
+	a := c.awaiting[id]
+	a.count += n
+	a.mark = c.epoch
+	c.awaiting[id] = a
+	c.await_n += n
+}
+
+@(private)
+_await_done :: proc(c: ^Client, id: [32]u8) {
+	a, ok := c.awaiting[id]
+	if !ok {
+		return
+	}
+	a.count -= 1
+	c.await_n -= 1
+	if a.count <= 0 {
+		delete_key(&c.awaiting, id)
+		return
+	}
+	a.mark = c.epoch
+	c.awaiting[id] = a
+}
+
+@(private)
+_await_progress :: proc(c: ^Client, id: [32]u8) {
+	if a, ok := &c.awaiting[id]; ok {
+		a.mark = c.epoch
+	}
 }
 
 client_pending :: proc "contextless" (c: ^Client) -> []u8 {
@@ -207,6 +279,9 @@ client_pending :: proc "contextless" (c: ^Client) -> []u8 {
 }
 
 client_consumed :: proc(c: ^Client, n: int) {
+	if n > 0 {
+		c.sent_mark = c.epoch
+	}
 	c.out_pos += n
 	if c.out_pos >= len(c.out) {
 		clear(&c.out)
@@ -241,7 +316,9 @@ client_list :: proc(c: ^Client, since: i64) -> Error {
 	start := frame_begin(b, .List) or_return
 	w := prim.writer(b)
 	prim.write_u64le(&w, u64(since))
-	return frame_end(b, start, &w)
+	frame_end(b, start, &w) or_return
+	_await_add(c, cast([32]u8)reserved_id(LIST_TAG, 0))
+	return .None
 }
 
 client_read :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
@@ -251,7 +328,9 @@ client_read :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
 	put_id(&w, cast([32]u8)id)
 	prim.write_u64le(&w, u64(max(from, 0)))
 	prim.write_u64le(&w, u64(max(to, from, 0)))
-	return frame_end(b, start, &w)
+	frame_end(b, start, &w) or_return
+	_await_add(c, cast([32]u8)id)
+	return .None
 }
 
 client_tail :: proc(c: ^Client, id: Stream_Id, n: i64) -> Error {
@@ -260,7 +339,9 @@ client_tail :: proc(c: ^Client, id: Stream_Id, n: i64) -> Error {
 	w := prim.writer(b)
 	put_id(&w, cast([32]u8)id)
 	prim.write_u64le(&w, u64(max(n, 0)))
-	return frame_end(b, start, &w)
+	frame_end(b, start, &w) or_return
+	_await_add(c, cast([32]u8)id)
+	return .None
 }
 
 client_probe :: proc(c: ^Client, ids: []Stream_Id) -> Error {
@@ -275,6 +356,9 @@ client_probe :: proc(c: ^Client, ids: []Stream_Id) -> Error {
 			put_id(&w, cast([32]u8)id)
 		}
 		frame_end(b, start, &w) or_return
+		for id in rest[:n] {
+			_await_add(c, cast([32]u8)id)
+		}
 		rest = rest[n:]
 	}
 	return .None
@@ -294,6 +378,9 @@ client_follow :: proc(c: ^Client, entries: []Follow_Entry, watch: bool) -> Error
 			prim.write_u64le(&w, e.offset)
 		}
 		frame_end(b, start, &w) or_return
+		for e in rest[:n] {
+			_await_add(c, cast([32]u8)e.stream)
+		}
 		rest = rest[n:]
 		if len(rest) == 0 {
 			return .None
@@ -330,6 +417,9 @@ client_get :: proc(c: ^Client, keys: []Object_Key) -> Error {
 			put_id(&w, cast([32]u8)k)
 		}
 		frame_end(b, start, &w) or_return
+		for k in rest[:n] {
+			_await_add(c, cast([32]u8)k)
+		}
 		rest = rest[n:]
 	}
 	return .None
@@ -342,7 +432,9 @@ client_redact :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
 	put_id(&w, cast([32]u8)id)
 	prim.write_u64le(&w, u64(max(from, 0)))
 	prim.write_u64le(&w, u64(max(to, from, 0)))
-	return frame_end(b, start, &w)
+	frame_end(b, start, &w) or_return
+	_await_add(c, cast([32]u8)id)
+	return .None
 }
 
 client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil, filtered := false, additive := false) -> Error {
@@ -367,6 +459,10 @@ client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil
 			}
 		}
 		frame_end(b, start, &w) or_return
+		if !((additive || !first) && c.feed_on) {
+			_await_add(c, cast([32]u8)reserved_id(FEED_TAG, 0))
+		}
+		c.feed_on = true
 		rest = rest[n:]
 		first = false
 	}
@@ -385,6 +481,9 @@ client_forget :: proc(c: ^Client, keys: []Object_Key) -> Error {
 			put_id(&w, cast([32]u8)k)
 		}
 		frame_end(b, start, &w) or_return
+		for k in rest[:n] {
+			_await_add(c, cast([32]u8)k)
+		}
 		rest = rest[n:]
 	}
 	return .None
@@ -395,7 +494,9 @@ client_drop :: proc(c: ^Client, id: Stream_Id) -> Error {
 	start := frame_begin(b, .Drop) or_return
 	w := prim.writer(b)
 	put_id(&w, cast([32]u8)id)
-	return frame_end(b, start, &w)
+	frame_end(b, start, &w) or_return
+	_await_add(c, cast([32]u8)id)
+	return .None
 }
 
 client_append_reserve :: proc(c: ^Client, id: Stream_Id, at: i64, n: int) -> (dst: []u8, err: Error) {
@@ -423,7 +524,10 @@ client_append_commit :: proc(c: ^Client, reserved: int, used: int) {
 		return
 	}
 	prim.put_u32le(b[start:start + 4], u32(APPEND_FIXED + used))
+	id: [32]u8
+	copy(id[:], b[start + FRAME_HEADER:][:32])
 	resize(b, len(b) - (reserved - used))
+	_await_add(c, id)
 }
 
 client_put_begin :: proc(c: ^Client, key: Object_Key, total: i64) -> Error {
@@ -439,6 +543,8 @@ client_put_begin :: proc(c: ^Client, key: Object_Key, total: i64) -> Error {
 	k := key
 	copy(c.out[start + FRAME_HEADER:], k[:])
 	c.streaming = true
+	c.put_key = cast([32]u8)key
+	_await_add(c, c.put_key)
 	return .None
 }
 
@@ -451,6 +557,7 @@ client_put_reserve :: proc(c: ^Client, n: int) -> (dst: []u8, err: Error) {
 		resize(&c.out, start)
 		return nil, .No_Memory
 	}
+	_await_progress(c, c.put_key)
 	return c.out[start:], .None
 }
 
@@ -518,7 +625,9 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		case .Data:
 			ev.kind = .Data
 			ev.at = get_i64(&r)
-			ev.length = get_i64(&r)
+			raw := prim.read_u64le(&r)
+			ev.final = raw & DATA_FINAL != 0
+			ev.length = i64(raw & ~DATA_FINAL)
 		case .Object:
 			ev.kind = .Object
 		case:
@@ -529,6 +638,7 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		}
 		c.bulk = ev
 		c.bulk.first = false
+		_await_progress(c, ev.id)
 		return handler(user, &ev)
 	case .Bulk_Data:
 		ev := c.bulk
@@ -539,6 +649,11 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		ev := c.bulk
 		ev.last = true
 		c.bulk = {}
+		if ev.kind == .Object || ev.final {
+			_await_done(c, ev.id)
+		} else {
+			_await_progress(c, ev.id)
+		}
 		return handler(user, &ev)
 	case .Control:
 		return _client_control(c, it, handler, user)
@@ -556,6 +671,7 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		if prim.read_u8(&r) != PROTOCOL_VERSION {
 			return .Protocol
 		}
+		_await_done(c, AWAIT_HELLO)
 		ev.time = get_i64(&r)
 		ev.usage = get_i64(&r)
 		ev.quota = get_i64(&r)
@@ -565,17 +681,27 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.more = prim.read_bool(&r)
 		n := int(prim.read_u16le(&r))
 		ev.entries = prim.read_raw(&r, n * 40)
+		if ev.more {
+			_await_progress(c, cast([32]u8)reserved_id(LIST_TAG, 0))
+		} else {
+			_await_done(c, cast([32]u8)reserved_id(LIST_TAG, 0))
+		}
 	case .Appended, .Conflict, .Created:
 		ev.kind = .Appended if it.frame == .Appended else .Conflict if it.frame == .Conflict else .Created
 		ev.id = get_id32(&r)
 		ev.length = get_i64(&r)
+		if it.frame != .Created {
+			_await_done(c, ev.id)
+		}
 	case .Stored, .Missing, .Dropped, .Forgotten:
 		ev.kind = .Stored if it.frame == .Stored else .Missing if it.frame == .Missing else .Dropped if it.frame == .Dropped else .Forgotten
 		ev.id = get_id32(&r)
+		_await_done(c, ev.id)
 	case .Refused:
 		ev.kind = .Refused
 		ev.code = Code(prim.read_u8(&r))
 		ev.id = get_id32(&r)
+		_await_done(c, ev.id)
 	case .Error:
 		ev.kind = .Error
 		ev.code = Code(prim.read_u8(&r))
@@ -583,11 +709,13 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.kind = .Announce
 		ev.at = get_i64(&r)
 		ev.length = get_i64(&r)
+		_await_done(c, cast([32]u8)reserved_id(FEED_TAG, 0))
 		n := int(prim.read_u16le(&r))
 		ev.entries = prim.read_raw(&r, n * FEED_ENTRY)
 	case .Redacted:
 		ev.kind = .Redacted
 		ev.id = get_id32(&r)
+		_await_done(c, ev.id)
 		ev.at = get_i64(&r)
 		ev.length = get_i64(&r)
 	case .Length, .Probed:
@@ -604,6 +732,7 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 			if !prim.reader_ok(&r) {
 				return .Protocol
 			}
+			_await_done(c, e.id)
 			handler(user, &e) or_return
 		}
 		return .None

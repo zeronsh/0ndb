@@ -356,6 +356,10 @@ replicator_link_down :: proc(r: ^Replicator, err: Error = .Closed) {
 
 @(private)
 _repl_close :: proc(r: ^Replicator) {
+	if r.deadline != 0 {
+		prim.timer_cancel(r.loop, r.deadline)
+		r.deadline = 0
+	}
 	if r.watch != 0 {
 		prim.unwatch(r.loop, r.watch)
 		r.watch = 0
@@ -386,6 +390,14 @@ _repl_fail :: proc(r: ^Replicator, err: Error) {
 	was := r.phase
 	_repl_close(r)
 	_resolver_stop(r)
+	if len(r.endpoints) > 1 {
+		r.relay_at = (r.relay_at + 1) % len(r.endpoints)
+		r.endpoint = r.endpoints[r.relay_at]
+		r.cfg.relay_public = r.publics[r.relay_at]
+		r.feed_cursor = -1
+		r.listed = false
+		r.cursor = 0
+	}
 	if r.timer != 0 {
 		prim.timer_cancel(r.loop, r.timer)
 		r.timer = 0

@@ -25,15 +25,6 @@ Listing :: struct {
 	cursor: i64,
 }
 
-reserved_id :: proc "contextless" (tag: u8, epoch: u64) -> (id: Stream_Id) {
-	for i in 0 ..< 16 {
-		id[i] = 0xff
-	}
-	id[16] = tag
-	prim.put_u64le(id[24:], epoch)
-	return
-}
-
 @(private)
 _reserved :: proc "contextless" (id: [32]u8) -> bool {
 	for i in 0 ..< 16 {
@@ -124,12 +115,6 @@ _feed_add_redaction :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, from, to: i
 	return need
 }
 
-feed_redaction :: proc "contextless" (length: u64) -> (at: i64, end: bool, ok: bool) {
-	if length & FEED_REDACT == 0 || length == FEED_DROPPED {
-		return
-	}
-	return i64(length & (FEED_REDACT_END - 1)), length & FEED_REDACT_END != 0, true
-}
 
 @(private)
 _redlog_open :: proc(r: ^Relay, sp: ^Space_State) -> Error {

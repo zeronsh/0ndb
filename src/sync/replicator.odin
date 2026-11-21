@@ -28,6 +28,7 @@ Repl_Event_Kind :: enum u8 {
 	Checkpoint,
 	Checkpoint_Missing,
 	Redacted,
+	Local_Redacted,
 	Quarantined,
 	Object_Shredded,
 }
@@ -65,9 +66,15 @@ Replicator_Config :: struct {
 	filtered:     bool,
 	padding:      bool,
 	random:       prim.Random,
+	relays:       []Relay_Address,
 	kernel_tls:   bool,
 	on_event:     Repl_Handler,
 	user:         rawptr,
+}
+
+Relay_Address :: struct {
+	addr:   string,
+	public: Public_Key,
 }
 
 Client_Link :: struct {
@@ -164,6 +171,10 @@ Replicator :: struct {
 	cfg:        Replicator_Config,
 	dir:        string,
 	endpoint:   Endpoint,
+	endpoints:  [dynamic]Endpoint,
+	publics:    [dynamic]Public_Key,
+	relay_at:   int,
+	deadline:   prim.Timer,
 	phase:      Phase,
 	fd:         prim.Fd,
 	watch:      prim.Watch,
@@ -242,7 +253,20 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.vfs = cfg.vfs if cfg.vfs.procs != nil else prim.os_vfs()
 	r.external = cfg.link.send != nil
 	if !r.external {
-		r.endpoint = endpoint_parse(cfg.relay) or_return
+		r.endpoints = make([dynamic]Endpoint, allocator)
+		r.publics = make([dynamic]Public_Key, allocator)
+		if len(cfg.relays) > 0 {
+			for a in cfg.relays {
+				append(&r.endpoints, endpoint_parse(a.addr) or_return)
+				append(&r.publics, a.public)
+			}
+		} else {
+			append(&r.endpoints, endpoint_parse(cfg.relay) or_return)
+			append(&r.publics, cfg.relay_public)
+		}
+		r.endpoint = r.endpoints[0]
+		r.cfg.relay_public = r.publics[0]
+		r.cfg.relays = nil
 		if cfg.noise_static != nil {
 			ecdh.private_key_set(&r.static, cfg.noise_static)
 		} else if !x25519_generate(&r.static, cfg.random) {
@@ -312,6 +336,12 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.fetches)
 	delete(r.reap)
 	delete(r.reap_local)
+	delete(r.endpoints)
+	delete(r.publics)
+	if r.deadline != 0 {
+		prim.timer_cancel(r.loop, r.deadline)
+		r.deadline = 0
+	}
 	ecdh.private_key_clear(&r.static)
 	if r.feed_fd >= 0 {
 		prim.close_file(r.vfs, r.feed_fd)
@@ -986,6 +1016,35 @@ _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
 }
 
 @(private)
+DEADLINE_TICK_MS :: 10_000
+
+@(private)
+_deadline_sync :: proc(r: ^Replicator) {
+	if r.loop == nil {
+		return
+	}
+	if r.phase == .Ready && client_awaiting(&r.client) > 0 {
+		if r.deadline == 0 {
+			r.deadline = prim.timer(r.loop, DEADLINE_TICK_MS, r, _on_deadline)
+		}
+	} else if r.deadline != 0 {
+		prim.timer_cancel(r.loop, r.deadline)
+		r.deadline = 0
+	}
+}
+
+@(private)
+_on_deadline :: proc(l: ^prim.Loop, data: rawptr) {
+	r := cast(^Replicator)data
+	r.deadline = 0
+	_enter(r)
+	defer _leave(r)
+	if r.phase == .Ready && client_deadline_tick(&r.client) {
+		_repl_fail(r, .Timeout)
+	}
+}
+
+@(private)
 _enter :: proc(r: ^Replicator) {
 	r.hold += 1
 }
@@ -996,6 +1055,7 @@ _leave :: proc(r: ^Replicator) {
 	if r.hold > 0 {
 		return
 	}
+	_deadline_sync(r)
 	for len(r.reap) > 0 {
 		rm := pop(&r.reap)
 		rm.reaping = false

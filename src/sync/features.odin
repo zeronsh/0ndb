@@ -373,9 +373,17 @@ _feed_cursor_load :: proc(r: ^Replicator) {
 	r.feed_fd = fd
 	newest, _, count, serr := slots_read(r.vfs, fd)
 	if serr == .None && count > 0 {
-		r.feed_cursor = newest.value
 		r.feed_seq = newest.seq
+		if newest.start == _relay_tag(r) {
+			r.feed_cursor = newest.value
+		}
 	}
+}
+
+@(private)
+_relay_tag :: proc(r: ^Replicator) -> i64 {
+	k := r.cfg.relay_public
+	return i64(prim.get_u64le(k[:8]) >> 1)
 }
 
 @(private)
@@ -415,7 +423,7 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 		r.feed_cursor = ev.length
 		if r.feed_fd >= 0 {
 			r.feed_seq += 1
-			slot_write(r.vfs, r.feed_fd, Slot{seq = r.feed_seq, value = r.feed_cursor, start = 0})
+			slot_write(r.vfs, r.feed_fd, Slot{seq = r.feed_seq, value = r.feed_cursor, start = _relay_tag(r)})
 		}
 	}
 	_fetch_check(r)
@@ -424,7 +432,15 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 @(private)
 _replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
 	dev := stream_device(id)
-	if dev == r.cfg.self || to <= from {
+	if to <= from {
+		return
+	}
+	if dev == r.cfg.self {
+		ev := Repl_Event{kind = .Local_Redacted, device = dev, stream = id, from = from, to = to}
+		if l, ok := r.locals[id]; ok {
+			ev.name, ev.epoch = l.name, l.epoch
+		}
+		_emit(r, ev)
 		return
 	}
 	if rm, ok := r.remotes[id]; ok {

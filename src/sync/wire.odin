@@ -3,7 +3,8 @@ package osync
 import "../journal"
 import "../prim"
 
-PROTOCOL_VERSION :: 1
+PROTOCOL_VERSION :: 2
+DATA_FINAL :: u64(1) << 63
 
 FRAME_HEADER :: 5
 CONTROL_MAX :: 64 * 1024
@@ -317,4 +318,20 @@ get_i64 :: proc "contextless" (r: ^prim.Reader) -> i64 {
 		return 0
 	}
 	return i64(v)
+}
+
+reserved_id :: proc "contextless" (tag: u8, epoch: u64) -> (id: Stream_Id) {
+	for i in 0 ..< 16 {
+		id[i] = 0xff
+	}
+	id[16] = tag
+	prim.put_u64le(id[24:], epoch)
+	return
+}
+
+feed_redaction :: proc "contextless" (length: u64) -> (at: i64, end: bool, ok: bool) {
+	if length & FEED_REDACT == 0 || length == FEED_DROPPED {
+		return
+	}
+	return i64(length & (FEED_REDACT_END - 1)), length & FEED_REDACT_END != 0, true
 }
