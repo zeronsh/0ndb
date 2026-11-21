@@ -1279,6 +1279,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
 
     try runCrdtFuzzSuite(allocator);
     try runDiffAndMerge3PropertyFuzz(allocator);
+    try runNativeGitLayerSuite(allocator, io);
 }
 
 const FuzzFileSnap = struct {
@@ -2833,7 +2834,7 @@ test "dumb protected E2EE relay syncs session list, statuses, Merkle paginated m
             var bad_hdr: [ondb.sync.wire.WIRE_HEADER_LEN]u8 = undefined;
             bad_hdr[0] = ondb.sync.wire.WIRE_MAGIC[0];
             bad_hdr[1] = ondb.sync.wire.WIRE_MAGIC[1];
-            bad_hdr[2] = @intFromEnum(ondb.sync.wire.Op.put_frame);
+            bad_hdr[2] = @backingInt(ondb.sync.wire.Op.put_frame);
             bad_hdr[3] = 0;
             std.mem.writeInt(u32, bad_hdr[4..8], @intCast(ondb.sync.wire.MAX_FRAME_LEN + 4096), .little);
             const wrc = linux.sendto(bad_fd, &bad_hdr, bad_hdr.len, linux.MSG.NOSIGNAL, null, 0);
@@ -2881,5 +2882,663 @@ test "dumb protected E2EE relay syncs session list, statuses, Merkle paginated m
             try testing.expectEqual(@as(u64, 13), v2.header.seq);
             try testing.expectEqualStrings("rec-13", v2.payload);
         }
+    }
+}
+
+fn runGitTestCmd(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, args: []const []const u8) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "git");
+    try argv.appendSlice(allocator, args);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    try env_map.put("GIT_TERMINAL_PROMPT", "0");
+    try env_map.put("GIT_AUTHOR_NAME", "tester");
+    try env_map.put("GIT_AUTHOR_EMAIL", "tester@local");
+    try env_map.put("GIT_COMMITTER_NAME", "tester");
+    try env_map.put("GIT_COMMITTER_EMAIL", "tester@local");
+
+    const res = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer allocator.free(res.stderr);
+    const ok = switch (res.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        allocator.free(res.stdout);
+        return error.GitCommandFailed;
+    }
+    return res.stdout;
+}
+
+fn writeTestFile(io: std.Io, dir_path: []const u8, rel_path: []const u8, data: []const u8, executable: bool) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
+    if (std.fs.path.dirname(rel_path)) |parent| {
+        try dir.createDirPath(io, parent);
+    }
+    const f = try dir.createFile(io, rel_path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writePositionalAll(io, data, 0);
+    if (executable) {
+        try f.setPermissions(io, .fromMode(0o755));
+    }
+}
+
+fn runNativeGitLayerSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const git_dirs = ondb.fs.git_dirs;
+    const git_index = ondb.fs.git_index;
+    const git_odb = ondb.fs.git_odb;
+    const git = ondb.fs.git;
+
+    {
+        try testing.expect(git_dirs.GitOid.ZERO.isZero());
+        const oid1 = git_dirs.GitOid.ofBlob(.sha1, "hello world\n");
+        var hbuf1: [64]u8 = undefined;
+        const hex1 = oid1.toHex(&hbuf1);
+        try testing.expectEqualStrings("3b18e512dba79e4c8300dd08aeb37f8e728b8dad", hex1);
+        for (oid1.bytes[20..32]) |b| try testing.expectEqual(@as(u8, 0), b);
+
+        const parsed1 = try git_dirs.GitOid.fromHex(hex1);
+        try testing.expect(oid1.eql(parsed1));
+        try testing.expectEqual(std.math.Order.eq, oid1.order(parsed1));
+        try testing.expectEqual(@as(usize, 20), parsed1.slice().len);
+
+        const oid2 = git_dirs.GitOid.ofBlob(.sha256, "hello world\n");
+        var hbuf2: [64]u8 = undefined;
+        const hex2 = oid2.toHex(&hbuf2);
+        try testing.expectEqual(@as(usize, 64), hex2.len);
+        const parsed2 = try git_dirs.GitOid.fromHex(hex2);
+        try testing.expect(oid2.eql(parsed2));
+
+        var oid_map: std.HashMapUnmanaged(git_dirs.GitOid, u32, git_dirs.GitOid.hashContext, std.hash_map.default_max_load_percentage) = .empty;
+        defer oid_map.deinit(allocator);
+        try oid_map.put(allocator, oid1, 42);
+        try oid_map.put(allocator, oid2, 99);
+        try testing.expectEqual(@as(?u32, 42), oid_map.get(parsed1));
+        try testing.expectEqual(@as(?u32, 99), oid_map.get(parsed2));
+    }
+
+    const base_tmp = "/tmp/0ndb-verify-native-git";
+    cleanDir(io, base_tmp);
+    defer cleanDir(io, base_tmp);
+
+    const repo1 = "/tmp/0ndb-verify-native-git/repo-sha1";
+    const wt1 = "/tmp/0ndb-verify-native-git/wt-sha1";
+    const alt_repo = "/tmp/0ndb-verify-native-git/repo-alt";
+    const clone_dst = "/tmp/0ndb-verify-native-git/reflink-dst";
+    const repo256 = "/tmp/0ndb-verify-native-git/repo-sha256";
+
+    try std.Io.Dir.cwd().createDirPath(io, repo1);
+    {
+        const out = try runGitTestCmd(allocator, io, repo1, &.{ "init", "-b", "main" });
+        allocator.free(out);
+    }
+
+    const empty_data = "";
+    const short_a = "content-a\n";
+    const short_ab = "content-ab\n";
+    const exec_script = "#!/bin/sh\necho hi\n";
+    const deep_text = "deep nested file content\n";
+
+    const big_blob = try allocator.alloc(u8, 80 * 1024);
+    defer allocator.free(big_blob);
+    for (big_blob, 0..) |*b, i| {
+        b.* = @intCast((i * 31 + 17) % 95 + 32);
+    }
+
+    try writeTestFile(io, repo1, "a", short_a, false);
+    try writeTestFile(io, repo1, "ab", short_ab, false);
+    try writeTestFile(io, repo1, "empty.txt", empty_data, false);
+    try writeTestFile(io, repo1, "run.sh", exec_script, true);
+    try writeTestFile(io, repo1, "sub/deep/file.txt", deep_text, false);
+    try writeTestFile(io, repo1, "large.bin", big_blob, false);
+
+    {
+        const o1 = try runGitTestCmd(allocator, io, repo1, &.{ "add", "-A" });
+        allocator.free(o1);
+        const o2 = try runGitTestCmd(allocator, io, repo1, &.{ "commit", "-m", "init" });
+        allocator.free(o2);
+    }
+
+    var dirs = (try git_dirs.GitDirs.locate(allocator, io, repo1)).?;
+    defer dirs.deinit(allocator);
+    try testing.expectEqual(git_dirs.ObjectFormat.sha1, dirs.config.object_format);
+    try testing.expectEqualStrings(dirs.git_dir, dirs.common_dir);
+
+    {
+        const sub_path = "/tmp/0ndb-verify-native-git/repo-sha1/sub/deep";
+        var sub_dirs = (try git_dirs.GitDirs.locate(allocator, io, sub_path)).?;
+        defer sub_dirs.deinit(allocator);
+        try testing.expectEqualStrings(dirs.worktree_root, sub_dirs.worktree_root);
+        try testing.expectEqualStrings(dirs.git_dir, sub_dirs.git_dir);
+    }
+
+    try testing.expect(git.isGitRepo(allocator, io, repo1));
+    try testing.expect(!git.isGitRepo(allocator, io, "/tmp"));
+
+    var h1 = try git.head(allocator, io, repo1);
+    defer h1.deinit(allocator);
+    try testing.expectEqualStrings("main", h1.branch.?);
+    try testing.expectEqual(@as(usize, 40), h1.commit.?.len);
+
+    const tip1 = (try git.branchTip(allocator, io, repo1, "main")).?;
+    defer allocator.free(tip1);
+    try testing.expectEqualStrings(h1.commit.?, tip1);
+
+    try dirs.ensureExclude(io);
+    try dirs.ensureExclude(io);
+    {
+        var cd = try std.Io.Dir.cwd().openDir(io, dirs.common_dir, .{});
+        defer cd.close(io);
+        const ef = try cd.openFile(io, "info/exclude", .{});
+        defer ef.close(io);
+        const st = try ef.stat(io);
+        const raw = try allocator.alloc(u8, @intCast(st.size));
+        defer allocator.free(raw);
+        _ = try ef.readPositionalAll(io, raw, 0);
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, raw, '\n');
+        while (it.next()) |ln| {
+            if (std.mem.eql(u8, ln, "/.0ndb/")) count += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+
+    try testing.expect(!(try dirs.hasCustomFilters(allocator, io)));
+    try writeTestFile(io, repo1, ".gitattributes", "*.bin filter=lfs\n", false);
+    try testing.expect(try dirs.hasCustomFilters(allocator, io));
+    try writeTestFile(io, repo1, ".gitattributes", "*.txt -ident !eol\n", false);
+    try testing.expect(!(try dirs.hasCustomFilters(allocator, io)));
+    try writeTestFile(io, repo1, ".gitattributes", "*.txt eol=crlf\n", false);
+    try testing.expect(try dirs.hasCustomFilters(allocator, io));
+    try writeTestFile(io, repo1, ".gitattributes", "*.txt ident\n", false);
+    try testing.expect(try dirs.hasCustomFilters(allocator, io));
+    try writeTestFile(io, repo1, ".gitattributes", "*.txt working-tree-encoding=UTF-16\n", false);
+    try testing.expect(try dirs.hasCustomFilters(allocator, io));
+    {
+        var rdir = try std.Io.Dir.cwd().openDir(io, repo1, .{});
+        defer rdir.close(io);
+        try rdir.deleteFile(io, ".gitattributes");
+    }
+
+    try testing.expect(!dirs.isBusy(io));
+    try writeTestFile(io, dirs.git_dir, "index.lock", "", false);
+    try testing.expect(dirs.isBusy(io));
+    {
+        var gdir = try std.Io.Dir.cwd().openDir(io, dirs.git_dir, .{});
+        defer gdir.close(io);
+        try gdir.deleteFile(io, "index.lock");
+    }
+    try testing.expect(!dirs.isBusy(io));
+
+    try testing.expect(git.operationInProgress(allocator, io, repo1) == null);
+    try writeTestFile(io, dirs.git_dir, "MERGE_HEAD", h1.commit.?, false);
+    try testing.expectEqualStrings("merge", git.operationInProgress(allocator, io, repo1).?);
+    {
+        var gdir = try std.Io.Dir.cwd().openDir(io, dirs.git_dir, .{});
+        defer gdir.close(io);
+        try gdir.deleteFile(io, "MERGE_HEAD");
+    }
+
+    const stamp = (try dirs.indexStamp(io)).?;
+    try testing.expect(stamp.size > 0);
+
+    var idx_v2 = (try git_index.GitIndex.load(allocator, io, &dirs)).?;
+    defer idx_v2.deinit(allocator);
+    try testing.expectEqual(@as(u32, 2), idx_v2.version);
+    try testing.expectEqual(@as(usize, 6), idx_v2.entries.len);
+
+    const e_a = idx_v2.find("a").?;
+    try testing.expect(e_a.oid.eql(git_dirs.GitOid.ofBlob(.sha1, short_a)));
+    try testing.expect(e_a.isRegularFile());
+    try testing.expect(!e_a.isExecutable());
+
+    const e_ab = idx_v2.find("ab").?;
+    try testing.expect(e_ab.oid.eql(git_dirs.GitOid.ofBlob(.sha1, short_ab)));
+
+    const e_sh = idx_v2.find("run.sh").?;
+    try testing.expect(e_sh.isExecutable());
+    try testing.expect(idx_v2.find("does-not-exist") == null);
+
+    {
+        var rdir = try std.Io.Dir.cwd().openDir(io, repo1, .{});
+        defer rdir.close(io);
+        const st_sh = try rdir.statFile(io, "run.sh", .{});
+
+        idx_v2.index_mtime_s = e_sh.stat.mtime_s;
+        idx_v2.index_mtime_ns = e_sh.stat.mtime_ns;
+        try testing.expect(!idx_v2.isStatClean(e_sh, st_sh, dirs.config));
+
+        idx_v2.index_mtime_s = e_sh.stat.mtime_s + 10;
+        try testing.expect(idx_v2.isStatClean(e_sh, st_sh, dirs.config));
+
+        var flipped_stat = st_sh;
+        flipped_stat.permissions = .fromMode(0o644);
+        try testing.expect(!idx_v2.isStatClean(e_sh, flipped_stat, dirs.config));
+        var no_filemode = dirs.config;
+        no_filemode.filemode = false;
+        try testing.expect(idx_v2.isStatClean(e_sh, flipped_stat, no_filemode));
+    }
+
+    {
+        const o_v4 = try runGitTestCmd(allocator, io, repo1, &.{ "update-index", "--index-version", "4" });
+        allocator.free(o_v4);
+    }
+    var idx_v4 = (try git_index.GitIndex.load(allocator, io, &dirs)).?;
+    defer idx_v4.deinit(allocator);
+    try testing.expectEqual(@as(u32, 4), idx_v4.version);
+    try testing.expectEqual(idx_v2.entries.len, idx_v4.entries.len);
+    for (idx_v2.entries, idx_v4.entries) |ev2, ev4| {
+        try testing.expectEqualStrings(ev2.path, ev4.path);
+        try testing.expect(ev2.oid.eql(ev4.oid));
+    }
+
+    {
+        var bad_buf: [64]u8 = undefined;
+        @memcpy(bad_buf[0..4], "DIRC");
+        std.mem.writeInt(u32, bad_buf[4..8], 2, .big);
+        std.mem.writeInt(u32, bad_buf[8..12], 0, .big);
+        @memcpy(bad_buf[12..16], "link");
+        std.mem.writeInt(u32, bad_buf[16..20], 0, .big);
+        @memset(bad_buf[20..40], 0);
+        try testing.expectError(error.UnsupportedIndexExtension, git_index.GitIndex.parse(allocator, bad_buf[0..40], .sha1, 100, 0, 40, 1));
+
+        @memcpy(bad_buf[12..16], "sdir");
+        try testing.expectError(error.UnsupportedIndexExtension, git_index.GitIndex.parse(allocator, bad_buf[0..40], .sha1, 100, 0, 40, 1));
+
+        @memcpy(bad_buf[12..16], "TREE");
+        var skip_hash_idx = try git_index.GitIndex.parse(allocator, bad_buf[0..40], .sha1, 100, 0, 40, 1);
+        skip_hash_idx.deinit(allocator);
+    }
+
+    try writeTestFile(io, repo1, "a", "content-a-modified\n", false);
+    try writeTestFile(io, repo1, "added.txt", "brand new\n", false);
+    {
+        var rdir = try std.Io.Dir.cwd().openDir(io, repo1, .{});
+        defer rdir.close(io);
+        try rdir.deleteFile(io, "ab");
+    }
+
+    {
+        const dirty = try git.dirtyPaths(allocator, io, repo1);
+        defer git.freePaths(allocator, dirty);
+        try testing.expectEqual(@as(usize, 3), dirty.len);
+    }
+
+    {
+        const o1 = try runGitTestCmd(allocator, io, repo1, &.{ "add", "-A" });
+        allocator.free(o1);
+    }
+    var idx_after = (try git_index.GitIndex.load(allocator, io, &dirs)).?;
+    defer idx_after.deinit(allocator);
+
+    const diffs = try git_index.GitIndex.diffIndices(allocator, &idx_v4, &idx_after);
+    defer allocator.free(diffs);
+    try testing.expectEqual(@as(usize, 3), diffs.len);
+    try testing.expectEqual(git_index.IndexDiffKind.modified, diffs[0].kind);
+    try testing.expectEqualStrings("a", diffs[0].path);
+    try testing.expectEqual(git_index.IndexDiffKind.removed, diffs[1].kind);
+    try testing.expectEqualStrings("ab", diffs[1].path);
+    try testing.expectEqual(git_index.IndexDiffKind.added, diffs[2].kind);
+    try testing.expectEqualStrings("added.txt", diffs[2].path);
+
+    {
+        const o2 = try runGitTestCmd(allocator, io, repo1, &.{ "commit", "-m", "second" });
+        allocator.free(o2);
+    }
+    var h2 = try git.head(allocator, io, repo1);
+    defer h2.deinit(allocator);
+    {
+        const changed = try git.changedPaths(allocator, io, repo1, h1.commit.?, h2.commit.?);
+        defer git.freePaths(allocator, changed);
+        try testing.expectEqual(@as(usize, 3), changed.len);
+    }
+
+    var delta_oids: std.ArrayList(git_dirs.GitOid) = .empty;
+    defer delta_oids.deinit(allocator);
+    var delta_payloads: std.ArrayList([]u8) = .empty;
+    defer {
+        for (delta_payloads.items) |p| allocator.free(p);
+        delta_payloads.deinit(allocator);
+    }
+
+    var base_text: std.ArrayList(u8) = .empty;
+    defer base_text.deinit(allocator);
+    for (0..400) |line_i| {
+        var lbuf: [64]u8 = undefined;
+        const ln = try std.fmt.bufPrint(&lbuf, "line {d:0>4}: alpha beta gamma delta epsilon zeta eta\n", .{line_i});
+        try base_text.appendSlice(allocator, ln);
+    }
+
+    for (0..20) |rev| {
+        var cur: std.ArrayList(u8) = .empty;
+        defer cur.deinit(allocator);
+        try cur.appendSlice(allocator, base_text.items);
+        var tail_buf: [64]u8 = undefined;
+        const tail = try std.fmt.bufPrint(&tail_buf, "revision-marker-{d}\n", .{rev});
+        try cur.appendSlice(allocator, tail);
+
+        const owned_payload = try allocator.dupe(u8, cur.items);
+        errdefer allocator.free(owned_payload);
+        try delta_payloads.append(allocator, owned_payload);
+        try delta_oids.append(allocator, git_dirs.GitOid.ofBlob(.sha1, owned_payload));
+
+        try writeTestFile(io, repo1, "evolving.txt", owned_payload, false);
+        const oa = try runGitTestCmd(allocator, io, repo1, &.{ "add", "evolving.txt" });
+        allocator.free(oa);
+        var msg_buf: [32]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&msg_buf, "rev-{d}", .{rev});
+        const oc = try runGitTestCmd(allocator, io, repo1, &.{ "commit", "-m", msg });
+        allocator.free(oc);
+    }
+
+    const odb = try git_odb.GitOdb.open(allocator, io, dirs.common_dir, dirs.config.object_format, "refs/0ndb/testpin");
+    defer odb.deinit();
+
+    const big_oid = git_dirs.GitOid.ofBlob(.sha1, big_blob);
+    const empty_oid = git_dirs.GitOid.ofBlob(.sha1, empty_data);
+    try testing.expect(odb.contains(big_oid));
+    try testing.expect(odb.contains(empty_oid));
+
+    {
+        const loose_read = (try odb.readBlobAlloc(allocator, big_oid)).?;
+        defer allocator.free(loose_read);
+        try testing.expectEqualSlices(u8, big_blob, loose_read);
+
+        const loose_empty = (try odb.readBlobAlloc(allocator, empty_oid)).?;
+        defer allocator.free(loose_empty);
+        try testing.expectEqual(@as(usize, 0), loose_empty.len);
+
+        var stream_out = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
+        defer stream_out.deinit();
+        const copied = (try odb.copyBlobToFile(delta_oids.items[0], &stream_out.writer)).?;
+        try testing.expectEqual(delta_payloads.items[0].len, copied);
+        try testing.expectEqualSlices(u8, delta_payloads.items[0], stream_out.written());
+    }
+
+    {
+        const gc_out = try runGitTestCmd(allocator, io, repo1, &.{ "gc", "--aggressive", "--prune=now" });
+        allocator.free(gc_out);
+        const pr_out = try runGitTestCmd(allocator, io, repo1, &.{ "pack-refs", "--all" });
+        allocator.free(pr_out);
+    }
+
+    {
+        var packed_head = try git.head(allocator, io, repo1);
+        defer packed_head.deinit(allocator);
+        try testing.expectEqualStrings("main", packed_head.branch.?);
+        try testing.expect(packed_head.commit != null);
+        const packed_tip = (try git.branchTip(allocator, io, repo1, "main")).?;
+        defer allocator.free(packed_tip);
+        try testing.expectEqualStrings(packed_head.commit.?, packed_tip);
+    }
+
+    odb.hibernate();
+
+    for (delta_oids.items, delta_payloads.items) |d_oid, expected| {
+        const got = (try odb.readBlobAlloc(allocator, d_oid)).?;
+        defer allocator.free(got);
+        try testing.expectEqualSlices(u8, expected, got);
+    }
+
+    {
+        const cached = (try odb.readBlobCached(big_oid)).?;
+        try testing.expectEqualSlices(u8, big_blob, cached);
+
+        var reader = odb.externalReader();
+        defer reader.deinit();
+        reader.lock();
+        defer reader.unlock();
+        const locked_slice = (try reader.readBlobCachedLocked(delta_oids.items[10])).?;
+        try testing.expectEqualSlices(u8, delta_payloads.items[10], locked_slice);
+    }
+
+    {
+        const midx_out = try runGitTestCmd(allocator, io, repo1, &.{ "multi-pack-index", "write" });
+        allocator.free(midx_out);
+    }
+    {
+        const odb_midx = try git_odb.GitOdb.open(allocator, io, dirs.common_dir, dirs.config.object_format, null);
+        defer odb_midx.deinit();
+        try testing.expect(odb_midx.stores.items[0].midx != null);
+        for (delta_oids.items, delta_payloads.items) |d_oid, expected| {
+            const got = (try odb_midx.readBlobAlloc(allocator, d_oid)).?;
+            defer allocator.free(got);
+            try testing.expectEqualSlices(u8, expected, got);
+        }
+        var stream_out = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
+        defer stream_out.deinit();
+        const copied = (try odb_midx.copyBlobToFile(big_oid, &stream_out.writer)).?;
+        try testing.expectEqual(big_blob.len, copied);
+        try testing.expectEqualSlices(u8, big_blob, stream_out.written());
+    }
+
+    {
+        var to_pin: std.ArrayList(git_dirs.GitOid) = .empty;
+        defer to_pin.deinit(allocator);
+        try to_pin.append(allocator, big_oid);
+        try to_pin.append(allocator, empty_oid);
+        try to_pin.append(allocator, big_oid);
+        try to_pin.appendSlice(allocator, delta_oids.items[0..5]);
+
+        try odb.pinOids(to_pin.items);
+
+        const pin_hex = (try dirs.resolveRef(allocator, io, "refs/0ndb/testpin")).?;
+        defer allocator.free(pin_hex);
+        try testing.expectEqual(@as(usize, 40), pin_hex.len);
+
+        const pin_commit_oid = try git_dirs.GitOid.fromHex(pin_hex);
+        var pin_commit_obj = (try odb.readObject(allocator, pin_commit_oid)).?;
+        defer pin_commit_obj.deinit(allocator);
+        try testing.expectEqual(git_odb.ObjectType.commit, pin_commit_obj.kind);
+        try testing.expectError(error.NotABlob, odb.readBlobAlloc(allocator, pin_commit_oid));
+
+        const fsck_out = try runGitTestCmd(allocator, io, repo1, &.{ "fsck", "--full", "--strict" });
+        allocator.free(fsck_out);
+
+        const ls_out = try runGitTestCmd(allocator, io, repo1, &.{ "ls-tree", "refs/0ndb/testpin" });
+        defer allocator.free(ls_out);
+        var line_count: usize = 0;
+        var lit = std.mem.tokenizeScalar(u8, ls_out, '\n');
+        while (lit.next()) |_| line_count += 1;
+        try testing.expectEqual(@as(usize, 7), line_count);
+
+        try odb.pinOids(&.{});
+        const fsck_empty = try runGitTestCmd(allocator, io, repo1, &.{ "fsck", "--full", "--strict" });
+        allocator.free(fsck_empty);
+    }
+
+    {
+        const WorkerCtx = struct {
+            odb: *git_odb.GitOdb,
+            oids: []const git_dirs.GitOid,
+            payloads: []const []u8,
+            failed: std.atomic.Value(bool),
+
+            fn run(ctx: *@This()) void {
+                defer ctx.odb.release();
+                for (0..ctx.oids.len) |i| {
+                    const got = (ctx.odb.readBlobAlloc(std.heap.page_allocator, ctx.oids[i]) catch {
+                        ctx.failed.store(true, .release);
+                        return;
+                    }) orelse {
+                        ctx.failed.store(true, .release);
+                        return;
+                    };
+                    defer std.heap.page_allocator.free(got);
+                    if (!std.mem.eql(u8, got, ctx.payloads[i])) {
+                        ctx.failed.store(true, .release);
+                        return;
+                    }
+                    ctx.odb.lock();
+                    const locked = ctx.odb.readBlobCachedLocked(ctx.oids[i]) catch {
+                        ctx.odb.unlock();
+                        ctx.failed.store(true, .release);
+                        return;
+                    };
+                    const ok = locked != null and std.mem.eql(u8, locked.?, ctx.payloads[i]);
+                    ctx.odb.unlock();
+                    if (!ok) {
+                        ctx.failed.store(true, .release);
+                        return;
+                    }
+                }
+            }
+        };
+
+        var ctx = WorkerCtx{
+            .odb = odb,
+            .oids = delta_oids.items,
+            .payloads = delta_payloads.items,
+            .failed = .init(false),
+        };
+        var threads: [4]std.Thread = undefined;
+        for (&threads) |*t| {
+            odb.retain();
+            t.* = try std.Thread.spawn(.{}, WorkerCtx.run, .{&ctx});
+        }
+        for (&threads) |*t| t.join();
+        try testing.expect(!ctx.failed.load(.acquire));
+    }
+
+    {
+        const wt_out = try runGitTestCmd(allocator, io, repo1, &.{ "worktree", "add", "-b", "wt-branch", wt1 });
+        allocator.free(wt_out);
+
+        var wt_dirs = (try git_dirs.GitDirs.locate(allocator, io, wt1)).?;
+        defer wt_dirs.deinit(allocator);
+        try testing.expect(!std.mem.eql(u8, wt_dirs.git_dir, wt_dirs.common_dir));
+        try testing.expectEqualStrings(dirs.common_dir, wt_dirs.common_dir);
+
+        try writeTestFile(io, wt1, "intent.txt", "pending\n", false);
+        const o_ita = try runGitTestCmd(allocator, io, wt1, &.{ "add", "-N", "intent.txt" });
+        allocator.free(o_ita);
+        const o_sw = try runGitTestCmd(allocator, io, wt1, &.{ "update-index", "--skip-worktree", "a" });
+        allocator.free(o_sw);
+
+        var wt_idx = (try git_index.GitIndex.load(allocator, io, &wt_dirs)).?;
+        defer wt_idx.deinit(allocator);
+        try testing.expect(wt_idx.version >= 3);
+        const e_ita = wt_idx.find("intent.txt").?;
+        try testing.expect(e_ita.isExtended());
+        try testing.expect(e_ita.isIntentToAdd());
+        const e_sw = wt_idx.find("a").?;
+        try testing.expect(e_sw.isExtended());
+        try testing.expect(e_sw.isSkipWorktree());
+
+        var wtd = try std.Io.Dir.cwd().openDir(io, wt1, .{});
+        defer wtd.close(io);
+        const st_a = try wtd.statFile(io, "a", .{});
+        wt_idx.index_mtime_s = e_sw.stat.mtime_s + 10;
+        try testing.expect(!wt_idx.isStatClean(e_sw, st_a, wt_dirs.config));
+        const st_ita = try wtd.statFile(io, "intent.txt", .{});
+        try testing.expect(!wt_idx.isStatClean(e_ita, st_ita, wt_dirs.config));
+
+        var wt_head = try wt_dirs.readHead(allocator, io);
+        defer wt_head.deinit(allocator);
+        try testing.expectEqualStrings("wt-branch", wt_head.branch.?);
+        try testing.expect(wt_head.commit != null);
+
+        const mc = (try git.mainCheckout(allocator, io, wt1)).?;
+        defer allocator.free(mc);
+        try testing.expectEqualStrings(dirs.worktree_root, mc);
+
+        try writeTestFile(io, wt_dirs.git_dir, "config.worktree", "[core]\n\tfilemode = false\n", false);
+        var wt_dirs2 = (try git_dirs.GitDirs.locate(allocator, io, wt1)).?;
+        defer wt_dirs2.deinit(allocator);
+        try testing.expect(!wt_dirs2.config.filemode);
+    }
+
+    {
+        try std.Io.Dir.cwd().createDirPath(io, alt_repo);
+        const o_init = try runGitTestCmd(allocator, io, alt_repo, &.{ "init", "-b", "main" });
+        allocator.free(o_init);
+        var alt_dirs = (try git_dirs.GitDirs.locate(allocator, io, alt_repo)).?;
+        defer alt_dirs.deinit(allocator);
+        const primary_objs = try std.fs.path.join(allocator, &.{ dirs.common_dir, "objects" });
+        defer allocator.free(primary_objs);
+        const alt_line = try std.fmt.allocPrint(allocator, "{s}\n", .{primary_objs});
+        defer allocator.free(alt_line);
+        try writeTestFile(io, alt_dirs.common_dir, "objects/info/alternates", alt_line, false);
+
+        const alt_odb = try git_odb.GitOdb.open(allocator, io, alt_dirs.common_dir, .sha1, null);
+        defer alt_odb.deinit();
+        try testing.expect(alt_odb.contains(big_oid));
+        const got_alt = (try alt_odb.readBlobAlloc(allocator, delta_oids.items[5])).?;
+        defer allocator.free(got_alt);
+        try testing.expectEqualSlices(u8, delta_payloads.items[5], got_alt);
+    }
+
+    {
+        try git.cloneDirReflink(allocator, io, repo1, clone_dst);
+        var d = try std.Io.Dir.cwd().openDir(io, clone_dst, .{});
+        defer d.close(io);
+        const f = try d.openFile(io, "sub/deep/file.txt", .{});
+        defer f.close(io);
+        var rbuf: [128]u8 = undefined;
+        const rn = try f.readPositionalAll(io, &rbuf, 0);
+        try testing.expectEqualStrings(deep_text, rbuf[0..rn]);
+    }
+
+    {
+        try std.Io.Dir.cwd().createDirPath(io, repo256);
+        const o_init = try runGitTestCmd(allocator, io, repo256, &.{ "init", "--object-format=sha256", "-b", "main" });
+        allocator.free(o_init);
+
+        const s256_data = "sha256 blob payload for native git layer\n";
+        try writeTestFile(io, repo256, "hello.txt", s256_data, false);
+        try writeTestFile(io, repo256, "dir/sub.txt", "nested sha256 file\n", false);
+        const oa = try runGitTestCmd(allocator, io, repo256, &.{ "add", "-A" });
+        allocator.free(oa);
+        const oc = try runGitTestCmd(allocator, io, repo256, &.{ "commit", "-m", "sha256-init" });
+        allocator.free(oc);
+
+        var dirs256 = (try git_dirs.GitDirs.locate(allocator, io, repo256)).?;
+        defer dirs256.deinit(allocator);
+        try testing.expectEqual(git_dirs.ObjectFormat.sha256, dirs256.config.object_format);
+
+        var h256 = try dirs256.readHead(allocator, io);
+        defer h256.deinit(allocator);
+        try testing.expectEqualStrings("main", h256.branch.?);
+        try testing.expectEqual(@as(usize, 64), h256.commit.?.len);
+
+        var idx256_v2 = (try git_index.GitIndex.load(allocator, io, &dirs256)).?;
+        defer idx256_v2.deinit(allocator);
+        const e_hello = idx256_v2.find("hello.txt").?;
+        const expected_oid256 = git_dirs.GitOid.ofBlob(.sha256, s256_data);
+        try testing.expect(e_hello.oid.eql(expected_oid256));
+
+        const ov4 = try runGitTestCmd(allocator, io, repo256, &.{ "update-index", "--index-version", "4" });
+        allocator.free(ov4);
+        var idx256_v4 = (try git_index.GitIndex.load(allocator, io, &dirs256)).?;
+        defer idx256_v4.deinit(allocator);
+        try testing.expectEqual(@as(u32, 4), idx256_v4.version);
+        try testing.expect(idx256_v4.find("hello.txt").?.oid.eql(expected_oid256));
+        try testing.expect(idx256_v4.find("dir/sub.txt") != null);
+
+        const ogc = try runGitTestCmd(allocator, io, repo256, &.{ "gc", "--aggressive", "--prune=now" });
+        allocator.free(ogc);
+        const omidx = try runGitTestCmd(allocator, io, repo256, &.{ "multi-pack-index", "write" });
+        allocator.free(omidx);
+
+        const odb256 = try git_odb.GitOdb.open(allocator, io, dirs256.common_dir, .sha256, "refs/0ndb/pin256");
+        defer odb256.deinit();
+        try testing.expect(odb256.stores.items[0].midx != null);
+        const got256 = (try odb256.readBlobAlloc(allocator, expected_oid256)).?;
+        defer allocator.free(got256);
+        try testing.expectEqualStrings(s256_data, got256);
+
+        try odb256.pinOids(&.{ expected_oid256, idx256_v4.find("dir/sub.txt").?.oid });
+        const fsck256 = try runGitTestCmd(allocator, io, repo256, &.{ "fsck", "--full", "--strict" });
+        allocator.free(fsck256);
     }
 }
