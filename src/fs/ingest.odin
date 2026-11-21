@@ -249,23 +249,29 @@ store_file :: proc(m: ^Mount, abs: string, pack: ^odb.Pack_Builder, pin := true)
 }
 
 @(private)
-index_clean :: proc(e: ^Index_Entry, st: Stat, kind: Disk_Kind, index_mtime: i64) -> bool {
+index_clean :: proc(e: ^Index_Entry, st: Stat, kind: Disk_Kind, index_mtime: i64, trust_exec := true, symlinks := true) -> bool {
 	if e.stage != 0 || .Skip_Worktree in e.flags || .Intent_To_Add in e.flags || .Sparse_Dir in e.flags {
 		return false
 	}
 	mtime := i64(e.mtime_s) * 1_000_000_000 + i64(e.mtime_ns)
-	ctime := i64(e.ctime_s) * 1_000_000_000 + i64(e.ctime_ns)
-	if mtime != st.mtime_ns || ctime != st.ctime_ns || u32(st.size) != e.size || u32(st.ino) != e.ino {
-		return false
+	when ODIN_OS == .Windows {
+		if mtime != st.mtime_ns || u32(st.size) != e.size {
+			return false
+		}
+	} else {
+		ctime := i64(e.ctime_s) * 1_000_000_000 + i64(e.ctime_ns)
+		if mtime != st.mtime_ns || ctime != st.ctime_ns || u32(st.size) != e.size || u32(st.ino) != e.ino {
+			return false
+		}
 	}
 	if mtime >= index_mtime {
 		return false
 	}
 	switch e.mode & 0o170000 {
 	case 0o100000:
-		return kind == .File && (e.mode & 0o111 != 0) == (st.mode & 0o100 != 0)
+		return kind == .File && (!trust_exec || (e.mode & 0o111 != 0) == (st.mode & 0o100 != 0))
 	case 0o120000:
-		return kind == .Symlink
+		return kind == .Symlink || (!symlinks && kind == .File)
 	}
 	return false
 }
@@ -296,6 +302,8 @@ Import_State :: struct {
 }
 
 mount_import :: proc(m: ^Mount) -> Error {
+	attr_begin(m)
+	defer attr_end(m)
 	held := m.shadow.hold
 	m.shadow.hold = false
 	defer m.shadow.hold = held
@@ -672,9 +680,14 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		stat = disk_stat(s)
 		kind = disk_kind(s.kind)
 	}
-	if kind == .Symlink {
-		target := it.target
-		if len(target) == 0 {
+	link_text: string
+	link_file := kind == .File && tracked && e.mode & 0o170000 == 0o120000 && !mount_symlinks(m)
+	if link_file {
+		link_text, link_file = read_link_file(m, abs, stat)
+	}
+	if kind == .Symlink || link_file {
+		target := it.target if !link_file else link_text
+		if len(target) == 0 && !link_file {
 			tbuf: [prim.PATH_MAX]u8
 			n, lerr := prim.readlink(m.vfs, abs, tbuf[:])
 			if lerr != .None {
@@ -684,7 +697,7 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		}
 		inode := builder_tree(&st.b, fstree.Op_Create{parent = parent.inode, name = it.name, kind = .Symlink, target = target})
 		oid: odb.Oid
-		if tracked && m.git_refs && index_clean(e, stat, kind, st.index_mtime) {
+		if tracked && m.git_refs && index_clean(e, stat, kind, st.index_mtime, mount_trust_exec(m), mount_symlinks(m)) {
 			oid = e.oid
 		} else if m.db != nil {
 			mark_dirty_dirs(st, it.path)
@@ -699,18 +712,28 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		return .None
 	}
 	flags: fstree.Flags
-	if stat.mode & 0o100 != 0 {
+	exec := exec_bit(m, stat, tracked && e.mode & 0o170000 == 0o100000 && e.mode & 0o111 != 0)
+	if exec {
 		flags += {.Exec}
 	}
 	oid: odb.Oid
 	binary := false
-	clean := tracked && m.git_refs && index_clean(e, stat, kind, st.index_mtime)
+	size := stat.size
+	clean := tracked && m.git_refs && index_clean(e, stat, kind, st.index_mtime, mount_trust_exec(m), mount_symlinks(m))
 	if !clean {
 		mark_dirty_dirs(st, it.path)
 	}
+	if clean && m.has_git && m.db != nil && eol_action(m, it.path) != .Binary {
+		if _, hsize, herr := odb.read_header(m.db, e.oid); herr == .None {
+			size = hsize
+		} else {
+			clean = false
+			mark_dirty_dirs(st, it.path)
+		}
+	}
 	if clean {
 		oid = e.oid
-		binary = stat.size > m.opts.large_limit
+		binary = size > m.opts.large_limit
 	} else {
 		if it.has_data && st.use_pack {
 			binary = it.binary
@@ -719,6 +742,19 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 				return .None
 			}
 			oid = o
+		} else if m.has_git && m.db != nil && stat.size <= m.opts.large_limit && eol_action(m, it.path) != .Binary {
+			d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+			if rerr != .None {
+				return .None
+			}
+			d = eol_clean(m, it.path, d)
+			binary = textdiff.is_binary(d)
+			o, werr := odb.write(m.db, .Blob, d)
+			if werr != .None {
+				return .None
+			}
+			oid = o
+			size = i64(len(d))
 		} else {
 			if stat.size > m.opts.large_limit {
 				binary = true
@@ -741,17 +777,34 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	}
 	inode := builder_tree(&st.b, fstree.Op_Create{parent = parent.inode, name = it.name, kind = .File, flags = flags})
 	if binary {
-		builder_content(&st.b, inode, oid, stat.size)
-	} else if stat.size > 0 {
-		first, last := builder_insert_ref(&st.b, inode, 0, oid, int(stat.size))
-		append(&st.b.imports, Import_File{inode = inode, oid = oid, len = stat.size, first = first, last = last})
+		builder_content(&st.b, inode, oid, size)
+	} else if size > 0 {
+		first, last := builder_insert_ref(&st.b, inode, 0, oid, int(size))
+		append(&st.b.imports, Import_File{inode = inode, oid = oid, len = size, first = first, last = last})
 	} else {
 		append(&st.b.imports, Import_File{inode = inode, oid = oid, len = 0, last = crdt.Op_Id{st.b.actor, inode.seq}})
 	}
 	import_shadow(st, it.path, Entry{inode = inode, kind = .File, stat = stat, oid = oid}) or_return
-	frame_add(st, it.name, oid, odb.MODE_EXEC if stat.mode & 0o100 != 0 else odb.MODE_FILE)
+	frame_add(st, it.name, oid, odb.MODE_EXEC if exec else odb.MODE_FILE)
 	st.files += 1
 	return .None
+}
+
+@(private)
+read_link_file :: proc(m: ^Mount, abs: string, stat: Stat) -> (string, bool) {
+	if stat.size <= 0 || stat.size >= prim.PATH_MAX {
+		return "", false
+	}
+	d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+	if rerr != .None || len(d) == 0 || len(d) >= prim.PATH_MAX {
+		return "", false
+	}
+	for c in d {
+		if c == 0 {
+			return "", false
+		}
+	}
+	return string(d), true
 }
 
 @(private)
@@ -944,7 +997,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			c.actor = unattributed_actor(m.actor) if m.lost else a.actor
 			continue
 		}
-		_, disk_oid, _, ok := read_content(m, c.path, c.stat) or_return
+		_, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
 		if !ok || disk_oid == a.oid {
 			c.actor = a.actor
 			continue
@@ -976,6 +1029,8 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 }
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
+	attr_begin(m)
+	defer attr_end(m)
 	long: virtual.Arena
 	if virtual.arena_init_growing(&long, 256 << 10) != nil {
 		return .No_Memory
@@ -1437,6 +1492,16 @@ collect_path :: proc(p: ^Pass, rel: string) -> Error {
 			collect_subtree(p, rel) or_return
 		}
 		return .None
+	}
+	if d.kind == .File && e.kind == .Symlink && !mount_symlinks(m) {
+		if d.stat == e.stat {
+			return .None
+		}
+		abuf: prim.Path_Buf
+		if t, ok := read_link_file(m, abs_path(m, rel, abuf[:]), d.stat); ok {
+			d.kind = .Symlink
+			d.target = t
+		}
 	}
 	switch {
 	case d.kind == .Missing || d.kind == .Other || disk_to_tree(d.kind) != e.kind:
@@ -2029,7 +2094,7 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 			return .None
 		}
 		flags: fstree.Flags
-		if c.stat.mode & 0o100 != 0 {
+		if exec_bit(m, c.stat, false) {
 			flags += {.Exec}
 		}
 		if binary {
@@ -2058,7 +2123,7 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 }
 
 @(private)
-read_content :: proc(m: ^Mount, rel: string, stat: Stat) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
+read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{}, has_old := false) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
 	if o, has := m.override[rel]; has && m.db != nil {
 		t, d, rerr := odb.read(m.db, o, context.temp_allocator)
 		if rerr != .None || t != .Blob {
@@ -2079,6 +2144,7 @@ read_content :: proc(m: ^Mount, rel: string, stat: Stat) -> (data: []u8, oid: od
 	if rerr != .None {
 		return nil, {}, false, false, .None
 	}
+	d = eol_clean(m, rel, d, old, has_old)
 	binary = textdiff.is_binary(d)
 	if m.db != nil {
 		o, herr := odb.hash(m.db.format, .Blob, d)
@@ -2123,7 +2189,7 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 		}
 		return .None
 	}
-	data, oid, binary, ok := read_content(m, path, c.stat) or_return
+	data, oid, binary, ok := read_content(m, path, c.stat, e.inode, true) or_return
 	if !ok {
 		return .None
 	}
@@ -2131,7 +2197,7 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	ne.stat = c.stat
 	ne.oid = oid
 	old_flags := tree_flags(h, e.inode)
-	exec := c.stat.mode & 0o100 != 0
+	exec := exec_bit(m, c.stat, .Exec in old_flags)
 	if exec != (.Exec in old_flags) {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Exec}, value = {.Exec} if exec else {}})
 	}

@@ -4,7 +4,6 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
-import "core:sys/posix"
 import "../capi/api"
 import "../prim"
 import osync "../sync"
@@ -891,36 +890,7 @@ cmd_mcp :: proc(a: ^Args) -> int {
 	if !mcp_open(&s.c, ob) {
 		return report_error(.Closed, "the daemon refused the MCP session")
 	}
-	fds := [2]posix.pollfd{{fd = 0, events = {.IN}}, {fd = s.c.fd, events = {.IN}}}
-	buf: [65536]u8
-	in_open := true
-	for {
-		fds[0].fd = 0 if in_open else -1
-		if posix.poll(raw_data(fds[:]), 2, -1) < 0 {
-			if posix.errno() == .EINTR {
-				continue
-			}
-			return 1
-		}
-		if fds[0].revents != {} {
-			n := posix.read(0, raw_data(buf[:]), len(buf))
-			if n <= 0 {
-				in_open = false
-				posix.shutdown(s.c.fd, .WR)
-			} else if !_write_all(s.c.fd, buf[:n]) {
-				return 0
-			}
-		}
-		if fds[1].revents != {} {
-			n := posix.read(s.c.fd, raw_data(buf[:]), len(buf))
-			if n <= 0 {
-				return 0
-			}
-			if !_write_all(1, buf[:n]) {
-				return 0
-			}
-		}
-	}
+	return mcp_bridge(s.c.fd)
 }
 
 mcp_open :: proc(c: ^Client, caller: api.Object) -> bool {
@@ -978,8 +948,11 @@ _mcp_request :: proc(m: ^Mcp_Client, method: string, params: string, notify := f
 			}
 		}
 		buf: [65536]u8
-		n := posix.read(m.c.fd, raw_data(buf[:]), len(buf))
-		if n <= 0 {
+		n, st := sock_read(m.c.fd, buf[:])
+		if st == .Again {
+			continue
+		}
+		if st != .Ok {
 			return nil, false
 		}
 		append(&m.line, ..buf[:n])

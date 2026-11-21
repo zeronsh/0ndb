@@ -930,7 +930,7 @@ _env_merge :: proc(env: []string, allocator := context.temp_allocator) -> []stri
 		name := s[:eq] if eq >= 0 else s
 		over := false
 		for e in env {
-			if strings.has_prefix(e, name) && len(e) > len(name) && e[len(name)] == '=' {
+			if len(e) > len(name) && e[len(name)] == '=' && (e[:len(name)] == name || (ODIN_OS == .Windows && strings.equal_fold(e[:len(name)], name))) {
 				over = true
 				break
 			}

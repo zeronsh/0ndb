@@ -524,9 +524,12 @@ _pending_clear :: proc(r: ^Runtime, o: Object) {
 }
 
 @(private)
-_pending_scan :: proc(r: ^Runtime, space: prim.Id) {
+_pending_scan :: proc(r: ^Runtime, space: prim.Id, runner: prim.Id = {}) {
 	for &row in map_rows(r, pending_object(space), nil) {
 		if len(row.key) != 16 || obj.rid_none(entry_rid(&row.entry, 1)) {
+			continue
+		}
+		if !prim.id_is_zero(runner) && entry_id(&row.entry, 4) != runner {
 			continue
 		}
 		id: prim.Id

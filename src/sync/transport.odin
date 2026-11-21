@@ -40,6 +40,7 @@ Transport :: struct {
 	ppos:      int,
 	pend:      int,
 	ws:        ^Ws,
+	os:        _Transport_Os,
 	allocator: runtime.Allocator,
 }
 
@@ -145,10 +146,12 @@ transport_init_plain :: proc(t: ^Transport, fd: prim.Fd, allocator := context.al
 
 transport_init_secure :: proc(t: ^Transport, fd: prim.Fd, keys: ^Session_Keys, try_kernel: bool, allocator := context.allocator) {
 	ws := t.ws
+	os := t.os
 	t^ = {
 		fd        = fd,
 		secure    = true,
 		ws        = ws,
+		os        = os,
 		allocator = allocator,
 	}
 	if try_kernel && ws == nil {
@@ -162,7 +165,12 @@ transport_init_secure :: proc(t: ^Transport, fd: prim.Fd, keys: ^Session_Keys, t
 	}
 }
 
+transport_attach :: proc "contextless" (t: ^Transport, l: ^prim.Loop, w: prim.Watch) {
+	_t_attach(t, l, w)
+}
+
 transport_close :: proc(t: ^Transport) {
+	_t_os_close(t)
 	if t.fd >= 0 {
 		prim.close(t.fd)
 	}
@@ -260,7 +268,7 @@ transport_sendfile :: proc(t: ^Transport, src: prim.Fd, off: i64, n: int, scratc
 		return 0, .None
 	}
 	if !transport_user_tx(t) && t.ws == nil {
-		w, serr := _sendfile(t.fd, src, off, n)
+		w, serr := _t_sendfile(t, src, off, n)
 		if serr != .Unsupported {
 			return w, serr
 		}

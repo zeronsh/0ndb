@@ -566,6 +566,14 @@ spawn :: proc(
 	}
 	ta := context.temp_allocator
 	exe, batch := _resolve_exec_windows(argv[0], env, ta) or_return
+	args := argv
+	if batch && _has_suffix_fold(exe, ".cmd") {
+		if direct, ok := npm_shim_argv(exe, argv[1:], env, ta); ok {
+			args = direct
+			exe = direct[0]
+			batch = false
+		}
+	}
 
 	cmd := _Cmd {
 		buf = make([dynamic]u16, ta),
@@ -599,7 +607,7 @@ spawn :: proc(
 		_cmd_str(&cmd, "cmd.exe /e:ON /v:OFF /d /c \"\"")
 		append(&cmd.buf, ..script)
 		_cmd_char(&cmd, '"')
-		for a in argv[1:] {
+		for a in args[1:] {
 			_cmd_char(&cmd, ' ')
 			_bat_arg(&cmd, a)
 		}
@@ -607,7 +615,7 @@ spawn :: proc(
 	} else {
 		app_p, _ := _dos_path(exe, &app_buf) or_return
 		app = app_p
-		a0 := argv[0]
+		a0 := args[0]
 		for i in 0 ..< len(a0) {
 			if a0[i] == '"' || a0[i] == 0 {
 				return child, .Invalid
@@ -616,7 +624,7 @@ spawn :: proc(
 		_cmd_char(&cmd, '"')
 		_cmd_str(&cmd, a0)
 		_cmd_char(&cmd, '"')
-		for a in argv[1:] {
+		for a in args[1:] {
 			_cmd_char(&cmd, ' ')
 			_cmd_arg(&cmd, a)
 		}

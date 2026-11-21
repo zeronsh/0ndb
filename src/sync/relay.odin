@@ -811,6 +811,7 @@ _conn_new :: proc(r: ^Relay, fd: prim.Fd, unix: bool, ws := false) -> (c: ^Conn,
 		return nil, _from_prim(werr)
 	}
 	c.watch = w
+	transport_attach(&c.tr, r.loop, w)
 	c.timer = prim.timer(r.loop, r.cfg.handshake_ms, c, _on_conn_timeout)
 	return c, .None
 }

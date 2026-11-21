@@ -59,6 +59,8 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 
 @(private)
 materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
+	attr_begin(m)
+	defer attr_end(m)
 	h := m.history
 	tl := make([dynamic]crdt.Lv, context.temp_allocator)
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -79,6 +81,13 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	snap := version_snapshot(h, tl[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
 	displaced_touch(m, &snap, &touched) or_return
+	for c in m.collided {
+		if ino, ok, lerr := fstree.lookup(&snap, c); lerr == nil && ok {
+			touched[ino] = true
+		}
+		delete(c, m.allocator)
+	}
+	clear(&m.collided)
 	items := make([dynamic]Mat_Item, context.temp_allocator)
 	for ino in sorted_inodes(touched) {
 		it := Mat_Item {
@@ -120,6 +129,11 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		}
 		if a.depth != b.depth {
 			return a.depth < b.depth
+		}
+		ag := path_name(a.path) == ".gitattributes"
+		bg := path_name(b.path) == ".gitattributes"
+		if ag != bg {
+			return ag
 		}
 		am := a.has_old && a.old != a.path
 		bm := b.has_old && b.old != b.path
@@ -325,6 +339,35 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 }
 
 @(private)
+mat_collides :: proc(m: ^Mount, it: ^Mat_Item, abs: string) -> bool {
+	for c in m.collided {
+		if path_under(it.path, c) {
+			return true
+		}
+	}
+	if it.has_old && it.old == it.path {
+		return false
+	}
+	st, err := prim.lstat(m.vfs, abs)
+	if err != .None || disk_name_matches(m.vfs, abs) {
+		return false
+	}
+	if it.has_old {
+		obuf: prim.Path_Buf
+		if ost, oerr := prim.lstat(m.vfs, abs_path(m, it.old, obuf[:])); oerr == .None && ost.ino == st.ino && ost.dev == st.dev {
+			return false
+		}
+	}
+	c, _ := clone_string(it.path, m.allocator)
+	append(&m.collided, c)
+	return true
+}
+
+mount_collisions :: proc(m: ^Mount) -> []string {
+	return m.collided[:]
+}
+
+@(private)
 conflict_base :: proc(p: string) -> string {
 	start := 0
 	for i := len(p) - 1; i >= 0; i -= 1 {
@@ -388,6 +431,9 @@ disk_matches :: proc(m: ^Mount, rel: string, e: Entry) -> bool {
 	if d.kind == .Missing {
 		return true
 	}
+	if d.kind == .File && e.kind == .Symlink && !mount_symlinks(m) {
+		return d.stat == e.stat
+	}
 	if disk_to_tree(d.kind) != e.kind {
 		return false
 	}
@@ -439,6 +485,9 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		return .None if m.restoring else shadow_remove(&m.shadow, it.old)
 	}
 	abs := abs_path(m, it.path, abuf[:])
+	if mat_collides(m, it, abs) {
+		return .None
+	}
 	if it.has_old && it.old != it.path {
 		if !disk_matches(m, it.path, Entry{kind = it.kind}) && probe(m, it.path).kind != .Missing {
 			mount_mark(m, it.path)
@@ -479,7 +528,19 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		ensure_parent(m, abs) or_return
 		tmp := temp_name(m, abs, context.temp_allocator)
 		prim.remove(m.vfs, tmp)
-		from_prim(prim.symlink(m.vfs, it.target, tmp)) or_return
+		if mount_symlinks(m) {
+			from_prim(prim.symlink(m.vfs, it.target, tmp)) or_return
+		} else {
+			fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, 0o644)
+			from_prim(oerr) or_return
+			werr := prim.write_at(m.vfs, fd, transmute([]u8)it.target, 0)
+			prim.close_file(m.vfs, fd)
+			if werr != .None {
+				prim.remove(m.vfs, tmp)
+				return from_prim(werr)
+			}
+			mat_file(m, abs)
+		}
 		from_prim(prim.rename(m.vfs, tmp, abs)) or_return
 		mat_ancestors(m, abs)
 		if m.db != nil {
@@ -488,6 +549,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	case .File:
 		ensure_parent(m, abs) or_return
 		write_file_content(m, it, abs, tl, &e) or_return
+		attr_invalidate(m, it.path)
 	}
 	if st, serr := prim.lstat(m.vfs, abs); serr == .None {
 		e.stat = disk_stat(st)
@@ -538,11 +600,12 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 			return set_mode(m, abs, mode)
 		}
 	}
+	disk := eol_smudge(m, it.path, data)
 	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
 	if oerr != .None {
 		return from_prim(oerr)
 	}
-	werr := prim.write_at(m.vfs, fd, data, 0)
+	werr := prim.write_at(m.vfs, fd, disk, 0)
 	prim.fchmod(m.vfs, fd, mode)
 	prim.close_file(m.vfs, fd)
 	if werr != .None {
@@ -561,8 +624,12 @@ merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	h := m.history
 	abuf: prim.Path_Buf
 	abs := abs_path(m, it.path, abuf[:])
-	ours, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
-	if rerr != .None || textdiff.is_binary(ours) {
+	raw, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+	if rerr != .None {
+		return .None
+	}
+	ours := eol_clean(m, it.path, raw, it.inode, true)
+	if textdiff.is_binary(ours) {
 		return .None
 	}
 	base, berr := history_text_at(h, it.inode, m.merge_base, context.temp_allocator)
@@ -588,7 +655,7 @@ merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if oerr != .None {
 		return from_prim(oerr)
 	}
-	werr := prim.write_at(m.vfs, fd, merged, 0)
+	werr := prim.write_at(m.vfs, fd, eol_smudge(m, it.path, merged), 0)
 	prim.fchmod(m.vfs, fd, mode)
 	prim.close_file(m.vfs, fd)
 	if werr != .None {

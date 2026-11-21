@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
-import "core:sys/posix"
 import "../capi/api"
 import eng "../engine"
 import "../mcp"
@@ -34,8 +33,8 @@ State :: struct {
 
 Mcp_Session :: struct {
 	sess: ^rt.Stdio_Session,
-	fd:   prim.Fd,
-	out:  prim.Fd,
+	fd:   Sock,
+	out:  Sock,
 }
 
 Daemon :: struct {
@@ -44,7 +43,7 @@ Daemon :: struct {
 	engine_dir: string,
 	sock:       string,
 	state_path: string,
-	lfd:        posix.FD,
+	lfd:        Sock,
 	lwatch:     prim.Watch,
 	sig:        Signals,
 	swatch:     prim.Watch,
@@ -74,7 +73,7 @@ Sub_Tag :: struct {
 
 Conn :: struct {
 	d:       ^Daemon,
-	fd:      posix.FD,
+	fd:      Sock,
 	watch:   prim.Watch,
 	writing: bool,
 	rbuf:    [dynamic]u8,
@@ -104,7 +103,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	d.engine_dir, _ = prim.path_join(context.allocator, d.home, "engine")
 	d.state_path, _ = prim.path_join(context.allocator, d.home, "daemon.state")
 	d.sock = socket_path()
-	d.lfd = -1
+	d.lfd = NO_SOCK
 	d.sig.fd = -1
 	d.conns = make([dynamic]^Conn)
 	d.links = make(map[prim.Id]eng.Error)
@@ -114,7 +113,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	if prim.mkdir_all(prim.os_vfs(), d.home, 0o700) != .None {
 		return report_error(.Io, "cannot create %s", d.home)
 	}
-	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
+	ignore_broken_pipes()
 	_state_load(d)
 	ec := eng.default_config(d.engine_dir)
 	ec.credentials = eng.Credentials_Source{data = d, produce = _cred_produce}
@@ -173,7 +172,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	if signals_open(&d.sig) {
 		d.swatch, _ = prim.watch(&d.s.loop, d.sig.fd, {.Read}, d, _on_signal)
 	}
-	_ready_notify()
+	ready_notify()
 	fmt.eprintfln("0ndb daemon %s listening on %s (device %s, runner %v)", VERSION, d.sock, hex(eng.self(&d.s.e)), d.runner)
 	for !d.stopping {
 		if prim.loop_step(&d.s.loop, true) != .None {
@@ -185,68 +184,28 @@ daemon_main :: proc(args: ^Args) -> int {
 }
 
 @(private)
-_ready_notify :: proc() {
-	v, ok := os.lookup_env("ONDB_READY_FD", context.temp_allocator)
-	if !ok {
-		return
-	}
-	n, nok := strconv.parse_int(v)
-	if !nok {
-		return
-	}
-	b := [1]u8{'1'}
-	posix.write(posix.FD(n), raw_data(b[:]), 1)
-	posix.close(posix.FD(n))
-	posix.unsetenv("ONDB_READY_FD")
-}
-
-@(private)
 _listen :: proc(d: ^Daemon) -> bool {
 	dir := prim.dir_name(d.sock)
 	if prim.mkdir_all(prim.os_vfs(), dir, 0o700) != .None {
 		return false
 	}
-	if fd, ok := _connect_once(d.sock); ok {
-		posix.close(fd)
+	if fd, ok := sock_connect(d.sock); ok {
+		sock_close(fd)
 		return false
 	}
-	cpath := cstr(d.sock)
-	posix.unlink(cpath)
-	fd := posix.socket(.UNIX, .STREAM)
-	if fd < 0 {
+	fd, lok := sock_listen(d.sock)
+	if !lok {
 		return false
 	}
-	addr: posix.sockaddr_un
-	addr.sun_family = .UNIX
-	if len(d.sock) >= len(addr.sun_path) {
-		posix.close(fd)
-		return false
-	}
-	copy(addr.sun_path[:], d.sock)
-	old := posix.umask({.IRGRP, .IWGRP, .IXGRP, .IROTH, .IWOTH, .IXOTH})
-	bok := posix.bind(fd, (^posix.sockaddr)(&addr), posix.socklen_t(size_of(addr))) == .OK
-	posix.umask(old)
-	if !bok || posix.listen(fd, 128) != .OK {
-		posix.close(fd)
-		return false
-	}
-	_nonblock(fd)
 	d.lfd = fd
-	w, err := prim.watch(&d.s.loop, prim.Fd(fd), {.Read}, d, _on_accept)
+	w, err := prim.watch(&d.s.loop, watch_fd(fd), {.Read}, d, _on_accept)
 	if err != .None {
-		posix.close(fd)
-		d.lfd = -1
+		sock_close(fd)
+		d.lfd = NO_SOCK
 		return false
 	}
 	d.lwatch = w
 	return true
-}
-
-@(private)
-_nonblock :: proc(fd: posix.FD) {
-	flags := posix.fcntl(fd, .GETFL)
-	posix.fcntl(fd, .SETFL, flags | posix.O_NONBLOCK)
-	posix.fcntl(fd, .SETFD, posix.FD_CLOEXEC)
 }
 
 @(private)
@@ -267,13 +226,12 @@ _on_accept :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 	d := (^Daemon)(data)
 	_mcp_sweep(d)
 	for {
-		cfd := posix.accept(d.lfd, nil, nil)
-		if cfd < 0 {
+		cfd, aok := sock_accept(d.lfd)
+		if !aok {
 			break
 		}
-		_nonblock(cfd)
-		if !peer_is_self(prim.Fd(cfd)) {
-			posix.close(cfd)
+		if !peer_is_self(watch_fd(cfd)) {
+			sock_close(cfd)
 			continue
 		}
 		c := new(Conn)
@@ -283,9 +241,9 @@ _on_accept :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 		c.wbuf = make([dynamic]u8)
 		c.calls = make([dynamic]^Pending)
 		c.subs = make([dynamic]^Sub_Tag)
-		w, err := prim.watch(l, prim.Fd(cfd), {.Read}, c, _on_conn)
+		w, err := prim.watch(l, watch_fd(cfd), {.Read}, c, _on_conn)
 		if err != .None {
-			posix.close(cfd)
+			sock_close(cfd)
 			_conn_free(c)
 			continue
 		}
@@ -314,18 +272,11 @@ _on_conn :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 _conn_read :: proc(c: ^Conn) -> (alive: bool) {
 	buf: [65536]u8
 	for !c.dead {
-		n := posix.read(c.fd, raw_data(buf[:]), len(buf))
-		if n < 0 {
-			e := posix.errno()
-			if e == .EINTR {
-				continue
-			}
-			if e != .EAGAIN && e != .EWOULDBLOCK {
-				c.dead = true
-			}
+		n, st := sock_read(c.fd, buf[:])
+		if st == .Again {
 			break
 		}
-		if n == 0 {
+		if st != .Ok {
 			c.dead = true
 			break
 		}
@@ -451,15 +402,11 @@ _conn_write :: proc(c: ^Conn, kind: Frame_Kind, parts: ..[]u8) {
 @(private)
 _conn_flush :: proc(c: ^Conn) {
 	for len(c.wbuf) > 0 && !c.dead {
-		n := posix.write(c.fd, raw_data(c.wbuf[:]), uint(len(c.wbuf)))
-		if n < 0 {
-			e := posix.errno()
-			if e == .EINTR {
-				continue
-			}
-			if e == .EAGAIN || e == .EWOULDBLOCK {
-				break
-			}
+		n, st := sock_write(c.fd, c.wbuf[:])
+		if st == .Again {
+			break
+		}
+		if st != .Ok {
 			c.dead = true
 			return
 		}
@@ -557,10 +504,10 @@ _conn_drop :: proc(c: ^Conn, close_fd: bool) {
 		prim.unwatch(&d.s.loop, c.watch)
 		c.watch = 0
 	}
-	if close_fd && c.fd >= 0 {
-		posix.close(c.fd)
+	if close_fd && c.fd != NO_SOCK {
+		sock_close(c.fd)
 	}
-	c.fd = -1
+	c.fd = NO_SOCK
 	c.dead = true
 	for pc in c.calls {
 		api.cancel(&d.s.a, pc.id)
@@ -606,8 +553,8 @@ _relay_handoff :: proc(c: ^Conn) {
 	copy(initial, c.rbuf[:])
 	fd := c.fd
 	_conn_drop(c, false)
-	if err := osync.relay_adopt(&d.relay, prim.Fd(fd), true, initial); err != .None {
-		posix.close(fd)
+	if err := osync.relay_adopt(&d.relay, watch_fd(fd), true, initial); err != .None {
+		sock_close(fd)
 	}
 }
 
@@ -630,20 +577,26 @@ _mcp_handoff :: proc(c: ^Conn, payload: []u8) -> (gone: bool) {
 	}
 	fd := c.fd
 	_conn_drop(c, false)
-	out := posix.dup(fd)
-	if out < 0 {
-		posix.close(fd)
+	out, dok := sock_dup(fd)
+	if !dok {
+		sock_close(fd)
 		return true
 	}
-	posix.fcntl(out, .SETFD, posix.FD_CLOEXEC)
-	sess, err := rt.serve_stdio(&d.s.r, caller, prim.Fd(fd), prim.Fd(out))
+	sess, err := rt.serve_stdio(&d.s.r, caller, watch_fd(fd), watch_fd(out))
 	if err != .None {
-		posix.close(fd)
-		posix.close(out)
+		_mcp_close_fds(fd, out)
 		return true
 	}
-	append(&d.mcp, Mcp_Session{sess, prim.Fd(fd), prim.Fd(out)})
+	append(&d.mcp, Mcp_Session{sess, fd, out})
 	return true
+}
+
+@(private)
+_mcp_close_fds :: proc(fd, out: Sock) {
+	sock_close(fd)
+	if out != fd {
+		sock_close(out)
+	}
 }
 
 @(private)
@@ -664,8 +617,7 @@ _mcp_sweep :: proc(d: ^Daemon) {
 		}
 		mcp.stdio_server_destroy(&m.sess.ss)
 		free(m.sess, d.s.r.allocator)
-		posix.close(posix.FD(m.fd))
-		posix.close(posix.FD(m.out))
+		_mcp_close_fds(m.fd, m.out)
 		unordered_remove(&d.mcp, i)
 	}
 }
@@ -678,9 +630,9 @@ _shutdown :: proc(d: ^Daemon) {
 	if d.lwatch != 0 {
 		prim.unwatch(&d.s.loop, d.lwatch)
 	}
-	if d.lfd >= 0 {
-		posix.close(d.lfd)
-		posix.unlink(cstr(d.sock))
+	if d.lfd != NO_SOCK {
+		sock_close(d.lfd)
+		sock_unlink(d.sock)
 	}
 	if d.swatch != 0 {
 		prim.unwatch(&d.s.loop, d.swatch)
@@ -688,8 +640,7 @@ _shutdown :: proc(d: ^Daemon) {
 	signals_close(&d.sig)
 	_state_save(d)
 	for m in d.mcp {
-		posix.close(posix.FD(m.fd))
-		posix.close(posix.FD(m.out))
+		_mcp_close_fds(m.fd, m.out)
 	}
 	if d.relay_on {
 		osync.relay_destroy(&d.relay)
@@ -798,7 +749,7 @@ _host :: proc(c: ^api.Call) -> ^Daemon {
 op_daemon_status :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	d := _host(c)
 	api.o_str(o, "version", VERSION)
-	api.o_u64(o, "pid", u64(posix.getpid()))
+	api.o_u64(o, "pid", self_pid())
 	api.o_str(o, "home", d.home)
 	api.o_str(o, "socket", d.sock)
 	api.o_i64(o, "uptime_ms", prim.now_ms() - d.started)

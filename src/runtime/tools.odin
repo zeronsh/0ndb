@@ -330,7 +330,7 @@ shell_tool :: proc(r: ^Runtime, run: ^Run, call: ^Tool_Call, rep: Reply) -> u64 
 	cmd := jstr(v, "command")
 	cwd := run.ws.root if run.ws != nil else concat(r.cfg.work_root, "/", hex(run.o.id))
 	prim.mkdir_all(r.e.base, cwd, 0o755)
-	argv := []string{"/bin/sh", "-c", cmd}
+	argv := shell_argv(cmd)
 	req := Spawn_Request {
 		argv      = argv,
 		cwd       = cwd,

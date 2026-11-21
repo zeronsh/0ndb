@@ -381,14 +381,16 @@ _presence_changed :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, up: bool
 	if !attached {
 		return
 	}
-	if !up {
-		for w in r.leases {
-			if w.object.space == space {
-				_queue_eval(r, w.object)
-			}
+	if up {
+		_pending_scan(r, space)
+		return
+	}
+	for w in r.leases {
+		if w.object.space == space {
+			_queue_eval(r, w.object)
 		}
 	}
-	_pending_scan(r, space)
+	_pending_scan(r, space, device)
 }
 
 close :: proc(r: ^Runtime) {

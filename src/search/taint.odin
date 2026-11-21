@@ -157,6 +157,10 @@ _stale_model :: proc(ix: ^Index) -> bool {
 	return false
 }
 
+models_pending :: proc(ix: ^Index) -> bool {
+	return ix.taint_check || ix.zd_tainted || ix.cb_tainted || ix.vtrain != nil || _stale_model(ix)
+}
+
 redact_models :: proc(ix: ^Index) -> (more: bool, err: Error) {
 	taint_refresh(ix) or_return
 	if ix.zd_tainted && ix.merge == nil {
@@ -165,6 +169,15 @@ redact_models :: proc(ix: ^Index) -> (more: bool, err: Error) {
 	}
 	if ix.cb_tainted && ix.vtrain == nil && ix.merge == nil {
 		_ = vec_maybe_train(ix) or_return
+		if ix.cb_tainted && ix.vtrain == nil {
+			old := ix.man.cb_gen
+			ix.man.cb_gen = 0
+			if e := manifest_write(ix); e != .None {
+				ix.man.cb_gen = old
+				return false, e
+			}
+			ix.cb_tainted = false
+		}
 	}
 	more = ix.zd_tainted || ix.cb_tainted || ix.vtrain != nil || _stale_model(ix)
 	if !more && ix.merge == nil {

@@ -290,6 +290,8 @@ Mount :: struct {
 	hold_line:   bool,
 	alias:       [dynamic]Version,
 	unwatched:   [dynamic]string,
+	attrs:       ^Attr_Ctx,
+	collided:    [dynamic]string,
 }
 
 Intent :: struct {
@@ -401,6 +403,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
 	m.unwatched = make([dynamic]string, allocator)
+	m.collided = make([dynamic]string, allocator)
 	ok := false
 	defer if !ok {
 		mount_close(m)
@@ -573,6 +576,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(u, m.allocator)
 	}
 	delete(m.unwatched)
+	for c in m.collided {
+		delete(c, m.allocator)
+	}
+	delete(m.collided)
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
@@ -753,6 +760,17 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 	if scope == nil || path_internal(rel) {
 		return .None
 	}
+	if a, ok := m.attrib[rel]; ok && !a.used && a.actor != scope.actor {
+		if o := m.open_scopes[rel]; o != nil && o != scope {
+			m.open_scopes[rel] = nil
+		}
+		mount_mark(m, rel)
+		mount_pass(m, false) or_return
+		if b, still := m.attrib[rel]; still && !b.used && b.actor == a.actor {
+			key, _ := delete_key(&m.attrib, rel)
+			delete(key, m.allocator)
+		}
+	}
 	if v, ok := &m.open_scopes[rel]; ok {
 		v^ = scope
 	} else {
@@ -872,6 +890,8 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if rerr != .None {
 		return
 	}
+	prev, has_prev, _ := shadow_get(&m.shadow, rel)
+	data = eol_clean(m, rel, data, prev.inode, has_prev && prev.kind == .File)
 	oid, werr := odb.write(m.db, .Blob, data)
 	if werr != .None || oid == a.oid {
 		return

@@ -248,7 +248,15 @@ path_parent_abs :: proc(p: string) -> string {
 	return p[:i]
 }
 
-clean_path :: proc(p: string, allocator := context.allocator) -> string {
+clean_path :: proc(path: string, allocator := context.allocator) -> string {
+	p := path
+	when ODIN_OS == .Windows {
+		w := make([]u8, len(path), context.temp_allocator)
+		for c, i in transmute([]u8)path {
+			w[i] = '/' if c == '\\' else c
+		}
+		p = string(w)
+	}
 	parts := make([dynamic]string, context.temp_allocator)
 	rest := p
 	for part in strings.split_iterator(&rest, "/") {
@@ -265,6 +273,9 @@ clean_path :: proc(p: string, allocator := context.allocator) -> string {
 	b := strings.builder_make(allocator)
 	if len(p) > 0 && p[0] == '/' {
 		strings.write_byte(&b, '/')
+		if ODIN_OS == .Windows && len(p) > 1 && p[1] == '/' {
+			strings.write_byte(&b, '/')
+		}
 	}
 	for part, i in parts {
 		if i > 0 {

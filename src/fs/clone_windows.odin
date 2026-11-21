@@ -52,7 +52,7 @@ clone_file :: proc(vfs: prim.Vfs, src, dst: string, mode: u32) -> Error {
 	sw, dw: [prim.PATH_MAX + 8]u16
 	if abs_wide(src, sw[:]) && abs_wide(dst, dw[:]) {
 		flags: u32 = win.COPY_FILE_NO_BUFFERING if size >= COPY_UNBUFFERED_MIN else 0
-		if win.CopyFileExW(&sw[0], &dw[0], nil, nil, nil, flags) {
+		if win.CopyFileExW(cstring16(&sw[0]), cstring16(&dw[0]), nil, nil, nil, flags) {
 			if fd, oerr := prim.open_file(vfs, dst, {.Write}); oerr == .None {
 				prim.fchmod(vfs, fd, mode & 0o7777)
 				prim.close_file(vfs, fd)
@@ -68,7 +68,7 @@ block_clone :: proc(vfs: prim.Vfs, in_fd: prim.Fd, dst: string, mode: u32) -> bo
 	hin := fd_handle(in_fd)
 	iosb: win.IO_STATUS_BLOCK
 	attr: [64]u8
-	if NtQueryVolumeInformationFile(hin, &iosb, &attr[0], size_of(attr), NT_FS_ATTRIBUTE_INFO) < 0 && u32(NtQueryVolumeInformationFile(hin, &iosb, &attr[0], size_of(attr), NT_FS_ATTRIBUTE_INFO)) != u32(STATUS_BUFFER_OVERFLOW) {
+	if qs := NtQueryVolumeInformationFile(hin, &iosb, &attr[0], size_of(attr), NT_FS_ATTRIBUTE_INFO); qs < 0 && qs != STATUS_BUFFER_OVERFLOW {
 		return false
 	}
 	if (^u32)(&attr[0])^ & FILE_SUPPORTS_BLOCK_REFCOUNTING == 0 {

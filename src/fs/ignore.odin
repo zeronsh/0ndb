@@ -105,6 +105,7 @@ Ignore :: struct {
 	global:      ^Rules,
 	defaults:    ^Rules,
 	ignore_case: bool,
+	git:         Git_Settings,
 	allocator:   runtime.Allocator,
 }
 
@@ -311,6 +312,7 @@ ignore_destroy :: proc(ig: ^Ignore) {
 	rules_destroy(ig.excludes, ig.allocator)
 	rules_destroy(ig.global, ig.allocator)
 	rules_destroy(ig.defaults, ig.allocator)
+	git_settings_destroy(&ig.git, ig.allocator)
 	ig.excludes = nil
 	ig.global = nil
 	ig.defaults = nil
@@ -805,7 +807,7 @@ ignore_has_prefix :: proc "contextless" (s, prefix: string) -> bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
-@(private = "file")
+@(private)
 Wild_Result :: enum u8 {
 	Match,
 	No_Match,
@@ -818,7 +820,7 @@ wild_at :: #force_inline proc "contextless" (s: string, i: int) -> u8 {
 	return s[i] if i < len(s) else 0
 }
 
-@(private = "file")
+@(private)
 wild_do :: proc "contextless" (pat: string, p0: int, text: string, t0: int, pathname, fold: bool) -> Wild_Result {
 	p, t := p0, t0
 	for ; p < len(pat); p, t = p + 1, t + 1 {
@@ -1049,7 +1051,7 @@ wild_posix_class :: proc "contextless" (name: string, c: u8, fold: bool) -> (in_
 	return false, false
 }
 
-@(private = "file")
+@(private)
 ignore_read :: proc(vfs: prim.Vfs, path: string, limit: i64, allocator: runtime.Allocator) -> (data: []u8, err: Error) {
 	fd, perr := prim.open_file(vfs, path)
 	if perr != .None {
@@ -1109,6 +1111,8 @@ ignore_load :: proc(ig: ^Ignore, git_dir, common_dir: string, plain: bool) -> Er
 		vfs       = ig.vfs,
 		allocator = ig.allocator,
 		git_dir   = gd,
+		filemode  = true,
+		symlinks  = true,
 	}
 	buf: prim.Path_Buf = ---
 	nosystem := false
@@ -1118,7 +1122,16 @@ ignore_load :: proc(ig: ^Ignore, git_dir, common_dir: string, plain: bool) -> Er
 	if !nosystem {
 		system, ok := prim.getenv("GIT_CONFIG_SYSTEM")
 		if !ok {
-			system = "/etc/gitconfig"
+			when ODIN_OS == .Windows {
+				if p, pok := git_program_data_config(buf[:]); pok {
+					config_load(&c, p) or_return
+				}
+				if p, pok := git_system_file(buf[:], "etc/gitconfig"); pok {
+					system = p
+				}
+			} else {
+				system = "/etc/gitconfig"
+			}
 		}
 		config_load(&c, system) or_return
 	}
@@ -1128,7 +1141,7 @@ ignore_load :: proc(ig: ^Ignore, git_dir, common_dir: string, plain: bool) -> Er
 		if p, pok := ignore_xdg_path(buf[:], "config"); pok {
 			config_load(&c, p) or_return
 		}
-		if home, hok := prim.getenv("HOME"); hok {
+		if home, hok := git_home(); hok {
 			if p, pok := path_join_buf(buf[:], home, ".gitconfig"); pok {
 				config_load(&c, p) or_return
 			}
@@ -1146,10 +1159,24 @@ ignore_load :: proc(ig: ^Ignore, git_dir, common_dir: string, plain: bool) -> Er
 		}
 	}
 	ig.ignore_case = c.ignore_case
+	ig.git = Git_Settings {
+		autocrlf     = c.autocrlf,
+		core_eol     = c.core_eol,
+		trust_exec   = c.filemode && ODIN_OS != .Windows,
+		symlinks     = c.symlinks,
+		ignore_case  = c.ignore_case,
+	}
+	attributes_file := ""
+	if c.has_attributes {
+		attributes_file = string(c.attributes[:c.attributes_len])
+	} else if p, ok := ignore_xdg_path(buf[:], "attributes"); ok {
+		attributes_file = p
+	}
+	git_settings_attributes(&ig.git, ig.vfs, attributes_file, ig.allocator)
 	excludes_file := ""
 	if c.has_excludes {
 		excludes_file = string(c.excludes[:c.excludes_len])
-		if len(excludes_file) > 0 && excludes_file[0] != '/' {
+		if len(excludes_file) > 0 && !path_is_abs(excludes_file) {
 			root_buf: prim.Path_Buf = ---
 			root, ok := ignore_worktree_root(ig.vfs, gd, root_buf[:])
 			if !ok {
@@ -1175,7 +1202,7 @@ ignore_xdg_path :: proc "contextless" (buf: []u8, name: string) -> (string, bool
 	if xdg, ok := prim.getenv("XDG_CONFIG_HOME"); ok {
 		return path_join_buf(buf, xdg, "git", name)
 	}
-	if home, ok := prim.getenv("HOME"); ok {
+	if home, ok := git_home(); ok {
 		return path_join_buf(buf, home, ".config/git", name)
 	}
 	return "", false
@@ -1236,6 +1263,13 @@ Git_Config :: struct {
 	has_excludes:    bool,
 	ignore_case:     bool,
 	worktree_config: bool,
+	autocrlf:        Autocrlf,
+	core_eol:        Core_Eol,
+	filemode:        bool,
+	symlinks:        bool,
+	attributes:      [prim.PATH_MAX]u8,
+	attributes_len:  int,
+	has_attributes:  bool,
 }
 
 @(private = "file")
@@ -1509,6 +1543,37 @@ config_entry :: proc(c: ^Git_Config, key, val: string, has_value: bool, from: st
 		if b, ok := config_bool(val, has_value); ok {
 			c.ignore_case = b
 		}
+	case "core.autocrlf":
+		if has_value && ignore_equal(val, "input", true) {
+			c.autocrlf = .Input
+		} else if b, ok := config_bool(val, has_value); ok {
+			c.autocrlf = .True if b else .False
+		}
+	case "core.eol":
+		switch {
+		case ignore_equal(val, "lf", true):
+			c.core_eol = .Lf
+		case ignore_equal(val, "crlf", true):
+			c.core_eol = .Crlf
+		case ignore_equal(val, "native", true):
+			c.core_eol = .Native
+		}
+	case "core.filemode":
+		if b, ok := config_bool(val, has_value); ok {
+			c.filemode = b
+		}
+	case "core.symlinks":
+		if b, ok := config_bool(val, has_value); ok {
+			c.symlinks = b
+		}
+	case "core.attributesfile":
+		if has_value {
+			c.has_attributes = true
+			c.attributes_len = 0
+			if p, ok := config_path(c.attributes[:], val, ""); ok {
+				c.attributes_len = len(p)
+			}
+		}
 	case "extensions.worktreeconfig":
 		if b, ok := config_bool(val, has_value); ok {
 			c.worktree_config = b
@@ -1534,7 +1599,7 @@ config_include :: proc(c: ^Git_Config, val, from: string) -> Error {
 	}
 	buf: prim.Path_Buf = ---
 	p, ok := config_path(buf[:], val, from)
-	if !ok || len(p) == 0 || p[0] != '/' {
+	if !ok || len(p) == 0 || !path_is_abs(p) {
 		return .None
 	}
 	return config_load(c, p)
@@ -1549,7 +1614,7 @@ config_path :: proc "contextless" (buf: []u8, val, from: string) -> (string, boo
 		if slash != 1 && !(slash < 0 && len(val) == 1) {
 			return "", false
 		}
-		home, ok := prim.getenv("HOME")
+		home, ok := git_home()
 		if !ok || len(home) > len(buf) {
 			return "", false
 		}
@@ -1557,7 +1622,7 @@ config_path :: proc "contextless" (buf: []u8, val, from: string) -> (string, boo
 		rest = val[1:]
 	} else if ignore_has_prefix(val, "%(prefix)/") {
 		return "", false
-	} else if len(val) > 0 && val[0] != '/' && len(from) > 0 {
+	} else if len(val) > 0 && !path_is_abs(val) && len(from) > 0 {
 		slash := len(from) - 1
 		for slash >= 0 && from[slash] != '/' {
 			slash -= 1
@@ -1571,6 +1636,13 @@ config_path :: proc "contextless" (buf: []u8, val, from: string) -> (string, boo
 		return "", false
 	}
 	n += copy(buf[n:], rest)
+	when ODIN_OS == .Windows {
+		for i in 0 ..< n {
+			if buf[i] == '\\' {
+				buf[i] = '/'
+			}
+		}
+	}
 	return string(buf[:n]), true
 }
 

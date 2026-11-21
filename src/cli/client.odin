@@ -1,16 +1,13 @@
 package main
 
 import "core:encoding/json"
-import "core:fmt"
 import "core:os"
 import "core:strconv"
-import "core:strings"
-import "core:sys/posix"
 import "../capi/api"
 import "../prim"
 
 Client :: struct {
-	fd:   posix.FD,
+	fd:   Sock,
 	rbuf: [dynamic]u8,
 	tag:  u64,
 }
@@ -38,34 +35,14 @@ home_dir :: proc(allocator := context.allocator) -> string {
 	return d
 }
 
-@(private)
-_connect_once :: proc(path: string) -> (fd: posix.FD, ok: bool) {
-	fd = posix.socket(.UNIX, .STREAM)
-	if fd < 0 {
-		return -1, false
-	}
-	addr: posix.sockaddr_un
-	addr.sun_family = .UNIX
-	if len(path) >= len(addr.sun_path) {
-		posix.close(fd)
-		return -1, false
-	}
-	copy(addr.sun_path[:], path)
-	if posix.connect(fd, (^posix.sockaddr)(&addr), posix.socklen_t(size_of(addr))) != .OK {
-		posix.close(fd)
-		return -1, false
-	}
-	return fd, true
-}
-
 client_connect :: proc(c: ^Client, autostart := true) -> bool {
 	path := socket_path(context.temp_allocator)
-	fd, ok := _connect_once(path)
+	fd, ok := sock_connect(path)
 	if !ok && autostart {
 		if !_spawn_daemon() {
 			return false
 		}
-		fd, ok = _connect_once(path)
+		fd, ok = sock_connect(path)
 	}
 	if !ok {
 		return false
@@ -79,9 +56,9 @@ client_connect :: proc(c: ^Client, autostart := true) -> bool {
 }
 
 client_close :: proc(c: ^Client) {
-	if c.fd >= 0 {
-		posix.close(c.fd)
-		c.fd = -1
+	if c.fd != NO_SOCK {
+		sock_close(c.fd)
+		c.fd = NO_SOCK
 	}
 	delete(c.rbuf)
 }
@@ -95,71 +72,12 @@ _spawn_daemon :: proc() -> bool {
 	home := home_dir(context.temp_allocator)
 	prim.mkdir_all(prim.os_vfs(), home, 0o700)
 	log_path, _ := prim.path_join(context.temp_allocator, home, "daemon.log")
-	fds: [2]posix.FD
-	if posix.pipe(&fds) != .OK {
-		return false
-	}
-	pid := posix.fork()
-	if pid < 0 {
-		posix.close(fds[0])
-		posix.close(fds[1])
-		return false
-	}
-	if pid == 0 {
-		posix.close(fds[0])
-		posix.setsid()
-		null := posix.open("/dev/null", {.RDWR})
-		logfd := posix.open(strings.clone_to_cstring(log_path, context.temp_allocator), {.WRONLY, .CREAT, .APPEND}, {.IRUSR, .IWUSR})
-		if null >= 0 {
-			posix.dup2(null, 0)
-		}
-		if logfd >= 0 {
-			posix.dup2(logfd, 1)
-			posix.dup2(logfd, 2)
-		}
-		env := fmt.ctprintf("ONDB_READY_FD=%d", fds[1])
-		posix.setenv("ONDB_READY_FD", strings.clone_to_cstring(fmt.tprintf("%d", fds[1]), context.temp_allocator), true)
-		_ = env
-		argv := [3]cstring{strings.clone_to_cstring(exe, context.temp_allocator), "daemon", nil}
-		posix.execv(argv[0], raw_data(argv[:]))
-		posix._exit(127)
-	}
-	posix.close(fds[1])
-	pfd := posix.pollfd{fd = fds[0], events = {.IN}}
-	ready := false
-	for {
-		r := posix.poll(&pfd, 1, 15_000)
-		if r < 0 && posix.errno() == .EINTR {
-			continue
-		}
-		if r > 0 {
-			b: [1]u8
-			n := posix.read(fds[0], raw_data(b[:]), 1)
-			ready = n == 1 && b[0] == '1'
-		}
-		break
-	}
-	posix.close(fds[0])
-	status: i32
-	posix.waitpid(pid, &status, {.NOHANG})
-	return ready
+	return spawn_daemon(exe, log_path)
 }
 
 @(private)
-_write_all :: proc(fd: posix.FD, data: []u8) -> bool {
-	off := 0
-	for off < len(data) {
-		rem := len(data) - off
-		n := posix.write(fd, raw_data(data[off:]), uint(rem))
-		if n < 0 {
-			if posix.errno() == .EINTR {
-				continue
-			}
-			return false
-		}
-		off += int(n)
-	}
-	return true
+_write_all :: proc(fd: Sock, data: []u8) -> bool {
+	return sock_write_all(fd, data)
 }
 
 client_send :: proc(c: ^Client, kind: Frame_Kind, parts: ..[]u8) -> bool {
@@ -180,19 +98,15 @@ client_read :: proc(c: ^Client, timeout_ms: i64 = -1) -> (kind: Frame_Kind, payl
 			remove_range(&c.rbuf, 0, used)
 			return k, out, true
 		}
-		if timeout_ms >= 0 {
-			pfd := posix.pollfd{fd = c.fd, events = {.IN}}
-			r := posix.poll(&pfd, 1, i32(min(timeout_ms, i64(max(i32)))))
-			if r == 0 {
-				return .None, nil, false
-			}
+		if timeout_ms >= 0 && !sock_wait(c.fd, timeout_ms) {
+			return .None, nil, false
 		}
 		buf: [65536]u8
-		n := posix.read(c.fd, raw_data(buf[:]), len(buf))
-		if n < 0 && posix.errno() == .EINTR {
+		n, st := sock_read(c.fd, buf[:])
+		if st == .Again {
 			continue
 		}
-		if n <= 0 {
+		if st != .Ok {
 			return .None, nil, false
 		}
 		append(&c.rbuf, ..buf[:n])

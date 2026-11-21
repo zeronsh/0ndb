@@ -143,7 +143,11 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			policy   = a.policy,
 			exclude  = hm.runner,
 		}
-		if place(r, &p) == r.self && start_run(r, o, hm.parent) == .None {
+		x := place(r, &p)
+		if prim.id_is_zero(x) {
+			_placement_waiting(r, o, hm.parent, p.provider, hm.runner)
+		}
+		if x == r.self && start_run(r, o, hm.parent) == .None {
 			r.stats.takeovers += 1
 		}
 	}
@@ -348,16 +352,16 @@ _placed_here :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^c
 }
 
 @(private)
-_place_message :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message) -> (runner: prim.Id, assignee: prim.Id) {
+_place_message :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message, dead: prim.Id = {}) -> (runner: prim.Id, assignee: prim.Id) {
 	a, _ := agent_resolve(r, o, m.provider, m.model, context.temp_allocator)
 	provider := placement_provider(&a)
-	exclude: prim.Id
+	exclude := dead
 	if as, aerr := convo.assignee(v, t, m.id); aerr == .None && !prim.id_is_zero(as) {
 		assignee = as
-		if as == r.self && r.cfg.runner {
+		if as == r.self && r.cfg.runner && as != dead {
 			return as, as
 		}
-		if !_claim_overdue(r, o, m.id, as, provider) {
+		if as != dead && !_claim_overdue(r, o, m.id, as, provider) {
 			return as, as
 		}
 		exclude = as
@@ -583,7 +587,7 @@ start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
 		return .Not_Assigned if cerr == .Not_Assigned else .Engine
 	}
 	run.claim = claim
-	_pending_clear(r, o)
+	_pending_put(r, o, Pending_Entry{msg = user, provider = placement_provider(&run.ai), since_ms = wall_ms(r), runner = r.self, assigned = true})
 	_claim_prune(r, o, {})
 	if exhausted {
 		eng.pin(r.e, o)
@@ -1268,7 +1272,8 @@ _follow_stale :: proc(r: ^Runtime, o: Object, v: ^obj.View, c: ^eng.Catalog_Entr
 			idx = i
 		}
 	}
-	behind := remote && i64(c.activity) > _view_activity(v) && !_activity_mine(r, o)
+	author := _activity_author(r, o)
+	behind := remote && i64(c.activity) > _view_activity(v) && author != r.self && runner_present(r, o.space, author)
 	if idx < 0 {
 		if !behind || run_find(r, o) != nil {
 			return false
@@ -1338,19 +1343,19 @@ _on_follow_convo :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: 
 }
 
 @(private)
-_activity_mine :: proc(r: ^Runtime, o: Object) -> bool {
+_activity_author :: proc(r: ^Runtime, o: Object) -> prim.Id {
 	kb: [16]u8
 	key := omap.catalog_key(o.id, &kb)
 	en, found, err := eng.map_get(r.e, eng.space_catalog(r.e, o.space), key, context.temp_allocator)
 	if err != .None || !found {
-		return false
+		return {}
 	}
 	for reg in en.registers {
 		if reg.tag == u32(omap.Catalog_Tag.Activity) {
-			return reg.by == r.self
+			return reg.by
 		}
 	}
-	return false
+	return {}
 }
 
 REVIVE_SYNC_MS :: 30_000

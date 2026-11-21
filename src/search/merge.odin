@@ -560,8 +560,9 @@ _merge_step :: proc(ix: ^Index, budget: i64, idle: bool) -> (more: bool, err: Er
 	if ix.broken {
 		return false, .Corrupt
 	}
+	pending := false
 	if idle && ix.merge == nil {
-		_ = redact_models(ix) or_return
+		pending = redact_models(ix) or_return
 		_ = vec_maybe_train(ix) or_return
 	}
 	if ix.vtrain != nil {
@@ -571,7 +572,7 @@ _merge_step :: proc(ix: ^Index, budget: i64, idle: bool) -> (more: bool, err: Er
 	if ix.merge == nil {
 		from, to, ok := merge_pick(ix, idle)
 		if !ok {
-			return false, .None
+			return pending, .None
 		}
 		if e := merge_start(ix, from, to); e != .None {
 			merge_abort(ix)
@@ -595,7 +596,7 @@ _merge_step :: proc(ix: ^Index, budget: i64, idle: bool) -> (more: bool, err: Er
 			free(m, ix.allocator)
 			ix.merge = nil
 			_, _, again := merge_pick(ix, idle)
-			return again, .None
+			return again || (idle && models_pending(ix)), .None
 		}
 	}
 	return true, .None

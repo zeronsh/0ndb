@@ -3,7 +3,6 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import "core:sys/posix"
 import "../capi/api"
 import "../prim"
 
@@ -71,7 +70,7 @@ COMMANDS := []Command {
 }
 
 main :: proc() {
-	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
+	ignore_broken_pipes()
 	code := run(os.args[1:])
 	free_all(context.temp_allocator)
 	os.exit(code)

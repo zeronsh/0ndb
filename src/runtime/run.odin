@@ -523,6 +523,9 @@ _run_finish_tail :: proc(run: ^Run) {
 			convo.writer_landed(w, run.claim, files, run.status)
 		}
 	}
+	if pe, ok := pending_get(r, run.o); ok && pe.msg == run.user && pe.runner == r.self {
+		_pending_clear(r, run.o)
+	}
 	_awaits_settle(r, run.o)
 	run_raw_commit(run)
 	eng.catalog_usage(r.e, run.o, run.usage)

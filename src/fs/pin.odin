@@ -212,7 +212,8 @@ dir_tree :: proc(m: ^Mount, dir: string, pack: ^odb.Pack_Builder = nil) -> (oid:
 			mode = odb.MODE_TREE
 		case .File:
 			ensure_blob(m, child, &e) or_continue
-			mode = odb.MODE_EXEC if e.stat.mode & 0o100 != 0 else odb.MODE_FILE
+			exec := e.stat.mode & 0o100 != 0 if mount_trust_exec(m) else .Exec in tree_flags(m.history, e.inode)
+			mode = odb.MODE_EXEC if exec else odb.MODE_FILE
 		case .Symlink:
 			ensure_link_blob(m, child, &e) or_continue
 			mode = odb.MODE_LINK

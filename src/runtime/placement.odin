@@ -34,78 +34,88 @@ _evaluate_sender :: proc(r: ^Runtime, o: Object) {
 	waiting: Rid
 	defer _claim_prune(r, o, waiting)
 	if t.running {
-		_pending_settled(r, o, v, &t, {})
-		return
+		if _, live := _open_live(r, o, v, &t); live {
+			return
+		}
 	}
 	if task_cancelled(r, o) {
 		return
 	}
-	for &it in items {
-		if it.kind != .Queue && it.kind != .Steer {
-			continue
-		}
-		if it.by != r.self {
+	if !t.running {
+		for &it in items {
+			if it.kind != .Queue && it.kind != .Steer {
+				continue
+			}
+			if it.by == r.self && prim.id_is_zero(place_intent(r, o, &it)) {
+				_placement_waiting(r, o, it.item, _intent_provider(r, o), {})
+			}
 			return
 		}
-		if prim.id_is_zero(place_intent(r, o, &it)) {
-			_placement_waiting(r, o, it.item, _intent_provider(r, o), {})
-		} else {
-			_pending_settled(r, o, v, &t, {})
+	}
+	msg, um, dead, ok := _unanswered(r, o, v, &t)
+	if !ok {
+		if !t.running && t.queued == 0 {
+			_pending_clear(r, o)
 		}
 		return
 	}
-	head := convo.tail_head(v, &t)
-	if obj.rid_none(head) {
+	if um.author != r.self {
 		return
 	}
-	hm, herr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator)
-	if herr != .None {
-		return
-	}
-	if (hm.role != .User && hm.role != .System) || hm.open || hm.status != .Done {
-		_pending_settled(r, o, v, &t, {})
-		return
-	}
-	if hm.author != r.self {
-		return
-	}
-	waiting = head
-	x, assignee := _place_message(r, o, v, &t, &hm)
+	waiting = msg
+	x, assignee := _place_message(r, o, v, &t, &um, dead)
 	if prim.id_is_zero(x) {
 		return
 	}
-	a, _ := agent_resolve(r, o, hm.provider, hm.model, context.temp_allocator)
+	a, _ := agent_resolve(r, o, um.provider, um.model, context.temp_allocator)
 	provider := placement_provider(&a)
 	if x != assignee {
 		w := _convo_w(r, o)
 		if w == nil {
 			return
 		}
-		if _, aerr := convo.writer_assign(w, head, x); aerr != .None {
+		if _, aerr := convo.writer_assign(w, msg, x); aerr != .None {
 			return
 		}
 		eng.touched(r.e, o)
-		_claim_overdue(r, o, head, x, provider)
+		_claim_overdue(r, o, msg, x, provider)
 	}
-	if _pending_put(r, o, Pending_Entry{msg = head, provider = provider, since_ms = wall_ms(r), runner = x, assigned = true}) {
-		_placement_hook(r, o, Placement_Info{state = .Assigned, msg = head, runner = x, provider = provider, since_ms = wall_ms(r)})
+	if _pending_put(r, o, Pending_Entry{msg = msg, provider = provider, since_ms = wall_ms(r), runner = x, assigned = true}) {
+		_placement_hook(r, o, Placement_Info{state = .Assigned, msg = msg, runner = x, provider = provider, since_ms = wall_ms(r)})
 	}
 }
 
 @(private)
-_pending_settled :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, keep: Rid) {
-	p, ok := pending_get(r, o)
-	if !ok || p.msg == keep {
+_unanswered :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> (msg: Rid, um: convo.Message, dead: prim.Id, ok: bool) {
+	head := convo.tail_head(v, t)
+	if obj.rid_none(head) {
 		return
 	}
-	if p.msg.seg != r.self {
-		if _, merr := convo.message(v, t, convo.Position{msg = p.msg}, context.temp_allocator); merr != .None {
-			if s := obj.view_find(v, p.msg.seg); s < 0 {
-				return
-			}
-		}
+	hm, herr := convo.message(v, t, convo.Position{msg = head}, context.temp_allocator)
+	if herr != .None {
+		return
 	}
-	_pending_clear(r, o)
+	if hm.role == .User || hm.role == .System {
+		if hm.open || hm.status != .Done {
+			return
+		}
+		return head, hm, {}, true
+	}
+	if !hm.open || obj.rid_none(hm.parent) || hm.runner == r.self {
+		return
+	}
+	reassigned := false
+	if as, aerr := convo.assignee(v, t, hm.parent); aerr == .None && !prim.id_is_zero(as) && as != hm.runner {
+		reassigned = true
+	}
+	if !reassigned && runner_present(r, o.space, hm.runner) {
+		return
+	}
+	pm, perr := convo.message(v, t, convo.Position{msg = hm.parent}, context.temp_allocator)
+	if perr != .None {
+		return
+	}
+	return hm.parent, pm, hm.runner, true
 }
 
 placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: Error) {
@@ -144,22 +154,15 @@ placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: 
 			return info, .None
 		}
 	}
-	head := convo.tail_head(v, &t)
-	if obj.rid_none(head) {
-		return info, .None
-	}
-	hm, herr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator)
-	if herr != .None {
-		return info, .Pending if herr == .Missing else .Engine
-	}
-	if (hm.role != .User && hm.role != .System) || hm.open || hm.status != .Done {
+	head, hm, dead, uok := _unanswered(r, o, v, &t)
+	if !uok {
 		return info, .None
 	}
 	a, _ := agent_resolve(r, o, hm.provider, hm.model, context.temp_allocator)
 	info.msg = head
 	info.provider = placement_provider(&a)
-	exclude: prim.Id
-	if as, aerr := convo.assignee(v, &t, head); aerr == .None && !prim.id_is_zero(as) {
+	exclude := dead
+	if as, aerr := convo.assignee(v, &t, head); aerr == .None && !prim.id_is_zero(as) && as != dead {
 		overdue := !runner_live(r, o.space, as, info.provider)
 		for w in r.leases {
 			if w.claim && w.object == o && w.msg == head && w.runner == as && wall_ms(r) >= w.seen + r.cfg.claim_wait_ms {

@@ -3,7 +3,6 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import "core:sys/posix"
 import "../capi/api"
 import eng "../engine"
 import "../fs"
@@ -67,7 +66,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 		}
 	}
 	m := new(Relay_Main)
-	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
+	ignore_broken_pipes()
 	if prim.loop_init(&m.loop) != .None {
 		return report_error(.Io, "cannot create the event loop")
 	}
