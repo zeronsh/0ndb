@@ -2484,7 +2484,7 @@ fn openFallbackMock(
     return ondb.providers.registry.MockRun.start(allocator, .{ .native_steer = false, .split_chunks = true });
 }
 
-test "all 9 providers, durable queuing, native and fallback steering, edit/rollback/branching, pagination" {
+test "all 10 providers, durable queuing, native and fallback steering, edit/rollback/branching, pagination" {
     const allocator = testing.allocator;
     const io = testing.io;
     const tmp_root = "/tmp/0ndb-verify-session";
@@ -2495,7 +2495,7 @@ test "all 9 providers, durable queuing, native and fallback steering, edit/rollb
     defer cleanDir(io, tmp_state);
 
     const all = ondb.providers.registry.listProviders(io);
-    try testing.expectEqual(@as(usize, 9), all.len);
+    try testing.expectEqual(@as(usize, 10), all.len);
 
     var ws = try ondb.fs.workspace.Workspace.open(allocator, io, tmp_root, tmp_state, 99);
     defer ws.deinit();
@@ -2917,6 +2917,514 @@ test "all 9 providers, durable queuing, native and fallback steering, edit/rollb
             try testing.expect(awts2.get(primary_ws.history.history_id) == null);
             try testing.expect(awts2.get(fork_id_saved) != null);
         }
+    }
+
+    {
+        const s_model = ondb.session.model;
+        const s_pager = ondb.session.pager;
+        const codec = ondb.store.codec;
+
+        var bad_ver_w = codec.Writer{};
+        defer bad_ver_w.deinit(allocator);
+        try bad_ver_w.writeVarint(allocator, 0xFFFF_FFFF);
+        var bad_ver_r = codec.Reader.init(bad_ver_w.items());
+        try testing.expectError(error.CorruptRecord, s_model.decodeVersionChecked(allocator, &bad_ver_r));
+
+        var bad_page_w = codec.Writer{};
+        defer bad_page_w.deinit(allocator);
+        try bad_page_w.writeRaw(allocator, &s_pager.PAGE_MAGIC);
+        try bad_page_w.writeU8(allocator, s_pager.PAGE_VERSION);
+        try bad_page_w.writeU128(allocator, 1);
+        try bad_page_w.writeU8(allocator, 0);
+        try bad_page_w.writeU8(allocator, 0);
+        try bad_page_w.writeU32(allocator, 0xFFFF_FFFF);
+        try testing.expectError(error.CorruptRecord, s_pager.MessagePage.decode(allocator, bad_page_w.items()));
+
+        var bad_thread_w = codec.Writer{};
+        defer bad_thread_w.deinit(allocator);
+        try bad_thread_w.writeU128(allocator, 1);
+        try bad_thread_w.writeU128(allocator, 2);
+        try bad_thread_w.writeBytes(allocator, "t");
+        try bad_thread_w.writeU8(allocator, 0);
+        try bad_thread_w.writeU8(allocator, 0);
+        try bad_thread_w.writeU8(allocator, 250);
+        try bad_thread_w.writeOptBytes(allocator, null);
+        try bad_thread_w.writeU8(allocator, 0);
+        try bad_thread_w.writeU32(allocator, 0);
+        try bad_thread_w.writeU32(allocator, 0);
+        try bad_thread_w.writeU64(allocator, 1);
+        try bad_thread_w.writeU64(allocator, 1);
+        var bad_thread_r = codec.Reader.init(bad_thread_w.items());
+        try testing.expectError(error.CorruptRecord, s_model.Thread.decode(allocator, &bad_thread_r));
+
+        var bad_msg_w = codec.Writer{};
+        defer bad_msg_w.deinit(allocator);
+        try bad_msg_w.writeU128(allocator, 10);
+        try bad_msg_w.writeU128(allocator, 1);
+        try bad_msg_w.writeU8(allocator, 0);
+        try bad_msg_w.writeU8(allocator, 99);
+        try bad_msg_w.writeBytes(allocator, "hi");
+        var bad_msg_r = codec.Reader.init(bad_msg_w.items());
+        try testing.expectError(error.CorruptRecord, s_model.Message.decode(allocator, &bad_msg_r));
+
+        var bad_q_w = codec.Writer{};
+        defer bad_q_w.deinit(allocator);
+        try bad_q_w.writeU128(allocator, 11);
+        try bad_q_w.writeU128(allocator, 1);
+        try bad_q_w.writeU8(allocator, 99);
+        try bad_q_w.writeU8(allocator, 1);
+        var bad_q_r = codec.Reader.init(bad_q_w.items());
+        try testing.expectError(error.CorruptRecord, s_model.QueueItem.decode(allocator, &bad_q_r));
+    }
+
+    {
+        const j_dir = "/tmp/0ndb-verify-journal-reopen";
+        cleanDir(io, j_dir);
+        defer cleanDir(io, j_dir);
+
+        const j_mod = ondb.session.journal;
+        const tid_j: u128 = 0x1111;
+        const mid_j: u128 = 0x2222;
+
+        {
+            var j = try j_mod.SessionJournal.open(allocator, io, j_dir);
+            defer j.deinit();
+
+            const rv = ondb.core.version.Version.single(ondb.core.id.OpId.init(7, 9));
+            try j.putThread(.{
+                .thread_id = tid_j,
+                .worktree_id = 1,
+                .title = try allocator.dupe(u8, "persist"),
+                .leaf_msg_id = mid_j,
+                .head_page = null,
+                .default_provider = .grok,
+                .default_model = try allocator.dupe(u8, "grok-3"),
+                .status = .idle,
+                .queued_count = 0,
+                .message_count = 1,
+                .created_ms = 100,
+                .updated_ms = 100,
+                .root_version = rv,
+            });
+
+            try j.putMessage(.{
+                .msg_id = mid_j,
+                .thread_id = tid_j,
+                .parent_id = null,
+                .role = .assistant,
+                .content = try allocator.dupe(u8, "partial"),
+                .provider = .grok,
+                .model = null,
+                .native_session = null,
+                .native_turn = null,
+                .pre_version = ondb.core.version.Version.ROOT,
+                .post_version = ondb.core.version.Version.ROOT,
+                .git_branch = null,
+                .git_commit = null,
+                .worktree_id = 1,
+                .status = .failed,
+                .steer_of = null,
+                .switched_from = null,
+                .created_ms = 100,
+                .updated_ms = 101,
+                .err_msg = try allocator.dupe(u8, "boom-err"),
+            }, false);
+
+            const giant = try allocator.alloc(u8, 300 * 1024);
+            defer allocator.free(giant);
+            @memset(giant, 'a');
+            try j.putToolCall(mid_j, "call-big", "bash", "{\"cmd\":\"cat\"}", "", false);
+            try j.putToolCall(mid_j, "call-big", "", "", giant, false);
+            try j.flushWal();
+        }
+
+        {
+            var j2 = try j_mod.SessionJournal.open(allocator, io, j_dir);
+            defer j2.deinit();
+            const t2 = j2.threads.get(tid_j).?;
+            try testing.expectEqual(ondb.providers.interface.ProviderId.grok, t2.default_provider);
+            try testing.expect(t2.root_version != null);
+            try testing.expectEqual(@as(usize, 1), t2.root_version.?.len);
+            const jm2 = j2.messages.get(mid_j).?;
+            try testing.expectEqualStrings("boom-err", jm2.err_msg.?);
+            const tcs = j2.toolCallsFor(mid_j);
+            try testing.expectEqual(@as(usize, 1), tcs.len);
+            try testing.expectEqualStrings("bash", tcs[0].name);
+            try testing.expect(tcs[0].output.len <= j_mod.MAX_TOOL_OUTPUT_BYTES);
+            try testing.expect(std.mem.endsWith(u8, tcs[0].output, j_mod.TOOL_TRUNCATION_MARKER));
+        }
+    }
+
+    {
+        const rb_root = "/tmp/0ndb-verify-rb-root";
+        const rb_state = "/tmp/0ndb-verify-rb-state";
+        cleanDir(io, rb_root);
+        cleanDir(io, rb_state);
+        defer cleanDir(io, rb_root);
+        defer cleanDir(io, rb_state);
+
+        var rb_ws = try ondb.fs.workspace.Workspace.open(allocator, io, rb_root, rb_state, 777);
+        defer rb_ws.deinit();
+        _ = try rb_ws.writeFileDirect(1, "init.txt", "baseline-content\n");
+
+        var rb_eng = try ondb.session.engine.SessionEngine.open(allocator, io, &rb_ws, rb_state);
+        defer rb_eng.deinit();
+        rb_eng.page_size = 2;
+
+        const rb_tid = try rb_eng.createThread("root-preserve", .mock, null);
+        _ = try rb_ws.writeFileDirect(1, "init.txt", "mutated\n");
+        _ = try rb_ws.writeFileDirect(1, "added.txt", "temp\n");
+        const m_rb1 = try rb_eng.executePrompt(rb_tid, "first", .mock, null, native_factory, null);
+        _ = m_rb1;
+
+        try rb_eng.rollback(rb_tid, null);
+        const restored_init = (try rb_ws.history.readFileAt(allocator, "init.txt", null)).?;
+        defer allocator.free(restored_init);
+        try testing.expectEqualStrings("baseline-content\n", restored_init);
+        const missing_added = try rb_ws.history.readFileAt(allocator, "added.txt", null);
+        try testing.expect(missing_added == null);
+
+        const DeltaThenTextMock = struct {
+            allocator: std.mem.Allocator,
+            step: usize = 0,
+            const vt = ondb.providers.interface.RunHandle.VTable{
+                .send = sendImpl,
+                .steer = steerImpl,
+                .next = nextImpl,
+                .interrupt = interruptImpl,
+                .close = closeImpl,
+            };
+            fn open(
+                _: ?*anyopaque,
+                alloc: std.mem.Allocator,
+                _: std.Io,
+                _: ondb.providers.interface.ProviderId,
+                _: ondb.providers.interface.StartRequest,
+            ) anyerror!ondb.providers.interface.RunHandle {
+                const self = try alloc.create(@This());
+                self.* = .{ .allocator = alloc };
+                return .{ .ptr = self, .vtable = &vt };
+            }
+            fn sendImpl(_: *anyopaque, _: []const u8) anyerror!void {}
+            fn steerImpl(_: *anyopaque, _: []const u8, _: ?[]const u8) anyerror!ondb.providers.interface.SteerOutcome {
+                return .requires_interrupt_fallback;
+            }
+            fn nextImpl(ptr: *anyopaque) anyerror!?ondb.providers.interface.Event {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const s = self.step;
+                self.step += 1;
+                return switch (s) {
+                    0 => .{ .kind = .{ .session_started = .{ .native_id = try self.allocator.dupe(u8, "dt-1") } } },
+                    1 => .{ .kind = .{ .text_delta = .{ .text = try self.allocator.dupe(u8, "alpha ") } } },
+                    2 => .{ .kind = .{ .text_delta = .{ .text = try self.allocator.dupe(u8, "one") } } },
+                    3 => .{ .kind = .{ .text = .{ .text = try self.allocator.dupe(u8, "alpha one") } } },
+                    4 => .{ .kind = .{ .text = .{ .text = try self.allocator.dupe(u8, "beta two") } } },
+                    5 => .{ .kind = .{ .tool_started = .{
+                        .id = try self.allocator.dupe(u8, "t-1"),
+                        .name = try self.allocator.dupe(u8, "read"),
+                        .input_json = try self.allocator.dupe(u8, "{}"),
+                    } } },
+                    6 => .{ .kind = .{ .tool_finished = .{
+                        .id = try self.allocator.dupe(u8, "t-1"),
+                        .output = try self.allocator.dupe(u8, "ok"),
+                        .is_error = false,
+                    } } },
+                    7 => .{ .kind = .{ .text_delta = .{ .text = try self.allocator.dupe(u8, "gamma three") } } },
+                    8 => .{ .kind = .{ .turn_ended = .{ .ok = true, .err_msg = null } } },
+                    else => null,
+                };
+            }
+            fn interruptImpl(_: *anyopaque) void {}
+            fn closeImpl(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.allocator.destroy(self);
+            }
+        };
+
+        const dt_factory = ondb.session.engine.HandleFactory{ .ptr = null, .open_fn = DeltaThenTextMock.open };
+        const dt_tid = try rb_eng.createThread("delta-blocks", .claude_code, null);
+        const dt_asst = try rb_eng.executePrompt(dt_tid, "multi", .claude_code, null, dt_factory, null);
+        const dt_msg = rb_eng.journal.messages.get(dt_asst).?;
+        try testing.expectEqual(ondb.session.model.MessageStatus.completed, dt_msg.status);
+        try testing.expectEqualStrings("alpha one\nbeta two\ngamma three", dt_msg.content);
+
+        const SilentEofMock = struct {
+            allocator: std.mem.Allocator,
+            const vt = ondb.providers.interface.RunHandle.VTable{
+                .send = sendImpl,
+                .steer = steerImpl,
+                .next = nextImpl,
+                .interrupt = interruptImpl,
+                .close = closeImpl,
+            };
+            fn open(
+                _: ?*anyopaque,
+                alloc: std.mem.Allocator,
+                _: std.Io,
+                _: ondb.providers.interface.ProviderId,
+                _: ondb.providers.interface.StartRequest,
+            ) anyerror!ondb.providers.interface.RunHandle {
+                const self = try alloc.create(@This());
+                self.* = .{ .allocator = alloc };
+                return .{ .ptr = self, .vtable = &vt };
+            }
+            fn sendImpl(_: *anyopaque, _: []const u8) anyerror!void {}
+            fn steerImpl(_: *anyopaque, _: []const u8, _: ?[]const u8) anyerror!ondb.providers.interface.SteerOutcome {
+                return .requires_interrupt_fallback;
+            }
+            fn nextImpl(_: *anyopaque) anyerror!?ondb.providers.interface.Event {
+                return null;
+            }
+            fn interruptImpl(_: *anyopaque) void {}
+            fn closeImpl(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.allocator.destroy(self);
+            }
+        };
+        const eof_factory = ondb.session.engine.HandleFactory{ .ptr = null, .open_fn = SilentEofMock.open };
+        const eof_tid = try rb_eng.createThread("eof-fail", .codex, null);
+        const eof_asst = try rb_eng.executePrompt(eof_tid, "crash", .codex, null, eof_factory, null);
+        try testing.expectEqual(ondb.session.model.MessageStatus.failed, rb_eng.journal.messages.get(eof_asst).?.status);
+        try testing.expectEqual(ondb.session.model.SessionStatus.failed, rb_eng.journal.threads.get(eof_tid).?.status);
+
+        const pg_tid_a = try rb_eng.createThread("page-a", .mock, null);
+        const pg_tid_b = try rb_eng.createThread("page-b", .mock, null);
+        const pg_b_msg = try rb_eng.appendUserMessage(pg_tid_b, null, .user, "other-thread", .mock, null, null, null);
+        try testing.expectError(error.MessageWrongThread, rb_eng.getPage(allocator, pg_tid_a, pg_b_msg, 2));
+
+        const pm1 = try rb_eng.appendUserMessage(pg_tid_a, null, .user, "p-msg-1", .mock, null, null, null);
+        const pm2 = try rb_eng.appendUserMessage(pg_tid_a, pm1, .assistant, "p-msg-2", .mock, null, null, null);
+        const pm3 = try rb_eng.appendUserMessage(pg_tid_a, pm2, .user, "p-msg-3", .mock, null, null, null);
+        _ = try rb_eng.appendUserMessage(pg_tid_a, pm3, .assistant, "p-msg-4", .mock, null, null, null);
+
+        if (rb_eng.journal.messages.fetchRemove(pm1)) |kv| {
+            var v = kv.value;
+            v.deinit(allocator);
+        }
+        if (rb_eng.journal.messages.fetchRemove(pm2)) |kv| {
+            var v = kv.value;
+            v.deinit(allocator);
+        }
+
+        var sealed_p1 = try rb_eng.getPage(allocator, pg_tid_a, null, 2);
+        defer sealed_p1.deinit(allocator);
+        try testing.expectEqual(@as(usize, 2), sealed_p1.messages.len);
+        try testing.expect(sealed_p1.has_more);
+        try testing.expectEqualStrings("p-msg-3", sealed_p1.messages[0].content);
+        try testing.expectEqualStrings("p-msg-4", sealed_p1.messages[1].content);
+
+        var sealed_p2 = try rb_eng.getPage(allocator, pg_tid_a, sealed_p1.next_before, 2);
+        defer sealed_p2.deinit(allocator);
+        try testing.expectEqual(@as(usize, 2), sealed_p2.messages.len);
+        try testing.expect(!sealed_p2.has_more);
+        try testing.expectEqualStrings("p-msg-1", sealed_p2.messages[0].content);
+        try testing.expectEqualStrings("p-msg-2", sealed_p2.messages[1].content);
+
+        const ri_tid = try rb_eng.createThread("resume-int", .mock, null);
+        const ri_qid = try rb_eng.enqueue(ri_tid, "stuck-q", .mock, null);
+        if (rb_eng.journal.queue_items.getPtr(ri_qid)) |q| q.status = .dispatching;
+        const ri_mid = try rb_eng.appendUserMessage(ri_tid, null, .assistant, "in-flight", .mock, null, null, null);
+        if (rb_eng.journal.messages.getPtr(ri_mid)) |m| m.status = .running;
+        if (rb_eng.journal.threads.getPtr(ri_tid)) |t| t.status = .running;
+
+        const recovered = try rb_eng.resumeInterrupted();
+        try testing.expect(recovered >= 3);
+        try testing.expectEqual(ondb.session.model.MessageStatus.interrupted, rb_eng.journal.messages.get(ri_mid).?.status);
+        try testing.expectEqual(ondb.session.model.QueueStatus.pending, rb_eng.journal.queue_items.get(ri_qid).?.status);
+        try testing.expectEqual(ondb.session.model.SessionStatus.queued, rb_eng.journal.threads.get(ri_tid).?.status);
+    }
+
+    {
+        const dr_root = "/tmp/0ndb-verify-defer-rb-root";
+        const dr_state = "/tmp/0ndb-verify-defer-rb-state";
+        const dr_wt_state = "/tmp/0ndb-verify-defer-rb-wt-state";
+        const dr_wt_chk = "/tmp/0ndb-verify-defer-rb-wt-chk";
+        cleanDir(io, dr_root);
+        cleanDir(io, dr_state);
+        cleanDir(io, dr_wt_state);
+        cleanDir(io, dr_wt_chk);
+        defer cleanDir(io, dr_root);
+        defer cleanDir(io, dr_state);
+        defer cleanDir(io, dr_wt_state);
+        defer cleanDir(io, dr_wt_chk);
+
+        var main_ws = try ondb.fs.workspace.Workspace.open(allocator, io, dr_root, dr_state, 0xbbbb_0001);
+        defer main_ws.deinit();
+        _ = try main_ws.writeFileDirect(1, "main.txt", "main-orig\n");
+
+        var dr_wts = try ondb.fs.worktrees.Worktrees.open(allocator, io, dr_wt_state, dr_wt_chk);
+        defer dr_wts.deinit();
+        var scr_info = try dr_wts.scratch("defer-wt");
+        defer scr_info.deinit(allocator);
+        const scr_ws = dr_wts.getWorkspace(scr_info.id).?;
+        _ = try scr_ws.writeFileDirect(1, "wt.txt", "wt-v1\n");
+        const v1 = try scr_ws.history.headsClone();
+        var v1_owned = true;
+        defer if (v1_owned) {
+            var tmp = v1;
+            tmp.deinit(allocator);
+        };
+        _ = try scr_ws.writeFileDirect(1, "wt.txt", "wt-v2\n");
+
+        {
+            var e1 = try ondb.session.engine.SessionEngine.open(allocator, io, &main_ws, dr_state);
+            defer e1.deinit();
+            e1.attachWorktrees(&dr_wts);
+            defer e1.attachWorktrees(null);
+            const wt_tid = try e1.createThreadInWorktree("wt-defer", .mock, null, scr_info.id);
+            try e1.journal.beginRollback(.{
+                .intent_id = 0x9999_0001,
+                .thread_id = wt_tid,
+                .target_msg_id = null,
+                .target_version = v1,
+                .target_git_commit = null,
+                .created_ms = 1,
+                .target_git_branch = null,
+            });
+            v1_owned = false;
+        }
+
+        {
+            var e2 = try ondb.session.engine.SessionEngine.open(allocator, io, &main_ws, dr_state);
+            defer e2.deinit();
+            try testing.expectEqual(@as(usize, 1), e2.journal.pending_rollbacks.count());
+            const main_still = (try main_ws.history.readFileAt(allocator, "main.txt", null)).?;
+            defer allocator.free(main_still);
+            try testing.expectEqualStrings("main-orig\n", main_still);
+
+            e2.attachWorktrees(&dr_wts);
+            defer e2.attachWorktrees(null);
+            try testing.expectEqual(@as(usize, 0), e2.journal.pending_rollbacks.count());
+            const wt_restored = (try scr_ws.history.readFileAt(allocator, "wt.txt", null)).?;
+            defer allocator.free(wt_restored);
+            try testing.expectEqualStrings("wt-v1\n", wt_restored);
+        }
+    }
+
+    {
+        const NonBlockingCloseHandle = struct {
+            allocator: std.mem.Allocator,
+            pool: *ondb.providers.pool.WarmPool,
+            closed_count: *usize,
+            const vt = ondb.providers.interface.RunHandle.VTable{
+                .send = sendImpl,
+                .steer = steerImpl,
+                .next = nextImpl,
+                .interrupt = interruptImpl,
+                .close = closeImpl,
+            };
+            fn create(
+                alloc: std.mem.Allocator,
+                target_pool: *ondb.providers.pool.WarmPool,
+                closed_count: *usize,
+            ) !ondb.providers.interface.RunHandle {
+                const self = try alloc.create(@This());
+                self.* = .{ .allocator = alloc, .pool = target_pool, .closed_count = closed_count };
+                return .{ .ptr = self, .vtable = &vt };
+            }
+            fn sendImpl(_: *anyopaque, _: []const u8) anyerror!void {}
+            fn steerImpl(_: *anyopaque, _: []const u8, _: ?[]const u8) anyerror!ondb.providers.interface.SteerOutcome {
+                return .requires_interrupt_fallback;
+            }
+            fn nextImpl(_: *anyopaque) anyerror!?ondb.providers.interface.Event {
+                return null;
+            }
+            fn interruptImpl(_: *anyopaque) void {}
+            fn closeImpl(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                _ = self.pool.warmCount();
+                self.closed_count.* += 1;
+                self.allocator.destroy(self);
+            }
+        };
+
+        var nb_pool = ondb.providers.pool.WarmPool.init(allocator, io, 1, 60_000);
+        defer nb_pool.deinit();
+        var closed_count: usize = 0;
+        const h1 = try NonBlockingCloseHandle.create(allocator, &nb_pool, &closed_count);
+        const h2 = try NonBlockingCloseHandle.create(allocator, &nb_pool, &closed_count);
+        nb_pool.park(.claude_code, "s1", null, "/tmp", h1);
+        nb_pool.park(.claude_code, "s2", null, "/tmp", h2);
+        try testing.expectEqual(@as(usize, 1), closed_count);
+        try testing.expectEqual(@as(usize, 1), nb_pool.warmCount());
+        nb_pool.closeIdle();
+        try testing.expectEqual(@as(usize, 2), closed_count);
+        try testing.expectEqual(@as(usize, 0), nb_pool.warmCount());
+    }
+
+    {
+        const rpc = ondb.providers.json_rpc;
+        var crash_pipe = try rpc.SubprocessPipe.spawn(allocator, io, &.{ "/bin/sh", "-c", "echo boom-stderr >&2; exit 42" }, "/tmp");
+        defer crash_pipe.deinit();
+        while (try crash_pipe.readNextLine(5000)) |raw_line| {
+            var line = raw_line;
+            line.deinit(allocator);
+        }
+        try testing.expectEqual(@as(?i32, 42), crash_pipe.waitExitStatus());
+        try testing.expect(std.mem.indexOf(u8, crash_pipe.lastStderrSnippet(), "boom-stderr") != null);
+        const cmsg = try crash_pipe.formatCrashMessage(allocator, "testcli");
+        defer allocator.free(cmsg);
+        try testing.expect(std.mem.indexOf(u8, cmsg, "exited with code 42") != null);
+        try testing.expect(std.mem.indexOf(u8, cmsg, "boom-stderr") != null);
+
+        var stub_pipe = try rpc.SubprocessPipe.spawn(allocator, io, &.{ "/bin/sh", "-c", "trap '' TERM; echo ready; sleep 30" }, "/tmp");
+        defer stub_pipe.deinit();
+        if (try stub_pipe.readNextLine(5000)) |ready_raw| {
+            var ready_line = ready_raw;
+            ready_line.deinit(allocator);
+        }
+        const t0 = rpc.monotonicMs(io);
+        stub_pipe.killGraceful(150);
+        const elapsed = rpc.monotonicMs(io) - t0;
+        try testing.expect(elapsed < 4000);
+        try testing.expectEqual(@as(?i32, -9), stub_pipe.waitExitStatus());
+    }
+
+    {
+        try testing.expectEqual(ondb.providers.interface.ProviderId.grok, ondb.providers.interface.ProviderId.fromSlug("grok").?);
+        try testing.expectEqualStrings("grok", ondb.providers.registry.programFor(.grok));
+        try testing.expectEqualStrings("{\"decision\":\"decline\"}", ondb.providers.codex.approvalDecisionJson(.accept_edits, "item/commandExecution/requestApproval"));
+        try testing.expectEqualStrings("{\"decision\":\"accept\"}", ondb.providers.codex.approvalDecisionJson(.accept_edits, "item/fileChange/requestApproval"));
+        try testing.expectEqualStrings("{\"decision\":\"accept\"}", ondb.providers.codex.approvalDecisionJson(.full, "item/commandExecution/requestApproval"));
+
+        var muse_cmd_p = try std.json.parseFromSlice(std.json.Value, allocator, "{\"kind\":\"commandExecution\"}", .{});
+        defer muse_cmd_p.deinit();
+        try testing.expectEqualStrings("deny", ondb.providers.muse.approvalChoice(.accept_edits, muse_cmd_p.value));
+        var muse_file_p = try std.json.parseFromSlice(std.json.Value, allocator, "{\"kind\":\"fileChange\"}", .{});
+        defer muse_file_p.deinit();
+        try testing.expectEqualStrings("approve", ondb.providers.muse.approvalChoice(.accept_edits, muse_file_p.value));
+
+        var acp_perm_p = try std.json.parseFromSlice(std.json.Value, allocator, "{\"options\":[{\"optionId\":\"opt-allow\",\"kind\":\"allow_once\"}]}", .{});
+        defer acp_perm_p.deinit();
+        const acp_cancel = try ondb.providers.acp.formatPermissionOutcome(allocator, .plan, acp_perm_p.value);
+        defer allocator.free(acp_cancel);
+        try testing.expectEqualStrings("{\"outcome\":\"cancelled\"}", acp_cancel);
+
+        var c_seen = false;
+        var c_evs: std.ArrayList(ondb.providers.interface.Event) = .empty;
+        defer {
+            for (c_evs.items) |*ev| ev.deinit(allocator);
+            c_evs.deinit(allocator);
+        }
+        try ondb.providers.claude.parseStreamLine(
+            allocator,
+            "{\"type\":\"result\",\"is_error\":false,\"total_cost_usd\":0.0125,\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}",
+            &c_seen,
+            &c_evs,
+        );
+        try testing.expectEqual(@as(usize, 2), c_evs.items.len);
+        try testing.expect(c_evs.items[0].kind == .usage);
+        try testing.expectEqual(@as(?f64, 0.0125), c_evs.items[0].kind.usage.cost_usd);
+
+        try ondb.providers.claude.parseStreamLine(
+            allocator,
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":\"ok\"}]},\"tool_use_result\":{\"stdout\":\"out-line\",\"stderr\":\"err-line\"}}",
+            &c_seen,
+            &c_evs,
+        );
+        try testing.expectEqual(@as(usize, 3), c_evs.items.len);
+        try testing.expectEqualStrings("out-line", c_evs.items[2].kind.tool_finished.stdout.?);
+        try testing.expectEqualStrings("err-line", c_evs.items[2].kind.tool_finished.stderr.?);
     }
 }
 

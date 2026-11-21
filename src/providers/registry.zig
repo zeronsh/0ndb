@@ -18,6 +18,7 @@ pub const ALL_PROVIDERS = [_]iface.ProviderId{
     .opencode,
     .cursor,
     .devin,
+    .grok,
     .muse,
 };
 
@@ -31,6 +32,7 @@ pub fn programFor(provider: iface.ProviderId) []const u8 {
         .opencode => "opencode",
         .cursor => "cursor-agent",
         .devin => "devin",
+        .grok => "grok",
         .muse => "muse",
         .mock => "mock",
     };
@@ -46,7 +48,7 @@ pub fn isAvailable(io: Io, provider: iface.ProviderId) bool {
 
 pub fn capabilities(provider: iface.ProviderId) iface.Capabilities {
     return switch (provider) {
-        .antigravity, .hermes, .opencode, .cursor, .devin => acp.capabilities(),
+        .antigravity, .hermes, .opencode, .cursor, .devin, .grok => acp.capabilities(),
         .claude_code => claude.capabilities(),
         .codex => codex.capabilities(),
         .pi => pi.capabilities(),
@@ -91,6 +93,7 @@ pub fn start(
         .opencode => acp.AcpRun.start(allocator, io, acp.OPENCODE_PROFILE, req),
         .cursor => acp.AcpRun.start(allocator, io, acp.CURSOR_PROFILE, req),
         .devin => acp.AcpRun.start(allocator, io, acp.DEVIN_PROFILE, req),
+        .grok => acp.AcpRun.start(allocator, io, acp.GROK_PROFILE, req),
         .claude_code => claude.ClaudeRun.start(allocator, io, req),
         .codex => codex.CodexRun.start(allocator, io, req),
         .pi => pi.PiRun.start(allocator, io, req),

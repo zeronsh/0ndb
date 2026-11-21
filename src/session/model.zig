@@ -6,6 +6,10 @@ const Version = version_mod.Version;
 const codec = @import("../store/codec.zig");
 const iface = @import("../providers/interface.zig");
 
+pub const MAX_SHORT_STR: usize = 4 * 1024;
+pub const MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_VERSION_HEADS: usize = 4096;
+
 pub const Role = enum(u8) {
     user = 1,
     assistant = 2,
@@ -43,6 +47,49 @@ pub const QueueStatus = enum(u8) {
     cancelled = 5,
 };
 
+fn decodeEnum(comptime T: type, r: *codec.Reader) !T {
+    const raw = try r.readU8();
+    return std.enums.fromInt(T, raw) orelse return error.CorruptRecord;
+}
+
+pub fn decodeFlag(r: *codec.Reader) !bool {
+    const raw = try r.readU8();
+    return switch (raw) {
+        0 => false,
+        1 => true,
+        else => error.CorruptRecord,
+    };
+}
+
+fn readBytesCapped(r: *codec.Reader, max_len: usize) ![]const u8 {
+    const len_u64 = try r.readVarint();
+    if (len_u64 > max_len or len_u64 > r.remaining()) return error.CorruptRecord;
+    const len: usize = @intCast(len_u64);
+    const out = r.data[r.pos .. r.pos + len];
+    r.pos += len;
+    return out;
+}
+
+fn readOptBytesCapped(r: *codec.Reader, max_len: usize) !?[]const u8 {
+    if (!try decodeFlag(r)) return null;
+    return try readBytesCapped(r, max_len);
+}
+
+pub fn decodeVersionChecked(allocator: Allocator, r: *codec.Reader) !Version {
+    const n_u64 = try r.readVarint();
+    if (n_u64 > MAX_VERSION_HEADS) return error.CorruptRecord;
+    const n: usize = @intCast(n_u64);
+    if (n * 24 > r.remaining()) return error.CorruptRecord;
+    var v = Version{};
+    errdefer v.deinit(allocator);
+    for (0..n) |_| {
+        const ts = try r.readU64();
+        const actor = try r.readU128();
+        try v.insert(allocator, id.OpId.init(ts, actor));
+    }
+    return v;
+}
+
 pub const Thread = struct {
     thread_id: u128,
     worktree_id: u128,
@@ -56,26 +103,35 @@ pub const Thread = struct {
     message_count: u32,
     created_ms: u64,
     updated_ms: u64,
+    root_version: ?Version = null,
 
     pub fn deinit(self: *Thread, allocator: Allocator) void {
         allocator.free(self.title);
         if (self.default_model) |m| allocator.free(m);
+        if (self.root_version) |*rv| rv.deinit(allocator);
     }
 
     pub fn clone(self: *const Thread, allocator: Allocator) Allocator.Error!Thread {
+        const title = try allocator.dupe(u8, self.title);
+        errdefer allocator.free(title);
+        const default_model = if (self.default_model) |m| try allocator.dupe(u8, m) else null;
+        errdefer if (default_model) |m| allocator.free(m);
+        var root_version: ?Version = if (self.root_version) |*rv| try rv.clone(allocator) else null;
+        errdefer if (root_version) |*rv| rv.deinit(allocator);
         return .{
             .thread_id = self.thread_id,
             .worktree_id = self.worktree_id,
-            .title = try allocator.dupe(u8, self.title),
+            .title = title,
             .leaf_msg_id = self.leaf_msg_id,
             .head_page = self.head_page,
             .default_provider = self.default_provider,
-            .default_model = if (self.default_model) |m| try allocator.dupe(u8, m) else null,
+            .default_model = default_model,
             .status = self.status,
             .queued_count = self.queued_count,
             .message_count = self.message_count,
             .created_ms = self.created_ms,
             .updated_ms = self.updated_ms,
+            .root_version = root_version,
         };
     }
 
@@ -94,26 +150,35 @@ pub const Thread = struct {
         try w.writeU32(allocator, self.message_count);
         try w.writeU64(allocator, self.created_ms);
         try w.writeU64(allocator, self.updated_ms);
+        try w.writeU8(allocator, if (self.root_version != null) 1 else 0);
+        if (self.root_version) |*rv| try rv.encode(allocator, w);
     }
 
     pub fn decode(allocator: Allocator, r: *codec.Reader) !Thread {
         const tid = try r.readU128();
         const wid = try r.readU128();
-        const title = try allocator.dupe(u8, try r.readBytes());
+        const title = try allocator.dupe(u8, try readBytesCapped(r, MAX_SHORT_STR));
         errdefer allocator.free(title);
-        const has_leaf = try r.readU8();
-        const leaf: ?u128 = if (has_leaf != 0) try r.readU128() else null;
-        const has_page = try r.readU8();
-        const head_page: ?id.PageId = if (has_page != 0) (try r.readFixed(32)).* else null;
-        const prov: iface.ProviderId = @enumFromInt(try r.readU8());
-        const model_raw = try r.readOptBytes();
+        const has_leaf = try decodeFlag(r);
+        const leaf: ?u128 = if (has_leaf) try r.readU128() else null;
+        const has_page = try decodeFlag(r);
+        const head_page: ?id.PageId = if (has_page) (try r.readFixed(32)).* else null;
+        const prov = try decodeEnum(iface.ProviderId, r);
+        const model_raw = try readOptBytesCapped(r, MAX_SHORT_STR);
         const model: ?[]u8 = if (model_raw) |m| try allocator.dupe(u8, m) else null;
         errdefer if (model) |m| allocator.free(m);
-        const status: SessionStatus = @enumFromInt(try r.readU8());
+        const status = try decodeEnum(SessionStatus, r);
         const queued = try r.readU32();
         const msg_count = try r.readU32();
         const created = try r.readU64();
         const updated = try r.readU64();
+        var root_version: ?Version = null;
+        errdefer if (root_version) |*rv| rv.deinit(allocator);
+        if (r.remaining() > 0) {
+            if (try decodeFlag(r)) {
+                root_version = try decodeVersionChecked(allocator, r);
+            }
+        }
         return .{
             .thread_id = tid,
             .worktree_id = wid,
@@ -127,6 +192,7 @@ pub const Thread = struct {
             .message_count = msg_count,
             .created_ms = created,
             .updated_ms = updated,
+            .root_version = root_version,
         };
     }
 };
@@ -151,6 +217,7 @@ pub const Message = struct {
     switched_from: ?u128,
     created_ms: u64,
     updated_ms: u64,
+    err_msg: ?[]u8 = null,
 
     pub fn deinit(self: *Message, allocator: Allocator) void {
         allocator.free(self.content);
@@ -161,6 +228,7 @@ pub const Message = struct {
         self.post_version.deinit(allocator);
         if (self.git_branch) |b| allocator.free(b);
         if (self.git_commit) |c| allocator.free(c);
+        if (self.err_msg) |e| allocator.free(e);
     }
 
     pub fn clone(self: *const Message, allocator: Allocator) Allocator.Error!Message {
@@ -179,6 +247,8 @@ pub const Message = struct {
         const gb = if (self.git_branch) |b| try allocator.dupe(u8, b) else null;
         errdefer if (gb) |b| allocator.free(b);
         const gc = if (self.git_commit) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (gc) |c| allocator.free(c);
+        const em = if (self.err_msg) |e| try allocator.dupe(u8, e) else null;
         return .{
             .msg_id = self.msg_id,
             .thread_id = self.thread_id,
@@ -199,6 +269,7 @@ pub const Message = struct {
             .switched_from = self.switched_from,
             .created_ms = self.created_ms,
             .updated_ms = self.updated_ms,
+            .err_msg = em,
         };
     }
 
@@ -225,39 +296,44 @@ pub const Message = struct {
         if (self.switched_from) |sf| try w.writeU128(allocator, sf);
         try w.writeU64(allocator, self.created_ms);
         try w.writeU64(allocator, self.updated_ms);
+        try w.writeOptBytes(allocator, self.err_msg);
     }
 
-    pub fn decode(allocator: Allocator, r: *codec.Reader) !Message {
+    pub fn decodeEx(allocator: Allocator, r: *codec.Reader, has_ext: bool) !Message {
         const mid = try r.readU128();
         const tid = try r.readU128();
-        const has_p = try r.readU8();
-        const pid: ?u128 = if (has_p != 0) try r.readU128() else null;
-        const role: Role = @enumFromInt(try r.readU8());
-        const content = try allocator.dupe(u8, try r.readBytes());
+        const has_p = try decodeFlag(r);
+        const pid: ?u128 = if (has_p) try r.readU128() else null;
+        const role = try decodeEnum(Role, r);
+        const content = try allocator.dupe(u8, try readBytesCapped(r, MAX_CONTENT_BYTES));
         errdefer allocator.free(content);
-        const prov: iface.ProviderId = @enumFromInt(try r.readU8());
-        const model = if (try r.readOptBytes()) |m| try allocator.dupe(u8, m) else null;
+        const prov = try decodeEnum(iface.ProviderId, r);
+        const model = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |m| try allocator.dupe(u8, m) else null;
         errdefer if (model) |m| allocator.free(m);
-        const ns = if (try r.readOptBytes()) |s| try allocator.dupe(u8, s) else null;
+        const ns = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |s| try allocator.dupe(u8, s) else null;
         errdefer if (ns) |s| allocator.free(s);
-        const nt = if (try r.readOptBytes()) |t| try allocator.dupe(u8, t) else null;
+        const nt = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |t| try allocator.dupe(u8, t) else null;
         errdefer if (nt) |t| allocator.free(t);
-        var pre = try Version.decode(allocator, r);
+        var pre = try decodeVersionChecked(allocator, r);
         errdefer pre.deinit(allocator);
-        var post = try Version.decode(allocator, r);
+        var post = try decodeVersionChecked(allocator, r);
         errdefer post.deinit(allocator);
-        const gb = if (try r.readOptBytes()) |b| try allocator.dupe(u8, b) else null;
+        const gb = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |b| try allocator.dupe(u8, b) else null;
         errdefer if (gb) |b| allocator.free(b);
-        const gc = if (try r.readOptBytes()) |c| try allocator.dupe(u8, c) else null;
+        const gc = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |c| try allocator.dupe(u8, c) else null;
         errdefer if (gc) |c| allocator.free(c);
         const wid = try r.readU128();
-        const status: MessageStatus = @enumFromInt(try r.readU8());
-        const has_so = try r.readU8();
-        const steer_of: ?u128 = if (has_so != 0) try r.readU128() else null;
-        const has_sf = try r.readU8();
-        const switched_from: ?u128 = if (has_sf != 0) try r.readU128() else null;
+        const status = try decodeEnum(MessageStatus, r);
+        const has_so = try decodeFlag(r);
+        const steer_of: ?u128 = if (has_so) try r.readU128() else null;
+        const has_sf = try decodeFlag(r);
+        const switched_from: ?u128 = if (has_sf) try r.readU128() else null;
         const created = try r.readU64();
         const updated = try r.readU64();
+        const err_msg: ?[]u8 = if (has_ext)
+            if (try readOptBytesCapped(r, MAX_CONTENT_BYTES)) |e| try allocator.dupe(u8, e) else null
+        else
+            null;
         return .{
             .msg_id = mid,
             .thread_id = tid,
@@ -278,7 +354,19 @@ pub const Message = struct {
             .switched_from = switched_from,
             .created_ms = created,
             .updated_ms = updated,
+            .err_msg = err_msg,
         };
+    }
+
+    pub fn decode(allocator: Allocator, r: *codec.Reader) !Message {
+        var msg = try decodeEx(allocator, r, false);
+        errdefer msg.deinit(allocator);
+        if (r.remaining() > 0) {
+            if (try readOptBytesCapped(r, MAX_CONTENT_BYTES)) |e| {
+                msg.err_msg = try allocator.dupe(u8, e);
+            }
+        }
+        return msg;
     }
 };
 
@@ -300,14 +388,17 @@ pub const QueueItem = struct {
     }
 
     pub fn clone(self: *const QueueItem, allocator: Allocator) Allocator.Error!QueueItem {
+        const prompt = try allocator.dupe(u8, self.prompt);
+        errdefer allocator.free(prompt);
+        const model = if (self.model) |m| try allocator.dupe(u8, m) else null;
         return .{
             .item_id = self.item_id,
             .thread_id = self.thread_id,
             .kind = self.kind,
             .status = self.status,
-            .prompt = try allocator.dupe(u8, self.prompt),
+            .prompt = prompt,
             .provider = self.provider,
-            .model = if (self.model) |m| try allocator.dupe(u8, m) else null,
+            .model = model,
             .target_turn_msg_id = self.target_turn_msg_id,
             .created_ms = self.created_ms,
             .updated_ms = self.updated_ms,
@@ -331,15 +422,15 @@ pub const QueueItem = struct {
     pub fn decode(allocator: Allocator, r: *codec.Reader) !QueueItem {
         const iid = try r.readU128();
         const tid = try r.readU128();
-        const kind: QueueKind = @enumFromInt(try r.readU8());
-        const status: QueueStatus = @enumFromInt(try r.readU8());
-        const prompt = try allocator.dupe(u8, try r.readBytes());
+        const kind = try decodeEnum(QueueKind, r);
+        const status = try decodeEnum(QueueStatus, r);
+        const prompt = try allocator.dupe(u8, try readBytesCapped(r, MAX_CONTENT_BYTES));
         errdefer allocator.free(prompt);
-        const prov: iface.ProviderId = @enumFromInt(try r.readU8());
-        const model = if (try r.readOptBytes()) |m| try allocator.dupe(u8, m) else null;
+        const prov = try decodeEnum(iface.ProviderId, r);
+        const model = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |m| try allocator.dupe(u8, m) else null;
         errdefer if (model) |m| allocator.free(m);
-        const has_t = try r.readU8();
-        const target: ?u128 = if (has_t != 0) try r.readU128() else null;
+        const has_t = try decodeFlag(r);
+        const target: ?u128 = if (has_t) try r.readU128() else null;
         const created = try r.readU64();
         const updated = try r.readU64();
         return .{
@@ -364,10 +455,12 @@ pub const RollbackIntent = struct {
     target_version: Version,
     target_git_commit: ?[]u8,
     created_ms: u64,
+    target_git_branch: ?[]u8 = null,
 
     pub fn deinit(self: *RollbackIntent, allocator: Allocator) void {
         self.target_version.deinit(allocator);
         if (self.target_git_commit) |c| allocator.free(c);
+        if (self.target_git_branch) |b| allocator.free(b);
     }
 
     pub fn encode(self: *const RollbackIntent, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
@@ -378,17 +471,26 @@ pub const RollbackIntent = struct {
         try self.target_version.encode(allocator, w);
         try w.writeOptBytes(allocator, self.target_git_commit);
         try w.writeU64(allocator, self.created_ms);
+        try w.writeOptBytes(allocator, self.target_git_branch);
     }
 
     pub fn decode(allocator: Allocator, r: *codec.Reader) !RollbackIntent {
         const iid = try r.readU128();
         const tid = try r.readU128();
-        const has_m = try r.readU8();
-        const target_msg: ?u128 = if (has_m != 0) try r.readU128() else null;
-        var tv = try Version.decode(allocator, r);
+        const has_m = try decodeFlag(r);
+        const target_msg: ?u128 = if (has_m) try r.readU128() else null;
+        var tv = try decodeVersionChecked(allocator, r);
         errdefer tv.deinit(allocator);
-        const gc = if (try r.readOptBytes()) |c| try allocator.dupe(u8, c) else null;
+        const gc = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (gc) |c| allocator.free(c);
         const created = try r.readU64();
+        var gb: ?[]u8 = null;
+        errdefer if (gb) |b| allocator.free(b);
+        if (r.remaining() > 0) {
+            if (try readOptBytesCapped(r, MAX_SHORT_STR)) |b| {
+                gb = try allocator.dupe(u8, b);
+            }
+        }
         return .{
             .intent_id = iid,
             .thread_id = tid,
@@ -396,6 +498,7 @@ pub const RollbackIntent = struct {
             .target_version = tv,
             .target_git_commit = gc,
             .created_ms = created,
+            .target_git_branch = gb,
         };
     }
 };
@@ -419,12 +522,15 @@ pub const SessionSummary = struct {
     }
 
     pub fn fromThread(allocator: Allocator, t: *const Thread) Allocator.Error!SessionSummary {
+        const title = try allocator.dupe(u8, t.title);
+        errdefer allocator.free(title);
+        const model = if (t.default_model) |m| try allocator.dupe(u8, m) else null;
         return .{
             .thread_id = t.thread_id,
             .worktree_id = t.worktree_id,
-            .title = try allocator.dupe(u8, t.title),
+            .title = title,
             .provider = t.default_provider,
-            .model = if (t.default_model) |m| try allocator.dupe(u8, m) else null,
+            .model = model,
             .status = t.status,
             .leaf_msg_id = t.leaf_msg_id,
             .head_page = t.head_page,
@@ -453,16 +559,16 @@ pub const SessionSummary = struct {
     pub fn decode(allocator: Allocator, r: *codec.Reader) !SessionSummary {
         const tid = try r.readU128();
         const wid = try r.readU128();
-        const title = try allocator.dupe(u8, try r.readBytes());
+        const title = try allocator.dupe(u8, try readBytesCapped(r, MAX_SHORT_STR));
         errdefer allocator.free(title);
-        const prov: iface.ProviderId = @enumFromInt(try r.readU8());
-        const model = if (try r.readOptBytes()) |m| try allocator.dupe(u8, m) else null;
+        const prov = try decodeEnum(iface.ProviderId, r);
+        const model = if (try readOptBytesCapped(r, MAX_SHORT_STR)) |m| try allocator.dupe(u8, m) else null;
         errdefer if (model) |m| allocator.free(m);
-        const status: SessionStatus = @enumFromInt(try r.readU8());
-        const has_l = try r.readU8();
-        const leaf: ?u128 = if (has_l != 0) try r.readU128() else null;
-        const has_p = try r.readU8();
-        const hp: ?id.PageId = if (has_p != 0) (try r.readFixed(32)).* else null;
+        const status = try decodeEnum(SessionStatus, r);
+        const has_l = try decodeFlag(r);
+        const leaf: ?u128 = if (has_l) try r.readU128() else null;
+        const has_p = try decodeFlag(r);
+        const hp: ?id.PageId = if (has_p) (try r.readFixed(32)).* else null;
         const queued = try r.readU32();
         const msg_count = try r.readU32();
         const updated = try r.readU64();
@@ -538,14 +644,15 @@ pub const ToolCallRecord = struct {
 
     pub fn decode(allocator: Allocator, r: *codec.Reader) !ToolCallRecord {
         const mid = try r.readU128();
-        const cid = try allocator.dupe(u8, try r.readBytes());
+        const cid = try allocator.dupe(u8, try readBytesCapped(r, MAX_SHORT_STR));
         errdefer allocator.free(cid);
-        const nm = try allocator.dupe(u8, try r.readBytes());
+        const nm = try allocator.dupe(u8, try readBytesCapped(r, MAX_SHORT_STR));
         errdefer allocator.free(nm);
-        const inp = try allocator.dupe(u8, try r.readBytes());
+        const inp = try allocator.dupe(u8, try readBytesCapped(r, MAX_CONTENT_BYTES));
         errdefer allocator.free(inp);
-        const out = try allocator.dupe(u8, try r.readBytes());
-        const is_err = (try r.readU8()) != 0;
+        const out = try allocator.dupe(u8, try readBytesCapped(r, MAX_CONTENT_BYTES));
+        errdefer allocator.free(out);
+        const is_err = try decodeFlag(r);
         return .{
             .msg_id = mid,
             .call_id = cid,

@@ -13,6 +13,7 @@ pub const ProviderId = enum(u8) {
     devin = 8,
     muse = 9,
     mock = 10,
+    grok = 11,
 
     pub fn slug(self: ProviderId) []const u8 {
         return switch (self) {
@@ -26,6 +27,7 @@ pub const ProviderId = enum(u8) {
             .devin => "devin",
             .muse => "muse",
             .mock => "mock",
+            .grok => "grok",
         };
     }
 
@@ -41,6 +43,7 @@ pub const ProviderId = enum(u8) {
             .devin => "Devin",
             .muse => "Muse",
             .mock => "Mock",
+            .grok => "Grok",
         };
     }
 
@@ -55,6 +58,7 @@ pub const ProviderId = enum(u8) {
         if (std.mem.eql(u8, s, "devin")) return .devin;
         if (std.mem.eql(u8, s, "muse")) return .muse;
         if (std.mem.eql(u8, s, "mock")) return .mock;
+        if (std.mem.eql(u8, s, "grok")) return .grok;
         return null;
     }
 };
@@ -110,8 +114,18 @@ pub const EventKind = union(enum) {
     reasoning_delta: struct { text: []u8 },
     reasoning: struct { text: []u8 },
     tool_started: struct { id: []u8, name: []u8, input_json: []u8 },
-    tool_finished: struct { id: []u8, output: []u8, is_error: bool },
-    usage: struct { input_tokens: u64, output_tokens: u64 },
+    tool_finished: struct {
+        id: []u8,
+        output: []u8,
+        is_error: bool,
+        stdout: ?[]u8 = null,
+        stderr: ?[]u8 = null,
+    },
+    usage: struct {
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: ?f64 = null,
+    },
     turn_ended: struct { ok: bool, err_msg: ?[]u8 },
     other: struct { kind: []u8 },
 
@@ -131,6 +145,8 @@ pub const EventKind = union(enum) {
             .tool_finished => |v| {
                 allocator.free(v.id);
                 allocator.free(v.output);
+                if (v.stdout) |s| allocator.free(s);
+                if (v.stderr) |s| allocator.free(s);
             },
             .usage => {},
             .turn_ended => |v| if (v.err_msg) |m| allocator.free(m),

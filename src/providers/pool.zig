@@ -1,10 +1,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const id = @import("../core/id.zig");
 const iface = @import("interface.zig");
+const rpc = @import("json_rpc.zig");
 
 pub const DEFAULT_WARM_LIMIT: usize = 4;
+pub const MAX_WARM_LIMIT: usize = 64;
 pub const DEFAULT_WARM_IDLE_MS: u64 = 90_000;
 
 const Entry = struct {
@@ -43,7 +44,7 @@ pub const WarmPool = struct {
         return .{
             .allocator = allocator,
             .io = io,
-            .warm_limit = warm_limit,
+            .warm_limit = @min(warm_limit, MAX_WARM_LIMIT),
             .warm_idle_ms = warm_idle_ms,
             .mu = Io.Mutex.init,
             .cond = Io.Condition.init,
@@ -54,26 +55,13 @@ pub const WarmPool = struct {
     }
 
     pub fn deinit(self: *WarmPool) void {
-        var to_close: std.ArrayList(Entry) = .empty;
-        defer {
-            for (to_close.items) |*e| {
-                e.handle.close();
-                e.deinitMeta(self.allocator);
-            }
-            to_close.deinit(self.allocator);
-        }
-
+        var detached: std.ArrayList(Entry) = .empty;
         const thread = blk: {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             self.stopping = true;
-            to_close.appendSlice(self.allocator, self.entries.items) catch {
-                for (self.entries.items) |*e| {
-                    e.handle.close();
-                    e.deinitMeta(self.allocator);
-                }
-            };
-            self.entries.clearRetainingCapacity();
+            detached = self.entries;
+            self.entries = .empty;
             self.cond.broadcast(self.io);
             const t = self.reaper_thread;
             self.reaper_thread = null;
@@ -81,6 +69,11 @@ pub const WarmPool = struct {
         };
 
         if (thread) |t| t.join();
+        for (detached.items) |*e| {
+            e.handle.close();
+            e.deinitMeta(self.allocator);
+        }
+        detached.deinit(self.allocator);
         self.entries.deinit(self.allocator);
     }
 
@@ -148,14 +141,8 @@ pub const WarmPool = struct {
             return;
         };
 
-        var evicted: std.ArrayList(Entry) = .empty;
-        defer {
-            for (evicted.items) |*e| {
-                e.handle.close();
-                e.deinitMeta(self.allocator);
-            }
-            evicted.deinit(self.allocator);
-        }
+        var evicted_buf: [MAX_WARM_LIMIT + 2]Entry = undefined;
+        var evicted_len: usize = 0;
 
         var accepted = false;
         {
@@ -166,12 +153,12 @@ pub const WarmPool = struct {
                 while (i < self.entries.items.len) {
                     const e = &self.entries.items[i];
                     if (e.provider == provider and std.mem.eql(u8, e.session_id, sid_copy)) {
-                        const old = self.entries.orderedRemove(i);
-                        evicted.append(self.allocator, old) catch {
-                            var tmp = old;
-                            tmp.handle.close();
-                            tmp.deinitMeta(self.allocator);
-                        };
+                        if (evicted_len < evicted_buf.len) {
+                            evicted_buf[evicted_len] = self.entries.orderedRemove(i);
+                            evicted_len += 1;
+                        } else {
+                            i += 1;
+                        }
                     } else {
                         i += 1;
                     }
@@ -183,17 +170,13 @@ pub const WarmPool = struct {
                     .model = model_copy,
                     .cwd = cwd_copy,
                     .handle = handle,
-                    .parked_ms = id.nowMs(self.io),
+                    .parked_ms = rpc.monotonicMs(self.io),
                 };
                 if (self.entries.append(self.allocator, entry)) |_| {
                     accepted = true;
-                    while (self.entries.items.len > self.warm_limit) {
-                        const old = self.entries.orderedRemove(0);
-                        evicted.append(self.allocator, old) catch {
-                            var tmp = old;
-                            tmp.handle.close();
-                            tmp.deinitMeta(self.allocator);
-                        };
+                    while (self.entries.items.len > self.warm_limit and evicted_len < evicted_buf.len) {
+                        evicted_buf[evicted_len] = self.entries.orderedRemove(0);
+                        evicted_len += 1;
                     }
                     if (self.reaper_thread == null and self.warm_idle_ms > 0) {
                         self.reaper_thread = std.Thread.spawn(.{}, reaperMain, .{self}) catch null;
@@ -201,6 +184,11 @@ pub const WarmPool = struct {
                     self.cond.signal(self.io);
                 } else |_| {}
             }
+        }
+
+        for (evicted_buf[0..evicted_len]) |*e| {
+            e.handle.close();
+            e.deinitMeta(self.allocator);
         }
 
         if (!accepted) {
@@ -212,31 +200,25 @@ pub const WarmPool = struct {
     }
 
     pub fn closeIdle(self: *WarmPool) void {
-        var evicted: std.ArrayList(Entry) = .empty;
-        defer {
-            for (evicted.items) |*e| {
-                e.handle.close();
-                e.deinitMeta(self.allocator);
-            }
-            evicted.deinit(self.allocator);
-        }
+        var detached: std.ArrayList(Entry) = .empty;
         {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
-            evicted.appendSlice(self.allocator, self.entries.items) catch {
-                for (self.entries.items) |*e| {
-                    e.handle.close();
-                    e.deinitMeta(self.allocator);
-                }
-            };
-            self.entries.clearRetainingCapacity();
+            detached = self.entries;
+            self.entries = .empty;
             self.cond.signal(self.io);
         }
+        for (detached.items) |*e| {
+            e.handle.close();
+            e.deinitMeta(self.allocator);
+        }
+        detached.deinit(self.allocator);
     }
 
     fn reaperMain(self: *WarmPool) void {
         while (true) {
-            var expired: std.ArrayList(Entry) = .empty;
+            var expired_buf: [MAX_WARM_LIMIT + 2]Entry = undefined;
+            var expired_len: usize = 0;
             var should_exit = false;
             {
                 self.mu.lockUncancelable(self.io);
@@ -248,7 +230,7 @@ pub const WarmPool = struct {
                 if (self.stopping) {
                     should_exit = true;
                 } else {
-                    const now = id.nowMs(self.io);
+                    const now = rpc.monotonicMs(self.io);
                     var earliest_deadline: u64 = std.math.maxInt(u64);
                     for (self.entries.items) |e| {
                         const d = e.parked_ms +| self.warm_idle_ms;
@@ -266,16 +248,16 @@ pub const WarmPool = struct {
                     if (self.stopping) {
                         should_exit = true;
                     } else {
-                        const check_now = id.nowMs(self.io);
+                        const check_now = rpc.monotonicMs(self.io);
                         var i: usize = 0;
                         while (i < self.entries.items.len) {
                             if (check_now >= self.entries.items[i].parked_ms +| self.warm_idle_ms) {
-                                const old = self.entries.orderedRemove(i);
-                                expired.append(self.allocator, old) catch {
-                                    var tmp = old;
-                                    tmp.handle.close();
-                                    tmp.deinitMeta(self.allocator);
-                                };
+                                if (expired_len < expired_buf.len) {
+                                    expired_buf[expired_len] = self.entries.orderedRemove(i);
+                                    expired_len += 1;
+                                } else {
+                                    break;
+                                }
                             } else {
                                 i += 1;
                             }
@@ -283,11 +265,10 @@ pub const WarmPool = struct {
                     }
                 }
             }
-            for (expired.items) |*e| {
+            for (expired_buf[0..expired_len]) |*e| {
                 e.handle.close();
                 e.deinitMeta(self.allocator);
             }
-            expired.deinit(self.allocator);
             if (should_exit) return;
         }
     }
