@@ -4,6 +4,7 @@ const Io = std.Io;
 const Aegis = std.crypto.aead.aegis.Aegis256;
 const Blake3 = std.crypto.hash.Blake3;
 const X25519 = std.crypto.dh.X25519;
+const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const Key = [Aegis.key_length]u8;
 pub const Nonce = [Aegis.nonce_length]u8;
@@ -215,9 +216,11 @@ pub fn sealWithDerivedNonce(
     aad: []const u8,
     plaintext: []const u8,
 ) Allocator.Error![]u8 {
+    var pt_hash = hashBytes(plaintext);
+    defer zeroize(&pt_hash);
     var h = Blake3.init(.{ .key = key });
     defer zeroize(std.mem.asBytes(&h));
-    h.update("0ndb-derived-nonce-v1");
+    h.update("0ndb-derived-nonce-v2");
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, context.len, .little);
     h.update(&len_buf);
@@ -225,6 +228,9 @@ pub fn sealWithDerivedNonce(
     std.mem.writeInt(u64, &len_buf, aad.len, .little);
     h.update(&len_buf);
     h.update(aad);
+    std.mem.writeInt(u64, &len_buf, plaintext.len, .little);
+    h.update(&len_buf);
+    h.update(&pt_hash);
     var nonce: Nonce = undefined;
     defer zeroize(&nonce);
     h.final(&nonce);
@@ -320,6 +326,41 @@ pub const DeviceKeypair = struct {
 
     pub fn zeroize(self: *DeviceKeypair) void {
         std.crypto.secureZero(u8, &self.secret_key);
+        std.crypto.secureZero(u8, &self.public_key);
+    }
+};
+
+pub const SigningKeypair = struct {
+    seed: [32]u8,
+    public_key: [32]u8,
+
+    pub fn generate(io: Io) SigningKeypair {
+        var kp = Ed25519.KeyPair.generate(io);
+        defer std.crypto.secureZero(u8, &kp.secret_key.bytes);
+        return .{
+            .seed = kp.secret_key.seed(),
+            .public_key = kp.public_key.toBytes(),
+        };
+    }
+
+    pub fn fromSeed(seed: [32]u8) !SigningKeypair {
+        var kp = try Ed25519.KeyPair.generateDeterministic(seed);
+        defer std.crypto.secureZero(u8, &kp.secret_key.bytes);
+        return .{
+            .seed = seed,
+            .public_key = kp.public_key.toBytes(),
+        };
+    }
+
+    pub fn sign(self: *const SigningKeypair, msg: []const u8) ![64]u8 {
+        var kp = try Ed25519.KeyPair.generateDeterministic(self.seed);
+        defer std.crypto.secureZero(u8, &kp.secret_key.bytes);
+        const sig = try kp.sign(msg, null);
+        return sig.toBytes();
+    }
+
+    pub fn zeroize(self: *SigningKeypair) void {
+        std.crypto.secureZero(u8, &self.seed);
         std.crypto.secureZero(u8, &self.public_key);
     }
 };
@@ -513,11 +554,15 @@ pub const DelegationBundle = struct {
     issued_ms: u64,
     expires_ms: u64,
     grants: []DelegationGrant,
+    issuer_ed25519_pubkey: ?[32]u8 = null,
+    issuer_signature: ?[64]u8 = null,
 
     pub const MAGIC: [4]u8 = .{ '0', 'D', 'B', 'G' };
     pub const FORMAT_VERSION: u8 = 3;
+    pub const FORMAT_VERSION_SIGNED: u8 = 4;
     pub const HEADER_LEN: usize = 4 + 1 + 16 + 16 + 8 + 8 + 4;
     pub const GRANT_FIXED_LEN: usize = 32 + 32 + 4 + 4 + 8 + 4;
+    pub const SIGNATURE_TRAILER_LEN: usize = 32 + 64;
     pub const MAX_GRANTS: usize = 4096;
     pub const MAX_TOKEN_LEN: usize = 65536;
 
@@ -525,10 +570,12 @@ pub const DelegationBundle = struct {
         for (self.grants) |*g| g.deinit(allocator);
         if (self.grants.len > 0) allocator.free(self.grants);
         self.grants = &.{};
+        self.issuer_ed25519_pubkey = null;
+        self.issuer_signature = null;
     }
 
-    pub fn encode(self: *const DelegationBundle, allocator: Allocator) Allocator.Error![]u8 {
-        var total_len: usize = HEADER_LEN;
+    fn encodeBody(self: *const DelegationBundle, allocator: Allocator, version: u8, extra_tail: usize) Allocator.Error![]u8 {
+        var total_len: usize = HEADER_LEN + extra_tail;
         for (self.grants) |g| {
             total_len += GRANT_FIXED_LEN + g.token.len;
         }
@@ -541,7 +588,7 @@ pub const DelegationBundle = struct {
         var pos: usize = 0;
         @memcpy(out[pos..][0..4], &MAGIC);
         pos += 4;
-        out[pos] = FORMAT_VERSION;
+        out[pos] = version;
         pos += 1;
         std.mem.writeInt(u128, out[pos..][0..16], self.issued_by_runner, .little);
         pos += 16;
@@ -575,10 +622,61 @@ pub const DelegationBundle = struct {
         return out;
     }
 
+    fn computeSigningDigest(self: *const DelegationBundle, allocator: Allocator, issuer_pubkey: [32]u8) Allocator.Error![32]u8 {
+        const body = try self.encodeBody(allocator, FORMAT_VERSION_SIGNED, 0);
+        defer {
+            zeroize(body);
+            allocator.free(body);
+        }
+        var h = Blake3.init(.{});
+        defer zeroize(std.mem.asBytes(&h));
+        h.update("0ndb-delegation-sig-v4:");
+        h.update(&issuer_pubkey);
+        h.update(body);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return digest;
+    }
+
+    pub fn signWithIssuer(self: *DelegationBundle, allocator: Allocator, kp: *const SigningKeypair) !void {
+        var digest = try self.computeSigningDigest(allocator, kp.public_key);
+        defer zeroize(&digest);
+        const sig = try kp.sign(&digest);
+        self.issuer_ed25519_pubkey = kp.public_key;
+        self.issuer_signature = sig;
+    }
+
+    pub fn verifyIssuerSignature(self: *const DelegationBundle, allocator: Allocator, expected_pubkey: ?[32]u8) !void {
+        const pk_bytes = self.issuer_ed25519_pubkey orelse return error.MissingIssuerSignature;
+        const sig_bytes = self.issuer_signature orelse return error.MissingIssuerSignature;
+        if (expected_pubkey) |exp_pk| {
+            if (!std.crypto.timing_safe.eql([32]u8, pk_bytes, exp_pk)) {
+                return error.UntrustedIssuer;
+            }
+        }
+        const pk = Ed25519.PublicKey.fromBytes(pk_bytes) catch return error.InvalidSignature;
+        const sig = Ed25519.Signature.fromBytes(sig_bytes);
+        var digest = try self.computeSigningDigest(allocator, pk_bytes);
+        defer zeroize(&digest);
+        sig.verify(&digest, pk) catch return error.InvalidSignature;
+    }
+
+    pub fn encode(self: *const DelegationBundle, allocator: Allocator) Allocator.Error![]u8 {
+        if (self.issuer_ed25519_pubkey != null and self.issuer_signature != null) {
+            const out = try self.encodeBody(allocator, FORMAT_VERSION_SIGNED, SIGNATURE_TRAILER_LEN);
+            const tail = out.len - SIGNATURE_TRAILER_LEN;
+            @memcpy(out[tail .. tail + 32], &self.issuer_ed25519_pubkey.?);
+            @memcpy(out[tail + 32 ..], &self.issuer_signature.?);
+            return out;
+        }
+        return self.encodeBody(allocator, FORMAT_VERSION, 0);
+    }
+
     pub fn decode(allocator: Allocator, data: []const u8) (Allocator.Error || error{InvalidBundle})!DelegationBundle {
         if (data.len < HEADER_LEN) return error.InvalidBundle;
         if (!std.mem.eql(u8, data[0..4], &MAGIC)) return error.InvalidBundle;
-        if (data[4] != FORMAT_VERSION) return error.InvalidBundle;
+        const version = data[4];
+        if (version != FORMAT_VERSION and version != FORMAT_VERSION_SIGNED) return error.InvalidBundle;
 
         var pos: usize = 5;
         const issued_by_runner = std.mem.readInt(u128, data[pos..][0..16], .little);
@@ -628,7 +726,18 @@ pub const DelegationBundle = struct {
             };
             initialized += 1;
         }
-        if (pos != data.len) return error.InvalidBundle;
+
+        var issuer_pk: ?[32]u8 = null;
+        var issuer_sig: ?[64]u8 = null;
+        if (version == FORMAT_VERSION_SIGNED) {
+            if (data.len - pos != SIGNATURE_TRAILER_LEN) return error.InvalidBundle;
+            issuer_pk = data[pos..][0..32].*;
+            pos += 32;
+            issuer_sig = data[pos..][0..64].*;
+            pos += 64;
+        } else if (pos != data.len) {
+            return error.InvalidBundle;
+        }
 
         return .{
             .issued_by_runner = issued_by_runner,
@@ -636,6 +745,8 @@ pub const DelegationBundle = struct {
             .issued_ms = issued_ms,
             .expires_ms = expires_ms,
             .grants = grants,
+            .issuer_ed25519_pubkey = issuer_pk,
+            .issuer_signature = issuer_sig,
         };
     }
 

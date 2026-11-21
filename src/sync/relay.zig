@@ -12,6 +12,14 @@ const wire = @import("wire.zig");
 const TopicId = [32]u8;
 const MAX_PEERS: usize = 512;
 const MAX_PEER_RX_BYTES: usize = wire.MAX_FRAME_LEN + wire.WIRE_HEADER_LEN + 65536;
+const MAX_PREAUTH_RX_BYTES: usize = 1024;
+const MAX_PREAUTH_PAYLOAD_BYTES: usize = wire.AUTH_V3_LEN + 64;
+
+fn nowAwakeMs(io: Io) u64 {
+    const ts = Io.Clock.awake.now(io);
+    const ms = @divFloor(ts.nanoseconds, std.time.ns_per_ms);
+    return if (ms < 0) 0 else @intCast(ms);
+}
 const MAX_PEER_TX_BYTES: usize = 32 * 1024 * 1024;
 const TX_COMPACT_THRESHOLD: usize = 65536;
 const IDLE_BUF_SHRINK_CAP: usize = 65536;
@@ -37,9 +45,14 @@ pub const TopicLeaseState = struct {
     holder_runner_id: u128 = 0,
     fencing_epoch: u64 = 0,
     expires_ms: u64 = 0,
+    expires_mono_ms: u64 = 0,
     handoff_target: ?u128 = null,
     canceled: bool = false,
     cancel_epoch: u64 = 0,
+
+    pub fn isExpiredMono(self: TopicLeaseState, now_mono_ms: u64) bool {
+        return self.expires_mono_ms == 0 or now_mono_ms >= self.expires_mono_ms;
+    }
 
     pub fn toResponse(self: TopicLeaseState) wire.LeaseResponse {
         return .{
@@ -52,11 +65,38 @@ pub const TopicLeaseState = struct {
         };
     }
 
+    pub fn toResponseAt(self: TopicLeaseState, now_wall_ms: u64, now_mono_ms: u64) wire.LeaseResponse {
+        const rem: u64 = if (self.expires_mono_ms > now_mono_ms) self.expires_mono_ms - now_mono_ms else 0;
+        const wire_exp: u64 = if (rem > 0) now_wall_ms +| rem else 0;
+        return .{
+            .holder_runner_id = self.holder_runner_id,
+            .fencing_epoch = self.fencing_epoch,
+            .expires_ms = wire_exp,
+            .handoff_target = self.handoff_target,
+            .canceled = self.canceled,
+            .cancel_epoch = self.cancel_epoch,
+        };
+    }
+
     pub fn fromResponse(resp: wire.LeaseResponse) TopicLeaseState {
         return .{
             .holder_runner_id = resp.holder_runner_id,
             .fencing_epoch = resp.fencing_epoch,
             .expires_ms = resp.expires_ms,
+            .expires_mono_ms = 0,
+            .handoff_target = resp.handoff_target,
+            .canceled = resp.canceled,
+            .cancel_epoch = resp.cancel_epoch,
+        };
+    }
+
+    pub fn fromResponseAt(resp: wire.LeaseResponse, now_wall_ms: u64, now_mono_ms: u64) TopicLeaseState {
+        const rem: u64 = if (resp.expires_ms > now_wall_ms) @min(resp.expires_ms - now_wall_ms, MAX_LEASE_TTL_MS) else 0;
+        return .{
+            .holder_runner_id = resp.holder_runner_id,
+            .fencing_epoch = resp.fencing_epoch,
+            .expires_ms = if (rem > 0) now_wall_ms +| rem else 0,
+            .expires_mono_ms = if (rem > 0) now_mono_ms +| rem else 0,
             .handoff_target = resp.handoff_target,
             .canceled = resp.canceled,
             .cancel_epoch = resp.cancel_epoch,
@@ -409,17 +449,21 @@ pub const RelayServer = struct {
             return error.CorruptLeaseState;
         }
 
+        const now_wall = id.nowMs(self.io);
+        const now_mono = nowAwakeMs(self.io);
         var pos: usize = 16;
         for (0..count) |_| {
             const topic: TopicId = buf[pos..][0..32].*;
             pos += 32;
             const resp = try wire.LeaseResponse.decode(buf[pos .. pos + wire.LeaseResponse.ENCODED_LEN]);
             pos += wire.LeaseResponse.ENCODED_LEN;
-            try self.leases.put(self.allocator, topic, TopicLeaseState.fromResponse(resp));
+            try self.leases.put(self.allocator, topic, TopicLeaseState.fromResponseAt(resp, now_wall, now_mono));
         }
     }
 
     fn persistLeasesLocked(self: *RelayServer) !void {
+        const now_wall = id.nowMs(self.io);
+        const now_mono = nowAwakeMs(self.io);
         const count = self.leases.count();
         const total_len = 16 + count * LEASE_ENTRY_LEN + 32;
         const buf = try self.allocator.alloc(u8, total_len);
@@ -434,7 +478,7 @@ pub const RelayServer = struct {
         while (it.next()) |entry| {
             @memcpy(buf[pos..][0..32], entry.key_ptr);
             pos += 32;
-            const enc = entry.value_ptr.toResponse().encode();
+            const enc = entry.value_ptr.toResponseAt(now_wall, now_mono).encode();
             @memcpy(buf[pos .. pos + wire.LeaseResponse.ENCODED_LEN], &enc);
             pos += wire.LeaseResponse.ENCODED_LEN;
         }
@@ -477,7 +521,7 @@ pub const RelayServer = struct {
         const rc = linux.epoll_wait(self.epfd, &events, events.len, effective_timeout);
         const e = linux.errno(rc);
         if (e == .INTR) {
-            self.sweepTimeouts(id.nowMs(self.io));
+            self.sweepTimeouts(nowAwakeMs(self.io));
             return 0;
         }
         if (e != .SUCCESS) return error.EpollWaitFailed;
@@ -511,7 +555,7 @@ pub const RelayServer = struct {
             };
         }
 
-        self.sweepTimeouts(id.nowMs(self.io));
+        self.sweepTimeouts(nowAwakeMs(self.io));
         return n;
     }
 
@@ -555,7 +599,7 @@ pub const RelayServer = struct {
     }
 
     fn acceptLoop(self: *RelayServer) void {
-        const now_ms = id.nowMs(self.io);
+        const now_ms = nowAwakeMs(self.io);
         while (true) {
             var peer_addr: linux.sockaddr.in = undefined;
             var peer_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
@@ -655,7 +699,7 @@ pub const RelayServer = struct {
 
     fn flushPeerTx(self: *RelayServer, peer: *PeerConn) bool {
         if (peer.closing) return false;
-        const now_ms = id.nowMs(self.io);
+        const now_ms = nowAwakeMs(self.io);
         while (peer.tx_off < peer.tx.items.len) {
             const rem = peer.tx.items[peer.tx_off..];
             const rc = linux.sendto(peer.fd, rem.ptr, rem.len, linux.MSG.NOSIGNAL, null, 0);
@@ -718,7 +762,7 @@ pub const RelayServer = struct {
             }
         }
         if ((revents & linux.EPOLL.IN) != 0) {
-            const now_ms = id.nowMs(self.io);
+            const now_ms = nowAwakeMs(self.io);
             var tmp: [16384]u8 = undefined;
             while (true) {
                 const rc = linux.read(fd, &tmp, tmp.len);
@@ -729,7 +773,8 @@ pub const RelayServer = struct {
                     self.markPeerClosing(fd);
                     return;
                 }
-                if (rc > MAX_PEER_RX_BYTES or peer.rx.items.len > MAX_PEER_RX_BYTES - rc) {
+                const rx_cap: usize = if (self.require_auth and !peer.authed) MAX_PREAUTH_RX_BYTES else MAX_PEER_RX_BYTES;
+                if (rc > rx_cap or peer.rx.items.len > rx_cap - rc) {
                     self.markPeerClosing(fd);
                     return;
                 }
@@ -758,6 +803,11 @@ pub const RelayServer = struct {
             }
             const avail = peer.rx.items[consumed..];
             const hdr = (try wire.decodeHeader(avail)) orelse break;
+            if (self.require_auth and !peer.authed) {
+                if (hdr.op != .auth or hdr.len > MAX_PREAUTH_PAYLOAD_BYTES) {
+                    return error.PreAuthRejected;
+                }
+            }
             const total = wire.WIRE_HEADER_LEN + hdr.len;
             if (avail.len < total) break;
             const payload = avail[wire.WIRE_HEADER_LEN..total];
@@ -868,7 +918,7 @@ pub const RelayServer = struct {
     }
 
     fn dispatchFrame(self: *RelayServer, peer: *PeerConn, op: wire.Op, payload: []const u8) !void {
-        peer.last_activity_ms = id.nowMs(self.io);
+        peer.last_activity_ms = nowAwakeMs(self.io);
         switch (op) {
             .auth => {
                 if (payload.len == 32 + 1 + 8 + 32) {
@@ -927,13 +977,37 @@ pub const RelayServer = struct {
                     return;
                 }
                 const topic: TopicId = payload[0..32].*;
-                if (!self.checkAnyPerm(peer, topic, @as(u32, wire.PERM_WRITE) | wire.PERM_INBOX_APPEND)) {
+                const has_write = self.checkPerm(peer, topic, wire.PERM_WRITE);
+                const has_inbox = self.checkPerm(peer, topic, wire.PERM_INBOX_APPEND);
+                if (!has_write and !has_inbox) {
                     self.sendErr(peer, .unauthorized, "write denied");
                     return;
                 }
+                const inbox_only = self.require_auth and has_inbox and !has_write;
                 const opaque_bytes = payload[32..];
                 if (opaque_bytes.len > MAX_OPAQUE_PAYLOAD) {
                     self.sendErr(peer, .bad_frame, "frame payload too large");
+                    return;
+                }
+                var lease_err: ?wire.ErrCode = null;
+                var lease_resp: wire.LeaseResponse = .{};
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    if (self.leases.get(topic)) |st| {
+                        const now_wall = id.nowMs(self.io);
+                        const now_mono = nowAwakeMs(self.io);
+                        if (st.canceled) {
+                            lease_err = .cancelled;
+                            lease_resp = st.toResponseAt(now_wall, now_mono);
+                        } else if (st.fencing_epoch > 0 and !inbox_only) {
+                            lease_err = .fenced;
+                            lease_resp = st.toResponseAt(now_wall, now_mono);
+                        }
+                    }
+                }
+                if (lease_err) |code| {
+                    self.sendLeaseErr(peer, code, lease_resp);
                     return;
                 }
                 try self.appendAndBroadcastFrame(peer, topic, opaque_bytes);
@@ -957,10 +1031,11 @@ pub const RelayServer = struct {
                 {
                     self.lease_mu.lockUncancelable(self.io);
                     defer self.lease_mu.unlock(self.io);
-                    const now_ms = id.nowMs(self.io);
+                    const now_wall = id.nowMs(self.io);
+                    const now_mono = nowAwakeMs(self.io);
                     if (self.leases.get(req.topic)) |st| {
-                        fence_resp = st.toResponse();
-                        if (st.fencing_epoch == 0 or st.holder_runner_id == 0 or req.required_epoch != st.fencing_epoch or now_ms >= st.expires_ms) {
+                        fence_resp = st.toResponseAt(now_wall, now_mono);
+                        if (st.fencing_epoch == 0 or st.holder_runner_id == 0 or req.required_epoch != st.fencing_epoch or st.isExpiredMono(now_mono)) {
                             fence_err = .fenced;
                         } else if (st.canceled) {
                             fence_err = .cancelled;
@@ -991,48 +1066,106 @@ pub const RelayServer = struct {
 
                 var resp: wire.LeaseResponse = .{};
                 var err_code: ?wire.ErrCode = null;
+                var persist_failed = false;
+                var epoch_overflow = false;
                 {
                     self.lease_mu.lockUncancelable(self.io);
                     defer self.lease_mu.unlock(self.io);
                     const gop = try self.leases.getOrPut(self.allocator, req.topic);
-                    if (!gop.found_existing) {
+                    const existed = gop.found_existing;
+                    if (!existed) {
                         gop.value_ptr.* = .{};
                     }
                     const st = gop.value_ptr;
-                    const now_ms = id.nowMs(self.io);
+                    const prev_state = st.*;
+                    const now_wall = id.nowMs(self.io);
+                    const now_mono = nowAwakeMs(self.io);
                     const ttl = clampLeaseTtl(req.ttl_ms);
 
-                    const is_vacant_or_expired = (st.holder_runner_id == 0) or (now_ms >= st.expires_ms);
-                    const is_same_holder = (st.holder_runner_id == req.runner_id) and (st.fencing_epoch == req.expected_epoch) and (now_ms < st.expires_ms);
+                    const is_vacant_or_expired = (st.holder_runner_id == 0) or st.isExpiredMono(now_mono);
+                    const is_same_holder = (st.holder_runner_id == req.runner_id) and (st.fencing_epoch == req.expected_epoch) and !st.isExpiredMono(now_mono);
                     const is_handoff = (st.handoff_target != null) and (st.handoff_target.? == req.runner_id) and (st.fencing_epoch == req.expected_epoch);
 
-                    if (is_vacant_or_expired or is_handoff) {
-                        st.fencing_epoch += 1;
-                        st.holder_runner_id = req.runner_id;
-                        st.expires_ms = now_ms +| ttl;
-                        st.handoff_target = null;
-                        st.canceled = false;
-                        self.persistLeasesLocked() catch {
-                            self.sendErr(peer, .internal, "lease persist failed");
-                            return;
-                        };
-                        resp = st.toResponse();
+                    if (is_handoff) {
+                        if (st.canceled) {
+                            err_code = .cancelled;
+                            resp = st.toResponseAt(now_wall, now_mono);
+                        } else if (std.math.add(u64, st.fencing_epoch, 1)) |next_epoch| {
+                            st.fencing_epoch = next_epoch;
+                            st.holder_runner_id = req.runner_id;
+                            st.expires_ms = now_wall +| ttl;
+                            st.expires_mono_ms = now_mono +| ttl;
+                            st.handoff_target = null;
+                            st.canceled = false;
+                            if (self.persistLeasesLocked()) {
+                                resp = st.toResponseAt(now_wall, now_mono);
+                            } else |_| {
+                                if (existed) {
+                                    st.* = prev_state;
+                                } else {
+                                    _ = self.leases.remove(req.topic);
+                                }
+                                persist_failed = true;
+                            }
+                        } else |_| {
+                            epoch_overflow = true;
+                        }
+                    } else if (is_vacant_or_expired) {
+                        if (req.expected_epoch != 0 and req.expected_epoch != st.fencing_epoch) {
+                            err_code = .fenced;
+                            resp = st.toResponseAt(now_wall, now_mono);
+                            if (!existed) {
+                                _ = self.leases.remove(req.topic);
+                            }
+                        } else if (std.math.add(u64, st.fencing_epoch, 1)) |next_epoch| {
+                            st.fencing_epoch = next_epoch;
+                            st.holder_runner_id = req.runner_id;
+                            st.expires_ms = now_wall +| ttl;
+                            st.expires_mono_ms = now_mono +| ttl;
+                            st.handoff_target = null;
+                            st.canceled = false;
+                            if (self.persistLeasesLocked()) {
+                                resp = st.toResponseAt(now_wall, now_mono);
+                            } else |_| {
+                                if (existed) {
+                                    st.* = prev_state;
+                                } else {
+                                    _ = self.leases.remove(req.topic);
+                                }
+                                persist_failed = true;
+                            }
+                        } else |_| {
+                            if (!existed) {
+                                _ = self.leases.remove(req.topic);
+                            }
+                            epoch_overflow = true;
+                        }
                     } else if (is_same_holder) {
                         if (st.canceled) {
                             err_code = .cancelled;
-                            resp = st.toResponse();
+                            resp = st.toResponseAt(now_wall, now_mono);
                         } else {
-                            st.expires_ms = now_ms +| ttl;
-                            self.persistLeasesLocked() catch {
-                                self.sendErr(peer, .internal, "lease persist failed");
-                                return;
-                            };
-                            resp = st.toResponse();
+                            st.expires_ms = now_wall +| ttl;
+                            st.expires_mono_ms = now_mono +| ttl;
+                            if (self.persistLeasesLocked()) {
+                                resp = st.toResponseAt(now_wall, now_mono);
+                            } else |_| {
+                                st.* = prev_state;
+                                persist_failed = true;
+                            }
                         }
                     } else {
                         err_code = .lease_held;
-                        resp = st.toResponse();
+                        resp = st.toResponseAt(now_wall, now_mono);
                     }
+                }
+                if (persist_failed) {
+                    self.sendErr(peer, .internal, "lease persist failed");
+                    return;
+                }
+                if (epoch_overflow) {
+                    self.sendErr(peer, .internal, "lease epoch overflow");
+                    return;
                 }
                 if (err_code) |code| {
                     self.sendLeaseErr(peer, code, resp);
@@ -1053,28 +1186,38 @@ pub const RelayServer = struct {
 
                 var resp: wire.LeaseResponse = .{};
                 var err_code: ?wire.ErrCode = null;
+                var persist_failed = false;
                 {
                     self.lease_mu.lockUncancelable(self.io);
                     defer self.lease_mu.unlock(self.io);
-                    const now_ms = id.nowMs(self.io);
+                    const now_wall = id.nowMs(self.io);
+                    const now_mono = nowAwakeMs(self.io);
                     if (self.leases.getPtr(req.topic)) |st| {
-                        if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch or now_ms >= st.expires_ms) {
+                        if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch or st.isExpiredMono(now_mono)) {
                             err_code = .fenced;
-                            resp = st.toResponse();
+                            resp = st.toResponseAt(now_wall, now_mono);
                         } else if (st.canceled) {
                             err_code = .cancelled;
-                            resp = st.toResponse();
+                            resp = st.toResponseAt(now_wall, now_mono);
                         } else {
-                            st.expires_ms = now_ms +| clampLeaseTtl(req.ttl_ms);
-                            self.persistLeasesLocked() catch {
-                                self.sendErr(peer, .internal, "lease persist failed");
-                                return;
-                            };
-                            resp = st.toResponse();
+                            const prev_state = st.*;
+                            const ttl = clampLeaseTtl(req.ttl_ms);
+                            st.expires_ms = now_wall +| ttl;
+                            st.expires_mono_ms = now_mono +| ttl;
+                            if (self.persistLeasesLocked()) {
+                                resp = st.toResponseAt(now_wall, now_mono);
+                            } else |_| {
+                                st.* = prev_state;
+                                persist_failed = true;
+                            }
                         }
                     } else {
                         err_code = .fenced;
                     }
+                }
+                if (persist_failed) {
+                    self.sendErr(peer, .internal, "lease persist failed");
+                    return;
                 }
                 if (err_code) |code| {
                     self.sendLeaseErr(peer, code, resp);
@@ -1099,28 +1242,36 @@ pub const RelayServer = struct {
 
                 var resp: wire.LeaseResponse = .{};
                 var err_code: ?wire.ErrCode = null;
+                var persist_failed = false;
                 {
                     self.lease_mu.lockUncancelable(self.io);
                     defer self.lease_mu.unlock(self.io);
-                    const now_ms = id.nowMs(self.io);
+                    const now_wall = id.nowMs(self.io);
+                    const now_mono = nowAwakeMs(self.io);
                     if (self.leases.getPtr(req.topic)) |st| {
-                        if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch or now_ms >= st.expires_ms) {
+                        if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch or st.isExpiredMono(now_mono)) {
                             err_code = .fenced;
-                            resp = st.toResponse();
+                            resp = st.toResponseAt(now_wall, now_mono);
                         } else if (st.canceled) {
                             err_code = .cancelled;
-                            resp = st.toResponse();
+                            resp = st.toResponseAt(now_wall, now_mono);
                         } else {
+                            const prev_state = st.*;
                             st.handoff_target = req.target_runner_id;
-                            self.persistLeasesLocked() catch {
-                                self.sendErr(peer, .internal, "lease persist failed");
-                                return;
-                            };
-                            resp = st.toResponse();
+                            if (self.persistLeasesLocked()) {
+                                resp = st.toResponseAt(now_wall, now_mono);
+                            } else |_| {
+                                st.* = prev_state;
+                                persist_failed = true;
+                            }
                         }
                     } else {
                         err_code = .fenced;
                     }
+                }
+                if (persist_failed) {
+                    self.sendErr(peer, .internal, "lease persist failed");
+                    return;
                 }
                 if (err_code) |code| {
                     self.sendLeaseErr(peer, code, resp);
@@ -1141,26 +1292,36 @@ pub const RelayServer = struct {
 
                 var resp: wire.LeaseResponse = .{};
                 var err_code: ?wire.ErrCode = null;
+                var persist_failed = false;
                 {
                     self.lease_mu.lockUncancelable(self.io);
                     defer self.lease_mu.unlock(self.io);
+                    const now_wall = id.nowMs(self.io);
+                    const now_mono = nowAwakeMs(self.io);
                     if (self.leases.getPtr(req.topic)) |st| {
                         if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch) {
                             err_code = .fenced;
-                            resp = st.toResponse();
+                            resp = st.toResponseAt(now_wall, now_mono);
                         } else {
+                            const prev_state = st.*;
                             st.expires_ms = 0;
+                            st.expires_mono_ms = 0;
                             st.holder_runner_id = 0;
                             st.handoff_target = null;
-                            self.persistLeasesLocked() catch {
-                                self.sendErr(peer, .internal, "lease persist failed");
-                                return;
-                            };
-                            resp = st.toResponse();
+                            if (self.persistLeasesLocked()) {
+                                resp = st.toResponseAt(now_wall, now_mono);
+                            } else |_| {
+                                st.* = prev_state;
+                                persist_failed = true;
+                            }
                         }
                     } else {
                         err_code = .fenced;
                     }
+                }
+                if (persist_failed) {
+                    self.sendErr(peer, .internal, "lease persist failed");
+                    return;
                 }
                 if (err_code) |code| {
                     self.sendLeaseErr(peer, code, resp);
@@ -1180,21 +1341,33 @@ pub const RelayServer = struct {
                 }
 
                 var resp: wire.LeaseResponse = .{};
+                var persist_failed = false;
                 {
                     self.lease_mu.lockUncancelable(self.io);
                     defer self.lease_mu.unlock(self.io);
                     const gop = try self.leases.getOrPut(self.allocator, req.topic);
-                    if (!gop.found_existing) {
+                    const existed = gop.found_existing;
+                    if (!existed) {
                         gop.value_ptr.* = .{};
                     }
                     const st = gop.value_ptr;
+                    const prev_state = st.*;
                     st.canceled = true;
                     st.cancel_epoch = @max(req.cancel_epoch, st.cancel_epoch);
-                    self.persistLeasesLocked() catch {
-                        self.sendErr(peer, .internal, "lease persist failed");
-                        return;
-                    };
-                    resp = st.toResponse();
+                    if (self.persistLeasesLocked()) {
+                        resp = st.toResponseAt(id.nowMs(self.io), nowAwakeMs(self.io));
+                    } else |_| {
+                        if (existed) {
+                            st.* = prev_state;
+                        } else {
+                            _ = self.leases.remove(req.topic);
+                        }
+                        persist_failed = true;
+                    }
+                }
+                if (persist_failed) {
+                    self.sendErr(peer, .internal, "lease persist failed");
+                    return;
                 }
                 const enc = resp.encode();
                 try self.sendToPeer(peer, .lease_resp, 0, &enc);
@@ -1214,7 +1387,7 @@ pub const RelayServer = struct {
                     self.lease_mu.lockUncancelable(self.io);
                     defer self.lease_mu.unlock(self.io);
                     if (self.leases.get(req.topic)) |st| {
-                        resp = st.toResponse();
+                        resp = st.toResponseAt(id.nowMs(self.io), nowAwakeMs(self.io));
                     }
                 }
                 const enc = resp.encode();
@@ -1290,6 +1463,10 @@ pub const RelayServer = struct {
                     return;
                 }
                 const after_seq = std.mem.readInt(u64, payload[32..40], .little);
+                if (after_seq != std.math.maxInt(u64) and !self.checkPerm(peer, topic, wire.PERM_READ)) {
+                    self.sendErr(peer, .unauthorized, "read denied");
+                    return;
+                }
                 const tlog = self.getOrOpenTopic(topic) catch {
                     self.sendErr(peer, .internal, "topic open failed");
                     return;
@@ -1418,6 +1595,7 @@ pub const RelayServer = struct {
             return;
         } else |_| {}
         try self.blob_dir.rename(tmp_name, self.blob_dir, &hex, self.io);
+        if (self.durable_sync) try mmap.fsyncDir(self.io, self.blob_dir);
     }
 
     fn loadOpaqueBlob(self: *RelayServer, topic: TopicId, oid: [32]u8) !?[]u8 {
