@@ -189,7 +189,6 @@ Full_Active :: struct {
 	kind:     Kind,
 	progress: i64,
 	stall:    int,
-	probed:   bool,
 }
 
 @(private)
@@ -496,8 +495,7 @@ _full_step :: proc(e: ^Engine) {
 			unordered_remove(&r.active, i)
 			continue
 		}
-		done, progress := _full_check(e, sp, a.object, a.kind, !a.probed)
-		r.active[i].probed = true
+		done, progress := _full_check(e, sp, a.object, a.kind)
 		if done {
 			k := _full_key(a.space, a.object)
 			_reg_del(e, ROOT_SEARCH, k[:])
@@ -575,7 +573,7 @@ _full_step :: proc(e: ^Engine) {
 }
 
 @(private)
-_full_check :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, probe: bool) -> (done: bool, progress: i64) {
+_full_check :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) -> (done: bool, progress: i64) {
 	h, err := _handle_get(e, Object{sp.id, id}, kind)
 	if err != .None {
 		return err == .Not_Found || err == .Invalid, 0
@@ -593,10 +591,6 @@ _full_check :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, probe: bool
 		end := journal.reader_end(&s.jr)
 		if sp.repl_on {
 			n := osync.replicator_relay_length(&sp.repl, &h.scope, s.device, h.name, 0)
-			if probe {
-				osync.replicator_want_tail(&sp.repl, &h.scope, s.device, h.name, 0, 1)
-				done = false
-			}
 			if n < 0 {
 				osync.replicator_want_tail(&sp.repl, &h.scope, s.device, h.name, 0, 1)
 				done = false
@@ -632,7 +626,6 @@ _full_kick :: proc(e: ^Engine, sp: ^Space) {
 
 @(private)
 _full_settle :: proc(e: ^Engine) {
-	_full_step(e)
 	for sid in _sorted_keys(e.spaces) {
 		sp := e.spaces[sid]
 		if !sp.open || !sp.connected || !_full_on(e, sp) {
