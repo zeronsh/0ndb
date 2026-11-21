@@ -1,6 +1,7 @@
 package osync
 
 import "base:runtime"
+import "../pack"
 import "../prim"
 
 Relay_Config :: struct {
@@ -18,6 +19,13 @@ Relay_Config :: struct {
 	max_follows:     int,
 	handshake_ms:    i64,
 	sync_threads:    int,
+	compact_header:  bool,
+	pack:            bool,
+	feed_compact:    i64,
+	source_conns:    int,
+	source_rate:     int,
+	source_burst:    int,
+	principal_conns: int,
 	kernel_tls:      bool,
 }
 
@@ -29,6 +37,7 @@ Relay_Stats :: struct {
 	spaces:     int,
 	streams:    int,
 	accepted:   u64,
+	limited:    u64,
 	appends:    u64,
 	bytes_in:   u64,
 	bytes_out:  u64,
@@ -57,6 +66,7 @@ Relay :: struct {
 	has_key:    bool,
 	store:      Relay_Storage,
 	own_store:  ^File_Store,
+	own_pack:   ^pack.Pack,
 	auth:       Authorizer,
 	own_auth:   ^Space_Authorizer,
 	listeners:  [dynamic]^Listener,
@@ -67,6 +77,8 @@ Relay :: struct {
 	rscratch:   []u8,
 	wscratch:   []u8,
 	graveyard:  [dynamic]^Conn,
+	sources:    map[[16]u8]Source,
+	principals: map[[32]u8]int,
 	stats:      Relay_Stats,
 	allocator:  runtime.Allocator,
 }
@@ -94,6 +106,15 @@ Space_State :: struct {
 	feed_q:   [dynamic]u8,
 	feed_busy: bool,
 	feeders:  [dynamic]^Conn,
+	feed_epoch: u64,
+	feed_base: i64,
+	feed_flight: [dynamic]u8,
+	feed_wait: [dynamic]^Pending,
+	feed_ready: bool,
+	compacting: bool,
+	meta:     ^Stream_State,
+	next_feed: ^Stream_State,
+	next_len: i64,
 }
 
 Stream_State :: struct {
@@ -160,11 +181,6 @@ Out :: struct {
 	obj:     rawptr,
 }
 
-Listing :: struct {
-	it:     rawptr,
-	cursor: i64,
-	done:   bool,
-}
 
 Conn :: struct {
 	relay:     ^Relay,
@@ -205,6 +221,10 @@ Conn :: struct {
 	feed_on:   bool,
 	feed_off:  i64,
 	feed_hint: bool,
+	source:    [16]u8,
+	sourced:   bool,
+	pkey:      [32]u8,
+	pcounted:  bool,
 }
 
 @(private)
@@ -214,6 +234,9 @@ Pending_Kind :: enum u8 {
 	Drop,
 	Redact,
 	Feed,
+	Forget,
+	Compact,
+	Meta,
 }
 
 @(private)
@@ -225,6 +248,8 @@ Pending :: struct {
 	space:  ^Space_State,
 	total:  i64,
 	from:   i64,
+	need:   i64,
+	length: i64,
 	id:     [32]u8,
 }
 
@@ -275,6 +300,23 @@ relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := con
 	if r.cfg.handshake_ms <= 0 {
 		r.cfg.handshake_ms = 10_000
 	}
+	if r.cfg.feed_compact == 0 {
+		r.cfg.feed_compact = FEED_COMPACT_DEFAULT
+	}
+	if r.cfg.source_conns <= 0 {
+		r.cfg.source_conns = 256
+	}
+	if r.cfg.source_rate <= 0 {
+		r.cfg.source_rate = 50
+	}
+	if r.cfg.source_burst <= 0 {
+		r.cfg.source_burst = 100
+	}
+	if r.cfg.principal_conns <= 0 {
+		r.cfg.principal_conns = 1024
+	}
+	r.sources = make(map[[16]u8]Source, allocator)
+	r.principals = make(map[[32]u8]int, allocator)
 	r.cfg.listen = nil
 	r.listeners = make([dynamic]^Listener, allocator)
 	r.conns = make([dynamic]^Conn, allocator)
@@ -317,7 +359,36 @@ relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := con
 		if aerr != nil {
 			return .No_Memory
 		}
-		if ferr := file_store_init(fs, l, r.vfs, r.root, cfg.sync_threads, allocator); ferr != .None {
+		store_vfs := r.vfs
+		threads := cfg.sync_threads
+		lay := LAYOUT_COMPACT if cfg.compact_header else LAYOUT_SECTOR
+		if cfg.pack {
+			pk, perr := new(pack.Pack, allocator)
+			if perr != nil {
+				free(fs, allocator)
+				return .No_Memory
+			}
+			proot, _ := prim.path_join(context.temp_allocator, r.root, "spaces")
+			if merr := prim.mkdir_all(r.vfs, proot, 0o700); merr != .None {
+				free(pk, allocator)
+				free(fs, allocator)
+				return _from_prim(merr)
+			}
+			if oerr := pack.open(pk, r.vfs, proot, pack.DEFAULT_OPTIONS, allocator); oerr != .None {
+				free(pk, allocator)
+				free(fs, allocator)
+				return _from_prim(oerr)
+			}
+			r.own_pack = pk
+			store_vfs = pack.vfs(pk)
+			threads = 0
+			lay = LAYOUT_COMPACT
+		}
+		group: Group_Commit
+		if r.own_pack != nil {
+			group = Group_Commit{data = r.own_pack, begin = _pack_begin, end = _pack_end}
+		}
+		if ferr := file_store_init(fs, l, store_vfs, r.root, threads, lay, group, allocator); ferr != .None {
 			free(fs, allocator)
 			return ferr
 		}
@@ -377,6 +448,8 @@ relay_destroy :: proc(r: ^Relay) {
 		free(sp, r.allocator)
 	}
 	delete(r.spaces)
+	delete(r.sources)
+	delete(r.principals)
 	delete(r.conns)
 	delete(r.gens)
 	delete(r.free)
@@ -385,6 +458,10 @@ relay_destroy :: proc(r: ^Relay) {
 		delete(r.own_store.scratch, r.allocator)
 		delete(r.own_store.root, r.allocator)
 		free(r.own_store, r.allocator)
+	}
+	if r.own_pack != nil {
+		pack.close(r.own_pack)
+		free(r.own_pack, r.allocator)
 	}
 	if r.own_auth != nil {
 		space_authorizer_destroy(r.own_auth)
@@ -574,7 +651,7 @@ _on_listen :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr
 	ln := cast(^Listener)data
 	r := ln.relay
 	for {
-		cfd, err := _accept(ln.fd)
+		cfd, src, err := _accept(ln.fd)
 		if err != .None {
 			break
 		}
@@ -587,7 +664,20 @@ _on_listen :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr
 			prim.close(cfd)
 			continue
 		}
-		_conn_new(r, cfd, ln.unix)
+		if !ln.unix && !_source_admit(r, src) {
+			r.stats.limited += 1
+			prim.close(cfd)
+			continue
+		}
+		c, cerr := _conn_new(r, cfd, ln.unix)
+		if !ln.unix {
+			if cerr == .None {
+				c.source = src
+				c.sourced = true
+			} else {
+				_source_leave(r, src)
+			}
+		}
 	}
 	_reap(r)
 }
@@ -727,6 +817,18 @@ _conn_close :: proc(c: ^Conn) {
 	c.out_head = 0
 	if c.listing != nil {
 		_listing_end(c)
+	}
+	if c.sourced {
+		_source_leave(r, c.source)
+		c.sourced = false
+	}
+	if c.pcounted {
+		if n := r.principals[c.pkey] - 1; n > 0 {
+			r.principals[c.pkey] = n
+		} else {
+			delete_key(&r.principals, c.pkey)
+		}
+		c.pcounted = false
 	}
 	sp := c.space
 	if sp != nil {
@@ -957,6 +1059,8 @@ _handle :: proc(c: ^Conn, it: ^Item) {
 			_on_redact(c, &rd)
 		case .Feed:
 			_on_feed(c, &rd)
+		case .Forget:
+			_on_forget(c, &rd)
 		case:
 			_fail(c, .Protocol)
 		}
@@ -993,6 +1097,16 @@ _on_hello :: proc(c: ^Conn, payload: []u8) {
 		_fail(c, code)
 		return
 	}
+	pk: [32]u8
+	ns := p.namespace
+	pid := p.participant
+	copy(pk[:16], ns[:])
+	copy(pk[16:], pid[:])
+	limit := p.max_conns if p.max_conns > 0 else r.cfg.principal_conns
+	if r.principals[pk] >= limit {
+		_fail(c, .Limit)
+		return
+	}
 	sp, err := _space_get(r, p.namespace)
 	if err != .None {
 		_fail(c, .Io)
@@ -1006,6 +1120,9 @@ _on_hello :: proc(c: ^Conn, payload: []u8) {
 	sp.quota = p.quota
 	sp.conns += 1
 	c.space = sp
+	r.principals[pk] += 1
+	c.pkey = pk
+	c.pcounted = true
 	c.principal = p
 	_conn_ready(c)
 	b: [FRAME_HEADER + 25]u8
@@ -1019,7 +1136,7 @@ _on_hello :: proc(c: ^Conn, payload: []u8) {
 
 @(private)
 _can :: proc(c: ^Conn, access: Access, id: [32]u8) -> bool {
-	if id == cast([32]u8)FEED_ID {
+	if _reserved(id) {
 		return false
 	}
 	return principal_allows(&c.principal, access, id)
@@ -1044,18 +1161,21 @@ _space_get :: proc(r: ^Relay, id: Space_Id) -> (sp: ^Space_State, err: Error) {
 	sp.watchers = make([dynamic]^Conn, r.allocator)
 	sp.feeders = make([dynamic]^Conn, r.allocator)
 	sp.feed_q = make([dynamic]u8, r.allocator)
+	sp.feed_flight = make([dynamic]u8, r.allocator)
+	sp.feed_wait = make([dynamic]^Pending, r.allocator)
 	r.spaces[id] = sp
 	return sp, .None
 }
 
 @(private)
 _space_release :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || len(sp.feed_q) > 0 || len(sp.streams) > (1 if sp.feed != nil else 0) {
+	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || sp.compacting || len(sp.feed_q) > 0 || len(sp.feed_wait) > 0 || len(sp.streams) > _owned_streams(sp) {
 		return
 	}
-	if sp.feed != nil {
-		st := sp.feed
-		sp.feed = nil
+	for st in ([]^Stream_State{sp.feed, sp.meta}) {
+		if st == nil {
+			continue
+		}
 		delete_key(&sp.streams, st.id)
 		if st.h != nil {
 			r.store.stream_close(r.store.data, st.h)
@@ -1064,11 +1184,15 @@ _space_release :: proc(r: ^Relay, sp: ^Space_State) {
 		free(st, r.allocator)
 		r.stats.streams -= 1
 	}
+	sp.feed = nil
+	sp.meta = nil
 	delete_key(&r.spaces, sp.id)
 	delete(sp.streams)
 	delete(sp.watchers)
 	delete(sp.feeders)
 	delete(sp.feed_q)
+	delete(sp.feed_flight)
+	delete(sp.feed_wait)
 	r.store.namespace_close(r.store.data, sp.ns)
 	free(sp, r.allocator)
 }
@@ -1246,94 +1370,8 @@ _out_release :: proc(r: ^Relay, o: ^Out) {
 	}
 }
 
-@(private)
-_on_list :: proc(c: ^Conn, rd: ^prim.Reader) {
-	r := c.relay
-	since := i64(prim.read_u64le(rd))
-	if !prim.reader_done(rd) {
-		_fail(c, .Protocol)
-		return
-	}
-	if !_can(c, .List, {}) {
-		_reply_refused(c, .Not_Owner, {})
-		return
-	}
-	ls, aerr := new(Listing, r.allocator)
-	if aerr != nil {
-		_conn_close(c)
-		return
-	}
-	it, cursor, err := r.store.list_begin(r.store.data, c.space.ns, since)
-	if err != .None {
-		ls.done = true
-	}
-	ls.it = it
-	ls.cursor = cursor
-	c.listing = ls
-}
 
-@(private)
-_listing_end :: proc(c: ^Conn) {
-	r := c.relay
-	if c.listing.it != nil {
-		r.store.list_end(r.store.data, c.listing.it)
-	}
-	free(c.listing, r.allocator)
-	c.listing = nil
-}
 
-@(private)
-_produce_listing :: proc(c: ^Conn) -> bool {
-	r := c.relay
-	ls := c.listing
-	head := FRAME_HEADER + 8 + 1 + 2
-	buf, aerr := make([]u8, head + LIST_BATCH * 40, r.allocator)
-	if aerr != nil {
-		_conn_close(c)
-		return false
-	}
-	count := 0
-	done := ls.done
-	for !done && count < LIST_BATCH {
-		id, ok := r.store.list_next(r.store.data, ls.it)
-		if !ok {
-			done = true
-			break
-		}
-		if !_can(c, .Read, cast([32]u8)id) {
-			continue
-		}
-		length: i64
-		if st, sok := c.space.streams[id]; sok && st.h != nil && !st.dropped && !st.poisoned {
-			length = st.length
-		} else {
-			l, exists, ferr := r.store.stream_probe(r.store.data, c.space.ns, id)
-			if ferr != .None || !exists {
-				continue
-			}
-			length = l
-		}
-		if length <= 0 {
-			continue
-		}
-		e := buf[head + count * 40:]
-		v := id
-		copy(e[:32], v[:])
-		prim.put_u64le(e[32:], u64(length))
-		count += 1
-	}
-	payload := 8 + 1 + 2 + count * 40
-	frame_header(buf, .Listing, payload)
-	prim.put_u64le(buf[FRAME_HEADER:], u64(ls.cursor))
-	buf[FRAME_HEADER + 8] = 0 if done else 1
-	buf[FRAME_HEADER + 9] = u8(count)
-	buf[FRAME_HEADER + 10] = u8(count >> 8)
-	_push_buf(c, buf[:FRAME_HEADER + payload])
-	if done && c.listing != nil {
-		_listing_end(c)
-	}
-	return true
-}
 
 @(private)
 _on_read :: proc(c: ^Conn, rd: ^prim.Reader, tail: bool) {
@@ -1643,6 +1681,9 @@ _on_append_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
 	length := _live_len(st)
 	if st.busy || st.h == nil || st.dropped || at != st.length {
 		c.op.reply, c.op.len = .Conflict, length
+		if !st.busy && st.h != nil && !st.dropped && at < st.length {
+			_feed_add(r, sp, cast([32]u8)id, u64(st.length))
+		}
 		_stream_maybe_release(r, st)
 		return
 	}
@@ -1734,7 +1775,7 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_len(c, op.reply, op.id, op.len)
 		case .Stored:
 			_reply_id(c, .Stored, op.id)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce:
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten:
 		}
 	case .Append:
 		st := op.stream
@@ -1798,9 +1839,7 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			was := st.length
 			st.length = value
 			sp.usage += p.total
-			if c != nil {
-				_reply_len(c, .Appended, p.id, st.length)
-			}
+			p.length = value
 			if was == 0 {
 				for w in sp.watchers {
 					if _can(w, .Read, p.id) {
@@ -1813,7 +1852,9 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 				f.scan = true
 				_conn_kick(f)
 			}
-			_feed_add(r, sp, p.id, u64(st.length))
+			_feed_wait(r, sp, p, u64(st.length))
+			_reap(r)
+			return
 		} else {
 			st.poisoned = true
 			if c != nil {
@@ -1868,28 +1909,26 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 					_conn_kick(w)
 				}
 			}
-			if c != nil {
-				_reply_id(c, .Dropped, p.id)
+			if !_reserved(p.id) {
+				p.length = -1
+				_feed_wait(r, sp, p, FEED_DROPPED)
+				_reap(r)
+				return
 			}
-			_feed_add(r, sp, p.id, FEED_DROPPED)
 		} else if c != nil {
 			_reply_refused(c, .Io, p.id)
 		}
-	case .Feed:
-		sp.feed_busy = false
+	case .Forget:
 		if result == .None {
-			sp.feed_len = value
-			if sp.feed != nil {
-				sp.feed.length = value
+			sp.usage = max(sp.usage - value, 0)
+			if c != nil {
+				_reply_id(c, .Forgotten, p.id)
 			}
-			for f in sp.feeders {
-				f.feed_hint = true
-				_conn_kick(f)
-			}
-		} else if sp.feed != nil {
-			sp.feed.poisoned = true
+		} else if c != nil {
+			_reply_refused(c, .Io, p.id)
 		}
-		_feed_flush(r, sp)
+	case .Feed, .Compact, .Meta:
+		_feed_done(r, sp, p.kind, result, value)
 	}
 	if p.stream != nil {
 		_stream_unref(r, p.stream)
@@ -2163,142 +2202,95 @@ _clone_string :: proc(s: string, allocator: runtime.Allocator) -> (string, Error
 	return string(b), .None
 }
 
-@(private)
-_feed_open :: proc(r: ^Relay, sp: ^Space_State) -> Error {
-	if sp.feed != nil && !sp.feed.poisoned {
-		return .None
-	}
-	st := _stream_get(r, sp, FEED_ID, true) or_return
-	if sp.feed == nil {
-		st.refs += 1
-	}
-	sp.feed = st
-	sp.feed_len = st.length
-	return .None
-}
+
+
+
+
+
 
 @(private)
-_feed_add :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, length: u64) {
-	e: [FEED_ENTRY]u8
-	v := id
-	copy(e[:32], v[:])
-	prim.put_u64le(e[32:], length)
-	append(&sp.feed_q, ..e[:])
-	_feed_flush(r, sp)
-}
-
-@(private)
-_feed_flush :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.feed_busy || len(sp.feed_q) == 0 {
-		return
-	}
-	if _feed_open(r, sp) != .None {
-		clear(&sp.feed_q)
-		return
-	}
-	st := sp.feed
-	w, err := r.store.append_begin(r.store.data, st.h, st.length, i64(len(sp.feed_q)))
-	if err == .None {
-		err = r.store.append_write(r.store.data, w, sp.feed_q[:])
-		if err != .None {
-			r.store.append_abort(r.store.data, w)
-		}
-	}
-	clear(&sp.feed_q)
-	if err != .None {
-		st.poisoned = true
-		return
-	}
-	p, aerr := new(Pending, r.allocator)
-	if aerr != nil {
-		r.store.append_abort(r.store.data, w)
-		st.poisoned = true
-		return
-	}
-	p^ = {
-		relay = r,
-		kind  = .Feed,
-		space = sp,
-	}
-	sp.jobs += 1
-	sp.feed_busy = true
-	r.store.append_commit(r.store.data, w, _relay_done, p)
-}
-
-@(private)
-_on_feed :: proc(c: ^Conn, rd: ^prim.Reader) {
+_on_forget :: proc(c: ^Conn, rd: ^prim.Reader) {
 	r := c.relay
-	from := prim.read_u64le(rd)
-	if !prim.reader_done(rd) {
+	count := int(prim.read_u16le(rd))
+	if !prim.reader_ok(rd) || count > GET_BATCH || prim.reader_remaining(rd) != count * 32 {
 		_fail(c, .Protocol)
 		return
 	}
-	sp := c.space
-	if _feed_open(r, sp) != .None {
-		_reply_refused(c, .Io, cast([32]u8)FEED_ID)
-		return
-	}
-	end := sp.feed_len
-	off := end if from == FEED_DROPPED || from > u64(end) else i64(from - from % FEED_ENTRY)
-	if !c.feed_on {
-		if _, e := append(&sp.feeders, c); e != nil {
-			_conn_close(c)
-			return
+	for _ in 0 ..< count {
+		key := Object_Key(get_id32(rd))
+		if !_can(c, .Forget, cast([32]u8)key) {
+			_reply_refused(c, .Not_Owner, cast([32]u8)key)
+			continue
 		}
+		p := _pending_new(c, .Forget, nil, 0, cast([32]u8)key)
+		if p == nil {
+			_reply_refused(c, .Io, cast([32]u8)key)
+			continue
+		}
+		r.store.object_remove(r.store.data, c.space.ns, key, _relay_done, p)
 	}
-	c.feed_on = true
-	c.feed_off = off
-	c.feed_hint = true
-	_announce(c, off, off, nil)
+}
+
+Source :: struct {
+	conns:  int,
+	tokens: i64,
+	last:   i64,
 }
 
 @(private)
-_announce :: proc(c: ^Conn, from, next: i64, entries: []u8) {
-	r := c.relay
-	n := len(entries) / FEED_ENTRY
-	buf, aerr := make([]u8, FRAME_HEADER + 18 + len(entries), r.allocator)
-	if aerr != nil {
-		_conn_close(c)
-		return
-	}
-	frame_header(buf, .Announce, 18 + len(entries))
-	prim.put_u64le(buf[FRAME_HEADER:], u64(from))
-	prim.put_u64le(buf[FRAME_HEADER + 8:], u64(next))
-	buf[FRAME_HEADER + 16] = u8(n)
-	buf[FRAME_HEADER + 17] = u8(n >> 8)
-	copy(buf[FRAME_HEADER + 18:], entries)
-	_push_buf(c, buf)
-}
+SOURCE_TABLE_MAX :: 65536
 
 @(private)
-_produce_feed :: proc(c: ^Conn) -> bool {
-	r := c.relay
-	sp := c.space
-	if sp.feed == nil || sp.feed.h == nil || c.feed_off >= sp.feed_len {
-		return false
-	}
-	want := min(sp.feed_len - c.feed_off, FEED_BATCH * FEED_ENTRY)
-	raw, aerr := make([]u8, int(want), context.temp_allocator)
-	if aerr != nil {
-		return false
-	}
-	got, err := r.store.stream_read(r.store.data, sp.feed.h, c.feed_off, raw)
-	if err != .None || i64(got) != want {
-		return false
-	}
-	keep := 0
-	for i := 0; i + FEED_ENTRY <= got; i += FEED_ENTRY {
-		id: [32]u8
-		copy(id[:], raw[i:i + 32])
-		if principal_allows(&c.principal, .Read, id) {
-			if keep != i {
-				copy(raw[keep:], raw[i:i + FEED_ENTRY])
+_source_admit :: proc(r: ^Relay, src: [16]u8) -> bool {
+	now := prim.mono_ns()
+	burst := i64(r.cfg.source_burst) * 1_000_000
+	s, ok := r.sources[src]
+	if !ok {
+		if len(r.sources) >= SOURCE_TABLE_MAX {
+			_source_sweep(r, now)
+			if len(r.sources) >= SOURCE_TABLE_MAX {
+				return false
 			}
-			keep += FEED_ENTRY
+		}
+		s = Source{tokens = burst, last = now}
+	}
+	s.tokens = min(burst, s.tokens + (now - s.last) / 1000 * i64(r.cfg.source_rate))
+	s.last = now
+	if s.conns >= r.cfg.source_conns || s.tokens < 1_000_000 {
+		r.sources[src] = s
+		return false
+	}
+	s.tokens -= 1_000_000
+	s.conns += 1
+	r.sources[src] = s
+	return true
+}
+
+@(private)
+_source_leave :: proc(r: ^Relay, src: [16]u8) {
+	if s, ok := r.sources[src]; ok {
+		s.conns = max(s.conns - 1, 0)
+		r.sources[src] = s
+	}
+}
+
+@(private)
+_source_sweep :: proc(r: ^Relay, now: i64) {
+	burst := i64(r.cfg.source_burst) * 1_000_000
+	for k, s in r.sources {
+		refilled := min(burst, s.tokens + (now - s.last) / 1000 * i64(r.cfg.source_rate))
+		if s.conns == 0 && refilled >= burst {
+			delete_key(&r.sources, k)
 		}
 	}
-	from := c.feed_off
-	c.feed_off += want
-	_announce(c, from, c.feed_off, raw[:keep])
-	return true
+}
+
+@(private)
+_pack_begin :: proc(data: rawptr) {
+	pack.batch_begin(cast(^pack.Pack)data)
+}
+
+@(private)
+_pack_end :: proc(data: rawptr) -> Error {
+	return _from_prim(pack.batch_end(cast(^pack.Pack)data))
 }

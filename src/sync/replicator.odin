@@ -26,6 +26,7 @@ Repl_Event_Kind :: enum u8 {
 	Checkpoint_Missing,
 	Redacted,
 	Quarantined,
+	Object_Shredded,
 }
 
 Verdict :: enum u8 {
@@ -42,6 +43,8 @@ Verify_Request :: struct {
 	replica: ^journal.Replica,
 	from:    i64,
 	to:      i64,
+	span:    ^journal.Sig_Info,
+	span_ok: ^bool,
 }
 
 Repl_Event :: struct {
@@ -144,6 +147,10 @@ Remote :: struct {
 	held:      i64,
 	pulled:    i64,
 	pulling:   bool,
+	span:      journal.Sig_Info,
+	span_ok:   bool,
+	span_fd:   prim.Fd,
+	span_seq:  u64,
 }
 
 Group :: struct {
@@ -155,41 +162,7 @@ Group :: struct {
 	members: [dynamic]Device_Id,
 }
 
-Put_Job :: struct {
-	oid:     [32]u8,
-	oid_len: int,
-	key:     Object_Key,
-	ckey:    [32]u8,
-	data:    []u8,
-	path:    string,
-	fd:      prim.Fd,
-	size:    i64,
-	done:    i64,
-	sealer:  Object_Sealer,
-	plain:   bool,
-	real:    i64,
-	vfs:     prim.Vfs,
-	sent:    bool,
-}
 
-Get_Job :: struct {
-	oid:     [32]u8,
-	oid_len: int,
-	key:     Object_Key,
-	ckey:    [32]u8,
-	dest:    string,
-	tmp:     string,
-	fd:      prim.Fd,
-	opener:  ^Object_Opener,
-	written: i64,
-	plain:   bool,
-	total:   i64,
-	real:    i64,
-	vpos:    i64,
-	vfs:     prim.Vfs,
-	sent:    bool,
-	failed:  bool,
-}
 
 Replicator :: struct {
 	vfs:        prim.Vfs,
@@ -211,9 +184,7 @@ Replicator :: struct {
 	remotes:    map[Stream_Id]^Remote,
 	probes:     map[Stream_Id]^Remote,
 	devices:    map[Device_Id]bool,
-	puts:       [dynamic]^Put_Job,
-	put_active: ^Put_Job,
-	gets:       map[Object_Key]^Get_Job,
+	objs:       Objects,
 	uploading:  int,
 	external:   bool,
 	static:     ecdh.Private_Key,
@@ -227,7 +198,6 @@ Replicator :: struct {
 	listed:     bool,
 	rx_remote:  ^Remote,
 	rx_local:   ^Local,
-	rx_get:     ^Get_Job,
 	rx_at:      i64,
 	rx_start:   i64,
 	stage:      [dynamic]u8,
@@ -298,8 +268,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.remotes = make(map[Stream_Id]^Remote, allocator)
 	r.probes = make(map[Stream_Id]^Remote, allocator)
 	r.devices = make(map[Device_Id]bool, allocator)
-	r.gets = make(map[Object_Key]^Get_Job, allocator)
-	r.puts = make([dynamic]^Put_Job, allocator)
+	_objs_init(r)
 	r.stage = make([dynamic]u8, allocator)
 	r.groups = make(map[[16]u8]^Group, allocator)
 	r.feed_cursor = -1
@@ -325,18 +294,11 @@ replicator_destroy :: proc(r: ^Replicator) {
 	for _, rm in r.remotes {
 		_remote_free(r, rm)
 	}
-	for p in r.puts {
-		_put_free(r, p)
-	}
-	for _, g in r.gets {
-		_get_free(r, g)
-	}
+	_objs_destroy(r)
 	delete(r.locals)
 	delete(r.remotes)
 	delete(r.probes)
 	delete(r.devices)
-	delete(r.gets)
-	delete(r.puts)
 	delete(r.stage)
 	for _, g in r.groups {
 		_group_free(r, g)
@@ -520,42 +482,8 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 	return -1
 }
 
-replicator_put_object :: proc(r: ^Replicator, scope: ^Scope, oid: []u8, data: []u8) -> Error {
-	return _put_new(r, scope, oid, data, "")
-}
 
-replicator_put_object_file :: proc(r: ^Replicator, scope: ^Scope, oid: []u8, path: string) -> Error {
-	return _put_new(r, scope, oid, nil, path)
-}
 
-replicator_get_object :: proc(r: ^Replicator, scope: ^Scope, oid: []u8, dest: string) -> Error {
-	if len(oid) == 0 || len(oid) > 32 {
-		return .Invalid
-	}
-	key := object_index(scope, oid)
-	if _, ok := r.gets[key]; ok {
-		return .None
-	}
-	g, aerr := new(Get_Job, r.allocator)
-	if aerr != nil {
-		return .No_Memory
-	}
-	g.oid_len = copy(g.oid[:], oid)
-	g.key = key
-	g.ckey = object_content_key(scope, oid)
-	g.plain = scope.mode == .Transparent
-	g.vfs = r.vfs
-	g.fd = prim.INVALID_FD
-	derr: Error
-	g.dest, derr = _clone_string(dest, r.allocator)
-	if derr != .None {
-		free(g, r.allocator)
-		return derr
-	}
-	r.gets[key] = g
-	_repl_pump(r)
-	return .None
-}
 
 @(private)
 _emit :: proc(r: ^Replicator, ev: Repl_Event) {
@@ -932,6 +860,8 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 	rm.epoch = epoch
 	rm.id = id
 	rm.relay_len = -1
+	rm.span_fd = prim.INVALID_FD
+	_span_load(r, rm, path)
 	rm.wants = make([dynamic]journal.Range, r.allocator)
 	rm.inflight = make([dynamic]journal.Range, r.allocator)
 	nerr, perr: Error
@@ -961,6 +891,9 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 		r.rx_remote = nil
 	}
 	journal.replica_close(&rm.rep)
+	if rm.span_fd >= 0 {
+		prim.close_file(r.vfs, rm.span_fd)
+	}
 	delete(rm.wants)
 	delete(rm.inflight)
 	delete(rm.name, r.allocator)
@@ -1125,321 +1058,15 @@ _stage_flush :: proc(r: ^Replicator) {
 	}
 }
 
-@(private)
-_put_new :: proc(r: ^Replicator, scope: ^Scope, oid: []u8, data: []u8, path: string) -> Error {
-	if len(oid) == 0 || len(oid) > 32 {
-		return .Invalid
-	}
-	key := object_index(scope, oid)
-	for p in r.puts {
-		if p.key == key {
-			return .None
-		}
-	}
-	p, aerr := new(Put_Job, r.allocator)
-	if aerr != nil {
-		return .No_Memory
-	}
-	p.oid_len = copy(p.oid[:], oid)
-	p.key = key
-	p.ckey = object_content_key(scope, oid)
-	p.plain = scope.mode == .Transparent
-	p.vfs = r.vfs
-	p.fd = prim.INVALID_FD
-	if len(path) > 0 {
-		perr: Error
-		p.path, perr = _clone_string(path, r.allocator)
-		if perr != .None {
-			free(p, r.allocator)
-			return perr
-		}
-	} else {
-		b, berr := make([]u8, len(data), r.allocator)
-		if berr != nil {
-			free(p, r.allocator)
-			return .No_Memory
-		}
-		copy(b, data)
-		p.data = b
-		p.real = i64(len(data))
-	}
-	if _, e := append(&r.puts, p); e != nil {
-		_put_free(r, p)
-		return .No_Memory
-	}
-	_repl_pump(r)
-	return .None
-}
 
-@(private)
-_put_free :: proc(r: ^Replicator, p: ^Put_Job) {
-	if p.fd >= 0 {
-		prim.close_file(r.vfs, p.fd)
-	}
-	object_sealer_reset(&p.sealer)
-	crypto.zero_explicit(&p.ckey, size_of(p.ckey))
-	if p.data != nil {
-		delete(p.data, r.allocator)
-	}
-	if len(p.path) > 0 {
-		delete(p.path, r.allocator)
-	}
-	free(p, r.allocator)
-}
 
-@(private)
-_put_fail :: proc(r: ^Replicator, p: ^Put_Job, err: Error) {
-	for i := 0; i < len(r.puts); i += 1 {
-		if r.puts[i] == p {
-			ordered_remove(&r.puts, i)
-			break
-		}
-	}
-	_emit(r, Repl_Event{kind = .Object_Failed, err = err, oid = p.oid[:p.oid_len]})
-	_put_free(r, p)
-}
 
-@(private)
-_put_fill :: proc(r: ^Replicator) {
-	for r.phase == .Ready {
-		p := r.put_active
-		if p == nil {
-			for q in r.puts {
-				if !q.sent {
-					p = q
-					break
-				}
-			}
-			if p == nil || client_streaming(&r.client) {
-				return
-			}
-			if len(p.path) > 0 {
-				fd, err := prim.open_file(r.vfs, p.path)
-				if err != .None {
-					_put_fail(r, p, _from_prim(err))
-					continue
-				}
-				size, serr := prim.file_size(r.vfs, fd)
-				if serr != .None || object_sealed_size(size) > i64(OBJECT_MAX) {
-					prim.close_file(r.vfs, fd)
-					_put_fail(r, p, .Too_Large if serr == .None else _from_prim(serr))
-					continue
-				}
-				p.fd = fd
-				p.real = size
-			}
-			p.size = p.real if p.plain else _vsize(r, p.real)
-			p.done = 0
-			object_sealer_init(&p.sealer, &p.ckey, p.size)
-			if client_put_begin(&r.client, p.key, p.size if p.plain else object_sealed_size(p.size)) != .None {
-				object_sealer_reset(&p.sealer)
-				return
-			}
-			r.put_active = p
-		}
-		for !(p.done >= p.size if p.plain else object_sealer_done(&p.sealer)) {
-			if client_queued(&r.client) >= OUT_HIGH {
-				return
-			}
-			k := int(min(p.size - p.done, OBJECT_CHUNK))
-			if p.plain {
-				dst, rerr := client_put_reserve(&r.client, k)
-				if rerr != .None {
-					return
-				}
-				if p.data != nil {
-					copy(dst, p.data[p.done:][:k])
-				} else if got, err := prim.read_at(r.vfs, p.fd, dst, p.done); err != .None || got != k {
-					_repl_fail(r, .Io)
-					return
-				}
-				p.done += i64(k)
-				continue
-			}
-			dst, rerr := client_put_reserve(&r.client, k + OBJECT_TAG)
-			if rerr != .None {
-				return
-			}
-			if err := _vread(p, p.done, dst[:k]); err != .None {
-				_repl_fail(r, err)
-				return
-			}
-			if _, err := object_seal_next(&p.sealer, dst[:k], dst); err != .None {
-				_repl_fail(r, err)
-				return
-			}
-			p.done += i64(k)
-		}
-		client_put_end(&r.client)
-		object_sealer_reset(&p.sealer)
-		if p.fd >= 0 {
-			prim.close_file(r.vfs, p.fd)
-			p.fd = prim.INVALID_FD
-		}
-		p.sent = true
-		r.put_active = nil
-	}
-}
 
-@(private)
-_get_free :: proc(r: ^Replicator, g: ^Get_Job) {
-	if g.fd >= 0 {
-		prim.close_file(r.vfs, g.fd)
-	}
-	if len(g.tmp) > 0 {
-		prim.remove(r.vfs, g.tmp)
-		delete(g.tmp, r.allocator)
-	}
-	if g.opener != nil {
-		object_opener_reset(g.opener)
-		free(g.opener, r.allocator)
-	}
-	crypto.zero_explicit(&g.ckey, size_of(g.ckey))
-	delete(g.dest, r.allocator)
-	free(g, r.allocator)
-}
 
-@(private)
-_get_reset :: proc(r: ^Replicator, g: ^Get_Job) {
-	if g.fd >= 0 {
-		prim.close_file(r.vfs, g.fd)
-		g.fd = prim.INVALID_FD
-	}
-	if len(g.tmp) > 0 {
-		prim.remove(r.vfs, g.tmp)
-		delete(g.tmp, r.allocator)
-		g.tmp = ""
-	}
-	g.written = 0
-	g.real = 0
-	g.vpos = 0
-	g.sent = false
-	g.failed = false
-}
 
-@(private)
-_get_finish :: proc(r: ^Replicator, g: ^Get_Job, kind: Repl_Event_Kind, err: Error) {
-	delete_key(&r.gets, g.key)
-	_emit(r, Repl_Event{kind = kind, err = err, oid = g.oid[:g.oid_len], path = g.dest})
-	_fetch_object_done(r, g.key, kind, err, g.dest)
-	_get_free(r, g)
-}
 
-@(private)
-_get_sink_padded :: proc(user: rawptr, plain: []u8) -> Error {
-	g := cast(^Get_Job)user
-	data := plain
-	if g.vpos < 8 {
-		k := int(min(8 - g.vpos, i64(len(data))))
-		for i in 0 ..< k {
-			g.real |= i64(data[i]) << u64(8 * (g.vpos + i64(i)))
-		}
-		g.vpos += i64(k)
-		data = data[k:]
-		if g.vpos == 8 && (g.real < 0 || g.real > g.total) {
-			return .Corrupt
-		}
-	}
-	if len(data) == 0 {
-		return .None
-	}
-	keep := int(clamp(g.real - (g.vpos - 8), 0, i64(len(data))))
-	g.vpos += i64(len(data))
-	if keep == 0 {
-		return .None
-	}
-	return _get_sink(g, data[:keep])
-}
 
-@(private)
-_get_sink :: proc(user: rawptr, plain: []u8) -> Error {
-	g := cast(^Get_Job)user
-	if err := prim.write_at(g.vfs, g.fd, plain, g.written); err != .None {
-		return _from_prim(err)
-	}
-	g.written += i64(len(plain))
-	return .None
-}
 
-@(private)
-_on_object :: proc(r: ^Replicator, ev: ^Event) {
-	if ev.first {
-		g, ok := r.gets[Object_Key(ev.id)]
-		r.rx_get = nil
-		if !ok {
-			return
-		}
-		_get_reset(r, g)
-		g.sent = true
-		if g.opener == nil {
-			op, aerr := new(Object_Opener, r.allocator)
-			if aerr != nil {
-				g.failed = true
-				r.rx_get = g
-				return
-			}
-			g.opener = op
-		}
-		g.total = ev.total
-		if !g.plain && object_opener_init(g.opener, &g.ckey, ev.total) != .None {
-			g.failed = true
-			r.rx_get = g
-			return
-		}
-		suffix: [21]u8
-		rb: [8]u8
-		crypto.rand_bytes(rb[:])
-		copy(suffix[:], ".tmp.")
-		prim.hex_encode(suffix[5:], rb[:])
-		tmp, terr := _concat(r.allocator, g.dest, string(suffix[:]))
-		if terr != .None {
-			g.failed = true
-			r.rx_get = g
-			return
-		}
-		g.tmp = tmp
-		fd, oerr := prim.open_file(r.vfs, tmp, {.Write, .Create, .Exclusive}, 0o600)
-		if oerr != .None {
-			g.failed = true
-		}
-		g.fd = fd
-		r.rx_get = g
-		return
-	}
-	g := r.rx_get
-	if g == nil {
-		return
-	}
-	if len(ev.data) > 0 && !g.failed {
-		if g.plain {
-			if _get_sink(g, ev.data) != .None {
-				g.failed = true
-			}
-		} else if object_open_feed(g.opener, ev.data, _get_sink_padded, g) != .None {
-			g.failed = true
-		}
-	}
-	if !ev.last {
-		return
-	}
-	r.rx_get = nil
-	if g.failed || (g.plain && g.written != g.total) || (!g.plain && (!object_open_done(g.opener) || g.vpos < 8 || g.written != g.real)) {
-		_get_finish(r, g, .Object_Failed, .Corrupt)
-		return
-	}
-	err := _from_prim(prim.datasync(r.vfs, g.fd))
-	prim.close_file(r.vfs, g.fd)
-	g.fd = prim.INVALID_FD
-	if err == .None {
-		err = _from_prim(prim.rename(r.vfs, g.tmp, g.dest))
-	}
-	if err == .None {
-		delete(g.tmp, r.allocator)
-		g.tmp = ""
-		err = _from_prim(prim.sync_dir(r.vfs, prim.dir_name(g.dest)))
-	}
-	_get_finish(r, g, .Object_Fetched if err == .None else .Object_Failed, err)
-}
 
 @(private)
 _on_data :: proc(r: ^Replicator, ev: ^Event) {
@@ -1578,21 +1205,13 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Data:
 		_on_data(r, ev)
 	case .Object:
-		_on_object(r, ev)
+		_objs_on_object(r, ev)
 	case .Stored:
-		for i := 0; i < len(r.puts); i += 1 {
-			p := r.puts[i]
-			if p.key == Object_Key(ev.id) {
-				ordered_remove(&r.puts, i)
-				_emit(r, Repl_Event{kind = .Object_Stored, oid = p.oid[:p.oid_len]})
-				_put_free(r, p)
-				break
-			}
-		}
+		_objs_on_stored(r, Object_Key(ev.id))
 	case .Missing:
-		if g, ok := r.gets[Object_Key(ev.id)]; ok {
-			_get_finish(r, g, .Object_Missing, .Not_Found)
-		}
+		_objs_on_missing(r, Object_Key(ev.id))
+	case .Forgotten:
+		_objs_on_forgotten(r, Object_Key(ev.id))
 	case .Length, .Created:
 		_seen_stream(r, Stream_Id(ev.id), ev.length)
 		if rm, ok := r.remotes[Stream_Id(ev.id)]; ok && ev.kind == .Length {
@@ -1642,11 +1261,8 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		_emit(r, rv)
 		return
 	}
-	for p in r.puts {
-		if p.key == Object_Key(ev.id) {
-			_put_fail(r, p, .Quota if ev.code == .Quota else .Refused)
-			return
-		}
+	if _objs_on_refused(r, Object_Key(ev.id), ev.code) {
+		return
 	}
 	if rm, ok := r.remotes[id]; ok {
 		clear(&rm.inflight)
@@ -1690,19 +1306,7 @@ _repl_pump :: proc(r: ^Replicator) {
 			}
 			_local_pump(r, l)
 		}
-		_put_fill(r)
-		if r.phase == .Ready {
-			keys := make([dynamic]Object_Key, context.temp_allocator)
-			for k, g in r.gets {
-				if !g.sent {
-					g.sent = true
-					append(&keys, k)
-				}
-			}
-			if len(keys) > 0 {
-				client_get(&r.client, keys[:])
-			}
-		}
+		_objs_pump(r)
 	}
 	_repl_flush(r)
 }
@@ -1714,7 +1318,6 @@ _repl_reset_state :: proc(r: ^Replicator) {
 	}
 	r.rx_remote = nil
 	r.rx_local = nil
-	r.rx_get = nil
 	clear(&r.stage)
 	r.uploading = 0
 	for _, l in r.locals {
@@ -1727,19 +1330,6 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		clear(&rm.inflight)
 		rm.pulling = false
 	}
-	if p := r.put_active; p != nil {
-		object_sealer_reset(&p.sealer)
-		if p.fd >= 0 {
-			prim.close_file(r.vfs, p.fd)
-			p.fd = prim.INVALID_FD
-		}
-		r.put_active = nil
-	}
-	for p in r.puts {
-		p.sent = false
-	}
-	for _, g in r.gets {
-		_get_reset(r, g)
-	}
+	_objs_reset(r)
 	_fetches_reset(r)
 }

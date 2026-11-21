@@ -20,12 +20,14 @@ Access :: enum u8 {
 	Put,
 	Get,
 	Redact,
+	Forget,
 }
 
 Principal :: struct {
 	namespace:   Space_Id,
 	participant: Device_Id,
 	quota:       i64,
+	max_conns:   int,
 	read_all:    bool,
 	append_own:  bool,
 	objects:     bool,
@@ -90,7 +92,7 @@ principal_allows :: proc(p: ^Principal, access: Access, id: [32]u8) -> bool {
 				return true
 			}
 		}
-	case .Put, .Get:
+	case .Put, .Get, .Forget:
 		if p.objects {
 			return true
 		}

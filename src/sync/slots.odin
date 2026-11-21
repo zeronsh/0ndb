@@ -6,6 +6,14 @@ import "../prim"
 SLOT_SPACING :: 512
 SLOTS_SIZE :: 2 * SLOT_SPACING
 
+Layout :: struct {
+	spacing: i64,
+	base:    i64,
+}
+
+LAYOUT_SECTOR :: Layout{SLOT_SPACING, SLOTS_SIZE}
+LAYOUT_COMPACT :: Layout{64, 128}
+
 @(private)
 SLOT_MAGIC :: 0x746f_6c73_6264_6e30
 @(private)
@@ -20,7 +28,7 @@ Slot :: struct {
 	hash:  u64,
 }
 
-slot_write :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot) -> Error {
+slot_write :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot, spacing: i64 = SLOT_SPACING) -> Error {
 	b: [SLOT_BYTES]u8
 	prim.put_u64le(b[0:], SLOT_MAGIC)
 	prim.put_u64le(b[8:], s.seq)
@@ -28,19 +36,19 @@ slot_write :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot) -> Error {
 	prim.put_u64le(b[24:], u64(s.start))
 	prim.put_u64le(b[32:], s.hash)
 	prim.put_u64le(b[40:], xxhash.XXH3_64_with_seed(b[:40], SLOT_SEED))
-	return _from_prim(prim.write_at(vfs, fd, b[:], i64(s.seq & 1) * SLOT_SPACING))
+	return _from_prim(prim.write_at(vfs, fd, b[:], i64(s.seq & 1) * spacing))
 }
 
-slots_read :: proc(vfs: prim.Vfs, fd: prim.Fd) -> (newest: Slot, older: Slot, count: int, err: Error) {
+slots_read :: proc(vfs: prim.Vfs, fd: prim.Fd, spacing: i64 = SLOT_SPACING) -> (newest: Slot, older: Slot, count: int, err: Error) {
 	b: [SLOTS_SIZE]u8
-	n, rerr := prim.read_at(vfs, fd, b[:], 0)
+	n, rerr := prim.read_at(vfs, fd, b[:2 * spacing], 0)
 	if rerr != .None {
 		return {}, {}, 0, _from_prim(rerr)
 	}
 	found: [2]Slot
 	ok: [2]bool
 	for i in 0 ..< 2 {
-		off := i * SLOT_SPACING
+		off := i * int(spacing)
 		if off + SLOT_BYTES > n {
 			continue
 		}

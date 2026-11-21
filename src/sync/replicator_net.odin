@@ -273,8 +273,8 @@ _repl_flush :: proc(r: ^Replicator) {
 		}
 		b := client_pending(&r.client)
 		if len(b) == 0 {
-			if r.put_active != nil && r.phase == .Ready && !r.pumping {
-				_put_fill(r)
+			if r.objs.active != nil && r.phase == .Ready && !r.pumping {
+				_objs_fill(r)
 				if len(client_pending(&r.client)) > 0 {
 					continue
 				}

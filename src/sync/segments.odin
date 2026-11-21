@@ -30,6 +30,7 @@ Ckpt_Fetch :: struct {
 	oid_len: int,
 	key:     Object_Key,
 	meta:    [dynamic]u8,
+	tree:    ^Key_Tree,
 }
 
 replicator_follow_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, full: bool) -> Error {
@@ -81,7 +82,7 @@ replicator_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: 
 	return nil
 }
 
-replicator_publish_checkpoint :: proc(r: ^Replicator, scope: ^Scope, history: string, hlc: u64, oid: []u8, meta: []u8, data: []u8 = nil, path: string = "") -> Error {
+replicator_publish_checkpoint :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, history: string, hlc: u64, oid: []u8, meta: []u8, data: []u8 = nil, path: string = "") -> Error {
 	if len(oid) == 0 || len(oid) > 32 || len(meta) > journal.MAX_BODY - 64 {
 		return .Invalid
 	}
@@ -134,19 +135,20 @@ replicator_publish_checkpoint :: proc(r: ^Replicator, scope: ^Scope, history: st
 		return _from_journal(aerr)
 	}
 	if len(path) > 0 {
-		_put_new(r, scope, oid, nil, path) or_return
+		replicator_put_object_file(r, scope, tree, oid, path) or_return
 	} else {
-		_put_new(r, scope, oid, data, "") or_return
+		replicator_put_object(r, scope, tree, oid, data) or_return
 	}
 	return replicator_publish(r, scope, name, 0, jpath, durable)
 }
 
-replicator_fetch_checkpoint :: proc(r: ^Replicator, scope: ^Scope, history: string, dest: string) -> Error {
+replicator_fetch_checkpoint :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, history: string, dest: string) -> Error {
 	f, aerr := new(Ckpt_Fetch, r.allocator)
 	if aerr != nil {
 		return .No_Memory
 	}
 	f.scope = scope^
+	f.tree = tree
 	f.cands = make([dynamic]Stream_Id, r.allocator)
 	f.done = make([dynamic]bool, r.allocator)
 	f.meta = make([dynamic]u8, r.allocator)
@@ -367,7 +369,7 @@ _fetch_check :: proc(r: ^Replicator) {
 		}
 		f.state = .Getting
 		f.key = object_index(&f.scope, f.oid[:f.oid_len])
-		if err := replicator_get_object(r, &f.scope, f.oid[:f.oid_len], f.dest); err != .None {
+		if err := replicator_get_object(r, &f.scope, f.tree, f.oid[:f.oid_len], f.dest); err != .None {
 			_emit(r, Repl_Event{kind = .Checkpoint_Missing, err = err, name = f.name})
 			i -= 1
 			_fetch_remove(r, f)

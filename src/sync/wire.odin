@@ -29,6 +29,7 @@ Kind :: enum u8 {
 	Drop      = 0x0a,
 	Redact    = 0x0b,
 	Feed      = 0x0c,
+	Forget    = 0x0d,
 	Welcome   = 0x81,
 	Listing   = 0x82,
 	Appended  = 0x83,
@@ -44,6 +45,7 @@ Kind :: enum u8 {
 	Error     = 0x8d,
 	Redacted  = 0x8e,
 	Announce  = 0x8f,
+	Forgotten = 0x90,
 }
 
 Code :: enum u8 {
@@ -61,7 +63,8 @@ Code :: enum u8 {
 }
 
 FOLLOW_WATCH :: 1
-FEED_ID :: Stream_Id{0 ..< 32 = 0xff}
+FEED_TAG :: 1
+FEED_META_TAG :: 2
 FEED_ENTRY :: 40
 FEED_BATCH :: 1500
 FEED_DROPPED :: max(u64)
@@ -213,7 +216,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 	bulk := false
 	if p.relay {
 		#partial switch k {
-		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed:
+		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget:
 		case .Append:
 			bulk, fixed, limit = true, APPEND_FIXED, APPEND_MAX
 		case .Put:
@@ -223,7 +226,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 		}
 	} else {
 		#partial switch k {
-		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce:
+		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten:
 		case .Data:
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
 		case .Object:

@@ -261,15 +261,28 @@ _unlink_stale :: proc(ep: ^Endpoint) {
 }
 
 @(private)
-_accept :: proc "contextless" (lfd: prim.Fd) -> (prim.Fd, Error) {
+_accept :: proc "contextless" (lfd: prim.Fd) -> (prim.Fd, [16]u8, Error) {
 	for {
-		fd := posix.accept(posix.FD(lfd), nil, nil)
+		sa: _Sockaddr
+		sl := posix.socklen_t(size_of(sa))
+		fd := posix.accept(posix.FD(lfd), (^posix.sockaddr)(&sa), &sl)
 		if fd < 0 {
 			e := posix.errno()
 			if e == .EINTR || e == .ECONNABORTED {
 				continue
 			}
-			return prim.INVALID_FD, _errno_of(e)
+			return prim.INVALID_FD, {}, _errno_of(e)
+		}
+		src: [16]u8
+		#partial switch sa.v4.sin_family {
+		case .INET:
+			src[10] = 0xff
+			src[11] = 0xff
+			a := sa.v4.sin_addr.s_addr
+			b := transmute([4]u8)a
+			copy(src[12:], b[:])
+		case .INET6:
+			src = sa.v6.sin6_addr.s6_addr
 		}
 		if !_nonblock(fd) {
 			posix.close(fd)
@@ -277,7 +290,7 @@ _accept :: proc "contextless" (lfd: prim.Fd) -> (prim.Fd, Error) {
 		}
 		one: c.int = 1
 		_c_setsockopt(fd, D_SOL_SOCKET, D_SO_NOSIGPIPE, &one, size_of(one))
-		return prim.Fd(fd), .None
+		return prim.Fd(fd), src, .None
 	}
 }
 

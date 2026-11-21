@@ -8,7 +8,6 @@ import "core:strings"
 import "../journal"
 import "../prim"
 
-STREAM_BASE :: SLOTS_SIZE
 
 Allow :: struct {
 	vfs:       prim.Vfs,
@@ -144,7 +143,7 @@ parse_size :: proc(s: string) -> (v: i64, ok: bool) {
 	return i64(n) * mult, true
 }
 
-stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u8) -> (f: Stream_File, err: Error) {
+stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u8, lay := LAYOUT_SECTOR) -> (f: Stream_File, err: Error) {
 	f.fd = prim.INVALID_FD
 	fd, oerr := prim.open_file(vfs, path, {.Write}, 0o600)
 	if oerr == .Not_Found && create {
@@ -160,26 +159,26 @@ stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u
 	if f.fresh {
 		return f, .None
 	}
-	f.length, f.seq, err = stream_file_recover(vfs, fd, scratch)
+	f.length, f.seq, err = stream_file_recover(vfs, fd, scratch, lay)
 	if err != .None {
 		prim.close_file(vfs, fd)
 		f.fd = prim.INVALID_FD
 		return f, err
 	}
-	if size, serr := prim.file_size(vfs, fd); serr == .None && size > STREAM_BASE + f.length {
-		if terr := prim.truncate(vfs, fd, STREAM_BASE + f.length); terr == .None {
+	if size, serr := prim.file_size(vfs, fd); serr == .None && size > lay.base + f.length {
+		if terr := prim.truncate(vfs, fd, lay.base + f.length); terr == .None {
 			prim.datasync(vfs, fd)
 		}
 	}
 	return f, .None
 }
 
-stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8) -> (length: i64, seq: u64, err: Error) {
-	newest, older, count := slots_read(vfs, fd) or_return
+stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, seq: u64, err: Error) {
+	newest, older, count := slots_read(vfs, fd, lay.spacing) or_return
 	if count == 0 {
 		return 0, 0, .None
 	}
-	ok := _chunk_verify(vfs, fd, newest, scratch) or_return
+	ok := _chunk_verify(vfs, fd, newest, scratch, lay.base) or_return
 	if ok {
 		return newest.value, newest.seq, .None
 	}
@@ -189,7 +188,7 @@ stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8) -> (lengt
 	return 0, 0, .None
 }
 
-stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8) -> (length: i64, exists: bool, err: Error) {
+stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, exists: bool, err: Error) {
 	fd, oerr := prim.open_file(vfs, path)
 	if oerr == .Not_Found {
 		return 0, false, .None
@@ -198,12 +197,12 @@ stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8) -> (length:
 		return 0, false, _from_prim(oerr)
 	}
 	defer prim.close_file(vfs, fd)
-	length, _, err = stream_file_recover(vfs, fd, scratch)
+	length, _, err = stream_file_recover(vfs, fd, scratch, lay)
 	return length, err == .None, err
 }
 
 @(private)
-_chunk_verify :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot, scratch: []u8) -> (bool, Error) {
+_chunk_verify :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot, scratch: []u8, base: i64) -> (bool, Error) {
 	if s.value == s.start {
 		return true, .None
 	}
@@ -212,7 +211,7 @@ _chunk_verify :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot, scratch: []u8) -> (bo
 	pos := s.start
 	for pos < s.value {
 		n := int(min(i64(len(scratch)), s.value - pos))
-		got, rerr := prim.read_at(vfs, fd, scratch[:n], STREAM_BASE + pos)
+		got, rerr := prim.read_at(vfs, fd, scratch[:n], base + pos)
 		if rerr != .None {
 			return false, _from_prim(rerr)
 		}
@@ -287,9 +286,9 @@ parse_stream_name :: proc(name: string) -> (id: Stream_Id, ok: bool) {
 	return
 }
 
-space_usage_scan :: proc(vfs: prim.Vfs, dir: string, allocator: runtime.Allocator) -> (usage: i64, err: Error) {
+space_usage_scan :: proc(vfs: prim.Vfs, dir: string, allocator: runtime.Allocator, base: i64 = SLOTS_SIZE) -> (usage: i64, err: Error) {
 	sdir, _ := prim.path_join(context.temp_allocator, dir, "s")
-	usage += _dir_bytes(vfs, sdir, STREAM_BASE, false, allocator)
+	usage += _dir_bytes(vfs, sdir, base, false, allocator)
 	odir, _ := prim.path_join(context.temp_allocator, dir, "o")
 	usage += _dir_bytes(vfs, odir, 0, true, allocator)
 	tdir, _ := prim.path_join(context.temp_allocator, dir, "t")
@@ -337,11 +336,11 @@ _dir_bytes :: proc(vfs: prim.Vfs, dir: string, base: i64, nested: bool, allocato
 }
 
 @(private)
-_redact_records :: proc(vfs: prim.Vfs, fd: prim.Fd, from, to: i64) -> Error {
+_redact_records :: proc(vfs: prim.Vfs, fd: prim.Fd, from, to: i64, base: i64) -> Error {
 	pos := from
 	for pos < to {
 		head: [4]u8
-		if n, err := prim.read_at(vfs, fd, head[:], STREAM_BASE + pos); err != .None || n != 4 {
+		if n, err := prim.read_at(vfs, fd, head[:], base + pos); err != .None || n != 4 {
 			return .Corrupt
 		}
 		body := i64(prim.get_u32le(head[:]))
@@ -350,12 +349,12 @@ _redact_records :: proc(vfs: prim.Vfs, fd: prim.Fd, from, to: i64) -> Error {
 			return .Invalid
 		}
 		trail: [4]u8
-		if n, err := prim.read_at(vfs, fd, trail[:], STREAM_BASE + pos + journal.HEADER + body); err != .None || n != 4 || prim.get_u32le(trail[:]) != u32(body) {
+		if n, err := prim.read_at(vfs, fd, trail[:], base + pos + journal.HEADER + body); err != .None || n != 4 || prim.get_u32le(trail[:]) != u32(body) {
 			return .Invalid
 		}
 		tag := journal.redacted_tag(pos, int(body))
-		_from_prim(prim.write_at(vfs, fd, tag[:], STREAM_BASE + pos + 4)) or_return
-		_from_prim(prim.zero_range(vfs, fd, STREAM_BASE + pos + journal.HEADER, body)) or_return
+		_from_prim(prim.write_at(vfs, fd, tag[:], base + pos + 4)) or_return
+		_from_prim(prim.zero_range(vfs, fd, base + pos + journal.HEADER, body)) or_return
 		pos += size
 	}
 	return .None

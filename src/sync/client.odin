@@ -28,6 +28,7 @@ Event_Kind :: enum u8 {
 	Error,
 	Redacted,
 	Announce,
+	Forgotten,
 }
 
 Event :: struct {
@@ -334,6 +335,23 @@ client_feed_follow :: proc(c: ^Client, from: u64) -> Error {
 	return frame_end(b, start, &w)
 }
 
+client_forget :: proc(c: ^Client, keys: []Object_Key) -> Error {
+	rest := keys
+	for len(rest) > 0 {
+		n := min(len(rest), GET_BATCH)
+		b := _client_buf(c)
+		start := frame_begin(b, .Forget) or_return
+		w := prim.writer(b)
+		prim.write_u16le(&w, u16(n))
+		for k in rest[:n] {
+			put_id(&w, cast([32]u8)k)
+		}
+		frame_end(b, start, &w) or_return
+		rest = rest[n:]
+	}
+	return .None
+}
+
 client_drop :: proc(c: ^Client, id: Stream_Id) -> Error {
 	b := _client_buf(c)
 	start := frame_begin(b, .Drop) or_return
@@ -513,8 +531,8 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.kind = .Appended if it.frame == .Appended else .Conflict if it.frame == .Conflict else .Created
 		ev.id = get_id32(&r)
 		ev.length = get_i64(&r)
-	case .Stored, .Missing, .Dropped:
-		ev.kind = .Stored if it.frame == .Stored else .Missing if it.frame == .Missing else .Dropped
+	case .Stored, .Missing, .Dropped, .Forgotten:
+		ev.kind = .Stored if it.frame == .Stored else .Missing if it.frame == .Missing else .Dropped if it.frame == .Dropped else .Forgotten
 		ev.id = get_id32(&r)
 	case .Refused:
 		ev.kind = .Refused

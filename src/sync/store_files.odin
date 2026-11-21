@@ -6,6 +6,7 @@ import "../prim"
 
 File_Store :: struct {
 	vfs:       prim.Vfs,
+	lay:       Layout,
 	root:      string,
 	loop:      ^prim.Loop,
 	worker:    Worker,
@@ -61,9 +62,10 @@ _Flist :: struct {
 	since: i64,
 }
 
-file_store_init :: proc(fs: ^File_Store, l: ^prim.Loop, vfs: prim.Vfs, root: string, sync_threads := 4, allocator := context.allocator) -> Error {
+file_store_init :: proc(fs: ^File_Store, l: ^prim.Loop, vfs: prim.Vfs, root: string, sync_threads := 4, lay := LAYOUT_SECTOR, group := Group_Commit{}, allocator := context.allocator) -> Error {
 	fs^ = {
 		vfs       = vfs,
+		lay       = lay,
 		loop      = l,
 		allocator = allocator,
 	}
@@ -83,6 +85,7 @@ file_store_init :: proc(fs: ^File_Store, l: ^prim.Loop, vfs: prim.Vfs, root: str
 		delete(fs.root, allocator)
 		return err
 	}
+	fs.worker.group = group
 	return .None
 }
 
@@ -120,6 +123,7 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		object_read = _fs_object_read,
 		object_fd = _fs_object_fd,
 		object_close = _fs_object_close,
+		object_remove = _fs_object_remove,
 	}
 }
 
@@ -127,7 +131,7 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 _fs_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err: Error) {
 	fs := cast(^File_Store)data
 	dir := space_paths(fs.vfs, fs.root, id, fs.allocator) or_return
-	usage, _ = space_usage_scan(fs.vfs, dir, fs.allocator)
+	usage, _ = space_usage_scan(fs.vfs, dir, fs.allocator, fs.lay.base)
 	ns, aerr := new(_Fns, fs.allocator)
 	if aerr != nil {
 		delete(dir, fs.allocator)
@@ -150,7 +154,7 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 	fs := cast(^File_Store)data
 	ns := cast(^_Fns)h
 	pbuf: prim.Path_Buf = ---
-	f := stream_file_open(fs.vfs, stream_path(&pbuf, ns.dir, id), create, fs.scratch) or_return
+	f := stream_file_open(fs.vfs, stream_path(&pbuf, ns.dir, id), create, fs.scratch, fs.lay) or_return
 	st, aerr := new(_Fstream, fs.allocator)
 	if aerr != nil {
 		prim.close_file(fs.vfs, f.fd)
@@ -180,14 +184,14 @@ _fs_stream_probe :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64
 	fs := cast(^File_Store)data
 	ns := cast(^_Fns)h
 	pbuf: prim.Path_Buf = ---
-	return stream_file_size(fs.vfs, stream_path(&pbuf, ns.dir, id), fs.scratch)
+	return stream_file_size(fs.vfs, stream_path(&pbuf, ns.dir, id), fs.scratch, fs.lay)
 }
 
 @(private)
 _fs_stream_read :: proc(data: rawptr, s: rawptr, at: i64, dst: []u8) -> (int, Error) {
 	fs := cast(^File_Store)data
 	st := cast(^_Fstream)s
-	n, err := prim.read_at(fs.vfs, st.fd, dst, STREAM_BASE + at)
+	n, err := prim.read_at(fs.vfs, st.fd, dst, fs.lay.base + at)
 	return n, _from_prim(err)
 }
 
@@ -195,7 +199,7 @@ _fs_stream_read :: proc(data: rawptr, s: rawptr, at: i64, dst: []u8) -> (int, Er
 _fs_stream_fd :: proc(data: rawptr, s: rawptr) -> (fd: prim.Fd, base: i64, ok: bool) {
 	fs := cast(^File_Store)data
 	st := cast(^_Fstream)s
-	return st.fd, STREAM_BASE, fs.vfs.procs == prim.os_vfs().procs
+	return st.fd, fs.lay.base, fs.vfs.procs == prim.os_vfs().procs
 }
 
 @(private)
@@ -224,7 +228,7 @@ _fs_append_write :: proc(data: rawptr, w: rawptr, bytes: []u8) -> Error {
 	fs := cast(^File_Store)data
 	a := cast(^_Fappend)w
 	if a.failed == .None {
-		if err := prim.write_at(fs.vfs, a.st.fd, bytes, STREAM_BASE + a.pos); err != .None {
+		if err := prim.write_at(fs.vfs, a.st.fd, bytes, fs.lay.base + a.pos); err != .None {
 			a.failed = _from_prim(err)
 		} else {
 			xxhash.XXH64_update(&a.hash, bytes)
@@ -255,7 +259,7 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 	}
 	new_len := a.at + a.total
 	if err == .None {
-		err = slot_write(fs.vfs, st.fd, Slot{seq = st.seq + 1, value = new_len, start = a.at, hash = xxhash.XXH64_digest(&a.hash)})
+		err = slot_write(fs.vfs, st.fd, Slot{seq = st.seq + 1, value = new_len, start = a.at, hash = xxhash.XXH64_digest(&a.hash)}, fs.lay.spacing)
 	}
 	_fs_append_free(fs, a)
 	if err != .None {
@@ -269,6 +273,7 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 	}
 	job^ = {
 		vfs    = fs.vfs,
+		lay    = fs.lay,
 		kind   = .Stream_Sync,
 		fd     = st.fd,
 		value  = new_len,
@@ -307,9 +312,10 @@ _fs_drop :: proc(data: rawptr, h: rawptr, id: Stream_Id, done: Storage_Done, ctx
 	}
 	job^ = {
 		vfs    = fs.vfs,
+		lay    = fs.lay,
 		kind  = .Remove,
 		fd    = prim.INVALID_FD,
-		value = max(size - STREAM_BASE, 0),
+		value = max(size - fs.lay.base, 0),
 		done  = done,
 		ctx   = ctx,
 	}
@@ -337,6 +343,7 @@ _fs_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, c
 	}
 	job^ = {
 		vfs    = fs.vfs,
+		lay    = fs.lay,
 		kind   = .Redact,
 		fd     = st.fd,
 		value  = st.length,
@@ -488,6 +495,7 @@ _fs_put_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawptr)
 	}
 	job^ = {
 		vfs    = fs.vfs,
+		lay    = fs.lay,
 		kind  = .Object_Commit,
 		fd    = p.fd,
 		path  = p.tmp,
@@ -527,6 +535,37 @@ _fs_object_open :: proc(data: rawptr, h: rawptr, key: Object_Key) -> (o: rawptr,
 	}
 	ob.fd = fd
 	return ob, sz, .None
+}
+
+@(private)
+_fs_object_remove :: proc(data: rawptr, h: rawptr, key: Object_Key, done: Storage_Done, ctx: rawptr) {
+	fs := cast(^File_Store)data
+	ns := cast(^_Fns)h
+	pbuf: prim.Path_Buf = ---
+	path := object_path(&pbuf, ns.dir, key)
+	st, serr := prim.stat(fs.vfs, path)
+	if serr != .None {
+		done(ctx, .None, 0)
+		return
+	}
+	job, jerr := new(Job, fs.allocator)
+	if jerr != nil {
+		done(ctx, .No_Memory, 0)
+		return
+	}
+	job^ = {
+		vfs   = fs.vfs,
+		kind  = .Remove,
+		fd    = prim.INVALID_FD,
+		value = st.size,
+		done  = done,
+		ctx   = ctx,
+	}
+	job.path, _ = _clone_string(path, fs.allocator)
+	if err := worker_submit(&fs.worker, job); err != .None {
+		job.result = err
+		_fs_job_done(fs, job)
+	}
 }
 
 @(private)

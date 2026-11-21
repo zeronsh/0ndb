@@ -1,6 +1,7 @@
 package osync
 
 import "core:crypto"
+import "core:hash/xxhash"
 import "../journal"
 import "../prim"
 
@@ -114,6 +115,7 @@ _verdict :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> Verdict {
 	if r.cfg.verify == nil {
 		return .Accept
 	}
+	before := rm.span
 	req := Verify_Request {
 		device  = rm.device,
 		name    = rm.name,
@@ -122,8 +124,14 @@ _verdict :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> Verdict {
 		replica = &rm.rep,
 		from    = from,
 		to      = to,
+		span    = &rm.span,
+		span_ok = &rm.span_ok,
 	}
-	return r.cfg.verify(r.cfg.user, &req)
+	v := r.cfg.verify(r.cfg.user, &req)
+	if v == .Accept && rm.span_ok && (rm.span.off != before.off || rm.span.head != before.head) {
+		_span_save(r, rm)
+	}
+	return v
 }
 
 @(private)
@@ -193,40 +201,7 @@ _clz64 :: proc "contextless" (v: u64) -> u64 {
 	return n
 }
 
-@(private)
-_vsize :: proc(r: ^Replicator, real: i64) -> i64 {
-	n := real + 8
-	return padme(n) if r.cfg.padding else n
-}
 
-@(private)
-_vread :: proc(p: ^Put_Job, pos: i64, dst: []u8) -> Error {
-	at := pos
-	out := dst
-	for len(out) > 0 {
-		switch {
-		case at < 8:
-			out[0] = u8(p.real >> u64(8 * at))
-			out = out[1:]
-			at += 1
-		case at - 8 < p.real:
-			k := int(min(p.real - (at - 8), i64(len(out))))
-			if p.data != nil {
-				copy(out[:k], p.data[at - 8:][:k])
-			} else if got, err := prim.read_at(p.vfs, p.fd, out[:k], at - 8); err != .None || got != k {
-				return .Io
-			}
-			out = out[k:]
-			at += i64(k)
-		case:
-			for &b in out {
-				b = 0
-			}
-			out = out[len(out):]
-		}
-	}
-	return .None
-}
 
 @(private)
 _feed_cursor_load :: proc(r: ^Replicator) {
@@ -278,4 +253,72 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 		}
 	}
 	_fetch_check(r)
+}
+
+@(private)
+SPAN_REC :: 128
+
+@(private)
+_span_load :: proc(r: ^Replicator, rm: ^Remote, replica_path: string) {
+	path, err := _concat(context.temp_allocator, replica_path, ".span")
+	if err != .None {
+		return
+	}
+	fd, oerr := prim.open_file(r.vfs, path, {.Write}, 0o600)
+	if oerr == .Not_Found {
+		fd, oerr = prim.open_file(r.vfs, path, {.Write, .Create}, 0o600)
+	}
+	if oerr != .None {
+		return
+	}
+	rm.span_fd = fd
+	b: [2 * SPAN_REC]u8
+	n, rerr := prim.read_at(r.vfs, fd, b[:], 0)
+	if rerr != .None {
+		return
+	}
+	best: u64
+	for i in 0 ..< 2 {
+		if (i + 1) * SPAN_REC > n {
+			break
+		}
+		rec := b[i * SPAN_REC:][:SPAN_REC]
+		if xxhash.XXH3_64_with_seed(rec[:112], SPAN_SEED) != prim.get_u64le(rec[112:]) {
+			continue
+		}
+		seq := prim.get_u64le(rec[0:])
+		if seq <= best {
+			continue
+		}
+		best = seq
+		rm.span_seq = seq
+		rm.span.off = i64(prim.get_u64le(rec[8:]))
+		rm.span.end = i64(prim.get_u64le(rec[16:]))
+		rm.span.range_start = i64(prim.get_u64le(rec[24:]))
+		copy(rm.span.prev_head[:], rec[32:64])
+		copy(rm.span.head[:], rec[64:96])
+		rm.span_ok = true
+	}
+}
+
+@(private)
+SPAN_SEED :: 0x7370_616e
+
+@(private)
+_span_save :: proc(r: ^Replicator, rm: ^Remote) {
+	if rm.span_fd < 0 {
+		return
+	}
+	rm.span_seq += 1
+	rec: [SPAN_REC]u8
+	prim.put_u64le(rec[0:], rm.span_seq)
+	prim.put_u64le(rec[8:], u64(rm.span.off))
+	prim.put_u64le(rec[16:], u64(rm.span.end))
+	prim.put_u64le(rec[24:], u64(rm.span.range_start))
+	copy(rec[32:64], rm.span.prev_head[:])
+	copy(rec[64:96], rm.span.head[:])
+	prim.put_u64le(rec[112:], xxhash.XXH3_64_with_seed(rec[:112], SPAN_SEED))
+	if prim.write_at(r.vfs, rm.span_fd, rec[:], i64(rm.span_seq & 1) * SPAN_REC) == .None {
+		prim.datasync(r.vfs, rm.span_fd)
+	}
 }

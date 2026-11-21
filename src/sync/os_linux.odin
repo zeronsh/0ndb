@@ -226,7 +226,7 @@ _unlink_stale :: proc(ep: ^Endpoint) {
 }
 
 @(private)
-_accept :: proc "contextless" (lfd: prim.Fd) -> (prim.Fd, Error) {
+_accept :: proc "contextless" (lfd: prim.Fd) -> (prim.Fd, [16]u8, Error) {
 	for {
 		sa: linux.Sock_Addr_Any
 		fd, err := linux.accept(linux.Fd(lfd), &sa, {.CLOEXEC, .NONBLOCK})
@@ -234,9 +234,18 @@ _accept :: proc "contextless" (lfd: prim.Fd) -> (prim.Fd, Error) {
 			continue
 		}
 		if err != .NONE {
-			return prim.INVALID_FD, _errno(err)
+			return prim.INVALID_FD, {}, _errno(err)
 		}
-		return prim.Fd(fd), .None
+		src: [16]u8
+		#partial switch sa.family {
+		case .INET:
+			src[10] = 0xff
+			src[11] = 0xff
+			copy(src[12:], sa.ipv4.sin_addr[:])
+		case .INET6:
+			src = sa.ipv6.sin6_addr
+		}
+		return prim.Fd(fd), src, .None
 	}
 }
 

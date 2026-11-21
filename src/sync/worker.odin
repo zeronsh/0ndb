@@ -25,6 +25,7 @@ Job :: struct {
 	seq:     u64,
 	from:    i64,
 	to:      i64,
+	lay:     Layout,
 	target:  rawptr,
 	done:    Storage_Done,
 	ctx:     rawptr,
@@ -46,6 +47,8 @@ Worker :: struct {
 	loop:      ^prim.Loop,
 	on_done:   proc(data: rawptr, job: ^Job),
 	data:      rawptr,
+	inline_q:  [dynamic]^Job,
+	group:     Group_Commit,
 	allocator: runtime.Allocator,
 }
 
@@ -58,6 +61,7 @@ worker_init :: proc(w: ^Worker, l: ^prim.Loop, limit: int, on_done: proc(data: r
 		allocator = allocator,
 	}
 	w.threads = make([dynamic]^thread.Thread, allocator)
+	w.inline_q = make([dynamic]^Job, allocator)
 	_notifier_open(&w.notifier) or_return
 	wt, err := prim.watch(l, _notifier_fd(&w.notifier), {.Read}, w, _worker_ready)
 	if err != .None {
@@ -83,14 +87,19 @@ worker_destroy :: proc(w: ^Worker) {
 		prim.unwatch(w.loop, w.watch)
 	}
 	_notifier_close(&w.notifier)
+	delete(w.inline_q)
 	w.threads = nil
 }
 
 worker_submit :: proc(w: ^Worker, job: ^Job) -> Error {
 	job.next = nil
 	if w.limit == 0 {
-		_job_run(job)
-		w.on_done(w.data, job)
+		if _, e := append(&w.inline_q, job); e != nil {
+			return .No_Memory
+		}
+		if len(w.inline_q) == 1 {
+			_notifier_signal(&w.notifier)
+		}
 		return .None
 	}
 	csync.mutex_lock(&w.mutex)
@@ -150,6 +159,29 @@ _worker_main :: proc(data: rawptr) {
 _worker_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
 	w := cast(^Worker)data
 	_notifier_drain(&w.notifier)
+	if len(w.inline_q) > 0 {
+		jobs := w.inline_q
+		w.inline_q = make([dynamic]^Job, w.allocator)
+		if w.group.begin != nil {
+			w.group.begin(w.group.data)
+		}
+		for j in jobs {
+			_job_run(j)
+		}
+		if w.group.end != nil {
+			if gerr := w.group.end(w.group.data); gerr != .None {
+				for j in jobs {
+					if j.result == .None {
+						j.result = gerr
+					}
+				}
+			}
+		}
+		for j in jobs {
+			w.on_done(w.data, j)
+		}
+		delete(jobs)
+	}
 	csync.mutex_lock(&w.mutex)
 	list := w.done
 	w.done = nil
@@ -203,12 +235,12 @@ _job_run :: proc(job: ^Job) {
 			job.result = _from_prim(prim.sync_dir(job.vfs, prim.dir_name(final)))
 		}
 	case .Redact:
-		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value})
+		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value}, job.lay.spacing)
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
 		}
 		if job.result == .None {
-			job.result = _redact_records(job.vfs, job.fd, job.from, job.to)
+			job.result = _redact_records(job.vfs, job.fd, job.from, job.to, job.lay.base)
 		}
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
@@ -222,4 +254,10 @@ _job_run :: proc(job: ^Job) {
 			job.result = _from_prim(prim.sync_dir(job.vfs, prim.dir_name(path)))
 		}
 	}
+}
+
+Group_Commit :: struct {
+	data:  rawptr,
+	begin: proc(data: rawptr),
+	end:   proc(data: rawptr) -> Error,
 }

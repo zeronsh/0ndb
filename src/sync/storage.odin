@@ -30,4 +30,5 @@ Relay_Storage :: struct {
 	object_read:     proc(data: rawptr, o: rawptr, at: i64, dst: []u8) -> (int, Error),
 	object_fd:       proc(data: rawptr, o: rawptr) -> (fd: prim.Fd, base: i64, ok: bool),
 	object_close:    proc(data: rawptr, o: rawptr),
+	object_remove:   proc(data: rawptr, ns: rawptr, key: Object_Key, done: Storage_Done, ctx: rawptr),
 }
