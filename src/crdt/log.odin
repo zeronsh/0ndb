@@ -7,8 +7,8 @@ Log_Entry :: struct {
 	len:  int,
 	pos:  int,
 	at:   int,
-	au:   int,
-	nau:  int,
+	au:   u32,
+	nau:  u32,
 	kind: Op_Kind,
 	red:  bool,
 }
@@ -75,9 +75,10 @@ log_store :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) -> (e: Log_Ent
 	case .Insert_Copy:
 		e.at = len(log.bytes)
 		resize(&log.bytes, e.at + run.len)
-		e.au = len(log.authors)
+		au := len(log.authors)
 		err = copy_resolve(log, g, lv, run, log.bytes[e.at:][:run.len])
-		e.nau = len(log.authors) - e.au
+		e.au = u32(au)
+		e.nau = u32(len(log.authors) - au)
 	}
 	return
 }
@@ -214,6 +215,13 @@ log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) -> Error {
 			}
 		}
 	}
+	if run.kind == .Insert {
+		at := len(log.bytes)
+		append(&log.bytes, ..run.content[:run.len])
+		append(&log.entries, Log_Entry{lv = lv, len = run.len, pos = run.pos, at = at, kind = .Insert})
+		log_redact_new(log, g, lv, run.len)
+		return .None
+	}
 	e, err := log_store(log, g, lv, run)
 	append(&log.entries, e)
 	log_redact_new(log, g, lv, run.len)
@@ -259,33 +267,33 @@ log_split :: proc(log: ^Text_Log, lv: Lv) {
 	case .Insert_Copy:
 		right.pos = e.pos + k
 		right.at = e.at + k
-		right.au = len(log.authors)
+		right.au = u32(len(log.authors))
 		off := 0
-		cut := e.nau
-		for j in 0 ..< e.nau {
-			a := log.authors[e.au + j]
+		cut := int(e.nau)
+		for j in 0 ..< int(e.nau) {
+			a := log.authors[int(e.au) + j]
 			if off + a.len > k {
 				d := max(k - off, 0)
-				if cut == e.nau {
+				if cut == int(e.nau) {
 					cut = j
 				}
 				append(&log.authors, Copy_Author{a.len - d, a.seq + u64(d), a.actor})
 			}
 			off += a.len
 		}
-		right.nau = len(log.authors) - right.au
+		right.nau = u32(len(log.authors)) - right.au
 		left := &log.entries[i]
-		if cut < e.nau {
+		if cut < int(e.nau) {
 			lead := k
 			for j in 0 ..< cut {
-				lead -= log.authors[e.au + j].len
+				lead -= log.authors[int(e.au) + j].len
 			}
 			if lead > 0 {
-				log.authors[e.au + cut].len = lead
+				log.authors[int(e.au) + cut].len = lead
 				cut += 1
 			}
 		}
-		left.nau = cut
+		left.nau = u32(cut)
 	case .Delete_Back:
 		right.pos = e.pos - k
 	}
@@ -333,7 +341,7 @@ log_redact :: proc(log: ^Text_Log, g: ^Graph, actor: prim.Id, seq: u64, n: int) 
 log_add_batch :: proc(log: ^Text_Log, g: ^Graph, b: ^Batch, target: Op_Id, first: Lv, skip: int) -> (err: Error) {
 	lv := first
 	rest := skip
-	for op in b.ops {
+	for &op in b.ops {
 		if rest >= op.len {
 			rest -= op.len
 			continue
@@ -401,7 +409,7 @@ log_trim :: proc(log: ^Text_Log, floor: Lv) {
 			keep += e.len
 		case .Insert_Copy:
 			keep += e.len
-			nau += e.nau
+			nau += int(e.nau)
 		case .Insert_Ref:
 			nrefs += 1
 		}
@@ -418,7 +426,7 @@ log_trim :: proc(log: ^Text_Log, floor: Lv) {
 			if e.kind == .Insert_Copy {
 				au := len(authors)
 				append(&authors, ..log.authors[e.au:][:e.nau])
-				e.au = au
+				e.au = u32(au)
 			}
 		case .Insert_Ref:
 			append(&refs, log.refs[e.at])

@@ -11,6 +11,16 @@ Text :: struct {
 	version:   [dynamic]Lv,
 	ids:       Index,
 	ids_on:    bool,
+	authors:   [dynamic]Override,
+}
+
+@(private)
+Override :: struct {
+	seq:    u64,
+	aseq:   u64,
+	len:    int,
+	actor:  u32,
+	aactor: u32,
 }
 
 @(private)
@@ -36,6 +46,7 @@ text_init :: proc(t: ^Text, allocator := context.allocator) {
 	tree_init(&t.rope, allocator)
 	tree_init(&t.spans, allocator)
 	t.version = make([dynamic]Lv, allocator)
+	t.authors = make([dynamic]Override, allocator)
 }
 
 text_destroy :: proc(t: ^Text) {
@@ -45,6 +56,7 @@ text_destroy :: proc(t: ^Text) {
 		tree_destroy(&t.ids)
 	}
 	delete(t.version)
+	delete(t.authors)
 	t^ = {}
 }
 
@@ -55,6 +67,7 @@ text_clone :: proc(dst: ^Text, src: ^Text, allocator := context.allocator) {
 	tree_clone(&dst.rope, &src.rope, allocator)
 	tree_clone(&dst.spans, &src.spans, allocator)
 	append(&dst.version, ..src.version[:])
+	append(&dst.authors, ..src.authors[:])
 }
 
 text_len :: proc "contextless" (t: ^Text) -> int {
@@ -87,21 +100,86 @@ text_spans :: proc(t: ^Text, g: ^Graph, allocator := context.allocator) -> []Aut
 				continue
 			}
 			if have {
-				append(&out, author_span(g, prev))
+				author_emit(t, g, prev, &out)
 			}
 			prev = s
 			have = true
 		}
 	}
 	if have {
-		append(&out, author_span(g, prev))
+		author_emit(t, g, prev, &out)
 	}
 	return out[:]
 }
 
 @(private)
-author_span :: proc(g: ^Graph, s: Span) -> Author_Span {
-	return Author_Span{id = Op_Id{g.actors[s.aactor], s.aseq}, op = Op_Id{g.actors[s.actor], s.seq}, len = s.len, redacted = s.red}
+override_first :: proc "contextless" (t: ^Text, actor: u32, seq: u64) -> int {
+	o := t.authors[:]
+	lo, hi := 0, len(o)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if o[mid].actor < actor || o[mid].actor == actor && o[mid].seq + u64(o[mid].len) <= seq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+@(private)
+override_add :: proc(t: ^Text, actor: u32, seq: u64, aactor: u32, aseq: u64, n: int) {
+	if n <= 0 || (actor == aactor && seq == aseq) {
+		return
+	}
+	i := override_first(t, actor, seq)
+	if i < len(t.authors) && t.authors[i].actor == actor && t.authors[i].seq <= seq {
+		return
+	}
+	if i > 0 {
+		p := &t.authors[i - 1]
+		if p.actor == actor && p.aactor == aactor && p.seq + u64(p.len) == seq && p.aseq + u64(p.len) == aseq {
+			p.len += n
+			return
+		}
+	}
+	inject_at(&t.authors, i, Override{seq = seq, aseq = aseq, len = n, actor = actor, aactor = aactor})
+}
+
+@(private)
+author_push :: proc(out: ^[dynamic]Author_Span, a: Author_Span) {
+	if n := len(out); n > 0 {
+		l := &out[n - 1]
+		if l.redacted == a.redacted && l.op.actor == a.op.actor && l.id.actor == a.id.actor && l.op.seq + u64(l.len) == a.op.seq && l.id.seq + u64(l.len) == a.id.seq {
+			l.len += a.len
+			return
+		}
+	}
+	append(out, a)
+}
+
+@(private)
+author_emit :: proc(t: ^Text, g: ^Graph, s: Span, out: ^[dynamic]Author_Span) {
+	own := g.actors[s.actor]
+	cur := s.seq
+	end := s.seq + u64(s.len)
+	i := override_first(t, s.actor, cur) if len(t.authors) > 0 else 0
+	for cur < end {
+		if i < len(t.authors) && t.authors[i].actor == s.actor && t.authors[i].seq < end {
+			o := t.authors[i]
+			if o.seq > cur {
+				author_push(out, Author_Span{id = Op_Id{own, cur}, op = Op_Id{own, cur}, len = int(o.seq - cur), redacted = s.red})
+				cur = o.seq
+			}
+			b := min(end, o.seq + u64(o.len))
+			author_push(out, Author_Span{id = Op_Id{g.actors[o.aactor], o.aseq + (cur - o.seq)}, op = Op_Id{own, cur}, len = int(b - cur), redacted = s.red})
+			cur = b
+			i += 1
+		} else {
+			author_push(out, Author_Span{id = Op_Id{own, cur}, op = Op_Id{own, cur}, len = int(end - cur), redacted = s.red})
+			cur = end
+		}
+	}
 }
 
 text_author :: proc(t: ^Text, g: ^Graph, pos: int) -> (author: Op_Id, op: Op_Id, ok: bool) {
@@ -109,7 +187,14 @@ text_author :: proc(t: ^Text, g: ^Graph, pos: int) -> (author: Op_Id, op: Op_Id,
 	if !found {
 		return {}, {}, false
 	}
-	return Op_Id{g.actors[s.aactor], s.aseq + u64(off)}, Op_Id{g.actors[s.actor], s.seq + u64(off)}, true
+	seq := s.seq + u64(off)
+	op = Op_Id{g.actors[s.actor], seq}
+	author = op
+	if i := override_first(t, s.actor, seq); i < len(t.authors) && t.authors[i].actor == s.actor && t.authors[i].seq <= seq {
+		o := t.authors[i]
+		author = Op_Id{g.actors[o.aactor], o.aseq + (seq - o.seq)}
+	}
+	return author, op, true
 }
 
 text_from :: proc(t: ^Text, g: ^Graph, data: []u8, spans: []Author_Span, version: []Op_Id, allocator := context.allocator) -> Error {
@@ -134,14 +219,15 @@ text_from :: proc(t: ^Text, g: ^Graph, data: []u8, spans: []Author_Span, version
 	defer delete(parts)
 	for s in spans {
 		sp := Span {
-			len    = s.len,
-			seq    = s.op.seq,
-			aseq   = s.id.seq,
-			actor  = graph_intern(g, s.op.actor),
-			aactor = graph_intern(g, s.id.actor),
-			red    = s.redacted,
+			len   = s.len,
+			seq   = s.op.seq,
+			actor = graph_intern(g, s.op.actor),
+			red   = s.redacted,
 		}
 		run_insert(&t.spans, pos, sp)
+		if s.id != s.op {
+			override_add(t, sp.actor, sp.seq, graph_intern(g, s.id.actor), s.id.seq, s.len)
+		}
 		if s.redacted {
 			append(&parts, Red_Part{pos, sp})
 		} else {
@@ -267,38 +353,41 @@ shift_point :: proc "contextless" (x, pos, n: int) -> int {
 doc_insert :: proc(m: ^Merge, pos: int, data: []u8, actor: u32, seq: u64, red := false, aactor := NO_ACTOR, aseq: u64 = 0) {
 	at := clamp(pos, 0, text_len(m.t))
 	rope_insert(&m.t.rope, at, data)
-	sp := Span {
-		len    = len(data),
-		seq    = seq,
-		aseq   = seq if aactor == NO_ACTOR else aseq,
-		actor  = actor,
-		aactor = actor if aactor == NO_ACTOR else aactor,
-		red    = red,
+	run_insert(&m.t.spans, at, Span{len(data), seq, actor, red}, &m.t.ids if m.t.ids_on else nil)
+	if aactor != NO_ACTOR {
+		override_add(m.t, actor, seq, aactor, aseq, len(data))
 	}
-	run_insert(&m.t.spans, at, sp, &m.t.ids if m.t.ids_on else nil)
 	conflict_shift(m, true, at, len(data))
 }
 
 @(private)
-doc_insert_piece :: proc(m: ^Merge, at: int, e: Log_Entry, k: int, n: int, lv: Lv) {
+doc_insert_piece :: proc(m: ^Merge, at: int, e: ^Log_Entry, k: int, n: int, lv: Lv) {
 	actor, seq := graph_op(m.g, lv)
 	if e.kind == .Insert && !e.red {
 		doc_insert(m, at, m.log.bytes[e.at + k:][:n], actor, seq)
-		return
+	} else if e.kind == .Insert_Copy {
+		doc_insert_copy(m, at, e, k, n, actor, seq)
+	} else {
+		doc_insert_chunks(m, at, e, k, n, actor, seq)
 	}
-	if e.kind == .Insert_Copy {
-		off := 0
-		for a in m.log.authors[e.au:][:e.nau] {
-			lo := max(off, k)
-			hi := min(off + a.len, k + n)
-			if hi > lo {
-				d := lo - k
-				doc_insert(m, at + d, m.log.bytes[e.at + lo:][:hi - lo], actor, seq + u64(d), e.red, a.actor, a.seq + u64(lo - off))
-			}
-			off += a.len
+}
+
+@(private)
+doc_insert_copy :: proc(m: ^Merge, at: int, e: ^Log_Entry, k: int, n: int, actor: u32, seq: u64) {
+	off := 0
+	for a in m.log.authors[e.au:][:e.nau] {
+		lo := max(off, k)
+		hi := min(off + a.len, k + n)
+		if hi > lo {
+			d := lo - k
+			doc_insert(m, at + d, m.log.bytes[e.at + lo:][:hi - lo], actor, seq + u64(d), e.red, a.actor, a.seq + u64(lo - off))
 		}
-		return
+		off += a.len
 	}
+}
+
+@(private)
+doc_insert_chunks :: proc(m: ^Merge, at: int, e: ^Log_Entry, k: int, n: int, actor: u32, seq: u64) {
 	buf: [4096]u8
 	done := 0
 	for done < n {
@@ -379,9 +468,9 @@ piece_pos :: proc "contextless" (e: Log_Entry, k: int) -> int {
 
 @(private)
 apply_direct :: proc(m: ^Merge, p: Piece) {
-	e := m.log.entries[p.entry]
+	e := &m.log.entries[p.entry]
 	k := p.lv - e.lv
-	at, _, cnt := effect(e.kind, piece_pos(e, k), p.len, text_len(m.t))
+	at, _, cnt := effect(e.kind, piece_pos(e^, k), p.len, text_len(m.t))
 	if cnt == 0 {
 		return
 	}
@@ -447,11 +536,11 @@ walk_piece :: proc(m: ^Merge, tr: ^Tracker, heads: ^[dynamic]Lv, p: Piece, side:
 	buf: [1]Lv
 	ps := graph_parents(g, p.lv, &buf)
 	tr_move(tr, g, m.log, ps)
-	e := m.log.entries[p.entry]
+	e := &m.log.entries[p.entry]
 	k := p.lv - e.lv
 	size := tr.items.total[CUR] - tr.tail if emit else tr.items.total[CUR]
 	out := m if emit else nil
-	at, s, cnt := effect(e.kind, piece_pos(e, k), p.len, size)
+	at, s, cnt := effect(e.kind, piece_pos(e^, k), p.len, size)
 	if cnt > 0 {
 		switch e.kind {
 		case .Insert, .Insert_Ref, .Insert_Copy:
@@ -804,7 +893,7 @@ text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id
 	size: int
 	have := false
 	rest := skip
-	for op in b.ops {
+	for &op in b.ops {
 		if rest >= op.len {
 			rest -= op.len
 			continue

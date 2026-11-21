@@ -247,9 +247,9 @@ graph_records :: proc "contextless" (g: ^Graph) -> int {
 }
 
 graph_add :: proc(g: ^Graph, b: ^Batch) -> (first: Lv, skip: int, err: Error) {
-	n := batch_check_ops(b) or_return
+	n, copies := batch_check_ops(b) or_return
 	first, skip = graph_add_header(g, b.actor, b.seq, b.lamport, b.parents, n) or_return
-	if skip >= n {
+	if skip >= n || !copies {
 		return
 	}
 	own := graph_intern(g, b.actor)
@@ -267,28 +267,28 @@ graph_add :: proc(g: ^Graph, b: ^Batch) -> (first: Lv, skip: int, err: Error) {
 }
 
 @(private)
-batch_check_ops :: proc(b: ^Batch) -> (int, Error) {
-	n := 0
+batch_check_ops :: proc(b: ^Batch) -> (n: int, copies: bool, err: Error) {
 	for &op in b.ops {
 		if op.len <= 0 || op.len > MAX_RUN || op.pos < -MAX_RUN || op.pos > MAX_POS {
-			return 0, .Invalid
+			return 0, false, .Invalid
 		}
 		if op.kind == .Insert && len(op.content) != op.len || op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS || op.ref.oid.len != 20 && op.ref.oid.len != 32) {
-			return 0, .Invalid
+			return 0, false, .Invalid
 		}
+		copies ||= op.kind == .Insert_Copy
 		if op.kind == .Insert_Copy && op.src.seq >= MAX_COUNTER - u64(op.len) {
-			return 0, .Invalid
+			return 0, false, .Invalid
 		}
 		n += op.len
 		if n > MAX_RUN {
-			return 0, .Invalid
+			return 0, false, .Invalid
 		}
 	}
-	return n, .None
+	return n, copies, .None
 }
 
 graph_check :: proc(g: ^Graph, b: ^Batch, parents: ^[dynamic]Lv) -> (skip: int, err: Error) {
-	n := batch_check_ops(b) or_return
+	n, _ := batch_check_ops(b) or_return
 	skip, _, err = check_header(g, b.actor, b.seq, b.lamport, b.parents, n)
 	clear(parents)
 	append(parents, ..g.tmp[:])

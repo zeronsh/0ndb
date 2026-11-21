@@ -178,18 +178,20 @@ decode :: proc(d: ^Decoder, data: []u8, dict: ^Actor_Dict = nil) -> (b: Batch, e
 	if r.err != .None || na == 0 || na > u64(prim.reader_remaining(&r)) {
 		return {}, .Corrupt
 	}
-	for _ in 0 ..< int(na) {
-		if format == BATCH_FORMAT {
+	if format == BATCH_FORMAT {
+		for _ in 0 ..< int(na) {
 			append(&d.actors, prim.read_id(&r))
-			continue
 		}
-		ref := prim.read_uvarint(&r)
-		if ref == 0 {
-			append(&d.actors, prim.read_id(&r))
-		} else if ref - 1 < u64(len(dict.ids)) {
-			append(&d.actors, dict.ids[ref - 1])
-		} else {
-			return {}, .Corrupt
+	} else {
+		for _ in 0 ..< int(na) {
+			ref := prim.read_uvarint(&r)
+			if ref == 0 {
+				append(&d.actors, prim.read_id(&r))
+			} else if ref - 1 < u64(len(dict.ids)) {
+				append(&d.actors, dict.ids[ref - 1])
+			} else {
+				return {}, .Corrupt
+			}
 		}
 	}
 	if r.err != .None {
@@ -237,11 +239,11 @@ decode :: proc(d: ^Decoder, data: []u8, dict: ^Actor_Dict = nil) -> (b: Batch, e
 		if r.err != .None || n == 0 || n > MAX_RUN {
 			return {}, .Corrupt
 		}
-		op := Op_Run {
-			target = target,
-			kind   = kind,
-			len    = int(n),
-		}
+		append(&d.ops, Op_Run{})
+		op := &d.ops[len(d.ops) - 1]
+		op.target = target
+		op.kind = kind
+		op.len = int(n)
 		if kind != .Opaque {
 			delta := prim.read_ivarint(&r)
 			if delta < -MAX_POS || delta > MAX_POS {
@@ -291,7 +293,6 @@ decode :: proc(d: ^Decoder, data: []u8, dict: ^Actor_Dict = nil) -> (b: Batch, e
 		if total > MAX_RUN {
 			return {}, .Corrupt
 		}
-		append(&d.ops, op)
 	}
 	if !prim.reader_done(&r) || b.seq >= MAX_COUNTER - u64(total) || b.lamport == 0 || b.lamport >= MAX_COUNTER - u64(total) {
 		return {}, .Corrupt

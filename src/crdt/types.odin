@@ -64,14 +64,18 @@ Copy_Source :: struct {
 	read: proc(data: rawptr, src: Op_Id, dst: []u8, authors: ^[dynamic]Author_Span) -> int,
 }
 
+Op_Source :: struct #raw_union {
+	ref: Content_Ref,
+	src: Op_Id,
+}
+
 Op_Run :: struct {
 	target:  Op_Id,
 	kind:    Op_Kind,
 	pos:     int,
 	len:     int,
 	content: []u8,
-	ref:     Content_Ref,
-	src:     Op_Id,
+	using source: Op_Source,
 }
 
 Batch :: struct {
