@@ -35,6 +35,7 @@ Error :: enum u8 {
 	No_Space,
 	No_Memory,
 	Io,
+	Conflict,
 }
 
 Kind :: obj.Kind
@@ -255,6 +256,9 @@ Stats :: struct {
 	git_fetches:     u64,
 	git_objects:     u64,
 	over_budget:     u64,
+	buffers:     int,
+	buffer_deltas: u64,
+	buffer_edits: u64,
 }
 
 Engine :: struct {
@@ -302,6 +306,9 @@ Engine :: struct {
 	held:         [dynamic]^Pending_Cmd,
 	subs:         [dynamic]^Sub,
 	next_sub:     u64,
+	buffers:      [dynamic]^Buffer,
+	next_buffer:  u64,
+	cursor_inbox: [dynamic]Cursor_Msg,
 	tick:         u64,
 	tick_timer:   prim.Timer,
 	settle_timer: prim.Timer,
@@ -485,6 +492,7 @@ stats :: proc(e: ^Engine) -> Stats {
 	context = context_for(e)
 	s := e.stats
 	s.handles = len(e.handles)
+	s.buffers = len(e.buffers)
 	s.pending = len(e.waiters)
 	s.subs = len(e.subs)
 	return s
@@ -759,6 +767,7 @@ _tick_end :: proc(e: ^Engine) {
 	_mounts_commit(e)
 	_handles_commit(e)
 	_mounts_changed(e)
+	_buffers_tick(e)
 	_subs_deliver(e)
 	_full_step(e)
 	_index_step(e)
@@ -779,7 +788,7 @@ _tick_end :: proc(e: ^Engine) {
 
 @(private)
 _tick_pending :: proc(e: ^Engine) -> bool {
-	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || _remote_pending(e) {
+	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || _remote_pending(e) {
 		return true
 	}
 	for _, sp in e.spaces {
@@ -887,6 +896,7 @@ _log :: proc(e: ^Engine, level: Log_Level, msg: string) {
 _teardown :: proc(e: ^Engine) {
 	e.closing = true
 	_subs_free_all(e)
+	_buffers_free_all(e)
 	_waiters_fail_all(e, .Closed)
 	_space_waits_fail_all(e, .Closed)
 	_remote_close(e)

@@ -375,6 +375,7 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			clear(&f.rec.cp_spans)
 			append(&f.rec.cp_spans, ..crdt.text_spans(&f.text, &h.g, context.temp_allocator))
+			f.rec.spans_ext = false
 			f.rec.cp_text = fshist.Raw_Oid(oid)
 			f.rec.cp_len = i64(len(data))
 			f.rec.cp_count = f.rec.ops + u32(len(f.new_refs))
