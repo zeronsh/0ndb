@@ -625,3 +625,333 @@ export function indexedDBStore(name, idb = globalThis.indexedDB) {
     },
   };
 }
+
+function opLen(o, utf16) {
+  if (o.kind === 'insert') return utf16 ? o.text.length : enc.encode(o.text).length;
+  return o.n;
+}
+
+function pushOp(out, o) {
+  if (o.kind !== 'insert' && !(o.n > 0)) return;
+  if (o.kind === 'insert' && !o.text) return;
+  const l = out[out.length - 1];
+  if (l && l.kind === o.kind && o.kind !== 'insert') {
+    l.n += o.n;
+    return;
+  }
+  out.push({ ...o });
+}
+
+function trimOps(out) {
+  while (out.length && out[out.length - 1].kind === 'retain') out.pop();
+  return out;
+}
+
+export function transformDelta(a, b, utf16 = true) {
+  const ao = [], bo = [];
+  let i = 0, j = 0, ui = 0, uj = 0;
+  const peek = (ops, k, used) => (k < ops.length ? [ops[k], opLen(ops[k], utf16) - used] : [{ kind: 'retain' }, Infinity]);
+  for (;;) {
+    const [oa, ra] = peek(a, i, ui);
+    const [ob, rb] = peek(b, j, uj);
+    if (i >= a.length && j >= b.length) break;
+    if (i < a.length && oa.kind === 'insert') {
+      pushOp(ao, oa);
+      pushOp(bo, { kind: 'retain', n: ra });
+      i++; ui = 0;
+      continue;
+    }
+    if (j < b.length && ob.kind === 'insert') {
+      pushOp(ao, { kind: 'retain', n: rb });
+      pushOp(bo, ob);
+      j++; uj = 0;
+      continue;
+    }
+    const k = Math.min(ra, rb);
+    if (oa.kind === 'retain' && ob.kind === 'retain') {
+      pushOp(ao, { kind: 'retain', n: k });
+      pushOp(bo, { kind: 'retain', n: k });
+    } else if (oa.kind === 'delete' && ob.kind === 'retain') {
+      pushOp(ao, { kind: 'delete', n: k });
+    } else if (oa.kind === 'retain' && ob.kind === 'delete') {
+      pushOp(bo, { kind: 'delete', n: k });
+    }
+    if (i < a.length) { ui += k; if (ui >= opLen(a[i], utf16)) { i++; ui = 0; } }
+    if (j < b.length) { uj += k; if (uj >= opLen(b[j], utf16)) { j++; uj = 0; } }
+  }
+  return [trimOps(ao), trimOps(bo)];
+}
+
+export function transformPosition(ops, pos, after = false, utf16 = true) {
+  let old = 0, shift = 0;
+  for (const o of ops) {
+    const n = opLen(o, utf16);
+    if (o.kind === 'retain') {
+      if (pos < old + n) return pos + shift;
+      old += n;
+    } else if (o.kind === 'insert') {
+      if (pos === old && !after) return pos + shift;
+      shift += n;
+    } else {
+      if (pos <= old) return pos + shift;
+      if (pos < old + n) return old + shift;
+      shift -= n;
+      old += n;
+    }
+  }
+  return pos + shift;
+}
+
+export function applyDelta(text, ops) {
+  let out = '', at = 0;
+  for (const o of ops) {
+    if (o.kind === 'retain') { out += text.slice(at, at + o.n); at += o.n; }
+    else if (o.kind === 'delete') at += o.n;
+    else out += o.text;
+  }
+  return out + text.slice(at);
+}
+
+function editsToOps(edits, utf16) {
+  const ops = [];
+  let at = 0;
+  for (const e of edits) {
+    if (e.pos < at) throw new OndbError('invalid', 'edits must be sorted and non-overlapping');
+    pushOp(ops, { kind: 'retain', n: e.pos - at });
+    pushOp(ops, { kind: 'delete', n: e.del || 0 });
+    if (e.ins) pushOp(ops, { kind: 'insert', n: opLen({ kind: 'insert', text: e.ins }, utf16), text: e.ins });
+    at = e.pos + (e.del || 0);
+  }
+  return trimOps(ops);
+}
+
+class Runs {
+  constructor(text, total) {
+    this.runs = [];
+    if (text) this.runs.push({ s: text });
+    if (total > text.length) this.runs.push({ hole: total - text.length });
+  }
+  get length() {
+    let n = 0;
+    for (const r of this.runs) n += r.s != null ? r.s.length : r.hole;
+    return n;
+  }
+  holes() {
+    const out = [];
+    let at = 0;
+    for (const r of this.runs) {
+      const n = r.s != null ? r.s.length : r.hole;
+      if (r.hole) out.push([at, n]);
+      at += n;
+    }
+    return out;
+  }
+  text() {
+    return this.runs.map((r) => (r.s != null ? r.s : '\u0000'.repeat(r.hole))).join('');
+  }
+  _split(pos) {
+    let at = 0;
+    for (let i = 0; i < this.runs.length; i++) {
+      const r = this.runs[i];
+      const n = r.s != null ? r.s.length : r.hole;
+      if (pos === at) return i;
+      if (pos < at + n) {
+        const k = pos - at;
+        const [a, b] = r.s != null ? [{ s: r.s.slice(0, k) }, { s: r.s.slice(k) }] : [{ hole: k }, { hole: n - k }];
+        this.runs.splice(i, 1, a, b);
+        return i + 1;
+      }
+      at += n;
+    }
+    return this.runs.length;
+  }
+  _norm() {
+    const out = [];
+    for (const r of this.runs) {
+      const n = r.s != null ? r.s.length : r.hole;
+      if (!n) continue;
+      const l = out[out.length - 1];
+      if (l && l.s != null && r.s != null) l.s += r.s;
+      else if (l && l.hole && r.hole) l.hole += r.hole;
+      else out.push({ ...r });
+    }
+    this.runs = out;
+  }
+  apply(ops) {
+    let at = 0;
+    for (const o of ops) {
+      if (o.kind === 'retain') at += o.n;
+      else if (o.kind === 'delete') {
+        const a = this._split(at), b = this._split(at + o.n);
+        this.runs.splice(a, b - a);
+      } else {
+        const a = this._split(at);
+        this.runs.splice(a, 0, { s: o.text });
+        at += o.text.length;
+      }
+    }
+    this._norm();
+  }
+  fill(pos, text) {
+    for (let k = 0; k < text.length; ) {
+      let at = 0, done = false;
+      for (let i = 0; i < this.runs.length && !done; i++) {
+        const r = this.runs[i];
+        const n = r.s != null ? r.s.length : r.hole;
+        if (pos + k < at + n) {
+          const take = Math.min(at + n - (pos + k), text.length - k);
+          if (r.hole) {
+            const a = this._split(pos + k), b = this._split(pos + k + take);
+            this.runs.splice(a, b - a, { s: text.slice(k, k + take) });
+            this._norm();
+          }
+          k += take;
+          done = true;
+        }
+        at += n;
+      }
+      if (!done) break;
+    }
+  }
+}
+
+export class LiveBuffer {
+  constructor(transport, open, units) {
+    this.t = transport;
+    this.utf16 = units !== 'bytes';
+    this.id = open.buffer;
+    this.rev = open.rev;
+    this.seq = 0;
+    this.pending = [];
+    this.doc = new Runs(open.text || '', open.length);
+    this.actor = open.actor;
+    this.line = open.line;
+    this.listeners = new Set();
+    this.cursors = [];
+    this.acks = [];
+  }
+
+  static async open(transport, { object, path = '', line = '', units = 'utf16', actor, page = 65536 } = {}) {
+    let lb = null;
+    const early = [];
+    const sub = await transport.subscribe({ op: 'buffer.open', object, path, line, units, actor, page }, (ev) => {
+      if (lb) lb._event(ev);
+      else early.push(ev);
+    });
+    lb = new LiveBuffer(transport, sub.result, units);
+    lb.sub = sub;
+    for (const ev of early) lb._event(ev);
+    return lb;
+  }
+
+  get text() {
+    return this.doc.text();
+  }
+
+  get loaded() {
+    return this.doc.holes().length === 0;
+  }
+
+  on(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  _emit(change) {
+    for (const fn of this.listeners) fn(change);
+  }
+
+  _acked(ack) {
+    while (this.pending.length && this.pending[0].seq <= ack) this.pending.shift();
+  }
+
+  _event(ev) {
+    if (ev.kind === 'delta') {
+      this._acked(ev.ack);
+      let d = ev.ops;
+      for (const p of this.pending) {
+        const [p2, d2] = transformDelta(p.ops, d, this.utf16);
+        p.ops = p2;
+        d = d2;
+      }
+      this.doc.apply(d);
+      this.rev = ev.rev;
+      while (this.acks.length && this.acks[0].rev <= this.rev) this._acked(this.acks.shift().ack);
+      this.cursors = this.cursors.map((c) => ({ ...c, ranges: c.ranges.map((r) => ({ anchor: transformPosition(d, r.anchor, true, this.utf16), head: transformPosition(d, r.head, true, this.utf16) })) }));
+      this._emit({ kind: 'delta', ops: d, rev: ev.rev });
+    } else if (ev.kind === 'cursors') {
+      this.cursors = ev.cursors.map((c) => ({ ...c, ranges: c.ranges.map((r) => ({ anchor: this._local(r.anchor, ev.ack, true), head: this._local(r.head, ev.ack, true) })) }));
+      this._emit({ kind: 'cursors', cursors: this.cursors });
+    } else if (ev.kind === 'closed') {
+      this._emit({ kind: 'closed', status: ev.status });
+    }
+  }
+
+  _local(pos, ack, after) {
+    if (pos < 0) return pos;
+    let p = pos;
+    for (const e of this.pending) if (e.seq > ack) p = transformPosition(e.ops, p, after, this.utf16);
+    return p;
+  }
+
+  edit(edits, group = 0) {
+    const ops = editsToOps(edits, this.utf16);
+    if (!ops.length) return Promise.resolve(this.seq);
+    this.doc.apply(ops);
+    this.seq++;
+    const seq = this.seq;
+    this.pending.push({ seq, ops });
+    const call = this.t.call({
+      op: 'buffer.edit', buffer: this.id, rev: this.rev, group,
+      pos: edits.map((e) => e.pos), del: edits.map((e) => e.del || 0), ins: edits.map((e) => e.ins || ''),
+    });
+    return call.then((r) => {
+      if (r.rev <= this.rev) this._acked(r.ack);
+      else this.acks.push({ rev: r.rev, ack: r.ack });
+      return r.ack;
+    });
+  }
+
+  async read(from, len) {
+    const r = await this.t.call({ op: 'buffer.read', buffer: this.id, rev: this.rev, from, len });
+    this.doc.fill(this._local(r.from, r.ack, false), r.text);
+    return r;
+  }
+
+  async loadAll(chunk = 1 << 16) {
+    for (let h = this.doc.holes(); h.length; h = this.doc.holes()) {
+      const [at, n] = h[0];
+      await this.read(at, Math.min(n, chunk));
+    }
+  }
+
+  async anchors(positions, bias = 'before') {
+    const r = await this.t.call({ op: 'buffer.anchors', buffer: this.id, rev: this.rev, positions, bias });
+    return r.anchors;
+  }
+
+  async resolve(anchors) {
+    const r = await this.t.call({ op: 'buffer.resolve', buffer: this.id, anchors });
+    return r.positions.map((p) => this._local(p, r.ack, false));
+  }
+
+  setCursors(ranges) {
+    return this.t.call({ op: 'buffer.cursors', buffer: this.id, rev: this.rev, ranges: ranges.flatMap((r) => [r.anchor, r.head]) });
+  }
+
+  undo() {
+    return this.t.call({ op: 'buffer.undo', buffer: this.id }).then((r) => r.done);
+  }
+
+  redo() {
+    return this.t.call({ op: 'buffer.redo', buffer: this.id }).then((r) => r.done);
+  }
+
+  ack() {
+    return this.t.call({ op: 'buffer.ack', buffer: this.id, rev: this.rev });
+  }
+
+  close() {
+    if (this.sub) this.sub.unsubscribe();
+  }
+}

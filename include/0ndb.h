@@ -241,6 +241,33 @@
  *                 text: str, key: bytes, tag: uvarint, removed: bool,
  *                 length: ivarint
  *   Deltas     := deltas: [Delta]
+ *   BufferEvent := kind: enum{open,delta,cursors,closed}, buffer: uvarint,
+ *                 rev: uvarint, ack: uvarint, length: uvarint, text: str,
+ *                 more: bool, actor: id, line: str, ops: [ {kind:
+ *                 enum{retain,delete,insert}, n: uvarint, text: str,
+ *                 author: id} ], cursors: [ {device: id, actor: id,
+ *                 ranges: [ {anchor: ivarint, head: ivarint} ]} ],
+ *                 status: enum status (since 2.0). buffer.open is a
+ *                 subscription: its first payload (the daemon's subscribe
+ *                 result, or the first callback of ondb_subscribe) is kind
+ *                 open with the snapshot's first page in text, more set when
+ *                 the rest must be read with buffer.read; later payloads are
+ *                 delta (ops against the previous rev, in the buffer's units;
+ *                 insert n counts units of text, which is UTF-8), cursors
+ *                 (remote cursors resolved at rev; -1 when not yet known) and
+ *                 closed. ondb_unsubscribe closes the buffer. Clients keep
+ *                 their unacknowledged edits, drop those with seq <= ack and
+ *                 transform each delta over the rest (their own insert first
+ *                 at equal positions) before applying it; buffer.edit takes
+ *                 sorted non-overlapping edits against the client's text at
+ *                 rev plus its earlier edits, returns ack and rev, and
+ *                 fails with conflict once rev is too old to transform
+ *                 (reopen). Every delta the edit was transformed over is
+ *                 delivered before its result, so the result's rev never
+ *                 exceeds the deltas a client has received and either ack
+ *                 source may drop acknowledged edits.
+ *                 Anchors are opaque strings ("s", "e", or
+ *                 "<actor hex>.<seq>[.<offset>].<b|a>").
  *   Event      := kind: enum event, space: id, object: id, device: id,
  *                 tick: uvarint, length: ivarint, status: enum status,
  *                 detail: str, Placement (zero unless kind is
@@ -1286,6 +1313,26 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_WAKE 138u
 /* placement(object: object) -> Placement */
 #define ONDB_OP_PLACEMENT 139u
+/* buffer.open(object: object, path: str, line: str, units: enum{bytes,utf16}, actor: id, page: uvarint) -> BufferEvent */
+#define ONDB_OP_BUFFER_OPEN 141u
+/* buffer.read(buffer: uvarint, rev: uvarint, from: uvarint, len: uvarint) -> rev:uvarint ack:uvarint from:uvarint length:uvarint text:str */
+#define ONDB_OP_BUFFER_READ 142u
+/* buffer.edit(buffer: uvarint, rev: uvarint, pos: uvarints, del: uvarints, ins: strs, group: uvarint) -> ack:uvarint rev:uvarint */
+#define ONDB_OP_BUFFER_EDIT 143u
+/* buffer.ack(buffer: uvarint, rev: uvarint) -> {} */
+#define ONDB_OP_BUFFER_ACK 144u
+/* buffer.undo(buffer: uvarint) -> done:bool */
+#define ONDB_OP_BUFFER_UNDO 145u
+/* buffer.redo(buffer: uvarint) -> done:bool */
+#define ONDB_OP_BUFFER_REDO 146u
+/* buffer.anchors(buffer: uvarint, rev: uvarint, positions: uvarints, bias: enum{before,after}) -> anchors:strs */
+#define ONDB_OP_BUFFER_ANCHORS 147u
+/* buffer.resolve(buffer: uvarint, anchors: strs) -> positions:[ivarint] rev:uvarint ack:uvarint */
+#define ONDB_OP_BUFFER_RESOLVE 148u
+/* buffer.cursors(buffer: uvarint, rev: uvarint, ranges: uvarints) -> {} */
+#define ONDB_OP_BUFFER_CURSORS 149u
+/* buffer.text(buffer: uvarint) -> rev:uvarint text:str */
+#define ONDB_OP_BUFFER_TEXT 150u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

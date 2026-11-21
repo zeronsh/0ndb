@@ -187,6 +187,11 @@ find_op :: proc(a: ^Api, name: string, code: u16) -> ^Op {
 			return &op
 		}
 	}
+	for &op in BUFFER_OPS {
+		if (len(name) > 0 && op.name == name) || (len(name) == 0 && op.code == code) {
+			return &op
+		}
+	}
 	for &op in a.host.ops {
 		if (len(name) > 0 && op.name == name) || (len(name) == 0 && op.code == code) {
 			return &op
@@ -296,7 +301,7 @@ describe :: proc(a: ^Api, json_form: bool, allocator := context.allocator) -> []
 	o: Out
 	out_init(&o, &buf, json_form)
 	o_u64(&o, "version", VERSION)
-	n := len(OPS) + len(RUNTIME_OPS) + len(a.host.ops)
+	n := len(OPS) + len(RUNTIME_OPS) + len(BUFFER_OPS) + len(a.host.ops)
 	o_arr(&o, "ops", n)
 	describe_op :: proc(o: ^Out, op: ^Op) {
 		o_obj(o, "")
@@ -322,6 +327,9 @@ describe :: proc(a: ^Api, json_form: bool, allocator := context.allocator) -> []
 		describe_op(&o, &op)
 	}
 	for &op in RUNTIME_OPS {
+		describe_op(&o, &op)
+	}
+	for &op in BUFFER_OPS {
 		describe_op(&o, &op)
 	}
 	for &op in a.host.ops {

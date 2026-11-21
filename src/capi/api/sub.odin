@@ -8,24 +8,27 @@ import rt "../../runtime"
 Sub_Proc :: #type proc(data: rawptr, id: u64, payload: []u8)
 
 Raw_Sub_Proc :: #type proc(data: rawptr, id: u64, deltas: []eng.Delta)
+Sub_Ready :: #type proc(data: rawptr) -> bool
 
 Sub :: struct {
 	api:    ^Api,
 	id:     u64,
 	engine: eng.Sub_Id,
+	buffer: eng.Buffer_Id,
 	json:   bool,
 	cb:     Sub_Proc,
 	raw:    Raw_Sub_Proc,
 	data:   rawptr,
 	catalog: bool,
 	object: Object,
+	ready:  Sub_Ready,
 }
 
 subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, data: rawptr) -> (id: u64, catalog: bool, object: Object, status: Status) {
 	if raw == nil {
 		return 0, false, {}, .Invalid
 	}
-	id, status = _subscribe(a, req, json_form, nil, raw, data)
+	id, status, _ = _subscribe(a, req, json_form, nil, raw, data)
 	for s in a.subs {
 		if s.id == id {
 			catalog = s.catalog
@@ -36,27 +39,42 @@ subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, da
 }
 
 subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, data: rawptr) -> (id: u64, status: Status) {
-	if cb == nil {
-		return 0, .Invalid
+	open: []u8
+	id, status, open = subscribe_open(a, req, json_form, cb, data)
+	if status == .Ok && len(open) > 0 {
+		cb(data, id, open)
 	}
-	return _subscribe(a, req, json_form, cb, nil, data)
+	return
+}
+
+subscribe_open :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, data: rawptr, ready: Sub_Ready = nil) -> (id: u64, status: Status, open: []u8) {
+	if cb == nil {
+		return 0, .Invalid, nil
+	}
+	return _subscribe(a, req, json_form, cb, nil, data, ready)
 }
 
 @(private)
-_subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_Sub_Proc, data: rawptr) -> (id: u64, status: Status) {
+_subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_Sub_Proc, data: rawptr, ready: Sub_Ready = nil) -> (id: u64, status: Status, open: []u8) {
 	c: Call
 	c.api = a
 	c.json = json_form
 	if st := _decode(a, &c, req, context.temp_allocator); st != .Ok {
-		return 0, st
+		return 0, st, nil
 	}
 	catalog := false
+	buffer := false
 	switch c.op.name {
 	case "subscribe":
 	case "subscribe.catalog":
 		catalog = true
+	case "buffer.open":
+		if raw != nil {
+			return 0, .Unsupported, nil
+		}
+		buffer = true
 	case:
-		return 0, .Bad_Request
+		return 0, .Bad_Request, nil
 	}
 	s := new(Sub, a.allocator)
 	s.api = a
@@ -65,33 +83,50 @@ _subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_S
 	s.raw = raw
 	s.catalog = catalog
 	s.data = data
+	s.ready = ready
 	err: eng.Error
+	if buffer {
+		a.next_sub += 1
+		s.id = a.next_sub
+		open, err = _buffer_open(a, &c, s)
+		if err != .None {
+			free(s, a.allocator)
+			return 0, status_of(err), nil
+		}
+		s.object = a_object(&c, "object")
+		append(&a.subs, s)
+		return s.id, .Ok, open
+	}
 	if catalog {
 		s.engine, err = eng.subscribe_catalog(a.e, a_id(&c, "space"), _on_deltas, s)
 	} else {
 		kind := eng.Kind(a_u64(&c, "kind"))
 		if kind < .Conversation || kind > .File_Tree {
 			free(s, a.allocator)
-			return 0, .Invalid
+			return 0, .Invalid, nil
 		}
 		s.object = a_object(&c, "object")
 		s.engine, err = eng.subscribe(a.e, s.object, kind, _on_deltas, s)
 	}
 	if err != .None {
 		free(s, a.allocator)
-		return 0, status_of(err)
+		return 0, status_of(err), nil
 	}
 	a.next_sub += 1
 	s.id = a.next_sub
 	append(&a.subs, s)
-	return s.id, .Ok
+	return s.id, .Ok, nil
 }
 
 unsubscribe :: proc(a: ^Api, id: u64) {
 	for s, i in a.subs {
 		if s.id == id {
 			ordered_remove(&a.subs, i)
-			eng.unsubscribe(a.e, s.engine)
+			if s.buffer != 0 {
+				eng.buffer_close(a.e, s.buffer)
+			} else {
+				eng.unsubscribe(a.e, s.engine)
+			}
 			free(s, a.allocator)
 			return
 		}

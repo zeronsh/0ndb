@@ -77,6 +77,7 @@ Sub_Tag :: struct {
 	catalog: bool,
 	gap:     bool,
 	compact: bool,
+	buffer:  bool,
 	object:  api.Object,
 	changed: [dynamic]api.Object,
 }
@@ -462,16 +463,26 @@ _conn_process :: proc(c: ^Conn) -> bool {
 			st_.tag = tag
 			st_.json = payload[8] & 1 != 0
 			st_.compact = payload[8] & 2 != 0
-			id, catalog, object, st := api.subscribe_raw(&d.s.a, payload[9:], st_.json, _on_sub, st_)
-			st_.catalog = catalog
-			st_.object = object
+			id: u64
+			st: api.Status
+			open: []u8
+			if api.request_is(&d.s.a, payload[9:], st_.json, "buffer.open") {
+				st_.buffer = true
+				id, st, open = api.subscribe_open(&d.s.a, payload[9:], st_.json, _on_buffer_sub, st_, _sub_ready)
+			} else {
+				catalog: bool
+				object: api.Object
+				id, catalog, object, st = api.subscribe_raw(&d.s.a, payload[9:], st_.json, _on_sub, st_)
+				st_.catalog = catalog
+				st_.object = object
+			}
 			if st != .Ok {
 				free(st_)
 				_send_result(c, tag, st, _status_payload(st, payload[8] & 1 != 0))
 			} else {
 				st_.id = id
 				append(&c.subs, st_)
-				_send_result(c, tag, .Ok, nil)
+				_send_result(c, tag, .Ok, open)
 			}
 		case .Unsubscribe:
 			if len(payload) < 8 {
@@ -633,8 +644,34 @@ _flush_pushed :: proc(d: ^Daemon) {
 }
 
 @(private)
+_sub_ready :: proc(data: rawptr) -> bool {
+	s := (^Sub_Tag)(data)
+	c := s.conn
+	if c.dead {
+		return false
+	}
+	if c.lagging || len(c.wbuf) > LAG_HIGH {
+		c.lagging = true
+		return false
+	}
+	return true
+}
+
+@(private)
+_on_buffer_sub :: proc(data: rawptr, id: u64, payload: []u8) {
+	s := (^Sub_Tag)(data)
+	t := u64_bytes(s.tag)
+	_conn_push(s.conn, .Deltas, t[:], payload)
+}
+
+@(private)
 _conn_resume :: proc(c: ^Conn) {
 	c.lagging = false
+	for s in c.subs {
+		if s.buffer {
+			api.sub_kick(&c.d.s.a, s.id)
+		}
+	}
 	for s in c.subs {
 		if !s.gap && len(s.changed) == 0 {
 			continue
