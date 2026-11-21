@@ -50,6 +50,7 @@ Db :: struct {
 	cache_no:  [CACHE_PAGES]u64,
 	cache:     []u8,
 	txn:       ^Txn,
+	poisoned:  bool,
 	allocator: runtime.Allocator,
 }
 
@@ -118,7 +119,9 @@ db_close :: proc(db: ^Db) {
 		txn_abort(db.txn)
 	}
 	if db.fd >= 0 {
-		prim.datasync(db.vfs, db.fd)
+		if !db.poisoned {
+			prim.datasync(db.vfs, db.fd)
+		}
 		prim.close_file(db.vfs, db.fd)
 	}
 	delete(db.cache, db.allocator)
@@ -133,6 +136,9 @@ db_count :: proc "contextless" (db: ^Db, root: int) -> u64 {
 }
 
 db_get :: proc(db: ^Db, root: int, key: []u8, allocator := context.allocator) -> (value: []u8, found: bool, err: Error) {
+	if db.poisoned {
+		return nil, false, .Io
+	}
 	if db.txn != nil {
 		return txn_get(db.txn, root, key, allocator)
 	}
@@ -153,6 +159,9 @@ db_get :: proc(db: ^Db, root: int, key: []u8, allocator := context.allocator) ->
 }
 
 db_scan :: proc(db: ^Db, root: int, start: []u8, prefix: []u8, data: rawptr, visit: Visit) -> Error {
+	if db.poisoned {
+		return .Io
+	}
 	ref := db.meta.roots[root]
 	if db.txn != nil {
 		ref = db.txn.meta.roots[root]
@@ -216,6 +225,9 @@ db_scan :: proc(db: ^Db, root: int, start: []u8, prefix: []u8, data: rawptr, vis
 txn_begin :: proc(db: ^Db) -> (t: ^Txn, err: Error) {
 	if db.txn != nil {
 		return nil, .Busy
+	}
+	if db.poisoned {
+		return nil, .Io
 	}
 	t = new(Txn, db.allocator)
 	if t == nil {
@@ -352,10 +364,12 @@ txn_commit :: proc(t: ^Txn) -> Error {
 		}
 		if err := prim.write_at(db.vfs, db.fd, buf, i64(start) * PAGE); err != .None {
 			txn_abort(t)
+			db.poisoned = true
 			return obj.perr(err)
 		}
 		if err := prim.datasync(db.vfs, db.fd); err != .None {
 			txn_abort(t)
+			db.poisoned = true
 			return obj.perr(err)
 		}
 	}
@@ -365,6 +379,7 @@ txn_commit :: proc(t: ^Txn) -> Error {
 	m.live = db.meta.live + written - min(t.freed, db.meta.live + written)
 	if err := _meta_write(db.vfs, db.fd, &m); err != .None {
 		txn_abort(t)
+		db.poisoned = true
 		return err
 	}
 	db.meta = m
@@ -382,6 +397,9 @@ db_sync :: proc(db: ^Db) -> Error {
 db_compact :: proc(db: ^Db) -> Error {
 	if db.txn != nil {
 		return .Busy
+	}
+	if db.poisoned {
+		return .Io
 	}
 	buf: prim.Path_Buf
 	if len(db.path) + 8 >= len(buf) {
@@ -432,7 +450,11 @@ db_compact :: proc(db: ^Db) -> Error {
 	db.fd = fd
 	db.meta = m
 	db.cache_no = {}
-	return obj.perr(prim.sync_dir(db.vfs, prim.dir_name(db.path)))
+	if err := prim.sync_dir(db.vfs, prim.dir_name(db.path)); err != .None {
+		db.poisoned = true
+		return obj.perr(err)
+	}
+	return .None
 }
 
 @(private)
@@ -1102,6 +1124,9 @@ builder_begin :: proc(b: ^Builder, db: ^Db) -> Error {
 	if db.txn != nil {
 		return .Busy
 	}
+	if db.poisoned {
+		return .Io
+	}
 	b^ = {}
 	b.db = db
 	if len(db.path) + 6 >= len(b.tmp) {
@@ -1264,7 +1289,11 @@ builder_commit :: proc(b: ^Builder) -> Error {
 	db.fd = fd
 	db.meta = m
 	db.cache_no = {}
-	return obj.perr(prim.sync_dir(db.vfs, prim.dir_name(db.path)))
+	if err := prim.sync_dir(db.vfs, prim.dir_name(db.path)); err != .None {
+		db.poisoned = true
+		return obj.perr(err)
+	}
+	return .None
 }
 
 @(private)
@@ -1362,4 +1391,8 @@ _level_add_kid :: proc(b: ^Builder, t: ^Build_Tree, i: int, first: []u8, page: u
 	append(&l.node.kids, page)
 	l.size += cost
 	return .None
+}
+
+db_poisoned :: proc "contextless" (db: ^Db) -> bool {
+	return db.poisoned
 }

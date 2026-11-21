@@ -31,6 +31,7 @@ Table :: struct {
 	path:      string,
 	defs:      [MAX_INDEXES]Index_Def,
 	ndefs:     int,
+	poisoned:  bool,
 	allocator: runtime.Allocator,
 }
 
@@ -89,7 +90,20 @@ table_close :: proc(t: ^Table) {
 	t.path = ""
 }
 
+table_poisoned :: proc "contextless" (t: ^Table) -> bool {
+	return t.poisoned || db_poisoned(&t.db)
+}
+
+@(private)
+_fault :: proc(t: ^Table, err: Error) -> Error {
+	if err == .Io || err == .Corrupt || err == .No_Space {
+		t.poisoned = true
+	}
+	return err
+}
+
 table_reset :: proc(t: ^Table) -> Error {
+	t.poisoned = false
 	db_close(&t.db)
 	if e := prim.remove(t.vfs, t.path); e != .None && e != .Not_Found {
 		return obj.perr(e)
@@ -115,9 +129,24 @@ table_consumed :: proc(t: ^Table, seg: prim.Id) -> (off: i64, err: Error) {
 }
 
 table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
+	if table_poisoned(t) {
+		if e := table_reset(t); e != .None {
+			t.poisoned = true
+			return 0, e
+		}
+	}
+	pos, err = _table_apply(t, seg, r)
+	if err != .None && err != .Missing {
+		_fault(t, err)
+	}
+	return
+}
+
+@(private)
+_table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
 	if db_count(&t.db, ROOT_CONSUMED) == 0 && db_count(&t.db, ROOT_ENTRIES) == 0 && db_count(&t.db, ROOT_PENDING) == 0 && journal.reader_end(r) >= REBUILD_MIN {
 		src := [1]Source{{seg, r}}
-		table_rebuild(t, src[:]) or_return
+		_table_rebuild(t, src[:]) or_return
 		return journal.reader_end(r), .None
 	}
 	pos = table_consumed(t, seg) or_return
@@ -164,7 +193,13 @@ table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, e
 }
 
 table_get :: proc(t: ^Table, key: []u8, allocator := context.allocator) -> (e: Entry, found: bool, err: Error) {
-	v, hit := db_get(&t.db, ROOT_ENTRIES, key, allocator) or_return
+	if t.poisoned {
+		return e, false, .Io
+	}
+	v, hit, ge := db_get(&t.db, ROOT_ENTRIES, key, allocator)
+	if ge != .None {
+		return e, false, _fault(t, ge)
+	}
 	if !hit {
 		return e, false, .None
 	}
@@ -250,11 +285,14 @@ table_scan :: proc(t: ^Table, index: int, prefix: []u8, after: ^Cursor, limit: i
 		append(c.last, ..key)
 		return true
 	}
+	if t.poisoned {
+		return nil, false, .Io
+	}
 	if err = db_scan(&t.db, root, start, prefix, &c, visit); err != .None {
-		return nil, false, err
+		return nil, false, _fault(t, err)
 	}
 	if c.err != .None {
-		return nil, false, c.err
+		return nil, false, _fault(t, c.err)
 	}
 	if index >= 0 && t.defs[index].project == nil {
 		for &row in c.list {
@@ -277,6 +315,17 @@ cursor_destroy :: proc(c: ^Cursor) {
 }
 
 table_rebuild :: proc(t: ^Table, sources: []Source) -> Error {
+	if table_poisoned(t) {
+		if e := table_reset(t); e != .None {
+			t.poisoned = true
+			return e
+		}
+	}
+	return _fault(t, _table_rebuild(t, sources))
+}
+
+@(private)
+_table_rebuild :: proc(t: ^Table, sources: []Source) -> Error {
 	for a, i in sources {
 		if a.reader == nil {
 			return .Invalid
