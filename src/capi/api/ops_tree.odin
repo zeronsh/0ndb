@@ -1,0 +1,206 @@
+package api
+
+import "core:strings"
+import "../../crdt"
+import eng "../../engine"
+import "../../fs"
+import "../../fstree"
+import "../../prim"
+
+Mounted :: struct {
+	object: Object,
+	root:   string,
+	mount:  ^fs.Mount,
+}
+
+@(private)
+_mounts_close_all :: proc(a: ^Api) {
+	for m in a.mounts {
+		eng.tree_unmount(a.e, m.mount)
+		delete(m.root, a.allocator)
+		free(m, a.allocator)
+	}
+	clear(&a.mounts)
+}
+
+mount_find :: proc(a: ^Api, ob: Object, root: string) -> ^Mounted {
+	for m in a.mounts {
+		if m.object == ob && (len(root) == 0 || m.root == root) {
+			return m
+		}
+	}
+	return nil
+}
+
+mount_open :: proc(a: ^Api, ob: Object, root: string) -> (m: ^Mounted, st: Status) {
+	if len(root) == 0 || root[0] != '/' {
+		return nil, .Invalid
+	}
+	clean := strings.trim_right(root, "/")
+	if len(clean) == 0 {
+		clean = "/"
+	}
+	if x := mount_find(a, ob, clean); x != nil {
+		return x, .Ok
+	}
+	for x in a.mounts {
+		if x.root == clean {
+			return nil, .Exists
+		}
+	}
+	if perr := prim.mkdir_all(prim.os_vfs(), clean, 0o755); perr != .None {
+		return nil, .Io
+	}
+	fm, err := eng.tree_mount(a.e, ob, clean)
+	if err != .None {
+		return nil, status_of(err)
+	}
+	m = new(Mounted, a.allocator)
+	m.object = ob
+	m.root = strings.clone(clean, a.allocator)
+	m.mount = fm
+	append(&a.mounts, m)
+	return m, .Ok
+}
+
+mount_close :: proc(a: ^Api, m: ^Mounted) {
+	for x, i in a.mounts {
+		if x == m {
+			ordered_remove(&a.mounts, i)
+			break
+		}
+	}
+	eng.tree_unmount(a.e, m.mount)
+	delete(m.root, a.allocator)
+	free(m, a.allocator)
+}
+
+mount_at :: proc(a: ^Api, path: string) -> (m: ^Mounted, rel: string) {
+	best := -1
+	for x in a.mounts {
+		r := x.root
+		if path == r || (strings.has_prefix(path, r) && (r == "/" || (len(path) > len(r) && path[len(r)] == '/'))) {
+			if len(r) > best {
+				best = len(r)
+				m = x
+			}
+		}
+	}
+	if m == nil {
+		return nil, ""
+	}
+	rel = path[len(m.root):]
+	for len(rel) > 0 && rel[0] == '/' {
+		rel = rel[1:]
+	}
+	return m, rel
+}
+
+op_tree_mount :: proc(c: ^Call, o: ^Out) -> Status {
+	_, st := mount_open(c.api, a_object(c, "object"), a_str(c, "root"))
+	return st
+}
+
+op_tree_unmount :: proc(c: ^Call, o: ^Out) -> Status {
+	m := mount_find(c.api, a_object(c, "object"), strings.trim_right(a_str(c, "root"), "/"))
+	if m == nil {
+		return .Not_Found
+	}
+	mount_close(c.api, m)
+	return .Ok
+}
+
+op_tree_mounts :: proc(c: ^Call, o: ^Out) -> Status {
+	o_arr(o, "mounts", len(c.api.mounts))
+	for m in c.api.mounts {
+		o_obj(o, "")
+		o_object(o, "object", m.object)
+		o_str(o, "root", m.root)
+		o_str(o, "line", m.mount.line)
+		o_end(o)
+	}
+	o_end(o)
+	return .Ok
+}
+
+op_tree_sync :: proc(c: ^Call, o: ^Out) -> Status {
+	m := mount_find(c.api, a_object(c, "object"), strings.trim_right(a_str(c, "root"), "/"))
+	if m == nil {
+		return .Not_Found
+	}
+	if err := fs.mount_sync(m.mount); err != .None {
+		return .Io
+	}
+	eng.touched(c.api.e, m.object)
+	return .Ok
+}
+
+op_tree_find :: proc(c: ^Call, o: ^Out) -> Status {
+	m, rel := mount_at(c.api, a_str(c, "path"))
+	if m == nil {
+		return .Not_Found
+	}
+	o_object(o, "object", m.object)
+	o_str(o, "root", m.root)
+	o_str(o, "rel", rel)
+	return .Ok
+}
+
+emit_spans :: proc(o: ^Out, data: []u8, spans: []crdt.Author_Span) {
+	o_text(o, "text", data)
+	o_arr(o, "spans", len(spans))
+	at := 0
+	line: u64 = 1
+	for s in spans {
+		lo := min(at, len(data))
+		hi := min(at + s.len, len(data))
+		l0 := line
+		for i in lo ..< hi {
+			if data[i] == '\n' {
+				line += 1
+			}
+		}
+		o_obj(o, "")
+		o_u64(o, "lo", u64(lo))
+		o_u64(o, "hi", u64(hi))
+		o_u64(o, "line_lo", l0)
+		o_u64(o, "line_hi", line)
+		o_id(o, "actor", s.id.actor)
+		o_u64(o, "seq", s.id.seq)
+		o_id(o, "op_actor", s.op.actor)
+		o_u64(o, "op_seq", s.op.seq)
+		o_bool(o, "redacted", s.redacted)
+		o_end(o)
+		at = hi
+	}
+	o_end(o)
+}
+
+op_tree_blame :: proc(c: ^Call, o: ^Out) -> Status {
+	ob := a_object(c, "object")
+	path := a_str(c, "path")
+	if m := mount_find(c.api, ob, ""); m != nil {
+		fs.mount_sync(m.mount)
+	}
+	hist, err := eng.tree_history(c.api.e, ob)
+	if err != .None {
+		return status_of(err)
+	}
+	defer eng.tree_release(c.api.e, ob)
+	snap := fstree.current(&hist.tree)
+	id, found, lerr := fstree.lookup(&snap, path)
+	if lerr != nil {
+		return .Corrupt
+	}
+	if !found {
+		return .Not_Found
+	}
+	f, ferr := fs.history_file(hist, id)
+	if ferr != .None {
+		return .Io
+	}
+	data := crdt.text_bytes(&f.text, context.temp_allocator)
+	spans := crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
+	emit_spans(o, data, spans)
+	return .Ok
+}
