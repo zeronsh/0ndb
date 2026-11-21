@@ -1279,6 +1279,417 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
 
     try runCrdtFuzzSuite(allocator);
     try runDiffAndMerge3PropertyFuzz(allocator);
+    try runDaemonWatcherSuite(allocator, io);
+}
+
+fn countOpenFds(io: std.Io) !usize {
+    var dir = try std.Io.Dir.cwd().openDir(io, "/proc/self/fd", .{ .iterate = true });
+    defer dir.close(io);
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |_| {
+        count += 1;
+    }
+    return count;
+}
+
+fn writeVerifyFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, bytes);
+}
+
+fn customIgnoreGenDir(_: ?*const anyopaque, rel_path: []const u8, _: bool) bool {
+    if (std.mem.eql(u8, rel_path, "gen_custom")) return true;
+    return std.mem.startsWith(u8, rel_path, "gen_custom/");
+}
+
+fn batchHasPath(batch: *const ondb.fs.watch.MountBatch, target_path: []const u8) bool {
+    for (batch.paths.items) |p| {
+        if (std.mem.eql(u8, p.rel_path, target_path)) return true;
+    }
+    return false;
+}
+
+fn batchPathMask(batch: *const ondb.fs.watch.MountBatch, target_path: []const u8) ?u32 {
+    for (batch.paths.items) |p| {
+        if (std.mem.eql(u8, p.rel_path, target_path)) return p.mask;
+    }
+    return null;
+}
+
+const IdleTickTestCtx = struct {
+    ticks: usize = 0,
+    hibernated: usize = 0,
+    do_hibernate: bool = false,
+
+    fn onTick(ctx_ptr: ?*anyopaque, w: *ondb.fs.watch.SharedWatcher, now_ms: u64) void {
+        const ctx: *IdleTickTestCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        ctx.ticks += 1;
+        if (ctx.do_hibernate) {
+            ctx.hibernated += w.hibernateIdleMounts(0, now_ms);
+            ctx.do_hibernate = false;
+        }
+    }
+};
+
+fn runDaemonWatcherSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const watch = ondb.fs.watch;
+    const linux = std.os.linux;
+
+    const sys_max = watch.readSystemMaxUserWatches();
+    try testing.expect(sys_max > 0);
+    const default_budget = watch.computeDefaultWatchBudget();
+    try testing.expect(default_budget > 0);
+    try testing.expect(default_budget <= watch.MAX_DEFAULT_WATCH_BUDGET);
+
+    const root = "/tmp/0ndb-verify-daemon-watcher";
+    cleanDir(io, root);
+    defer cleanDir(io, root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    const fd_before = try countOpenFds(io);
+    {
+        var watcher = try watch.DaemonWatcher.init(allocator);
+        defer watcher.deinit();
+        try testing.expectEqual(@as(usize, 4), watcher.fdCount());
+
+        const custom_filter = watch.IgnoreFilter{
+            .ctx = null,
+            .should_ignore = customIgnoreGenDir,
+        };
+
+        var wt_paths: [32][]u8 = undefined;
+        var wt_init_count: usize = 0;
+        defer {
+            for (wt_paths[0..wt_init_count]) |p| allocator.free(p);
+        }
+
+        for (0..32) |i| {
+            const wt = try std.fmt.allocPrint(allocator, "{s}/wt_{d}", .{ root, i });
+            wt_paths[i] = wt;
+            wt_init_count = i + 1;
+
+            const sub_dirs = [_][]const u8{
+                "src",
+                "src/deep",
+                "target/debug",
+                "node_modules/pkg",
+                "dist",
+                "build",
+                ".next",
+                ".zig-cache",
+                "zig-out",
+                "gen_custom/sub",
+            };
+            for (sub_dirs) |sd| {
+                const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ wt, sd });
+                defer allocator.free(full);
+                try std.Io.Dir.cwd().createDirPath(io, full);
+            }
+
+            const mode = try watcher.registerMount(io, @as(u64, i + 1), wt, custom_filter);
+            try testing.expectEqual(watch.WatchMode.full_inotify, mode);
+            try testing.expectEqual(@as(usize, 3), watcher.mountWatchCount(@as(u64, i + 1)));
+        }
+
+        try testing.expectEqual(@as(usize, 32), watcher.mountCount());
+        try testing.expectEqual(@as(usize, 32 * 3), watcher.activeWatches());
+
+        const fd_after = try countOpenFds(io);
+        try testing.expectEqual(fd_before + 4, fd_after);
+
+        for (0..250) |k| {
+            const p1 = try std.fmt.allocPrint(allocator, "{s}/target/debug/out_{d}.o", .{ wt_paths[0], k });
+            defer allocator.free(p1);
+            try writeVerifyFile(io, p1, "obj");
+
+            const p2 = try std.fmt.allocPrint(allocator, "{s}/node_modules/pkg/f_{d}.js", .{ wt_paths[0], k });
+            defer allocator.free(p2);
+            try writeVerifyFile(io, p2, "js");
+        }
+        for (0..10) |k| {
+            const p3 = try std.fmt.allocPrint(allocator, "{s}/gen_custom/sub/g_{d}.txt", .{ wt_paths[0], k });
+            defer allocator.free(p3);
+            try writeVerifyFile(io, p3, "gen");
+        }
+        {
+            var ignored_batch = try watcher.nextEventBatch(io, 60);
+            defer ignored_batch.deinit(allocator);
+            try testing.expectEqual(@as(usize, 0), ignored_batch.batches.items.len);
+            try testing.expect(ignored_batch.timed_out);
+        }
+
+        const mid_path = try std.fmt.allocPrint(allocator, "{s}/src/midwrite.zig", .{wt_paths[3]});
+        defer allocator.free(mid_path);
+        try writeVerifyFile(io, mid_path, "initial\n");
+        watcher.setDebounce(20, 80);
+        {
+            var init_b = try watcher.nextEventBatch(io, 300);
+            defer init_b.deinit(allocator);
+            try testing.expect(init_b.batches.items.len >= 1);
+        }
+        {
+            const f = try std.Io.Dir.cwd().openFile(io, mid_path, .{ .mode = .read_write });
+            var closed = false;
+            defer if (!closed) f.close(io);
+            try f.writePositionalAll(io, "mid-write-1", 0);
+            try f.writePositionalAll(io, "mid-write-2", 0);
+
+            var no_mod = try watcher.nextEventBatch(io, 50);
+            defer no_mod.deinit(allocator);
+            try testing.expectEqual(@as(usize, 0), no_mod.batches.items.len);
+
+            f.close(io);
+            closed = true;
+
+            var after_close = try watcher.nextEventBatch(io, 300);
+            defer after_close.deinit(allocator);
+            try testing.expectEqual(@as(usize, 1), after_close.batches.items.len);
+            try testing.expectEqual(@as(u64, 4), after_close.batches.items[0].mount_id);
+            const msk = batchPathMask(&after_close.batches.items[0], "src/midwrite.zig").?;
+            try testing.expect((msk & linux.IN.CLOSE_WRITE) != 0);
+            try testing.expect((msk & linux.IN.MODIFY) == 0);
+        }
+
+        const p_a = try std.fmt.allocPrint(allocator, "{s}/src/deep/alpha.zig", .{wt_paths[0]});
+        defer allocator.free(p_a);
+        const p_b = try std.fmt.allocPrint(allocator, "{s}/root_file.txt", .{wt_paths[15]});
+        defer allocator.free(p_b);
+        const p_c = try std.fmt.allocPrint(allocator, "{s}/src/omega.zig", .{wt_paths[31]});
+        defer allocator.free(p_c);
+        try writeVerifyFile(io, p_a, "alpha\n");
+        try writeVerifyFile(io, p_b, "beta\n");
+        try writeVerifyFile(io, p_c, "omega\n");
+
+        var got_m1 = false;
+        var got_m16 = false;
+        var got_m32 = false;
+        var attempts: usize = 0;
+        while ((!got_m1 or !got_m16 or !got_m32) and attempts < 10) : (attempts += 1) {
+            var evb = try watcher.nextEventBatch(io, 300);
+            defer evb.deinit(allocator);
+            for (evb.batches.items) |*b| {
+                if (b.mount_id == 1 and batchHasPath(b, "src/deep/alpha.zig")) got_m1 = true;
+                if (b.mount_id == 16 and batchHasPath(b, "root_file.txt")) got_m16 = true;
+                if (b.mount_id == 32 and batchHasPath(b, "src/omega.zig")) got_m32 = true;
+            }
+        }
+        try testing.expect(got_m1);
+        try testing.expect(got_m16);
+        try testing.expect(got_m32);
+
+        const burst_path = try std.fmt.allocPrint(allocator, "{s}/src/burst.zig", .{wt_paths[5]});
+        defer allocator.free(burst_path);
+        for (0..15) |bi| {
+            var line_buf: [32]u8 = undefined;
+            const line = try std.fmt.bufPrint(&line_buf, "burst {d}\n", .{bi});
+            try writeVerifyFile(io, burst_path, line);
+        }
+        {
+            var burst_res = try watcher.nextEventBatch(io, 300);
+            defer burst_res.deinit(allocator);
+            try testing.expectEqual(@as(usize, 1), burst_res.batches.items.len);
+            try testing.expectEqual(@as(u64, 6), burst_res.batches.items[0].mount_id);
+            try testing.expectEqual(@as(usize, 1), burst_res.batches.items[0].paths.items.len);
+            try testing.expectEqualStrings("src/burst.zig", burst_res.batches.items[0].paths.items[0].rel_path);
+        }
+
+        const git_common = try std.fmt.allocPrint(allocator, "{s}/shared_git", .{root});
+        defer allocator.free(git_common);
+        const git_heads = try std.fmt.allocPrint(allocator, "{s}/refs/heads", .{git_common});
+        defer allocator.free(git_heads);
+        try std.Io.Dir.cwd().createDirPath(io, git_heads);
+
+        for (0..10) |gi| {
+            try watcher.subscribeGitCommon(@as(u64, gi + 1), git_common);
+        }
+        try testing.expectEqual(@as(usize, 3), watcher.sharedGitWatchCount());
+
+        const ref_main = try std.fmt.allocPrint(allocator, "{s}/main", .{git_heads});
+        defer allocator.free(ref_main);
+        try writeVerifyFile(io, ref_main, "0123456789abcdef\n");
+
+        var git_seen: [32]bool = @splat(false);
+        var git_attempts: usize = 0;
+        while (git_attempts < 10) : (git_attempts += 1) {
+            var all_ten = true;
+            for (0..10) |gi| {
+                if (!git_seen[gi]) all_ten = false;
+            }
+            if (all_ten) break;
+            var gb = try watcher.nextEventBatch(io, 300);
+            defer gb.deinit(allocator);
+            for (gb.batches.items) |*b| {
+                if (b.git_changed and b.mount_id >= 1 and b.mount_id <= 32) {
+                    git_seen[@intCast(b.mount_id - 1)] = true;
+                }
+            }
+        }
+        for (0..10) |gi| try testing.expect(git_seen[gi]);
+        for (10..32) |gi| try testing.expect(!git_seen[gi]);
+
+        for (0..9) |gi| watcher.unsubscribeGitCommon(@as(u64, gi + 1));
+        try testing.expectEqual(@as(usize, 3), watcher.sharedGitWatchCount());
+        watcher.unsubscribeGitCommon(10);
+        try testing.expectEqual(@as(usize, 0), watcher.sharedGitWatchCount());
+
+        const before_hib = watcher.activeWatches();
+        try testing.expect(watcher.hibernateMountWatches(2));
+        try testing.expectEqual(watch.WatchMode.stat_on_demand, watcher.mountMode(2));
+        try testing.expectEqual(@as(usize, 0), watcher.mountWatchCount(2));
+        try testing.expectEqual(@as(usize, 32), watcher.mountCount());
+        try testing.expectEqual(before_hib - 3, watcher.activeWatches());
+
+        const restored_mode = try watcher.restoreMountWatches(io, 2);
+        try testing.expectEqual(watch.WatchMode.full_inotify, restored_mode);
+        try testing.expectEqual(@as(usize, 3), watcher.mountWatchCount(2));
+        try testing.expectEqual(before_hib, watcher.activeWatches());
+
+        var tick_ctx = IdleTickTestCtx{ .do_hibernate = true };
+        watcher.setIdleTick(25, .{
+            .ctx = &tick_ctx,
+            .on_tick = IdleTickTestCtx.onTick,
+        });
+        {
+            var tick_res = try watcher.nextEventBatch(io, 300);
+            defer tick_res.deinit(allocator);
+            try testing.expect(tick_res.idle_ticked);
+            try testing.expect(tick_ctx.ticks >= 1);
+            try testing.expectEqual(@as(usize, 32), tick_ctx.hibernated);
+            try testing.expectEqual(@as(usize, 0), watcher.activeWatches());
+        }
+        watcher.setIdleTick(0, null);
+        _ = try watcher.restoreMountWatches(io, 1);
+        try testing.expectEqual(@as(usize, 3), watcher.activeWatches());
+
+        for (0..32) |i| {
+            watcher.removeMount(@as(u64, i + 1));
+        }
+        try testing.expectEqual(@as(usize, 0), watcher.mountCount());
+        try testing.expectEqual(@as(usize, 0), watcher.activeWatches());
+        try testing.expectEqual(@as(usize, 0), watcher.sharedGitWatchCount());
+    }
+
+    const fd_after_close = try countOpenFds(io);
+    try testing.expectEqual(fd_before, fd_after_close);
+
+    {
+        var budgeted = try watch.SharedWatcher.initWithBudget(allocator, 5);
+        defer budgeted.deinit();
+        budgeted.setDebounce(15, 60);
+
+        const ok_root = try std.fmt.allocPrint(allocator, "{s}/budget_ok", .{root});
+        defer allocator.free(ok_root);
+        for ([_][]const u8{ "a", "b", "c" }) |sd| {
+            const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ok_root, sd });
+            defer allocator.free(p);
+            try std.Io.Dir.cwd().createDirPath(io, p);
+        }
+
+        const over_root = try std.fmt.allocPrint(allocator, "{s}/budget_over", .{root});
+        defer allocator.free(over_root);
+        for ([_][]const u8{ "d1", "d2", "d3", "d4" }) |sd| {
+            const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ over_root, sd });
+            defer allocator.free(p);
+            try std.Io.Dir.cwd().createDirPath(io, p);
+        }
+
+        const m_ok = try budgeted.registerMount(io, 10, ok_root, null);
+        try testing.expectEqual(watch.WatchMode.full_inotify, m_ok);
+        try testing.expectEqual(@as(usize, 4), budgeted.activeWatches());
+
+        const m_over = try budgeted.registerMount(io, 20, over_root, null);
+        try testing.expectEqual(watch.WatchMode.stat_on_demand, m_over);
+        try testing.expectEqual(watch.WatchMode.stat_on_demand, budgeted.mountMode(20));
+        try testing.expect(budgeted.isMountOverflow(20));
+        try testing.expectEqual(@as(usize, 0), budgeted.mountWatchCount(20));
+        try testing.expectEqual(@as(usize, 4), budgeted.activeWatches());
+
+        {
+            var ov_res = try budgeted.nextEventBatch(io, 300);
+            defer ov_res.deinit(allocator);
+            var saw_ov = false;
+            for (ov_res.batches.items) |b| {
+                if (b.mount_id == 20 and b.overflow and b.mode == .stat_on_demand) saw_ov = true;
+            }
+            try testing.expect(saw_ov);
+        }
+
+        const dyn_sub = try std.fmt.allocPrint(allocator, "{s}/dyn1/dyn2", .{ok_root});
+        defer allocator.free(dyn_sub);
+        try std.Io.Dir.cwd().createDirPath(io, dyn_sub);
+        {
+            var dyn_res = try budgeted.nextEventBatch(io, 300);
+            defer dyn_res.deinit(allocator);
+            try testing.expectEqual(watch.WatchMode.stat_on_demand, budgeted.mountMode(10));
+            try testing.expectEqual(@as(usize, 0), budgeted.activeWatches());
+        }
+    }
+
+    {
+        var fwatcher = try watch.SharedWatcher.init(allocator);
+        defer fwatcher.deinit();
+        fwatcher.setDebounce(5000, 5000);
+
+        const fence_wt = try std.fmt.allocPrint(allocator, "{s}/fence_wt", .{root});
+        defer allocator.free(fence_wt);
+        const fence_src = try std.fmt.allocPrint(allocator, "{s}/src", .{fence_wt});
+        defer allocator.free(fence_src);
+        const fence_state = try std.fmt.allocPrint(allocator, "{s}/.0ndb", .{fence_wt});
+        defer allocator.free(fence_state);
+        try std.Io.Dir.cwd().createDirPath(io, fence_src);
+        try std.Io.Dir.cwd().createDirPath(io, fence_state);
+
+        const fm = try fwatcher.registerMount(io, 100, fence_wt, null);
+        try testing.expectEqual(watch.WatchMode.full_inotify, fm);
+
+        const f1 = try std.fmt.allocPrint(allocator, "{s}/a.zig", .{fence_wt});
+        defer allocator.free(f1);
+        const f2 = try std.fmt.allocPrint(allocator, "{s}/src/b.zig", .{fence_wt});
+        defer allocator.free(f2);
+        const f3 = try std.fmt.allocPrint(allocator, "{s}/src/c.zig", .{fence_wt});
+        defer allocator.free(f3);
+        try writeVerifyFile(io, f1, "a\n");
+        try writeVerifyFile(io, f2, "b\n");
+        try writeVerifyFile(io, f3, "c\n");
+
+        const fenced_1 = try fwatcher.fence(io, 100, fence_state, 2000);
+        try testing.expect(fenced_1);
+
+        var batch1 = (try fwatcher.flushMountPending(100)).?;
+        defer batch1.deinit(allocator);
+        try testing.expect(batchHasPath(&batch1, "a.zig"));
+        try testing.expect(batchHasPath(&batch1, "src/b.zig"));
+        try testing.expect(batchHasPath(&batch1, "src/c.zig"));
+        try testing.expectEqual(@as(usize, 3), batch1.paths.items.len);
+
+        const fences_dir_path = try std.fmt.allocPrint(allocator, "{s}/fences", .{fence_state});
+        defer allocator.free(fences_dir_path);
+        {
+            var fdir = try std.Io.Dir.cwd().openDir(io, fences_dir_path, .{ .iterate = true });
+            defer fdir.close(io);
+            var fit = fdir.iterate();
+            var leftover: usize = 0;
+            while (try fit.next(io)) |_| leftover += 1;
+            try testing.expectEqual(@as(usize, 0), leftover);
+        }
+
+        const f4 = try std.fmt.allocPrint(allocator, "{s}/src/d.zig", .{fence_wt});
+        defer allocator.free(f4);
+        try writeVerifyFile(io, f4, "d\n");
+
+        const fenced_2 = try fwatcher.fence(io, 100, fence_state, 2000);
+        try testing.expect(fenced_2);
+
+        var batch2 = (try fwatcher.flushMountPending(100)).?;
+        defer batch2.deinit(allocator);
+        try testing.expectEqual(@as(usize, 1), batch2.paths.items.len);
+        try testing.expect(batchHasPath(&batch2, "src/d.zig"));
+
+        fwatcher.removeMount(100);
+        try testing.expectEqual(@as(usize, 0), fwatcher.activeWatches());
+    }
 }
 
 const FuzzFileSnap = struct {

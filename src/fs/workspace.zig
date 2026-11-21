@@ -753,11 +753,20 @@ pub const Workspace = struct {
         }
     }
 
+    fn watchIgnoreFilter(ctx: ?*const anyopaque, rel_path: []const u8, is_dir: bool) bool {
+        const gi: *const GitIgnore = @ptrCast(@alignCast(ctx orelse return false));
+        return gi.isPathOrAncestorIgnored(rel_path, is_dir);
+    }
+
     pub fn attachWatcher(self: *Workspace) !void {
         if (self.watcher != null) return;
+        self.gitignore.reloadIfNeeded(self.allocator, self.io, self.work_dir);
         var w = try watch.SharedWatcher.init(self.allocator);
         errdefer w.deinit();
-        try w.addDirRecursive(self.io, 1, self.root_path);
+        _ = try w.registerMount(self.io, 1, self.root_path, .{
+            .ctx = &self.gitignore,
+            .should_ignore = watchIgnoreFilter,
+        });
         self.watcher = w;
     }
 
@@ -772,6 +781,9 @@ pub const Workspace = struct {
 
     pub fn drainWatched(self: *Workspace, source: []const u8) !?id.BatchId {
         if (self.watcher) |*w| {
+            if (w.mountMode(1) == .stat_on_demand) {
+                return try self.ingestDiskWithSource(source);
+            }
             var events: std.ArrayList(watch.WatchEvent) = .empty;
             defer {
                 for (events.items) |*ev| ev.deinit(self.allocator);
@@ -786,6 +798,14 @@ pub const Workspace = struct {
 
     pub fn watchStep(self: *Workspace, timeout_ms: i32, source: []const u8) !WatchStepResult {
         if (self.watcher == null) try self.attachWatcher();
+        if (self.watcher.?.mountMode(1) == .stat_on_demand) {
+            const bid = try self.ingestDiskWithSource(source);
+            return .{
+                .batch_id = bid,
+                .woken = false,
+                .events = 0,
+            };
+        }
         var events: std.ArrayList(watch.WatchEvent) = .empty;
         defer {
             for (events.items) |*ev| ev.deinit(self.allocator);
