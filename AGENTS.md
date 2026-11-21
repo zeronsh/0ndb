@@ -9,8 +9,16 @@
 - Platform testing happens on real machines through Zeron `run_command`:
   macOS on `home-laptop`, Windows on `WING-PC`. No CI.
 - Tests: `odin test tests/convergence -o:speed`, `odin test tests/fstree -o:speed`,
-  `odin test tests/sim -o:speed`
+  `odin test tests/sim -o:speed`. When several agents share the checkout,
+  always pass `-out:<your scratch dir>/<name>` to `odin test` and
+  `odin build`; the default output lands in the repo root and concurrent
+  builds overwrite each other's binaries.
 - Design: `DESIGN.md` is the source of truth for formats and invariants.
+- zstd is vendored as the 1.5.7 amalgamation (`src/zstd/src/zstd.c`) with a
+  prebuilt static library per target in `src/zstd/lib`, so the build stays
+  one command. Rebuild a library only when `zstd.c` or the flags change, on
+  its own host: `src/zstd/build.sh` (linux_amd64, darwin_arm64) and
+  `src/zstd/build.bat` from a VS x64 prompt (windows_amd64).
 
 ## Rules
 
