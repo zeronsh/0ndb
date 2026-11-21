@@ -32,6 +32,7 @@ pub const FragSummary = struct {
     total: u64 = 0,
     max_ts: u64 = 0,
     ends_with_nl: bool = false,
+    unknown_newlines: bool = false,
 
     pub inline fn add(self: *FragSummary, other: FragSummary) void {
         self.visible += other.visible;
@@ -39,6 +40,7 @@ pub const FragSummary = struct {
         self.total += other.total;
         if (other.max_ts > self.max_ts) self.max_ts = other.max_ts;
         if (other.visible > 0) self.ends_with_nl = other.ends_with_nl;
+        if (other.unknown_newlines) self.unknown_newlines = true;
     }
 };
 
@@ -67,6 +69,7 @@ pub const Fragment = struct {
     len: u64,
     del_count: u8 = 0,
     ends_with_nl: bool = false,
+    newlines_known: bool = true,
     del_inline: id.OpId = id.OpId.ZERO,
     del_overflow: ?[]id.OpId = null,
 
@@ -126,10 +129,11 @@ pub const Fragment = struct {
         const vis = self.isVisible() and self.len > 0;
         return .{
             .visible = if (vis) self.len else 0,
-            .visible_newlines = if (vis) self.newlines else 0,
+            .visible_newlines = if (vis and self.newlines_known) self.newlines else 0,
             .total = self.len,
             .max_ts = self.maxTs(),
-            .ends_with_nl = if (vis) self.ends_with_nl else false,
+            .ends_with_nl = if (vis and self.newlines_known) self.ends_with_nl else false,
+            .unknown_newlines = vis and !self.newlines_known,
         };
     }
 
@@ -183,35 +187,51 @@ pub const Fragment = struct {
         right.off += at;
         right.len -= at;
 
-        if (self.newlines == 0) {
+        if (self.newlines_known and self.newlines == 0) {
             left.newlines = 0;
             right.newlines = 0;
             left.ends_with_nl = false;
             right.ends_with_nl = false;
-        } else if (resolver_opt) |res| {
-            if (res.resolve(self.key())) |bytes| {
-                const ls: usize = @intCast(left.off);
-                const le: usize = @intCast(left.off + left.len);
-                const re: usize = @intCast(right.off + right.len);
-                if (re <= bytes.len) {
-                    if (left.len <= right.len) {
-                        const lnl = countNewlinesSlice(bytes[ls..le]);
-                        left.newlines = lnl;
-                        right.newlines = self.newlines -| lnl;
-                    } else {
-                        const rnl = countNewlinesSlice(bytes[le..re]);
-                        right.newlines = rnl;
-                        left.newlines = self.newlines -| rnl;
+            left.newlines_known = true;
+            right.newlines_known = true;
+        } else {
+            var resolved = false;
+            if (resolver_opt) |res| {
+                if (res.resolve(self.key())) |bytes| {
+                    const ls: usize = @intCast(left.off);
+                    const le: usize = @intCast(left.off + left.len);
+                    const re: usize = @intCast(right.off + right.len);
+                    if (re <= bytes.len) {
+                        if (self.newlines_known) {
+                            if (left.len <= right.len) {
+                                const lnl = countNewlinesSlice(bytes[ls..le]);
+                                left.newlines = lnl;
+                                right.newlines = self.newlines -| lnl;
+                            } else {
+                                const rnl = countNewlinesSlice(bytes[le..re]);
+                                right.newlines = rnl;
+                                left.newlines = self.newlines -| rnl;
+                            }
+                        } else {
+                            left.newlines = countNewlinesSlice(bytes[ls..le]);
+                            right.newlines = countNewlinesSlice(bytes[le..re]);
+                        }
+                        left.ends_with_nl = left.len > 0 and bytes[le - 1] == '\n';
+                        right.ends_with_nl = right.len > 0 and bytes[re - 1] == '\n';
+                        left.newlines_known = true;
+                        right.newlines_known = true;
+                        resolved = true;
                     }
-                    left.ends_with_nl = left.len > 0 and bytes[le - 1] == '\n';
-                    right.ends_with_nl = right.len > 0 and bytes[re - 1] == '\n';
                 }
             }
-        } else {
-            left.newlines = 0;
-            left.ends_with_nl = false;
-            right.newlines = self.newlines;
-            right.ends_with_nl = self.ends_with_nl;
+            if (!resolved) {
+                left.newlines = 0;
+                right.newlines = 0;
+                left.ends_with_nl = false;
+                right.ends_with_nl = false;
+                left.newlines_known = false;
+                right.newlines_known = false;
+            }
         }
         return .{ left, right };
     }
@@ -238,8 +258,14 @@ pub const Fragment = struct {
 
     pub fn appendMerged(self: *Fragment, next: *const Fragment) void {
         self.len += next.len;
-        self.newlines +|= next.newlines;
-        if (next.len > 0) self.ends_with_nl = next.ends_with_nl;
+        if (self.newlines_known and next.newlines_known) {
+            self.newlines +|= next.newlines;
+            if (next.len > 0) self.ends_with_nl = next.ends_with_nl;
+        } else {
+            self.newlines = 0;
+            self.ends_with_nl = false;
+            self.newlines_known = false;
+        }
     }
 };
 
@@ -417,15 +443,17 @@ const Node = struct {
 fn buildTree(allocator: Allocator, frags: []Fragment) Allocator.Error!?*Node {
     if (frags.len == 0) return null;
     var level: std.ArrayList(*Node) = .empty;
+    var level_consumed: usize = 0;
     defer level.deinit(allocator);
     errdefer {
-        for (level.items) |n| n.release(allocator);
+        for (level.items[level_consumed..]) |n| n.release(allocator);
     }
 
     var i: usize = 0;
     while (i < frags.len) {
         const end = @min(i + LEAF_CAP, frags.len);
         const leaf = try Node.createLeaf(allocator, frags[i..end]);
+        errdefer leaf.release(allocator);
         try level.append(allocator, leaf);
         i = end;
     }
@@ -434,16 +462,20 @@ fn buildTree(allocator: Allocator, frags: []Fragment) Allocator.Error!?*Node {
         var next_level: std.ArrayList(*Node) = .empty;
         errdefer {
             for (next_level.items) |n| n.release(allocator);
+            next_level.deinit(allocator);
         }
         var j: usize = 0;
         while (j < level.items.len) {
             const end = @min(j + BRANCH_CAP, level.items.len);
             const br = try Node.createBranch(allocator, level.items[j..end]);
+            level_consumed = end;
+            errdefer br.release(allocator);
             try next_level.append(allocator, br);
             j = end;
         }
         level.deinit(allocator);
         level = next_level;
+        level_consumed = 0;
     }
     return level.items[0];
 }
@@ -452,6 +484,7 @@ fn ensureLeafCap(allocator: Allocator, node: *Node, needed: usize) Allocator.Err
     if (needed <= node.data.leaf.len) return;
     const new_cap = leafCapFor(needed);
     const new_buf = try allocator.alloc(Fragment, new_cap);
+    @memcpy(new_buf[0..node.len], node.data.leaf[0..node.len]);
     allocator.free(node.data.leaf);
     node.data.leaf = new_buf;
 }
@@ -465,9 +498,8 @@ fn writeLeafAndSplit(allocator: Allocator, node: *Node, buf: []const Fragment) A
         return null;
     }
     const mid = buf.len / 2;
-    const right = try Node.createLeaf(allocator, buf[mid..]);
-    errdefer right.release(allocator);
     try ensureLeafCap(allocator, node, mid);
+    const right = try Node.createLeaf(allocator, buf[mid..]);
     for (buf[0..mid], 0..) |f, i| node.data.leaf[i] = f;
     node.len = @intCast(mid);
     node.recomputeLeaf();
@@ -510,6 +542,13 @@ fn nodeInsertFast(
             var out_len: usize = 0;
             var acc: u64 = 0;
             var placed = false;
+            var split_old: ?Fragment = null;
+            var new_left: ?Fragment = null;
+            var new_right: ?Fragment = null;
+            errdefer {
+                if (new_left) |*l| l.deinit(allocator);
+                if (new_right) |*r| r.deinit(allocator);
+            }
 
             for (0..node.len) |i| {
                 const cur = node.data.leaf[i];
@@ -566,8 +605,9 @@ fn nodeInsertFast(
                     }
                     const cut = pos - acc;
                     const pair = try cur.split(allocator, cut, resolver);
-                    var old_cur = cur;
-                    old_cur.deinit(allocator);
+                    split_old = cur;
+                    new_left = pair[0];
+                    new_right = pair[1];
                     tmp[out_len] = pair[0];
                     out_len += 1;
                     tmp[out_len] = frag;
@@ -589,7 +629,11 @@ fn nodeInsertFast(
                     out_len += 1;
                 }
             }
-            return try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            const right_node = try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            new_left = null;
+            new_right = null;
+            if (split_old) |*o| o.deinit(allocator);
+            return right_node;
         },
         .branch => {
             var acc: u64 = 0;
@@ -606,6 +650,7 @@ fn nodeInsertFast(
             }
             const split_right = try nodeInsertFast(allocator, &node.data.branch.children[target_idx], local_pos, frag, resolver);
             if (split_right) |r| {
+                errdefer r.release(allocator);
                 return try insertChildInBranch(allocator, node, target_idx + 1, r);
             }
             node.recomputeBranch();
@@ -628,53 +673,113 @@ fn nodeDeleteFast(
     switch (node.kind) {
         .leaf => {
             var tmp: [LEAF_CAP + 2]Fragment = undefined;
+            var owned_new: [LEAF_CAP + 2]bool = @splat(false);
             var out_len: usize = 0;
+            var deferred_free: [2]Fragment = undefined;
+            var deferred_free_len: usize = 0;
+            errdefer {
+                for (0..out_len) |k| {
+                    if (owned_new[k]) tmp[k].deinit(allocator);
+                }
+                node.recomputeLeaf();
+            }
             var acc: u64 = 0;
             for (0..node.len) |i| {
-                var cur = node.data.leaf[i];
-                const w: u64 = if (cur.isVisible()) cur.len else 0;
+                const orig = node.data.leaf[i];
+                const w: u64 = if (orig.isVisible()) orig.len else 0;
                 if (w == 0 or rem.* == 0 or acc + w <= pos) {
-                    tmp[out_len] = cur;
+                    tmp[out_len] = orig;
+                    owned_new[out_len] = false;
                     out_len += 1;
                     acc += w;
                     continue;
                 }
                 if (acc < pos) {
                     const pre = pos - acc;
-                    const p1 = try cur.split(allocator, pre, resolver);
-                    cur.deinit(allocator);
-                    tmp[out_len] = p1[0];
-                    out_len += 1;
-                    acc += pre;
-                    cur = p1[1];
-                }
-                const avail = cur.len;
-                if (avail <= rem.*) {
-                    try cur.markDeleted(allocator, op);
-                    tmp[out_len] = cur;
-                    out_len += 1;
-                    acc += avail;
-                    rem.* -= avail;
+                    const p1 = try orig.split(allocator, pre, resolver);
+                    var left_part = p1[0];
+                    errdefer left_part.deinit(allocator);
+                    var right_part = p1[1];
+                    errdefer right_part.deinit(allocator);
+                    const avail = right_part.len;
+                    if (avail <= rem.*) {
+                        try right_part.markDeleted(allocator, op);
+                        deferred_free[deferred_free_len] = orig;
+                        deferred_free_len += 1;
+                        tmp[out_len] = left_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = right_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        acc += pre + avail;
+                        rem.* -= avail;
+                    } else {
+                        const p2 = try right_part.split(allocator, rem.*, resolver);
+                        var mid_part = p2[0];
+                        errdefer mid_part.deinit(allocator);
+                        var tail_part = p2[1];
+                        errdefer tail_part.deinit(allocator);
+                        try mid_part.markDeleted(allocator, op);
+                        right_part.deinit(allocator);
+                        deferred_free[deferred_free_len] = orig;
+                        deferred_free_len += 1;
+                        tmp[out_len] = left_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = mid_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = tail_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        acc += pre + avail;
+                        rem.* = 0;
+                    }
                 } else {
-                    const p2 = try cur.split(allocator, rem.*, resolver);
-                    cur.deinit(allocator);
-                    var mid = p2[0];
-                    try mid.markDeleted(allocator, op);
-                    tmp[out_len] = mid;
-                    out_len += 1;
-                    tmp[out_len] = p2[1];
-                    out_len += 1;
-                    acc += avail;
-                    rem.* = 0;
+                    const avail = orig.len;
+                    if (avail <= rem.*) {
+                        try node.data.leaf[i].markDeleted(allocator, op);
+                        tmp[out_len] = node.data.leaf[i];
+                        owned_new[out_len] = false;
+                        out_len += 1;
+                        acc += avail;
+                        rem.* -= avail;
+                    } else {
+                        const p2 = try orig.split(allocator, rem.*, resolver);
+                        var mid_part = p2[0];
+                        errdefer mid_part.deinit(allocator);
+                        var tail_part = p2[1];
+                        errdefer tail_part.deinit(allocator);
+                        try mid_part.markDeleted(allocator, op);
+                        deferred_free[deferred_free_len] = orig;
+                        deferred_free_len += 1;
+                        tmp[out_len] = mid_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = tail_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        acc += avail;
+                        rem.* = 0;
+                    }
                 }
             }
-            return try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            const right_node = try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            for (deferred_free[0..deferred_free_len]) |*old_f| old_f.deinit(allocator);
+            return right_node;
         },
         .branch => {
             var acc: u64 = 0;
             var i: usize = 0;
             var extra_splits: [BRANCH_CAP * 2]*Node = undefined;
             var new_count: usize = 0;
+            var extra_only: [BRANCH_CAP]*Node = undefined;
+            var extra_only_len: usize = 0;
+            errdefer {
+                for (extra_only[0..extra_only_len]) |r| r.release(allocator);
+                node.recomputeBranch();
+            }
             while (i < node.len) : (i += 1) {
                 const w = node.data.branch.summaries[i].visible;
                 if (rem.* > 0 and w > 0 and acc + w > pos) {
@@ -685,6 +790,8 @@ fn nodeDeleteFast(
                     if (split_r) |r| {
                         extra_splits[new_count] = r;
                         new_count += 1;
+                        extra_only[extra_only_len] = r;
+                        extra_only_len += 1;
                     }
                 } else {
                     extra_splits[new_count] = node.data.branch.children[i];
@@ -761,6 +868,13 @@ fn nodeInsertInView(
             const node = node_slot.*;
             var tmp: [LEAF_CAP + 2]Fragment = undefined;
             var out_len: usize = 0;
+            var split_old: ?Fragment = null;
+            var new_left: ?Fragment = null;
+            var new_right: ?Fragment = null;
+            errdefer {
+                if (new_left) |*l| l.deinit(allocator);
+                if (new_right) |*r| r.deinit(allocator);
+            }
 
             for (0..node.len) |i| {
                 const cur = node.data.leaf[i];
@@ -784,8 +898,9 @@ fn nodeInsertInView(
                     }
                     const cut = pos - acc.*;
                     const pair = try cur.split(allocator, cut, resolver);
-                    var old_cur = cur;
-                    old_cur.deinit(allocator);
+                    split_old = cur;
+                    new_left = pair[0];
+                    new_right = pair[1];
                     tmp[out_len] = pair[0];
                     out_len += 1;
                     tmp[out_len] = frag;
@@ -822,7 +937,11 @@ fn nodeInsertInView(
                 }
                 placed.* = true;
             }
-            return try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            const right_node = try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            new_left = null;
+            new_right = null;
+            if (split_old) |*o| o.deinit(allocator);
+            return right_node;
         },
         .branch => {
             var made_unique = false;
@@ -855,6 +974,7 @@ fn nodeInsertInView(
                     resolver,
                 );
                 if (split_right) |r| {
+                    errdefer r.release(allocator);
                     return try insertChildInBranch(allocator, node, i + 1, r);
                 }
                 if (placed.*) {
@@ -890,51 +1010,111 @@ fn nodeDeleteInView(
             node_slot.* = try node_slot.*.makeUnique(allocator);
             const node = node_slot.*;
             var tmp: [LEAF_CAP + 2]Fragment = undefined;
+            var owned_new: [LEAF_CAP + 2]bool = @splat(false);
             var out_len: usize = 0;
+            var deferred_free: [2]Fragment = undefined;
+            var deferred_free_len: usize = 0;
+            errdefer {
+                for (0..out_len) |k| {
+                    if (owned_new[k]) tmp[k].deinit(allocator);
+                }
+                node.recomputeLeaf();
+            }
             for (0..node.len) |i| {
-                var cur = node.data.leaf[i];
-                const w = cur.widthIn(view);
+                const orig = node.data.leaf[i];
+                const w = orig.widthIn(view);
                 if (w == 0 or rem.* == 0 or acc.* + w <= pos) {
-                    tmp[out_len] = cur;
+                    tmp[out_len] = orig;
+                    owned_new[out_len] = false;
                     out_len += 1;
                     acc.* += w;
                     continue;
                 }
                 if (acc.* < pos) {
                     const pre = pos - acc.*;
-                    const p1 = try cur.split(allocator, pre, resolver);
-                    cur.deinit(allocator);
-                    tmp[out_len] = p1[0];
-                    out_len += 1;
-                    acc.* += pre;
-                    cur = p1[1];
-                }
-                const avail = cur.len;
-                if (avail <= rem.*) {
-                    try cur.markDeleted(allocator, op);
-                    tmp[out_len] = cur;
-                    out_len += 1;
-                    acc.* += avail;
-                    rem.* -= avail;
+                    const p1 = try orig.split(allocator, pre, resolver);
+                    var left_part = p1[0];
+                    errdefer left_part.deinit(allocator);
+                    var right_part = p1[1];
+                    errdefer right_part.deinit(allocator);
+                    const avail = right_part.len;
+                    if (avail <= rem.*) {
+                        try right_part.markDeleted(allocator, op);
+                        deferred_free[deferred_free_len] = orig;
+                        deferred_free_len += 1;
+                        tmp[out_len] = left_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = right_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        acc.* += pre + avail;
+                        rem.* -= avail;
+                    } else {
+                        const p2 = try right_part.split(allocator, rem.*, resolver);
+                        var mid_part = p2[0];
+                        errdefer mid_part.deinit(allocator);
+                        var tail_part = p2[1];
+                        errdefer tail_part.deinit(allocator);
+                        try mid_part.markDeleted(allocator, op);
+                        right_part.deinit(allocator);
+                        deferred_free[deferred_free_len] = orig;
+                        deferred_free_len += 1;
+                        tmp[out_len] = left_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = mid_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = tail_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        acc.* += pre + avail;
+                        rem.* = 0;
+                    }
                 } else {
-                    const p2 = try cur.split(allocator, rem.*, resolver);
-                    cur.deinit(allocator);
-                    var mid = p2[0];
-                    try mid.markDeleted(allocator, op);
-                    tmp[out_len] = mid;
-                    out_len += 1;
-                    tmp[out_len] = p2[1];
-                    out_len += 1;
-                    acc.* += avail;
-                    rem.* = 0;
+                    const avail = orig.len;
+                    if (avail <= rem.*) {
+                        try node.data.leaf[i].markDeleted(allocator, op);
+                        tmp[out_len] = node.data.leaf[i];
+                        owned_new[out_len] = false;
+                        out_len += 1;
+                        acc.* += avail;
+                        rem.* -= avail;
+                    } else {
+                        const p2 = try orig.split(allocator, rem.*, resolver);
+                        var mid_part = p2[0];
+                        errdefer mid_part.deinit(allocator);
+                        var tail_part = p2[1];
+                        errdefer tail_part.deinit(allocator);
+                        try mid_part.markDeleted(allocator, op);
+                        deferred_free[deferred_free_len] = orig;
+                        deferred_free_len += 1;
+                        tmp[out_len] = mid_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        tmp[out_len] = tail_part;
+                        owned_new[out_len] = true;
+                        out_len += 1;
+                        acc.* += avail;
+                        rem.* = 0;
+                    }
                 }
             }
-            return try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            const right_node = try writeLeafAndSplit(allocator, node, tmp[0..out_len]);
+            for (deferred_free[0..deferred_free_len]) |*old_f| old_f.deinit(allocator);
+            return right_node;
         },
         .branch => {
             var made_unique = false;
             var extra_splits: [BRANCH_CAP * 2]*Node = undefined;
             var new_count: usize = 0;
+            var extra_only: [BRANCH_CAP]*Node = undefined;
+            var extra_only_len: usize = 0;
+            errdefer {
+                for (extra_only[0..extra_only_len]) |r| r.release(allocator);
+                if (made_unique) node_slot.*.recomputeBranch();
+            }
             var i: usize = 0;
             while (i < node_slot.*.len) : (i += 1) {
                 const cur_node = node_slot.*;
@@ -955,6 +1135,8 @@ fn nodeDeleteInView(
                     if (split_r) |r| {
                         extra_splits[new_count] = r;
                         new_count += 1;
+                        extra_only[extra_only_len] = r;
+                        extra_only_len += 1;
                     }
                 } else {
                     if (made_unique) {
@@ -988,6 +1170,11 @@ pub const TextError = error{
     Unordered,
     OutOfBounds,
     LengthMismatch,
+    InvalidSplice,
+};
+
+pub const DiffError = error{
+    MissingBlob,
 };
 
 pub const TextSplice = struct {
@@ -1061,6 +1248,7 @@ pub const Text = struct {
         if (len == 0) return .{};
         var nl: u32 = 0;
         var ends_nl = false;
+        var known = false;
         if (bytes_opt) |bytes| {
             const s: usize = @intCast(off);
             const e: usize = @intCast(off + len);
@@ -1068,6 +1256,7 @@ pub const Text = struct {
                 const sl = bytes[s..e];
                 nl = countNewlinesSlice(sl);
                 ends_nl = sl.len > 0 and sl[sl.len - 1] == '\n';
+                known = true;
             }
         }
         var arr = [_]Fragment{.{
@@ -1077,6 +1266,7 @@ pub const Text = struct {
             .off = off,
             .len = len,
             .ends_with_nl = ends_nl,
+            .newlines_known = known,
         }};
         return .{ .root = try buildTree(allocator, &arr) };
     }
@@ -1093,8 +1283,47 @@ pub const Text = struct {
         return if (r.summary.ends_with_nl) nl else nl + 1;
     }
 
-    pub fn countLines(self: *const Text, _: ContentResolver) usize {
-        return self.lineCount();
+    pub fn countLines(self: *const Text, resolver: ContentResolver) usize {
+        const r = self.root orelse return 0;
+        if (r.summary.visible == 0) return 0;
+        if (!r.summary.unknown_newlines) return self.lineCount();
+        var nl: usize = 0;
+        var last_nl = false;
+        countLinesNode(r, resolver, &nl, &last_nl);
+        return if (last_nl) nl else nl + 1;
+    }
+
+    fn countLinesNode(node: *const Node, resolver: ContentResolver, nl: *usize, last_nl: *bool) void {
+        if (node.summary.visible == 0) return;
+        if (!node.summary.unknown_newlines) {
+            nl.* += @intCast(node.summary.visible_newlines);
+            last_nl.* = node.summary.ends_with_nl;
+            return;
+        }
+        switch (node.kind) {
+            .leaf => {
+                for (node.data.leaf[0..node.len]) |*f| {
+                    if (!f.isVisible() or f.len == 0) continue;
+                    if (f.newlines_known) {
+                        nl.* += f.newlines;
+                        last_nl.* = f.ends_with_nl;
+                    } else if (resolver.resolve(f.key())) |bytes| {
+                        const st: usize = @intCast(f.off);
+                        const en: usize = @intCast(f.off + f.len);
+                        if (en <= bytes.len) {
+                            const sl = bytes[st..en];
+                            nl.* += countNewlinesSlice(sl);
+                            last_nl.* = sl.len > 0 and sl[sl.len - 1] == '\n';
+                        }
+                    }
+                }
+            },
+            .branch => {
+                for (node.data.branch.children[0..node.len]) |c| {
+                    countLinesNode(c, resolver, nl, last_nl);
+                }
+            },
+        }
     }
 
     pub fn lenIn(self: *const Text, view: View) u64 {
@@ -1224,20 +1453,24 @@ pub const Text = struct {
         out: *std.ArrayList(u8),
     ) Allocator.Error!bool {
         if (done.* or node.summary.visible == 0) return true;
-        const sub_nl: usize = @intCast(node.summary.visible_newlines);
-        if (cur_line.* + sub_nl < start_line) {
-            cur_line.* += sub_nl;
-            return true;
+        if (!node.summary.unknown_newlines) {
+            const sub_nl: usize = @intCast(node.summary.visible_newlines);
+            if (cur_line.* + sub_nl < start_line) {
+                cur_line.* += sub_nl;
+                return true;
+            }
         }
         switch (node.kind) {
             .leaf => {
                 for (node.data.leaf[0..node.len]) |*f| {
                     if (done.*) break;
                     if (!f.isVisible() or f.len == 0) continue;
-                    const fnl: usize = f.newlines;
-                    if (cur_line.* + fnl < start_line) {
-                        cur_line.* += fnl;
-                        continue;
+                    if (f.newlines_known) {
+                        const fnl: usize = f.newlines;
+                        if (cur_line.* + fnl < start_line) {
+                            cur_line.* += fnl;
+                            continue;
+                        }
                     }
                     const bytes = resolver.resolve(f.key()) orelse return false;
                     const s: usize = @intCast(f.off);
@@ -1349,7 +1582,7 @@ pub const Text = struct {
         resolver: ContentResolver,
         from_view: View,
         to_view: View,
-    ) Allocator.Error!ViewDiff {
+    ) (DiffError || Allocator.Error)!ViewDiff {
         const r = self.root orelse return .{};
         var pending: std.ArrayList(PendingSplice) = .empty;
         defer {
@@ -1400,7 +1633,7 @@ pub const Text = struct {
         cutoff: u64,
         from_pos: *u64,
         pending: *std.ArrayList(PendingSplice),
-    ) Allocator.Error!void {
+    ) (DiffError || Allocator.Error)!void {
         if (node.summary.max_ts < cutoff) {
             from_pos.* += node.summary.visible;
             return;
@@ -1432,12 +1665,12 @@ pub const Text = struct {
                         });
                         from_pos.* += f.len;
                     } else if (!in_from and in_to) {
-                        const bytes = resolver.resolve(f.key()) orelse continue;
+                        const bytes = resolver.resolve(f.key()) orelse return error.MissingBlob;
                         const s: usize = @intCast(f.off);
                         const e: usize = @intCast(f.off + f.len);
-                        if (e > bytes.len) continue;
+                        if (e > bytes.len) return error.MissingBlob;
                         const slice = bytes[s..e];
-                        const ins_nl = f.newlines;
+                        const ins_nl = if (f.newlines_known) f.newlines else countNewlinesSlice(slice);
                         if (pending.items.len > 0) {
                             const last = &pending.items[pending.items.len - 1];
                             if (last.at + last.del == from_pos.*) {
@@ -1485,37 +1718,32 @@ pub const Text = struct {
         self: *Text,
         allocator: Allocator,
         op: id.OpId,
-        splices: []const diff.Splice,
+        s: diff.Splice,
         inserted_bytes: []const u8,
         resolver: ?ContentResolver,
     ) Allocator.Error!void {
-        var delta: i64 = 0;
-        var ins_off: u64 = 0;
-        for (splices) |s| {
-            const cur_pos: u64 = @intCast(@as(i64, @intCast(s.at)) + delta);
-            if (s.ins > 0) {
-                const frag = makeFragment(op, ins_off, s.ins, inserted_bytes);
-                if (self.root != null) {
-                    if (try nodeInsertFast(allocator, &(self.root.?), cur_pos, frag, resolver)) |right| {
-                        const pair = [_]*Node{ self.root.?, right };
-                        self.root = try Node.createBranch(allocator, &pair);
-                    }
-                } else {
-                    const arr = [_]Fragment{frag};
-                    self.root = try Node.createLeaf(allocator, &arr);
+        if (s.ins > 0) {
+            const frag = makeFragment(op, 0, s.ins, inserted_bytes);
+            if (self.root != null) {
+                if (try nodeInsertFast(allocator, &(self.root.?), s.at, frag, resolver)) |right| {
+                    errdefer right.release(allocator);
+                    const pair = [_]*Node{ self.root.?, right };
+                    self.root = try Node.createBranch(allocator, &pair);
                 }
-                ins_off += s.ins;
+            } else {
+                const arr = [_]Fragment{frag};
+                self.root = try Node.createLeaf(allocator, &arr);
             }
-            if (s.del > 0) {
-                if (self.root != null) {
-                    var rem = s.del;
-                    if (try nodeDeleteFast(allocator, &(self.root.?), cur_pos + s.ins, &rem, op, resolver)) |right| {
-                        const pair = [_]*Node{ self.root.?, right };
-                        self.root = try Node.createBranch(allocator, &pair);
-                    }
+        }
+        if (s.del > 0) {
+            if (self.root != null) {
+                var rem = s.del;
+                if (try nodeDeleteFast(allocator, &(self.root.?), s.at + s.ins, &rem, op, resolver)) |right| {
+                    errdefer right.release(allocator);
+                    const pair = [_]*Node{ self.root.?, right };
+                    self.root = try Node.createBranch(allocator, &pair);
                 }
             }
-            delta += @as(i64, @intCast(s.ins)) - @as(i64, @intCast(s.del));
         }
     }
 
@@ -1532,16 +1760,16 @@ pub const Text = struct {
         var used_check: u64 = 0;
         for (splices) |s| {
             if (s.at < floor) return error.Unordered;
-            floor = s.at + s.del;
-            used_check += s.ins;
+            floor = std.math.add(u64, s.at, s.del) catch return error.InvalidSplice;
+            used_check = std.math.add(u64, used_check, s.ins) catch return error.InvalidSplice;
         }
         if (used_check != inserted_bytes.len) return error.LengthMismatch;
         if (splices.len == 0) return;
 
-        const fast_eligible = if (self.root) |r| r.summary.max_ts < @min(base_view.min_unobserved, op.ts) else true;
+        const fast_eligible = splices.len == 1 and (if (self.root) |r| r.summary.max_ts < @min(base_view.min_unobserved, op.ts) else true);
         if (fast_eligible) {
             if (floor > self.visibleLen()) return error.OutOfBounds;
-            try self.applyFast(allocator, op, splices, inserted_bytes, resolver);
+            try self.applyFast(allocator, op, splices[0], inserted_bytes, resolver);
             return;
         }
 
@@ -1572,6 +1800,7 @@ pub const Text = struct {
                     var acc: u64 = 0;
                     var placed = false;
                     if (try nodeInsertInView(allocator, &(self.root.?), s.at, frag, op, view, &acc, &placed, true, resolver)) |right| {
+                        errdefer right.release(allocator);
                         const pair = [_]*Node{ self.root.?, right };
                         self.root = try Node.createBranch(allocator, &pair);
                     }
@@ -1586,6 +1815,7 @@ pub const Text = struct {
                     var rem = s.del;
                     var acc: u64 = 0;
                     if (try nodeDeleteInView(allocator, &(self.root.?), s.at, &rem, op, view, &acc, resolver)) |right| {
+                        errdefer right.release(allocator);
                         const pair = [_]*Node{ self.root.?, right };
                         self.root = try Node.createBranch(allocator, &pair);
                     }
