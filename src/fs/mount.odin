@@ -280,6 +280,8 @@ Mount :: struct {
 	log_fd:      prim.Fd,
 	log_len:     i64,
 	lost:        bool,
+	window:      bool,
+	override:    map[string]odb.Oid,
 	clean:       bool,
 	waits:       [dynamic]Mount_Wait,
 	open_scopes: map[string]^Scope,
@@ -561,6 +563,7 @@ mount_close :: proc(m: ^Mount) {
 		image_free(m, &w.img)
 	}
 	delete(m.waits)
+	delete(m.override)
 	image_free(m, &m.img)
 	for k in m.attrib {
 		delete(k, m.allocator)
@@ -799,18 +802,23 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		rd := prim.reader(body)
 		path := prim.read_str(&rd)
 		actor := prim.read_id(&rd)
+		o: odb.Oid
+		if prim.reader_remaining(&rd) >= len(o) {
+			prim.read_fixed(&rd, o[:])
+		}
 		if !prim.reader_ok(&rd) {
 			break
 		}
-		attrib_set(m, path, actor)
+		attrib_set(m, path, actor, false, o)
 		pos += 8 + n
 	}
 	m.log_len = i64(pos)
+	m.window = pos > 0
 	return .None
 }
 
 @(private)
-attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id) -> Error {
+attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}) -> Error {
 	if m.log_fd < 0 {
 		return save_mount_state(m)
 	}
@@ -818,12 +826,20 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id) -> Error {
 	w := prim.writer(&body)
 	prim.write_str(&w, rel)
 	prim.write_id(&w, actor)
+	if oid != {} {
+		o := oid
+		prim.write_raw(&w, o[:])
+	}
 	rec := make([]u8, 8 + len(body), context.temp_allocator)
 	prim.put_u32le(rec[0:4], u32(len(body)))
 	prim.put_u32le(rec[4:8], u32(xxhash.XXH3_64_default(body[:])))
 	copy(rec[8:], body[:])
+	first := m.log_len == 0
 	from_prim(prim.write_at(m.vfs, m.log_fd, rec, m.log_len)) or_return
 	m.log_len += i64(len(rec))
+	if first {
+		from_prim(prim.datasync(m.vfs, m.log_fd)) or_return
+	}
 	return .None
 }
 
@@ -842,6 +858,26 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 		k, _ := delete_key(&m.open_scopes, rel)
 		delete(k, m.allocator)
 	}
+	a, ok := m.attrib[rel]
+	if !ok || a.used || m.db == nil {
+		return
+	}
+	abuf: prim.Path_Buf
+	abs := abs_path(m, rel, abuf[:])
+	st, serr := prim.lstat(m.vfs, abs)
+	if serr != .None || st.kind != .File || st.size > m.opts.large_limit {
+		return
+	}
+	data, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+	if rerr != .None {
+		return
+	}
+	oid, werr := odb.write(m.db, .Blob, data)
+	if werr != .None || oid == a.oid {
+		return
+	}
+	attrib_set(m, rel, a.actor, false, oid)
+	attrib_log_append(m, rel, a.actor, oid)
 }
 
 observer_installed :: proc(reg: ^Registry) -> bool {
@@ -1169,8 +1205,10 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			k := prim.read_str(&rd)
 			a := prim.read_id(&rd)
 			used := prim.read_bool(&rd)
+			o: odb.Oid
+			prim.read_fixed(&rd, o[:])
 			if prim.reader_ok(&rd) {
-				attrib_set(m, k, a, used)
+				attrib_set(m, k, a, used, o)
 			}
 		}
 	}
@@ -1240,16 +1278,17 @@ shadow_flush :: proc(m: ^Mount) -> Error {
 Attrib :: struct {
 	actor: prim.Id,
 	used:  bool,
+	oid:   odb.Oid,
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false) {
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}) {
 	if p, ok := &m.attrib[path]; ok {
-		p^ = Attrib{actor, used}
+		p^ = Attrib{actor, used, oid}
 		return
 	}
 	k, _ := clone_string(path, m.allocator)
-	m.attrib[k] = Attrib{actor, used}
+	m.attrib[k] = Attrib{actor, used, oid}
 }
 
 @(private)
@@ -1364,6 +1403,8 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		prim.write_str(&w, k)
 		prim.write_id(&w, a.actor)
 		prim.write_bool(&w, a.used)
+		o := a.oid
+		prim.write_raw(&w, o[:])
 	}
 	boot := registry_boot(m.reg) if m.reg != nil else prim.Id{}
 	prim.write_id(&w, boot)

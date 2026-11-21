@@ -925,6 +925,56 @@ catch_up :: proc(m: ^Mount) -> Error {
 	return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), true)
 }
 
+@(private)
+attribute_changes :: proc(p: ^Pass) -> Error {
+	m := p.m
+	for &c in p.changes {
+		if c.scope != nil {
+			continue
+		}
+		a, has := m.attrib[c.path]
+		if !has {
+			if m.lost && m.window {
+				c.actor = unattributed_actor(m.actor)
+			}
+			continue
+		}
+		file := (c.kind == .Modify || c.kind == .Create) && c.disk == .File && c.moved == ""
+		if !file || a.oid == {} || m.db == nil || !odb.exists(m.db, a.oid) {
+			c.actor = unattributed_actor(m.actor) if m.lost else a.actor
+			continue
+		}
+		_, disk_oid, _, ok := read_content(m, c.path, c.stat) or_return
+		if !ok || disk_oid == a.oid {
+			c.actor = a.actor
+			continue
+		}
+		first := c
+		first.stat = {}
+		if m.override == nil {
+			m.override = make(map[string]odb.Oid, m.allocator)
+		}
+		k, _ := clone_string(c.path, m.allocator)
+		m.override[k] = a.oid
+		b: Builder
+		builder_init(&b, m.history, a.actor)
+		attrib_set(m, c.path, a.actor, true, a.oid)
+		eerr := emit_change(p, &b, &first)
+		key, _ := delete_key(&m.override, k)
+		delete(key, m.allocator)
+		eerr or_return
+		builder_commit(m, &b) or_return
+		e, found := shadow_get(&m.shadow, c.path) or_return
+		if !found {
+			continue
+		}
+		c.kind = .Modify
+		c.old = e
+		c.actor = {}
+	}
+	return .None
+}
+
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	long: virtual.Arena
 	if virtual.arena_init_growing(&long, 256 << 10) != nil {
@@ -1233,11 +1283,6 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				}
 			}
 		}
-		if c.scope == nil {
-			if a, ok := m.attrib[c.path]; ok {
-				c.actor = a.actor
-			}
-		}
 	}
 	detect_moves(p)
 	if !final && p.full {
@@ -1287,14 +1332,13 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		}
 		builder_commit(m, &b) or_return
 	} else {
+		attribute_changes(p) or_return
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
 		order := make([dynamic]prim.Id, context.temp_allocator)
 		for c, i in p.changes {
 			actor := m.actor
 			if c.scope != nil {
 				actor = c.scope.actor
-			} else if m.lost {
-				actor = unattributed_actor(m.actor)
 			} else if c.actor != {} {
 				actor = c.actor
 			}
@@ -1340,7 +1384,7 @@ probe :: proc(m: ^Mount, rel: string) -> Probe {
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
 	st, err := prim.lstat(m.vfs, abs)
-	if err != .None {
+	if err != .None || !disk_name_matches(m.vfs, abs) {
 		return {kind = .Missing}
 	}
 	out := Probe{kind = disk_kind(st.kind), stat = disk_stat(st)}
@@ -2015,6 +2059,13 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 
 @(private)
 read_content :: proc(m: ^Mount, rel: string, stat: Stat) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
+	if o, has := m.override[rel]; has && m.db != nil {
+		t, d, rerr := odb.read(m.db, o, context.temp_allocator)
+		if rerr != .None || t != .Blob {
+			return nil, {}, false, false, .None
+		}
+		return d, o, textdiff.is_binary(d), true, .None
+	}
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
 	if stat.size > m.opts.large_limit {
