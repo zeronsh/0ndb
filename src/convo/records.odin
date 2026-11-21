@@ -99,7 +99,7 @@ Forks :: struct {
 	assigns:    []Digest_Assign,
 	mounts:     []Digest_Mount,
 	superseded: []Superseded,
-	landed:     []Ref,
+	landed:     []Digest_Landed,
 	spine:      Spine_Index,
 	base:       i64,
 	base_len:   i64,
@@ -179,8 +179,14 @@ Superseded :: struct {
 }
 
 Landed :: struct {
-	run:   Ref,
-	files: []File_Delta,
+	run:     Ref,
+	files:   []File_Delta,
+	outcome: Seal_Status,
+}
+
+Digest_Landed :: struct {
+	run:     Ref,
+	outcome: Seal_Status,
 }
 
 Mount :: struct {
@@ -519,7 +525,15 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 			_nested(w, 5, b[:])
 		}
 		for e in v.landed {
-			obj.tw_ref(w, 6, off, e)
+			if e.outcome == .Done {
+				obj.tw_ref(w, 6, off, e.run)
+			} else {
+				b := make([dynamic]u8, context.temp_allocator)
+				bw := prim.writer(&b)
+				obj.tw_ref(&bw, 1, off, e.run)
+				obj.tw_uv(&bw, 2, u64(e.outcome))
+				_nested(w, 11, b[:])
+			}
 		}
 		if v.spine.at != 0 || v.spine.c != 0 {
 			b := make([dynamic]u8, context.temp_allocator)
@@ -591,6 +605,9 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 	case Landed:
 		obj.tw_ref(w, 1, off, v.run)
 		_put_files(w, 2, v.files)
+		if v.outcome != .Done {
+			obj.tw_uv(w, 3, u64(v.outcome))
+		}
 	case Mount:
 		obj.tw_str(w, 1, v.name)
 		obj.tw_id(w, 2, v.tree)
@@ -962,10 +979,25 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		assigns := make([dynamic]Digest_Assign, allocator)
 		mounts := make([dynamic]Digest_Mount, allocator)
 		sups := make([dynamic]Superseded, allocator)
-		landed := make([dynamic]Ref, allocator)
+		landed := make([dynamic]Digest_Landed, allocator)
 		for obj.dec_next(&d) {
 			if d.f.tag == 6 {
-				append(&landed, obj.dec_ref(&d))
+				append(&landed, Digest_Landed{obj.dec_ref(&d), .Done})
+				continue
+			}
+			if d.f.tag == 11 {
+				sub := obj.dec_init(obj.dec_bytes(&d), off)
+				e := Digest_Landed{outcome = .Done}
+				for obj.dec_next(&sub) {
+					switch sub.f.tag {
+					case 1:
+						e.run = obj.dec_ref(&sub)
+					case 2:
+						e.outcome = Seal_Status(obj.dec_enum(&sub, 1, u8(max(Seal_Status))))
+					}
+				}
+				d.bad ||= !obj.dec_ok(&sub) || obj.ref_none(e.run)
+				append(&landed, e)
 				continue
 			}
 			if d.f.tag == 8 {
@@ -1204,6 +1236,7 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		rec.body = v
 	case .Landed:
 		v: Landed
+		v.outcome = .Done
 		files := make([dynamic]File_Delta, allocator)
 		for obj.dec_next(&d) {
 			switch d.f.tag {
@@ -1211,6 +1244,8 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				v.run = obj.dec_ref(&d)
 			case 2:
 				append(&files, _get_file(&d, off))
+			case 3:
+				v.outcome = Seal_Status(obj.dec_enum(&d, 1, u8(max(Seal_Status))))
 			}
 		}
 		v.files = files[:]

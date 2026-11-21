@@ -1,7 +1,6 @@
 package convo
 
 import "base:runtime"
-import "core:mem/virtual"
 import "../obj"
 import "../prim"
 
@@ -53,7 +52,7 @@ Structure :: struct {
 	index:      map[[2]Vref]int,
 	assigns:    [dynamic]Assign_Entry,
 	superseded: [dynamic][2]Vref,
-	landed:     [dynamic]Vref,
+	landed:     [dynamic]Landed_Entry,
 	mounts:     [dynamic]Mount_Entry,
 	spines:     []Seg_Spine,
 	branches:   ^[dynamic]Branch,
@@ -82,7 +81,7 @@ Pos :: struct {
 
 @(private)
 Structure_Cache :: struct {
-	arena: virtual.Arena,
+	arena: runtime.Arena,
 	ready: bool,
 	ends:  [dynamic]i64,
 	now:   [dynamic]i64,
@@ -111,7 +110,7 @@ _cache :: proc(v: ^obj.View) -> (c: ^Structure_Cache, err: Error) {
 	v.cache_free = proc(p: rawptr, allocator: runtime.Allocator) {
 		c := (^Structure_Cache)(p)
 		if c.ready {
-			virtual.arena_destroy(&c.arena)
+			runtime.arena_destroy(&c.arena)
 		}
 		delete(c.ends)
 		delete(c.now)
@@ -132,21 +131,21 @@ structure_load :: proc(v: ^obj.View, t: ^Tail, floor: prim.Hlc, st: ^Structure) 
 	}
 	if !same {
 		if c.ready {
-			virtual.arena_destroy(&c.arena)
+			runtime.arena_destroy(&c.arena)
 			c.ready = false
 		}
-		if virtual.arena_init_growing(&c.arena) != nil {
+		if _arena_init(&c.arena) != nil {
 			return .No_Memory
 		}
 		c.ready = true
-		a := virtual.arena_allocator(&c.arena)
+		a := runtime.arena_allocator(&c.arena)
 		c.st = {
 			entries    = make([dynamic]Entry, a),
 			chains     = make([dynamic]Entry, a),
 			index      = make(map[[2]Vref]int, a),
 			assigns    = make([dynamic]Assign_Entry, a),
 			superseded = make([dynamic][2]Vref, a),
-			landed     = make([dynamic]Vref, a),
+			landed     = make([dynamic]Landed_Entry, a),
 			mounts     = make([dynamic]Mount_Entry, a),
 			spines     = make([]Seg_Spine, len(v.segs), a),
 			branches   = new([dynamic]Branch, a),
@@ -169,7 +168,7 @@ structure_load :: proc(v: ^obj.View, t: ^Tail, floor: prim.Hlc, st: ^Structure) 
 		append(&c.ends, ..c.now[:])
 	}
 	if c.st.floor > floor {
-		a := virtual.arena_allocator(&c.arena)
+		a := runtime.arena_allocator(&c.arena)
 		missing := false
 		for s in 0 ..< len(v.segs) {
 			w := &c.walks[s]
@@ -188,7 +187,7 @@ structure_load :: proc(v: ^obj.View, t: ^Tail, floor: prim.Hlc, st: ^Structure) 
 			if e == .Missing {
 				missing = true
 			} else if e != .None {
-				virtual.arena_destroy(&c.arena)
+				runtime.arena_destroy(&c.arena)
 				c.ready = false
 				return e
 			}
@@ -289,13 +288,19 @@ is_superseded :: proc(st: ^Structure, claim: Vref) -> bool {
 	return false
 }
 
-is_landed :: proc(st: ^Structure, claim: Vref) -> bool {
+Landed_Entry :: struct {
+	run:     Vref,
+	outcome: Seal_Status,
+}
+
+is_landed :: proc(st: ^Structure, claim: Vref) -> (landed: bool, outcome: Seal_Status) {
 	for l in st.landed {
-		if l == claim {
-			return true
+		if l.run == claim {
+			landed = true
+			outcome = max(outcome, l.outcome)
 		}
 	}
-	return false
+	return
 }
 
 sort_children :: proc(list: []Entry, v: ^obj.View) {
@@ -423,7 +428,8 @@ _visit_structure :: proc(c: ^Chain_Ctx, s: int, off: i64, env: ^obj.Envelope) ->
 		_add_digest(c, s, r) or_return
 		full: Forks
 		if r.base != 0 {
-			body, _ := obj.get(v, s, r.base, -1, r.base + r.base_len) or_return
+			raw, _ := obj.get(v, s, r.base, -1, r.base + r.base_len) or_return
+			body := obj.clone_bytes(raw, v.scratch) or_return
 			br := decode_record(body, r.base, v.scratch) or_return
 			ok: bool
 			full, ok = br.body.(Forks)
@@ -466,7 +472,7 @@ _visit_structure :: proc(c: ^Chain_Ctx, s: int, off: i64, env: ^obj.Envelope) ->
 		append(&c.st.superseded, [2]Vref{run, by})
 	case Landed:
 		run := obj.resolve(v, s, r.run) or_return
-		append(&c.st.landed, run)
+		append(&c.st.landed, Landed_Entry{run, r.outcome})
 	case Mount:
 		name := obj.clone_str(r.name, c.alloc) or_return
 		path := obj.clone_str(r.path, c.alloc) or_return
@@ -766,8 +772,19 @@ _add_digest :: proc(c: ^Chain_Ctx, s: int, r: Forks) -> Error {
 		append(&c.st.superseded, [2]Vref{run, by})
 	}
 	for d in r.landed {
-		run := obj.resolve(v, s, d) or_return
-		append(&c.st.landed, run)
+		run := obj.resolve(v, s, d.run) or_return
+		append(&c.st.landed, Landed_Entry{run, d.outcome})
 	}
 	return .None
+}
+
+ARENA_BLOCK :: 1 << 20
+
+@(private)
+_arena_init :: proc(a: ^runtime.Arena) -> runtime.Allocator_Error {
+	a^ = runtime.Arena{
+		backing_allocator  = context.allocator,
+		minimum_block_size = ARENA_BLOCK,
+	}
+	return nil
 }

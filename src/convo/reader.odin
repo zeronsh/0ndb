@@ -69,6 +69,7 @@ Message :: struct {
 	siblings:    int,
 	superseded:  bool,
 	landed:      bool,
+	landed_as:   Seal_Status,
 	claim:       Rid,
 	lines:       []Line,
 }
@@ -1259,7 +1260,7 @@ _page_siblings :: proc(v: ^obj.View, t: ^Tail, msgs: []Message, floor: prim.Hlc,
 			continue
 		}
 		c := obj.vref(v, m.claim) or_return
-		m.landed = is_landed(&st, c)
+		m.landed, m.landed_as = is_landed(&st, c)
 		m.superseded = is_superseded(&st, c)
 		env, red := obj.envelope(v, c.seg, c.off) or_return
 		if !red {

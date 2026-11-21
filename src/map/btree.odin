@@ -2,7 +2,6 @@ package omap
 
 import "base:runtime"
 import "core:hash/xxhash"
-import "core:mem/virtual"
 import "../obj"
 import "../prim"
 
@@ -56,7 +55,7 @@ Db :: struct {
 
 Txn :: struct {
 	db:    ^Db,
-	arena: virtual.Arena,
+	arena: runtime.Arena,
 	alloc: runtime.Allocator,
 	meta:  Meta,
 	dirty: [dynamic]^Node,
@@ -222,12 +221,12 @@ txn_begin :: proc(db: ^Db) -> (t: ^Txn, err: Error) {
 	if t == nil {
 		return nil, .No_Memory
 	}
-	if virtual.arena_init_growing(&t.arena) != nil {
+	if _arena_init(&t.arena) != nil {
 		free(t, db.allocator)
 		return nil, .No_Memory
 	}
 	t.db = db
-	t.alloc = virtual.arena_allocator(&t.arena)
+	t.alloc = runtime.arena_allocator(&t.arena)
 	t.meta = db.meta
 	t.dirty = make([dynamic]^Node, t.alloc)
 	t.clean = make(map[u64]^Node, t.alloc)
@@ -237,7 +236,7 @@ txn_begin :: proc(db: ^Db) -> (t: ^Txn, err: Error) {
 
 txn_abort :: proc(t: ^Txn) {
 	db := t.db
-	virtual.arena_destroy(&t.arena)
+	runtime.arena_destroy(&t.arena)
 	db.txn = nil
 	free(t, db.allocator)
 }
@@ -405,11 +404,11 @@ db_compact :: proc(db: ^Db) -> Error {
 		fd   = fd,
 		next = 2,
 	}
-	if virtual.arena_init_growing(&c.arena) != nil {
+	if _arena_init(&c.arena) != nil {
 		return .No_Memory
 	}
-	defer virtual.arena_destroy(&c.arena)
-	c.buf = make([dynamic]u8, 0, WRITE_CHUNK * PAGE, virtual.arena_allocator(&c.arena))
+	defer runtime.arena_destroy(&c.arena)
+	c.buf = make([dynamic]u8, 0, WRITE_CHUNK * PAGE, runtime.arena_allocator(&c.arena))
 	m := db.meta
 	for r in 0 ..< ROOTS {
 		if m.roots[r] != 0 {
@@ -443,7 +442,7 @@ Copier :: struct {
 	next:  u64,
 	at:    u64,
 	buf:   [dynamic]u8,
-	arena: virtual.Arena,
+	arena: runtime.Arena,
 }
 
 @(private)
@@ -481,9 +480,9 @@ _copier_flush :: proc(c: ^Copier) -> Error {
 
 @(private)
 _copy_tree :: proc(c: ^Copier, ref: u64) -> (page: u64, err: Error) {
-	mark := virtual.arena_temp_begin(&c.arena)
-	defer virtual.arena_temp_end(mark)
-	alloc := virtual.arena_allocator(&c.arena)
+	mark := runtime.arena_temp_begin(&c.arena)
+	defer runtime.arena_temp_end(mark)
+	alloc := runtime.arena_allocator(&c.arena)
 	n := _node_read(c.db, ref, alloc) or_return
 	if n.leaf {
 		for &v in n.vals {
@@ -1092,7 +1091,7 @@ Build_Tree :: struct {
 
 @(private)
 Build_Level :: struct {
-	arena:   virtual.Arena,
+	arena:   runtime.Arena,
 	node:    Node,
 	first:   []u8,
 	size:    int,
@@ -1119,12 +1118,12 @@ builder_begin :: proc(b: ^Builder, db: ^Db) -> Error {
 		fd   = fd,
 		next = 2,
 	}
-	if virtual.arena_init_growing(&b.c.arena) != nil {
+	if _arena_init(&b.c.arena) != nil {
 		prim.close_file(db.vfs, fd)
 		prim.remove(db.vfs, string(b.tmp[:b.tlen]))
 		return .No_Memory
 	}
-	b.c.buf = make([dynamic]u8, 0, WRITE_CHUNK * PAGE, virtual.arena_allocator(&b.c.arena))
+	b.c.buf = make([dynamic]u8, 0, WRITE_CHUNK * PAGE, runtime.arena_allocator(&b.c.arena))
 	b.meta = Meta{
 		txn = db.meta.txn,
 	}
@@ -1176,7 +1175,7 @@ builder_add :: proc(b: ^Builder, root: int, key: []u8, value: []u8) -> Error {
 	if len(l.node.keys) > 0 && l.size + cost > PAGE {
 		_level_flush(b, t, 0) or_return
 	}
-	a := virtual.arena_allocator(&l.arena)
+	a := runtime.arena_allocator(&l.arena)
 	if v.size > INLINE_LIMIT {
 		v.ovf = b.c.next
 		pos := 0
@@ -1224,7 +1223,7 @@ builder_end :: proc(b: ^Builder, root: int) -> Error {
 				break
 			}
 			p, dst := _copier_page(&b.c) or_return
-			_encode_into(&l.node, dst, p, virtual.arena_allocator(&l.arena))
+			_encode_into(&l.node, dst, p, runtime.arena_allocator(&l.arena))
 			b.meta.roots[root] = p
 			break
 		}
@@ -1273,7 +1272,7 @@ _builder_free :: proc(b: ^Builder) {
 	for &t in b.trees {
 		_tree_free(&t)
 	}
-	virtual.arena_destroy(&b.c.arena)
+	runtime.arena_destroy(&b.c.arena)
 }
 
 @(private)
@@ -1282,7 +1281,7 @@ _tree_free :: proc(t: ^Build_Tree) {
 		return
 	}
 	for l in t.levels {
-		virtual.arena_destroy(&l.arena)
+		runtime.arena_destroy(&l.arena)
 		free(l, t.allocator)
 	}
 	delete(t.levels)
@@ -1296,13 +1295,13 @@ _level_push :: proc(b: ^Builder, t: ^Build_Tree) -> Error {
 	if l == nil {
 		return .No_Memory
 	}
-	if virtual.arena_init_growing(&l.arena) != nil {
+	if _arena_init(&l.arena) != nil {
 		free(l, t.allocator)
 		return .No_Memory
 	}
 	_level_reset(l, len(t.levels) == 0)
 	if _, e := append(&t.levels, l); e != nil {
-		virtual.arena_destroy(&l.arena)
+		runtime.arena_destroy(&l.arena)
 		free(l, t.allocator)
 		return .No_Memory
 	}
@@ -1311,8 +1310,8 @@ _level_push :: proc(b: ^Builder, t: ^Build_Tree) -> Error {
 
 @(private)
 _level_reset :: proc(l: ^Build_Level, leaf: bool) {
-	virtual.arena_free_all(&l.arena)
-	a := virtual.arena_allocator(&l.arena)
+	runtime.arena_free_all(&l.arena)
+	a := runtime.arena_allocator(&l.arena)
 	l.node = Node{
 		leaf = leaf,
 		keys = make([dynamic][]u8, a),
@@ -1331,7 +1330,7 @@ _level_reset :: proc(l: ^Build_Level, leaf: bool) {
 _level_flush :: proc(b: ^Builder, t: ^Build_Tree, i: int) -> Error {
 	l := t.levels[i]
 	p, dst := _copier_page(&b.c) or_return
-	_encode_into(&l.node, dst, p, virtual.arena_allocator(&l.arena))
+	_encode_into(&l.node, dst, p, runtime.arena_allocator(&l.arena))
 	if i + 1 == len(t.levels) {
 		_level_push(b, t) or_return
 	}
@@ -1348,7 +1347,7 @@ _level_add_kid :: proc(b: ^Builder, t: ^Build_Tree, i: int, first: []u8, page: u
 	if len(l.node.kids) > 0 && l.size + cost > PAGE {
 		_level_flush(b, t, i) or_return
 	}
-	a := virtual.arena_allocator(&l.arena)
+	a := runtime.arena_allocator(&l.arena)
 	k, e := make([]u8, len(first), a)
 	if e != nil {
 		return .No_Memory
@@ -1363,4 +1362,15 @@ _level_add_kid :: proc(b: ^Builder, t: ^Build_Tree, i: int, first: []u8, page: u
 	append(&l.node.kids, page)
 	l.size += cost
 	return .None
+}
+
+ARENA_BLOCK :: 1 << 20
+
+@(private)
+_arena_init :: proc(a: ^runtime.Arena) -> runtime.Allocator_Error {
+	a^ = runtime.Arena{
+		backing_allocator  = context.allocator,
+		minimum_block_size = ARENA_BLOCK,
+	}
+	return nil
 }

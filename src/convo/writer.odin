@@ -496,10 +496,13 @@ writer_superseded :: proc(w: ^Writer, run: Rid, by: Rid) -> (off: i64, err: Erro
 	return _event(w, Superseded{run = rr, by = br})
 }
 
-writer_landed :: proc(w: ^Writer, run: Rid, files: []File_Delta) -> (off: i64, err: Error) {
+writer_landed :: proc(w: ^Writer, run: Rid, files: []File_Delta, outcome := Seal_Status.Done) -> (off: i64, err: Error) {
+	if outcome == .Open || outcome > max(Seal_Status) {
+		return 0, .Invalid
+	}
 	_prepare(w, false) or_return
 	rr := _local_rid(w, run) or_return
-	return _event(w, Landed{run = rr, files = files})
+	return _event(w, Landed{run = rr, files = files, outcome = outcome})
 }
 
 writer_mount :: proc(w: ^Writer, name: string, tree: prim.Id, line: prim.Id, path := "") -> (off: i64, err: Error) {
@@ -1080,6 +1083,8 @@ _intent :: proc(w: ^Writer, body: Body) -> (item: Rid, err: Error) {
 @(private)
 _redact_record :: proc(w: ^Writer, from: Vref, to: i64, target: Vref) -> Error {
 	_flush(w) or_return
+	obj.local(&w.core, from) or_return
+	obj.local(&w.core, target) or_return
 	obj.seg_flush(&w.core, true) or_return
 	off := obj.writer_len(&w.core)
 	extra := encode_summary(off, &w.sum)
@@ -1098,7 +1103,7 @@ _write_digest :: proc(w: ^Writer, full: bool) -> Error {
 		assigns:    [dynamic]Digest_Assign,
 		mounts:     [dynamic]Digest_Mount,
 		superseded: [dynamic]Superseded,
-		landed:     [dynamic]Ref,
+		landed:     [dynamic]Digest_Landed,
 		heads:      map[i64]Spine_Head,
 		prior:      Spine_Index,
 		base:       i64,
@@ -1117,7 +1122,7 @@ _write_digest :: proc(w: ^Writer, full: bool) -> Error {
 		assigns    = make([dynamic]Digest_Assign, v.scratch),
 		mounts     = make([dynamic]Digest_Mount, v.scratch),
 		superseded = make([dynamic]Superseded, v.scratch),
-		landed     = make([dynamic]Ref, v.scratch),
+		landed     = make([dynamic]Digest_Landed, v.scratch),
 	}
 	add :: proc(c: ^Ctx, d: Remember) {
 		key := [3]Ref{d.parent, d.child, d.leaf}
@@ -1187,7 +1192,7 @@ _write_digest :: proc(w: ^Writer, full: bool) -> Error {
 		case Superseded:
 			append(&c.superseded, r)
 		case Landed:
-			append(&c.landed, r.run)
+			append(&c.landed, Digest_Landed{r.run, r.outcome})
 		case Mount:
 			name := obj.clone_str(r.name, c.v.scratch) or_return
 			path := obj.clone_str(r.path, c.v.scratch) or_return
@@ -1200,7 +1205,8 @@ _write_digest :: proc(w: ^Writer, full: bool) -> Error {
 	}
 	obj.walk_events(v, w.core.seg, 0, &ctx, visit) or_return
 	if ctx.need_base {
-		body, _ := obj.get(v, w.core.seg, ctx.base) or_return
+		raw, _ := obj.get(v, w.core.seg, ctx.base) or_return
+		body := obj.clone_bytes(raw, v.scratch) or_return
 		rec := decode_record(body, ctx.base, v.scratch) or_return
 		r, ok := rec.body.(Forks)
 		if !ok || r.base != 0 {
@@ -1272,7 +1278,7 @@ _write_digest :: proc(w: ^Writer, full: bool) -> Error {
 	if is_full {
 		sum.since = 0
 		sum.base = off
-		sum.digest_size = u32(min(len(ctx.forks) + len(ctx.assigns) + len(ctx.mounts) + len(ctx.superseded) + len(ctx.landed), int(max(u32))))
+		sum.digest_size = u32(min(u64(len(ctx.forks) + len(ctx.assigns) + len(ctx.mounts) + len(ctx.superseded) + len(ctx.landed)), u64(max(u32))))
 	} else {
 		digest.base = ctx.base
 		digest.base_len = w.sum.base_len

@@ -1,7 +1,6 @@
 package omap
 
 import "base:runtime"
-import "core:mem/virtual"
 import "core:slice"
 import "../journal"
 import "../obj"
@@ -122,12 +121,12 @@ table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, e
 		return journal.reader_end(r), .None
 	}
 	pos = table_consumed(t, seg) or_return
-	scratch: virtual.Arena
-	if virtual.arena_init_growing(&scratch) != nil {
+	scratch: runtime.Arena
+	if _arena_init(&scratch) != nil {
 		return pos, .No_Memory
 	}
-	defer virtual.arena_destroy(&scratch)
-	context.temp_allocator = virtual.arena_allocator(&scratch)
+	defer runtime.arena_destroy(&scratch)
+	context.temp_allocator = runtime.arena_allocator(&scratch)
 	txn := txn_begin(&t.db) or_return
 	stop: Error
 	for {
@@ -156,7 +155,7 @@ table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, e
 			}
 			txn = txn_begin(&t.db) or_return
 		}
-		virtual.arena_free_all(&scratch)
+		runtime.arena_free_all(&scratch)
 	}
 	if ce := _commit_consumed(txn, seg, pos); ce != .None {
 		return pos, ce
@@ -293,7 +292,7 @@ table_rebuild :: proc(t: ^Table, sources: []Source) -> Error {
 		sources = sources,
 	}
 	defer _rebuild_cleanup(&rb)
-	if virtual.arena_init_growing(&rb.batch) != nil || virtual.arena_init_growing(&rb.scratch) != nil {
+	if _arena_init(&rb.batch) != nil || _arena_init(&rb.scratch) != nil {
 		return .No_Memory
 	}
 	rb.ready = true
@@ -365,8 +364,8 @@ Rebuild :: struct {
 	t:       ^Table,
 	sources: []Source,
 	ends:    []i64,
-	batch:   virtual.Arena,
-	scratch: virtual.Arena,
+	batch:   runtime.Arena,
+	scratch: runtime.Arena,
 	ready:   bool,
 	items:   [dynamic]Run_Item,
 	runs:    [dynamic]string,
@@ -390,8 +389,8 @@ _rebuild_cleanup :: proc(rb: ^Rebuild) {
 	delete(rb.iruns)
 	delete(rb.items)
 	delete(rb.ends, rb.t.allocator)
-	virtual.arena_destroy(&rb.batch)
-	virtual.arena_destroy(&rb.scratch)
+	runtime.arena_destroy(&rb.batch)
+	runtime.arena_destroy(&rb.scratch)
 }
 
 @(private)
@@ -410,7 +409,7 @@ _rebuild_source :: proc(rb: ^Rebuild, i: int, s: Source) -> Error {
 			return obj.jerr(e)
 		}
 		if !obj.is_sig(body) && !obj.is_redacted(body) && obj.record_kind(body) >= obj.RECORD_KIND_FIRST {
-			a := virtual.arena_allocator(&rb.batch)
+			a := runtime.arena_allocator(&rb.batch)
 			own := obj.clone_bytes(body, a) or_return
 			env, eerr := obj.decode_envelope(own, pos)
 			if eerr == .None {
@@ -482,7 +481,7 @@ _spill_entries :: proc(rb: ^Rebuild) -> Error {
 	w: Run_Writer
 	_run_create(&w, rb.t.vfs, path, rb.t.allocator) or_return
 	defer _run_close(&w)
-	sa := virtual.arena_allocator(&rb.scratch)
+	sa := runtime.arena_allocator(&rb.scratch)
 	buf := make([dynamic]u8, rb.t.allocator)
 	defer delete(buf)
 	i := 0
@@ -503,12 +502,12 @@ _spill_entries :: proc(rb: ^Rebuild) -> Error {
 			encode_entry(&buf, &e) or_return
 		}
 		_run_put(&w, e.key, buf[:]) or_return
-		virtual.arena_free_all(&rb.scratch)
+		runtime.arena_free_all(&rb.scratch)
 		i = j
 	}
 	_run_flush(&w) or_return
 	clear(&rb.items)
-	virtual.arena_free_all(&rb.batch)
+	runtime.arena_free_all(&rb.batch)
 	return .None
 }
 
@@ -545,7 +544,7 @@ _merge_runs :: proc(rb: ^Rebuild, paths: []string, data: rawptr, emit: proc(rb: 
 		clear(&key)
 		append(&key, ..readers[best].key)
 		clear(&vals)
-		a := virtual.arena_allocator(&rb.scratch)
+		a := runtime.arena_allocator(&rb.scratch)
 		for &r in readers {
 			for !r.done && string(r.key) == string(key[:]) {
 				v := obj.clone_bytes(r.value, a) or_return
@@ -554,7 +553,7 @@ _merge_runs :: proc(rb: ^Rebuild, paths: []string, data: rawptr, emit: proc(rb: 
 			}
 		}
 		emit(rb, data, key[:], vals[:]) or_return
-		virtual.arena_free_all(&rb.scratch)
+		runtime.arena_free_all(&rb.scratch)
 	}
 }
 
@@ -562,7 +561,7 @@ _merge_runs :: proc(rb: ^Rebuild, paths: []string, data: rawptr, emit: proc(rb: 
 _merge_entries :: proc(rb: ^Rebuild, b: ^Builder) -> Error {
 	emit :: proc(rb: ^Rebuild, data: rawptr, key: []u8, vals: [][]u8) -> Error {
 		b := (^Builder)(data)
-		a := virtual.arena_allocator(&rb.scratch)
+		a := runtime.arena_allocator(&rb.scratch)
 		context.temp_allocator = a
 		e := decode_entry(key, vals[0], a) or_return
 		for v in vals[1:] {
@@ -612,7 +611,7 @@ _merge_entries :: proc(rb: ^Rebuild, b: ^Builder) -> Error {
 			if t.defs[i].project != nil {
 				t.defs[i].project(t.defs[i].data, &e, &pv)
 			}
-			ba := virtual.arena_allocator(&rb.batch)
+			ba := runtime.arena_allocator(&rb.batch)
 			k := make([]u8, len(ik) + 1, ba)
 			k[0] = u8(i)
 			copy(k[1:], ik)
@@ -657,7 +656,7 @@ _spill_index :: proc(rb: ^Rebuild) -> Error {
 	}
 	_run_flush(&w) or_return
 	clear(&rb.items)
-	virtual.arena_free_all(&rb.batch)
+	runtime.arena_free_all(&rb.batch)
 	return .None
 }
 
