@@ -40,6 +40,10 @@ pub const RuntimeError = error{
     NoPendingRollback,
     InvalidCronExpression,
     ForkNotFound,
+    InvalidSpaceAccess,
+    InvalidJoinQuorum,
+    InvalidTaskDependency,
+    InvalidPath,
 };
 
 pub const TopicKind = enum(u8) {
@@ -132,15 +136,46 @@ pub const SpaceVirtualBridge = struct {
         return error.SpaceNotBound;
     }
 
-    fn requireWritable(self: *const SpaceVirtualBridge, space_id: u128) RuntimeError!void {
+    fn requireWritable(self: *const SpaceVirtualBridge, space_id: u128) RuntimeError!*const model.SpaceBinding {
         const b = try self.findBinding(space_id);
         if (b.access == .read_only) return error.PermissionDenied;
+        return b;
+    }
+
+    pub fn resolveBoundPath(
+        allocator: Allocator,
+        b: *const model.SpaceBinding,
+        rel: []const u8,
+        allow_empty: bool,
+    ) ![]u8 {
+        const norm_rel: []const u8 = if (rel.len == 0) blk: {
+            if (!allow_empty) return error.InvalidPath;
+            break :blk "";
+        } else (model.canonicalRelPath(rel) catch return error.PermissionDenied);
+
+        const base: []const u8 = if (b.mount_rel) |mr|
+            (model.canonicalRelPath(mr) catch return error.PermissionDenied)
+        else
+            "";
+
+        const combined = if (base.len == 0)
+            try allocator.dupe(u8, norm_rel)
+        else if (norm_rel.len == 0)
+            try allocator.dupe(u8, base)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, norm_rel });
+        errdefer allocator.free(combined);
+
+        if (!model.mountRelWithin(b.mount_rel, combined)) return error.PermissionDenied;
+        return combined;
     }
 
     pub fn listDir(self: *SpaceVirtualBridge, allocator: Allocator, space_id: u128, prefix: []const u8) ![][]u8 {
-        _ = try self.findBinding(space_id);
+        const b = try self.findBinding(space_id);
+        const resolved = try resolveBoundPath(self.allocator, b, prefix, true);
+        defer self.allocator.free(resolved);
         const sp = try self.spaces.activate(space_id);
-        const entries = try sp.listDir(allocator, prefix);
+        const entries = try sp.listDir(allocator, resolved);
         defer {
             for (entries) |*e| e.deinit(allocator);
             allocator.free(entries);
@@ -156,23 +191,27 @@ pub const SpaceVirtualBridge = struct {
             built += 1;
         }
         std.mem.sort([]u8, out, {}, struct {
-            fn lt(_: void, a: []u8, b: []u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
+            fn lt(_: void, a: []u8, b_item: []u8) bool {
+                return std.mem.order(u8, a, b_item) == .lt;
             }
         }.lt);
         return out;
     }
 
     pub fn readFile(self: *SpaceVirtualBridge, allocator: Allocator, space_id: u128, path: []const u8) !?[]u8 {
-        _ = try self.findBinding(space_id);
+        const b = try self.findBinding(space_id);
+        const resolved = try resolveBoundPath(self.allocator, b, path, false);
+        defer self.allocator.free(resolved);
         const sp = try self.spaces.activate(space_id);
-        return try sp.readFileAlloc(allocator, path);
+        return try sp.readFileAlloc(allocator, resolved);
     }
 
     pub fn writeFile(self: *SpaceVirtualBridge, space_id: u128, path: []const u8, content: []const u8) !void {
-        try self.requireWritable(space_id);
+        const b = try self.requireWritable(space_id);
+        const resolved = try resolveBoundPath(self.allocator, b, path, false);
+        defer self.allocator.free(resolved);
         const sp = try self.spaces.activate(space_id);
-        _ = try sp.putFile(self.actor_id, path, content);
+        _ = try sp.putFile(self.actor_id, resolved, content);
     }
 
     pub fn editText(
@@ -182,10 +221,12 @@ pub const SpaceVirtualBridge = struct {
         old_str: []const u8,
         new_str: []const u8,
     ) !void {
-        try self.requireWritable(space_id);
+        const b = try self.requireWritable(space_id);
         if (old_str.len == 0) return error.InvalidEdit;
+        const resolved = try resolveBoundPath(self.allocator, b, path, false);
+        defer self.allocator.free(resolved);
         const sp = try self.spaces.activate(space_id);
-        const current = (try sp.readFileAlloc(self.allocator, path)) orelse return error.NotFound;
+        const current = (try sp.readFileAlloc(self.allocator, resolved)) orelse return error.NotFound;
         defer self.allocator.free(current);
         const idx = std.mem.indexOf(u8, current, old_str) orelse return error.InvalidEdit;
         const splices = [_]text_mod.TextSplice{.{
@@ -193,34 +234,41 @@ pub const SpaceVirtualBridge = struct {
             .del = old_str.len,
             .text = @constCast(new_str),
         }};
-        _ = try sp.editText(self.actor_id, path, &splices);
+        _ = try sp.editText(self.actor_id, resolved, &splices);
     }
 
     pub fn deletePath(self: *SpaceVirtualBridge, space_id: u128, path: []const u8) !void {
-        try self.requireWritable(space_id);
+        const b = try self.requireWritable(space_id);
+        const resolved = try resolveBoundPath(self.allocator, b, path, false);
+        defer self.allocator.free(resolved);
         const sp = try self.spaces.activate(space_id);
-        _ = try sp.deletePath(self.actor_id, path);
+        _ = try sp.deletePath(self.actor_id, resolved);
     }
 
     pub fn searchText(self: *SpaceVirtualBridge, allocator: Allocator, space_id: u128, query: []const u8) ![][]u8 {
-        _ = try self.findBinding(space_id);
+        const b = try self.findBinding(space_id);
+        const base_opt: ?[]const u8 = if (b.mount_rel) |mr|
+            (model.canonicalRelPath(mr) catch return error.PermissionDenied)
+        else
+            null;
         const sp = try self.spaces.activate(space_id);
-        const hits = try sp.searchText(allocator, query, null, 256);
+        const hits = try sp.searchText(allocator, query, base_opt, 256);
         defer {
             for (hits) |*h| h.deinit(allocator);
             allocator.free(hits);
         }
-        const out = try allocator.alloc([]u8, hits.len);
-        var built: usize = 0;
+        var out: std.ArrayList([]u8) = .empty;
         errdefer {
-            for (out[0..built]) |item| allocator.free(item);
-            allocator.free(out);
+            for (out.items) |item| allocator.free(item);
+            out.deinit(allocator);
         }
-        for (hits, 0..) |h, i| {
-            out[i] = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ h.path, h.line, h.snippet });
-            built += 1;
+        for (hits) |h| {
+            if (!model.mountRelWithin(b.mount_rel, h.path)) continue;
+            const formatted = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ h.path, h.line, h.snippet });
+            errdefer allocator.free(formatted);
+            try out.append(allocator, formatted);
         }
-        return out;
+        return try out.toOwnedSlice(allocator);
     }
 
     pub fn getMeta(self: *SpaceVirtualBridge, allocator: Allocator, space_id: u128, key: []const u8) !?[]u8 {
@@ -231,7 +279,7 @@ pub const SpaceVirtualBridge = struct {
     }
 
     pub fn setMeta(self: *SpaceVirtualBridge, space_id: u128, key: []const u8, val: ?[]const u8) !void {
-        try self.requireWritable(space_id);
+        _ = try self.requireWritable(space_id);
         const sp = try self.spaces.activate(space_id);
         _ = try sp.setMeta(self.actor_id, key, val);
     }
@@ -248,7 +296,7 @@ pub const SpaceVirtualBridge = struct {
     }
 
     pub fn checkpoint(self: *SpaceVirtualBridge, space_id: u128, kind: space_mod.CheckpointKind) !void {
-        try self.requireWritable(space_id);
+        _ = try self.requireWritable(space_id);
         const sp = try self.spaces.activate(space_id);
         try sp.checkpoint(kind);
     }
@@ -327,7 +375,10 @@ pub const CreateThreadOptions = struct {
     provider_id: iface.ProviderId = .mock,
     model: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
+    inherit_project_spaces: bool = true,
 };
+
+pub const CreateThreadRequest = CreateThreadOptions;
 
 pub const BeginTurnOptions = struct {
     provider: ?iface.ProviderId = null,
@@ -501,6 +552,37 @@ pub fn freeDueTriggers(allocator: Allocator, list: []DueTrigger) void {
 const CachedThread = struct {
     store: store_mod.ThreadStore,
     last_touch: u64,
+    pin_count: usize = 0,
+};
+
+pub const PinnedThread = struct {
+    ct: *CachedThread,
+
+    pub fn store(self: *const PinnedThread) *store_mod.ThreadStore {
+        return &self.ct.store;
+    }
+
+    pub fn deinit(self: *PinnedThread) void {
+        if (self.ct.pin_count > 0) self.ct.pin_count -= 1;
+    }
+};
+
+const ScopedLease = struct {
+    leases: *lease_mod.LeaseManager,
+    handle: ?lease_mod.LeaseHandle,
+    fencing_epoch: u64,
+
+    fn deinit(self: *ScopedLease) void {
+        if (self.handle) |*h| {
+            self.leases.release(h) catch {};
+            self.handle = null;
+        }
+    }
+};
+
+const PendingSpaceChange = struct {
+    digest: [32]u8,
+    first_seen_ms: u64,
 };
 
 const ActiveTurn = struct {
@@ -528,9 +610,10 @@ pub const ThreadRuntime = struct {
     touch_clock: u64 = 0,
     open_threads: std.AutoHashMapUnmanaged(u128, *CachedThread) = .empty,
     active_turns: std.AutoHashMapUnmanaged(u128, ActiveTurn) = .empty,
-    acked_mailbox: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    active_turn_leases: std.AutoHashMapUnmanaged(u128, u64) = .empty,
     last_mounts_digest: std.AutoHashMapUnmanaged(u128, [32]u8) = .empty,
     watched_space_digests: std.AutoHashMapUnmanaged(u128, [32]u8) = .empty,
+    pending_trigger_changes: std.AutoHashMapUnmanaged(u128, PendingSpaceChange) = .empty,
 
     pub const open = init;
 
@@ -566,6 +649,7 @@ pub const ThreadRuntime = struct {
             self.leases.release(&at.lease) catch {};
         }
         self.active_turns.deinit(self.allocator);
+        self.active_turn_leases.deinit(self.allocator);
 
         var oit = self.open_threads.valueIterator();
         while (oit.next()) |ct| {
@@ -574,25 +658,26 @@ pub const ThreadRuntime = struct {
         }
         self.open_threads.deinit(self.allocator);
 
-        self.acked_mailbox.deinit(self.allocator);
         self.last_mounts_digest.deinit(self.allocator);
         self.watched_space_digests.deinit(self.allocator);
+        self.pending_trigger_changes.deinit(self.allocator);
 
         self.root_dir.close(self.io);
         self.allocator.free(self.root_dir_path);
     }
 
-    pub fn openThread(self: *ThreadRuntime, thread_id: u128) !*store_mod.ThreadStore {
+    fn openThreadCached(self: *ThreadRuntime, thread_id: u128) !*CachedThread {
         self.touch_clock +|= 1;
         if (self.open_threads.get(thread_id)) |ct| {
             ct.last_touch = self.touch_clock;
-            return &ct.store;
+            return ct;
         }
 
         self.maybeEvictLruThread();
 
         const ct = try self.allocator.create(CachedThread);
-        errdefer self.allocator.destroy(ct);
+        var ct_owned = true;
+        errdefer if (ct_owned) self.allocator.destroy(ct);
         ct.* = .{
             .store = try store_mod.ThreadStore.open(
                 self.allocator,
@@ -602,11 +687,26 @@ pub const ThreadRuntime = struct {
                 self.shared_blobs,
             ),
             .last_touch = self.touch_clock,
+            .pin_count = 0,
         };
-        errdefer ct.store.deinit();
+        var store_owned = true;
+        errdefer if (store_owned) ct.store.deinit();
 
         try self.open_threads.put(self.allocator, thread_id, ct);
+        store_owned = false;
+        ct_owned = false;
+        return ct;
+    }
+
+    pub fn openThread(self: *ThreadRuntime, thread_id: u128) !*store_mod.ThreadStore {
+        const ct = try self.openThreadCached(thread_id);
         return &ct.store;
+    }
+
+    pub fn openThreadPinned(self: *ThreadRuntime, thread_id: u128) !PinnedThread {
+        const ct = try self.openThreadCached(thread_id);
+        ct.pin_count += 1;
+        return .{ .ct = ct };
     }
 
     fn maybeEvictLruThread(self: *ThreadRuntime) void {
@@ -616,6 +716,7 @@ pub const ThreadRuntime = struct {
         var it = self.open_threads.iterator();
         while (it.next()) |kv| {
             const tid = kv.key_ptr.*;
+            if (kv.value_ptr.*.pin_count > 0) continue;
             if (self.active_turns.contains(tid)) continue;
             if (kv.value_ptr.*.store.pendingRollback() != null) continue;
             if (kv.value_ptr.*.last_touch < victim_touch) {
@@ -629,10 +730,47 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn closeThread(self: *ThreadRuntime, thread_id: u128) void {
+        if (self.open_threads.get(thread_id)) |ct| {
+            if (ct.pin_count > 0) return;
+        }
         if (self.open_threads.fetchRemove(thread_id)) |kv| {
             kv.value.store.deinit();
             self.allocator.destroy(kv.value);
         }
+    }
+
+    fn acquireScopedThreadLease(
+        self: *ThreadRuntime,
+        store: *store_mod.ThreadStore,
+        thread_id: u128,
+        ttl_ms: u64,
+    ) !ScopedLease {
+        if (self.active_turn_leases.get(thread_id) != null) {
+            if (self.active_turns.getPtr(thread_id)) |at| {
+                if (self.leases.isStillValid(&at.lease)) {
+                    return .{
+                        .leases = self.leases,
+                        .handle = null,
+                        .fencing_epoch = at.lease.fencing_epoch,
+                    };
+                }
+            }
+        }
+        const thread_topic = topicId(.thread, thread_id);
+        const expected_epoch: u64 = if (store.last_lease) |ll| ll.fencing_epoch else 0;
+        var lease = try self.leases.acquire(thread_topic, expected_epoch, ttl_ms);
+        errdefer self.leases.release(&lease) catch {};
+        var lease_ev = try store.appendEvent(self.runner_id, .{ .lease_observed = .{
+            .holder_runner_id = lease.runner_id,
+            .fencing_epoch = lease.fencing_epoch,
+            .expires_ms = lease.expires_ms,
+        } });
+        lease_ev.deinit(self.allocator);
+        return .{
+            .leases = self.leases,
+            .handle = lease,
+            .fencing_epoch = lease.fencing_epoch,
+        };
     }
 
     pub fn getThreadMeta(self: *ThreadRuntime, allocator: Allocator, thread_id: u128) !?model.ThreadMeta {
@@ -652,8 +790,8 @@ pub const ThreadRuntime = struct {
         }
     }
 
-    fn accessFromU8(raw: u8) model.SpaceAccess {
-        return std.enums.fromInt(model.SpaceAccess, raw) orelse .shared_rw;
+    fn accessFromU8(raw: u8) RuntimeError!model.SpaceAccess {
+        return std.enums.fromInt(model.SpaceAccess, raw) orelse error.InvalidSpaceAccess;
     }
 
     fn mountKindFromSpaceKind(kind: space_mod.SpaceKind) iface.MountKind {
@@ -691,7 +829,9 @@ pub const ThreadRuntime = struct {
             errdefer if (vcs_rev) |v| self.allocator.free(v);
 
             if (try self.spaces.activateProjection(b.space_id)) |proj| {
-                _ = try proj.ingestDirty();
+                if (b.access != .read_only) {
+                    _ = try proj.ingestDirty();
+                }
                 var head_info = proj.vcsHead(self.allocator) catch vcs.VcsHead{ .kind = .none };
                 defer head_info.deinit(self.allocator);
                 vcs_kind = head_info.kind;
@@ -725,7 +865,7 @@ pub const ThreadRuntime = struct {
         }
         var unread_mb: u32 = 0;
         for (store.mailbox_order.items) |mid| {
-            if (!self.acked_mailbox.contains(mid)) unread_mb += 1;
+            if (!store.acked_mailbox.contains(mid)) unread_mb += 1;
         }
         const summary = model.ThreadSummary{
             .thread_id = meta.thread_id,
@@ -746,23 +886,86 @@ pub const ThreadRuntime = struct {
         _ = try self.catalog.putThread(summary);
     }
 
+    fn hasWritableBinding(bindings: []const model.SpaceBinding) bool {
+        for (bindings) |b| {
+            if (b.access != .read_only) return true;
+        }
+        return false;
+    }
+
+    fn containsU128(slice: []const u128, needle: u128) bool {
+        for (slice) |v| {
+            if (v == needle) return true;
+        }
+        return false;
+    }
+
+    fn validateChildBindingsAgainstParent(
+        self: *ThreadRuntime,
+        parent_bindings: []const model.SpaceBinding,
+        child_bindings: []const model.SpaceBinding,
+        allow_ephemeral_virtual: []const u128,
+    ) !void {
+        for (child_bindings) |cg| {
+            if (cg.mount_rel) |mr| {
+                _ = model.canonicalRelPath(mr) catch return error.AccessEscalation;
+            }
+            if (containsU128(allow_ephemeral_virtual, cg.space_id)) {
+                if (!hasWritableBinding(parent_bindings)) return error.AccessEscalation;
+                continue;
+            }
+            model.ThreadMeta.validateGrantAttenuation(parent_bindings, &.{cg}) catch |err| {
+                if (self.spaces.get(cg.space_id)) |rec| {
+                    if (rec.origin) |orig| {
+                        const synthetic = [_]model.SpaceBinding{.{
+                            .space_id = orig.origin_space_id,
+                            .alias = cg.alias,
+                            .access = .isolated_fork,
+                            .mount_rel = cg.mount_rel,
+                        }};
+                        try model.ThreadMeta.validateGrantAttenuation(parent_bindings, &synthetic);
+                        continue;
+                    }
+                }
+                return err;
+            };
+        }
+    }
+
     pub fn createThread(self: *ThreadRuntime, opts: CreateThreadOptions) !model.ThreadMeta {
+        return try self.createThreadInternal(opts, &.{});
+    }
+
+    fn createThreadInternal(
+        self: *ThreadRuntime,
+        opts: CreateThreadOptions,
+        allow_ephemeral_virtual: []const u128,
+    ) !model.ThreadMeta {
         const now = id.nowMs(self.io);
         const thread_id = id.newUuidV7(self.io);
         const root_tid = opts.root_thread_id orelse thread_id;
 
+        var transferred = false;
+
         var resolved_bindings: []model.SpaceBinding = &.{};
-        errdefer model.freeBindings(self.allocator, resolved_bindings);
+        errdefer if (!transferred) model.freeBindings(self.allocator, resolved_bindings);
 
         var eff_provider = opts.provider_id;
         var eff_model: ?[]u8 = if (opts.model) |m| try self.allocator.dupe(u8, m) else null;
-        errdefer if (eff_model) |m| self.allocator.free(m);
+        errdefer if (!transferred) {
+            if (eff_model) |m| self.allocator.free(m);
+        };
 
         if (opts.bindings.len > 0) {
+            for (opts.bindings) |b| {
+                if (b.mount_rel) |mr| {
+                    _ = model.canonicalRelPath(mr) catch return error.AccessEscalation;
+                }
+            }
             resolved_bindings = try model.cloneBindings(self.allocator, opts.bindings);
         } else if (opts.project_id) |pid| {
             const proj = self.projects.get(pid) orelse return error.ProjectNotFound;
-            if (proj.spaces.len > 0) {
+            if (opts.inherit_project_spaces and opts.parent_thread_id == null and proj.spaces.len > 0) {
                 const arr = try self.allocator.alloc(model.SpaceBinding, proj.spaces.len);
                 var built: usize = 0;
                 errdefer {
@@ -770,10 +973,11 @@ pub const ThreadRuntime = struct {
                     self.allocator.free(arr);
                 }
                 for (proj.spaces, 0..) |sr, i| {
+                    const access = try accessFromU8(sr.default_access);
                     arr[i] = .{
                         .space_id = sr.space_id,
                         .alias = try self.allocator.dupe(u8, sr.alias),
-                        .access = accessFromU8(sr.default_access),
+                        .access = access,
                         .mount_rel = null,
                     };
                     built += 1;
@@ -792,14 +996,27 @@ pub const ThreadRuntime = struct {
             }
         }
 
+        if (opts.parent_thread_id) |ptid| {
+            var parent_pin = try self.openThreadPinned(ptid);
+            defer parent_pin.deinit();
+            const parent_meta = parent_pin.store().meta orelse return error.ThreadNotFound;
+            try self.validateChildBindingsAgainstParent(
+                parent_meta.bindings,
+                resolved_bindings,
+                allow_ephemeral_virtual,
+            );
+        }
+
         var root_cp = if (resolved_bindings.len == 0)
             model.CheckpointVector{}
         else
             try self.captureCheckpointVector(resolved_bindings, false);
-        errdefer root_cp.deinit(self.allocator);
+        errdefer if (!transferred) root_cp.deinit(self.allocator);
 
         const title_copy: []u8 = if (opts.title.len > 0) try self.allocator.dupe(u8, opts.title) else &.{};
-        errdefer if (title_copy.len > 0) self.allocator.free(title_copy);
+        errdefer if (!transferred) {
+            if (title_copy.len > 0) self.allocator.free(title_copy);
+        };
 
         var meta = model.ThreadMeta{
             .thread_id = thread_id,
@@ -818,9 +1035,12 @@ pub const ThreadRuntime = struct {
             .created_ms = now,
             .updated_ms = now,
         };
+        transferred = true;
         errdefer meta.deinit(self.allocator);
 
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         var ev = try store.appendEvent(self.runner_id, .{ .thread_created = meta });
         ev.deinit(self.allocator);
 
@@ -856,8 +1076,20 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn bindSpace(self: *ThreadRuntime, thread_id: u128, binding: model.SpaceBinding) !void {
-        const store = try self.openThread(thread_id);
+        if (binding.mount_rel) |mr| {
+            _ = model.canonicalRelPath(mr) catch return error.AccessEscalation;
+        }
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const meta = store.meta orelse return error.ThreadNotFound;
+
+        if (meta.parent_thread_id) |ptid| {
+            var parent_pin = try self.openThreadPinned(ptid);
+            defer parent_pin.deinit();
+            const parent_meta = parent_pin.store().meta orelse return error.ThreadNotFound;
+            try self.validateChildBindingsAgainstParent(parent_meta.bindings, &.{binding}, &.{});
+        }
 
         var list: std.ArrayList(model.SpaceBinding) = .empty;
         defer {
@@ -890,7 +1122,9 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn unbindSpace(self: *ThreadRuntime, thread_id: u128, space_id: u128) !bool {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const meta = store.meta orelse return error.ThreadNotFound;
 
         var list: std.ArrayList(model.SpaceBinding) = .empty;
@@ -921,10 +1155,8 @@ pub const ThreadRuntime = struct {
     }
 
     fn currentChainTipId(self: *ThreadRuntime, store: *store_mod.ThreadStore) !?u128 {
-        const chain = try store.activeChain(self.allocator);
-        defer store_mod.ThreadStore.freeMessages(self.allocator, chain);
-        if (chain.len == 0) return null;
-        return chain[chain.len - 1].msg_id;
+        _ = self;
+        return try store.activeTipMsgId();
     }
 
     pub fn beginTurn(
@@ -933,13 +1165,19 @@ pub const ThreadRuntime = struct {
         user_prompt: []const u8,
         opts: BeginTurnOptions,
     ) !BeginTurnResult {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const meta = store.meta orelse return error.ThreadNotFound;
+        if (!meta.budget.hasHeadroom()) return error.BudgetExceeded;
 
         const thread_topic = topicId(.thread, thread_id);
         const expected_epoch: u64 = if (store.last_lease) |ll| ll.fencing_epoch else 0;
         var lease = try self.leases.acquire(thread_topic, expected_epoch, opts.lease_ttl_ms);
-        errdefer self.leases.release(&lease) catch {};
+        var lease_transferred = false;
+        errdefer if (!lease_transferred) {
+            self.leases.release(&lease) catch {};
+        };
 
         var lease_ev = try store.appendEvent(self.runner_id, .{ .lease_observed = .{
             .holder_runner_id = lease.runner_id,
@@ -986,7 +1224,7 @@ pub const ThreadRuntime = struct {
         uev.deinit(self.allocator);
 
         const siblings = store.getChildren(parent_id);
-        if (siblings.len > 1) {
+        if (siblings.len > 1 or store.hasBranchChoice(parent_id) or store.isSealed(parent_id)) {
             var bev = try store.appendEvent(self.runner_id, .{ .branch_choice_set = .{
                 .parent_id = parent_id,
                 .selected_child_id = user_msg_id,
@@ -1017,19 +1255,25 @@ pub const ThreadRuntime = struct {
 
         var tev = try store.appendEvent(self.runner_id, .{ .thread_updated = .{
             .status = .running,
-            .updated_ms = now,
+            .updated_ms = @max(now, meta.updated_ms + 1),
         } });
         tev.deinit(self.allocator);
 
+        try self.active_turns.ensureUnusedCapacity(self.allocator, 1);
+        try self.active_turn_leases.ensureUnusedCapacity(self.allocator, 1);
         if (self.active_turns.getPtr(thread_id)) |prev| {
-            self.leases.release(&prev.lease) catch {};
+            if (prev.lease.fencing_epoch != lease.fencing_epoch) {
+                self.leases.release(&prev.lease) catch {};
+            }
         }
-        try self.active_turns.put(self.allocator, thread_id, .{
+        self.active_turns.putAssumeCapacity(thread_id, .{
             .turn_id = turn_id,
             .user_msg_id = user_msg_id,
             .lease = lease,
             .started_ms = now,
         });
+        self.active_turn_leases.putAssumeCapacity(thread_id, lease.fencing_epoch);
+        lease_transferred = true;
 
         try self.syncCatalogSummary(store);
 
@@ -1093,7 +1337,9 @@ pub const ThreadRuntime = struct {
         prompt: []const u8,
         local_mounts: []const iface.MountSpec,
     ) !ProviderStartPlan {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const meta = store.meta orelse return error.ThreadNotFound;
 
         const target_provider: iface.ProviderId = blk: {
@@ -1115,6 +1361,7 @@ pub const ThreadRuntime = struct {
 
         var has_headless_or_virtual = false;
         if (local_mounts.len > 0) {
+            try owned_mounts_list.ensureUnusedCapacity(allocator, local_mounts.len);
             for (local_mounts) |lm| {
                 if (lm.kind == .virtual or lm.local_path == null) {
                     has_headless_or_virtual = true;
@@ -1122,7 +1369,8 @@ pub const ThreadRuntime = struct {
                 const alias_c: []u8 = if (lm.alias.len > 0) try allocator.dupe(u8, lm.alias) else &.{};
                 errdefer if (alias_c.len > 0) allocator.free(alias_c);
                 const lp_c = if (lm.local_path) |p| try allocator.dupe(u8, p) else null;
-                try owned_mounts_list.append(allocator, .{
+                errdefer if (lp_c) |p| allocator.free(p);
+                owned_mounts_list.appendAssumeCapacity(.{
                     .alias = alias_c,
                     .space_id = lm.space_id,
                     .kind = lm.kind,
@@ -1131,6 +1379,7 @@ pub const ThreadRuntime = struct {
                 });
             }
         } else {
+            try owned_mounts_list.ensureUnusedCapacity(allocator, meta.bindings.len);
             for (meta.bindings) |b| {
                 const rec = self.spaces.get(b.space_id);
                 const sp_kind: space_mod.SpaceKind = if (rec) |r| r.kind else .virtual;
@@ -1146,7 +1395,8 @@ pub const ThreadRuntime = struct {
                 const alias_c: []u8 = if (b.alias.len > 0) try allocator.dupe(u8, b.alias) else &.{};
                 errdefer if (alias_c.len > 0) allocator.free(alias_c);
                 const lp_c = if (lp_opt) |p| try allocator.dupe(u8, p) else null;
-                try owned_mounts_list.append(allocator, .{
+                errdefer if (lp_c) |p| allocator.free(p);
+                owned_mounts_list.appendAssumeCapacity(.{
                     .alias = alias_c,
                     .space_id = b.space_id,
                     .kind = mountKindFromSpaceKind(sp_kind),
@@ -1168,10 +1418,20 @@ pub const ThreadRuntime = struct {
             mounts[i] = om.toSpec();
         }
 
+        var has_writable_mount = false;
+        for (mounts) |m| {
+            if (m.access != .read_only) {
+                has_writable_mount = true;
+                break;
+            }
+        }
+        const start_access: iface.AccessMode = if (has_writable_mount) .full else .plan;
+
         var cwd_slice: []u8 = &.{};
         errdefer if (cwd_slice.len > 0) allocator.free(cwd_slice);
         if (meta.bindings.len > 0) {
             for (mounts) |m| {
+                if (m.access == .read_only) continue;
                 if (m.local_path) |lp| {
                     if (lp.len > 0) {
                         cwd_slice = try allocator.dupe(u8, lp);
@@ -1191,8 +1451,13 @@ pub const ThreadRuntime = struct {
             }
         }
         if (has_headless_or_virtual and meta.bindings.len > 0) {
-            bridge_owner = try allocator.create(SpaceVirtualBridge);
-            bridge_owner.?.* = try SpaceVirtualBridge.init(allocator, self.spaces, meta.bindings, thread_id);
+            var bridge_val = try SpaceVirtualBridge.init(allocator, self.spaces, meta.bindings, thread_id);
+            var bridge_moved = false;
+            errdefer if (!bridge_moved) bridge_val.deinit();
+            const bo = try allocator.create(SpaceVirtualBridge);
+            bo.* = bridge_val;
+            bridge_moved = true;
+            bridge_owner = bo;
             bridge_iface = try allocator.create(iface.VirtualSpaceBridge);
             bridge_iface.?.* = bridge_owner.?.asInterface();
         }
@@ -1264,7 +1529,7 @@ pub const ThreadRuntime = struct {
             .model = model_copy,
             .resume_id = resume_sid,
             .fork_at = null,
-            .access = .full,
+            .access = start_access,
             .mounts = mounts,
             .virtual_bridge = if (bridge_iface) |bi| bi else null,
             .runner_id = self.runner_id,
@@ -1311,12 +1576,24 @@ pub const ThreadRuntime = struct {
         if (active.turn_id != turn_id) return error.LeaseEpochMismatch;
         if (!self.leases.isStillValid(&active.lease)) return error.LeaseNotActive;
 
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const meta = store.meta orelse return error.ThreadNotFound;
         const msg_cur = store.messages.getPtr(turn_id) orelse return error.MessageNotFound;
 
         var updated_budget = meta.budget;
-        try updated_budget.recordUsage(usage.tokens, usage.cost_microusd, usage.wall_ms);
+        var budget_exceeded = false;
+        updated_budget.recordUsage(usage.tokens, usage.cost_microusd, usage.wall_ms) catch |err| {
+            if (err == error.BudgetExceeded) {
+                budget_exceeded = true;
+                updated_budget.used_tokens +|= usage.tokens;
+                updated_budget.used_cost_microusd +|= usage.cost_microusd;
+                updated_budget.used_wall_ms +|= usage.wall_ms;
+            } else {
+                return err;
+            }
+        };
 
         var post_cp = if (meta.bindings.len == 0)
             model.CheckpointVector{}
@@ -1335,14 +1612,34 @@ pub const ThreadRuntime = struct {
         var updated_msg = try msg_cur.clone(self.allocator);
         defer updated_msg.deinit(self.allocator);
 
+        const new_content: []u8 = if (assistant_text.len > 0) try self.allocator.dupe(u8, assistant_text) else &.{};
+        var content_swapped = false;
+        errdefer if (!content_swapped and new_content.len > 0) self.allocator.free(new_content);
+
+        var new_post_cp = try post_cp.clone(self.allocator);
+        var post_cp_swapped = false;
+        errdefer if (!post_cp_swapped) new_post_cp.deinit(self.allocator);
+
+        var new_cursor_opt: ?model.ProviderCursor = if (new_cursor) |*nc| try nc.clone(self.allocator) else null;
+        var cursor_swapped = false;
+        errdefer if (!cursor_swapped) {
+            if (new_cursor_opt) |*c| c.deinit(self.allocator);
+        };
+
         if (updated_msg.content.len > 0) self.allocator.free(updated_msg.content);
-        updated_msg.content = if (assistant_text.len > 0) try self.allocator.dupe(u8, assistant_text) else &.{};
+        updated_msg.content = new_content;
+        content_swapped = true;
+
         updated_msg.post_checkpoint.deinit(self.allocator);
-        updated_msg.post_checkpoint = try post_cp.clone(self.allocator);
-        if (new_cursor) |*nc| {
+        updated_msg.post_checkpoint = new_post_cp;
+        post_cp_swapped = true;
+
+        if (new_cursor_opt) |nc| {
             if (updated_msg.cursor) |*old_c| old_c.deinit(self.allocator);
-            updated_msg.cursor = try nc.clone(self.allocator);
+            updated_msg.cursor = nc;
+            cursor_swapped = true;
         }
+
         updated_msg.status = .completed;
         updated_msg.updated_ms = @max(now, updated_msg.updated_ms + 1);
 
@@ -1356,17 +1653,24 @@ pub const ThreadRuntime = struct {
         } });
         tev.deinit(self.allocator);
 
+        _ = self.active_turn_leases.remove(thread_id);
         if (self.active_turns.fetchRemove(thread_id)) |kv| {
             var lease_copy = kv.value.lease;
             self.leases.release(&lease_copy) catch {};
         }
 
         try self.syncCatalogSummary(store);
+        if (budget_exceeded) {
+            post_cp.deinit(self.allocator);
+            return error.BudgetExceeded;
+        }
         return post_cp;
     }
 
     pub fn cancelTurn(self: *ThreadRuntime, thread_id: u128, turn_id: u128) !void {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const now = id.nowMs(self.io);
 
         if (store.messages.getPtr(turn_id)) |msg_cur| {
@@ -1386,6 +1690,7 @@ pub const ThreadRuntime = struct {
             tev.deinit(self.allocator);
         }
 
+        _ = self.active_turn_leases.remove(thread_id);
         if (self.active_turns.fetchRemove(thread_id)) |kv| {
             var lease_copy = kv.value.lease;
             self.leases.release(&lease_copy) catch {};
@@ -1488,21 +1793,21 @@ pub const ThreadRuntime = struct {
         return std.mem.order(u8, &ab, &bb);
     }
 
+    fn findBindingInMeta(meta: *const model.ThreadMeta, space_id: u128) ?*const model.SpaceBinding {
+        for (meta.bindings) |*b| {
+            if (b.space_id == space_id) return b;
+        }
+        return null;
+    }
+
     fn prevalidateRollback(
         self: *ThreadRuntime,
         meta: *const model.ThreadMeta,
         target_vec: *const model.CheckpointVector,
     ) !void {
         for (target_vec.entries) |*cp| {
-            var binding_found: ?*const model.SpaceBinding = null;
-            for (meta.bindings) |*b| {
-                if (b.space_id == cp.space_id) {
-                    binding_found = b;
-                    break;
-                }
-            }
-            const b = binding_found orelse return error.RollbackSpaceReadOnly;
-            if (b.access == .read_only) return error.RollbackSpaceReadOnly;
+            const b = findBindingInMeta(meta, cp.space_id) orelse return error.RollbackSpaceReadOnly;
+            if (b.access == .read_only) continue;
 
             if (self.spaces.get(cp.space_id) == null) return error.RollbackTargetInvalid;
             const sp = self.spaces.activate(cp.space_id) catch return error.RollbackTargetInvalid;
@@ -1539,13 +1844,37 @@ pub const ThreadRuntime = struct {
         }.lt);
 
         var rolled: usize = 0;
+        var had_missing_space = false;
         for (order_idx, 0..) |entry_i, step_idx| {
             const cp = &intent.target_vector.entries[entry_i];
             if (!intent.isSpaceCompleted(cp.space_id)) {
-                try self.spaces.pin(cp.space_id);
+                const meta = store.meta orelse return error.ThreadNotFound;
+                const b_opt = findBindingInMeta(&meta, cp.space_id);
+                if (b_opt == null or b_opt.?.access == .read_only) {
+                    continue;
+                }
+
+                if (self.spaces.get(cp.space_id) == null) {
+                    had_missing_space = true;
+                    continue;
+                }
+
+                self.spaces.pin(cp.space_id) catch |err| {
+                    if (err == error.SpaceNotFound) {
+                        had_missing_space = true;
+                        continue;
+                    }
+                    return err;
+                };
                 defer self.spaces.unpin(cp.space_id);
 
-                const sp = try self.spaces.activate(cp.space_id);
+                const sp = self.spaces.activate(cp.space_id) catch |err| {
+                    if (err == error.SpaceNotFound) {
+                        had_missing_space = true;
+                        continue;
+                    }
+                    return err;
+                };
                 _ = try sp.rollbackToVersion(self.runner_id, &cp.version);
 
                 if (try self.spaces.activateProjection(cp.space_id)) |proj| {
@@ -1574,14 +1903,32 @@ pub const ThreadRuntime = struct {
         }
 
         if (intent.target_msg_id) |tmid| {
-            if (store.messages.getPtr(tmid)) |tmsg| {
-                var bev = try store.appendEvent(self.runner_id, .{ .branch_choice_set = .{
-                    .parent_id = tmsg.parent_id,
-                    .selected_child_id = tmid,
+            if (try store.loadMessageById(self.allocator, tmid)) |tmsg_val| {
+                var cur_msg = tmsg_val;
+                var hop: usize = 0;
+                while (hop < 4096) : (hop += 1) {
+                    const p_id = cur_msg.parent_id;
+                    const c_id = cur_msg.msg_id;
+                    cur_msg.deinit(self.allocator);
+                    if (store.getChildren(p_id).len > 1 or store.hasBranchChoice(p_id) or store.isSealed(p_id)) {
+                        var bev = try store.appendEvent(self.runner_id, .{ .branch_choice_set = .{
+                            .parent_id = p_id,
+                            .selected_child_id = c_id,
+                            .lamport = store.lamport + 1,
+                            .actor = self.runner_id,
+                        } });
+                        bev.deinit(self.allocator);
+                    }
+                    const next_pid = p_id orelse break;
+                    cur_msg = (try store.loadMessageById(self.allocator, next_pid)) orelse break;
+                }
+                var trunc_ev = try store.appendEvent(self.runner_id, .{ .branch_choice_set = .{
+                    .parent_id = tmid,
+                    .selected_child_id = 0,
                     .lamport = store.lamport + 1,
                     .actor = self.runner_id,
                 } });
-                bev.deinit(self.allocator);
+                trunc_ev.deinit(self.allocator);
             }
         }
 
@@ -1596,7 +1943,7 @@ pub const ThreadRuntime = struct {
         return .{
             .intent_id = intent.intent_id,
             .spaces_rolled_back = rolled,
-            .completed = true,
+            .completed = !had_missing_space,
         };
     }
 
@@ -1606,44 +1953,37 @@ pub const ThreadRuntime = struct {
         target_msg_id: u128,
         opts: RollbackOptions,
     ) !RollbackResult {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         if (store.pendingRollback() != null) return error.RollbackAlreadyPending;
         const meta = store.meta orelse return error.ThreadNotFound;
-        const target_msg = store.messages.getPtr(target_msg_id) orelse return error.MessageNotFound;
+        var target_msg = (try store.loadMessageById(self.allocator, target_msg_id)) orelse return error.MessageNotFound;
+        defer target_msg.deinit(self.allocator);
 
-        var target_vec = if (opts.use_pre_checkpoint)
-            try target_msg.pre_checkpoint.clone(self.allocator)
+        const raw_vec = if (opts.use_pre_checkpoint)
+            &target_msg.pre_checkpoint
         else if (!target_msg.post_checkpoint.isEmpty())
-            try target_msg.post_checkpoint.clone(self.allocator)
+            &target_msg.post_checkpoint
         else
-            try target_msg.pre_checkpoint.clone(self.allocator);
-        defer target_vec.deinit(self.allocator);
+            &target_msg.pre_checkpoint;
 
-        const thread_topic = topicId(.thread, thread_id);
-        const expected_epoch: u64 = if (store.last_lease) |ll| ll.fencing_epoch else 0;
-        var lease = try self.leases.acquire(thread_topic, expected_epoch, opts.lease_ttl_ms);
-        defer self.leases.release(&lease) catch {};
+        var target_vec = model.CheckpointVector{};
+        defer target_vec.deinit(self.allocator);
+        for (raw_vec.entries) |*cp| {
+            if (findBindingInMeta(&meta, cp.space_id)) |b| {
+                if (b.access == .read_only) continue;
+            }
+            try target_vec.setSpace(self.allocator, cp.*);
+        }
+
+        try self.prevalidateRollback(&meta, &target_vec);
+
+        var scoped_lease = try self.acquireScopedThreadLease(store, thread_id, opts.lease_ttl_ms);
+        defer scoped_lease.deinit();
 
         const intent_id = id.newUuidV7(self.io);
         const now = id.nowMs(self.io);
-
-        self.prevalidateRollback(&meta, &target_vec) catch |err| {
-            var abort_begin = try store.appendEvent(self.runner_id, .{ .rollback_begin = .{
-                .intent_id = intent_id,
-                .target_msg_id = target_msg_id,
-                .target_vector = target_vec,
-                .completed_spaces = &.{},
-                .created_ms = now,
-            } });
-            abort_begin.deinit(self.allocator);
-
-            var abort_commit = try store.appendEvent(self.runner_id, .{ .rollback_commit = .{
-                .intent_id = intent_id,
-                .committed_ms = now,
-            } });
-            abort_commit.deinit(self.allocator);
-            return err;
-        };
 
         var intent = model.RollbackIntent{
             .intent_id = intent_id,
@@ -1661,16 +2001,16 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn recoverPendingRollbacks(self: *ThreadRuntime, thread_id: u128) !?RollbackResult {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const pending = store.pendingRollback() orelse return null;
 
         var intent = try pending.clone(self.allocator);
         defer intent.deinit(self.allocator);
 
-        const thread_topic = topicId(.thread, thread_id);
-        const expected_epoch: u64 = if (store.last_lease) |ll| ll.fencing_epoch else 0;
-        var lease = try self.leases.acquire(thread_topic, expected_epoch, DEFAULT_LEASE_TTL_MS);
-        defer self.leases.release(&lease) catch {};
+        var scoped_lease = try self.acquireScopedThreadLease(store, thread_id, DEFAULT_LEASE_TTL_MS);
+        defer scoped_lease.deinit();
 
         return try self.executeRollbackPhase2(store, &intent, null);
     }
@@ -1681,10 +2021,52 @@ pub const ThreadRuntime = struct {
         parent_thread_id: u128,
         req: SpawnSubordinateRequest,
     ) !SpawnSubordinateResult {
-        const parent_store = try self.openThread(parent_thread_id);
+        var parent_pinned = try self.openThreadPinned(parent_thread_id);
+        defer parent_pinned.deinit();
+        const parent_store = parent_pinned.store();
         const parent_meta = parent_store.meta orelse return error.ThreadNotFound;
 
         try model.ThreadMeta.validateGrantAttenuation(parent_meta.bindings, req.grants);
+        if (req.create_virtual_spaces.len > 0 and !hasWritableBinding(parent_meta.bindings)) {
+            return error.AccessEscalation;
+        }
+
+        var unique_deps: std.ArrayList(u128) = .empty;
+        defer unique_deps.deinit(self.allocator);
+        for (req.depends_on) |dep_id| {
+            if (dep_id == 0) return error.InvalidTaskDependency;
+            if (containsU128(unique_deps.items, dep_id)) continue;
+            const dep_task = parent_store.tasks.getPtr(dep_id) orelse return error.InvalidTaskDependency;
+            if (dep_task.child_thread_id == parent_thread_id) return error.InvalidTaskDependency;
+            try unique_deps.append(self.allocator, dep_id);
+        }
+
+        if (req.join_quorum > unique_deps.items.len) return error.InvalidJoinQuorum;
+
+        var initial_status: model.TaskStatus = .ready;
+        if (unique_deps.items.len > 0) {
+            var done_deps: usize = 0;
+            var non_terminal_deps: usize = 0;
+            for (unique_deps.items) |dep_id| {
+                if (parent_store.tasks.getPtr(dep_id)) |dep| {
+                    if (dep.status == .completed) {
+                        done_deps += 1;
+                    } else if (!dep.status.isTerminal()) {
+                        non_terminal_deps += 1;
+                    }
+                }
+            }
+            const needed: usize = if (req.join_quorum == 0)
+                unique_deps.items.len
+            else
+                @as(usize, req.join_quorum);
+            if (done_deps + non_terminal_deps < needed) {
+                return error.InvalidJoinQuorum;
+            }
+            if (done_deps < needed) {
+                initial_status = .pending;
+            }
+        }
 
         var parent_budget = parent_meta.budget;
         const carved_budget = try parent_budget.carveChild(req.budget, parent_meta.depth);
@@ -1702,6 +2084,15 @@ pub const ThreadRuntime = struct {
             }
             forked_ids.deinit(allocator);
         }
+
+        var created_virtual_ids: std.ArrayList(u128) = .empty;
+        defer created_virtual_ids.deinit(self.allocator);
+        var virtual_committed = false;
+        errdefer if (!virtual_committed) {
+            for (created_virtual_ids.items) |vsid| {
+                self.spaces.removeSpace(vsid, true) catch {};
+            }
+        };
 
         for (req.grants, 0..) |g, idx| {
             if (g.access == .isolated_fork) {
@@ -1727,6 +2118,7 @@ pub const ThreadRuntime = struct {
             var vrec = try self.spaces.createVirtual(vtitle);
             const vsid = vrec.space_id;
             vrec.deinit(self.allocator);
+            try created_virtual_ids.append(self.allocator, vsid);
             try child_bindings.append(self.allocator, .{
                 .space_id = vsid,
                 .alias = if (vtitle.len > 0) try self.allocator.dupe(u8, vtitle) else &.{},
@@ -1738,7 +2130,7 @@ pub const ThreadRuntime = struct {
         const task_id = id.newUuidV7(self.io);
         const now = id.nowMs(self.io);
 
-        var child_meta = try self.createThread(.{
+        var child_meta = try self.createThreadInternal(.{
             .title = req.title,
             .project_id = parent_meta.project_id,
             .bindings = child_bindings.items,
@@ -1750,26 +2142,10 @@ pub const ThreadRuntime = struct {
             .placement = req.placement,
             .provider_id = req.provider_id orelse parent_meta.default_provider,
             .model = req.model orelse parent_meta.default_model,
-        });
+            .inherit_project_spaces = false,
+        }, created_virtual_ids.items);
         const child_tid = child_meta.thread_id;
         defer child_meta.deinit(self.allocator);
-
-        var initial_status: model.TaskStatus = .ready;
-        if (req.depends_on.len > 0) {
-            var done_deps: usize = 0;
-            for (req.depends_on) |dep_id| {
-                if (parent_store.tasks.getPtr(dep_id)) |dep| {
-                    if (dep.status == .completed) done_deps += 1;
-                }
-            }
-            const needed: usize = if (req.join_quorum == 0)
-                req.depends_on.len
-            else
-                @min(@as(usize, req.join_quorum), req.depends_on.len);
-            if (done_deps < needed) {
-                initial_status = .pending;
-            }
-        }
 
         const task = model.Task{
             .task_id = task_id,
@@ -1778,7 +2154,7 @@ pub const ThreadRuntime = struct {
             .title = @constCast(req.title),
             .status = initial_status,
             .attempt = 1,
-            .depends_on = @constCast(req.depends_on),
+            .depends_on = unique_deps.items,
             .join_quorum = req.join_quorum,
             .placement = req.placement,
             .grants = child_bindings.items,
@@ -1790,7 +2166,7 @@ pub const ThreadRuntime = struct {
             .updated_ms = now,
         };
 
-        const pstore_ref = try self.openThread(parent_thread_id);
+        const pstore_ref = parent_pinned.store();
         var buev = try pstore_ref.appendEvent(self.runner_id, .{ .thread_updated = .{
             .budget = parent_budget,
             .updated_ms = @max(now, parent_meta.updated_ms + 1),
@@ -1799,6 +2175,7 @@ pub const ThreadRuntime = struct {
 
         var tkev = try pstore_ref.appendEvent(self.runner_id, .{ .task_created = task });
         tkev.deinit(self.allocator);
+        virtual_committed = true;
 
         if (req.prompt.len > 0) {
             _ = try self.postMailbox(child_tid, .{
@@ -1878,7 +2255,9 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn postMailbox(self: *ThreadRuntime, target_thread_id: u128, item: model.MailboxItem) !bool {
-        const store = try self.openThread(target_thread_id);
+        var pinned = try self.openThreadPinned(target_thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         if (store.mailbox.contains(item.item_id)) return false;
 
         var ev = try store.appendEvent(self.runner_id, .{ .mailbox_received = item });
@@ -1888,27 +2267,36 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn unreadMailboxCount(self: *ThreadRuntime, thread_id: u128) !usize {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         var count: usize = 0;
         for (store.mailbox_order.items) |mid| {
-            if (!self.acked_mailbox.contains(mid)) count += 1;
+            if (!store.acked_mailbox.contains(mid)) count += 1;
         }
         return count;
     }
 
     pub fn drainMailbox(self: *ThreadRuntime, allocator: Allocator, thread_id: u128) ![]model.MailboxItem {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         var out: std.ArrayList(model.MailboxItem) = .empty;
         errdefer {
             for (out.items) |*item| item.deinit(allocator);
             out.deinit(allocator);
         }
 
+        const now = id.nowMs(self.io);
         for (store.mailbox_order.items) |mid| {
-            if (self.acked_mailbox.contains(mid)) continue;
+            if (store.acked_mailbox.contains(mid)) continue;
             if (store.mailbox.getPtr(mid)) |item| {
                 try out.append(allocator, try item.clone(allocator));
-                try self.acked_mailbox.put(self.allocator, mid, {});
+                var aev = try store.appendEvent(self.runner_id, .{ .mailbox_acked = .{
+                    .item_id = mid,
+                    .acked_ms = now,
+                } });
+                aev.deinit(self.allocator);
             }
         }
 
@@ -1917,8 +2305,12 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn evaluateReadyTasks(self: *ThreadRuntime, parent_thread_id: u128) !usize {
-        const store = try self.openThread(parent_thread_id);
-        return try store.evaluateReadyTasksWithActor(self.runner_id);
+        var pinned = try self.openThreadPinned(parent_thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
+        const newly_ready = try store.evaluateReadyTasksWithActor(self.runner_id);
+        try self.syncCatalogSummary(store);
+        return newly_ready;
     }
 
     pub fn settleTask(
@@ -1931,7 +2323,9 @@ pub const ThreadRuntime = struct {
     ) !usize {
         if (!terminal_status.isTerminal()) return error.InvalidTaskTransition;
 
-        const parent_store = try self.openThread(parent_thread_id);
+        var parent_pinned = try self.openThreadPinned(parent_thread_id);
+        defer parent_pinned.deinit();
+        const parent_store = parent_pinned.store();
         const task_ptr = parent_store.tasks.getPtr(task_id) orelse return error.TaskNotFound;
         if (task_ptr.status.isTerminal()) return error.InvalidTaskTransition;
         if (!task_ptr.status.canTransitionTo(terminal_status)) return error.InvalidTaskTransition;
@@ -1944,37 +2338,49 @@ pub const ThreadRuntime = struct {
         var end_cp = model.CheckpointVector{};
         defer end_cp.deinit(self.allocator);
 
-        if (self.openThread(child_tid)) |child_store| {
-            if (child_store.meta) |cm| {
-                if (child_used_budget == null) {
-                    eff_child_budget.used_tokens = cm.budget.used_tokens;
-                    eff_child_budget.used_cost_microusd = cm.budget.used_cost_microusd;
-                    eff_child_budget.used_wall_ms = cm.budget.used_wall_ms;
-                }
-                if (cm.bindings.len > 0) {
-                    end_cp = try self.captureCheckpointVector(cm.bindings, false);
-                }
+        {
+            var child_pinned = try self.openThreadPinned(child_tid);
+            defer child_pinned.deinit();
+            const child_meta = child_pinned.store().meta orelse return error.ThreadNotFound;
+            eff_child_budget.used_tokens = child_meta.budget.used_tokens;
+            eff_child_budget.used_cost_microusd = child_meta.budget.used_cost_microusd;
+            eff_child_budget.used_wall_ms = child_meta.budget.used_wall_ms;
+            if (child_meta.bindings.len > 0) {
+                end_cp = try self.captureCheckpointVector(child_meta.bindings, false);
             }
-        } else |_| {}
+        }
 
         if (child_used_budget) |cub| {
-            eff_child_budget.used_tokens = cub.used_tokens;
-            eff_child_budget.used_cost_microusd = cub.used_cost_microusd;
-            eff_child_budget.used_wall_ms = cub.used_wall_ms;
+            eff_child_budget.used_tokens = @max(eff_child_budget.used_tokens, cub.used_tokens);
+            eff_child_budget.used_cost_microusd = @max(eff_child_budget.used_cost_microusd, cub.used_cost_microusd);
+            eff_child_budget.used_wall_ms = @max(eff_child_budget.used_wall_ms, cub.used_wall_ms);
         }
 
         const now = id.nowMs(self.io);
+        var new_end_cp = try end_cp.clone(self.allocator);
+        var end_cp_swapped = false;
+        errdefer if (!end_cp_swapped) new_end_cp.deinit(self.allocator);
+
+        const need_err_msg = (terminal_status == .failed or terminal_status == .canceled) and result_summary.len > 0;
+        const new_err_msg: ?[]u8 = if (need_err_msg) try self.allocator.dupe(u8, result_summary) else null;
+        var err_msg_swapped = false;
+        errdefer if (!err_msg_swapped) {
+            if (new_err_msg) |em| self.allocator.free(em);
+        };
+
         updated_task.status = terminal_status;
         updated_task.budget = eff_child_budget;
         updated_task.end_checkpoint.deinit(self.allocator);
-        updated_task.end_checkpoint = try end_cp.clone(self.allocator);
-        if ((terminal_status == .failed or terminal_status == .canceled) and result_summary.len > 0) {
+        updated_task.end_checkpoint = new_end_cp;
+        end_cp_swapped = true;
+        if (new_err_msg) |em| {
             if (updated_task.err_msg) |old| self.allocator.free(old);
-            updated_task.err_msg = try self.allocator.dupe(u8, result_summary);
+            updated_task.err_msg = em;
+            err_msg_swapped = true;
         }
         updated_task.updated_ms = @max(now, updated_task.updated_ms + 1);
 
-        const pstore = try self.openThread(parent_thread_id);
+        const pstore = parent_pinned.store();
         var tev = try pstore.appendEvent(self.runner_id, .{ .task_updated = updated_task });
         tev.deinit(self.allocator);
 
@@ -2014,7 +2420,9 @@ pub const ThreadRuntime = struct {
         if (visited.contains(thread_id)) return;
         try visited.put(self.allocator, thread_id, {});
 
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const now = id.nowMs(self.io);
 
         const ttopic = topicId(.thread, thread_id);
@@ -2030,6 +2438,7 @@ pub const ThreadRuntime = struct {
         _ = self.leases.cancelTopic(ttopic, next_epoch) catch {};
         report.canceled_leases += 1;
 
+        _ = self.active_turn_leases.remove(thread_id);
         if (self.active_turns.fetchRemove(thread_id)) |kv| {
             var lc = kv.value.lease;
             self.leases.release(&lc) catch {};
@@ -2062,50 +2471,49 @@ pub const ThreadRuntime = struct {
         cev.deinit(self.allocator);
         report.canceled_threads += 1;
 
+        for (children.items) |ch| {
+            if (!ch.was_active) continue;
+            report.canceled_tasks += 1;
+            _ = self.postMailbox(ch.child_thread_id, .{
+                .item_id = id.newUuidV7(self.io),
+                .from_thread_id = thread_id,
+                .to_thread_id = ch.child_thread_id,
+                .task_id = ch.task_id,
+                .kind = .cancel,
+                .payload = @constCast(reason orelse "cancelled"),
+                .created_ms = now,
+            }) catch {};
+            self.cancelTreeRec(ch.child_thread_id, reason, visited, report) catch {};
+        }
+
         var refund_budget_needed = false;
         var parent_budget: model.Budget = if (store.meta) |m| m.budget else .{};
         for (children.items) |ch| {
-            if (ch.was_active) {
-                report.canceled_tasks += 1;
-                var child_b = ch.budget;
-                if (self.openThread(ch.child_thread_id)) |cs| {
-                    if (cs.meta) |cm| {
-                        child_b.used_tokens = cm.budget.used_tokens;
-                        child_b.used_cost_microusd = cm.budget.used_cost_microusd;
-                        child_b.used_wall_ms = cm.budget.used_wall_ms;
-                    }
-                } else |_| {}
-                parent_budget.refundChild(child_b);
-                refund_budget_needed = true;
-            }
+            if (!ch.was_active) continue;
+            var child_b = ch.budget;
+            if (self.openThreadPinned(ch.child_thread_id)) |cpin_val| {
+                var cpin = cpin_val;
+                defer cpin.deinit();
+                if (cpin.store().meta) |cm| {
+                    child_b.used_tokens = cm.budget.used_tokens;
+                    child_b.used_cost_microusd = cm.budget.used_cost_microusd;
+                    child_b.used_wall_ms = cm.budget.used_wall_ms;
+                }
+            } else |_| {}
+            parent_budget.refundChild(child_b);
+            refund_budget_needed = true;
         }
 
-        const store_again = try self.openThread(thread_id);
-        if (store_again.meta) |m| {
+        if (store.meta) |m| {
             if (refund_budget_needed or m.status == .running) {
-                var uev = try store_again.appendEvent(self.runner_id, .{ .thread_updated = .{
+                var uev = try store.appendEvent(self.runner_id, .{ .thread_updated = .{
                     .status = if (m.status == .running) .interrupted else null,
                     .budget = if (refund_budget_needed) parent_budget else null,
                     .updated_ms = @max(now, m.updated_ms + 1),
                 } });
                 uev.deinit(self.allocator);
             }
-            try self.syncCatalogSummary(store_again);
-        }
-
-        for (children.items) |ch| {
-            if (ch.was_active) {
-                _ = self.postMailbox(ch.child_thread_id, .{
-                    .item_id = id.newUuidV7(self.io),
-                    .from_thread_id = thread_id,
-                    .to_thread_id = ch.child_thread_id,
-                    .task_id = ch.task_id,
-                    .kind = .cancel,
-                    .payload = @constCast(reason orelse "cancelled"),
-                    .created_ms = now,
-                }) catch {};
-            }
-            try self.cancelTreeRec(ch.child_thread_id, reason, visited, report);
+            try self.syncCatalogSummary(store);
         }
     }
 
@@ -2118,12 +2526,17 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn retryTask(self: *ThreadRuntime, parent_thread_id: u128, task_id: u128) !u128 {
-        const parent_store = try self.openThread(parent_thread_id);
+        var parent_pinned = try self.openThreadPinned(parent_thread_id);
+        defer parent_pinned.deinit();
+        const parent_store = parent_pinned.store();
         const orig_ptr = parent_store.tasks.getPtr(task_id) orelse return error.TaskNotFound;
+        if (!orig_ptr.status.isTerminal()) return error.InvalidTaskTransition;
         const parent_meta = parent_store.meta orelse return error.ThreadNotFound;
 
         var orig = try orig_ptr.clone(self.allocator);
         defer orig.deinit(self.allocator);
+
+        try self.validateChildBindingsAgainstParent(parent_meta.bindings, orig.grants, &.{});
 
         var req_budget = orig.budget;
         req_budget.used_tokens = 0;
@@ -2137,7 +2550,7 @@ pub const ThreadRuntime = struct {
         const new_task_id = id.newUuidV7(self.io);
         const now = id.nowMs(self.io);
 
-        var child_meta = try self.createThread(.{
+        var child_meta = try self.createThreadInternal(.{
             .title = orig.title,
             .project_id = parent_meta.project_id,
             .bindings = orig.grants,
@@ -2149,7 +2562,8 @@ pub const ThreadRuntime = struct {
             .placement = orig.placement,
             .provider_id = parent_meta.default_provider,
             .model = parent_meta.default_model,
-        });
+            .inherit_project_spaces = false,
+        }, &.{});
         const new_child_tid = child_meta.thread_id;
         defer child_meta.deinit(self.allocator);
 
@@ -2172,7 +2586,7 @@ pub const ThreadRuntime = struct {
             .updated_ms = now,
         };
 
-        const pstore = try self.openThread(parent_thread_id);
+        const pstore = parent_pinned.store();
         var buev = try pstore.appendEvent(self.runner_id, .{ .thread_updated = .{
             .budget = parent_budget,
             .updated_ms = @max(now, parent_meta.updated_ms + 1),
@@ -2191,7 +2605,9 @@ pub const ThreadRuntime = struct {
         parent_thread_id: u128,
         task_id: u128,
     ) !project_mod.SpaceSetLandReport {
-        const store = try self.openThread(parent_thread_id);
+        var pinned = try self.openThreadPinned(parent_thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const task = store.tasks.getPtr(task_id) orelse return error.TaskNotFound;
 
         var fork_ids: std.ArrayList(u128) = .empty;
@@ -2241,6 +2657,103 @@ pub const ThreadRuntime = struct {
         return out;
     }
 
+    fn hashSubtreeRec(
+        self: *ThreadRuntime,
+        sp: *const space_mod.Space,
+        rel: []const u8,
+        h: *std.crypto.hash.Blake3,
+    ) !void {
+        const entries = sp.listDir(self.allocator, rel) catch |err| {
+            if (err == error.NotFound) {
+                h.update("M");
+                return;
+            }
+            if (err == error.NotADir) {
+                h.update("F");
+                if (try sp.readFileAlloc(self.allocator, rel)) |data| {
+                    defer self.allocator.free(data);
+                    var lbuf: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &lbuf, data.len, .little);
+                    h.update(&lbuf);
+                    h.update(data);
+                }
+                return;
+            }
+            return err;
+        };
+        defer {
+            for (entries) |*e| e.deinit(self.allocator);
+            self.allocator.free(entries);
+        }
+
+        std.mem.sort(space_mod.DirEntry, entries, {}, struct {
+            fn lt(_: void, a: space_mod.DirEntry, b: space_mod.DirEntry) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lt);
+
+        h.update("D");
+        var cnt_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &cnt_buf, entries.len, .little);
+        h.update(&cnt_buf);
+
+        for (entries) |e| {
+            var nbuf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &nbuf, e.name.len, .little);
+            h.update(&nbuf);
+            h.update(e.name);
+            h.update(&[_]u8{@backingInt(e.kind)});
+
+            const child_path = if (rel.len == 0)
+                try self.allocator.dupe(u8, e.name)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel, e.name });
+            defer self.allocator.free(child_path);
+
+            switch (e.kind) {
+                .dir => try self.hashSubtreeRec(sp, child_path, h),
+                .file => {
+                    if (try sp.readFileAlloc(self.allocator, child_path)) |data| {
+                        defer self.allocator.free(data);
+                        var dbuf: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &dbuf, data.len, .little);
+                        h.update(&dbuf);
+                        h.update(data);
+                    }
+                },
+                .symlink => {},
+            }
+        }
+    }
+
+    fn spaceTriggerDigest(
+        self: *ThreadRuntime,
+        space_id: u128,
+        binding: *const model.SpaceBinding,
+        path_prefix: []const u8,
+    ) ![32]u8 {
+        const eff_prefix = try SpaceVirtualBridge.resolveBoundPath(self.allocator, binding, path_prefix, true);
+        defer self.allocator.free(eff_prefix);
+        if (eff_prefix.len == 0) {
+            return try self.spaceHeadsDigest(space_id);
+        }
+
+        const sp = try self.spaces.activate(space_id);
+        var h = std.crypto.hash.Blake3.init(.{});
+        h.update("0ndb-space-prefix-v1:");
+        var sid_buf: [16]u8 = undefined;
+        std.mem.writeInt(u128, &sid_buf, space_id, .little);
+        h.update(&sid_buf);
+        var pbuf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &pbuf, eff_prefix.len, .little);
+        h.update(&pbuf);
+        h.update(eff_prefix);
+        try self.hashSubtreeRec(sp, eff_prefix, &h);
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        return out;
+    }
+
     pub fn registerTrigger(self: *ThreadRuntime, thread_id: u128, trigger: model.Trigger) !u128 {
         switch (trigger.kind) {
             .cron => |expr| {
@@ -2249,7 +2762,20 @@ pub const ThreadRuntime = struct {
             else => {},
         }
 
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
+        const meta = store.meta orelse return error.ThreadNotFound;
+
+        var bound_for_sc: ?*const model.SpaceBinding = null;
+        if (trigger.kind == .space_changed) {
+            const sc = trigger.kind.space_changed;
+            bound_for_sc = findBindingInMeta(&meta, sc.space_id) orelse return error.SpaceNotBound;
+            if (sc.path_prefix.len > 0) {
+                _ = model.canonicalRelPath(sc.path_prefix) catch return error.PermissionDenied;
+            }
+        }
+
         var tr = try trigger.clone(self.allocator);
         defer tr.deinit(self.allocator);
         if (tr.trigger_id == 0) tr.trigger_id = id.newUuidV7(self.io);
@@ -2261,9 +2787,17 @@ pub const ThreadRuntime = struct {
 
         if (tr.kind == .space_changed) {
             const sc = tr.kind.space_changed;
-            if (self.spaces.get(sc.space_id) != null) {
-                const dig = try self.spaceHeadsDigest(sc.space_id);
-                try self.watched_space_digests.put(self.allocator, tr.trigger_id, dig);
+            if (bound_for_sc) |b| {
+                if (self.spaces.get(sc.space_id) != null) {
+                    const dig = try self.spaceTriggerDigest(sc.space_id, b, sc.path_prefix);
+                    try self.watched_space_digests.put(self.allocator, tr.trigger_id, dig);
+                    var wev = try store.appendEvent(self.runner_id, .{ .trigger_state_put = .{
+                        .trigger_id = tr.trigger_id,
+                        .digest = dig,
+                        .updated_ms = tr.created_ms,
+                    } });
+                    wev.deinit(self.allocator);
+                }
             }
         }
 
@@ -2271,7 +2805,9 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn disableTrigger(self: *ThreadRuntime, thread_id: u128, trigger_id: u128) !void {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const cur = store.triggers.getPtr(trigger_id) orelse return error.TriggerNotFound;
         var updated = try cur.clone(self.allocator);
         defer updated.deinit(self.allocator);
@@ -2281,7 +2817,9 @@ pub const ThreadRuntime = struct {
     }
 
     pub fn listTriggers(self: *ThreadRuntime, allocator: Allocator, thread_id: u128) ![]model.Trigger {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         var out: std.ArrayList(model.Trigger) = .empty;
         errdefer {
             for (out.items) |*t| t.deinit(allocator);
@@ -2310,17 +2848,17 @@ pub const ThreadRuntime = struct {
         event_token: []const u8,
         now_ms: u64,
     ) !FireTriggerOutcome {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         const tr = store.triggers.getPtr(trigger_id) orelse return .not_found;
         if (!tr.enabled) return .disabled;
 
         const slot = computeTriggerSlot(event_token);
         const dkey = model.Trigger.dedupKey(trigger_id, slot);
 
-        const thread_topic = topicId(.thread, thread_id);
-        const expected_epoch: u64 = if (store.last_lease) |ll| ll.fencing_epoch else 0;
-        var lease = try self.leases.acquire(thread_topic, expected_epoch, DEFAULT_LEASE_TTL_MS);
-        defer self.leases.release(&lease) catch {};
+        var scoped_lease = try self.acquireScopedThreadLease(store, thread_id, DEFAULT_LEASE_TTL_MS);
+        defer scoped_lease.deinit();
 
         if (store.fired_triggers.contains(dkey)) return .already_fired;
 
@@ -2341,9 +2879,20 @@ pub const ThreadRuntime = struct {
             uev.deinit(self.allocator);
         } else if (tr.kind == .space_changed) {
             const sc = tr.kind.space_changed;
-            if (self.spaces.get(sc.space_id) != null) {
-                const dig = try self.spaceHeadsDigest(sc.space_id);
-                try self.watched_space_digests.put(self.allocator, trigger_id, dig);
+            if (store.meta) |meta| {
+                if (findBindingInMeta(&meta, sc.space_id)) |b| {
+                    if (self.spaces.get(sc.space_id) != null) {
+                        const dig = try self.spaceTriggerDigest(sc.space_id, b, sc.path_prefix);
+                        try self.watched_space_digests.put(self.allocator, trigger_id, dig);
+                        _ = self.pending_trigger_changes.remove(trigger_id);
+                        var wev = try store.appendEvent(self.runner_id, .{ .trigger_state_put = .{
+                            .trigger_id = trigger_id,
+                            .digest = dig,
+                            .updated_ms = now_ms,
+                        } });
+                        wev.deinit(self.allocator);
+                    }
+                }
             }
         }
 
@@ -2356,7 +2905,9 @@ pub const ThreadRuntime = struct {
         thread_id: u128,
         now_ms: u64,
     ) ![]DueTrigger {
-        const store = try self.openThread(thread_id);
+        var pinned = try self.openThreadPinned(thread_id);
+        defer pinned.deinit();
+        const store = pinned.store();
         var out: std.ArrayList(DueTrigger) = .empty;
         errdefer {
             for (out.items) |*d| d.deinit(allocator);
@@ -2383,23 +2934,58 @@ pub const ThreadRuntime = struct {
                     }
                 },
                 .space_changed => |sc| {
+                    const meta = store.meta orelse continue;
+                    const b = findBindingInMeta(&meta, sc.space_id) orelse continue;
                     if (self.spaces.get(sc.space_id) != null) {
-                        const cur_dig = try self.spaceHeadsDigest(sc.space_id);
-                        const changed = if (self.watched_space_digests.get(tr.trigger_id)) |prev_dig|
+                        const cur_dig = try self.spaceTriggerDigest(sc.space_id, b, sc.path_prefix);
+                        const prev_dig_opt: ?[32]u8 = if (store.trigger_watch_states.get(tr.trigger_id)) |ws|
+                            ws.digest
+                        else
+                            self.watched_space_digests.get(tr.trigger_id);
+                        const changed = if (prev_dig_opt) |prev_dig|
                             !std.mem.eql(u8, &prev_dig, &cur_dig)
                         else
                             true;
                         if (changed) {
-                            var hex_buf: [64]u8 = undefined;
-                            const hex = id.formatHashHex(cur_dig, &hex_buf);
-                            token_opt = try std.fmt.allocPrint(allocator, "space:{s}", .{hex});
+                            var debounced = false;
+                            if (sc.debounce_ms > 0) {
+                                if (store.trigger_last_fired_ms.get(tr.trigger_id)) |last_ms| {
+                                    if (now_ms < last_ms +| @as(u64, sc.debounce_ms)) {
+                                        debounced = true;
+                                    }
+                                }
+                                if (!debounced) {
+                                    if (self.pending_trigger_changes.getPtr(tr.trigger_id)) |pc| {
+                                        if (!std.mem.eql(u8, &pc.digest, &cur_dig)) {
+                                            pc.digest = cur_dig;
+                                            pc.first_seen_ms = now_ms;
+                                            debounced = true;
+                                        } else if (now_ms < pc.first_seen_ms +| @as(u64, sc.debounce_ms)) {
+                                            debounced = true;
+                                        }
+                                    } else {
+                                        try self.pending_trigger_changes.put(self.allocator, tr.trigger_id, .{
+                                            .digest = cur_dig,
+                                            .first_seen_ms = now_ms,
+                                        });
+                                        debounced = true;
+                                    }
+                                }
+                            }
+                            if (!debounced) {
+                                var hex_buf: [64]u8 = undefined;
+                                const hex = id.formatHashHex(cur_dig, &hex_buf);
+                                token_opt = try std.fmt.allocPrint(allocator, "space:{s}", .{hex});
+                            }
+                        } else {
+                            _ = self.pending_trigger_changes.remove(tr.trigger_id);
                         }
                     }
                 },
                 .mailbox => {
                     var newest: ?u128 = null;
                     for (store.mailbox_order.items) |mid| {
-                        if (!self.acked_mailbox.contains(mid)) newest = mid;
+                        if (!store.acked_mailbox.contains(mid)) newest = mid;
                     }
                     if (newest) |mid| {
                         var hex_buf: [32]u8 = undefined;
@@ -2499,28 +3085,50 @@ fn matchCronField(field: []const u8, value: u8, min_val: u8, max_val: u8, is_dow
         }
 
         if (std.mem.indexOfScalar(u8, base_part, '-')) |dash| {
-            var lo = try parseCronUint(base_part[0..dash]);
-            var hi = try parseCronUint(base_part[dash + 1 ..]);
+            const raw_lo = try parseCronUint(base_part[0..dash]);
+            const raw_hi = try parseCronUint(base_part[dash + 1 ..]);
             if (is_dow) {
-                if (lo == 7) lo = 0;
-                if (hi == 7) hi = 6;
-            }
-            if (lo < min_val or hi > max_val or lo > hi) return error.InvalidCronExpression;
-            if (value >= lo and value <= hi and ((value - lo) % step == 0)) {
-                matched = true;
+                if (raw_lo > 7 or raw_hi > 7 or raw_lo > raw_hi) return error.InvalidCronExpression;
+                var d: u16 = raw_lo;
+                while (d <= raw_hi) : (d += step) {
+                    if (@as(u8, @intCast(d % 7)) == value) {
+                        matched = true;
+                        break;
+                    }
+                }
+            } else {
+                if (raw_lo < min_val or raw_hi > max_val or raw_lo > raw_hi) return error.InvalidCronExpression;
+                if (value >= raw_lo and value <= raw_hi and ((value - raw_lo) % step == 0)) {
+                    matched = true;
+                }
             }
             continue;
         }
 
-        var exact = try parseCronUint(base_part);
-        if (is_dow and exact == 7) exact = 0;
-        if (exact < min_val or exact > max_val) return error.InvalidCronExpression;
-        if (std.mem.indexOfScalar(u8, item, '/') != null) {
-            if (value >= exact and value <= max_val and ((value - exact) % step == 0)) {
-                matched = true;
+        const raw_exact = try parseCronUint(base_part);
+        if (is_dow) {
+            if (raw_exact > 7) return error.InvalidCronExpression;
+            if (std.mem.indexOfScalar(u8, item, '/') != null) {
+                const raw_hi: u16 = if (raw_exact == 7) 7 else 6;
+                var d: u16 = raw_exact;
+                while (d <= raw_hi) : (d += step) {
+                    if (@as(u8, @intCast(d % 7)) == value) {
+                        matched = true;
+                        break;
+                    }
+                }
+            } else {
+                if (@as(u8, @intCast(raw_exact % 7)) == value) matched = true;
             }
         } else {
-            if (value == exact) matched = true;
+            if (raw_exact < min_val or raw_exact > max_val) return error.InvalidCronExpression;
+            if (std.mem.indexOfScalar(u8, item, '/') != null) {
+                if (value >= raw_exact and value <= max_val and ((value - raw_exact) % step == 0)) {
+                    matched = true;
+                }
+            } else {
+                if (value == raw_exact) matched = true;
+            }
         }
     }
     return matched;
@@ -2543,5 +3151,8 @@ pub fn matchesCron(expr: []const u8, unix_secs: u64) !bool {
     const dom_ok = try matchCronField(parts[2], dt.dom, 1, 31, false);
     const mon_ok = try matchCronField(parts[3], dt.month, 1, 12, false);
     const dow_ok = try matchCronField(parts[4], dt.dow, 0, 6, true);
-    return m_ok and h_ok and dom_ok and mon_ok and dow_ok;
+    const dom_restricted = !std.mem.eql(u8, parts[2], "*");
+    const dow_restricted = !std.mem.eql(u8, parts[4], "*");
+    const day_ok = if (dom_restricted and dow_restricted) (dom_ok or dow_ok) else (dom_ok and dow_ok);
+    return m_ok and h_ok and mon_ok and day_ok;
 }
