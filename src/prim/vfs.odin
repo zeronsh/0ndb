@@ -75,10 +75,6 @@ Vfs_Procs :: struct {
 	caps:       proc(data: rawptr, fd: Fd) -> Vfs_Caps,
 }
 
-os_vfs :: proc "contextless" () -> Vfs {
-	return Vfs{procs = &OS_VFS_PROCS}
-}
-
 open_file :: #force_inline proc(vfs: Vfs, path: string, flags: Open_Flags = {}, mode: u32 = 0o644) -> (Fd, Error) {
 	return vfs.procs.open(vfs.data, path, flags, mode)
 }

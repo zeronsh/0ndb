@@ -1,6 +1,7 @@
 package prim
 
 import "core:sys/linux"
+import "core:sys/posix"
 
 @(private)
 MAX_EVENTS :: 64
@@ -214,4 +215,15 @@ ignore_sigpipe :: proc "contextless" () {
 	act: linux.Sig_Action
 	act.special = .SIG_IGN
 	linux.rt_sigaction(.SIGPIPE, &act, nil)
+}
+
+@(private)
+_os_fd :: proc "contextless" (l: ^Loop) -> Fd {
+	return Fd(l.os.epfd)
+}
+
+@(private)
+_os_has_ready :: proc(l: ^Loop) -> bool {
+	fds := [1]posix.pollfd{{fd = posix.FD(l.os.epfd), events = {.IN}}}
+	return posix.poll(&fds[0], 1, 0) > 0
 }

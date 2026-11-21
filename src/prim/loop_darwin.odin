@@ -205,3 +205,14 @@ _os_child_release :: proc(l: ^Loop, s: ^_Slot) {
 ignore_sigpipe :: proc "contextless" () {
 	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
 }
+
+@(private)
+_os_fd :: proc "contextless" (l: ^Loop) -> Fd {
+	return Fd(l.os.kq)
+}
+
+@(private)
+_os_has_ready :: proc(l: ^Loop) -> bool {
+	fds := [1]posix.pollfd{{fd = posix.FD(l.os.kq), events = {.IN}}}
+	return posix.poll(&fds[0], 1, 0) > 0
+}

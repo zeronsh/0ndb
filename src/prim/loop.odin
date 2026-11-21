@@ -1,3 +1,4 @@
+#+build linux, darwin
 package prim
 
 import "base:intrinsics"
@@ -129,6 +130,51 @@ loop_timeout_ms :: proc(l: ^Loop) -> i64 {
 		return 0
 	}
 	return (d + 999_999) / 1_000_000
+}
+
+Timer_Info :: struct {
+	deadline: i64,
+	cb:       Timer_Proc,
+	data:     rawptr,
+}
+
+loop_next_deadline :: proc "contextless" (l: ^Loop) -> (deadline: i64, ok: bool) {
+	if len(l.heap) == 0 {
+		return 0, false
+	}
+	return l.timers[l.heap[0]].deadline, true
+}
+
+loop_armed :: proc "contextless" (l: ^Loop) -> int {
+	return len(l.heap)
+}
+
+loop_timer_info :: proc "contextless" (l: ^Loop, i: int) -> (info: Timer_Info, ok: bool) {
+	if i < 0 || i >= len(l.heap) {
+		return
+	}
+	t := l.timers[l.heap[i]]
+	return Timer_Info{deadline = t.deadline, cb = t.cb, data = t.data}, true
+}
+
+loop_has_ready :: proc(l: ^Loop) -> bool {
+	if len(l.pending) > 0 {
+		return true
+	}
+	return _os_has_ready(l)
+}
+
+loop_fd :: proc "contextless" (l: ^Loop) -> Fd {
+	return _os_fd(l)
+}
+
+loop_abandon :: proc(l: ^Loop) {
+	for &s in l.slots {
+		if s.kind == .Fd && s.fd >= 0 {
+			close(s.fd)
+		}
+	}
+	loop_destroy(l)
 }
 
 loop_stop :: proc "contextless" (l: ^Loop) {
