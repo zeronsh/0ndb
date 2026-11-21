@@ -577,6 +577,7 @@ _pending_scan :: proc(r: ^Runtime, space: prim.Id, runner: prim.Id = {}) {
 
 @(private)
 _on_runners :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	for d in deltas {
 		_pending_scan(r, d.object.space)

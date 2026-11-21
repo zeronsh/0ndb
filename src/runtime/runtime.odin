@@ -271,6 +271,7 @@ Runtime :: struct {
 }
 
 open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allocator) -> Error {
+	context = eng.context_for(e)
 	r^ = {
 		e         = e,
 		cfg       = cfg,
@@ -356,6 +357,7 @@ _home_default :: proc(env: []string) -> string {
 
 @(private)
 _on_engine_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	if !r.closing {
 		#partial switch ev.kind {
@@ -399,6 +401,7 @@ _presence_changed :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, up: bool
 }
 
 close :: proc(r: ^Runtime) {
+	context = eng.context_for(r.e)
 	if !r.opened {
 		return
 	}
@@ -501,6 +504,7 @@ close :: proc(r: ^Runtime) {
 }
 
 attach :: proc(r: ^Runtime, space: prim.Id) -> Error {
+	context = eng.context_for(r.e)
 	for sw in r.spaces {
 		if sw.space == space {
 			return .None
@@ -536,6 +540,7 @@ attach :: proc(r: ^Runtime, space: prim.Id) -> Error {
 }
 
 detach :: proc(r: ^Runtime, space: prim.Id) {
+	context = eng.context_for(r.e)
 	for sw, i in r.spaces {
 		if sw.space != space {
 			continue
@@ -578,10 +583,12 @@ stats :: proc(r: ^Runtime) -> Stats {
 }
 
 active_runs :: proc(r: ^Runtime) -> int {
+	context = eng.context_for(r.e)
 	return len(r.runs)
 }
 
 warm_processes :: proc(r: ^Runtime) -> int {
+	context = eng.context_for(r.e)
 	n := 0
 	for p in r.procs {
 		if p.run == nil {
@@ -592,6 +599,7 @@ warm_processes :: proc(r: ^Runtime) -> int {
 }
 
 wake :: proc(r: ^Runtime, o: Object) {
+	context = eng.context_for(r.e)
 	_queue_eval(r, o)
 }
 
@@ -661,6 +669,7 @@ parse_rid :: proc(s: string) -> (rid: Rid, ok: bool) {
 
 @(private)
 _on_catalog :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	seen := make([dynamic]Object, context.temp_allocator)
 	outer: for &d in deltas {
@@ -700,6 +709,7 @@ _queue_eval :: proc(r: ^Runtime, o: Object) {
 
 @(private)
 _on_eval_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	r.eval_timer = 0
 	list := make([]Object, len(r.pending), context.temp_allocator)
@@ -742,6 +752,7 @@ _wait_drop :: proc(r: ^Runtime, ready: eng.Ready) {
 
 @(private)
 _on_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+	context = eng.context_for((^Eval_Wait)(data).r.e)
 	w := (^Eval_Wait)(data)
 	r := w.r
 	o := w.object
@@ -777,12 +788,18 @@ _engine_spawn :: proc(data: rawptr, req: ^Spawn_Request) -> (prim.Child, prim.Er
 	return sp.spawn(sp.data, req.argv, req.cwd, env, req.new_group)
 }
 
+spawn_child :: proc(r: ^Runtime, req: ^Spawn_Request) -> (prim.Child, prim.Error) {
+	context.allocator = r.allocator
+	return r.cfg.spawner.spawn(r.cfg.spawner.data, req)
+}
+
 default_scheduler :: proc() -> Scheduler {
 	return Scheduler{place = _default_place}
 }
 
 @(private)
 _default_place :: proc(data: rawptr, r: ^Runtime, p: ^Placement) -> prim.Id {
+	context = eng.context_for(r.e)
 	space := p.object.space
 	if !prim.id_is_zero(p.sender) && p.sender != p.exclude && runner_live(r, space, p.sender, p.provider) {
 		return p.sender

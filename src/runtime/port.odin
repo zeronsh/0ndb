@@ -273,6 +273,7 @@ purge_hook :: proc(r: ^Runtime) -> eng.Purge_Hook {
 
 @(private)
 _purge :: proc(data: rawptr, e: ^eng.Engine, req: ^eng.Purge_Request) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	if !r.opened {
 		return

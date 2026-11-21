@@ -1,5 +1,6 @@
 package rt
 
+import eng "../engine"
 import "../mcp"
 import "../prim"
 
@@ -62,6 +63,7 @@ _w_statuses :: proc(b: ^Buf, key: string, s: Task_Statuses) {
 }
 
 task_spawn :: proc(r: ^Runtime, caller: Object, args: Spawn_Args, data: rawptr, done: Orch_Done) {
+	context = eng.context_for(r.e)
 	b := make(Buf, context.temp_allocator)
 	append(&b, '{')
 	jw_kstr(&b, "goal", args.goal)
@@ -110,6 +112,7 @@ task_spawn :: proc(r: ^Runtime, caller: Object, args: Spawn_Args, data: rawptr, 
 }
 
 task_send :: proc(r: ^Runtime, caller: Object, task: prim.Id, message: string, mode: Send_Mode, data: rawptr, done: Orch_Done) {
+	context = eng.context_for(r.e)
 	b := make(Buf, context.temp_allocator)
 	append(&b, '{')
 	jw_kstr(&b, "task", hex(task))
@@ -120,6 +123,7 @@ task_send :: proc(r: ^Runtime, caller: Object, task: prim.Id, message: string, m
 }
 
 task_wait :: proc(r: ^Runtime, caller: Object, tasks: []prim.Id, all: bool, statuses: Task_Statuses, timeout_seconds: i64, data: rawptr, done: Orch_Done) -> (token: u64) {
+	context = eng.context_for(r.e)
 	b := make(Buf, context.temp_allocator)
 	append(&b, '{')
 	if len(tasks) > 0 {
@@ -135,10 +139,12 @@ task_wait :: proc(r: ^Runtime, caller: Object, tasks: []prim.Id, all: bool, stat
 }
 
 task_wait_cancel :: proc(r: ^Runtime, token: u64) {
+	context = eng.context_for(r.e)
 	tool_abort(r, token)
 }
 
 task_list :: proc(r: ^Runtime, caller: Object, parent: prim.Id, recursive: bool, statuses: Task_Statuses, limit: int, cursor: string, data: rawptr, done: Orch_Done) {
+	context = eng.context_for(r.e)
 	b := make(Buf, context.temp_allocator)
 	append(&b, '{')
 	if !prim.id_is_zero(parent) {
@@ -157,6 +163,7 @@ task_list :: proc(r: ^Runtime, caller: Object, parent: prim.Id, recursive: bool,
 }
 
 task_cancel :: proc(r: ^Runtime, caller: Object, tasks: []prim.Id, recursive: bool, reason: string, data: rawptr, done: Orch_Done) {
+	context = eng.context_for(r.e)
 	b := make(Buf, context.temp_allocator)
 	append(&b, '{')
 	_w_ids(&b, "tasks", tasks)
@@ -169,6 +176,7 @@ task_cancel :: proc(r: ^Runtime, caller: Object, tasks: []prim.Id, recursive: bo
 }
 
 task_result :: proc(r: ^Runtime, caller: Object, task: prim.Id, messages: int, diff: bool, max_chars: int, data: rawptr, done: Orch_Done) {
+	context = eng.context_for(r.e)
 	b := make(Buf, context.temp_allocator)
 	append(&b, '{')
 	jw_kstr(&b, "task", hex(task))
@@ -182,6 +190,7 @@ task_result :: proc(r: ^Runtime, caller: Object, task: prim.Id, messages: int, d
 }
 
 task_merge :: proc(r: ^Runtime, caller: Object, task: prim.Id, mounts: []string, dry_run: bool, data: rawptr, done: Orch_Done) {
+	context = eng.context_for(r.e)
 	b := make(Buf, context.temp_allocator)
 	append(&b, '{')
 	jw_kstr(&b, "task", hex(task))

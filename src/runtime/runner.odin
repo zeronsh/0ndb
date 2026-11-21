@@ -13,6 +13,7 @@ import "../prim"
 REVIVE_PROMPT :: "Your previous turn was cut off by a restart of the machine running you. Continue the task from exactly where you left off; do not repeat work that is already done."
 
 evaluate :: proc(r: ^Runtime, o: Object) {
+	context = eng.context_for(r.e)
 	if r.closing {
 		return
 	}
@@ -292,6 +293,7 @@ _lease_arm :: proc(r: ^Runtime) {
 
 @(private)
 _on_lease_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	r.lease_timer = 0
 	r.lease_at = 0
@@ -307,6 +309,7 @@ _on_lease_timer :: proc(l: ^prim.Loop, data: rawptr) {
 
 @(private)
 _on_renew :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Run)(data).r.e)
 	run := (^Run)(data)
 	r := run.r
 	run.renew_timer = 0
@@ -899,6 +902,7 @@ _blob_read :: proc(r: ^Runtime, oid_bytes: []u8) -> []u8 {
 
 @(private)
 _on_run_convo :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	context = eng.context_for((^Run)(data).r.e)
 	run := (^Run)(data)
 	for d in deltas {
 		if d.kind == .Intent || d.kind == .Run {
@@ -1250,6 +1254,7 @@ _lease_prune :: proc(r: ^Runtime, o: Object, v: ^obj.View) {
 
 @(private)
 _on_watch_convo :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	for d in deltas {
 		_queue_eval(r, d.object)
@@ -1305,6 +1310,7 @@ FOLLOW_GRACE_MS :: 5000
 
 @(private)
 _on_follow_grace :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Follow_Grace)(data).r.e)
 	g := (^Follow_Grace)(data)
 	for &f in g.r.follows {
 		if f.sub == g.sub {
@@ -1334,6 +1340,7 @@ _follow_start :: proc(r: ^Runtime, o: Object) -> bool {
 
 @(private)
 _on_follow_convo :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	remote := false
 	for d in deltas {

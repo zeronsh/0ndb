@@ -118,6 +118,7 @@ version_decode :: proc(b: []u8, allocator := context.temp_allocator) -> (v: []cr
 }
 
 agent_actor :: proc(r: ^Runtime, agent_id: prim.Id) -> prim.Id {
+	context = eng.context_for(r.e)
 	me, a := r.self, agent_id
 	return derive_id("0ndb-agent-actor-v1", me[:], a[:])
 }
@@ -206,6 +207,7 @@ _fence_issue :: proc(ctx: ^Fence_Ctx) {
 
 @(private)
 _fence_done :: proc(data: rawptr, e: ^eng.Engine, m: ^fs.Mount, err: eng.Error) {
+	context = eng.context_for((^Fence_Ctx)(data).r.e)
 	ctx := (^Fence_Ctx)(data)
 	if err != .None && ctx.err == .None {
 		ctx.err = .Io
@@ -224,6 +226,7 @@ _fence_step :: proc(ctx: ^Fence_Ctx) {
 
 @(private)
 _fence_fire :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Fence_Ctx)(data).r.e)
 	ctx := (^Fence_Ctx)(data)
 	r, o, arg, err, next := ctx.r, ctx.o, ctx.arg, ctx.err, ctx.next
 	free(ctx, r.allocator)
@@ -881,6 +884,7 @@ worktree_close :: proc(ws: ^Worktree) {
 }
 
 worktree_go_back :: proc(r: ^Runtime, o: Object, msg: Rid) -> Error {
+	context = eng.context_for(r.e)
 	v, verr := eng.convo_view(r.e, o)
 	if verr != .None {
 		return .Engine
@@ -953,6 +957,7 @@ observe_sink :: proc(r: ^Runtime) -> observe.Sink {
 
 @(private)
 _observe_write :: proc(data: rawptr, w: ^observe.Write) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	reg, rerr := eng.registry(r.e)
 	if rerr != .None {

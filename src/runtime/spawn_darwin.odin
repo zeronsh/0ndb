@@ -1,5 +1,6 @@
 package rt
 
+import eng "../engine"
 import "../fs"
 import "../observe"
 import "../prim"
@@ -36,6 +37,7 @@ libproc_decider :: proc(r: ^Runtime) -> observe.Decider {
 
 @(private)
 _libproc_spawn :: proc(data: rawptr, req: ^Spawn_Request) -> (prim.Child, prim.Error) {
+	context = eng.context_for((^Libproc_Spawn)(data).r.e)
 	s := (^Libproc_Spawn)(data)
 	child, err := s.fallback.spawn(s.fallback.data, req)
 	if err == .None && req.observe {
@@ -46,6 +48,7 @@ _libproc_spawn :: proc(data: rawptr, req: ^Spawn_Request) -> (prim.Child, prim.E
 
 @(private)
 _libproc_decide :: proc(data: rawptr, m: ^fs.Mount, w: ^observe.Write) -> (^fs.Scope, bool) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	for run in r.runs {
 		if !_run_has_mount(run, m) {

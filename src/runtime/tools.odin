@@ -1,6 +1,7 @@
 package rt
 
 import "core:strings"
+import eng "../engine"
 import "../fs"
 import "../mcp"
 import "../model"
@@ -109,6 +110,7 @@ tool_dispatch :: proc(r: ^Runtime, run: ^Run, n: ^Native, call: ^Tool_Call) -> u
 }
 
 tool_result :: proc(r: ^Runtime, call: ^Tool_Call, text: string, is_error := false) {
+	context = eng.context_for(r.e)
 	reply_done(r, Reply{kind = .Native, o = call.object, id = call.id}, text, "", is_error)
 }
 

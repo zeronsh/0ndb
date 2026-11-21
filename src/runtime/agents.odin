@@ -72,6 +72,7 @@ Agent_Info :: struct {
 }
 
 agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", allocator := context.allocator) -> (a: Agent_Info, ok: bool) {
+	context = eng.context_for(r.e)
 	settings, serr := eng.convo_settings(r.e, o, context.temp_allocator)
 	if serr != .None && serr != .Pending {
 		return a, false

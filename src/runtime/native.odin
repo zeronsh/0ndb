@@ -49,6 +49,7 @@ reference_model_plug :: proc() -> Model_Plug {
 
 @(private)
 _reference_resolve :: proc(data: rawptr, r: ^Runtime, provider: string, model_id: string, cfg: ^model.Config, m: ^model.Model) -> bool {
+	context = eng.context_for(r.e)
 	id := model_id
 	if len(id) == 0 {
 		id = model.DEFAULT_ANTHROPIC_MODEL
@@ -162,6 +163,7 @@ native_start :: proc(run: ^Run) -> Error {
 
 @(private)
 _native_mcp_ready :: proc(data: rawptr, c: ^Mcp_Conn) {
+	context = eng.context_for((^Native)(data).r.e)
 	n := (^Native)(data)
 	if n.started || n.dead {
 		return
@@ -654,6 +656,7 @@ _native_arm :: proc(n: ^Native) {
 
 @(private)
 _native_on_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Native)(data).r.e)
 	n := (^Native)(data)
 	n.timer = 0
 	n.timer_at = 0
@@ -664,6 +667,7 @@ _native_on_timer :: proc(l: ^prim.Loop, data: rawptr) {
 
 @(private)
 _native_head :: proc(data: rawptr, id: http.Id, status: int, headers: []http.Header) {
+	context = eng.context_for((^Native)(data).r.e)
 	n := (^Native)(data)
 	if n.http_id != id || n.dead {
 		return
@@ -675,6 +679,7 @@ _native_head :: proc(data: rawptr, id: http.Id, status: int, headers: []http.Hea
 
 @(private)
 _native_body :: proc(data: rawptr, id: http.Id, chunk: []u8) -> bool {
+	context = eng.context_for((^Native)(data).r.e)
 	n := (^Native)(data)
 	if n.http_id != id || n.dead {
 		return false
@@ -690,6 +695,7 @@ _native_body :: proc(data: rawptr, id: http.Id, chunk: []u8) -> bool {
 
 @(private)
 _native_done :: proc(data: rawptr, id: http.Id, err: http.Error, detail: string) {
+	context = eng.context_for((^Native)(data).r.e)
 	n := (^Native)(data)
 	if n.http_id != id || n.dead {
 		return
@@ -753,6 +759,7 @@ _warm_object :: proc(r: ^Runtime, key: u64) -> (o: Object, ok: bool) {
 
 @(private)
 _warm_report :: proc(data: rawptr, key: u64, usage: model.Call_Usage, cost: f64, status: int, err: http.Error) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	r.stats.warmups += 1
 	o, ok := _warm_object(r, key)
@@ -766,6 +773,7 @@ _warm_report :: proc(data: rawptr, key: u64, usage: model.Call_Usage, cost: f64,
 
 @(private)
 _warm_supply :: proc(data: rawptr, key: u64, cfg: ^model.Config, ctx: ^model.Context) -> bool {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	k := make([]u8, 8, context.temp_allocator)
 	prim.put_u64le(k, key)

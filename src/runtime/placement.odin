@@ -122,6 +122,7 @@ _unanswered :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> (ms
 }
 
 placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: Error) {
+	context = eng.context_for(r.e)
 	v, verr := eng.convo_view(r.e, o)
 	if verr != .None {
 		return info, _eerr(verr)

@@ -24,6 +24,7 @@ Record_Update :: struct {
 }
 
 record :: proc(r: ^Runtime, o: Object, source: string, external_id: string, sequence: u64, update: Record_Update) -> (receipt: convo.Receipt, msg: Rid, err: Error) {
+	context = eng.context_for(r.e)
 	if len(source) == 0 || len(external_id) == 0 {
 		return {}, {}, .Invalid
 	}

@@ -257,7 +257,7 @@ _proc_spawn :: proc(p: ^Proc) -> Error {
 		new_group = true,
 		observe   = p.run == nil || p.run.ai.observe,
 	}
-	child, serr := r.cfg.spawner.spawn(r.cfg.spawner.data, &req)
+	child, serr := spawn_child(r, &req)
 	if serr != .None {
 		return .Spawn
 	}
@@ -376,11 +376,13 @@ _proc_flush :: proc(p: ^Proc) {
 
 @(private)
 _proc_on_in :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
+	context = eng.context_for((^Proc)(data).r.e)
 	_proc_flush((^Proc)(data))
 }
 
 @(private)
 _proc_on_out :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
+	context = eng.context_for((^Proc)(data).r.e)
 	p := (^Proc)(data)
 	r := p.r
 	for p.alive || p.child.stdout >= 0 {
@@ -433,6 +435,7 @@ _proc_lines :: proc(p: ^Proc) {
 
 @(private)
 _proc_on_err :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
+	context = eng.context_for((^Proc)(data).r.e)
 	p := (^Proc)(data)
 	for {
 		n, err := prim.line_fill(&p.lb_err, fd)
@@ -469,6 +472,7 @@ _proc_on_err :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) 
 
 @(private)
 _proc_on_exit :: proc(l: ^prim.Loop, pid: prim.Pid, status: prim.Exit_Status, data: rawptr) {
+	context = eng.context_for((^Proc)(data).r.e)
 	p := (^Proc)(data)
 	r := p.r
 	p.cw = 0
@@ -710,6 +714,7 @@ _proc_close :: proc(p: ^Proc) {
 
 @(private)
 _proc_on_kill :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Proc)(data).r.e)
 	p := (^Proc)(data)
 	p.kill_timer = 0
 	if p.alive {
@@ -832,6 +837,7 @@ _warm_arm :: proc(r: ^Runtime) {
 
 @(private)
 _on_warm_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	r.warm_timer = 0
 	r.warm_at = 0
@@ -973,6 +979,7 @@ _native_pending :: proc(r: ^Runtime, run: ^Run) -> bool {
 
 @(private)
 _on_launch_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+	context = eng.context_for((^Launch_Wait)(data).r.e)
 	w := (^Launch_Wait)(data)
 	r, o := w.r, w.o
 	free(w, r.allocator)

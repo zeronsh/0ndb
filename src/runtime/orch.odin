@@ -55,6 +55,7 @@ TASK_STATUS_NAMES := [Task_Status]string {
 }
 
 task_get :: proc(r: ^Runtime, o: Object) -> (t: Task_Info, found: bool) {
+	context = eng.context_for(r.e)
 	en, ok := map_read(r, meta_object(o), transmute([]u8)string(KEY_TASK))
 	if !ok {
 		return {}, false
@@ -71,6 +72,7 @@ task_cancelled :: proc(r: ^Runtime, o: Object) -> bool {
 }
 
 task_status :: proc(r: ^Runtime, o: Object) -> (s: Task_Status, summary: string, ok: bool) {
+	context = eng.context_for(r.e)
 	if task_cancelled(r, o) {
 		return .Cancelled, _last_reply_text(r, o, 600), true
 	}
@@ -564,6 +566,7 @@ _await_existing :: proc(r: ^Runtime, caller: Object, tasks: []prim.Id, cond: con
 
 @(private)
 _await_on_timeout :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Await_Wait)(data).r.e)
 	w := (^Await_Wait)(data)
 	w.timer = 0
 	_await_check(w.r, w, true)
@@ -860,6 +863,7 @@ File_Change :: struct {
 }
 
 task_changes :: proc(r: ^Runtime, caller: Object, task: Object, want_diff: bool, max_chars: int) -> (out: []File_Change, diff: string) {
+	context = eng.context_for(r.e)
 	list := make([dynamic]File_Change, context.temp_allocator)
 	db := make(Buf, context.temp_allocator)
 	kms, kerr := eng.convo_mounts(r.e, task, context.temp_allocator)
@@ -1061,6 +1065,7 @@ _orch_merge :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
 }
 
 merge_line :: proc(r: ^Runtime, tree: Object, from: string, into: string, dry: bool) -> (landed: bool, files: int, conflicts: []string) {
+	context = eng.context_for(r.e)
 	h, herr := eng.tree_history(r.e, tree)
 	if herr != .None {
 		return false, 0, nil
@@ -1199,6 +1204,7 @@ File_Key_Ctx :: struct {
 
 @(private)
 _file_key :: proc(data: rawptr, path: string, out: ^[dynamic]u8) -> bool {
+	context = eng.context_for((^File_Key_Ctx)(data).r.e)
 	c := (^File_Key_Ctx)(data)
 	ms, err := eng.convo_mounts(c.r.e, c.caller, context.temp_allocator)
 	if err != .None {

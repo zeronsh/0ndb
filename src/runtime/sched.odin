@@ -39,6 +39,7 @@ Cron :: struct {
 }
 
 schedule_get :: proc(r: ^Runtime, owner: Object, id: string) -> (s: Schedule, found: bool) {
+	context = eng.context_for(r.e)
 	en, ok := map_read(r, owner, key_of(SCHED_PREFIX, transmute([]u8)id))
 	if !ok {
 		return {}, false
@@ -80,6 +81,7 @@ _index_put :: proc(r: ^Runtime, s: ^Schedule) {
 }
 
 schedule_remove :: proc(r: ^Runtime, owner: Object, id: string) -> bool {
+	context = eng.context_for(r.e)
 	_, found := schedule_get(r, owner, id)
 	map_clear(r, owner, key_of(SCHED_PREFIX, transmute([]u8)id), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 	map_clear(r, schedules_object(owner.space), _index_key(owner, id), 1, 2)
@@ -99,6 +101,7 @@ schedule_next :: proc(r: ^Runtime, s: ^Schedule, after_ms: i64) -> i64 {
 
 @(private)
 _on_schedules :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	_sched_rearm(r)
 }
@@ -139,6 +142,7 @@ _sched_rearm :: proc(r: ^Runtime) {
 
 @(private)
 _on_sched_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	r.sched_timer = 0
 	r.sched_at = 0
@@ -312,6 +316,7 @@ _schedule_json :: proc(b: ^Buf, s: ^Schedule) {
 }
 
 schedule_create :: proc(r: ^Runtime, owner: Object, id: string, prompt: string, cron: string, at_ms: i64, tz: string, conversation: Object, fresh := false) -> Error {
+	context = eng.context_for(r.e)
 	s := Schedule {
 		id           = id,
 		owner        = owner,

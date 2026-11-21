@@ -424,6 +424,7 @@ _run_budget_check :: proc(run: ^Run) {
 
 @(private)
 _on_budget_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Run)(data).r.e)
 	run := (^Run)(data)
 	run.budget_timer = 0
 	if run.state == .Running && !run.interrupting {
@@ -452,6 +453,7 @@ run_interrupt :: proc(run: ^Run) {
 
 @(private)
 _on_kill_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Run)(data).r.e)
 	run := (^Run)(data)
 	run.kill_timer = 0
 	if run.state == .Finished {

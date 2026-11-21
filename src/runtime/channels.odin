@@ -21,6 +21,7 @@ Channel_Message :: struct {
 }
 
 channel_deliver :: proc(r: ^Runtime, space: prim.Id, m: Channel_Message) -> (o: Object, err: Error) {
+	context = eng.context_for(r.e)
 	routes := named_w(r, routes_named(space))
 	k := key_of("k/", transmute([]u8)m.channel, []u8{0}, transmute([]u8)m.key)
 	if en, ok := map_read(r, routes, k); ok {
@@ -97,6 +98,7 @@ channel_reply :: proc(r: ^Runtime, o: Object, reply: Rid, status: convo.Seal_Sta
 }
 
 event_deliver :: proc(r: ^Runtime, space: prim.Id, agent_id: prim.Id, name: string, payload: string) -> Error {
+	context = eng.context_for(r.e)
 	a := Object{space, agent_id}
 	def, err := eng.agent_get(r.e, a, context.temp_allocator)
 	if err != .None {
@@ -153,6 +155,7 @@ _trigger_touched :: proc(r: ^Runtime, o: Object) {
 }
 
 trigger_watch :: proc(r: ^Runtime, agent_obj: Object) -> Error {
+	context = eng.context_for(r.e)
 	def, err := eng.agent_get(r.e, agent_obj, context.temp_allocator)
 	if err != .None {
 		return .Not_Found

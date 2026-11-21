@@ -105,6 +105,7 @@ serve_revoke :: proc(r: ^Runtime, token: string) {
 }
 
 serve_stdio :: proc(r: ^Runtime, caller: Object, in_fd: prim.Fd, out_fd: prim.Fd) -> (sess: ^Stdio_Session, err: Error) {
+	context = eng.context_for(r.e)
 	_serve_ensure(r)
 	sess = new(Stdio_Session, r.allocator)
 	sess.r = r
@@ -119,6 +120,7 @@ serve_stdio :: proc(r: ^Runtime, caller: Object, in_fd: prim.Fd, out_fd: prim.Fd
 
 @(private)
 _serve_stdio_closed :: proc(data: rawptr, ss: ^mcp.Stdio_Server) {
+	context = eng.context_for((^Stdio_Session)(data).r.e)
 	sess := (^Stdio_Session)(data)
 	sess.closed = true
 }
@@ -149,6 +151,7 @@ serve_close :: proc(r: ^Runtime) {
 
 @(private)
 _serve_authorize :: proc(data: rawptr, headers: []mcp.Header) -> int {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	for h in headers {
 		if !http.ascii_ieq(h.name, "authorization") {
@@ -177,6 +180,7 @@ _serve_caller :: proc(r: ^Runtime, authorization: string) -> (o: Object, ok: boo
 
 @(private)
 _serve_tool :: proc(data: rawptr, s: ^mcp.Server, req: ^mcp.Request) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	caller, ok := _serve_caller(r, req.authorization)
 	if !ok {
@@ -211,6 +215,7 @@ _serve_tool :: proc(data: rawptr, s: ^mcp.Server, req: ^mcp.Request) {
 
 @(private)
 _serve_cancel :: proc(data: rawptr, s: ^mcp.Server, ref: mcp.Ref) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	for p, i in r.serve.pending {
 		if p.ref == ref {

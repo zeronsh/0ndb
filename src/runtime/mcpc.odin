@@ -81,6 +81,7 @@ mcp_conn_open :: proc(r: ^Runtime, spec: ^Mcp_Spec, cwd: string, data: rawptr, o
 
 @(private)
 _mcp_spawn :: proc(data: rawptr, argv: []string, env: []string, cwd: string) -> (prim.Child, prim.Error) {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	req := Spawn_Request {
 		argv      = argv,
@@ -90,7 +91,7 @@ _mcp_spawn :: proc(data: rawptr, argv: []string, env: []string, cwd: string) -> 
 		observe   = true,
 	}
 	r.stats.spawns += 1
-	return r.cfg.spawner.spawn(r.cfg.spawner.data, &req)
+	return spawn_child(r, &req)
 }
 
 @(private)
@@ -114,6 +115,7 @@ _mcp_notify :: proc(c: ^Mcp_Conn) {
 
 @(private)
 _mcp_event :: proc(data: rawptr, cl: ^mcp.Client, e: ^mcp.Event) {
+	context = eng.context_for((^Mcp_Conn)(data).r.e)
 	c := (^Mcp_Conn)(data)
 	r := c.r
 	#partial switch e.kind {

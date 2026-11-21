@@ -31,7 +31,7 @@ Job :: struct {
 JOB_OUTPUT_LIMIT :: 1 << 20
 
 job_start :: proc(r: ^Runtime, req: ^Spawn_Request, stdin: []u8, data: rawptr, done: Job_Done, timeout_ms: i64 = 0, limit := JOB_OUTPUT_LIMIT) -> (j: ^Job, err: Error) {
-	child, serr := r.cfg.spawner.spawn(r.cfg.spawner.data, req)
+	child, serr := spawn_child(r, req)
 	if serr != .None {
 		return nil, .Spawn
 	}
@@ -102,6 +102,7 @@ _job_read :: proc(j: ^Job, fd: prim.Fd, dst: ^[dynamic]u8) -> bool {
 
 @(private)
 _job_on_out :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
+	context = eng.context_for((^Job)(data).r.e)
 	j := (^Job)(data)
 	if _job_read(j, fd, &j.out) {
 		prim.unwatch(l, j.w_out)
@@ -113,6 +114,7 @@ _job_on_out :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 
 @(private)
 _job_on_err :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
+	context = eng.context_for((^Job)(data).r.e)
 	j := (^Job)(data)
 	if _job_read(j, fd, &j.err) {
 		prim.unwatch(l, j.w_err)
@@ -124,6 +126,7 @@ _job_on_err :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 
 @(private)
 _job_on_in :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
+	context = eng.context_for((^Job)(data).r.e)
 	j := (^Job)(data)
 	for len(j.stdin) > 0 {
 		n, err := prim.write(fd, j.stdin[:])
@@ -143,6 +146,7 @@ _job_on_in :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 
 @(private)
 _job_on_exit :: proc(l: ^prim.Loop, pid: prim.Pid, status: prim.Exit_Status, data: rawptr) {
+	context = eng.context_for((^Job)(data).r.e)
 	j := (^Job)(data)
 	j.exited = true
 	j.cw = 0
@@ -160,6 +164,7 @@ _job_on_exit :: proc(l: ^prim.Loop, pid: prim.Pid, status: prim.Exit_Status, dat
 
 @(private)
 _job_on_timeout :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Job)(data).r.e)
 	j := (^Job)(data)
 	j.timer = 0
 	job_kill(j)
@@ -217,7 +222,7 @@ run_blocking :: proc(r: ^Runtime, argv: []string, cwd: string) -> (status: prim.
 		cwd  = cwd,
 		env  = r.cfg.env,
 	}
-	child, serr := r.cfg.spawner.spawn(r.cfg.spawner.data, &req)
+	child, serr := spawn_child(r, &req)
 	if serr != .None {
 		return {}, nil, .Spawn
 	}
@@ -239,6 +244,7 @@ fs_spawner :: proc(r: ^Runtime) -> fs.Spawner {
 
 @(private)
 _fs_run :: proc(data: rawptr, argv: []string, cwd: string) -> fs.Error {
+	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	st, _, err := run_blocking(r, argv, cwd)
 	if err != .None {
