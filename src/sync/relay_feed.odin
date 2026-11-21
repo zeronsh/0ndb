@@ -1,4 +1,7 @@
+#+build linux, darwin
 package osync
+
+import "base:runtime"
 
 import "../prim"
 
@@ -11,6 +14,7 @@ COMPACT_COPY :: FEED_BATCH * FEED_ENTRY
 Compact_Phase :: enum u8 {
 	Idle,
 	Snapshot,
+	Redlog,
 	Tail,
 	Meta,
 }
@@ -47,6 +51,9 @@ _owned_streams :: proc "contextless" (sp: ^Space_State) -> int {
 		n += 1
 	}
 	if sp.meta != nil {
+		n += 1
+	}
+	if sp.redlog != nil {
 		n += 1
 	}
 	return n
@@ -101,6 +108,135 @@ _feed_add :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, length: u64) -> i64 {
 	need := _feed_end(sp) + i64(len(sp.feed_flight) + len(sp.feed_q))
 	_feed_flush(r, sp)
 	return need
+}
+
+@(private)
+_feed_add_redaction :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, from, to: i64) -> i64 {
+	e: [2 * FEED_ENTRY]u8
+	v := id
+	copy(e[:32], v[:])
+	prim.put_u64le(e[32:], FEED_REDACT | u64(from))
+	copy(e[FEED_ENTRY:][:32], v[:])
+	prim.put_u64le(e[FEED_ENTRY + 32:], FEED_REDACT | FEED_REDACT_END | u64(to))
+	append(&sp.feed_q, ..e[:])
+	need := _feed_end(sp) + i64(len(sp.feed_flight) + len(sp.feed_q))
+	_feed_flush(r, sp)
+	return need
+}
+
+feed_redaction :: proc "contextless" (length: u64) -> (at: i64, end: bool, ok: bool) {
+	if length & FEED_REDACT == 0 || length == FEED_DROPPED {
+		return
+	}
+	return i64(length & (FEED_REDACT_END - 1)), length & FEED_REDACT_END != 0, true
+}
+
+@(private)
+_redlog_open :: proc(r: ^Relay, sp: ^Space_State) -> Error {
+	if sp.redlog != nil {
+		if sp.redlog.poisoned && !sp.redlog.busy {
+			_stream_get(r, sp, sp.redlog.id, true) or_return
+		}
+		return .None
+	}
+	sp.redlog = _pin(r, sp, reserved_id(REDLOG_TAG, 0)) or_return
+	return .None
+}
+
+@(private)
+_redlog_add :: proc(r: ^Relay, sp: ^Space_State, p: ^Pending) {
+	rec: [REDLOG_RECORD]u8
+	copy(rec[:32], p.id[:])
+	prim.put_u64le(rec[32:], u64(p.from))
+	prim.put_u64le(rec[40:], u64(p.total))
+	append(&sp.redlog_q, ..rec[:])
+	append(&sp.redlog_qp, p)
+	_redlog_flush(r, sp)
+}
+
+@(private)
+_redlog_fail :: proc(r: ^Relay, sp: ^Space_State, ps: ^[dynamic]^Pending) {
+	for p in ps {
+		if c := _conn_lookup(r, p.conn); c != nil {
+			_reply_refused(c, .Io, p.id)
+			c.inflight -= 1
+			_conn_kick(c)
+		}
+		if p.stream != nil {
+			_stream_unref(r, p.stream)
+		}
+		sp.jobs -= 1
+		free(p, r.allocator)
+	}
+	clear(ps)
+}
+
+@(private)
+_redlog_flush :: proc(r: ^Relay, sp: ^Space_State) {
+	if sp.redlog_busy || len(sp.redlog_q) == 0 {
+		return
+	}
+	if _redlog_open(r, sp) != .None {
+		clear(&sp.redlog_q)
+		_redlog_fail(r, sp, &sp.redlog_qp)
+		return
+	}
+	sp.redlog_flight, sp.redlog_q = sp.redlog_q, sp.redlog_flight
+	sp.redlog_fp, sp.redlog_qp = sp.redlog_qp, sp.redlog_fp
+	st := sp.redlog
+	w, err := r.store.append_begin(r.store.data, st.h, st.length, i64(len(sp.redlog_flight)))
+	if err == .None {
+		err = r.store.append_write(r.store.data, w, sp.redlog_flight[:])
+		if err != .None {
+			r.store.append_abort(r.store.data, w)
+		}
+	}
+	job: ^Pending
+	if err == .None {
+		aerr: runtime.Allocator_Error
+		job, aerr = new(Pending, r.allocator)
+		if aerr != nil {
+			r.store.append_abort(r.store.data, w)
+			err = .No_Memory
+		}
+	}
+	if err != .None {
+		st.poisoned = true
+		clear(&sp.redlog_flight)
+		_redlog_fail(r, sp, &sp.redlog_fp)
+		return
+	}
+	job^ = {
+		relay = r,
+		kind  = .Redlog,
+		space = sp,
+	}
+	sp.jobs += 1
+	sp.redlog_busy = true
+	st.busy = true
+	r.store.append_commit(r.store.data, w, _relay_done, job)
+}
+
+@(private)
+_redlog_done :: proc(r: ^Relay, sp: ^Space_State, result: Error, value: i64) {
+	sp.redlog_busy = false
+	st := sp.redlog
+	st.busy = false
+	if result != .None {
+		st.poisoned = true
+		clear(&sp.redlog_flight)
+		_redlog_fail(r, sp, &sp.redlog_fp)
+	} else {
+		st.length = value
+		clear(&sp.redlog_flight)
+		for p in sp.redlog_fp {
+			p.need = _feed_add_redaction(r, sp, p.id, p.from, p.total)
+			append(&sp.feed_wait, p)
+		}
+		clear(&sp.redlog_fp)
+		_feed_release(r, sp)
+	}
+	_redlog_flush(r, sp)
 }
 
 @(private)
@@ -163,9 +299,12 @@ _feed_release :: proc(r: ^Relay, sp: ^Space_State) {
 		ordered_remove(&sp.feed_wait, i)
 		c := _conn_lookup(r, p.conn)
 		if c != nil {
-			if p.kind == .Drop {
+			#partial switch p.kind {
+			case .Drop:
 				_reply_id(c, .Dropped, p.id)
-			} else {
+			case .Redact:
+				_reply_redacted(c, p.id, p.from, p.total)
+			case:
 				_reply_len(c, .Appended, p.id, p.length)
 			}
 			c.inflight -= 1
@@ -322,11 +461,20 @@ _produce_feed :: proc(c: ^Conn) -> bool {
 	if !ok {
 		return false
 	}
+	if n := len(raw); n >= FEED_ENTRY {
+		if _, end, red := feed_redaction(prim.get_u64le(raw[n - 8:])); red && !end {
+			if n == FEED_ENTRY {
+				return false
+			}
+			raw = raw[:n - FEED_ENTRY]
+		}
+	}
 	keep := 0
 	for i := 0; i + FEED_ENTRY <= len(raw); i += FEED_ENTRY {
 		id: [32]u8
 		copy(id[:], raw[i:i + 32])
-		if !_reserved(id) && _filter_match(c.filter, id) && principal_allows(&c.principal, .Read, id) {
+		_, _, red := feed_redaction(prim.get_u64le(raw[i + 32:]))
+		if !_reserved(id) && (red || _filter_match(c.filter, id)) && principal_allows(&c.principal, .Read, id) {
 			if keep != i {
 				copy(raw[keep:], raw[i:i + FEED_ENTRY])
 			}
@@ -559,7 +707,12 @@ _compact_step :: proc(r: ^Relay, sp: ^Space_State) {
 				if !ok {
 					r.store.list_end(r.store.data, sp.compact_it)
 					sp.compact_it = nil
-					sp.phase = .Tail
+					sp.phase = .Redlog
+					sp.compact_red = 0
+					sp.compact_red_end = 0
+					if _redlog_open(r, sp) == .None {
+						sp.compact_red_end = sp.redlog.length
+					}
 					break
 				}
 				if _reserved(cast([32]u8)id) {
@@ -589,6 +742,34 @@ _compact_step :: proc(r: ^Relay, sp: ^Space_State) {
 				}
 				return
 			}
+		case .Redlog:
+			if sp.compact_red >= sp.compact_red_end {
+				sp.phase = .Tail
+				continue
+			}
+			n := min(sp.compact_red_end - sp.compact_red, i64(COMPACT_COPY / (2 * FEED_ENTRY)) * REDLOG_RECORD)
+			n -= n % REDLOG_RECORD
+			raw := make([]u8, int(n), context.temp_allocator)
+			got, err := r.store.stream_read(r.store.data, sp.redlog.h, sp.compact_red, raw)
+			if err != .None || i64(got) != n {
+				_compact_abort(r, sp)
+				return
+			}
+			buf := make([]u8, int(n / REDLOG_RECORD) * 2 * FEED_ENTRY, context.temp_allocator)
+			for k in 0 ..< int(n / REDLOG_RECORD) {
+				rec := raw[k * REDLOG_RECORD:][:REDLOG_RECORD]
+				e := buf[k * 2 * FEED_ENTRY:]
+				copy(e[:32], rec[:32])
+				prim.put_u64le(e[32:], FEED_REDACT | prim.get_u64le(rec[32:]))
+				copy(e[FEED_ENTRY:][:32], rec[:32])
+				prim.put_u64le(e[FEED_ENTRY + 32:], FEED_REDACT | FEED_REDACT_END | prim.get_u64le(rec[40:]))
+			}
+			if !_feed_job(r, sp, .Compact, sp.next_feed, buf) {
+				_compact_abort(r, sp)
+				return
+			}
+			sp.compact_red += n
+			return
 		case .Tail:
 			avail := _feed_end(sp) - sp.compact_copied
 			if avail > COMPACT_TAIL || (avail > 0 && sp.freeze) {

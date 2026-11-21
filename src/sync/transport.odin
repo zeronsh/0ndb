@@ -1,3 +1,4 @@
+#+build linux, darwin
 package osync
 
 import "base:runtime"
@@ -38,6 +39,7 @@ Transport :: struct {
 	rec:       int,
 	ppos:      int,
 	pend:      int,
+	ws:        ^Ws,
 	allocator: runtime.Allocator,
 }
 
@@ -142,12 +144,14 @@ transport_init_plain :: proc(t: ^Transport, fd: prim.Fd, allocator := context.al
 }
 
 transport_init_secure :: proc(t: ^Transport, fd: prim.Fd, keys: ^Session_Keys, try_kernel: bool, allocator := context.allocator) {
+	ws := t.ws
 	t^ = {
 		fd        = fd,
 		secure    = true,
+		ws        = ws,
 		allocator = allocator,
 	}
-	if try_kernel {
+	if try_kernel && ws == nil {
 		t.ktx, t.krx = _ktls_install(fd, keys)
 	}
 	if !t.ktx {
@@ -170,9 +174,26 @@ transport_close :: proc(t: ^Transport) {
 	if t.rbuf != nil {
 		delete(t.rbuf, t.allocator)
 	}
+	ws_free(t.ws)
 	t^ = {
 		fd = prim.INVALID_FD,
 	}
+}
+
+@(private)
+_t_send :: proc(t: ^Transport, data: []u8, more: bool) -> (int, Error) {
+	if t.ws != nil {
+		return ws_send(t.ws, t.fd, data)
+	}
+	return _send(t.fd, data, more)
+}
+
+@(private)
+_t_recv :: proc(t: ^Transport, buf: []u8) -> (int, Error) {
+	if t.ws != nil {
+		return ws_recv(t.ws, t.fd, buf)
+	}
+	return _recv(t.fd, buf)
 }
 
 transport_user_tx :: proc "contextless" (t: ^Transport) -> bool {
@@ -184,8 +205,11 @@ transport_user_rx :: proc "contextless" (t: ^Transport) -> bool {
 }
 
 transport_flush :: proc(t: ^Transport) -> Error {
+	if t.ws != nil {
+		ws_flush(t.ws, t.fd) or_return
+	}
 	for t.wpos < t.wlen {
-		n, err := _send(t.fd, t.wbuf[t.wpos:t.wlen], false)
+		n, err := _t_send(t, t.wbuf[t.wpos:t.wlen], false)
 		if err != .None {
 			return err
 		}
@@ -201,7 +225,7 @@ transport_flush :: proc(t: ^Transport) -> Error {
 }
 
 transport_pending :: proc "contextless" (t: ^Transport) -> bool {
-	return t.wpos < t.wlen
+	return t.wpos < t.wlen || (t.ws != nil && ws_pending(t.ws))
 }
 
 transport_send :: proc(t: ^Transport, data: []u8, more := false) -> (used: int, err: Error) {
@@ -209,7 +233,7 @@ transport_send :: proc(t: ^Transport, data: []u8, more := false) -> (used: int, 
 		return 0, .None
 	}
 	if !transport_user_tx(t) {
-		return _send(t.fd, data, more)
+		return _t_send(t, data, more)
 	}
 	transport_flush(t) or_return
 	if t.wbuf == nil {
@@ -235,7 +259,7 @@ transport_sendfile :: proc(t: ^Transport, src: prim.Fd, off: i64, n: int, scratc
 	if n <= 0 {
 		return 0, .None
 	}
-	if !transport_user_tx(t) {
+	if !transport_user_tx(t) && t.ws == nil {
 		w, serr := _sendfile(t.fd, src, off, n)
 		if serr != .Unsupported {
 			return w, serr
@@ -260,7 +284,7 @@ transport_sendfile :: proc(t: ^Transport, src: prim.Fd, off: i64, n: int, scratc
 
 transport_recv :: proc(t: ^Transport, buf: []u8) -> (int, Error) {
 	if !transport_user_rx(t) {
-		return _recv(t.fd, buf)
+		return _t_recv(t, buf)
 	}
 	out := 0
 	for out < len(buf) {
@@ -303,7 +327,7 @@ transport_recv :: proc(t: ^Transport, buf: []u8) -> (int, Error) {
 			}
 			t.rbuf = b
 		}
-		n, err := _recv(t.fd, t.rbuf[t.rlen:])
+		n, err := _t_recv(t, t.rbuf[t.rlen:])
 		if err != .None {
 			if out > 0 && err == .Would_Block {
 				break

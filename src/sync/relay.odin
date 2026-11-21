@@ -1,6 +1,8 @@
+#+build linux, darwin
 package osync
 
 import "base:runtime"
+import "core:strings"
 import "../pack"
 import "../prim"
 
@@ -90,6 +92,7 @@ Listener :: struct {
 	fd:    prim.Fd,
 	watch: prim.Watch,
 	unix:  bool,
+	ws:    bool,
 	path:  string,
 }
 
@@ -124,6 +127,14 @@ Space_State :: struct {
 	next_epoch: u64,
 	meta:     ^Stream_State,
 	next_feed: ^Stream_State,
+	redlog:   ^Stream_State,
+	redlog_q: [dynamic]u8,
+	redlog_qp: [dynamic]^Pending,
+	redlog_flight: [dynamic]u8,
+	redlog_fp: [dynamic]^Pending,
+	redlog_busy: bool,
+	compact_red: i64,
+	compact_red_end: i64,
 }
 
 Stream_State :: struct {
@@ -139,6 +150,7 @@ Stream_State :: struct {
 }
 
 Conn_State :: enum u8 {
+	Upgrade,
 	Handshake,
 	Hello,
 	Ready,
@@ -248,6 +260,7 @@ Pending_Kind :: enum u8 {
 	Forget,
 	Compact,
 	Meta,
+	Redlog,
 }
 
 @(private)
@@ -519,7 +532,19 @@ relay_stats :: proc "contextless" (r: ^Relay) -> Relay_Stats {
 }
 
 relay_listen :: proc(r: ^Relay, addr: string) -> Error {
-	ep := endpoint_parse(addr) or_return
+	a := addr
+	ws := false
+	if strings.has_prefix(a, "ws://") {
+		ws = true
+		a = a[len("ws://"):]
+		if slash := strings.index_byte(a, '/'); slash >= 0 {
+			a = a[:slash]
+		}
+	}
+	ep := endpoint_parse(a) or_return
+	if ws && ep.family == .Unix {
+		return .Invalid
+	}
 	if ep.family == .Host {
 		ep = endpoint_resolve(&ep) or_return
 	}
@@ -534,6 +559,7 @@ relay_listen :: proc(r: ^Relay, addr: string) -> Error {
 	}
 	ln.relay = r
 	ln.fd = fd
+	ln.ws = ws
 	ln.unix = ep.family == .Unix
 	if ln.unix {
 		ln.path, _ = _clone_string(string(ep.path[:ep.path_len]), r.allocator)
@@ -694,7 +720,7 @@ _on_listen :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr
 			prim.close(cfd)
 			continue
 		}
-		c, cerr := _conn_new(r, cfd, ln.unix)
+		c, cerr := _conn_new(r, cfd, ln.unix, ln.ws)
 		if !ln.unix {
 			if cerr == .None {
 				c.source = src
@@ -746,7 +772,7 @@ _conn_alloc :: proc(r: ^Relay) -> (c: ^Conn, err: Error) {
 }
 
 @(private)
-_conn_new :: proc(r: ^Relay, fd: prim.Fd, unix: bool) -> (c: ^Conn, err: Error) {
+_conn_new :: proc(r: ^Relay, fd: prim.Fd, unix: bool, ws := false) -> (c: ^Conn, err: Error) {
 	c, err = _conn_alloc(r)
 	if err != .None {
 		prim.close(fd)
@@ -756,6 +782,14 @@ _conn_new :: proc(r: ^Relay, fd: prim.Fd, unix: bool) -> (c: ^Conn, err: Error) 
 	c.local = unix
 	c.state = .Hello if unix else .Handshake
 	transport_init_plain(&c.tr, fd, r.allocator)
+	if ws {
+		c.tr.ws, err = ws_new(r.allocator)
+		if err != .None {
+			_conn_close(c)
+			return nil, err
+		}
+		c.state = .Upgrade
+	}
 	if !unix {
 		_tune_tcp(fd)
 	}
@@ -881,7 +915,7 @@ _conn_close :: proc(c: ^Conn) {
 		switch c.state {
 		case .Ready:
 			r.stats.ready -= 1
-		case .Handshake, .Hello:
+		case .Upgrade, .Handshake, .Hello:
 			r.stats.pending -= 1
 		}
 		if c.tr.ktx || c.tr.krx {
@@ -922,7 +956,7 @@ _conn_handshake :: proc(c: ^Conn) {
 	need := 2 + MSG1_LEN
 	for c.hs_have < need {
 		want := 2 if c.hs_have < 2 else need
-		n, err := _recv(c.fd, c.hs[c.hs_have:want])
+		n, err := _t_recv(&c.tr, c.hs[c.hs_have:want])
 		if err == .Would_Block {
 			return
 		}
@@ -946,12 +980,12 @@ _conn_handshake :: proc(c: ^Conn) {
 	defer session_keys_clear(&keys)
 	out[0] = u8(MSG2_LEN)
 	out[1] = 0
-	w, serr := _send(c.fd, out[:2 + MSG2_LEN], false)
+	w, serr := _t_send(&c.tr, out[:2 + MSG2_LEN], false)
 	if serr != .None || w != 2 + MSG2_LEN {
 		_conn_close(c)
 		return
 	}
-	transport_init_secure(&c.tr, c.fd, &keys, r.cfg.kernel_tls, r.allocator)
+	transport_init_secure(&c.tr, c.fd, &keys, r.cfg.kernel_tls && c.tr.ws == nil, r.allocator)
 	if c.tr.ktx || c.tr.krx {
 		r.stats.kernel_tls += 1
 	}
@@ -964,6 +998,21 @@ _conn_read :: proc(c: ^Conn) {
 	r := c.relay
 	if c.dead {
 		return
+	}
+	if c.state == .Upgrade {
+		if c.external {
+			c.state = .Handshake
+		} else {
+			err := ws_upgrade(c.tr.ws, c.fd)
+			if err == .Would_Block {
+				return
+			}
+			if err != .None {
+				_conn_close(c)
+				return
+			}
+			c.state = .Handshake
+		}
 	}
 	if c.state == .Handshake {
 		_conn_handshake(c)
@@ -1087,6 +1136,8 @@ _handle :: proc(c: ^Conn, it: ^Item) {
 			_on_feed(c, &rd)
 		case .Forget:
 			_on_forget(c, &rd)
+		case .Probe:
+			_on_probe(c, &rd)
 		case:
 			_fail(c, .Protocol)
 		}
@@ -1191,16 +1242,20 @@ _space_get :: proc(r: ^Relay, id: Space_Id) -> (sp: ^Space_State, err: Error) {
 	sp.compact_buf = make([dynamic]u8, r.allocator)
 	sp.relay = r
 	sp.feed_wait = make([dynamic]^Pending, r.allocator)
+	sp.redlog_q = make([dynamic]u8, r.allocator)
+	sp.redlog_qp = make([dynamic]^Pending, r.allocator)
+	sp.redlog_flight = make([dynamic]u8, r.allocator)
+	sp.redlog_fp = make([dynamic]^Pending, r.allocator)
 	r.spaces[id] = sp
 	return sp, .None
 }
 
 @(private)
 _space_release :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || sp.phase != .Idle || len(sp.feed_q) > 0 || len(sp.feed_wait) > 0 || len(sp.streams) > _owned_streams(sp) {
+	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || sp.redlog_busy || sp.phase != .Idle || len(sp.feed_q) > 0 || len(sp.feed_wait) > 0 || len(sp.redlog_q) > 0 || len(sp.streams) > _owned_streams(sp) {
 		return
 	}
-	for st in ([]^Stream_State{sp.feed, sp.meta}) {
+	for st in ([]^Stream_State{sp.feed, sp.meta, sp.redlog}) {
 		if st == nil {
 			continue
 		}
@@ -1214,6 +1269,7 @@ _space_release :: proc(r: ^Relay, sp: ^Space_State) {
 	}
 	sp.feed = nil
 	sp.meta = nil
+	sp.redlog = nil
 	delete_key(&r.spaces, sp.id)
 	delete(sp.streams)
 	delete(sp.watchers)
@@ -1222,6 +1278,10 @@ _space_release :: proc(r: ^Relay, sp: ^Space_State) {
 	delete(sp.feed_flight)
 	delete(sp.compact_buf)
 	delete(sp.feed_wait)
+	delete(sp.redlog_q)
+	delete(sp.redlog_qp)
+	delete(sp.redlog_flight)
+	delete(sp.redlog_fp)
 	r.store.namespace_close(r.store.data, sp.ns)
 	free(sp, r.allocator)
 }
@@ -1448,6 +1508,50 @@ _on_read :: proc(c: ^Conn, rd: ^prim.Reader, tail: bool) {
 }
 
 @(private)
+_on_probe :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	count := int(prim.read_u16le(rd))
+	if !prim.reader_ok(rd) || count > FOLLOW_BATCH || prim.reader_remaining(rd) != count * 32 {
+		_fail(c, .Protocol)
+		return
+	}
+	buf, aerr := make([]u8, FRAME_HEADER + 2 + count * 40, r.allocator)
+	if aerr != nil {
+		_conn_close(c)
+		return
+	}
+	sp := c.space
+	n := 0
+	for _ in 0 ..< count {
+		id := Stream_Id(get_id32(rd))
+		if !_can(c, .Read, cast([32]u8)id) {
+			_reply_refused(c, .Not_Owner, cast([32]u8)id)
+			continue
+		}
+		length: i64
+		if st, ok := sp.streams[id]; ok && st.h != nil && !st.poisoned {
+			length = _live_len(st)
+		} else {
+			l, exists, err := r.store.stream_probe(r.store.data, sp.ns, id)
+			if err != .None {
+				_reply_refused(c, .Io, cast([32]u8)id)
+				continue
+			}
+			length = l if exists else 0
+		}
+		e := buf[FRAME_HEADER + 2 + n * 40:]
+		v := id
+		copy(e[:32], v[:])
+		prim.put_u64le(e[32:], u64(max(length, 0)))
+		n += 1
+	}
+	frame_header(buf, .Probed, 2 + n * 40)
+	buf[FRAME_HEADER] = u8(n)
+	buf[FRAME_HEADER + 1] = u8(n >> 8)
+	_push_buf(c, buf[:FRAME_HEADER + 2 + n * 40])
+}
+
+@(private)
 _on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
 	r := c.relay
 	flags := prim.read_u8(rd)
@@ -1642,7 +1746,7 @@ _on_redact :: proc(c: ^Conn, rd: ^prim.Reader) {
 	id := Stream_Id(get_id32(rd))
 	from := prim.read_u64le(rd)
 	to := prim.read_u64le(rd)
-	if !prim.reader_done(rd) || from > u64(max(i64)) || to > u64(max(i64)) || to < from {
+	if !prim.reader_done(rd) || from > u64(REDACT_LIMIT) || to > u64(REDACT_LIMIT) || to < from {
 		_fail(c, .Protocol)
 		return
 	}
@@ -1655,21 +1759,19 @@ _on_redact :: proc(c: ^Conn, rd: ^prim.Reader) {
 		_reply_refused(c, .Io, cast([32]u8)id)
 		return
 	}
-	lo := min(i64(from), _live_len(st))
-	hi := min(i64(to), _live_len(st))
-	if hi <= lo || st.h == nil {
+	if to <= from || st.h == nil {
 		_reply_redacted(c, cast([32]u8)id, i64(from), i64(to))
 		_stream_maybe_release(r, st)
 		return
 	}
-	p := _pending_new(c, .Redact, st, hi, cast([32]u8)id)
+	p := _pending_new(c, .Redact, st, i64(to), cast([32]u8)id)
 	if p == nil {
 		_reply_refused(c, .Io, cast([32]u8)id)
 		_stream_maybe_release(r, st)
 		return
 	}
-	p.from = lo
-	r.store.redact(r.store.data, st.h, lo, hi, _relay_done, p)
+	p.from = i64(from)
+	r.store.redact(r.store.data, st.h, i64(from), i64(to), _relay_done, p)
 }
 
 @(private)
@@ -1798,7 +1900,7 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_len(c, op.reply, op.id, op.len)
 		case .Stored:
 			_reply_id(c, .Stored, op.id)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten:
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed:
 		}
 	case .Append:
 		st := op.stream
@@ -1895,13 +1997,16 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			_reply_refused(c, .Quota if result == .No_Space else .Io, p.id)
 		}
 	case .Redact:
-		if c != nil {
-			if result == .None {
-				_reply_redacted(c, p.id, p.from, p.total)
-			} else {
-				_reply_refused(c, .Io, p.id)
-			}
+		if result == .None {
+			_redlog_add(r, sp, p)
+			_reap(r)
+			return
 		}
+		if c != nil {
+			_reply_refused(c, .Io, p.id)
+		}
+	case .Redlog:
+		_redlog_done(r, sp, result, value)
 	case .Drop:
 		st := p.stream
 		st.busy = false
@@ -2040,7 +2145,12 @@ _c_copy :: proc(c: ^Conn, read: proc(data: rawptr, h: rawptr, at: i64, dst: []u8
 @(private)
 _conn_write :: proc(c: ^Conn) {
 	r := c.relay
-	if c.dead || c.state == .Handshake {
+	if c.dead || c.state == .Upgrade || c.state == .Handshake {
+		if !c.dead && !c.external && transport_pending(&c.tr) {
+			if e := transport_flush(&c.tr); e != .None && e != .Would_Block {
+				_conn_close(c)
+			}
+		}
 		return
 	}
 	for !c.dead {
@@ -2214,15 +2324,6 @@ _out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
 	return true, .None
 }
 
-@(private)
-_clone_string :: proc(s: string, allocator: runtime.Allocator) -> (string, Error) {
-	b, e := make([]u8, len(s), allocator)
-	if e != nil {
-		return "", .No_Memory
-	}
-	copy(b, s)
-	return string(b), .None
-}
 
 
 
@@ -2299,11 +2400,15 @@ _source_leave :: proc(r: ^Relay, src: [16]u8) {
 @(private)
 _source_sweep :: proc(r: ^Relay, now: i64) {
 	burst := i64(r.cfg.source_burst) * 1_000_000
+	gone := make([dynamic][16]u8, context.temp_allocator)
 	for k, s in r.sources {
 		refilled := min(burst, s.tokens + (now - s.last) / 1000 * i64(r.cfg.source_rate))
 		if s.conns == 0 && refilled >= burst {
-			delete_key(&r.sources, k)
+			append(&gone, k)
 		}
+	}
+	for k in gone {
+		delete_key(&r.sources, k)
 	}
 }
 

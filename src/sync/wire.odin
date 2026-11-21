@@ -9,11 +9,16 @@ FRAME_HEADER :: 5
 CONTROL_MAX :: 64 * 1024
 APPEND_MAX :: journal.MAX_BODY + journal.OVERHEAD
 DATA_MAX :: 4 * 1024 * 1024
-OBJECT_MAX :: int(max(u32)) - 64
 FOLLOW_BATCH :: 1024
 GET_BATCH :: 1024
 LIST_BATCH :: 1500
 FOLLOW_END :: max(u64)
+
+when size_of(int) == 8 {
+	OBJECT_MAX :: int(max(u32)) - 64
+} else {
+	OBJECT_MAX :: max(int) - 64
+}
 
 Kind :: enum u8 {
 	None      = 0,
@@ -30,6 +35,7 @@ Kind :: enum u8 {
 	Redact    = 0x0b,
 	Feed      = 0x0c,
 	Forget    = 0x0d,
+	Probe     = 0x0e,
 	Welcome   = 0x81,
 	Listing   = 0x82,
 	Appended  = 0x83,
@@ -46,6 +52,7 @@ Kind :: enum u8 {
 	Redacted  = 0x8e,
 	Announce  = 0x8f,
 	Forgotten = 0x90,
+	Probed    = 0x91,
 }
 
 Code :: enum u8 {
@@ -66,6 +73,11 @@ FOLLOW_WATCH :: 1
 FEED_TAG :: 1
 FEED_META_TAG :: 2
 LIST_TAG :: 3
+REDLOG_TAG :: 4
+REDLOG_RECORD :: 48
+FEED_REDACT :: u64(1) << 63
+FEED_REDACT_END :: u64(1) << 62
+REDACT_LIMIT :: i64(1) << 62
 FEED_ENTRY :: 40
 FEED_BATCH :: 1500
 FEED_DROPPED :: max(u64)
@@ -233,7 +245,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 	bulk := false
 	if p.relay {
 		#partial switch k {
-		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget:
+		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget, .Probe:
 		case .Append:
 			bulk, fixed, limit = true, APPEND_FIXED, APPEND_MAX
 		case .Put:
@@ -243,7 +255,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 		}
 	} else {
 		#partial switch k {
-		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten:
+		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed:
 		case .Data:
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
 		case .Object:

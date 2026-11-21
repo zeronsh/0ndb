@@ -1,3 +1,4 @@
+#+build linux, darwin
 package osync
 
 import "base:runtime"
@@ -374,4 +375,67 @@ _clear_tmp :: proc(vfs: prim.Vfs, tdir: string, allocator: runtime.Allocator) {
 		p, _ := prim.path_join(context.temp_allocator, tdir, e.name)
 		prim.remove(vfs, p)
 	}
+}
+
+Space_Authorizer :: struct {
+	allow:         Allow,
+	open:          bool,
+	default_quota: i64,
+	allocator:     runtime.Allocator,
+}
+
+space_authorizer_init :: proc(a: ^Space_Authorizer, vfs: prim.Vfs, allow_path: string, open: bool, default_quota: i64, allocator := context.allocator) -> Error {
+	a^ = {
+		open          = open,
+		default_quota = default_quota,
+		allocator     = allocator,
+	}
+	path := _clone_string(allow_path, allocator) or_return
+	allow_init(&a.allow, vfs, path, allocator)
+	return .None
+}
+
+space_authorizer_destroy :: proc(a: ^Space_Authorizer) {
+	if len(a.allow.path) > 0 {
+		delete(a.allow.path, a.allocator)
+	}
+	allow_destroy(&a.allow)
+}
+
+space_authorizer :: proc(a: ^Space_Authorizer) -> Authorizer {
+	return Authorizer{data = a, authorize = _space_authorize}
+}
+
+@(private)
+_space_authorize :: proc(data: rawptr, credential: []u8, binding: []u8, local: bool, p: ^Principal) -> Code {
+	a := cast(^Space_Authorizer)data
+	if len(credential) != SPACE_CREDENTIAL_LEN || credential[0] != 1 {
+		return .Auth
+	}
+	space_pub: Public_Key
+	part_pub: Public_Key
+	copy(space_pub[:], credential[1:33])
+	copy(part_pub[:], credential[33:65])
+	if !local {
+		if len(binding) == 0 || !hello_verify(space_pub, credential[65:129], binding) || !hello_verify(part_pub, credential[129:193], binding) {
+			return .Auth
+		}
+	}
+	id := space_id(space_pub)
+	quota, allowed := allow_lookup(&a.allow, id)
+	if !allowed {
+		if !a.open {
+			return .Auth
+		}
+		quota = a.default_quota
+	}
+	p^ = Principal {
+		namespace   = id,
+		participant = device_id(part_pub),
+		quota       = quota,
+		read_all    = true,
+		append_own  = true,
+		objects     = true,
+	}
+	return .None
 }

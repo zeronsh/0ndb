@@ -1,7 +1,7 @@
 package osync
 
-import "base:runtime"
 import "core:crypto/ecdh"
+import "base:runtime"
 import "../prim"
 
 Client_State :: enum u8 {
@@ -29,6 +29,7 @@ Event_Kind :: enum u8 {
 	Redacted,
 	Announce,
 	Forgotten,
+	Probed,
 }
 
 Event :: struct {
@@ -262,6 +263,23 @@ client_tail :: proc(c: ^Client, id: Stream_Id, n: i64) -> Error {
 	return frame_end(b, start, &w)
 }
 
+client_probe :: proc(c: ^Client, ids: []Stream_Id) -> Error {
+	rest := ids
+	for len(rest) > 0 {
+		n := min(len(rest), FOLLOW_BATCH)
+		b := _client_buf(c)
+		start := frame_begin(b, .Probe) or_return
+		w := prim.writer(b)
+		prim.write_u16le(&w, u16(n))
+		for id in rest[:n] {
+			put_id(&w, cast([32]u8)id)
+		}
+		frame_end(b, start, &w) or_return
+		rest = rest[n:]
+	}
+	return .None
+}
+
 client_follow :: proc(c: ^Client, entries: []Follow_Entry, watch: bool) -> Error {
 	rest := entries
 	for {
@@ -327,7 +345,7 @@ client_redact :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
 	return frame_end(b, start, &w)
 }
 
-client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil, filtered := false) -> Error {
+client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil, filtered := false, additive := false) -> Error {
 	if len(patterns) > FEED_PATTERNS_MAX {
 		return .Too_Large
 	}
@@ -340,7 +358,7 @@ client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil
 		w := prim.writer(b)
 		prim.write_u64le(&w, from)
 		if filtered || len(patterns) > 0 {
-			prim.write_u8(&w, FEED_FILTERED | (0 if first else FEED_ADD))
+			prim.write_u8(&w, FEED_FILTERED | (FEED_ADD if additive || !first else 0))
 			prim.write_u16le(&w, u16(n))
 			for p in rest[:n] {
 				prim.write_u8(&w, u8(p.kind))
@@ -572,14 +590,14 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.id = get_id32(&r)
 		ev.at = get_i64(&r)
 		ev.length = get_i64(&r)
-	case .Length:
+	case .Length, .Probed:
 		n := int(prim.read_u16le(&r))
 		if prim.reader_remaining(&r) != n * 40 {
 			return .Protocol
 		}
 		for _ in 0 ..< n {
 			e := Event {
-				kind = .Length,
+				kind = .Length if it.frame == .Length else .Probed,
 			}
 			e.id = get_id32(&r)
 			e.length = get_i64(&r)

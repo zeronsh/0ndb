@@ -1,14 +1,10 @@
+#+build linux, darwin
 package osync
 
 import "core:crypto"
-import "core:crypto/blake2b"
 import "../prim"
 
-OBJECT_INLINE_MAX :: 64 * 1024 * 1024
-OBJECT_PART :: 16 * 1024 * 1024
 OBJECT_WINDOW :: 8
-OBJECT_HEAD :: 9
-OBJECT_MANIFEST :: 13
 
 Obj_Op :: enum u8 {
 	Put,
@@ -255,10 +251,14 @@ _obj_free :: proc(r: ^Replicator, j: ^Obj_Job) {
 
 @(private)
 _obj_finish :: proc(r: ^Replicator, j: ^Obj_Job, kind: Repl_Event_Kind, err: Error, path: string = "") {
+	gone := make([dynamic]Object_Key, context.temp_allocator)
 	for k, ref in r.objs.keys {
 		if ref.job == j {
-			delete_key(&r.objs.keys, k)
+			append(&gone, k)
 		}
+	}
+	for k in gone {
+		delete_key(&r.objs.keys, k)
 	}
 	r.objs.flying -= len(j.flying)
 	if r.objs.active == j {
@@ -283,30 +283,12 @@ _obj_finish :: proc(r: ^Replicator, j: ^Obj_Job, kind: Repl_Event_Kind, err: Err
 
 @(private)
 _part_key :: proc(key: Object_Key, part: i64) -> Object_Key {
-	if part < 0 {
-		return key
-	}
-	out: Object_Key
-	b: [8]u8
-	prim.put_u64le(b[:], u64(part))
-	k := key
-	ctx: blake2b.Context
-	blake2b.init_mac(&ctx, k[:], 32)
-	blake2b.update(&ctx, transmute([]u8)string("0ndb chunk"))
-	blake2b.update(&ctx, b[:])
-	blake2b.final(&ctx, out[:])
-	return out
+	return object_part_index(key, part)
 }
 
 @(private)
 _part_ckey :: proc(j: ^Obj_Job, part: i64) -> (k: [32]u8) {
-	if part < 0 {
-		return j.ckey
-	}
-	b: [8]u8
-	prim.put_u64le(b[:], u64(part))
-	_derive(j.ckey[:], "0ndb chunk key", b[:], k[:])
-	return
+	return object_part_content_key(&j.ckey, part)
 }
 
 @(private)

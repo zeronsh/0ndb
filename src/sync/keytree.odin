@@ -7,6 +7,20 @@ import "core:crypto/blake2b"
 import "../journal"
 import "../prim"
 
+KEYS_STREAM :: "keys/"
+KEYS_RECORD :: 2
+
+keys_stream_name :: proc(segment: string, allocator := context.temp_allocator) -> (string, Error) {
+	return _concat(allocator, KEYS_STREAM, segment)
+}
+
+keys_record_decode :: proc(t: ^Key_Tree, body: []u8, allocator := context.allocator) -> Error {
+	if len(body) < 1 || body[0] != KEYS_RECORD {
+		return .Corrupt
+	}
+	return keytree_decode(t, body[1:], allocator)
+}
+
 KEY_TREE_DEPTH :: 44
 KEY_TREE_SHIFT :: 4
 OBJECT_TREE_DEPTH :: 64

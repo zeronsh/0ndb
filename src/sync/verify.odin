@@ -2,6 +2,25 @@ package osync
 
 import "../journal"
 
+Verdict :: enum u8 {
+	Accept,
+	Hold,
+	Equivocation,
+}
+
+Verify_Request :: struct {
+	device:  Device_Id,
+	name:    string,
+	epoch:   u64,
+	stream:  Stream_Id,
+	replica: ^journal.Replica,
+	from:    i64,
+	to:      i64,
+	span:    ^journal.Sig_Info,
+	span_ok: ^bool,
+	done:    i64,
+}
+
 Chain_Verifier :: struct {
 	data:     rawptr,
 	identity: proc(data: rawptr, device: Device_Id) -> (Identity, bool),

@@ -1,5 +1,6 @@
 package osync
 
+import "base:runtime"
 import "../journal"
 import "../prim"
 
@@ -81,4 +82,14 @@ _from_journal :: proc "contextless" (e: journal.Error) -> Error {
 		return .No_Memory
 	}
 	return .Io
+}
+
+@(private)
+_clone_string :: proc(s: string, allocator: runtime.Allocator) -> (string, Error) {
+	b, e := make([]u8, len(s), allocator)
+	if e != nil {
+		return "", .No_Memory
+	}
+	copy(b, s)
+	return string(b), .None
 }

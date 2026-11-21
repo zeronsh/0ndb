@@ -1,13 +1,14 @@
+#+build linux, darwin
 package osync
 
 import "core:crypto"
+import "core:slice"
+import "core:mem"
 import "core:hash/xxhash"
 import "../journal"
 import "../prim"
 
-KEYS_STREAM :: "keys/"
 PADDING_KIND :: 0xff
-KEYS_RECORD :: 2
 
 padme :: proc "contextless" (n: i64) -> i64 {
 	if n < 2 {
@@ -29,17 +30,6 @@ padding_filler :: proc "contextless" (pending: i64) -> int {
 	}
 	target := padme(pending + journal.OVERHEAD + 1)
 	return int(target - pending - journal.OVERHEAD)
-}
-
-keys_stream_name :: proc(segment: string, allocator := context.temp_allocator) -> (string, Error) {
-	return _concat(allocator, KEYS_STREAM, segment)
-}
-
-keys_record_decode :: proc(t: ^Key_Tree, body: []u8, allocator := context.allocator) -> Error {
-	if len(body) < 1 || body[0] != KEYS_RECORD {
-		return .Corrupt
-	}
-	return keytree_decode(t, body[1:], allocator)
 }
 
 replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, tree: ^Key_Tree) -> Error {
@@ -68,17 +58,22 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 	if aerr != .None {
 		return _from_journal(aerr)
 	}
-	replicator_publish(r, scope, name, epoch, path, durable) or_return
-	if epoch == 0 {
-		return .None
+	if epoch > 0 {
+		l, ok := r.locals[id]
+		if !ok {
+			l = _local_open(r, scope, name, epoch, id, path) or_return
+		}
+		prev := stream_id(scope, r.cfg.self, name, epoch - 1)
+		pb: prim.Path_Buf = ---
+		drop_path := _clone_string(_keys_path(r, &pb, prev), r.allocator) or_return
+		if len(l.drop_path) > 0 {
+			delete(l.drop_path, r.allocator)
+		}
+		l.drop_id = prev
+		l.drop_path = drop_path
+		l.dropping = true
 	}
-	l := r.locals[id]
-	prev := stream_id(scope, r.cfg.self, name, epoch - 1)
-	l.drop_id = prev
-	l.dropping = true
-	pb: prim.Path_Buf = ---
-	l.drop_path = _clone_string(_keys_path(r, &pb, prev), r.allocator) or_return
-	return .None
+	return replicator_publish(r, scope, name, epoch, path, durable)
 }
 
 replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
@@ -385,11 +380,23 @@ _feed_cursor_load :: proc(r: ^Replicator) {
 
 @(private)
 _on_announce :: proc(r: ^Replicator, ev: ^Event) {
+	red_id: Stream_Id
+	red_from := i64(-1)
 	for i in 0 ..< listing_count(ev) {
 		e := ev.entries[i * FEED_ENTRY:][:FEED_ENTRY]
 		id: Stream_Id
 		copy(id[:], e[:32])
 		length := prim.get_u64le(e[32:])
+		if at, end, red := feed_redaction(length); red {
+			if !end {
+				red_id, red_from = id, at
+			} else if red_from >= 0 && red_id == id {
+				_replica_redacted(r, id, red_from, at)
+				red_from = -1
+			}
+			continue
+		}
+		red_from = -1
 		if length == FEED_DROPPED {
 			if rm, ok := r.remotes[id]; ok {
 				_emit(r, Repl_Event{kind = .Dropped, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
@@ -412,6 +419,37 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 		}
 	}
 	_fetch_check(r)
+}
+
+@(private)
+_replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
+	dev := stream_device(id)
+	if dev == r.cfg.self || to <= from {
+		return
+	}
+	if rm, ok := r.remotes[id]; ok {
+		hi := min(to, journal.replica_length(&rm.rep))
+		if hi > from {
+			journal.replica_redact(&rm.rep, from, hi)
+		}
+		_emit(r, Repl_Event{kind = .Redacted, device = rm.device, name = rm.name, epoch = rm.epoch, stream = id, from = from, to = to})
+		return
+	}
+	pbuf: prim.Path_Buf = ---
+	path := _replica_path(r, &pbuf, id)
+	if _, serr := prim.stat(r.vfs, path); serr != .None {
+		return
+	}
+	rep: journal.Replica
+	if journal.replica_open(&rep, r.vfs, path, r.allocator) != .None {
+		return
+	}
+	hi := min(to, journal.replica_length(&rep))
+	if hi > from {
+		journal.replica_redact(&rep, from, hi)
+	}
+	journal.replica_close(&rep)
+	_emit(r, Repl_Event{kind = .Redacted, device = dev, stream = id, from = from, to = to})
 }
 
 @(private)
@@ -496,6 +534,13 @@ _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 		copy(p.bytes[:16], sfx[:])
 		append(&pats, p)
 	}
+	slice.sort_by(pats[:], proc(a, b: Feed_Pattern) -> bool {
+		if a.kind != b.kind {
+			return a.kind < b.kind
+		}
+		x, y := a.bytes, b.bytes
+		return mem.compare(x[:], y[:]) < 0
+	})
 	from := u64(0) if from_start || r.feed_cursor < 0 else u64(r.feed_cursor)
 	client_feed_follow(&r.client, from, pats[:], true)
 }
