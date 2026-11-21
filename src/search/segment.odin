@@ -1328,6 +1328,8 @@ DF_FIELDS :: u8(2)
 DF_TITLE :: u8(4)
 DF_CHUNK :: u8(8)
 DF_TEXT :: u8(16)
+DF_SLOT :: u8(32)
+DF_UNSTABLE :: DF_TITLE | DF_SLOT
 
 Doc_Block :: struct {
 	gen:     u64,

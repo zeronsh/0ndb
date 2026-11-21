@@ -631,6 +631,9 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 	if chunked {
 		md.flags |= DF_CHUNK
 	}
+	if len(d.slot) > 0 {
+		md.flags |= DF_SLOT
+	}
 	if d.title {
 		md.flags |= DF_TITLE
 		_post_fix(m, key64(NS_TITLE, 1), id) or_return

@@ -234,6 +234,7 @@ Vtrain :: struct {
 	counts: []int,
 	ids:    []u32,
 	dead:   []u32,
+	blk:    Doc_Block,
 	j:      int,
 	it:     int,
 	si:     int,
@@ -289,6 +290,7 @@ vec_maybe_train :: proc(ix: ^Index) -> (started: bool, err: Error) {
 		return false, .No_Memory
 	}
 	t.ids = make([]u32, t.sn, a)
+	db_init(&t.blk, a)
 	t.dead = make([]u32, len(dead), a)
 	copy(t.dead, dead)
 	delete(dead, ix.allocator)
@@ -347,6 +349,13 @@ _vtrain_work :: proc(ix: ^Index, t: ^Vtrain) -> (work: i64, done: bool, err: Err
 						cache_read(&ix.cache, &s, s.f.vids_off + i64(g) * 4, vb[:]) or_return
 						id := prim.get_u32le(vb[:])
 						if _, dead := slice.binary_search(t.dead, id); dead {
+							break
+						}
+						if u64(id) < s.f.lo || u64(id) >= s.f.hi {
+							return 0, false, .Corrupt
+						}
+						doc_load(&ix.cache, &s, &t.blk, u64(id) / DOC_BLOCK) or_return
+						if t.blk.docs[id - t.blk.first].flags & DF_UNSTABLE != 0 {
 							break
 						}
 						dst := slice.to_bytes(t.sample[i * dim:][:dim])

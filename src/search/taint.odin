@@ -72,7 +72,7 @@ zd_retrain :: proc(ix: ^Index) -> Error {
 		if len(zs.bytes) >= DICT_SAMPLE_MAX {
 			break
 		}
-		if d.flags & DF_TEXT == 0 || d.flags & DF_DELETED != 0 {
+		if d.flags & DF_TEXT == 0 || d.flags & (DF_DELETED | DF_UNSTABLE) != 0 {
 			continue
 		}
 		at := int(m.frames[d.frame]) + int(d.frame_off)
@@ -96,7 +96,7 @@ zd_retrain :: proc(ix: ^Index) -> Error {
 					break outer
 				}
 				dm := &blk.docs[k]
-				if dm.flags & DF_DELETED != 0 || dm.flags & DF_TEXT == 0 || dm.len < 8 {
+				if dm.flags & (DF_DELETED | DF_UNSTABLE) != 0 || dm.flags & DF_TEXT == 0 || dm.len < 8 {
 					continue
 				}
 				if _, gone := slice.binary_search(dead, dm.id); gone {

@@ -328,7 +328,7 @@ zstd_train :: proc(ix: ^Index) -> Error {
 	m := &ix.mem
 	total := 0
 	for d in m.docs {
-		if d.flags & DF_TEXT != 0 && d.flags & DF_DELETED == 0 {
+		if d.flags & DF_TEXT != 0 && d.flags & (DF_DELETED | DF_UNSTABLE) == 0 {
 			total += min(int(d.len), DICT_SAMPLE_PIECE)
 		}
 	}
@@ -344,7 +344,7 @@ zstd_train :: proc(ix: ^Index) -> Error {
 	}
 	zs := zd_samples_init(context.temp_allocator)
 	for d, i in m.docs {
-		if d.flags & DF_TEXT == 0 || d.flags & DF_DELETED != 0 || d.len < 8 {
+		if d.flags & DF_TEXT == 0 || d.flags & (DF_DELETED | DF_UNSTABLE) != 0 || d.len < 8 {
 			continue
 		}
 		if len(zs.bytes) >= DICT_SAMPLE_MAX {

@@ -121,7 +121,6 @@ delete_record :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, re
 	o := object
 	copy(key[1:], o[:])
 	_kill_term(ix, key[:], ref) or_return
-	ix.taint_check = true
 	m.sources[source] = pos
 	return _maybe_flush(ix)
 }
@@ -132,7 +131,11 @@ redact :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, ref: []u8
 }
 
 erase :: proc(ix: ^Index) -> Error {
-	flush(ix) or_return
+	ferr := flush(ix)
+	if ferr != .None && ferr != .Busy {
+		return ferr
+	}
+	ix.taint_check = true
 	for {
 		more := purge_step(ix, max(i64)) or_return
 		if !more {
@@ -142,7 +145,7 @@ erase :: proc(ix: ^Index) -> Error {
 	for {
 		more := redact_models(ix) or_return
 		if !more {
-			return .None
+			return ferr
 		}
 		_ = _merge_step(ix, max(i64), false) or_return
 	}
@@ -217,6 +220,7 @@ flush :: proc(ix: ^Index) -> Error {
 	}
 	before := len(ix.segs)
 	mem_flush(ix) or_return
+	_ = redact_models(ix) or_return
 	vec_maybe_train(ix) or_return
 	if len(ix.segs) > before {
 		size := ix.segs[len(ix.segs) - 1].size
@@ -289,6 +293,7 @@ _reconcile :: proc(ix: ^Index) -> (reset_needed: bool, err: Error) {
 
 @(private)
 _kill_term :: proc(ix: ^Index, key: []u8, ref: []u8, keep_titles := false) -> Error {
+	ix.taint_check = true
 	blk: Doc_Block
 	db_init(&blk, context.temp_allocator)
 	for &s in ix.segs {
