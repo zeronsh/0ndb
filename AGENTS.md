@@ -5,7 +5,9 @@
 - Toolchain: Odin `dev-2026-11` (`odin version`).
 - Build: `odin build src/cli -out:bin/0ndb -o:speed`
 - Check a package: `odin check src/<pkg> -vet -strict-style -no-entry-point` and
-  the same with `-target:darwin_arm64`
+  the same with `-target:darwin_arm64` and `-target:windows_amd64`
+- Platform testing happens on real machines through Zeron `run_command`:
+  macOS on `home-laptop`, Windows on `WING-PC`. No CI.
 - Tests: `odin test tests -o:speed`
 - Design: `DESIGN.md` is the source of truth for formats and invariants.
 

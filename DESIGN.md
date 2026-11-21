@@ -104,9 +104,12 @@ tests/       convergence, fstree, sim
 ```
 
 Packages import each other with relative paths. Build:
-`odin build src/cli -out:bin/0ndb -o:speed`. Every package passes
-`odin check src/<pkg> -vet -strict-style -no-entry-point` on Linux and with
-`-target:darwin_arm64`.
+`odin build src/cli -out:bin/0ndb -o:speed`. Platforms: Linux, macOS and
+Windows, each first-class, with platform code in `_linux.odin`,
+`_darwin.odin` and `_windows.odin` files; the browser read side targets
+`js_wasm32`. Every package passes
+`odin check src/<pkg> -vet -strict-style -no-entry-point` for every target it
+supports, and platform behaviour is verified on real machines (no CI).
 
 Code style: idiomatic Odin, no comments, explicit allocators where lifetimes
 matter, `context.temp_allocator` for per-event scratch, errors as values, no
