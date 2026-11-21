@@ -314,7 +314,7 @@ _ckpt_load :: proc(e: ^Engine, sp: ^Space, w: ^Ckpt_Wait) -> Error {
 	src := Ckpt_Source{e = e, fd = fd, end = size, db = db}
 	h, hok := e.handles[w.object]
 	streams := fs.Stream_Source{data = h, read = _hist_read} if hok else fs.Stream_Source{}
-	opts := fs.History_Options{clock = _fs_clock(e)}
+	opts := fs.History_Options{clock = _fs_clock(e), random = e.cfg.random}
 	if hok {
 		opts = _hist_options(h)
 	}
