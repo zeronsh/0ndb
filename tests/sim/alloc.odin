@@ -3,7 +3,6 @@ package sim
 import "base:intrinsics"
 import "base:runtime"
 import "core:mem"
-import "core:sys/posix"
 
 REGION_BASE :: uintptr(0x6000_0000_0000)
 REGION_STRIDE :: uintptr(0x2000_0000)
@@ -28,12 +27,7 @@ Region :: struct {
 
 region_map :: proc(r: ^Region, base: uintptr, size: uint, bump: bool) -> bool {
 	r^ = {}
-	ptr := posix.mmap(rawptr(base), size, {.READ, .WRITE}, {.PRIVATE, .ANONYMOUS})
-	if ptr == posix.MAP_FAILED {
-		return false
-	}
-	if uintptr(ptr) != base {
-		posix.munmap(ptr, size)
+	if !os_region_map(base, size) {
 		return false
 	}
 	r.base = base
@@ -46,7 +40,7 @@ region_map :: proc(r: ^Region, base: uintptr, size: uint, bump: bool) -> bool {
 
 region_unmap :: proc(r: ^Region) {
 	if r.mapped {
-		posix.munmap(rawptr(r.base), r.size)
+		os_region_unmap(r.base, r.size)
 	}
 	r^ = {}
 }
@@ -54,7 +48,7 @@ region_unmap :: proc(r: ^Region) {
 region_reset :: proc(r: ^Region) {
 	if r.top > r.base {
 		used := uint(r.top - r.base)
-		posix.posix_madvise(rawptr(r.base), used, .DONTNEED)
+		os_region_discard(r.base, used)
 	}
 	r.top = r.base
 	r.free = {}

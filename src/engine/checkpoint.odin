@@ -390,6 +390,7 @@ _oid_name :: proc(oid: [32]u8) -> [prim.ID_HEX_LEN]u8 {
 }
 
 checkpoint_info :: proc(e: ^Engine, o: Object) -> (length: i64, loaded: bool, found: bool) {
+	context = context_for(e)
 	n, oid, ok := _ckpt_get(e, o.id)
 	return n, ok && n == 0 && oid == {}, ok
 }

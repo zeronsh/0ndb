@@ -37,6 +37,7 @@ Kind :: enum u8 {
 	Feed      = 0x0c,
 	Forget    = 0x0d,
 	Probe     = 0x0e,
+	Direct    = 0x10,
 	Welcome   = 0x81,
 	Listing   = 0x82,
 	Appended  = 0x83,
@@ -55,6 +56,8 @@ Kind :: enum u8 {
 	Forgotten = 0x90,
 	Probed    = 0x91,
 	Presence  = 0x92,
+	Directed  = 0x93,
+	Undelivered = 0x94,
 }
 
 Code :: enum u8 {
@@ -91,6 +94,8 @@ FEED_ADD :: 2
 FEED_PRESENCE :: 4
 PRESENCE_ENTRY :: 16 + 1 + 8
 PRESENCE_SNAPSHOT :: 1
+DIRECT_FIXED :: 16 + 8
+DIRECT_MAX :: CONTROL_MAX - FRAME_HEADER - DIRECT_FIXED
 
 Feed_Pattern_Kind :: enum u8 {
 	Prefix = 1,

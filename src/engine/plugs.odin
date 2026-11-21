@@ -26,6 +26,7 @@ Boot_Source :: struct {
 }
 
 boot_id :: proc(e: ^Engine) -> prim.Id {
+	context = context_for(e)
 	if e.cfg.boot_id.boot_id != nil {
 		return e.cfg.boot_id.boot_id(e.cfg.boot_id.data)
 	}
@@ -54,6 +55,7 @@ _default_spawn :: proc(data: rawptr, argv: []string, cwd: string, env: []string,
 }
 
 spawner :: proc(e: ^Engine) -> Spawner {
+	context = context_for(e)
 	if e.cfg.spawner.spawn != nil {
 		return e.cfg.spawner
 	}
@@ -61,6 +63,7 @@ spawner :: proc(e: ^Engine) -> Spawner {
 }
 
 http_client :: proc(e: ^Engine) -> (c: ^http.Client, err: Error) {
+	context = context_for(e)
 	if e.cfg.http.start == nil {
 		e.cfg.http = http.Client{data = e, start = _curl_start, cancel = _curl_cancel, resume = _curl_resume}
 	}
@@ -104,6 +107,7 @@ _curl_settle :: proc(e: ^Engine) {
 }
 
 registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
+	context = context_for(e)
 	if !e.plug.reg_on {
 		run := _join(context.temp_allocator, e.dir, "run") or_return
 		_ferr(fs.registry_init(&e.plug.reg, e.base, run, e.allocator)) or_return
@@ -126,6 +130,7 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 }
 
 tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT) -> (m: ^fs.Mount, err: Error) {
+	context = context_for(e)
 	reg := registry(e) or_return
 	hist := tree_history(e, o) or_return
 	defer if err != .None {
@@ -149,6 +154,7 @@ tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT
 }
 
 tree_unmount :: proc(e: ^Engine, m: ^fs.Mount) {
+	context = context_for(e)
 	for mt, i in e.plug.mounts {
 		if &mt.mount == m {
 			fs.mount_close(&mt.mount)
@@ -174,6 +180,7 @@ _mount_id :: proc(tree: prim.Id, root: string) -> (id: prim.Id) {
 @(private)
 _on_mount_ready :: proc(m: ^fs.Mount, data: rawptr) {
 	e := (^Engine)(data)
+	context = context_for(e)
 	if err := fs.mount_run(m); err != .None {
 		_log(e, .Warn, "mount pass failed")
 	}
@@ -211,6 +218,7 @@ Fence_Ctx :: struct {
 }
 
 tree_mount_fence :: proc(e: ^Engine, m: ^fs.Mount, done: Mount_Done = {}) -> Error {
+	context = context_for(e)
 	ctx := new(Fence_Ctx, e.allocator)
 	ctx.e = e
 	ctx.done = done
@@ -225,13 +233,17 @@ tree_mount_fence :: proc(e: ^Engine, m: ^fs.Mount, done: Mount_Done = {}) -> Err
 _mount_fenced :: proc(m: ^fs.Mount, data: rawptr, err: fs.Error) {
 	ctx := (^Fence_Ctx)(data)
 	e := ctx.e
+	context = context_for(e)
 	for mt in e.plug.mounts {
 		if &mt.mount == m {
 			_mount_touched(e, mt)
 		}
 	}
 	if ctx.done.call != nil {
-		ctx.done.call(ctx.done.data, e, m, _ferr(err))
+		{
+			context = _outer(e)
+			ctx.done.call(ctx.done.data, e, m, _ferr(err))
+		}
 	}
 	free(ctx, e.allocator)
 }

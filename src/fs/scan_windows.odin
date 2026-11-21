@@ -108,10 +108,11 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 				gitignore^ = data
 			}
 		case r.kind == .File && sc.opts.read_limit > 0 && r.stat.size <= sc.opts.read_limit && r.stat.size <= budget:
+			own := copy(nbuf[:], name)
 			start := len(t.names)
 			size := int(r.stat.size)
 			resize(&t.names, start + size + 1)
-			if !read_rel_into(dir, name, t.names[start:]) {
+			if !read_rel_into(dir, string(nbuf[:own]), t.names[start:]) {
 				resize(&t.names, start)
 				continue
 			}

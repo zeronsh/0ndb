@@ -203,3 +203,51 @@ _redact :: proc(t: ^_Redact_Target, intent_path: string, from, to: i64) -> Error
 	}
 	return result
 }
+
+@(private)
+_redact_records :: proc(t: ^_Redact_Target, intent_path: string, offs: []i64) -> Error {
+	keep := make([dynamic]i64, context.temp_allocator)
+	buf := make([dynamic]u8, context.temp_allocator)
+	for off in offs {
+		if off < 0 || t.end - off < OVERHEAD {
+			return .Bad_Offset
+		}
+		head: [4]u8
+		if n, err := prim.read_at(t.vfs, t.fd, head[:], off); err != .None || n != 4 {
+			return .Corrupt if err == .None else _err(err)
+		}
+		size := i64(prim.get_u32le(head[:]))
+		if size > MAX_BODY || size + OVERHEAD > t.end - off {
+			return .Corrupt
+		}
+		if resize(&buf, int(size) + OVERHEAD) != nil {
+			return .No_Memory
+		}
+		if n, err := prim.read_at(t.vfs, t.fd, buf[:], off); err != .None || n != len(buf) {
+			return .Corrupt if err == .None else _err(err)
+		}
+		switch classify(buf[:], off) {
+		case .Invalid:
+			return .Corrupt
+		case .Redacted:
+			continue
+		case .Sealed:
+			if !t.sealed {
+				return .Corrupt
+			}
+		case .Plain:
+		}
+		if is_sig(buf[HEADER:][:size]) {
+			continue
+		}
+		if _, aerr := append(&keep, off); aerr != nil {
+			return .No_Memory
+		}
+	}
+	if len(keep) == 0 {
+		return .None
+	}
+	_intent_write(t.vfs, intent_path, keep[:]) or_return
+	_redact_apply(t, keep[:]) or_return
+	return _err(prim.remove(t.vfs, intent_path))
+}

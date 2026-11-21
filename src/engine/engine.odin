@@ -1,6 +1,7 @@
 package engine
 
 import "base:runtime"
+import "core:mem/virtual"
 import "core:sync"
 import "core:thread"
 import "../convo"
@@ -102,6 +103,8 @@ Purge_Request :: struct {
 	native:   string,
 	ids:      []string,
 	texts:    []string,
+	bodies:   []string,
+	claim:    Rid,
 }
 
 Purge_Hook :: struct {
@@ -270,6 +273,9 @@ Engine :: struct {
 	redact_tick:  u64,
 	plug:         Plug_State,
 	pages:        Page_Heap,
+	temp:         virtual.Arena,
+	outer:        runtime.Context,
+	outer_set:    bool,
 	content:      Content_State,
 	card_pubs:    [dynamic]Card_Pub,
 	stats:        Stats,
@@ -286,6 +292,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 		_pages_init(&e.pages)
 		e.allocator = _pages_allocator(&e.pages)
 	}
+	context = context_for(e)
 	if len(cfg.dir) == 0 {
 		return .Invalid
 	}
@@ -299,27 +306,27 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 		e.cfg.search_budget = DEFAULT_SEARCH_BUDGET
 	}
 	e.base = cfg.vfs if cfg.vfs.procs != nil else prim.os_vfs()
-	e.dir = _clone(cfg.dir, allocator) or_return
-	e.pack_root = _join(allocator, e.dir, "pack") or_return
-	e.spaces = make(map[prim.Id]^Space, allocator)
-	e.links = make([dynamic]^Space, allocator)
-	e.handles = make(map[prim.Id]^Handle, allocator)
-	e.lru = make([dynamic]^Handle, allocator)
-	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, allocator)
-	e.waiters = make([dynamic]^Waiter, allocator)
-	e.held = make([dynamic]^Pending_Cmd, allocator)
-	e.purged = make([dynamic]Rid, allocator)
-	e.subs = make([dynamic]^Sub, allocator)
-	e.posted = make([dynamic]Posted, allocator)
-	e.post_swap = make([dynamic]Posted, allocator)
-	e.wake_hooks = make([dynamic]Posted, allocator)
-	e.dirty = make([dynamic]Dirty_Seg, allocator)
-	e.batches = make([dynamic]^Durable_Batch, allocator)
-	e.changed = make(map[prim.Id]Change, allocator)
+	e.dir = _clone(cfg.dir, e.allocator) or_return
+	e.pack_root = _join(e.allocator, e.dir, "pack") or_return
+	e.spaces = make(map[prim.Id]^Space, e.allocator)
+	e.links = make([dynamic]^Space, e.allocator)
+	e.handles = make(map[prim.Id]^Handle, e.allocator)
+	e.lru = make([dynamic]^Handle, e.allocator)
+	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, e.allocator)
+	e.waiters = make([dynamic]^Waiter, e.allocator)
+	e.held = make([dynamic]^Pending_Cmd, e.allocator)
+	e.purged = make([dynamic]Rid, e.allocator)
+	e.subs = make([dynamic]^Sub, e.allocator)
+	e.posted = make([dynamic]Posted, e.allocator)
+	e.post_swap = make([dynamic]Posted, e.allocator)
+	e.wake_hooks = make([dynamic]Posted, e.allocator)
+	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
+	e.batches = make([dynamic]^Durable_Batch, e.allocator)
+	e.changed = make(map[prim.Id]Change, e.allocator)
 	_content_init(e)
-	e.card_pubs = make([dynamic]Card_Pub, allocator)
-	e.catalog_q = make(map[prim.Id]^Catalog_Update, allocator)
-	e.index_dirty = make([dynamic]Index_Item, allocator)
+	e.card_pubs = make([dynamic]Card_Pub, e.allocator)
+	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
+	e.index_dirty = make([dynamic]Index_Item, e.allocator)
 	defer if err != .None {
 		_teardown(e)
 	}
@@ -333,7 +340,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	if cfg.loop != nil {
 		e.loop = cfg.loop
 	} else {
-		_perr(prim.loop_init(&e.own_loop, allocator)) or_return
+		_perr(prim.loop_init(&e.own_loop, e.allocator)) or_return
 		e.loop = &e.own_loop
 		e.owns_loop = true
 		prim.loop_set_clock(e.loop, cfg.clock)
@@ -354,7 +361,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 		opts.wake_data = e
 	}
 	_perr(prim.mkdir_all(e.base, e.pack_root, 0o700)) or_return
-	_perr(pack.open(&e.pk, e.base, e.pack_root, opts, allocator)) or_return
+	_perr(pack.open(&e.pk, e.base, e.pack_root, opts, e.allocator)) or_return
 	e.pk_open = true
 	e.vfs = pack.vfs(&e.pk)
 	pack.batch_begin(&e.pk)
@@ -376,6 +383,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 }
 
 close :: proc(e: ^Engine) -> Error {
+	context = context_for(e)
 	if e.running {
 		stop(e)
 	}
@@ -402,6 +410,7 @@ vfs :: proc "contextless" (e: ^Engine) -> prim.Vfs {
 }
 
 stats :: proc(e: ^Engine) -> Stats {
+	context = context_for(e)
 	s := e.stats
 	s.handles = len(e.handles)
 	s.pending = len(e.waiters)
@@ -414,10 +423,12 @@ fd :: proc "contextless" (e: ^Engine) -> prim.Fd {
 }
 
 timeout_ms :: proc(e: ^Engine) -> i64 {
+	context = context_for(e)
 	return prim.loop_timeout_ms(e.loop)
 }
 
 new_id :: proc(e: ^Engine) -> prim.Id {
+	context = context_for(e)
 	if e.cfg.ids.next != nil {
 		return e.cfg.ids.next(e.cfg.ids.data)
 	}
@@ -425,18 +436,35 @@ new_id :: proc(e: ^Engine) -> prim.Id {
 }
 
 random_fill :: proc(e: ^Engine, out: []u8) {
+	context = context_for(e)
 	prim.random_fill(e.cfg.random, out)
 }
 
 step :: proc(e: ^Engine, block := false) -> Error {
+	context = context_for(e)
+	context = context_for(e)
 	return _perr(prim.loop_step(e.loop, block))
 }
 
 run :: proc(e: ^Engine) -> Error {
+	context = context_for(e)
+	context = context_for(e)
 	return _perr(prim.loop_run(e.loop))
 }
 
+context_for :: proc(e: ^Engine) -> runtime.Context {
+	if context.allocator.procedure != e.allocator.procedure || context.allocator.data != e.allocator.data {
+		e.outer = context
+		e.outer_set = true
+	}
+	c := context
+	c.allocator = e.allocator
+	c.temp_allocator = virtual.arena_allocator(&e.temp)
+	return c
+}
+
 start :: proc(e: ^Engine) -> Error {
+	context = context_for(e)
 	if e.running {
 		return .Busy
 	}
@@ -455,6 +483,7 @@ start :: proc(e: ^Engine) -> Error {
 }
 
 stop :: proc(e: ^Engine) {
+	context = context_for(e)
 	if !e.running {
 		return
 	}
@@ -466,6 +495,7 @@ stop :: proc(e: ^Engine) {
 }
 
 post :: proc(e: ^Engine, call: proc(e: ^Engine, data: rawptr), data: rawptr) -> Error {
+	context = context_for(e)
 	sync.mutex_lock(&e.post_mu)
 	_, aerr := append(&e.posted, Posted{call, data})
 	sync.mutex_unlock(&e.post_mu)
@@ -477,6 +507,7 @@ post :: proc(e: ^Engine, call: proc(e: ^Engine, data: rawptr), data: rawptr) -> 
 }
 
 flush :: proc(e: ^Engine) -> Error {
+	context = context_for(e)
 	if !e.pk_open {
 		return .Closed
 	}
@@ -508,13 +539,22 @@ current_tick :: proc "contextless" (e: ^Engine) -> u64 {
 }
 
 hlc_now :: proc(e: ^Engine) -> prim.Hlc {
+	context = context_for(e)
 	return prim.hlc_now_with(&e.hlc, e.cfg.clock)
+}
+
+@(private)
+_outer :: proc(e: ^Engine) -> runtime.Context {
+	if e.outer_set {
+		return e.outer
+	}
+	return context
 }
 
 @(private)
 _thread_main :: proc(t: ^thread.Thread) {
 	e := (^Engine)(t.data)
-	context.allocator = e.allocator
+	context = context_for(e)
 	for !prim.loop_stopped(e.loop) {
 		if prim.loop_step(e.loop, true) != .None {
 			break
@@ -556,12 +596,14 @@ _fs_clock :: proc(e: ^Engine) -> fs.Clock {
 @(private)
 _pack_wake :: proc(data: rawptr) {
 	e := (^Engine)(data)
+	context = context_for(e)
 	prim.wake(e.loop)
 }
 
 @(private)
 _on_wake :: proc(l: ^prim.Loop, data: rawptr) {
 	e := (^Engine)(data)
+	context = context_for(e)
 	e.stats.wakeups += 1
 	if e.prev_wake != nil {
 		e.prev_wake(l, e.prev_wake_data)
@@ -570,7 +612,10 @@ _on_wake :: proc(l: ^prim.Loop, data: rawptr) {
 	e.posted, e.post_swap = e.post_swap, e.posted
 	sync.mutex_unlock(&e.post_mu)
 	for p in e.post_swap {
-		p.call(e, p.data)
+		{
+			context = _outer(e)
+			p.call(e, p.data)
+		}
 	}
 	clear(&e.post_swap)
 	_pack_poll(e)
@@ -610,6 +655,7 @@ _touch :: proc(e: ^Engine) {
 @(private)
 _on_tick :: proc(l: ^prim.Loop, data: rawptr) {
 	e := (^Engine)(data)
+	context = context_for(e)
 	e.tick_timer = 0
 	_tick_end(e)
 }
@@ -682,6 +728,7 @@ _settle_arm :: proc(e: ^Engine) {
 @(private)
 _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	e := (^Engine)(data)
+	context = context_for(e)
 	e.settle_timer = 0
 	if len(e.batches) > 0 || len(e.dirty) > 0 || e.in_tick {
 		e.settle_timer = prim.timer(e.loop, e.cfg.settle_ms, e, _on_settle)
@@ -705,6 +752,9 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 			runtime.default_temp_allocator_destroy(&runtime.global_default_temp_allocator_data)
 		}
 	}
+	if context.temp_allocator.data == &e.temp {
+		virtual.arena_destroy(&e.temp)
+	}
 	if !e.pack_more {
 		_pages_release(&e.pages)
 		_heap_release(e)
@@ -726,14 +776,20 @@ _fatal :: proc(e: ^Engine, err: Error) {
 _emit :: proc(e: ^Engine, ev: Event) {
 	if e.cfg.events.event != nil {
 		x := ev
-		e.cfg.events.event(e.cfg.events.data, e, &x)
+		{
+			context = _outer(e)
+			e.cfg.events.event(e.cfg.events.data, e, &x)
+		}
 	}
 }
 
 @(private)
 _log :: proc(e: ^Engine, level: Log_Level, msg: string) {
 	if e.cfg.log.write != nil {
-		e.cfg.log.write(e.cfg.log.data, level, msg)
+		{
+			context = _outer(e)
+			e.cfg.log.write(e.cfg.log.data, level, msg)
+		}
 	}
 }
 
@@ -822,6 +878,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.dir, e.allocator)
 	e.pack_root = ""
 	e.dir = ""
+	virtual.arena_destroy(&e.temp)
 	if e.pages.on {
 		_pages_destroy(&e.pages)
 	}

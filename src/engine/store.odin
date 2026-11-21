@@ -431,6 +431,7 @@ _pack_step :: proc(e: ^Engine) {
 @(private)
 _batch_cb :: proc(data: rawptr, err: pack.Error) {
 	b := (^Durable_Batch)(data)
+	context = context_for(b.e)
 	_batch_complete(b.e, b, _perr(err))
 }
 

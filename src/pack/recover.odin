@@ -737,14 +737,19 @@ _replay_put :: proc(p: ^Pack, key: []u8, val: []u8, tomb: bool) -> Error {
 		for ph in added.a[:added.n] {
 			_live_add(p, ph, 1)
 		}
-	} else if len(key) == 21 && key[0] == K_STALE && tomb {
+	} else if len(key) == 21 && key[0] == K_STALE {
 		if f, err := _get(p, key, &p.vbuf); err == .None && f {
-			foff, n1 := prim.get_uvarint(p.vbuf[:])
+			_, n1 := prim.get_uvarint(p.vbuf[:])
 			ln, n2 := prim.get_uvarint(p.vbuf[max(n1, 0):])
-			if n1 > 0 && n2 > 0 {
-				_ = foff
+			keep: u64
+			if !tomb {
+				_, m1 := prim.get_uvarint(val)
+				nl, m2 := prim.get_uvarint(val[max(m1, 0):])
+				keep = nl if m1 > 0 && m2 > 0 else ln
+			}
+			if n1 > 0 && n2 > 0 && keep < ln {
 				cont := u32(key[9]) << 24 | u32(key[10]) << 16 | u32(key[11]) << 8 | u32(key[12])
-				_defer_zero(p, Phys{cont = cont, off = i64(_get_be64(key[13:21])), len = i64(ln)}, false)
+				_defer_zero(p, Phys{cont = cont, off = i64(_get_be64(key[13:21])) + i64(keep), len = i64(ln - keep)}, false)
 			}
 		}
 	} else if len(key) > 9 && key[0] == K_DIR && !tomb {

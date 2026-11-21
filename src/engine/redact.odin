@@ -16,6 +16,7 @@ import osync "../sync"
 ROOT_REDACT :: 4
 
 text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
+	context = context_for(e)
 	h := _handle_get(e, o, .Text) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
@@ -53,6 +54,7 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 }
 
 map_redact :: proc(e: ^Engine, o: Object, key: []u8) -> Error {
+	context = context_for(e)
 	h := _map_writable(e, o) or_return
 	w := &h.mw.core
 	jr := &w.jr
@@ -799,22 +801,27 @@ _purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid, m: ^convo.Message) {
 		}
 	}
 	texts := make([dynamic]string, context.temp_allocator)
+	bodies := make([dynamic]string, context.temp_allocator)
 	for b in m.blocks {
 		if len(b.id) > 0 {
 			append(&ids, b.id)
 		}
 		if len(b.text) > 0 {
 			append(&texts, string(b.text))
+			append(&bodies, string(b.text))
 		}
 		if len(b.name) > 0 && b.kind == .Tool_Call {
 			append(&texts, b.name)
 		}
 	}
-	if len(ids) == 0 && len(texts) == 0 && len(m.native) == 0 {
+	if len(ids) == 0 && len(texts) == 0 && len(m.native) == 0 && obj.rid_none(m.claim) {
 		return
 	}
-	req := Purge_Request{object = Object{h.sp.id, h.id}, msg = msg, role = m.role, provider = m.provider, native = m.native, ids = ids[:], texts = texts[:]}
-	e.cfg.purge.purge(e.cfg.purge.data, e, &req)
+	req := Purge_Request{object = Object{h.sp.id, h.id}, msg = msg, role = m.role, provider = m.provider, native = m.native, ids = ids[:], texts = texts[:], bodies = bodies[:], claim = m.claim}
+	{
+		context = _outer(e)
+		e.cfg.purge.purge(e.cfg.purge.data, e, &req)
+	}
 }
 
 @(private)

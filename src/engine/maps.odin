@@ -50,6 +50,7 @@ named_id :: proc(space: prim.Id, name: string, parent: prim.Id = {}) -> (id: pri
 }
 
 map_named :: proc(e: ^Engine, space: prim.Id, name: string, parent: Object = {}, create := true) -> (o: Object, err: Error) {
+	context = context_for(e)
 	if len(name) == 0 {
 		return o, .Invalid
 	}
@@ -70,6 +71,7 @@ map_named :: proc(e: ^Engine, space: prim.Id, name: string, parent: Object = {},
 }
 
 catalog_role :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (role: string, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, o.space) or_return
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
@@ -82,7 +84,7 @@ catalog_role :: proc(e: ^Engine, o: Object, allocator := context.allocator, read
 		return "", _oerr(gerr)
 	}
 	if !found {
-		if (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+		if (merr == .Missing || _handle_waiting(h, ready.fresh)) && ready.call != nil {
 			return "", _wait(e, h, ready)
 		}
 		return "", .Not_Found
@@ -94,6 +96,7 @@ catalog_role :: proc(e: ^Engine, o: Object, allocator := context.allocator, read
 }
 
 map_create :: proc(e: ^Engine, space: prim.Id, title := "", settings: []u8 = nil) -> (o: Object, err: Error) {
+	context = context_for(e)
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Map) or_return
 	_handle_create_writer(h, {}, settings) or_return
@@ -102,24 +105,27 @@ map_create :: proc(e: ^Engine, space: prim.Id, title := "", settings: []u8 = nil
 }
 
 map_open :: proc(e: ^Engine, o: Object) -> Error {
+	context = context_for(e)
 	_, err := _handle_get(e, o, .Map)
 	return err
 }
 
 map_writer :: proc(e: ^Engine, o: Object) -> (w: ^omap.Writer, err: Error) {
+	context = context_for(e)
 	h := _map_writable(e, o) or_return
 	_handle_mark(h)
 	return &h.mw, .None
 }
 
 map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator, ready: Ready = {}) -> (entry: Map_Entry, found: bool, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
 		return entry, false, merr
 	}
 	entry, found = _oerr2(omap.table_get(&h.table, key, allocator)) or_return
-	if merr == .Missing || _handle_waiting(h) {
+	if merr == .Missing || _handle_waiting(h, ready.fresh) {
 		if ready.call != nil {
 			return entry, found, _wait(e, h, ready)
 		}
@@ -128,6 +134,7 @@ map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator
 }
 
 map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Map_Row, more: bool, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
@@ -137,13 +144,14 @@ map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit:
 	if serr != .None {
 		return nil, false, _oerr(serr)
 	}
-	if (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+	if (merr == .Missing || _handle_waiting(h, ready.fresh)) && ready.call != nil {
 		return r, m, _wait(e, h, ready)
 	}
 	return r, m, .None
 }
 
 catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (c: Catalog_Entry, found: bool, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, o.space) or_return
 	if !e.in_tick {
 		_catalog_flush(e)
@@ -154,13 +162,14 @@ catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready
 		return c, false, merr
 	}
 	c, found = _oerr2(omap.catalog_get(&h.table, o.id, allocator)) or_return
-	if !found && (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+	if !found && (merr == .Missing || _handle_waiting(h, ready.fresh)) && ready.call != nil {
 		return c, false, _wait(e, h, ready)
 	}
 	return c, found, .None
 }
 
 catalog_list :: proc(e: ^Engine, space: prim.Id, archived: bool, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Catalog_Row, more: bool, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, space) or_return
 	if !e.in_tick {
 		_catalog_flush(e)
@@ -174,13 +183,14 @@ catalog_list :: proc(e: ^Engine, space: prim.Id, archived: bool, after: ^Map_Cur
 	if lerr != .None {
 		return nil, false, _oerr(lerr)
 	}
-	if len(r) == 0 && (merr == .Missing || _handle_waiting(h)) && ready.call != nil {
+	if len(r) == 0 && (merr == .Missing || _handle_waiting(h, ready.fresh)) && ready.call != nil {
 		return r, m, _wait(e, h, ready)
 	}
 	return r, m, .None
 }
 
 catalog_usage :: proc(e: ^Engine, o: Object, usage: convo.Usage) {
+	context = context_for(e)
 	u := _catalog_q(e, o.space, o.id, .Conversation)
 	if u == nil {
 		return
@@ -529,6 +539,7 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 USAGE_TAG :: u32(64)
 
 catalog_usage_get :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (u: convo.Usage, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, o.space) or_return
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)

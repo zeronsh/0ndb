@@ -1,8 +1,10 @@
 package fs
 
 import "base:runtime"
+import "core:io"
 import "core:mem/virtual"
 import "../fstree"
+import "../odb"
 import "../prim"
 
 Autocrlf :: enum u8 {
@@ -899,4 +901,297 @@ eol_smudge :: proc(m: ^Mount, rel: string, data: []u8, allocator := context.temp
 		return data
 	}
 	return eol_smudge_action(m, eol_action(m, rel), data, allocator)
+}
+
+@(private)
+Eol_Stream :: struct {
+	s:    Text_Stat,
+	cr:   bool,
+	last: u8,
+	n:    i64,
+}
+
+@(private)
+eol_stream_feed :: proc "contextless" (es: ^Eol_Stream, data: []u8) {
+	for c in data {
+		if es.cr {
+			es.cr = false
+			if c == '\n' {
+				es.s.crlf += 1
+				continue
+			}
+			es.s.lonecr += 1
+		}
+		switch {
+		case c == '\r':
+			es.cr = true
+		case c == '\n':
+			es.s.lonelf += 1
+		case c == 127:
+			es.s.nonprintable += 1
+		case c < 32:
+			switch c {
+			case '\b', '\t', 0o33, 0o14:
+				es.s.printable += 1
+			case 0:
+				es.s.nul += 1
+				es.s.nonprintable += 1
+			case:
+				es.s.nonprintable += 1
+			}
+		case:
+			es.s.printable += 1
+		}
+	}
+	if len(data) > 0 {
+		es.last = data[len(data) - 1]
+		es.n += i64(len(data))
+	}
+}
+
+@(private)
+eol_stream_finish :: proc "contextless" (es: ^Eol_Stream) -> Text_Stat {
+	s := es.s
+	if es.cr {
+		s.lonecr += 1
+	}
+	if es.n >= 1 && es.last == 0o32 {
+		s.nonprintable -= 1
+	}
+	return s
+}
+
+@(private)
+LARGE_CHUNK :: 1 << 20
+
+@(private)
+blob_has_cr :: proc(m: ^Mount, inode: fstree.Inode_Id) -> bool {
+	if m.history == nil || m.db == nil {
+		return false
+	}
+	reg, has, err := history_blob(m.history, inode)
+	if err != .None || !has {
+		old, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
+		if terr != .None {
+			return false
+		}
+		for c in old {
+			if c == '\r' {
+				return true
+			}
+		}
+		return false
+	}
+	Cr_Sink :: struct {
+		found: bool,
+	}
+	sink := Cr_Sink{}
+	odb.stream(m.db, odb.Oid(reg.oid), io.Stream{procedure = proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+		#partial switch mode {
+		case .Write:
+			s := (^Cr_Sink)(data)
+			if !s.found {
+				for c in p {
+					if c == '\r' {
+						s.found = true
+						break
+					}
+				}
+			}
+			return i64(len(p)), nil
+		case .Query:
+			return io.query_utility({.Write, .Query})
+		}
+		return 0, .Unsupported
+	}, data = &sink})
+	return sink.found
+}
+
+store_large_clean :: proc(m: ^Mount, rel: string, abs: string, old := fstree.Inode_Id{}, has_old := false) -> (oid: odb.Oid, size: i64, ok: bool) {
+	if !m.has_git || m.db == nil {
+		return
+	}
+	action := eol_action(m, rel)
+	if action == .Binary || action == .Undefined {
+		return
+	}
+	fd, oerr := prim.open_file(m.vfs, abs)
+	if oerr != .None {
+		return
+	}
+	defer prim.close_file(m.vfs, fd)
+	buf := make([]u8, LARGE_CHUNK, context.temp_allocator)
+	es: Eol_Stream
+	off: i64
+	for {
+		n, rerr := prim.read_at(m.vfs, fd, buf, off)
+		if rerr != .None {
+			return
+		}
+		if n <= 0 {
+			break
+		}
+		eol_stream_feed(&es, buf[:n])
+		off += i64(n)
+	}
+	s := eol_stream_finish(&es)
+	if s.crlf == 0 {
+		return
+	}
+	if action_auto(action) {
+		if text_is_binary(s) {
+			return
+		}
+		if has_old && blob_has_cr(m, old) {
+			return
+		}
+	}
+	tmp, _ := path_join(m.dir, "eol-clean.tmp", context.temp_allocator)
+	out, cerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, 0o600)
+	if cerr != .None {
+		return
+	}
+	defer prim.remove(m.vfs, tmp)
+	conv := make([]u8, LARGE_CHUNK, context.temp_allocator)
+	auto := action_auto(action)
+	pending := false
+	woff: i64
+	off = 0
+	for {
+		n, rerr := prim.read_at(m.vfs, fd, buf, off)
+		if rerr != .None {
+			prim.close_file(m.vfs, out)
+			return
+		}
+		if n <= 0 {
+			break
+		}
+		off += i64(n)
+		k := 0
+		for c in buf[:n] {
+			if auto {
+				if c != '\r' {
+					conv[k] = c
+					k += 1
+				}
+				continue
+			}
+			if pending {
+				pending = false
+				if c != '\n' {
+					conv[k] = '\r'
+					k += 1
+				}
+			}
+			if c == '\r' {
+				pending = true
+				continue
+			}
+			conv[k] = c
+			k += 1
+			if k == len(conv) {
+				if prim.write_at(m.vfs, out, conv[:k], woff) != .None {
+					prim.close_file(m.vfs, out)
+					return
+				}
+				woff += i64(k)
+				k = 0
+			}
+		}
+		if k > 0 {
+			if prim.write_at(m.vfs, out, conv[:k], woff) != .None {
+				prim.close_file(m.vfs, out)
+				return
+			}
+			woff += i64(k)
+		}
+	}
+	if pending {
+		one := [1]u8{'\r'}
+		if prim.write_at(m.vfs, out, one[:], woff) != .None {
+			prim.close_file(m.vfs, out)
+			return
+		}
+		woff += 1
+	}
+	prim.close_file(m.vfs, out)
+	o, werr := odb.write_file(m.db, tmp)
+	if werr != .None {
+		return
+	}
+	history_note_blob(m.history, o)
+	return o, woff, true
+}
+
+@(private)
+Smudge_Sink :: struct {
+	inner: io.Stream,
+	prev:  u8,
+	buf:   []u8,
+	err:   bool,
+}
+
+@(private)
+smudge_sink_proc :: proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+	s := (^Smudge_Sink)(data)
+	#partial switch mode {
+	case .Write:
+		k := 0
+		for c in p {
+			if k + 2 > len(s.buf) {
+				if _, e := io.write(s.inner, s.buf[:k]); e != nil {
+					return 0, e
+				}
+				k = 0
+			}
+			if c == '\n' && s.prev != '\r' {
+				s.buf[k] = '\r'
+				k += 1
+			}
+			s.buf[k] = c
+			k += 1
+			s.prev = c
+		}
+		if k > 0 {
+			if _, e := io.write(s.inner, s.buf[:k]); e != nil {
+				return 0, e
+			}
+		}
+		return i64(len(p)), nil
+	case .Query:
+		return io.query_utility({.Write, .Query})
+	}
+	return 0, .Unsupported
+}
+
+eol_smudge_large :: proc(m: ^Mount, rel: string, oid: odb.Oid) -> (convert: bool) {
+	if !m.has_git || m.db == nil {
+		return false
+	}
+	action := eol_action(m, rel)
+	if !output_crlf(m, action) {
+		return false
+	}
+	es := new(Eol_Stream, context.temp_allocator)
+	_, _, serr := odb.stream(m.db, oid, io.Stream{procedure = proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+		#partial switch mode {
+		case .Write:
+			eol_stream_feed((^Eol_Stream)(data), p)
+			return i64(len(p)), nil
+		case .Query:
+			return io.query_utility({.Write, .Query})
+		}
+		return 0, .Unsupported
+	}, data = es})
+	if serr != .None {
+		return false
+	}
+	s := eol_stream_finish(es)
+	if s.lonelf == 0 {
+		return false
+	}
+	if action_auto(action) && (s.lonecr > 0 || s.crlf > 0 || text_is_binary(s)) {
+		return false
+	}
+	return true
 }

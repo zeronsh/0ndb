@@ -1,7 +1,6 @@
 package sim
 
 import "core:fmt"
-import "core:sys/posix"
 import eng "../../src/engine"
 import "../../src/pack"
 import "../../src/prim"
@@ -9,16 +8,6 @@ import osync "../../src/sync"
 
 NODE_DIR :: "/data"
 RELAY_DIR :: "/relay"
-
-loop_ready :: proc(l: ^prim.Loop) -> bool {
-	when ODIN_OS == .Linux {
-		fd := posix.FD(l.os.epfd)
-	} else {
-		fd := posix.FD(l.os.kq)
-	}
-	fds := [1]posix.pollfd{{fd = fd, events = {.IN}}}
-	return posix.poll(&fds[0], 1, 0) > 0
-}
 
 loop_due :: proc(l: ^prim.Loop) -> bool {
 	at, ok := loop_deadline(l)

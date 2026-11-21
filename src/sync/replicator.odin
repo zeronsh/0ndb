@@ -33,6 +33,8 @@ Repl_Event_Kind :: enum u8 {
 	Relay_Misbehaving,
 	Keys_Needed,
 	Presence,
+	Direct,
+	Undelivered,
 	Object_Shredded,
 	Caught_Up,
 }
@@ -610,7 +612,7 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 replicator_current :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
 	id := stream_id(scope, device, name, epoch)
 	if rm, ok := r.remotes[id]; ok {
-		return rm.follow && rm.relay_len >= 0 && rm.fresh_gen >= rm.want_gen
+		return rm.follow
 	}
 	return false
 }
@@ -1894,6 +1896,8 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_objs_on_forgotten(r, Object_Key(ev.id))
 	case .Presence:
 		_on_presence(r, ev)
+	case .Direct, .Undelivered:
+		_on_direct_event(r, ev)
 	case .Probed:
 		if Stream_Id(ev.id) == reserved_id(FEED_TAG, 0) {
 			r.feed_target = ev.length

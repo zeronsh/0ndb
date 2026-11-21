@@ -29,8 +29,9 @@ Change :: struct {
 }
 
 Ready :: struct {
-	data: rawptr,
-	call: proc(data: rawptr, e: ^Engine, err: Error),
+	data:  rawptr,
+	call:  proc(data: rawptr, e: ^Engine, err: Error),
+	fresh: bool,
 }
 
 @(private)
@@ -51,6 +52,7 @@ Seg :: struct {
 	tree:    ^Remote_Tree,
 	in_view: bool,
 	waiting: bool,
+	probing: bool,
 	follow:  bool,
 	check:   Seg_Check,
 	chain:   journal.Chain,
@@ -383,8 +385,12 @@ _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 		seg.tree = rt
 	}
 	append(&h.segs, seg)
-	if journal.replica_length(rep) == 0 || (sp.connected && !osync.replicator_current(&sp.repl, &h.scope, device, h.name, 0)) {
+	if journal.replica_length(rep) == 0 {
 		seg.waiting = true
+		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
+		e.stats.fetches += 1
+	} else if sp.connected && !osync.replicator_current(&sp.repl, &h.scope, device, h.name, 0) {
+		seg.probing = true
 		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
 		e.stats.fetches += 1
 	}
@@ -440,6 +446,7 @@ _handle_remote_grew :: proc(h: ^Handle, device: prim.Id) {
 	for s in h.segs {
 		if s.device == device {
 			s.waiting = false
+			s.probing = false
 			if !s.in_view && s.tree != nil && !s.tree.loaded {
 				_remote_tree_load(h.e, h.sp, s.tree)
 			}
@@ -450,6 +457,26 @@ _handle_remote_grew :: proc(h: ^Handle, device: prim.Id) {
 				}
 			}
 			return
+		}
+	}
+}
+
+@(private)
+_probes_settle :: proc(e: ^Engine, sp: ^Space, only := prim.Id{}) {
+	for _, h in e.handles {
+		if h.sp != sp || (!prim.id_is_zero(only) && h.id != only) {
+			continue
+		}
+		settled := false
+		for s in h.segs {
+			if s.probing {
+				s.probing = false
+				s.waiting = false
+				settled = true
+			}
+		}
+		if settled {
+			_object_changed(e, sp.id, h.id, .Data)
 		}
 	}
 }
@@ -480,9 +507,9 @@ _handle_refresh :: proc(h: ^Handle) {
 }
 
 @(private)
-_handle_waiting :: proc(h: ^Handle) -> bool {
+_handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 	for s in h.segs {
-		if s.waiting {
+		if s.waiting || (fresh && s.probing) {
 			return true
 		}
 		if !s.in_view && s.tree != nil && !s.tree.absent {
@@ -666,7 +693,7 @@ _handle_want :: proc(h: ^Handle) -> (fetched: bool) {
 		obj.view_reset(&h.view)
 	}
 	for s in h.segs {
-		if s.waiting || (!s.in_view && s.tree != nil && !s.tree.absent) {
+		if s.waiting || s.probing || (!s.in_view && s.tree != nil && !s.tree.absent) {
 			fetched = true
 		}
 	}
@@ -742,7 +769,7 @@ _waiters_run :: proc(e: ^Engine) {
 		if h, ok := e.handles[w.object]; ok {
 			_handle_refresh(h)
 			c := e.changed[w.object]
-			if w.cmd == nil && _handle_waiting(h) && c.kinds & {.Quarantined, .Redacted} == {} {
+			if w.cmd == nil && _handle_waiting(h, w.ready.fresh) && c.kinds & {.Quarantined, .Redacted} == {} {
 				append(&e.waiters, w)
 				continue
 			}
@@ -750,7 +777,10 @@ _waiters_run :: proc(e: ^Engine) {
 		if w.cmd != nil {
 			_cmd_retry(e, w.cmd, w.tries + 1)
 		} else if w.ready.call != nil {
-			w.ready.call(w.ready.data, e, .None)
+			{
+				context = _outer(e)
+				w.ready.call(w.ready.data, e, .None)
+			}
 		}
 		free(w, e.allocator)
 	}
@@ -764,7 +794,10 @@ _waiters_fail_all :: proc(e: ^Engine, err: Error) {
 		if w.cmd != nil {
 			_cmd_fail(e, w.cmd, err)
 		} else if w.ready.call != nil {
-			w.ready.call(w.ready.data, e, err)
+			{
+				context = _outer(e)
+				w.ready.call(w.ready.data, e, err)
+			}
 		}
 		free(w, e.allocator)
 	}
@@ -772,6 +805,7 @@ _waiters_fail_all :: proc(e: ^Engine, err: Error) {
 }
 
 cancel_waits :: proc(e: ^Engine, data: rawptr) {
+	context = context_for(e)
 	i := 0
 	for i < len(e.waiters) {
 		w := e.waiters[i]

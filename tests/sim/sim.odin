@@ -6,7 +6,6 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:testing"
-import "core:sys/posix"
 import "core:time"
 import eng "../../src/engine"
 import "../../src/prim"
@@ -514,6 +513,7 @@ free_result :: proc(res: ^Run_Result) {
 
 @(test)
 simulate :: proc(t: ^testing.T) {
+	hermetic_env()
 	verbose := env_u64("SIM_VERBOSE", 0) != 0
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 && env_u64("SIM_SHRINK", 0) != 0 {
 		seed, _ := strconv.parse_u64(s)
@@ -557,7 +557,7 @@ simulate :: proc(t: ^testing.T) {
 				st.first_len = copy(st.first[:], line)
 			}
 			b := transmute([size_of(Wire_Stats)]u8)st
-			posix.write(posix.FD(fd), raw_data(b[:]), len(b))
+			os_stats_write(fd, b[:])
 		} else {
 			print_stats(&a)
 		}
@@ -623,6 +623,15 @@ simulate :: proc(t: ^testing.T) {
 		fmt.eprintf("sim: %s\n", f)
 	}
 	testing.expect(t, len(failed) == 0)
+}
+
+hermetic_env :: proc() {
+	_ = os.set_env("HOME", "/home/sim")
+	_ = os.set_env("XDG_CONFIG_HOME", "/home/sim/.config")
+	_ = os.set_env("GIT_CONFIG_SYSTEM", "/etc/gitconfig")
+	_ = os.set_env("GIT_ATTR_NOSYSTEM", "1")
+	_ = os.unset_env("GIT_CONFIG_NOSYSTEM")
+	_ = os.unset_env("GIT_CONFIG_GLOBAL")
 }
 
 Filter :: struct {
@@ -720,67 +729,27 @@ _hexrun :: proc(s: string) -> int {
 }
 
 run_child :: proc(seed: u64, replay: bool, extra: []string = nil) -> (st: Wire_Stats, ok: bool, why: string) {
-	fds: [2]posix.FD
-	if posix.pipe(&fds) != .OK {
-		return st, false, "pipe failed"
-	}
-	env := make([dynamic]cstring, context.temp_allocator)
+	env := make([dynamic]string, context.temp_allocator)
 	environ, _ := os.environ(context.temp_allocator)
 	for kv in environ {
 		if strings.has_prefix(kv, "SIM_SEED=") || strings.has_prefix(kv, "SIM_REPLAY=") || strings.has_prefix(kv, "SIM_STATS_FD=") || strings.has_prefix(kv, "SIM_SHRINK") || (len(extra) > 0 && strings.has_prefix(kv, "SIM_KEEP_")) {
 			continue
 		}
-		append(&env, strings.clone_to_cstring(kv, context.temp_allocator))
+		append(&env, kv)
 	}
-	append(&env, strings.clone_to_cstring(fmt.tprintf("SIM_SEED=%d", seed), context.temp_allocator))
-	append(&env, strings.clone_to_cstring(fmt.tprintf("SIM_REPLAY=%d", 1 if replay else 0), context.temp_allocator))
-	append(&env, strings.clone_to_cstring(fmt.tprintf("SIM_STATS_FD=%d", fds[1]), context.temp_allocator))
+	append(&env, fmt.tprintf("SIM_SEED=%d", seed))
+	append(&env, fmt.tprintf("SIM_REPLAY=%d", 1 if replay else 0))
 	for x in extra {
-		append(&env, strings.clone_to_cstring(x, context.temp_allocator))
-	}
-	append(&env, nil)
-	when ODIN_OS == .Linux {
-		exe := cstring("/proc/self/exe")
-	} else {
-		exe := strings.clone_to_cstring(os.args[0], context.temp_allocator)
-	}
-	argv := [2]cstring{exe, nil}
-	pid := posix.fork()
-	if pid == 0 {
-		posix.close(fds[0])
-		posix.execve(exe, raw_data(argv[:]), raw_data(env[:]))
-		posix._exit(127)
-	}
-	posix.close(fds[1])
-	if pid < 0 {
-		posix.close(fds[0])
-		return st, false, "fork failed"
+		append(&env, x)
 	}
 	buf: [size_of(Wire_Stats)]u8
-	got := 0
-	for got < len(buf) {
-		n := posix.read(fds[0], &buf[got], uint(len(buf) - got))
-		if n <= 0 {
-			break
-		}
-		got += int(n)
-	}
-	posix.close(fds[0])
-	status: i32
-	for {
-		r := posix.waitpid(pid, &status, {})
-		if r == pid {
-			break
-		}
-		if r < 0 && posix.errno() != .EINTR {
-			return st, false, "waitpid failed"
-		}
+	got, sig, code, err := os_child_run(env[:], buf[:])
+	if len(err) > 0 {
+		return st, false, err
 	}
 	if got == len(buf) {
 		st = transmute(Wire_Stats)buf
 	}
-	sig := status & 0x7f
-	code := (status >> 8) & 0xff
 	if sig != 0 {
 		return st, false, fmt.tprintf("killed by signal %d", sig)
 	}

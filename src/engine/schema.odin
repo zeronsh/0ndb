@@ -75,6 +75,7 @@ Agent_Def :: struct {
 }
 
 workspace_create :: proc(e: ^Engine, space: prim.Id, def: Workspace_Def) -> (o: Object, err: Error) {
+	context = context_for(e)
 	o = map_create(e, space, def.name) or_return
 	workspace_set(e, o, def) or_return
 	for m in def.members {
@@ -88,6 +89,7 @@ workspace_create :: proc(e: ^Engine, space: prim.Id, def: Workspace_Def) -> (o: 
 }
 
 workspace_set :: proc(e: ^Engine, o: Object, def: Workspace_Def) -> Error {
+	context = context_for(e)
 	f := make([dynamic]omap.Field, context.temp_allocator)
 	append(&f, omap.field_str(u32(Workspace_Tag.Name), def.name))
 	append(&f, omap.field_id(u32(Workspace_Tag.Agent), def.agent))
@@ -105,16 +107,19 @@ workspace_set :: proc(e: ^Engine, o: Object, def: Workspace_Def) -> Error {
 }
 
 workspace_add_member :: proc(e: ^Engine, o: Object, m: Workspace_Member) -> Error {
+	context = context_for(e)
 	b := _member_encode(m)
 	_, err := map_add(e, o, transmute([]u8)string(DEF_KEY), u32(Workspace_Tag.Members), b)
 	return aerr_ok(err)
 }
 
 workspace_remove_member :: proc(e: ^Engine, o: Object, m: Workspace_Member) -> Error {
+	context = context_for(e)
 	return aerr_ok(map_remove(e, o, transmute([]u8)string(DEF_KEY), u32(Workspace_Tag.Members), _member_encode(m)))
 }
 
 workspace_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (def: Workspace_Def, err: Error) {
+	context = context_for(e)
 	en, found := map_get(e, o, transmute([]u8)string(DEF_KEY), context.temp_allocator, ready) or_return
 	if !found {
 		return def, .Not_Found
@@ -144,6 +149,7 @@ workspace_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, rea
 }
 
 agent_create :: proc(e: ^Engine, space: prim.Id, def: Agent_Def) -> (o: Object, err: Error) {
+	context = context_for(e)
 	o = map_create(e, space, def.name) or_return
 	agent_set(e, o, def) or_return
 	for t in def.tools {
@@ -160,6 +166,7 @@ agent_create :: proc(e: ^Engine, space: prim.Id, def: Agent_Def) -> (o: Object, 
 }
 
 agent_set :: proc(e: ^Engine, o: Object, def: Agent_Def) -> Error {
+	context = context_for(e)
 	f := make([dynamic]omap.Field, context.temp_allocator)
 	append(&f, omap.field_str(u32(Agent_Tag.Name), def.name))
 	append(&f, omap.field_str(u32(Agent_Tag.Instructions), def.instructions))
@@ -179,15 +186,18 @@ agent_set :: proc(e: ^Engine, o: Object, def: Agent_Def) -> Error {
 }
 
 agent_add :: proc(e: ^Engine, o: Object, tag: Agent_Tag, element: []u8) -> Error {
+	context = context_for(e)
 	_, err := map_add(e, o, transmute([]u8)string(DEF_KEY), u32(tag), element)
 	return aerr_ok(err)
 }
 
 agent_remove :: proc(e: ^Engine, o: Object, tag: Agent_Tag, element: []u8) -> Error {
+	context = context_for(e)
 	return aerr_ok(map_remove(e, o, transmute([]u8)string(DEF_KEY), u32(tag), element))
 }
 
 agent_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (def: Agent_Def, err: Error) {
+	context = context_for(e)
 	en, found := map_get(e, o, transmute([]u8)string(DEF_KEY), context.temp_allocator, ready) or_return
 	if !found {
 		return def, .Not_Found

@@ -13,6 +13,7 @@ import osync "../sync"
 TEXT_NAME :: "text"
 
 text_create :: proc(e: ^Engine, space: prim.Id, title := "", initial := "") -> (o: Object, err: Error) {
+	context = context_for(e)
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Text) or_return
 	_handle_create_writer(h) or_return
@@ -23,6 +24,7 @@ text_create :: proc(e: ^Engine, space: prim.Id, title := "", initial := "") -> (
 }
 
 tree_create :: proc(e: ^Engine, space: prim.Id, title := "") -> (o: Object, err: Error) {
+	context = context_for(e)
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
@@ -32,6 +34,7 @@ tree_create :: proc(e: ^Engine, space: prim.Id, title := "") -> (o: Object, err:
 }
 
 text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Text) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
@@ -46,6 +49,7 @@ text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: 
 }
 
 text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (spans: []crdt.Author_Span, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Text) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
@@ -60,6 +64,7 @@ text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 }
 
 tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
@@ -78,6 +83,7 @@ tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 }
 
 tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}) -> (names: []string, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
@@ -107,6 +113,7 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 }
 
 tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8) -> Error {
+	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
@@ -144,6 +151,7 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8) -> Error {
 }
 
 tree_remove :: proc(e: ^Engine, o: Object, path: string) -> Error {
+	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
@@ -161,6 +169,7 @@ tree_remove :: proc(e: ^Engine, o: Object, path: string) -> Error {
 }
 
 tree_history :: proc(e: ^Engine, o: Object) -> (hist: ^fs.History, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
@@ -170,6 +179,7 @@ tree_history :: proc(e: ^Engine, o: Object) -> (hist: ^fs.History, err: Error) {
 }
 
 tree_release :: proc(e: ^Engine, o: Object) {
+	context = context_for(e)
 	if h, ok := e.handles[o.id]; ok {
 		_handle_mark(h)
 		if h.pins > 0 {
@@ -179,6 +189,7 @@ tree_release :: proc(e: ^Engine, o: Object) {
 }
 
 device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
+	context = context_for(e)
 	if !e.db_open {
 		dir := _join(context.temp_allocator, e.dir, "objects") or_return
 		_perr(prim.mkdir_all(e.base, dir, 0o700)) or_return
@@ -524,10 +535,12 @@ Tree_Conflict :: struct {
 }
 
 tree_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
+	context = context_for(e)
 	return _conflicts(e, o, .File_Tree, allocator, ready)
 }
 
 text_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
+	context = context_for(e)
 	return _conflicts(e, o, .Text, allocator, ready)
 }
 
@@ -556,6 +569,7 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 }
 
 conflicts_clear :: proc(e: ^Engine, o: Object, kind: Kind) -> Error {
+	context = context_for(e)
 	if kind != .File_Tree && kind != .Text {
 		return .Invalid
 	}

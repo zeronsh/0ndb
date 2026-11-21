@@ -540,7 +540,12 @@ op_revert :: proc(c: ^Call, o: ^Out) -> Status {
 		if !aok || !pok {
 			return .Corrupt
 		}
-		if err := fs.mount_revert(tm.mount, fs.Version(pv), fs.Version(av)); err != .None {
+		rerr: fs.Error
+		{
+			context = eng.context_for(c.api.e)
+			rerr = fs.mount_revert(tm.mount, fs.Version(pv), fs.Version(av))
+		}
+		if rerr != .None {
 			return .Io
 		}
 		eng.touched(c.api.e, tm.object)

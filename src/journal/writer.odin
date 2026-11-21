@@ -278,6 +278,23 @@ journal_redact :: proc(j: ^Journal, from, to: i64) -> Error {
 	return err
 }
 
+journal_redact_records :: proc(j: ^Journal, offs: []i64) -> Error {
+	if j.fd < 0 || j.open_at >= 0 {
+		return .Invalid
+	}
+	if err := journal_commit(j); err != .None {
+		return err
+	}
+	t := _Redact_Target {
+		vfs = j.vfs,
+		fd  = j.fd,
+		end = j.durable,
+	}
+	err := _redact_records(&t, j.redact_path, offs)
+	j.version += 1
+	return err
+}
+
 journal_reader :: proc(j: ^Journal, r: ^Reader, allocator := context.allocator) {
 	reader_init(r, j.vfs, j.fd, 0, allocator)
 	r.journal = j

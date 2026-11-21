@@ -76,6 +76,7 @@ Sub :: struct {
 }
 
 subscribe :: proc(e: ^Engine, o: Object, kind: Kind, cb: Sub_Proc, data: rawptr) -> (id: Sub_Id, err: Error) {
+	context = context_for(e)
 	if cb == nil {
 		return 0, .Invalid
 	}
@@ -95,11 +96,13 @@ subscribe :: proc(e: ^Engine, o: Object, kind: Kind, cb: Sub_Proc, data: rawptr)
 }
 
 subscribe_catalog :: proc(e: ^Engine, space: prim.Id, cb: Sub_Proc, data: rawptr) -> (id: Sub_Id, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, space) or_return
 	return subscribe(e, Object{space, sp.catalog}, .Map, cb, data)
 }
 
 unsubscribe :: proc(e: ^Engine, id: Sub_Id) {
+	context = context_for(e)
 	for s, i in e.subs {
 		if s.id != id {
 			continue
@@ -229,7 +232,10 @@ _subs_deliver :: proc(e: ^Engine) {
 		deltas := make([dynamic]Delta, context.temp_allocator)
 		_sub_collect(e, s, c.kinds, &deltas)
 		if len(deltas) > 0 {
-			s.cb(s.data, e, s.id, deltas[:])
+			{
+				context = _outer(e)
+				s.cb(s.data, e, s.id, deltas[:])
+			}
 		}
 	}
 }

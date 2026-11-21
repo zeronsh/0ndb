@@ -207,6 +207,7 @@ Pending_Cmd :: struct {
 }
 
 exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Error) {
+	context = context_for(e)
 	st: Cmd_State
 	h: ^Handle
 	res, h, err = _cmd_run(e, cmd, &st)
@@ -236,96 +237,115 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 }
 
 convo_send :: proc(e: ^Engine, o: Object, text: string, parent: Rid = {}, attachments: []convo.Attachment = nil, done: Done = {}) -> (msg: Rid, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Send{object = o, text = text, parent = parent, attachments = attachments}, done)
 	return r.item, x
 }
 
 convo_queue :: proc(e: ^Engine, o: Object, text: string, attachments: []convo.Attachment = nil, done: Done = {}) -> (item: Rid, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Queue{object = o, text = text, attachments = attachments}, done)
 	return r.item, x
 }
 
 convo_steer :: proc(e: ^Engine, o: Object, text: string, msg: Rid = {}, done: Done = {}) -> (item: Rid, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Steer{object = o, text = text, msg = msg}, done)
 	return r.item, x
 }
 
 convo_edit :: proc(e: ^Engine, o: Object, item: Rid, text: string, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Edit{object = o, item = item, text = text}, done)
 	return x
 }
 
 convo_cancel :: proc(e: ^Engine, o: Object, item: Rid, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Cancel{object = o, item = item}, done)
 	return x
 }
 
 convo_interrupt :: proc(e: ^Engine, o: Object, msg: Rid = {}, done: Done = {}) -> (item: Rid, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Interrupt{object = o, msg = msg}, done)
 	return r.item, x
 }
 
 convo_answer :: proc(e: ^Engine, o: Object, request: Rid, allow: bool, text := "", done: Done = {}) -> (item: Rid, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Answer{object = o, request = request, allow = allow, text = text}, done)
 	return r.item, x
 }
 
 convo_switch :: proc(e: ^Engine, o: Object, sibling: Rid, done: Done = {}) -> (leaf: Rid, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Switch{object = o, sibling = sibling}, done)
 	return r.leaf, x
 }
 
 convo_back :: proc(e: ^Engine, o: Object, msg: Rid, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Back{object = o, msg = msg}, done)
 	return x
 }
 
 convo_follow :: proc(e: ^Engine, o: Object, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Follow{object = o}, done)
 	return x
 }
 
 convo_mount :: proc(e: ^Engine, o: Object, name: string, tree: prim.Id, line: prim.Id, path := "", done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Mount{object = o, name = name, tree = tree, line = line, path = path}, done)
 	return x
 }
 
 convo_unmount :: proc(e: ^Engine, o: Object, name: string, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Unmount{object = o, name = name}, done)
 	return x
 }
 
 convo_redact :: proc(e: ^Engine, o: Object, msg: Rid, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Redact{object = o, msg = msg}, done)
 	return x
 }
 
 map_set :: proc(e: ^Engine, o: Object, key: []u8, fields: []omap.Field, done: Done = {}) -> (off: i64, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Map_Set{object = o, key = key, fields = fields}, done)
 	return r.off, x
 }
 
 map_delete :: proc(e: ^Engine, o: Object, key: []u8, tags: []u32, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Map_Delete{object = o, key = key, tags = tags}, done)
 	return x
 }
 
 map_add :: proc(e: ^Engine, o: Object, key: []u8, tag: u32, element: []u8, done: Done = {}) -> (id: Rid, err: Error) {
+	context = context_for(e)
 	r, x := exec(e, Cmd_Map_Add{object = o, key = key, tag = tag, element = element}, done)
 	return r.item, x
 }
 
 map_remove :: proc(e: ^Engine, o: Object, key: []u8, tag: u32, element: []u8, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Map_Remove{object = o, key = key, tag = tag, element = element}, done)
 	return x
 }
 
 text_edit :: proc(e: ^Engine, o: Object, pos: int, remove: int, insert: string, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, Cmd_Text_Edit{object = o, pos = pos, remove = remove, insert = insert}, done)
 	return x
 }
 
 catalog_set :: proc(e: ^Engine, c: Cmd_Catalog_Set, done: Done = {}) -> Error {
+	context = context_for(e)
 	_, x := exec(e, c, done)
 	return x
 }
@@ -346,7 +366,10 @@ _cmd_retry :: proc(e: ^Engine, p: ^Pending_Cmd, tries: int) {
 	}
 	res.tick = current_tick(e)
 	if p.done.call != nil {
-		p.done.call(p.done.data, e, &res, err)
+		{
+			context = _outer(e)
+			p.done.call(p.done.data, e, &res, err)
+		}
 	}
 	_cmd_free(e, p)
 }
@@ -355,7 +378,10 @@ _cmd_retry :: proc(e: ^Engine, p: ^Pending_Cmd, tries: int) {
 _cmd_fail :: proc(e: ^Engine, p: ^Pending_Cmd, err: Error) {
 	if p.done.call != nil {
 		res: Result
-		p.done.call(p.done.data, e, &res, err)
+		{
+			context = _outer(e)
+			p.done.call(p.done.data, e, &res, err)
+		}
 	}
 	_cmd_free(e, p)
 }
@@ -636,6 +662,7 @@ _cmd_clone :: proc(cmd: Command, a: runtime.Allocator) -> Command {
 }
 
 pressured :: proc(e: ^Engine) -> bool {
+	context = context_for(e)
 	return e.pk_open && pack.pressure(&e.pk)
 }
 

@@ -1050,6 +1050,7 @@ _revive_ready :: proc(r: ^Runtime, o: Object, v: ^obj.View) -> bool {
 		}
 	}
 	ready := _wait_ready(r, o)
+	ready.fresh = true
 	if _, serr := eng.convo_status(r.e, o, ready); serr == .Pending {
 		return false
 	}
@@ -1280,7 +1281,7 @@ _follow_stale :: proc(r: ^Runtime, o: Object, v: ^obj.View, c: ^eng.Catalog_Entr
 		}
 	}
 	author := _activity_author(r, o)
-	behind := remote && i64(c.activity) > _view_activity(v) && author != r.self && !runner_gone(r, o.space, author)
+	behind := remote && i64(c.activity) > _view_activity(v) && author != r.self && runner_present(r, o.space, author)
 	if idx < 0 {
 		if !behind || run_find(r, o) != nil {
 			return false

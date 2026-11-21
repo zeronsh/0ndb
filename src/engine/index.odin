@@ -35,6 +35,7 @@ Index_Item :: struct {
 }
 
 search_query :: proc(e: ^Engine, query: string, req: search.Request, allocator := context.allocator) -> (res: search.Results, err: Error) {
+	context = context_for(e)
 	if !e.cfg.search {
 		return res, .Unsupported
 	}
@@ -44,6 +45,7 @@ search_query :: proc(e: ^Engine, query: string, req: search.Request, allocator :
 }
 
 search_wrote :: proc(e: ^Engine, tree: prim.Id, path: string, unit: search.Unit, lo, hi: u64, allocator := context.allocator) -> (hits: []search.Wrote_Hit, err: Error) {
+	context = context_for(e)
 	if !e.cfg.search {
 		return nil, .Unsupported
 	}

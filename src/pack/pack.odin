@@ -565,7 +565,14 @@ _erase_stale :: proc(p: ^Pack, inum: u64, lo, hi: i64, urgent: bool) -> Error {
 		_miter_destroy(&it)
 		return e
 	}
-	keys := make([dynamic]u8, context.temp_allocator)
+	Cut :: struct {
+		key:  [21]u8,
+		foff: i64,
+		end:  i64,
+		a:    i64,
+		b:    i64,
+	}
+	cuts := make([dynamic]Cut, context.temp_allocator)
 	for {
 		key, val, ok := _miter_next(&it)
 		if !ok {
@@ -582,20 +589,41 @@ _erase_stale :: proc(p: ^Pack, inum: u64, lo, hi: i64, urgent: bool) -> Error {
 		if i64(foff) >= hi || i64(foff + ln) <= lo {
 			continue
 		}
+		c := Cut{foff = i64(foff), end = i64(foff + ln)}
+		c.a = max(lo, c.foff)
+		c.b = min(hi, c.end)
+		copy(c.key[:], key)
 		cont := u32(key[9]) << 24 | u32(key[10]) << 16 | u32(key[11]) << 8 | u32(key[12])
 		off := i64(_get_be64(key[13:21]))
-		_defer_zero(p, Phys{cont = cont, off = off, len = i64(ln)}, urgent)
-		append(&keys, ..key)
+		_defer_zero(p, Phys{cont = cont, off = off + (c.a - c.foff), len = c.b - c.a, foff = c.a}, urgent)
+		append(&cuts, c)
 	}
 	err := it.err
 	_miter_destroy(&it)
 	if err != .None {
 		return err
 	}
-	for i := 0; i + 21 <= len(keys); i += 21 {
-		_put(p, keys[i:i + 21], nil, true) or_return
+	for &c in cuts {
+		if c.a > c.foff {
+			_put(p, c.key[:], _stale_val(c.foff, c.a - c.foff), false) or_return
+		} else {
+			_put(p, c.key[:], nil, true) or_return
+		}
+		if c.b < c.end {
+			off := i64(_get_be64(c.key[13:21]))
+			_put_be64(c.key[13:21], u64(off + (c.b - c.foff)))
+			_put(p, c.key[:], _stale_val(c.b, c.end - c.b), false) or_return
+		}
 	}
 	return .None
+}
+
+@(private)
+_stale_val :: proc(foff, ln: i64) -> []u8 {
+	vb := make([]u8, 20, context.temp_allocator)
+	n := prim.put_uvarint(vb, u64(foff))
+	n += prim.put_uvarint(vb[n:], u64(ln))
+	return vb[:n]
 }
 
 @(private)

@@ -175,7 +175,20 @@ watch_fail :: proc(w: ^Win_Watch) {
 		mount_mark_git(w.m)
 	} else {
 		note_unwatched(w.m, "")
-		mount_mark_rescan(w.m)
+		watch_lost(w.m)
+	}
+}
+
+@(private)
+watch_lost :: proc(m: ^Mount) {
+	mount_mark_rescan(m)
+	ready := false
+	for &f in m.fences {
+		f.arrived = true
+		ready ||= fence_ready(f)
+	}
+	if ready {
+		mount_schedule(m, 0)
 	}
 }
 
@@ -199,7 +212,7 @@ watch_done :: proc(l: ^prim.Loop, wt: prim.Watch, op: ^prim.Overlapped_Op, bytes
 		if w.git {
 			mount_mark_git(w.m)
 		} else {
-			mount_mark_rescan(w.m)
+			watch_lost(w.m)
 		}
 		return
 	}

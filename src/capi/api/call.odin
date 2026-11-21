@@ -360,7 +360,7 @@ ready :: proc(c: ^Call) -> eng.Ready {
 		return {}
 	}
 	c.waiting = true
-	return eng.Ready{data = c, call = _on_ready}
+	return eng.Ready{data = c, call = _on_ready, fresh = true}
 }
 
 done :: proc(c: ^Call) -> eng.Done {

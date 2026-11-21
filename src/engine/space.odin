@@ -71,6 +71,7 @@ Held :: struct {
 }
 
 space_create :: proc(e: ^Engine, name: string, relay := "", relay_public: osync.Public_Key = {}, mode := osync.Encryption_Mode.End_To_End) -> (id: prim.Id, err: Error) {
+	context = context_for(e)
 	s, serr := osync.space_new(e.cfg.random)
 	if serr != .None {
 		return {}, _serr(serr)
@@ -80,10 +81,12 @@ space_create :: proc(e: ^Engine, name: string, relay := "", relay_public: osync.
 }
 
 space_join :: proc(e: ^Engine, secret: osync.Secret, name := "", relay := "", relay_public: osync.Public_Key = {}, mode := osync.Encryption_Mode.End_To_End) -> (id: prim.Id, err: Error) {
+	context = context_for(e)
 	return _space_add(e, secret, name, relay, relay_public, mode)
 }
 
 space_join_pairing :: proc(e: ^Engine, code: string, name := "") -> (id: prim.Id, err: Error) {
+	context = context_for(e)
 	p, perr := osync.pairing_decode(code)
 	if perr != .None {
 		return {}, _serr(perr)
@@ -93,6 +96,7 @@ space_join_pairing :: proc(e: ^Engine, code: string, name := "") -> (id: prim.Id
 }
 
 space_pairing :: proc(e: ^Engine, id: prim.Id, allocator := context.allocator) -> (code: string, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, id) or_return
 	if sp.keyless {
 		return "", .Permission
@@ -107,6 +111,7 @@ space_pairing :: proc(e: ^Engine, id: prim.Id, allocator := context.allocator) -
 }
 
 space_secret :: proc(e: ^Engine, id: prim.Id) -> (secret: osync.Secret, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, id) or_return
 	if sp.keyless {
 		return {}, .Permission
@@ -115,11 +120,13 @@ space_secret :: proc(e: ^Engine, id: prim.Id) -> (secret: osync.Secret, err: Err
 }
 
 space_open :: proc(e: ^Engine, id: prim.Id) -> Error {
+	context = context_for(e)
 	_, err := _space_open(e, id)
 	return err
 }
 
 space_close :: proc(e: ^Engine, id: prim.Id) {
+	context = context_for(e)
 	sp, ok := e.spaces[id]
 	if !ok || !sp.open {
 		return
@@ -128,6 +135,7 @@ space_close :: proc(e: ^Engine, id: prim.Id) {
 }
 
 space_set_relay :: proc(e: ^Engine, id: prim.Id, relay: string, relay_public: osync.Public_Key) -> Error {
+	context = context_for(e)
 	sp, ok := e.spaces[id]
 	if !ok {
 		return .Not_Found
@@ -148,6 +156,7 @@ space_set_relay :: proc(e: ^Engine, id: prim.Id, relay: string, relay_public: os
 }
 
 space_info :: proc(e: ^Engine, id: prim.Id) -> (info: Space_Info, err: Error) {
+	context = context_for(e)
 	sp, ok := e.spaces[id]
 	if !ok {
 		return info, .Not_Found
@@ -156,6 +165,7 @@ space_info :: proc(e: ^Engine, id: prim.Id) -> (info: Space_Info, err: Error) {
 }
 
 space_list :: proc(e: ^Engine, allocator := context.allocator) -> []Space_Info {
+	context = context_for(e)
 	out := make([dynamic]Space_Info, 0, len(e.spaces), allocator)
 	for id in _sorted_keys(e.spaces) {
 		append(&out, _space_info(e.spaces[id]))
@@ -164,6 +174,7 @@ space_list :: proc(e: ^Engine, allocator := context.allocator) -> []Space_Info {
 }
 
 space_catalog :: proc(e: ^Engine, id: prim.Id) -> Object {
+	context = context_for(e)
 	return Object{id, _catalog_id(id)}
 }
 

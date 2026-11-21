@@ -21,6 +21,7 @@ Share :: struct {
 }
 
 object_key :: proc(e: ^Engine, o: Object) -> (key: osync.Content_Key, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, o.space) or_return
 	if g, ok := _grant_get(e, sp, o.id); ok {
 		return g, .None
@@ -34,6 +35,7 @@ object_key :: proc(e: ^Engine, o: Object) -> (key: osync.Content_Key, err: Error
 }
 
 share_object :: proc(e: ^Engine, o: Object, recipient: osync.Identity, access := Access_Set{.Read, .Write}) -> (s: Share, err: Error) {
+	context = context_for(e)
 	key := object_key(e, o) or_return
 	defer crypto.zero_explicit(&key, size_of(key))
 	rec, found := _rec_get(e, o.id) or_return
@@ -73,6 +75,7 @@ share_object :: proc(e: ^Engine, o: Object, recipient: osync.Identity, access :=
 }
 
 accept_share :: proc(e: ^Engine, share: Share) -> Error {
+	context = context_for(e)
 	s := share
 	sp, ok := e.spaces[s.space]
 	if !ok {
@@ -155,6 +158,7 @@ _grants_load :: proc(e: ^Engine, sp: ^Space) {
 }
 
 space_join_shared :: proc(e: ^Engine, space: prim.Id, name := "", relay := "", relay_public: osync.Public_Key = {}) -> Error {
+	context = context_for(e)
 	if _, ok := e.spaces[space]; ok {
 		return .Exists
 	}

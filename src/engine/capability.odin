@@ -40,6 +40,7 @@ CAPABILITY_LEN :: 1 + 16 * 3 + 1 + 1 + 8 + 32 + 32 + 64
 CAP_CREDENTIAL_LEN :: 1 + CAPABILITY_LEN + 32 + 64
 
 capability_issue :: proc(e: ^Engine, c: Capability, allocator := context.allocator) -> (token: []u8, err: Error) {
+	context = context_for(e)
 	sp := _space_open(e, c.space) or_return
 	if sp.keyless {
 		return nil, .Permission

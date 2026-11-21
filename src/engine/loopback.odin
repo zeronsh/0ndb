@@ -69,6 +69,7 @@ hub_transport :: proc(h: ^Hub) -> Transport {
 }
 
 on_wake :: proc(e: ^Engine, call: proc(e: ^Engine, data: rawptr), data: rawptr) {
+	context = context_for(e)
 	append(&e.wake_hooks, Posted{call, data})
 }
 
@@ -263,6 +264,9 @@ _hub_engine_drain :: proc(e: ^Engine, data: rawptr) {
 @(private)
 _loopback_drain :: proc(e: ^Engine) {
 	for hk in e.wake_hooks {
-		hk.call(e, hk.data)
+		{
+			context = _outer(e)
+			hk.call(e, hk.data)
+		}
 	}
 }

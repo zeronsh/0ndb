@@ -540,6 +540,56 @@ token queries with filters, vectors (an `Embedder` plug; an on-disk
 quantized index), and `wrote:PATH#Lx-Ly` through authorship spans. Redacted
 content is purged from every index.
 
+Indexes are never durable ahead of their sources: a flush that would persist
+a source position past that source's durable end is deferred, and on open an
+index whose recorded position is beyond a source's durable end is rebuilt.
+Dictionaries and codebooks record the documents they were trained on and
+retrain when any of them is deleted.
+
+**Cross-device search.** Partial replication means a device can only index
+what it holds, so search reaches across devices:
+
+- *Full indexers.* A device can keep a full index of a space (opt-in per
+  device and per space; on by default for CLI daemons and runners, off for
+  embedders). It walks the space catalog and every catalog change, keeps a
+  persistent queue of objects to index, and fetches their segments through
+  the ordinary replicator, conversations and titles first, file trees only
+  when configured. Nothing per object stays in memory between events and
+  nothing wakes it at rest. It advertises itself in the space's
+  `0ndb:indexers` map: its card (for encryption) and its coverage.
+- *Peer query.* A requester sends one end-to-end encrypted query (an
+  ephemeral X25519 key against the indexer's card, so only that device can
+  read it) through the relay's direct-message path to an online indexer and
+  gets one reply: refs only, `(object, record ref, part, score, hlc, match
+  spans)`, a cursor, and a freshness vector, never content. The request
+  carries the requester's card and a signature, plus a proof derived from
+  the space secret when the requester is a member; a non-member is answered
+  only from objects it participates in.
+- *Verification.* The requester fetches every hit itself through normal
+  paged reads, verifying chains and decrypting with its own keys, re-checks
+  that the record matches the query, and builds snippets locally. An indexer
+  can hide results; it cannot inject, alter or leak them.
+- *Freshness and merge.* The reply carries, per hit source, the indexer's
+  indexed high-water mark and the number of objects it has queued. Local and
+  peer results merge deterministically (score, then recency, then object
+  and ref), deduplicated by `(object, ref)`, and every result says which
+  sources answered, which were partial, and by how much.
+- *Availability.* Indexers come and go. A query in flight is re-sent to
+  another indexer the moment presence reports its indexer down or the relay
+  reports it undeliverable, and hedged to a second indexer after a short
+  deadline; the first answer wins. With no indexer online the local results
+  return at once, marked partial, and the engine emits `Indexer_Wanted` so a
+  host can start one. Timers exist only while a query is in flight.
+- *Snapshots.* An indexer checkpoints its index as an ordinary encrypted
+  object of the space: each immutable index segment once, then a small
+  manifest naming the live segments and their exact per-source coverage.
+  Snapshots are incremental and taken only at settle. A fresh indexer
+  restores the newest manifest and catches up from there. Redaction
+  supersedes the manifest and zero-fills and punctures the segments that
+  covered the redacted record. Only space members can read a snapshot.
+- *Plug.* `Search_Remote` routes peer queries to an embedder's own hosted
+  indexer instead of the relay path; its answers are verified the same way.
+
 ## agent
 
 Harness drivers are sans-IO state machines with steering, rewind, attachments,
@@ -560,6 +610,11 @@ checkpoint bundles, as before, plus:
   cares about; ten million objects cost nothing until touched.
 - Partial replication is the default: a participant holds exactly the
   objects (and ranges) it has used.
+- **Direct messages.** A participant can send an opaque frame to another
+  participant of the same space by device id. The relay delivers it to one
+  live connection of that device or answers `Undelivered` at once; it keeps
+  no state beyond delivery and cannot read the payload, which the endpoints
+  encrypt end to end. Cross-device search is its only user.
 
 ## engine
 
@@ -568,8 +623,9 @@ orchestration, attribution, recording and change events, over the plug
 points `Vfs`, `Keyring`, `Credentials`, `Transport`, `Authorizer`,
 `Relay_Storage`, `Scheduler`, `Spawner`, `Write_Observer`, `Secrets`,
 `Model`, `Http`, `Tools`, `Channels`, `Embedder`, `Providers`, `Clock`,
-`Log`. Any engine instance can be a runner. Several engines can share a
-process to use several cores, each owning a shard of objects.
+`Log`, `Search_Remote`. Any engine instance can be a runner or a full
+indexer. Several engines can share a process to use several cores, each
+owning a shard of objects.
 
 ## capi
 

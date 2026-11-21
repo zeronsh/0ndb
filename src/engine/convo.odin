@@ -23,6 +23,7 @@ Convo_Status :: struct {
 }
 
 convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}) -> (o: Object, err: Error) {
+	context = context_for(e)
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_create_writer(h, settings) or_return
@@ -31,11 +32,13 @@ convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}) 
 }
 
 convo_open :: proc(e: ^Engine, o: Object) -> Error {
+	context = context_for(e)
 	_, err := _handle_get(e, o, .Conversation)
 	return err
 }
 
 convo_writer :: proc(e: ^Engine, o: Object) -> (w: ^convo.Writer, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_create_writer(h) or_return
 	_handle_mark(h)
@@ -43,37 +46,42 @@ convo_writer :: proc(e: ^Engine, o: Object) -> (w: ^convo.Writer, err: Error) {
 }
 
 convo_view :: proc(e: ^Engine, o: Object) -> (v: ^obj.View, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	return &h.view, .None
 }
 
 touched :: proc(e: ^Engine, o: Object) {
+	context = context_for(e)
 	if h, ok := e.handles[o.id]; ok {
 		_handle_mark(h)
 	}
 }
 
 pin :: proc(e: ^Engine, o: Object) {
+	context = context_for(e)
 	if h, ok := e.handles[o.id]; ok {
 		h.pins += 1
 	}
 }
 
 unpin :: proc(e: ^Engine, o: Object) {
+	context = context_for(e)
 	if h, ok := e.handles[o.id]; ok && h.pins > 0 {
 		h.pins -= 1
 	}
 }
 
 convo_status :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (st: Convo_Status, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
 	if terr != .None {
 		return st, _pending_result(e, h, _oerr(terr), ready)
 	}
-	if _handle_waiting(h) && ready.call != nil {
+	if _handle_waiting(h, ready.fresh) && ready.call != nil {
 		return _status_of(&h.view, &t), _wait(e, h, ready)
 	}
 	return _status_of(&h.view, &t), .None
@@ -98,9 +106,10 @@ _status_of :: proc(v: ^obj.View, t: ^convo.Tail) -> Convo_Status {
 }
 
 convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32, allocator := context.allocator, ready: Ready = {}, dir := convo.Direction.Older, leaf := Rid{}) -> (p: convo.Page, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
-	if _handle_waiting(h) && ready.call != nil && len(h.view.segs) == 0 {
+	if _handle_waiting(h, ready.fresh) && ready.call != nil && len(h.view.segs) == 0 {
 		return p, _wait(e, h, ready)
 	}
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
@@ -114,13 +123,14 @@ convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32
 	if perr != .None {
 		return pg, _pending_result(e, h, _oerr(perr), ready)
 	}
-	if _handle_waiting(h) && ready.call != nil {
+	if _handle_waiting(h, ready.fresh) && ready.call != nil {
 		return pg, _wait(e, h, ready)
 	}
 	return pg, .None
 }
 
 convo_window :: proc(e: ^Engine, o: Object, anchor: Rid, before: int, after: int, leaf := Rid{}, allocator := context.allocator, ready: Ready = {}) -> (w: convo.Window, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
@@ -131,13 +141,14 @@ convo_window :: proc(e: ^Engine, o: Object, anchor: Rid, before: int, after: int
 	if werr != .None {
 		return win, _pending_result(e, h, _oerr(werr), ready)
 	}
-	if _handle_waiting(h) && ready.call != nil {
+	if _handle_waiting(h, ready.fresh) && ready.call != nil {
 		return win, _wait(e, h, ready)
 	}
 	return win, .None
 }
 
 convo_peek_switch :: proc(e: ^Engine, o: Object, sibling: Rid, before: int, after: int, allocator := context.allocator, ready: Ready = {}) -> (leaf: Rid, w: convo.Window, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
@@ -152,6 +163,7 @@ convo_peek_switch :: proc(e: ^Engine, o: Object, sibling: Rid, before: int, afte
 }
 
 convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := context.allocator, ready: Ready = {}) -> (m: convo.Message, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
@@ -166,6 +178,7 @@ convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := c
 }
 
 convo_siblings :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.allocator, ready: Ready = {}) -> (list: []Rid, at: int, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
@@ -180,6 +193,7 @@ convo_siblings :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.all
 }
 
 convo_intents :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (items: []convo.Intent, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	it, ierr := convo.intents(&h.view, allocator)
@@ -190,6 +204,7 @@ convo_intents :: proc(e: ^Engine, o: Object, allocator := context.allocator, rea
 }
 
 convo_mounts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.Mount_Entry, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	m, merr := convo.mounts(&h.view, allocator)
@@ -206,6 +221,7 @@ convo_mounts :: proc(e: ^Engine, o: Object, allocator := context.allocator, read
 }
 
 convo_files_at :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.File_Delta, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	f, ferr := convo.files_at(&h.view, msg, allocator)
@@ -216,6 +232,7 @@ convo_files_at :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.all
 }
 
 convo_compactions :: proc(e: ^Engine, o: Object, floor: prim.Hlc = 0, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.Compaction, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	c, cerr := convo.compactions(&h.view, floor, allocator)
@@ -226,6 +243,7 @@ convo_compactions :: proc(e: ^Engine, o: Object, floor: prim.Hlc = 0, allocator 
 }
 
 convo_unsealed :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.Unsealed, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	u, uerr := convo.unsealed(&h.view, allocator)
@@ -236,6 +254,7 @@ convo_unsealed :: proc(e: ^Engine, o: Object, allocator := context.allocator, re
 }
 
 convo_settings :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (s: Convo_Settings, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	best := -1

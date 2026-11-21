@@ -31,6 +31,8 @@ Event_Kind :: enum u8 {
 	Forgotten,
 	Probed,
 	Presence,
+	Direct,
+	Undelivered,
 }
 
 Event :: struct {
@@ -766,6 +768,8 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		_await_done(c, ev.id)
 		ev.at = get_i64(&r)
 		ev.length = get_i64(&r)
+	case .Directed, .Undelivered:
+		return _client_direct_event(it, handler, user)
 	case .Presence:
 		flags := prim.read_u8(&r)
 		n := int(prim.read_u16le(&r))

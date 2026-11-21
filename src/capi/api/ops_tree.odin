@@ -128,7 +128,12 @@ op_tree_sync :: proc(c: ^Call, o: ^Out) -> Status {
 	if m == nil {
 		return .Not_Found
 	}
-	if err := fs.mount_sync(m.mount); err != .None {
+	serr: fs.Error
+	{
+		context = eng.context_for(c.api.e)
+		serr = fs.mount_sync(m.mount)
+	}
+	if serr != .None {
 		return .Io
 	}
 	eng.touched(c.api.e, m.object)
@@ -180,6 +185,7 @@ op_tree_blame :: proc(c: ^Call, o: ^Out) -> Status {
 	ob := a_object(c, "object")
 	path := a_str(c, "path")
 	if m := mount_find(c.api, ob, ""); m != nil {
+		context = eng.context_for(c.api.e)
 		fs.mount_sync(m.mount)
 	}
 	hist, err := eng.tree_history(c.api.e, ob)
@@ -195,12 +201,17 @@ op_tree_blame :: proc(c: ^Call, o: ^Out) -> Status {
 	if !found {
 		return .Not_Found
 	}
-	f, ferr := fs.history_file(hist, id)
-	if ferr != .None {
-		return .Io
+	data: []u8
+	spans: []crdt.Author_Span
+	{
+		context = eng.context_for(c.api.e)
+		f, ferr := fs.history_file(hist, id)
+		if ferr != .None {
+			return .Io
+		}
+		data = crdt.text_bytes(&f.text, context.temp_allocator)
+		spans = crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
 	}
-	data := crdt.text_bytes(&f.text, context.temp_allocator)
-	spans := crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
 	emit_spans(o, data, spans)
 	return .Ok
 }

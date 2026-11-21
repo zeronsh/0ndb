@@ -436,6 +436,7 @@ _content_retry :: proc(e: ^Engine, w: ^Content_Wait) {
 	}
 	w.timer = prim.timer(e.loop, delay, w, proc(l: ^prim.Loop, data: rawptr) {
 		w := (^Content_Wait)(data)
+		context = context_for(w.e)
 		w.timer = 0
 		if !_content_request(w.e, w) {
 			_content_retry(w.e, w)

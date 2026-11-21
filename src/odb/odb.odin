@@ -327,7 +327,7 @@ add_dir :: proc(db: ^Odb, path: string, extra: bool, depth: int) {
 		}
 		target: string
 		cerr: Error
-		if prim.is_abs(l) {
+		if _rooted(l) {
 			target, cerr = clean(l, db.allocator)
 		} else {
 			joined := join3(path, "/", l, db.allocator) or_continue
@@ -405,7 +405,7 @@ git_dir_at :: proc(vfs: prim.Vfs, dir: string, allocator: runtime.Allocator) -> 
 	}
 	resolved: string
 	cerr: Error
-	if prim.is_abs(target) {
+	if _rooted(target) {
 		resolved, cerr = clean(target, allocator)
 	} else {
 		joined := join3(dir, "/", target, allocator) or_else ""
@@ -453,7 +453,7 @@ resolve_common_dir :: proc(vfs: prim.Vfs, git_dir: string, allocator: runtime.Al
 	if len(target) == 0 {
 		return clean(git_dir, allocator)
 	}
-	if prim.is_abs(target) {
+	if _rooted(target) {
 		return clean(target, allocator)
 	}
 	joined := join3(git_dir, "/", target, allocator) or_return
@@ -471,10 +471,15 @@ parent_dir :: proc(path: string) -> string {
 }
 
 @(private)
+_rooted :: proc "contextless" (p: string) -> bool {
+	return prim.is_abs(p) || (len(p) > 0 && (p[0] == '/' || p[0] == '\\'))
+}
+
+@(private)
 clean :: proc(path: string, allocator: runtime.Allocator) -> (cleaned: string, err: Error) {
 	p := path
 	abs: string
-	if !prim.is_abs(p) {
+	if !_rooted(p) {
 		cwd, werr := os.get_working_directory(allocator)
 		if werr != nil {
 			return "", .Io
@@ -486,19 +491,91 @@ clean :: proc(path: string, allocator: runtime.Allocator) -> (cleaned: string, e
 	defer if abs != "" {
 		delete(abs, allocator)
 	}
-	out, cerr := os.clean_path(p, allocator)
-	if cerr != nil {
+	when ODIN_OS == .Windows {
+		return _clean_lexical(p, allocator)
+	} else {
+		out, cerr := os.clean_path(p, allocator)
+		if cerr != nil {
+			return "", .Out_Of_Memory
+		}
+		return out, .None
+	}
+}
+
+@(private)
+_clean_lexical :: proc(path: string, allocator: runtime.Allocator) -> (string, Error) {
+	b := make([dynamic]u8, 0, len(path) + 1, allocator)
+	if b == nil && len(path) > 0 {
 		return "", .Out_Of_Memory
 	}
-	when ODIN_OS == .Windows {
-		b := transmute([]u8)out
-		for i in 0 ..< len(b) {
-			if b[i] == '\\' {
-				b[i] = '/'
+	sep :: proc "contextless" (c: u8) -> bool {
+		return c == '/' || c == '\\'
+	}
+	i := 0
+	if len(path) >= 2 && sep(path[0]) && sep(path[1]) {
+		append(&b, '/', '/')
+		i = 2
+		for parts := 0; parts < 2 && i < len(path); parts += 1 {
+			for i < len(path) && sep(path[i]) {
+				i += 1
+			}
+			for i < len(path) && !sep(path[i]) {
+				append(&b, path[i])
+				i += 1
+			}
+			append(&b, '/')
+		}
+	} else if len(path) >= 2 && path[1] == ':' {
+		append(&b, path[0], ':')
+		i = 2
+		if i < len(path) && sep(path[i]) {
+			append(&b, '/')
+		}
+	} else if len(path) > 0 && sep(path[0]) {
+		append(&b, '/')
+	}
+	root := len(b)
+	for i < len(path) {
+		for i < len(path) && sep(path[i]) {
+			i += 1
+		}
+		j := i
+		for j < len(path) && !sep(path[j]) {
+			j += 1
+		}
+		comp := path[i:j]
+		i = j
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			k := len(b)
+			for k > root && b[k - 1] == '/' {
+				k -= 1
+			}
+			if k > root {
+				for k > root && b[k - 1] != '/' {
+					k -= 1
+				}
+				resize(&b, k)
+				continue
+			}
+			if root > 0 {
+				continue
 			}
 		}
+		if len(b) > root && b[len(b) - 1] != '/' {
+			append(&b, '/')
+		}
+		append(&b, ..transmute([]u8)comp)
 	}
-	return out, .None
+	for len(b) > root && b[len(b) - 1] == '/' {
+		resize(&b, len(b) - 1)
+	}
+	if len(b) == 0 {
+		append(&b, '.')
+	}
+	return string(b[:]), .None
 }
 
 @(private)

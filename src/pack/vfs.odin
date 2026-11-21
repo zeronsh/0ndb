@@ -436,7 +436,7 @@ _symlink_target :: proc(p: ^Pack, path: string, inum: u64) -> (target: string, t
 		return "", .Io
 	}
 	t := string(ino.target[:ino.tlen])
-	if prim.is_abs(t) {
+	if prim.is_abs(t) || (len(t) > 0 && (t[0] == '/' || t[0] == '\\')) {
 		out := make([]u8, len(t), context.temp_allocator)
 		copy(out, t)
 		return string(out), .None
@@ -699,10 +699,6 @@ _v_punch_hole :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> Error {
 			if e := prim.zero_range(p.base, oi.real_fd, off, n); e != .None {
 				return _poison(p, e)
 			}
-		}
-		if e := _sync(p, oi.real_fd); e != .None {
-			_suspect_record(p, []u64{oi.inum})
-			return _poison(p, e)
 		}
 		if !oi.ino.stale {
 			return .None

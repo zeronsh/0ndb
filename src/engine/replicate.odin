@@ -24,7 +24,10 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 	}
 	creds_ok := false
 	if e.cfg.credentials.produce != nil {
-		cfg.credentials, creds_ok = e.cfg.credentials.produce(e.cfg.credentials.data, sp.id)
+		{
+			context = _outer(e)
+			cfg.credentials, creds_ok = e.cfg.credentials.produce(e.cfg.credentials.data, sp.id)
+		}
 	}
 	if !creds_ok {
 		if sp.keyless {
@@ -46,7 +49,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		sp.link = Link(len(e.links))
 	}
 	if e.cfg.transport.open != nil {
-		conn, err := e.cfg.transport.open(e.cfg.transport.data, e, sp.link, Peer{space = sp.id, relay = sp.relay, relay_public = sp.relay_public})
+		conn, err := _transport_open(e, sp)
 		if err != .None {
 			_log(e, .Warn, "transport open failed")
 			_link_schedule(e, sp)
@@ -78,7 +81,10 @@ _repl_stop :: proc(e: ^Engine, sp: ^Space) {
 		return
 	}
 	if sp.conn != nil && e.cfg.transport.close != nil {
-		e.cfg.transport.close(e.cfg.transport.data, sp.conn)
+		{
+			context = _outer(e)
+			e.cfg.transport.close(e.cfg.transport.data, sp.conn)
+		}
 	}
 	sp.conn = nil
 	if sp.reopen != 0 {
@@ -97,6 +103,7 @@ _repl_stop :: proc(e: ^Engine, sp: ^Space) {
 }
 
 link_up :: proc(e: ^Engine, link: Link, binding: []u8 = nil) -> Error {
+	context = context_for(e)
 	sp := _link_space(e, link)
 	if sp == nil {
 		return .Closed
@@ -108,6 +115,7 @@ link_up :: proc(e: ^Engine, link: Link, binding: []u8 = nil) -> Error {
 }
 
 link_input :: proc(e: ^Engine, link: Link, data: []u8) -> Error {
+	context = context_for(e)
 	sp := _link_space(e, link)
 	if sp == nil {
 		return .Closed
@@ -118,6 +126,7 @@ link_input :: proc(e: ^Engine, link: Link, data: []u8) -> Error {
 }
 
 link_writable :: proc(e: ^Engine, link: Link) {
+	context = context_for(e)
 	if sp := _link_space(e, link); sp != nil {
 		osync.replicator_writable(&sp.repl)
 		_touch(e)
@@ -125,6 +134,7 @@ link_writable :: proc(e: ^Engine, link: Link) {
 }
 
 link_down :: proc(e: ^Engine, link: Link) {
+	context = context_for(e)
 	if sp := _link_space(e, link); sp != nil {
 		osync.replicator_link_down(&sp.repl)
 		sp.connected = false
@@ -154,11 +164,12 @@ _link_schedule :: proc(e: ^Engine, sp: ^Space) {
 _link_reopen :: proc(l: ^prim.Loop, data: rawptr) {
 	sp := (^Space)(data)
 	e := sp.e
+	context = context_for(e)
 	sp.reopen = 0
 	if e.closing || !sp.repl_on || sp.conn != nil {
 		return
 	}
-	conn, err := e.cfg.transport.open(e.cfg.transport.data, e, sp.link, Peer{space = sp.id, relay = sp.relay, relay_public = sp.relay_public})
+	conn, err := _transport_open(e, sp)
 	if err != .None {
 		_link_schedule(e, sp)
 		return
@@ -185,7 +196,7 @@ _link_send :: proc(data: rawptr, bytes: []u8) -> (int, osync.Error) {
 	if e.cfg.transport.send == nil || sp.conn == nil {
 		return 0, .Closed
 	}
-	n, err := e.cfg.transport.send(e.cfg.transport.data, sp.conn, bytes)
+	n, err := _transport_send(e, sp, bytes)
 	#partial switch err {
 	case .None:
 		return n, .None
@@ -200,7 +211,10 @@ _link_close :: proc(data: rawptr) {
 	sp := (^Space)(data)
 	e := sp.e
 	if sp.conn != nil && e.cfg.transport.close != nil {
-		e.cfg.transport.close(e.cfg.transport.data, sp.conn)
+		{
+			context = _outer(e)
+			e.cfg.transport.close(e.cfg.transport.data, sp.conn)
+		}
 	}
 	sp.conn = nil
 	sp.connected = false
@@ -258,6 +272,7 @@ Need :: struct {
 _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	sp := (^Space)(user)
 	e := sp.e
+	context = context_for(e)
 	#partial switch ev.kind {
 	case .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed:
 		_content_on_event(e, sp, ev)
@@ -333,6 +348,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_relay_redact_resend(e, sp)
 	case .Disconnected:
 		sp.connected = false
+		_probes_settle(e, sp)
 		_emit(e, Event{kind = .Disconnected, space = sp.id, err = _serr(ev.err)})
 	case .Uploaded:
 		_own_tree_uploaded(e, ev.stream, ev.length)
@@ -363,12 +379,14 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 	case .Quarantined:
 		obj_id, _, _ := _object_of_name(ev.name)
 		_emit(e, Event{kind = .Quarantined, space = sp.id, object = obj_id, device = ev.device, length = ev.from})
+		_probes_settle(e, sp, obj_id)
 		_object_changed(e, sp.id, obj_id, .Quarantined)
 	case .Refused:
 		_emit(e, Event{kind = .Refused, space = sp.id, device = ev.device, err = _serr(ev.err)})
 	case .Fatal:
 		obj_id, _, _ := _object_of_name(ev.name)
 		_emit(e, Event{kind = .Fatal, space = sp.id, object = obj_id, err = _serr(ev.err), length = ev.length})
+		_probes_settle(e, sp, obj_id)
 	case .Redacted:
 		_relay_redacted_event(e, sp, ev.stream, ev.from, ev.to)
 	case .Local_Redacted:
@@ -384,6 +402,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 }
 
 space_caught_up :: proc(e: ^Engine, space: prim.Id) -> bool {
+	context = context_for(e)
 	sp, ok := e.spaces[space]
 	if !ok || !sp.repl_on || !sp.connected {
 		return false
@@ -392,6 +411,7 @@ space_caught_up :: proc(e: ^Engine, space: prim.Id) -> bool {
 }
 
 presence :: proc(e: ^Engine, space: prim.Id, device: prim.Id) -> (up: bool, since: i64, known: bool) {
+	context = context_for(e)
 	sp, ok := e.spaces[space]
 	if !ok || !sp.repl_on || !sp.connected {
 		return false, 0, false
@@ -561,4 +581,16 @@ _verify :: proc(user: rawptr, req: ^osync.Verify_Request) -> osync.Verdict {
 		_held_add(e, sp, req.device, req.name)
 	}
 	return verdict
+}
+
+@(private)
+_transport_open :: proc(e: ^Engine, sp: ^Space) -> (rawptr, Error) {
+	context = _outer(e)
+	return e.cfg.transport.open(e.cfg.transport.data, e, sp.link, Peer{space = sp.id, relay = sp.relay, relay_public = sp.relay_public})
+}
+
+@(private)
+_transport_send :: proc(e: ^Engine, sp: ^Space, bytes: []u8) -> (int, Error) {
+	context = _outer(e)
+	return e.cfg.transport.send(e.cfg.transport.data, sp.conn, bytes)
 }

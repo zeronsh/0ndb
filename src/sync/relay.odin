@@ -1237,6 +1237,8 @@ _handle :: proc(c: ^Conn, it: ^Item) {
 			_on_forget(c, &rd)
 		case .Probe:
 			_on_probe(c, &rd)
+		case .Direct:
+			_on_direct(c, &rd)
 		case:
 			_fail(c, .Protocol)
 		}
@@ -2005,7 +2007,7 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_len(c, op.reply, op.id, op.len)
 		case .Stored:
 			_reply_id(c, .Stored, op.id)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence:
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered:
 		}
 	case .Append:
 		st := op.stream

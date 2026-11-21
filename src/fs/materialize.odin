@@ -578,7 +578,13 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 			return from_prim(oerr)
 		}
 		sink := Fd_Sink{m.vfs, fd, 0, .None}
-		_, _, serr := odb.stream(m.db, odb.Oid(reg.oid), io.Stream{procedure = fd_sink_proc, data = &sink})
+		out := io.Stream{procedure = fd_sink_proc, data = &sink}
+		smudge: Smudge_Sink
+		if eol_smudge_large(m, it.path, odb.Oid(reg.oid)) {
+			smudge = Smudge_Sink{inner = out, buf = make([]u8, 1 << 16, context.temp_allocator)}
+			out = io.Stream{procedure = smudge_sink_proc, data = &smudge}
+		}
+		_, _, serr := odb.stream(m.db, odb.Oid(reg.oid), out)
 		prim.fchmod(m.vfs, fd, mode)
 		prim.close_file(m.vfs, fd)
 		if serr != .None || sink.err != .None {

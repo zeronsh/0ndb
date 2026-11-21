@@ -761,6 +761,10 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		} else {
 			if stat.size > m.opts.large_limit {
 				binary = true
+				if co, csize, cok := store_large_clean(m, it.path, abs); cok {
+					oid = co
+					size = csize
+				}
 			} else if stat.size > 0 {
 				b, serr := sniff_binary(m, abs)
 				if serr != .None {
@@ -768,11 +772,13 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 				}
 				binary = b
 			}
-			o, werr := store_file(m, abs, st.packp if st.use_pack else nil, false)
-			if werr != .None {
-				return .None
+			if oid == {} {
+				o, werr := store_file(m, abs, st.packp if st.use_pack else nil, false)
+				if werr != .None {
+					return .None
+				}
+				oid = o
 			}
-			oid = o
 		}
 	}
 	if binary {
@@ -1460,11 +1466,11 @@ Probe :: struct {
 }
 
 @(private)
-probe :: proc(m: ^Mount, rel: string) -> Probe {
+probe :: proc(m: ^Mount, rel: string, listed := false) -> Probe {
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
 	st, err := prim.lstat(m.vfs, abs)
-	if err != .None || !disk_name_matches(m.vfs, abs) {
+	if err != .None || (!listed && !disk_name_matches(m.vfs, abs)) {
 		return {kind = .Missing}
 	}
 	out := Probe{kind = disk_kind(st.kind), stat = disk_stat(st)}
@@ -1480,7 +1486,7 @@ probe :: proc(m: ^Mount, rel: string) -> Probe {
 }
 
 @(private)
-collect_path :: proc(p: ^Pass, rel: string) -> Error {
+collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 	m := p.m
 	if len(rel) == 0 || path_internal(rel) || p.seen[rel] {
 		return .None
@@ -1493,7 +1499,7 @@ collect_path :: proc(p: ^Pass, rel: string) -> Error {
 			}
 		}
 	}
-	d := probe(m, rel)
+	d := probe(m, rel, listed)
 	e, found := shadow_get(&m.shadow, rel) or_return
 	if !found {
 		if d.kind == .Missing || d.kind == .Other {
@@ -1705,7 +1711,7 @@ compare_dir :: proc(p: ^Pass, rel: string) -> Error {
 				add_remove_tree(p, child, k.entry) or_return
 			}
 		} else if k.entry.kind != .Dir {
-			collect_path(p, child) or_return
+			collect_path(p, child, true) or_return
 		}
 		pass_maybe_flush(p) or_return
 	}
@@ -1839,7 +1845,7 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 	if err := prim.dir_open(m.vfs, &d, abs, heap); err != .None {
 		return .None
 	}
-	names := make(map[string]bool, heap)
+	names := make(map[string]Listed, heap)
 	defer {
 		for k in names {
 			delete(k, heap)
@@ -1854,7 +1860,7 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		if de.name == "." || de.name == ".." || name_internal(de.name) {
 			continue
 		}
-		names[clone_string(de.name, heap) or_else ""] = true
+		names[clone_string(de.name, heap) or_else ""] = Listed{kind = de.kind, has_stat = de.has_stat, size = de.size, mtime_ns = de.mtime_ns, ctime_ns = de.ctime_ns, ino = de.ino}
 	}
 	prim.dir_close(m.vfs, &d)
 	cbuf: [prim.PATH_MAX]u8
@@ -1863,13 +1869,17 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		if !ok {
 			continue
 		}
-		if !names[k.name] {
+		ls, listed := names[k.name]
+		if !listed {
 			add_remove_tree(p, child, k.entry) or_return
 			continue
 		}
 		dk, _ := delete_key(&names, k.name)
 		delete(dk, heap)
-		dp := probe(m, child)
+		if ls.has_stat && ls.kind == .File && k.entry.kind == .File && ls.size == k.entry.stat.size && ls.mtime_ns == k.entry.stat.mtime_ns && ls.ctime_ns == k.entry.stat.ctime_ns && ls.ino == k.entry.stat.ino {
+			continue
+		}
+		dp := Probe{kind = .Dir} if ls.kind == .Dir && k.entry.kind == .Dir else probe(m, child, true)
 		if k.entry.kind == .Dir && dp.kind == .Dir {
 			c, _ := clone_string(child, heap)
 			cwd, _ := watch_dir(m.reg, m, c, wd)
@@ -1879,7 +1889,7 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		} else if dp.kind == .File && k.entry.kind == .File && dp.stat == k.entry.stat {
 			continue
 		} else {
-			collect_path(p, child) or_return
+			collect_path(p, child, true) or_return
 		}
 		pass_maybe_flush(p) or_return
 	}
@@ -1895,6 +1905,16 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		pass_maybe_flush(p) or_return
 	}
 	return .None
+}
+
+@(private)
+Listed :: struct {
+	kind:     prim.File_Kind,
+	has_stat: bool,
+	size:     i64,
+	mtime_ns: i64,
+	ctime_ns: i64,
+	ino:      u64,
 }
 
 @(private)
@@ -2130,7 +2150,7 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 		}
 		inode := builder_tree(b, fstree.Op_Create{parent = parent, name = name, kind = .File, flags = flags})
 		if binary {
-			builder_content(b, inode, oid, c.stat.size)
+			builder_content(b, inode, oid, blob_size(m, data, oid, c.stat.size))
 		} else if len(m.alias) > 0 && len(data) >= MOVE_MIN {
 			emit_text_edits(m, b, inode, c.path, nil, data) or_return
 		} else if len(data) > m.opts.inline_limit {
@@ -2159,6 +2179,9 @@ read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
 	if stat.size > m.opts.large_limit {
+		if co, _, cok := store_large_clean(m, rel, abs, old, has_old); cok {
+			return nil, co, true, true, .None
+		}
 		o, werr := store_file(m, abs, nil)
 		if werr != .None {
 			return nil, {}, true, false, .None
@@ -2179,6 +2202,20 @@ read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{
 		oid = o
 	}
 	return d, oid, binary, true, .None
+}
+
+@(private)
+blob_size :: proc(m: ^Mount, data: []u8, oid: odb.Oid, disk: i64) -> i64 {
+	if data != nil {
+		return i64(len(data))
+	}
+	if !m.has_git || m.db == nil {
+		return disk
+	}
+	if _, hs, he := odb.read_header(m.db, oid); he == .None {
+		return hs
+	}
+	return disk
 }
 
 @(private)
@@ -2237,7 +2274,7 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 		if !was_binary {
 			builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Opaque}, value = {.Opaque}})
 		}
-		builder_content(b, e.inode, oid, c.stat.size)
+		builder_content(b, e.inode, oid, blob_size(m, data, oid, c.stat.size))
 		note_builder_blob(b, e.inode, oid)
 		return shadow_put(&m.shadow, path, ne)
 	}
