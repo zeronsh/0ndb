@@ -474,6 +474,36 @@ history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (ad
 		}
 		return 0, history_persist(h)
 	}
+	if body[0] == REC_ALIAS {
+		rd := prim.reader(body[1:])
+		n := prim.read_uvarint(&rd)
+		if n > u64(len(body)) {
+			return 0, .Corrupt
+		}
+		for _ in 0 ..< n {
+			prim.read_str(&rd)
+		}
+		commit := prim.read_str(&rd)
+		vb := prim.read_bytes(&rd)
+		if !prim.reader_ok(&rd) {
+			return 0, .Corrupt
+		}
+		key := make([]u8, 3 + len(commit), context.temp_allocator)
+		copy(key, "cv:")
+		copy(key[3:], commit)
+		kv_put(&h.kv, key, vb) or_return
+		if h.applied[si] < off + 1 {
+			h.applied[si] = off + 1
+		}
+		return 0, history_persist(h)
+	}
+	if body[0] == REC_SEAL {
+		apply_seal_record(h, si, body) or_return
+		if h.applied[si] < off + 1 {
+			h.applied[si] = off + 1
+		}
+		return 0, history_persist(h)
+	}
 	if body[0] == REC_REDACT {
 		apply_redact_record(h, body) or_return
 		if h.applied[si] < off + 1 {
@@ -694,6 +724,65 @@ history_text_spans_at :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Lv,
 		crdt.log_destroy(&tmp.log)
 	}
 	return crdt.text_bytes(&tmp.text, allocator), crdt.text_spans(&tmp.text, &h.g, allocator), .None
+}
+
+@(private)
+blob_log_add :: proc(h: ^History, inode: fstree.Inode_Id, reg: Blob_Reg) -> Error {
+	key := inode_key("fb", inode)
+	data, _ := kv_get(&h.kv, key, context.temp_allocator) or_return
+	rd := prim.reader(data)
+	for !prim.reader_done(&rd) {
+		e := read_blob_reg(&rd)
+		if !prim.reader_ok(&rd) {
+			return .Corrupt
+		}
+		if e.actor == reg.actor && e.seq == reg.seq {
+			return .None
+		}
+	}
+	buf := make([dynamic]u8, 0, len(data) + 64, context.temp_allocator)
+	append(&buf, ..data)
+	w := prim.writer(&buf)
+	prim.write_uvarint(&w, reg.lamport)
+	prim.write_id(&w, reg.actor)
+	prim.write_uvarint(&w, reg.seq)
+	oid := reg.oid
+	prim.write_raw(&w, oid[:])
+	prim.write_ivarint(&w, reg.size)
+	return kv_put(&h.kv, key, buf[:])
+}
+
+@(private)
+read_blob_reg :: proc(rd: ^prim.Reader) -> (e: Blob_Reg) {
+	e.lamport = prim.read_uvarint(rd)
+	e.actor = prim.read_id(rd)
+	e.seq = prim.read_uvarint(rd)
+	prim.read_fixed(rd, e.oid[:])
+	e.size = prim.read_ivarint(rd)
+	return
+}
+
+history_blob_at :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Lv) -> (reg: Blob_Reg, found: bool, err: Error) {
+	data, ok := kv_get(&h.kv, inode_key("fb", inode), context.temp_allocator) or_return
+	if !ok {
+		return history_blob(h, inode)
+	}
+	rd := prim.reader(data)
+	for !prim.reader_done(&rd) {
+		e := read_blob_reg(&rd)
+		if !prim.reader_ok(&rd) {
+			return {}, false, .Corrupt
+		}
+		lv, known := crdt.graph_lv(&h.g, crdt.Op_Id{e.actor, e.seq})
+		if !known || !crdt.graph_contains(&h.g, v, lv) {
+			continue
+		}
+		if !found || blob_newer(e, reg) {
+			reg = e
+			found = true
+		}
+	}
+	return reg, found, .None
 }
 
 history_blob :: proc(h: ^History, inode: fstree.Inode_Id) -> (reg: Blob_Reg, found: bool, err: Error) {
@@ -952,6 +1041,7 @@ apply_opaque :: proc(h: ^History, b: ^crdt.Batch, at: u64, lv: crdt.Lv, op: crdt
 			f.rec.has_blob = true
 			f.dirty = true
 		}
+		blob_log_add(h, inode, reg) or_return
 		note_touched(h, inode)
 		return .None
 	case TOP_GIT:
@@ -1298,6 +1388,7 @@ persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error 
 		oid, werr := odb.write(h.db, .Blob, data)
 		if werr == .None {
 			history_note_blob(h, oid)
+			history_note_file_blob(h, id, oid, crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			clear(&f.rec.cp_version)
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			clear(&f.rec.cp_spans)
@@ -1588,6 +1679,8 @@ replay_own :: proc(h: ^History) -> Error {
 			apply_redact_record(h, body) or_return
 		} else if len(body) > 0 && body[0] == REC_REPLACE {
 			apply_replace_record(h, 0, body, u64(off)) or_return
+		} else if len(body) > 0 && body[0] == REC_SEAL {
+			apply_seal_record(h, 0, body) or_return
 		} else if len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT) {
 			b, derr := crdt.batch_decode(body[1:], context.temp_allocator, &h.dict)
 			if derr != .None {
@@ -1876,4 +1969,28 @@ apply_replace_record :: proc(h: ^History, stream: u32, body: []u8, off: u64) -> 
 		}
 	}
 	return remap_ref(h, stream, old, off, inodes[:])
+}
+
+REC_ALIAS :: u8(7)
+
+history_alias :: proc(h: ^History, sources: []string, commit: string, v: Version) -> Error {
+	clear(&h.io)
+	w := prim.writer(&h.io)
+	prim.write_u8(&w, REC_ALIAS)
+	prim.write_uvarint(&w, u64(len(sources)))
+	for s in sources {
+		prim.write_str(&w, s)
+	}
+	prim.write_str(&w, commit)
+	vb := make([dynamic]u8, context.temp_allocator)
+	encode_version(&vb, v)
+	prim.write_bytes(&w, vb[:])
+	if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
+		return .Io
+	}
+	if journal.journal_commit(&h.journal) != .None {
+		return .Io
+	}
+	h.applied[0] = journal.journal_durable_len(&h.journal)
+	return .None
 }

@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "core:bytes"
+import "core:strings"
 import "core:mem/virtual"
 import "core:slice"
 import "../crdt"
@@ -126,6 +127,15 @@ builder_copy_spans :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, spans:
 		from += take
 		at = end
 	}
+}
+
+@(private)
+note_builder_blob :: proc(b: ^Builder, inode: fstree.Inode_Id, oid: odb.Oid) {
+	if b.n == 0 {
+		return
+	}
+	v := [1]crdt.Op_Id{{b.actor, b.seq0 + u64(b.n) - 1}}
+	history_note_file_blob(b.h, inode, oid, v[:])
 }
 
 @(private)
@@ -320,6 +330,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 	if !m.has_git && m.db != nil {
 		if odb.pack_begin(&st.pack, m.db) == .None {
 			st.use_pack = true
+			odb.pack_set_local(&st.pack, true)
 		}
 	}
 	defer if st.use_pack {
@@ -636,6 +647,10 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	} else if stat.size > 0 {
 		first, last := builder_insert_ref(&st.b, inode, 0, oid, int(stat.size))
 		append(&st.b.imports, Import_File{inode = inode, oid = oid, len = stat.size, first = first, last = last})
+		if !clean {
+			lv := [1]crdt.Op_Id{last}
+			history_note_file_blob(m.history, inode, oid, lv[:])
+		}
 	} else {
 		append(&st.b.imports, Import_File{inode = inode, oid = oid, len = 0, last = crdt.Op_Id{st.b.actor, inode.seq}})
 	}
@@ -665,6 +680,9 @@ import_flush :: proc(st: ^Import_State) -> Error {
 			return from_odb(err)
 		}
 		st.use_pack = odb.pack_begin(&st.pack, m.db) == .None
+		if st.use_pack {
+			odb.pack_set_local(&st.pack, true)
+		}
 	}
 	if len(st.b.imports) == 0 && st.b.n > 0 {
 		append(&st.b.imports, Import_File{inode = fstree.ROOT, len = -1})
@@ -769,6 +787,10 @@ Pass :: struct {
 	head:       Git_Head,
 	long:       runtime.Allocator,
 	chunk:      virtual.Arena,
+	held:       [dynamic]Change,
+	alias_commits: [dynamic]string,
+	held_r:     map[string]bool,
+	held_c:     map[string]bool,
 }
 
 PASS_CHUNK :: 4096
@@ -800,7 +822,14 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 		p.operation = git_operation(m.vfs, m.git)
 		p.git_wrote = (p.head_moved && (!commits_only || rewritten)) || (p.operation != "" && stamp != m.stamp)
 	}
+	if p.git_wrote {
+		collect_alias_sources(m, &p)
+	}
+	defer clear(&m.alias)
 	p.changes = make([dynamic]Change, p.long)
+	p.held = make([dynamic]Change, p.long)
+	p.held_r = make(map[string]bool, p.long)
+	p.held_c = make(map[string]bool, p.long)
 	p.seen = make(map[string]bool, p.long)
 	p.young = make([dynamic]string, p.long)
 	p.scope_of = make(map[string]^Scope, p.long)
@@ -861,6 +890,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 		encode_git_op(&buf, "commit", p.head.branch, p.head.commit)
 		builder_opaque(&b, buf[:])
 		builder_commit(m, &b) or_return
+	}
+	if m.has_git && len(p.head.commit) > 0 {
+		record_commit_version(m, p.head.commit, p.git_wrote, p.alias_commits[:]) or_return
 	}
 	if m.has_git {
 		git_head_destroy(&m.head, m.allocator)
@@ -941,16 +973,112 @@ pre_moves :: proc(p: ^Pass, keys: []string) -> Error {
 }
 
 @(private)
+collect_alias_sources :: proc(m: ^Mount, p: ^Pass) {
+	h := m.history
+	p.alias_commits = make([dynamic]string, p.long)
+	add :: proc(p: ^Pass, c: string) {
+		if len(c) == 0 {
+			return
+		}
+		for x in p.alias_commits {
+			if x == c {
+				return
+			}
+		}
+		append(&p.alias_commits, clone_string(c, p.long) or_else "")
+	}
+	add(p, m.head.commit)
+	for c in git_reflog_olds(m.vfs, m.git, m.reflog_pos, p.long) {
+		add(p, c)
+	}
+	for name in ([]string{"ORIG_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"}) {
+		if c, ok := git_special_head(m.vfs, m.git, name, p.long); ok {
+			add(p, c)
+		}
+	}
+	if m.db != nil && len(p.head.commit) > 0 {
+		if oid, _, ok := odb.oid_from_hex(p.head.commit); ok {
+			if t, data, err := odb.read(m.db, oid, context.temp_allocator); err == .None && t == .Commit {
+				if c, cerr := odb.commit_decode(data, m.db.format, context.temp_allocator); cerr == .None {
+					msg := c.message
+					marker := "(cherry picked from commit "
+					for {
+						i := strings.index(msg, marker)
+						if i < 0 {
+							break
+						}
+						rest := msg[i + len(marker):]
+						j := strings.index_byte(rest, ')')
+						if j > 0 {
+							add(p, rest[:j])
+						}
+						msg = rest
+					}
+				}
+			}
+		}
+	}
+	for c in p.alias_commits {
+		key := strings.concatenate({"cv:", c}, context.temp_allocator)
+		data, found, err := kv_get(&h.kv, transmute([]u8)key, context.temp_allocator)
+		if err != .None || !found {
+			continue
+		}
+		v, derr := decode_version(data, p.long)
+		if derr == .None {
+			append(&m.alias, v)
+		}
+	}
+}
+
+@(private)
+record_commit_version :: proc(m: ^Mount, commit: string, rewrite: bool, sources: []string) -> Error {
+	h := m.history
+	key := strings.concatenate({"cv:", commit}, context.temp_allocator)
+	if _, found := kv_get(&h.kv, transmute([]u8)key, context.temp_allocator) or_return; !found {
+		buf := make([dynamic]u8, context.temp_allocator)
+		encode_version(&buf, m.synced[:])
+		kv_put(&h.kv, transmute([]u8)key, buf[:]) or_return
+	}
+	if rewrite && len(sources) > 0 {
+		history_alias(h, sources, commit, m.synced[:]) or_return
+	}
+	return kv_commit(&h.kv)
+}
+
+@(private)
 pass_maybe_flush :: proc(p: ^Pass) -> Error {
 	if len(p.changes) < PASS_CHUNK {
 		return .None
 	}
-	return pass_flush(p)
+	return pass_flush(p, false)
+}
+
+HOLD_MAX :: 65536
+
+@(private)
+held_under :: proc(set: map[string]bool, path: string) -> bool {
+	for q := path; len(q) > 0; q = path_parent(q) {
+		if set[q] {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
-pass_flush :: proc(p: ^Pass) -> Error {
+pass_flush :: proc(p: ^Pass, final := true) -> Error {
 	m := p.m
+	if len(p.held) > 0 {
+		merged := make([dynamic]Change, 0, len(p.held) + len(p.changes), context.temp_allocator)
+		append(&merged, ..p.held[:])
+		append(&merged, ..p.changes[:])
+		clear(&p.changes)
+		append(&p.changes, ..merged[:])
+		clear(&p.held)
+		clear(&p.held_r)
+		clear(&p.held_c)
+	}
 	if len(p.changes) == 0 && !(p.git_wrote && !p.marked) {
 		return .None
 	}
@@ -966,6 +1094,30 @@ pass_flush :: proc(p: ^Pass) -> Error {
 		}
 	}
 	detect_moves(p)
+	if !final && p.full {
+		for c in p.changes {
+			if c.kind == .Remove && c.old.kind == .Dir && c.moved == "" && !c.carried && c.old.stat.ino != 0 {
+				p.held_r[clone_string(c.path, p.long) or_else ""] = true
+			} else if c.kind == .Create && c.disk == .Dir && c.moved == "" && c.stat.ino != 0 {
+				p.held_c[clone_string(c.path, p.long) or_else ""] = true
+			}
+		}
+		keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+		for c in p.changes {
+			hold := (c.kind == .Remove && held_under(p.held_r, c.path)) || held_under(p.held_c, c.path)
+			if hold && len(p.held) < HOLD_MAX {
+				h2 := c
+				h2.path = clone_string(c.path, p.long) or_else ""
+				h2.target = clone_string(c.target, p.long) or_else ""
+				h2.moved = clone_string(c.moved, p.long) or_else ""
+				append(&p.held, h2)
+			} else {
+				append(&keep, c)
+			}
+		}
+		clear(&p.changes)
+		append(&p.changes, ..keep[:])
+	}
 	if p.git_wrote {
 		b: Builder
 		builder_init(&b, m.history, m.actor)
@@ -1696,10 +1848,15 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 		inode := builder_tree(b, fstree.Op_Create{parent = parent, name = name, kind = .File, flags = flags})
 		if binary {
 			builder_content(b, inode, oid, c.stat.size)
+		} else if len(m.alias) > 0 && len(data) >= MOVE_MIN {
+			emit_text_edits(m, b, inode, c.path, nil, data) or_return
 		} else if len(data) > m.opts.inline_limit {
 			builder_insert_ref(b, inode, 0, oid, len(data))
 		} else {
 			builder_insert(b, inode, 0, data)
+		}
+		if binary || len(data) > m.opts.inline_limit {
+			note_builder_blob(b, inode, oid)
 		}
 		shadow_put(&m.shadow, c.path, Entry{inode = inode, kind = .File, stat = c.stat, oid = oid}) or_return
 	case .Missing, .Other:
@@ -1790,18 +1947,19 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 			builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Opaque}, value = {.Opaque}})
 		}
 		builder_content(b, e.inode, oid, c.stat.size)
+		note_builder_blob(b, e.inode, oid)
 		return shadow_put(&m.shadow, path, ne)
 	}
 	old := history_text_at(h, e.inode, m.synced[:], context.temp_allocator) or_return
 	if was_binary {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Opaque}, value = {}})
 	}
-	emit_text_edits(m, b, e.inode, old, data) or_return
+	emit_text_edits(m, b, e.inode, path, old, data) or_return
 	return shadow_put(&m.shadow, path, ne)
 }
 
 @(private)
-emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, full_old, full_data: []u8) -> Error {
+emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, path: string, full_old, full_data: []u8) -> Error {
 	h := m.history
 	pre := 0
 	for pre < len(full_old) && pre < len(full_data) && full_old[pre] == full_data[pre] {
@@ -1847,11 +2005,12 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, full_old
 	}
 	Win :: struct {
 		q, w0, w1: int,
+		src:       int,
 	}
 	wins := make([]Win, len(rs), context.temp_allocator)
 	any_pair := false
 	for r, i in rs {
-		wins[i] = Win{-1, 0, 0}
+		wins[i] = Win{-1, 0, 0, -1}
 		hk := hunks[i]
 		if r.a0 != r.a1 || r.b1 - r.b0 < MOVE_MIN {
 			continue
@@ -1878,9 +2037,68 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, full_old
 					}
 				}
 				if overlap * 2 >= w1 - w0 {
-					wins[i] = Win{q, w0, w1}
+					wins[i] = Win{q, w0, w1, -1}
 					any_pair = true
 					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+	}
+	Alias_Text :: struct {
+		text:  []u8,
+		spans: []crdt.Author_Span,
+	}
+	alias_texts := make([dynamic]Alias_Text, context.temp_allocator)
+	alias_loaded := false
+	for r, i in rs {
+		if wins[i].q >= 0 || len(m.alias) == 0 || r.b1 - r.b0 < MOVE_MIN {
+			continue
+		}
+		if !alias_loaded {
+			alias_loaded = true
+			for av in m.alias {
+				al := make([dynamic]crdt.Lv, context.temp_allocator)
+				if crdt.graph_version_lvs(&h.g, av, &al) != .None {
+					continue
+				}
+				snap, serr := version_snapshot(h, al[:])
+				if serr != .None {
+					continue
+				}
+				ino, found, lerr := fstree.lookup(&snap, path)
+				fstree.snapshot_destroy(&snap)
+				if lerr != nil || !found {
+					continue
+				}
+				t, sp, terr := history_text_spans_at(h, ino, al[:], context.temp_allocator)
+				if terr == .None {
+					append(&alias_texts, Alias_Text{t, sp})
+				}
+			}
+		}
+		hk := hunks[i]
+		nl := int(hk.b_len)
+		found := false
+		for front in 0 ..= min(3, nl - 1) {
+			for back in 0 ..= min(3, nl - 1 - front) {
+				w0 := int(lb.offs[int(hk.b_start) + front])
+				w1 := int(lb.offs[int(hk.b_start) + nl - back])
+				if w1 - w0 < MOVE_MIN {
+					continue
+				}
+				for at, k in alias_texts {
+					q := bytes.index(at.text, data[w0:w1])
+					if q >= 0 {
+						wins[i] = Win{q, w0, w1, k}
+						found = true
+						break
+					}
+				}
+				if found {
 					break
 				}
 			}
@@ -1900,10 +2118,14 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, full_old
 		}
 	}
 	for r, i in rs {
-		if wins[i].q >= 0 && old_spans != nil {
+		if wins[i].q >= 0 && (wins[i].src >= 0 || old_spans != nil) {
 			w := wins[i]
+			if r.a1 > r.a0 {
+				builder_delete(b, inode, pre + r.b0, r.a1 - r.a0)
+			}
+			spans := old_spans if w.src < 0 else alias_texts[w.src].spans
 			emit_insert(m, b, inode, pre + r.b0, data[r.b0:w.w0]) or_return
-			builder_copy_spans(b, inode, pre + w.w0, old_spans, w.q, w.w1 - w.w0)
+			builder_copy_spans(b, inode, pre + w.w0, spans, w.q, w.w1 - w.w0)
 			emit_insert(m, b, inode, pre + w.w1, data[w.w1:r.b1]) or_return
 			continue
 		}
@@ -1932,6 +2154,7 @@ emit_insert :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, pos: int, in
 		if werr == .None {
 			history_note_blob(m.history, sub)
 			builder_insert_ref(b, inode, pos, sub, len(ins))
+			note_builder_blob(b, inode, sub)
 			return .None
 		}
 	}

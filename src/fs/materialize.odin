@@ -267,7 +267,7 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 	mode: u32 = 0o755 if .Exec in it.flags else 0o644
 	tmp := temp_name(m, abs, context.temp_allocator)
 	if .Opaque in it.flags {
-		reg, has := history_blob(h, it.inode) or_return
+		reg, has := history_blob_at(h, it.inode, tl) or_return
 		if !has || m.db == nil {
 			return .None
 		}

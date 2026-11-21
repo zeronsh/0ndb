@@ -73,7 +73,7 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span) -> (res: Redact_Resul
 	history_persist(h) or_return
 	if h.db != nil && len(targets) > 0 {
 		rewrites, stats, rerr := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
-		if rerr != .None && rerr != .Not_Found {
+		if rerr != .None {
 			return res, from_odb(rerr)
 		}
 		res.rewrites = len(rewrites)
@@ -235,6 +235,9 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 		}
 		if secret && f.rec.has_cp && f.rec.cp_len > 0 {
 			append(targets, f.rec.cp_text)
+		}
+		if secret {
+			blob_versions_hit(h, ino, spans, targets) or_return
 		}
 		if h.db != nil {
 			data := crdt.text_bytes(&f.text, context.temp_allocator)

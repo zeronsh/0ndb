@@ -273,3 +273,53 @@ clean_path :: proc(p: string, allocator := context.allocator) -> string {
 	}
 	return strings.to_string(b)
 }
+
+git_reflog_olds :: proc(vfs: prim.Vfs, g: Git_Dirs, from: i64, allocator := context.allocator) -> []string {
+	out := make([dynamic]string, allocator)
+	p, _ := path_join(g.dir, "logs/HEAD", context.temp_allocator)
+	fd, err := prim.open_file(vfs, p)
+	if err != .None {
+		return out[:]
+	}
+	defer prim.close_file(vfs, fd)
+	size, serr := prim.file_size(vfs, fd)
+	if serr != .None || size <= from || size - from > 1 << 20 {
+		return out[:]
+	}
+	buf := make([]u8, int(size - from), context.temp_allocator)
+	got, rerr := prim.read_at(vfs, fd, buf, from)
+	if rerr != .None {
+		return out[:]
+	}
+	text := string(buf[:got])
+	for line in strings.split_lines_iterator(&text) {
+		sp := strings.index_byte(line, ' ')
+		if sp <= 0 {
+			continue
+		}
+		old := line[:sp]
+		if strings.trim_left(old, "0") == "" {
+			continue
+		}
+		c, _ := clone_string(old, allocator)
+		append(&out, c)
+	}
+	return out[:]
+}
+
+git_special_head :: proc(vfs: prim.Vfs, g: Git_Dirs, name: string, allocator := context.allocator) -> (string, bool) {
+	p, _ := path_join(g.dir, name, context.temp_allocator)
+	data, err := prim.read_file(vfs, p, context.temp_allocator)
+	if err != .None {
+		return "", false
+	}
+	s := strings.trim_space(string(data))
+	if len(s) < 40 {
+		return "", false
+	}
+	out, _ := clone_string(s[:min(len(s), 64)], allocator)
+	if i := strings.index_any(out, " \n\t"); i >= 0 {
+		out = out[:i]
+	}
+	return out, true
+}

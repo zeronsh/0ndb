@@ -205,7 +205,15 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 		if it.kind == .Symlink && it.target != ic.target {
 			builder_tree(&b, fstree.Op_Set_Target{inode = ino, target = it.target})
 		}
-		if it.kind != .File || .Opaque in it.flags {
+		if it.kind == .File && .Opaque in it.flags {
+			want_reg, has_want := history_blob_at(h, ino, tl[:]) or_return
+			cur_reg, has_cur := history_blob_at(h, ino, cl[:]) or_return
+			if has_want && (!has_cur || cur_reg.oid != want_reg.oid) {
+				builder_content(&b, ino, want_reg.oid, want_reg.size)
+			}
+			continue
+		}
+		if it.kind != .File {
 			continue
 		}
 		cur, _, cerr := history_text_spans_at(h, ino, cl[:], context.temp_allocator)

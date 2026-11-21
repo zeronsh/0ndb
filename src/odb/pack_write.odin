@@ -21,6 +21,7 @@ Pack_Builder :: struct {
 	entries:  [dynamic]Pack_Entry,
 	seen:     map[Oid]i32,
 	active:   bool,
+	local:    bool,
 }
 
 pack_begin :: proc(b: ^Pack_Builder, db: ^Odb) -> Error {
@@ -80,7 +81,11 @@ pack_contains :: proc(b: ^Pack_Builder, oid: Oid) -> bool {
 
 @(private)
 pack_has :: proc(b: ^Pack_Builder, oid: Oid) -> bool {
-	return oid in b.seen || exists_for_write(b.db, oid)
+	return oid in b.seen || (!b.local && exists_for_write(b.db, oid))
+}
+
+pack_set_local :: proc(b: ^Pack_Builder, local: bool) {
+	b.local = local
 }
 
 @(private)

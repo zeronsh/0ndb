@@ -3,6 +3,7 @@ package fs
 import "base:runtime"
 import "core:mem/virtual"
 import "core:strings"
+import "../crdt"
 import "../fstree"
 import "../odb"
 import "../prim"
@@ -144,9 +145,15 @@ mount_commit :: proc(m: ^Mount, info: Commit_Info) -> (commit: odb.Oid, err: Err
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
 	mount_wake(m) or_return
-	tree, _ := dir_tree(m, "") or_return
+	tree, nonempty := dir_tree(m, "") or_return
+	if !nonempty {
+		tree = from_odb_v(odb.write_tree(m.db, nil)) or_return
+	}
 	shadow_persist(&m.shadow) or_return
 	msg := info.message
+	if len(m.line) > 0 {
+		msg = strings.concatenate({msg, "\n\n0ndb-line: ", m.line}, context.temp_allocator)
+	}
 	if len(m.head.commit) > 0 {
 		msg = strings.concatenate({msg, "\n\n0ndb-head: ", m.head.branch, "@", m.head.commit}, context.temp_allocator)
 	}
@@ -245,6 +252,7 @@ ensure_blob :: proc(m: ^Mount, rel: string, e: ^Entry) -> Error {
 		if terr == .None {
 			oid := from_odb_v(odb.write(m.db, .Blob, text)) or_return
 			history_note_blob(h, oid)
+			history_note_file_blob(h, e.inode, oid, m.synced[:])
 			e.oid = oid
 			return .None
 		}
@@ -280,4 +288,71 @@ invalidate_parents :: proc(m: ^Mount, rel: string) -> Error {
 		shadow_put(&m.shadow, q, e) or_return
 	}
 	return .None
+}
+
+history_note_file_blob :: proc(h: ^History, inode: fstree.Inode_Id, oid: odb.Oid, version: Version) {
+	if h == nil || oid == {} || len(version) == 0 {
+		return
+	}
+	key := inode_key("fv", inode)
+	data, _, err := kv_get(&h.kv, key, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	buf := make([dynamic]u8, 0, len(data) + 64, context.temp_allocator)
+	append(&buf, ..data)
+	w := prim.writer(&buf)
+	o := oid
+	prim.write_raw(&w, o[:])
+	vb := make([dynamic]u8, context.temp_allocator)
+	encode_version(&vb, version)
+	prim.write_bytes(&w, vb[:])
+	kv_put(&h.kv, key, buf[:])
+}
+
+blob_versions_hit :: proc(h: ^History, inode: fstree.Inode_Id, spans: []crdt.Op_Span, out: ^[dynamic]odb.Oid) -> Error {
+	key := inode_key("fv", inode)
+	data, found := kv_get(&h.kv, key, context.temp_allocator) or_return
+	if !found {
+		return .None
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	rd := prim.reader(data)
+	keep := make([dynamic]u8, 0, len(data), context.temp_allocator)
+	for !prim.reader_done(&rd) {
+		start := rd.pos
+		oid: odb.Oid
+		prim.read_fixed(&rd, oid[:])
+		vb := prim.read_bytes(&rd)
+		if !prim.reader_ok(&rd) {
+			return .Corrupt
+		}
+		v := decode_version(vb, context.temp_allocator) or_return
+		hit := false
+		if crdt.graph_version_lvs(&h.g, v, &lvs) == .None {
+			for sp in spans {
+				for k := 0; k < sp.len && !hit; k += 1 {
+					lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{sp.id.actor, sp.id.seq + u64(k)})
+					if ok && crdt.graph_contains(&h.g, lvs[:], lv) {
+						hit = true
+					}
+					if ok {
+						break
+					}
+				}
+				if hit {
+					break
+				}
+			}
+		}
+		if hit {
+			append(out, oid)
+		} else {
+			append(&keep, ..data[start:rd.pos])
+		}
+	}
+	if len(keep) == len(data) {
+		return .None
+	}
+	return kv_put(&h.kv, key, keep[:])
 }

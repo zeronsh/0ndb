@@ -102,6 +102,7 @@ Mount :: struct {
 	intents:     [dynamic]Intent,
 	imported:    bool,
 	hold_line:   bool,
+	alias:       [dynamic]Version,
 	unwatched:   [dynamic]string,
 }
 
