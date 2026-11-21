@@ -167,7 +167,10 @@ http_server_close :: proc(hs: ^Http_Server) {
 	}
 	net_close(hs.lfd)
 	hs.lfd = prim.INVALID_FD
-	server_shutdown(hs.server)
+	server_shutdown(hs.server, hs.modern)
+	for sess in hs.sessions {
+		server_shutdown(hs.server, sess.conn)
+	}
 	for len(hs.conns) > 0 {
 		_hs_close_conn(hs.conns[len(hs.conns) - 1])
 	}

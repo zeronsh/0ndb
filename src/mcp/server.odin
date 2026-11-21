@@ -624,10 +624,10 @@ server_stream_closed :: proc(s: ^Server, conn: Conn_Id, stream: Stream_Id) {
 	}
 }
 
-server_shutdown :: proc(s: ^Server) {
+server_shutdown :: proc(s: ^Server, conn := Conn_Id(0)) {
 	listens := make([dynamic]Ref, context.temp_allocator)
 	for a in s.actives {
-		if a.kind == .Listen && !a.done {
+		if a.kind == .Listen && !a.done && (conn == 0 || a.conn == conn) {
 			append(&listens, a.ref)
 		}
 	}
