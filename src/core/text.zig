@@ -1429,6 +1429,11 @@ pub const Text = struct {
     disk_summary: FragSummary = .{},
     disk_item_count: usize = 0,
     node_source: ?NodeSource = null,
+    content_resolver: ?ContentResolver = null,
+
+    pub fn setContentResolver(self: *Text, resolver: ?ContentResolver) void {
+        self.content_resolver = resolver;
+    }
 
     pub fn deinit(self: *Text, allocator: Allocator) void {
         if (self.root) |r| {
@@ -1439,6 +1444,7 @@ pub const Text = struct {
         self.disk_summary = .{};
         self.disk_item_count = 0;
         self.node_source = null;
+        self.content_resolver = null;
     }
 
     pub fn share(self: *const Text) Text {
@@ -1448,6 +1454,7 @@ pub const Text = struct {
             .disk_summary = self.disk_summary,
             .disk_item_count = self.disk_item_count,
             .node_source = self.node_source,
+            .content_resolver = self.content_resolver,
         };
     }
 
@@ -1567,6 +1574,11 @@ pub const Text = struct {
     pub fn lineCount(self: *const Text) usize {
         const s = self.summary();
         if (s.visible == 0) return 0;
+        if (s.unknown_newlines) {
+            if (self.content_resolver) |res| {
+                return self.countLines(res);
+            }
+        }
         const nl: usize = @intCast(s.visible_newlines);
         return if (s.ends_with_nl) nl else nl + 1;
     }

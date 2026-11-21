@@ -8,7 +8,6 @@ const dag_mod = @import("../core/dag.zig");
 const text_mod = @import("../core/text.zig");
 const tree_mod = @import("../core/tree.zig");
 const history_mod = @import("../core/history.zig");
-const git_dirs = @import("../fs/git_dirs.zig");
 const codec = @import("codec.zig");
 const crypto = @import("crypto.zig");
 const mmap = @import("mmap.zig");
@@ -418,7 +417,7 @@ fn writeSlottedSection(
     return records.len;
 }
 
-const SlottedView = struct {
+pub const SlottedView = struct {
     data: []const u8,
     page_count: u32,
     total_records: u32,
@@ -426,7 +425,7 @@ const SlottedView = struct {
     fence_bytes: []const u8,
     pages_bytes: []const u8,
 
-    fn init(data: []const u8) ?SlottedView {
+    pub fn init(data: []const u8) ?SlottedView {
         if (data.len < 32) return null;
         const page_count = std.mem.readInt(u32, data[0..4], .little);
         const total_records = std.mem.readInt(u32, data[4..8], .little);
@@ -434,13 +433,15 @@ const SlottedView = struct {
         const fence_len = std.mem.readInt(u64, data[16..24], .little);
         const pages_off = std.mem.readInt(u64, data[24..32], .little);
         if (dir_len != @as(u64, page_count) * PAGE_DIR_ENTRY_SIZE) return null;
-        if (32 + dir_len + fence_len > pages_off or pages_off > data.len) return null;
+        const dir_end = std.math.add(u64, 32, dir_len) catch return null;
+        const fence_end = std.math.add(u64, dir_end, fence_len) catch return null;
+        if (fence_end > pages_off or pages_off > data.len) return null;
         return .{
             .data = data,
             .page_count = page_count,
             .total_records = total_records,
-            .dir_bytes = data[32..@intCast(32 + dir_len)],
-            .fence_bytes = data[@intCast(32 + dir_len)..@intCast(32 + dir_len + fence_len)],
+            .dir_bytes = data[32..@intCast(dir_end)],
+            .fence_bytes = data[@intCast(dir_end)..@intCast(fence_end)],
             .pages_bytes = data[@intCast(pages_off)..],
         };
     }
@@ -457,7 +458,7 @@ const SlottedView = struct {
 
     fn fenceKey(self: SlottedView, idx: usize) ?[]const u8 {
         const de = self.dirEntry(idx);
-        const end = @as(usize, de.key_off) + @as(usize, de.key_len);
+        const end = std.math.add(usize, @as(usize, de.key_off), @as(usize, de.key_len)) catch return null;
         if (end > self.fence_bytes.len) return null;
         return self.fence_bytes[de.key_off..end];
     }
@@ -465,32 +466,47 @@ const SlottedView = struct {
     fn verifyAndGetPage(self: SlottedView, idx: usize) ?[]const u8 {
         if (idx >= self.page_count) return null;
         const de = self.dirEntry(idx);
-        const off: usize = @intCast(de.page_off);
+        const off = std.math.cast(usize, de.page_off) orelse return null;
         const len: usize = @intCast(de.page_len);
-        if (len < PAGE_HDR_SIZE or off + len > self.pages_bytes.len) return null;
-        const page = self.pages_bytes[off .. off + len];
+        const end = std.math.add(usize, off, len) catch return null;
+        if (len < PAGE_HDR_SIZE or end > self.pages_bytes.len) return null;
+        const page = self.pages_bytes[off..end];
         if (!std.mem.eql(u8, page[0..4], &PAGE_MAGIC)) return null;
         const expected_crc = std.mem.readInt(u32, page[4..8], .little);
         if (codec.crc32c(page[8..len]) != expected_crc) return null;
         return page;
     }
 
-    fn pageRecordCount(page: []const u8) u32 {
+    pub fn pageRecordCount(page: []const u8) u32 {
         return std.mem.readInt(u32, page[12..16], .little);
     }
 
-    fn pageRecord(page: []const u8, rec_idx: usize) ?struct { key: []const u8, val: []const u8 } {
+    pub fn pageRecord(page: []const u8, rec_idx: usize) ?struct { key: []const u8, val: []const u8 } {
+        if (page.len < PAGE_HDR_SIZE) return null;
         const cnt = pageRecordCount(page);
         if (rec_idx >= cnt) return null;
-        const slots_base = PAGE_HDR_SIZE;
-        const s0 = std.mem.readInt(u32, page[slots_base + rec_idx * 4 ..][0..4], .little);
-        const s1 = std.mem.readInt(u32, page[slots_base + (rec_idx + 1) * 4 ..][0..4], .little);
-        if (s0 + 4 > s1 or s1 > page.len) return null;
-        const klen = std.mem.readInt(u32, page[s0..][0..4], .little);
-        if (s0 + 4 + klen > s1) return null;
+        const slots_base: usize = PAGE_HDR_SIZE;
+        const cnt_plus_1 = std.math.add(usize, cnt, 1) catch return null;
+        const slots_bytes = std.math.mul(usize, cnt_plus_1, 4) catch return null;
+        const slots_end = std.math.add(usize, slots_base, slots_bytes) catch return null;
+        if (slots_end > page.len) return null;
+        const next_idx = std.math.add(usize, rec_idx, 1) catch return null;
+        const next_slot_off = std.math.mul(usize, next_idx, 4) catch return null;
+        const slot1_pos = std.math.add(usize, slots_base, next_slot_off) catch return null;
+        const slot1_end = std.math.add(usize, slot1_pos, 4) catch return null;
+        if (slot1_end > page.len) return null;
+        const slot0_pos = slots_base + rec_idx * 4;
+        const s0: usize = std.mem.readInt(u32, page[slot0_pos..][0..4], .little);
+        const s1: usize = std.mem.readInt(u32, page[slot1_pos..][0..4], .little);
+        if (s0 < slots_end or s0 > s1 or s1 > page.len) return null;
+        const key_start = std.math.add(usize, s0, 4) catch return null;
+        if (key_start > s1) return null;
+        const klen: usize = std.mem.readInt(u32, page[s0..][0..4], .little);
+        const val_start = std.math.add(usize, key_start, klen) catch return null;
+        if (val_start > s1) return null;
         return .{
-            .key = page[s0 + 4 .. s0 + 4 + klen],
-            .val = page[s0 + 4 + klen .. s1],
+            .key = page[key_start..val_start],
+            .val = page[val_start..s1],
         };
     }
 
@@ -999,8 +1015,8 @@ pub const SnapshotReader = struct {
                         2 => blk: {
                             const olen = try r.readByte();
                             const goid = switch (olen) {
-                                20 => git_dirs.GitOid.fromSlice(try r.readFixed(20)) catch return error.InvalidData,
-                                32 => git_dirs.GitOid.fromSlice(try r.readFixed(32)) catch return error.InvalidData,
+                                20 => id.GitOid.fromSlice(try r.readFixed(20)) catch return error.InvalidData,
+                                32 => id.GitOid.fromSlice(try r.readFixed(32)) catch return error.InvalidData,
                                 else => return error.InvalidData,
                             };
                             break :blk .{ .git_binary = .{ .oid = goid, .len = try r.readVarint() } };
@@ -1008,8 +1024,8 @@ pub const SnapshotReader = struct {
                         3 => blk: {
                             const olen = try r.readByte();
                             const goid = switch (olen) {
-                                20 => git_dirs.GitOid.fromSlice(try r.readFixed(20)) catch return error.InvalidData,
-                                32 => git_dirs.GitOid.fromSlice(try r.readFixed(32)) catch return error.InvalidData,
+                                20 => id.GitOid.fromSlice(try r.readFixed(20)) catch return error.InvalidData,
+                                32 => id.GitOid.fromSlice(try r.readFixed(32)) catch return error.InvalidData,
                                 else => return error.InvalidData,
                             };
                             break :blk .{ .git_lazy = .{ .oid = goid, .len = try r.readVarint() } };
@@ -1070,7 +1086,7 @@ pub const SnapshotReader = struct {
         };
     }
 
-    pub fn collectDirChildren(self: *const SnapshotReader, allocator: Allocator, dir: id.InodeId, out: *std.ArrayList(id.InodeId)) Allocator.Error!void {
+    pub fn collectDirChildren(self: *const SnapshotReader, allocator: Allocator, dir: id.InodeId, out: *std.ArrayList(id.InodeId)) (Allocator.Error || SnapshotError)!void {
         const sv = SlottedView.init(self.dir_children_sec) orelse return;
         if (sv.page_count == 0) return;
         const min_key = encodeDirChildKey(dir, id.InodeId.ROOT);
@@ -1082,11 +1098,11 @@ pub const SnapshotReader = struct {
         }
         var pidx = start_page;
         while (pidx < sv.page_count) : (pidx += 1) {
-            const page = sv.verifyAndGetPage(pidx) orelse return;
+            const page = sv.verifyAndGetPage(pidx) orelse return error.CorruptSnapshot;
             const cnt = SlottedView.pageRecordCount(page);
             var past_prefix = false;
             for (0..cnt) |j| {
-                const rec = SlottedView.pageRecord(page, j) orelse break;
+                const rec = SlottedView.pageRecord(page, j) orelse return error.CorruptSnapshot;
                 if (rec.key.len < INODE_KEY_LEN * 2) continue;
                 const ord = std.mem.order(u8, rec.key[0..INODE_KEY_LEN], dir_prefix);
                 if (ord == .lt) continue;
@@ -1251,7 +1267,7 @@ pub const SnapshotReader = struct {
                         if (gidx >= git_cnt) return null;
                         const goff = gits_off + gidx * 36;
                         const glen = self.insertions_sec[goff];
-                        var goid = git_dirs.GitOid{ .len = glen, .bytes = @splat(0) };
+                        var goid = id.GitOid{ .len = glen, .bytes = @splat(0) };
                         @memcpy(&goid.bytes, self.insertions_sec[goff + 1 .. goff + 33]);
                         return .{ .git_oid = goid };
                     },
@@ -1288,9 +1304,10 @@ pub const SnapshotReader = struct {
                         errdefer h.allocator.free(kc);
                         var lww = tree_mod.Lww(?[]u8){};
                         errdefer lww.deinit(h.allocator);
-                        const vc: ?[]u8 = if (val) |v| try h.allocator.dupe(u8, v) else null;
+                        var vc: ?[]u8 = if (val) |v| try h.allocator.dupe(u8, v) else null;
                         errdefer if (vc) |c| h.allocator.free(c);
                         try lww.set(h.allocator, op, vc);
+                        vc = null;
                         try h.meta.put(h.allocator, kc, lww);
                     }
                 }
@@ -1312,27 +1329,30 @@ pub const SnapshotReader = struct {
         self: *const SnapshotReader,
         allocator: Allocator,
         out: *std.AutoHashMapUnmanaged(id.Oid, void),
-    ) Allocator.Error!void {
+    ) (Allocator.Error || SnapshotError)!void {
         if (self.insertions_sec.len >= 24) {
             const entry_cnt = std.mem.readInt(u32, self.insertions_sec[0..4], .little);
             const blob_cnt = std.mem.readInt(u32, self.insertions_sec[4..8], .little);
             const blobs_off: usize = 24 + @as(usize, entry_cnt) * 32;
-            if (blobs_off + @as(usize, blob_cnt) * 32 <= self.insertions_sec.len) {
-                for (0..blob_cnt) |i| {
-                    const oid: id.Oid = self.insertions_sec[blobs_off + i * 32 ..][0..32].*;
-                    try out.put(allocator, oid, {});
-                }
+            const blobs_end = std.math.add(usize, blobs_off, @as(usize, blob_cnt) * 32) catch return error.CorruptSnapshot;
+            if (blobs_end > self.insertions_sec.len) return error.CorruptSnapshot;
+            for (0..blob_cnt) |i| {
+                const oid: id.Oid = self.insertions_sec[blobs_off + i * 32 ..][0..32].*;
+                try out.put(allocator, oid, {});
             }
         }
         if (SlottedView.init(self.inodes_sec)) |sv| {
             for (0..sv.page_count) |pidx| {
-                const page = sv.verifyAndGetPage(pidx) orelse continue;
+                const page = sv.verifyAndGetPage(pidx) orelse return error.CorruptSnapshot;
                 const cnt = SlottedView.pageRecordCount(page);
                 for (0..cnt) |j| {
-                    const rec = SlottedView.pageRecord(page, j) orelse continue;
+                    const rec = SlottedView.pageRecord(page, j) orelse return error.CorruptSnapshot;
                     if (rec.key.len != INODE_KEY_LEN) continue;
                     const iid = decodeInodeKey(@ptrCast(rec.key[0..INODE_KEY_LEN].ptr));
-                    const inode = (self.decodeInodeRecord(allocator, iid, rec.val, null) catch continue);
+                    const inode = self.decodeInodeRecord(allocator, iid, rec.val, null) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.CorruptSnapshot,
+                    };
                     defer {
                         inode.deinit(allocator);
                         allocator.destroy(inode);
@@ -1448,7 +1468,7 @@ pub const SnapshotStack = struct {
         self: *const SnapshotStack,
         allocator: Allocator,
         out: *std.AutoHashMapUnmanaged(id.Oid, void),
-    ) Allocator.Error!void {
+    ) (Allocator.Error || SnapshotError)!void {
         if (self.base) |b| try b.collectReferencedBlobOids(allocator, out);
         if (self.delta) |d| try d.collectReferencedBlobOids(allocator, out);
     }
@@ -1533,14 +1553,25 @@ pub const SnapshotStack = struct {
 
     fn collectDirChildrenAdapter(ptr: *const anyopaque, allocator: Allocator, dir: id.InodeId, out: *std.ArrayList(id.InodeId)) Allocator.Error!void {
         const self: *const SnapshotStack = @ptrCast(@alignCast(ptr));
-        if (self.base) |b| try b.collectDirChildren(allocator, dir, out);
+        if (self.base) |b| {
+            b.collectDirChildren(allocator, dir, out) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return,
+            };
+        }
         if (self.delta) |d| {
             if (out.items.len == 0) {
-                try d.collectDirChildren(allocator, dir, out);
+                d.collectDirChildren(allocator, dir, out) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return,
+                };
             } else {
                 var tmp: std.ArrayList(id.InodeId) = .empty;
                 defer tmp.deinit(allocator);
-                try d.collectDirChildren(allocator, dir, &tmp);
+                d.collectDirChildren(allocator, dir, &tmp) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return,
+                };
                 if (tmp.items.len > 0) {
                     var seen: std.AutoHashMapUnmanaged(id.InodeId, void) = .empty;
                     defer seen.deinit(allocator);
@@ -1791,15 +1822,15 @@ const TextNodeWriter = struct {
         return .{ .id = node_id, .is_delta = self.is_delta };
     }
 
-    fn copyDiskRef(self: *TextNodeWriter, old_ref: text_mod.DiskNodeRef) Allocator.Error!text_mod.DiskNodeRef {
+    fn copyDiskRef(self: *TextNodeWriter, old_ref: text_mod.DiskNodeRef) (Allocator.Error || SnapshotError)!text_mod.DiskNodeRef {
         if (self.is_delta and !old_ref.is_delta) {
             return old_ref;
         }
         const raw = old_ref.toRaw();
         if (self.ref_remap.get(raw)) |mapped| return mapped;
-        const stack = self.old_stack orelse return old_ref;
-        const reader = (if (old_ref.is_delta) stack.delta else stack.base) orelse return old_ref;
-        const loaded = (try reader.loadTextNode(self.allocator, old_ref)) orelse return old_ref;
+        const stack = self.old_stack orelse return error.CorruptSnapshot;
+        const reader = (if (old_ref.is_delta) stack.delta else stack.base) orelse return error.CorruptSnapshot;
+        const loaded = (try reader.loadTextNode(self.allocator, old_ref)) orelse return error.CorruptSnapshot;
         defer loaded.release(self.allocator);
         loaded.persisted = null;
         const new_ref = try self.writeResidentNode(loaded);
@@ -1807,7 +1838,7 @@ const TextNodeWriter = struct {
         return new_ref;
     }
 
-    fn writeResidentNode(self: *TextNodeWriter, node: *const text_mod.Node) Allocator.Error!text_mod.DiskNodeRef {
+    fn writeResidentNode(self: *TextNodeWriter, node: *const text_mod.Node) (Allocator.Error || SnapshotError)!text_mod.DiskNodeRef {
         if (node.persisted) |pref| {
             if (self.is_delta and !pref.is_delta) {
                 return pref;
@@ -1891,7 +1922,7 @@ const TextNodeWriter = struct {
         return new_ref;
     }
 
-    fn writeText(self: *TextNodeWriter, txt: *const text_mod.Text) Allocator.Error!?text_mod.DiskNodeRef {
+    fn writeText(self: *TextNodeWriter, txt: *const text_mod.Text) (Allocator.Error || SnapshotError)!?text_mod.DiskNodeRef {
         if (txt.root) |r| {
             return try self.writeResidentNode(r);
         }
@@ -1936,7 +1967,7 @@ fn encodeInodePayload(
     actors: *ActorInterner,
     node_writer: *TextNodeWriter,
     out: *codec.Writer,
-) Allocator.Error!u64 {
+) (Allocator.Error || SnapshotError)!u64 {
     var max_ts: u64 = inode.inode_id.op.ts;
     const ktag: u8 = switch (inode.kind) {
         .dir => 0,
@@ -2032,7 +2063,7 @@ fn encodeInodePayload(
                 if (e.op.ts > max_ts) max_ts = e.op.ts;
                 try out.writeVarint(allocator, e.op.ts);
                 try out.writeVarint(allocator, try actors.intern(allocator, e.op.actor));
-                try out.writeByte(allocator, @intFromEnum(e.value));
+                try out.writeByte(allocator, @backingInt(e.value));
             }
 
             try out.writeVarint(allocator, f.line_ending.entries.items.len);
@@ -2040,7 +2071,7 @@ fn encodeInodePayload(
                 if (e.op.ts > max_ts) max_ts = e.op.ts;
                 try out.writeVarint(allocator, e.op.ts);
                 try out.writeVarint(allocator, try actors.intern(allocator, e.op.actor));
-                try out.writeByte(allocator, @intFromEnum(e.value));
+                try out.writeByte(allocator, @backingInt(e.value));
             }
         },
         .symlink => |*sym| {
@@ -2083,7 +2114,7 @@ fn buildDagSection(
     }
 
     const readers: [2]?*SnapshotReader = if (old_stack) |st|
-        if (is_delta) .{ st.delta, null } else .{ st.base, st.delta }
+        if (is_delta) .{ st.delta, null } else .{ st.delta, st.base }
     else
         .{ null, null };
 
@@ -2097,7 +2128,13 @@ fn buildDagSection(
                 if (ps.contains(bid)) continue;
             }
             if (batch_map.contains(bid)) continue;
-            const meta = reader.dagGetBatchMeta(bid) orelse continue;
+            var meta = reader.dagGetBatchMeta(bid) orelse continue;
+            if (h.dag.batch_locations.get(bid)) |loc| {
+                meta.log_seg = loc.seg_id;
+                meta.log_off = loc.offset;
+                meta.log_len = loc.len;
+                meta.flags = loc.flags;
+            }
             var plist: std.ArrayList(id.BatchId) = .empty;
             errdefer plist.deinit(allocator);
             _ = try reader.dagAppendParents(allocator, bid, &plist);
@@ -2115,7 +2152,13 @@ fn buildDagSection(
         if (pruned) |ps| {
             if (ps.contains(bid)) continue;
         }
-        const meta = h.dag.getBatchMeta(bid) orelse continue;
+        var meta = h.dag.getBatchMeta(bid) orelse continue;
+        if (h.dag.batch_locations.get(bid)) |loc| {
+            meta.log_seg = loc.seg_id;
+            meta.log_off = loc.offset;
+            meta.log_len = loc.len;
+            meta.flags = loc.flags;
+        }
         var plist: std.ArrayList(id.BatchId) = .empty;
         errdefer plist.deinit(allocator);
         try plist.appendSlice(allocator, kv.value_ptr.parents.slice());
@@ -2126,6 +2169,41 @@ fn buildDagSection(
         })) |old| {
             var ov = old.value;
             ov.deinit(allocator);
+        }
+    }
+
+    var loc_it = h.dag.batch_locations.iterator();
+    while (loc_it.next()) |kv| {
+        const bid = kv.key_ptr.*;
+        if (pruned) |ps| {
+            if (ps.contains(bid)) continue;
+        }
+        const loc = kv.value_ptr.*;
+        if (batch_map.getPtr(bid)) |item| {
+            item.meta.log_seg = loc.seg_id;
+            item.meta.log_off = loc.offset;
+            item.meta.log_len = loc.len;
+            item.meta.flags = loc.flags;
+        } else if (is_delta) {
+            if (old_stack) |st| {
+                if (st.base) |b| {
+                    if (b.dagGetBatchMeta(bid)) |bmeta| {
+                        var meta = bmeta;
+                        meta.log_seg = loc.seg_id;
+                        meta.log_off = loc.offset;
+                        meta.log_len = loc.len;
+                        meta.flags = loc.flags;
+                        var plist: std.ArrayList(id.BatchId) = .empty;
+                        errdefer plist.deinit(allocator);
+                        _ = try b.dagAppendParents(allocator, bid, &plist);
+                        try batch_map.put(allocator, bid, .{
+                            .bid = bid,
+                            .meta = meta,
+                            .parents = plist,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -2243,7 +2321,7 @@ fn buildDagSection(
 const InsertionBuildVal = union(enum) {
     inline_bytes: []u8,
     blob_oid: id.Oid,
-    git_oid: git_dirs.GitOid,
+    git_oid: id.GitOid,
 
     fn deinit(self: *InsertionBuildVal, allocator: Allocator) void {
         switch (self.*) {
@@ -2299,13 +2377,15 @@ fn collectInsertionsFromReader(
                 const gi: usize = @intCast(pref);
                 if (gi >= git_cnt) continue;
                 const goff = gits_off + gi * 36;
-                var goid = git_dirs.GitOid{ .len = reader.insertions_sec[goff], .bytes = @splat(0) };
+                var goid = id.GitOid{ .len = reader.insertions_sec[goff], .bytes = @splat(0) };
                 @memcpy(&goid.bytes, reader.insertions_sec[goff + 1 .. goff + 33]);
                 break :blk .{ .git_oid = goid };
             },
             else => continue,
         };
-        if (try map.fetchPut(allocator, key, val)) |prev| {
+        var val_owned = val;
+        errdefer val_owned.deinit(allocator);
+        if (try map.fetchPut(allocator, key, val_owned)) |prev| {
             var pv = prev.value;
             pv.deinit(allocator);
         }
@@ -2361,7 +2441,9 @@ fn buildInsertionsSection(
             .blob_ref => |oid| .{ .blob_oid = oid },
             .git_blob => |goid| .{ .git_oid = goid },
         };
-        if (try map.fetchPut(allocator, kv.key_ptr.*, val)) |prev| {
+        var val_owned = val;
+        errdefer val_owned.deinit(allocator);
+        if (try map.fetchPut(allocator, kv.key_ptr.*, val_owned)) |prev| {
             var pv = prev.value;
             pv.deinit(allocator);
         }
@@ -2372,9 +2454,9 @@ fn buildInsertionsSection(
     var blob_idx_map: std.AutoHashMapUnmanaged(id.Oid, u32) = .empty;
     defer blob_idx_map.deinit(allocator);
 
-    var git_list: std.ArrayList(git_dirs.GitOid) = .empty;
+    var git_list: std.ArrayList(id.GitOid) = .empty;
     defer git_list.deinit(allocator);
-    var git_idx_map: std.HashMapUnmanaged(git_dirs.GitOid, u32, git_dirs.GitOid.hashContext, 80) = .empty;
+    var git_idx_map: std.HashMapUnmanaged(id.GitOid, u32, id.GitOid.hashContext, 80) = .empty;
     defer git_idx_map.deinit(allocator);
 
     var arena: std.ArrayList(u8) = .empty;
@@ -2639,14 +2721,21 @@ pub const SnapshotWriter = struct {
                 if (SlottedView.init(d.inodes_sec)) |sv| {
                     const ns = st.nodeSource();
                     for (0..sv.page_count) |pidx| {
-                        const page = sv.verifyAndGetPage(pidx) orelse continue;
+                        const page = sv.verifyAndGetPage(pidx) orelse return error.CorruptSnapshot;
                         const cnt = SlottedView.pageRecordCount(page);
                         for (0..cnt) |j| {
-                            const rec = SlottedView.pageRecord(page, j) orelse continue;
+                            const rec = SlottedView.pageRecord(page, j) orelse return error.CorruptSnapshot;
                             if (rec.key.len != INODE_KEY_LEN) continue;
                             const iid = decodeInodeKey(@ptrCast(rec.key[0..INODE_KEY_LEN].ptr));
                             if (h.tree.inodes.contains(iid)) continue;
-                            const loaded = (d.decodeInodeRecord(allocator, iid, rec.val, ns) catch continue);
+                            const loaded = d.decodeInodeRecord(allocator, iid, rec.val, ns) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.CorruptSnapshot,
+                            };
+                            errdefer {
+                                loaded.deinit(allocator);
+                                allocator.destroy(loaded);
+                            }
                             try owned_loaded.append(allocator, loaded);
                             try dirty_inodes.put(allocator, iid, loaded);
                         }
@@ -2680,10 +2769,10 @@ pub const SnapshotWriter = struct {
             if (st.delta) |d| {
                 if (SlottedView.init(d.dir_children_sec)) |sv| {
                     for (0..sv.page_count) |pidx| {
-                        const page = sv.verifyAndGetPage(pidx) orelse continue;
+                        const page = sv.verifyAndGetPage(pidx) orelse return error.CorruptSnapshot;
                         const cnt = SlottedView.pageRecordCount(page);
                         for (0..cnt) |j| {
-                            const rec = SlottedView.pageRecord(page, j) orelse continue;
+                            const rec = SlottedView.pageRecord(page, j) orelse return error.CorruptSnapshot;
                             if (rec.key.len != INODE_KEY_LEN * 2) continue;
                             try child_edges.put(allocator, rec.key[0 .. INODE_KEY_LEN * 2].*, {});
                         }
@@ -2701,37 +2790,14 @@ pub const SnapshotWriter = struct {
         defer freeSlottedRecords(allocator, &child_recs);
         var ce_it = child_edges.keyIterator();
         while (ce_it.next()) |k| {
+            const rk = try allocator.dupe(u8, k);
+            errdefer allocator.free(rk);
             try child_recs.append(allocator, .{
-                .key = try allocator.dupe(u8, k),
+                .key = rk,
                 .val = &.{},
             });
         }
         sortSlottedRecords(child_recs.items);
-
-        var name_map: std.StringHashMapUnmanaged([INODE_KEY_LEN + 2]u8) = .empty;
-        defer {
-            var nmit = name_map.keyIterator();
-            while (nmit.next()) |k| allocator.free(k.*);
-            name_map.deinit(allocator);
-        }
-        if (params.stack) |st| {
-            if (st.delta) |d| {
-                if (SlottedView.init(d.dir_name_sec)) |sv| {
-                    for (0..sv.page_count) |pidx| {
-                        const page = sv.verifyAndGetPage(pidx) orelse continue;
-                        const cnt = SlottedView.pageRecordCount(page);
-                        for (0..cnt) |j| {
-                            const rec = SlottedView.pageRecord(page, j) orelse continue;
-                            if (rec.val.len < INODE_KEY_LEN + 2) continue;
-                            const kcopy = try allocator.dupe(u8, rec.key);
-                            if (try name_map.fetchPut(allocator, kcopy, rec.val[0 .. INODE_KEY_LEN + 2].*)) |prev| {
-                                allocator.free(prev.key);
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         var affected_dirs: std.AutoHashMapUnmanaged(id.InodeId, void) = .empty;
         defer affected_dirs.deinit(allocator);
@@ -2743,6 +2809,40 @@ pub const SnapshotWriter = struct {
                 try affected_dirs.put(allocator, pe.value.parent, {});
             }
         }
+
+        var name_map: std.StringHashMapUnmanaged([INODE_KEY_LEN + 2]u8) = .empty;
+        defer {
+            var nmit = name_map.keyIterator();
+            while (nmit.next()) |k| allocator.free(k.*);
+            name_map.deinit(allocator);
+        }
+        if (params.stack) |st| {
+            if (st.delta) |d| {
+                if (SlottedView.init(d.dir_name_sec)) |sv| {
+                    for (0..sv.page_count) |pidx| {
+                        const page = sv.verifyAndGetPage(pidx) orelse return error.CorruptSnapshot;
+                        const cnt = SlottedView.pageRecordCount(page);
+                        for (0..cnt) |j| {
+                            const rec = SlottedView.pageRecord(page, j) orelse return error.CorruptSnapshot;
+                            if (rec.key.len < INODE_KEY_LEN + 8 or rec.val.len < INODE_KEY_LEN + 2) continue;
+                            const parent_id = decodeInodeKey(@ptrCast(rec.key[0..INODE_KEY_LEN].ptr));
+                            if (affected_dirs.contains(parent_id)) continue;
+                            const kcopy = try allocator.dupe(u8, rec.key);
+                            errdefer allocator.free(kcopy);
+                            const gop = try name_map.getOrPut(allocator, kcopy);
+                            if (gop.found_existing) {
+                                allocator.free(kcopy);
+                                gop.value_ptr.* = rec.val[0 .. INODE_KEY_LEN + 2].*;
+                            } else {
+                                gop.key_ptr.* = kcopy;
+                                gop.value_ptr.* = rec.val[0 .. INODE_KEY_LEN + 2].*;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         var ad_it = affected_dirs.keyIterator();
         while (ad_it.next()) |dir_id| {
             try buildDirNameEntriesForDir(allocator, &h.tree, params.stack, dir_id.*, true, &name_map);
@@ -2752,9 +2852,13 @@ pub const SnapshotWriter = struct {
         defer freeSlottedRecords(allocator, &name_recs);
         var nm_it = name_map.iterator();
         while (nm_it.next()) |kv| {
+            const rk = try allocator.dupe(u8, kv.key_ptr.*);
+            errdefer allocator.free(rk);
+            const rv = try allocator.dupe(u8, kv.value_ptr);
+            errdefer allocator.free(rv);
             try name_recs.append(allocator, .{
-                .key = try allocator.dupe(u8, kv.key_ptr.*),
-                .val = try allocator.dupe(u8, kv.value_ptr),
+                .key = rk,
+                .val = rv,
             });
         }
         sortSlottedRecords(name_recs.items);
@@ -2838,10 +2942,10 @@ pub const SnapshotWriter = struct {
                 const reader = r_opt orelse continue;
                 if (SlottedView.init(reader.inodes_sec)) |sv| {
                     for (0..sv.page_count) |pidx| {
-                        const page = sv.verifyAndGetPage(pidx) orelse continue;
+                        const page = sv.verifyAndGetPage(pidx) orelse return error.CorruptSnapshot;
                         const cnt = SlottedView.pageRecordCount(page);
                         for (0..cnt) |j| {
-                            const rec = SlottedView.pageRecord(page, j) orelse continue;
+                            const rec = SlottedView.pageRecord(page, j) orelse return error.CorruptSnapshot;
                             if (rec.key.len != INODE_KEY_LEN) continue;
                             const iid = decodeInodeKey(@ptrCast(rec.key[0..INODE_KEY_LEN].ptr));
                             try all_inode_ids.put(allocator, iid, {});
@@ -2897,8 +3001,10 @@ pub const SnapshotWriter = struct {
         defer freeSlottedRecords(allocator, &child_recs);
         var ce_it = child_edges.keyIterator();
         while (ce_it.next()) |k| {
+            const rk = try allocator.dupe(u8, k);
+            errdefer allocator.free(rk);
             try child_recs.append(allocator, .{
-                .key = try allocator.dupe(u8, k),
+                .key = rk,
                 .val = &.{},
             });
         }
@@ -2918,9 +3024,13 @@ pub const SnapshotWriter = struct {
         defer freeSlottedRecords(allocator, &name_recs);
         var nm_it = name_map.iterator();
         while (nm_it.next()) |kv| {
+            const rk = try allocator.dupe(u8, kv.key_ptr.*);
+            errdefer allocator.free(rk);
+            const rv = try allocator.dupe(u8, kv.value_ptr);
+            errdefer allocator.free(rv);
             try name_recs.append(allocator, .{
-                .key = try allocator.dupe(u8, kv.key_ptr.*),
-                .val = try allocator.dupe(u8, kv.value_ptr),
+                .key = rk,
+                .val = rv,
             });
         }
         sortSlottedRecords(name_recs.items);
@@ -2978,7 +3088,7 @@ fn buildDirNameEntriesForDir(
     dir: id.InodeId,
     emit_tombstones: bool,
     out_map: *std.StringHashMapUnmanaged([INODE_KEY_LEN + 2]u8),
-) Allocator.Error!void {
+) (Allocator.Error || SnapshotError)!void {
     t.beginPinScope();
     defer t.endPinScope();
     var entries = try t.listDir(allocator, text_mod.View.EVERYTHING, dir);
@@ -2988,16 +3098,29 @@ fn buildDirNameEntriesForDir(
     }
 
     var present_raw_counts: std.StringHashMapUnmanaged(u32) = .empty;
-    defer present_raw_counts.deinit(allocator);
+    defer {
+        var pit = present_raw_counts.keyIterator();
+        while (pit.next()) |k| allocator.free(k.*);
+        present_raw_counts.deinit(allocator);
+    }
 
     var live_names: std.StringHashMapUnmanaged(void) = .empty;
     defer live_names.deinit(allocator);
 
     for (entries.items) |e| {
         try live_names.put(allocator, e.name, {});
-        const pe = try t.placementIn(allocator, text_mod.View.EVERYTHING, e.inode_id) orelse continue;
-        const gop = try present_raw_counts.getOrPut(allocator, pe.value.name);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        var pe = try t.placementIn(allocator, text_mod.View.EVERYTHING, e.inode_id) orelse continue;
+        defer pe.deinit(allocator);
+        const kcopy = try allocator.dupe(u8, pe.value.name);
+        errdefer allocator.free(kcopy);
+        const gop = try present_raw_counts.getOrPut(allocator, kcopy);
+        if (gop.found_existing) {
+            allocator.free(kcopy);
+            gop.value_ptr.* += 1;
+        } else {
+            gop.key_ptr.* = kcopy;
+            gop.value_ptr.* = 1;
+        }
     }
 
     for (entries.items) |e| {
@@ -3018,8 +3141,13 @@ fn buildDirNameEntriesForDir(
         @memcpy(val[0..INODE_KEY_LEN], &ck);
         val[INODE_KEY_LEN] = ktag;
         val[INODE_KEY_LEN + 1] = flags;
-        if (try out_map.fetchPut(allocator, key, val)) |prev| {
-            allocator.free(prev.key);
+        const gop = try out_map.getOrPut(allocator, key);
+        if (gop.found_existing) {
+            allocator.free(key);
+            gop.value_ptr.* = val;
+        } else {
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = val;
         }
     }
 
@@ -3032,11 +3160,11 @@ fn buildDirNameEntriesForDir(
                     @memcpy(min_k[0..INODE_KEY_LEN], &dir_prefix);
                     var pidx: usize = sv.findPageForKey(&min_k) orelse 0;
                     while (pidx < sv.page_count) : (pidx += 1) {
-                        const page = sv.verifyAndGetPage(pidx) orelse break;
+                        const page = sv.verifyAndGetPage(pidx) orelse return error.CorruptSnapshot;
                         const cnt = SlottedView.pageRecordCount(page);
                         var past = false;
                         for (0..cnt) |j| {
-                            const rec = SlottedView.pageRecord(page, j) orelse break;
+                            const rec = SlottedView.pageRecord(page, j) orelse return error.CorruptSnapshot;
                             if (rec.key.len < INODE_KEY_LEN + 8) continue;
                             const ord = std.mem.order(u8, rec.key[0..INODE_KEY_LEN], &dir_prefix);
                             if (ord == .lt) continue;
@@ -3047,10 +3175,16 @@ fn buildDirNameEntriesForDir(
                             const old_name = rec.key[INODE_KEY_LEN + 8 ..];
                             if (!live_names.contains(old_name)) {
                                 const tk = try allocator.dupe(u8, rec.key);
+                                errdefer allocator.free(tk);
                                 var tval: [INODE_KEY_LEN + 2]u8 = @splat(0);
                                 tval[INODE_KEY_LEN + 1] = tree_mod.DIR_NAME_FLAG_TOMBSTONE;
-                                if (try out_map.fetchPut(allocator, tk, tval)) |prev| {
-                                    allocator.free(prev.key);
+                                const gop = try out_map.getOrPut(allocator, tk);
+                                if (gop.found_existing) {
+                                    allocator.free(tk);
+                                    gop.value_ptr.* = tval;
+                                } else {
+                                    gop.key_ptr.* = tk;
+                                    gop.value_ptr.* = tval;
                                 }
                             }
                         }

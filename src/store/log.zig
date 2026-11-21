@@ -304,12 +304,13 @@ pub const AppendLog = struct {
         if (offset < size_usize) {
             self.unmapAll();
             try self.file.setLength(self.io, offset);
+            try self.syncData();
             self.write_offset = offset;
             if (offset > 0) try self.ensureMappedFor(offset);
         } else {
             self.write_offset = offset;
         }
-        self.next_seq = last_seq + 1;
+        self.next_seq = last_seq +| 1;
     }
 
     pub fn append(self: *AppendLog, kind: u8, flags: u8, aux: u16, payload: []const u8) !u64 {
@@ -347,6 +348,7 @@ pub const AppendLog = struct {
         hdr.crc = frameCrc(&hdr_bytes, payload);
         hdr_bytes = hdr.encode();
 
+        try self.index.ensureUnusedCapacity(self.allocator, 1);
         const raw_total = HEADER_SIZE + payload.len;
         const aligned_total = alignUp(raw_total);
         const pad_len = aligned_total - raw_total;
@@ -377,8 +379,8 @@ pub const AppendLog = struct {
         }
 
         self.write_offset = frame_offset + aligned_total;
-        if (seq >= self.next_seq) self.next_seq = seq + 1;
-        try self.index.append(self.allocator, .{
+        if (seq >= self.next_seq) self.next_seq = seq +| 1;
+        self.index.appendAssumeCapacity(.{
             .seq = seq,
             .offset = frame_offset,
             .payload_len = @intCast(payload.len),
@@ -536,6 +538,7 @@ pub const AppendLog = struct {
         tmp_closed = true;
         try dir.rename(tmp_path, dir, sub_path, self.io);
         tmp_renamed = true;
+        try mmap.fsyncDir(self.io, dir);
 
         const new_file = try dir.createFile(self.io, sub_path, .{
             .read = true,
@@ -584,12 +587,16 @@ pub const AppendLog = struct {
         if (idx >= self.index.items.len) return error.OutOfBounds;
         const entry = self.index.items[idx];
         const off: usize = @intCast(entry.offset);
-        const end = off + HEADER_SIZE + entry.payload_len;
+        const hdr_end = std.math.add(usize, off, HEADER_SIZE) catch return error.CorruptLog;
+        const end = std.math.add(usize, hdr_end, entry.payload_len) catch return error.CorruptLog;
         try self.ensureMappedFor(end);
         const mapping = self.mapped orelse return error.OutOfBounds;
-        const hdr_ptr: *const [HEADER_SIZE]u8 = @ptrCast(mapping[off .. off + HEADER_SIZE].ptr);
+        if (hdr_end > mapping.len) return error.CorruptLog;
+        const hdr_ptr: *const [HEADER_SIZE]u8 = @ptrCast(mapping[off..hdr_end].ptr);
         const hdr = try FrameHeader.decode(hdr_ptr);
-        const payload = mapping[off + HEADER_SIZE .. off + HEADER_SIZE + hdr.payload_len];
+        const payload_end = std.math.add(usize, hdr_end, hdr.payload_len) catch return error.CorruptLog;
+        if (hdr.payload_len != entry.payload_len or payload_end > mapping.len) return error.CorruptLog;
+        const payload = mapping[hdr_end..payload_end];
         return .{ .header = hdr, .payload = payload };
     }
 
@@ -597,9 +604,11 @@ pub const AppendLog = struct {
         if (idx >= self.index.items.len) return error.OutOfBounds;
         const entry = self.index.items[idx];
         const off: usize = @intCast(entry.offset);
-        const end = off + HEADER_SIZE + entry.payload_len;
+        const hdr_end = std.math.add(usize, off, HEADER_SIZE) catch return error.CorruptLog;
+        const end = std.math.add(usize, hdr_end, entry.payload_len) catch return error.CorruptLog;
         try self.ensureMappedFor(end);
         const mapping = self.mapped orelse return error.OutOfBounds;
+        if (end > mapping.len) return error.CorruptLog;
         return mapping[off..end];
     }
 

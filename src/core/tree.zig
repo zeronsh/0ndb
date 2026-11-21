@@ -57,6 +57,25 @@ pub const Placement = struct {
     }
 };
 
+pub const OwnedPlacementEntry = struct {
+    op: id.OpId,
+    value: Placement,
+
+    pub fn deinit(self: *OwnedPlacementEntry, allocator: Allocator) void {
+        self.value.deinit(allocator);
+    }
+};
+
+const DirNameHashKey = struct {
+    parent: id.InodeId,
+    name_hash: u64,
+};
+
+const NameSlot = union(enum) {
+    single: id.InodeId,
+    multiple,
+};
+
 pub fn Lww(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -277,7 +296,9 @@ pub const Tree = struct {
     inodes: std.AutoHashMapUnmanaged(id.InodeId, *Inode) = .empty,
     children: std.AutoHashMapUnmanaged(id.InodeId, std.AutoArrayHashMapUnmanaged(id.InodeId, void)) = .empty,
     dirty_dirs: std.AutoHashMapUnmanaged(id.InodeId, void) = .empty,
+    dir_name_slots: std.AutoHashMapUnmanaged(DirNameHashKey, NameSlot) = .empty,
     source: ?InodeSource = null,
+    content_resolver: ?text_mod.ContentResolver = null,
     clean_cache_box: ?*CleanCacheBox = null,
 
     pub fn init(allocator: Allocator) Allocator.Error!Tree {
@@ -320,12 +341,18 @@ pub const Tree = struct {
         }
         self.children.deinit(allocator);
         self.dirty_dirs.deinit(allocator);
+        self.dir_name_slots.deinit(allocator);
         if (self.clean_cache_box) |box| {
             box.cache.deinit();
             allocator.destroy(box);
             self.clean_cache_box = null;
         }
         self.source = null;
+        self.content_resolver = null;
+    }
+
+    pub fn setContentResolver(self: *Tree, res: ?text_mod.ContentResolver) void {
+        self.content_resolver = res;
     }
 
     pub fn setSource(self: *Tree, src: ?InodeSource) void {
@@ -395,7 +422,28 @@ pub const Tree = struct {
         }
         self.children.clearRetainingCapacity();
         self.dirty_dirs.clearRetainingCapacity();
+        self.dir_name_slots.clearRetainingCapacity();
         self.evictClean();
+    }
+
+    fn recordNameSlot(self: *Tree, allocator: Allocator, parent: id.InodeId, name: []const u8, child: id.InodeId) Allocator.Error!void {
+        const key = DirNameHashKey{
+            .parent = parent,
+            .name_hash = std.hash.Wyhash.hash(0, name),
+        };
+        const gop = try self.dir_name_slots.getOrPut(allocator, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .single = child };
+        } else {
+            switch (gop.value_ptr.*) {
+                .single => |existing| {
+                    if (!existing.eql(child)) {
+                        gop.value_ptr.* = .multiple;
+                    }
+                },
+                .multiple => {},
+            }
+        }
     }
 
     pub fn markDirtyDir(self: *Tree, allocator: Allocator, dir: id.InodeId) Allocator.Error!void {
@@ -406,6 +454,7 @@ pub const Tree = struct {
         if (self.getMut(iid)) |inode| {
             for (inode.placement.entries.items) |e| {
                 try self.dirty_dirs.put(allocator, e.value.parent, {});
+                try self.recordNameSlot(allocator, e.value.parent, e.value.name, iid);
             }
         }
     }
@@ -416,6 +465,9 @@ pub const Tree = struct {
             if (box.cache.get(iid)) |ptr_ptr| return ptr_ptr.*;
             if (self.source) |src| {
                 const loaded = (src.loadInode(box.allocator, iid) catch return null) orelse return null;
+                if (self.content_resolver) |cr| {
+                    if (loaded.filePtr()) |f| f.text.content_resolver = cr;
+                }
                 const slot = box.cache.put(iid, loaded) catch {
                     loaded.deinit(box.allocator);
                     box.allocator.destroy(loaded);
@@ -431,6 +483,11 @@ pub const Tree = struct {
         if (self.inodes.get(iid)) |ptr| return ptr;
         if (self.clean_cache_box) |box| {
             if (box.cache.take(iid)) |taken| {
+                if (self.content_resolver) |cr| {
+                    if (taken.filePtr()) |f| {
+                        if (f.text.content_resolver == null) f.text.content_resolver = cr;
+                    }
+                }
                 self.inodes.put(box.allocator, iid, taken) catch {
                     taken.deinit(box.allocator);
                     box.allocator.destroy(taken);
@@ -440,6 +497,9 @@ pub const Tree = struct {
             }
             if (self.source) |src| {
                 const loaded = (src.loadInode(box.allocator, iid) catch return null) orelse return null;
+                if (self.content_resolver) |cr| {
+                    if (loaded.filePtr()) |f| f.text.content_resolver = cr;
+                }
                 self.inodes.put(box.allocator, iid, loaded) catch {
                     loaded.deinit(box.allocator);
                     box.allocator.destroy(loaded);
@@ -474,6 +534,7 @@ pub const Tree = struct {
     pub fn insertInode(self: *Tree, allocator: Allocator, inode: *Inode) Allocator.Error!void {
         for (inode.placement.entries.items) |e| {
             try self.addChildRef(allocator, e.value.parent, inode.inode_id);
+            try self.recordNameSlot(allocator, e.value.parent, e.value.name, inode.inode_id);
         }
         if (self.clean_cache_box) |box| {
             _ = box.cache.remove(inode.inode_id);
@@ -486,9 +547,11 @@ pub const Tree = struct {
 
     pub fn place(self: *Tree, allocator: Allocator, iid: id.InodeId, op: id.OpId, parent: id.InodeId, name: []const u8) Allocator.Error!void {
         try self.addChildRef(allocator, parent, iid);
+        try self.recordNameSlot(allocator, parent, name, iid);
         const inode = self.getMut(iid) orelse return;
         for (inode.placement.entries.items) |e| {
             try self.dirty_dirs.put(allocator, e.value.parent, {});
+            try self.recordNameSlot(allocator, e.value.parent, e.value.name, iid);
         }
         const owned = try allocator.dupe(u8, name);
         errdefer allocator.free(owned);
@@ -522,7 +585,7 @@ pub const Tree = struct {
         }
     }
 
-    pub fn placementIn(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!?*const Lww(Placement).Entry {
+    pub fn placementIn(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!?OwnedPlacementEntry {
         if (iid.isRoot()) return null;
         self.beginPinScope();
         defer self.endPinScope();
@@ -540,7 +603,11 @@ pub const Tree = struct {
                 if (cur.isRoot()) {
                     const n = demoted.get(iid) orelse 0;
                     const inode = self.get(iid) orelse return null;
-                    return inode.placement.nthIn(view, n);
+                    const entry = inode.placement.nthIn(view, n) orelse return null;
+                    return .{
+                        .op = entry.op,
+                        .value = try entry.value.clone(allocator),
+                    };
                 }
                 for (chain.items, 0..) |c, pos| {
                     if (c.eql(cur)) {
@@ -586,8 +653,10 @@ pub const Tree = struct {
         defer kids.deinit(allocator);
         try self.collectDirChildrenUnion(allocator, iid, &kids);
         for (kids.items) |child| {
-            const entry = try self.placementIn(allocator, view, child) orelse continue;
-            if (entry.value.parent.eql(iid) and try self.isPresent(allocator, view, child)) return true;
+            var entry = try self.placementIn(allocator, view, child) orelse continue;
+            const parent = entry.value.parent;
+            entry.deinit(allocator);
+            if (parent.eql(iid) and try self.isPresent(allocator, view, child)) return true;
         }
         return false;
     }
@@ -611,6 +680,11 @@ pub const Tree = struct {
             op: id.OpId,
             iid: id.InodeId,
         };
+        var owned_entries: std.ArrayList(OwnedPlacementEntry) = .empty;
+        defer {
+            for (owned_entries.items) |*oe| oe.deinit(allocator);
+            owned_entries.deinit(allocator);
+        }
         var by_name: std.StringHashMapUnmanaged(std.ArrayList(Candidate)) = .empty;
         defer {
             var it = by_name.valueIterator();
@@ -619,13 +693,26 @@ pub const Tree = struct {
         }
 
         for (kids.items) |child| {
-            const entry = try self.placementIn(allocator, view, child) orelse continue;
-            const p = &entry.value;
-            if (!p.parent.eql(dir)) continue;
-            if (!try self.isPresent(allocator, view, child)) continue;
-            const gop = try by_name.getOrPut(allocator, p.name);
+            var entry = try self.placementIn(allocator, view, child) orelse continue;
+            var entry_owned = true;
+            errdefer if (entry_owned) entry.deinit(allocator);
+            if (!entry.value.parent.eql(dir)) {
+                entry.deinit(allocator);
+                entry_owned = false;
+                continue;
+            }
+            if (!try self.isPresent(allocator, view, child)) {
+                entry.deinit(allocator);
+                entry_owned = false;
+                continue;
+            }
+            const name_slice = entry.value.name;
+            const op = entry.op;
+            try owned_entries.append(allocator, entry);
+            entry_owned = false;
+            const gop = try by_name.getOrPut(allocator, name_slice);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(allocator, .{ .name = p.name, .op = entry.op, .iid = child });
+            try gop.value_ptr.append(allocator, .{ .name = name_slice, .op = op, .iid = child });
         }
 
         var it = by_name.iterator();
@@ -709,22 +796,65 @@ pub const Tree = struct {
             guard += 1;
             if (guard > 4096) return null;
             if (!try self.isPresent(allocator, view, cur)) return null;
-            const entry = try self.placementIn(allocator, view, cur) orelse return null;
+            var entry = try self.placementIn(allocator, view, cur) orelse return null;
+            defer entry.deinit(allocator);
             const p = &entry.value;
             var has_winner_before = false;
-            var siblings: std.ArrayList(id.InodeId) = .empty;
-            defer siblings.deinit(allocator);
-            try self.collectDirChildrenUnion(allocator, p.parent, &siblings);
-            for (siblings.items) |sib| {
-                if (sib.eql(cur)) continue;
-                const sib_entry = try self.placementIn(allocator, view, sib) orelse continue;
-                if (!sib_entry.value.parent.eql(p.parent)) continue;
-                if (!std.mem.eql(u8, sib_entry.value.name, p.name)) continue;
-                if (!try self.isPresent(allocator, view, sib)) continue;
-                const ord = sib_entry.op.order(entry.op);
-                if (ord == .gt or (ord == .eq and sib.order(cur) == .lt)) {
-                    has_winner_before = true;
-                    break;
+            var need_sibling_scan = true;
+            const name_key = DirNameHashKey{
+                .parent = p.parent,
+                .name_hash = std.hash.Wyhash.hash(0, p.name),
+            };
+            if (self.source) |src| {
+                if (view.min_unobserved == std.math.maxInt(u64)) {
+                    if (!self.dirty_dirs.contains(p.parent)) {
+                        if (src.lookupDirName(p.parent, p.name)) |lookup| {
+                            if ((lookup.flags & DIR_NAME_FLAG_TOMBSTONE) == 0 and
+                                (lookup.flags & DIR_NAME_FLAG_CONFLICT) == 0 and
+                                lookup.child_id.eql(cur) and
+                                !self.inodes.contains(cur))
+                            {
+                                need_sibling_scan = false;
+                            }
+                        }
+                    } else {
+                        const mem_ok = if (self.dir_name_slots.get(name_key)) |slot| switch (slot) {
+                            .single => |only| only.eql(cur),
+                            .multiple => false,
+                        } else true;
+                        if (mem_ok) {
+                            const disk_ok = if (src.lookupDirName(p.parent, p.name)) |lookup|
+                                ((lookup.flags & DIR_NAME_FLAG_TOMBSTONE) != 0) or
+                                    ((lookup.flags & DIR_NAME_FLAG_CONFLICT) == 0 and lookup.child_id.eql(cur))
+                            else
+                                true;
+                            if (disk_ok) need_sibling_scan = false;
+                        }
+                    }
+                }
+            } else {
+                if (self.dir_name_slots.get(name_key)) |slot| {
+                    if (slot == .single and slot.single.eql(cur)) {
+                        need_sibling_scan = false;
+                    }
+                }
+            }
+            if (need_sibling_scan) {
+                var siblings: std.ArrayList(id.InodeId) = .empty;
+                defer siblings.deinit(allocator);
+                try self.collectDirChildrenUnion(allocator, p.parent, &siblings);
+                for (siblings.items) |sib| {
+                    if (sib.eql(cur)) continue;
+                    var sib_entry = try self.placementIn(allocator, view, sib) orelse continue;
+                    defer sib_entry.deinit(allocator);
+                    if (!sib_entry.value.parent.eql(p.parent)) continue;
+                    if (!std.mem.eql(u8, sib_entry.value.name, p.name)) continue;
+                    if (!try self.isPresent(allocator, view, sib)) continue;
+                    const ord = sib_entry.op.order(entry.op);
+                    if (ord == .gt or (ord == .eq and sib.order(cur) == .lt)) {
+                        has_winner_before = true;
+                        break;
+                    }
                 }
             }
             const display_name = if (has_winner_before) blk: {

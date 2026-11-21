@@ -1282,6 +1282,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
     try runDiffAndMerge3PropertyFuzz(allocator);
     try runDaemonWatcherSuite(allocator, io);
     try runPagedStorePrimitivesSuite(allocator, io);
+    try runAuditFixCoreStoreSuite(allocator, io);
     try runNativeGitLayerSuite(allocator, io);
     try runDaemonPoolAndShadowSuite(allocator, io);
     try runTimelineAndRemoteSuite(allocator, io);
@@ -1750,7 +1751,8 @@ fn collectLiveTreeSnap(
             allocator.free(rel);
             continue;
         };
-        const p_entry = (try hist.tree.placementIn(allocator, ondb.core.text.View.EVERYTHING, e.inode_id)).?;
+        var p_entry = (try hist.tree.placementIn(allocator, ondb.core.text.View.EVERYTHING, e.inode_id)).?;
+        defer p_entry.deinit(allocator);
         const raw_name = try allocator.dupe(u8, p_entry.value.name);
         errdefer allocator.free(raw_name);
         switch (inode.kind) {
@@ -11994,5 +11996,653 @@ fn runV2DaemonHttpSuite(allocator: std.mem.Allocator, io: std.Io) !void {
         defer r_chk.deinit(allocator);
         try testing.expectEqual(@as(u16, 200), r_chk.status);
         try testing.expect(std.mem.indexOf(u8, r_chk.body, "\"exists\":false") != null);
+    }
+}
+
+fn runAuditFixCoreStoreSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const tmp_root = "/tmp/0ndb-verify-audit-core-store";
+    cleanDir(io, tmp_root);
+    defer cleanDir(io, tmp_root);
+    try std.Io.Dir.cwd().createDirPath(io, tmp_root);
+
+    {
+        const work_dir = tmp_root ++ "/minor_work";
+        const state_dir = tmp_root ++ "/minor_state";
+        try std.Io.Dir.cwd().createDirPath(io, work_dir);
+        try std.Io.Dir.cwd().createDirPath(io, state_dir);
+        try std.Io.Dir.cwd().createDirPath(io, work_dir ++ "/sub");
+
+        try writeTestFile(io, work_dir, "keep_base.txt", "base-v1\n", false);
+        try writeTestFile(io, work_dir, "del_base.txt", "delete-me-base\n", false);
+        try writeTestFile(io, work_dir, "ren_base.txt", "rename-me-base\n", false);
+        try writeTestFile(io, work_dir, "sub/nested_del.txt", "nested-del\n", false);
+        try writeTestFile(io, work_dir, "sub/nested_ren.txt", "nested-ren\n", false);
+
+        {
+            var ws = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9201);
+            defer ws.deinit();
+            _ = try ws.ingestDisk();
+            try ws.checkpoint(.major);
+        }
+
+        {
+            var ws = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9201);
+            defer ws.deinit();
+            _ = try ws.writeFileDirect(201, "del_m1.txt", "delete-me-m1\n");
+            _ = try ws.writeFileDirect(201, "ren_m1.txt", "rename-me-m1\n");
+            _ = try ws.writeFileDirect(201, "keep_m1.txt", "keep-then-del-m1\n");
+            try ws.checkpoint(.minor);
+        }
+
+        {
+            var ws = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9201);
+            defer ws.deinit();
+            _ = try ws.deleteFileDirect(202, "del_base.txt");
+            _ = try ws.deleteFileDirect(202, "del_m1.txt");
+            _ = try ws.deleteFileDirect(202, "sub/nested_del.txt");
+            try std.Io.Dir.cwd().rename(work_dir ++ "/ren_base.txt", std.Io.Dir.cwd(), work_dir ++ "/ren_base_new.txt", io);
+            try std.Io.Dir.cwd().rename(work_dir ++ "/ren_m1.txt", std.Io.Dir.cwd(), work_dir ++ "/ren_m1_new.txt", io);
+            try std.Io.Dir.cwd().rename(work_dir ++ "/sub/nested_ren.txt", std.Io.Dir.cwd(), work_dir ++ "/sub/nested_ren_new.txt", io);
+            _ = try ws.ingestDisk();
+            try ws.checkpoint(.minor);
+        }
+
+        {
+            var ws = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9201);
+            defer ws.deinit();
+            _ = try ws.writeFileDirect(203, "keep_base.txt", "base-v2\n");
+            _ = try ws.writeFileDirect(203, "keep_m3.txt", "created-in-m3\n");
+            _ = try ws.deleteFileDirect(203, "keep_m1.txt");
+            try ws.checkpoint(.minor);
+        }
+
+        {
+            var ws = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9201);
+            defer ws.deinit();
+
+            const dead_paths = [_][]const u8{
+                "del_base.txt",
+                "del_m1.txt",
+                "sub/nested_del.txt",
+                "ren_base.txt",
+                "ren_m1.txt",
+                "sub/nested_ren.txt",
+                "keep_m1.txt",
+            };
+            for (dead_paths) |dp| {
+                const resolved = try ws.history.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, dp);
+                try testing.expectEqual(@as(?ondb.core.id.InodeId, null), resolved);
+                const content = try ws.history.readFileAt(allocator, dp, &ws.history.dag.heads);
+                try testing.expectEqual(@as(?[]u8, null), content);
+            }
+
+            const live_checks = [_]struct { p: []const u8, expected: []const u8 }{
+                .{ .p = "keep_base.txt", .expected = "base-v2\n" },
+                .{ .p = "ren_base_new.txt", .expected = "rename-me-base\n" },
+                .{ .p = "ren_m1_new.txt", .expected = "rename-me-m1\n" },
+                .{ .p = "sub/nested_ren_new.txt", .expected = "nested-ren\n" },
+                .{ .p = "keep_m3.txt", .expected = "created-in-m3\n" },
+            };
+            for (live_checks) |chk| {
+                const content = (try ws.history.readFileAt(allocator, chk.p, &ws.history.dag.heads)).?;
+                defer allocator.free(content);
+                try testing.expectEqualStrings(chk.expected, content);
+            }
+        }
+    }
+
+    {
+        const snap_path = tmp_root ++ "/dag_loc_snap";
+        try std.Io.Dir.cwd().createDirPath(io, snap_path);
+        var snap_dir = try std.Io.Dir.cwd().openDir(io, snap_path, .{ .iterate = true });
+        defer snap_dir.close(io);
+
+        var h = try ondb.core.history.History.init(allocator, 9202);
+        defer h.deinit();
+
+        var ops1 = [_]ondb.core.op.Op{.{ .create_file = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "a.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = try allocator.dupe(u8, "one\n") },
+        } }};
+        defer for (&ops1) |*o| o.deinit(allocator);
+        var b1 = ondb.core.op.Batch{
+            .header = .{ .actor = 10, .start = 1, .end = 1, .parents = ondb.core.version.Version.ROOT, .wall_ms = 1000 },
+            .ops = &ops1,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b1));
+        const b1_id = ondb.core.id.BatchId{ .actor = 10, .ts = 1 };
+        try h.dag.setBatchLocation(allocator, b1_id, .{ .seg_id = 1, .offset = 0, .len = 64, .flags = 1 });
+
+        var p2 = try h.headsClone();
+        defer p2.deinit(allocator);
+        var ops2 = [_]ondb.core.op.Op{.{ .create_file = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "b.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = try allocator.dupe(u8, "two\n") },
+        } }};
+        defer for (&ops2) |*o| o.deinit(allocator);
+        var b2 = ondb.core.op.Batch{
+            .header = .{ .actor = 10, .start = 2, .end = 2, .parents = p2, .wall_ms = 2000 },
+            .ops = &ops2,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b2));
+        const b2_id = ondb.core.id.BatchId{ .actor = 10, .ts = 2 };
+        try h.dag.setBatchLocation(allocator, b2_id, .{ .seg_id = 1, .offset = 64, .len = 80, .flags = 2 });
+
+        _ = try ondb.store.snapshot.SnapshotWriter.writeCompactedBase(allocator, io, snap_dir, "base1.snap", .{
+            .history = &h,
+            .generation = 1,
+            .base_generation = 1,
+            .wal_cutoff_seq = 2,
+            .created_ms = 2000,
+        });
+
+        const r1 = try ondb.store.snapshot.SnapshotReader.open(allocator, io, snap_dir, "base1.snap");
+        defer r1.release();
+        const st1 = try ondb.store.snapshot.SnapshotStack.create(allocator, r1, null);
+        defer st1.release();
+
+        var h2 = try ondb.core.history.History.init(allocator, 9202);
+        defer h2.deinit();
+        var ms = try st1.loadStateIntoHistory(allocator, &h2);
+        ms.deinit(allocator);
+        h2.attachSnapshotSources(st1.dagSource(), st1.inodeSource(), st1.nodeSource(), st1.insertionSource());
+
+        try h2.dag.setBatchLocation(allocator, b2_id, .{ .seg_id = 2, .offset = 512, .len = 120, .flags = 7 });
+
+        _ = try ondb.store.snapshot.SnapshotWriter.writeDelta(allocator, io, snap_dir, "delta1.snap", .{
+            .history = &h2,
+            .stack = st1,
+            .generation = 2,
+            .base_generation = 1,
+            .wal_cutoff_seq = 2,
+            .created_ms = 3000,
+        });
+
+        _ = try ondb.store.snapshot.SnapshotWriter.writeCompactedBase(allocator, io, snap_dir, "base2.snap", .{
+            .history = &h2,
+            .stack = st1,
+            .generation = 3,
+            .base_generation = 3,
+            .wal_cutoff_seq = 2,
+            .created_ms = 4000,
+        });
+
+        const rd = try ondb.store.snapshot.SnapshotReader.open(allocator, io, snap_dir, "delta1.snap");
+        defer rd.release();
+        const md2 = rd.dagGetBatchMeta(b2_id).?;
+        try testing.expectEqual(@as(u32, 2), md2.log_seg);
+        try testing.expectEqual(@as(u64, 512), md2.log_off);
+        try testing.expectEqual(@as(u32, 120), md2.log_len);
+        try testing.expectEqual(@as(u16, 7), md2.flags);
+
+        const r2 = try ondb.store.snapshot.SnapshotReader.open(allocator, io, snap_dir, "base2.snap");
+        defer r2.release();
+        const mb1 = r2.dagGetBatchMeta(b1_id).?;
+        try testing.expectEqual(@as(u32, 1), mb1.log_seg);
+        try testing.expectEqual(@as(u64, 0), mb1.log_off);
+        try testing.expectEqual(@as(u32, 64), mb1.log_len);
+        try testing.expectEqual(@as(u16, 1), mb1.flags);
+
+        const mb2 = r2.dagGetBatchMeta(b2_id).?;
+        try testing.expectEqual(@as(u32, 2), mb2.log_seg);
+        try testing.expectEqual(@as(u64, 512), mb2.log_off);
+        try testing.expectEqual(@as(u32, 120), mb2.log_len);
+        try testing.expectEqual(@as(u16, 7), mb2.flags);
+    }
+
+    {
+        const SV = ondb.store.snapshot.SlottedView;
+
+        var short_page: [16]u8 = @splat(0);
+        try testing.expect(SV.pageRecord(&short_page, 0) == null);
+
+        var bad_cnt_page: [64]u8 = @splat(0);
+        std.mem.writeInt(u32, bad_cnt_page[12..16], 0xFFFF_FFFF, .little);
+        try testing.expect(SV.pageRecord(&bad_cnt_page, 0) == null);
+
+        var slots_oob_page: [32]u8 = @splat(0);
+        std.mem.writeInt(u32, slots_oob_page[12..16], 10, .little);
+        try testing.expect(SV.pageRecord(&slots_oob_page, 0) == null);
+
+        var ovf_off_page: [64]u8 = @splat(0);
+        std.mem.writeInt(u32, ovf_off_page[12..16], 1, .little);
+        std.mem.writeInt(u32, ovf_off_page[24..28], 0xFFFF_FFFE, .little);
+        std.mem.writeInt(u32, ovf_off_page[28..32], 0xFFFF_FFFF, .little);
+        try testing.expect(SV.pageRecord(&ovf_off_page, 0) == null);
+
+        var rev_off_page: [64]u8 = @splat(0);
+        std.mem.writeInt(u32, rev_off_page[12..16], 1, .little);
+        std.mem.writeInt(u32, rev_off_page[24..28], 50, .little);
+        std.mem.writeInt(u32, rev_off_page[28..32], 40, .little);
+        try testing.expect(SV.pageRecord(&rev_off_page, 0) == null);
+
+        var overlap_page: [64]u8 = @splat(0);
+        std.mem.writeInt(u32, overlap_page[12..16], 1, .little);
+        std.mem.writeInt(u32, overlap_page[24..28], 20, .little);
+        std.mem.writeInt(u32, overlap_page[28..32], 40, .little);
+        try testing.expect(SV.pageRecord(&overlap_page, 0) == null);
+
+        var klen_ovf_page: [64]u8 = @splat(0);
+        std.mem.writeInt(u32, klen_ovf_page[12..16], 1, .little);
+        std.mem.writeInt(u32, klen_ovf_page[24..28], 32, .little);
+        std.mem.writeInt(u32, klen_ovf_page[28..32], 48, .little);
+        std.mem.writeInt(u32, klen_ovf_page[32..36], 0xFFFF_FFF0, .little);
+        try testing.expect(SV.pageRecord(&klen_ovf_page, 0) == null);
+
+        var valid_page: [64]u8 = @splat(0);
+        std.mem.writeInt(u32, valid_page[12..16], 1, .little);
+        std.mem.writeInt(u32, valid_page[24..28], 32, .little);
+        std.mem.writeInt(u32, valid_page[28..32], 43, .little);
+        std.mem.writeInt(u32, valid_page[32..36], 3, .little);
+        @memcpy(valid_page[36..39], "abc");
+        @memcpy(valid_page[39..43], "1234");
+        const rec = SV.pageRecord(&valid_page, 0).?;
+        try testing.expectEqualStrings("abc", rec.key);
+        try testing.expectEqualStrings("1234", rec.val);
+    }
+
+    {
+        const SliceResolverCtx = struct {
+            bytes: []const u8,
+            fn resolve(ptr: *const anyopaque, _: ondb.core.id.InsertionKey) ?[]const u8 {
+                const self: *const @This() = @ptrCast(@alignCast(ptr));
+                return self.bytes;
+            }
+        };
+
+        const payload1 = "alpha\nbeta\ngamma\ndelta\n";
+        var ctx1 = SliceResolverCtx{ .bytes = payload1 };
+        var t1 = try ondb.core.text.Text.fromInsertion(allocator, .{ .actor = 1, .ts = 1 }, 0, 0, payload1.len, null);
+        defer t1.deinit(allocator);
+        try testing.expect(t1.summary().unknown_newlines);
+        t1.setContentResolver(.{ .ptr = &ctx1, .resolveFn = SliceResolverCtx.resolve });
+        try testing.expectEqual(@as(usize, 4), t1.lineCount());
+
+        const payload2 = "one\ntwo\nthree";
+        var ctx2 = SliceResolverCtx{ .bytes = payload2 };
+        var t2 = try ondb.core.text.Text.fromInsertion(allocator, .{ .actor = 1, .ts = 2 }, 0, 0, payload2.len, null);
+        defer t2.deinit(allocator);
+        t2.setContentResolver(.{ .ptr = &ctx2, .resolveFn = SliceResolverCtx.resolve });
+        try testing.expectEqual(@as(usize, 3), t2.lineCount());
+
+        const MockGit = struct {
+            oid: ondb.core.id.GitOid,
+            data: []const u8,
+
+            fn readAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, oid: ondb.core.id.GitOid) std.mem.Allocator.Error!?[]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.oid.eql(oid)) return try alloc.dupe(u8, self.data);
+                return null;
+            }
+            fn readCached(ptr: *anyopaque, oid: ondb.core.id.GitOid) ?[]const u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.oid.eql(oid)) return self.data;
+                return null;
+            }
+            fn contains(ptr: *anyopaque, oid: ondb.core.id.GitOid) bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.oid.eql(oid);
+            }
+        };
+
+        var oid = ondb.core.id.GitOid{ .len = 20, .bytes = @splat(0) };
+        @memcpy(oid.bytes[0..20], "0123456789abcdefghij");
+        var mock_git = MockGit{ .oid = oid, .data = "l1\nl2\nl3\nl4\nl5\n" };
+
+        var hg = try ondb.core.history.History.init(allocator, 9203);
+        defer hg.deinit();
+        hg.setGitReader(.{
+            .ptr = &mock_git,
+            .readAllocFn = MockGit.readAlloc,
+            .readCachedFn = MockGit.readCached,
+            .containsFn = MockGit.contains,
+        });
+
+        var gops = [_]ondb.core.op.Op{.{ .create_file = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "lazy.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .git_text_blob = .{ .oid = oid, .len = mock_git.data.len } },
+        } }};
+        defer for (&gops) |*o| o.deinit(allocator);
+        var gb = ondb.core.op.Batch{
+            .header = .{ .actor = 33, .start = 1, .end = 1, .parents = ondb.core.version.Version.ROOT, .wall_ms = 100 },
+            .ops = &gops,
+            .blobs = &.{},
+        };
+        try testing.expect(try hg.integrate(&gb));
+        const lazy_iid = (try hg.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "lazy.txt")).?;
+        const lazy_node = hg.tree.get(lazy_iid).?;
+        try testing.expectEqual(@as(usize, 5), lazy_node.fileConstPtr().?.text.lineCount());
+
+        var gp = try hg.headsClone();
+        defer gp.deinit(allocator);
+        var esplices = [_]ondb.core.diff.Splice{.{ .at = mock_git.data.len, .del = 0, .ins = 3 }};
+        var edit_ops = [_]ondb.core.op.Op{.{ .edit_text = .{
+            .inode = lazy_iid,
+            .text = try allocator.dupe(u8, "l6\n"),
+            .splices = &esplices,
+        } }};
+        defer allocator.free(edit_ops[0].edit_text.text);
+        var eb = ondb.core.op.Batch{
+            .header = .{ .actor = 33, .start = 2, .end = 2, .parents = gp, .wall_ms = 200 },
+            .ops = &edit_ops,
+            .blobs = &.{},
+        };
+        try testing.expect(try hg.integrate(&eb));
+        const lazy_node2 = hg.tree.get(lazy_iid).?;
+        try testing.expectEqual(@as(usize, 6), lazy_node2.fileConstPtr().?.text.lineCount());
+    }
+
+    {
+        const lru_path = tmp_root ++ "/lru_snap";
+        try std.Io.Dir.cwd().createDirPath(io, lru_path);
+        var lru_dir = try std.Io.Dir.cwd().openDir(io, lru_path, .{ .iterate = true });
+        defer lru_dir.close(io);
+
+        var h = try ondb.core.history.History.init(allocator, 9204);
+        defer h.deinit();
+
+        var next_ts: u64 = 1;
+        var d1_ops = [_]ondb.core.op.Op{.{ .create_dir = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "a"),
+        } }};
+        defer for (&d1_ops) |*o| o.deinit(allocator);
+        var db1 = ondb.core.op.Batch{
+            .header = .{ .actor = 40, .start = next_ts, .end = next_ts, .parents = ondb.core.version.Version.ROOT, .wall_ms = 100 },
+            .ops = &d1_ops,
+            .blobs = &.{},
+        };
+        next_ts += 1;
+        try testing.expect(try h.integrate(&db1));
+        const dir_a = (try h.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "a")).?;
+
+        var dp2 = try h.headsClone();
+        defer dp2.deinit(allocator);
+        var d2_ops = [_]ondb.core.op.Op{.{ .create_dir = .{
+            .parent = dir_a,
+            .name = try allocator.dupe(u8, "b"),
+        } }};
+        defer for (&d2_ops) |*o| o.deinit(allocator);
+        var db2 = ondb.core.op.Batch{
+            .header = .{ .actor = 40, .start = next_ts, .end = next_ts, .parents = dp2, .wall_ms = 110 },
+            .ops = &d2_ops,
+            .blobs = &.{},
+        };
+        next_ts += 1;
+        try testing.expect(try h.integrate(&db2));
+        const dir_b = (try h.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "a/b")).?;
+
+        var fids: [6]ondb.core.id.InodeId = undefined;
+        for (0..6) |i| {
+            var fp = try h.headsClone();
+            defer fp.deinit(allocator);
+            const fname = try std.fmt.allocPrint(allocator, "f{d}.txt", .{i});
+            const body = try std.fmt.allocPrint(allocator, "orig-{d}\n", .{i});
+            var fops = [_]ondb.core.op.Op{.{ .create_file = .{
+                .parent = dir_b,
+                .name = fname,
+                .mode = .regular,
+                .line_ending = .lf,
+                .content = .{ .text_inline = body },
+            } }};
+            defer for (&fops) |*o| o.deinit(allocator);
+            var fb = ondb.core.op.Batch{
+                .header = .{ .actor = 40, .start = next_ts, .end = next_ts, .parents = fp, .wall_ms = @intCast(200 + i) },
+                .ops = &fops,
+                .blobs = &.{},
+            };
+            next_ts += 1;
+            try testing.expect(try h.integrate(&fb));
+            const full = try std.fmt.allocPrint(allocator, "a/b/f{d}.txt", .{i});
+            defer allocator.free(full);
+            fids[i] = (try h.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, full)).?;
+        }
+
+        var v_before = try h.headsClone();
+        defer v_before.deinit(allocator);
+
+        _ = try ondb.store.snapshot.SnapshotWriter.writeCompactedBase(allocator, io, lru_dir, "lru.snap", .{
+            .history = &h,
+            .generation = 1,
+            .base_generation = 1,
+            .wal_cutoff_seq = 10,
+            .created_ms = 300,
+        });
+
+        const rl = try ondb.store.snapshot.SnapshotReader.open(allocator, io, lru_dir, "lru.snap");
+        defer rl.release();
+        const stl = try ondb.store.snapshot.SnapshotStack.create(allocator, rl, null);
+        defer stl.release();
+
+        var h2 = try ondb.core.history.History.init(allocator, 9204);
+        defer h2.deinit();
+        var msl = try stl.loadStateIntoHistory(allocator, &h2);
+        msl.deinit(allocator);
+        h2.attachSnapshotSources(stl.dagSource(), stl.inodeSource(), stl.nodeSource(), stl.insertionSource());
+        h2.tree.setCleanCacheBudget(1, 1);
+
+        var p0 = (try h2.tree.placementIn(allocator, ondb.core.text.View.EVERYTHING, fids[0])).?;
+        defer p0.deinit(allocator);
+        for (1..6) |i| {
+            _ = h2.tree.get(fids[i]);
+        }
+        try testing.expectEqualStrings("f0.txt", p0.value.name);
+        try testing.expect(p0.value.parent.eql(dir_b));
+
+        const p0_path = (try h2.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, fids[0])).?;
+        defer allocator.free(p0_path);
+        try testing.expectEqualStrings("a/b/f0.txt", p0_path);
+
+        var mp = try h2.headsClone();
+        defer mp.deinit(allocator);
+        var mut_splices = [_]ondb.core.diff.Splice{.{ .at = 0, .del = 0, .ins = 8 }};
+        var mut_ops = [_]ondb.core.op.Op{
+            .{ .edit_text = .{ .inode = fids[0], .text = try allocator.dupe(u8, "MUTATED-"), .splices = &mut_splices } },
+            .{ .remove = .{ .inode = fids[1] } },
+        };
+        defer allocator.free(mut_ops[0].edit_text.text);
+        var mb = ondb.core.op.Batch{
+            .header = .{ .actor = 41, .start = next_ts, .end = next_ts + 1, .parents = mp, .wall_ms = 400 },
+            .ops = &mut_ops,
+            .blobs = &.{},
+        };
+        try testing.expect(try h2.integrate(&mb));
+
+        try testing.expectEqual(@as(?[]u8, null), try h2.readFileAt(allocator, "a/b/f1.txt", &h2.dag.heads));
+
+        var rb = (try h2.buildRollbackBatch(allocator, 41, &v_before, 500)).?;
+        defer rb.deinit(allocator);
+        try testing.expect(try h2.integrate(&rb));
+
+        const c0 = (try h2.readFileAt(allocator, "a/b/f0.txt", &h2.dag.heads)).?;
+        defer allocator.free(c0);
+        try testing.expectEqualStrings("orig-0\n", c0);
+        const c1 = (try h2.readFileAt(allocator, "a/b/f1.txt", &h2.dag.heads)).?;
+        defer allocator.free(c1);
+        try testing.expectEqualStrings("orig-1\n", c1);
+
+        var hc1 = try ondb.core.history.History.init(allocator, 9205);
+        defer hc1.deinit();
+        var hc2 = try ondb.core.history.History.init(allocator, 9205);
+        defer hc2.deinit();
+
+        var ca_ops = [_]ondb.core.op.Op{.{ .create_file = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "dup.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = try allocator.dupe(u8, "from-a\n") },
+        } }};
+        defer for (&ca_ops) |*o| o.deinit(allocator);
+        var ba = ondb.core.op.Batch{
+            .header = .{ .actor = 50, .start = 1, .end = 1, .parents = ondb.core.version.Version.ROOT, .wall_ms = 100 },
+            .ops = &ca_ops,
+            .blobs = &.{},
+        };
+        try testing.expect(try hc1.integrate(&ba));
+
+        var cb_ops = [_]ondb.core.op.Op{.{ .create_file = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "dup.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = try allocator.dupe(u8, "from-b\n") },
+        } }};
+        defer for (&cb_ops) |*o| o.deinit(allocator);
+        var bb = ondb.core.op.Batch{
+            .header = .{ .actor = 60, .start = 1, .end = 1, .parents = ondb.core.version.Version.ROOT, .wall_ms = 100 },
+            .ops = &cb_ops,
+            .blobs = &.{},
+        };
+        try testing.expect(try hc2.integrate(&bb));
+        try testing.expect(try hc1.integrate(&bb));
+
+        const id_a = ondb.core.id.InodeId{ .op = .{ .actor = 50, .ts = 1 }, .part = 0 };
+        const id_b = ondb.core.id.InodeId{ .op = .{ .actor = 60, .ts = 1 }, .part = 0 };
+        const pa = (try hc1.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, id_a)).?;
+        defer allocator.free(pa);
+        const pb = (try hc1.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, id_b)).?;
+        defer allocator.free(pb);
+        try testing.expect(std.mem.startsWith(u8, pa, "dup.txt~"));
+        try testing.expectEqualStrings("dup.txt", pb);
+        try testing.expect(!std.mem.eql(u8, pa, pb));
+    }
+
+    {
+        const blob_root = tmp_root ++ "/blobs_audit";
+        try std.Io.Dir.cwd().createDirPath(io, blob_root);
+        var bdir = try std.Io.Dir.cwd().openDir(io, blob_root, .{ .iterate = true });
+        defer bdir.close(io);
+
+        var fa = testing.FailingAllocator.init(allocator, .{ .fail_index = std.math.maxInt(usize) });
+        const falloc = fa.allocator();
+
+        var h_a: ondb.store.crypto.Hash = undefined;
+        var h_b: ondb.store.crypto.Hash = undefined;
+        {
+            var bs = try ondb.store.blobs.BlobStore.open(falloc, io, bdir, "seal_fail", 0);
+            defer bs.deinit();
+
+            h_a = try bs.put("blob-A-payload-must-survive-failed-seal");
+            fa.fail_index = fa.alloc_index + 1;
+            try testing.expectError(error.OutOfMemory, bs.sealActivePack());
+            fa.fail_index = std.math.maxInt(usize);
+
+            try testing.expect(bs.active_file != null);
+            try testing.expect(bs.active_write_offset > 0);
+
+            h_b = try bs.put("blob-B-payload-after-failed-seal");
+
+            const got_a = (try bs.get(allocator, h_a)).?;
+            defer allocator.free(got_a);
+            try testing.expectEqualStrings("blob-A-payload-must-survive-failed-seal", got_a);
+
+            const got_b = (try bs.get(allocator, h_b)).?;
+            defer allocator.free(got_b);
+            try testing.expectEqualStrings("blob-B-payload-after-failed-seal", got_b);
+
+            try bs.sealActivePack();
+        }
+        {
+            var bs2 = try ondb.store.blobs.BlobStore.open(allocator, io, bdir, "seal_fail", 0);
+            defer bs2.deinit();
+            const got_a = (try bs2.get(allocator, h_a)).?;
+            defer allocator.free(got_a);
+            try testing.expectEqualStrings("blob-A-payload-must-survive-failed-seal", got_a);
+            const got_b = (try bs2.get(allocator, h_b)).?;
+            defer allocator.free(got_b);
+            try testing.expectEqualStrings("blob-B-payload-after-failed-seal", got_b);
+        }
+
+        {
+            const pre_dir_path = blob_root ++ "/preexist";
+            try std.Io.Dir.cwd().createDirPath(io, pre_dir_path);
+            const sentinel = "EXISTING_UNINDEXED_PACK_DATA";
+            try writeVerifyFile(io, pre_dir_path ++ "/pack-00000001.pack", sentinel);
+
+            var h_c: ondb.store.crypto.Hash = undefined;
+            {
+                var bs = try ondb.store.blobs.BlobStore.open(allocator, io, bdir, "preexist", 0);
+                defer bs.deinit();
+                h_c = try bs.put("blob-C-on-pack-2");
+                try bs.sealActivePack();
+            }
+
+            const f = try std.Io.Dir.cwd().openFile(io, pre_dir_path ++ "/pack-00000001.pack", .{});
+            defer f.close(io);
+            var buf: [64]u8 = undefined;
+            const n = try f.readPositionalAll(io, &buf, 0);
+            try testing.expectEqualStrings(sentinel, buf[0..n]);
+
+            var bs2 = try ondb.store.blobs.BlobStore.open(allocator, io, bdir, "preexist", 0);
+            defer bs2.deinit();
+            const got_c = (try bs2.get(allocator, h_c)).?;
+            defer allocator.free(got_c);
+            try testing.expectEqualStrings("blob-C-on-pack-2", got_c);
+        }
+
+        const log_root = tmp_root ++ "/log_audit";
+        try std.Io.Dir.cwd().createDirPath(io, log_root);
+        var ldir = try std.Io.Dir.cwd().openDir(io, log_root, .{ .iterate = true });
+        defer ldir.close(io);
+
+        var valid_end: u64 = 0;
+        {
+            var al = try ondb.store.log.AppendLog.open(allocator, io, ldir, "audit.0ndb", true);
+            defer al.deinit();
+            _ = try al.append(1, 0, 0, "frame-zero");
+            _ = try al.append(1, 0, 0, "frame-one");
+            _ = try al.append(1, 0, 0, "frame-two");
+            valid_end = al.write_offset;
+        }
+        {
+            const f = try ldir.openFile(io, "audit.0ndb", .{ .mode = .read_write });
+            defer f.close(io);
+            const junk = "TORN_TAIL_GARBAGE!!";
+            try f.writePositionalAll(io, junk, valid_end);
+        }
+        {
+            var al = try ondb.store.log.AppendLog.open(allocator, io, ldir, "audit.0ndb", true);
+            defer al.deinit();
+            try testing.expectEqual(@as(usize, 3), al.count());
+            try testing.expectEqual(valid_end, al.write_offset);
+
+            const st = try al.file.stat(io);
+            try testing.expectEqual(valid_end, st.size);
+
+            const keep = [_]usize{ 0, 2 };
+            try al.compact(ldir, "audit.0ndb", &keep);
+            try testing.expectEqual(@as(usize, 2), al.count());
+        }
+        {
+            var al = try ondb.store.log.AppendLog.open(allocator, io, ldir, "audit.0ndb", true);
+            defer al.deinit();
+            try testing.expectEqual(@as(usize, 2), al.count());
+            const f0 = try al.readAt(0);
+            try testing.expectEqualStrings("frame-zero", f0.payload);
+            const f1 = try al.readAt(1);
+            try testing.expectEqualStrings("frame-two", f1.payload);
+
+            const saved_len = al.index.items[0].payload_len;
+            al.index.items[0].payload_len = 0x7FFF_FFFF;
+            try testing.expectError(error.CorruptLog, al.readAt(0));
+            al.index.items[0].payload_len = saved_len;
+
+            const saved_off = al.index.items[0].offset;
+            al.index.items[0].offset = std.math.maxInt(u64) - 4;
+            try testing.expectError(error.CorruptLog, al.readAt(0));
+            al.index.items[0].offset = saved_off;
+        }
     }
 }

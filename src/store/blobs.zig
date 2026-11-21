@@ -459,15 +459,25 @@ pub const BlobStore = struct {
 
     fn ensureActiveFile(self: *BlobStore) !Io.File {
         if (self.active_file) |f| return f;
-        var name_buf: [20]u8 = undefined;
-        const fname = packFileName(self.active_pack_id, &name_buf);
-        const f = try self.dir.createFile(self.io, fname, .{
-            .read = true,
-            .truncate = false,
-        });
-        self.active_file = f;
-        self.active_write_offset = 0;
-        return f;
+        while (true) {
+            var name_buf: [20]u8 = undefined;
+            const fname = packFileName(self.active_pack_id, &name_buf);
+            const f = try self.dir.createFile(self.io, fname, .{
+                .read = true,
+                .truncate = false,
+            });
+            errdefer f.close(self.io);
+            const st = try f.stat(self.io);
+            if (st.size > 0 and self.active_index.count() == 0) {
+                f.close(self.io);
+                if (self.active_pack_id == std.math.maxInt(u32)) return error.PackIdOverflow;
+                self.active_pack_id += 1;
+                continue;
+            }
+            self.active_file = f;
+            self.active_write_offset = st.size;
+            return f;
+        }
     }
 
     fn writePackIdxEntries(self: *BlobStore, entries: []PackIdxEntry, max_pack_id: u32) !void {
@@ -549,8 +559,6 @@ pub const BlobStore = struct {
         }
 
         try mmap.fdatasyncFile(self.io, f);
-        f.close(self.io);
-        self.active_file = null;
 
         const sealed_id = self.active_pack_id;
 
@@ -564,9 +572,17 @@ pub const BlobStore = struct {
         }
 
         const new_max = @max(self.indexed_max_pack_id, sealed_id);
-        try self.writeMergedPackIdx(new_entries, new_max);
+        const had_map = self.sealed_packs.contains(sealed_id);
         _ = try self.getSealedPackMap(sealed_id);
+        errdefer if (!had_map) {
+            if (self.sealed_packs.fetchRemove(sealed_id)) |kv| {
+                kv.value.release(self.allocator);
+            }
+        };
+        try self.writeMergedPackIdx(new_entries, new_max);
 
+        f.close(self.io);
+        self.active_file = null;
         self.active_index.clearRetainingCapacity();
         self.active_write_offset = 0;
         self.active_pack_id = new_max + 1;

@@ -158,6 +158,73 @@ const ExternalReadCache = lru.LruCache(ReadCacheKey, []u8, sliceSizeFn, sliceDei
 const ReadCacheBox = struct {
     allocator: Allocator,
     cache: ExternalReadCache,
+    git_reader: ?ExternalGitReader = null,
+    blob_reader: ?ExternalBlobReader = null,
+    insertion_source: ?InsertionSource = null,
+    lazy_git_oids: std.AutoHashMapUnmanaged(id.InsertionKey, id.GitOid) = .empty,
+    lazy_blob_oids: std.AutoHashMapUnmanaged(id.InsertionKey, id.Oid) = .empty,
+
+    fn deinit(self: *ReadCacheBox) void {
+        self.cache.deinit();
+        self.lazy_git_oids.deinit(self.allocator);
+        self.lazy_blob_oids.deinit(self.allocator);
+    }
+
+    fn resolveBlob(self: *ReadCacheBox, oid: id.Oid) ?[]const u8 {
+        const ckey = ReadCacheKey.forBlob(oid);
+        if (self.cache.get(ckey)) |slot| return slot.*;
+        if (self.blob_reader) |br| {
+            const loaded = (br.readAlloc(self.allocator, oid) catch return null) orelse return null;
+            const slot = self.cache.put(ckey, loaded) catch {
+                self.allocator.free(loaded);
+                return null;
+            };
+            return slot.*;
+        }
+        return null;
+    }
+
+    fn resolveGitBlob(self: *ReadCacheBox, goid: id.GitOid) ?[]const u8 {
+        const ckey = ReadCacheKey.forGit(goid);
+        if (self.cache.get(ckey)) |slot| return slot.*;
+        if (self.git_reader) |gr| {
+            if (gr.readCached(goid)) |cached| return cached;
+            const loaded = (gr.readAlloc(self.allocator, goid) catch return null) orelse return null;
+            const slot = self.cache.put(ckey, loaded) catch {
+                self.allocator.free(loaded);
+                return null;
+            };
+            return slot.*;
+        }
+        return null;
+    }
+
+    fn resolveInsertion(ptr: *const anyopaque, key: id.InsertionKey) ?[]const u8 {
+        const self: *ReadCacheBox = @ptrCast(@alignCast(@constCast(ptr)));
+        if (self.lazy_git_oids.get(key)) |goid| {
+            if (self.resolveGitBlob(goid)) |b| return b;
+        }
+        if (self.lazy_blob_oids.get(key)) |oid| {
+            if (self.resolveBlob(oid)) |b| return b;
+        }
+        if (self.insertion_source) |src| {
+            if (src.lookup(key)) |found| {
+                return switch (found) {
+                    .inline_bytes => |b| b,
+                    .blob_oid => |oid| self.resolveBlob(oid),
+                    .git_oid => |goid| self.resolveGitBlob(goid),
+                };
+            }
+        }
+        return null;
+    }
+
+    fn contentResolver(self: *ReadCacheBox) text_mod.ContentResolver {
+        return .{
+            .ptr = self,
+            .resolveFn = resolveInsertion,
+        };
+    }
 };
 
 pub const BlameLine = struct {
@@ -257,6 +324,7 @@ pub const History = struct {
                 .max_entries = 512,
             }),
         };
+        t.setContentResolver(box.contentResolver());
         return .{
             .allocator = allocator,
             .history_id = history_id,
@@ -297,10 +365,14 @@ pub const History = struct {
         }
         self.meta.deinit(self.allocator);
         if (self.read_cache_box) |box| {
-            box.cache.deinit();
+            box.deinit();
             self.allocator.destroy(box);
             self.read_cache_box = null;
         }
+    }
+
+    fn lazyTextResolver(self: *const History) ?text_mod.ContentResolver {
+        return if (self.read_cache_box) |box| box.contentResolver() else null;
     }
 
     pub fn setLogReader(self: *History, reader: ?LogSliceReader) void {
@@ -309,10 +381,12 @@ pub const History = struct {
 
     pub fn setGitReader(self: *History, reader: ?ExternalGitReader) void {
         self.git_reader = reader;
+        if (self.read_cache_box) |box| box.git_reader = reader;
     }
 
     pub fn setBlobReader(self: *History, reader: ?ExternalBlobReader) void {
         self.blob_reader = reader;
+        if (self.read_cache_box) |box| box.blob_reader = reader;
     }
 
     pub fn attachSnapshotSources(
@@ -326,6 +400,7 @@ pub const History = struct {
         self.tree.setSource(inode_src);
         self.node_source = node_src;
         self.insertion_source = ins_src;
+        if (self.read_cache_box) |box| box.insertion_source = ins_src;
     }
 
     pub fn attachSnapshotStack(self: *History, stack_opt: anytype) void {
@@ -374,6 +449,10 @@ pub const History = struct {
         var bit = self.blobs.valueIterator();
         while (bit.next()) |s| s.deinit(self.allocator);
         self.blobs.clearRetainingCapacity();
+        if (self.read_cache_box) |box| {
+            box.lazy_git_oids.clearRetainingCapacity();
+            box.lazy_blob_oids.clearRetainingCapacity();
+        }
         self.clearReadCache();
     }
 
@@ -702,7 +781,7 @@ pub const History = struct {
                         if (inode.fileConstPtr()) |f| {
                             try set_content_prev.put(allocator, iid, .{
                                 .bytes = f.text.visibleLen(),
-                                .lines = f.text.lineCount(),
+                                .lines = f.text.countLines(self.resolver()),
                             });
                         }
                     }
@@ -783,7 +862,7 @@ pub const History = struct {
 
             if (before_alive and !after_alive) {
                 const p = before_path orelse continue;
-                const old_lines = f.text.lineCount();
+                const old_lines = f.text.countLines(res);
                 try files.append(allocator, .{
                     .inode_id = iid,
                     .path = try allocator.dupe(u8, p),
@@ -799,13 +878,13 @@ pub const History = struct {
 
             const ap = after_path orelse continue;
             const bytes_len = f.text.visibleLen();
-            const lines_cnt = f.text.lineCount();
+            const lines_cnt = f.text.countLines(res);
             const is_text = if (f.content.get()) |ck| ck.* == .text else false;
 
             if (!before_alive or before_path == null or !std.mem.eql(u8, before_path.?, ap)) {
                 if (before_alive) {
                     if (before_path) |bp| {
-                        const old_lines = f.text.lineCount();
+                        const old_lines = f.text.countLines(res);
                         try files.append(allocator, .{
                             .inode_id = iid,
                             .path = try allocator.dupe(u8, bp),
@@ -1280,8 +1359,12 @@ pub const History = struct {
                         var old = prev.value;
                         old.deinit(self.allocator);
                     }
+                    if (self.read_cache_box) |box| {
+                        try box.lazy_git_oids.put(box.allocator, lazy_key, ref.oid);
+                    }
                     f.text = try Text.fromInsertion(self.allocator, ck_entry.op, 0, 0, ref.len, null);
                     f.text.node_source = self.node_source;
+                    f.text.content_resolver = self.lazyTextResolver();
                 }
                 return true;
             }
@@ -1335,7 +1418,11 @@ pub const History = struct {
                         var old = prev.value;
                         old.deinit(self.allocator);
                     }
+                    if (self.read_cache_box) |box| {
+                        try box.lazy_git_oids.put(box.allocator, key, ref.oid);
+                    }
                 }
+                f.text.content_resolver = self.lazyTextResolver();
                 f.text.replaceWithLazyInsertion(self.allocator, op_id, view, ref.len, self.resolver()) catch |err| return switch (err) {
                     error.Unordered => error.Unordered,
                     error.OutOfBounds => error.OutOfBounds,
@@ -1403,8 +1490,12 @@ pub const History = struct {
                 if (ref.len > 0) {
                     const key = id.InsertionKey{ .op = op_id, .part = 0 };
                     try self.insertion_blobs.put(self.allocator, key, ref.oid);
+                    if (self.read_cache_box) |box| {
+                        try box.lazy_blob_oids.put(box.allocator, key, ref.oid);
+                    }
                     f.text.deinit(self.allocator);
                     f.text = try Text.fromInsertion(self.allocator, op_id, 0, 0, ref.len, self.resolveBlob(ref.oid));
+                    f.text.content_resolver = self.lazyTextResolver();
                 } else {
                     f.text.deinit(self.allocator);
                 }
@@ -1420,9 +1511,13 @@ pub const History = struct {
                         var old = prev.value;
                         old.deinit(self.allocator);
                     }
+                    if (self.read_cache_box) |box| {
+                        try box.lazy_git_oids.put(box.allocator, key, ref.oid);
+                    }
                     f.text.deinit(self.allocator);
                     f.text = try Text.fromInsertion(self.allocator, op_id, 0, 0, ref.len, null);
                     f.text.node_source = self.node_source;
+                    f.text.content_resolver = self.lazyTextResolver();
                 } else {
                     f.text.deinit(self.allocator);
                 }
@@ -1467,6 +1562,8 @@ pub const History = struct {
         defer self.tree.endPinScope();
         const iid = try self.tree.resolvePath(allocator, View.EVERYTHING, rel_path) orelse return null;
         const inode = self.tree.get(iid) orelse return null;
+        const alive = inode.alive.get() orelse return null;
+        if (!alive.*) return null;
         const f = inode.fileConstPtr() orelse return null;
         const ck = f.content.get() orelse return null;
         return switch (ck.*) {
@@ -1488,6 +1585,8 @@ pub const History = struct {
         defer self.tree.endPinScope();
         const iid = try self.tree.resolvePath(allocator, View.EVERYTHING, rel_path) orelse return null;
         const inode = self.tree.get(iid) orelse return null;
+        const alive = inode.alive.get() orelse return null;
+        if (!alive.*) return null;
         const f = inode.fileConstPtr() orelse return null;
         const ck = f.content.get() orelse return null;
         switch (ck.*) {
@@ -1770,8 +1869,10 @@ pub const History = struct {
         var depth: usize = 0;
         var cur = iid;
         while (!cur.isRoot() and depth < 4096) {
-            const entry = try self.tree.placementIn(allocator, view, cur) orelse break;
-            cur = entry.value.parent;
+            var entry = try self.tree.placementIn(allocator, view, cur) orelse break;
+            const parent = entry.value.parent;
+            entry.deinit(allocator);
+            cur = parent;
             depth += 1;
         }
         return depth;
@@ -1786,6 +1887,8 @@ pub const History = struct {
         wall_ms: u64,
     ) (RevertError || Allocator.Error)!?op_mod.Batch {
         if (diff_batches.len == 0) return null;
+        self.tree.beginPinScope();
+        defer self.tree.endPinScope();
 
         var touched: std.AutoArrayHashMapUnmanaged(id.InodeId, void) = .empty;
         defer touched.deinit(allocator);
@@ -1844,7 +1947,6 @@ pub const History = struct {
 
         const res = self.resolver();
         for (candidates) |iid| {
-            const inode = self.tree.get(iid) orelse continue;
             const now_present = try self.tree.isPresent(allocator, View.EVERYTHING, iid);
             const target_present = try self.tree.isPresent(allocator, target_view, iid);
 
@@ -1856,8 +1958,9 @@ pub const History = struct {
                 continue;
             }
 
-            const now_alive = if (inode.alive.get()) |a| a.* else false;
-            const target_alive = if (inode.alive.getIn(target_view)) |a| a.* else false;
+            const inode_alive = self.tree.get(iid) orelse continue;
+            const now_alive = if (inode_alive.alive.get()) |a| a.* else false;
+            const target_alive = if (inode_alive.alive.getIn(target_view)) |a| a.* else false;
             if (target_alive and !now_alive) {
                 try restore_set.put(allocator, iid, {});
             }
@@ -1866,8 +1969,9 @@ pub const History = struct {
             var guard: usize = 0;
             while (!anc.isRoot() and guard < 4096) {
                 guard += 1;
-                const anc_entry = try self.tree.placementIn(allocator, target_view, anc) orelse break;
+                var anc_entry = try self.tree.placementIn(allocator, target_view, anc) orelse break;
                 const p = anc_entry.value.parent;
+                anc_entry.deinit(allocator);
                 if (p.isRoot()) break;
                 if (self.tree.get(p)) |pinode| {
                     const p_now_alive = if (pinode.alive.get()) |a| a.* else false;
@@ -1879,8 +1983,11 @@ pub const History = struct {
                 anc = p;
             }
 
-            const now_entry = try self.tree.placementIn(allocator, View.EVERYTHING, iid);
-            const target_entry = try self.tree.placementIn(allocator, target_view, iid);
+            var now_entry = try self.tree.placementIn(allocator, View.EVERYTHING, iid);
+            defer if (now_entry) |*ne| ne.deinit(allocator);
+            var target_entry = try self.tree.placementIn(allocator, target_view, iid);
+            defer if (target_entry) |*te| te.deinit(allocator);
+            const inode = self.tree.get(iid) orelse continue;
             if (target_entry) |te| {
                 const tp = &te.value;
                 const eff_moved = if (now_entry) |ne|
