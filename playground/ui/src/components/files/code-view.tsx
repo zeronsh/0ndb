@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDown, ArrowUp } from 'lucide-react'
 import { highlight } from '@/lib/highlight'
 
@@ -18,6 +18,7 @@ export const CodeView = memo(function CodeView({ code, lang, changed, flashKey }
   const host = useRef<HTMLDivElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
   const [offscreen, setOffscreen] = useState<'above' | 'below' | null>(null)
+  const changedSet = useMemo(() => new Set(changed), [changed])
 
   useEffect(() => {
     let alive = true
@@ -37,10 +38,9 @@ export const CodeView = memo(function CodeView({ code, lang, changed, flashKey }
     const el = host.current
     if (!el) return
     const lines = el.querySelectorAll<HTMLElement>('.line')
-    const set = new Set(changed)
     const toFlash: HTMLElement[] = []
     lines.forEach((ln, i) => {
-      const hit = set.has(i)
+      const hit = changedSet.has(i)
       ln.classList.toggle('is-recent', hit)
       if (ln.classList.contains('is-changed')) ln.classList.remove('is-changed')
       if (hit && flashKey) toFlash.push(ln)
@@ -60,7 +60,7 @@ export const CodeView = memo(function CodeView({ code, lang, changed, flashKey }
     if (top < sc.scrollTop) setOffscreen('above')
     else if (top > sc.scrollTop + sc.clientHeight - 24) setOffscreen('below')
     else setOffscreen(null)
-  }, [html, changed, flashKey])
+  }, [html, changed, changedSet, flashKey])
 
   const jump = () => {
     const el = host.current?.querySelectorAll<HTMLElement>('.line')[changed[0]]
@@ -80,7 +80,7 @@ export const CodeView = memo(function CodeView({ code, lang, changed, flashKey }
         <div className="flex min-w-max py-3">
           <div className="sticky left-0 z-[1] shrink-0 bg-background pr-1 pl-4 text-right text-muted-foreground/50 select-none tabular">
             {Array.from({ length: n }, (_, i) => (
-              <div key={i} className={changed.includes(i) ? 'text-ok' : undefined}>
+              <div key={i} className={changedSet.has(i) ? 'text-ok' : undefined}>
                 {i + 1}
               </div>
             ))}

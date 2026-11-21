@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { ChevronRight, FileMinus2, FilePlus2, FileDiff } from 'lucide-react'
-import { diffStat, hunks, lineDiff } from '@/lib/diff'
+import { diffStat, hunks, lineDiff, type DiffLine } from '@/lib/diff'
 import { cn } from '@/lib/utils'
 
 export function DiffStat({ added, removed, className }: { added: number; removed: number; className?: string }) {
@@ -13,8 +13,8 @@ export function DiffStat({ added, removed, className }: { added: number; removed
   )
 }
 
-export function DiffLines({ before, after, context = 3, className }: { before: string; after: string; context?: number; className?: string }) {
-  const lines = useMemo(() => lineDiff(before, after), [before, after])
+export function DiffLines({ before, after, precomputed, context = 3, className }: { before: string; after: string; precomputed?: DiffLine[]; context?: number; className?: string }) {
+  const lines = useMemo(() => precomputed ?? lineDiff(before, after), [precomputed, before, after])
   const hs = useMemo(() => hunks(lines, context), [lines, context])
   if (!hs.length) return <div className="px-3 py-2 text-[12px] text-muted-foreground">No textual changes.</div>
   return (
@@ -48,7 +48,8 @@ export function DiffLines({ before, after, context = 3, className }: { before: s
 
 export function FileDiffCard({ path, status, before, after, defaultOpen = true }: { path: string; status: 'added' | 'removed' | 'modified'; before: string | null; after: string | null; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen)
-  const stat = useMemo(() => diffStat(lineDiff(before ?? '', after ?? '')), [before, after])
+  const diffLines = useMemo(() => lineDiff(before ?? '', after ?? ''), [before, after])
+  const stat = useMemo(() => diffStat(diffLines), [diffLines])
   const Icon = status === 'added' ? FilePlus2 : status === 'removed' ? FileMinus2 : FileDiff
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card">
@@ -59,7 +60,7 @@ export function FileDiffCard({ path, status, before, after, defaultOpen = true }
         {status !== 'modified' ? <span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">{status}</span> : null}
         <DiffStat added={stat.added} removed={stat.removed} className="ml-auto" />
       </button>
-      {open ? <DiffLines before={before ?? ''} after={after ?? ''} className="border-t border-hairline py-1" /> : null}
+      {open ? <DiffLines before={before ?? ''} after={after ?? ''} precomputed={diffLines} className="border-t border-hairline py-1" /> : null}
     </div>
   )
 }

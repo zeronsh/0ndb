@@ -1,6 +1,6 @@
-import type { TraceTool } from './api'
-import { stripAnsi } from './ansi'
-import { duration } from './format'
+import type { TraceTool } from './api.ts'
+import { stripAnsi } from './ansi.ts'
+import { duration } from './format.ts'
 
 export type ToolKind = 'run' | 'read' | 'write' | 'edit' | 'search' | 'list' | 'web' | 'fetch' | 'plan' | 'agent' | 'tool'
 export type ToolStatus = 'running' | 'done' | 'failed' | 'interrupted'

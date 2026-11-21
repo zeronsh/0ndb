@@ -6,10 +6,11 @@ import { api, type Message, type Page } from '@/lib/api'
 import { providerName } from '@/lib/catalog'
 import { micros, shortId } from '@/lib/format'
 import { useStore, useThreadPage } from '@/lib/store'
-import { buildTurns, type Turn } from '@/lib/turns'
+import { buildTurns, type Turn, type TurnBlock } from '@/lib/turns'
 import { cn } from '@/lib/utils'
 import { Composer, type ComposerHandle } from './composer'
 import { TurnCtx, TurnRow, type TurnActions } from './turn-row'
+import { ForkBar } from '../fork-bar'
 import { Button } from '../ui/button'
 import { Tip } from '../ui/tooltip'
 import { Kbd } from '../ui/kbd'
@@ -19,10 +20,30 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 const HEADER_H = 56
 const CLEARANCE = 188
 
+function blocksRevision(blocks: TurnBlock[]) {
+  let rev = blocks.length
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i]
+    if (b.kind === 'markdown' || b.kind === 'error') {
+      rev = (rev * 31 + b.text.length) | 0
+    } else if (b.kind === 'reasoning') {
+      rev = (rev * 31 + b.text.length + (b.done ? 1 : 0)) | 0
+    } else if (b.kind === 'steer') {
+      rev = (rev * 31 + b.steer.prompt.length + (b.steer.at_ms & 0xffff)) | 0
+    } else {
+      for (let j = 0; j < b.tools.length; j++) {
+        const x = b.tools[j]
+        rev = (rev * 31 + x.input.length + x.output.length + (x.ended_ms ? 7 : 0) + (x.is_error ? 3 : 0)) | 0
+      }
+    }
+  }
+  return rev
+}
+
 function turnSig(t: Turn) {
   const m = t.msg
-  if (t.streaming || t.msg.status === 'running') return `${t.id}|live|${t.text.length}|${JSON.stringify(t.blocks).length}|${t.blocks.length}`
-  return `${t.id}|${m.status}|${m.updated_ms ?? 0}|${m.sibling_index ?? 0}|${m.siblings?.length ?? 0}|${t.blocks.length}|${t.text.length}|${t.blocks.map(b => (b.kind === 'tools' ? b.tools.map(x => x.ended_ms ?? 0).join(',') : b.kind)).join(';')}`
+  if (t.streaming || t.msg.status === 'running') return `${t.id}|live|${t.text.length}|${blocksRevision(t.blocks)}|${t.blocks.length}`
+  return `${t.id}|${m.status}|${m.updated_ms ?? 0}|${m.sibling_index ?? 0}|${m.siblings?.length ?? 0}|${t.blocks.length}|${t.text.length}|${blocksRevision(t.blocks)}`
 }
 
 function useStableTurns(turns: Turn[]) {
@@ -581,13 +602,16 @@ function Header({ title, threadId, sidebarOpen, onToggleSidebar, inspectorOpen, 
         </div>
         <TitleEditor key={threadId} title={title} onSave={t => run('Rename failed', () => api.config(threadId, { title: t })).then(refreshSessions)} />
       </div>
-      <div className="pointer-events-auto ml-auto flex items-center gap-1 rounded-xl border border-border bg-background/70 p-1 shadow-sm backdrop-blur-md">
-        <PageReadout />
-        <Tip label={inspectorOpen ? 'Hide workspace' : 'Show workspace'} shortcut="⌘.">
-          <Button variant="ghost" size="icon" className={cn('size-8 rounded-lg', inspectorOpen && 'text-foreground')} onClick={onToggleInspector} aria-label={inspectorOpen ? 'Hide workspace' : 'Show workspace'}>
-            <PanelRight className="size-4" />
-          </Button>
-        </Tip>
+      <div className="pointer-events-auto ml-auto flex items-center gap-1.5">
+        <ForkBar />
+        <div className="flex items-center gap-1 rounded-xl border border-border bg-background/70 p-1 shadow-sm backdrop-blur-md">
+          <PageReadout />
+          <Tip label={inspectorOpen ? 'Hide workspace' : 'Show workspace'} shortcut="⌘.">
+            <Button variant="ghost" size="icon" className={cn('size-8 rounded-lg', inspectorOpen && 'text-foreground')} onClick={onToggleInspector} aria-label={inspectorOpen ? 'Hide workspace' : 'Show workspace'}>
+              <PanelRight className="size-4" />
+            </Button>
+          </Tip>
+        </div>
       </div>
     </div>
   )

@@ -2871,6 +2871,193 @@ test "all 10 providers, durable queuing, native and fallback steering, edit/roll
         try testing.expect(need_res == .need_more);
         try testing.expectError(error.PayloadTooLarge, srv_mod.decodeChunkedBody(allocator, "5\r\nhello\r\n0\r\n\r\n", 4));
         try testing.expectError(error.BadFraming, srv_mod.decodeChunkedBody(allocator, "5\r\nhelloXX0\r\n\r\n", 1024));
+        try testing.expectError(
+            error.BadFraming,
+            srv_mod.parseHttpFraming("POST /api/file HTTP/1.1\r\nTransfer-Encoding: chunked, chunked"),
+        );
+
+        {
+            var dec = srv_mod.ChunkedDecoder.init(1024);
+            defer dec.deinit(allocator);
+            const full_wire = "5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-End: 1\r\n\r\n";
+            var st: srv_mod.ChunkedStatus = .need_more;
+            var pos: usize = 1;
+            while (pos <= full_wire.len) : (pos += 1) {
+                st = try dec.feed(allocator, full_wire[0..pos]);
+                if (st == .complete) break;
+            }
+            try testing.expectEqual(srv_mod.ChunkedStatus.complete, st);
+            try testing.expectEqual(full_wire.len, dec.consumed());
+            const body = try dec.takeBody(allocator);
+            defer allocator.free(body);
+            try testing.expectEqualStrings("hello world", body);
+        }
+
+        try testing.expect(srv_mod.validateHostHeader("GET / HTTP/1.1\r\nHost: 127.0.0.1:8080"));
+        try testing.expect(srv_mod.validateHostHeader("GET / HTTP/1.1\r\nHost: localhost:3000"));
+        try testing.expect(srv_mod.validateHostHeader("GET / HTTP/1.1\r\nHost: [::1]:8080"));
+        try testing.expect(srv_mod.validateHostHeader("GET / HTTP/1.1\r\nHost: localhost"));
+        try testing.expect(!srv_mod.validateHostHeader("GET / HTTP/1.1\r\nHost: evil.com"));
+        try testing.expect(!srv_mod.validateHostHeader("GET / HTTP/1.1\r\nHost: evil.com:8080"));
+        try testing.expect(!srv_mod.validateHostHeader("GET / HTTP/1.1\r\nHost: localhost.evil.com"));
+        try testing.expect(!srv_mod.validateHostHeader("GET / HTTP/1.1\r\nX-No-Host: 1"));
+
+        try testing.expect(srv_mod.hasJsonContentType("POST /api/threads HTTP/1.1\r\nContent-Type: application/json"));
+        try testing.expect(srv_mod.hasJsonContentType("POST /api/threads HTTP/1.1\r\nContent-Type: application/json; charset=utf-8"));
+        try testing.expect(!srv_mod.hasJsonContentType("POST /api/threads HTTP/1.1\r\nContent-Type: text/plain"));
+        try testing.expect(!srv_mod.hasJsonContentType("POST /api/threads HTTP/1.1\r\nHost: localhost"));
+
+        try testing.expect(srv_mod.validateOriginHeaders("POST /api/threads HTTP/1.1\r\nOrigin: http://127.0.0.1:8080\r\nSec-Fetch-Site: same-origin", 8080));
+        try testing.expect(srv_mod.validateOriginHeaders("POST /api/threads HTTP/1.1\r\nSec-Fetch-Site: none", 8080));
+        try testing.expect(!srv_mod.validateOriginHeaders("POST /api/threads HTTP/1.1\r\nOrigin: https://evil.com", 8080));
+        try testing.expect(!srv_mod.validateOriginHeaders("POST /api/threads HTTP/1.1\r\nOrigin: http://127.0.0.1:9999", 8080));
+        try testing.expect(!srv_mod.validateOriginHeaders("POST /api/threads HTTP/1.1\r\nSec-Fetch-Site: cross-site", 8080));
+
+        try testing.expectEqual(@as(u64, 42), try srv_mod.jsonU64(.{ .integer = 42 }));
+        try testing.expectEqual(@as(u64, 12), try srv_mod.jsonU64(.{ .float = 12.0 }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .float = 1e30 }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .float = -1.0 }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .float = 1.5 }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .float = std.math.nan(f64) }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .float = std.math.inf(f64) }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .integer = -5 }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .string = "12" }));
+        try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(null));
+
+        try testing.expect(srv_mod.isSafeRelPath("src/main.zig"));
+        try testing.expect(!srv_mod.isSafeRelPath(".git/config"));
+        try testing.expect(!srv_mod.isSafeRelPath("sub/.git/hooks/pre-commit"));
+        try testing.expect(!srv_mod.isSafeRelPath("a/.0ndb/sync_master.key"));
+        try testing.expect(!srv_mod.isSafeRelPath("../escape"));
+        try testing.expect(!srv_mod.isSafeRelPath("a/./b"));
+        try testing.expect(!srv_mod.isSafeRelPath("/abs/path"));
+        try testing.expect(!srv_mod.isSafeRelPath("bad\x00name"));
+
+        const bad_overflow = [_]ondb.core.diff.Splice{.{ .at = std.math.maxInt(u64) - 1, .del = 10, .ins = 0 }};
+        try testing.expectError(error.InvalidSplice, srv_mod.validateSplices(&bad_overflow, 100, 10));
+        const bad_oob = [_]ondb.core.diff.Splice{.{ .at = 95, .del = 10, .ins = 0 }};
+        try testing.expectError(error.InvalidSplice, srv_mod.validateSplices(&bad_oob, 100, 10));
+        const bad_ins = [_]ondb.core.diff.Splice{.{ .at = 0, .del = 0, .ins = 12 }};
+        try testing.expectError(error.InvalidSplice, srv_mod.validateSplices(&bad_ins, 100, 10));
+        const bad_overlap = [_]ondb.core.diff.Splice{
+            .{ .at = 5, .del = 5, .ins = 0 },
+            .{ .at = 8, .del = 2, .ins = 0 },
+        };
+        try testing.expectError(error.InvalidSplice, srv_mod.validateSplices(&bad_overlap, 100, 10));
+        const ok_splices = [_]ondb.core.diff.Splice{.{ .at = 2, .del = 3, .ins = 4 }};
+        try srv_mod.validateSplices(&ok_splices, 10, 4);
+
+        const path_dec = try srv_mod.urlDecode(allocator, "c++/a%20b+c.zig");
+        defer allocator.free(path_dec);
+        try testing.expectEqualStrings("c++/a b+c.zig", path_dec);
+        const query_dec = try srv_mod.urlDecodeQuery(allocator, "a+b%2Bc");
+        defer allocator.free(query_dec);
+        try testing.expectEqualStrings("a b+c", query_dec);
+
+        {
+            const pg_root = "/tmp/0ndb-verify-pg-http";
+            cleanDir(io, pg_root);
+            defer cleanDir(io, pg_root);
+
+            const pg = try srv_mod.PlaygroundServer.startWithConfig(allocator, io, pg_root, 0, .{
+                .default_access = .accept_edits,
+                .prewarm_models = false,
+            });
+            const serve_th = try std.Thread.spawn(.{}, playgroundServeMain, .{pg});
+            defer {
+                pg.stop();
+                serve_th.join();
+                pg.deinit();
+            }
+
+            const port = pg.http_port;
+            try testing.expect(port != 0);
+
+            const key_path = "/tmp/0ndb-verify-pg-http/.0ndb/sync_master.key";
+            const key_bytes = try std.Io.Dir.cwd().readFileAlloc(io, key_path, allocator, .limited(64));
+            defer allocator.free(key_bytes);
+            try testing.expectEqual(@as(usize, 32), key_bytes.len);
+            const all_42: [32]u8 = @splat(0x42);
+            try testing.expect(!std.mem.eql(u8, key_bytes, &all_42));
+            const key_stat = try std.Io.Dir.cwd().statFile(io, key_path, .{});
+            try testing.expectEqual(@as(u32, 0o600), key_stat.permissions.toMode() & 0o777);
+
+            const r_bad_host = try sendRawHttpRequest(
+                allocator,
+                port,
+                "GET /api/info HTTP/1.1\r\nHost: evil.com\r\nConnection: close\r\n\r\n",
+            );
+            defer allocator.free(r_bad_host);
+            try testing.expect(std.mem.startsWith(u8, r_bad_host, "HTTP/1.1 403 "));
+
+            const req_no_ct = try std.fmt.allocPrint(
+                allocator,
+                "POST /api/threads HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                .{port},
+            );
+            defer allocator.free(req_no_ct);
+            const r_no_ct = try sendRawHttpRequest(allocator, port, req_no_ct);
+            defer allocator.free(r_no_ct);
+            try testing.expect(std.mem.startsWith(u8, r_no_ct, "HTTP/1.1 415 "));
+
+            const req_bad_origin = try std.fmt.allocPrint(
+                allocator,
+                "POST /api/threads HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: application/json\r\nOrigin: https://evil.com\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                .{port},
+            );
+            defer allocator.free(req_bad_origin);
+            const r_bad_origin = try sendRawHttpRequest(allocator, port, req_bad_origin);
+            defer allocator.free(r_bad_origin);
+            try testing.expect(std.mem.startsWith(u8, r_bad_origin, "HTTP/1.1 403 "));
+
+            const req_info = try std.fmt.allocPrint(
+                allocator,
+                "GET /api/info HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n",
+                .{port},
+            );
+            defer allocator.free(req_info);
+            const r_info = try sendRawHttpRequest(allocator, port, req_info);
+            defer allocator.free(r_info);
+            try testing.expect(std.mem.startsWith(u8, r_info, "HTTP/1.1 200 "));
+            try testing.expect(std.mem.indexOf(u8, r_info, "X-Content-Type-Options: nosniff\r\n") != null);
+            try testing.expect(std.mem.indexOf(u8, r_info, "X-Frame-Options: DENY\r\n") != null);
+            try testing.expect(std.mem.indexOf(u8, r_info, "Referrer-Policy: no-referrer\r\n") != null);
+            try testing.expect(std.mem.indexOf(u8, r_info, "\"default_access\":\"accept_edits\"") != null);
+
+            const req_root = try std.fmt.allocPrint(
+                allocator,
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n",
+                .{port},
+            );
+            defer allocator.free(req_root);
+            const r_root = try sendRawHttpRequest(allocator, port, req_root);
+            defer allocator.free(r_root);
+            try testing.expect(std.mem.startsWith(u8, r_root, "HTTP/1.1 200 "));
+            try testing.expect(std.mem.indexOf(u8, r_root, "Content-Security-Policy:") != null);
+
+            const req_wt = try std.fmt.allocPrint(
+                allocator,
+                "GET /api/worktrees HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n",
+                .{port},
+            );
+            defer allocator.free(req_wt);
+            const r_wt = try sendRawHttpRequest(allocator, port, req_wt);
+            defer allocator.free(r_wt);
+            try testing.expect(std.mem.startsWith(u8, r_wt, "HTTP/1.1 200 "));
+            try testing.expect(std.mem.indexOf(u8, r_wt, "\"worktrees\":[") != null);
+
+            const chat_body = "{\"title\":\"Chat Alias\",\"provider\":\"mock\"}";
+            const req_chat = try std.fmt.allocPrint(
+                allocator,
+                "POST /api/chats HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: application/json\r\nOrigin: http://127.0.0.1:{d}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ port, port, chat_body.len, chat_body },
+            );
+            defer allocator.free(req_chat);
+            const r_chat = try sendRawHttpRequest(allocator, port, req_chat);
+            defer allocator.free(r_chat);
+            try testing.expect(std.mem.startsWith(u8, r_chat, "HTTP/1.1 200 "));
+            try testing.expect(std.mem.indexOf(u8, r_chat, "\"thread_id\":\"") != null);
+        }
 
         const ap_root = "/tmp/0ndb-verify-ap-root";
         const ap_state = "/tmp/0ndb-verify-ap-state";
@@ -4045,6 +4232,48 @@ fn runSyncHardeningChecks(allocator: std.mem.Allocator, io: std.Io) !void {
         const elapsed = ondb.core.id.nowMs(io) -| t0;
         try testing.expect(elapsed < 80);
     }
+}
+
+fn playgroundServeMain(srv: *ondb.playground.server.PlaygroundServer) void {
+    srv.serve() catch {};
+}
+
+fn sendRawHttpRequest(allocator: std.mem.Allocator, port: u16, req: []const u8) ![]u8 {
+    const linux = std.os.linux;
+    const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(s_rc) != .SUCCESS) return error.SocketFailed;
+    const fd: std.posix.fd_t = @intCast(s_rc);
+    defer _ = linux.close(fd);
+
+    var addr = linux.sockaddr.in{
+        .family = linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    const c_rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+    if (linux.errno(c_rc) != .SUCCESS) return error.ConnectFailed;
+
+    var sent: usize = 0;
+    while (sent < req.len) {
+        const w_rc = linux.sendto(fd, req[sent..].ptr, req.len - sent, linux.MSG.NOSIGNAL, null, 0);
+        const we = linux.errno(w_rc);
+        if (we == .INTR) continue;
+        if (we != .SUCCESS or w_rc == 0) return error.WriteFailed;
+        sent += w_rc;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const r_rc = linux.read(fd, &buf, buf.len);
+        const re = linux.errno(r_rc);
+        if (re == .INTR) continue;
+        if (re != .SUCCESS) return error.ReadFailed;
+        if (r_rc == 0) break;
+        try out.appendSlice(allocator, buf[0..r_rc]);
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 fn relayThreadMain(srv: *ondb.sync.relay.RelayServer) void {

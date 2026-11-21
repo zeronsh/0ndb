@@ -5,7 +5,7 @@ import { api, type BlameLine, type FilesChangedEvent } from '@/lib/api'
 import { diffStat, lineDiff } from '@/lib/diff'
 import { ago, bytes, shortId } from '@/lib/format'
 import { langFromPath } from '@/lib/highlight'
-import { applyUtf8Splices, changedLinesFromSplices, utf16ToUtf8Offset, utf8ToUtf16Offset } from '@/lib/splices'
+import { applyUtf8Splices, changedLinesFromSplices, computeUtf8Splices, utf16ToUtf8Offset, utf8ToUtf16Offset } from '@/lib/splices'
 import { useStore, type FileActivity } from '@/lib/store'
 import { cn } from '@/lib/utils'
 import { DiffLines } from '../diff-view'
@@ -260,7 +260,18 @@ export function FileViewer({ path, activity }: { path: string; activity: FileAct
   const save = async () => {
     if (!dirty || saving) return
     setSaving(true)
-    const res = await run('Save failed', () => api.writeFile(path, draftRef.current, draftBaseVersionRef.current ?? undefined))
+    const baseVer = draftBaseVersionRef.current
+    const baseContent = serverContentRef.current
+    const nextDraft = draftRef.current
+    const res = await run('Save failed', () => {
+      if (baseVer && baseContent != null && serverVersionRef.current === baseVer) {
+        const patch = computeUtf8Splices(baseContent, nextDraft)
+        if (patch.splices.length > 0) {
+          return api.saveFileSplices(path, baseVer, patch.splices, patch.inserted)
+        }
+      }
+      return api.writeFile(path, nextDraft, baseVer ?? undefined)
+    })
     setSaving(false)
     if (res?.ok) {
       serverContentRef.current = res.content
