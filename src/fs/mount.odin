@@ -802,12 +802,18 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 	if scope == nil || path_internal(rel) {
 		return .None
 	}
-	if a, ok := m.attrib[rel]; ok && !a.used && a.actor != scope.actor {
+	a, attributed := m.attrib[rel]
+	stale := attributed && !a.used && a.actor != scope.actor
+	pending, dirty := m.dirty[rel]
+	other := dirty && pending != scope
+	if stale || other {
 		if o := m.open_scopes[rel]; o != nil && o != scope {
 			m.open_scopes[rel] = nil
 		}
-		mount_mark_observed(m, rel, nil)
+		mount_mark_observed(m, rel, pending if other else nil)
 		mount_pass(m, false) or_return
+	}
+	if stale {
 		if b, still := m.attrib[rel]; still && !b.used && b.actor == a.actor {
 			key, _ := delete_key(&m.attrib, rel)
 			delete(key, m.allocator)
@@ -819,7 +825,7 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 		k, _ := clone_string(rel, m.allocator)
 		m.open_scopes[k] = scope
 	}
-	if a, ok := m.attrib[rel]; ok && a.actor == scope.actor && !a.used {
+	if c, ok := m.attrib[rel]; ok && c.actor == scope.actor && !c.used {
 		return .None
 	}
 	attrib_set(m, rel, scope.actor)
@@ -1136,7 +1142,7 @@ mount_sync :: proc(m: ^Mount) -> Error {
 }
 
 scope_open :: proc(reg: ^Registry, m: ^Mount, id: prim.Id, actor: prim.Id, pids: []prim.Pid = nil) -> ^Scope {
-	if m != nil && m.awake && len(m.dirty) > 0 {
+	if m != nil && len(m.dirty) > 0 {
 		mount_pass(m, false)
 	}
 	s := new(Scope, reg.allocator)
