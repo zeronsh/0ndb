@@ -1,29 +1,194 @@
 package search
 
 import "core:c"
+import "core:dynlib"
 import "core:hash/xxhash"
+import "core:sync"
 import "../prim"
 
-foreign import libzstd "system:zstd"
+when ODIN_OS == .Darwin {
+	ZSTD_LIBRARIES :: [?]string{"libzstd.1.dylib", "/opt/homebrew/lib/libzstd.1.dylib", "/usr/local/lib/libzstd.1.dylib", "libzstd.dylib"}
+} else {
+	ZSTD_LIBRARIES :: [?]string{"libzstd.so.1", "libzstd.so"}
+}
 
-@(default_calling_convention = "c")
-foreign libzstd {
-	ZSTD_compressBound :: proc(src_size: c.size_t) -> c.size_t ---
-	ZSTD_isError :: proc(code: c.size_t) -> c.uint ---
-	ZSTD_createCCtx :: proc() -> rawptr ---
-	ZSTD_freeCCtx :: proc(cctx: rawptr) -> c.size_t ---
-	ZSTD_createDCtx :: proc() -> rawptr ---
-	ZSTD_freeDCtx :: proc(dctx: rawptr) -> c.size_t ---
-	ZSTD_createCDict :: proc(dict: rawptr, size: c.size_t, level: c.int) -> rawptr ---
-	ZSTD_freeCDict :: proc(cdict: rawptr) -> c.size_t ---
-	ZSTD_createDDict :: proc(dict: rawptr, size: c.size_t) -> rawptr ---
-	ZSTD_freeDDict :: proc(ddict: rawptr) -> c.size_t ---
-	ZSTD_compressCCtx :: proc(cctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t, level: c.int) -> c.size_t ---
-	ZSTD_decompressDCtx :: proc(dctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t) -> c.size_t ---
-	ZSTD_compress_usingCDict :: proc(cctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t, cdict: rawptr) -> c.size_t ---
-	ZSTD_decompress_usingDDict :: proc(dctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t, ddict: rawptr) -> c.size_t ---
-	ZDICT_trainFromBuffer :: proc(dict: rawptr, cap: c.size_t, samples: rawptr, sizes: [^]c.size_t, n: c.uint) -> c.size_t ---
-	ZDICT_isError :: proc(code: c.size_t) -> c.uint ---
+@(private)
+Zstd_Loader :: struct {
+	mu:   sync.Mutex,
+	lib:  dynlib.Library,
+	refs: int,
+}
+
+@(private)
+zstd_loader: Zstd_Loader
+
+ZSTD_compressBound: proc "c" (src_size: c.size_t) -> c.size_t
+ZSTD_isError: proc "c" (code: c.size_t) -> c.uint
+ZSTD_createCCtx: proc "c" () -> rawptr
+ZSTD_freeCCtx: proc "c" (cctx: rawptr) -> c.size_t
+ZSTD_createDCtx: proc "c" () -> rawptr
+ZSTD_freeDCtx: proc "c" (dctx: rawptr) -> c.size_t
+ZSTD_createCDict: proc "c" (dict: rawptr, size: c.size_t, level: c.int) -> rawptr
+ZSTD_freeCDict: proc "c" (cdict: rawptr) -> c.size_t
+ZSTD_createDDict: proc "c" (dict: rawptr, size: c.size_t) -> rawptr
+ZSTD_freeDDict: proc "c" (ddict: rawptr) -> c.size_t
+ZSTD_compressCCtx: proc "c" (cctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t, level: c.int) -> c.size_t
+ZSTD_decompressDCtx: proc "c" (dctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t) -> c.size_t
+ZSTD_compress_usingCDict: proc "c" (cctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t, cdict: rawptr) -> c.size_t
+ZSTD_decompress_usingDDict: proc "c" (dctx: rawptr, dst: rawptr, cap: c.size_t, src: rawptr, size: c.size_t, ddict: rawptr) -> c.size_t
+ZDICT_trainFromBuffer: proc "c" (dict: rawptr, cap: c.size_t, samples: rawptr, sizes: [^]c.size_t, n: c.uint) -> c.size_t
+ZDICT_isError: proc "c" (code: c.size_t) -> c.uint
+
+zstd_load :: proc() -> bool {
+	sync.mutex_lock(&zstd_loader.mu)
+	defer sync.mutex_unlock(&zstd_loader.mu)
+	if zstd_loader.refs > 0 {
+		zstd_loader.refs += 1
+		return true
+	}
+	lib: dynlib.Library
+	ok := false
+	for name in ZSTD_LIBRARIES {
+		if lib, ok = dynlib.load_library(name); ok {
+			break
+		}
+	}
+	if !ok {
+		return false
+	}
+	resolved := true
+	if p, found := dynlib.symbol_address(lib, "ZSTD_compressBound"); found {
+		ZSTD_compressBound = cast(type_of(ZSTD_compressBound))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_isError"); found {
+		ZSTD_isError = cast(type_of(ZSTD_isError))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_createCCtx"); found {
+		ZSTD_createCCtx = cast(type_of(ZSTD_createCCtx))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_freeCCtx"); found {
+		ZSTD_freeCCtx = cast(type_of(ZSTD_freeCCtx))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_createDCtx"); found {
+		ZSTD_createDCtx = cast(type_of(ZSTD_createDCtx))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_freeDCtx"); found {
+		ZSTD_freeDCtx = cast(type_of(ZSTD_freeDCtx))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_createCDict"); found {
+		ZSTD_createCDict = cast(type_of(ZSTD_createCDict))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_freeCDict"); found {
+		ZSTD_freeCDict = cast(type_of(ZSTD_freeCDict))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_createDDict"); found {
+		ZSTD_createDDict = cast(type_of(ZSTD_createDDict))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_freeDDict"); found {
+		ZSTD_freeDDict = cast(type_of(ZSTD_freeDDict))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_compressCCtx"); found {
+		ZSTD_compressCCtx = cast(type_of(ZSTD_compressCCtx))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_decompressDCtx"); found {
+		ZSTD_decompressDCtx = cast(type_of(ZSTD_decompressDCtx))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_compress_usingCDict"); found {
+		ZSTD_compress_usingCDict = cast(type_of(ZSTD_compress_usingCDict))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZSTD_decompress_usingDDict"); found {
+		ZSTD_decompress_usingDDict = cast(type_of(ZSTD_decompress_usingDDict))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZDICT_trainFromBuffer"); found {
+		ZDICT_trainFromBuffer = cast(type_of(ZDICT_trainFromBuffer))p
+	} else {
+		resolved = false
+	}
+	if p, found := dynlib.symbol_address(lib, "ZDICT_isError"); found {
+		ZDICT_isError = cast(type_of(ZDICT_isError))p
+	} else {
+		resolved = false
+	}
+	if !resolved {
+		dynlib.unload_library(lib)
+		_zstd_clear()
+		return false
+	}
+	zstd_loader.lib = lib
+	zstd_loader.refs = 1
+	return true
+}
+
+zstd_unload :: proc() {
+	sync.mutex_lock(&zstd_loader.mu)
+	defer sync.mutex_unlock(&zstd_loader.mu)
+	if zstd_loader.refs == 0 {
+		return
+	}
+	zstd_loader.refs -= 1
+	if zstd_loader.refs > 0 {
+		return
+	}
+	dynlib.unload_library(zstd_loader.lib)
+	zstd_loader.lib = nil
+	_zstd_clear()
+}
+
+@(private)
+_zstd_clear :: proc() {
+	ZSTD_compressBound = nil
+	ZSTD_isError = nil
+	ZSTD_createCCtx = nil
+	ZSTD_freeCCtx = nil
+	ZSTD_createDCtx = nil
+	ZSTD_freeDCtx = nil
+	ZSTD_createCDict = nil
+	ZSTD_freeCDict = nil
+	ZSTD_createDDict = nil
+	ZSTD_freeDDict = nil
+	ZSTD_compressCCtx = nil
+	ZSTD_decompressDCtx = nil
+	ZSTD_compress_usingCDict = nil
+	ZSTD_decompress_usingDDict = nil
+	ZDICT_trainFromBuffer = nil
+	ZDICT_isError = nil
+}
+
+@(private)
+_zstd_ready :: proc(z: ^Zstd) -> bool {
+	if z.loaded {
+		return true
+	}
+	z.loaded = zstd_load()
+	return z.loaded
 }
 
 ZSTD_LEVEL :: 6
@@ -39,11 +204,16 @@ Zstd :: struct {
 	cctx:  rawptr,
 	dctx:  rawptr,
 	cdict: rawptr,
-	ddict: rawptr,
-	gen:   u64,
+	ddict:  rawptr,
+	gen:    u64,
+	loaded: bool,
 }
 
 zstd_destroy :: proc(z: ^Zstd) {
+	if !z.loaded {
+		z^ = {}
+		return
+	}
 	if z.cctx != nil {
 		ZSTD_freeCCtx(z.cctx)
 	}
@@ -57,6 +227,7 @@ zstd_destroy :: proc(z: ^Zstd) {
 		ZSTD_freeDDict(z.ddict)
 	}
 	z^ = {}
+	zstd_unload()
 }
 
 zd_path :: proc(ix: ^Index, gen: u64, buf: ^Name_Buf) -> string {
@@ -74,6 +245,9 @@ _zstd_dict :: proc(ix: ^Index) -> Error {
 	z := &ix.zstd
 	if ix.man.zd_gen == 0 || z.gen == ix.man.zd_gen {
 		return .None
+	}
+	if !_zstd_ready(z) {
+		return .Io
 	}
 	buf: Name_Buf
 	data, rerr := prim.read_file(ix.vfs, zd_path(ix, ix.man.zd_gen, &buf), context.temp_allocator)
@@ -102,7 +276,7 @@ _zstd_dict :: proc(ix: ^Index) -> Error {
 }
 
 zstd_train :: proc(ix: ^Index) -> Error {
-	if !ix.man.store || ix.man.zd_gen != 0 {
+	if !ix.man.store || ix.man.zd_gen != 0 || !_zstd_ready(&ix.zstd) {
 		return .None
 	}
 	m := &ix.mem
@@ -154,6 +328,17 @@ zstd_train :: proc(ix: ^Index) -> Error {
 
 frame_write :: proc(ix: ^Index, w: ^prim.Writer, raw: []u8, scratch: ^[dynamic]u8) -> Error {
 	z := &ix.zstd
+	if !_zstd_ready(z) {
+		prim.write_uvarint(w, u64(len(raw)))
+		prim.write_u8(w, FRAME_RAW)
+		prim.write_uvarint(w, u64(len(raw)))
+		start := len(w.buf)
+		prim.write_raw(w, raw)
+		if w.err == .None {
+			prim.write_u32le(w, xxhash.XXH32(w.buf[start:]))
+		}
+		return _cerr(w.err)
+	}
 	_zstd_dict(ix) or_return
 	if z.cctx == nil {
 		z.cctx = ZSTD_createCCtx()
@@ -242,6 +427,9 @@ frame_read :: proc(ix: ^Index, s: ^Seg, at: i64, out: ^[dynamic]u8, scratch: ^[d
 		}
 	}
 	z := &ix.zstd
+	if !_zstd_ready(z) {
+		return .Io
+	}
 	if z.dctx == nil {
 		z.dctx = ZSTD_createDCtx()
 		if z.dctx == nil {
