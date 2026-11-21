@@ -22,6 +22,9 @@ pub const store = struct {
 
 pub const fs = struct {
     pub const git = @import("fs/git.zig");
+    pub const git_dirs = @import("fs/git_dirs.zig");
+    pub const git_index = @import("fs/git_index.zig");
+    pub const git_odb = @import("fs/git_odb.zig");
     pub const vcs = @import("fs/vcs.zig");
     pub const watch = @import("fs/watch.zig");
     pub const workspace = @import("fs/workspace.zig");

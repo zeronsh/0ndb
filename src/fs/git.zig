@@ -1,7 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const process = std.process;
+const git_dirs = @import("git_dirs.zig");
+const watch = @import("watch.zig");
+
+const FICLONE: u32 = 0x40049409;
+
+var env_cache_mutex: Io.Mutex = .init;
+var env_cache_loaded: std.atomic.Value(bool) = .init(false);
+var env_cache_buf: [65536]u8 = undefined;
+var env_cache_len: usize = 0;
 
 pub const HeadInfo = struct {
     branch: ?[]u8 = null,
@@ -19,19 +29,33 @@ pub const GitError = error{
     CommitMissing,
 };
 
-fn loadParentEnv(io: Io, env_map: *process.Environ.Map) void {
-    var env_buf: [65536]u8 = undefined;
-    if (Io.Dir.cwd().openFile(io, "/proc/self/environ", .{})) |ef| {
-        defer ef.close(io);
-        const n = ef.readPositionalAll(io, &env_buf, 0) catch 0;
-        var it = std.mem.splitScalar(u8, env_buf[0..n], 0);
-        while (it.next()) |entry| {
-            if (entry.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-            if (eq == 0) continue;
-            env_map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
+fn ensureParentEnvLoaded(io: Io) []const u8 {
+    if (env_cache_loaded.load(.acquire)) {
+        return env_cache_buf[0..env_cache_len];
+    }
+    env_cache_mutex.lockUncancelable(io);
+    defer env_cache_mutex.unlock(io);
+    if (!env_cache_loaded.load(.monotonic)) {
+        if (Io.Dir.cwd().openFile(io, "/proc/self/environ", .{})) |ef| {
+            defer ef.close(io);
+            env_cache_len = ef.readPositionalAll(io, &env_cache_buf, 0) catch 0;
+        } else |_| {
+            env_cache_len = 0;
         }
-    } else |_| {}
+        env_cache_loaded.store(true, .release);
+    }
+    return env_cache_buf[0..env_cache_len];
+}
+
+fn loadParentEnv(io: Io, env_map: *process.Environ.Map) void {
+    const raw = ensureParentEnvLoaded(io);
+    var it = std.mem.splitScalar(u8, raw, 0);
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        if (eq == 0) continue;
+        env_map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
+    }
     if (env_map.get("PATH") == null) {
         env_map.put("PATH", "/usr/local/bin:/usr/bin:/bin") catch {};
     }
@@ -69,35 +93,25 @@ fn trimLine(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
 
-fn hasGitMarker(io: Io, dir_path: []const u8) bool {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var cur: []const u8 = if (Io.Dir.cwd().realPathFile(io, dir_path, &path_buf)) |n|
-        path_buf[0..n]
-    else |_|
-        dir_path;
-
-    while (true) {
-        var dir = Io.Dir.cwd().openDir(io, cur, .{}) catch return false;
-        const found = if (dir.statFile(io, ".git", .{})) |_| true else |_| false;
-        dir.close(io);
-        if (found) return true;
-        const parent = std.fs.path.dirname(cur) orelse return false;
-        if (parent.len == cur.len) return false;
-        cur = parent;
-    }
-}
-
 pub fn isGitRepo(allocator: Allocator, io: Io, dir_path: []const u8) bool {
-    if (!hasGitMarker(io, dir_path)) return false;
-    const r = runGit(allocator, io, dir_path, &.{ "rev-parse", "--is-inside-work-tree" }) catch return false;
-    defer allocator.free(r.stdout);
-    defer allocator.free(r.stderr);
-    return r.ok and std.mem.eql(u8, trimLine(r.stdout), "true");
+    var dirs = (git_dirs.GitDirs.locate(allocator, io, dir_path) catch return false) orelse return false;
+    dirs.deinit(allocator);
+    return true;
 }
 
 pub fn head(allocator: Allocator, io: Io, dir_path: []const u8) !HeadInfo {
+    var dirs = (try git_dirs.GitDirs.locate(allocator, io, dir_path)) orelse return HeadInfo{};
+    defer dirs.deinit(allocator);
+
+    if (!dirs.config.reftable) {
+        const hs = try dirs.readHead(allocator, io);
+        return .{
+            .branch = hs.branch,
+            .commit = hs.commit,
+        };
+    }
+
     var info = HeadInfo{};
-    if (!hasGitMarker(io, dir_path)) return info;
     errdefer info.deinit(allocator);
 
     const rev = runGit(allocator, io, dir_path, &.{ "rev-parse", "--verify", "HEAD" }) catch return info;
@@ -128,8 +142,15 @@ pub fn commitExists(allocator: Allocator, io: Io, dir_path: []const u8, commit: 
 }
 
 pub fn branchTip(allocator: Allocator, io: Io, dir_path: []const u8, branch: []const u8) !?[]u8 {
+    var dirs = (try git_dirs.GitDirs.locate(allocator, io, dir_path)) orelse return null;
+    defer dirs.deinit(allocator);
+
     var ref_buf: [256]u8 = undefined;
     const ref = std.fmt.bufPrint(&ref_buf, "refs/heads/{s}", .{branch}) catch return null;
+    if (!dirs.config.reftable) {
+        return try dirs.resolveRef(allocator, io, ref);
+    }
+
     const r = try runGit(allocator, io, dir_path, &.{ "rev-parse", "--verify", ref });
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
@@ -140,31 +161,9 @@ pub fn branchTip(allocator: Allocator, io: Io, dir_path: []const u8, branch: []c
 }
 
 pub fn operationInProgress(allocator: Allocator, io: Io, dir_path: []const u8) ?[]const u8 {
-    if (!hasGitMarker(io, dir_path)) return null;
-    const r = runGit(allocator, io, dir_path, &.{ "rev-parse", "--git-dir" }) catch return null;
-    defer allocator.free(r.stdout);
-    defer allocator.free(r.stderr);
-    if (!r.ok) return null;
-    const git_dir_rel = trimLine(r.stdout);
-    var base = Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
-    defer base.close(io);
-    var gd = base.openDir(io, git_dir_rel, .{}) catch return null;
-    defer gd.close(io);
-
-    const markers = .{
-        .{ "MERGE_HEAD", "merge" },
-        .{ "REBASE_HEAD", "rebase" },
-        .{ "CHERRY_PICK_HEAD", "cherry-pick" },
-        .{ "REVERT_HEAD", "revert" },
-        .{ "rebase-merge", "rebase" },
-        .{ "rebase-apply", "rebase" },
-    };
-    inline for (markers) |m| {
-        if (gd.statFile(io, m[0], .{})) |_| {
-            return m[1];
-        } else |_| {}
-    }
-    return null;
+    var dirs = (git_dirs.GitDirs.locate(allocator, io, dir_path) catch return null) orelse return null;
+    defer dirs.deinit(allocator);
+    return dirs.operationInProgress(io);
 }
 
 pub fn createBranchAt(allocator: Allocator, io: Io, dir_path: []const u8, branch: []const u8, commit: []const u8) !void {
@@ -175,7 +174,7 @@ pub fn createBranchAt(allocator: Allocator, io: Io, dir_path: []const u8, branch
 }
 
 pub fn moveHeadSafe(allocator: Allocator, io: Io, dir_path: []const u8, branch: ?[]const u8, commit: []const u8) !void {
-    if (!hasGitMarker(io, dir_path)) return error.GitFailed;
+    if (!isGitRepo(allocator, io, dir_path)) return error.GitFailed;
     var cur = head(allocator, io, dir_path) catch HeadInfo{};
     defer cur.deinit(allocator);
     if (cur.commit) |cc| {
@@ -259,7 +258,7 @@ pub fn deleteBranch(allocator: Allocator, io: Io, repo_path: []const u8, branch:
 }
 
 pub fn isClean(allocator: Allocator, io: Io, dir_path: []const u8) !bool {
-    if (!hasGitMarker(io, dir_path)) return true;
+    if (!isGitRepo(allocator, io, dir_path)) return true;
     const r = try runGit(allocator, io, dir_path, &.{ "status", "--porcelain" });
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
@@ -268,21 +267,152 @@ pub fn isClean(allocator: Allocator, io: Io, dir_path: []const u8) !bool {
 }
 
 pub fn mainCheckout(allocator: Allocator, io: Io, dir_path: []const u8) !?[]u8 {
-    if (!hasGitMarker(io, dir_path)) return null;
-    const r = runGit(allocator, io, dir_path, &.{ "rev-parse", "--path-format=absolute", "--git-common-dir" }) catch return null;
+    var dirs = (try git_dirs.GitDirs.locate(allocator, io, dir_path)) orelse return null;
+    defer dirs.deinit(allocator);
+    if (std.mem.endsWith(u8, dirs.common_dir, "/.git")) {
+        return try allocator.dupe(u8, dirs.common_dir[0 .. dirs.common_dir.len - 5]);
+    }
+    return try allocator.dupe(u8, dirs.worktree_root);
+}
+
+pub fn freePaths(allocator: Allocator, paths: [][]u8) void {
+    for (paths) |p| allocator.free(p);
+    allocator.free(paths);
+}
+
+pub fn changedPaths(allocator: Allocator, io: Io, dir_path: []const u8, rev_a: []const u8, rev_b: []const u8) ![][]u8 {
+    const r = try runGit(allocator, io, dir_path, &.{ "diff", "--name-only", "-z", rev_a, rev_b });
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
-    if (!r.ok) return null;
-    const common = trimLine(r.stdout);
-    if (common.len == 0) return null;
-    if (std.mem.endsWith(u8, common, "/.git")) {
-        return try allocator.dupe(u8, common[0 .. common.len - 5]);
+    if (!r.ok) return error.GitFailed;
+
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
     }
-    const top = runGit(allocator, io, dir_path, &.{ "rev-parse", "--show-toplevel" }) catch return null;
-    defer allocator.free(top.stdout);
-    defer allocator.free(top.stderr);
-    if (!top.ok) return null;
-    const t = trimLine(top.stdout);
-    if (t.len == 0) return null;
-    return try allocator.dupe(u8, t);
+
+    var it = std.mem.splitScalar(u8, r.stdout, 0);
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        try out.append(allocator, try allocator.dupe(u8, entry));
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn dirtyPaths(allocator: Allocator, io: Io, dir_path: []const u8) ![][]u8 {
+    const r = try runGit(allocator, io, dir_path, &.{ "status", "--porcelain=v1", "-z", "-uall" });
+    defer allocator.free(r.stdout);
+    defer allocator.free(r.stderr);
+    if (!r.ok) return error.GitFailed;
+
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < r.stdout.len) {
+        const nul = std.mem.indexOfScalarPos(u8, r.stdout, pos, 0) orelse r.stdout.len;
+        const rec = r.stdout[pos..nul];
+        pos = if (nul < r.stdout.len) nul + 1 else r.stdout.len;
+        if (rec.len < 4) continue;
+
+        const x = rec[0];
+        const y = rec[1];
+        const path_a = rec[3..];
+        if (path_a.len > 0 and !seen.contains(path_a)) {
+            const owned = try allocator.dupe(u8, path_a);
+            errdefer allocator.free(owned);
+            try out.append(allocator, owned);
+            try seen.put(allocator, owned, {});
+        }
+
+        if (x == 'R' or x == 'C' or y == 'R' or y == 'C') {
+            if (pos < r.stdout.len) {
+                const nul2 = std.mem.indexOfScalarPos(u8, r.stdout, pos, 0) orelse r.stdout.len;
+                const path_b = r.stdout[pos..nul2];
+                pos = if (nul2 < r.stdout.len) nul2 + 1 else r.stdout.len;
+                if (path_b.len > 0 and !seen.contains(path_b)) {
+                    const owned = try allocator.dupe(u8, path_b);
+                    errdefer allocator.free(owned);
+                    try out.append(allocator, owned);
+                    try seen.put(allocator, owned, {});
+                }
+            }
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn cloneDirReflink(allocator: Allocator, io: Io, src_root: []const u8, dst_root: []const u8) !void {
+    try Io.Dir.cwd().createDirPath(io, dst_root);
+    var src = try Io.Dir.cwd().openDir(io, src_root, .{ .iterate = true });
+    defer src.close(io);
+    var dst = try Io.Dir.cwd().openDir(io, dst_root, .{ .iterate = true });
+    defer dst.close(io);
+    try cloneDirRecursive(allocator, io, src, dst);
+}
+
+fn cloneDirRecursive(allocator: Allocator, io: Io, src: Io.Dir, dst: Io.Dir) !void {
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        if (watch.isIgnoredName(entry.name)) continue;
+        switch (entry.kind) {
+            .directory => {
+                try dst.createDirPath(io, entry.name);
+                var sub_src = try src.openDir(io, entry.name, .{ .iterate = true });
+                defer sub_src.close(io);
+                var sub_dst = try dst.openDir(io, entry.name, .{ .iterate = true });
+                defer sub_dst.close(io);
+                try cloneDirRecursive(allocator, io, sub_src, sub_dst);
+            },
+            .file => {
+                try cloneFileReflink(io, src, dst, entry.name);
+            },
+            .sym_link => {
+                var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = src.readLink(io, entry.name, &link_buf) catch continue;
+                dst.symLink(io, link_buf[0..n], entry.name, .{}) catch {};
+            },
+            else => {},
+        }
+    }
+}
+
+fn cloneFileReflink(io: Io, src: Io.Dir, dst: Io.Dir, name: []const u8) !void {
+    const sf = try src.openFile(io, name, .{});
+    defer sf.close(io);
+    const st = try sf.stat(io);
+
+    const df = try dst.createFile(io, name, .{ .truncate = true });
+    defer df.close(io);
+
+    var reflinked = false;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.ioctl(df.handle, FICLONE, @intCast(sf.handle));
+        if (linux.errno(rc) == .SUCCESS) {
+            reflinked = true;
+        }
+    }
+
+    if (!reflinked) {
+        var buf: [65536]u8 = undefined;
+        var off: u64 = 0;
+        while (off < st.size) {
+            const want: usize = @intCast(@min(@as(u64, buf.len), st.size - off));
+            const n = try sf.readPositionalAll(io, buf[0..want], off);
+            if (n == 0) break;
+            try df.writePositionalAll(io, buf[0..n], off);
+            off += n;
+        }
+    }
+
+    df.setPermissions(io, st.permissions) catch {};
 }
