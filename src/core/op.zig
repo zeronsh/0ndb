@@ -155,8 +155,8 @@ pub const Op = union(enum) {
                 try w.writeByte(allocator, 2);
                 try writeInodeId(allocator, w, v.parent);
                 try w.writeBytes(allocator, v.name);
-                try w.writeByte(allocator, @intFromEnum(v.mode));
-                try w.writeByte(allocator, @intFromEnum(v.line_ending));
+                try w.writeByte(allocator, @backingInt(v.mode));
+                try w.writeByte(allocator, @backingInt(v.line_ending));
                 try v.content.encode(allocator, w);
             },
             .create_symlink => |v| {
@@ -198,12 +198,12 @@ pub const Op = union(enum) {
             .set_mode => |v| {
                 try w.writeByte(allocator, 9);
                 try writeInodeId(allocator, w, v.inode);
-                try w.writeByte(allocator, @intFromEnum(v.mode));
+                try w.writeByte(allocator, @backingInt(v.mode));
             },
             .set_line_ending => |v| {
                 try w.writeByte(allocator, 10);
                 try writeInodeId(allocator, w, v.inode);
-                try w.writeByte(allocator, @intFromEnum(v.ending));
+                try w.writeByte(allocator, @backingInt(v.ending));
             },
             .set_symlink_target => |v| {
                 try w.writeByte(allocator, 11);
@@ -347,8 +347,8 @@ pub const Batch = struct {
                     try w.writeByte(allocator, 2);
                     try writeInodeId(allocator, w, v.parent);
                     try w.writeBytes(allocator, v.name);
-                    try w.writeByte(allocator, @intFromEnum(v.mode));
-                    try w.writeByte(allocator, @intFromEnum(v.line_ending));
+                    try w.writeByte(allocator, @backingInt(v.mode));
+                    try w.writeByte(allocator, @backingInt(v.line_ending));
                     try v.content.encode(allocator, w);
                     switch (v.content) {
                         .text_inline => |b| {

@@ -1177,7 +1177,7 @@ pub const Worktrees = struct {
             try w.writeU128(self.allocator, e.id);
             try w.writeBytes(self.allocator, e.title);
             try w.writeBytes(self.allocator, e.path);
-            try w.writeU8(self.allocator, @intFromEnum(e.vcs_kind));
+            try w.writeU8(self.allocator, @backingInt(e.vcs_kind));
             try w.writeOptBytes(self.allocator, e.repo_root);
             try w.writeOptBytes(self.allocator, e.ref_name);
             try w.writeBytes(self.allocator, e.state_path);
@@ -1265,7 +1265,7 @@ pub const Worktrees = struct {
         try w.writeU32(self.allocator, @intCast(items.len));
         for (items) |c| {
             try w.writeBytes(self.allocator, c.path);
-            try w.writeU8(self.allocator, @intFromEnum(c.kind));
+            try w.writeU8(self.allocator, @backingInt(c.kind));
             try w.writeOptBytes(self.allocator, c.ours);
             try w.writeOptBytes(self.allocator, c.theirs);
         }

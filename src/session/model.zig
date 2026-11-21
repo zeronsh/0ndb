@@ -143,9 +143,9 @@ pub const Thread = struct {
         if (self.leaf_msg_id) |lid| try w.writeU128(allocator, lid);
         try w.writeU8(allocator, if (self.head_page != null) 1 else 0);
         if (self.head_page) |hp| try w.writeRaw(allocator, &hp);
-        try w.writeU8(allocator, @intFromEnum(self.default_provider));
+        try w.writeU8(allocator, @backingInt(self.default_provider));
         try w.writeOptBytes(allocator, self.default_model);
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeU32(allocator, self.queued_count);
         try w.writeU32(allocator, self.message_count);
         try w.writeU64(allocator, self.created_ms);
@@ -278,9 +278,9 @@ pub const Message = struct {
         try w.writeU128(allocator, self.thread_id);
         try w.writeU8(allocator, if (self.parent_id != null) 1 else 0);
         if (self.parent_id) |pid| try w.writeU128(allocator, pid);
-        try w.writeU8(allocator, @intFromEnum(self.role));
+        try w.writeU8(allocator, @backingInt(self.role));
         try w.writeBytes(allocator, self.content);
-        try w.writeU8(allocator, @intFromEnum(self.provider));
+        try w.writeU8(allocator, @backingInt(self.provider));
         try w.writeOptBytes(allocator, self.model);
         try w.writeOptBytes(allocator, self.native_session);
         try w.writeOptBytes(allocator, self.native_turn);
@@ -289,7 +289,7 @@ pub const Message = struct {
         try w.writeOptBytes(allocator, self.git_branch);
         try w.writeOptBytes(allocator, self.git_commit);
         try w.writeU128(allocator, self.worktree_id);
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeU8(allocator, if (self.steer_of != null) 1 else 0);
         if (self.steer_of) |so| try w.writeU128(allocator, so);
         try w.writeU8(allocator, if (self.switched_from != null) 1 else 0);
@@ -408,10 +408,10 @@ pub const QueueItem = struct {
     pub fn encode(self: *const QueueItem, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
         try w.writeU128(allocator, self.item_id);
         try w.writeU128(allocator, self.thread_id);
-        try w.writeU8(allocator, @intFromEnum(self.kind));
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try w.writeU8(allocator, @backingInt(self.kind));
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeBytes(allocator, self.prompt);
-        try w.writeU8(allocator, @intFromEnum(self.provider));
+        try w.writeU8(allocator, @backingInt(self.provider));
         try w.writeOptBytes(allocator, self.model);
         try w.writeU8(allocator, if (self.target_turn_msg_id != null) 1 else 0);
         if (self.target_turn_msg_id) |t| try w.writeU128(allocator, t);
@@ -544,9 +544,9 @@ pub const SessionSummary = struct {
         try w.writeU128(allocator, self.thread_id);
         try w.writeU128(allocator, self.worktree_id);
         try w.writeBytes(allocator, self.title);
-        try w.writeU8(allocator, @intFromEnum(self.provider));
+        try w.writeU8(allocator, @backingInt(self.provider));
         try w.writeOptBytes(allocator, self.model);
-        try w.writeU8(allocator, @intFromEnum(self.status));
+        try w.writeU8(allocator, @backingInt(self.status));
         try w.writeU8(allocator, if (self.leaf_msg_id != null) 1 else 0);
         if (self.leaf_msg_id) |lid| try w.writeU128(allocator, lid);
         try w.writeU8(allocator, if (self.head_page != null) 1 else 0);
