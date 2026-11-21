@@ -39,11 +39,9 @@ Rec_Key :: struct {
 
 @(private)
 File :: struct {
-	rec:    File_Record,
-	refs:   [dynamic]Op_Ref,
-	loaded: bool,
-	text:   crdt.Text,
-	log:    crdt.Text_Log,
+	rec:      File_Record,
+	refs:     [dynamic]Op_Ref,
+	using st: Text_State,
 }
 
 Reader :: struct {
@@ -352,7 +350,7 @@ reader_wants :: proc(r: ^Reader) -> []Want {
 
 reader_unload :: proc(r: ^Reader, inode: fstree.Inode_Id) {
 	if f, ok := r.files[inode]; ok {
-		text_drop(f)
+		text_drop(&f.st)
 	}
 	if r.blob_data != nil {
 		delete(r.blob_data, r.allocator)
@@ -601,7 +599,7 @@ apply_batch :: proc(r: ^Reader, si: u32, off: u64, body: []u8) -> (n: int, err: 
 			at := crdt.Op_Id{b.actor, b.seq + u64(pos)}
 			append(&f.rec.cp_version, crdt.Op_Id{b.actor, at.seq + u64(op.len) - 1})
 			append(&f.rec.cp_spans, crdt.Author_Span{id = at, op = at, len = op.len})
-			text_drop(f)
+			text_drop(&f.st)
 		}
 		lv += cnt
 		pos += op.len
@@ -610,7 +608,7 @@ apply_batch :: proc(r: ^Reader, si: u32, off: u64, body: []u8) -> (n: int, err: 
 		for t in text_targets(&b) {
 			f := file_get(r, inode_of(r, t)) or_return
 			append(&f.refs, Op_Ref{si, off, u32(gskip), u32(total)})
-			text_drop(f)
+			text_drop(&f.st)
 		}
 	}
 	return total - gskip, .None
@@ -678,24 +676,15 @@ file_get :: proc(r: ^Reader, inode: fstree.Inode_Id) -> (f: ^File, err: Error) {
 }
 
 @(private)
-text_drop :: proc(f: ^File) {
-	if f.loaded {
-		crdt.text_destroy(&f.text)
-		crdt.log_destroy(&f.log)
-		f.loaded = false
-	}
-}
-
-@(private)
 texts_drop :: proc(r: ^Reader) {
 	for _, f in r.files {
-		text_drop(f)
+		text_drop(&f.st)
 	}
 }
 
 @(private)
 file_drop :: proc(r: ^Reader, f: ^File) {
-	text_drop(f)
+	text_drop(&f.st)
 	file_record_destroy(&f.rec)
 	delete(f.refs)
 	free(f, r.allocator)
@@ -715,92 +704,48 @@ heads_text :: proc(r: ^Reader, inode: fstree.Inode_Id) -> (f: ^File, err: Error)
 
 @(private)
 load :: proc(r: ^Reader, inode: fstree.Inode_Id, f: ^File, v: []crdt.Lv) -> Error {
-	text_drop(f)
 	r.missing = false
-	if f.rec.has_cp {
-		ok := load_checkpoint(r, inode, f, v) or_return
-		if ok {
-			redact_loaded(r, f)
-			return .None
-		}
+	src := Text_Source {
+		data       = r,
+		g          = &r.g,
+		allocator  = r.allocator,
+		content    = crdt.Content_Source{r, content_read},
+		copies     = crdt.Copy_Source{r, copy_read},
+		op_ref     = proc(data: rawptr, inode: fstree.Inode_Id, i: u32) -> (Op_Ref, Error) {
+			r := (^Reader)(data)
+			chunk, ok := r.kv[string(ops_key(inode, i / OPS_CHUNK))]
+			if !ok {
+				return {}, .Corrupt
+			}
+			ref, rok := op_ref_at(chunk, i % OPS_CHUNK)
+			return ref, .None if rok else .Corrupt
+		},
+		record     = proc(data: rawptr, stream: u32, off: u64, buf: ^[dynamic]u8) -> ([]u8, Error) {
+			return record((^Reader)(data), stream, off)
+		},
+		dict       = proc(data: rawptr, stream: u32) -> ^crdt.Actor_Dict {
+			return &(^Reader)(data).dicts[stream]
+		},
+		checkpoint = proc(data: rawptr, oid: Raw_Oid, size: i64, allocator: runtime.Allocator) -> ([]u8, Error) {
+			r := (^Reader)(data)
+			out := make([]u8, int(size), allocator)
+			got, e := blob_read(r, oid_full(oid), 0, out)
+			if e != .None {
+				return nil, e
+			}
+			if got != len(out) {
+				return nil, .Not_Found
+			}
+			return out, .None
+		},
 	}
-	crdt.text_init(&f.text, r.allocator)
-	crdt.log_init(&f.log, r.allocator, crdt.Content_Source{r, content_read}, crdt.Copy_Source{r, copy_read})
-	f.loaded = true
-	target := op_of(r, inode)
-	if f.rec.has_base {
-		if _, e := replay(r, f, target, f.rec.base, nil); e != .None {
-			text_drop(f)
-			return e
-		}
-	}
-	if _, e := replay_all(r, f, inode, target, 0, nil); e != .None {
-		text_drop(f)
-		return e
-	}
-	if e := crdt.text_merge(&f.text, &r.g, &f.log, v); e != .None {
-		text_drop(f)
-		return .Missing if r.missing else .Corrupt
+	e := text_load(&src, &f.st, inode, op_of(r, inode), &f.rec, f.refs[:], v)
+	if e != .None {
+		text_drop(&f.st)
+		return .Missing if r.missing || e == .Missing else e
 	}
 	redact_loaded(r, f)
 	return .None
-}
-
-@(private)
-load_checkpoint :: proc(r: ^Reader, inode: fstree.Inode_Id, f: ^File, v: []crdt.Lv) -> (ok: bool, err: Error) {
-	cpv := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&r.g, f.rec.cp_version[:], &cpv) != .None || !crdt.graph_contains_all(&r.g, v, cpv[:]) {
-		return false, .None
-	}
-	data := make([]u8, int(f.rec.cp_len), context.temp_allocator)
-	if f.rec.cp_len > 0 {
-		oid := oid_full(f.rec.cp_text)
-		got, e := blob_read(r, oid, 0, data)
-		if e != .None {
-			return false, e
-		}
-		if got != len(data) {
-			return false, .Corrupt
-		}
-	}
-	if crdt.text_from(&f.text, &r.g, data, f.rec.cp_spans[:], f.rec.cp_version[:], r.allocator) != .None {
-		return false, .None
-	}
-	crdt.log_init(&f.log, r.allocator, crdt.Content_Source{r, content_read}, crdt.Copy_Source{r, copy_read})
-	f.loaded = true
-	descends, e := replay_all(r, f, inode, op_of(r, inode), f.rec.cp_count, cpv[:])
-	if e != .None || !descends {
-		text_drop(f)
-		return false, e
-	}
-	if crdt.text_merge(&f.text, &r.g, &f.log, v) != .None {
-		text_drop(f)
-		return false, .Missing if r.missing else .None
-	}
-	return true, .None
-}
-
-@(private)
-replay_all :: proc(r: ^Reader, f: ^File, inode: fstree.Inode_Id, target: crdt.Op_Id, from: u32, base: []crdt.Lv) -> (descends: bool, err: Error) {
-	for i := from; i < f.rec.ops; i += 1 {
-		chunk, ok := r.kv[string(ops_key(inode, i / OPS_CHUNK))]
-		if !ok {
-			return false, .Corrupt
-		}
-		ref, rok := op_ref_at(chunk, i % OPS_CHUNK)
-		if !rok {
-			return false, .Corrupt
-		}
-		if !(replay(r, f, target, ref, base) or_return) {
-			return false, .None
-		}
-	}
-	for ref in f.refs {
-		if !(replay(r, f, target, ref, base) or_return) {
-			return false, .None
-		}
-	}
-	return true, .None
 }
 
 @(private)
@@ -826,51 +771,12 @@ record :: proc(r: ^Reader, stream: u32, off: u64) -> (body: []u8, err: Error) {
 	case .None:
 		return b, .None
 	case .Redacted:
-		return nil, .Not_Found
+		return nil, .Redacted
 	case .Missing, .Eof:
 		want_add(r, Want{stream = id, from = i64(at), to = i64(at) + 1})
 		return nil, .Missing
 	}
 	return nil, .Corrupt
-}
-
-@(private)
-replay :: proc(r: ^Reader, f: ^File, target: crdt.Op_Id, ref: Op_Ref, base: []crdt.Lv) -> (descends: bool, err: Error) {
-	body, rerr := record(r, ref.stream, ref.off)
-	if rerr == .Not_Found {
-		return true, .None
-	}
-	if rerr != .None {
-		return false, rerr
-	}
-	payload, pok := batch_payload(body)
-	if !pok {
-		return false, .Corrupt
-	}
-	b, derr := crdt.batch_decode(payload, context.temp_allocator, &r.dicts[ref.stream])
-	if derr != .None {
-		return false, .Corrupt
-	}
-	if len(base) > 0 {
-		ps := make([dynamic]crdt.Lv, context.temp_allocator)
-		if crdt.graph_version_lvs(&r.g, b.parents, &ps) != .None || !crdt.graph_contains_all(&r.g, ps[:], base) {
-			return false, .None
-		}
-	}
-	use := &b
-	if ref.to < u32(crdt.batch_len(&b)) {
-		cut, cerr := crdt.batch_slice(&b, 0, int(ref.to), context.temp_allocator)
-		if cerr != .None {
-			return false, .Corrupt
-		}
-		use = &cut
-	}
-	first, ok := crdt.graph_lv(&r.g, crdt.Op_Id{use.actor, use.seq})
-	if !ok {
-		return false, .Missing
-	}
-	crdt.log_add_batch(&f.log, &r.g, use, target, first, 0)
-	return true, .None
 }
 
 @(private)

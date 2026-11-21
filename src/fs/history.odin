@@ -38,14 +38,11 @@ Op_Ref :: fshist.Op_Ref
 File_Record :: fshist.File_Record
 
 File_State :: struct {
-	inode:  fstree.Inode_Id,
-	rec:    File_Record,
-	text:   crdt.Text,
-	log:    crdt.Text_Log,
-	loaded: bool,
-	dirty:  bool,
+	inode:    fstree.Inode_Id,
+	rec:      File_Record,
+	using st: fshist.Text_State,
+	dirty:    bool,
 	new_refs: [dynamic]Op_Ref,
-	from_cp: bool,
 }
 
 Git_Marker :: struct {
@@ -105,6 +102,7 @@ History :: struct {
 	blob_data:  []u8,
 	touched:    [dynamic]fstree.Inode_Id,
 	touched_set: map[fstree.Inode_Id]struct{},
+	src_err:    Error,
 	pins:       [dynamic]odb.Oid,
 	lvidx:      prim.Fd,
 	lvidx_n:    u64,
@@ -1438,131 +1436,67 @@ content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> boo
 
 @(private)
 load_text :: proc(h: ^History, f: ^File_State, v: []crdt.Lv, full := false) -> Error {
-	if f.loaded {
-		crdt.text_destroy(&f.text)
-		crdt.log_destroy(&f.log)
-		f.loaded = false
+	src := fshist.Text_Source {
+		data       = h,
+		g          = &h.g,
+		allocator  = h.allocator,
+		content    = crdt.Content_Source{h, content_read},
+		copies     = crdt.Copy_Source{h, copy_read},
+		op_ref     = proc(data: rawptr, inode: fstree.Inode_Id, i: u32) -> (fshist.Op_Ref, fshist.Error) {
+			h := (^History)(data)
+			ref, err := read_op_ref(h, inode, i)
+			if err != .None {
+				h.src_err = err
+				return {}, .Corrupt
+			}
+			return ref, .None
+		},
+		record     = proc(data: rawptr, stream: u32, off: u64, buf: ^[dynamic]u8) -> ([]u8, fshist.Error) {
+			h := (^History)(data)
+			body, err := read_stream(h, stream, i64(off), buf)
+			if err == .Redacted {
+				return nil, .Redacted
+			}
+			if err != .None {
+				h.src_err = err
+				return nil, .Corrupt
+			}
+			return body, .None
+		},
+		dict       = proc(data: rawptr, stream: u32) -> ^crdt.Actor_Dict {
+			return stream_dict((^History)(data), stream)
+		},
+		checkpoint = proc(data: rawptr, oid: fshist.Raw_Oid, size: i64, allocator: runtime.Allocator) -> ([]u8, fshist.Error) {
+			h := (^History)(data)
+			if h.db == nil {
+				return nil, .Not_Found
+			}
+			t, d, rerr := odb.read(h.db, odb.Oid(oid), allocator)
+			if rerr != .None || t != .Blob || i64(len(d)) != size {
+				return nil, .Not_Found
+			}
+			return d, .None
+		},
 	}
-	if f.rec.has_cp && !full {
-		ok, err := load_from_checkpoint(h, f, v)
-		if err != .None {
-			return err
-		}
-		if ok {
-			return .None
-		}
+	h.src_err = .None
+	e := fshist.text_load(&src, &f.st, f.inode, inode_op(h, f.inode), &f.rec, f.new_refs[:], v, full)
+	if e == .None {
+		return .None
 	}
-	crdt.text_init(&f.text, h.allocator)
-	crdt.log_init(&f.log, h.allocator, crdt.Content_Source{h, content_read}, crdt.Copy_Source{h, copy_read})
-	f.loaded = true
-	f.from_cp = false
-	if f.rec.has_base {
-		buf := make([dynamic]u8, context.temp_allocator)
-		replay_ref(h, f, inode_op(h, f.inode), f.rec.base, &buf, nil) or_return
+	if h.src_err != .None {
+		return h.src_err
 	}
-	replay_ops(h, f, 0, nil) or_return
-	if e := crdt.text_merge(&f.text, &h.g, &f.log, v); e != .None {
-		return .Corrupt
+	#partial switch e {
+	case .Not_Found:
+		return .Not_Found
+	case .Invalid:
+		return .Invalid
+	case .No_Memory:
+		return .No_Memory
+	case .Redacted:
+		return .Redacted
 	}
-	return .None
-}
-
-@(private)
-load_from_checkpoint :: proc(h: ^History, f: ^File_State, v: []crdt.Lv) -> (ok: bool, err: Error) {
-	cpv := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&h.g, f.rec.cp_version[:], &cpv) != .None {
-		return false, .None
-	}
-	if !crdt.graph_contains_all(&h.g, v, cpv[:]) {
-		return false, .None
-	}
-	data: []u8
-	if f.rec.cp_len > 0 {
-		if h.db == nil {
-			return false, .None
-		}
-		t, d, rerr := odb.read(h.db, odb.Oid(f.rec.cp_text), context.temp_allocator)
-		if rerr != .None || t != .Blob || i64(len(d)) != f.rec.cp_len {
-			return false, .None
-		}
-		data = d
-	}
-	if crdt.text_from(&f.text, &h.g, data, f.rec.cp_spans[:], f.rec.cp_version[:], h.allocator) != .None {
-		return false, .None
-	}
-	crdt.log_init(&f.log, h.allocator, crdt.Content_Source{h, content_read}, crdt.Copy_Source{h, copy_read})
-	f.loaded = true
-	descends, rerr := replay_ops(h, f, f.rec.cp_count, cpv[:])
-	if rerr != .None || !descends {
-		crdt.text_destroy(&f.text)
-		crdt.log_destroy(&f.log)
-		f.loaded = false
-		return false, rerr
-	}
-	if e := crdt.text_merge(&f.text, &h.g, &f.log, v); e != .None {
-		crdt.text_destroy(&f.text)
-		crdt.log_destroy(&f.log)
-		f.loaded = false
-		return false, .None
-	}
-	f.from_cp = true
-	return true, .None
-}
-
-@(private)
-replay_ops :: proc(h: ^History, f: ^File_State, from: u32, base: []crdt.Lv) -> (descends: bool, err: Error) {
-	target := inode_op(h, f.inode)
-	buf := make([dynamic]u8, context.temp_allocator)
-	for i := from; i < f.rec.ops; i += 1 {
-		ref := read_op_ref(h, f.inode, i) or_return
-		if !(replay_ref(h, f, target, ref, &buf, base) or_return) {
-			return false, .None
-		}
-	}
-	for ref in f.new_refs {
-		if !(replay_ref(h, f, target, ref, &buf, base) or_return) {
-			return false, .None
-		}
-	}
-	return true, .None
-}
-
-@(private)
-replay_ref :: proc(h: ^History, f: ^File_State, target: crdt.Op_Id, ref: Op_Ref, buf: ^[dynamic]u8, base: []crdt.Lv) -> (descends: bool, err: Error) {
-	body, rerr := read_stream(h, ref.stream, i64(ref.off), buf)
-	if rerr == .Redacted {
-		return true, .None
-	}
-	rerr or_return
-	payload, pok := batch_payload(body)
-	if !pok {
-		return false, .Corrupt
-	}
-	dict := stream_dict(h, ref.stream)
-	b, derr := crdt.batch_decode(payload, context.temp_allocator, dict)
-	if derr != .None {
-		return false, .Corrupt
-	}
-	if len(base) > 0 {
-		ps := make([dynamic]crdt.Lv, context.temp_allocator)
-		if crdt.graph_version_lvs(&h.g, b.parents, &ps) != .None || !crdt.graph_contains_all(&h.g, ps[:], base) {
-			return false, .None
-		}
-	}
-	use := &b
-	if ref.to < u32(crdt.batch_len(&b)) {
-		cut, cerr := crdt.batch_slice(&b, 0, int(ref.to), context.temp_allocator)
-		if cerr != .None {
-			return false, .Corrupt
-		}
-		use = &cut
-	}
-	first, ok := crdt.graph_lv(&h.g, crdt.Op_Id{use.actor, use.seq})
-	if !ok {
-		return false, .Corrupt
-	}
-	crdt.log_add_batch(&f.log, &h.g, use, target, first, 0)
-	return true, .None
+	return .Corrupt
 }
 
 @(private)

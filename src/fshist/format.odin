@@ -11,6 +11,7 @@ Error :: enum u8 {
 	Not_Found,
 	Invalid,
 	No_Memory,
+	Redacted,
 }
 
 REC_BATCH :: u8(1)
