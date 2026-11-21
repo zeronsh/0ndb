@@ -11,6 +11,11 @@ muse_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
 	f_str(b, "name", "ondb")
 	f_str(b, "version", "0.1.0")
 	close_obj(b)
+	if len(d.req.mcp) > 0 {
+		f_obj(b, "capabilities")
+		f_raw(b, "requestedCapabilities", `["sessionMcp"]`)
+		close_obj(b)
+	}
 	rpc_end(b)
 	append(b, `{"jsonrpc":"2.0","method":"initialized"}`)
 	end_line(b)
@@ -20,7 +25,7 @@ muse_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
 @(private)
 muse_command :: proc(d: ^Driver, b: ^[dynamic]u8, kind: Request, method: string, ref := "", command := "") {
 	rpc_request(b, request(d, kind, ref), method)
-	f_str(b, "commandId", command != "" ? command : new_uuid())
+	f_str(b, "commandId", command != "" ? command : new_uuid(d))
 }
 
 @(private)
@@ -38,12 +43,14 @@ muse_open :: proc(d: ^Driver, b: ^[dynamic]u8) {
 	case t.session == "" && d.req.resume != "":
 		muse_command(d, b, .Open, "session/resume")
 		f_str(b, "sessionId", d.req.resume)
+		muse_mcp(d, b)
 		f_bool(b, "excludeItems", true)
 		if d.req.model != "" {
 			f_str(b, "modelId", d.req.model)
 		}
 	case:
 		muse_command(d, b, .Open, "session/start")
+		muse_mcp(d, b)
 		if d.req.cwd != "" {
 			f_str(b, "workspaceRoot", d.req.cwd)
 		}
@@ -121,7 +128,7 @@ muse_write_prompt :: proc(d: ^Driver, b: ^[dynamic]u8, p: ^Prompt) {
 
 @(private)
 muse_submit :: proc(d: ^Driver, p: ^Prompt, o: ^Output) {
-	set(d, &p.cmd, is_uuid7(p.id) ? p.id : new_uuid())
+	set(d, &p.cmd, is_uuid7(p.id) ? p.id : new_uuid(d))
 	if d.ready {
 		muse_write_prompt(d, &o.bytes, p)
 	}
@@ -456,4 +463,28 @@ muse_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 			notice(o, .Warning, rpc_error_message(v))
 		}
 	}
+}
+
+@(private)
+muse_mcp :: proc(d: ^Driver, b: ^[dynamic]u8) {
+	if len(d.req.mcp) == 0 {
+		return
+	}
+	f_obj(b, "config")
+	f_obj(b, "mcpServers")
+	for m in d.req.mcp {
+		f_obj(b, m.name)
+		if m.url != "" {
+			f_str(b, "transport", "streamableHttp")
+			f_str(b, "url", m.url)
+			f_kv_object(b, "headers", m.headers, ':')
+		} else {
+			f_str(b, "transport", "stdio")
+			f_str(b, "command", m.command)
+			f_str_array(b, "args", m.args)
+			f_kv_object(b, "env", m.env, '=')
+		}
+		close_obj(b)
+	}
+	append(b, "}}")
 }

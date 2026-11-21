@@ -1,9 +1,8 @@
 package agent
 
-import "core:math/rand"
 import "core:mem"
+import "../prim"
 import "core:strings"
-import "core:time"
 
 Provider :: enum u8 {
 	Claude,
@@ -105,8 +104,26 @@ Start_Request :: struct {
 	checkpoint:      string,
 	rewind:          Rewind_Target,
 	seed_budget:     int,
+	mcp:             []Mcp_Server,
+	scratch:         string,
+	clock:           prim.Clock,
+	random:          prim.Random,
 	seed:            []Seed_Entry,
 	env:             []string,
+}
+
+Mcp_Server :: struct {
+	name:    string,
+	command: string,
+	args:    []string,
+	env:     []string,
+	url:     string,
+	headers: []string,
+}
+
+Launch_File :: struct {
+	path: string,
+	data: []u8,
 }
 
 Launch :: struct {
@@ -114,6 +131,7 @@ Launch :: struct {
 	env:   []string,
 	cwd:   string,
 	stdin: []u8,
+	files: []Launch_File,
 }
 
 Model :: struct {
@@ -360,6 +378,7 @@ Driver :: struct {
 	cost_base:   f64,
 	cost_seen:   f64,
 	undo:        int,
+	can_http:    bool,
 }
 
 capabilities :: proc(p: Provider) -> Capabilities {
@@ -437,6 +456,25 @@ init_with :: proc(d: ^Driver, desc: Provider_Descriptor, req: Start_Request, all
 	r.resume = own(d, req.resume)
 	r.checkpoint = own(d, req.checkpoint)
 	r.rewind = own_target(d, req.rewind)
+	r.scratch = own(d, req.scratch)
+	r.seed = nil
+	if len(req.mcp) > 0 {
+		servers, merr := make([]Mcp_Server, len(req.mcp), allocator)
+		if merr != nil {
+			return .Out_Of_Memory
+		}
+		for m, i in req.mcp {
+			servers[i] = Mcp_Server {
+				name    = own(d, m.name),
+				command = own(d, m.command),
+				url     = own(d, m.url),
+			}
+			servers[i].args, _ = clone_strings(m.args, allocator)
+			servers[i].env, _ = clone_strings(m.env, allocator)
+			servers[i].headers, _ = clone_strings(m.headers, allocator)
+		}
+		r.mcp = servers
+	}
 	env, err := make([]string, len(req.env), allocator)
 	if err != nil {
 		return .Out_Of_Memory
@@ -471,6 +509,16 @@ destroy :: proc(d: ^Driver) {
 	delete(d.req.resume, a)
 	delete(d.req.checkpoint, a)
 	drop_target(d, &d.req.rewind)
+	delete(d.req.scratch, a)
+	for m in d.req.mcp {
+		delete(m.name, a)
+		delete(m.command, a)
+		delete(m.url, a)
+		drop_strings(m.args, a)
+		drop_strings(m.env, a)
+		drop_strings(m.headers, a)
+	}
+	delete(d.req.mcp, a)
 	for e in d.req.env {
 		delete(e, a)
 	}
@@ -518,13 +566,14 @@ launch :: proc(d: ^Driver, allocator := context.temp_allocator) -> Launch {
 	d.usage = {}
 	argv := make([dynamic]string, allocator)
 	b := make([dynamic]u8, allocator)
+	files := make([dynamic]Launch_File, allocator)
 	switch d.desc.protocol {
 	case .Claude_Stream_Json:
 		claude_launch(d, &argv, &b)
 	case .Codex_App_Server:
 		codex_launch(d, &argv, &b)
 	case .Pi_Rpc:
-		pi_launch(d, &argv, &b)
+		pi_launch(d, &argv, &b, &files)
 	case .Muse:
 		muse_launch(d, &argv, &b)
 	case .Acp:
@@ -533,7 +582,7 @@ launch :: proc(d: ^Driver, allocator := context.temp_allocator) -> Launch {
 	env := make([dynamic]string, allocator)
 	append(&env, ..d.desc.env)
 	append(&env, ..d.req.env)
-	return Launch{argv = argv[:], env = env[:], cwd = d.req.cwd, stdin = b[:]}
+	return Launch{argv = argv[:], env = env[:], cwd = d.req.cwd, stdin = b[:], files = files[:]}
 }
 
 feed :: proc(d: ^Driver, line: []u8, allocator := context.temp_allocator) -> Output {
@@ -573,7 +622,7 @@ steer :: proc(d: ^Driver, text: string, id := "", files: []Attachment = nil, all
 @(private)
 submit :: proc(d: ^Driver, text, id: string, files: []Attachment, steer: bool, allocator: mem.Allocator) -> Output {
 	o := output(allocator)
-	pid := id != "" ? id : new_uuid()
+	pid := id != "" ? id : new_uuid(d)
 	body := text
 	if d.seed != "" && d.seed_for == "" {
 		body = strings.concatenate({d.seed, "\n\n", text}, context.temp_allocator)
@@ -1082,20 +1131,8 @@ text_delta :: proc(d: ^Driver, o: ^Output, item, text: string) {
 }
 
 @(private)
-new_uuid :: proc() -> string {
-	ms := u64(time.time_to_unix_nano(time.now()) / 1_000_000)
-	hi := rand.uint64()
-	lo := rand.uint64()
-	b: [16]u8
-	for i in 0 ..< 6 {
-		b[i] = u8(ms >> (8 * u64(5 - i)))
-	}
-	b[6] = 0x70 | u8(hi & 0x0f)
-	b[7] = u8(hi >> 8)
-	b[8] = 0x80 | u8(lo & 0x3f)
-	for i in 9 ..< 16 {
-		b[i] = u8(lo >> (8 * u64(i - 8)))
-	}
+new_uuid :: proc(d: ^Driver) -> string {
+	id := prim.id_new_with(d.req.clock, d.req.random)
 	hex := "0123456789abcdef"
 	out := make([]u8, 36, context.temp_allocator)
 	j := 0
@@ -1104,8 +1141,8 @@ new_uuid :: proc() -> string {
 			out[j] = '-'
 			j += 1
 		}
-		out[j] = hex[b[i] >> 4]
-		out[j + 1] = hex[b[i] & 0xf]
+		out[j] = hex[id[i] >> 4]
+		out[j + 1] = hex[id[i] & 0xf]
 		j += 2
 	}
 	return string(out)

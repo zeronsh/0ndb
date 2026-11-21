@@ -28,6 +28,23 @@ codex_config :: proc(d: ^Driver, b: ^[dynamic]u8) {
 		f_str(b, "model", d.req.model)
 	}
 	f_str(b, "approvalPolicy", d.req.ask_permissions ? "on-request" : "never")
+	if len(d.req.mcp) > 0 {
+		f_obj(b, "config")
+		f_obj(b, "mcp_servers")
+		for m in d.req.mcp {
+			f_obj(b, m.name)
+			if m.url != "" {
+				f_str(b, "url", m.url)
+				f_kv_object(b, "http_headers", m.headers, ':')
+			} else {
+				f_str(b, "command", m.command)
+				f_str_array(b, "args", m.args)
+				f_kv_object(b, "env", m.env, '=')
+			}
+			close_obj(b)
+		}
+		append(b, "}}")
+	}
 	switch d.req.access {
 	case .Plan:
 		f_str(b, "sandbox", "read-only")

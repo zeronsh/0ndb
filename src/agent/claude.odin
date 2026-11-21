@@ -35,6 +35,9 @@ claude_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
 	if d.req.effort != "" {
 		append(argv, "--effort", d.req.effort)
 	}
+	if len(d.req.mcp) > 0 {
+		append(argv, "--mcp-config", claude_mcp_config(d))
+	}
 	t := d.req.rewind
 	if t.session != "" {
 		if t.after != "" {
@@ -418,4 +421,27 @@ claude_control_response :: proc(d: ^Driver, r: json.Value, o: ^Output) {
 		}
 		emit_models(o, list[:])
 	}
+}
+
+@(private)
+claude_mcp_config :: proc(d: ^Driver) -> string {
+	b := make([dynamic]u8, context.temp_allocator)
+	append(&b, '{')
+	f_obj(&b, "mcpServers")
+	for m in d.req.mcp {
+		f_obj(&b, m.name)
+		if m.url != "" {
+			f_str(&b, "type", "http")
+			f_str(&b, "url", m.url)
+			f_kv_object(&b, "headers", m.headers, ':')
+		} else {
+			f_str(&b, "type", "stdio")
+			f_str(&b, "command", m.command)
+			f_str_array(&b, "args", m.args)
+			f_kv_object(&b, "env", m.env, '=')
+		}
+		close_obj(&b)
+	}
+	append(&b, "}}")
+	return string(b[:])
 }

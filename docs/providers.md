@@ -75,6 +75,29 @@ it is recorded but never parsed.
 - `list_models(d)` returns request bytes; the answer arrives as a `Models`
   event (ACP agents emit `Models` whenever a session opens).
 
+## MCP servers
+
+`Start_Request.mcp` lists MCP servers for the session:
+`Mcp_Server{name, command, args, env ("KEY=VALUE"), url, headers ("Name: value")}`
+(a `url` selects streamable HTTP, otherwise stdio). Each driver passes them
+in its provider's own form; nothing outside the driver files knows a flag:
+
+| Provider | Wire form | Verified |
+|---|---|---|
+| Claude Code | `--mcp-config '{"mcpServers":{name:{"type":"stdio","command","args","env"} \| {"type":"http","url","headers"}}}'` (inline JSON) | live: the model called `mcp__ondbtest__secret_word` on a scratch stdio server and got its output, env included |
+| Codex | `config: {"mcp_servers": {name: {command, args, env} \| {url, http_headers}}}` on `thread/start` / `resume` / `fork` | live: the server reached `mcpServer/startupStatus/updated` `ready` and was initialized and listed |
+| Pi | no per-run option exists (Pi reads `mcp.json` files); the driver returns a `Launch.files` entry, `<scratch>/ondb-mcp.mjs`, an extension calling `pi.registerMcpServer(name, config)` for each server, and adds `--extension <file>`. Needs `Start_Request.scratch`; the host writes `Launch.files` before spawning | live: Pi initialized the server and listed its tools |
+| Muse | `config: {"mcpServers": {name: {"transport":"stdio","command","args","env"} \| {"transport":"streamableHttp","url","headers"}}}` on `session/start` / `session/resume`; `initialize` must request `capabilities.requestedCapabilities: ["sessionMcp"]` or the session is refused ("session MCP configuration requires the sessionMcp capability") | live: capability granted and session started (servers start on use; turns need a login) |
+| ACP | `mcpServers` in `session/new`, `load`, `resume`, `fork`: `{name, command, args, env:[{name,value}]}` or `{type:"http", name, url, headers:[{name,value}]}` (HTTP only when `agentCapabilities.mcpCapabilities.http`) | live (OpenCode): the model called the server's tool |
+
+## Determinism
+
+Ids the driver mints (prompt ids when the host passes none, Muse command ids,
+the undo prompt) come from `prim.id_new_with(Start_Request.clock,
+Start_Request.random)`: UUIDv7 from the injected clock and `prim.Random`
+(system clock and `crypto.rand_bytes` when unset), so a simulator gets the
+same bytes on every run.
+
 ## Provider registry
 
 Every provider is a `Provider_Descriptor{id, name, argv, protocol,

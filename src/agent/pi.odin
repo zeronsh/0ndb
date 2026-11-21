@@ -5,7 +5,7 @@ import "core:strconv"
 import "core:strings"
 
 @(private)
-pi_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
+pi_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8, files: ^[dynamic]Launch_File) {
 	base_argv(d, argv)
 	append(argv, "--mode", "rpc", "--no-themes")
 	if d.req.model != "" {
@@ -20,6 +20,11 @@ pi_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
 	case .Edit:
 		append(argv, "--exclude-tools", "bash")
 	case .Full:
+	}
+	if len(d.req.mcp) > 0 && d.req.scratch != "" {
+		path := strings.concatenate({d.req.scratch, "/ondb-mcp.mjs"}, context.temp_allocator)
+		append(files, Launch_File{path = path, data = transmute([]u8)pi_mcp_extension(d)})
+		append(argv, "--extension", path)
 	}
 	if d.req.rewind.session != "" {
 		append(argv, "--session", d.req.rewind.session)
@@ -522,4 +527,25 @@ pi_rewind_fallback :: proc(d: ^Driver, o: ^Output, message: string) {
 	rewind_failed(d, o, message)
 	pi_command(d, &o.bytes, .State, "get_state")
 	pi_end(&o.bytes)
+}
+
+@(private)
+pi_mcp_extension :: proc(d: ^Driver) -> string {
+	b := make([dynamic]u8, context.temp_allocator)
+	append(&b, "const servers = ")
+	append(&b, '{')
+	for m in d.req.mcp {
+		f_obj(&b, m.name)
+		if m.url != "" {
+			f_str(&b, "url", m.url)
+			f_kv_object(&b, "headers", m.headers, ':')
+		} else {
+			f_str(&b, "command", m.command)
+			f_str_array(&b, "args", m.args)
+			f_kv_object(&b, "env", m.env, '=')
+		}
+		close_obj(&b)
+	}
+	append(&b, "};\nexport default function (pi) {\n\tfor (const name of Object.keys(servers)) pi.registerMcpServer(name, servers[name]);\n}\n")
+	return string(b[:])
 }

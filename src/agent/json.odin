@@ -409,3 +409,44 @@ put :: proc(b: ^[dynamic]u8, parts: ..string) {
 		append(b, part)
 	}
 }
+
+@(private)
+kv_split :: proc(s: string, sep: u8) -> (string, string) {
+	if i := strings.index_byte(s, sep); i >= 0 {
+		return strings.trim_space(s[:i]), strings.trim_space(s[i + 1:])
+	}
+	return strings.trim_space(s), ""
+}
+
+@(private)
+f_kv_object :: proc(b: ^[dynamic]u8, k: string, list: []string, sep: u8) {
+	f_obj(b, k)
+	for item in list {
+		name, value := kv_split(item, sep)
+		f_str(b, name, value)
+	}
+	close_obj(b)
+}
+
+@(private)
+f_kv_array :: proc(b: ^[dynamic]u8, k: string, list: []string, sep: u8) {
+	f_arr(b, k)
+	for item in list {
+		name, value := kv_split(item, sep)
+		open(b)
+		f_str(b, "name", name)
+		f_str(b, "value", value)
+		close_obj(b)
+	}
+	close_arr(b)
+}
+
+@(private)
+f_str_array :: proc(b: ^[dynamic]u8, k: string, list: []string) {
+	f_arr(b, k)
+	for item in list {
+		sep(b)
+		w_str(b, item)
+	}
+	close_arr(b)
+}

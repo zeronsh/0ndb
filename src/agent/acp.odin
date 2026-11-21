@@ -44,7 +44,25 @@ acp_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
 @(private)
 acp_session_params :: proc(d: ^Driver, b: ^[dynamic]u8) {
 	f_str(b, "cwd", d.req.cwd)
-	f_raw(b, "mcpServers", "[]")
+	f_arr(b, "mcpServers")
+	for m in d.req.mcp {
+		if m.url != "" && !d.can_http {
+			continue
+		}
+		open(b)
+		f_str(b, "name", m.name)
+		if m.url != "" {
+			f_str(b, "type", "http")
+			f_str(b, "url", m.url)
+			f_kv_array(b, "headers", m.headers, ':')
+		} else {
+			f_str(b, "command", m.command)
+			f_str_array(b, "args", m.args)
+			f_kv_array(b, "env", m.env, '=')
+		}
+		close_obj(b)
+	}
+	close_arr(b)
 }
 
 @(private)
@@ -555,7 +573,7 @@ acp_session_opened :: proc(d: ^Driver, p: Pending, result: json.Value, o: ^Outpu
 	if d.undo > 0 {
 		buf: [32]u8
 		line := strings.concatenate({"/undo ", strconv.write_int(buf[:], i64(d.undo), 10)}, context.temp_allocator)
-		acp_write_prompt(d, &o.bytes, .Undo, new_uuid(), line, nil)
+		acp_write_prompt(d, &o.bytes, .Undo, new_uuid(d), line, nil)
 		return
 	}
 	if !pending_kind(d, .Configure) {
@@ -697,6 +715,7 @@ acp_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 		d.can_resume = has(sc, "resume")
 		d.can_fork = has(sc, "fork")
 		d.can_close = has(sc, "close")
+		d.can_http = get_bool(get(caps, "mcpCapabilities"), "http")
 		pc := get(caps, "promptCapabilities")
 		d.can_image = get_bool(pc, "image")
 		d.can_embed = get_bool(pc, "embeddedContext")
