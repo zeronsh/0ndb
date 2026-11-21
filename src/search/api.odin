@@ -29,9 +29,13 @@ add :: proc(ix: ^Index, source: prim.Id, pos: i64, doc: ^Doc) -> Error {
 	if len(doc.slot) > 0 {
 		key: [MAX_KEY]u8
 		n := slot_key(doc.object, doc.slot, &key)
-		k := make([]u8, n, ix.mem.allocator)
-		copy(k, key[:n])
-		ix.mem.slots[string(k)] = id
+		if v, found := &ix.mem.slots[string(key[:n])]; found {
+			v^ = id
+		} else {
+			k := make([]u8, n, ix.mem.allocator)
+			copy(k, key[:n])
+			ix.mem.slots[string(k)] = id
+		}
 	}
 	ix.mem.sources[source] = pos
 	return _maybe_flush(ix)

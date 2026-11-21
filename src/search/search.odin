@@ -266,6 +266,10 @@ open :: proc(ix: ^Index, dir: string, opts: Options, allocator := context.alloca
 	}
 	_remove(ix, "flush.tmp")
 	_remove(ix, "merge.tmp")
+	_remove(ix, "graph.tmp")
+	for n in ([?]string{"vt-flush.tmp", "vs-flush.tmp", "vt-merge.tmp", "vs-merge.tmp"}) {
+		_remove(ix, n)
+	}
 	lerr2 := _load(ix)
 	if lerr2 == .None && ix.man.store != ix.opts.store_text {
 		lerr2 = .Corrupt

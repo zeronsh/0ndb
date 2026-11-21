@@ -327,12 +327,13 @@ Merge :: struct {
 	vbase:     [dynamic]u32,
 	vin:       int,
 	vpos:      int,
-	vm:        ^Vmerge,
+	gb:        ^Graph_Build,
 	work:      int,
 	wmap:      [dynamic][]u32,
 	in_ord:    [dynamic]u32,
 	out_ord:   u32,
 	vtmp:      [dynamic]u32,
+	vw:        Vocab_Writer,
 	vbuf:      []u8,
 	kw:        Kv_Writer,
 	arena:     runtime.Arena,
@@ -510,6 +511,8 @@ merge_abort :: proc(ix: ^Index) {
 		prim.close_file(m.sw.out.vfs, m.sw.out.fd)
 		m.sw.out.fd = prim.INVALID_FD
 	}
+	vmerge_destroy(ix, m)
+	vocab_destroy(ix, &m.vw)
 	_remove(ix, "merge.tmp")
 	runtime.arena_destroy(&m.arena)
 	free(m, ix.allocator)
@@ -581,6 +584,7 @@ _merge_work :: proc(ix: ^Index, m: ^Merge) -> (done: bool, err: Error) {
 		fin := _merge_term(ix, m) or_return
 		if fin {
 			sw_post_end(&m.sw)
+			vocab_write(ix, &m.sw, &m.vw)
 			_merge_src_init(m)
 			m.sw.f.src_off = sw_off(&m.sw)
 			m.phase = .Src
@@ -627,7 +631,7 @@ _merge_work :: proc(ix: ^Index, m: ^Merge) -> (done: bool, err: Error) {
 	case .Vec_Ids:
 		return false, _merge_vec(ix, m)
 	case .Vec_Graph:
-		fin := vmerge_step(m) or_return
+		fin := vmerge_step(ix, m) or_return
 		if fin {
 			m.phase = .Finish
 		}
@@ -758,6 +762,7 @@ _merge_post_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 	m.wmap = make([dynamic][]u32, len(m.segs), a)
 	m.in_ord = make([dynamic]u32, len(m.segs), a)
 	m.vtmp = make([dynamic]u32, a)
+	vocab_init(ix, &m.vw, "vt-merge.tmp", "vs-merge.tmp", a) or_return
 	for &s, i in m.segs {
 		m.wmap[i] = make([]u32, int(s.f.w_count), a)
 		slice.fill(m.wmap[i], max(u32))
@@ -974,6 +979,7 @@ _merge_term :: proc(ix: ^Index, m: ^Merge) -> (fin: bool, err: Error) {
 		}
 		if written {
 			m.out_ord += 1
+			vocab_add(&m.vw, &m.sw, key[1:])
 		}
 	}
 	for i in 0 ..< nin {

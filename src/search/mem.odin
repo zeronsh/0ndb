@@ -938,6 +938,9 @@ mem_flush :: proc(ix: ^Index) -> Error {
 	lw_init(&lw, &sw, context.temp_allocator)
 	vocab := make(map[u32][dynamic]u32, context.temp_allocator)
 	word_ord := u32(0)
+	vw: Vocab_Writer
+	vocab_init(ix, &vw, "vt-flush.tmp", "vs-flush.tmp", context.temp_allocator) or_return
+	defer vocab_destroy(ix, &vw)
 	for ti in order {
 		t := &m.terms[ti]
 		vk := mem_term_vk(m, t)
@@ -966,11 +969,13 @@ mem_flush :: proc(ix: ^Index) -> Error {
 		}
 		if vk == VAL_IMPACT && sw.f.n_terms > before {
 			token_trigrams(key[1:], &vocab, word_ord, context.temp_allocator)
+			vocab_add(&vw, &sw, key[1:])
 			word_ord += 1
 		}
 	}
 	vocab_lists(vocab, &sw, &lw) or_return
 	sw_post_end(&sw)
+	vocab_write(ix, &sw, &vw)
 	src := make([dynamic]prim.Id, 0, len(m.sources), context.temp_allocator)
 	for k in m.sources {
 		append(&src, k)

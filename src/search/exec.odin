@@ -1,5 +1,6 @@
 package search
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:bytes"
 import "core:hash/xxhash"
@@ -83,6 +84,9 @@ Iter :: struct {
 	kids:  [dynamic]^Iter,
 	heap:  [dynamic]^Iter,
 	init:  bool,
+	h:     Handle,
+	sp:    ^Src_Plan,
+	bm:    []u64,
 	blo:   u32,
 	bhi:   u32,
 	lo:    u32,
@@ -115,6 +119,8 @@ Atom_Src :: struct {
 	titled: bool,
 	vcands: []^Plist,
 	vwords: []^Plist,
+	driven: bool,
+	planned: bool,
 }
 
 Src_Plan :: struct {
@@ -126,6 +132,8 @@ Src_Plan :: struct {
 	atoms: []Atom_Src,
 	mdir:  Dir_Entry,
 	dir:   Dir_Entry,
+	ready: bool,
+	empty: bool,
 }
 
 Entry :: struct {
@@ -316,6 +324,9 @@ search :: proc(ix: ^Index, query: string, req: Request, allocator := context.all
 		}
 	}
 	qhash := xxhash.XXH3_64_default(transmute([]u8)query) if len(query) > 0 else 0
+	if r.vector == nil && !r.semantic && _contradiction(&q) {
+		return res, .None
+	}
 	dead := make([dynamic]u32, a)
 	for &s in ix.segs {
 		tomb_load(&s, &dead) or_return
@@ -347,7 +358,7 @@ search :: proc(ix: ^Index, query: string, req: Request, allocator := context.all
 		append(&e.srcs, sp)
 	}
 	for &sp in e.srcs {
-		_plan_source(e, &sp) or_return
+		_plan_words(e, &sp) or_return
 	}
 	qv := _query_vector(e, &r) or_return
 	if len(r.cursor) > 0 && qv == nil {
@@ -404,6 +415,31 @@ search :: proc(ix: ^Index, query: string, req: Request, allocator := context.all
 		res.cursor = _cursor_encode(e, qhash, e.heap[limit - 1], allocator) or_return
 	}
 	return res, .None
+}
+
+@(private)
+_contradiction :: proc(q: ^Query) -> bool {
+	for &c in q.clauses {
+		if len(c.atoms) != 1 || !c.atoms[0].neg {
+			continue
+		}
+		x := &c.atoms[0]
+		#partial switch x.field {
+		case .Any, .Title, .Body, .Named, .Kind:
+		case:
+			continue
+		}
+		for &d in q.clauses {
+			if len(d.atoms) != 1 || d.atoms[0].neg {
+				continue
+			}
+			y := &d.atoms[0]
+			if x.field == y.field && x.substr == y.substr && x.word == y.word && x.prefix == y.prefix && x.whole == y.whole && x.kind == y.kind && string(x.name) == string(y.name) && string(x.text) == string(y.text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 @(private)
@@ -533,7 +569,7 @@ _range :: proc(e: ^Exec, sp: ^Src_Plan, p: ^Atom_Src, key: []u8, prefix: bool, n
 }
 
 @(private)
-_plan_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
+_plan_words :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 	a := e.alloc
 	sp.atoms = make([]Atom_Src, len(e.atoms), a)
 	if sp.seg != nil {
@@ -548,11 +584,12 @@ _plan_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 		p.checks = make([dynamic]Handle, a)
 		p.exact = -1
 		p.kind = .All
-		key: [MAX_KEY]u8
-		switch at.field {
+		#partial switch at.field {
 		case .Any, .Title, .Body:
+			key: [MAX_KEY]u8
 			p.words = make([]Handle, len(at.tokens), a)
 			p.has = make([]bool, len(at.tokens), a)
+			p.vwords = make([]^Plist, len(at.tokens), a)
 			for tok, j in at.tokens {
 				n := word_key(tok, &key)
 				h, found := _lookup(e, sp, key[:n]) or_return
@@ -562,6 +599,45 @@ _plan_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 					p.exact = 0
 				}
 			}
+		}
+	}
+	return .None
+}
+
+@(private)
+_plan_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
+	if sp.ready {
+		return .None
+	}
+	sp.ready = true
+	for &c in e.q.clauses {
+		if len(c.atoms) != 1 || c.atoms[0].neg || _is_text(&c.atoms[0]) {
+			continue
+		}
+		at := &c.atoms[0]
+		_plan_atom(e, sp, at, at.index) or_return
+		if sp.atoms[at.index].kind == .Empty {
+			sp.empty = true
+			return .None
+		}
+	}
+	for at, i in e.atoms {
+		if !sp.atoms[i].planned {
+			_plan_atom(e, sp, at, i) or_return
+		}
+	}
+	return .None
+}
+
+@(private)
+_plan_atom :: proc(e: ^Exec, sp: ^Src_Plan, at: ^Atom, i: int) -> Error {
+	a := e.alloc
+	{
+		p := &sp.atoms[i]
+		p.planned = true
+		key: [MAX_KEY]u8
+		switch at.field {
+		case .Any, .Title, .Body:
 			if at.word {
 				if p.exact >= 0 && p.has[0] {
 					p.kind = .List
@@ -664,19 +740,12 @@ _plan_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 			append(&p.checks, ..p.cands[:])
 		}
 		p.vcands = make([]^Plist, len(p.checks), a)
-		p.vwords = make([]^Plist, len(p.words), a)
-		for h, j in p.checks {
-			p.vcands[j] = _plist(e, sp, h)
+		if len(p.vwords) != len(p.words) {
+			p.vwords = make([]^Plist, len(p.words), a)
 		}
-		for h, j in p.words {
-			if p.has[j] {
-				p.vwords[j] = _plist(e, sp, h)
-			}
-		}
+
 		p.vtris = make([]^Plist, len(p.tris), a)
-		for h, j in p.tris {
-			p.vtris[j] = _plist(e, sp, h)
-		}
+
 		for h in p.cands {
 			p.est += u64(h.term.count)
 		}
@@ -711,7 +780,8 @@ _plist :: proc(e: ^Exec, sp: ^Src_Plan, h: Handle) -> ^Plist {
 _iter_list :: proc(e: ^Exec, sp: ^Src_Plan, h: Handle) -> ^Iter {
 	it := new(Iter, e.alloc)
 	it.kind = .List
-	it.pl = _plist(e, sp, h)
+	it.h = h
+	it.sp = sp
 	it.count = h.term.count
 	it.blo, it.bhi = h.term.lo, h.term.hi
 	if h.mem && len(h.ids) > 0 {
@@ -770,6 +840,9 @@ _seek :: proc(e: ^Exec, it: ^Iter, t: u32) -> (u32, bool) {
 		}
 		return 0, false
 	case .List:
+		if it.pl == nil {
+			it.pl = _plist(e, it.sp, it.h)
+		}
 		v, ok := pl_seek(it.pl, t)
 		if it.pl.err != .None && e.err == .None {
 			e.err = it.pl.err
@@ -841,11 +914,12 @@ _remaining_bound :: proc(e: ^Exec, sp: ^Src_Plan) -> f64 {
 		}
 		p := &sp.atoms[at.index]
 		for idf, j in at.tok_idf {
-			pl := p.vwords[j] if j < len(p.vwords) else nil
-			if pl == nil {
+			if j >= len(p.has) || !p.has[j] {
 				continue
 			}
-			rem += idf * (K1 + 1) * f64(pl.smax) / 15
+			pl := p.vwords[j]
+			sm := 15 if pl == nil else int(pl.smax)
+			rem += idf * (K1 + 1) * f64(sm) / 15
 		}
 	}
 	return rem
@@ -856,6 +930,29 @@ _run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 	if sp.hi == sp.lo {
 		return .None
 	}
+	if len(e.heap) == e.k {
+		if e.sort == .Relevance {
+			for at in e.atoms {
+				if !at.scored {
+					continue
+				}
+				p := &sp.atoms[at.index]
+				for _, j in at.tok_idf {
+					if pl := _vw(e, sp, p, j); pl != nil {
+						pl_seek(pl, u32(sp.hi - 1))
+					}
+				}
+			}
+		}
+		act := _block_enter(e, sp, (sp.hi - 1) / DOC_BLOCK) or_return
+		if act == .Stop || e.err != .None {
+			return e.err
+		}
+	}
+	_plan_source(e, sp) or_return
+	if sp.empty {
+		return .None
+	}
 	a := e.alloc
 	root := new(Iter, a)
 	root.kind = .And
@@ -863,6 +960,7 @@ _run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 	root.kids = make([dynamic]^Iter, a)
 	ests := make([dynamic]u64, a)
 	cis := make([dynamic]^Iter, a)
+	cas := make([dynamic]^Atom, a)
 	for &c in e.q.clauses {
 		all := false
 		est := u64(0)
@@ -887,11 +985,20 @@ _run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 		}
 		if len(kids) == 1 {
 			append(&cis, kids[0])
+			only: ^Atom
+			for &at in c.atoms {
+				p := &sp.atoms[at.index]
+				if !at.neg && p.kind != .Empty && p.kind != .All {
+					only = &at
+				}
+			}
+			append(&cas, only)
 		} else {
 			ci := new(Iter, a)
 			ci.kind = .Or
 			ci.kids = kids
 			append(&cis, ci)
+			append(&cas, nil)
 		}
 		append(&ests, est)
 	}
@@ -903,6 +1010,9 @@ _run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 		for ci, i in cis {
 			if ests[i] <= 4 * lo {
 				append(&root.kids, ci)
+				if cas[i] != nil {
+					sp.atoms[cas[i].index].driven = true
+				}
 			}
 		}
 	}
@@ -917,6 +1027,30 @@ _run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 			append(&excl, &c.atoms[0])
 		}
 	}
+	exact_neg := make([dynamic]Handle, a)
+	for x in excl {
+		p := &sp.atoms[x.index]
+		switch {
+		case p.kind == .Empty:
+		case p.exactu:
+			append(&exact_neg, ..p.checks[:])
+		case x.word && p.exact >= 0 && p.has[p.exact]:
+			append(&exact_neg, p.words[p.exact])
+		case len(x.text) == 3 && p.kind == .List && len(p.cands) == 1:
+			append(&exact_neg, p.cands[0])
+		}
+	}
+	dense := root.kind == .And && len(root.kids) >= 2
+	if dense {
+		for ci, i in cis {
+			if ci.kind != .Empty && ests[i] * 64 < (sp.hi - sp.lo) {
+				dense = false
+			}
+		}
+	}
+	if (len(exact_neg) > 0 || dense) && sp.seg != nil {
+		return _run_bitmap(e, sp, root, exact_neg[:], excl[:])
+	}
 	t := u32(sp.hi - 1)
 	last_blk := max(u64)
 	for {
@@ -926,32 +1060,27 @@ _run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 		}
 		blk := u64(d) / DOC_BLOCK
 		if blk != last_blk {
-			sp.dir = _source_dir(e, sp, blk) or_return
-			if len(e.heap) == e.k {
-				kth := e.heap[0]
-				stop := false
-				switch e.sort {
-				case .Newest:
-					stop = sp.dir.pmax <= kth.hlc
-				case .Relevance:
-					stop = (1 + _remaining_bound(e, sp)) * _decay(e, sp.dir.pmax) < kth.score
-				}
-				if stop {
-					if e.sort == .Newest {
-						e.stop = true
-					}
-					return .None
-				}
-			}
-			if sp.dir.max_hlc < e.after || sp.dir.min_hlc >= e.before {
+			act := _block_enter(e, sp, blk) or_return
+			switch act {
+			case .Stop:
+				return .None
+			case .Skip:
 				start := max(blk * DOC_BLOCK, sp.lo)
 				if start == sp.lo || sp.seg == nil {
-					break
+					return e.err
 				}
 				t = u32(start - 1)
 				continue
+			case .Go:
 			}
 			last_blk = blk
+		}
+		if f, skip := _bmw(e, sp, d); skip {
+			if u64(f) <= sp.lo {
+				break
+			}
+			t = f - 1
+			continue
 		}
 		excluded := false
 		for x in excl {
@@ -969,6 +1098,49 @@ _run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
 		t = d - 1
 	}
 	return e.err
+}
+
+@(private)
+_bmw :: proc(e: ^Exec, sp: ^Src_Plan, d: u32) -> (floor: u32, skip: bool) {
+	if e.sort != .Relevance || e.bm25max <= 0 || len(e.heap) < e.k {
+		return 0, false
+	}
+	bound := 0.0
+	floor = u32(sp.lo)
+	for at in e.atoms {
+		if !at.scored {
+			continue
+		}
+		p := &sp.atoms[at.index]
+		for idf, j in at.tok_idf {
+			if idf == 0 {
+				continue
+			}
+			pl := _vw(e, sp, p, j)
+			if pl == nil {
+				continue
+			}
+			_, ok := pl_seek(pl, d)
+			if pl.err != .None {
+				if e.err == .None {
+					e.err = pl.err
+				}
+				return 0, false
+			}
+			if !ok {
+				continue
+			}
+			bm := 15
+			if pl.arr == nil {
+				bm = int(pl.bmax)
+				if pl.ninl == 0 && pl.loaded && pl.n > 0 {
+					floor = max(floor, pl.ids[0])
+				}
+			}
+			bound += idf * (K1 + 1) * f64(bm) / 15
+		}
+	}
+	return floor, (1 + bound) * _decay(e, sp.dir.pmax) < e.heap[0].score
 }
 
 @(private)
@@ -1132,17 +1304,21 @@ _verdict :: proc(e: ^Exec, sp: ^Src_Plan, at: ^Atom, dm: ^Doc_Meta, d: u32) -> i
 		return 0
 	case .List, .And, .Or:
 	}
+	if p.driven && (p.exactu || (at.word && p.exact >= 0 && p.kind == .List)) {
+		return 1
+	}
 	if p.exactu {
 		if p.vunion == nil {
 			return -1
 		}
-		if p.exact >= 0 && p.vwords[p.exact] != nil {
-			v, ok := pl_seek(p.vwords[p.exact], d)
+		if pl := _vw(e, sp, p, p.exact); pl != nil {
+			v, ok := pl_seek(pl, d)
 			if ok && v == d {
 				return 1
 			}
 		}
-		for pl in p.vtris {
+		for j in 0 ..< len(p.tris) {
+			pl := _vt(e, sp, p, j)
 			v, ok := pl_seek(pl, d)
 			if !ok || v != d {
 				return -1
@@ -1152,7 +1328,7 @@ _verdict :: proc(e: ^Exec, sp: ^Src_Plan, at: ^Atom, dm: ^Doc_Meta, d: u32) -> i
 		return 1 if ok && v == d else -1
 	}
 	if p.exact >= 0 {
-		pl := p.vwords[p.exact]
+		pl := _vw(e, sp, p, p.exact)
 		if pl != nil {
 			v, ok := pl_seek(pl, d)
 			if ok && v == d {
@@ -1163,13 +1339,55 @@ _verdict :: proc(e: ^Exec, sp: ^Src_Plan, at: ^Atom, dm: ^Doc_Meta, d: u32) -> i
 			return -1
 		}
 	}
-	for pl in p.vcands {
+	for j in 0 ..< len(p.checks) {
+		pl := _vc(e, sp, p, j)
 		v, ok := pl_seek(pl, d)
 		if !ok || v != d {
 			return -1
 		}
 	}
 	return 0
+}
+
+@(private)
+_post_reject :: proc(e: ^Exec, sp: ^Src_Plan, at: ^Atom, d: u32) -> bool {
+	if at.neg {
+		return false
+	}
+	#partial switch at.field {
+	case .Named, .Kind, .Object, .From:
+	case:
+		return false
+	}
+	p := &sp.atoms[at.index]
+	switch p.kind {
+	case .Empty:
+		return true
+	case .All:
+		return false
+	case .List, .And:
+		for j in 0 ..< len(p.checks) {
+			pl := _vc(e, sp, p, j)
+			v, ok := pl_seek(pl, d)
+			if !ok || v != d {
+				return true
+			}
+		}
+		return false
+	case .Or:
+		if len(p.checks) > 16 {
+			return false
+		}
+		for j in 0 ..< len(p.checks) {
+			pl := _vc(e, sp, p, j)
+			v, ok := pl_seek(pl, d)
+			if ok && v == d {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 @(private)
@@ -1205,6 +1423,9 @@ _consider :: proc(e: ^Exec, sp: ^Src_Plan, d: u32) -> Error {
 		if decided && !ok {
 			return .None
 		}
+		if len(c.atoms) == 1 && _post_reject(e, sp, &c.atoms[0], d) {
+			return .None
+		}
 	}
 	bm := 0.0
 	if e.sort == .Relevance && e.bm25max > 0 {
@@ -1214,7 +1435,7 @@ _consider :: proc(e: ^Exec, sp: ^Src_Plan, d: u32) -> Error {
 			}
 			p := &sp.atoms[at.index]
 			for idf, j in at.tok_idf {
-				pl := p.vwords[j] if j < len(p.vwords) else nil
+				pl := _vw(e, sp, p, j)
 				if pl == nil || idf == 0 {
 					continue
 				}
@@ -1786,37 +2007,20 @@ _vocab :: proc(e: ^Exec, sp: ^Src_Plan, text: []u8) -> (hs: [dynamic]Handle, ok:
 		t = o - 1
 	}
 	slice.reverse(ords[:])
-	dc := new(Dict_Cursor, e.alloc)
-	dc_init(dc, &e.ix.cache, sp.seg, sp.dc.dix, e.alloc)
-	cur := i64(-1)
+	matched := make([dynamic]u32, e.alloc)
+	tb: [MAX_WORD]u8
 	for o in ords {
-		if u64(o) >= sp.seg.f.w_count {
-			return hs, false, .Corrupt
-		}
-		target := i64(sp.seg.f.w_first + u64(o))
-		blk := int(target / DICT_BLOCK)
-		if dc.blk != blk || cur > target || cur < i64(blk) * DICT_BLOCK - 1 {
-			if !dc_load(dc, blk) {
-				return hs, false, dc.err
-			}
-			cur = i64(blk) * DICT_BLOCK - 1
-		}
-		for cur < target {
-			if !dc_next(dc) {
-				return hs, false, dc.err if dc.err != .None else .Corrupt
-			}
-			cur += 1
-		}
-		k := dc_key(dc)
-		if len(k) == 0 || k[0] != NS_WORD {
-			return hs, false, .Corrupt
-		}
-		if bytes.contains(k[1:], text) {
-			if len(hs) >= VOCAB_CAP {
+		tok := vocab_token(&e.ix.cache, sp.seg, o, &tb) or_return
+		if bytes.contains(tok, text) {
+			if len(matched) >= VOCAB_CAP {
 				return hs, false, .None
 			}
-			append(&hs, Handle{term = dc.term})
+			append(&matched, o)
 		}
+	}
+	for o in matched {
+		t := word_term(&e.ix.cache, sp.seg, o) or_return
+		append(&hs, Handle{term = t})
 	}
 	return hs, true, e.err
 }
@@ -1888,4 +2092,282 @@ _iter_sift :: proc(h: []^Iter, i0: int) {
 		h[i], h[m] = h[m], h[i]
 		i = m
 	}
+}
+
+@(private)
+_vc :: proc(e: ^Exec, sp: ^Src_Plan, p: ^Atom_Src, j: int) -> ^Plist {
+	if p.vcands[j] == nil {
+		for k in 0 ..< len(p.words) {
+			if p.has[k] && _same_list(p.checks[j], p.words[k]) {
+				p.vcands[j] = _vw(e, sp, p, k)
+				return p.vcands[j]
+			}
+		}
+		p.vcands[j] = _plist(e, sp, p.checks[j])
+	}
+	return p.vcands[j]
+}
+
+@(private)
+_same_list :: proc "contextless" (a, b: Handle) -> bool {
+	return a.mem == b.mem && a.term.off == b.term.off && a.term.count == b.term.count && a.term.hi == b.term.hi && a.term.lo == b.term.lo && a.term.inl == b.term.inl && a.term.vals == b.term.vals && raw_data(a.ids) == raw_data(b.ids)
+}
+
+@(private)
+_vw :: proc(e: ^Exec, sp: ^Src_Plan, p: ^Atom_Src, j: int) -> ^Plist {
+	if j < 0 || j >= len(p.has) || !p.has[j] {
+		return nil
+	}
+	if p.vwords[j] == nil {
+		for k in 0 ..< len(p.checks) {
+			if p.vcands[k] != nil && _same_list(p.checks[k], p.words[j]) {
+				p.vwords[j] = p.vcands[k]
+				return p.vwords[j]
+			}
+		}
+		p.vwords[j] = _plist(e, sp, p.words[j])
+	}
+	return p.vwords[j]
+}
+
+@(private)
+_vt :: proc(e: ^Exec, sp: ^Src_Plan, p: ^Atom_Src, j: int) -> ^Plist {
+	if p.vtris[j] == nil {
+		p.vtris[j] = _plist(e, sp, p.tris[j])
+	}
+	return p.vtris[j]
+}
+
+Block_Act :: enum u8 {
+	Go,
+	Skip,
+	Stop,
+}
+
+@(private)
+_block_enter :: proc(e: ^Exec, sp: ^Src_Plan, blk: u64) -> (act: Block_Act, err: Error) {
+	sp.dir = _source_dir(e, sp, blk) or_return
+	if len(e.heap) == e.k {
+		kth := e.heap[0]
+		stop := false
+		switch e.sort {
+		case .Newest:
+			stop = sp.dir.pmax <= kth.hlc
+		case .Relevance:
+			stop = (1 + _remaining_bound(e, sp)) * _decay(e, sp.dir.pmax) < kth.score
+		}
+		if stop {
+			if e.sort == .Newest {
+				e.stop = true
+			}
+			return .Stop, .None
+		}
+	}
+	if sp.dir.max_hlc < e.after || sp.dir.min_hlc >= e.before {
+		return .Skip, .None
+	}
+	return .Go, .None
+}
+
+BM_MIN :: 1 << 13
+BM_MAX :: 1 << 16
+
+@(private)
+_bm :: proc(e: ^Exec, it: ^Iter, lo, hi: u32, out: []u64) {
+	slice.fill(out, 0)
+	switch it.kind {
+	case .Empty:
+	case .All:
+		a := max(lo, it.lo)
+		for x := a; x < hi; x += 1 {
+			k := x - lo
+			out[k >> 6] |= u64(1) << (k & 63)
+		}
+	case .List:
+		if it.bhi < lo || (it.count > INLINE && it.blo >= hi) {
+			return
+		}
+		if it.pl == nil {
+			it.pl = _plist(e, it.sp, it.h)
+		}
+		pl_fill(it.pl, lo, hi, out)
+		if it.pl.err != .None && e.err == .None {
+			e.err = it.pl.err
+		}
+	case .Or:
+		for kid in it.kids {
+			if kid.kind == .List {
+				if kid.bhi < lo || kid.blo >= hi {
+					continue
+				}
+				if kid.pl == nil {
+					kid.pl = _plist(e, kid.sp, kid.h)
+				}
+				pl_fill(kid.pl, lo, hi, out)
+				continue
+			}
+			if kid.bm == nil {
+				kid.bm = make([]u64, BM_MAX / 64, e.alloc)
+			}
+			_bm(e, kid, lo, hi, kid.bm[:len(out)])
+			for w, i in kid.bm[:len(out)] {
+				out[i] |= w
+			}
+		}
+	case .And:
+		for kid, k in it.kids {
+			if kid.bm == nil {
+				kid.bm = make([]u64, BM_MAX / 64, e.alloc)
+			}
+			if k == 0 {
+				_bm(e, kid, lo, hi, out)
+				continue
+			}
+			_bm(e, kid, lo, hi, kid.bm[:len(out)])
+			any := u64(0)
+			for w, i in kid.bm[:len(out)] {
+				out[i] &= w
+				any |= out[i]
+			}
+			if any == 0 {
+				return
+			}
+		}
+	}
+}
+
+@(private)
+_covered :: proc(it: ^Iter, neg: []Handle) -> bool {
+	switch it.kind {
+	case .Empty:
+		return true
+	case .All:
+		return false
+	case .List:
+		for h in neg {
+			if _same_list(it.h, h) {
+				return true
+			}
+		}
+		return false
+	case .Or:
+		for kid in it.kids {
+			if !_covered(kid, neg) {
+				return false
+			}
+		}
+		return len(it.kids) > 0
+	case .And:
+		for kid in it.kids {
+			if _covered(kid, neg) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+@(private)
+_run_bitmap :: proc(e: ^Exec, sp: ^Src_Plan, root: ^Iter, neg: []Handle, excl: []^Atom) -> Error {
+	a := e.alloc
+	if _covered(root, neg) {
+		return .None
+	}
+	pos := make([]u64, BM_MAX / 64, a)
+	nb := make([]u64, BM_MAX / 64, a)
+	negs := make([]^Iter, len(neg), a)
+	for h, i in neg {
+		negs[i] = _iter_list(e, sp, h)
+		negs[i].blo, negs[i].bhi = h.term.lo, h.term.hi
+		if h.mem && len(h.ids) > 0 {
+			negs[i].blo, negs[i].bhi = h.ids[0], h.ids[len(h.ids) - 1]
+		}
+	}
+	win := u32(BM_MIN)
+	hi := u32(sp.hi)
+	last_blk := max(u64)
+	skip_blk := max(u64)
+	skip_floor := u32(0)
+	have_skip := false
+	for u64(hi) > sp.lo {
+		if have_skip && skip_floor < hi {
+			if u64(skip_floor) <= sp.lo {
+				break
+			}
+			hi = skip_floor
+			have_skip = false
+		}
+		if len(e.heap) == e.k {
+			act := _block_enter(e, sp, u64(hi - 1) / DOC_BLOCK) or_return
+			if act == .Stop {
+				return e.err
+			}
+			last_blk = max(u64)
+		}
+		w := min(win, hi - u32(sp.lo))
+		lo := hi - w
+		nw := int((w + 63) / 64)
+		_bm(e, root, lo, hi, pos[:nw])
+		if e.err != .None {
+			return e.err
+		}
+		if len(negs) > 0 {
+			slice.fill(nb[:nw], 0)
+			for x in negs {
+				if x.bhi < lo || x.blo >= hi {
+					continue
+				}
+				if x.pl == nil {
+					x.pl = _plist(e, x.sp, x.h)
+				}
+				pl_fill(x.pl, lo, hi, nb[:nw])
+			}
+			for i in 0 ..< nw {
+				pos[i] &~= nb[i]
+			}
+		}
+		for i := nw - 1; i >= 0; i -= 1 {
+			word := pos[i]
+			for word != 0 {
+				b := 63 - intrinsics.count_leading_zeros(word)
+				word &~= u64(1) << u64(b)
+				d := lo + u32(i) * 64 + u32(b)
+				blk := u64(d) / DOC_BLOCK
+				if blk == skip_blk || (have_skip && d >= skip_floor) {
+					continue
+				}
+				if blk != last_blk {
+					act := _block_enter(e, sp, blk) or_return
+					switch act {
+					case .Stop:
+						return .None
+					case .Skip:
+						skip_blk = blk
+						continue
+					case .Go:
+					}
+					last_blk = blk
+				}
+				if f, skip := _bmw(e, sp, d); skip {
+					skip_floor = f
+					have_skip = true
+					continue
+				}
+				excluded := false
+				for x in excl {
+					if _verdict(e, sp, x, nil, d) > 0 {
+						excluded = true
+						break
+					}
+				}
+				if !excluded {
+					_consider(e, sp, d) or_return
+				}
+			}
+		}
+		hi = lo
+		win = min(win * 4, BM_MAX)
+	}
+	return e.err
 }
