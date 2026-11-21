@@ -528,7 +528,7 @@ call :: proc(r: ^Run, now: i64, kind: Request_Kind, out: ^Output) {
 		kind       = k,
 		compaction = r.t.compaction,
 	}
-	server_compact := k == .Compact && r.cfg.spec.server_compact && !r.cfg.client_compact && !r.no_srv_comp && r.model.compacted != nil
+	server_compact := k == .Compact && r.cfg.server_state == .Provider_Retained && r.cfg.spec.server_compact && !r.cfg.client_compact && !r.no_srv_comp && r.model.compacted != nil
 	opts.server_compact = server_compact && r.model.trigger == nil
 	if k == .Normal && r.srv_mode != .None {
 		opts.op = len(r.srv_id) > 0 ? .Continue : .Create
@@ -1242,7 +1242,7 @@ load_context :: proc(r: ^Run, ctx: ^Context) {
 	r.t = Transcript {
 		buf = r.t.buf,
 	}
-	r.srv_mode = r.cfg.stateless ? .None : r.cfg.spec.server_state
+	r.srv_mode = r.cfg.server_state == .Provider_Retained ? r.cfg.spec.state_api : .None
 	if r.model.api == .OpenAI_Chat || (r.srv_mode == .Thread && r.model.api != .Anthropic) || (r.srv_mode == .Response && r.model.api != .OpenAI_Responses) {
 		r.srv_mode = .None
 	}

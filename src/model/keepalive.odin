@@ -25,10 +25,10 @@ keepalive_build :: proc(r: ^Run, ctx: ^Context, allocator := context.temp_alloca
 		return {}, false
 	}
 	context.allocator = r.allocator
-	saved := r.cfg.stateless
-	r.cfg.stateless = true
+	saved := r.cfg.server_state
+	r.cfg.server_state = .Off
 	load_context(r, ctx)
-	r.cfg.stateless = saved
+	r.cfg.server_state = saved
 	if r.t.items == 0 {
 		return {}, false
 	}

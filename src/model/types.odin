@@ -90,6 +90,11 @@ Budget :: struct {
 	wall_ms:  i64,
 }
 
+Server_State_Policy :: enum u8 {
+	Off,
+	Provider_Retained,
+}
+
 Keepalive :: struct {
 	enabled:   bool,
 	window_ms: i64,
@@ -124,7 +129,7 @@ Config :: struct {
 	compact_tokens:   u64,
 	connect_ms:       i64,
 	stall_ms:         i64,
-	stateless:        bool,
+	server_state:     Server_State_Policy,
 	client_compact:   bool,
 	keepalive:        Keepalive,
 }
