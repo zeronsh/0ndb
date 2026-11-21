@@ -535,6 +535,12 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 		if !s.in_view && s.tree != nil && !s.tree.absent {
 			return true
 		}
+		if s.follow && h.kind != .Conversation && h.sp.repl_on && h.sp.connected {
+			n := osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0)
+			if n > 0 && !_replica_covers(s.rep, n) {
+				return true
+			}
+		}
 	}
 	return false
 }
