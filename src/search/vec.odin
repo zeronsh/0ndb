@@ -261,6 +261,9 @@ vec_maybe_train :: proc(ix: ^Index) -> (started: bool, err: Error) {
 	if total < u64(ix.opts.train_min) || (ix.man.cb_gen != 0 && total < TRAIN_GROWTH * ix.man.cb_n && !ix.cb_tainted) {
 		return false, .None
 	}
+	if ix.train_futile && ix.futile_gen == ix.man.next_gen {
+		return false, .None
+	}
 	dead := _dead_sorted(ix, ix.allocator) or_return
 	t, aerr := new(Vtrain, ix.allocator)
 	if aerr != nil {
@@ -386,6 +389,8 @@ _vtrain_work :: proc(ix: ^Index, t: ^Vtrain) -> (work: i64, done: bool, err: Err
 					}
 					ix.cb_tainted = false
 				}
+				ix.train_futile = true
+				ix.futile_gen = ix.man.next_gen
 				return 0, true, .None
 			}
 		}
