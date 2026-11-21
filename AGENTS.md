@@ -12,13 +12,13 @@
 ## Rules
 
 - No code comments.
-- Minimal tests: `tests/convergence`, `tests/fstree` and one end-to-end
-  package. Everything else is verified with throwaway programs, real git and
+- Minimal tests: `tests/convergence`, `tests/fstree` and `tests/sim` (the
+  deterministic whole-system simulator). Everything else is verified with throwaway programs, real git and
   real provider CLIs, not committed tests.
 - Nothing per thread or per file stays in memory between events. Idle means
   no wakeups and no armed timers.
 - Streams are single-writer and append-only. A durable record is never
-  rewritten or truncated. Offsets are identical locally, on the relay and on
+  rewritten or truncated, except that redaction zero-fills it in place. Offsets are identical locally, on the relay and on
   replicas.
 - Provider wire formats live only in their driver file under `src/agent/`.
 - Every provider line is recorded raw before it is interpreted.

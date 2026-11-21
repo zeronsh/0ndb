@@ -82,7 +82,7 @@ src/
   engine/    the embeddable engine: plug points, commands, runs, attribution, recording, events
   capi/      the C ABI over engine (`lib0ndb`, `0ndb.h`)
   cli/       the reference consumer: `0ndb` daemon, relay, runner, record and commands
-tests/       only: convergence (text), fstree (tree), and one end-to-end
+tests/       only: convergence (text), fstree (tree), sim (deterministic whole-system simulator)
 ```
 
 Packages import each other with relative paths (`import "../journal"`).
@@ -96,6 +96,61 @@ matter, `context.temp_allocator` for per-event scratch freed by the loop,
 errors as enums/unions returned as the last value, no global mutable state
 anywhere (the engine is a value; several may live in one process). No panics on bad input from disk, network or child processes.
 
+## Guarantees
+
+The engine is designed so that none of these has an exception:
+
+- **Agents never silently merge each other's code.** Worktree histories have
+  *lines* (named frontiers). Every run writes on its own run line forked from
+  its message's version; when its claim wins, the thread's line fast-forwards
+  to it. Conversation branches are worktree lines, so sibling turns never
+  share files. Two lines only ever combine through an explicit land that
+  reports every overlapping concurrent region and never auto-resolves one.
+  Live editing by people on one line from several devices merges
+  character-wise, as collaborative editors do.
+- **Anything can be deleted, everywhere, without changing an id.** Record
+  bodies and op contents are encrypted with per-message keys drawn from a
+  puncturable key tree (a GGM tree of seeds per segment epoch). Deleting a
+  message, block, object or inserted text range punctures the tree (its key
+  becomes underivable on every replica, the relay never had it), appends a
+  `Redact{ref}` record, zero-fills the bytes in place on every replica and on
+  the relay (offsets and lengths unchanged, so every id and CRDT position
+  stays valid), purges derived indexes, drops objects, rewrites the scope
+  commit pins without the redacted blobs, and asks the provider driver to
+  purge its native session state. Secrets are also redacted before anything
+  is recorded.
+- **Each participant has its own view.** The leaf is per participant (in its
+  own segment); the thread's shared head is the newest sent message. Browsing
+  an old branch on one device never moves anyone else.
+- **Every write is attributed to whoever made it.** A `Write_Observer` plug
+  point reports (process, path, operation) for writes: on Linux, unprivileged
+  `seccomp` user notification installed in every process the engine spawns
+  (only write-intent `open`/`openat2`/`creat`/`rename`/`unlink`/`link`/
+  `truncate` reach the supervisor; `io_uring_setup` is refused in agent
+  trees), or fanotify when privileged; on macOS, Endpoint Security when the
+  embedder is entitled, otherwise open-file correlation through `libproc` on
+  every change event. Writes by the agent process itself are matched to the
+  tool call whose input names the path, so parallel tool calls are separated.
+  Any change not produced by an observed agent process belongs to the other
+  actors on that machine, never to a tool.
+- **Nobody can forge or fork another participant's history.** Every segment
+  is hash-chained (each record's links prefix carries the running chain
+  hash) and each commit appends a signature of the chain head by the
+  writer's key. Readers verify before integrating; two different chains for
+  one segment are proof of equivocation and the segment is quarantined. The
+  relay can withhold bytes but cannot alter or invent them.
+- **Metadata is minimal.** Stream and object names are keyed hashes; an
+  optional padding policy rounds appends and objects to size buckets.
+- **The whole system is tested as a whole.** The single end-to-end test is a
+  deterministic simulator: every engine runs against simulated disk (a `Vfs`
+  that models write ordering, `fsync`, torn and lost writes), network
+  (delays, reordering, partitions, duplicate delivery), clock and provider
+  processes, under seeded randomness, with crashes at any instruction
+  boundary. It checks convergence, durability, attribution and deletion
+  across thousands of runs. Any failure replays exactly from its seed.
+- **Every platform claim is verified on that platform.** CI runs the
+  simulator and real-process checks on Linux and macOS hardware.
+
 ## prim
 
 - `Id :: distinct [16]u8`. `id_new()` is UUIDv7-shaped (48-bit ms time then
@@ -105,6 +160,8 @@ anywhere (the engine is a value; several may live in one process). No panics on 
 - Codec: `Writer` (appends to a `[dynamic]u8`) and `Reader` (over `[]u8`,
   sticky error flag) with `u8`, `u16le`, `u32le`, `u64le`, `uvarint`,
   `ivarint`, `bytes` (uvarint length prefix), `str`, `id`, fixed arrays.
+- All file and directory operations go through a `Vfs` value (direct
+  syscalls by default; the simulator substitutes its modelled disk).
 - Files: `read_at`, `write_at` (full, EINTR-safe), `datasync`,
   `replace_atomic(path, data)` (temp + fsync + rename + fsync dir),
   `lock_file` (flock, non-blocking, held for process lifetime),
@@ -153,6 +210,11 @@ record := len:u32le  tag:[16]u8  body:[len]u8  len:u32le
   their offsets; a sidecar `.have` file keeps the sorted list of present
   ranges. Reads of missing ranges return `.Missing` with the range, which the
   caller fetches and retries.
+- Redaction is the one in-place change: a `Redact` record names a range,
+  and every holder (writer, replicas, relay) zero-fills that body and marks
+  the record redacted in its tag slot, keeping lengths and offsets. The
+  record's plaintext key was already destroyed by puncturing the key tree,
+  so zero-filling removes the only remaining ciphertext.
 - Epochs: a writer may start a new epoch of a stream (compaction) beginning
   with a snapshot record; the old epoch file is deleted after the new one is
   uploaded.
@@ -345,9 +407,10 @@ uses tagged fields so records written today decode forever):
   events, and a periodic `Forks` digest record summarises all fork events
   seen so far, so the full branch structure of a thread loads in O(1) reads
   plus the events since the last digest.
-- `Leaf{msg, hlc}`: the thread's current leaf is a last-writer-wins register
-  over every segment's `Leaf` and `Msg` events; each record's links prefix
-  carries the best leaf its writer knew, so any up-to-date tail suffices.
+- `Leaf{msg, hlc}`: each participant's own current leaf, written only in its
+  own segment. The thread's shared head is the newest `Msg` across segments
+  (by hlc, then participant id); a participant without a leaf of its own,
+  and every runner, follows the head.
 - `Assign{msg, runner, hlc}` reassigns who answers a message (LWW).
   `Claim{msg, lease}` is written by a runner when it starts; a runner only
   starts messages assigned to it. If two runners ever answer the same message
@@ -453,7 +516,8 @@ The embeddable engine owns the loop, journals, worktrees, provider
 processes and replication, and exposes commands and change events.
 Plug points (all optional, reference implementations provided):
 
-- `Keyring` (identity keys, content-key wrapping), `Credentials`,
+- `Keyring` (identity keys, content-key wrapping), `Write_Observer`, `Vfs`,
+  `Credentials`,
   `Transport`, `Authorizer` and `Relay_Storage` (for embedders that host a
   relay), `Scheduler` (which runner answers a message; reassignment),
   `Spawner` (how provider processes start: direct, sandboxed, container,
