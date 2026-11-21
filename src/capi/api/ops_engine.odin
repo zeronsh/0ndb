@@ -205,11 +205,24 @@ op_convo_page :: proc(c: ^Call, o: ^Out) -> Status {
 		limit = 32
 	}
 	dir := convo.Direction(min(a_u64(c, "dir"), 1))
-	p, err := eng.convo_page(c.api.e, a_object(c, "object"), from, min(limit, 4096), context.temp_allocator, ready(c), dir, a_rid(c, "leaf"))
+	leaf := a_rid(c, "leaf")
+	if has(c, "cursor") {
+		cur, ok := cursor_decode(a_bytes(c, "cursor"))
+		if !ok {
+			return .Invalid
+		}
+		if cur.end {
+			empty: convo.Page
+			emit_page(o, &empty, cur.dir, cur.leaf)
+			return .Ok
+		}
+		from, dir, leaf = cur.pos, cur.dir, cur.leaf
+	}
+	p, err := eng.convo_page(c.api.e, a_object(c, "object"), from, min(limit, 4096), context.temp_allocator, ready(c), dir, leaf)
 	if err != .None {
 		return pend(c, err)
 	}
-	emit_page(o, &p)
+	emit_page(o, &p, dir, leaf)
 	return .Ok
 }
 

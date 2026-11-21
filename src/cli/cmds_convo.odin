@@ -203,9 +203,9 @@ cmd_switch :: proc(a: ^Args) -> int {
 			return 0
 		}
 		self := jstr(must(s, `{"op":"identity"}`), "id")
-		_hint(a, "older", jbool(pv, "more_older"), jget(pv, "older"))
+		_hint(a, "older", jbool(pv, "more_older"), jstr(pv, "older_cursor"))
 		_print_list(a, jarr(pv, "messages")[:], self, int(jint(pv, "anchor")))
-		_hint(a, "newer", jbool(pv, "more_newer"), jget(pv, "newer"), jstr(pv, "leaf"))
+		_hint(a, "newer", jbool(pv, "more_newer"), jstr(pv, "newer_cursor"))
 		fmt.printfln("preview only: switching would put you at %s", short_rid(jstr(pv, "leaf")))
 		return 0
 	}
@@ -239,24 +239,6 @@ cmd_back :: proc(a: ^Args) -> int {
 	return 0
 }
 
-cursor_text :: proc(pos: json.Value) -> string {
-	return fmt.tprintf("%s,%s,%d", jstr(pos, "msg"), jstr(pos, "seal"), 1 if jbool(pos, "seal_known") else 0)
-}
-
-@(private)
-_cursor_req :: proc(r: ^Request, cursor: string) {
-	parts := strings.split(cursor, ",", context.temp_allocator)
-	if len(parts) != 3 {
-		fail(.Usage, "%q is not a cursor (use the one 0ndb log printed)", cursor)
-	}
-	if _, ok := api.parse_rid(parts[0]); !ok {
-		fail(.Usage, "%q is not a cursor (use the one 0ndb log printed)", cursor)
-	}
-	req_str(r, "from", parts[0])
-	req_opt(r, "from_seal", parts[1])
-	req_bool(r, "from_known", parts[2] == "1")
-}
-
 @(private)
 _print_list :: proc(a: ^Args, msgs: []json.Value, self: string, anchor := -1) {
 	for m, i in msgs {
@@ -269,9 +251,9 @@ _print_list :: proc(a: ^Args, msgs: []json.Value, self: string, anchor := -1) {
 }
 
 @(private)
-_hint :: proc(a: ^Args, label: string, more: bool, pos: json.Value, leaf := "") {
+_hint :: proc(a: ^Args, label: string, more: bool, cursor: string) {
 	if more && !a.json {
-		fmt.printfln("  … %s: 0ndb log --%s %s%s", label, label, cursor_text(pos), fmt.tprintf(" --leaf %s", leaf) if len(leaf) > 0 && label == "newer" else "")
+		fmt.printfln("  … %s: 0ndb log --%s %s", label, label, cursor)
 	}
 }
 
@@ -299,9 +281,9 @@ cmd_log :: proc(a: ^Args) -> int {
 			print_json(v)
 			return 0
 		}
-		_hint(a, "older", jbool(v, "more_older"), jget(v, "older"))
+		_hint(a, "older", jbool(v, "more_older"), jstr(v, "older_cursor"))
 		_print_list(a, jarr(v, "messages")[:], self, int(jint(v, "anchor")))
-		_hint(a, "newer", jbool(v, "more_newer"), jget(v, "newer"), jstr(v, "leaf"))
+		_hint(a, "newer", jbool(v, "more_newer"), jstr(v, "newer_cursor"))
 		return 0
 	}
 	older, has_older := flag_value(a, "older")
@@ -310,14 +292,24 @@ cmd_log :: proc(a: ^Args) -> int {
 		if has_older && has_newer {
 			return usage_error("use either --older or --newer")
 		}
+		cursor := older if has_older else newer
+		cb := make([]u8, len(cursor) / 2, context.temp_allocator)
+		if len(cursor) < 4 || !prim.hex_decode(cb, transmute([]u8)cursor) {
+			return usage_error("%q is not a cursor (use the one 0ndb log printed)", cursor)
+		}
+		is_newer := cb[1] & 2 != 0
+		if is_newer != has_newer {
+			return usage_error("that cursor pages %s; use --%s", "newer" if is_newer else "older", "newer" if is_newer else "older")
+		}
 		r := req_begin("convo.page")
 		req_str(&r, "object", object_str(ob))
 		req_int(&r, "limit", i64(n))
-		_cursor_req(&r, older if has_older else newer)
-		req_str(&r, "dir", "older" if has_older else "newer")
-		req_opt(&r, "leaf", leaf)
+		req_str(&r, "cursor", cursor)
 		v := must(s, req_end(&r), "cannot read the conversation")
 		msgs := jarr(v, "messages")
+		if len(msgs) == 0 && !a.json {
+			fmt.printfln("no %s messages", "newer" if has_newer else "older")
+		}
 		if has_older {
 			for i in 0 ..< len(msgs) / 2 {
 				msgs[i], msgs[len(msgs) - 1 - i] = msgs[len(msgs) - 1 - i], msgs[i]
@@ -328,11 +320,11 @@ cmd_log :: proc(a: ^Args) -> int {
 			return 0
 		}
 		if has_older {
-			_hint(a, "older", jbool(v, "more"), jget(v, "next"))
+			_hint(a, "older", jbool(v, "more"), jstr(v, "cursor"))
 		}
 		_print_list(a, msgs[:], self)
 		if has_newer {
-			_hint(a, "newer", jbool(v, "more"), jget(v, "next"), leaf)
+			_hint(a, "newer", jbool(v, "more"), jstr(v, "cursor"))
 		}
 		return 0
 	}
@@ -345,7 +337,7 @@ cmd_log :: proc(a: ^Args) -> int {
 		msgs[i], msgs[len(msgs) - 1 - i] = msgs[len(msgs) - 1 - i], msgs[i]
 	}
 	if !a.json {
-		_hint(a, "older", jbool(v, "more"), jget(v, "next"))
+		_hint(a, "older", jbool(v, "more"), jstr(v, "cursor"))
 	}
 	_print_list(a, msgs[:], self)
 	if !a.json {

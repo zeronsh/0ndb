@@ -52,7 +52,7 @@ COMMANDS := []Command {
 	{"edit", cmd_edit, "edit [CONVO] ITEM TEXT", "edit a queued message"},
 	{"switch", cmd_switch, "switch [CONVO] SIBLING|next|prev [--preview] [-n N]", "switch to a sibling branch, or preview it without switching"},
 	{"back", cmd_back, "back [CONVO] MSG", "go back to a message (restores mounted files)"},
-	{"log", cmd_log, "log [CONVO] [-n N] [--follow] [--around MSG] [--older CURSOR | --newer CURSOR] [--leaf MSG]", "print a conversation, a window around a message, or one page from a cursor"},
+	{"log", cmd_log, "log [CONVO] [-n N] [--follow] [--around MSG [--leaf MSG]] [--older CURSOR | --newer CURSOR]", "print a conversation, a window around a message, or one page from a cursor"},
 	{"show", cmd_show, "show OBJECT|MSG [CONVO]", "show an object or a message"},
 	{"search", cmd_search, "search QUERY [--limit N] [--semantic] [--newest]", "search everything indexed on this device"},
 	{"interrupt", cmd_interrupt, "interrupt [CONVO]", "interrupt the running turn"},

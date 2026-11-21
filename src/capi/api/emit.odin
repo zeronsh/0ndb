@@ -137,14 +137,80 @@ emit_position :: proc(o: ^Out, name: string, p: convo.Position) {
 	o_end(o)
 }
 
-emit_page :: proc(o: ^Out, p: ^convo.Page) {
+CURSOR_VERSION :: u8(1)
+CURSOR_END :: u8(1 << 0)
+CURSOR_NEWER :: u8(1 << 1)
+CURSOR_KNOWN :: u8(1 << 2)
+
+Cursor :: struct {
+	dir:  convo.Direction,
+	pos:  convo.Position,
+	leaf: Rid,
+	end:  bool,
+}
+
+cursor_encode :: proc(c: Cursor) -> []u8 {
+	buf := make([dynamic]u8, context.temp_allocator)
+	w := prim.writer(&buf)
+	f: u8
+	if c.end {
+		f |= CURSOR_END
+	}
+	if c.dir == .Newer {
+		f |= CURSOR_NEWER
+	}
+	if c.pos.seal_known {
+		f |= CURSOR_KNOWN
+	}
+	prim.write_u8(&w, CURSOR_VERSION)
+	prim.write_u8(&w, f)
+	for r in ([3]Rid{c.pos.msg, c.pos.seal, c.leaf}) {
+		prim.write_id(&w, r.seg)
+		prim.write_ivarint(&w, r.off)
+	}
+	return buf[:]
+}
+
+cursor_decode :: proc(b: []u8) -> (c: Cursor, ok: bool) {
+	r := prim.reader(b)
+	if prim.read_u8(&r) != CURSOR_VERSION {
+		return {}, false
+	}
+	f := prim.read_u8(&r)
+	rids: [3]Rid
+	for &x in rids {
+		x.seg = prim.read_id(&r)
+		x.off = prim.read_ivarint(&r)
+	}
+	if !prim.reader_done(&r) || f & ~(CURSOR_END | CURSOR_NEWER | CURSOR_KNOWN) != 0 {
+		return {}, false
+	}
+	c.end = f & CURSOR_END != 0
+	c.dir = .Newer if f & CURSOR_NEWER != 0 else .Older
+	c.pos = convo.Position{msg = rids[0], seal = rids[1], seal_known = f & CURSOR_KNOWN != 0}
+	c.leaf = rids[2]
+	return c, true
+}
+
+emit_edge :: proc(o: ^Out, name: string, p: convo.Position, present: bool) {
+	if present {
+		emit_position(o, name, p)
+	} else if o.json {
+		o_raw_json(o, name, "null")
+	} else {
+		emit_position(o, name, {})
+	}
+}
+
+emit_page :: proc(o: ^Out, p: ^convo.Page, dir: convo.Direction, leaf: Rid) {
 	o_arr(o, "messages", len(p.messages))
 	for &m in p.messages {
 		emit_message(o, "", &m)
 	}
 	o_end(o)
-	emit_position(o, "next", p.next)
+	emit_edge(o, "next", p.next, p.more)
 	o_bool(o, "more", p.more)
+	o_bytes(o, "cursor", cursor_encode(Cursor{dir = dir, pos = p.next if p.more else {}, leaf = leaf, end = !p.more}))
 }
 
 emit_intent :: proc(o: ^Out, it: ^convo.Intent) {
@@ -373,9 +439,11 @@ emit_window :: proc(o: ^Out, w: ^convo.Window) {
 	}
 	o_end(o)
 	o_int(o, "anchor", w.anchor)
-	emit_position(o, "older", w.older)
-	emit_position(o, "newer", w.newer)
+	emit_edge(o, "older", w.older, w.more_older)
+	emit_edge(o, "newer", w.newer, w.more_newer)
 	o_bool(o, "more_older", w.more_older)
 	o_bool(o, "more_newer", w.more_newer)
 	o_rid(o, "leaf", w.leaf)
+	o_bytes(o, "older_cursor", cursor_encode(Cursor{dir = .Older, pos = w.older if w.more_older else {}, end = !w.more_older}))
+	o_bytes(o, "newer_cursor", cursor_encode(Cursor{dir = .Newer, pos = w.newer if w.more_newer else {}, leaf = w.leaf, end = !w.more_newer}))
 }

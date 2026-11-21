@@ -126,15 +126,22 @@
  *                 siblings: uvarint, superseded: bool, landed: bool,
  *                 claim: rid, files: [File], lines: [Line], blocks: [Block]
  *   Position   := msg: rid, seal: rid, seal_known: bool
- *   Page       := messages: [Message], next: Position, more: bool
+ *   Page       := messages: [Message], next: Edge, more: bool,
+ *                 cursor: bytes (since 1.3)
  *                 (dir older: newest first, toward the root; dir newer:
- *                 oldest first, toward leaf or the reader's position;
- *                 pass next back as from/from_seal/from_known to continue)
+ *                 oldest first, toward leaf or the reader's position)
  *   Window     := messages: [Message] (oldest first), anchor: uvarint (index
- *                 of the anchor in messages), older: Position, newer: Position,
- *                 more_older: bool, more_newer: bool, leaf: rid (page from
- *                 older with dir older and from newer with dir newer and this
- *                 leaf to extend the window; since 1.2)
+ *                 of the anchor in messages), older: Edge, newer: Edge,
+ *                 more_older: bool, more_newer: bool, leaf: rid,
+ *                 older_cursor: bytes, newer_cursor: bytes (since 1.3)
+ *   Edge       := Position when there is more in that direction; otherwise
+ *                 JSON null (binary: an all-zero Position). An absent from
+ *                 means "start at the reader's position", so never page from
+ *                 an exhausted edge: continue with the cursor instead.
+ *   cursor     := opaque bytes carrying direction, position, leaf and an end
+ *                 mark. Pass it as convo.page's cursor argument (it overrides
+ *                 from, dir and leaf); an end cursor returns an empty page with
+ *                 more=false and the same end cursor.
  *   Attachment := name: str, mime: str, oid: bytes, size: uvarint
  *   Intent     := item: rid, latest: rid, kind: enum intent, by: id,
  *                 stamp: uvarint, text: str, target: rid, allow: bool,
@@ -234,7 +241,7 @@ extern "C" {
 #endif
 
 #define ONDB_ABI_MAJOR 1u
-#define ONDB_ABI_MINOR 2u
+#define ONDB_ABI_MINOR 3u
 #define ONDB_ABI_VERSION ((ONDB_ABI_MAJOR << 16) | ONDB_ABI_MINOR)
 
 typedef struct ondb ondb;
@@ -845,7 +852,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_CONVO_CREATE 30u
 /* convo.status(object: object) -> Status */
 #define ONDB_OP_CONVO_STATUS 31u
-/* convo.page(object: object, from: rid, from_seal: rid, from_known: bool, limit: uvarint, dir: enum{older,newer}, leaf: rid) -> Page */
+/* convo.page(object: object, from: rid, from_seal: rid, from_known: bool, limit: uvarint, dir: enum{older,newer}, leaf: rid, cursor: bytes) -> Page */
 #define ONDB_OP_CONVO_PAGE 32u
 /* convo.message(object: object, msg: rid) -> message:Message */
 #define ONDB_OP_CONVO_MESSAGE 33u

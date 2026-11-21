@@ -28,7 +28,7 @@ OPS := []Op {
 	{19, "space.join_shared", {SPACE, {"name", .Str, nil}, {"relay", .Str, nil}, {"relay_key", .Bytes, nil}}, "", op_space_join_shared},
 	{30, "convo.create", {SPACE, {"title", .Str, nil}, {"agent", .Id, nil}, {"workspace", .Id, nil}, {"parent", .Object, nil}, {"parent_msg", .Rid, nil}, {"provider", .Str, nil}, {"model", .Str, nil}}, "object:object", op_convo_create},
 	{31, "convo.status", {OBJ}, "Status", op_convo_status},
-	{32, "convo.page", {OBJ, {"from", .Rid, nil}, {"from_seal", .Rid, nil}, {"from_known", .Bool, nil}, {"limit", .U64, nil}, {"dir", .Enum, DIR_NAMES[:]}, {"leaf", .Rid, nil}}, "Page", op_convo_page},
+	{32, "convo.page", {OBJ, {"from", .Rid, nil}, {"from_seal", .Rid, nil}, {"from_known", .Bool, nil}, {"limit", .U64, nil}, {"dir", .Enum, DIR_NAMES[:]}, {"leaf", .Rid, nil}, {"cursor", .Bytes, nil}}, "Page", op_convo_page},
 	{33, "convo.message", {OBJ, MSG}, "message:Message", op_convo_message},
 	{34, "convo.siblings", {OBJ, MSG}, "siblings:[rid] at:uvarint", op_convo_siblings},
 	{35, "convo.intents", {OBJ}, "intents:[Intent]", op_convo_intents},
