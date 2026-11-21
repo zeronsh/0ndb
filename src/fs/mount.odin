@@ -686,6 +686,23 @@ mount_mark_observed :: proc(m: ^Mount, rel: string, scope: ^Scope) {
 	mount_schedule(m, m.opts.settle_ms)
 }
 
+mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
+	if scope == nil || path_internal(rel) {
+		return .None
+	}
+	if v, ok := &m.open_scopes[rel]; ok {
+		v^ = scope
+	} else {
+		k, _ := clone_string(rel, m.allocator)
+		m.open_scopes[k] = scope
+	}
+	if a, ok := m.attrib[rel]; ok && a == scope.actor {
+		return .None
+	}
+	attrib_set(m, rel, scope.actor)
+	return save_mount_state(m)
+}
+
 mount_closed :: proc(m: ^Mount, rel: string) {
 	if _, ok := m.open_scopes[rel]; ok {
 		k, _ := delete_key(&m.open_scopes, rel)
@@ -1079,7 +1096,7 @@ attrib_prune :: proc(m: ^Mount) {
 	}
 	drop := make([dynamic]string, context.temp_allocator)
 	for k in m.attrib {
-		if k not_in m.dirty {
+		if k not_in m.dirty && k not_in m.open_scopes {
 			append(&drop, k)
 		}
 	}

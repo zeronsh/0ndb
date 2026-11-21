@@ -955,7 +955,10 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	if p.git_wrote {
 		collect_alias_sources(m, &p)
 	}
-	defer clear(&m.alias)
+	defer {
+		delete(m.alias)
+		m.alias = nil
+	}
 	p.changes = make([dynamic]Change, p.long)
 	p.held = make([dynamic]Change, p.long)
 	p.held_r = make(map[string]bool, p.long)
