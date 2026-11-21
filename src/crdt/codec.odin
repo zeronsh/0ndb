@@ -356,7 +356,7 @@ checkpoint_encode :: proc(t: ^Text, g: ^Graph, buf: ^[dynamic]u8) -> Error {
 		ix := actor_slot(&table, s.id.actor)
 		prim.write_uvarint(&w, ix)
 		prim.write_ivarint(&w, i64(s.id.seq) - i64(ends[ix]))
-		prim.write_uvarint(&w, u64(s.len))
+		prim.write_uvarint(&w, u64(s.len) << 1 | (1 if s.redacted else 0))
 		ends[ix] = s.id.seq + u64(s.len)
 	}
 	if w.err != .None {
@@ -404,7 +404,8 @@ checkpoint_decode :: proc(g: ^Graph, data: []u8, text: []u8, allocator := contex
 	for i in 0 ..< len(spans) {
 		ix := prim.read_uvarint(&r)
 		d := prim.read_ivarint(&r)
-		n := prim.read_uvarint(&r)
+		packed := prim.read_uvarint(&r)
+		n := packed >> 1
 		if r.err != .None || ix >= na || n == 0 || n > MAX_RUN {
 			return {}, .Corrupt
 		}
@@ -412,7 +413,7 @@ checkpoint_decode :: proc(g: ^Graph, data: []u8, text: []u8, allocator := contex
 		if seq < 0 || u64(seq) >= MAX_COUNTER {
 			return {}, .Corrupt
 		}
-		spans[i] = Author_Span{Op_Id{actors[ix], u64(seq)}, int(n)}
+		spans[i] = Author_Span{Op_Id{actors[ix], u64(seq)}, int(n), packed & 1 == 1}
 		ends[ix] = u64(seq) + n
 	}
 	if !prim.reader_done(&r) {

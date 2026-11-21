@@ -13,6 +13,7 @@ Span :: struct {
 	len:   int,
 	seq:   u64,
 	actor: u32,
+	red:   bool,
 }
 
 Ix :: struct {
@@ -25,7 +26,7 @@ Index :: Tree(Run_Leaf(Ix), 1)
 
 @(private)
 span_merge :: #force_inline proc "contextless" (a: ^Span, b: Span) -> bool {
-	if a.actor == b.actor && a.seq + u64(a.len) == b.seq {
+	if a.actor == b.actor && a.red == b.red && a.seq + u64(a.len) == b.seq {
 		a.len += b.len
 		return true
 	}
@@ -34,7 +35,7 @@ span_merge :: #force_inline proc "contextless" (a: ^Span, b: Span) -> bool {
 
 @(private)
 span_split :: #force_inline proc "contextless" (e: Span, k: int) -> (Span, Span) {
-	return Span{k, e.seq, e.actor}, Span{e.len - k, e.seq + u64(k), e.actor}
+	return Span{k, e.seq, e.actor, e.red}, Span{e.len - k, e.seq + u64(k), e.actor, e.red}
 }
 
 @(private)

@@ -2,6 +2,7 @@ package crdt
 
 import "base:runtime"
 import "core:slice"
+import "../prim"
 
 Text :: struct {
 	allocator: runtime.Allocator,
@@ -86,14 +87,14 @@ text_spans :: proc(t: ^Text, g: ^Graph, allocator := context.allocator) -> []Aut
 				continue
 			}
 			if have {
-				append(&out, Author_Span{Op_Id{g.actors[prev.actor], prev.seq}, prev.len})
+				append(&out, Author_Span{Op_Id{g.actors[prev.actor], prev.seq}, prev.len, prev.red})
 			}
 			prev = s
 			have = true
 		}
 	}
 	if have {
-		append(&out, Author_Span{Op_Id{g.actors[prev.actor], prev.seq}, prev.len})
+		append(&out, Author_Span{Op_Id{g.actors[prev.actor], prev.seq}, prev.len, prev.red})
 	}
 	return out[:]
 }
@@ -126,10 +127,98 @@ text_from :: proc(t: ^Text, g: ^Graph, data: []u8, spans: []Author_Span, version
 	pos := 0
 	for s in spans {
 		ix := graph_intern(g, s.id.actor)
-		run_insert(&t.spans, pos, Span{s.len, s.id.seq, ix})
+		run_insert(&t.spans, pos, Span{s.len, s.id.seq, ix, s.redacted})
 		pos += s.len
 	}
+	pos = 0
+	parts := make([dynamic]Red_Part, t.allocator)
+	defer delete(parts)
+	for s in spans {
+		ix := graph_intern(g, s.id.actor)
+		if s.redacted {
+			append(&parts, Red_Part{pos, s.id.seq, s.len, ix})
+		} else {
+			graph_redacted(g, ix, s.id.seq, s.len, &g.red)
+			for r in g.red {
+				append(&parts, Red_Part{pos + int(r.seq - s.id.seq), r.seq, r.len, ix})
+			}
+		}
+		pos += s.len
+	}
+	redact_parts(t, parts[:])
 	return .None
+}
+
+@(private)
+Red_Part :: struct {
+	pos:   int,
+	seq:   u64,
+	len:   int,
+	actor: u32,
+}
+
+@(private)
+redact_parts :: proc(t: ^Text, parts: []Red_Part) {
+	ids := &t.ids if t.ids_on else nil
+	for p in parts {
+		rope_fill(&t.rope, p.pos, p.len, 0)
+		run_delete(&t.spans, p.pos, p.len, ids)
+		run_insert(&t.spans, p.pos, Span{p.len, p.seq, p.actor, true}, ids)
+	}
+}
+
+text_redact :: proc(t: ^Text, g: ^Graph, actor: prim.Id, seq: u64, n: int) {
+	ix, ok := graph_actor(g, actor)
+	if !ok || n <= 0 || seq >= MAX_COUNTER - u64(n) {
+		return
+	}
+	parts := make([dynamic]Red_Part, t.allocator)
+	defer delete(parts)
+	end := seq + u64(n)
+	collect :: proc(parts: ^[dynamic]Red_Part, l: ^Run_Leaf(Span), base: int, actor: u32, seq, end: u64) {
+		pos := base
+		for i in 0 ..< int(l.n) {
+			s := l.items[i]
+			if s.actor == actor && !s.red {
+				a := max(s.seq, seq)
+				b := min(s.seq + u64(s.len), end)
+				if b > a {
+					append(parts, Red_Part{pos + int(a - s.seq), a, int(b - a), actor})
+				}
+			}
+			pos += s.len
+		}
+	}
+	key, keyed := span_key(ix, seq, n)
+	if !keyed {
+		base := 0
+		for leaf := tree_first_leaf(&t.spans); leaf != NIL; leaf = tree_next_leaf(&t.spans, leaf) {
+			collect(&parts, &t.spans.leaves[leaf], base, ix, seq, end)
+			base += tree_leaf_size(&t.spans, leaf)[0]
+		}
+	} else {
+		text_index_ids(t)
+		seen := make([dynamic]u32, t.allocator)
+		defer delete(seen)
+		cur := key
+		for cur < key + n {
+			e, off, found := run_get(&t.ids, cur)
+			if !found {
+				break
+			}
+			if e.leaf != NIL && int(e.leaf) < len(t.spans.leaves) && !slice.contains(seen[:], e.leaf) {
+				append(&seen, e.leaf)
+				collect(&parts, &t.spans.leaves[e.leaf], tree_leaf_pos(&t.spans, e.leaf)[0], ix, seq, end)
+			}
+			cur += e.len - off
+		}
+	}
+	redact_parts(t, parts[:])
+}
+
+text_is_redacted :: proc(t: ^Text, pos: int) -> bool {
+	s, _, ok := run_get(&t.spans, pos)
+	return ok && s.red
 }
 
 @(private)
@@ -164,26 +253,31 @@ shift_point :: proc "contextless" (x, pos, n: int) -> int {
 }
 
 @(private)
-doc_insert :: proc(m: ^Merge, pos: int, data: []u8, actor: u32, seq: u64) {
+doc_insert :: proc(m: ^Merge, pos: int, data: []u8, actor: u32, seq: u64, red := false) {
 	at := clamp(pos, 0, text_len(m.t))
 	rope_insert(&m.t.rope, at, data)
-	run_insert(&m.t.spans, at, Span{len(data), seq, actor}, &m.t.ids if m.t.ids_on else nil)
+	run_insert(&m.t.spans, at, Span{len(data), seq, actor, red}, &m.t.ids if m.t.ids_on else nil)
 	conflict_shift(m, true, at, len(data))
 }
 
 @(private)
 doc_insert_piece :: proc(m: ^Merge, at: int, e: Log_Entry, k: int, n: int, lv: Lv) {
 	actor, seq := graph_op(m.g, lv)
-	if e.kind == .Insert {
+	if e.kind == .Insert && !e.red {
 		doc_insert(m, at, m.log.bytes[e.at + k:][:n], actor, seq)
 		return
 	}
-	ref := m.log.refs[e.at]
 	buf: [4096]u8
 	done := 0
 	for done < n {
 		c := min(len(buf), n - done)
 		chunk := buf[:c]
+		if e.red {
+			doc_insert(m, at + done, chunk, actor, seq + u64(done), true)
+			done += c
+			continue
+		}
+		ref := m.log.refs[e.at]
 		src := m.log.content
 		if src.read == nil || !src.read(src.data, ref.oid, ref.offset + k + done, chunk) {
 			for &b in chunk {

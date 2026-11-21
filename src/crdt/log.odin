@@ -1,11 +1,14 @@
 package crdt
 
+import "../prim"
+
 Log_Entry :: struct {
 	lv:   Lv,
 	len:  int,
 	pos:  int,
 	at:   int,
 	kind: Op_Kind,
+	red:  bool,
 }
 
 Text_Log :: struct {
@@ -80,22 +83,25 @@ log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) {
 			return
 		}
 		inject_at(&log.entries, i, Log_Entry{lv = lv, len = run.len, pos = run.pos, at = log_store(log, run), kind = run.kind})
+		log_redact_new(log, g, lv, run.len)
 		return
 	}
 	if n > 0 {
 		last := &log.entries[n - 1]
-		if last.kind == run.kind && last.lv + last.len == lv && graph_continues(g, lv) {
+		if last.kind == run.kind && !last.red && last.lv + last.len == lv && graph_continues(g, lv) {
 			switch run.kind {
 			case .Insert:
 				if run.pos == last.pos + last.len && last.at + last.len == len(log.bytes) {
 					append(&log.bytes, ..run.content[:run.len])
 					last.len += run.len
+					log_redact_new(log, g, lv, run.len)
 					return
 				}
 			case .Insert_Ref:
 				r := log.refs[last.at]
 				if run.pos == last.pos + last.len && run.ref.oid == r.oid && run.ref.offset == r.offset + last.len {
 					last.len += run.len
+					log_redact_new(log, g, lv, run.len)
 					return
 				}
 			case .Delete:
@@ -113,7 +119,88 @@ log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) {
 		}
 	}
 	append(&log.entries, Log_Entry{lv = lv, len = run.len, pos = run.pos, at = log_store(log, run), kind = run.kind})
+	log_redact_new(log, g, lv, run.len)
 }
+
+@(private)
+log_redact_new :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, n: int) {
+	actor, seq := graph_op(g, lv)
+	if int(actor) >= len(g.seqs) || len(g.seqs[actor].red) == 0 {
+		return
+	}
+	graph_redacted(g, actor, seq, n, &g.red)
+	for r in g.red {
+		log_mark(log, lv + int(r.seq - seq), r.len)
+	}
+}
+
+@(private)
+log_split :: proc(log: ^Text_Log, lv: Lv) {
+	i := log_find(log, lv)
+	if i >= len(log.entries) {
+		return
+	}
+	e := log.entries[i]
+	if e.lv >= lv || e.lv + e.len <= lv {
+		return
+	}
+	k := lv - e.lv
+	right := e
+	right.lv = lv
+	right.len = e.len - k
+	#partial switch e.kind {
+	case .Insert:
+		right.pos = e.pos + k
+		right.at = e.at + k
+	case .Insert_Ref:
+		right.pos = e.pos + k
+		ref := log.refs[e.at]
+		ref.offset += k
+		append(&log.refs, ref)
+		right.at = len(log.refs) - 1
+	case .Delete_Back:
+		right.pos = e.pos - k
+	}
+	log.entries[i].len = k
+	inject_at(&log.entries, i + 1, right)
+}
+
+@(private)
+log_mark :: proc(log: ^Text_Log, lv: Lv, n: int) {
+	log_split(log, lv)
+	log_split(log, lv + n)
+	for i := log_find(log, lv); i < len(log.entries) && log.entries[i].lv < lv + n; i += 1 {
+		e := &log.entries[i]
+		if !is_insert(e.kind) || e.red {
+			continue
+		}
+		e.red = true
+		if e.kind == .Insert {
+			for &b in log.bytes[e.at:][:e.len] {
+				b = 0
+			}
+		}
+	}
+}
+
+log_redact :: proc(log: ^Text_Log, g: ^Graph, actor: prim.Id, seq: u64, n: int) {
+	ix, ok := graph_actor(g, actor)
+	if !ok || n <= 0 {
+		return
+	}
+	end := seq + u64(n)
+	cur := seq
+	for cur < end {
+		lv, avail, found := graph_seq_span(g, ix, cur)
+		if !found {
+			return
+		}
+		k := min(int(end - cur), avail)
+		log_mark(log, lv, k)
+		cur += u64(k)
+	}
+}
+
 
 log_add_batch :: proc(log: ^Text_Log, g: ^Graph, b: ^Batch, target: Op_Id, first: Lv, skip: int) {
 	lv := first

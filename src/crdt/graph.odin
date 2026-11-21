@@ -53,6 +53,7 @@ Graph :: struct {
 	failed:      bool,
 	heap:        [dynamic]Heap_Item,
 	tmp:         [dynamic]Lv,
+	red:         [dynamic]Seq_Range,
 	walk:        [dynamic]Walk_Span,
 	only_a:      [dynamic]Lv_Span,
 	only_b:      [dynamic]Lv_Span,
@@ -79,6 +80,7 @@ graph_init :: proc(g: ^Graph, allocator := context.allocator, source := Graph_So
 	g.heads = make([dynamic]Lv, allocator)
 	g.heap = make([dynamic]Heap_Item, allocator)
 	g.tmp = make([dynamic]Lv, allocator)
+	g.red = make([dynamic]Seq_Range, allocator)
 	g.walk = make([dynamic]Walk_Span, allocator)
 	g.only_a = make([dynamic]Lv_Span, allocator)
 	g.only_b = make([dynamic]Lv_Span, allocator)
@@ -96,6 +98,7 @@ graph_destroy :: proc(g: ^Graph) {
 			delete(p.runs)
 		}
 		delete(s.pages)
+		delete(s.red)
 	}
 	delete(g.pages)
 	delete(g.actors)
@@ -104,6 +107,7 @@ graph_destroy :: proc(g: ^Graph) {
 	delete(g.heads)
 	delete(g.heap)
 	delete(g.tmp)
+	delete(g.red)
 	delete(g.walk)
 	delete(g.only_a)
 	delete(g.only_b)
@@ -131,7 +135,7 @@ graph_intern :: proc(g: ^Graph, actor: prim.Id) -> u32 {
 	}
 	ix := u32(len(g.actors))
 	append(&g.actors, actor)
-	append(&g.seqs, Actor_Seqs{pages = make([dynamic]Seq_Page, g.allocator)})
+	append(&g.seqs, Actor_Seqs{pages = make([dynamic]Seq_Page, g.allocator), red = make([dynamic]Seq_Range, g.allocator)})
 	g.actor_index[actor] = ix
 	return ix
 }
@@ -153,8 +157,13 @@ graph_lv :: proc(g: ^Graph, id: Op_Id) -> (Lv, bool) {
 }
 
 graph_lv_ix :: proc(g: ^Graph, actor: u32, seq: u64) -> (Lv, bool) {
+	lv, _, ok := graph_seq_span(g, actor, seq)
+	return lv, ok
+}
+
+graph_seq_span :: proc(g: ^Graph, actor: u32, seq: u64) -> (lv: Lv, avail: int, ok: bool) {
 	if int(actor) >= len(g.seqs) || seq >= g.seqs[actor].known {
-		return 0, false
+		return 0, 0, false
 	}
 	runs := seq_page_runs(g, actor, seq)
 	lo, hi := 0, len(runs)
@@ -167,9 +176,10 @@ graph_lv_ix :: proc(g: ^Graph, actor: u32, seq: u64) -> (Lv, bool) {
 		}
 	}
 	if lo < len(runs) && runs[lo].seq <= seq {
-		return runs[lo].lv + int(seq - runs[lo].seq), true
+		d := int(seq - runs[lo].seq)
+		return runs[lo].lv + d, runs[lo].len - d, true
 	}
-	return 0, false
+	return 0, 0, false
 }
 
 graph_op :: proc(g: ^Graph, lv: Lv) -> (actor: u32, seq: u64) {

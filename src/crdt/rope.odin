@@ -164,3 +164,21 @@ rope_append :: proc(r: ^Rope, data: []u8) {
 		rest = rest[c:]
 	}
 }
+
+rope_fill :: proc(r: ^Rope, pos: int, n: int, b: u8) {
+	at := clamp(pos, 0, r.total[0])
+	rem := min(max(n, 0), r.total[0] - at)
+	for rem > 0 {
+		leaf, off := tree_find(r, 0, at, false)
+		l := &r.leaves[leaf]
+		k := min(rem, int(l.len) - off)
+		if k <= 0 {
+			return
+		}
+		for &x in l.data[off:][:k] {
+			x = b
+		}
+		at += k
+		rem -= k
+	}
+}

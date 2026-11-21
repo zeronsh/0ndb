@@ -70,7 +70,13 @@ Op_Span :: struct {
 }
 
 Author_Span :: struct {
-	id:  Op_Id,
+	id:       Op_Id,
+	len:      int,
+	redacted: bool,
+}
+
+Seq_Range :: struct {
+	seq: u64,
 	len: int,
 }
 

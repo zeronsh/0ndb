@@ -231,7 +231,57 @@ hostile :: proc(id: prim.Id) -> bool {
 	return id[1] == 0xad
 }
 
+REDACT :: u8(0xff)
+
+redact_msg :: proc(actor: prim.Id, seq: u64, n: int) -> []u8 {
+	buf := make([dynamic]u8)
+	w := prim.writer(&buf)
+	prim.write_u8(&w, REDACT)
+	prim.write_id(&w, actor)
+	prim.write_uvarint(&w, seq)
+	prim.write_uvarint(&w, u64(n))
+	return buf[:]
+}
+
+apply_redact :: proc(r: ^Replica, msg: []u8) {
+	rd := prim.reader(msg[1:])
+	actor := prim.read_id(&rd)
+	seq := prim.read_uvarint(&rd)
+	n := int(prim.read_uvarint(&rd))
+	crdt.graph_redact(&r.g, actor, seq, n)
+	for &f in r.files {
+		crdt.log_redact(&f.log, &r.g, actor, seq, n)
+		crdt.text_redact(&f.text, &r.g, actor, seq, n)
+	}
+}
+
+expected :: proc(g: ^crdt.Graph, s: Snapshot) -> ([]u8, []crdt.Author_Span) {
+	bytes := slice.clone(s.bytes)
+	spans := make([dynamic]crdt.Author_Span)
+	pos := 0
+	for sp in s.spans {
+		for i in 0 ..< sp.len {
+			id := crdt.Op_Id{sp.id.actor, sp.id.seq + u64(i)}
+			red := crdt.graph_is_redacted(g, id)
+			if red {
+				bytes[pos + i] = 0
+			}
+			if n := len(spans); n > 0 && spans[n - 1].id.actor == id.actor && spans[n - 1].id.seq + u64(spans[n - 1].len) == id.seq && spans[n - 1].redacted == red {
+				spans[n - 1].len += 1
+			} else {
+				append(&spans, crdt.Author_Span{id, 1, red})
+			}
+		}
+		pos += sp.len
+	}
+	return bytes, spans[:]
+}
+
 deliver :: proc(t: ^testing.T, r: ^Replica, msg: []u8, rng: ^Rng) -> bool {
+	if len(msg) > 0 && msg[0] == REDACT {
+		apply_redact(r, msg)
+		return true
+	}
 	b, err := crdt.batch_decode(msg, dict = r.dict)
 	testing.expect_value(t, err, crdt.Error.None)
 	if err != .None {
@@ -539,7 +589,17 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 		who := below(&rng, replicas)
 		switch below(&rng, 10) {
 		case 0 ..= 3:
-			if chance(&rng, 12) {
+			if chance(&rng, 10) {
+				victim := &rs[below(&rng, replicas)]
+				seq := u64(below(&rng, int(victim.seq) + 20))
+				n := 1 + below(&rng, 40)
+				for &o in rs {
+					append(&o.inbox, redact_msg(victim.actor, seq, n))
+					if chance(&rng, 20) {
+						append(&o.inbox, redact_msg(victim.actor, seq, n))
+					}
+				}
+			} else if chance(&rng, 12) {
 				attack(t, rs, who, &rng, &attacks)
 			} else {
 				local_edit(t, rs, who, &rng)
@@ -605,7 +665,10 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 			testing.expect_value(t, err, crdt.Error.None)
 			got := crdt.text_bytes(&out)
 			gs := crdt.text_spans(&out, &r.g)
-			if !slice.equal(got, s.bytes) || !spans_equal(gs, s.spans) {
+			want, wspans := expected(&r.g, s)
+			defer delete(want)
+			defer delete(wspans)
+			if !slice.equal(got, want) || !spans_equal(gs, wspans) {
 				testing.expectf(t, false, "seed %v: checkout mismatch (%v vs %v bytes)", seed, len(got), len(s.bytes))
 			}
 			delete(got)
@@ -653,7 +716,10 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 			crdt.text_destroy(&empty)
 			testing.expect_value(t, err, crdt.Error.None)
 			got := crdt.text_bytes(&out)
-			testing.expect(t, slice.equal(got, s.bytes), "checkout through reopened graph")
+			want, wspans := expected(&g2, s)
+			testing.expect(t, slice.equal(got, want), "checkout through reopened graph")
+			delete(want)
+			delete(wspans)
 			delete(got)
 			crdt.text_destroy(&out)
 			crdt.graph_trim(&g2)

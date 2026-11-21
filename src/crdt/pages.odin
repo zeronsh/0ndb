@@ -34,6 +34,7 @@ Seq_Page :: struct {
 Actor_Seqs :: struct {
 	pages: [dynamic]Seq_Page,
 	known: u64,
+	red:   [dynamic]Seq_Range,
 }
 
 @(private)
@@ -395,6 +396,9 @@ graph_trim :: proc(g: ^Graph) {
 graph_memory :: proc(g: ^Graph) -> int {
 	n := size_of(Graph) + cap(g.pages) * size_of(Rec_Page) + cap(g.actors) * size_of(prim.Id) + cap(g.seqs) * size_of(Actor_Seqs)
 	n += len(g.actor_index) * (size_of(prim.Id) + size_of(u32) + 8)
+	for &s in g.seqs {
+		n += cap(s.red) * size_of(Seq_Range)
+	}
 	for &p in g.pages {
 		n += cap(p.recs) * size_of(Rec) + cap(p.parents) * size_of(Lv)
 	}
@@ -427,6 +431,13 @@ graph_meta_encode :: proc(g: ^Graph, buf: ^[dynamic]u8) -> Error {
 		for &p in s.pages {
 			prim.write_uvarint(&w, p.first)
 			prim.write_uvarint(&w, u64(p.count))
+		}
+		prim.write_uvarint(&w, u64(len(s.red)))
+		end: u64
+		for x in s.red {
+			prim.write_uvarint(&w, x.seq - end)
+			prim.write_uvarint(&w, u64(x.len))
+			end = x.seq + u64(x.len)
 		}
 	}
 	prim.write_uvarint(&w, u64(len(g.pages)))
@@ -486,6 +497,20 @@ graph_open :: proc(g: ^Graph, meta: []u8, source: Graph_Source, allocator := con
 			prev = first
 			append(&s.pages, Seq_Page{first = first, count = u32(count)})
 		}
+		nr := prim.read_uvarint(&r)
+		if r.err != .None || nr > u64(prim.reader_remaining(&r) / 2) {
+			return fail(g)
+		}
+		end: u64
+		for _ in 0 ..< int(nr) {
+			d := prim.read_uvarint(&r)
+			l := prim.read_uvarint(&r)
+			if r.err != .None || l == 0 || l > MAX_RUN || d > MAX_COUNTER - end || end + d >= MAX_COUNTER - l || (len(s.red) > 0 && d == 0) {
+				return fail(g)
+			}
+			append(&s.red, Seq_Range{end + d, int(l)})
+			end += d + l
+		}
 	}
 	if len(g.actors) != int(na) {
 		return fail(g)
@@ -508,4 +533,67 @@ graph_open :: proc(g: ^Graph, meta: []u8, source: Graph_Source, allocator := con
 		return fail(g)
 	}
 	return .None
+}
+
+graph_redact :: proc(g: ^Graph, actor: prim.Id, seq: u64, n: int) -> bool {
+	if n <= 0 || n > MAX_RUN || seq >= MAX_COUNTER - u64(n) {
+		return false
+	}
+	ix := graph_intern(g, actor)
+	rs := &g.seqs[ix].red
+	lo := seq
+	hi := seq + u64(n)
+	i := red_first(rs[:], lo)
+	j := i
+	for j < len(rs) && rs[j].seq <= hi {
+		lo = min(lo, rs[j].seq)
+		hi = max(hi, rs[j].seq + u64(rs[j].len))
+		j += 1
+	}
+	if j - i == 1 && rs[i].seq <= seq && rs[i].seq + u64(rs[i].len) >= seq + u64(n) {
+		return false
+	}
+	remove_range(rs, i, j)
+	inject_at(rs, i, Seq_Range{lo, int(hi - lo)})
+	return true
+}
+
+@(private)
+red_first :: proc "contextless" (rs: []Seq_Range, seq: u64) -> int {
+	lo, hi := 0, len(rs)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if rs[mid].seq + u64(rs[mid].len) < seq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+graph_redacted :: proc(g: ^Graph, actor: u32, seq: u64, n: int, out: ^[dynamic]Seq_Range) {
+	clear(out)
+	if int(actor) >= len(g.seqs) {
+		return
+	}
+	rs := g.seqs[actor].red[:]
+	end := seq + u64(n)
+	for i := red_first(rs, seq); i < len(rs) && rs[i].seq < end; i += 1 {
+		a := max(rs[i].seq, seq)
+		b := min(rs[i].seq + u64(rs[i].len), end)
+		if b > a {
+			append(out, Seq_Range{a, int(b - a)})
+		}
+	}
+}
+
+graph_is_redacted :: proc(g: ^Graph, id: Op_Id) -> bool {
+	ix, ok := graph_actor(g, id.actor)
+	if !ok {
+		return false
+	}
+	rs := g.seqs[ix].red[:]
+	i := red_first(rs, id.seq)
+	return i < len(rs) && rs[i].seq <= id.seq && id.seq < rs[i].seq + u64(rs[i].len)
 }
