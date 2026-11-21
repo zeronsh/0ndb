@@ -516,7 +516,7 @@ env_disabled :: proc() -> (out: bit_set[Op_Kind]) {
 trace_events := false
 trace_bytes_at: u64
 
-FIXED_SEEDS :: [?]u64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+FIXED_SEEDS :: [?]u64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 report :: proc(t: ^testing.T, res: ^Run_Result) -> bool {
 	if len(res.failures) == 0 {
