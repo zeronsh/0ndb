@@ -97,7 +97,7 @@ _status_of :: proc(v: ^obj.View, t: ^convo.Tail) -> Convo_Status {
 	}
 }
 
-convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32, allocator := context.allocator, ready: Ready = {}) -> (p: convo.Page, err: Error) {
+convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32, allocator := context.allocator, ready: Ready = {}, dir := convo.Direction.Older, leaf := Rid{}) -> (p: convo.Page, err: Error) {
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	if _handle_waiting(h) && ready.call != nil && len(h.view.segs) == 0 {
@@ -110,7 +110,7 @@ convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32
 	if terr == .Missing {
 		return p, _pending_result(e, h, .Missing, ready)
 	}
-	pg, perr := convo.page(&h.view, &t, from, limit, allocator)
+	pg, perr := convo.page(&h.view, &t, from, limit, allocator, dir, leaf)
 	if perr != .None {
 		return pg, _pending_result(e, h, _oerr(perr), ready)
 	}
@@ -118,6 +118,37 @@ convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32
 		return pg, _wait(e, h, ready)
 	}
 	return pg, .None
+}
+
+convo_window :: proc(e: ^Engine, o: Object, anchor: Rid, before: int, after: int, leaf := Rid{}, allocator := context.allocator, ready: Ready = {}) -> (w: convo.Window, err: Error) {
+	h := _handle_get(e, o, .Conversation) or_return
+	_handle_refresh(h)
+	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
+	if terr != .None {
+		return w, _pending_result(e, h, _oerr(terr), ready)
+	}
+	win, werr := convo.page_around(&h.view, &t, anchor, before, after, leaf, allocator)
+	if werr != .None {
+		return win, _pending_result(e, h, _oerr(werr), ready)
+	}
+	if _handle_waiting(h) && ready.call != nil {
+		return win, _wait(e, h, ready)
+	}
+	return win, .None
+}
+
+convo_peek_switch :: proc(e: ^Engine, o: Object, sibling: Rid, before: int, after: int, allocator := context.allocator, ready: Ready = {}) -> (leaf: Rid, w: convo.Window, err: Error) {
+	h := _handle_get(e, o, .Conversation) or_return
+	_handle_refresh(h)
+	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
+	if terr != .None {
+		return leaf, w, _pending_result(e, h, _oerr(terr), ready)
+	}
+	lf, win, serr := convo.switch_window(&h.view, &t, sibling, before, after, allocator)
+	if serr != .None {
+		return lf, win, _pending_result(e, h, _oerr(serr), ready)
+	}
+	return lf, win, .None
 }
 
 convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := context.allocator, ready: Ready = {}) -> (m: convo.Message, err: Error) {
