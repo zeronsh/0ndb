@@ -75,6 +75,12 @@ batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8, dict: ^Actor_Dict = nil) -> E
 			return .Invalid
 		}
 		actor_slot(&table, op.target.actor)
+		if op.kind == .Insert_Copy {
+			actor_slot(&table, op.src.actor)
+		}
+		if op.kind == .Insert_Ref && op.ref.oid.len != 20 && op.ref.oid.len != 32 {
+			return .Invalid
+		}
 	}
 	w := prim.writer(buf)
 	prim.write_u8(&w, BATCH_FORMAT if dict == nil else BATCH_DICT_FORMAT)
@@ -118,8 +124,13 @@ batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8, dict: ^Actor_Dict = nil) -> E
 			pred = op.pos + op.len
 		case .Insert_Ref:
 			oid := op.ref.oid
-			prim.write_raw(&w, oid[:])
+			prim.write_u8(&w, oid.len)
+			prim.write_raw(&w, oid_bytes(&oid))
 			prim.write_uvarint(&w, u64(op.ref.offset))
+			pred = op.pos + op.len
+		case .Insert_Copy:
+			prim.write_uvarint(&w, actor_slot(&table, op.src.actor))
+			prim.write_uvarint(&w, op.src.seq)
 			pred = op.pos + op.len
 		case .Delete:
 			pred = op.pos
@@ -246,12 +257,25 @@ decode :: proc(d: ^Decoder, data: []u8, dict: ^Actor_Dict = nil) -> (b: Batch, e
 			op.content = prim.read_raw(&r, op.len)
 			pred = op.pos + op.len
 		case .Insert_Ref:
-			prim.read_fixed(&r, op.ref.oid[:])
+			ol := prim.read_u8(&r)
+			if ol != 20 && ol != 32 {
+				return {}, .Corrupt
+			}
+			op.ref.oid.len = ol
+			prim.read_fixed(&r, op.ref.oid.bytes[:ol])
 			off := prim.read_uvarint(&r)
 			if off > MAX_POS {
 				return {}, .Corrupt
 			}
 			op.ref.offset = int(off)
+			pred = op.pos + op.len
+		case .Insert_Copy:
+			ix := prim.read_uvarint(&r)
+			sq := prim.read_uvarint(&r)
+			if ix >= u64(len(actors)) || sq >= MAX_COUNTER - u64(op.len) {
+				return {}, .Corrupt
+			}
+			op.src = Op_Id{actors[ix], sq}
 			pred = op.pos + op.len
 		case .Delete:
 			pred = op.pos
@@ -336,6 +360,7 @@ checkpoint_encode :: proc(t: ^Text, g: ^Graph, buf: ^[dynamic]u8) -> Error {
 		actor_slot(&table, v.actor)
 	}
 	for s in spans {
+		actor_slot(&table, s.op.actor)
 		actor_slot(&table, s.id.actor)
 	}
 	ends := make([]u64, len(table.ids), buf.allocator)
@@ -353,11 +378,16 @@ checkpoint_encode :: proc(t: ^Text, g: ^Graph, buf: ^[dynamic]u8) -> Error {
 	}
 	prim.write_uvarint(&w, u64(len(spans)))
 	for s in spans {
-		ix := actor_slot(&table, s.id.actor)
+		ix := actor_slot(&table, s.op.actor)
+		copied := s.id != s.op
 		prim.write_uvarint(&w, ix)
-		prim.write_ivarint(&w, i64(s.id.seq) - i64(ends[ix]))
-		prim.write_uvarint(&w, u64(s.len) << 1 | (1 if s.redacted else 0))
-		ends[ix] = s.id.seq + u64(s.len)
+		prim.write_ivarint(&w, i64(s.op.seq) - i64(ends[ix]))
+		prim.write_uvarint(&w, u64(s.len) << 2 | (2 if copied else 0) | (1 if s.redacted else 0))
+		if copied {
+			prim.write_uvarint(&w, actor_slot(&table, s.id.actor))
+			prim.write_uvarint(&w, s.id.seq)
+		}
+		ends[ix] = s.op.seq + u64(s.len)
 	}
 	if w.err != .None {
 		return .Too_Large
@@ -405,15 +435,25 @@ checkpoint_decode :: proc(g: ^Graph, data: []u8, text: []u8, allocator := contex
 		ix := prim.read_uvarint(&r)
 		d := prim.read_ivarint(&r)
 		packed := prim.read_uvarint(&r)
-		n := packed >> 1
+		n := packed >> 2
 		if r.err != .None || ix >= na || n == 0 || n > MAX_RUN {
 			return {}, .Corrupt
 		}
 		seq := i64(ends[ix]) + d
-		if seq < 0 || u64(seq) >= MAX_COUNTER {
+		if seq < 0 || u64(seq) >= MAX_COUNTER - n {
 			return {}, .Corrupt
 		}
-		spans[i] = Author_Span{Op_Id{actors[ix], u64(seq)}, int(n), packed & 1 == 1}
+		op := Op_Id{actors[ix], u64(seq)}
+		author := op
+		if packed & 2 != 0 {
+			ax := prim.read_uvarint(&r)
+			as := prim.read_uvarint(&r)
+			if r.err != .None || ax >= na || as >= MAX_COUNTER - n {
+				return {}, .Corrupt
+			}
+			author = Op_Id{actors[ax], as}
+		}
+		spans[i] = Author_Span{id = author, op = op, len = int(n), redacted = packed & 1 == 1}
 		ends[ix] = u64(seq) + n
 	}
 	if !prim.reader_done(&r) {

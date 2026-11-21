@@ -399,6 +399,7 @@ graph_memory :: proc(g: ^Graph) -> int {
 	for &s in g.seqs {
 		n += cap(s.red) * size_of(Seq_Range)
 	}
+	n += cap(g.copies) * size_of(Copy_Rec)
 	for &p in g.pages {
 		n += cap(p.recs) * size_of(Rec) + cap(p.parents) * size_of(Lv)
 	}
@@ -444,6 +445,14 @@ graph_meta_encode :: proc(g: ^Graph, buf: ^[dynamic]u8) -> Error {
 	for &p in g.pages {
 		prim.write_uvarint(&w, u64(p.first))
 		prim.write_uvarint(&w, u64(p.count))
+	}
+	prim.write_uvarint(&w, u64(len(g.copies)))
+	for c in g.copies {
+		prim.write_uvarint(&w, u64(c.src))
+		prim.write_uvarint(&w, c.src_seq)
+		prim.write_uvarint(&w, u64(c.own))
+		prim.write_uvarint(&w, c.own_seq)
+		prim.write_uvarint(&w, u64(c.len))
 	}
 	return .Too_Large if w.err != .None else .None
 }
@@ -529,18 +538,99 @@ graph_open :: proc(g: ^Graph, meta: []u8, source: Graph_Source, allocator := con
 		prev = int(first)
 		append(&g.pages, Rec_Page{first = int(first), count = u32(count)})
 	}
+	nc := prim.read_uvarint(&r)
+	if r.err != .None || nc > u64(prim.reader_remaining(&r) / 5) {
+		return fail(g)
+	}
+	for _ in 0 ..< int(nc) {
+		c: Copy_Rec
+		c.src = u32(prim.read_uvarint(&r))
+		c.src_seq = prim.read_uvarint(&r)
+		c.own = u32(prim.read_uvarint(&r))
+		c.own_seq = prim.read_uvarint(&r)
+		l := prim.read_uvarint(&r)
+		if r.err != .None || int(c.src) >= len(g.actors) || int(c.own) >= len(g.actors) || l == 0 || l > MAX_RUN {
+			return fail(g)
+		}
+		c.len = int(l)
+		append(&g.copies, c)
+	}
 	if !prim.reader_done(&r) {
 		return fail(g)
 	}
 	return .None
 }
 
-graph_redact :: proc(g: ^Graph, actor: prim.Id, seq: u64, n: int) -> bool {
+Copy_Rec :: struct {
+	src_seq: u64,
+	own_seq: u64,
+	len:     int,
+	src:     u32,
+	own:     u32,
+}
+
+@(private)
+Red_Work :: struct {
+	actor: u32,
+	seq:   u64,
+	len:   int,
+}
+
+graph_redact :: proc(g: ^Graph, actor: prim.Id, seq: u64, n: int, added: ^[dynamic]Op_Span = nil) -> bool {
 	if n <= 0 || n > MAX_RUN || seq >= MAX_COUNTER - u64(n) {
 		return false
 	}
-	ix := graph_intern(g, actor)
-	rs := &g.seqs[ix].red
+	return redact_closure(g, graph_intern(g, actor), seq, n, added)
+}
+
+@(private)
+redact_closure :: proc(g: ^Graph, actor: u32, seq: u64, n: int, added: ^[dynamic]Op_Span) -> bool {
+	work := make([dynamic]Red_Work, g.allocator)
+	defer delete(work)
+	gaps := make([dynamic]Seq_Range, g.allocator)
+	defer delete(gaps)
+	append(&work, Red_Work{actor, seq, n})
+	changed := false
+	for len(work) > 0 {
+		w := pop(&work)
+		rs := &g.seqs[w.actor].red
+		clear(&gaps)
+		cur := w.seq
+		end := w.seq + u64(w.len)
+		for i := red_first(rs[:], cur); i < len(rs) && rs[i].seq < end && cur < end; i += 1 {
+			if rs[i].seq > cur {
+				append(&gaps, Seq_Range{cur, int(rs[i].seq - cur)})
+			}
+			cur = max(cur, rs[i].seq + u64(rs[i].len))
+		}
+		if cur < end {
+			append(&gaps, Seq_Range{cur, int(end - cur)})
+		}
+		if len(gaps) == 0 {
+			continue
+		}
+		red_insert(rs, w.seq, w.len)
+		changed = true
+		for gp in gaps {
+			if added != nil {
+				append(added, Op_Span{Op_Id{g.actors[w.actor], gp.seq}, gp.len})
+			}
+			ge := gp.seq + u64(gp.len)
+			for i := copy_first(g, w.actor); i < len(g.copies) && g.copies[i].src == w.actor; i += 1 {
+				c := g.copies[i]
+				a := max(c.src_seq, gp.seq)
+				b := min(c.src_seq + u64(c.len), ge)
+				if b > a {
+					append(&work, Red_Work{c.own, c.own_seq + (a - c.src_seq), int(b - a)})
+				}
+			}
+		}
+	}
+	return changed
+}
+
+@(private)
+red_insert :: proc(rs: ^[dynamic]Seq_Range, seq: u64, n: int) {
 	lo := seq
 	hi := seq + u64(n)
 	i := red_first(rs[:], lo)
@@ -550,12 +640,48 @@ graph_redact :: proc(g: ^Graph, actor: prim.Id, seq: u64, n: int) -> bool {
 		hi = max(hi, rs[j].seq + u64(rs[j].len))
 		j += 1
 	}
-	if j - i == 1 && rs[i].seq <= seq && rs[i].seq + u64(rs[i].len) >= seq + u64(n) {
-		return false
-	}
 	remove_range(rs, i, j)
 	inject_at(rs, i, Seq_Range{lo, int(hi - lo)})
-	return true
+}
+
+@(private)
+copy_first :: proc "contextless" (g: ^Graph, src: u32) -> int {
+	c := g.copies[:]
+	lo, hi := 0, len(c)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if c[mid].src < src {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+@(private)
+copy_register :: proc(g: ^Graph, c: Copy_Rec) {
+	c_ := g.copies[:]
+	lo, hi := 0, len(c_)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if c_[mid].src < c.src || c_[mid].src == c.src && c_[mid].src_seq <= c.src_seq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	inject_at(&g.copies, lo, c)
+	graph_redacted(g, c.src, c.src_seq, c.len, &g.red)
+	if len(g.red) == 0 {
+		return
+	}
+	parts := make([dynamic]Seq_Range, 0, len(g.red), g.allocator)
+	defer delete(parts)
+	append(&parts, ..g.red[:])
+	for r in parts {
+		redact_closure(g, c.own, c.own_seq + (r.seq - c.src_seq), r.len, nil)
+	}
 }
 
 @(private)

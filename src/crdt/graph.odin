@@ -54,6 +54,7 @@ Graph :: struct {
 	heap:        [dynamic]Heap_Item,
 	tmp:         [dynamic]Lv,
 	red:         [dynamic]Seq_Range,
+	copies:      [dynamic]Copy_Rec,
 	walk:        [dynamic]Walk_Span,
 	only_a:      [dynamic]Lv_Span,
 	only_b:      [dynamic]Lv_Span,
@@ -81,6 +82,7 @@ graph_init :: proc(g: ^Graph, allocator := context.allocator, source := Graph_So
 	g.heap = make([dynamic]Heap_Item, allocator)
 	g.tmp = make([dynamic]Lv, allocator)
 	g.red = make([dynamic]Seq_Range, allocator)
+	g.copies = make([dynamic]Copy_Rec, allocator)
 	g.walk = make([dynamic]Walk_Span, allocator)
 	g.only_a = make([dynamic]Lv_Span, allocator)
 	g.only_b = make([dynamic]Lv_Span, allocator)
@@ -108,6 +110,7 @@ graph_destroy :: proc(g: ^Graph) {
 	delete(g.heap)
 	delete(g.tmp)
 	delete(g.red)
+	delete(g.copies)
 	delete(g.walk)
 	delete(g.only_a)
 	delete(g.only_b)
@@ -245,7 +248,22 @@ graph_records :: proc "contextless" (g: ^Graph) -> int {
 
 graph_add :: proc(g: ^Graph, b: ^Batch) -> (first: Lv, skip: int, err: Error) {
 	n := batch_check_ops(b) or_return
-	return graph_add_header(g, b.actor, b.seq, b.lamport, b.parents, n)
+	first, skip = graph_add_header(g, b.actor, b.seq, b.lamport, b.parents, n) or_return
+	if skip >= n {
+		return
+	}
+	own := graph_intern(g, b.actor)
+	o := 0
+	for &op in b.ops {
+		lo := max(skip, o)
+		hi := o + op.len
+		if op.kind == .Insert_Copy && hi > lo {
+			k := lo - o
+			copy_register(g, Copy_Rec{src_seq = op.src.seq + u64(k), own_seq = b.seq + u64(lo), len = hi - lo, src = graph_intern(g, op.src.actor), own = own})
+		}
+		o = hi
+	}
+	return
 }
 
 @(private)
@@ -255,7 +273,10 @@ batch_check_ops :: proc(b: ^Batch) -> (int, Error) {
 		if op.len <= 0 || op.len > MAX_RUN || op.pos < -MAX_RUN || op.pos > MAX_POS {
 			return 0, .Invalid
 		}
-		if op.kind == .Insert && len(op.content) != op.len || op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS) {
+		if op.kind == .Insert && len(op.content) != op.len || op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS || op.ref.oid.len != 20 && op.ref.oid.len != 32) {
+			return 0, .Invalid
+		}
+		if op.kind == .Insert_Copy && op.src.seq >= MAX_COUNTER - u64(op.len) {
 			return 0, .Invalid
 		}
 		n += op.len

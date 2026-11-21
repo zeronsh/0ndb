@@ -10,10 +10,12 @@ Run_Leaf :: struct($E: typeid) {
 }
 
 Span :: struct {
-	len:   int,
-	seq:   u64,
-	actor: u32,
-	red:   bool,
+	len:    int,
+	seq:    u64,
+	aseq:   u64,
+	actor:  u32,
+	aactor: u32,
+	red:    bool,
 }
 
 Ix :: struct {
@@ -26,7 +28,7 @@ Index :: Tree(Run_Leaf(Ix), 1)
 
 @(private)
 span_merge :: #force_inline proc "contextless" (a: ^Span, b: Span) -> bool {
-	if a.actor == b.actor && a.red == b.red && a.seq + u64(a.len) == b.seq {
+	if a.actor == b.actor && a.aactor == b.aactor && a.red == b.red && a.seq + u64(a.len) == b.seq && a.aseq + u64(a.len) == b.aseq {
 		a.len += b.len
 		return true
 	}
@@ -35,7 +37,12 @@ span_merge :: #force_inline proc "contextless" (a: ^Span, b: Span) -> bool {
 
 @(private)
 span_split :: #force_inline proc "contextless" (e: Span, k: int) -> (Span, Span) {
-	return Span{k, e.seq, e.actor, e.red}, Span{e.len - k, e.seq + u64(k), e.actor, e.red}
+	a, b := e, e
+	a.len = k
+	b.len = e.len - k
+	b.seq += u64(k)
+	b.aseq += u64(k)
+	return a, b
 }
 
 @(private)

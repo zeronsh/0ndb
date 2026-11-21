@@ -28,9 +28,26 @@ Op_Kind :: enum u8 {
 	Delete_Back,
 	Opaque,
 	Insert_Ref,
+	Insert_Copy,
 }
 
-Oid :: [20]u8
+Oid :: struct {
+	len:   u8,
+	bytes: [32]u8,
+}
+
+oid_make :: proc "contextless" (b: []u8) -> (o: Oid, ok: bool) {
+	if len(b) != 20 && len(b) != 32 {
+		return {}, false
+	}
+	o.len = u8(len(b))
+	copy(o.bytes[:], b)
+	return o, true
+}
+
+oid_bytes :: proc "contextless" (o: ^Oid) -> []u8 {
+	return o.bytes[:min(int(o.len), 32)]
+}
 
 Content_Ref :: struct {
 	oid:    Oid,
@@ -42,6 +59,11 @@ Content_Source :: struct {
 	read: proc(data: rawptr, oid: Oid, offset: int, dst: []u8) -> bool,
 }
 
+Copy_Source :: struct {
+	data: rawptr,
+	read: proc(data: rawptr, src: Op_Id, dst: []u8, authors: ^[dynamic]Author_Span) -> int,
+}
+
 Op_Run :: struct {
 	target:  Op_Id,
 	kind:    Op_Kind,
@@ -49,6 +71,7 @@ Op_Run :: struct {
 	len:     int,
 	content: []u8,
 	ref:     Content_Ref,
+	src:     Op_Id,
 }
 
 Batch :: struct {
@@ -71,6 +94,7 @@ Op_Span :: struct {
 
 Author_Span :: struct {
 	id:       Op_Id,
+	op:       Op_Id,
 	len:      int,
 	redacted: bool,
 }
@@ -103,7 +127,7 @@ MAX_LV :: 1 << 52
 MAX_RUN :: 1 << 40
 
 is_insert :: #force_inline proc "contextless" (k: Op_Kind) -> bool {
-	return k == .Insert || k == .Insert_Ref
+	return k == .Insert || k == .Insert_Ref || k == .Insert_Copy
 }
 
 batch_len :: proc "contextless" (b: ^Batch) -> int {

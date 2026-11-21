@@ -87,24 +87,29 @@ text_spans :: proc(t: ^Text, g: ^Graph, allocator := context.allocator) -> []Aut
 				continue
 			}
 			if have {
-				append(&out, Author_Span{Op_Id{g.actors[prev.actor], prev.seq}, prev.len, prev.red})
+				append(&out, author_span(g, prev))
 			}
 			prev = s
 			have = true
 		}
 	}
 	if have {
-		append(&out, Author_Span{Op_Id{g.actors[prev.actor], prev.seq}, prev.len, prev.red})
+		append(&out, author_span(g, prev))
 	}
 	return out[:]
 }
 
-text_author :: proc(t: ^Text, g: ^Graph, pos: int) -> (Op_Id, bool) {
-	s, off, ok := run_get(&t.spans, pos)
-	if !ok {
-		return {}, false
+@(private)
+author_span :: proc(g: ^Graph, s: Span) -> Author_Span {
+	return Author_Span{id = Op_Id{g.actors[s.aactor], s.aseq}, op = Op_Id{g.actors[s.actor], s.seq}, len = s.len, redacted = s.red}
+}
+
+text_author :: proc(t: ^Text, g: ^Graph, pos: int) -> (author: Op_Id, op: Op_Id, ok: bool) {
+	s, off, found := run_get(&t.spans, pos)
+	if !found {
+		return {}, {}, false
 	}
-	return Op_Id{g.actors[s.actor], s.seq + u64(off)}, true
+	return Op_Id{g.actors[s.aactor], s.aseq + u64(off)}, Op_Id{g.actors[s.actor], s.seq + u64(off)}, true
 }
 
 text_from :: proc(t: ^Text, g: ^Graph, data: []u8, spans: []Author_Span, version: []Op_Id, allocator := context.allocator) -> Error {
@@ -125,22 +130,26 @@ text_from :: proc(t: ^Text, g: ^Graph, data: []u8, spans: []Author_Span, version
 	}
 	rope_append(&t.rope, data)
 	pos := 0
-	for s in spans {
-		ix := graph_intern(g, s.id.actor)
-		run_insert(&t.spans, pos, Span{s.len, s.id.seq, ix, s.redacted})
-		pos += s.len
-	}
-	pos = 0
 	parts := make([dynamic]Red_Part, t.allocator)
 	defer delete(parts)
 	for s in spans {
-		ix := graph_intern(g, s.id.actor)
+		sp := Span {
+			len    = s.len,
+			seq    = s.op.seq,
+			aseq   = s.id.seq,
+			actor  = graph_intern(g, s.op.actor),
+			aactor = graph_intern(g, s.id.actor),
+			red    = s.redacted,
+		}
+		run_insert(&t.spans, pos, sp)
 		if s.redacted {
-			append(&parts, Red_Part{pos, s.id.seq, s.len, ix})
+			append(&parts, Red_Part{pos, sp})
 		} else {
-			graph_redacted(g, ix, s.id.seq, s.len, &g.red)
+			graph_redacted(g, sp.actor, sp.seq, sp.len, &g.red)
 			for r in g.red {
-				append(&parts, Red_Part{pos + int(r.seq - s.id.seq), r.seq, r.len, ix})
+				_, tail := span_split(sp, int(r.seq - sp.seq))
+				piece, _ := span_split(tail, r.len)
+				append(&parts, Red_Part{pos + int(r.seq - sp.seq), piece})
 			}
 		}
 		pos += s.len
@@ -151,19 +160,19 @@ text_from :: proc(t: ^Text, g: ^Graph, data: []u8, spans: []Author_Span, version
 
 @(private)
 Red_Part :: struct {
-	pos:   int,
-	seq:   u64,
-	len:   int,
-	actor: u32,
+	pos:  int,
+	span: Span,
 }
 
 @(private)
 redact_parts :: proc(t: ^Text, parts: []Red_Part) {
 	ids := &t.ids if t.ids_on else nil
 	for p in parts {
-		rope_fill(&t.rope, p.pos, p.len, 0)
-		run_delete(&t.spans, p.pos, p.len, ids)
-		run_insert(&t.spans, p.pos, Span{p.len, p.seq, p.actor, true}, ids)
+		x := p.span
+		x.red = true
+		rope_fill(&t.rope, p.pos, x.len, 0)
+		run_delete(&t.spans, p.pos, x.len, ids)
+		run_insert(&t.spans, p.pos, x, ids)
 	}
 }
 
@@ -183,7 +192,9 @@ text_redact :: proc(t: ^Text, g: ^Graph, actor: prim.Id, seq: u64, n: int) {
 				a := max(s.seq, seq)
 				b := min(s.seq + u64(s.len), end)
 				if b > a {
-					append(parts, Red_Part{pos + int(a - s.seq), a, int(b - a), actor})
+					_, tail := span_split(s, int(a - s.seq))
+					piece, _ := span_split(tail, int(b - a))
+					append(parts, Red_Part{pos + int(a - s.seq), piece})
 				}
 			}
 			pos += s.len
@@ -253,10 +264,18 @@ shift_point :: proc "contextless" (x, pos, n: int) -> int {
 }
 
 @(private)
-doc_insert :: proc(m: ^Merge, pos: int, data: []u8, actor: u32, seq: u64, red := false) {
+doc_insert :: proc(m: ^Merge, pos: int, data: []u8, actor: u32, seq: u64, red := false, aactor := NO_ACTOR, aseq: u64 = 0) {
 	at := clamp(pos, 0, text_len(m.t))
 	rope_insert(&m.t.rope, at, data)
-	run_insert(&m.t.spans, at, Span{len(data), seq, actor, red}, &m.t.ids if m.t.ids_on else nil)
+	sp := Span {
+		len    = len(data),
+		seq    = seq,
+		aseq   = seq if aactor == NO_ACTOR else aseq,
+		actor  = actor,
+		aactor = actor if aactor == NO_ACTOR else aactor,
+		red    = red,
+	}
+	run_insert(&m.t.spans, at, sp, &m.t.ids if m.t.ids_on else nil)
 	conflict_shift(m, true, at, len(data))
 }
 
@@ -265,6 +284,19 @@ doc_insert_piece :: proc(m: ^Merge, at: int, e: Log_Entry, k: int, n: int, lv: L
 	actor, seq := graph_op(m.g, lv)
 	if e.kind == .Insert && !e.red {
 		doc_insert(m, at, m.log.bytes[e.at + k:][:n], actor, seq)
+		return
+	}
+	if e.kind == .Insert_Copy {
+		off := 0
+		for a in m.log.authors[e.au:][:e.nau] {
+			lo := max(off, k)
+			hi := min(off + a.len, k + n)
+			if hi > lo {
+				d := lo - k
+				doc_insert(m, at + d, m.log.bytes[e.at + lo:][:hi - lo], actor, seq + u64(d), e.red, a.actor, a.seq + u64(lo - off))
+			}
+			off += a.len
+		}
 		return
 	}
 	buf: [4096]u8
@@ -315,7 +347,7 @@ heads_within :: proc(g: ^Graph, heads: []Lv, ps: []Lv) -> bool {
 @(private)
 effect :: proc "contextless" (kind: Op_Kind, pos: int, n: int, size: int) -> (at: int, s: int, cnt: int) {
 	switch kind {
-	case .Insert, .Insert_Ref:
+	case .Insert, .Insert_Ref, .Insert_Copy:
 		return clamp(pos, 0, size), 0, n
 	case .Delete:
 		if pos < 0 || pos >= size {
@@ -337,7 +369,7 @@ effect :: proc "contextless" (kind: Op_Kind, pos: int, n: int, size: int) -> (at
 @(private)
 piece_pos :: proc "contextless" (e: Log_Entry, k: int) -> int {
 	#partial switch e.kind {
-	case .Insert, .Insert_Ref:
+	case .Insert, .Insert_Ref, .Insert_Copy:
 		return e.pos + k
 	case .Delete_Back:
 		return e.pos - k
@@ -422,7 +454,7 @@ walk_piece :: proc(m: ^Merge, tr: ^Tracker, heads: ^[dynamic]Lv, p: Piece, side:
 	at, s, cnt := effect(e.kind, piece_pos(e, k), p.len, size)
 	if cnt > 0 {
 		switch e.kind {
-		case .Insert, .Insert_Ref:
+		case .Insert, .Insert_Ref, .Insert_Copy:
 			ep := tr_insert(tr, g, at, PH + p.lv, p.len)
 			if emit {
 				doc_insert_piece(m, ep, e, k, p.len, p.lv)
@@ -756,7 +788,7 @@ text_length_at :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv) -> (int, Er
 @(private)
 run_valid :: proc "contextless" (r: Op_Run, size: int) -> int {
 	switch r.kind {
-	case .Insert, .Insert_Ref:
+	case .Insert, .Insert_Ref, .Insert_Copy:
 		return r.len if r.pos >= 0 && r.pos <= size else 0
 	case .Delete:
 		return clamp(size - r.pos, 0, r.len) if r.pos >= 0 else 0
@@ -788,6 +820,9 @@ text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id
 			have = true
 		}
 		ok := run_valid(r, size)
+		if r.kind == .Insert_Copy && ok > 0 {
+			ok = min(ok, copy_valid(t, g, log, r, b.actor, b.seq + u64(valid), parents))
+		}
 		valid += ok
 		if ok < r.len {
 			return valid, .None
@@ -795,4 +830,47 @@ text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id
 		size += r.len if is_insert(r.kind) else -r.len
 	}
 	return valid, .None
+}
+
+@(private)
+copy_valid :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, r: Op_Run, actor: prim.Id, seq: u64, parents: []Lv) -> int {
+	n := r.len
+	ext := n
+	if r.src.actor == actor {
+		if r.src.seq >= seq {
+			return 0
+		}
+		ext = min(n, int(seq - r.src.seq))
+	} else {
+		ix, known := graph_actor(g, r.src.actor)
+		if !known {
+			return 0
+		}
+		inside :: proc(g: ^Graph, ix: u32, s: u64, parents: []Lv) -> bool {
+			lv, found := graph_lv_ix(g, ix, s)
+			return found && graph_contains(g, parents, lv)
+		}
+		if !inside(g, ix, r.src.seq + u64(n) - 1, parents) {
+			lo, hi := 0, n - 1
+			for lo < hi {
+				mid := (lo + hi + 1) / 2
+				if inside(g, ix, r.src.seq + u64(mid) - 1, parents) {
+					lo = mid
+				} else {
+					hi = mid - 1
+				}
+			}
+			n = lo
+			ext = lo
+		}
+	}
+	if ext == 0 || log.copies.read == nil {
+		return 0
+	}
+	buf := make([]u8, ext, t.allocator)
+	defer delete(buf, t.allocator)
+	authors := make([dynamic]Author_Span, t.allocator)
+	defer delete(authors)
+	got := clamp(log.copies.read(log.copies.data, Op_Id{r.src.actor, r.src.seq}, buf, &authors), 0, ext)
+	return got if got < ext else n
 }

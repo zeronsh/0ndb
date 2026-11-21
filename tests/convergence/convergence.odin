@@ -76,7 +76,7 @@ store_load :: proc(data: rawptr, key: crdt.Page_Key, out: ^[dynamic]u8) -> bool 
 
 blob_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> bool {
 	for &b, i in dst {
-		b = u8('0' + (int(oid[0]) + offset + i) % 10)
+		b = u8('0' + (int(oid.bytes[0]) + int(oid.len) + offset + i) % 10)
 	}
 	return true
 }
@@ -109,7 +109,7 @@ replica_init :: proc(r: ^Replica, n: int, paged := false) {
 	}
 	for &f in r.files {
 		crdt.text_init(&f.text)
-		crdt.log_init(&f.log, content = crdt.Content_Source{nil, blob_read})
+		crdt.log_init(&f.log, content = crdt.Content_Source{nil, blob_read}, copies = crdt.Copy_Source{r, copy_read})
 	}
 	r.actor = actor_of(n)
 	r.inbox = make([dynamic][]u8)
@@ -210,7 +210,7 @@ apply_batch :: proc(t: ^testing.T, r: ^Replica, b: ^crdt.Batch, collect: bool) -
 	testing.expect_value(t, err2, crdt.Error.None)
 	testing.expect_value(t, skip2, skip)
 	for f in 0 ..< FILES {
-		crdt.log_add_batch(&r.files[f].log, &r.g, use, target_of(f), first, skip)
+		testing.expect_value(t, crdt.log_add_batch(&r.files[f].log, &r.g, use, target_of(f), first, skip), crdt.Error.None)
 	}
 	for f in 0 ..< FILES {
 		file := &r.files[f]
@@ -248,11 +248,34 @@ apply_redact :: proc(r: ^Replica, msg: []u8) {
 	actor := prim.read_id(&rd)
 	seq := prim.read_uvarint(&rd)
 	n := int(prim.read_uvarint(&rd))
-	crdt.graph_redact(&r.g, actor, seq, n)
-	for &f in r.files {
-		crdt.log_redact(&f.log, &r.g, actor, seq, n)
-		crdt.text_redact(&f.text, &r.g, actor, seq, n)
+	added := make([dynamic]crdt.Op_Span)
+	defer delete(added)
+	crdt.graph_redact(&r.g, actor, seq, n, &added)
+	for a in added {
+		for &f in r.files {
+			crdt.log_redact(&f.log, &r.g, a.id.actor, a.id.seq, a.len)
+			crdt.text_redact(&f.text, &r.g, a.id.actor, a.id.seq, a.len)
+		}
 	}
+}
+
+copy_read :: proc(data: rawptr, src: crdt.Op_Id, dst: []u8, authors: ^[dynamic]crdt.Author_Span) -> int {
+	r := (^Replica)(data)
+	done := 0
+	for done < len(dst) {
+		step := 0
+		for &f in r.files {
+			step = crdt.log_read(&f.log, &r.g, crdt.Op_Id{src.actor, src.seq + u64(done)}, dst[done:], authors)
+			if step > 0 {
+				break
+			}
+		}
+		if step == 0 {
+			break
+		}
+		done += step
+	}
+	return done
 }
 
 expected :: proc(g: ^crdt.Graph, s: Snapshot) -> ([]u8, []crdt.Author_Span) {
@@ -262,15 +285,19 @@ expected :: proc(g: ^crdt.Graph, s: Snapshot) -> ([]u8, []crdt.Author_Span) {
 	for sp in s.spans {
 		for i in 0 ..< sp.len {
 			id := crdt.Op_Id{sp.id.actor, sp.id.seq + u64(i)}
-			red := crdt.graph_is_redacted(g, id)
+			op := crdt.Op_Id{sp.op.actor, sp.op.seq + u64(i)}
+			red := crdt.graph_is_redacted(g, op)
 			if red {
 				bytes[pos + i] = 0
 			}
-			if n := len(spans); n > 0 && spans[n - 1].id.actor == id.actor && spans[n - 1].id.seq + u64(spans[n - 1].len) == id.seq && spans[n - 1].redacted == red {
-				spans[n - 1].len += 1
-			} else {
-				append(&spans, crdt.Author_Span{id, 1, red})
+			if n := len(spans); n > 0 {
+				l := &spans[n - 1]
+				if l.id.actor == id.actor && l.id.seq + u64(l.len) == id.seq && l.op.actor == op.actor && l.op.seq + u64(l.len) == op.seq && l.redacted == red {
+					l.len += 1
+					continue
+				}
 			}
+			append(&spans, crdt.Author_Span{id = id, op = op, len = 1, redacted = red})
 		}
 		pos += sp.len
 	}
@@ -423,8 +450,27 @@ local_edit :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng) {
 			if chance(rng, 20) {
 				op.kind = .Insert_Ref
 				op.content = nil
-				op.ref.oid[0] = u8(below(rng, 256))
+				op.ref.oid.len = 20 if chance(rng, 50) else 32
+				op.ref.oid.bytes[0] = u8(below(rng, 256))
 				op.ref.offset = below(rng, 1 << 20)
+			} else if chance(rng, 30) {
+				src := &r.files[below(rng, FILES)].log
+				for _ in 0 ..< 8 {
+					if len(src.entries) == 0 {
+						break
+					}
+					e := src.entries[below(rng, len(src.entries))]
+					if !crdt.is_insert(e.kind) {
+						continue
+					}
+					k := below(rng, e.len)
+					n = 1 + below(rng, min(e.len - k, 60))
+					op.kind = .Insert_Copy
+					op.content = nil
+					op.len = n
+					op.src = crdt.graph_id(&r.g, e.lv + k)
+					break
+				}
 			}
 			sizes[f] += n
 		} else if roll < 85 {
@@ -501,7 +547,11 @@ attack :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng, counter: ^u64)
 			pos    = below(rng, 2 * size + 4),
 			len    = 1 + below(rng, 12),
 		}
-		switch below(rng, 3) {
+		switch below(rng, 4) {
+		case 3:
+			op.kind = .Insert_Copy
+			victim := &rs[below(rng, len(rs))]
+			op.src = crdt.Op_Id{victim.actor, u64(below(rng, int(victim.seq) + 8))}
 		case 0:
 			op.kind = .Insert
 			op.content = content[:op.len]
@@ -681,8 +731,8 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 				live := crdt.text_spans(&rs[0].files[s.file].text, &rs[0].g)
 				at := 0
 				for sp in live {
-					if sp.id.actor == s.anchor.id.actor && s.anchor.id.seq >= sp.id.seq && s.anchor.id.seq < sp.id.seq + u64(sp.len) {
-						testing.expect_value(t, p0, at + int(s.anchor.id.seq - sp.id.seq))
+					if sp.op.actor == s.anchor.id.actor && s.anchor.id.seq >= sp.op.seq && s.anchor.id.seq < sp.op.seq + u64(sp.len) {
+						testing.expect_value(t, p0, at + int(s.anchor.id.seq - sp.op.seq))
 					}
 					at += sp.len
 				}
