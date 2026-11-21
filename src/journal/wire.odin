@@ -72,6 +72,11 @@ _seal :: proc(rec: []u8, off: i64, keys: Key_Provider) -> Error {
 		return .None
 	case .Plain:
 		if is_sig(body) {
+			tag, ok := sig_tag(body, off, keys)
+			if !ok {
+				return .No_Key
+			}
+			copy(rec[4:HEADER], tag[:])
 			return .None
 		}
 	}
@@ -103,11 +108,15 @@ _open :: proc(rec: []u8, off: i64, keys: Key_Provider) -> Error {
 	case .Redacted:
 		return .None
 	case .Plain:
-		if is_sig(body) {
-			return .None
-		}
 		return .Corrupt
 	case .Sealed:
+		if is_sig(body) {
+			if tag, ok := sig_tag(body, off, keys); ok && _tag_eq(tag[:], rec[4:HEADER]) {
+				local := local_tag(body, off)
+				copy(rec[4:HEADER], local[:])
+				return .None
+			}
+		}
 	}
 	if keys.key == nil {
 		return .No_Key

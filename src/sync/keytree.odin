@@ -1,6 +1,7 @@
 package osync
 
 import "base:intrinsics"
+import "core:slice"
 import "base:runtime"
 import "core:crypto"
 import "core:crypto/blake2b"
@@ -145,6 +146,38 @@ keytree_puncture :: proc(t: ^Key_Tree, from, to: i64) -> Error {
 		return .None
 	}
 	return keytree_puncture_cells(t, lo, hi - 1)
+}
+
+keytree_puncture_except :: proc(t: ^Key_Tree, from, to: i64, keep: []i64) -> Error {
+	if from < 0 || to <= from {
+		return .Invalid
+	}
+	lo := u64(from) >> t.shift
+	hi := u64(to) >> t.shift
+	if hi <= lo {
+		return .None
+	}
+	cells := make([dynamic]u64, 0, len(keep), context.temp_allocator)
+	for k in keep {
+		if k >= 0 {
+			c := u64(k) >> t.shift
+			if c >= lo && c < hi {
+				append(&cells, c)
+			}
+		}
+	}
+	slice.sort(cells[:])
+	start := lo
+	for c in cells {
+		if c > start {
+			keytree_puncture_cells(t, start, c - 1) or_return
+		}
+		start = max(start, c + 1)
+	}
+	if start < hi {
+		keytree_puncture_cells(t, start, hi - 1) or_return
+	}
+	return .None
 }
 
 keytree_puncture_cells :: proc(t: ^Key_Tree, lo, hi_incl: u64) -> Error {

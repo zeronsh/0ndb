@@ -290,6 +290,7 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	rt.loaded = true
 	rt.absent = false
 	_held_release(e, sp, rt.device)
+	osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
 }
 
 @(private)

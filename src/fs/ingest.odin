@@ -1235,7 +1235,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		}
 		if c.scope == nil {
 			if a, ok := m.attrib[c.path]; ok {
-				c.actor = a
+				c.actor = a.actor
 			}
 		}
 	}
@@ -1293,6 +1293,8 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			actor := m.actor
 			if c.scope != nil {
 				actor = c.scope.actor
+			} else if m.lost {
+				actor = unattributed_actor(m.actor)
 			} else if c.actor != {} {
 				actor = c.actor
 			}
@@ -1310,7 +1312,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			emit_order(p, groups[actor][:])
 			if actor != m.actor {
 				for i in groups[actor] {
-					attrib_set(m, p.changes[i].path, actor)
+					attrib_set(m, p.changes[i].path, actor, true)
 				}
 			}
 			for i in groups[actor] {

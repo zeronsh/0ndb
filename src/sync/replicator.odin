@@ -31,6 +31,7 @@ Repl_Event_Kind :: enum u8 {
 	Local_Redacted,
 	Quarantined,
 	Relay_Misbehaving,
+	Keys_Needed,
 	Object_Shredded,
 }
 
@@ -150,10 +151,10 @@ Remote :: struct {
 	quarantined: bool,
 	keys_wait: bool,
 	scope:     Scope,
-	head_of:   Stream_Id,
+	head_keys: string,
+	head_min:  u64,
 	is_head:   bool,
 	tamper_hold: bool,
-	tamper_seen: bool,
 	plain:     bool,
 	skey:      journal.Key,
 	reaping:   bool,
@@ -1073,6 +1074,7 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 		_remote_free(r, rm)
 		return nil, .No_Memory
 	}
+	_pending_apply(r, rm)
 	for i in 0 ..< PROBES {
 		rm.probes[i] = stream_id(scope, device, name, epoch + 1 + u64(i))
 		r.probes[rm.probes[i]] = rm
@@ -1095,6 +1097,9 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 	journal.replica_close(&rm.rep)
 	crypto.zero_explicit(&rm.skey, size_of(rm.skey))
 	scope_clear(&rm.scope)
+	if len(rm.head_keys) > 0 {
+		delete(rm.head_keys, r.allocator)
+	}
 	if rm.span_fd >= 0 {
 		prim.close_file(r.vfs, rm.span_fd)
 	}
@@ -1304,7 +1309,7 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 				i += 1
 				continue
 			}
-			v, _, _ := _verdict(r, rm, w.from, to)
+			v, tlo, thi := _verdict(r, rm, w.from, to)
 			if v == .Hold {
 				i += 1
 				continue
@@ -1314,7 +1319,7 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 				return
 			}
 			if v == .Tampered {
-				_tamper_persisted(r, rm)
+				_tamper_forget(r, rm, tlo, thi)
 				i += 1
 				continue
 			}
@@ -1352,16 +1357,26 @@ _keys_head_watch :: proc(r: ^Replicator, rm: ^Remote) {
 	if rm.is_head || len(rm.name) <= len(KEYS_STREAM) || rm.name[:len(KEYS_STREAM)] != KEYS_STREAM {
 		return
 	}
-	hname, err := keys_head_name(rm.name)
+	_keys_head_start(r, &rm.scope, rm.device, rm.name, rm.epoch + 1)
+}
+
+@(private)
+_keys_head_start :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, keys_name: string, min_epoch: u64) {
+	hname, err := keys_head_name(keys_name)
 	if err != .None {
 		return
 	}
-	head, herr := _remote_get(r, &rm.scope, rm.device, hname, 0)
-	if herr != .None || head == rm {
+	head, herr := _remote_get(r, scope, device, hname, 0)
+	if herr != .None {
 		return
 	}
 	head.is_head = true
-	head.head_of = rm.id
+	if len(head.head_keys) == 0 {
+		head.head_keys, _ = _clone_string(keys_name, r.allocator)
+		head.head_min = min_epoch
+	} else {
+		head.head_min = min(head.head_min, min_epoch)
+	}
 	if head.tail == 0 && len(head.wants) == 0 {
 		head.tail = 64
 		head.want_gen += 1
@@ -1370,9 +1385,20 @@ _keys_head_watch :: proc(r: ^Replicator, rm: ^Remote) {
 }
 
 @(private)
+_keys_needed :: proc(r: ^Replicator, rm: ^Remote) {
+	if rm.keys_wait {
+		return
+	}
+	rm.keys_wait = true
+	_emit(r, Repl_Event{kind = .Keys_Needed, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+	if kn, err := keys_stream_name(rm.name); err == .None {
+		_keys_head_start(r, &rm.scope, rm.device, kn, 0)
+	}
+}
+
+@(private)
 _keys_head_seen :: proc(r: ^Replicator, head: ^Remote) {
-	target, ok := r.remotes[head.head_of]
-	if !ok {
+	if len(head.head_keys) == 0 {
 		return
 	}
 	rd: journal.Reader
@@ -1386,8 +1412,8 @@ _keys_head_seen :: proc(r: ^Replicator, head: ^Remote) {
 		return
 	}
 	epoch := prim.get_u64le(body[1:])
-	if epoch > target.epoch {
-		_emit(r, Repl_Event{kind = .Epoch_Seen, device = target.device, name = target.name, epoch = epoch, stream = stream_id(&target.scope, target.device, target.name, epoch)})
+	if epoch >= head.head_min {
+		_emit(r, Repl_Event{kind = .Epoch_Seen, device = head.device, name = head.head_keys, epoch = epoch, stream = stream_id(&head.scope, head.device, head.head_keys, epoch)})
 	}
 }
 
@@ -1464,12 +1490,14 @@ _tamper :: proc(r: ^Replicator, rm: ^Remote) {
 }
 
 @(private)
-_tamper_persisted :: proc(r: ^Replicator, rm: ^Remote) {
-	if rm.tamper_seen {
-		return
+_tamper_forget :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
+	if to > from {
+		journal.replica_forget(&rm.rep, from, to)
+		if c := _contiguous(rm); c < rm.pulled {
+			rm.pulled = c
+		}
 	}
-	rm.tamper_seen = true
-	_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+	_tamper(r, rm)
 }
 
 @(private)
@@ -1571,7 +1599,7 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 			_quarantine(r, rm, r.rx_start)
 			return
 		case .Tampered:
-			_tamper_persisted(r, rm)
+			_tamper_forget(r, rm, vlo, vhi)
 		}
 	}
 	rm.pulling = false

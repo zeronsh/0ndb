@@ -243,13 +243,18 @@ _decode :: proc(r: ^Reader, rec: []u8, off: i64) -> (body: []u8, kind: Record_Ki
 	case .Redacted:
 		return nil, kind, .None
 	case .Plain:
-		if r.keys.key != nil && !is_sig(b) {
+		if r.keys.key != nil {
 			return nil, kind, .Corrupt
 		}
 		return b, kind, .None
 	case .Sealed:
 		if r.keys.key == nil {
 			return nil, kind, .Corrupt
+		}
+		if is_sig(b) {
+			if tag, ok := sig_tag(b, off, r.keys); ok && _tag_eq(tag[:], rec[4:HEADER]) {
+				return b, .Plain, .None
+			}
 		}
 	}
 	k: Key
@@ -343,8 +348,7 @@ _find_span :: proc(r: ^Reader, from: i64) -> Error {
 			first := _fetch(r, pos + HEADER, pos + HEADER + 1, true) or_return
 			if first[0] == SIG_KIND {
 				rec := _fetch(r, pos, end, true) or_return
-				if classify(rec, pos) == .Plain {
-					b, _ := record_body(rec)
+				if b, kind, err := _decode(r, rec, pos); err == .None && kind == .Plain && is_sig(b) {
 					return _check_sig_record(r, b, pos)
 				}
 			}

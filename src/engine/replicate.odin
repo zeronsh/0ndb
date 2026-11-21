@@ -20,6 +20,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		kernel_tls   = e.cfg.kernel_tls,
 		on_event     = _on_repl_event,
 		user         = sp,
+		keys         = _repl_keys,
 	}
 	creds_ok := false
 	if e.cfg.credentials.produce != nil {
@@ -368,6 +369,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_relay_redacted_event(e, sp, ev.stream, ev.from, ev.to)
 	case .Local_Redacted:
 		_local_redacted(e, sp, ev.stream, ev.from, ev.to)
+	case .Relay_Misbehaving:
+		obj_id, _, _ := _object_of_name(ev.name)
+		_emit(e, Event{kind = .Relay_Misbehaving, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err)})
 	}
 }
 
@@ -455,6 +459,19 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 		}
 	}
 	_object_changed(e, sp.id, id, .Keys)
+}
+
+@(private)
+_repl_keys :: proc(user: rawptr, device: prim.Id, name: string, epoch: u64, stream: osync.Stream_Id) -> (osync.Stream_Sealing, journal.Key_Provider) {
+	sp := (^Space)(user)
+	if _, _, ok := _object_of_name(name); !ok {
+		return .Stream_Key, {}
+	}
+	rt, found := sp.remote_trees[stream]
+	if !found || !rt.loaded {
+		return .Unknown, {}
+	}
+	return .Key_Tree, osync.keytree_provider(&rt.tree)
 }
 
 @(private)

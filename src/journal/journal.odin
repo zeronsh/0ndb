@@ -98,6 +98,8 @@ CHAIN_DOMAIN :: "0ndb-chain-v1"
 SIG_DOMAIN :: "0ndb-sig-v1"
 @(private)
 COMMIT_DOMAIN :: "0ndb-commit-v1"
+@(private)
+SIG_TAG_DOMAIN :: "0ndb-sig-tag-v1"
 
 record_size :: proc "contextless" (body_len: int) -> i64 {
 	return i64(body_len) + OVERHEAD
@@ -187,6 +189,26 @@ redact_bytes :: proc(rec: []u8, off: i64) -> Error {
 		b = 0
 	}
 	return .None
+}
+
+sig_tag :: proc(body: []u8, off: i64, keys: Key_Provider) -> (tag: Tag, ok: bool) {
+	if keys.key == nil {
+		return
+	}
+	k: Key
+	if !keys.key(keys.data, off, &k) {
+		return
+	}
+	ctx: blake2b.Context
+	blake2b.init_mac(&ctx, k[:], len(Tag))
+	_zero(k[:])
+	blake2b.update(&ctx, transmute([]u8)string(SIG_TAG_DOMAIN))
+	b: [8]u8
+	prim.put_u64le(b[:], u64(off))
+	blake2b.update(&ctx, b[:])
+	blake2b.update(&ctx, body)
+	blake2b.final(&ctx, tag[:])
+	return tag, true
 }
 
 chain_genesis :: proc(seed: Hash) -> (h: Hash) {

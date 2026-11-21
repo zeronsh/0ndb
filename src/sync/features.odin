@@ -44,14 +44,33 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 	append(&body, KEYS_RECORD)
 	keytree_encode(tree, &body) or_return
 	defer crypto.zero_explicit(raw_data(body), len(body))
-	journal.journal_remove(r.vfs, path)
+	floor := replicator_floor(r, scope, name, epoch) or_return
+	if floor > 0 {
+		same := false
+		rd: journal.Reader
+		if journal.reader_open(&rd, r.vfs, path, context.temp_allocator) == .None {
+			c := journal.cursor(&rd, 0)
+			if b, _, ok := journal.next(&c); ok {
+				same = string(b) == string(body[:])
+			}
+			journal.reader_close(&rd)
+		}
+		if !same {
+			return .Conflict
+		}
+	} else {
+		journal.journal_remove(r.vfs, path)
+	}
 	j: journal.Journal
 	if jerr := journal.journal_open(&j, r.vfs, path, {}, context.allocator); jerr != .None {
 		return _from_journal(jerr)
 	}
-	_, aerr := journal.journal_append(&j, body[:])
-	if aerr == .None {
-		aerr = journal.journal_commit(&j)
+	aerr: journal.Error
+	if journal.journal_durable_len(&j) == 0 {
+		_, aerr = journal.journal_append(&j, body[:])
+		if aerr == .None {
+			aerr = journal.journal_commit(&j)
+		}
 	}
 	durable := journal.journal_durable_len(&j)
 	journal.journal_close(&j)
@@ -125,7 +144,82 @@ replicator_zero_replica :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 	if hi <= from {
 		return .None
 	}
-	return _from_journal(journal.replica_redact(&rm.rep, from, hi))
+	keys, known := _remote_keys(r, rm)
+	if !known {
+		_pending_add(r, rm.path, from, hi)
+		return .None
+	}
+	return _from_journal(journal.replica_redact(&rm.rep, from, hi, keys))
+}
+
+@(private)
+_remote_keys :: proc(r: ^Replicator, rm: ^Remote) -> (keys: journal.Key_Provider, known: bool) {
+	if rm.plain {
+		return {}, true
+	}
+	if r.cfg.keys != nil {
+		sealing, tree := r.cfg.keys(r.cfg.user, rm.device, rm.name, rm.epoch, rm.id)
+		switch sealing {
+		case .Unknown:
+			return {}, false
+		case .Key_Tree:
+			return tree, true
+		case .Stream_Key:
+		}
+	}
+	return static_provider(&rm.skey), true
+}
+
+@(private)
+_pending_path :: proc(buf: ^prim.Path_Buf, replica_path: string) -> string {
+	n := copy(buf[:], replica_path)
+	n += copy(buf[n:], ".pending")
+	return string(buf[:n])
+}
+
+@(private)
+_pending_add :: proc(r: ^Replicator, replica_path: string, from, to: i64) {
+	pbuf: prim.Path_Buf = ---
+	path := _pending_path(&pbuf, replica_path)
+	fd, err := prim.open_file(r.vfs, path, {.Write, .Create}, 0o600)
+	if err != .None {
+		return
+	}
+	defer prim.close_file(r.vfs, fd)
+	size, _ := prim.file_size(r.vfs, fd)
+	rec: [16]u8
+	prim.put_u64le(rec[0:8], u64(from))
+	prim.put_u64le(rec[8:16], u64(to))
+	if prim.write_at(r.vfs, fd, rec[:], size - size % 16) == .None {
+		prim.datasync(r.vfs, fd)
+	}
+}
+
+@(private)
+_pending_apply :: proc(r: ^Replicator, rm: ^Remote) {
+	pbuf: prim.Path_Buf = ---
+	path := _pending_path(&pbuf, rm.path)
+	data, err := prim.read_file(r.vfs, path, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	keys, known := _remote_keys(r, rm)
+	if !known {
+		return
+	}
+	done := true
+	for i := 0; i + 16 <= len(data); i += 16 {
+		from := i64(prim.get_u64le(data[i:]))
+		to := min(i64(prim.get_u64le(data[i + 8:])), journal.replica_length(&rm.rep))
+		if to > from && from >= 0 {
+			if e := journal.replica_redact(&rm.rep, from, to, keys); e != .None && e != .Missing {
+				done = false
+			}
+		}
+	}
+	if done {
+		prim.remove(r.vfs, path)
+	}
 }
 
 @(private)
@@ -175,7 +269,11 @@ _verdict :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> (v: Verdict, lo,
 	switch v {
 	case .Accept:
 		_verified_add(rm, lo, hi)
-	case .Hold, .Tampered:
+	case .Tampered:
+		done := req.done if req.done > lo && req.done <= hi else lo
+		_verified_add(rm, lo, done)
+		return v, done, hi
+	case .Hold:
 		hi = req.done if req.done > lo && req.done <= hi else lo
 		_verified_add(rm, lo, hi)
 	case .Equivocation:
@@ -475,7 +573,12 @@ _replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
 	if rm, ok := r.remotes[id]; ok {
 		hi := min(to, journal.replica_length(&rm.rep))
 		if hi > from {
-			journal.replica_redact(&rm.rep, from, hi)
+			keys, known := _remote_keys(r, rm)
+			if !known {
+				_pending_add(r, rm.path, from, hi)
+			} else if e := journal.replica_redact(&rm.rep, from, hi, keys); e != .None && e != .Missing {
+				_pending_add(r, rm.path, from, hi)
+			}
 		}
 		_emit(r, Repl_Event{kind = .Redacted, device = rm.device, name = rm.name, epoch = rm.epoch, stream = id, from = from, to = to})
 		return
@@ -491,7 +594,9 @@ _replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
 	}
 	hi := min(to, journal.replica_length(&rep))
 	if hi > from {
-		journal.replica_redact(&rep, from, hi)
+		if e := journal.replica_redact(&rep, from, hi, {}); e != .None && e != .Missing {
+			_pending_add(r, path, from, hi)
+		}
 	}
 	journal.replica_close(&rep)
 	_emit(r, Repl_Event{kind = .Redacted, device = dev, stream = id, from = from, to = to})
@@ -635,7 +740,7 @@ _record_check :: proc(k: ^_Checker, rec: []u8, off: i64) -> _Check {
 	case .Redacted:
 		return .Ok
 	case .Plain:
-		return .Ok if !k.on || k.plain || journal.is_sig(body) else .Bad
+		return .Ok if !k.on || k.plain else .Bad
 	case .Sealed:
 		if !k.on {
 			return .Ok
@@ -647,6 +752,11 @@ _record_check :: proc(k: ^_Checker, rec: []u8, off: i64) -> _Check {
 	for kp, i in ([2]journal.Key_Provider{k.skey, k.tree}) {
 		if kp.key == nil {
 			continue
+		}
+		if journal.is_sig(body) {
+			if tag, ok := journal.sig_tag(body, off, kp); ok && string(tag[:]) == string(rec[4:journal.HEADER]) {
+				return .Ok
+			}
 		}
 		resize(&k.scratch, len(rec))
 		copy(k.scratch[:], rec)
@@ -705,7 +815,7 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 			pos += size
 		}
 		if held {
-			rm.keys_wait = true
+			_keys_needed(r, rm)
 			return 0, pos, 0, false
 		}
 		if !final {
@@ -738,7 +848,7 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 		case .Bad:
 			return pos, len(data), 0, true
 		case .Unknown:
-			rm.keys_wait = true
+			_keys_needed(r, rm)
 			return pos, len(data), 0, false
 		}
 		pos = start
@@ -751,9 +861,14 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	defer _leave(r)
 	id := stream_id(scope, device, name, epoch)
 	rm, ok := r.remotes[id]
-	if !ok || !rm.keys_wait {
+	if !ok {
 		return
 	}
+	if !rm.keys_wait {
+		_pending_apply(r, rm)
+		return
+	}
+	_pending_apply(r, rm)
 	rm.keys_wait = false
 	if r.phase == .Ready {
 		_remote_pull(r, rm)

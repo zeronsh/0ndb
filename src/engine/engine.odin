@@ -120,6 +120,7 @@ Event_Kind :: enum u8 {
 	Space_Joined,
 	Object_Seen,
 	Failure,
+	Relay_Misbehaving,
 }
 
 Event :: struct {
@@ -260,6 +261,7 @@ Engine :: struct {
 	db_open:      bool,
 	pack_more:    bool,
 	purged:       [dynamic]Rid,
+	redact_tick:  u64,
 	plug:         Plug_State,
 	content:      Content_State,
 	card_pubs:    [dynamic]Card_Pub,
@@ -624,6 +626,7 @@ _tick_end :: proc(e: ^Engine) {
 	_subs_deliver(e)
 	_index_step(e)
 	_handles_commit(e)
+	_index_durable_advanced(e)
 	_handles_sweep(e, e.cfg.handle_cache)
 	_durable_begin(e)
 	if e.pk_open && e.pk.poisoned && e.fatal == .None {
@@ -674,6 +677,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 		return
 	}
 
+	_redact_settle(e)
 	_mounts_settle(e)
 	_index_settle(e)
 	_checkpoints_write(e)

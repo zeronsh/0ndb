@@ -1,6 +1,7 @@
 package fs
 
 import "base:runtime"
+import "core:hash/xxhash"
 import "core:mem/virtual"
 import "core:strconv"
 import "../crdt"
@@ -75,6 +76,45 @@ Registry :: struct {
 	watcher:   Watcher,
 	random:    prim.Random,
 	os_ready:  bool,
+	boot:      prim.Id,
+}
+
+@(private)
+UNATTRIBUTED_PREFIX :: [8]u8{'0', 'n', 'd', 'b', '-', 'u', 'n', 'a'}
+
+unattributed_actor :: proc(device: prim.Id) -> (id: prim.Id) {
+	p := UNATTRIBUTED_PREFIX
+	copy(id[:8], p[:])
+	d := device
+	prim.put_u64le(id[8:16], xxhash.XXH3_64_with_seed(d[:], 0x756e61))
+	return
+}
+
+is_unattributed :: proc "contextless" (id: prim.Id) -> bool {
+	p := UNATTRIBUTED_PREFIX
+	x := id
+	return string(x[:8]) == string(p[:])
+}
+
+registry_set_boot :: proc(reg: ^Registry, boot: prim.Id) {
+	reg.boot = boot
+}
+
+@(private)
+BOOT_ID_PATH :: "/proc/sys/kernel/random/boot_id"
+
+@(private)
+registry_boot :: proc(reg: ^Registry) -> prim.Id {
+	if reg.boot == {} {
+		data, err := prim.read_file(reg.vfs, BOOT_ID_PATH, context.temp_allocator)
+		if err == .None && len(data) > 0 {
+			id: prim.Id
+			prim.put_u64le(id[0:8], xxhash.XXH3_64_with_seed(data, 1))
+			prim.put_u64le(id[8:16], xxhash.XXH3_64_with_seed(data, 2))
+			reg.boot = id
+		}
+	}
+	return reg.boot
 }
 
 Watcher :: struct {
@@ -236,7 +276,11 @@ Mount :: struct {
 	img:         Mount_Image,
 	mat:         ^Mat_Sync,
 	merge_base:  Version,
-	attrib:      map[string]prim.Id,
+	attrib:      map[string]Attrib,
+	log_fd:      prim.Fd,
+	log_len:     i64,
+	lost:        bool,
+	clean:       bool,
 	waits:       [dynamic]Mount_Wait,
 	open_scopes: map[string]^Scope,
 	intents:     [dynamic]Intent,
@@ -342,6 +386,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		actor     = actor,
 		opts      = opts,
 		lock_fd   = prim.INVALID_FD,
+		log_fd    = prim.INVALID_FD,
 		root_wd   = -1,
 		slot      = -1,
 	}
@@ -367,8 +412,9 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.lock_fd = fd
 	m.git, m.has_git = git_locate(m.vfs, m.root, allocator)
 	m.waits = make([dynamic]Mount_Wait, allocator)
-	m.attrib = make(map[string]prim.Id, allocator)
+	m.attrib = make(map[string]Attrib, allocator)
 	fresh := load_mount_state(m) or_return
+	attrib_log_open(m) or_return
 	image_take(m, &m.img)
 	if h != nil {
 		append(&h.mounts, m)
@@ -389,6 +435,8 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.slot = slot
 	mount_wake(m) or_return
 	m.shadow.hold = mount_deferred(m)
+	m.clean = false
+	save_mount_state(m) or_return
 	mount_git_sources(m) or_return
 	if fresh {
 		save_mount_state(m) or_return
@@ -402,6 +450,10 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		mount_pass(m, true) or_return
 	}
 	mount_materialize(m) or_return
+	if m.lost {
+		m.lost = false
+		save_mount_state(m) or_return
+	}
 	ok = true
 	mount_touch(m)
 	return .None
@@ -463,6 +515,14 @@ mount_close :: proc(m: ^Mount) {
 		mount_pass(m, false)
 	}
 	mount_hibernate(m)
+	if m.lock_fd >= 0 && m.dir != "" {
+		m.clean = true
+		save_mount_state(m)
+	}
+	if m.log_fd >= 0 {
+		prim.close_file(m.vfs, m.log_fd)
+		m.log_fd = prim.INVALID_FD
+	}
 	if m.shadow.dir != "" {
 		shadow_close(&m.shadow)
 	}
@@ -696,11 +756,85 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 		k, _ := clone_string(rel, m.allocator)
 		m.open_scopes[k] = scope
 	}
-	if a, ok := m.attrib[rel]; ok && a == scope.actor {
+	if a, ok := m.attrib[rel]; ok && a.actor == scope.actor && !a.used {
 		return .None
 	}
 	attrib_set(m, rel, scope.actor)
-	return save_mount_state(m)
+	return attrib_log_append(m, rel, scope.actor)
+}
+
+@(private)
+ATTRIB_LOG :: "attrib.log"
+
+@(private)
+attrib_log_open :: proc(m: ^Mount) -> Error {
+	p, _ := path_join(m.dir, ATTRIB_LOG, context.temp_allocator)
+	fd, err := prim.open_file(m.vfs, p, {.Write, .Create}, 0o600)
+	if err != .None {
+		return from_prim(err)
+	}
+	m.log_fd = fd
+	size, serr := prim.file_size(m.vfs, fd)
+	if serr != .None {
+		return from_prim(serr)
+	}
+	if size == 0 {
+		return .None
+	}
+	data := make([]u8, int(size), context.temp_allocator)
+	got, rerr := prim.read_at(m.vfs, fd, data, 0)
+	if rerr != .None {
+		return from_prim(rerr)
+	}
+	pos := 0
+	for pos + 8 <= got {
+		n := int(prim.get_u32le(data[pos:]))
+		if n <= 0 || pos + 8 + n > got {
+			break
+		}
+		body := data[pos + 8:][:n]
+		if u32(xxhash.XXH3_64_default(body)) != prim.get_u32le(data[pos + 4:]) {
+			break
+		}
+		rd := prim.reader(body)
+		path := prim.read_str(&rd)
+		actor := prim.read_id(&rd)
+		if !prim.reader_ok(&rd) {
+			break
+		}
+		attrib_set(m, path, actor)
+		pos += 8 + n
+	}
+	m.log_len = i64(pos)
+	return .None
+}
+
+@(private)
+attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id) -> Error {
+	if m.log_fd < 0 {
+		return save_mount_state(m)
+	}
+	body := make([dynamic]u8, context.temp_allocator)
+	w := prim.writer(&body)
+	prim.write_str(&w, rel)
+	prim.write_id(&w, actor)
+	rec := make([]u8, 8 + len(body), context.temp_allocator)
+	prim.put_u32le(rec[0:4], u32(len(body)))
+	prim.put_u32le(rec[4:8], u32(xxhash.XXH3_64_default(body[:])))
+	copy(rec[8:], body[:])
+	from_prim(prim.write_at(m.vfs, m.log_fd, rec, m.log_len)) or_return
+	m.log_len += i64(len(rec))
+	return .None
+}
+
+@(private)
+attrib_log_reset :: proc(m: ^Mount) {
+	if m.log_fd < 0 || m.log_len == 0 {
+		return
+	}
+	if prim.truncate(m.vfs, m.log_fd, 0) == .None {
+		m.log_len = 0
+	}
 }
 
 mount_closed :: proc(m: ^Mount, rel: string) {
@@ -930,8 +1064,21 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 				}
 			}
 			save_mount_state(sm)
-		} else if s.mount.db != nil {
-			_, err = mount_commit(s.mount, {message = "0ndb: scope"})
+		} else {
+			sm := s.mount
+			drop := make([dynamic]string, context.temp_allocator)
+			for k, a in sm.attrib {
+				if o := sm.open_scopes[k]; !a.used && a.actor == s.actor && k not_in sm.dirty && (o == nil || o == s) {
+					append(&drop, k)
+				}
+			}
+			for k in drop {
+				key, _ := delete_key(&sm.attrib, k)
+				delete(key, sm.allocator)
+			}
+			if sm.db != nil {
+				_, err = mount_commit(sm, {message = "0ndb: scope"})
+			}
 		}
 	}
 	for x, i in reg.scopes {
@@ -1021,9 +1168,19 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		for _ in 0 ..< na {
 			k := prim.read_str(&rd)
 			a := prim.read_id(&rd)
+			used := prim.read_bool(&rd)
 			if prim.reader_ok(&rd) {
-				attrib_set(m, k, a)
+				attrib_set(m, k, a, used)
 			}
+		}
+	}
+	if prim.reader_remaining(&rd) > 0 {
+		boot := prim.read_id(&rd)
+		clean := prim.read_bool(&rd)
+		was_lost := prim.read_bool(&rd) if prim.reader_remaining(&rd) > 0 else false
+		if prim.reader_ok(&rd) {
+			now := registry_boot(m.reg)
+			m.lost = was_lost || (!clean && (boot != now || now == {}))
 		}
 	}
 	if !prim.reader_ok(&rd) {
@@ -1080,13 +1237,19 @@ shadow_flush :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id) {
+Attrib :: struct {
+	actor: prim.Id,
+	used:  bool,
+}
+
+@(private)
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false) {
 	if p, ok := &m.attrib[path]; ok {
-		p^ = actor
+		p^ = Attrib{actor, used}
 		return
 	}
 	k, _ := clone_string(path, m.allocator)
-	m.attrib[k] = actor
+	m.attrib[k] = Attrib{actor, used}
 }
 
 @(private)
@@ -1095,8 +1258,8 @@ attrib_prune :: proc(m: ^Mount) {
 		return
 	}
 	drop := make([dynamic]string, context.temp_allocator)
-	for k in m.attrib {
-		if k not_in m.dirty && k not_in m.open_scopes {
+	for k, a in m.attrib {
+		if a.used && k not_in m.dirty && m.open_scopes[k] == nil {
 			append(&drop, k)
 		}
 	}
@@ -1197,11 +1360,19 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_bool(&w, img.imported)
 	prim.write_uvarint(&w, u64(len(m.attrib)))
 	for k in sorted_strings(m.attrib) {
+		a := m.attrib[k]
 		prim.write_str(&w, k)
-		prim.write_id(&w, m.attrib[k])
+		prim.write_id(&w, a.actor)
+		prim.write_bool(&w, a.used)
 	}
+	boot := registry_boot(m.reg) if m.reg != nil else prim.Id{}
+	prim.write_id(&w, boot)
+	prim.write_bool(&w, m.clean)
+	prim.write_bool(&w, m.lost)
 	p, _ := path_join(m.dir, "mount", context.temp_allocator)
-	return from_prim(prim.replace_atomic(m.vfs, p, buf[:]))
+	from_prim(prim.replace_atomic(m.vfs, p, buf[:])) or_return
+	attrib_log_reset(m)
+	return .None
 }
 
 mount_recover :: proc(m: ^Mount) -> Error {

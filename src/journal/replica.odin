@@ -66,14 +66,77 @@ replica_open :: proc(rep: ^Replica, vfs: prim.Vfs, path: string, allocator := co
 	return .None
 }
 
-replica_redact :: proc(rep: ^Replica, from, to: i64) -> Error {
+replica_redact :: proc(rep: ^Replica, from, to: i64, keys: Key_Provider) -> Error {
 	t := _target(rep)
+	t.keys = keys
 	err := _redact(&t, rep.redact, from, to)
 	if err == .Missing {
 		rep.missing = t.missing
 	}
 	rep.version += 1
 	return err
+}
+
+replica_forget :: proc(rep: ^Replica, from, to: i64) -> Error {
+	if from < 0 || to < from {
+		return .Bad_Offset
+	}
+	if from == to {
+		return .None
+	}
+	if err := _remove_range(&rep.have, {from, to}); err != .None {
+		return err
+	}
+	rep.version += 1
+	if err := _save_have(rep); err != .None {
+		return err
+	}
+	size, serr := prim.file_size(rep.vfs, rep.fd)
+	if serr != .None {
+		return _err(serr)
+	}
+	stop := min(to, size)
+	if stop > from {
+		if err := prim.zero_range(rep.vfs, rep.fd, from, stop - from); err != .None {
+			return _err(err)
+		}
+		if err := prim.datasync(rep.vfs, rep.fd); err != .None {
+			return _err(err)
+		}
+	}
+	return .None
+}
+
+@(private)
+_remove_range :: proc(have: ^[dynamic]Range, cut: Range) -> Error {
+	i := 0
+	for i < len(have) {
+		h := have[i]
+		if h.to <= cut.from || h.from >= cut.to {
+			i += 1
+			continue
+		}
+		left := Range{h.from, cut.from}
+		right := Range{cut.to, h.to}
+		switch {
+		case left.from < left.to && right.from < right.to:
+			have[i] = left
+			if _, err := inject_at(have, i + 1, right); err != nil {
+				have[i] = h
+				return .No_Memory
+			}
+			i += 2
+		case left.from < left.to:
+			have[i] = left
+			i += 1
+		case right.from < right.to:
+			have[i] = right
+			i += 1
+		case:
+			ordered_remove(have, i)
+		}
+	}
+	return .None
 }
 
 @(private)

@@ -251,9 +251,17 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 
 @(private)
 _redact_intent :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64, target: i64 = -1) -> Error {
-	k, n := _relay_key(e, h.sp.id, h.id, device, from)
+	return _redact_intent_at(e, h.sp.id, h.id, h.kind, device, from, to, target)
+}
+
+@(private)
+_redact_intent_at :: proc(e: ^Engine, space: prim.Id, object: prim.Id, kind: Kind, device: prim.Id, from, to: i64, target: i64 = -1) -> Error {
+	k, n := _relay_key(e, space, object, device, from)
+	if _, found, _ := omap.db_get(&e.reg.db, ROOT_REDACT, k[:n], context.temp_allocator); found && target < 0 {
+		return .None
+	}
 	v: [17]u8
-	v[0] = u8(h.kind)
+	v[0] = u8(kind)
 	prim.put_u64le(v[1:9], u64(to))
 	vn := 9
 	if target >= 0 {
@@ -330,7 +338,7 @@ _redact_recover :: proc(e: ^Engine) {
 	list := make([dynamic]Pending, context.temp_allocator)
 	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		l := (^[dynamic]Pending)(data)
-		if len(key) != 40 || (len(value) != 9 && len(value) != 17) || value[0] < 1 || value[0] > u8(max(Kind)) {
+		if len(key) != 40 || (len(value) != 9 && len(value) != 17) || value[0] & 0x80 != 0 || value[0] < 1 || value[0] > u8(max(Kind)) {
 			return true
 		}
 		p := Pending{kind = Kind(value[0]), from = i64(prim.get_u64le(key[32:40])), to = i64(prim.get_u64le(value[1:9])), target = -1}
@@ -356,6 +364,35 @@ _redact_recover :: proc(e: ^Engine) {
 }
 
 @(private)
+_redact_settle :: proc(e: ^Engine) {
+	if e.tick == e.redact_tick {
+		return
+	}
+	e.redact_tick = e.tick
+	_redact_recover(e)
+}
+
+@(private)
+_redact_mark_done :: proc(e: ^Engine, key: []u8) {
+	v, found, gerr := omap.db_get(&e.reg.db, ROOT_REDACT, key, context.temp_allocator)
+	if gerr != .None || !found || len(v) < 1 || v[0] & 0x80 != 0 {
+		return
+	}
+	nv := make([]u8, len(v), context.temp_allocator)
+	copy(nv, v)
+	nv[0] |= 0x80
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		return
+	}
+	if omap.txn_put(t, ROOT_REDACT, key, nv) != .None {
+		omap.txn_abort(t)
+		return
+	}
+	omap.txn_commit(t)
+}
+
+@(private)
 _redact_finish :: proc(e: ^Engine, h: ^Handle, from, to: i64, target: i64) {
 	r: ^journal.Reader
 	#partial switch h.kind {
@@ -376,6 +413,8 @@ _redact_finish :: proc(e: ^Engine, h: ^Handle, from, to: i64, target: i64) {
 	_, _, je := journal.record_at(r, from)
 	if je == .Redacted {
 		_own_puncture(e, h, from, to)
+		k, n := _relay_key(e, h.sp.id, h.id, e.self, from)
+		_redact_mark_done(e, k[:n])
 		return
 	}
 	if je != .None {
@@ -386,14 +425,14 @@ _redact_finish :: proc(e: ^Engine, h: ^Handle, from, to: i64, target: i64) {
 		w := &h.cw.core
 		tv := obj.Vref{w.seg, target} if target >= 0 else obj.Vref{}
 		if convo.writer_redact_range(&h.cw, obj.Vref{w.seg, from}, to, tv) == .None {
-			_own_puncture(e, h, from, to)
+			_own_redacted(e, h, from, to)
 			_handle_mark(h)
 			_derived_purge(e, h)
 		}
 	case .Map:
 		w := &h.mw.core
 		if _, werr := obj.writer_redact(w, obj.Vref{w.seg, from}, to, {}); werr == .None {
-			_own_puncture(e, h, from, to)
+			_own_redacted(e, h, from, to)
 			_handle_mark(h)
 			_derived_purge(e, h)
 		}
@@ -428,6 +467,9 @@ _relay_redact_add :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64
 	if _, found, _ := omap.db_get(&e.reg.db, ROOT_REDACT, k[:n], context.temp_allocator); !found {
 		_redact_intent(e, h, device, from, to)
 	}
+	if device == e.self {
+		_redact_mark_done(e, k[:n])
+	}
 	if h.sp.repl_on && h.sp.connected {
 		osync.replicator_redact(&h.sp.repl, &h.scope, device, h.name, 0, from, to)
 	}
@@ -444,7 +486,7 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 	acc := Acc{e, sp, object}
 	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		a := (^Acc)(data)
-		if (len(key) != 40 && len(key) != 56) || (len(value) != 9 && len(value) != 17) || value[0] < 1 || value[0] > u8(max(Kind)) {
+		if (len(key) != 40 && len(key) != 56) || (len(value) != 9 && len(value) != 17) || value[0] & 0x7f < 1 || value[0] & 0x7f > u8(max(Kind)) {
 			return true
 		}
 		id: prim.Id
@@ -457,7 +499,7 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 		to := i64(prim.get_u64le(value[1:9]))
 		sc := _object_scope(a.sp, id)
 		defer osync.scope_clear(&sc)
-		name := _seg_name(Kind(value[0]), id)
+		name := _seg_name(Kind(value[0] & 0x7f), id)
 		osync.replicator_redact(&a.sp.repl, &sc, device, name, 0, from, to)
 		return true
 	}
@@ -569,6 +611,9 @@ _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, t
 	if !found || (kind != .Conversation && kind != .Map) {
 		return
 	}
+	if _redact_intent_at(e, sp.id, id, kind, e.self, from, to) != .None {
+		return
+	}
 	h, herr := _handle_get(e, Object{sp.id, id}, kind)
 	if herr != .None || !h.w_open {
 		return
@@ -654,6 +699,9 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 		}
 	}
 	if dev == e.self {
+		if _redact_intent(e, h, e.self, from.off, r.to, target.off if !obj.vref_none(target) && target.seg == from.seg else -1) != .None {
+			return .None
+		}
 		if !h.w_open {
 			return .None
 		}
@@ -671,9 +719,6 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 			return .None
 		}
 		if _, _, je := journal.record_at(&w.jr, from.off); je != .Redacted {
-			if _redact_intent(e, h, e.self, from.off, r.to, target.off if !obj.vref_none(target) && target.seg == from.seg else -1) != .None {
-				return .None
-			}
 			werr: obj.Error
 			if h.kind == .Conversation {
 				werr = convo.writer_redact_range(&h.cw, from, r.to, target)
@@ -847,4 +892,28 @@ _hist_admit_redacted :: proc(e: ^Engine, h: ^Handle, s: ^Seg, off: i64) -> fs.Er
 		return .Not_Found
 	}
 	return .None
+}
+
+@(private)
+_publish_later :: proc(e: ^Engine, d: ^Dirty_Seg) {
+	for &x in e.dirty {
+		if x.object == d.object {
+			x.keys ||= d.keys
+			x.length = max(x.length, d.length)
+			if len(x.path) == 0 && len(d.path) > 0 {
+				x.path = _clone(d.path, e.allocator) or_else ""
+			}
+			if x.tree == nil && d.tree != nil {
+				d.tree.refs += 1
+				x.tree = d.tree
+			}
+			_touch(e)
+			return
+		}
+	}
+	if d.tree != nil {
+		d.tree.refs += 1
+	}
+	append(&e.dirty, Dirty_Seg{space = d.space, object = d.object, kind = d.kind, scope = d.scope, name = _clone(d.name, e.allocator) or_else "", path = _clone(d.path, e.allocator) or_else "", length = d.length, tree = d.tree, keys = d.keys})
+	_touch(e)
 }

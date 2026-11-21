@@ -74,6 +74,8 @@ _index_open :: proc(e: ^Engine) -> Error {
 	opts.embedder = e.cfg.embedder
 	opts.kind_names = KIND_NAMES[:]
 	opts.budget = e.cfg.search_budget
+	opts.durable = _index_durable
+	opts.durable_data = e
 	if opts.cache_pages == 0 {
 		opts.cache_pages = 32
 	}
@@ -109,18 +111,35 @@ _index_all :: proc(e: ^Engine) {
 }
 
 @(private)
-_index_close :: proc(e: ^Engine) {
+_index_close :: proc(e: ^Engine) -> bool {
 	if !e.index_open {
-		return
+		return true
 	}
-	search.flush(&e.index)
+	if search.flush(&e.index) == .Busy && !e.closing {
+		return false
+	}
 	search.close(&e.index)
 	e.index_open = false
+	return true
 }
 
 @(private)
 _index_settle :: proc(e: ^Engine) {
-	_index_close(e)
+	if !_index_close(e) && e.settle_timer == 0 {
+		e.settle_timer = prim.timer(e.loop, e.cfg.settle_ms, e, _on_settle)
+	}
+}
+
+@(private)
+_index_durable :: proc(data: rawptr, source: prim.Id) -> i64 {
+	return max(i64)
+}
+
+@(private)
+_index_durable_advanced :: proc(e: ^Engine) {
+	if e.index_open {
+		search.durable_advanced(&e.index)
+	}
 }
 
 @(private)

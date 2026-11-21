@@ -496,6 +496,10 @@ _publish :: proc(e: ^Engine, d: ^Dirty_Seg) {
 	if !ok || !sp.repl_on {
 		return
 	}
+	if d.tree != nil && d.tree.dirty {
+		_publish_later(e, d)
+		return
+	}
 	if d.keys && d.tree != nil {
 		if err := osync.replicator_publish_keys(&sp.repl, &d.scope, d.name, &d.tree.tree); err != .None {
 			_log(e, .Warn, "keys publish failed")

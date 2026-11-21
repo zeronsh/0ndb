@@ -776,7 +776,6 @@ writer_redact_plan :: proc(w: ^Writer, msg: Rid, allocator := context.allocator)
 }
 
 writer_redact_range :: proc(w: ^Writer, from: Vref, to: i64, target: Vref) -> Error {
-	_prepare(w, false) or_return
 	return _redact_record(w, from, to, target)
 }
 
@@ -1319,19 +1318,33 @@ _prepare :: proc(w: ^Writer, force: bool) -> Error {
 	if !changed {
 		return .None
 	}
+	complete := true
 	for s in 0 ..< len(v.segs) {
 		if s == w.core.seg {
 			continue
 		}
-		sum, ok := _tail(v, s) or_return
+		sum, ok, te := _tail(v, s)
+		if te == .Missing {
+			complete = false
+			continue
+		}
+		if te != .None {
+			return te
+		}
 		if ok {
 			obj.observe(&w.core, sum.tip_hlc)
 			obj.observe(&w.core, sum.leaf_hlc)
 		}
 	}
-	_ack_pending(w) or_return
-	for s in 0 ..< len(v.segs) {
-		w.seen[s] = obj.end(v, s)
+	if e := _ack_pending(w); e == .Missing {
+		complete = false
+	} else if e != .None {
+		return e
+	}
+	if complete {
+		for s in 0 ..< len(v.segs) {
+			w.seen[s] = obj.end(v, s)
+		}
 	}
 	return .None
 }

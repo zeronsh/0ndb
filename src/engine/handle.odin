@@ -123,6 +123,14 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 		return x, .None
 	}
 	sp := _space_open(e, o.space) or_return
+	if x, ok := e.handles[o.id]; ok {
+		if x.kind != kind || x.sp.id != o.space {
+			return nil, .Invalid
+		}
+		x.used = e.tick
+		_lru_touch(e, x)
+		return x, .None
+	}
 	rec, found := _rec_get(e, o.id) or_return
 	if found && (rec.space != o.space || rec.kind != kind) {
 		return nil, .Invalid
