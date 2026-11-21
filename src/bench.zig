@@ -241,10 +241,11 @@ fn generateGitRepo(allocator: Allocator, io: Io, repo_dir: []const u8, file_coun
 
     const cmds = [_][]const []const u8{
         &.{ "git", "init", "-q" },
+        &.{ "git", "config", "gc.auto", "0" },
         &.{ "git", "config", "user.email", "bench@0ndb.local" },
         &.{ "git", "config", "user.name", "0ndb-bench" },
         &.{ "git", "add", "." },
-        &.{ "git", "commit", "-q", "-m", "initial bench repo" },
+        &.{ "git", "-c", "gc.auto=0", "commit", "-q", "-m", "initial bench repo" },
         &.{ "git", "gc", "--quiet" },
     };
     for (cmds) |argv| {
@@ -1170,7 +1171,10 @@ pub fn runBenchAgents(
             .{ .space_id = api_id, .alias = @constCast("api"), .access = .shared_rw },
             .{ .space_id = web_id, .alias = @constCast("web"), .access = .shared_rw },
         };
-        const initial_max_tokens: u64 = 1_000_000;
+        const sub_u64: u64 = @intCast(subordinates);
+        const initial_max_tokens: u64 = @max(@as(u64, 200_000), (sub_u64 + 4) * 25_000);
+        const initial_max_cost_microusd: u64 = @max(@as(u64, 200_000), (sub_u64 + 4) * 2_000_000);
+        const initial_max_wall_ms: u64 = @max(@as(u64, 600_000), (sub_u64 + 4) * 60_000);
         const per_worker_carve: u64 = 10_000;
         const per_worker_used: u64 = 2_500;
 
@@ -1181,10 +1185,10 @@ pub fn runBenchAgents(
             .provider_id = .mock,
             .budget = .{
                 .max_tokens = initial_max_tokens,
-                .max_cost_microusd = 100_000_000,
-                .max_wall_ms = 600_000,
+                .max_cost_microusd = initial_max_cost_microusd,
+                .max_wall_ms = initial_max_wall_ms,
                 .max_depth = 4,
-                .max_children = @intCast(subordinates + 8),
+                .max_children = std.math.cast(u16, subordinates + 8) orelse std.math.maxInt(u16),
             },
         });
         defer cap_meta.deinit(allocator);

@@ -46,6 +46,7 @@ interface Store {
   active: Session | null
   queue: QueueItem[]
   workspaceTick: number
+  v2Tick: number
   fileActivity: Record<string, FileActivity>
   fileFeed: { path: string; act: FileActivity }[]
   conn: Conn
@@ -156,6 +157,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [live, setLive] = useState<Record<string, LiveTrace>>({})
   const [workspaceTick, setWorkspaceTick] = useState(0)
+  const [v2Tick, setV2Tick] = useState(0)
   const [fileActivity, setFileActivity] = useState<Record<string, FileActivity>>({})
   const [fileFeed, setFileFeed] = useState<{ path: string; act: FileActivity }[]>([])
   const [conn, setConn] = useState<Conn>('connecting')
@@ -506,6 +508,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               30,
             )
             break
+          case 'v2_updated':
+          case 'v2_trigger_fired':
+            h.debounce(
+              'v2Tick',
+              () => {
+                startTransition(() => setV2Tick(x => x + 1))
+              },
+              60,
+            )
+            break
           case 'turn_delta': {
             const d = msg
             const key = d.msg_id ?? `live:${d.thread_id}`
@@ -554,6 +566,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       active,
       queue,
       workspaceTick,
+      v2Tick,
       fileActivity,
       fileFeed,
       conn,
@@ -583,6 +596,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       active,
       queue,
       workspaceTick,
+      v2Tick,
       fileActivity,
       fileFeed,
       conn,

@@ -41,9 +41,11 @@ import {
   type V2TimelineEntry,
 } from '@/lib/api'
 import { bytes } from '@/lib/format'
+import { useStore } from '@/lib/store'
 import {
   formatBudgetSummary,
   groupThreadsByHierarchy,
+  resolveForkActionProjectId,
   spaceStateBadgeVariant,
   summarizeHealth,
   taskStatusBadgeVariant,
@@ -57,6 +59,7 @@ import { Button } from '../ui/button'
 type V2Section = 'spaces' | 'threads' | 'captain'
 
 export function V2Workspace() {
+  const { v2Tick } = useStore()
   const [section, setSection] = useState<V2Section>('spaces')
   const [health, setHealth] = useState<V2Health | null>(null)
   const [projects, setProjects] = useState<V2Project[]>([])
@@ -82,6 +85,8 @@ export function V2Workspace() {
   const [newSpacePath, setNewSpacePath] = useState('')
   const [newProjectName, setNewProjectName] = useState('')
   const [newProjectSpaces, setNewProjectSpaces] = useState<string[]>([])
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
+  const [forkProjectByOrigin, setForkProjectByOrigin] = useState<Record<string, string>>({})
 
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
   const [threadDetail, setThreadDetail] = useState<V2ThreadDetail | null>(null)
@@ -163,6 +168,13 @@ export function V2Workspace() {
   useEffect(() => {
     if (selectedThreadId) loadThreadDetail(selectedThreadId)
   }, [selectedThreadId, loadThreadDetail])
+
+  useEffect(() => {
+    if (v2Tick === 0) return
+    void refreshAll()
+    if (selectedSpaceId) void loadSpaceDetails(selectedSpaceId)
+    if (selectedThreadId) void loadThreadDetail(selectedThreadId)
+  }, [v2Tick, refreshAll, selectedSpaceId, loadSpaceDetails, selectedThreadId, loadThreadDetail])
 
   const selectedSpace = useMemo(
     () => spaces.find(s => s.space_id === selectedSpaceId) ?? null,
@@ -483,11 +495,27 @@ export function V2Workspace() {
                 ) : null}
               </div>
               <div className="space-y-2">
-                {projects.map(p => (
-                  <div key={p.project_id} className="rounded-xl border border-border bg-card p-3 space-y-2">
+                {projects.map(p => {
+                  const projectSpaceIds = p.spaces.map(sr => sr.space_id)
+                  const isForkProject = projectSpaceIds.some(sid => Boolean(spaces.find(s => s.space_id === sid)?.origin_space_id))
+                  const actionProjectId = resolveForkActionProjectId(p.project_id, projectSpaceIds, spaces, forkProjectByOrigin)
+                  return (
+                  <div
+                    key={p.project_id}
+                    onClick={() => setSelectedProjectId(p.project_id)}
+                    className={cn(
+                      'cursor-pointer rounded-xl border p-3 space-y-2 transition-colors',
+                      selectedProjectId === p.project_id
+                        ? 'border-primary/60 bg-primary/5'
+                        : 'border-border bg-card hover:bg-accent/30',
+                    )}
+                  >
                     <div className="flex items-center justify-between gap-2">
                       <span className="truncate text-[13px] font-medium">{p.name}</span>
-                      <Badge variant="mono">{p.spaces.length} spaces</Badge>
+                      <div className="flex items-center gap-1">
+                        {isForkProject ? <Badge variant="violet">fork</Badge> : null}
+                        <Badge variant="mono">{p.spaces.length} spaces</Badge>
+                      </div>
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {p.spaces.map(sr => (
@@ -496,7 +524,7 @@ export function V2Workspace() {
                         </Badge>
                       ))}
                     </div>
-                    <div className="flex gap-1.5">
+                    <div className="flex gap-1.5" onClick={e => e.stopPropagation()}>
                       <Button
                         variant="outline"
                         size="sm"
@@ -504,7 +532,12 @@ export function V2Workspace() {
                         onClick={async () => {
                           try {
                             const r = await apiV2.forkProject(p.project_id, 'fork')
-                            toast.success(`Forked ${r.forked_space_ids.length} space(s)`)
+                            if (r.fork_project_id) {
+                              setSelectedProjectId(r.fork_project_id)
+                              setForkProjectByOrigin(cur => ({ ...cur, [p.project_id]: r.fork_project_id }))
+                            }
+                            if (r.forked_space_ids[0]) setSelectedSpaceId(r.forked_space_ids[0])
+                            toast.success(`Forked ${r.forked_space_ids.length} space(s) into ${r.project?.name ?? 'fork project'}`)
                             await refreshAll()
                           } catch (e) {
                             toast.error(e instanceof Error ? e.message : 'Fork failed')
@@ -519,7 +552,7 @@ export function V2Workspace() {
                         className="h-6 px-2 text-[11px]"
                         onClick={async () => {
                           try {
-                            const r = await apiV2.syncProject(p.project_id)
+                            const r = await apiV2.syncProject(actionProjectId)
                             toast.success(`Synced ${r.synced.length} fork(s)`)
                             await refreshAll()
                           } catch (e) {
@@ -535,7 +568,7 @@ export function V2Workspace() {
                         className="h-6 px-2 text-[11px]"
                         onClick={async () => {
                           try {
-                            const r = await apiV2.landProject(p.project_id)
+                            const r = await apiV2.landProject(actionProjectId)
                             toast.success(r.aborted ? `Aborted (${r.failures.length} issue)` : `Landed ${r.entries.length} space(s)`)
                             await refreshAll()
                           } catch (e) {
@@ -547,7 +580,8 @@ export function V2Workspace() {
                       </Button>
                     </div>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             </section>
 
@@ -976,9 +1010,13 @@ export function V2Workspace() {
                         <span className="text-primary">{b.access}</span>
                         <button
                           onClick={async () => {
-                            await apiV2.unbindSpace(threadDetail.thread.thread_id, b.space_id)
-                            await loadThreadDetail(threadDetail.thread.thread_id)
-                            await refreshAll()
+                            try {
+                              await apiV2.unbindSpace(threadDetail.thread.thread_id, b.space_id)
+                              await loadThreadDetail(threadDetail.thread.thread_id)
+                              await refreshAll()
+                            } catch (err) {
+                              toast.error(err instanceof Error ? err.message : 'Unbind space failed')
+                            }
                           }}
                           className="ml-0.5 text-muted-foreground hover:text-destructive"
                         >
@@ -1206,9 +1244,13 @@ export function V2Workspace() {
                   size="sm"
                   className="h-7 text-[11px]"
                   onClick={async () => {
-                    await apiV2.postMailbox(threadDetail.thread.thread_id, { action: 'drain' })
-                    toast.success('Drained mailbox')
-                    await loadThreadDetail(threadDetail.thread.thread_id)
+                    try {
+                      await apiV2.drainMailbox(threadDetail.thread.thread_id)
+                      toast.success('Drained mailbox')
+                      await loadThreadDetail(threadDetail.thread.thread_id)
+                    } catch (err) {
+                      toast.error(err instanceof Error ? err.message : 'Drain mailbox failed')
+                    }
                   }}
                 >
                   Drain
@@ -1239,9 +1281,13 @@ export function V2Workspace() {
                     className="h-8 px-2.5 text-[12px]"
                     onClick={async () => {
                       if (!mailboxPayload.trim()) return
-                      await apiV2.postMailbox(threadDetail.thread.thread_id, { kind: mailboxKind, payload: mailboxPayload.trim() })
-                      setMailboxPayload('')
-                      await loadThreadDetail(threadDetail.thread.thread_id)
+                      try {
+                        await apiV2.postMailbox(threadDetail.thread.thread_id, { kind: mailboxKind, payload: mailboxPayload.trim() })
+                        setMailboxPayload('')
+                        await loadThreadDetail(threadDetail.thread.thread_id)
+                      } catch (err) {
+                        toast.error(err instanceof Error ? err.message : 'Post mailbox failed')
+                      }
                     }}
                   >
                     Post
@@ -1277,9 +1323,13 @@ export function V2Workspace() {
                   size="sm"
                   className="h-7 text-[11px]"
                   onClick={async () => {
-                    const r = await apiV2.pollTriggers(threadDetail.thread.thread_id)
-                    toast.success(`Polled: ${r.due.length} due trigger(s)`)
-                    await loadThreadDetail(threadDetail.thread.thread_id)
+                    try {
+                      const r = await apiV2.pollTriggers(threadDetail.thread.thread_id)
+                      toast.success(`Polled: ${r.due.length} due trigger(s)`)
+                      await loadThreadDetail(threadDetail.thread.thread_id)
+                    } catch (err) {
+                      toast.error(err instanceof Error ? err.message : 'Poll triggers failed')
+                    }
                   }}
                 >
                   Poll Due
@@ -1345,8 +1395,12 @@ export function V2Workspace() {
                             size="sm"
                             className="h-6 px-2 text-[10.5px]"
                             onClick={async () => {
-                              await apiV2.disableTrigger(threadDetail.thread.thread_id, tr.trigger_id)
-                              await loadThreadDetail(threadDetail.thread.thread_id)
+                              try {
+                                await apiV2.disableTrigger(threadDetail.thread.thread_id, tr.trigger_id)
+                                await loadThreadDetail(threadDetail.thread.thread_id)
+                              } catch (err) {
+                                toast.error(err instanceof Error ? err.message : 'Disable trigger failed')
+                              }
                             }}
                           >
                             Disable
