@@ -34,6 +34,7 @@ Loop :: struct {
 	timers:     [dynamic]_Timer_Slot,
 	free_timer: u32,
 	heap:       [dynamic]u32,
+	timer_seq:  u64,
 	pending:    [dynamic]u64,
 	wake_cb:    Wake_Proc,
 	wake_data:  rawptr,
@@ -66,6 +67,7 @@ _Slot :: struct {
 @(private)
 _Timer_Slot :: struct {
 	deadline:  i64,
+	seq:       u64,
 	data:      rawptr,
 	cb:        Timer_Proc,
 	gen:       u32,
@@ -315,6 +317,8 @@ timer_at :: proc(l: ^Loop, deadline_ns: i64, data: rawptr, cb: Timer_Proc) -> Ti
 	}
 	t := &l.timers[idx]
 	t.deadline = deadline_ns
+	t.seq = l.timer_seq
+	l.timer_seq += 1
 	t.data = data
 	t.cb = cb
 	t.pos = i32(len(l.heap) - 1)
@@ -484,10 +488,11 @@ _run_timers :: proc(l: ^Loop) {
 		return
 	}
 	now := loop_now_ns(l)
+	limit := l.timer_seq
 	for len(l.heap) > 0 && !loop_stopped(l) {
 		idx := l.heap[0]
 		t := &l.timers[idx]
-		if t.deadline > now {
+		if t.deadline > now || t.seq >= limit {
 			break
 		}
 		cb := t.cb
@@ -513,7 +518,12 @@ _timer_free :: proc(l: ^Loop, idx: u32) {
 
 @(private)
 _heap_less :: proc "contextless" (l: ^Loop, a, b: int) -> bool {
-	return l.timers[l.heap[a]].deadline < l.timers[l.heap[b]].deadline
+	ta := &l.timers[l.heap[a]]
+	tb := &l.timers[l.heap[b]]
+	if ta.deadline != tb.deadline {
+		return ta.deadline < tb.deadline
+	}
+	return ta.seq < tb.seq
 }
 
 @(private)
