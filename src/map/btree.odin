@@ -89,7 +89,22 @@ db_open :: proc(db: ^Db, vfs: prim.Vfs, path: string, allocator := context.alloc
 		fd        = prim.INVALID_FD,
 		allocator = allocator,
 	}
-	fd, oerr := prim.open_file(vfs, path, {.Write, .Create}, 0o600)
+	fd, oerr := prim.open_file(vfs, path, {.Write})
+	if oerr == .None {
+		size, serr := prim.file_size(vfs, fd)
+		if serr != .None {
+			prim.close_file(vfs, fd)
+			return obj.perr(serr)
+		}
+		if size == 0 {
+			prim.close_file(vfs, fd)
+			oerr = .Not_Found
+		}
+	}
+	if oerr == .Not_Found {
+		_db_init(vfs, path) or_return
+		fd, oerr = prim.open_file(vfs, path, {.Write})
+	}
 	if oerr != .None {
 		return obj.perr(oerr)
 	}
@@ -544,19 +559,6 @@ _db_load :: proc(db: ^Db) -> Error {
 	size, serr := prim.file_size(db.vfs, db.fd)
 	if serr != .None {
 		return obj.perr(serr)
-	}
-	if size == 0 {
-		m := Meta{
-			pages = 2,
-		}
-		_meta_write_slot(db.vfs, db.fd, &m, 0) or_return
-		m.txn = 1
-		_meta_write_slot(db.vfs, db.fd, &m, 1) or_return
-		if err := prim.datasync(db.vfs, db.fd); err != .None {
-			return obj.perr(err)
-		}
-		db.meta = m
-		return obj.perr(prim.sync_dir(db.vfs, prim.dir_name(db.path)))
 	}
 	best: Meta
 	found := false
@@ -1395,4 +1397,39 @@ _level_add_kid :: proc(b: ^Builder, t: ^Build_Tree, i: int, first: []u8, page: u
 
 db_poisoned :: proc "contextless" (db: ^Db) -> bool {
 	return db.poisoned
+}
+
+@(private)
+_db_init :: proc(vfs: prim.Vfs, path: string) -> Error {
+	buf: prim.Path_Buf
+	if len(path) + 5 >= len(buf) {
+		return .Invalid
+	}
+	n := copy(buf[:], path)
+	n += copy(buf[n:], ".init")
+	tmp := string(buf[:n])
+	fd, oerr := prim.open_file(vfs, tmp, {.Write, .Create, .Truncate}, 0o600)
+	if oerr != .None {
+		return obj.perr(oerr)
+	}
+	m := Meta{
+		pages = 2,
+	}
+	err := _meta_write_slot(vfs, fd, &m, 0)
+	if err == .None {
+		m.txn = 1
+		err = _meta_write_slot(vfs, fd, &m, 1)
+	}
+	if err == .None {
+		err = obj.perr(prim.datasync(vfs, fd))
+	}
+	prim.close_file(vfs, fd)
+	if err == .None {
+		err = obj.perr(prim.rename(vfs, tmp, path))
+	}
+	if err != .None {
+		prim.remove(vfs, tmp)
+		return err
+	}
+	return obj.perr(prim.sync_dir(vfs, prim.dir_name(path)))
 }

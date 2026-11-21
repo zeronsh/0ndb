@@ -135,6 +135,12 @@ table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, e
 			return 0, e
 		}
 	}
+	if cur, ce := table_consumed(t, seg); ce == .None && cur > durable_end(r) {
+		if e := table_reset(t); e != .None {
+			t.poisoned = true
+			return 0, e
+		}
+	}
 	pos, err = _table_apply(t, seg, r)
 	if err != .None && err != .Missing {
 		_fault(t, err)
@@ -142,12 +148,20 @@ table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, e
 	return
 }
 
+durable_end :: proc "contextless" (r: ^journal.Reader) -> i64 {
+	if r.journal != nil {
+		return journal.journal_durable_len(r.journal)
+	}
+	return journal.reader_end(r)
+}
+
 @(private)
 _table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
-	if db_count(&t.db, ROOT_CONSUMED) == 0 && db_count(&t.db, ROOT_ENTRIES) == 0 && db_count(&t.db, ROOT_PENDING) == 0 && journal.reader_end(r) >= REBUILD_MIN {
+	limit := durable_end(r)
+	if db_count(&t.db, ROOT_CONSUMED) == 0 && db_count(&t.db, ROOT_ENTRIES) == 0 && db_count(&t.db, ROOT_PENDING) == 0 && limit >= REBUILD_MIN {
 		src := [1]Source{{seg, r}}
 		_table_rebuild(t, src[:]) or_return
-		return journal.reader_end(r), .None
+		return table_consumed(t, seg)
 	}
 	pos = table_consumed(t, seg) or_return
 	scratch: obj.Arena
@@ -158,7 +172,7 @@ _table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, 
 	context.temp_allocator = obj.arena_allocator(&scratch)
 	txn := txn_begin(&t.db) or_return
 	stop: Error
-	for {
+	for pos < limit {
 		body, next, e := journal.record_at(r, pos)
 		if e == .Eof {
 			break
@@ -445,7 +459,8 @@ _rebuild_cleanup :: proc(rb: ^Rebuild) {
 @(private)
 _rebuild_source :: proc(rb: ^Rebuild, i: int, s: Source) -> Error {
 	pos: i64
-	for {
+	limit := durable_end(s.reader)
+	for pos < limit {
 		body, next, e := journal.record_at(s.reader, pos)
 		if e == .Eof {
 			break
