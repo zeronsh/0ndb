@@ -153,6 +153,8 @@ Index :: struct {
 	taint_check: bool,
 	zd_tainted: bool,
 	cb_tainted: bool,
+	train_futile: bool,
+	futile_gen: u64,
 }
 
 @(private)
