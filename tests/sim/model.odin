@@ -256,6 +256,8 @@ op_done_cb :: proc(data: rawptr, e: ^eng.Engine, res: ^eng.Result, err: eng.Erro
 	op := (^M_Op)(data)
 	if op.kind == .Send || op.kind == .Queue || op.kind == .Steer || op.kind == .Interrupt || op.kind == .Answer {
 		op.rid = res.item
+	} else if op.kind == .Map_Set && err == .None {
+		op.rid = eng.Rid{op.actor, res.off}
 	}
 	op_done(op, res.tick, err)
 }

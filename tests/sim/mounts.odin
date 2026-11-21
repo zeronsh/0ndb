@@ -489,7 +489,7 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 			if merr == .None {
 				op_done(op, 0, .None)
 				op.status = .Acked
-			} else if merr == .Io {
+			} else if merr == .Io || merr == .No_Space {
 				op.status = .Uncertain
 			} else {
 				op.status = .Failed

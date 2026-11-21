@@ -475,7 +475,10 @@ _op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		op.token = new_token(m, n, "v")
 		op.key = strings.clone(fmt.tprintf("u/%s", op.token), w.allocator)
 		f := [1]omap.Field{{tag = 1, value = transmute([]u8)op.token}}
-		_, err := eng.map_set(&n.e, o, transmute([]u8)op.key, f[:], op_done_handle(op))
+		off, err := eng.map_set(&n.e, o, transmute([]u8)op.key, f[:], op_done_handle(op))
+		if err == .None {
+			op.rid = eng.Rid{op.actor, off}
+		}
 		op_result(op, n, err)
 	case .Map_Hot:
 		op := new_op(m, .Map_Hot, n, oi)

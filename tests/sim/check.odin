@@ -334,6 +334,9 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 				continue
 			}
 			present := err == .None && msg.author == op.actor && (msg.redacted || msg_text(msg) == op.token)
+			if err == .None {
+				_settle_redaction(m, op, msg.redacted)
+			}
 			redacted := _redacted_by(m, op)
 			switch op.status {
 			case .Acked, .Observed, .Done:
@@ -371,6 +374,11 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 					present ||= r.tag == 1 && string(r.value) == op.token
 				}
 			}
+			if !obj.rid_none(op.rid) {
+				if state, known := _record_state(n, ob, op.rid); known {
+					_settle_redaction(m, op, state == .Redacted)
+				}
+			}
 			redacted := _redacted_by(m, op)
 			if redacted {
 				if present {
@@ -406,6 +414,36 @@ _redacted_by :: proc(m: ^Model, target: ^M_Op) -> bool {
 		}
 	}
 	return false
+}
+
+@(private = "file")
+_settle_redaction :: proc(m: ^Model, target: ^M_Op, gone: bool) {
+	for op in m.ops {
+		if op.target == target.idx && (op.kind == .Redact_Msg || op.kind == .Redact_Map) && op.status == .Uncertain {
+			op.status = .Observed if gone else .Lost
+		}
+	}
+}
+
+@(private = "file")
+_record_state :: proc(n: ^Node, ob: ^M_Obj, rid: eng.Rid) -> (state: Rec_State, known: bool) {
+	h, ok := n.e.handles[ob.o.id]
+	if !ok {
+		return
+	}
+	for s in h.segs {
+		if s.device != rid.seg {
+			continue
+		}
+		_, _, err := journal.record_at(&s.jr, rid.off)
+		#partial switch err {
+		case .None:
+			return .Live, true
+		case .Redacted:
+			return .Redacted, true
+		}
+	}
+	return
 }
 
 @(private = "file")
