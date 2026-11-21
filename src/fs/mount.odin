@@ -293,6 +293,8 @@ Mount :: struct {
 	log_len:     i64,
 	log_gen:     u64,
 	saved:       u64,
+	state_seq:   u64,
+	legacy:      bool,
 	lost:        bool,
 	retained:    bool,
 	window:      bool,
@@ -302,6 +304,7 @@ Mount :: struct {
 	open_scopes: map[string]^Scope,
 	intents:     [dynamic]Intent,
 	nonce:       prim.Id,
+	mat_wait:    bool,
 	jpos:        i64,
 	jpend:       i64,
 	imported:    bool,
@@ -467,6 +470,21 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.clean = false
 	save_mount_state(m) or_return
 	mount_git_sources(m) or_return
+	before := mount_jlen(m)
+	if err := mount_open_rest(m, fresh); err != .None {
+		if mount_jlen(m) == before {
+			return err
+		}
+		m.rescan = true
+		mount_schedule(m, 0)
+	}
+	ok = true
+	mount_touch(m)
+	return .None
+}
+
+@(private)
+mount_open_rest :: proc(m: ^Mount, fresh: bool) -> Error {
 	if fresh {
 		save_mount_state(m) or_return
 		mount_import(m) or_return
@@ -483,8 +501,6 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		m.lost = false
 		save_mount_state(m) or_return
 	}
-	ok = true
-	mount_touch(m)
 	return .None
 }
 
@@ -1205,9 +1221,8 @@ active_scope :: proc(m: ^Mount) -> ^Scope {
 
 @(private)
 load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
-	p, _ := path_join(m.dir, "mount", context.temp_allocator)
-	data, rerr := prim.read_file(m.vfs, p, context.temp_allocator)
-	if rerr == .Not_Found {
+	data, have := state_read(m) or_return
+	if !have {
 		mount_new_nonce(m)
 		if m.has_git {
 			m.head, _ = git_head(m.vfs, m.git, m.allocator)
@@ -1215,9 +1230,6 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			m.stamp = git_index_stamp(m.vfs, m.git)
 		}
 		return true, .None
-	}
-	if rerr != .None {
-		return false, from_prim(rerr)
 	}
 	rd := prim.reader(data)
 	if prim.read_u8(&rd) != 1 {
@@ -1348,6 +1360,27 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 }
 
 @(private)
+mount_durable_now :: proc(m: ^Mount) -> bool {
+	if !mount_deferred(m) {
+		return true
+	}
+	h := m.history
+	fp := history_fp(h)
+	if fp != h.mark_fp {
+		h.mark += 1
+		h.mark_fp = fp
+	}
+	if h.mark <= h.durable {
+		return true
+	}
+	if !m.mat_wait {
+		m.mat_wait = true
+		mount_schedule(m, 0)
+	}
+	return false
+}
+
+@(private)
 mount_deferred :: proc "contextless" (m: ^Mount) -> bool {
 	return m.history != nil && m.history.opts.deferred
 }
@@ -1430,6 +1463,10 @@ mount_settle :: proc(m: ^Mount) -> Error {
 @(private)
 mount_ack :: proc(m: ^Mount) -> Error {
 	h := m.history
+	if m.mat_wait && h.mark <= h.durable {
+		m.mat_wait = false
+		mount_schedule(m, 0)
+	}
 	n := 0
 	for n < len(m.waits) && m.waits[n].mark <= h.durable {
 		n += 1
@@ -1508,9 +1545,8 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		attrib_log_reset(m)
 		return .None
 	}
-	p, _ := path_join(m.dir, "mount", context.temp_allocator)
 	m.saved = 0
-	from_prim(prim.replace_atomic(m.vfs, p, buf[:])) or_return
+	state_write(m, buf[:]) or_return
 	m.saved = sum
 	m.log_gen = gen
 	attrib_log_reset(m)
@@ -1612,4 +1648,92 @@ note_unwatched :: proc(m: ^Mount, rel: string) {
 
 mount_unwatched :: proc(m: ^Mount) -> []string {
 	return m.unwatched[:]
+}
+
+STATE_MAGIC :: u64(0x31736d62646e3030)
+STATE_HEADER :: 28
+
+@(private)
+state_path :: proc(m: ^Mount, slot: u64) -> string {
+	p, _ := path_join(m.dir, "state.1" if slot & 1 == 1 else "state.0", context.temp_allocator)
+	return p
+}
+
+@(private)
+state_write :: proc(m: ^Mount, payload: []u8) -> Error {
+	seq := m.state_seq + 1
+	out := make([]u8, STATE_HEADER + len(payload), context.temp_allocator)
+	prim.put_u64le(out[0:8], STATE_MAGIC)
+	prim.put_u64le(out[8:16], seq)
+	prim.put_u32le(out[16:20], u32(len(payload)))
+	copy(out[STATE_HEADER:], payload)
+	prim.put_u64le(out[20:28], xxhash.XXH3_64_with_seed(out[8:20], xxhash.XXH3_64_with_seed(payload, 0)))
+	p := state_path(m, seq)
+	created := false
+	fd, oerr := prim.open_file(m.vfs, p, {.Write})
+	if oerr == .Not_Found {
+		fd, oerr = prim.open_file(m.vfs, p, {.Write, .Create}, 0o600)
+		created = true
+	}
+	from_prim(oerr) or_return
+	werr := prim.write_at(m.vfs, fd, out, 0)
+	if werr == .None {
+		werr = prim.datasync(m.vfs, fd)
+	}
+	cerr := prim.close_file(m.vfs, fd)
+	from_prim(werr) or_return
+	from_prim(cerr) or_return
+	if created {
+		from_prim(prim.sync_dir(m.vfs, m.dir)) or_return
+	}
+	m.state_seq = seq
+	if m.legacy {
+		lp, _ := path_join(m.dir, "mount", context.temp_allocator)
+		if prim.remove(m.vfs, lp) == .None {
+			prim.sync_dir(m.vfs, m.dir)
+		}
+		m.legacy = false
+	}
+	return .None
+}
+
+@(private)
+state_read :: proc(m: ^Mount) -> (payload: []u8, found: bool, err: Error) {
+	best: u64
+	for slot in u64(0) ..< 2 {
+		data, rerr := prim.read_file(m.vfs, state_path(m, slot), context.temp_allocator)
+		if rerr == .Not_Found {
+			continue
+		}
+		from_prim(rerr) or_return
+		if len(data) < STATE_HEADER || prim.get_u64le(data[0:8]) != STATE_MAGIC {
+			continue
+		}
+		seq := prim.get_u64le(data[8:16])
+		n := int(prim.get_u32le(data[16:20]))
+		if n > len(data) - STATE_HEADER || seq & 1 != slot {
+			continue
+		}
+		body := data[STATE_HEADER:][:n]
+		if xxhash.XXH3_64_with_seed(data[8:20], xxhash.XXH3_64_with_seed(body, 0)) != prim.get_u64le(data[20:28]) {
+			continue
+		}
+		if !found || seq > best {
+			best = seq
+			payload = body
+			found = true
+		}
+	}
+	if found {
+		m.state_seq = best
+		return payload, true, .None
+	}
+	lp, _ := path_join(m.dir, "mount", context.temp_allocator)
+	data, rerr := prim.read_file(m.vfs, lp, context.temp_allocator)
+	if rerr == .Not_Found {
+		return nil, false, .None
+	}
+	from_prim(rerr) or_return
+	m.legacy = true
+	return data, true, .None
 }

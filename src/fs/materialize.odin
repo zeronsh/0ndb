@@ -53,6 +53,9 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	if len(m.dirty) > 0 || m.rescan {
 		mount_pass(m, false) or_return
 	}
+	if !mount_durable_now(m) {
+		return .None
+	}
 	materialize_to(m, target, false) or_return
 	return mount_settle(m)
 }

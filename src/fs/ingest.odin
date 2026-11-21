@@ -1048,6 +1048,9 @@ catch_up :: proc(m: ^Mount) -> Error {
 	if crdt.graph_contains(&h.g, sl[:], latest) {
 		return .None
 	}
+	if !mount_durable_now(m) {
+		return .None
+	}
 	one := [1]crdt.Lv{latest}
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
 	crdt.version_union(&h.g, sl[:], one[:], &both)
