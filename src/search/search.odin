@@ -96,7 +96,6 @@ Options :: struct {
 	pace:             int,
 	train_min:        int,
 	dict_sample_min:  int,
-	no_compress:      bool,
 	durable:          Durable_End,
 	durable_data:     rawptr,
 }

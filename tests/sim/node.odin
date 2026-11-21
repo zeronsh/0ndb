@@ -76,7 +76,6 @@ node_start :: proc(n: ^Node) -> bool {
 	}}
 	cfg.search_options.train_min = w.cfg.train_min
 	cfg.search_options.dict_sample_min = w.cfg.dict_sample_min
-	cfg.search_options.no_compress = true
 	cfg.durability = .Deferred
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
@@ -103,6 +102,7 @@ node_start :: proc(n: ^Node) -> bool {
 		return false
 	}
 	n.e_open = true
+	live_start(n)
 	if n.disk.dead {
 		node_crashed(n)
 		return false
@@ -169,6 +169,7 @@ _free_partial :: proc(n: ^Node) {
 node_kill :: proc(n: ^Node) {
 	w := n.w
 	context = w.ctx
+	live_kill(n)
 	conns_drop_node(w, n)
 	node_mounts_drop(w, n)
 	n.alive = false

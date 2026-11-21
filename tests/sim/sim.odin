@@ -41,7 +41,7 @@ default_config :: proc(seed: u64) -> Config {
 		byzantine = rng_chance(&r, 1, 6),
 		train_min = 16 + rng_int(&r, 48),
 		bulk = rng_chance(&r, 1, 8),
-		dict_sample_min = 2048 + rng_int(&r, 14336),
+		dict_sample_min = 64 + rng_int(&r, 960),
 		settle_ms = 200 + rng_range(&r, 0, 1500),
 		trace_limit = 4000,
 	}
@@ -418,6 +418,7 @@ finish :: proc(w: ^World) {
 	if !idle {
 		world_fail(w, "idle: world never became idle (timers keep firing)")
 	}
+	check_live_reads(w)
 	check_idle(w)
 	if len(w.failures) == 0 {
 		check_close(w)
@@ -429,6 +430,7 @@ check_close :: proc(w: ^World) {
 		if !n.alive || !n.e_open {
 			continue
 		}
+		live_close(n)
 		context = instance_context(&n.inst)
 		err := eng.close(&n.e)
 		n.e_open = false
@@ -613,6 +615,14 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.io_errors += st.stats.io_errors
 		total.stats.stalls += st.stats.stalls
 		total.stats.conflict_pairs += st.stats.conflict_pairs
+		total.stats.live_reads += st.stats.live_reads
+		total.stats.live_waited += st.stats.live_waited
+		total.stats.live_data += st.stats.live_data
+		total.stats.live_absent += st.stats.live_absent
+		total.stats.live_quarantined += st.stats.live_quarantined
+		total.stats.live_closed += st.stats.live_closed
+		total.stats.live_dropped += st.stats.live_dropped
+		total.stats.live_wait_ms = max(total.stats.live_wait_ms, st.stats.live_wait_ms)
 		total.disk_ops += st.disk_ops
 		total.sim_ns += st.sim_ns
 	}
@@ -766,6 +776,7 @@ print_stats :: proc(r: ^Run_Result) {
 	secs := f64(r.wall_ns) / 1e9
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
 	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d expected_conflicts=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, r.stats.conflict_pairs, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
+	fmt.eprintf("sim: interactive_reads=%d waited=%d data=%d absent=%d quarantined=%d closed=%d dropped_by_crash=%d max_wait_ms=%d\n", r.stats.live_reads, r.stats.live_waited, r.stats.live_data, r.stats.live_absent, r.stats.live_quarantined, r.stats.live_closed, r.stats.live_dropped, r.stats.live_wait_ms)
 }
 
 @(private = "file")

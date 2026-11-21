@@ -3,6 +3,7 @@ package sim
 import "base:runtime"
 import "core:fmt"
 import "core:strings"
+import api "../../src/capi/api"
 import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/prim"
@@ -78,6 +79,8 @@ Node :: struct {
 	writers:     map[string]Writer_Info,
 	reg:         ^fs.Registry,
 	watch_scheduled: bool,
+	api:         api.Api,
+	api_on:      bool,
 }
 
 Relay_Node :: struct {
@@ -115,6 +118,14 @@ World_Stats :: struct {
 	stalls:       u64,
 	conflict_pairs: u64,
 	search_models:  u64,
+	live_reads:     u64,
+	live_waited:    u64,
+	live_data:      u64,
+	live_absent:    u64,
+	live_quarantined: u64,
+	live_closed:    u64,
+	live_dropped:   u64,
+	live_wait_ms:   u64,
 }
 
 Config :: struct {
@@ -168,6 +179,7 @@ World :: struct {
 	phase:     Phase,
 	ctx:       runtime.Context,
 	quarantines: [dynamic]Quarantine,
+	live:      [dynamic]^Live_Read,
 }
 
 Quarantine :: struct {
@@ -325,6 +337,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	w.failures = make([dynamic]string, w.allocator)
 	w.log = make([dynamic]string, w.allocator)
 	w.quarantines = make([dynamic]Quarantine, w.allocator)
+	w.live = make([dynamic]^Live_Read, w.allocator)
 	rng_init(&w.rng, cfg.seed, 1)
 	rng_init(&w.net_rng, cfg.seed, 2)
 	rng_init(&w.fault_rng, cfg.seed, 3)
@@ -395,6 +408,10 @@ world_destroy :: proc(w: ^World) {
 	}
 	delete(w.log)
 	delete(w.quarantines)
+	for r in w.live {
+		free(r, w.allocator)
+	}
+	delete(w.live)
 	model_destroy(&w.model)
 }
 

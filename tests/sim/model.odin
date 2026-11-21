@@ -60,6 +60,7 @@ Op_Kind :: enum u8 {
 	Disk_Agent,
 	Disk_Person,
 	Git_Mount,
+	Read_Live,
 }
 
 M_Space :: struct {
