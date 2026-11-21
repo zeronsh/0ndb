@@ -10,6 +10,8 @@ import "../prim"
 
 when ODIN_OS == .Darwin {
 	ZSTD_LIBRARIES :: [?]string{"libzstd.1.dylib", "/opt/homebrew/lib/libzstd.1.dylib", "/usr/local/lib/libzstd.1.dylib", "libzstd.dylib"}
+} else when ODIN_OS == .Windows {
+	ZSTD_LIBRARIES :: [?]string{}
 } else {
 	ZSTD_LIBRARIES :: [?]string{"libzstd.so.1", "libzstd.so"}
 }
@@ -53,6 +55,13 @@ zstd_load :: proc() -> bool {
 	for name in ZSTD_LIBRARIES {
 		if lib, ok = dynlib.load_library(name); ok {
 			break
+		}
+	}
+	when ODIN_OS == .Windows {
+		if !ok {
+			if path, pok := _zstd_git_library(); pok {
+				lib, ok = dynlib.load_library(path)
+			}
 		}
 	}
 	if !ok {
@@ -322,7 +331,7 @@ _zstd_dict :: proc(ix: ^Index, gen: u64) -> (sl: ^Zd_Slot, err: Error) {
 }
 
 zstd_train :: proc(ix: ^Index) -> Error {
-	if !ix.man.store || ix.man.zd_gen != 0 || !_zstd_ready(&ix.zstd) {
+	if ix.opts.no_compress || !ix.man.store || ix.man.zd_gen != 0 || !_zstd_ready(&ix.zstd) {
 		return .None
 	}
 	m := &ix.mem
@@ -379,7 +388,7 @@ zd_sample_add :: proc(zs: ^Zd_Samples, id: u32, text: []u8) {
 zd_install :: proc(ix: ^Index, zs: ^Zd_Samples) -> Error {
 	gen := u64(0)
 	defer slice.zero(zs.bytes[:])
-	if len(zs.bytes) >= ix.opts.dict_sample_min && _zstd_ready(&ix.zstd) {
+	if !ix.opts.no_compress && len(zs.bytes) >= ix.opts.dict_sample_min && _zstd_ready(&ix.zstd) {
 		out := make([]u8, DICT_CAP + 4 * len(zs.ids) + 16, context.temp_allocator)
 		defer slice.zero(out)
 		cap_n := min(DICT_CAP, max(len(zs.bytes) / 10, 1024))
@@ -424,7 +433,7 @@ zd_install :: proc(ix: ^Index, zs: ^Zd_Samples) -> Error {
 
 frame_write :: proc(ix: ^Index, w: ^prim.Writer, raw: []u8, scratch: ^[dynamic]u8) -> Error {
 	z := &ix.zstd
-	if !_zstd_ready(z) {
+	if ix.opts.no_compress || !_zstd_ready(z) {
 		prim.write_uvarint(w, u64(len(raw)))
 		prim.write_u8(w, FRAME_RAW)
 		prim.write_uvarint(w, u64(len(raw)))

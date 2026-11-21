@@ -53,6 +53,7 @@ Seg :: struct {
 	in_view: bool,
 	waiting: bool,
 	probing: bool,
+	probed:  bool,
 	follow:  bool,
 	check:   Seg_Check,
 	chain:   journal.Chain,
@@ -389,10 +390,6 @@ _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 		seg.waiting = true
 		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
 		e.stats.fetches += 1
-	} else if sp.connected && !osync.replicator_current(&sp.repl, &h.scope, device, h.name, 0) {
-		seg.probing = true
-		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
-		e.stats.fetches += 1
 	}
 	_seg_enter(h, seg)
 }
@@ -462,6 +459,26 @@ _handle_remote_grew :: proc(h: ^Handle, device: prim.Id) {
 }
 
 @(private)
+_handle_probe :: proc(h: ^Handle) {
+	sp := h.sp
+	if !sp.repl_on || !sp.connected {
+		return
+	}
+	for s in h.segs {
+		if s.probed || s.waiting || journal.replica_length(s.rep) == 0 {
+			continue
+		}
+		s.probed = true
+		if osync.replicator_current(&sp.repl, &h.scope, s.device, h.name, 0) {
+			continue
+		}
+		s.probing = true
+		osync.replicator_want_tail(&sp.repl, &h.scope, s.device, h.name, 0)
+		h.e.stats.fetches += 1
+	}
+}
+
+@(private)
 _probes_settle :: proc(e: ^Engine, sp: ^Space, only := prim.Id{}) {
 	for _, h in e.handles {
 		if h.sp != sp || (!prim.id_is_zero(only) && h.id != only) {
@@ -508,6 +525,9 @@ _handle_refresh :: proc(h: ^Handle) {
 
 @(private)
 _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
+	if fresh {
+		_handle_probe(h)
+	}
 	for s in h.segs {
 		if s.waiting || (fresh && s.probing) {
 			return true

@@ -106,7 +106,14 @@ BOOT_ID_PATH :: "/proc/sys/kernel/random/boot_id"
 @(private)
 registry_boot :: proc(reg: ^Registry) -> prim.Id {
 	if reg.boot == {} {
-		data, err := prim.read_file(reg.vfs, BOOT_ID_PATH, context.temp_allocator)
+		buf: [64]u8
+		n := 0
+		err := prim.Error.Not_Found
+		if fd, oerr := prim.open_file(reg.vfs, BOOT_ID_PATH); oerr == .None {
+			n, err = prim.read_at(reg.vfs, fd, buf[:], 0)
+			prim.close_file(reg.vfs, fd)
+		}
+		data := buf[:max(n, 0)]
 		if err == .None && len(data) > 0 {
 			id: prim.Id
 			prim.put_u64le(id[0:8], xxhash.XXH3_64_with_seed(data, 1))

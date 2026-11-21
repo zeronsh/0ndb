@@ -71,8 +71,12 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.write_observer = sim_observer(n)
 	cfg.watcher = sim_watcher(n)
 	cfg.embedder = sim_embedder()
+	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
+		return {}
+	}}
 	cfg.search_options.train_min = w.cfg.train_min
 	cfg.search_options.dict_sample_min = w.cfg.dict_sample_min
+	cfg.search_options.no_compress = true
 	cfg.durability = .Deferred
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
