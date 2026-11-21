@@ -65,6 +65,7 @@ close :: proc(p: ^Pack) -> Error {
 	err: Error
 	if !p.poisoned {
 		p.batch = 0
+		p.closing = true
 		err = _flush(p)
 		if err == .None {
 			_fire_waiters(p)
@@ -98,8 +99,13 @@ _release :: proc(p: ^Pack) {
 		virtual.release(raw_data(p.bcache), uint(BCACHE * size_of(Bc_Entry)))
 		p.bcache = nil
 	}
-	for oi in p.open_inodes {
-		o := p.open_inodes[oi]
+	inos := make([dynamic]u64, context.temp_allocator)
+	for k in p.open_inodes {
+		append(&inos, k)
+	}
+	slice.sort(inos[:])
+	for k in inos {
+		o := p.open_inodes[k]
 		if o.real_fd >= 0 {
 			prim.close_file(p.base, o.real_fd)
 		}
@@ -279,20 +285,6 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 		}
 		append(&p.conts, c)
 	}
-	removed_any := false
-	for id in run_ids {
-		listed := false
-		for r in sb.runs {
-			if r.id == id {
-				listed = true
-			}
-		}
-		if !listed {
-			pb: prim.Path_Buf
-			prim.remove(p.base, _phys_path(p, &pb, 'r', u64(id)))
-			removed_any = true
-		}
-	}
 	for r in sb.runs {
 		run := r
 		pb: prim.Path_Buf
@@ -306,6 +298,21 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 		append(&p.runs, nr)
 		if e := _run_load(p, nr); e != .None {
 			return e
+		}
+	}
+	_super_write(p) or_return
+	removed_any := false
+	for id in run_ids {
+		listed := false
+		for r in sb.runs {
+			if r.id == id {
+				listed = true
+			}
+		}
+		if !listed {
+			pb: prim.Path_Buf
+			prim.remove(p.base, _phys_path(p, &pb, 'r', u64(id)))
+			removed_any = true
 		}
 	}
 	if _cont_index(p, p.ck_cont) < 0 {
@@ -343,6 +350,24 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 		_sync_dirty_conts(p) or_return
 	}
 	p.recovering = false
+	_suspect_repair(p) or_return
+	if !sb.clean {
+		for id in ext_ids {
+			xb: prim.Path_Buf
+			fd, oerr := prim.open_file(p.base, _phys_path(p, &xb, 'x', id), {.Write})
+			if oerr == .Not_Found {
+				continue
+			}
+			if oerr != .None {
+				return oerr
+			}
+			e := _sync(p, fd)
+			prim.close_file(p.base, fd)
+			if e != .None {
+				return e
+			}
+		}
+	}
 	if p.compacting != 0 && _cont_index(p, p.compacting) < 0 {
 		p.compacting = 0
 	}
@@ -546,6 +571,8 @@ _replay :: proc(p: ^Pack) -> Error {
 	defer delete(lr.buf)
 	groups := make([dynamic]Group, p.allocator)
 	defer delete(groups)
+	win := make([dynamic]Window, p.allocator)
+	defer delete(win)
 	cont := p.ck_cont
 	off := p.ck_off
 	seq := p.ck_seq
@@ -594,6 +621,13 @@ _replay :: proc(p: ^Pack) -> Error {
 			end_cont = last.cont
 			end_off = last.end
 		}
+	}
+	for g in groups {
+		_note_window(p, &win, g.cont, g.end)
+	}
+	_note_window(p, &win, end_cont, end_off)
+	for w in win {
+		_rewrite_range(p, w.cont, w.lo, w.hi) or_return
 	}
 	datas := make([dynamic]Replay_Data, p.allocator)
 	defer delete(datas)
@@ -654,12 +688,11 @@ _replay :: proc(p: ^Pack) -> Error {
 	p.active = ci
 	fd := _cont_fd(p, end_cont) or_return
 	size := prim.file_size(p.base, fd) or_return
-	if size != end_off {
-		if e := prim.truncate(p.base, fd, end_off); e != .None {
-			return e
-		}
-		_sync(p, fd) or_return
+	if e := prim.truncate(p.base, fd, end_off); e != .None {
+		return e
 	}
+	_sync(p, fd) or_return
+	_ = size
 	p.conts[ci].size = end_off
 	p.buf_base = end_off
 	p.group_start = end_off
@@ -767,4 +800,100 @@ _destroy_inode :: proc(p: ^Pack, inum: u64, orphan: bool) -> Error {
 		return .None
 	}
 	return _put(p, _ikey(kb[:], K_ORPHAN, inum), nil, true)
+}
+
+@(private)
+Window :: struct {
+	cont: u32,
+	lo:   i64,
+	hi:   i64,
+}
+
+@(private)
+_note_window :: proc(p: ^Pack, win: ^[dynamic]Window, cont: u32, hi: i64) {
+	for &w in win {
+		if w.cont == cont {
+			w.hi = max(w.hi, hi)
+			return
+		}
+	}
+	lo: i64 = p.ck_off if cont == p.ck_cont else 0
+	append(win, Window{cont = cont, lo = lo, hi = max(hi, lo)})
+}
+
+@(private)
+_rewrite_range :: proc(p: ^Pack, cont: u32, lo, hi: i64) -> Error {
+	fd := _cont_fd(p, cont) or_return
+	CHUNK :: 1 << 20
+	buf := make([]u8, CHUNK, p.allocator)
+	defer delete(buf, p.allocator)
+	pos := lo
+	for pos < hi {
+		n := int(min(hi - pos, CHUNK))
+		got := prim.read_at(p.base, fd, buf[:n], pos) or_return
+		if got != n {
+			return .Io
+		}
+		prim.write_at(p.base, fd, buf[:n], pos) or_return
+		pos += i64(n)
+	}
+	return _sync(p, fd)
+}
+
+@(private)
+_suspect_repair :: proc(p: ^Pack) -> Error {
+	pb: prim.Path_Buf
+	n := copy(pb[:], p.root)
+	n += copy(pb[n:], "/SUSPECT")
+	path := string(pb[:n])
+	data, err := prim.read_file(p.base, path, context.temp_allocator)
+	if err == .Not_Found {
+		return .None
+	}
+	if err != .None {
+		return err
+	}
+	for i := 0; i + 8 <= len(data); i += 8 {
+		inum := prim.get_u64le(data[i:])
+		ino: Inode
+		found := _inode_load(p, inum, &ino) or_return
+		if !found || ino.kind != .External {
+			continue
+		}
+		xb: prim.Path_Buf
+		fd, oerr := prim.open_file(p.base, _phys_path(p, &xb, 'x', inum), {.Write})
+		if oerr == .Not_Found {
+			continue
+		}
+		if oerr != .None {
+			return oerr
+		}
+		e := _rewrite_fd(p, fd)
+		prim.close_file(p.base, fd)
+		if e != .None {
+			return e
+		}
+	}
+	prim.remove(p.base, path) or_return
+	return _sync_root(p)
+}
+
+@(private)
+_rewrite_fd :: proc(p: ^Pack, fd: prim.Fd) -> Error {
+	size := prim.file_size(p.base, fd) or_return
+	CHUNK :: 1 << 20
+	buf := make([]u8, CHUNK, p.allocator)
+	defer delete(buf, p.allocator)
+	pos: i64
+	for pos < size {
+		n := int(min(size - pos, CHUNK))
+		got := prim.read_at(p.base, fd, buf[:n], pos) or_return
+		if got != n {
+			return .Io
+		}
+		prim.write_at(p.base, fd, buf[:n], pos) or_return
+		pos += i64(n)
+	}
+	prim.truncate(p.base, fd, size) or_return
+	return _sync(p, fd)
 }

@@ -692,9 +692,13 @@ _v_punch_hole :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> Error {
 	if oi.ino.kind == .External {
 		oi.dirty = true
 		if e := prim.punch_hole(p.base, oi.real_fd, off, size); e != .None {
-			return e
+			return _poison(p, e)
 		}
-		return _sync(p, oi.real_fd)
+		if e := _sync(p, oi.real_fd); e != .None {
+			_suspect_record(p, []u64{oi.inum})
+			return _poison(p, e)
+		}
+		return .None
 	}
 	old := oi.ino
 	scratch: Phys_List

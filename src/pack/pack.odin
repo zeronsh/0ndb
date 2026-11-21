@@ -162,6 +162,7 @@ Pack :: struct {
 	dirsync_pending: bool,
 	pressure:      bool,
 	want_flush:    bool,
+	closing:       bool,
 	cscan:         [dynamic]Scan,
 	bcache:        []Bc_Entry,
 	tick:          u64,
@@ -199,7 +200,7 @@ SUPER_MAGIC :: u64(0x7265_7075_736b_6370)
 CONT_MAGIC :: u64(0x746e_6f63_6b63_6170)
 CONT_HDR :: 64
 @(private)
-VERSION :: u32(4)
+VERSION :: u32(5)
 ROOT_INO :: u64(1)
 
 @(private)
@@ -617,6 +618,7 @@ Super :: struct {
 	next_run:  u32,
 	compacting: u32,
 	cpos:      i64,
+	clean:     bool,
 	runs:      [dynamic]Run,
 	lives:     [dynamic]Cont,
 }
@@ -650,6 +652,7 @@ _super_decode :: proc(b: []u8, s: ^Super) -> bool {
 	s.next_run = prim.read_u32le(&r)
 	s.compacting = prim.read_u32le(&r)
 	s.cpos = i64(prim.read_u64le(&r))
+	s.clean = prim.read_u8(&r) == 1
 	nr := prim.read_uvarint(&r)
 	if r.err != .None || nr > 4096 {
 		return false
@@ -731,6 +734,7 @@ _super_read :: proc(p: ^Pack, s: ^Super) -> bool {
 			s.next_run = tmp.next_run
 			s.compacting = tmp.compacting
 			s.cpos = tmp.cpos
+			s.clean = tmp.clean
 			clear(&s.runs)
 			append(&s.runs, ..tmp.runs[:])
 			clear(&s.lives)

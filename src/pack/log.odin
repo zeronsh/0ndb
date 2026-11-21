@@ -268,6 +268,13 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 @(private)
 _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 	fl := &p.fl
+	if err != .None && len(fl.fds) > 0 {
+		inums := make([dynamic]u64, context.temp_allocator)
+		for j in fl.fds {
+			append(&inums, j.inum)
+		}
+		_suspect_record(p, inums[:])
+	}
 	for j in fl.fds {
 		if j.owned {
 			prim.close_file(p.base, j.fd)
@@ -421,12 +428,19 @@ _cont_deleted :: proc(p: ^Pack, id: u32) {
 
 @(private)
 _collect_externals :: proc(p: ^Pack) -> Error {
+	dirty := make([dynamic]^Open_Inode, context.temp_allocator)
 	for _, oi in p.open_inodes {
 		if oi.dirty && oi.real_fd >= 0 {
-			append(&p.fl.fds, Job_Fd{fd = oi.real_fd})
-			oi.dirty = false
-			oi.pinned += 1
+			append(&dirty, oi)
 		}
+	}
+	slice.sort_by(dirty[:], proc(a, b: ^Open_Inode) -> bool {
+		return a.inum < b.inum
+	})
+	for oi in dirty {
+		append(&p.fl.fds, Job_Fd{fd = oi.real_fd, inum = oi.inum})
+		oi.dirty = false
+		oi.pinned += 1
 	}
 	for inum in p.ext_dirty {
 		pb: prim.Path_Buf
@@ -437,7 +451,7 @@ _collect_externals :: proc(p: ^Pack) -> Error {
 		if err != .None {
 			return _poison(p, err)
 		}
-		append(&p.fl.fds, Job_Fd{fd = fd, owned = true})
+		append(&p.fl.fds, Job_Fd{fd = fd, inum = inum, owned = true})
 	}
 	clear(&p.ext_dirty)
 	return .None
@@ -989,4 +1003,29 @@ _flush_start :: proc(p: ^Pack) -> Error {
 	}
 	fl.kind = .Flush
 	return _submit(p)
+}
+
+@(private)
+_suspect_record :: proc(p: ^Pack, inums: []u64) {
+	pb: prim.Path_Buf
+	n := copy(pb[:], p.root)
+	n += copy(pb[n:], "/SUSPECT")
+	fd, err := prim.open_file(p.base, string(pb[:n]), {.Write, .Create}, 0o600)
+	if err != .None {
+		return
+	}
+	defer prim.close_file(p.base, fd)
+	size, serr := prim.file_size(p.base, fd)
+	if serr != .None {
+		return
+	}
+	buf := make([]u8, len(inums) * 8, context.temp_allocator)
+	for v, i in inums {
+		prim.put_u64le(buf[i * 8:], v)
+	}
+	if prim.write_at(p.base, fd, buf, size - size % 8) != .None {
+		return
+	}
+	prim.datasync(p.base, fd)
+	prim.sync_dir(p.base, p.root)
 }

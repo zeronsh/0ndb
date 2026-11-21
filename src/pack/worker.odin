@@ -48,6 +48,7 @@ Snap :: struct {
 	next_run:   u32,
 	compacting: u32,
 	cpos:       i64,
+	clean:      bool,
 	runs:       [dynamic]Run,
 	conts:      [dynamic]Cont,
 }
@@ -95,6 +96,7 @@ Inflight :: struct {
 @(private)
 Job_Fd :: struct {
 	fd:    prim.Fd,
+	inum:  u64,
 	owned: bool,
 }
 
@@ -123,6 +125,7 @@ _snap_take :: proc(p: ^Pack, s: ^Snap) {
 		next_run   = p.next_run,
 		compacting = p.compacting,
 		cpos       = p.compact_resume,
+		clean      = p.closing,
 	}
 	s.runs = make([dynamic]Run, 0, len(p.runs) + 1, p.allocator)
 	for r in p.runs {
@@ -157,6 +160,7 @@ _snap_encode :: proc(s: ^Snap, out: ^[dynamic]u8) -> bool {
 	prim.write_u32le(&w, s.next_run)
 	prim.write_u32le(&w, s.compacting)
 	prim.write_u64le(&w, u64(max(s.cpos, 0)))
+	prim.write_u8(&w, 1 if s.clean else 0)
 	prim.write_uvarint(&w, u64(len(s.runs)))
 	for r in s.runs {
 		prim.write_u32le(&w, r.id)
