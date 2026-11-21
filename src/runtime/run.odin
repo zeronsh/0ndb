@@ -520,7 +520,7 @@ _run_finish_tail :: proc(run: ^Run) {
 		if run.superseded {
 			convo.writer_superseded(w, run.claim, run.by)
 		} else if run.ws != nil {
-			convo.writer_landed(w, run.claim, files)
+			convo.writer_landed(w, run.claim, files, run.status)
 		}
 	}
 	_awaits_settle(r, run.o)

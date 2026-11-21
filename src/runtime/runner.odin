@@ -1035,7 +1035,7 @@ _land_lines :: proc(r: ^Runtime, o: Object, claim: Rid, lines: []convo.Line) {
 	}
 	if len(files) > 0 {
 		if w := _convo_w(r, o); w != nil {
-			convo.writer_landed(w, claim, files[:])
+			convo.writer_landed(w, claim, files[:], .Interrupted)
 		}
 	}
 }
