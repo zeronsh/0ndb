@@ -22,6 +22,7 @@ pending :: proc "contextless" (ix: ^Index) -> int {
 TITLE_SLOT :: "\x00title"
 
 add :: proc(ix: ^Index, source: prim.Id, pos: i64, doc: ^Doc) -> Error {
+	_admit(ix) or_return
 	if len(doc.slot) > 0 {
 		_kill_slot(ix, doc.object, doc.slot) or_return
 	}
@@ -42,6 +43,7 @@ add :: proc(ix: ^Index, source: prim.Id, pos: i64, doc: ^Doc) -> Error {
 }
 
 advance :: proc(ix: ^Index, source: prim.Id, pos: i64) -> Error {
+	_admit(ix) or_return
 	ix.mem.sources[source] = pos
 	return _maybe_flush(ix)
 }
@@ -60,12 +62,14 @@ set_title :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, partic
 }
 
 delete_slot :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, slot: []u8) -> Error {
+	_admit(ix) or_return
 	_kill_slot(ix, object, slot) or_return
 	ix.mem.sources[source] = pos
 	return _maybe_flush(ix)
 }
 
 delete_object :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id) -> Error {
+	_admit(ix) or_return
 	m := &ix.mem
 	if oi, ok := m.id_map[object]; ok {
 		for d, i in m.docs {
@@ -84,6 +88,7 @@ delete_object :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id) ->
 }
 
 delete_content :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id) -> Error {
+	_admit(ix) or_return
 	m := &ix.mem
 	if oi, ok := m.id_map[object]; ok {
 		for d, i in m.docs {
@@ -102,6 +107,7 @@ delete_content :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id) -
 }
 
 delete_record :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, ref: []u8) -> Error {
+	_admit(ix) or_return
 	m := &ix.mem
 	if oi, ok := m.id_map[object]; ok {
 		for d, i in m.docs {
@@ -115,6 +121,7 @@ delete_record :: proc(ix: ^Index, source: prim.Id, pos: i64, object: prim.Id, re
 	o := object
 	copy(key[1:], o[:])
 	_kill_term(ix, key[:], ref) or_return
+	ix.taint_check = true
 	m.sources[source] = pos
 	return _maybe_flush(ix)
 }
@@ -129,8 +136,15 @@ erase :: proc(ix: ^Index) -> Error {
 	for {
 		more := purge_step(ix, max(i64)) or_return
 		if !more {
+			break
+		}
+	}
+	for {
+		more := redact_models(ix) or_return
+		if !more {
 			return .None
 		}
+		_ = _merge_step(ix, max(i64), false) or_return
 	}
 }
 
@@ -146,6 +160,7 @@ _kill_slot :: proc(ix: ^Index, object: prim.Id, slot: []u8) -> Error {
 }
 
 set_spans :: proc(ix: ^Index, source: prim.Id, pos: i64, file: []u8, spans: []Span) -> Error {
+	_admit(ix) or_return
 	if len(file) == 0 || len(file) > MAX_FILE_KEY {
 		return .Invalid
 	}
@@ -167,6 +182,7 @@ set_spans :: proc(ix: ^Index, source: prim.Id, pos: i64, file: []u8, spans: []Sp
 }
 
 add_scope :: proc(ix: ^Index, source: prim.Id, pos: i64, sc: Scope) -> Error {
+	_admit(ix) or_return
 	if len(sc.ref) > MAX_REF {
 		return .Invalid
 	}
@@ -196,6 +212,9 @@ flush :: proc(ix: ^Index) -> Error {
 	if ix.broken {
 		return .Corrupt
 	}
+	if mem_ahead(ix) {
+		return .Busy
+	}
 	before := len(ix.segs)
 	mem_flush(ix) or_return
 	vec_maybe_train(ix) or_return
@@ -209,10 +228,63 @@ flush :: proc(ix: ^Index) -> Error {
 
 @(private)
 _maybe_flush :: proc(ix: ^Index) -> Error {
-	if mem_bytes(&ix.mem) < ix.opts.budget {
+	n := mem_bytes(&ix.mem)
+	if n < ix.opts.budget {
+		return .None
+	}
+	if mem_ahead(ix) {
 		return .None
 	}
 	return flush(ix)
+}
+
+@(private)
+_admit :: proc(ix: ^Index) -> Error {
+	if mem_bytes(&ix.mem) >= AHEAD_LIMIT * ix.opts.budget && mem_ahead(ix) {
+		return .Busy
+	}
+	return .None
+}
+
+AHEAD_LIMIT :: 4
+
+mem_ahead :: proc(ix: ^Index) -> bool {
+	if ix.opts.durable == nil {
+		return false
+	}
+	for src, p in ix.mem.sources {
+		if p > ix.opts.durable(ix.opts.durable_data, src) {
+			return true
+		}
+	}
+	return false
+}
+
+durable_advanced :: proc(ix: ^Index) -> Error {
+	if mem_bytes(&ix.mem) >= ix.opts.budget && !mem_ahead(ix) {
+		return flush(ix)
+	}
+	return .None
+}
+
+@(private)
+_reconcile :: proc(ix: ^Index) -> (reset_needed: bool, err: Error) {
+	if ix.opts.durable == nil {
+		return false, .None
+	}
+	b: [SRC_ENTRY]u8
+	for &s in ix.segs {
+		n := s.f.src_len / SRC_ENTRY
+		for k in 0 ..< n {
+			cache_read(&ix.cache, &s, s.f.src_off + k * SRC_ENTRY, b[:]) or_return
+			src: prim.Id
+			copy(src[:], b[:16])
+			if i64(prim.get_u64le(b[16:])) > ix.opts.durable(ix.opts.durable_data, src) {
+				return true, .None
+			}
+		}
+	}
+	return false, .None
 }
 
 @(private)

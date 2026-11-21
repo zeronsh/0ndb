@@ -34,6 +34,9 @@ Gb_Phase :: enum u8 {
 	Patch,
 	Indeg,
 	Repair,
+	CalInit,
+	CalBrute,
+	CalSearch,
 	Codes,
 	Done,
 }
@@ -56,6 +59,8 @@ Job :: enum u8 {
 	Build,
 	Insert,
 	Patch,
+	Brute,
+	Calib,
 }
 
 Worker :: struct {
@@ -80,6 +85,11 @@ Worker :: struct {
 	rv:     [dynamic]f32,
 	delta:  [dynamic]u64,
 	err:    Error,
+	bt_s:   []f32,
+	bt_i:   []u32,
+	bt_m:   []int,
+	cvis:   Visited,
+	hits:   int,
 }
 
 Graph_Build :: struct {
@@ -129,6 +139,12 @@ Graph_Build :: struct {
 	ins:      int,
 	need:     []bool,
 	dl:       [dynamic]u64,
+	cal_q:    int,
+	cal_ids:  []u32,
+	cal_vec:  []f32,
+	cal_lut:  []f32,
+	cal_truth: []u32,
+	cal_level: int,
 }
 
 @(private)
@@ -201,7 +217,7 @@ vmerge_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 	if gb.codes == nil {
 		return .No_Memory
 	}
-	gb.nthreads = BUILD_THREADS
+	gb.nthreads = BUILD_THREADS if ix.vfs.procs == &prim.OS_VFS_PROCS else 1
 	gb.workers = make([]Worker, gb.nthreads, a)
 	for &w in gb.workers {
 		_worker_init(gb, &w, ix.allocator) or_return
@@ -261,18 +277,28 @@ vmerge_destroy :: proc(ix: ^Index, m: ^Merge) {
 	for &w in gb.workers {
 		runtime.arena_destroy(&w.arena)
 	}
+	_gb_free_shard(gb)
+	m.gb = nil
+}
+
+@(private)
+_gb_free_shard :: proc(gb: ^Graph_Build) {
 	delete(gb.sh.ids)
 	delete(gb.sh.sq)
 	delete(gb.sh.sqs)
 	delete(gb.sh.adj)
 	delete(gb.sh.deg)
-	m.gb = nil
+	gb.sh.ids = nil
+	gb.sh.sq = nil
+	gb.sh.sqs = nil
+	gb.sh.adj = nil
+	gb.sh.deg = nil
 }
 
 @(private)
 _worker_init :: proc(gb: ^Graph_Build, w: ^Worker, backing: runtime.Allocator) -> Error {
 	w.gb = gb
-	if runtime.arena_init(&w.arena, 1 << 20, backing) != nil {
+	if runtime.arena_init(&w.arena, 4 << 20, backing) != nil {
 		return .No_Memory
 	}
 	a := runtime.arena_allocator(&w.arena)
@@ -343,10 +369,20 @@ _gb_partition :: proc(m: ^Merge) -> Error {
 
 @(private)
 _run_workers :: proc(gb: ^Graph_Build, job: Job, n: int) {
+	_run_workers_min(gb, job, n, 64)
+}
+
+@(private)
+_warena :: proc(w: ^Worker) -> runtime.Allocator {
+	return runtime.arena_allocator(&w.arena)
+}
+
+@(private)
+_run_workers_min :: proc(gb: ^Graph_Build, job: Job, n: int, per: int) {
 	if n == 0 {
 		return
 	}
-	t := min(gb.nthreads, max(1, n / 64))
+	t := min(gb.nthreads, max(1, n / per))
 	ths: [BUILD_THREADS]^thread.Thread
 	for i in 0 ..< t {
 		w := &gb.workers[i]
@@ -421,6 +457,10 @@ _worker_run :: proc(w: ^Worker) {
 		_ins_job(w)
 	case .Patch:
 		_patch_job(w)
+	case .Brute:
+		_brute_job(w)
+	case .Calib:
+		_cal_job(w)
 	}
 }
 
@@ -652,6 +692,12 @@ vmerge_step :: proc(ix: ^Index, m: ^Merge) -> (done: bool, err: Error) {
 		return false, _gb_indeg(m)
 	case .Repair:
 		return false, _gb_repair(ix, m)
+	case .CalInit:
+		return false, _cal_init(m)
+	case .CalBrute:
+		return false, _cal_brute(m)
+	case .CalSearch:
+		return false, _cal_search(m)
 	case .Codes:
 		if gb.graph {
 			left := gb.n * gb.m - gb.cursor
@@ -903,6 +949,7 @@ _gb_final :: proc(ix: ^Index, m: ^Merge) -> Error {
 	}
 	m.sw.f.vcodes_off = sw_off(&m.sw)
 	gb.cursor = 0
+	_gb_free_shard(gb)
 	if gb.graph {
 		m.sw.f.vec_m = u64(gb.m)
 		m.sw.f.cb_gen = gb.cb.gen
@@ -1066,6 +1113,6 @@ _gb_repair :: proc(ix: ^Index, m: ^Merge) -> Error {
 		return .None
 	}
 	gb.cursor = 0
-	gb.phase = .Codes
+	gb.phase = .CalInit
 	return .None
 }

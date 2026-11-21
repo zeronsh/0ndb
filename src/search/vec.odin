@@ -15,11 +15,12 @@ TRAIN_GROWTH :: 8
 TRAIN_ITERS :: 10
 ALPHA :: f32(1.2)
 DEFAULT_BEAM :: 128
+MAX_BEAM :: 4096
 GRAPH_MIN :: 2048
 REC_ALIGN :: 4096
 INSERT_WORK :: 16 * 1024
 CB_MAGIC :: u64(0x6276_6863_7273_6e30)
-CB_VERSION :: u64(3)
+CB_VERSION :: u64(4)
 CB_HEADER :: 6 * 8
 
 V8 :: #simd[8]f32
@@ -114,7 +115,11 @@ cb_load :: proc(ix: ^Index, gen: u64, allocator: runtime.Allocator) -> (cb: ^Cb,
 	cb.ksub = int(h[4])
 	cb.n = h[5]
 	np := cb.m * cb.ksub * cb.dsub
-	if len(data) != CB_HEADER + np * 4 + 8 {
+	if len(data) < CB_HEADER + np * 4 + 16 {
+		return nil, .Corrupt
+	}
+	nid := int(prim.get_u64le(data[CB_HEADER + np * 4:]))
+	if nid < 0 || len(data) != CB_HEADER + np * 4 + 8 + nid * 4 + 8 {
 		return nil, .Corrupt
 	}
 	cb.pq = make([]f32, np, allocator)
@@ -227,6 +232,8 @@ Vtrain :: struct {
 	cent:   []f32,
 	sums:   []f64,
 	counts: []int,
+	ids:    []u32,
+	dead:   []u32,
 	j:      int,
 	it:     int,
 	si:     int,
@@ -240,9 +247,20 @@ vec_maybe_train :: proc(ix: ^Index) -> (started: bool, err: Error) {
 		return false, .None
 	}
 	total := vec_total(ix)
-	if total < TRAIN_MIN || (ix.man.cb_gen != 0 && total < TRAIN_GROWTH * ix.man.cb_n) {
+	if ix.cb_tainted && total < u64(ix.opts.train_min) {
+		old := ix.man.cb_gen
+		ix.man.cb_gen = 0
+		if e := manifest_write(ix); e != .None {
+			ix.man.cb_gen = old
+			return false, e
+		}
+		ix.cb_tainted = false
 		return false, .None
 	}
+	if total < u64(ix.opts.train_min) || (ix.man.cb_gen != 0 && total < TRAIN_GROWTH * ix.man.cb_n && !ix.cb_tainted) {
+		return false, .None
+	}
+	dead := _dead_sorted(ix, ix.allocator) or_return
 	t, aerr := new(Vtrain, ix.allocator)
 	if aerr != nil {
 		return false, .No_Memory
@@ -270,6 +288,10 @@ vec_maybe_train :: proc(ix: ^Index) -> (started: bool, err: Error) {
 		free(t, ix.allocator)
 		return false, .No_Memory
 	}
+	t.ids = make([]u32, t.sn, a)
+	t.dead = make([]u32, len(dead), a)
+	copy(t.dead, dead)
+	delete(dead, ix.allocator)
 	ix.vtrain = t
 	return true, .None
 }
@@ -315,20 +337,47 @@ _vtrain_work :: proc(ix: ^Index, t: ^Vtrain) -> (work: i64, done: bool, err: Err
 		}
 		end := min(t.si + 1024, t.sn)
 		for i in t.si ..< end {
-			g := u64(i) * total / u64(t.sn)
-			for &s in ix.segs {
-				if g < s.f.vec_n {
-					dst := slice.to_bytes(t.sample[i * dim:][:dim])
-					got, rerr := prim.read_at(s.vfs, s.fd, dst, rec_vec_off(&s, g))
-					if rerr != .None {
-						return 0, false, _perr(rerr)
+			g0 := u64(i) * total / u64(t.sn)
+			found := false
+			for step in u64(0) ..< min(total, 4096) {
+				g := (g0 + step) % total
+				for &s in ix.segs {
+					if g < s.f.vec_n {
+						vb: [4]u8
+						cache_read(&ix.cache, &s, s.f.vids_off + i64(g) * 4, vb[:]) or_return
+						id := prim.get_u32le(vb[:])
+						if _, dead := slice.binary_search(t.dead, id); dead {
+							break
+						}
+						dst := slice.to_bytes(t.sample[i * dim:][:dim])
+						got, rerr := prim.read_at(s.vfs, s.fd, dst, rec_vec_off(&s, g))
+						if rerr != .None {
+							return 0, false, _perr(rerr)
+						}
+						if got != len(dst) {
+							return 0, false, .Corrupt
+						}
+						t.ids[i] = id
+						found = true
+						break
 					}
-					if got != len(dst) {
-						return 0, false, .Corrupt
-					}
+					g -= s.f.vec_n
+				}
+				if found {
 					break
 				}
-				g -= s.f.vec_n
+			}
+			if !found {
+				if ix.cb_tainted {
+					old := ix.man.cb_gen
+					ix.man.cb_gen = 0
+					if e := manifest_write(ix); e != .None {
+						ix.man.cb_gen = old
+						return 0, false, e
+					}
+					ix.cb_tainted = false
+				}
+				return 0, true, .None
 			}
 		}
 		work = i64(end - t.si) * i64(dim) * 4
@@ -409,6 +458,10 @@ _vtrain_work :: proc(ix: ^Index, t: ^Vtrain) -> (work: i64, done: bool, err: Err
 			prim.write_u64le(&w, v)
 		}
 		prim.write_raw(&w, slice.to_bytes(t.pq))
+		prim.write_u64le(&w, u64(len(t.ids)))
+		for id in t.ids {
+			prim.write_u32le(&w, id)
+		}
 		prim.write_u64le(&w, xxhash.XXH3_64_default(out[:]))
 		if w.err != .None {
 			return 0, false, .No_Memory
@@ -426,6 +479,8 @@ _vtrain_work :: proc(ix: ^Index, t: ^Vtrain) -> (work: i64, done: bool, err: Err
 			_ = prim.remove(ix.vfs, cb_path(ix, gen, &buf))
 			return 0, false, e
 		}
+		ix.cb_tainted = false
+		ix.taint_check = true
 		cb_gc(ix)
 		return i64(len(out)), true, .None
 	}
@@ -433,11 +488,14 @@ _vtrain_work :: proc(ix: ^Index, t: ^Vtrain) -> (work: i64, done: bool, err: Err
 }
 
 cb_gc :: proc(ix: ^Index) {
+	if !_dir_synced(ix) {
+		return
+	}
 	d: prim.Dir
 	if prim.dir_open(ix.vfs, &d, ix.dir, context.temp_allocator) != .None {
 		return
 	}
-	defer prim.dir_close(ix.vfs, &d)
+	drop := make([dynamic]string, context.temp_allocator)
 	for {
 		ent, ok, err := prim.dir_next(ix.vfs, &d)
 		if err != .None || !ok {
@@ -448,22 +506,26 @@ cb_gc :: proc(ix: ^Index) {
 			continue
 		}
 		g, gok := _parse_hex(name[3:])
-		if !gok || g == ix.man.cb_gen || (name[:3] == "zd-" && g == ix.man.zd_gen) {
+		if !gok || (name[:3] == "vq-" && g == ix.man.cb_gen) || (name[:3] == "zd-" && g == ix.man.zd_gen) {
 			continue
 		}
 		used := false
-		if name[:3] == "vq-" {
-			for s in ix.segs {
-				if s.f.cb_gen == g {
-					used = true
-					break
-				}
+		for s in ix.segs {
+			if (name[:3] == "vq-" && s.f.vec_m > 0 && s.f.cb_gen == g) || (name[:3] == "zd-" && s.f.zd_gen == g) {
+				used = true
+				break
 			}
 		}
 		if !used {
-			buf: Name_Buf
-			_ = prim.remove(ix.vfs, file_path(ix, name, &buf))
+			append(&drop, _clone_str(name, context.temp_allocator))
+			if name[:3] == "zd-" {
+				zstd_forget(&ix.zstd, g)
+			}
 		}
+	}
+	prim.dir_close(ix.vfs, &d)
+	for name in drop {
+		secure_remove(ix, name)
 	}
 }
 
@@ -684,7 +746,7 @@ _graph_search :: proc(e: ^Exec, si: int, s: ^Seg, cb: ^Cb, lut: []f32, q: []f32,
 	return .None
 }
 
-vec_candidates :: proc(e: ^Exec, q: []f32, want: int, beam: int) -> (out: [dynamic]Vhit, err: Error) {
+vec_candidates :: proc(e: ^Exec, q: []f32, want: int, beam: int, scale: int) -> (out: [dynamic]Vhit, err: Error) {
 	a := e.alloc
 	dim := len(q)
 	cap_n := max(want, 10)
@@ -693,7 +755,13 @@ vec_candidates :: proc(e: ^Exec, q: []f32, want: int, beam: int) -> (out: [dynam
 	cbs := make(map[u64]^Cb, a)
 	luts := make(map[u64][]f32, a)
 	vis: Visited
-	visited_init(&vis, max(beam, cap_n) * DEGREE * 8, a)
+	vis_n := beam if beam > 0 else DEFAULT_BEAM
+	for &sg in e.ix.segs {
+		if beam <= 0 && sg.f.vbeam > 0 {
+			vis_n = max(vis_n, int(sg.f.vbeam))
+		}
+	}
+	visited_init(&vis, max(min(vis_n * scale, MAX_BEAM), cap_n) * DEGREE * 8, a)
 	rec: []u8
 	for si in 0 ..< len(e.ix.segs) {
 		s := &e.ix.segs[si]
@@ -736,7 +804,8 @@ vec_candidates :: proc(e: ^Exec, q: []f32, want: int, beam: int) -> (out: [dynam
 		if len(rec) < int(s.f.vrec) {
 			rec = make([]u8, int(s.f.vrec), a)
 		}
-		_graph_search(e, si, s, cb, luts[s.f.cb_gen], q, max(beam, cap_n), &heap, cap_n, &vis, rec) or_return
+		sb := beam if beam > 0 else (int(s.f.vbeam) if s.f.vbeam > 0 else DEFAULT_BEAM)
+		_graph_search(e, si, s, cb, luts[s.f.cb_gen], q, max(min(sb * scale, MAX_BEAM), cap_n), &heap, cap_n, &vis, rec) or_return
 	}
 	for &h in heap {
 		s := &e.ix.segs[h.seg]

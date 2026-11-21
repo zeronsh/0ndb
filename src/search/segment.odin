@@ -6,10 +6,10 @@ import "core:slice"
 import "../prim"
 
 SEG_MAGIC :: u64(0x6765_7368_6372_7330)
-SEG_VERSION :: 11
+SEG_VERSION :: 13
 RESTART :: 64
 SUPER_ENTRY :: 12
-NFIELDS :: 42
+NFIELDS :: 44
 FOOTER_SIZE :: (NFIELDS + 3) * 8
 DIR_ENTRY :: 40
 OUT_BUF :: 256 * 1024
@@ -58,6 +58,8 @@ Footer :: struct {
 	w_count:    u64,
 	voc_off:    i64,
 	voc_len:    i64,
+	vbeam:      u64,
+	zd_gen:     u64,
 	sum:        u64,
 }
 
@@ -153,6 +155,8 @@ _footer_fields :: proc "contextless" (f: ^Footer) -> [NFIELDS]u64 {
 		f.w_count,
 		u64(f.voc_off),
 		u64(f.voc_len),
+		f.vbeam,
+		f.zd_gen,
 	}
 }
 
@@ -203,6 +207,11 @@ footer_decode :: proc(b: []u8, size: i64) -> (f: Footer, ok: bool) {
 	f.cb_gen, f.vec_m, f.medoid = v[35], v[36], v[37]
 	f.w_first, f.w_count = v[38], v[39]
 	f.voc_off, f.voc_len = i64(v[40]), i64(v[41])
+	f.vbeam = v[42]
+	f.zd_gen = v[43]
+	if f.vbeam > MAX_BEAM {
+		return
+	}
 	if f.w_first + f.w_count > f.n_terms || (f.voc_len > 0 && f.voc_len < i64(f.w_count + 1) * VREC) {
 		return
 	}

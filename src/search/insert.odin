@@ -351,25 +351,11 @@ _ins_seed :: #force_inline proc(w: ^Worker, x: u32) {
 }
 
 @(private)
-_ins_one :: proc(w: ^Worker, m: ^Merge, u: u32) -> Error {
+_expand :: proc(w: ^Worker, m: ^Merge, qv: []f32, vis: ^Visited, l: int, keep: bool) -> Error {
 	gb := w.gb
 	d := gb.dim
 	ids_at := 4 + d * 4
 	codes_at := ids_at + DEGREE * 4
-	_gb_rec_read(m, u, w.rec) or_return
-	qv := slice.reinterpret([]f32, w.rec[4:][:d * 4])
-	cb_lut(gb.cb, qv, w.lut)
-	visited_clear(&w.vis)
-	clear(&w.pool)
-	clear(&w.cands)
-	clear(&w.dists)
-	clear(&w.evec)
-	visited_add(&w.vis, u)
-	_ins_seed(w, gb.medoid)
-	own := min(int(prim.get_u32le(w.rec)), DEGREE)
-	for k in 0 ..< own {
-		_ins_seed(w, prim.get_u32le(w.rec[ids_at + 4 * k:]))
-	}
 	for {
 		idx := -1
 		for x, i in w.pool {
@@ -387,19 +373,44 @@ _ins_one :: proc(w: ^Worker, m: ^Merge, u: u32) -> Error {
 		xv := slice.reinterpret([]f32, w.rec2[4:][:d * 4])
 		append(&w.cands, x)
 		append(&w.dists, dot(qv, xv))
-		append(&w.evec, ..xv)
+		if keep {
+			append(&w.evec, ..xv)
+		}
 		dg := int(prim.get_u32le(w.rec2))
 		if dg > DEGREE {
 			continue
 		}
 		for k in 0 ..< dg {
 			nb := prim.get_u32le(w.rec2[ids_at + 4 * k:])
-			if int(nb) >= gb.n || !visited_add(&w.vis, nb) {
+			if int(nb) >= gb.n || !visited_add(vis, nb) {
 				continue
 			}
-			pool_insert(&w.pool, L_INS, Pnode{sim = adc(w.lut, w.rec2[codes_at + k * gb.m:][:gb.m], gb.cb.ksub), pos = nb})
+			pool_insert(&w.pool, l, Pnode{sim = adc(w.lut, w.rec2[codes_at + k * gb.m:][:gb.m], gb.cb.ksub), pos = nb})
 		}
 	}
+	return .None
+}
+
+@(private)
+_ins_one :: proc(w: ^Worker, m: ^Merge, u: u32) -> Error {
+	gb := w.gb
+	d := gb.dim
+	ids_at := 4 + d * 4
+	_gb_rec_read(m, u, w.rec) or_return
+	qv := slice.reinterpret([]f32, w.rec[4:][:d * 4])
+	cb_lut(gb.cb, qv, w.lut)
+	visited_clear(&w.vis)
+	clear(&w.pool)
+	clear(&w.cands)
+	clear(&w.dists)
+	clear(&w.evec)
+	visited_add(&w.vis, u)
+	_ins_seed(w, gb.medoid)
+	own := min(int(prim.get_u32le(w.rec)), DEGREE)
+	for k in 0 ..< own {
+		_ins_seed(w, prim.get_u32le(w.rec[ids_at + 4 * k:]))
+	}
+	_expand(w, m, qv, &w.vis, L_INS, true) or_return
 	_ins_extra(w, m, u, qv) or_return
 	_prune_vecs(w, u, w.cands[:], w.dists[:], w.evec[:], INS_ALPHA, INS_DEG)
 	_rec_put(gb, w.rec, w.keep[:])
@@ -632,5 +643,215 @@ _gb_indeg :: proc(m: ^Merge) -> Error {
 		gb.cursor = 0
 		_gb_repair_init(m)
 	}
+	return .None
+}
+
+CAL_Q :: 128
+CAL_K :: 10
+CAL_R :: 256
+CAL_TARGET :: 0.995
+CAL_STEP :: 65536
+CAL_LADDER :: [?]int{32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024}
+
+@(private)
+_cal_init :: proc(m: ^Merge) -> Error {
+	gb := m.gb
+	a := gb.alloc
+	q := min(CAL_Q, gb.n - 1)
+	gb.cal_q = q
+	gb.cal_ids = make([]u32, q, a)
+	gb.cal_vec = make([]f32, q * gb.dim, a)
+	gb.cal_lut = make([]f32, q * gb.m * gb.cb.ksub, a)
+	gb.cal_truth = make([]u32, q * CAL_K, a)
+	for k in 0 ..< q {
+		o := u32((k * gb.n) / q + gb.n / (2 * q))
+		gb.cal_ids[k] = o
+		v := gb.cal_vec[k * gb.dim:][:gb.dim]
+		_gb_read_vec(m, int(o), v) or_return
+		cb_lut(gb.cb, v, gb.cal_lut[k * gb.m * gb.cb.ksub:][:gb.m * gb.cb.ksub])
+	}
+	for &w in gb.workers {
+		w.bt_s = make([]f32, q * CAL_R, gb.alloc)
+		w.bt_i = make([]u32, q * CAL_R, gb.alloc)
+		w.bt_m = make([]int, q, gb.alloc)
+		if w.cvis.slots == nil {
+			ladder := CAL_LADDER
+			visited_init(&w.cvis, ladder[len(ladder) - 1] * DEGREE * 2, _warena(&w))
+			reserve(&w.cands, ladder[len(ladder) - 1] * 2)
+			reserve(&w.dists, ladder[len(ladder) - 1] * 2)
+			reserve(&w.pool, ladder[len(ladder) - 1] + 1)
+		}
+		slice.fill(w.bt_s, min(f32))
+		slice.fill(w.bt_i, NONE_U32)
+	}
+	gb.cursor = 0
+	gb.cal_level = 0
+	gb.phase = .CalBrute
+	return .None
+}
+
+@(private)
+_brute_job :: proc(w: ^Worker) {
+	gb := w.gb
+	ls := gb.m * gb.cb.ksub
+	for x in u32(gb.cursor + w.from) ..< u32(gb.cursor + w.to) {
+		code := gb.codes[int(x) * gb.m:][:gb.m]
+		for q in 0 ..< gb.cal_q {
+			if gb.cal_ids[q] == x {
+				continue
+			}
+			sim := adc(gb.cal_lut[q * ls:][:ls], code, gb.cb.ksub)
+			ts := w.bt_s[q * CAL_R:][:CAL_R]
+			mi := w.bt_m[q]
+			if sim <= ts[mi] {
+				continue
+			}
+			ts[mi] = sim
+			w.bt_i[q * CAL_R + mi] = x
+			for t in 0 ..< CAL_R {
+				if ts[t] < ts[mi] {
+					mi = t
+				}
+			}
+			w.bt_m[q] = mi
+		}
+	}
+}
+
+@(private)
+_cal_brute :: proc(m: ^Merge) -> Error {
+	gb := m.gb
+	if gb.cursor < gb.n {
+		c := min(CAL_STEP, gb.n - gb.cursor)
+		_run_workers(gb, .Brute, c)
+		_gb_workers_err(gb) or_return
+		gb.cursor += c
+		m.work += c * gb.cal_q * gb.m
+		return .None
+	}
+	d := gb.dim
+	v := gb.workers[0].vec
+	for q in 0 ..< gb.cal_q {
+		best_s: [CAL_K]f32
+		best_i: [CAL_K]u32
+		for t in 0 ..< CAL_K {
+			best_s[t] = min(f32)
+			best_i[t] = NONE_U32
+		}
+		qv := gb.cal_vec[q * d:][:d]
+		for &w in gb.workers {
+			for t in 0 ..< CAL_R {
+				id := w.bt_i[q * CAL_R + t]
+				if id == NONE_U32 {
+					continue
+				}
+				_gb_read_vec(m, int(id), v) or_return
+				sim := dot(qv, v)
+				mi := 0
+				for k in 1 ..< CAL_K {
+					if best_s[k] < best_s[mi] {
+						mi = k
+					}
+				}
+				if sim > best_s[mi] {
+					best_s[mi] = sim
+					best_i[mi] = id
+				}
+			}
+		}
+		copy(gb.cal_truth[q * CAL_K:][:CAL_K], best_i[:])
+	}
+	m.work += gb.cal_q * CAL_R * BUILD_THREADS * d * 4
+	gb.phase = .CalSearch
+	return .None
+}
+
+@(private)
+_cal_job :: proc(w: ^Worker) {
+	gb := w.gb
+	m := gb.merge
+	d := gb.dim
+	ladder := CAL_LADDER
+	l := ladder[gb.cal_level]
+	for q in w.from ..< w.to {
+		qv := gb.cal_vec[q * d:][:d]
+		self := gb.cal_ids[q]
+		cb_lut(gb.cb, qv, w.lut)
+		visited_clear(&w.cvis)
+		clear(&w.pool)
+		clear(&w.cands)
+		clear(&w.dists)
+		visited_add(&w.cvis, self)
+		if self != gb.medoid {
+			visited_add(&w.cvis, gb.medoid)
+			pool_insert(&w.pool, l, Pnode{sim = max(f32), pos = gb.medoid})
+		}
+		if e := _expand(w, m, qv, &w.cvis, l, false); e != .None {
+			w.err = e
+			return
+		}
+		top: [CAL_K]u32
+		ts: [CAL_K]f32
+		for t in 0 ..< CAL_K {
+			top[t] = NONE_U32
+			ts[t] = min(f32)
+		}
+		for x, i in w.cands {
+			if x == self {
+				continue
+			}
+			mi := 0
+			for t in 1 ..< CAL_K {
+				if ts[t] < ts[mi] {
+					mi = t
+				}
+			}
+			if w.dists[i] > ts[mi] {
+				ts[mi] = w.dists[i]
+				top[mi] = x
+			}
+		}
+		for x in top {
+			if x == NONE_U32 {
+				continue
+			}
+			for y in gb.cal_truth[q * CAL_K:][:CAL_K] {
+				if x == y {
+					w.hits += 1
+					break
+				}
+			}
+		}
+	}
+}
+
+@(private)
+_cal_search :: proc(m: ^Merge) -> Error {
+	gb := m.gb
+	ladder := CAL_LADDER
+	for &w in gb.workers {
+		w.hits = 0
+	}
+	_run_workers_min(gb, .Calib, gb.cal_q, 1)
+	_gb_workers_err(gb) or_return
+	hits := 0
+	for &w in gb.workers {
+		hits += w.hits
+	}
+	want := 0
+	for x in gb.cal_truth {
+		if x != NONE_U32 {
+			want += 1
+		}
+	}
+	l := ladder[gb.cal_level]
+	m.work += gb.cal_q * l * gb.rec
+	if f64(hits) >= CAL_TARGET * f64(want) || gb.cal_level == len(ladder) - 1 {
+		m.sw.f.vbeam = u64(ladder[min(gb.cal_level + 1, len(ladder) - 1)])
+		gb.cursor = 0
+		gb.phase = .Codes
+		return .None
+	}
+	gb.cal_level += 1
 	return .None
 }

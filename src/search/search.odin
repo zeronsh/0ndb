@@ -94,7 +94,13 @@ Options :: struct {
 	cache_pages:      int,
 	merge_factor:     int,
 	pace:             int,
+	train_min:        int,
+	dict_sample_min:  int,
+	durable:          Durable_End,
+	durable_data:     rawptr,
 }
+
+Durable_End :: #type proc(data: rawptr, source: prim.Id) -> i64
 
 Span :: struct {
 	byte_lo: u64,
@@ -143,6 +149,10 @@ Index :: struct {
 	zstd:      Zstd,
 	vtrain:    ^Vtrain,
 	broken:    bool,
+	unsynced:  bool,
+	taint_check: bool,
+	zd_tainted: bool,
+	cb_tainted: bool,
 }
 
 @(private)
@@ -231,6 +241,12 @@ open :: proc(ix: ^Index, dir: string, opts: Options, allocator := context.alloca
 	if ix.opts.pace <= 0 {
 		ix.opts.pace = DEFAULT_PACE
 	}
+	if ix.opts.train_min <= 0 {
+		ix.opts.train_min = TRAIN_MIN
+	}
+	if ix.opts.dict_sample_min <= 0 {
+		ix.opts.dict_sample_min = DICT_SAMPLE_MIN
+	}
 	if !ix.opts.store_text && ix.opts.fetch == nil {
 		return false, .Invalid
 	}
@@ -292,7 +308,20 @@ open :: proc(ix: ^Index, dir: string, opts: Options, allocator := context.alloca
 		_remove_gen(ix, g)
 	}
 	mem_reset(&ix.mem, ix.man.next_doc)
+	ix.taint_check = true
 	cb_gc(ix)
+	ahead, rerr := _reconcile(ix)
+	if rerr != .None {
+		close(ix)
+		return false, rerr
+	}
+	if ahead {
+		if e := reset(ix); e != .None {
+			close(ix)
+			return false, e
+		}
+		return true, .None
+	}
 	return false, .None
 }
 
@@ -501,7 +530,38 @@ manifest_write :: proc(ix: ^Index) -> Error {
 		return .No_Memory
 	}
 	buf: Name_Buf
-	return _perr(prim.replace_atomic(ix.vfs, file_path(ix, "MANIFEST", &buf), out[:]))
+	tbuf: Name_Buf
+	path := file_path(ix, "MANIFEST", &buf)
+	tmp := file_path(ix, "MANIFEST.tmp", &tbuf)
+	fd, oerr := prim.open_file(ix.vfs, tmp, {.Write, .Create, .Truncate})
+	if oerr != .None {
+		return _perr(oerr)
+	}
+	err := prim.write_at(ix.vfs, fd, out[:], 0)
+	if err == .None {
+		err = prim.datasync(ix.vfs, fd)
+	}
+	cerr := prim.close_file(ix.vfs, fd)
+	if err == .None {
+		err = cerr
+	}
+	if err == .None {
+		err = prim.rename(ix.vfs, tmp, path)
+	}
+	if err != .None {
+		_ = prim.remove(ix.vfs, tmp)
+		return _perr(err)
+	}
+	ix.unsynced = prim.sync_dir(ix.vfs, ix.dir) != .None
+	return .None
+}
+
+@(private)
+_dir_synced :: proc(ix: ^Index) -> bool {
+	if ix.unsynced && prim.sync_dir(ix.vfs, ix.dir) == .None {
+		ix.unsynced = false
+	}
+	return !ix.unsynced
 }
 
 commit_segment :: proc(ix: ^Index, tmp: string, replace_from, replace_to: int, f: ^Footer) -> Error {
@@ -528,10 +588,10 @@ commit_segment :: proc(ix: ^Index, tmp: string, replace_from, replace_to: int, f
 		append(&old_obs, g)
 	}
 	old_next := ix.man
-	clear(&ix.man.obsolete)
-	removed := make([dynamic]u64, context.temp_allocator)
+	if _dir_synced(ix) {
+		clear(&ix.man.obsolete)
+	}
 	for i in replace_from ..< replace_to {
-		append(&removed, ix.man.segs[i].gen)
 		append(&ix.man.obsolete, ix.man.segs[i].gen)
 	}
 	remove_range(&ix.man.segs, replace_from, replace_to)
@@ -562,8 +622,10 @@ commit_segment :: proc(ix: ^Index, tmp: string, replace_from, replace_to: int, f
 	}
 	remove_range(&ix.segs, replace_from, replace_to)
 	inject_at(&ix.segs, replace_from, s)
-	for g in removed {
-		_remove_gen(ix, g)
+	if !ix.unsynced {
+		for g in ix.man.obsolete {
+			_remove_gen(ix, g)
+		}
 	}
 	return .None
 }

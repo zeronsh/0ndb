@@ -5,6 +5,7 @@ import "core:slice"
 import "../prim"
 
 MIN_LEVEL_SIZE :: 1024 * 1024
+CONVERGE_DIV :: 4
 SMALL_LIST :: 8 * BLOCK
 RS_BUF :: 64 * 1024
 
@@ -367,11 +368,12 @@ merge_pick :: proc(ix: ^Index, idle: bool) -> (from, to: int, ok: bool) {
 		}
 		run_end = run_start
 	}
-	if ix.man.cb_gen != 0 {
-		for s, i in ix.segs {
-			if s.f.vec_n >= GRAPH_MIN && s.f.cb_gen != ix.man.cb_gen {
-				return i, i + 1, true
-			}
+	for s, i in ix.segs {
+		if s.f.vec_m > 0 && s.f.cb_gen != ix.man.cb_gen && (ix.man.cb_gen == 0 || s.f.vec_n >= GRAPH_MIN) {
+			return i, i + 1, true
+		}
+		if ix.man.store && s.f.zd_gen != 0 && s.f.zd_gen != ix.man.zd_gen {
+			return i, i + 1, true
 		}
 	}
 	if n > 4 * f {
@@ -389,15 +391,18 @@ merge_pick :: proc(ix: ^Index, idle: bool) -> (from, to: int, ok: bool) {
 	}
 	if idle {
 		first, last := -1, -1
+		largest, total := u64(0), u64(0)
 		for s, i in ix.segs {
 			if s.f.vec_n > 0 {
 				if first < 0 {
 					first = i
 				}
 				last = i
+				largest = max(largest, s.f.vec_n)
+				total += s.f.vec_n
 			}
 		}
-		if first >= 0 && last > first && last - first < 64 {
+		if first >= 0 && last > first && last - first < 64 && (total - largest) * CONVERGE_DIV >= largest {
 			return first, last + 1, true
 		}
 	}
@@ -415,6 +420,8 @@ merge_start :: proc(ix: ^Index, from, to: int) -> Error {
 		return .No_Memory
 	}
 	m.alloc = runtime.arena_allocator(&m.arena)
+	m.sw.out.vfs = ix.vfs
+	m.sw.out.fd = prim.INVALID_FD
 	ix.merge = m
 	m.from = from
 	m.to = to
@@ -471,10 +478,20 @@ merge_start :: proc(ix: ^Index, from, to: int) -> Error {
 	for i in 0 ..< len(m.segs) {
 		m.dirty[i] = make([dynamic][3]i64, a)
 		m.remap[i] = make([dynamic][2]i64, a)
-		if !ix.man.store || !m.has_dead[i] {
+		if !ix.man.store {
 			continue
 		}
 		s := &m.segs[i]
+		if s.f.zd_gen != 0 && s.f.zd_gen != ix.man.zd_gen {
+			end := s.f.text_off + s.f.text_len
+			for at := s.f.text_off; at < end; {
+				append(&m.dirty[i], [3]i64{at, 0, 0})
+				at += frame_size(&ix.cache, s, at) or_return
+			}
+		}
+		if !m.has_dead[i] {
+			continue
+		}
 		b: Doc_Block
 		db_init(&b, context.temp_allocator)
 		for d in m.dead {
@@ -509,6 +526,7 @@ merge_start :: proc(ix: ^Index, from, to: int) -> Error {
 	for s in m.segs {
 		m.sw.f.total_len += s.f.total_len
 	}
+	m.sw.f.zd_gen = ix.man.zd_gen if ix.man.store else 0
 	m.sw.f.text_off = sw_off(&m.sw)
 	m.phase = .Text
 	m.in_i = 0
@@ -543,6 +561,7 @@ _merge_step :: proc(ix: ^Index, budget: i64, idle: bool) -> (more: bool, err: Er
 		return false, .Corrupt
 	}
 	if idle && ix.merge == nil {
+		_ = redact_models(ix) or_return
 		_ = vec_maybe_train(ix) or_return
 	}
 	if ix.vtrain != nil {

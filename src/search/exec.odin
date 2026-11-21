@@ -1815,10 +1815,10 @@ _search_vector :: proc(e: ^Exec, qv: []f32, r: ^Request, qhash: u64, allocator: 
 	}
 	depth := max(HYBRID_DEPTH, 4 * limit) if has_text else limit + 1
 	vl := make([dynamic]Entry, e.alloc)
-	beam := r.beam if r.beam > 0 else DEFAULT_BEAM
+	scale := 1
 	need := depth
 	for round in 0 ..< 5 {
-		cand := vec_candidates(e, qv, need, beam) or_return
+		cand := vec_candidates(e, qv, need, r.beam, scale) or_return
 		clear(&vl)
 		for h in cand {
 			x := Entry{score = f64(h.score), id = h.id, seg = h.seg}
@@ -1845,7 +1845,7 @@ _search_vector :: proc(e: ^Exec, qv: []f32, r: ^Request, qhash: u64, allocator: 
 			break
 		}
 		need *= 4
-		beam *= 2
+		scale *= 2
 	}
 	all := make([dynamic]Entry, e.alloc)
 	if !has_text {

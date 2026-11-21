@@ -3,6 +3,8 @@ package search
 import "core:c"
 import "core:dynlib"
 import "core:hash/xxhash"
+import "base:runtime"
+import "core:slice"
 import "core:sync"
 import "../prim"
 
@@ -200,13 +202,38 @@ FRAME_RAW :: u8(0)
 FRAME_ZSTD :: u8(1)
 FRAME_DICT :: u8(2)
 
-Zstd :: struct {
-	cctx:  rawptr,
-	dctx:  rawptr,
+Zd_Slot :: struct {
+	gen:   u64,
 	cdict: rawptr,
-	ddict:  rawptr,
-	gen:    u64,
+	ddict: rawptr,
+	used:  u64,
+}
+
+Zstd :: struct {
+	cctx:   rawptr,
+	dctx:   rawptr,
+	slots:  [2]Zd_Slot,
+	tick:   u64,
 	loaded: bool,
+}
+
+@(private)
+_zd_slot_free :: proc(sl: ^Zd_Slot) {
+	if sl.cdict != nil {
+		ZSTD_freeCDict(sl.cdict)
+	}
+	if sl.ddict != nil {
+		ZSTD_freeDDict(sl.ddict)
+	}
+	sl^ = {}
+}
+
+zstd_forget :: proc(z: ^Zstd, gen: u64) {
+	for &sl in z.slots {
+		if sl.gen == gen && gen != 0 {
+			_zd_slot_free(&sl)
+		}
+	}
 }
 
 zstd_destroy :: proc(z: ^Zstd) {
@@ -220,11 +247,8 @@ zstd_destroy :: proc(z: ^Zstd) {
 	if z.dctx != nil {
 		ZSTD_freeDCtx(z.dctx)
 	}
-	if z.cdict != nil {
-		ZSTD_freeCDict(z.cdict)
-	}
-	if z.ddict != nil {
-		ZSTD_freeDDict(z.ddict)
+	for &sl in z.slots {
+		_zd_slot_free(&sl)
 	}
 	z^ = {}
 	zstd_unload()
@@ -240,39 +264,61 @@ zd_path :: proc(ix: ^Index, gen: u64, buf: ^Name_Buf) -> string {
 	return file_path(ix, string(name[:]), buf)
 }
 
+zd_parse :: proc(data: []u8) -> (dict: []u8, ids: []u8, ok: bool) {
+	if len(data) < 16 || xxhash.XXH3_64_default(data[:len(data) - 8]) != prim.get_u64le(data[len(data) - 8:]) {
+		return nil, nil, false
+	}
+	body := data[:len(data) - 8]
+	dl := int(prim.get_u32le(body[len(body) - 4:]))
+	n := int(prim.get_u32le(body[len(body) - 8:]))
+	if dl < 8 || n < 0 || dl + 4 * n + 8 != len(body) {
+		return nil, nil, false
+	}
+	return body[:dl], body[dl:][:4 * n], true
+}
+
 @(private)
-_zstd_dict :: proc(ix: ^Index) -> Error {
+_zstd_dict :: proc(ix: ^Index, gen: u64) -> (sl: ^Zd_Slot, err: Error) {
 	z := &ix.zstd
-	if ix.man.zd_gen == 0 || z.gen == ix.man.zd_gen {
-		return .None
+	if gen == 0 {
+		return nil, .None
+	}
+	z.tick += 1
+	for &x in z.slots {
+		if x.gen == gen {
+			x.used = z.tick
+			return &x, .None
+		}
 	}
 	if !_zstd_ready(z) {
-		return .Io
+		return nil, .Io
 	}
 	buf: Name_Buf
-	data, rerr := prim.read_file(ix.vfs, zd_path(ix, ix.man.zd_gen, &buf), context.temp_allocator)
+	data, rerr := prim.read_file(ix.vfs, zd_path(ix, gen, &buf), context.temp_allocator)
 	if rerr != .None {
-		return .Corrupt if rerr == .Not_Found else _perr(rerr)
+		return nil, .Corrupt if rerr == .Not_Found else _perr(rerr)
 	}
-	if len(data) < 12 || xxhash.XXH3_64_default(data[:len(data) - 8]) != prim.get_u64le(data[len(data) - 8:]) {
-		return .Corrupt
+	d, _, ok := zd_parse(data)
+	if !ok {
+		return nil, .Corrupt
 	}
-	d := data[:len(data) - 8]
-	if z.cdict != nil {
-		ZSTD_freeCDict(z.cdict)
-		z.cdict = nil
+	v := &z.slots[0]
+	for &x in z.slots {
+		if x.used < v.used {
+			v = &x
+		}
 	}
-	if z.ddict != nil {
-		ZSTD_freeDDict(z.ddict)
-		z.ddict = nil
+	_zd_slot_free(v)
+	v.cdict = ZSTD_createCDict(raw_data(d), c.size_t(len(d)), ZSTD_LEVEL)
+	v.ddict = ZSTD_createDDict(raw_data(d), c.size_t(len(d)))
+	slice.zero(data)
+	if v.cdict == nil || v.ddict == nil {
+		_zd_slot_free(v)
+		return nil, .No_Memory
 	}
-	z.cdict = ZSTD_createCDict(raw_data(d), c.size_t(len(d)), ZSTD_LEVEL)
-	z.ddict = ZSTD_createDDict(raw_data(d), c.size_t(len(d)))
-	if z.cdict == nil || z.ddict == nil {
-		return .No_Memory
-	}
-	z.gen = ix.man.zd_gen
-	return .None
+	v.gen = gen
+	v.used = z.tick
+	return v, .None
 }
 
 zstd_train :: proc(ix: ^Index) -> Error {
@@ -286,43 +332,93 @@ zstd_train :: proc(ix: ^Index) -> Error {
 			total += min(int(d.len), DICT_SAMPLE_PIECE)
 		}
 	}
-	if total < DICT_SAMPLE_MIN {
+	if total < ix.opts.dict_sample_min {
+		stored := u64(total)
+		for s in ix.segs {
+			stored += s.f.total_len
+		}
+		if stored >= u64(ix.opts.dict_sample_min) {
+			return zd_retrain(ix)
+		}
 		return .None
 	}
-	samples := make([dynamic]u8, 0, min(total, DICT_SAMPLE_MAX), context.temp_allocator)
-	sizes := make([dynamic]c.size_t, context.temp_allocator)
-	for d in m.docs {
+	zs := zd_samples_init(context.temp_allocator)
+	for d, i in m.docs {
 		if d.flags & DF_TEXT == 0 || d.flags & DF_DELETED != 0 || d.len < 8 {
 			continue
 		}
-		if len(samples) >= DICT_SAMPLE_MAX {
+		if len(zs.bytes) >= DICT_SAMPLE_MAX {
 			break
 		}
 		at := int(m.frames[d.frame]) + int(d.frame_off)
-		n := min(int(d.len), DICT_SAMPLE_PIECE)
-		append(&samples, ..m.raw[at:][:n])
-		append(&sizes, c.size_t(n))
+		zd_sample_add(&zs, u32(m.base) + u32(i), m.raw[at:][:d.len])
 	}
-	dict := make([]u8, DICT_CAP + 8, context.temp_allocator)
-	got := ZDICT_trainFromBuffer(raw_data(dict), DICT_CAP, raw_data(samples), raw_data(sizes), c.uint(len(sizes)))
-	if ZDICT_isError(got) != 0 {
+	return zd_install(ix, &zs)
+}
+
+Zd_Samples :: struct {
+	bytes: [dynamic]u8,
+	sizes: [dynamic]c.size_t,
+	ids:   [dynamic]u32,
+}
+
+zd_samples_init :: proc(allocator: runtime.Allocator) -> Zd_Samples {
+	return Zd_Samples{bytes = make([dynamic]u8, allocator), sizes = make([dynamic]c.size_t, allocator), ids = make([dynamic]u32, allocator)}
+}
+
+zd_sample_add :: proc(zs: ^Zd_Samples, id: u32, text: []u8) {
+	n := min(len(text), DICT_SAMPLE_PIECE)
+	if n < 8 {
+		return
+	}
+	append(&zs.bytes, ..text[:n])
+	append(&zs.sizes, c.size_t(n))
+	append(&zs.ids, id)
+}
+
+zd_install :: proc(ix: ^Index, zs: ^Zd_Samples) -> Error {
+	gen := u64(0)
+	defer slice.zero(zs.bytes[:])
+	if len(zs.bytes) >= ix.opts.dict_sample_min && _zstd_ready(&ix.zstd) {
+		out := make([]u8, DICT_CAP + 4 * len(zs.ids) + 16, context.temp_allocator)
+		defer slice.zero(out)
+		cap_n := min(DICT_CAP, max(len(zs.bytes) / 10, 1024))
+		got := ZDICT_trainFromBuffer(raw_data(out), c.size_t(cap_n), raw_data(zs.bytes), raw_data(zs.sizes), c.uint(len(zs.sizes)))
+		if ZDICT_isError(got) == 0 {
+			n := int(got)
+			at := n
+			for id in zs.ids {
+				prim.put_u32le(out[at:], id)
+				at += 4
+			}
+			prim.put_u32le(out[at:], u32(len(zs.ids)))
+			prim.put_u32le(out[at + 4:], u32(n))
+			at += 8
+			prim.put_u64le(out[at:], xxhash.XXH3_64_default(out[:at]))
+			gen = ix.man.next_gen
+			buf: Name_Buf
+			if e := prim.replace_atomic(ix.vfs, zd_path(ix, gen, &buf), out[:at + 8]); e != .None {
+				return _perr(e)
+			}
+		}
+	}
+	if gen == 0 && ix.man.zd_gen == 0 {
 		return .None
-	}
-	n := int(got)
-	prim.put_u64le(dict[n:], xxhash.XXH3_64_default(dict[:n]))
-	gen := ix.man.next_gen
-	buf: Name_Buf
-	if e := prim.replace_atomic(ix.vfs, zd_path(ix, gen, &buf), dict[:n + 8]); e != .None {
-		return _perr(e)
 	}
 	old_gen, old_next := ix.man.zd_gen, ix.man.next_gen
 	ix.man.zd_gen = gen
-	ix.man.next_gen = gen + 1
+	if gen != 0 {
+		ix.man.next_gen = gen + 1
+	}
 	if e := manifest_write(ix); e != .None {
 		ix.man.zd_gen, ix.man.next_gen = old_gen, old_next
-		_ = prim.remove(ix.vfs, zd_path(ix, gen, &buf))
+		if gen != 0 {
+			buf: Name_Buf
+			_ = prim.remove(ix.vfs, zd_path(ix, gen, &buf))
+		}
 		return e
 	}
+	ix.taint_check = true
 	return .None
 }
 
@@ -339,7 +435,7 @@ frame_write :: proc(ix: ^Index, w: ^prim.Writer, raw: []u8, scratch: ^[dynamic]u
 		}
 		return _cerr(w.err)
 	}
-	_zstd_dict(ix) or_return
+	sl := _zstd_dict(ix, ix.man.zd_gen) or_return
 	if z.cctx == nil {
 		z.cctx = ZSTD_createCCtx()
 		if z.cctx == nil {
@@ -352,9 +448,9 @@ frame_write :: proc(ix: ^Index, w: ^prim.Writer, raw: []u8, scratch: ^[dynamic]u
 	}
 	mode := FRAME_ZSTD
 	got: c.size_t
-	if z.cdict != nil {
+	if sl != nil {
 		mode = FRAME_DICT
-		got = ZSTD_compress_usingCDict(z.cctx, raw_data(scratch[:]), c.size_t(bound), raw_data(raw), c.size_t(len(raw)), z.cdict)
+		got = ZSTD_compress_usingCDict(z.cctx, raw_data(scratch[:]), c.size_t(bound), raw_data(raw), c.size_t(len(raw)), sl.cdict)
 	} else {
 		got = ZSTD_compressCCtx(z.cctx, raw_data(scratch[:]), c.size_t(bound), raw_data(raw), c.size_t(len(raw)), ZSTD_LEVEL)
 	}
@@ -408,6 +504,7 @@ frame_size :: proc(c: ^Cache, s: ^Seg, at: i64) -> (size: i64, err: Error) {
 
 frame_read :: proc(ix: ^Index, s: ^Seg, at: i64, out: ^[dynamic]u8, scratch: ^[dynamic]u8) -> Error {
 	raw, mode, plen, hdr := _frame_header(&ix.cache, s, at) or_return
+	ddict: rawptr
 	if grow(scratch, plen + 4) != nil || grow(out, raw) != nil {
 		return .No_Memory
 	}
@@ -421,10 +518,11 @@ frame_read :: proc(ix: ^Index, s: ^Seg, at: i64, out: ^[dynamic]u8, scratch: ^[d
 		copy(out[:], payload)
 		return .None
 	case FRAME_DICT:
-		_zstd_dict(ix) or_return
-		if ix.zstd.ddict == nil {
+		sl := _zstd_dict(ix, s.f.zd_gen) or_return
+		if sl == nil {
 			return .Corrupt
 		}
+		ddict = sl.ddict
 	}
 	z := &ix.zstd
 	if !_zstd_ready(z) {
@@ -438,7 +536,7 @@ frame_read :: proc(ix: ^Index, s: ^Seg, at: i64, out: ^[dynamic]u8, scratch: ^[d
 	}
 	got: c.size_t
 	if mode == FRAME_DICT {
-		got = ZSTD_decompress_usingDDict(z.dctx, raw_data(out[:]), c.size_t(raw), raw_data(payload), c.size_t(plen), z.ddict)
+		got = ZSTD_decompress_usingDDict(z.dctx, raw_data(out[:]), c.size_t(raw), raw_data(payload), c.size_t(plen), ddict)
 	} else {
 		got = ZSTD_decompressDCtx(z.dctx, raw_data(out[:]), c.size_t(raw), raw_data(payload), c.size_t(plen))
 	}

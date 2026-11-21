@@ -850,6 +850,7 @@ mem_flush :: proc(ix: ^Index) -> Error {
 	sw.f.text_len = sw_off(&sw) - sw.f.text_off
 	sw.f.docs_off = sw_off(&sw)
 	sw.f.total_len = m.total_len
+	sw.f.zd_gen = ix.man.zd_gen if store else 0
 	metas: [DOC_BLOCK]Doc_Meta
 	enc := make([dynamic]u8, 0, 64 * 1024, context.temp_allocator)
 	field_scratch := make([dynamic]Field_Bytes, context.temp_allocator)
