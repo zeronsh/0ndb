@@ -748,7 +748,7 @@ check_idle :: proc(w: ^World) {
 			world_fail(w, "idle: %s has %d armed timers after settle (batches=%d dirty=%d durable_tick=%d tick=%d pack_pressure=%v)", n.name, a, len(n.e.batches), len(n.e.dirty), n.e.durable_tick, n.e.tick, eng.pressured(&n.e))
 			for h in n.inst.loop.heap {
 				t := n.inst.loop.timers[h]
-				world_note(w, "  armed timer cb=%p ref=%p due in %d ms", rawptr(t.cb), rawptr(prim.loop_step), (t.deadline - prim.loop_now_ns(&n.inst.loop)) / 1_000_000)
+				world_note(w, "  armed timer cb=%s due in %d ms", code_ref(rawptr(t.cb)), (t.deadline - prim.loop_now_ns(&n.inst.loop)) / 1_000_000)
 			}
 		}
 		if loop_ready(&n.inst.loop) {

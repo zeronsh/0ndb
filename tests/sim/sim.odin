@@ -281,9 +281,8 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	trace_bytes_at = env_u64("SIM_TRACE_BYTES_AT", 0)
 	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {}
 	cfg.io_rate = env_u64("SIM_IO", cfg.io_rate)
-	cfg.drain_wall_s = int(env_u64("SIM_DRAIN_WALL", 30))
 	region_configure(env_u64("SIM_REGION_MB", 256), env_u64("SIM_TEMP_MB", 96))
-	cfg.rss_max = env_u64("SIM_RSS_MAX", 1500)
+	cfg.mem_max = env_u64("SIM_MEM_MAX", 1500)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
 	if v, ok := os.lookup_env("SIM_STORAGE", context.temp_allocator); ok {
 		if mode, mok := storage_mode_of(v); mok {
@@ -962,17 +961,16 @@ got_stats :: proc(st: Wire_Stats) -> bool {
 	return st.ops > 0 || st.faults > 0 || st.disk_ops > 0
 }
 
-rss_mib :: proc() -> int {
-	data, err := os.read_entire_file_from_path("/proc/self/statm", context.temp_allocator)
-	if err != nil {
-		return 0
+sim_footprint :: proc(w: ^World) -> (total: int) {
+	for n in w.nodes {
+		total += n.inst.main.bytes
+		if n.inst.temp.peak > 0 {
+			total += int(n.inst.temp.peak - n.inst.temp.base)
+		}
+		total += int(disk_bytes(&n.disk)) + int(n.disk.pend_bytes)
 	}
-	fields := strings.fields(string(data), context.temp_allocator)
-	if len(fields) < 2 {
-		return 0
-	}
-	pages, _ := strconv.parse_int(fields[1])
-	return pages * 4096 >> 20
+	total += w.relay.inst.main.bytes + int(disk_bytes(&w.relay.disk)) + int(w.relay.disk.pend_bytes)
+	return
 }
 
 memory_runaway :: proc(w: ^World) -> bool {
@@ -980,12 +978,12 @@ memory_runaway :: proc(w: ^World) -> bool {
 	if w.mem_checks & 255 != 0 {
 		return false
 	}
-	rss := rss_mib()
-	if rss < int(w.cfg.rss_max) {
+	mib := sim_footprint(w) >> 20
+	if mib < int(w.cfg.mem_max) {
 		return false
 	}
 	b := strings.builder_make(context.temp_allocator)
-	fmt.sbprintf(&b, "memory runaway: RSS %d MiB at t=%d ms; queue=%d events", rss, w.now / 1_000_000, len(w.queue))
+	fmt.sbprintf(&b, "memory runaway: footprint %d MiB at t=%d ms; queue=%d events", mib, w.now / 1_000_000, len(w.queue))
 	for n in w.nodes {
 		fmt.sbprintf(&b, "; %s region %d MiB live (%d blocks) temp peak %d MiB disk %d MiB unsynced %d MiB", n.name, n.inst.main.bytes >> 20, n.inst.main.live, int(n.inst.temp.peak - n.inst.temp.base) >> 20 if n.inst.temp.peak > 0 else 0, disk_bytes(&n.disk) >> 20, n.disk.pend_bytes >> 20)
 	}

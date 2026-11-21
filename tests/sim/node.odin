@@ -1,7 +1,6 @@
 package sim
 
 import "core:fmt"
-import "core:time"
 import eng "../../src/engine"
 import "../../src/pack"
 import "../../src/prim"
@@ -161,6 +160,17 @@ id_less :: proc(a, b: prim.Id) -> bool {
 	return false
 }
 
+code_ref :: proc(p: rawptr) -> string {
+	if p == nil {
+		return "none"
+	}
+	off := i64(uintptr(p)) - i64(uintptr(rawptr(prim.loop_step)))
+	if off < 0 {
+		return fmt.tprintf("prim.loop_step-%#x", -off)
+	}
+	return fmt.tprintf("prim.loop_step+%#x", off)
+}
+
 id_short :: proc(id: prim.Id) -> string {
 	h := prim.id_hex(id)
 	return fmt.tprintf("%s", string(h[24:32]))
@@ -242,7 +252,6 @@ node_drain :: proc(n: ^Node) -> bool {
 		return false
 	}
 	context = instance_context(&n.inst)
-	started := time.tick_now()
 	for i := 0; ; i += 1 {
 		if !n.alive {
 			return did
@@ -250,12 +259,12 @@ node_drain :: proc(n: ^Node) -> bool {
 		if !loop_ready(&n.inst.loop) && !loop_due(&n.inst.loop) {
 			return did
 		}
-		if i > 100_000 || time.duration_seconds(time.tick_since(started)) > f64(w.cfg.drain_wall_s) {
+		if i > 100_000 {
 			cb: rawptr
 			if len(n.inst.loop.heap) > 0 {
 				cb = rawptr(n.inst.loop.timers[n.inst.loop.heap[0]].cb)
 			}
-			world_fail(w, "%s livelock: its loop kept running at t=%d ms for %d steps (%.0f s wall) without settling; next timer callback %p (prim.loop_step at %p)", n.name, w.now / 1_000_000, i, time.duration_seconds(time.tick_since(started)), cb, rawptr(prim.loop_step))
+			world_fail(w, "%s livelock: its loop kept running at t=%d ms for %d steps without settling; next timer callback %s", n.name, w.now / 1_000_000, i, code_ref(cb))
 			w.aborted = true
 			return did
 		}
