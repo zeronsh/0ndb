@@ -577,7 +577,7 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 	snap := fstree.current(&h.hist.tree)
 	out = make([]Tree_Conflict, len(list), allocator)
 	for c, i in list {
-		p, ok, perr := fstree.path(&snap, c.inode, context.temp_allocator)
+		p, ok, perr := fstree.last_path(&snap, c.inode, context.temp_allocator)
 		if perr == nil && ok {
 			out[i].path = _clone(p, allocator) or_return
 		}
