@@ -25,6 +25,16 @@ const history_mod = @import("../core/history.zig");
 const diff_mod = @import("../core/diff.zig");
 const vcs = @import("../fs/vcs.zig");
 const wt_mod = @import("../fs/worktrees.zig");
+const pool_mod = @import("../fs/pool.zig");
+const space_mod = @import("../space/space.zig");
+const space_mgr_mod = @import("../space/manager.zig");
+const project_mod = @import("../project/project.zig");
+const timeline_mod = @import("../fs/timeline.zig");
+const keyring_mod = @import("../sync/keyring.zig");
+const lease_mod = @import("../sync/lease.zig");
+const thread_model = @import("../thread/model.zig");
+const thread_store_mod = @import("../thread/store.zig");
+const thread_rt_mod = @import("../thread/runtime.zig");
 
 pub const MAX_CONNS: usize = 128;
 pub const MAX_WORKERS: usize = 32;
@@ -43,6 +53,7 @@ const CONFLICTS_MAGIC: u32 = 0x43464C31;
 pub const ServerConfig = struct {
     default_access: iface.AccessMode = .accept_edits,
     prewarm_models: bool = true,
+    v2_root: ?[]const u8 = null,
 };
 
 pub fn parseAccessMode(s: []const u8) ?iface.AccessMode {
@@ -741,7 +752,7 @@ fn nextGeneratedTurn(io: Io, root: []const u8) u64 {
     return max + 1;
 }
 
-const BASH_TEST_OUTPUT ="\x1b[1mBuild Summary:\x1b[0m 3/3 steps succeeded\n\x1b[32m✓\x1b[0m test-core 41 passed\n\x1b[32m✓\x1b[0m test-sync 17 passed\n\x1b[2m(0.84s)\x1b[0m\n";
+const BASH_TEST_OUTPUT = "\x1b[1mBuild Summary:\x1b[0m 3/3 steps succeeded\n\x1b[32m✓\x1b[0m test-core 41 passed\n\x1b[32m✓\x1b[0m test-sync 17 passed\n\x1b[2m(0.84s)\x1b[0m\n";
 
 fn nowUs(io: Io) u64 {
     const ts = Io.Clock.awake.now(io);
@@ -1469,6 +1480,29 @@ fn loadOrCreateMasterKey(allocator: Allocator, io: Io, state_path: []const u8) !
     return key;
 }
 
+fn chmodPath(allocator: Allocator, path: []const u8, mode: posix.mode_t) void {
+    const z = allocator.alloc(u8, path.len + 1) catch return;
+    defer allocator.free(z);
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    const zptr: [*:0]const u8 = @ptrCast(z.ptr);
+    _ = linux.fchmodat(linux.AT.FDCWD, zptr, mode);
+}
+
+const V2State = struct {
+    v2_root_path: []u8,
+    runner_id: u128,
+    device_id: u128,
+    resources: *pool_mod.DaemonResources,
+    spaces: space_mgr_mod.SpaceManager,
+    projects: project_mod.ProjectStore,
+    catalog_dir: Io.Dir,
+    catalog: thread_store_mod.CatalogStore,
+    keyring: keyring_mod.Keyring,
+    leases: lease_mod.LeaseManager,
+    runtime: thread_rt_mod.ThreadRuntime,
+};
+
 pub const PlaygroundServer = struct {
     allocator: Allocator,
     io: Io,
@@ -1518,6 +1552,9 @@ pub const PlaygroundServer = struct {
     relay_sync_cond: Io.Condition,
     relay_sync_pending: std.ArrayList(u128),
     relay_sync_thread: std.Thread,
+    v2_mu: Io.Mutex,
+    v2: V2State,
+    v2_maint_thread: std.Thread,
 
     pub fn start(
         allocator: Allocator,
@@ -1646,6 +1683,85 @@ pub const PlaygroundServer = struct {
         self.dev_b_pages = try blobs_mod.BlobStore.open(allocator, io, self.dev_b_dir, "pages", blobs_mod.DEFAULT_CACHE_BUDGET);
         errdefer self.dev_b_pages.deinit();
 
+        self.v2_mu = Io.Mutex.init;
+        const v2_root = if (config.v2_root) |vr|
+            try allocator.dupe(u8, vr)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/.0ndb/v2", .{workspace_path});
+        self.v2.v2_root_path = v2_root;
+        errdefer allocator.free(self.v2.v2_root_path);
+
+        try Io.Dir.cwd().createDirPath(io, v2_root);
+        chmodPath(allocator, v2_root, 0o700);
+
+        const v2_res_path = try std.fmt.allocPrint(allocator, "{s}/resources", .{v2_root});
+        defer allocator.free(v2_res_path);
+        const v2_spaces_path = try std.fmt.allocPrint(allocator, "{s}/spaces", .{v2_root});
+        defer allocator.free(v2_spaces_path);
+        const v2_checkouts_path = try std.fmt.allocPrint(allocator, "{s}/checkouts", .{v2_root});
+        defer allocator.free(v2_checkouts_path);
+        const v2_projects_path = try std.fmt.allocPrint(allocator, "{s}/projects", .{v2_root});
+        defer allocator.free(v2_projects_path);
+        const v2_catalog_path = try std.fmt.allocPrint(allocator, "{s}/catalog", .{v2_root});
+        defer allocator.free(v2_catalog_path);
+        const v2_leases_path = try std.fmt.allocPrint(allocator, "{s}/leases", .{v2_root});
+        defer allocator.free(v2_leases_path);
+        const v2_threads_path = try std.fmt.allocPrint(allocator, "{s}/threads", .{v2_root});
+        defer allocator.free(v2_threads_path);
+
+        try Io.Dir.cwd().createDirPath(io, v2_catalog_path);
+
+        self.v2.resources = try pool_mod.DaemonResources.init(allocator, io, v2_res_path, .{});
+        errdefer self.v2.resources.deinit();
+
+        self.v2.spaces = try space_mgr_mod.SpaceManager.open(allocator, io, v2_spaces_path, v2_checkouts_path, self.v2.resources);
+        errdefer self.v2.spaces.deinit();
+
+        self.v2.projects = try project_mod.ProjectStore.open(allocator, io, v2_projects_path);
+        errdefer self.v2.projects.deinit();
+
+        self.v2.catalog_dir = try Io.Dir.cwd().openDir(io, v2_catalog_path, .{ .iterate = true });
+        errdefer self.v2.catalog_dir.close(io);
+
+        self.v2.catalog = try thread_store_mod.CatalogStore.open(allocator, io, self.v2.catalog_dir);
+        errdefer self.v2.catalog.deinit();
+
+        {
+            var v2_dir = try Io.Dir.cwd().openDir(io, v2_root, .{ .iterate = true });
+            defer v2_dir.close(io);
+            if (keyring_mod.Keyring.load(allocator, io, v2_dir, "keyring.bin")) |kr| {
+                self.v2.keyring = kr;
+            } else |_| {
+                const rid = id.newUuidV7(io);
+                const ark = crypto.AccountRootKey.generate(io);
+                self.v2.keyring = keyring_mod.Keyring.initAccountDevice(allocator, io, ark, rid);
+                try self.v2.keyring.saveAtomic(v2_dir, "keyring.bin");
+                const kr_path = try std.fmt.allocPrint(allocator, "{s}/keyring.bin", .{v2_root});
+                defer allocator.free(kr_path);
+                chmodPath(allocator, kr_path, 0o600);
+            }
+        }
+        errdefer self.v2.keyring.deinit();
+
+        self.v2.runner_id = self.v2.keyring.runner_id;
+        self.v2.device_id = self.v2.keyring.runner_id;
+
+        self.v2.leases = try lease_mod.LeaseManager.init(allocator, io, v2_leases_path, self.v2.runner_id, null);
+        errdefer self.v2.leases.deinit();
+
+        self.v2.runtime = try thread_rt_mod.ThreadRuntime.init(allocator, io, .{
+            .spaces = &self.v2.spaces,
+            .projects = &self.v2.projects,
+            .catalog = &self.v2.catalog,
+            .keyring = &self.v2.keyring,
+            .leases = &self.v2.leases,
+            .root_dir = v2_threads_path,
+            .runner_id = self.v2.runner_id,
+            .device_id = self.v2.device_id,
+            .shared_blobs = self.v2.resources.blob_pool,
+        });
+        errdefer self.v2.runtime.deinit();
+
         const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
         if (linux.errno(s_rc) != .SUCCESS) return error.SocketFailed;
         self.listen_fd = @intCast(s_rc);
@@ -1695,6 +1811,12 @@ pub const PlaygroundServer = struct {
             self.relay_sync_thread.join();
         }
         self.sse_keepalive_thread = try std.Thread.spawn(.{}, sseKeepaliveMain, .{self});
+        errdefer {
+            self.running.store(false, .release);
+            self.sse_keepalive_thread.join();
+            self.v2_maint_thread.join();
+        }
+        self.v2_maint_thread = try std.Thread.spawn(.{}, v2MaintMain, .{self});
         if (config.prewarm_models) {
             self.startPrewarmModels();
         }
@@ -1747,6 +1869,20 @@ pub const PlaygroundServer = struct {
         while (mit.next()) |v| v.deinit(self.allocator);
         self.model_cache.deinit();
         self.models_mu.unlock(self.io);
+        self.v2.runtime.deinit();
+        self.v2.leases.deinit();
+        if (Io.Dir.cwd().openDir(self.io, self.v2.v2_root_path, .{ .iterate = true })) |vd_val| {
+            var vd = vd_val;
+            defer vd.close(self.io);
+            self.v2.keyring.saveAtomic(vd, "keyring.bin") catch {};
+        } else |_| {}
+        self.v2.keyring.deinit();
+        self.v2.catalog.deinit();
+        self.v2.catalog_dir.close(self.io);
+        self.v2.projects.deinit();
+        self.v2.spaces.deinit();
+        self.v2.resources.deinit();
+        self.allocator.free(self.v2.v2_root_path);
         self.dev_b_pages.deinit();
         self.dev_b_dir.close(self.io);
         self.dev_b.deinit();
@@ -1995,7 +2131,7 @@ pub const PlaygroundServer = struct {
 
         self.models_mu.lockUncancelable(self.io);
         defer self.models_mu.unlock(self.io);
-        const key = @intFromEnum(provider);
+        const key = @backingInt(provider);
         if (self.model_cache.fetchRemove(key)) |old| {
             var ov = old.value;
             ov.deinit(self.allocator);
@@ -2700,6 +2836,9 @@ pub const PlaygroundServer = struct {
         body: []const u8,
         out: *std.ArrayList(u8),
     ) !void {
+        if (std.mem.startsWith(u8, path, "/api/v2/")) {
+            return self.routeV2Api(method, path, query, body, out);
+        }
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/info")) {
             const provs = registry.listProviders(self.io);
             const rss_kb = readRssKb(self.io);
@@ -2779,7 +2918,7 @@ pub const PlaygroundServer = struct {
                 .muse,
             };
             for (all_ids) |pid| {
-                const entry = self.model_cache.get(@intFromEnum(pid)) orelse continue;
+                const entry = self.model_cache.get(@backingInt(pid)) orelse continue;
                 if (!first) try out.append(self.allocator, ',');
                 first = false;
                 try out.print(self.allocator, "\"{s}\":", .{pid.slug()});
@@ -2810,7 +2949,7 @@ pub const PlaygroundServer = struct {
             var has_cached = false;
             if (!force) {
                 self.models_mu.lockUncancelable(self.io);
-                has_cached = self.model_cache.contains(@intFromEnum(pid));
+                has_cached = self.model_cache.contains(@backingInt(pid));
                 self.models_mu.unlock(self.io);
             }
             if (!has_cached or force) {
@@ -2819,7 +2958,7 @@ pub const PlaygroundServer = struct {
 
             self.models_mu.lockUncancelable(self.io);
             defer self.models_mu.unlock(self.io);
-            if (self.model_cache.get(@intFromEnum(pid))) |entry| {
+            if (self.model_cache.get(@backingInt(pid))) |entry| {
                 try appendCatalogJson(self.allocator, out, pid, &entry);
             } else {
                 try out.print(
@@ -4995,7 +5134,2191 @@ pub const PlaygroundServer = struct {
         appendDeltaJson(self.allocator, &buf, ctx, kind, id.nowMs(self.io), extra) catch return;
         self.broadcastSse(buf.items);
     }
+
+    fn v2MaintMain(self: *PlaygroundServer) void {
+        var elapsed_ms: u64 = 0;
+        while (self.running.load(.acquire)) {
+            self.io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch {};
+            if (!self.running.load(.acquire)) return;
+            elapsed_ms += 100;
+            if (elapsed_ms >= 2000) {
+                elapsed_ms = 0;
+                self.v2_mu.lockUncancelable(self.io);
+                self.runV2MaintenanceTickLocked();
+                self.v2_mu.unlock(self.io);
+            }
+        }
+    }
+
+    fn runV2MaintenanceTickLocked(self: *PlaygroundServer) void {
+        const now_ms = id.nowMs(self.io);
+        _ = self.v2.spaces.hibernateIdle(now_ms, self.v2.resources.governor.budget.idle_hibernate_ms);
+
+        if (self.v2.resources.watcher) |w| {
+            if (w.nextEventBatch(self.io, 0) catch null) |res_val| {
+                var res = res_val;
+                defer res.deinit(self.allocator);
+                for (res.batches.items) |*batch| {
+                    var sit = self.v2.spaces.slots.valueIterator();
+                    while (sit.next()) |slot| {
+                        if (slot.projection) |proj| {
+                            if (proj.watcher_mount_id) |mid| {
+                                if (mid == batch.mount_id) {
+                                    _ = proj.ingestMountBatch(batch) catch {};
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var sit2 = self.v2.spaces.slots.valueIterator();
+        while (sit2.next()) |slot| {
+            if (slot.projection) |proj| {
+                if (proj.isDirty()) {
+                    _ = proj.ingestDirty() catch {};
+                }
+            }
+        }
+
+        if (self.v2.runtime.listThreads(self.allocator, null) catch null) |threads| {
+            defer {
+                for (threads) |*t| t.deinit(self.allocator);
+                self.allocator.free(threads);
+            }
+            for (threads) |ts| {
+                if (self.v2.runtime.pollDueTriggers(self.allocator, ts.thread_id, now_ms) catch null) |due| {
+                    defer thread_rt_mod.freeDueTriggers(self.allocator, due);
+                    for (due) |dt| {
+                        const outcome = self.v2.runtime.fireTrigger(ts.thread_id, dt.trigger_id, dt.event_token, now_ms) catch continue;
+                        if (outcome == .fired) {
+                            self.emitV2Event("v2_trigger_fired");
+                        }
+                    }
+                }
+            }
+        }
+
+        self.v2.resources.refreshGovernorStats();
+    }
+
+    fn emitV2Event(self: *PlaygroundServer, kind: []const u8) void {
+        var buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"type\":\"{s}\"}}", .{kind}) catch return;
+        self.broadcastSse(json);
+    }
+
+    fn hibernateSpaceByIdLocked(self: *PlaygroundServer, space_id: u128) !struct { hibernated: bool, state: space_mgr_mod.SlotState } {
+        if (self.v2.spaces.get(space_id) == null) return error.SpaceNotFound;
+        const slot = self.v2.spaces.slots.getPtr(space_id) orelse return error.SpaceNotFound;
+        if (slot.state != .hot or slot.pin_count > 0) {
+            return .{ .hibernated = false, .state = slot.state };
+        }
+        if (slot.projection) |proj| {
+            proj.hibernate();
+        } else if (slot.space) |sp| {
+            sp.hibernate();
+        }
+        slot.state = .warm;
+        self.v2.resources.governor.decHot();
+        const new_bytes: usize = if (slot.space) |sp| sp.approxMemoryBytes() else 0;
+        if (new_bytes > slot.approx_bytes) {
+            self.v2.resources.governor.addWorkspaceBytes(new_bytes - slot.approx_bytes);
+        } else if (slot.approx_bytes > new_bytes) {
+            self.v2.resources.governor.subWorkspaceBytes(slot.approx_bytes - new_bytes);
+        }
+        slot.approx_bytes = new_bytes;
+        self.v2.resources.refreshGovernorStats();
+        return .{ .hibernated = true, .state = slot.state };
+    }
+
+    fn routeV2Api(
+        self: *PlaygroundServer,
+        method: []const u8,
+        path: []const u8,
+        query: []const u8,
+        body: []const u8,
+        out: *std.ArrayList(u8),
+    ) !void {
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v2/health")) {
+            return self.handleV2Health(out);
+        }
+        if (std.mem.eql(u8, path, "/api/v2/projects") or std.mem.startsWith(u8, path, "/api/v2/projects/")) {
+            return self.handleV2Projects(method, path, body, out);
+        }
+        if (std.mem.eql(u8, path, "/api/v2/spaces") or std.mem.startsWith(u8, path, "/api/v2/spaces/")) {
+            return self.handleV2Spaces(method, path, query, body, out);
+        }
+        if (std.mem.eql(u8, path, "/api/v2/threads") or std.mem.startsWith(u8, path, "/api/v2/threads/")) {
+            return self.handleV2Threads(method, path, query, body, out);
+        }
+        return error.InvalidRoute;
+    }
+
+    fn handleV2Health(self: *PlaygroundServer, out: *std.ArrayList(u8)) !void {
+        self.v2_mu.lockUncancelable(self.io);
+        defer self.v2_mu.unlock(self.io);
+
+        self.v2.resources.refreshGovernorStats();
+        const stats = self.v2.resources.governor.snapshot();
+        const hot = self.v2.spaces.hotCount();
+        const warm = self.v2.spaces.warmCount();
+        const cold = self.v2.spaces.coldCount();
+        const open_spaces = hot + warm;
+        const hibernated_spaces = warm + cold;
+        const projects_count = self.v2.projects.list().len;
+        const threads = try self.v2.runtime.listThreads(self.allocator, null);
+        defer {
+            for (threads) |*t| t.deinit(self.allocator);
+            self.allocator.free(threads);
+        }
+        const watcher_fds: usize = if (self.v2.resources.watcher) |w| w.fdCount() else 0;
+        const mem_bytes = stats.workspace_bytes + stats.blob_bytes + stats.git_delta_bytes;
+
+        var rhex: [32]u8 = undefined;
+        _ = id.formatIdHex(self.v2.runner_id, &rhex);
+        var dhex: [32]u8 = undefined;
+        _ = id.formatIdHex(self.v2.device_id, &dhex);
+
+        try out.print(
+            self.allocator,
+            "{{\"ok\":true,\"open_spaces\":{d},\"total_spaces\":{d},\"hot_spaces\":{d},\"warm_spaces\":{d},\"cold_spaces\":{d},\"hibernated_spaces\":{d},\"projects_count\":{d},\"threads_count\":{d},\"memory_governor_bytes\":{d},\"workspace_bytes\":{d},\"blob_bytes\":{d},\"git_delta_bytes\":{d},\"watcher_fds\":{d},\"watch_count\":{d},\"runner_id\":\"{s}\",\"device_id\":\"{s}\"}}",
+            .{
+                open_spaces,
+                self.v2.spaces.spaceCount(),
+                hot,
+                warm,
+                cold,
+                hibernated_spaces,
+                projects_count,
+                threads.len,
+                mem_bytes,
+                stats.workspace_bytes,
+                stats.blob_bytes,
+                stats.git_delta_bytes,
+                watcher_fds,
+                stats.watch_count,
+                rhex,
+                dhex,
+            },
+        );
+    }
+
+    fn handleV2Projects(
+        self: *PlaygroundServer,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+        out: *std.ArrayList(u8),
+    ) !void {
+        if (std.mem.eql(u8, path, "/api/v2/projects")) {
+            if (std.mem.eql(u8, method, "GET")) {
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                try out.appendSlice(self.allocator, "{\"projects\":[");
+                for (self.v2.projects.list(), 0..) |*p, i| {
+                    if (i > 0) try out.append(self.allocator, ',');
+                    try appendV2ProjectJson(self.allocator, out, p);
+                }
+                try out.appendSlice(self.allocator, "]}");
+                return;
+            }
+            if (std.mem.eql(u8, method, "POST")) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                const name = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "name")) orelse
+                    rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse return error.MissingName;
+                const instructions = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "instructions")) orelse "";
+                const prov_slug = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "default_provider")) orelse "mock";
+                const prov_id = parseProviderSlug(prov_slug);
+                const def_model = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "default_model"));
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+
+                var proj = try self.v2.projects.create(name, instructions, @backingInt(prov_id), def_model);
+                const pid = proj.project_id;
+                proj.deinit(self.allocator);
+
+                if (rpc.jsonObjGet(parsed.value, "space_ids")) |sids_val| {
+                    if (sids_val == .array) {
+                        for (sids_val.array.items) |item| {
+                            var sid: u128 = 0;
+                            var alias_opt: ?[]const u8 = null;
+                            var access_u8: u8 = @backingInt(thread_model.SpaceAccess.shared_rw);
+                            if (item == .string) {
+                                sid = try id.parseIdHex(item.string);
+                            } else if (item == .object) {
+                                const sid_str = rpc.jsonStr(rpc.jsonObjGet(item, "space_id")) orelse return error.InvalidSpaceId;
+                                sid = try id.parseIdHex(sid_str);
+                                alias_opt = rpc.jsonStr(rpc.jsonObjGet(item, "alias")) orelse rpc.jsonStr(rpc.jsonObjGet(item, "role"));
+                                if (rpc.jsonStr(rpc.jsonObjGet(item, "access"))) |acc_s| {
+                                    access_u8 = @backingInt(parseV2SpaceAccess(acc_s));
+                                }
+                            } else {
+                                return error.InvalidSpaceId;
+                            }
+                            const rec = self.v2.spaces.get(sid) orelse return error.SpaceNotFound;
+                            try self.v2.projects.addSpace(pid, .{
+                                .space_id = sid,
+                                .alias = @constCast(alias_opt orelse rec.title),
+                                .kind = rec.kind,
+                                .default_access = access_u8,
+                                .git_remote_url = rec.git_remote_url,
+                            });
+                        }
+                    }
+                }
+
+                const stored = self.v2.projects.get(pid) orelse return error.ProjectNotFound;
+                const proj_sids = try self.allocator.alloc(u128, stored.spaces.len);
+                defer self.allocator.free(proj_sids);
+                for (stored.spaces, 0..) |sr, idx| proj_sids[idx] = sr.space_id;
+                _ = self.v2.catalog.putProject(.{
+                    .project_id = stored.project_id,
+                    .name = stored.title,
+                    .space_ids = proj_sids,
+                    .default_provider = prov_id,
+                    .updated_ms = stored.updated_ms,
+                    .actor = self.v2.runner_id,
+                }) catch {};
+
+                try out.appendSlice(self.allocator, "{\"project\":");
+                try appendV2ProjectJson(self.allocator, out, stored);
+                try out.append(self.allocator, '}');
+                self.emitV2Event("v2_updated");
+                return;
+            }
+            return error.InvalidRoute;
+        }
+
+        const rest = path["/api/v2/projects/".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidRoute;
+        const pid = try id.parseIdHex(rest[0..slash]);
+        const sub = rest[slash + 1 ..];
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "spaces")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const sid_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "space_id")) orelse return error.InvalidSpaceId;
+            const sid = try id.parseIdHex(sid_str);
+            const alias_opt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "alias")) orelse rpc.jsonStr(rpc.jsonObjGet(parsed.value, "role"));
+            const acc_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "access")) orelse "shared_rw";
+            const acc = parseV2SpaceAccess(acc_str);
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const rec = self.v2.spaces.get(sid) orelse return error.SpaceNotFound;
+            try self.v2.projects.addSpace(pid, .{
+                .space_id = sid,
+                .alias = @constCast(alias_opt orelse rec.title),
+                .kind = rec.kind,
+                .default_access = @backingInt(acc),
+                .git_remote_url = rec.git_remote_url,
+            });
+            const stored = self.v2.projects.get(pid) orelse return error.ProjectNotFound;
+            try out.appendSlice(self.allocator, "{\"ok\":true,\"project\":");
+            try appendV2ProjectJson(self.allocator, out, stored);
+            try out.append(self.allocator, '}');
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, sub, "spaces/")) {
+            const sid = try id.parseIdHex(sub["spaces/".len..]);
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const removed = try self.v2.projects.removeSpace(pid, sid);
+            try out.print(self.allocator, "{{\"ok\":true,\"removed\":{}}}", .{removed});
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "fork")) {
+            var title_prefix: []const u8 = "fork";
+            var project_locally = false;
+            var parsed_opt: ?std.json.Parsed(std.json.Value) = null;
+            defer if (parsed_opt) |*p| p.deinit();
+            if (body.len > 0) {
+                parsed_opt = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                if (rpc.jsonStr(rpc.jsonObjGet(parsed_opt.?.value, "title_prefix"))) |tp| title_prefix = tp;
+                if (rpc.jsonBool(rpc.jsonObjGet(parsed_opt.?.value, "project_locally"))) |pl| project_locally = pl;
+            }
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const proj = self.v2.projects.get(pid) orelse return error.ProjectNotFound;
+            const sids = try self.allocator.alloc(u128, proj.spaces.len);
+            defer self.allocator.free(sids);
+            for (proj.spaces, 0..) |sr, i| sids[i] = sr.space_id;
+
+            const forked_ids = try project_mod.SpaceSet.forkSpaceSet(self.allocator, &self.v2.spaces, sids, title_prefix, project_locally);
+            defer self.allocator.free(forked_ids);
+
+            var phex: [32]u8 = undefined;
+            _ = id.formatIdHex(pid, &phex);
+            try out.print(self.allocator, "{{\"project_id\":\"{s}\",\"forked_space_ids\":[", .{phex});
+            for (forked_ids, 0..) |fid, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                var fhex: [32]u8 = undefined;
+                _ = id.formatIdHex(fid, &fhex);
+                try out.print(self.allocator, "\"{s}\"", .{fhex});
+            }
+            try out.appendSlice(self.allocator, "]}");
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "sync")) {
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const fork_ids = try self.resolveProjectForkIdsLocked(pid, body);
+            defer self.allocator.free(fork_ids);
+
+            const entries = try project_mod.SpaceSet.syncSpaceSet(self.allocator, &self.v2.spaces, fork_ids);
+            defer {
+                for (entries) |*e| e.deinit(self.allocator);
+                self.allocator.free(entries);
+            }
+
+            try out.appendSlice(self.allocator, "{\"synced\":[");
+            for (entries, 0..) |e, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                var shex: [32]u8 = undefined;
+                var ohex: [32]u8 = undefined;
+                _ = id.formatIdHex(e.space_id, &shex);
+                _ = id.formatIdHex(e.origin_space_id, &ohex);
+                try out.print(
+                    self.allocator,
+                    "{{\"space_id\":\"{s}\",\"origin_space_id\":\"{s}\",\"brought\":{d},\"merged_count\":{d},\"conflict_count\":{d}}}",
+                    .{ shex, ohex, e.report.brought, e.report.merged.len, e.report.conflicts.len },
+                );
+            }
+            try out.appendSlice(self.allocator, "]}");
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "land")) {
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const fork_ids = try self.resolveProjectForkIdsLocked(pid, body);
+            defer self.allocator.free(fork_ids);
+
+            var report = try project_mod.SpaceSet.landSpaceSet(self.allocator, &self.v2.spaces, fork_ids);
+            defer report.deinit(self.allocator);
+
+            try appendV2LandReportJson(self.allocator, out, &report);
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        return error.InvalidRoute;
+    }
+
+    fn resolveProjectForkIdsLocked(self: *PlaygroundServer, pid: u128, body: []const u8) ![]u128 {
+        var list: std.ArrayList(u128) = .empty;
+        errdefer list.deinit(self.allocator);
+
+        if (body.len > 0) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            if (rpc.jsonObjGet(parsed.value, "fork_ids")) |fv| {
+                if (fv == .array) {
+                    for (fv.array.items) |it| {
+                        if (it != .string) return error.InvalidSpaceId;
+                        try list.append(self.allocator, try id.parseIdHex(it.string));
+                    }
+                    return try list.toOwnedSlice(self.allocator);
+                }
+            }
+        }
+
+        const proj = self.v2.projects.get(pid) orelse return error.ProjectNotFound;
+        for (proj.spaces) |sr| {
+            if (self.v2.spaces.get(sr.space_id)) |rec| {
+                if (rec.origin != null) {
+                    try list.append(self.allocator, sr.space_id);
+                }
+            }
+        }
+        return try list.toOwnedSlice(self.allocator);
+    }
+
+    fn handleV2Spaces(
+        self: *PlaygroundServer,
+        method: []const u8,
+        path: []const u8,
+        query: []const u8,
+        body: []const u8,
+        out: *std.ArrayList(u8),
+    ) !void {
+        if (std.mem.eql(u8, path, "/api/v2/spaces")) {
+            if (std.mem.eql(u8, method, "GET")) {
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                try out.appendSlice(self.allocator, "{\"spaces\":[");
+                for (self.v2.spaces.list(), 0..) |*rec, i| {
+                    if (i > 0) try out.append(self.allocator, ',');
+                    try self.appendV2SpaceJsonLocked(out, rec);
+                }
+                try out.appendSlice(self.allocator, "]}");
+                return;
+            }
+            if (std.mem.eql(u8, method, "POST")) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                const name = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "name")) orelse
+                    rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse return error.MissingName;
+                const kind_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "kind")) orelse "virtual";
+                const local_path_opt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "path"));
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+
+                var rec = if (std.mem.eql(u8, kind_str, "virtual") and local_path_opt == null)
+                    try self.v2.spaces.createVirtual(name)
+                else if (std.mem.eql(u8, kind_str, "dir") or std.mem.eql(u8, kind_str, "git_worktree") or local_path_opt != null) blk: {
+                    const lp = local_path_opt orelse return error.MissingPath;
+                    if (lp.len == 0) return error.MissingPath;
+                    break :blk try self.v2.spaces.adoptLocal(lp, name);
+                } else return error.InvalidKind;
+                defer rec.deinit(self.allocator);
+
+                const proj_lp: ?[]u8 = if (self.v2.spaces.getProjectionRecord(rec.space_id)) |pr| pr.local_path else null;
+                _ = self.v2.catalog.putSpace(.{
+                    .space_id = rec.space_id,
+                    .name = rec.title,
+                    .kind = switch (rec.kind) {
+                        .virtual => .virtual,
+                        .dir => .dir,
+                        .git_worktree => .git_worktree,
+                    },
+                    .local_path = proj_lp,
+                    .remote_url = rec.git_remote_url,
+                    .updated_ms = rec.updated_ms,
+                    .actor = self.v2.runner_id,
+                }) catch {};
+
+                const stored = self.v2.spaces.get(rec.space_id) orelse &rec;
+                try out.appendSlice(self.allocator, "{\"space\":");
+                try self.appendV2SpaceJsonLocked(out, stored);
+                try out.append(self.allocator, '}');
+                self.emitV2Event("v2_updated");
+                return;
+            }
+            return error.InvalidRoute;
+        }
+
+        const rest = path["/api/v2/spaces/".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidRoute;
+        const sid = try id.parseIdHex(rest[0..slash]);
+        const sub = rest[slash + 1 ..];
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "fork")) {
+            var title: []const u8 = "fork";
+            var project_locally = false;
+            var parsed_opt: ?std.json.Parsed(std.json.Value) = null;
+            defer if (parsed_opt) |*p| p.deinit();
+            if (body.len > 0) {
+                parsed_opt = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                if (rpc.jsonStr(rpc.jsonObjGet(parsed_opt.?.value, "name")) orelse rpc.jsonStr(rpc.jsonObjGet(parsed_opt.?.value, "title"))) |t| title = t;
+                if (rpc.jsonBool(rpc.jsonObjGet(parsed_opt.?.value, "project_locally"))) |pl| project_locally = pl;
+            }
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            var rec = try self.v2.spaces.forkSpace(sid, title, project_locally);
+            defer rec.deinit(self.allocator);
+            const stored = self.v2.spaces.get(rec.space_id) orelse &rec;
+            try out.appendSlice(self.allocator, "{\"space\":");
+            try self.appendV2SpaceJsonLocked(out, stored);
+            try out.append(self.allocator, '}');
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "hibernate")) {
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const res = try self.hibernateSpaceByIdLocked(sid);
+            try out.print(
+                self.allocator,
+                "{{\"ok\":true,\"hibernated\":{},\"state\":\"{s}\"}}",
+                .{ res.hibernated, slotStateName(res.state) },
+            );
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "compact")) {
+            var policy = space_mod.CompactPolicy{};
+            if (body.len > 0) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                if (rpc.jsonU64(rpc.jsonObjGet(parsed.value, "retain_latest_batches"))) |v| policy.retain_latest_batches = @intCast(v);
+                if (rpc.jsonU64(rpc.jsonObjGet(parsed.value, "retain_ms"))) |v| policy.retain_ms = v;
+                if (rpc.jsonBool(rpc.jsonObjGet(parsed.value, "force_gc"))) |v| policy.force_gc = v;
+            }
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+            const st = try sp.compactWithPolicy(policy);
+            try out.print(
+                self.allocator,
+                "{{\"ok\":true,\"pruned_batches\":{d},\"reclaimed_batch_bytes\":{d},\"removed_blobs\":{d},\"reclaimed_blob_bytes\":{d},\"removed_segments\":{d},\"rewritten_segments\":{d},\"base_size_bytes\":{d}}}",
+                .{
+                    st.pruned_batches,
+                    st.reclaimed_batch_bytes,
+                    st.removed_blobs,
+                    st.reclaimed_blob_bytes,
+                    st.removed_segments,
+                    st.rewritten_segments,
+                    st.base_size_bytes,
+                },
+            );
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "files")) {
+            const dir_opt = try queryParamAlloc(self.allocator, query, "dir");
+            defer if (dir_opt) |d| self.allocator.free(d);
+            const rec_opt = try queryParamAlloc(self.allocator, query, "recursive");
+            defer if (rec_opt) |r| self.allocator.free(r);
+            const base_dir = dir_opt orelse "";
+            const recursive = if (rec_opt) |r| !std.mem.eql(u8, r, "0") else (dir_opt == null);
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+
+            var entries: std.ArrayList(V2FileItem) = .empty;
+            defer {
+                for (entries.items) |*e| e.deinit(self.allocator);
+                entries.deinit(self.allocator);
+            }
+            try collectSpaceFiles(self.allocator, sp, base_dir, recursive, 0, &entries);
+
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"dir\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, base_dir);
+            try out.appendSlice(self.allocator, ",\"files\":[");
+            for (entries.items, 0..) |e, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                try out.appendSlice(self.allocator, "{\"path\":");
+                try rpc.appendJsonEscaped(self.allocator, out, e.path);
+                try out.appendSlice(self.allocator, ",\"name\":");
+                try rpc.appendJsonEscaped(self.allocator, out, e.name);
+                try out.print(self.allocator, ",\"kind\":\"{s}\"}}", .{dirEntryKindName(e.kind)});
+            }
+            try out.appendSlice(self.allocator, "]}");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "file")) {
+            const rel_path = (try queryParamAlloc(self.allocator, query, "path")) orelse return error.MissingPath;
+            defer self.allocator.free(rel_path);
+            if (!isSafeRelPath(rel_path)) return error.InvalidPath;
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+            const content_opt = try sp.readFileAlloc(self.allocator, rel_path);
+            defer if (content_opt) |c| self.allocator.free(c);
+
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"path\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, rel_path);
+            try out.print(self.allocator, ",\"exists\":{},\"content\":", .{content_opt != null});
+            if (content_opt) |c| {
+                try rpc.appendJsonEscaped(self.allocator, out, c);
+            } else {
+                try out.appendSlice(self.allocator, "null");
+            }
+            try out.append(self.allocator, '}');
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "PUT") and std.mem.eql(u8, sub, "file")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const rel_path = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "path")) orelse return error.MissingPath;
+            const content = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "content")) orelse return error.MissingContent;
+            if (!isSafeRelPath(rel_path)) return error.InvalidPath;
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+            const bid = try sp.putFile(self.v2.runner_id, rel_path, content);
+            if (try self.v2.spaces.activateProjection(sid)) |proj| {
+                proj.materializeFile(rel_path) catch {};
+            }
+
+            var shex: [32]u8 = undefined;
+            var ahex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            _ = id.formatIdHex(bid.actor, &ahex);
+            try out.print(self.allocator, "{{\"ok\":true,\"space_id\":\"{s}\",\"path\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, rel_path);
+            try out.print(self.allocator, ",\"batch_ts\":{d},\"batch_actor\":\"{s}\"}}", .{ bid.ts, ahex });
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "DELETE") and std.mem.eql(u8, sub, "file")) {
+            const rel_alloc: ?[]u8 = try queryParamAlloc(self.allocator, query, "path");
+            defer if (rel_alloc) |p| self.allocator.free(p);
+            var parsed_opt: ?std.json.Parsed(std.json.Value) = null;
+            defer if (parsed_opt) |*p| p.deinit();
+            var rel_path: []const u8 = "";
+            if (rel_alloc) |p| {
+                rel_path = p;
+            } else if (body.len > 0) {
+                parsed_opt = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                rel_path = rpc.jsonStr(rpc.jsonObjGet(parsed_opt.?.value, "path")) orelse return error.MissingPath;
+            } else {
+                return error.MissingPath;
+            }
+            if (!isSafeRelPath(rel_path)) return error.InvalidPath;
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+            const deleted_bid = try sp.deletePath(self.v2.runner_id, rel_path);
+            if (try self.v2.spaces.activateProjection(sid)) |proj| {
+                proj.materializeChanged() catch {};
+            }
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            try out.print(self.allocator, "{{\"ok\":true,\"space_id\":\"{s}\",\"path\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, rel_path);
+            try out.print(self.allocator, ",\"deleted\":{}}}", .{deleted_bid != null});
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "search")) {
+            const q_str = (try queryParamAlloc(self.allocator, query, "q")) orelse return error.MissingQuery;
+            defer self.allocator.free(q_str);
+            const prefix_opt = try queryParamAlloc(self.allocator, query, "prefix");
+            defer if (prefix_opt) |p| self.allocator.free(p);
+            const lim_opt = try queryParamAlloc(self.allocator, query, "limit");
+            defer if (lim_opt) |l| self.allocator.free(l);
+            const limit: usize = if (lim_opt) |l| std.fmt.parseInt(usize, l, 10) catch 50 else 50;
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+            const hits = try sp.searchText(self.allocator, q_str, prefix_opt, @min(limit, 500));
+            defer {
+                for (hits) |*h| h.deinit(self.allocator);
+                self.allocator.free(hits);
+            }
+
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"query\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, q_str);
+            try out.appendSlice(self.allocator, ",\"hits\":[");
+            for (hits, 0..) |h, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                try out.appendSlice(self.allocator, "{\"path\":");
+                try rpc.appendJsonEscaped(self.allocator, out, h.path);
+                try out.print(self.allocator, ",\"line\":{d},\"snippet\":", .{h.line});
+                try rpc.appendJsonEscaped(self.allocator, out, h.snippet);
+                try out.append(self.allocator, '}');
+            }
+            try out.appendSlice(self.allocator, "]}");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "meta")) {
+            const key_opt = try queryParamAlloc(self.allocator, query, "key");
+            defer if (key_opt) |k| self.allocator.free(k);
+            const prefix_opt = try queryParamAlloc(self.allocator, query, "prefix");
+            defer if (prefix_opt) |p| self.allocator.free(p);
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+
+            if (key_opt) |k| {
+                const val = sp.getMeta(k);
+                try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"key\":", .{shex});
+                try rpc.appendJsonEscaped(self.allocator, out, k);
+                try out.appendSlice(self.allocator, ",\"value\":");
+                if (val) |v| {
+                    try rpc.appendJsonEscaped(self.allocator, out, v);
+                } else {
+                    try out.appendSlice(self.allocator, "null");
+                }
+                try out.append(self.allocator, '}');
+                return;
+            }
+
+            const pref = prefix_opt orelse "";
+            const entries = try sp.listMetaPrefix(self.allocator, pref);
+            defer {
+                for (entries) |*e| e.deinit(self.allocator);
+                self.allocator.free(entries);
+            }
+            try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"prefix\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, pref);
+            try out.appendSlice(self.allocator, ",\"entries\":[");
+            for (entries, 0..) |e, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                try out.appendSlice(self.allocator, "{\"key\":");
+                try rpc.appendJsonEscaped(self.allocator, out, e.key);
+                try out.appendSlice(self.allocator, ",\"value\":");
+                try rpc.appendJsonEscaped(self.allocator, out, e.value);
+                try out.append(self.allocator, '}');
+            }
+            try out.appendSlice(self.allocator, "]}");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "PUT") and std.mem.eql(u8, sub, "meta")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const key = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "key")) orelse return error.MissingKey;
+            const val_raw = rpc.jsonObjGet(parsed.value, "value");
+            const val_opt: ?[]const u8 = if (val_raw) |vr| switch (vr) {
+                .null => null,
+                .string => |s| s,
+                else => return error.InvalidValue,
+            } else null;
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+            _ = try sp.setMeta(self.v2.runner_id, key, val_opt);
+
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            try out.print(self.allocator, "{{\"ok\":true,\"space_id\":\"{s}\",\"key\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, key);
+            try out.appendSlice(self.allocator, ",\"value\":");
+            if (val_opt) |v| {
+                try rpc.appendJsonEscaped(self.allocator, out, v);
+            } else {
+                try out.appendSlice(self.allocator, "null");
+            }
+            try out.append(self.allocator, '}');
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "timeline")) {
+            const lim_opt = try queryParamAlloc(self.allocator, query, "limit");
+            defer if (lim_opt) |l| self.allocator.free(l);
+            const limit: usize = if (lim_opt) |l| std.fmt.parseInt(usize, l, 10) catch 50 else 50;
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+            const entries = try timeline_mod.listEntriesForSpace(self.allocator, sp, null, @min(limit, 500));
+            defer timeline_mod.freeTimelineEntries(self.allocator, entries);
+
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"entries\":[", .{shex});
+            for (entries, 0..) |e, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                var ahex: [32]u8 = undefined;
+                _ = id.formatIdHex(e.batch_id.actor, &ahex);
+                try out.print(
+                    self.allocator,
+                    "{{\"batch_id\":{{\"ts\":{d},\"actor\":\"{s}\"}},\"wall_ms\":{d},\"total_added\":{d},\"total_removed\":{d},\"files\":[",
+                    .{ e.batch_id.ts, ahex, e.wall_ms, e.total_added, e.total_removed },
+                );
+                for (e.files, 0..) |f, j| {
+                    if (j > 0) try out.append(self.allocator, ',');
+                    try out.appendSlice(self.allocator, "{\"path\":");
+                    try rpc.appendJsonEscaped(self.allocator, out, f.path);
+                    try out.print(
+                        self.allocator,
+                        ",\"kind\":\"{s}\",\"added_lines\":{d},\"removed_lines\":{d}}}",
+                        .{ changeKindName(f.kind), f.added_lines, f.removed_lines },
+                    );
+                }
+                try out.appendSlice(self.allocator, "]}");
+            }
+            try out.appendSlice(self.allocator, "]}");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "diff")) {
+            const ts_opt = try queryParamAlloc(self.allocator, query, "ts");
+            defer if (ts_opt) |t| self.allocator.free(t);
+            const actor_opt = try queryParamAlloc(self.allocator, query, "actor");
+            defer if (actor_opt) |a| self.allocator.free(a);
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            try self.v2.spaces.pin(sid);
+            defer self.v2.spaces.unpin(sid);
+            const sp = try self.v2.spaces.activate(sid);
+
+            var bids_buf: [1]id.BatchId = undefined;
+            var bids_len: usize = 0;
+            if (ts_opt != null and actor_opt != null) {
+                const ts = try std.fmt.parseInt(u64, ts_opt.?, 10);
+                const actor = try id.parseIdHex(actor_opt.?);
+                bids_buf[0] = id.BatchId.init(ts, actor);
+                bids_len = 1;
+            } else {
+                const latest = try timeline_mod.listEntriesForSpace(self.allocator, sp, null, 1);
+                defer timeline_mod.freeTimelineEntries(self.allocator, latest);
+                if (latest.len > 0) {
+                    bids_buf[0] = latest[0].batch_id;
+                    bids_len = 1;
+                }
+            }
+
+            const diff_text = try timeline_mod.unifiedDiffForSpace(self.allocator, sp, bids_buf[0..bids_len]);
+            defer self.allocator.free(diff_text);
+
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sid, &shex);
+            try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"diff\":", .{shex});
+            try rpc.appendJsonEscaped(self.allocator, out, diff_text);
+            try out.append(self.allocator, '}');
+            return;
+        }
+
+        return error.InvalidRoute;
+    }
+
+    fn handleV2Threads(
+        self: *PlaygroundServer,
+        method: []const u8,
+        path: []const u8,
+        query: []const u8,
+        body: []const u8,
+        out: *std.ArrayList(u8),
+    ) !void {
+        if (std.mem.eql(u8, path, "/api/v2/threads")) {
+            if (std.mem.eql(u8, method, "GET")) {
+                const pid_opt_str = try queryParamAlloc(self.allocator, query, "project_id");
+                defer if (pid_opt_str) |s| self.allocator.free(s);
+                const pid_filter: ?u128 = if (pid_opt_str) |s| if (s.len > 0) try id.parseIdHex(s) else null else null;
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                const summaries = try self.v2.runtime.listThreads(self.allocator, pid_filter);
+                defer {
+                    for (summaries) |*s| s.deinit(self.allocator);
+                    self.allocator.free(summaries);
+                }
+
+                try out.appendSlice(self.allocator, "{\"threads\":[");
+                for (summaries, 0..) |s, i| {
+                    if (i > 0) try out.append(self.allocator, ',');
+                    const active_turn: ?u128 = if (self.v2.runtime.active_turns.get(s.thread_id)) |at| at.turn_id else null;
+                    if (self.v2.runtime.getThreadMeta(self.allocator, s.thread_id) catch null) |meta_val| {
+                        var meta = meta_val;
+                        defer meta.deinit(self.allocator);
+                        try appendV2ThreadMetaJson(self.allocator, out, &meta, active_turn, s.message_count, s.active_tasks, s.unread_mailbox);
+                    } else {
+                        try appendV2ThreadSummaryFallbackJson(self.allocator, out, &s, active_turn);
+                    }
+                }
+                try out.appendSlice(self.allocator, "]}");
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "POST")) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                const title = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse "Untitled V2 Thread";
+                const pid_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "project_id"));
+                const project_id: ?u128 = if (pid_str) |ps| if (ps.len > 0) try id.parseIdHex(ps) else null else null;
+                const prov_slug = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "provider_id")) orelse
+                    rpc.jsonStr(rpc.jsonObjGet(parsed.value, "provider")) orelse "mock";
+                const prov_id = parseProviderSlug(prov_slug);
+                const model_opt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "model"));
+                const sys_prompt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "system_prompt"));
+                const budget = parseV2Budget(rpc.jsonObjGet(parsed.value, "budget"));
+
+                var bindings: std.ArrayList(thread_model.SpaceBinding) = .empty;
+                defer {
+                    for (bindings.items) |*b| b.deinit(self.allocator);
+                    bindings.deinit(self.allocator);
+                }
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+
+                if (rpc.jsonObjGet(parsed.value, "bindings")) |bval| {
+                    if (bval == .array) {
+                        for (bval.array.items) |item| {
+                            const b = try self.parseBindingItemLocked(item);
+                            try bindings.append(self.allocator, b);
+                        }
+                    }
+                }
+
+                var meta = try self.v2.runtime.createThread(.{
+                    .title = title,
+                    .project_id = project_id,
+                    .bindings = bindings.items,
+                    .budget = budget,
+                    .provider_id = prov_id,
+                    .model = model_opt,
+                    .system_prompt = sys_prompt,
+                });
+                defer meta.deinit(self.allocator);
+
+                try out.appendSlice(self.allocator, "{\"thread\":");
+                try appendV2ThreadMetaJson(self.allocator, out, &meta, null, 0, 0, 0);
+                try out.append(self.allocator, '}');
+                self.emitV2Event("v2_updated");
+                return;
+            }
+            return error.InvalidRoute;
+        }
+
+        const rest = path["/api/v2/threads/".len..];
+        const slash_opt = std.mem.indexOfScalar(u8, rest, '/');
+        if (slash_opt == null) {
+            if (!std.mem.eql(u8, method, "GET")) return error.InvalidRoute;
+            const tid = try id.parseIdHex(rest);
+            return self.handleV2ThreadDetail(tid, out);
+        }
+
+        const tid = try id.parseIdHex(rest[0..slash_opt.?]);
+        const sub = rest[slash_opt.? + 1 ..];
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "bind")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            var b = try self.parseBindingItemLocked(parsed.value);
+            defer b.deinit(self.allocator);
+            try self.v2.runtime.bindSpace(tid, b);
+            var meta = (try self.v2.runtime.getThreadMeta(self.allocator, tid)) orelse return error.ThreadNotFound;
+            defer meta.deinit(self.allocator);
+            const active_turn: ?u128 = if (self.v2.runtime.active_turns.get(tid)) |at| at.turn_id else null;
+            try out.appendSlice(self.allocator, "{\"ok\":true,\"thread\":");
+            try appendV2ThreadMetaJson(self.allocator, out, &meta, active_turn, 0, 0, 0);
+            try out.append(self.allocator, '}');
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, sub, "bind/")) {
+            const sid = try id.parseIdHex(sub["bind/".len..]);
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const removed = try self.v2.runtime.unbindSpace(tid, sid);
+            try out.print(self.allocator, "{{\"ok\":true,\"removed\":{}}}", .{removed});
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "turns")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const prompt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "prompt")) orelse return error.MissingPrompt;
+            const reply_opt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "reply")) orelse
+                rpc.jsonStr(rpc.jsonObjGet(parsed.value, "assistant_text"));
+            const prov_opt: ?iface.ProviderId = if (rpc.jsonStr(rpc.jsonObjGet(parsed.value, "provider_id")) orelse rpc.jsonStr(rpc.jsonObjGet(parsed.value, "provider"))) |ps|
+                parseProviderSlug(ps)
+            else
+                null;
+            const model_opt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "model"));
+            const parent_msg_id: ?u128 = if (rpc.jsonStr(rpc.jsonObjGet(parsed.value, "parent_msg_id"))) |ps|
+                if (ps.len > 0) try id.parseIdHex(ps) else null
+            else
+                null;
+            const usage = thread_rt_mod.TurnUsage{
+                .tokens = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "tokens")) orelse 0,
+                .cost_microusd = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "cost_microusd")) orelse 0,
+                .wall_ms = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "wall_ms")) orelse 0,
+            };
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+
+            var begin_res = try self.v2.runtime.beginTurn(tid, prompt, .{
+                .provider = prov_opt,
+                .model = model_opt,
+                .parent_msg_id = parent_msg_id,
+            });
+            defer begin_res.deinit(self.allocator);
+            var completed = false;
+            errdefer if (!completed) {
+                self.v2.runtime.cancelTurn(tid, begin_res.turn_id) catch {};
+            };
+
+            if (rpc.jsonObjGet(parsed.value, "mutations")) |mval| {
+                if (mval == .array) {
+                    const store = try self.v2.runtime.openThread(tid);
+                    const meta = store.meta orelse return error.ThreadNotFound;
+                    for (mval.array.items) |mut| {
+                        const sid_str = rpc.jsonStr(rpc.jsonObjGet(mut, "space_id")) orelse return error.InvalidSpaceId;
+                        const sid = try id.parseIdHex(sid_str);
+                        const rel_path = rpc.jsonStr(rpc.jsonObjGet(mut, "path")) orelse return error.MissingPath;
+                        const content = rpc.jsonStr(rpc.jsonObjGet(mut, "content")) orelse return error.MissingContent;
+                        if (!isSafeRelPath(rel_path)) return error.InvalidPath;
+                        var writable = false;
+                        for (meta.bindings) |b| {
+                            if (b.space_id == sid) {
+                                writable = (b.access != .read_only);
+                                break;
+                            }
+                        }
+                        if (!writable) return error.AccessEscalation;
+                        try self.v2.spaces.pin(sid);
+                        defer self.v2.spaces.unpin(sid);
+                        const sp = try self.v2.spaces.activate(sid);
+                        _ = try sp.putFile(self.v2.runner_id, rel_path, content);
+                        if (try self.v2.spaces.activateProjection(sid)) |proj| {
+                            proj.materializeFile(rel_path) catch {};
+                        }
+                    }
+                }
+            }
+
+            const default_reply = if (reply_opt == null)
+                try std.fmt.allocPrint(self.allocator, "Acknowledged: {s}", .{prompt})
+            else
+                null;
+            defer if (default_reply) |r| self.allocator.free(r);
+            const assistant_text = reply_opt orelse default_reply.?;
+
+            var post_cp = try self.v2.runtime.completeTurn(tid, begin_res.turn_id, assistant_text, &.{}, usage, null);
+            defer post_cp.deinit(self.allocator);
+            completed = true;
+
+            var turn_hex: [32]u8 = undefined;
+            var umsg_hex: [32]u8 = undefined;
+            _ = id.formatIdHex(begin_res.turn_id, &turn_hex);
+            _ = id.formatIdHex(begin_res.user_msg_id, &umsg_hex);
+            try out.print(
+                self.allocator,
+                "{{\"turn_id\":\"{s}\",\"user_msg_id\":\"{s}\",\"fencing_epoch\":{d},\"assistant_text\":",
+                .{ turn_hex, umsg_hex, begin_res.fencing_epoch },
+            );
+            try rpc.appendJsonEscaped(self.allocator, out, assistant_text);
+            try out.appendSlice(self.allocator, ",\"pre_checkpoint\":");
+            try appendV2CheckpointVectorJson(self.allocator, out, &begin_res.pre_checkpoint);
+            try out.appendSlice(self.allocator, ",\"post_checkpoint\":");
+            try appendV2CheckpointVectorJson(self.allocator, out, &post_cp);
+            try out.append(self.allocator, '}');
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "rollback")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const mid_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "message_id")) orelse
+                rpc.jsonStr(rpc.jsonObjGet(parsed.value, "msg_id")) orelse return error.MissingMessageId;
+            const mid = try id.parseIdHex(mid_str);
+            const use_pre = rpc.jsonBool(rpc.jsonObjGet(parsed.value, "use_pre_checkpoint")) orelse false;
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const res = try self.v2.runtime.rollbackThreadToMessage(tid, mid, .{
+                .use_pre_checkpoint = use_pre,
+            });
+            var ihex: [32]u8 = undefined;
+            _ = id.formatIdHex(res.intent_id, &ihex);
+            try out.print(
+                self.allocator,
+                "{{\"ok\":true,\"intent_id\":\"{s}\",\"spaces_rolled_back\":{d},\"completed\":{}}}",
+                .{ ihex, res.spaces_rolled_back, res.completed },
+            );
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "recover-rollbacks")) {
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const res_opt = try self.v2.runtime.recoverPendingRollbacks(tid);
+            if (res_opt) |res| {
+                var ihex: [32]u8 = undefined;
+                _ = id.formatIdHex(res.intent_id, &ihex);
+                try out.print(
+                    self.allocator,
+                    "{{\"ok\":true,\"recovered\":true,\"intent_id\":\"{s}\",\"spaces_rolled_back\":{d},\"completed\":{}}}",
+                    .{ ihex, res.spaces_rolled_back, res.completed },
+                );
+            } else {
+                try out.appendSlice(self.allocator, "{\"ok\":true,\"recovered\":false}");
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "tasks")) {
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const store = try self.v2.runtime.openThread(tid);
+            var thex: [32]u8 = undefined;
+            _ = id.formatIdHex(tid, &thex);
+            try out.print(self.allocator, "{{\"thread_id\":\"{s}\",\"tasks\":[", .{thex});
+            var it = store.tasks.valueIterator();
+            var idx: usize = 0;
+            while (it.next()) |task| {
+                if (idx > 0) try out.append(self.allocator, ',');
+                idx += 1;
+                try appendV2TaskJson(self.allocator, out, task);
+            }
+            try out.appendSlice(self.allocator, "]}");
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "subordinates")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const title = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse "Subordinate Task";
+            const prompt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "prompt")) orelse "";
+            const budget = parseV2Budget(rpc.jsonObjGet(parsed.value, "budget"));
+            const join_quorum: u16 = @intCast(rpc.jsonU64(rpc.jsonObjGet(parsed.value, "join_quorum")) orelse 0);
+            const project_forks = rpc.jsonBool(rpc.jsonObjGet(parsed.value, "project_forks_locally")) orelse false;
+            const prov_opt: ?iface.ProviderId = if (rpc.jsonStr(rpc.jsonObjGet(parsed.value, "provider_id")) orelse rpc.jsonStr(rpc.jsonObjGet(parsed.value, "provider"))) |ps|
+                parseProviderSlug(ps)
+            else
+                null;
+            const model_opt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "model"));
+
+            var grants: std.ArrayList(thread_model.SpaceBinding) = .empty;
+            defer {
+                for (grants.items) |*g| g.deinit(self.allocator);
+                grants.deinit(self.allocator);
+            }
+            var deps: std.ArrayList(u128) = .empty;
+            defer deps.deinit(self.allocator);
+            var virt_spaces: std.ArrayList([]const u8) = .empty;
+            defer virt_spaces.deinit(self.allocator);
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+
+            const grants_val = rpc.jsonObjGet(parsed.value, "bindings") orelse rpc.jsonObjGet(parsed.value, "grants");
+            if (grants_val) |gv| {
+                if (gv == .array) {
+                    for (gv.array.items) |item| {
+                        try grants.append(self.allocator, try self.parseBindingItemLocked(item));
+                    }
+                }
+            }
+            if (rpc.jsonObjGet(parsed.value, "depends_on")) |dv| {
+                if (dv == .array) {
+                    for (dv.array.items) |item| {
+                        if (item != .string) return error.InvalidTaskId;
+                        try deps.append(self.allocator, try id.parseIdHex(item.string));
+                    }
+                }
+            }
+            if (rpc.jsonObjGet(parsed.value, "create_virtual_spaces")) |vv| {
+                if (vv == .array) {
+                    for (vv.array.items) |item| {
+                        if (item == .string) try virt_spaces.append(self.allocator, item.string);
+                    }
+                }
+            }
+
+            var res = try self.v2.runtime.spawnSubordinate(self.allocator, tid, .{
+                .title = title,
+                .prompt = prompt,
+                .grants = grants.items,
+                .create_virtual_spaces = virt_spaces.items,
+                .budget = budget,
+                .depends_on = deps.items,
+                .join_quorum = join_quorum,
+                .project_forks_locally = project_forks,
+                .provider_id = prov_opt,
+                .model = model_opt,
+            });
+            defer res.deinit(self.allocator);
+
+            var task_hex: [32]u8 = undefined;
+            var child_hex: [32]u8 = undefined;
+            _ = id.formatIdHex(res.task_id, &task_hex);
+            _ = id.formatIdHex(res.child_thread_id, &child_hex);
+            try out.print(
+                self.allocator,
+                "{{\"task_id\":\"{s}\",\"child_thread_id\":\"{s}\",\"status\":\"{s}\",\"carved_budget\":",
+                .{ task_hex, child_hex, taskStatusName(res.status) },
+            );
+            try appendV2BudgetJson(self.allocator, out, &res.carved_budget);
+            try out.appendSlice(self.allocator, ",\"forked_space_ids\":[");
+            for (res.forked_space_ids, 0..) |fid, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                var fhex: [32]u8 = undefined;
+                _ = id.formatIdHex(fid, &fhex);
+                try out.print(self.allocator, "\"{s}\"", .{fhex});
+            }
+            try out.appendSlice(self.allocator, "]}");
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.startsWith(u8, sub, "tasks/")) {
+            const trest = sub["tasks/".len..];
+            const tslash = std.mem.indexOfScalar(u8, trest, '/') orelse return error.InvalidRoute;
+            const task_id = try id.parseIdHex(trest[0..tslash]);
+            const taction = trest[tslash + 1 ..];
+
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, taction, "settle")) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                const status_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "status")) orelse "completed";
+                const status = parseV2TaskStatus(status_str) orelse return error.InvalidTaskTransition;
+                const summary = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "summary")) orelse
+                    rpc.jsonStr(rpc.jsonObjGet(parsed.value, "result_summary")) orelse "";
+
+                var used_opt: ?thread_model.Budget = null;
+                const ut = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "used_tokens"));
+                const uc = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "used_cost_microusd"));
+                const uw = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "used_wall_ms"));
+                if (ut != null or uc != null or uw != null) {
+                    used_opt = .{
+                        .used_tokens = ut orelse 0,
+                        .used_cost_microusd = uc orelse 0,
+                        .used_wall_ms = uw orelse 0,
+                    };
+                }
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                const woken = try self.v2.runtime.settleTask(tid, task_id, status, summary, used_opt);
+                var task_hex: [32]u8 = undefined;
+                _ = id.formatIdHex(task_id, &task_hex);
+                try out.print(
+                    self.allocator,
+                    "{{\"ok\":true,\"task_id\":\"{s}\",\"status\":\"{s}\",\"woken_tasks\":{d}}}",
+                    .{ task_hex, taskStatusName(status), woken },
+                );
+                self.emitV2Event("v2_updated");
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, taction, "land")) {
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                var report = try self.v2.runtime.landSubordinateForks(self.allocator, tid, task_id);
+                defer report.deinit(self.allocator);
+                try appendV2LandReportJson(self.allocator, out, &report);
+                self.emitV2Event("v2_updated");
+                return;
+            }
+            return error.InvalidRoute;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "cancel-tree")) {
+            var reason_opt: ?[]const u8 = null;
+            var parsed_opt: ?std.json.Parsed(std.json.Value) = null;
+            defer if (parsed_opt) |*p| p.deinit();
+            if (body.len > 0) {
+                parsed_opt = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                reason_opt = rpc.jsonStr(rpc.jsonObjGet(parsed_opt.?.value, "reason"));
+            }
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const rep = try self.v2.runtime.cancelTree(tid, reason_opt);
+            try out.print(
+                self.allocator,
+                "{{\"ok\":true,\"canceled_threads\":{d},\"canceled_tasks\":{d},\"canceled_leases\":{d}}}",
+                .{ rep.canceled_threads, rep.canceled_tasks, rep.canceled_leases },
+            );
+            self.emitV2Event("v2_updated");
+            return;
+        }
+
+        if (std.mem.eql(u8, sub, "mailbox")) {
+            if (std.mem.eql(u8, method, "GET")) {
+                const drain_opt = try queryParamAlloc(self.allocator, query, "drain");
+                defer if (drain_opt) |d| self.allocator.free(d);
+                const do_drain = if (drain_opt) |d| std.mem.eql(u8, d, "1") or std.mem.eql(u8, d, "true") else false;
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                var thex: [32]u8 = undefined;
+                _ = id.formatIdHex(tid, &thex);
+                if (do_drain) {
+                    const drained = try self.v2.runtime.drainMailbox(self.allocator, tid);
+                    defer {
+                        for (drained) |*it| it.deinit(self.allocator);
+                        self.allocator.free(drained);
+                    }
+                    try out.print(self.allocator, "{{\"thread_id\":\"{s}\",\"drained\":true,\"unread_count\":0,\"items\":[", .{thex});
+                    for (drained, 0..) |*it, i| {
+                        if (i > 0) try out.append(self.allocator, ',');
+                        try appendV2MailboxItemJson(self.allocator, out, it);
+                    }
+                    try out.appendSlice(self.allocator, "]}");
+                    return;
+                }
+
+                const store = try self.v2.runtime.openThread(tid);
+                const unread = try self.v2.runtime.unreadMailboxCount(tid);
+                try out.print(self.allocator, "{{\"thread_id\":\"{s}\",\"unread_count\":{d},\"items\":[", .{ thex, unread });
+                var wrote: usize = 0;
+                for (store.mailbox_order.items) |iid| {
+                    const it = store.mailbox.getPtr(iid) orelse continue;
+                    if (wrote > 0) try out.append(self.allocator, ',');
+                    wrote += 1;
+                    try appendV2MailboxItemJson(self.allocator, out, it);
+                }
+                try out.appendSlice(self.allocator, "]}");
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "POST")) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                const action = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "action"));
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+
+                if (action != null and std.mem.eql(u8, action.?, "drain")) {
+                    const drained = try self.v2.runtime.drainMailbox(self.allocator, tid);
+                    defer {
+                        for (drained) |*it| it.deinit(self.allocator);
+                        self.allocator.free(drained);
+                    }
+                    try out.appendSlice(self.allocator, "{\"ok\":true,\"drained\":true,\"items\":[");
+                    for (drained, 0..) |*it, i| {
+                        if (i > 0) try out.append(self.allocator, ',');
+                        try appendV2MailboxItemJson(self.allocator, out, it);
+                    }
+                    try out.appendSlice(self.allocator, "]}");
+                    self.emitV2Event("v2_updated");
+                    return;
+                }
+
+                const payload = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "payload")) orelse "";
+                const kind_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "kind")) orelse "progress";
+                const kind = parseV2MailboxKind(kind_str);
+                const from_tid: u128 = if (rpc.jsonStr(rpc.jsonObjGet(parsed.value, "from_thread_id"))) |fs|
+                    if (fs.len > 0) try id.parseIdHex(fs) else tid
+                else
+                    tid;
+                const task_id_opt: ?u128 = if (rpc.jsonStr(rpc.jsonObjGet(parsed.value, "task_id"))) |ts|
+                    if (ts.len > 0) try id.parseIdHex(ts) else null
+                else
+                    null;
+
+                const iid = id.newUuidV7(self.io);
+                const posted = try self.v2.runtime.postMailbox(tid, .{
+                    .item_id = iid,
+                    .from_thread_id = from_tid,
+                    .to_thread_id = tid,
+                    .task_id = task_id_opt,
+                    .kind = kind,
+                    .payload = @constCast(payload),
+                    .created_ms = id.nowMs(self.io),
+                });
+                var ihex: [32]u8 = undefined;
+                _ = id.formatIdHex(iid, &ihex);
+                try out.print(self.allocator, "{{\"ok\":true,\"posted\":{},\"item_id\":\"{s}\"}}", .{ posted, ihex });
+                self.emitV2Event("v2_updated");
+                return;
+            }
+            return error.InvalidRoute;
+        }
+
+        if (std.mem.eql(u8, sub, "triggers")) {
+            if (std.mem.eql(u8, method, "GET")) {
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                const triggers = try self.v2.runtime.listTriggers(self.allocator, tid);
+                defer {
+                    for (triggers) |*t| t.deinit(self.allocator);
+                    self.allocator.free(triggers);
+                }
+                var thex: [32]u8 = undefined;
+                _ = id.formatIdHex(tid, &thex);
+                try out.print(self.allocator, "{{\"thread_id\":\"{s}\",\"triggers\":[", .{thex});
+                for (triggers, 0..) |*t, i| {
+                    if (i > 0) try out.append(self.allocator, ',');
+                    try appendV2TriggerJson(self.allocator, out, t);
+                }
+                try out.appendSlice(self.allocator, "]}");
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "POST")) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                const kind_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "kind")) orelse return error.MissingTriggerKind;
+                const prompt_tpl = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "prompt_template")) orelse
+                    rpc.jsonStr(rpc.jsonObjGet(parsed.value, "prompt")) orelse "";
+                const enabled = rpc.jsonBool(rpc.jsonObjGet(parsed.value, "enabled")) orelse true;
+
+                const tkind: thread_model.TriggerKind = if (std.mem.eql(u8, kind_str, "once")) blk: {
+                    const at_ms = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "at_ms")) orelse id.nowMs(self.io);
+                    break :blk .{ .once = at_ms };
+                } else if (std.mem.eql(u8, kind_str, "cron")) blk: {
+                    const expr = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "cron")) orelse
+                        rpc.jsonStr(rpc.jsonObjGet(parsed.value, "expr")) orelse return error.InvalidCron;
+                    break :blk .{ .cron = @constCast(expr) };
+                } else if (std.mem.eql(u8, kind_str, "space_changed")) blk: {
+                    const sid_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "space_id")) orelse return error.InvalidSpaceId;
+                    const sid = try id.parseIdHex(sid_str);
+                    const pref = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "path_prefix")) orelse "";
+                    const deb: u32 = @intCast(rpc.jsonU64(rpc.jsonObjGet(parsed.value, "debounce_ms")) orelse 0);
+                    break :blk .{ .space_changed = .{
+                        .space_id = sid,
+                        .path_prefix = @constCast(pref),
+                        .debounce_ms = deb,
+                    } };
+                } else if (std.mem.eql(u8, kind_str, "mailbox"))
+                    .mailbox
+                else if (std.mem.eql(u8, kind_str, "webhook")) blk: {
+                    const secret = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "webhook_secret")) orelse
+                        rpc.jsonStr(rpc.jsonObjGet(parsed.value, "secret")) orelse "";
+                    break :blk .{ .webhook = @constCast(secret) };
+                } else return error.InvalidTriggerKind;
+
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                const tr_id = try self.v2.runtime.registerTrigger(tid, .{
+                    .trigger_id = 0,
+                    .thread_id = tid,
+                    .kind = tkind,
+                    .prompt_template = @constCast(prompt_tpl),
+                    .enabled = enabled,
+                    .created_ms = id.nowMs(self.io),
+                });
+                var tr_hex: [32]u8 = undefined;
+                _ = id.formatIdHex(tr_id, &tr_hex);
+                try out.print(self.allocator, "{{\"ok\":true,\"trigger_id\":\"{s}\"}}", .{tr_hex});
+                self.emitV2Event("v2_updated");
+                return;
+            }
+            return error.InvalidRoute;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "triggers/poll")) {
+            var now_ms = id.nowMs(self.io);
+            var fire_due = true;
+            if (body.len > 0) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                defer parsed.deinit();
+                if (rpc.jsonU64(rpc.jsonObjGet(parsed.value, "now_ms"))) |nm| now_ms = nm;
+                if (rpc.jsonBool(rpc.jsonObjGet(parsed.value, "fire"))) |f| fire_due = f;
+            }
+
+            self.v2_mu.lockUncancelable(self.io);
+            defer self.v2_mu.unlock(self.io);
+            const due = try self.v2.runtime.pollDueTriggers(self.allocator, tid, now_ms);
+            defer thread_rt_mod.freeDueTriggers(self.allocator, due);
+
+            try out.print(self.allocator, "{{\"now_ms\":{d},\"due\":[", .{now_ms});
+            for (due, 0..) |dt, i| {
+                if (i > 0) try out.append(self.allocator, ',');
+                var outcome_str: []const u8 = "pending";
+                if (fire_due) {
+                    const outcome = try self.v2.runtime.fireTrigger(tid, dt.trigger_id, dt.event_token, now_ms);
+                    outcome_str = fireOutcomeName(outcome);
+                }
+                var tr_hex: [32]u8 = undefined;
+                _ = id.formatIdHex(dt.trigger_id, &tr_hex);
+                try out.print(self.allocator, "{{\"trigger_id\":\"{s}\",\"event_token\":", .{tr_hex});
+                try rpc.appendJsonEscaped(self.allocator, out, dt.event_token);
+                try out.appendSlice(self.allocator, ",\"prompt\":");
+                try rpc.appendJsonEscaped(self.allocator, out, dt.prompt);
+                try out.print(self.allocator, ",\"outcome\":\"{s}\"}}", .{outcome_str});
+            }
+            try out.appendSlice(self.allocator, "]}");
+            return;
+        }
+
+        if (std.mem.startsWith(u8, sub, "triggers/")) {
+            const tr_rest = sub["triggers/".len..];
+            if (std.mem.eql(u8, method, "DELETE") and std.mem.indexOfScalar(u8, tr_rest, '/') == null) {
+                const trigger_id = try id.parseIdHex(tr_rest);
+                self.v2_mu.lockUncancelable(self.io);
+                defer self.v2_mu.unlock(self.io);
+                try self.v2.runtime.disableTrigger(tid, trigger_id);
+                var tr_hex: [32]u8 = undefined;
+                _ = id.formatIdHex(trigger_id, &tr_hex);
+                try out.print(self.allocator, "{{\"ok\":true,\"trigger_id\":\"{s}\",\"enabled\":false}}", .{tr_hex});
+                self.emitV2Event("v2_updated");
+                return;
+            }
+            if (std.mem.eql(u8, method, "POST")) {
+                const tr_slash = std.mem.indexOfScalar(u8, tr_rest, '/') orelse return error.InvalidRoute;
+                const trigger_id = try id.parseIdHex(tr_rest[0..tr_slash]);
+                const action = tr_rest[tr_slash + 1 ..];
+                if (std.mem.eql(u8, action, "fire")) {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                    defer parsed.deinit();
+                    const token = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "event_token")) orelse return error.MissingEventToken;
+                    const now_ms = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "now_ms")) orelse id.nowMs(self.io);
+
+                    self.v2_mu.lockUncancelable(self.io);
+                    defer self.v2_mu.unlock(self.io);
+                    const outcome = try self.v2.runtime.fireTrigger(tid, trigger_id, token, now_ms);
+                    var tr_hex: [32]u8 = undefined;
+                    _ = id.formatIdHex(trigger_id, &tr_hex);
+                    try out.print(
+                        self.allocator,
+                        "{{\"ok\":true,\"trigger_id\":\"{s}\",\"outcome\":\"{s}\"}}",
+                        .{ tr_hex, fireOutcomeName(outcome) },
+                    );
+                    return;
+                }
+            }
+        }
+
+        return error.InvalidRoute;
+    }
+
+    fn handleV2ThreadDetail(self: *PlaygroundServer, tid: u128, out: *std.ArrayList(u8)) !void {
+        self.v2_mu.lockUncancelable(self.io);
+        defer self.v2_mu.unlock(self.io);
+
+        const store = try self.v2.runtime.openThread(tid);
+        const meta = store.meta orelse return error.ThreadNotFound;
+        const active_turn: ?u128 = if (self.v2.runtime.active_turns.get(tid)) |at| at.turn_id else null;
+        const msgs = try store.activeChain(self.allocator);
+        defer thread_store_mod.ThreadStore.freeMessages(self.allocator, msgs);
+        const unread = try self.v2.runtime.unreadMailboxCount(tid);
+
+        var active_tasks: u32 = 0;
+        var tit_count = store.tasks.valueIterator();
+        while (tit_count.next()) |tk| {
+            if (!tk.status.isTerminal()) active_tasks += 1;
+        }
+
+        try out.appendSlice(self.allocator, "{\"thread\":");
+        try appendV2ThreadMetaJson(self.allocator, out, &meta, active_turn, store.total_message_count, active_tasks, @intCast(unread));
+
+        try out.appendSlice(self.allocator, ",\"messages\":[");
+        for (msgs, 0..) |*m, i| {
+            if (i > 0) try out.append(self.allocator, ',');
+            try appendV2MessageJson(self.allocator, out, m);
+        }
+        try out.appendSlice(self.allocator, "],\"sealed_pages\":[");
+        for (store.sealed_pages.items, 0..) |sp, i| {
+            if (i > 0) try out.append(self.allocator, ',');
+            var phex: [64]u8 = undefined;
+            _ = id.formatHashHex(sp.page_id, &phex);
+            var fhex: [32]u8 = undefined;
+            var lhex: [32]u8 = undefined;
+            _ = id.formatIdHex(sp.first_msg_id, &fhex);
+            _ = id.formatIdHex(sp.last_msg_id, &lhex);
+            try out.print(
+                self.allocator,
+                "{{\"page_id\":\"{s}\",\"first_msg_id\":\"{s}\",\"last_msg_id\":\"{s}\",\"msg_count\":{d},\"sealed_ms\":{d}}}",
+                .{ phex, fhex, lhex, sp.msg_count, sp.sealed_ms },
+            );
+        }
+        try out.appendSlice(self.allocator, "],\"tasks\":[");
+        var tit = store.tasks.valueIterator();
+        var tidx: usize = 0;
+        while (tit.next()) |task| {
+            if (tidx > 0) try out.append(self.allocator, ',');
+            tidx += 1;
+            try appendV2TaskJson(self.allocator, out, task);
+        }
+        try out.appendSlice(self.allocator, "],\"mailbox\":[");
+        var midx: usize = 0;
+        for (store.mailbox_order.items) |iid| {
+            const it = store.mailbox.getPtr(iid) orelse continue;
+            if (midx > 0) try out.append(self.allocator, ',');
+            midx += 1;
+            try appendV2MailboxItemJson(self.allocator, out, it);
+        }
+        try out.appendSlice(self.allocator, "],\"triggers\":[");
+        var trit = store.triggers.valueIterator();
+        var tridx: usize = 0;
+        while (trit.next()) |tr| {
+            if (tridx > 0) try out.append(self.allocator, ',');
+            tridx += 1;
+            try appendV2TriggerJson(self.allocator, out, tr);
+        }
+        try out.print(
+            self.allocator,
+            "],\"pending_rollback\":{},\"unread_mailbox\":{d}}}",
+            .{ store.pendingRollback() != null, unread },
+        );
+    }
+
+    fn parseBindingItemLocked(self: *PlaygroundServer, item: std.json.Value) !thread_model.SpaceBinding {
+        const sid_str = rpc.jsonStr(rpc.jsonObjGet(item, "space_id")) orelse return error.InvalidSpaceId;
+        const sid = try id.parseIdHex(sid_str);
+        const alias_src = rpc.jsonStr(rpc.jsonObjGet(item, "alias")) orelse blk: {
+            if (self.v2.spaces.get(sid)) |rec| break :blk rec.title;
+            break :blk "space";
+        };
+        const acc_str = rpc.jsonStr(rpc.jsonObjGet(item, "access")) orelse "shared_rw";
+        const mount_rel_opt = rpc.jsonStr(rpc.jsonObjGet(item, "mount_rel"));
+        const alias_copy = try self.allocator.dupe(u8, alias_src);
+        errdefer self.allocator.free(alias_copy);
+        const mount_copy: ?[]u8 = if (mount_rel_opt) |mr| if (mr.len > 0) try self.allocator.dupe(u8, mr) else null else null;
+        return .{
+            .space_id = sid,
+            .alias = alias_copy,
+            .access = parseV2SpaceAccess(acc_str),
+            .mount_rel = mount_copy,
+        };
+    }
+
+    fn appendV2SpaceJsonLocked(
+        self: *PlaygroundServer,
+        out: *std.ArrayList(u8),
+        rec: *const space_mgr_mod.SpaceRecord,
+    ) !void {
+        var shex: [32]u8 = undefined;
+        _ = id.formatIdHex(rec.space_id, &shex);
+        const slot_opt = self.v2.spaces.slots.get(rec.space_id);
+        const state: space_mgr_mod.SlotState = if (slot_opt) |sl| sl.state else .cold;
+        const head_count: usize = if (slot_opt) |sl| if (sl.space) |sp| sp.history.dag.heads.slice().len else 0 else 0;
+        const approx_bytes: usize = if (slot_opt) |sl| sl.approx_bytes else 0;
+        const proj_opt = self.v2.spaces.getProjectionRecord(rec.space_id);
+
+        try out.print(self.allocator, "{{\"space_id\":\"{s}\",\"name\":", .{shex});
+        try rpc.appendJsonEscaped(self.allocator, out, rec.title);
+        try out.appendSlice(self.allocator, ",\"title\":");
+        try rpc.appendJsonEscaped(self.allocator, out, rec.title);
+        try out.print(
+            self.allocator,
+            ",\"kind\":\"{s}\",\"state\":\"{s}\",\"projection_path\":",
+            .{ spaceKindName(rec.kind), slotStateName(state) },
+        );
+        if (proj_opt) |pr| {
+            try rpc.appendJsonEscaped(self.allocator, out, pr.local_path);
+        } else {
+            try out.appendSlice(self.allocator, "null");
+        }
+        try out.appendSlice(self.allocator, ",\"origin_space_id\":");
+        if (rec.origin) |o| {
+            var ohex: [32]u8 = undefined;
+            _ = id.formatIdHex(o.origin_space_id, &ohex);
+            try out.print(self.allocator, "\"{s}\"", .{ohex});
+        } else {
+            try out.appendSlice(self.allocator, "null");
+        }
+        try out.appendSlice(self.allocator, ",\"git_remote_url\":");
+        if (rec.git_remote_url) |u| {
+            try rpc.appendJsonEscaped(self.allocator, out, u);
+        } else {
+            try out.appendSlice(self.allocator, "null");
+        }
+        try out.print(
+            self.allocator,
+            ",\"head_count\":{d},\"approx_bytes\":{d},\"created_ms\":{d},\"updated_ms\":{d}}}",
+            .{ head_count, approx_bytes, rec.created_ms, rec.updated_ms },
+        );
+    }
 };
+
+const V2FileItem = struct {
+    path: []u8,
+    name: []u8,
+    kind: space_mod.DirEntryKind,
+
+    fn deinit(self: *V2FileItem, allocator: Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.name);
+    }
+};
+
+fn collectSpaceFiles(
+    allocator: Allocator,
+    sp: *const space_mod.Space,
+    rel_dir: []const u8,
+    recursive: bool,
+    depth: usize,
+    out: *std.ArrayList(V2FileItem),
+) !void {
+    if (depth > 64) return;
+    const entries = try sp.listDir(allocator, rel_dir);
+    defer {
+        for (entries) |*e| e.deinit(allocator);
+        allocator.free(entries);
+    }
+    for (entries) |e| {
+        const full_path = if (rel_dir.len == 0)
+            try allocator.dupe(u8, e.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_dir, e.name });
+        errdefer allocator.free(full_path);
+        const name_copy = try allocator.dupe(u8, e.name);
+        errdefer allocator.free(name_copy);
+        try out.append(allocator, .{
+            .path = full_path,
+            .name = name_copy,
+            .kind = e.kind,
+        });
+        if (recursive and e.kind == .dir) {
+            try collectSpaceFiles(allocator, sp, full_path, true, depth + 1, out);
+        }
+    }
+}
+
+fn spaceKindName(k: space_mod.SpaceKind) []const u8 {
+    return switch (k) {
+        .virtual => "virtual",
+        .dir => "dir",
+        .git_worktree => "git_worktree",
+    };
+}
+
+fn slotStateName(s: space_mgr_mod.SlotState) []const u8 {
+    return switch (s) {
+        .cold => "cold",
+        .warm => "warm",
+        .hot => "hot",
+    };
+}
+
+fn dirEntryKindName(k: space_mod.DirEntryKind) []const u8 {
+    return switch (k) {
+        .file => "file",
+        .dir => "dir",
+        .symlink => "symlink",
+    };
+}
+
+fn changeKindName(k: timeline_mod.ChangeKind) []const u8 {
+    return switch (k) {
+        .added => "added",
+        .modified => "modified",
+        .deleted => "deleted",
+        .renamed => "renamed",
+        .binary => "binary",
+    };
+}
+
+fn spaceAccessName(a: thread_model.SpaceAccess) []const u8 {
+    return switch (a) {
+        .read_only => "read_only",
+        .shared_rw => "shared_rw",
+        .isolated_fork => "isolated_fork",
+    };
+}
+
+fn parseV2SpaceAccess(s: []const u8) thread_model.SpaceAccess {
+    if (std.ascii.eqlIgnoreCase(s, "read_only") or std.ascii.eqlIgnoreCase(s, "ro")) return .read_only;
+    if (std.ascii.eqlIgnoreCase(s, "isolated_fork") or std.ascii.eqlIgnoreCase(s, "fork")) return .isolated_fork;
+    return .shared_rw;
+}
+
+fn sessionStatusName(s: thread_model.SessionStatus) []const u8 {
+    return switch (s) {
+        .idle => "idle",
+        .running => "running",
+        .queued => "queued",
+        .steering => "steering",
+        .interrupted => "interrupted",
+        .failed => "failed",
+    };
+}
+
+fn messageRoleName(r: thread_model.Role) []const u8 {
+    return switch (r) {
+        .user => "user",
+        .assistant => "assistant",
+        .system => "system",
+        .steer => "steer",
+    };
+}
+
+fn messageStatusName(s: thread_model.MessageStatus) []const u8 {
+    return switch (s) {
+        .pending => "pending",
+        .running => "running",
+        .completed => "completed",
+        .interrupted => "interrupted",
+        .failed => "failed",
+    };
+}
+
+fn taskStatusName(s: thread_model.TaskStatus) []const u8 {
+    return switch (s) {
+        .pending => "pending",
+        .ready => "ready",
+        .leased => "leased",
+        .running => "running",
+        .completed => "completed",
+        .failed => "failed",
+        .canceled => "canceled",
+    };
+}
+
+fn parseV2TaskStatus(s: []const u8) ?thread_model.TaskStatus {
+    if (std.ascii.eqlIgnoreCase(s, "completed")) return .completed;
+    if (std.ascii.eqlIgnoreCase(s, "failed")) return .failed;
+    if (std.ascii.eqlIgnoreCase(s, "canceled")) return .canceled;
+    return null;
+}
+
+fn mailboxKindName(k: thread_model.MailboxKind) []const u8 {
+    return switch (k) {
+        .assign => "assign",
+        .steer => "steer",
+        .progress => "progress",
+        .question => "question",
+        .answer => "answer",
+        .handoff => "handoff",
+        .result => "result",
+        .cancel => "cancel",
+    };
+}
+
+fn parseV2MailboxKind(s: []const u8) thread_model.MailboxKind {
+    if (std.ascii.eqlIgnoreCase(s, "assign")) return .assign;
+    if (std.ascii.eqlIgnoreCase(s, "steer")) return .steer;
+    if (std.ascii.eqlIgnoreCase(s, "question")) return .question;
+    if (std.ascii.eqlIgnoreCase(s, "answer")) return .answer;
+    if (std.ascii.eqlIgnoreCase(s, "handoff")) return .handoff;
+    if (std.ascii.eqlIgnoreCase(s, "result")) return .result;
+    if (std.ascii.eqlIgnoreCase(s, "cancel")) return .cancel;
+    return .progress;
+}
+
+fn fireOutcomeName(o: thread_rt_mod.FireTriggerOutcome) []const u8 {
+    return switch (o) {
+        .fired => "fired",
+        .already_fired => "already_fired",
+        .disabled => "disabled",
+        .not_found => "not_found",
+    };
+}
+
+fn failureReasonName(r: project_mod.FailureReason) []const u8 {
+    return switch (r) {
+        .space_not_found => "space_not_found",
+        .not_a_fork => "not_a_fork",
+        .origin_not_found => "origin_not_found",
+        .vcs_operation_in_progress => "vcs_operation_in_progress",
+        .unresolved_conflicts => "unresolved_conflicts",
+        .would_conflict => "would_conflict",
+    };
+}
+
+fn parseV2Budget(val_opt: ?std.json.Value) thread_model.Budget {
+    var b = thread_model.Budget{};
+    const v = val_opt orelse return b;
+    if (v != .object) return b;
+    if (rpc.jsonU64(rpc.jsonObjGet(v, "max_tokens"))) |x| b.max_tokens = x;
+    if (rpc.jsonU64(rpc.jsonObjGet(v, "max_cost_microusd"))) |x| b.max_cost_microusd = x;
+    if (rpc.jsonU64(rpc.jsonObjGet(v, "max_wall_ms"))) |x| b.max_wall_ms = x;
+    if (rpc.jsonU64(rpc.jsonObjGet(v, "max_depth"))) |x| b.max_depth = @intCast(@min(x, 255));
+    if (rpc.jsonU64(rpc.jsonObjGet(v, "max_children"))) |x| b.max_children = @intCast(@min(x, 65535));
+    return b;
+}
+
+fn appendV2BudgetJson(allocator: Allocator, out: *std.ArrayList(u8), b: *const thread_model.Budget) !void {
+    try out.print(
+        allocator,
+        "{{\"max_tokens\":{d},\"used_tokens\":{d},\"max_cost_microusd\":{d},\"used_cost_microusd\":{d},\"max_wall_ms\":{d},\"used_wall_ms\":{d},\"max_depth\":{d},\"max_children\":{d},\"active_children\":{d}}}",
+        .{
+            b.max_tokens,
+            b.used_tokens,
+            b.max_cost_microusd,
+            b.used_cost_microusd,
+            b.max_wall_ms,
+            b.used_wall_ms,
+            b.max_depth,
+            b.max_children,
+            b.active_children,
+        },
+    );
+}
+
+fn appendV2BindingsJson(allocator: Allocator, out: *std.ArrayList(u8), bindings: []const thread_model.SpaceBinding) !void {
+    try out.append(allocator, '[');
+    for (bindings, 0..) |b, i| {
+        if (i > 0) try out.append(allocator, ',');
+        var shex: [32]u8 = undefined;
+        _ = id.formatIdHex(b.space_id, &shex);
+        try out.print(allocator, "{{\"space_id\":\"{s}\",\"alias\":", .{shex});
+        try rpc.appendJsonEscaped(allocator, out, b.alias);
+        try out.print(allocator, ",\"access\":\"{s}\",\"mount_rel\":", .{spaceAccessName(b.access)});
+        if (b.mount_rel) |mr| {
+            try rpc.appendJsonEscaped(allocator, out, mr);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.append(allocator, '}');
+    }
+    try out.append(allocator, ']');
+}
+
+fn appendV2CheckpointVectorJson(allocator: Allocator, out: *std.ArrayList(u8), cv: *const thread_model.CheckpointVector) !void {
+    try out.append(allocator, '[');
+    for (cv.entries, 0..) |e, i| {
+        if (i > 0) try out.append(allocator, ',');
+        var shex: [32]u8 = undefined;
+        _ = id.formatIdHex(e.space_id, &shex);
+        try out.print(allocator, "{{\"space_id\":\"{s}\",\"heads\":{d},\"vcs_ref\":", .{ shex, e.version.slice().len });
+        if (e.vcs_ref) |r| {
+            try rpc.appendJsonEscaped(allocator, out, r);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.appendSlice(allocator, ",\"vcs_rev\":");
+        if (e.vcs_rev) |v| {
+            try rpc.appendJsonEscaped(allocator, out, v);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.append(allocator, '}');
+    }
+    try out.append(allocator, ']');
+}
+
+fn appendV2ProjectJson(allocator: Allocator, out: *std.ArrayList(u8), p: *const project_mod.Project) !void {
+    var phex: [32]u8 = undefined;
+    _ = id.formatIdHex(p.project_id, &phex);
+    try out.print(allocator, "{{\"project_id\":\"{s}\",\"name\":", .{phex});
+    try rpc.appendJsonEscaped(allocator, out, p.title);
+    try out.appendSlice(allocator, ",\"title\":");
+    try rpc.appendJsonEscaped(allocator, out, p.title);
+    try out.appendSlice(allocator, ",\"instructions\":");
+    try rpc.appendJsonEscaped(allocator, out, p.instructions);
+    try out.appendSlice(allocator, ",\"spaces\":[");
+    for (p.spaces, 0..) |sr, i| {
+        if (i > 0) try out.append(allocator, ',');
+        var shex: [32]u8 = undefined;
+        _ = id.formatIdHex(sr.space_id, &shex);
+        const acc = std.enums.fromInt(thread_model.SpaceAccess, sr.default_access) orelse .shared_rw;
+        try out.print(allocator, "{{\"space_id\":\"{s}\",\"alias\":", .{shex});
+        try rpc.appendJsonEscaped(allocator, out, sr.alias);
+        try out.print(allocator, ",\"kind\":\"{s}\",\"access\":\"{s}\"}}", .{ spaceKindName(sr.kind), spaceAccessName(acc) });
+    }
+    try out.print(allocator, "],\"created_ms\":{d},\"updated_ms\":{d}}}", .{ p.created_ms, p.updated_ms });
+}
+
+fn appendV2LandReportJson(allocator: Allocator, out: *std.ArrayList(u8), report: *const project_mod.SpaceSetLandReport) !void {
+    try out.print(allocator, "{{\"aborted\":{},\"entries\":[", .{report.aborted});
+    for (report.entries, 0..) |e, i| {
+        if (i > 0) try out.append(allocator, ',');
+        var shex: [32]u8 = undefined;
+        var ohex: [32]u8 = undefined;
+        _ = id.formatIdHex(e.space_id, &shex);
+        _ = id.formatIdHex(e.origin_space_id, &ohex);
+        try out.print(
+            allocator,
+            "{{\"space_id\":\"{s}\",\"origin_space_id\":\"{s}\",\"landed\":{d},\"brought\":{d}}}",
+            .{ shex, ohex, e.report.landed, e.report.sync.brought },
+        );
+    }
+    try out.appendSlice(allocator, "],\"failures\":[");
+    for (report.failures, 0..) |f, i| {
+        if (i > 0) try out.append(allocator, ',');
+        var shex: [32]u8 = undefined;
+        _ = id.formatIdHex(f.space_id, &shex);
+        try out.print(allocator, "{{\"space_id\":\"{s}\",\"reason\":\"{s}\",\"detail\":", .{ shex, failureReasonName(f.reason) });
+        if (f.detail) |d| {
+            try rpc.appendJsonEscaped(allocator, out, d);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.append(allocator, '}');
+    }
+    try out.appendSlice(allocator, "]}");
+}
+
+fn appendV2ThreadMetaJson(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    m: *const thread_model.ThreadMeta,
+    active_turn_id: ?u128,
+    message_count: u32,
+    active_tasks: u32,
+    unread_mailbox: u32,
+) !void {
+    var thex: [32]u8 = undefined;
+    var rhex: [32]u8 = undefined;
+    _ = id.formatIdHex(m.thread_id, &thex);
+    _ = id.formatIdHex(m.root_thread_id, &rhex);
+    try out.print(allocator, "{{\"thread_id\":\"{s}\",\"root_thread_id\":\"{s}\",\"project_id\":", .{ thex, rhex });
+    try appendOptIdHex(allocator, out, m.project_id);
+    try out.appendSlice(allocator, ",\"parent_thread_id\":");
+    try appendOptIdHex(allocator, out, m.parent_thread_id);
+    try out.appendSlice(allocator, ",\"task_id\":");
+    try appendOptIdHex(allocator, out, m.task_id);
+    try out.appendSlice(allocator, ",\"active_turn_id\":");
+    try appendOptIdHex(allocator, out, active_turn_id);
+    try out.print(allocator, ",\"depth\":{d},\"title\":", .{m.depth});
+    try rpc.appendJsonEscaped(allocator, out, m.title);
+    try out.print(allocator, ",\"provider\":\"{s}\",\"model\":", .{m.default_provider.slug()});
+    if (m.default_model) |mdl| {
+        try rpc.appendJsonEscaped(allocator, out, mdl);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    try out.print(allocator, ",\"status\":\"{s}\",\"bindings\":", .{sessionStatusName(m.status)});
+    try appendV2BindingsJson(allocator, out, m.bindings);
+    try out.appendSlice(allocator, ",\"budget\":");
+    try appendV2BudgetJson(allocator, out, &m.budget);
+    try out.print(
+        allocator,
+        ",\"message_count\":{d},\"active_tasks\":{d},\"unread_mailbox\":{d},\"created_ms\":{d},\"updated_ms\":{d}}}",
+        .{ message_count, active_tasks, unread_mailbox, m.created_ms, m.updated_ms },
+    );
+}
+
+fn appendV2ThreadSummaryFallbackJson(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    s: *const thread_model.ThreadSummary,
+    active_turn_id: ?u128,
+) !void {
+    var thex: [32]u8 = undefined;
+    var rhex: [32]u8 = undefined;
+    _ = id.formatIdHex(s.thread_id, &thex);
+    _ = id.formatIdHex(s.root_thread_id, &rhex);
+    try out.print(allocator, "{{\"thread_id\":\"{s}\",\"root_thread_id\":\"{s}\",\"project_id\":", .{ thex, rhex });
+    try appendOptIdHex(allocator, out, s.project_id);
+    try out.appendSlice(allocator, ",\"parent_thread_id\":");
+    try appendOptIdHex(allocator, out, s.parent_thread_id);
+    try out.appendSlice(allocator, ",\"task_id\":null,\"active_turn_id\":");
+    try appendOptIdHex(allocator, out, active_turn_id);
+    try out.appendSlice(allocator, ",\"depth\":0,\"title\":");
+    try rpc.appendJsonEscaped(allocator, out, s.title);
+    try out.print(allocator, ",\"provider\":\"{s}\",\"model\":", .{s.provider.slug()});
+    if (s.model) |mdl| {
+        try rpc.appendJsonEscaped(allocator, out, mdl);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    try out.print(
+        allocator,
+        ",\"status\":\"{s}\",\"bindings\":[],\"budget\":{{\"max_tokens\":0,\"used_tokens\":0,\"max_cost_microusd\":0,\"used_cost_microusd\":0,\"max_wall_ms\":0,\"used_wall_ms\":0,\"max_depth\":4,\"max_children\":32,\"active_children\":0}},\"message_count\":{d},\"active_tasks\":{d},\"unread_mailbox\":{d},\"created_ms\":{d},\"updated_ms\":{d}}}",
+        .{ sessionStatusName(s.status), s.message_count, s.active_tasks, s.unread_mailbox, s.updated_ms, s.updated_ms },
+    );
+}
+
+fn appendV2MessageJson(allocator: Allocator, out: *std.ArrayList(u8), m: *const thread_model.Message) !void {
+    var mhex: [32]u8 = undefined;
+    var thex: [32]u8 = undefined;
+    _ = id.formatIdHex(m.msg_id, &mhex);
+    _ = id.formatIdHex(m.thread_id, &thex);
+    try out.print(allocator, "{{\"msg_id\":\"{s}\",\"thread_id\":\"{s}\",\"parent_id\":", .{ mhex, thex });
+    try appendOptIdHex(allocator, out, m.parent_id);
+    try out.print(allocator, ",\"role\":\"{s}\",\"content\":", .{messageRoleName(m.role)});
+    try rpc.appendJsonEscaped(allocator, out, m.content);
+    try out.print(
+        allocator,
+        ",\"provider\":\"{s}\",\"status\":\"{s}\",\"fencing_epoch\":{d},\"pre_checkpoint\":",
+        .{ m.provider.slug(), messageStatusName(m.status), m.fencing_epoch },
+    );
+    try appendV2CheckpointVectorJson(allocator, out, &m.pre_checkpoint);
+    try out.appendSlice(allocator, ",\"post_checkpoint\":");
+    try appendV2CheckpointVectorJson(allocator, out, &m.post_checkpoint);
+    try out.print(allocator, ",\"created_ms\":{d},\"updated_ms\":{d}}}", .{ m.created_ms, m.updated_ms });
+}
+
+fn appendV2TaskJson(allocator: Allocator, out: *std.ArrayList(u8), t: *const thread_model.Task) !void {
+    var task_hex: [32]u8 = undefined;
+    var parent_hex: [32]u8 = undefined;
+    var child_hex: [32]u8 = undefined;
+    _ = id.formatIdHex(t.task_id, &task_hex);
+    _ = id.formatIdHex(t.parent_thread_id, &parent_hex);
+    _ = id.formatIdHex(t.child_thread_id, &child_hex);
+    try out.print(
+        allocator,
+        "{{\"task_id\":\"{s}\",\"parent_thread_id\":\"{s}\",\"child_thread_id\":\"{s}\",\"title\":",
+        .{ task_hex, parent_hex, child_hex },
+    );
+    try rpc.appendJsonEscaped(allocator, out, t.title);
+    try out.print(
+        allocator,
+        ",\"status\":\"{s}\",\"attempt\":{d},\"join_quorum\":{d},\"depends_on\":[",
+        .{ taskStatusName(t.status), t.attempt, t.join_quorum },
+    );
+    for (t.depends_on, 0..) |dep, i| {
+        if (i > 0) try out.append(allocator, ',');
+        var dhex: [32]u8 = undefined;
+        _ = id.formatIdHex(dep, &dhex);
+        try out.print(allocator, "\"{s}\"", .{dhex});
+    }
+    try out.appendSlice(allocator, "],\"grants\":");
+    try appendV2BindingsJson(allocator, out, t.grants);
+    try out.appendSlice(allocator, ",\"budget\":");
+    try appendV2BudgetJson(allocator, out, &t.budget);
+    try out.appendSlice(allocator, ",\"err_msg\":");
+    if (t.err_msg) |em| {
+        try rpc.appendJsonEscaped(allocator, out, em);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    try out.print(allocator, ",\"created_ms\":{d},\"updated_ms\":{d}}}", .{ t.created_ms, t.updated_ms });
+}
+
+fn appendV2MailboxItemJson(allocator: Allocator, out: *std.ArrayList(u8), it: *const thread_model.MailboxItem) !void {
+    var ihex: [32]u8 = undefined;
+    var fhex: [32]u8 = undefined;
+    var thex: [32]u8 = undefined;
+    _ = id.formatIdHex(it.item_id, &ihex);
+    _ = id.formatIdHex(it.from_thread_id, &fhex);
+    _ = id.formatIdHex(it.to_thread_id, &thex);
+    try out.print(
+        allocator,
+        "{{\"item_id\":\"{s}\",\"from_thread_id\":\"{s}\",\"to_thread_id\":\"{s}\",\"task_id\":",
+        .{ ihex, fhex, thex },
+    );
+    try appendOptIdHex(allocator, out, it.task_id);
+    try out.print(allocator, ",\"kind\":\"{s}\",\"payload\":", .{mailboxKindName(it.kind)});
+    try rpc.appendJsonEscaped(allocator, out, it.payload);
+    try out.print(allocator, ",\"created_ms\":{d}}}", .{it.created_ms});
+}
+
+fn appendV2TriggerJson(allocator: Allocator, out: *std.ArrayList(u8), tr: *const thread_model.Trigger) !void {
+    var tr_hex: [32]u8 = undefined;
+    var thex: [32]u8 = undefined;
+    _ = id.formatIdHex(tr.trigger_id, &tr_hex);
+    _ = id.formatIdHex(tr.thread_id, &thex);
+    try out.print(allocator, "{{\"trigger_id\":\"{s}\",\"thread_id\":\"{s}\",\"kind\":", .{ tr_hex, thex });
+    switch (tr.kind) {
+        .once => |at_ms| try out.print(allocator, "\"once\",\"at_ms\":{d}", .{at_ms}),
+        .cron => |expr| {
+            try out.appendSlice(allocator, "\"cron\",\"cron\":");
+            try rpc.appendJsonEscaped(allocator, out, expr);
+        },
+        .space_changed => |sc| {
+            var shex: [32]u8 = undefined;
+            _ = id.formatIdHex(sc.space_id, &shex);
+            try out.print(allocator, "\"space_changed\",\"space_id\":\"{s}\",\"path_prefix\":", .{shex});
+            try rpc.appendJsonEscaped(allocator, out, sc.path_prefix);
+            try out.print(allocator, ",\"debounce_ms\":{d}", .{sc.debounce_ms});
+        },
+        .mailbox => try out.appendSlice(allocator, "\"mailbox\""),
+        .webhook => try out.appendSlice(allocator, "\"webhook\""),
+    }
+    try out.appendSlice(allocator, ",\"prompt_template\":");
+    try rpc.appendJsonEscaped(allocator, out, tr.prompt_template);
+    try out.print(allocator, ",\"enabled\":{},\"created_ms\":{d}}}", .{ tr.enabled, tr.created_ms });
+}
 
 fn appendDeltaJson(
     allocator: Allocator,
@@ -5278,11 +7601,27 @@ pub fn httpStatusForError(err: anyerror) []const u8 {
         error.PageNotFound,
         error.WorktreeNotFound,
         error.ConflictNotFound,
+        error.SpaceNotFound,
+        error.ProjectNotFound,
+        error.TaskNotFound,
+        error.TriggerNotFound,
         error.InvalidRoute,
         => "404 Not Found",
+        error.AccessEscalation,
+        error.UnauthorizedSpaceGrant,
+        => "403 Forbidden",
         error.TurnAlreadyActive,
         error.UnresolvedConflicts,
         error.DirtyWorktree,
+        error.RollbackAlreadyPending,
+        error.LeaseNotActive,
+        error.LeaseEpochMismatch,
+        error.InvalidTaskTransition,
+        error.NotAFork,
+        error.BudgetExceeded,
+        error.MaxDepthExceeded,
+        error.MaxChildrenExceeded,
+        error.SpaceLocked,
         => "409 Conflict",
         error.PayloadTooLarge => "413 Payload Too Large",
         error.TooManyWorkers,

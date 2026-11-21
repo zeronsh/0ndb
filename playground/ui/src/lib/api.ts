@@ -275,6 +275,8 @@ function humanizeError(code: string) {
 }
 
 const post = <T>(path: string, body: unknown = {}) => request<T>(path, { method: 'POST', body: JSON.stringify(body) })
+const put = <T>(path: string, body: unknown = {}) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
+const del = <T>(path: string) => request<T>(path, { method: 'DELETE' })
 const q = encodeURIComponent
 
 export const api = {
@@ -360,6 +362,8 @@ export type ServerEvent =
   | { type: 'workspace_updated' }
   | { type: 'worktrees_updated' }
   | { type: 'queue_updated'; thread_id: string }
+  | { type: 'v2_updated' }
+  | { type: 'v2_trigger_fired' }
   | FilesChangedEvent
   | TurnDelta
 
@@ -380,4 +384,334 @@ export interface TurnDelta {
   is_error?: boolean
   input_tokens?: number
   output_tokens?: number
+}
+
+import type {
+  V2Budget,
+  V2Health,
+  V2SlotState,
+  V2SpaceAccess,
+  V2SpaceBinding,
+  V2SpaceKind,
+  V2TaskStatus,
+} from './v2'
+
+export type {
+  V2Budget,
+  V2Health,
+  V2SlotState,
+  V2SpaceAccess,
+  V2SpaceBinding,
+  V2SpaceKind,
+  V2TaskStatus,
+}
+
+export interface V2ProjectSpaceRef {
+  space_id: string
+  alias: string
+  kind: V2SpaceKind
+  access: V2SpaceAccess
+}
+
+export interface V2Project {
+  project_id: string
+  name: string
+  title: string
+  instructions: string
+  spaces: V2ProjectSpaceRef[]
+  created_ms: number
+  updated_ms: number
+}
+
+export interface V2Space {
+  space_id: string
+  name: string
+  title: string
+  kind: V2SpaceKind
+  state: V2SlotState
+  projection_path: string | null
+  origin_space_id: string | null
+  git_remote_url: string | null
+  head_count: number
+  approx_bytes: number
+  created_ms: number
+  updated_ms: number
+}
+
+export interface V2SpaceFileEntry {
+  path: string
+  name: string
+  kind: 'file' | 'dir' | 'symlink'
+}
+
+export interface V2SearchHit {
+  path: string
+  line: number
+  snippet: string
+}
+
+export interface V2MetaEntry {
+  key: string
+  value: string
+}
+
+export interface V2TimelineEntry {
+  batch_id: { ts: number; actor: string }
+  wall_ms: number
+  total_added: number
+  total_removed: number
+  files: { path: string; kind: string; added_lines: number; removed_lines: number }[]
+}
+
+export interface V2CheckpointEntry {
+  space_id: string
+  heads: number
+  vcs_ref: string | null
+  vcs_rev: string | null
+}
+
+export interface V2Thread {
+  thread_id: string
+  root_thread_id: string
+  project_id: string | null
+  parent_thread_id: string | null
+  task_id: string | null
+  active_turn_id: string | null
+  depth: number
+  title: string
+  provider: string
+  model: string | null
+  status: string
+  bindings: V2SpaceBinding[]
+  budget: V2Budget
+  message_count: number
+  active_tasks: number
+  unread_mailbox: number
+  created_ms: number
+  updated_ms: number
+}
+
+export interface V2Message {
+  msg_id: string
+  thread_id: string
+  parent_id: string | null
+  role: 'user' | 'assistant' | 'system' | 'steer'
+  content: string
+  provider: string
+  status: string
+  fencing_epoch: number
+  pre_checkpoint: V2CheckpointEntry[]
+  post_checkpoint: V2CheckpointEntry[]
+  created_ms: number
+  updated_ms: number
+}
+
+export interface V2Task {
+  task_id: string
+  parent_thread_id: string
+  child_thread_id: string
+  title: string
+  status: V2TaskStatus
+  attempt: number
+  join_quorum: number
+  depends_on: string[]
+  grants: V2SpaceBinding[]
+  budget: V2Budget
+  err_msg: string | null
+  created_ms: number
+  updated_ms: number
+}
+
+export interface V2MailboxItem {
+  item_id: string
+  from_thread_id: string
+  to_thread_id: string
+  task_id: string | null
+  kind: 'assign' | 'steer' | 'progress' | 'question' | 'answer' | 'handoff' | 'result' | 'cancel'
+  payload: string
+  created_ms: number
+}
+
+export interface V2Trigger {
+  trigger_id: string
+  thread_id: string
+  kind: 'once' | 'cron' | 'space_changed' | 'mailbox' | 'webhook'
+  at_ms?: number
+  cron?: string
+  space_id?: string
+  path_prefix?: string
+  debounce_ms?: number
+  prompt_template: string
+  enabled: boolean
+  created_ms: number
+}
+
+export interface V2ThreadDetail {
+  thread: V2Thread
+  messages: V2Message[]
+  sealed_pages: { page_id: string; first_msg_id: string; last_msg_id: string; msg_count: number; sealed_ms: number }[]
+  tasks: V2Task[]
+  mailbox: V2MailboxItem[]
+  triggers: V2Trigger[]
+  pending_rollback: boolean
+  unread_mailbox: number
+}
+
+export interface V2LandReport {
+  aborted: boolean
+  entries: { space_id: string; origin_space_id: string; landed: number; brought: number }[]
+  failures: { space_id: string; reason: string; detail: string | null }[]
+}
+
+export const apiV2 = {
+  health: () => request<V2Health>('/api/v2/health'),
+  projects: () => request<{ projects: V2Project[] }>('/api/v2/projects'),
+  createProject: (name: string, spaceIds: string[] = []) =>
+    post<{ project: V2Project }>('/api/v2/projects', { name, space_ids: spaceIds }),
+  addProjectSpace: (projectId: string, spaceId: string, role?: string) =>
+    post<{ ok: boolean; project: V2Project }>(`/api/v2/projects/${projectId}/spaces`, { space_id: spaceId, ...(role ? { role } : {}) }),
+  removeProjectSpace: (projectId: string, spaceId: string) =>
+    del<{ ok: boolean; removed: boolean }>(`/api/v2/projects/${projectId}/spaces/${spaceId}`),
+  forkProject: (projectId: string, titlePrefix = 'fork') =>
+    post<{ project_id: string; forked_space_ids: string[] }>(`/api/v2/projects/${projectId}/fork`, { title_prefix: titlePrefix }),
+  syncProject: (projectId: string, forkIds?: string[]) =>
+    post<{ synced: { space_id: string; origin_space_id: string; brought: number; merged_count: number; conflict_count: number }[] }>(
+      `/api/v2/projects/${projectId}/sync`,
+      forkIds ? { fork_ids: forkIds } : {},
+    ),
+  landProject: (projectId: string, forkIds?: string[]) =>
+    post<V2LandReport>(`/api/v2/projects/${projectId}/land`, forkIds ? { fork_ids: forkIds } : {}),
+
+  spaces: () => request<{ spaces: V2Space[] }>('/api/v2/spaces'),
+  createSpace: (name: string, kind: V2SpaceKind = 'virtual', path?: string) =>
+    post<{ space: V2Space }>('/api/v2/spaces', kind === 'virtual' ? { name, kind } : { name, kind, path }),
+  forkSpace: (spaceId: string, name?: string) =>
+    post<{ space: V2Space }>(`/api/v2/spaces/${spaceId}/fork`, name ? { name } : {}),
+  hibernateSpace: (spaceId: string) =>
+    post<{ ok: boolean; hibernated: boolean; state: V2SlotState }>(`/api/v2/spaces/${spaceId}/hibernate`, {}),
+  compactSpace: (spaceId: string) =>
+    post<{ ok: boolean; pruned_batches: number; reclaimed_batch_bytes: number; removed_blobs: number }>(
+      `/api/v2/spaces/${spaceId}/compact`,
+      {},
+    ),
+  spaceFiles: (spaceId: string, dir?: string) =>
+    request<{ space_id: string; dir: string; files: V2SpaceFileEntry[] }>(
+      `/api/v2/spaces/${spaceId}/files${dir ? `?dir=${q(dir)}` : ''}`,
+    ),
+  spaceFile: (spaceId: string, path: string) =>
+    request<{ space_id: string; path: string; exists: boolean; content: string | null }>(
+      `/api/v2/spaces/${spaceId}/file?path=${q(path)}`,
+    ),
+  writeSpaceFile: (spaceId: string, path: string, content: string) =>
+    put<{ ok: boolean; space_id: string; path: string }>(`/api/v2/spaces/${spaceId}/file`, { path, content }),
+  deleteSpaceFile: (spaceId: string, path: string) =>
+    del<{ ok: boolean; deleted: boolean }>(`/api/v2/spaces/${spaceId}/file?path=${q(path)}`),
+  searchSpace: (spaceId: string, query: string) =>
+    request<{ space_id: string; query: string; hits: V2SearchHit[] }>(`/api/v2/spaces/${spaceId}/search?q=${q(query)}`),
+  spaceMeta: (spaceId: string, prefix = '') =>
+    request<{ space_id: string; prefix: string; entries: V2MetaEntry[] }>(
+      `/api/v2/spaces/${spaceId}/meta?prefix=${q(prefix)}`,
+    ),
+  setSpaceMeta: (spaceId: string, key: string, value: string | null) =>
+    put<{ ok: boolean; key: string; value: string | null }>(`/api/v2/spaces/${spaceId}/meta`, { key, value }),
+  spaceTimeline: (spaceId: string, limit = 30) =>
+    request<{ space_id: string; entries: V2TimelineEntry[] }>(`/api/v2/spaces/${spaceId}/timeline?limit=${limit}`),
+  spaceDiff: (spaceId: string) =>
+    request<{ space_id: string; diff: string }>(`/api/v2/spaces/${spaceId}/diff`),
+
+  threads: (projectId?: string) =>
+    request<{ threads: V2Thread[] }>(`/api/v2/threads${projectId ? `?project_id=${q(projectId)}` : ''}`),
+  createThread: (body: {
+    title: string
+    project_id?: string | null
+    bindings?: V2SpaceBinding[]
+    provider_id?: string
+    model?: string | null
+    budget?: Partial<V2Budget>
+  }) => post<{ thread: V2Thread }>('/api/v2/threads', body),
+  thread: (threadId: string) => request<V2ThreadDetail>(`/api/v2/threads/${threadId}`),
+  bindSpace: (threadId: string, spaceId: string, alias: string, access: V2SpaceAccess) =>
+    post<{ ok: boolean; thread: V2Thread }>(`/api/v2/threads/${threadId}/bind`, { space_id: spaceId, alias, access }),
+  unbindSpace: (threadId: string, spaceId: string) =>
+    del<{ ok: boolean; removed: boolean }>(`/api/v2/threads/${threadId}/bind/${spaceId}`),
+  runTurn: (
+    threadId: string,
+    body: { prompt: string; reply?: string; mutations?: { space_id: string; path: string; content: string }[] },
+  ) =>
+    post<{
+      turn_id: string
+      user_msg_id: string
+      fencing_epoch: number
+      assistant_text: string
+      pre_checkpoint: V2CheckpointEntry[]
+      post_checkpoint: V2CheckpointEntry[]
+    }>(`/api/v2/threads/${threadId}/turns`, body),
+  rollbackThread: (threadId: string, messageId: string, usePreCheckpoint = false) =>
+    post<{ ok: boolean; intent_id: string; spaces_rolled_back: number; completed: boolean }>(
+      `/api/v2/threads/${threadId}/rollback`,
+      { message_id: messageId, use_pre_checkpoint: usePreCheckpoint },
+    ),
+  recoverRollbacks: (threadId: string) =>
+    post<{ ok: boolean; recovered: boolean }>(`/api/v2/threads/${threadId}/recover-rollbacks`, {}),
+
+  tasks: (threadId: string) => request<{ thread_id: string; tasks: V2Task[] }>(`/api/v2/threads/${threadId}/tasks`),
+  spawnSubordinate: (
+    threadId: string,
+    body: {
+      title: string
+      prompt?: string
+      bindings: V2SpaceBinding[]
+      budget?: Partial<V2Budget>
+      depends_on?: string[]
+      join_quorum?: number
+    },
+  ) =>
+    post<{ task_id: string; child_thread_id: string; status: V2TaskStatus; carved_budget: V2Budget; forked_space_ids: string[] }>(
+      `/api/v2/threads/${threadId}/subordinates`,
+      body,
+    ),
+  settleTask: (threadId: string, taskId: string, status: 'completed' | 'failed' | 'canceled', summary = '') =>
+    post<{ ok: boolean; task_id: string; status: V2TaskStatus; woken_tasks: number }>(
+      `/api/v2/threads/${threadId}/tasks/${taskId}/settle`,
+      { status, summary },
+    ),
+  landTask: (threadId: string, taskId: string) =>
+    post<V2LandReport>(`/api/v2/threads/${threadId}/tasks/${taskId}/land`, {}),
+  cancelTree: (threadId: string, reason = 'Canceled by operator') =>
+    post<{ ok: boolean; canceled_threads: number; canceled_tasks: number; canceled_leases: number }>(
+      `/api/v2/threads/${threadId}/cancel-tree`,
+      { reason },
+    ),
+
+  mailbox: (threadId: string, drain = false) =>
+    request<{ thread_id: string; unread_count: number; items: V2MailboxItem[] }>(
+      `/api/v2/threads/${threadId}/mailbox${drain ? '?drain=1' : ''}`,
+    ),
+  postMailbox: (
+    threadId: string,
+    body: { action?: 'drain'; kind?: V2MailboxItem['kind']; payload?: string; from_thread_id?: string; task_id?: string },
+  ) => post<{ ok: boolean; posted?: boolean; drained?: boolean; item_id?: string }>(`/api/v2/threads/${threadId}/mailbox`, body),
+
+  triggers: (threadId: string) =>
+    request<{ thread_id: string; triggers: V2Trigger[] }>(`/api/v2/threads/${threadId}/triggers`),
+  createTrigger: (
+    threadId: string,
+    body: {
+      kind: V2Trigger['kind']
+      at_ms?: number
+      cron?: string
+      space_id?: string
+      path_prefix?: string
+      debounce_ms?: number
+      webhook_secret?: string
+      prompt_template: string
+    },
+  ) => post<{ ok: boolean; trigger_id: string }>(`/api/v2/threads/${threadId}/triggers`, body),
+  disableTrigger: (threadId: string, triggerId: string) =>
+    del<{ ok: boolean; trigger_id: string; enabled: boolean }>(`/api/v2/threads/${threadId}/triggers/${triggerId}`),
+  pollTriggers: (threadId: string, nowMs?: number, fire = true) =>
+    post<{ now_ms: number; due: { trigger_id: string; event_token: string; prompt: string; outcome: string }[] }>(
+      `/api/v2/threads/${threadId}/triggers/poll`,
+      { ...(nowMs !== undefined ? { now_ms: nowMs } : {}), fire },
+    ),
 }

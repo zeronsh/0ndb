@@ -9,6 +9,7 @@ import { Inspector, type InspectorTab } from '@/components/inspector/inspector'
 import { CommandPalette } from '@/components/command-palette'
 import type { ComposerHandle } from '@/components/thread/composer'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { V2Workspace } from '@/components/v2/v2-workspace'
 
 function Shell() {
   const { pref, setPref } = useTheme()
@@ -16,6 +17,7 @@ function Shell() {
   const [sidebarOpen, setSidebarOpen] = usePersistent('ondb-sidebar', true)
   const [inspectorOpen, setInspectorOpen] = usePersistent('ondb-inspector', true)
   const [tab, setTab] = usePersistent<InspectorTab>('ondb-inspector-tab', 'workspace')
+  const [viewMode, setViewMode] = usePersistent<'workspace' | 'v2'>('ondb-view-mode', 'workspace')
   const [diffMsg, setDiffMsg] = useState<Message | null>(null)
   const [palette, setPalette] = useState(false)
   const composer = useRef<ComposerHandle>(null)
@@ -69,19 +71,23 @@ function Shell() {
         aria-hidden={!sidebarOpen}
         className={`flex shrink-0 overflow-hidden transition-[width,opacity] duration-200 ease-out ${sidebarOpen ? 'w-[256px] opacity-100' : 'pointer-events-none w-0 opacity-0'}`}
       >
-        <Sidebar onSearch={() => setPalette(true)} theme={pref} setTheme={setPref} />
+        <Sidebar onSearch={() => setPalette(true)} theme={pref} setTheme={setPref} viewMode={viewMode} setViewMode={setViewMode} />
       </div>
       <main className="flex min-w-0 flex-1 bg-background">
-        <ThreadView
-          composerRef={composer}
-          onShowChanges={showChanges}
-          sidebarOpen={sidebarOpen}
-          onToggleSidebar={() => setSidebarOpen(o => !o)}
-          inspectorOpen={inspectorOpen}
-          onToggleInspector={() => setInspectorOpen(o => !o)}
-        />
+        {viewMode === 'v2' ? (
+          <V2Workspace />
+        ) : (
+          <ThreadView
+            composerRef={composer}
+            onShowChanges={showChanges}
+            sidebarOpen={sidebarOpen}
+            onToggleSidebar={() => setSidebarOpen(o => !o)}
+            inspectorOpen={inspectorOpen}
+            onToggleInspector={() => setInspectorOpen(o => !o)}
+          />
+        )}
       </main>
-      {inspectorOpen ? (
+      {viewMode === 'workspace' && inspectorOpen ? (
         <div className="hidden lg:flex">
           <Inspector tab={tab} setTab={setTab} diffMsg={diffMsg} setDiffMsg={setDiffMsg} />
         </div>

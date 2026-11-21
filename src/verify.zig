@@ -5028,6 +5028,7 @@ fn runThreadV2CoreSuite(allocator: std.mem.Allocator, io: std.Io) !void {
         var oom_r = codec.Reader.init(oom_w.items());
         try testing.expectError(error.CorruptRecord, tm.CheckpointVector.decode(allocator, &oom_r));
     }
+    try runV2DaemonHttpSuite(allocator, io);
 }
 
 fn applyDiffForVerify(
@@ -11483,5 +11484,515 @@ fn runThreadRuntimeSuite(allocator: std.mem.Allocator, io: std.Io) !void {
         try testing.expect(!changed_bind_plan.resumed_natively);
         try testing.expect(changed_bind_plan.resume_session_id == null);
         try testing.expect(changed_bind_plan.fallback_prompt_history != null);
+    }
+}
+
+const V2HttpResp = struct {
+    status: u16,
+    body: []u8,
+
+    fn deinit(self: *V2HttpResp, allocator: std.mem.Allocator) void {
+        allocator.free(self.body);
+    }
+};
+
+fn v2HttpRequest(
+    allocator: std.mem.Allocator,
+    port: u16,
+    method: []const u8,
+    target: []const u8,
+    body: ?[]const u8,
+) !V2HttpResp {
+    const req = if (body) |b|
+        try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: application/json\r\nOrigin: http://127.0.0.1:{d}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ method, target, port, port, b.len, b },
+        )
+    else if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD"))
+        try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: application/json\r\nOrigin: http://127.0.0.1:{d}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ method, target, port, port },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n",
+            .{ method, target, port },
+        );
+    defer allocator.free(req);
+
+    const raw = try sendRawHttpRequest(allocator, port, req);
+    defer allocator.free(raw);
+
+    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadHttpResponse;
+    const head = raw[0..sep];
+    const first_nl = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+    const status_line = head[0..first_nl];
+    var parts = std.mem.splitScalar(u8, status_line, ' ');
+    _ = parts.next();
+    const code_str = parts.next() orelse return error.BadHttpResponse;
+    const status = try std.fmt.parseInt(u16, code_str, 10);
+    return .{
+        .status = status,
+        .body = try allocator.dupe(u8, raw[sep + 4 ..]),
+    };
+}
+
+fn jsonFieldStrAlloc(allocator: std.mem.Allocator, body: []const u8, path_keys: []const []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    var cur = parsed.value;
+    for (path_keys) |k| {
+        if (cur != .object) return error.MissingJsonField;
+        cur = cur.object.get(k) orelse return error.MissingJsonField;
+    }
+    if (cur != .string) return error.InvalidJsonField;
+    return try allocator.dupe(u8, cur.string);
+}
+
+fn runV2DaemonHttpSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const srv_mod = ondb.playground.server;
+    const pg_root = "/tmp/0ndb-verify-v2-http";
+    cleanDir(io, pg_root);
+    defer cleanDir(io, pg_root);
+
+    const pg = try srv_mod.PlaygroundServer.startWithConfig(allocator, io, pg_root, 0, .{
+        .default_access = .accept_edits,
+        .prewarm_models = false,
+    });
+    const serve_th = try std.Thread.spawn(.{}, playgroundServeMain, .{pg});
+    defer {
+        pg.stop();
+        serve_th.join();
+        pg.deinit();
+    }
+
+    const port = pg.http_port;
+    try testing.expect(port != 0);
+
+    const v2_dir_stat = try std.Io.Dir.cwd().statFile(io, "/tmp/0ndb-verify-v2-http/.0ndb/v2", .{});
+    try testing.expectEqual(@as(u32, 0o700), v2_dir_stat.permissions.toMode() & 0o777);
+    const kr_stat = try std.Io.Dir.cwd().statFile(io, "/tmp/0ndb-verify-v2-http/.0ndb/v2/keyring.bin", .{});
+    try testing.expectEqual(@as(u32, 0o600), kr_stat.permissions.toMode() & 0o777);
+
+    {
+        var r = try v2HttpRequest(allocator, port, "GET", "/api/v2/health", null);
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, "\"ok\":true") != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, "\"open_spaces\":") != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, "\"memory_governor_bytes\":") != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, "\"watcher_fds\":") != null);
+    }
+
+    var s1_id: []u8 = undefined;
+    {
+        var r = try v2HttpRequest(allocator, port, "POST", "/api/v2/spaces", "{\"name\":\"notes\",\"kind\":\"virtual\"}");
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        s1_id = try jsonFieldStrAlloc(allocator, r.body, &.{ "space", "space_id" });
+    }
+    defer allocator.free(s1_id);
+
+    var s2_id: []u8 = undefined;
+    {
+        var r = try v2HttpRequest(allocator, port, "POST", "/api/v2/spaces", "{\"name\":\"specs\",\"kind\":\"virtual\"}");
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        s2_id = try jsonFieldStrAlloc(allocator, r.body, &.{ "space", "space_id" });
+    }
+    defer allocator.free(s2_id);
+
+    var s_ro_id: []u8 = undefined;
+    {
+        var r = try v2HttpRequest(allocator, port, "POST", "/api/v2/spaces", "{\"name\":\"readonly-ref\",\"kind\":\"virtual\"}");
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        s_ro_id = try jsonFieldStrAlloc(allocator, r.body, &.{ "space", "space_id" });
+    }
+    defer allocator.free(s_ro_id);
+
+    {
+        var r = try v2HttpRequest(allocator, port, "GET", "/api/v2/spaces", null);
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, s1_id) != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, s2_id) != null);
+    }
+
+    {
+        const ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file", .{s1_id});
+        defer allocator.free(ep);
+        var r = try v2HttpRequest(allocator, port, "PUT", ep, "{\"path\":\"memory/prefs.md\",\"content\":\"theme=dark\\nlanguage=zig\\n\"}");
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, "\"ok\":true") != null);
+    }
+
+    {
+        const ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/files", .{s1_id});
+        defer allocator.free(ep);
+        var r = try v2HttpRequest(allocator, port, "GET", ep, null);
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, "memory/prefs.md") != null);
+    }
+
+    {
+        const ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file?path=memory/prefs.md", .{s1_id});
+        defer allocator.free(ep);
+        var r = try v2HttpRequest(allocator, port, "GET", ep, null);
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, "language=zig") != null);
+    }
+
+    {
+        const ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/search?q=zig", .{s1_id});
+        defer allocator.free(ep);
+        var r = try v2HttpRequest(allocator, port, "GET", ep, null);
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, "memory/prefs.md") != null);
+    }
+
+    {
+        const ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/meta", .{s1_id});
+        defer allocator.free(ep);
+        var r_put = try v2HttpRequest(allocator, port, "PUT", ep, "{\"key\":\"user.name\",\"value\":\"alice\"}");
+        defer r_put.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_put.status);
+
+        const ep_get = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/meta?key=user.name", .{s1_id});
+        defer allocator.free(ep_get);
+        var r_get = try v2HttpRequest(allocator, port, "GET", ep_get, null);
+        defer r_get.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_get.status);
+        try testing.expect(std.mem.indexOf(u8, r_get.body, "\"value\":\"alice\"") != null);
+
+        const ep_pref = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/meta?prefix=user.", .{s1_id});
+        defer allocator.free(ep_pref);
+        var r_pref = try v2HttpRequest(allocator, port, "GET", ep_pref, null);
+        defer r_pref.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_pref.status);
+        try testing.expect(std.mem.indexOf(u8, r_pref.body, "\"key\":\"user.name\"") != null);
+    }
+
+    {
+        const ep_tl = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/timeline", .{s1_id});
+        defer allocator.free(ep_tl);
+        var r_tl = try v2HttpRequest(allocator, port, "GET", ep_tl, null);
+        defer r_tl.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_tl.status);
+        try testing.expect(std.mem.indexOf(u8, r_tl.body, "\"entries\":[") != null);
+
+        const ep_df = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/diff", .{s1_id});
+        defer allocator.free(ep_df);
+        var r_df = try v2HttpRequest(allocator, port, "GET", ep_df, null);
+        defer r_df.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_df.status);
+        try testing.expect(std.mem.indexOf(u8, r_df.body, "\"diff\":") != null);
+    }
+
+    {
+        const ep_hib = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/hibernate", .{s1_id});
+        defer allocator.free(ep_hib);
+        var r_hib = try v2HttpRequest(allocator, port, "POST", ep_hib, "{}");
+        defer r_hib.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_hib.status);
+        try testing.expect(std.mem.indexOf(u8, r_hib.body, "\"state\":\"warm\"") != null);
+
+        const ep_cmp = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/compact", .{s1_id});
+        defer allocator.free(ep_cmp);
+        var r_cmp = try v2HttpRequest(allocator, port, "POST", ep_cmp, "{}");
+        defer r_cmp.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_cmp.status);
+        try testing.expect(std.mem.indexOf(u8, r_cmp.body, "\"ok\":true") != null);
+    }
+
+    var proj_id: []u8 = undefined;
+    {
+        const body = try std.fmt.allocPrint(allocator, "{{\"name\":\"apollo\",\"space_ids\":[\"{s}\"]}}", .{s1_id});
+        defer allocator.free(body);
+        var r = try v2HttpRequest(allocator, port, "POST", "/api/v2/projects", body);
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        proj_id = try jsonFieldStrAlloc(allocator, r.body, &.{ "project", "project_id" });
+    }
+    defer allocator.free(proj_id);
+
+    {
+        const ep = try std.fmt.allocPrint(allocator, "/api/v2/projects/{s}/spaces", .{proj_id});
+        defer allocator.free(ep);
+        const body = try std.fmt.allocPrint(allocator, "{{\"space_id\":\"{s}\",\"role\":\"specs\"}}", .{s2_id});
+        defer allocator.free(body);
+        var r = try v2HttpRequest(allocator, port, "POST", ep, body);
+        defer r.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, s2_id) != null);
+    }
+
+    {
+        const ep_fork = try std.fmt.allocPrint(allocator, "/api/v2/projects/{s}/fork", .{proj_id});
+        defer allocator.free(ep_fork);
+        var r_fork = try v2HttpRequest(allocator, port, "POST", ep_fork, "{\"title_prefix\":\"exp\"}");
+        defer r_fork.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_fork.status);
+        try testing.expect(std.mem.indexOf(u8, r_fork.body, "\"forked_space_ids\":[") != null);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, r_fork.body, .{});
+        defer parsed.deinit();
+        const fids = parsed.value.object.get("forked_space_ids").?.array.items;
+        try testing.expectEqual(@as(usize, 2), fids.len);
+
+        const fid0 = fids[0].string;
+        const ep_f0 = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file", .{fid0});
+        defer allocator.free(ep_f0);
+        var r_w = try v2HttpRequest(allocator, port, "PUT", ep_f0, "{\"path\":\"forked.txt\",\"content\":\"from-fork\"}");
+        defer r_w.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_w.status);
+
+        const fork_list_body = try std.fmt.allocPrint(allocator, "{{\"fork_ids\":[\"{s}\",\"{s}\"]}}", .{ fids[0].string, fids[1].string });
+        defer allocator.free(fork_list_body);
+
+        const ep_sync = try std.fmt.allocPrint(allocator, "/api/v2/projects/{s}/sync", .{proj_id});
+        defer allocator.free(ep_sync);
+        var r_sync = try v2HttpRequest(allocator, port, "POST", ep_sync, fork_list_body);
+        defer r_sync.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_sync.status);
+
+        const ep_land = try std.fmt.allocPrint(allocator, "/api/v2/projects/{s}/land", .{proj_id});
+        defer allocator.free(ep_land);
+        var r_land = try v2HttpRequest(allocator, port, "POST", ep_land, fork_list_body);
+        defer r_land.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_land.status);
+        try testing.expect(std.mem.indexOf(u8, r_land.body, "\"aborted\":false") != null);
+    }
+
+    {
+        var r_zr = try v2HttpRequest(allocator, port, "POST", "/api/v2/threads", "{\"title\":\"Zero Repo Bot\",\"bindings\":[]}");
+        defer r_zr.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_zr.status);
+        const zr_tid = try jsonFieldStrAlloc(allocator, r_zr.body, &.{ "thread", "thread_id" });
+        defer allocator.free(zr_tid);
+
+        const ep_turn = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/turns", .{zr_tid});
+        defer allocator.free(ep_turn);
+        var r_t = try v2HttpRequest(allocator, port, "POST", ep_turn, "{\"prompt\":\"hello zero-repo\",\"reply\":\"hi zero-repo\"}");
+        defer r_t.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_t.status);
+        try testing.expect(std.mem.indexOf(u8, r_t.body, "\"pre_checkpoint\":[]") != null);
+        try testing.expect(std.mem.indexOf(u8, r_t.body, "\"post_checkpoint\":[]") != null);
+
+        const ep_tr = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/triggers", .{zr_tid});
+        defer allocator.free(ep_tr);
+        var r_once = try v2HttpRequest(allocator, port, "POST", ep_tr, "{\"kind\":\"once\",\"at_ms\":1000,\"prompt_template\":\"morning check\"}");
+        defer r_once.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_once.status);
+
+        var r_cron = try v2HttpRequest(allocator, port, "POST", ep_tr, "{\"kind\":\"cron\",\"cron\":\"* * * * *\",\"prompt_template\":\"minutely tick\"}");
+        defer r_cron.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_cron.status);
+        const cron_id = try jsonFieldStrAlloc(allocator, r_cron.body, &.{"trigger_id"});
+        defer allocator.free(cron_id);
+
+        const ep_poll = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/triggers/poll", .{zr_tid});
+        defer allocator.free(ep_poll);
+        var r_p1 = try v2HttpRequest(allocator, port, "POST", ep_poll, "{\"now_ms\":60000,\"fire\":true}");
+        defer r_p1.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_p1.status);
+        try testing.expect(std.mem.indexOf(u8, r_p1.body, "\"outcome\":\"fired\"") != null);
+
+        var r_p2 = try v2HttpRequest(allocator, port, "POST", ep_poll, "{\"now_ms\":60000,\"fire\":true}");
+        defer r_p2.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_p2.status);
+        try testing.expect(std.mem.indexOf(u8, r_p2.body, "\"due\":[]") != null);
+
+        const ep_fire = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/triggers/{s}/fire", .{ zr_tid, cron_id });
+        defer allocator.free(ep_fire);
+        var r_dup = try v2HttpRequest(allocator, port, "POST", ep_fire, "{\"event_token\":\"cron:1\",\"now_ms\":60000}");
+        defer r_dup.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_dup.status);
+        try testing.expect(std.mem.indexOf(u8, r_dup.body, "\"outcome\":\"already_fired\"") != null);
+
+        const ep_del_tr = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/triggers/{s}", .{ zr_tid, cron_id });
+        defer allocator.free(ep_del_tr);
+        var r_dt = try v2HttpRequest(allocator, port, "DELETE", ep_del_tr, null);
+        defer r_dt.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_dt.status);
+        try testing.expect(std.mem.indexOf(u8, r_dt.body, "\"enabled\":false") != null);
+    }
+
+    {
+        const f1_ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file", .{s1_id});
+        defer allocator.free(f1_ep);
+        const f2_ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file", .{s2_id});
+        defer allocator.free(f2_ep);
+
+        var r_w1 = try v2HttpRequest(allocator, port, "PUT", f1_ep, "{\"path\":\"a.txt\",\"content\":\"v1\"}");
+        defer r_w1.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_w1.status);
+
+        var r_w2 = try v2HttpRequest(allocator, port, "PUT", f2_ep, "{\"path\":\"b.txt\",\"content\":\"v1\"}");
+        defer r_w2.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_w2.status);
+
+        const t_body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"title\":\"Captain Multi-Space\",\"project_id\":\"{s}\",\"bindings\":[{{\"space_id\":\"{s}\",\"alias\":\"notes\",\"access\":\"shared_rw\"}},{{\"space_id\":\"{s}\",\"alias\":\"specs\",\"access\":\"shared_rw\"}}],\"budget\":{{\"max_tokens\":10000,\"max_depth\":3,\"max_children\":8}}}}",
+            .{ proj_id, s1_id, s2_id },
+        );
+        defer allocator.free(t_body);
+        var r_th = try v2HttpRequest(allocator, port, "POST", "/api/v2/threads", t_body);
+        defer r_th.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_th.status);
+        const cap_tid = try jsonFieldStrAlloc(allocator, r_th.body, &.{ "thread", "thread_id" });
+        defer allocator.free(cap_tid);
+
+        const bind_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/bind", .{cap_tid});
+        defer allocator.free(bind_ep);
+        const bind_body = try std.fmt.allocPrint(allocator, "{{\"space_id\":\"{s}\",\"alias\":\"ro\",\"access\":\"read_only\"}}", .{s_ro_id});
+        defer allocator.free(bind_body);
+        var r_bind = try v2HttpRequest(allocator, port, "POST", bind_ep, bind_body);
+        defer r_bind.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_bind.status);
+
+        const turn_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/turns", .{cap_tid});
+        defer allocator.free(turn_ep);
+        var r_t1 = try v2HttpRequest(allocator, port, "POST", turn_ep, "{\"prompt\":\"checkpoint v1\",\"reply\":\"recorded v1\"}");
+        defer r_t1.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_t1.status);
+        const turn1_id = try jsonFieldStrAlloc(allocator, r_t1.body, &.{"turn_id"});
+        defer allocator.free(turn1_id);
+
+        const t2_body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"prompt\":\"mutate both to v2\",\"reply\":\"mutated to v2\",\"mutations\":[{{\"space_id\":\"{s}\",\"path\":\"a.txt\",\"content\":\"v2\"}},{{\"space_id\":\"{s}\",\"path\":\"b.txt\",\"content\":\"v2\"}}]}}",
+            .{ s1_id, s2_id },
+        );
+        defer allocator.free(t2_body);
+        var r_t2 = try v2HttpRequest(allocator, port, "POST", turn_ep, t2_body);
+        defer r_t2.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_t2.status);
+
+        const g1_ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file?path=a.txt", .{s1_id});
+        defer allocator.free(g1_ep);
+        const g2_ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file?path=b.txt", .{s2_id});
+        defer allocator.free(g2_ep);
+        {
+            var c1 = try v2HttpRequest(allocator, port, "GET", g1_ep, null);
+            defer c1.deinit(allocator);
+            try testing.expect(std.mem.indexOf(u8, c1.body, "\"content\":\"v2\"") != null);
+            var c2 = try v2HttpRequest(allocator, port, "GET", g2_ep, null);
+            defer c2.deinit(allocator);
+            try testing.expect(std.mem.indexOf(u8, c2.body, "\"content\":\"v2\"") != null);
+        }
+
+        const rb_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/rollback", .{cap_tid});
+        defer allocator.free(rb_ep);
+        const rb_body = try std.fmt.allocPrint(allocator, "{{\"message_id\":\"{s}\"}}", .{turn1_id});
+        defer allocator.free(rb_body);
+        var r_rb = try v2HttpRequest(allocator, port, "POST", rb_ep, rb_body);
+        defer r_rb.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_rb.status);
+        try testing.expect(std.mem.indexOf(u8, r_rb.body, "\"completed\":true") != null);
+
+        {
+            var c1 = try v2HttpRequest(allocator, port, "GET", g1_ep, null);
+            defer c1.deinit(allocator);
+            try testing.expect(std.mem.indexOf(u8, c1.body, "\"content\":\"v1\"") != null);
+            var c2 = try v2HttpRequest(allocator, port, "GET", g2_ep, null);
+            defer c2.deinit(allocator);
+            try testing.expect(std.mem.indexOf(u8, c2.body, "\"content\":\"v1\"") != null);
+        }
+
+        const sub_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/subordinates", .{cap_tid});
+        defer allocator.free(sub_ep);
+        const bad_sub_body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"title\":\"escalate\",\"bindings\":[{{\"space_id\":\"{s}\",\"alias\":\"ro\",\"access\":\"shared_rw\"}}],\"budget\":{{\"max_tokens\":100}}}}",
+            .{s_ro_id},
+        );
+        defer allocator.free(bad_sub_body);
+        var r_esc = try v2HttpRequest(allocator, port, "POST", sub_ep, bad_sub_body);
+        defer r_esc.deinit(allocator);
+        try testing.expectEqual(@as(u16, 403), r_esc.status);
+
+        const ok_sub_body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"title\":\"worker-1\",\"prompt\":\"refactor notes\",\"bindings\":[{{\"space_id\":\"{s}\",\"alias\":\"notes\",\"access\":\"isolated_fork\"}}],\"budget\":{{\"max_tokens\":500}}}}",
+            .{s1_id},
+        );
+        defer allocator.free(ok_sub_body);
+        var r_sub1 = try v2HttpRequest(allocator, port, "POST", sub_ep, ok_sub_body);
+        defer r_sub1.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_sub1.status);
+        const task1_id = try jsonFieldStrAlloc(allocator, r_sub1.body, &.{"task_id"});
+        defer allocator.free(task1_id);
+
+        const mb_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/mailbox", .{cap_tid});
+        defer allocator.free(mb_ep);
+        var r_mb_post = try v2HttpRequest(allocator, port, "POST", mb_ep, "{\"kind\":\"progress\",\"payload\":\"halfway\"}");
+        defer r_mb_post.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_mb_post.status);
+
+        var r_mb_get = try v2HttpRequest(allocator, port, "GET", mb_ep, null);
+        defer r_mb_get.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_mb_get.status);
+        try testing.expect(std.mem.indexOf(u8, r_mb_get.body, "halfway") != null);
+
+        const land_task_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/tasks/{s}/land", .{ cap_tid, task1_id });
+        defer allocator.free(land_task_ep);
+        var r_lt = try v2HttpRequest(allocator, port, "POST", land_task_ep, "{}");
+        defer r_lt.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_lt.status);
+        try testing.expect(std.mem.indexOf(u8, r_lt.body, "\"aborted\":false") != null);
+
+        const settle_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/tasks/{s}/settle", .{ cap_tid, task1_id });
+        defer allocator.free(settle_ep);
+        var r_settle = try v2HttpRequest(allocator, port, "POST", settle_ep, "{\"status\":\"completed\",\"summary\":\"all green\",\"used_tokens\":120}");
+        defer r_settle.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_settle.status);
+        try testing.expect(std.mem.indexOf(u8, r_settle.body, "\"status\":\"completed\"") != null);
+
+        const ok_sub2_body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"title\":\"worker-2\",\"prompt\":\"long task\",\"bindings\":[{{\"space_id\":\"{s}\",\"alias\":\"ro\",\"access\":\"read_only\"}}],\"budget\":{{\"max_tokens\":500}}}}",
+            .{s_ro_id},
+        );
+        defer allocator.free(ok_sub2_body);
+        var r_sub2 = try v2HttpRequest(allocator, port, "POST", sub_ep, ok_sub2_body);
+        defer r_sub2.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_sub2.status);
+
+        const cancel_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}/cancel-tree", .{cap_tid});
+        defer allocator.free(cancel_ep);
+        var r_cancel = try v2HttpRequest(allocator, port, "POST", cancel_ep, "{\"reason\":\"abort test\"}");
+        defer r_cancel.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_cancel.status);
+        try testing.expect(std.mem.indexOf(u8, r_cancel.body, "\"ok\":true") != null);
+
+        const det_ep = try std.fmt.allocPrint(allocator, "/api/v2/threads/{s}", .{cap_tid});
+        defer allocator.free(det_ep);
+        var r_det = try v2HttpRequest(allocator, port, "GET", det_ep, null);
+        defer r_det.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_det.status);
+        try testing.expect(std.mem.indexOf(u8, r_det.body, "\"tasks\":[") != null);
+    }
+
+    {
+        const del_ep = try std.fmt.allocPrint(allocator, "/api/v2/spaces/{s}/file?path=memory/prefs.md", .{s1_id});
+        defer allocator.free(del_ep);
+        var r_del = try v2HttpRequest(allocator, port, "DELETE", del_ep, null);
+        defer r_del.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_del.status);
+        try testing.expect(std.mem.indexOf(u8, r_del.body, "\"deleted\":true") != null);
+
+        var r_chk = try v2HttpRequest(allocator, port, "GET", del_ep, null);
+        defer r_chk.deinit(allocator);
+        try testing.expectEqual(@as(u16, 200), r_chk.status);
+        try testing.expect(std.mem.indexOf(u8, r_chk.body, "\"exists\":false") != null);
     }
 }

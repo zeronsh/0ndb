@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Loader2, Monitor, Moon, Plus, Search, Sun } from 'lucide-react'
+import { Boxes, Loader2, MessageSquare, Monitor, Moon, Plus, Search, Sun } from 'lucide-react'
 import type { Session } from '@/lib/api'
 import { providerName } from '@/lib/catalog'
 import { bytes } from '@/lib/format'
@@ -30,7 +30,7 @@ function groupOf(ms: number, now: number) {
   return 'Older'
 }
 
-export function Sidebar({ onSearch, theme, setTheme }: { onSearch: () => void; theme: ThemePref; setTheme: (t: ThemePref) => void }) {
+export function Sidebar({ onSearch, theme, setTheme, viewMode, setViewMode }: { onSearch: () => void; theme: ThemePref; setTheme: (t: ThemePref) => void; viewMode: 'workspace' | 'v2'; setViewMode: (m: 'workspace' | 'v2') => void }) {
   const { sessions, activeId, select, createSession, active, info, conn, providers } = useStore()
   const [now, setNow] = useState(Date.now())
   useEffect(() => {
@@ -83,6 +83,30 @@ export function Sidebar({ onSearch, theme, setTheme }: { onSearch: () => void; t
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>
+      </div>
+      <div className="px-2 pb-2">
+        <div className="grid grid-cols-2 rounded-lg border border-border bg-background/60 p-0.5 text-[11.5px]">
+          <button
+            onClick={() => setViewMode('workspace')}
+            className={cn(
+              'flex items-center justify-center gap-1.5 rounded-md py-1 font-medium transition-colors',
+              viewMode === 'workspace' ? 'bg-accent text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            <MessageSquare className="size-3.5" />
+            Workspace
+          </button>
+          <button
+            onClick={() => setViewMode('v2')}
+            className={cn(
+              'flex items-center justify-center gap-1.5 rounded-md py-1 font-medium transition-colors',
+              viewMode === 'v2' ? 'bg-accent text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            <Boxes className="size-3.5" />
+            Spaces V2
+          </button>
+        </div>
       </div>
       <div className="flex flex-col gap-1 px-2 pb-2">
         <Button className="h-9 justify-start gap-2 rounded-lg px-3" onClick={newSession} disabled={creating}>

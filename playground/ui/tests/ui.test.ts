@@ -11,6 +11,16 @@ import {
   utf8ToUtf16Offset,
 } from '../src/lib/splices.ts'
 import { displayCommand, parseInput, presentTool, summarizeTools } from '../src/lib/tools.ts'
+import {
+  canAttenuateAccess,
+  formatBudgetSummary,
+  groupThreadsByHierarchy,
+  spaceStateBadgeVariant,
+  summarizeHealth,
+  taskStatusBadgeVariant,
+  threadModeLabel,
+  validateSubordinateGrants,
+} from '../src/lib/v2.ts'
 
 test('ansi strips and parses SGR colors, 256-color, RGB, reset, and carriage returns', () => {
   assert.equal(stripAnsi('\x1b[31merror\x1b[0m: ok'), 'error: ok')
@@ -135,4 +145,95 @@ test('sanitizeUrl allows safe protocols and relative links and rejects XSS schem
   assert.equal(sanitizeUrl(''), null)
   assert.equal(sanitizeUrl(null), null)
   assert.equal(sanitizeUrl(undefined), null)
+})
+
+test('v2 access attenuation prevents privilege escalation and allows monotonic narrowing', () => {
+  assert.equal(canAttenuateAccess('shared_rw', 'shared_rw'), true)
+  assert.equal(canAttenuateAccess('shared_rw', 'isolated_fork'), true)
+  assert.equal(canAttenuateAccess('shared_rw', 'read_only'), true)
+  assert.equal(canAttenuateAccess('isolated_fork', 'isolated_fork'), true)
+  assert.equal(canAttenuateAccess('isolated_fork', 'read_only'), true)
+  assert.equal(canAttenuateAccess('isolated_fork', 'shared_rw'), false)
+  assert.equal(canAttenuateAccess('read_only', 'read_only'), true)
+  assert.equal(canAttenuateAccess('read_only', 'isolated_fork'), false)
+  assert.equal(canAttenuateAccess('read_only', 'shared_rw'), false)
+
+  const parent = [
+    { space_id: 's1', alias: 'notes', access: 'read_only' as const },
+    { space_id: 's2', alias: 'api', access: 'shared_rw' as const },
+  ]
+  assert.deepEqual(validateSubordinateGrants(parent, [{ space_id: 's2', alias: 'api', access: 'isolated_fork' }]), { ok: true })
+  const escalated = validateSubordinateGrants(parent, [{ space_id: 's1', alias: 'notes', access: 'shared_rw' }])
+  assert.equal(escalated.ok, false)
+  const unbound = validateSubordinateGrants(parent, [{ space_id: 's3', alias: 'other', access: 'read_only' }])
+  assert.equal(unbound.ok, false)
+})
+
+test('v2 thread mode, hierarchy grouping, badges, budget, and health summaries', () => {
+  assert.equal(threadModeLabel([]), 'Zero-Repo')
+  assert.equal(threadModeLabel([{ space_id: 's1' }]), '1 Space')
+  assert.equal(threadModeLabel([{ space_id: 's1' }, { space_id: 's2' }]), '2 Spaces')
+
+  assert.equal(spaceStateBadgeVariant('hot'), 'ok')
+  assert.equal(spaceStateBadgeVariant('warm'), 'amber')
+  assert.equal(spaceStateBadgeVariant('cold'), 'outline')
+
+  assert.equal(taskStatusBadgeVariant('completed'), 'ok')
+  assert.equal(taskStatusBadgeVariant('failed'), 'danger')
+  assert.equal(taskStatusBadgeVariant('running'), 'violet')
+  assert.equal(taskStatusBadgeVariant('ready'), 'amber')
+
+  assert.equal(
+    formatBudgetSummary({
+      max_tokens: 5000,
+      used_tokens: 250,
+      max_cost_microusd: 0,
+      used_cost_microusd: 0,
+      max_wall_ms: 0,
+      used_wall_ms: 0,
+      max_depth: 4,
+      max_children: 8,
+      active_children: 2,
+    }),
+    '250/5000 tok · 2/8 workers · depth ≤ 4',
+  )
+
+  const summary = summarizeHealth({
+    ok: true,
+    open_spaces: 2,
+    total_spaces: 5,
+    hot_spaces: 1,
+    warm_spaces: 1,
+    cold_spaces: 3,
+    hibernated_spaces: 4,
+    projects_count: 1,
+    threads_count: 3,
+    memory_governor_bytes: 20480,
+    workspace_bytes: 16384,
+    blob_bytes: 4096,
+    git_delta_bytes: 0,
+    watcher_fds: 4,
+    watch_count: 12,
+    runner_id: 'r1',
+    device_id: 'd1',
+  })
+  assert.deepEqual(summary, {
+    spacesLabel: '1 hot · 4 hibernated',
+    governorKb: 20,
+    watcherLabel: '4 FDs / 12 watches',
+  })
+
+  const ordered = groupThreadsByHierarchy([
+    { thread_id: 'child-1', parent_thread_id: 'root-1', depth: 1, title: 'Worker 1' },
+    { thread_id: 'root-1', parent_thread_id: null, depth: 0, title: 'Captain' },
+    { thread_id: 'grandchild-1', parent_thread_id: 'child-1', depth: 2, title: 'Subworker' },
+  ])
+  assert.deepEqual(
+    ordered.map(r => [r.thread.thread_id, r.indent]),
+    [
+      ['root-1', 0],
+      ['child-1', 1],
+      ['grandchild-1', 2],
+    ],
+  )
 })
