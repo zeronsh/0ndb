@@ -136,6 +136,7 @@ seal_checkpoint :: proc(h: ^History, ino: fstree.Inode_Id, eff: []crdt.Lv) -> Er
 	append(&tmp.rec.cp_version, ..crdt.graph_version_ids(&h.g, eff, context.temp_allocator))
 	clear(&tmp.rec.cp_spans)
 	append(&tmp.rec.cp_spans, ..crdt.text_spans(&tmp.text, &h.g, context.temp_allocator))
+	tmp.rec.spans_ext = false
 	tmp.rec.cp_text = fshist.Raw_Oid(oid)
 	tmp.rec.cp_len = i64(len(data))
 	tmp.rec.cp_count = count

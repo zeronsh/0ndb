@@ -9,6 +9,8 @@ Text_View :: struct {
 	inode:    fstree.Inode_Id,
 	using st: fshist.Text_State,
 	stale:    bool,
+	full:     bool,
+	cp:       [dynamic]crdt.Op_Id,
 }
 
 history_view_open :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (view: ^Text_View, err: Error) {
@@ -37,7 +39,13 @@ history_view_close :: proc(h: ^History, view: ^Text_View) {
 		}
 	}
 	fshist.text_drop(&view.st)
+	delete(view.cp)
 	free(view, h.allocator)
+}
+
+history_op_content :: proc(h: ^History, src: crdt.Op_Id, dst: []u8) -> int {
+	authors := make([dynamic]crdt.Author_Span, context.temp_allocator)
+	return copy_read_depth(h, src, dst, &authors, 0)
 }
 
 history_view_version :: proc(h: ^History, view: ^Text_View, allocator := context.allocator) -> Version {
@@ -57,17 +65,47 @@ views_stale :: proc(h: ^History, inode: Maybe(fstree.Inode_Id) = nil) {
 @(private)
 views_feed :: proc(h: ^History, ino: fstree.Inode_Id, b: ^crdt.Batch, target: crdt.Op_Id, first: crdt.Lv, skip: int) {
 	for v in h.views {
-		if v.inode == ino && v.loaded && !v.stale {
-			crdt.log_add_batch(&v.log, &h.g, b, target, first, skip)
+		if v.inode != ino || !v.loaded || v.stale {
+			continue
 		}
+		if v.from_cp && !view_descends(h, v, b) {
+			v.stale = true
+			v.full = true
+			continue
+		}
+		crdt.log_add_batch(&v.log, &h.g, b, target, first, skip)
 	}
+}
+
+@(private)
+view_descends :: proc(h: ^History, v: ^Text_View, b: ^crdt.Batch) -> bool {
+	cpv := make([dynamic]crdt.Lv, context.temp_allocator)
+	ps := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, v.cp[:], &cpv) != .None || crdt.graph_version_lvs(&h.g, b.parents, &ps) != .None {
+		return false
+	}
+	return crdt.graph_contains_all(&h.g, ps[:], cpv[:])
 }
 
 @(private)
 view_load :: proc(h: ^History, view: ^Text_View, lvs: []crdt.Lv) -> Error {
 	fshist.text_drop(&view.st)
+	full := view.full
 	view.stale = false
-	if f, ok := h.files[view.inode]; ok && f.loaded && crdt.frontier_eq(f.text.version[:], lvs) {
+	view.full = false
+	if view.cp == nil {
+		view.cp = make([dynamic]crdt.Op_Id, h.allocator)
+	}
+	clear(&view.cp)
+	if f, ok := h.files[view.inode]; ok && f.loaded && !full && crdt.frontier_eq(f.text.version[:], lvs) {
+		append(&view.cp, ..f.rec.cp_version[:])
+		if !f.dirty && len(f.new_refs) == 0 {
+			view.st = f.st
+			f.st = {}
+			file_free(h, f)
+			delete_key(&h.files, view.inode)
+			return .None
+		}
 		crdt.text_clone(&view.text, &f.text, h.allocator)
 		crdt.log_clone(&view.log, &f.log, h.allocator)
 		view.loaded = true
@@ -92,26 +130,35 @@ view_load :: proc(h: ^History, view: ^Text_View, lvs: []crdt.Lv) -> Error {
 		delete(tmp.rec.cp_version)
 		delete(tmp.rec.cp_spans)
 	}
-	if err := load_text(h, &tmp, lvs); err != .None {
+	if err := load_text(h, &tmp, lvs, full); err != .None {
 		fshist.text_drop(&tmp.st)
 		return err
+	}
+	if tmp.from_cp {
+		append(&view.cp, ..tmp.rec.cp_version[:])
 	}
 	view.st = tmp.st
 	return .None
 }
 
 history_view_advance :: proc(h: ^History, view: ^Text_View, target: Version, sink: crdt.Text_Sink) -> Error {
+	_, err := history_view_advance_ex(h, view, target, sink)
+	return err
+}
+
+history_view_advance_ex :: proc(h: ^History, view: ^Text_View, target: Version, sink: crdt.Text_Sink) -> (reloaded: bool, err: Error) {
 	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, target, &lvs) != .None {
-		return .Not_Found
+		return false, .Not_Found
 	}
 	if view.loaded && !view.stale {
 		if crdt.frontier_eq(view.text.version[:], lvs[:]) {
-			return .None
+			return false, .None
 		}
 		if crdt.graph_contains_all(&h.g, lvs[:], view.text.version[:]) {
-			if crdt.text_merge(&view.text, &h.g, &view.log, lvs[:], nil, sink) == .None {
-				return .None
+			merr := crdt.text_merge(&view.text, &h.g, &view.log, lvs[:], nil, sink)
+			if merr == .None || merr == .Missing_Content {
+				return false, .None
 			}
 		}
 	}
@@ -119,10 +166,14 @@ history_view_advance :: proc(h: ^History, view: ^Text_View, target: Version, sin
 	if view.loaded {
 		old = crdt.text_bytes(&view.text, context.temp_allocator)
 	}
-	view_load(h, view, lvs[:]) or_return
-	nw := crdt.text_bytes(&view.text, context.temp_allocator)
-	view_diff_feed(h, view, old, nw, sink)
-	return .None
+	if lerr := view_load(h, view, lvs[:]); lerr != .None {
+		return true, lerr
+	}
+	if sink.insert != nil && sink.delete != nil {
+		nw := crdt.text_bytes(&view.text, context.temp_allocator)
+		view_diff_feed(h, view, old, nw, sink)
+	}
+	return true, .None
 }
 
 @(private)
@@ -153,10 +204,10 @@ view_diff_feed :: proc(h: ^History, view: ^Text_View, old, nw: []u8, sink: crdt.
 	}
 	shift := 0
 	for e in edits {
-		pos := int(e.pos)
-		at := pos + shift
+		at := int(e.pos)
+		from := at - shift
 		if e.del > 0 {
-			sink.delete(sink.data, at, old[pos:pos + int(e.del)])
+			sink.delete(sink.data, at, old[from:from + int(e.del)])
 		}
 		if e.ins > 0 {
 			insert(h, view, sink, at, nw, int(e.ins))

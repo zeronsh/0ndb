@@ -704,7 +704,12 @@ file_get :: proc(r: ^Reader, inode: fstree.Inode_Id) -> (f: ^File, err: Error) {
 	f.rec.cp_spans = make([dynamic]crdt.Author_Span, r.allocator)
 	f.refs = make([dynamic]Op_Ref, r.allocator)
 	if v, ok := r.kv[string(inode_key("f", inode))]; ok {
-		if e := decode_file_record(v, &f.rec); e != .None {
+		e := decode_file_record(v, &f.rec)
+		if e == .None && f.rec.has_cp && f.rec.spans_ext {
+			sp, sok := r.kv[string(inode_key("fc", inode))]
+			e = decode_spans(sp, &f.rec.cp_spans) if sok else .Corrupt
+		}
+		if e != .None {
 			file_record_destroy(&f.rec)
 			delete(f.refs)
 			free(f, r.allocator)

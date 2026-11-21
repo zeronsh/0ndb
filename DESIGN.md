@@ -513,13 +513,16 @@ concurrent typing is never lost or reverted.
   `Cursors` delta per buffer of that object; the newest set per
   (device, actor) replaces the previous one, and leaving drops it.
 - **Undo.** Each buffer keeps an undo stack of its own edits only: inserts
-  as op-id runs, deletes as the deleted op-id runs plus an anchor. Undo of a
-  group deletes whatever of its inserted characters still exist (wherever
-  concurrent work moved them) and re-inserts its deleted characters as
-  `Insert_Copy` of the original ops at their anchors, so authorship of
-  restored text is kept; redo is the inverse. It never touches characters
-  another author inserted, so an agent's or another device's concurrent work
-  survives undo. Groups are the client's `group` ids (equal ids merge).
+  as op-id runs, deletes as the deleted op-id runs. Undo of a group deletes
+  whatever of its inserted characters still exist (wherever concurrent work
+  moved them) and re-inserts its deleted characters where they were (each
+  deleted character resolves through the transient merge state), as plain
+  inserts whose content is read from the original ops at undo time;
+  redacted text is never restored, and nothing in the batch depends on a
+  replica's redaction or fetch state, so every replica admits it. Redo is
+  the inverse. It never touches characters another author inserted, so an
+  agent's or another device's concurrent work survives undo. Groups are the
+  client's `group` ids (equal ids merge).
 - **Large files.** Open is one rope clone or checkpoint read and a first
   page; deltas, edits and anchors cost O(changes · log n). A file the tree
   keeps as opaque large content cannot be opened as a buffer (`Too_Large`).

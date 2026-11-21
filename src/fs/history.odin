@@ -25,6 +25,8 @@ TOP_CONTENT :: fshist.TOP_CONTENT
 TOP_GIT :: fshist.TOP_GIT
 
 CHECKPOINT_OPS :: 64
+CHECKPOINT_SPAN :: 64 << 10
+CHECKPOINT_INLINE :: 1 << 20
 OPS_CHUNK :: fshist.OPS_CHUNK
 MOVES_CHUNK :: fshist.MOVES_CHUNK
 
@@ -45,6 +47,7 @@ File_State :: struct {
 	using st: fshist.Text_State,
 	dirty:    bool,
 	new_refs: [dynamic]Op_Ref,
+	log_mark: int,
 }
 
 Git_Marker :: struct {
@@ -433,6 +436,13 @@ history_close :: proc(h: ^History) {
 	h.own_next = nil
 	delete(h.mounts)
 	h.mounts = nil
+	for v in h.views {
+		fshist.text_drop(&v.st)
+		delete(v.cp)
+		free(v, h.allocator)
+	}
+	delete(h.views)
+	h.views = nil
 	for x in h.staged {
 		delete(x.data, h.allocator)
 	}
@@ -2149,6 +2159,7 @@ load_text :: proc(h: ^History, f: ^File_State, v: []crdt.Lv, full := false) -> E
 		src.decoded = scan_decoded
 	}
 	h.src_err = .None
+	f.log_mark = 0
 	e := fshist.text_load(&src, &f.st, f.inode, inode_op(h, f.inode), &f.rec, f.new_refs[:], v, full)
 	if e == .None {
 		return .None
@@ -2204,13 +2215,27 @@ read_stream :: proc(h: ^History, stream: u32, off: i64, buf: ^[dynamic]u8) -> (b
 }
 
 @(private)
+checkpoint_due :: proc(f: ^File_State) -> bool {
+	since := int(f.rec.ops - f.rec.cp_count)
+	if since <= 0 {
+		return false
+	}
+	size := crdt.text_len(&f.text)
+	if since >= max(CHECKPOINT_OPS, size / CHECKPOINT_SPAN) {
+		return true
+	}
+	inline := len(f.log.bytes) - f.log_mark
+	return inline >= CHECKPOINT_INLINE && inline >= size / 2
+}
+
+@(private)
 persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error {
 	for ref in f.new_refs {
 		write_op_ref(h, id, f.rec.ops, ref) or_return
 		f.rec.ops += 1
 	}
 	clear(&f.new_refs)
-	if f.loaded && f.rec.ops - f.rec.cp_count >= CHECKPOINT_OPS && h.db != nil {
+	if f.loaded && checkpoint_due(f) && h.db != nil {
 		data := crdt.text_bytes(&f.text, context.temp_allocator)
 		oid, werr := history_stage_blob(h, data)
 		if werr == .None {
@@ -2223,6 +2248,11 @@ persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error 
 			f.rec.cp_len = i64(len(data))
 			f.rec.cp_count = f.rec.ops
 			f.rec.has_cp = true
+			f.log_mark = len(f.log.bytes)
+			sbuf := make([dynamic]u8, context.temp_allocator)
+			fshist.encode_spans(&sbuf, f.rec.cp_spans[:])
+			kv_put(&h.kv, inode_key("fc", id), sbuf[:]) or_return
+			f.rec.spans_ext = true
 		}
 	}
 	buf := make([dynamic]u8, context.temp_allocator)
@@ -2245,7 +2275,14 @@ read_file_record :: proc(h: ^History, id: fstree.Inode_Id, r: ^File_Record) -> E
 	if !found {
 		return .None
 	}
-	return decode_file_record(data, r)
+	decode_file_record(data, r) or_return
+	if r.has_cp && r.spans_ext {
+		sp, sfound := kv_get(&h.kv, inode_key("fc", id), context.temp_allocator) or_return
+		if !sfound || fshist.decode_spans(sp, &r.cp_spans) != .None {
+			return .Corrupt
+		}
+	}
+	return .None
 }
 
 @(private)

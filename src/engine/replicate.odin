@@ -332,6 +332,10 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	case .Device_Seen, .Dropped, .Object_Shredded:
 		return
 	case .Direct, .Undelivered:
+		if ev.kind == .Direct && u64(ev.length) == CURSOR_TAG {
+			_cursors_queue(e, sp, ev.device, ev.meta)
+			return
+		}
 		_remote_on_repl(e, sp, ev)
 		return
 	case .Draft, .Draft_Pulled:
@@ -491,6 +495,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		obj_id, _, _ := _object_of_name(ev.name)
 		_emit(e, Event{kind = .Relay_Misbehaving, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err)})
 	case .Presence:
+		if ev.from == 0 {
+			_cursors_gone(e, ev.device)
+		}
 		_emit(e, Event{kind = .Presence, space = sp.id, device = ev.device, tick = u64(ev.from), length = ev.length})
 		_remote_presence(e, sp, ev.device, ev.from != 0)
 	case .Caught_Up:
