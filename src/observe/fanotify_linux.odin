@@ -208,7 +208,7 @@ fanotify_watch :: proc(f: ^Fanotify, path: string) -> prim.Error {
 }
 
 fanotify_observer :: proc(f: ^Fanotify) -> fs.Write_Observer {
-	return fs.Write_Observer{data = f, start = _fan_start, stop = _fan_stop}
+	return fs.Write_Observer{data = f, start = _fan_start, stop = _fan_stop, fence = _fan_fence}
 }
 
 @(private)
@@ -448,4 +448,13 @@ _fan_overflow_dir :: proc(f: ^Fanotify, mount_fd: i32) {
 @(private)
 _u16le :: #force_inline proc "contextless" (b: []u8) -> u16 {
 	return u16(b[0]) | u16(b[1]) << 8
+}
+
+@(private)
+_fan_fence :: proc(data: rawptr, reg: ^fs.Registry, done: proc(data: rawptr), done_data: rawptr) {
+	f := (^Fanotify)(data)
+	if f.fd >= 0 {
+		_fan_drain(f)
+	}
+	done(done_data)
 }

@@ -327,7 +327,7 @@ supervisor_trees :: proc(s: ^Supervisor) -> int {
 }
 
 write_observer :: proc(s: ^Supervisor) -> fs.Write_Observer {
-	return fs.Write_Observer{data = s, start = _observer_start, stop = _observer_stop}
+	return fs.Write_Observer{data = s, start = _observer_start, stop = _observer_stop, fence = _observer_fence}
 }
 
 @(private)
@@ -1214,4 +1214,9 @@ _fences_run :: proc(s: ^Supervisor) {
 		_fence_free(s, f)
 		cb(data)
 	}
+}
+
+@(private)
+_observer_fence :: proc(data: rawptr, reg: ^fs.Registry, done: proc(data: rawptr), done_data: rawptr) {
+	supervisor_fence((^Supervisor)(data), done, done_data)
 }

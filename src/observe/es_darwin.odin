@@ -245,7 +245,7 @@ endpoint_stats :: proc(e: ^Endpoint) -> Stats {
 }
 
 endpoint_observer :: proc(e: ^Endpoint) -> fs.Write_Observer {
-	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop, changed = _es_changed}
+	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop, changed = _es_changed, fence = _es_fence}
 }
 
 @(private)
@@ -528,4 +528,13 @@ _es_changed :: proc(data: rawptr, m: ^fs.Mount, rel: string) -> (^fs.Scope, bool
 		router_bind(&e.fallback.router, e.router.reg)
 	}
 	return libproc_changed(e.fallback, m, rel)
+}
+
+@(private)
+_es_fence :: proc(data: rawptr, reg: ^fs.Registry, done: proc(data: rawptr), done_data: rawptr) {
+	e := (^Endpoint)(data)
+	if e.client != nil {
+		_es_on_pipe(e.loop, prim.Fd(e.pipe[0]), {.Read}, e)
+	}
+	done(done_data)
 }
