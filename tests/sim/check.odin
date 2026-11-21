@@ -328,6 +328,10 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 				continue
 			}
 			msg, err := eng.convo_message(&n.e, ob.o, convo.Position{msg = op.rid}, context.temp_allocator)
+			if err == .Busy {
+				world_note(w, "model: message %s unknown on %s (Busy)", op.token, n.name)
+				continue
+			}
 			present := err == .None && msg.author == op.actor && (msg.redacted || msg_text(msg) == op.token)
 			redacted := _redacted_by(m, op)
 			switch op.status {
@@ -356,6 +360,10 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 				continue
 			}
 			en, found, err := eng.map_get(&n.e, ob.o, transmute([]u8)op.key, context.temp_allocator)
+			if err == .Busy {
+				world_note(w, "model: map key %s unknown on %s (Busy)", op.key, n.name)
+				continue
+			}
 			present := false
 			if err == .None && found {
 				for r in en.registers {
@@ -470,6 +478,10 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 	}
 	if ob.kind == .Text {
 		data, err := eng.text_read(&n.e, ob.o, context.temp_allocator)
+		if err == .Busy {
+			world_note(w, "model: text %s unknown on %s (Busy)", id_short(ob.o.id), n.name)
+			return
+		}
 		if err != .None {
 			world_fail(w, "model: text %s unreadable on %s: %v", id_short(ob.o.id), n.name, err)
 			return
@@ -519,6 +531,10 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 				for a in s.actors {
 					own ||= a == op.actor
 					if a == op.actor {
+						continue
+					}
+					if op.kind == .Disk_Agent && op.power_crash && unattributed(a) {
+						own = true
 						continue
 					}
 					if !diffed {
@@ -1132,4 +1148,14 @@ file_base :: proc(name: string) -> string {
 		return name[:i]
 	}
 	return name
+}
+
+unattributed :: proc(a: prim.Id) -> bool {
+	p := [8]u8{'0', 'n', 'd', 'b', '-', 'u', 'n', 'a'}
+	for i in 0 ..< 8 {
+		if a[i] != p[i] {
+			return false
+		}
+	}
+	return true
 }

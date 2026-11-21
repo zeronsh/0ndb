@@ -281,6 +281,13 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 		scope = fs.scope_open(n.reg, sm.m, sid, op.actor)
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
+	if agent {
+		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && !n.disk.dead {
+			if w.cfg.io_rate == 0 {
+				world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
+			}
+		}
+	}
 	atomic := !agent && rng_chance(&w.rng, 1, 2)
 	if atomic {
 		_writer_set(w, n, strings.concatenate({sm.root, "/.", name, ".swp"}, context.temp_allocator), Writer_Info{scope = scope, agent = agent})
@@ -305,8 +312,12 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 			world_fail(w, "%s disk edit failed: %v", n.name, err)
 		}
 	} else {
-		op_done(op, 0, .None)
-		op.status = .Acked
+		if agent {
+			op_done(op, eng.current_tick(&n.e), .None)
+		} else {
+			op_done(op, 0, .None)
+			op.status = .Acked
+		}
 		if serr != .None && w.cfg.io_rate == 0 {
 			world_fail(w, "%s scope_close failed: %v", n.name, serr)
 		}

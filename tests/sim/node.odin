@@ -188,7 +188,7 @@ node_crashed :: proc(n: ^Node) {
 	w.stats.crashes += 1
 	node_kill(n)
 	disk_crash(&n.disk, mode, &w.fault_rng)
-	model_node_crashed(&w.model, n)
+	model_node_crashed(&w.model, n, mode)
 	delay := rng_range(&w.fault_rng, 10, 3000) * 1_000_000
 	schedule(w, Sim_Event{at = w.now + delay, kind = .Restart, node = n.idx})
 }

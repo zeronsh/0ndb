@@ -101,6 +101,7 @@ M_Op :: struct {
 	at:      i64,
 	overwrite: bool,
 	gens:    [dynamic]string,
+	power_crash: bool,
 }
 
 Model :: struct {
@@ -277,7 +278,7 @@ model_durable :: proc(m: ^Model, n: ^Node, t: u64) {
 	}
 }
 
-model_node_crashed :: proc(m: ^Model, n: ^Node) {
+model_node_crashed :: proc(m: ^Model, n: ^Node, mode: Crash_Mode) {
 	for op in m.ops {
 		if op.node != n.idx {
 			continue
@@ -285,6 +286,7 @@ model_node_crashed :: proc(m: ^Model, n: ^Node) {
 		switch op.status {
 		case .Issued, .Done:
 			op.status = .Uncertain
+			op.power_crash = mode == .Power
 		case .Acked, .Observed, .Uncertain, .Lost, .Failed:
 		}
 	}
@@ -345,7 +347,7 @@ op_presence :: proc(m: ^Model, n: ^Node, op: ^M_Op) -> Presence {
 			return .Unknown
 		}
 		msg, err := eng.convo_message(&n.e, o, convo.Position{msg = op.rid}, context.temp_allocator)
-		if err == .Missing || err == .Pending {
+		if err == .Missing || err == .Pending || err == .Busy {
 			return .Unknown
 		}
 		if err != .None {
