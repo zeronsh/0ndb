@@ -27,6 +27,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	dir_open   = _os_dir_open,
 	dir_next   = _os_dir_next,
 	dir_close  = _os_dir_close,
+	writeout   = _os_writeout,
 }
 
 @(private)
@@ -493,6 +494,25 @@ _os_datasync :: proc(data: rawptr, fd: Fd) -> Error {
 	}
 	if st == STATUS_UNSUCCESSFUL {
 		return _last()
+	}
+	return _nterror(st)
+}
+
+@(private)
+FLUSH_FLAGS_NO_SYNC :: 0x2
+
+@(private)
+_os_writeout :: proc(data: rawptr, fd: Fd) -> Error {
+	h := _h(fd)
+	iosb: IO_STATUS_BLOCK
+	st := NtFlushBuffersFileEx(h, FLUSH_FLAGS_NO_SYNC, nil, 0, &iosb)
+	if st == STATUS_ACCESS_DENIED {
+		twin := _writable_twin(h)
+		if twin == INVALID_HANDLE {
+			return _last()
+		}
+		st = NtFlushBuffersFileEx(twin, FLUSH_FLAGS_NO_SYNC, nil, 0, &iosb)
+		win.CloseHandle(twin)
 	}
 	return _nterror(st)
 }
@@ -1151,7 +1171,17 @@ _os_dir_next :: proc(data: rawptr, d: ^Dir) -> (Dir_Entry, bool, Error) {
 		case:
 			kind = .File
 		}
-		return Dir_Entry{name = string(out[:n]), ino = ino, kind = kind}, true, .None
+		return Dir_Entry {
+				name = string(out[:n]),
+				ino = ino,
+				kind = kind,
+				has_stat = true,
+				size = (^i64)(&rec[40])^ if kind == .File else 0,
+				mtime_ns = _filetime_ns((^i64)(&rec[24])^),
+				ctime_ns = _filetime_ns((^i64)(&rec[32])^),
+			},
+			true,
+			.None
 	}
 }
 

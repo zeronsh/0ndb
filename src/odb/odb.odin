@@ -2,7 +2,6 @@ package odb
 
 import "base:runtime"
 import "core:io"
-import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -607,7 +606,7 @@ load_pack :: proc(db: ^Odb, d: ^Object_Dir, base: string) -> ^Pack {
 	p.fd = prim.INVALID_FD
 	p.hsz = oid_size(db.format)
 	if db.use_mmap && vfs_is_os(db.vfs) {
-		idx, merr := virtual.map_file_from_path(idx_path, {.Read})
+		idx, merr := vfs_map_path(db.vfs, idx_path)
 		if merr != .None {
 			free(p, db.allocator)
 			return nil

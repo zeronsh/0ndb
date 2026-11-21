@@ -14,6 +14,10 @@ TIMER_KEY :: uint(1)
 PIPE_KEY :: uint(2)
 @(private)
 WRITER_KEY :: uint(3)
+@(private)
+OVERLAPPED_KEY :: uint(4)
+@(private)
+OP_CACHE :: 16
 
 @(private)
 SOCK_NOTIFY_OP_ENABLE :: 1
@@ -54,7 +58,21 @@ _Watch_Kind :: enum u8 {
 	None,
 	Pipe,
 	Socket,
+	Overlapped,
 }
+
+Overlapped_Op :: struct {
+	ov:     win.OVERLAPPED,
+	buf:    []u8,
+	user:   u64,
+	status: u32,
+	handle: u64,
+	file:   HANDLE,
+	index:  int,
+	issued: bool,
+}
+
+Overlapped_Proc :: #type proc(l: ^Loop, w: Watch, op: ^Overlapped_Op, bytes: int, err: Error, data: rawptr)
 
 @(private)
 _Io :: struct {
@@ -84,6 +102,8 @@ _Slot_Os :: struct {
 	writer:  ^_Writer,
 	process: HANDLE,
 	packet:  HANDLE,
+	ocb:     Overlapped_Proc,
+	ofile:   HANDLE,
 }
 
 @(private)
@@ -104,6 +124,8 @@ _Loop_Os :: struct {
 	ios:         [dynamic]^_Io,
 	writers:     [dynamic]^_Writer,
 	ready:       [dynamic]_Ready,
+	ops:         [dynamic]^Overlapped_Op,
+	op_cache:    [dynamic]^Overlapped_Op,
 	stash_n:     int,
 	stash_pos:   int,
 	entries:     [MAX_EVENTS]win.OVERLAPPED_ENTRY,
@@ -125,6 +147,8 @@ _os_init :: proc(l: ^Loop) -> Error {
 	l.os.ios = make([dynamic]^_Io, l.allocator)
 	l.os.writers = make([dynamic]^_Writer, l.allocator)
 	l.os.ready = make([dynamic]_Ready, l.allocator)
+	l.os.ops = make([dynamic]^Overlapped_Op, l.allocator)
+	l.os.op_cache = make([dynamic]^Overlapped_Op, l.allocator)
 	l.os.port = win.CreateIoCompletionPort(INVALID_HANDLE, nil, 0, 1)
 	if l.os.port == nil {
 		err := _last()
@@ -166,6 +190,16 @@ _os_destroy :: proc(l: ^Loop) {
 	for io in l.os.ios {
 		free(io, l.allocator)
 	}
+	for op in l.os.ops {
+		_op_free(l, op)
+	}
+	for op in l.os.op_cache {
+		_op_free(l, op)
+	}
+	delete(l.os.ops)
+	delete(l.os.op_cache)
+	l.os.ops = nil
+	l.os.op_cache = nil
 	delete(l.os.ios)
 	delete(l.os.writers)
 	delete(l.os.ready)
@@ -205,6 +239,10 @@ _drain_orphans :: proc(l: ^Loop) {
 				if k := _io_find(l, rawptr(e.lpOverlapped)); k >= 0 {
 					l.os.ios[k].pending = false
 				}
+			} else if e.lpCompletionKey == OVERLAPPED_KEY {
+				if op := _op_from(l, rawptr(e.lpOverlapped)); op != nil {
+					op.issued = false
+				}
 			}
 		}
 	}
@@ -214,6 +252,11 @@ _drain_orphans :: proc(l: ^Loop) {
 _io_outstanding :: proc(l: ^Loop) -> bool {
 	for io in l.os.ios {
 		if io.pending {
+			return true
+		}
+	}
+	for op in l.os.ops {
+		if op.issued {
 			return true
 		}
 	}
@@ -345,6 +388,29 @@ _entry :: proc(l: ^Loop, e: win.OVERLAPPED_ENTRY) {
 			io.eof = true
 		}
 		_deliver(l, io.handle, events)
+	case OVERLAPPED_KEY:
+		op := _op_from(l, rawptr(e.lpOverlapped))
+		if op == nil {
+			return
+		}
+		op.issued = false
+		op.status = u32(e.Internal)
+		h := op.handle
+		s := _slot_get(l, h, .Fd) if h != 0 else nil
+		if s == nil || s.os.kind != .Overlapped || s.os.ocb == nil {
+			_op_release(l, op)
+			return
+		}
+		st := NTSTATUS(i32(op.status))
+		err := Error.None
+		if st == STATUS_CANCELLED {
+			err = .Interrupted
+		} else if st < 0 {
+			err = _nterror(st)
+		}
+		op.handle = 0
+		s.os.ocb(l, Watch(h), op, int(e.dwNumberOfBytesTransferred), err, s.data)
+		_op_release(l, op)
 	case WRITER_KEY:
 		w := (^_Writer)(e.lpOverlapped)
 		found := false
@@ -718,7 +784,7 @@ _os_modify :: proc(l: ^Loop, fd: Fd, old, next: Events, h: u64) -> Error {
 			s.os.writer = nil
 		}
 		return .None
-	case .None:
+	case .None, .Overlapped:
 	}
 	return .Unsupported
 }
@@ -738,9 +804,169 @@ _os_unwatch :: proc(l: ^Loop, fd: Fd, events: Events, h: u64) {
 			_writer_stop(l, s.os.writer)
 			s.os.writer = nil
 		}
+	case .Overlapped:
+		cancel := false
+		for op in l.os.ops {
+			if op.handle == h {
+				op.handle = 0
+				cancel ||= op.issued
+			}
+		}
+		if cancel {
+			win.CancelIoEx(s.os.ofile, nil)
+		}
+		i := 0
+		for i < len(l.os.ops) {
+			op := l.os.ops[i]
+			if op.handle == 0 && !op.issued {
+				_op_release(l, op)
+				continue
+			}
+			i += 1
+		}
 	case .None:
 	}
 	s.os = {}
+}
+
+@(private)
+FileReplaceCompletionInformation :: 61
+
+@(private)
+_Completion_Info :: struct {
+	port: HANDLE,
+	key:  uintptr,
+}
+
+watch_overlapped :: proc(l: ^Loop, fd: Fd, data: rawptr, cb: Overlapped_Proc) -> (Watch, Error) {
+	if cb == nil {
+		return 0, .Invalid
+	}
+	file := _h(fd)
+	if _handle_synchronous(file) {
+		return 0, .Unsupported
+	}
+	if win.CreateIoCompletionPort(file, l.os.port, OVERLAPPED_KEY, 0) == nil {
+		if win.GetLastError() != ERROR_INVALID_PARAMETER {
+			return 0, _last()
+		}
+		iosb: IO_STATUS_BLOCK
+		info := _Completion_Info{l.os.port, uintptr(OVERLAPPED_KEY)}
+		if st := NtSetInformationFile(file, &iosb, &info, size_of(info), FileReplaceCompletionInformation); st < 0 {
+			return 0, _nterror(st)
+		}
+	}
+	idx, gen, ok := _slot_alloc(l)
+	if !ok {
+		return 0, .No_Memory
+	}
+	s := &l.slots[idx]
+	s.kind = .Fd
+	s.fd = fd
+	s.data = data
+	s.os = {kind = .Overlapped, ocb = cb, ofile = file}
+	return Watch(_handle(idx, gen)), .None
+}
+
+overlapped_begin :: proc(l: ^Loop, w: Watch, size: int) -> (^Overlapped_Op, Error) {
+	s := _slot_get(l, u64(w), .Fd)
+	if s == nil || s.os.kind != .Overlapped || size < 0 {
+		return nil, .Invalid
+	}
+	op: ^Overlapped_Op
+	for c, i in l.os.op_cache {
+		if len(c.buf) == size {
+			op = c
+			unordered_remove(&l.os.op_cache, i)
+			break
+		}
+	}
+	if op == nil {
+		n, aerr := new(Overlapped_Op, l.allocator)
+		if aerr != nil {
+			return nil, .No_Memory
+		}
+		if size > 0 {
+			b, berr := make([]u8, size, l.allocator)
+			if berr != nil {
+				free(n, l.allocator)
+				return nil, .No_Memory
+			}
+			n.buf = b
+		}
+		op = n
+	}
+	buf := op.buf
+	op^ = {}
+	op.buf = buf
+	op.handle = u64(w)
+	op.file = s.os.ofile
+	op.index = len(l.os.ops)
+	if _, aerr := append(&l.os.ops, op); aerr != nil {
+		_op_free(l, op)
+		return nil, .No_Memory
+	}
+	return op, .None
+}
+
+overlapped_ptr :: #force_inline proc "contextless" (op: ^Overlapped_Op) -> rawptr {
+	return &op.ov
+}
+
+overlapped_submit :: proc(l: ^Loop, op: ^Overlapped_Op, ok: bool) -> Error {
+	if ok {
+		op.issued = true
+		return .None
+	}
+	code := win.GetLastError()
+	if code == ERROR_IO_PENDING {
+		op.issued = true
+		return .None
+	}
+	_op_release(l, op)
+	return _werror(code)
+}
+
+overlapped_abort :: proc(l: ^Loop, op: ^Overlapped_Op) {
+	if !op.issued {
+		_op_release(l, op)
+	}
+}
+
+@(private)
+_op_from :: proc "contextless" (l: ^Loop, p: rawptr) -> ^Overlapped_Op {
+	op := (^Overlapped_Op)(p)
+	if op == nil || op.index < 0 || op.index >= len(l.os.ops) || l.os.ops[op.index] != op {
+		return nil
+	}
+	return op
+}
+
+@(private)
+_op_release :: proc(l: ^Loop, op: ^Overlapped_Op) {
+	k := op.index
+	if k >= 0 && k < len(l.os.ops) && l.os.ops[k] == op {
+		last := len(l.os.ops) - 1
+		l.os.ops[k] = l.os.ops[last]
+		l.os.ops[k].index = k
+		pop(&l.os.ops)
+	}
+	op.index = -1
+	op.handle = 0
+	if len(l.os.op_cache) < OP_CACHE {
+		if _, err := append(&l.os.op_cache, op); err == nil {
+			return
+		}
+	}
+	_op_free(l, op)
+}
+
+@(private)
+_op_free :: proc(l: ^Loop, op: ^Overlapped_Op) {
+	if op.buf != nil {
+		delete(op.buf, l.allocator)
+	}
+	free(op, l.allocator)
 }
 
 @(private)

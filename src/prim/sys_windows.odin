@@ -475,6 +475,7 @@ foreign ntdll {
 	NtAssociateWaitCompletionPacket :: proc(packet: HANDLE, port: HANDLE, target: HANDLE, key: rawptr, apc: rawptr, status: NTSTATUS, info: uintptr, already: ^win.BOOLEAN) -> NTSTATUS ---
 	NtCancelWaitCompletionPacket :: proc(packet: HANDLE, remove_signaled: win.BOOLEAN) -> NTSTATUS ---
 	RtlNtStatusToDosError :: proc(status: NTSTATUS) -> u32 ---
+	NtSetInformationFile :: proc(file: HANDLE, iosb: ^IO_STATUS_BLOCK, info: rawptr, size: u32, class: i32) -> NTSTATUS ---
 }
 
 @(private)

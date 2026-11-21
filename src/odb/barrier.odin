@@ -142,6 +142,11 @@ sync_one :: proc(db: ^Odb, path: string, dir: bool, data_only: bool) -> (fd: pri
 
 @(private)
 sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
+	when ODIN_OS == .Windows {
+		if vfs_is_os(db.vfs) && len(files) + len(dirs) > 1 && writeout_batch(db, files, dirs, roots) == .None {
+			return .None
+		}
+	}
 	if HAS_SYNCFS && vfs_is_os(db.vfs) && len(files) + len(dirs) > SYNCFS_THRESHOLD {
 		done := 0
 		for r in roots {
@@ -199,4 +204,41 @@ sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
 		}
 	}
 	return .None
+}
+
+@(private)
+writeout_batch :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
+	for list, li in ([][]string{files, dirs}) {
+		for p in list {
+			flags := prim.Open_Flags{.Directory} if li == 1 else prim.Open_Flags{}
+			fd, e := prim.open_file(db.vfs, p, flags)
+			if e == .Not_Found {
+				continue
+			}
+			if e != .None {
+				return perr(e)
+			}
+			we := prim.writeout(db.vfs, fd)
+			prim.close_file(db.vfs, fd)
+			if we != .None && !(li == 1 && (we == .Invalid || we == .Unsupported)) {
+				return perr(we)
+			}
+		}
+	}
+	root := ""
+	for r in roots {
+		if r != "" {
+			root = r
+			break
+		}
+	}
+	if root == "" {
+		return .Invalid
+	}
+	buf: [PATH_MAX]u8
+	fd, path := create_temp(db, root, ".barrier_", buf[:]) or_return
+	err := perr(prim.fullsync(db.vfs, fd))
+	prim.close_file(db.vfs, fd)
+	prim.remove(db.vfs, path)
+	return err
 }

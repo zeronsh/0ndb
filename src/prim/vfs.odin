@@ -37,9 +37,13 @@ Dir :: struct {
 }
 
 Dir_Entry :: struct {
-	name: string,
-	ino:  u64,
-	kind: File_Kind,
+	name:      string,
+	ino:       u64,
+	kind:      File_Kind,
+	has_stat:  bool,
+	size:      i64,
+	mtime_ns:  i64,
+	ctime_ns:  i64,
 }
 
 Vfs_Cap :: enum u8 {
@@ -73,6 +77,7 @@ Vfs_Procs :: struct {
 	dir_next:   proc(data: rawptr, d: ^Dir) -> (Dir_Entry, bool, Error),
 	dir_close:  proc(data: rawptr, d: ^Dir),
 	caps:       proc(data: rawptr, fd: Fd) -> Vfs_Caps,
+	writeout:   proc(data: rawptr, fd: Fd) -> Error,
 }
 
 open_file :: #force_inline proc(vfs: Vfs, path: string, flags: Open_Flags = {}, mode: u32 = 0o644) -> (Fd, Error) {
@@ -165,6 +170,13 @@ dir_next :: #force_inline proc(vfs: Vfs, d: ^Dir) -> (Dir_Entry, bool, Error) {
 
 dir_close :: #force_inline proc(vfs: Vfs, d: ^Dir) {
 	vfs.procs.dir_close(vfs.data, d)
+}
+
+writeout :: proc(vfs: Vfs, fd: Fd) -> Error {
+	if vfs.procs == nil || vfs.procs.writeout == nil {
+		return .Unsupported
+	}
+	return vfs.procs.writeout(vfs.data, fd)
 }
 
 file_caps :: proc(vfs: Vfs, fd: Fd) -> Vfs_Caps {

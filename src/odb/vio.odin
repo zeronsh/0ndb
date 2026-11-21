@@ -66,3 +66,18 @@ set_mtime :: proc(db: ^Odb, path: string, ns: i64) -> bool {
 now_ns :: proc(db: ^Odb) -> i64 {
 	return prim.clock_wall_ns(db.clock)
 }
+
+@(private)
+vfs_map_path :: proc(vfs: prim.Vfs, path: string) -> (data: []u8, err: Error) {
+	fd, e := prim.open_file(vfs, path)
+	if e != .None {
+		return nil, perr(e)
+	}
+	defer prim.close_file(vfs, fd)
+	size := vfs_size(vfs, fd) or_return
+	if size <= 0 || size > i64(max(int)) {
+		return nil, .Corrupt if size <= 0 else .Too_Large
+	}
+	mapped, merr := prim.map_file(fd, int(size), false)
+	return mapped, perr(merr)
+}

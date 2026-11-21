@@ -2,7 +2,6 @@ package odb
 
 import "core:encoding/endian"
 import "core:io"
-import "core:mem/virtual"
 import "../prim"
 
 @(private)
@@ -158,10 +157,10 @@ pack_open_data :: proc(db: ^Odb, p: ^Pack) -> Error {
 	buf: [PATH_MAX]u8
 	path := concat_into(buf[:], p.base, ".pack") or_return
 	if db.use_mmap && vfs_is_os(db.vfs) {
-		data, merr := virtual.map_file_from_path(path, {.Read})
+		data, merr := vfs_map_path(db.vfs, path)
 		if merr != .None {
 			p.failed = true
-			return .Not_Found if merr == .Open_Failure else .Io
+			return merr
 		}
 		p.data = data
 		p.size = i64(len(data))
@@ -222,7 +221,7 @@ pack_view :: proc(db: ^Odb, p: ^Pack, off: i64, n: int, buf: []u8, whole := fals
 @(private)
 pack_close :: proc(db: ^Odb, p: ^Pack) {
 	if p.data != nil {
-		virtual.unmap_file(p.data)
+		prim.unmap_file(p.data)
 		p.data = nil
 	}
 	if p.opened && p.fd != prim.INVALID_FD && p.fd != 0 {
@@ -232,7 +231,7 @@ pack_close :: proc(db: ^Odb, p: ^Pack) {
 	p.opened = false
 	if p.idx != nil {
 		if p.idx_mapped {
-			virtual.unmap_file(p.idx)
+			prim.unmap_file(p.idx)
 		} else {
 			delete(p.idx, db.allocator)
 		}
