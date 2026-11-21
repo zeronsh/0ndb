@@ -139,7 +139,7 @@ _export_file :: proc(r: ^Runtime, o: Object, e: Port_Entry) {
 	if serr != .None || st.kind != .File {
 		return
 	}
-	meta := meta_object(o)
+	meta := meta_w(r, o)
 	k := _nf_key(e.key, e.rel)
 	en, found := map_read(r, meta, k)
 	tid := entry_id(&en, 1) if found else prim.Id{}
@@ -180,7 +180,7 @@ _export_file :: proc(r: ^Runtime, o: Object, e: Port_Entry) {
 
 @(private)
 _store_file :: proc(r: ^Runtime, o: Object, key: string, rel: string, data: []u8, replace: bool) {
-	meta := meta_object(o)
+	meta := meta_w(r, o)
 	k := _nf_key(key, rel)
 	en, found := map_read(r, meta, k)
 	tid := entry_id(&en, 1) if found else prim.Id{}
@@ -287,7 +287,7 @@ _purge :: proc(data: rawptr, e: ^eng.Engine, req: ^eng.Purge_Request) {
 		if t, terr := convo.view_tail(v, r.self, context.temp_allocator); terr == .None {
 			if m, merr := convo.message(v, &t, convo.Position{msg = req.msg}, context.temp_allocator); merr == .None {
 				if m.role == .Assistant {
-					sn := seal_native(v, &m)
+					sn := m.seal_native
 					to := sn if len(sn) > 0 && sn[0] != 0 else ""
 					if !obj.rid_none(m.parent) {
 						append(&targets, agent.Purge_Target{from = rid_uuid(m.parent), to = to, keep_from = true})
@@ -297,6 +297,11 @@ _purge :: proc(data: rawptr, e: ^eng.Engine, req: ^eng.Purge_Request) {
 					append(&targets, agent.Purge_Target{from = u, to = u})
 				}
 			}
+		}
+	}
+	for t in req.texts {
+		if len(t) > 0 {
+			append(&targets, agent.Purge_Target{text = t})
 		}
 	}
 	if len(targets) == 0 {

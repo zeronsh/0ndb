@@ -48,6 +48,7 @@ Spawner :: struct {
 
 Placement_Kind :: enum u8 {
 	Message,
+	Takeover,
 	Intent,
 	Revive,
 	Schedule,
@@ -59,8 +60,9 @@ Placement :: struct {
 	object: Object,
 	msg:    Rid,
 	sender: prim.Id,
-	agent:  prim.Id,
-	policy: []u8,
+	agent:   prim.Id,
+	policy:  []u8,
+	exclude: prim.Id,
 }
 
 Scheduler :: struct {
@@ -98,7 +100,6 @@ Channels :: struct {
 Providers :: struct {
 	data:     rawptr,
 	lookup:   proc(data: rawptr, id: string) -> (agent.Provider_Descriptor, bool),
-	mcp_args: proc(data: rawptr, desc: ^agent.Provider_Descriptor, url: string, token: string, out: ^[dynamic]string) -> bool,
 }
 
 Secrets :: struct {
@@ -139,6 +140,7 @@ Config :: struct {
 	interrupt_ms:     i64,
 	mcp_http:         bool,
 	mcp_port:         int,
+	catalog_command:  []string,
 	home_dir:         string,
 	env:              []string,
 }
@@ -158,6 +160,8 @@ Stats :: struct {
 	raw_lines:     u64,
 	tool_calls:    u64,
 	schedules:     u64,
+	warmups:       u64,
+	takeovers:     u64,
 	timers:        int,
 }
 
@@ -166,6 +170,38 @@ Space_Watch :: struct {
 	space:     prim.Id,
 	catalog:   eng.Sub_Id,
 	schedules: eng.Sub_Id,
+	synced:    bool,
+}
+
+@(private)
+Lease_Watch :: struct {
+	object:   Object,
+	msg:      Rid,
+	activity: prim.Hlc,
+	seen:     i64,
+	at:       i64,
+	sub:      eng.Sub_Id,
+}
+
+@(private)
+Revive_Wait :: struct {
+	object: Object,
+	since:  i64,
+}
+
+@(private)
+Follow :: struct {
+	object: Object,
+	sub:    eng.Sub_Id,
+	fresh:  bool,
+	timer:  prim.Timer,
+	grace:  ^Follow_Grace,
+}
+
+@(private)
+Follow_Grace :: struct {
+	r:   ^Runtime,
+	sub: eng.Sub_Id,
 }
 
 @(private)
@@ -202,6 +238,11 @@ Runtime :: struct {
 	router_on:   bool,
 	next_token:  u64,
 	triggers:    bool,
+	leases:      [dynamic]Lease_Watch,
+	follows:     [dynamic]Follow,
+	revives:     [dynamic]Revive_Wait,
+	lease_timer: prim.Timer,
+	lease_at:    i64,
 	stats:       Stats,
 }
 
@@ -240,6 +281,13 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 		}
 		r.cfg.env = env
 	}
+	if len(cfg.catalog_command) > 0 {
+		cc := make([]string, len(cfg.catalog_command), allocator)
+		for x, i in cfg.catalog_command {
+			cc[i] = clone(x, allocator)
+		}
+		r.cfg.catalog_command = cc
+	}
 	if len(r.cfg.work_root) == 0 {
 		r.cfg.work_root = clone(concat(e.dir, "/work"), allocator)
 	}
@@ -257,6 +305,9 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	r.jobs = make([dynamic]^Job, allocator)
 	r.awaits = make([dynamic]^Await_Wait, allocator)
 	r.clients = make([dynamic]^Mcp_Conn, allocator)
+	r.leases = make([dynamic]Lease_Watch, allocator)
+	r.follows = make([dynamic]Follow, allocator)
+	r.revives = make([dynamic]Revive_Wait, allocator)
 	agent.registry_init(&r.registry, allocator)
 	r.opened = true
 	return .None
@@ -306,6 +357,24 @@ close :: proc(r: ^Runtime) {
 	if r.sched_timer != 0 {
 		prim.timer_cancel(l, r.sched_timer)
 	}
+	if r.lease_timer != 0 {
+		prim.timer_cancel(l, r.lease_timer)
+	}
+	for w in r.leases {
+		if w.sub != 0 {
+			eng.unsubscribe(r.e, w.sub)
+		}
+	}
+	delete(r.leases)
+	for f in r.follows {
+		eng.unsubscribe(r.e, f.sub)
+		if f.timer != 0 {
+			prim.timer_cancel(l, f.timer)
+		}
+		free(f.grace, r.allocator)
+	}
+	delete(r.follows)
+	delete(r.revives)
 	if r.warmer_on {
 		model.warmer_destroy(&r.warmer)
 	}
@@ -329,6 +398,10 @@ close :: proc(r: ^Runtime) {
 		delete(s, r.allocator)
 	}
 	delete(r.cfg.env, r.allocator)
+	for x in r.cfg.catalog_command {
+		delete(x, r.allocator)
+	}
+	delete(r.cfg.catalog_command, r.allocator)
 	r.opened = false
 }
 
@@ -389,6 +462,9 @@ stats :: proc(r: ^Runtime) -> Stats {
 		n += 1
 	}
 	if r.sched_timer != 0 {
+		n += 1
+	}
+	if r.lease_timer != 0 {
 		n += 1
 	}
 	s.timers = n
@@ -481,12 +557,29 @@ parse_rid :: proc(s: string) -> (rid: Rid, ok: bool) {
 _on_catalog :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
 	r := (^Runtime)(data)
 	for &d in deltas {
+		if !d.local {
+			for &sw in r.spaces {
+				if sw.space == d.object.space {
+					sw.synced = true
+				}
+			}
+			break
+		}
+	}
+	seen := make([dynamic]Object, context.temp_allocator)
+	outer: for &d in deltas {
 		if d.kind != .Catalog || len(d.key) != 16 {
 			continue
 		}
 		id: prim.Id
 		copy(id[:], d.key)
 		o := Object{d.object.space, id}
+		for x in seen {
+			if x == o {
+				continue outer
+			}
+		}
+		append(&seen, o)
 		_queue_eval(r, o)
 		_await_touched(r, o)
 		_trigger_touched(r, o)
@@ -566,7 +659,11 @@ engine_spawner :: proc(e: ^eng.Engine) -> Spawner {
 _engine_spawn :: proc(data: rawptr, req: ^Spawn_Request) -> (prim.Child, prim.Error) {
 	e := (^eng.Engine)(data)
 	sp := eng.spawner(e)
-	return sp.spawn(sp.data, req.argv, req.cwd, _env_merge(req.env), req.new_group)
+	env := req.env
+	if e.cfg.spawner.spawn == nil {
+		env = _env_merge(req.env)
+	}
+	return sp.spawn(sp.data, req.argv, req.cwd, env, req.new_group)
 }
 
 default_scheduler :: proc() -> Scheduler {
@@ -575,14 +672,17 @@ default_scheduler :: proc() -> Scheduler {
 
 @(private)
 _default_place :: proc(data: rawptr, r: ^Runtime, p: ^Placement) -> prim.Id {
-	if !prim.id_is_zero(p.sender) && runner_known(r, p.object.space, p.sender) {
+	if !prim.id_is_zero(p.sender) && p.sender != p.exclude && runner_known(r, p.object.space, p.sender) {
 		return p.sender
 	}
-	if id, ok := policy_runner(p.policy); ok {
+	if id, ok := policy_runner(p.policy); ok && id != p.exclude {
 		return id
 	}
-	if !prim.id_is_zero(r.cfg.default_runner) {
+	if !prim.id_is_zero(r.cfg.default_runner) && r.cfg.default_runner != p.exclude {
 		return r.cfg.default_runner
+	}
+	if p.kind == .Takeover {
+		return r.self if r.cfg.runner else {}
 	}
 	return p.sender
 }

@@ -2,6 +2,7 @@ package rt
 
 import "base:runtime"
 import "core:mem/virtual"
+import "core:strings"
 import "../convo"
 import "../crdt"
 import eng "../engine"
@@ -46,6 +47,7 @@ Worktree :: struct {
 	scope:   prim.Id,
 	setup:   bool,
 	busy:    bool,
+	linked:  []string,
 }
 
 line_name :: proc(id: prim.Id, allocator := context.temp_allocator) -> string {
@@ -122,24 +124,98 @@ worktree_open :: proc(r: ^Runtime, o: Object, run: ^Run, lines: []convo.Line) ->
 				mb.run_line = lines[i].line
 			}
 			ws.busy = true
-			if e := _worktree_begin(ws, run); e != .None {
-				return nil, e
-			}
 			return ws, .None
 		}
 	}
-	ws, err = worktree_attach(r, o, run.ai.object.id, lines)
-	if err != .None {
-		return nil, err
-	}
-	if e := _worktree_begin(ws, run); e != .None {
-		worktree_close(ws)
-		return nil, e
-	}
-	return ws, .None
+	return worktree_attach(r, o, run.ai.object.id, lines, run.ai.linked)
 }
 
-worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []convo.Line) -> (ws: ^Worktree, err: Error) {
+Fence_Next :: #type proc(r: ^Runtime, o: Object, arg: int, err: Error)
+
+@(private)
+Fence_Ctx :: struct {
+	r:    ^Runtime,
+	o:    Object,
+	arg:  int,
+	left: int,
+	err:  Error,
+	next: Fence_Next,
+}
+
+OBSERVE_SETTLE_MS :: 5
+
+worktree_fence :: proc(ws: ^Worktree, arg: int, next: Fence_Next) {
+	r := ws.r
+	ctx := new(Fence_Ctx, r.allocator)
+	ctx^ = {r = r, o = ws.o, arg = arg, next = next, left = 1}
+	if reg, rerr := eng.registry(r.e); rerr == .None && fs.observer_installed(reg) {
+		prim.timer(eng.loop(r.e), OBSERVE_SETTLE_MS, ctx, _fence_settled)
+		return
+	}
+	_fence_issue(ctx)
+}
+
+@(private)
+_fence_settled :: proc(l: ^prim.Loop, data: rawptr) {
+	ctx := (^Fence_Ctx)(data)
+	run := run_find(ctx.r, ctx.o)
+	if run == nil || run.ws == nil {
+		r, o, arg, next := ctx.r, ctx.o, ctx.arg, ctx.next
+		free(ctx, r.allocator)
+		next(r, o, arg, .Closed)
+		return
+	}
+	_fence_issue(ctx)
+}
+
+@(private)
+_fence_issue :: proc(ctx: ^Fence_Ctx) {
+	r := ctx.r
+	ws := run_find(r, ctx.o).ws if run_find(r, ctx.o) != nil else nil
+	if ws == nil {
+		_fence_step(ctx)
+		return
+	}
+	for mb in ws.members {
+		if mb.m == nil {
+			continue
+		}
+		ctx.left += 1
+		if eng.tree_mount_fence(r.e, mb.m, eng.Mount_Done{data = ctx, call = _fence_done}) != .None {
+			ctx.left -= 1
+			ctx.err = .Io
+		}
+	}
+	_fence_step(ctx)
+}
+
+@(private)
+_fence_done :: proc(data: rawptr, e: ^eng.Engine, m: ^fs.Mount, err: eng.Error) {
+	ctx := (^Fence_Ctx)(data)
+	if err != .None && ctx.err == .None {
+		ctx.err = .Io
+	}
+	_fence_step(ctx)
+}
+
+@(private)
+_fence_step :: proc(ctx: ^Fence_Ctx) {
+	ctx.left -= 1
+	if ctx.left > 0 {
+		return
+	}
+	prim.timer(eng.loop(ctx.r.e), 0, ctx, _fence_fire)
+}
+
+@(private)
+_fence_fire :: proc(l: ^prim.Loop, data: rawptr) {
+	ctx := (^Fence_Ctx)(data)
+	r, o, arg, err, next := ctx.r, ctx.o, ctx.arg, ctx.err, ctx.next
+	free(ctx, r.allocator)
+	next(r, o, arg, err)
+}
+
+worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []convo.Line, linked: []string = nil) -> (ws: ^Worktree, err: Error) {
 	ms, merr := eng.convo_mounts(r.e, o, context.temp_allocator)
 	if merr != .None {
 		return nil, .Engine
@@ -155,6 +231,7 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 	ws.members = make([dynamic]Wt_Member, ws.alloc)
 	ws.tools = make([dynamic]Wt_Tool, ws.alloc)
 	ws.actor = agent_actor(r, agent_id)
+	ws.linked = linked
 	ws.busy = true
 	id := o.id
 	base := concat(r.cfg.work_root, "/", hex(id))
@@ -196,7 +273,13 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 	if len(ws.root) == 0 {
 		ws.root = clone(base, ws.alloc)
 	}
-	prim.mkdir_all(r.e.base, ws.root, 0o755)
+	nested := true
+	for mb in ws.members {
+		nested &&= mb.dir != ws.root
+	}
+	if nested {
+		prim.mkdir_all(r.e.base, ws.root, 0o755)
+	}
 	for &mb in ws.members {
 		if e := _member_mount(ws, &mb); e != .None {
 			worktree_close(ws)
@@ -250,10 +333,12 @@ _member_mount :: proc(ws: ^Worktree, mb: ^Wt_Member) -> Error {
 		}
 		mb.m = m
 		mb.owned = true
+		_link_ignored(ws, busy_src, mb.dir)
 		return .None
 	}
 	opts := fs.DEFAULT_MOUNT
 	opts.line = conv
+	prim.mkdir_all(r.e.base, mb.dir, 0o755)
 	m, merr := eng.tree_mount(r.e, tree, mb.dir, opts)
 	eng.tree_release(r.e, tree)
 	if merr != .None {
@@ -261,7 +346,41 @@ _member_mount :: proc(ws: ^Worktree, mb: ^Wt_Member) -> Error {
 	}
 	mb.m = m
 	mb.engine = true
+	for src in reg.mounts {
+		if src != nil && src != m && src.history == m.history && src.root != m.root {
+			_link_ignored(ws, src, mb.dir)
+			break
+		}
+	}
 	return .None
+}
+
+@(private)
+_link_ignored :: proc(ws: ^Worktree, src: ^fs.Mount, dest: string) {
+	if fs.mount_wake(src) != .None {
+		return
+	}
+	vfs := ws.r.e.base
+	fs.agents_link(vfs, &src.ignore, src.root, dest)
+	for raw in ws.linked {
+		line := strings.trim(raw, "/ \t")
+		if len(line) == 0 || !fs.path_valid(line) || fs.path_internal(line) {
+			continue
+		}
+		from := concat(src.root, "/", line)
+		st, serr := prim.lstat(vfs, from)
+		if serr != .None || !fs.ignore_path(&src.ignore, src.root, line, st.kind == .Dir) {
+			continue
+		}
+		to := concat(dest, "/", line)
+		if prim.exists(vfs, to) {
+			continue
+		}
+		if parent := fs.path_parent(line); len(parent) > 0 {
+			prim.mkdir_all(vfs, concat(dest, "/", parent), 0o755)
+		}
+		prim.symlink(vfs, from, to)
+	}
 }
 
 @(private)
@@ -272,20 +391,13 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 		return .Engine
 	}
 	targets := _target_versions(r, ws.o, run)
-	claim := run.claim
-	cid := claim.seg
-	off: [8]u8
-	prim.put_u64le(off[:], u64(claim.off))
-	ws.scope = derive_id("0ndb-turn-scope-v1", cid[:], off[:])
+	ws.scope = turn_scope_id(run.claim)
 	for &mb in ws.members {
 		m := mb.m
 		if m == nil {
 			return .Io
 		}
 		h := m.history
-		if fs.mount_sync(m) != .None {
-			return .Io
-		}
 		conv := line_name(mb.conv_line)
 		target: []crdt.Op_Id
 		branch, commit: string
@@ -588,7 +700,7 @@ worktree_tool_open :: proc(ws: ^Worktree, run: ^Run, id: string) -> int {
 	sid := _tool_scope_id(ws, id)
 	for mb, i in ws.members {
 		if mb.m != nil {
-			scopes[i] = fs.scope_open(reg, mb.m, sid, ws.actor)
+			scopes[i] = fs.scope_open(reg, mb.m, sid, sid)
 		}
 	}
 	append(&ws.tools, Wt_Tool{id = clone(id, ws.alloc), scopes = scopes, before = _versions_blob(ws, ws.alloc), open = true})
@@ -596,6 +708,23 @@ worktree_tool_open :: proc(ws: ^Worktree, run: ^Run, id: string) -> int {
 }
 
 worktree_tool_close :: proc(ws: ^Worktree, run: ^Run, idx: int) {
+	if idx < 0 || idx >= len(ws.tools) || !ws.tools[idx].open {
+		return
+	}
+	worktree_fence(ws, idx, _tool_fenced)
+}
+
+@(private)
+_tool_fenced :: proc(r: ^Runtime, o: Object, idx: int, err: Error) {
+	run := run_find(r, o)
+	if run == nil || run.ws == nil {
+		return
+	}
+	_tool_close_now(run.ws, run, idx)
+}
+
+@(private)
+_tool_close_now :: proc(ws: ^Worktree, run: ^Run, idx: int) {
 	if idx < 0 || idx >= len(ws.tools) || !ws.tools[idx].open {
 		return
 	}
@@ -613,7 +742,7 @@ worktree_tool_close :: proc(ws: ^Worktree, run: ^Run, idx: int) {
 	}
 	after := _versions_blob(ws, context.temp_allocator)
 	if w := _writer(run); w != nil {
-		convo.writer_scope(w, run.reply, .Tool, _tool_scope_id(ws, t.id), ws.actor, t.before, after)
+		convo.writer_scope(w, run.reply, .Tool, _tool_scope_id(ws, t.id), _tool_scope_id(ws, t.id), t.before, after)
 	}
 }
 
@@ -621,6 +750,18 @@ worktree_tool_close :: proc(ws: ^Worktree, run: ^Run, idx: int) {
 _tool_scope_id :: proc(ws: ^Worktree, id: string) -> prim.Id {
 	s := ws.scope
 	return derive_id("0ndb-tool-scope-v1", s[:], transmute([]u8)id)
+}
+
+turn_scope_id :: proc(claim: Rid) -> prim.Id {
+	cid := claim.seg
+	off: [8]u8
+	prim.put_u64le(off[:], u64(claim.off))
+	return derive_id("0ndb-turn-scope-v1", cid[:], off[:])
+}
+
+tool_scope_id :: proc(claim: Rid, tool_id: string) -> prim.Id {
+	s := turn_scope_id(claim)
+	return derive_id("0ndb-tool-scope-v1", s[:], transmute([]u8)tool_id)
 }
 
 @(private)
@@ -667,8 +808,6 @@ worktree_finish :: proc(ws: ^Worktree, run: ^Run, land: bool) -> []convo.File_De
 		if mb.turn != nil && rerr == .None {
 			fs.scope_close(reg, mb.turn)
 			mb.turn = nil
-		} else {
-			fs.mount_sync(m)
 		}
 		h := m.history
 		conv := line_name(mb.conv_line)
@@ -816,7 +955,7 @@ _observe_write :: proc(data: rawptr, w: ^observe.Write) {
 		calls := make([dynamic]observe.Tool_Call, context.temp_allocator)
 		idx := make([dynamic]int, context.temp_allocator)
 		for &t, i in run.tools {
-			if !t.done && t.has_obs && t.scope >= 0 {
+			if t.has_obs && t.scope >= 0 && t.scope < len(run.ws.tools) && run.ws.tools[t.scope].open {
 				append(&calls, t.call)
 				append(&idx, i)
 			}

@@ -71,7 +71,7 @@ _index_key :: proc(owner: Object, id: string) -> []u8 {
 
 @(private)
 _index_put :: proc(r: ^Runtime, s: ^Schedule) {
-	so := schedules_object(s.owner.space)
+	so := named_w(r, schedules_named(s.owner.space))
 	if s.next <= 0 {
 		map_clear(r, so, _index_key(s.owner, s.id), 1, 2)
 		return
@@ -201,7 +201,7 @@ _sched_fire :: proc(r: ^Runtime, s: ^Schedule, now: i64) {
 }
 
 schedule_tool :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value, rep: Reply) {
-	owner := meta_object(caller)
+	owner := meta_w(r, caller)
 	agent_id: prim.Id
 	if a != nil && !prim.id_is_zero(a.object.id) {
 		owner = a.object

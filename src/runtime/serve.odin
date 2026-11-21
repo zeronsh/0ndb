@@ -1,6 +1,5 @@
 package rt
 
-import "core:crypto"
 import "core:strings"
 import eng "../engine"
 import "../http"
@@ -78,7 +77,7 @@ serve_http_token :: proc(r: ^Runtime, o: Object) -> (url: string, token: string,
 		s.url = string(b[:])
 	}
 	raw: [16]u8
-	crypto.rand_bytes(raw[:])
+	eng.random_fill(r.e, raw[:])
 	hx := prim.id_hex(prim.Id(raw))
 	t := clone(string(hx[:]), r.allocator)
 	append(&s.tokens, Serve_Token{token = t, o = o})
@@ -238,23 +237,4 @@ serve_reply :: proc(r: ^Runtime, ref: mcp.Ref, text: string, structured: string,
 		body = structured
 	}
 	mcp.server_tool_text(&s.server, ref, body, is_error, structured)
-}
-
-reference_mcp_args :: proc() -> Providers {
-	return Providers{mcp_args = _reference_mcp_args}
-}
-
-@(private)
-_reference_mcp_args :: proc(data: rawptr, desc: ^Provider_Descriptor_Alias, url: string, token: string, out: ^[dynamic]string) -> bool {
-	if desc.protocol != .Claude_Stream_Json {
-		return false
-	}
-	b := make(Buf, context.temp_allocator)
-	append(&b, `{"mcpServers":{"ondb":{"type":"http","url":`)
-	jw_str(&b, url)
-	append(&b, `,"headers":{"Authorization":`)
-	jw_str(&b, concat("Bearer ", token))
-	append(&b, "}}}}")
-	append(out, "--mcp-config", string(b[:]))
-	return true
 }

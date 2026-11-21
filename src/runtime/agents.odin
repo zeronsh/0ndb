@@ -7,8 +7,6 @@ import "../agent"
 import eng "../engine"
 import "../prim"
 
-Provider_Descriptor_Alias :: agent.Provider_Descriptor
-
 Driver_Kind :: enum u8 {
 	Harness,
 	Native,
@@ -57,6 +55,8 @@ Agent_Info :: struct {
 	ask_permissions: bool,
 	observe:         bool,
 	keepalive:       bool,
+	keep_margin_ms:  i64,
+	keep_window_ms:  i64,
 	warm:            bool,
 	catalog:         bool,
 	compact_at:      f64,
@@ -68,6 +68,7 @@ Agent_Info :: struct {
 	policy:          []u8,
 	triggers:        [][]u8,
 	setup:           string,
+	linked:          []string,
 }
 
 agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", allocator := context.allocator) -> (a: Agent_Info, ok: bool) {
@@ -127,6 +128,7 @@ agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", al
 	a.policy = clone_bytes(def.runner_policy if len(def.runner_policy) > 0 else (ws.runner_policy if has_ws else nil), allocator)
 	if has_ws {
 		a.setup = clone(ws.setup, allocator)
+		a.linked = _clone_list(ws.linked, allocator)
 	}
 	switch def.driver {
 	case "native", "model":
@@ -158,6 +160,8 @@ agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", al
 		a.ask_permissions = jbool(opts, "ask_permissions")
 		a.observe = jbool(opts, "observe", true)
 		a.keepalive = jbool(opts, "keepalive")
+		a.keep_margin_ms = jint(opts, "keepalive_margin_ms")
+		a.keep_window_ms = jint(opts, "keepalive_window_ms")
 		a.warm = jbool(opts, "warm", true)
 		a.catalog = jbool(opts, "catalog", a.catalog)
 		a.effort = clone(jstr(opts, "effort"), allocator)
@@ -206,8 +210,13 @@ agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", al
 			spec.allow = _clone_list(jstrs(v, "allow"), allocator)
 			hdrs := make([dynamic]string, allocator)
 			if ho, hok := jget(v, "headers").(json.Object); hok {
-				for k, hv in ho {
-					if s, sok := hv.(json.String); sok {
+				keys := make([dynamic]string, 0, len(ho), context.temp_allocator)
+				for k in ho {
+					append(&keys, k)
+				}
+				_sort_strings(keys[:])
+				for k in keys {
+					if s, sok := ho[k].(json.String); sok {
 						append(&hdrs, clone(k, allocator), clone(s, allocator))
 					}
 				}

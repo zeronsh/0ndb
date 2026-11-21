@@ -35,7 +35,6 @@ Native :: struct {
 	waiting:  int,
 	first:    Rid,
 	tokens:   [dynamic]Native_Tool,
-	v:        ^obj.View,
 }
 
 @(private)
@@ -135,7 +134,7 @@ native_start :: proc(run: ^Run) -> Error {
 	if len(a.effort) > 0 {
 		n.cfg.effort = model.effort_from_name(a.effort)
 	}
-	n.cfg.keepalive.enabled = a.keepalive
+	n.cfg.keepalive = model.Keepalive{enabled = a.keepalive, margin_ms = a.keep_margin_ms, window_ms = a.keep_window_ms}
 	model.run_init(&n.mr, n.cfg, m, n.alloc)
 	n.mr_on = true
 	builtin_defs(r, a, &n.defs, n.alloc)
@@ -220,7 +219,6 @@ native_context :: proc(n: ^Native) -> model.Context {
 	if verr != .None {
 		return ctx
 	}
-	n.v = v
 	t, terr := convo.view_tail(v, r.self, context.temp_allocator)
 	if terr != .None {
 		return ctx
@@ -282,7 +280,7 @@ _push :: proc(msgs: ^[dynamic]model.Message, role: model.Role, blk: model.Block,
 _message_blocks :: proc(n: ^Native, msgs: ^[dynamic]model.Message, m: ^convo.Message) {
 	a := n.alloc
 	if m.role == .Assistant || m.role == .Tool {
-		if items, ok := native_items_decode(seal_native(n.v, m), a); ok {
+		if items, ok := native_items_decode(m.seal_native, a); ok {
 			usable := len(items) > 0
 			for it in items {
 				usable &&= it.api == n.api
@@ -681,28 +679,13 @@ _native_body :: proc(data: rawptr, id: http.Id, chunk: []u8) -> bool {
 	if n.http_id != id || n.dead {
 		return false
 	}
-	rest := chunk
-	for len(rest) > 0 {
-		cut := len(rest)
-		for i in 0 ..< len(rest) - 1 {
-			if rest[i] == '\n' && (rest[i + 1] == '\n' || (rest[i + 1] == '\r' && i + 2 < len(rest) && rest[i + 2] == '\n')) {
-				cut = i + 2 if rest[i + 1] == '\n' else i + 3
-				break
-			}
-		}
-		piece := rest[:cut]
-		rest = rest[cut:]
-		out := model.output_make()
-		keep := model.run_on_body(&n.mr, piece, mono_ns(n.r), &out)
-		if !keep && n.http_id == id {
-			n.http_id = 0
-		}
-		_native_apply(n, &out)
-		if !keep || n.dead || n.http_id != id {
-			return false
-		}
+	out := model.output_make()
+	keep := model.run_on_body(&n.mr, chunk, mono_ns(n.r), &out)
+	if !keep && n.http_id == id {
+		n.http_id = 0
 	}
-	return true
+	_native_apply(n, &out)
+	return keep && !n.dead && n.http_id == id
 }
 
 @(private)
@@ -726,7 +709,7 @@ keepalive_schedule :: proc(r: ^Runtime, o: Object, at: i64, until: i64) {
 		if err != .None {
 			return
 		}
-		model.warmer_init(&r.warmer, eng.loop(r.e), c^, _warm_supply, nil, r, r.allocator)
+		model.warmer_init(&r.warmer, eng.loop(r.e), c^, _warm_supply, _warm_report, r, r.allocator)
 		r.warmer_on = true
 	}
 	model.warmer_schedule(&r.warmer, _warm_key(o), at, until)
@@ -741,11 +724,44 @@ _warm_key :: proc(o: Object) -> u64 {
 
 @(private)
 _warm_register :: proc(r: ^Runtime, o: Object) {
-	so := state_object(r, o.space)
+	so := state_w(r, o.space)
 	k := make([]u8, 8, context.temp_allocator)
 	prim.put_u64le(k, _warm_key(o))
 	id := o.id
 	map_put(r, so, key_of("warm/", k), field_bytes(1, id[:]))
+}
+
+@(private)
+_warm_object :: proc(r: ^Runtime, key: u64) -> (o: Object, ok: bool) {
+	k := make([]u8, 8, context.temp_allocator)
+	prim.put_u64le(k, key)
+	for sw in r.spaces {
+		en, found := map_read(r, state_object(r, sw.space), key_of("warm/", k))
+		if !found {
+			continue
+		}
+		b := entry_bytes(&en, 1)
+		if len(b) != 16 {
+			continue
+		}
+		o = Object{space = sw.space}
+		copy(o.id[:], b)
+		return o, true
+	}
+	return {}, false
+}
+
+@(private)
+_warm_report :: proc(data: rawptr, key: u64, usage: model.Call_Usage, cost: f64, status: int, err: http.Error) {
+	r := (^Runtime)(data)
+	r.stats.warmups += 1
+	o, ok := _warm_object(r, key)
+	if !ok || usage == {} {
+		return
+	}
+	u := convo.Usage{input = usage.input, output = usage.output, cache_read = usage.cache_read, cache_write = usage.cache_write + usage.cache_long}
+	eng.catalog_usage(r.e, o, u)
+	usage_rollup(r, o, u)
 }
 
 @(private)
@@ -786,6 +802,7 @@ _warm_context :: proc(r: ^Runtime, o: Object, cfg: ^model.Config, ctx: ^model.Co
 	if !plug.resolve(plug.data, r, a.provider, a.model, cfg, &m) {
 		return false
 	}
+	cfg.keepalive = model.Keepalive{enabled = true, margin_ms = a.keep_margin_ms, window_ms = a.keep_window_ms}
 	v, verr := eng.convo_view(r.e, o)
 	if verr != .None {
 		return false

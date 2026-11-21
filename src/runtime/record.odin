@@ -44,12 +44,14 @@ record :: proc(r: ^Runtime, o: Object, source: string, external_id: string, sequ
 		}
 	}
 	parent := update.parent
+	root := false
 	if found && obj.rid_none(parent) {
 		v, verr := eng.convo_view(r.e, o)
 		if verr == .None {
 			if t, terr := convo.view_tail(v, r.self, context.temp_allocator); terr == .None {
 				if m, merr := convo.message(v, &t, convo.Position{msg = prev}, context.temp_allocator); merr == .None {
 					parent = m.parent
+					root = obj.rid_none(m.parent)
 				}
 			}
 		}
@@ -58,7 +60,7 @@ record :: proc(r: ^Runtime, o: Object, source: string, external_id: string, sequ
 	if role == convo.Role(0) {
 		role = .Assistant
 	}
-	m, merr := convo.writer_message(w, convo.Msg_Spec{role = role, parent = parent, provider = update.provider, model = update.model, native = update.native})
+	m, merr := convo.writer_message(w, convo.Msg_Spec{role = role, parent = parent, root = root, files = current_files(r, o, parent), provider = update.provider, model = update.model, native = update.native})
 	if merr != .None {
 		return {}, {}, .Engine
 	}

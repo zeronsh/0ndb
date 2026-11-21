@@ -5,6 +5,7 @@ import "core:mem/virtual"
 import "../agent"
 import "../convo"
 import eng "../engine"
+import "../fs"
 import "../journal"
 import "../obj"
 import "../observe"
@@ -79,6 +80,9 @@ Run :: struct {
 	token:        string,
 	sealed:       bool,
 	pinned:       bool,
+	lines:        []convo.Line,
+	revive_of:    Rid,
+	renew_timer:  prim.Timer,
 }
 
 @(private)
@@ -130,6 +134,9 @@ _run_free :: proc(run: ^Run) {
 	}
 	if run.budget_timer != 0 {
 		prim.timer_cancel(l, run.budget_timer)
+	}
+	if run.renew_timer != 0 {
+		prim.timer_cancel(l, run.renew_timer)
 	}
 	for &t in run.tools {
 		if t.has_obs {
@@ -326,7 +333,11 @@ run_tool_started :: proc(run: ^Run, id, name, input, parent: string) {
 		scope  = -1,
 	}
 	if run.ws != nil {
-		observe.tool_call_init(&t.call, id, transmute([]u8)input, run.ws.root, true, run.alloc)
+		canonical := false
+		if reg, rerr := eng.registry(run.r.e); rerr == .None {
+			canonical = fs.observer_installed(reg)
+		}
+		observe.tool_call_init(&t.call, id, transmute([]u8)input, run.ws.root, canonical, run.alloc)
 		t.has_obs = true
 		t.scope = worktree_tool_open(run.ws, run, id)
 	}
@@ -361,7 +372,6 @@ run_tool_finished :: proc(run: ^Run, id: string, output: string, is_error: bool)
 			name = t.name
 			if t.scope >= 0 && run.ws != nil {
 				worktree_tool_close(run.ws, run, t.scope)
-				t.scope = -1
 			}
 			break
 		}
@@ -460,6 +470,7 @@ run_finish :: proc(run: ^Run, status: convo.Seal_Status) {
 		return
 	}
 	r := run.r
+	_ensure_reply(run, nil)
 	run.state = .Finished
 	run.status = status
 	if run.superseded {
@@ -477,6 +488,23 @@ run_finish :: proc(run: ^Run, status: convo.Seal_Status) {
 			run_block(run, .Tool_Result, transmute([]u8)string("The tool call did not complete before the turn ended."), t.id, t.name, true)
 		}
 	}
+	if run.ws != nil {
+		worktree_fence(run.ws, 0, _finish_fenced)
+		return
+	}
+	_run_finish_tail(run)
+}
+
+@(private)
+_finish_fenced :: proc(r: ^Runtime, o: Object, arg: int, err: Error) {
+	if run := run_find(r, o); run != nil && run.state == .Finished && !run.sealed {
+		_run_finish_tail(run)
+	}
+}
+
+@(private)
+_run_finish_tail :: proc(run: ^Run) {
+	r := run.r
 	files: []convo.File_Delta
 	if run.ws != nil {
 		files = worktree_finish(run.ws, run, !run.superseded)
@@ -571,31 +599,6 @@ run_steered :: proc(run: ^Run, item: Rid) -> bool {
 		}
 	}
 	return false
-}
-
-seal_native :: proc(v: ^obj.View, m: ^convo.Message, allocator := context.temp_allocator) -> string {
-	if len(m.seal_native) > 0 {
-		return m.seal_native
-	}
-	if obj.rid_none(m.seal) {
-		return ""
-	}
-	x, xerr := obj.vref(v, m.seal)
-	if xerr != .None {
-		return ""
-	}
-	body, _, gerr := obj.get(v, x.seg, x.off)
-	if gerr != .None || obj.is_redacted(body) {
-		return ""
-	}
-	rec, derr := convo.decode_record(body, x.off, context.temp_allocator)
-	if derr != .None {
-		return ""
-	}
-	if s, ok := rec.body.(convo.Seal); ok {
-		return clone(s.native_msg, allocator)
-	}
-	return ""
 }
 
 usage_rollup :: proc(r: ^Runtime, o: Object, u: convo.Usage) {

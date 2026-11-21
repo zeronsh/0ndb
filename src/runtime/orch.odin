@@ -297,7 +297,7 @@ _orch_spawn :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value, 
 	} else if a != nil {
 		budget = budget_min(budget, a.budget)
 	}
-	map_put(r, meta_object(child), transmute([]u8)string(KEY_TASK), field_bytes(1, budget_encode(budget)), omap.field_bool(2, false))
+	map_put(r, meta_w(r, child), transmute([]u8)string(KEY_TASK), field_bytes(1, budget_encode(budget)), omap.field_bool(2, false))
 	text := goal
 	if c := jstr(v, "context"); len(c) > 0 {
 		text = concat(goal, "\n\n", c)
@@ -332,6 +332,9 @@ _agent_by_name :: proc(r: ^Runtime, space: prim.Id, name: string) -> (id: prim.I
 		}
 		for row in rows {
 			if row.kind == .Map && row.title == name {
+				if role, rerr := eng.catalog_role(r.e, Object{space, row.object}, context.temp_allocator); rerr == .None && len(role) > 0 {
+					continue
+				}
 				if def, derr := eng.agent_get(r.e, Object{space, row.object}, context.temp_allocator); derr == .None && len(def.name) > 0 {
 					return row.object, true
 				}
@@ -761,7 +764,7 @@ _orch_cancel :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
 			continue
 		}
 		t, _ := task_get(r, o)
-		map_put(r, meta_object(o), transmute([]u8)string(KEY_TASK), field_bytes(1, budget_encode(t.budget)), omap.field_bool(2, true), omap.field_str(3, reason))
+		map_put(r, meta_w(r, o), transmute([]u8)string(KEY_TASK), field_bytes(1, budget_encode(t.budget)), omap.field_bool(2, true), omap.field_str(3, reason))
 		eng.convo_interrupt(r.e, o)
 		append(&cancelled, id)
 	}
@@ -905,7 +908,7 @@ task_changes :: proc(r: ^Runtime, caller: Object, task: Object, want_diff: bool,
 			fstree.snapshot_destroy(&sa)
 			continue
 		}
-		for ino in touched {
+		for ino in _sorted_inodes(touched) {
 			ia, oka, _ := fstree.info(&sa, ino, context.temp_allocator)
 			ib, okb, _ := fstree.info(&sb, ino, context.temp_allocator)
 			pa := oka && ia.present
@@ -1090,7 +1093,7 @@ merge_line :: proc(r: ^Runtime, tree: Object, from: string, into: string, dry: b
 	snap, serr := fs.version_snapshot(h, tl[:])
 	if serr == .None {
 		defer fstree.snapshot_destroy(&snap)
-		for ino in b_set {
+		for ino in _sorted_inodes(b_set) {
 			if !a_set[ino] {
 				continue
 			}
@@ -1298,4 +1301,20 @@ _orch_redact :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
 	jw_kint(&b, "records", i64(count))
 	append(&b, '}')
 	reply_done(r, rep, "", string(b[:]), err != .None && err != .Pending)
+}
+
+@(private)
+_sorted_inodes :: proc(set: map[fstree.Inode_Id]bool) -> []fstree.Inode_Id {
+	out := make([dynamic]fstree.Inode_Id, 0, len(set), context.temp_allocator)
+	for ino in set {
+		append(&out, ino)
+	}
+	for i in 1 ..< len(out) {
+		j := i
+		for j > 0 && (out[j].actor < out[j - 1].actor || (out[j].actor == out[j - 1].actor && out[j].seq < out[j - 1].seq)) {
+			out[j], out[j - 1] = out[j - 1], out[j]
+			j -= 1
+		}
+	}
+	return out[:]
 }

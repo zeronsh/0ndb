@@ -24,8 +24,10 @@ memory_object :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value
 		}
 	}
 	if a == nil || prim.id_is_zero(a.object.id) {
-		s := caller.space
-		return Object{caller.space, derive_id("0ndb-memory-v1", s[:])}, true
+		if create {
+			return named_w(r, memory_named(caller.space)), true
+		}
+		return named_obj(memory_named(caller.space)), true
 	}
 	if !create {
 		return {}, false

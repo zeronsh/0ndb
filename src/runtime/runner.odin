@@ -4,6 +4,7 @@ import "../agent"
 import "../convo"
 import eng "../engine"
 import "../fs"
+import omap "../map"
 import "../obj"
 import "../odb"
 import "../prim"
@@ -30,6 +31,13 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	if terr != .None {
 		return
 	}
+	if _follow_stale(r, o, v, &c) {
+		return
+	}
+	if _revive_pending(r, o, v) {
+		return
+	}
+	_lease_prune(r, o, v)
 	items, ierr := convo.intents(v, context.temp_allocator)
 	if ierr == .Missing {
 		eng.convo_intents(r.e, o, context.temp_allocator, _wait_ready(r, o))
@@ -44,6 +52,7 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	}
 	cancelled := task_cancelled(r, o)
 	head := convo.tail_head(v, &t)
+	busy := t.running && _running_live(r, o, v, &t)
 	for &it in items {
 		#partial switch it.kind {
 		case .Queue, .Steer:
@@ -55,7 +64,7 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 				}
 				continue
 			}
-			if t.running {
+			if busy {
 				break
 			}
 			if place_intent(r, o, &it) != r.self {
@@ -64,7 +73,7 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			_start_from_intent(r, o, head, &it)
 			return
 		case .Interrupt, .Answer:
-			if t.running {
+			if busy {
 				continue
 			}
 			if place_intent(r, o, &it) == r.self {
@@ -83,7 +92,7 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	}
 	switch hm.role {
 	case .User, .System:
-		if hm.open || hm.status != .Done || t.running {
+		if hm.open || hm.status != .Done || busy {
 			return
 		}
 		if _placed_here(r, o, v, &t, &hm) {
@@ -96,8 +105,200 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		assignee, aerr := convo.assignee(v, &t, hm.parent)
 		if aerr == .None && assignee == r.self {
 			start_run(r, o, hm.parent)
+			return
+		}
+		expires, live := _lease_live(r, o, v, &hm)
+		if live {
+			lease_watch(r, o, expires)
+			return
+		}
+		a, ok := agent_resolve(r, o, hm.provider, hm.model, context.temp_allocator)
+		if !ok {
+			return
+		}
+		um, uerr := convo.message(v, &t, convo.Position{msg = hm.parent}, context.temp_allocator)
+		if uerr != .None {
+			return
+		}
+		p := Placement {
+			kind    = .Takeover,
+			object  = o,
+			msg     = hm.parent,
+			sender  = um.author,
+			agent   = a.object.id,
+			policy  = a.policy,
+			exclude = hm.runner,
+		}
+		if place(r, &p) == r.self && start_run(r, o, hm.parent) == .None {
+			r.stats.takeovers += 1
 		}
 	}
+}
+
+@(private)
+_claim_lease :: proc(v: ^obj.View, claim: Rid) -> (lease_ms: i64, stamp: prim.Hlc, ok: bool) {
+	if obj.rid_none(claim) {
+		return 0, 0, false
+	}
+	x, xerr := obj.vref(v, claim)
+	if xerr != .None {
+		return 0, 0, false
+	}
+	body, _, gerr := obj.get(v, x.seg, x.off)
+	if gerr != .None || obj.is_redacted(body) {
+		return 0, 0, false
+	}
+	rec, derr := convo.decode_record(body, x.off, context.temp_allocator)
+	if derr != .None {
+		return 0, 0, false
+	}
+	c, cok := rec.body.(convo.Claim)
+	if !cok {
+		return 0, 0, false
+	}
+	return i64(min(c.lease, u64(max(i64) / 4))), rec.stamp, true
+}
+
+@(private)
+_lease_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, m: ^convo.Message) -> (expires_ms: i64, live: bool) {
+	if m.runner == r.self {
+		return 0, true
+	}
+	lease, stamp, ok := _claim_lease(v, m.claim)
+	if !ok || lease <= 0 {
+		return 0, true
+	}
+	last := stamp
+	if s := obj.view_find(v, m.id.seg); s >= 0 {
+		if act, aerr := convo.segment_activity(v, s); aerr == .None && act > last {
+			last = act
+		}
+	}
+	now := wall_ms(r)
+	seen := now
+	found := false
+	for &w in r.leases {
+		if w.object == o && w.msg == m.id {
+			found = true
+			if w.activity != last {
+				w.activity = last
+				w.seen = now
+			}
+			seen = w.seen
+		}
+	}
+	if !found {
+		w := Lease_Watch{object = o, msg = m.id, activity = last, seen = now}
+		watched := false
+		for x in r.leases {
+			watched ||= x.object == o && x.sub != 0
+		}
+		if !watched {
+			if sid, serr := eng.subscribe(r.e, o, .Conversation, _on_watch_convo, r); serr == .None {
+				w.sub = sid
+			}
+		}
+		append(&r.leases, w)
+	}
+	expires_ms = max(prim.hlc_ms(last), seen) + lease
+	return expires_ms, now < expires_ms
+}
+
+@(private)
+_running_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> bool {
+	list, err := convo.unsealed(v, context.temp_allocator)
+	if err != .None {
+		return true
+	}
+	any := false
+	for u in list {
+		if u.state != .Running {
+			continue
+		}
+		if u.msg.seg == r.self {
+			return true
+		}
+		m, merr := convo.message(v, t, convo.Position{msg = u.msg}, context.temp_allocator)
+		if merr != .None {
+			return true
+		}
+		assignee, aerr := convo.assignee(v, t, m.parent)
+		if aerr == .None && !prim.id_is_zero(assignee) && assignee != m.runner {
+			continue
+		}
+		expires, live := _lease_live(r, o, v, &m)
+		if live {
+			lease_watch(r, o, expires)
+			any = true
+		}
+	}
+	return any
+}
+
+lease_watch :: proc(r: ^Runtime, o: Object, at_ms: i64) {
+	for &w in r.leases {
+		if w.object == o {
+			w.at = at_ms if w.at == 0 else min(w.at, at_ms)
+		}
+	}
+	_lease_arm(r)
+}
+
+@(private)
+_lease_arm :: proc(r: ^Runtime) {
+	l := eng.loop(r.e)
+	at: i64 = 0
+	for w in r.leases {
+		if w.at > 0 && (at == 0 || w.at < at) {
+			at = w.at
+		}
+	}
+	if at == r.lease_at && (at == 0 || prim.timer_pending(l, r.lease_timer)) {
+		return
+	}
+	if r.lease_timer != 0 {
+		prim.timer_cancel(l, r.lease_timer)
+		r.lease_timer = 0
+	}
+	r.lease_at = at
+	if at != 0 {
+		r.lease_timer = prim.timer(l, max(at - wall_ms(r), 0) + 1, r, _on_lease_timer)
+	}
+}
+
+@(private)
+_on_lease_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	r := (^Runtime)(data)
+	r.lease_timer = 0
+	r.lease_at = 0
+	now := wall_ms(r)
+	for &w in r.leases {
+		if w.at > 0 && w.at <= now {
+			w.at = 0
+			_queue_eval(r, w.object)
+		}
+	}
+	_lease_arm(r)
+}
+
+@(private)
+_on_renew :: proc(l: ^prim.Loop, data: rawptr) {
+	run := (^Run)(data)
+	r := run.r
+	run.renew_timer = 0
+	if run.state == .Finished || run.superseded {
+		return
+	}
+	if w := _writer(run); w != nil {
+		if _, err := convo.writer_claim(w, run.user, r.cfg.lease_ms, run.lines); err == .Not_Assigned {
+			run.superseded = true
+			run_notice(run, "this turn was reassigned to another runner")
+			run_interrupt(run)
+			return
+		}
+		eng.touched(r.e, run.o)
+	}
+	run.renew_timer = prim.timer(l, i64(r.cfg.lease_ms / 3), run, _on_renew)
 }
 
 place_intent :: proc(r: ^Runtime, o: Object, it: ^convo.Intent) -> prim.Id {
@@ -156,7 +357,7 @@ _start_from_intent :: proc(r: ^Runtime, o: Object, head: Rid, it: ^convo.Intent)
 	if a, ok := agent_resolve(r, o, "", "", context.temp_allocator); ok && a.kind == .Harness {
 		native = a.provider
 	}
-	msg, merr := convo.writer_message(w, convo.Msg_Spec{role = .User, author = it.by, parent = head, runner = r.self, intent = it.item, native = native})
+	msg, merr := convo.writer_message(w, convo.Msg_Spec{role = .User, author = it.by, parent = head, runner = r.self, intent = it.item, native = native, files = current_files(r, o, head)})
 	if merr != .None {
 		return
 	}
@@ -230,15 +431,14 @@ start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
 		return .Not_Assigned if cerr == .Not_Assigned else .Engine
 	}
 	run.claim = claim
-	reply, rerr := convo.writer_message(w, convo.Msg_Spec{role = .Assistant, parent = user, runner = r.self, provider = a.provider, model = a.model, claim = claim.off, native = a.provider if a.kind == .Harness else ""})
-	if rerr != .None {
-		_run_free(run)
-		return .Engine
-	}
-	run.reply = reply
 	if exhausted {
 		eng.pin(r.e, o)
 		run.pinned = true
+		run.lines = lines
+		if _ensure_reply(run, nil) != .None {
+			_run_free(run)
+			return .Engine
+		}
 		run.state = .Running
 		run_error(run, "the task's budget is exhausted")
 		run_finish(run, .Failed)
@@ -263,27 +463,159 @@ _run_begin :: proc(run: ^Run, lines: []convo.Line) -> Error {
 	o := run.o
 	eng.pin(r.e, o)
 	run.pinned = true
-	state_run_put(r, Run_Entry{object = o, user = run.user, reply = run.reply, claim = run.claim, agent = run.ai.object.id, lines = lines_encode(lines)})
-	eng.touched(r.e, o)
-	eng.catalog_usage(r.e, o, {})
 	if sid, serr := eng.subscribe(r.e, o, .Conversation, _on_run_convo, run); serr == .None {
 		run.sub = sid
 	}
 	r.stats.runs_started += 1
+	run.lines = lines
+	run.renew_timer = prim.timer(eng.loop(r.e), i64(r.cfg.lease_ms / 3), run, _on_renew)
 	if run.ai.budget.seconds > 0 {
 		run.budget_timer = prim.timer(eng.loop(r.e), run.ai.budget.seconds * 1000, run, _on_budget_timer)
 	}
 	if len(lines) > 0 {
 		ws, werr := worktree_open(r, o, run, lines)
 		if werr != .None {
+			_ensure_reply(run, nil)
 			run_error(run, "the conversation's file trees could not be materialized")
 			run.state = .Running
 			run_finish(run, .Failed)
 			return werr
 		}
 		run.ws = ws
+		worktree_fence(ws, 0, _begin_fenced)
+		return .None
+	}
+	if err := _ensure_reply(run, nil); err != .None {
+		_run_free(run)
+		return err
 	}
 	return _run_setup(run)
+}
+
+@(private)
+_ensure_reply :: proc(run: ^Run, files: []convo.File_Delta) -> Error {
+	if !obj.rid_none(run.reply) {
+		return .None
+	}
+	r := run.r
+	o := run.o
+	w := _convo_w(r, o)
+	if w == nil {
+		return .Engine
+	}
+	a := &run.ai
+	spec := convo.Msg_Spec{role = .Assistant, parent = run.user, runner = r.self, provider = a.provider, model = a.model, claim = run.claim.off, native = a.provider if a.kind == .Harness else "", files = files}
+	reply: Rid
+	err: convo.Error
+	if !obj.rid_none(run.revive_of) {
+		spec.parent = {}
+		reply, err = convo.writer_revive(w, run.revive_of, spec)
+	} else {
+		reply, err = convo.writer_message(w, spec)
+	}
+	if err != .None {
+		return .Engine
+	}
+	run.reply = reply
+	state_run_put(r, Run_Entry{object = o, user = run.user, reply = run.reply, claim = run.claim, agent = run.ai.object.id, lines = lines_encode(run.lines)})
+	eng.touched(r.e, o)
+	eng.catalog_usage(r.e, o, {})
+	return .None
+}
+
+@(private)
+_start_files :: proc(run: ^Run) -> []convo.File_Delta {
+	ws := run.ws
+	if ws == nil {
+		return nil
+	}
+	cur := make(map[string]convo.File_Delta, context.temp_allocator)
+	for mb in ws.members {
+		if mb.m == nil {
+			continue
+		}
+		cur[mb.name] = convo.File_Delta{mount = mb.name, tree = mb.tree, line = mb.conv_line, version = version_encode(mb.start, mb.branch, mb.commit)}
+	}
+	return files_delta(run.r, run.o, run.user, ws_names(ws), cur)
+}
+
+@(private)
+ws_names :: proc(ws: ^Worktree) -> []string {
+	out := make([]string, len(ws.members), context.temp_allocator)
+	for mb, i in ws.members {
+		out[i] = mb.name
+	}
+	return out
+}
+
+files_delta :: proc(r: ^Runtime, o: Object, parent: Rid, names: []string, cur: map[string]convo.File_Delta) -> []convo.File_Delta {
+	base: []convo.File_Delta
+	if !obj.rid_none(parent) {
+		if b, err := eng.convo_files_at(r.e, o, parent, context.temp_allocator); err == .None {
+			base = b
+		}
+	}
+	out := make([dynamic]convo.File_Delta, context.temp_allocator)
+	for name in names {
+		c, ok := cur[name]
+		if !ok {
+			continue
+		}
+		same := false
+		for f in base {
+			if f.mount == name && f.tree == c.tree && f.line == c.line && string(f.version) == string(c.version) {
+				same = true
+			}
+		}
+		if !same {
+			append(&out, c)
+		}
+	}
+	return out[:]
+}
+
+current_files :: proc(r: ^Runtime, o: Object, parent: Rid) -> []convo.File_Delta {
+	ms, err := eng.convo_mounts(r.e, o, context.temp_allocator)
+	if err != .None || len(ms) == 0 {
+		return nil
+	}
+	cur := make(map[string]convo.File_Delta, context.temp_allocator)
+	names := make([dynamic]string, context.temp_allocator)
+	for m in ms {
+		tree := Object{o.space, m.tree}
+		h, herr := eng.tree_history(r.e, tree)
+		if herr != .None {
+			continue
+		}
+		v, found, verr := fs.history_line(h, line_name(m.line), context.temp_allocator)
+		if verr == .None && found {
+			cur[m.name] = convo.File_Delta{mount = m.name, tree = m.tree, line = m.line, version = version_encode(v, "", "")}
+			append(&names, m.name)
+		}
+		eng.tree_release(r.e, tree)
+	}
+	return files_delta(r, o, parent, names[:], cur)
+}
+
+@(private)
+_begin_fenced :: proc(r: ^Runtime, o: Object, arg: int, err: Error) {
+	run := run_find(r, o)
+	if run == nil || run.ws == nil || run.state != .Preparing {
+		return
+	}
+	if e := _worktree_begin(run.ws, run); e != .None || err != .None {
+		_ensure_reply(run, nil)
+		run_error(run, "the conversation's file trees could not be materialized")
+		run.state = .Running
+		run_finish(run, .Failed)
+		return
+	}
+	if _ensure_reply(run, _start_files(run)) != .None {
+		run.state = .Running
+		run_finish(run, .Failed)
+		return
+	}
+	_run_setup(run)
 }
 
 @(private)
@@ -300,7 +632,7 @@ _run_launch :: proc(run: ^Run) {
 	run.state = .Running
 	switch run.ai.kind {
 	case .Harness:
-		if err := harness_start(run); err != .None {
+		if err := harness_start(run); err != .None && err != .Pending {
 			run_error(run, "the agent could not be started")
 			run_finish(run, .Failed)
 		}
@@ -514,28 +846,92 @@ _recover :: proc(r: ^Runtime, space: prim.Id) {
 			continue
 		}
 		convo.writer_interrupt_open(w, now)
-		lines := lines_decode(ent.lines)
-		revived := false
-		list, n := convo.writer_revivable(w)
-		for i in 0 ..< n {
-			msg := list[i]
-			if msg != ent.reply || revived {
-				convo.writer_decline(w, msg)
-				continue
-			}
-			if _revive(r, ent, lines) == .None {
-				revived = true
-			} else {
-				convo.writer_decline(w, msg)
-			}
-		}
-		if !revived {
-			_land_lines(r, ent.object, ent.claim, lines)
-			state_run_clear(r, ent.object)
-		}
 		eng.touched(r.e, ent.object)
-		eng.catalog_usage(r.e, ent.object, {})
+		if _replicated(r, ent.object.space) && _follow_start(r, ent.object) {
+			append(&r.revives, Revive_Wait{object = ent.object, since = now})
+			continue
+		}
+		_revive_decide(r, ent)
 	}
+}
+
+
+@(private)
+_revive_pending :: proc(r: ^Runtime, o: Object, v: ^obj.View) -> bool {
+	idx := -1
+	for x, i in r.revives {
+		if x.object == o {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return false
+	}
+	pend := r.revives[idx]
+	if wall_ms(r) - pend.since < min(i64(r.cfg.lease_ms), REVIVE_SYNC_MS) && !_revive_ready(r, o, v) {
+		_follow_start(r, o)
+		return true
+	}
+	unordered_remove(&r.revives, idx)
+	if ent, ok := state_run_get(r, o); ok {
+		_revive_decide(r, ent)
+	}
+	return true
+}
+
+@(private)
+_revive_ready :: proc(r: ^Runtime, o: Object, v: ^obj.View) -> bool {
+	if info, err := eng.space_info(r.e, o.space); err == .None && len(info.relay) > 0 && !info.connected {
+		return false
+	}
+	for sw in r.spaces {
+		if sw.space == o.space && !sw.synced {
+			return false
+		}
+	}
+	c, found, err := eng.catalog_get(r.e, o, context.temp_allocator)
+	if err != .None || !found {
+		return false
+	}
+	for p in c.participants {
+		if p == r.self {
+			continue
+		}
+		s := obj.view_find(v, p)
+		if s < 0 || obj.end(v, s) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+_revive_decide :: proc(r: ^Runtime, ent: Run_Entry) {
+	w := _convo_w(r, ent.object)
+	if w == nil {
+		return
+	}
+	lines := lines_decode(ent.lines)
+	revived := false
+	list, n := convo.writer_revivable(w)
+	for i in 0 ..< n {
+		msg := list[i]
+		if msg != ent.reply || revived {
+			convo.writer_decline(w, msg)
+			continue
+		}
+		if _revive(r, ent, lines) == .None {
+			revived = true
+		} else {
+			convo.writer_decline(w, msg)
+		}
+	}
+	if !revived {
+		_land_lines(r, ent.object, ent.claim, lines)
+		state_run_clear(r, ent.object)
+	}
+	eng.touched(r.e, ent.object)
+	eng.catalog_usage(r.e, ent.object, {})
 }
 
 @(private)
@@ -578,6 +974,10 @@ _revive :: proc(r: ^Runtime, ent: Run_Entry, lines: []convo.Line) -> Error {
 		_run_free(run)
 		return .Not_Assigned
 	}
+	if assignee, aerr := convo.assignee(v, &t, ent.user); aerr == .None && !prim.id_is_zero(assignee) && assignee != r.self {
+		_run_free(run)
+		return .Not_Assigned
+	}
 	run.ai = a
 	run.user = ent.user
 	run.parent = um.parent
@@ -599,12 +999,7 @@ _revive :: proc(r: ^Runtime, ent: Run_Entry, lines: []convo.Line) -> Error {
 		return .Not_Assigned
 	}
 	run.claim = claim
-	reply, verr2 := convo.writer_revive(w, ent.reply, convo.Msg_Spec{role = .Assistant, runner = r.self, provider = a.provider, model = a.model, claim = claim.off, native = a.provider if a.kind == .Harness else ""})
-	if verr2 != .None {
-		_run_free(run)
-		return .Engine
-	}
-	run.reply = reply
+	run.revive_of = ent.reply
 	run.attempt = rm.open_state == .Revive ? 1 : 0
 	_run_begin(run, owned)
 	return .None
@@ -651,4 +1046,163 @@ _reply_hooks :: proc(r: ^Runtime, o: Object, reply: Rid, status: convo.Seal_Stat
 	if r.cfg.hooks.sealed != nil {
 		r.cfg.hooks.sealed(r.cfg.hooks.data, r, o, reply, status)
 	}
+}
+
+@(private)
+_lease_prune :: proc(r: ^Runtime, o: Object, v: ^obj.View) {
+	any := false
+	for w in r.leases {
+		any ||= w.object == o
+	}
+	if !any {
+		return
+	}
+	list, err := convo.unsealed(v, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	i := 0
+	for i < len(r.leases) {
+		w := r.leases[i]
+		keep := w.object != o
+		if !keep {
+			for u in list {
+				keep ||= u.msg == w.msg && u.state == .Running
+			}
+		}
+		if !keep {
+			if w.sub != 0 {
+				eng.unsubscribe(r.e, w.sub)
+			}
+			unordered_remove(&r.leases, i)
+			continue
+		}
+		i += 1
+	}
+	_lease_arm(r)
+}
+
+@(private)
+_on_watch_convo :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	r := (^Runtime)(data)
+	for d in deltas {
+		_queue_eval(r, d.object)
+		return
+	}
+}
+
+@(private)
+_view_activity :: proc(v: ^obj.View) -> i64 {
+	best: prim.Hlc
+	for s in 0 ..< len(v.segs) {
+		if a, err := convo.segment_activity(v, s); err == .None && a > best {
+			best = a
+		}
+	}
+	return prim.hlc_ms(best)
+}
+
+@(private)
+_follow_stale :: proc(r: ^Runtime, o: Object, v: ^obj.View, c: ^eng.Catalog_Entry) -> (waiting: bool) {
+	remote := false
+	for p in c.participants {
+		remote ||= p != r.self
+	}
+	idx := -1
+	for f, i in r.follows {
+		if f.object == o {
+			idx = i
+		}
+	}
+	behind := remote && i64(c.activity) > _view_activity(v) && !_activity_mine(r, o)
+	if idx < 0 {
+		if !behind || run_find(r, o) != nil {
+			return false
+		}
+		return _follow_start(r, o)
+	}
+	f := &r.follows[idx]
+	if !f.fresh {
+		return true
+	}
+	eng.unsubscribe(r.e, f.sub)
+	if f.timer != 0 {
+		prim.timer_cancel(eng.loop(r.e), f.timer)
+	}
+	free(f.grace, r.allocator)
+	unordered_remove(&r.follows, idx)
+	return false
+}
+
+FOLLOW_GRACE_MS :: 5000
+
+@(private)
+_on_follow_grace :: proc(l: ^prim.Loop, data: rawptr) {
+	g := (^Follow_Grace)(data)
+	for &f in g.r.follows {
+		if f.sub == g.sub {
+			f.timer = 0
+			f.fresh = true
+			_queue_eval(g.r, f.object)
+		}
+	}
+}
+
+@(private)
+_follow_start :: proc(r: ^Runtime, o: Object) -> bool {
+	for f in r.follows {
+		if f.object == o {
+			return true
+		}
+	}
+	sid, serr := eng.subscribe(r.e, o, .Conversation, _on_follow_convo, r)
+	if serr != .None {
+		return false
+	}
+	g := new(Follow_Grace, r.allocator)
+	g^ = {r = r, sub = sid}
+	append(&r.follows, Follow{object = o, sub = sid, grace = g, timer = prim.timer(eng.loop(r.e), FOLLOW_GRACE_MS, g, _on_follow_grace)})
+	return true
+}
+
+@(private)
+_on_follow_convo :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	r := (^Runtime)(data)
+	remote := false
+	for d in deltas {
+		remote ||= !d.local
+	}
+	if !remote {
+		return
+	}
+	for &f in r.follows {
+		if f.sub == sub {
+			f.fresh = true
+			_queue_eval(r, f.object)
+		}
+	}
+}
+
+@(private)
+_activity_mine :: proc(r: ^Runtime, o: Object) -> bool {
+	kb: [16]u8
+	key := omap.catalog_key(o.id, &kb)
+	en, found, err := eng.map_get(r.e, eng.space_catalog(r.e, o.space), key, context.temp_allocator)
+	if err != .None || !found {
+		return false
+	}
+	for reg in en.registers {
+		if reg.tag == u32(omap.Catalog_Tag.Activity) {
+			return reg.by == r.self
+		}
+	}
+	return false
+}
+
+REVIVE_SYNC_MS :: 30_000
+
+@(private)
+_replicated :: proc(r: ^Runtime, space: prim.Id) -> bool {
+	info, err := eng.space_info(r.e, space)
+	return err == .None && len(info.relay) > 0
 }

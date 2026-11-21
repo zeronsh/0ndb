@@ -48,7 +48,6 @@ Proc :: struct {
 	idle_since: i64,
 	cwd:        string,
 	token:      string,
-	extra:      []string,
 	closing:    bool,
 	kill_timer: prim.Timer,
 }
@@ -71,7 +70,7 @@ native_get :: proc(r: ^Runtime, o: Object) -> (n: Native_Info, found: bool) {
 }
 
 native_put :: proc(r: ^Runtime, o: Object, n: Native_Info) {
-	map_put(r, meta_object(o), transmute([]u8)string(KEY_NATIVE), omap.field_str(1, n.provider), omap.field_str(2, n.session), omap.field_id(3, n.runner), field_rid(4, n.head), omap.field_str(5, n.cwd), omap.field_str(6, n.manifest), omap.field_str(7, n.home), omap.field_str(8, n.native), omap.field_str(9, n.checkpoint))
+	map_put(r, meta_w(r, o), transmute([]u8)string(KEY_NATIVE), omap.field_str(1, n.provider), omap.field_str(2, n.session), omap.field_id(3, n.runner), field_rid(4, n.head), omap.field_str(5, n.cwd), omap.field_str(6, n.manifest), omap.field_str(7, n.home), omap.field_str(8, n.native), omap.field_str(9, n.checkpoint))
 }
 
 proc_for :: proc(r: ^Runtime, o: Object) -> ^Proc {
@@ -102,6 +101,9 @@ harness_start :: proc(run: ^Run) -> Error {
 	desc, ok := _descriptor(r, run.ai.provider)
 	if !ok {
 		return .Not_Found
+	}
+	if _native_pending(r, run) {
+		return .Pending
 	}
 	cwd := ""
 	if run.ws != nil {
@@ -172,6 +174,38 @@ harness_start :: proc(run: ^Run) -> Error {
 	append(&r.procs, p)
 	env := make([dynamic]string, context.temp_allocator)
 	append(&env, ..r.cfg.env)
+	servers := make([dynamic]agent.Mcp_Server, context.temp_allocator)
+	for spec in run.ai.mcp {
+		hdrs := make([dynamic]string, context.temp_allocator)
+		for i := 0; i + 1 < len(spec.headers); i += 2 {
+			append(&hdrs, concat(spec.headers[i], ": ", spec.headers[i + 1]))
+		}
+		srv := agent.Mcp_Server {
+			name    = spec.name,
+			url     = spec.url,
+			env     = spec.env,
+			headers = hdrs[:],
+		}
+		if len(spec.argv) > 0 {
+			srv.command = spec.argv[0]
+			srv.args = spec.argv[1:]
+		}
+		append(&servers, srv)
+	}
+	if run.ai.catalog {
+		id := run.o.id
+		if len(r.cfg.catalog_command) > 0 {
+			args := make([dynamic]string, context.temp_allocator)
+			append(&args, ..r.cfg.catalog_command[1:])
+			append(&args, hex(id))
+			append(&servers, agent.Mcp_Server{name = "ondb", command = r.cfg.catalog_command[0], args = args[:]})
+		} else if url, token, sok := serve_http_token(r, run.o); sok {
+			p.token = clone(token, r.allocator)
+			hdr := make([]string, 1, context.temp_allocator)
+			hdr[0] = concat("Authorization: Bearer ", token)
+			append(&servers, agent.Mcp_Server{name = "ondb", url = url, headers = hdr})
+		}
+	}
 	req := agent.Start_Request {
 		cwd             = cwd,
 		model           = run.ai.model,
@@ -183,6 +217,10 @@ harness_start :: proc(run: ^Run) -> Error {
 		rewind          = rewind,
 		seed            = seed,
 		env             = env[:],
+		mcp             = servers[:],
+		scratch         = concat(r.cfg.work_root, "/.scratch"),
+		clock           = r.e.cfg.clock,
+		random          = r.e.cfg.random,
 	}
 	if agent.init_with(&p.d, desc, req, r.allocator) != .None {
 		_proc_free(p, false)
@@ -190,21 +228,6 @@ harness_start :: proc(run: ^Run) -> Error {
 	}
 	p.d_on = true
 	p.desc = p.d.desc
-	if run.ai.catalog {
-		if url, token, sok := serve_http_token(r, run.o); sok && r.cfg.providers.mcp_args != nil {
-			extra := make([dynamic]string, context.temp_allocator)
-			if r.cfg.providers.mcp_args(r.cfg.providers.data, &p.desc, url, token, &extra) {
-				p.token = clone(token, r.allocator)
-				list := make([]string, len(extra), r.allocator)
-				for s, i in extra {
-					list[i] = clone(s, r.allocator)
-				}
-				p.extra = list
-			} else {
-				serve_revoke(r, token)
-			}
-		}
-	}
 	p.run = run
 	run.proc_ = p
 	if err := _proc_spawn(p); err != .None {
@@ -221,11 +244,15 @@ harness_start :: proc(run: ^Run) -> Error {
 _proc_spawn :: proc(p: ^Proc) -> Error {
 	r := p.r
 	l := agent.launch(&p.d)
-	argv := make([dynamic]string, context.temp_allocator)
-	append(&argv, ..l.argv)
-	append(&argv, ..p.extra)
+	for f in l.files {
+		prim.mkdir_all(r.e.base, prim.dir_name(f.path), 0o700)
+		if prim.replace_atomic(r.e.base, f.path, f.data) != .None {
+			return .Io
+		}
+	}
+	argv := l.argv
 	req := Spawn_Request {
-		argv      = argv[:],
+		argv      = argv,
 		cwd       = l.cwd if len(l.cwd) > 0 else p.cwd,
 		env       = l.env,
 		new_group = true,
@@ -356,6 +383,7 @@ _proc_on_in :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 @(private)
 _proc_on_out :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 	p := (^Proc)(data)
+	r := p.r
 	for p.alive || p.child.stdout >= 0 {
 		n, err := prim.line_fill(&p.lb_out, fd)
 		if err == .Would_Block || err == .Interrupted {
@@ -366,6 +394,9 @@ _proc_on_out :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) 
 			prim.line_finish(&p.lb_out)
 		}
 		_proc_lines(p)
+		if !_proc_live(r, p) {
+			return
+		}
 		if eof {
 			if p.w_out != 0 {
 				prim.unwatch(l, p.w_out)
@@ -390,7 +421,11 @@ _proc_lines :: proc(p: ^Proc) {
 			run_raw(p.run, RAW_STDOUT, line)
 		}
 		out := agent.feed(&p.d, line)
+		r := p.r
 		_proc_output(p, &out)
+		if !_proc_live(r, p) {
+			return
+		}
 		if p.closing && p.run == nil && !p.alive {
 			return
 		}
@@ -440,9 +475,15 @@ _proc_on_exit :: proc(l: ^prim.Loop, pid: prim.Pid, status: prim.Exit_Status, da
 	p.cw = 0
 	if p.w_out != 0 && p.child.stdout >= 0 {
 		_proc_on_out(l, p.child.stdout, {.Read}, p)
+		if !_proc_live(r, p) {
+			return
+		}
 	}
 	prim.line_finish(&p.lb_out)
 	_proc_lines(p)
+	if !_proc_live(r, p) {
+		return
+	}
 	p.alive = false
 	if p.w_out != 0 {
 		prim.unwatch(l, p.w_out)
@@ -485,6 +526,9 @@ _proc_on_exit :: proc(l: ^prim.Loop, pid: prim.Pid, status: prim.Exit_Status, da
 		for e in out.events {
 			_proc_event(p, e)
 		}
+		if !_proc_live(r, p) {
+			return
+		}
 		clear(&p.err_tail)
 		if _proc_spawn(p) == .None {
 			return
@@ -496,26 +540,43 @@ _proc_on_exit :: proc(l: ^prim.Loop, pid: prim.Pid, status: prim.Exit_Status, da
 		return
 	}
 	_proc_output(p, &out)
+	if !_proc_live(r, p) {
+		return
+	}
 	if p.run != nil {
 		run := p.run
 		run_error(run, msg if len(msg) > 0 else "the agent process exited")
 		run_finish(run, .Interrupted if run.interrupting else .Failed)
 	}
-	if !p.closing {
-		_proc_free(p, false)
+	if !_proc_live(r, p) {
 		_warm_arm(r)
-	} else {
-		_proc_free(p, false)
+		return
 	}
+	_proc_free(p, false)
+	_warm_arm(r)
+}
+
+@(private)
+_proc_live :: proc(r: ^Runtime, p: ^Proc) -> bool {
+	for x in r.procs {
+		if x == p {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
 _proc_output :: proc(p: ^Proc, out: ^agent.Output) {
+	r := p.r
 	if len(out.bytes) > 0 {
 		_proc_write(p, out.bytes[:])
 	}
 	for e in out.events {
 		_proc_event(p, e)
+		if !_proc_live(r, p) {
+			return
+		}
 	}
 	if out.close_stdin && p.child.stdin >= 0 {
 		_proc_flush(p)
@@ -707,10 +768,6 @@ _proc_free :: proc(p: ^Proc, kill: bool) {
 		serve_revoke(r, p.token)
 		delete(p.token, r.allocator)
 	}
-	for s in p.extra {
-		delete(s, r.allocator)
-	}
-	delete(p.extra, r.allocator)
 	if p.d_on {
 		agent.destroy(&p.d)
 	}
@@ -806,7 +863,7 @@ _checkpoint_of :: proc(r: ^Runtime, o: Object, msg: Rid, provider: string) -> st
 	if merr != .None || m.role != .Assistant || m.provider != provider {
 		return ""
 	}
-	if sn := seal_native(v, &m); len(sn) > 0 && sn[0] != 0 {
+	if sn := m.seal_native; len(sn) > 0 && sn[0] != 0 {
 		return sn
 	}
 	return ""
@@ -887,4 +944,44 @@ _env_merge :: proc(env: []string, allocator := context.temp_allocator) -> []stri
 	}
 	append(&out, ..env)
 	return out[:]
+}
+
+@(private)
+Launch_Wait :: struct {
+	r: ^Runtime,
+	o: Object,
+}
+
+@(private)
+_native_pending :: proc(r: ^Runtime, run: ^Run) -> bool {
+	meta := meta_object(run.o)
+	w := new(Launch_Wait, r.allocator)
+	w^ = {r = r, o = run.o}
+	ready := eng.Ready{data = w, call = _on_launch_ready}
+	en, found, err := eng.map_get(r.e, meta, transmute([]u8)string(KEY_NATIVE), context.temp_allocator, ready)
+	if err == .Pending {
+		return true
+	}
+	if found && entry_id(&en, 3) != r.self {
+		for &row in map_rows(r, meta, transmute([]u8)string(KEY_FILE), 4096) {
+			tid := entry_id(&row.entry, 1)
+			if _, terr := eng.text_read(r.e, Object{run.o.space, tid}, context.temp_allocator, ready); terr == .Pending {
+				return true
+			}
+		}
+	}
+	free(w, r.allocator)
+	return false
+}
+
+@(private)
+_on_launch_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+	w := (^Launch_Wait)(data)
+	r, o := w.r, w.o
+	free(w, r.allocator)
+	run := run_find(r, o)
+	if run == nil || run.state != .Running || run.proc_ != nil || run.native != nil {
+		return
+	}
+	_run_launch(run)
 }

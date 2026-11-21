@@ -20,29 +20,74 @@ Run_Entry :: struct {
 	lines:  []u8,
 }
 
+Named :: struct {
+	space:  prim.Id,
+	name:   string,
+	parent: prim.Id,
+}
+
+named_obj :: proc(n: Named) -> Object {
+	return Object{n.space, eng.named_id(n.space, n.name, n.parent)}
+}
+
+named_w :: proc(r: ^Runtime, n: Named) -> Object {
+	o, err := eng.map_named(r.e, n.space, n.name, Object{n.space, n.parent}, true)
+	if err != .None {
+		return named_obj(n)
+	}
+	return o
+}
+
+runners_named :: proc(space: prim.Id) -> Named {
+	return Named{space, "0ndb:runners", {}}
+}
+
+schedules_named :: proc(space: prim.Id) -> Named {
+	return Named{space, "0ndb:schedules", {}}
+}
+
+routes_named :: proc(space: prim.Id) -> Named {
+	return Named{space, "0ndb:routes", {}}
+}
+
+state_named :: proc(r: ^Runtime, space: prim.Id) -> Named {
+	return Named{space, concat("0ndb:runner-state:", hex(r.self)), {}}
+}
+
+meta_named :: proc(o: Object) -> Named {
+	return Named{o.space, "0ndb:meta", o.id}
+}
+
+memory_named :: proc(space: prim.Id) -> Named {
+	return Named{space, "0ndb:memory", {}}
+}
+
 runners_object :: proc(space: prim.Id) -> Object {
-	s := space
-	return Object{space, derive_id("0ndb-runners-v1", s[:])}
+	return named_obj(runners_named(space))
 }
 
 schedules_object :: proc(space: prim.Id) -> Object {
-	s := space
-	return Object{space, derive_id("0ndb-schedules-v1", s[:])}
+	return named_obj(schedules_named(space))
 }
 
 routes_object :: proc(space: prim.Id) -> Object {
-	s := space
-	return Object{space, derive_id("0ndb-routes-v1", s[:])}
+	return named_obj(routes_named(space))
 }
 
 state_object :: proc(r: ^Runtime, space: prim.Id) -> Object {
-	s, me := space, r.self
-	return Object{space, derive_id("0ndb-runner-state-v1", s[:], me[:])}
+	return named_obj(state_named(r, space))
 }
 
 meta_object :: proc(o: Object) -> Object {
-	id := o.id
-	return Object{o.space, derive_id("0ndb-convo-meta-v1", id[:])}
+	return named_obj(meta_named(o))
+}
+
+meta_w :: proc(r: ^Runtime, o: Object) -> Object {
+	return named_w(r, meta_named(o))
+}
+
+state_w :: proc(r: ^Runtime, space: prim.Id) -> Object {
+	return named_w(r, state_named(r, space))
 }
 
 key_of :: proc(prefix: string, parts: ..[]u8) -> []u8 {
@@ -210,7 +255,7 @@ _eerr :: proc "contextless" (err: eng.Error) -> Error {
 }
 
 state_run_put :: proc(r: ^Runtime, ent: Run_Entry) -> Error {
-	so := state_object(r, ent.object.space)
+	so := state_w(r, ent.object.space)
 	id := ent.object.id
 	return map_put(r, so, key_of(KEY_RUN, id[:]), field_rid(1, ent.user), field_rid(2, ent.reply), field_rid(3, ent.claim), omap.field_id(4, ent.agent), field_bytes(5, ent.lines))
 }
@@ -265,7 +310,7 @@ state_claimed :: proc(r: ^Runtime, o: Object, msg: Rid) -> bool {
 
 state_mark_claimed :: proc(r: ^Runtime, o: Object, msg: Rid, claim: Rid) {
 	id := o.id
-	map_put(r, state_object(r, o.space), key_of(KEY_CLAIMED, id[:], rid_bytes(msg)), field_rid(1, claim))
+	map_put(r, state_w(r, o.space), key_of(KEY_CLAIMED, id[:], rid_bytes(msg)), field_rid(1, claim))
 }
 
 runner_known :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
@@ -287,5 +332,5 @@ _advertise :: proc(r: ^Runtime, space: prim.Id) {
 	if ok && entry_u64(&en, 1) == u64(r.cfg.capacity) {
 		return
 	}
-	map_put(r, runners_object(space), me[:], omap.field_u64(1, u64(r.cfg.capacity)))
+	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(r.cfg.capacity)))
 }

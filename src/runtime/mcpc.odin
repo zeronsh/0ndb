@@ -54,7 +54,7 @@ mcp_conn_open :: proc(r: ^Runtime, spec: ^Mcp_Spec, cwd: string, data: rawptr, o
 	if len(spec.argv) > 0 {
 		cfg := mcp.Stdio_Config {
 			argv    = spec.argv,
-			env     = _env_merge(spec.env),
+			env     = spec.env,
 			cwd     = spec.cwd if len(spec.cwd) > 0 else cwd,
 			spawner = mcp.Spawner{data = r, spawn = _mcp_spawn},
 		}

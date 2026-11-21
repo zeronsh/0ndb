@@ -21,7 +21,7 @@ Channel_Message :: struct {
 }
 
 channel_deliver :: proc(r: ^Runtime, space: prim.Id, m: Channel_Message) -> (o: Object, err: Error) {
-	routes := routes_object(space)
+	routes := named_w(r, routes_named(space))
 	k := key_of("k/", transmute([]u8)m.channel, []u8{0}, transmute([]u8)m.key)
 	if en, ok := map_read(r, routes, k); ok {
 		o = Object{space, entry_id(&en, 1)}
@@ -116,10 +116,20 @@ _trigger_touched :: proc(r: ^Runtime, o: Object) {
 	if !r.cfg.runner || !r.triggers {
 		return
 	}
-	en, ok := map_read(r, state_object(r, o.space), key_of("trig/", rid_bytes(Rid{o.id, 0})[:16]))
+	oid16 := rid_bytes(Rid{o.id, 0})[:16]
+	en, ok := map_read(r, state_object(r, o.space), key_of("trig/", oid16))
 	if !ok {
 		return
 	}
+	c, cfound, cerr := eng.catalog_get(r.e, o, context.temp_allocator)
+	if cerr != .None || !cfound {
+		return
+	}
+	fk := key_of("tf/", oid16)
+	if fe, ffound := map_read(r, state_object(r, o.space), fk); ffound && entry_u64(&fe, 1) >= c.activity {
+		return
+	}
+	map_put(r, state_w(r, o.space), fk, omap.field_u64(1, c.activity))
 	for reg in en.registers {
 		if len(reg.value) != 16 {
 			continue
@@ -156,7 +166,7 @@ trigger_watch :: proc(r: ^Runtime, agent_obj: Object) -> Error {
 		if s := jstr(v, "object"); len(s) > 0 {
 			if oid, iok := prim.id_parse(s); iok {
 				tag := u32(prim.get_u64le(aid[:8]) & 0x7fff_ffff) | 1
-				map_put(r, state_object(r, agent_obj.space), key_of("trig/", oid[:]), omap.Field{tag = tag, value = aid[:]})
+				map_put(r, state_w(r, agent_obj.space), key_of("trig/", oid[:]), omap.Field{tag = tag, value = aid[:]})
 				r.triggers = true
 			}
 		}

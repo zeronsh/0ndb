@@ -11,13 +11,18 @@ TOOL_OUTPUT_MAX :: 64 * 1024
 Reply_Kind :: enum u8 {
 	Native,
 	Server,
+	Callback,
 }
+
+Orch_Done :: #type proc(data: rawptr, r: ^Runtime, result: string, is_error: bool)
 
 Reply :: struct {
 	kind: Reply_Kind,
 	o:    Object,
 	id:   string,
 	ref:  mcp.Ref,
+	done: Orch_Done,
+	data: rawptr,
 }
 
 @(private)
@@ -79,7 +84,7 @@ tool_dispatch :: proc(r: ^Runtime, run: ^Run, n: ^Native, call: ^Tool_Call) -> u
 	}
 	switch call.name {
 	case "read_file", "write_file", "edit_file", "list_files":
-		text, is_error := file_tool(r, run, call.name, call.input)
+		text, is_error := file_tool(r, run, call.name, call.input, call.id)
 		reply_done(r, rep, text, "", is_error)
 		return 0
 	case "shell":
@@ -151,6 +156,10 @@ reply_done :: proc(r: ^Runtime, rep: Reply, text: string, structured: string, is
 		native_tool_result(run.native, rep.id, clipped, is_error)
 	case .Server:
 		serve_reply(r, rep.ref, text, structured, is_error)
+	case .Callback:
+		if rep.done != nil {
+			rep.done(rep.data, r, structured if len(structured) > 0 else text, is_error)
+		}
 	}
 }
 
@@ -185,7 +194,7 @@ observe_under :: proc(path: string, root: string) -> (rel: string, ok: bool) {
 	return "", false
 }
 
-file_tool :: proc(r: ^Runtime, run: ^Run, name: string, input: string) -> (text: string, is_error: bool) {
+file_tool :: proc(r: ^Runtime, run: ^Run, name: string, input: string, call_id := "") -> (text: string, is_error: bool) {
 	v, ok := json_parse(input)
 	if !ok {
 		return "the input is not valid JSON", true
@@ -228,7 +237,7 @@ file_tool :: proc(r: ^Runtime, run: ^Run, name: string, input: string) -> (text:
 		if prim.replace_atomic(vfs, path, transmute([]u8)content) != .None {
 			return concat("cannot write ", jstr(v, "path")), true
 		}
-		_mark_written(run, path)
+		_mark_written(run, path, call_id)
 		return concat("wrote ", jstr(v, "path")), false
 	case "edit_file":
 		data, err := prim.read_file(vfs, path, context.temp_allocator)
@@ -248,7 +257,7 @@ file_tool :: proc(r: ^Runtime, run: ^Run, name: string, input: string) -> (text:
 		if prim.replace_atomic(vfs, path, transmute([]u8)res) != .None {
 			return concat("cannot write ", jstr(v, "path")), true
 		}
-		_mark_written(run, path)
+		_mark_written(run, path, call_id)
 		return concat("edited ", jstr(v, "path")), false
 	case "list_files":
 		d: prim.Dir
@@ -278,7 +287,7 @@ file_tool :: proc(r: ^Runtime, run: ^Run, name: string, input: string) -> (text:
 }
 
 @(private)
-_mark_written :: proc(run: ^Run, path: string) {
+_mark_written :: proc(run: ^Run, path: string, call_id: string) {
 	ws := run.ws
 	if ws == nil {
 		return
@@ -286,7 +295,7 @@ _mark_written :: proc(run: ^Run, path: string) {
 	scope: ^fs.Scope
 	tool := -1
 	for t in run.tools {
-		if !t.done && t.scope >= 0 {
+		if t.id == call_id && t.scope >= 0 && t.scope < len(ws.tools) && ws.tools[t.scope].open {
 			tool = t.scope
 		}
 	}
