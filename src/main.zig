@@ -2063,10 +2063,39 @@ fn handleRelayCmd(allocator: Allocator, io: Io, opts: *const GlobalOpts, args: *
 }
 
 fn handlePlaygroundCmd(allocator: Allocator, io: Io, opts: *const GlobalOpts, args: *ArgSlice, out: anytype) !void {
-    const port_str = args.next() orelse "4321";
-    const port = std.fmt.parseInt(u16, port_str, 10) catch return UsageError.InvalidArgument;
-    const dir_arg = args.next();
-    try rejectExtraArgs(args);
+    var port: u16 = 4321;
+    var port_set = false;
+    var dir_arg: ?[]const u8 = null;
+    var extra_hosts: std.ArrayList([]const u8) = .empty;
+    defer extra_hosts.deinit(allocator);
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--allow-host")) {
+            const val = args.next() orelse return UsageError.MissingArgument;
+            const trimmed = std.mem.trim(u8, val, " \t");
+            if (trimmed.len == 0) return UsageError.InvalidArgument;
+            try extra_hosts.append(allocator, trimmed);
+        } else if (std.mem.startsWith(u8, arg, "--allow-host=")) {
+            const trimmed = std.mem.trim(u8, arg["--allow-host=".len..], " \t");
+            if (trimmed.len == 0) return UsageError.InvalidArgument;
+            try extra_hosts.append(allocator, trimmed);
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            const val = args.next() orelse return UsageError.MissingArgument;
+            port = std.fmt.parseInt(u16, val, 10) catch return UsageError.InvalidArgument;
+            port_set = true;
+        } else if (std.mem.eql(u8, arg, "--dir")) {
+            dir_arg = args.next() orelse return UsageError.MissingArgument;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return UsageError.InvalidArgument;
+        } else if (!port_set) {
+            port = std.fmt.parseInt(u16, arg, 10) catch return UsageError.InvalidArgument;
+            port_set = true;
+        } else if (dir_arg == null) {
+            dir_arg = arg;
+        } else {
+            return UsageError.InvalidArgument;
+        }
+    }
 
     var default_dir: ?[]u8 = null;
     defer if (default_dir) |d| allocator.free(d);
@@ -2076,9 +2105,18 @@ fn handlePlaygroundCmd(allocator: Allocator, io: Io, opts: *const GlobalOpts, ar
     };
     try ensureDir0700(io, dir);
 
+    const env_hosts = try ondb.playground.server.resolveAllowedHosts(allocator, io);
+    defer ondb.playground.server.freeAllowedHosts(allocator, env_hosts);
+
+    var all_hosts: std.ArrayList([]const u8) = .empty;
+    defer all_hosts.deinit(allocator);
+    for (env_hosts) |h| try all_hosts.append(allocator, h);
+    for (extra_hosts.items) |h| try all_hosts.append(allocator, h);
+
     var srv = try ondb.playground.server.PlaygroundServer.startWithConfig(allocator, io, dir, port, .{
         .default_access = ondb.playground.server.resolveDefaultAccess(allocator, io),
         .v2_root = if (opts.db_explicit) opts.db_path else null,
+        .allowed_hosts = all_hosts.items,
     });
     defer srv.deinit();
 
@@ -2146,7 +2184,7 @@ fn printUsage(out: anytype) !void {
             "  init|adopt|status|watch|blame|log|diff|changes|scopes|revert|verify\n" ++
             "  worktree <list|adopt|scratch|fork|sync|land|conflicts|remove>\n" ++
             "  run <provider> <prompt> | providers | sessions | sync <push|pull> <host:port> [secret]\n" ++
-            "  pr <info|create|open> | relay [port] [dir] [secret] | playground [port] [dir]\n",
+            "  pr <info|create|open> | relay [port] [dir] [secret] | playground [port] [dir] [--allow-host <host>]\n",
         .{VERSION_STR},
     );
 }

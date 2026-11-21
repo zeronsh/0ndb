@@ -5545,6 +5545,34 @@ test "all 10 providers, durable queuing, native and fallback steering, edit/roll
         try testing.expect(!srv_mod.validateOriginHeaders("POST /api/threads HTTP/1.1\r\nOrigin: http://127.0.0.1:9999", 8080));
         try testing.expect(!srv_mod.validateOriginHeaders("POST /api/threads HTTP/1.1\r\nSec-Fetch-Site: cross-site", 8080));
 
+        const zeron_allowed = [_][]const u8{"*.zeron.sh"};
+        const any_allowed = [_][]const u8{"*"};
+        try testing.expect(srv_mod.validateHostHeaderWithAllowed("GET / HTTP/1.1\r\nHost: preview-4323.zeron.sh", &zeron_allowed));
+        try testing.expect(!srv_mod.validateHostHeaderWithAllowed("GET / HTTP/1.1\r\nHost: evilzeron.sh", &zeron_allowed));
+        try testing.expect(!srv_mod.validateHostHeaderWithAllowed("GET / HTTP/1.1\r\nHost: evil.com", &zeron_allowed));
+        try testing.expect(srv_mod.validateHostHeaderWithAllowed("GET / HTTP/1.1\r\nHost: preview.example.dev:443", &any_allowed));
+        try testing.expect(!srv_mod.validateHostHeaderWithAllowed("GET / HTTP/1.1\r\nHost: bad host", &any_allowed));
+        try testing.expect(srv_mod.validateOriginHeadersWithAllowed(
+            "POST /api/v2/threads HTTP/1.1\r\nHost: preview-4323.zeron.sh\r\nOrigin: https://preview-4323.zeron.sh\r\nSec-Fetch-Site: same-origin",
+            4323,
+            &zeron_allowed,
+        ));
+        try testing.expect(srv_mod.validateOriginHeadersWithAllowed(
+            "POST /api/v2/threads HTTP/1.1\r\nHost: 127.0.0.1:4323\r\nX-Forwarded-Host: preview-4323.zeron.sh\r\nOrigin: https://preview-4323.zeron.sh\r\nSec-Fetch-Site: same-origin",
+            4323,
+            &any_allowed,
+        ));
+        try testing.expect(!srv_mod.validateOriginHeadersWithAllowed(
+            "POST /api/v2/threads HTTP/1.1\r\nHost: preview-4323.zeron.sh\r\nOrigin: https://other.zeron.sh\r\nSec-Fetch-Site: same-origin",
+            4323,
+            &any_allowed,
+        ));
+        try testing.expect(!srv_mod.validateOriginHeadersWithAllowed(
+            "POST /api/v2/threads HTTP/1.1\r\nHost: preview-4323.zeron.sh\r\nOrigin: https://evil.com\r\nSec-Fetch-Site: cross-site",
+            4323,
+            &any_allowed,
+        ));
+
         try testing.expectEqual(@as(u64, 42), try srv_mod.jsonU64(.{ .integer = 42 }));
         try testing.expectEqual(@as(u64, 12), try srv_mod.jsonU64(.{ .float = 12.0 }));
         try testing.expectError(error.InvalidNumber, srv_mod.jsonU64(.{ .float = 1e30 }));

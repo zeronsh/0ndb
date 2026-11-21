@@ -54,6 +54,7 @@ pub const ServerConfig = struct {
     default_access: iface.AccessMode = .accept_edits,
     prewarm_models: bool = true,
     v2_root: ?[]const u8 = null,
+    allowed_hosts: []const []const u8 = &.{},
 };
 
 pub fn parseAccessMode(s: []const u8) ?iface.AccessMode {
@@ -70,6 +71,53 @@ pub fn resolveDefaultAccess(allocator: Allocator, io: Io) iface.AccessMode {
         if (parseAccessMode(raw)) |mode| return mode;
     }
     return .accept_edits;
+}
+
+pub fn freeAllowedHosts(allocator: Allocator, hosts: [][]const u8) void {
+    for (hosts) |h| allocator.free(h);
+    allocator.free(hosts);
+}
+
+pub fn resolveAllowedHosts(allocator: Allocator, io: Io) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |h| allocator.free(h);
+        out.deinit(allocator);
+    }
+
+    const env_raw = readEnvVarAlloc(allocator, io, "ONDB_ALLOWED_HOSTS") orelse
+        readEnvVarAlloc(allocator, io, "ONDB_PLAYGROUND_ALLOWED_HOSTS");
+    if (env_raw) |raw| {
+        defer allocator.free(raw);
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            try out.append(allocator, try allocator.dupe(u8, trimmed));
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    var is_cloud_proxy = false;
+    const proxy_env_keys = [_][]const u8{
+        "ZERON_DEVICE_PLATFORM",
+        "ZERON_EDGE_URL",
+        "CODESPACES",
+        "GITPOD_WORKSPACE_URL",
+    };
+    for (proxy_env_keys) |k| {
+        if (readEnvVarAlloc(allocator, io, k)) |val| {
+            defer allocator.free(val);
+            if (std.mem.trim(u8, val, " \t\r\n").len > 0) {
+                is_cloud_proxy = true;
+                break;
+            }
+        }
+    }
+    if (is_cloud_proxy) {
+        try out.append(allocator, try allocator.dupe(u8, "*"));
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 pub const HttpFraming = union(enum) {
@@ -121,27 +169,44 @@ pub fn parseHttpFraming(headers: []const u8) error{ BadFraming, PayloadTooLarge 
     return .{ .content_length = cl_val orelse 0 };
 }
 
-fn isValidLocalHostPort(host_port: []const u8, out_port: *?u16) bool {
+fn parseHostPort(host_port: []const u8, out_host: *[]const u8, out_port: *?u16) bool {
+    out_host.* = "";
     out_port.* = null;
-    if (host_port.len == 0) return false;
+    if (host_port.len == 0 or host_port.len > 255) return false;
     var host: []const u8 = host_port;
     var port_str: ?[]const u8 = null;
     if (host_port[0] == '[') {
         const close_b = std.mem.indexOfScalar(u8, host_port, ']') orelse return false;
+        if (close_b < 2) return false;
         host = host_port[0 .. close_b + 1];
+        for (host[1..close_b]) |c| {
+            const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F') or c == ':' or c == '.';
+            if (!ok) return false;
+        }
         const tail = host_port[close_b + 1 ..];
         if (tail.len > 0) {
             if (tail[0] != ':') return false;
             port_str = tail[1..];
         }
-        if (!std.mem.eql(u8, host, "[::1]")) return false;
     } else {
         if (std.mem.indexOfScalar(u8, host_port, ':')) |colon| {
             host = host_port[0..colon];
             port_str = host_port[colon + 1 ..];
+            if (std.mem.indexOfScalar(u8, port_str.?, ':') != null) return false;
         }
-        const ok_host = std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1");
-        if (!ok_host) return false;
+        if (host.len == 0) return false;
+        if (host[0] == '.' or host[host.len - 1] == '.' or host[0] == '-' or host[host.len - 1] == '-') return false;
+        var prev_dot = false;
+        for (host) |c| {
+            const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '.' or c == '-';
+            if (!ok) return false;
+            if (c == '.') {
+                if (prev_dot) return false;
+                prev_dot = true;
+            } else {
+                prev_dot = false;
+            }
+        }
     }
     if (port_str) |ps| {
         if (ps.len == 0 or ps.len > 5) return false;
@@ -152,10 +217,74 @@ fn isValidLocalHostPort(host_port: []const u8, out_port: *?u16) bool {
         if (p == 0) return false;
         out_port.* = p;
     }
+    out_host.* = host;
     return true;
 }
 
+fn isLocalHost(host: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.mem.eql(u8, host, "127.0.0.1") or
+        std.mem.eql(u8, host, "[::1]");
+}
+
+fn hostMatchesPattern(host_port: []const u8, host: []const u8, raw_pat: []const u8) bool {
+    const pat = std.mem.trim(u8, raw_pat, " \t");
+    if (pat.len == 0) return false;
+    if (std.mem.eql(u8, pat, "*")) return true;
+    if (pat.len >= 2 and pat[0] == '*' and pat[1] == '.') {
+        const suffix = pat[1..];
+        return host.len > suffix.len and std.ascii.endsWithIgnoreCase(host, suffix);
+    }
+    if (pat[0] == '.') {
+        return (host.len > pat.len and std.ascii.endsWithIgnoreCase(host, pat)) or
+            std.ascii.eqlIgnoreCase(host, pat[1..]);
+    }
+    if (pat[0] != '[' and std.mem.indexOfScalar(u8, pat, ':') != null) {
+        return std.ascii.eqlIgnoreCase(host_port, pat);
+    }
+    return std.ascii.eqlIgnoreCase(host, pat);
+}
+
+fn isAllowedHostPort(
+    host_port: []const u8,
+    allowed_hosts: []const []const u8,
+    out_port: *?u16,
+    out_is_local: *bool,
+) bool {
+    var host: []const u8 = "";
+    if (!parseHostPort(host_port, &host, out_port)) {
+        out_is_local.* = false;
+        return false;
+    }
+    if (isLocalHost(host)) {
+        out_is_local.* = true;
+        return true;
+    }
+    out_is_local.* = false;
+    for (allowed_hosts) |pat| {
+        if (hostMatchesPattern(host_port, host, pat)) return true;
+    }
+    return false;
+}
+
+fn hostPortMatchesOrigin(hdr_host_port: []const u8, origin_host_port: []const u8, origin_default_port: u16) bool {
+    var h_host: []const u8 = "";
+    var h_port: ?u16 = null;
+    if (!parseHostPort(hdr_host_port, &h_host, &h_port)) return false;
+    var o_host: []const u8 = "";
+    var o_port: ?u16 = null;
+    if (!parseHostPort(origin_host_port, &o_host, &o_port)) return false;
+    if (!std.ascii.eqlIgnoreCase(h_host, o_host)) return false;
+    const o_eff = o_port orelse origin_default_port;
+    const h_eff = h_port orelse origin_default_port;
+    return o_eff == h_eff;
+}
+
 pub fn validateHostHeader(headers: []const u8) bool {
+    return validateHostHeaderWithAllowed(headers, &.{});
+}
+
+pub fn validateHostHeaderWithAllowed(headers: []const u8, allowed_hosts: []const []const u8) bool {
     var it = std.mem.splitSequence(u8, headers, "\r\n");
     _ = it.next();
     var host_val: ?[]const u8 = null;
@@ -167,16 +296,38 @@ pub fn validateHostHeader(headers: []const u8) bool {
     }
     const hv = host_val orelse return false;
     var parsed_port: ?u16 = null;
-    return isValidLocalHostPort(hv, &parsed_port);
+    var is_local = false;
+    return isAllowedHostPort(hv, allowed_hosts, &parsed_port, &is_local);
 }
 
 pub fn validateOriginHeaders(headers: []const u8, expected_port: u16) bool {
+    return validateOriginHeadersWithAllowed(headers, expected_port, &.{});
+}
+
+pub fn validateOriginHeadersWithAllowed(
+    headers: []const u8,
+    expected_port: u16,
+    allowed_hosts: []const []const u8,
+) bool {
     var it = std.mem.splitSequence(u8, headers, "\r\n");
     _ = it.next();
-    var saw_origin = false;
+    var host_val: ?[]const u8 = null;
+    var xfh_val: ?[]const u8 = null;
+    var origin_val: ?[]const u8 = null;
     var saw_sfs = false;
     while (it.next()) |line| {
-        if (line.len >= 15 and std.ascii.eqlIgnoreCase(line[0..15], "sec-fetch-site:")) {
+        if (line.len >= 5 and std.ascii.eqlIgnoreCase(line[0..5], "host:")) {
+            if (host_val == null) {
+                host_val = std.mem.trim(u8, line[5..], " \t");
+            }
+        } else if (line.len >= 17 and std.ascii.eqlIgnoreCase(line[0..17], "x-forwarded-host:")) {
+            if (xfh_val == null) {
+                const raw_xfh = std.mem.trim(u8, line[17..], " \t");
+                const comma = std.mem.indexOfScalar(u8, raw_xfh, ',') orelse raw_xfh.len;
+                const first_xfh = std.mem.trim(u8, raw_xfh[0..comma], " \t");
+                if (first_xfh.len > 0) xfh_val = first_xfh;
+            }
+        } else if (line.len >= 15 and std.ascii.eqlIgnoreCase(line[0..15], "sec-fetch-site:")) {
             if (saw_sfs) return false;
             saw_sfs = true;
             const sfs = std.mem.trim(u8, line[15..], " \t");
@@ -184,27 +335,48 @@ pub fn validateOriginHeaders(headers: []const u8, expected_port: u16) bool {
                 return false;
             }
         } else if (line.len >= 7 and std.ascii.eqlIgnoreCase(line[0..7], "origin:")) {
-            if (saw_origin) return false;
-            saw_origin = true;
-            const orig = std.mem.trim(u8, line[7..], " \t");
-            var rest: []const u8 = "";
-            var default_port: u16 = 80;
-            if (orig.len > 7 and std.ascii.eqlIgnoreCase(orig[0..7], "http://")) {
-                rest = orig[7..];
-                default_port = 80;
-            } else if (orig.len > 8 and std.ascii.eqlIgnoreCase(orig[0..8], "https://")) {
-                rest = orig[8..];
-                default_port = 443;
-            } else {
-                return false;
-            }
-            if (std.mem.indexOfAny(u8, rest, "/?#@ \t") != null) return false;
-            var parsed_port: ?u16 = null;
-            if (!isValidLocalHostPort(rest, &parsed_port)) return false;
+            if (origin_val != null) return false;
+            origin_val = std.mem.trim(u8, line[7..], " \t");
+        }
+    }
+    if (origin_val) |orig| {
+        var rest: []const u8 = "";
+        var default_port: u16 = 80;
+        if (orig.len > 7 and std.ascii.eqlIgnoreCase(orig[0..7], "http://")) {
+            rest = orig[7..];
+            default_port = 80;
+        } else if (orig.len > 8 and std.ascii.eqlIgnoreCase(orig[0..8], "https://")) {
+            rest = orig[8..];
+            default_port = 443;
+        } else {
+            return false;
+        }
+        if (std.mem.indexOfAny(u8, rest, "/?#@ \t") != null) return false;
+        var parsed_port: ?u16 = null;
+        var origin_is_local = false;
+        if (!isAllowedHostPort(rest, allowed_hosts, &parsed_port, &origin_is_local)) return false;
+        if (origin_is_local) {
             if (expected_port != 0) {
                 const eff_port = parsed_port orelse default_port;
                 if (eff_port != expected_port) return false;
             }
+        } else {
+            var matched_host = false;
+            if (host_val) |hv| {
+                if (hostPortMatchesOrigin(hv, rest, default_port)) matched_host = true;
+            }
+            if (!matched_host) {
+                if (xfh_val) |xfh| {
+                    var xfh_port: ?u16 = null;
+                    var xfh_local = false;
+                    if (isAllowedHostPort(xfh, allowed_hosts, &xfh_port, &xfh_local) and
+                        hostPortMatchesOrigin(xfh, rest, default_port))
+                    {
+                        matched_host = true;
+                    }
+                }
+            }
+            if (!matched_host) return false;
         }
     }
     return true;
@@ -1559,6 +1731,7 @@ pub const PlaygroundServer = struct {
     v2_mu: Io.Mutex,
     v2: V2State,
     v2_maint_thread: std.Thread,
+    allowed_hosts: [][]const u8,
 
     pub fn start(
         allocator: Allocator,
@@ -1628,6 +1801,16 @@ pub const PlaygroundServer = struct {
         errdefer self.traces_dir.close(io);
         self.ui_dist = resolveUiDist(allocator, io);
         errdefer if (self.ui_dist) |d| allocator.free(d);
+        self.allowed_hosts = try allocator.alloc([]const u8, config.allowed_hosts.len);
+        var ah_inited: usize = 0;
+        errdefer {
+            for (self.allowed_hosts[0..ah_inited]) |h| allocator.free(h);
+            allocator.free(self.allowed_hosts);
+        }
+        for (config.allowed_hosts, 0..) |h, idx| {
+            self.allowed_hosts[idx] = try allocator.dupe(u8, h);
+            ah_inited = idx + 1;
+        }
 
         var auth_secret: [32]u8 = undefined;
         io.random(&auth_secret);
@@ -1908,6 +2091,7 @@ pub const PlaygroundServer = struct {
         self.live_traces.deinit(self.allocator);
         self.trace_mu.unlock(self.io);
         self.traces_dir.close(self.io);
+        freeAllowedHosts(self.allocator, self.allowed_hosts);
         if (self.ui_dist) |d| self.allocator.free(d);
         self.allocator.destroy(self);
     }
@@ -2651,7 +2835,7 @@ pub const PlaygroundServer = struct {
             const hend = hidx + 4;
             const head_pre = req_buf.items[0..hidx];
 
-            if (!validateHostHeader(head_pre)) {
+            if (!validateHostHeaderWithAllowed(head_pre, self.allowed_hosts)) {
                 _ = sendHttp(fd, "403 Forbidden", "application/json", "{\"error\":\"InvalidHost\"}", false);
                 return;
             }
@@ -2662,7 +2846,7 @@ pub const PlaygroundServer = struct {
             const method_pre = parts_pre.next() orelse "";
 
             if (isMutationMethod(method_pre)) {
-                if (!validateOriginHeaders(head_pre, self.http_port)) {
+                if (!validateOriginHeadersWithAllowed(head_pre, self.http_port, self.allowed_hosts)) {
                     _ = sendHttp(fd, "403 Forbidden", "application/json", "{\"error\":\"CrossOriginForbidden\"}", false);
                     return;
                 }
@@ -2738,7 +2922,7 @@ pub const PlaygroundServer = struct {
             }
 
             if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/events")) {
-                if (!validateOriginHeaders(head, self.http_port)) {
+                if (!validateOriginHeadersWithAllowed(head, self.http_port, self.allowed_hosts)) {
                     _ = sendHttp(fd, "403 Forbidden", "application/json", "{\"error\":\"CrossOriginForbidden\"}", false);
                     return;
                 }
