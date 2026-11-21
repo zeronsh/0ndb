@@ -56,6 +56,7 @@ Msg_Spec :: struct {
 	role:       Role,
 	author:     prim.Id,
 	parent:     Rid,
+	root:       bool,
 	runner:     prim.Id,
 	intent:     Rid,
 	files:      []File_Delta,
@@ -963,7 +964,7 @@ _running :: proc(w: ^Writer, msg: i64) -> (index: int, err: Error) {
 
 @(private)
 _check_spec :: proc(s: ^Msg_Spec) -> Error {
-	if u8(s.role) < 1 || s.role > max(Role) {
+	if u8(s.role) < 1 || s.role > max(Role) || (s.root && !obj.rid_none(s.parent)) {
 		return .Invalid
 	}
 	if len(s.files) > MAX_FILES {
@@ -1521,7 +1522,9 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 	v := w.core.v
 	pos, _, _, lit := _positions(v, w.core.id) or_return
 	p := pos.at
-	if !obj.rid_none(s.parent) {
+	if s.root {
+		p = {}
+	} else if !obj.rid_none(s.parent) {
 		p = obj.vref(v, s.parent) or_return
 	}
 	depth, jump_depth: i64 = 1, 0

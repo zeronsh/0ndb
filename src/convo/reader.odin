@@ -872,7 +872,7 @@ _fill_message :: proc(v: ^obj.View, at: Vref, m: ^Msg, msg: ^Message, allocator:
 }
 
 @(private)
-_seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at: ^Vref) -> (last: i64, err: Error) {
+_seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at: ^Vref, allocator := context.temp_allocator) -> (last: i64, err: Error) {
 	s := at.seg
 	sum, _ := _tail(v, s) or_return
 	msg.id = obj.rid(v, at)
@@ -880,7 +880,7 @@ _seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at
 		sv := obj.vref(v, pos.seal) or_return
 		if sv.seg == s && sv.off > at.off {
 			body, _ := obj.get(v, s, sv.off) or_return
-			_apply_seal(body, sv.off, at.off, msg) or_return
+			_apply_seal(body, sv.off, at.off, msg, allocator) or_return
 			msg.seal = obj.rid(v, sv)
 			seal_at^ = sv
 			return msg.last_block, .None
@@ -911,7 +911,7 @@ _seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at
 			}
 			c.seals[key] = mo
 			if mo == at.off {
-				_apply_seal(body, sum.last_seal, at.off, msg) or_return
+				_apply_seal(body, sum.last_seal, at.off, msg, allocator) or_return
 				seal_at^ = Vref{s, sum.last_seal}
 				msg.seal = obj.rid(v, seal_at^)
 				return msg.last_block, .None
@@ -924,14 +924,14 @@ _seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at
 		return l, .None
 	}
 	body, _ := obj.get(v, s, so) or_return
-	_apply_seal(body, so, at.off, msg) or_return
+	_apply_seal(body, so, at.off, msg, allocator) or_return
 	seal_at^ = Vref{s, so}
 	msg.seal = obj.rid(v, seal_at^)
 	return msg.last_block, .None
 }
 
 @(private)
-_apply_seal :: proc(body: []u8, off: i64, m: i64, msg: ^Message) -> Error {
+_apply_seal :: proc(body: []u8, off: i64, m: i64, msg: ^Message, allocator: runtime.Allocator) -> Error {
 	rec := decode_record(body, off) or_return
 	#partial switch r in rec.body {
 	case Seal:
@@ -941,6 +941,7 @@ _apply_seal :: proc(body: []u8, off: i64, m: i64, msg: ^Message) -> Error {
 		msg.status = r.status
 		msg.usage = r.usage
 		msg.last_block = r.last_block
+		msg.seal_native = obj.clone_str(r.native_msg, allocator) or_return
 		return .None
 	case Interrupted:
 		if r.msg != m {
@@ -991,7 +992,7 @@ _scan_seal :: proc(v: ^obj.View, s: int, m: i64) -> (seal: i64, last: i64, err: 
 @(private)
 _resolve_body :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, below: ^i64, allocator: runtime.Allocator) -> Error {
 	seal_at := Vref{}
-	last := _seal_info(v, at, pos, msg, &seal_at) or_return
+	last := _seal_info(v, at, pos, msg, &seal_at, allocator) or_return
 	if !obj.vref_none(seal_at) {
 		below^ = min(below^, seal_at.off)
 	}
@@ -1380,4 +1381,49 @@ _spine_prefetch :: proc(v: ^obj.View, t: ^Tail, lo, hi: i64, floor: prim.Hlc) {
 			}
 		}
 	}
+}
+
+Activity :: struct {
+	seg: prim.Id,
+	hlc: prim.Hlc,
+}
+
+segment_activity :: proc(v: ^obj.View, s: int) -> (hlc: prim.Hlc, err: Error) {
+	sum, ok := _tail(v, s) or_return
+	if !ok {
+		return 0, .None
+	}
+	hlc = max(sum.tip_hlc, sum.leaf_hlc)
+	sg := &v.segs[s]
+	if e := sg.links.event; e != 0 {
+		if e == sg.last {
+			hlc = max(hlc, sg.links.stamp)
+		} else {
+			env, red := obj.envelope(v, s, e) or_return
+			if !red {
+				hlc = max(hlc, env.links.stamp)
+			}
+		}
+	}
+	return hlc, .None
+}
+
+activity :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Activity, err: Error) {
+	list := make([dynamic]Activity, 0, len(v.segs), allocator)
+	missing := false
+	for s in 0 ..< len(v.segs) {
+		h, e := segment_activity(v, s)
+		if e == .Missing {
+			missing = true
+			continue
+		}
+		if e != .None {
+			return nil, e
+		}
+		append(&list, Activity{v.segs[s].id, h})
+	}
+	if missing {
+		return list[:], .Missing
+	}
+	return list[:], .None
 }
