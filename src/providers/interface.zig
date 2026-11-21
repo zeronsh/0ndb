@@ -76,12 +76,83 @@ pub const Capabilities = struct {
     native_steer: bool = false,
 };
 
+pub const MountKind = enum(u8) {
+    virtual = 0,
+    dir = 1,
+    git_worktree = 2,
+};
+
+pub const MountAccess = enum(u8) {
+    read_only = 0,
+    shared_rw = 1,
+    isolated_fork = 2,
+};
+
+pub const MountSpec = struct {
+    alias: []const u8,
+    space_id: u128,
+    kind: MountKind,
+    access: MountAccess,
+    local_path: ?[]const u8 = null,
+};
+
+pub const VirtualSpaceBridge = struct {
+    ctx: *anyopaque,
+    listFn: *const fn (ctx: *anyopaque, allocator: Allocator, space_id: u128, prefix: []const u8) anyerror![][]u8,
+    readFn: *const fn (ctx: *anyopaque, allocator: Allocator, space_id: u128, path: []const u8) anyerror!?[]u8,
+    writeFn: *const fn (ctx: *anyopaque, space_id: u128, path: []const u8, content: []const u8) anyerror!void,
+    editFn: *const fn (ctx: *anyopaque, space_id: u128, path: []const u8, old_str: []const u8, new_str: []const u8) anyerror!void,
+    deleteFn: *const fn (ctx: *anyopaque, space_id: u128, path: []const u8) anyerror!void,
+    searchFn: *const fn (ctx: *anyopaque, allocator: Allocator, space_id: u128, query: []const u8) anyerror![][]u8,
+    metaGetFn: *const fn (ctx: *anyopaque, allocator: Allocator, space_id: u128, key: []const u8) anyerror!?[]u8,
+    metaSetFn: *const fn (ctx: *anyopaque, space_id: u128, key: []const u8, val: []const u8) anyerror!void,
+
+    pub fn list(self: *const VirtualSpaceBridge, allocator: Allocator, space_id: u128, prefix: []const u8) ![][]u8 {
+        return self.listFn(self.ctx, allocator, space_id, prefix);
+    }
+
+    pub fn read(self: *const VirtualSpaceBridge, allocator: Allocator, space_id: u128, path: []const u8) !?[]u8 {
+        return self.readFn(self.ctx, allocator, space_id, path);
+    }
+
+    pub fn write(self: *const VirtualSpaceBridge, space_id: u128, path: []const u8, content: []const u8) !void {
+        return self.writeFn(self.ctx, space_id, path, content);
+    }
+
+    pub fn edit(self: *const VirtualSpaceBridge, space_id: u128, path: []const u8, old_str: []const u8, new_str: []const u8) !void {
+        return self.editFn(self.ctx, space_id, path, old_str, new_str);
+    }
+
+    pub fn delete(self: *const VirtualSpaceBridge, space_id: u128, path: []const u8) !void {
+        return self.deleteFn(self.ctx, space_id, path);
+    }
+
+    pub fn search(self: *const VirtualSpaceBridge, allocator: Allocator, space_id: u128, query: []const u8) ![][]u8 {
+        return self.searchFn(self.ctx, allocator, space_id, query);
+    }
+
+    pub fn metaGet(self: *const VirtualSpaceBridge, allocator: Allocator, space_id: u128, key: []const u8) !?[]u8 {
+        return self.metaGetFn(self.ctx, allocator, space_id, key);
+    }
+
+    pub fn metaSet(self: *const VirtualSpaceBridge, space_id: u128, key: []const u8, val: []const u8) !void {
+        return self.metaSetFn(self.ctx, space_id, key, val);
+    }
+};
+
 pub const StartRequest = struct {
-    cwd: []const u8,
+    cwd: []const u8 = "",
     model: ?[]const u8 = null,
     resume_id: ?[]const u8 = null,
     fork_at: ?[]const u8 = null,
     access: AccessMode = .full,
+    mounts: []const MountSpec = &.{},
+    virtual_bridge: ?*const VirtualSpaceBridge = null,
+    runner_id: u128 = 0,
+
+    pub fn hasLocalCwd(self: *const StartRequest) bool {
+        return self.cwd.len > 0;
+    }
 };
 
 pub const SteerOutcome = enum(u8) {
