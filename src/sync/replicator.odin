@@ -1090,6 +1090,7 @@ _records_match :: proc(mine, theirs: []u8, base: i64, redacted: ^[dynamic]journa
 @(private)
 _local_retry :: proc(r: ^Replicator, l: ^Local) {
 	l.retry = true
+	l.ahead = 0
 	if r.retry == 0 {
 		r.retry = prim.timer(r.loop, RETRY_MS, r, _on_retry)
 	}
@@ -1782,6 +1783,10 @@ TAMPER_REPORT :: 3
 _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	id := Stream_Id(ev.id)
 	if ev.first {
+		r.rx_local = nil
+		if l, ok := r.locals[id]; ok && l.verifying && ev.at == l.verify_at + i64(len(l.verify)) && ev.at < l.verify_to {
+			r.rx_local = l
+		}
 		if rm := r.rx_remote; rm != nil {
 			if rm.id == id && ev.at == r.rx_at {
 				return
@@ -1798,15 +1803,10 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 			}
 		}
 		r.rx_remote = nil
-		r.rx_local = nil
 		r.rx_at = ev.at
 		r.rx_start = ev.at
 		r.stage_at = ev.at
 		clear(&r.stage)
-		if l, ok := r.locals[id]; ok && l.verifying {
-			r.rx_local = l
-			return
-		}
 		rm, ok := r.remotes[id]
 		if !ok {
 			return
@@ -1832,11 +1832,10 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 		return
 	}
 	if len(ev.data) > 0 {
-		if l := r.rx_local; l != nil {
-			if r.rx_at >= l.verify_at && r.rx_at + i64(len(ev.data)) <= l.verify_to && r.rx_at == l.verify_at + i64(len(l.verify)) {
-				append(&l.verify, ..ev.data)
-			}
-		} else if r.rx_remote != nil {
+		if l := r.rx_local; l != nil && r.rx_at == l.verify_at + i64(len(l.verify)) {
+			append(&l.verify, ..ev.data[:min(i64(len(ev.data)), l.verify_to - r.rx_at)])
+		}
+		if r.rx_remote != nil {
 			r.read_bytes += i64(len(ev.data))
 			append(&r.stage, ..ev.data)
 			if len(r.stage) >= STAGE_MAX {
@@ -1853,7 +1852,6 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 		if r.rx_at >= l.verify_to || r.rx_at >= ev.length {
 			_local_verify_done(r, l)
 		}
-		return
 	}
 	rm := r.rx_remote
 	if rm == nil {
