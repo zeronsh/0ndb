@@ -1174,6 +1174,8 @@ ignore_load :: proc(ig: ^Ignore, git_dir, common_dir: string, plain: bool) -> Er
 	}
 	git_settings_attributes(&ig.git, ig.vfs, attributes_file, ig.allocator)
 	ig.git.filters = c.filters
+	ig.git.roundtrip = c.roundtrip
+	ig.git.has_roundtrip = c.has_roundtrip
 	excludes_file := ""
 	if c.has_excludes {
 		excludes_file = string(c.excludes[:c.excludes_len])
@@ -1272,6 +1274,8 @@ Git_Config :: struct {
 	attributes_len:  int,
 	has_attributes:  bool,
 	filters:         [dynamic]Filter_Driver,
+	roundtrip:       string,
+	has_roundtrip:   bool,
 }
 
 @(private = "file")
@@ -1575,6 +1579,14 @@ config_entry :: proc(c: ^Git_Config, key, val: string, has_value: bool, from: st
 			if p, ok := config_path(c.attributes[:], val, ""); ok {
 				c.attributes_len = len(p)
 			}
+		}
+	case "core.checkroundtripencoding":
+		if has_value {
+			if c.has_roundtrip {
+				delete(c.roundtrip, c.allocator)
+			}
+			c.roundtrip, _ = clone_string(val, c.allocator)
+			c.has_roundtrip = true
 		}
 	case "extensions.worktreeconfig":
 		if b, ok := config_bool(val, has_value); ok {

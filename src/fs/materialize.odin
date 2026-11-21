@@ -447,6 +447,9 @@ disk_matches :: proc(m: ^Mount, rel: string, e: Entry) -> bool {
 
 @(private)
 materialize_one :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
+	if m.adopting && it.present && it.has_old && it.old == it.path && it.kind == .File && it.entry.kind == .File && it.entry.oid != {} && disk_matches(m, it.path, it.entry) {
+		return .None
+	}
 	materialize_inner(m, it, tl) or_return
 	if m.restoring {
 		return .None
@@ -590,28 +593,12 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 		}
 		sink := Fd_Sink{m.vfs, fd, 0, .None}
 		out := io.Stream{procedure = fd_sink_proc, data = &sink}
-		smudge: Smudge_Sink
-		serr: odb.Error
-		if cv := conv_attrs(m, it.path); cv.driver != nil || cv.ident || cv.encoding != .None {
-			t, blob, rerr := odb.read(m.db, odb.Oid(reg.oid), context.temp_allocator)
-			serr = rerr
-			if rerr == .None && t == .Blob && !eol_smudge_to(m, it.path, blob, out) {
-				prim.close_file(m.vfs, fd)
-				prim.remove(m.vfs, tmp)
-				return .Io
-			}
-		} else {
-			if eol_smudge_large(m, it.path, odb.Oid(reg.oid)) {
-				smudge = Smudge_Sink{inner = out, buf = make([]u8, 1 << 16, context.temp_allocator)}
-				out = io.Stream{procedure = smudge_sink_proc, data = &smudge}
-			}
-			_, _, serr = odb.stream(m.db, odb.Oid(reg.oid), out)
-		}
+		sok := eol_smudge_blob(m, it.path, odb.Oid(reg.oid), out, fd_sink_rewind, &sink)
 		prim.fchmod(m.vfs, fd, mode)
 		prim.close_file(m.vfs, fd)
-		if serr != .None || sink.err != .None {
+		if !sok || sink.err != .None {
 			prim.remove(m.vfs, tmp)
-			return from_odb(serr) if serr != .None else sink.err
+			return sink.err if sink.err != .None else .Io
 		}
 		from_prim(prim.rename(m.vfs, tmp, abs)) or_return
 		mat_file(m, abs)
@@ -809,6 +796,13 @@ fd_sink_proc :: proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i64, w
 		return io.query_utility({.Write, .Query})
 	}
 	return 0, .Unsupported
+}
+
+@(private)
+fd_sink_rewind :: proc(data: rawptr) -> bool {
+	s := (^Fd_Sink)(data)
+	s.off = 0
+	return prim.truncate(s.vfs, s.fd, 0) == .None
 }
 
 @(private)

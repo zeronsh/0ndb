@@ -280,12 +280,14 @@ Mount :: struct {
 	root_wd:     i32,
 	watched:     bool,
 	restoring:   bool,
+	adopting:    bool,
 	img:         Mount_Image,
 	mat:         ^Mat_Sync,
 	merge_base:  Version,
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
 	log_len:     i64,
+	saved:       u64,
 	lost:        bool,
 	retained:    bool,
 	window:      bool,
@@ -1450,8 +1452,15 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_id(&w, boot)
 	prim.write_bool(&w, m.clean)
 	prim.write_bool(&w, m.lost)
+	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
+	if sum == m.saved {
+		attrib_log_reset(m)
+		return .None
+	}
 	p, _ := path_join(m.dir, "mount", context.temp_allocator)
+	m.saved = 0
 	from_prim(prim.replace_atomic(m.vfs, p, buf[:])) or_return
+	m.saved = sum
 	attrib_log_reset(m)
 	return .None
 }

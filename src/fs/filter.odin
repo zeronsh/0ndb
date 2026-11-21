@@ -103,6 +103,7 @@ filter_argv :: proc(cmd: string, rel: string, allocator: runtime.Allocator) -> [
 			append(&out, strings.clone(strings.to_string(cur), allocator))
 		}
 		if len(out) > 0 {
+			out[0] = filter_program(out[0], allocator)
 			return out[:]
 		}
 	}
@@ -111,6 +112,45 @@ filter_argv :: proc(cmd: string, rel: string, allocator: runtime.Allocator) -> [
 	out[1] = "-c"
 	out[2] = full
 	return out
+}
+
+@(private)
+filter_program :: proc(name: string, allocator: runtime.Allocator) -> string {
+	when ODIN_OS == .Windows {
+		for c in transmute([]u8)name {
+			if c == '/' || c == '\\' || c == ':' {
+				return name
+			}
+		}
+		buf: [prim.PATH_MAX]u8
+		prefix, ok := git_prefix(buf[:])
+		if !ok {
+			return name
+		}
+		has_ext := strings.last_index_byte(name, '.') > 0
+		for dir in ([]string{"mingw64\\bin", "usr\\bin", "cmd"}) {
+			for ext in ([]string{"", ".exe"}) {
+				if len(ext) > 0 && has_ext {
+					continue
+				}
+				pbuf: prim.Path_Buf
+				d, dok := path_join_buf(pbuf[:], prefix, dir)
+				if !dok {
+					continue
+				}
+				fbuf: prim.Path_Buf
+				f, fok := path_join_buf(fbuf[:], d, strings.concatenate({name, ext}, context.temp_allocator))
+				if fok && prim.exists(prim.os_vfs(), f) {
+					if st, serr := prim.lstat(prim.os_vfs(), f); serr == .None && st.kind == .File {
+						return strings.clone(f, allocator)
+					}
+				}
+			}
+		}
+		return name
+	} else {
+		return name
+	}
 }
 
 @(private)
@@ -480,14 +520,15 @@ filter_oneshot :: proc(m: ^Mount, cmd_line: string, rel: string, in_: Filter_Inp
 }
 
 filter_apply :: proc(m: ^Mount, driver: ^Filter_Driver, cmd: Filter_Cmd, rel: string, in_: Filter_Input, out: io.Stream) -> bool {
-	if len(driver.process) > 0 && m.attrs != nil {
+	if len(driver.process) > 0 {
+		attr_begin(m)
+		defer attr_end(m)
 		fp := attr_filter_proc(m, driver)
-		if fp != nil {
-			ok, handled := filter_via_process(m, fp, cmd, rel, in_, out)
-			if handled {
-				return ok
-			}
+		if fp == nil {
+			return false
 		}
+		ok, _ := filter_via_process(m, fp, cmd, rel, in_, out)
+		return ok
 	}
 	line := driver.clean if cmd == .Clean else driver.smudge
 	if len(line) == 0 {

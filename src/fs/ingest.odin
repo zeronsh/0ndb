@@ -295,6 +295,7 @@ Import_State :: struct {
 	resume:    bool,
 	adopt:     bool,
 	snap:      fstree.Snapshot,
+	line:      []crdt.Lv,
 	dirty_dirs: map[string]bool,
 	packp:     ^odb.Pack_Builder,
 	cur:       ^Pipe_Chunk,
@@ -327,6 +328,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 			lvs := make([dynamic]crdt.Lv, st.long)
 			if crdt.graph_version_lvs(&m.history.g, line, &lvs) == .None {
 				st.snap = version_snapshot(m.history, lvs[:]) or_return
+				st.line = lvs[:]
 				st.adopt = true
 				clear(&m.synced)
 				append(&m.synced, ..line)
@@ -418,7 +420,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 			}
 			continue
 		}
-		if st.adopt && import_adopt(&st, it, parent) {
+		if st.adopt && import_adopt(&st, it, parent, tracked, &entry) {
 			continue
 		}
 		if st.resume {
@@ -481,7 +483,10 @@ mount_import :: proc(m: ^Mount) -> Error {
 	if st.adopt {
 		if line, has := history_line(m.history, m.line, context.temp_allocator) or_return; has {
 			clear(&m.synced)
-			materialize_to(m, line, false) or_return
+			m.adopting = true
+			merr := materialize_to(m, line, false)
+			m.adopting = false
+			merr or_return
 		}
 	}
 	_heap_release()
@@ -489,7 +494,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame) -> bool {
+import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracked: bool, entry: ^Index_Entry) -> bool {
 	m := st.m
 	ino, found, lerr := fstree.lookup(&st.snap, it.path)
 	if lerr != nil || !found {
@@ -524,8 +529,60 @@ import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame) -> bo
 		append(&st.stack, Dir_Frame{path = p, inode = ino, depth = it.depth, wd = wd, partial = true})
 		return true
 	}
-	import_shadow(st, it.path, Entry{inode = ino, kind = want})
+	e := Entry{inode = ino, kind = want}
+	if want == .File {
+		if oid, same := adopt_same(st, it, ino, info.flags, tracked, entry); same {
+			e.stat = it.stat
+			e.oid = oid
+		}
+	}
+	import_shadow(st, it.path, e)
 	return true
+}
+
+@(private)
+adopt_same :: proc(st: ^Import_State, it: ^Scan_Item, ino: fstree.Inode_Id, flags: fstree.Flags, tracked: bool, entry: ^Index_Entry) -> (oid: odb.Oid, same: bool) {
+	m := st.m
+	h := m.history
+	if !tracked || !m.git_refs || m.db == nil || !it.statted || !index_clean(entry, it.stat, .File, st.index_mtime, mount_trust_exec(m), mount_symlinks(m)) {
+		return {}, false
+	}
+	if exec_bit(m, it.stat, .Exec in flags) != (.Exec in flags) {
+		return {}, false
+	}
+	if .Opaque in flags {
+		reg, has, err := history_blob_at(h, ino, st.line)
+		return entry.oid, err == .None && has && odb.Oid(reg.oid) == entry.oid
+	}
+	rec: File_Record
+	owned := false
+	if f, ok := h.files[ino]; ok {
+		if len(f.new_refs) > 0 {
+			return {}, false
+		}
+		rec = f.rec
+	} else {
+		owned = true
+		if read_file_record(h, ino, &rec) != .None {
+			delete(rec.cp_version)
+			delete(rec.cp_spans)
+			return {}, false
+		}
+	}
+	defer if owned {
+		delete(rec.cp_version)
+		delete(rec.cp_spans)
+	}
+	if !rec.has_cp || rec.ops != rec.cp_count || odb.Oid(rec.cp_text) != entry.oid {
+		return {}, false
+	}
+	for id in rec.cp_version {
+		lv, known := crdt.graph_lv(&h.g, id)
+		if !known || !crdt.graph_contains(&h.g, st.line, lv) {
+			return {}, false
+		}
+	}
+	return entry.oid, true
 }
 
 @(private)
@@ -765,7 +822,11 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		} else {
 			if stat.size > m.opts.large_limit {
 				binary = true
-				if co, csize, cok := store_large_clean(m, it.path, abs); cok {
+				co, csize, cst := store_large_clean(m, it.path, abs)
+				if cst == .Failed {
+					return .None
+				}
+				if cst == .Stored {
 					oid = co
 					size = csize
 				}
@@ -989,6 +1050,24 @@ catch_up :: proc(m: ^Mount) -> Error {
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
 	crdt.version_union(&h.g, sl[:], one[:], &both)
 	return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), true)
+}
+
+@(private)
+commit_bounded :: proc(p: ^Pass, actor: prim.Id, indices: []int, marker: []u8 = nil) -> Error {
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch, 1 << 20) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&scratch)
+	context.temp_allocator = virtual.arena_allocator(&scratch)
+	b: Builder
+	builder_init(&b, p.m.history, actor)
+	if marker != nil {
+		builder_opaque(&b, marker)
+	}
+	commit_group(p, &b, indices) or_return
+	history_trim(p.m.history)
+	return .None
 }
 
 @(private)
@@ -1363,9 +1442,9 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		clear(&p.changes)
 		append(&p.changes, ..merged[:])
 		clear(&p.held)
-		clear(&p.held_r)
-		clear(&p.held_c)
 	}
+	clear(&p.held_r)
+	clear(&p.held_c)
 	if len(p.changes) == 0 && !(p.git_wrote && !p.marked) {
 		return .None
 	}
@@ -1389,41 +1468,52 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				p.held_c[clone_string(c.path, p.long) or_else ""] = true
 			}
 		}
-		keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+		holding := 0
 		for c in p.changes {
-			hold := (c.kind == .Remove && held_under(p.held_r, c.path)) || held_under(p.held_c, c.path)
-			if hold && len(p.held) < HOLD_MAX {
-				h2 := c
-				h2.path = clone_string(c.path, p.long) or_else ""
-				h2.target = clone_string(c.target, p.long) or_else ""
-				h2.moved = clone_string(c.moved, p.long) or_else ""
-				append(&p.held, h2)
-			} else {
-				append(&keep, c)
+			if (c.kind == .Remove && held_under(p.held_r, c.path)) || held_under(p.held_c, c.path) {
+				holding += 1
 			}
 		}
-		clear(&p.changes)
-		append(&p.changes, ..keep[:])
+		if holding <= HOLD_MAX {
+			keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+			for c in p.changes {
+				if (c.kind == .Remove && held_under(p.held_r, c.path)) || held_under(p.held_c, c.path) {
+					h2 := c
+					h2.path = clone_string(c.path, p.long) or_else ""
+					h2.target = clone_string(c.target, p.long) or_else ""
+					h2.moved = clone_string(c.moved, p.long) or_else ""
+					append(&p.held, h2)
+				} else {
+					append(&keep, c)
+				}
+			}
+			clear(&p.changes)
+			append(&p.changes, ..keep[:])
+		} else {
+			clear(&p.held_r)
+			clear(&p.held_c)
+		}
 	}
 	if p.git_wrote {
-		b: Builder
-		builder_init(&b, m.history, m.actor)
-		if !p.marked {
-			buf := make([dynamic]u8, context.temp_allocator)
-			kind := p.operation if p.operation != "" else "checkout"
-			if !p.head_moved {
-				kind = p.operation if p.operation != "" else "git"
-			}
-			encode_git_op(&buf, kind, p.head.branch, p.head.commit)
-			builder_opaque(&b, buf[:])
-			p.marked = true
-		}
 		all := make([dynamic]int, 0, len(p.changes), context.temp_allocator)
 		for _, i in p.changes {
 			append(&all, i)
 		}
 		emit_order(p, all[:])
-		commit_group(p, &b, all[:]) or_return
+		for lo := 0; lo == 0 || lo < len(all); lo += PASS_CHUNK {
+			marker: []u8
+			if !p.marked {
+				buf := make([dynamic]u8, context.temp_allocator)
+				kind := p.operation if p.operation != "" else "checkout"
+				if !p.head_moved {
+					kind = p.operation if p.operation != "" else "git"
+				}
+				encode_git_op(&buf, kind, p.head.branch, p.head.commit)
+				marker = buf[:]
+				p.marked = true
+			}
+			commit_bounded(p, m.actor, all[lo:min(lo + PASS_CHUNK, len(all))], marker) or_return
+		}
 	} else {
 		attribute_changes(p) or_return
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
@@ -1444,15 +1534,16 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			groups[actor] = l
 		}
 		for actor in order {
-			b: Builder
-			builder_init(&b, m.history, actor)
-			emit_order(p, groups[actor][:])
+			idx := groups[actor][:]
+			emit_order(p, idx)
 			if actor != m.actor {
-				for i in groups[actor] {
+				for i in idx {
 					attrib_set(m, p.changes[i].path, actor, true)
 				}
 			}
-			commit_group(p, &b, groups[actor][:]) or_return
+			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
+				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))]) or_return
+			}
 		}
 	}
 	mount_settle(m) or_return
@@ -1719,7 +1810,9 @@ compare_dir :: proc(p: ^Pass, rel: string) -> Error {
 		}
 		pass_maybe_flush(p) or_return
 	}
-	for name in sorted_strings(names) {
+	pending := sorted_strings(names, heap)
+	defer delete(pending, heap)
+	for name in pending {
 		found := false
 		for k in kids {
 			if k.name == name {
@@ -1897,7 +1990,9 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		}
 		pass_maybe_flush(p) or_return
 	}
-	for name in sorted_strings(names) {
+	pending := sorted_strings(names, heap)
+	defer delete(pending, heap)
+	for name in pending {
 		child, ok := path_join_buf(cbuf[:], rel, name)
 		if !ok {
 			continue
@@ -2183,7 +2278,11 @@ read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
 	if stat.size > m.opts.large_limit {
-		if co, _, cok := store_large_clean(m, rel, abs, old, has_old); cok {
+		co, _, cst := store_large_clean(m, rel, abs, old, has_old)
+		if cst == .Failed {
+			return nil, {}, true, false, .None
+		}
+		if cst == .Stored {
 			return nil, co, true, true, .None
 		}
 		o, werr := store_file(m, abs, nil)
@@ -2275,6 +2374,15 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 		return shadow_put(&m.shadow, path, ne)
 	}
 	was_binary := .Opaque in old_flags
+	if binary && was_binary && m.db != nil && blob_current(h, e.inode, m.synced[:], oid) {
+		return shadow_put(&m.shadow, path, ne)
+	}
+	if binary && !was_binary && data != nil {
+		cur := history_text_at(h, e.inode, m.synced[:], context.temp_allocator) or_return
+		if string(cur) == string(data) {
+			return shadow_put(&m.shadow, path, ne)
+		}
+	}
 	if binary {
 		if data != nil {
 			store_blob(m, data) or_return
@@ -2292,6 +2400,16 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	}
 	emit_text_edits(m, b, e.inode, path, old, data) or_return
 	return shadow_put(&m.shadow, path, ne)
+}
+
+@(private)
+blob_current :: proc(h: ^History, inode: fstree.Inode_Id, synced: []crdt.Op_Id, oid: odb.Oid) -> bool {
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, synced, &lvs) != .None {
+		return false
+	}
+	reg, has, err := history_blob_at(h, inode, lvs[:])
+	return err == .None && has && odb.Oid(reg.oid) == oid
 }
 
 @(private)
