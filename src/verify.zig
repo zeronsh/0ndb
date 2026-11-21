@@ -1287,6 +1287,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
     try runTimelineAndRemoteSuite(allocator, io);
     try runSpaceProjectionProjectSuite(allocator, io);
     try runSyncClientV3Suite(allocator, io);
+    try runThreadRuntimeSuite(allocator, io);
 }
 
 fn countOpenFds(io: std.Io) !usize {
@@ -10648,5 +10649,839 @@ fn runSyncClientV3Suite(allocator: std.mem.Allocator, io: std.Io) !void {
         const got_th = cat_b.getThread(th_id).?;
         try testing.expectEqualStrings("Release Planning", got_th.title);
         try testing.expectEqual(@as(?u128, proj_id), got_th.project_id);
+    }
+}
+
+fn runThreadRuntimeSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const tm = ondb.thread.model;
+    const ts = ondb.thread.store;
+    const tr = ondb.thread.runtime;
+    const sp_mgr = ondb.space.manager;
+    const proj_mod = ondb.project;
+    const kr_mod = ondb.sync.keyring;
+    const lease_mod = ondb.sync.lease;
+    const wire = ondb.sync.wire;
+    const crypto = ondb.store.crypto;
+    const iface = ondb.providers.interface;
+    const tl = ondb.fs.timeline;
+
+    const root = "/tmp/0ndb-verify-thread-runtime";
+    cleanDir(io, root);
+    defer cleanDir(io, root);
+
+    const spaces_state = root ++ "/spaces-state";
+    const checkouts_dir = root ++ "/checkouts";
+    const projects_state = root ++ "/projects-state";
+    const runtime_state = root ++ "/runtime-state";
+    const leases_state = root ++ "/leases-state";
+    const catalog_state = root ++ "/catalog-state";
+
+    try std.Io.Dir.cwd().createDirPath(io, catalog_state);
+    var cat_dir = try std.Io.Dir.cwd().openDir(io, catalog_state, .{ .iterate = true });
+    defer cat_dir.close(io);
+
+    var spaces = try sp_mgr.SpaceManager.open(allocator, io, spaces_state, checkouts_dir, null);
+    defer spaces.deinit();
+
+    var projects = try proj_mod.ProjectStore.open(allocator, io, projects_state);
+    defer projects.deinit();
+
+    var catalog = try ts.CatalogStore.open(allocator, io, cat_dir);
+    defer catalog.deinit();
+
+    const runner_a: u128 = 0xAA01;
+    const device_a: u128 = 0xDD01;
+    var root_key = crypto.AccountRootKey.generate(io);
+    defer root_key.zeroize();
+
+    var keyring = kr_mod.Keyring.initAccountDevice(allocator, io, root_key, runner_a);
+    defer keyring.deinit();
+
+    var leases = try lease_mod.LeaseManager.init(allocator, io, leases_state, runner_a, null);
+    defer leases.deinit();
+
+    var rt = try tr.ThreadRuntime.init(allocator, io, .{
+        .spaces = &spaces,
+        .projects = &projects,
+        .catalog = &catalog,
+        .keyring = &keyring,
+        .leases = &leases,
+        .providers = null,
+        .root_dir = runtime_state,
+        .runner_id = runner_a,
+        .device_id = device_a,
+    });
+    defer rt.deinit();
+
+    {
+        var meta = try rt.createThread(.{
+            .title = "Zero Repo Chat",
+            .provider_id = .mock,
+            .system_prompt = "Be concise.",
+        });
+        defer meta.deinit(allocator);
+        try testing.expectEqual(@as(usize, 0), meta.bindings.len);
+        try testing.expect(meta.root_checkpoint.isEmpty());
+        try testing.expectEqual(@as(usize, 0), spaces.spaceCount());
+        try testing.expectEqual(@as(u32, 0), spaces.hotCount());
+
+        const listed = try rt.listThreads(allocator, null);
+        defer {
+            for (listed) |*t| t.deinit(allocator);
+            allocator.free(listed);
+        }
+        try testing.expectEqual(@as(usize, 1), listed.len);
+        try testing.expectEqual(meta.thread_id, listed[0].thread_id);
+
+        var t1 = try rt.beginTurn(meta.thread_id, "Hello zero repo", .{});
+        defer t1.deinit(allocator);
+        try testing.expect(t1.pre_checkpoint.isEmpty());
+        try testing.expectEqual(@as(usize, 0), spaces.spaceCount());
+
+        var plan = try rt.resolveProviderStart(allocator, meta.thread_id, t1.turn_id, "Hello zero repo", &.{});
+        defer plan.deinit(allocator);
+        try testing.expect(!plan.start_request.hasLocalCwd());
+        try testing.expectEqual(@as(usize, 0), plan.start_request.mounts.len);
+        try testing.expect(plan.start_request.virtual_bridge == null);
+        try testing.expect(!plan.resumed_natively);
+
+        var post1 = try rt.completeTurn(meta.thread_id, t1.turn_id, "Hi back!", &.{}, .{ .tokens = 40, .cost_microusd = 500, .wall_ms = 12 }, null);
+        defer post1.deinit(allocator);
+        try testing.expect(post1.isEmpty());
+        try testing.expectEqual(@as(u32, 0), spaces.hotCount());
+
+        const q_follow = try rt.enqueueMessage(meta.thread_id, .follow_up, "later task", null, null);
+        const q_steer = try rt.enqueueMessage(meta.thread_id, .steer, "urgent steer", null, null);
+        var d1 = (try rt.dequeueNext(allocator, meta.thread_id)).?;
+        defer d1.deinit(allocator);
+        try testing.expectEqual(q_steer, d1.item_id);
+        try testing.expectEqual(tm.QueueStatus.dispatching, d1.status);
+        var d2 = (try rt.dequeueNext(allocator, meta.thread_id)).?;
+        defer d2.deinit(allocator);
+        try testing.expectEqual(q_follow, d2.item_id);
+        try testing.expect((try rt.dequeueNext(allocator, meta.thread_id)) == null);
+
+        var t2a = try rt.beginTurn(meta.thread_id, "Branch A", .{ .parent_msg_id = t1.turn_id });
+        defer t2a.deinit(allocator);
+        var p2a = try rt.completeTurn(meta.thread_id, t2a.turn_id, "Reply A", &.{}, .{}, null);
+        defer p2a.deinit(allocator);
+
+        var t2b = try rt.beginTurn(meta.thread_id, "Branch B", .{ .parent_msg_id = t1.turn_id });
+        defer t2b.deinit(allocator);
+        var p2b = try rt.completeTurn(meta.thread_id, t2b.turn_id, "Reply B", &.{}, .{}, null);
+        defer p2b.deinit(allocator);
+
+        const st_ptr = try rt.openThread(meta.thread_id);
+        {
+            const chain_b = try st_ptr.activeChain(allocator);
+            defer ts.ThreadStore.freeMessages(allocator, chain_b);
+            try testing.expectEqualStrings("Reply B", chain_b[chain_b.len - 1].content);
+        }
+
+        try rt.switchBranch(meta.thread_id, t1.turn_id, t2a.user_msg_id);
+        {
+            const chain_a = try st_ptr.activeChain(allocator);
+            defer ts.ThreadStore.freeMessages(allocator, chain_a);
+            try testing.expectEqualStrings("Reply A", chain_a[chain_a.len - 1].content);
+        }
+
+        var t3 = try rt.beginTurn(meta.thread_id, "To cancel", .{});
+        defer t3.deinit(allocator);
+        try rt.cancelTurn(meta.thread_id, t3.turn_id);
+        try testing.expectEqual(tm.MessageStatus.interrupted, st_ptr.messages.get(t3.turn_id).?.status);
+
+        const z_id = ondb.core.id.newUuidV7(io);
+        var zev = try st_ptr.appendEvent(runner_a, .{ .message_appended = .{
+            .msg_id = z_id,
+            .thread_id = meta.thread_id,
+            .parent_id = t2a.turn_id,
+            .role = .assistant,
+            .content = &.{},
+            .provider = .mock,
+            .runner_id = runner_a,
+            .fencing_epoch = 1,
+            .status = .running,
+            .created_ms = 100,
+            .updated_ms = 100,
+        } });
+        zev.deinit(allocator);
+        const rec_n = try rt.reconcileInterrupted(meta.thread_id);
+        try testing.expectEqual(@as(usize, 1), rec_n);
+        try testing.expectEqual(tm.MessageStatus.interrupted, st_ptr.messages.get(z_id).?.status);
+        try testing.expectEqual(@as(usize, 0), spaces.spaceCount());
+    }
+
+    {
+        var mem_rec = try spaces.createVirtual("grok-memory");
+        const mem_id = mem_rec.space_id;
+        mem_rec.deinit(allocator);
+
+        var ro_rec = try spaces.createVirtual("grok-readonly");
+        const ro_id = ro_rec.space_id;
+        ro_rec.deinit(allocator);
+
+        const init_bindings = [_]tm.SpaceBinding{
+            .{ .space_id = mem_id, .alias = @constCast("memory"), .access = .shared_rw },
+        };
+        var grok_meta = try rt.createThread(.{
+            .title = "Grok Bot",
+            .bindings = &init_bindings,
+            .provider_id = .grok,
+        });
+        defer grok_meta.deinit(allocator);
+        const digest_before = grok_meta.bindingsDigest();
+
+        try rt.bindSpace(grok_meta.thread_id, .{
+            .space_id = ro_id,
+            .alias = @constCast("rules"),
+            .access = .read_only,
+        });
+        var grok_meta2 = (try rt.getThreadMeta(allocator, grok_meta.thread_id)).?;
+        defer grok_meta2.deinit(allocator);
+        try testing.expectEqual(@as(usize, 2), grok_meta2.bindings.len);
+        try testing.expect(!std.mem.eql(u8, &digest_before, &grok_meta2.bindingsDigest()));
+
+        var turn1 = try rt.beginTurn(grok_meta.thread_id, "Save my preferences", .{});
+        defer turn1.deinit(allocator);
+
+        var plan = try rt.resolveProviderStart(allocator, grok_meta.thread_id, turn1.turn_id, "Save my preferences", &.{});
+        defer plan.deinit(allocator);
+        try testing.expect(!plan.start_request.hasLocalCwd());
+        try testing.expectEqual(@as(usize, 2), plan.start_request.mounts.len);
+        try testing.expect(plan.start_request.virtual_bridge != null);
+
+        const vb = plan.start_request.virtual_bridge.?;
+        try vb.write(mem_id, "notes/daily.md", "day 1: alpha needle\nline 2\n");
+        try vb.write(mem_id, "notes/todo.md", "buy milk\n");
+        try vb.edit(mem_id, "notes/daily.md", "alpha", "beta");
+
+        const daily = (try vb.read(allocator, mem_id, "notes/daily.md")).?;
+        defer allocator.free(daily);
+        try testing.expectEqualStrings("day 1: beta needle\nline 2\n", daily);
+
+        const dir_names = try vb.list(allocator, mem_id, "notes");
+        defer {
+            for (dir_names) |n| allocator.free(n);
+            allocator.free(dir_names);
+        }
+        try testing.expectEqual(@as(usize, 2), dir_names.len);
+        try testing.expectEqualStrings("daily.md", dir_names[0]);
+        try testing.expectEqualStrings("todo.md", dir_names[1]);
+
+        const hits = try vb.search(allocator, mem_id, "needle");
+        defer {
+            for (hits) |h| allocator.free(h);
+            allocator.free(hits);
+        }
+        try testing.expectEqual(@as(usize, 1), hits.len);
+        try testing.expect(std.mem.indexOf(u8, hits[0], "notes/daily.md:1:") != null);
+
+        try vb.metaSet(mem_id, "pref/theme", "dark");
+        try vb.metaSet(mem_id, "pref/lang", "zig");
+        const theme = (try vb.metaGet(allocator, mem_id, "pref/theme")).?;
+        defer allocator.free(theme);
+        try testing.expectEqualStrings("dark", theme);
+
+        const prefs = try plan.virtual_bridge_owner.?.listMetaPrefix(allocator, mem_id, "pref/");
+        defer {
+            for (prefs) |*p| p.deinit(allocator);
+            allocator.free(prefs);
+        }
+        try testing.expectEqual(@as(usize, 2), prefs.len);
+        try testing.expectEqualStrings("pref/lang", prefs[0].key);
+        try testing.expectEqualStrings("pref/theme", prefs[1].key);
+
+        try vb.delete(mem_id, "notes/todo.md");
+        try testing.expect((try vb.read(allocator, mem_id, "notes/todo.md")) == null);
+        try plan.virtual_bridge_owner.?.checkpoint(mem_id, .minor);
+
+        try testing.expectError(error.PermissionDenied, vb.write(ro_id, "x.txt", "no"));
+        try testing.expectError(error.PermissionDenied, vb.edit(ro_id, "x.txt", "a", "b"));
+        try testing.expectError(error.PermissionDenied, vb.delete(ro_id, "x.txt"));
+        try testing.expectError(error.PermissionDenied, vb.metaSet(ro_id, "k", "v"));
+
+        const mem_sp = try spaces.activate(mem_id);
+        const tl_entries = try tl.listEntriesForSpace(allocator, mem_sp, null, 20);
+        defer tl.freeTimelineEntries(allocator, tl_entries);
+        try testing.expect(tl_entries.len >= 2);
+
+        const diff_bytes = try tl.unifiedDiffForSpace(allocator, mem_sp, &.{tl_entries[0].batch_id});
+        defer allocator.free(diff_bytes);
+        try testing.expect(diff_bytes.len > 0);
+
+        const fchanges = try tl.foreignChangesForSpace(allocator, mem_sp, null, 0x999999);
+        defer tl.freeForeignChanges(allocator, fchanges);
+        try testing.expect(fchanges.len >= 1);
+        const xml = try tl.formatWorkspaceChangesXml(allocator, fchanges);
+        defer allocator.free(xml);
+        try testing.expect(std.mem.indexOf(u8, xml, "<workspace-changes>") != null);
+
+        var post1 = try rt.completeTurn(grok_meta.thread_id, turn1.turn_id, "Saved!", &.{}, .{}, null);
+        defer post1.deinit(allocator);
+
+        var turn2 = try rt.beginTurn(grok_meta.thread_id, "Hallucinate", .{});
+        defer turn2.deinit(allocator);
+        try vb.write(mem_id, "notes/daily.md", "CORRUPTED HALLUCINATION\n");
+        var post2 = try rt.completeTurn(grok_meta.thread_id, turn2.turn_id, "Oops", &.{}, .{}, null);
+        defer post2.deinit(allocator);
+
+        try testing.expect(try rt.unbindSpace(grok_meta.thread_id, ro_id));
+        const rb_res = try rt.rollbackThreadToMessage(grok_meta.thread_id, turn1.turn_id, .{});
+        try testing.expect(rb_res.completed);
+        try testing.expectEqual(@as(usize, 1), rb_res.spaces_rolled_back);
+
+        const restored = (try mem_sp.readFileAlloc(allocator, "notes/daily.md")).?;
+        defer allocator.free(restored);
+        try testing.expectEqualStrings("day 1: beta needle\nline 2\n", restored);
+
+        const sun_2026_01_04_09_15: u64 = 1767518100;
+        try testing.expect(try tr.matchesCron("*/5 * * * *", sun_2026_01_04_09_15));
+        try testing.expect(try tr.matchesCron("15 9 4 1 0", sun_2026_01_04_09_15));
+        try testing.expect(try tr.matchesCron("15 9 4 1 7", sun_2026_01_04_09_15));
+        try testing.expect(try tr.matchesCron("10-20 8-10 1,4,10 1 0-2", sun_2026_01_04_09_15));
+        try testing.expect(!(try tr.matchesCron("16 9 * * *", sun_2026_01_04_09_15)));
+        try testing.expect(!(try tr.matchesCron("*/5 10 * * *", sun_2026_01_04_09_15)));
+        try testing.expectError(error.InvalidCronExpression, tr.matchesCron("bad cron", sun_2026_01_04_09_15));
+        try testing.expectError(error.InvalidCronExpression, tr.matchesCron("*/0 * * * *", sun_2026_01_04_09_15));
+
+        const once_id = try rt.registerTrigger(grok_meta.thread_id, .{
+            .trigger_id = 0,
+            .thread_id = grok_meta.thread_id,
+            .kind = .{ .once = sun_2026_01_04_09_15 * 1000 },
+            .prompt_template = @constCast("one-shot wake"),
+            .created_ms = 1000,
+        });
+        const cron_id = try rt.registerTrigger(grok_meta.thread_id, .{
+            .trigger_id = 0,
+            .thread_id = grok_meta.thread_id,
+            .kind = .{ .cron = @constCast("*/5 9 * * 0") },
+            .prompt_template = @constCast("sunday morning digest"),
+            .created_ms = 1000,
+        });
+        const sc_id = try rt.registerTrigger(grok_meta.thread_id, .{
+            .trigger_id = 0,
+            .thread_id = grok_meta.thread_id,
+            .kind = .{ .space_changed = .{
+                .space_id = mem_id,
+                .path_prefix = @constCast("notes/"),
+                .debounce_ms = 0,
+            } },
+            .prompt_template = @constCast("memory updated"),
+            .created_ms = 1000,
+        });
+
+        const due1 = try rt.pollDueTriggers(allocator, grok_meta.thread_id, sun_2026_01_04_09_15 * 1000);
+        defer tr.freeDueTriggers(allocator, due1);
+        try testing.expectEqual(@as(usize, 2), due1.len);
+
+        for (due1) |d| {
+            try testing.expectEqual(tr.FireTriggerOutcome.fired, try rt.fireTrigger(grok_meta.thread_id, d.trigger_id, d.event_token, sun_2026_01_04_09_15 * 1000));
+            const second = try rt.fireTrigger(grok_meta.thread_id, d.trigger_id, d.event_token, sun_2026_01_04_09_15 * 1000 + 5);
+            if (d.trigger_id == once_id) {
+                try testing.expectEqual(tr.FireTriggerOutcome.disabled, second);
+            } else {
+                try testing.expectEqual(tr.FireTriggerOutcome.already_fired, second);
+            }
+        }
+
+        _ = try mem_sp.putFile(runner_a, "notes/new.md", "fresh insight\n");
+        const due2 = try rt.pollDueTriggers(allocator, grok_meta.thread_id, sun_2026_01_04_09_15 * 1000 + 100);
+        defer tr.freeDueTriggers(allocator, due2);
+        try testing.expectEqual(@as(usize, 1), due2.len);
+        try testing.expectEqual(sc_id, due2[0].trigger_id);
+
+        try testing.expectEqual(tr.FireTriggerOutcome.fired, try rt.fireTrigger(grok_meta.thread_id, sc_id, due2[0].event_token, sun_2026_01_04_09_15 * 1000 + 100));
+        try testing.expectEqual(tr.FireTriggerOutcome.already_fired, try rt.fireTrigger(grok_meta.thread_id, sc_id, due2[0].event_token, sun_2026_01_04_09_15 * 1000 + 101));
+
+        try rt.disableTrigger(grok_meta.thread_id, cron_id);
+        try testing.expectEqual(tr.FireTriggerOutcome.disabled, try rt.fireTrigger(grok_meta.thread_id, cron_id, "cron:9999999", sun_2026_01_04_09_15 * 1000 + 200));
+
+        const tr_list = try rt.listTriggers(allocator, grok_meta.thread_id);
+        defer {
+            for (tr_list) |*x| x.deinit(allocator);
+            allocator.free(tr_list);
+        }
+        try testing.expectEqual(@as(usize, 3), tr_list.len);
+    }
+
+    {
+        const repo1_dir = root ++ "/repo1";
+        const repo2_dir = root ++ "/repo2";
+        try std.Io.Dir.cwd().createDirPath(io, repo1_dir);
+        try std.Io.Dir.cwd().createDirPath(io, repo2_dir);
+        try writeVerifyFile(io, repo1_dir ++ "/a.txt", "v0-a\n");
+        try writeVerifyFile(io, repo2_dir ++ "/b.txt", "v0-b\n");
+
+        var r1 = try spaces.adoptLocal(repo1_dir, "repo1");
+        const id1 = r1.space_id;
+        r1.deinit(allocator);
+
+        var r2 = try spaces.adoptLocal(repo2_dir, "repo2");
+        const id2 = r2.space_id;
+        r2.deinit(allocator);
+
+        var proj = try projects.create("Two-Repo Project", "Sync both repos.", @backingInt(iface.ProviderId.mock), null);
+        const proj_id = proj.project_id;
+        proj.deinit(allocator);
+        try projects.addSpace(proj_id, .{ .space_id = id1, .alias = @constCast("repo1"), .kind = .dir, .default_access = @backingInt(tm.SpaceAccess.shared_rw) });
+        try projects.addSpace(proj_id, .{ .space_id = id2, .alias = @constCast("repo2"), .kind = .dir, .default_access = @backingInt(tm.SpaceAccess.shared_rw) });
+
+        var tmeta = try rt.createThread(.{
+            .title = "Multi-Repo Rollback Thread",
+            .project_id = proj_id,
+            .provider_id = .mock,
+        });
+        defer tmeta.deinit(allocator);
+        try testing.expectEqual(@as(usize, 2), tmeta.bindings.len);
+
+        var turn1 = try rt.beginTurn(tmeta.thread_id, "Update v1", .{});
+        defer turn1.deinit(allocator);
+        const sp1 = try spaces.activate(id1);
+        const sp2 = try spaces.activate(id2);
+        _ = try sp1.putFile(runner_a, "a.txt", "v1-a\n");
+        if (try spaces.activateProjection(id1)) |p1| try p1.materializeChanged();
+        _ = try sp2.putFile(runner_a, "b.txt", "v1-b\n");
+        if (try spaces.activateProjection(id2)) |p2| try p2.materializeChanged();
+        var post1 = try rt.completeTurn(tmeta.thread_id, turn1.turn_id, "Done v1", &.{}, .{}, null);
+        defer post1.deinit(allocator);
+
+        var turn2 = try rt.beginTurn(tmeta.thread_id, "Update v2", .{});
+        defer turn2.deinit(allocator);
+        _ = try sp1.putFile(runner_a, "a.txt", "v2-a\n");
+        if (try spaces.activateProjection(id1)) |p1| try p1.materializeChanged();
+        _ = try sp2.putFile(runner_a, "b.txt", "v2-b\n");
+        if (try spaces.activateProjection(id2)) |p2| try p2.materializeChanged();
+        var post2 = try rt.completeTurn(tmeta.thread_id, turn2.turn_id, "Done v2", &.{}, .{}, null);
+        defer post2.deinit(allocator);
+
+        {
+            var bad_cp = try post1.clone(allocator);
+            defer bad_cp.deinit(allocator);
+            var bad_ver = ondb.core.version.Version{};
+            defer bad_ver.deinit(allocator);
+            try bad_ver.insert(allocator, ondb.core.id.OpId.init(999999, 0xBAD));
+            var bogus = tm.SpaceCheckpoint{
+                .space_id = id2,
+                .version = bad_ver,
+            };
+            try bad_cp.setSpace(allocator, bogus);
+            _ = &bogus;
+
+            const bad_msg_id = ondb.core.id.newUuidV7(io);
+            const st_ptr = try rt.openThread(tmeta.thread_id);
+            var bev = try st_ptr.appendEvent(runner_a, .{ .message_appended = .{
+                .msg_id = bad_msg_id,
+                .thread_id = tmeta.thread_id,
+                .parent_id = turn2.turn_id,
+                .role = .assistant,
+                .content = @constCast("bad cp"),
+                .provider = .mock,
+                .post_checkpoint = bad_cp,
+                .status = .completed,
+                .created_ms = 500,
+                .updated_ms = 500,
+            } });
+            bev.deinit(allocator);
+
+            try testing.expectError(error.RollbackTargetInvalid, rt.rollbackThreadToMessage(tmeta.thread_id, bad_msg_id, .{}));
+            try testing.expect(st_ptr.pendingRollback() == null);
+
+            const a_untouched = (try sp1.readFileAlloc(allocator, "a.txt")).?;
+            defer allocator.free(a_untouched);
+            try testing.expectEqualStrings("v2-a\n", a_untouched);
+        }
+
+        const partial = try rt.rollbackThreadToMessage(tmeta.thread_id, turn1.turn_id, .{
+            .simulate_crash_after_space_index = 0,
+        });
+        try testing.expect(!partial.completed);
+        try testing.expectEqual(@as(usize, 1), partial.spaces_rolled_back);
+
+        const low_id = @min(id1, id2);
+        const high_id = @max(id1, id2);
+        const low_file = if (low_id == id1) "a.txt" else "b.txt";
+        const high_file = if (high_id == id1) "a.txt" else "b.txt";
+        const low_v1 = if (low_id == id1) "v1-a\n" else "v1-b\n";
+        const high_v2 = if (high_id == id1) "v2-a\n" else "v2-b\n";
+
+        {
+            const low_sp = try spaces.activate(low_id);
+            const lb = (try low_sp.readFileAlloc(allocator, low_file)).?;
+            defer allocator.free(lb);
+            try testing.expectEqualStrings(low_v1, lb);
+
+            const high_sp = try spaces.activate(high_id);
+            const hb = (try high_sp.readFileAlloc(allocator, high_file)).?;
+            defer allocator.free(hb);
+            try testing.expectEqualStrings(high_v2, hb);
+        }
+
+        rt.closeThread(tmeta.thread_id);
+        const st_reopened = try rt.openThread(tmeta.thread_id);
+        try testing.expect(st_reopened.pendingRollback() != null);
+
+        const rec = (try rt.recoverPendingRollbacks(tmeta.thread_id)).?;
+        try testing.expect(rec.completed);
+        try testing.expectEqual(@as(usize, 1), rec.spaces_rolled_back);
+        try testing.expect(st_reopened.pendingRollback() == null);
+
+        const a_after = (try (try spaces.activate(id1)).readFileAlloc(allocator, "a.txt")).?;
+        defer allocator.free(a_after);
+        try testing.expectEqualStrings("v1-a\n", a_after);
+
+        const b_after = (try (try spaces.activate(id2)).readFileAlloc(allocator, "b.txt")).?;
+        defer allocator.free(b_after);
+        try testing.expectEqualStrings("v1-b\n", b_after);
+
+        const a_disk = try readDiskPathAlloc(allocator, io, repo1_dir ++ "/a.txt");
+        defer allocator.free(a_disk);
+        try testing.expectEqualStrings("v1-a\n", a_disk);
+
+        const b_disk = try readDiskPathAlloc(allocator, io, repo2_dir ++ "/b.txt");
+        defer allocator.free(b_disk);
+        try testing.expectEqualStrings("v1-b\n", b_disk);
+    }
+
+    {
+        var rw_rec = try spaces.createVirtual("captain-rw");
+        const s_rw = rw_rec.space_id;
+        rw_rec.deinit(allocator);
+
+        var ro_rec = try spaces.createVirtual("captain-ro");
+        const s_ro = ro_rec.space_id;
+        ro_rec.deinit(allocator);
+
+        {
+            const srw = try spaces.activate(s_rw);
+            _ = try srw.putFile(runner_a, "base.txt", "base-content\n");
+        }
+
+        const cap_bindings = [_]tm.SpaceBinding{
+            .{ .space_id = s_rw, .alias = @constCast("rw"), .access = .shared_rw },
+            .{ .space_id = s_ro, .alias = @constCast("ro"), .access = .read_only },
+        };
+        var cap_meta = try rt.createThread(.{
+            .title = "Captain",
+            .bindings = &cap_bindings,
+            .budget = .{
+                .max_tokens = 1000,
+                .max_cost_microusd = 100_000,
+                .max_wall_ms = 60_000,
+                .max_depth = 3,
+                .max_children = 8,
+            },
+        });
+        defer cap_meta.deinit(allocator);
+
+        try testing.expectError(
+            error.AccessEscalation,
+            rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+                .title = "escalate",
+                .grants = &.{.{ .space_id = s_ro, .alias = @constCast("ro"), .access = .shared_rw }},
+                .budget = .{ .max_tokens = 100, .max_cost_microusd = 10_000, .max_wall_ms = 5_000 },
+            }),
+        );
+
+        try testing.expectError(
+            error.UnauthorizedSpaceGrant,
+            rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+                .title = "unknown-space",
+                .grants = &.{.{ .space_id = 0xDEADBEEF, .alias = @constCast("x"), .access = .read_only }},
+                .budget = .{ .max_tokens = 100, .max_cost_microusd = 10_000, .max_wall_ms = 5_000 },
+            }),
+        );
+
+        try testing.expectError(
+            error.BudgetExceeded,
+            rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+                .title = "over-budget",
+                .grants = &.{.{ .space_id = s_ro, .alias = @constCast("ro"), .access = .read_only }},
+                .budget = .{ .max_tokens = 2000, .max_cost_microusd = 10_000, .max_wall_ms = 5_000 },
+            }),
+        );
+
+        var sub_kr = kr_mod.Keyring.initSubordinateDevice(allocator, io, 0x50B1);
+        defer sub_kr.deinit();
+
+        var w1 = try rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+            .title = "worker-1",
+            .prompt = "implement feature 1",
+            .grants = &.{
+                .{ .space_id = s_rw, .alias = @constCast("rw"), .access = .isolated_fork },
+                .{ .space_id = s_ro, .alias = @constCast("ro"), .access = .read_only },
+            },
+            .budget = .{ .max_tokens = 200, .max_cost_microusd = 20_000, .max_wall_ms = 10_000 },
+            .target_runner_id = 0x50B1,
+            .target_runner_pubkey = sub_kr.device_keypair.public_key,
+        });
+        defer w1.deinit(allocator);
+        try testing.expectEqual(tm.TaskStatus.ready, w1.status);
+        try testing.expectEqual(@as(usize, 1), w1.forked_space_ids.len);
+        try testing.expect(w1.delegation_bundle != null);
+        try testing.expect(w1.sealed_delegation != null);
+
+        const parent_inbox_topic = tr.topicId(.mailbox, cap_meta.thread_id);
+        const parent_thread_topic = tr.topicId(.thread, cap_meta.thread_id);
+        var saw_parent_inbox = false;
+        var saw_parent_thread = false;
+        for (w1.delegation_bundle.?.grants) |g| {
+            if (std.mem.eql(u8, &g.topic_id, &parent_inbox_topic)) {
+                saw_parent_inbox = true;
+                try testing.expectEqual(wire.PERM_INBOX_APPEND, g.perms);
+            }
+            if (std.mem.eql(u8, &g.topic_id, &parent_thread_topic)) {
+                saw_parent_thread = true;
+            }
+        }
+        try testing.expect(saw_parent_inbox);
+        try testing.expect(!saw_parent_thread);
+
+        const imported_n = try sub_kr.importDelegationBundle(w1.sealed_delegation.?);
+        try testing.expect(imported_n >= 4);
+        try testing.expect(sub_kr.getTopicGrant(parent_thread_topic) == null);
+        try testing.expectEqual(wire.PERM_INBOX_APPEND, sub_kr.getTopicGrant(parent_inbox_topic).?.perms);
+
+        var w2 = try rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+            .title = "worker-2",
+            .grants = &.{.{ .space_id = s_rw, .alias = @constCast("rw"), .access = .isolated_fork }},
+            .budget = .{ .max_tokens = 200, .max_cost_microusd = 20_000, .max_wall_ms = 10_000 },
+        });
+        defer w2.deinit(allocator);
+
+        var w3 = try rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+            .title = "worker-3",
+            .grants = &.{.{ .space_id = s_rw, .alias = @constCast("rw"), .access = .isolated_fork }},
+            .budget = .{ .max_tokens = 200, .max_cost_microusd = 20_000, .max_wall_ms = 10_000 },
+        });
+        defer w3.deinit(allocator);
+
+        const deps = [_]u128{ w1.task_id, w2.task_id, w3.task_id };
+        var synth = try rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+            .title = "synthesizer",
+            .grants = &.{.{ .space_id = s_rw, .alias = @constCast("rw"), .access = .read_only }},
+            .depends_on = &deps,
+            .join_quorum = 2,
+            .budget = .{ .max_tokens = 200, .max_cost_microusd = 20_000, .max_wall_ms = 10_000 },
+        });
+        defer synth.deinit(allocator);
+        try testing.expectEqual(tm.TaskStatus.pending, synth.status);
+
+        {
+            const f1 = try spaces.activate(w1.forked_space_ids[0]);
+            _ = try f1.putFile(w1.child_thread_id, "worker1.txt", "from worker 1\n");
+            const f2 = try spaces.activate(w2.forked_space_ids[0]);
+            _ = try f2.putFile(w2.child_thread_id, "worker2.txt", "from worker 2\n");
+        }
+
+        const r1_ready = try rt.settleTask(cap_meta.thread_id, w1.task_id, .completed, "w1 done", .{
+            .used_tokens = 80,
+            .used_cost_microusd = 8_000,
+            .used_wall_ms = 1_000,
+        });
+        try testing.expectEqual(@as(usize, 0), r1_ready);
+
+        {
+            var cm_after1 = (try rt.getThreadMeta(allocator, cap_meta.thread_id)).?;
+            defer cm_after1.deinit(allocator);
+            try testing.expectEqual(@as(u64, 680), cm_after1.budget.used_tokens);
+            try testing.expectEqual(@as(u64, 68_000), cm_after1.budget.used_cost_microusd);
+        }
+
+        const r2_ready = try rt.settleTask(cap_meta.thread_id, w2.task_id, .completed, "w2 done", .{
+            .used_tokens = 50,
+            .used_cost_microusd = 5_000,
+            .used_wall_ms = 1_000,
+        });
+        try testing.expectEqual(@as(usize, 1), r2_ready);
+
+        const cap_store = try rt.openThread(cap_meta.thread_id);
+        try testing.expectEqual(tm.TaskStatus.ready, cap_store.tasks.get(synth.task_id).?.status);
+
+        try testing.expectError(
+            error.InvalidTaskTransition,
+            rt.settleTask(cap_meta.thread_id, w2.task_id, .failed, "cannot regress", null),
+        );
+
+        const inbox_items = try rt.drainMailbox(allocator, cap_meta.thread_id);
+        defer {
+            for (inbox_items) |*m| m.deinit(allocator);
+            allocator.free(inbox_items);
+        }
+        try testing.expectEqual(@as(usize, 2), inbox_items.len);
+        try testing.expectEqual(@as(usize, 0), try rt.unreadMailboxCount(cap_meta.thread_id));
+
+        var land1 = try rt.landSubordinateForks(allocator, cap_meta.thread_id, w1.task_id);
+        defer land1.deinit(allocator);
+        try testing.expect(!land1.aborted);
+        try testing.expectEqual(@as(usize, 1), land1.entries.len);
+
+        var land2 = try rt.landSubordinateForks(allocator, cap_meta.thread_id, w2.task_id);
+        defer land2.deinit(allocator);
+        try testing.expect(!land2.aborted);
+        try testing.expectEqual(@as(usize, 1), land2.entries.len);
+
+        {
+            const origin_sp = try spaces.activate(s_rw);
+            const c1 = (try origin_sp.readFileAlloc(allocator, "worker1.txt")).?;
+            defer allocator.free(c1);
+            try testing.expectEqualStrings("from worker 1\n", c1);
+            const c2 = (try origin_sp.readFileAlloc(allocator, "worker2.txt")).?;
+            defer allocator.free(c2);
+            try testing.expectEqualStrings("from worker 2\n", c2);
+        }
+
+        _ = try rt.settleTask(cap_meta.thread_id, w3.task_id, .failed, "transient error", .{ .used_tokens = 10, .used_cost_microusd = 1_000, .used_wall_ms = 500 });
+        const retry_id = try rt.retryTask(cap_meta.thread_id, w3.task_id);
+        const retry_task = cap_store.tasks.get(retry_id).?;
+        try testing.expectEqual(@as(u32, 2), retry_task.attempt);
+        try testing.expectEqual(tm.TaskStatus.ready, retry_task.status);
+        try testing.expectEqual(tm.TaskStatus.failed, cap_store.tasks.get(w3.task_id).?.status);
+
+        var sub_parent = try rt.spawnSubordinate(allocator, cap_meta.thread_id, .{
+            .title = "sub-parent",
+            .grants = &.{.{ .space_id = s_ro, .alias = @constCast("ro"), .access = .read_only }},
+            .budget = .{ .max_tokens = 150, .max_cost_microusd = 15_000, .max_wall_ms = 5_000, .max_depth = 3, .max_children = 4 },
+        });
+        defer sub_parent.deinit(allocator);
+
+        var sub_grandchild = try rt.spawnSubordinate(allocator, sub_parent.child_thread_id, .{
+            .title = "sub-grandchild",
+            .grants = &.{.{ .space_id = s_ro, .alias = @constCast("ro"), .access = .read_only }},
+            .budget = .{ .max_tokens = 50, .max_cost_microusd = 5_000, .max_wall_ms = 2_000 },
+        });
+        defer sub_grandchild.deinit(allocator);
+
+        var bt_child = try rt.beginTurn(sub_parent.child_thread_id, "child work", .{});
+        defer bt_child.deinit(allocator);
+        var bt_gc = try rt.beginTurn(sub_grandchild.child_thread_id, "grandchild work", .{});
+        defer bt_gc.deinit(allocator);
+
+        const c_rep = try rt.cancelTree(sub_parent.child_thread_id, "abort subtree");
+        try testing.expectEqual(@as(usize, 2), c_rep.canceled_threads);
+        try testing.expectEqual(@as(usize, 1), c_rep.canceled_tasks);
+        try testing.expectEqual(@as(usize, 2), c_rep.canceled_leases);
+
+        const sp_store = try rt.openThread(sub_parent.child_thread_id);
+        try testing.expect(sp_store.canceled);
+        try testing.expectEqual(tm.TaskStatus.canceled, sp_store.tasks.get(sub_grandchild.task_id).?.status);
+
+        const gc_store = try rt.openThread(sub_grandchild.child_thread_id);
+        try testing.expect(gc_store.canceled);
+
+        const child_lease_st = try leases.status(tr.topicId(.thread, sub_parent.child_thread_id));
+        try testing.expect(child_lease_st.canceled);
+        const gc_lease_st = try leases.status(tr.topicId(.thread, sub_grandchild.child_thread_id));
+        try testing.expect(gc_lease_st.canceled);
+
+        const gc_mb = try rt.drainMailbox(allocator, sub_grandchild.child_thread_id);
+        defer {
+            for (gc_mb) |*m| m.deinit(allocator);
+            allocator.free(gc_mb);
+        }
+        var saw_cancel_mb = false;
+        for (gc_mb) |m| {
+            if (m.kind == .cancel) saw_cancel_mb = true;
+        }
+        try testing.expect(saw_cancel_mb);
+    }
+
+    {
+        var psp = try spaces.createVirtual("portable-space");
+        const psp_id = psp.space_id;
+        psp.deinit(allocator);
+
+        var psp2 = try spaces.createVirtual("portable-space-extra");
+        const psp2_id = psp2.space_id;
+        psp2.deinit(allocator);
+
+        var pmeta = try rt.createThread(.{
+            .title = "Portable Cursor Thread",
+            .bindings = &.{.{ .space_id = psp_id, .alias = @constCast("main"), .access = .shared_rw }},
+            .provider_id = .claude_code,
+        });
+        defer pmeta.deinit(allocator);
+
+        var t1 = try rt.beginTurn(pmeta.thread_id, "First prompt", .{ .provider = .claude_code });
+        defer t1.deinit(allocator);
+        var post1 = try rt.completeTurn(
+            pmeta.thread_id,
+            t1.turn_id,
+            "First answer",
+            &.{},
+            .{},
+            .{
+                .provider = .claude_code,
+                .runner_id = runner_a,
+                .scope = .local_process,
+                .native_session = @constCast("claude-local-42"),
+                .bindings_digest = pmeta.bindingsDigest(),
+            },
+        );
+        defer post1.deinit(allocator);
+
+        var t2 = try rt.beginTurn(pmeta.thread_id, "Second prompt", .{ .provider = .claude_code });
+        defer t2.deinit(allocator);
+
+        var same_plan = try rt.resolveProviderStart(allocator, pmeta.thread_id, t2.turn_id, "Second prompt", &.{});
+        defer same_plan.deinit(allocator);
+        try testing.expect(same_plan.resumed_natively);
+        try testing.expectEqualStrings("claude-local-42", same_plan.resume_session_id.?);
+        try testing.expect(same_plan.fallback_prompt_history == null);
+
+        try rt.cancelTurn(pmeta.thread_id, t2.turn_id);
+
+        const runner_b: u128 = 0xBB02;
+        var leases_b = try lease_mod.LeaseManager.init(allocator, io, leases_state, runner_b, null);
+        defer leases_b.deinit();
+        var rt_b = try tr.ThreadRuntime.init(allocator, io, .{
+            .spaces = &spaces,
+            .projects = &projects,
+            .catalog = &catalog,
+            .keyring = &keyring,
+            .leases = &leases_b,
+            .providers = null,
+            .root_dir = runtime_state,
+            .runner_id = runner_b,
+            .device_id = 0xDD02,
+        });
+        defer rt_b.deinit();
+
+        var handoff_plan = try rt_b.resolveProviderStart(allocator, pmeta.thread_id, 0, "Continued in cloud", &.{});
+        defer handoff_plan.deinit(allocator);
+        try testing.expect(!handoff_plan.resumed_natively);
+        try testing.expect(handoff_plan.resume_session_id == null);
+        try testing.expect(handoff_plan.fallback_prompt_history != null);
+        try testing.expect(std.mem.indexOf(u8, handoff_plan.fallback_prompt_history.?, "First answer") != null);
+
+        var t3 = try rt.beginTurn(pmeta.thread_id, "Cloud turn", .{ .provider = .claude_code });
+        defer t3.deinit(allocator);
+        var post3 = try rt.completeTurn(
+            pmeta.thread_id,
+            t3.turn_id,
+            "Cloud reply",
+            &.{},
+            .{},
+            .{
+                .provider = .claude_code,
+                .runner_id = runner_a,
+                .scope = .cloud_hosted,
+                .native_session = @constCast("cloud-sess-99"),
+                .bindings_digest = pmeta.bindingsDigest(),
+            },
+        );
+        defer post3.deinit(allocator);
+
+        rt_b.closeThread(pmeta.thread_id);
+        var cloud_plan = try rt_b.resolveProviderStart(allocator, pmeta.thread_id, 0, "Resume cloud", &.{});
+        defer cloud_plan.deinit(allocator);
+        try testing.expect(cloud_plan.resumed_natively);
+        try testing.expectEqualStrings("cloud-sess-99", cloud_plan.resume_session_id.?);
+
+        try rt.bindSpace(pmeta.thread_id, .{ .space_id = psp2_id, .alias = @constCast("extra"), .access = .read_only });
+        var changed_bind_plan = try rt.resolveProviderStart(allocator, pmeta.thread_id, 0, "After rebind", &.{});
+        defer changed_bind_plan.deinit(allocator);
+        try testing.expect(!changed_bind_plan.resumed_natively);
+        try testing.expect(changed_bind_plan.resume_session_id == null);
+        try testing.expect(changed_bind_plan.fallback_prompt_history != null);
     }
 }
