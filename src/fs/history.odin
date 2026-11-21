@@ -1381,20 +1381,25 @@ text_targets :: proc(b: ^crdt.Batch, allocator: runtime.Allocator) -> []crdt.Op_
 
 @(private)
 apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error {
-	first, skip, gerr := crdt.graph_add(&h.g, b)
-	if gerr != .None {
-		return .Corrupt
-	}
-	n := crdt.batch_len(b)
 	targets := text_targets(b, context.temp_allocator)
-	for t in targets {
-		ino := op_inode(h, t)
-		f := history_file(h, ino) or_return
+	files := make([]^File_State, len(targets), context.temp_allocator)
+	for t, i in targets {
+		f := history_file(h, op_inode(h, t)) or_return
 		if f.from_cp && !descends_from_cp(h, f, b) {
 			prev := make([dynamic]crdt.Lv, context.temp_allocator)
 			append(&prev, ..f.text.version[:])
 			load_text(h, f, prev[:], true) or_return
 		}
+		files[i] = f
+	}
+	first, skip, gerr := crdt.graph_add(&h.g, b)
+	if gerr != .None {
+		return .Corrupt
+	}
+	n := crdt.batch_len(b)
+	for t, i in targets {
+		ino := op_inode(h, t)
+		f := files[i]
 		append(&f.new_refs, Op_Ref{stream, off, u32(skip), u32(n)})
 		f.dirty = true
 		note_touched(h, ino)
@@ -1403,9 +1408,9 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 	}
 	lvidx_add(h, first, n - skip, stream, off)
 	apply_tree_ops(h, b, first, skip, stream, off) or_return
-	for t in targets {
+	for t, i in targets {
 		ino := op_inode(h, t)
-		f := h.files[ino]
+		f := files[i]
 		found := make([dynamic]crdt.Conflict, context.temp_allocator)
 		if e := crdt.text_merge(&f.text, &h.g, &f.log, h.g.heads[:], &found); e != .None {
 			return .Corrupt
