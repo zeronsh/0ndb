@@ -1202,9 +1202,6 @@ _card_want :: proc(s: ^Session, device: prim.Id) {
 }
 
 @(private)
-CARD_RECORD :: u8(1)
-
-@(private)
 _card_landed :: proc(s: ^Session, rm: ^Remote) {
 	n := journal.replica_length(&rm.rep)
 	if n == 0 {
@@ -1233,7 +1230,7 @@ _card_landed :: proc(s: ^Session, rm: ^Remote) {
 		if err != .None {
 			break
 		}
-		card := body[1:] if len(body) == 1 + osync.CARD_LEN && body[0] == CARD_RECORD else body
+		card := osync.card_record_body(body)
 		id, cerr := osync.card_verify(card)
 		if pos == 0 && (cerr != .None || id.id != rm.device) {
 			return
