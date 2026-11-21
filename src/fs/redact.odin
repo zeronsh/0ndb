@@ -231,7 +231,8 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 			got += max(n - (lv - first), 1)
 		}
 	}
-	for ino, secret in touched {
+	for ino in sorted_inodes(touched) {
+		secret := touched[ino]
 		history_unload_files(h)
 		f := history_file(h, ino) or_return
 		for sp in spans {

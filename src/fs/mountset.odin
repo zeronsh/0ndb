@@ -173,10 +173,7 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 	defer fstree.snapshot_destroy(&snap_c)
 	snap_t := version_snapshot(h, tl[:]) or_return
 	defer fstree.snapshot_destroy(&snap_t)
-	order := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
-	for ino in touched {
-		append(&order, ino)
-	}
+	order := sorted_inodes(touched)
 	b: Builder
 	builder_init(&b, h, m.actor)
 	for ino in order {

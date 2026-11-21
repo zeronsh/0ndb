@@ -97,7 +97,7 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	defer fstree.snapshot_destroy(&snap_c)
 	b: Builder
 	builder_init(&b, h, m.actor)
-	for ino in touched {
+	for ino in sorted_inodes(touched) {
 		ib, okb, e1 := fstree.info(&snap_b, ino, context.temp_allocator)
 		ia, oka, e2 := fstree.info(&snap_a, ino, context.temp_allocator)
 		ic, okc, e3 := fstree.info(&snap_c, ino, context.temp_allocator)

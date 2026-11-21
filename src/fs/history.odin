@@ -84,6 +84,7 @@ History_Options :: struct {
 	chain:         Maybe(journal.Chain),
 	keep_at_least: i64,
 	clock:         Clock,
+	random:        prim.Random,
 }
 
 History :: struct {
@@ -146,6 +147,23 @@ history_wall_ms :: proc(h: ^History) -> i64 {
 		return h.opts.clock.wall_ms(h.opts.clock.data)
 	}
 	return prim.now_ms()
+}
+
+history_wall_ns :: proc(h: ^History) -> i64 {
+	if h.opts.clock.wall_ms != nil {
+		return h.opts.clock.wall_ms(h.opts.clock.data) * 1_000_000
+	}
+	return prim.now_ns()
+}
+
+history_id_new :: proc(h: ^History) -> prim.Id {
+	c := prim.Clock {
+		data    = h,
+		wall_ns = proc(data: rawptr) -> i64 {
+			return history_wall_ns((^History)(data))
+		},
+	}
+	return prim.id_new_with(c, h.opts.random)
 }
 
 history_close :: proc(h: ^History) {
@@ -632,6 +650,13 @@ history_persist :: proc(h: ^History) -> Error {
 	if derr != nil {
 		return .No_Memory
 	}
+	slice.sort_by(inodes, inode_less)
+	slice.sort_by(nodes, proc(a, b: fstree.Node_State) -> bool {
+		if a.key.dir != b.key.dir {
+			return inode_less(a.key.dir, b.key.dir)
+		}
+		return a.key.node < b.key.node
+	})
 	for id in inodes {
 		clear(&buf)
 		if fstree.encode_inode_record(&h.tree, id, &buf) {
@@ -652,8 +677,8 @@ history_persist :: proc(h: ^History) -> Error {
 	fstree.mark_persisted(&h.tree)
 	persist_moves(h) or_return
 	pins_persist(h) or_return
-	for id, f in h.files {
-		if f.dirty {
+	for id in sorted_inodes(h.files) {
+		if f := h.files[id]; f.dirty {
 			persist_file(h, id, f) or_return
 		}
 	}

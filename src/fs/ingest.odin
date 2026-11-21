@@ -764,7 +764,8 @@ import_cache_tree :: proc(m: ^Mount, dirty: ^map[string]bool) -> Error {
 		return .None
 	}
 	defer cache_tree_destroy(&ct)
-	for dir, node in ct.nodes {
+	for dir in sorted_strings(ct.nodes) {
+		node := ct.nodes[dir]
 		if dirty[dir] {
 			continue
 		}
@@ -864,7 +865,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 	p.young = make([dynamic]string, p.long)
 	p.scope_of = make(map[string]^Scope, p.long)
 	p.settle = settle && !p.git_wrote
-	p.cutoff = prim.now_ns() - m.opts.settle_ms * 1_000_000
+	p.cutoff = history_wall_ns(m.history) - m.opts.settle_ms * 1_000_000
 	p.full = full || m.rescan || p.git_wrote
 	m.hold_line = p.git_wrote
 	defer m.hold_line = false
@@ -1449,7 +1450,7 @@ compare_dir :: proc(p: ^Pass, rel: string) -> Error {
 		}
 		pass_maybe_flush(p) or_return
 	}
-	for name in names {
+	for name in sorted_strings(names) {
 		found := false
 		for k in kids {
 			if k.name == name {
@@ -1607,15 +1608,8 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 			add_remove_tree(p, child, k.entry) or_return
 			continue
 		}
-		key: string
-		for n in names {
-			if n == k.name {
-				key = n
-				break
-			}
-		}
-		delete_key(&names, k.name)
-		delete(key, heap)
+		dk, _ := delete_key(&names, k.name)
+		delete(dk, heap)
 		dp := probe(m, child)
 		if k.entry.kind == .Dir && dp.kind == .Dir {
 			c, _ := clone_string(child, heap)
@@ -1630,7 +1624,7 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		}
 		pass_maybe_flush(p) or_return
 	}
-	for name in names {
+	for name in sorted_strings(names) {
 		child, ok := path_join_buf(cbuf[:], rel, name)
 		if !ok {
 			continue

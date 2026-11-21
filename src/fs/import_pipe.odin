@@ -6,6 +6,7 @@ import "core:sync"
 import "core:thread"
 import "../crdt"
 import "../odb"
+import "../prim"
 
 @(private)
 Pipe_Shadow :: struct {
@@ -47,6 +48,7 @@ Pipe :: struct {
 	maps:    sync.Mutex,
 	shadow:  sync.Mutex,
 	trees:   bool,
+	inline:  bool,
 	seq:     u64,
 	lamport: u64,
 	parents: [dynamic]crdt.Op_Id,
@@ -162,8 +164,9 @@ import_dir_pop :: proc(st: ^Import_State) -> Error {
 pipe_start :: proc(st: ^Import_State, p: ^Pipe) -> Error {
 	m := st.m
 	p^ = {
-		m     = m,
-		trees = !m.has_git,
+		m      = m,
+		trees  = !m.has_git,
+		inline = m.vfs.procs != prim.os_vfs().procs,
 	}
 	p.parents = make([dynamic]crdt.Op_Id, st.long)
 	append(&p.parents, ..m.synced[:])
@@ -177,6 +180,9 @@ pipe_start :: proc(st: ^Import_State, p: ^Pipe) -> Error {
 	c := chunk_new(st) or_return
 	st.cur = c
 	st.packp = &c.pack
+	if p.inline {
+		return .None
+	}
 	p.worker = thread.create_and_start_with_data(p, pipe_main, context)
 	p.worker_b = thread.create_and_start_with_data(p, pipe_main_b, context)
 	if p.worker == nil || p.worker_b == nil {
@@ -218,11 +224,34 @@ pipe_rotate :: proc(st: ^Import_State, final: bool) -> Error {
 		clear(&p.parents)
 		append(&p.parents, crdt.Op_Id{st.b.actor, c.seq0 + u64(c.n) - 1})
 	}
+	err: Error
+	if p.inline {
+		err = pipe_stage_a(p, c)
+		if err == .None {
+			err = pipe_stage_b(p, c)
+		}
+		chunk_free(c)
+		st.cur = nil
+		st.packp = nil
+		if err != .None {
+			p.err = err
+			return err
+		}
+		if final {
+			return .None
+		}
+		n := chunk_new(st) or_return
+		st.cur = n
+		st.packp = &n.pack
+		st.use_pack = n.has_pack
+		st.files = 0
+		return .None
+	}
 	sync.mutex_lock(&p.mutex)
 	for p.slot != nil && p.err == .None {
 		sync.cond_wait(&p.cond, &p.mutex)
 	}
-	err := p.err
+	err = p.err
 	if err == .None {
 		p.slot = c
 		sync.cond_broadcast(&p.cond)

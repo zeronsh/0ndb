@@ -219,12 +219,9 @@ _unwatch_mount :: proc(reg: ^Registry, m: ^Mount) {
 	}
 }
 
-watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd: i32, err: Error) {
+@(private)
+_os_watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd: i32, err: Error) {
 	return -1, .None
-}
-
-watch_exhausted :: proc(reg: ^Registry) -> bool {
-	return reg.os.full
 }
 
 @(private)

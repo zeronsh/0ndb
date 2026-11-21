@@ -1,5 +1,7 @@
 package fs
 
+import "core:slice"
+import "../fstree"
 import "../odb"
 import "../prim"
 
@@ -93,4 +95,33 @@ from_odb :: proc "contextless" (e: odb.Error) -> Error {
 		return .Changed
 	}
 	return .Io
+}
+
+inode_less :: proc(a, b: fstree.Inode_Id) -> bool {
+	if a.actor != b.actor {
+		return a.actor < b.actor
+	}
+	return a.seq < b.seq
+}
+
+sorted_inodes :: proc(set: map[fstree.Inode_Id]$V, allocator := context.temp_allocator) -> []fstree.Inode_Id {
+	out := make([]fstree.Inode_Id, len(set), allocator)
+	i := 0
+	for k in set {
+		out[i] = k
+		i += 1
+	}
+	slice.sort_by(out, inode_less)
+	return out
+}
+
+sorted_strings :: proc(set: map[string]$V, allocator := context.temp_allocator) -> []string {
+	out := make([]string, len(set), allocator)
+	i := 0
+	for k in set {
+		out[i] = k
+		i += 1
+	}
+	slice.sort(out)
+	return out
 }

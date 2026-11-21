@@ -96,7 +96,7 @@ apply_seal :: proc(h: ^History, stream: u32, v: Version) -> Error {
 	crdt.graph_diff(&h.g, pl[:], eff[:], &only_a, &only_b)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	spans_touched(h, only_b[:], &touched) or_return
-	for ino in touched {
+	for ino in sorted_inodes(touched) {
 		seal_checkpoint(h, ino, eff[:]) or_return
 	}
 	ev := crdt.graph_version_ids(&h.g, eff[:], context.temp_allocator)

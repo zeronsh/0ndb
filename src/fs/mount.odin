@@ -56,7 +56,122 @@ Registry :: struct {
 	on_ready:  proc(m: ^Mount, data: rawptr),
 	ready_data: rawptr,
 	observer:  Write_Observer,
+	watcher:   Watcher,
+	random:    prim.Random,
 	os_ready:  bool,
+}
+
+Watcher :: struct {
+	data:      rawptr,
+	start:     proc(data: rawptr, reg: ^Registry) -> Error,
+	stop:      proc(data: rawptr, reg: ^Registry),
+	attach:    proc(data: rawptr, reg: ^Registry, loop: ^prim.Loop) -> Error,
+	watch:     proc(data: rawptr, reg: ^Registry, m: ^Mount) -> Error,
+	unwatch:   proc(data: rawptr, reg: ^Registry, m: ^Mount),
+	watch_dir: proc(data: rawptr, reg: ^Registry, m: ^Mount, rel: string, parent: i32) -> (i32, Error),
+	poll:      proc(data: rawptr, reg: ^Registry) -> Error,
+	wait:      proc(data: rawptr, reg: ^Registry, ms: i32) -> bool,
+	exhausted: proc(data: rawptr, reg: ^Registry) -> bool,
+}
+
+Watch_Kind :: enum u8 {
+	Changed,
+	Closed,
+	Gone,
+	Overflow,
+}
+
+os_watcher :: proc() -> Watcher {
+	return Watcher {
+		start = proc(data: rawptr, reg: ^Registry) -> Error {
+			return _registry_os_init(reg)
+		},
+		stop = proc(data: rawptr, reg: ^Registry) {
+			_registry_os_destroy(reg)
+		},
+		attach = proc(data: rawptr, reg: ^Registry, loop: ^prim.Loop) -> Error {
+			return _registry_os_attach(reg, loop)
+		},
+		watch = proc(data: rawptr, reg: ^Registry, m: ^Mount) -> Error {
+			return _watch_mount(reg, m)
+		},
+		unwatch = proc(data: rawptr, reg: ^Registry, m: ^Mount) {
+			_unwatch_mount(reg, m)
+		},
+		watch_dir = proc(data: rawptr, reg: ^Registry, m: ^Mount, rel: string, parent: i32) -> (i32, Error) {
+			return _os_watch_dir(reg, m, rel, parent)
+		},
+		poll = proc(data: rawptr, reg: ^Registry) -> Error {
+			return _registry_os_read(reg)
+		},
+		wait = proc(data: rawptr, reg: ^Registry, ms: i32) -> bool {
+			return _registry_wait(reg, ms)
+		},
+		exhausted = proc(data: rawptr, reg: ^Registry) -> bool {
+			return reg.os.full
+		},
+	}
+}
+
+registry_set_watcher :: proc(reg: ^Registry, w: Watcher) -> Error {
+	if reg.os_ready {
+		return .Busy
+	}
+	reg.watcher = w
+	return .None
+}
+
+registry_notify :: proc(reg: ^Registry, path: string, kind: Watch_Kind) {
+	if kind == .Overflow {
+		for m in reg.mounts {
+			if m != nil {
+				mount_mark_rescan(m)
+			}
+		}
+		return
+	}
+	best: ^Mount
+	for m in reg.mounts {
+		if m == nil {
+			continue
+		}
+		if m.has_git && (path_under(path, m.git.dir) || (len(m.git.common) > 0 && path_under(path, m.git.common))) {
+			name := path_name(path)
+			parent := path_parent(path)
+			if (parent == m.git.dir || parent == m.git.common) && (name == "HEAD" || name == "index" || name == "ORIG_HEAD" || name == "MERGE_HEAD") {
+				mount_mark_git(m)
+			}
+			return
+		}
+		if path == m.root {
+			if kind == .Gone {
+				mount_mark_rescan(m)
+			}
+			return
+		}
+		if path_under(path, m.root) && (best == nil || len(m.root) > len(best.root)) {
+			best = m
+		}
+	}
+	if best == nil {
+		return
+	}
+	rel := path[len(best.root) + 1:]
+	mount_mark(best, rel)
+	if kind == .Closed {
+		mount_closed(best, rel)
+	}
+}
+
+watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd: i32, err: Error) {
+	if reg == nil || !reg.os_ready || reg.watcher.watch_dir == nil {
+		return -1, .None
+	}
+	return reg.watcher.watch_dir(reg.watcher.data, reg, m, rel, parent_wd)
+}
+
+watch_exhausted :: proc(reg: ^Registry) -> bool {
+	return reg.os_ready && reg.watcher.exhausted != nil && reg.watcher.exhausted(reg.watcher.data, reg)
 }
 
 Write_Observer :: struct {
@@ -98,7 +213,6 @@ Mount :: struct {
 	idle_timer:  prim.Timer,
 	root_wd:     i32,
 	watched:     bool,
-	last_activity: i64,
 	restoring:   bool,
 	open_scopes: map[string]^Scope,
 	intents:     [dynamic]Intent,
@@ -114,10 +228,12 @@ Intent :: struct {
 	n:     u64,
 }
 
-registry_init :: proc(reg: ^Registry, vfs: prim.Vfs, run_dir: string, allocator := context.allocator) -> Error {
+registry_init :: proc(reg: ^Registry, vfs: prim.Vfs, run_dir: string, allocator := context.allocator, random := prim.Random{}) -> Error {
 	reg^ = {
 		vfs       = vfs,
 		allocator = allocator,
+		watcher   = os_watcher(),
+		random    = random,
 	}
 	d, aerr := clone_string(run_dir, allocator)
 	if aerr != nil {
@@ -135,10 +251,13 @@ registry_ready :: proc(reg: ^Registry) -> Error {
 		return .None
 	}
 	from_prim(prim.mkdir_all(reg.vfs, reg.run_dir, 0o700)) or_return
-	_registry_os_init(reg) or_return
+	w := reg.watcher
+	if w.start != nil {
+		w.start(w.data, reg) or_return
+	}
 	reg.os_ready = true
-	if reg.loop != nil {
-		return _registry_os_attach(reg, reg.loop)
+	if reg.loop != nil && w.attach != nil {
+		return w.attach(w.data, reg, reg.loop)
 	}
 	return .None
 }
@@ -147,8 +266,8 @@ registry_destroy :: proc(reg: ^Registry) {
 	if reg.observer.stop != nil {
 		reg.observer.stop(reg.observer.data, reg)
 	}
-	if reg.os_ready {
-		_registry_os_destroy(reg)
+	if reg.os_ready && reg.watcher.stop != nil {
+		reg.watcher.stop(reg.watcher.data, reg)
 	}
 	for s in reg.scopes {
 		delete(s.pids)
@@ -164,10 +283,10 @@ registry_attach :: proc(reg: ^Registry, loop: ^prim.Loop, on_ready: proc(m: ^Mou
 	reg.loop = loop
 	reg.on_ready = on_ready
 	reg.ready_data = data
-	if !reg.os_ready {
+	if !reg.os_ready || reg.watcher.attach == nil {
 		return .None
 	}
-	return _registry_os_attach(reg, loop)
+	return reg.watcher.attach(reg.watcher.data, reg, loop)
 }
 
 registry_set_observer :: proc(reg: ^Registry, obs: Write_Observer) -> Error {
@@ -182,10 +301,10 @@ registry_set_observer :: proc(reg: ^Registry, obs: Write_Observer) -> Error {
 }
 
 registry_poll :: proc(reg: ^Registry) -> Error {
-	if !reg.os_ready {
+	if !reg.os_ready || reg.watcher.poll == nil {
 		return .None
 	}
-	return _registry_os_read(reg)
+	return reg.watcher.poll(reg.watcher.data, reg)
 }
 
 mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: prim.Id, root: string, state_dir: string, actor: prim.Id, opts := DEFAULT_MOUNT, allocator := context.allocator) -> Error {
@@ -265,8 +384,8 @@ mount_close :: proc(m: ^Mount) {
 		shadow_close(&m.shadow)
 	}
 	if m.reg != nil && m.slot >= 0 && m.slot < len(m.reg.mounts) {
-		if m.reg.os_ready {
-			_unwatch_mount(m.reg, m)
+		if m.reg.os_ready && m.reg.watcher.unwatch != nil {
+			m.reg.watcher.unwatch(m.reg.watcher.data, m.reg, m)
 		}
 		m.reg.mounts[m.slot] = nil
 	}
@@ -342,7 +461,9 @@ mount_wake :: proc(m: ^Mount) -> Error {
 	m.awake = true
 	if !m.watched {
 		registry_ready(m.reg) or_return
-		_watch_mount(m.reg, m) or_return
+		if m.reg.watcher.watch != nil {
+			m.reg.watcher.watch(m.reg.watcher.data, m.reg, m) or_return
+		}
 		m.watched = true
 	}
 	return .None
@@ -392,7 +513,6 @@ mount_root :: proc(m: ^Mount) -> string {
 }
 
 mount_touch :: proc(m: ^Mount) {
-	m.last_activity = prim.mono_ns()
 	if m.reg.loop == nil || m.opts.idle_ms <= 0 {
 		return
 	}
@@ -593,7 +713,7 @@ mount_sync :: proc(m: ^Mount) -> Error {
 		}
 		if arrived || !m.watched {
 			mount_run(m) or_return
-		} else if !m.reg.os_ready || !_registry_wait(m.reg, 2000) {
+		} else if !m.reg.os_ready || m.reg.watcher.wait == nil || !m.reg.watcher.wait(m.reg.watcher.data, m.reg, 2000) {
 			m.rescan = true
 			for &f in m.fences {
 				f.arrived = true
@@ -758,7 +878,7 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	}
 	if l, ok := last.?; ok {
 		snap := fstree.current(&h.tree)
-		for ino in touched {
+		for ino in sorted_inodes(touched) {
 			info, found, ierr := fstree.info(&snap, ino, context.temp_allocator)
 			if ierr != nil {
 				return .Corrupt

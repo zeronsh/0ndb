@@ -73,7 +73,7 @@ mount_fork :: proc(src: ^Mount, dst: ^Mount, id: prim.Id, root: string, state_di
 	tmp := Mount {
 		vfs       = vfs,
 		dir       = state_dir,
-		actor     = prim.id_new(),
+		actor     = history_id_new(src.history),
 		allocator = context.temp_allocator,
 	}
 	tmp.synced = make([dynamic]crdt.Op_Id, context.temp_allocator)
@@ -207,7 +207,7 @@ mount_sync_from :: proc(fork: ^Mount, source_line: string, conflicts: ^[dynamic]
 	spans_touched(h, only_a[:], &a_set) or_return
 	spans_touched(h, only_b[:], &b_set) or_return
 	both := make([dynamic]fstree.Inode_Id, context.temp_allocator)
-	for ino in a_set {
+	for ino in sorted_inodes(a_set) {
 		if b_set[ino] {
 			append(&both, ino)
 		}

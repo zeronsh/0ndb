@@ -48,7 +48,8 @@ _registry_os_init :: proc(reg: ^Registry) -> Error {
 		return from_errno(errno)
 	}
 	reg.os.ifd = fd
-	id := prim.id_new()
+	id: prim.Id
+	prim.random_fill(reg.random, id[:])
 	hex := prim.id_hex(id)
 	pbuf: prim.Path_Buf
 	for ext, i in ([]string{".wd", ".names"}) {
@@ -191,7 +192,8 @@ _unwatch_mount :: proc(reg: ^Registry, m: ^Mount) {
 	}
 }
 
-watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd: i32, err: Error) {
+@(private)
+_os_watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd: i32, err: Error) {
 	if !reg.os_ready || reg.os.ifd < 0 {
 		return -1, .None
 	}
@@ -234,10 +236,6 @@ watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd
 	}
 	put_watch(reg, w, m.slot, parent, path_name(rel), false) or_return
 	return i32(w), .None
-}
-
-watch_exhausted :: proc(reg: ^Registry) -> bool {
-	return reg.os.full
 }
 
 @(private)

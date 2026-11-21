@@ -62,7 +62,7 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	snap := version_snapshot(h, tl[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
 	items := make([dynamic]Mat_Item, context.temp_allocator)
-	for ino in touched {
+	for ino in sorted_inodes(touched) {
 		it := Mat_Item {
 			inode = ino,
 		}
