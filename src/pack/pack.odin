@@ -1,0 +1,731 @@
+package pack
+
+import "base:runtime"
+import "core:hash/xxhash"
+import "core:strconv"
+import "../prim"
+
+Error :: prim.Error
+
+Options :: struct {
+	promote_size:   i64,
+	container_size: i64,
+	mem_budget:     int,
+	log_window:     i64,
+	spill:          int,
+	merge_fanout:   int,
+	max_runs:       int,
+	compact_ratio:  f64,
+	now:            proc() -> i64,
+	wake:           proc(data: rawptr),
+	wake_data:      rawptr,
+	deferred_sync:  bool,
+}
+
+DEFAULT_OPTIONS :: Options {
+	promote_size   = 256 * 1024,
+	container_size = 64 * 1024 * 1024,
+	mem_budget     = 2 * 1024 * 1024,
+	log_window     = 64 * 1024 * 1024,
+	spill          = 256 * 1024,
+	merge_fanout   = 4,
+	max_runs       = 12,
+	compact_ratio  = 0.5,
+}
+
+Stats :: struct {
+	commits:       u64,
+	fsyncs:        u64,
+	flushes:       u64,
+	merges:        u64,
+	merge_bytes:   u64,
+	log_bytes:     u64,
+	run_reads:     u64,
+	cache_hits:    u64,
+	zeroed_bytes:  u64,
+	compact_moved: u64,
+	compact_conts: u64,
+	promotions:    u64,
+	replayed:      u64,
+	runs:          int,
+	containers:    int,
+	mem_bytes:     int,
+	open_handles:  int,
+}
+
+@(private)
+Cont :: struct {
+	id:      u32,
+	fd:      prim.Fd,
+	size:    i64,
+	live:    i64,
+	dirty:   bool,
+	lent:    bool,
+	busy:    bool,
+	used:    u64,
+}
+
+@(private)
+Zero :: struct {
+	phys:   Phys,
+	need:   u64,
+	urgent: bool,
+}
+
+@(private)
+Open_Inode :: struct {
+	inum:     u64,
+	refs:     int,
+	ino:      Inode,
+	real_fd:  prim.Fd,
+	locked:   int,
+	unlinked: bool,
+	dirty:    bool,
+	pinned:   int,
+}
+
+@(private)
+Handle :: struct {
+	used:  bool,
+	write: bool,
+	dir:   bool,
+	oi:    ^Open_Inode,
+	inum:  u64,
+}
+
+@(private)
+Pending_Unlink :: struct {
+	inum: u64,
+	need: u64,
+}
+
+Pack :: struct {
+	base:          prim.Vfs,
+	root:          string,
+	opts:          Options,
+	allocator:     runtime.Allocator,
+	lock_fd:       prim.Fd,
+	super_fd:      prim.Fd,
+	gen:           u64,
+	next_ino:      u64,
+	next_cont:     u32,
+	next_run:      u32,
+	ck_cont:       u32,
+	ck_off:        i64,
+	ck_seq:        u64,
+	conts:         [dynamic]Cont,
+	active:        int,
+	buf:           [dynamic]u8,
+	buf_base:      i64,
+	group_start:   i64,
+	last_cont:     u32,
+	last_start:    i64,
+	seq:           u64,
+	durable_seq:   u64,
+	nrec:          int,
+	hh:            u64,
+	dh:            u64,
+	force:         bool,
+	dirty:         [dynamic]u32,
+	zeros:         [dynamic]Zero,
+	unlinks:       [dynamic]Pending_Unlink,
+	ext_dirty:     [dynamic]u64,
+	graveyard:     [dynamic]prim.Fd,
+	fl:            Inflight,
+	waiters:       [dynamic]Waiter,
+	worker:        ^Worker,
+	log_since_ck:  i64,
+	mem:           Mem,
+	runs:          [dynamic]^Run,
+	merge:         ^Merge,
+	compact:       Compact,
+	compacting:    u32,
+	horizon:       u32,
+	handles:       [dynamic]Handle,
+	free_handles:  [dynamic]int,
+	open_inodes:   map[u64]^Open_Inode,
+	dcache:        [DCACHE]Dcache_Entry,
+	poisoned:      bool,
+	recovering:    bool,
+	batch:         int,
+	stats:         Stats,
+	bcache:        []Bc_Entry,
+	tick:          u64,
+	scratch:       [dynamic]u8,
+	vbuf:          [dynamic]u8,
+	work:          [dynamic]u8,
+}
+
+@(private)
+DCACHE :: 64
+@(private)
+BCACHE :: 128
+
+@(private)
+Bc_Entry :: struct {
+	run:   u32,
+	blk:   u32,
+	valid: bool,
+	data:  [BLOCK]u8,
+}
+
+@(private)
+Dcache_Entry :: struct {
+	parent: u64,
+	ino:    u64,
+	nlen:   int,
+	name:   [MAX_NAME]u8,
+}
+
+@(private)
+SUPER_SLOT :: 64 * 1024
+@(private)
+SUPER_MAGIC :: u64(0x7265_7075_736b_6370)
+@(private)
+CONT_MAGIC :: u64(0x746e_6f63_6b63_6170)
+CONT_HDR :: 64
+@(private)
+VERSION :: u32(3)
+ROOT_INO :: u64(1)
+
+@(private)
+K_DIR :: u8('D')
+@(private)
+K_INODE :: u8('I')
+@(private)
+K_ORPHAN :: u8('O')
+@(private)
+K_STALE :: u8('S')
+
+@(private)
+Erase :: struct {
+	on:  bool,
+	lo:  i64,
+	hi:  i64,
+}
+
+@(private)
+_skey :: proc "contextless" (buf: []u8, inum: u64, cont: u32, off: i64) -> []u8 {
+	buf[0] = K_STALE
+	_put_be64(buf[1:9], inum)
+	buf[9] = u8(cont >> 24)
+	buf[10] = u8(cont >> 16)
+	buf[11] = u8(cont >> 8)
+	buf[12] = u8(cont)
+	_put_be64(buf[13:21], u64(off))
+	return buf[:21]
+}
+
+@(private)
+_perr :: #force_inline proc "contextless" (e: prim.Error) -> Error {
+	return e
+}
+
+@(private)
+_dkey :: proc "contextless" (buf: []u8, parent: u64, name: string) -> []u8 {
+	buf[0] = K_DIR
+	_put_be64(buf[1:9], parent)
+	n := copy(buf[9:], name)
+	return buf[:9 + n]
+}
+
+@(private)
+_ikey :: proc "contextless" (buf: []u8, kind: u8, inum: u64) -> []u8 {
+	buf[0] = kind
+	_put_be64(buf[1:9], inum)
+	return buf[:9]
+}
+
+@(private)
+_put_be64 :: proc "contextless" (b: []u8, v: u64) {
+	for i in 0 ..< 8 {
+		b[i] = u8(v >> (56 - 8 * uint(i)))
+	}
+}
+
+@(private)
+_get_be64 :: proc "contextless" (b: []u8) -> u64 {
+	v: u64
+	for i in 0 ..< 8 {
+		v = v << 8 | u64(b[i])
+	}
+	return v
+}
+
+@(private)
+_name :: proc(buf: []u8, prefix: u8, id: u64, width: int) -> string {
+	buf[0] = prefix
+	digits := "0123456789abcdef"
+	for i in 0 ..< width {
+		buf[width - i] = digits[(id >> (4 * uint(i))) & 0xf]
+	}
+	return string(buf[:width + 1])
+}
+
+@(private)
+_phys_path :: proc(p: ^Pack, buf: ^prim.Path_Buf, prefix: u8, id: u64) -> string {
+	n := copy(buf[:], p.root)
+	buf[n] = '/'
+	n += 1
+	width := 16 if prefix == 'x' else 8
+	nm := _name(buf[n:], prefix, id, width)
+	return string(buf[:n + len(nm)])
+}
+
+@(private)
+_parse_phys_name :: proc(name: string) -> (prefix: u8, id: u64, ok: bool) {
+	if len(name) != 9 && len(name) != 17 {
+		return
+	}
+	prefix = name[0]
+	width := 16 if prefix == 'x' else 8
+	if len(name) != width + 1 || (prefix != 'c' && prefix != 'r' && prefix != 'x') {
+		return
+	}
+	v, vok := strconv.parse_u64_of_base(name[1:], 16)
+	if !vok {
+		return
+	}
+	return prefix, v, true
+}
+
+@(private)
+_sync :: proc(p: ^Pack, fd: prim.Fd) -> Error {
+	p.stats.fsyncs += 1
+	return prim.datasync(p.base, fd)
+}
+
+@(private)
+_sync_root :: proc(p: ^Pack) -> Error {
+	p.stats.fsyncs += 1
+	return prim.sync_dir(p.base, p.root)
+}
+
+@(private)
+_poison :: proc(p: ^Pack, e: Error) -> Error {
+	p.poisoned = true
+	return e if e != .None else .Io
+}
+
+@(private)
+_cont_index :: proc "contextless" (p: ^Pack, id: u32) -> int {
+	lo, hi := 0, len(p.conts)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if p.conts[mid].id < id {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < len(p.conts) && p.conts[lo].id == id {
+		return lo
+	}
+	return -1
+}
+
+@(private)
+MAX_OPEN_CONTS :: 32
+
+@(private)
+_cont_fd :: proc(p: ^Pack, id: u32) -> (prim.Fd, Error) {
+	i := _cont_index(p, id)
+	if i < 0 {
+		return prim.INVALID_FD, .Not_Found
+	}
+	c := &p.conts[i]
+	p.tick += 1
+	if c.fd >= 0 {
+		c.used = p.tick
+		return c.fd, .None
+	}
+	open := 0
+	victim := -1
+	for &o, k in p.conts {
+		if o.fd >= 0 {
+			open += 1
+			if k != p.active && !o.dirty && !o.lent && !o.busy && (victim < 0 || o.used < p.conts[victim].used) {
+				victim = k
+			}
+		}
+	}
+	if open >= MAX_OPEN_CONTS && victim >= 0 {
+		prim.close_file(p.base, p.conts[victim].fd)
+		p.conts[victim].fd = prim.INVALID_FD
+	}
+	pb: prim.Path_Buf
+	fd, err := prim.open_file(p.base, _phys_path(p, &pb, 'c', u64(id)), {.Write})
+	if err != .None {
+		return prim.INVALID_FD, err
+	}
+	c.fd = fd
+	c.used = p.tick
+	return fd, .None
+}
+
+@(private)
+_live_add :: proc "contextless" (p: ^Pack, ph: Phys, sign: i64) {
+	i := _cont_index(p, ph.cont)
+	if i >= 0 {
+		p.conts[i].live += sign * ph.len
+	}
+}
+
+@(private)
+_get :: proc(p: ^Pack, key: []u8, out: ^[dynamic]u8) -> (found: bool, err: Error) {
+	if r, ok := _mem_get(&p.mem, key); ok {
+		if r.flags & MEM_TOMB != 0 {
+			return false, .None
+		}
+		clear(out)
+		append(out, ..r.val)
+		return true, .None
+	}
+	if p.fl.imm != nil {
+		if r, ok := _mem_get(p.fl.imm, key); ok {
+			if r.flags & MEM_TOMB != 0 {
+				return false, .None
+			}
+			clear(out)
+			append(out, ..r.val)
+			return true, .None
+		}
+	}
+	for i := len(p.runs) - 1; i >= 0; i -= 1 {
+		f, tomb := _run_get(p, p.runs[i], key, out) or_return
+		if f {
+			return !tomb, .None
+		}
+	}
+	return false, .None
+}
+
+@(private)
+_put :: proc(p: ^Pack, key: []u8, val: []u8, tomb: bool) -> Error {
+	flags := MEM_TOMB if tomb else 0
+	if !p.recovering {
+		flags |= MEM_DIRTY
+	}
+	off, ok := _mem_put(&p.mem, key, val, flags)
+	if !ok {
+		return .No_Memory
+	}
+	if !p.recovering {
+		append(&p.dirty, off)
+	}
+	return .None
+}
+
+@(private)
+_inode_load :: proc(p: ^Pack, inum: u64, ino: ^Inode) -> (found: bool, err: Error) {
+	if oi, ok := p.open_inodes[inum]; ok {
+		ino^ = oi.ino
+		return true, .None
+	}
+	if inum == ROOT_INO {
+		ino^ = {}
+		ino.kind = .Dir
+		ino.mode = 0o040755
+		return true, .None
+	}
+	kb: [16]u8
+	f := _get(p, _ikey(kb[:], K_INODE, inum), &p.vbuf) or_return
+	if !f {
+		return false, .None
+	}
+	if !_inode_decode(p.vbuf[:], ino) {
+		return false, .Io
+	}
+	return true, .None
+}
+
+@(private)
+_range_seq :: proc "contextless" (p: ^Pack, ph: Phys) -> u64 {
+	if p.active >= 0 && ph.cont == p.conts[p.active].id && ph.off >= p.group_start {
+		return p.seq
+	}
+	if p.fl.on && ph.cont == p.fl.cont && ph.off >= p.fl.start {
+		return p.fl.seq
+	}
+	if ph.cont == p.last_cont && ph.off >= p.last_start {
+		return p.durable_seq
+	}
+	return 0
+}
+
+@(private)
+_defer_zero :: proc(p: ^Pack, ph: Phys, urgent: bool) {
+	if ph.len <= 0 {
+		return
+	}
+	if p.compacting != 0 && ph.cont == p.compacting && !p.recovering {
+		return
+	}
+	need: u64
+	if !p.recovering {
+		need = max(p.seq, _range_seq(p, ph) + 1)
+	}
+	append(&p.zeros, Zero{phys = ph, need = need, urgent = urgent})
+}
+
+@(private)
+_inode_store :: proc(p: ^Pack, inum: u64, old: ^Inode, new: ^Inode, erase := Erase{}) -> Error {
+	olds, news, removed, added: Phys_List
+	if old != nil {
+		_phys_of(old, &olds)
+	}
+	if new != nil {
+		_phys_of(new, &news)
+	}
+	_phys_diff(olds.a[:olds.n], news.a[:news.n], &removed)
+	_phys_diff(news.a[:news.n], olds.a[:olds.n], &added)
+	for ph in added.a[:added.n] {
+		_live_add(p, ph, 1)
+	}
+	destroy := new == nil
+	stale := old != nil && old.stale
+	for ph in removed.a[:removed.n] {
+		_live_add(p, ph, -1)
+		if destroy || (erase.on && ph.foff < erase.hi && ph.foff + ph.len > erase.lo) {
+			_defer_zero(p, ph, erase.on && !destroy)
+			continue
+		}
+		if p.compacting != 0 && ph.cont == p.compacting {
+			continue
+		}
+		sb: [32]u8
+		vb: [20]u8
+		vn := prim.put_uvarint(vb[:], u64(ph.foff))
+		vn += prim.put_uvarint(vb[vn:], u64(ph.len))
+		_put(p, _skey(sb[:], inum, ph.cont, ph.off), vb[:vn], false) or_return
+		stale = true
+	}
+	if stale && (destroy || erase.on) {
+		lo := erase.lo if !destroy else 0
+		hi := erase.hi if !destroy else max(i64)
+		_erase_stale(p, inum, lo, hi, !destroy) or_return
+	}
+	kb: [16]u8
+	key := _ikey(kb[:], K_INODE, inum)
+	if destroy {
+		if oi, ok := p.open_inodes[inum]; ok {
+			oi.ino.kind = .None
+		}
+		return _put(p, key, nil, true)
+	}
+	if stale && !new.stale {
+		new.stale = true
+	}
+	if !_inode_encode(new, &p.scratch) {
+		return .No_Memory
+	}
+	if oi, ok := p.open_inodes[inum]; ok && &oi.ino != new {
+		oi.ino = new^
+	}
+	return _put(p, key, p.scratch[:], false)
+}
+
+@(private)
+_erase_stale :: proc(p: ^Pack, inum: u64, lo, hi: i64, urgent: bool) -> Error {
+	klo: [9]u8
+	khi: [9]u8
+	klo[0] = K_STALE
+	_put_be64(klo[1:9], inum)
+	khi[0] = K_STALE
+	_put_be64(khi[1:9], inum + 1)
+	it: Merge_Iter
+	if e := _miter_init(&it, p, klo[:], khi[:]); e != .None {
+		_miter_destroy(&it)
+		return e
+	}
+	keys := make([dynamic]u8, context.temp_allocator)
+	for {
+		key, val, ok := _miter_next(&it)
+		if !ok {
+			break
+		}
+		if len(key) != 21 {
+			continue
+		}
+		foff, n1 := prim.get_uvarint(val)
+		ln, n2 := prim.get_uvarint(val[max(n1, 0):])
+		if n1 <= 0 || n2 <= 0 {
+			continue
+		}
+		if i64(foff) >= hi || i64(foff + ln) <= lo {
+			continue
+		}
+		cont := u32(key[9]) << 24 | u32(key[10]) << 16 | u32(key[11]) << 8 | u32(key[12])
+		off := i64(_get_be64(key[13:21]))
+		_defer_zero(p, Phys{cont = cont, off = off, len = i64(ln)}, urgent)
+		append(&keys, ..key)
+	}
+	err := it.err
+	_miter_destroy(&it)
+	if err != .None {
+		return err
+	}
+	for i := 0; i + 21 <= len(keys); i += 21 {
+		_put(p, keys[i:i + 21], nil, true) or_return
+	}
+	return .None
+}
+
+@(private)
+_super_encode :: proc(p: ^Pack, out: ^[dynamic]u8) -> bool {
+	snap: Snap
+	_snap_take(p, &snap)
+	defer _snap_free(&snap)
+	return _snap_encode(&snap, out)
+}
+
+@(private)
+Super :: struct {
+	version:   u32,
+	gen:       u64,
+	ck_cont:   u32,
+	ck_off:    i64,
+	ck_seq:    u64,
+	next_ino:  u64,
+	next_cont: u32,
+	next_run:  u32,
+	compacting: u32,
+	runs:      [dynamic]Run,
+	lives:     [dynamic]Cont,
+}
+
+@(private)
+_super_decode :: proc(b: []u8, s: ^Super) -> bool {
+	if len(b) < 12 {
+		return false
+	}
+	n := int(prim.get_u32le(b[0:4]))
+	if n < 12 || n > len(b) {
+		return false
+	}
+	if xxhash.XXH3_64_with_seed(b[12:n], SUPER_MAGIC) != prim.get_u64le(b[4:12]) {
+		return false
+	}
+	r := prim.reader(b[12:n])
+	if prim.read_u64le(&r) != SUPER_MAGIC {
+		return false
+	}
+	s.version = prim.read_u32le(&r)
+	if s.version != VERSION {
+		return true
+	}
+	s.gen = prim.read_u64le(&r)
+	s.ck_cont = prim.read_u32le(&r)
+	s.ck_off = i64(prim.read_u64le(&r))
+	s.ck_seq = prim.read_u64le(&r)
+	s.next_ino = prim.read_u64le(&r)
+	s.next_cont = prim.read_u32le(&r)
+	s.next_run = prim.read_u32le(&r)
+	s.compacting = prim.read_u32le(&r)
+	nr := prim.read_uvarint(&r)
+	if r.err != .None || nr > 4096 {
+		return false
+	}
+	clear(&s.runs)
+	for _ in 0 ..< nr {
+		run := Run {
+			fd = prim.INVALID_FD,
+		}
+		run.id = prim.read_u32le(&r)
+		run.level = prim.read_u8(&r)
+		run.depth = prim.read_u8(&r)
+		run.root = prim.read_u32le(&r)
+		run.nblocks = prim.read_u32le(&r)
+		run.nentries = prim.read_u64le(&r)
+		append(&s.runs, run)
+	}
+	nc := prim.read_uvarint(&r)
+	if r.err != .None || nc > 1 << 20 {
+		return false
+	}
+	clear(&s.lives)
+	for _ in 0 ..< nc {
+		c := Cont {
+			fd = prim.INVALID_FD,
+		}
+		c.id = prim.read_u32le(&r)
+		c.live = i64(prim.read_uvarint(&r))
+		append(&s.lives, c)
+	}
+	return r.err == .None && prim.reader_done(&r) && s.ck_off >= CONT_HDR
+}
+
+@(private)
+_super_write :: proc(p: ^Pack) -> Error {
+	_drain(p) or_return
+	p.gen += 1
+	buf := make([dynamic]u8, context.temp_allocator)
+	if !_super_encode(p, &buf) {
+		return .Too_Large
+	}
+	slot := i64(p.gen % 2) * SUPER_SLOT
+	if e := prim.write_at(p.base, p.super_fd, buf[:], slot); e != .None {
+		return e
+	}
+	return _sync(p, p.super_fd)
+}
+
+@(private)
+_super_read :: proc(p: ^Pack, s: ^Super) -> bool {
+	best := false
+	tmp: Super
+	tmp.runs.allocator = context.temp_allocator
+	tmp.lives.allocator = context.temp_allocator
+	buf := make([]u8, SUPER_SLOT, context.temp_allocator)
+	for slot in 0 ..< 2 {
+		n, err := prim.read_at(p.base, p.super_fd, buf, i64(slot) * SUPER_SLOT)
+		if err != .None {
+			continue
+		}
+		if !_super_decode(buf[:n], &tmp) {
+			continue
+		}
+		if tmp.version != VERSION {
+			if !best {
+				s.version = tmp.version
+				best = true
+			}
+			continue
+		}
+		if !best || s.version != VERSION || tmp.gen > s.gen {
+			s.version = tmp.version
+			s.gen = tmp.gen
+			s.ck_cont = tmp.ck_cont
+			s.ck_off = tmp.ck_off
+			s.ck_seq = tmp.ck_seq
+			s.next_ino = tmp.next_ino
+			s.next_cont = tmp.next_cont
+			s.next_run = tmp.next_run
+			s.compacting = tmp.compacting
+			clear(&s.runs)
+			append(&s.runs, ..tmp.runs[:])
+			clear(&s.lives)
+			append(&s.lives, ..tmp.lives[:])
+			best = true
+		}
+	}
+	return best
+}
+
+stats :: proc(p: ^Pack) -> Stats {
+	s := p.stats
+	s.runs = len(p.runs)
+	s.containers = len(p.conts)
+	s.mem_bytes = _mem_bytes(&p.mem) + cap(p.buf) + cap(p.scratch)
+	if p.fl.imm != nil {
+		s.mem_bytes += _mem_bytes(p.fl.imm)
+	}
+	n := 0
+	for h in p.handles {
+		if h.used {
+			n += 1
+		}
+	}
+	s.open_handles = n
+	return s
+}
