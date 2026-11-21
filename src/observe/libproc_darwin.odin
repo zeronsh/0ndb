@@ -11,6 +11,7 @@ Libproc :: struct {
 	router:    Router,
 	sink:      Sink,
 	roots:     [dynamic]prim.Pid,
+	decider:   Decider,
 	pids:      [MAX_LINEAGE]prim.Pid,
 	stats:     Stats,
 }
@@ -70,6 +71,15 @@ _libproc_stop :: proc(data: rawptr, reg: ^fs.Registry) {
 	}
 }
 
+Decider :: struct {
+	data:   rawptr,
+	decide: proc(data: rawptr, m: ^fs.Mount, w: ^Write) -> (^fs.Scope, bool),
+}
+
+libproc_set_decider :: proc(l: ^Libproc, d: Decider) {
+	l.decider = d
+}
+
 libproc_changed :: proc(l: ^Libproc, m: ^fs.Mount, rel: string) -> (scope: ^fs.Scope, found: bool) {
 	router_refresh(&l.router)
 	base := ""
@@ -86,26 +96,52 @@ libproc_changed :: proc(l: ^Libproc, m: ^fs.Mount, rel: string) -> (scope: ^fs.S
 	copy(full, base)
 	full[len(base)] = '/'
 	copy(full[len(base) + 1:], rel)
-	pid, flags, ok := libproc_writer(l, string(full))
-	if !ok {
-		return nil, false
-	}
-	parent, _ := _parent_of(pid)
-	n := _walk_lineage(pid, parent, l.pids[:])
 	w := Write {
-		op      = .Truncate if flags & O_TRUNC_DARWIN != 0 else .Write,
-		pid     = pid,
-		tid     = pid,
-		lineage = l.pids[:n],
-		path    = string(full),
-		flags   = flags,
-		exact   = true,
+		op   = .Write,
+		path = string(full),
 	}
-	l.stats.reported += 1
-	if l.sink.write != nil {
-		l.sink.write(l.sink.data, &w)
+	pid, flags, ok := libproc_writer(l, string(full))
+	if ok {
+		parent, _ := _parent_of(pid)
+		n := _walk_lineage(pid, parent, l.pids[:])
+		w.op = .Truncate if flags & O_TRUNC_DARWIN != 0 else .Write
+		w.pid = pid
+		w.tid = pid
+		w.lineage = l.pids[:n]
+		w.flags = flags
+		w.exact = true
+		for p in w.lineage {
+			for r in l.roots {
+				if p == r {
+					w.tree = r
+				}
+			}
+		}
+		l.stats.reported += 1
+	} else {
+		if !_any_alive(l) {
+			return nil, false
+		}
+		w.window = true
+		l.stats.inexact += 1
 	}
-	return scope_of(l.router.reg, w.lineage), true
+	if l.decider.decide != nil {
+		return l.decider.decide(l.decider.data, m, &w)
+	}
+	if w.exact {
+		return scope_of(l.router.reg, w.lineage), true
+	}
+	return nil, false
+}
+
+@(private)
+_any_alive :: proc(l: ^Libproc) -> bool {
+	for p in l.roots {
+		if _, ok := _parent_of(p); ok {
+			return true
+		}
+	}
+	return false
 }
 
 libproc_writer :: proc(l: ^Libproc, path: string) -> (pid: prim.Pid, flags: u32, ok: bool) {

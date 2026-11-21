@@ -442,3 +442,18 @@ attribute :: proc(calls: []Tool_Call, w: ^Write, agent: prim.Pid) -> (index: int
 	}
 	return match_write(calls, w.path, w.from)
 }
+
+attribute_window :: proc(calls: []Tool_Call, w: ^Write) -> (index: int, ambiguous: bool) {
+	index = -1
+	if len(calls) == 0 {
+		return
+	}
+	index, ambiguous = match_write(calls, w.path, w.from)
+	if index >= 0 {
+		return
+	}
+	if len(calls) == 1 {
+		return 0, false
+	}
+	return -1, true
+}

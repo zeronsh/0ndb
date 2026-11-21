@@ -39,6 +39,8 @@ ES_NEW_CLIENT_ERR_TOO_MANY_CLIENTS :: 6
 @(private)
 ES_EVENT_TYPE_NOTIFY_OPEN :: u32(10)
 @(private)
+ES_EVENT_TYPE_NOTIFY_CLOSE :: u32(12)
+@(private)
 ES_EVENT_TYPE_NOTIFY_CREATE :: u32(13)
 @(private)
 ES_EVENT_TYPE_NOTIFY_EXCHANGEDATA :: u32(14)
@@ -187,6 +189,7 @@ endpoint_init :: proc(e: ^Endpoint, loop: ^prim.Loop, allocator := context.alloc
 		}
 	}
 	events := [?]u32 {
+		ES_EVENT_TYPE_NOTIFY_CLOSE,
 		ES_EVENT_TYPE_NOTIFY_OPEN,
 		ES_EVENT_TYPE_NOTIFY_CREATE,
 		ES_EVENT_TYPE_NOTIFY_EXCHANGEDATA,
@@ -377,6 +380,9 @@ _es_handler :: proc "c" (b: ^Es_Block, client: rawptr, msg: rawptr) {
 			return
 		}
 		op = .Truncate if flags & O_TRUNC_DARWIN != 0 else .Write
+		path = _es_file(_ptr_at(ev, 8))
+	case ES_EVENT_TYPE_NOTIFY_CLOSE:
+		op = .Close
 		path = _es_file(_ptr_at(ev, 8))
 	case ES_EVENT_TYPE_NOTIFY_CREATE:
 		op = .Write

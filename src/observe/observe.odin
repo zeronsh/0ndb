@@ -18,6 +18,7 @@ Op :: enum u8 {
 	Symlink,
 	Mknod,
 	Chmod,
+	Close,
 }
 
 MAX_LINEAGE :: 64
@@ -34,6 +35,7 @@ Write :: struct {
 	exact:   bool,
 	dev:     u64,
 	args:    []u8,
+	window:  bool,
 }
 
 Stats :: struct {
@@ -233,6 +235,12 @@ scope_of :: proc(reg: ^fs.Registry, lineage: []prim.Pid) -> ^fs.Scope {
 
 route :: proc(r: ^Router, w: ^Write, scope: ^fs.Scope) {
 	if r.reg == nil {
+		return
+	}
+	if w.op == .Close {
+		if m, rel, ok := router_locate(r, w.path); ok && len(rel) > 0 {
+			fs.mount_closed(m, rel)
+		}
 		return
 	}
 	if !w.exact && w.dev != 0 {
