@@ -1,100 +1,118 @@
 # 0ndb design
 
-0ndb is an engine. It records everything that happens in a worktree and in
-the agent sessions that work on it, keeps that history forever at near-zero
-cost, and replicates it between devices, runners and people through relays
-that do nothing but store and forward opaque bytes.
+0ndb is an engine for durable, replicated agent state. It holds everything an
+agent system produces (conversations, task graphs, memory, documents,
+workspaces spanning any number of repositories, every byte any agent or
+person wrote into them) forever at near-zero cost, runs agents against it,
+and replicates it between devices, runners and people through relays that
+only store and forward opaque bytes.
+
+It serves a coding agent in one repository, a project-wide workspace across
+fifty repositories, a persistent assistant answering millions of people on a
+chat platform, a captain agent driving a thousand subordinate tasks, and a
+plain conversation with no files at all, with one model and no special cases.
+A capability that a use case does not touch costs it nothing.
 
 It provides mechanisms, never policies. Who a user is, how they sign in,
-where bytes are hosted, which machine runs a turn, how keys are custodied
-and how agent processes are sandboxed all belong to whoever embeds 0ndb.
-Every such decision is a plug point with a reference implementation, and the
-`0ndb` binary is just one consumer assembled from those defaults.
+where bytes are hosted, which machine runs an agent, how keys are custodied,
+how processes are sandboxed, which channels an assistant listens on and which
+models it calls all belong to whoever embeds 0ndb. Every such decision is a
+plug point with a reference implementation; the `0ndb` binary is one consumer
+assembled from those defaults.
 
-The design is built around five ideas:
+The design rests on six ideas:
 
-1. **Everything is a single-writer append-only stream.** Each participant
-   (device, runner, teammate, external harness) appends only to its own
-   streams. There is never a write conflict to resolve at storage, relay or
-   replica level. Merging happens only where meaning lives: the message tree
-   only grows, registers are last-writer-wins by hybrid logical clock, and
-   files are CRDTs. Nothing is ever rejected for arriving late.
-2. **A record's identity is its position.** A message id is
-   `(segment, offset)`. Offsets are identical on the writer, the relay and
-   every replica, so a remote device can page a transcript by fetching byte
-   ranges from the end of a stream and following references. No index is
-   needed anywhere for the common path.
-3. **Every byte has an identity and an author, at the cost of plain text.**
-   Worktrees are a causal graph of index-based edits (Eg-walker) ordered by
-   Fugue, with an inode tree CRDT using the replicated-tree move operation.
-   With linear history a file in memory is just its text plus run-length
-   origin spans; CRDT state exists only transiently while merging concurrent
-   branches. Any number of devices and forks edit one history concurrently
-   and converge. Writes are credited to the actor and scope that made them
-   at write time, down to the writing process where the OS allows.
-   Git is the storage substrate, not the model: text checkpoints are git
-   blobs, content git already holds is referenced and never copied, and each
-   scope boundary also emits a real git tree/commit so every version is
-   inspectable with plain `git`.
-4. **Sans-IO cores, one event loop.** Provider drivers, the thread writer,
-   the sync client and the relay are pure state machines fed bytes and
-   returning bytes. The engine runs on one epoll/kqueue loop (its own thread,
-   or the embedder's loop through an fd and a step call) and is asleep (zero
-   wakeups, no timers armed) whenever nothing is happening.
-5. **Assume nothing about the embedder.** Identity, credentials, transport,
-   relay storage, key custody, encryption mode, turn scheduling, process
-   spawning, secret handling and provider registration are interfaces. The
-   engine is usable as an Odin package, a C library (`lib0ndb`), and its
-   read side as WebAssembly for browsers.
+1. **Everything is an object.** A space holds objects of four kinds:
+   *conversations* (growing message trees), *maps* (keyed registers and
+   sets), *texts* (sequence CRDTs) and *file trees* (inode trees whose files
+   are texts). Agents, tasks, workspaces, memory, session lists, routes,
+   schedules and settings are all objects of those kinds that reference each
+   other by id. There are no other storage concepts.
+2. **Every object is a set of single-writer segments.** Each participant
+   (device, runner, teammate, external harness, service) appends only to its
+   own segment of an object. Nothing is ever a write conflict at storage,
+   relay or replica level, and nothing is ever rejected for arriving late;
+   merging happens only where meaning lives, inside the object kind. An
+   intent from another device is not a command routed through a server: it
+   is a record the device writes into the object itself, durable and real the
+   moment it is written. Local-first is literal.
+3. **A record's identity is its position.** A record id is
+   `(segment, offset)`, identical on the writer, the relay and every replica,
+   so any device pages any object by fetching byte ranges from a segment's
+   tail and following references. No index is needed for the common path.
+4. **Every byte has an identity and an author, at the cost of plain text.**
+   Texts are Eg-walker with Fugue ordering; file trees use the
+   replicated-tree move operation. With linear history a text in memory is
+   its bytes plus run-length authorship spans; CRDT state exists only while
+   merging concurrent work. Git is the storage substrate for file contents,
+   never the model.
+5. **Sans-IO cores, one event loop, zero idle cost.** Drivers, object
+   writers, the model loop, the sync client and the relay are pure state
+   machines. An engine runs on one epoll/kqueue loop (its own thread or the
+   embedder's) and sleeps with no wakeups and at most one armed timer (the
+   next due schedule) when nothing is happening. Nothing per object stays in
+   memory between events, so a space with ten million objects idles like one
+   with ten.
+6. **Assume nothing about the embedder.** Identity, credentials, transport,
+   relay storage, key custody, encryption mode, scheduling, process spawning,
+   write observation, secrets, model access, tools, channels and disk are
+   interfaces. The engine is an Odin package, a C library (`lib0ndb`), and its
+   read side runs as WebAssembly in browsers.
 
 ## Targets
 
-- Idle daemon: 0 wakeups/s, RSS under 4 MiB with any number of threads and
-  worktrees. Nothing per thread or per file stays in memory between events.
-- Opening a thread with 100k messages: O(page) reads.
-- Remote first paint of a thread: one round trip to the relay for the tail
-  of the stream.
-- Ingesting an agent tool call in a 1M-file repository: O(changed bytes),
-  driven by the watcher; no full walk.
-- Integrating a remote batch: O(ops) when it does not overlap concurrent
-  work, O(concurrent region) otherwise; never O(document) or O(history).
-- Memory per loaded file: text + O(runs of authorship); per unloaded file:
-  nothing.
-- Relay: one handshake per connection, then zero-copy `sendfile` through
-  kernel TLS; it never parses or decrypts records.
+- Idle engine: 0 wakeups/s beyond the next due schedule; RSS under 4 MiB
+  regardless of how many objects, conversations, agents or worktrees exist.
+- Opening any conversation, map or text: O(page) reads; remote first paint
+  in one round trip.
+- Creating an object: one appended record, no file creation (segments of
+  small objects share a container; see Storage).
+- One fdatasync per loop tick for all objects written in that tick.
+- Ingesting a tool call in a 1M-file repository: O(changed bytes).
+- Integrating remote work: O(ops) linear, O(concurrent region) otherwise.
+- A conversation with no files, or an assistant with no schedules, performs
+  no file-tree or timer work at all.
+- A captain fanning out to N tasks: O(N) records, no processes beyond the
+  runs actually executing, no polling.
+- Relay: one handshake per connection, then zero-copy `sendfile`; it never
+  parses or decrypts records.
 
 ## Layout
 
 ```
 src/
-  prim/      ids, hybrid logical clock, binary codec, file helpers, event loop, child processes, paths
-  journal/   the record log format (local, replica and wire), group commit, sparse replicas
-  odb/       git object database: read loose/packed objects, write loose/packs, trees, commits
+  prim/      ids, hlc, codec, Vfs, event loop, processes
+  pack/      container Vfs: millions of small streams in shared files, one fsync per tick
+  journal/   the record log format (local, replica, wire), recovery, redaction, signed chains
+  obj/       objects and segments: refs, segment tables, links, missing ranges, keys, redaction
+  convo/     the conversation kind: message trees, blocks, branches, runs, intents, compaction
+  map/       the map kind: registers, sets, materialized ordered views
+  crdt/      causal graph, Eg-walker text, authorship spans (pure)
+  fstree/    inode tree CRDT with the move operation (pure)
+  odb/       git object database
   textdiff/  line and byte diff, three-way merge
-  crdt/      causal graph, Eg-walker text with Fugue ordering, authorship spans (pure, no I/O)
-  fstree/    inode tree CRDT with the replicated-tree move operation (pure, no I/O)
-  fs/        worktree mounts: scanning, ignore rules, watching, ingestion, materialization, git awareness, fork, land
-  thread/    multi-writer thread segments: messages, blocks, branches, queue, claims, pagination
-  index/     index and command streams, merged session table
-  search/    local full-text index over transcripts and the code-to-thread lookup
-  agent/     provider drivers (sans-IO), the normalized event model, native session portability
-  sync/      keys, encryption, relay protocol and relay core, replicator client
-  engine/    the embeddable engine: plug points, commands, runs, attribution, recording, events
-  capi/      the C ABI over engine (`lib0ndb`, `0ndb.h`)
-  cli/       the reference consumer: `0ndb` daemon, relay, runner, record and commands
-tests/       only: convergence (text), fstree (tree), sim (deterministic whole-system simulator)
+  fs/        file-tree objects on disk: mounts, scanning, ignore, watching, ingestion, materialization, git, lines, land
+  search/    full-text and vector indexes over any objects, code-to-conversation lookup
+  agent/     harness drivers (Claude Code, Codex, Pi, Muse, ACP agents), session portability, purge
+  model/     the native agent loop over model APIs (streaming, tools, caching, compaction)
+  mcp/       MCP client (tools for the native loop) and server (0ndb tools for any harness)
+  sync/      keys, encryption, relay core and protocol, announce feeds, replicator
+  engine/    runtime: spaces, runs, runners, scheduling, triggers, channels, orchestration, plug points, events
+  capi/      the C ABI (`lib0ndb`, `0ndb.h`)
+  cli/       the reference consumer
+tests/       convergence, fstree, sim
 ```
 
-Packages import each other with relative paths (`import "../journal"`).
-Build: `odin build src/cli -out:bin/0ndb -o:speed`. Every package must pass
-`odin check src/<pkg> -vet -strict-style` and also
-`odin check src/<pkg> -target:darwin_arm64` (Linux is primary; macOS must
-compile, with platform code in `_linux.odin` / `_darwin.odin` files).
+Packages import each other with relative paths. Build:
+`odin build src/cli -out:bin/0ndb -o:speed`. Every package passes
+`odin check src/<pkg> -vet -strict-style -no-entry-point` on Linux and with
+`-target:darwin_arm64`.
 
 Code style: idiomatic Odin, no comments, explicit allocators where lifetimes
-matter, `context.temp_allocator` for per-event scratch freed by the loop,
-errors as enums/unions returned as the last value, no global mutable state
-anywhere (the engine is a value; several may live in one process). No panics on bad input from disk, network or child processes.
+matter, `context.temp_allocator` for per-event scratch, errors as values, no
+global mutable state anywhere (an engine is a value; many may share a
+process, e.g. one per core). No panics on bad input from disk, network,
+models or child processes.
 
 ## Guarantees
 
@@ -372,177 +390,183 @@ equal in both directions.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
 
-## thread
+## Storage
 
-A thread is a set of **segments**. A segment is one single-writer journal
-stream owned by one participant (a device, a runner, a teammate's device, an
-external harness recording through the engine). Any participant may append
-to a thread by writing its own segment; nobody else's bytes ever change.
-The message tree only grows, so segments merge without any authority:
-concurrent turns become sibling branches, never rejections.
+- Every segment is a logical journal stream. Physically, an engine stores its
+  segments through `pack`, a `Vfs` that keeps small streams as extents inside
+  shared append-only container files (an on-disk B+ tree maps stream ->
+  extents) and promotes a stream to its own file once it grows past a
+  threshold. Creating an object costs one record, not a file; ten million
+  objects cost ten million small extents, not inodes.
+- Durability is batched across objects: every journal written in a loop
+  tick is committed with one container fdatasync. Compaction rewrites cold
+  containers so each stream's extents stay contiguous, keeping page reads to
+  one or two preads.
+- Redaction punches holes in extents; the simulator substitutes its own disk
+  beneath `pack` exactly as beneath plain files.
 
-References: `Ref{seg, off}` where `seg` is a small index into the writing
-segment's own table of segment ids (`Seg{index, id}` records declared on
-first use) and `off` the offset in that segment. A message id is the `Ref` of
-its `Msg` record; globally it is `(segment id, offset)`.
+## Objects
 
-Records (kind byte, a common links prefix, then fields; every record format
-uses tagged fields so records written today decode forever):
+- An object is `(id, kind, key)`. Its history is the set of its segments,
+  one per participant that ever wrote it. Segment records share one
+  envelope: kind byte, links prefix (segment table refs, chain state,
+  per-kind tail summary), fields with tagged encoding so records written
+  today decode forever.
+- References: `Ref{seg, off}` within an object; `(object id, Ref)` across
+  objects. Objects reference each other freely (a conversation names its
+  agent, workspace, parent task and mounted file trees).
+- Every kind supports: paging from any tail with batched missing-range
+  reporting, per-participant signed hash chains, per-record keys from the
+  object's puncturable key tree, and redaction.
+- A space is a key hierarchy and a relay namespace. Its catalog is a map
+  object with one entry per object (kind, title, parent, workspace, agent,
+  participants, status, activity, usage, archived, pinned), materialized
+  locally into ordered views so any listing is a paged range read.
 
-- `Head{thread, created, format}` first record of every segment; the thread's
-  first segment also carries the creating settings.
-- `Seg{index, id}` segment table entries.
-- `Msg{role, parent: Ref, depth, jump: Ref, runner, cmd, hlc, version,
-  git_branch, git_commit, provider, model, provider_session, provider_msg}`.
-  `jump` is a skew-binary jump pointer (O(log depth) ancestry and level
-  ancestors across segments). `runner` names the participant that should
-  answer a user message (decided by the embedder's scheduler).
-- `Block{msg, index, kind, ...}` and streaming chunks, as before; payloads
-  over 4 KiB are objects referenced by oid with a preview.
-- `Seal{msg, status, usage, provider_msg}`.
-- `Fork{parent, child, prev_fork}` written when a message is created as a
-  non-first child of `parent`; `Remember{parent, child, leaf, hlc}` written
-  whenever the leaf leaves the subtree of `child` at fork point `parent`
-  (edit, regenerate, switch, going back). Every segment chains its fork
-  events, and a periodic `Forks` digest record summarises all fork events
-  seen so far, so the full branch structure of a thread loads in O(1) reads
-  plus the events since the last digest.
-- `Leaf{msg, hlc}`: each participant's own current leaf, written only in its
-  own segment. The thread's shared head is the newest `Msg` across segments
-  (by hlc, then participant id); a participant without a leaf of its own,
-  and every runner, follows the head.
-- `Assign{msg, runner, hlc}` reassigns who answers a message (LWW).
-  `Claim{msg, lease}` is written by a runner when it starts; a runner only
-  starts messages assigned to it. If two runners ever answer the same message
-  (an assignment changed while one was offline), both replies are kept as
-  siblings and the one whose claim lost the assignment is marked superseded.
-- `Queue{item, mode, text, attachments}` from any participant;
-  `Unqueue{item, outcome, msg}` from the runner that consumed it (started,
-  steered into a running turn, cancelled, edited). Pending items are the
-  queue records with no unqueue, carried in the links prefix.
-- `Scope{msg, kind, id, actor, before, after}`, `Interrupted`, `Revived` as
-  before.
-- `Recorded{source, external_id, sequence}` idempotency keys for turns
-  recorded from harnesses the engine did not start.
+## Conversations (`convo`)
 
-Semantics:
+A conversation is a message tree that only grows. Everything about agents
+running on it is a record in it.
 
-- Pages follow `parent` refs from the leaf (or any message) across segments;
-  every read path reports missing byte ranges per segment so a remote client
-  batches its fetches; the first page needs one round trip.
-- Siblings and switching come from the fork structure: switching to sibling
-  `s` at fork point `p` goes to the latest `Remember{p, s}` leaf, or to the
-  newest descendant chain of `s` if it was never left. O(1) after the fork
-  structure is loaded; nothing scans history.
-- Editing, regenerating, going back, queue, steer, crash recovery and git
-  restoration behave as before. One thread never rewinds another's files.
-- A participant can join any thread at any time: it reads the other segments,
-  starts its own, and is immediately a full peer.
+- `Msg{role, author, parent, depth, jump, hlc, files, provider, model,
+  native}` with blocks, chunks and seals as before. `files` is the delta of
+  the conversation's mount set since its parent: for each mounted file tree
+  that changed, `(mount name, tree id, line, version)`; a message with no
+  mounts carries nothing.
+- Branches: `Fork`/`Remember` with digests (O(1) sibling switch), a
+  per-participant `Leaf`, and the shared head (newest message).
+- Intents written by any participant: `Queue`, `Steer`, `Edit_Queued`,
+  `Cancel`, `Interrupt`, `Answer` (permissions and questions), `Assign`.
+  There is no command stream; another device's intent is a record in the
+  conversation it targets.
+- Runs: `Claim{msg, runner, lease, lines}` when a runner starts, `Unqueue`
+  for what it consumed, `Seal` when done, `Superseded` when a reassignment
+  made a duplicate. Each run writes its own lines of every mounted tree and
+  fast-forwards the conversation's lines on success (`Landed{run}`), all
+  mounts together.
+- Mounts: `Mount{name, tree, line, path}` and `Unmount{name}` change which
+  file trees a conversation works on; zero, one or many, from any
+  workspace. Going back to a message restores every mounted tree (and each
+  repository's git state) to that message's versions together.
+- `Compact{from, to, summary}` records a context summary for long or
+  infinite conversations; history is never dropped, the summary is what a
+  model sees in place of the range. Harness-side compactions are recorded
+  the same way.
+- `Scope` attribution, `Recorded` idempotency for external harnesses,
+  `Interrupted`/`Revived` crash recovery, `Redact`, as before.
 
-Native session portability: when a turn moves to a runner that lacks the
-provider's own session state, the previous runner's native session files
-(exported by the driver, paths rewritten) travel as encrypted objects so the
-new runner resumes natively; the seeded transcript is only the fallback.
+## Maps (`map`)
 
-## index
+A map holds keyed last-writer-wins registers (by `(hlc, participant)`) and
+add-wins sets, per field. Materialized views (copy-on-write B+ trees,
+rebuildable) give any secondary ordering as a paged range read. Maps are the
+catalog, workspaces, agent definitions, memory facts, routes, schedules,
+runner capacity and settings.
 
-Per-participant `index` stream (session list, statuses, worktrees,
-participants; per-field LWW by `(hlc, participant)`), and the derived on-disk
-session table (copy-on-write B+ tree, paged listing). Commands addressed to
-other participants travel in each participant's `cmd` stream and are applied
-by their target; `Cursor` and `Rejected` records close the optimistic loop.
+## Workspaces
+
+A workspace is a map: name, members (file trees with default mount names
+and paths, documents, memory objects), defaults (agent, provider, model,
+runner policy), setup (`.agents/setup`, linked ignored files) and access.
+Conversations may belong to a workspace or not, and mount any subset of its
+file trees (or trees from elsewhere). A runner materializes a conversation's
+mounts side by side under one root it gives the agent as its working
+directory, each a clone with alternates or a reflink copy, so a turn that
+spans many repositories sees them all and every write is attributed to the
+right tree.
+
+## Agents
+
+An agent is a map: instructions, driver (a harness provider or the native
+model loop) with model and options, tools (built-ins, MCP servers), memory
+(objects it reads and writes), triggers, budgets, default workspace and
+runner policy. Conversations name the agent that answers them.
+
+- **Persistent assistants.** Triggers start runs without a person present:
+  `Channel` messages (the embedder's ingress adapters deliver inbound
+  messages; a routes map binds `(channel, key)` to a conversation, creating
+  one on first contact), `Schedule` entries (cron or one-shot, durable in the
+  agent map; the engine arms a single timer for the earliest due entry across
+  all agents) and `Event` hooks (object changes, webhooks via the embedder).
+  Replies leave through the same channel plug. Memory is ordinary objects
+  (texts for notes, maps for facts) indexed by `search`, including vectors.
+- **Native model loop** (`model`). For agents that need no CLI harness, the
+  engine runs the agent loop itself: streaming model calls through the
+  `Model` plug (reference adapters: Anthropic Messages, OpenAI Responses and
+  compatible APIs, over an `Http` plug whose reference implementation is
+  libcurl's multi interface driven by the engine loop), tool calls, prompt
+  caching, compaction. No process per conversation: one assistant serves
+  any number of concurrent conversations from one loop.
+- **Harness drivers** (`agent`). Claude Code, Codex, Pi, Muse and ACP agents
+  as before, with steering, rewind, attachments, portability and purge.
+- **External harnesses** record through `record(...)` with idempotent
+  receipts.
+
+## Orchestration
+
+A task is a conversation with a parent. A captain agent creates tasks
+(child conversations with a goal, agent, mounts forked from its own lines,
+budget and runner policy), writes into them, and waits on them; children
+report by sealing results that the captain's runs see.
+
+- Tools: `spawn`, `send`, `wait` (any/all/condition, with timeout), `list`,
+  `cancel`, `result`, `merge` (land a child's lines). The native loop has
+  them built in; harnesses get them through the 0ndb MCP server (`mcp`), so a
+  Claude Code captain orchestrates exactly like a native one.
+- Waiting is a record (`Await{tasks, condition, deadline}`), so a captain
+  resumes after a crash or on another runner without losing its place.
+  Wake-ups come from object change events, never polling.
+- Budgets and cancellation flow down the task tree; usage and status roll up
+  through the catalog. Agent-to-agent messages are records written into the
+  recipient's conversation by the sender.
+- Placement of every run is the embedder's `Scheduler`; runners advertise
+  capacity in a map.
+
+## Moving between devices and runners
+
+Everything a run needs is objects: the conversation, its agent, its
+workspace, its mounted trees (checkpoint plus tail), its memory, and the
+provider's native session (exported into an object after each turn, imported
+by the next runner). A run moves by assignment; the new runner fetches only
+what it touches, tail first.
 
 ## search
 
-A derived, rebuildable local index per participant over the transcripts it
-holds: an on-disk inverted index (trigram postings for substring search,
-compressed, appended incrementally as segments grow) with title, body, tool,
-path and time filters. `wrote:PATH#Lx-Ly` resolves lines to the scopes that
-wrote them through authorship spans, and scopes to the messages and threads
-that opened them. Results page; nothing is held in memory between queries.
+Derived, rebuildable local indexes over any objects: trigram full text,
+token queries with filters, vectors (an `Embedder` plug; an on-disk
+quantized index), and `wrote:PATH#Lx-Ly` through authorship spans. Redacted
+content is purged from every index.
 
 ## agent
 
-Each driver is a sans-IO state machine (launch, feed, send, steer,
-interrupt, rewind with native fork/undo/seed paths, permissions, models,
-attachments). Every raw provider line is recorded before it is interpreted.
-Drivers: Claude Code, Codex, Pi, Muse, and one ACP driver for Antigravity,
-Cursor, Devin, Hermes and OpenCode. Embedders register further providers
-from descriptors (argv, protocol family, capabilities) without changing the
-engine. Drivers also export and import their provider's native session state
-for portability. Provider wire formats are known only to their driver file;
-`docs/providers.md` records each protocol.
+Harness drivers are sans-IO state machines with steering, rewind, attachments,
+portability, purge and a provider registry. Provider wire formats live only
+in their driver file; `docs/providers.md` records each protocol.
 
 ## sync
 
-Mechanisms, each behind a plug point:
+Mechanisms behind plug points (`Keyring`, `Credentials`, `Transport`,
+`Authorizer`, `Relay_Storage`), per-object keys from puncturable key trees
+with sharing by wrapping, relay redaction, signed chains, padding and
+checkpoint bundles, as before, plus:
 
-- **Identity.** A participant has a signing key (Ed25519) held by the
-  embedder's `Keyring`; its id is derived from the public key. What a
-  participant *is* (a person's device, a runner, a service) is the embedder's
-  business.
-- **Content keys.** Every thread, worktree history and space-level stream has
-  its own random content key. Keys are wrapped for recipients by the
-  `Keyring` (reference: X25519 sealed boxes to participant keys; embedders may
-  use a KMS). Sharing a thread with someone means wrapping its key for them
-  and granting relay capabilities; revoking rotates to a new epoch key.
-  Encryption mode is per space: end-to-end (default, the relay never sees
-  plaintext) or transparent (the embedder's servers may index content).
-- **Transport.** The sync core is sans-IO; the embedder supplies byte
-  transport (reference: Noise `IK` then kernel TLS over TCP with zero-copy
-  `sendfile`, userspace AEAD fallback; Unix sockets locally; embedders may use
-  WebSockets, HTTP/2, QUIC or an in-process pipe).
-- **Credentials and authorization.** The client asks the embedder's
-  `Credentials` for whatever its transport needs; the relay core asks the
-  embedder's `Authorizer` to turn a connection's credential into a principal
-  and a capability set (which streams it may read, which it may append to,
-  quotas). The relay core enforces only that.
-- **Relay core** as a library over a `Relay_Storage` interface (append at
-  offset, read range, follow, put/get object, drop), so an embedder can host
-  it on files (reference), object storage, or a database. It never parses or
-  decrypts records.
-- Protocol: `Hello`, `List`, `Append(stream, at, bytes)`, `Read`, `Follow`,
-  `Put`, `Get`, `Drop`, framed with hard caps and backpressure.
-- **Replicator**: uploads own durable bytes (journal floor = uploaded
-  length), follows index/cmd streams fully, fetches thread segments tail-first
-  into sparse replicas on demand, fetches objects lazily.
-- **Checkpoint bundles**: a participant joining a worktree history fetches the
-  newest published checkpoint (fstree records, text checkpoints, git base
-  references) plus the ops after it, never the whole history.
+- **Announce feeds.** For each space the relay core keeps an append-only feed
+  of `(segment, new length)` entries, one per append, filtered per principal
+  by its capabilities when served. A participant follows one feed per space
+  instead of one subscription per segment, and fetches only the segments it
+  cares about; ten million objects cost nothing until touched.
+- Partial replication is the default: a participant holds exactly the
+  objects (and ranges) it has used.
 
 ## engine
 
-The embeddable engine owns the loop, journals, worktrees, provider
-processes and replication, and exposes commands and change events.
-Plug points (all optional, reference implementations provided):
-
-- `Keyring` (identity keys, content-key wrapping), `Write_Observer`, `Vfs`,
-  `Credentials`,
-  `Transport`, `Authorizer` and `Relay_Storage` (for embedders that host a
-  relay), `Scheduler` (which runner answers a message; reassignment),
-  `Spawner` (how provider processes start: direct, sandboxed, container,
-  remote exec), `Secrets` (redaction rules applied before anything is
-  recorded, secret environment injection), `Providers` (registry), `Clock`,
-  `Log`.
-- Runners: any engine instance can be a runner; the embedder provisions it
-  (cloud sandbox, VM, a laptop) and starts the engine with credentials. A
-  runner joins histories through checkpoint bundles, materializes a
-  worktree (clone with alternates or from the git remote, reflink copies),
-  runs `.agents/setup` once per environment and links `.agents/linked`
-  ignored files, then answers the messages assigned to it.
-- Recording API: harnesses the engine did not start append turns through
-  `record(source, external_id, sequence, update)` with idempotent receipts
-  (recorded, duplicate, superseded); recorded turns get scopes and
-  attribution like driven ones.
-- Text identity across git rewrites: alias records map text through
-  rebase, squash, cherry-pick and moved code so blame survives commits.
-- Seals: a history's writers may publish seal records that bound transient
-  merge state and let checkpoints drop deleted text, without rejecting any
-  late work.
-- Events: a subscription API for UIs (sessions, thread pages, statuses,
-  worktree changes) with optimistic command overlays.
-- The engine is a value: several may live in one process; it can run on its
-  own thread or inside the embedder's loop (`engine_fd`, `engine_step`).
+The runtime: spaces, objects, runs, runners, triggers, channels,
+orchestration, attribution, recording and change events, over the plug
+points `Vfs`, `Keyring`, `Credentials`, `Transport`, `Authorizer`,
+`Relay_Storage`, `Scheduler`, `Spawner`, `Write_Observer`, `Secrets`,
+`Model`, `Http`, `Tools`, `Channels`, `Embedder`, `Providers`, `Clock`,
+`Log`. Any engine instance can be a runner. Several engines can share a
+process to use several cores, each owning a shard of objects.
 
 ## capi
 
@@ -555,6 +579,7 @@ side (journal, thread, index, crdt, sync client) also builds for
 ## cli
 
 The reference consumer, assembled from the default plug implementations:
-`0ndb daemon | relay | runner | record | pair | join | status | ls | new |
-send | queue | steer | edit | switch | back | log | show | search |
-interrupt | models | worktree | blame | revert | land | share | verify`.
+`0ndb daemon | relay | runner | record | mcp | pair | join | status | ls |
+new | send | queue | steer | edit | switch | back | log | show | search |
+interrupt | models | agent | task | workspace | mount | schedule | blame |
+revert | land | share | redact | verify`.
