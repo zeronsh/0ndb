@@ -238,7 +238,7 @@ decode_node :: proc(record: []u8, allocator := context.allocator) -> (n: Node, e
 
 @(private)
 arena_add :: proc(n: ^Node, name: string) -> (off: u32, err: Error) {
-	if len(n.arena) + len(name) > int(max(u32)) {
+	if u64(len(n.arena)) + u64(len(name)) > u64(max(u32)) {
 		return 0, .Corrupt
 	}
 	off = u32(len(n.arena))

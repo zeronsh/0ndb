@@ -5,37 +5,37 @@ import "base:runtime"
 NIL :: max(u32)
 FANOUT :: 16
 
-Node :: struct($M: int) {
+Node :: struct($M: int, $T: typeid) {
 	parent: u32,
 	slot:   u8,
 	n:      u8,
 	child:  [FANOUT]u32,
-	size:   [FANOUT][M]int,
+	size:   [FANOUT][M]T,
 }
 
-Tree :: struct($L: typeid, $M: int) {
+Tree :: struct($L: typeid, $M: int, $T: typeid) {
 	leaves:      [dynamic]L,
-	nodes:       [dynamic]Node(M),
+	nodes:       [dynamic]Node(M, T),
 	free_leaves: [dynamic]u32,
 	free_nodes:  [dynamic]u32,
 	root:        u32,
 	height:      int,
-	total:       [M]int,
+	total:       [M]T,
 	cache_leaf:  u32,
-	cache_start: [M]int,
+	cache_start: [M]T,
 }
 
-tree_init :: proc(t: ^Tree($L, $M), allocator: runtime.Allocator) {
+tree_init :: proc(t: ^Tree($L, $M, $T), allocator: runtime.Allocator) {
 	t^ = {}
 	t.leaves = make([dynamic]L, allocator)
-	t.nodes = make([dynamic]Node(M), allocator)
+	t.nodes = make([dynamic]Node(M, T), allocator)
 	t.free_leaves = make([dynamic]u32, allocator)
 	t.free_nodes = make([dynamic]u32, allocator)
 	t.root = tree_new_leaf(t)
 	t.cache_leaf = NIL
 }
 
-tree_destroy :: proc(t: ^Tree($L, $M)) {
+tree_destroy :: proc(t: ^Tree($L, $M, $T)) {
 	delete(t.leaves)
 	delete(t.nodes)
 	delete(t.free_leaves)
@@ -43,11 +43,11 @@ tree_destroy :: proc(t: ^Tree($L, $M)) {
 	t^ = {}
 }
 
-tree_clone :: proc(dst: ^Tree($L, $M), src: ^Tree(L, M), allocator: runtime.Allocator) {
+tree_clone :: proc(dst: ^Tree($L, $M, $T), src: ^Tree(L, M, T), allocator: runtime.Allocator) {
 	dst^ = src^
 	dst.leaves = make([dynamic]L, len(src.leaves), allocator)
 	copy(dst.leaves[:], src.leaves[:])
-	dst.nodes = make([dynamic]Node(M), len(src.nodes), allocator)
+	dst.nodes = make([dynamic]Node(M, T), len(src.nodes), allocator)
 	copy(dst.nodes[:], src.nodes[:])
 	dst.free_leaves = make([dynamic]u32, len(src.free_leaves), allocator)
 	copy(dst.free_leaves[:], src.free_leaves[:])
@@ -55,7 +55,7 @@ tree_clone :: proc(dst: ^Tree($L, $M), src: ^Tree(L, M), allocator: runtime.Allo
 	copy(dst.free_nodes[:], src.free_nodes[:])
 }
 
-tree_new_leaf :: proc(t: ^Tree($L, $M)) -> u32 {
+tree_new_leaf :: proc(t: ^Tree($L, $M, $T)) -> u32 {
 	if n := len(t.free_leaves); n > 0 {
 		id := t.free_leaves[n - 1]
 		pop(&t.free_leaves)
@@ -67,7 +67,7 @@ tree_new_leaf :: proc(t: ^Tree($L, $M)) -> u32 {
 	return u32(len(t.leaves) - 1)
 }
 
-tree_new_node :: proc(t: ^Tree($L, $M)) -> u32 {
+tree_new_node :: proc(t: ^Tree($L, $M, $T)) -> u32 {
 	if n := len(t.free_nodes); n > 0 {
 		id := t.free_nodes[n - 1]
 		pop(&t.free_nodes)
@@ -75,18 +75,18 @@ tree_new_node :: proc(t: ^Tree($L, $M)) -> u32 {
 		t.nodes[id].parent = NIL
 		return id
 	}
-	append(&t.nodes, Node(M){parent = NIL})
+	append(&t.nodes, Node(M, T){parent = NIL})
 	return u32(len(t.nodes) - 1)
 }
 
-tree_parent :: #force_inline proc "contextless" (t: ^Tree($L, $M), id: u32, leaf: bool) -> (u32, int) {
+tree_parent :: #force_inline proc "contextless" (t: ^Tree($L, $M, $T), id: u32, leaf: bool) -> (u32, int) {
 	if leaf {
 		return t.leaves[id].parent, int(t.leaves[id].slot)
 	}
 	return t.nodes[id].parent, int(t.nodes[id].slot)
 }
 
-tree_set_parent :: #force_inline proc "contextless" (t: ^Tree($L, $M), id: u32, leaf: bool, p: u32, s: int) {
+tree_set_parent :: #force_inline proc "contextless" (t: ^Tree($L, $M, $T), id: u32, leaf: bool, p: u32, s: int) {
 	if leaf {
 		t.leaves[id].parent = p
 		t.leaves[id].slot = u8(s)
@@ -96,7 +96,7 @@ tree_set_parent :: #force_inline proc "contextless" (t: ^Tree($L, $M), id: u32, 
 	}
 }
 
-tree_bubble :: proc "contextless" (t: ^Tree($L, $M), parent: u32, slot: int, d: [M]int) {
+tree_bubble :: proc "contextless" (t: ^Tree($L, $M, $T), parent: u32, slot: int, d: [M]T) {
 	p, s := parent, slot
 	for p != NIL {
 		n := &t.nodes[p]
@@ -107,7 +107,7 @@ tree_bubble :: proc "contextless" (t: ^Tree($L, $M), parent: u32, slot: int, d: 
 	t.total += d
 }
 
-tree_add :: proc "contextless" (t: ^Tree($L, $M), leaf: u32, d: [M]int) {
+tree_add :: proc "contextless" (t: ^Tree($L, $M, $T), leaf: u32, d: [M]T) {
 	if leaf != t.cache_leaf {
 		t.cache_leaf = NIL
 	}
@@ -115,7 +115,7 @@ tree_add :: proc "contextless" (t: ^Tree($L, $M), leaf: u32, d: [M]int) {
 	tree_bubble(t, p, s, d)
 }
 
-tree_leaf_size :: #force_inline proc "contextless" (t: ^Tree($L, $M), leaf: u32) -> [M]int {
+tree_leaf_size :: #force_inline proc "contextless" (t: ^Tree($L, $M, $T), leaf: u32) -> [M]T {
 	p, s := tree_parent(t, leaf, true)
 	if p == NIL {
 		return t.total
@@ -123,7 +123,7 @@ tree_leaf_size :: #force_inline proc "contextless" (t: ^Tree($L, $M), leaf: u32)
 	return t.nodes[p].size[s]
 }
 
-tree_find :: proc "contextless" (t: ^Tree($L, $M), m: int, pos: int, left: bool) -> (leaf: u32, off: int) {
+tree_find :: proc "contextless" (t: ^Tree($L, $M, $T), m: int, pos: T, left: bool) -> (leaf: u32, off: T) {
 	if c := t.cache_leaf; c != NIL {
 		st := t.cache_start[m]
 		end := st + tree_leaf_size(t, c)[m]
@@ -133,7 +133,7 @@ tree_find :: proc "contextless" (t: ^Tree($L, $M), m: int, pos: int, left: bool)
 	}
 	id := t.root
 	off = pos
-	acc: [M]int
+	acc: [M]T
 	for h := t.height; h > 0; h -= 1 {
 		node := &t.nodes[id]
 		last := int(node.n) - 1
@@ -153,7 +153,7 @@ tree_find :: proc "contextless" (t: ^Tree($L, $M), m: int, pos: int, left: bool)
 	return id, off
 }
 
-tree_first_leaf :: proc "contextless" (t: ^Tree($L, $M)) -> u32 {
+tree_first_leaf :: proc "contextless" (t: ^Tree($L, $M, $T)) -> u32 {
 	id := t.root
 	for _ in 0 ..< t.height {
 		id = t.nodes[id].child[0]
@@ -161,7 +161,7 @@ tree_first_leaf :: proc "contextless" (t: ^Tree($L, $M)) -> u32 {
 	return id
 }
 
-tree_last_leaf :: proc "contextless" (t: ^Tree($L, $M)) -> u32 {
+tree_last_leaf :: proc "contextless" (t: ^Tree($L, $M, $T)) -> u32 {
 	id := t.root
 	for _ in 0 ..< t.height {
 		id = t.nodes[id].child[t.nodes[id].n - 1]
@@ -169,7 +169,7 @@ tree_last_leaf :: proc "contextless" (t: ^Tree($L, $M)) -> u32 {
 	return id
 }
 
-tree_next_leaf :: proc "contextless" (t: ^Tree($L, $M), leaf: u32) -> u32 {
+tree_next_leaf :: proc "contextless" (t: ^Tree($L, $M, $T), leaf: u32) -> u32 {
 	p, s := tree_parent(t, leaf, true)
 	up := 0
 	for p != NIL && s + 1 >= int(t.nodes[p].n) {
@@ -187,7 +187,7 @@ tree_next_leaf :: proc "contextless" (t: ^Tree($L, $M), leaf: u32) -> u32 {
 	return id
 }
 
-tree_prev_leaf :: proc "contextless" (t: ^Tree($L, $M), leaf: u32) -> u32 {
+tree_prev_leaf :: proc "contextless" (t: ^Tree($L, $M, $T), leaf: u32) -> u32 {
 	p, s := tree_parent(t, leaf, true)
 	up := 0
 	for p != NIL && s == 0 {
@@ -205,7 +205,7 @@ tree_prev_leaf :: proc "contextless" (t: ^Tree($L, $M), leaf: u32) -> u32 {
 	return id
 }
 
-tree_leaf_pos :: proc "contextless" (t: ^Tree($L, $M), leaf: u32) -> (acc: [M]int) {
+tree_leaf_pos :: proc "contextless" (t: ^Tree($L, $M, $T), leaf: u32) -> (acc: [M]T) {
 	p, s := tree_parent(t, leaf, true)
 	for p != NIL {
 		n := &t.nodes[p]
@@ -218,7 +218,7 @@ tree_leaf_pos :: proc "contextless" (t: ^Tree($L, $M), leaf: u32) -> (acc: [M]in
 	return
 }
 
-tree_insert_after :: proc(t: ^Tree($L, $M), sib: u32, leaf: bool, id: u32, size: [M]int) {
+tree_insert_after :: proc(t: ^Tree($L, $M, $T), sib: u32, leaf: bool, id: u32, size: [M]T) {
 	t.cache_leaf = NIL
 	parent, slot := tree_parent(t, sib, leaf)
 	if parent == NIL {
@@ -253,7 +253,7 @@ tree_insert_after :: proc(t: ^Tree($L, $M), sib: u32, leaf: bool, id: u32, size:
 		return
 	}
 	kids: [FANOUT + 1]u32
-	sizes: [FANOUT + 1][M]int
+	sizes: [FANOUT + 1][M]T
 	src := &t.nodes[parent]
 	j := 0
 	for i in 0 ..< FANOUT {
@@ -272,7 +272,7 @@ tree_insert_after :: proc(t: ^Tree($L, $M), sib: u32, leaf: bool, id: u32, size:
 	}
 	right := tree_new_node(t)
 	half := (FANOUT + 1) / 2
-	sum_left, sum_right: [M]int
+	sum_left, sum_right: [M]T
 	ln := &t.nodes[parent]
 	ln.n = u8(half)
 	for i in 0 ..< half {
@@ -316,7 +316,7 @@ tree_insert_after :: proc(t: ^Tree($L, $M), sib: u32, leaf: bool, id: u32, size:
 	tree_insert_after(t, parent, false, right, sum_right)
 }
 
-tree_remove :: proc(t: ^Tree($L, $M), id: u32, leaf: bool) {
+tree_remove :: proc(t: ^Tree($L, $M, $T), id: u32, leaf: bool) {
 	t.cache_leaf = NIL
 	parent, slot := tree_parent(t, id, leaf)
 	if parent == NIL {

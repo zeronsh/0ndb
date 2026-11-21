@@ -11,7 +11,7 @@ Rope_Leaf :: struct {
 	data:   [ROPE_CAP]u8,
 }
 
-Rope :: Tree(Rope_Leaf, 1)
+Rope :: Tree(Rope_Leaf, 1, int)
 
 rope_init :: proc(r: ^Rope, allocator: runtime.Allocator) {
 	tree_init(r, allocator)

@@ -17,12 +17,12 @@ Span :: struct {
 }
 
 Ix :: struct {
-	len:  int,
+	len:  i64,
 	leaf: u32,
 }
 
-Spans :: Tree(Run_Leaf(Span), 1)
-Index :: Tree(Run_Leaf(Ix), 1)
+Spans :: Tree(Run_Leaf(Span), 1, int)
+Index :: Tree(Run_Leaf(Ix), 1, i64)
 
 @(private)
 span_merge :: #force_inline proc "contextless" (a: ^Span, b: Span) -> bool {
@@ -48,7 +48,7 @@ ix_merge :: #force_inline proc "contextless" (a: ^Ix, b: Ix) -> bool {
 }
 
 @(private)
-ix_split :: #force_inline proc "contextless" (e: Ix, k: int) -> (Ix, Ix) {
+ix_split :: #force_inline proc "contextless" (e: Ix, k: i64) -> (Ix, Ix) {
 	return Ix{k, e.leaf}, Ix{e.len - k, e.leaf}
 }
 
@@ -69,27 +69,27 @@ ID_KEY_SEQS :: 1 << 40
 ID_SPACE_KEYS :: ID_KEY_ACTORS * ID_KEY_SEQS
 
 @(private)
-span_key :: #force_inline proc "contextless" (actor: u32, seq: u64, n: int) -> (int, bool) {
+span_key :: #force_inline proc "contextless" (actor: u32, seq: u64, n: int) -> (i64, bool) {
 	if actor >= ID_KEY_ACTORS || seq + u64(n) > ID_KEY_SEQS {
 		return 0, false
 	}
-	return int(actor) * ID_KEY_SEQS + int(seq), true
+	return i64(actor) * ID_KEY_SEQS + i64(seq), true
 }
 
 @(private)
 span_index :: proc(ids: ^Index, s: Span, leaf: u32) {
 	if key, ok := span_key(s.actor, s.seq, s.len); ok {
-		run_assign(ids, key, Ix{s.len, leaf})
+		run_assign(ids, key, Ix{i64(s.len), leaf})
 	}
 }
 
 @(private)
-run_leaf_split :: proc(t: ^Tree(Run_Leaf($E), 1), leaf: u32, ids: ^Index = nil) {
+run_leaf_split :: proc(t: ^Tree(Run_Leaf($E), 1, $T), leaf: u32, ids: ^Index = nil) {
 	id := tree_new_leaf(t)
 	l := &t.leaves[leaf]
 	r := &t.leaves[id]
 	h := int(l.n) / 2
-	moved := 0
+	moved: T
 	for i in h ..< int(l.n) {
 		r.items[i - h] = l.items[i]
 		moved += l.items[i].len
@@ -107,7 +107,7 @@ run_leaf_split :: proc(t: ^Tree(Run_Leaf($E), 1), leaf: u32, ids: ^Index = nil) 
 	}
 }
 
-run_insert :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E, ids: ^Index = nil) {
+run_insert :: proc(t: ^Tree(Run_Leaf($E), 1, $T), pos: T, e: E, ids: ^Index = nil) {
 	if e.len <= 0 {
 		return
 	}
@@ -179,7 +179,7 @@ run_indexed :: #force_inline proc(ids: ^Index, e: $E, leaf: u32) {
 	}
 }
 
-run_delete :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, count: int, ids: ^Index = nil) {
+run_delete :: proc(t: ^Tree(Run_Leaf($E), 1, $T), pos: T, count: T, ids: ^Index = nil) {
 	at := clamp(pos, 0, t.total[0])
 	rem := min(max(count, 0), t.total[0] - at)
 	for rem > 0 {
@@ -227,7 +227,7 @@ run_delete :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, count: int, ids: ^Index 
 }
 
 @(private)
-run_join :: proc(t: ^Tree(Run_Leaf($E), 1), at: int) {
+run_join :: proc(t: ^Tree(Run_Leaf($E), 1, $T), at: T) {
 	if at <= 0 || at >= t.total[0] {
 		return
 	}
@@ -247,7 +247,7 @@ run_join :: proc(t: ^Tree(Run_Leaf($E), 1), at: int) {
 	}
 }
 
-run_get :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int) -> (e: E, off: int, ok: bool) {
+run_get :: proc(t: ^Tree(Run_Leaf($E), 1, $T), pos: T) -> (e: E, off: T, ok: bool) {
 	if pos < 0 || pos >= t.total[0] {
 		return
 	}
@@ -262,7 +262,7 @@ run_get :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int) -> (e: E, off: int, ok: boo
 	return
 }
 
-run_assign :: proc(t: ^Tree(Run_Leaf($E), 1), pos: int, e: E) {
+run_assign :: proc(t: ^Tree(Run_Leaf($E), 1, $T), pos: T, e: E) {
 	run_delete(t, pos, e.len)
 	run_insert(t, pos, e)
 }

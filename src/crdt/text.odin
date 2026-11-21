@@ -298,7 +298,7 @@ text_redact :: proc(t: ^Text, g: ^Graph, actor: prim.Id, seq: u64, n: int) {
 		seen := make([dynamic]u32, t.allocator)
 		defer delete(seen)
 		cur := key
-		for cur < key + n {
+		for cur < key + i64(n) {
 			e, off, found := run_get(&t.ids, cur)
 			if !found {
 				break
@@ -434,7 +434,7 @@ heads_within :: proc(g: ^Graph, heads: []Lv, ps: []Lv) -> bool {
 }
 
 @(private)
-effect :: proc "contextless" (kind: Op_Kind, pos: int, n: int, size: int) -> (at: int, s: int, cnt: int) {
+effect :: proc "contextless" (kind: Op_Kind, pos: i64, n: i64, size: i64) -> (at: i64, s: i64, cnt: i64) {
 	switch kind {
 	case .Insert, .Insert_Ref, .Insert_Copy:
 		return clamp(pos, 0, size), 0, n
@@ -470,14 +470,14 @@ piece_pos :: proc "contextless" (e: Log_Entry, k: int) -> int {
 apply_direct :: proc(m: ^Merge, p: Piece) {
 	e := &m.log.entries[p.entry]
 	k := p.lv - e.lv
-	at, _, cnt := effect(e.kind, piece_pos(e^, k), p.len, text_len(m.t))
+	at, _, cnt := effect(e.kind, i64(piece_pos(e^, k)), i64(p.len), i64(text_len(m.t)))
 	if cnt == 0 {
 		return
 	}
 	if is_insert(e.kind) {
-		doc_insert_piece(m, at, e, k, p.len, p.lv)
+		doc_insert_piece(m, int(at), e, k, p.len, p.lv)
 	} else {
-		doc_delete(m, at, cnt)
+		doc_delete(m, int(at), int(cnt))
 	}
 }
 
@@ -540,18 +540,18 @@ walk_piece :: proc(m: ^Merge, tr: ^Tracker, heads: ^[dynamic]Lv, p: Piece, side:
 	k := p.lv - e.lv
 	size := tr.items.total[CUR] - tr.tail if emit else tr.items.total[CUR]
 	out := m if emit else nil
-	at, s, cnt := effect(e.kind, piece_pos(e^, k), p.len, size)
+	at, s, cnt := effect(e.kind, i64(piece_pos(e^, k)), i64(p.len), size)
 	if cnt > 0 {
 		switch e.kind {
 		case .Insert, .Insert_Ref, .Insert_Copy:
-			ep := tr_insert(tr, g, at, PH + p.lv, p.len)
+			ep := tr_insert(tr, g, at, PH + i64(p.lv), i64(p.len))
 			if emit {
-				doc_insert_piece(m, ep, e, k, p.len, p.lv)
+				doc_insert_piece(m, narrow(ep), e, k, p.len, p.lv)
 			}
 		case .Delete:
-			tr_delete(tr, at, cnt, p.lv, false, 0, side, out)
+			tr_delete(tr, at, cnt, p.lv, false, 0, i64(side), out)
 		case .Delete_Back:
-			tr_delete(tr, at, cnt, 0, true, p.lv + s + cnt - 1, side, out)
+			tr_delete(tr, at, cnt, 0, true, p.lv + Lv(s + cnt - 1), i64(side), out)
 		case .Opaque:
 		}
 	}
@@ -598,7 +598,7 @@ build_tracker :: proc(m: ^Merge, tr: ^Tracker, heads: ^[dynamic]Lv, walked: ^[dy
 	for w in walked {
 		walk_piece(m, tr, heads, w.piece, 0, false)
 	}
-	tr.tail = tr.items.total[END] - text_len(t)
+	tr.tail = tr.items.total[END] - i64(text_len(t))
 	return .None
 }
 
@@ -646,7 +646,7 @@ Mark :: struct {
 }
 
 @(private)
-mark_ids :: proc(tr: ^Tracker, marks: ^[dynamic]Mark, id: int, n: int, side: int, p: Piece, point: bool) {
+mark_ids :: proc(tr: ^Tracker, marks: ^[dynamic]Mark, id: i64, n: i64, side: int, p: Piece, point: bool) {
 	cur := id
 	rem := n
 	for rem > 0 {
@@ -658,9 +658,9 @@ mark_ids :: proc(tr: ^Tracker, marks: ^[dynamic]Mark, id: int, n: int, side: int
 		k := min(rem, it.len - off)
 		ep := tr_end_pos(tr, leaf, i)
 		if it.ever || point {
-			append(marks, Mark{ep, ep, side, p.lv, p.len})
+			append(marks, Mark{narrow(ep), narrow(ep), side, p.lv, p.len})
 		} else {
-			append(marks, Mark{ep + off, ep + off + k, side, p.lv, p.len})
+			append(marks, Mark{narrow(ep + off), narrow(ep + off + k), side, p.lv, p.len})
 		}
 		cur += k
 		rem -= k
@@ -671,22 +671,22 @@ mark_ids :: proc(tr: ^Tracker, marks: ^[dynamic]Mark, id: int, n: int, side: int
 mark_piece :: proc(m: ^Merge, tr: ^Tracker, marks: ^[dynamic]Mark, p: Piece, side: int) {
 	e := m.log.entries[p.entry]
 	if is_insert(e.kind) {
-		mark_ids(tr, marks, PH + p.lv, p.len, side, p, false)
+		mark_ids(tr, marks, PH + i64(p.lv), i64(p.len), side, p, false)
 		return
 	}
 	recs := tr.dels[side][:]
 	for j := rec_first(recs, p.lv); j < len(recs) && recs[j].lv < p.lv + p.len; j += 1 {
 		r := recs[j]
 		x := max(p.lv, r.lv)
-		y := min(p.lv + p.len, r.lv + r.len)
+		y := min(p.lv + p.len, Lv(i64(r.lv) + r.len))
 		if y <= x {
 			continue
 		}
-		lo := r.target + (x - r.lv)
+		lo := r.target + i64(x - r.lv)
 		if r.back {
-			lo = r.target - (y - 1 - r.lv)
+			lo = r.target - i64(y - 1 - r.lv)
 		}
-		mark_ids(tr, marks, lo, y - x, side, p, true)
+		mark_ids(tr, marks, lo, i64(y - x), side, p, true)
 	}
 }
 
@@ -837,7 +837,7 @@ anchor_resolve :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, a: Anchor) -> (int, 
 		return 0, err
 	}
 	defer tracker_destroy(&tr)
-	leaf, k, off, found := tr_locate(&tr, PH + lv)
+	leaf, k, off, found := tr_locate(&tr, PH + i64(lv))
 	if !found {
 		return 0, .Unknown
 	}
@@ -845,7 +845,7 @@ anchor_resolve :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, a: Anchor) -> (int, 
 	if !tr.items.leaves[leaf].items[k].ever {
 		p += off
 	}
-	return p, .None
+	return narrow(p), .None
 }
 
 text_length_at :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv) -> (int, Error) {
@@ -871,7 +871,7 @@ text_length_at :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv) -> (int, Er
 	}
 	defer tracker_destroy(&tr)
 	tr_move(&tr, g, log, v)
-	return tr.items.total[CUR] - tr.tail, .None
+	return narrow(tr.items.total[CUR] - tr.tail), .None
 }
 
 @(private)

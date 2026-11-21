@@ -4,7 +4,6 @@ import "../prim"
 
 BATCH_FORMAT :: u8(1)
 CHECKPOINT_FORMAT :: u8(1)
-MAX_POS :: 1 << 46
 
 @(private)
 Actor_Table :: struct {

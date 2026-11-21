@@ -127,8 +127,15 @@ Conflict :: struct {
 }
 
 MAX_COUNTER :: u64(1) << 62
-MAX_LV :: 1 << 52
-MAX_RUN :: 1 << 40
+when size_of(int) == 8 {
+	MAX_LV :: 1 << 52
+	MAX_RUN :: 1 << 40
+	MAX_POS :: 1 << 46
+} else {
+	MAX_LV :: 1 << 30
+	MAX_RUN :: 1 << 28
+	MAX_POS :: 1 << 29
+}
 
 is_insert :: #force_inline proc "contextless" (k: Op_Kind) -> bool {
 	return k == .Insert || k == .Insert_Ref || k == .Insert_Copy

@@ -18,10 +18,10 @@ ITEM_CAP :: 24
 
 @(private)
 Item :: struct {
-	id:    int,
-	len:   int,
-	left:  int,
-	right: int,
+	id:    i64,
+	len:   i64,
+	left:  i64,
+	right: i64,
 	state: u32,
 	ever:  bool,
 }
@@ -35,13 +35,13 @@ Item_Leaf :: struct {
 }
 
 @(private)
-Items :: Tree(Item_Leaf, 3)
+Items :: Tree(Item_Leaf, 3, i64)
 
 @(private)
 Del_Rec :: struct {
 	lv:     Lv,
-	len:    int,
-	target: int,
+	len:    i64,
+	target: i64,
 	back:   bool,
 }
 
@@ -51,21 +51,30 @@ Tracker :: struct {
 	index:   Index,
 	dels:    [2][dynamic]Del_Rec,
 	version: [dynamic]Lv,
-	tail:    int,
+	tail:    i64,
 	ra:      [dynamic]Lv_Span,
 	ad:      [dynamic]Lv_Span,
 	pieces:  [dynamic]Piece,
 }
 
 @(private)
-Cursor :: struct {
-	leaf: u32,
-	i:    int,
-	off:  int,
+narrow :: #force_inline proc "contextless" (x: i64) -> int {
+	when size_of(int) == 8 {
+		return int(x)
+	} else {
+		return int(clamp(x, i64(min(int)), i64(max(int))))
+	}
 }
 
 @(private)
-item_metrics :: #force_inline proc "contextless" (it: Item) -> [3]int {
+Cursor :: struct {
+	leaf: u32,
+	i:    i64,
+	off:  i64,
+}
+
+@(private)
+item_metrics :: #force_inline proc "contextless" (it: Item) -> [3]i64 {
 	return {it.len if it.state == 1 else 0, 0 if it.ever else it.len, it.len}
 }
 
@@ -109,16 +118,16 @@ tracker_destroy :: proc(tr: ^Tracker) {
 }
 
 @(private)
-tr_room :: proc(tr: ^Tracker, leaf: u32, i: int, need: int) -> (u32, int) {
-	if int(tr.items.leaves[leaf].n) + need <= ITEM_CAP {
+tr_room :: proc(tr: ^Tracker, leaf: u32, i: i64, need: i64) -> (u32, i64) {
+	if i64(tr.items.leaves[leaf].n) + need <= ITEM_CAP {
 		return leaf, i
 	}
 	id := tree_new_leaf(&tr.items)
 	l := &tr.items.leaves[leaf]
 	r := &tr.items.leaves[id]
-	h := int(l.n) / 2
-	moved: [3]int
-	for k in h ..< int(l.n) {
+	h := i64(l.n) / 2
+	moved: [3]i64
+	for k in h ..< i64(l.n) {
 		r.items[k - h] = l.items[k]
 		moved += item_metrics(l.items[k])
 	}
@@ -126,7 +135,7 @@ tr_room :: proc(tr: ^Tracker, leaf: u32, i: int, need: int) -> (u32, int) {
 	l.n = u8(h)
 	tree_add(&tr.items, leaf, -moved)
 	tree_insert_after(&tr.items, leaf, true, id, moved)
-	for k in 0 ..< int(tr.items.leaves[id].n) {
+	for k in 0 ..< i64(tr.items.leaves[id].n) {
 		it := tr.items.leaves[id].items[k]
 		run_assign(&tr.index, it.id, Ix{it.len, id})
 	}
@@ -137,11 +146,11 @@ tr_room :: proc(tr: ^Tracker, leaf: u32, i: int, need: int) -> (u32, int) {
 }
 
 @(private)
-tr_split_at :: proc(tr: ^Tracker, leaf: u32, i: int, off: int) -> (u32, int) {
+tr_split_at :: proc(tr: ^Tracker, leaf: u32, i: i64, off: i64) -> (u32, i64) {
 	lf, li := tr_room(tr, leaf, i, 1)
 	l := &tr.items.leaves[lf]
 	it := l.items[li]
-	n := int(l.n)
+	n := i64(l.n)
 	copy(l.items[li + 2:n + 1], l.items[li + 1:n])
 	l.items[li].len = off
 	l.items[li + 1] = Item {
@@ -157,23 +166,23 @@ tr_split_at :: proc(tr: ^Tracker, leaf: u32, i: int, off: int) -> (u32, int) {
 }
 
 @(private)
-tr_locate :: proc(tr: ^Tracker, id: int) -> (leaf: u32, i: int, off: int, ok: bool) {
+tr_locate :: proc(tr: ^Tracker, id: i64) -> (leaf: u32, i: i64, off: i64, ok: bool) {
 	e, _, found := run_get(&tr.index, id)
 	if !found || e.leaf == NIL {
 		return
 	}
 	l := &tr.items.leaves[e.leaf]
-	for k in 0 ..< int(l.n) {
+	for k in 0 ..< i64(l.n) {
 		it := l.items[k]
 		if id >= it.id && id < it.id + it.len {
-			return e.leaf, k, id - it.id, true
+			return e.leaf, i64(k), id - it.id, true
 		}
 	}
 	return
 }
 
 @(private)
-tr_raw_pos :: proc(tr: ^Tracker, id: int) -> int {
+tr_raw_pos :: proc(tr: ^Tracker, id: i64) -> i64 {
 	leaf, i, off, ok := tr_locate(tr, id)
 	if !ok {
 		return -1
@@ -187,7 +196,7 @@ tr_raw_pos :: proc(tr: ^Tracker, id: int) -> int {
 }
 
 @(private)
-tr_end_pos :: proc(tr: ^Tracker, leaf: u32, i: int) -> int {
+tr_end_pos :: proc(tr: ^Tracker, leaf: u32, i: i64) -> i64 {
 	p := tree_leaf_pos(&tr.items, leaf)[END]
 	l := &tr.items.leaves[leaf]
 	for k in 0 ..< i {
@@ -203,7 +212,7 @@ cursor_norm :: proc(tr: ^Tracker, c: Cursor) -> Cursor {
 	x := c
 	for x.leaf != NIL {
 		l := &tr.items.leaves[x.leaf]
-		if x.i < int(l.n) {
+		if x.i < i64(l.n) {
 			if x.off < l.items[x.i].len {
 				return x
 			}
@@ -222,24 +231,24 @@ cursor_next :: proc(tr: ^Tracker, c: Cursor) -> Cursor {
 }
 
 @(private)
-order_less :: proc(g: ^Graph, a, b: int) -> bool {
-	ia := graph_id(g, a - PH)
-	ib := graph_id(g, b - PH)
+order_less :: proc(g: ^Graph, a, b: i64) -> bool {
+	ia := graph_id(g, Lv(a - PH))
+	ib := graph_id(g, Lv(b - PH))
 	return op_id_less(ia, ib)
 }
 
 @(private)
-tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
+tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: i64, id: i64, n: i64) -> i64 {
 	pos := clamp(at, 0, tr.items.total[CUR])
-	left := -1
+	left: i64 = -1
 	c: Cursor
 	if pos == 0 {
 		c = Cursor{tree_first_leaf(&tr.items), 0, 0}
 	} else {
 		leaf, off := tree_find(&tr.items, CUR, pos - 1, false)
 		l := &tr.items.leaves[leaf]
-		i := 0
-		for i < int(l.n) {
+		i: i64 = 0
+		for i < i64(l.n) {
 			cl := l.items[i].len if l.items[i].state == 1 else 0
 			if off < cl {
 				break
@@ -247,7 +256,7 @@ tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
 			off -= cl
 			i += 1
 		}
-		if i >= int(l.n) {
+		if i >= i64(l.n) {
 			return -1
 		}
 		left = l.items[i].id + off
@@ -255,7 +264,7 @@ tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
 	}
 	c = cursor_norm(tr, c)
 	scan := c
-	right := -1
+	right: i64 = -1
 	for scan.leaf != NIL {
 		it := tr.items.leaves[scan.leaf].items[scan.i]
 		if it.state != 0 {
@@ -266,7 +275,7 @@ tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
 	}
 	dest := c
 	if scan != c {
-		left_pos := -1 if left < 0 else tr_raw_pos(tr, left)
+		left_pos: i64 = -1 if left < 0 else tr_raw_pos(tr, left)
 		right_pos := tr.items.total[RAW] if right < 0 else tr_raw_pos(tr, right)
 		scanning := false
 		cc := c
@@ -278,7 +287,7 @@ tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
 				break
 			}
 			other := tr.items.leaves[cc.leaf].items[cc.i]
-			ol := -1 if other.left < 0 else tr_raw_pos(tr, other.left)
+			ol: i64 = -1 if other.left < 0 else tr_raw_pos(tr, other.left)
 			if ol < left_pos {
 				break
 			}
@@ -299,10 +308,10 @@ tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
 		}
 	}
 	leaf: u32
-	i: int
+	i: i64
 	if dest.leaf == NIL {
 		leaf = tree_last_leaf(&tr.items)
-		i = int(tr.items.leaves[leaf].n)
+		i = i64(tr.items.leaves[leaf].n)
 	} else if dest.off > 0 {
 		leaf, i = tr_split_at(tr, dest.leaf, dest.i, dest.off)
 		i += 1
@@ -321,7 +330,7 @@ tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
 	}
 	leaf, i = tr_room(tr, leaf, i, 1)
 	l := &tr.items.leaves[leaf]
-	cnt := int(l.n)
+	cnt := i64(l.n)
 	copy(l.items[i + 1:cnt + 1], l.items[i:cnt])
 	l.items[i] = Item {
 		id    = id,
@@ -337,14 +346,14 @@ tr_insert :: proc(tr: ^Tracker, g: ^Graph, at: int, id: int, n: int) -> int {
 }
 
 @(private)
-tr_delete :: proc(tr: ^Tracker, pos: int, count: int, lv: Lv, back: bool, lv_hi: Lv, side: int, m: ^Merge) {
+tr_delete :: proc(tr: ^Tracker, pos: i64, count: i64, lv: Lv, back: bool, lv_hi: Lv, side: i64, m: ^Merge) {
 	start := len(tr.dels[side])
-	done := 0
+	done: i64 = 0
 	for done < count {
 		leaf, off := tree_find(&tr.items, CUR, pos, false)
 		l := &tr.items.leaves[leaf]
-		i := 0
-		for i < int(l.n) {
+		i: i64 = 0
+		for i < i64(l.n) {
 			cl := l.items[i].len if l.items[i].state == 1 else 0
 			if off < cl {
 				break
@@ -352,7 +361,7 @@ tr_delete :: proc(tr: ^Tracker, pos: int, count: int, lv: Lv, back: bool, lv_hi:
 			off -= cl
 			i += 1
 		}
-		if i >= int(l.n) {
+		if i >= i64(l.n) {
 			break
 		}
 		if off > 0 {
@@ -363,7 +372,7 @@ tr_delete :: proc(tr: ^Tracker, pos: int, count: int, lv: Lv, back: bool, lv_hi:
 		if k < tr.items.leaves[leaf].items[i].len {
 			leaf, i = tr_split_at(tr, leaf, i, k)
 		}
-		ep := -1
+		ep: i64 = -1
 		if !tr.items.leaves[leaf].items[i].ever && m != nil {
 			ep = tr_end_pos(tr, leaf, i)
 		}
@@ -374,12 +383,12 @@ tr_delete :: proc(tr: ^Tracker, pos: int, count: int, lv: Lv, back: bool, lv_hi:
 		target := it.id
 		tree_add(&tr.items, leaf, item_metrics(it^) - before)
 		if ep >= 0 {
-			doc_delete(m, ep, k)
+			doc_delete(m, narrow(ep), narrow(k))
 		}
 		if back {
-			append(&tr.dels[side], Del_Rec{lv = lv_hi - done - k + 1, len = k, target = target + k - 1, back = true})
+			append(&tr.dels[side], Del_Rec{lv = lv_hi - Lv(done + k) + 1, len = k, target = target + k - 1, back = true})
 		} else {
-			append(&tr.dels[side], Del_Rec{lv = lv + done, len = k, target = target, back = false})
+			append(&tr.dels[side], Del_Rec{lv = lv + Lv(done), len = k, target = target, back = false})
 		}
 		done += k
 	}
@@ -389,7 +398,7 @@ tr_delete :: proc(tr: ^Tracker, pos: int, count: int, lv: Lv, back: bool, lv_hi:
 }
 
 @(private)
-tr_state :: proc(tr: ^Tracker, id: int, n: int, delta: int) {
+tr_state :: proc(tr: ^Tracker, id: i64, n: i64, delta: i64) {
 	cur := id
 	rem := n
 	for rem > 0 {
@@ -407,7 +416,7 @@ tr_state :: proc(tr: ^Tracker, id: int, n: int, delta: int) {
 		}
 		it := &tr.items.leaves[leaf].items[i]
 		before := item_metrics(it^)
-		it.state = u32(max(int(it.state) + delta, 0))
+		it.state = u32(max(i64(it.state) + delta, 0))
 		tree_add(&tr.items, leaf, item_metrics(it^) - before)
 		cur += k
 		rem -= k
@@ -419,7 +428,7 @@ rec_first :: proc "contextless" (recs: []Del_Rec, lv: Lv) -> int {
 	lo, hi := 0, len(recs)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if recs[mid].lv + recs[mid].len <= lv {
+		if i64(recs[mid].lv) + recs[mid].len <= i64(lv) {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -429,21 +438,21 @@ rec_first :: proc "contextless" (recs: []Del_Rec, lv: Lv) -> int {
 }
 
 @(private)
-tr_del_targets :: proc(tr: ^Tracker, a, b: Lv, delta: int) {
+tr_del_targets :: proc(tr: ^Tracker, a, b: Lv, delta: i64) {
 	for side in 0 ..< 2 {
 		recs := tr.dels[side][:]
 		for j := rec_first(recs, a); j < len(recs) && recs[j].lv < b; j += 1 {
 			r := recs[j]
 			x := max(a, r.lv)
-			y := min(b, r.lv + r.len)
+			y := min(b, Lv(i64(r.lv) + r.len))
 			if y <= x {
 				continue
 			}
 			if r.back {
-				hi := r.target - (x - r.lv)
-				tr_state(tr, hi - (y - x) + 1, y - x, delta)
+				hi := r.target - i64(x - r.lv)
+				tr_state(tr, hi - i64(y - x) + 1, i64(y - x), delta)
 			} else {
-				tr_state(tr, r.target + (x - r.lv), y - x, delta)
+				tr_state(tr, r.target + i64(x - r.lv), i64(y - x), delta)
 			}
 		}
 	}
@@ -457,13 +466,13 @@ tr_move :: proc(tr: ^Tracker, g: ^Graph, log: ^Text_Log, to: []Lv) {
 	graph_diff(g, tr.version[:], to, &tr.ra, &tr.ad)
 	for pass in 0 ..< 2 {
 		spans := tr.ra[:] if pass == 0 else tr.ad[:]
-		delta := -1 if pass == 0 else 1
+		delta: i64 = -1 if pass == 0 else 1
 		clear(&tr.pieces)
 		_ = log_pieces(log, spans, &tr.pieces)
 		for p in tr.pieces {
 			e := log.entries[p.entry]
 			if is_insert(e.kind) {
-				tr_state(tr, PH + p.lv, p.len, delta)
+				tr_state(tr, PH + i64(p.lv), i64(p.len), delta)
 			} else {
 				tr_del_targets(tr, p.lv, p.lv + p.len, delta)
 			}
