@@ -81,7 +81,7 @@ Pos :: struct {
 
 @(private)
 Structure_Cache :: struct {
-	arena: runtime.Arena,
+	arena: obj.Arena,
 	ready: bool,
 	ends:  [dynamic]i64,
 	now:   [dynamic]i64,
@@ -110,7 +110,7 @@ _cache :: proc(v: ^obj.View) -> (c: ^Structure_Cache, err: Error) {
 	v.cache_free = proc(p: rawptr, allocator: runtime.Allocator) {
 		c := (^Structure_Cache)(p)
 		if c.ready {
-			runtime.arena_destroy(&c.arena)
+			obj.arena_destroy(&c.arena)
 		}
 		delete(c.ends)
 		delete(c.now)
@@ -131,14 +131,14 @@ structure_load :: proc(v: ^obj.View, t: ^Tail, floor: prim.Hlc, st: ^Structure) 
 	}
 	if !same {
 		if c.ready {
-			runtime.arena_destroy(&c.arena)
+			obj.arena_destroy(&c.arena)
 			c.ready = false
 		}
-		if _arena_init(&c.arena) != nil {
+		if obj.arena_init(&c.arena) != nil {
 			return .No_Memory
 		}
 		c.ready = true
-		a := runtime.arena_allocator(&c.arena)
+		a := obj.arena_allocator(&c.arena)
 		c.st = {
 			entries    = make([dynamic]Entry, a),
 			chains     = make([dynamic]Entry, a),
@@ -168,7 +168,7 @@ structure_load :: proc(v: ^obj.View, t: ^Tail, floor: prim.Hlc, st: ^Structure) 
 		append(&c.ends, ..c.now[:])
 	}
 	if c.st.floor > floor {
-		a := runtime.arena_allocator(&c.arena)
+		a := obj.arena_allocator(&c.arena)
 		missing := false
 		for s in 0 ..< len(v.segs) {
 			w := &c.walks[s]
@@ -187,7 +187,7 @@ structure_load :: proc(v: ^obj.View, t: ^Tail, floor: prim.Hlc, st: ^Structure) 
 			if e == .Missing {
 				missing = true
 			} else if e != .None {
-				runtime.arena_destroy(&c.arena)
+				obj.arena_destroy(&c.arena)
 				c.ready = false
 				return e
 			}
@@ -776,15 +776,4 @@ _add_digest :: proc(c: ^Chain_Ctx, s: int, r: Forks) -> Error {
 		append(&c.st.landed, Landed_Entry{run, d.outcome})
 	}
 	return .None
-}
-
-ARENA_BLOCK :: 1 << 20
-
-@(private)
-_arena_init :: proc(a: ^runtime.Arena) -> runtime.Allocator_Error {
-	a^ = runtime.Arena{
-		backing_allocator  = context.allocator,
-		minimum_block_size = ARENA_BLOCK,
-	}
-	return nil
 }
