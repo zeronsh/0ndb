@@ -157,6 +157,7 @@ Config :: struct {
 	write_observer:  fs.Write_Observer,
 	durability:      Durability,
 	verify_chains:   bool,
+	idle_pageout:    bool,
 	kernel_tls:      bool,
 	padding:         bool,
 	search:          bool,
@@ -678,6 +679,9 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	}
 	if !e.pack_more {
 		_heap_release(e)
+		if e.cfg.idle_pageout {
+			_pageout(e)
+		}
 	}
 }
 
