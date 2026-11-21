@@ -202,6 +202,9 @@ view_tail :: proc(v: ^obj.View, self: prim.Id = {}, allocator := context.allocat
 				return t, merr
 			}
 			if moved {
+				if t.head == (Vref{s, o.msg}) {
+					t.running = true
+				}
 				continue
 			}
 			if o.state != .Running {

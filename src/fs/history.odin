@@ -238,6 +238,10 @@ history_retain :: proc(h: ^History) {
 	h.refs += 1
 }
 
+history_set_streams :: proc(h: ^History, streams: Stream_Source) {
+	h.streams = streams
+}
+
 history_release :: proc(h: ^History) {
 	if h == nil {
 		return

@@ -116,6 +116,10 @@ run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
 		for len(w.queue) > 0 && w.queue[0].at <= w.now {
 			ev := pop_event(w)
 			w.stats.events += 1
+			if trace_events {
+				cid: u64 = ev.conn.id if ev.conn != nil else 0
+				fmt.eprintf("ev %d t=%d k=%v node=%d conn=%d gen=%d len=%d h=%x arg=%d\n", w.stats.events, ev.at, ev.kind, ev.node, cid, ev.gen, len(ev.bytes), mix_bytes(0, ev.bytes), ev.arg)
+			}
 			handle_event(w, &ev)
 			delete(ev.bytes, w.allocator)
 			drain_all(w)
@@ -264,6 +268,7 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	cfg.verbose = verbose
 	cfg.disabled = env_disabled()
 	leak_sites = env_u64("SIM_LEAK_SITES", 0) != 0
+	trace_events = env_u64("SIM_TRACE_EVENTS", 0) != 0
 	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {}
 	cfg.io_rate = env_u64("SIM_IO", cfg.io_rate)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
@@ -481,6 +486,8 @@ env_disabled :: proc() -> (out: bit_set[Op_Kind]) {
 	}
 	return
 }
+
+trace_events := false
 
 FIXED_SEEDS :: [?]u64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 

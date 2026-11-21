@@ -214,6 +214,7 @@ _hist_open :: proc(h: ^Handle) -> Error {
 	for mt in e.plug.mounts {
 		if mt.object.id == h.id && mt.mount.history != nil {
 			fs.history_retain(mt.mount.history)
+			fs.history_set_streams(mt.mount.history, fs.Stream_Source{data = h, read = _hist_read})
 			h.hist = mt.mount.history
 			h.hist_chain = h.own_tree != nil
 			return .None

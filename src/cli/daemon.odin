@@ -178,6 +178,9 @@ daemon_main :: proc(args: ^Args) -> int {
 		if prim.loop_step(&d.s.loop, true) != .None {
 			break
 		}
+		if len(d.mcp) > 0 {
+			_mcp_sweep(d)
+		}
 	}
 	_shutdown(d)
 	return 0

@@ -885,6 +885,7 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	}
 	_pending_apply(r, rm)
 	rm.keys_wait = false
+	_held_apply(r, rm)
 	if r.phase == .Ready {
 		_remote_pull(r, rm)
 		_remote_settle(r, rm)

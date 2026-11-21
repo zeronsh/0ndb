@@ -383,7 +383,7 @@ _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 		seg.tree = rt
 	}
 	append(&h.segs, seg)
-	if journal.replica_length(rep) == 0 {
+	if journal.replica_length(rep) == 0 || (sp.connected && !osync.replicator_current(&sp.repl, &h.scope, device, h.name, 0)) {
 		seg.waiting = true
 		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
 		e.stats.fetches += 1
@@ -558,6 +558,7 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 		h.w_open = false
 	}
 	if h.hist != nil {
+		fs.history_set_streams(h.hist, {})
 		fs.history_release(h.hist)
 		h.hist = nil
 	}

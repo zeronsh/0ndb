@@ -158,6 +158,8 @@ Remote :: struct {
 	grouped:   bool,
 	quarantined: bool,
 	keys_wait: bool,
+	kheld_at:  i64,
+	kheld:     [dynamic]u8,
 	claims:    [dynamic]i64,
 	backward:  bool,
 	last_from: i64,
@@ -603,6 +605,14 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 		return rm.relay_len
 	}
 	return -1
+}
+
+replicator_current :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
+	id := stream_id(scope, device, name, epoch)
+	if rm, ok := r.remotes[id]; ok {
+		return rm.follow && rm.relay_len >= 0 && rm.fresh_gen >= rm.want_gen
+	}
+	return false
 }
 
 
@@ -1122,6 +1132,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 		r.rx_remote = nil
 	}
 	journal.replica_close(&rm.rep)
+	delete(rm.kheld)
 	crypto.zero_explicit(&rm.skey, size_of(rm.skey))
 	scope_clear(&rm.scope)
 	if len(rm.head_keys) > 0 {
@@ -1585,6 +1596,9 @@ _stage_flush :: proc(r: ^Replicator, final: bool, stream_len: i64) {
 	keep := 0
 	if rm != nil && !rm.quarantined {
 		lo, hi, rest, bad := _stage_check(r, rm, final, stream_len)
+		if rest == 0 {
+			_hold_unchecked(r, rm, lo, hi, bad)
+		}
 		if hi > lo {
 			if err := _stage_write(rm, r.stage_at + i64(lo), r.stage[lo:hi]); err != .None {
 				_emit(r, Repl_Event{kind = .Refused, err = _from_journal(err), device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
@@ -1611,6 +1625,53 @@ _stage_flush :: proc(r: ^Replicator, final: bool, stream_len: i64) {
 		delete(r.stage)
 		r.stage = make([dynamic]u8, r.allocator)
 	}
+}
+
+@(private)
+_hold_unchecked :: proc(r: ^Replicator, rm: ^Remote, lo, hi: int, bad: bool) {
+	if bad || !rm.keys_wait {
+		return
+	}
+	from, to := 0, len(r.stage)
+	if lo == 0 && hi < len(r.stage) {
+		from = hi
+	} else if lo > 0 && hi == len(r.stage) {
+		to = lo
+	} else if hi > lo {
+		return
+	}
+	if to <= from {
+		return
+	}
+	at := r.stage_at + i64(from)
+	if len(rm.kheld) > 0 && rm.kheld_at + i64(len(rm.kheld)) == at {
+		append(&rm.kheld, ..r.stage[from:to])
+		return
+	}
+	clear(&rm.kheld)
+	append(&rm.kheld, ..r.stage[from:to])
+	rm.kheld_at = at
+}
+
+@(private)
+_held_apply :: proc(r: ^Replicator, rm: ^Remote) {
+	if len(rm.kheld) == 0 {
+		return
+	}
+	saved := r.stage
+	saved_at := r.stage_at
+	r.stage = rm.kheld
+	r.stage_at = rm.kheld_at
+	rm.kheld = make([dynamic]u8, r.allocator)
+	lo, hi, _, bad := _stage_check(r, rm, true, rm.relay_len)
+	if !bad && hi > lo {
+		if err := _stage_write(rm, r.stage_at + i64(lo), r.stage[lo:hi]); err == .None {
+			_remote_landed(r, rm, r.stage_at + i64(lo), r.stage_at + i64(hi), rm.relay_len)
+		}
+	}
+	delete(r.stage)
+	r.stage = saved
+	r.stage_at = saved_at
 }
 
 @(private)

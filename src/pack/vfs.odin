@@ -691,14 +691,27 @@ _v_punch_hole :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> Error {
 	oi := h.oi
 	if oi.ino.kind == .External {
 		oi.dirty = true
-		if e := prim.punch_hole(p.base, oi.real_fd, off, size); e != .None {
-			return _poison(p, e)
+		fsize, serr := prim.file_size(p.base, oi.real_fd)
+		if serr != .None {
+			return _poison(p, serr)
+		}
+		if n := min(off + size, fsize) - off; n > 0 {
+			if e := prim.zero_range(p.base, oi.real_fd, off, n); e != .None {
+				return _poison(p, e)
+			}
 		}
 		if e := _sync(p, oi.real_fd); e != .None {
 			_suspect_record(p, []u64{oi.inum})
 			return _poison(p, e)
 		}
-		return .None
+		if !oi.ino.stale {
+			return .None
+		}
+		_erase_stale(p, oi.inum, off, off + size, true) or_return
+		if p.compacting != 0 {
+			append(&p.cscan, Scan{inum = oi.inum, lo = off, hi = off + size})
+		}
+		return _maybe_flush(p)
 	}
 	old := oi.ino
 	scratch: Phys_List
