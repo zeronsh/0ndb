@@ -253,8 +253,8 @@ ensure_blob :: proc(m: ^Mount, rel: string, e: ^Entry) -> Error {
 	context.temp_allocator = virtual.arena_allocator(&scratch)
 	if .Opaque in tree_flags(h, e.inode) {
 		reg, has := history_blob(h, e.inode) or_return
-		if has && odb.exists(m.db, reg.oid) {
-			e.oid = reg.oid
+		if has && odb.exists(m.db, odb.Oid(reg.oid)) {
+			e.oid = odb.Oid(reg.oid)
 			return .None
 		}
 	} else {

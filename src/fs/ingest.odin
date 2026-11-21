@@ -718,6 +718,7 @@ import_flush :: proc(st: ^Import_State) -> Error {
 		append(&st.b.imports, Import_File{inode = fstree.ROOT, len = -1})
 	}
 	builder_commit_import(m, &st.b) or_return
+	history_sync(m.history) or_return
 	shadow_persist(&m.shadow) or_return
 	clear(&m.intents)
 	save_mount_state(m) or_return
@@ -935,6 +936,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 		m.reflog_pos = git_reflog_len(m.vfs, m.git)
 		m.stamp = git_index_stamp(m.vfs, m.git)
 	}
+	history_sync(m.history) or_return
 	shadow_persist(&m.shadow) or_return
 	clear(&m.intents)
 	if len(m.dirty) > 0 {
@@ -1197,6 +1199,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			builder_commit(m, &b) or_return
 		}
 	}
+	history_sync(m.history) or_return
 	shadow_persist(&m.shadow) or_return
 	clear(&m.intents)
 	save_mount_state(m) or_return

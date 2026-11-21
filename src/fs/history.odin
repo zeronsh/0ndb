@@ -3,63 +3,39 @@ package fs
 import "base:runtime"
 import "core:slice"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../journal"
 import "../odb"
 import "../prim"
 
-REC_BATCH :: u8(1)
-REC_IMPORT :: u8(3)
-REC_ACTORS :: u8(2)
+REC_BATCH :: fshist.REC_BATCH
+REC_IMPORT :: fshist.REC_IMPORT
+REC_ACTORS :: fshist.REC_ACTORS
 
-TOP_CREATE :: u8(1)
-TOP_MOVE :: u8(2)
-TOP_REMOVE :: u8(3)
-TOP_RESTORE :: u8(4)
-TOP_FLAGS :: u8(5)
-TOP_TARGET :: u8(6)
-TOP_CONTENT :: u8(16)
-TOP_GIT :: u8(17)
+TOP_CREATE :: fshist.TOP_CREATE
+TOP_MOVE :: fshist.TOP_MOVE
+TOP_REMOVE :: fshist.TOP_REMOVE
+TOP_RESTORE :: fshist.TOP_RESTORE
+TOP_FLAGS :: fshist.TOP_FLAGS
+TOP_TARGET :: fshist.TOP_TARGET
+TOP_CONTENT :: fshist.TOP_CONTENT
+TOP_GIT :: fshist.TOP_GIT
 
 CHECKPOINT_OPS :: 64
-OPS_CHUNK :: 256
-MOVES_CHUNK :: 512
+OPS_CHUNK :: fshist.OPS_CHUNK
+MOVES_CHUNK :: fshist.MOVES_CHUNK
 
-Version :: []crdt.Op_Id
+Version :: fshist.Version
 
 Stream_Source :: struct {
 	data: rawptr,
 	read: proc(data: rawptr, stream: prim.Id, off: i64, out: ^[dynamic]u8) -> bool,
 }
 
-Blob_Reg :: struct {
-	lamport: u64,
-	actor:   prim.Id,
-	seq:     u64,
-	oid:     odb.Oid,
-	size:    i64,
-}
-
-Op_Ref :: struct {
-	stream: u32,
-	off:    u64,
-	from:   u32,
-	to:     u32,
-}
-
-File_Record :: struct {
-	blob:       Blob_Reg,
-	has_blob:   bool,
-	cp_version: [dynamic]crdt.Op_Id,
-	cp_text:    odb.Oid,
-	cp_spans:   [dynamic]crdt.Author_Span,
-	cp_len:     i64,
-	cp_count:   u32,
-	has_cp:     bool,
-	ops:        u32,
-	base:       Op_Ref,
-	has_base:   bool,
-}
+Blob_Reg :: fshist.Blob_Reg
+Op_Ref :: fshist.Op_Ref
+File_Record :: fshist.File_Record
 
 File_State :: struct {
 	inode:  fstree.Inode_Id,
@@ -88,6 +64,19 @@ History_Options :: struct {
 	keep_at_least: i64,
 	clock:         Clock,
 	random:        prim.Random,
+	sync:          Sync_Hook,
+}
+
+Sync_Hook :: struct {
+	data: rawptr,
+	call: proc(data: rawptr) -> bool,
+}
+
+history_sync :: proc(h: ^History) -> Error {
+	if h.opts.sync.call != nil && !h.opts.sync.call(h.opts.sync.data) {
+		return .Io
+	}
+	return .None
 }
 
 History :: struct {
@@ -538,7 +527,7 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 		rec.has_base = true
 		rec.base = Op_Ref{stream, off, 0, u32(pos)}
 		rec.has_cp = true
-		rec.cp_text = odb_oid(op.ref.oid)
+		rec.cp_text = fshist.oid_from_crdt(op.ref.oid)
 		rec.cp_len = i64(op.len)
 		rec.cp_version = make([dynamic]crdt.Op_Id, context.temp_allocator)
 		rec.cp_spans = make([dynamic]crdt.Author_Span, context.temp_allocator)
@@ -970,10 +959,10 @@ history_text_oid :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (oi
 	if crdt.graph_version_lvs(&h.g, rec.cp_version[:], &cpv) != .None {
 		return {}, false, .None
 	}
-	if !crdt.graph_contains_all(&h.g, lvs[:], cpv[:]) || !odb.exists(h.db, rec.cp_text) {
+	if !crdt.graph_contains_all(&h.g, lvs[:], cpv[:]) || !odb.exists(h.db, odb.Oid(rec.cp_text)) {
 		return {}, false, .None
 	}
-	return rec.cp_text, true, .None
+	return odb.Oid(rec.cp_text), true, .None
 }
 
 history_text_spans_at :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Lv, allocator := context.allocator) -> (data: []u8, spans: []crdt.Author_Span, err: Error) {
@@ -1106,23 +1095,7 @@ stream_index :: proc(h: ^History, id: prim.Id) -> u32 {
 
 @(private)
 text_targets :: proc(b: ^crdt.Batch, allocator: runtime.Allocator) -> []crdt.Op_Id {
-	out := make([dynamic]crdt.Op_Id, allocator)
-	for op in b.ops {
-		if op.kind == .Opaque {
-			continue
-		}
-		seen := false
-		for t in out {
-			if t == op.target {
-				seen = true
-				break
-			}
-		}
-		if !seen {
-			append(&out, op.target)
-		}
-	}
-	return out[:]
+	return fshist.text_targets(b, allocator)
 }
 
 @(private)
@@ -1177,7 +1150,7 @@ descends_from_cp :: proc(h: ^History, f: ^File_State, b: ^crdt.Batch) -> bool {
 	return crdt.graph_contains_all(&h.g, ps[:], cpv[:])
 }
 
-LVIDX_REC :: 24
+LVIDX_REC :: fshist.LVIDX_REC
 
 @(private)
 lvidx_add :: proc(h: ^History, first: crdt.Lv, n: int, stream: u32, off: u64) {
@@ -1277,109 +1250,55 @@ note_touched :: proc(h: ^History, ino: fstree.Inode_Id) {
 
 @(private)
 apply_opaque :: proc(h: ^History, b: ^crdt.Batch, at: u64, lv: crdt.Lv, op: crdt.Op_Run, stream: u32, off: u64) -> Error {
-	r := prim.reader(op.content)
-	tag := prim.read_u8(&r)
 	seq := b.seq + at
 	actor := crdt.graph_intern(&h.g, b.actor)
 	lamport := crdt.graph_lamport(&h.g, lv)
 	id := fstree.Op_Id{actor, seq}
-	read_inode :: proc(h: ^History, r: ^prim.Reader) -> fstree.Inode_Id {
-		a := prim.read_id(r)
-		s := prim.read_uvarint(r)
-		return op_inode(h, crdt.Op_Id{a, s})
+	decoded, ok := fshist.decode_opaque(op.content, h, proc(data: rawptr, id: crdt.Op_Id) -> fstree.Inode_Id {
+		return op_inode((^History)(data), id)
+	})
+	if !ok {
+		return .None
 	}
-	tree_op: fstree.Op
-	switch tag {
-	case TOP_CREATE:
-		parent := read_inode(h, &r)
-		kind := prim.read_u8(&r)
-		flags := prim.read_u8(&r)
-		name := prim.read_str(&r)
-		target := prim.read_str(&r)
-		if kind > u8(max(fstree.Kind)) {
-			return .None
-		}
-		tree_op = fstree.Op_Create{parent, name, fstree.Kind(kind), transmute(fstree.Flags)flags & fstree.ALL_FLAGS, target}
-	case TOP_MOVE:
-		inode := read_inode(h, &r)
-		parent := read_inode(h, &r)
-		name := prim.read_str(&r)
-		tree_op = fstree.Op_Move{inode, parent, name}
-	case TOP_REMOVE:
-		tree_op = fstree.Op_Remove{read_inode(h, &r)}
-	case TOP_RESTORE:
-		tree_op = fstree.Op_Restore{read_inode(h, &r)}
-	case TOP_FLAGS:
-		inode := read_inode(h, &r)
-		mask := prim.read_u8(&r)
-		value := prim.read_u8(&r)
-		tree_op = fstree.Op_Set_Flags{inode, transmute(fstree.Flags)mask & fstree.ALL_FLAGS, transmute(fstree.Flags)value & fstree.ALL_FLAGS}
-	case TOP_TARGET:
-		inode := read_inode(h, &r)
-		tree_op = fstree.Op_Set_Target{inode, prim.read_str(&r)}
-	case TOP_CONTENT:
-		inode := read_inode(h, &r)
+	switch o in decoded {
+	case fshist.Content_Op:
 		reg := Blob_Reg {
 			lamport = lamport,
 			actor   = b.actor,
 			seq     = seq,
+			oid     = o.oid,
+			size    = o.size,
 		}
-		osz := prim.read_u8(&r)
-		if osz > 32 {
-			return .None
-		}
-		prim.read_fixed(&r, reg.oid[:osz])
-		reg.size = i64(prim.read_uvarint(&r))
-		if !prim.reader_ok(&r) {
-			return .None
-		}
-		f := history_file(h, inode) or_return
+		f := history_file(h, o.inode) or_return
 		if !f.rec.has_blob || blob_newer(reg, f.rec.blob) {
 			f.rec.blob = reg
 			f.rec.has_blob = true
 			f.dirty = true
 		}
-		blob_log_add(h, inode, reg) or_return
-		note_touched(h, inode)
-		return .None
-	case TOP_GIT:
-		kind := prim.read_str(&r)
-		branch := prim.read_str(&r)
-		commit := prim.read_str(&r)
-		if prim.reader_ok(&r) {
-			k, _ := clone_string(kind, h.allocator)
-			br, _ := clone_string(branch, h.allocator)
-			c, _ := clone_string(commit, h.allocator)
-			append(&h.markers, Git_Marker{k, br, c})
+		blob_log_add(h, o.inode, reg) or_return
+		note_touched(h, o.inode)
+	case fshist.Git_Op:
+		k, _ := clone_string(o.kind, h.allocator)
+		br, _ := clone_string(o.branch, h.allocator)
+		c, _ := clone_string(o.commit, h.allocator)
+		append(&h.markers, Git_Marker{k, br, c})
+	case fshist.Tree_Op:
+		if e := fstree.apply(&h.tree, id, lamport, o.op); e == nil {
+			ino := fstree.op_inode(id, o.op)
+			note_touched(h, ino)
+			if _, mv := o.op.(fstree.Op_Move); mv {
+				append(&h.moves, fstree.Move_Ref{event = {lamport = lamport, seq = seq, actor = actor}, inode = ino})
+			}
+		} else if e == .Unavailable {
+			return .Io
 		}
-		return .None
-	case:
-		return .None
-	}
-	if !prim.reader_ok(&r) {
-		return .None
-	}
-	if e := fstree.apply(&h.tree, id, lamport, tree_op); e == nil {
-		ino := fstree.op_inode(id, tree_op)
-		note_touched(h, ino)
-		if _, ok := tree_op.(fstree.Op_Move); ok {
-			append(&h.moves, fstree.Move_Ref{event = {lamport = lamport, seq = seq, actor = actor}, inode = ino})
-		}
-	} else if e == .Unavailable {
-		return .Io
 	}
 	return .None
 }
 
 @(private)
 blob_newer :: proc(a, b: Blob_Reg) -> bool {
-	if a.lamport != b.lamport {
-		return a.lamport > b.lamport
-	}
-	if a.actor != b.actor {
-		return crdt.id_less(b.actor, a.actor)
-	}
-	return a.seq > b.seq
+	return fshist.blob_newer(a, b)
 }
 
 Local_Actor :: struct {
@@ -1389,69 +1308,33 @@ Local_Actor :: struct {
 }
 
 encode_tree_op :: proc(h: ^History, buf: ^[dynamic]u8, op: fstree.Op, la := Local_Actor{}) {
-	w := prim.writer(buf)
-	put :: proc(h: ^History, w: ^prim.Writer, id: fstree.Inode_Id, la: Local_Actor) {
-		o: crdt.Op_Id
-		if id == fstree.ROOT {
-			o = {}
-		} else if la.on && id.actor == la.ix {
-			o = crdt.Op_Id{la.actor, id.seq}
-		} else {
-			o = inode_op(h, id)
-		}
-		prim.write_id(w, o.actor)
-		prim.write_uvarint(w, o.seq)
+	ctx := Op_Ctx{h, la}
+	fshist.encode_tree_op(buf, op, &ctx, op_ctx_map)
+}
+
+@(private)
+Op_Ctx :: struct {
+	h:  ^History,
+	la: Local_Actor,
+}
+
+@(private)
+op_ctx_map :: proc(data: rawptr, id: fstree.Inode_Id) -> crdt.Op_Id {
+	c := (^Op_Ctx)(data)
+	if c.la.on && id.actor == c.la.ix {
+		return crdt.Op_Id{c.la.actor, id.seq}
 	}
-	switch o in op {
-	case fstree.Op_Create:
-		prim.write_u8(&w, TOP_CREATE)
-		put(h, &w, o.parent, la)
-		prim.write_u8(&w, u8(o.kind))
-		prim.write_u8(&w, transmute(u8)o.flags)
-		prim.write_str(&w, o.name)
-		prim.write_str(&w, o.target)
-	case fstree.Op_Move:
-		prim.write_u8(&w, TOP_MOVE)
-		put(h, &w, o.inode, la)
-		put(h, &w, o.parent, la)
-		prim.write_str(&w, o.name)
-	case fstree.Op_Remove:
-		prim.write_u8(&w, TOP_REMOVE)
-		put(h, &w, o.inode, la)
-	case fstree.Op_Restore:
-		prim.write_u8(&w, TOP_RESTORE)
-		put(h, &w, o.inode, la)
-	case fstree.Op_Set_Flags:
-		prim.write_u8(&w, TOP_FLAGS)
-		put(h, &w, o.inode, la)
-		prim.write_u8(&w, transmute(u8)o.mask)
-		prim.write_u8(&w, transmute(u8)o.value)
-	case fstree.Op_Set_Target:
-		prim.write_u8(&w, TOP_TARGET)
-		put(h, &w, o.inode, la)
-		prim.write_str(&w, o.target)
-	}
+	return inode_op(c.h, id)
 }
 
 encode_content_op :: proc(h: ^History, buf: ^[dynamic]u8, inode: fstree.Inode_Id, oid: odb.Oid, size: i64, la := Local_Actor{}) {
-	w := prim.writer(buf)
-	prim.write_u8(&w, TOP_CONTENT)
-	o := crdt.Op_Id{la.actor, inode.seq} if la.on && inode.actor == la.ix else inode_op(h, inode)
-	prim.write_id(&w, o.actor)
-	prim.write_uvarint(&w, o.seq)
+	ctx := Op_Ctx{h, la}
 	n := h.db.format == .Sha256 ? 32 : 20 if h.db != nil else 20
-	prim.write_u8(&w, u8(n))
-	x := oid
-	prim.write_raw(&w, x[:n])
-	prim.write_uvarint(&w, u64(size))
+	fshist.encode_content_op(buf, op_ctx_map(&ctx, inode), fshist.Raw_Oid(oid), n, size)
 }
 
 encode_git_op :: proc(buf: ^[dynamic]u8, kind, branch, commit: string) {
-	w := prim.writer(buf)
-	prim.write_u8(&w, TOP_GIT)
-	prim.write_str(&w, kind)
-	prim.write_str(&w, branch)
-	prim.write_str(&w, commit)
+	fshist.encode_git_op(buf, kind, branch, commit)
 }
 
 @(private)
@@ -1598,7 +1481,7 @@ load_from_checkpoint :: proc(h: ^History, f: ^File_State, v: []crdt.Lv) -> (ok: 
 		if h.db == nil {
 			return false, .None
 		}
-		t, d, rerr := odb.read(h.db, f.rec.cp_text, context.temp_allocator)
+		t, d, rerr := odb.read(h.db, odb.Oid(f.rec.cp_text), context.temp_allocator)
 		if rerr != .None || t != .Blob || i64(len(d)) != f.rec.cp_len {
 			return false, .None
 		}
@@ -1726,7 +1609,7 @@ persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error 
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			clear(&f.rec.cp_spans)
 			append(&f.rec.cp_spans, ..crdt.text_spans(&f.text, &h.g, context.temp_allocator))
-			f.rec.cp_text = oid
+			f.rec.cp_text = fshist.Raw_Oid(oid)
 			f.rec.cp_len = i64(len(data))
 			f.rec.cp_count = f.rec.ops
 			f.rec.has_cp = true
@@ -1741,51 +1624,7 @@ persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error 
 
 @(private)
 encode_file_record :: proc(buf: ^[dynamic]u8, r: ^File_Record) {
-	w := prim.writer(buf)
-	prim.write_bool(&w, r.has_blob)
-	if r.has_blob {
-		prim.write_uvarint(&w, r.blob.lamport)
-		prim.write_id(&w, r.blob.actor)
-		prim.write_uvarint(&w, r.blob.seq)
-		oid := r.blob.oid
-		prim.write_raw(&w, oid[:])
-		prim.write_ivarint(&w, r.blob.size)
-	}
-	prim.write_uvarint(&w, u64(r.ops))
-	prim.write_bool(&w, r.has_cp)
-	if r.has_cp {
-		prim.write_uvarint(&w, u64(r.cp_count))
-		oid := r.cp_text
-		prim.write_raw(&w, oid[:])
-		prim.write_ivarint(&w, r.cp_len)
-		prim.write_uvarint(&w, u64(len(r.cp_version)))
-		for v in r.cp_version {
-			prim.write_id(&w, v.actor)
-			prim.write_uvarint(&w, v.seq)
-		}
-		prim.write_uvarint(&w, u64(len(r.cp_spans)))
-		for s in r.cp_spans {
-			prim.write_id(&w, s.id.actor)
-			prim.write_uvarint(&w, s.id.seq)
-			prim.write_uvarint(&w, u64(s.len))
-			flags: u8 = 1 if s.redacted else 0
-			if s.op != s.id {
-				flags |= 2
-			}
-			prim.write_u8(&w, flags)
-			if s.op != s.id {
-				prim.write_id(&w, s.op.actor)
-				prim.write_uvarint(&w, s.op.seq)
-			}
-		}
-	}
-	if r.has_base {
-		prim.write_u8(&w, 1)
-		prim.write_uvarint(&w, u64(r.base.stream))
-		prim.write_uvarint(&w, r.base.off)
-		prim.write_uvarint(&w, u64(r.base.from))
-		prim.write_uvarint(&w, u64(r.base.to))
-	}
+	fshist.encode_file_record(buf, r)
 }
 
 @(private)
@@ -1801,62 +1640,7 @@ read_file_record :: proc(h: ^History, id: fstree.Inode_Id, r: ^File_Record) -> E
 
 @(private)
 decode_file_record :: proc(data: []u8, r: ^File_Record) -> Error {
-	rd := prim.reader(data)
-	r.has_blob = prim.read_bool(&rd)
-	if r.has_blob {
-		r.blob.lamport = prim.read_uvarint(&rd)
-		r.blob.actor = prim.read_id(&rd)
-		r.blob.seq = prim.read_uvarint(&rd)
-		prim.read_fixed(&rd, r.blob.oid[:])
-		r.blob.size = prim.read_ivarint(&rd)
-	}
-	r.ops = u32(prim.read_uvarint(&rd))
-	r.has_cp = prim.read_bool(&rd)
-	if r.has_cp {
-		r.cp_count = u32(prim.read_uvarint(&rd))
-		prim.read_fixed(&rd, r.cp_text[:])
-		r.cp_len = prim.read_ivarint(&rd)
-		nv := prim.read_uvarint(&rd)
-		if nv > u64(prim.reader_remaining(&rd)) {
-			return .Corrupt
-		}
-		for _ in 0 ..< nv {
-			a := prim.read_id(&rd)
-			append(&r.cp_version, crdt.Op_Id{a, prim.read_uvarint(&rd)})
-		}
-		ns := prim.read_uvarint(&rd)
-		if ns > u64(prim.reader_remaining(&rd)) {
-			return .Corrupt
-		}
-		for _ in 0 ..< ns {
-			a := prim.read_id(&rd)
-			seq := prim.read_uvarint(&rd)
-			l := prim.read_uvarint(&rd)
-			flags := prim.read_u8(&rd)
-			span := crdt.Author_Span {
-				id       = {a, seq},
-				op       = {a, seq},
-				len      = int(l),
-				redacted = flags & 1 != 0,
-			}
-			if flags & 2 != 0 {
-				span.op.actor = prim.read_id(&rd)
-				span.op.seq = prim.read_uvarint(&rd)
-			}
-			append(&r.cp_spans, span)
-		}
-	}
-	if prim.reader_ok(&rd) && !prim.reader_done(&rd) && prim.read_u8(&rd) == 1 {
-		r.has_base = true
-		r.base.stream = u32(prim.read_uvarint(&rd))
-		r.base.off = prim.read_uvarint(&rd)
-		r.base.from = u32(prim.read_uvarint(&rd))
-		r.base.to = u32(prim.read_uvarint(&rd))
-	}
-	if !prim.reader_ok(&rd) {
-		return .Corrupt
-	}
-	return .None
+	return .Corrupt if fshist.decode_file_record(data, r) != .None else .None
 }
 
 @(private)
@@ -1865,11 +1649,7 @@ write_op_ref :: proc(h: ^History, id: fstree.Inode_Id, i: u32, ref: Op_Ref) -> E
 	data, _ := kv_get(&h.kv, key, context.temp_allocator) or_return
 	buf := make([dynamic]u8, 0, len(data) + 24, context.temp_allocator)
 	append(&buf, ..data)
-	w := prim.writer(&buf)
-	prim.write_uvarint(&w, u64(ref.stream))
-	prim.write_uvarint(&w, ref.off)
-	prim.write_uvarint(&w, u64(ref.from))
-	prim.write_uvarint(&w, u64(ref.to))
+	fshist.encode_op_ref(&buf, ref)
 	return kv_put(&h.kv, key, buf[:])
 }
 
@@ -1879,17 +1659,11 @@ read_op_ref :: proc(h: ^History, id: fstree.Inode_Id, i: u32) -> (ref: Op_Ref, e
 	if !found {
 		return {}, .Corrupt
 	}
-	rd := prim.reader(data)
-	for k: u32 = 0; k <= i % OPS_CHUNK; k += 1 {
-		ref.stream = u32(prim.read_uvarint(&rd))
-		ref.off = prim.read_uvarint(&rd)
-		ref.from = u32(prim.read_uvarint(&rd))
-		ref.to = u32(prim.read_uvarint(&rd))
-	}
-	if !prim.reader_ok(&rd) {
+	r, ok := fshist.op_ref_at(data, i % OPS_CHUNK)
+	if !ok {
 		return {}, .Corrupt
 	}
-	return ref, .None
+	return r, .None
 }
 
 @(private)
@@ -1903,12 +1677,7 @@ persist_moves :: proc(h: ^History) -> Error {
 		data, _ := kv_get(&h.kv, key, context.temp_allocator) or_return
 		buf := make([dynamic]u8, 0, len(data) + 32, context.temp_allocator)
 		append(&buf, ..data)
-		w := prim.writer(&buf)
-		prim.write_uvarint(&w, m.event.lamport)
-		prim.write_uvarint(&w, m.event.seq)
-		prim.write_uvarint(&w, u64(m.event.actor))
-		prim.write_uvarint(&w, u64(m.inode.actor))
-		prim.write_uvarint(&w, m.inode.seq)
+		fshist.encode_move(&buf, m)
 		kv_put(&h.kv, key, buf[:]) or_return
 		h.moves_count += 1
 	}
@@ -2098,20 +1867,8 @@ tree_load_moves :: proc(data: rawptr, from_lamport: u64, out: ^[dynamic]fstree.M
 		if err != .None || !ok {
 			return false
 		}
-		rd := prim.reader(v)
-		for !prim.reader_done(&rd) {
-			m: fstree.Move_Ref
-			m.event.lamport = prim.read_uvarint(&rd)
-			m.event.seq = prim.read_uvarint(&rd)
-			m.event.actor = u32(prim.read_uvarint(&rd))
-			m.inode.actor = u32(prim.read_uvarint(&rd))
-			m.inode.seq = prim.read_uvarint(&rd)
-			if !prim.reader_ok(&rd) {
-				return false
-			}
-			if m.event.lamport >= from_lamport {
-				append(out, m)
-			}
+		if !fshist.decode_moves(v, from_lamport, out) {
+			return false
 		}
 	}
 	for m in h.moves {
@@ -2124,52 +1881,27 @@ tree_load_moves :: proc(data: rawptr, from_lamport: u64, out: ^[dynamic]fstree.M
 
 @(private)
 page_key :: proc(k: crdt.Page_Key) -> []u8 {
-	out := make([]u8, 10, context.temp_allocator)
-	out[0] = 'g'
-	out[1] = 'p'
-	prim.put_u32le(out[2:6], k.actor)
-	prim.put_u32le(out[6:10], k.page)
-	return out
+	return fshist.page_key(k)
 }
 
 @(private)
 inode_key :: proc(prefix: string, id: fstree.Inode_Id) -> []u8 {
-	out := make([]u8, len(prefix) + 12, context.temp_allocator)
-	n := copy(out, prefix)
-	prim.put_u32le(out[n:], id.actor)
-	prim.put_u64le(out[n + 4:], id.seq)
-	return out
+	return fshist.inode_key(prefix, id)
 }
 
 @(private)
 node_key :: proc(k: fstree.Node_Key) -> []u8 {
-	out := make([]u8, 22, context.temp_allocator)
-	out[0] = 't'
-	out[1] = 'n'
-	prim.put_u32le(out[2:6], k.dir.actor)
-	prim.put_u64le(out[6:14], k.dir.seq)
-	prim.put_u64le(out[14:22], k.node)
-	return out
+	return fshist.node_key(k)
 }
 
 @(private)
 ops_key :: proc(id: fstree.Inode_Id, chunk: u32) -> []u8 {
-	out := make([]u8, 18, context.temp_allocator)
-	out[0] = 'f'
-	out[1] = 'o'
-	prim.put_u32le(out[2:6], id.actor)
-	prim.put_u64le(out[6:14], id.seq)
-	prim.put_u32le(out[14:18], chunk)
-	return out
+	return fshist.ops_key(id, chunk)
 }
 
 @(private)
 moves_key :: proc(chunk: u64) -> []u8 {
-	out := make([]u8, 10, context.temp_allocator)
-	out[0] = 'm'
-	out[1] = 'v'
-	prim.put_u64le(out[2:10], chunk)
-	return out
+	return fshist.moves_key(chunk)
 }
 
 @(private)
@@ -2182,31 +1914,12 @@ line_key :: proc(name: string, allocator: runtime.Allocator) -> []u8 {
 }
 
 encode_version :: proc(buf: ^[dynamic]u8, v: Version) {
-	w := prim.writer(buf)
-	prim.write_uvarint(&w, u64(len(v)))
-	for x in v {
-		prim.write_id(&w, x.actor)
-		prim.write_uvarint(&w, x.seq)
-	}
+	fshist.encode_version(buf, v)
 }
 
 decode_version :: proc(data: []u8, allocator := context.allocator) -> (v: Version, err: Error) {
-	rd := prim.reader(data)
-	n := prim.read_uvarint(&rd)
-	if n > u64(len(data)) {
-		return nil, .Corrupt
-	}
-	out := make([]crdt.Op_Id, int(n), allocator)
-	for i in 0 ..< int(n) {
-		out[i].actor = prim.read_id(&rd)
-		out[i].seq = prim.read_uvarint(&rd)
-	}
-	if !prim.reader_ok(&rd) {
-		delete(out, allocator)
-		return nil, .Corrupt
-	}
-	slice.sort_by(out, crdt.op_id_less)
-	return out, .None
+	out, e := fshist.decode_version(data, allocator)
+	return out, .Corrupt if e != .None else .None
 }
 
 odb_oid :: proc "contextless" (o: crdt.Oid) -> (out: odb.Oid) {
@@ -2224,23 +1937,10 @@ crdt_oid :: proc "contextless" (o: odb.Oid, format: odb.Hash_Format) -> (out: cr
 	return
 }
 
-REC_REPLACE :: u8(5)
+REC_REPLACE :: fshist.REC_REPLACE
 
 batch_payload :: proc(body: []u8) -> (payload: []u8, ok: bool) {
-	if len(body) == 0 {
-		return nil, false
-	}
-	switch body[0] {
-	case REC_BATCH, REC_IMPORT:
-		return body[1:], true
-	case REC_REPLACE:
-		_, n := prim.get_uvarint(body[1:])
-		if n <= 0 || 1 + n + 1 > len(body) {
-			return nil, false
-		}
-		return body[1 + n + 1:], true
-	}
-	return nil, false
+	return fshist.batch_payload(body)
 }
 
 @(private)
@@ -2329,8 +2029,8 @@ apply_replace_record :: proc(h: ^History, stream: u32, body: []u8, off: u64) -> 
 	return remap_ref(h, stream, old, off, inodes[:])
 }
 
-REC_ALIAS :: u8(7)
-REC_LINE :: u8(8)
+REC_ALIAS :: fshist.REC_ALIAS
+REC_LINE :: fshist.REC_LINE
 
 history_alias :: proc(h: ^History, sources: []string, commit: string, v: Version) -> Error {
 	clear(&h.io)

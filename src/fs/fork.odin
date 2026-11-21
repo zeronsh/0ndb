@@ -283,6 +283,18 @@ mount_land :: proc(fork: ^Mount, source: ^Mount, conflicts: ^[dynamic]Land_Confl
 	return mount_materialize(source)
 }
 
+history_lv_end :: proc "contextless" (h: ^History) -> crdt.Lv {
+	return h.g.next
+}
+
+history_touched_between :: proc(h: ^History, from, to: crdt.Lv, out: ^map[fstree.Inode_Id]bool) -> Error {
+	if to <= from {
+		return .None
+	}
+	spans := []crdt.Lv_Span{{lv = from, len = to - from}}
+	return spans_touched(h, spans, out)
+}
+
 @(private)
 spans_touched :: proc(h: ^History, spans: []crdt.Lv_Span, out: ^map[fstree.Inode_Id]bool) -> Error {
 	for span in spans {

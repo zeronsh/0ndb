@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "../crdt"
+import "../fshist"
 import "../odb"
 import "../prim"
 
@@ -73,6 +74,20 @@ history_bundle_write :: proc(h: ^History, sink: Bundle_Sink) -> Error {
 	}
 	end := [1]u8{u8(Bundle_Frame.End)}
 	return sink.write(sink.data, end[:])
+}
+
+history_checkpoint_meta :: proc(h: ^History, allocator := context.allocator) -> (meta: []u8, err: Error) {
+	out := make([dynamic]u8, allocator)
+	sink := Bundle_Sink{&out, proc(data: rawptr, frame: []u8) -> Error {
+		w := prim.writer((^[dynamic]u8)(data))
+		prim.write_bytes(&w, frame)
+		return .None if w.err == .None else .No_Memory
+	}}
+	if e := history_bundle_write(h, sink); e != .None {
+		delete(out)
+		return nil, e
+	}
+	return out[:], .None
 }
 
 history_bundle_load :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams: Stream_Source, source: Bundle_Source, allocator := context.allocator, opts := History_Options{}) -> Error {
@@ -160,10 +175,10 @@ history_bundle_objects :: proc(h: ^History, data: rawptr, visit: proc(data: rawp
 			return true
 		}
 		if r.has_cp && r.cp_len > 0 {
-			s.visit(s.data, r.cp_text)
+			s.visit(s.data, odb.Oid(r.cp_text))
 		}
 		if r.has_blob {
-			s.visit(s.data, r.blob.oid)
+			s.visit(s.data, odb.Oid(r.blob.oid))
 		}
 		return true
 	})
@@ -230,6 +245,20 @@ remap_record :: proc(key: []u8, value: []u8, self: prim.Id) -> (out: []u8, err: 
 		}
 		prim.write_uvarint(&w, 0)
 		prim.write_uvarint(&w, moves)
+		return buf[:], .None
+	}
+	if len(key) == 13 && key[0] == 'f' {
+		rec: File_Record
+		defer fshist.file_record_destroy(&rec)
+		if fshist.decode_file_record(value, &rec) != .None {
+			return nil, .Corrupt
+		}
+		if !rec.has_base {
+			return value, .None
+		}
+		rec.base.stream += 1
+		buf := make([dynamic]u8, context.temp_allocator)
+		fshist.encode_file_record(&buf, &rec)
 		return buf[:], .None
 	}
 	if len(key) == 18 && key[0] == 'f' && key[1] == 'o' {

@@ -4,6 +4,7 @@ import "core:mem/virtual"
 import "core:slice"
 import "../crdt"
 import "../fstree"
+import "../odb"
 import "../prim"
 
 @(private)
@@ -142,7 +143,7 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 			ra, ha := history_blob_at(h, ino, al[:]) or_return
 			rc, hc := history_blob_at(h, ino, cl[:]) or_return
 			if hb && ha && hc && rb.oid != ra.oid && rc.oid == ra.oid {
-				builder_content(&b, ino, rb.oid, rb.size)
+				builder_content(&b, ino, odb.Oid(rb.oid), rb.size)
 			}
 			continue
 		}

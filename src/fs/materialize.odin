@@ -111,6 +111,7 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	for &it in items {
 		materialize_one(m, &it, tl[:]) or_return
 	}
+	history_sync(m.history) or_return
 	shadow_persist(&m.shadow) or_return
 	clear(&m.intents)
 	if !m.restoring {
@@ -308,7 +309,7 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 		if !has || m.db == nil {
 			return .None
 		}
-		if e.oid == reg.oid && it.has_old && it.old == it.path {
+		if e.oid == odb.Oid(reg.oid) && it.has_old && it.old == it.path {
 			return set_mode(m, abs, mode)
 		}
 		fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
@@ -316,7 +317,7 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 			return from_prim(oerr)
 		}
 		sink := Fd_Sink{m.vfs, fd, 0, .None}
-		_, _, serr := odb.stream(m.db, reg.oid, io.Stream{procedure = fd_sink_proc, data = &sink})
+		_, _, serr := odb.stream(m.db, odb.Oid(reg.oid), io.Stream{procedure = fd_sink_proc, data = &sink})
 		prim.fchmod(m.vfs, fd, mode)
 		prim.close_file(m.vfs, fd)
 		if serr != .None || sink.err != .None {
@@ -324,7 +325,7 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 			return from_odb(serr) if serr != .None else sink.err
 		}
 		from_prim(prim.rename(m.vfs, tmp, abs)) or_return
-		e.oid = reg.oid
+		e.oid = odb.Oid(reg.oid)
 		return .None
 	}
 	ids := crdt.graph_version_ids(&h.g, tl, context.temp_allocator)

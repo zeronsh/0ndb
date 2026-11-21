@@ -5,6 +5,7 @@ import "core:mem/virtual"
 import "core:strings"
 import "../crdt"
 import "../fstree"
+import "../odb"
 import "../prim"
 import "../textdiff"
 
@@ -206,7 +207,7 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 			want_reg, has_want := history_blob_at(h, ino, tl[:]) or_return
 			cur_reg, has_cur := history_blob_at(h, ino, cl[:]) or_return
 			if has_want && (!has_cur || cur_reg.oid != want_reg.oid) {
-				builder_content(&b, ino, want_reg.oid, want_reg.size)
+				builder_content(&b, ino, odb.Oid(want_reg.oid), want_reg.size)
 			}
 			continue
 		}

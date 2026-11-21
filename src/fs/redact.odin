@@ -2,12 +2,13 @@ package fs
 
 import "core:mem/virtual"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../journal"
 import "../odb"
 import "../prim"
 
-REC_REDACT :: u8(4)
+REC_REDACT :: fshist.REC_REDACT
 
 Redact_Result :: struct {
 	spans:     int,
@@ -240,7 +241,7 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 			crdt.log_redact(&f.log, &h.g, sp.id.actor, sp.id.seq, sp.len)
 		}
 		if secret && f.rec.has_cp && f.rec.cp_len > 0 {
-			append(targets, f.rec.cp_text)
+			append(targets, odb.Oid(f.rec.cp_text))
 		}
 		if secret {
 			blob_versions_hit(h, ino, spans, targets) or_return
@@ -257,7 +258,7 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			clear(&f.rec.cp_spans)
 			append(&f.rec.cp_spans, ..crdt.text_spans(&f.text, &h.g, context.temp_allocator))
-			f.rec.cp_text = oid
+			f.rec.cp_text = fshist.Raw_Oid(oid)
 			f.rec.cp_len = i64(len(data))
 			f.rec.cp_count = f.rec.ops + u32(len(f.new_refs))
 			f.rec.has_cp = true

@@ -2,11 +2,12 @@ package fs
 
 import "core:mem/virtual"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../journal"
 import "../odb"
 
-REC_SEAL :: u8(6)
+REC_SEAL :: fshist.REC_SEAL
 
 history_seal :: proc(h: ^History, v: Version) -> Error {
 	arena: virtual.Arena
@@ -140,7 +141,7 @@ seal_checkpoint :: proc(h: ^History, ino: fstree.Inode_Id, eff: []crdt.Lv) -> Er
 	append(&tmp.rec.cp_version, ..crdt.graph_version_ids(&h.g, eff, context.temp_allocator))
 	clear(&tmp.rec.cp_spans)
 	append(&tmp.rec.cp_spans, ..crdt.text_spans(&tmp.text, &h.g, context.temp_allocator))
-	tmp.rec.cp_text = oid
+	tmp.rec.cp_text = fshist.Raw_Oid(oid)
 	tmp.rec.cp_len = i64(len(data))
 	tmp.rec.cp_count = count
 	tmp.rec.has_cp = true
