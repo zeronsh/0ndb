@@ -83,6 +83,8 @@ status_of :: proc "contextless" (err: eng.Error) -> Status {
 		return .No_Memory
 	case .Io:
 		return .Io
+	case .Conflict:
+		return .Conflict
 	}
 	return .Io
 }

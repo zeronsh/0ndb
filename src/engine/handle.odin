@@ -612,6 +612,7 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 		h.w_open = false
 	}
 	if h.hist != nil {
+		_buffers_detach(e, h)
 		fs.history_set_streams(h.hist, {})
 		fs.history_release(h.hist)
 		h.hist = nil

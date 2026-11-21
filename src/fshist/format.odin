@@ -74,6 +74,7 @@ File_Record :: struct {
 	ops:        u32,
 	base:       Op_Ref,
 	has_base:   bool,
+	spans_ext:  bool,
 }
 
 Content_Op :: struct {
@@ -267,20 +268,10 @@ encode_file_record :: proc(buf: ^[dynamic]u8, r: ^File_Record) {
 			prim.write_id(&w, v.actor)
 			prim.write_uvarint(&w, v.seq)
 		}
-		prim.write_uvarint(&w, u64(len(r.cp_spans)))
-		for s in r.cp_spans {
-			prim.write_id(&w, s.id.actor)
-			prim.write_uvarint(&w, s.id.seq)
-			prim.write_uvarint(&w, u64(s.len))
-			flags: u8 = 1 if s.redacted else 0
-			if s.op != s.id {
-				flags |= 2
-			}
-			prim.write_u8(&w, flags)
-			if s.op != s.id {
-				prim.write_id(&w, s.op.actor)
-				prim.write_uvarint(&w, s.op.seq)
-			}
+		if r.spans_ext {
+			prim.write_uvarint(&w, 0)
+		} else {
+			encode_spans(buf, r.cp_spans[:])
 		}
 	}
 	if r.has_base {
@@ -290,6 +281,60 @@ encode_file_record :: proc(buf: ^[dynamic]u8, r: ^File_Record) {
 		prim.write_uvarint(&w, u64(r.base.from))
 		prim.write_uvarint(&w, u64(r.base.to))
 	}
+	if r.has_cp && r.spans_ext {
+		prim.write_u8(&w, 2)
+	}
+}
+
+encode_spans :: proc(buf: ^[dynamic]u8, spans: []crdt.Author_Span) {
+	w := prim.writer(buf)
+	prim.write_uvarint(&w, u64(len(spans)))
+	for s in spans {
+		prim.write_id(&w, s.id.actor)
+		prim.write_uvarint(&w, s.id.seq)
+		prim.write_uvarint(&w, u64(s.len))
+		flags: u8 = 1 if s.redacted else 0
+		if s.op != s.id {
+			flags |= 2
+		}
+		prim.write_u8(&w, flags)
+		if s.op != s.id {
+			prim.write_id(&w, s.op.actor)
+			prim.write_uvarint(&w, s.op.seq)
+		}
+	}
+}
+
+decode_spans :: proc(data: []u8, out: ^[dynamic]crdt.Author_Span) -> Error {
+	rd := prim.reader(data)
+	read_spans(&rd, out) or_return
+	return .None if prim.reader_ok(&rd) else .Corrupt
+}
+
+@(private)
+read_spans :: proc(rd: ^prim.Reader, out: ^[dynamic]crdt.Author_Span) -> Error {
+	ns := prim.read_uvarint(rd)
+	if ns > u64(prim.reader_remaining(rd)) {
+		return .Corrupt
+	}
+	for _ in 0 ..< ns {
+		a := prim.read_id(rd)
+		seq := prim.read_uvarint(rd)
+		l := prim.read_uvarint(rd)
+		flags := prim.read_u8(rd)
+		span := crdt.Author_Span {
+			id       = {a, seq},
+			op       = {a, seq},
+			len      = int(l),
+			redacted = flags & 1 != 0,
+		}
+		if flags & 2 != 0 {
+			span.op.actor = prim.read_id(rd)
+			span.op.seq = prim.read_uvarint(rd)
+		}
+		append(out, span)
+	}
+	return .None
 }
 
 decode_file_record :: proc(data: []u8, r: ^File_Record) -> Error {
@@ -316,34 +361,21 @@ decode_file_record :: proc(data: []u8, r: ^File_Record) -> Error {
 			a := prim.read_id(&rd)
 			append(&r.cp_version, crdt.Op_Id{a, prim.read_uvarint(&rd)})
 		}
-		ns := prim.read_uvarint(&rd)
-		if ns > u64(prim.reader_remaining(&rd)) {
+		read_spans(&rd, &r.cp_spans) or_return
+	}
+	for prim.reader_ok(&rd) && !prim.reader_done(&rd) {
+		switch prim.read_u8(&rd) {
+		case 1:
+			r.has_base = true
+			r.base.stream = u32(prim.read_uvarint(&rd))
+			r.base.off = prim.read_uvarint(&rd)
+			r.base.from = u32(prim.read_uvarint(&rd))
+			r.base.to = u32(prim.read_uvarint(&rd))
+		case 2:
+			r.spans_ext = true
+		case:
 			return .Corrupt
 		}
-		for _ in 0 ..< ns {
-			a := prim.read_id(&rd)
-			seq := prim.read_uvarint(&rd)
-			l := prim.read_uvarint(&rd)
-			flags := prim.read_u8(&rd)
-			span := crdt.Author_Span {
-				id       = {a, seq},
-				op       = {a, seq},
-				len      = int(l),
-				redacted = flags & 1 != 0,
-			}
-			if flags & 2 != 0 {
-				span.op.actor = prim.read_id(&rd)
-				span.op.seq = prim.read_uvarint(&rd)
-			}
-			append(&r.cp_spans, span)
-		}
-	}
-	if prim.reader_ok(&rd) && !prim.reader_done(&rd) && prim.read_u8(&rd) == 1 {
-		r.has_base = true
-		r.base.stream = u32(prim.read_uvarint(&rd))
-		r.base.off = prim.read_uvarint(&rd)
-		r.base.from = u32(prim.read_uvarint(&rd))
-		r.base.to = u32(prim.read_uvarint(&rd))
 	}
 	if !prim.reader_ok(&rd) {
 		return .Corrupt

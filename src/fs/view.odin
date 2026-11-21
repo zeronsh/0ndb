@@ -68,6 +68,13 @@ view_load :: proc(h: ^History, view: ^Text_View, lvs: []crdt.Lv) -> Error {
 	fshist.text_drop(&view.st)
 	view.stale = false
 	if f, ok := h.files[view.inode]; ok && f.loaded && crdt.frontier_eq(f.text.version[:], lvs) {
+		if !f.dirty && len(f.new_refs) == 0 {
+			view.st = f.st
+			f.st = {}
+			file_free(h, f)
+			delete_key(&h.files, view.inode)
+			return .None
+		}
 		crdt.text_clone(&view.text, &f.text, h.allocator)
 		crdt.log_clone(&view.log, &f.log, h.allocator)
 		view.loaded = true
@@ -101,17 +108,23 @@ view_load :: proc(h: ^History, view: ^Text_View, lvs: []crdt.Lv) -> Error {
 }
 
 history_view_advance :: proc(h: ^History, view: ^Text_View, target: Version, sink: crdt.Text_Sink) -> Error {
+	_, err := history_view_advance_ex(h, view, target, sink)
+	return err
+}
+
+history_view_advance_ex :: proc(h: ^History, view: ^Text_View, target: Version, sink: crdt.Text_Sink) -> (reloaded: bool, err: Error) {
 	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, target, &lvs) != .None {
-		return .Not_Found
+		return false, .Not_Found
 	}
 	if view.loaded && !view.stale {
 		if crdt.frontier_eq(view.text.version[:], lvs[:]) {
-			return .None
+			return false, .None
 		}
 		if crdt.graph_contains_all(&h.g, lvs[:], view.text.version[:]) {
-			if crdt.text_merge(&view.text, &h.g, &view.log, lvs[:], nil, sink) == .None {
-				return .None
+			merr := crdt.text_merge(&view.text, &h.g, &view.log, lvs[:], nil, sink)
+			if merr == .None || merr == .Missing_Content {
+				return false, .None
 			}
 		}
 	}
@@ -119,10 +132,14 @@ history_view_advance :: proc(h: ^History, view: ^Text_View, target: Version, sin
 	if view.loaded {
 		old = crdt.text_bytes(&view.text, context.temp_allocator)
 	}
-	view_load(h, view, lvs[:]) or_return
-	nw := crdt.text_bytes(&view.text, context.temp_allocator)
-	view_diff_feed(h, view, old, nw, sink)
-	return .None
+	if lerr := view_load(h, view, lvs[:]); lerr != .None {
+		return true, lerr
+	}
+	if sink.insert != nil && sink.delete != nil {
+		nw := crdt.text_bytes(&view.text, context.temp_allocator)
+		view_diff_feed(h, view, old, nw, sink)
+	}
+	return true, .None
 }
 
 @(private)
