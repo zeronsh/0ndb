@@ -1,0 +1,362 @@
+package sim
+
+import "base:runtime"
+import "core:fmt"
+import "core:strings"
+import eng "../../src/engine"
+import "../../src/prim"
+import osync "../../src/sync"
+
+EPOCH_NS :: i64(1_790_000_000) * 1_000_000_000
+
+Ev_Kind :: enum u8 {
+	Op,
+	Connect,
+	To_Relay,
+	To_Node,
+	Fin_To_Node,
+	Reset,
+	Writable_Node,
+	Writable_Relay,
+	Fault,
+	Restart,
+	Relay_Restart,
+	Heal,
+}
+
+Sim_Event :: struct {
+	at:    i64,
+	seq:   u64,
+	kind:  Ev_Kind,
+	node:  int,
+	conn:  ^Conn,
+	gen:   u64,
+	bytes: []u8,
+	arg:   u64,
+}
+
+Node_Clock :: struct {
+	w:        ^World,
+	mono_off: i64,
+	wall_off: i64,
+}
+
+Instance :: struct {
+	main:    Region,
+	temp:    Region,
+	loop:    prim.Loop,
+	loop_on: bool,
+}
+
+Node :: struct {
+	w:           ^World,
+	idx:         int,
+	name:        string,
+	disk:        Disk,
+	clock:       Node_Clock,
+	alive:       bool,
+	incarnation: int,
+	inst:        Instance,
+	e:           eng.Engine,
+	e_open:      bool,
+	keyring:     osync.File_Keyring,
+	key_open:    bool,
+	rng:         Rng,
+	ids:         Rng,
+	conns:       [dynamic]^Conn,
+	partitioned: bool,
+	durable:     u64,
+	failures:    int,
+	last_wake:   u64,
+	identity:    osync.Identity,
+	caps:        [8]eng.Cap_Credentials,
+}
+
+Relay_Node :: struct {
+	w:      ^World,
+	disk:   Disk,
+	clock:  Node_Clock,
+	alive:  bool,
+	inst:   Instance,
+	r:      osync.Relay,
+	r_on:   bool,
+	rng:    Rng,
+	public: osync.Public_Key,
+	sauth:  osync.Space_Authorizer,
+	cauth:  eng.Cap_Authorizer,
+}
+
+World_Stats :: struct {
+	events:       u64,
+	steps:        u64,
+	ops:          u64,
+	ops_failed:   u64,
+	crashes:      u64,
+	relay_crash:  u64,
+	resets:       u64,
+	partitions:   u64,
+	jumps:        u64,
+	bytes_net:    u64,
+	deliveries:   u64,
+	engine_close: u64,
+	relay_close:  u64,
+	backpressure: u64,
+}
+
+Config :: struct {
+	seed:        u64,
+	nodes:       int,
+	spaces:      int,
+	ops:         int,
+	op_gap_ms:   i64,
+	crash_rate:  int,
+	fault_rate:  int,
+	fault_gap_ms: i64,
+	max_delay:   i64,
+	window:      int,
+	settle_ms:   i64,
+	verbose:     bool,
+	trace_limit: int,
+	disabled:    bit_set[Op_Kind],
+	share_access: eng.Access_Set,
+}
+
+World :: struct {
+	cfg:       Config,
+	now:       i64,
+	seq:       u64,
+	queue:     [dynamic]Sim_Event,
+	rng:       Rng,
+	net_rng:   Rng,
+	fault_rng: Rng,
+	nodes:     [dynamic]^Node,
+	relay:     Relay_Node,
+	conn_ids:  u64,
+	conns:     [dynamic]^Conn,
+	trace:     u64,
+	stats:     World_Stats,
+	failures:  [dynamic]string,
+	log:       [dynamic]string,
+	model:     Model,
+	allocator: runtime.Allocator,
+	phase:     Phase,
+	ctx:       runtime.Context,
+}
+
+Phase :: enum u8 {
+	Workload,
+	Quiesce,
+	Check,
+}
+
+clock_mono :: proc(data: rawptr) -> i64 {
+	c := (^Node_Clock)(data)
+	return c.w.now + c.mono_off
+}
+
+clock_wall :: proc(data: rawptr) -> i64 {
+	c := (^Node_Clock)(data)
+	return EPOCH_NS + c.w.now + c.wall_off
+}
+
+node_clock :: proc(c: ^Node_Clock) -> prim.Clock {
+	return prim.Clock{data = c, mono_ns = clock_mono, wall_ns = clock_wall}
+}
+
+world_fail :: proc(w: ^World, format: string, args: ..any) {
+	context = w.ctx
+	s := fmt.aprintf(format, ..args, allocator = w.allocator)
+	append(&w.failures, s)
+	world_note(w, "FAIL %s", s)
+}
+
+world_note :: proc(w: ^World, format: string, args: ..any) {
+	context = w.ctx
+	s := fmt.tprintf(format, ..args)
+	w.trace = mix_str(w.trace, s)
+	if w.cfg.verbose {
+		fmt.eprintf("[%9.3f] %s\n", f64(w.now) / 1e6, s)
+	}
+	if len(w.log) < w.cfg.trace_limit {
+		append(&w.log, strings.clone(s, w.allocator))
+	}
+}
+
+schedule :: proc(w: ^World, ev: Sim_Event) {
+	x := ev
+	w.seq += 1
+	x.seq = w.seq
+	append(&w.queue, x)
+	i := len(w.queue) - 1
+	for i > 0 {
+		p := (i - 1) / 2
+		if !_ev_less(w.queue[i], w.queue[p]) {
+			break
+		}
+		w.queue[i], w.queue[p] = w.queue[p], w.queue[i]
+		i = p
+	}
+}
+
+@(private = "file")
+_ev_less :: proc(a, b: Sim_Event) -> bool {
+	if a.at != b.at {
+		return a.at < b.at
+	}
+	return a.seq < b.seq
+}
+
+pop_event :: proc(w: ^World) -> Sim_Event {
+	top := w.queue[0]
+	last := pop(&w.queue)
+	if len(w.queue) > 0 {
+		w.queue[0] = last
+		i := 0
+		n := len(w.queue)
+		for {
+			l := 2 * i + 1
+			if l >= n {
+				break
+			}
+			m := l
+			if l + 1 < n && _ev_less(w.queue[l + 1], w.queue[l]) {
+				m = l + 1
+			}
+			if !_ev_less(w.queue[m], w.queue[i]) {
+				break
+			}
+			w.queue[i], w.queue[m] = w.queue[m], w.queue[i]
+			i = m
+		}
+	}
+	return top
+}
+
+instance_begin :: proc(inst: ^Instance, slot: int) -> bool {
+	base := REGION_BASE + uintptr(slot) * REGION_STRIDE
+	if !region_map(&inst.main, base, MAIN_SIZE, false) {
+		return false
+	}
+	if !region_map(&inst.temp, base + uintptr(MAIN_SIZE), TEMP_SIZE, true) {
+		region_unmap(&inst.main)
+		return false
+	}
+	if leak_sites {
+		inst.main.sites = new(map[uintptr]runtime.Source_Code_Location, runtime.heap_allocator())
+		inst.main.sites^ = make(map[uintptr]runtime.Source_Code_Location, runtime.heap_allocator())
+	}
+	return true
+}
+
+instance_context :: proc(inst: ^Instance) -> runtime.Context {
+	c := context
+	c.allocator = region_allocator(&inst.main)
+	c.temp_allocator = region_allocator(&inst.temp)
+	return c
+}
+
+instance_kill :: proc(inst: ^Instance) {
+	if inst.loop_on {
+		for s in inst.loop.slots {
+			if u8(s.kind) == 1 && s.fd >= 0 {
+				prim.close(s.fd)
+			}
+		}
+		context = instance_context(inst)
+		prim.loop_destroy(&inst.loop)
+		inst.loop_on = false
+	}
+	if inst.main.sites != nil {
+		delete(inst.main.sites^)
+		free(inst.main.sites, runtime.heap_allocator())
+	}
+	region_unmap(&inst.main)
+	region_unmap(&inst.temp)
+	inst^ = {}
+}
+
+leak_sites := false
+
+instance_leaks :: proc(inst: ^Instance) -> (n: int, bytes: int) {
+	return inst.main.live, inst.main.bytes
+}
+
+world_init :: proc(w: ^World, cfg: Config) {
+	w^ = {}
+	w.cfg = cfg
+	w.allocator = runtime.heap_allocator()
+	w.ctx = context
+	w.ctx.allocator = runtime.heap_allocator()
+	w.queue = make([dynamic]Sim_Event, w.allocator)
+	w.nodes = make([dynamic]^Node, w.allocator)
+	w.conns = make([dynamic]^Conn, w.allocator)
+	w.failures = make([dynamic]string, w.allocator)
+	w.log = make([dynamic]string, w.allocator)
+	rng_init(&w.rng, cfg.seed, 1)
+	rng_init(&w.net_rng, cfg.seed, 2)
+	rng_init(&w.fault_rng, cfg.seed, 3)
+	model_init(&w.model, w)
+	w.relay.w = w
+	disk_init(&w.relay.disk, "relay", w.allocator)
+	w.relay.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -5_000_000_000, 5_000_000_000)}
+	w.relay.disk.wall = clock_wall
+	w.relay.disk.wall_data = &w.relay.clock
+	for i in 0 ..< cfg.nodes {
+		n := new(Node, w.allocator)
+		n.w = w
+		n.idx = i
+		n.name = fmt.aprintf("n%d", i, allocator = w.allocator)
+		disk_init(&n.disk, n.name, w.allocator)
+		n.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -30_000_000_000, 30_000_000_000)}
+		n.disk.verbose = cfg.verbose
+		n.disk.wall = clock_wall
+		n.disk.wall_data = &n.clock
+		n.conns = make([dynamic]^Conn, w.allocator)
+		append(&w.nodes, n)
+	}
+}
+
+world_destroy :: proc(w: ^World) {
+	for n in w.nodes {
+		if n.alive {
+			node_kill(n)
+		}
+		disk_destroy(&n.disk)
+		delete(n.conns)
+		delete(n.name, w.allocator)
+		free(n, w.allocator)
+	}
+	delete(w.nodes)
+	if w.relay.alive {
+		relay_kill(&w.relay)
+	}
+	disk_destroy(&w.relay.disk)
+	for c in w.conns {
+		free(c, w.allocator)
+	}
+	delete(w.conns)
+	for ev in w.queue {
+		delete(ev.bytes, w.allocator)
+	}
+	delete(w.queue)
+	for s in w.failures {
+		delete(s, w.allocator)
+	}
+	delete(w.failures)
+	for s in w.log {
+		delete(s, w.allocator)
+	}
+	delete(w.log)
+	model_destroy(&w.model)
+}
+
+loop_deadline :: proc(l: ^prim.Loop) -> (at: i64, ok: bool) {
+	if len(l.heap) == 0 {
+		return 0, false
+	}
+	return l.timers[l.heap[0]].deadline, true
+}
+
+loop_armed :: proc(l: ^prim.Loop) -> int {
+	return len(l.heap)
+}
