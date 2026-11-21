@@ -8,7 +8,8 @@
   the same with `-target:darwin_arm64` and `-target:windows_amd64`
 - Platform testing happens on real machines through Zeron `run_command`:
   macOS on `home-laptop`, Windows on `WING-PC`. No CI.
-- Tests: `odin test tests -o:speed`
+- Tests: `odin test tests/convergence -o:speed`, `odin test tests/fstree -o:speed`,
+  `odin test tests/sim -o:speed`
 - Design: `DESIGN.md` is the source of truth for formats and invariants.
 
 ## Rules
