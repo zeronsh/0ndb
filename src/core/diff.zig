@@ -36,10 +36,25 @@ const Snake = struct {
     found: bool,
 };
 
+const Range = struct {
+    oa: usize,
+    ob: usize,
+    na: usize,
+    nb: usize,
+};
+
+const AnchorResult = struct {
+    kind: enum { disjoint, found, crowded },
+    os: usize = 0,
+    ns: usize = 0,
+    len: usize = 0,
+};
+
 const HISTO_MAX_CHAIN: u32 = 64;
 
 fn splitLines(allocator: Allocator, bytes: []const u8) Allocator.Error![]Line {
     var list: std.ArrayList(Line) = .empty;
+    errdefer list.deinit(allocator);
     var start: usize = 0;
     for (bytes, 0..) |b, i| {
         if (b == '\n') {
@@ -122,13 +137,25 @@ fn appendTrimmedSplice(
 }
 
 const DiffCtx = struct {
-    out_alloc: Allocator,
-    scratch: Allocator,
+    alloc: Allocator,
     old: []const u8,
     new: []const u8,
     old_lines: []const Line,
     new_lines: []const Line,
     res: *DiffResult,
+    table: std.AutoHashMapUnmanaged(u64, HistoEntry) = .empty,
+    next_pos: std.ArrayList(u32) = .empty,
+    vf: std.ArrayList(isize) = .empty,
+    vb: std.ArrayList(isize) = .empty,
+    work: std.ArrayList(Range) = .empty,
+
+    fn deinit(self: *DiffCtx) void {
+        self.table.deinit(self.alloc);
+        self.next_pos.deinit(self.alloc);
+        self.vf.deinit(self.alloc);
+        self.vb.deinit(self.alloc);
+        self.work.deinit(self.alloc);
+    }
 
     fn lineByteStart(lines: []const Line, idx: usize, total_len: usize) usize {
         return if (idx < lines.len) lines[idx].start else total_len;
@@ -139,159 +166,197 @@ const DiffCtx = struct {
         const old_e = lineByteStart(self.old_lines, ob, self.old.len);
         const new_s = lineByteStart(self.new_lines, na, self.new.len);
         const new_e = lineByteStart(self.new_lines, nb, self.new.len);
-        try appendTrimmedSplice(self.out_alloc, self.res, self.old, self.new, old_s, old_e, new_s, new_e);
+        try appendTrimmedSplice(self.alloc, self.res, self.old, self.new, old_s, old_e, new_s, new_e);
     }
 
     fn eq(self: *const DiffCtx, oi: usize, ni: usize) bool {
         return linesEqual(self.old, self.new, self.old_lines[oi], self.new_lines[ni]);
     }
 
-    fn diffRange(self: *DiffCtx, raw_oa: usize, raw_ob: usize, raw_na: usize, raw_nb: usize) Allocator.Error!void {
-        var oa = raw_oa;
-        var ob = raw_ob;
-        var na = raw_na;
-        var nb = raw_nb;
+    fn findAnchor(
+        self: *DiffCtx,
+        oa: usize,
+        n_len: usize,
+        na: usize,
+        m_len: usize,
+        table: *std.AutoHashMapUnmanaged(u64, HistoEntry),
+    ) Allocator.Error!AnchorResult {
+        try table.ensureTotalCapacity(self.alloc, @intCast(@min(n_len, 1 << 20)));
+        try self.next_pos.resize(self.alloc, n_len);
+        const next_pos = self.next_pos.items[0..n_len];
 
-        while (oa < ob and na < nb and self.eq(oa, na)) {
-            oa += 1;
-            na += 1;
+        var i: usize = n_len;
+        while (i > 0) {
+            i -= 1;
+            const h = self.old_lines[oa + i].hash;
+            const gop = try table.getOrPut(self.alloc, h);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .count = 1, .head = @intCast(i) };
+                next_pos[i] = std.math.maxInt(u32);
+            } else {
+                gop.value_ptr.count +|= 1;
+                next_pos[i] = gop.value_ptr.head;
+                gop.value_ptr.head = @intCast(i);
+            }
         }
-        while (ob > oa and nb > na and self.eq(ob - 1, nb - 1)) {
-            ob -= 1;
-            nb -= 1;
-        }
 
-        const n_len = ob - oa;
-        const m_len = nb - na;
-        if (n_len == 0 and m_len == 0) return;
-        if (n_len == 0 or m_len == 0 or (n_len == 1 and m_len == 1)) {
-            try self.emitRange(oa, ob, na, nb);
-            return;
-        }
+        var has_any_match = false;
+        var has_low_match = false;
+        var best_count: u32 = HISTO_MAX_CHAIN + 1;
+        var best_len: usize = 0;
+        var best_os: usize = 0;
+        var best_ns: usize = 0;
 
-        const AnchorResult = struct {
-            kind: enum { disjoint, found, crowded },
-            os: usize = 0,
-            ns: usize = 0,
-            len: usize = 0,
-        };
-
-        const anchor: AnchorResult = blk: {
-            var table = std.AutoHashMapUnmanaged(u64, HistoEntry){};
-            defer table.deinit(self.scratch);
-            try table.ensureTotalCapacity(self.scratch, @intCast(@min(n_len, 1 << 20)));
-
-            const next_pos = try self.scratch.alloc(u32, n_len);
-            defer self.scratch.free(next_pos);
-
-            var i: usize = n_len;
-            while (i > 0) {
-                i -= 1;
-                const h = self.old_lines[oa + i].hash;
-                const gop = try table.getOrPut(self.scratch, h);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = .{ .count = 1, .head = @intCast(i) };
-                    next_pos[i] = std.math.maxInt(u32);
-                } else {
-                    gop.value_ptr.count +|= 1;
-                    next_pos[i] = gop.value_ptr.head;
-                    gop.value_ptr.head = @intCast(i);
+        var b_idx: usize = 0;
+        while (b_idx < m_len) {
+            const bh = self.new_lines[na + b_idx].hash;
+            const entry = table.get(bh) orelse {
+                b_idx += 1;
+                continue;
+            };
+            if (entry.count > HISTO_MAX_CHAIN) {
+                var scan = entry.head;
+                var checked: u32 = 0;
+                while (scan != std.math.maxInt(u32) and checked < 16) : (checked += 1) {
+                    if (self.eq(oa + scan, na + b_idx)) {
+                        has_any_match = true;
+                        break;
+                    }
+                    scan = next_pos[scan];
                 }
+                b_idx += 1;
+                continue;
             }
 
-            var has_any_match = false;
-            var has_low_match = false;
-            var best_count: u32 = HISTO_MAX_CHAIN + 1;
-            var best_len: usize = 0;
-            var best_os: usize = 0;
-            var best_ns: usize = 0;
+            var next_b = b_idx + 1;
+            var cur = entry.head;
+            while (cur != std.math.maxInt(u32)) {
+                const a_idx: usize = cur;
+                cur = next_pos[cur];
+                if (!self.eq(oa + a_idx, na + b_idx)) continue;
+                has_any_match = true;
 
-            var b_idx: usize = 0;
-            while (b_idx < m_len) {
-                const bh = self.new_lines[na + b_idx].hash;
-                const entry = table.get(bh) orelse {
-                    b_idx += 1;
-                    continue;
-                };
-                if (entry.count > HISTO_MAX_CHAIN) {
-                    var scan = entry.head;
-                    var checked: u32 = 0;
-                    while (scan != std.math.maxInt(u32) and checked < 16) : (checked += 1) {
-                        if (self.eq(oa + scan, na + b_idx)) {
-                            has_any_match = true;
-                            break;
-                        }
-                        scan = next_pos[scan];
-                    }
-                    b_idx += 1;
-                    continue;
-                }
-
-                var next_b = b_idx + 1;
-                var cur = entry.head;
-                while (cur != std.math.maxInt(u32)) {
-                    const a_idx: usize = cur;
-                    cur = next_pos[cur];
-                    if (!self.eq(oa + a_idx, na + b_idx)) continue;
-                    has_any_match = true;
-
-                    var as = a_idx;
-                    var bs = b_idx;
-                    var min_cnt = entry.count;
-                    while (as > 0 and bs > 0 and self.eq(oa + as - 1, na + bs - 1)) {
-                        as -= 1;
-                        bs -= 1;
-                        if (table.get(self.old_lines[oa + as].hash)) |pe| {
-                            if (pe.count < min_cnt) min_cnt = pe.count;
-                        }
-                    }
-                    var ae = a_idx + 1;
-                    var be = b_idx + 1;
-                    while (ae < n_len and be < m_len and self.eq(oa + ae, na + be)) {
-                        if (table.get(self.old_lines[oa + ae].hash)) |ne| {
-                            if (ne.count < min_cnt) min_cnt = ne.count;
-                        }
-                        ae += 1;
-                        be += 1;
-                    }
-                    if (be > next_b) next_b = be;
-                    const run_len = ae - as;
-                    if (!has_low_match or min_cnt < best_count or (min_cnt == best_count and run_len > best_len)) {
-                        has_low_match = true;
-                        best_count = min_cnt;
-                        best_len = run_len;
-                        best_os = oa + as;
-                        best_ns = na + bs;
+                var as = a_idx;
+                var bs = b_idx;
+                var min_cnt = entry.count;
+                while (as > 0 and bs > 0 and self.eq(oa + as - 1, na + bs - 1)) {
+                    as -= 1;
+                    bs -= 1;
+                    if (table.get(self.old_lines[oa + as].hash)) |pe| {
+                        if (pe.count < min_cnt) min_cnt = pe.count;
                     }
                 }
-                b_idx = next_b;
+                var ae = a_idx + 1;
+                var be = b_idx + 1;
+                while (ae < n_len and be < m_len and self.eq(oa + ae, na + be)) {
+                    if (table.get(self.old_lines[oa + ae].hash)) |ne| {
+                        if (ne.count < min_cnt) min_cnt = ne.count;
+                    }
+                    ae += 1;
+                    be += 1;
+                }
+                if (be > next_b) next_b = be;
+                const run_len = ae - as;
+                if (!has_low_match or min_cnt < best_count or (min_cnt == best_count and run_len > best_len)) {
+                    has_low_match = true;
+                    best_count = min_cnt;
+                    best_len = run_len;
+                    best_os = oa + as;
+                    best_ns = na + bs;
+                }
+            }
+            b_idx = next_b;
+        }
+
+        if (!has_any_match) return .{ .kind = .disjoint };
+        if (has_low_match) return .{ .kind = .found, .os = best_os, .ns = best_ns, .len = best_len };
+        return .{ .kind = .crowded };
+    }
+
+    fn diffAll(self: *DiffCtx, init_oa: usize, init_ob: usize, init_na: usize, init_nb: usize) Allocator.Error!void {
+        try self.work.append(self.alloc, .{
+            .oa = init_oa,
+            .ob = init_ob,
+            .na = init_na,
+            .nb = init_nb,
+        });
+
+        while (self.work.pop()) |range| {
+            var oa = range.oa;
+            var ob = range.ob;
+            var na = range.na;
+            var nb = range.nb;
+
+            while (oa < ob and na < nb and self.eq(oa, na)) {
+                oa += 1;
+                na += 1;
+            }
+            while (ob > oa and nb > na and self.eq(ob - 1, nb - 1)) {
+                ob -= 1;
+                nb -= 1;
             }
 
-            if (!has_any_match) break :blk .{ .kind = .disjoint };
-            if (has_low_match) break :blk .{ .kind = .found, .os = best_os, .ns = best_ns, .len = best_len };
-            break :blk .{ .kind = .crowded };
-        };
-
-        switch (anchor.kind) {
-            .disjoint => {
+            const n_len = ob - oa;
+            const m_len = nb - na;
+            if (n_len == 0 and m_len == 0) continue;
+            if (n_len == 0 or m_len == 0 or (n_len == 1 and m_len == 1)) {
                 try self.emitRange(oa, ob, na, nb);
-                return;
-            },
-            .found => {
-                try self.diffRange(oa, anchor.os, na, anchor.ns);
-                try self.diffRange(anchor.os + anchor.len, ob, anchor.ns + anchor.len, nb);
-                return;
-            },
-            .crowded => {},
-        }
+                continue;
+            }
 
-        const snake = try self.findMiddleSnake(oa, n_len, na, m_len);
-        if (!snake.found) {
-            try self.emitRange(oa, ob, na, nb);
-            return;
+            if (n_len >= 64 or m_len >= 64) {
+                const anchor = blk: {
+                    if (self.table.capacity() > 512 and n_len * 16 < self.table.capacity()) {
+                        var local_table: std.AutoHashMapUnmanaged(u64, HistoEntry) = .empty;
+                        defer local_table.deinit(self.alloc);
+                        break :blk try self.findAnchor(oa, n_len, na, m_len, &local_table);
+                    }
+                    self.table.clearRetainingCapacity();
+                    break :blk try self.findAnchor(oa, n_len, na, m_len, &self.table);
+                };
+
+                switch (anchor.kind) {
+                    .disjoint => {
+                        try self.emitRange(oa, ob, na, nb);
+                        continue;
+                    },
+                    .found => {
+                        try self.work.append(self.alloc, .{
+                            .oa = anchor.os + anchor.len,
+                            .ob = ob,
+                            .na = anchor.ns + anchor.len,
+                            .nb = nb,
+                        });
+                        try self.work.append(self.alloc, .{
+                            .oa = oa,
+                            .ob = anchor.os,
+                            .na = na,
+                            .nb = anchor.ns,
+                        });
+                        continue;
+                    },
+                    .crowded => {},
+                }
+            }
+
+            const snake = try self.findMiddleSnake(oa, n_len, na, m_len);
+            if (!snake.found) {
+                try self.emitRange(oa, ob, na, nb);
+                continue;
+            }
+            try self.work.append(self.alloc, .{
+                .oa = oa + snake.x1,
+                .ob = ob,
+                .na = na + snake.y1,
+                .nb = nb,
+            });
+            try self.work.append(self.alloc, .{
+                .oa = oa,
+                .ob = oa + snake.x0,
+                .na = na,
+                .nb = na + snake.y0,
+            });
         }
-        try self.diffRange(oa, oa + snake.x0, na, na + snake.y0);
-        try self.diffRange(oa + snake.x1, ob, na + snake.y1, nb);
     }
 
     fn findMiddleSnake(self: *DiffCtx, oa: usize, n_len: usize, na: usize, m_len: usize) Allocator.Error!Snake {
@@ -299,19 +364,20 @@ const DiffCtx = struct {
         const m_i: isize = @intCast(m_len);
         const delta: isize = n_i - m_i;
         const odd = (@mod(delta, 2) != 0);
-        const max_d: usize = (n_len + m_len + 1) / 2;
-        const v_len: usize = 2 * max_d + 3;
-        const off: isize = @intCast(max_d + 1);
+        const raw_max_d: usize = (n_len + m_len + 1) / 2;
+        const cap_d: usize = @min(raw_max_d, 256 + std.math.sqrt(n_len + m_len) * 2);
+        const v_len: usize = 2 * cap_d + 3;
+        const off: isize = @intCast(cap_d + 1);
 
-        const vf = try self.scratch.alloc(isize, v_len);
-        defer self.scratch.free(vf);
-        const vb = try self.scratch.alloc(isize, v_len);
-        defer self.scratch.free(vb);
+        try self.vf.resize(self.alloc, v_len);
+        try self.vb.resize(self.alloc, v_len);
+        const vf = self.vf.items[0..v_len];
+        const vb = self.vb.items[0..v_len];
         @memset(vf, 0);
         @memset(vb, 0);
 
         var d: usize = 0;
-        while (d <= max_d) : (d += 1) {
+        while (d <= cap_d) : (d += 1) {
             const d_i: isize = @intCast(d);
 
             var k: isize = -d_i;
@@ -331,7 +397,7 @@ const DiffCtx = struct {
                     const bk = delta - k;
                     if (bk >= -(d_i - 1) and bk <= (d_i - 1)) {
                         const bx = vb[@intCast(bk + off)];
-                        if (x + bx >= n_i) {
+                        if (x >= 0 and x <= n_i and y >= 0 and y <= m_i and bx >= 0 and bx <= n_i and (bx - bk) <= m_i and x + bx >= n_i) {
                             const cx0: usize = @intCast(@max(0, @min(x_start, n_i)));
                             const cy0: usize = @intCast(@max(0, @min(y_start, m_i)));
                             const cx1: usize = @intCast(@max(0, @min(x, n_i)));
@@ -362,7 +428,7 @@ const DiffCtx = struct {
                     const fk = delta - c;
                     if (fk >= -d_i and fk <= d_i) {
                         const fx = vf[@intCast(fk + off)];
-                        if (fx + u >= n_i) {
+                        if (u >= 0 and u <= n_i and v >= 0 and v <= m_i and fx >= 0 and fx <= n_i and (fx - fk) <= m_i and fx + u >= n_i) {
                             const cx0: usize = @intCast(@max(0, @min(n_i - u, n_i)));
                             const cy0: usize = @intCast(@max(0, @min(m_i - v, m_i)));
                             const cx1: usize = @intCast(@max(0, @min(n_i - u_start, n_i)));
@@ -386,22 +452,20 @@ pub fn diffBytes(allocator: Allocator, old: []const u8, new: []const u8) Allocat
 
     if (std.mem.eql(u8, old, new)) return res;
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const scratch = arena.allocator();
-
-    const old_lines = try splitLines(scratch, old);
-    const new_lines = try splitLines(scratch, new);
+    const old_lines = try splitLines(allocator, old);
+    defer allocator.free(old_lines);
+    const new_lines = try splitLines(allocator, new);
+    defer allocator.free(new_lines);
 
     var ctx = DiffCtx{
-        .out_alloc = allocator,
-        .scratch = scratch,
+        .alloc = allocator,
         .old = old,
         .new = new,
         .old_lines = old_lines,
         .new_lines = new_lines,
         .res = &res,
     };
-    try ctx.diffRange(0, old_lines.len, 0, new_lines.len);
+    defer ctx.deinit();
+    try ctx.diffAll(0, old_lines.len, 0, new_lines.len);
     return res;
 }

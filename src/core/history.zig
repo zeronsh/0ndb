@@ -21,12 +21,40 @@ pub const IntegrateError = error{
     OpCountMismatch,
     UnknownInode,
     NotAFile,
+    NotADir,
     NotASymlink,
     Unordered,
     OutOfBounds,
     LengthMismatch,
+    InvalidSplice,
+    MissingBlob,
+    InvalidName,
+    CannotModifyRoot,
+    HistoryPoisoned,
+};
+
+pub const UnpinError = error{
+    LogReadFailed,
+};
+
+pub const RevertError = error{
     MissingBlob,
 };
+
+pub fn isValidName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 4096) return false;
+    if (std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, "..") or
+        std.mem.eql(u8, name, ".git") or
+        std.mem.eql(u8, name, ".0ndb"))
+    {
+        return false;
+    }
+    for (name) |b| {
+        if (b == '/' or b == '\\' or b == 0) return false;
+    }
+    return true;
+}
 
 pub const LogSliceReader = struct {
     ptr: *anyopaque,
@@ -128,8 +156,10 @@ pub const History = struct {
     insertions: std.AutoHashMapUnmanaged(id.InsertionKey, InsertionStorage),
     blobs: std.AutoHashMapUnmanaged(id.Oid, InsertionStorage),
     insertion_blobs: std.AutoHashMapUnmanaged(id.InsertionKey, id.Oid),
+    batch_inodes: std.AutoHashMapUnmanaged(id.BatchId, []id.InodeId),
     meta: std.StringHashMapUnmanaged(tree_mod.Lww(?[]u8)),
     log_reader: ?LogSliceReader = null,
+    poisoned: bool = false,
 
     pub fn init(allocator: Allocator, history_id: u128) Allocator.Error!History {
         return .{
@@ -140,8 +170,10 @@ pub const History = struct {
             .insertions = .empty,
             .blobs = .empty,
             .insertion_blobs = .empty,
+            .batch_inodes = .empty,
             .meta = .empty,
             .log_reader = null,
+            .poisoned = false,
         };
     }
 
@@ -155,13 +187,13 @@ pub const History = struct {
         while (bit.next()) |s| s.deinit(self.allocator);
         self.blobs.deinit(self.allocator);
         self.insertion_blobs.deinit(self.allocator);
+        var biit = self.batch_inodes.valueIterator();
+        while (biit.next()) |sl| self.allocator.free(sl.*);
+        self.batch_inodes.deinit(self.allocator);
         var mit = self.meta.iterator();
         while (mit.next()) |kv| {
             self.allocator.free(kv.key_ptr.*);
-            for (kv.value_ptr.entries.items) |e| {
-                if (e.value) |v| self.allocator.free(v);
-            }
-            kv.value_ptr.entries.deinit(self.allocator);
+            kv.value_ptr.deinit(self.allocator);
         }
         self.meta.deinit(self.allocator);
     }
@@ -208,17 +240,26 @@ pub const History = struct {
         }
     }
 
-    pub fn unpinAllLogSpans(self: *History) Allocator.Error!void {
-        const lr = self.log_reader orelse return;
+    pub fn unpinAllLogSpans(self: *History) (UnpinError || Allocator.Error)!void {
+        const lr = self.log_reader orelse {
+            var iit = self.insertions.valueIterator();
+            while (iit.next()) |slot| {
+                if (slot.* == .log_span) return error.LogReadFailed;
+            }
+            var bit = self.blobs.valueIterator();
+            while (bit.next()) |slot| {
+                if (slot.* == .log_span) return error.LogReadFailed;
+            }
+            return;
+        };
         var iit = self.insertions.valueIterator();
         while (iit.next()) |slot| {
             switch (slot.*) {
                 .owned => {},
                 .log_span => |sp| {
-                    if (lr.read(sp.offset, sp.len)) |bytes| {
-                        const copy = try self.allocator.dupe(u8, bytes);
-                        slot.* = .{ .owned = copy };
-                    }
+                    const bytes = lr.read(sp.offset, sp.len) orelse return error.LogReadFailed;
+                    const copy = try self.allocator.dupe(u8, bytes);
+                    slot.* = .{ .owned = copy };
                 },
             }
         }
@@ -227,10 +268,9 @@ pub const History = struct {
             switch (slot.*) {
                 .owned => {},
                 .log_span => |sp| {
-                    if (lr.read(sp.offset, sp.len)) |bytes| {
-                        const copy = try self.allocator.dupe(u8, bytes);
-                        slot.* = .{ .owned = copy };
-                    }
+                    const bytes = lr.read(sp.offset, sp.len) orelse return error.LogReadFailed;
+                    const copy = try self.allocator.dupe(u8, bytes);
+                    slot.* = .{ .owned = copy };
                 },
             }
         }
@@ -298,8 +338,17 @@ pub const History = struct {
         return @max(self.dag.max_ts, parents.maxTs()) +| 1;
     }
 
+    fn putOwnedInsertion(self: *History, key: id.InsertionKey, bytes: []const u8) Allocator.Error!void {
+        const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        if (try self.insertions.fetchPut(self.allocator, key, .{ .owned = owned })) |prev| {
+            var old = prev.value;
+            old.deinit(self.allocator);
+        }
+    }
+
     pub fn integrate(self: *History, batch: *const op_mod.Batch) (IntegrateError || Allocator.Error)!bool {
-        if (batch.header.opCount() != batch.ops.len) return error.OpCountMismatch;
+        if (self.poisoned) return error.HistoryPoisoned;
         const already = self.dag.check(&batch.header) catch |err| return switch (err) {
             error.MissingParents => error.MissingParents,
             error.LamportViolation => error.LamportViolation,
@@ -307,10 +356,19 @@ pub const History = struct {
             error.Overlap => error.Overlap,
         };
         if (already) return false;
+        if (batch.header.opCount() != batch.ops.len) return error.OpCountMismatch;
+
+        var mutated = false;
+        errdefer if (mutated) {
+            self.poisoned = true;
+        };
 
         for (batch.blobs) |blob| {
             if (!self.blobs.contains(blob.oid)) {
-                try self.blobs.put(self.allocator, blob.oid, .{ .owned = try self.allocator.dupe(u8, blob.data) });
+                const copy = try self.allocator.dupe(u8, blob.data);
+                errdefer self.allocator.free(copy);
+                mutated = true;
+                try self.blobs.put(self.allocator, blob.oid, .{ .owned = copy });
             }
         }
 
@@ -341,6 +399,9 @@ pub const History = struct {
         };
         const min_unobs = @min(parent_view.min_unobserved, batch.header.start);
 
+        var touched_set: std.AutoArrayHashMapUnmanaged(id.InodeId, void) = .empty;
+        defer touched_set.deinit(self.allocator);
+
         for (batch.ops, 0..) |*operation, idx| {
             const op_id = batch.header.opId(idx);
             local_ctx.cur_ts = op_id.ts;
@@ -349,10 +410,23 @@ pub const History = struct {
                 .observesFn = BatchLocalCtx.observes,
                 .min_unobserved = min_unobs,
             };
-            try self.applyOp(op_id, op_view, operation);
+            try self.applyOp(op_id, op_view, operation, &mutated, &touched_set);
         }
 
-        const hdr_copy = try batch.header.clone(self.allocator);
+        const bid = batch.header.batchId();
+        if (touched_set.count() > 0) {
+            const touched_slice = try self.allocator.dupe(id.InodeId, touched_set.keys());
+            errdefer self.allocator.free(touched_slice);
+            mutated = true;
+            if (try self.batch_inodes.fetchPut(self.allocator, bid, touched_slice)) |prev| {
+                self.allocator.free(prev.value);
+            }
+        }
+
+        var hdr_copy = try batch.header.clone(self.allocator);
+        var hdr_owned = true;
+        errdefer if (hdr_owned) hdr_copy.deinit(self.allocator);
+        mutated = true;
         _ = self.dag.insert(self.allocator, hdr_copy) catch |err| return switch (err) {
             error.MissingParents => error.MissingParents,
             error.LamportViolation => error.LamportViolation,
@@ -360,6 +434,7 @@ pub const History = struct {
             error.Overlap => error.Overlap,
             error.OutOfMemory => error.OutOfMemory,
         };
+        hdr_owned = false;
         return true;
     }
 
@@ -620,7 +695,10 @@ pub const History = struct {
         const base_bytes = base_bytes_opt orelse "";
 
         if (std.mem.eql(u8, base_bytes, draft_bytes)) {
-            var vd = try f.text.diffViews(allocator, res, base_view, View.EVERYTHING);
+            var vd = f.text.diffViews(allocator, res, base_view, View.EVERYTHING) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.MissingBlob => return null,
+            };
             errdefer vd.deinit(allocator);
             const cur_s = text_mod.mapCursor(cursor_start, vd.splices);
             const cur_e = text_mod.mapCursor(cursor_end, vd.splices);
@@ -694,7 +772,10 @@ pub const History = struct {
             .min_unobserved = base_view.min_unobserved,
         };
 
-        var vd = try merged.diffViews(allocator, draft_resolver, draft_view, View.EVERYTHING);
+        var vd = merged.diffViews(allocator, draft_resolver, draft_view, View.EVERYTHING) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MissingBlob => return null,
+        };
         errdefer vd.deinit(allocator);
         const cur_s = text_mod.mapCursor(cursor_start, vd.splices);
         const cur_e = text_mod.mapCursor(cursor_end, vd.splices);
@@ -708,126 +789,218 @@ pub const History = struct {
         };
     }
 
-    fn applyOp(self: *History, op_id: id.OpId, view: View, operation: *const op_mod.Op) (IntegrateError || Allocator.Error)!void {
+    fn requireKnown(self: *History, view: View, iid: id.InodeId) IntegrateError!*tree_mod.Inode {
+        if (!iid.isRoot() and !view.observes(iid.op)) return error.UnknownInode;
+        return self.tree.getMut(iid) orelse error.UnknownInode;
+    }
+
+    fn requireKnownDir(self: *const History, view: View, parent: id.InodeId) IntegrateError!void {
+        if (!parent.isRoot() and !view.observes(parent.op)) return error.UnknownInode;
+        const inode = self.tree.get(parent) orelse return error.UnknownInode;
+        if (!inode.isDir()) return error.NotADir;
+    }
+
+    fn applyOp(
+        self: *History,
+        op_id: id.OpId,
+        view: View,
+        operation: *const op_mod.Op,
+        mutated: *bool,
+        touched: *std.AutoArrayHashMapUnmanaged(id.InodeId, void),
+    ) (IntegrateError || Allocator.Error)!void {
         switch (operation.*) {
             .create_dir => |v| {
-                if (!self.tree.contains(v.parent)) return error.UnknownInode;
+                if (!isValidName(v.name)) return error.InvalidName;
+                try self.requireKnownDir(view, v.parent);
+                const iid = id.InodeId.init(op_id, 0);
                 const inode = try self.allocator.create(tree_mod.Inode);
-                inode.* = .{ .inode_id = id.InodeId.init(op_id, 0), .kind = .dir };
+                inode.* = .{ .inode_id = iid, .kind = .dir };
                 errdefer {
                     inode.deinit(self.allocator);
                     self.allocator.destroy(inode);
                 }
                 try inode.alive.set(self.allocator, op_id, true);
-                try inode.placement.set(self.allocator, op_id, .{
-                    .parent = v.parent,
-                    .name = try self.allocator.dupe(u8, v.name),
-                });
+                {
+                    const name_copy = try self.allocator.dupe(u8, v.name);
+                    errdefer self.allocator.free(name_copy);
+                    try inode.placement.set(self.allocator, op_id, .{
+                        .parent = v.parent,
+                        .name = name_copy,
+                    });
+                }
+                mutated.* = true;
                 try self.tree.insertInode(self.allocator, inode);
+                try touched.put(self.allocator, iid, {});
+                if (!v.parent.isRoot()) try touched.put(self.allocator, v.parent, {});
             },
             .create_file => |v| {
-                if (!self.tree.contains(v.parent)) return error.UnknownInode;
+                if (!isValidName(v.name)) return error.InvalidName;
+                try self.requireKnownDir(view, v.parent);
+                const iid = id.InodeId.init(op_id, 0);
                 const inode = try self.allocator.create(tree_mod.Inode);
-                inode.* = .{ .inode_id = id.InodeId.init(op_id, 0), .kind = .{ .file = .{} } };
+                inode.* = .{ .inode_id = iid, .kind = .{ .file = .{} } };
                 errdefer {
                     inode.deinit(self.allocator);
                     self.allocator.destroy(inode);
                 }
                 try inode.alive.set(self.allocator, op_id, true);
-                try inode.placement.set(self.allocator, op_id, .{
-                    .parent = v.parent,
-                    .name = try self.allocator.dupe(u8, v.name),
-                });
+                {
+                    const name_copy = try self.allocator.dupe(u8, v.name);
+                    errdefer self.allocator.free(name_copy);
+                    try inode.placement.set(self.allocator, op_id, .{
+                        .parent = v.parent,
+                        .name = name_copy,
+                    });
+                }
                 const f = inode.filePtr().?;
                 try f.mode.set(self.allocator, op_id, v.mode);
                 try f.line_ending.set(self.allocator, op_id, v.line_ending);
+                mutated.* = true;
                 try self.initFileContent(f, op_id, &v.content);
                 try self.tree.insertInode(self.allocator, inode);
+                try touched.put(self.allocator, iid, {});
+                if (!v.parent.isRoot()) try touched.put(self.allocator, v.parent, {});
             },
             .create_symlink => |v| {
-                if (!self.tree.contains(v.parent)) return error.UnknownInode;
+                if (!isValidName(v.name)) return error.InvalidName;
+                try self.requireKnownDir(view, v.parent);
+                const iid = id.InodeId.init(op_id, 0);
                 const inode = try self.allocator.create(tree_mod.Inode);
-                inode.* = .{ .inode_id = id.InodeId.init(op_id, 0), .kind = .{ .symlink = .{} } };
+                inode.* = .{ .inode_id = iid, .kind = .{ .symlink = .{} } };
                 errdefer {
                     inode.deinit(self.allocator);
                     self.allocator.destroy(inode);
                 }
                 try inode.alive.set(self.allocator, op_id, true);
-                try inode.placement.set(self.allocator, op_id, .{
-                    .parent = v.parent,
-                    .name = try self.allocator.dupe(u8, v.name),
-                });
-                try inode.kind.symlink.set(self.allocator, op_id, try self.allocator.dupe(u8, v.target));
+                {
+                    const name_copy = try self.allocator.dupe(u8, v.name);
+                    errdefer self.allocator.free(name_copy);
+                    try inode.placement.set(self.allocator, op_id, .{
+                        .parent = v.parent,
+                        .name = name_copy,
+                    });
+                }
+                {
+                    const target_copy = try self.allocator.dupe(u8, v.target);
+                    errdefer self.allocator.free(target_copy);
+                    try inode.kind.symlink.set(self.allocator, op_id, target_copy);
+                }
+                mutated.* = true;
                 try self.tree.insertInode(self.allocator, inode);
+                try touched.put(self.allocator, iid, {});
+                if (!v.parent.isRoot()) try touched.put(self.allocator, v.parent, {});
             },
             .rename => |v| {
-                if (!self.tree.contains(v.inode) or !self.tree.contains(v.parent)) return error.UnknownInode;
+                if (v.inode.isRoot()) return error.CannotModifyRoot;
+                if (!isValidName(v.name)) return error.InvalidName;
+                _ = try self.requireKnown(view, v.inode);
+                try self.requireKnownDir(view, v.parent);
+                mutated.* = true;
                 try self.tree.place(self.allocator, v.inode, op_id, v.parent, v.name);
+                try touched.put(self.allocator, v.inode, {});
+                if (!v.parent.isRoot()) try touched.put(self.allocator, v.parent, {});
             },
             .remove => |v| {
-                const inode = self.tree.getMut(v.inode) orelse return error.UnknownInode;
+                if (v.inode.isRoot()) return error.CannotModifyRoot;
+                const inode = try self.requireKnown(view, v.inode);
+                mutated.* = true;
                 if (inode.isDir()) {
-                    try self.removeDirSubtree(v.inode, op_id, view);
+                    try self.removeDirSubtree(v.inode, op_id, view, touched);
                 } else {
                     try inode.alive.set(self.allocator, op_id, false);
+                    try touched.put(self.allocator, v.inode, {});
                 }
             },
             .restore => |v| {
-                const inode = self.tree.getMut(v.inode) orelse return error.UnknownInode;
+                const inode = try self.requireKnown(view, v.inode);
+                mutated.* = true;
                 try inode.alive.set(self.allocator, op_id, true);
+                if (!v.inode.isRoot()) try touched.put(self.allocator, v.inode, {});
             },
             .edit_text => |v| {
-                const inode = self.tree.getMut(v.inode) orelse return error.UnknownInode;
+                const inode = try self.requireKnown(view, v.inode);
                 const f = inode.filePtr() orelse return error.NotAFile;
+                f.text.apply(self.allocator, op_id, view, v.splices, v.text, self.resolver()) catch |err| switch (err) {
+                    error.Unordered => return error.Unordered,
+                    error.OutOfBounds => return error.OutOfBounds,
+                    error.LengthMismatch => return error.LengthMismatch,
+                    error.InvalidSplice => return error.InvalidSplice,
+                    error.OutOfMemory => {
+                        mutated.* = true;
+                        return error.OutOfMemory;
+                    },
+                };
+                mutated.* = true;
                 if (v.text.len > 0) {
                     const key = id.InsertionKey{ .op = op_id, .part = 0 };
-                    const owned = try self.allocator.dupe(u8, v.text);
-                    if (self.insertions.getPtr(key)) |prev| prev.deinit(self.allocator);
-                    try self.insertions.put(self.allocator, key, .{ .owned = owned });
+                    try self.putOwnedInsertion(key, v.text);
                 }
-                f.text.apply(self.allocator, op_id, view, v.splices, v.text, self.resolver()) catch |err| return switch (err) {
-                    error.Unordered => error.Unordered,
-                    error.OutOfBounds => error.OutOfBounds,
-                    error.LengthMismatch => error.LengthMismatch,
-                    error.OutOfMemory => error.OutOfMemory,
-                };
+                try touched.put(self.allocator, v.inode, {});
             },
             .set_content => |v| {
-                const inode = self.tree.getMut(v.inode) orelse return error.UnknownInode;
+                const inode = try self.requireKnown(view, v.inode);
                 const f = inode.filePtr() orelse return error.NotAFile;
-                try self.applySetContent(f, op_id, view, &v.content);
+                try self.applySetContent(f, op_id, view, &v.content, mutated);
+                try touched.put(self.allocator, v.inode, {});
             },
             .set_mode => |v| {
-                const inode = self.tree.getMut(v.inode) orelse return error.UnknownInode;
+                const inode = try self.requireKnown(view, v.inode);
                 const f = inode.filePtr() orelse return error.NotAFile;
+                mutated.* = true;
                 try f.mode.set(self.allocator, op_id, v.mode);
+                try touched.put(self.allocator, v.inode, {});
             },
             .set_line_ending => |v| {
-                const inode = self.tree.getMut(v.inode) orelse return error.UnknownInode;
+                const inode = try self.requireKnown(view, v.inode);
                 const f = inode.filePtr() orelse return error.NotAFile;
+                mutated.* = true;
                 try f.line_ending.set(self.allocator, op_id, v.ending);
+                try touched.put(self.allocator, v.inode, {});
             },
             .set_symlink_target => |v| {
-                const inode = self.tree.getMut(v.inode) orelse return error.UnknownInode;
+                const inode = try self.requireKnown(view, v.inode);
                 switch (inode.kind) {
-                    .symlink => |*s| try s.set(self.allocator, op_id, try self.allocator.dupe(u8, v.target)),
+                    .symlink => |*s| {
+                        const target_copy = try self.allocator.dupe(u8, v.target);
+                        errdefer self.allocator.free(target_copy);
+                        mutated.* = true;
+                        try s.set(self.allocator, op_id, target_copy);
+                        try touched.put(self.allocator, v.inode, {});
+                    },
                     else => return error.NotASymlink,
                 }
             },
             .git_checkout => {},
             .meta => |v| {
-                const gop = try self.meta.getOrPut(self.allocator, v.key);
-                if (!gop.found_existing) {
-                    gop.key_ptr.* = try self.allocator.dupe(u8, v.key);
-                    gop.value_ptr.* = .{};
+                if (self.meta.getPtr(v.key)) |lww| {
+                    const val_copy: ?[]u8 = if (v.value) |raw| try self.allocator.dupe(u8, raw) else null;
+                    errdefer if (val_copy) |vc| self.allocator.free(vc);
+                    mutated.* = true;
+                    try lww.set(self.allocator, op_id, val_copy);
+                } else {
+                    const key_copy = try self.allocator.dupe(u8, v.key);
+                    errdefer self.allocator.free(key_copy);
+                    var lww = tree_mod.Lww(?[]u8){};
+                    errdefer lww.deinit(self.allocator);
+                    {
+                        const val_copy: ?[]u8 = if (v.value) |raw| try self.allocator.dupe(u8, raw) else null;
+                        errdefer if (val_copy) |vc| self.allocator.free(vc);
+                        try lww.set(self.allocator, op_id, val_copy);
+                    }
+                    mutated.* = true;
+                    try self.meta.put(self.allocator, key_copy, lww);
                 }
-                const val_copy: ?[]u8 = if (v.value) |raw| try self.allocator.dupe(u8, raw) else null;
-                try gop.value_ptr.set(self.allocator, op_id, val_copy);
             },
         }
     }
 
-    fn removeDirSubtree(self: *History, dir_iid: id.InodeId, op_id: id.OpId, view: View) Allocator.Error!void {
+    fn removeDirSubtree(
+        self: *History,
+        dir_iid: id.InodeId,
+        op_id: id.OpId,
+        view: View,
+        touched: *std.AutoArrayHashMapUnmanaged(id.InodeId, void),
+    ) Allocator.Error!void {
         var stack: std.ArrayList(id.InodeId) = .empty;
         defer stack.deinit(self.allocator);
         try stack.append(self.allocator, dir_iid);
@@ -835,6 +1008,7 @@ pub const History = struct {
         while (stack.pop()) |cur_iid| {
             const cur = self.tree.getMut(cur_iid) orelse continue;
             try cur.alive.set(self.allocator, op_id, false);
+            if (!cur_iid.isRoot()) try touched.put(self.allocator, cur_iid, {});
             if (!cur.isDir()) continue;
             var entries = try self.tree.listDir(self.allocator, view, cur_iid);
             defer {
@@ -853,25 +1027,31 @@ pub const History = struct {
         op_id: id.OpId,
         view: View,
         content: *const op_mod.Content,
+        mutated: *bool,
     ) (IntegrateError || Allocator.Error)!void {
         switch (content.*) {
             .text_inline => |bytes| {
+                mutated.* = true;
                 try f.content.set(self.allocator, op_id, .text);
                 try self.applySetTextBytes(f, op_id, view, bytes, null);
             },
             .text_blob => |ref| {
-                try f.content.set(self.allocator, op_id, .text);
                 if (ref.len == 0) {
+                    mutated.* = true;
+                    try f.content.set(self.allocator, op_id, .text);
                     try self.applySetTextBytes(f, op_id, view, "", ref.oid);
                 } else if (self.resolveBlob(ref.oid)) |raw_bytes| {
                     const copy = try self.allocator.dupe(u8, raw_bytes);
                     defer self.allocator.free(copy);
+                    mutated.* = true;
+                    try f.content.set(self.allocator, op_id, .text);
                     try self.applySetTextBytes(f, op_id, view, copy, ref.oid);
                 } else {
                     return error.MissingBlob;
                 }
             },
             .binary => |ref| {
+                mutated.* = true;
                 try f.content.set(self.allocator, op_id, .{ .binary = ref });
             },
         }
@@ -886,42 +1066,23 @@ pub const History = struct {
         blob_oid: ?id.Oid,
     ) (IntegrateError || Allocator.Error)!void {
         const vis_len = f.text.lenIn(view);
-        if (vis_len == 0) {
-            if (new_bytes.len == 0) return;
+        if (vis_len == 0 and new_bytes.len == 0) return;
+
+        if (new_bytes.len > 0) {
             const key = id.InsertionKey{ .op = op_id, .part = 0 };
             if (blob_oid) |oid| {
                 try self.insertion_blobs.put(self.allocator, key, oid);
             } else {
-                const owned = try self.allocator.dupe(u8, new_bytes);
-                if (self.insertions.getPtr(key)) |prev| prev.deinit(self.allocator);
-                try self.insertions.put(self.allocator, key, .{ .owned = owned });
+                try self.putOwnedInsertion(key, new_bytes);
             }
-            const sp = [_]diff.Splice{.{ .at = 0, .del = 0, .ins = new_bytes.len }};
-            f.text.apply(self.allocator, op_id, view, &sp, new_bytes, self.resolver()) catch |err| return switch (err) {
-                error.Unordered => error.Unordered,
-                error.OutOfBounds => error.OutOfBounds,
-                error.LengthMismatch => error.LengthMismatch,
-                error.OutOfMemory => error.OutOfMemory,
-            };
-            return;
         }
 
-        const old_bytes = (try f.text.readIn(self.allocator, self.resolver(), view)) orelse try self.allocator.dupe(u8, "");
-        defer self.allocator.free(old_bytes);
-        var d = try diff.diffBytes(self.allocator, old_bytes, new_bytes);
-        defer d.deinit(self.allocator);
-        if (d.splices.items.len == 0) return;
-
-        if (d.inserted.items.len > 0) {
-            const key = id.InsertionKey{ .op = op_id, .part = 0 };
-            const owned = try self.allocator.dupe(u8, d.inserted.items);
-            if (self.insertions.getPtr(key)) |prev| prev.deinit(self.allocator);
-            try self.insertions.put(self.allocator, key, .{ .owned = owned });
-        }
-        f.text.apply(self.allocator, op_id, view, d.splices.items, d.inserted.items, self.resolver()) catch |err| return switch (err) {
+        const sp = [_]diff.Splice{.{ .at = 0, .del = vis_len, .ins = new_bytes.len }};
+        f.text.apply(self.allocator, op_id, view, &sp, new_bytes, self.resolver()) catch |err| return switch (err) {
             error.Unordered => error.Unordered,
             error.OutOfBounds => error.OutOfBounds,
             error.LengthMismatch => error.LengthMismatch,
+            error.InvalidSplice => error.InvalidSplice,
             error.OutOfMemory => error.OutOfMemory,
         };
     }
@@ -932,9 +1093,7 @@ pub const History = struct {
                 try f.content.set(self.allocator, op_id, .text);
                 if (bytes.len > 0) {
                     const key = id.InsertionKey{ .op = op_id, .part = 0 };
-                    const owned = try self.allocator.dupe(u8, bytes);
-                    if (self.insertions.getPtr(key)) |prev| prev.deinit(self.allocator);
-                    try self.insertions.put(self.allocator, key, .{ .owned = owned });
+                    try self.putOwnedInsertion(key, bytes);
                     f.text.deinit(self.allocator);
                     f.text = try Text.fromInsertion(self.allocator, op_id, 0, 0, bytes.len, bytes);
                 } else {
@@ -1064,7 +1223,7 @@ pub const History = struct {
         f: *const tree_mod.FileNode,
         res: text_mod.ContentResolver,
         target_view: View,
-    ) Allocator.Error!void {
+    ) (RevertError || Allocator.Error)!void {
         var vd = try f.text.diffViews(allocator, res, View.EVERYTHING, target_view);
         defer vd.deinit(allocator);
         if (vd.splices.len == 0) return;
@@ -1100,7 +1259,7 @@ pub const History = struct {
         inode: *const tree_mod.Inode,
         res: text_mod.ContentResolver,
         target_view: View,
-    ) Allocator.Error!void {
+    ) (RevertError || Allocator.Error)!void {
         switch (inode.kind) {
             .dir => {},
             .file => |*f| {
@@ -1125,7 +1284,6 @@ pub const History = struct {
                             .text => false,
                         };
                         if (!same) {
-                            try ops.append(allocator, .{ .set_content = .{ .inode = iid, .content = .{ .binary = tref } } });
                             var already_attached = false;
                             for (blobs.items) |b| {
                                 if (std.mem.eql(u8, &b.oid, &tref.oid)) {
@@ -1135,18 +1293,30 @@ pub const History = struct {
                             }
                             if (!already_attached) {
                                 if (self.resolveBlob(tref.oid)) |raw| {
+                                    const data_copy = try allocator.dupe(u8, raw);
+                                    errdefer allocator.free(data_copy);
                                     try blobs.append(allocator, .{
                                         .oid = tref.oid,
-                                        .data = try allocator.dupe(u8, raw),
+                                        .data = data_copy,
                                     });
+                                } else if (tref.len == 0) {
+                                    const empty_copy = try allocator.dupe(u8, "");
+                                    errdefer allocator.free(empty_copy);
+                                    try blobs.append(allocator, .{
+                                        .oid = tref.oid,
+                                        .data = empty_copy,
+                                    });
+                                } else {
+                                    return error.MissingBlob;
                                 }
                             }
+                            try ops.append(allocator, .{ .set_content = .{ .inode = iid, .content = .{ .binary = tref } } });
                         }
                     },
                     .text => {
                         switch (now_ck) {
                             .binary => {
-                                const tgt_text = (try f.text.readIn(allocator, res, target_view)) orelse try allocator.dupe(u8, "");
+                                const tgt_text = (try f.text.readIn(allocator, res, target_view)) orelse return error.MissingBlob;
                                 errdefer allocator.free(tgt_text);
                                 try ops.append(allocator, .{ .set_content = .{
                                     .inode = iid,
@@ -1164,13 +1334,224 @@ pub const History = struct {
                 const now_tgt = if (sym.get()) |t| t.* else "";
                 const tgt_tgt = if (sym.getIn(target_view)) |t| t.* else "";
                 if (!std.mem.eql(u8, now_tgt, tgt_tgt)) {
+                    const copy = try allocator.dupe(u8, tgt_tgt);
+                    errdefer allocator.free(copy);
                     try ops.append(allocator, .{ .set_symlink_target = .{
                         .inode = iid,
-                        .target = try allocator.dupe(u8, tgt_tgt),
+                        .target = copy,
                     } });
                 }
             },
         }
+    }
+
+    fn depthIn(self: *const History, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!usize {
+        var depth: usize = 0;
+        var cur = iid;
+        while (!cur.isRoot() and depth < 4096) {
+            const entry = try self.tree.placementIn(allocator, view, cur) orelse break;
+            cur = entry.value.parent;
+            depth += 1;
+        }
+        return depth;
+    }
+
+    fn buildRevertForTarget(
+        self: *const History,
+        allocator: Allocator,
+        actor: id.ActorId,
+        target_view: View,
+        diff_batches: []const id.BatchId,
+        wall_ms: u64,
+    ) (RevertError || Allocator.Error)!?op_mod.Batch {
+        if (diff_batches.len == 0) return null;
+
+        var touched: std.AutoArrayHashMapUnmanaged(id.InodeId, void) = .empty;
+        defer touched.deinit(allocator);
+        var queue: std.ArrayList(id.InodeId) = .empty;
+        defer queue.deinit(allocator);
+
+        for (diff_batches) |bid| {
+            if (self.batch_inodes.get(bid)) |inodes| {
+                for (inodes) |iid| {
+                    if (iid.isRoot()) continue;
+                    const gop = try touched.getOrPut(allocator, iid);
+                    if (!gop.found_existing) try queue.append(allocator, iid);
+                }
+            }
+        }
+        while (queue.pop()) |cur| {
+            const inode = self.tree.get(cur) orelse continue;
+            for (inode.placement.entries.items) |e| {
+                const p = e.value.parent;
+                if (p.isRoot()) continue;
+                const gop = try touched.getOrPut(allocator, p);
+                if (!gop.found_existing) try queue.append(allocator, p);
+            }
+        }
+
+        if (touched.count() == 0) return null;
+
+        const candidates = try allocator.dupe(id.InodeId, touched.keys());
+        defer allocator.free(candidates);
+        std.mem.sort(id.InodeId, candidates, {}, struct {
+            fn lt(_: void, a: id.InodeId, b: id.InodeId) bool {
+                return a.order(b) == .lt;
+            }
+        }.lt);
+
+        var restore_set: std.AutoArrayHashMapUnmanaged(id.InodeId, void) = .empty;
+        defer restore_set.deinit(allocator);
+
+        var phase2_ops: std.ArrayList(op_mod.Op) = .empty;
+        errdefer {
+            for (phase2_ops.items) |*o| o.deinit(allocator);
+            phase2_ops.deinit(allocator);
+        }
+        var blobs: std.ArrayList(op_mod.BlobAttachment) = .empty;
+        errdefer {
+            for (blobs.items) |*b| b.deinit(allocator);
+            blobs.deinit(allocator);
+        }
+
+        const RemoveItem = struct {
+            iid: id.InodeId,
+            depth: usize,
+        };
+        var phase3_items: std.ArrayList(RemoveItem) = .empty;
+        defer phase3_items.deinit(allocator);
+
+        const res = self.resolver();
+        for (candidates) |iid| {
+            const inode = self.tree.get(iid) orelse continue;
+            const now_present = try self.tree.isPresent(allocator, View.EVERYTHING, iid);
+            const target_present = try self.tree.isPresent(allocator, target_view, iid);
+
+            if (!now_present and !target_present) continue;
+
+            if (now_present and !target_present) {
+                const d = try self.depthIn(allocator, View.EVERYTHING, iid);
+                try phase3_items.append(allocator, .{ .iid = iid, .depth = d });
+                continue;
+            }
+
+            const now_alive = if (inode.alive.get()) |a| a.* else false;
+            const target_alive = if (inode.alive.getIn(target_view)) |a| a.* else false;
+            if (target_alive and !now_alive) {
+                try restore_set.put(allocator, iid, {});
+            }
+
+            var anc = iid;
+            var guard: usize = 0;
+            while (!anc.isRoot() and guard < 4096) {
+                guard += 1;
+                const anc_entry = try self.tree.placementIn(allocator, target_view, anc) orelse break;
+                const p = anc_entry.value.parent;
+                if (p.isRoot()) break;
+                if (self.tree.get(p)) |pinode| {
+                    const p_now_alive = if (pinode.alive.get()) |a| a.* else false;
+                    const p_tgt_alive = if (pinode.alive.getIn(target_view)) |a| a.* else false;
+                    if (p_tgt_alive and !p_now_alive) {
+                        try restore_set.put(allocator, p, {});
+                    }
+                }
+                anc = p;
+            }
+
+            const now_entry = try self.tree.placementIn(allocator, View.EVERYTHING, iid);
+            const target_entry = try self.tree.placementIn(allocator, target_view, iid);
+            if (target_entry) |te| {
+                const tp = &te.value;
+                const eff_moved = if (now_entry) |ne|
+                    (!ne.value.parent.eql(tp.parent) or !std.mem.eql(u8, ne.value.name, tp.name))
+                else
+                    true;
+                const raw_moved = if (inode.placement.get()) |rn|
+                    (!rn.parent.eql(tp.parent) or !std.mem.eql(u8, rn.name, tp.name))
+                else
+                    true;
+                if (eff_moved or raw_moved) {
+                    const name_copy = try allocator.dupe(u8, tp.name);
+                    errdefer allocator.free(name_copy);
+                    try phase2_ops.append(allocator, .{ .rename = .{
+                        .inode = iid,
+                        .parent = tp.parent,
+                        .name = name_copy,
+                    } });
+                }
+            }
+
+            try self.appendNodeRevertOps(allocator, &phase2_ops, &blobs, iid, inode, res, target_view);
+        }
+
+        const total_ops = restore_set.count() + phase2_ops.items.len + phase3_items.items.len;
+        if (total_ops == 0) {
+            phase2_ops.deinit(allocator);
+            for (blobs.items) |*b| b.deinit(allocator);
+            blobs.deinit(allocator);
+            return null;
+        }
+
+        const restore_ids = try allocator.dupe(id.InodeId, restore_set.keys());
+        defer allocator.free(restore_ids);
+        std.mem.sort(id.InodeId, restore_ids, {}, struct {
+            fn lt(_: void, a: id.InodeId, b: id.InodeId) bool {
+                return a.order(b) == .lt;
+            }
+        }.lt);
+
+        std.mem.sort(RemoveItem, phase3_items.items, {}, struct {
+            fn lt(_: void, a: RemoveItem, b: RemoveItem) bool {
+                if (a.depth != b.depth) return a.depth > b.depth;
+                return a.iid.order(b.iid) == .lt;
+            }
+        }.lt);
+
+        const parents = try self.dag.heads.clone(allocator);
+        var parents_owned = true;
+        errdefer if (parents_owned) {
+            var p = parents;
+            p.deinit(allocator);
+        };
+
+        const ops_slice = try allocator.alloc(op_mod.Op, total_ops);
+        var built: usize = 0;
+        errdefer {
+            for (ops_slice[0..built]) |*o| o.deinit(allocator);
+            allocator.free(ops_slice);
+        }
+
+        for (restore_ids) |rid| {
+            ops_slice[built] = .{ .restore = .{ .inode = rid } };
+            built += 1;
+        }
+        for (phase2_ops.items) |op_item| {
+            ops_slice[built] = op_item;
+            built += 1;
+        }
+        phase2_ops.clearRetainingCapacity();
+        phase2_ops.deinit(allocator);
+
+        for (phase3_items.items) |rm| {
+            ops_slice[built] = .{ .remove = .{ .inode = rm.iid } };
+            built += 1;
+        }
+
+        const blobs_slice = try blobs.toOwnedSlice(allocator);
+        const start = self.nextStartTs(&parents);
+        const end = start + @as(u64, @intCast(ops_slice.len)) - 1;
+        parents_owned = false;
+        return .{
+            .header = .{
+                .actor = actor,
+                .start = start,
+                .end = end,
+                .parents = parents,
+                .wall_ms = wall_ms,
+            },
+            .ops = ops_slice,
+            .blobs = blobs_slice,
+        };
     }
 
     pub fn buildRollbackBatch(
@@ -1179,92 +1560,14 @@ pub const History = struct {
         actor: id.ActorId,
         target_version: *const Version,
         wall_ms: u64,
-    ) Allocator.Error!?op_mod.Batch {
-        var cv = try self.dag.compileView(allocator, target_version);
+    ) (RevertError || Allocator.Error)!?op_mod.Batch {
+        var diff_batches = try self.dag.difference(allocator, &self.dag.heads, target_version);
+        defer diff_batches.deinit(allocator);
+        if (diff_batches.items.len == 0) return null;
+
+        var cv = try self.dag.compileExcluding(allocator, diff_batches.items);
         defer cv.deinit(allocator);
-        const target_view = cv.view();
-
-        var ops: std.ArrayList(op_mod.Op) = .empty;
-        errdefer {
-            for (ops.items) |*o| o.deinit(allocator);
-            ops.deinit(allocator);
-        }
-        var blobs: std.ArrayList(op_mod.BlobAttachment) = .empty;
-        errdefer {
-            for (blobs.items) |*b| b.deinit(allocator);
-            blobs.deinit(allocator);
-        }
-
-        const res = self.resolver();
-        var it = self.tree.inodes.iterator();
-        while (it.next()) |kv| {
-            const iid = kv.key_ptr.*;
-            if (iid.isRoot()) continue;
-            const inode = kv.value_ptr.*;
-            const now_alive = if (inode.alive.get()) |a| a.* else false;
-            const target_alive = if (inode.alive.getIn(target_view)) |a| a.* else false;
-
-            if (now_alive and !target_alive) {
-                try ops.append(allocator, .{ .remove = .{ .inode = iid } });
-                continue;
-            }
-            if (!now_alive and target_alive) {
-                try ops.append(allocator, .{ .restore = .{ .inode = iid } });
-            }
-
-            const now_p = inode.placement.get();
-            const target_p = inode.placement.getIn(target_view);
-            if (target_p) |tp| {
-                const moved = if (now_p) |np|
-                    (!np.parent.eql(tp.parent) or !std.mem.eql(u8, np.name, tp.name))
-                else
-                    true;
-                if (moved) {
-                    try ops.append(allocator, .{ .rename = .{
-                        .inode = iid,
-                        .parent = tp.parent,
-                        .name = try allocator.dupe(u8, tp.name),
-                    } });
-                }
-            }
-
-            if (target_alive) {
-                try self.appendNodeRevertOps(allocator, &ops, &blobs, iid, inode, res, target_view);
-            }
-        }
-
-        if (ops.items.len == 0) {
-            for (blobs.items) |*b| b.deinit(allocator);
-            blobs.deinit(allocator);
-            return null;
-        }
-
-        const parents = try self.dag.heads.clone(allocator);
-        var parents_owned = true;
-        errdefer if (parents_owned) {
-            var p = parents;
-            p.deinit(allocator);
-        };
-        const ops_slice = try ops.toOwnedSlice(allocator);
-        errdefer {
-            for (ops_slice) |*o| o.deinit(allocator);
-            allocator.free(ops_slice);
-        }
-        const blobs_slice = try blobs.toOwnedSlice(allocator);
-        const start = self.nextStartTs(&parents);
-        const end = start + @as(u64, @intCast(ops_slice.len)) - 1;
-        parents_owned = false;
-        return .{
-            .header = .{
-                .actor = actor,
-                .start = start,
-                .end = end,
-                .parents = parents,
-                .wall_ms = wall_ms,
-            },
-            .ops = ops_slice,
-            .blobs = blobs_slice,
-        };
+        return try self.buildRevertForTarget(allocator, actor, cv.view(), diff_batches.items, wall_ms);
     }
 
     pub fn buildRevertScopeBatch(
@@ -1273,108 +1576,11 @@ pub const History = struct {
         actor: id.ActorId,
         excluded: []const id.BatchId,
         wall_ms: u64,
-    ) Allocator.Error!?op_mod.Batch {
-        const ExclCtx = struct {
-            dag_ptr: *const Dag,
-            excluded: []const id.BatchId,
-            fn observes(ptr: *const anyopaque, op_id: id.OpId) bool {
-                const ctx: *const @This() = @ptrCast(@alignCast(ptr));
-                const bid = ctx.dag_ptr.batchOf(op_id) orelse return true;
-                for (ctx.excluded) |ex| {
-                    if (ex.eql(bid)) return false;
-                }
-                return true;
-            }
-        };
-        var min_ts: id.Lamport = std.math.maxInt(id.Lamport);
-        for (excluded) |ex| {
-            if (self.dag.getHeader(ex)) |h| {
-                if (h.start < min_ts) min_ts = h.start;
-            } else if (ex.ts < min_ts) {
-                min_ts = ex.ts;
-            }
-        }
-        const ctx = ExclCtx{ .dag_ptr = &self.dag, .excluded = excluded };
-        const view = View{ .ptr = &ctx, .observesFn = ExclCtx.observes, .min_unobserved = min_ts };
+    ) (RevertError || Allocator.Error)!?op_mod.Batch {
+        if (excluded.len == 0) return null;
 
-        var ops: std.ArrayList(op_mod.Op) = .empty;
-        errdefer {
-            for (ops.items) |*o| o.deinit(allocator);
-            ops.deinit(allocator);
-        }
-        var blobs: std.ArrayList(op_mod.BlobAttachment) = .empty;
-        errdefer {
-            for (blobs.items) |*b| b.deinit(allocator);
-            blobs.deinit(allocator);
-        }
-
-        const res = self.resolver();
-        var it = self.tree.inodes.iterator();
-        while (it.next()) |kv| {
-            const iid = kv.key_ptr.*;
-            if (iid.isRoot()) continue;
-            const inode = kv.value_ptr.*;
-            const now_alive = if (inode.alive.get()) |a| a.* else false;
-            const tgt_alive = if (inode.alive.getIn(view)) |a| a.* else false;
-            if (now_alive and !tgt_alive) {
-                try ops.append(allocator, .{ .remove = .{ .inode = iid } });
-                continue;
-            }
-            if (!now_alive and tgt_alive) {
-                try ops.append(allocator, .{ .restore = .{ .inode = iid } });
-            }
-
-            const now_p = inode.placement.get();
-            const target_p = inode.placement.getIn(view);
-            if (target_p) |tp| {
-                const moved = if (now_p) |np|
-                    (!np.parent.eql(tp.parent) or !std.mem.eql(u8, np.name, tp.name))
-                else
-                    true;
-                if (moved) {
-                    try ops.append(allocator, .{ .rename = .{
-                        .inode = iid,
-                        .parent = tp.parent,
-                        .name = try allocator.dupe(u8, tp.name),
-                    } });
-                }
-            }
-
-            if (tgt_alive) {
-                try self.appendNodeRevertOps(allocator, &ops, &blobs, iid, inode, res, view);
-            }
-        }
-
-        if (ops.items.len == 0) {
-            for (blobs.items) |*b| b.deinit(allocator);
-            blobs.deinit(allocator);
-            return null;
-        }
-        const parents = try self.dag.heads.clone(allocator);
-        var parents_owned = true;
-        errdefer if (parents_owned) {
-            var p = parents;
-            p.deinit(allocator);
-        };
-        const ops_slice = try ops.toOwnedSlice(allocator);
-        errdefer {
-            for (ops_slice) |*o| o.deinit(allocator);
-            allocator.free(ops_slice);
-        }
-        const blobs_slice = try blobs.toOwnedSlice(allocator);
-        const start = self.nextStartTs(&parents);
-        const end = start + @as(u64, @intCast(ops_slice.len)) - 1;
-        parents_owned = false;
-        return .{
-            .header = .{
-                .actor = actor,
-                .start = start,
-                .end = end,
-                .parents = parents,
-                .wall_ms = wall_ms,
-            },
-            .ops = ops_slice,
-            .blobs = blobs_slice,
-        };
+        var cv = try self.dag.compileExcluding(allocator, excluded);
+        defer cv.deinit(allocator);
+        return try self.buildRevertForTarget(allocator, actor, cv.view(), excluded, wall_ms);
     }
 };

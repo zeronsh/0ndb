@@ -18,7 +18,8 @@ pub const BatchHeader = struct {
     }
 
     pub fn opCount(self: *const BatchHeader) u64 {
-        return self.end - self.start + 1;
+        if (self.end < self.start) return 0;
+        return (self.end - self.start) +| 1;
     }
 
     pub fn opId(self: *const BatchHeader, index: usize) id.OpId {
@@ -136,6 +137,7 @@ pub const Dag = struct {
     batch_indices: std.AutoHashMapUnmanaged(id.BatchId, u32) = .empty,
     by_actor: std.AutoHashMapUnmanaged(id.ActorId, std.ArrayList(ActorRun)) = .empty,
     heads: Version = Version.ROOT,
+    horizon: Version = Version.ROOT,
     max_ts: id.Lamport = 0,
     next_batch_idx: u32 = 0,
 
@@ -152,6 +154,7 @@ pub const Dag = struct {
         }
         self.by_actor.deinit(allocator);
         self.heads.deinit(allocator);
+        self.horizon.deinit(allocator);
     }
 
     pub fn count(self: *const Dag) usize {
@@ -458,6 +461,77 @@ pub const Dag = struct {
             }
         }
         return min_ts;
+    }
+
+    pub fn closure(self: *const Dag, allocator: Allocator, v: *const Version) Allocator.Error!std.AutoHashMapUnmanaged(id.BatchId, void) {
+        var seen: std.AutoHashMapUnmanaged(id.BatchId, void) = .empty;
+        errdefer seen.deinit(allocator);
+        var stack: std.ArrayList(id.BatchId) = .empty;
+        defer stack.deinit(allocator);
+
+        try stack.appendSlice(allocator, v.slice());
+        while (stack.pop()) |cur| {
+            const gop = try seen.getOrPut(allocator, cur);
+            if (gop.found_existing) continue;
+            if (self.headers.getPtr(cur)) |h| {
+                try stack.appendSlice(allocator, h.parents.slice());
+            }
+        }
+        return seen;
+    }
+
+    pub fn commonFrontier(self: *const Dag, allocator: Allocator, versions: []const Version) Allocator.Error!Version {
+        if (versions.len == 0) return Version.ROOT;
+        for (versions) |*ver| {
+            if (ver.isEmpty()) return Version.ROOT;
+        }
+
+        var common = try self.closure(allocator, &versions[0]);
+        defer common.deinit(allocator);
+
+        var to_remove: std.ArrayList(id.BatchId) = .empty;
+        defer to_remove.deinit(allocator);
+
+        for (versions[1..]) |*ver| {
+            if (common.count() == 0) return Version.ROOT;
+            var cur_closure = try self.closure(allocator, ver);
+            defer cur_closure.deinit(allocator);
+            to_remove.clearRetainingCapacity();
+            var it = common.keyIterator();
+            while (it.next()) |k| {
+                if (!cur_closure.contains(k.*)) {
+                    try to_remove.append(allocator, k.*);
+                }
+            }
+            for (to_remove.items) |k| {
+                _ = common.remove(k);
+            }
+        }
+
+        if (common.count() == 0) return Version.ROOT;
+
+        var non_maximal: std.AutoHashMapUnmanaged(id.BatchId, void) = .empty;
+        defer non_maximal.deinit(allocator);
+        var cit = common.keyIterator();
+        while (cit.next()) |k| {
+            if (self.headers.getPtr(k.*)) |h| {
+                for (h.parents.slice()) |p| {
+                    if (common.contains(p)) {
+                        try non_maximal.put(allocator, p, {});
+                    }
+                }
+            }
+        }
+
+        var out = Version{};
+        errdefer out.deinit(allocator);
+        var fit = common.keyIterator();
+        while (fit.next()) |k| {
+            if (!non_maximal.contains(k.*)) {
+                try out.insert(allocator, k.*);
+            }
+        }
+        return out;
     }
 };
 

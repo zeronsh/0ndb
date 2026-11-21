@@ -4,6 +4,7 @@ const id = @import("id.zig");
 const codec = @import("../store/codec.zig");
 
 pub const INLINE_CAP: usize = 4;
+pub const MAX_VERSION_ENTRIES: usize = 65536;
 
 pub const Version = struct {
     inline_buf: [INLINE_CAP]id.BatchId = undefined,
@@ -156,7 +157,9 @@ pub const Version = struct {
 
     pub fn decode(allocator: Allocator, r: *codec.Reader) (codec.DecodeError || Allocator.Error)!Version {
         const n_u64 = try r.readVarint();
+        if (n_u64 > MAX_VERSION_ENTRIES) return error.InvalidData;
         const n: usize = @intCast(n_u64);
+        if (n > r.remaining() / 24) return error.UnexpectedEof;
         var v = Version{};
         errdefer v.deinit(allocator);
         for (0..n) |_| {

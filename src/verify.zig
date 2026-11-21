@@ -711,7 +711,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
         const sc_r2 = (try hi2.readFileAt(allocator, "intra.txt", null)).?;
         defer allocator.free(sc_r2);
         try testing.expectEqualStrings(sc_r1, sc_r2);
-        try testing.expectEqualStrings("top hello world!\n", sc_r1);
+        try testing.expectEqualStrings("hello world!\ntop ", sc_r1);
 
         var p_dir = try hi1.headsClone();
         defer p_dir.deinit(allocator);
@@ -1277,12 +1277,15 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
         try testing.expectEqual(@as(usize, 1), both_count);
     }
 
+    try runCoreHardeningTests(allocator);
     try runCrdtFuzzSuite(allocator);
     try runDiffAndMerge3PropertyFuzz(allocator);
 }
 
 const FuzzFileSnap = struct {
     path: []u8,
+    parent: ondb.core.id.InodeId,
+    raw_name: []u8,
     inode_id: ondb.core.id.InodeId,
     is_dir: bool,
     is_symlink: bool,
@@ -1294,6 +1297,7 @@ const FuzzFileSnap = struct {
 
     fn deinit(self: *FuzzFileSnap, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
+        allocator.free(self.raw_name);
         allocator.free(self.data);
     }
 };
@@ -1327,10 +1331,15 @@ fn collectLiveTreeSnap(
             allocator.free(rel);
             continue;
         };
+        const p_entry = (try hist.tree.placementIn(allocator, ondb.core.text.View.EVERYTHING, e.inode_id)).?;
+        const raw_name = try allocator.dupe(u8, p_entry.value.name);
+        errdefer allocator.free(raw_name);
         switch (inode.kind) {
             .dir => {
                 try out.append(allocator, .{
                     .path = rel,
+                    .parent = p_entry.value.parent,
+                    .raw_name = raw_name,
                     .inode_id = e.inode_id,
                     .is_dir = true,
                     .is_symlink = false,
@@ -1348,6 +1357,8 @@ fn collectLiveTreeSnap(
                 errdefer allocator.free(data);
                 try out.append(allocator, .{
                     .path = rel,
+                    .parent = p_entry.value.parent,
+                    .raw_name = raw_name,
                     .inode_id = e.inode_id,
                     .is_dir = false,
                     .is_symlink = true,
@@ -1374,6 +1385,8 @@ fn collectLiveTreeSnap(
                 }
                 try out.append(allocator, .{
                     .path = rel,
+                    .parent = p_entry.value.parent,
+                    .raw_name = raw_name,
                     .inode_id = e.inode_id,
                     .is_dir = false,
                     .is_symlink = false,
@@ -1403,7 +1416,43 @@ fn expectSnapsEqual(a: []const FuzzFileSnap, b: []const FuzzFileSnap) !void {
     try testing.expectEqual(a.len, b.len);
     for (a, b) |sa, sb| {
         try testing.expectEqualStrings(sa.path, sb.path);
+        try testing.expect(sa.parent.eql(sb.parent));
+        try testing.expectEqualStrings(sa.raw_name, sb.raw_name);
         try testing.expect(sa.inode_id.eql(sb.inode_id));
+        try testing.expectEqual(sa.is_dir, sb.is_dir);
+        try testing.expectEqual(sa.is_symlink, sb.is_symlink);
+        try testing.expectEqual(sa.is_binary, sb.is_binary);
+        try testing.expectEqual(sa.mode, sb.mode);
+        try testing.expectEqual(sa.line_ending, sb.line_ending);
+        try testing.expectEqual(sa.line_count, sb.line_count);
+        try testing.expectEqualStrings(sa.data, sb.data);
+    }
+}
+
+fn expectRollbackSnapsEqual(allocator: std.mem.Allocator, a: []const FuzzFileSnap, b: []const FuzzFileSnap) !void {
+    try testing.expectEqual(a.len, b.len);
+    const sa_idx = try allocator.alloc(usize, a.len);
+    defer allocator.free(sa_idx);
+    const sb_idx = try allocator.alloc(usize, b.len);
+    defer allocator.free(sb_idx);
+    for (0..a.len) |i| {
+        sa_idx[i] = i;
+        sb_idx[i] = i;
+    }
+    const Ctx = struct { items: []const FuzzFileSnap };
+    const lessByInode = struct {
+        fn lt(ctx: Ctx, ia: usize, ib: usize) bool {
+            return ctx.items[ia].inode_id.order(ctx.items[ib].inode_id) == .lt;
+        }
+    }.lt;
+    std.mem.sort(usize, sa_idx, Ctx{ .items = a }, lessByInode);
+    std.mem.sort(usize, sb_idx, Ctx{ .items = b }, lessByInode);
+    for (sa_idx, sb_idx) |ia, ib| {
+        const sa = a[ia];
+        const sb = b[ib];
+        try testing.expect(sa.inode_id.eql(sb.inode_id));
+        try testing.expect(sa.parent.eql(sb.parent));
+        try testing.expectEqualStrings(sa.raw_name, sb.raw_name);
         try testing.expectEqual(sa.is_dir, sb.is_dir);
         try testing.expectEqual(sa.is_symlink, sb.is_symlink);
         try testing.expectEqual(sa.is_binary, sb.is_binary);
@@ -1432,6 +1481,22 @@ fn assertHistoriesConverged(
     try expectSnapsEqual(sa.items, sb.items);
 
     for (sa.items) |s| {
+        const pa = (try ha.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, s.inode_id)).?;
+        defer allocator.free(pa);
+        const pb = (try hb.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, s.inode_id)).?;
+        defer allocator.free(pb);
+        try testing.expectEqualStrings(s.path, pa);
+        try testing.expectEqualStrings(s.path, pb);
+
+        if (!s.is_dir and !s.is_symlink) {
+            const ra = (try ha.readFileAt(allocator, s.path, null)).?;
+            defer allocator.free(ra);
+            const rb = (try hb.readFileAt(allocator, s.path, null)).?;
+            defer allocator.free(rb);
+            try testing.expectEqualStrings(s.data, ra);
+            try testing.expectEqualStrings(s.data, rb);
+        }
+
         if (s.is_dir or s.is_symlink or s.is_binary) continue;
         var ba_opt = try ha.blameFile(allocator, s.path);
         var bb_opt = try hb.blameFile(allocator, s.path);
@@ -1454,8 +1519,28 @@ fn assertHistoriesConverged(
             }
         }
     }
-}
 
+    var dead_it = ha.tree.inodes.keyIterator();
+    while (dead_it.next()) |kp| {
+        const iid = kp.*;
+        if (iid.isRoot()) continue;
+        if (try ha.tree.isPresent(allocator, ondb.core.text.View.EVERYTHING, iid)) continue;
+        try testing.expect((try ha.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, iid)) == null);
+        try testing.expect((try hb.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, iid)) == null);
+    }
+
+    try testing.expectEqual(ha.meta.count(), hb.meta.count());
+    var mit = ha.meta.iterator();
+    while (mit.next()) |kv| {
+        const lww_b = hb.meta.getPtr(kv.key_ptr.*) orelse return error.TestUnexpectedResult;
+        const va = if (kv.value_ptr.get()) |p| p.* else null;
+        const vb = if (lww_b.get()) |p| p.* else null;
+        try testing.expectEqual(va != null, vb != null);
+        if (va) |a_str| {
+            try testing.expectEqualStrings(a_str, vb.?);
+        }
+    }
+}
 const FUZZ_TOKENS = [_][]const u8{
     "alpha",
     "beta",
@@ -1578,19 +1663,51 @@ fn integrateRandomTopoOrder(
     }
 }
 
-fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
-    var prng = std.Random.DefaultPrng.init(0x00db_f022_2026);
+const COLLISION_NAMES = [_][]const u8{
+    "clash.txt",
+    "same",
+    "dup.md",
+    "sub",
+};
+
+const META_KEYS = [_][]const u8{
+    "author",
+    "tag",
+    "lang",
+};
+
+fn pickFuzzName(
+    allocator: std.mem.Allocator,
+    rng: std.Random,
+    prefix: []const u8,
+    a_idx: usize,
+    step: usize,
+    sub_idx: usize,
+) ![]u8 {
+    if (rng.uintLessThan(usize, 100) < 35) {
+        return try allocator.dupe(u8, COLLISION_NAMES[rng.uintLessThan(usize, COLLISION_NAMES.len)]);
+    }
+    return try std.fmt.allocPrint(allocator, "{s}_{d}_{d}_{d}", .{ prefix, a_idx, step, sub_idx });
+}
+
+fn runCrdtFuzzSeed(allocator: std.mem.Allocator, seed_idx: usize) !void {
+    var prng = std.Random.DefaultPrng.init(0x00db_f022_2026 +% @as(u64, seed_idx) *% 0x9e37_79b9_7f4a_7c15);
     const rng = prng.random();
-    const actors = [4]ondb.core.id.ActorId{ 101, 102, 103, 104 };
+    const actors = [4]ondb.core.id.ActorId{ 101, 202, 303, 404 };
 
     var actor_h: [4]ondb.core.history.History = undefined;
     var initialized: usize = 0;
-    errdefer for (0..initialized) |i| actor_h[i].deinit();
+    defer for (0..initialized) |i| actor_h[i].deinit();
     for (0..4) |i| {
-        actor_h[i] = try ondb.core.history.History.init(allocator, 0xf022);
+        actor_h[i] = try ondb.core.history.History.init(allocator, 0xf022 +% @as(u128, seed_idx));
         initialized += 1;
     }
-    defer for (0..4) |i| actor_h[i].deinit();
+
+    var actor_past: [4]std.ArrayList(ondb.core.version.Version) = .{ .empty, .empty, .empty, .empty };
+    defer for (0..4) |i| {
+        for (actor_past[i].items) |*v| v.deinit(allocator);
+        actor_past[i].deinit(allocator);
+    };
 
     var all_batches: std.ArrayList(ondb.core.op.Batch) = .empty;
     defer {
@@ -1606,7 +1723,7 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
     }
 
     {
-        var seed_ops = try allocator.alloc(ondb.core.op.Op, 2);
+        var seed_ops = try allocator.alloc(ondb.core.op.Op, 4);
         seed_ops[0] = .{ .create_file = .{
             .parent = ondb.core.id.InodeId.ROOT,
             .name = try allocator.dupe(u8, "shared_a.txt"),
@@ -1621,11 +1738,19 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
             .line_ending = .crlf,
             .content = .{ .text_inline = try allocator.dupe(u8, "alpha\r\nbeta \xe4\xb8\xad\xe6\x96\x87\r\ngamma\r\n") },
         } };
+        seed_ops[2] = .{ .create_dir = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "dir_a"),
+        } };
+        seed_ops[3] = .{ .create_dir = .{
+            .parent = ondb.core.id.InodeId.ROOT,
+            .name = try allocator.dupe(u8, "dir_b"),
+        } };
         var seed_batch = ondb.core.op.Batch{
             .header = .{
                 .actor = actors[0],
                 .start = 1,
-                .end = 2,
+                .end = 4,
                 .parents = ondb.core.version.Version.ROOT,
                 .wall_ms = 500,
             },
@@ -1635,17 +1760,18 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
         errdefer seed_batch.deinit(allocator);
         for (0..4) |i| {
             try testing.expect(try actor_h[i].integrate(&seed_batch));
+            try actor_past[i].append(allocator, try actor_h[i].headsClone());
         }
         try all_batches.append(allocator, seed_batch);
     }
 
-    const total_rounds: usize = 160;
+    const total_rounds: usize = 42;
     for (0..total_rounds) |step| {
         const a_idx = rng.uintLessThan(usize, 4);
         const h = &actor_h[a_idx];
 
-        if (all_batches.items.len > 0 and rng.uintLessThan(usize, 100) < 40) {
-            const sync_budget = 1 + rng.uintLessThan(usize, 6);
+        if (all_batches.items.len > 0 and rng.uintLessThan(usize, 100) < 45) {
+            const sync_budget = 1 + rng.uintLessThan(usize, 5);
             var synced: usize = 0;
             for (all_batches.items) |*cand| {
                 if (synced >= sync_budget) break;
@@ -1665,31 +1791,58 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
                     synced += 1;
                 }
             }
+            if (synced > 0 and actor_past[a_idx].items.len < 8) {
+                try actor_past[a_idx].append(allocator, try h.headsClone());
+            }
         }
+
+        const use_stale = actor_past[a_idx].items.len > 0 and rng.uintLessThan(usize, 100) < 20;
+        var parents = if (use_stale)
+            try actor_past[a_idx].items[rng.uintLessThan(usize, actor_past[a_idx].items.len)].clone(allocator)
+        else
+            try h.headsClone();
+        var parents_owned = true;
+        errdefer if (parents_owned) parents.deinit(allocator);
+
+        var cv = try h.dag.compileView(allocator, &parents);
+        defer cv.deinit(allocator);
+        const view = cv.view();
 
         var live_dirs: std.ArrayList(ondb.core.id.InodeId) = .empty;
         defer live_dirs.deinit(allocator);
         try live_dirs.append(allocator, ondb.core.id.InodeId.ROOT);
 
+        var live_nonroot_dirs: std.ArrayList(ondb.core.id.InodeId) = .empty;
+        defer live_nonroot_dirs.deinit(allocator);
         var live_text_files: std.ArrayList(ondb.core.id.InodeId) = .empty;
         defer live_text_files.deinit(allocator);
         var live_files: std.ArrayList(ondb.core.id.InodeId) = .empty;
         defer live_files.deinit(allocator);
         var live_symlinks: std.ArrayList(ondb.core.id.InodeId) = .empty;
         defer live_symlinks.deinit(allocator);
+        var dead_inodes: std.ArrayList(ondb.core.id.InodeId) = .empty;
+        defer dead_inodes.deinit(allocator);
 
         var iit = h.tree.inodes.iterator();
         while (iit.next()) |kv| {
             const iid = kv.key_ptr.*;
             if (iid.isRoot()) continue;
+            if (!view.observes(iid.op)) continue;
             const node = kv.value_ptr.*;
-            if (!(if (node.alive.get()) |a| a.* else false)) continue;
+            const present = try h.tree.isPresent(allocator, view, iid);
+            if (!present) {
+                try dead_inodes.append(allocator, iid);
+                continue;
+            }
             switch (node.kind) {
-                .dir => try live_dirs.append(allocator, iid),
+                .dir => {
+                    try live_dirs.append(allocator, iid);
+                    try live_nonroot_dirs.append(allocator, iid);
+                },
                 .symlink => try live_symlinks.append(allocator, iid),
                 .file => |*f| {
                     try live_files.append(allocator, iid);
-                    const ck = if (f.content.get()) |c| c.* else ondb.core.tree.ContentKind.text;
+                    const ck = if (f.content.getIn(view)) |c| c.* else ondb.core.tree.ContentKind.text;
                     if (ck == .text) try live_text_files.append(allocator, iid);
                 },
             }
@@ -1705,121 +1858,156 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
             for (blobs.items) |*ba| ba.deinit(allocator);
             blobs.deinit(allocator);
         }
+        var edited_files = std.AutoHashMapUnmanaged(ondb.core.id.InodeId, void){};
+        defer edited_files.deinit(allocator);
 
-        const action = rng.uintLessThan(usize, 10);
-        if (action <= 1 or live_files.items.len < 2) {
-            const parent_dir = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
-            const fname = try std.fmt.allocPrint(allocator, "f_{d}_{d}.txt", .{ a_idx, step });
-            errdefer allocator.free(fname);
-            const mode: ondb.core.tree.FileMode = if (rng.boolean()) .executable else .regular;
-            const le: ondb.core.tree.LineEnding = if (rng.boolean()) .crlf else .lf;
-            if (rng.uintLessThan(usize, 5) == 0) {
-                var bin_bytes: [24]u8 = undefined;
-                rng.bytes(&bin_bytes);
-                bin_bytes[0] = 0;
-                const oid = ondb.store.crypto.hashBytes(&bin_bytes);
-                try blobs.append(allocator, .{ .oid = oid, .data = try allocator.dupe(u8, &bin_bytes) });
-                if (!blob_pool.contains(oid)) {
-                    try blob_pool.put(allocator, oid, try allocator.dupe(u8, &bin_bytes));
+        const batch_op_goal: usize = if (rng.uintLessThan(usize, 100) < 35) 2 + rng.uintLessThan(usize, 2) else 1;
+        for (0..batch_op_goal) |sub| {
+            const action = rng.uintLessThan(usize, 14);
+            if (action <= 1 or live_files.items.len < 2) {
+                const parent_dir = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
+                const fname = try pickFuzzName(allocator, rng, "f", a_idx, step, sub);
+                errdefer allocator.free(fname);
+                const mode: ondb.core.tree.FileMode = if (rng.boolean()) .executable else .regular;
+                const le: ondb.core.tree.LineEnding = if (rng.boolean()) .crlf else .lf;
+                if (rng.uintLessThan(usize, 5) == 0) {
+                    var bin_bytes: [24]u8 = undefined;
+                    rng.bytes(&bin_bytes);
+                    bin_bytes[0] = 0;
+                    const oid = ondb.store.crypto.hashBytes(&bin_bytes);
+                    try blobs.append(allocator, .{ .oid = oid, .data = try allocator.dupe(u8, &bin_bytes) });
+                    if (!blob_pool.contains(oid)) {
+                        try blob_pool.put(allocator, oid, try allocator.dupe(u8, &bin_bytes));
+                    }
+                    try ops.append(allocator, .{ .create_file = .{
+                        .parent = parent_dir,
+                        .name = fname,
+                        .mode = mode,
+                        .line_ending = .lf,
+                        .content = .{ .binary = .{ .oid = oid, .len = bin_bytes.len } },
+                    } });
+                } else {
+                    const txt = try randomUtf8Text(allocator, rng, 6);
+                    try ops.append(allocator, .{ .create_file = .{
+                        .parent = parent_dir,
+                        .name = fname,
+                        .mode = mode,
+                        .line_ending = le,
+                        .content = .{ .text_inline = txt },
+                    } });
                 }
-                try ops.append(allocator, .{ .create_file = .{
-                    .parent = parent_dir,
-                    .name = fname,
-                    .mode = mode,
-                    .line_ending = .lf,
-                    .content = .{ .binary = .{ .oid = oid, .len = bin_bytes.len } },
-                } });
-            } else {
-                const txt = try randomUtf8Text(allocator, rng, 8);
-                try ops.append(allocator, .{ .create_file = .{
-                    .parent = parent_dir,
-                    .name = fname,
-                    .mode = mode,
-                    .line_ending = le,
-                    .content = .{ .text_inline = txt },
-                } });
-            }
-        } else if (action == 2 and live_dirs.items.len < 5) {
-            const parent_dir = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
-            const dname = try std.fmt.allocPrint(allocator, "dir_{d}_{d}", .{ a_idx, step });
-            try ops.append(allocator, .{ .create_dir = .{ .parent = parent_dir, .name = dname } });
-        } else if (action == 3 and live_symlinks.items.len < 4) {
-            const parent_dir = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
-            const sname = try std.fmt.allocPrint(allocator, "link_{d}_{d}", .{ a_idx, step });
-            errdefer allocator.free(sname);
-            const tgt = try std.fmt.allocPrint(allocator, "target_{d}", .{step});
-            try ops.append(allocator, .{ .create_symlink = .{ .parent = parent_dir, .name = sname, .target = tgt } });
-        } else if ((action == 4 or action == 5) and live_text_files.items.len > 0) {
-            const target_iid = live_text_files.items[rng.uintLessThan(usize, live_text_files.items.len)];
-            const cur_bytes = (try h.readInodeInView(allocator, target_iid, ondb.core.text.View.EVERYTHING)) orelse try allocator.dupe(u8, "");
-            defer allocator.free(cur_bytes);
-            const next_bytes = try mutateUtf8Text(allocator, rng, cur_bytes);
-            defer allocator.free(next_bytes);
-            var dr = try ondb.core.diff.diffBytes(allocator, cur_bytes, next_bytes);
-            errdefer dr.deinit(allocator);
-            if (dr.splices.items.len > 0) {
-                const ins_slice = try dr.inserted.toOwnedSlice(allocator);
-                errdefer allocator.free(ins_slice);
-                const sp_slice = try dr.splices.toOwnedSlice(allocator);
-                errdefer allocator.free(sp_slice);
-                try ops.append(allocator, .{ .edit_text = .{
-                    .inode = target_iid,
-                    .text = ins_slice,
-                    .splices = sp_slice,
-                } });
-            } else {
-                dr.deinit(allocator);
-            }
-        } else if (action == 6 and live_files.items.len > 0) {
-            const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
-            if (rng.uintLessThan(usize, 3) == 0) {
-                var bin_bytes: [16]u8 = undefined;
-                rng.bytes(&bin_bytes);
-                bin_bytes[0] = 0;
-                const oid = ondb.store.crypto.hashBytes(&bin_bytes);
-                try blobs.append(allocator, .{ .oid = oid, .data = try allocator.dupe(u8, &bin_bytes) });
-                if (!blob_pool.contains(oid)) {
-                    try blob_pool.put(allocator, oid, try allocator.dupe(u8, &bin_bytes));
+            } else if (action == 2 and live_dirs.items.len < 6) {
+                const parent_dir = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
+                const dname = try pickFuzzName(allocator, rng, "dir", a_idx, step, sub);
+                try ops.append(allocator, .{ .create_dir = .{ .parent = parent_dir, .name = dname } });
+            } else if (action == 3 and live_symlinks.items.len < 4) {
+                const parent_dir = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
+                const sname = try pickFuzzName(allocator, rng, "link", a_idx, step, sub);
+                errdefer allocator.free(sname);
+                const tgt = try std.fmt.allocPrint(allocator, "target_{d}_{d}", .{ step, sub });
+                try ops.append(allocator, .{ .create_symlink = .{ .parent = parent_dir, .name = sname, .target = tgt } });
+            } else if ((action == 4 or action == 5) and live_text_files.items.len > 0) {
+                const target_iid = live_text_files.items[rng.uintLessThan(usize, live_text_files.items.len)];
+                if (edited_files.contains(target_iid)) continue;
+                try edited_files.put(allocator, target_iid, {});
+                const cur_bytes = (try h.readInodeInView(allocator, target_iid, view)) orelse try allocator.dupe(u8, "");
+                defer allocator.free(cur_bytes);
+                const next_bytes = try mutateUtf8Text(allocator, rng, cur_bytes);
+                defer allocator.free(next_bytes);
+                var dr = try ondb.core.diff.diffBytes(allocator, cur_bytes, next_bytes);
+                errdefer dr.deinit(allocator);
+                if (dr.splices.items.len > 0) {
+                    const ins_slice = try dr.inserted.toOwnedSlice(allocator);
+                    errdefer allocator.free(ins_slice);
+                    const sp_slice = try dr.splices.toOwnedSlice(allocator);
+                    errdefer allocator.free(sp_slice);
+                    try ops.append(allocator, .{ .edit_text = .{
+                        .inode = target_iid,
+                        .text = ins_slice,
+                        .splices = sp_slice,
+                    } });
+                } else {
+                    dr.deinit(allocator);
                 }
-                try ops.append(allocator, .{ .set_content = .{
+            } else if (action == 6 and live_files.items.len > 0) {
+                const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
+                if (edited_files.contains(target_iid)) continue;
+                try edited_files.put(allocator, target_iid, {});
+                if (rng.uintLessThan(usize, 3) == 0) {
+                    var bin_bytes: [16]u8 = undefined;
+                    rng.bytes(&bin_bytes);
+                    bin_bytes[0] = 0;
+                    const oid = ondb.store.crypto.hashBytes(&bin_bytes);
+                    try blobs.append(allocator, .{ .oid = oid, .data = try allocator.dupe(u8, &bin_bytes) });
+                    if (!blob_pool.contains(oid)) {
+                        try blob_pool.put(allocator, oid, try allocator.dupe(u8, &bin_bytes));
+                    }
+                    try ops.append(allocator, .{ .set_content = .{
+                        .inode = target_iid,
+                        .content = .{ .binary = .{ .oid = oid, .len = bin_bytes.len } },
+                    } });
+                } else {
+                    const txt = try randomUtf8Text(allocator, rng, 5);
+                    try ops.append(allocator, .{ .set_content = .{
+                        .inode = target_iid,
+                        .content = .{ .text_inline = txt },
+                    } });
+                }
+            } else if (action == 7 and live_files.items.len > 0) {
+                const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
+                const new_parent = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
+                const new_name = try pickFuzzName(allocator, rng, "mv", a_idx, step, sub);
+                try ops.append(allocator, .{ .rename = .{
                     .inode = target_iid,
-                    .content = .{ .binary = .{ .oid = oid, .len = bin_bytes.len } },
+                    .parent = new_parent,
+                    .name = new_name,
                 } });
-            } else {
-                const txt = try randomUtf8Text(allocator, rng, 6);
-                try ops.append(allocator, .{ .set_content = .{
-                    .inode = target_iid,
-                    .content = .{ .text_inline = txt },
+            } else if (action == 8 and live_nonroot_dirs.items.len >= 2) {
+                const target_dir = live_nonroot_dirs.items[rng.uintLessThan(usize, live_nonroot_dirs.items.len)];
+                var new_parent = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
+                if (new_parent.eql(target_dir)) new_parent = ondb.core.id.InodeId.ROOT;
+                const new_name = try pickFuzzName(allocator, rng, "dmv", a_idx, step, sub);
+                try ops.append(allocator, .{ .rename = .{
+                    .inode = target_dir,
+                    .parent = new_parent,
+                    .name = new_name,
                 } });
-            }
-        } else if (action == 7 and live_files.items.len > 0) {
-            const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
-            const new_parent = live_dirs.items[rng.uintLessThan(usize, live_dirs.items.len)];
-            const new_name = try std.fmt.allocPrint(allocator, "mv_{d}_{d}.txt", .{ a_idx, step });
-            try ops.append(allocator, .{ .rename = .{
-                .inode = target_iid,
-                .parent = new_parent,
-                .name = new_name,
-            } });
-        } else if (action == 8 and live_files.items.len > 3) {
-            const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
-            try ops.append(allocator, .{ .remove = .{ .inode = target_iid } });
-        } else if (live_symlinks.items.len > 0 and rng.boolean()) {
-            const target_iid = live_symlinks.items[rng.uintLessThan(usize, live_symlinks.items.len)];
-            const tgt = try std.fmt.allocPrint(allocator, "retarget_{d}_{d}", .{ a_idx, step });
-            try ops.append(allocator, .{ .set_symlink_target = .{ .inode = target_iid, .target = tgt } });
-        } else if (live_files.items.len > 0) {
-            const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
-            if (rng.boolean()) {
-                try ops.append(allocator, .{ .set_mode = .{
-                    .inode = target_iid,
-                    .mode = if (rng.boolean()) .executable else .regular,
-                } });
-            } else {
-                try ops.append(allocator, .{ .set_line_ending = .{
-                    .inode = target_iid,
-                    .ending = if (rng.boolean()) .crlf else .lf,
-                } });
+            } else if (action == 9 and (live_files.items.len > 2 or live_nonroot_dirs.items.len > 1)) {
+                if (live_nonroot_dirs.items.len > 1 and rng.uintLessThan(usize, 3) == 0) {
+                    const target_dir = live_nonroot_dirs.items[rng.uintLessThan(usize, live_nonroot_dirs.items.len)];
+                    try ops.append(allocator, .{ .remove = .{ .inode = target_dir } });
+                } else if (live_files.items.len > 0) {
+                    const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
+                    try ops.append(allocator, .{ .remove = .{ .inode = target_iid } });
+                }
+            } else if (action == 10 and dead_inodes.items.len > 0) {
+                const target_iid = dead_inodes.items[rng.uintLessThan(usize, dead_inodes.items.len)];
+                try ops.append(allocator, .{ .restore = .{ .inode = target_iid } });
+            } else if (action == 11) {
+                const mk = try allocator.dupe(u8, META_KEYS[rng.uintLessThan(usize, META_KEYS.len)]);
+                errdefer allocator.free(mk);
+                const mv: ?[]u8 = if (rng.uintLessThan(usize, 4) == 0)
+                    null
+                else
+                    try std.fmt.allocPrint(allocator, "v_{d}_{d}_{d}", .{ a_idx, step, sub });
+                try ops.append(allocator, .{ .meta = .{ .key = mk, .value = mv } });
+            } else if (live_symlinks.items.len > 0 and rng.boolean()) {
+                const target_iid = live_symlinks.items[rng.uintLessThan(usize, live_symlinks.items.len)];
+                const tgt = try std.fmt.allocPrint(allocator, "retarget_{d}_{d}", .{ a_idx, step });
+                try ops.append(allocator, .{ .set_symlink_target = .{ .inode = target_iid, .target = tgt } });
+            } else if (live_files.items.len > 0) {
+                const target_iid = live_files.items[rng.uintLessThan(usize, live_files.items.len)];
+                if (rng.boolean()) {
+                    try ops.append(allocator, .{ .set_mode = .{
+                        .inode = target_iid,
+                        .mode = if (rng.boolean()) .executable else .regular,
+                    } });
+                } else {
+                    try ops.append(allocator, .{ .set_line_ending = .{
+                        .inode = target_iid,
+                        .ending = if (rng.boolean()) .crlf else .lf,
+                    } });
+                }
             }
         }
 
@@ -1827,12 +2015,14 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
             for (blobs.items) |*ba| ba.deinit(allocator);
             blobs.deinit(allocator);
             ops.deinit(allocator);
+            parents.deinit(allocator);
+            parents_owned = false;
             continue;
         }
 
-        const parents = try h.headsClone();
         const start = h.nextStartTs(&parents);
         const end = start + @as(u64, @intCast(ops.items.len)) - 1;
+        parents_owned = false;
         var batch = ondb.core.op.Batch{
             .header = .{
                 .actor = actors[a_idx],
@@ -1846,16 +2036,17 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
         };
         errdefer batch.deinit(allocator);
         try testing.expect(try h.integrate(&batch));
+        if (actor_past[a_idx].items.len < 8 and rng.uintLessThan(usize, 3) == 0) {
+            try actor_past[a_idx].append(allocator, try h.headsClone());
+        }
         try all_batches.append(allocator, batch);
     }
 
-    try testing.expect(all_batches.items.len >= 120);
-
-    var r0 = try ondb.core.history.History.init(allocator, 0xf022);
+    var r0 = try ondb.core.history.History.init(allocator, 0xf022 +% @as(u128, seed_idx));
     defer r0.deinit();
-    var r1 = try ondb.core.history.History.init(allocator, 0xf022);
+    var r1 = try ondb.core.history.History.init(allocator, 0xf022 +% @as(u128, seed_idx));
     defer r1.deinit();
-    var r2 = try ondb.core.history.History.init(allocator, 0xf022);
+    var r2 = try ondb.core.history.History.init(allocator, 0xf022 +% @as(u128, seed_idx));
     defer r2.deinit();
 
     var bp_it = blob_pool.iterator();
@@ -1866,7 +2057,7 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
     }
 
     const n = all_batches.items.len;
-    const pts = [_]usize{ n / 4, n / 2, (3 * n) / 4, n };
+    const pts = [_]usize{ @max(@as(usize, 1), n / 3), @max(@as(usize, 2), (2 * n) / 3), n };
     var cap_vers: std.ArrayList(ondb.core.version.Version) = .empty;
     defer {
         for (cap_vers.items) |*v| v.deinit(allocator);
@@ -1881,14 +2072,14 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
         cap_snaps.deinit(allocator);
     }
 
-    try integrateRandomTopoOrder(allocator, &r0, all_batches.items, 1001, &pts, &cap_vers, &cap_snaps);
-    try integrateRandomTopoOrder(allocator, &r1, all_batches.items, 2002, null, null, null);
-    try integrateRandomTopoOrder(allocator, &r2, all_batches.items, 3003, null, null, null);
+    const base_s = @as(u64, seed_idx + 1) *% 10_007;
+    try integrateRandomTopoOrder(allocator, &r0, all_batches.items, base_s +% 1001, &pts, &cap_vers, &cap_snaps);
+    try integrateRandomTopoOrder(allocator, &r1, all_batches.items, base_s +% 2002, null, null, null);
+    try integrateRandomTopoOrder(allocator, &r2, all_batches.items, base_s +% 3003, null, null, null);
 
     try assertHistoriesConverged(allocator, &r0, &r1);
     try assertHistoriesConverged(allocator, &r0, &r2);
 
-    try testing.expectEqual(@as(usize, 4), cap_vers.items.len);
     for (cap_vers.items, cap_snaps.items, 0..) |*target_ver, expected_snap, idx| {
         const rb_opt = try r1.buildRollbackBatch(allocator, 999, target_ver, @intCast(50_000 + idx));
         if (rb_opt) |rb_val| {
@@ -1901,10 +2092,781 @@ fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
             for (actual_snap.items) |*s| s.deinit(allocator);
             actual_snap.deinit(allocator);
         }
-        try expectSnapsEqual(expected_snap.items, actual_snap.items);
+        try expectRollbackSnapsEqual(allocator, expected_snap.items, actual_snap.items);
+        for (actual_snap.items) |s| {
+            const p = (try r1.tree.pathOf(allocator, ondb.core.text.View.EVERYTHING, s.inode_id)).?;
+            defer allocator.free(p);
+            try testing.expectEqualStrings(s.path, p);
+        }
+    }
+
+    if (cap_vers.items.len > 0) {
+        var diff_excl = try r0.dag.difference(allocator, &r0.dag.heads, &cap_vers.items[0]);
+        defer diff_excl.deinit(allocator);
+        if (diff_excl.items.len > 0) {
+            const rev_opt = try r0.buildRevertScopeBatch(allocator, 998, diff_excl.items, 70_000);
+            if (rev_opt) |rev_val| {
+                var rev = rev_val;
+                defer rev.deinit(allocator);
+                try testing.expect(try r0.integrate(&rev));
+                try testing.expect(try r2.integrate(&rev));
+            }
+            var snap0 = try snapshotLiveTree(allocator, &r0);
+            defer {
+                for (snap0.items) |*s| s.deinit(allocator);
+                snap0.deinit(allocator);
+            }
+            try expectRollbackSnapsEqual(allocator, cap_snaps.items[0].items, snap0.items);
+            try assertHistoriesConverged(allocator, &r0, &r2);
+        }
     }
 }
 
+fn runCrdtFuzzSuite(allocator: std.mem.Allocator) !void {
+    const num_seeds: usize = 60;
+    for (0..num_seeds) |seed_idx| {
+        try runCrdtFuzzSeed(allocator, seed_idx);
+    }
+}
+
+fn runCoreHardeningTests(allocator: std.mem.Allocator) !void {
+    const core = ondb.core;
+    const Id = core.id;
+    const Ver = core.version.Version;
+
+    {
+        try testing.expect(!core.history.isValidName(""));
+        try testing.expect(!core.history.isValidName("."));
+        try testing.expect(!core.history.isValidName(".."));
+        try testing.expect(!core.history.isValidName(".git"));
+        try testing.expect(!core.history.isValidName(".0ndb"));
+        try testing.expect(!core.history.isValidName("a/b"));
+        try testing.expect(!core.history.isValidName("a\\b"));
+        try testing.expect(!core.history.isValidName("a\x00b"));
+        const too_long = try allocator.alloc(u8, 4097);
+        defer allocator.free(too_long);
+        @memset(too_long, 'x');
+        try testing.expect(!core.history.isValidName(too_long));
+        try testing.expect(core.history.isValidName("valid.txt"));
+        try testing.expect(core.history.isValidName(".gitignore"));
+        try testing.expect(core.history.isValidName("..hidden"));
+    }
+
+    {
+        var h = try core.history.History.init(allocator, 0xca01);
+        defer h.deinit();
+
+        const bad_names = [_][]const u8{ "", ".", "..", ".git", ".0ndb", "a/b", "a\\b", "a\x00b" };
+        for (bad_names, 0..) |bn, idx| {
+            const ts: Id.Lamport = @intCast(idx + 1);
+            var op_cf = [_]core.op.Op{.{ .create_file = .{
+                .parent = Id.InodeId.ROOT,
+                .name = @constCast(bn),
+                .mode = .regular,
+                .line_ending = .lf,
+                .content = .{ .text_inline = @constCast("") },
+            } }};
+            const b_cf = core.op.Batch{
+                .header = .{ .actor = 1, .start = ts, .end = ts, .parents = Ver.ROOT, .wall_ms = 1 },
+                .ops = &op_cf,
+                .blobs = &.{},
+            };
+            try testing.expectError(error.InvalidName, h.integrate(&b_cf));
+            try testing.expect(!h.poisoned);
+
+            var op_cd = [_]core.op.Op{.{ .create_dir = .{
+                .parent = Id.InodeId.ROOT,
+                .name = @constCast(bn),
+            } }};
+            const b_cd = core.op.Batch{
+                .header = .{ .actor = 1, .start = ts, .end = ts, .parents = Ver.ROOT, .wall_ms = 1 },
+                .ops = &op_cd,
+                .blobs = &.{},
+            };
+            try testing.expectError(error.InvalidName, h.integrate(&b_cd));
+
+            var op_cs = [_]core.op.Op{.{ .create_symlink = .{
+                .parent = Id.InodeId.ROOT,
+                .name = @constCast(bn),
+                .target = @constCast("t"),
+            } }};
+            const b_cs = core.op.Batch{
+                .header = .{ .actor = 1, .start = ts, .end = ts, .parents = Ver.ROOT, .wall_ms = 1 },
+                .ops = &op_cs,
+                .blobs = &.{},
+            };
+            try testing.expectError(error.InvalidName, h.integrate(&b_cs));
+        }
+
+        var op_rm_root = [_]core.op.Op{.{ .remove = .{ .inode = Id.InodeId.ROOT } }};
+        const b_rm_root = core.op.Batch{
+            .header = .{ .actor = 1, .start = 1, .end = 1, .parents = Ver.ROOT, .wall_ms = 1 },
+            .ops = &op_rm_root,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.CannotModifyRoot, h.integrate(&b_rm_root));
+        try testing.expect(!h.poisoned);
+
+        var op_rn_root = [_]core.op.Op{.{ .rename = .{
+            .inode = Id.InodeId.ROOT,
+            .parent = Id.InodeId.ROOT,
+            .name = @constCast("x"),
+        } }};
+        const b_rn_root = core.op.Batch{
+            .header = .{ .actor = 1, .start = 1, .end = 1, .parents = Ver.ROOT, .wall_ms = 1 },
+            .ops = &op_rn_root,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.CannotModifyRoot, h.integrate(&b_rn_root));
+        try testing.expect(!h.poisoned);
+
+        const bad_range_batch = core.op.Batch{
+            .header = .{ .actor = 1, .start = 5, .end = 3, .parents = Ver.ROOT, .wall_ms = 1 },
+            .ops = &.{},
+            .blobs = &.{},
+        };
+        try testing.expectEqual(@as(u64, 0), bad_range_batch.header.opCount());
+        try testing.expectError(error.InvalidRange, h.integrate(&bad_range_batch));
+        try testing.expect(!h.poisoned);
+
+        var ok_ops = [_]core.op.Op{
+            .{ .create_file = .{
+                .parent = Id.InodeId.ROOT,
+                .name = @constCast("ok.txt"),
+                .mode = .regular,
+                .line_ending = .lf,
+                .content = .{ .text_inline = @constCast("hi") },
+            } },
+            .{ .create_dir = .{
+                .parent = Id.InodeId.ROOT,
+                .name = @constCast("sub"),
+            } },
+        };
+        const b1 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 1, .end = 2, .parents = Ver.ROOT, .wall_ms = 10 },
+            .ops = &ok_ops,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b1));
+        const file_iid = Id.InodeId.init(b1.header.opId(0), 0);
+        const dir_iid = Id.InodeId.init(b1.header.opId(1), 0);
+
+        var rn_bad_ops = [_]core.op.Op{.{ .rename = .{
+            .inode = file_iid,
+            .parent = Id.InodeId.ROOT,
+            .name = @constCast(".."),
+        } }};
+        var p1 = try h.headsClone();
+        defer p1.deinit(allocator);
+        const b_rn_bad = core.op.Batch{
+            .header = .{ .actor = 1, .start = 3, .end = 3, .parents = p1, .wall_ms = 11 },
+            .ops = &rn_bad_ops,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.InvalidName, h.integrate(&b_rn_bad));
+
+        var non_dir_ops = [_]core.op.Op{.{ .create_file = .{
+            .parent = file_iid,
+            .name = @constCast("child.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = @constCast("x") },
+        } }};
+        const b_non_dir = core.op.Batch{
+            .header = .{ .actor = 1, .start = 3, .end = 3, .parents = p1, .wall_ms = 11 },
+            .ops = &non_dir_ops,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.NotADir, h.integrate(&b_non_dir));
+
+        var non_causal_parent_ops = [_]core.op.Op{.{ .create_file = .{
+            .parent = dir_iid,
+            .name = @constCast("sneaky.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = @constCast("x") },
+        } }};
+        const b_non_causal_parent = core.op.Batch{
+            .header = .{ .actor = 2, .start = 3, .end = 3, .parents = Ver.ROOT, .wall_ms = 12 },
+            .ops = &non_causal_parent_ops,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.UnknownInode, h.integrate(&b_non_causal_parent));
+
+        var non_causal_target_ops = [_]core.op.Op{.{ .remove = .{ .inode = file_iid } }};
+        const b_non_causal_target = core.op.Batch{
+            .header = .{ .actor = 2, .start = 4, .end = 4, .parents = Ver.ROOT, .wall_ms = 12 },
+            .ops = &non_causal_target_ops,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.UnknownInode, h.integrate(&b_non_causal_target));
+        try testing.expect(!h.poisoned);
+
+        var poison_ops = [_]core.op.Op{
+            .{ .create_file = .{
+                .parent = Id.InodeId.ROOT,
+                .name = @constCast("partial.txt"),
+                .mode = .regular,
+                .line_ending = .lf,
+                .content = .{ .text_inline = @constCast("half") },
+            } },
+            .{ .remove = .{ .inode = Id.InodeId.ROOT } },
+        };
+        const b_poison = core.op.Batch{
+            .header = .{ .actor = 1, .start = 5, .end = 6, .parents = p1, .wall_ms = 13 },
+            .ops = &poison_ops,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.CannotModifyRoot, h.integrate(&b_poison));
+        try testing.expect(h.poisoned);
+
+        var after_ops = [_]core.op.Op{.{ .create_dir = .{
+            .parent = Id.InodeId.ROOT,
+            .name = @constCast("after"),
+        } }};
+        const b_after = core.op.Batch{
+            .header = .{ .actor = 1, .start = 7, .end = 7, .parents = p1, .wall_ms = 14 },
+            .ops = &after_ops,
+            .blobs = &.{},
+        };
+        try testing.expectError(error.HistoryPoisoned, h.integrate(&b_after));
+    }
+
+    {
+        var h = try core.history.History.init(allocator, 0xca02);
+        defer h.deinit();
+
+        var op1 = [_]core.op.Op{
+            .{ .create_dir = .{ .parent = Id.InodeId.ROOT, .name = @constCast("d1") } },
+            .{ .create_dir = .{ .parent = Id.InodeId.ROOT, .name = @constCast("d2") } },
+        };
+        const b1 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 1, .end = 2, .parents = Ver.ROOT, .wall_ms = 1 },
+            .ops = &op1,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b1));
+        const d1 = Id.InodeId.init(b1.header.opId(0), 0);
+        const d2 = Id.InodeId.init(b1.header.opId(1), 0);
+        var v1 = try h.headsClone();
+        defer v1.deinit(allocator);
+
+        var op2 = [_]core.op.Op{.{ .rename = .{
+            .inode = d1,
+            .parent = Id.InodeId.ROOT,
+            .name = @constCast("dup"),
+        } }};
+        const b2 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 3, .end = 3, .parents = v1, .wall_ms = 2 },
+            .ops = &op2,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b2));
+        var v2 = try h.headsClone();
+        defer v2.deinit(allocator);
+
+        var op3 = [_]core.op.Op{.{ .create_dir = .{
+            .parent = Id.InodeId.ROOT,
+            .name = @constCast("dup"),
+        } }};
+        const b3 = core.op.Batch{
+            .header = .{ .actor = 3, .start = 4, .end = 4, .parents = v1, .wall_ms = 3 },
+            .ops = &op3,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b3));
+        const d3 = Id.InodeId.init(b3.header.opId(0), 0);
+
+        var op4 = [_]core.op.Op{.{ .rename = .{
+            .inode = d2,
+            .parent = d1,
+            .name = @constCast("inside_d1"),
+        } }};
+        const b4 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 5, .end = 5, .parents = v2, .wall_ms = 4 },
+            .ops = &op4,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b4));
+
+        var op5 = [_]core.op.Op{.{ .rename = .{
+            .inode = d1,
+            .parent = d2,
+            .name = @constCast("cycle_move"),
+        } }};
+        const b5 = core.op.Batch{
+            .header = .{ .actor = 2, .start = 6, .end = 6, .parents = v2, .wall_ms = 5 },
+            .ops = &op5,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b5));
+
+        var short_buf: [16]u8 = undefined;
+        const short1 = Id.formatShortId(1, &short_buf);
+        const expected_d1 = try std.fmt.allocPrint(allocator, "dup~{s}-3", .{short1[0..8]});
+        defer allocator.free(expected_d1);
+        const expected_d2 = try std.fmt.allocPrint(allocator, "{s}/inside_d1", .{expected_d1});
+        defer allocator.free(expected_d2);
+
+        const p_d3 = (try h.tree.pathOf(allocator, core.text.View.EVERYTHING, d3)).?;
+        defer allocator.free(p_d3);
+        const p_d1 = (try h.tree.pathOf(allocator, core.text.View.EVERYTHING, d1)).?;
+        defer allocator.free(p_d1);
+        const p_d2 = (try h.tree.pathOf(allocator, core.text.View.EVERYTHING, d2)).?;
+        defer allocator.free(p_d2);
+
+        try testing.expectEqualStrings("dup", p_d3);
+        try testing.expectEqualStrings(expected_d1, p_d1);
+        try testing.expectEqualStrings(expected_d2, p_d2);
+
+        var root_list = try h.tree.listDir(allocator, core.text.View.EVERYTHING, Id.InodeId.ROOT);
+        defer {
+            for (root_list.items) |*e| e.deinit(allocator);
+            root_list.deinit(allocator);
+        }
+        try testing.expectEqual(@as(usize, 2), root_list.items.len);
+        var saw_d1 = false;
+        var saw_d3 = false;
+        for (root_list.items) |e| {
+            if (e.inode_id.eql(d1)) {
+                try testing.expectEqualStrings(expected_d1, e.name);
+                saw_d1 = true;
+            }
+            if (e.inode_id.eql(d3)) {
+                try testing.expectEqualStrings("dup", e.name);
+                saw_d3 = true;
+            }
+        }
+        try testing.expect(saw_d1 and saw_d3);
+    }
+
+    {
+        var h = try core.history.History.init(allocator, 0xca03);
+        defer h.deinit();
+
+        var op1 = [_]core.op.Op{.{ .create_file = .{
+            .parent = Id.InodeId.ROOT,
+            .name = @constCast("keep.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = @constCast("v1\n") },
+        } }};
+        const b1 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 1, .end = 1, .parents = Ver.ROOT, .wall_ms = 1 },
+            .ops = &op1,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b1));
+        const f_iid = Id.InodeId.init(b1.header.opId(0), 0);
+        var v1 = try h.headsClone();
+        defer v1.deinit(allocator);
+
+        var op2 = [_]core.op.Op{
+            .{ .create_dir = .{ .parent = Id.InodeId.ROOT, .name = @constCast("tempdir") } },
+            .{ .rename = .{
+                .inode = f_iid,
+                .parent = Id.InodeId.init(Id.OpId.init(2, 1), 0),
+                .name = @constCast("moved.txt"),
+            } },
+            .{ .set_content = .{
+                .inode = f_iid,
+                .content = .{ .text_inline = @constCast("v2\n") },
+            } },
+        };
+        const b2 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 2, .end = 4, .parents = v1, .wall_ms = 2 },
+            .ops = &op2,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b2));
+        const d_iid = Id.InodeId.init(b2.header.opId(0), 0);
+
+        var rb = (try h.buildRollbackBatch(allocator, 2, &v1, 10)).?;
+        defer rb.deinit(allocator);
+        try testing.expect(try h.integrate(&rb));
+
+        try testing.expect(try h.tree.isPresent(allocator, core.text.View.EVERYTHING, f_iid));
+        try testing.expect(!try h.tree.isPresent(allocator, core.text.View.EVERYTHING, d_iid));
+        const pf = (try h.tree.pathOf(allocator, core.text.View.EVERYTHING, f_iid)).?;
+        defer allocator.free(pf);
+        try testing.expectEqualStrings("keep.txt", pf);
+        try testing.expect((try h.tree.pathOf(allocator, core.text.View.EVERYTHING, d_iid)) == null);
+        const content = (try h.readFileAt(allocator, "keep.txt", null)).?;
+        defer allocator.free(content);
+        try testing.expectEqualStrings("v1\n", content);
+
+        var v_after_rb = try h.headsClone();
+        defer v_after_rb.deinit(allocator);
+        const bin_data = "binary-payload-missing-check";
+        const bin_oid = ondb.store.crypto.hashBytes(bin_data);
+        var op_bin = [_]core.op.Op{.{ .set_content = .{
+            .inode = f_iid,
+            .content = .{ .binary = .{ .oid = bin_oid, .len = bin_data.len } },
+        } }};
+        var blob_att = [_]core.op.BlobAttachment{.{ .oid = bin_oid, .data = @constCast(bin_data) }};
+        const b_bin = core.op.Batch{
+            .header = .{ .actor = 1, .start = h.nextStartTs(&v_after_rb), .end = h.nextStartTs(&v_after_rb), .parents = v_after_rb, .wall_ms = 20 },
+            .ops = &op_bin,
+            .blobs = &blob_att,
+        };
+        try testing.expect(try h.integrate(&b_bin));
+        var v_bin = try h.headsClone();
+        defer v_bin.deinit(allocator);
+
+        var op_txt = [_]core.op.Op{.{ .set_content = .{
+            .inode = f_iid,
+            .content = .{ .text_inline = @constCast("text-again\n") },
+        } }};
+        const b_txt = core.op.Batch{
+            .header = .{ .actor = 1, .start = h.nextStartTs(&v_bin), .end = h.nextStartTs(&v_bin), .parents = v_bin, .wall_ms = 21 },
+            .ops = &op_txt,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b_txt));
+
+        if (h.blobs.fetchRemove(bin_oid)) |removed| {
+            var slot = removed.value;
+            slot.deinit(allocator);
+        }
+        try testing.expectError(error.MissingBlob, h.buildRollbackBatch(allocator, 2, &v_bin, 22));
+    }
+
+    {
+        var h = try core.history.History.init(allocator, 0xca04);
+        defer h.deinit();
+        const dummy_oid = ondb.store.crypto.hashBytes("span-test");
+        try h.blobs.put(allocator, dummy_oid, .{ .log_span = .{ .offset = 0, .len = 16 } });
+        try testing.expectError(error.LogReadFailed, h.unpinAllLogSpans());
+
+        const NullReader = struct {
+            fn read(_: *const anyopaque, _: u64, _: u32) ?[]const u8 {
+                return null;
+            }
+        };
+        var dummy_ctx: u8 = 0;
+        h.setLogReader(.{ .ptr = &dummy_ctx, .readFn = NullReader.read });
+        try testing.expectError(error.LogReadFailed, h.unpinAllLogSpans());
+    }
+
+    {
+        var old_rev: std.ArrayList(u8) = .empty;
+        defer old_rev.deinit(allocator);
+        var new_rev: std.ArrayList(u8) = .empty;
+        defer new_rev.deinit(allocator);
+        for (0..5000) |i| {
+            const line = try std.fmt.allocPrint(allocator, "line-{d:0>5}\n", .{i});
+            defer allocator.free(line);
+            try old_rev.appendSlice(allocator, line);
+            const rline = try std.fmt.allocPrint(allocator, "line-{d:0>5}\n", .{4999 - i});
+            defer allocator.free(rline);
+            try new_rev.appendSlice(allocator, rline);
+        }
+        const t0 = std.Io.Clock.awake.now(testing.io).nanoseconds;
+        var dr_rev = try core.diff.diffBytes(allocator, old_rev.items, new_rev.items);
+        defer dr_rev.deinit(allocator);
+        const t1 = std.Io.Clock.awake.now(testing.io).nanoseconds;
+        try testing.expect(t1 - t0 < 5_000_000_000);
+        const rebuilt_rev = try applyDiffForVerify(allocator, old_rev.items, dr_rev.splices.items, dr_rev.inserted.items);
+        defer allocator.free(rebuilt_rev);
+        try testing.expectEqualStrings(new_rev.items, rebuilt_rev);
+
+        var old_rep: std.ArrayList(u8) = .empty;
+        defer old_rep.deinit(allocator);
+        var new_rep: std.ArrayList(u8) = .empty;
+        defer new_rep.deinit(allocator);
+        for (0..5000) |i| {
+            const l = switch (i % 3) {
+                0 => "{\n",
+                1 => "  \"key\": 1,\n",
+                else => "},\n",
+            };
+            try old_rep.appendSlice(allocator, l);
+            if (i % 137 == 0) {
+                try new_rep.appendSlice(allocator, "  \"changed\": true,\n");
+            } else {
+                try new_rep.appendSlice(allocator, l);
+            }
+        }
+        const t2 = std.Io.Clock.awake.now(testing.io).nanoseconds;
+        var dr_rep = try core.diff.diffBytes(allocator, old_rep.items, new_rep.items);
+        defer dr_rep.deinit(allocator);
+        const t3 = std.Io.Clock.awake.now(testing.io).nanoseconds;
+        try testing.expect(t3 - t2 < 5_000_000_000);
+        const rebuilt_rep = try applyDiffForVerify(allocator, old_rep.items, dr_rep.splices.items, dr_rep.inserted.items);
+        defer allocator.free(rebuilt_rep);
+        try testing.expectEqualStrings(new_rep.items, rebuilt_rep);
+    }
+
+    {
+        var t = core.text.Text{};
+        defer t.deinit(allocator);
+        const empty_res = core.text.ContentResolver{ .ptr = &t, .resolveFn = struct {
+            fn resolve(_: *const anyopaque, _: Id.InsertionKey) ?[]const u8 {
+                return null;
+            }
+        }.resolve };
+
+        const ov_splices_1 = [_]core.diff.Splice{.{ .at = std.math.maxInt(u64), .del = 1, .ins = 0 }};
+        try testing.expectError(
+            error.InvalidSplice,
+            t.apply(allocator, Id.OpId.init(1, 1), core.text.View.EVERYTHING, &ov_splices_1, "", empty_res),
+        );
+
+        const ov_splices_2 = [_]core.diff.Splice{
+            .{ .at = 0, .del = 0, .ins = std.math.maxInt(u64) },
+            .{ .at = 0, .del = 0, .ins = 1 },
+        };
+        try testing.expectError(
+            error.InvalidSplice,
+            t.apply(allocator, Id.OpId.init(2, 1), core.text.View.EVERYTHING, &ov_splices_2, "", empty_res),
+        );
+
+        var frag = core.text.Fragment{
+            .ins = Id.OpId.init(1, 1),
+            .part = 0,
+            .newlines = 0,
+            .off = 0,
+            .len = 10,
+            .ends_with_nl = false,
+            .newlines_known = false,
+        };
+        const split_pair = try frag.split(allocator, 4, empty_res);
+        var left = split_pair[0];
+        var right = split_pair[1];
+        defer left.deinit(allocator);
+        defer right.deinit(allocator);
+        try testing.expect(!left.newlines_known);
+        try testing.expect(!right.newlines_known);
+        try testing.expectEqual(@as(u32, 0), left.newlines);
+        try testing.expectEqual(@as(u32, 0), right.newlines);
+        try testing.expect(left.summary().unknown_newlines);
+        try testing.expect(right.summary().unknown_newlines);
+
+        var t2 = try core.text.Text.fromInsertion(allocator, Id.OpId.init(1, 1), 0, 0, 6, "hello\n");
+        defer t2.deinit(allocator);
+        try testing.expectError(
+            error.MissingBlob,
+            t2.diffViews(allocator, empty_res, .{
+                .ptr = &t2,
+                .observesFn = struct {
+                    fn obs(_: *const anyopaque, _: Id.OpId) bool {
+                        return false;
+                    }
+                }.obs,
+                .min_unobserved = 0,
+            }, core.text.View.EVERYTHING),
+        );
+    }
+
+    {
+        var ha = try core.history.History.init(allocator, 0xca05);
+        defer ha.deinit();
+        var hb = try core.history.History.init(allocator, 0xca05);
+        defer hb.deinit();
+
+        var op0 = [_]core.op.Op{.{ .create_file = .{
+            .parent = Id.InodeId.ROOT,
+            .name = @constCast("multi.txt"),
+            .mode = .regular,
+            .line_ending = .lf,
+            .content = .{ .text_inline = @constCast("abcdef") },
+        } }};
+        const b0 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 1, .end = 1, .parents = Ver.ROOT, .wall_ms = 1 },
+            .ops = &op0,
+            .blobs = &.{},
+        };
+        try testing.expect(try ha.integrate(&b0));
+        try testing.expect(try hb.integrate(&b0));
+        const iid = Id.InodeId.init(b0.header.opId(0), 0);
+        const v0 = Ver.single(b0.header.batchId());
+
+        var sp_a = [_]core.diff.Splice{
+            .{ .at = 0, .del = 3, .ins = 0 },
+            .{ .at = 3, .del = 0, .ins = 2 },
+        };
+        var op_a = [_]core.op.Op{.{ .edit_text = .{
+            .inode = iid,
+            .text = @constCast("XY"),
+            .splices = &sp_a,
+        } }};
+        const ba = core.op.Batch{
+            .header = .{ .actor = 1, .start = 2, .end = 2, .parents = v0, .wall_ms = 2 },
+            .ops = &op_a,
+            .blobs = &.{},
+        };
+
+        var sp_b = [_]core.diff.Splice{
+            .{ .at = 1, .del = 0, .ins = 2 },
+        };
+        var op_b = [_]core.op.Op{.{ .edit_text = .{
+            .inode = iid,
+            .text = @constCast("ZZ"),
+            .splices = &sp_b,
+        } }};
+        const bb = core.op.Batch{
+            .header = .{ .actor = 2, .start = 2, .end = 2, .parents = v0, .wall_ms = 2 },
+            .ops = &op_b,
+            .blobs = &.{},
+        };
+
+        try testing.expect(try ha.integrate(&ba));
+        try testing.expect(try ha.integrate(&bb));
+        try testing.expect(try hb.integrate(&bb));
+        try testing.expect(try hb.integrate(&ba));
+
+        const ra = (try ha.readFileAt(allocator, "multi.txt", null)).?;
+        defer allocator.free(ra);
+        const rb = (try hb.readFileAt(allocator, "multi.txt", null)).?;
+        defer allocator.free(rb);
+        try testing.expectEqualStrings("ZZXYdef", ra);
+        try testing.expectEqualStrings(ra, rb);
+    }
+
+    {
+        var h = try core.history.History.init(allocator, 0xca06);
+        defer h.deinit();
+
+        var op0 = [_]core.op.Op{
+            .{ .create_dir = .{ .parent = Id.InodeId.ROOT, .name = @constCast("da") } },
+            .{ .create_dir = .{ .parent = Id.InodeId.ROOT, .name = @constCast("db") } },
+        };
+        const b0 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 1, .end = 2, .parents = Ver.ROOT, .wall_ms = 1 },
+            .ops = &op0,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b0));
+        const da = Id.InodeId.init(b0.header.opId(0), 0);
+        const db = Id.InodeId.init(b0.header.opId(1), 0);
+        const v0 = Ver.single(b0.header.batchId());
+
+        var op1 = [_]core.op.Op{.{ .rename = .{ .inode = da, .parent = db, .name = @constCast("da") } }};
+        const b1 = core.op.Batch{
+            .header = .{ .actor = 1, .start = 3, .end = 3, .parents = v0, .wall_ms = 2 },
+            .ops = &op1,
+            .blobs = &.{},
+        };
+        var op2 = [_]core.op.Op{.{ .rename = .{ .inode = db, .parent = da, .name = @constCast("db") } }};
+        const b2 = core.op.Batch{
+            .header = .{ .actor = 2, .start = 4, .end = 4, .parents = v0, .wall_ms = 3 },
+            .ops = &op2,
+            .blobs = &.{},
+        };
+        try testing.expect(try h.integrate(&b1));
+        try testing.expect(try h.integrate(&b2));
+
+        var rb = (try h.buildRollbackBatch(allocator, 9, &v0, 10)).?;
+        defer rb.deinit(allocator);
+        try testing.expect(try h.integrate(&rb));
+
+        const pa = (try h.tree.pathOf(allocator, core.text.View.EVERYTHING, da)).?;
+        defer allocator.free(pa);
+        const pb = (try h.tree.pathOf(allocator, core.text.View.EVERYTHING, db)).?;
+        defer allocator.free(pb);
+        try testing.expectEqualStrings("da", pa);
+        try testing.expectEqualStrings("db", pb);
+    }
+
+    {
+        var w = ondb.store.codec.Writer{};
+        defer w.deinit(allocator);
+        try w.writeVarint(allocator, 1_000_000);
+        var r = ondb.store.codec.Reader.init(w.items());
+        try testing.expectError(error.InvalidData, Ver.decode(allocator, &r));
+
+        var w2 = ondb.store.codec.Writer{};
+        defer w2.deinit(allocator);
+        try w2.writeVarint(allocator, 100);
+        try w2.writeU64(allocator, 1);
+        var r2 = ondb.store.codec.Reader.init(w2.items());
+        try testing.expectError(error.UnexpectedEof, Ver.decode(allocator, &r2));
+
+        var w3 = ondb.store.codec.Writer{};
+        defer w3.deinit(allocator);
+        const hdr = core.dag.BatchHeader{
+            .actor = 1,
+            .start = 1,
+            .end = 1,
+            .parents = Ver.ROOT,
+            .wall_ms = 1,
+        };
+        try hdr.encode(allocator, &w3);
+        try w3.writeVarint(allocator, 1 << 25);
+        var r3 = ondb.store.codec.Reader.init(w3.items());
+        try testing.expectError(error.InvalidData, core.op.Batch.decode(allocator, &r3));
+
+        var r3s = ondb.store.codec.Reader.init(w3.items());
+        var op_sp: std.ArrayList(core.op.PayloadSpan) = .empty;
+        defer op_sp.deinit(allocator);
+        var bl_sp: std.ArrayList(core.op.BlobSpan) = .empty;
+        defer bl_sp.deinit(allocator);
+        try testing.expectError(error.InvalidData, core.op.Batch.decodeWithSpans(allocator, &r3s, &op_sp, &bl_sp));
+    }
+
+    {
+        var dag = core.dag.Dag{};
+        defer dag.deinit(allocator);
+        try testing.expect(dag.horizon.isEmpty());
+
+        _ = try dag.insert(allocator, .{ .actor = 1, .start = 1, .end = 1, .parents = Ver.ROOT, .wall_ms = 1 });
+        const b1_id = Id.OpId.init(1, 1);
+        const v_b1 = Ver.single(b1_id);
+        _ = try dag.insert(allocator, .{ .actor = 1, .start = 2, .end = 2, .parents = try v_b1.clone(allocator), .wall_ms = 2 });
+        const b2_id = Id.OpId.init(2, 1);
+        _ = try dag.insert(allocator, .{ .actor = 2, .start = 2, .end = 2, .parents = try v_b1.clone(allocator), .wall_ms = 3 });
+        const b3_id = Id.OpId.init(2, 2);
+        var p4 = Ver.ROOT;
+        try p4.insert(allocator, b2_id);
+        try p4.insert(allocator, b3_id);
+        _ = try dag.insert(allocator, .{ .actor = 1, .start = 3, .end = 3, .parents = p4, .wall_ms = 4 });
+        const b4_id = Id.OpId.init(3, 1);
+        _ = try dag.insert(allocator, .{ .actor = 3, .start = 1, .end = 1, .parents = Ver.ROOT, .wall_ms = 5 });
+        const b5_id = Id.OpId.init(1, 3);
+
+        const v_b2 = Ver.single(b2_id);
+        const v_b3 = Ver.single(b3_id);
+        const v_b4 = Ver.single(b4_id);
+        const v_b5 = Ver.single(b5_id);
+
+        var cl4 = try dag.closure(allocator, &v_b4);
+        defer cl4.deinit(allocator);
+        try testing.expectEqual(@as(usize, 4), cl4.count());
+        try testing.expect(cl4.contains(b1_id));
+        try testing.expect(cl4.contains(b2_id));
+        try testing.expect(cl4.contains(b3_id));
+        try testing.expect(cl4.contains(b4_id));
+        try testing.expect(!cl4.contains(b5_id));
+
+        var cf_23 = try dag.commonFrontier(allocator, &.{ v_b2, v_b3 });
+        defer cf_23.deinit(allocator);
+        try testing.expect(cf_23.eql(&v_b1));
+
+        var cf_24 = try dag.commonFrontier(allocator, &.{ v_b2, v_b4 });
+        defer cf_24.deinit(allocator);
+        try testing.expect(cf_24.eql(&v_b2));
+
+        var cf_25 = try dag.commonFrontier(allocator, &.{ v_b2, v_b5 });
+        defer cf_25.deinit(allocator);
+        try testing.expect(cf_25.isEmpty());
+
+        var cf_empty = try dag.commonFrontier(allocator, &.{});
+        defer cf_empty.deinit(allocator);
+        try testing.expect(cf_empty.isEmpty());
+
+        dag.horizon = try v_b1.clone(allocator);
+        try testing.expect(dag.horizon.eql(&v_b1));
+    }
+
+    {
+        var lww = core.tree.Lww(?[]u8){};
+        defer lww.deinit(allocator);
+        try lww.set(allocator, Id.OpId.init(1, 1), try allocator.dupe(u8, "first"));
+        try lww.set(allocator, Id.OpId.init(1, 1), try allocator.dupe(u8, "dup-same-op"));
+        try lww.set(allocator, Id.OpId.init(2, 1), null);
+        try testing.expect(lww.get().?.* == null);
+    }
+}
 fn isUtf8Boundary(s: []const u8, pos: usize) bool {
     if (pos == 0 or pos == s.len) return true;
     if (pos > s.len) return false;

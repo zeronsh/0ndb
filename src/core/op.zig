@@ -8,6 +8,9 @@ const codec = @import("../store/codec.zig");
 const crypto = @import("../store/crypto.zig");
 
 pub const INLINE_TEXT_MAX: usize = 4096;
+pub const MAX_OPS_PER_BATCH: usize = 1 << 20;
+pub const MAX_BLOBS_PER_BATCH: usize = 1 << 16;
+pub const MAX_SPLICES_PER_OP: usize = 1 << 20;
 
 pub const Content = union(enum) {
     text_inline: []u8,
@@ -210,7 +213,10 @@ pub const Op = union(enum) {
                 const inode = try readInodeId(r);
                 const txt = try r.readBytesAlloc(allocator);
                 errdefer allocator.free(txt);
-                const n: usize = @intCast(try r.readVarint());
+                const n_u64 = try r.readVarint();
+                if (n_u64 > MAX_SPLICES_PER_OP) return error.InvalidData;
+                const n: usize = @intCast(n_u64);
+                if (n > r.remaining() / 3) return error.UnexpectedEof;
                 const splices = try allocator.alloc(diff.Splice, n);
                 errdefer allocator.free(splices);
                 for (splices) |*s| {
@@ -380,7 +386,10 @@ pub const Batch = struct {
         var header = try dag.BatchHeader.decode(allocator, r);
         errdefer header.deinit(allocator);
 
-        const op_n: usize = @intCast(try r.readVarint());
+        const op_n_u64 = try r.readVarint();
+        if (op_n_u64 > MAX_OPS_PER_BATCH) return error.InvalidData;
+        const op_n: usize = @intCast(op_n_u64);
+        if (op_n > r.remaining() / 3) return error.UnexpectedEof;
         const ops = try allocator.alloc(Op, op_n);
         var ops_done: usize = 0;
         errdefer {
@@ -391,7 +400,10 @@ pub const Batch = struct {
             ops[ops_done] = try Op.decode(allocator, r);
         }
 
-        const blob_n: usize = @intCast(try r.readVarint());
+        const blob_n_u64 = try r.readVarint();
+        if (blob_n_u64 > MAX_BLOBS_PER_BATCH) return error.InvalidData;
+        const blob_n: usize = @intCast(blob_n_u64);
+        if (blob_n > r.remaining() / 33) return error.UnexpectedEof;
         const blobs = try allocator.alloc(BlobAttachment, blob_n);
         var blobs_done: usize = 0;
         errdefer {
@@ -414,10 +426,19 @@ pub const Batch = struct {
         blob_spans: *std.ArrayList(BlobSpan),
     ) (codec.DecodeError || Allocator.Error)!Batch {
         const base_pos = r.pos;
+        const init_op_spans = op_spans.items.len;
+        const init_blob_spans = blob_spans.items.len;
+        errdefer {
+            op_spans.items.len = init_op_spans;
+            blob_spans.items.len = init_blob_spans;
+        }
         var header = try dag.BatchHeader.decode(allocator, r);
         errdefer header.deinit(allocator);
 
-        const op_n: usize = @intCast(try r.readVarint());
+        const op_n_u64 = try r.readVarint();
+        if (op_n_u64 > MAX_OPS_PER_BATCH) return error.InvalidData;
+        const op_n: usize = @intCast(op_n_u64);
+        if (op_n > r.remaining() / 3) return error.UnexpectedEof;
         const ops = try allocator.alloc(Op, op_n);
         var ops_done: usize = 0;
         errdefer {
@@ -431,15 +452,11 @@ pub const Batch = struct {
                 const inode = try readInodeId(r);
                 const txt = try r.readBytesAlloc(allocator);
                 errdefer allocator.free(txt);
-                if (txt.len > 0) {
-                    const end_rel = r.pos - base_pos;
-                    try op_spans.append(allocator, .{
-                        .op_index = @intCast(ops_done),
-                        .offset = @intCast(end_rel - txt.len),
-                        .len = @intCast(txt.len),
-                    });
-                }
-                const n: usize = @intCast(try r.readVarint());
+                const txt_end_rel = r.pos - base_pos;
+                const n_u64 = try r.readVarint();
+                if (n_u64 > MAX_SPLICES_PER_OP) return error.InvalidData;
+                const n: usize = @intCast(n_u64);
+                if (n > r.remaining() / 3) return error.UnexpectedEof;
                 const splices = try allocator.alloc(diff.Splice, n);
                 errdefer allocator.free(splices);
                 for (splices) |*s| {
@@ -449,11 +466,18 @@ pub const Batch = struct {
                         .ins = try r.readVarint(),
                     };
                 }
+                if (txt.len > 0) {
+                    try op_spans.append(allocator, .{
+                        .op_index = @intCast(ops_done),
+                        .offset = @intCast(txt_end_rel - txt.len),
+                        .len = @intCast(txt.len),
+                    });
+                }
                 ops[ops_done] = .{ .edit_text = .{ .inode = inode, .text = txt, .splices = splices } };
             } else {
                 r.pos = start_op_pos;
-                const op = try Op.decode(allocator, r);
-                ops[ops_done] = op;
+                var op = try Op.decode(allocator, r);
+                errdefer op.deinit(allocator);
                 switch (op) {
                     .create_file => |v| switch (v.content) {
                         .text_inline => |b| {
@@ -483,10 +507,14 @@ pub const Batch = struct {
                     },
                     else => {},
                 }
+                ops[ops_done] = op;
             }
         }
 
-        const blob_n: usize = @intCast(try r.readVarint());
+        const blob_n_u64 = try r.readVarint();
+        if (blob_n_u64 > MAX_BLOBS_PER_BATCH) return error.InvalidData;
+        const blob_n: usize = @intCast(blob_n_u64);
+        if (blob_n > r.remaining() / 33) return error.UnexpectedEof;
         const blobs = try allocator.alloc(BlobAttachment, blob_n);
         var blobs_done: usize = 0;
         errdefer {
@@ -496,6 +524,7 @@ pub const Batch = struct {
         while (blobs_done < blob_n) : (blobs_done += 1) {
             const oid = (try r.readFixed(32)).*;
             const data = try r.readBytesAlloc(allocator);
+            errdefer allocator.free(data);
             if (data.len > 0) {
                 const end_rel = r.pos - base_pos;
                 try blob_spans.append(allocator, .{

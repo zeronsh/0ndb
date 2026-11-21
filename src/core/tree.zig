@@ -60,6 +60,10 @@ pub fn Lww(comptime T: type) type {
                 for (self.entries.items) |*e| e.value.deinit(allocator);
             } else if (T == []u8) {
                 for (self.entries.items) |e| allocator.free(e.value);
+            } else if (T == ?[]u8) {
+                for (self.entries.items) |e| {
+                    if (e.value) |v| allocator.free(v);
+                }
             }
             self.entries.deinit(allocator);
         }
@@ -78,6 +82,8 @@ pub fn Lww(comptime T: type) type {
                             v.deinit(allocator);
                         } else if (T == []u8) {
                             allocator.free(value);
+                        } else if (T == ?[]u8) {
+                            if (value) |v| allocator.free(v);
                         }
                         return;
                     },
@@ -182,12 +188,16 @@ pub const DirEntry = struct {
 
 pub const Tree = struct {
     inodes: std.AutoHashMapUnmanaged(id.InodeId, *Inode) = .empty,
-    children: std.AutoHashMapUnmanaged(id.InodeId, std.ArrayList(id.InodeId)) = .empty,
+    children: std.AutoHashMapUnmanaged(id.InodeId, std.AutoArrayHashMapUnmanaged(id.InodeId, void)) = .empty,
 
     pub fn init(allocator: Allocator) Allocator.Error!Tree {
         var t = Tree{};
         errdefer t.deinit(allocator);
         const root = try allocator.create(Inode);
+        errdefer {
+            root.deinit(allocator);
+            allocator.destroy(root);
+        }
         root.* = .{
             .inode_id = id.InodeId.ROOT,
             .kind = .dir,
@@ -205,8 +215,8 @@ pub const Tree = struct {
         }
         self.inodes.deinit(allocator);
         var cit = self.children.valueIterator();
-        while (cit.next()) |list| {
-            list.deinit(allocator);
+        while (cit.next()) |set| {
+            set.deinit(allocator);
         }
         self.children.deinit(allocator);
     }
@@ -228,21 +238,17 @@ pub const Tree = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = .empty;
         }
-        for (gop.value_ptr.items) |existing| {
-            if (existing.eql(child)) return;
-        }
-        try gop.value_ptr.append(allocator, child);
+        try gop.value_ptr.put(allocator, child, {});
     }
 
     pub fn insertInode(self: *Tree, allocator: Allocator, inode: *Inode) Allocator.Error!void {
         for (inode.placement.entries.items) |e| {
             try self.addChildRef(allocator, e.value.parent, inode.inode_id);
         }
-        if (self.inodes.fetchRemove(inode.inode_id)) |old| {
+        if (try self.inodes.fetchPut(allocator, inode.inode_id, inode)) |old| {
             old.value.deinit(allocator);
             allocator.destroy(old.value);
         }
-        try self.inodes.put(allocator, inode.inode_id, inode);
     }
 
     pub fn place(self: *Tree, allocator: Allocator, iid: id.InodeId, op: id.OpId, parent: id.InodeId, name: []const u8) Allocator.Error!void {
@@ -253,7 +259,7 @@ pub const Tree = struct {
         try inode.placement.set(allocator, op, .{ .parent = parent, .name = owned });
     }
 
-    pub fn placementIn(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!?*const Placement {
+    pub fn placementIn(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!?*const Lww(Placement).Entry {
         if (iid.isRoot()) return null;
         var demoted: std.AutoHashMapUnmanaged(id.InodeId, usize) = .empty;
         defer demoted.deinit(allocator);
@@ -268,21 +274,22 @@ pub const Tree = struct {
                 if (cur.isRoot()) {
                     const n = demoted.get(iid) orelse 0;
                     const inode = self.get(iid) orelse return null;
-                    const entry = inode.placement.nthIn(view, n) orelse return null;
-                    return &entry.value;
+                    return inode.placement.nthIn(view, n);
                 }
                 for (chain.items, 0..) |c, pos| {
                     if (c.eql(cur)) {
                         const cycle = chain.items[pos..];
                         var victim = cycle[0];
                         var best_op = id.OpId.ZERO;
+                        var has_best = false;
                         for (cycle) |member| {
                             const n = demoted.get(member) orelse 0;
                             const minode = self.get(member) orelse return null;
                             const me = minode.placement.nthIn(view, n) orelse return null;
-                            if (me.op.greaterThan(best_op)) {
+                            if (!has_best or me.op.greaterThan(best_op) or (me.op.eql(best_op) and member.order(victim) == .gt)) {
                                 best_op = me.op;
                                 victim = member;
+                                has_best = true;
                             }
                         }
                         const gop = try demoted.getOrPut(allocator, victim);
@@ -307,10 +314,10 @@ pub const Tree = struct {
             if (a.*) return true;
         }
         if (!inode.isDir()) return false;
-        const list = self.children.getPtr(iid) orelse return false;
-        for (list.items) |child| {
-            const p = try self.placementIn(allocator, view, child) orelse continue;
-            if (p.parent.eql(iid) and try self.isPresent(allocator, view, child)) return true;
+        const set = self.children.getPtr(iid) orelse return false;
+        for (set.keys()) |child| {
+            const entry = try self.placementIn(allocator, view, child) orelse continue;
+            if (entry.value.parent.eql(iid) and try self.isPresent(allocator, view, child)) return true;
         }
         return false;
     }
@@ -335,12 +342,11 @@ pub const Tree = struct {
             by_name.deinit(allocator);
         }
 
-        for (kids.items) |child| {
-            const p = try self.placementIn(allocator, view, child) orelse continue;
+        for (kids.keys()) |child| {
+            const entry = try self.placementIn(allocator, view, child) orelse continue;
+            const p = &entry.value;
             if (!p.parent.eql(dir)) continue;
             if (!try self.isPresent(allocator, view, child)) continue;
-            const inode = self.get(child) orelse continue;
-            const entry = inode.placement.nthIn(view, 0) orelse continue;
             const gop = try by_name.getOrPut(allocator, p.name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(allocator, .{ .name = p.name, .op = entry.op, .iid = child });
@@ -351,7 +357,9 @@ pub const Tree = struct {
             const items = kv.value_ptr.items;
             std.mem.sort(Candidate, items, {}, struct {
                 fn lt(_: void, a: Candidate, b: Candidate) bool {
-                    return a.op.greaterThan(b.op);
+                    const ord = a.op.order(b.op);
+                    if (ord != .eq) return ord == .gt;
+                    return a.iid.order(b.iid) == .lt;
                 }
             }.lt);
             for (items, 0..) |cand, idx| {
@@ -402,15 +410,41 @@ pub const Tree = struct {
 
     pub fn pathOf(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!?[]u8 {
         if (iid.isRoot()) return try allocator.dupe(u8, "");
-        var parts: std.ArrayList([]const u8) = .empty;
-        defer parts.deinit(allocator);
+        var parts: std.ArrayList([]u8) = .empty;
+        defer {
+            for (parts.items) |part| allocator.free(part);
+            parts.deinit(allocator);
+        }
         var cur = iid;
         var guard: usize = 0;
         while (!cur.isRoot()) {
             guard += 1;
-            if (guard > 256) return null;
-            const p = try self.placementIn(allocator, view, cur) orelse return null;
-            try parts.append(allocator, p.name);
+            if (guard > 4096) return null;
+            if (!try self.isPresent(allocator, view, cur)) return null;
+            const entry = try self.placementIn(allocator, view, cur) orelse return null;
+            const p = &entry.value;
+            var has_winner_before = false;
+            if (self.children.getPtr(p.parent)) |siblings| {
+                for (siblings.keys()) |sib| {
+                    if (sib.eql(cur)) continue;
+                    const sib_entry = try self.placementIn(allocator, view, sib) orelse continue;
+                    if (!sib_entry.value.parent.eql(p.parent)) continue;
+                    if (!std.mem.eql(u8, sib_entry.value.name, p.name)) continue;
+                    if (!try self.isPresent(allocator, view, sib)) continue;
+                    const ord = sib_entry.op.order(entry.op);
+                    if (ord == .gt or (ord == .eq and sib.order(cur) == .lt)) {
+                        has_winner_before = true;
+                        break;
+                    }
+                }
+            }
+            const display_name = if (has_winner_before) blk: {
+                var short_buf: [16]u8 = undefined;
+                const short = id.formatShortId(entry.op.actor, &short_buf);
+                break :blk try std.fmt.allocPrint(allocator, "{s}~{s}-{d}", .{ p.name, short[0..8], entry.op.ts });
+            } else try allocator.dupe(u8, p.name);
+            errdefer allocator.free(display_name);
+            try parts.append(allocator, display_name);
             cur = p.parent;
         }
         var out: std.ArrayList(u8) = .empty;
