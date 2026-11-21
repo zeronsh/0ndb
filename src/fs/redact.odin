@@ -90,6 +90,7 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 	h.applied[0] = journal.journal_durable_len(&h.journal)
 	history_persist(h) or_return
 	if h.db != nil && len(targets) > 0 {
+		unstage(h, targets[:], protect[:])
 		rewrites, stats, rerr := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
 		if rerr != .None {
 			return res, from_odb(rerr)
@@ -385,7 +386,29 @@ apply_redact_record :: proc(h: ^History, body: []u8) -> Error {
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
 	apply_redaction(h, spans[:], nil, &targets, &protect) or_return
 	if h.db != nil && len(targets) > 0 {
+		unstage(h, targets[:], protect[:])
 		odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
 	}
 	return .None
+}
+
+@(private)
+unstage :: proc(h: ^History, targets: []odb.Oid, protect: []odb.Oid) {
+	i := 0
+	for i < len(h.staged) {
+		s := h.staged[i]
+		hit := false
+		for t in targets {
+			hit ||= t == s.oid
+		}
+		for p in protect {
+			hit &&= p != s.oid
+		}
+		if !hit {
+			i += 1
+			continue
+		}
+		delete(s.data, h.allocator)
+		ordered_remove(&h.staged, i)
+	}
 }
