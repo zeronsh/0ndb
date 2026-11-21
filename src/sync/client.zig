@@ -18,6 +18,34 @@ pub const SenderKey = struct {
     sender_id: u128,
 };
 
+pub const CapabilityToken = struct {
+    topic: [32]u8,
+    perms: u8,
+    expires_ms: u64,
+    mac: crypto.Mac,
+
+    pub fn mint(secret: [32]u8, topic: [32]u8, perms: u8, expires_ms: u64) CapabilityToken {
+        return .{
+            .topic = topic,
+            .perms = perms,
+            .expires_ms = expires_ms,
+            .mac = crypto.deriveCapabilityToken(secret, topic, perms, expires_ms),
+        };
+    }
+};
+
+pub const QuarantineReason = enum {
+    invalid_envelope,
+    auth_failed,
+    decode_failed,
+};
+
+pub const QuarantinedFrame = struct {
+    topic_id: [32]u8,
+    seq: u64,
+    reason: QuarantineReason,
+};
+
 pub const DecryptedFrame = struct {
     topic_id: [32]u8,
     seq: u64,
@@ -30,6 +58,18 @@ pub const DecryptedFrame = struct {
     }
 };
 
+pub const RangePage = struct {
+    frames: []DecryptedFrame,
+    last_seq: u64,
+    has_more: bool,
+    item_count: usize,
+
+    pub fn deinit(self: *RangePage, allocator: Allocator) void {
+        for (self.frames) |*f| f.deinit(allocator);
+        allocator.free(self.frames);
+    }
+};
+
 pub const FramePayload = struct {
     sender_id: u128,
     sender_seq: u64,
@@ -39,6 +79,10 @@ pub const FramePayload = struct {
 const FRAME_AAD_PREFIX = "0ndb-frame-v2";
 const BLOB_AAD_PREFIX = "0ndb-blob-v2";
 const FRAME_HEADER_LEN: usize = 24;
+const SEQ_RESERVE_STRIDE: u64 = 64;
+pub const PULL_PAGE_LIMIT: u32 = 128;
+const MAX_WAITING_BATCHES: usize = 4096;
+const MAX_QUARANTINED_RECORDS: usize = 1024;
 
 fn buildFrameAad(topic: [32]u8, sender_id: u128, sender_seq: u64) [FRAME_AAD_PREFIX.len + 32 + 16 + 8]u8 {
     var aad: [FRAME_AAD_PREFIX.len + 32 + 16 + 8]u8 = undefined;
@@ -67,7 +111,8 @@ pub fn sealFramePayload(
     sender_seq: u64,
     plaintext: []const u8,
 ) ![]u8 {
-    const key = crypto.deriveTopicKey(master_key, topic);
+    var key = crypto.deriveTopicKey(master_key, topic);
+    defer crypto.zeroize(&key);
     const aad = buildFrameAad(topic, sender_id, sender_seq);
     const sealed = try crypto.sealRandom(allocator, io, key, &aad, plaintext);
     defer allocator.free(sealed);
@@ -97,7 +142,8 @@ pub fn openFramePayload(
         if (sender_seq <= prev) return error.ReplayOrReorder;
     }
 
-    const key = crypto.deriveTopicKey(master_key, expected_topic);
+    var key = crypto.deriveTopicKey(master_key, expected_topic);
+    defer crypto.zeroize(&key);
     const aad = buildFrameAad(expected_topic, sender_id, sender_seq);
     const plain = try crypto.open(allocator, key, &aad, raw[FRAME_HEADER_LEN..]);
     errdefer allocator.free(plain);
@@ -111,17 +157,49 @@ pub fn openFramePayload(
 }
 
 const SYNC_CURSOR_MAGIC: u32 = 0x30534352;
-const SYNC_CURSOR_VERSION: u16 = 1;
+const SYNC_CURSOR_VERSION_V1: u16 = 1;
+const SYNC_CURSOR_VERSION: u16 = 2;
+
+const WaitingBatch = struct {
+    batch_id: id.BatchId,
+    raw_batch: []u8,
+};
 
 const WorkspaceSyncState = struct {
     last_pulled_seq: u64 = 0,
     pushed_batches: std.AutoHashMapUnmanaged(id.BatchId, void) = .empty,
     uploaded_blobs: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    waiting: std.ArrayList(WaitingBatch) = .empty,
 
     fn deinit(self: *WorkspaceSyncState, allocator: Allocator) void {
         self.pushed_batches.deinit(allocator);
         self.uploaded_blobs.deinit(allocator);
+        for (self.waiting.items) |w| allocator.free(w.raw_batch);
+        self.waiting.deinit(allocator);
     }
+
+    fn containsWaiting(self: *const WorkspaceSyncState, bid: id.BatchId) bool {
+        for (self.waiting.items) |w| {
+            if (w.batch_id.eql(bid)) return true;
+        }
+        return false;
+    }
+
+    fn addWaiting(self: *WorkspaceSyncState, allocator: Allocator, bid: id.BatchId, raw: []const u8) !bool {
+        if (self.containsWaiting(bid)) return false;
+        if (self.waiting.items.len >= MAX_WAITING_BATCHES) return false;
+        const dup = try allocator.dupe(u8, raw);
+        errdefer allocator.free(dup);
+        try self.waiting.append(allocator, .{ .batch_id = bid, .raw_batch = dup });
+        return true;
+    }
+};
+
+const IntegrateOutcome = enum {
+    applied,
+    already_present,
+    waiting_parents,
+    waiting_blob,
 };
 
 fn opReferencedBlob(op: op_mod.Op) ?struct { oid: id.Oid, is_text_blob: bool } {
@@ -145,22 +223,26 @@ pub const SyncClient = struct {
     io: Io,
     fd: posix.fd_t,
     master_key: crypto.Key,
-    auth_secret: [32]u8,
+    auth_secret: ?[32]u8,
     sender_id: u128,
     out_seqs: std.AutoHashMapUnmanaged([32]u8, u64),
-    live_seen_seqs: std.AutoHashMapUnmanaged(SenderKey, u64),
+    persisted_out_seqs: std.AutoHashMapUnmanaged([32]u8, u64),
+    seen_seqs: std.AutoHashMapUnmanaged(SenderKey, u64),
     authorized_topics: std.AutoHashMapUnmanaged([32]u8, u8),
+    scoped_tokens: std.AutoHashMapUnmanaged([32]u8, CapabilityToken),
     uploaded_blobs: std.AutoHashMapUnmanaged([32]u8, void),
     ws_states: std.AutoHashMapUnmanaged(id.ActorId, WorkspaceSyncState),
     pending_events: std.ArrayList(DecryptedFrame),
+    quarantined: std.ArrayList(QuarantinedFrame),
+    quarantined_count: usize,
 
-    pub fn connect(
+    fn connectInternal(
         allocator: Allocator,
         io: Io,
         host_ip: [4]u8,
         port: u16,
         master_key: crypto.Key,
-        auth_secret: [32]u8,
+        auth_secret: ?[32]u8,
     ) !SyncClient {
         const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
         if (linux.errno(s_rc) != .SUCCESS) return error.SocketFailed;
@@ -169,6 +251,7 @@ pub const SyncClient = struct {
 
         var one: i32 = 1;
         _ = linux.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(i32));
+        wire.setSocketTimeouts(fd, @intCast(wire.DEFAULT_IO_TIMEOUT_MS)) catch {};
 
         var addr = linux.sockaddr.in{
             .family = linux.AF.INET,
@@ -187,32 +270,107 @@ pub const SyncClient = struct {
             .auth_secret = auth_secret,
             .sender_id = id.newUuidV7(io),
             .out_seqs = .empty,
-            .live_seen_seqs = .empty,
+            .persisted_out_seqs = .empty,
+            .seen_seqs = .empty,
             .authorized_topics = .empty,
+            .scoped_tokens = .empty,
             .uploaded_blobs = .empty,
             .ws_states = .empty,
             .pending_events = .empty,
+            .quarantined = .empty,
+            .quarantined_count = 0,
         };
+    }
+
+    pub fn connect(
+        allocator: Allocator,
+        io: Io,
+        host_ip: [4]u8,
+        port: u16,
+        master_key: crypto.Key,
+        auth_secret: [32]u8,
+    ) !SyncClient {
+        return connectInternal(allocator, io, host_ip, port, master_key, auth_secret);
+    }
+
+    pub fn connectWithToken(
+        allocator: Allocator,
+        io: Io,
+        host_ip: [4]u8,
+        port: u16,
+        master_key: crypto.Key,
+        token: CapabilityToken,
+    ) !SyncClient {
+        const toks = [_]CapabilityToken{token};
+        return connectWithTokens(allocator, io, host_ip, port, master_key, &toks);
+    }
+
+    pub fn connectWithTokens(
+        allocator: Allocator,
+        io: Io,
+        host_ip: [4]u8,
+        port: u16,
+        master_key: crypto.Key,
+        tokens: []const CapabilityToken,
+    ) !SyncClient {
+        var client = try connectInternal(allocator, io, host_ip, port, master_key, null);
+        errdefer client.deinit();
+        for (tokens) |tok| {
+            try client.scoped_tokens.put(allocator, tok.topic, tok);
+        }
+        return client;
     }
 
     pub fn deinit(self: *SyncClient) void {
         for (self.pending_events.items) |*ev| ev.deinit(self.allocator);
         self.pending_events.deinit(self.allocator);
+        self.quarantined.deinit(self.allocator);
         self.out_seqs.deinit(self.allocator);
-        self.live_seen_seqs.deinit(self.allocator);
+        self.persisted_out_seqs.deinit(self.allocator);
+        self.seen_seqs.deinit(self.allocator);
         self.authorized_topics.deinit(self.allocator);
+        var tit = self.scoped_tokens.valueIterator();
+        while (tit.next()) |tok| crypto.zeroize(&tok.mac);
+        self.scoped_tokens.deinit(self.allocator);
         self.uploaded_blobs.deinit(self.allocator);
         var wit = self.ws_states.valueIterator();
         while (wit.next()) |st| st.deinit(self.allocator);
         self.ws_states.deinit(self.allocator);
+        crypto.zeroize(&self.master_key);
+        if (self.auth_secret != null) {
+            crypto.zeroize(&self.auth_secret.?);
+            self.auth_secret = null;
+        }
         _ = linux.close(self.fd);
+    }
+
+    fn recordQuarantine(self: *SyncClient, topic_id: [32]u8, seq: u64, reason: QuarantineReason) void {
+        self.quarantined_count += 1;
+        if (self.quarantined.items.len < MAX_QUARANTINED_RECORDS) {
+            self.quarantined.append(self.allocator, .{
+                .topic_id = topic_id,
+                .seq = seq,
+                .reason = reason,
+            }) catch {};
+        }
     }
 
     fn bufferLiveEventFrame(self: *SyncClient, frame: *const wire.WireFrame) !void {
         if (frame.payload.len < 40) return;
         const tid: [32]u8 = frame.payload[0..32].*;
         const seq = std.mem.readInt(u64, frame.payload[32..40], .little);
-        const dec = openFramePayload(self.allocator, self.master_key, tid, frame.payload[40..], &self.live_seen_seqs, self.allocator) catch return;
+        const dec = openFramePayload(self.allocator, self.master_key, tid, frame.payload[40..], &self.seen_seqs, self.allocator) catch |err| switch (err) {
+            error.ReplayOrReorder => return,
+            error.InvalidEnvelope => {
+                self.recordQuarantine(tid, seq, .invalid_envelope);
+                return;
+            },
+            error.AuthenticationFailed => {
+                self.recordQuarantine(tid, seq, .auth_failed);
+                return;
+            },
+            else => return err,
+        };
         errdefer self.allocator.free(dec.plaintext);
         try self.pending_events.append(self.allocator, .{
             .topic_id = tid,
@@ -246,26 +404,44 @@ pub const SyncClient = struct {
         }
     }
 
+    pub fn authorizeWithToken(self: *SyncClient, token: CapabilityToken) !void {
+        var payload: [32 + 1 + 8 + 32]u8 = undefined;
+        defer crypto.zeroize(&payload);
+        @memcpy(payload[0..32], &token.topic);
+        payload[32] = token.perms;
+        std.mem.writeInt(u64, payload[33..41], token.expires_ms, .little);
+        @memcpy(payload[41..73], &token.mac);
+        try wire.writeFrameBlocking(self.allocator, self.fd, .auth, 0, &payload);
+        var resp = try self.readRpcResponse();
+        defer resp.deinit(self.allocator);
+        if (resp.op != .ack) return error.AuthRejected;
+        if (token.expires_ms == 0) {
+            const prev = self.authorized_topics.get(token.topic) orelse 0;
+            try self.authorized_topics.put(self.allocator, token.topic, prev | token.perms);
+        }
+    }
+
     pub fn authorizeTopic(self: *SyncClient, topic: [32]u8, perms: u8) !void {
         if (self.authorized_topics.get(topic)) |existing| {
             if ((existing & perms) == perms) return;
         }
+        if (self.scoped_tokens.get(topic)) |tok| {
+            if ((tok.perms & perms) == perms) {
+                try self.authorizeWithToken(tok);
+                return;
+            }
+        }
+        if (self.auth_secret == null) return error.MissingCapabilityToken;
         try self.authorizeTopicWithExpiry(topic, perms, 0);
         const prev = self.authorized_topics.get(topic) orelse 0;
         try self.authorized_topics.put(self.allocator, topic, prev | perms);
     }
 
     pub fn authorizeTopicWithExpiry(self: *SyncClient, topic: [32]u8, perms: u8, expires_ms: u64) !void {
-        const mac = crypto.deriveCapabilityToken(self.auth_secret, topic, perms, expires_ms);
-        var payload: [32 + 1 + 8 + 32]u8 = undefined;
-        @memcpy(payload[0..32], &topic);
-        payload[32] = perms;
-        std.mem.writeInt(u64, payload[33..41], expires_ms, .little);
-        @memcpy(payload[41..73], &mac);
-        try wire.writeFrameBlocking(self.allocator, self.fd, .auth, 0, &payload);
-        var resp = try self.readRpcResponse();
-        defer resp.deinit(self.allocator);
-        if (resp.op != .ack) return error.AuthRejected;
+        const secret = self.auth_secret orelse return error.MissingAuthSecret;
+        var token = CapabilityToken.mint(secret, topic, perms, expires_ms);
+        defer crypto.zeroize(&token.mac);
+        try self.authorizeWithToken(token);
     }
 
     pub fn putEncryptedFrame(self: *SyncClient, topic: [32]u8, plaintext: []const u8) !u64 {
@@ -288,21 +464,18 @@ pub const SyncClient = struct {
         return std.mem.readInt(u64, resp.payload[0..8], .little);
     }
 
-    pub fn getEncryptedRange(
+    pub fn getEncryptedRangePage(
         self: *SyncClient,
         allocator: Allocator,
         topic: [32]u8,
         after_seq: u64,
         limit: u32,
-    ) ![]DecryptedFrame {
+    ) !RangePage {
         var req: [32 + 8 + 4]u8 = undefined;
         @memcpy(req[0..32], &topic);
         std.mem.writeInt(u64, req[32..40], after_seq, .little);
         std.mem.writeInt(u32, req[40..44], limit, .little);
         try wire.writeFrameBlocking(self.allocator, self.fd, .get_range, 0, &req);
-
-        var range_seen: std.AutoHashMapUnmanaged(SenderKey, u64) = .empty;
-        defer range_seen.deinit(self.allocator);
 
         var out: std.ArrayList(DecryptedFrame) = .empty;
         errdefer {
@@ -310,10 +483,17 @@ pub const SyncClient = struct {
             out.deinit(allocator);
         }
 
+        var last_seq = after_seq;
+        var has_more = false;
+        var item_count: usize = 0;
+
         while (true) {
             var frame = try wire.readFrameBlocking(self.allocator, self.fd);
             defer frame.deinit(self.allocator);
-            if (frame.op == .range_end) break;
+            if (frame.op == .range_end) {
+                has_more = (frame.flags & wire.RANGE_FLAG_HAS_MORE) != 0;
+                break;
+            }
             if (frame.op == .err) return error.RelayError;
             if (frame.op == .frame_event) {
                 try self.bufferLiveEventFrame(&frame);
@@ -330,10 +510,24 @@ pub const SyncClient = struct {
                 return error.BadRelayFrame;
             }
             const seq = std.mem.readInt(u64, frame.payload[32..40], .little);
+            if (seq > last_seq) last_seq = seq;
+            item_count += 1;
+
             const env = frame.payload[40..];
-            const dec = openFramePayload(allocator, self.master_key, topic, env, &range_seen, self.allocator) catch |err| {
-                self.drainUntilOp(.range_end);
-                return err;
+            const dec = openFramePayload(allocator, self.master_key, topic, env, &self.seen_seqs, self.allocator) catch |err| switch (err) {
+                error.ReplayOrReorder => continue,
+                error.InvalidEnvelope => {
+                    self.recordQuarantine(tid, seq, .invalid_envelope);
+                    continue;
+                },
+                error.AuthenticationFailed => {
+                    self.recordQuarantine(tid, seq, .auth_failed);
+                    continue;
+                },
+                else => {
+                    self.drainUntilOp(.range_end);
+                    return err;
+                },
             };
             errdefer allocator.free(dec.plaintext);
             try out.append(allocator, .{
@@ -344,7 +538,52 @@ pub const SyncClient = struct {
                 .plaintext = dec.plaintext,
             });
         }
-        return try out.toOwnedSlice(allocator);
+        return .{
+            .frames = try out.toOwnedSlice(allocator),
+            .last_seq = last_seq,
+            .has_more = has_more,
+            .item_count = item_count,
+        };
+    }
+
+    pub fn getEncryptedRange(
+        self: *SyncClient,
+        allocator: Allocator,
+        topic: [32]u8,
+        after_seq: u64,
+        limit: u32,
+    ) ![]DecryptedFrame {
+        var all: std.ArrayList(DecryptedFrame) = .empty;
+        errdefer {
+            for (all.items) |*f| f.deinit(allocator);
+            all.deinit(allocator);
+        }
+
+        var cursor = after_seq;
+        var seen_items: usize = 0;
+        while (true) {
+            const req_limit: u32 = if (limit == 0)
+                PULL_PAGE_LIMIT
+            else blk: {
+                const rem = limit - @as(u32, @intCast(@min(seen_items, limit)));
+                if (rem == 0) break;
+                break :blk @min(rem, PULL_PAGE_LIMIT);
+            };
+            var page = try self.getEncryptedRangePage(allocator, topic, cursor, req_limit);
+            errdefer page.deinit(allocator);
+
+            for (page.frames) |f| {
+                try all.append(allocator, f);
+            }
+            allocator.free(page.frames);
+            page.frames = &.{};
+
+            seen_items += page.item_count;
+            if (!page.has_more or page.item_count == 0 or page.last_seq <= cursor) break;
+            cursor = page.last_seq;
+            if (limit > 0 and seen_items >= limit) break;
+        }
+        return try all.toOwnedSlice(allocator);
     }
 
     pub fn subscribe(self: *SyncClient, topic: [32]u8, after_seq: u64) ![]DecryptedFrame {
@@ -375,9 +614,20 @@ pub const SyncClient = struct {
                     return error.BadRelayFrame;
                 }
                 const seq = std.mem.readInt(u64, frame.payload[32..40], .little);
-                const dec = openFramePayload(self.allocator, self.master_key, topic, frame.payload[40..], &self.live_seen_seqs, self.allocator) catch |err| {
-                    self.drainUntilOp(.ack);
-                    return err;
+                const dec = openFramePayload(self.allocator, self.master_key, topic, frame.payload[40..], &self.seen_seqs, self.allocator) catch |err| switch (err) {
+                    error.ReplayOrReorder => continue,
+                    error.InvalidEnvelope => {
+                        self.recordQuarantine(tid, seq, .invalid_envelope);
+                        continue;
+                    },
+                    error.AuthenticationFailed => {
+                        self.recordQuarantine(tid, seq, .auth_failed);
+                        continue;
+                    },
+                    else => {
+                        self.drainUntilOp(.ack);
+                        return err;
+                    },
                 };
                 errdefer self.allocator.free(dec.plaintext);
                 try backlog.append(self.allocator, .{
@@ -400,23 +650,37 @@ pub const SyncClient = struct {
             ev.plaintext = duped;
             return ev;
         }
-        var frame = try wire.readFrameBlocking(self.allocator, self.fd);
-        defer frame.deinit(self.allocator);
-        if (frame.op != .frame_event or frame.payload.len < 40) return error.BadRelayFrame;
-        const tid: [32]u8 = frame.payload[0..32].*;
-        const seq = std.mem.readInt(u64, frame.payload[32..40], .little);
-        const dec = try openFramePayload(allocator, self.master_key, tid, frame.payload[40..], &self.live_seen_seqs, self.allocator);
-        return .{
-            .topic_id = tid,
-            .seq = seq,
-            .sender_id = dec.sender_id,
-            .sender_seq = dec.sender_seq,
-            .plaintext = dec.plaintext,
-        };
+        while (true) {
+            var frame = try wire.readFrameBlocking(self.allocator, self.fd);
+            defer frame.deinit(self.allocator);
+            if (frame.op != .frame_event or frame.payload.len < 40) return error.BadRelayFrame;
+            const tid: [32]u8 = frame.payload[0..32].*;
+            const seq = std.mem.readInt(u64, frame.payload[32..40], .little);
+            const dec = openFramePayload(allocator, self.master_key, tid, frame.payload[40..], &self.seen_seqs, self.allocator) catch |err| switch (err) {
+                error.ReplayOrReorder => continue,
+                error.InvalidEnvelope => {
+                    self.recordQuarantine(tid, seq, .invalid_envelope);
+                    continue;
+                },
+                error.AuthenticationFailed => {
+                    self.recordQuarantine(tid, seq, .auth_failed);
+                    continue;
+                },
+                else => return err,
+            };
+            return .{
+                .topic_id = tid,
+                .seq = seq,
+                .sender_id = dec.sender_id,
+                .sender_seq = dec.sender_seq,
+                .plaintext = dec.plaintext,
+            };
+        }
     }
 
     pub fn putEncryptedBlob(self: *SyncClient, topic: [32]u8, oid: [32]u8, plaintext: []const u8) !void {
-        const key = crypto.deriveTopicKey(self.master_key, topic);
+        var key = crypto.deriveTopicKey(self.master_key, topic);
+        defer crypto.zeroize(&key);
         const lookup_id = crypto.deriveBlobLookupId(self.master_key, topic, oid);
         const aad = buildBlobAad(topic, oid);
         const sealed = try crypto.sealRandom(self.allocator, self.io, key, &aad, plaintext);
@@ -445,7 +709,8 @@ pub const SyncClient = struct {
         defer resp.deinit(self.allocator);
         if (resp.op != .blob_data or resp.payload.len < 33) return error.GetBlobFailed;
         if (resp.payload[32] == 0) return null;
-        const key = crypto.deriveTopicKey(self.master_key, topic);
+        var key = crypto.deriveTopicKey(self.master_key, topic);
+        defer crypto.zeroize(&key);
         const aad = buildBlobAad(topic, oid);
         const plain = try crypto.open(allocator, key, &aad, resp.payload[33..]);
         errdefer allocator.free(plain);
@@ -486,7 +751,10 @@ pub const SyncClient = struct {
         for (frames) |f| {
             if (f.seq > last_seq) last_seq = f.seq;
             var r = codec.Reader.init(f.plaintext);
-            const sum = try model.SessionSummary.decode(allocator, &r);
+            const sum = model.SessionSummary.decode(allocator, &r) catch {
+                self.recordQuarantine(topic, f.seq, .decode_failed);
+                continue;
+            };
             const gop = try latest.getOrPut(allocator, sum.thread_id);
             if (gop.found_existing) gop.value_ptr.deinit(allocator);
             gop.value_ptr.* = sum;
@@ -564,6 +832,20 @@ pub const SyncClient = struct {
         return try self.putEncryptedFrame(topic, w.items());
     }
 
+    pub fn waitingCount(self: *const SyncClient, ws: *const ws_mod.Workspace) usize {
+        const st = self.ws_states.get(ws.disk_actor) orelse return 0;
+        return st.waiting.items.len;
+    }
+
+    pub fn loadWorkspaceCursor(self: *SyncClient, ws: *ws_mod.Workspace) !void {
+        _ = try self.getOrLoadWorkspaceState(ws);
+    }
+
+    pub fn persistWorkspaceCursor(self: *SyncClient, ws: *ws_mod.Workspace) !void {
+        const st = try self.getOrLoadWorkspaceState(ws);
+        try self.saveWorkspaceCursorFile(ws, st);
+    }
+
     fn getOrLoadWorkspaceState(self: *SyncClient, ws: *ws_mod.Workspace) !*WorkspaceSyncState {
         const gop = try self.ws_states.getOrPut(self.allocator, ws.disk_actor);
         if (!gop.found_existing) {
@@ -586,59 +868,129 @@ pub const SyncClient = struct {
         var r = codec.Reader.init(buf);
         const magic = r.readU32() catch return;
         const ver = r.readU16() catch return;
-        if (magic != SYNC_CURSOR_MAGIC or ver != SYNC_CURSOR_VERSION) return;
+        if (magic != SYNC_CURSOR_MAGIC) return;
+        if (ver != SYNC_CURSOR_VERSION_V1 and ver != SYNC_CURSOR_VERSION) return;
 
         const saved_sender = r.readU128() catch return;
-        const out_count = r.readU32() catch return;
+        const out_count: usize = if (ver == SYNC_CURSOR_VERSION_V1)
+            @intCast(r.readU32() catch return)
+        else
+            r.readCount(40, 65536) catch return;
+        if (out_count > r.remaining() / 40) return;
+
         const adopt_sender = self.out_seqs.count() == 0;
         if (adopt_sender and saved_sender != 0) {
             self.sender_id = saved_sender;
         }
+        const merge_out = adopt_sender or (saved_sender == self.sender_id);
         for (0..out_count) |_| {
             const topic = (r.readFixed(32) catch return).*;
             const seq = r.readU64() catch return;
-            if (adopt_sender) {
-                self.out_seqs.put(self.allocator, topic, seq) catch return;
+            if (merge_out) {
+                const prev = self.out_seqs.get(topic) orelse 0;
+                const merged = @max(prev, seq);
+                self.out_seqs.put(self.allocator, topic, merged) catch return;
+                const prev_p = self.persisted_out_seqs.get(topic) orelse 0;
+                self.persisted_out_seqs.put(self.allocator, topic, @max(prev_p, merged)) catch return;
             }
         }
 
         st.last_pulled_seq = r.readU64() catch return;
-        const batch_count = r.readU32() catch return;
+        const batch_count: usize = if (ver == SYNC_CURSOR_VERSION_V1)
+            @intCast(r.readU32() catch return)
+        else
+            r.readCount(24, 1_000_000) catch return;
+        if (batch_count > r.remaining() / 24) return;
         for (0..batch_count) |_| {
             const actor = r.readU128() catch return;
             const ts = r.readU64() catch return;
             st.pushed_batches.put(self.allocator, id.OpId.init(ts, actor), {}) catch return;
         }
-        const blob_count = r.readU32() catch return;
+
+        const blob_count: usize = if (ver == SYNC_CURSOR_VERSION_V1)
+            @intCast(r.readU32() catch return)
+        else
+            r.readCount(32, 1_000_000) catch return;
+        if (blob_count > r.remaining() / 32) return;
         for (0..blob_count) |_| {
             const oid = (r.readFixed(32) catch return).*;
             st.uploaded_blobs.put(self.allocator, oid, {}) catch return;
         }
+
+        if (ver >= SYNC_CURSOR_VERSION and r.remaining() > 0) {
+            const seen_count = r.readCount(56, 1_000_000) catch return;
+            for (0..seen_count) |_| {
+                const topic = (r.readFixed(32) catch return).*;
+                const sid = r.readU128() catch return;
+                const last_seen = r.readU64() catch return;
+                const sk = SenderKey{ .topic = topic, .sender_id = sid };
+                const prev = self.seen_seqs.get(sk) orelse 0;
+                if (last_seen > prev) {
+                    self.seen_seqs.put(self.allocator, sk, last_seen) catch return;
+                }
+            }
+            if (r.remaining() > 0) {
+                const wait_count = r.readCount(25, MAX_WAITING_BATCHES) catch return;
+                for (0..wait_count) |_| {
+                    const actor = r.readU128() catch return;
+                    const ts = r.readU64() catch return;
+                    const raw = r.readBytes() catch return;
+                    _ = st.addWaiting(self.allocator, id.OpId.init(ts, actor), raw) catch return;
+                }
+            }
+        }
     }
 
     fn saveWorkspaceCursorFile(self: *SyncClient, ws: *ws_mod.Workspace, st: *const WorkspaceSyncState) !void {
+        var combined_out: std.AutoHashMapUnmanaged([32]u8, u64) = .empty;
+        defer combined_out.deinit(self.allocator);
+        {
+            var oit = self.out_seqs.iterator();
+            while (oit.next()) |e| {
+                try combined_out.put(self.allocator, e.key_ptr.*, e.value_ptr.*);
+            }
+            var pit = self.persisted_out_seqs.iterator();
+            while (pit.next()) |e| {
+                const prev = combined_out.get(e.key_ptr.*) orelse 0;
+                try combined_out.put(self.allocator, e.key_ptr.*, @max(prev, e.value_ptr.*));
+            }
+        }
+
         var w = codec.Writer{};
         defer w.deinit(self.allocator);
         try w.writeU32(self.allocator, SYNC_CURSOR_MAGIC);
         try w.writeU16(self.allocator, SYNC_CURSOR_VERSION);
         try w.writeU128(self.allocator, self.sender_id);
-        try w.writeU32(self.allocator, @intCast(self.out_seqs.count()));
-        var oit = self.out_seqs.iterator();
+        try w.writeVarint(self.allocator, combined_out.count());
+        var oit = combined_out.iterator();
         while (oit.next()) |e| {
             try w.writeRaw(self.allocator, &e.key_ptr.*);
             try w.writeU64(self.allocator, e.value_ptr.*);
         }
         try w.writeU64(self.allocator, st.last_pulled_seq);
-        try w.writeU32(self.allocator, @intCast(st.pushed_batches.count()));
+        try w.writeVarint(self.allocator, st.pushed_batches.count());
         var bit = st.pushed_batches.keyIterator();
         while (bit.next()) |bid| {
             try w.writeU128(self.allocator, bid.actor);
             try w.writeU64(self.allocator, bid.ts);
         }
-        try w.writeU32(self.allocator, @intCast(st.uploaded_blobs.count()));
+        try w.writeVarint(self.allocator, st.uploaded_blobs.count());
         var blit = st.uploaded_blobs.keyIterator();
         while (blit.next()) |oid| {
             try w.writeRaw(self.allocator, &oid.*);
+        }
+        try w.writeVarint(self.allocator, self.seen_seqs.count());
+        var sit = self.seen_seqs.iterator();
+        while (sit.next()) |e| {
+            try w.writeRaw(self.allocator, &e.key_ptr.topic);
+            try w.writeU128(self.allocator, e.key_ptr.sender_id);
+            try w.writeU64(self.allocator, e.value_ptr.*);
+        }
+        try w.writeVarint(self.allocator, st.waiting.items.len);
+        for (st.waiting.items) |wb| {
+            try w.writeU128(self.allocator, wb.batch_id.actor);
+            try w.writeU64(self.allocator, wb.batch_id.ts);
+            try w.writeBytes(self.allocator, wb.raw_batch);
         }
 
         const tmp = "sync_cursor.0ndb.tmp";
@@ -655,9 +1007,23 @@ pub const SyncClient = struct {
         try ws.state_dir.rename(tmp, ws.state_dir, "sync_cursor.0ndb", self.io);
     }
 
+    fn reserveTopicSeqForWorkspace(
+        self: *SyncClient,
+        ws: *ws_mod.Workspace,
+        st: *const WorkspaceSyncState,
+        topic: [32]u8,
+    ) !void {
+        const used = self.out_seqs.get(topic) orelse 0;
+        const reserved = self.persisted_out_seqs.get(topic) orelse 0;
+        if (used + 1 <= reserved) return;
+        const new_reserved = used + SEQ_RESERVE_STRIDE;
+        try self.persisted_out_seqs.put(self.allocator, topic, new_reserved);
+        try self.saveWorkspaceCursorFile(ws, st);
+    }
+
     pub fn pushWorkspace(self: *SyncClient, ws: *ws_mod.Workspace) !usize {
         const topic = id.worktreeStreamId(ws.history.history_id);
-        try self.authorizeTopic(topic, wire.PERM_ALL);
+        try self.authorizeTopic(topic, wire.PERM_WRITE);
         const st = try self.getOrLoadWorkspaceState(ws);
         var pushed: usize = 0;
         const n = ws.batch_log.count();
@@ -691,6 +1057,8 @@ pub const SyncClient = struct {
                 }
             }
 
+            try self.reserveTopicSeqForWorkspace(ws, st, topic);
+
             if (batch.blobs.len > 0) {
                 var stripped = batch;
                 stripped.blobs = &.{};
@@ -710,70 +1078,165 @@ pub const SyncClient = struct {
         return pushed;
     }
 
+    fn tryIntegrateBatch(
+        self: *SyncClient,
+        ws: *ws_mod.Workspace,
+        st: *WorkspaceSyncState,
+        topic: [32]u8,
+        batch: *const op_mod.Batch,
+    ) !IntegrateOutcome {
+        const bid = batch.header.batchId();
+        if (ws.history.dag.containsBatch(bid)) {
+            if (!st.pushed_batches.contains(bid)) {
+                try st.pushed_batches.put(self.allocator, bid, {});
+            }
+            return .already_present;
+        }
+
+        for (batch.blobs) |b| {
+            if (!ws.blob_store.exists(b.oid)) {
+                try ws.blob_store.putVerified(b.oid, b.data);
+            }
+            if (!ws.history.blobs.contains(b.oid)) {
+                try ws.history.putBlob(b.oid, b.data);
+            }
+        }
+        for (batch.ops) |op| {
+            if (opReferencedBlob(op)) |ref| {
+                if (!ws.blob_store.exists(ref.oid)) {
+                    const raw_opt = self.getEncryptedBlob(self.allocator, topic, ref.oid) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return .waiting_blob,
+                    };
+                    const raw = raw_opt orelse return .waiting_blob;
+                    defer self.allocator.free(raw);
+                    try ws.blob_store.putVerified(ref.oid, raw);
+                    if (ref.is_text_blob and !ws.history.blobs.contains(ref.oid)) {
+                        try ws.history.putBlob(ref.oid, raw);
+                    }
+                } else if (ref.is_text_blob and !ws.history.blobs.contains(ref.oid)) {
+                    const raw = (try ws.blob_store.get(self.allocator, ref.oid)) orelse return .waiting_blob;
+                    defer self.allocator.free(raw);
+                    try ws.history.putBlob(ref.oid, raw);
+                }
+            }
+        }
+
+        const committed = ws.commitBatchWithSource(batch, "sync") catch |err| switch (err) {
+            error.MissingParents => return .waiting_parents,
+            else => return err,
+        };
+        if (!st.pushed_batches.contains(bid)) {
+            try st.pushed_batches.put(self.allocator, bid, {});
+        }
+        return if (committed) .applied else .already_present;
+    }
+
+    fn drainWaiting(
+        self: *SyncClient,
+        ws: *ws_mod.Workspace,
+        st: *WorkspaceSyncState,
+        topic: [32]u8,
+    ) !usize {
+        var total_applied: usize = 0;
+        var progress = true;
+        while (progress and st.waiting.items.len > 0) {
+            progress = false;
+            var i: usize = 0;
+            while (i < st.waiting.items.len) {
+                var r = codec.Reader.init(st.waiting.items[i].raw_batch);
+                var batch = op_mod.Batch.decode(self.allocator, &r) catch {
+                    const bad = st.waiting.orderedRemove(i);
+                    self.allocator.free(bad.raw_batch);
+                    continue;
+                };
+                defer batch.deinit(self.allocator);
+                const outcome = try self.tryIntegrateBatch(ws, st, topic, &batch);
+                switch (outcome) {
+                    .applied => {
+                        total_applied += 1;
+                        progress = true;
+                        const done = st.waiting.orderedRemove(i);
+                        self.allocator.free(done.raw_batch);
+                    },
+                    .already_present => {
+                        const done = st.waiting.orderedRemove(i);
+                        self.allocator.free(done.raw_batch);
+                    },
+                    .waiting_parents, .waiting_blob => {
+                        i += 1;
+                    },
+                }
+            }
+        }
+        return total_applied;
+    }
+
     pub fn pullWorkspace(
         self: *SyncClient,
         ws: *ws_mod.Workspace,
         after_seq: u64,
     ) !struct { applied: usize, last_seq: u64 } {
         const topic = id.worktreeStreamId(ws.history.history_id);
-        try self.authorizeTopic(topic, wire.PERM_ALL);
+        try self.authorizeTopic(topic, wire.PERM_READ);
         const st = try self.getOrLoadWorkspaceState(ws);
         const effective_after = @max(after_seq, st.last_pulled_seq);
-        const frames = try self.getEncryptedRange(self.allocator, topic, effective_after, 0);
-        defer {
-            for (frames) |*f| f.deinit(self.allocator);
-            self.allocator.free(frames);
-        }
 
         var applied: usize = 0;
         var last_seq = effective_after;
         var dirty = false;
-        for (frames) |f| {
-            if (f.seq > last_seq) {
-                last_seq = f.seq;
-                dirty = true;
-            }
-            var r = codec.Reader.init(f.plaintext);
-            var batch = try op_mod.Batch.decode(self.allocator, &r);
-            defer batch.deinit(self.allocator);
-            const bid = batch.header.batchId();
-            if (!st.pushed_batches.contains(bid)) {
-                try st.pushed_batches.put(self.allocator, bid, {});
-                dirty = true;
-            }
-            if (ws.history.dag.containsBatch(bid)) continue;
 
-            for (batch.blobs) |b| {
-                if (!ws.blob_store.exists(b.oid)) {
-                    try ws.blob_store.putVerified(b.oid, b.data);
+        while (true) {
+            const prev_seq = last_seq;
+            var page = try self.getEncryptedRangePage(self.allocator, topic, prev_seq, PULL_PAGE_LIMIT);
+            defer page.deinit(self.allocator);
+
+            for (page.frames) |f| {
+                if (f.seq > last_seq) {
+                    last_seq = f.seq;
+                    dirty = true;
                 }
-                if (!ws.history.blobs.contains(b.oid)) {
-                    try ws.history.putBlob(b.oid, b.data);
-                }
-            }
-            for (batch.ops) |op| {
-                if (opReferencedBlob(op)) |ref| {
-                    if (!ws.blob_store.exists(ref.oid)) {
-                        if (try self.getEncryptedBlob(self.allocator, topic, ref.oid)) |raw| {
-                            defer self.allocator.free(raw);
-                            try ws.blob_store.putVerified(ref.oid, raw);
-                            if (ref.is_text_blob and !ws.history.blobs.contains(ref.oid)) {
-                                try ws.history.putBlob(ref.oid, raw);
-                            }
+                var r = codec.Reader.init(f.plaintext);
+                var batch = op_mod.Batch.decode(self.allocator, &r) catch {
+                    self.recordQuarantine(topic, f.seq, .decode_failed);
+                    continue;
+                };
+                defer batch.deinit(self.allocator);
+                const bid = batch.header.batchId();
+                const outcome = try self.tryIntegrateBatch(ws, st, topic, &batch);
+                switch (outcome) {
+                    .applied => {
+                        applied += 1;
+                        dirty = true;
+                        const drained = try self.drainWaiting(ws, st, topic);
+                        if (drained > 0) applied += drained;
+                    },
+                    .already_present => {
+                        dirty = true;
+                    },
+                    .waiting_parents, .waiting_blob => {
+                        if (try st.addWaiting(self.allocator, bid, f.plaintext)) {
+                            dirty = true;
                         }
-                    } else if (ref.is_text_blob and !ws.history.blobs.contains(ref.oid)) {
-                        if (try ws.blob_store.get(self.allocator, ref.oid)) |raw| {
-                            defer self.allocator.free(raw);
-                            try ws.history.putBlob(ref.oid, raw);
-                        }
-                    }
+                    },
                 }
             }
 
-            if (try ws.commitBatchWithSource(&batch, "sync")) {
-                applied += 1;
+            if (page.last_seq > last_seq) {
+                last_seq = page.last_seq;
+                dirty = true;
+            }
+            if (!page.has_more or page.item_count == 0 or last_seq <= prev_seq) break;
+        }
+
+        if (st.waiting.items.len > 0) {
+            const drained = try self.drainWaiting(ws, st, topic);
+            if (drained > 0) {
+                applied += drained;
+                dirty = true;
             }
         }
+
         if (last_seq > st.last_pulled_seq) {
             st.last_pulled_seq = last_seq;
             dirty = true;

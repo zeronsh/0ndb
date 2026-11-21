@@ -122,6 +122,7 @@ pub const Reader = struct {
     }
 
     pub fn remaining(self: *const Reader) usize {
+        if (self.pos >= self.data.len) return 0;
         return self.data.len - self.pos;
     }
 
@@ -137,7 +138,12 @@ pub const Reader = struct {
     }
 
     pub fn readBool(self: *Reader) DecodeError!bool {
-        return (try self.readByte()) != 0;
+        const b = try self.readByte();
+        return switch (b) {
+            0 => false,
+            1 => true,
+            else => error.InvalidData,
+        };
     }
 
     pub fn readU16(self: *Reader) DecodeError!u16 {
@@ -161,9 +167,11 @@ pub const Reader = struct {
     }
 
     pub fn readFixed(self: *Reader, comptime n: usize) DecodeError!*const [n]u8 {
-        if (self.pos + n > self.data.len) return error.UnexpectedEof;
-        const ptr: *const [n]u8 = @ptrCast(self.data[self.pos .. self.pos + n].ptr);
-        self.pos += n;
+        if (self.remaining() < n) return error.UnexpectedEof;
+        const end = @addWithOverflow(self.pos, n);
+        if (end[1] != 0 or end[0] > self.data.len) return error.UnexpectedEof;
+        const ptr: *const [n]u8 = @ptrCast(self.data[self.pos..end[0]].ptr);
+        self.pos = end[0];
         return ptr;
     }
 
@@ -173,7 +181,8 @@ pub const Reader = struct {
         var count: u8 = 0;
         while (count < 10) : (count += 1) {
             const b = try self.readByte();
-            if (count == 9 and b > 1) return error.InvalidVarint;
+            if (count == 9 and b != 1) return error.InvalidVarint;
+            if (count > 0 and b == 0) return error.InvalidVarint;
             result |= @as(u64, b & 0x7F) << shift;
             if ((b & 0x80) == 0) return result;
             shift += 7;
@@ -181,12 +190,24 @@ pub const Reader = struct {
         return error.InvalidVarint;
     }
 
+    pub fn readCount(self: *Reader, min_elem_bytes: usize, hard_cap: usize) DecodeError!usize {
+        const count_u64 = try self.readVarint();
+        if (count_u64 > hard_cap or count_u64 > std.math.maxInt(usize)) return error.InvalidData;
+        const count: usize = @intCast(count_u64);
+        if (min_elem_bytes > 0 and count > self.remaining() / min_elem_bytes) {
+            return error.UnexpectedEof;
+        }
+        return count;
+    }
+
     pub fn readBytes(self: *Reader) DecodeError![]const u8 {
         const len_u64 = try self.readVarint();
         if (len_u64 > self.remaining()) return error.UnexpectedEof;
         const len: usize = @intCast(len_u64);
-        const out = self.data[self.pos .. self.pos + len];
-        self.pos += len;
+        const end = @addWithOverflow(self.pos, len);
+        if (end[1] != 0 or end[0] > self.data.len) return error.UnexpectedEof;
+        const out = self.data[self.pos..end[0]];
+        self.pos = end[0];
         return out;
     }
 

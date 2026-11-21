@@ -2920,6 +2920,624 @@ test "all 9 providers, durable queuing, native and fallback steering, edit/rollb
     }
 }
 
+fn runSyncHardeningChecks(allocator: std.mem.Allocator, io: std.Io) !void {
+    const linux = std.os.linux;
+    const codec = ondb.store.codec;
+    const crypto = ondb.store.crypto;
+    const wire = ondb.sync.wire;
+    const relay = ondb.sync.relay;
+    const client_mod = ondb.sync.client;
+
+    {
+        var w = codec.Writer{};
+        defer w.deinit(allocator);
+        try w.writeVarint(allocator, 1_000_000);
+        try w.writeU32(allocator, 0x12345678);
+        var r1 = codec.Reader.init(w.items());
+        try testing.expectError(error.UnexpectedEof, r1.readCount(8, 10_000_000));
+
+        var r2 = codec.Reader.init(w.items());
+        try testing.expectError(error.InvalidData, r2.readCount(1, 500_000));
+
+        w.clearRetainingCapacity();
+        try w.writeVarint(allocator, 4);
+        for (0..16) |_| try w.writeByte(allocator, 0xaa);
+        var r3 = codec.Reader.init(w.items());
+        try testing.expectEqual(@as(usize, 4), try r3.readCount(4, 100));
+
+        const non_canon_a = [_]u8{ 0x80, 0x00 };
+        var rna = codec.Reader.init(&non_canon_a);
+        try testing.expectError(error.InvalidVarint, rna.readVarint());
+
+        const non_canon_b = [_]u8{ 0x81, 0x00 };
+        var rnb = codec.Reader.init(&non_canon_b);
+        try testing.expectError(error.InvalidVarint, rnb.readVarint());
+
+        const non_canon_c = [_]u8{ 0x80, 0x80, 0x00 };
+        var rnc = codec.Reader.init(&non_canon_c);
+        try testing.expectError(error.InvalidVarint, rnc.readVarint());
+
+        const over_10_a = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02 };
+        var ro1 = codec.Reader.init(&over_10_a);
+        try testing.expectError(error.InvalidVarint, ro1.readVarint());
+
+        const over_10_b = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 };
+        var ro2 = codec.Reader.init(&over_10_b);
+        try testing.expectError(error.InvalidVarint, ro2.readVarint());
+
+        const over_11 = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x01 };
+        var ro3 = codec.Reader.init(&over_11);
+        try testing.expectError(error.InvalidVarint, ro3.readVarint());
+
+        const canon_zero = [_]u8{0x00};
+        var rz = codec.Reader.init(&canon_zero);
+        try testing.expectEqual(@as(u64, 0), try rz.readVarint());
+
+        const canon_max = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 };
+        var rmax = codec.Reader.init(&canon_max);
+        try testing.expectEqual(std.math.maxInt(u64), try rmax.readVarint());
+
+        const bool_bytes = [_]u8{ 0, 1, 2, 0xff };
+        var rb = codec.Reader.init(&bool_bytes);
+        try testing.expectEqual(false, try rb.readBool());
+        try testing.expectEqual(true, try rb.readBool());
+        try testing.expectError(error.InvalidData, rb.readBool());
+        try testing.expectError(error.InvalidData, rb.readBool());
+
+        var r_ov = codec.Reader{ .data = &bool_bytes, .pos = std.math.maxInt(usize) - 2 };
+        try testing.expectError(error.UnexpectedEof, r_ov.readFixed(8));
+    }
+
+    {
+        const k1: crypto.Key = @splat(0x11);
+        const k2: crypto.Key = @splat(0x22);
+        const env_r = try crypto.sealRandom(allocator, io, k1, "aad-1", "hello-crypto");
+        defer allocator.free(env_r);
+        const pt_r = try crypto.open(allocator, k1, "aad-1", env_r);
+        defer allocator.free(pt_r);
+        try testing.expectEqualStrings("hello-crypto", pt_r);
+
+        try testing.expectError(error.AuthenticationFailed, crypto.open(allocator, k2, "aad-1", env_r));
+        try testing.expectError(error.AuthenticationFailed, crypto.open(allocator, k1, "aad-2", env_r));
+
+        const bad_ver = try allocator.dupe(u8, env_r);
+        defer allocator.free(bad_ver);
+        bad_ver[0] ^= 0x01;
+        try testing.expectError(error.InvalidEnvelope, crypto.open(allocator, k1, "aad-1", bad_ver));
+
+        const bad_cmt = try allocator.dupe(u8, env_r);
+        defer allocator.free(bad_cmt);
+        bad_cmt[1 + 32 + 5] ^= 0x80;
+        try testing.expectError(error.AuthenticationFailed, crypto.open(allocator, k1, "aad-1", bad_cmt));
+
+        const env_d1 = try crypto.sealWithDerivedNonce(allocator, k1, "ctx-1", "aad", "derived-msg");
+        defer allocator.free(env_d1);
+        const env_d2 = try crypto.sealWithDerivedNonce(allocator, k1, "ctx-1", "aad", "derived-msg");
+        defer allocator.free(env_d2);
+        const env_d3 = try crypto.sealWithDerivedNonce(allocator, k1, "ctx-2", "aad", "derived-msg");
+        defer allocator.free(env_d3);
+        try testing.expectEqualSlices(u8, env_d1, env_d2);
+        try testing.expect(!std.mem.eql(u8, env_d1, env_d3));
+        const pt_d = try crypto.open(allocator, k1, "aad", env_d1);
+        defer allocator.free(pt_d);
+        try testing.expectEqualStrings("derived-msg", pt_d);
+
+        const det_nonce: crypto.Nonce = @splat(0x42);
+        const env_t = try crypto.sealDeterministicForTest(allocator, k1, "test-aad", "det-pt", det_nonce);
+        defer allocator.free(env_t);
+        const pt_t = try crypto.open(allocator, k1, "test-aad", env_t);
+        defer allocator.free(pt_t);
+        try testing.expectEqualStrings("det-pt", pt_t);
+    }
+
+    {
+        const huge = try allocator.alloc(u8, wire.MAX_FRAME_LEN + 1);
+        defer allocator.free(huge);
+        @memset(huge, 0);
+        try testing.expectError(error.FrameTooLarge, wire.encodeFrame(allocator, .put_frame, 0, huge));
+
+        var sp: [2]std.posix.fd_t = undefined;
+        const sp_rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sp);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(sp_rc));
+        defer _ = linux.close(sp[0]);
+        defer _ = linux.close(sp[1]);
+        var tbuf: [8]u8 = undefined;
+        try testing.expectError(error.Timeout, wire.readExactFdTimeout(sp[0], &tbuf, 30));
+    }
+
+    const h_relay_dir = "/tmp/0ndb-verify-hardening-relay";
+    cleanDir(io, h_relay_dir);
+    defer cleanDir(io, h_relay_dir);
+
+    const secret = crypto.hashBytes("hardening-relay-secret");
+    const master_key: crypto.Key = @splat(0x7c);
+
+    var server = try relay.RelayServer.start(
+        allocator,
+        io,
+        h_relay_dir,
+        .{ 127, 0, 0, 1 },
+        0,
+        secret,
+        true,
+    );
+    defer server.deinit();
+    const port = server.port;
+
+    const srv_thread = try std.Thread.spawn(.{}, relayThreadMain, .{&server});
+    defer {
+        server.stop();
+        srv_thread.join();
+    }
+
+    const topic_a = ondb.core.id.streamId("hardening", 1001);
+    const topic_b = ondb.core.id.streamId("hardening", 1002);
+
+    {
+        var esc = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer esc.deinit();
+        const short_write_exp = ondb.core.id.nowMs(io) + 45;
+        try esc.authorizeTopicWithExpiry(topic_a, wire.PERM_WRITE, short_write_exp);
+        try esc.authorizeTopicWithExpiry(topic_a, wire.PERM_READ, 0);
+
+        const s1 = try esc.putEncryptedFrame(topic_a, "before-write-expiry");
+        try testing.expect(s1 >= 1);
+
+        io.sleep(.fromMilliseconds(70), .awake) catch {};
+        try testing.expectError(error.PutFrameFailed, esc.putEncryptedFrame(topic_a, "after-write-expiry"));
+
+        const read_ok = try esc.getEncryptedRange(allocator, topic_a, 0, 10);
+        defer {
+            for (read_ok) |*f| f.deinit(allocator);
+            allocator.free(read_ok);
+        }
+        try testing.expectEqual(@as(usize, 1), read_ok.len);
+        try testing.expectEqualStrings("before-write-expiry", read_ok[0].plaintext);
+    }
+
+    {
+        const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(s_rc));
+        const rfd: std.posix.fd_t = @intCast(s_rc);
+        defer _ = linux.close(rfd);
+        var addr = linux.sockaddr.in{
+            .family = linux.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        };
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.connect(rfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+
+        const tok_a = client_mod.CapabilityToken.mint(secret, topic_a, wire.PERM_READ | wire.PERM_WRITE, 0);
+        var auth_a: [73]u8 = undefined;
+        @memcpy(auth_a[0..32], &tok_a.topic);
+        auth_a[32] = tok_a.perms;
+        std.mem.writeInt(u64, auth_a[33..41], tok_a.expires_ms, .little);
+        @memcpy(auth_a[41..73], &tok_a.mac);
+        try wire.writeFrameBlocking(allocator, rfd, .auth, 0, &auth_a);
+        var aa = try wire.readFrameBlocking(allocator, rfd);
+        defer aa.deinit(allocator);
+        try testing.expectEqual(wire.Op.ack, aa.op);
+
+        const tok_b = client_mod.CapabilityToken.mint(secret, topic_b, wire.PERM_READ | wire.PERM_WRITE, 0);
+        var auth_b: [73]u8 = undefined;
+        @memcpy(auth_b[0..32], &tok_b.topic);
+        auth_b[32] = tok_b.perms;
+        std.mem.writeInt(u64, auth_b[33..41], tok_b.expires_ms, .little);
+        @memcpy(auth_b[41..73], &tok_b.mac);
+        try wire.writeFrameBlocking(allocator, rfd, .auth, 0, &auth_b);
+        var ab = try wire.readFrameBlocking(allocator, rfd);
+        defer ab.deinit(allocator);
+        try testing.expectEqual(wire.Op.ack, ab.op);
+
+        const shared_oid = crypto.hashBytes("shared-oid-seed");
+
+        var pb1: [64 + 16]u8 = undefined;
+        @memcpy(pb1[0..32], &topic_a);
+        @memcpy(pb1[32..64], &shared_oid);
+        @memcpy(pb1[64..], "topic-a-original");
+        try wire.writeFrameBlocking(allocator, rfd, .put_blob, 0, &pb1);
+        var r_pb1 = try wire.readFrameBlocking(allocator, rfd);
+        defer r_pb1.deinit(allocator);
+        try testing.expectEqual(wire.Op.ack, r_pb1.op);
+
+        var gb_b: [64]u8 = undefined;
+        @memcpy(gb_b[0..32], &topic_b);
+        @memcpy(gb_b[32..64], &shared_oid);
+        try wire.writeFrameBlocking(allocator, rfd, .get_blob, 0, &gb_b);
+        var r_gb_b = try wire.readFrameBlocking(allocator, rfd);
+        defer r_gb_b.deinit(allocator);
+        try testing.expectEqual(wire.Op.blob_data, r_gb_b.op);
+        try testing.expectEqual(@as(u8, 0), r_gb_b.payload[32]);
+
+        var pb2: [64 + 16]u8 = undefined;
+        @memcpy(pb2[0..32], &topic_b);
+        @memcpy(pb2[32..64], &shared_oid);
+        @memcpy(pb2[64..], "topic-b-distinct");
+        try wire.writeFrameBlocking(allocator, rfd, .put_blob, 0, &pb2);
+        var r_pb2 = try wire.readFrameBlocking(allocator, rfd);
+        defer r_pb2.deinit(allocator);
+        try testing.expectEqual(wire.Op.ack, r_pb2.op);
+
+        var pb_ov: [64 + 16]u8 = undefined;
+        @memcpy(pb_ov[0..32], &topic_a);
+        @memcpy(pb_ov[32..64], &shared_oid);
+        @memcpy(pb_ov[64..], "topic-a-tampered");
+        try wire.writeFrameBlocking(allocator, rfd, .put_blob, 0, &pb_ov);
+        var r_ov = try wire.readFrameBlocking(allocator, rfd);
+        defer r_ov.deinit(allocator);
+        try testing.expectEqual(wire.Op.ack, r_ov.op);
+
+        var gb_a: [64]u8 = undefined;
+        @memcpy(gb_a[0..32], &topic_a);
+        @memcpy(gb_a[32..64], &shared_oid);
+        try wire.writeFrameBlocking(allocator, rfd, .get_blob, 0, &gb_a);
+        var r_gb_a = try wire.readFrameBlocking(allocator, rfd);
+        defer r_gb_a.deinit(allocator);
+        try testing.expectEqual(wire.Op.blob_data, r_gb_a.op);
+        try testing.expectEqual(@as(u8, 1), r_gb_a.payload[32]);
+        try testing.expectEqualStrings("topic-a-original", r_gb_a.payload[33..]);
+
+        try wire.writeFrameBlocking(allocator, rfd, .get_blob, 0, &gb_b);
+        var r_gb_b2 = try wire.readFrameBlocking(allocator, rfd);
+        defer r_gb_b2.deinit(allocator);
+        try testing.expectEqual(@as(u8, 1), r_gb_b2.payload[32]);
+        try testing.expectEqualStrings("topic-b-distinct", r_gb_b2.payload[33..]);
+
+        const poison = try allocator.alloc(u8, wire.MAX_FRAME_LEN);
+        defer allocator.free(poison);
+        @memset(poison, 0xab);
+        @memcpy(poison[0..32], &topic_a);
+        try wire.writeFrameBlocking(allocator, rfd, .put_frame, 0, poison);
+        var r_poison = try wire.readFrameBlocking(allocator, rfd);
+        defer r_poison.deinit(allocator);
+        try testing.expectEqual(wire.Op.err, r_poison.op);
+        try testing.expect(r_poison.payload.len >= 1);
+        try testing.expectEqual(@intFromEnum(wire.ErrCode.bad_frame), r_poison.payload[0]);
+    }
+
+    {
+        const ro_tok = client_mod.CapabilityToken.mint(secret, topic_a, wire.PERM_READ, 0);
+        var ro_client = try client_mod.SyncClient.connectWithToken(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, ro_tok);
+        defer ro_client.deinit();
+        try ro_client.authorizeTopic(topic_a, wire.PERM_READ);
+        const got = try ro_client.getEncryptedRange(allocator, topic_a, 0, 10);
+        defer {
+            for (got) |*f| f.deinit(allocator);
+            allocator.free(got);
+        }
+        try testing.expectEqual(@as(usize, 1), got.len);
+        try testing.expectError(error.MissingCapabilityToken, ro_client.authorizeTopic(topic_a, wire.PERM_WRITE));
+        try testing.expectError(error.MissingCapabilityToken, ro_client.authorizeTopic(topic_b, wire.PERM_READ));
+        try testing.expectError(error.PutFrameFailed, ro_client.putEncryptedFrame(topic_a, "should-fail"));
+    }
+
+    {
+        const page_topic = ondb.core.id.streamId("hardening-paged", 2001);
+        var pw = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer pw.deinit();
+        try pw.authorizeTopic(page_topic, wire.PERM_ALL);
+        for (0..150) |i| {
+            var msg_buf: [32]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&msg_buf, "frame-{d:0>3}", .{i});
+            _ = try pw.putEncryptedFrame(page_topic, msg);
+        }
+
+        var pr = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer pr.deinit();
+        try pr.authorizeTopic(page_topic, wire.PERM_READ);
+        var first_page = try pr.getEncryptedRangePage(allocator, page_topic, 0, 50);
+        defer first_page.deinit(allocator);
+        try testing.expectEqual(@as(usize, 50), first_page.frames.len);
+        try testing.expect(first_page.has_more);
+
+        const rest = try pr.getEncryptedRange(allocator, page_topic, first_page.last_seq, 0);
+        defer {
+            for (rest) |*f| f.deinit(allocator);
+            allocator.free(rest);
+        }
+        try testing.expectEqual(@as(usize, 100), rest.len);
+        try testing.expectEqualStrings("frame-050", rest[0].plaintext);
+        try testing.expectEqualStrings("frame-149", rest[99].plaintext);
+    }
+
+    {
+        const ooo_a_root = "/tmp/0ndb-verify-ooo-a";
+        const ooo_a_state = "/tmp/0ndb-verify-ooo-a-state";
+        const ooo_b_root = "/tmp/0ndb-verify-ooo-b";
+        const ooo_b_state = "/tmp/0ndb-verify-ooo-b-state";
+        cleanDir(io, ooo_a_root);
+        cleanDir(io, ooo_a_state);
+        cleanDir(io, ooo_b_root);
+        cleanDir(io, ooo_b_state);
+        defer cleanDir(io, ooo_a_root);
+        defer cleanDir(io, ooo_a_state);
+        defer cleanDir(io, ooo_b_root);
+        defer cleanDir(io, ooo_b_state);
+
+        const ooo_hid: u128 = 555001;
+        var wsa = try ondb.fs.workspace.Workspace.open(allocator, io, ooo_a_root, ooo_a_state, ooo_hid);
+        defer wsa.deinit();
+        var wsb = try ondb.fs.workspace.Workspace.open(allocator, io, ooo_b_root, ooo_b_state, ooo_hid);
+        defer wsb.deinit();
+
+        _ = try wsa.writeFileDirect(wsa.disk_actor, "chain.txt", "step1\n");
+        _ = try wsa.writeFileDirect(wsa.disk_actor, "chain.txt", "step1\nstep2\n");
+        _ = try wsa.writeFileDirect(wsa.disk_actor, "chain.txt", "step1\nstep2\nstep3\n");
+
+        var batches: std.ArrayList([]u8) = .empty;
+        defer {
+            for (batches.items) |b| allocator.free(b);
+            batches.deinit(allocator);
+        }
+        for (0..wsa.batch_log.count()) |i| {
+            const v = try wsa.batch_log.readAt(i);
+            if (v.header.kind == ondb.fs.workspace.FRAME_BATCH) {
+                try batches.append(allocator, try allocator.dupe(u8, v.payload));
+            }
+        }
+        try testing.expectEqual(@as(usize, 3), batches.items.len);
+
+        const ooo_topic = ondb.core.id.worktreeStreamId(ooo_hid);
+        var pub_c = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer pub_c.deinit();
+        try pub_c.authorizeTopic(ooo_topic, wire.PERM_ALL);
+
+        _ = try pub_c.putEncryptedFrame(ooo_topic, batches.items[2]);
+        _ = try pub_c.putEncryptedFrame(ooo_topic, batches.items[1]);
+
+        var sub_c1 = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer sub_c1.deinit();
+        const r_wait = try sub_c1.pullWorkspace(&wsb, 0);
+        try testing.expectEqual(@as(usize, 0), r_wait.applied);
+        try testing.expectEqual(@as(usize, 2), sub_c1.waitingCount(&wsb));
+
+        _ = try pub_c.putEncryptedFrame(ooo_topic, batches.items[0]);
+
+        var sub_c2 = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer sub_c2.deinit();
+        const r_conv = try sub_c2.pullWorkspace(&wsb, 0);
+        try testing.expectEqual(@as(usize, 3), r_conv.applied);
+        try testing.expectEqual(@as(usize, 0), sub_c2.waitingCount(&wsb));
+
+        const txt = (try wsb.history.readFileAt(allocator, "chain.txt", null)).?;
+        defer allocator.free(txt);
+        try testing.expectEqualStrings("step1\nstep2\nstep3\n", txt);
+    }
+
+    {
+        const mb_a_root = "/tmp/0ndb-verify-mb-a";
+        const mb_a_state = "/tmp/0ndb-verify-mb-a-state";
+        const mb_b_root = "/tmp/0ndb-verify-mb-b";
+        const mb_b_state = "/tmp/0ndb-verify-mb-b-state";
+        cleanDir(io, mb_a_root);
+        cleanDir(io, mb_a_state);
+        cleanDir(io, mb_b_root);
+        cleanDir(io, mb_b_state);
+        defer cleanDir(io, mb_a_root);
+        defer cleanDir(io, mb_a_state);
+        defer cleanDir(io, mb_b_root);
+        defer cleanDir(io, mb_b_state);
+
+        const mb_hid: u128 = 555002;
+        var wsa = try ondb.fs.workspace.Workspace.open(allocator, io, mb_a_root, mb_a_state, mb_hid);
+        defer wsa.deinit();
+        var wsb = try ondb.fs.workspace.Workspace.open(allocator, io, mb_b_root, mb_b_state, mb_hid);
+        defer wsb.deinit();
+
+        const bin_data = "\x00\x01\x02missing-blob-payload\xff\xfe";
+        {
+            const f = try std.Io.Dir.cwd().createFile(io, mb_a_root ++ "/secret.bin", .{ .truncate = true });
+            defer f.close(io);
+            try f.writeStreamingAll(io, bin_data);
+        }
+        _ = try wsa.ingestDisk();
+        const bin_oid = crypto.hashBytes(bin_data);
+
+        const mb_topic = ondb.core.id.worktreeStreamId(mb_hid);
+        var pub_c = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer pub_c.deinit();
+        try pub_c.authorizeTopic(mb_topic, wire.PERM_ALL);
+
+        const v0 = try wsa.batch_log.readAt(0);
+        var br = codec.Reader.init(v0.payload);
+        var b_dec = try ondb.core.op.Batch.decode(allocator, &br);
+        defer b_dec.deinit(allocator);
+        var stripped = b_dec;
+        stripped.blobs = &.{};
+        var sw = codec.Writer{};
+        defer sw.deinit(allocator);
+        try stripped.encode(allocator, &sw);
+        _ = try pub_c.putEncryptedFrame(mb_topic, sw.items());
+
+        var sub_c = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer sub_c.deinit();
+        const p1 = try sub_c.pullWorkspace(&wsb, 0);
+        try testing.expectEqual(@as(usize, 0), p1.applied);
+        try testing.expectEqual(@as(usize, 1), sub_c.waitingCount(&wsb));
+
+        try pub_c.putEncryptedBlob(mb_topic, bin_oid, bin_data);
+        const p2 = try sub_c.pullWorkspace(&wsb, 0);
+        try testing.expectEqual(@as(usize, 1), p2.applied);
+        try testing.expectEqual(@as(usize, 0), sub_c.waitingCount(&wsb));
+
+        const got_bin = try std.Io.Dir.cwd().readFileAlloc(io, mb_b_root ++ "/secret.bin", allocator, .limited(1024));
+        defer allocator.free(got_bin);
+        try testing.expectEqualStrings(bin_data, got_bin);
+    }
+
+    {
+        const cr_a_root = "/tmp/0ndb-verify-crash-a";
+        const cr_a_state = "/tmp/0ndb-verify-crash-a-state";
+        const cr_b_root = "/tmp/0ndb-verify-crash-b";
+        const cr_b_state = "/tmp/0ndb-verify-crash-b-state";
+        cleanDir(io, cr_a_root);
+        cleanDir(io, cr_a_state);
+        cleanDir(io, cr_b_root);
+        cleanDir(io, cr_b_state);
+        defer cleanDir(io, cr_a_root);
+        defer cleanDir(io, cr_a_state);
+        defer cleanDir(io, cr_b_root);
+        defer cleanDir(io, cr_b_state);
+
+        const cr_hid: u128 = 555003;
+        const cr_topic = ondb.core.id.worktreeStreamId(cr_hid);
+        var wsa = try ondb.fs.workspace.Workspace.open(allocator, io, cr_a_root, cr_a_state, cr_hid);
+        defer wsa.deinit();
+        var wsb = try ondb.fs.workspace.Workspace.open(allocator, io, cr_b_root, cr_b_state, cr_hid);
+        defer wsb.deinit();
+
+        _ = try wsa.writeFileDirect(wsa.disk_actor, "crash.txt", "v1\n");
+
+        var c1 = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer c1.deinit();
+        const pushed1 = try c1.pushWorkspace(&wsa);
+        try testing.expectEqual(@as(usize, 1), pushed1);
+        const orig_sender = c1.sender_id;
+
+        _ = try wsa.writeFileDirect(wsa.disk_actor, "crash.txt", "v2\n");
+
+        var c2 = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer c2.deinit();
+        const pushed2 = try c2.pushWorkspace(&wsa);
+        try testing.expectEqual(@as(usize, 1), pushed2);
+        try testing.expectEqual(orig_sender, c2.sender_id);
+
+        var insp = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer insp.deinit();
+        try insp.authorizeTopic(cr_topic, wire.PERM_READ);
+        const cr_frames = try insp.getEncryptedRange(allocator, cr_topic, 0, 10);
+        defer {
+            for (cr_frames) |*f| f.deinit(allocator);
+            allocator.free(cr_frames);
+        }
+        try testing.expectEqual(@as(usize, 2), cr_frames.len);
+        try testing.expectEqual(orig_sender, cr_frames[0].sender_id);
+        try testing.expectEqual(@as(u64, 1), cr_frames[0].sender_seq);
+        try testing.expectEqual(orig_sender, cr_frames[1].sender_id);
+        try testing.expect(cr_frames[1].sender_seq >= 65);
+
+        var b1 = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer b1.deinit();
+        const pr1 = try b1.pullWorkspace(&wsb, 0);
+        try testing.expectEqual(@as(usize, 2), pr1.applied);
+
+        const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(s_rc));
+        const rfd: std.posix.fd_t = @intCast(s_rc);
+        defer _ = linux.close(rfd);
+        var addr = linux.sockaddr.in{
+            .family = linux.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        };
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.connect(rfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+        const tok = client_mod.CapabilityToken.mint(secret, cr_topic, wire.PERM_WRITE, 0);
+        var ap: [73]u8 = undefined;
+        @memcpy(ap[0..32], &tok.topic);
+        ap[32] = tok.perms;
+        std.mem.writeInt(u64, ap[33..41], tok.expires_ms, .little);
+        @memcpy(ap[41..73], &tok.mac);
+        try wire.writeFrameBlocking(allocator, rfd, .auth, 0, &ap);
+        var aa = try wire.readFrameBlocking(allocator, rfd);
+        defer aa.deinit(allocator);
+
+        const replayed = try client_mod.sealFramePayload(allocator, io, master_key, cr_topic, orig_sender, 1, "replayed-old-seq");
+        defer allocator.free(replayed);
+        const rep_pay = try allocator.alloc(u8, 32 + replayed.len);
+        defer allocator.free(rep_pay);
+        @memcpy(rep_pay[0..32], &cr_topic);
+        @memcpy(rep_pay[32..], replayed);
+        try wire.writeFrameBlocking(allocator, rfd, .put_frame, 0, rep_pay);
+        var r_rep = try wire.readFrameBlocking(allocator, rfd);
+        defer r_rep.deinit(allocator);
+        try testing.expectEqual(wire.Op.ack, r_rep.op);
+
+        const corrupt = try allocator.dupe(u8, replayed);
+        defer allocator.free(corrupt);
+        std.mem.writeInt(u64, corrupt[16..24], 9999, .little);
+        corrupt[corrupt.len - 1] ^= 0xff;
+        const cor_pay = try allocator.alloc(u8, 32 + corrupt.len);
+        defer allocator.free(cor_pay);
+        @memcpy(cor_pay[0..32], &cr_topic);
+        @memcpy(cor_pay[32..], corrupt);
+        try wire.writeFrameBlocking(allocator, rfd, .put_frame, 0, cor_pay);
+        var r_cor = try wire.readFrameBlocking(allocator, rfd);
+        defer r_cor.deinit(allocator);
+        try testing.expectEqual(wire.Op.ack, r_cor.op);
+
+        _ = try wsa.writeFileDirect(wsa.disk_actor, "crash.txt", "v3-healthy\n");
+        const pushed3 = try c2.pushWorkspace(&wsa);
+        try testing.expectEqual(@as(usize, 1), pushed3);
+
+        var b2 = try client_mod.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, secret);
+        defer b2.deinit();
+        const pr2 = try b2.pullWorkspace(&wsb, 0);
+        try testing.expectEqual(@as(usize, 1), pr2.applied);
+        try testing.expect(b2.quarantined_count >= 1);
+
+        const final_txt = (try wsb.history.readFileAt(allocator, "crash.txt", null)).?;
+        defer allocator.free(final_txt);
+        try testing.expectEqualStrings("v3-healthy\n", final_txt);
+    }
+
+    {
+        const sl_dir = "/tmp/0ndb-verify-slowloris-relay";
+        cleanDir(io, sl_dir);
+        defer cleanDir(io, sl_dir);
+        var sl_srv = try relay.RelayServer.start(allocator, io, sl_dir, .{ 127, 0, 0, 1 }, 0, secret, true);
+        defer sl_srv.deinit();
+        sl_srv.auth_timeout_ms = 50;
+        sl_srv.max_conns_per_ip = 2;
+        const sl_port = sl_srv.port;
+
+        const sl_thread = try std.Thread.spawn(.{}, relayThreadMain, .{&sl_srv});
+        var stopped = false;
+        defer if (!stopped) {
+            sl_srv.stop();
+            sl_thread.join();
+        };
+
+        var fds: [3]std.posix.fd_t = undefined;
+        var opened: usize = 0;
+        defer for (0..opened) |idx| {
+            _ = linux.close(fds[idx]);
+        };
+        for (0..3) |idx| {
+            const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(s_rc));
+            fds[idx] = @intCast(s_rc);
+            opened += 1;
+            var addr = linux.sockaddr.in{
+                .family = linux.AF.INET,
+                .port = std.mem.nativeToBig(u16, sl_port),
+                .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+            };
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.connect(fds[idx], @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+        }
+
+        var probe: [8]u8 = undefined;
+        var p3 = [_]linux.pollfd{.{ .fd = fds[2], .events = linux.POLL.IN, .revents = 0 }};
+        const prc3 = linux.poll(&p3, 1, 500);
+        try testing.expect(linux.errno(prc3) == .SUCCESS and prc3 > 0);
+        const rrc3 = linux.read(fds[2], &probe, probe.len);
+        try testing.expect(linux.errno(rrc3) != .SUCCESS or rrc3 == 0);
+
+        io.sleep(.fromMilliseconds(140), .awake) catch {};
+        var p0 = [_]linux.pollfd{.{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 }};
+        const prc0 = linux.poll(&p0, 1, 500);
+        try testing.expect(linux.errno(prc0) == .SUCCESS and prc0 > 0);
+        const rrc0 = linux.read(fds[0], &probe, probe.len);
+        try testing.expect(linux.errno(rrc0) != .SUCCESS or rrc0 == 0);
+
+        const t0 = ondb.core.id.nowMs(io);
+        sl_srv.stop();
+        sl_thread.join();
+        stopped = true;
+        const elapsed = ondb.core.id.nowMs(io) -| t0;
+        try testing.expect(elapsed < 80);
+    }
+}
+
 fn relayThreadMain(srv: *ondb.sync.relay.RelayServer) void {
     srv.run() catch {};
 }
@@ -3053,21 +3671,29 @@ test "dumb protected E2EE relay syncs session list, statuses, Merkle paginated m
         const head_pid = thread_a.head_page.?;
         const keyed_id = ondb.store.crypto.deriveBlobLookupId(master_key, thread_topic, head_pid);
         try testing.expect(!std.mem.eql(u8, &head_pid, &keyed_id));
+        const scoped_id = ondb.sync.relay.scopedBlobKey(thread_topic, keyed_id);
+        try testing.expect(!std.mem.eql(u8, &keyed_id, &scoped_id));
 
         var raw_hex: [64]u8 = undefined;
         _ = ondb.core.id.formatHashHex(head_pid, &raw_hex);
         var keyed_hex: [64]u8 = undefined;
         _ = ondb.core.id.formatHashHex(keyed_id, &keyed_hex);
+        var scoped_hex: [64]u8 = undefined;
+        _ = ondb.core.id.formatHashHex(scoped_id, &scoped_hex);
 
         const raw_path = try std.fmt.allocPrint(allocator, "{s}/blobs/{s}", .{ relay_dir, raw_hex });
         defer allocator.free(raw_path);
         const keyed_path = try std.fmt.allocPrint(allocator, "{s}/blobs/{s}", .{ relay_dir, keyed_hex });
         defer allocator.free(keyed_path);
+        const scoped_path = try std.fmt.allocPrint(allocator, "{s}/blobs/{s}", .{ relay_dir, scoped_hex });
+        defer allocator.free(scoped_path);
 
         const raw_exists = if (std.Io.Dir.cwd().statFile(io, raw_path, .{})) |_| true else |_| false;
         const keyed_exists = if (std.Io.Dir.cwd().statFile(io, keyed_path, .{})) |_| true else |_| false;
+        const scoped_exists = if (std.Io.Dir.cwd().statFile(io, scoped_path, .{})) |_| true else |_| false;
         try testing.expect(!raw_exists);
-        try testing.expect(keyed_exists);
+        try testing.expect(!keyed_exists);
+        try testing.expect(scoped_exists);
 
         const f1 = try ondb.sync.client.sealFramePayload(allocator, io, master_key, thread_topic, 99, 1, "secret-msg");
         defer allocator.free(f1);
@@ -3209,7 +3835,17 @@ test "dumb protected E2EE relay syncs session list, statuses, Merkle paginated m
             for (range_frames) |*f| f.deinit(allocator);
             allocator.free(range_frames);
         }
-        try testing.expect(range_frames.len >= 3);
+        try testing.expectEqual(@as(usize, 0), range_frames.len);
+
+        var fresh_reader = try ondb.sync.client.SyncClient.connect(allocator, io, .{ 127, 0, 0, 1 }, port, master_key, auth_secret);
+        defer fresh_reader.deinit();
+        try fresh_reader.authorizeTopic(thread_topic, ondb.sync.wire.PERM_READ);
+        const fresh_frames = try fresh_reader.getEncryptedRange(allocator, thread_topic, 0, 100);
+        defer {
+            for (fresh_frames) |*f| f.deinit(allocator);
+            allocator.free(fresh_frames);
+        }
+        try testing.expect(fresh_frames.len >= 3);
 
         var live3_ev = try dev_b.readLiveEvent(allocator);
         defer live3_ev.deinit(allocator);
@@ -3295,6 +3931,8 @@ test "dumb protected E2EE relay syncs session list, statuses, Merkle paginated m
             try testing.expectEqualStrings("rec-13", v2.payload);
         }
     }
+
+    try runSyncHardeningChecks(allocator, io);
 }
 
 fn testLruSliceSize(s: []u8) usize {
