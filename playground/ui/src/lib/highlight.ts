@@ -52,7 +52,49 @@ export function langFromPath(path: string): string | null {
 
 let core: Promise<HighlighterCore> | null = null
 const loaded = new Set<string>()
+const MAX_CACHE_ENTRIES = 64
+const MAX_CACHE_CHARS = 4 * 1024 * 1024
 const cache = new Map<string, string>()
+let cacheChars = 0
+
+function hashContent(code: string): string {
+  let h1 = 0x811c9dc5
+  let h2 = 0x01000193
+  for (let i = 0; i < code.length; i++) {
+    const ch = code.charCodeAt(i)
+    h1 ^= ch
+    h1 = Math.imul(h1, 0x01000193)
+    h2 ^= ch ^ (i & 0xff)
+    h2 = Math.imul(h2, 0x85ebca6b)
+  }
+  return `${code.length}:${(h1 >>> 0).toString(16)}:${(h2 >>> 0).toString(16)}`
+}
+
+function cacheGet(key: string): string | undefined {
+  const hit = cache.get(key)
+  if (hit === undefined) return undefined
+  cache.delete(key)
+  cache.set(key, hit)
+  return hit
+}
+
+function cacheSet(key: string, html: string) {
+  if (html.length > MAX_CACHE_CHARS) return
+  const prev = cache.get(key)
+  if (prev !== undefined) {
+    cacheChars -= prev.length
+    cache.delete(key)
+  }
+  while (cache.size >= MAX_CACHE_ENTRIES || cacheChars + html.length > MAX_CACHE_CHARS) {
+    const oldest = cache.keys().next().value
+    if (oldest === undefined) break
+    const val = cache.get(oldest)
+    if (val !== undefined) cacheChars -= val.length
+    cache.delete(oldest)
+  }
+  cache.set(key, html)
+  cacheChars += html.length
+}
 
 function highlighter() {
   core ??= (async () => {
@@ -74,8 +116,8 @@ function highlighter() {
 export async function highlight(code: string, lang: string): Promise<string | null> {
   const key = resolveLang(lang)
   if (!key) return null
-  const ck = `${key}\u0000${code}`
-  const hit = cache.get(ck)
+  const ck = `${key}:${hashContent(code)}`
+  const hit = cacheGet(ck)
   if (hit) return hit
   const hl = await highlighter()
   if (!loaded.has(key)) {
@@ -89,7 +131,6 @@ export async function highlight(code: string, lang: string): Promise<string | nu
     themes: { light: 'github-light-default', dark: 'github-dark-default' },
     defaultColor: 'light',
   })
-  if (cache.size > 400) cache.clear()
-  cache.set(ck, html)
+  cacheSet(ck, html)
   return html
 }

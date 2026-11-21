@@ -126,3 +126,37 @@ export function changedLinesFromSplices(afterContent: string, splices: TextSplic
   }
   return [...lines].sort((a, b) => a - b)
 }
+
+export interface SpliceOp {
+  at: number
+  del: number
+  ins: number
+}
+
+export function computeUtf8Splices(before: string, after: string): { splices: SpliceOp[]; inserted: string } {
+  if (before === after) return { splices: [], inserted: '' }
+  const a = enc.encode(before)
+  const b = enc.encode(after)
+  let prefix = 0
+  const minLen = Math.min(a.length, b.length)
+  while (prefix < minLen && a[prefix] === b[prefix]) prefix++
+  while (prefix > 0 && ((prefix < a.length && (a[prefix] & 0xc0) === 0x80) || (prefix < b.length && (b[prefix] & 0xc0) === 0x80))) {
+    prefix--
+  }
+  let suffix = 0
+  const maxSuffix = minLen - prefix
+  while (suffix < maxSuffix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++
+  while (
+    suffix > 0 &&
+    ((a[a.length - suffix] & 0xc0) === 0x80 || (b[b.length - suffix] & 0xc0) === 0x80)
+  ) {
+    suffix--
+  }
+  const del = a.length - prefix - suffix
+  const insBytes = b.subarray(prefix, b.length - suffix)
+  return {
+    splices: [{ at: prefix, del, ins: insBytes.length }],
+    inserted: dec.decode(insBytes),
+  }
+}
+

@@ -27,9 +27,39 @@ const vcs = @import("../fs/vcs.zig");
 const wt_mod = @import("../fs/worktrees.zig");
 
 pub const MAX_CONNS: usize = 128;
+pub const MAX_WORKERS: usize = 32;
 pub const MAX_SSE_CLIENTS: usize = 64;
+pub const MAX_SSE_PENDING_BYTES: usize = 256 * 1024;
+pub const SSE_KEEPALIVE_MS: u64 = 15_000;
+pub const REQUEST_READ_TIMEOUT_MS: u64 = 15_000;
+pub const KEEPALIVE_IDLE_MS: u64 = 15_000;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CHUNK_LINE_BYTES: usize = 4096;
+pub const MAX_TRAILER_BYTES: usize = 64 * 1024;
+pub const MAX_MSG_CHAIN_DEPTH: usize = 100_000;
+const CONFLICTS_MAGIC: u32 = 0x43464C31;
+
+pub const ServerConfig = struct {
+    default_access: iface.AccessMode = .accept_edits,
+    prewarm_models: bool = true,
+};
+
+pub fn parseAccessMode(s: []const u8) ?iface.AccessMode {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "read_only") or std.ascii.eqlIgnoreCase(trimmed, "plan")) return .plan;
+    if (std.ascii.eqlIgnoreCase(trimmed, "accept_edits")) return .accept_edits;
+    if (std.ascii.eqlIgnoreCase(trimmed, "full")) return .full;
+    return null;
+}
+
+fn resolveDefaultAccess(allocator: Allocator, io: Io) iface.AccessMode {
+    if (readEnvVarAlloc(allocator, io, "ONDB_PLAYGROUND_ACCESS")) |raw| {
+        defer allocator.free(raw);
+        if (parseAccessMode(raw)) |mode| return mode;
+    }
+    return .accept_edits;
+}
 
 pub const HttpFraming = union(enum) {
     content_length: usize,
@@ -65,6 +95,7 @@ pub fn parseHttpFraming(headers: []const u8) error{ BadFraming, PayloadTooLarge 
                 const tok = std.mem.trim(u8, raw, " \t");
                 if (tok.len == 0) return error.BadFraming;
                 if (std.ascii.eqlIgnoreCase(tok, "chunked")) {
+                    if (is_chunked) return error.BadFraming;
                     is_chunked = true;
                     saw_tok = true;
                 } else {
@@ -79,6 +110,216 @@ pub fn parseHttpFraming(headers: []const u8) error{ BadFraming, PayloadTooLarge 
     return .{ .content_length = cl_val orelse 0 };
 }
 
+fn isValidLocalHostPort(host_port: []const u8, out_port: *?u16) bool {
+    out_port.* = null;
+    if (host_port.len == 0) return false;
+    var host: []const u8 = host_port;
+    var port_str: ?[]const u8 = null;
+    if (host_port[0] == '[') {
+        const close_b = std.mem.indexOfScalar(u8, host_port, ']') orelse return false;
+        host = host_port[0 .. close_b + 1];
+        const tail = host_port[close_b + 1 ..];
+        if (tail.len > 0) {
+            if (tail[0] != ':') return false;
+            port_str = tail[1..];
+        }
+        if (!std.mem.eql(u8, host, "[::1]")) return false;
+    } else {
+        if (std.mem.indexOfScalar(u8, host_port, ':')) |colon| {
+            host = host_port[0..colon];
+            port_str = host_port[colon + 1 ..];
+        }
+        const ok_host = std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1");
+        if (!ok_host) return false;
+    }
+    if (port_str) |ps| {
+        if (ps.len == 0 or ps.len > 5) return false;
+        for (ps) |c| {
+            if (c < '0' or c > '9') return false;
+        }
+        const p = std.fmt.parseInt(u16, ps, 10) catch return false;
+        if (p == 0) return false;
+        out_port.* = p;
+    }
+    return true;
+}
+
+pub fn validateHostHeader(headers: []const u8) bool {
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = it.next();
+    var host_val: ?[]const u8 = null;
+    while (it.next()) |line| {
+        if (line.len >= 5 and std.ascii.eqlIgnoreCase(line[0..5], "host:")) {
+            if (host_val != null) return false;
+            host_val = std.mem.trim(u8, line[5..], " \t");
+        }
+    }
+    const hv = host_val orelse return false;
+    var parsed_port: ?u16 = null;
+    return isValidLocalHostPort(hv, &parsed_port);
+}
+
+pub fn validateOriginHeaders(headers: []const u8, expected_port: u16) bool {
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = it.next();
+    var saw_origin = false;
+    var saw_sfs = false;
+    while (it.next()) |line| {
+        if (line.len >= 15 and std.ascii.eqlIgnoreCase(line[0..15], "sec-fetch-site:")) {
+            if (saw_sfs) return false;
+            saw_sfs = true;
+            const sfs = std.mem.trim(u8, line[15..], " \t");
+            if (!std.ascii.eqlIgnoreCase(sfs, "same-origin") and !std.ascii.eqlIgnoreCase(sfs, "none")) {
+                return false;
+            }
+        } else if (line.len >= 7 and std.ascii.eqlIgnoreCase(line[0..7], "origin:")) {
+            if (saw_origin) return false;
+            saw_origin = true;
+            const orig = std.mem.trim(u8, line[7..], " \t");
+            var rest: []const u8 = "";
+            var default_port: u16 = 80;
+            if (orig.len > 7 and std.ascii.eqlIgnoreCase(orig[0..7], "http://")) {
+                rest = orig[7..];
+                default_port = 80;
+            } else if (orig.len > 8 and std.ascii.eqlIgnoreCase(orig[0..8], "https://")) {
+                rest = orig[8..];
+                default_port = 443;
+            } else {
+                return false;
+            }
+            if (std.mem.indexOfAny(u8, rest, "/?#@ \t") != null) return false;
+            var parsed_port: ?u16 = null;
+            if (!isValidLocalHostPort(rest, &parsed_port)) return false;
+            if (expected_port != 0) {
+                const eff_port = parsed_port orelse default_port;
+                if (eff_port != expected_port) return false;
+            }
+        }
+    }
+    return true;
+}
+
+pub fn hasJsonContentType(headers: []const u8) bool {
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = it.next();
+    var found = false;
+    while (it.next()) |line| {
+        if (line.len >= 13 and std.ascii.eqlIgnoreCase(line[0..13], "content-type:")) {
+            const raw = std.mem.trim(u8, line[13..], " \t");
+            const semi = std.mem.indexOfScalar(u8, raw, ';') orelse raw.len;
+            const media = std.mem.trim(u8, raw[0..semi], " \t");
+            if (!std.ascii.eqlIgnoreCase(media, "application/json")) return false;
+            found = true;
+        }
+    }
+    return found;
+}
+
+pub fn isMutationMethod(method: []const u8) bool {
+    return !std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD");
+}
+
+pub const ChunkedStatus = enum {
+    need_more,
+    complete,
+};
+
+pub const ChunkedDecoder = struct {
+    state: enum { size_line, chunk_data, chunk_crlf, trailers, done } = .size_line,
+    cursor: usize = 0,
+    remaining_chunk: usize = 0,
+    trailer_bytes: usize = 0,
+    max_bytes: usize,
+    out: std.ArrayList(u8) = .empty,
+
+    pub fn init(max_bytes: usize) ChunkedDecoder {
+        return .{ .max_bytes = max_bytes };
+    }
+
+    pub fn deinit(self: *ChunkedDecoder, allocator: Allocator) void {
+        self.out.deinit(allocator);
+    }
+
+    pub fn feed(
+        self: *ChunkedDecoder,
+        allocator: Allocator,
+        raw: []const u8,
+    ) error{ BadFraming, PayloadTooLarge, OutOfMemory }!ChunkedStatus {
+        while (true) {
+            switch (self.state) {
+                .size_line => {
+                    const crlf = std.mem.indexOfPos(u8, raw, self.cursor, "\r\n") orelse {
+                        if (raw.len - self.cursor > MAX_CHUNK_LINE_BYTES) return error.BadFraming;
+                        return .need_more;
+                    };
+                    if (crlf - self.cursor > MAX_CHUNK_LINE_BYTES) return error.BadFraming;
+                    const line = raw[self.cursor..crlf];
+                    const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+                    const hex_str = std.mem.trim(u8, line[0..semi], " \t");
+                    if (hex_str.len == 0) return error.BadFraming;
+                    for (hex_str) |c| {
+                        if (!std.ascii.isHex(c)) return error.BadFraming;
+                    }
+                    const chunk_u64 = std.fmt.parseInt(u64, hex_str, 16) catch return error.PayloadTooLarge;
+                    self.cursor = crlf + 2;
+                    if (chunk_u64 == 0) {
+                        self.state = .trailers;
+                        continue;
+                    }
+                    if (chunk_u64 > self.max_bytes) return error.PayloadTooLarge;
+                    const chunk_len: usize = @intCast(chunk_u64);
+                    if (chunk_len > self.max_bytes - self.out.items.len) return error.PayloadTooLarge;
+                    self.remaining_chunk = chunk_len;
+                    self.state = .chunk_data;
+                },
+                .chunk_data => {
+                    const avail = raw.len - self.cursor;
+                    if (avail == 0) return .need_more;
+                    const take = @min(avail, self.remaining_chunk);
+                    try self.out.appendSlice(allocator, raw[self.cursor .. self.cursor + take]);
+                    self.cursor += take;
+                    self.remaining_chunk -= take;
+                    if (self.remaining_chunk == 0) {
+                        self.state = .chunk_crlf;
+                    } else {
+                        return .need_more;
+                    }
+                },
+                .chunk_crlf => {
+                    if (raw.len - self.cursor < 2) return .need_more;
+                    if (raw[self.cursor] != '\r' or raw[self.cursor + 1] != '\n') return error.BadFraming;
+                    self.cursor += 2;
+                    self.state = .size_line;
+                },
+                .trailers => {
+                    const tcrlf = std.mem.indexOfPos(u8, raw, self.cursor, "\r\n") orelse {
+                        if (self.trailer_bytes + (raw.len - self.cursor) > MAX_TRAILER_BYTES) return error.BadFraming;
+                        return .need_more;
+                    };
+                    if (tcrlf == self.cursor) {
+                        self.cursor += 2;
+                        self.state = .done;
+                        return .complete;
+                    }
+                    const line_len = (tcrlf - self.cursor) + 2;
+                    self.trailer_bytes = std.math.add(usize, self.trailer_bytes, line_len) catch return error.BadFraming;
+                    if (self.trailer_bytes > MAX_TRAILER_BYTES) return error.BadFraming;
+                    self.cursor = tcrlf + 2;
+                },
+                .done => return .complete,
+            }
+        }
+    }
+
+    pub fn takeBody(self: *ChunkedDecoder, allocator: Allocator) ![]u8 {
+        return try self.out.toOwnedSlice(allocator);
+    }
+
+    pub fn consumed(self: *const ChunkedDecoder) usize {
+        return self.cursor;
+    }
+};
+
 pub const ChunkedResult = union(enum) {
     need_more: void,
     complete: struct {
@@ -92,53 +333,30 @@ pub fn decodeChunkedBody(
     raw: []const u8,
     max_bytes: usize,
 ) error{ BadFraming, PayloadTooLarge, OutOfMemory }!ChunkedResult {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pos: usize = 0;
+    var dec = ChunkedDecoder.init(max_bytes);
+    defer dec.deinit(allocator);
+    const st = try dec.feed(allocator, raw);
+    if (st == .need_more) return .need_more;
+    return .{ .complete = .{
+        .body = try dec.takeBody(allocator),
+        .consumed = dec.consumed(),
+    } };
+}
 
-    while (true) {
-        const crlf = std.mem.indexOfPos(u8, raw, pos, "\r\n") orelse {
-            out.deinit(allocator);
-            return .need_more;
-        };
-        const line = raw[pos..crlf];
-        const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
-        const hex_str = std.mem.trim(u8, line[0..semi], " \t");
-        if (hex_str.len == 0) return error.BadFraming;
-        for (hex_str) |c| {
-            if (!std.ascii.isHex(c)) return error.BadFraming;
-        }
-        const chunk_u64 = std.fmt.parseInt(u64, hex_str, 16) catch return error.PayloadTooLarge;
-        pos = crlf + 2;
-
-        if (chunk_u64 == 0) {
-            while (true) {
-                const tcrlf = std.mem.indexOfPos(u8, raw, pos, "\r\n") orelse {
-                    out.deinit(allocator);
-                    return .need_more;
-                };
-                if (tcrlf == pos) {
-                    pos += 2;
-                    break;
-                }
-                pos = tcrlf + 2;
-            }
-            return .{ .complete = .{
-                .body = try out.toOwnedSlice(allocator),
-                .consumed = pos,
-            } };
-        }
-
-        if (chunk_u64 > max_bytes) return error.PayloadTooLarge;
-        const chunk_len: usize = @intCast(chunk_u64);
-        if (chunk_len > max_bytes - out.items.len) return error.PayloadTooLarge;
-        if (pos + chunk_len + 2 > raw.len) {
-            out.deinit(allocator);
-            return .need_more;
-        }
-        if (raw[pos + chunk_len] != '\r' or raw[pos + chunk_len + 1] != '\n') return error.BadFraming;
-        try out.appendSlice(allocator, raw[pos .. pos + chunk_len]);
-        pos += chunk_len + 2;
+pub fn validateSplices(
+    splices: []const diff_mod.Splice,
+    base_len: u64,
+    inserted_len: usize,
+) error{InvalidSplice}!void {
+    var prev_end: u64 = 0;
+    var total_ins: u64 = 0;
+    for (splices) |s| {
+        if (s.at < prev_end) return error.InvalidSplice;
+        const end = std.math.add(u64, s.at, s.del) catch return error.InvalidSplice;
+        if (end > base_len) return error.InvalidSplice;
+        total_ins = std.math.add(u64, total_ins, s.ins) catch return error.InvalidSplice;
+        if (total_ins > inserted_len or total_ins > MAX_BODY_BYTES) return error.InvalidSplice;
+        prev_end = end;
     }
 }
 
@@ -156,12 +374,10 @@ pub fn isSafeRelPath(path: []const u8) bool {
     if (path[0] == '/' or path[path.len - 1] == '/') return false;
     if (std.mem.indexOfAny(u8, path, "\\\x00") != null) return false;
     var it = std.mem.splitScalar(u8, path, '/');
-    var first = true;
     while (it.next()) |seg| {
         if (seg.len == 0) return false;
         if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
-        if (first and (std.mem.eql(u8, seg, ".0ndb") or std.mem.eql(u8, seg, ".git"))) return false;
-        first = false;
+        if (std.mem.eql(u8, seg, ".0ndb") or std.mem.eql(u8, seg, ".git")) return false;
     }
     return true;
 }
@@ -603,7 +819,7 @@ const InteractiveMock = struct {
         self.interrupted.store(false, .release);
         self.step_idx = 0;
         self.turn_id = turn;
-        self.clearStaged();
+        self.clearStagedLocked();
     }
 
     fn steerImpl(ptr: *anyopaque, prompt: []const u8, _: ?[]const u8) anyerror!iface.SteerOutcome {
@@ -623,17 +839,31 @@ const InteractiveMock = struct {
 
     fn closeImpl(ptr: *anyopaque) void {
         const self: *InteractiveMock = @ptrCast(@alignCast(ptr));
-        if (!self.closed) {
-            self.closed = true;
-            if (self.prompt) |p| self.allocator.free(p);
-            if (self.steered_prompt) |p| self.allocator.free(p);
-            self.clearStaged();
-            self.allocator.free(self.workspace_root);
-            self.allocator.destroy(self);
+        self.mu.lockUncancelable(self.io);
+        if (self.closed) {
+            self.mu.unlock(self.io);
+            return;
         }
+        self.closed = true;
+        const p = self.prompt;
+        const sp = self.steered_prompt;
+        const stp = self.staged_path;
+        const std_d = self.staged_data;
+        self.prompt = null;
+        self.steered_prompt = null;
+        self.staged_path = null;
+        self.staged_data = null;
+        self.mu.unlock(self.io);
+
+        if (p) |x| self.allocator.free(x);
+        if (sp) |x| self.allocator.free(x);
+        if (stp) |x| self.allocator.free(x);
+        if (std_d) |x| self.allocator.free(x);
+        self.allocator.free(self.workspace_root);
+        self.allocator.destroy(self);
     }
 
-    fn clearStaged(self: *InteractiveMock) void {
+    fn clearStagedLocked(self: *InteractiveMock) void {
         if (self.staged_path) |p| self.allocator.free(p);
         if (self.staged_data) |d| self.allocator.free(d);
         self.staged_path = null;
@@ -644,19 +874,29 @@ const InteractiveMock = struct {
         const p = try self.allocator.dupe(u8, rel);
         errdefer self.allocator.free(p);
         const d = try self.allocator.dupe(u8, data);
-        self.clearStaged();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.clearStagedLocked();
         self.staged_path = p;
         self.staged_data = d;
     }
 
     fn flushStaged(self: *InteractiveMock) void {
-        defer self.clearStaged();
-        const rel = self.staged_path orelse return;
-        const data = self.staged_data orelse return;
+        self.mu.lockUncancelable(self.io);
+        const rel = self.staged_path;
+        const data = self.staged_data;
+        self.staged_path = null;
+        self.staged_data = null;
+        self.mu.unlock(self.io);
+
+        defer if (rel) |p| self.allocator.free(p);
+        defer if (data) |d| self.allocator.free(d);
+        const r = rel orelse return;
+        const d = data orelse return;
         var wd = Io.Dir.cwd().openDir(self.io, self.workspace_root, .{}) catch return;
         defer wd.close(self.io);
-        if (std.fs.path.dirname(rel)) |parent| wd.createDirPath(self.io, parent) catch return;
-        wd.writeFile(self.io, .{ .sub_path = rel, .data = data }) catch {};
+        if (std.fs.path.dirname(r)) |parent| wd.createDirPath(self.io, parent) catch return;
+        wd.writeFile(self.io, .{ .sub_path = r, .data = d }) catch {};
     }
 
     fn readWorkspaceFile(self: *InteractiveMock, rel: []const u8) ?[]u8 {
@@ -678,20 +918,29 @@ const InteractiveMock = struct {
 
     fn nextImpl(ptr: *anyopaque) anyerror!?iface.Event {
         const self: *InteractiveMock = @ptrCast(@alignCast(ptr));
+        self.mu.lockUncancelable(self.io);
+        if (self.closed) {
+            self.mu.unlock(self.io);
+            return null;
+        }
         const idx = self.step_idx;
         self.step_idx += 1;
+        const tid_num = self.turn_id;
+        self.mu.unlock(self.io);
 
         if (idx == 0) {
             return .{ .kind = .{ .session_started = .{ .native_id = try self.allocator.dupe(u8, "sim-session") } } };
         }
         if (idx == 1) {
-            const tid = try std.fmt.allocPrint(self.allocator, "sim-turn-{d}", .{self.turn_id});
+            const tid = try std.fmt.allocPrint(self.allocator, "sim-turn-{d}", .{tid_num});
             return .{ .kind = .{ .turn_started = .{ .native_turn_id = tid } } };
         }
 
         if (self.interrupted.load(.acquire)) {
             if (idx < 100) {
+                self.mu.lockUncancelable(self.io);
                 self.step_idx = 100;
+                self.mu.unlock(self.io);
                 return .{ .kind = .{ .turn_ended = .{
                     .ok = false,
                     .err_msg = try self.allocator.dupe(u8, "interrupted"),
@@ -705,7 +954,9 @@ const InteractiveMock = struct {
         self.io.sleep(Io.Duration.fromMilliseconds(220), .awake) catch {};
 
         if (self.interrupted.load(.acquire)) {
+            self.mu.lockUncancelable(self.io);
             self.step_idx = 100;
+            self.mu.unlock(self.io);
             return .{ .kind = .{ .turn_ended = .{
                 .ok = false,
                 .err_msg = try self.allocator.dupe(u8, "interrupted"),
@@ -713,8 +964,19 @@ const InteractiveMock = struct {
         }
 
         self.mu.lockUncancelable(self.io);
-        const prompt_copy = try self.allocator.dupe(u8, self.prompt orelse "");
-        const steer_copy: ?[]u8 = if (self.steered_prompt) |sp| try self.allocator.dupe(u8, sp) else null;
+        const prompt_copy = self.allocator.dupe(u8, self.prompt orelse "") catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        const steer_copy: ?[]u8 = if (self.steered_prompt) |sp|
+            self.allocator.dupe(u8, sp) catch |err| {
+                self.mu.unlock(self.io);
+                self.allocator.free(prompt_copy);
+                return err;
+            }
+        else
+            null;
+        const cur_turn_id = self.turn_id;
         self.mu.unlock(self.io);
         defer self.allocator.free(prompt_copy);
         defer if (steer_copy) |s| self.allocator.free(s);
@@ -748,7 +1010,7 @@ const InteractiveMock = struct {
                 defer self.allocator.free(label);
                 std.mem.replaceScalar(u8, label, '\n', ' ');
                 std.mem.replaceScalar(u8, label, '\r', ' ');
-                const line = try std.fmt.allocPrint(self.allocator, "- turn {d}: {s}\n", .{ self.turn_id, label });
+                const line = try std.fmt.allocPrint(self.allocator, "- turn {d}: {s}\n", .{ cur_turn_id, label });
                 defer self.allocator.free(line);
                 const existing = self.readWorkspaceFile("CHANGELOG.md");
                 defer if (existing) |e| self.allocator.free(e);
@@ -772,12 +1034,12 @@ const InteractiveMock = struct {
                 return try toolFinishedEvent(self.allocator, "tool-2", "Appended 1 line to CHANGELOG.md", false);
             },
             8 => {
-                const rel = try std.fmt.allocPrint(self.allocator, "src/generated/turn_{d}.zig", .{self.turn_id});
+                const rel = try std.fmt.allocPrint(self.allocator, "src/generated/turn_{d}.zig", .{cur_turn_id});
                 defer self.allocator.free(rel);
                 const body = try std.fmt.allocPrint(
                     self.allocator,
                     "pub const TURN: u64 = {d};\npub const STEERED = {s};\npub const FILES_TOUCHED = 3;\n\npub fn id() u64 {{\n    return TURN;\n}}\n",
-                    .{ self.turn_id, if (steer_copy != null) "true" else "false" },
+                    .{ cur_turn_id, if (steer_copy != null) "true" else "false" },
                 );
                 defer self.allocator.free(body);
                 try self.stageWrite(rel, body);
@@ -787,7 +1049,7 @@ const InteractiveMock = struct {
             },
             9 => {
                 self.flushStaged();
-                const output = try std.fmt.allocPrint(self.allocator, "Created src/generated/turn_{d}.zig", .{self.turn_id});
+                const output = try std.fmt.allocPrint(self.allocator, "Created src/generated/turn_{d}.zig", .{cur_turn_id});
                 defer self.allocator.free(output);
                 return try toolFinishedEvent(self.allocator, "tool-3", output, false);
             },
@@ -808,7 +1070,7 @@ const InteractiveMock = struct {
                 .text = try std.fmt.allocPrint(
                     self.allocator,
                     "Updated `app.zig`, appended to `CHANGELOG.md`, created `src/generated/turn_{d}.zig`, ran the tests, and sealed the turn's causal version into the append-only WAL. ",
-                    .{self.turn_id},
+                    .{cur_turn_id},
                 ),
             } } },
             15 => {
@@ -833,7 +1095,9 @@ const InteractiveMock = struct {
             },
             17 => return .{ .kind = .{ .usage = .{ .input_tokens = 1840, .output_tokens = 212 } } },
             18 => {
+                self.mu.lockUncancelable(self.io);
                 self.step_idx = 100;
+                self.mu.unlock(self.io);
                 return .{ .kind = .{ .turn_ended = .{ .ok = true, .err_msg = null } } };
             },
             else => return null,
@@ -1146,6 +1410,65 @@ const ActiveTurnHandle = struct {
     interrupted: *std.atomic.Value(bool),
 };
 
+const SseClient = struct {
+    fd: posix.fd_t,
+    pending: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *SseClient, allocator: Allocator) void {
+        self.pending.deinit(allocator);
+    }
+};
+
+fn loadOrCreateMasterKey(allocator: Allocator, io: Io, state_path: []const u8) !crypto.Key {
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/sync_master.key", .{state_path});
+    defer allocator.free(key_path);
+    const key_path_buf = try allocator.alloc(u8, key_path.len + 1);
+    defer allocator.free(key_path_buf);
+    @memcpy(key_path_buf[0..key_path.len], key_path);
+    key_path_buf[key_path.len] = 0;
+    const key_path_z: [*:0]const u8 = @ptrCast(key_path_buf.ptr);
+
+    const open_r = linux.open(key_path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(open_r) == .SUCCESS) {
+        const fd: posix.fd_t = @intCast(open_r);
+        defer _ = linux.close(fd);
+        var key: crypto.Key = undefined;
+        var got: usize = 0;
+        while (got < key.len) {
+            const rrc = linux.read(fd, key[got..].ptr, key.len - got);
+            const re = linux.errno(rrc);
+            if (re == .INTR) continue;
+            if (re != .SUCCESS or rrc == 0) break;
+            got += rrc;
+        }
+        if (got == key.len) {
+            _ = linux.fchmod(fd, 0o600);
+            return key;
+        }
+    }
+
+    var key: crypto.Key = undefined;
+    io.random(&key);
+    const open_w = linux.open(
+        key_path_z,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+        0o600,
+    );
+    if (linux.errno(open_w) != .SUCCESS) return error.MasterKeyWriteFailed;
+    const wfd: posix.fd_t = @intCast(open_w);
+    defer _ = linux.close(wfd);
+    _ = linux.fchmod(wfd, 0o600);
+    var off: usize = 0;
+    while (off < key.len) {
+        const wrc = linux.write(wfd, key[off..].ptr, key.len - off);
+        const we = linux.errno(wrc);
+        if (we == .INTR) continue;
+        if (we != .SUCCESS or wrc == 0) return error.MasterKeyWriteFailed;
+        off += wrc;
+    }
+    return key;
+}
+
 pub const PlaygroundServer = struct {
     allocator: Allocator,
     io: Io,
@@ -1162,17 +1485,24 @@ pub const PlaygroundServer = struct {
     vault_id: u128,
     auth_secret: [32]u8,
     master_key: crypto.Key,
+    default_access: iface.AccessMode,
     dev_a: client_mod.SyncClient,
     dev_b: client_mod.SyncClient,
     dev_b_dir: Io.Dir,
     dev_b_pages: blobs_mod.BlobStore,
     dev_b_path: []u8,
-    sse_clients: std.ArrayList(posix.fd_t),
+    sse_clients: std.ArrayList(SseClient),
+    sse_keepalive_thread: std.Thread,
     listen_fd: posix.fd_t,
     http_port: u16,
     running: std.atomic.Value(bool),
     active_threads: std.atomic.Value(usize),
     active_conns: std.atomic.Value(usize),
+    active_workers: std.atomic.Value(usize),
+    busy_threads_mu: Io.Mutex,
+    busy_threads: std.AutoHashMapUnmanaged(u128, void),
+    client_fds_mu: Io.Mutex,
+    client_fds: std.AutoHashMapUnmanaged(posix.fd_t, void),
     active_handles_mu: Io.Mutex,
     active_handles: std.AutoHashMapUnmanaged(u128, ActiveTurnHandle),
     trace_mu: Io.Mutex,
@@ -1194,6 +1524,18 @@ pub const PlaygroundServer = struct {
         io: Io,
         workspace_path: []const u8,
         port: u16,
+    ) !*PlaygroundServer {
+        return startWithConfig(allocator, io, workspace_path, port, .{
+            .default_access = resolveDefaultAccess(allocator, io),
+        });
+    }
+
+    pub fn startWithConfig(
+        allocator: Allocator,
+        io: Io,
+        workspace_path: []const u8,
+        port: u16,
+        config: ServerConfig,
     ) !*PlaygroundServer {
         ignoreSigpipe();
         const state_path = try std.fmt.allocPrint(allocator, "{s}/.0ndb", .{workspace_path});
@@ -1226,19 +1568,29 @@ pub const PlaygroundServer = struct {
         self.active_msg_id = null;
         self.active_threads = std.atomic.Value(usize).init(0);
         self.active_conns = std.atomic.Value(usize).init(0);
+        self.active_workers = std.atomic.Value(usize).init(0);
+        self.busy_threads_mu = Io.Mutex.init;
+        self.busy_threads = .empty;
+        errdefer self.busy_threads.deinit(allocator);
+        self.client_fds_mu = Io.Mutex.init;
+        self.client_fds = .empty;
+        errdefer self.client_fds.deinit(allocator);
         self.active_handles_mu = Io.Mutex.init;
         self.active_handles = .empty;
+        errdefer self.active_handles.deinit(allocator);
         self.relay_io_mu = Io.Mutex.init;
         self.relay_sync_mu = Io.Mutex.init;
         self.relay_sync_cond = Io.Condition.init;
         self.relay_sync_pending = .empty;
+        errdefer self.relay_sync_pending.deinit(allocator);
         self.traces_dir = try Io.Dir.cwd().openDir(io, traces_path, .{});
         errdefer self.traces_dir.close(io);
         self.ui_dist = resolveUiDist(allocator, io);
         errdefer if (self.ui_dist) |d| allocator.free(d);
 
-        const auth_secret = crypto.hashBytes("0ndb-playground-relay-cap-secret");
-        const master_key: crypto.Key = @splat(0x42);
+        var auth_secret: [32]u8 = undefined;
+        io.random(&auth_secret);
+        const master_key = try loadOrCreateMasterKey(allocator, io, state_path);
 
         self.allocator = allocator;
         self.io = io;
@@ -1250,7 +1602,9 @@ pub const PlaygroundServer = struct {
         self.vault_id = 0x00db_0001;
         self.auth_secret = auth_secret;
         self.master_key = master_key;
+        self.default_access = config.default_access;
         self.sse_clients = .empty;
+        errdefer self.sse_clients.deinit(allocator);
         self.running = std.atomic.Value(bool).init(true);
         self.dev_b_path = devb_path;
         devb_path_owned = false;
@@ -1333,25 +1687,39 @@ pub const PlaygroundServer = struct {
             self.workspace.setObserver(null);
         }
         self.relay_sync_thread = try std.Thread.spawn(.{}, relaySyncMain, .{self});
-        self.startPrewarmModels();
+        errdefer {
+            self.running.store(false, .release);
+            self.relay_sync_mu.lockUncancelable(io);
+            self.relay_sync_cond.broadcast(io);
+            self.relay_sync_mu.unlock(io);
+            self.relay_sync_thread.join();
+        }
+        self.sse_keepalive_thread = try std.Thread.spawn(.{}, sseKeepaliveMain, .{self});
+        if (config.prewarm_models) {
+            self.startPrewarmModels();
+        }
         return self;
     }
 
-    pub fn deinit(self: *PlaygroundServer) void {
+    pub fn stop(self: *PlaygroundServer) void {
         self.running.store(false, .release);
         _ = linux.shutdown(self.listen_fd, linux.SHUT.RDWR);
-        _ = linux.close(self.listen_fd);
         self.interruptAllActiveTurns();
-        self.sse_mu.lockUncancelable(self.io);
-        for (self.sse_clients.items) |fd| {
-            _ = linux.shutdown(fd, linux.SHUT.RDWR);
-            _ = linux.close(fd);
-        }
-        self.sse_clients.clearRetainingCapacity();
-        self.sse_mu.unlock(self.io);
+        self.shutdownAllClientSockets();
+        self.closeAllSseClients();
+    }
 
-        var waited_ms: usize = 0;
-        while (self.active_threads.load(.acquire) > 0 and waited_ms < 5000) : (waited_ms += 5) {
+    pub fn deinit(self: *PlaygroundServer) void {
+        self.stop();
+        _ = linux.close(self.listen_fd);
+        self.sse_keepalive_thread.join();
+
+        var spins: usize = 0;
+        while (self.active_threads.load(.acquire) > 0) : (spins += 1) {
+            if (spins % 20 == 0) {
+                self.interruptAllActiveTurns();
+                self.shutdownAllClientSockets();
+            }
             self.io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch {};
         }
 
@@ -1363,10 +1731,14 @@ pub const PlaygroundServer = struct {
         self.workspace.wakeWatcher();
         self.watcher_thread.join();
         self.workspace.setObserver(null);
-        self.sse_mu.lockUncancelable(self.io);
-        for (self.sse_clients.items) |fd| _ = linux.close(fd);
+        self.closeAllSseClients();
         self.sse_clients.deinit(self.allocator);
-        self.sse_mu.unlock(self.io);
+        self.client_fds_mu.lockUncancelable(self.io);
+        self.client_fds.deinit(self.allocator);
+        self.client_fds_mu.unlock(self.io);
+        self.busy_threads_mu.lockUncancelable(self.io);
+        self.busy_threads.deinit(self.allocator);
+        self.busy_threads_mu.unlock(self.io);
         self.active_handles_mu.lockUncancelable(self.io);
         self.active_handles.deinit(self.allocator);
         self.active_handles_mu.unlock(self.io);
@@ -1394,6 +1766,57 @@ pub const PlaygroundServer = struct {
         self.traces_dir.close(self.io);
         if (self.ui_dist) |d| self.allocator.free(d);
         self.allocator.destroy(self);
+    }
+
+    fn registerClientFd(self: *PlaygroundServer, fd: posix.fd_t) void {
+        self.client_fds_mu.lockUncancelable(self.io);
+        defer self.client_fds_mu.unlock(self.io);
+        self.client_fds.put(self.allocator, fd, {}) catch {};
+    }
+
+    fn unregisterClientFd(self: *PlaygroundServer, fd: posix.fd_t) void {
+        self.client_fds_mu.lockUncancelable(self.io);
+        defer self.client_fds_mu.unlock(self.io);
+        _ = self.client_fds.remove(fd);
+    }
+
+    fn shutdownAllClientSockets(self: *PlaygroundServer) void {
+        self.client_fds_mu.lockUncancelable(self.io);
+        defer self.client_fds_mu.unlock(self.io);
+        var it = self.client_fds.keyIterator();
+        while (it.next()) |k| {
+            _ = linux.shutdown(k.*, linux.SHUT.RDWR);
+        }
+    }
+
+    fn closeAllSseClients(self: *PlaygroundServer) void {
+        self.sse_mu.lockUncancelable(self.io);
+        defer self.sse_mu.unlock(self.io);
+        for (self.sse_clients.items) |*c| {
+            _ = linux.shutdown(c.fd, linux.SHUT.RDWR);
+            _ = linux.close(c.fd);
+            c.deinit(self.allocator);
+        }
+        self.sse_clients.clearRetainingCapacity();
+    }
+
+    fn acquireThreadTurn(self: *PlaygroundServer, thread_id: u128) error{ TurnAlreadyActive, OutOfMemory }!void {
+        self.busy_threads_mu.lockUncancelable(self.io);
+        defer self.busy_threads_mu.unlock(self.io);
+        if (self.busy_threads.contains(thread_id)) return error.TurnAlreadyActive;
+        try self.busy_threads.put(self.allocator, thread_id, {});
+    }
+
+    fn releaseThreadTurn(self: *PlaygroundServer, thread_id: u128) void {
+        self.busy_threads_mu.lockUncancelable(self.io);
+        defer self.busy_threads_mu.unlock(self.io);
+        _ = self.busy_threads.remove(thread_id);
+    }
+
+    fn isThreadTurnActive(self: *PlaygroundServer, thread_id: u128) bool {
+        self.busy_threads_mu.lockUncancelable(self.io);
+        defer self.busy_threads_mu.unlock(self.io);
+        return self.busy_threads.contains(thread_id);
     }
 
     fn registerActiveTurn(self: *PlaygroundServer, thread_id: u128, handle: *iface.RunHandle, interrupted: *std.atomic.Value(bool)) void {
@@ -1861,22 +2284,107 @@ pub const PlaygroundServer = struct {
         }
     }
 
-    fn broadcastSse(self: *PlaygroundServer, json_payload: []const u8) void {
-        const frame = std.fmt.allocPrint(self.allocator, "data: {s}\n\n", .{json_payload}) catch return;
-        defer self.allocator.free(frame);
+    fn drainSseClientLocked(self: *PlaygroundServer, client: *SseClient) bool {
+        const poll_rdhup: i16 = 0x2000;
+        var pfd = [_]linux.pollfd{.{
+            .fd = client.fd,
+            .events = poll_rdhup,
+            .revents = 0,
+        }};
+        const prc = linux.poll(&pfd, 1, 0);
+        if (linux.errno(prc) == .SUCCESS and prc > 0) {
+            if ((pfd[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL | poll_rdhup)) != 0) {
+                return false;
+            }
+        }
+        var sent: usize = 0;
+        while (sent < client.pending.items.len) {
+            const rc = linux.sendto(
+                client.fd,
+                client.pending.items[sent..].ptr,
+                client.pending.items.len - sent,
+                linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT,
+                null,
+                0,
+            );
+            const e = linux.errno(rc);
+            if (e == .INTR) continue;
+            if (e == .AGAIN) break;
+            if (e != .SUCCESS or rc == 0) return false;
+            sent += rc;
+        }
+        if (sent > 0) {
+            const rem = client.pending.items.len - sent;
+            if (rem > 0) {
+                std.mem.copyForwards(u8, client.pending.items[0..rem], client.pending.items[sent..]);
+            }
+            client.pending.shrinkRetainingCapacity(rem);
+        }
+        _ = self;
+        return true;
+    }
 
+    fn pushSseRaw(self: *PlaygroundServer, frame: []const u8) void {
         self.sse_mu.lockUncancelable(self.io);
         defer self.sse_mu.unlock(self.io);
 
         var i: usize = 0;
         while (i < self.sse_clients.items.len) {
-            const fd = self.sse_clients.items[i];
-            const ok = writeAllNonBlocking(fd, frame);
-            if (!ok) {
-                _ = linux.close(fd);
+            var client = &self.sse_clients.items[i];
+            var alive = self.drainSseClientLocked(client);
+            if (alive) {
+                if (client.pending.items.len + frame.len > MAX_SSE_PENDING_BYTES) {
+                    alive = false;
+                } else {
+                    client.pending.appendSlice(self.allocator, frame) catch {
+                        alive = false;
+                    };
+                    if (alive) {
+                        alive = self.drainSseClientLocked(client);
+                    }
+                }
+            }
+            if (!alive) {
+                _ = linux.shutdown(client.fd, linux.SHUT.RDWR);
+                _ = linux.close(client.fd);
+                client.deinit(self.allocator);
                 _ = self.sse_clients.swapRemove(i);
             } else {
                 i += 1;
+            }
+        }
+    }
+
+    fn broadcastSse(self: *PlaygroundServer, json_payload: []const u8) void {
+        const frame = std.fmt.allocPrint(self.allocator, "data: {s}\n\n", .{json_payload}) catch return;
+        defer self.allocator.free(frame);
+        self.pushSseRaw(frame);
+    }
+
+    fn sseKeepaliveMain(self: *PlaygroundServer) void {
+        var elapsed_ms: u64 = 0;
+        while (self.running.load(.acquire)) {
+            self.io.sleep(Io.Duration.fromMilliseconds(250), .awake) catch {};
+            if (!self.running.load(.acquire)) return;
+            elapsed_ms += 250;
+            if (elapsed_ms >= SSE_KEEPALIVE_MS) {
+                elapsed_ms = 0;
+                self.pushSseRaw(": ping\n\n");
+            } else {
+                self.sse_mu.lockUncancelable(self.io);
+                var i: usize = 0;
+                while (i < self.sse_clients.items.len) {
+                    var client = &self.sse_clients.items[i];
+                    if (client.pending.items.len > 0 and !self.drainSseClientLocked(client)) {
+                        _ = linux.shutdown(client.fd, linux.SHUT.RDWR);
+                        _ = linux.close(client.fd);
+                        client.deinit(self.allocator);
+                        _ = self.sse_clients.swapRemove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                self.sse_mu.unlock(self.io);
             }
         }
     }
@@ -1924,41 +2432,40 @@ pub const PlaygroundServer = struct {
         srv.handleConnection(fd);
     }
 
-    fn readMoreHttp(
+    fn readMoreHttpUntil(
         self: *PlaygroundServer,
         fd: posix.fd_t,
         req_buf: *std.ArrayList(u8),
         tmp: *[4096]u8,
-        max_wait_ms: usize,
-        waited_ms: *usize,
+        deadline_ms: u64,
     ) bool {
         while (true) {
             if (!self.running.load(.acquire)) return false;
+            const now = id.nowMs(self.io);
+            if (now >= deadline_ms) return false;
+            const remain_ms = deadline_ms - now;
+            const poll_ms: i32 = @intCast(@min(remain_ms, 250));
             var pfd = [_]linux.pollfd{.{
                 .fd = fd,
                 .events = linux.POLL.IN,
                 .revents = 0,
             }};
-            const prc = linux.poll(&pfd, 1, 250);
+            const prc = linux.poll(&pfd, 1, poll_ms);
             const pe = linux.errno(prc);
             if (pe == .INTR) continue;
             if (pe != .SUCCESS) return false;
-            if (prc == 0) {
-                waited_ms.* += 250;
-                if (waited_ms.* >= max_wait_ms) return false;
-                continue;
-            }
+            if (prc == 0) continue;
             const rc = linux.read(fd, tmp, tmp.len);
             const e = linux.errno(rc);
             if (e == .INTR) continue;
             if (e != .SUCCESS or rc == 0) return false;
-            waited_ms.* = 0;
             req_buf.appendSlice(self.allocator, tmp[0..rc]) catch return false;
             return true;
         }
     }
 
     fn handleConnection(self: *PlaygroundServer, fd: posix.fd_t) void {
+        self.registerClientFd(fd);
         var req_buf: std.ArrayList(u8) = .empty;
         defer req_buf.deinit(self.allocator);
         var out: std.ArrayList(u8) = .empty;
@@ -1966,14 +2473,21 @@ pub const PlaygroundServer = struct {
 
         var tmp: [4096]u8 = undefined;
         var handed_to_sse = false;
-        defer if (!handed_to_sse) {
-            _ = linux.close(fd);
-        };
+        defer {
+            self.unregisterClientFd(fd);
+            if (!handed_to_sse) {
+                _ = linux.close(fd);
+            }
+        }
 
         var req_count: usize = 0;
         while (self.running.load(.acquire)) {
-            const max_wait_ms: usize = if (req_count == 0) 30_000 else 15_000;
-            var waited_ms: usize = 0;
+            if (req_buf.items.len == 0) {
+                const idle_ms: u64 = if (req_count == 0) REQUEST_READ_TIMEOUT_MS else KEEPALIVE_IDLE_MS;
+                const first_deadline = id.nowMs(self.io) + idle_ms;
+                if (!self.readMoreHttpUntil(fd, &req_buf, &tmp, first_deadline)) return;
+            }
+            const deadline_ms = id.nowMs(self.io) + REQUEST_READ_TIMEOUT_MS;
 
             var header_idx: ?usize = std.mem.indexOf(u8, req_buf.items, "\r\n\r\n");
             while (header_idx == null) {
@@ -1981,7 +2495,7 @@ pub const PlaygroundServer = struct {
                     _ = sendHttp(fd, "431 Request Header Fields Too Large", "application/json", "{\"error\":\"HeadersTooLarge\"}", false);
                     return;
                 }
-                if (!self.readMoreHttp(fd, &req_buf, &tmp, max_wait_ms, &waited_ms)) return;
+                if (!self.readMoreHttpUntil(fd, &req_buf, &tmp, deadline_ms)) return;
                 header_idx = std.mem.indexOf(u8, req_buf.items, "\r\n\r\n");
             }
 
@@ -1991,7 +2505,30 @@ pub const PlaygroundServer = struct {
                 return;
             }
             const hend = hidx + 4;
-            const framing = parseHttpFraming(req_buf.items[0..hidx]) catch |err| {
+            const head_pre = req_buf.items[0..hidx];
+
+            if (!validateHostHeader(head_pre)) {
+                _ = sendHttp(fd, "403 Forbidden", "application/json", "{\"error\":\"InvalidHost\"}", false);
+                return;
+            }
+
+            const first_nl_pre = std.mem.indexOf(u8, head_pre, "\r\n") orelse head_pre.len;
+            const req_line_pre = head_pre[0..first_nl_pre];
+            var parts_pre = std.mem.splitScalar(u8, req_line_pre, ' ');
+            const method_pre = parts_pre.next() orelse "";
+
+            if (isMutationMethod(method_pre)) {
+                if (!validateOriginHeaders(head_pre, self.http_port)) {
+                    _ = sendHttp(fd, "403 Forbidden", "application/json", "{\"error\":\"CrossOriginForbidden\"}", false);
+                    return;
+                }
+                if (!hasJsonContentType(head_pre)) {
+                    _ = sendHttp(fd, "415 Unsupported Media Type", "application/json", "{\"error\":\"UnsupportedMediaType\"}", false);
+                    return;
+                }
+            }
+
+            const framing = parseHttpFraming(head_pre) catch |err| {
                 switch (err) {
                     error.BadFraming => _ = sendHttp(fd, "400 Bad Request", "application/json", "{\"error\":\"BadFraming\"}", false),
                     error.PayloadTooLarge => _ = sendHttp(fd, "413 Payload Too Large", "application/json", "{\"error\":\"PayloadTooLarge\"}", false),
@@ -2007,15 +2544,17 @@ pub const PlaygroundServer = struct {
             switch (framing) {
                 .content_length => |content_len| {
                     while (req_buf.items.len < hend + content_len) {
-                        if (!self.readMoreHttp(fd, &req_buf, &tmp, max_wait_ms, &waited_ms)) return;
+                        if (!self.readMoreHttpUntil(fd, &req_buf, &tmp, deadline_ms)) return;
                     }
                     total_req_len = hend + content_len;
                     body = req_buf.items[hend..total_req_len];
                 },
                 .chunked => {
                     const max_raw_chunked = hend + MAX_BODY_BYTES * 2 + 65536;
+                    var dec = ChunkedDecoder.init(MAX_BODY_BYTES);
+                    defer dec.deinit(self.allocator);
                     while (true) {
-                        const res = decodeChunkedBody(self.allocator, req_buf.items[hend..], MAX_BODY_BYTES) catch |err| {
+                        const st = dec.feed(self.allocator, req_buf.items[hend..]) catch |err| {
                             switch (err) {
                                 error.BadFraming => _ = sendHttp(fd, "400 Bad Request", "application/json", "{\"error\":\"BadFraming\"}", false),
                                 error.PayloadTooLarge => _ = sendHttp(fd, "413 Payload Too Large", "application/json", "{\"error\":\"PayloadTooLarge\"}", false),
@@ -2023,21 +2562,17 @@ pub const PlaygroundServer = struct {
                             }
                             return;
                         };
-                        switch (res) {
-                            .complete => |done| {
-                                chunked_body = done.body;
-                                body = done.body;
-                                total_req_len = hend + done.consumed;
-                                break;
-                            },
-                            .need_more => {
-                                if (req_buf.items.len >= max_raw_chunked) {
-                                    _ = sendHttp(fd, "413 Payload Too Large", "application/json", "{\"error\":\"PayloadTooLarge\"}", false);
-                                    return;
-                                }
-                                if (!self.readMoreHttp(fd, &req_buf, &tmp, max_wait_ms, &waited_ms)) return;
-                            },
+                        if (st == .complete) {
+                            chunked_body = dec.takeBody(self.allocator) catch return;
+                            body = chunked_body.?;
+                            total_req_len = hend + dec.consumed();
+                            break;
                         }
+                        if (req_buf.items.len >= max_raw_chunked) {
+                            _ = sendHttp(fd, "413 Payload Too Large", "application/json", "{\"error\":\"PayloadTooLarge\"}", false);
+                            return;
+                        }
+                        if (!self.readMoreHttpUntil(fd, &req_buf, &tmp, deadline_ms)) return;
                     }
                 },
             }
@@ -2066,7 +2601,15 @@ pub const PlaygroundServer = struct {
                     _ = sendHttp(fd, "503 Service Unavailable", "application/json", "{\"error\":\"TooManySseClients\"}", false);
                     return;
                 }
-                const sse_hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n: connected\n\n";
+                const sse_hdr =
+                    "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Type: text/event-stream\r\n" ++
+                    "Cache-Control: no-cache\r\n" ++
+                    "Connection: keep-alive\r\n" ++
+                    "X-Content-Type-Options: nosniff\r\n" ++
+                    "X-Frame-Options: DENY\r\n" ++
+                    "Referrer-Policy: no-referrer\r\n" ++
+                    "\r\n: connected\n\n";
                 if (!writeAllRaw(fd, sse_hdr)) return;
                 wire.setNonBlocking(fd) catch return;
                 self.sse_mu.lockUncancelable(self.io);
@@ -2074,7 +2617,7 @@ pub const PlaygroundServer = struct {
                     self.sse_mu.unlock(self.io);
                     return;
                 }
-                self.sse_clients.append(self.allocator, fd) catch {
+                self.sse_clients.append(self.allocator, .{ .fd = fd }) catch {
                     self.sse_mu.unlock(self.io);
                     return;
                 };
@@ -2094,7 +2637,7 @@ pub const PlaygroundServer = struct {
                 } else |err| {
                     out.clearRetainingCapacity();
                     out.print(self.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
-                    write_ok = sendHttp(fd, "400 Bad Request", "application/json", out.items, keep_alive);
+                    write_ok = sendHttp(fd, httpStatusForError(err), "application/json", out.items, keep_alive);
                 }
             }
 
@@ -2140,7 +2683,13 @@ pub const PlaygroundServer = struct {
     fn readDistFile(self: *PlaygroundServer, dist: []const u8, rel: []const u8) ?[]u8 {
         const full = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dist, rel }) catch return null;
         defer self.allocator.free(full);
-        return Io.Dir.cwd().readFileAlloc(self.io, full, self.allocator, .limited(MAX_STATIC_BYTES)) catch null;
+        var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = Io.Dir.cwd().realPathFile(self.io, full, &resolved_buf) catch return null;
+        const resolved = resolved_buf[0..n];
+        if (resolved.len <= dist.len) return null;
+        if (!std.mem.startsWith(u8, resolved, dist)) return null;
+        if (resolved[dist.len] != '/') return null;
+        return Io.Dir.cwd().readFileAlloc(self.io, resolved, self.allocator, .limited(MAX_STATIC_BYTES)) catch null;
     }
 
     fn routeApi(
@@ -2152,26 +2701,37 @@ pub const PlaygroundServer = struct {
         out: *std.ArrayList(u8),
     ) !void {
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/info")) {
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
             const provs = registry.listProviders(self.io);
+            const rss_kb = readRssKb(self.io);
+            self.mu.lockUncancelable(self.io);
             var hhex: [32]u8 = undefined;
             _ = id.formatIdHex(self.workspace.history.history_id, &hhex);
+            const root_copy = try self.allocator.dupe(u8, self.workspace.root_path);
+            const heads_len = self.workspace.history.dag.heads.slice().len;
+            const batch_cnt = self.workspace.batch_log.count();
+            const owned_heap = self.workspace.history.ownedHeapBytes();
+            const page_sz = self.engine.page_size;
+            const thread_cnt = self.engine.journal.threads.count();
+            const dag_cnt = self.workspace.history.dag.count();
+            self.mu.unlock(self.io);
+            defer self.allocator.free(root_copy);
+
             try out.appendSlice(self.allocator, "{\"workspace_root\":");
-            try rpc.appendJsonEscaped(self.allocator, out, self.workspace.root_path);
+            try rpc.appendJsonEscaped(self.allocator, out, root_copy);
             try out.print(
                 self.allocator,
-                ",\"history_id\":\"{s}\",\"heads\":{d},\"batches\":{d},\"rss_kb\":{d},\"owned_heap_bytes\":{d},\"relay_port\":{d},\"page_size\":{d},\"threads\":{d},\"dag_batches\":{d},\"ui_dist\":",
+                ",\"history_id\":\"{s}\",\"heads\":{d},\"batches\":{d},\"rss_kb\":{d},\"owned_heap_bytes\":{d},\"relay_port\":{d},\"page_size\":{d},\"threads\":{d},\"dag_batches\":{d},\"default_access\":\"{s}\",\"ui_dist\":",
                 .{
                     hhex,
-                    self.workspace.history.dag.heads.slice().len,
-                    self.workspace.batch_log.count(),
-                    readRssKb(self.io),
-                    self.workspace.history.ownedHeapBytes(),
+                    heads_len,
+                    batch_cnt,
+                    rss_kb,
+                    owned_heap,
                     self.relay.port,
-                    self.engine.page_size,
-                    self.engine.journal.threads.count(),
-                    self.workspace.history.dag.count(),
+                    page_sz,
+                    thread_cnt,
+                    dag_cnt,
+                    @tagName(self.default_access),
                 },
             );
             if (self.ui_dist) |d| {
@@ -2230,8 +2790,11 @@ pub const PlaygroundServer = struct {
         }
 
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/models")) {
-            const pslug = queryParam(query, "provider") orelse return error.MissingProvider;
-            const force = std.mem.eql(u8, queryParam(query, "refresh") orelse "0", "1");
+            const pslug = (try queryParamAlloc(self.allocator, query, "provider")) orelse return error.MissingProvider;
+            defer self.allocator.free(pslug);
+            const refresh_val = try queryParamAlloc(self.allocator, query, "refresh");
+            defer if (refresh_val) |r| self.allocator.free(r);
+            const force = if (refresh_val) |r| std.mem.eql(u8, r, "1") else false;
             const pid = parseProviderSlug(pslug);
             const avail = registry.isAvailable(self.io, pid);
 
@@ -2279,20 +2842,23 @@ pub const PlaygroundServer = struct {
             try out.appendSlice(self.allocator, "{\"sessions\":[");
             for (sums, 0..) |s, i| {
                 if (i > 0) try out.append(self.allocator, ',');
-                const t_model: ?[]const u8 = if (self.engine.journal.threads.get(s.thread_id)) |t| t.default_model else null;
-                try appendSessionSummaryJson(self.allocator, out, &s, t_model);
+                const t_opt = self.engine.journal.threads.get(s.thread_id);
+                const t_model: ?[]const u8 = if (t_opt) |t| t.default_model else null;
+                const t_wt: ?u128 = if (t_opt) |t| t.worktree_id else null;
+                try appendSessionSummaryJson(self.allocator, out, &s, t_model, t_wt);
             }
             try out.appendSlice(self.allocator, "]}");
             return;
         }
 
-        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/threads")) {
+        if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/api/threads") or std.mem.eql(u8, path, "/api/chats"))) {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
             defer parsed.deinit();
             const title = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse "Untitled session";
             const prov_slug = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "provider")) orelse "mock";
             const mdl_raw = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "model")) orelse "";
             const wt_raw = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "worktree_id")) orelse "";
+            const prompt_opt = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "prompt"));
             const prov = parseProviderSlug(prov_slug);
             const mdl: ?[]const u8 = if (mdl_raw.len > 0)
                 mdl_raw
@@ -2313,9 +2879,20 @@ pub const PlaygroundServer = struct {
             };
 
             self.scheduleRelaySync(tid);
+            if (std.mem.eql(u8, path, "/api/chats")) {
+                if (prompt_opt) |prompt| {
+                    if (prompt.len > 0) {
+                        try self.spawnWorker(tid, .send_new, prompt, null, prov_slug, mdl);
+                    }
+                }
+            }
             var thex: [32]u8 = undefined;
             _ = id.formatIdHex(tid, &thex);
-            try out.print(self.allocator, "{{\"thread_id\":\"{s}\"}}", .{thex});
+            if (std.mem.eql(u8, path, "/api/chats")) {
+                try out.print(self.allocator, "{{\"thread_id\":\"{s}\",\"chat_id\":\"{s}\"}}", .{ thex, thex });
+            } else {
+                try out.print(self.allocator, "{{\"thread_id\":\"{s}\"}}", .{thex});
+            }
             self.emitSessionEvent(tid);
             return;
         }
@@ -2337,27 +2914,26 @@ pub const PlaygroundServer = struct {
                 {
                     self.mu.lockUncancelable(self.io);
                     defer self.mu.unlock(self.io);
-                    if (self.engine.journal.threads.getPtr(tid)) |t| {
-                        var u = try t.clone(self.allocator);
-                        errdefer u.deinit(self.allocator);
-                        if (prov_raw) |ps| u.default_provider = parseProviderSlug(ps);
-                        if (mdl_val) |mv| {
-                            if (u.default_model) |old| self.allocator.free(old);
-                            u.default_model = null;
-                            if (mv == .string and mv.string.len > 0) {
-                                u.default_model = try self.allocator.dupe(u8, mv.string);
-                            }
+                    const t = self.engine.journal.threads.getPtr(tid) orelse return error.ThreadNotFound;
+                    var u = try t.clone(self.allocator);
+                    errdefer u.deinit(self.allocator);
+                    if (prov_raw) |ps| u.default_provider = parseProviderSlug(ps);
+                    if (mdl_val) |mv| {
+                        if (u.default_model) |old| self.allocator.free(old);
+                        u.default_model = null;
+                        if (mv == .string and mv.string.len > 0) {
+                            u.default_model = try self.allocator.dupe(u8, mv.string);
                         }
-                        if (title_raw) |tr| {
-                            if (tr.len > 0) {
-                                const new_title = try self.allocator.dupe(u8, tr);
-                                self.allocator.free(u.title);
-                                u.title = new_title;
-                            }
-                        }
-                        u.updated_ms = id.nowMs(self.io);
-                        try self.engine.journal.putThread(u);
                     }
+                    if (title_raw) |tr| {
+                        if (tr.len > 0) {
+                            const new_title = try self.allocator.dupe(u8, tr);
+                            self.allocator.free(u.title);
+                            u.title = new_title;
+                        }
+                    }
+                    u.updated_ms = id.nowMs(self.io);
+                    try self.engine.journal.putThread(u);
                 }
 
                 self.scheduleRelaySync(tid);
@@ -2367,21 +2943,23 @@ pub const PlaygroundServer = struct {
             }
 
             if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "page")) {
-                const limit_str = queryParam(query, "limit") orelse "8";
-                const limit = @min(std.fmt.parseInt(usize, limit_str, 10) catch 8, 200);
-                const before_str = queryParam(query, "before");
+                const limit_str = try queryParamAlloc(self.allocator, query, "limit");
+                defer if (limit_str) |s| self.allocator.free(s);
+                const limit = @min(if (limit_str) |s| (std.fmt.parseInt(usize, s, 10) catch 8) else 8, 200);
+                const before_str = try queryParamAlloc(self.allocator, query, "before");
+                defer if (before_str) |s| self.allocator.free(s);
                 const before_id: ?u128 = if (before_str) |b| (if (b.len == 32) try id.parseIdHex(b) else null) else null;
-                const branch_str = queryParam(query, "branch");
+                const branch_str = try queryParamAlloc(self.allocator, query, "branch");
+                defer if (branch_str) |s| self.allocator.free(s);
                 const branch_id: ?u128 = if (branch_str) |b| (if (b.len == 32) try id.parseIdHex(b) else null) else null;
-                const from_str = queryParam(query, "from_msg_id");
+                const from_str = try queryParamAlloc(self.allocator, query, "from_msg_id");
+                defer if (from_str) |s| self.allocator.free(s);
                 const from_id: ?u128 = if (from_str) |b| (if (b.len == 32) id.parseIdHex(b) catch null else null) else null;
 
-                self.mu.lockUncancelable(self.io);
-                defer self.mu.unlock(self.io);
                 if (branch_id) |bmid| {
-                    try self.appendBranchPreviewJsonLocked(tid, bmid, from_id, limit, out);
+                    try self.appendBranchPreviewJson(tid, bmid, from_id, limit, out);
                 } else {
-                    try self.appendPageJsonLocked(tid, before_id, limit, out);
+                    try self.appendPageJson(tid, before_id, limit, out);
                 }
                 return;
             }
@@ -2417,7 +2995,8 @@ pub const PlaygroundServer = struct {
             }
 
             if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "diff")) {
-                const mid_hex = queryParam(query, "msg_id") orelse return error.MissingMsgId;
+                const mid_hex = (try queryParamAlloc(self.allocator, query, "msg_id")) orelse return error.MissingMsgId;
+                defer self.allocator.free(mid_hex);
                 const mid = try id.parseIdHex(mid_hex);
                 const t0 = nowUs(self.io);
                 self.mu.lockUncancelable(self.io);
@@ -2518,6 +3097,8 @@ pub const PlaygroundServer = struct {
                 const mdl: ?[]const u8 = if (mdl_raw.len > 0) mdl_raw else null;
                 const mid = try id.parseIdHex(mid_hex);
 
+                if (self.isThreadTurnActive(tid)) return error.TurnAlreadyActive;
+
                 const new_user_id = blk: {
                     self.mu.lockUncancelable(self.io);
                     defer self.mu.unlock(self.io);
@@ -2543,10 +3124,10 @@ pub const PlaygroundServer = struct {
                 defer parsed.deinit();
                 const mid_hex = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "msg_id")) orelse "";
                 const mid: ?u128 = if (mid_hex.len == 32) try id.parseIdHex(mid_hex) else null;
-                const req_limit = jsonU64(rpc.jsonObjGet(parsed.value, "limit"));
+                const req_limit = try jsonU64Opt(rpc.jsonObjGet(parsed.value, "limit"));
                 const limit: usize = if (req_limit > 0) @intCast(@min(req_limit, 200)) else self.engine.page_size;
 
-                const head_page: ?id.PageId = blk: {
+                const res_rb = blk: {
                     self.mu.lockUncancelable(self.io);
                     defer self.mu.unlock(self.io);
                     const t0 = nowUs(self.io);
@@ -2558,13 +3139,14 @@ pub const PlaygroundServer = struct {
                     }
                     try self.engine.rollback(tid, mid);
                     const elapsed = nowUs(self.io) -| t0;
-                    try out.print(self.allocator, "{{\"ok\":true,\"elapsed_us\":{d},\"page\":", .{elapsed});
-                    try self.appendPageJsonLocked(tid, null, limit, out);
-                    try out.append(self.allocator, '}');
-                    break :blk if (self.engine.journal.threads.get(tid)) |t| t.head_page else null;
+                    const hp = if (self.engine.journal.threads.get(tid)) |t| t.head_page else null;
+                    break :blk .{ .elapsed = elapsed, .head_page = hp };
                 };
 
-                self.emitSessionEventWithHead(tid, head_page);
+                try out.print(self.allocator, "{{\"ok\":true,\"elapsed_us\":{d},\"page\":", .{res_rb.elapsed});
+                try self.appendPageJson(tid, null, limit, out);
+                try out.append(self.allocator, '}');
+                self.emitSessionEventWithHead(tid, res_rb.head_page);
                 self.scheduleRelaySync(tid);
                 return;
             }
@@ -2578,10 +3160,10 @@ pub const PlaygroundServer = struct {
                     (if (fh.len > 0) id.parseIdHex(fh) catch null else null)
                 else
                     null;
-                const req_limit = jsonU64(rpc.jsonObjGet(parsed.value, "limit"));
+                const req_limit = try jsonU64Opt(rpc.jsonObjGet(parsed.value, "limit"));
                 const limit: usize = if (req_limit > 0) @intCast(@min(req_limit, 200)) else self.engine.page_size;
 
-                const head_page: ?id.PageId = blk: {
+                const res_br = blk: {
                     self.mu.lockUncancelable(self.io);
                     defer self.mu.unlock(self.io);
                     const t0 = nowUs(self.io);
@@ -2596,6 +3178,7 @@ pub const PlaygroundServer = struct {
                     var effective_limit: usize = limit;
                     {
                         var cur: ?u128 = leaf;
+                        var slow: ?u128 = leaf;
                         var count: usize = 0;
                         while (cur) |cid| : (count += 1) {
                             if (count >= 1000) break;
@@ -2611,18 +3194,49 @@ pub const PlaygroundServer = struct {
                             }
                             const m = self.engine.journal.messages.get(cid) orelse break;
                             cur = m.parent_id;
+                            if (count % 2 == 1) {
+                                if (slow) |sid| {
+                                    slow = if (self.engine.journal.messages.get(sid)) |sm| sm.parent_id else null;
+                                }
+                            }
+                            if (cur != null and slow != null and cur.? == slow.?) break;
                         }
                     }
-                    var lhex: [32]u8 = undefined;
-                    _ = id.formatIdHex(leaf, &lhex);
-                    try out.print(self.allocator, "{{\"leaf_msg_id\":\"{s}\",\"elapsed_us\":{d},\"page\":", .{ lhex, elapsed });
-                    try self.appendPageJsonLocked(tid, null, effective_limit, out);
-                    try out.append(self.allocator, '}');
-                    break :blk if (self.engine.journal.threads.get(tid)) |t| t.head_page else null;
+                    const hp = if (self.engine.journal.threads.get(tid)) |t| t.head_page else null;
+                    break :blk .{ .leaf = leaf, .elapsed = elapsed, .effective_limit = effective_limit, .head_page = hp };
                 };
 
-                self.emitSessionEventWithHead(tid, head_page);
+                var lhex: [32]u8 = undefined;
+                _ = id.formatIdHex(res_br.leaf, &lhex);
+                try out.print(self.allocator, "{{\"leaf_msg_id\":\"{s}\",\"elapsed_us\":{d},\"page\":", .{ lhex, res_br.elapsed });
+                try self.appendPageJson(tid, null, res_br.effective_limit, out);
+                try out.append(self.allocator, '}');
+                self.emitSessionEventWithHead(tid, res_br.head_page);
                 self.scheduleRelaySync(tid);
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "sync")) {
+                const wid = try self.threadWorktreeId(tid);
+                try self.handleWorktreeSync(wid, out);
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "land")) {
+                const wid = try self.threadWorktreeId(tid);
+                try self.handleWorktreeLand(wid, out);
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "conflicts")) {
+                const wid = try self.threadWorktreeId(tid);
+                try self.handleWorktreeConflicts(wid, out);
+                return;
+            }
+
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "resolve")) {
+                const wid = try self.threadWorktreeId(tid);
+                try self.handleWorktreeResolve(wid, body, out);
                 return;
             }
         }
@@ -2667,112 +3281,19 @@ pub const PlaygroundServer = struct {
         }
 
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/files")) {
-            const t0 = nowUs(self.io);
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
-            var paths: std.ArrayList([]u8) = .empty;
-            defer {
-                for (paths.items) |p| self.allocator.free(p);
-                paths.deinit(self.allocator);
-            }
-            try self.collectTrackedFilePaths(id.InodeId.ROOT, "", text_mod.View.EVERYTHING, &paths);
-            sortDedupePaths(self.allocator, &paths);
-            const ver_hex = try self.workspace.history.dag.heads.formatHex(self.allocator);
-            defer self.allocator.free(ver_hex);
-            try out.appendSlice(self.allocator, "{\"version\":");
-            try rpc.appendJsonEscaped(self.allocator, out, ver_hex);
-            try out.appendSlice(self.allocator, ",\"files\":[");
-            for (paths.items, 0..) |p, i| {
-                if (i > 0) try out.append(self.allocator, ',');
-                var bytes_len: u64 = 0;
-                var lines_cnt: usize = 0;
-                if (try self.workspace.history.tree.resolvePath(self.allocator, text_mod.View.EVERYTHING, p)) |iid| {
-                    if (self.workspace.history.tree.get(iid)) |inode| {
-                        if (inode.fileConstPtr()) |f| {
-                            bytes_len = f.text.visibleLen();
-                            lines_cnt = f.text.lineCount();
-                        }
-                    }
-                }
-                const meta = self.file_meta.get(p);
-                try out.appendSlice(self.allocator, "{\"path\":");
-                try rpc.appendJsonEscaped(self.allocator, out, p);
-                try out.print(
-                    self.allocator,
-                    ",\"bytes\":{d},\"lines\":{d},\"changed_ms\":{d},\"kind\":\"{s}\"}}",
-                    .{
-                        bytes_len,
-                        lines_cnt,
-                        if (meta) |m| m.changed_ms else id.nowMs(self.io),
-                        if (meta) |m| @tagName(m.kind) else "added",
-                    },
-                );
-            }
-            try out.print(self.allocator, "],\"elapsed_us\":{d}}}", .{nowUs(self.io) -| t0});
+            try self.appendFilesJsonLocked(&self.workspace, true, out);
             return;
         }
 
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/file")) {
-            const raw_p = queryParam(query, "path") orelse return error.MissingPath;
-            const decoded_p = try urlDecode(self.allocator, raw_p);
+            const decoded_p = (try queryParamAlloc(self.allocator, query, "path")) orelse return error.MissingPath;
             defer self.allocator.free(decoded_p);
             if (!isSafeRelPath(decoded_p)) return error.InvalidPath;
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
-            if (queryParam(query, "at")) |at_hex| {
-                const mid = try id.parseIdHex(at_hex);
-                const msg = self.engine.journal.messages.getPtr(mid) orelse return error.MessageNotFound;
-                const side = queryParam(query, "side") orelse "post";
-                const ver = if (std.mem.eql(u8, side, "pre")) &msg.pre_version else &msg.post_version;
-                const at_content = try self.workspace.history.readFileAt(self.allocator, decoded_p, ver);
-                defer if (at_content) |c| self.allocator.free(c);
-                var mhex: [32]u8 = undefined;
-                _ = id.formatIdHex(mid, &mhex);
-                try out.appendSlice(self.allocator, "{\"path\":");
-                try rpc.appendJsonEscaped(self.allocator, out, decoded_p);
-                try out.appendSlice(self.allocator, ",\"content\":");
-                if (at_content) |c| {
-                    try rpc.appendJsonEscaped(self.allocator, out, c);
-                } else {
-                    try out.appendSlice(self.allocator, "null");
-                }
-                try out.print(self.allocator, ",\"at\":\"{s}\"}}", .{mhex});
-                return;
-            }
-            const total_lines: usize = blk: {
-                const iid = (try self.workspace.history.tree.resolvePath(self.allocator, text_mod.View.EVERYTHING, decoded_p)) orelse break :blk 0;
-                const inode = self.workspace.history.tree.get(iid) orelse break :blk 0;
-                const f = inode.fileConstPtr() orelse break :blk 0;
-                break :blk f.text.lineCount();
-            };
-            const ver_hex = try self.workspace.history.dag.heads.formatHex(self.allocator);
-            defer self.allocator.free(ver_hex);
-            const start_param = queryParam(query, "start_line");
-            const lines_param = queryParam(query, "lines");
-            if (start_param != null or lines_param != null) {
-                const start_1 = if (start_param) |s| std.fmt.parseInt(usize, s, 10) catch 1 else 1;
-                const clamped_1 = if (start_1 == 0) 1 else start_1;
-                const max_lines = if (lines_param) |l| std.fmt.parseInt(usize, l, 10) catch 200 else 200;
-                const slice = try self.workspace.history.readFileLines(self.allocator, decoded_p, clamped_1 - 1, max_lines) orelse return error.FileNotFound;
-                defer self.allocator.free(slice);
-                try out.appendSlice(self.allocator, "{\"path\":");
-                try rpc.appendJsonEscaped(self.allocator, out, decoded_p);
-                try out.appendSlice(self.allocator, ",\"version\":");
-                try rpc.appendJsonEscaped(self.allocator, out, ver_hex);
-                try out.print(self.allocator, ",\"start_line\":{d},\"total_lines\":{d},\"content\":", .{ clamped_1, total_lines });
-                try rpc.appendJsonEscaped(self.allocator, out, slice);
-                try out.append(self.allocator, '}');
-                return;
-            }
-            const content = try self.workspace.history.readFileAt(self.allocator, decoded_p, null) orelse return error.FileNotFound;
-            defer self.allocator.free(content);
-            try out.appendSlice(self.allocator, "{\"path\":");
-            try rpc.appendJsonEscaped(self.allocator, out, decoded_p);
-            try out.appendSlice(self.allocator, ",\"version\":");
-            try rpc.appendJsonEscaped(self.allocator, out, ver_hex);
-            try out.print(self.allocator, ",\"total_lines\":{d},\"content\":", .{total_lines});
-            try rpc.appendJsonEscaped(self.allocator, out, content);
-            try out.append(self.allocator, '}');
+            try self.appendFileJsonLocked(&self.workspace, decoded_p, query, out);
             return;
         }
 
@@ -2783,8 +3304,8 @@ pub const PlaygroundServer = struct {
             if (!isSafeRelPath(fpath)) return error.InvalidPath;
             const bv_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "base_version")) orelse "";
             const draft = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "draft")) orelse "";
-            const cur_start = jsonU64(rpc.jsonObjGet(parsed.value, "cursor_start"));
-            const cur_end = jsonU64(rpc.jsonObjGet(parsed.value, "cursor_end"));
+            const cur_start = try jsonU64Opt(rpc.jsonObjGet(parsed.value, "cursor_start"));
+            const cur_end = try jsonU64Opt(rpc.jsonObjGet(parsed.value, "cursor_end"));
 
             var base_ver = version_mod.Version.parseHex(self.allocator, bv_str) catch {
                 try out.appendSlice(self.allocator, "{\"ok\":false,\"reload\":true}");
@@ -2854,11 +3375,15 @@ pub const PlaygroundServer = struct {
                             defer splices.deinit(self.allocator);
                             for (sp_val.array.items) |item| {
                                 try splices.append(self.allocator, .{
-                                    .at = jsonU64(rpc.jsonObjGet(item, "at")),
-                                    .del = jsonU64(rpc.jsonObjGet(item, "del")),
-                                    .ins = jsonU64(rpc.jsonObjGet(item, "ins")),
+                                    .at = try jsonU64(rpc.jsonObjGet(item, "at")),
+                                    .del = try jsonU64(rpc.jsonObjGet(item, "del")),
+                                    .ins = try jsonU64(rpc.jsonObjGet(item, "ins")),
                                 });
                             }
+                            const base_bytes = try self.workspace.history.readFileAt(self.allocator, fpath, bv);
+                            defer if (base_bytes) |b| self.allocator.free(b);
+                            const base_len: u64 = if (base_bytes) |b| b.len else 0;
+                            try validateSplices(splices.items, base_len, inserted.len);
                             break :blk try self.workspace.applyFileSplices(7, fpath, bv, splices.items, inserted, "editor");
                         }
                     }
@@ -2900,8 +3425,7 @@ pub const PlaygroundServer = struct {
         }
 
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/blame")) {
-            const raw_p = queryParam(query, "path") orelse return error.MissingPath;
-            const decoded_p = try urlDecode(self.allocator, raw_p);
+            const decoded_p = (try queryParamAlloc(self.allocator, query, "path")) orelse return error.MissingPath;
             defer self.allocator.free(decoded_p);
             if (!isSafeRelPath(decoded_p)) return error.InvalidPath;
             self.mu.lockUncancelable(self.io);
@@ -2934,49 +3458,12 @@ pub const PlaygroundServer = struct {
         }
 
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/history")) {
-            const limit = std.fmt.parseInt(usize, queryParam(query, "limit") orelse "200", 10) catch 200;
-            const t0 = nowUs(self.io);
+            const limit_str = try queryParamAlloc(self.allocator, query, "limit");
+            defer if (limit_str) |s| self.allocator.free(s);
+            const limit = if (limit_str) |s| (std.fmt.parseInt(usize, s, 10) catch 200) else 200;
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
-            const dag = &self.workspace.history.dag;
-            var hdrs: std.ArrayList(*const dag_mod.BatchHeader) = .empty;
-            defer hdrs.deinit(self.allocator);
-            try hdrs.ensureTotalCapacityPrecise(self.allocator, dag.count());
-            var hit = dag.headers.valueIterator();
-            while (hit.next()) |h| hdrs.appendAssumeCapacity(h);
-            std.mem.sort(*const dag_mod.BatchHeader, hdrs.items, {}, struct {
-                fn newerFirst(_: void, a: *const dag_mod.BatchHeader, b: *const dag_mod.BatchHeader) bool {
-                    if (a.wall_ms != b.wall_ms) return a.wall_ms > b.wall_ms;
-                    if (a.start != b.start) return a.start > b.start;
-                    return a.actor > b.actor;
-                }
-            }.newerFirst);
-            const shown = hdrs.items[0..@min(limit, hdrs.items.len)];
-            const elapsed = nowUs(self.io) -| t0;
-
-            try out.print(self.allocator, "{{\"elapsed_us\":{d},\"total\":{d},\"batches\":[", .{ elapsed, dag.count() });
-            for (shown, 0..) |h, i| {
-                if (i > 0) try out.append(self.allocator, ',');
-                var ahex: [32]u8 = undefined;
-                _ = id.formatIdHex(h.actor, &ahex);
-                try out.print(
-                    self.allocator,
-                    "{{\"id\":\"{s}:{d}\",\"actor\":\"{s}\",\"actor_label\":\"{s}\",\"start\":{d},\"end\":{d},\"ops\":{d},\"wall_ms\":{d},\"parents\":{d},\"head\":{}}}",
-                    .{
-                        ahex,
-                        h.start,
-                        ahex,
-                        self.actorLabel(h.actor),
-                        h.start,
-                        h.end,
-                        h.opCount(),
-                        h.wall_ms,
-                        h.parents.slice().len,
-                        dag.heads.contains(h.batchId()),
-                    },
-                );
-            }
-            try out.appendSlice(self.allocator, "]}");
+            try self.appendHistoryJsonLocked(&self.workspace, limit, out);
             return;
         }
 
@@ -2996,16 +3483,20 @@ pub const PlaygroundServer = struct {
             defer self.mu.unlock(self.io);
             for (pulled.summaries, 0..) |s, i| {
                 if (i > 0) try out.append(self.allocator, ',');
-                const t_model: ?[]const u8 = if (self.engine.journal.threads.get(s.thread_id)) |t| t.default_model else null;
-                try appendSessionSummaryJson(self.allocator, out, &s, t_model);
+                const t_opt = self.engine.journal.threads.get(s.thread_id);
+                const t_model: ?[]const u8 = if (t_opt) |t| t.default_model else null;
+                const t_wt: ?u128 = if (t_opt) |t| t.worktree_id else null;
+                try appendSessionSummaryJson(self.allocator, out, &s, t_model, t_wt);
             }
             try out.appendSlice(self.allocator, "]}");
             return;
         }
 
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/remote/page")) {
-            const tid_hex = queryParam(query, "thread_id") orelse return error.MissingThreadId;
-            const pid_hex = queryParam(query, "page_id") orelse return error.MissingPageId;
+            const tid_hex = (try queryParamAlloc(self.allocator, query, "thread_id")) orelse return error.MissingThreadId;
+            defer self.allocator.free(tid_hex);
+            const pid_hex = (try queryParamAlloc(self.allocator, query, "page_id")) orelse return error.MissingPageId;
+            defer self.allocator.free(pid_hex);
             const tid = try id.parseIdHex(tid_hex);
             var pid: id.PageId = undefined;
             if (pid_hex.len != 64) return error.InvalidPageId;
@@ -3067,35 +3558,71 @@ pub const PlaygroundServer = struct {
         }
 
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/worktrees")) {
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            const items = self.worktrees.list();
+            var snapshot: std.ArrayList(wt_mod.WorktreeInfo) = .empty;
+            defer {
+                for (snapshot.items) |*info| info.deinit(self.allocator);
+                snapshot.deinit(self.allocator);
+            }
+            {
+                self.mu.lockUncancelable(self.io);
+                defer self.mu.unlock(self.io);
+                const items = self.worktrees.list();
+                try snapshot.ensureTotalCapacityPrecise(self.allocator, items.len);
+                for (items) |*info| {
+                    snapshot.appendAssumeCapacity(try info.clone(self.allocator));
+                }
+            }
             try out.appendSlice(self.allocator, "{\"worktrees\":[");
-            for (items, 0..) |*info, i| {
+            for (snapshot.items, 0..) |*info, i| {
                 if (i > 0) try out.append(self.allocator, ',');
-                const cfs = self.worktrees.conflicts(info.id) catch null;
-                defer if (cfs) |cs| {
-                    for (cs) |*c| c.deinit(self.allocator);
-                    self.allocator.free(cs);
-                };
-                const conflict_count: usize = if (cfs) |cs| cs.len else 0;
+                const conflict_count = readStoredConflictCount(self.allocator, self.io, info.state_path);
                 try appendWorktreeJson(self.allocator, out, info, info.id == self.primary_wt_id, conflict_count);
             }
             try out.appendSlice(self.allocator, "]}");
             return;
         }
 
-        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/worktrees/scratch")) {
+        if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/api/worktrees") or std.mem.eql(u8, path, "/api/worktrees/scratch"))) {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
             defer parsed.deinit();
             const title = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse "scratch";
+            if (std.mem.eql(u8, path, "/api/worktrees")) {
+                if (rpc.jsonStr(rpc.jsonObjGet(parsed.value, "source_id"))) |src_hex| {
+                    if (src_hex.len > 0) {
+                        const src_id = try id.parseIdHex(src_hex);
+                        const ref_raw = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "ref_name")) orelse "";
+                        const ref_opt: ?[]const u8 = if (ref_raw.len > 0) ref_raw else null;
+                        try self.handleWorktreeFork(src_id, title, ref_opt, out);
+                        return;
+                    }
+                }
+                if (rpc.jsonStr(rpc.jsonObjGet(parsed.value, "path"))) |adopt_path| {
+                    if (adopt_path.len > 0) {
+                        try self.handleWorktreeAdopt(adopt_path, title, out);
+                        return;
+                    }
+                }
+            }
             self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            var info = try self.worktrees.scratch(title);
+            var info = self.worktrees.scratch(title) catch |err| {
+                self.mu.unlock(self.io);
+                return err;
+            };
+            self.mu.unlock(self.io);
             defer info.deinit(self.allocator);
             try out.appendSlice(self.allocator, "{\"worktree\":");
             try appendWorktreeJson(self.allocator, out, &info, false, 0);
             try out.append(self.allocator, '}');
+            self.emitWorktreesUpdated();
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/worktrees/adopt")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const adopt_path = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "path")) orelse return error.MissingPath;
+            const title = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse "adopted";
+            try self.handleWorktreeAdopt(adopt_path, title, out);
             return;
         }
 
@@ -3107,13 +3634,7 @@ pub const PlaygroundServer = struct {
             const ref_raw = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "ref_name")) orelse "";
             const src_id: u128 = if (src_hex.len > 0) try id.parseIdHex(src_hex) else self.primary_wt_id;
             const ref_opt: ?[]const u8 = if (ref_raw.len > 0) ref_raw else null;
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            var info = try self.worktrees.fork(src_id, title, null, ref_opt);
-            defer info.deinit(self.allocator);
-            try out.appendSlice(self.allocator, "{\"worktree\":");
-            try appendWorktreeJson(self.allocator, out, &info, false, 0);
-            try out.append(self.allocator, '}');
+            try self.handleWorktreeFork(src_id, title, ref_opt, out);
             return;
         }
 
@@ -3122,23 +3643,7 @@ pub const PlaygroundServer = struct {
             defer parsed.deinit();
             const wid_hex = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "worktree_id")) orelse return error.MissingWorktreeId;
             const wid = try id.parseIdHex(wid_hex);
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            var rep = try self.worktrees.syncFork(wid);
-            defer rep.deinit(self.allocator);
-            try out.print(self.allocator, "{{\"brought\":{d},\"merged\":[", .{rep.brought});
-            for (rep.merged, 0..) |mp, i| {
-                if (i > 0) try out.append(self.allocator, ',');
-                try rpc.appendJsonEscaped(self.allocator, out, mp);
-            }
-            try out.appendSlice(self.allocator, "],\"conflicts\":[");
-            for (rep.conflicts, 0..) |*c, i| {
-                if (i > 0) try out.append(self.allocator, ',');
-                try out.appendSlice(self.allocator, "{\"path\":");
-                try rpc.appendJsonEscaped(self.allocator, out, c.path);
-                try out.print(self.allocator, ",\"kind\":\"{s}\"}}", .{@tagName(c.kind)});
-            }
-            try out.appendSlice(self.allocator, "]}");
+            try self.handleWorktreeSync(wid, out);
             return;
         }
 
@@ -3147,11 +3652,7 @@ pub const PlaygroundServer = struct {
             defer parsed.deinit();
             const wid_hex = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "worktree_id")) orelse return error.MissingWorktreeId;
             const wid = try id.parseIdHex(wid_hex);
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            var rep = try self.worktrees.landFork(wid);
-            defer rep.deinit(self.allocator);
-            try out.print(self.allocator, "{{\"landed\":{d},\"brought\":{d}}}", .{ rep.landed, rep.sync.brought });
+            try self.handleWorktreeLand(wid, out);
             return;
         }
 
@@ -3159,24 +3660,8 @@ pub const PlaygroundServer = struct {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
             defer parsed.deinit();
             const wid_hex = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "worktree_id")) orelse return error.MissingWorktreeId;
-            const rel = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "path")) orelse return error.MissingPath;
-            if (!isSafeRelPath(rel)) return error.InvalidPath;
-            const res_str = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "resolution")) orelse return error.MissingResolution;
             const wid = try id.parseIdHex(wid_hex);
-            const res: wt_mod.Resolution = if (std.mem.eql(u8, res_str, "ours"))
-                .ours
-            else if (std.mem.eql(u8, res_str, "theirs"))
-                .theirs
-            else if (std.mem.eql(u8, res_str, "delete"))
-                .{ .content = null }
-            else if (std.mem.eql(u8, res_str, "content"))
-                .{ .content = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "content")) orelse "" }
-            else
-                return error.InvalidResolution;
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            try self.worktrees.resolveConflict(wid, rel, res);
-            try out.appendSlice(self.allocator, "{\"ok\":true}");
+            try self.handleWorktreeResolveParsed(wid, parsed.value, out);
             return;
         }
 
@@ -3186,40 +3671,381 @@ pub const PlaygroundServer = struct {
                 const wid = try id.parseIdHex(rest[0..slash]);
                 const sub = rest[slash + 1 ..];
                 if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "conflicts")) {
+                    try self.handleWorktreeConflicts(wid, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "fork")) {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                    defer parsed.deinit();
+                    const title = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "title")) orelse "fork";
+                    const ref_raw = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "ref_name")) orelse "";
+                    const ref_opt: ?[]const u8 = if (ref_raw.len > 0) ref_raw else null;
+                    try self.handleWorktreeFork(wid, title, ref_opt, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "sync")) {
+                    try self.handleWorktreeSync(wid, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "land")) {
+                    try self.handleWorktreeLand(wid, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "resolve")) {
+                    try self.handleWorktreeResolve(wid, body, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub, "remove")) {
+                    var force = false;
+                    var delete_ref = false;
+                    if (body.len > 0) {
+                        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+                        defer parsed.deinit();
+                        if (rpc.jsonObjGet(parsed.value, "force")) |fv| {
+                            if (fv == .bool) force = fv.bool;
+                        }
+                        if (rpc.jsonObjGet(parsed.value, "delete_ref")) |dv| {
+                            if (dv == .bool) delete_ref = dv.bool;
+                        }
+                    }
+                    try self.handleWorktreeRemove(wid, force, delete_ref, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "files")) {
                     self.mu.lockUncancelable(self.io);
                     defer self.mu.unlock(self.io);
-                    const cfs = try self.worktrees.conflicts(wid);
-                    defer {
-                        for (cfs) |*c| c.deinit(self.allocator);
-                        self.allocator.free(cfs);
-                    }
-                    try out.appendSlice(self.allocator, "{\"conflicts\":[");
-                    for (cfs, 0..) |*c, i| {
-                        if (i > 0) try out.append(self.allocator, ',');
-                        try out.appendSlice(self.allocator, "{\"path\":");
-                        try rpc.appendJsonEscaped(self.allocator, out, c.path);
-                        try out.print(self.allocator, ",\"kind\":\"{s}\",\"ours\":", .{@tagName(c.kind)});
-                        try appendOptTruncated(self.allocator, out, c.ours);
-                        try out.appendSlice(self.allocator, ",\"theirs\":");
-                        try appendOptTruncated(self.allocator, out, c.theirs);
-                        try out.append(self.allocator, '}');
-                    }
-                    try out.appendSlice(self.allocator, "]}");
+                    const ws = self.worktrees.getWorkspace(wid) orelse return error.WorktreeNotFound;
+                    try self.appendFilesJsonLocked(ws, wid == self.primary_wt_id, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "file")) {
+                    const decoded_p = (try queryParamAlloc(self.allocator, query, "path")) orelse return error.MissingPath;
+                    defer self.allocator.free(decoded_p);
+                    if (!isSafeRelPath(decoded_p)) return error.InvalidPath;
+                    self.mu.lockUncancelable(self.io);
+                    defer self.mu.unlock(self.io);
+                    const ws = self.worktrees.getWorkspace(wid) orelse return error.WorktreeNotFound;
+                    try self.appendFileJsonLocked(ws, decoded_p, query, out);
+                    return;
+                }
+                if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, sub, "history")) {
+                    const limit_str = try queryParamAlloc(self.allocator, query, "limit");
+                    defer if (limit_str) |s| self.allocator.free(s);
+                    const limit = if (limit_str) |s| (std.fmt.parseInt(usize, s, 10) catch 200) else 200;
+                    self.mu.lockUncancelable(self.io);
+                    defer self.mu.unlock(self.io);
+                    const ws = self.worktrees.getWorkspace(wid) orelse return error.WorktreeNotFound;
+                    try self.appendHistoryJsonLocked(ws, limit, out);
                     return;
                 }
             } else if (std.mem.eql(u8, method, "DELETE")) {
                 const wid = try id.parseIdHex(rest);
-                const force = std.mem.eql(u8, queryParam(query, "force") orelse "0", "1");
-                const delete_ref = std.mem.eql(u8, queryParam(query, "delete_ref") orelse "0", "1");
-                self.mu.lockUncancelable(self.io);
-                defer self.mu.unlock(self.io);
-                try self.worktrees.remove(wid, force, delete_ref);
-                try out.appendSlice(self.allocator, "{\"ok\":true}");
+                const force_str = try queryParamAlloc(self.allocator, query, "force");
+                defer if (force_str) |s| self.allocator.free(s);
+                const del_str = try queryParamAlloc(self.allocator, query, "delete_ref");
+                defer if (del_str) |s| self.allocator.free(s);
+                const force = if (force_str) |s| std.mem.eql(u8, s, "1") else false;
+                const delete_ref = if (del_str) |s| std.mem.eql(u8, s, "1") else false;
+                try self.handleWorktreeRemove(wid, force, delete_ref, out);
                 return;
             }
         }
 
         return error.NotFound;
+    }
+
+    fn threadWorktreeId(self: *PlaygroundServer, tid: u128) !u128 {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const t = self.engine.journal.threads.get(tid) orelse return error.ThreadNotFound;
+        return if (t.worktree_id != 0) t.worktree_id else self.primary_wt_id;
+    }
+
+    fn emitWorktreesUpdated(self: *PlaygroundServer) void {
+        self.broadcastSse("{\"type\":\"worktrees_updated\"}");
+    }
+
+    fn handleWorktreeAdopt(self: *PlaygroundServer, adopt_path: []const u8, title: []const u8, out: *std.ArrayList(u8)) !void {
+        if (adopt_path.len == 0 or adopt_path.len > 4096) return error.InvalidPath;
+        if (std.mem.indexOfScalar(u8, adopt_path, 0) != null) return error.InvalidPath;
+        var d = Io.Dir.cwd().openDir(self.io, adopt_path, .{}) catch return error.InvalidPath;
+        d.close(self.io);
+        self.mu.lockUncancelable(self.io);
+        var info = self.worktrees.adopt(adopt_path, title) catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        self.mu.unlock(self.io);
+        defer info.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"worktree\":");
+        try appendWorktreeJson(self.allocator, out, &info, info.id == self.primary_wt_id, 0);
+        try out.append(self.allocator, '}');
+        self.emitWorktreesUpdated();
+    }
+
+    fn handleWorktreeFork(self: *PlaygroundServer, src_id: u128, title: []const u8, ref_opt: ?[]const u8, out: *std.ArrayList(u8)) !void {
+        self.mu.lockUncancelable(self.io);
+        var info = self.worktrees.fork(src_id, title, null, ref_opt) catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        self.mu.unlock(self.io);
+        defer info.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"worktree\":");
+        try appendWorktreeJson(self.allocator, out, &info, false, 0);
+        try out.append(self.allocator, '}');
+        self.emitWorktreesUpdated();
+    }
+
+    fn handleWorktreeSync(self: *PlaygroundServer, wid: u128, out: *std.ArrayList(u8)) !void {
+        self.mu.lockUncancelable(self.io);
+        var rep = self.worktrees.syncFork(wid) catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        self.mu.unlock(self.io);
+        defer rep.deinit(self.allocator);
+        try out.print(self.allocator, "{{\"brought\":{d},\"merged\":[", .{rep.brought});
+        for (rep.merged, 0..) |mp, i| {
+            if (i > 0) try out.append(self.allocator, ',');
+            try rpc.appendJsonEscaped(self.allocator, out, mp);
+        }
+        try out.appendSlice(self.allocator, "],\"conflicts\":[");
+        for (rep.conflicts, 0..) |*c, i| {
+            if (i > 0) try out.append(self.allocator, ',');
+            try out.appendSlice(self.allocator, "{\"path\":");
+            try rpc.appendJsonEscaped(self.allocator, out, c.path);
+            try out.print(self.allocator, ",\"kind\":\"{s}\"}}", .{@tagName(c.kind)});
+        }
+        try out.appendSlice(self.allocator, "]}");
+        self.emitWorktreesUpdated();
+    }
+
+    fn handleWorktreeLand(self: *PlaygroundServer, wid: u128, out: *std.ArrayList(u8)) !void {
+        self.mu.lockUncancelable(self.io);
+        var rep = self.worktrees.landFork(wid) catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        self.mu.unlock(self.io);
+        defer rep.deinit(self.allocator);
+        try out.print(self.allocator, "{{\"landed\":{d},\"brought\":{d}}}", .{ rep.landed, rep.sync.brought });
+        self.emitWorktreesUpdated();
+    }
+
+    fn handleWorktreeConflicts(self: *PlaygroundServer, wid: u128, out: *std.ArrayList(u8)) !void {
+        self.mu.lockUncancelable(self.io);
+        const cfs = self.worktrees.conflicts(wid) catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        self.mu.unlock(self.io);
+        defer {
+            for (cfs) |*c| c.deinit(self.allocator);
+            self.allocator.free(cfs);
+        }
+        try out.appendSlice(self.allocator, "{\"conflicts\":[");
+        for (cfs, 0..) |*c, i| {
+            if (i > 0) try out.append(self.allocator, ',');
+            try out.appendSlice(self.allocator, "{\"path\":");
+            try rpc.appendJsonEscaped(self.allocator, out, c.path);
+            try out.print(self.allocator, ",\"kind\":\"{s}\",\"ours\":", .{@tagName(c.kind)});
+            try appendOptTruncated(self.allocator, out, c.ours);
+            try out.appendSlice(self.allocator, ",\"theirs\":");
+            try appendOptTruncated(self.allocator, out, c.theirs);
+            try out.append(self.allocator, '}');
+        }
+        try out.appendSlice(self.allocator, "]}");
+    }
+
+    fn handleWorktreeResolve(self: *PlaygroundServer, wid: u128, body: []const u8, out: *std.ArrayList(u8)) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+        defer parsed.deinit();
+        try self.handleWorktreeResolveParsed(wid, parsed.value, out);
+    }
+
+    fn handleWorktreeResolveParsed(self: *PlaygroundServer, wid: u128, val: std.json.Value, out: *std.ArrayList(u8)) !void {
+        const rel = rpc.jsonStr(rpc.jsonObjGet(val, "path")) orelse return error.MissingPath;
+        if (!isSafeRelPath(rel)) return error.InvalidPath;
+        const res_str = rpc.jsonStr(rpc.jsonObjGet(val, "resolution")) orelse return error.MissingResolution;
+        const res: wt_mod.Resolution = if (std.mem.eql(u8, res_str, "ours"))
+            .ours
+        else if (std.mem.eql(u8, res_str, "theirs"))
+            .theirs
+        else if (std.mem.eql(u8, res_str, "delete"))
+            .{ .content = null }
+        else if (std.mem.eql(u8, res_str, "content"))
+            .{ .content = rpc.jsonStr(rpc.jsonObjGet(val, "content")) orelse "" }
+        else
+            return error.InvalidResolution;
+        self.mu.lockUncancelable(self.io);
+        self.worktrees.resolveConflict(wid, rel, res) catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        self.mu.unlock(self.io);
+        try out.appendSlice(self.allocator, "{\"ok\":true}");
+        self.emitWorktreesUpdated();
+    }
+
+    fn handleWorktreeRemove(self: *PlaygroundServer, wid: u128, force: bool, delete_ref: bool, out: *std.ArrayList(u8)) !void {
+        self.mu.lockUncancelable(self.io);
+        self.worktrees.remove(wid, force, delete_ref) catch |err| {
+            self.mu.unlock(self.io);
+            return err;
+        };
+        self.mu.unlock(self.io);
+        try out.appendSlice(self.allocator, "{\"ok\":true}");
+        self.emitWorktreesUpdated();
+    }
+
+    fn appendFilesJsonLocked(self: *PlaygroundServer, ws: *const ws_mod.Workspace, use_meta: bool, out: *std.ArrayList(u8)) !void {
+        const t0 = nowUs(self.io);
+        var paths: std.ArrayList([]u8) = .empty;
+        defer {
+            for (paths.items) |p| self.allocator.free(p);
+            paths.deinit(self.allocator);
+        }
+        try self.collectTrackedFilePathsFrom(ws, id.InodeId.ROOT, "", text_mod.View.EVERYTHING, &paths);
+        sortDedupePaths(self.allocator, &paths);
+        const ver_hex = try ws.history.dag.heads.formatHex(self.allocator);
+        defer self.allocator.free(ver_hex);
+        try out.appendSlice(self.allocator, "{\"version\":");
+        try rpc.appendJsonEscaped(self.allocator, out, ver_hex);
+        try out.appendSlice(self.allocator, ",\"files\":[");
+        for (paths.items, 0..) |p, i| {
+            if (i > 0) try out.append(self.allocator, ',');
+            var bytes_len: u64 = 0;
+            var lines_cnt: usize = 0;
+            if (try ws.history.tree.resolvePath(self.allocator, text_mod.View.EVERYTHING, p)) |iid| {
+                if (ws.history.tree.get(iid)) |inode| {
+                    if (inode.fileConstPtr()) |f| {
+                        bytes_len = f.text.visibleLen();
+                        lines_cnt = f.text.lineCount();
+                    }
+                }
+            }
+            const meta = if (use_meta) self.file_meta.get(p) else null;
+            try out.appendSlice(self.allocator, "{\"path\":");
+            try rpc.appendJsonEscaped(self.allocator, out, p);
+            try out.print(
+                self.allocator,
+                ",\"bytes\":{d},\"lines\":{d},\"changed_ms\":{d},\"kind\":\"{s}\"}}",
+                .{
+                    bytes_len,
+                    lines_cnt,
+                    if (meta) |m| m.changed_ms else id.nowMs(self.io),
+                    if (meta) |m| @tagName(m.kind) else "added",
+                },
+            );
+        }
+        try out.print(self.allocator, "],\"elapsed_us\":{d}}}", .{nowUs(self.io) -| t0});
+    }
+
+    fn appendFileJsonLocked(self: *PlaygroundServer, ws: *const ws_mod.Workspace, decoded_p: []const u8, query: []const u8, out: *std.ArrayList(u8)) !void {
+        const at_hex_opt = try queryParamAlloc(self.allocator, query, "at");
+        defer if (at_hex_opt) |s| self.allocator.free(s);
+        if (at_hex_opt) |at_hex| {
+            const mid = try id.parseIdHex(at_hex);
+            const msg = self.engine.journal.messages.getPtr(mid) orelse return error.MessageNotFound;
+            const side_opt = try queryParamAlloc(self.allocator, query, "side");
+            defer if (side_opt) |s| self.allocator.free(s);
+            const side = side_opt orelse "post";
+            const ver = if (std.mem.eql(u8, side, "pre")) &msg.pre_version else &msg.post_version;
+            const at_content = try ws.history.readFileAt(self.allocator, decoded_p, ver);
+            defer if (at_content) |c| self.allocator.free(c);
+            var mhex: [32]u8 = undefined;
+            _ = id.formatIdHex(mid, &mhex);
+            try out.appendSlice(self.allocator, "{\"path\":");
+            try rpc.appendJsonEscaped(self.allocator, out, decoded_p);
+            try out.appendSlice(self.allocator, ",\"content\":");
+            if (at_content) |c| {
+                try rpc.appendJsonEscaped(self.allocator, out, c);
+            } else {
+                try out.appendSlice(self.allocator, "null");
+            }
+            try out.print(self.allocator, ",\"at\":\"{s}\"}}", .{mhex});
+            return;
+        }
+        const total_lines: usize = blk: {
+            const iid = (try ws.history.tree.resolvePath(self.allocator, text_mod.View.EVERYTHING, decoded_p)) orelse break :blk 0;
+            const inode = ws.history.tree.get(iid) orelse break :blk 0;
+            const f = inode.fileConstPtr() orelse break :blk 0;
+            break :blk f.text.lineCount();
+        };
+        const ver_hex = try ws.history.dag.heads.formatHex(self.allocator);
+        defer self.allocator.free(ver_hex);
+        const start_param = try queryParamAlloc(self.allocator, query, "start_line");
+        defer if (start_param) |s| self.allocator.free(s);
+        const lines_param = try queryParamAlloc(self.allocator, query, "lines");
+        defer if (lines_param) |s| self.allocator.free(s);
+        if (start_param != null or lines_param != null) {
+            const start_1 = if (start_param) |s| std.fmt.parseInt(usize, s, 10) catch 1 else 1;
+            const clamped_1 = if (start_1 == 0) 1 else start_1;
+            const max_lines = if (lines_param) |l| std.fmt.parseInt(usize, l, 10) catch 200 else 200;
+            const slice = try ws.history.readFileLines(self.allocator, decoded_p, clamped_1 - 1, max_lines) orelse return error.FileNotFound;
+            defer self.allocator.free(slice);
+            try out.appendSlice(self.allocator, "{\"path\":");
+            try rpc.appendJsonEscaped(self.allocator, out, decoded_p);
+            try out.appendSlice(self.allocator, ",\"version\":");
+            try rpc.appendJsonEscaped(self.allocator, out, ver_hex);
+            try out.print(self.allocator, ",\"start_line\":{d},\"total_lines\":{d},\"content\":", .{ clamped_1, total_lines });
+            try rpc.appendJsonEscaped(self.allocator, out, slice);
+            try out.append(self.allocator, '}');
+            return;
+        }
+        const content = try ws.history.readFileAt(self.allocator, decoded_p, null) orelse return error.FileNotFound;
+        defer self.allocator.free(content);
+        try out.appendSlice(self.allocator, "{\"path\":");
+        try rpc.appendJsonEscaped(self.allocator, out, decoded_p);
+        try out.appendSlice(self.allocator, ",\"version\":");
+        try rpc.appendJsonEscaped(self.allocator, out, ver_hex);
+        try out.print(self.allocator, ",\"total_lines\":{d},\"content\":", .{total_lines});
+        try rpc.appendJsonEscaped(self.allocator, out, content);
+        try out.append(self.allocator, '}');
+    }
+
+    fn appendHistoryJsonLocked(self: *PlaygroundServer, ws: *const ws_mod.Workspace, limit: usize, out: *std.ArrayList(u8)) !void {
+        const t0 = nowUs(self.io);
+        const dag = &ws.history.dag;
+        var hdrs: std.ArrayList(*const dag_mod.BatchHeader) = .empty;
+        defer hdrs.deinit(self.allocator);
+        try hdrs.ensureTotalCapacityPrecise(self.allocator, dag.count());
+        var hit = dag.headers.valueIterator();
+        while (hit.next()) |h| hdrs.appendAssumeCapacity(h);
+        std.mem.sort(*const dag_mod.BatchHeader, hdrs.items, {}, struct {
+            fn newerFirst(_: void, a: *const dag_mod.BatchHeader, b: *const dag_mod.BatchHeader) bool {
+                if (a.wall_ms != b.wall_ms) return a.wall_ms > b.wall_ms;
+                if (a.start != b.start) return a.start > b.start;
+                return a.actor > b.actor;
+            }
+        }.newerFirst);
+        const shown = hdrs.items[0..@min(limit, hdrs.items.len)];
+        const elapsed = nowUs(self.io) -| t0;
+
+        try out.print(self.allocator, "{{\"elapsed_us\":{d},\"total\":{d},\"batches\":[", .{ elapsed, dag.count() });
+        for (shown, 0..) |h, i| {
+            if (i > 0) try out.append(self.allocator, ',');
+            var ahex: [32]u8 = undefined;
+            _ = id.formatIdHex(h.actor, &ahex);
+            try out.print(
+                self.allocator,
+                "{{\"id\":\"{s}:{d}\",\"actor\":\"{s}\",\"actor_label\":\"{s}\",\"start\":{d},\"end\":{d},\"ops\":{d},\"wall_ms\":{d},\"parents\":{d},\"head\":{}}}",
+                .{
+                    ahex,
+                    h.start,
+                    ahex,
+                    self.actorLabel(h.actor),
+                    h.start,
+                    h.end,
+                    h.opCount(),
+                    h.wall_ms,
+                    h.parents.slice().len,
+                    dag.heads.contains(h.batchId()),
+                },
+            );
+        }
+        try out.appendSlice(self.allocator, "]}");
     }
 
     fn collectTrackedFilePaths(
@@ -3229,7 +4055,18 @@ pub const PlaygroundServer = struct {
         view: text_mod.View,
         out: *std.ArrayList([]u8),
     ) !void {
-        var entries = try self.workspace.history.tree.listDir(self.allocator, view, dir_iid);
+        try self.collectTrackedFilePathsFrom(&self.workspace, dir_iid, prefix, view, out);
+    }
+
+    fn collectTrackedFilePathsFrom(
+        self: *const PlaygroundServer,
+        ws: *const ws_mod.Workspace,
+        dir_iid: id.InodeId,
+        prefix: []const u8,
+        view: text_mod.View,
+        out: *std.ArrayList([]u8),
+    ) !void {
+        var entries = try ws.history.tree.listDir(self.allocator, view, dir_iid);
         defer {
             for (entries.items) |*e| e.deinit(self.allocator);
             entries.deinit(self.allocator);
@@ -3239,13 +4076,13 @@ pub const PlaygroundServer = struct {
                 try self.allocator.dupe(u8, entry.name)
             else
                 try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, entry.name });
-            const inode = self.workspace.history.tree.get(entry.inode_id) orelse {
+            const inode = ws.history.tree.get(entry.inode_id) orelse {
                 self.allocator.free(rel);
                 continue;
             };
             if (inode.isDir()) {
                 defer self.allocator.free(rel);
-                try self.collectTrackedFilePaths(entry.inode_id, rel, view, out);
+                try self.collectTrackedFilePathsFrom(ws, entry.inode_id, rel, view, out);
             } else {
                 out.append(self.allocator, rel) catch |err| {
                     self.allocator.free(rel);
@@ -3306,6 +4143,15 @@ pub const PlaygroundServer = struct {
         provider_slug: []const u8,
         mdl: ?[]const u8,
     ) !void {
+        if (self.active_workers.fetchAdd(1, .acq_rel) >= MAX_WORKERS) {
+            _ = self.active_workers.fetchSub(1, .release);
+            return error.TooManyWorkers;
+        }
+        errdefer _ = self.active_workers.fetchSub(1, .release);
+
+        try self.acquireThreadTurn(thread_id);
+        errdefer self.releaseThreadTurn(thread_id);
+
         const wa = try self.allocator.create(WorkerArgs);
         errdefer self.allocator.destroy(wa);
         const prompt_dup = try self.allocator.dupe(u8, prompt);
@@ -3333,7 +4179,10 @@ pub const PlaygroundServer = struct {
 
     fn workerMain(wa: *WorkerArgs) void {
         const self = wa.srv;
+        const tid = wa.thread_id;
         defer _ = self.active_threads.fetchSub(1, .release);
+        defer _ = self.active_workers.fetchSub(1, .release);
+        defer self.releaseThreadTurn(tid);
         defer {
             self.allocator.free(wa.prompt);
             self.allocator.free(wa.provider_slug);
@@ -3344,33 +4193,33 @@ pub const PlaygroundServer = struct {
         switch (wa.mode) {
             .send_new => {
                 self.mu.lockUncancelable(self.io);
-                const t = self.engine.journal.threads.get(wa.thread_id) orelse {
+                const t = self.engine.journal.threads.get(tid) orelse {
                     self.mu.unlock(self.io);
                     return;
                 };
                 const prov = parseProviderSlug(wa.provider_slug);
-                const uid = self.engine.appendUserMessage(wa.thread_id, t.leaf_msg_id, .user, wa.prompt, prov, wa.model, null, null) catch {
+                const uid = self.engine.appendUserMessage(tid, t.leaf_msg_id, .user, wa.prompt, prov, wa.model, null, null) catch {
                     self.mu.unlock(self.io);
                     return;
                 };
                 self.mu.unlock(self.io);
-                self.emitSessionEvent(wa.thread_id);
-                self.executeStreamingTurn(wa.thread_id, uid, wa.prompt, wa.provider_slug, wa.model);
-                self.drainPendingFollowUps(wa.thread_id);
+                self.emitSessionEvent(tid);
+                self.executeStreamingTurn(tid, uid, wa.prompt, wa.provider_slug, wa.model);
+                self.drainPendingFollowUps(tid);
             },
             .reply_existing => {
                 const pid = wa.parent_msg_id orelse return;
-                self.executeStreamingTurn(wa.thread_id, pid, wa.prompt, wa.provider_slug, wa.model);
-                self.drainPendingFollowUps(wa.thread_id);
+                self.executeStreamingTurn(tid, pid, wa.prompt, wa.provider_slug, wa.model);
+                self.drainPendingFollowUps(tid);
             },
             .drain_queue => {
-                self.drainPendingFollowUps(wa.thread_id);
+                self.drainPendingFollowUps(tid);
             },
         }
     }
 
     fn drainPendingFollowUps(self: *PlaygroundServer, thread_id: u128) void {
-        while (true) {
+        while (self.running.load(.acquire)) {
             self.mu.lockUncancelable(self.io);
             const pending_ids = self.engine.journal.pendingQueueForThread(self.allocator, thread_id) catch {
                 self.mu.unlock(self.io);
@@ -3406,9 +4255,17 @@ pub const PlaygroundServer = struct {
                 return;
             };
             const mdl_copy: ?[]u8 = if (disp.model) |m| (self.allocator.dupe(u8, m) catch null) else null;
-            self.engine.journal.putQueueItem(disp) catch {};
+            const disp_prov = disp.provider;
+            self.engine.journal.putQueueItem(disp) catch {
+                disp.deinit(self.allocator);
+                self.allocator.free(prompt_copy);
+                self.allocator.free(prov_slug);
+                if (mdl_copy) |m| self.allocator.free(m);
+                self.mu.unlock(self.io);
+                return;
+            };
             const leaf = if (self.engine.journal.threads.get(thread_id)) |t| t.leaf_msg_id else null;
-            const uid = self.engine.appendUserMessage(thread_id, leaf, .user, prompt_copy, disp.provider, mdl_copy, null, null) catch {
+            const uid = self.engine.appendUserMessage(thread_id, leaf, .user, prompt_copy, disp_prov, mdl_copy, null, null) catch {
                 self.allocator.free(prompt_copy);
                 self.allocator.free(prov_slug);
                 if (mdl_copy) |m| self.allocator.free(m);
@@ -3431,7 +4288,9 @@ pub const PlaygroundServer = struct {
                     var done = done_init;
                     done.status = .completed;
                     done.updated_ms = id.nowMs(self.io);
-                    self.engine.journal.putQueueItem(done) catch {};
+                    self.engine.journal.putQueueItem(done) catch {
+                        done.deinit(self.allocator);
+                    };
                 } else |_| {}
             }
             self.mu.unlock(self.io);
@@ -3454,7 +4313,7 @@ pub const PlaygroundServer = struct {
         defer self.allocator.free(cur_prompt);
         const prov = parseProviderSlug(provider_slug);
 
-        while (true) {
+        while (self.running.load(.acquire)) {
             var trace: Trace = .{ .started_ms = 0 };
             defer trace.deinit(self.allocator);
 
@@ -3483,14 +4342,24 @@ pub const PlaygroundServer = struct {
                 self.mu.unlock(self.io);
                 return;
             };
+            const init_content = self.allocator.dupe(u8, "") catch {
+                var pv = pre_ver;
+                pv.deinit(self.allocator);
+                var piv = post_init;
+                piv.deinit(self.allocator);
+                plan.deinit(self.allocator);
+                self.allocator.free(root_copy);
+                self.mu.unlock(self.io);
+                return;
+            };
             const asst_id = id.newUuidV7(self.io);
             const now = id.nowMs(self.io);
-            const running_msg = model.Message{
+            var running_msg = model.Message{
                 .msg_id = asst_id,
                 .thread_id = thread_id,
                 .parent_id = cur_parent,
                 .role = .assistant,
-                .content = self.allocator.dupe(u8, "") catch "",
+                .content = init_content,
                 .provider = prov,
                 .model = if (model_opt) |m| (self.allocator.dupe(u8, m) catch null) else null,
                 .native_session = if (plan.resume_id) |rs| (self.allocator.dupe(u8, rs) catch null) else null,
@@ -3506,14 +4375,22 @@ pub const PlaygroundServer = struct {
                 .created_ms = now,
                 .updated_ms = now,
             };
-            self.engine.journal.putMessage(running_msg, false) catch {};
+            self.engine.journal.putMessage(running_msg, false) catch {
+                running_msg.deinit(self.allocator);
+                plan.deinit(self.allocator);
+                self.allocator.free(root_copy);
+                self.mu.unlock(self.io);
+                return;
+            };
             self.engine.journal.setBranchChoice(thread_id, cur_parent, asst_id) catch {};
             if (self.engine.journal.threads.getPtr(thread_id)) |t| {
                 if (t.clone(self.allocator)) |u_init| {
                     var u = u_init;
                     u.status = .running;
                     u.updated_ms = now;
-                    self.engine.journal.putThread(u) catch {};
+                    self.engine.journal.putThread(u) catch {
+                        u.deinit(self.allocator);
+                    };
                 } else |_| {}
             }
             var turn_scope_id: ?u128 = turn_ws.beginScope(.turn, turn_ws.disk_actor, "turn") catch null;
@@ -3579,7 +4456,7 @@ pub const PlaygroundServer = struct {
                             .model = model_opt,
                             .resume_id = if (use_resume) plan.resume_id else null,
                             .fork_at = if (use_resume) plan.fork_at else null,
-                            .access = .full,
+                            .access = self.default_access,
                         })) catch |err| {
                         if (use_resume and plan.handoff_prompt != null) {
                             use_resume = false;
@@ -3773,6 +4650,8 @@ pub const PlaygroundServer = struct {
 
             var vhead = vcs.head(self.allocator, self.io, root_copy) catch vcs.VcsHead{};
             defer vhead.deinit(self.allocator);
+            const end_ms = id.nowMs(self.io);
+            self.finalizeTrace(asst_id, &trace, end_ms, null);
 
             self.mu.lockUncancelable(self.io);
             const ws_done = self.engine.workspaceForThread(thread_id);
@@ -3786,13 +4665,13 @@ pub const PlaygroundServer = struct {
                 turn_scope_id = null;
             }
             const post_ver = ws_done.history.headsClone() catch version_mod.Version.ROOT;
-            const end_ms = id.nowMs(self.io);
-            self.finalizeTrace(asst_id, &trace, end_ms, null);
             if (self.engine.journal.messages.getPtr(asst_id)) |existing| {
                 if (existing.clone(self.allocator)) |s_init| {
                     var sealed = s_init;
-                    self.allocator.free(sealed.content);
-                    sealed.content = self.allocator.dupe(u8, acc_text.items) catch "";
+                    if (self.allocator.dupe(u8, acc_text.items)) |new_content| {
+                        self.allocator.free(sealed.content);
+                        sealed.content = new_content;
+                    } else |_| {}
                     if (sealed.native_session) |old| self.allocator.free(old);
                     sealed.native_session = if (native_session) |ns| (self.allocator.dupe(u8, ns) catch null) else null;
                     if (sealed.native_turn) |old| self.allocator.free(old);
@@ -3805,8 +4684,16 @@ pub const PlaygroundServer = struct {
                     sealed.post_version = post_ver;
                     sealed.status = final_status;
                     sealed.updated_ms = end_ms;
-                    self.engine.journal.putMessage(sealed, true) catch {};
-                } else |_| {}
+                    self.engine.journal.putMessage(sealed, true) catch {
+                        sealed.deinit(self.allocator);
+                    };
+                } else |_| {
+                    var pv = post_ver;
+                    pv.deinit(self.allocator);
+                }
+            } else {
+                var pv = post_ver;
+                pv.deinit(self.allocator);
             }
             if (self.engine.journal.threads.getPtr(thread_id)) |t| {
                 if (t.clone(self.allocator)) |u_init| {
@@ -3817,14 +4704,24 @@ pub const PlaygroundServer = struct {
                     u.status = if (fallback_prompt != null) .steering else if (u.queued_count > 0) .queued else .idle;
                     var count_m: u32 = 0;
                     var c_id: ?u128 = asst_id;
+                    var slow_id: ?u128 = asst_id;
                     while (c_id) |cid| {
+                        if (count_m >= MAX_MSG_CHAIN_DEPTH) break;
                         const mm = self.engine.journal.messages.get(cid) orelse break;
                         count_m += 1;
                         c_id = mm.parent_id;
+                        if (count_m % 2 == 0) {
+                            if (slow_id) |sid| {
+                                slow_id = if (self.engine.journal.messages.get(sid)) |sm| sm.parent_id else null;
+                            }
+                        }
+                        if (c_id != null and slow_id != null and c_id.? == slow_id.?) break;
                     }
                     u.message_count = count_m;
                     u.updated_ms = end_ms;
-                    self.engine.journal.putThread(u) catch {};
+                    self.engine.journal.putThread(u) catch {
+                        u.deinit(self.allocator);
+                    };
                 } else |_| {}
             }
             self.mu.unlock(self.io);
@@ -3859,21 +4756,27 @@ pub const PlaygroundServer = struct {
         var u = q.clone(self.allocator) catch return;
         u.status = status;
         u.updated_ms = id.nowMs(self.io);
-        self.engine.journal.putQueueItem(u) catch {};
+        self.engine.journal.putQueueItem(u) catch {
+            u.deinit(self.allocator);
+        };
     }
 
     fn finishTurnError(self: *PlaygroundServer, ctx: *const TurnCtx, trace: *Trace, err_name: []const u8) void {
-        self.mu.lockUncancelable(self.io);
         const now = id.nowMs(self.io);
         self.finalizeTrace(ctx.msg_id, trace, now, err_name);
+        self.mu.lockUncancelable(self.io);
         if (self.engine.journal.messages.getPtr(ctx.msg_id)) |existing| {
             if (existing.clone(self.allocator)) |s_init| {
                 var sealed = s_init;
-                self.allocator.free(sealed.content);
-                sealed.content = std.fmt.allocPrint(self.allocator, "Provider error: {s}", .{err_name}) catch "";
+                if (std.fmt.allocPrint(self.allocator, "Provider error: {s}", .{err_name})) |msg_str| {
+                    self.allocator.free(sealed.content);
+                    sealed.content = msg_str;
+                } else |_| {}
                 sealed.status = .failed;
                 sealed.updated_ms = now;
-                self.engine.journal.putMessage(sealed, true) catch {};
+                self.engine.journal.putMessage(sealed, true) catch {
+                    sealed.deinit(self.allocator);
+                };
             } else |_| {}
         }
         if (self.engine.journal.threads.getPtr(ctx.thread_id)) |t| {
@@ -3882,7 +4785,9 @@ pub const PlaygroundServer = struct {
                 u.leaf_msg_id = ctx.msg_id;
                 u.status = .failed;
                 u.updated_ms = now;
-                self.engine.journal.putThread(u) catch {};
+                self.engine.journal.putThread(u) catch {
+                    u.deinit(self.allocator);
+                };
             } else |_| {}
         }
         self.mu.unlock(self.io);
@@ -3890,7 +4795,7 @@ pub const PlaygroundServer = struct {
         self.emitTurnCompletedEvent(ctx.thread_id);
     }
 
-    fn appendPageJsonLocked(
+    fn appendPageJson(
         self: *PlaygroundServer,
         tid: u128,
         before_id: ?u128,
@@ -3898,18 +4803,31 @@ pub const PlaygroundServer = struct {
         out: *std.ArrayList(u8),
     ) !void {
         const t0 = nowUs(self.io);
-        var page = try self.engine.getPage(self.allocator, tid, before_id, limit);
+        var sibs_list: std.ArrayList([]u128) = .empty;
+        defer {
+            for (sibs_list.items) |s| self.allocator.free(s);
+            sibs_list.deinit(self.allocator);
+        }
+        var page = blk: {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            var p = try self.engine.getPage(self.allocator, tid, before_id, limit);
+            errdefer p.deinit(self.allocator);
+            try sibs_list.ensureTotalCapacityPrecise(self.allocator, p.messages.len);
+            for (p.messages) |m| {
+                sibs_list.appendAssumeCapacity(try self.siblingsIncluding(m.msg_id));
+            }
+            break :blk p;
+        };
         defer page.deinit(self.allocator);
         const elapsed = nowUs(self.io) -| t0;
 
         try out.appendSlice(self.allocator, "{\"messages\":[");
         for (page.messages, 0..) |m, i| {
             if (i > 0) try out.append(self.allocator, ',');
-            const sibs = try self.siblingsIncluding(m.msg_id);
-            defer self.allocator.free(sibs);
             const trace_json = self.traceJsonFor(m.msg_id);
             defer if (trace_json) |tj| self.allocator.free(tj);
-            try appendMessageJson(self.allocator, out, &m, sibs, trace_json);
+            try appendMessageJson(self.allocator, out, &m, sibs_list.items[i], trace_json);
         }
         try out.print(self.allocator, "],\"has_more\":{},\"elapsed_us\":{d},\"next_before\":", .{ page.has_more, elapsed });
         if (page.next_before) |nb| {
@@ -3930,7 +4848,7 @@ pub const PlaygroundServer = struct {
         try out.append(self.allocator, '}');
     }
 
-    fn appendBranchPreviewJsonLocked(
+    fn appendBranchPreviewJson(
         self: *PlaygroundServer,
         tid: u128,
         branch_mid: u128,
@@ -3939,62 +4857,102 @@ pub const PlaygroundServer = struct {
         out: *std.ArrayList(u8),
     ) !void {
         const t0 = nowUs(self.io);
-        _ = self.engine.journal.threads.get(tid) orelse return error.ThreadNotFound;
-        const target = self.engine.journal.messages.get(branch_mid) orelse return error.MessageNotFound;
-        if (target.thread_id != tid) return error.MessageWrongThread;
+        var cloned_msgs: std.ArrayList(model.Message) = .empty;
+        defer {
+            for (cloned_msgs.items) |*m| m.deinit(self.allocator);
+            cloned_msgs.deinit(self.allocator);
+        }
+        var sibs_list: std.ArrayList([]u128) = .empty;
+        defer {
+            for (sibs_list.items) |s| self.allocator.free(s);
+            sibs_list.deinit(self.allocator);
+        }
+        var has_more = false;
+        var next_before_id: ?u128 = null;
 
-        const leaf = self.engine.journal.resolveBranchLeaf(tid, branch_mid);
-        var effective_limit: usize = if (limit == 0) self.engine.page_size else limit;
         {
-            var cur: ?u128 = leaf;
-            var count: usize = 0;
-            while (cur) |cid| : (count += 1) {
-                if (count >= 1000) break;
-                if (cid == branch_mid) {
-                    effective_limit = @max(effective_limit, count + 1);
-                    if (from_mid == null) break;
-                }
-                if (from_mid) |fmid| {
-                    if (cid == fmid) {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            _ = self.engine.journal.threads.get(tid) orelse return error.ThreadNotFound;
+            const target = self.engine.journal.messages.get(branch_mid) orelse return error.MessageNotFound;
+            if (target.thread_id != tid) return error.MessageWrongThread;
+
+            const leaf = self.engine.journal.resolveBranchLeaf(tid, branch_mid);
+            var effective_limit: usize = if (limit == 0) self.engine.page_size else limit;
+            {
+                var cur: ?u128 = leaf;
+                var slow: ?u128 = leaf;
+                var count: usize = 0;
+                while (cur) |cid| : (count += 1) {
+                    if (count >= 1000) break;
+                    if (cid == branch_mid) {
                         effective_limit = @max(effective_limit, count + 1);
-                        break;
+                        if (from_mid == null) break;
                     }
+                    if (from_mid) |fmid| {
+                        if (cid == fmid) {
+                            effective_limit = @max(effective_limit, count + 1);
+                            break;
+                        }
+                    }
+                    const m = self.engine.journal.messages.get(cid) orelse break;
+                    cur = m.parent_id;
+                    if (count % 2 == 1) {
+                        if (slow) |sid| {
+                            slow = if (self.engine.journal.messages.get(sid)) |sm| sm.parent_id else null;
+                        }
+                    }
+                    if (cur != null and slow != null and cur.? == slow.?) break;
+                }
+            }
+
+            var rev: std.ArrayList(u128) = .empty;
+            defer rev.deinit(self.allocator);
+            var cur: ?u128 = leaf;
+            var slow: ?u128 = leaf;
+            var step: usize = 0;
+            while (cur) |cid| : (step += 1) {
+                if (step >= MAX_MSG_CHAIN_DEPTH) break;
+                if (rev.items.len >= effective_limit) {
+                    has_more = true;
+                    break;
                 }
                 const m = self.engine.journal.messages.get(cid) orelse break;
+                try rev.append(self.allocator, cid);
                 cur = m.parent_id;
+                if (step % 2 == 1) {
+                    if (slow) |sid| {
+                        slow = if (self.engine.journal.messages.get(sid)) |sm| sm.parent_id else null;
+                    }
+                }
+                if (cur != null and slow != null and cur.? == slow.?) break;
             }
-        }
+            if (has_more and rev.items.len > 0) {
+                next_before_id = rev.items[rev.items.len - 1];
+            }
 
-        var rev: std.ArrayList(u128) = .empty;
-        defer rev.deinit(self.allocator);
-        var cur: ?u128 = leaf;
-        var has_more = false;
-        while (cur) |cid| {
-            if (rev.items.len >= effective_limit) {
-                has_more = true;
-                break;
+            try cloned_msgs.ensureTotalCapacityPrecise(self.allocator, rev.items.len);
+            try sibs_list.ensureTotalCapacityPrecise(self.allocator, rev.items.len);
+            for (0..rev.items.len) |i| {
+                const cid = rev.items[rev.items.len - 1 - i];
+                const m = self.engine.journal.messages.getPtr(cid).?;
+                cloned_msgs.appendAssumeCapacity(try m.clone(self.allocator));
+                sibs_list.appendAssumeCapacity(try self.siblingsIncluding(m.msg_id));
             }
-            const m = self.engine.journal.messages.get(cid) orelse break;
-            try rev.append(self.allocator, cid);
-            cur = m.parent_id;
         }
         const elapsed = nowUs(self.io) -| t0;
 
         try out.appendSlice(self.allocator, "{\"messages\":[");
-        for (0..rev.items.len) |i| {
+        for (cloned_msgs.items, 0..) |*m, i| {
             if (i > 0) try out.append(self.allocator, ',');
-            const cid = rev.items[rev.items.len - 1 - i];
-            const m = self.engine.journal.messages.getPtr(cid).?;
-            const sibs = try self.siblingsIncluding(m.msg_id);
-            defer self.allocator.free(sibs);
             const trace_json = self.traceJsonFor(m.msg_id);
             defer if (trace_json) |tj| self.allocator.free(tj);
-            try appendMessageJson(self.allocator, out, m, sibs, trace_json);
+            try appendMessageJson(self.allocator, out, m, sibs_list.items[i], trace_json);
         }
         try out.print(self.allocator, "],\"has_more\":{},\"elapsed_us\":{d},\"next_before\":", .{ has_more, elapsed });
-        if (has_more and rev.items.len > 0) {
+        if (next_before_id) |nb| {
             var nhex: [32]u8 = undefined;
-            _ = id.formatIdHex(rev.items[rev.items.len - 1], &nhex);
+            _ = id.formatIdHex(nb, &nhex);
             try out.print(self.allocator, "\"{s}\"", .{nhex});
         } else {
             try out.appendSlice(self.allocator, "null");
@@ -4116,10 +5074,18 @@ fn appendCatalogJson(
     try out.appendSlice(allocator, "]}");
 }
 
-fn appendSessionSummaryJson(allocator: Allocator, out: *std.ArrayList(u8), s: *const model.SessionSummary, t_model: ?[]const u8) !void {
+fn appendSessionSummaryJson(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    s: *const model.SessionSummary,
+    t_model: ?[]const u8,
+    t_worktree_id: ?u128,
+) !void {
     var thex: [32]u8 = undefined;
     _ = id.formatIdHex(s.thread_id, &thex);
     try out.print(allocator, "{{\"thread_id\":\"{s}\"", .{thex});
+    try out.appendSlice(allocator, ",\"worktree_id\":");
+    try appendOptIdHex(allocator, out, t_worktree_id);
     try out.appendSlice(allocator, ",\"title\":");
     try rpc.appendJsonEscaped(allocator, out, s.title);
     try out.print(
@@ -4286,8 +5252,48 @@ fn readEnvVarAlloc(allocator: Allocator, io: Io, name: []const u8) ?[]u8 {
 
 fn canonicalDir(allocator: Allocator, io: Io, path: []const u8) ?[]u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = Io.Dir.cwd().realPathFile(io, path, &buf) catch return allocator.dupe(u8, path) catch null;
+    const n = Io.Dir.cwd().realPathFile(io, path, &buf) catch return null;
     return allocator.dupe(u8, buf[0..n]) catch null;
+}
+
+fn readStoredConflictCount(allocator: Allocator, io: Io, state_path: []const u8) usize {
+    const path = std.fmt.allocPrint(allocator, "{s}/conflicts.0ndb", .{state_path}) catch return 0;
+    defer allocator.free(path);
+    const f = Io.Dir.cwd().openFile(io, path, .{}) catch return 0;
+    defer f.close(io);
+    var hdr: [8]u8 = undefined;
+    const n = f.readPositionalAll(io, &hdr, 0) catch return 0;
+    if (n < 8) return 0;
+    const magic = std.mem.readInt(u32, hdr[0..4], .little);
+    if (magic != CONFLICTS_MAGIC) return 0;
+    return @intCast(std.mem.readInt(u32, hdr[4..8], .little));
+}
+
+pub fn httpStatusForError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotFound,
+        error.ThreadNotFound,
+        error.MessageNotFound,
+        error.FileNotFound,
+        error.PageNotFound,
+        error.WorktreeNotFound,
+        error.ConflictNotFound,
+        error.InvalidRoute,
+        => "404 Not Found",
+        error.TurnAlreadyActive,
+        error.UnresolvedConflicts,
+        error.DirtyWorktree,
+        => "409 Conflict",
+        error.PayloadTooLarge => "413 Payload Too Large",
+        error.TooManyWorkers,
+        error.TooManySseClients,
+        error.ServerBusy,
+        => "503 Service Unavailable",
+        error.OutOfMemory,
+        error.MasterKeyWriteFailed,
+        => "500 Internal Server Error",
+        else => "400 Bad Request",
+    };
 }
 
 fn distCandidate(allocator: Allocator, io: Io, dir_path: []const u8) ?[]u8 {
@@ -4367,17 +5373,33 @@ fn appendWorktreeJson(
     try out.print(allocator, ",\"conflicts\":{d}}}", .{conflict_count});
 }
 
-fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
+fn queryParamAlloc(allocator: Allocator, query: []const u8, key: []const u8) !?[]u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
-            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+            const raw_k = pair[0..eq];
+            if (std.mem.eql(u8, raw_k, key)) {
+                return try urlDecodeQuery(allocator, pair[eq + 1 ..]);
+            }
+            const dec_k = try urlDecodeQuery(allocator, raw_k);
+            defer allocator.free(dec_k);
+            if (std.mem.eql(u8, dec_k, key)) {
+                return try urlDecodeQuery(allocator, pair[eq + 1 ..]);
+            }
         }
     }
     return null;
 }
 
-fn urlDecode(allocator: Allocator, s: []const u8) ![]u8 {
+pub fn urlDecode(allocator: Allocator, s: []const u8) ![]u8 {
+    return urlDecodeInternal(allocator, s, false);
+}
+
+pub fn urlDecodeQuery(allocator: Allocator, s: []const u8) ![]u8 {
+    return urlDecodeInternal(allocator, s, true);
+}
+
+fn urlDecodeInternal(allocator: Allocator, s: []const u8, plus_as_space: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
@@ -4389,7 +5411,7 @@ fn urlDecode(allocator: Allocator, s: []const u8) ![]u8 {
             };
             try out.append(allocator, v);
             i += 2;
-        } else if (s[i] == '+') {
+        } else if (plus_as_space and s[i] == '+') {
             try out.append(allocator, ' ');
         } else {
             try out.append(allocator, s[i]);
@@ -4403,12 +5425,16 @@ fn sendHttp(fd: posix.fd_t, status: []const u8, content_type: []const u8, body: 
 }
 
 fn sendHttpFull(fd: posix.fd_t, status: []const u8, content_type: []const u8, body: []const u8, cache_control: []const u8, head_only: bool, keep_alive: bool) bool {
-    var hdr_buf: [512]u8 = undefined;
+    var hdr_buf: [1024]u8 = undefined;
     const conn_hdr = if (keep_alive) "keep-alive\r\nKeep-Alive: timeout=15" else "close";
+    const csp_hdr = if (std.mem.startsWith(u8, content_type, "text/html"))
+        "Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'\r\n"
+    else
+        "";
     const hdr = std.fmt.bufPrint(
         &hdr_buf,
-        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: {s}\r\nConnection: {s}\r\n\r\n",
-        .{ status, content_type, body.len, cache_control, conn_hdr },
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: {s}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n{s}Connection: {s}\r\n\r\n",
+        .{ status, content_type, body.len, cache_control, csp_hdr, conn_hdr },
     ) catch return false;
     if (head_only or body.len == 0) {
         return writeAllRaw(fd, hdr);
@@ -4442,23 +5468,20 @@ fn writeAllRaw(fd: posix.fd_t, data: []const u8) bool {
     return true;
 }
 
-fn writeAllNonBlocking(fd: posix.fd_t, data: []const u8) bool {
-    var off: usize = 0;
-    while (off < data.len) {
-        const rc = linux.sendto(fd, data[off..].ptr, data.len - off, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT, null, 0);
-        const e = linux.errno(rc);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS or rc == 0) return false;
-        off += rc;
-    }
-    return true;
+pub fn jsonU64(val: ?std.json.Value) error{InvalidNumber}!u64 {
+    const v = val orelse return error.InvalidNumber;
+    return switch (v) {
+        .integer => |n| if (n >= 0) @intCast(n) else error.InvalidNumber,
+        .float => |fl| if (std.math.isFinite(fl) and fl >= 0.0 and fl <= 9007199254740991.0 and @floor(fl) == fl)
+            @intFromFloat(fl)
+        else
+            error.InvalidNumber,
+        else => error.InvalidNumber,
+    };
 }
 
-fn jsonU64(val: ?std.json.Value) u64 {
+fn jsonU64Opt(val: ?std.json.Value) error{InvalidNumber}!u64 {
     const v = val orelse return 0;
-    return switch (v) {
-        .integer => |n| if (n >= 0) @intCast(n) else 0,
-        .float => |fl| if (fl >= 0) @intFromFloat(fl) else 0,
-        else => 0,
-    };
+    if (v == .null) return 0;
+    return jsonU64(v);
 }

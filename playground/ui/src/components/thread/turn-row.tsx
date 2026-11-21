@@ -1,10 +1,11 @@
 import { createContext, useContext, type ReactNode } from 'react'
 import { Collapse, definePrimitive, Escape, HStack, Text, useMugenState, VStack } from '@wingleeio/mugen'
-import { Markdown } from '@wingleeio/mugen-markdown'
+import { defineMarkdownComponents, Markdown } from '@wingleeio/mugen-markdown'
 import { ChevronLeft, ChevronRight, Copy, FileDiff, GitBranch, Pencil, RotateCcw, AlertTriangle, CircleSlash } from 'lucide-react'
 import type { Message, ProviderInfo } from '@/lib/api'
 import { modelName, providerName, useCatalogs } from '@/lib/catalog'
 import { duration } from '@/lib/format'
+import { sanitizeUrl } from '@/lib/sanitize'
 import { presentTool, summarizeTools } from '@/lib/tools'
 import type { Turn, TurnBlock } from '@/lib/turns'
 import { cn } from '@/lib/utils'
@@ -12,6 +13,25 @@ import { HarnessGlyph } from '../harness-glyph'
 import { CopyButton } from '../copy-button'
 import { Tip } from '../ui/tooltip'
 import { ToolDetailBox, ToolRowView, TOOL_ROW_H, toolDetailHeight } from './tool-parts'
+
+const SAFE_MD_COMPONENTS = defineMarkdownComponents({
+  image: ({ node }) => {
+    const safe = sanitizeUrl(node.url)
+    if (!safe) return null
+    return null
+  },
+  inline: {
+    link: (node, ctx) => {
+      const safe = sanitizeUrl(node.url)
+      if (!safe) return ctx.runs(node.children)
+      return ctx.runs(node.children, {
+        href: safe,
+        color: ctx.theme.link.color,
+        underline: ctx.theme.link.underline ? true : ctx.fmt.underline,
+      })
+    },
+  },
+})
 
 const SANS = 'Geist, sans-serif'
 const MONO = "'Geist Mono', monospace"
@@ -161,7 +181,7 @@ function AssistantTurn({ turn, openMap, setOpenMap }: { turn: Turn; openMap: Ope
 }
 
 function Block({ block, turn, fading, openMap, setOpenMap }: { block: TurnBlock; turn: Turn; fading: boolean; openMap: OpenMap; setOpenMap: (next: OpenMap) => void }): ReactNode {
-  if (block.kind === 'markdown') return <Markdown source={block.text} theme={CHAT_MD_THEME} fade={fading} />
+  if (block.kind === 'markdown') return <Markdown source={block.text} theme={CHAT_MD_THEME} fade={fading} components={SAFE_MD_COMPONENTS} />
 
   if (block.kind === 'error') {
     return (
@@ -208,7 +228,7 @@ function Block({ block, turn, fading, openMap, setOpenMap }: { block: TurnBlock;
             <HStack gap={13} align="stretch">
               <VStack width={2} style={{ background: INK.hairline, borderRadius: 2 }} />
               <VStack gap={10}>
-                <Markdown source={block.text} theme={REASONING_MD_THEME} fade={fading && !block.done} />
+                <Markdown source={block.text} theme={REASONING_MD_THEME} fade={fading && !block.done} components={SAFE_MD_COMPONENTS} />
               </VStack>
             </HStack>
           </VStack>

@@ -1,6 +1,6 @@
 import { createContext, startTransition, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
-import { api, type FilesChangedEvent, type Info, type Message, type Page, type ProviderInfo, type QueueItem, type ServerEvent, type Session, type TextSplice, type Trace, type TurnDelta } from './api'
+import { api, type FilesChangedEvent, type Info, type Message, type Page, type ProviderInfo, type QueueItem, type ServerEvent, type Session, type TextSplice, type Trace, type TurnDelta, type WorktreeInfo } from './api'
 import { loadModels, seedCatalogs, SIMULATOR } from './catalog'
 
 export interface FileActivity {
@@ -39,6 +39,9 @@ interface Store {
   info: Info | null
   providers: ProviderInfo[]
   sessions: Session[]
+  worktrees: WorktreeInfo[]
+  activeWorktreeId: string | null
+  activeWorktree: WorktreeInfo | null
   activeId: string | null
   active: Session | null
   queue: QueueItem[]
@@ -48,8 +51,10 @@ interface Store {
   conn: Conn
   pageSize: number
   select: (id: string) => void
+  selectWorktree: (id: string) => void
   onFilesChanged: (fn: (ev: FilesChangedEvent) => void) => () => void
   refreshSessions: () => Promise<void>
+  refreshWorktrees: () => Promise<void>
   refreshInfo: () => Promise<void>
   refreshPage: () => Promise<void>
   applyPage: (page: Page, opts?: { optimistic?: boolean }) => void
@@ -132,6 +137,8 @@ function applyDelta(t: LiveTrace, d: TurnDelta): LiveTrace {
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [info, setInfo] = useState<Info | null>(null)
   const [sessions, setSessions] = useState<Session[]>([])
+  const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([])
+  const [activeWorktreeId, setActiveWorktreeId] = useState<string | null>(null)
   const [activeId, setActiveId] = useState<string | null>(() => {
     try {
       return localStorage.getItem('ondb-active')
@@ -155,6 +162,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const activeRef = useRef(activeId)
   activeRef.current = activeId
+  const activeWorktreeRef = useRef(activeWorktreeId)
+  activeWorktreeRef.current = activeWorktreeId
   const countRef = useRef(0)
   countRef.current = messages.length
   const headPageRef = useRef(headPage)
@@ -173,6 +182,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshInfo = useCallback(async () => {
     const i = await api.info().catch(() => null)
     if (i) setInfo(i)
+  }, [])
+
+  const refreshWorktrees = useCallback(async () => {
+    const r = await api.worktrees().catch(() => null)
+    if (!r) return
+    setWorktrees(r.worktrees)
+    if (!activeWorktreeRef.current || !r.worktrees.some(w => w.id === activeWorktreeRef.current)) {
+      const primary = r.worktrees.find(w => w.is_primary) ?? r.worktrees[0] ?? null
+      if (primary) setActiveWorktreeId(primary.id)
+    }
   }, [])
 
   const refreshSessions = useCallback(async () => {
@@ -327,6 +346,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setActiveId(id)
   }, [])
 
+  const selectWorktree = useCallback((id: string) => {
+    if (id === activeWorktreeRef.current) return
+    setActiveWorktreeId(id)
+  }, [])
+
   useEffect(() => {
     try {
       if (activeId) localStorage.setItem('ondb-active', activeId)
@@ -353,7 +377,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const createSession = useCallback(
     async (title = 'New session', provider = 'mock', model: string | null = 'sim-native-v1') => {
-      const r = await run('Could not create session', () => api.createThread(title, provider, model))
+      const r = await run('Could not create session', () => api.createThread(title, provider, model, activeWorktreeRef.current))
       if (!r) return null
       await refreshSessions()
       setActiveId(r.thread_id)
@@ -372,17 +396,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     refreshInfo()
     refreshSessions()
+    refreshWorktrees()
     api.allModels().then(r => seedCatalogs(r.catalogs)).catch(() => undefined)
     loadModels('mock')
-  }, [refreshInfo, refreshSessions])
+  }, [refreshInfo, refreshSessions, refreshWorktrees])
 
   const debounce = useCallback((key: string, fn: () => void, ms = 60) => {
     clearTimeout(timers.current[key])
     timers.current[key] = setTimeout(fn, ms)
   }, [])
 
-  const handlers = useRef({ refreshPage, refreshQueue, refreshSessions, refreshInfo, debounce, flushDeferredFiles })
-  handlers.current = { refreshPage, refreshQueue, refreshSessions, refreshInfo, debounce, flushDeferredFiles }
+  const handlers = useRef({ refreshPage, refreshQueue, refreshSessions, refreshWorktrees, refreshInfo, debounce, flushDeferredFiles })
+  handlers.current = { refreshPage, refreshQueue, refreshSessions, refreshWorktrees, refreshInfo, debounce, flushDeferredFiles }
 
   useEffect(() => {
     let es: EventSource | null = null
@@ -396,6 +421,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const h = handlers.current
         h.refreshInfo()
         h.refreshSessions()
+        h.refreshWorktrees()
         h.refreshPage()
         h.refreshQueue()
       }
@@ -415,8 +441,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const isActive = 'thread_id' in msg && msg.thread_id === activeRef.current
         switch (msg.type) {
           case 'models_updated':
-            loadModels(msg.provider, false)
             api.models(msg.provider).then(c => seedCatalogs({ [msg.provider]: c })).catch(() => undefined)
+            break
+          case 'worktrees_updated':
+            h.debounce('worktrees', h.refreshWorktrees)
+            h.debounce('info', h.refreshInfo, 200)
             break
           case 'session_updated':
             h.debounce('sessions', h.refreshSessions)
@@ -508,12 +537,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const providers = useMemo(() => [SIMULATOR, ...(info?.providers ?? [])], [info])
   const active = useMemo(() => sessions.find(s => s.thread_id === activeId) ?? null, [sessions, activeId])
+  const activeWorktree = useMemo(
+    () => worktrees.find(w => w.id === activeWorktreeId) ?? worktrees.find(w => w.is_primary) ?? worktrees[0] ?? null,
+    [worktrees, activeWorktreeId],
+  )
 
   const value = useMemo<Store>(
     () => ({
       info,
       providers,
       sessions,
+      worktrees,
+      activeWorktreeId,
+      activeWorktree,
       activeId,
       active,
       queue,
@@ -523,8 +559,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       conn,
       pageSize,
       select,
+      selectWorktree,
       onFilesChanged,
       refreshSessions,
+      refreshWorktrees,
       refreshInfo,
       refreshPage,
       applyPage,
@@ -538,6 +576,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       info,
       providers,
       sessions,
+      worktrees,
+      activeWorktreeId,
+      activeWorktree,
       activeId,
       active,
       queue,
@@ -547,8 +588,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       conn,
       pageSize,
       select,
+      selectWorktree,
       onFilesChanged,
       refreshSessions,
+      refreshWorktrees,
       refreshInfo,
       refreshPage,
       applyPage,

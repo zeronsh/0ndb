@@ -1,5 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from 'react'
-import { ArrowUp, Check, GitBranch, ListPlus, Loader2, Pencil, Play, Repeat, X, Zap } from 'lucide-react'
+import { ArrowUp, Check, GitBranch, ListPlus, Loader2, Pencil, Play, Repeat, Square, X, Zap } from 'lucide-react'
 import { api, type Message, type ProviderInfo, type QueueItem, type Session } from '@/lib/api'
 import { steerMode } from '@/lib/catalog'
 import { useStore } from '@/lib/store'
@@ -40,12 +40,17 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer({ se
   const { run, refreshQueue, refreshPage, queue } = useStore()
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
   const ta = useRef<HTMLTextAreaElement>(null)
   const mode = steerMode(session.provider, session.model, providers)
   const pending = queue.filter(q => q.status === 'pending' || q.status === 'dispatching')
   const lastPending = useRef<QueueItem[]>(pending)
   if (pending.length) lastPending.current = pending
+
+  useEffect(() => {
+    if (!running) setStopping(false)
+  }, [running])
 
   useImperativeHandle(
     ref,
@@ -99,6 +104,12 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer({ se
     refreshQueue()
     onSubmitted(effective)
     if (effective === 'send' || effective === 'edit') setTimeout(refreshPage, 60)
+  }
+
+  const stopTurn = async () => {
+    if (stopping) return
+    setStopping(true)
+    await run('Interrupt failed', () => api.interruptThread(session.thread_id))
   }
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -180,6 +191,11 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer({ se
               </Tip>
             ) : running ? (
               <>
+                <Tip label="Stop the running turn">
+                  <Button variant="ghost" className="h-9 rounded-xl px-3 text-destructive hover:bg-danger-soft hover:text-destructive" onClick={stopTurn} disabled={stopping} aria-label="Stop turn">
+                    {stopping ? <Loader2 className="size-3.5 animate-spin" /> : <Square className="size-3 fill-current" />} Stop
+                  </Button>
+                </Tip>
                 <Tip label="Queue as the next turn (durable WAL)" shortcut="↵">
                   <Button variant="ghost" className="h-9 rounded-xl px-3 text-muted-foreground" onClick={() => act('queue')} disabled={!text.trim() || busy}>
                     <ListPlus /> Queue

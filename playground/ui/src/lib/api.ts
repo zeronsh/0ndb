@@ -1,6 +1,6 @@
-import type { TextSplice } from './splices'
+import type { SpliceOp, TextSplice } from './splices'
 
-export type { TextSplice }
+export type { SpliceOp, TextSplice }
 
 export type ProviderSlug =
   | 'mock'
@@ -32,6 +32,7 @@ export interface Info {
   batches: number
   rss_kb: number
   relay_port: number
+  default_access?: string
   page_size?: number
   threads?: number
   dag_batches?: number
@@ -58,6 +59,7 @@ export type SessionStatus = 'idle' | 'running' | 'queued' | 'steering' | 'failed
 
 export interface Session {
   thread_id: string
+  worktree_id?: string | null
   title: string
   provider: ProviderSlug
   model: string | null
@@ -66,6 +68,39 @@ export interface Session {
   message_count: number
   updated_ms: number
   head_page: string | null
+}
+
+export interface WorktreeInfo {
+  id: string
+  title: string
+  path: string
+  vcs_kind: string
+  repo_root: string | null
+  ref_name: string | null
+  history_id: string
+  created: boolean
+  is_primary: boolean
+  created_ms: number
+  source_id: string | null
+  conflicts: number
+}
+
+export interface WorktreeConflict {
+  path: string
+  kind: string
+  ours: string | null
+  theirs: string | null
+}
+
+export interface WorktreeSyncResult {
+  brought: number
+  merged: string[]
+  conflicts: { path: string; kind: string }[]
+}
+
+export interface WorktreeLandResult {
+  landed: number
+  brought: number
 }
 
 export interface TraceReasoning {
@@ -215,9 +250,11 @@ export interface RemotePage {
 export class ApiError extends Error {}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const isMutation = method !== 'GET' && method !== 'HEAD'
   const res = await fetch(path, {
     ...init,
-    headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: isMutation || init?.body ? { 'Content-Type': 'application/json' } : undefined,
   })
   const text = await res.text()
   let data: unknown = null
@@ -245,7 +282,13 @@ export const api = {
   models: (provider: string, refresh = false) => request<Catalog>(`/api/models?provider=${q(provider)}&refresh=${refresh ? 1 : 0}`),
   allModels: () => request<{ catalogs: Partial<Record<ProviderSlug, Catalog>> }>('/api/models/all'),
   sessions: () => request<{ sessions: Session[] }>('/api/sessions'),
-  createThread: (title: string, provider: string, model: string | null) => post<{ thread_id: string }>('/api/threads', { title, provider, model: model ?? '' }),
+  createThread: (title: string, provider: string, model: string | null, worktreeId?: string | null) =>
+    post<{ thread_id: string }>('/api/threads', {
+      title,
+      provider,
+      model: model ?? '',
+      ...(worktreeId ? { worktree_id: worktreeId } : {}),
+    }),
   config: (tid: string, body: { provider?: string; model?: string | null; title?: string }) => post<{ ok: boolean }>(`/api/threads/${tid}/config`, body),
   page: (tid: string, limit: number, before?: string | null) => request<Page>(`/api/threads/${tid}/page?limit=${limit}${before ? `&before=${before}` : ''}`),
   branchPreview: (tid: string, branchMsgId: string, limit: number, fromMsgId?: string) =>
@@ -254,6 +297,7 @@ export const api = {
   send: (tid: string, prompt: string, provider: string, model: string | null) => post<{ ok: boolean }>(`/api/threads/${tid}/send`, { prompt, provider, model: model ?? '' }),
   steer: (tid: string, prompt: string, provider: string, model: string | null) => post<{ item_id: string }>(`/api/threads/${tid}/steer`, { prompt, provider, model: model ?? '' }),
   enqueue: (tid: string, prompt: string, provider: string, model: string | null) => post<{ item_id: string }>(`/api/threads/${tid}/queue`, { prompt, provider, model: model ?? '' }),
+  interruptThread: (tid: string) => post<{ interrupted: boolean }>(`/api/threads/${tid}/interrupt`),
   drain: (tid: string) => post<{ ok: boolean }>(`/api/threads/${tid}/drain`),
   edit: (tid: string, msgId: string, prompt: string, provider: string, model: string | null) => post<{ msg_id: string }>(`/api/threads/${tid}/edit`, { msg_id: msgId, prompt, provider, model: model ?? '' }),
   rollback: (tid: string, msgId: string | null, limit?: number) => post<{ ok: boolean; elapsed_us: number; page: Page }>(`/api/threads/${tid}/rollback`, limit ? { msg_id: msgId ?? '', limit } : { msg_id: msgId ?? '' }),
@@ -271,11 +315,28 @@ export const api = {
     request<{ path: string; version?: string; content: string | null; at?: string }>(`/api/file?path=${q(path)}${at ? `&at=${at}&side=${side}` : ''}`),
   writeFile: (path: string, content: string, baseVersion?: string) =>
     post<WriteFileResult>('/api/file', baseVersion ? { path, content, base_version: baseVersion } : { path, content }),
+  saveFileSplices: (path: string, baseVersion: string, splices: SpliceOp[], inserted: string) =>
+    post<WriteFileResult>('/api/file', { path, base_version: baseVersion, splices, inserted }),
   rebaseFile: (path: string, baseVersion: string, draft: string, cursorStart: number, cursorEnd: number) =>
     post<RebaseResult>('/api/file/rebase', { path, base_version: baseVersion, draft, cursor_start: cursorStart, cursor_end: cursorEnd }),
   ingest: () => post<{ ingested: boolean }>('/api/ingest'),
   blame: (path: string) => request<{ lines: BlameLine[] }>(`/api/blame?path=${q(path)}`),
   history: (limit = 200) => request<{ elapsed_us: number; total: number; batches: HistoryBatch[] }>(`/api/history?limit=${limit}`),
+  worktrees: () => request<{ worktrees: WorktreeInfo[] }>('/api/worktrees'),
+  createWorktree: (title: string) => post<{ worktree: WorktreeInfo }>('/api/worktrees', { title }),
+  adoptWorktree: (path: string, title: string) => post<{ worktree: WorktreeInfo }>('/api/worktrees/adopt', { path, title }),
+  forkWorktree: (id: string, title: string, refName?: string) =>
+    post<{ worktree: WorktreeInfo }>(`/api/worktrees/${id}/fork`, refName ? { title, ref_name: refName } : { title }),
+  syncWorktree: (id: string) => post<WorktreeSyncResult>(`/api/worktrees/${id}/sync`),
+  landWorktree: (id: string) => post<WorktreeLandResult>(`/api/worktrees/${id}/land`),
+  worktreeConflicts: (id: string) => request<{ conflicts: WorktreeConflict[] }>(`/api/worktrees/${id}/conflicts`),
+  resolveWorktreeConflict: (id: string, path: string, resolution: 'ours' | 'theirs' | 'delete' | 'content', content?: string) =>
+    post<{ ok: boolean }>(`/api/worktrees/${id}/resolve`, resolution === 'content' ? { path, resolution, content: content ?? '' } : { path, resolution }),
+  removeWorktree: (id: string, force = false, deleteRef = false) =>
+    post<{ ok: boolean }>(`/api/worktrees/${id}/remove`, { force, delete_ref: deleteRef }),
+  worktreeFiles: (id: string) => request<{ version?: string; files: FileEntry[] }>(`/api/worktrees/${id}/files`),
+  worktreeFile: (id: string, path: string) => request<{ path: string; version?: string; content: string | null }>(`/api/worktrees/${id}/file?path=${q(path)}`),
+  worktreeHistory: (id: string, limit = 200) => request<{ elapsed_us: number; total: number; batches: HistoryBatch[] }>(`/api/worktrees/${id}/history?limit=${limit}`),
   remoteSessions: () => request<{ elapsed_us: number; last_seq: number; sessions: Session[] }>('/api/remote/sessions'),
   remotePage: (tid: string, pageId: string) => request<RemotePage>(`/api/remote/page?thread_id=${tid}&page_id=${pageId}`),
   remoteClear: () => post<{ ok: boolean }>('/api/remote/clear-cache'),
@@ -297,6 +358,7 @@ export type ServerEvent =
   | { type: 'session_updated'; thread_id: string; head_page?: string | null }
   | { type: 'turn_completed'; thread_id: string }
   | { type: 'workspace_updated' }
+  | { type: 'worktrees_updated' }
   | { type: 'queue_updated'; thread_id: string }
   | FilesChangedEvent
   | TurnDelta
