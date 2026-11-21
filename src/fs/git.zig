@@ -133,9 +133,10 @@ pub fn head(allocator: Allocator, io: Io, dir_path: []const u8) !HeadInfo {
 }
 
 pub fn commitExists(allocator: Allocator, io: Io, dir_path: []const u8, commit: []const u8) bool {
+    if (commit.len == 0 or commit[0] == '-') return false;
     var spec_buf: [128]u8 = undefined;
     const spec = std.fmt.bufPrint(&spec_buf, "{s}^{{commit}}", .{commit}) catch return false;
-    const r = runGit(allocator, io, dir_path, &.{ "cat-file", "-e", spec }) catch return false;
+    const r = runGit(allocator, io, dir_path, &.{ "cat-file", "-e", "--", spec }) catch return false;
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
     return r.ok;
@@ -167,7 +168,8 @@ pub fn operationInProgress(allocator: Allocator, io: Io, dir_path: []const u8) ?
 }
 
 pub fn createBranchAt(allocator: Allocator, io: Io, dir_path: []const u8, branch: []const u8, commit: []const u8) !void {
-    const r = try runGit(allocator, io, dir_path, &.{ "branch", branch, commit });
+    if (branch.len == 0 or commit.len == 0 or commit[0] == '-') return error.GitFailed;
+    const r = try runGit(allocator, io, dir_path, &.{ "branch", "--", branch, commit });
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
     if (!r.ok) return error.GitFailed;
@@ -205,12 +207,12 @@ pub fn moveHeadSafe(allocator: Allocator, io: Io, dir_path: []const u8, branch: 
         const b = branch.?;
         var ref_buf: [256]u8 = undefined;
         const ref = try std.fmt.bufPrint(&ref_buf, "refs/heads/{s}", .{b});
-        const r = try runGit(allocator, io, dir_path, &.{ "symbolic-ref", "-m", "checkout: 0ndb restore", "HEAD", ref });
+        const r = try runGit(allocator, io, dir_path, &.{ "symbolic-ref", "-m", "checkout: 0ndb restore", "--", "HEAD", ref });
         defer allocator.free(r.stdout);
         defer allocator.free(r.stderr);
         if (!r.ok) return error.GitFailed;
     } else {
-        const r = try runGit(allocator, io, dir_path, &.{ "update-ref", "--no-deref", "-m", "checkout: 0ndb restore", "HEAD", commit });
+        const r = try runGit(allocator, io, dir_path, &.{ "update-ref", "--no-deref", "-m", "checkout: 0ndb restore", "--", "HEAD", commit });
         defer allocator.free(r.stdout);
         defer allocator.free(r.stderr);
         if (!r.ok) return error.GitFailed;
@@ -230,10 +232,12 @@ pub fn addWorktree(allocator: Allocator, io: Io, repo_path: []const u8, dest_pat
     if (branch) |b| {
         try args.append(allocator, "-b");
         try args.append(allocator, b);
+        try args.append(allocator, "--");
         try args.append(allocator, dest_path);
         try args.append(allocator, commit);
     } else {
         try args.append(allocator, "--detach");
+        try args.append(allocator, "--");
         try args.append(allocator, dest_path);
         try args.append(allocator, commit);
     }
@@ -244,14 +248,14 @@ pub fn addWorktree(allocator: Allocator, io: Io, repo_path: []const u8, dest_pat
 }
 
 pub fn removeWorktree(allocator: Allocator, io: Io, repo_path: []const u8, dest_path: []const u8) !void {
-    const r = try runGit(allocator, io, repo_path, &.{ "worktree", "remove", "--force", dest_path });
+    const r = try runGit(allocator, io, repo_path, &.{ "worktree", "remove", "--force", "--", dest_path });
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
     if (!r.ok) return error.GitFailed;
 }
 
 pub fn deleteBranch(allocator: Allocator, io: Io, repo_path: []const u8, branch: []const u8) !void {
-    const r = try runGit(allocator, io, repo_path, &.{ "branch", "-D", branch });
+    const r = try runGit(allocator, io, repo_path, &.{ "branch", "-D", "--", branch });
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
     if (!r.ok) return error.GitFailed;
@@ -281,7 +285,8 @@ pub fn freePaths(allocator: Allocator, paths: [][]u8) void {
 }
 
 pub fn changedPaths(allocator: Allocator, io: Io, dir_path: []const u8, rev_a: []const u8, rev_b: []const u8) ![][]u8 {
-    const r = try runGit(allocator, io, dir_path, &.{ "diff", "--name-only", "-z", rev_a, rev_b });
+    if (rev_a.len == 0 or rev_b.len == 0 or rev_a[0] == '-' or rev_b[0] == '-') return error.GitFailed;
+    const r = try runGit(allocator, io, dir_path, &.{ "diff", "--name-only", "-z", rev_a, rev_b, "--" });
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
     if (!r.ok) return error.GitFailed;

@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const id = @import("../core/id.zig");
+const version_mod = @import("../core/version.zig");
 const codec = @import("../core/codec.zig");
 const mmap = @import("../store/mmap.zig");
 const space_mod = @import("../space/space.zig");
@@ -44,7 +45,7 @@ pub const SpaceRef = struct {
     pub fn encode(self: *const SpaceRef, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
         try w.writeU128(allocator, self.space_id);
         try w.writeBytes(allocator, self.alias);
-        try w.writeByte(allocator, @intFromEnum(self.kind));
+        try w.writeByte(allocator, @backingInt(self.kind));
         try w.writeByte(allocator, self.default_access);
         if (self.git_remote_url) |u| {
             try w.writeByte(allocator, 1);
@@ -241,12 +242,13 @@ pub const ProjectStore = struct {
     ) !Project {
         const pid = id.newUuidV7(self.io);
         const now = id.nowMs(self.io);
+        var fields_transferred = false;
         const title_copy = try self.allocator.dupe(u8, title);
-        errdefer self.allocator.free(title_copy);
+        errdefer if (!fields_transferred) self.allocator.free(title_copy);
         const instr_copy = try self.allocator.dupe(u8, instructions);
-        errdefer self.allocator.free(instr_copy);
+        errdefer if (!fields_transferred) self.allocator.free(instr_copy);
         const model_copy: ?[]u8 = if (default_model) |m| try self.allocator.dupe(u8, m) else null;
-        errdefer if (model_copy) |m| self.allocator.free(m);
+        errdefer if (!fields_transferred) if (model_copy) |m| self.allocator.free(m);
 
         var proj = Project{
             .project_id = pid,
@@ -258,6 +260,7 @@ pub const ProjectStore = struct {
             .created_ms = now,
             .updated_ms = now,
         };
+        fields_transferred = true;
         var owned = false;
         errdefer if (!owned) proj.deinit(self.allocator);
 
@@ -306,14 +309,15 @@ pub const ProjectStore = struct {
             }
         }
         const idx = found_idx orelse return false;
-        proj.spaces[idx].deinit(self.allocator);
         if (proj.spaces.len == 1) {
+            proj.spaces[idx].deinit(self.allocator);
             self.allocator.free(proj.spaces);
             proj.spaces = &.{};
         } else {
             const next_spaces = try self.allocator.alloc(SpaceRef, proj.spaces.len - 1);
             @memcpy(next_spaces[0..idx], proj.spaces[0..idx]);
             @memcpy(next_spaces[idx..], proj.spaces[idx + 1 ..]);
+            proj.spaces[idx].deinit(self.allocator);
             self.allocator.free(proj.spaces);
             proj.spaces = next_spaces;
         }
@@ -521,7 +525,7 @@ pub const SpaceSet = struct {
                 _ = try fproj.ingestDirty();
             }
 
-            var report = try fork_sp.syncFromOrigin(origin_sp);
+            var report = try fork_sp.syncFromOriginAlloc(allocator, origin_sp);
             errdefer report.deinit(allocator);
 
             if (fork_proj) |fproj| {
@@ -562,6 +566,9 @@ pub const SpaceSet = struct {
             failures.deinit(allocator);
         }
 
+        var seen_origins: std.AutoHashMapUnmanaged(u128, void) = .empty;
+        defer seen_origins.deinit(allocator);
+
         for (fork_ids) |fid| {
             if (manager.get(fid) == null) {
                 try failures.append(allocator, .{
@@ -570,8 +577,9 @@ pub const SpaceSet = struct {
                 });
                 continue;
             }
+            try pinned.ensureUnusedCapacity(allocator, 1);
             try manager.pin(fid);
-            try pinned.append(allocator, fid);
+            pinned.appendAssumeCapacity(fid);
 
             const fork_sp = try manager.activate(fid);
             const origin = fork_sp.origin orelse {
@@ -589,8 +597,17 @@ pub const SpaceSet = struct {
                 });
                 continue;
             }
+            const gop = try seen_origins.getOrPut(allocator, oid);
+            if (gop.found_existing) {
+                try failures.append(allocator, .{
+                    .space_id = fid,
+                    .reason = .would_conflict,
+                });
+                continue;
+            }
+            try pinned.ensureUnusedCapacity(allocator, 1);
             try manager.pin(oid);
-            try pinned.append(allocator, oid);
+            pinned.appendAssumeCapacity(oid);
 
             const origin_sp = try manager.activate(oid);
 
@@ -660,18 +677,46 @@ pub const SpaceSet = struct {
             };
         }
 
+        var pre_versions = try allocator.alloc(version_mod.Version, pairs.items.len);
+        var pre_versions_inited: usize = 0;
+        defer {
+            for (pre_versions[0..pre_versions_inited]) |*v| v.deinit(allocator);
+            allocator.free(pre_versions);
+        }
+        for (pairs.items, 0..) |pair, idx| {
+            const origin_sp = try manager.activate(pair.origin_id);
+            pre_versions[idx] = try origin_sp.headsClone(allocator);
+            pre_versions_inited = idx + 1;
+        }
+
+        var rollback_limit: usize = 0;
+        errdefer {
+            var k: usize = rollback_limit;
+            while (k > 0) {
+                k -= 1;
+                if (manager.activate(pairs.items[k].origin_id)) |osp| {
+                    _ = osp.rollbackToVersion(osp.actor_id, &pre_versions[k]) catch {};
+                    if (manager.activateProjection(pairs.items[k].origin_id) catch null) |oproj| {
+                        oproj.materializeChanged() catch {};
+                    }
+                } else |_| {}
+            }
+        }
+
         var entries: std.ArrayList(SpaceSetLandEntry) = .empty;
         errdefer {
             for (entries.items) |*e| e.deinit(allocator);
             entries.deinit(allocator);
         }
 
-        for (pairs.items) |pair| {
+        for (pairs.items, 0..) |pair, idx| {
             const fork_sp = try manager.activate(pair.fork_id);
             const origin_sp = try manager.activate(pair.origin_id);
 
-            var report = try fork_sp.landToOrigin(origin_sp);
-            errdefer report.deinit(allocator);
+            rollback_limit = idx + 1;
+            var report = try fork_sp.landToOriginAlloc(allocator, origin_sp);
+            var report_owned = true;
+            errdefer if (report_owned) report.deinit(allocator);
 
             if (try manager.activateProjection(pair.fork_id)) |fproj| {
                 try fproj.materializeChanged();
@@ -685,6 +730,7 @@ pub const SpaceSet = struct {
                 .origin_space_id = pair.origin_id,
                 .report = report,
             });
+            report_owned = false;
         }
 
         return .{

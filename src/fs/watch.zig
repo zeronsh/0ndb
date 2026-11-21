@@ -187,7 +187,6 @@ const DirtyMeta = struct {
 
 const WatchEntry = struct {
     mount_idx: u32,
-    wd_slot: u32,
     rel_dir: []u8,
 
     fn deinit(self: *WatchEntry, allocator: Allocator) void {
@@ -309,7 +308,7 @@ pub const SharedWatcher = struct {
     idle_callback: ?IdleTickCallback = null,
     fence_seq: u64 = 0,
     pending_wake: bool = false,
-    watches: std.AutoHashMapUnmanaged(i32, WatchEntry) = .empty,
+    watches: std.AutoHashMapUnmanaged(i32, std.ArrayList(WatchEntry)) = .empty,
     mounts: std.ArrayList(?MountState) = .empty,
     free_mount_slots: std.ArrayList(u32) = .empty,
     mount_id_to_idx: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -317,7 +316,7 @@ pub const SharedWatcher = struct {
     free_git_slots: std.ArrayList(u32) = .empty,
     shared_git_by_path: std.StringHashMapUnmanaged(u32) = .empty,
     shared_git_watches: std.AutoHashMapUnmanaged(i32, u32) = .empty,
-    fence_watches: std.AutoHashMapUnmanaged(i32, u32) = .empty,
+    fence_watches: std.AutoHashMapUnmanaged(i32, std.ArrayList(u32)) = .empty,
 
     pub fn init(allocator: Allocator) !SharedWatcher {
         return try initWithBudget(allocator, computeDefaultWatchBudget());
@@ -380,7 +379,10 @@ pub const SharedWatcher = struct {
 
     pub fn deinit(self: *SharedWatcher) void {
         var wit = self.watches.valueIterator();
-        while (wit.next()) |e| e.deinit(self.allocator);
+        while (wit.next()) |list| {
+            for (list.items) |*e| e.deinit(self.allocator);
+            list.deinit(self.allocator);
+        }
         self.watches.deinit(self.allocator);
 
         for (self.mounts.items) |*slot| {
@@ -403,6 +405,8 @@ pub const SharedWatcher = struct {
         self.shared_git_groups.deinit(self.allocator);
         self.free_git_slots.deinit(self.allocator);
         self.shared_git_watches.deinit(self.allocator);
+        var fwit = self.fence_watches.valueIterator();
+        while (fwit.next()) |list| list.deinit(self.allocator);
         self.fence_watches.deinit(self.allocator);
 
         _ = linux.close(self.epoll_fd);
@@ -490,16 +494,20 @@ pub const SharedWatcher = struct {
         }
 
         const root_copy = try self.allocator.dupe(u8, norm_root);
-        errdefer self.allocator.free(root_copy);
+        var root_owned = true;
+        errdefer if (root_owned) self.allocator.free(root_copy);
 
         const now = nowMonotonicMs();
-        const state = MountState{
+        var state = MountState{
             .mount_id = mount_id,
             .root_path = root_copy,
             .mode = .none,
             .ignore_filter = if (update_filter) filter_opt else null,
             .last_activity_ms = now,
         };
+        root_owned = false;
+        var state_owned = true;
+        errdefer if (state_owned) state.deinit(self.allocator);
 
         var idx: u32 = undefined;
         if (self.free_mount_slots.items.len > 0) {
@@ -509,6 +517,7 @@ pub const SharedWatcher = struct {
             idx = @intCast(self.mounts.items.len);
             try self.mounts.append(self.allocator, state);
         }
+        state_owned = false;
         errdefer {
             if (self.mounts.items[idx]) |*m| {
                 m.deinit(self.allocator);
@@ -562,35 +571,26 @@ pub const SharedWatcher = struct {
         }
         const wd: i32 = @intCast(rc);
 
-        if (self.watches.getPtr(wd)) |existing| {
+        if (self.watches.getPtr(wd)) |bucket| {
             const rel_copy = try self.allocator.dupe(u8, rel_dir);
-            if (existing.mount_idx == mount_idx) {
-                self.allocator.free(existing.rel_dir);
-                existing.rel_dir = rel_copy;
-                return wd;
-            }
-            const old_idx = existing.mount_idx;
-            const old_slot: usize = existing.wd_slot;
-            if (old_idx < self.mounts.items.len) {
-                if (self.mounts.items[old_idx]) |*old_m| {
-                    if (old_slot < old_m.wd_list.items.len and old_m.wd_list.items[old_slot] == wd) {
-                        _ = old_m.wd_list.swapRemove(old_slot);
-                        if (old_slot < old_m.wd_list.items.len) {
-                            const moved_wd = old_m.wd_list.items[old_slot];
-                            if (self.watches.getPtr(moved_wd)) |moved_e| {
-                                moved_e.wd_slot = @intCast(old_slot);
-                            }
-                        }
-                    }
+            var rel_owned = true;
+            errdefer if (rel_owned) self.allocator.free(rel_copy);
+            for (bucket.items) |*existing| {
+                if (existing.mount_idx == mount_idx) {
+                    self.allocator.free(existing.rel_dir);
+                    existing.rel_dir = rel_copy;
+                    rel_owned = false;
+                    return wd;
                 }
             }
             var new_m = &(self.mounts.items[mount_idx].?);
-            const new_slot: u32 = @intCast(new_m.wd_list.items.len);
             try new_m.wd_list.append(self.allocator, wd);
-            self.allocator.free(existing.rel_dir);
-            existing.mount_idx = mount_idx;
-            existing.wd_slot = new_slot;
-            existing.rel_dir = rel_copy;
+            errdefer _ = new_m.wd_list.pop();
+            try bucket.append(self.allocator, .{
+                .mount_idx = mount_idx,
+                .rel_dir = rel_copy,
+            });
+            rel_owned = false;
             return wd;
         }
 
@@ -601,18 +601,25 @@ pub const SharedWatcher = struct {
         }
 
         const rel_copy = try self.allocator.dupe(u8, rel_dir);
-        errdefer self.allocator.free(rel_copy);
+        var rel_owned = true;
+        errdefer if (rel_owned) self.allocator.free(rel_copy);
+
+        var bucket: std.ArrayList(WatchEntry) = .empty;
+        errdefer {
+            for (bucket.items) |*e| e.deinit(self.allocator);
+            bucket.deinit(self.allocator);
+        }
+        try bucket.append(self.allocator, .{
+            .mount_idx = mount_idx,
+            .rel_dir = rel_copy,
+        });
+        rel_owned = false;
 
         var m = &(self.mounts.items[mount_idx].?);
-        const slot: u32 = @intCast(m.wd_list.items.len);
         try m.wd_list.append(self.allocator, wd);
         errdefer _ = m.wd_list.pop();
 
-        try self.watches.put(self.allocator, wd, .{
-            .mount_idx = mount_idx,
-            .wd_slot = slot,
-            .rel_dir = rel_copy,
-        });
+        try self.watches.put(self.allocator, wd, bucket);
         if (!already_counted) {
             self.active_watches += 1;
         }
@@ -733,43 +740,94 @@ pub const SharedWatcher = struct {
         }
     }
 
-    fn dropMountWorktreeWatches(self: *SharedWatcher, mount_idx: u32) void {
-        if (mount_idx >= self.mounts.items.len) return;
-        var m = &(self.mounts.items[mount_idx] orelse return);
-        for (m.wd_list.items) |wd| {
-            if (self.watches.fetchRemove(wd)) |kv| {
-                var entry = kv.value;
-                entry.deinit(self.allocator);
-                if (!self.shared_git_watches.contains(wd) and !self.fence_watches.contains(wd)) {
-                    _ = linux.inotify_rm_watch(self.inotify_fd, wd);
-                    if (self.active_watches > 0) self.active_watches -= 1;
-                }
+    fn removeWdFromMountList(m: *MountState, wd: i32) void {
+        var i: usize = 0;
+        while (i < m.wd_list.items.len) {
+            if (m.wd_list.items[i] == wd) {
+                _ = m.wd_list.swapRemove(i);
+            } else {
+                i += 1;
             }
         }
-        m.wd_list.clearRetainingCapacity();
     }
 
-    fn removeWorktreeWatch(self: *SharedWatcher, wd: i32, call_rm: bool) void {
-        if (self.watches.fetchRemove(wd)) |kv| {
-            var entry = kv.value;
-            defer entry.deinit(self.allocator);
+    fn removeMountFromWd(self: *SharedWatcher, mount_idx: u32, wd: i32, call_rm: bool) void {
+        const bucket = self.watches.getPtr(wd) orelse return;
+        var i: usize = 0;
+        while (i < bucket.items.len) {
+            if (bucket.items[i].mount_idx == mount_idx) {
+                var removed = bucket.swapRemove(i);
+                removed.deinit(self.allocator);
+            } else {
+                i += 1;
+            }
+        }
+        if (bucket.items.len == 0) {
+            if (self.watches.fetchRemove(wd)) |kv| {
+                var empty_list = kv.value;
+                empty_list.deinit(self.allocator);
+            }
             if (!self.shared_git_watches.contains(wd) and !self.fence_watches.contains(wd)) {
                 if (call_rm) {
                     _ = linux.inotify_rm_watch(self.inotify_fd, wd);
                 }
                 if (self.active_watches > 0) self.active_watches -= 1;
             }
-            if (entry.mount_idx < self.mounts.items.len) {
-                if (self.mounts.items[entry.mount_idx]) |*m| {
-                    const slot: usize = entry.wd_slot;
-                    if (slot < m.wd_list.items.len and m.wd_list.items[slot] == wd) {
-                        _ = m.wd_list.swapRemove(slot);
-                        if (slot < m.wd_list.items.len) {
-                            const moved_wd = m.wd_list.items[slot];
-                            if (self.watches.getPtr(moved_wd)) |moved_entry| {
-                                moved_entry.wd_slot = @intCast(slot);
-                            }
-                        }
+        }
+    }
+
+    fn cleanupSubtreeWatchesForMount(self: *SharedWatcher, mount_idx: u32, moved_rel_dir: []const u8) void {
+        if (mount_idx >= self.mounts.items.len) return;
+        const m = &(self.mounts.items[mount_idx] orelse return);
+        var to_remove: std.ArrayList(i32) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        for (m.wd_list.items) |wd| {
+            const bucket = self.watches.get(wd) orelse continue;
+            for (bucket.items) |entry| {
+                if (entry.mount_idx != mount_idx) continue;
+                const match = std.mem.eql(u8, entry.rel_dir, moved_rel_dir) or
+                    (entry.rel_dir.len > moved_rel_dir.len and
+                        std.mem.startsWith(u8, entry.rel_dir, moved_rel_dir) and
+                        entry.rel_dir[moved_rel_dir.len] == '/');
+                if (match) {
+                    to_remove.append(self.allocator, wd) catch {};
+                    break;
+                }
+            }
+        }
+        for (to_remove.items) |wd| {
+            removeWdFromMountList(m, wd);
+            self.removeMountFromWd(mount_idx, wd, true);
+        }
+    }
+
+    fn dropMountWorktreeWatches(self: *SharedWatcher, mount_idx: u32) void {
+        if (mount_idx >= self.mounts.items.len) return;
+        var m = &(self.mounts.items[mount_idx] orelse return);
+        for (m.wd_list.items) |wd| {
+            self.removeMountFromWd(mount_idx, wd, true);
+        }
+        m.wd_list.clearRetainingCapacity();
+    }
+
+    fn removeWorktreeWatch(self: *SharedWatcher, wd: i32, call_rm: bool) void {
+        if (self.watches.fetchRemove(wd)) |kv| {
+            var bucket = kv.value;
+            defer {
+                for (bucket.items) |*e| e.deinit(self.allocator);
+                bucket.deinit(self.allocator);
+            }
+            if (!self.shared_git_watches.contains(wd) and !self.fence_watches.contains(wd)) {
+                if (call_rm) {
+                    _ = linux.inotify_rm_watch(self.inotify_fd, wd);
+                }
+                if (self.active_watches > 0) self.active_watches -= 1;
+            }
+            for (bucket.items) |entry| {
+                if (entry.mount_idx < self.mounts.items.len) {
+                    if (self.mounts.items[entry.mount_idx]) |*m| {
+                        removeWdFromMountList(m, wd);
                     }
                 }
             }
@@ -838,12 +896,15 @@ pub const SharedWatcher = struct {
         }
 
         const dir_copy = try self.allocator.dupe(u8, norm);
-        errdefer self.allocator.free(dir_copy);
+        var dir_owned = true;
+        errdefer if (dir_owned) self.allocator.free(dir_copy);
 
         var group = SharedGitGroup{
             .common_dir = dir_copy,
         };
-        errdefer group.deinit(self.allocator);
+        dir_owned = false;
+        var group_owned = true;
+        errdefer if (group_owned) group.deinit(self.allocator);
 
         try group.subscribers.append(self.allocator, mount_idx);
 
@@ -855,6 +916,7 @@ pub const SharedWatcher = struct {
             gidx = @intCast(self.shared_git_groups.items.len);
             try self.shared_git_groups.append(self.allocator, group);
         }
+        group_owned = false;
         errdefer {
             self.destroySharedGitGroup(gidx);
         }
@@ -894,13 +956,15 @@ pub const SharedWatcher = struct {
         }
 
         const prefix_copy = try self.allocator.dupe(u8, sub_prefix);
-        errdefer self.allocator.free(prefix_copy);
+        var prefix_owned = true;
+        errdefer if (prefix_owned) self.allocator.free(prefix_copy);
 
         var g = &(self.shared_git_groups.items[gidx].?);
         try g.wds.append(self.allocator, .{
             .wd = wd,
             .sub_prefix = prefix_copy,
         });
+        prefix_owned = false;
         errdefer {
             var popped = g.wds.pop().?;
             popped.deinit(self.allocator);
@@ -958,10 +1022,25 @@ pub const SharedWatcher = struct {
         if (mount_idx >= self.mounts.items.len) return;
         var m = &(self.mounts.items[mount_idx] orelse return);
         if (m.fence_wd) |wd| {
-            _ = self.fence_watches.remove(wd);
-            if (!self.watches.contains(wd) and !self.shared_git_watches.contains(wd)) {
-                _ = linux.inotify_rm_watch(self.inotify_fd, wd);
-                if (self.active_watches > 0) self.active_watches -= 1;
+            if (self.fence_watches.getPtr(wd)) |list| {
+                var i: usize = 0;
+                while (i < list.items.len) {
+                    if (list.items[i] == mount_idx) {
+                        _ = list.swapRemove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                if (list.items.len == 0) {
+                    if (self.fence_watches.fetchRemove(wd)) |kv| {
+                        var empty_list = kv.value;
+                        empty_list.deinit(self.allocator);
+                    }
+                    if (!self.watches.contains(wd) and !self.shared_git_watches.contains(wd)) {
+                        _ = linux.inotify_rm_watch(self.inotify_fd, wd);
+                        if (self.active_watches > 0) self.active_watches -= 1;
+                    }
+                }
             }
             m.fence_wd = null;
         }
@@ -1055,6 +1134,10 @@ pub const SharedWatcher = struct {
         return try self.drainKernel(io, out);
     }
 
+    pub fn drainPending(self: *SharedWatcher, io: Io) !void {
+        _ = try self.drainKernel(io, null);
+    }
+
     pub fn poll(self: *SharedWatcher, io: Io, timeout_ms: i32, out: *std.ArrayList(WatchEvent)) !PollResult {
         const w = self.wait(timeout_ms);
         const woken = w.woken or self.pending_wake;
@@ -1105,8 +1188,10 @@ pub const SharedWatcher = struct {
                 const nul_pos = std.mem.indexOfScalar(u8, raw_name, 0) orelse raw_name.len;
                 const name = raw_name[0..nul_pos];
 
-                if (self.fence_watches.get(ev.wd)) |f_mount_idx| {
-                    self.handleFenceEvent(io, f_mount_idx, ev.mask, name);
+                if (self.fence_watches.get(ev.wd)) |f_list| {
+                    for (f_list.items) |f_mount_idx| {
+                        self.handleFenceEvent(io, f_mount_idx, ev.mask, name);
+                    }
                     continue;
                 }
 
@@ -1115,27 +1200,38 @@ pub const SharedWatcher = struct {
                     continue;
                 }
 
-                const entry_ptr = self.watches.getPtr(ev.wd) orelse continue;
-                const mount_idx = entry_ptr.mount_idx;
-                if (mount_idx >= self.mounts.items.len) continue;
-                const m_opt = &self.mounts.items[mount_idx];
-                if (m_opt.* == null) continue;
+                const bucket_ptr = self.watches.getPtr(ev.wd) orelse continue;
+                const SnapEntry = struct { mount_idx: u32, rel_dir: []u8 };
+                var snapped: std.ArrayList(SnapEntry) = .empty;
+                defer {
+                    for (snapped.items) |se| self.allocator.free(se.rel_dir);
+                    snapped.deinit(self.allocator);
+                }
+                for (bucket_ptr.items) |we| {
+                    try snapped.append(self.allocator, .{
+                        .mount_idx = we.mount_idx,
+                        .rel_dir = try self.allocator.dupe(u8, we.rel_dir),
+                    });
+                }
 
                 const is_self_event = (ev.mask & (linux.IN.DELETE_SELF | linux.IN.MOVE_SELF)) != 0;
                 if (is_self_event) {
-                    const rel_copy = try self.allocator.dupe(u8, entry_ptr.rel_dir);
-                    defer self.allocator.free(rel_copy);
-                    if (rel_copy.len == 0) {
-                        self.mounts.items[mount_idx].?.overflow = true;
-                        self.mounts.items[mount_idx].?.markPending(now);
-                        res.overflow = true;
-                    } else if ((ev.mask & linux.IN.MOVE_SELF) != 0) {
-                        self.removeWorktreeWatch(ev.wd, true);
-                        self.mounts.items[mount_idx].?.overflow = true;
-                        if (raw_out == null) {
-                            try self.mounts.items[mount_idx].?.recordDirty(self.allocator, rel_copy, ev.mask, true, now);
+                    for (snapped.items) |se| {
+                        const mount_idx = se.mount_idx;
+                        if (mount_idx >= self.mounts.items.len) continue;
+                        if (self.mounts.items[mount_idx] == null) continue;
+                        if (se.rel_dir.len == 0) {
+                            self.mounts.items[mount_idx].?.overflow = true;
+                            self.mounts.items[mount_idx].?.markPending(now);
+                            res.overflow = true;
+                        } else {
+                            self.cleanupSubtreeWatchesForMount(mount_idx, se.rel_dir);
+                            self.mounts.items[mount_idx].?.overflow = true;
+                            if (raw_out == null) {
+                                try self.mounts.items[mount_idx].?.recordDirty(self.allocator, se.rel_dir, ev.mask, true, now);
+                            }
+                            res.overflow = true;
                         }
-                        res.overflow = true;
                     }
                     continue;
                 }
@@ -1143,48 +1239,58 @@ pub const SharedWatcher = struct {
                 if (name.len > 0 and isIgnoredName(name)) continue;
 
                 const is_dir = (ev.mask & linux.IN.ISDIR) != 0;
-                const rel_path = if (entry_ptr.rel_dir.len == 0)
-                    try self.allocator.dupe(u8, name)
-                else if (name.len == 0)
-                    try self.allocator.dupe(u8, entry_ptr.rel_dir)
-                else
-                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ entry_ptr.rel_dir, name });
-                errdefer self.allocator.free(rel_path);
+                for (snapped.items) |se| {
+                    const mount_idx = se.mount_idx;
+                    if (mount_idx >= self.mounts.items.len) continue;
+                    if (self.mounts.items[mount_idx] == null) continue;
 
-                if (self.mounts.items[mount_idx].?.isIgnored(rel_path, is_dir)) {
-                    self.allocator.free(rel_path);
-                    continue;
-                }
+                    const rel_path = if (se.rel_dir.len == 0)
+                        try self.allocator.dupe(u8, name)
+                    else if (name.len == 0)
+                        try self.allocator.dupe(u8, se.rel_dir)
+                    else
+                        try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ se.rel_dir, name });
+                    var rel_owned = true;
+                    errdefer if (rel_owned) self.allocator.free(rel_path);
 
-                if (is_dir and rel_path.len > 0 and ((ev.mask & linux.IN.CREATE) != 0 or (ev.mask & linux.IN.MOVED_TO) != 0)) {
-                    self.watchSubdirRecursiveByIdx(io, mount_idx, rel_path) catch |werr| switch (werr) {
-                        error.WatchBudgetExceeded => {
-                            self.degradeMount(mount_idx);
-                            res.overflow = true;
-                        },
-                        else => {},
-                    };
-                }
+                    if (self.mounts.items[mount_idx].?.isIgnored(rel_path, is_dir)) {
+                        self.allocator.free(rel_path);
+                        rel_owned = false;
+                        continue;
+                    }
 
-                const mount_id = self.mounts.items[mount_idx].?.mount_id;
-                if (raw_out) |out| {
-                    const name_copy = try self.allocator.dupe(u8, name);
-                    errdefer self.allocator.free(name_copy);
-                    self.mounts.items[mount_idx].?.last_activity_ms = now;
-                    try out.append(self.allocator, .{
-                        .mount_id = mount_id,
-                        .wd = ev.wd,
-                        .mask = ev.mask,
-                        .name = name_copy,
-                        .rel_path = rel_path,
-                        .is_dir = is_dir,
-                        .is_git = false,
-                    });
-                } else {
-                    defer self.allocator.free(rel_path);
-                    try self.mounts.items[mount_idx].?.recordDirty(self.allocator, rel_path, ev.mask, is_dir, now);
+                    if (is_dir and rel_path.len > 0 and ((ev.mask & linux.IN.CREATE) != 0 or (ev.mask & linux.IN.MOVED_TO) != 0)) {
+                        self.watchSubdirRecursiveByIdx(io, mount_idx, rel_path) catch |werr| switch (werr) {
+                            error.WatchBudgetExceeded => {
+                                self.degradeMount(mount_idx);
+                                res.overflow = true;
+                            },
+                            else => {},
+                        };
+                    }
+
+                    const mount_id = self.mounts.items[mount_idx].?.mount_id;
+                    if (raw_out) |out| {
+                        const name_copy = try self.allocator.dupe(u8, name);
+                        errdefer self.allocator.free(name_copy);
+                        self.mounts.items[mount_idx].?.last_activity_ms = now;
+                        try out.append(self.allocator, .{
+                            .mount_id = mount_id,
+                            .wd = ev.wd,
+                            .mask = ev.mask,
+                            .name = name_copy,
+                            .rel_path = rel_path,
+                            .is_dir = is_dir,
+                            .is_git = false,
+                        });
+                        rel_owned = false;
+                    } else {
+                        defer self.allocator.free(rel_path);
+                        rel_owned = false;
+                        try self.mounts.items[mount_idx].?.recordDirty(self.allocator, rel_path, ev.mask, is_dir, now);
+                    }
+                    res.count += 1;
                 }
-                res.count += 1;
             }
         }
         return res;
@@ -1214,10 +1320,13 @@ pub const SharedWatcher = struct {
             }
         }
         if (self.fence_watches.fetchRemove(wd)) |kv| {
-            const midx = kv.value;
-            if (midx < self.mounts.items.len) {
-                if (self.mounts.items[midx]) |*m| {
-                    if (m.fence_wd == wd) m.fence_wd = null;
+            var list = kv.value;
+            defer list.deinit(self.allocator);
+            for (list.items) |midx| {
+                if (midx < self.mounts.items.len) {
+                    if (self.mounts.items[midx]) |*m| {
+                        if (m.fence_wd == wd) m.fence_wd = null;
+                    }
                 }
             }
             if (!self.watches.contains(wd) and !self.shared_git_watches.contains(wd)) {
@@ -1389,7 +1498,11 @@ pub const SharedWatcher = struct {
             const n_rc = linux.epoll_wait(self.epoll_fd, &ep_events, ep_events.len, wait_ms);
             const ep_err = linux.errno(n_rc);
             if (ep_err == .INTR) continue;
-            if (ep_err != .SUCCESS or n_rc == 0) {
+            if (ep_err != .SUCCESS) {
+                res.timed_out = true;
+                return res;
+            }
+            if (n_rc == 0) {
                 continue;
             }
 
@@ -1437,7 +1550,23 @@ pub const SharedWatcher = struct {
         const wd: i32 = @intCast(rc);
 
         const already_counted = self.watches.contains(wd) or self.shared_git_watches.contains(wd) or self.fence_watches.contains(wd);
-        try self.fence_watches.put(self.allocator, wd, mount_idx);
+        if (self.fence_watches.getPtr(wd)) |list| {
+            var found = false;
+            for (list.items) |existing_idx| {
+                if (existing_idx == mount_idx) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try list.append(self.allocator, mount_idx);
+            }
+        } else {
+            var list: std.ArrayList(u32) = .empty;
+            errdefer list.deinit(self.allocator);
+            try list.append(self.allocator, mount_idx);
+            try self.fence_watches.put(self.allocator, wd, list);
+        }
         if (!already_counted) {
             self.active_watches += 1;
         }
@@ -1495,7 +1624,12 @@ pub const SharedWatcher = struct {
             const n_rc = linux.epoll_wait(self.epoll_fd, &ep_events, ep_events.len, wait_ms);
             const ep_err = linux.errno(n_rc);
             if (ep_err == .INTR) continue;
-            if (ep_err != .SUCCESS or n_rc == 0) continue;
+            if (ep_err != .SUCCESS) {
+                Io.Dir.cwd().deleteFile(io, marker_path) catch {};
+                self.rearmTimer(nowMonotonicMs());
+                return false;
+            }
+            if (n_rc == 0) continue;
 
             const n_ev: usize = @intCast(n_rc);
             for (ep_events[0..n_ev]) |eev| {

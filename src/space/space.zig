@@ -346,6 +346,7 @@ const FallbackGitReaderCtx = struct {
 
 const ProcessLockSlot = struct {
     in_use: bool = false,
+    dev: u64 = 0,
     ino: u64 = 0,
     fd: posix.fd_t = -1,
     refs: usize = 0,
@@ -376,12 +377,19 @@ pub const StateDirLock = struct {
         };
         const ino: u64 = st.inode;
         const fd: posix.fd_t = lock_file.handle;
+        var dev: u64 = 0;
+        if (builtin.os.tag == .linux) {
+            var stx: linux.Statx = undefined;
+            if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{}, &stx)) == .SUCCESS) {
+                dev = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor);
+            }
+        }
 
         acquireLockSpin();
         defer releaseLockSpin();
 
         for (&g_lock_slots, 0..) |*slot, idx| {
-            if (slot.in_use and slot.ino == ino) {
+            if (slot.in_use and slot.dev == dev and slot.ino == ino) {
                 slot.refs += 1;
                 lock_file.close(io);
                 return .{ .slot_idx = idx };
@@ -398,6 +406,7 @@ pub const StateDirLock = struct {
             if (!slot.in_use) {
                 slot.* = .{
                     .in_use = true,
+                    .dev = dev,
                     .ino = ino,
                     .fd = fd,
                     .refs = 1,
@@ -411,20 +420,17 @@ pub const StateDirLock = struct {
     pub fn release(self: *StateDirLock) void {
         if (self.slot_idx) |idx| {
             acquireLockSpin();
-            var close_fd: ?posix.fd_t = null;
             if (g_lock_slots[idx].in_use) {
                 if (g_lock_slots[idx].refs > 1) {
                     g_lock_slots[idx].refs -= 1;
                 } else {
-                    close_fd = g_lock_slots[idx].fd;
+                    const fd = g_lock_slots[idx].fd;
+                    _ = linux.flock(fd, @intCast(posix.LOCK.UN));
+                    _ = linux.close(fd);
                     g_lock_slots[idx] = .{};
                 }
             }
             releaseLockSpin();
-            if (close_fd) |fd| {
-                _ = linux.flock(fd, @intCast(posix.LOCK.UN));
-                _ = linux.close(fd);
-            }
             self.slot_idx = null;
         }
         if (self.direct_fd) |fd| {
@@ -811,18 +817,23 @@ pub const Space = struct {
                     if (cur_is_text) {
                         const old_bytes_opt = try self.history.readFileAt(self.allocator, norm, null);
                         defer if (old_bytes_opt) |ob| self.allocator.free(ob);
-                        const old_bytes = old_bytes_opt orelse "";
-                        if (!std.mem.eql(u8, old_bytes, normalized)) {
-                            var d = try diff.diffBytes(self.allocator, old_bytes, normalized);
-                            defer d.deinit(self.allocator);
-                            if (d.splices.items.len > 0) {
-                                try ops.append(self.allocator, .{ .edit_text = .{
-                                    .inode = iid,
-                                    .text = try self.allocator.dupe(u8, d.inserted.items),
-                                    .splices = try self.allocator.dupe(diff.Splice, d.splices.items),
-                                } });
+                        if (old_bytes_opt) |old_bytes| {
+                            if (!std.mem.eql(u8, old_bytes, normalized)) {
+                                var d = try diff.diffBytes(self.allocator, old_bytes, normalized);
+                                defer d.deinit(self.allocator);
+                                if (d.splices.items.len > 0) {
+                                    try ops.append(self.allocator, .{ .edit_text = .{
+                                        .inode = iid,
+                                        .text = try self.allocator.dupe(u8, d.inserted.items),
+                                        .splices = try self.allocator.dupe(diff.Splice, d.splices.items),
+                                    } });
+                                }
+                            } else if (ops.items.len == 0) {
+                                const cm = try op_mod.makeTextContent(self.allocator, normalized);
+                                if (cm[1]) |att| try blobs.append(self.allocator, att);
+                                try ops.append(self.allocator, .{ .set_content = .{ .inode = iid, .content = cm[0] } });
                             }
-                        } else if (ops.items.len == 0) {
+                        } else {
                             const cm = try op_mod.makeTextContent(self.allocator, normalized);
                             if (cm[1]) |att| try blobs.append(self.allocator, att);
                             try ops.append(self.allocator, .{ .set_content = .{ .inode = iid, .content = cm[0] } });
@@ -1163,8 +1174,28 @@ pub const Space = struct {
         return try out.toOwnedSlice(allocator);
     }
 
+    pub fn hydrateBatchInodes(self: *Space, batches: []const id.BatchId) !void {
+        for (batches) |bid| {
+            if (self.history.batch_inodes.contains(bid)) continue;
+            var touched = try self.collectTouchedInodes(self.allocator, &.{bid});
+            defer touched.deinit(self.allocator);
+            const slice = try self.history.allocator.alloc(id.InodeId, touched.count());
+            errdefer self.history.allocator.free(slice);
+            var i: usize = 0;
+            var it = touched.keyIterator();
+            while (it.next()) |k| : (i += 1) {
+                slice[i] = k.*;
+            }
+            try self.history.batch_inodes.put(self.history.allocator, bid, slice);
+        }
+    }
+
     pub fn rollbackToVersion(self: *Space, actor: id.ActorId, target_version: *const Version) !bool {
         if (target_version.eql(&self.history.dag.heads)) return false;
+        var diff_batches = try self.history.dag.difference(self.allocator, &self.history.dag.heads, target_version);
+        defer diff_batches.deinit(self.allocator);
+        if (diff_batches.items.len == 0) return false;
+        try self.hydrateBatchInodes(diff_batches.items);
         const batch_opt = try self.history.buildRollbackBatch(
             self.allocator,
             actor,
@@ -1174,6 +1205,13 @@ pub const Space = struct {
         var batch = batch_opt orelse return false;
         defer batch.deinit(self.allocator);
         return try self.commitBatch(&batch);
+    }
+
+    fn rollbackWalAppend(self: *Space, prev_offset: u64, prev_next_seq: u64, prev_index_len: usize) void {
+        self.batch_log.file.setLength(self.io, prev_offset) catch {};
+        self.batch_log.write_offset = prev_offset;
+        self.batch_log.next_seq = prev_next_seq;
+        self.batch_log.index.shrinkRetainingCapacity(prev_index_len);
     }
 
     pub fn commitBatch(self: *Space, batch: *const op_mod.Batch) !bool {
@@ -1197,11 +1235,21 @@ pub const Space = struct {
         defer blob_spans.deinit(self.allocator);
         try batch.encodeWithSpans(self.allocator, &w, &op_spans, &blob_spans);
 
+        const prev_offset = self.batch_log.write_offset;
+        const prev_next_seq = self.batch_log.next_seq;
+        const prev_index_len = self.batch_log.index.items.len;
+
         const append_res = try self.batch_log.appendWithOffset(self.batch_log.next_seq, FRAME_BATCH, 0, 0, w.items());
         const log_idx = self.batch_log.count() - 1;
 
-        const applied = try self.history.integrate(batch);
-        if (!applied) return false;
+        const applied = self.history.integrate(batch) catch |err| {
+            self.rollbackWalAppend(prev_offset, prev_next_seq, prev_index_len);
+            return err;
+        };
+        if (!applied) {
+            self.rollbackWalAppend(prev_offset, prev_next_seq, prev_index_len);
+            return false;
+        }
 
         self.history.pinBatchToLog(batch, append_res.payload_offset, op_spans.items, blob_spans.items);
         try self.batch_log_idx.put(self.allocator, batch.header.batchId(), log_idx);
@@ -1351,6 +1399,7 @@ pub const Space = struct {
 
             for (batch.blobs) |*b| b.deinit(allocator);
             allocator.free(batch.blobs);
+            batch.blobs = &.{};
             batch.blobs = try extra_blobs.toOwnedSlice(allocator);
             try out.append(allocator, batch);
         }
@@ -1682,6 +1731,10 @@ pub const Space = struct {
     }
 
     pub fn syncFromOrigin(self: *Space, origin_space: *Space) !SpaceSyncReport {
+        return try self.syncFromOriginAlloc(self.allocator, origin_space);
+    }
+
+    pub fn syncFromOriginAlloc(self: *Space, allocator: Allocator, origin_space: *Space) !SpaceSyncReport {
         if (self.history.history_id != origin_space.history.history_id) {
             return error.HistoryNotShared;
         }
@@ -1693,7 +1746,7 @@ pub const Space = struct {
         }
 
         if (incoming.len == 0) {
-            const cur_conflicts = try self.conflicts(self.allocator);
+            const cur_conflicts = try self.conflicts(allocator);
             return .{ .brought = 0, .merged = &.{}, .conflicts = cur_conflicts };
         }
 
@@ -1710,19 +1763,27 @@ pub const Space = struct {
             }
         }
 
-        const existing_conflicts = try self.conflicts(self.allocator);
+        const existing_conflicts = try self.conflicts(allocator);
         var conflict_list: std.ArrayList(SpaceConflict) = .empty;
         errdefer {
-            for (conflict_list.items) |*c| c.deinit(self.allocator);
-            conflict_list.deinit(self.allocator);
+            for (conflict_list.items) |*c| c.deinit(allocator);
+            conflict_list.deinit(allocator);
         }
-        for (existing_conflicts) |c| try conflict_list.append(self.allocator, c);
-        self.allocator.free(existing_conflicts);
+        var ec_transferred: usize = 0;
+        errdefer {
+            for (existing_conflicts[ec_transferred..]) |*c| c.deinit(allocator);
+            allocator.free(existing_conflicts);
+        }
+        for (existing_conflicts) |c| {
+            try conflict_list.append(allocator, c);
+            ec_transferred += 1;
+        }
+        allocator.free(existing_conflicts);
 
         var merged_paths: std.ArrayList([]u8) = .empty;
         errdefer {
-            for (merged_paths.items) |p| self.allocator.free(p);
-            merged_paths.deinit(self.allocator);
+            for (merged_paths.items) |p| allocator.free(p);
+            merged_paths.deinit(allocator);
         }
 
         for (clashes.items) |*cl| {
@@ -1754,28 +1815,36 @@ pub const Space = struct {
                 } else {
                     _ = try self.deletePath(self.actor_id, target_path);
                 }
-                removeConflictByPath(&conflict_list, self.allocator, target_path);
-                try merged_paths.append(self.allocator, try self.allocator.dupe(u8, target_path));
+                removeConflictByPath(&conflict_list, allocator, target_path);
+                try merged_paths.append(allocator, try allocator.dupe(u8, target_path));
                 continue;
             }
 
             if (cl.ours == null and cl.theirs != null) {
                 _ = try self.putFileWithMeta(self.actor_id, target_path, cl.theirs.?, cl.mode, cl.ending);
-                try upsertConflict(&conflict_list, self.allocator, .{
-                    .path = try self.allocator.dupe(u8, target_path),
+                const p_dup = try allocator.dupe(u8, target_path);
+                errdefer allocator.free(p_dup);
+                const t_dup = try allocator.dupe(u8, cl.theirs.?);
+                errdefer allocator.free(t_dup);
+                try upsertConflict(&conflict_list, allocator, .{
+                    .path = p_dup,
                     .kind = .deleted_here,
                     .ours = null,
-                    .theirs = try self.allocator.dupe(u8, cl.theirs.?),
+                    .theirs = t_dup,
                 });
                 continue;
             }
 
             if (cl.ours != null and cl.theirs == null) {
                 _ = try self.putFileWithMeta(self.actor_id, target_path, cl.ours.?, cl.mode, cl.ending);
-                try upsertConflict(&conflict_list, self.allocator, .{
-                    .path = try self.allocator.dupe(u8, target_path),
+                const p_dup = try allocator.dupe(u8, target_path);
+                errdefer allocator.free(p_dup);
+                const o_dup = try allocator.dupe(u8, cl.ours.?);
+                errdefer allocator.free(o_dup);
+                try upsertConflict(&conflict_list, allocator, .{
+                    .path = p_dup,
                     .kind = .deleted_there,
-                    .ours = try self.allocator.dupe(u8, cl.ours.?),
+                    .ours = o_dup,
                     .theirs = null,
                 });
                 continue;
@@ -1786,11 +1855,17 @@ pub const Space = struct {
             const bb = cl.base orelse "";
             if (isBinaryBytes(ob) or isBinaryBytes(tb) or isBinaryBytes(bb)) {
                 _ = try self.putFileWithMeta(self.actor_id, target_path, ob, cl.mode, cl.ending);
-                try upsertConflict(&conflict_list, self.allocator, .{
-                    .path = try self.allocator.dupe(u8, target_path),
+                const p_dup = try allocator.dupe(u8, target_path);
+                errdefer allocator.free(p_dup);
+                const o_dup = try allocator.dupe(u8, ob);
+                errdefer allocator.free(o_dup);
+                const t_dup = try allocator.dupe(u8, tb);
+                errdefer allocator.free(t_dup);
+                try upsertConflict(&conflict_list, allocator, .{
+                    .path = p_dup,
                     .kind = .binary,
-                    .ours = try self.allocator.dupe(u8, ob),
-                    .theirs = try self.allocator.dupe(u8, tb),
+                    .ours = o_dup,
+                    .theirs = t_dup,
                 });
                 continue;
             }
@@ -1799,32 +1874,42 @@ pub const Space = struct {
             defer self.allocator.free(m.output);
             _ = try self.putFileWithMeta(self.actor_id, target_path, m.output, cl.mode, cl.ending);
             if (m.has_conflict) {
-                try upsertConflict(&conflict_list, self.allocator, .{
-                    .path = try self.allocator.dupe(u8, target_path),
+                const p_dup = try allocator.dupe(u8, target_path);
+                errdefer allocator.free(p_dup);
+                const o_dup = try allocator.dupe(u8, ob);
+                errdefer allocator.free(o_dup);
+                const t_dup = try allocator.dupe(u8, tb);
+                errdefer allocator.free(t_dup);
+                try upsertConflict(&conflict_list, allocator, .{
+                    .path = p_dup,
                     .kind = .text,
-                    .ours = try self.allocator.dupe(u8, ob),
-                    .theirs = try self.allocator.dupe(u8, tb),
+                    .ours = o_dup,
+                    .theirs = t_dup,
                 });
             } else {
-                removeConflictByPath(&conflict_list, self.allocator, target_path);
-                try merged_paths.append(self.allocator, try self.allocator.dupe(u8, target_path));
+                removeConflictByPath(&conflict_list, allocator, target_path);
+                try merged_paths.append(allocator, try allocator.dupe(u8, target_path));
             }
         }
 
         try self.saveConflictsSlice(conflict_list.items);
         return .{
             .brought = brought,
-            .merged = try merged_paths.toOwnedSlice(self.allocator),
-            .conflicts = try conflict_list.toOwnedSlice(self.allocator),
+            .merged = try merged_paths.toOwnedSlice(allocator),
+            .conflicts = try conflict_list.toOwnedSlice(allocator),
         };
     }
 
     pub fn landToOrigin(self: *Space, origin_space: *Space) !SpaceLandReport {
+        return try self.landToOriginAlloc(self.allocator, origin_space);
+    }
+
+    pub fn landToOriginAlloc(self: *Space, allocator: Allocator, origin_space: *Space) !SpaceLandReport {
         if (self.history.history_id != origin_space.history.history_id) {
             return error.HistoryNotShared;
         }
-        var sync_rep = try self.syncFromOrigin(origin_space);
-        errdefer sync_rep.deinit(self.allocator);
+        var sync_rep = try self.syncFromOriginAlloc(allocator, origin_space);
+        errdefer sync_rep.deinit(allocator);
         if (sync_rep.conflicts.len > 0) {
             return error.UnresolvedConflicts;
         }
@@ -2021,7 +2106,6 @@ pub const Space = struct {
         defer wal_dir.close(self.io);
 
         const sealed_seg_max = try self.sealCurrentWalIntoSegments(wal_dir);
-        self.manifest.seg_max_id = sealed_seg_max;
         const wal_cutoff_seq: u64 = if (self.batch_log.next_seq > 0) self.batch_log.next_seq - 1 else self.manifest.wal_base_seq;
 
         var retained_vers: std.ArrayList(Version) = .empty;
@@ -2106,14 +2190,12 @@ pub const Space = struct {
                 return !ctx.pruned.contains(bid);
             }
         };
-        var prune_res = try self.segments.pruneSegments(KeepCtx{ .loc_map = &loc_to_bid, .pruned = &pruned_set });
+        var prune_res = try self.segments.pruneSegmentsDeferred(KeepCtx{ .loc_map = &loc_to_bid, .pruned = &pruned_set });
         defer prune_res.deinit(self.allocator);
 
-        const seg_bytes_after = dirTotalBytes(self.io, self.state_dir, "seg");
         stats.removed_segments = prune_res.removed_segments;
         stats.rewritten_segments = prune_res.rewritten_segments;
         stats.pruned_batches = pruned_set.count();
-        stats.reclaimed_batch_bytes = if (seg_bytes_before > seg_bytes_after) seg_bytes_before - seg_bytes_after else 0;
 
         for (prune_res.remaps.items) |rm| {
             if (loc_to_bid.get(.{ .seg_id = rm.old_seg_id, .offset = rm.old_offset })) |bid| {
@@ -2157,16 +2239,6 @@ pub const Space = struct {
         const new_stack = try snapshot_mod.SnapshotStack.create(self.allocator, new_base_reader, null);
         errdefer new_stack.release();
 
-        if (policy.force_gc and !self.blob_store.isShared()) {
-            var live_oids: std.AutoHashMapUnmanaged(crypto.Hash, void) = .empty;
-            defer live_oids.deinit(self.allocator);
-            try new_stack.collectReferencedBlobOids(self.allocator, &live_oids);
-            try self.blob_store.sealActivePack();
-            const gc_res = try self.blob_store.gc(&live_oids);
-            stats.removed_blobs = gc_res.removed_blobs;
-            stats.reclaimed_blob_bytes = gc_res.reclaimed_bytes;
-        }
-
         const new_wal_gen = self.manifest.wal_gen + 1;
         var new_wal_buf: [32]u8 = undefined;
         const new_wal_name = manifest_mod.walFileName(new_wal_gen, &new_wal_buf);
@@ -2189,7 +2261,7 @@ pub const Space = struct {
         new_manifest.delta_blake3 = @splat(0);
         new_manifest.wal_gen = new_wal_gen;
         new_manifest.wal_base_seq = wal_cutoff_seq;
-        new_manifest.seg_max_id = @max(prune_res.max_seg_id, self.manifest.seg_max_id);
+        new_manifest.seg_max_id = @max(prune_res.max_seg_id, sealed_seg_max);
         new_manifest.pack_max_id = self.blob_store.maxPackId();
         new_manifest.pack_idx_blake3 = self.blob_store.packIdxDigest();
         new_manifest.checkpoint_wall_ms = now_ms;
@@ -2217,6 +2289,72 @@ pub const Space = struct {
         old_log.deinit();
         self.allocator.destroy(old_log);
         if (old_stack) |os| os.release();
+
+        self.segments.unlinkSegments(prune_res.obsolete_seg_ids.items);
+        const seg_bytes_after = dirTotalBytes(self.io, self.state_dir, "seg");
+        stats.reclaimed_batch_bytes = if (seg_bytes_before > seg_bytes_after) seg_bytes_before - seg_bytes_after else 0;
+
+        if (policy.force_gc and !self.blob_store.isShared()) {
+            var live_oids: std.AutoHashMapUnmanaged(crypto.Hash, void) = .empty;
+            defer live_oids.deinit(self.allocator);
+            try new_stack.collectReferencedBlobOids(self.allocator, &live_oids);
+
+            const seg_ids = try self.segments.listSegmentIds(self.allocator);
+            defer self.allocator.free(seg_ids);
+            for (seg_ids) |sid| {
+                const mf_seg = self.segments.getMapped(sid) catch continue;
+                const data = mf_seg.slice();
+                var off: usize = 0;
+                while (off + log_mod.HEADER_SIZE <= data.len) {
+                    const hdr = log_mod.FrameHeader.decode(data[off..][0..log_mod.HEADER_SIZE]) catch break;
+                    const payload_start = off + log_mod.HEADER_SIZE;
+                    const payload_end = payload_start + hdr.payload_len;
+                    const aligned_end = log_mod.alignUp(payload_end);
+                    if (aligned_end > data.len) break;
+                    if (hdr.kind == FRAME_BATCH) {
+                        var br = codec.Reader.init(data[payload_start..payload_end]);
+                        if (op_mod.Batch.decode(self.allocator, &br)) |b_val| {
+                            var b = b_val;
+                            defer b.deinit(self.allocator);
+                            for (b.ops) |op| {
+                                const maybe_oid: ?id.Oid = switch (op) {
+                                    .create_file => |cf| switch (cf.content) {
+                                        .binary => |x| x.oid,
+                                        .text_blob => |x| x.oid,
+                                        else => null,
+                                    },
+                                    .set_content => |sc| switch (sc.content) {
+                                        .binary => |x| x.oid,
+                                        .text_blob => |x| x.oid,
+                                        else => null,
+                                    },
+                                    else => null,
+                                };
+                                if (maybe_oid) |oid| try live_oids.put(self.allocator, oid, {});
+                            }
+                            for (b.blobs) |ba| {
+                                try live_oids.put(self.allocator, ba.oid, {});
+                            }
+                        } else |_| {}
+                    }
+                    off = aligned_end;
+                }
+            }
+
+            try self.blob_store.sealActivePack();
+            const gc_res = try self.blob_store.gc(&live_oids);
+            stats.removed_blobs = gc_res.removed_blobs;
+            stats.reclaimed_blob_bytes = gc_res.reclaimed_bytes;
+
+            const new_pack_max = self.blob_store.maxPackId();
+            const new_pack_digest = self.blob_store.packIdxDigest();
+            if (new_pack_max != new_manifest.pack_max_id or !std.mem.eql(u8, &new_pack_digest, &new_manifest.pack_idx_blake3)) {
+                new_manifest.pack_max_id = new_pack_max;
+                new_manifest.pack_idx_blake3 = new_pack_digest;
+                new_manifest.saveAtomic(self.io, self.state_dir) catch {};
+                mmap.fsyncDir(self.io, self.state_dir) catch {};
+            }
+        }
 
         self.manifest = new_manifest;
         manifest_mod.Manifest.gcOrphanFiles(self.allocator, self.io, self.state_dir, self.manifest);
@@ -2435,7 +2573,7 @@ pub const Space = struct {
         try w.writeVarint(self.allocator, items.len);
         for (items) |c| {
             try w.writeBytes(self.allocator, c.path);
-            try w.writeByte(self.allocator, @intFromEnum(c.kind));
+            try w.writeByte(self.allocator, @backingInt(c.kind));
             try w.writeOptBytes(self.allocator, c.ours);
             try w.writeOptBytes(self.allocator, c.theirs);
         }
@@ -2492,9 +2630,12 @@ fn linkOrCopyDirFiles(allocator: Allocator, io: Io, src_parent: Io.Dir, dst_pare
 
     var it = src_d.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
         if (std.mem.startsWith(u8, entry.name, "tmp.")) continue;
-        try linkOrCopyFile(allocator, io, src_d, dst_d, entry.name);
+        switch (entry.kind) {
+            .file => try linkOrCopyFile(allocator, io, src_d, dst_d, entry.name),
+            .directory => try linkOrCopyDirFiles(allocator, io, src_d, dst_d, entry.name),
+            else => {},
+        }
     }
     mmap.fsyncDir(io, dst_d) catch {};
 }

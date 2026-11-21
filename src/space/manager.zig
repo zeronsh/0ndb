@@ -66,7 +66,7 @@ pub const SpaceRecord = struct {
     pub fn encode(self: *const SpaceRecord, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
         try w.writeU128(allocator, self.space_id);
         try w.writeBytes(allocator, self.title);
-        try w.writeByte(allocator, @intFromEnum(self.kind));
+        try w.writeByte(allocator, @backingInt(self.kind));
         try w.writeBytes(allocator, self.state_path);
         if (self.origin) |*o| {
             try w.writeByte(allocator, 1);
@@ -399,9 +399,54 @@ pub const SpaceManager = struct {
         self.bumpAccess(slot);
     }
 
+    pub const PinnedSpace = struct {
+        manager: *SpaceManager,
+        space_id: u128,
+        space: *space_mod.Space,
+
+        pub fn deinit(self: *PinnedSpace) void {
+            self.manager.unpin(self.space_id);
+        }
+    };
+
+    pub const PinnedProjection = struct {
+        manager: *SpaceManager,
+        space_id: u128,
+        projection: *projection_mod.Projection,
+
+        pub fn deinit(self: *PinnedProjection) void {
+            self.manager.unpin(self.space_id);
+        }
+    };
+
     pub fn unpin(self: *SpaceManager, space_id: u128) void {
         const slot = self.slots.getPtr(space_id) orelse return;
         if (slot.pin_count > 0) slot.pin_count -= 1;
+    }
+
+    pub fn activatePinned(self: *SpaceManager, space_id: u128) !PinnedSpace {
+        try self.pin(space_id);
+        errdefer self.unpin(space_id);
+        const sp = try self.activate(space_id);
+        return .{
+            .manager = self,
+            .space_id = space_id,
+            .space = sp,
+        };
+    }
+
+    pub fn activateProjectionPinned(self: *SpaceManager, space_id: u128) !?PinnedProjection {
+        try self.pin(space_id);
+        errdefer self.unpin(space_id);
+        const proj = (try self.activateProjection(space_id)) orelse {
+            self.unpin(space_id);
+            return null;
+        };
+        return .{
+            .manager = self,
+            .space_id = space_id,
+            .projection = proj,
+        };
     }
 
     pub fn activate(self: *SpaceManager, space_id: u128) !*space_mod.Space {
@@ -456,6 +501,9 @@ pub const SpaceManager = struct {
             self.updateSlotBytes(slot);
             return proj;
         }
+
+        try self.pin(space_id);
+        defer self.unpin(space_id);
 
         const sp = try self.activate(space_id);
         _ = self.evictHotForIncoming(space_id);
@@ -596,8 +644,9 @@ pub const SpaceManager = struct {
 
     pub fn createVirtual(self: *SpaceManager, title: []const u8) !SpaceRecord {
         const sid = id.newUuidV7(self.io);
+        var fields_transferred = false;
         const state_path = try self.allocSpaceStatePath(sid);
-        errdefer self.allocator.free(state_path);
+        errdefer if (!fields_transferred) self.allocator.free(state_path);
 
         var sp = try space_mod.Space.open(
             self.allocator,
@@ -611,7 +660,7 @@ pub const SpaceManager = struct {
 
         const now = id.nowMs(self.io);
         const title_copy = try self.allocator.dupe(u8, title);
-        errdefer self.allocator.free(title_copy);
+        errdefer if (!fields_transferred) self.allocator.free(title_copy);
 
         var rec = SpaceRecord{
             .space_id = sid,
@@ -623,6 +672,7 @@ pub const SpaceManager = struct {
             .created_ms = now,
             .updated_ms = now,
         };
+        fields_transferred = true;
         var owned_by_records = false;
         errdefer if (!owned_by_records) rec.deinit(self.allocator);
 
@@ -658,8 +708,9 @@ pub const SpaceManager = struct {
         if (self.get(sid)) |existing| {
             return try existing.clone(self.allocator);
         }
+        var fields_transferred = false;
         const state_path = try self.allocSpaceStatePath(sid);
-        errdefer self.allocator.free(state_path);
+        errdefer if (!fields_transferred) self.allocator.free(state_path);
 
         var sp = try space_mod.Space.open(
             self.allocator,
@@ -673,9 +724,9 @@ pub const SpaceManager = struct {
 
         const now = id.nowMs(self.io);
         const title_copy = try self.allocator.dupe(u8, title);
-        errdefer self.allocator.free(title_copy);
+        errdefer if (!fields_transferred) self.allocator.free(title_copy);
         const remote_copy: ?[]u8 = if (git_remote_url) |u| try self.allocator.dupe(u8, u) else null;
-        errdefer if (remote_copy) |u| self.allocator.free(u);
+        errdefer if (!fields_transferred) if (remote_copy) |u| self.allocator.free(u);
 
         var rec = SpaceRecord{
             .space_id = sid,
@@ -687,6 +738,7 @@ pub const SpaceManager = struct {
             .created_ms = now,
             .updated_ms = now,
         };
+        fields_transferred = true;
         var owned = false;
         errdefer if (!owned) rec.deinit(self.allocator);
 
@@ -731,15 +783,16 @@ pub const SpaceManager = struct {
                 remote_url = readGitOriginUrl(self.allocator, self.io, gd.common_dir) catch null;
             }
         }
-        errdefer if (remote_url) |u| self.allocator.free(u);
+        var rec_fields_transferred = false;
+        errdefer if (!rec_fields_transferred) if (remote_url) |u| self.allocator.free(u);
 
         const sid = id.newUuidV7(self.io);
         const state_path = try self.allocSpaceStatePath(sid);
-        errdefer self.allocator.free(state_path);
+        errdefer if (!rec_fields_transferred) self.allocator.free(state_path);
 
         const now = id.nowMs(self.io);
         const title_copy = try self.allocator.dupe(u8, title);
-        errdefer self.allocator.free(title_copy);
+        errdefer if (!rec_fields_transferred) self.allocator.free(title_copy);
 
         var rec = SpaceRecord{
             .space_id = sid,
@@ -751,13 +804,15 @@ pub const SpaceManager = struct {
             .created_ms = now,
             .updated_ms = now,
         };
+        rec_fields_transferred = true;
         var rec_owned = false;
         errdefer if (!rec_owned) rec.deinit(self.allocator);
 
+        var proj_fields_transferred = false;
         const path_copy = try self.allocator.dupe(u8, canon);
-        errdefer self.allocator.free(path_copy);
+        errdefer if (!proj_fields_transferred) self.allocator.free(path_copy);
         const rr_copy: ?[]u8 = if (repo.kind == .git) try self.allocator.dupe(u8, repo.root) else null;
-        errdefer if (rr_copy) |r| self.allocator.free(r);
+        errdefer if (!proj_fields_transferred) if (rr_copy) |r| self.allocator.free(r);
 
         var proj_rec = ProjectionRecord{
             .space_id = sid,
@@ -766,6 +821,7 @@ pub const SpaceManager = struct {
             .repo_root = rr_copy,
             .ref_name = null,
         };
+        proj_fields_transferred = true;
         var proj_owned = false;
         errdefer if (!proj_owned) proj_rec.deinit(self.allocator);
 
@@ -801,8 +857,12 @@ pub const SpaceManager = struct {
     ) !SpaceRecord {
         const src_rec_const = self.get(source_id) orelse return error.SpaceNotFound;
         const src_kind = src_rec_const.kind;
+        try self.pin(source_id);
+        defer self.unpin(source_id);
+
+        var rec_fields_transferred = false;
         const src_remote: ?[]u8 = if (src_rec_const.git_remote_url) |u| try self.allocator.dupe(u8, u) else null;
-        errdefer if (src_remote) |u| self.allocator.free(u);
+        errdefer if (!rec_fields_transferred) if (src_remote) |u| self.allocator.free(u);
 
         if (self.slots.getPtr(source_id)) |src_slot| {
             if (src_slot.projection) |p| {
@@ -813,15 +873,16 @@ pub const SpaceManager = struct {
         const src_space = try self.activate(source_id);
         const new_sid = id.newUuidV7(self.io);
         const dst_state_path = try self.allocSpaceStatePath(new_sid);
-        errdefer self.allocator.free(dst_state_path);
+        errdefer if (!rec_fields_transferred) self.allocator.free(dst_state_path);
 
         const forked_sp = try self.allocator.create(space_mod.Space);
         var forked_inited = false;
-        errdefer {
+        var forked_owned = true;
+        errdefer if (forked_owned) {
             if (forked_inited) forked_sp.deinit();
             self.allocator.destroy(forked_sp);
             Io.Dir.cwd().deleteTree(self.io, dst_state_path) catch {};
-        }
+        };
         forked_sp.* = try src_space.forkCow(dst_state_path, new_sid);
         forked_inited = true;
 
@@ -829,8 +890,9 @@ pub const SpaceManager = struct {
         errdefer if (new_proj_rec) |*pr| pr.deinit(self.allocator);
 
         if (project_locally and src_kind != .virtual) {
+            var proj_fields_transferred = false;
             const dest_checkout = try self.allocCheckoutPath(new_sid);
-            errdefer self.allocator.free(dest_checkout);
+            errdefer if (!proj_fields_transferred) self.allocator.free(dest_checkout);
 
             if (src_kind == .git_worktree) {
                 const src_proj_rec = self.projections.getPtr(source_id) orelse return error.MissingOriginCheckout;
@@ -843,15 +905,15 @@ pub const SpaceManager = struct {
                 var hex_buf: [32]u8 = undefined;
                 const hex_id = id.formatIdHex(new_sid, &hex_buf);
                 const branch_name = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ BRANCH_PREFIX, hex_id[0..12] });
-                errdefer self.allocator.free(branch_name);
+                errdefer if (!proj_fields_transferred) self.allocator.free(branch_name);
 
                 try git.addWorktree(self.allocator, self.io, repo_root, dest_checkout, branch_name, base_rev);
-                errdefer {
+                errdefer if (!proj_fields_transferred) {
                     git.removeWorktree(self.allocator, self.io, repo_root, dest_checkout) catch {
                         Io.Dir.cwd().deleteTree(self.io, dest_checkout) catch {};
                     };
                     git.deleteBranch(self.allocator, self.io, repo_root, branch_name) catch {};
-                }
+                };
 
                 if (forked_sp.origin) |*orig| {
                     var updated = try orig.clone(self.allocator);
@@ -864,7 +926,7 @@ pub const SpaceManager = struct {
                 }
 
                 const rr_copy = try self.allocator.dupe(u8, repo_root);
-                errdefer self.allocator.free(rr_copy);
+                errdefer if (!proj_fields_transferred) self.allocator.free(rr_copy);
                 new_proj_rec = .{
                     .space_id = new_sid,
                     .local_path = dest_checkout,
@@ -872,6 +934,7 @@ pub const SpaceManager = struct {
                     .repo_root = rr_copy,
                     .ref_name = branch_name,
                 };
+                proj_fields_transferred = true;
             } else {
                 try Io.Dir.cwd().createDirPath(self.io, dest_checkout);
                 new_proj_rec = .{
@@ -881,14 +944,15 @@ pub const SpaceManager = struct {
                     .repo_root = null,
                     .ref_name = null,
                 };
+                proj_fields_transferred = true;
             }
         }
 
         const now = id.nowMs(self.io);
         const title_copy = try self.allocator.dupe(u8, title);
-        errdefer self.allocator.free(title_copy);
+        errdefer if (!rec_fields_transferred) self.allocator.free(title_copy);
         var origin_copy: ?space_mod.SpaceOrigin = if (forked_sp.origin) |*o| try o.clone(self.allocator) else null;
-        errdefer if (origin_copy) |*o| o.deinit(self.allocator);
+        errdefer if (!rec_fields_transferred) if (origin_copy) |*o| o.deinit(self.allocator);
 
         var rec = SpaceRecord{
             .space_id = new_sid,
@@ -900,6 +964,7 @@ pub const SpaceManager = struct {
             .created_ms = now,
             .updated_ms = now,
         };
+        rec_fields_transferred = true;
         var rec_owned = false;
         errdefer if (!rec_owned) rec.deinit(self.allocator);
 
@@ -923,10 +988,10 @@ pub const SpaceManager = struct {
             .projection = null,
         };
         self.next_access_seq += 1;
-        forked_inited = false;
-        if (self.resources) |res| res.governor.addWorkspaceBytes(slot_bytes);
 
         try self.slots.put(self.allocator, new_sid, slot);
+        forked_owned = false;
+        if (self.resources) |res| res.governor.addWorkspaceBytes(slot_bytes);
 
         if (new_proj_rec) |pr| {
             try self.projections.put(self.allocator, new_sid, pr);
@@ -938,7 +1003,7 @@ pub const SpaceManager = struct {
         if (project_locally and src_kind != .virtual) {
             const proj_opt = try self.activateProjection(new_sid);
             if (proj_opt) |proj| {
-                try proj.materializeToDisk(.{ .force = src_kind == .dir });
+                try proj.materializeToDisk(.{ .force = src_kind == .dir or src_kind == .git_worktree });
             }
         } else {
             _ = self.evictToBudgetExcluding(new_sid);
@@ -965,10 +1030,11 @@ pub const SpaceManager = struct {
                 rr_copy = try self.allocator.dupe(u8, repo.root);
             }
         }
-        errdefer if (rr_copy) |r| self.allocator.free(r);
+        var proj_transferred = false;
+        errdefer if (!proj_transferred) if (rr_copy) |r| self.allocator.free(r);
 
         const path_copy = try self.allocator.dupe(u8, path_str);
-        errdefer self.allocator.free(path_copy);
+        errdefer if (!proj_transferred) self.allocator.free(path_copy);
 
         if (self.slots.getPtr(space_id)) |slot| {
             if (slot.projection) |proj| {
@@ -994,6 +1060,7 @@ pub const SpaceManager = struct {
             .repo_root = rr_copy,
             .ref_name = null,
         });
+        proj_transferred = true;
         try self.saveProjectionTable();
     }
 

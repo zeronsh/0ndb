@@ -145,7 +145,8 @@ const PackFile = struct {
         defer allocator.free(pack_name);
 
         const idx_map = (try MmapSlice.open(io, pack_dir, idx_name)) orelse return null;
-        errdefer idx_map.deinit();
+        var idx_committed = false;
+        defer if (!idx_committed) idx_map.deinit();
 
         const hash_len = format.byteLen();
         const raw = idx_map.mem;
@@ -171,10 +172,13 @@ const PackFile = struct {
         if (off64_bytes % 8 != 0) return null;
 
         const pack_map = (try MmapSlice.open(io, pack_dir, pack_name)) orelse return null;
-        errdefer pack_map.deinit();
+        var pack_committed = false;
+        defer if (!pack_committed) pack_map.deinit();
         if (!validatePackHeader(pack_map.mem)) return null;
 
         const owned_name = try allocator.dupe(u8, idx_name);
+        idx_committed = true;
+        pack_committed = true;
         return .{
             .idx_name = owned_name,
             .idx_map = idx_map,
@@ -196,10 +200,12 @@ const PackFile = struct {
         defer allocator.free(pack_name);
 
         const pack_map = (try MmapSlice.open(io, pack_dir, pack_name)) orelse return null;
-        errdefer pack_map.deinit();
+        var pack_committed = false;
+        defer if (!pack_committed) pack_map.deinit();
         if (!validatePackHeader(pack_map.mem)) return null;
 
         const owned_name = try allocator.dupe(u8, idx_name);
+        pack_committed = true;
         return .{
             .idx_name = owned_name,
             .idx_map = null,
@@ -287,7 +293,15 @@ const MidxIndex = struct {
         format: ObjectFormat,
     ) !?MidxIndex {
         const map = (try MmapSlice.open(io, pack_dir, "multi-pack-index")) orelse return null;
-        errdefer map.deinit();
+        var committed = false;
+        defer if (!committed) map.deinit();
+        const initial_packs_len = packs.items.len;
+        defer if (!committed) {
+            while (packs.items.len > initial_packs_len) {
+                var p = packs.pop().?;
+                p.deinit(allocator);
+            }
+        };
 
         const raw = map.mem;
         if (raw.len < 12) return null;
@@ -363,7 +377,7 @@ const MidxIndex = struct {
         if (ooff_len < @as(usize, total) * 8) return null;
 
         const pack_map = try allocator.alloc(usize, pack_count);
-        errdefer allocator.free(pack_map);
+        defer if (!committed) allocator.free(pack_map);
 
         const pnam_slice = raw[pnam_s .. pnam_s + pnam_len];
         var ppos: usize = 0;
@@ -394,6 +408,7 @@ const MidxIndex = struct {
             packs.items[idx].in_midx = true;
         }
 
+        committed = true;
         return .{
             .map = map,
             .hash_len = hash_len,
@@ -462,7 +477,6 @@ const ObjectStore = struct {
 
     fn init(allocator: Allocator, io: Io, objects_dir_path: []const u8, format: ObjectFormat) !ObjectStore {
         const owned = try allocator.dupe(u8, objects_dir_path);
-        errdefer allocator.free(owned);
         var store = ObjectStore{
             .objects_dir = owned,
             .packs = .empty,
@@ -923,10 +937,11 @@ pub const GitOdb = struct {
         errdefer allocator.destroy(self);
 
         const cd_copy = try allocator.dupe(u8, common_dir);
-        errdefer allocator.free(cd_copy);
+        var fields_transferred = false;
+        errdefer if (!fields_transferred) allocator.free(cd_copy);
 
         const pin_copy = try allocator.dupe(u8, pin_ref_opt orelse DEFAULT_PIN_REF);
-        errdefer allocator.free(pin_copy);
+        errdefer if (!fields_transferred) allocator.free(pin_copy);
 
         var is_reftable = false;
         if (Io.Dir.cwd().openDir(io, common_dir, .{})) |cd_val| {
@@ -950,6 +965,7 @@ pub const GitOdb = struct {
             .delta_cache = DeltaCache.init(allocator, DEFAULT_DELTA_CACHE_BUDGET),
             .blob_cache = BlobCache.init(allocator, DEFAULT_BLOB_CACHE_BUDGET),
         };
+        fields_transferred = true;
         errdefer self.cleanupFields();
 
         const primary_objects = try std.fs.path.join(allocator, &.{ common_dir, "objects" });
@@ -972,14 +988,14 @@ pub const GitOdb = struct {
 
     pub fn release(self: *GitOdb) void {
         if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
-            self.deinit();
+            const alloc = self.allocator;
+            self.cleanupFields();
+            alloc.destroy(self);
         }
     }
 
     pub fn deinit(self: *GitOdb) void {
-        const alloc = self.allocator;
-        self.cleanupFields();
-        alloc.destroy(self);
+        self.release();
     }
 
     fn cleanupFields(self: *GitOdb) void {
@@ -1017,11 +1033,16 @@ pub const GitOdb = struct {
 
         if (visited.contains(canon)) return;
         const key = try self.allocator.dupe(u8, canon);
-        errdefer self.allocator.free(key);
+        var key_owned = true;
+        errdefer if (key_owned) self.allocator.free(key);
         try visited.put(self.allocator, key, {});
+        key_owned = false;
 
-        const store = try ObjectStore.init(self.allocator, self.io, canon, self.format);
+        var store = try ObjectStore.init(self.allocator, self.io, canon, self.format);
+        var store_owned = true;
+        errdefer if (store_owned) store.deinit(self.allocator);
         try self.stores.append(self.allocator, store);
+        store_owned = false;
 
         if (depth >= MAX_ALTERNATES_DEPTH) return;
 
@@ -1110,11 +1131,12 @@ pub const GitOdb = struct {
         return obj.data;
     }
 
-    pub fn readBlobCached(self: *GitOdb, oid: GitOid) !?[]const u8 {
+    pub fn readBlobCached(self: *GitOdb, allocator: Allocator, oid: GitOid) !?[]u8 {
         if (oid.len != self.format.byteLen()) return null;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return try self.readBlobCachedLocked(oid);
+        const cached = (try self.readBlobCachedLocked(oid)) orelse return null;
+        return try allocator.dupe(u8, cached);
     }
 
     pub fn readBlobCachedLocked(self: *GitOdb, oid: GitOid) !?[]const u8 {
@@ -1315,13 +1337,115 @@ pub const GitOdb = struct {
     }
 
     pub fn pinOids(self: *GitOdb, oids: []const GitOid) !void {
+        try self.pinOidsForRef(self.pin_ref, oids);
+    }
+
+    fn resolveRefHexLocked(self: *GitOdb, allocator: Allocator, ref_name: []const u8) !?[]u8 {
+        if (!self.reftable) {
+            var cd = Io.Dir.cwd().openDir(self.io, self.common_dir, .{}) catch return null;
+            defer cd.close(self.io);
+
+            if (cd.openFile(self.io, ref_name, .{})) |rf| {
+                defer rf.close(self.io);
+                var buf: [128]u8 = undefined;
+                const n = rf.readPositionalAll(self.io, &buf, 0) catch 0;
+                const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+                if (trimmed.len == self.format.hexLen()) {
+                    return try allocator.dupe(u8, trimmed);
+                }
+            } else |_| {}
+
+            if (cd.openFile(self.io, "packed-refs", .{})) |pf| {
+                defer pf.close(self.io);
+                const st = pf.stat(self.io) catch return null;
+                if (st.size > 0 and st.size <= 16 * 1024 * 1024) {
+                    const raw = try allocator.alloc(u8, @intCast(st.size));
+                    defer allocator.free(raw);
+                    const n = pf.readPositionalAll(self.io, raw, 0) catch 0;
+                    var lines = std.mem.splitScalar(u8, raw[0..n], '\n');
+                    while (lines.next()) |line_raw| {
+                        const line = std.mem.trim(u8, line_raw, " \t\r");
+                        if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+                        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+                        if (std.mem.eql(u8, line[sp + 1 ..], ref_name) and sp == self.format.hexLen()) {
+                            return try allocator.dupe(u8, line[0..sp]);
+                        }
+                    }
+                }
+            } else |_| {}
+            return null;
+        }
+
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        try env_map.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+        try env_map.put("GIT_TERMINAL_PROMPT", "0");
+        const res = std.process.run(allocator, self.io, .{
+            .argv = &.{ "git", "--git-dir", self.common_dir, "rev-parse", "--verify", ref_name },
+            .environ_map = &env_map,
+            .stdout_limit = .limited(256),
+            .stderr_limit = .limited(4096),
+        }) catch return null;
+        defer allocator.free(res.stdout);
+        defer allocator.free(res.stderr);
+        const ok = switch (res.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!ok) return null;
+        const trimmed = std.mem.trim(u8, res.stdout, " \t\r\n");
+        if (trimmed.len != self.format.hexLen()) return null;
+        return try allocator.dupe(u8, trimmed);
+    }
+
+    fn collectExistingPinnedOidsLocked(self: *GitOdb, ref_name: []const u8, out: *std.ArrayList(GitOid)) !void {
+        const hex = (self.resolveRefHexLocked(self.allocator, ref_name) catch null) orelse return;
+        defer self.allocator.free(hex);
+        const commit_oid = GitOid.fromHex(hex) catch return;
+        var commit_obj = (self.readObjectLocked(self.allocator, commit_oid, true) catch null) orelse return;
+        defer commit_obj.deinit(self.allocator);
+        if (commit_obj.kind != .commit) return;
+
+        var tree_oid_opt: ?GitOid = null;
+        var lines = std.mem.splitScalar(u8, commit_obj.data, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "tree ")) {
+                const thex = std.mem.trim(u8, line[5..], " \t\r");
+                tree_oid_opt = GitOid.fromHex(thex) catch null;
+                break;
+            }
+            if (line.len == 0) break;
+        }
+        const tree_oid = tree_oid_opt orelse return;
+        var tree_obj = (self.readObjectLocked(self.allocator, tree_oid, true) catch null) orelse return;
+        defer tree_obj.deinit(self.allocator);
+        if (tree_obj.kind != .tree) return;
+
+        const hash_len = self.format.byteLen();
+        var pos: usize = 0;
+        while (pos < tree_obj.data.len) {
+            const nul = std.mem.indexOfScalarPos(u8, tree_obj.data, pos, 0) orelse break;
+            const oid_start = nul + 1;
+            const oid_end = oid_start + hash_len;
+            if (oid_end > tree_obj.data.len) break;
+            var oid = GitOid{ .bytes = @splat(0), .len = @intCast(hash_len) };
+            @memcpy(oid.bytes[0..hash_len], tree_obj.data[oid_start..oid_end]);
+            try out.append(self.allocator, oid);
+            pos = oid_end;
+        }
+    }
+
+    pub fn pinOidsForRef(self: *GitOdb, ref_name: []const u8, oids: []const GitOid) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const sorted = try self.allocator.dupe(GitOid, oids);
-        defer self.allocator.free(sorted);
+        var combined: std.ArrayList(GitOid) = .empty;
+        defer combined.deinit(self.allocator);
 
-        std.mem.sort(GitOid, sorted, {}, struct {
+        try self.collectExistingPinnedOidsLocked(ref_name, &combined);
+        try combined.appendSlice(self.allocator, oids);
+
+        std.mem.sort(GitOid, combined.items, {}, struct {
             fn lessThan(_: void, a: GitOid, b: GitOid) bool {
                 return a.order(b) == .lt;
             }
@@ -1331,7 +1455,7 @@ pub const GitOdb = struct {
         defer tree_buf.deinit(self.allocator);
 
         var prev_oid: ?GitOid = null;
-        for (sorted) |oid| {
+        for (combined.items) |oid| {
             if (oid.len != self.format.byteLen()) continue;
             if (prev_oid) |p| {
                 if (p.eql(oid)) continue;
@@ -1364,7 +1488,7 @@ pub const GitOdb = struct {
         var commit_hex_buf: [64]u8 = undefined;
         const commit_hex = commit_oid.toHex(&commit_hex_buf);
 
-        try self.updateRefLocked(self.pin_ref, commit_hex);
+        try self.updateRefLocked(ref_name, commit_hex);
     }
 
     fn writeLooseObjectLocked(self: *GitOdb, kind_name: []const u8, payload: []const u8) !GitOid {
@@ -1474,7 +1598,7 @@ pub const GitOdb = struct {
         try env_map.put("GIT_TERMINAL_PROMPT", "0");
 
         const res = try std.process.run(self.allocator, self.io, .{
-            .argv = &.{ "git", "--git-dir", self.common_dir, "update-ref", ref_name, commit_hex },
+            .argv = &.{ "git", "--git-dir", self.common_dir, "update-ref", "--", ref_name, commit_hex },
             .environ_map = &env_map,
             .stdout_limit = .limited(4096),
             .stderr_limit = .limited(4096),

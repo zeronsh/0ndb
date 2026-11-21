@@ -577,12 +577,26 @@ fn resolveTouchedInodesForBatch(
     allocator: Allocator,
     hist: *history_mod.History,
     sp_opt: ?*space_mod.Space,
+    ws_opt: ?*workspace.Workspace,
     bid: id.BatchId,
     owned_out: *?[]id.InodeId,
 ) ![]const id.InodeId {
     if (hist.batch_inodes.get(bid)) |inodes| return inodes;
     if (sp_opt) |sp| {
         var map = try sp.collectTouchedInodes(allocator, &.{bid});
+        defer map.deinit(allocator);
+        if (map.count() == 0) return &.{};
+        const slice = try allocator.alloc(id.InodeId, map.count());
+        var i: usize = 0;
+        var mit = map.keyIterator();
+        while (mit.next()) |k| : (i += 1) {
+            slice[i] = k.*;
+        }
+        owned_out.* = slice;
+        return slice;
+    }
+    if (ws_opt) |ws| {
+        var map = try ws.collectTouchedInodes(allocator, &.{bid});
         defer map.deinit(allocator);
         if (map.count() == 0) return &.{};
         const slice = try allocator.alloc(id.InodeId, map.count());
@@ -601,6 +615,7 @@ fn listEntriesForHistory(
     allocator: Allocator,
     hist: *history_mod.History,
     sp_opt: ?*space_mod.Space,
+    ws_opt: ?*workspace.Workspace,
     scope_map: ?*const std.AutoHashMapUnmanaged(id.BatchId, *const workspace.ScopeRecord),
     before: ?id.BatchId,
     limit: usize,
@@ -632,7 +647,7 @@ fn listEntriesForHistory(
         if (out.items.len >= limit) break;
         var owned_touched: ?[]id.InodeId = null;
         defer if (owned_touched) |ot| allocator.free(ot);
-        const touched = try resolveTouchedInodesForBatch(allocator, hist, sp_opt, bid, &owned_touched);
+        const touched = try resolveTouchedInodesForBatch(allocator, hist, sp_opt, ws_opt, bid, &owned_touched);
         if (touched.len == 0) continue;
         var hdr = (try hist.dag.getHeaderAlloc(allocator, bid)) orelse continue;
         defer hdr.deinit(allocator);
@@ -697,7 +712,7 @@ pub fn listEntries(
     if (limit == 0) return try allocator.alloc(TimelineEntry, 0);
     var scope_map = try buildScopeLookup(allocator, ws);
     defer scope_map.deinit(allocator);
-    return listEntriesForHistory(allocator, &ws.history, null, &scope_map, before, limit);
+    return listEntriesForHistory(allocator, &ws.history, null, ws, &scope_map, before, limit);
 }
 
 pub fn listEntriesForSpace(
@@ -706,13 +721,14 @@ pub fn listEntriesForSpace(
     before: ?id.BatchId,
     limit: usize,
 ) ![]TimelineEntry {
-    return listEntriesForHistory(allocator, &sp.history, sp, null, before, limit);
+    return listEntriesForHistory(allocator, &sp.history, sp, null, null, before, limit);
 }
 
 fn unifiedDiffForHistory(
     allocator: Allocator,
     hist: *history_mod.History,
     sp_opt: ?*space_mod.Space,
+    ws_opt: ?*workspace.Workspace,
     batch_ids: []const id.BatchId,
 ) ![]u8 {
     if (batch_ids.len == 0) return try allocator.alloc(u8, 0);
@@ -721,6 +737,13 @@ fn unifiedDiffForHistory(
     defer touched_set.deinit(allocator);
     if (sp_opt) |sp| {
         var collected = try sp.collectTouchedInodes(allocator, batch_ids);
+        defer collected.deinit(allocator);
+        var cit = collected.keyIterator();
+        while (cit.next()) |iid| {
+            try touched_set.put(allocator, iid.*, {});
+        }
+    } else if (ws_opt) |ws| {
+        var collected = try ws.collectTouchedInodes(allocator, batch_ids);
         defer collected.deinit(allocator);
         var cit = collected.keyIterator();
         while (cit.next()) |iid| {
@@ -836,7 +859,7 @@ pub fn unifiedDiff(
     ws: *workspace.Workspace,
     batch_ids: []const id.BatchId,
 ) ![]u8 {
-    return unifiedDiffForHistory(allocator, &ws.history, null, batch_ids);
+    return unifiedDiffForHistory(allocator, &ws.history, null, ws, batch_ids);
 }
 
 pub fn unifiedDiffForSpace(
@@ -844,13 +867,14 @@ pub fn unifiedDiffForSpace(
     sp: *space_mod.Space,
     batch_ids: []const id.BatchId,
 ) ![]u8 {
-    return unifiedDiffForHistory(allocator, &sp.history, sp, batch_ids);
+    return unifiedDiffForHistory(allocator, &sp.history, sp, null, batch_ids);
 }
 
 fn foreignChangesForHistory(
     allocator: Allocator,
     hist: *history_mod.History,
     sp_opt: ?*space_mod.Space,
+    ws_opt: ?*workspace.Workspace,
     scope_map: ?*const std.AutoHashMapUnmanaged(id.BatchId, *const workspace.ScopeRecord),
     own_scope_batches: ?*const std.AutoHashMapUnmanaged(id.BatchId, void),
     since_version: ?version.Version,
@@ -884,7 +908,7 @@ fn foreignChangesForHistory(
         }
         var owned_touched: ?[]id.InodeId = null;
         defer if (owned_touched) |ot| allocator.free(ot);
-        const touched = try resolveTouchedInodesForBatch(allocator, hist, sp_opt, bid, &owned_touched);
+        const touched = try resolveTouchedInodesForBatch(allocator, hist, sp_opt, ws_opt, bid, &owned_touched);
         if (touched.len == 0) continue;
 
         const eff_actor = if (scope_map) |sm| (if (sm.get(bid)) |sc| sc.actor else hdr.actor) else hdr.actor;
@@ -947,6 +971,7 @@ pub fn foreignChanges(
         allocator,
         &ws.history,
         null,
+        ws,
         &scope_map,
         &own_scope_batches,
         since_version,
@@ -964,6 +989,7 @@ pub fn foreignChangesForSpace(
         allocator,
         &sp.history,
         sp,
+        null,
         null,
         null,
         since_version,
