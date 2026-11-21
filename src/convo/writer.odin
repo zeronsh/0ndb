@@ -363,12 +363,22 @@ writer_set_leaf :: proc(w: ^Writer, target: Rid) -> (off: i64, err: Error) {
 	} else if !obj.vref_none(lit.at) && !obj.ref_none(w.sum.leaf) && w.sum.leaf_hlc > w.sum.tip_hlc {
 		_keep(w, lit) or_return
 	}
+	anchor, tdepth := y, i64(0)
+	if obj.vref_none(y) && w.sum.tip != 0 {
+		anchor = Vref{w.core.seg, w.sum.tip}
+	}
+	if !obj.vref_none(anchor) {
+		na := _node(v, anchor) or_return
+		tdepth = na.depth
+	}
+	spine := _spine_update(w, anchor, tdepth) or_return
 	lr := obj.local(&w.core, y) or_return
 	obj.seg_flush(&w.core, lr.seg != 0) or_return
 	hlc := obj.now(&w.core)
 	sum := w.sum
 	sum.leaf = lr
 	sum.leaf_hlc = hlc
+	sum.spine = spine
 	return _append(w, &sum, Leaf{msg = lr, hlc = hlc})
 }
 
@@ -603,26 +613,101 @@ writer_decline :: proc(w: ^Writer, msg: Rid) -> (off: i64, err: Error) {
 }
 
 writer_recorded :: proc(w: ^Writer, source, external_id: string) -> (sequence: u64, msg: Rid, found: bool, err: Error) {
-	key := _record_key(source, external_id)
-	_, at := _kids_get(w, key) or_return
-	if at == 0 {
-		return 0, {}, false, .None
-	}
+	_record_catch_up(w) or_return
 	v := w.core.v
-	body, _ := obj.get(v, w.core.seg, at) or_return
-	if obj.is_redacted(body) {
-		return 0, {}, false, .None
+	for s in 0 ..< len(v.segs) {
+		at: i64
+		if s == w.core.seg {
+			_, at = _kids_get(w, _record_key(source, external_id)) or_return
+		} else {
+			_, at = obj.slots_get(&w.kids, _peer_record_key(source, external_id, v.segs[s].id)) or_return
+		}
+		if at == 0 {
+			continue
+		}
+		body, _ := obj.get(v, s, at) or_return
+		if obj.is_redacted(body) {
+			continue
+		}
+		rec := decode_record(body, at, v.scratch) or_return
+		r, ok := rec.body.(Recorded)
+		if !ok {
+			return 0, {}, false, .Corrupt
+		}
+		if r.source != source || r.external_id != external_id {
+			continue
+		}
+		if found && r.sequence <= sequence {
+			continue
+		}
+		mv := obj.resolve(v, s, r.msg) or_return
+		sequence, msg, found = r.sequence, obj.rid(v, mv), true
 	}
-	rec := decode_record(body, at, v.scratch) or_return
-	r, ok := rec.body.(Recorded)
-	if !ok {
-		return 0, {}, false, .Corrupt
+	return
+}
+
+@(private)
+_peer_record_key :: proc(source, external_id: string, seg: prim.Id) -> u64 {
+	id := seg
+	h := xxhash.XXH3_64_with_seed(id[:], 0x7065_6572)
+	h = xxhash.XXH3_64_with_seed(transmute([]u8)source, h)
+	h = xxhash.XXH3_64_with_seed(transmute([]u8)external_id, h)
+	return (1 << 63) | (h & ((1 << 63) - 1)) | 1
+}
+
+@(private)
+_progress_key :: proc(seg: prim.Id) -> u64 {
+	id := seg
+	h := xxhash.XXH3_64_with_seed(id[:], 0x7072_6f67)
+	return (1 << 63) | (h & ((1 << 63) - 1)) | 1
+}
+
+@(private)
+_record_catch_up :: proc(w: ^Writer) -> Error {
+	v := w.core.v
+	Ctx :: struct {
+		w:     ^Writer,
+		from:  i64,
+		seg:   prim.Id,
+		added: bool,
 	}
-	if r.source != source || r.external_id != external_id {
-		return 0, {}, false, .None
+	visit :: proc(data: rawptr, s: int, off: i64, env: ^obj.Envelope) -> (stop: bool, err: Error) {
+		c := (^Ctx)(data)
+		if off < c.from {
+			return true, .None
+		}
+		if env.kind != u8(Kind.Recorded) {
+			return false, .None
+		}
+		rec := decode_env(env, c.w.core.v.scratch) or_return
+		r := rec.body.(Recorded)
+		key := _peer_record_key(r.source, r.external_id, c.seg)
+		seq := i64(min(r.sequence, u64(max(i64))))
+		have, _ := obj.slots_get(&c.w.kids, key) or_return
+		if seq > have {
+			obj.slots_put(&c.w.kids, key, seq, off) or_return
+			c.added = true
+		}
+		return false, .None
 	}
-	mv := obj.resolve(v, w.core.seg, r.msg) or_return
-	return r.sequence, obj.rid(v, mv), true, .None
+	for s in 0 ..< len(v.segs) {
+		if s == w.core.seg {
+			continue
+		}
+		end := obj.end(v, s)
+		pk := _progress_key(v.segs[s].id)
+		from, _ := obj.slots_get(&w.kids, pk) or_return
+		if from >= end {
+			continue
+		}
+		ctx := Ctx{w, from, v.segs[s].id, false}
+		obj.walk_events(v, s, 0, &ctx, visit) or_return
+		if ctx.added {
+			obj.slots_sync(&w.kids) or_return
+		}
+		obj.slots_put(&w.kids, pk, end, 0) or_return
+	}
+	return .None
 }
 
 writer_record :: proc(w: ^Writer, source, external_id: string, sequence: u64, msg: Rid) -> (receipt: Receipt, err: Error) {
@@ -942,7 +1027,7 @@ _append :: proc(w: ^Writer, sum: ^Summary, body: Body) -> (off: i64, err: Error)
 	}
 	off = obj.finish(&w.core, &rec) or_return
 	w.sum = sum^
-	if k != .Forks && int(w.sum.since) >= max(DIGEST_EVERY, int(w.sum.digest_size) / DIGEST_RATIO) {
+	if k != .Forks && k != .Spine && int(w.sum.since) >= max(DIGEST_EVERY, int(w.sum.digest_size) / DIGEST_RATIO) {
 		_write_digest(w) or_return
 	}
 	return off, .None
@@ -1002,8 +1087,11 @@ _write_digest :: proc(w: ^Writer) -> Error {
 		mounts:     [dynamic]Digest_Mount,
 		superseded: [dynamic]Superseded,
 		landed:     [dynamic]Ref,
+		heads:      map[i64]Spine_Head,
+		prior:      Spine_Index,
 	}
 	ctx := Ctx{
+		heads      = make(map[i64]Spine_Head, v.scratch),
 		v          = v,
 		forks      = make([dynamic]Remember, v.scratch),
 		index      = make(map[[3]Ref]int, v.scratch),
@@ -1037,7 +1125,12 @@ _write_digest :: proc(w: ^Writer) -> Error {
 		}
 		rec := decode_env(env, c.v.scratch) or_return
 		#partial switch r in rec.body {
+		case Spine:
+			c.heads[off] = Spine_Head{r.prev, r.c, r.first}
 		case Forks:
+			c.prior = r.spine
+			c.prior.blocks = make([]i64, len(r.spine.blocks), c.v.scratch)
+			copy(c.prior.blocks, r.spine.blocks)
 			for d in r.forks {
 				add(c, d)
 			}
@@ -1105,7 +1198,12 @@ _write_digest :: proc(w: ^Writer) -> Error {
 		}
 	}
 	resize(&ctx.mounts, n)
-	digest := Forks{ctx.forks[:], ctx.assigns[:], ctx.claims[:], ctx.mounts[:], ctx.superseded[:], ctx.landed[:]}
+	sc, sb, complete := spine_resolve(ctx.heads, w.sum.spine, &ctx.prior, v.scratch)
+	spine := Spine_Index{}
+	if complete {
+		spine = Spine_Index{w.sum.spine, sc, sb}
+	}
+	digest := Forks{ctx.forks[:], ctx.assigns[:], ctx.claims[:], ctx.mounts[:], ctx.superseded[:], ctx.landed[:], spine}
 	off := _prep_off(w, false) or_return
 	sum := w.sum
 	sum.digest = off
@@ -1312,6 +1410,29 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 		}
 		files_prev = p if np.files else np.files_prev
 	}
+	files_run: u32
+	files_base: []File_Delta
+	if len(s.files) > 0 && !obj.vref_none(files_prev) {
+		fp := np if files_prev == p else (_node(v, files_prev) or_return)
+		files_run = fp.files_run + 1
+		if files_run >= FILES_SNAPSHOT {
+			state := _files_walk(v, files_prev, nil, v.scratch) or_return
+			base := make([dynamic]File_Delta, v.scratch)
+			for f in state {
+				own := false
+				for g in s.files {
+					own ||= g.mount == f.mount
+				}
+				if !own {
+					append(&base, f)
+				}
+			}
+			if len(base) <= MAX_FILES {
+				files_run = 0
+				files_base = base[:]
+			}
+		}
+	}
 	st: Structure
 	structure_load(v, nil, np.hlc, &st) or_return
 	other := _is_fork_point(&st, p)
@@ -1335,6 +1456,7 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 			_leave(w, Pos{tip, w.sum.tip_hlc, w.core.id}, p) or_return
 		}
 	}
+	spine := _spine_update(w, p, depth) or_return
 	pseal := Vref{}
 	if !obj.vref_none(p) {
 		if p.seg == w.core.seg {
@@ -1378,6 +1500,7 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 	sum.open_len += 1
 	sum.tip = off
 	sum.tip_hlc = hlc
+	sum.spine = spine
 	author := s.author if !prim.id_is_zero(s.author) else w.core.id
 	m := Msg{
 		role        = s.role,
@@ -1397,6 +1520,8 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 		parent_seal = sr,
 		claim       = s.claim if s.claim > 0 && s.claim < off else 0,
 		files_prev  = fr,
+		files_run   = files_run,
+		files_base  = files_base,
 	}
 	got := _append(w, &sum, m) or_return
 	if got != off {
@@ -1461,4 +1586,48 @@ _flush_full :: proc(w: ^Writer, all: bool) -> Error {
 		clear(&b.meta)
 	}
 	return .None
+}
+
+@(private)
+_spine_update :: proc(w: ^Writer, anchor: Vref, tdepth: i64) -> (spine: i64, err: Error) {
+	v := w.core.v
+	cnew := max(tdepth - 1, 0) / SPINE_SPAN * SPINE_SPAN
+	old := w.sum.spine
+	cold: i64
+	told: Vref
+	if old != 0 {
+		body, _ := obj.get(v, w.core.seg, old) or_return
+		if !obj.is_redacted(body) {
+			rec := decode_record(body, old, v.scratch) or_return
+			sp, ok := rec.body.(Spine)
+			if !ok {
+				return 0, .Corrupt
+			}
+			cold = sp.c
+			told = obj.resolve(v, w.core.seg, sp.target) or_return
+		}
+	}
+	keep: i64
+	if cold > 0 && cnew > 0 && !obj.vref_none(told) && !obj.vref_none(anchor) {
+		a := lca(v, told, anchor) or_return
+		if !obj.vref_none(a) {
+			na := _node(v, a) or_return
+			keep = min(na.depth, cold, cnew) / SPINE_SPAN * SPINE_SPAN
+		}
+	}
+	if cnew == cold && keep == cnew && (old != 0 || cnew == 0) {
+		return old, .None
+	}
+	nodes := make([]Ref, cnew - keep, v.scratch)
+	if cnew > keep {
+		n := level_ancestor(v, anchor, cnew) or_return
+		for i := len(nodes) - 1; i >= 0; i -= 1 {
+			nodes[i] = obj.local(&w.core, n.ref) or_return
+			if i > 0 {
+				n = _node(v, n.parent) or_return
+			}
+		}
+	}
+	tr := obj.local(&w.core, anchor) or_return
+	return _event(w, Spine{target = tr, prev = old, c = cnew, first = keep / SPINE_SPAN, nodes = spine_encode(nodes, v.scratch)})
 }

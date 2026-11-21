@@ -338,6 +338,11 @@ page :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocator := co
 		body, _, e := obj.get_before(v, cur.seg, cur.off, below)
 		if e == .Missing {
 			obj.want_chain(v, cur.seg, 0, cur.off + obj.MSG_GUESS)
+			if len(out) == 0 {
+				_prefetch_structure(v, t, cur)
+			} else {
+				_spine_prefetch(v, t, prev_depth - i64(limit - len(out)), prev_depth - 1, floor)
+			}
 			missing = true
 			break
 		}
@@ -403,7 +408,13 @@ message :: proc(v: ^obj.View, t: ^Tail, pos: Position, allocator := context.allo
 
 siblings :: proc(v: ^obj.View, t: ^Tail, msg: Rid, allocator := context.allocator) -> (list: []Rid, pos: int, err: Error) {
 	x := obj.vref(v, msg) or_return
-	n := _node(v, x) or_return
+	n, ne := _node(v, x)
+	if ne == .Missing {
+		_prefetch_structure(v, t, x)
+	}
+	if ne != .None {
+		return nil, 0, ne
+	}
 	floor: prim.Hlc
 	if !obj.vref_none(n.parent) {
 		pn := _node(v, n.parent) or_return
@@ -426,25 +437,49 @@ siblings :: proc(v: ^obj.View, t: ^Tail, msg: Rid, allocator := context.allocato
 
 switch_target :: proc(v: ^obj.View, t: ^Tail, s: Rid) -> (leaf: Rid, err: Error) {
 	sv := obj.vref(v, s) or_return
-	ns := _node(v, sv) or_return
+	ns, ne := _node(v, sv)
+	if ne == .Missing {
+		_prefetch_structure(v, t, sv)
+	}
+	if ne != .None {
+		return {}, ne
+	}
 	st: Structure
 	structure_load(v, t, ns.hlc, &st) or_return
-	best := Pos{
-		at = sv,
-	}
+	list := make([dynamic]Entry, v.scratch)
 	for e in chains(&st) {
 		if e.child_depth - 1 > ns.depth || e.leaf_depth < ns.depth {
 			continue
 		}
-		if e.leaf_hlc < best.hlc || (e.leaf_hlc == best.hlc && !obj.id_less(best.by, e.leaf_by)) {
+		append(&list, e)
+	}
+	slice.sort_by(list[:], proc(a, b: Entry) -> bool {
+		if a.leaf_hlc != b.leaf_hlc {
+			return a.leaf_hlc > b.leaf_hlc
+		}
+		return obj.id_less(b.leaf_by, a.leaf_by)
+	})
+	missing := false
+	for e in list {
+		at, ae := chain_at(v, &st, e, ns.depth)
+		if ae == .Missing {
+			missing = true
 			continue
 		}
-		at := chain_at(v, e, ns.depth) or_return
+		if ae != .None {
+			return {}, ae
+		}
 		if at == sv {
-			best = Pos{e.leaf, e.leaf_hlc, e.leaf_by}
+			if missing {
+				return {}, .Missing
+			}
+			return obj.rid(v, e.leaf), .None
 		}
 	}
-	return obj.rid(v, best.at), .None
+	if missing {
+		return {}, .Missing
+	}
+	return obj.rid(v, sv), .None
 }
 
 assignee :: proc(v: ^obj.View, t: ^Tail, msg: Rid) -> (runner: prim.Id, err: Error) {
@@ -475,39 +510,44 @@ files_at :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (out
 	for m in ms {
 		append(&names, m.name)
 	}
+	if len(names) == 0 {
+		return nil, .None
+	}
+	return _files_walk(v, x, names[:], allocator)
+}
+
+@(private)
+_files_walk :: proc(v: ^obj.View, x: Vref, names: []string, allocator: runtime.Allocator) -> (out: []File_Delta, err: Error) {
 	list := make([dynamic]File_Delta, allocator)
-	cur := x
-	for !obj.vref_none(cur) && len(list) < len(names) + MAX_FILES {
-		body, _ := obj.get(v, cur.seg, cur.off) or_return
-		m := _decode_msg(body, cur.off) or_return
-		for f in m.files {
-			seen := false
-			for o in list {
-				if o.mount == f.mount {
-					seen = true
-					break
-				}
+	take :: proc(list: ^[dynamic]File_Delta, names: []string, files: []File_Delta, allocator: runtime.Allocator) -> Error {
+		for f in files {
+			wanted := names == nil
+			for nm in names {
+				wanted ||= nm == f.mount
 			}
-			if seen {
+			for o in list {
+				wanted &&= o.mount != f.mount
+			}
+			if !wanted {
 				continue
 			}
 			c := f
 			c.mount = obj.clone_str(f.mount, allocator) or_return
 			c.version = obj.clone_bytes(f.version, allocator) or_return
-			append(&list, c)
+			append(list, c)
 		}
-		done := len(names) > 0
-		for nm in names {
-			found := false
-			for o in list {
-				if o.mount == nm {
-					found = true
-					break
-				}
-			}
-			done &&= found
+		return .None
+	}
+	cur := x
+	for !obj.vref_none(cur) {
+		if names != nil && len(list) == len(names) {
+			break
 		}
-		if done {
+		body, _ := obj.get(v, cur.seg, cur.off) or_return
+		m := _decode_msg(body, cur.off) or_return
+		take(&list, names, m.files, allocator) or_return
+		if len(m.files) > 0 && m.files_run == 0 {
+			take(&list, names, m.files_base, allocator) or_return
 			break
 		}
 		cur = obj.resolve(v, cur.seg, m.files_prev) or_return
@@ -1100,7 +1140,7 @@ _collect_siblings :: proc(v: ^obj.View, st: ^Structure, set: []Kid_Set) -> Error
 	}
 	missing := false
 	for e in chains(st) {
-		err := _chain_sibling(v, e, set, path, lo, hi)
+		err := _chain_sibling(v, st, e, set, path, lo, hi)
 		if err == .Missing {
 			missing = true
 		} else if err != .None {
@@ -1117,7 +1157,7 @@ _collect_siblings :: proc(v: ^obj.View, st: ^Structure, set: []Kid_Set) -> Error
 }
 
 @(private)
-_chain_sibling :: proc(v: ^obj.View, e: Entry, set: []Kid_Set, path: []Vref, lo, hi: i64) -> Error {
+_chain_sibling :: proc(v: ^obj.View, st: ^Structure, e: Entry, set: []Kid_Set, path: []Vref, lo, hi: i64) -> Error {
 	at :: proc(path: []Vref, lo, d: i64) -> Vref {
 		return path[d - lo + 1]
 	}
@@ -1129,10 +1169,10 @@ _chain_sibling :: proc(v: ^obj.View, e: Entry, set: []Kid_Set, path: []Vref, lo,
 	if a > b {
 		return .None
 	}
-	top := chain_at(v, e, b) or_return
+	top := chain_at(v, st, e, b) or_return
 	l := b
 	if top != at(path, lo, b) {
-		first := chain_at(v, e, a) or_return
+		first := chain_at(v, st, e, a) or_return
 		if first != at(path, lo, a) {
 			return .None
 		}
@@ -1140,7 +1180,7 @@ _chain_sibling :: proc(v: ^obj.View, e: Entry, set: []Kid_Set, path: []Vref, lo,
 		r := b - 1
 		for l < r {
 			mid := (l + r + 1) / 2
-			c := chain_at(v, e, mid) or_return
+			c := chain_at(v, st, e, mid) or_return
 			if c == at(path, lo, mid) {
 				l = mid
 			} else {
@@ -1149,7 +1189,7 @@ _chain_sibling :: proc(v: ^obj.View, e: Entry, set: []Kid_Set, path: []Vref, lo,
 		}
 	}
 	d := l + 1
-	c := chain_at(v, e, d) or_return
+	c := chain_at(v, st, e, d) or_return
 	if obj.vref_none(c) || c == at(path, lo, d) {
 		return .None
 	}
@@ -1249,4 +1289,56 @@ _claim_window :: proc(v: ^obj.View, c: Vref) -> (w: [2]i64, err: Error) {
 	}
 	start := prim.hlc_ms(rec.stamp)
 	return {start, start + i64(min(cl.lease, u64(max(i64) / 2)))}, .None
+}
+
+@(private)
+_prefetch_structure :: proc(v: ^obj.View, t: ^Tail, at: Vref) {
+	sum, ok, e := _tail(v, at.seg)
+	if e != .None || !ok || sum.digest == 0 || at.off >= sum.digest {
+		return
+	}
+	obj.want(v, at.seg, max(at.off - obj.TAIL_GUESS / 2, 0), min(at.off + obj.TAIL_GUESS / 2, obj.end(v, at.seg)))
+	st: Structure
+	structure_load(v, t, 0, &st)
+}
+
+@(private)
+_spine_prefetch :: proc(v: ^obj.View, t: ^Tail, lo, hi: i64, floor: prim.Hlc) {
+	if hi < 1 {
+		return
+	}
+	st: Structure
+	if structure_load(v, t, floor, &st) != .None {
+		return
+	}
+	a := max(lo, 1)
+	for s in 0 ..< len(st.spines) {
+		sp, e := _spine_get(v, &st, s)
+		if e != .None || sp == nil || !sp.ready {
+			continue
+		}
+		for k := (a - 1) / SPINE_SPAN; k <= (hi - 1) / SPINE_SPAN && k < i64(len(sp.blocks)); k += 1 {
+			rec := sp.blocks[k]
+			if rec == 0 {
+				continue
+			}
+			from := rec - obj.TAIL_GUESS
+			if k > 0 && sp.blocks[k - 1] < rec {
+				from = sp.blocks[k - 1] - obj.TAIL_GUESS / 8
+			}
+			obj.want(v, s, max(from, 0), min(rec + obj.MSG_GUESS, obj.end(v, s)))
+		}
+		if hi > sp.c {
+			obj.want(v, s, sp.start, min(sp.start + 4 * obj.TAIL_GUESS, obj.end(v, s)))
+		}
+		for e2 in chains(&st) {
+			if e2.leaf_depth < lo || e2.child_depth > hi || e2.leaf == sp.target || e2.leaf_depth > sp.c {
+				continue
+			}
+			rec := sp.blocks[(e2.leaf_depth - 1) / SPINE_SPAN]
+			if rec != 0 {
+				obj.want(v, s, rec, min(rec + obj.MSG_GUESS, obj.end(v, s)))
+			}
+		}
+	}
 }

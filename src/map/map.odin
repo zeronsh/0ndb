@@ -596,3 +596,74 @@ value_id :: proc "contextless" (v: []u8) -> (id: prim.Id, ok: bool) {
 	copy(id[:], v)
 	return id, true
 }
+
+entry_join :: proc(a, b: ^Entry, allocator := context.temp_allocator) -> (out: Entry) {
+	out.key = a.key
+	regs := make([dynamic]Register, 0, len(a.registers) + len(b.registers), allocator)
+	append(&regs, ..a.registers)
+	for r in b.registers {
+		k := -1
+		for x, i in regs {
+			if x.tag == r.tag {
+				k = i
+				break
+			}
+		}
+		if k < 0 {
+			append(&regs, r)
+		} else if register_wins(r.hlc, r.by, r.value, regs[k].hlc, regs[k].by, regs[k].value) {
+			regs[k] = r
+		}
+	}
+	slice.sort_by(regs[:], proc(x, y: Register) -> bool {
+		return x.tag < y.tag
+	})
+	out.registers = regs[:]
+	els := make([dynamic]Element, 0, len(a.elements) + len(b.elements), allocator)
+	append(&els, ..a.elements)
+	for el in b.elements {
+		k := -1
+		for x, i in els {
+			if x.tag == el.tag && string(x.value) == string(el.value) {
+				k = i
+				break
+			}
+		}
+		if k < 0 {
+			append(&els, el)
+			continue
+		}
+		live := make([dynamic]Rid, 0, len(els[k].live) + len(el.live), allocator)
+		dead := make([dynamic]Rid, 0, len(els[k].dead) + len(el.dead), allocator)
+		append(&dead, ..els[k].dead)
+		for r in el.dead {
+			if !_rid_in(dead[:], r) {
+				append(&dead, r)
+			}
+		}
+		for list in ([2][]Rid{els[k].live, el.live}) {
+			for r in list {
+				if !_rid_in(dead[:], r) && !_rid_in(live[:], r) {
+					append(&live, r)
+				}
+			}
+		}
+		els[k].live = live[:]
+		els[k].dead = dead[:]
+	}
+	n := 0
+	for el in els {
+		if len(el.live) > 0 || len(el.dead) > 0 {
+			els[n] = el
+			n += 1
+		}
+	}
+	slice.sort_by(els[:n], proc(x, y: Element) -> bool {
+		if x.tag != y.tag {
+			return x.tag < y.tag
+		}
+		return string(x.value) < string(y.value)
+	})
+	out.elements = els[:n]
+	return
+}

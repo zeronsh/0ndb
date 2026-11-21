@@ -1070,3 +1070,297 @@ _encode_into :: proc(n: ^Node, dst: []u8, no: u64, scratch: runtime.Allocator) {
 	copy(dst[NODE_HEADER:], body[:])
 	prim.put_u64le(dst[0:8], xxhash.XXH3_64_with_seed(dst[8:], no))
 }
+
+Builder :: struct {
+	db:    ^Db,
+	c:     Copier,
+	tmp:   prim.Path_Buf,
+	tlen:  int,
+	meta:  Meta,
+	trees: [ROOTS]Build_Tree,
+	open:  bool,
+}
+
+@(private)
+Build_Tree :: struct {
+	levels: [dynamic]^Build_Level,
+	last:      [dynamic]u8,
+	count:     u64,
+	active:    bool,
+	allocator: runtime.Allocator,
+}
+
+@(private)
+Build_Level :: struct {
+	arena:   virtual.Arena,
+	node:    Node,
+	first:   []u8,
+	size:    int,
+	flushed: int,
+}
+
+builder_begin :: proc(b: ^Builder, db: ^Db) -> Error {
+	if db.txn != nil {
+		return .Busy
+	}
+	b^ = {}
+	b.db = db
+	if len(db.path) + 6 >= len(b.tmp) {
+		return .Invalid
+	}
+	b.tlen = copy(b.tmp[:], db.path)
+	b.tlen += copy(b.tmp[b.tlen:], ".build")
+	fd, oerr := prim.open_file(db.vfs, string(b.tmp[:b.tlen]), {.Write, .Create, .Truncate}, 0o600)
+	if oerr != .None {
+		return obj.perr(oerr)
+	}
+	b.c = Copier{
+		db   = db,
+		fd   = fd,
+		next = 2,
+	}
+	if virtual.arena_init_growing(&b.c.arena) != nil {
+		prim.close_file(db.vfs, fd)
+		prim.remove(db.vfs, string(b.tmp[:b.tlen]))
+		return .No_Memory
+	}
+	b.c.buf = make([dynamic]u8, 0, WRITE_CHUNK * PAGE, virtual.arena_allocator(&b.c.arena))
+	b.meta = Meta{
+		txn = db.meta.txn,
+	}
+	b.open = true
+	return .None
+}
+
+builder_abort :: proc(b: ^Builder) {
+	if !b.open {
+		return
+	}
+	_builder_free(b)
+	prim.close_file(b.db.vfs, b.c.fd)
+	prim.remove(b.db.vfs, string(b.tmp[:b.tlen]))
+	b.open = false
+}
+
+builder_add :: proc(b: ^Builder, root: int, key: []u8, value: []u8) -> Error {
+	if root < 0 || root >= ROOTS || b.meta.roots[root] != 0 {
+		return .Invalid
+	}
+	if len(key) == 0 || len(key) > MAX_KEY {
+		return .Invalid
+	}
+	if len(value) > MAX_VALUE {
+		return .Too_Large
+	}
+	t := &b.trees[root]
+	if t.active && string(key) <= string(t.last[:]) {
+		return .Invalid
+	}
+	if !t.active {
+		t.levels = make([dynamic]^Build_Level, b.db.allocator)
+		t.last = make([dynamic]u8, b.db.allocator)
+		t.allocator = b.db.allocator
+		t.active = true
+	}
+	clear(&t.last)
+	append(&t.last, ..key)
+	t.count += 1
+	if len(t.levels) == 0 {
+		_level_push(b, t) or_return
+	}
+	l := t.levels[0]
+	v := Val{
+		size = u64(len(value)),
+	}
+	cost := prim.uvarint_len(u64(len(key))) + len(key) + _val_cost(v)
+	if len(l.node.keys) > 0 && l.size + cost > PAGE {
+		_level_flush(b, t, 0) or_return
+	}
+	a := virtual.arena_allocator(&l.arena)
+	if v.size > INLINE_LIMIT {
+		v.ovf = b.c.next
+		pos := 0
+		for _ in 0 ..< _ovf_pages(v.size) {
+			p, dst := _copier_page(&b.c) or_return
+			dst[8] = KIND_OVF
+			pos += copy(dst[NODE_HEADER:], value[pos:])
+			prim.put_u64le(dst[0:8], xxhash.XXH3_64_with_seed(dst[8:], p))
+		}
+	} else {
+		d, e := make([]u8, len(value), a)
+		if e != nil {
+			return .No_Memory
+		}
+		copy(d, value)
+		v.data = d
+	}
+	k, ke := make([]u8, len(key), a)
+	if ke != nil {
+		return .No_Memory
+	}
+	copy(k, key)
+	if len(l.node.keys) == 0 {
+		l.first = k
+	}
+	append(&l.node.keys, k)
+	append(&l.node.vals, v)
+	l.size += cost
+	return .None
+}
+
+builder_end :: proc(b: ^Builder, root: int) -> Error {
+	if root < 0 || root >= ROOTS || b.meta.roots[root] != 0 {
+		return .Invalid
+	}
+	t := &b.trees[root]
+	if !t.active {
+		return .None
+	}
+	for i := 0; i < len(t.levels); i += 1 {
+		l := t.levels[i]
+		if i == len(t.levels) - 1 && l.flushed == 0 {
+			if !l.node.leaf && len(l.node.kids) == 1 {
+				b.meta.roots[root] = l.node.kids[0]
+				break
+			}
+			p, dst := _copier_page(&b.c) or_return
+			_encode_into(&l.node, dst, p, virtual.arena_allocator(&l.arena))
+			b.meta.roots[root] = p
+			break
+		}
+		_level_flush(b, t, i) or_return
+	}
+	b.meta.counts[root] = t.count
+	_tree_free(t)
+	return .None
+}
+
+builder_commit :: proc(b: ^Builder) -> Error {
+	if !b.open {
+		return .Invalid
+	}
+	for r in 0 ..< ROOTS {
+		if b.trees[r].active {
+			builder_end(b, r) or_return
+		}
+	}
+	_copier_flush(&b.c) or_return
+	m := b.meta
+	m.txn += 1
+	m.pages = b.c.next
+	m.live = b.c.next - 2
+	db := b.db
+	fd := b.c.fd
+	_meta_write_slot(db.vfs, fd, &m, 0) or_return
+	_meta_write_slot(db.vfs, fd, &m, 1) or_return
+	if err := prim.datasync(db.vfs, fd); err != .None {
+		return obj.perr(err)
+	}
+	if err := prim.rename(db.vfs, string(b.tmp[:b.tlen]), db.path); err != .None {
+		return obj.perr(err)
+	}
+	_builder_free(b)
+	b.open = false
+	prim.close_file(db.vfs, db.fd)
+	db.fd = fd
+	db.meta = m
+	db.cache_no = {}
+	return obj.perr(prim.sync_dir(db.vfs, prim.dir_name(db.path)))
+}
+
+@(private)
+_builder_free :: proc(b: ^Builder) {
+	for &t in b.trees {
+		_tree_free(&t)
+	}
+	virtual.arena_destroy(&b.c.arena)
+}
+
+@(private)
+_tree_free :: proc(t: ^Build_Tree) {
+	if !t.active {
+		return
+	}
+	for l in t.levels {
+		virtual.arena_destroy(&l.arena)
+		free(l, t.allocator)
+	}
+	delete(t.levels)
+	delete(t.last)
+	t^ = {}
+}
+
+@(private)
+_level_push :: proc(b: ^Builder, t: ^Build_Tree) -> Error {
+	l := new(Build_Level, t.allocator)
+	if l == nil {
+		return .No_Memory
+	}
+	if virtual.arena_init_growing(&l.arena) != nil {
+		free(l, t.allocator)
+		return .No_Memory
+	}
+	_level_reset(l, len(t.levels) == 0)
+	if _, e := append(&t.levels, l); e != nil {
+		virtual.arena_destroy(&l.arena)
+		free(l, t.allocator)
+		return .No_Memory
+	}
+	return .None
+}
+
+@(private)
+_level_reset :: proc(l: ^Build_Level, leaf: bool) {
+	virtual.arena_free_all(&l.arena)
+	a := virtual.arena_allocator(&l.arena)
+	l.node = Node{
+		leaf = leaf,
+		keys = make([dynamic][]u8, a),
+	}
+	if leaf {
+		l.node.vals = make([dynamic]Val, a)
+		l.size = NODE_HEADER
+	} else {
+		l.node.kids = make([dynamic]u64, a)
+		l.size = NODE_HEADER + 8
+	}
+	l.first = nil
+}
+
+@(private)
+_level_flush :: proc(b: ^Builder, t: ^Build_Tree, i: int) -> Error {
+	l := t.levels[i]
+	p, dst := _copier_page(&b.c) or_return
+	_encode_into(&l.node, dst, p, virtual.arena_allocator(&l.arena))
+	if i + 1 == len(t.levels) {
+		_level_push(b, t) or_return
+	}
+	_level_add_kid(b, t, i + 1, l.first, p) or_return
+	l.flushed += 1
+	_level_reset(l, i == 0)
+	return .None
+}
+
+@(private)
+_level_add_kid :: proc(b: ^Builder, t: ^Build_Tree, i: int, first: []u8, page: u64) -> Error {
+	l := t.levels[i]
+	cost := prim.uvarint_len(u64(len(first))) + len(first) + 8
+	if len(l.node.kids) > 0 && l.size + cost > PAGE {
+		_level_flush(b, t, i) or_return
+	}
+	a := virtual.arena_allocator(&l.arena)
+	k, e := make([]u8, len(first), a)
+	if e != nil {
+		return .No_Memory
+	}
+	copy(k, first)
+	if len(l.node.kids) == 0 {
+		l.first = k
+		append(&l.node.kids, page)
+		return .None
+	}
+	append(&l.node.keys, k)
+	append(&l.node.kids, page)
+	l.size += cost
+	return .None
+}

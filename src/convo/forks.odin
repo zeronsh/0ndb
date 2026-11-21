@@ -53,7 +53,22 @@ Structure :: struct {
 	superseded: [dynamic][2]Vref,
 	landed:     [dynamic]Vref,
 	mounts:     [dynamic]Mount_Entry,
+	spines:     []Seg_Spine,
+	nodes:      ^map[[2]i64]Spine_Nodes,
 	floor:      prim.Hlc,
+	alloc:      runtime.Allocator,
+}
+
+Seg_Spine :: struct {
+	heads:  map[i64]Spine_Head,
+	digest: Spine_Index,
+	start:  i64,
+	c:      i64,
+	blocks: []i64,
+	target: Vref,
+	ready:  bool,
+	tried:  int,
+	seen:   i64,
 }
 
 Pos :: struct {
@@ -131,7 +146,15 @@ structure_load :: proc(v: ^obj.View, t: ^Tail, floor: prim.Hlc, st: ^Structure) 
 			superseded = make([dynamic][2]Vref, a),
 			landed     = make([dynamic]Vref, a),
 			mounts     = make([dynamic]Mount_Entry, a),
+			spines     = make([]Seg_Spine, len(v.segs), a),
+			nodes      = new(map[[2]i64]Spine_Nodes, a),
 			floor      = max(prim.Hlc),
+			alloc      = a,
+		}
+		c.st.nodes^ = make(map[[2]i64]Spine_Nodes, a)
+		for &sp in c.st.spines {
+			sp.heads = make(map[i64]Spine_Head, a)
+			sp.tried = -1
 		}
 		clear(&c.walks)
 		resize(&c.walks, len(v.segs))
@@ -277,7 +300,7 @@ sort_children :: proc(list: []Entry, v: ^obj.View) {
 	}
 }
 
-chain_at :: proc(v: ^obj.View, e: Entry, d: i64) -> (at: Vref, err: Error) {
+chain_at :: proc(v: ^obj.View, st: ^Structure, e: Entry, d: i64) -> (at: Vref, err: Error) {
 	switch {
 	case d <= 0 || d < e.child_depth - 1 || d > e.leaf_depth:
 		return {}, .None
@@ -287,6 +310,25 @@ chain_at :: proc(v: ^obj.View, e: Entry, d: i64) -> (at: Vref, err: Error) {
 		return e.child, .None
 	case d == e.leaf_depth:
 		return e.leaf, .None
+	}
+	if st != nil {
+		for s in 0 ..< len(st.spines) {
+			sp := _spine_get(v, st, s) or_return
+			if sp == nil || !sp.ready || d > sp.c {
+				continue
+			}
+			on := e.leaf == sp.target
+			if !on && e.leaf_depth <= sp.c {
+				x, ok := _spine_node(v, st, s, e.leaf_depth) or_return
+				on = ok && x == e.leaf
+			}
+			if on {
+				x, ok := _spine_node(v, st, s, d) or_return
+				if ok {
+					return x, .None
+				}
+			}
+		}
 	}
 	n := level_ancestor(v, e.leaf, d) or_return
 	return n.ref, .None
@@ -362,6 +404,8 @@ _visit_structure :: proc(c: ^Chain_Ctx, s: int, off: i64, env: ^obj.Envelope) ->
 	}
 	rec := decode_env(env, v.scratch) or_return
 	#partial switch r in rec.body {
+	case Spine:
+		c.st.spines[s].heads[off] = Spine_Head{r.prev, r.c, r.first}
 	case Forks:
 		for d in r.forks {
 			_add_remember(v, s, c.st, d, c.by) or_return
@@ -388,6 +432,14 @@ _visit_structure :: proc(c: ^Chain_Ctx, s: int, off: i64, env: ^obj.Envelope) ->
 			run := obj.resolve(v, s, d) or_return
 			append(&c.st.landed, run)
 		}
+		sp := &c.st.spines[s]
+		sp.digest = r.spine
+		blocks, be := make([]i64, len(r.spine.blocks), c.alloc)
+		if be != nil {
+			return false, .No_Memory
+		}
+		copy(blocks, r.spine.blocks)
+		sp.digest.blocks = blocks
 		return true, .None
 	case Fork:
 		en := Entry{
@@ -485,4 +537,133 @@ _add_virtual :: proc(t: ^Tail, e: Entry) {
 		}
 	}
 	append(&t.virtual, e)
+}
+
+Spine_Head :: struct {
+	prev:  i64,
+	c:     i64,
+	first: i64,
+}
+
+spine_resolve :: proc(heads: map[i64]Spine_Head, start: i64, digest: ^Spine_Index, allocator: runtime.Allocator) -> (c: i64, blocks: []i64, complete: bool) {
+	switch {
+	case start == 0:
+		return 0, nil, true
+	case digest != nil && start == digest.at:
+		c = digest.c
+	case:
+		h, ok := heads[start]
+		if !ok {
+			return 0, nil, false
+		}
+		c = h.c
+	}
+	blocks = make([]i64, c / SPINE_SPAN, allocator)
+	limit := c
+	cur := start
+	for cur != 0 {
+		if digest != nil && cur == digest.at {
+			limit = min(limit, digest.c)
+			for k in 0 ..< int(limit / SPINE_SPAN) {
+				if blocks[k] == 0 && k < len(digest.blocks) {
+					blocks[k] = digest.blocks[k]
+				}
+			}
+			return c, blocks, true
+		}
+		h, ok := heads[cur]
+		if !ok {
+			return c, blocks, false
+		}
+		limit = min(limit, h.c)
+		for k := h.first; k < limit / SPINE_SPAN; k += 1 {
+			if blocks[k] == 0 {
+				blocks[k] = cur
+			}
+		}
+		if h.prev >= cur {
+			return c, blocks, false
+		}
+		cur = h.prev
+	}
+	for x in blocks[:limit / SPINE_SPAN] {
+		if x == 0 {
+			return c, blocks, false
+		}
+	}
+	return c, blocks, true
+}
+
+@(private)
+_spine_get :: proc(v: ^obj.View, st: ^Structure, s: int) -> (sp: ^Seg_Spine, err: Error) {
+	if st.spines == nil || s >= len(st.spines) {
+		return nil, .None
+	}
+	sp = &st.spines[s]
+	if sp.ready || (sp.tried == len(sp.heads) && sp.seen == sp.digest.at) {
+		return sp, .None
+	}
+	sp.tried = len(sp.heads)
+	sp.seen = sp.digest.at
+	sum, ok := _tail(v, s) or_return
+	if !ok || sum.spine == 0 {
+		return sp, .None
+	}
+	sp.start = sum.spine
+	if !obj.ref_none(sum.leaf) && sum.leaf_hlc > sum.tip_hlc {
+		sp.target = obj.resolve(v, s, sum.leaf) or_return
+	} else if sum.tip != 0 {
+		sp.target = Vref{s, sum.tip}
+	}
+	dg := &sp.digest if sp.digest.at != 0 || sp.digest.c != 0 else nil
+	c, blocks, complete := spine_resolve(sp.heads, sum.spine, dg, st.alloc)
+	sp.c = c
+	sp.blocks = blocks
+	sp.ready = complete
+	return sp, .None
+}
+
+@(private)
+_spine_node :: proc(v: ^obj.View, st: ^Structure, s: int, d: i64) -> (at: Vref, ok: bool, err: Error) {
+	sp := _spine_get(v, st, s) or_return
+	if sp == nil || !sp.ready || d < 1 || d > sp.c {
+		return {}, false, .None
+	}
+	rec := sp.blocks[(d - 1) / SPINE_SPAN]
+	if rec == 0 {
+		return {}, false, .None
+	}
+	sn, has := st.nodes[{i64(s), rec}]
+	if !has {
+		body, _ := obj.get(v, s, rec) or_return
+		if obj.is_redacted(body) {
+			return {}, false, .None
+		}
+		r := decode_record(body, rec, v.scratch) or_return
+		x, isx := r.body.(Spine)
+		if !isx {
+			return {}, false, .Corrupt
+		}
+		refs, rok := spine_decode(x.nodes, int(x.c - x.first * SPINE_SPAN), v.scratch)
+		if !rok {
+			return {}, false, .Corrupt
+		}
+		list := make([]Vref, len(refs), st.alloc)
+		for f, i in refs {
+			list[i] = obj.resolve(v, s, f) or_return
+		}
+		sn = Spine_Nodes{x.first * SPINE_SPAN, list}
+		st.nodes[{i64(s), rec}] = sn
+	}
+	i := d - 1 - sn.first
+	if i < 0 || i >= i64(len(sn.nodes)) {
+		return {}, false, .Corrupt
+	}
+	return sn.nodes[i], true, .None
+}
+
+@(private)
+Spine_Nodes :: struct {
+	first: i64,
+	nodes: []Vref,
 }

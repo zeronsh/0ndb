@@ -13,6 +13,8 @@ MAX_UPDATES :: 256
 DIGEST_EVERY :: 64
 DIGEST_RATIO :: 16
 MAX_FILES :: 1024
+FILES_SNAPSHOT :: 8
+SPINE_SPAN :: 64
 NODE_CACHE :: 16384
 
 Error :: obj.Error
@@ -49,6 +51,7 @@ Kind :: enum u8 {
 	Interrupted = 39,
 	Revived     = 40,
 	Recorded    = 41,
+	Spine       = 42,
 }
 
 Role :: enum u8 {
@@ -182,6 +185,7 @@ Summary :: struct {
 	last_seal:   i64,
 	digest:      i64,
 	digest_hlc:  prim.Hlc,
+	spine:       i64,
 	since:       u32,
 	digest_size: u32,
 	pending:     [MAX_PENDING]Pending_Entry,
@@ -247,6 +251,9 @@ encode_summary :: proc(off: i64, s: ^Summary, allocator := context.temp_allocato
 	if s.digest_hlc != 0 {
 		obj.tw_uv(&w, 24, u64(s.digest_hlc))
 	}
+	if s.spine != 0 {
+		obj.tw_ref(&w, 25, off, Ref{0, s.spine})
+	}
 	for p in summary_pending(s) {
 		f: obj.Fixed
 		obj.fx_ref(&f, off, p.item)
@@ -294,12 +301,15 @@ decode_summary :: proc "contextless" (extra: []u8, off: i64, s: ^Summary) -> boo
 			if fr.err != .None {
 				return false
 			}
-		case 18, 19:
+		case 18, 19, 25:
 			v := obj.field_own(f, off, false) or_return
-			if f.tag == 18 {
+			switch f.tag {
+			case 18:
 				s.last_seal = v
-			} else {
+			case 19:
 				s.digest = v
+			case:
+				s.spine = v
 			}
 		case 22, 23:
 			if f.ty != obj.F_UV || f.uv > u64(max(u32)) {

@@ -14,6 +14,7 @@ Node :: struct {
 	runner:     prim.Id,
 	claim:      Vref,
 	files:      bool,
+	files_run:  u32,
 	files_prev: Vref,
 }
 
@@ -42,6 +43,7 @@ _read_node :: proc(v: ^obj.View, ref: Vref) -> (n: Node, err: Error) {
 	n.role = m.role
 	n.runner = m.runner
 	n.files = len(m.files) > 0
+	n.files_run = m.files_run
 	n.parent = obj.resolve(v, ref.seg, m.parent) or_return
 	n.jump = obj.resolve(v, ref.seg, m.jump) or_return
 	n.files_prev = obj.resolve(v, ref.seg, m.files_prev) or_return

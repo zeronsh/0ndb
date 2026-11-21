@@ -21,6 +21,8 @@ Msg :: struct {
 	parent_seal: Ref,
 	claim:       i64,
 	files_prev:  Ref,
+	files_run:   u32,
+	files_base:  []File_Delta,
 }
 
 Block :: struct {
@@ -96,6 +98,21 @@ Forks :: struct {
 	mounts:     []Digest_Mount,
 	superseded: []Superseded,
 	landed:     []Ref,
+	spine:      Spine_Index,
+}
+
+Spine_Index :: struct {
+	at:     i64,
+	c:      i64,
+	blocks: []i64,
+}
+
+Spine :: struct {
+	target: Ref,
+	prev:   i64,
+	c:      i64,
+	first:  i64,
+	nodes:  []u8,
 }
 
 Assign :: struct {
@@ -240,6 +257,7 @@ Body :: union {
 	Interrupted,
 	Revived,
 	Recorded,
+	Spine,
 }
 
 Record :: struct {
@@ -303,13 +321,15 @@ body_kind :: proc "contextless" (b: Body) -> Kind {
 		return .Revived
 	case Recorded:
 		return .Recorded
+	case Spine:
+		return .Spine
 	}
 	return Kind(0)
 }
 
 is_event_kind :: proc "contextless" (k: Kind) -> bool {
 	#partial switch k {
-	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded:
+	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded, .Spine:
 		return true
 	}
 	return false
@@ -423,6 +443,8 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		obj.tw_ref(w, 15, off, v.parent_seal)
 		obj.tw_ref(w, 16, off, Ref{0, v.claim})
 		obj.tw_ref(w, 17, off, v.files_prev)
+		obj.tw_uv(w, 18, u64(v.files_run))
+		_put_files(w, 19, v.files_base)
 	case Block:
 		obj.tw_ref(w, 1, off, Ref{0, v.msg})
 		obj.tw_ref(w, 2, off, Ref{0, v.prev})
@@ -499,6 +521,27 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		for e in v.landed {
 			obj.tw_ref(w, 6, off, e)
 		}
+		if v.spine.at != 0 || v.spine.c != 0 {
+			b := make([dynamic]u8, context.temp_allocator)
+			bw := prim.writer(&b)
+			obj.tw_ref(&bw, 1, off, Ref{0, v.spine.at})
+			obj.tw_uv(&bw, 2, u64(v.spine.c))
+			pb := make([dynamic]u8, context.temp_allocator)
+			pw := prim.writer(&pb)
+			last: i64
+			for x in v.spine.blocks {
+				prim.write_uvarint(&pw, _zigzag(x - last))
+				last = x
+			}
+			obj.tw_bytes(&bw, 3, pb[:])
+			_nested(w, 7, b[:])
+		}
+	case Spine:
+		obj.tw_ref(w, 1, off, v.target)
+		obj.tw_ref(w, 2, off, Ref{0, v.prev})
+		obj.tw_uv(w, 3, u64(v.c))
+		obj.tw_uv(w, 4, u64(v.first))
+		obj.tw_bytes(w, 5, v.nodes)
 	case Assign:
 		obj.tw_ref(w, 1, off, v.msg)
 		obj.tw_id(w, 2, v.runner)
@@ -688,6 +731,7 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 	case .Msg:
 		v: Msg
 		files := make([dynamic]File_Delta, allocator)
+		base := make([dynamic]File_Delta, allocator)
 		for obj.dec_next(&d) {
 			switch d.f.tag {
 			case 1:
@@ -728,9 +772,18 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				v.claim = obj.dec_own(&d)
 			case 17:
 				v.files_prev = obj.dec_ref(&d)
+			case 18:
+				v.files_run = u32(min(obj.dec_uv(&d), u64(max(u32))))
+			case 19:
+				if len(base) >= MAX_FILES {
+					d.bad = true
+				} else {
+					append(&base, _get_file(&d, off))
+				}
 			}
 		}
 		v.files = files[:]
+		v.files_base = base[:]
 		bad := u8(v.role) == 0 || v.depth < 1 || v.jump_depth >= v.depth || obj.ref_none(v.jump) != (v.jump_depth == 0)
 		bad ||= obj.ref_none(v.parent) != (v.depth == 1)
 		bad ||= (v.parent.seg == 0 && !obj.ref_none(v.parent) && v.parent.off >= off) || (v.jump.seg == 0 && !obj.ref_none(v.jump) && v.jump.off >= off)
@@ -828,6 +881,7 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		d.bad ||= obj.ref_none(v.leaf) || v.child_depth < 1 || v.leaf_depth < v.child_depth
 		rec.body = v
 	case .Forks:
+		spine: Spine_Index
 		forks := make([dynamic]Remember, allocator)
 		assigns := make([dynamic]Digest_Assign, allocator)
 		claims := make([dynamic]Digest_Claim, allocator)
@@ -837,6 +891,35 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		for obj.dec_next(&d) {
 			if d.f.tag == 6 {
 				append(&landed, obj.dec_ref(&d))
+				continue
+			}
+			if d.f.tag == 7 {
+				sub := obj.dec_init(obj.dec_bytes(&d), off)
+				packed: []u8
+				for obj.dec_next(&sub) {
+					switch sub.f.tag {
+					case 1:
+						spine.at = obj.dec_own(&sub)
+					case 2:
+						spine.c = obj.dec_int(&sub)
+					case 3:
+						packed = obj.dec_bytes(&sub)
+					}
+				}
+				d.bad ||= !obj.dec_ok(&sub) || spine.c % SPINE_SPAN != 0
+				n := spine.c / SPINE_SPAN
+				if !d.bad {
+					blocks := make([]i64, n, allocator)
+					pr := prim.reader(packed)
+					last: i64
+					for &x in blocks {
+						last += _unzigzag(prim.read_uvarint(&pr))
+						x = last
+						d.bad ||= x <= 0 || x >= off
+					}
+					d.bad ||= pr.err != .None || !prim.reader_done(&pr)
+					spine.blocks = blocks
+				}
 				continue
 			}
 			sub := obj.dec_init(obj.dec_bytes(&d), off)
@@ -910,7 +993,7 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 			}
 			d.bad ||= !obj.dec_ok(&sub)
 		}
-		rec.body = Forks{forks[:], assigns[:], claims[:], mounts[:], sups[:], landed[:]}
+		rec.body = Forks{forks[:], assigns[:], claims[:], mounts[:], sups[:], landed[:], spine}
 	case .Assign:
 		v: Assign
 		for obj.dec_next(&d) {
@@ -1170,6 +1253,24 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		}
 		d.bad ||= v.msg == 0
 		rec.body = v
+	case .Spine:
+		v: Spine
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				v.target = obj.dec_ref(&d)
+			case 2:
+				v.prev = obj.dec_own(&d)
+			case 3:
+				v.c = obj.dec_int(&d)
+			case 4:
+				v.first = obj.dec_int(&d)
+			case 5:
+				v.nodes = obj.dec_bytes(&d)
+			}
+		}
+		d.bad ||= v.c < 0 || v.c % SPINE_SPAN != 0 || v.first < 0 || v.first * SPINE_SPAN > v.c || obj.ref_none(v.target)
+		rec.body = v
 	case .Recorded:
 		v: Recorded
 		for obj.dec_next(&d) {
@@ -1193,4 +1294,48 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 		return rec, .Corrupt
 	}
 	return rec, .None
+}
+
+@(private)
+_zigzag :: proc "contextless" (x: i64) -> u64 {
+	return u64(x << 1) ~ u64(x >> 63)
+}
+
+@(private)
+_unzigzag :: proc "contextless" (x: u64) -> i64 {
+	return i64(x >> 1) ~ -i64(x & 1)
+}
+
+spine_encode :: proc(nodes: []Ref, allocator := context.temp_allocator) -> []u8 {
+	b := make([dynamic]u8, allocator)
+	w := prim.writer(&b)
+	last := make(map[u32]i64, allocator)
+	for n in nodes {
+		prim.write_uvarint(&w, u64(n.seg))
+		prev := last[n.seg]
+		prim.write_uvarint(&w, u64(n.off - prev))
+		last[n.seg] = n.off
+	}
+	return b[:]
+}
+
+spine_decode :: proc(b: []u8, count: int, allocator := context.temp_allocator) -> (nodes: []Ref, ok: bool) {
+	out := make([]Ref, count, allocator)
+	last := make(map[u32]i64, allocator)
+	r := prim.reader(b)
+	for &n in out {
+		seg := prim.read_uvarint(&r)
+		d := prim.read_uvarint(&r)
+		if r.err != .None || seg > u64(obj.MAX_SEGS) || d == 0 || d > u64(max(i64)) {
+			return nil, false
+		}
+		n.seg = u32(seg)
+		prev := last[n.seg]
+		if i64(d) > max(i64) - prev {
+			return nil, false
+		}
+		n.off = prev + i64(d)
+		last[n.seg] = n.off
+	}
+	return out, prim.reader_done(&r)
 }

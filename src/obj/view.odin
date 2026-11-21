@@ -196,6 +196,13 @@ want :: proc(v: ^View, s: int, from, to: i64) {
 	if b <= a {
 		return
 	}
+	if jr := v.segs[s].jr; jr != nil && jr.replica != nil {
+		gap, missing := journal.replica_missing(jr.replica, a, b)
+		if !missing {
+			return
+		}
+		a, b = gap.from, gap.to
+	}
 	append(&v.want, Want{v.object, v.segs[s].id, a, b})
 }
 
