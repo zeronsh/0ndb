@@ -1,0 +1,598 @@
+package omap
+
+import "base:runtime"
+import "core:slice"
+import "../journal"
+import "../obj"
+import "../prim"
+
+Error :: obj.Error
+Rid :: obj.Rid
+
+MAX_KEY_LEN :: 200
+MAX_FIELDS :: 256
+MAX_TOMBS :: 4096
+
+Kind :: enum u8 {
+	Put = 16,
+	Add = 17,
+	Del = 18,
+}
+
+Field :: struct {
+	tag:   u32,
+	hlc:   prim.Hlc,
+	value: []u8,
+}
+
+Put :: struct {
+	key:    []u8,
+	fields: []Field,
+}
+
+Add :: struct {
+	key:     []u8,
+	tag:     u32,
+	element: []u8,
+}
+
+Del :: struct {
+	key:     []u8,
+	tag:     u32,
+	element: []u8,
+	removed: []Rid,
+}
+
+Body :: union {
+	Put,
+	Add,
+	Del,
+}
+
+Register :: struct {
+	tag:    u32,
+	hlc:    prim.Hlc,
+	by:     prim.Id,
+	value:  []u8,
+}
+
+Element :: struct {
+	tag:   u32,
+	value: []u8,
+	live:  []Rid,
+	dead:  []Rid,
+}
+
+Entry :: struct {
+	key:       []u8,
+	registers: []Register,
+	elements:  []Element,
+}
+
+encode_fields :: proc(w: ^prim.Writer, body: Body) {
+	switch v in body {
+	case Put:
+		obj.tw_bytes(w, 1, v.key)
+		for f in v.fields {
+			b := make([dynamic]u8, context.temp_allocator)
+			bw := prim.writer(&b)
+			obj.tw_uv(&bw, 1, u64(f.tag) + 1)
+			obj.tw_u64(&bw, 2, u64(f.hlc))
+			obj.tw_bytes(&bw, 3, f.value)
+			prim.write_uvarint(w, 2 << 2 | obj.F_BYTES)
+			prim.write_bytes(w, b[:])
+		}
+	case Add:
+		obj.tw_bytes(w, 1, v.key)
+		obj.tw_uv(w, 2, u64(v.tag) + 1)
+		obj.tw_bytes(w, 3, v.element)
+	case Del:
+		obj.tw_bytes(w, 1, v.key)
+		obj.tw_uv(w, 2, u64(v.tag) + 1)
+		obj.tw_bytes(w, 3, v.element)
+		for r in v.removed {
+			f: obj.Fixed
+			id := r.seg
+			obj.fx_raw(&f, id[:])
+			obj.fx_uv(&f, u64(max(r.off, 0)))
+			obj.tw_fixed(w, 4, &f)
+		}
+	}
+}
+
+decode_body :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (body: Body, err: Error) {
+	d := obj.dec_init(env.fields, env.off)
+	switch Kind(env.kind) {
+	case .Put:
+		v: Put
+		fields := make([dynamic]Field, allocator)
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				v.key = obj.dec_bytes(&d)
+			case 2:
+				sub := obj.dec_init(obj.dec_bytes(&d), env.off)
+				f: Field
+				has := false
+				for obj.dec_next(&sub) {
+					switch sub.f.tag {
+					case 1:
+						t := obj.dec_uv(&sub)
+						if t == 0 || t - 1 > u64(max(u32)) {
+							sub.bad = true
+						}
+						f.tag = u32(t - 1)
+						has = true
+					case 2:
+						f.hlc = obj.dec_hlc(&sub)
+					case 3:
+						f.value = obj.dec_bytes(&sub)
+					}
+				}
+				if !obj.dec_ok(&sub) || !has || len(fields) >= MAX_FIELDS {
+					return nil, .Corrupt
+				}
+				append(&fields, f)
+			}
+		}
+		v.fields = fields[:]
+		if len(v.key) == 0 || len(v.key) > MAX_KEY_LEN {
+			d.bad = true
+		}
+		body = v
+	case .Add, .Del:
+		key, elem: []u8
+		tag: u32
+		has := false
+		removed := make([dynamic]Rid, allocator)
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				key = obj.dec_bytes(&d)
+			case 2:
+				t := obj.dec_uv(&d)
+				if t == 0 || t - 1 > u64(max(u32)) {
+					d.bad = true
+				}
+				tag = u32(t - 1)
+				has = true
+			case 3:
+				elem = obj.dec_bytes(&d)
+			case 4:
+				r := prim.reader(obj.dec_bytes(&d))
+				id := prim.read_id(&r)
+				off := prim.read_uvarint(&r)
+				if !prim.reader_done(&r) || off == 0 || off > u64(max(i64)) || len(removed) >= MAX_TOMBS {
+					d.bad = true
+				} else {
+					append(&removed, Rid{id, i64(off)})
+				}
+			}
+		}
+		if len(key) == 0 || len(key) > MAX_KEY_LEN || !has {
+			d.bad = true
+		}
+		if Kind(env.kind) == .Add {
+			body = Add{key, tag, elem}
+		} else {
+			body = Del{key, tag, elem, removed[:]}
+		}
+	case:
+		return nil, .Unsupported
+	}
+	if !obj.dec_ok(&d) {
+		return nil, .Corrupt
+	}
+	return body, .None
+}
+
+register_wins :: proc "contextless" (a_hlc: prim.Hlc, a_by: prim.Id, a_val: []u8, b_hlc: prim.Hlc, b_by: prim.Id, b_val: []u8) -> bool {
+	if a_hlc != b_hlc {
+		return a_hlc > b_hlc
+	}
+	if a_by != b_by {
+		return obj.id_less(b_by, a_by)
+	}
+	n := min(len(a_val), len(b_val))
+	for i in 0 ..< n {
+		if a_val[i] != b_val[i] {
+			return a_val[i] > b_val[i]
+		}
+	}
+	return len(a_val) > len(b_val)
+}
+
+entry_empty :: proc "contextless" (e: ^Entry) -> bool {
+	if len(e.registers) > 0 {
+		return false
+	}
+	for el in e.elements {
+		if len(el.live) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+entry_register :: proc "contextless" (e: ^Entry, tag: u32) -> (value: []u8, found: bool) {
+	for r in e.registers {
+		if r.tag == tag {
+			return r.value, true
+		}
+	}
+	return nil, false
+}
+
+entry_elements :: proc(e: ^Entry, tag: u32, allocator := context.temp_allocator) -> [][]u8 {
+	out := make([dynamic][]u8, allocator)
+	for el in e.elements {
+		if el.tag == tag && len(el.live) > 0 {
+			append(&out, el.value)
+		}
+	}
+	return out[:]
+}
+
+ENTRY_FORMAT :: 2
+
+encode_entry :: proc(buf: ^[dynamic]u8, e: ^Entry) -> Error {
+	devs := make([dynamic]prim.Id, context.temp_allocator)
+	dev :: proc(devs: ^[dynamic]prim.Id, id: prim.Id) -> u64 {
+		for d, j in devs {
+			if d == id {
+				return u64(j)
+			}
+		}
+		append(devs, id)
+		return u64(len(devs) - 1)
+	}
+	base: prim.Hlc
+	for r in e.registers {
+		dev(&devs, r.by)
+		base = max(base, r.hlc)
+	}
+	for el in e.elements {
+		for r in el.live {
+			dev(&devs, r.seg)
+		}
+		for r in el.dead {
+			dev(&devs, r.seg)
+		}
+	}
+	w := prim.writer(buf)
+	prim.write_u8(&w, ENTRY_FORMAT)
+	prim.write_uvarint(&w, u64(len(devs)))
+	for d in devs {
+		prim.write_id(&w, d)
+	}
+	prim.write_uvarint(&w, u64(len(e.registers)))
+	if len(e.registers) > 0 {
+		prim.write_u64le(&w, u64(base))
+	}
+	for r in e.registers {
+		prim.write_uvarint(&w, u64(r.tag))
+		prim.write_uvarint(&w, u64(base - r.hlc))
+		prim.write_uvarint(&w, dev(&devs, r.by))
+		prim.write_bytes(&w, r.value)
+	}
+	prim.write_uvarint(&w, u64(len(e.elements)))
+	for el in e.elements {
+		prim.write_uvarint(&w, u64(el.tag))
+		prim.write_bytes(&w, el.value)
+		for list in ([2][]Rid{el.live, el.dead}) {
+			prim.write_uvarint(&w, u64(len(list)))
+			for r in list {
+				prim.write_uvarint(&w, dev(&devs, r.seg))
+				prim.write_uvarint(&w, u64(r.off))
+			}
+		}
+	}
+	if w.err != .None {
+		return .No_Memory
+	}
+	return .None
+}
+
+decode_entry :: proc(key: []u8, data: []u8, allocator := context.temp_allocator) -> (e: Entry, err: Error) {
+	e.key = key
+	if len(data) == 0 {
+		return e, .None
+	}
+	r := prim.reader(data)
+	if prim.read_u8(&r) != ENTRY_FORMAT {
+		return e, .Corrupt
+	}
+	nd := prim.read_uvarint(&r)
+	if r.err != .None || nd * 16 > u64(prim.reader_remaining(&r)) {
+		return e, .Corrupt
+	}
+	devs := make([]prim.Id, int(nd), allocator)
+	for &d in devs {
+		d = prim.read_id(&r)
+	}
+	nr := prim.read_uvarint(&r)
+	if r.err != .None || nr * 4 > u64(prim.reader_remaining(&r)) {
+		return e, .Corrupt
+	}
+	base: u64
+	if nr > 0 {
+		base = prim.read_u64le(&r)
+	}
+	regs := make([]Register, int(nr), allocator)
+	for &g in regs {
+		t := prim.read_uvarint(&r)
+		delta := prim.read_uvarint(&r)
+		di := prim.read_uvarint(&r)
+		g.value = prim.read_bytes(&r)
+		if t > u64(max(u32)) || di >= nd || delta > base {
+			return e, .Corrupt
+		}
+		g.tag = u32(t)
+		g.hlc = prim.Hlc(base - delta)
+		g.by = devs[di]
+	}
+	ne := prim.read_uvarint(&r)
+	if r.err != .None || ne * 4 > u64(prim.reader_remaining(&r)) {
+		return e, .Corrupt
+	}
+	els := make([]Element, int(ne), allocator)
+	for &el in els {
+		t := prim.read_uvarint(&r)
+		el.value = prim.read_bytes(&r)
+		if t > u64(max(u32)) {
+			return e, .Corrupt
+		}
+		el.tag = u32(t)
+		for k in 0 ..< 2 {
+			n := prim.read_uvarint(&r)
+			if r.err != .None || n * 2 > u64(prim.reader_remaining(&r)) {
+				return e, .Corrupt
+			}
+			list := make([]Rid, int(n), allocator)
+			for &x in list {
+				di := prim.read_uvarint(&r)
+				off := prim.read_uvarint(&r)
+				if di >= nd || off > u64(max(i64)) {
+					return e, .Corrupt
+				}
+				x.seg = devs[di]
+				x.off = i64(off)
+			}
+			if k == 0 {
+				el.live = list
+			} else {
+				el.dead = list
+			}
+		}
+	}
+	if r.err != .None {
+		return e, .Corrupt
+	}
+	e.registers = regs
+	e.elements = els
+	return e, .None
+}
+
+apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.temp_allocator) -> (changed: bool) {
+	switch v in body {
+	case Put:
+		regs := make([dynamic]Register, 0, len(e.registers) + len(v.fields), allocator)
+		append(&regs, ..e.registers)
+		for f in v.fields {
+			k := -1
+			for r, i in regs {
+				if r.tag == f.tag {
+					k = i
+					break
+				}
+			}
+			n := Register{f.tag, f.hlc, by, f.value}
+			if k < 0 {
+				append(&regs, n)
+				changed = true
+			} else if register_wins(f.hlc, by, f.value, regs[k].hlc, regs[k].by, regs[k].value) {
+				regs[k] = n
+				changed = true
+			}
+		}
+		if changed {
+			slice.sort_by(regs[:], proc(a, b: Register) -> bool {
+				return a.tag < b.tag
+			})
+			e.registers = regs[:]
+		}
+	case Add:
+		k := _element(e, v.tag, v.element, allocator)
+		el := &e.elements[k]
+		if _rid_in(el.live, at) || _rid_in(el.dead, at) {
+			return false
+		}
+		live := make([dynamic]Rid, allocator)
+		append(&live, ..el.live)
+		append(&live, at)
+		el.live = live[:]
+		changed = true
+	case Del:
+		k := _element(e, v.tag, v.element, allocator)
+		el := &e.elements[k]
+		live := make([dynamic]Rid, allocator)
+		dead := make([dynamic]Rid, allocator)
+		append(&dead, ..el.dead)
+		for r in v.removed {
+			if !_rid_in(dead[:], r) {
+				append(&dead, r)
+				changed = true
+			}
+		}
+		for r in el.live {
+			if !_rid_in(dead[:], r) {
+				append(&live, r)
+			}
+		}
+		el.live = live[:]
+		el.dead = dead[:]
+	}
+	if changed {
+		n := 0
+		for el in e.elements {
+			if len(el.live) > 0 || len(el.dead) > 0 {
+				e.elements[n] = el
+				n += 1
+			}
+		}
+		e.elements = e.elements[:n]
+	}
+	return
+}
+
+@(private)
+_rid_in :: proc "contextless" (list: []Rid, r: Rid) -> bool {
+	for x in list {
+		if x == r {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_element :: proc(e: ^Entry, tag: u32, value: []u8, allocator: runtime.Allocator) -> int {
+	for el, i in e.elements {
+		if el.tag == tag && string(el.value) == string(value) {
+			return i
+		}
+	}
+	els := make([dynamic]Element, 0, len(e.elements) + 1, allocator)
+	append(&els, ..e.elements)
+	append(&els, Element{tag = tag, value = value})
+	slice.sort_by(els[:], proc(a, b: Element) -> bool {
+		if a.tag != b.tag {
+			return a.tag < b.tag
+		}
+		return string(a.value) < string(b.value)
+	})
+	e.elements = els[:]
+	for el, i in e.elements {
+		if el.tag == tag && string(el.value) == string(value) {
+			return i
+		}
+	}
+	return -1
+}
+
+Writer :: struct {
+	core: obj.Writer,
+}
+
+writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator) -> Error {
+	return obj.writer_create(&w.core, v, vfs, path, object, .Map, participant, created, settings, opts, allocator)
+}
+
+writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, opts := journal.Options{}, allocator := context.allocator) -> (head: obj.Head, err: Error) {
+	return obj.writer_open(&w.core, v, vfs, path, object, .Map, participant, opts, allocator)
+}
+
+writer_close :: proc(w: ^Writer) -> Error {
+	return obj.writer_close(&w.core)
+}
+
+writer_commit :: proc(w: ^Writer) -> Error {
+	return obj.writer_commit(&w.core)
+}
+
+put :: proc(w: ^Writer, key: []u8, fields: []Field) -> (off: i64, err: Error) {
+	if len(key) == 0 || len(key) > MAX_KEY_LEN || len(fields) > MAX_FIELDS {
+		return 0, .Invalid
+	}
+	stamped := make([]Field, len(fields), context.temp_allocator)
+	h := obj.now(&w.core)
+	for f, i in fields {
+		stamped[i] = f
+		if stamped[i].hlc == 0 {
+			stamped[i].hlc = h
+		} else {
+			obj.observe(&w.core, f.hlc)
+		}
+	}
+	return _append(w, Put{key, stamped})
+}
+
+add :: proc(w: ^Writer, key: []u8, tag: u32, element: []u8) -> (id: Rid, err: Error) {
+	if len(key) == 0 || len(key) > MAX_KEY_LEN {
+		return {}, .Invalid
+	}
+	off := _append(w, Add{key, tag, element}) or_return
+	return Rid{w.core.id, off}, .None
+}
+
+del :: proc(w: ^Writer, key: []u8, tag: u32, element: []u8, observed: []Rid) -> (off: i64, err: Error) {
+	if len(key) == 0 || len(key) > MAX_KEY_LEN || len(observed) > MAX_TOMBS {
+		return 0, .Invalid
+	}
+	return _append(w, Del{key, tag, element, observed})
+}
+
+@(private)
+_append :: proc(w: ^Writer, body: Body) -> (off: i64, err: Error) {
+	k: Kind
+	switch _ in body {
+	case Put:
+		k = .Put
+	case Add:
+		k = .Add
+	case Del:
+		k = .Del
+	}
+	rec := obj.begin(&w.core, u8(k), false, false) or_return
+	obj.put_links(&rec, nil)
+	encode_fields(&rec.pw, body)
+	if rec.pw.err != .None {
+		obj.abort(&w.core, &rec)
+		return 0, .No_Memory
+	}
+	return obj.finish(&w.core, &rec)
+}
+
+field_u64 :: proc(tag: u32, v: u64, allocator := context.temp_allocator) -> Field {
+	b := make([]u8, 10, allocator)
+	n := prim.put_uvarint(b, v)
+	return Field{tag = tag, value = b[:n]}
+}
+
+field_bool :: proc(tag: u32, v: bool, allocator := context.temp_allocator) -> Field {
+	b := make([]u8, 1, allocator)
+	b[0] = 1 if v else 0
+	return Field{tag = tag, value = b}
+}
+
+field_id :: proc(tag: u32, id: prim.Id, allocator := context.temp_allocator) -> Field {
+	b := make([]u8, 16, allocator)
+	x := id
+	copy(b, x[:])
+	return Field{tag = tag, value = b}
+}
+
+field_str :: proc(tag: u32, s: string) -> Field {
+	return Field{tag = tag, value = transmute([]u8)s}
+}
+
+value_u64 :: proc "contextless" (v: []u8) -> (x: u64, ok: bool) {
+	n: int
+	x, n = prim.get_uvarint(v)
+	return x, n > 0 && n == len(v)
+}
+
+value_bool :: proc "contextless" (v: []u8) -> (bool, bool) {
+	if len(v) != 1 || v[0] > 1 {
+		return false, false
+	}
+	return v[0] == 1, true
+}
+
+value_id :: proc "contextless" (v: []u8) -> (id: prim.Id, ok: bool) {
+	if len(v) != 16 {
+		return
+	}
+	copy(id[:], v)
+	return id, true
+}

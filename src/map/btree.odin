@@ -1,8 +1,9 @@
-package index
+package omap
 
 import "base:runtime"
 import "core:hash/xxhash"
 import "core:mem/virtual"
+import "../obj"
 import "../prim"
 
 PAGE :: 4096
@@ -43,6 +44,7 @@ Meta :: struct {
 }
 
 Db :: struct {
+	vfs:       prim.Vfs,
 	fd:        prim.Fd,
 	path:      string,
 	meta:      Meta,
@@ -81,14 +83,15 @@ Node :: struct {
 
 Visit :: #type proc(data: rawptr, key: []u8, value: []u8) -> bool
 
-db_open :: proc(db: ^Db, path: string, allocator := context.allocator) -> Error {
+db_open :: proc(db: ^Db, vfs: prim.Vfs, path: string, allocator := context.allocator) -> Error {
 	db^ = {
+		vfs       = vfs,
 		fd        = prim.INVALID_FD,
 		allocator = allocator,
 	}
-	fd, oerr := prim.open_file(path, {.Write, .Create}, 0o600)
+	fd, oerr := prim.open_file(vfs, path, {.Write, .Create}, 0o600)
 	if oerr != .None {
-		return _perr(oerr)
+		return obj.perr(oerr)
 	}
 	db.fd = fd
 	p, perr := make([]u8, len(path), allocator)
@@ -116,8 +119,8 @@ db_close :: proc(db: ^Db) {
 		txn_abort(db.txn)
 	}
 	if db.fd >= 0 {
-		prim.datasync(db.fd)
-		prim.close(db.fd)
+		prim.datasync(db.vfs, db.fd)
+		prim.close_file(db.vfs, db.fd)
 	}
 	delete(db.cache, db.allocator)
 	delete(db.path, db.allocator)
@@ -243,6 +246,10 @@ txn_dirty :: proc "contextless" (t: ^Txn) -> int {
 	return len(t.dirty)
 }
 
+txn_bytes :: proc "contextless" (t: ^Txn) -> int {
+	return int(t.arena.total_used)
+}
+
 txn_get :: proc(t: ^Txn, root: int, key: []u8, allocator := context.allocator) -> (value: []u8, found: bool, err: Error) {
 	ref := t.meta.roots[root]
 	for ref != 0 {
@@ -344,20 +351,20 @@ txn_commit :: proc(t: ^Txn) -> Error {
 			}
 			_encode_node(t, n, buf, start)
 		}
-		if err := prim.write_at(db.fd, buf, i64(start) * PAGE); err != .None {
+		if err := prim.write_at(db.vfs, db.fd, buf, i64(start) * PAGE); err != .None {
 			txn_abort(t)
-			return _perr(err)
+			return obj.perr(err)
 		}
-		if err := prim.datasync(db.fd); err != .None {
+		if err := prim.datasync(db.vfs, db.fd); err != .None {
 			txn_abort(t)
-			return _perr(err)
+			return obj.perr(err)
 		}
 	}
 	m := t.meta
 	m.txn = db.meta.txn + 1
 	m.pages = next
 	m.live = db.meta.live + written - min(t.freed, db.meta.live + written)
-	if err := _meta_write(db.fd, &m); err != .None {
+	if err := _meta_write(db.vfs, db.fd, &m); err != .None {
 		txn_abort(t)
 		return err
 	}
@@ -370,7 +377,7 @@ txn_commit :: proc(t: ^Txn) -> Error {
 }
 
 db_sync :: proc(db: ^Db) -> Error {
-	return _perr(prim.datasync(db.fd))
+	return obj.perr(prim.datasync(db.vfs, db.fd))
 }
 
 db_compact :: proc(db: ^Db) -> Error {
@@ -384,14 +391,14 @@ db_compact :: proc(db: ^Db) -> Error {
 	n := copy(buf[:], db.path)
 	n += copy(buf[n:], ".compact")
 	tmp := string(buf[:n])
-	fd, oerr := prim.open_file(tmp, {.Write, .Create, .Truncate}, 0o600)
+	fd, oerr := prim.open_file(db.vfs, tmp, {.Write, .Create, .Truncate}, 0o600)
 	if oerr != .None {
-		return _perr(oerr)
+		return obj.perr(oerr)
 	}
 	ok := false
 	defer if !ok {
-		prim.close(fd)
-		prim.remove(tmp)
+		prim.close_file(db.vfs, fd)
+		prim.remove(db.vfs, tmp)
 	}
 	c := Copier{
 		db   = db,
@@ -413,20 +420,20 @@ db_compact :: proc(db: ^Db) -> Error {
 	m.txn += 1
 	m.pages = c.next
 	m.live = c.next - 2
-	_meta_write_slot(fd, &m, 0) or_return
-	_meta_write_slot(fd, &m, 1) or_return
-	if err := prim.datasync(fd); err != .None {
-		return _perr(err)
+	_meta_write_slot(db.vfs, fd, &m, 0) or_return
+	_meta_write_slot(db.vfs, fd, &m, 1) or_return
+	if err := prim.datasync(db.vfs, fd); err != .None {
+		return obj.perr(err)
 	}
-	if err := prim.rename(tmp, db.path); err != .None {
-		return _perr(err)
+	if err := prim.rename(db.vfs, tmp, db.path); err != .None {
+		return obj.perr(err)
 	}
 	ok = true
-	prim.close(db.fd)
+	prim.close_file(db.vfs, db.fd)
 	db.fd = fd
 	db.meta = m
 	db.cache_no = {}
-	return _perr(prim.sync_dir(prim.dir_name(db.path)))
+	return obj.perr(prim.sync_dir(db.vfs, prim.dir_name(db.path)))
 }
 
 @(private)
@@ -465,8 +472,8 @@ _copier_flush :: proc(c: ^Copier) -> Error {
 	if len(c.buf) == 0 {
 		return .None
 	}
-	if err := prim.write_at(c.fd, c.buf[:], i64(c.at) * PAGE); err != .None {
-		return _perr(err)
+	if err := prim.write_at(c.db.vfs, c.fd, c.buf[:], i64(c.at) * PAGE); err != .None {
+		return obj.perr(err)
 	}
 	clear(&c.buf)
 	return .None
@@ -513,27 +520,27 @@ _ovf_pages :: proc "contextless" (size: u64) -> u64 {
 
 @(private)
 _db_load :: proc(db: ^Db) -> Error {
-	size, serr := prim.file_size(db.fd)
+	size, serr := prim.file_size(db.vfs, db.fd)
 	if serr != .None {
-		return _perr(serr)
+		return obj.perr(serr)
 	}
 	if size == 0 {
 		m := Meta{
 			pages = 2,
 		}
-		_meta_write_slot(db.fd, &m, 0) or_return
+		_meta_write_slot(db.vfs, db.fd, &m, 0) or_return
 		m.txn = 1
-		_meta_write_slot(db.fd, &m, 1) or_return
-		if err := prim.datasync(db.fd); err != .None {
-			return _perr(err)
+		_meta_write_slot(db.vfs, db.fd, &m, 1) or_return
+		if err := prim.datasync(db.vfs, db.fd); err != .None {
+			return obj.perr(err)
 		}
 		db.meta = m
-		return _perr(prim.sync_dir(prim.dir_name(db.path)))
+		return obj.perr(prim.sync_dir(db.vfs, prim.dir_name(db.path)))
 	}
 	best: Meta
 	found := false
 	for slot in 0 ..< 2 {
-		m, ok := _meta_read(db.fd, slot)
+		m, ok := _meta_read(db.vfs, db.fd, slot)
 		if !ok || m.pages < 2 || i64(m.pages) * PAGE > size {
 			continue
 		}
@@ -547,8 +554,8 @@ _db_load :: proc(db: ^Db) -> Error {
 	}
 	db.meta = best
 	if i64(best.pages) * PAGE < size {
-		if err := prim.truncate(db.fd, i64(best.pages) * PAGE); err != .None {
-			return _perr(err)
+		if err := prim.truncate(db.vfs, db.fd, i64(best.pages) * PAGE); err != .None {
+			return obj.perr(err)
 		}
 	}
 	return .None
@@ -569,21 +576,21 @@ _meta_encode :: proc(b: []u8, m: ^Meta) {
 }
 
 @(private)
-_meta_write :: proc(fd: prim.Fd, m: ^Meta) -> Error {
-	return _meta_write_slot(fd, m, int(m.txn & 1))
+_meta_write :: proc(vfs: prim.Vfs, fd: prim.Fd, m: ^Meta) -> Error {
+	return _meta_write_slot(vfs, fd, m, int(m.txn & 1))
 }
 
 @(private)
-_meta_write_slot :: proc(fd: prim.Fd, m: ^Meta, slot: int) -> Error {
+_meta_write_slot :: proc(vfs: prim.Vfs, fd: prim.Fd, m: ^Meta, slot: int) -> Error {
 	b: [PAGE]u8
 	_meta_encode(b[:], m)
-	return _perr(prim.write_at(fd, b[:], i64(slot) * PAGE))
+	return obj.perr(prim.write_at(vfs, fd, b[:], i64(slot) * PAGE))
 }
 
 @(private)
-_meta_read :: proc(fd: prim.Fd, slot: int) -> (m: Meta, ok: bool) {
+_meta_read :: proc(vfs: prim.Vfs, fd: prim.Fd, slot: int) -> (m: Meta, ok: bool) {
 	b: [META_LEN]u8
-	n, err := prim.read_at(fd, b[:], i64(slot) * PAGE)
+	n, err := prim.read_at(vfs, fd, b[:], i64(slot) * PAGE)
 	if err != .None || n != META_LEN {
 		return
 	}
@@ -617,9 +624,9 @@ _read_page :: proc(db: ^Db, no: u64) -> (page: []u8, err: Error) {
 		return buf, .None
 	}
 	db.cache_no[slot] = 0
-	n, rerr := prim.read_at(db.fd, buf, i64(no) * PAGE)
+	n, rerr := prim.read_at(db.vfs, db.fd, buf, i64(no) * PAGE)
 	if rerr != .None {
-		return nil, _perr(rerr)
+		return nil, obj.perr(rerr)
 	}
 	if n != PAGE || xxhash.XXH3_64_with_seed(buf[8:], no) != prim.get_u64le(buf[0:8]) {
 		return nil, .Corrupt
