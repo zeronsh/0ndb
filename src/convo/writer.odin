@@ -357,7 +357,7 @@ writer_set_leaf :: proc(w: ^Writer, target: Rid) -> (off: i64, err: Error) {
 	_, _, _, lit := _positions(v, w.core.id) or_return
 	y := Vref{}
 	if !obj.rid_none(target) {
-		y = obj.vref(v, target) or_return
+		y = _msg_at(v, target) or_return
 		n := _node(v, y) or_return
 		obj.observe(&w.core, n.hlc)
 		_leave(w, lit, y) or_return
@@ -397,7 +397,7 @@ writer_switch :: proc(w: ^Writer, sibling: Rid) -> (leaf: Rid, off: i64, err: Er
 
 writer_assign :: proc(w: ^Writer, msg: Rid, runner: prim.Id) -> (off: i64, err: Error) {
 	_prepare(w, false) or_return
-	x := obj.vref(w.core.v, msg) or_return
+	x := _msg_at(w.core.v, msg) or_return
 	n := _node(w.core.v, x) or_return
 	obj.observe(&w.core, n.hlc)
 	r := obj.local(&w.core, x) or_return
@@ -407,7 +407,7 @@ writer_assign :: proc(w: ^Writer, msg: Rid, runner: prim.Id) -> (off: i64, err: 
 writer_claim :: proc(w: ^Writer, msg: Rid, lease_ms: u64, lines: []Line = nil) -> (claim: Rid, err: Error) {
 	_prepare(w, false) or_return
 	v := w.core.v
-	x := obj.vref(v, msg) or_return
+	x := _msg_at(v, msg) or_return
 	n := _node(v, x) or_return
 	obj.observe(&w.core, n.hlc)
 	st: Structure
@@ -732,7 +732,7 @@ writer_record :: proc(w: ^Writer, source, external_id: string, sequence: u64, ms
 }
 
 redact_ranges :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (out: []obj.Redaction, err: Error) {
-	x := obj.vref(v, msg) or_return
+	x := _msg_at(v, msg) or_return
 	m := Message{}
 	sa := Vref{}
 	last := _seal_info(v, x, Position{}, &m, &sa) or_return
@@ -1554,7 +1554,7 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 	if s.root {
 		p = {}
 	} else if !obj.rid_none(s.parent) {
-		p = obj.vref(v, s.parent) or_return
+		p = _msg_at(v, s.parent) or_return
 	}
 	depth, jump_depth: i64 = 1, 0
 	jump := Vref{}

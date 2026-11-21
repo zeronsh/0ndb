@@ -399,7 +399,7 @@ switch_window :: proc(v: ^obj.View, t: ^Tail, sibling: Rid, before: int, after: 
 _page_newer :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, leaf: Rid, allocator: runtime.Allocator) -> (p: Page, err: Error) {
 	lv := t.position
 	if !obj.rid_none(leaf) {
-		lv = obj.vref(v, leaf) or_return
+		lv = _msg_at(v, leaf) or_return
 	}
 	p.next = from
 	if obj.vref_none(lv) || limit < 0 {
@@ -411,7 +411,7 @@ _page_newer :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, leaf: Ri
 	floor: prim.Hlc
 	fe := Error.None
 	if !obj.rid_none(from.msg) {
-		fv = obj.vref(v, from.msg) or_return
+		fv = _msg_at(v, from.msg) or_return
 		fn: Node
 		fn, fe = _node(v, fv)
 		if fe == .Missing {
@@ -487,7 +487,7 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 	if obj.rid_none(from.msg) {
 		cur = t.position
 	} else {
-		cur = obj.vref(v, from.msg) or_return
+		cur = _msg_at(v, from.msg) or_return
 		known = from.seal_known
 		if known && !obj.rid_none(from.seal) {
 			seal = obj.vref(v, from.seal) or_return
@@ -583,7 +583,7 @@ message :: proc(v: ^obj.View, t: ^Tail, pos: Position, allocator := context.allo
 }
 
 siblings :: proc(v: ^obj.View, t: ^Tail, msg: Rid, allocator := context.allocator) -> (list: []Rid, pos: int, err: Error) {
-	x := obj.vref(v, msg) or_return
+	x := _msg_at(v, msg) or_return
 	n, ne := _node(v, x)
 	if ne == .Missing {
 		_prefetch_structure(v, t, x)
@@ -612,7 +612,7 @@ siblings :: proc(v: ^obj.View, t: ^Tail, msg: Rid, allocator := context.allocato
 }
 
 switch_target :: proc(v: ^obj.View, t: ^Tail, s: Rid) -> (leaf: Rid, err: Error) {
-	sv := obj.vref(v, s) or_return
+	sv := _msg_at(v, s) or_return
 	ns, ne := _node(v, sv)
 	if ne == .Missing {
 		_prefetch_structure(v, t, sv)
@@ -659,7 +659,7 @@ switch_target :: proc(v: ^obj.View, t: ^Tail, s: Rid) -> (leaf: Rid, err: Error)
 }
 
 assignee :: proc(v: ^obj.View, t: ^Tail, msg: Rid) -> (runner: prim.Id, err: Error) {
-	x := obj.vref(v, msg) or_return
+	x := _msg_at(v, msg) or_return
 	n := _node(v, x) or_return
 	st: Structure
 	structure_load(v, t, n.hlc, &st) or_return
