@@ -101,18 +101,23 @@ _content_tree :: proc(scope: ^osync.Scope, t: ^osync.Key_Tree) -> Error {
 _content_mark_get :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> i64 {
 	k := _pending_key(sp.id, id)
 	v, found, err := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator)
-	if err != .None || !found || len(v) != 9 {
+	if err != .None || !found || len(v) != 9 && len(v) != 17 {
 		return 0
 	}
 	return i64(prim.get_u64le(v[1:]))
 }
 
 @(private)
-_content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, mark: i64) {
+_content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, mark: i64, target: i64 = -1) {
 	k := _pending_key(space, id)
-	v: [9]u8
-	v[0] = u8(kind)
-	prim.put_u64le(v[1:], u64(mark))
+	buf: [17]u8
+	buf[0] = u8(kind)
+	prim.put_u64le(buf[1:], u64(mark))
+	v := buf[:9]
+	if target > mark {
+		prim.put_u64le(buf[9:], u64(target))
+		v = buf[:]
+	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
 		return
@@ -194,6 +199,36 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 		return
 	}
 	e.content.marks[h.id] = mark
+	_content_mark_put(e, h.sp.id, h.id, h.kind, from, pos)
+}
+
+@(private)
+_content_resume :: proc(e: ^Engine, sp: ^Space) {
+	Acc :: struct {
+		ids: [dynamic]prim.Id,
+	}
+	acc := Acc{ids = make([dynamic]prim.Id, context.temp_allocator)}
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		a := (^Acc)(data)
+		if len(key) == 32 && len(value) == 17 && value[0] == u8(Kind.File_Tree) && prim.get_u64le(value[9:]) > prim.get_u64le(value[1:]) {
+			id: prim.Id
+			copy(id[:], key[16:])
+			append(&a.ids, id)
+		}
+		return true
+	}
+	s := sp.id
+	omap.db_scan(&e.reg.db, ROOT_OWNED, s[:], s[:], &acc, visit)
+	for id in acc.ids {
+		h, err := _handle_get(e, Object{sp.id, id}, .File_Tree)
+		if err != .None {
+			continue
+		}
+		if _hist_ready(e, h) != .None || _handle_create_writer(h) != .None {
+			continue
+		}
+		_content_publish(e, h)
+	}
 }
 
 @(private)

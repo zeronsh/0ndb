@@ -65,6 +65,9 @@ share_object :: proc(e: ^Engine, o: Object, recipient: osync.Identity, access :=
 	if sp, ok := e.spaces[o.space]; ok && sp.open {
 		_card_publish_object(e, sp, o.id)
 		_shared_follow(e, sp, o.id, rec.kind)
+		for m in rec.members {
+			_card_relay(e, sp, o.id, m.device)
+		}
 	}
 	return s, .None
 }

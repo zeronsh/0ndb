@@ -64,8 +64,5 @@ set_mtime :: proc(db: ^Odb, path: string, ns: i64) -> bool {
 
 @(private)
 now_ns :: proc(db: ^Odb) -> i64 {
-	if db.clock != nil {
-		return db.clock(db.clock_data)
-	}
-	return prim.now_ns()
+	return prim.clock_wall_ns(db.clock)
 }

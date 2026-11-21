@@ -1,5 +1,6 @@
 package engine
 
+import "core:crypto"
 import "../convo"
 import "../crdt"
 import "../fs"
@@ -37,6 +38,9 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	}
 	if len(ops) == 0 {
 		return .None
+	}
+	for r in _text_own_records(e, h, ops[:]) {
+		_redact_intent(e, h, e.self, r[0], r[1]) or_return
 	}
 	res, rerr := fs.history_redact(h.hist, ops[:], context.temp_allocator)
 	_ferr(rerr) or_return
@@ -89,6 +93,7 @@ map_redact :: proc(e: ^Engine, o: Object, key: []u8) -> Error {
 		}
 	}
 	for t in targets {
+		_redact_intent(e, h, e.self, t[0], t[1]) or_return
 		from := obj.Vref{w.seg, t[0]}
 		_oerr2b(obj.writer_redact(w, from, t[1], {})) or_return
 		_own_redacted(e, h, t[0], t[1])
@@ -116,7 +121,7 @@ _derived_purge :: proc(e: ^Engine, h: ^Handle) {
 }
 
 @(private)
-_relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
+_relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, device: prim.Id, from, to: i64) {
 	if kind != .Map && kind != .Conversation {
 		return
 	}
@@ -129,7 +134,50 @@ _relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
 	if err != .None {
 		return
 	}
-	_derived_purge(e, h)
+	if kind == .Map {
+		_derived_purge(e, h)
+		return
+	}
+	_index_purge_messages(e, h, _sealed_in(h, device, from, to))
+}
+
+@(private)
+_sealed_in :: proc(h: ^Handle, device: prim.Id, from, to: i64) -> []Rid {
+	out := make([dynamic]Rid, context.temp_allocator)
+	for s in h.segs {
+		if s.device != device || s.rep == nil {
+			continue
+		}
+		for g in journal.replica_have(s.rep) {
+			if g.to <= to {
+				continue
+			}
+			pos := max(g.from, to)
+			for pos < g.to {
+				body, next, je := journal.record_at(&s.jr, pos)
+				if je == .Redacted {
+					pos = next
+					continue
+				}
+				if je != .None {
+					break
+				}
+				at := pos
+				pos = next
+				if obj.is_sig(body) || obj.record_kind(body) != u8(convo.Kind.Seal) {
+					continue
+				}
+				rec, derr := convo.decode_record(body, at, context.temp_allocator)
+				if derr != .None {
+					continue
+				}
+				if seal, ok := rec.body.(convo.Seal); ok && seal.last_block >= from && seal.last_block < to {
+					append(&out, Rid{device, seal.msg})
+				}
+			}
+		}
+	}
+	return out[:]
 }
 
 @(private)
@@ -162,6 +210,13 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 	m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator)
 	if merr != .None {
 		return _oerr(merr)
+	}
+	plan, perr := convo.writer_redact_plan(&h.cw, msg, context.temp_allocator)
+	if perr != .None {
+		return _oerr(perr)
+	}
+	for r in plan {
+		_redact_intent(e, h, r.seg, r.from, r.to, msg.off) or_return
 	}
 	ranges, rerr := convo.writer_redact(&h.cw, msg)
 	if rerr != .None {
@@ -197,12 +252,179 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 }
 
 @(private)
-_own_redacted :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
-	if h.own_tree != nil {
-		if err := _own_tree_puncture(e, h.own_tree, from, to); err == .None {
-			_dirty_keys(e, h.sp, h.id, h.kind, h.scope, h.own_tree)
+_redact_intent :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64, target: i64 = -1) -> Error {
+	k, n := _relay_key(e, h.sp.id, h.id, device, from)
+	v: [17]u8
+	v[0] = u8(h.kind)
+	prim.put_u64le(v[1:9], u64(to))
+	vn := 9
+	if target >= 0 {
+		prim.put_u64le(v[9:17], u64(target))
+		vn = 17
+	}
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		return _oerr(terr)
+	}
+	if err := omap.txn_put(t, ROOT_REDACT, k[:n], v[:vn]); err != .None {
+		omap.txn_abort(t)
+		return _oerr(err)
+	}
+	return _oerr(omap.txn_commit(t))
+}
+
+@(private)
+_key_live :: proc(t: ^Own_Tree, off: i64) -> bool {
+	p := osync.keytree_provider(&t.tree)
+	k: journal.Key
+	ok := p.key(p.data, off, &k)
+	crypto.zero_explicit(&k, size_of(k))
+	return ok
+}
+
+@(private)
+_own_puncture :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
+	t := h.own_tree
+	if t == nil || !_key_live(t, from) {
+		return
+	}
+	if _own_tree_puncture(e, t, from, to) != .None {
+		return
+	}
+	if err := _own_tree_store(e, t); err == .None {
+		t.dirty = false
+	} else if err != .Busy {
+		_fatal(e, err)
+	}
+	_dirty_keys(e, h.sp, h.id, h.kind, h.scope, t)
+}
+
+@(private)
+_text_own_records :: proc(e: ^Engine, h: ^Handle, spans: []crdt.Op_Span) -> [][2]i64 {
+	out := make([dynamic][2]i64, context.temp_allocator)
+	hist := h.hist
+	if hist == nil || fs.history_wake(hist) != .None {
+		return out[:]
+	}
+	r: journal.Reader
+	journal.journal_reader(&hist.journal, &r, context.temp_allocator)
+	defer journal.reader_close(&r)
+	seen := make(map[u64]bool, context.temp_allocator)
+	for sp in spans {
+		if sp.id.actor != e.self {
+			continue
+		}
+		got := 0
+		for got < sp.len {
+			lv, ok := crdt.graph_lv(&hist.g, crdt.Op_Id{sp.id.actor, sp.id.seq + u64(got)})
+			if !ok {
+				break
+			}
+			first, n, stream, off, found := fs.history_batch_at(hist, lv)
+			if !found {
+				break
+			}
+			got += max(n - int(lv - first), 1)
+			if stream != 0 || seen[off] {
+				continue
+			}
+			seen[off] = true
+			if _, next, je := journal.record_at(&r, i64(off)); je == .None {
+				append(&out, [2]i64{i64(off), next})
+			}
 		}
 	}
+	return out[:]
+}
+
+@(private)
+_redact_recover :: proc(e: ^Engine) {
+	Pending :: struct {
+		space:  prim.Id,
+		object: prim.Id,
+		kind:   Kind,
+		from:   i64,
+		to:     i64,
+		target: i64,
+	}
+	list := make([dynamic]Pending, context.temp_allocator)
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		l := (^[dynamic]Pending)(data)
+		if len(key) != 40 || (len(value) != 9 && len(value) != 17) || value[0] < 1 || value[0] > u8(max(Kind)) {
+			return true
+		}
+		p := Pending{kind = Kind(value[0]), from = i64(prim.get_u64le(key[32:40])), to = i64(prim.get_u64le(value[1:9])), target = -1}
+		copy(p.space[:], key[:16])
+		copy(p.object[:], key[16:32])
+		if len(value) == 17 {
+			p.target = i64(prim.get_u64le(value[9:17]))
+		}
+		append(l, p)
+		return true
+	}
+	omap.db_scan(&e.reg.db, ROOT_REDACT, nil, nil, &list, visit)
+	for p in list {
+		if _, ok := e.spaces[p.space]; !ok {
+			continue
+		}
+		h, err := _handle_get(e, Object{p.space, p.object}, p.kind)
+		if err != .None || !h.w_open {
+			continue
+		}
+		_redact_finish(e, h, p.from, p.to, p.target)
+	}
+}
+
+@(private)
+_redact_finish :: proc(e: ^Engine, h: ^Handle, from, to: i64, target: i64) {
+	r: ^journal.Reader
+	#partial switch h.kind {
+	case .Conversation:
+		r = &h.cw.core.jr
+	case .Map:
+		r = &h.mw.core.jr
+	case .Text, .File_Tree:
+		if h.hist == nil || fs.history_wake(h.hist) != .None {
+			return
+		}
+		x := new(journal.Reader, context.temp_allocator)
+		journal.journal_reader(&h.hist.journal, x, context.temp_allocator)
+		r = x
+	case:
+		return
+	}
+	_, _, je := journal.record_at(r, from)
+	if je == .Redacted {
+		_own_puncture(e, h, from, to)
+		return
+	}
+	if je != .None {
+		return
+	}
+	#partial switch h.kind {
+	case .Conversation:
+		w := &h.cw.core
+		tv := obj.Vref{w.seg, target} if target >= 0 else obj.Vref{}
+		if convo.writer_redact_range(&h.cw, obj.Vref{w.seg, from}, to, tv) == .None {
+			_own_puncture(e, h, from, to)
+			_handle_mark(h)
+			_derived_purge(e, h)
+		}
+	case .Map:
+		w := &h.mw.core
+		if _, werr := obj.writer_redact(w, obj.Vref{w.seg, from}, to, {}); werr == .None {
+			_own_puncture(e, h, from, to)
+			_handle_mark(h)
+			_derived_purge(e, h)
+		}
+	case:
+		_relay_redact_done(e, h.sp, h.id, e.self, from)
+	}
+}
+
+@(private)
+_own_redacted :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
+	_own_puncture(e, h, from, to)
 	_relay_redact_add(e, h, e.self, from, to)
 }
 
@@ -223,16 +445,8 @@ _relay_key :: proc(e: ^Engine, space: prim.Id, object: prim.Id, device: prim.Id,
 @(private)
 _relay_redact_add :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64) {
 	k, n := _relay_key(e, h.sp.id, h.id, device, from)
-	v: [9]u8
-	v[0] = u8(h.kind)
-	prim.put_u64le(v[1:], u64(to))
-	t, terr := omap.txn_begin(&e.reg.db)
-	if terr == .None {
-		if omap.txn_put(t, ROOT_REDACT, k[:n], v[:]) == .None {
-			omap.txn_commit(t)
-		} else {
-			omap.txn_abort(t)
-		}
+	if _, found, _ := omap.db_get(&e.reg.db, ROOT_REDACT, k[:n], context.temp_allocator); !found {
+		_redact_intent(e, h, device, from, to)
 	}
 	if h.sp.repl_on && h.sp.connected {
 		osync.replicator_redact(&h.sp.repl, &h.scope, device, h.name, 0, from, to)
@@ -250,7 +464,7 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 	acc := Acc{e, sp, object}
 	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		a := (^Acc)(data)
-		if (len(key) != 40 && len(key) != 56) || len(value) != 9 || value[0] < 1 || value[0] > u8(max(Kind)) {
+		if (len(key) != 40 && len(key) != 56) || (len(value) != 9 && len(value) != 17) || value[0] < 1 || value[0] > u8(max(Kind)) {
 			return true
 		}
 		id: prim.Id
@@ -260,7 +474,7 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 			copy(device[:], key[40:56])
 		}
 		from := i64(prim.get_u64le(key[32:40]))
-		to := i64(prim.get_u64le(value[1:]))
+		to := i64(prim.get_u64le(value[1:9]))
 		sc := _object_scope(a.sp, id)
 		defer osync.scope_clear(&sc)
 		name := _seg_name(Kind(value[0]), id)
@@ -365,7 +579,7 @@ _relay_redacted_event :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, f
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
 	osync.replicator_zero_replica(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to)
-	_relay_zeroed(e, sp, id, kind)
+	_relay_zeroed(e, sp, id, kind, device, from, to)
 	_object_changed(e, sp.id, id, .Redacted)
 }
 
@@ -407,6 +621,9 @@ _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, t
 				}
 			}
 		}
+		if _redact_intent(e, h, e.self, from, to, target.off if !obj.vref_none(target) else -1) != .None {
+			return
+		}
 		if convo.writer_redact_range(&h.cw, fv, to, target) != .None {
 			return
 		}
@@ -416,6 +633,9 @@ _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, t
 			_derived_purge(e, h)
 		}
 	} else {
+		if _redact_intent(e, h, e.self, from, to) != .None {
+			return
+		}
 		if _, werr := obj.writer_redact(w, fv, to, {}); werr != .None {
 			return
 		}
@@ -471,6 +691,9 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 			return .None
 		}
 		if _, _, je := journal.record_at(&w.jr, from.off); je != .Redacted {
+			if _redact_intent(e, h, e.self, from.off, r.to, target.off if !obj.vref_none(target) && target.seg == from.seg else -1) != .None {
+				return .None
+			}
 			werr: obj.Error
 			if h.kind == .Conversation {
 				werr = convo.writer_redact_range(&h.cw, from, r.to, target)
@@ -551,6 +774,23 @@ _index_purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) {
 	src := _source_id(h.id, msg.seg)
 	pos, _ := search.position(&e.index, src)
 	search.redact(&e.index, src, pos, h.id, ref[:])
+}
+
+@(private)
+_index_purge_messages :: proc(e: ^Engine, h: ^Handle, msgs: []Rid) {
+	if len(msgs) == 0 || !e.cfg.search {
+		return
+	}
+	if _index_open(e) != .None {
+		return
+	}
+	for msg in msgs {
+		ref := _rid_ref(msg)
+		src := _source_id(h.id, msg.seg)
+		pos, _ := search.position(&e.index, src)
+		search.delete_record(&e.index, src, pos, h.id, ref[:])
+	}
+	search.erase(&e.index)
 }
 
 @(private)

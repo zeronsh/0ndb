@@ -57,6 +57,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 	}
 	_card_publish(e, sp)
 	_owned_follow(e, sp)
+	_content_resume(e, sp)
 	if !sp.keyless {
 		_catalog_follow(e, sp)
 	} else {

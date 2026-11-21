@@ -182,14 +182,9 @@ device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
 	if !e.db_open {
 		dir := _join(context.temp_allocator, e.dir, "objects") or_return
 		_perr(prim.mkdir_all(e.base, dir, 0o700)) or_return
-		if oerr := odb.open_store(&e.db, e.base, dir, nil, .Sha1, e.allocator); oerr != .None {
+		if oerr := odb.open_store(&e.db, e.base, dir, nil, .Sha1, e.allocator, e.cfg.clock, e.cfg.random); oerr != .None {
 			return nil, _derr(oerr)
 		}
-		e.db.clock = _wall_ns_data
-		e.db.clock_data = e
-		seed: [8]u8
-		random_fill(e, seed[:])
-		e.db.temp_seq = transmute(u64)seed
 		e.db_open = true
 	}
 	return &e.db, .None
@@ -494,7 +489,14 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 		}
 	}
 	if len(own) == 0 || !h.w_open {
+		_index_purge_object(e, h)
+		_index_item_add(e, h.sp.id, h.id, h.kind)
 		return
+	}
+	for r in _text_own_records(e, h, own[:]) {
+		if _redact_intent(e, h, e.self, r[0], r[1]) != .None {
+			return
+		}
 	}
 	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator)
 	if err != .None {

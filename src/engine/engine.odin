@@ -357,6 +357,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.self = e.identity.id
 	_registry_open(e) or_return
 	_spaces_load(e) or_return
+	_redact_recover(e)
 	return .None
 }
 

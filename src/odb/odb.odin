@@ -1,7 +1,6 @@
 package odb
 
 import "base:runtime"
-import "core:crypto"
 import "core:io"
 import "core:mem/virtual"
 import "core:os"
@@ -44,8 +43,8 @@ Odb :: struct {
 	allocator:      runtime.Allocator,
 	vfs:            prim.Vfs,
 	use_mmap:       bool,
-	clock:          proc(data: rawptr) -> i64,
-	clock_data:     rawptr,
+	clock:          prim.Clock,
+	random:         prim.Random,
 	temp_seq:       u64,
 	format:         Hash_Format,
 	dirs:           [dynamic]Object_Dir,
@@ -75,12 +74,14 @@ Location :: struct {
 }
 
 @(private)
-init :: proc(db: ^Odb, vfs: prim.Vfs, allocator: runtime.Allocator) {
+init :: proc(db: ^Odb, vfs: prim.Vfs, clock: prim.Clock, random: prim.Random, allocator: runtime.Allocator) {
 	db^ = {}
 	db.allocator = allocator
 	db.vfs = vfs
+	db.clock = clock
+	db.random = random
 	seed: [8]u8
-	crypto.rand_bytes(seed[:])
+	prim.random_fill(random, seed[:])
 	db.temp_seq = transmute(u64)seed
 	db.dirs = make([dynamic]Object_Dir, allocator)
 	db.pending_files = make([dynamic]string, allocator)
@@ -90,8 +91,8 @@ init :: proc(db: ^Odb, vfs: prim.Vfs, allocator: runtime.Allocator) {
 	db.two_pass_size = DEFAULT_TWO_PASS_SIZE
 }
 
-open :: proc(db: ^Odb, vfs: prim.Vfs, worktree: string, extra_dirs: []string = nil, allocator := context.allocator) -> Error {
-	init(db, vfs, allocator)
+open :: proc(db: ^Odb, vfs: prim.Vfs, worktree: string, extra_dirs: []string = nil, allocator := context.allocator, clock := prim.Clock{}, random := prim.Random{}) -> Error {
+	init(db, vfs, clock, random, allocator)
 	git_dir, common_dir, err := discover(vfs, worktree, allocator)
 	if err != .None {
 		close(db)
@@ -125,8 +126,8 @@ open :: proc(db: ^Odb, vfs: prim.Vfs, worktree: string, extra_dirs: []string = n
 	return .None
 }
 
-open_store :: proc(db: ^Odb, vfs: prim.Vfs, dir: string, extra_dirs: []string = nil, format := Hash_Format.Sha1, allocator := context.allocator) -> Error {
-	init(db, vfs, allocator)
+open_store :: proc(db: ^Odb, vfs: prim.Vfs, dir: string, extra_dirs: []string = nil, format := Hash_Format.Sha1, allocator := context.allocator, clock := prim.Clock{}, random := prim.Random{}) -> Error {
+	init(db, vfs, clock, random, allocator)
 	db.store = true
 	err := init_store(db, dir, format)
 	if err == .None {
