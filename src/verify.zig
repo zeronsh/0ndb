@@ -1286,6 +1286,7 @@ test "crdt convergence, blame, exact rollback, and append log crash recovery" {
     try runDaemonPoolAndShadowSuite(allocator, io);
     try runTimelineAndRemoteSuite(allocator, io);
     try runSpaceProjectionProjectSuite(allocator, io);
+    try runSyncClientV3Suite(allocator, io);
 }
 
 fn countOpenFds(io: std.Io) !usize {
@@ -9491,7 +9492,6 @@ fn runZeroReplayScaleAndGcSuite(allocator: std.mem.Allocator, io: std.Io) !void 
     }
 }
 
-
 fn initTestGitRepo(allocator: std.mem.Allocator, io: std.Io, repo_dir: []const u8, file_name: []const u8, content: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, repo_dir);
     const out_init = try runGitTestCmd(allocator, io, repo_dir, &.{"init"});
@@ -10073,5 +10073,580 @@ fn runSpaceProjectionProjectSuite(allocator: std.mem.Allocator, io: std.Io) !voi
             defer allocator.free(om_bytes);
             try testing.expectEqualStrings("memory-base\nmemory-fork-note\n", om_bytes);
         }
+    }
+}
+
+fn runSyncClientV3Suite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const id_mod = ondb.core.id;
+    const crypto = ondb.store.crypto;
+    const wire = ondb.sync.wire;
+    const relay_mod = ondb.sync.relay;
+    const keyring_mod = ondb.sync.keyring;
+    const client_mod = ondb.sync.client;
+    const space_mod = ondb.space.space;
+    const projection_mod = ondb.fs.projection;
+    const pool_mod = ondb.fs.pool;
+    const tm = ondb.thread.model;
+    const ts_mod = ondb.thread.store;
+    const Version = ondb.core.version.Version;
+
+    const base_tmp = "/tmp/0ndb-verify-syncclient-v3";
+    cleanDir(io, base_tmp);
+    defer cleanDir(io, base_tmp);
+    try std.Io.Dir.cwd().createDirPath(io, base_tmp);
+
+    const relay_dir = try std.fmt.allocPrint(allocator, "{s}/relay", .{base_tmp});
+    defer allocator.free(relay_dir);
+    const auth_secret = crypto.hashBytes("syncclient-v3-relay-auth-secret");
+
+    var server = try relay_mod.RelayServer.start(
+        allocator,
+        io,
+        relay_dir,
+        .{ 127, 0, 0, 1 },
+        0,
+        auth_secret,
+        true,
+    );
+    defer server.deinit();
+    const port = server.port;
+
+    const srv_thread = try std.Thread.spawn(.{}, relayThreadMain, .{&server});
+    defer {
+        server.stop();
+        srv_thread.join();
+    }
+
+    const root_key = crypto.AccountRootKey.generate(io);
+
+    {
+        const dir_a_path = try std.fmt.allocPrint(allocator, "{s}/t1_thread_a", .{base_tmp});
+        defer allocator.free(dir_a_path);
+        const dir_b_path = try std.fmt.allocPrint(allocator, "{s}/t1_thread_b", .{base_tmp});
+        defer allocator.free(dir_b_path);
+        try std.Io.Dir.cwd().createDirPath(io, dir_a_path);
+        try std.Io.Dir.cwd().createDirPath(io, dir_b_path);
+        var dir_a = try std.Io.Dir.cwd().openDir(io, dir_a_path, .{ .iterate = true });
+        defer dir_a.close(io);
+        var dir_b = try std.Io.Dir.cwd().openDir(io, dir_b_path, .{ .iterate = true });
+        defer dir_b.close(io);
+
+        const runner_a: u128 = 0xAA01;
+        const runner_b: u128 = 0xBB02;
+        const thread_id: u128 = id_mod.newUuidV7(io);
+        const thread_topic = client_mod.topicIdFor(.thread, thread_id);
+        const thread_ek = crypto.EntityKey.generate(io, 1);
+
+        var kr_a = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, runner_a);
+        defer kr_a.deinit();
+        try kr_a.setEntityKey(thread_topic, thread_ek);
+
+        var kr_b = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, runner_b);
+        defer kr_b.deinit();
+        try kr_b.setEntityKey(thread_topic, thread_ek);
+
+        var cli_a = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_a, auth_secret, .workstation);
+        defer cli_a.deinit();
+        var cli_b = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_b, auth_secret, .cloud_runner);
+        defer cli_b.deinit();
+
+        var ts_a = try ts_mod.ThreadStore.open(allocator, io, dir_a, thread_id, null);
+        defer ts_a.deinit();
+        var ts_b = try ts_mod.ThreadStore.open(allocator, io, dir_b, thread_id, null);
+        defer ts_b.deinit();
+
+        const lease_a = try cli_a.leaseAcquire(thread_topic, runner_a, 10_000);
+        try testing.expectEqual(@as(u64, 1), lease_a.epoch);
+        try testing.expectEqual(runner_a, lease_a.holder);
+
+        try testing.expectError(error.LeaseHeld, cli_b.leaseAcquire(thread_topic, runner_b, 10_000));
+
+        const renewed_a = try cli_a.leaseRenew(thread_topic, runner_a, lease_a.epoch, 15_000);
+        try testing.expectEqual(@as(u64, 1), renewed_a.epoch);
+        try testing.expectEqual(runner_a, renewed_a.holder);
+
+        const msg_a_id = id_mod.newUuidV7(io);
+        var ev_a = try ts_a.appendEvent(runner_a, .{ .message_appended = .{
+            .msg_id = msg_a_id,
+            .thread_id = thread_id,
+            .role = .user,
+            .content = @constCast("epoch-1 message from runner A"),
+            .provider = .claude_code,
+            .status = .completed,
+            .created_ms = 1000,
+            .updated_ms = 1000,
+        } });
+        defer ev_a.deinit(allocator);
+
+        const push_a1 = try cli_a.pushThread(&ts_a, thread_topic, lease_a.epoch);
+        try testing.expectEqual(@as(usize, 1), push_a1.frames_pushed);
+
+        const lease_b = try cli_a.leaseHandoff(thread_topic, runner_a, runner_b, lease_a.epoch, 10_000);
+        try testing.expectEqual(@as(u64, 2), lease_b.epoch);
+        try testing.expectEqual(runner_b, lease_b.holder);
+
+        const st_mid = try cli_b.leaseStatus(thread_topic);
+        try testing.expectEqual(@as(u64, 2), st_mid.epoch);
+        try testing.expectEqual(runner_b, st_mid.holder);
+
+        try testing.expectError(error.Fenced, cli_a.putFrameFenced(thread_topic, 1, 99, "stale-epoch-1-payload"));
+        try testing.expectError(error.Fenced, cli_a.leaseRenew(thread_topic, runner_a, 1, 10_000));
+
+        const stale_msg_id = id_mod.newUuidV7(io);
+        var ev_stale = try ts_a.appendEvent(runner_a, .{ .message_appended = .{
+            .msg_id = stale_msg_id,
+            .thread_id = thread_id,
+            .role = .assistant,
+            .content = @constCast("zombie runner A frame"),
+            .provider = .claude_code,
+            .status = .completed,
+            .created_ms = 1500,
+            .updated_ms = 1500,
+        } });
+        defer ev_stale.deinit(allocator);
+        try testing.expectError(error.Fenced, cli_a.pushThread(&ts_a, thread_topic, 1));
+
+        const pull_b = try cli_b.pullThread(&ts_b, thread_topic);
+        try testing.expectEqual(@as(usize, 1), pull_b.frames_pulled);
+        try testing.expect(ts_b.messages.contains(msg_a_id));
+        try testing.expect(!ts_b.messages.contains(stale_msg_id));
+
+        const msg_b_id = id_mod.newUuidV7(io);
+        var ev_b = try ts_b.appendEvent(runner_b, .{ .message_appended = .{
+            .msg_id = msg_b_id,
+            .thread_id = thread_id,
+            .role = .assistant,
+            .content = @constCast("epoch-2 reply from runner B"),
+            .provider = .codex,
+            .status = .completed,
+            .created_ms = 2000,
+            .updated_ms = 2000,
+        } });
+        defer ev_b.deinit(allocator);
+
+        const push_b = try cli_b.pushThread(&ts_b, thread_topic, lease_b.epoch);
+        try testing.expectEqual(@as(usize, 1), push_b.frames_pushed);
+
+        const pull_a = try cli_a.pullThread(&ts_a, thread_topic);
+        try testing.expectEqual(@as(usize, 1), pull_a.frames_pulled);
+        const got_b = ts_a.messages.get(msg_b_id).?;
+        try testing.expectEqualStrings("epoch-2 reply from runner B", got_b.content);
+
+        const sub_backlog = try cli_a.subscribeV3(thread_topic, 999);
+        defer {
+            for (sub_backlog) |*f| f.deinit(allocator);
+            allocator.free(sub_backlog);
+        }
+
+        const cancel_res = try cli_b.leaseCancel(thread_topic, lease_b.epoch);
+        try testing.expect(cancel_res.canceled);
+        try testing.expectEqual(@as(u64, 2), cancel_res.cancel_epoch);
+        const st_cancel = try cli_a.leaseStatus(thread_topic);
+        try testing.expect(st_cancel.canceled);
+        try testing.expectEqual(@as(u64, 2), st_cancel.cancel_epoch);
+        if (cli_a.popLeaseCancelEvent()) |cancel_ev| {
+            try testing.expectEqualSlices(u8, &thread_topic, &cancel_ev.topic_id);
+            try testing.expect(cancel_ev.lease.canceled);
+            try testing.expectEqual(@as(u64, 2), cancel_ev.lease.cancel_epoch);
+        }
+        try testing.expectError(error.LeaseCancelled, cli_b.putFrameFenced(thread_topic, 2, 100, "after-cancel"));
+
+        const rel_topic = client_mod.topicIdFor(.thread, id_mod.newUuidV7(io));
+        try kr_a.setEntityKey(rel_topic, crypto.EntityKey.generate(io, 1));
+        const lr_rel = try cli_a.leaseAcquire(rel_topic, runner_a, 10_000);
+        try testing.expectEqual(@as(u64, 1), lr_rel.epoch);
+        const released = try cli_a.leaseRelease(rel_topic, runner_a, lr_rel.epoch);
+        try testing.expectEqual(@as(u128, 0), released.holder);
+    }
+
+    {
+        const pool_dir = try std.fmt.allocPrint(allocator, "{s}/t2_pool", .{base_tmp});
+        defer allocator.free(pool_dir);
+        const resources = try pool_mod.DaemonResources.init(allocator, io, pool_dir, .{});
+        defer resources.deinit();
+
+        const repo_dir = try std.fmt.allocPrint(allocator, "{s}/t2_git_repo", .{base_tmp});
+        defer allocator.free(repo_dir);
+        try initTestGitRepo(allocator, io, repo_dir, "hello.txt", "hello git world\n");
+
+        const lib_path = try std.fmt.allocPrint(allocator, "{s}/lib.zig", .{repo_dir});
+        defer allocator.free(lib_path);
+        try writeVerifyFile(io, lib_path, "pub const answer = 42;\n");
+        const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{repo_dir});
+        defer allocator.free(readme_path);
+        try writeVerifyFile(io, readme_path, "# 0ndb test repo\n");
+        const out_add = try runGitTestCmd(allocator, io, repo_dir, &.{ "add", "lib.zig", "README.md" });
+        allocator.free(out_add);
+        const out_ci = try runGitTestCmd(allocator, io, repo_dir, &.{ "commit", "-m", "add tracked files" });
+        allocator.free(out_ci);
+
+        const sp_state = try std.fmt.allocPrint(allocator, "{s}/t2_space", .{base_tmp});
+        defer allocator.free(sp_state);
+        const sp_id = id_mod.newUuidV7(io);
+        const sp_topic = client_mod.topicIdFor(.space, sp_id);
+        const sp_ek = crypto.EntityKey.generate(io, 1);
+
+        var sp = try space_mod.Space.open(allocator, io, sp_state, sp_id, .git_worktree, resources);
+        defer sp.deinit();
+
+        var proj = try projection_mod.Projection.attach(allocator, io, &sp, repo_dir, resources);
+        defer proj.deinit();
+        try proj.adoptInitial();
+
+        var vh = try proj.vcsHead(allocator);
+        defer vh.deinit(allocator);
+        if (vh.rev) |rev| {
+            try sp.setOrigin(.{
+                .origin_space_id = sp_id,
+                .fork_base_version = Version.ROOT,
+                .git_remote_url = @constCast("https://example.invalid/repo.git"),
+                .git_base_rev = @constCast(rev),
+            });
+        }
+
+        const local_edit_path = try std.fmt.allocPrint(allocator, "{s}/local_delta.txt", .{repo_dir});
+        defer allocator.free(local_edit_path);
+        try writeVerifyFile(io, local_edit_path, "local uncommitted delta\n");
+        proj.markDirty();
+        const b_local = try proj.ingestDirty();
+        try testing.expect(b_local != null);
+
+        var kr = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, 0xCC01);
+        defer kr.deinit();
+        try kr.setEntityKey(sp_topic, sp_ek);
+
+        var cli = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr, auth_secret, .workstation);
+        defer cli.deinit();
+
+        const st1 = try cli.pushSpace(&sp, sp_topic, null);
+        try testing.expect(st1.git_blobs_skipped >= 3);
+        try testing.expect(st1.frames_pushed >= 2);
+        try testing.expectEqual(@as(usize, 0), st1.blobs_pushed);
+
+        const st2 = try cli.pushSpace(&sp, sp_topic, null);
+        try testing.expectEqual(@as(usize, 0), st2.frames_pushed);
+        try testing.expectEqual(@as(usize, 0), st2.blobs_pushed);
+        try testing.expectEqual(@as(usize, 0), st2.git_blobs_skipped);
+
+        _ = try sp.putFile(sp.actor_id, "local_delta.txt", "local uncommitted delta v2\n");
+        const st3 = try cli.pushSpace(&sp, sp_topic, null);
+        try testing.expectEqual(@as(usize, 1), st3.frames_pushed);
+        try testing.expectEqual(@as(usize, 0), st3.git_blobs_skipped);
+
+        var cli_reconnected = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr, auth_secret, .workstation);
+        defer cli_reconnected.deinit();
+        const st4 = try cli_reconnected.pushSpace(&sp, sp_topic, null);
+        try testing.expectEqual(@as(usize, 0), st4.frames_pushed);
+        try testing.expectEqual(@as(usize, 0), st4.blobs_pushed);
+    }
+
+    {
+        const sp_a_state = try std.fmt.allocPrint(allocator, "{s}/t3_space_a", .{base_tmp});
+        defer allocator.free(sp_a_state);
+        const sp_b_state = try std.fmt.allocPrint(allocator, "{s}/t3_space_b", .{base_tmp});
+        defer allocator.free(sp_b_state);
+        const sp_id = id_mod.newUuidV7(io);
+        const sp_topic = client_mod.topicIdFor(.space, sp_id);
+        const sp_ek = crypto.EntityKey.generate(io, 1);
+
+        var sp_a = try space_mod.Space.open(allocator, io, sp_a_state, sp_id, .virtual, null);
+        defer sp_a.deinit();
+
+        _ = try sp_a.setMeta(sp_a.actor_id, "assistant/role", "persistent-memory");
+        _ = try sp_a.putFile(sp_a.actor_id, "notes/plan.md", "thin client readable text\n");
+
+        const bin_payload = try allocator.alloc(u8, 12_288);
+        defer allocator.free(bin_payload);
+        for (bin_payload, 0..) |*b, idx| {
+            b.* = if (idx % 17 == 0) 0 else @intCast((idx * 31 + 7) & 0xff);
+        }
+        _ = try sp_a.putFile(sp_a.actor_id, "assets/image.bin", bin_payload);
+        const expected_hash = crypto.hashBytes(bin_payload);
+
+        var kr_a = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, 0xDD01);
+        defer kr_a.deinit();
+        try kr_a.setEntityKey(sp_topic, sp_ek);
+        var cli_a = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_a, auth_secret, .workstation);
+        defer cli_a.deinit();
+
+        const push_st = try cli_a.pushSpace(&sp_a, sp_topic, null);
+        try testing.expect(push_st.frames_pushed >= 3);
+        try testing.expectEqual(@as(usize, 1), push_st.blobs_pushed);
+
+        var sp_b = try space_mod.Space.open(allocator, io, sp_b_state, sp_id, .virtual, null);
+        defer sp_b.deinit();
+
+        var kr_b = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, 0xDD02);
+        defer kr_b.deinit();
+        try kr_b.setEntityKey(sp_topic, sp_ek);
+        var cli_b = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_b, auth_secret, .thin_client);
+        defer cli_b.deinit();
+
+        const pull_st = try cli_b.pullSpace(&sp_b, sp_topic, null);
+        try testing.expect(pull_st.frames_pulled >= 3);
+        try testing.expectEqual(@as(usize, 0), pull_st.blobs_pulled);
+
+        try testing.expectEqualStrings("persistent-memory", sp_b.getMeta("assistant/role").?);
+        {
+            const txt = (try sp_b.readFileAlloc(allocator, "notes/plan.md")).?;
+            defer allocator.free(txt);
+            try testing.expectEqualStrings("thin client readable text\n", txt);
+        }
+        {
+            const entries = try sp_b.listDir(allocator, "assets");
+            defer {
+                for (entries) |*e| e.deinit(allocator);
+                allocator.free(entries);
+            }
+            try testing.expectEqual(@as(usize, 1), entries.len);
+            try testing.expectEqualStrings("image.bin", entries[0].name);
+        }
+
+        try testing.expect((try sp_b.readFileAlloc(allocator, "assets/image.bin")) == null);
+        const lazy_oid = (try client_mod.getSpaceFileBlobOid(&sp_b, allocator, "assets/image.bin")).?;
+        try testing.expectEqualSlices(u8, &expected_hash, &lazy_oid);
+
+        const fetched = (try cli_b.fetchBlobOnDemand(&sp_b, sp_topic, lazy_oid)).?;
+        defer allocator.free(fetched);
+        try testing.expectEqualSlices(u8, bin_payload, fetched);
+
+        const local_after = (try sp_b.readFileAlloc(allocator, "assets/image.bin")).?;
+        defer allocator.free(local_after);
+        try testing.expectEqualSlices(u8, bin_payload, local_after);
+
+        const pull_st2 = try cli_b.pullSpace(&sp_b, sp_topic, null);
+        try testing.expectEqual(@as(usize, 0), pull_st2.frames_pulled);
+        try testing.expectEqual(@as(usize, 0), pull_st2.blobs_pulled);
+
+        const sp_c_state = try std.fmt.allocPrint(allocator, "{s}/t3_space_c", .{base_tmp});
+        defer allocator.free(sp_c_state);
+        const sp_c_work = try std.fmt.allocPrint(allocator, "{s}/t3_work_c", .{base_tmp});
+        defer allocator.free(sp_c_work);
+        try std.Io.Dir.cwd().createDirPath(io, sp_c_work);
+        var sp_c = try space_mod.Space.open(allocator, io, sp_c_state, sp_id, .dir, null);
+        defer sp_c.deinit();
+        var proj_c = try projection_mod.Projection.attach(allocator, io, &sp_c, sp_c_work, null);
+        defer proj_c.deinit();
+
+        var kr_c = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, 0xDD03);
+        defer kr_c.deinit();
+        try kr_c.setEntityKey(sp_topic, sp_ek);
+        var cli_c = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_c, auth_secret, .workstation);
+        defer cli_c.deinit();
+
+        const pull_c = try cli_c.pullSpace(&sp_c, sp_topic, &proj_c);
+        try testing.expect(pull_c.frames_pulled >= 3);
+        try testing.expectEqual(@as(usize, 1), pull_c.blobs_pulled);
+
+        const disk_plan = try std.fmt.allocPrint(allocator, "{s}/notes/plan.md", .{sp_c_work});
+        defer allocator.free(disk_plan);
+        const disk_plan_bytes = try readDiskPathAlloc(allocator, io, disk_plan);
+        defer allocator.free(disk_plan_bytes);
+        try testing.expectEqualStrings("thin client readable text\n", disk_plan_bytes);
+
+        const disk_bin = try std.fmt.allocPrint(allocator, "{s}/assets/image.bin", .{sp_c_work});
+        defer allocator.free(disk_bin);
+        const disk_bin_bytes = try readDiskPathAlloc(allocator, io, disk_bin);
+        defer allocator.free(disk_bin_bytes);
+        try testing.expectEqualSlices(u8, bin_payload, disk_bin_bytes);
+    }
+
+    {
+        const cap_dir_path = try std.fmt.allocPrint(allocator, "{s}/t4_captain", .{base_tmp});
+        defer allocator.free(cap_dir_path);
+        const sub_dir_path = try std.fmt.allocPrint(allocator, "{s}/t4_sub", .{base_tmp});
+        defer allocator.free(sub_dir_path);
+        const cap_sp_path = try std.fmt.allocPrint(allocator, "{s}/t4_cap_space", .{base_tmp});
+        defer allocator.free(cap_sp_path);
+        const sub_sp_path = try std.fmt.allocPrint(allocator, "{s}/t4_sub_space", .{base_tmp});
+        defer allocator.free(sub_sp_path);
+        try std.Io.Dir.cwd().createDirPath(io, cap_dir_path);
+        try std.Io.Dir.cwd().createDirPath(io, sub_dir_path);
+        var cap_dir = try std.Io.Dir.cwd().openDir(io, cap_dir_path, .{ .iterate = true });
+        defer cap_dir.close(io);
+        var sub_dir = try std.Io.Dir.cwd().openDir(io, sub_dir_path, .{ .iterate = true });
+        defer sub_dir.close(io);
+
+        const cap_runner: u128 = 0xEE01;
+        const sub_runner: u128 = 0xEE02;
+        const cap_tid = id_mod.newUuidV7(io);
+        const sub_tid = id_mod.newUuidV7(io);
+        const shared_sp_id = id_mod.newUuidV7(io);
+
+        const cap_thread_topic = client_mod.topicIdFor(.thread, cap_tid);
+        const cap_mailbox_topic = client_mod.topicIdFor(.mailbox, cap_tid);
+        const shared_space_topic = client_mod.topicIdFor(.space, shared_sp_id);
+
+        var cap_kr = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, cap_runner);
+        defer cap_kr.deinit();
+        try cap_kr.setEntityKey(cap_thread_topic, crypto.EntityKey.generate(io, 1));
+        try cap_kr.setEntityKey(cap_mailbox_topic, crypto.EntityKey.generate(io, 1));
+        try cap_kr.setEntityKey(shared_space_topic, crypto.EntityKey.generate(io, 1));
+
+        var cap_sp = try space_mod.Space.open(allocator, io, cap_sp_path, shared_sp_id, .virtual, null);
+        defer cap_sp.deinit();
+        _ = try cap_sp.putFile(cap_runner, "spec.md", "read-only context for subordinate\n");
+
+        var cap_cli = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &cap_kr, auth_secret, .workstation);
+        defer cap_cli.deinit();
+        const cap_push = try cap_cli.pushSpace(&cap_sp, shared_space_topic, null);
+        try testing.expectEqual(@as(usize, 1), cap_push.frames_pushed);
+
+        var sub_kr = keyring_mod.Keyring.initSubordinateDevice(allocator, io, sub_runner);
+        defer sub_kr.deinit();
+
+        const sealed_bundle = try client_mod.sealDelegationBundle(
+            allocator,
+            &cap_kr,
+            auth_secret,
+            sub_runner,
+            sub_kr.device_keypair.public_key,
+            id_mod.nowMs(io) + 60_000,
+            &.{
+                .{ .topic_id = shared_space_topic, .perms = wire.PERM_READ },
+                .{ .topic_id = cap_mailbox_topic, .perms = wire.PERM_INBOX_APPEND },
+            },
+        );
+        defer allocator.free(sealed_bundle);
+
+        var sub_cli = try client_mod.SyncClientV3.connectFromDelegationBundle(
+            allocator,
+            io,
+            .{ 127, 0, 0, 1 },
+            port,
+            &sub_kr,
+            sealed_bundle,
+            .thin_client,
+        );
+        defer sub_cli.deinit();
+
+        var sub_sp = try space_mod.Space.open(allocator, io, sub_sp_path, shared_sp_id, .virtual, null);
+        defer sub_sp.deinit();
+        const sub_pull_sp = try sub_cli.pullSpace(&sub_sp, shared_space_topic, null);
+        try testing.expectEqual(@as(usize, 1), sub_pull_sp.frames_pulled);
+        {
+            const spec_txt = (try sub_sp.readFileAlloc(allocator, "spec.md")).?;
+            defer allocator.free(spec_txt);
+            try testing.expectEqualStrings("read-only context for subordinate\n", spec_txt);
+        }
+
+        _ = try sub_sp.putFile(sub_runner, "unauthorized.txt", "blocked write\n");
+        try testing.expectError(error.PermissionDenied, sub_cli.pushSpace(&sub_sp, shared_space_topic, null));
+
+        const mb_item_id = id_mod.newUuidV7(io);
+        const mb_item = tm.MailboxItem{
+            .item_id = mb_item_id,
+            .from_thread_id = sub_tid,
+            .to_thread_id = cap_tid,
+            .task_id = id_mod.newUuidV7(io),
+            .kind = .result,
+            .payload = @constCast("subordinate finished task cleanly"),
+            .created_ms = 5000,
+        };
+        const inbox_push = try sub_cli.pushInbox(cap_mailbox_topic, &mb_item);
+        try testing.expectEqual(@as(usize, 1), inbox_push.frames_pushed);
+
+        var sub_ts = try ts_mod.ThreadStore.open(allocator, io, sub_dir, sub_tid, null);
+        defer sub_ts.deinit();
+        try testing.expectError(error.PermissionDenied, sub_cli.pullInbox(&sub_ts, cap_mailbox_topic));
+        try testing.expectError(error.PermissionDenied, sub_cli.pushThread(&sub_ts, cap_thread_topic, null));
+
+        var cap_ts = try ts_mod.ThreadStore.open(allocator, io, cap_dir, cap_tid, null);
+        defer cap_ts.deinit();
+        const inbox_pull = try cap_cli.pullInbox(&cap_ts, cap_mailbox_topic);
+        try testing.expectEqual(@as(usize, 1), inbox_pull.frames_pulled);
+        const got_mb = cap_ts.mailbox.get(mb_item_id).?;
+        try testing.expectEqual(sub_tid, got_mb.from_thread_id);
+        try testing.expectEqual(cap_tid, got_mb.to_thread_id);
+        try testing.expectEqual(tm.MailboxKind.result, got_mb.kind);
+        try testing.expectEqualStrings("subordinate finished task cleanly", got_mb.payload);
+    }
+
+    {
+        const cat_a_path = try std.fmt.allocPrint(allocator, "{s}/t5_cat_a", .{base_tmp});
+        defer allocator.free(cat_a_path);
+        const cat_b_path = try std.fmt.allocPrint(allocator, "{s}/t5_cat_b", .{base_tmp});
+        defer allocator.free(cat_b_path);
+        try std.Io.Dir.cwd().createDirPath(io, cat_a_path);
+        try std.Io.Dir.cwd().createDirPath(io, cat_b_path);
+        var cat_a_dir = try std.Io.Dir.cwd().openDir(io, cat_a_path, .{ .iterate = true });
+        defer cat_a_dir.close(io);
+        var cat_b_dir = try std.Io.Dir.cwd().openDir(io, cat_b_path, .{ .iterate = true });
+        defer cat_b_dir.close(io);
+
+        const vault_id = id_mod.newUuidV7(io);
+        const cat_topic = client_mod.topicIdFor(.catalog, vault_id);
+        const cat_ek = crypto.EntityKey.generate(io, 1);
+
+        var kr_a = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, 0xFF01);
+        defer kr_a.deinit();
+        try kr_a.setEntityKey(cat_topic, cat_ek);
+        var kr_b = keyring_mod.Keyring.initAccountDevice(allocator, io, root_key, 0xFF02);
+        defer kr_b.deinit();
+        try kr_b.setEntityKey(cat_topic, cat_ek);
+
+        var cli_a = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_a, auth_secret, .workstation);
+        defer cli_a.deinit();
+        var cli_b = try client_mod.SyncClientV3.connect(allocator, io, .{ 127, 0, 0, 1 }, port, &kr_b, auth_secret, .thin_client);
+        defer cli_b.deinit();
+
+        var cat_a = try ts_mod.CatalogStore.open(allocator, io, cat_a_dir);
+        defer cat_a.deinit();
+        var cat_b = try ts_mod.CatalogStore.open(allocator, io, cat_b_dir);
+        defer cat_b.deinit();
+
+        const proj_id = id_mod.newUuidV7(io);
+        const sp_id = id_mod.newUuidV7(io);
+        const th_id = id_mod.newUuidV7(io);
+
+        var sp_ids = [_]u128{sp_id};
+        try testing.expect(try cat_a.putProject(.{
+            .project_id = proj_id,
+            .name = @constCast("Atlas Workspace"),
+            .space_ids = &sp_ids,
+            .default_provider = .claude_code,
+            .updated_ms = 7001,
+            .actor = 0xFF01,
+        }));
+        try testing.expect(try cat_a.putSpace(.{
+            .space_id = sp_id,
+            .name = @constCast("api-repo"),
+            .kind = .git_worktree,
+            .vcs_kind = .git,
+            .remote_url = @constCast("https://example.invalid/api.git"),
+            .updated_ms = 7002,
+            .actor = 0xFF01,
+        }));
+        try testing.expect(try cat_a.putThread(.{
+            .thread_id = th_id,
+            .project_id = proj_id,
+            .root_thread_id = th_id,
+            .title = @constCast("Release Planning"),
+            .provider = .claude_code,
+            .status = .idle,
+            .updated_ms = 7003,
+            .actor = 0xFF01,
+        }));
+
+        const push_cat = try cli_a.pushCatalog(&cat_a, cat_topic);
+        try testing.expectEqual(@as(usize, 3), push_cat.frames_pushed);
+        const push_cat_noop = try cli_a.pushCatalog(&cat_a, cat_topic);
+        try testing.expectEqual(@as(usize, 0), push_cat_noop.frames_pushed);
+
+        const pull_cat = try cli_b.pullCatalog(&cat_b, cat_topic);
+        try testing.expectEqual(@as(usize, 3), pull_cat.frames_pulled);
+
+        const got_proj = cat_b.getProject(proj_id).?;
+        try testing.expectEqualStrings("Atlas Workspace", got_proj.name);
+        try testing.expectEqual(@as(usize, 1), got_proj.space_ids.len);
+        try testing.expectEqual(sp_id, got_proj.space_ids[0]);
+
+        const got_sp = cat_b.getSpace(sp_id).?;
+        try testing.expectEqualStrings("api-repo", got_sp.name);
+        try testing.expectEqual(tm.SpaceKind.git_worktree, got_sp.kind);
+
+        const got_th = cat_b.getThread(th_id).?;
+        try testing.expectEqualStrings("Release Planning", got_th.title);
+        try testing.expectEqual(@as(?u128, proj_id), got_th.project_id);
     }
 }
