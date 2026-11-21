@@ -10,6 +10,7 @@ spawn :: proc(
 	env: []string = nil,
 	new_process_group := false,
 	pipes := ALL_PIPES,
+	pre_exec := Pre_Exec{},
 ) -> (
 	child: Child,
 	err: Error,
@@ -102,7 +103,7 @@ spawn :: proc(
 		return child, _errno()
 	}
 	if pid == 0 {
-		_child_exec(path, cargv, cenv, ccwd, inner, report[1], new_process_group)
+		_child_exec(path, cargv, cenv, ccwd, inner, report[1], new_process_group, pre_exec)
 	}
 
 	if new_process_group {
@@ -155,6 +156,7 @@ _child_exec :: proc "contextless" (
 	inner: [3]posix.FD,
 	report: posix.FD,
 	group: bool,
+	pre_exec: Pre_Exec,
 ) -> ! {
 	if group {
 		posix.setpgid(0, 0)
@@ -177,8 +179,20 @@ _child_exec :: proc "contextless" (
 			_child_fail(report)
 		}
 	}
+	if pre_exec.run != nil {
+		if code := pre_exec.run(pre_exec.data); code != 0 {
+			_child_fail_code(report, code)
+		}
+	}
 	posix.execve(path, argv, envp)
 	_child_fail(report)
+}
+
+@(private)
+_child_fail_code :: proc "contextless" (report: posix.FD, code: i32) -> ! {
+	b := transmute([4]u8)code
+	posix.write(report, &b[0], 4)
+	posix._exit(127)
 }
 
 @(private)

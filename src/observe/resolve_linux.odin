@@ -20,12 +20,17 @@ Ctx :: struct {
 	root:  i32,
 	links: int,
 	nsdiff: int,
+	cwd:   i32,
+	moved: bool,
+	root_borrowed: bool,
+	dev:   u64,
 }
 
 @(private)
 Loc :: struct {
-	dfd:  i32,
-	name: string,
+	dfd:      i32,
+	name:     string,
+	borrowed: bool,
 }
 
 @(private)
@@ -125,7 +130,7 @@ _resolve :: proc(c: ^Ctx, a: Path_Arg, arg: []u8, out: []u8) -> (path: string, e
 		if e != 0 {
 			return "", false, false
 		}
-		dp, dok := _finish(c, Loc{fd, ""}, out)
+		dp, _, dok := _finish(c, Loc{fd, "", false}, out)
 		return dp, false, dok
 	case .Ok:
 	}
@@ -134,27 +139,42 @@ _resolve :: proc(c: ^Ctx, a: Path_Arg, arg: []u8, out: []u8) -> (path: string, e
 	}
 	needs_base := len(p) == 0 || p[0] != '/' || a.resolve & RESOLVE_IN_ROOT != 0
 	base: i32 = -1
+	borrowed := false
 	if needs_base {
-		e: int
-		base, e = _sys_openat(AT_FDCWD, _base(&pp, c.tid, a.dirfd), SYS_O_PATH | SYS_O_CLOEXEC)
-		if e != 0 {
-			return "", false, false
+		if a.dirfd == AT_FDCWD && c.cwd >= 0 {
+			base = c.cwd
+			borrowed = true
+		} else {
+			e: int
+			base, e = _sys_openat(AT_FDCWD, _base(&pp, c.tid, a.dirfd), SYS_O_PATH | SYS_O_CLOEXEC)
+			if e != 0 {
+				return "", false, false
+			}
 		}
 		if len(p) == 0 {
-			fp, fok := _finish(c, Loc{base, ""}, out)
-			return fp, fok, fok
+			return _finish(c, Loc{base, "", borrowed}, out)
 		}
 		if a.resolve & RESOLVE_IN_ROOT != 0 {
 			r, re := _dup_dir(base)
 			if re != 0 {
-				_sys_close(base)
+				if !borrowed {
+					_sys_close(base)
+				}
 				return "", false, false
 			}
+			if !c.root_borrowed {
+				_sys_close(c.root)
+			}
 			c.root = r
+			c.root_borrowed = false
 		}
 	}
 	loc, lok := _locate(c, base, p, a.resolve)
-	_sys_close(base)
+	if lok && loc.dfd == base && base >= 0 {
+		loc.borrowed = borrowed
+	} else if !borrowed {
+		_sys_close(base)
+	}
 	if !lok {
 		return "", false, false
 	}
@@ -164,14 +184,16 @@ _resolve :: proc(c: ^Ctx, a: Path_Arg, arg: []u8, out: []u8) -> (path: string, e
 			return "", false, false
 		}
 	}
-	fp, fok := _finish(c, loc, out)
-	return fp, fok, fok
+	return _finish(c, loc, out)
 }
 
 @(private)
 _locate :: proc(c: ^Ctx, base: i32, p: string, user_resolve: u64) -> (Loc, bool) {
 	dir, name := _split(p)
 	abs := p[0] == '/'
+	if !abs && dir == "." && user_resolve == 0 && base >= 0 {
+		return Loc{base, name, false}, true
+	}
 	from := base
 	if abs {
 		from = _root_fd(c)
@@ -191,7 +213,7 @@ _locate :: proc(c: ^Ctx, base: i32, p: string, user_resolve: u64) -> (Loc, bool)
 		}
 		dfd, e := _sys_openat2(from, cdir, &how)
 		if e == 0 {
-			return Loc{dfd, name}, true
+			return Loc{dfd, name, false}, true
 		}
 		if e != ELOOP || user_resolve & RESOLVE_NO_SYMLINKS != 0 {
 			return {}, false
@@ -201,7 +223,7 @@ _locate :: proc(c: ^Ctx, base: i32, p: string, user_resolve: u64) -> (Loc, bool)
 	if !ok {
 		return {}, false
 	}
-	return Loc{dfd, name}, true
+	return Loc{dfd, name, false}, true
 }
 
 @(private)
@@ -221,7 +243,7 @@ _locate_manual :: proc(c: ^Ctx, from: i32, p: string) -> (Loc, bool) {
 	if !ok {
 		return {}, false
 	}
-	return Loc{dfd, name}, true
+	return Loc{dfd, name, false}, true
 }
 
 @(private)
@@ -309,28 +331,36 @@ _step :: proc(c: ^Ctx, cur: i32, comp: string) -> (i32, bool) {
 		fd, e := _sys_openat(cur, cname, SYS_O_PATH | SYS_O_CLOEXEC | SYS_O_NOFOLLOW)
 		return fd, e == 0
 	}
-	loc, ok := _follow(c, Loc{cur, comp}, false)
+	loc, ok := _follow(c, Loc{cur, comp, true})
 	if !ok {
 		return -1, false
 	}
 	if len(loc.name) == 0 {
+		if loc.borrowed {
+			fd, e := _dup_dir(loc.dfd)
+			return fd, e == 0
+		}
 		return loc.dfd, true
 	}
 	lb: [256]u8
 	lname, lok := _cstr(loc.name, lb[:])
 	if !lok {
-		_sys_close(loc.dfd)
+		if !loc.borrowed {
+			_sys_close(loc.dfd)
+		}
 		return -1, false
 	}
 	fd, e := _sys_openat(loc.dfd, lname, SYS_O_PATH | SYS_O_CLOEXEC | SYS_O_NOFOLLOW)
-	_sys_close(loc.dfd)
+	if !loc.borrowed {
+		_sys_close(loc.dfd)
+	}
 	return fd, e == 0
 }
 
 @(private)
-_follow :: proc(c: ^Ctx, start: Loc, owned := true) -> (Loc, bool) {
+_follow :: proc(c: ^Ctx, start: Loc) -> (Loc, bool) {
 	loc := start
-	own := owned
+	own := !start.borrowed
 	for len(loc.name) > 0 {
 		nb: [256]u8
 		cname, cok := _cstr(loc.name, nb[:])
@@ -356,7 +386,7 @@ _follow :: proc(c: ^Ctx, start: Loc, owned := true) -> (Loc, bool) {
 			if e != 0 {
 				return {}, false
 			}
-			return Loc{fd, ""}, true
+			return Loc{fd, "", false}, true
 		}
 		target := make([]u8, prim.PATH_MAX, context.temp_allocator)
 		n, le := _sys_readlinkat(loc.dfd, cname, target)
@@ -376,18 +406,15 @@ _follow :: proc(c: ^Ctx, start: Loc, owned := true) -> (Loc, bool) {
 		loc = next
 		own = true
 	}
-	if !own {
-		fd, e := _dup_dir(loc.dfd)
-		if e != 0 {
-			return {}, false
-		}
-		loc.dfd = fd
-	}
+	loc.borrowed = !own
 	return loc, true
 }
 
 @(private)
 _is_foreign :: proc(c: ^Ctx) -> bool {
+	if !c.moved {
+		return false
+	}
 	if c.nsdiff != 0 {
 		return c.nsdiff == 2
 	}
@@ -406,24 +433,30 @@ _is_foreign :: proc(c: ^Ctx) -> bool {
 }
 
 @(private)
-_finish :: proc(c: ^Ctx, loc: Loc, out: []u8) -> (string, bool) {
-	defer _sys_close(loc.dfd)
-	dp, ok := _readlink_fd(loc.dfd, out[:prim.PATH_MAX])
-	if !ok || len(dp) == 0 || dp[0] != '/' {
-		return "", false
+_finish :: proc(c: ^Ctx, loc: Loc, out: []u8) -> (path: string, exact: bool, ok: bool) {
+	defer if !loc.borrowed {
+		_sys_close(loc.dfd)
+	}
+	dp, rok := _readlink_fd(loc.dfd, out[:prim.PATH_MAX])
+	if !rok || len(dp) == 0 || dp[0] != '/' {
+		return "", false, false
 	}
 	n := len(dp)
+	exact = true
 	if _is_foreign(c) {
-		mapped, mok := _map_foreign(c.s, loc.dfd, dp)
-		if !mok || len(mapped) > len(out) {
-			return "", false
+		if mapped, mok := _map_foreign(c.s, loc.dfd, dp); mok && len(mapped) <= len(out) {
+			copy(out, mapped)
+			n = len(mapped)
+		} else {
+			exact = false
+			if st, se := _sys_statx(loc.dfd, "", uintptr(AT_EMPTY_PATH)); se == 0 {
+				c.dev = st.dev
+			}
 		}
-		copy(out, mapped)
-		n = len(mapped)
 	}
 	if len(loc.name) > 0 {
 		if n + 1 + len(loc.name) > len(out) {
-			return "", false
+			return "", false, false
 		}
 		if n > 1 {
 			out[n] = '/'
@@ -432,7 +465,7 @@ _finish :: proc(c: ^Ctx, loc: Loc, out: []u8) -> (string, bool) {
 		copy(out[n:], loc.name)
 		n += len(loc.name)
 	}
-	return string(out[:n]), true
+	return string(out[:n]), exact, true
 }
 
 @(private)

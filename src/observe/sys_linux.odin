@@ -184,6 +184,11 @@ _sys_ioctl :: proc "contextless" (fd: i32, cmd: uintptr, arg: rawptr) -> int {
 }
 
 @(private)
+_sys_ioctl_val :: proc "contextless" (fd: i32, cmd: uintptr, arg: uintptr) -> int {
+	return _errno(intrinsics.syscall(linux.SYS_ioctl, uintptr(int(fd)), cmd, arg))
+}
+
+@(private)
 Pollfd :: struct {
 	fd:      i32,
 	events:  i16,

@@ -32,6 +32,7 @@ Write :: struct {
 	from:    string,
 	flags:   u32,
 	exact:   bool,
+	dev:     u64,
 }
 
 Stats :: struct {
@@ -232,6 +233,16 @@ scope_of :: proc(reg: ^fs.Registry, lineage: []prim.Pid) -> ^fs.Scope {
 route :: proc(r: ^Router, w: ^Write, scope: ^fs.Scope) {
 	if r.reg == nil {
 		return
+	}
+	if !w.exact && w.dev != 0 {
+		if _, _, found := router_locate(r, w.path); !found {
+			for root in r.roots {
+				if root.dev == w.dev {
+					fs.mount_mark_rescan(root.mount)
+				}
+			}
+			return
+		}
 	}
 	_route_path(r, w.path, w.exact, scope)
 	if w.op == .Rename || w.op == .Exchange {

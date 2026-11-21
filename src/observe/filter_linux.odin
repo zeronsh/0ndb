@@ -35,6 +35,12 @@ O_TRUNC :: u64(0o1000)
 @(private)
 O_PATH :: u64(0o10000000)
 @(private)
+CLONE_FS :: u32(0x200)
+@(private)
+CLONE_NEWNS :: u32(0x20000)
+@(private)
+CLONE_THREAD :: u32(0x10000)
+@(private)
 O_TMPFILE_BIT :: u64(0o20000000)
 @(private)
 WRITE_MASK :: O_WRONLY | O_RDWR | O_CREAT | O_TRUNC
@@ -66,6 +72,14 @@ Call :: enum u8 {
 	Fchmodat2,
 	Open_By_Handle,
 	Io_Uring_Setup,
+	Chdir,
+	Fchdir,
+	Chroot,
+	Pivot_Root,
+	Setns,
+	Unshare,
+	Clone,
+	Clone3,
 }
 
 Sys :: struct {
@@ -99,6 +113,14 @@ X86_64_CALLS :: [?]Sys {
 	{425, .Io_Uring_Setup},
 	{437, .Openat2},
 	{452, .Fchmodat2},
+	{56, .Clone},
+	{80, .Chdir},
+	{81, .Fchdir},
+	{155, .Pivot_Root},
+	{161, .Chroot},
+	{272, .Unshare},
+	{308, .Setns},
+	{435, .Clone3},
 }
 
 I386_CALLS :: [?]Sys {
@@ -128,6 +150,14 @@ I386_CALLS :: [?]Sys {
 	{425, .Io_Uring_Setup},
 	{437, .Openat2},
 	{452, .Fchmodat2},
+	{12, .Chdir},
+	{61, .Chroot},
+	{120, .Clone},
+	{133, .Fchdir},
+	{217, .Pivot_Root},
+	{310, .Unshare},
+	{346, .Setns},
+	{435, .Clone3},
 }
 
 AARCH64_CALLS :: [?]Sys {
@@ -146,6 +176,14 @@ AARCH64_CALLS :: [?]Sys {
 	{425, .Io_Uring_Setup},
 	{437, .Openat2},
 	{452, .Fchmodat2},
+	{41, .Pivot_Root},
+	{49, .Chdir},
+	{50, .Fchdir},
+	{51, .Chroot},
+	{97, .Unshare},
+	{220, .Clone},
+	{268, .Setns},
+	{435, .Clone3},
 }
 
 ARM_CALLS :: [?]Sys {
@@ -175,6 +213,14 @@ ARM_CALLS :: [?]Sys {
 	{425, .Io_Uring_Setup},
 	{437, .Openat2},
 	{452, .Fchmodat2},
+	{12, .Chdir},
+	{61, .Chroot},
+	{120, .Clone},
+	{133, .Fchdir},
+	{218, .Pivot_Root},
+	{337, .Unshare},
+	{375, .Setns},
+	{435, .Clone3},
 }
 
 when ODIN_ARCH == .amd64 {
@@ -273,6 +319,8 @@ Label :: enum u8 {
 	Chk1,
 	Chk2,
 	Chk_Handle,
+	Chk_Unshare,
+	Chk_Clone,
 	Notify,
 	Allow,
 	Enosys,
@@ -324,6 +372,10 @@ _emit_table :: proc(a: ^Asm, table: []Sys, x32: bool) {
 			target = .Chk_Handle
 		case .Io_Uring_Setup:
 			target = .Enosys
+		case .Unshare:
+			target = .Chk_Unshare
+		case .Clone:
+			target = .Chk_Clone
 		case:
 			target = .Notify
 		}
@@ -355,6 +407,14 @@ build_filter :: proc(allocator := context.allocator) -> (prog: []Insn, ok: bool)
 	_mark(&a, .Chk_Handle)
 	_emit(&a, BPF_LD_W_ABS, _arg_lo(2))
 	_emit(&a, BPF_JSET_K, u32(WRITE_MASK), .Eperm, .Allow)
+	_mark(&a, .Chk_Unshare)
+	_emit(&a, BPF_LD_W_ABS, _arg_lo(0))
+	_emit(&a, BPF_JSET_K, CLONE_NEWNS | CLONE_FS, .Notify, .Allow)
+	_mark(&a, .Chk_Clone)
+	_emit(&a, BPF_LD_W_ABS, _arg_lo(0))
+	_emit(&a, BPF_JSET_K, CLONE_NEWNS, .Notify, .Next)
+	_emit(&a, BPF_AND_K, CLONE_THREAD | CLONE_FS)
+	_emit(&a, BPF_JEQ_K, CLONE_THREAD, .Notify, .Allow)
 	_mark(&a, .Notify)
 	_emit(&a, BPF_RET_K, RET_USER_NOTIF)
 	_mark(&a, .Allow)

@@ -10,6 +10,7 @@ spawn :: proc(
 	env: []string = nil,
 	new_process_group := false,
 	pipes := ALL_PIPES,
+	pre_exec := Pre_Exec{},
 ) -> (
 	child: Child,
 	err: Error,
@@ -98,7 +99,7 @@ spawn :: proc(
 		return child, _error(ferr)
 	}
 	if pid == 0 {
-		_child_exec(path, cargv, cenv, ccwd, inner, report[1], new_process_group)
+		_child_exec(path, cargv, cenv, ccwd, inner, report[1], new_process_group, pre_exec)
 	}
 
 	if new_process_group {
@@ -155,6 +156,7 @@ _child_exec :: proc "contextless" (
 	inner: [3]linux.Fd,
 	report: linux.Fd,
 	group: bool,
+	pre_exec: Pre_Exec,
 ) -> ! {
 	errno: linux.Errno
 	if group {
@@ -178,6 +180,11 @@ _child_exec :: proc "contextless" (
 	if cwd != nil {
 		if cerr := linux.chdir(cwd); cerr != .NONE {
 			_child_fail(report, cerr)
+		}
+	}
+	if pre_exec.run != nil {
+		if code := pre_exec.run(pre_exec.data); code != 0 {
+			_child_fail(report, linux.Errno(code))
 		}
 	}
 	errno = linux.execve(path, argv, envp)

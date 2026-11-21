@@ -3,9 +3,7 @@ package observe
 
 import "base:intrinsics"
 import "base:runtime"
-import "core:strings"
 import "core:sys/linux"
-import "core:sys/posix"
 import "../fs"
 import "../prim"
 
@@ -97,6 +95,7 @@ Tree :: struct {
 	root:     prim.Pid,
 	watch:    prim.Watch,
 	killable: bool,
+	moved:    bool,
 }
 
 @(private)
@@ -126,6 +125,8 @@ Supervisor :: struct {
 	mnt_ns:     [64]u8,
 	mnt_ns_len: int,
 	has_openat2: bool,
+	root_fd:    i32,
+	pc:         Pcache,
 	sc:         ^Scratch,
 	stats:      Stats,
 }
@@ -137,6 +138,7 @@ supervisor_init :: proc(s: ^Supervisor, loop: ^prim.Loop, opts := DEFAULT_SUPERV
 		opts      = opts,
 	}
 	s.keeper.ctl = -1
+	s.root_fd = -1
 	when !NATIVE_SUPPORTED {
 		return .Unsupported
 	}
@@ -190,6 +192,13 @@ supervisor_init :: proc(s: ^Supervisor, loop: ^prim.Loop, opts := DEFAULT_SUPERV
 		_sys_close(fd)
 		s.has_openat2 = true
 	}
+	rfd, re := _sys_openat(AT_FDCWD, "/", SYS_O_PATH | SYS_O_DIRECTORY | SYS_O_CLOEXEC)
+	if re != 0 {
+		supervisor_destroy(s)
+		return .Io
+	}
+	s.root_fd = rfd
+	_pcache_init(s)
 	router_init(&s.router, allocator)
 	s.trees = make([dynamic]^Tree, allocator)
 	return .None
@@ -206,6 +215,8 @@ supervisor_destroy :: proc(s: ^Supervisor) {
 	_keeper_detach(s)
 	delete(s.trees)
 	router_destroy(&s.router)
+	_pcache_destroy(s)
+	_sys_close(s.root_fd)
 	if s.sc != nil {
 		free(s.sc, s.allocator)
 	}
@@ -217,6 +228,7 @@ supervisor_destroy :: proc(s: ^Supervisor) {
 	}
 	s^ = {}
 	s.keeper.ctl = -1
+	s.root_fd = -1
 }
 
 supervisor_set_sink :: proc(s: ^Supervisor, sink: Sink) {
@@ -260,6 +272,24 @@ _yama_scope :: proc() -> int {
 	return int(buf[0] - '0')
 }
 
+Observation :: enum u8 {
+	Observed,
+	Unobserved,
+}
+
+Spawn_Options :: struct {
+	cwd:               string,
+	env:               []string,
+	new_process_group: bool,
+	pipes:             prim.Pipes,
+	observation:       Observation,
+	allow_setuid:      bool,
+}
+
+DEFAULT_SPAWN :: Spawn_Options {
+	pipes = prim.ALL_PIPES,
+}
+
 spawn :: proc(
 	s: ^Supervisor,
 	argv: []string,
@@ -268,200 +298,122 @@ spawn :: proc(
 	new_process_group := false,
 	pipes := prim.ALL_PIPES,
 ) -> (
-	child: prim.Child,
-	err: prim.Error,
+	prim.Child,
+	prim.Error,
 ) {
+	return spawn_with(s, argv, Spawn_Options{cwd = cwd, env = env, new_process_group = new_process_group, pipes = pipes})
+}
+
+@(private)
+Install :: struct {
+	prog:      Fprog,
+	sock:      i32,
+	subreaper: bool,
+	nnp:       bool,
+}
+
+spawn_with :: proc(s: ^Supervisor, argv: []string, opts: Spawn_Options) -> (child: prim.Child, err: prim.Error) {
+	if opts.observation == .Unobserved {
+		return prim.spawn(argv, opts.cwd, opts.env, opts.new_process_group, opts.pipes)
+	}
 	child = {
 		stdin  = prim.INVALID_FD,
 		stdout = prim.INVALID_FD,
 		stderr = prim.INVALID_FD,
-		group  = new_process_group,
 	}
-	if s.prog == nil || s.loop == nil {
+	if s.prog == nil || s.loop == nil || len(argv) == 0 {
 		return child, .Invalid
 	}
-	if len(argv) == 0 {
-		return child, .Invalid
+	nnp := s.opts.no_new_privs && !opts.allow_setuid
+	if !nnp && !has_cap_sys_admin() {
+		return child, .Permission
 	}
 	if s.opts.keeper {
 		_keeper_ensure(s)
 	}
-	ta := context.temp_allocator
-	path := _resolve_exec(argv[0], env, ta) or_return
-	cargv := _cstrings(argv, ta) or_return
-	cenv := posix.environ
-	if env != nil {
-		cenv = _cstrings(env, ta) or_return
-	}
-	ccwd: cstring
-	if len(cwd) > 0 {
-		c, aerr := strings.clone_to_cstring(cwd, ta)
-		if aerr != nil {
-			return child, .No_Memory
-		}
-		ccwd = c
-	}
 	slot := _slot_alloc(s) or_return
-
-	inner := [3]linux.Fd{-1, -1, -1}
-	outer := [3]linux.Fd{-1, -1, -1}
-	report := [2]linux.Fd{-1, -1}
-	sock := [2]linux.Fd{-1, -1}
-	null_fd: linux.Fd = -1
-	listener: i32 = -1
-	defer {
-		for fd in inner {
-			if fd >= 0 && fd != null_fd {
-				linux.close(fd)
-			}
-		}
-		if null_fd >= 0 {
-			linux.close(null_fd)
-		}
-		for fd in report {
-			if fd >= 0 {
-				linux.close(fd)
-			}
-		}
-		for fd in sock {
-			if fd >= 0 {
-				linux.close(fd)
-			}
-		}
-		if err != .None {
-			for fd in outer {
-				if fd >= 0 {
-					linux.close(fd)
-				}
-			}
-			_sys_close(listener)
-		}
-	}
-
-	for i in 0 ..< 3 {
-		if prim.Pipe(i) in pipes {
-			p: [2]linux.Fd
-			if errno := linux.pipe2(&p, {.CLOEXEC}); errno != .NONE {
-				return child, _map_errno(errno)
-			}
-			if i == 0 {
-				inner[i], outer[i] = p[0], p[1]
-			} else {
-				inner[i], outer[i] = p[1], p[0]
-			}
-		} else {
-			if null_fd < 0 {
-				fd, errno := linux.open("/dev/null", {.RDWR, .CLOEXEC})
-				if errno != .NONE {
-					return child, _map_errno(errno)
-				}
-				null_fd = fd
-			}
-			inner[i] = null_fd
-		}
-	}
-	if errno := linux.pipe2(&report, {.CLOEXEC}); errno != .NONE {
-		return child, _map_errno(errno)
-	}
+	sock: [2]i32 = {-1, -1}
 	if e := _errno(intrinsics.syscall(linux.SYS_socketpair, 1, uintptr(5) | uintptr(0o2000000), 0, uintptr(&sock))); e != 0 {
 		return child, _map_errno(linux.Errno(e))
 	}
-	fprog := Fprog{u16(len(s.prog)), raw_data(s.prog)}
-	cfg := Child_Config {
-		path      = path,
-		argv      = cargv,
-		envp      = cenv,
-		cwd       = ccwd,
-		inner     = inner,
-		report    = report[1],
+	install := Install {
+		prog      = Fprog{u16(len(s.prog)), raw_data(s.prog)},
 		sock      = sock[1],
-		group     = new_process_group,
-		prog      = &fprog,
 		subreaper = s.subreaper,
-		nnp       = s.opts.no_new_privs,
+		nnp       = nnp,
 	}
-
-	pid, ferr := linux.fork()
-	if ferr != .NONE {
-		return child, _map_errno(ferr)
-	}
-	if pid == 0 {
-		_observed_child(&cfg)
-	}
-	if new_process_group {
-		linux.setpgid(pid, pid)
-	}
-	linux.close(report[1])
-	report[1] = -1
-	linux.close(sock[1])
-	sock[1] = -1
-	killable: bool
-	listener, killable = _recv_listener(i32(sock[0]))
-
-	code: i32
-	got := 0
-	for got < 4 {
-		b := ([^]u8)(&code)[got:4]
-		n, errno := linux.read(report[0], b)
-		if errno == .EINTR {
-			continue
-		}
-		if errno != .NONE || n == 0 {
-			break
-		}
-		got += n
-	}
-	if got == 4 || listener < 0 {
-		st: u32
-		for {
-			_, werr := linux.wait4(pid, &st, {}, nil)
-			if werr != .EINTR {
-				break
-			}
-		}
-		err = _map_errno(linux.Errno(code)) if got == 4 else .Io
-		if err == .None {
-			err = .Io
-		}
+	child, err = prim.spawn(argv, opts.cwd, opts.env, opts.new_process_group, opts.pipes, prim.Pre_Exec{&install, _install})
+	_sys_close(sock[1])
+	if err != .None {
+		_sys_close(sock[0])
 		return child, err
 	}
-
+	listener, killable := _recv_listener(sock[0])
+	_sys_close(sock[0])
+	if listener < 0 {
+		prim.kill_process(child.pid, .Kill)
+		prim.reap(child.pid, true)
+		prim.child_close(&child)
+		return child, .Io
+	}
 	t, terr := new(Tree, s.allocator)
 	if terr != nil {
-		linux.kill(pid, .SIGKILL)
+		_sys_close(listener)
+		prim.kill_process(child.pid, .Kill)
+		prim.reap(child.pid, true)
+		prim.child_close(&child)
 		return child, .No_Memory
 	}
 	t^ = {
 		sup      = s,
 		slot     = slot,
 		fd       = listener,
-		root     = prim.Pid(pid),
+		root     = child.pid,
 		killable = killable,
 	}
+	_sys_ioctl_val(listener, NOTIF_SET_FLAGS, uintptr(NOTIF_FD_SYNC_WAKE_UP))
 	w, werr := prim.watch(s.loop, prim.Fd(listener), {.Read}, t, _on_listener)
 	if werr != .None {
 		free(t, s.allocator)
-		linux.kill(pid, .SIGKILL)
+		_sys_close(listener)
+		prim.kill_process(child.pid, .Kill)
+		prim.reap(child.pid, true)
+		prim.child_close(&child)
 		return child, werr
 	}
-	sync_flag := u64(NOTIF_FD_SYNC_WAKE_UP)
-	_sys_ioctl(listener, NOTIF_SET_FLAGS, &sync_flag)
 	t.watch = w
 	s.trees[slot] = t
 	s.live += 1
-	listener = -1
 	_keeper_add(s, t)
+	return child, .None
+}
 
-	for fd in outer {
-		if fd >= 0 {
-			prim.set_nonblocking(prim.Fd(fd))
+@(private)
+_install :: proc "contextless" (data: rawptr) -> i32 {
+	c := (^Install)(data)
+	if c.subreaper {
+		intrinsics.syscall(linux.SYS_prctl, PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+	}
+	if c.nnp {
+		if e := _errno(intrinsics.syscall(linux.SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)); e != 0 {
+			return i32(e)
 		}
 	}
-	child.pid = prim.Pid(pid)
-	child.stdin = prim.Fd(outer[0])
-	child.stdout = prim.Fd(outer[1])
-	child.stderr = prim.Fd(outer[2])
-	return child, .None
+	killable := u8(1)
+	r := intrinsics.syscall(linux.SYS_seccomp, SECCOMP_SET_MODE_FILTER, FILTER_FLAG_NEW_LISTENER | FILTER_FLAG_WAIT_KILLABLE_RECV, uintptr(&c.prog))
+	if _errno(r) == EINVAL {
+		killable = 0
+		r = intrinsics.syscall(linux.SYS_seccomp, SECCOMP_SET_MODE_FILTER, FILTER_FLAG_NEW_LISTENER, uintptr(&c.prog))
+	}
+	if e := _errno(r); e != 0 {
+		return i32(e)
+	}
+	listener := i32(int(r))
+	payload := [4]u8{killable, 0, 0, 0}
+	e := _send_fd(c.sock, listener, payload[:])
+	_sys_close(listener)
+	_sys_close(c.sock)
+	return i32(e)
 }
 
 @(private)
@@ -528,21 +480,6 @@ _map_errno :: proc "contextless" (e: linux.Errno) -> prim.Error {
 		return .No_Memory
 	}
 	return .Io
-}
-
-@(private)
-Child_Config :: struct {
-	path:      cstring,
-	argv:      [^]cstring,
-	envp:      [^]cstring,
-	cwd:       cstring,
-	inner:     [3]linux.Fd,
-	report:    linux.Fd,
-	sock:      linux.Fd,
-	group:     bool,
-	prog:      ^Fprog,
-	subreaper: bool,
-	nnp:       bool,
 }
 
 @(private)
@@ -641,136 +578,6 @@ _recv_listener :: proc(sock: i32) -> (fd: i32, killable: bool) {
 }
 
 @(private)
-_observed_child :: proc "contextless" (c: ^Child_Config) -> ! {
-	errno: linux.Errno
-	if c.group {
-		linux.setpgid(0, 0)
-	}
-	act: linux.Sig_Action
-	act.special = .SIG_DFL
-	linux.rt_sigaction(.SIGPIPE, &act, nil)
-	moved: [3]linux.Fd
-	for i in 0 ..< 3 {
-		moved[i], errno = linux.fcntl(c.inner[i], linux.F_DUPFD_CLOEXEC, 3)
-		if errno != .NONE {
-			_child_fail(c.report, errno)
-		}
-	}
-	for i in 0 ..< 3 {
-		if _, derr := linux.dup2(moved[i], linux.Fd(i)); derr != .NONE {
-			_child_fail(c.report, derr)
-		}
-	}
-	if c.cwd != nil {
-		if cerr := linux.chdir(c.cwd); cerr != .NONE {
-			_child_fail(c.report, cerr)
-		}
-	}
-	if c.subreaper {
-		intrinsics.syscall(linux.SYS_prctl, PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
-	}
-	if c.nnp {
-		r := intrinsics.syscall(linux.SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
-		if e := _errno(r); e != 0 {
-			_child_fail(c.report, linux.Errno(e))
-		}
-	}
-	killable := u8(1)
-	r := intrinsics.syscall(linux.SYS_seccomp, SECCOMP_SET_MODE_FILTER, FILTER_FLAG_NEW_LISTENER | FILTER_FLAG_WAIT_KILLABLE_RECV, uintptr(c.prog))
-	if _errno(r) == EINVAL {
-		killable = 0
-		r = intrinsics.syscall(linux.SYS_seccomp, SECCOMP_SET_MODE_FILTER, FILTER_FLAG_NEW_LISTENER, uintptr(c.prog))
-	}
-	if e := _errno(r); e != 0 {
-		_child_fail(c.report, linux.Errno(e))
-	}
-	listener := i32(int(r))
-	payload := [4]u8{killable, 0, 0, 0}
-	if e := _send_fd(i32(c.sock), listener, payload[:]); e != 0 {
-		_child_fail(c.report, linux.Errno(e))
-	}
-	_sys_close(listener)
-	_sys_close(i32(c.sock))
-	errno = linux.execve(c.path, c.argv, c.envp)
-	_child_fail(c.report, errno)
-}
-
-@(private)
-_child_fail :: proc "contextless" (report: linux.Fd, errno: linux.Errno) -> ! {
-	code := i32(errno)
-	b := transmute([4]u8)code
-	linux.write(report, b[:])
-	linux.exit_group(127)
-}
-
-@(private)
-_resolve_exec :: proc(name: string, env: []string, allocator: runtime.Allocator) -> (cstring, prim.Error) {
-	if len(name) == 0 {
-		return nil, .Not_Found
-	}
-	if strings.contains_rune(name, '/') {
-		p, err := strings.clone_to_cstring(name, allocator)
-		if err != nil {
-			return nil, .No_Memory
-		}
-		return p, .None
-	}
-	search := "/usr/local/bin:/usr/bin:/bin"
-	found := false
-	for kv in env {
-		if strings.has_prefix(kv, "PATH=") {
-			search = kv[5:]
-			found = true
-		}
-	}
-	if !found && env == nil {
-		if v, ok := prim.getenv("PATH"); ok {
-			search = v
-		}
-	}
-	rest := search
-	for dir in strings.split_iterator(&rest, ":") {
-		d := dir if len(dir) > 0 else "."
-		full, err := strings.concatenate({d, "/", name}, allocator)
-		if err != nil {
-			return nil, .No_Memory
-		}
-		c, cerr := strings.clone_to_cstring(full, allocator)
-		if cerr != nil {
-			return nil, .No_Memory
-		}
-		st: linux.Stat
-		if linux.stat(c, &st) != .NONE {
-			continue
-		}
-		if transmute(u32)st.mode & 0o170000 != 0o100000 {
-			continue
-		}
-		if linux.access(c, linux.X_OK) == .NONE {
-			return c, .None
-		}
-	}
-	return nil, .Not_Found
-}
-
-@(private)
-_cstrings :: proc(list: []string, allocator: runtime.Allocator) -> ([^]cstring, prim.Error) {
-	out, err := make([]cstring, len(list) + 1, allocator)
-	if err != nil {
-		return nil, .No_Memory
-	}
-	for s, i in list {
-		c, cerr := strings.clone_to_cstring(s, allocator)
-		if cerr != nil {
-			return nil, .No_Memory
-		}
-		out[i] = c
-	}
-	out[len(list)] = nil
-	return raw_data(out), .None
-}
-
-@(private)
 _on_listener :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
 	t := (^Tree)(data)
 	s := t.sup
@@ -833,6 +640,20 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) {
 		_reply(s, t, n.id)
 		return
 	}
+	tid := i32(n.pid)
+	tgid, gok := _tgid_of(s, tid)
+	if !gok {
+		s.stats.failed += 1
+		_reply(s, t, n.id)
+		return
+	}
+	call := decode_call(n.data.arch, n.data.nr)
+	if call >= .Chdir {
+		_control(s, t, n, call, tid, tgid)
+		s.stats.ignored += 1
+		_reply(s, t, n.id)
+		return
+	}
 	w: Write
 	d: Decoded
 	if !_decode(s, t, n, &w, &d) {
@@ -840,16 +661,34 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) {
 		_reply(s, t, n.id)
 		return
 	}
-	tid := i32(n.pid)
-	w.lineage = _lineage(s, tid, t.root)
-	w.pid = w.lineage[0]
+	lineage, pe := _pcache_lineage(s, tgid, t.root)
+	w.lineage = lineage
+	w.pid = tgid
 	w.tid = prim.Pid(tid)
 	w.tree = t.root
 	ctx := Ctx {
-		s    = s,
-		tid  = tid,
-		tgid = i32(w.pid),
-		root = -1,
+		s       = s,
+		tid     = tid,
+		tgid    = i32(tgid),
+		root    = -1,
+		cwd     = -1,
+		moved   = t.moved,
+	}
+	if pe != nil {
+		if pe.chdir_tid == tid {
+			pe.chdir_tid = 0
+		}
+		if !pe.nocwd && pe.chdir_tid == 0 {
+			if pe.cwd < 0 {
+				pp: Proc_Path
+				pe.cwd, _ = _sys_openat(AT_FDCWD, _pp_proc(&pp, i64(tid), "/cwd"), SYS_O_PATH | SYS_O_DIRECTORY | SYS_O_CLOEXEC)
+			}
+			ctx.cwd = pe.cwd
+		}
+	}
+	if !t.moved {
+		ctx.root = s.root_fd
+		ctx.root_borrowed = true
 	}
 	p, exact, ok := _resolve(&ctx, d.one, s.sc.arg[:], s.sc.out[:])
 	if ok && d.has_two {
@@ -858,7 +697,9 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) {
 		exact = exact && exact2
 		ok = ok2
 	}
-	_sys_close(ctx.root)
+	if !ctx.root_borrowed {
+		_sys_close(ctx.root)
+	}
 	if !ok {
 		s.stats.failed += 1
 		_reply(s, t, n.id)
@@ -866,6 +707,7 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) {
 	}
 	w.path = p
 	w.exact = exact
+	w.dev = ctx.dev
 	if !_id_valid(t, n.id) {
 		s.stats.stale += 1
 		intrinsics.volatile_store(&sh.state, 0)
@@ -889,54 +731,6 @@ _id_valid :: proc(t: ^Tree, id: u64) -> bool {
 		}
 		return e == 0
 	}
-}
-
-@(private)
-_lineage :: proc(s: ^Supervisor, tid: i32, root: prim.Pid) -> []prim.Pid {
-	l := s.sc.lineage[:]
-	n := 0
-	if prim.Pid(tid) == root {
-		l[0] = root
-		return l[:1]
-	}
-	tgid: prim.Pid
-	ppid: prim.Pid
-	ok: bool
-	if _errno(intrinsics.syscall(linux.SYS_tgkill, uintptr(int(tid)), uintptr(int(tid)), 0)) != 3 {
-		tgid = prim.Pid(tid)
-		ppid, ok = _stat_ppid(tgid, s.sc.file[:])
-	} else {
-		tgid, ppid, ok = _status_ids(tid, s.sc.file[:])
-	}
-	if !ok {
-		l[0] = root
-		return l[:1]
-	}
-	l[0] = tgid
-	n = 1
-	cur := tgid
-	next := ppid
-	for cur != root && n < len(l) - 1 {
-		if next <= 1 || next == s.self {
-			break
-		}
-		l[n] = next
-		n += 1
-		cur = next
-		if cur == root {
-			break
-		}
-		p, pok := _stat_ppid(cur, s.sc.file[:])
-		if !pok {
-			break
-		}
-		next = p
-	}
-	if l[n - 1] != root {
-		l[n] = root
-		n += 1
-	}
-	return l[:n]
 }
 
 @(private)
@@ -1183,4 +977,59 @@ _read_proc_mem :: proc(tid: i32, addr: u64, buf: []u8) -> (int, int) {
 		}
 	}
 	return total, 0
+}
+
+@(private)
+_control :: proc(s: ^Supervisor, t: ^Tree, n: ^Notif, call: Call, tid: i32, tgid: prim.Pid) {
+	pe := _pentry(s, tgid, t.root, 0)
+	if pe != nil && pe.chdir_tid == tid {
+		pe.chdir_tid = 0
+	}
+	flags := u64(n.data.args[0])
+	#partial switch call {
+	case .Chdir, .Fchdir:
+		if pe != nil {
+			_sys_close(pe.cwd)
+			pe.cwd = -1
+			pe.chdir_tid = tid
+		}
+	case .Chroot, .Setns:
+		t.moved = true
+		if pe != nil {
+			_sys_close(pe.cwd)
+			pe.cwd = -1
+			pe.chdir_tid = tid
+		}
+	case .Pivot_Root:
+		t.moved = true
+		_pcache_drop_cwds(s)
+		if pe != nil {
+			pe.chdir_tid = tid
+		}
+	case .Clone3:
+		if n.data.args[1] < 8 {
+			return
+		}
+		f: u64
+		if !_read_mem(tid, n.data.args[0], ([^]u8)(&f)[:8]) {
+			t.moved = true
+			if pe != nil {
+				pe.nocwd = true
+			}
+			return
+		}
+		flags = f
+		fallthrough
+	case .Unshare, .Clone:
+		if flags & u64(CLONE_NEWNS) != 0 {
+			t.moved = true
+		}
+		thread_no_fs := call != .Unshare && flags & u64(CLONE_THREAD | CLONE_FS) == u64(CLONE_THREAD)
+		unshare_fs := call == .Unshare && flags & u64(CLONE_FS) != 0
+		if (thread_no_fs || unshare_fs) && pe != nil {
+			_sys_close(pe.cwd)
+			pe.cwd = -1
+			pe.nocwd = true
+		}
+	}
 }

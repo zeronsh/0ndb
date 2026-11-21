@@ -21,6 +21,11 @@ Signal :: enum i32 {
 	Terminate = 15,
 }
 
+Pre_Exec :: struct {
+	data: rawptr,
+	run:  proc "contextless" (data: rawptr) -> i32,
+}
+
 Child :: struct {
 	pid:    Pid,
 	stdin:  Fd,
