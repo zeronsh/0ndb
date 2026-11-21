@@ -20,6 +20,22 @@
   its own host: `src/zstd/build.sh` (linux_amd64, darwin_arm64) and
   `src/zstd/build.bat` from a VS x64 prompt (windows_amd64).
 
+## Cloud machines
+
+- Fresh cloud machines need Odin `dev-2026-11`:
+  `gh release download dev-2026-11 -R odin-lang/Odin -p odin-linux-amd64-dev-2026-11.tar.gz`,
+  verify its sha256, extract to `~/.local/odin` with `--strip-components=1`,
+  and put it on `PATH`.
+- Set `git config user.name wingleeio` and
+  `git config user.email 44917547+wingleeio@users.noreply.github.com` before
+  the first commit.
+- Odin on the test machines is not on the Zeron shell's `PATH`: on `WING-PC`
+  use `C:\Users\wing_\dev-tools\odin\dist\odin.exe`, on `home-laptop`
+  `~/.local/bin/odin`. Work only in `~/dev/0ndb-odin` and `~/dev/0ndb-scratch`
+  (`C:\Users\wing_\dev\...` on Windows); `home-laptop` has little free disk.
+- Work lands as small PRs into `odin-rewrite`; the coordinator verifies and
+  merges them.
+
 ## Rules
 
 - No code comments.
