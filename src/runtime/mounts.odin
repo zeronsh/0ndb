@@ -142,29 +142,10 @@ Fence_Ctx :: struct {
 	next: Fence_Next,
 }
 
-OBSERVE_SETTLE_MS :: 5
-
 worktree_fence :: proc(ws: ^Worktree, arg: int, next: Fence_Next) {
 	r := ws.r
 	ctx := new(Fence_Ctx, r.allocator)
 	ctx^ = {r = r, o = ws.o, arg = arg, next = next, left = 1}
-	if reg, rerr := eng.registry(r.e); rerr == .None && fs.observer_installed(reg) {
-		prim.timer(eng.loop(r.e), OBSERVE_SETTLE_MS, ctx, _fence_settled)
-		return
-	}
-	_fence_issue(ctx)
-}
-
-@(private)
-_fence_settled :: proc(l: ^prim.Loop, data: rawptr) {
-	ctx := (^Fence_Ctx)(data)
-	run := run_find(ctx.r, ctx.o)
-	if run == nil || run.ws == nil {
-		r, o, arg, next := ctx.r, ctx.o, ctx.arg, ctx.next
-		free(ctx, r.allocator)
-		next(r, o, arg, .Closed)
-		return
-	}
 	_fence_issue(ctx)
 }
 
