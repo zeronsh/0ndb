@@ -54,9 +54,12 @@ Obj_Job :: struct {
 }
 
 Objects :: struct {
-	jobs:   [dynamic]^Obj_Job,
-	keys:   map[Object_Key]Part_Ref,
-	active: ^Obj_Job,
+	jobs:    [dynamic]^Obj_Job,
+	owners:  map[Object_Key]^Obj_Job,
+	puts:    map[Object_Key]Part_Ref,
+	gets:    map[Object_Key]Part_Ref,
+	forgets: map[Object_Key]Part_Ref,
+	active:  ^Obj_Job,
 	rx:     ^Obj_Job,
 	rx_part: i64,
 	flying: int,
@@ -197,6 +200,9 @@ _obj_add :: proc(r: ^Replicator, j: ^Obj_Job) -> Error {
 		_obj_free(r, j)
 		return .No_Memory
 	}
+	if j.key not_in r.objs.owners {
+		r.objs.owners[j.key] = j
+	}
 	_repl_pump(r)
 	return .None
 }
@@ -204,7 +210,10 @@ _obj_add :: proc(r: ^Replicator, j: ^Obj_Job) -> Error {
 @(private)
 _objs_init :: proc(r: ^Replicator) {
 	r.objs.jobs = make([dynamic]^Obj_Job, r.allocator)
-	r.objs.keys = make(map[Object_Key]Part_Ref, r.allocator)
+	r.objs.owners = make(map[Object_Key]^Obj_Job, r.allocator)
+	r.objs.puts = make(map[Object_Key]Part_Ref, r.allocator)
+	r.objs.gets = make(map[Object_Key]Part_Ref, r.allocator)
+	r.objs.forgets = make(map[Object_Key]Part_Ref, r.allocator)
 }
 
 @(private)
@@ -213,7 +222,10 @@ _objs_destroy :: proc(r: ^Replicator) {
 		_obj_free(r, j)
 	}
 	delete(r.objs.jobs)
-	delete(r.objs.keys)
+	delete(r.objs.owners)
+	delete(r.objs.puts)
+	delete(r.objs.gets)
+	delete(r.objs.forgets)
 	r.objs = {}
 }
 
@@ -251,15 +263,9 @@ _obj_free :: proc(r: ^Replicator, j: ^Obj_Job) {
 
 @(private)
 _obj_finish :: proc(r: ^Replicator, j: ^Obj_Job, kind: Repl_Event_Kind, err: Error, path: string = "") {
-	gone := make([dynamic]Object_Key, context.temp_allocator)
-	for k, ref in r.objs.keys {
-		if ref.job == j {
-			append(&gone, k)
-		}
-	}
-	for k in gone {
-		delete_key(&r.objs.keys, k)
-	}
+	_obj_unmap(&r.objs.puts, j)
+	_obj_unmap(&r.objs.gets, j)
+	_obj_unmap(&r.objs.forgets, j)
 	r.objs.flying -= len(j.flying)
 	if r.objs.active == j {
 		r.objs.active = nil
@@ -274,11 +280,38 @@ _obj_finish :: proc(r: ^Replicator, j: ^Obj_Job, kind: Repl_Event_Kind, err: Err
 		}
 	}
 	key := j.key
+	if r.objs.owners[key] == j {
+		delete_key(&r.objs.owners, key)
+		for c in r.objs.jobs {
+			if c.key == key {
+				r.objs.owners[key] = c
+				break
+			}
+		}
+	}
 	_emit(r, Repl_Event{kind = kind, err = err, oid = j.oid[:j.oid_len], path = path})
 	if kind == .Object_Fetched || kind == .Object_Missing || kind == .Object_Failed {
 		_fetch_object_done(r, key, kind, err, path)
 	}
 	_obj_free(r, j)
+}
+
+@(private)
+_obj_unmap :: proc(m: ^map[Object_Key]Part_Ref, j: ^Obj_Job) {
+	gone := make([dynamic]Object_Key, context.temp_allocator)
+	for k, ref in m {
+		if ref.job == j {
+			append(&gone, k)
+		}
+	}
+	for k in gone {
+		delete_key(m, k)
+	}
+}
+
+@(private)
+_obj_owns :: proc(r: ^Replicator, j: ^Obj_Job) -> bool {
+	return r.objs.owners[j.key] == j
 }
 
 @(private)
@@ -370,6 +403,9 @@ _objs_pump :: proc(r: ^Replicator) {
 	_objs_fill(r)
 	gets := make([dynamic]Object_Key, context.temp_allocator)
 	for j in r.objs.jobs {
+		if !_obj_owns(r, j) {
+			continue
+		}
 		switch j.op {
 		case .Put:
 		case .Get, .Shred:
@@ -381,11 +417,11 @@ _objs_pump :: proc(r: ^Replicator) {
 			if !j.sent {
 				j.sent = true
 				append(&gets, j.key)
-				r.objs.keys[j.key] = Part_Ref{j, -1}
+				r.objs.gets[j.key] = Part_Ref{j, -1}
 			}
 			for j.op == .Get && j.chunked && j.req_next < j.parts && j.req_out < OBJECT_WINDOW {
 				k := _part_key(j.key, j.req_next)
-				r.objs.keys[k] = Part_Ref{j, j.req_next}
+				r.objs.gets[k] = Part_Ref{j, j.req_next}
 				append(&gets, k)
 				j.req_next += 1
 				j.req_out += 1
@@ -406,7 +442,7 @@ _objs_fill :: proc(r: ^Replicator) {
 				return
 			}
 			for c in r.objs.jobs {
-				if c.op != .Put {
+				if c.op != .Put || !_obj_owns(r, c) {
 					continue
 				}
 				for c.next < c.parts && c.next >= -1 && _bit(c.acked[:], c.next) {
@@ -445,7 +481,7 @@ _objs_fill :: proc(r: ^Replicator) {
 				j.next -= 1
 				return
 			}
-			r.objs.keys[pk] = Part_Ref{j, part}
+			r.objs.puts[pk] = Part_Ref{j, part}
 			append(&j.flying, part)
 			r.objs.flying += 1
 			r.objs.active = j
@@ -489,11 +525,11 @@ _objs_fill :: proc(r: ^Replicator) {
 
 @(private)
 _objs_on_stored :: proc(r: ^Replicator, key: Object_Key) {
-	ref, ok := r.objs.keys[key]
+	ref, ok := r.objs.puts[key]
 	if !ok {
 		return
 	}
-	delete_key(&r.objs.keys, key)
+	delete_key(&r.objs.puts, key)
 	j := ref.job
 	for i := 0; i < len(j.flying); i += 1 {
 		if j.flying[i] == ref.part {
@@ -513,7 +549,13 @@ _objs_on_stored :: proc(r: ^Replicator, key: Object_Key) {
 
 @(private)
 _objs_on_refused :: proc(r: ^Replicator, key: Object_Key, code: Code) -> bool {
-	ref, ok := r.objs.keys[key]
+	ref, ok := r.objs.puts[key]
+	if !ok {
+		ref, ok = r.objs.gets[key]
+	}
+	if !ok {
+		ref, ok = r.objs.forgets[key]
+	}
 	if !ok {
 		return false
 	}
@@ -523,12 +565,12 @@ _objs_on_refused :: proc(r: ^Replicator, key: Object_Key, code: Code) -> bool {
 
 @(private)
 _objs_on_missing :: proc(r: ^Replicator, key: Object_Key) {
-	ref, ok := r.objs.keys[key]
+	ref, ok := r.objs.gets[key]
 	if !ok {
 		return
 	}
 	j := ref.job
-	delete_key(&r.objs.keys, key)
+	delete_key(&r.objs.gets, key)
 	if j.op == .Shred {
 		_shred_forget(r, j)
 		return
@@ -538,11 +580,11 @@ _objs_on_missing :: proc(r: ^Replicator, key: Object_Key) {
 
 @(private)
 _objs_on_forgotten :: proc(r: ^Replicator, key: Object_Key) {
-	ref, ok := r.objs.keys[key]
+	ref, ok := r.objs.forgets[key]
 	if !ok {
 		return
 	}
-	delete_key(&r.objs.keys, key)
+	delete_key(&r.objs.forgets, key)
 	j := ref.job
 	j.forgets -= 1
 	if j.forgets == 0 {
@@ -558,7 +600,7 @@ _shred_forget :: proc(r: ^Replicator, j: ^Obj_Job) {
 		append(&keys, _part_key(j.key, i))
 	}
 	for k in keys {
-		r.objs.keys[k] = Part_Ref{j, -2}
+		r.objs.forgets[k] = Part_Ref{j, -2}
 	}
 	j.forgets = len(keys)
 	crypto.zero_explicit(&j.ckey, size_of(j.ckey))
@@ -569,11 +611,11 @@ _shred_forget :: proc(r: ^Replicator, j: ^Obj_Job) {
 _objs_on_object :: proc(r: ^Replicator, ev: ^Event) {
 	if ev.first {
 		r.objs.rx = nil
-		ref, ok := r.objs.keys[Object_Key(ev.id)]
-		if !ok || ref.part < -1 {
+		ref, ok := r.objs.gets[Object_Key(ev.id)]
+		if !ok {
 			return
 		}
-		delete_key(&r.objs.keys, Object_Key(ev.id))
+		delete_key(&r.objs.gets, Object_Key(ev.id))
 		j := ref.job
 		r.objs.rx = j
 		r.objs.rx_part = ref.part
@@ -762,7 +804,9 @@ _objs_reset :: proc(r: ^Replicator) {
 	}
 	r.objs.active = nil
 	r.objs.rx = nil
-	clear(&r.objs.keys)
+	clear(&r.objs.puts)
+	clear(&r.objs.gets)
+	clear(&r.objs.forgets)
 	r.objs.flying = 0
 	for j in r.objs.jobs {
 		switch j.op {
