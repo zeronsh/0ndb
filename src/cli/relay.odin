@@ -7,6 +7,8 @@ import "core:sys/posix"
 import "../capi/api"
 import eng "../engine"
 import "../fs"
+import "../fstree"
+import "../odb"
 import "../prim"
 import osync "../sync"
 
@@ -87,7 +89,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	eng.cap_authorizer_init(&m.ca, osync.space_authorizer(&m.sa), quota)
 	cfg := osync.relay_config(dir)
 	cfg.pack = true
-	cfg.kernel_tls = true
+	cfg.kernel_tls = ODIN_OS == .Linux
 	cfg.open = flag_bool(a, "open")
 	cfg.default_quota = quota
 	cfg.authorizer = eng.cap_authorizer(&m.ca)
@@ -155,6 +157,46 @@ cmd_relay :: proc(a: ^Args) -> int {
 	return 0
 }
 
+Verify_Node :: enum u8 {
+	Text,
+	Symlink,
+	Opaque,
+}
+
+verify_node :: proc(c: ^api.Call, m: ^api.Mounted, rel, disk: string, st: prim.Stat) -> (kind: Verify_Node, ok: bool) {
+	hist, herr := eng.tree_history(c.api.e, m.object)
+	if herr != .None {
+		return .Text, false
+	}
+	defer eng.tree_release(c.api.e, m.object)
+	snap := fstree.current(&hist.tree)
+	id, found, ferr := fstree.lookup(&snap, rel)
+	if ferr != nil || !found {
+		return .Text, false
+	}
+	info, iok, ierr := fstree.info(&snap, id, context.temp_allocator)
+	if ierr != nil || !iok {
+		return .Text, false
+	}
+	if info.kind == .Symlink {
+		if st.kind != .Symlink {
+			return .Symlink, false
+		}
+		lbuf: [prim.PATH_MAX]u8
+		n, lerr := prim.readlink(prim.os_vfs(), disk, lbuf[:])
+		return .Symlink, lerr == .None && info.target == string(lbuf[:n])
+	}
+	if .Opaque not_in info.flags {
+		return .Text, true
+	}
+	reg, has, berr := fs.history_blob(hist, id)
+	if berr != .None || !has || st.kind != .File {
+		return .Opaque, false
+	}
+	oid, oerr := odb.hash_file(prim.os_vfs(), disk)
+	return .Opaque, oerr == .None && oid == odb.Oid(reg.oid)
+}
+
 op_verify :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	root := trim_slash(api.a_str(c, "root"))
 	m: ^api.Mounted
@@ -193,6 +235,14 @@ op_verify :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 				continue
 			}
 			files^ += 1
+			if serr == .None {
+				if kind, same := verify_node(c, m, p, disk, st); kind != .Text {
+					if !same {
+						append(bad, p)
+					}
+					continue
+				}
+			}
 			got, derr := prim.read_file(prim.os_vfs(), disk, context.temp_allocator)
 			if derr != .None || string(got) != string(want) {
 				append(bad, p)

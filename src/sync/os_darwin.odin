@@ -14,6 +14,8 @@ foreign libc {
 	_c_getsockopt :: proc(fd: posix.FD, level: c.int, name: c.int, val: rawptr, len: ^u32) -> c.int ---
 	@(link_name = "getpeereid")
 	_c_getpeereid :: proc(fd: posix.FD, uid: ^u32, gid: ^u32) -> c.int ---
+	@(link_name = "sendfile")
+	_c_sendfile_raw :: proc(fd: posix.FD, s: posix.FD, offset: posix.off_t, length: ^posix.off_t, hdtr: rawptr, flags: c.int) -> c.int ---
 }
 
 @(private)
@@ -371,7 +373,26 @@ _recv :: proc "contextless" (fd: prim.Fd, buf: []u8) -> (int, Error) {
 
 @(private)
 _sendfile :: proc "contextless" (out: prim.Fd, src: prim.Fd, off: i64, n: int) -> (int, Error) {
-	return 0, .Unsupported
+	for {
+		length := posix.off_t(n)
+		if _c_sendfile_raw(posix.FD(src), posix.FD(out), posix.off_t(off), &length, nil, 0) == 0 {
+			if length == 0 && n > 0 {
+				return 0, .Corrupt
+			}
+			return int(length), .None
+		}
+		e := posix.errno()
+		if (e == .EAGAIN || e == .EINTR) && length > 0 {
+			return int(length), .None
+		}
+		#partial switch e {
+		case .EINTR:
+			continue
+		case .ENOTSOCK, .ENOTSUP, .EINVAL:
+			return 0, .Unsupported
+		}
+		return 0, _errno_of(e)
+	}
 }
 
 @(private)

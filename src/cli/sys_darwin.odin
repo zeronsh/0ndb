@@ -10,6 +10,7 @@ foreign import libc "system:System"
 foreign libc {
 	malloc_zone_pressure_relief :: proc(zone: rawptr, goal: uint) -> uint ---
 	getpeereid :: proc(fd: posix.FD, uid: ^posix.uid_t, gid: ^posix.gid_t) -> i32 ---
+	proc_pidinfo :: proc(pid: i32, flavor: i32, arg: u64, buffer: rawptr, size: i32) -> i32 ---
 }
 
 Signals :: struct {
@@ -61,12 +62,35 @@ peer_is_self :: proc(fd: prim.Fd) -> bool {
 	return uid == posix.getuid()
 }
 
+PROC_PIDTASKINFO :: 4
+
+Proc_Taskinfo :: struct {
+	virtual_size:  u64,
+	resident_size: u64,
+	total_user:    u64,
+	total_system:  u64,
+	threads_user:  u64,
+	threads_sys:   u64,
+	policy:        i32,
+	faults:        i32,
+	pageins:       i32,
+	cow_faults:    i32,
+	msgs_sent:     i32,
+	msgs_received: i32,
+	syscalls_mach: i32,
+	syscalls_unix: i32,
+	csw:           i32,
+	threadnum:     i32,
+	numrunning:    i32,
+	priority:      i32,
+}
+
 rss_bytes :: proc() -> i64 {
-	ru: posix.rusage
-	if posix.getrusage(.SELF, &ru) != .OK {
+	ti: Proc_Taskinfo
+	if proc_pidinfo(i32(posix.getpid()), PROC_PIDTASKINFO, 0, &ti, size_of(ti)) != size_of(ti) {
 		return 0
 	}
-	return i64(ru.ru_maxrss)
+	return i64(ti.resident_size)
 }
 
 idle_release :: proc() {
