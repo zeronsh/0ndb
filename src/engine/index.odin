@@ -21,6 +21,8 @@ TEXT_INDEX_MAX :: 4 << 20
 @(private)
 TREE_LV_CHUNK :: 4096
 @(private)
+SEARCH_STEP_BUDGET :: i64(4 << 20)
+@(private)
 TREE_LV_SOURCE :: prim.Id{0x74, 0x72, 0x65, 0x65, 0x2d, 0x6c, 0x76, 0, 0, 0, 0, 0, 0, 0, 0, 1}
 @(private)
 KIND_NAMES := [5]string{"", "conversation", "map", "text", "tree"}
@@ -125,6 +127,15 @@ _index_close :: proc(e: ^Engine) -> bool {
 
 @(private)
 _index_settle :: proc(e: ^Engine) {
+	if e.index_open {
+		more, merr := search.merge_step(&e.index, SEARCH_STEP_BUDGET)
+		if merr == .None && more {
+			if e.settle_timer == 0 {
+				e.settle_timer = prim.timer(e.loop, 0, e, _on_settle)
+			}
+			return
+		}
+	}
 	if !_index_close(e) && e.settle_timer == 0 {
 		e.settle_timer = prim.timer(e.loop, e.cfg.settle_ms, e, _on_settle)
 	}
