@@ -33,6 +33,16 @@ _node :: proc(v: ^obj.View, ref: Vref) -> (n: Node, err: Error) {
 }
 
 @(private)
+_msg_at :: proc(v: ^obj.View, r: Rid) -> (x: Vref, err: Error) {
+	x = obj.vref(v, r) or_return
+	body, _, gerr := obj.get(v, x.seg, x.off, x.off - obj.MSG_GUESS)
+	if gerr == .Corrupt || (gerr == .None && len(body) > 0 && obj.record_kind(body) != u8(Kind.Msg)) {
+		return x, .Not_Found
+	}
+	return x, .None
+}
+
+@(private)
 _read_node :: proc(v: ^obj.View, ref: Vref) -> (n: Node, err: Error) {
 	body, _ := obj.get(v, ref.seg, ref.off, ref.off - obj.MSG_GUESS) or_return
 	m := _decode_msg(body, ref.off) or_return
