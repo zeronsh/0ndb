@@ -80,6 +80,7 @@ Call :: enum u8 {
 	Unshare,
 	Clone,
 	Clone3,
+	Execve,
 }
 
 Sys :: struct {
@@ -121,6 +122,8 @@ X86_64_CALLS :: [?]Sys {
 	{272, .Unshare},
 	{308, .Setns},
 	{435, .Clone3},
+	{59, .Execve},
+	{322, .Execve},
 }
 
 I386_CALLS :: [?]Sys {
@@ -158,6 +161,8 @@ I386_CALLS :: [?]Sys {
 	{310, .Unshare},
 	{346, .Setns},
 	{435, .Clone3},
+	{11, .Execve},
+	{358, .Execve},
 }
 
 AARCH64_CALLS :: [?]Sys {
@@ -184,6 +189,8 @@ AARCH64_CALLS :: [?]Sys {
 	{220, .Clone},
 	{268, .Setns},
 	{435, .Clone3},
+	{221, .Execve},
+	{281, .Execve},
 }
 
 ARM_CALLS :: [?]Sys {
@@ -221,6 +228,8 @@ ARM_CALLS :: [?]Sys {
 	{337, .Unshare},
 	{375, .Setns},
 	{435, .Clone3},
+	{11, .Execve},
+	{387, .Execve},
 }
 
 when ODIN_ARCH == .amd64 {

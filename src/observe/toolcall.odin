@@ -374,11 +374,16 @@ match_command :: proc(calls: []Tool_Call, cmdline: []u8) -> (index: int, ambiguo
 		return
 	}
 	line := string(cmdline)
+	spaced := make([]u8, len(cmdline), context.temp_allocator)
+	for b, i in cmdline {
+		spaced[i] = ' ' if b == 0 else b
+	}
+	flat := string(spaced)
 	best := 0
 	for &c, i in calls {
 		score := 0
 		for cmd in c.commands {
-			if len(cmd) > score && (strings.contains(line, cmd) || strings.contains(line, _shell_quoted(cmd))) {
+			if len(cmd) > score && (strings.contains(line, cmd) || strings.contains(flat, cmd) || strings.contains(line, _shell_quoted(cmd))) {
 				score = len(cmd)
 			}
 		}
@@ -415,13 +420,17 @@ attribute :: proc(calls: []Tool_Call, w: ^Write, agent: prim.Pid) -> (index: int
 				break
 			}
 		}
-		if child > 0 {
-			buf: [8192]u8
-			if args, ok := process_args(child, buf[:]); ok {
-				index, ambiguous = match_command(calls, args)
-				if index >= 0 && !ambiguous {
-					return
-				}
+		args := w.args
+		buf: [8192]u8
+		if len(args) == 0 && child > 0 {
+			if a, ok := process_args(child, buf[:]); ok {
+				args = a
+			}
+		}
+		if len(args) > 0 {
+			index, ambiguous = match_command(calls, args)
+			if index >= 0 && !ambiguous {
+				return
 			}
 		}
 	}

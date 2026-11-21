@@ -130,6 +130,7 @@ Endpoint :: struct {
 	self:      prim.Pid,
 	inverted:  bool,
 	muted:     [dynamic]string,
+	fallback:  ^Libproc,
 	stats:     Stats,
 }
 
@@ -244,7 +245,7 @@ endpoint_stats :: proc(e: ^Endpoint) -> Stats {
 }
 
 endpoint_observer :: proc(e: ^Endpoint) -> fs.Write_Observer {
-	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop}
+	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop, changed = _es_changed}
 }
 
 @(private)
@@ -511,4 +512,20 @@ _es_on_pipe :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawpt
 		deliver(&e.router, e.sink, &w)
 	}
 	intrinsics.atomic_thread_fence(.Seq_Cst)
+}
+
+endpoint_set_fallback :: proc(e: ^Endpoint, l: ^Libproc) {
+	e.fallback = l
+}
+
+@(private)
+_es_changed :: proc(data: rawptr, m: ^fs.Mount, rel: string) -> (^fs.Scope, bool) {
+	e := (^Endpoint)(data)
+	if e.fallback == nil {
+		return nil, false
+	}
+	if e.fallback.router.reg == nil {
+		router_bind(&e.fallback.router, e.router.reg)
+	}
+	return libproc_changed(e.fallback, m, rel)
 }

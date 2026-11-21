@@ -2,6 +2,7 @@
 package observe
 
 import "base:intrinsics"
+import "core:sync"
 import "core:sys/linux"
 import "../prim"
 
@@ -15,6 +16,7 @@ MAX_LINKS :: 40
 @(private)
 Ctx :: struct {
 	s:     ^Supervisor,
+	t:     ^Tree,
 	tid:   i32,
 	tgid:  i32,
 	root:  i32,
@@ -444,7 +446,7 @@ _finish :: proc(c: ^Ctx, loc: Loc, out: []u8) -> (path: string, exact: bool, ok:
 	n := len(dp)
 	exact = true
 	if _is_foreign(c) {
-		if mapped, mok := _map_foreign(c.s, loc.dfd, dp); mok && len(mapped) <= len(out) {
+		if mapped, mok := _map_foreign(c, loc.dfd, dp); mok && len(mapped) <= len(out) {
 			copy(out, mapped)
 			n = len(mapped)
 		} else {
@@ -469,7 +471,8 @@ _finish :: proc(c: ^Ctx, loc: Loc, out: []u8) -> (path: string, exact: bool, ok:
 }
 
 @(private)
-_map_foreign :: proc(s: ^Supervisor, fd: i32, dp: string) -> (string, bool) {
+_map_foreign :: proc(c: ^Ctx, fd: i32, dp: string) -> (string, bool) {
+	s := c.s
 	cp: [prim.PATH_MAX + 1]u8
 	cpath, _ := _cstr(dp, cp[:])
 	mine, me := _sys_statx(AT_FDCWD, cpath, uintptr(AT_SYMLINK_NOFOLLOW))
@@ -480,25 +483,26 @@ _map_foreign :: proc(s: ^Supervisor, fd: i32, dp: string) -> (string, bool) {
 	if me == 0 && mine.dev == theirs.dev && mine.ino == theirs.ino {
 		return dp, true
 	}
-	router_refresh(&s.router)
-	if len(s.router.roots) == 0 {
-		return "", false
-	}
 	cur, ce := _dup_dir(fd)
 	if ce != 0 {
 		return "", false
 	}
 	defer _sys_close(cur)
+	sync.mutex_lock(&s.snap_mu)
+	defer sync.mutex_unlock(&s.snap_mu)
+	if len(s.snap) == 0 {
+		return "", false
+	}
 	tail := len(dp)
 	for {
 		st, se := _sys_statx(cur, "", uintptr(AT_EMPTY_PATH))
 		if se != 0 {
 			return "", false
 		}
-		for root in s.router.roots {
+		for root in s.snap {
 			if root.dev == st.dev && root.ino == st.ino {
 				rest := dp[tail:]
-				out := s.sc.tmp[:]
+				out := c.t.sc.tmp[:]
 				if len(root.real) + len(rest) > len(out) {
 					return "", false
 				}

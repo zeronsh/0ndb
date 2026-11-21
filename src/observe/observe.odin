@@ -33,6 +33,7 @@ Write :: struct {
 	flags:   u32,
 	exact:   bool,
 	dev:     u64,
+	args:    []u8,
 }
 
 Stats :: struct {
@@ -269,7 +270,7 @@ _route_path :: proc(r: ^Router, path: string, exact: bool, scope: ^fs.Scope) {
 	if fs.path_internal(rel) {
 		return
 	}
-	fs.mount_mark(m, rel, scope)
+	fs.mount_mark_observed(m, rel, scope)
 }
 
 deliver :: proc(r: ^Router, sink: Sink, w: ^Write) {

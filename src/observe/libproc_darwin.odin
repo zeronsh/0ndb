@@ -52,7 +52,7 @@ libproc_remove_root :: proc(l: ^Libproc, pid: prim.Pid) {
 }
 
 libproc_observer :: proc(l: ^Libproc) -> fs.Write_Observer {
-	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop}
+	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop, changed = _libproc_hook}
 }
 
 @(private)
@@ -182,4 +182,9 @@ _has_open_for_write :: proc(pid: prim.Pid, path: string) -> (u32, bool) {
 		}
 	}
 	return 0, false
+}
+
+@(private)
+_libproc_hook :: proc(data: rawptr, m: ^fs.Mount, rel: string) -> (^fs.Scope, bool) {
+	return libproc_changed((^Libproc)(data), m, rel)
 }

@@ -5,7 +5,7 @@ import "base:intrinsics"
 import "core:sys/linux"
 import "../prim"
 
-KEEPER_SLOTS :: 65536
+KEEPER_SLOTS :: 4096
 
 @(private)
 KEEPER_ADD :: u32(1)
@@ -129,7 +129,7 @@ _kmap :: proc "contextless" (size: uintptr) -> rawptr {
 }
 
 @(private)
-_keeper_main :: proc "contextless" (ctl: i32, sh: ^Shared) -> ! {
+_keeper_main :: proc "contextless" (ctl: i32, sh: [^]Shared) -> ! {
 	intrinsics.syscall(linux.SYS_setsid)
 	r := intrinsics.syscall(linux.SYS_close_range, 0, uintptr(ctl - 1), 0) if ctl > 0 else 0
 	r2 := intrinsics.syscall(linux.SYS_close_range, uintptr(ctl + 1), ~uintptr(0) >> 1, 0)
@@ -172,10 +172,12 @@ _keeper_main :: proc "contextless" (ctl: i32, sh: ^Shared) -> ! {
 	}
 	_sys_close(ctl)
 	#no_bounds_check {
-		if intrinsics.volatile_load(&sh.state) == 1 {
-			slot := intrinsics.volatile_load(&sh.slot)
-			n := (^Notif)(&sh.notif)
-			if slot < KEEPER_SLOTS && fds[slot] > 0 && n.id != 0 {
+		for slot in 0 ..< hi {
+			if fds[slot] <= 0 || intrinsics.volatile_load(&sh[slot].state) != 1 {
+				continue
+			}
+			n := (^Notif)(&sh[slot].notif)
+			if n.id != 0 {
 				resp := Notif_Resp {
 					id    = n.id,
 					flags = NOTIF_FLAG_CONTINUE,

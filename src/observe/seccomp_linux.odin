@@ -4,6 +4,8 @@ package observe
 import "base:intrinsics"
 import "base:runtime"
 import "core:sys/linux"
+import "core:sync"
+import "core:thread"
 import "../fs"
 import "../prim"
 
@@ -64,8 +66,7 @@ Notif_Sizes :: struct {
 
 Shared :: struct #align (64) {
 	state: u32,
-	slot:  u32,
-	_pad:  [56]u8,
+	_pad:  [60]u8,
 	notif: [NOTIF_BUF]u8,
 }
 
@@ -93,9 +94,20 @@ Tree :: struct {
 	slot:     u32,
 	fd:       i32,
 	root:     prim.Pid,
-	watch:    prim.Watch,
 	killable: bool,
 	moved:    bool,
+	ended:    u32,
+	stop_fd:  i32,
+	space_fd: i32,
+	ready_fd: i32,
+	sock:     i32,
+	unsignaled: int,
+	ring:     Ring,
+	thread:   ^thread.Thread,
+	alloc:    runtime.Allocator,
+	sc:       ^Scratch,
+	pc:       Pcache,
+	wbuf:     [dynamic]u8,
 }
 
 @(private)
@@ -106,6 +118,7 @@ Scratch :: struct {
 	out2:    [prim.PATH_MAX * 2]u8,
 	tmp:     [prim.PATH_MAX * 2]u8,
 	file:    [4096]u8,
+	args:    [8192]u8,
 	lineage: [MAX_LINEAGE]prim.Pid,
 }
 
@@ -119,15 +132,19 @@ Supervisor :: struct {
 	prog:       []Insn,
 	trees:      [dynamic]^Tree,
 	live:       int,
-	shared:     ^Shared,
+	shared:     [^]Shared,
 	keeper:     Keeper,
+	pending:    u32,
+	consumers:  u32,
+	wake_fd:    i32,
+	wake_watch: prim.Watch,
+	snap_mu:    sync.Mutex,
+	snap:       [dynamic]Root,
 	self:       prim.Pid,
 	mnt_ns:     [64]u8,
 	mnt_ns_len: int,
 	has_openat2: bool,
 	root_fd:    i32,
-	pc:         Pcache,
-	sc:         ^Scratch,
 	stats:      Stats,
 }
 
@@ -139,6 +156,7 @@ supervisor_init :: proc(s: ^Supervisor, loop: ^prim.Loop, opts := DEFAULT_SUPERV
 	}
 	s.keeper.ctl = -1
 	s.root_fd = -1
+	s.wake_fd = -1
 	when !NATIVE_SUPPORTED {
 		return .Unsupported
 	}
@@ -167,18 +185,24 @@ supervisor_init :: proc(s: ^Supervisor, loop: ^prim.Loop, opts := DEFAULT_SUPERV
 		return .Unsupported
 	}
 	s.prog = prog
-	mem := intrinsics.syscall(linux.SYS_mmap, 0, uintptr(size_of(Shared)), uintptr(0x3), uintptr(0x21), ~uintptr(0), 0)
+	mem := intrinsics.syscall(linux.SYS_mmap, 0, uintptr(size_of(Shared) * KEEPER_SLOTS), uintptr(0x3), uintptr(0x21), ~uintptr(0), 0)
 	if _errno(mem) != 0 {
 		delete(s.prog, allocator)
 		return .No_Memory
 	}
-	s.shared = (^Shared)(rawptr(mem))
-	sc, serr := new(Scratch, allocator)
-	if serr != nil {
+	s.shared = ([^]Shared)(rawptr(mem))
+	s.wake_fd = _eventfd()
+	if s.wake_fd < 0 {
 		supervisor_destroy(s)
-		return .No_Memory
+		return .Too_Many_Files
 	}
-	s.sc = sc
+	ww, werr := prim.watch(loop, prim.Fd(s.wake_fd), {.Read}, s, _on_wake)
+	if werr != .None {
+		supervisor_destroy(s)
+		return werr
+	}
+	s.wake_watch = ww
+	s.snap = make([dynamic]Root, allocator)
 	s.self = prim.Pid(linux.getpid())
 	pp: Proc_Path
 	n, e := _sys_readlinkat(AT_FDCWD, _pp_proc(&pp, i64(s.self), "/ns/mnt"), s.mnt_ns[:])
@@ -198,7 +222,6 @@ supervisor_init :: proc(s: ^Supervisor, loop: ^prim.Loop, opts := DEFAULT_SUPERV
 		return .Io
 	}
 	s.root_fd = rfd
-	_pcache_init(s)
 	router_init(&s.router, allocator)
 	s.trees = make([dynamic]^Tree, allocator)
 	return .None
@@ -215,28 +238,77 @@ supervisor_destroy :: proc(s: ^Supervisor) {
 	_keeper_detach(s)
 	delete(s.trees)
 	router_destroy(&s.router)
-	_pcache_destroy(s)
 	_sys_close(s.root_fd)
-	if s.sc != nil {
-		free(s.sc, s.allocator)
+	if s.wake_watch != 0 && s.loop != nil {
+		prim.unwatch(s.loop, s.wake_watch)
 	}
+	_sys_close(s.wake_fd)
+	_roots_clear(s)
+	delete(s.snap)
 	if s.prog != nil {
 		delete(s.prog, s.allocator)
 	}
 	if s.shared != nil {
-		intrinsics.syscall(linux.SYS_munmap, uintptr(s.shared), uintptr(size_of(Shared)))
+		intrinsics.syscall(linux.SYS_munmap, uintptr(s.shared), uintptr(size_of(Shared) * KEEPER_SLOTS))
 	}
 	s^ = {}
 	s.keeper.ctl = -1
 	s.root_fd = -1
+	s.wake_fd = -1
 }
 
 supervisor_set_sink :: proc(s: ^Supervisor, sink: Sink) {
 	s.sink = sink
+	_consumers_update(s)
+}
+
+@(private)
+_consumers_update :: proc(s: ^Supervisor) {
+	v := u32(1) if s.sink.write != nil || s.router.reg != nil else 0
+	intrinsics.atomic_store_explicit(&s.consumers, v, .Relaxed)
+}
+
+@(private)
+_roots_clear :: proc(s: ^Supervisor) {
+	for r in s.snap {
+		delete(r.real, s.allocator)
+	}
+	clear(&s.snap)
+}
+
+@(private)
+_roots_publish :: proc(s: ^Supervisor) {
+	same := len(s.snap) == len(s.router.roots)
+	if same {
+		for r, i in s.router.roots {
+			if s.snap[i].real != r.real || s.snap[i].dev != r.dev || s.snap[i].ino != r.ino {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		return
+	}
+	sync.mutex_lock(&s.snap_mu)
+	defer sync.mutex_unlock(&s.snap_mu)
+	_roots_clear(s)
+	for r in s.router.roots {
+		c := make([]u8, len(r.real), s.allocator)
+		copy(c, r.real)
+		append(&s.snap, Root{real = string(c), dev = r.dev, ino = r.ino})
+	}
 }
 
 supervisor_stats :: proc(s: ^Supervisor) -> Stats {
-	return s.stats
+	st: Stats
+	st.notifications = intrinsics.atomic_load(&s.stats.notifications)
+	st.reported = intrinsics.atomic_load(&s.stats.reported)
+	st.ignored = intrinsics.atomic_load(&s.stats.ignored)
+	st.failed = intrinsics.atomic_load(&s.stats.failed)
+	st.inexact = intrinsics.atomic_load(&s.stats.inexact)
+	st.stale = intrinsics.atomic_load(&s.stats.stale)
+	return st
 }
 
 supervisor_trees :: proc(s: ^Supervisor) -> int {
@@ -251,6 +323,9 @@ write_observer :: proc(s: ^Supervisor) -> fs.Write_Observer {
 _observer_start :: proc(data: rawptr, reg: ^fs.Registry) -> fs.Error {
 	s := (^Supervisor)(data)
 	router_bind(&s.router, reg)
+	router_refresh(&s.router)
+	_roots_publish(s)
+	_consumers_update(s)
 	return .None
 }
 
@@ -259,6 +334,7 @@ _observer_stop :: proc(data: rawptr, reg: ^fs.Registry) {
 	s := (^Supervisor)(data)
 	if s.router.reg == reg {
 		router_bind(&s.router, nil)
+		_consumers_update(s)
 	}
 }
 
@@ -336,6 +412,28 @@ spawn_with :: proc(s: ^Supervisor, argv: []string, opts: Spawn_Options) -> (chil
 	if e := _errno(intrinsics.syscall(linux.SYS_socketpair, 1, uintptr(5) | uintptr(0o2000000), 0, uintptr(&sock))); e != 0 {
 		return child, _map_errno(linux.Errno(e))
 	}
+	t, terr := new(Tree, s.allocator)
+	if terr != nil {
+		_sys_close(sock[0])
+		_sys_close(sock[1])
+		return child, .No_Memory
+	}
+	t^ = {
+		sup      = s,
+		slot     = slot,
+		fd       = -1,
+		sock     = sock[0],
+		stop_fd  = -1,
+		space_fd = -1,
+		ready_fd = -1,
+	}
+	router_refresh(&s.router)
+	_roots_publish(s)
+	if werr := _worker_start(s, t); werr != .None {
+		_sys_close(sock[1])
+		_tree_discard(t)
+		return child, werr
+	}
 	install := Install {
 		prog      = Fprog{u16(len(s.prog)), raw_data(s.prog)},
 		sock      = sock[1],
@@ -345,47 +443,36 @@ spawn_with :: proc(s: ^Supervisor, argv: []string, opts: Spawn_Options) -> (chil
 	child, err = prim.spawn(argv, opts.cwd, opts.env, opts.new_process_group, opts.pipes, prim.Pre_Exec{&install, _install})
 	_sys_close(sock[1])
 	if err != .None {
-		_sys_close(sock[0])
+		_tree_discard(t)
 		return child, err
 	}
-	listener, killable := _recv_listener(sock[0])
-	_sys_close(sock[0])
-	if listener < 0 {
+	pf := [1]Pollfd{{fd = t.ready_fd, events = POLLIN}}
+	for {
+		_, pe := _sys_poll(&pf[0], 1, -1)
+		if pe != EINTR {
+			break
+		}
+	}
+	if intrinsics.atomic_load(&t.fd) < 0 {
 		prim.kill_process(child.pid, .Kill)
 		prim.reap(child.pid, true)
 		prim.child_close(&child)
+		_tree_discard(t)
 		return child, .Io
 	}
-	t, terr := new(Tree, s.allocator)
-	if terr != nil {
-		_sys_close(listener)
-		prim.kill_process(child.pid, .Kill)
-		prim.reap(child.pid, true)
-		prim.child_close(&child)
-		return child, .No_Memory
-	}
-	t^ = {
-		sup      = s,
-		slot     = slot,
-		fd       = listener,
-		root     = child.pid,
-		killable = killable,
-	}
-	_sys_ioctl_val(listener, NOTIF_SET_FLAGS, uintptr(NOTIF_FD_SYNC_WAKE_UP))
-	w, werr := prim.watch(s.loop, prim.Fd(listener), {.Read}, t, _on_listener)
-	if werr != .None {
-		free(t, s.allocator)
-		_sys_close(listener)
-		prim.kill_process(child.pid, .Kill)
-		prim.reap(child.pid, true)
-		prim.child_close(&child)
-		return child, werr
-	}
-	t.watch = w
 	s.trees[slot] = t
 	s.live += 1
 	_keeper_add(s, t)
 	return child, .None
+}
+
+@(private)
+_tree_discard :: proc(t: ^Tree) {
+	s := t.sup
+	_worker_free(t)
+	_sys_close(t.fd)
+	_sys_close(t.sock)
+	free(t, s.allocator)
 }
 
 @(private)
@@ -409,7 +496,9 @@ _install :: proc "contextless" (data: rawptr) -> i32 {
 		return i32(e)
 	}
 	listener := i32(int(r))
-	payload := [4]u8{killable, 0, 0, 0}
+	pid := i32(int(intrinsics.syscall(linux.SYS_getpid)))
+	payload := [8]u8{killable, 0, 0, 0, 0, 0, 0, 0}
+	(^i32)(&payload[4])^ = pid
 	e := _send_fd(c.sock, listener, payload[:])
 	_sys_close(listener)
 	_sys_close(c.sock)
@@ -434,9 +523,8 @@ _slot_alloc :: proc(s: ^Supervisor) -> (u32, prim.Error) {
 
 @(private)
 _tree_free :: proc(s: ^Supervisor, t: ^Tree, notify_keeper: bool) {
-	if t.watch != 0 && s.loop != nil {
-		prim.unwatch(s.loop, t.watch)
-	}
+	_worker_free(t)
+	_sys_close(t.sock)
 	if notify_keeper {
 		_keeper_del(s, t)
 	}
@@ -567,49 +655,8 @@ _recv_fd :: proc "contextless" (sock: i32, payload: []u8) -> (n: int, fd: i32, e
 }
 
 @(private)
-_recv_listener :: proc(sock: i32) -> (fd: i32, killable: bool) {
-	payload: [4]u8
-	n, got, e := _recv_fd(sock, payload[:])
-	if e != 0 || n < 1 {
-		_sys_close(got)
-		return -1, false
-	}
-	return got, payload[0] == 1
-}
-
-@(private)
-_on_listener :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
-	t := (^Tree)(data)
-	s := t.sup
-	if .Read in events {
-		_handle_one(s, t)
-		if s.trees[t.slot] != t {
-			return
-		}
-	}
-	for {
-		pfd := Pollfd{fd = t.fd, events = POLLIN}
-		n, e := _sys_poll(&pfd, 1, 0)
-		if e == EINTR {
-			continue
-		}
-		if e != 0 || n == 0 {
-			return
-		}
-		if pfd.revents & POLLIN != 0 {
-			_handle_one(s, t)
-			continue
-		}
-		if pfd.revents & (POLLHUP | POLLERR | POLLNVAL) != 0 {
-			s.trees[t.slot] = nil
-			_tree_free(s, t, true)
-		}
-		return
-	}
-}
-
-@(private)
 _reply :: proc(s: ^Supervisor, t: ^Tree, id: u64) {
+	sh := &s.shared[t.slot]
 	resp := Notif_Resp {
 		id    = id,
 		flags = NOTIF_FLAG_CONTINUE,
@@ -620,63 +667,66 @@ _reply :: proc(s: ^Supervisor, t: ^Tree, id: u64) {
 			break
 		}
 	}
-	intrinsics.volatile_store(&s.shared.state, 0)
+	intrinsics.volatile_store(&sh.state, 0)
 }
 
 @(private)
-_handle_one :: proc(s: ^Supervisor, t: ^Tree) {
-	sh := s.shared
+_handle_one :: proc(s: ^Supervisor, t: ^Tree) -> bool {
+	sh := &s.shared[t.slot]
 	intrinsics.mem_zero(&sh.notif, NOTIF_BUF)
-	intrinsics.volatile_store(&sh.slot, t.slot)
 	intrinsics.volatile_store(&sh.state, 1)
 	e := _sys_ioctl(t.fd, NOTIF_RECV, &sh.notif)
 	if e != 0 {
 		intrinsics.volatile_store(&sh.state, 0)
-		return
+		return true
 	}
 	n := (^Notif)(&sh.notif)
-	s.stats.notifications += 1
-	if s.sink.write == nil && s.router.reg == nil {
-		_reply(s, t, n.id)
-		return
-	}
+	_stat_add(&s.stats.notifications)
 	tid := i32(n.pid)
-	tgid, gok := _tgid_of(s, tid)
+	tgid, gok := _tgid_of(t, tid)
 	if !gok {
-		s.stats.failed += 1
+		_stat_add(&s.stats.failed)
 		_reply(s, t, n.id)
-		return
+		return true
 	}
 	call := decode_call(n.data.arch, n.data.nr)
 	if call >= .Chdir {
 		_control(s, t, n, call, tid, tgid)
-		s.stats.ignored += 1
+		_stat_add(&s.stats.ignored)
 		_reply(s, t, n.id)
-		return
+		return true
+	}
+	if intrinsics.atomic_load_explicit(&s.consumers, .Relaxed) == 0 {
+		_reply(s, t, n.id)
+		return true
 	}
 	w: Write
 	d: Decoded
 	if !_decode(s, t, n, &w, &d) {
-		s.stats.ignored += 1
+		_stat_add(&s.stats.ignored)
 		_reply(s, t, n.id)
-		return
+		return true
 	}
-	lineage, pe := _pcache_lineage(s, tgid, t.root)
+	lineage, pe := _pcache_lineage(t, tgid, t.root)
 	w.lineage = lineage
 	w.pid = tgid
 	w.tid = prim.Pid(tid)
 	w.tree = t.root
 	ctx := Ctx {
-		s       = s,
-		tid     = tid,
-		tgid    = i32(tgid),
-		root    = -1,
-		cwd     = -1,
-		moved   = t.moved,
+		s     = s,
+		t     = t,
+		tid   = tid,
+		tgid  = i32(tgid),
+		root  = -1,
+		cwd   = -1,
+		moved = t.moved,
 	}
 	if pe != nil {
 		if pe.chdir_tid == tid {
 			pe.chdir_tid = 0
+		}
+		if pe.exec_tid == tid {
+			pe.exec_tid = 0
 		}
 		if !pe.nocwd && pe.chdir_tid == 0 {
 			if pe.cwd < 0 {
@@ -690,9 +740,9 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) {
 		ctx.root = s.root_fd
 		ctx.root_borrowed = true
 	}
-	p, exact, ok := _resolve(&ctx, d.one, s.sc.arg[:], s.sc.out[:])
+	p, exact, ok := _resolve(&ctx, d.one, t.sc.arg[:], t.sc.out[:])
 	if ok && d.has_two {
-		p2, exact2, ok2 := _resolve(&ctx, d.two, s.sc.arg2[:], s.sc.out2[:])
+		p2, exact2, ok2 := _resolve(&ctx, d.two, t.sc.arg2[:], t.sc.out2[:])
 		w.from = p2
 		exact = exact && exact2
 		ok = ok2
@@ -701,24 +751,26 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) {
 		_sys_close(ctx.root)
 	}
 	if !ok {
-		s.stats.failed += 1
+		_stat_add(&s.stats.failed)
 		_reply(s, t, n.id)
-		return
+		return true
 	}
 	w.path = p
 	w.exact = exact
 	w.dev = ctx.dev
+	w.args = _pcache_args(t, lineage)
 	if !_id_valid(t, n.id) {
-		s.stats.stale += 1
+		_stat_add(&s.stats.stale)
 		intrinsics.volatile_store(&sh.state, 0)
-		return
+		return true
 	}
-	s.stats.reported += 1
+	_stat_add(&s.stats.reported)
 	if !w.exact {
-		s.stats.inexact += 1
+		_stat_add(&s.stats.inexact)
 	}
-	deliver(&s.router, s.sink, &w)
+	_encode_write(&t.wbuf, &w)
 	_reply(s, t, n.id)
+	return _ring_push(t, t.wbuf[:])
 }
 
 @(private)
@@ -981,12 +1033,24 @@ _read_proc_mem :: proc(tid: i32, addr: u64, buf: []u8) -> (int, int) {
 
 @(private)
 _control :: proc(s: ^Supervisor, t: ^Tree, n: ^Notif, call: Call, tid: i32, tgid: prim.Pid) {
-	pe := _pentry(s, tgid, t.root, 0)
+	pe := _pentry(t, tgid, t.root, 0)
 	if pe != nil && pe.chdir_tid == tid {
 		pe.chdir_tid = 0
 	}
+	if pe != nil && pe.exec_tid == tid {
+		pe.exec_tid = 0
+	}
 	flags := u64(n.data.args[0])
 	#partial switch call {
+	case .Execve:
+		if pe != nil {
+			if pe.args != nil {
+				delete(pe.args, t.alloc)
+			}
+			pe.args = nil
+			pe.args_ok = false
+			pe.exec_tid = tid
+		}
 	case .Chdir, .Fchdir:
 		if pe != nil {
 			_sys_close(pe.cwd)
@@ -1002,7 +1066,7 @@ _control :: proc(s: ^Supervisor, t: ^Tree, n: ^Notif, call: Call, tid: i32, tgid
 		}
 	case .Pivot_Root:
 		t.moved = true
-		_pcache_drop_cwds(s)
+		_pcache_drop_cwds(t)
 		if pe != nil {
 			pe.chdir_tid = tid
 		}

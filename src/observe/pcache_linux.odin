@@ -17,6 +17,9 @@ Pentry :: struct {
 	cwd:       i32,
 	chdir_tid: i32,
 	nocwd:     bool,
+	exec_tid:  i32,
+	args:      []u8,
+	args_ok:   bool,
 	n:         int,
 	lineage:   [MAX_LINEAGE]prim.Pid,
 }
@@ -28,25 +31,30 @@ Pcache :: struct {
 }
 
 @(private)
-_pcache_init :: proc(s: ^Supervisor) {
-	s.pc.procs = make(map[prim.Pid]^Pentry, s.allocator)
-	s.pc.threads = make(map[prim.Pid]prim.Pid, s.allocator)
+_pcache_init :: proc(t: ^Tree) {
+	t.pc.procs = make(map[prim.Pid]^Pentry, t.alloc)
+	t.pc.threads = make(map[prim.Pid]prim.Pid, t.alloc)
+	t.wbuf = make([dynamic]u8, t.alloc)
 }
 
 @(private)
-_pentry_free :: proc(s: ^Supervisor, e: ^Pentry) {
+_pentry_free :: proc(t: ^Tree, e: ^Pentry) {
 	_sys_close(e.pidfd)
 	_sys_close(e.cwd)
-	free(e, s.allocator)
+	if e.args != nil {
+		delete(e.args, t.alloc)
+	}
+	free(e, t.alloc)
 }
 
 @(private)
-_pcache_destroy :: proc(s: ^Supervisor) {
-	for _, e in s.pc.procs {
-		_pentry_free(s, e)
+_pcache_destroy :: proc(t: ^Tree) {
+	for _, e in t.pc.procs {
+		_pentry_free(t, e)
 	}
-	delete(s.pc.procs)
-	delete(s.pc.threads)
+	delete(t.pc.procs)
+	delete(t.pc.threads)
+	delete(t.wbuf)
 }
 
 @(private)
@@ -57,35 +65,35 @@ _alive :: proc "contextless" (pidfd: i32) -> bool {
 }
 
 @(private)
-_tgid_of :: proc(s: ^Supervisor, tid: i32) -> (prim.Pid, bool) {
+_tgid_of :: proc(t: ^Tree, tid: i32) -> (prim.Pid, bool) {
 	if _errno(intrinsics.syscall(linux.SYS_tgkill, uintptr(int(tid)), uintptr(int(tid)), 0)) != ESRCH {
 		return prim.Pid(tid), true
 	}
-	if g, ok := s.pc.threads[prim.Pid(tid)]; ok {
+	if g, ok := t.pc.threads[prim.Pid(tid)]; ok {
 		if _errno(intrinsics.syscall(linux.SYS_tgkill, uintptr(int(g)), uintptr(int(tid)), 0)) != ESRCH {
 			return g, true
 		}
 	}
-	tgid, _, ok := _status_ids(tid, s.sc.file[:])
+	tgid, _, ok := _status_ids(tid, t.sc.file[:])
 	if !ok {
 		return 0, false
 	}
-	if len(s.pc.threads) >= TCACHE_MAX {
-		clear(&s.pc.threads)
+	if len(t.pc.threads) >= TCACHE_MAX {
+		clear(&t.pc.threads)
 	}
-	s.pc.threads[prim.Pid(tid)] = tgid
+	t.pc.threads[prim.Pid(tid)] = tgid
 	return tgid, true
 }
 
 @(private)
-_pcache_trim :: proc(s: ^Supervisor) {
-	if len(s.pc.procs) < PCACHE_MAX {
+_pcache_trim :: proc(t: ^Tree) {
+	if len(t.pc.procs) < PCACHE_MAX {
 		return
 	}
-	pfds := make([]Pollfd, len(s.pc.procs), context.temp_allocator)
-	keys := make([]prim.Pid, len(s.pc.procs), context.temp_allocator)
+	pfds := make([]Pollfd, len(t.pc.procs), context.temp_allocator)
+	keys := make([]prim.Pid, len(t.pc.procs), context.temp_allocator)
 	i := 0
-	for k, e in s.pc.procs {
+	for k, e in t.pc.procs {
 		pfds[i] = Pollfd{fd = e.pidfd, events = POLLIN}
 		keys[i] = k
 		i += 1
@@ -93,43 +101,44 @@ _pcache_trim :: proc(s: ^Supervisor) {
 	_sys_poll(raw_data(pfds), len(pfds), 0)
 	for p, j in pfds {
 		if p.revents & POLLIN != 0 {
-			_pentry_free(s, s.pc.procs[keys[j]])
-			delete_key(&s.pc.procs, keys[j])
+			_pentry_free(t, t.pc.procs[keys[j]])
+			delete_key(&t.pc.procs, keys[j])
 		}
 	}
-	if len(s.pc.procs) >= PCACHE_MAX {
-		for _, e in s.pc.procs {
-			_pentry_free(s, e)
+	if len(t.pc.procs) >= PCACHE_MAX {
+		for _, e in t.pc.procs {
+			_pentry_free(t, e)
 		}
-		clear(&s.pc.procs)
+		clear(&t.pc.procs)
 	}
 }
 
 @(private)
-_pentry :: proc(s: ^Supervisor, pid: prim.Pid, root: prim.Pid, depth: int) -> ^Pentry {
-	if e, ok := s.pc.procs[pid]; ok {
+_pentry :: proc(t: ^Tree, pid: prim.Pid, root: prim.Pid, depth: int) -> ^Pentry {
+	s := t.sup
+	if e, ok := t.pc.procs[pid]; ok {
 		if _alive(e.pidfd) {
 			return e
 		}
-		_pentry_free(s, e)
-		delete_key(&s.pc.procs, pid)
+		_pentry_free(t, e)
+		delete_key(&t.pc.procs, pid)
 	}
-	_pcache_trim(s)
+	_pcache_trim(t)
 	r := intrinsics.syscall(linux.SYS_pidfd_open, uintptr(int(pid)), 0)
 	if _errno(r) != 0 {
 		return nil
 	}
 	pidfd := i32(int(r))
-	ppid, pok := _stat_ppid(pid, s.sc.file[:])
+	ppid, pok := _stat_ppid(pid, t.sc.file[:])
 	if !pok || !_alive(pidfd) {
 		_sys_close(pidfd)
 		return nil
 	}
 	parent: ^Pentry
 	if pid != root && ppid > 1 && ppid != s.self && depth < MAX_LINEAGE - 1 {
-		parent = _pentry(s, ppid, root, depth + 1)
+		parent = _pentry(t, ppid, root, depth + 1)
 	}
-	e, aerr := new(Pentry, s.allocator)
+	e, aerr := new(Pentry, t.alloc)
 	if aerr != nil {
 		_sys_close(pidfd)
 		return nil
@@ -143,14 +152,14 @@ _pentry :: proc(s: ^Supervisor, pid: prim.Pid, root: prim.Pid, depth: int) -> ^P
 		copy(e.lineage[1:], parent.lineage[:k])
 		e.n += k
 	}
-	s.pc.procs[pid] = e
+	t.pc.procs[pid] = e
 	return e
 }
 
 @(private)
-_pcache_lineage :: proc(s: ^Supervisor, tgid: prim.Pid, root: prim.Pid) -> ([]prim.Pid, ^Pentry) {
-	l := s.sc.lineage[:]
-	e := _pentry(s, tgid, root, 0)
+_pcache_lineage :: proc(t: ^Tree, tgid: prim.Pid, root: prim.Pid) -> ([]prim.Pid, ^Pentry) {
+	l := t.sc.lineage[:]
+	e := _pentry(t, tgid, root, 0)
 	n := 0
 	if e != nil {
 		n = min(e.n, len(l) - 1)
@@ -167,9 +176,37 @@ _pcache_lineage :: proc(s: ^Supervisor, tgid: prim.Pid, root: prim.Pid) -> ([]pr
 }
 
 @(private)
-_pcache_drop_cwds :: proc(s: ^Supervisor) {
-	for _, e in s.pc.procs {
+_pcache_drop_cwds :: proc(t: ^Tree) {
+	for _, e in t.pc.procs {
 		_sys_close(e.cwd)
 		e.cwd = -1
 	}
+}
+
+@(private)
+_pcache_args :: proc(t: ^Tree, lineage: []prim.Pid) -> []u8 {
+	n := len(lineage)
+	if n < 2 || lineage[n - 1] != t.root || lineage[0] == t.root {
+		return nil
+	}
+	child := lineage[n - 2]
+	e := t.pc.procs[child]
+	if e != nil && e.args_ok && e.exec_tid == 0 {
+		return e.args
+	}
+	args, ok := process_args(child, t.sc.args[:])
+	if !ok {
+		return nil
+	}
+	if e == nil || e.exec_tid != 0 {
+		return args
+	}
+	c, err := make([]u8, len(args), t.alloc)
+	if err != nil {
+		return args
+	}
+	copy(c, args)
+	e.args = c
+	e.args_ok = true
+	return c
 }
