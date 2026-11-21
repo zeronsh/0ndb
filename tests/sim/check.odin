@@ -1149,6 +1149,10 @@ check_conflicts :: proc(w: ^World, oi: int) {
 			if !_has_any(p.a.deletes[:], p.b.deletes[:]) || !_survived(m, p.a) || !_survived(m, p.b) {
 				continue
 			}
+			if r := pair_resolver(w, oi, p); r != nil {
+				world_note(w, "conflict: pair ops %d/%d on %s resolved by op %d (%v), which saw both", p.a.idx, p.b.idx, p.a.path, r.idx, r.kind)
+				continue
+			}
 			found := false
 			for c in list {
 				if file_base(c.path) != p.a.path {
@@ -1173,3 +1177,19 @@ file_base :: proc(name: string) -> string {
 	return name
 }
 
+pair_resolver :: proc(w: ^World, oi: int, p: Pair) -> ^M_Op {
+	m := &w.model
+	last := max(p.a.at, p.b.at)
+	for r in m.ops {
+		if r.obj != oi || r.path != p.a.path || r.idx == p.a.idx || r.idx == p.b.idx || !op_maybe(r) || r.at <= last {
+			continue
+		}
+		if !(r.kind == .Tree_Remove || _rewrites(r)) {
+			continue
+		}
+		if _has_any(r.deletes[:], p.a.tokens[:]) && _has_any(r.deletes[:], p.b.tokens[:]) {
+			return r
+		}
+	}
+	return nil
+}

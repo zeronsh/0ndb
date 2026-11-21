@@ -124,6 +124,9 @@ run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
 			if trace_events {
 				cid: u64 = ev.conn.id if ev.conn != nil else 0
 				fmt.eprintf("ev %d t=%d k=%v node=%d conn=%d gen=%d len=%d h=%x arg=%d\n", w.stats.events, ev.at, ev.kind, ev.node, cid, ev.gen, len(ev.bytes), mix_bytes(0, ev.bytes), ev.arg)
+				if trace_bytes_at == w.stats.events {
+					fmt.eprintf("evbytes %d node=%s %x\n", w.stats.events, ev.conn.node.name if ev.conn != nil else "-", ev.bytes)
+				}
 			}
 			handle_event(w, &ev)
 			delete(ev.bytes, w.allocator)
@@ -268,15 +271,17 @@ inject_fault :: proc(w: ^World, r: ^Rng) {
 	}
 }
 
-run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
+run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label := "first") -> (res: Run_Result) {
 	cfg := default_config(seed)
 	cfg.verbose = verbose
 	cfg.disabled = env_disabled()
 	leak_sites = env_u64("SIM_LEAK_SITES", 0) != 0
 	trace_events = env_u64("SIM_TRACE_EVENTS", 0) != 0
+	trace_bytes_at = env_u64("SIM_TRACE_BYTES_AT", 0)
 	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {}
 	cfg.io_rate = env_u64("SIM_IO", cfg.io_rate)
 	cfg.drain_wall_s = int(env_u64("SIM_DRAIN_WALL", 30))
+	region_configure(env_u64("SIM_REGION_MB", 256), env_u64("SIM_TEMP_MB", 96))
 	cfg.rss_max = env_u64("SIM_RSS_MAX", 1500)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
@@ -334,13 +339,11 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	}
 	res.disk_ops += w.relay.disk.stats.ops
 	res.trace = mix64(res.trace, disk_digest(&w.relay.disk))
+	if images != nil {
+		disk_images_take(w, images, label)
+	}
 	if verbose {
-		disks := make([dynamic]^Disk, context.temp_allocator)
-		for n in w.nodes {
-			append(&disks, &n.disk)
-		}
-		append(&disks, &w.relay.disk)
-		for d in disks {
+		for d in world_disks(w) {
 			files := make([dynamic]Disk_File, context.temp_allocator)
 			disk_walk(d, &files)
 			fmt.eprintf("disk %s trace=%x digest=%x\n", d.name, d.trace, disk_digest(d))
@@ -422,6 +425,8 @@ finish :: proc(w: ^World) {
 		dump_replication(w)
 	}
 	check_redaction(w)
+	cipher_scan_relay(w)
+	cipher_resolve(w)
 	check_relay_redaction(w)
 	check_relay_plaintext(w)
 	check_mounts(w)
@@ -503,6 +508,7 @@ env_disabled :: proc() -> (out: bit_set[Op_Kind]) {
 }
 
 trace_events := false
+trace_bytes_at: u64
 
 FIXED_SEEDS :: [?]u64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
@@ -539,14 +545,32 @@ simulate :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		seed, _ := strconv.parse_u64(s)
 		replay := env_u64("SIM_REPLAY", 1) != 0
-		a := run_seed(seed, verbose)
+		ia, ib: Disk_Images
+		a := run_seed(seed, verbose, &ia if replay else nil, "first")
 		ok1 := report(t, &a)
 		if replay {
-			b := run_seed(seed, false)
-			if a.trace != b.trace {
-				fmt.eprintf("sim: seed %d is NOT deterministic: trace %x vs %x. Reproduce: SIM_SEED=%d odin test tests/sim -o:speed\n", seed, a.trace, b.trace, seed)
+			b := run_seed(seed, false, &ib, "second")
+			diffs := make([dynamic]string, runtime.heap_allocator())
+			same := disk_images_compare(&ia, &ib, &diffs)
+			if a.trace != b.trace || !same {
+				msg := fmt.aprintf("determinism: seed %d is NOT deterministic: two runs in one process differ (trace %x vs %x, disks %s)", seed, a.trace, b.trace, "identical" if same else "differ", allocator = runtime.heap_allocator())
+				fmt.eprintf("sim: seed %d FAILED (%s). Reproduce: SIM_SEED=%d odin test tests/sim -o:speed\n", seed, msg, seed)
+				for d in diffs {
+					fmt.eprintf("  %s\n", d)
+				}
+				inject_at(&a.failures, 0, msg)
+				for d, k in diffs {
+					inject_at(&a.failures, k + 1, d)
+				}
 				ok1 = false
+			} else {
+				for d in diffs {
+					delete(d, runtime.heap_allocator())
+				}
 			}
+			delete(diffs)
+			disk_images_free(&ia)
+			disk_images_free(&ib)
 			free_result(&b)
 		}
 		if fd := env_u64("SIM_STATS_FD", 0); fd > 0 {
@@ -607,8 +631,9 @@ simulate :: proc(t: ^testing.T) {
 	}
 	total: Run_Result
 	start := time.tick_now()
+	every := max(env_u64("SIM_REPLAY_EVERY", 1), 1)
 	for seed, i in seeds {
-		replay := count == 0 || i % 16 == 0
+		replay := count == 0 || u64(i) % every == 0
 		st, ok, why := run_child(seed, replay)
 		if !ok {
 			fmt.eprintf("sim: seed %d FAILED (%s). Reproduce: SIM_SEED=%d odin test tests/sim -o:speed\n", seed, why, seed)

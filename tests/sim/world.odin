@@ -181,6 +181,7 @@ World :: struct {
 	phase:     Phase,
 	ctx:       runtime.Context,
 	aborted:   bool,
+	cipher:    Cipher_Watch,
 	mem_checks: u64,
 	quarantines: [dynamic]Quarantine,
 	live:      [dynamic]^Live_Read,
@@ -281,11 +282,11 @@ pop_event :: proc(w: ^World) -> Sim_Event {
 }
 
 instance_begin :: proc(inst: ^Instance, slot: int) -> bool {
-	base := REGION_BASE + uintptr(slot) * REGION_STRIDE
-	if !region_map(&inst.main, base, MAIN_SIZE, false) {
+	base := REGION_BASE + uintptr(slot) * region_stride()
+	if !region_map(&inst.main, base, region_main_size, false) {
 		return false
 	}
-	if !region_map(&inst.temp, base + uintptr(MAIN_SIZE), TEMP_SIZE, true) {
+	if !region_map(&inst.temp, base + uintptr(region_main_size), region_temp_size, true) {
 		region_unmap(&inst.main)
 		return false
 	}
@@ -341,6 +342,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	w.failures = make([dynamic]string, w.allocator)
 	w.log = make([dynamic]string, w.allocator)
 	w.quarantines = make([dynamic]Quarantine, w.allocator)
+	cipher_init(w)
 	w.live = make([dynamic]^Live_Read, w.allocator)
 	rng_init(&w.rng, cfg.seed, 1)
 	rng_init(&w.net_rng, cfg.seed, 2)
@@ -396,6 +398,8 @@ world_destroy :: proc(w: ^World) {
 		delete(c.held)
 		delete(c.byz_buf)
 		delete(c.byz_hold)
+		delete(c.tap_up.buf)
+		delete(c.tap_down.buf)
 		free(c, w.allocator)
 	}
 	delete(w.conns)
@@ -412,6 +416,7 @@ world_destroy :: proc(w: ^World) {
 	}
 	delete(w.log)
 	delete(w.quarantines)
+	cipher_destroy(w)
 	for r in w.live {
 		free(r, w.allocator)
 	}

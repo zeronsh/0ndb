@@ -1493,8 +1493,9 @@ _reachable :: proc(d: ^Disk) -> map[u64]bool {
 }
 
 Disk_File :: struct {
-	path: string,
-	data: []u8,
+	path:    string,
+	data:    []u8,
+	durable: []u8,
 }
 
 disk_walk :: proc(d: ^Disk, out: ^[dynamic]Disk_File, allocator := context.temp_allocator) {
@@ -1515,7 +1516,7 @@ _walk :: proc(d: ^Disk, ino: u64, prefix: string, out: ^[dynamic]Disk_File, allo
 		p := strings.concatenate({prefix, "/", k}, allocator)
 		switch c.kind {
 		case .File:
-			append(out, Disk_File{path = p, data = c.data[:]})
+			append(out, Disk_File{path = p, data = c.data[:], durable = c.durable[:]})
 		case .Dir:
 			_walk(d, v, p, out, allocator)
 		case .Symlink:

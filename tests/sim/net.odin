@@ -34,6 +34,8 @@ Conn :: struct {
 	latency:      i64,
 	byz_buf:      [dynamic]u8,
 	byz_hold:     [dynamic]u8,
+	tap_up:       Tap,
+	tap_down:     Tap,
 }
 
 @(private = "file")
@@ -63,6 +65,8 @@ _t_open :: proc(data: rawptr, e: ^eng.Engine, link: eng.Link, peer: eng.Peer) ->
 	c.held = make([dynamic][]u8, w.allocator)
 	c.byz_buf = make([dynamic]u8, w.allocator)
 	c.byz_hold = make([dynamic]u8, w.allocator)
+	c.tap_up.buf = make([dynamic]u8, w.allocator)
+	c.tap_down.buf = make([dynamic]u8, w.allocator)
 	append(&w.conns, c)
 	append(&n.conns, c)
 	schedule(w, Sim_Event{at = w.now + _delay(c), kind = .Connect, conn = c, gen = c.gen})
@@ -91,6 +95,7 @@ _t_send :: proc(data: rawptr, conn: rawptr, bytes: []u8) -> (int, eng.Error) {
 		w.stats.backpressure += 1
 	}
 	c.to_relay += k
+	tap_feed(w, c, &c.tap_up, bytes[:k], false)
 	_emit_chunks(c, bytes[:k], .To_Relay)
 	return k, .None
 }
@@ -161,6 +166,7 @@ _r_send :: proc(data: rawptr, bytes: []u8, more: bool) -> (int, osync.Error) {
 		return k, .None
 	}
 	c.to_node += k
+	tap_feed(w, c, &c.tap_down, bytes[:k], true)
 	_emit_chunks(c, bytes[:k], .To_Node)
 	return k, .None
 }
