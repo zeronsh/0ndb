@@ -17,7 +17,7 @@ Options :: struct {
 	max_runs:       int,
 	compact_ratio:  f64,
 	filter_budget:  int,
-	now:            proc() -> i64,
+	clock:          prim.Clock,
 	wake:           proc(data: rawptr),
 	wake_data:      rawptr,
 	deferred_sync:  bool,

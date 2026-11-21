@@ -57,10 +57,7 @@ vfs :: proc(p: ^Pack) -> prim.Vfs {
 
 @(private)
 _now :: proc(p: ^Pack) -> i64 {
-	if p.opts.now != nil {
-		return p.opts.now()
-	}
-	return prim.now_ns()
+	return prim.clock_wall_ns(p.opts.clock)
 }
 
 @(private)
