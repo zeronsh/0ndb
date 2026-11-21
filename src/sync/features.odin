@@ -64,6 +64,9 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 			l = _local_open(r, scope, name, epoch, id, path) or_return
 		}
 		prev := stream_id(scope, r.cfg.self, name, epoch - 1)
+		if old, found := r.locals[prev]; found && old != l {
+			_local_supersede(r, old)
+		}
 		pb: prim.Path_Buf = ---
 		drop_path := _clone_string(_keys_path(r, &pb, prev), r.allocator) or_return
 		if len(l.drop_path) > 0 {

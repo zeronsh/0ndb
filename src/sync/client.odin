@@ -69,6 +69,7 @@ Client :: struct {
 	bind_len:  int,
 	out:       [dynamic]u8,
 	out_pos:   int,
+	frame_at:  int,
 	held:      [dynamic]u8,
 	streaming: bool,
 	parser:    Parser,
@@ -123,6 +124,7 @@ client_reset :: proc(c: ^Client) {
 		c.held = make([dynamic]u8, c.allocator)
 	}
 	c.out_pos = 0
+	c.frame_at = 0
 	c.streaming = false
 	c.hs_have = 0
 	c.state = .Idle
@@ -283,9 +285,17 @@ client_consumed :: proc(c: ^Client, n: int) {
 		c.sent_mark = c.epoch
 	}
 	c.out_pos += n
+	for c.frame_at + FRAME_HEADER <= len(c.out) {
+		size := FRAME_HEADER + int(prim.get_u32le(c.out[c.frame_at:]))
+		if c.frame_at + size > c.out_pos {
+			break
+		}
+		c.frame_at += size
+	}
 	if c.out_pos >= len(c.out) {
 		clear(&c.out)
 		c.out_pos = 0
+		c.frame_at = 0
 		if !c.streaming && len(c.held) > 0 {
 			append(&c.out, ..c.held[:])
 			clear(&c.held)
@@ -294,12 +304,47 @@ client_consumed :: proc(c: ^Client, n: int) {
 			delete(c.out)
 			c.out = make([dynamic]u8, c.allocator)
 		}
-	} else if c.out_pos > 1 << 20 && c.out_pos > len(c.out) / 2 {
-		rest := len(c.out) - c.out_pos
-		copy(c.out[:rest], c.out[c.out_pos:])
+	} else if c.frame_at > 1 << 20 && c.frame_at > len(c.out) / 2 {
+		rest := len(c.out) - c.frame_at
+		copy(c.out[:rest], c.out[c.frame_at:])
 		resize(&c.out, rest)
-		c.out_pos = 0
+		c.out_pos -= c.frame_at
+		c.frame_at = 0
 	}
+}
+
+client_cancel_appends :: proc(c: ^Client, id: Stream_Id) -> (removed: int) {
+	start := c.frame_at
+	if start < c.out_pos && start + FRAME_HEADER <= len(c.out) {
+		start += FRAME_HEADER + int(prim.get_u32le(c.out[start:]))
+	}
+	removed += _cancel_frames(&c.out, start, cast([32]u8)id)
+	removed += _cancel_frames(&c.held, 0, cast([32]u8)id)
+	for _ in 0 ..< removed {
+		_await_done(c, cast([32]u8)id)
+	}
+	return
+}
+
+@(private)
+_cancel_frames :: proc(buf: ^[dynamic]u8, from: int, id: [32]u8) -> (removed: int) {
+	key := id
+	pos := from
+	for pos + FRAME_HEADER <= len(buf) {
+		size := FRAME_HEADER + int(prim.get_u32le(buf[pos:]))
+		if pos + size > len(buf) {
+			break
+		}
+		if Kind(buf[pos + 4]) == .Append && size >= FRAME_HEADER + 32 && string(buf[pos + FRAME_HEADER:][:32]) == string(key[:]) {
+			rest := len(buf) - pos - size
+			copy(buf[pos:], buf[pos + size:])
+			resize(buf, pos + rest)
+			removed += 1
+			continue
+		}
+		pos += size
+	}
+	return
 }
 
 client_queued :: proc "contextless" (c: ^Client) -> int {

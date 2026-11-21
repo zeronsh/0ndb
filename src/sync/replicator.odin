@@ -810,26 +810,7 @@ _local_drop_prev :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	if prev, ok := r.locals[l.drop_id]; ok && prev != l {
-		prev.superseded = true
-		prev.durable = prev.cursor
-		prev.retry = false
-		prev.blocked = false
-		if prev.fd >= 0 {
-			prim.close_file(r.vfs, prev.fd)
-			prev.fd = prim.INVALID_FD
-		}
-		_local_maybe_free(r, prev)
-	}
-	if prev, ok := r.locals[l.drop_id]; ok && prev != l {
-		if prev.inflight > 0 {
-			r.uploading -= 1
-			prev.inflight = 0
-		}
-		prev.retry = false
-		prev.verifying = false
-		prev.ahead = 0
-		prev.cursor = prev.durable
-		_local_maybe_free(r, prev)
+		_local_supersede(r, prev)
 	}
 	if len(l.drop_path) > 0 {
 		journal.journal_remove(r.vfs, l.drop_path)
@@ -837,6 +818,37 @@ _local_drop_prev :: proc(r: ^Replicator, l: ^Local) {
 		l.drop_path = ""
 	}
 	l.dropping = false
+}
+
+@(private)
+_local_supersede :: proc(r: ^Replicator, l: ^Local) {
+	l.superseded = true
+	if l.dropping {
+		if r.phase == .Ready {
+			client_drop(&r.client, l.drop_id)
+		}
+		if len(l.drop_path) > 0 {
+			journal.journal_remove(r.vfs, l.drop_path)
+			delete(l.drop_path, r.allocator)
+			l.drop_path = ""
+		}
+		l.dropping = false
+	}
+	if l.inflight > 0 && client_cancel_appends(&r.client, l.id) > 0 {
+		r.uploading -= 1
+		l.inflight = 0
+	}
+	l.retry = false
+	l.blocked = false
+	l.verifying = false
+	clear(&l.verify)
+	l.ahead = 0
+	l.durable = l.cursor
+	if l.fd >= 0 {
+		prim.close_file(r.vfs, l.fd)
+		l.fd = prim.INVALID_FD
+	}
+	_local_maybe_free(r, l)
 }
 
 @(private)
