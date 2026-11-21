@@ -400,6 +400,7 @@ _redact_settle :: proc(e: ^Engine) {
 		return
 	}
 	e.redact_tick = e.tick
+	e.rlog.idle = true
 	_redact_recover(e)
 }
 
@@ -781,9 +782,6 @@ _purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid, m: ^convo.Message) {
 		if len(b.text) > 0 {
 			append(&texts, string(b.text))
 			append(&bodies, string(b.text))
-		}
-		if len(b.name) > 0 && b.kind == .Tool_Call {
-			append(&texts, b.name)
 		}
 	}
 	if len(ids) == 0 && len(texts) == 0 && len(m.native) == 0 && obj.rid_none(m.claim) {

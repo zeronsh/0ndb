@@ -39,7 +39,6 @@ Registry :: struct {
 	open:    bool,
 	staged:  map[prim.Id][]u8,
 	sstaged: map[prim.Id][]u8,
-	pending: map[[32]u8]i64,
 	meta:    bool,
 }
 
@@ -85,7 +84,6 @@ _registry_open :: proc(e: ^Engine) -> Error {
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.sstaged = make(map[prim.Id][]u8, e.allocator)
-	e.reg.pending = make(map[[32]u8]i64, e.allocator)
 	return .None
 }
 
@@ -104,14 +102,13 @@ _registry_close :: proc(e: ^Engine) {
 	}
 	delete(e.reg.staged)
 	delete(e.reg.sstaged)
-	delete(e.reg.pending)
 	omap.db_close(&e.reg.db)
 	e.reg.open = false
 }
 
 @(private)
 _registry_flush :: proc(e: ^Engine) -> Error {
-	if !e.reg.open || (len(e.reg.staged) == 0 && len(e.reg.sstaged) == 0 && len(e.reg.pending) == 0) {
+	if !e.reg.open || (len(e.reg.staged) == 0 && len(e.reg.sstaged) == 0) {
 		return .None
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
@@ -134,28 +131,10 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 			return _oerr(err)
 		}
 	}
-	for k in _sorted_keys(e.reg.pending) {
-		v := e.reg.pending[k]
-		key := k
-		if v < 0 {
-			if _, err := omap.txn_delete(t, ROOT_PENDING, key[:]); err != .None {
-				omap.txn_abort(t)
-				return _oerr(err)
-			}
-			continue
-		}
-		b: [8]u8
-		prim.put_u64le(b[:], u64(v))
-		if err := omap.txn_put(t, ROOT_PENDING, key[:], b[:]); err != .None {
-			omap.txn_abort(t)
-			return _oerr(err)
-		}
-	}
 	if err := omap.txn_commit(t); err != .None {
 		return _oerr(err)
 	}
 	e.reg.meta = true
-	clear(&e.reg.pending)
 	for _, v in e.reg.staged {
 		delete(v, e.allocator)
 	}

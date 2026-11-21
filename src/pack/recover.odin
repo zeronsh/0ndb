@@ -350,6 +350,7 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 		_sync_dirty_conts(p) or_return
 	}
 	p.recovering = false
+	p.unclean = !sb.clean
 	_suspect_repair(p) or_return
 	if !sb.clean {
 		for id in ext_ids {

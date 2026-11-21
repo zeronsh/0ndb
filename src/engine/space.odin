@@ -4,6 +4,7 @@ import "core:crypto"
 import "core:crypto/blake2b"
 import "../journal"
 import omap "../map"
+import "../pack"
 import "../prim"
 import osync "../sync"
 
@@ -799,30 +800,77 @@ _pending_key :: proc(space: prim.Id, object: prim.Id) -> (k: [32]u8) {
 
 @(private)
 _pending_set :: proc(e: ^Engine, space: prim.Id, object: prim.Id, length: i64) {
-	k := _pending_key(space, object)
-	if cur, ok := e.reg.pending[k]; ok && cur >= length {
-		return
-	}
-	e.reg.pending[k] = length
-	_touch(e)
+	_rlog_pend_set(e, _pending_key(space, object), length)
 }
 
 @(private)
 _pending_clear :: proc(e: ^Engine, space: prim.Id, object: prim.Id, length: i64) {
-	k := _pending_key(space, object)
-	if cur, ok := e.reg.pending[k]; ok {
-		if cur >= 0 && cur <= length {
-			e.reg.pending[k] = -1
-			_touch(e)
+	_rlog_pend_clear(e, _pending_key(space, object), length)
+}
+
+@(private)
+_pending_recover :: proc(e: ^Engine, sp: ^Space) {
+	if !e.pk_open || !pack.unclean(&e.pk) || !sp.repl_on || !_rlog_ready(e) || e.rlog.scanned[sp.id] {
+		return
+	}
+	e.rlog.scanned[sp.id] = true
+	Own :: struct {
+		id:   prim.Id,
+		kind: Kind,
+	}
+	Acc :: struct {
+		e:    ^Engine,
+		sp:   ^Space,
+		list: [dynamic]Own,
+	}
+	acc := Acc{e = e, sp = sp, list = make([dynamic]Own, context.temp_allocator)}
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		a := (^Acc)(data)
+		if len(key) != 16 {
+			return true
 		}
-		return
+		rec, err := _rec_decode(value, context.temp_allocator)
+		if err != .None || rec.space != a.sp.id || !rec.own {
+			return true
+		}
+		x: prim.Id
+		copy(x[:], key)
+		append(&a.list, Own{x, rec.kind})
+		return true
 	}
-	v, found, gerr := omap.db_get(&e.reg.db, ROOT_PENDING, k[:], context.temp_allocator)
-	if gerr != .None || !found || len(v) != 8 || i64(prim.get_u64le(v)) > length {
-		return
+	for k, v in e.reg.staged {
+		x := k
+		visit(&acc, x[:], v)
 	}
-	e.reg.pending[k] = -1
-	_touch(e)
+	omap.db_scan(&e.reg.db, ROOT_OBJECTS, nil, nil, &acc, visit)
+	for o in acc.list {
+		k := _pending_key(sp.id, o.id)
+		if _, known := e.rlog.pend[k]; known {
+			continue
+		}
+		path: string
+		perr: Error
+		if o.kind == .Text || o.kind == .File_Tree {
+			d := _obj_dir(e, o.id) or_continue
+			path, perr = _join(context.temp_allocator, d, "hist", "fs.journal")
+		} else {
+			path, perr = _seg_path(e, o.id)
+		}
+		if perr != .None {
+			continue
+		}
+		st, serr := prim.stat(e.vfs, path)
+		if serr != .None {
+			continue
+		}
+		sc := _object_scope(sp, o.id)
+		floor, ferr := osync.replicator_floor(&sp.repl, &sc, _seg_name(o.kind, o.id), 0)
+		osync.scope_clear(&sc)
+		if ferr != .None || st.size <= floor {
+			continue
+		}
+		_rlog_pend_set(e, k, RLOG_UNKNOWN)
+	}
 }
 
 @(private)
@@ -833,17 +881,19 @@ _pending_republish :: proc(e: ^Engine, sp: ^Space) {
 		list: [dynamic]prim.Id,
 	}
 	acc := Acc{e = e, sp = sp, list = make([dynamic]prim.Id, context.temp_allocator)}
-	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
-		a := (^Acc)(data)
-		if len(key) == 32 {
-			id: prim.Id
-			copy(id[:], key[16:])
-			append(&a.list, id)
-		}
-		return true
+	_pending_recover(e, sp)
+	if !_rlog_ready(e) {
+		return
 	}
 	s := sp.id
-	omap.db_scan(&e.reg.db, ROOT_PENDING, s[:], s[:], &acc, visit)
+	for kk in e.rlog.pend {
+		k := kk
+		if string(k[:16]) == string(s[:]) {
+			id: prim.Id
+			copy(id[:], k[16:])
+			append(&acc.list, id)
+		}
+	}
 	for id in acc.list {
 		rec, found, err := _rec_get(e, id)
 		if err != .None || !found || !rec.own {
@@ -857,6 +907,9 @@ _pending_republish :: proc(e: ^Engine, sp: ^Space) {
 		length := _own_len(h)
 		if length > 0 {
 			_dirty_add(e, h, path, length)
+		}
+		if cur, ok := &e.rlog.pend[_pending_key(sp.id, id)]; ok && cur^ == RLOG_UNKNOWN {
+			cur^ = length
 		}
 		_dirty_keys(e, sp, id, rec.kind, h.scope, h.own_tree)
 	}

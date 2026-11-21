@@ -514,7 +514,7 @@ scrub_value :: proc(plan: Purge_Plan, v: json.Value) -> json.Value {
 	case json.Object:
 		out := make(json.Object, context.temp_allocator)
 		for k, e in x {
-			out[scrub_string(plan, k)] = scrub_value(plan, e)
+			out[k] = e if is_structural(k) else scrub_value(plan, e)
 		}
 		return out
 	}
@@ -522,23 +522,55 @@ scrub_value :: proc(plan: Purge_Plan, v: json.Value) -> json.Value {
 }
 
 @(private)
+SCRUB_MIN :: 32
+
+@(private)
+target_in :: proc(s: string, text: string) -> bool {
+	if text == "" {
+		return false
+	}
+	if s == text || strings.trim_space(s) == strings.trim_space(text) {
+		return true
+	}
+	return len(text) >= SCRUB_MIN && strings.contains(s, text)
+}
+
+@(private)
 contains_target :: proc(plan: Purge_Plan, v: json.Value) -> bool {
-	s := to_json(v)
-	for t in plan.targets {
-		if t.text != "" && strings.contains(s, t.text) {
-			return true
+	found := false
+	walk :: proc(plan: Purge_Plan, v: json.Value, found: ^bool) {
+		#partial switch x in v {
+		case json.String:
+			for t in plan.targets {
+				found^ ||= target_in(string(x), t.text)
+			}
+		case json.Array:
+			for e in x {
+				walk(plan, e, found)
+			}
+		case json.Object:
+			for k, e in x {
+				if !is_structural(k) {
+					walk(plan, e, found)
+				}
+			}
 		}
 	}
-	return false
+	walk(plan, v, &found)
+	return found
 }
 
 @(private)
 scrub_string :: proc(plan: Purge_Plan, s: string) -> string {
 	out := s
 	for t in plan.targets {
-		if t.text != "" && strings.contains(out, t.text) {
-			out, _ = strings.replace_all(out, t.text, REDACTED, context.temp_allocator)
+		if !target_in(out, t.text) {
+			continue
 		}
+		if len(t.text) < SCRUB_MIN {
+			return REDACTED
+		}
+		out, _ = strings.replace_all(out, t.text, REDACTED, context.temp_allocator)
 	}
 	return out
 }
@@ -547,7 +579,7 @@ scrub_string :: proc(plan: Purge_Plan, s: string) -> string {
 scrub_raw :: proc(plan: Purge_Plan, data: []u8, allocator := context.allocator) -> []u8 {
 	rw := make([dynamic]Rewrite, context.temp_allocator)
 	for t in plan.targets {
-		if t.text != "" {
+		if len(t.text) >= SCRUB_MIN {
 			append(&rw, Rewrite{from = t.text, to = REDACTED})
 		}
 	}
@@ -555,7 +587,13 @@ scrub_raw :: proc(plan: Purge_Plan, data: []u8, allocator := context.allocator) 
 }
 
 purge_text :: proc(plan: Purge_Plan, data: []u8, allocator := context.allocator) -> []u8 {
-	return scrub_raw(plan, data, allocator)
+	rw := make([dynamic]Rewrite, context.temp_allocator)
+	for t in plan.targets {
+		if t.text != "" {
+			append(&rw, Rewrite{from = t.text, to = REDACTED})
+		}
+	}
+	return apply_rewrites(Port_Plan{rewrites = rw[:]}, data, allocator)
 }
 
 @(private)

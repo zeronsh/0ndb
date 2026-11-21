@@ -156,6 +156,7 @@ Pack :: struct {
 	dcache:        [DCACHE]Dcache_Entry,
 	poisoned:      bool,
 	recovering:    bool,
+	unclean:       bool,
 	batch:         int,
 	stats:         Stats,
 	filters_cold:  bool,
