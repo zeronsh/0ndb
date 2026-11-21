@@ -486,17 +486,12 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 	}
 	s.log_end = start + u64(len(s.out))
 	pos := 0
-	for oi in order {
-		p := s.pending[oi]
+	for _ in order {
 		n := int(prim.get_u32le(s.out[pos:pos + 4]))
 		r := decode_rec(s.out[pos + 8:][:n], s.oid_size) or_return
 		r.off = start + u64(pos)
 		r.size = u64(n + 8)
-		if p.fresh {
-			apply_fresh(s, r) or_return
-		} else {
-			apply_rec(s, r, false) or_return
-		}
+		apply_rec(s, r, false) or_return
 		pos += n + 8
 	}
 	for parent, info in parents {
@@ -765,49 +760,6 @@ apply_rec :: proc(s: ^Shadow, rec: Rec, link := true) -> Error {
 		inode_set(s, r.entry.inode, r.off) or_return
 	}
 	return .None
-}
-
-@(private = "file")
-apply_fresh :: proc(s: ^Shadow, r: Rec) -> Error {
-	h := path_hash(r.path)
-	mask := s.cap - 1
-	i := h & mask
-	block: [SHADOW_BLOCK]u8
-	placed := false
-	step := u64(8)
-	for scanned: u64 = 0; scanned < s.cap && !placed; {
-		n := min(step, s.cap - i)
-		step = SHADOW_BLOCK / SHADOW_PATH_SLOT
-		buf := block[:n * SHADOW_PATH_SLOT]
-		idx_read(s, buf, SHADOW_HEADER + i * SHADOW_PATH_SLOT) or_return
-		for k in 0 ..< n {
-			if prim.get_u64le(buf[k * SHADOW_PATH_SLOT:][:8]) == 0 {
-				write_path_slot(s, i + k, Path_Slot{hash = h, off = r.off, link = r.off if r.linked else 0}) or_return
-				placed = true
-				break
-			}
-		}
-		scanned += n
-		i = (i + n) & mask
-	}
-	if !placed {
-		return .Corrupt
-	}
-	s.used += 1
-	s.live += 1
-	ih := inode_hash(r.entry.inode)
-	j := ih & mask
-	for _ in 0 ..< s.cap {
-		slot := read_inode_slot(s, j) or_return
-		if slot.hash == 0 || slot.off == 0 {
-			if slot.hash == 0 {
-				s.inode_used += 1
-			}
-			return write_inode_slot(s, j, Inode_Slot{ih, r.off})
-		}
-		j = (j + 1) & mask
-	}
-	return .Corrupt
 }
 
 @(private = "file")
