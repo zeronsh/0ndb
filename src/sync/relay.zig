@@ -6,6 +6,7 @@ const linux = std.os.linux;
 const id = @import("../core/id.zig");
 const crypto = @import("../store/crypto.zig");
 const log_mod = @import("../store/log.zig");
+const mmap = @import("../store/mmap.zig");
 const wire = @import("wire.zig");
 
 const TopicId = [32]u8;
@@ -23,6 +24,49 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_WRITE_TIMEOUT_MS: u64 = 15_000;
 pub const DEFAULT_MAX_CONNS_PER_IP: usize = 64;
 pub const DEFAULT_MAX_FRAMES_PER_TICK: usize = 32;
+
+pub const MIN_LEASE_TTL_MS: u64 = 1000;
+pub const MAX_LEASE_TTL_MS: u64 = 300_000;
+
+const LEASE_STATE_FILE = "leases.state";
+const LEASE_STATE_MAGIC: [8]u8 = .{ '0', 'N', 'D', 'B', 'L', 'S', 'E', '1' };
+const LEASE_STATE_VERSION: u32 = 1;
+const LEASE_ENTRY_LEN: usize = 32 + wire.LeaseResponse.ENCODED_LEN;
+
+pub const TopicLeaseState = struct {
+    holder_runner_id: u128 = 0,
+    fencing_epoch: u64 = 0,
+    expires_ms: u64 = 0,
+    handoff_target: ?u128 = null,
+    canceled: bool = false,
+    cancel_epoch: u64 = 0,
+
+    pub fn toResponse(self: TopicLeaseState) wire.LeaseResponse {
+        return .{
+            .holder_runner_id = self.holder_runner_id,
+            .fencing_epoch = self.fencing_epoch,
+            .expires_ms = self.expires_ms,
+            .handoff_target = self.handoff_target,
+            .canceled = self.canceled,
+            .cancel_epoch = self.cancel_epoch,
+        };
+    }
+
+    pub fn fromResponse(resp: wire.LeaseResponse) TopicLeaseState {
+        return .{
+            .holder_runner_id = resp.holder_runner_id,
+            .fencing_epoch = resp.fencing_epoch,
+            .expires_ms = resp.expires_ms,
+            .handoff_target = resp.handoff_target,
+            .canceled = resp.canceled,
+            .cancel_epoch = resp.cancel_epoch,
+        };
+    }
+};
+
+fn clampLeaseTtl(ttl_ms: u64) u64 {
+    return std.math.clamp(ttl_ms, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
+}
 
 pub fn scopedBlobKey(topic: TopicId, oid: [32]u8) [32]u8 {
     var h = std.crypto.hash.Blake3.init(.{});
@@ -61,19 +105,35 @@ const Grant = struct {
     read: PermSlot = .{},
     write: PermSlot = .{},
     sub: PermSlot = .{},
+    inbox_append: PermSlot = .{},
+    lease: PermSlot = .{},
 
-    fn merge(self: *Grant, perms: u8, expires_ms: u64) void {
+    fn merge(self: *Grant, perms: u32, expires_ms: u64) void {
         if ((perms & wire.PERM_READ) != 0) self.read.merge(expires_ms);
         if ((perms & wire.PERM_WRITE) != 0) self.write.merge(expires_ms);
         if ((perms & wire.PERM_SUB) != 0) self.sub.merge(expires_ms);
+        if ((perms & wire.PERM_INBOX_APPEND) != 0) self.inbox_append.merge(expires_ms);
+        if ((perms & wire.PERM_LEASE) != 0) self.lease.merge(expires_ms);
     }
 
-    fn allows(self: Grant, mask: u8, now_ms: u64) bool {
-        if (mask == 0 or (mask & ~wire.PERM_ALL) != 0) return false;
+    fn allows(self: Grant, mask: u32, now_ms: u64) bool {
+        if (mask == 0 or (mask & ~wire.PERM_ALL_V3) != 0) return false;
         if ((mask & wire.PERM_READ) != 0 and !self.read.active(now_ms)) return false;
         if ((mask & wire.PERM_WRITE) != 0 and !self.write.active(now_ms)) return false;
         if ((mask & wire.PERM_SUB) != 0 and !self.sub.active(now_ms)) return false;
+        if ((mask & wire.PERM_INBOX_APPEND) != 0 and !self.inbox_append.active(now_ms)) return false;
+        if ((mask & wire.PERM_LEASE) != 0 and !self.lease.active(now_ms)) return false;
         return true;
+    }
+
+    fn allowsAny(self: Grant, mask: u32, now_ms: u64) bool {
+        if (mask == 0 or (mask & ~wire.PERM_ALL_V3) != 0) return false;
+        if ((mask & wire.PERM_READ) != 0 and self.read.active(now_ms)) return true;
+        if ((mask & wire.PERM_WRITE) != 0 and self.write.active(now_ms)) return true;
+        if ((mask & wire.PERM_SUB) != 0 and self.sub.active(now_ms)) return true;
+        if ((mask & wire.PERM_INBOX_APPEND) != 0 and self.inbox_append.active(now_ms)) return true;
+        if ((mask & wire.PERM_LEASE) != 0 and self.lease.active(now_ms)) return true;
+        return false;
     }
 };
 
@@ -120,9 +180,14 @@ const PeerConn = struct {
         self.subs.deinit(allocator);
     }
 
-    fn hasPerm(self: *const PeerConn, topic: TopicId, mask: u8, now_ms: u64) bool {
+    fn hasPerm(self: *const PeerConn, topic: TopicId, mask: u32, now_ms: u64) bool {
         const g = self.perms.get(topic) orelse return false;
         return g.allows(mask, now_ms);
+    }
+
+    fn hasAnyPerm(self: *const PeerConn, topic: TopicId, mask: u32, now_ms: u64) bool {
+        const g = self.perms.get(topic) orelse return false;
+        return g.allowsAny(mask, now_ms);
     }
 
     fn pendingTxBytes(self: *const PeerConn) usize {
@@ -185,6 +250,8 @@ pub const RelayServer = struct {
     closing_fds: std.ArrayList(posix.fd_t),
     closing_overflow: bool,
     topics: std.AutoHashMapUnmanaged(TopicId, log_mod.AppendLog),
+    lease_mu: Io.Mutex,
+    leases: std.AutoHashMapUnmanaged(TopicId, TopicLeaseState),
     tmp_seq: u64,
     running: std.atomic.Value(bool),
 
@@ -257,7 +324,7 @@ pub const RelayServer = struct {
             return error.EpollCtlFailed;
         }
 
-        return .{
+        var server = RelayServer{
             .allocator = allocator,
             .io = io,
             .auth_secret = auth_secret,
@@ -279,9 +346,14 @@ pub const RelayServer = struct {
             .closing_fds = .empty,
             .closing_overflow = false,
             .topics = .empty,
+            .lease_mu = Io.Mutex.init,
+            .leases = .empty,
             .tmp_seq = 0,
             .running = std.atomic.Value(bool).init(true),
         };
+        errdefer server.leases.deinit(allocator);
+        try server.loadLeases();
+        return server;
     }
 
     pub fn deinit(self: *RelayServer) void {
@@ -301,12 +373,75 @@ pub const RelayServer = struct {
             while (it.next()) |t| t.deinit();
             self.topics.deinit(self.allocator);
         }
+        self.leases.deinit(self.allocator);
         crypto.zeroize(&self.auth_secret);
         _ = linux.close(self.epfd);
         _ = linux.close(self.wake_fd);
         _ = linux.close(self.listen_fd);
         self.blob_dir.close(self.io);
         self.state_dir.close(self.io);
+    }
+
+    fn loadLeases(self: *RelayServer) !void {
+        const f = self.state_dir.openFile(self.io, LEASE_STATE_FILE, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer f.close(self.io);
+        const st = try f.stat(self.io);
+        const file_len: usize = @intCast(st.size);
+        if (file_len < 16 + 32) return error.CorruptLeaseState;
+        const buf = try self.allocator.alloc(u8, file_len);
+        defer self.allocator.free(buf);
+        const n = try f.readPositionalAll(self.io, buf, 0);
+        if (n != file_len) return error.CorruptLeaseState;
+
+        if (!std.mem.eql(u8, buf[0..8], &LEASE_STATE_MAGIC)) return error.CorruptLeaseState;
+        const version = std.mem.readInt(u32, buf[8..12], .little);
+        if (version != LEASE_STATE_VERSION) return error.CorruptLeaseState;
+        const count = std.mem.readInt(u32, buf[12..16], .little);
+        const expected_len = 16 + @as(usize, count) * LEASE_ENTRY_LEN + 32;
+        if (file_len != expected_len) return error.CorruptLeaseState;
+
+        const payload_end = file_len - 32;
+        const digest = crypto.hashBytes(buf[0..payload_end]);
+        if (!std.crypto.timing_safe.eql([32]u8, digest, buf[payload_end..][0..32].*)) {
+            return error.CorruptLeaseState;
+        }
+
+        var pos: usize = 16;
+        for (0..count) |_| {
+            const topic: TopicId = buf[pos..][0..32].*;
+            pos += 32;
+            const resp = try wire.LeaseResponse.decode(buf[pos .. pos + wire.LeaseResponse.ENCODED_LEN]);
+            pos += wire.LeaseResponse.ENCODED_LEN;
+            try self.leases.put(self.allocator, topic, TopicLeaseState.fromResponse(resp));
+        }
+    }
+
+    fn persistLeasesLocked(self: *RelayServer) !void {
+        const count = self.leases.count();
+        const total_len = 16 + count * LEASE_ENTRY_LEN + 32;
+        const buf = try self.allocator.alloc(u8, total_len);
+        defer self.allocator.free(buf);
+
+        @memcpy(buf[0..8], &LEASE_STATE_MAGIC);
+        std.mem.writeInt(u32, buf[8..12], LEASE_STATE_VERSION, .little);
+        std.mem.writeInt(u32, buf[12..16], @intCast(count), .little);
+
+        var pos: usize = 16;
+        var it = self.leases.iterator();
+        while (it.next()) |entry| {
+            @memcpy(buf[pos..][0..32], entry.key_ptr);
+            pos += 32;
+            const enc = entry.value_ptr.toResponse().encode();
+            @memcpy(buf[pos .. pos + wire.LeaseResponse.ENCODED_LEN], &enc);
+            pos += wire.LeaseResponse.ENCODED_LEN;
+        }
+        const digest = crypto.hashBytes(buf[0..pos]);
+        @memcpy(buf[pos..][0..32], &digest);
+
+        try mmap.atomicWriteFile(self.io, self.state_dir, LEASE_STATE_FILE, buf);
     }
 
     pub fn stop(self: *RelayServer) void {
@@ -555,10 +690,18 @@ pub const RelayServer = struct {
 
     fn sendErr(self: *RelayServer, peer: *PeerConn, code: wire.ErrCode, msg: []const u8) void {
         var buf: [256]u8 = undefined;
-        buf[0] = @intFromEnum(code);
+        buf[0] = @backingInt(code);
         const n = @min(msg.len, buf.len - 1);
         @memcpy(buf[1 .. 1 + n], msg[0..n]);
         self.sendToPeer(peer, .err, 0, buf[0 .. 1 + n]) catch {};
+    }
+
+    fn sendLeaseErr(self: *RelayServer, peer: *PeerConn, code: wire.ErrCode, resp: wire.LeaseResponse) void {
+        var buf: [1 + wire.LeaseResponse.ENCODED_LEN]u8 = undefined;
+        buf[0] = @backingInt(code);
+        const enc = resp.encode();
+        @memcpy(buf[1..], &enc);
+        self.sendToPeer(peer, .err, 0, &buf) catch {};
     }
 
     fn handlePeerEvent(self: *RelayServer, fd: posix.fd_t, revents: u32) void {
@@ -646,40 +789,137 @@ pub const RelayServer = struct {
         return gop.value_ptr;
     }
 
-    fn checkPerm(self: *const RelayServer, peer: *const PeerConn, topic: TopicId, mask: u8) bool {
+    fn checkPerm(self: *const RelayServer, peer: *const PeerConn, topic: TopicId, mask: u32) bool {
         if (!self.require_auth) return true;
         return peer.hasPerm(topic, mask, id.nowMs(self.io));
+    }
+
+    fn checkAnyPerm(self: *const RelayServer, peer: *const PeerConn, topic: TopicId, mask: u32) bool {
+        if (!self.require_auth) return true;
+        return peer.hasAnyPerm(topic, mask, id.nowMs(self.io));
+    }
+
+    fn appendAndBroadcastFrame(self: *RelayServer, peer: *PeerConn, topic: TopicId, opaque_bytes: []const u8) !void {
+        const tlog = try self.getOrOpenTopic(topic);
+        const seq = try tlog.append(1, 0, 0, opaque_bytes);
+
+        var ack: [8]u8 = undefined;
+        std.mem.writeInt(u64, &ack, seq, .little);
+        try self.sendToPeer(peer, .ack, 0, &ack);
+
+        const ev_payload = try self.allocator.alloc(u8, 32 + 8 + opaque_bytes.len);
+        defer self.allocator.free(ev_payload);
+        @memcpy(ev_payload[0..32], &topic);
+        std.mem.writeInt(u64, ev_payload[32..40], seq, .little);
+        if (opaque_bytes.len > 0) @memcpy(ev_payload[40..], opaque_bytes);
+
+        const encoded_ev = try wire.encodeFrame(self.allocator, .frame_event, 0, ev_payload);
+        defer self.allocator.free(encoded_ev);
+
+        const now_ms = id.nowMs(self.io);
+        var pit = self.peers.valueIterator();
+        while (pit.next()) |other_ptr| {
+            const other = other_ptr.*;
+            if (other.closing) continue;
+            if (other.subs.contains(topic)) {
+                if (self.require_auth and !other.hasPerm(topic, wire.PERM_SUB, now_ms)) {
+                    _ = other.subs.remove(topic);
+                    continue;
+                }
+                other.queueBytes(self.allocator, encoded_ev) catch {
+                    if (other.fd != peer.fd) self.markPeerClosing(other.fd);
+                    continue;
+                };
+                if (!self.flushPeerTx(other)) {
+                    if (other.fd != peer.fd) self.markPeerClosing(other.fd);
+                }
+            }
+        }
+    }
+
+    fn broadcastLeaseCancel(self: *RelayServer, origin_peer: *PeerConn, topic: TopicId, resp: wire.LeaseResponse) !void {
+        var ev_payload: [32 + wire.LeaseResponse.ENCODED_LEN]u8 = undefined;
+        @memcpy(ev_payload[0..32], &topic);
+        const enc = resp.encode();
+        @memcpy(ev_payload[32..], &enc);
+
+        const encoded_ev = try wire.encodeFrame(self.allocator, .lease_cancel_event, 0, &ev_payload);
+        defer self.allocator.free(encoded_ev);
+
+        const now_ms = id.nowMs(self.io);
+        var pit = self.peers.valueIterator();
+        while (pit.next()) |other_ptr| {
+            const other = other_ptr.*;
+            if (other.closing) continue;
+            if (other.subs.contains(topic)) {
+                if (self.require_auth and !other.hasPerm(topic, wire.PERM_SUB, now_ms)) {
+                    _ = other.subs.remove(topic);
+                    continue;
+                }
+                other.queueBytes(self.allocator, encoded_ev) catch {
+                    if (other.fd != origin_peer.fd) self.markPeerClosing(other.fd);
+                    continue;
+                };
+                if (!self.flushPeerTx(other)) {
+                    if (other.fd != origin_peer.fd) self.markPeerClosing(other.fd);
+                }
+            }
+        }
     }
 
     fn dispatchFrame(self: *RelayServer, peer: *PeerConn, op: wire.Op, payload: []const u8) !void {
         peer.last_activity_ms = id.nowMs(self.io);
         switch (op) {
             .auth => {
-                if (payload.len != 32 + 1 + 8 + 32) {
+                if (payload.len == 32 + 1 + 8 + 32) {
+                    const topic: TopicId = payload[0..32].*;
+                    const perms_u8 = payload[32];
+                    const perms: u32 = perms_u8;
+                    if (perms == 0 or (perms & ~wire.PERM_ALL_V3) != 0) {
+                        self.sendErr(peer, .bad_frame, "bad perms");
+                        return;
+                    }
+                    const expires = std.mem.readInt(u64, payload[33..41], .little);
+                    const mac: crypto.Mac = payload[41..73].*;
+                    if (self.require_auth and !crypto.verifyCapabilityToken(self.auth_secret, topic, perms_u8, expires, mac, id.nowMs(self.io))) {
+                        self.sendErr(peer, .unauthorized, "invalid token");
+                        return;
+                    }
+                    const gop = try peer.perms.getOrPut(self.allocator, topic);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .{};
+                    }
+                    gop.value_ptr.merge(perms, expires);
+                    peer.authed = true;
+                    var ack: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &ack, 0, .little);
+                    try self.sendToPeer(peer, .ack, 0, &ack);
+                } else if (payload.len == wire.AUTH_V3_LEN) {
+                    const topic: TopicId = payload[0..32].*;
+                    const perms = std.mem.readInt(u32, payload[32..36], .little);
+                    if (perms == 0 or (perms & ~wire.PERM_ALL_V3) != 0) {
+                        self.sendErr(peer, .bad_frame, "bad perms");
+                        return;
+                    }
+                    const expires = std.mem.readInt(u64, payload[36..44], .little);
+                    const mac: crypto.Mac = payload[44..76].*;
+                    if (self.require_auth and !crypto.verifyCapabilityTokenV3(self.auth_secret, topic, perms, expires, mac, id.nowMs(self.io))) {
+                        self.sendErr(peer, .unauthorized, "invalid token");
+                        return;
+                    }
+                    const gop = try peer.perms.getOrPut(self.allocator, topic);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .{};
+                    }
+                    gop.value_ptr.merge(perms, expires);
+                    peer.authed = true;
+                    var ack: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &ack, 0, .little);
+                    try self.sendToPeer(peer, .ack, 0, &ack);
+                } else {
                     self.sendErr(peer, .bad_frame, "bad auth");
                     return;
                 }
-                const topic: TopicId = payload[0..32].*;
-                const perms = payload[32];
-                if (perms == 0 or (perms & ~wire.PERM_ALL) != 0) {
-                    self.sendErr(peer, .bad_frame, "bad perms");
-                    return;
-                }
-                const expires = std.mem.readInt(u64, payload[33..41], .little);
-                const mac: crypto.Mac = payload[41..73].*;
-                if (self.require_auth and !crypto.verifyCapabilityToken(self.auth_secret, topic, perms, expires, mac, id.nowMs(self.io))) {
-                    self.sendErr(peer, .unauthorized, "invalid token");
-                    return;
-                }
-                const gop = try peer.perms.getOrPut(self.allocator, topic);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = .{};
-                }
-                gop.value_ptr.merge(perms, expires);
-                peer.authed = true;
-                var ack: [8]u8 = undefined;
-                std.mem.writeInt(u64, &ack, 0, .little);
-                try self.sendToPeer(peer, .ack, 0, &ack);
             },
             .put_frame => {
                 if (payload.len < 32) {
@@ -687,7 +927,7 @@ pub const RelayServer = struct {
                     return;
                 }
                 const topic: TopicId = payload[0..32].*;
-                if (!self.checkPerm(peer, topic, wire.PERM_WRITE)) {
+                if (!self.checkAnyPerm(peer, topic, @as(u32, wire.PERM_WRITE) | wire.PERM_INBOX_APPEND)) {
                     self.sendErr(peer, .unauthorized, "write denied");
                     return;
                 }
@@ -696,41 +936,289 @@ pub const RelayServer = struct {
                     self.sendErr(peer, .bad_frame, "frame payload too large");
                     return;
                 }
-                const tlog = try self.getOrOpenTopic(topic);
-                const seq = try tlog.append(1, 0, 0, opaque_bytes);
+                try self.appendAndBroadcastFrame(peer, topic, opaque_bytes);
+            },
+            .put_frame_fenced => {
+                const req = wire.PutFrameFencedReq.decode(payload) catch {
+                    self.sendErr(peer, .bad_frame, "bad put_frame_fenced");
+                    return;
+                };
+                if (!self.checkPerm(peer, req.topic, @as(u32, wire.PERM_WRITE) | wire.PERM_LEASE)) {
+                    self.sendErr(peer, .unauthorized, "fenced write denied");
+                    return;
+                }
+                if (req.frame.len > MAX_OPAQUE_PAYLOAD) {
+                    self.sendErr(peer, .bad_frame, "frame payload too large");
+                    return;
+                }
 
-                var ack: [8]u8 = undefined;
-                std.mem.writeInt(u64, &ack, seq, .little);
-                try self.sendToPeer(peer, .ack, 0, &ack);
-
-                const ev_payload = try self.allocator.alloc(u8, 32 + 8 + opaque_bytes.len);
-                defer self.allocator.free(ev_payload);
-                @memcpy(ev_payload[0..32], &topic);
-                std.mem.writeInt(u64, ev_payload[32..40], seq, .little);
-                if (opaque_bytes.len > 0) @memcpy(ev_payload[40..], opaque_bytes);
-
-                const encoded_ev = try wire.encodeFrame(self.allocator, .frame_event, 0, ev_payload);
-                defer self.allocator.free(encoded_ev);
-
-                const now_ms = id.nowMs(self.io);
-                var pit = self.peers.valueIterator();
-                while (pit.next()) |other_ptr| {
-                    const other = other_ptr.*;
-                    if (other.closing) continue;
-                    if (other.subs.contains(topic)) {
-                        if (self.require_auth and !other.hasPerm(topic, wire.PERM_SUB, now_ms)) {
-                            _ = other.subs.remove(topic);
-                            continue;
+                var fence_err: ?wire.ErrCode = null;
+                var fence_resp: wire.LeaseResponse = .{};
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    const now_ms = id.nowMs(self.io);
+                    if (self.leases.get(req.topic)) |st| {
+                        fence_resp = st.toResponse();
+                        if (st.fencing_epoch == 0 or st.holder_runner_id == 0 or req.required_epoch != st.fencing_epoch or now_ms >= st.expires_ms) {
+                            fence_err = .fenced;
+                        } else if (st.canceled) {
+                            fence_err = .cancelled;
                         }
-                        other.queueBytes(self.allocator, encoded_ev) catch {
-                            if (other.fd != peer.fd) self.markPeerClosing(other.fd);
-                            continue;
-                        };
-                        if (!self.flushPeerTx(other)) {
-                            if (other.fd != peer.fd) self.markPeerClosing(other.fd);
-                        }
+                    } else {
+                        fence_err = .fenced;
                     }
                 }
+                if (fence_err) |code| {
+                    self.sendLeaseErr(peer, code, fence_resp);
+                    return;
+                }
+                try self.appendAndBroadcastFrame(peer, req.topic, req.frame);
+            },
+            .lease_acquire => {
+                const req = wire.LeaseAcquireReq.decode(payload) catch {
+                    self.sendErr(peer, .bad_frame, "bad lease_acquire");
+                    return;
+                };
+                if (req.runner_id == 0) {
+                    self.sendErr(peer, .bad_frame, "zero runner_id");
+                    return;
+                }
+                if (!self.checkPerm(peer, req.topic, wire.PERM_LEASE)) {
+                    self.sendErr(peer, .unauthorized, "lease denied");
+                    return;
+                }
+
+                var resp: wire.LeaseResponse = .{};
+                var err_code: ?wire.ErrCode = null;
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    const gop = try self.leases.getOrPut(self.allocator, req.topic);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .{};
+                    }
+                    const st = gop.value_ptr;
+                    const now_ms = id.nowMs(self.io);
+                    const ttl = clampLeaseTtl(req.ttl_ms);
+
+                    const is_vacant_or_expired = (st.holder_runner_id == 0) or (now_ms >= st.expires_ms);
+                    const is_same_holder = (st.holder_runner_id == req.runner_id) and (st.fencing_epoch == req.expected_epoch) and (now_ms < st.expires_ms);
+                    const is_handoff = (st.handoff_target != null) and (st.handoff_target.? == req.runner_id) and (st.fencing_epoch == req.expected_epoch);
+
+                    if (is_vacant_or_expired or is_handoff) {
+                        st.fencing_epoch += 1;
+                        st.holder_runner_id = req.runner_id;
+                        st.expires_ms = now_ms +| ttl;
+                        st.handoff_target = null;
+                        st.canceled = false;
+                        self.persistLeasesLocked() catch {
+                            self.sendErr(peer, .internal, "lease persist failed");
+                            return;
+                        };
+                        resp = st.toResponse();
+                    } else if (is_same_holder) {
+                        if (st.canceled) {
+                            err_code = .cancelled;
+                            resp = st.toResponse();
+                        } else {
+                            st.expires_ms = now_ms +| ttl;
+                            self.persistLeasesLocked() catch {
+                                self.sendErr(peer, .internal, "lease persist failed");
+                                return;
+                            };
+                            resp = st.toResponse();
+                        }
+                    } else {
+                        err_code = .lease_held;
+                        resp = st.toResponse();
+                    }
+                }
+                if (err_code) |code| {
+                    self.sendLeaseErr(peer, code, resp);
+                    return;
+                }
+                const enc = resp.encode();
+                try self.sendToPeer(peer, .lease_resp, 0, &enc);
+            },
+            .lease_renew => {
+                const req = wire.LeaseRenewReq.decode(payload) catch {
+                    self.sendErr(peer, .bad_frame, "bad lease_renew");
+                    return;
+                };
+                if (!self.checkPerm(peer, req.topic, wire.PERM_LEASE)) {
+                    self.sendErr(peer, .unauthorized, "lease denied");
+                    return;
+                }
+
+                var resp: wire.LeaseResponse = .{};
+                var err_code: ?wire.ErrCode = null;
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    const now_ms = id.nowMs(self.io);
+                    if (self.leases.getPtr(req.topic)) |st| {
+                        if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch or now_ms >= st.expires_ms) {
+                            err_code = .fenced;
+                            resp = st.toResponse();
+                        } else if (st.canceled) {
+                            err_code = .cancelled;
+                            resp = st.toResponse();
+                        } else {
+                            st.expires_ms = now_ms +| clampLeaseTtl(req.ttl_ms);
+                            self.persistLeasesLocked() catch {
+                                self.sendErr(peer, .internal, "lease persist failed");
+                                return;
+                            };
+                            resp = st.toResponse();
+                        }
+                    } else {
+                        err_code = .fenced;
+                    }
+                }
+                if (err_code) |code| {
+                    self.sendLeaseErr(peer, code, resp);
+                    return;
+                }
+                const enc = resp.encode();
+                try self.sendToPeer(peer, .lease_resp, 0, &enc);
+            },
+            .lease_handoff => {
+                const req = wire.LeaseHandoffReq.decode(payload) catch {
+                    self.sendErr(peer, .bad_frame, "bad lease_handoff");
+                    return;
+                };
+                if (req.target_runner_id == 0) {
+                    self.sendErr(peer, .bad_frame, "zero target_runner_id");
+                    return;
+                }
+                if (!self.checkPerm(peer, req.topic, wire.PERM_LEASE)) {
+                    self.sendErr(peer, .unauthorized, "lease denied");
+                    return;
+                }
+
+                var resp: wire.LeaseResponse = .{};
+                var err_code: ?wire.ErrCode = null;
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    const now_ms = id.nowMs(self.io);
+                    if (self.leases.getPtr(req.topic)) |st| {
+                        if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch or now_ms >= st.expires_ms) {
+                            err_code = .fenced;
+                            resp = st.toResponse();
+                        } else if (st.canceled) {
+                            err_code = .cancelled;
+                            resp = st.toResponse();
+                        } else {
+                            st.handoff_target = req.target_runner_id;
+                            self.persistLeasesLocked() catch {
+                                self.sendErr(peer, .internal, "lease persist failed");
+                                return;
+                            };
+                            resp = st.toResponse();
+                        }
+                    } else {
+                        err_code = .fenced;
+                    }
+                }
+                if (err_code) |code| {
+                    self.sendLeaseErr(peer, code, resp);
+                    return;
+                }
+                const enc = resp.encode();
+                try self.sendToPeer(peer, .lease_resp, 0, &enc);
+            },
+            .lease_release => {
+                const req = wire.LeaseReleaseReq.decode(payload) catch {
+                    self.sendErr(peer, .bad_frame, "bad lease_release");
+                    return;
+                };
+                if (!self.checkPerm(peer, req.topic, wire.PERM_LEASE)) {
+                    self.sendErr(peer, .unauthorized, "lease denied");
+                    return;
+                }
+
+                var resp: wire.LeaseResponse = .{};
+                var err_code: ?wire.ErrCode = null;
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    if (self.leases.getPtr(req.topic)) |st| {
+                        if (st.holder_runner_id != req.runner_id or st.fencing_epoch != req.fencing_epoch) {
+                            err_code = .fenced;
+                            resp = st.toResponse();
+                        } else {
+                            st.expires_ms = 0;
+                            st.holder_runner_id = 0;
+                            st.handoff_target = null;
+                            self.persistLeasesLocked() catch {
+                                self.sendErr(peer, .internal, "lease persist failed");
+                                return;
+                            };
+                            resp = st.toResponse();
+                        }
+                    } else {
+                        err_code = .fenced;
+                    }
+                }
+                if (err_code) |code| {
+                    self.sendLeaseErr(peer, code, resp);
+                    return;
+                }
+                const enc = resp.encode();
+                try self.sendToPeer(peer, .lease_resp, 0, &enc);
+            },
+            .lease_cancel => {
+                const req = wire.LeaseCancelReq.decode(payload) catch {
+                    self.sendErr(peer, .bad_frame, "bad lease_cancel");
+                    return;
+                };
+                if (!self.checkPerm(peer, req.topic, wire.PERM_LEASE)) {
+                    self.sendErr(peer, .unauthorized, "lease denied");
+                    return;
+                }
+
+                var resp: wire.LeaseResponse = .{};
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    const gop = try self.leases.getOrPut(self.allocator, req.topic);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .{};
+                    }
+                    const st = gop.value_ptr;
+                    st.canceled = true;
+                    st.cancel_epoch = @max(req.cancel_epoch, st.cancel_epoch);
+                    self.persistLeasesLocked() catch {
+                        self.sendErr(peer, .internal, "lease persist failed");
+                        return;
+                    };
+                    resp = st.toResponse();
+                }
+                const enc = resp.encode();
+                try self.sendToPeer(peer, .lease_resp, 0, &enc);
+                try self.broadcastLeaseCancel(peer, req.topic, resp);
+            },
+            .lease_status => {
+                const req = wire.LeaseStatusReq.decode(payload) catch {
+                    self.sendErr(peer, .bad_frame, "bad lease_status");
+                    return;
+                };
+                if (!self.checkAnyPerm(peer, req.topic, @as(u32, wire.PERM_READ) | wire.PERM_LEASE)) {
+                    self.sendErr(peer, .unauthorized, "status denied");
+                    return;
+                }
+                var resp: wire.LeaseResponse = .{};
+                {
+                    self.lease_mu.lockUncancelable(self.io);
+                    defer self.lease_mu.unlock(self.io);
+                    if (self.leases.get(req.topic)) |st| {
+                        resp = st.toResponse();
+                    }
+                }
+                const enc = resp.encode();
+                try self.sendToPeer(peer, .lease_resp, 0, &enc);
             },
             .get_range => {
                 if (payload.len != 32 + 8 + 4) {

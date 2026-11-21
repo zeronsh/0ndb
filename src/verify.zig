@@ -3366,6 +3366,590 @@ fn runDiffAndMerge3PropertyFuzz(allocator: std.mem.Allocator) !void {
     defer allocator.free(cm.output);
     try testing.expect(cm.has_conflict);
     try testing.expect(std.mem.indexOf(u8, cm.output, "<<<<<<< ") != null);
+
+    try runSyncV3AndLeasesSuite(allocator, testing.io);
+}
+
+fn connectRawRelayForVerify(port: u16) !std.posix.fd_t {
+    const linux = std.os.linux;
+    const s_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(s_rc) != .SUCCESS) return error.SocketFailed;
+    const fd: std.posix.fd_t = @intCast(s_rc);
+    errdefer _ = linux.close(fd);
+
+    var one: i32 = 1;
+    _ = linux.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(i32));
+    ondb.sync.wire.setSocketTimeouts(fd, 5000) catch {};
+
+    var addr = linux.sockaddr.in{
+        .family = linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    if (linux.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        return error.ConnectFailed;
+    }
+    return fd;
+}
+
+fn runSyncV3AndLeasesSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const crypto = ondb.store.crypto;
+    const wire = ondb.sync.wire;
+    const relay = ondb.sync.relay;
+    const keyring_mod = ondb.sync.keyring;
+    const lease_mod = ondb.sync.lease;
+    const id = ondb.core.id;
+    const linux = std.os.linux;
+
+    const topic_a = id.streamId("syncv3-a", 101);
+    const topic_b = id.streamId("syncv3-b", 102);
+    const topic_inbox = id.streamId("syncv3-inbox", 103);
+    const local_oid_1 = crypto.hashBytes("blob-oid-1");
+    const local_oid_2 = crypto.hashBytes("blob-oid-2");
+
+    {
+        var ek1 = crypto.EntityKey.generate(io, 1);
+        defer ek1.zeroize();
+        var ek2 = crypto.EntityKey{ .key = ek1.key, .epoch = 2 };
+        defer ek2.zeroize();
+
+        const sk_a_e1 = crypto.deriveStreamKeyV3(&ek1, topic_a);
+        const sk_a_e2 = crypto.deriveStreamKeyV3(&ek2, topic_a);
+        const sk_b_e1 = crypto.deriveStreamKeyV3(&ek1, topic_b);
+        const snap_a_e1 = crypto.deriveSnapshotKeyV3(&ek1, topic_a);
+        const blob_a_1 = crypto.deriveBlobLookupIdV3(&ek1, topic_a, local_oid_1);
+        const blob_a_2 = crypto.deriveBlobLookupIdV3(&ek1, topic_a, local_oid_2);
+        const blob_a_e2 = crypto.deriveBlobLookupIdV3(&ek2, topic_a, local_oid_1);
+
+        try testing.expect(!std.mem.eql(u8, &sk_a_e1, &sk_a_e2));
+        try testing.expect(!std.mem.eql(u8, &sk_a_e1, &sk_b_e1));
+        try testing.expect(!std.mem.eql(u8, &sk_a_e1, &snap_a_e1));
+        try testing.expect(!std.mem.eql(u8, &sk_a_e1, &blob_a_1));
+        try testing.expect(!std.mem.eql(u8, &blob_a_1, &blob_a_2));
+        try testing.expect(!std.mem.eql(u8, &blob_a_1, &blob_a_e2));
+
+        var root1 = crypto.AccountRootKey.generate(io);
+        defer root1.zeroize();
+        var root2 = crypto.AccountRootKey.generate(io);
+        defer root2.zeroize();
+
+        const wrapped = try crypto.wrapEntityKeyForAccount(allocator, io, &root1, topic_a, &ek1);
+        defer allocator.free(wrapped);
+
+        var unwrapped = try crypto.unwrapEntityKeyForAccount(allocator, &root1, topic_a, wrapped);
+        defer unwrapped.zeroize();
+        try testing.expectEqual(ek1.epoch, unwrapped.epoch);
+        try testing.expectEqualSlices(u8, &ek1.key, &unwrapped.key);
+
+        try testing.expectError(error.AuthenticationFailed, crypto.unwrapEntityKeyForAccount(allocator, &root2, topic_a, wrapped));
+        try testing.expectError(error.AuthenticationFailed, crypto.unwrapEntityKeyForAccount(allocator, &root1, topic_b, wrapped));
+
+        const tampered = try allocator.dupe(u8, wrapped);
+        defer allocator.free(tampered);
+        tampered[tampered.len - 1] ^= 0xFF;
+        try testing.expectError(error.AuthenticationFailed, crypto.unwrapEntityKeyForAccount(allocator, &root1, topic_a, tampered));
+
+        var dev_target = crypto.DeviceKeypair.generate(io);
+        defer dev_target.zeroize();
+        var dev_wrong = crypto.DeviceKeypair.generate(io);
+        defer dev_wrong.zeroize();
+
+        const zero_pub: [32]u8 = @splat(0);
+        try testing.expectError(error.InvalidPublicKey, crypto.sealToDevicePubkey(allocator, io, zero_pub, "aad", "msg"));
+
+        const sealed_box = try crypto.sealToDevicePubkey(allocator, io, dev_target.public_key, "box-aad", "secret-device-payload");
+        defer allocator.free(sealed_box);
+        const opened_box = try crypto.openWithDeviceSecret(allocator, dev_target.secret_key, "box-aad", sealed_box);
+        defer allocator.free(opened_box);
+        try testing.expectEqualStrings("secret-device-payload", opened_box);
+
+        try testing.expectError(error.AuthenticationFailed, crypto.openWithDeviceSecret(allocator, dev_wrong.secret_key, "box-aad", sealed_box));
+        try testing.expectError(error.AuthenticationFailed, crypto.openWithDeviceSecret(allocator, dev_target.secret_key, "wrong-aad", sealed_box));
+
+        const now_ms = id.nowMs(io);
+        const grants_arr = try allocator.alloc(crypto.DelegationGrant, 1);
+        grants_arr[0] = .{
+            .topic_id = topic_a,
+            .entity_key = ek1,
+            .perms = @as(u32, wire.PERM_READ) | wire.PERM_INBOX_APPEND,
+            .expires_ms = now_ms + 60_000,
+            .token = try allocator.dupe(u8, "opaque-tok-v3"),
+        };
+        var bundle = crypto.DelegationBundle{
+            .issued_by_runner = 1001,
+            .target_runner = 2002,
+            .issued_ms = now_ms,
+            .expires_ms = now_ms + 60_000,
+            .grants = grants_arr,
+        };
+        defer bundle.deinit(allocator);
+
+        const sealed_bundle = try bundle.sealForDevice(allocator, io, dev_target.public_key);
+        defer allocator.free(sealed_bundle);
+
+        var opened_bundle = try crypto.DelegationBundle.openForDevice(allocator, dev_target.secret_key, 2002, sealed_bundle);
+        defer opened_bundle.deinit(allocator);
+        try testing.expectEqual(@as(u128, 1001), opened_bundle.issued_by_runner);
+        try testing.expectEqual(@as(u128, 2002), opened_bundle.target_runner);
+        try testing.expectEqual(@as(usize, 1), opened_bundle.grants.len);
+        try testing.expectEqualSlices(u8, &ek1.key, &opened_bundle.grants[0].entity_key.key);
+        try testing.expectEqualStrings("opaque-tok-v3", opened_bundle.grants[0].token);
+
+        try testing.expectError(
+            error.AuthenticationFailed,
+            crypto.DelegationBundle.openForDevice(allocator, dev_wrong.secret_key, 2002, sealed_bundle),
+        );
+        try testing.expectError(
+            error.AuthenticationFailed,
+            crypto.DelegationBundle.openForDevice(allocator, dev_target.secret_key, 9999, sealed_bundle),
+        );
+    }
+
+    {
+        const kr_dir_path = "/tmp/0ndb-verify-syncv3-keyring";
+        cleanDir(io, kr_dir_path);
+        defer cleanDir(io, kr_dir_path);
+        try std.Io.Dir.cwd().createDirPath(io, kr_dir_path);
+        var kr_dir = try std.Io.Dir.cwd().openDir(io, kr_dir_path, .{ .iterate = true });
+        defer kr_dir.close(io);
+
+        const root = crypto.AccountRootKey.generate(io);
+        var captain = keyring_mod.Keyring.initAccountDevice(allocator, io, root, 0xAAAA);
+        defer captain.deinit();
+        var sub = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xBBBB);
+        defer sub.deinit();
+        var sub2 = keyring_mod.Keyring.initSubordinateDevice(allocator, io, 0xCCCC);
+        defer sub2.deinit();
+
+        const now_ms = id.nowMs(io);
+        const cap_exp = now_ms + 120_000;
+        const ek_init = crypto.EntityKey.generate(io, 1);
+        try captain.setTopicGrant(
+            topic_a,
+            ek_init,
+            @as(u32, wire.PERM_READ) | wire.PERM_WRITE | wire.PERM_LEASE,
+            cap_exp,
+            "cap-token-a",
+        );
+
+        const wrapped_acc = try captain.exportWrappedForAccount(allocator, topic_a);
+        defer allocator.free(wrapped_acc);
+        var captain_clone = keyring_mod.Keyring.initAccountDevice(allocator, io, root, 0xAAAB);
+        defer captain_clone.deinit();
+        const imported_ek = try captain_clone.importWrappedForAccount(topic_a, wrapped_acc);
+        try testing.expectEqualSlices(u8, &ek_init.key, &imported_ek.key);
+        try testing.expectError(error.MissingAccountRootKey, sub.importWrappedForAccount(topic_a, wrapped_acc));
+
+        const sub_exp = now_ms + 60_000;
+        const sealed_to_sub = try captain.createDelegationBundle(
+            allocator,
+            sub.runner_id,
+            sub.device_keypair.public_key,
+            sub_exp,
+            &.{.{
+                .topic_id = topic_a,
+                .perms = wire.PERM_READ,
+                .expires_ms = sub_exp,
+            }},
+        );
+        defer allocator.free(sealed_to_sub);
+
+        const imported_n = try sub.importDelegationBundle(sealed_to_sub);
+        try testing.expectEqual(@as(usize, 1), imported_n);
+        const sub_grant = sub.getTopicGrant(topic_a).?;
+        try testing.expectEqual(@as(u32, wire.PERM_READ), sub_grant.perms);
+        try testing.expectEqualStrings("cap-token-a", sub_grant.token);
+
+        try testing.expectError(
+            error.PrivilegeEscalation,
+            sub.createDelegationBundle(
+                allocator,
+                sub2.runner_id,
+                sub2.device_keypair.public_key,
+                sub_exp - 1000,
+                &.{.{
+                    .topic_id = topic_a,
+                    .perms = @as(u32, wire.PERM_READ) | wire.PERM_WRITE,
+                    .expires_ms = sub_exp - 1000,
+                }},
+            ),
+        );
+        try testing.expectError(
+            error.ExpiryEscalation,
+            sub.createDelegationBundle(
+                allocator,
+                sub2.runner_id,
+                sub2.device_keypair.public_key,
+                sub_exp + 10_000,
+                &.{.{
+                    .topic_id = topic_a,
+                    .perms = wire.PERM_READ,
+                    .expires_ms = sub_exp + 10_000,
+                }},
+            ),
+        );
+        try testing.expectError(
+            error.ExpiryEscalation,
+            sub.createDelegationBundle(
+                allocator,
+                sub2.runner_id,
+                sub2.device_keypair.public_key,
+                0,
+                &.{.{
+                    .topic_id = topic_a,
+                    .perms = wire.PERM_READ,
+                    .expires_ms = 0,
+                }},
+            ),
+        );
+
+        const exp_grants = try allocator.alloc(crypto.DelegationGrant, 1);
+        exp_grants[0] = .{
+            .topic_id = topic_a,
+            .entity_key = ek_init,
+            .perms = wire.PERM_READ,
+            .expires_ms = now_ms - 10,
+            .token = try allocator.dupe(u8, "expired"),
+        };
+        var exp_bundle = crypto.DelegationBundle{
+            .issued_by_runner = captain.runner_id,
+            .target_runner = sub2.runner_id,
+            .issued_ms = now_ms - 100,
+            .expires_ms = now_ms - 5,
+            .grants = exp_grants,
+        };
+        defer exp_bundle.deinit(allocator);
+        const sealed_exp = try exp_bundle.sealForDevice(allocator, io, sub2.device_keypair.public_key);
+        defer allocator.free(sealed_exp);
+        try testing.expectError(error.BundleExpired, sub2.importDelegationBundle(sealed_exp));
+
+        const rotated = try captain.rotateEntityKey(topic_a);
+        try testing.expectEqual(@as(u32, 2), rotated.epoch);
+        try testing.expect(!std.mem.eql(u8, &ek_init.key, &rotated.key));
+        try testing.expect(captain.getEntityKeyForEpoch(topic_a, 1) == null);
+        try testing.expect(captain.getEntityKeyForEpoch(topic_a, 2) != null);
+        try testing.expectError(error.EpochDowngrade, captain.setEntityKey(topic_a, ek_init));
+
+        try captain.saveAtomic(kr_dir, "captain.kr");
+        var loaded = try keyring_mod.Keyring.load(allocator, io, kr_dir, "captain.kr");
+        defer loaded.deinit();
+        try testing.expectEqual(captain.runner_id, loaded.runner_id);
+        try testing.expectEqualSlices(u8, &captain.account_root_key.?.bytes, &loaded.account_root_key.?.bytes);
+        try testing.expectEqualSlices(u8, &captain.device_keypair.public_key, &loaded.device_keypair.public_key);
+        const loaded_ek = loaded.getEntityKey(topic_a).?;
+        try testing.expectEqual(@as(u32, 2), loaded_ek.epoch);
+        try testing.expectEqualSlices(u8, &rotated.key, &loaded_ek.key);
+        try testing.expect(loaded.getEntityKeyForEpoch(topic_a, 1) == null);
+
+        {
+            const kf = try kr_dir.openFile(io, "captain.kr", .{ .mode = .read_write });
+            defer kf.close(io);
+            var b: [1]u8 = undefined;
+            _ = try kf.readPositionalAll(io, &b, 20);
+            b[0] ^= 0x55;
+            try kf.writePositionalAll(io, &b, 20);
+        }
+        try testing.expectError(error.CorruptKeyring, keyring_mod.Keyring.load(allocator, io, kr_dir, "captain.kr"));
+    }
+
+    {
+        const relay_dir = "/tmp/0ndb-verify-syncv3-relay";
+        const lm_dir_a = "/tmp/0ndb-verify-syncv3-lm-a";
+        const lm_dir_b = "/tmp/0ndb-verify-syncv3-lm-b";
+        const lm_dir_c = "/tmp/0ndb-verify-syncv3-lm-c";
+        const lm_dir_d = "/tmp/0ndb-verify-syncv3-lm-d";
+        cleanDir(io, relay_dir);
+        cleanDir(io, lm_dir_a);
+        cleanDir(io, lm_dir_b);
+        cleanDir(io, lm_dir_c);
+        cleanDir(io, lm_dir_d);
+        defer cleanDir(io, relay_dir);
+        defer cleanDir(io, lm_dir_a);
+        defer cleanDir(io, lm_dir_b);
+        defer cleanDir(io, lm_dir_c);
+        defer cleanDir(io, lm_dir_d);
+
+        const secret = crypto.hashBytes("syncv3-lease-relay-secret");
+        var saved_epoch: u64 = 0;
+
+        {
+            var server = try relay.RelayServer.start(
+                allocator,
+                io,
+                relay_dir,
+                .{ 127, 0, 0, 1 },
+                0,
+                secret,
+                true,
+            );
+            defer server.deinit();
+            const port = server.port;
+
+            const srv_thread = try std.Thread.spawn(.{}, relayThreadMain, .{&server});
+            defer {
+                server.stop();
+                srv_thread.join();
+            }
+
+            const runner_a: u128 = 0x1111;
+            const runner_b: u128 = 0x2222;
+            const runner_c: u128 = 0x3333;
+            const runner_d: u128 = 0x4444;
+
+            const cfg = lease_mod.RelayConfig{
+                .host_ip = .{ 127, 0, 0, 1 },
+                .port = port,
+                .auth_secret = secret,
+                .io_timeout_ms = 5000,
+            };
+
+            var lm_a = try lease_mod.LeaseManager.init(allocator, io, lm_dir_a, runner_a, cfg);
+            defer lm_a.deinit();
+            var lm_b = try lease_mod.LeaseManager.init(allocator, io, lm_dir_b, runner_b, cfg);
+            defer lm_b.deinit();
+            var lm_c = try lease_mod.LeaseManager.init(allocator, io, lm_dir_c, runner_c, cfg);
+            defer lm_c.deinit();
+            var lm_d = try lease_mod.LeaseManager.init(allocator, io, lm_dir_d, runner_d, cfg);
+            defer lm_d.deinit();
+
+            const t_before = id.nowMs(io);
+            var h_a = try lm_a.acquire(topic_a, 0, 50);
+            try testing.expectEqual(lease_mod.LeaseMode.relay_fenced, h_a.mode);
+            try testing.expectEqual(@as(u64, 1), h_a.fencing_epoch);
+            try testing.expect(h_a.expires_ms >= t_before + 1000);
+            try testing.expect(lm_a.isStillValid(&h_a));
+
+            try lm_a.renew(&h_a, 1000);
+            const seq1 = try lm_a.putFrameFenced(&h_a, "fenced-frame-1");
+            try testing.expectEqual(@as(u64, 1), seq1);
+
+            try testing.expectError(error.LeaseHeld, lm_b.acquire(topic_a, 0, 5000));
+            try testing.expectEqual(runner_a, lm_b.last_lease_response.?.holder_runner_id);
+            try testing.expectEqual(@as(u64, 1), lm_b.last_lease_response.?.fencing_epoch);
+
+            io.sleep(.fromMilliseconds(1100), .awake) catch {};
+
+            var h_b = try lm_b.acquire(topic_a, 0, 10_000);
+            try testing.expectEqual(@as(u64, 2), h_b.fencing_epoch);
+            try testing.expectEqual(runner_b, h_b.runner_id);
+
+            try testing.expectError(error.Fenced, lm_a.renew(&h_a, 5000));
+            try testing.expectError(error.Fenced, lm_a.putFrameFenced(&h_a, "stale-frame-from-a"));
+
+            const seq2 = try lm_b.putFrameFenced(&h_b, "fenced-frame-2");
+            try testing.expectEqual(@as(u64, 2), seq2);
+
+            const ho_resp = try lm_b.handoff(&h_b, runner_c);
+            try testing.expectEqual(@as(?u128, runner_c), ho_resp.handoff_target);
+
+            try testing.expectError(error.LeaseHeld, lm_d.acquire(topic_a, h_b.fencing_epoch, 5000));
+
+            var h_c = try lm_c.acquire(topic_a, h_b.fencing_epoch, 10_000);
+            try testing.expectEqual(@as(u64, 3), h_c.fencing_epoch);
+            try testing.expectEqual(runner_c, h_c.runner_id);
+            try testing.expectError(error.Fenced, lm_b.putFrameFenced(&h_b, "post-handoff-b"));
+            const seq3 = try lm_c.putFrameFenced(&h_c, "fenced-frame-3");
+            try testing.expectEqual(@as(u64, 3), seq3);
+
+            const sub_fd = try connectRawRelayForVerify(port);
+            defer _ = linux.close(sub_fd);
+            {
+                const sub_mac = crypto.deriveCapabilityTokenV3(secret, topic_a, wire.PERM_SUB, 0);
+                const auth_p = wire.encodeAuthV3(topic_a, wire.PERM_SUB, 0, sub_mac);
+                try wire.writeFrameWithTimeout(allocator, sub_fd, .auth, 0, &auth_p, 5000);
+                var ar = try wire.readFrameWithTimeout(allocator, sub_fd, 5000);
+                defer ar.deinit(allocator);
+                try testing.expectEqual(wire.Op.ack, ar.op);
+
+                var sp: [40]u8 = undefined;
+                @memcpy(sp[0..32], &topic_a);
+                std.mem.writeInt(u64, sp[32..40], std.math.maxInt(u64), .little);
+                try wire.writeFrameWithTimeout(allocator, sub_fd, .subscribe, 0, &sp, 5000);
+                var sr = try wire.readFrameWithTimeout(allocator, sub_fd, 5000);
+                defer sr.deinit(allocator);
+                try testing.expectEqual(wire.Op.ack, sr.op);
+            }
+
+            const cancel_resp = try lm_d.cancelTopic(topic_a, h_c.fencing_epoch);
+            try testing.expect(cancel_resp.canceled);
+            try testing.expectEqual(h_c.fencing_epoch, cancel_resp.cancel_epoch);
+
+            try testing.expectError(error.LeaseCancelled, lm_c.renew(&h_c, 5000));
+            try testing.expectError(error.LeaseCancelled, lm_c.putFrameFenced(&h_c, "cancelled-write"));
+
+            var cancel_ev = try wire.readFrameWithTimeout(allocator, sub_fd, 5000);
+            defer cancel_ev.deinit(allocator);
+            try testing.expectEqual(wire.Op.lease_cancel_event, cancel_ev.op);
+            try testing.expectEqual(@as(usize, 32 + wire.LeaseResponse.ENCODED_LEN), cancel_ev.payload.len);
+            const ev_lr = try wire.LeaseResponse.decode(cancel_ev.payload[32..]);
+            try testing.expect(ev_lr.canceled);
+
+            try lm_c.release(&h_c);
+            saved_epoch = h_c.fencing_epoch;
+
+            const inbox_fd = try connectRawRelayForVerify(port);
+            defer _ = linux.close(inbox_fd);
+            const inbox_tok = lease_mod.TopicToken.mint(secret, topic_inbox, wire.PERM_INBOX_APPEND, 0);
+            const inbox_auth = wire.encodeAuthV3(inbox_tok.topic, inbox_tok.perms, inbox_tok.expires_ms, inbox_tok.mac);
+            try wire.writeFrameWithTimeout(allocator, inbox_fd, .auth, 0, &inbox_auth, 5000);
+            {
+                var r = try wire.readFrameWithTimeout(allocator, inbox_fd, 5000);
+                defer r.deinit(allocator);
+                try testing.expectEqual(wire.Op.ack, r.op);
+            }
+
+            {
+                var pf: [32 + 12]u8 = undefined;
+                @memcpy(pf[0..32], &topic_inbox);
+                @memcpy(pf[32..], "inbox-report");
+                try wire.writeFrameWithTimeout(allocator, inbox_fd, .put_frame, 0, &pf, 5000);
+                var r = try wire.readFrameWithTimeout(allocator, inbox_fd, 5000);
+                defer r.deinit(allocator);
+                try testing.expectEqual(wire.Op.ack, r.op);
+                try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, r.payload[0..8], .little));
+            }
+            {
+                var gr: [44]u8 = undefined;
+                @memcpy(gr[0..32], &topic_inbox);
+                std.mem.writeInt(u64, gr[32..40], 0, .little);
+                std.mem.writeInt(u32, gr[40..44], 10, .little);
+                try wire.writeFrameWithTimeout(allocator, inbox_fd, .get_range, 0, &gr, 5000);
+                var r = try wire.readFrameWithTimeout(allocator, inbox_fd, 5000);
+                defer r.deinit(allocator);
+                try testing.expectEqual(wire.Op.err, r.op);
+                const ep = try wire.decodeErrPayload(r.payload);
+                try testing.expectEqual(wire.ErrCode.unauthorized, ep.code);
+            }
+            {
+                var sb: [40]u8 = undefined;
+                @memcpy(sb[0..32], &topic_inbox);
+                std.mem.writeInt(u64, sb[32..40], 0, .little);
+                try wire.writeFrameWithTimeout(allocator, inbox_fd, .subscribe, 0, &sb, 5000);
+                var r = try wire.readFrameWithTimeout(allocator, inbox_fd, 5000);
+                defer r.deinit(allocator);
+                try testing.expectEqual(wire.Op.err, r.op);
+                const ep = try wire.decodeErrPayload(r.payload);
+                try testing.expectEqual(wire.ErrCode.unauthorized, ep.code);
+            }
+            {
+                const la = (wire.LeaseAcquireReq{
+                    .topic = topic_inbox,
+                    .runner_id = 0x5555,
+                    .expected_epoch = 0,
+                    .ttl_ms = 5000,
+                }).encode();
+                try wire.writeFrameWithTimeout(allocator, inbox_fd, wire.REQ_LEASE_ACQUIRE, 0, &la, 5000);
+                var r = try wire.readFrameWithTimeout(allocator, inbox_fd, 5000);
+                defer r.deinit(allocator);
+                try testing.expectEqual(wire.Op.err, r.op);
+                const ep = try wire.decodeErrPayload(r.payload);
+                try testing.expectEqual(wire.ErrCode.unauthorized, ep.code);
+            }
+            {
+                const pff = try (wire.PutFrameFencedReq{
+                    .topic = topic_inbox,
+                    .required_epoch = 1,
+                    .frame = "tamper",
+                }).encode(allocator);
+                defer allocator.free(pff);
+                try wire.writeFrameWithTimeout(allocator, inbox_fd, wire.REQ_PUT_FRAME_FENCED, 0, pff, 5000);
+                var r = try wire.readFrameWithTimeout(allocator, inbox_fd, 5000);
+                defer r.deinit(allocator);
+                try testing.expectEqual(wire.Op.err, r.op);
+                const ep = try wire.decodeErrPayload(r.payload);
+                try testing.expectEqual(wire.ErrCode.unauthorized, ep.code);
+            }
+            {
+                var lm_inbox = try lease_mod.LeaseManager.init(allocator, io, lm_dir_d, 0x5556, .{
+                    .host_ip = .{ 127, 0, 0, 1 },
+                    .port = port,
+                    .auth_secret = null,
+                    .io_timeout_ms = 5000,
+                });
+                defer lm_inbox.deinit();
+                try lm_inbox.setTopicToken(inbox_tok);
+                try testing.expectError(error.Unauthorized, lm_inbox.acquire(topic_inbox, 0, 5000));
+            }
+        }
+
+        {
+            var server2 = try relay.RelayServer.start(
+                allocator,
+                io,
+                relay_dir,
+                .{ 127, 0, 0, 1 },
+                0,
+                secret,
+                true,
+            );
+            defer server2.deinit();
+            const port2 = server2.port;
+            const srv_thread2 = try std.Thread.spawn(.{}, relayThreadMain, .{&server2});
+            defer {
+                server2.stop();
+                srv_thread2.join();
+            }
+
+            var lm_restarted = try lease_mod.LeaseManager.init(allocator, io, lm_dir_a, 0x7777, .{
+                .host_ip = .{ 127, 0, 0, 1 },
+                .port = port2,
+                .auth_secret = secret,
+                .io_timeout_ms = 5000,
+            });
+            defer lm_restarted.deinit();
+
+            const st_before = try lm_restarted.status(topic_a);
+            try testing.expectEqual(saved_epoch, st_before.fencing_epoch);
+
+            var h_after = try lm_restarted.acquire(topic_a, 0, 5000);
+            try testing.expectEqual(saved_epoch + 1, h_after.fencing_epoch);
+            try testing.expect(!h_after.canceled);
+            try lm_restarted.release(&h_after);
+        }
+    }
+
+    {
+        const off_dir = "/tmp/0ndb-verify-syncv3-offline-lease";
+        cleanDir(io, off_dir);
+        defer cleanDir(io, off_dir);
+
+        {
+            var off_a = try lease_mod.LeaseManager.init(allocator, io, off_dir, 0x8001, null);
+            defer off_a.deinit();
+            var off_b = try lease_mod.LeaseManager.init(allocator, io, off_dir, 0x8002, null);
+            defer off_b.deinit();
+
+            var ha = try off_a.acquire(topic_b, 0, 5000);
+            try testing.expectEqual(lease_mod.LeaseMode.local_offline, ha.mode);
+            try testing.expectEqual(@as(u64, 1), ha.fencing_epoch);
+            try testing.expect(off_a.isStillValid(&ha));
+
+            try testing.expectError(error.LeaseHeld, off_b.acquire(topic_b, 0, 5000));
+
+            try off_a.renew(&ha, 5000);
+            _ = try off_a.putFrameFenced(&ha, "local-fenced-ok");
+            try off_a.release(&ha);
+        }
+
+        {
+            var off_c = try lease_mod.LeaseManager.init(allocator, io, off_dir, 0x8003, .{
+                .host_ip = .{ 127, 0, 0, 1 },
+                .port = 1,
+                .auth_secret = null,
+                .io_timeout_ms = 500,
+            });
+            defer off_c.deinit();
+
+            var hc = try off_c.acquire(topic_b, 0, 5000);
+            try testing.expectEqual(lease_mod.LeaseMode.local_offline, hc.mode);
+            try testing.expectEqual(@as(u64, 2), hc.fencing_epoch);
+            const off_cancel = try off_c.cancelTopic(topic_b, 2);
+            try testing.expect(off_cancel.canceled);
+            try testing.expectError(error.LeaseCancelled, off_c.renew(&hc, 5000));
+            try testing.expectError(error.LeaseCancelled, off_c.putFrameFenced(&hc, "local-after-cancel"));
+            try off_c.release(&hc);
+        }
+    }
 }
 
 fn applyDiffForVerify(
