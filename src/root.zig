@@ -83,3 +83,5 @@ pub const thread = struct {
     pub const store = @import("thread/store.zig");
     pub const runtime = @import("thread/runtime.zig");
 };
+
+pub const bench = @import("bench.zig");
