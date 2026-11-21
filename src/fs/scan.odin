@@ -5,6 +5,7 @@ import "core:slice"
 import "core:sync"
 import "core:thread"
 import "../prim"
+import "../textdiff"
 
 Disk_Kind :: enum u8 {
 	Missing,
@@ -15,6 +16,9 @@ Disk_Kind :: enum u8 {
 }
 
 Scan_Entry :: struct {
+	data:    []u8,
+	has_data: bool,
+	binary:  bool,
 	name:    string,
 	target:  string,
 	kind:    Disk_Kind,
@@ -25,6 +29,9 @@ Scan_Entry :: struct {
 }
 
 Scan_Item :: struct {
+	data:    []u8,
+	has_data: bool,
+	binary:  bool,
 	path:    string,
 	name:    string,
 	target:  string,
@@ -36,6 +43,9 @@ Scan_Item :: struct {
 }
 
 Raw_Dirent :: struct {
+	data_off:   u32,
+	data_len:   u32,
+	has_data:   bool,
 	name_off:   u32,
 	name_len:   u32,
 	target_off: u32,
@@ -72,6 +82,8 @@ Scan_Frame :: struct {
 SCAN_OUTSTANDING :: 256
 
 Scan_Options :: struct {
+	read_limit:   i64,
+	read_budget:  i64,
 	threads:      int,
 	stat_ignored: bool,
 	descend_ignored: bool,
@@ -236,6 +248,9 @@ scan_next :: proc(sc: ^Scanner) -> (item: ^Scan_Item, ok: bool, err: Error) {
 		}
 		append(&sc.path, ..transmute([]u8)e.name)
 		sc.item = Scan_Item {
+			data    = e.data,
+			has_data = e.has_data,
+			binary  = e.binary,
 			path    = string(sc.path[:]),
 			name    = e.name,
 			target  = e.target,
@@ -460,11 +475,16 @@ finish_task :: proc(sc: ^Scanner, t: ^Dir_Task, raw: []Raw_Dirent, gitignore: []
 	reserve(&t.entries, len(raw))
 	for r in raw {
 		e := Scan_Entry {
+			has_data = r.has_data,
 			name    = string(t.names[r.name_off:][:r.name_len]),
 			target  = string(t.names[r.target_off:][:r.target_len]),
 			kind    = r.kind,
 			statted = r.statted,
 			stat    = r.stat,
+		}
+		if r.has_data {
+			e.data = t.names[r.data_off:][:r.data_len]
+			e.binary = textdiff.is_binary(e.data)
 		}
 		append(&t.entries, e)
 	}

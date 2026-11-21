@@ -59,32 +59,7 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	spans_touched(h, only_a[:], &touched) or_return
 	spans_touched(h, only_b[:], &touched) or_return
-	at_heads := crdt.frontier_eq(tl[:], h.g.heads[:])
-	snap: fstree.Snapshot
-	if at_heads {
-		snap = fstree.current(&h.tree)
-	} else {
-		Vis :: struct {
-			h:  ^History,
-			tl: []crdt.Lv,
-		}
-		vis := new(Vis, context.temp_allocator)
-		vis^ = {h, tl[:]}
-		view := fstree.View {
-			data = vis,
-			visible = proc(data: rawptr, id: fstree.Op_Id) -> bool {
-				v := (^Vis)(data)
-				lv, ok := crdt.graph_lv(&v.h.g, inode_op(v.h, id))
-				return ok && crdt.graph_contains(&v.h.g, v.tl, lv)
-			},
-			floor = 0,
-		}
-		s, serr := fstree.snapshot(&h.tree, view, context.temp_allocator)
-		if serr != nil {
-			return .Corrupt
-		}
-		snap = s
-	}
+	snap := version_snapshot(h, tl[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
 	items := make([dynamic]Mat_Item, context.temp_allocator)
 	for ino in touched {
@@ -198,6 +173,21 @@ disk_matches :: proc(m: ^Mount, rel: string, e: Entry) -> bool {
 
 @(private)
 materialize_one :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
+	materialize_inner(m, it, tl) or_return
+	if m.restoring {
+		return .None
+	}
+	if it.present {
+		invalidate_parents(m, it.path) or_return
+	}
+	if it.has_old {
+		invalidate_parents(m, it.old) or_return
+	}
+	return .None
+}
+
+@(private)
+materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if it.has_old && !disk_matches(m, it.old, it.entry) {
 		mount_mark(m, it.old)
 		return .None
@@ -380,4 +370,30 @@ temp_name :: proc(m: ^Mount, abs: string, allocator: runtime.Allocator) -> strin
 	copy(name[len(TEMP_PREFIX):], num)
 	out, _ := path_join(parent, string(name), allocator)
 	return out
+}
+
+version_snapshot :: proc(h: ^History, lvs: []crdt.Lv) -> (snap: fstree.Snapshot, err: Error) {
+	if crdt.frontier_eq(lvs, h.g.heads[:]) {
+		return fstree.current(&h.tree), .None
+	}
+	Vis :: struct {
+		h:  ^History,
+		tl: []crdt.Lv,
+	}
+	vis := new(Vis, context.temp_allocator)
+	vis^ = {h, lvs}
+	view := fstree.View {
+		data = vis,
+		visible = proc(data: rawptr, id: fstree.Op_Id) -> bool {
+			v := (^Vis)(data)
+			lv, ok := crdt.graph_lv(&v.h.g, inode_op(v.h, id))
+			return ok && crdt.graph_contains(&v.h.g, v.tl, lv)
+		},
+		floor = 0,
+	}
+	s, serr := fstree.snapshot(&h.tree, view, context.temp_allocator)
+	if serr != nil {
+		return {}, .Corrupt
+	}
+	return s, .None
 }

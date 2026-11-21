@@ -293,8 +293,12 @@ spans_touched :: proc(h: ^History, spans: []crdt.Lv_Span, out: ^map[fstree.Inode
 			if !ok {
 				return .Corrupt
 			}
-			b := history_read_batch(h, stream, off, context.temp_allocator) or_return
-			collect_touched(h, &b, first, lv, min(end, first + n), out)
+			b, berr := history_read_batch(h, stream, off, context.temp_allocator)
+			if berr == .None {
+				collect_touched(h, &b, first, lv, min(end, first + n), out)
+			} else if berr != .Redacted {
+				return berr
+			}
 			lv = first + n
 		}
 	}

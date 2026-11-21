@@ -24,6 +24,7 @@ Error :: enum u8 {
 	Not_Repository,
 	Stopped,
 	Conflicts,
+	Redacted,
 	Io,
 }
 

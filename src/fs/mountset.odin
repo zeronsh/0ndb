@@ -4,7 +4,9 @@ import "base:runtime"
 import "core:mem/virtual"
 import "core:strings"
 import "../crdt"
+import "../fstree"
 import "../prim"
+import "../textdiff"
 
 Spawner :: struct {
 	data: rawptr,
@@ -153,22 +155,84 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 	context.temp_allocator = virtual.arena_allocator(&arena)
 	mount_sync(m) or_return
 	h := m.history
-	saved := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
-	copy(saved, m.synced[:])
-	line_saved, had := history_line(h, m.line, context.temp_allocator) or_return
-	history_set_line(h, m.line, target) or_return
-	m.restoring = true
-	err := mount_materialize(m)
-	m.restoring = false
-	if had {
-		history_set_line(h, m.line, line_saved)
+	cl := make([dynamic]crdt.Lv, context.temp_allocator)
+	tl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &cl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
+		return .Not_Found
 	}
+	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+	crdt.graph_diff(&h.g, cl[:], tl[:], &only_a, &only_b)
+	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	spans_touched(h, only_a[:], &touched) or_return
+	spans_touched(h, only_b[:], &touched) or_return
+	if len(touched) == 0 {
+		return .None
+	}
+	snap_c := version_snapshot(h, cl[:]) or_return
+	defer fstree.snapshot_destroy(&snap_c)
+	snap_t := version_snapshot(h, tl[:]) or_return
+	defer fstree.snapshot_destroy(&snap_t)
+	order := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
+	for ino in touched {
+		append(&order, ino)
+	}
+	b: Builder
+	builder_init(&b, h, m.actor)
+	for ino in order {
+		it, okt, e1 := fstree.info(&snap_t, ino, context.temp_allocator)
+		ic, okc, e2 := fstree.info(&snap_c, ino, context.temp_allocator)
+		if e1 != nil || e2 != nil {
+			return .Corrupt
+		}
+		pt := okt && it.present
+		pc := okc && ic.present
+		if !pt {
+			if pc {
+				builder_tree(&b, fstree.Op_Remove{inode = ino})
+			}
+			continue
+		}
+		if !pc {
+			builder_tree(&b, fstree.Op_Restore{inode = ino})
+		}
+		if !pc || it.parent != ic.parent || it.name != ic.name {
+			builder_tree(&b, fstree.Op_Move{inode = ino, parent = it.parent, name = it.name})
+		}
+		if it.flags != ic.flags {
+			builder_tree(&b, fstree.Op_Set_Flags{inode = ino, mask = fstree.ALL_FLAGS, value = it.flags})
+		}
+		if it.kind == .Symlink && it.target != ic.target {
+			builder_tree(&b, fstree.Op_Set_Target{inode = ino, target = it.target})
+		}
+		if it.kind != .File || .Opaque in it.flags {
+			continue
+		}
+		cur, _, cerr := history_text_spans_at(h, ino, cl[:], context.temp_allocator)
+		cerr or_return
+		want, spans, werr := history_text_spans_at(h, ino, tl[:], context.temp_allocator)
+		werr or_return
+		edits, derr := textdiff.byte_diff(cur, want, context.temp_allocator)
+		if derr != nil {
+			builder_delete(&b, ino, 0, len(cur))
+			builder_copy_spans(&b, ino, 0, spans, 0, len(want))
+			continue
+		}
+		for ed in edits {
+			builder_delete(&b, ino, int(ed.pos), int(ed.del))
+			builder_copy_spans(&b, ino, int(ed.pos), spans, int(ed.pos), int(ed.ins))
+		}
+		history_unload_files(h)
+	}
+	if b.n == 0 {
+		return .None
+	}
+	before := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
+	copy(before, m.synced[:])
+	builder_commit(m, &b) or_return
 	clear(&m.synced)
-	append(&m.synced, ..saved)
-	if err != .None {
-		return err
-	}
-	return mount_pass(m, true)
+	append(&m.synced, ..before)
+	return mount_materialize(m)
 }
 
 git_restore :: proc(m: ^Mount, branch: string, commit: string, spawner: Spawner, thread: prim.Id) -> Error {

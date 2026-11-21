@@ -136,6 +136,47 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 			gitignore^ = read_small_at(dfd, ncp, int(r.stat.size), sc.allocator)
 		}
 	}
+	if sc.opts.read_limit > 0 {
+		budget := sc.opts.read_budget if sc.opts.read_budget > 0 else 8 << 20
+		for &r in raw {
+			if r.kind != .File || !r.statted || r.stat.size > sc.opts.read_limit || r.stat.size > budget {
+				continue
+			}
+			name := string(t.names[r.name_off:][:r.name_len])
+			ncp, nerr := prim.cpath(name, &pbuf)
+			if nerr != .None {
+				continue
+			}
+			fd, oerr := linux.openat(dfd, ncp, {.NOFOLLOW, .CLOEXEC})
+			if oerr != .NONE {
+				continue
+			}
+			size := int(r.stat.size)
+			start := len(t.names)
+			resize(&t.names, start + size + 1)
+			n := 0
+			for n < size + 1 {
+				got, rerr := linux.pread(fd, t.names[start + n:], i64(n))
+				if rerr == .EINTR {
+					continue
+				}
+				if rerr != .NONE || got <= 0 {
+					break
+				}
+				n += got
+			}
+			linux.close(fd)
+			if n != size {
+				resize(&t.names, start)
+				continue
+			}
+			resize(&t.names, start + size)
+			r.data_off = u32(start)
+			r.data_len = u32(size)
+			r.has_data = true
+			budget -= i64(size)
+		}
+	}
 	w := 0
 	for r in raw {
 		if r.kind != .Missing {

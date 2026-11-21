@@ -1,6 +1,7 @@
 package fs
 
 import "base:runtime"
+import "core:bytes"
 import "core:mem/virtual"
 import "core:slice"
 import "../crdt"
@@ -83,13 +84,48 @@ builder_insert :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, data: []u8
 @(private)
 builder_insert_ref :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, oid: odb.Oid, n: int) -> (first: crdt.Op_Id, last: crdt.Op_Id) {
 	ref: crdt.Content_Ref
-	x := oid
-	copy(ref.oid[:], x[:20])
+	ref.oid = crdt_oid(oid, b.h.db.format if b.h.db != nil else .Sha1)
 	first = crdt.Op_Id{b.actor, b.seq0 + u64(b.n)}
 	append(&b.ops, crdt.Op_Run{target = target_id(b, inode), kind = .Insert_Ref, pos = pos, len = n, ref = ref})
 	b.n += n
 	last = crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1}
 	return
+}
+
+@(private)
+builder_copy :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, src: crdt.Op_Id, n: int) {
+	if n <= 0 {
+		return
+	}
+	r := crdt.Op_Run{target = target_id(b, inode), kind = .Insert_Copy, pos = pos, len = n}
+	r.src = src
+	append(&b.ops, r)
+	b.n += n
+}
+
+@(private)
+builder_copy_spans :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, spans: []crdt.Author_Span, start: int, n: int) {
+	from := start
+	at := 0
+	p := pos
+	left := n
+	for s in spans {
+		if left <= 0 {
+			break
+		}
+		end := at + s.len
+		if end <= from {
+			at = end
+			continue
+		}
+		k := max(from - at, 0)
+		take := min(s.len - k, left)
+		builder_copy(b, inode, p, crdt.Op_Id{s.op.actor, s.op.seq + u64(k)}, take)
+		p += take
+		left -= take
+		from += take
+		at = end
+	}
 }
 
 @(private)
@@ -127,7 +163,9 @@ builder_commit :: proc(m: ^Mount, b: ^Builder) -> Error {
 	history_commit_local(h, &batch) or_return
 	clear(&m.synced)
 	append(&m.synced, crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1})
-	set_line(m) or_return
+	if !m.hold_line {
+		set_line(m) or_return
+	}
 	builder_reset(b)
 	return .None
 }
@@ -179,15 +217,21 @@ sniff_binary :: proc(m: ^Mount, abs: string) -> (binary: bool, err: Error) {
 }
 
 @(private)
-store_file :: proc(m: ^Mount, abs: string, pack: ^odb.Pack_Builder) -> (oid: odb.Oid, err: Error) {
+store_file :: proc(m: ^Mount, abs: string, pack: ^odb.Pack_Builder, pin := true) -> (oid: odb.Oid, err: Error) {
 	if m.db == nil {
 		return {}, .Invalid
 	}
 	if pack != nil {
 		o, perr := odb.pack_add_file(pack, abs)
+		if perr == .None && pin {
+			history_note_blob(m.history, o)
+		}
 		return o, from_odb(perr)
 	}
 	o, werr := odb.write_file(m.db, abs)
+	if werr == .None && pin {
+		history_note_blob(m.history, o)
+	}
 	return o, from_odb(werr)
 }
 
@@ -230,6 +274,7 @@ Import_State :: struct {
 	chunk:     virtual.Arena,
 	path_buf:  [dynamic]u8,
 	resume:    bool,
+	dirty_dirs: map[string]bool,
 }
 
 mount_import :: proc(m: ^Mount) -> Error {
@@ -248,9 +293,12 @@ mount_import :: proc(m: ^Mount) -> Error {
 	context.temp_allocator = virtual.arena_allocator(&st.chunk)
 	empty := shadow_empty(&m.shadow) or_return
 	st.resume = !empty
+	m.hold_line = true
+	defer m.hold_line = false
 	builder_init(&st.b, m.history, m.actor)
 	st.stack = make([dynamic]Dir_Frame, st.long)
 	st.path_buf = make([dynamic]u8, st.long)
+	st.dirty_dirs = make(map[string]bool, st.long)
 	append(&st.stack, Dir_Frame{path = "", inode = fstree.ROOT, depth = 0, wd = m.root_wd})
 	if m.has_git && m.db != nil {
 		if index_open(&st.index, m.vfs, m.git.dir, m.db.format, st.long) == .None {
@@ -278,7 +326,14 @@ mount_import :: proc(m: ^Mount) -> Error {
 		odb.pack_abort(&st.pack)
 	}
 	sc: Scanner
-	scan_open(&sc, m.vfs, m.root, "", &m.ignore, nil, {threads = m.opts.threads}) or_return
+	sopts := Scan_Options {
+		threads = m.opts.threads,
+	}
+	if st.use_pack {
+		sopts.read_limit = min(m.opts.large_limit, 1 << 20)
+		sopts.read_budget = 8 << 20
+	}
+	scan_open(&sc, m.vfs, m.root, "", &m.ignore, nil, sopts) or_return
 	defer scan_close(&sc)
 	for {
 		it, ok, err := scan_next(&sc)
@@ -300,7 +355,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 		if it.ignored && !tracked {
 			if it.kind == .Dir {
 				if st.has_index && index_has_under(&st, it.path) {
-					import_dir(&st, it, parent, &sc) or_return
+					import_tracked_under(&st, it, parent, &sc) or_return
 					continue
 				}
 				scan_skip(&sc)
@@ -331,13 +386,23 @@ mount_import :: proc(m: ^Mount) -> Error {
 			import_file(&st, it, parent, tracked, &entry) or_return
 		case .Missing, .Other:
 		}
-		if st.b.n > 0 && (st.files >= m.opts.import_chunk || shadow_pending_count(&m.shadow) >= 65536) {
+		chunk := m.opts.import_chunk * 4 if st.use_pack else m.opts.import_chunk
+		if st.b.n > 0 && (st.files >= chunk || shadow_pending_count(&m.shadow) >= 65536) {
 			import_flush(&st) or_return
 		}
 	}
 	import_flush(&st) or_return
+	m.hold_line = false
+	set_line(m) or_return
 	if m.has_git && m.db != nil {
-		import_cache_tree(m) or_return
+		for st.have_entry {
+			mark_dirty_dirs(&st, st.entry.path)
+			index_advance(&st) or_return
+		}
+		import_cache_tree(m, &st.dirty_dirs) or_return
+	}
+	if m.db != nil {
+		mount_commit(m, {message = "0ndb: first mount"}) or_return
 	}
 	m.imported = true
 	_heap_release()
@@ -367,6 +432,7 @@ index_seek :: proc(st: ^Import_State, path: string) -> (tracked: bool, e: Index_
 		if c >= 0 {
 			break
 		}
+		mark_dirty_dirs(st, st.entry.path)
 		index_advance(st) or_return
 	}
 	for st.have_entry && st.entry.path == path {
@@ -385,10 +451,90 @@ index_has_under :: proc(st: ^Import_State, dir: string) -> bool {
 }
 
 @(private)
+import_tracked_under :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, sc: ^Scanner) -> Error {
+	m := st.m
+	scan_skip(sc)
+	if st.resume {
+		if _, found := shadow_get(&m.shadow, it.path) or_return; !found {
+			import_dir(st, it, parent, sc) or_return
+		} else {
+			return .None
+		}
+	} else {
+		import_dir(st, it, parent, sc) or_return
+	}
+	top := it.path
+	top_inode := st.stack[len(st.stack) - 1].inode
+	dirs := make(map[string]fstree.Inode_Id, context.temp_allocator)
+	dirs[clone_string(top, context.temp_allocator) or_else ""] = top_inode
+	for st.have_entry && path_under(st.entry.path, top) {
+		e := st.entry
+		path, _ := clone_string(e.path, context.temp_allocator)
+		pdir := path_parent(path)
+		pino, have := dirs[pdir]
+		if !have {
+			cur := top
+			pino = top_inode
+			rest := pdir[len(top) + 1:]
+			for len(rest) > 0 {
+				i := 0
+				for i < len(rest) && rest[i] != '/' {
+					i += 1
+				}
+				next := pdir[:len(pdir) - len(rest) + i]
+				if ino, ok := dirs[next]; ok {
+					pino = ino
+				} else {
+					abuf: prim.Path_Buf
+					dst, derr := prim.lstat(m.vfs, abs_path(m, next, abuf[:]))
+					if derr != .None || dst.kind != .Dir {
+						break
+					}
+					created := builder_tree(&st.b, fstree.Op_Create{parent = pino, name = path_name(next), kind = .Dir})
+					shadow_append(&m.shadow, next, Entry{inode = created, kind = .Dir, stat = disk_stat(dst)}) or_return
+					dirs[clone_string(next, context.temp_allocator) or_else ""] = created
+					pino = created
+				}
+				cur = next
+				rest = rest[i + 1:] if i < len(rest) else ""
+			}
+			if cur != pdir {
+				index_advance(st) or_return
+				continue
+			}
+		}
+		abuf: prim.Path_Buf
+		fst, ferr := prim.lstat(m.vfs, abs_path(m, path, abuf[:]))
+		if ferr == .None && e.stage == 0 && (fst.kind == .File || fst.kind == .Symlink) {
+			item := Scan_Item {
+				path    = path,
+				name    = path_name(path),
+				kind    = disk_kind(fst.kind),
+				statted = true,
+				stat    = disk_stat(fst),
+			}
+			import_file(st, &item, Dir_Frame{path = pdir, inode = pino}, true, &e) or_return
+		}
+		index_advance(st) or_return
+	}
+	return .None
+}
+
+nested_repo :: proc(m: ^Mount, rel: string) -> bool {
+	buf: prim.Path_Buf
+	p, ok := path_join_buf(buf[:], m.root, rel, ".git")
+	if !ok {
+		return false
+	}
+	_, err := prim.lstat(m.vfs, p)
+	return err == .None
+}
+
+@(private)
 import_dir :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, sc: ^Scanner) -> Error {
 	m := st.m
 	name := it.name
-	if !fstree.valid_name(name) {
+	if !fstree.valid_name(name) || nested_repo(m, it.path) {
 		scan_skip(sc)
 		return .None
 	}
@@ -433,6 +579,7 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		if tracked && index_clean(e, stat, kind, st.index_mtime) {
 			oid = e.oid
 		} else if m.db != nil {
+			mark_dirty_dirs(st, it.path)
 			oid, _ = odb.hash(m.db.format, .Blob, transmute([]u8)target)
 		}
 		shadow_append(&m.shadow, it.path, Entry{inode = inode, kind = .Symlink, stat = stat, oid = oid}) or_return
@@ -449,24 +596,36 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	oid: odb.Oid
 	binary := false
 	clean := tracked && index_clean(e, stat, kind, st.index_mtime)
+	if !clean {
+		mark_dirty_dirs(st, it.path)
+	}
 	if clean {
 		oid = e.oid
 		binary = stat.size > m.opts.large_limit
 	} else {
-		if stat.size > m.opts.large_limit {
-			binary = true
-		} else if stat.size > 0 {
-			b, serr := sniff_binary(m, abs)
-			if serr != .None {
+		if it.has_data && st.use_pack {
+			binary = it.binary
+			o, perr := odb.pack_add(&st.pack, .Blob, it.data)
+			if perr != .None {
 				return .None
 			}
-			binary = b
+			oid = o
+		} else {
+			if stat.size > m.opts.large_limit {
+				binary = true
+			} else if stat.size > 0 {
+				b, serr := sniff_binary(m, abs)
+				if serr != .None {
+					return .None
+				}
+				binary = b
+			}
+			o, werr := store_file(m, abs, &st.pack if st.use_pack else nil, false)
+			if werr != .None {
+				return .None
+			}
+			oid = o
 		}
-		o, werr := store_file(m, abs, &st.pack if st.use_pack else nil)
-		if werr != .None {
-			return .None
-		}
-		oid = o
 	}
 	if binary {
 		flags += {.Opaque}
@@ -483,6 +642,19 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	shadow_append(&m.shadow, it.path, Entry{inode = inode, kind = .File, stat = stat, oid = oid}) or_return
 	st.files += 1
 	return .None
+}
+
+@(private)
+mark_dirty_dirs :: proc(st: ^Import_State, rel: string) {
+	q := rel
+	for len(q) > 0 {
+		q = path_parent(q)
+		if st.dirty_dirs[q] {
+			return
+		}
+		k, _ := clone_string(q, st.long)
+		st.dirty_dirs[k] = true
+	}
 }
 
 @(private)
@@ -530,20 +702,22 @@ builder_commit_import :: proc(m: ^Mount, b: ^Builder) -> Error {
 	history_commit_import(h, &batch) or_return
 	clear(&m.synced)
 	append(&m.synced, crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1})
-	set_line(m) or_return
+	if !m.hold_line {
+		set_line(m) or_return
+	}
 	builder_reset(b)
 	return .None
 }
 
 @(private)
-import_cache_tree :: proc(m: ^Mount) -> Error {
+import_cache_tree :: proc(m: ^Mount, dirty: ^map[string]bool) -> Error {
 	ct, err := index_cache_tree(m.vfs, m.git.dir, m.db.format, context.temp_allocator)
 	if err != .None {
 		return .None
 	}
 	defer cache_tree_destroy(&ct)
 	for dir, node in ct.nodes {
-		if len(dir) == 0 {
+		if dirty[dir] {
 			continue
 		}
 		e, found := shadow_get(&m.shadow, dir) or_return
@@ -598,6 +772,7 @@ Pass :: struct {
 }
 
 PASS_CHUNK :: 4096
+MOVE_MIN :: 32
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 	long: virtual.Arena
@@ -632,6 +807,8 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 	p.settle = settle && !p.git_wrote
 	p.cutoff = prim.now_ns() - m.opts.settle_ms * 1_000_000
 	p.full = full || m.rescan || p.git_wrote
+	m.hold_line = p.git_wrote
+	defer m.hold_line = false
 	keys := make([dynamic]string, 0, len(m.dirty), p.long)
 	for k, v in m.dirty {
 		c, _ := clone_string(k, p.long)
@@ -648,12 +825,31 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 		collect_full(&p) or_return
 	} else {
 		slice.sort_by(keys[:], proc(a, b: string) -> bool {return git_path_cmp(a, false, b, false) < 0})
+		pre_moves(&p, keys[:]) or_return
 		for k in keys {
 			collect_path(&p, k) or_return
 			pass_maybe_flush(&p) or_return
 		}
+		if !settle {
+			scoped := make([dynamic]string, 0, len(m.unwatched), p.long)
+			for u in m.unwatched {
+				append(&scoped, clone_string(u, p.long) or_else "")
+			}
+			for u in scoped {
+				d := probe(m, u)
+				if d.kind != .Dir {
+					collect_path(&p, u) or_return
+					continue
+				}
+				compare_dir_deep(&p, u, -1) or_return
+			}
+		}
 	}
 	pass_flush(&p) or_return
+	if m.hold_line {
+		m.hold_line = false
+		set_line(m) or_return
+	}
 	for y in p.young {
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
@@ -679,6 +875,69 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 		mount_schedule(m, m.opts.settle_ms)
 	}
 	return save_mount_state(m)
+}
+
+@(private)
+pre_moves :: proc(p: ^Pass, keys: []string) -> Error {
+	m := p.m
+	gone := make(map[u64]string, p.long)
+	gone_entry := make(map[u64]Entry, p.long)
+	for k in keys {
+		e, found := shadow_get(&m.shadow, k) or_return
+		if !found || e.kind != .Dir || e.stat.ino == 0 {
+			continue
+		}
+		d := probe(m, k)
+		if d.kind == .Dir && d.stat.ino == e.stat.ino {
+			continue
+		}
+		gone[e.stat.ino] = k
+		gone_entry[e.stat.ino] = e
+	}
+	if len(gone) == 0 {
+		return .None
+	}
+	moved := false
+	for k in keys {
+		d := probe(m, k)
+		if d.kind != .Dir {
+			continue
+		}
+		old, has := gone[d.stat.ino]
+		if !has || old == k {
+			continue
+		}
+		if _, exists := shadow_get(&m.shadow, k) or_return; exists {
+			continue
+		}
+		parent_ok := parent_tracked(p, k)
+		if !parent_ok {
+			continue
+		}
+		c := Change {
+			kind  = .Create,
+			path  = clone_string(k, context.temp_allocator) or_else "",
+			disk  = .Dir,
+			stat  = d.stat,
+			old   = gone_entry[d.stat.ino],
+			moved = clone_string(old, context.temp_allocator) or_else "",
+		}
+		append(&p.changes, c)
+		mark_seen(p, old)
+		delete_key(&gone, d.stat.ino)
+		moved = true
+	}
+	if moved {
+		targets := make([dynamic]string, 0, len(p.changes), p.long)
+		for c in p.changes {
+			append(&targets, clone_string(c.path, p.long) or_else "")
+		}
+		pass_flush(p) or_return
+		for t in targets {
+			compare_dir_deep(p, t, -1) or_return
+		}
+	}
+	return .None
 }
 
 @(private)
@@ -816,6 +1075,9 @@ collect_path :: proc(p: ^Pass, rel: string) -> Error {
 			return .None
 		}
 		if ignore_path(&m.ignore, m.root, rel, d.kind == .Dir) {
+			return .None
+		}
+		if d.kind == .Dir && nested_repo(m, rel) {
 			return .None
 		}
 		add_create(p, rel, d) or_return
@@ -1057,6 +1319,8 @@ collect_subtree :: proc(p: ^Pass, rel: string) -> Error {
 			if it.kind == .Dir {
 				scan_skip(&sc)
 			}
+		} else if it.kind == .Dir && nested_repo(m, it.path) {
+			scan_skip(&sc)
 		} else {
 			add_create(p, it.path, Probe{kind = it.kind, stat = it.stat, target = clone_string(it.target, context.temp_allocator) or_else ""}) or_return
 		}
@@ -1314,6 +1578,19 @@ parent_inode :: proc(p: ^Pass, rel: string) -> (fstree.Inode_Id, bool) {
 
 @(private)
 emit_change :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
+	emit_change_inner(p, b, c) or_return
+	if c.carried && c.kind == .Modify && c.disk == .Dir {
+		return .None
+	}
+	invalidate_parents(p.m, c.path) or_return
+	if c.moved != "" {
+		invalidate_parents(p.m, c.moved) or_return
+	}
+	return .None
+}
+
+@(private)
+emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 	m := p.m
 	switch c.kind {
 	case .Remove:
@@ -1461,7 +1738,10 @@ store_blob :: proc(m: ^Mount, data: []u8) -> Error {
 	if m.db == nil {
 		return .Invalid
 	}
-	_, err := odb.write(m.db, .Blob, data)
+	oid, err := odb.write(m.db, .Blob, data)
+	if err == .None {
+		history_note_blob(m.history, oid)
+	}
 	return from_odb(err)
 }
 
@@ -1516,30 +1796,147 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	if was_binary {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Opaque}, value = {}})
 	}
-	edits, derr := textdiff.byte_diff(old, data, context.temp_allocator)
-	if derr != nil {
-		builder_delete(b, e.inode, 0, len(old))
-		if len(data) > m.opts.inline_limit {
-			store_blob(m, data) or_return
-			builder_insert_ref(b, e.inode, 0, oid, len(data))
-		} else {
-			builder_insert(b, e.inode, 0, data)
-		}
-		return shadow_put(&m.shadow, path, ne)
+	emit_text_edits(m, b, e.inode, old, data) or_return
+	return shadow_put(&m.shadow, path, ne)
+}
+
+@(private)
+emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, full_old, full_data: []u8) -> Error {
+	h := m.history
+	pre := 0
+	for pre < len(full_old) && pre < len(full_data) && full_old[pre] == full_data[pre] {
+		pre += 1
 	}
-	for ed in edits {
-		builder_delete(b, e.inode, int(ed.pos), int(ed.del))
-		ins := data[ed.pos:][:ed.ins]
-		if len(ins) > m.opts.inline_limit {
-			sub, werr := odb.write(m.db, .Blob, ins)
-			if werr == .None {
-				builder_insert_ref(b, e.inode, int(ed.pos), sub, len(ins))
-				continue
+	for pre > 0 && full_old[pre - 1] != '\n' {
+		pre -= 1
+	}
+	suf := 0
+	for suf < len(full_old) - pre && suf < len(full_data) - pre && full_old[len(full_old) - 1 - suf] == full_data[len(full_data) - 1 - suf] {
+		suf += 1
+	}
+	for suf > 0 {
+		oa := len(full_old) - suf
+		na := len(full_data) - suf
+		if (oa == pre || full_old[oa - 1] == '\n') && (na == pre || full_data[na - 1] == '\n') {
+			break
+		}
+		suf -= 1
+	}
+	if pre == len(full_old) && pre == len(full_data) {
+		return .None
+	}
+	old := full_old[pre:len(full_old) - suf]
+	data := full_data[pre:len(full_data) - suf]
+	la, lerr := textdiff.split_lines(old, context.temp_allocator)
+	lb, lerr2 := textdiff.split_lines(data, context.temp_allocator)
+	hunks: []textdiff.Edit
+	herr: textdiff.Error
+	if lerr == nil && lerr2 == nil {
+		hunks, herr = textdiff.diff_lines(la, lb, textdiff.DEFAULT_DIFF, context.temp_allocator)
+	}
+	if lerr != nil || lerr2 != nil || herr != nil {
+		builder_delete(b, inode, pre, len(old))
+		return emit_insert(m, b, inode, pre, data)
+	}
+	A :: struct {
+		a0, a1, b0, b1: int,
+	}
+	rs := make([]A, len(hunks), context.temp_allocator)
+	for hk, i in hunks {
+		rs[i] = A{int(la.offs[hk.a_start]), int(la.offs[hk.a_start + hk.a_len]), int(lb.offs[hk.b_start]), int(lb.offs[hk.b_start + hk.b_len])}
+	}
+	Win :: struct {
+		q, w0, w1: int,
+	}
+	wins := make([]Win, len(rs), context.temp_allocator)
+	any_pair := false
+	for r, i in rs {
+		wins[i] = Win{-1, 0, 0}
+		hk := hunks[i]
+		if r.a0 != r.a1 || r.b1 - r.b0 < MOVE_MIN {
+			continue
+		}
+		nl := int(hk.b_len)
+		found := false
+		for front in 0 ..= min(3, nl - 1) {
+			for back in 0 ..= min(3, nl - 1 - front) {
+				w0 := int(lb.offs[int(hk.b_start) + front])
+				w1 := int(lb.offs[int(hk.b_start) + nl - back])
+				if w1 - w0 < MOVE_MIN {
+					continue
+				}
+				q := bytes.index(full_old, data[w0:w1])
+				if q < 0 {
+					continue
+				}
+				overlap := 0
+				for d in rs {
+					lo := max(q, pre + d.a0)
+					hi := min(q + (w1 - w0), pre + d.a1)
+					if d.a0 != d.a1 && hi > lo {
+						overlap += hi - lo
+					}
+				}
+				if overlap * 2 >= w1 - w0 {
+					wins[i] = Win{q, w0, w1}
+					any_pair = true
+					found = true
+					break
+				}
+			}
+			if found {
+				break
 			}
 		}
-		builder_insert(b, e.inode, int(ed.pos), ins)
 	}
-	return shadow_put(&m.shadow, path, ne)
+	old_spans: []crdt.Author_Span
+	if any_pair {
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, m.synced[:], &lvs) == .None {
+			_, sp, serr := history_text_spans_at(h, inode, lvs[:], context.temp_allocator)
+			if serr == .None {
+				old_spans = sp
+			}
+		}
+	}
+	for r, i in rs {
+		if wins[i].q >= 0 && old_spans != nil {
+			w := wins[i]
+			emit_insert(m, b, inode, pre + r.b0, data[r.b0:w.w0]) or_return
+			builder_copy_spans(b, inode, pre + w.w0, old_spans, w.q, w.w1 - w.w0)
+			emit_insert(m, b, inode, pre + w.w1, data[w.w1:r.b1]) or_return
+			continue
+		}
+		sub, serr := textdiff.byte_diff(old[r.a0:r.a1], data[r.b0:r.b1], context.temp_allocator)
+		if serr != nil {
+			builder_delete(b, inode, pre + r.b0, r.a1 - r.a0)
+			emit_insert(m, b, inode, pre + r.b0, data[r.b0:r.b1]) or_return
+			continue
+		}
+		for ed in sub {
+			pos := r.b0 + int(ed.pos)
+			builder_delete(b, inode, pre + pos, int(ed.del))
+			emit_insert(m, b, inode, pre + pos, data[pos:][:ed.ins]) or_return
+		}
+	}
+	return .None
+}
+
+@(private)
+emit_insert :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, pos: int, ins: []u8) -> Error {
+	if len(ins) == 0 {
+		return .None
+	}
+	if len(ins) > m.opts.inline_limit && m.db != nil {
+		sub, werr := odb.write(m.db, .Blob, ins)
+		if werr == .None {
+			history_note_blob(m.history, sub)
+			builder_insert_ref(b, inode, pos, sub, len(ins))
+			return .None
+		}
+	}
+	builder_insert(b, inode, pos, ins)
+	return .None
 }
 
 @(private)

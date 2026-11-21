@@ -210,6 +210,7 @@ watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd
 	if errno != .NONE {
 		if errno == .ENOSPC {
 			reg.os.full = true
+			note_unwatched(m, rel)
 			return -1, .None
 		}
 		if errno == .ENOENT || errno == .ENOTDIR {

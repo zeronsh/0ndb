@@ -101,6 +101,8 @@ Mount :: struct {
 	restoring:   bool,
 	intents:     [dynamic]Intent,
 	imported:    bool,
+	hold_line:   bool,
+	unwatched:   [dynamic]string,
 }
 
 Intent :: struct {
@@ -204,6 +206,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.dirty = make(map[string]^Scope, allocator)
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
+	m.unwatched = make([dynamic]string, allocator)
 	ok := false
 	defer if !ok {
 		mount_close(m)
@@ -280,6 +283,10 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.fences)
 	delete(m.intents)
+	for u in m.unwatched {
+		delete(u, m.allocator)
+	}
+	delete(m.unwatched)
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
@@ -568,6 +575,9 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 	err: Error
 	if s.mount != nil {
 		err = mount_sync(s.mount)
+		if err == .None && s.mount.db != nil {
+			_, err = mount_commit(s.mount, {message = "0ndb: scope"})
+		}
 	}
 	for x, i in reg.scopes {
 		if x == s {
@@ -747,4 +757,27 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	clear(&m.intents)
 	history_trim(h)
 	return save_mount_state(m)
+}
+
+note_unwatched :: proc(m: ^Mount, rel: string) {
+	for u in m.unwatched {
+		if path_at_or_under(rel, u) {
+			return
+		}
+	}
+	i := 0
+	for i < len(m.unwatched) {
+		if path_under(m.unwatched[i], rel) {
+			delete(m.unwatched[i], m.allocator)
+			unordered_remove(&m.unwatched, i)
+			continue
+		}
+		i += 1
+	}
+	c, _ := clone_string(rel, m.allocator)
+	append(&m.unwatched, c)
+}
+
+mount_unwatched :: proc(m: ^Mount) -> []string {
+	return m.unwatched[:]
 }

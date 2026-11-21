@@ -89,6 +89,7 @@ History :: struct {
 	tree:       fstree.Tree,
 	dict:       crdt.Actor_Dict,
 	stream_ids: [dynamic]prim.Id,
+	rdicts:     [dynamic]crdt.Actor_Dict,
 	applied:    [dynamic]i64,
 	files:      map[fstree.Inode_Id]^File_State,
 	moves:      [dynamic]fstree.Move_Ref,
@@ -98,6 +99,7 @@ History :: struct {
 	blob_cache: odb.Oid,
 	blob_data:  []u8,
 	touched:    [dynamic]fstree.Inode_Id,
+	pins:       [dynamic]odb.Oid,
 	lvidx:      prim.Fd,
 	lvidx_n:    u64,
 	markers:    [dynamic]Git_Marker,
@@ -145,11 +147,13 @@ history_wake :: proc(h: ^History) -> Error {
 	}
 	crdt.dict_init(&h.dict, h.allocator)
 	h.stream_ids = make([dynamic]prim.Id, h.allocator)
+	h.rdicts = make([dynamic]crdt.Actor_Dict, h.allocator)
 	h.applied = make([dynamic]i64, h.allocator)
 	h.files = make(map[fstree.Inode_Id]^File_State, h.allocator)
 	h.moves = make([dynamic]fstree.Move_Ref, h.allocator)
 	h.io = make([dynamic]u8, h.allocator)
 	h.touched = make([dynamic]fstree.Inode_Id, h.allocator)
+	h.pins = make([dynamic]odb.Oid, h.allocator)
 	h.markers = make([dynamic]Git_Marker, h.allocator)
 	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
 	lfd, lerr := prim.open_file(h.vfs, lp, {.Write, .Create}, 0o600)
@@ -180,6 +184,10 @@ history_sleep :: proc(h: ^History) {
 	fstree.destroy(&h.tree)
 	crdt.graph_destroy(&h.g)
 	crdt.dict_destroy(&h.dict)
+	for &d in h.rdicts {
+		crdt.dict_destroy(&d)
+	}
+	delete(h.rdicts)
 	journal.journal_close(&h.journal)
 	kv_close(&h.kv)
 	prim.close_file(h.vfs, h.lvidx)
@@ -190,6 +198,7 @@ history_sleep :: proc(h: ^History) {
 	delete(h.moves)
 	delete(h.io)
 	delete(h.touched)
+	delete(h.pins)
 	markers_clear(h)
 	delete(h.markers)
 	if h.blob_data != nil {
@@ -332,13 +341,12 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 		}
 		rec: File_Record
 		rec.has_cp = true
-		ref := op.ref
-		copy(rec.cp_text[:20], ref.oid[:])
+		rec.cp_text = odb_oid(op.ref.oid)
 		rec.cp_len = i64(op.len)
 		rec.cp_version = make([dynamic]crdt.Op_Id, context.temp_allocator)
 		rec.cp_spans = make([dynamic]crdt.Author_Span, context.temp_allocator)
 		append(&rec.cp_version, crdt.Op_Id{b.actor, at + u64(op.len) - 1})
-		append(&rec.cp_spans, crdt.Author_Span{id = {b.actor, at}, len = op.len})
+		append(&rec.cp_spans, crdt.Author_Span{id = {b.actor, at}, op = {b.actor, at}, len = op.len})
 		clear(&buf)
 		encode_file_record(&buf, &rec)
 		ino := op_inode(h, op.target)
@@ -439,18 +447,51 @@ journal_batch :: proc(h: ^History, b: ^crdt.Batch, kind := REC_BATCH) -> (off: i
 	return o, .None
 }
 
-history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8, dict: ^crdt.Actor_Dict) -> (admitted: int, err: Error) {
-	if len(body) == 0 || (body[0] != REC_BATCH && body[0] != REC_IMPORT) {
+history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (admitted: int, err: Error) {
+	if len(body) == 0 {
 		return 0, .None
 	}
+	si := stream_index(h, stream)
+	if body[0] == REC_ACTORS {
+		rd := prim.reader(body[1:])
+		n := prim.read_uvarint(&rd)
+		if n > u64(len(body)) {
+			return 0, .Corrupt
+		}
+		d := stream_dict(h, si)
+		for _ in 0 ..< n {
+			crdt.dict_add(d, prim.read_id(&rd))
+		}
+		if !prim.reader_ok(&rd) {
+			return 0, .Corrupt
+		}
+		return 0, history_persist(h)
+	}
+	if body[0] == REC_REPLACE {
+		apply_replace_record(h, si, body, u64(off)) or_return
+		if h.applied[si] < off + 1 {
+			h.applied[si] = off + 1
+		}
+		return 0, history_persist(h)
+	}
+	if body[0] == REC_REDACT {
+		apply_redact_record(h, body) or_return
+		if h.applied[si] < off + 1 {
+			h.applied[si] = off + 1
+		}
+		return 0, history_persist(h)
+	}
+	if body[0] != REC_BATCH && body[0] != REC_IMPORT {
+		return 0, .None
+	}
+	dict := stream_dict(h, si)
 	if body[0] == REC_IMPORT {
-		return admit_import(h, stream, off, body, dict)
+		return admit_import(h, si, off, body, dict)
 	}
 	b, derr := crdt.batch_decode(body[1:], context.temp_allocator, dict)
 	if derr != .None {
 		return 0, .Corrupt
 	}
-	si := stream_index(h, stream)
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, &b, &parents)
 	if gerr == .Missing {
@@ -489,12 +530,11 @@ history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8, dict: 
 }
 
 @(private)
-admit_import :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8, dict: ^crdt.Actor_Dict) -> (admitted: int, err: Error) {
+admit_import :: proc(h: ^History, si: u32, off: i64, body: []u8, dict: ^crdt.Actor_Dict) -> (admitted: int, err: Error) {
 	b, derr := crdt.batch_decode(body[1:], context.temp_allocator, dict)
 	if derr != .None {
 		return 0, .Corrupt
 	}
-	si := stream_index(h, stream)
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, &b, &parents)
 	if gerr == .Missing {
@@ -554,6 +594,7 @@ history_persist :: proc(h: ^History) -> Error {
 	}
 	fstree.mark_persisted(&h.tree)
 	persist_moves(h) or_return
+	pins_persist(h) or_return
 	for id, f in h.files {
 		if f.dirty {
 			persist_file(h, id, f) or_return
@@ -561,10 +602,18 @@ history_persist :: proc(h: ^History) -> Error {
 	}
 	clear(&buf)
 	w := prim.writer(&buf)
+	prim.write_u8(&w, 2)
 	prim.write_uvarint(&w, u64(len(h.stream_ids)))
 	for s, i in h.stream_ids {
 		prim.write_id(&w, s)
 		prim.write_uvarint(&w, u64(h.applied[i]))
+		if i > 0 {
+			d := &h.rdicts[i]
+			prim.write_uvarint(&w, u64(len(d.ids)))
+			for id in d.ids {
+				prim.write_id(&w, id)
+			}
+		}
 	}
 	prim.write_uvarint(&w, u64(len(h.dict.ids)))
 	for id in h.dict.ids {
@@ -631,6 +680,22 @@ history_text_at :: proc(h: ^History, inode: fstree.Inode_Id, v: Version, allocat
 	return crdt.text_bytes(&tmp.text, allocator), .None
 }
 
+history_text_spans_at :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Lv, allocator := context.allocator) -> (data: []u8, spans: []crdt.Author_Span, err: Error) {
+	tmp: File_State
+	tmp.inode = inode
+	read_file_record(h, inode, &tmp.rec) or_return
+	defer {
+		delete(tmp.rec.cp_version)
+		delete(tmp.rec.cp_spans)
+	}
+	load_text(h, &tmp, v) or_return
+	defer {
+		crdt.text_destroy(&tmp.text)
+		crdt.log_destroy(&tmp.log)
+	}
+	return crdt.text_bytes(&tmp.text, allocator), crdt.text_spans(&tmp.text, &h.g, allocator), .None
+}
+
 history_blob :: proc(h: ^History, inode: fstree.Inode_Id) -> (reg: Blob_Reg, found: bool, err: Error) {
 	f := history_file(h, inode) or_return
 	return f.rec.blob, f.rec.has_blob, .None
@@ -659,6 +724,9 @@ stream_index :: proc(h: ^History, id: prim.Id) -> u32 {
 	if len(h.stream_ids) == 0 {
 		append(&h.stream_ids, h.self)
 		append(&h.applied, 0)
+		d0: crdt.Actor_Dict
+		crdt.dict_init(&d0, h.allocator)
+		append(&h.rdicts, d0)
 	}
 	for s, i in h.stream_ids {
 		if s == id {
@@ -667,6 +735,9 @@ stream_index :: proc(h: ^History, id: prim.Id) -> u32 {
 	}
 	append(&h.stream_ids, id)
 	append(&h.applied, 0)
+	d: crdt.Actor_Dict
+	crdt.dict_init(&d, h.allocator)
+	append(&h.rdicts, d)
 	return u32(len(h.stream_ids) - 1)
 }
 
@@ -772,11 +843,12 @@ history_batch_at :: proc(h: ^History, lv: crdt.Lv) -> (first: crdt.Lv, n: int, s
 history_read_batch :: proc(h: ^History, stream: u32, off: u64, allocator := context.allocator) -> (b: crdt.Batch, err: Error) {
 	buf := make([dynamic]u8, context.temp_allocator)
 	body := read_stream(h, stream, i64(off), &buf) or_return
-	if len(body) == 0 || (body[0] != REC_BATCH && body[0] != REC_IMPORT) {
+	payload, ok := batch_payload(body)
+	if !ok {
 		return {}, .Corrupt
 	}
-	dict := &h.dict if stream == 0 else nil
-	bb, derr := crdt.batch_decode(body[1:], allocator, dict)
+	dict := stream_dict(h, stream)
+	bb, derr := crdt.batch_decode(payload, allocator, dict)
 	if derr != .None {
 		return {}, .Corrupt
 	}
@@ -994,14 +1066,70 @@ file_free :: proc(h: ^History, f: ^File_State) {
 }
 
 @(private)
+copy_read :: proc(data: rawptr, src: crdt.Op_Id, dst: []u8, authors: ^[dynamic]crdt.Author_Span) -> int {
+	return copy_read_depth((^History)(data), src, dst, authors, 0)
+}
+
+@(private)
+copy_read_depth :: proc(h: ^History, src: crdt.Op_Id, dst: []u8, authors: ^[dynamic]crdt.Author_Span, depth: int) -> int {
+	got := 0
+	outer: for got < len(dst) && depth < 64 {
+		id := crdt.Op_Id{src.actor, src.seq + u64(got)}
+		lv, ok := crdt.graph_lv(&h.g, id)
+		if !ok {
+			break
+		}
+		_, _, stream, off, found := history_batch_at(h, lv)
+		if !found {
+			break
+		}
+		b, err := history_read_batch(h, stream, off, context.temp_allocator)
+		if err != .None || b.actor != id.actor || id.seq < b.seq {
+			break
+		}
+		rel := int(id.seq - b.seq)
+		pos := 0
+		for op in b.ops {
+			if rel >= pos + op.len {
+				pos += op.len
+				continue
+			}
+			k := rel - pos
+			avail := min(op.len - k, len(dst) - got)
+			#partial switch op.kind {
+			case .Insert:
+				copy(dst[got:got + avail], op.content[k:k + avail])
+				append(authors, crdt.Author_Span{id = id, op = id, len = avail})
+			case .Insert_Ref:
+				r := op.ref
+				if !content_read(h, r.oid, r.offset + k, dst[got:got + avail]) {
+					break outer
+				}
+				append(authors, crdt.Author_Span{id = id, op = id, len = avail})
+			case .Insert_Copy:
+				sub := copy_read_depth(h, crdt.Op_Id{op.src.actor, op.src.seq + u64(k)}, dst[got:got + avail], authors, depth + 1)
+				if sub < avail {
+					got += sub
+					break outer
+				}
+			case:
+				break outer
+			}
+			got += avail
+			continue outer
+		}
+		break
+	}
+	return got
+}
+
+@(private)
 content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> bool {
 	h := (^History)(data)
 	if h.db == nil {
 		return false
 	}
-	full: odb.Oid
-	src := oid
-	copy(full[:20], src[:])
+	full := odb_oid(oid)
 	if h.blob_data == nil || h.blob_cache != full {
 		if h.blob_data != nil {
 			delete(h.blob_data, h.allocator)
@@ -1041,7 +1169,7 @@ load_text :: proc(h: ^History, f: ^File_State, v: []crdt.Lv) -> Error {
 		}
 	}
 	crdt.text_init(&f.text, h.allocator)
-	crdt.log_init(&f.log, h.allocator, crdt.Content_Source{h, content_read})
+	crdt.log_init(&f.log, h.allocator, crdt.Content_Source{h, content_read}, crdt.Copy_Source{h, copy_read})
 	f.loaded = true
 	replay_ops(h, f, 0) or_return
 	if e := crdt.text_merge(&f.text, &h.g, &f.log, v); e != .None {
@@ -1073,7 +1201,7 @@ load_from_checkpoint :: proc(h: ^History, f: ^File_State, v: []crdt.Lv) -> (ok: 
 	if crdt.text_from(&f.text, &h.g, data, f.rec.cp_spans[:], f.rec.cp_version[:], h.allocator) != .None {
 		return false, .None
 	}
-	crdt.log_init(&f.log, h.allocator, crdt.Content_Source{h, content_read})
+	crdt.log_init(&f.log, h.allocator, crdt.Content_Source{h, content_read}, crdt.Copy_Source{h, copy_read})
 	f.loaded = true
 	replay_ops(h, f, f.rec.cp_count) or_return
 	if e := crdt.text_merge(&f.text, &h.g, &f.log, v); e != .None {
@@ -1101,12 +1229,17 @@ replay_ops :: proc(h: ^History, f: ^File_State, from: u32) -> Error {
 
 @(private)
 replay_ref :: proc(h: ^History, f: ^File_State, target: crdt.Op_Id, ref: Op_Ref, buf: ^[dynamic]u8) -> Error {
-	body := read_stream(h, ref.stream, i64(ref.off), buf) or_return
-	if len(body) == 0 || (body[0] != REC_BATCH && body[0] != REC_IMPORT) {
+	body, rerr := read_stream(h, ref.stream, i64(ref.off), buf)
+	if rerr == .Redacted {
+		return .None
+	}
+	rerr or_return
+	payload, pok := batch_payload(body)
+	if !pok {
 		return .Corrupt
 	}
-	dict := &h.dict if ref.stream == 0 else nil
-	b, derr := crdt.batch_decode(body[1:], context.temp_allocator, dict)
+	dict := stream_dict(h, ref.stream)
+	b, derr := crdt.batch_decode(payload, context.temp_allocator, dict)
 	if derr != .None {
 		return .Corrupt
 	}
@@ -1133,6 +1266,9 @@ read_stream :: proc(h: ^History, stream: u32, off: i64, buf: ^[dynamic]u8) -> (b
 		journal.journal_reader(&h.journal, &r, context.temp_allocator)
 		defer journal.reader_close(&r)
 		b, _, jerr := journal.record_at(&r, off)
+		if jerr == .Redacted {
+			return nil, .Redacted
+		}
 		if jerr != .None {
 			return nil, .Corrupt
 		}
@@ -1161,6 +1297,7 @@ persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error 
 		data := crdt.text_bytes(&f.text, context.temp_allocator)
 		oid, werr := odb.write(h.db, .Blob, data)
 		if werr == .None {
+			history_note_blob(h, oid)
 			clear(&f.rec.cp_version)
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			clear(&f.rec.cp_spans)
@@ -1207,7 +1344,15 @@ encode_file_record :: proc(buf: ^[dynamic]u8, r: ^File_Record) {
 			prim.write_id(&w, s.id.actor)
 			prim.write_uvarint(&w, s.id.seq)
 			prim.write_uvarint(&w, u64(s.len))
-			prim.write_bool(&w, s.redacted)
+			flags: u8 = 1 if s.redacted else 0
+			if s.op != s.id {
+				flags |= 2
+			}
+			prim.write_u8(&w, flags)
+			if s.op != s.id {
+				prim.write_id(&w, s.op.actor)
+				prim.write_uvarint(&w, s.op.seq)
+			}
 		}
 	}
 }
@@ -1220,6 +1365,11 @@ read_file_record :: proc(h: ^History, id: fstree.Inode_Id, r: ^File_Record) -> E
 	if !found {
 		return .None
 	}
+	return decode_file_record(data, r)
+}
+
+@(private)
+decode_file_record :: proc(data: []u8, r: ^File_Record) -> Error {
 	rd := prim.reader(data)
 	r.has_blob = prim.read_bool(&rd)
 	if r.has_blob {
@@ -1251,8 +1401,18 @@ read_file_record :: proc(h: ^History, id: fstree.Inode_Id, r: ^File_Record) -> E
 			a := prim.read_id(&rd)
 			seq := prim.read_uvarint(&rd)
 			l := prim.read_uvarint(&rd)
-			red := prim.read_bool(&rd)
-			append(&r.cp_spans, crdt.Author_Span{id = {a, seq}, len = int(l), redacted = red})
+			flags := prim.read_u8(&rd)
+			span := crdt.Author_Span {
+				id       = {a, seq},
+				op       = {a, seq},
+				len      = int(l),
+				redacted = flags & 1 != 0,
+			}
+			if flags & 2 != 0 {
+				span.op.actor = prim.read_id(&rd)
+				span.op.seq = prim.read_uvarint(&rd)
+			}
+			append(&r.cp_spans, span)
 		}
 	}
 	if !prim.reader_ok(&rd) {
@@ -1348,10 +1508,29 @@ load_state :: proc(h: ^History) -> Error {
 	s, sfound := kv_get(&h.kv, transmute([]u8)string("s"), context.temp_allocator) or_return
 	if sfound {
 		rd := prim.reader(s)
+		if prim.read_u8(&rd) != 2 {
+			return .Corrupt
+		}
 		ns := prim.read_uvarint(&rd)
-		for _ in 0 ..< ns {
+		if ns > u64(len(s)) {
+			return .Corrupt
+		}
+		for i in 0 ..< ns {
 			append(&h.stream_ids, prim.read_id(&rd))
 			append(&h.applied, i64(prim.read_uvarint(&rd)))
+			d: crdt.Actor_Dict
+			crdt.dict_init(&d, h.allocator)
+			if i > 0 {
+				nd := prim.read_uvarint(&rd)
+				if nd > u64(prim.reader_remaining(&rd)) {
+					crdt.dict_destroy(&d)
+					return .Corrupt
+				}
+				for _ in 0 ..< nd {
+					crdt.dict_add(&d, prim.read_id(&rd))
+				}
+			}
+			append(&h.rdicts, d)
 		}
 		nd := prim.read_uvarint(&rd)
 		for _ in 0 ..< nd {
@@ -1365,8 +1544,19 @@ load_state :: proc(h: ^History) -> Error {
 	if len(h.stream_ids) == 0 {
 		append(&h.stream_ids, h.self)
 		append(&h.applied, 0)
+		d: crdt.Actor_Dict
+		crdt.dict_init(&d, h.allocator)
+		append(&h.rdicts, d)
 	}
 	return .None
+}
+
+@(private)
+stream_dict :: proc(h: ^History, i: u32) -> ^crdt.Actor_Dict {
+	if i == 0 || int(i) >= len(h.rdicts) {
+		return &h.dict
+	}
+	return &h.rdicts[i]
 }
 
 @(private)
@@ -1381,6 +1571,10 @@ replay_own :: proc(h: ^History) -> Error {
 	off := h.applied[0]
 	for off < end {
 		body, next, jerr := journal.record_at(&r, off)
+		if jerr == .Redacted && next > off {
+			off = next
+			continue
+		}
 		if jerr != .None {
 			return .Corrupt
 		}
@@ -1390,6 +1584,10 @@ replay_own :: proc(h: ^History) -> Error {
 			for _ in 0 ..< n {
 				crdt.dict_add(&h.dict, prim.read_id(&rd))
 			}
+		} else if len(body) > 0 && body[0] == REC_REDACT {
+			apply_redact_record(h, body) or_return
+		} else if len(body) > 0 && body[0] == REC_REPLACE {
+			apply_replace_record(h, 0, body, u64(off)) or_return
 		} else if len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT) {
 			b, derr := crdt.batch_decode(body[1:], context.temp_allocator, &h.dict)
 			if derr != .None {
@@ -1567,4 +1765,115 @@ decode_version :: proc(data: []u8, allocator := context.allocator) -> (v: Versio
 	}
 	slice.sort_by(out, crdt.op_id_less)
 	return out, .None
+}
+
+odb_oid :: proc "contextless" (o: crdt.Oid) -> (out: odb.Oid) {
+	x := o
+	n := min(int(x.len), 32)
+	copy(out[:n], x.bytes[:n])
+	return
+}
+
+crdt_oid :: proc "contextless" (o: odb.Oid, format: odb.Hash_Format) -> (out: crdt.Oid) {
+	x := o
+	n := odb.oid_size(format)
+	out.len = u8(n)
+	copy(out.bytes[:n], x[:n])
+	return
+}
+
+REC_REPLACE :: u8(5)
+
+batch_payload :: proc(body: []u8) -> (payload: []u8, ok: bool) {
+	if len(body) == 0 {
+		return nil, false
+	}
+	switch body[0] {
+	case REC_BATCH, REC_IMPORT:
+		return body[1:], true
+	case REC_REPLACE:
+		_, n := prim.get_uvarint(body[1:])
+		if n <= 0 || 1 + n + 1 > len(body) {
+			return nil, false
+		}
+		return body[1 + n + 1:], true
+	}
+	return nil, false
+}
+
+@(private)
+remap_ref :: proc(h: ^History, stream: u32, old_off: u64, new_off: u64, inodes: []fstree.Inode_Id) -> Error {
+	b: [LVIDX_REC]u8
+	for i in 0 ..< h.lvidx_n {
+		got, err := prim.read_at(h.vfs, h.lvidx, b[:], i64(i * LVIDX_REC))
+		if err != .None || got != LVIDX_REC {
+			return .Io
+		}
+		if prim.get_u32le(b[8:12]) == stream && prim.get_u64le(b[16:24]) == old_off {
+			prim.put_u64le(b[16:24], new_off)
+			from_prim(prim.write_at(h.vfs, h.lvidx, b[:], i64(i * LVIDX_REC))) or_return
+		}
+	}
+	for ino in inodes {
+		rec: File_Record
+		read_file_record(h, ino, &rec) or_return
+		chunks := (rec.ops + OPS_CHUNK - 1) / OPS_CHUNK
+		delete(rec.cp_version)
+		delete(rec.cp_spans)
+		for c in 0 ..< chunks {
+			key := ops_key(ino, c)
+			data, found := kv_get(&h.kv, key, context.temp_allocator) or_return
+			if !found {
+				continue
+			}
+			rd := prim.reader(data)
+			out := make([dynamic]u8, 0, len(data) + 8, context.temp_allocator)
+			w := prim.writer(&out)
+			changed := false
+			for !prim.reader_done(&rd) {
+				st := prim.read_uvarint(&rd)
+				off := prim.read_uvarint(&rd)
+				from := prim.read_uvarint(&rd)
+				to := prim.read_uvarint(&rd)
+				if !prim.reader_ok(&rd) {
+					return .Corrupt
+				}
+				if u32(st) == stream && off == old_off {
+					off = new_off
+					changed = true
+				}
+				prim.write_uvarint(&w, st)
+				prim.write_uvarint(&w, off)
+				prim.write_uvarint(&w, from)
+				prim.write_uvarint(&w, to)
+			}
+			if changed {
+				kv_put(&h.kv, key, out[:]) or_return
+			}
+		}
+	}
+	return .None
+}
+
+@(private)
+apply_replace_record :: proc(h: ^History, stream: u32, body: []u8, off: u64) -> Error {
+	old, n := prim.get_uvarint(body[1:])
+	if n <= 0 {
+		return .Corrupt
+	}
+	payload, ok := batch_payload(body)
+	if !ok {
+		return .Corrupt
+	}
+	b, derr := crdt.batch_decode(payload, context.temp_allocator, stream_dict(h, stream))
+	if derr != .None {
+		return .Corrupt
+	}
+	inodes := make([dynamic]fstree.Inode_Id, context.temp_allocator)
+	for op in b.ops {
+		if op.kind != .Opaque {
+			append(&inodes, op_inode(h, op.target))
+		}
+	}
+	return remap_ref(h, stream, old, off, inodes[:])
 }
