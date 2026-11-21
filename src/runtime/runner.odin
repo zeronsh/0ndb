@@ -1,5 +1,6 @@
 package rt
 
+import "core:slice"
 import "../agent"
 import "../convo"
 import eng "../engine"
@@ -12,7 +13,11 @@ import "../prim"
 REVIVE_PROMPT :: "Your previous turn was cut off by a restart of the machine running you. Continue the task from exactly where you left off; do not repeat work that is already done."
 
 evaluate :: proc(r: ^Runtime, o: Object) {
-	if !r.cfg.runner || r.closing {
+	if r.closing {
+		return
+	}
+	if !r.cfg.runner {
+		_evaluate_sender(r, o)
 		return
 	}
 	c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator)
@@ -47,12 +52,15 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	if run := run_find(r, o); run != nil {
+		_claim_prune(r, o, {})
 		_run_intents(run, v, &t, items)
 		return
 	}
 	cancelled := task_cancelled(r, o)
 	head := convo.tail_head(v, &t)
 	busy := t.running && _running_live(r, o, v, &t)
+	waiting_msg: Rid
+	defer _claim_prune(r, o, waiting_msg)
 	for &it in items {
 		#partial switch it.kind {
 		case .Queue, .Steer:
@@ -67,7 +75,11 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			if busy {
 				break
 			}
-			if place_intent(r, o, &it) != r.self {
+			x := place_intent(r, o, &it)
+			if prim.id_is_zero(x) {
+				_placement_waiting(r, o, it.item, _intent_provider(r, o), {})
+			}
+			if x != r.self {
 				return
 			}
 			_start_from_intent(r, o, head, &it)
@@ -95,6 +107,7 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		if hm.open || hm.status != .Done || busy {
 			return
 		}
+		waiting_msg = head
 		if _placed_here(r, o, v, &t, &hm) {
 			start_run(r, o, head)
 		}
@@ -121,13 +134,14 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			return
 		}
 		p := Placement {
-			kind    = .Takeover,
-			object  = o,
-			msg     = hm.parent,
-			sender  = um.author,
-			agent   = a.object.id,
-			policy  = a.policy,
-			exclude = hm.runner,
+			kind     = .Takeover,
+			object   = o,
+			msg      = hm.parent,
+			sender   = um.author,
+			agent    = a.object.id,
+			provider = placement_provider(&a),
+			policy   = a.policy,
+			exclude  = hm.runner,
 		}
 		if place(r, &p) == r.self && start_run(r, o, hm.parent) == .None {
 			r.stats.takeovers += 1
@@ -178,7 +192,7 @@ _lease_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, m: ^convo.Message) -> 
 	seen := now
 	found := false
 	for &w in r.leases {
-		if w.object == o && w.msg == m.id {
+		if !w.claim && w.object == o && w.msg == m.id {
 			found = true
 			if w.activity != last {
 				w.activity = last
@@ -237,7 +251,7 @@ _running_live :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> b
 
 lease_watch :: proc(r: ^Runtime, o: Object, at_ms: i64) {
 	for &w in r.leases {
-		if w.object == o {
+		if !w.claim && w.object == o {
 			w.at = at_ms if w.at == 0 else min(w.at, at_ms)
 		}
 	}
@@ -302,40 +316,175 @@ _on_renew :: proc(l: ^prim.Loop, data: rawptr) {
 }
 
 place_intent :: proc(r: ^Runtime, o: Object, it: ^convo.Intent) -> prim.Id {
-	a, ok := agent_resolve(r, o, "", "", context.temp_allocator)
-	if !ok {
-		return {}
-	}
+	a, _ := agent_resolve(r, o, "", "", context.temp_allocator)
 	p := Placement {
-		kind   = .Intent,
-		object = o,
-		msg    = it.item,
-		sender = it.by,
-		agent  = a.object.id,
-		policy = a.policy,
+		kind     = .Intent,
+		object   = o,
+		msg      = it.item,
+		sender   = it.by,
+		agent    = a.object.id,
+		provider = placement_provider(&a),
+		policy   = a.policy,
 	}
 	return place(r, &p)
 }
 
 @(private)
-_placed_here :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message) -> bool {
-	assignee, aerr := convo.assignee(v, t, m.id)
-	if aerr == .None && !prim.id_is_zero(assignee) {
-		return assignee == r.self
-	}
-	a, ok := agent_resolve(r, o, m.provider, m.model, context.temp_allocator)
+_intent_provider :: proc(r: ^Runtime, o: Object) -> string {
+	a, ok := agent_resolve(r, o, "", "", context.temp_allocator)
 	if !ok {
-		return false
+		return ""
+	}
+	return placement_provider(&a)
+}
+
+@(private)
+_placed_here :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message) -> bool {
+	x, _ := _place_message(r, o, v, t, m)
+	return x == r.self
+}
+
+@(private)
+_place_message :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message) -> (runner: prim.Id, assignee: prim.Id) {
+	a, _ := agent_resolve(r, o, m.provider, m.model, context.temp_allocator)
+	provider := placement_provider(&a)
+	exclude: prim.Id
+	if as, aerr := convo.assignee(v, t, m.id); aerr == .None && !prim.id_is_zero(as) {
+		assignee = as
+		if as == r.self && r.cfg.runner {
+			return as, as
+		}
+		if !_claim_overdue(r, o, m.id, as, provider) {
+			return as, as
+		}
+		exclude = as
 	}
 	p := Placement {
-		kind   = .Message,
-		object = o,
-		msg    = m.id,
-		sender = m.author,
-		agent  = a.object.id,
-		policy = a.policy,
+		kind     = .Message,
+		object   = o,
+		msg      = m.id,
+		sender   = m.author,
+		agent    = a.object.id,
+		provider = provider,
+		policy   = a.policy,
+		exclude  = exclude,
 	}
-	return place(r, &p) == r.self
+	runner = place(r, &p)
+	if prim.id_is_zero(runner) {
+		_placement_waiting(r, o, m.id, provider, exclude)
+	}
+	return runner, assignee
+}
+
+@(private)
+_claim_overdue :: proc(r: ^Runtime, o: Object, msg: Rid, runner: prim.Id, provider: string) -> bool {
+	if !runner_live(r, o.space, runner, provider) {
+		return true
+	}
+	now := wall_ms(r)
+	for &w in r.leases {
+		if w.claim && w.object == o && w.msg == msg {
+			if w.runner != runner {
+				w.runner = runner
+				w.seen = now
+				w.at = 0
+			}
+			due := w.seen + r.cfg.claim_wait_ms
+			if now >= due {
+				return true
+			}
+			if w.at == 0 || w.at > due {
+				w.at = due
+				_lease_arm(r)
+			}
+			return false
+		}
+	}
+	due := now + r.cfg.claim_wait_ms
+	append(&r.leases, Lease_Watch{object = o, msg = msg, runner = runner, seen = now, at = due, claim = true})
+	_lease_arm(r)
+	return false
+}
+
+@(private)
+_claim_prune :: proc(r: ^Runtime, o: Object, keep: Rid) {
+	i := 0
+	changed := false
+	for i < len(r.leases) {
+		w := r.leases[i]
+		if w.claim && w.object == o && (obj.rid_none(keep) || w.msg != keep) {
+			unordered_remove(&r.leases, i)
+			changed = true
+			continue
+		}
+		i += 1
+	}
+	if changed {
+		_lease_arm(r)
+	}
+}
+
+@(private)
+_placement_waiting :: proc(r: ^Runtime, o: Object, msg: Rid, provider: string, waiting_on: prim.Id) {
+	if _pending_put(r, o, Pending_Entry{msg = msg, provider = provider, since_ms = wall_ms(r), runner = waiting_on}) {
+		_placement_hook(r, o, Placement_Info{state = .Waiting_Runner, msg = msg, provider = provider, runner = waiting_on, since_ms = wall_ms(r)})
+	}
+}
+
+@(private)
+_placement_hook :: proc(r: ^Runtime, o: Object, info: Placement_Info) {
+	if r.cfg.hooks.placement != nil {
+		r.cfg.hooks.placement(r.cfg.hooks.data, r, o, info)
+	}
+}
+
+convo_runners :: proc(r: ^Runtime, o: Object, from: Rid) -> []prim.Id {
+	out := make([dynamic]prim.Id, context.temp_allocator)
+	v, verr := eng.convo_view(r.e, o)
+	if verr != .None {
+		return out[:]
+	}
+	t, terr := convo.view_tail(v, r.self, context.temp_allocator)
+	if terr != .None {
+		return out[:]
+	}
+	cur := from
+	if _, merr := convo.message(v, &t, convo.Position{msg = cur}, context.temp_allocator); obj.rid_none(cur) || merr != .None {
+		cur = convo.tail_head(v, &t)
+	}
+	for _ in 0 ..< 64 {
+		if obj.rid_none(cur) {
+			break
+		}
+		m, merr := convo.message(v, &t, convo.Position{msg = cur}, context.temp_allocator)
+		if merr != .None {
+			break
+		}
+		if !prim.id_is_zero(m.runner) {
+			append(&out, m.runner)
+			break
+		}
+		cur = m.parent
+	}
+	ms, mserr := convo.mounts(v, context.temp_allocator)
+	if mserr == .None {
+		for {
+			best := -1
+			for m, i in ms {
+				if m.removed || len(m.path) == 0 || prim.id_is_zero(m.by) || slice.contains(out[:], m.by) {
+					continue
+				}
+				if best < 0 || m.stamp > ms[best].stamp || (m.stamp == ms[best].stamp && obj.id_less(m.by, ms[best].by)) {
+					best = i
+				}
+			}
+			if best < 0 {
+				break
+			}
+			append(&out, ms[best].by)
+		}
+	}
+	return out[:]
 }
 
 @(private)
@@ -431,6 +580,8 @@ start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
 		return .Not_Assigned if cerr == .Not_Assigned else .Engine
 	}
 	run.claim = claim
+	_pending_clear(r, o)
+	_claim_prune(r, o, {})
 	if exhausted {
 		eng.pin(r.e, o)
 		run.pinned = true
@@ -1052,7 +1203,7 @@ _reply_hooks :: proc(r: ^Runtime, o: Object, reply: Rid, status: convo.Seal_Stat
 _lease_prune :: proc(r: ^Runtime, o: Object, v: ^obj.View) {
 	any := false
 	for w in r.leases {
-		any ||= w.object == o
+		any ||= !w.claim && w.object == o
 	}
 	if !any {
 		return
@@ -1064,7 +1215,7 @@ _lease_prune :: proc(r: ^Runtime, o: Object, v: ^obj.View) {
 	i := 0
 	for i < len(r.leases) {
 		w := r.leases[i]
-		keep := w.object != o
+		keep := w.object != o || w.claim
 		if !keep {
 			for u in list {
 				keep ||= u.msg == w.msg && u.state == .Running

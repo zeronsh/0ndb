@@ -1,7 +1,10 @@
 package rt
 
+import "core:slice"
+import "core:strings"
 import eng "../engine"
 import omap "../map"
+import "../obj"
 import "../prim"
 
 @(private)
@@ -314,23 +317,218 @@ state_mark_claimed :: proc(r: ^Runtime, o: Object, msg: Rid, claim: Rid) {
 }
 
 runner_known :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
+	return runner_live(r, space, device, "")
+}
+
+PROVIDER_NATIVE :: "native"
+
+placement_provider :: proc(a: ^Agent_Info) -> string {
+	if len(a.provider) == 0 {
+		return ""
+	}
+	if a.kind == .Native {
+		return PROVIDER_NATIVE
+	}
+	return a.provider
+}
+
+runner_live :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, provider: string) -> bool {
+	if prim.id_is_zero(device) {
+		return false
+	}
 	if device == r.self {
-		return r.cfg.runner
+		return r.cfg.runner && !r.closing && (len(provider) == 0 || _list_has(_providers_local(r), provider))
 	}
 	d := device
 	en, ok := map_read(r, runners_object(space), d[:])
 	if !ok {
 		return false
 	}
-	return entry_u64(&en, 1) > 0
+	return _advert_ok(&en, provider)
+}
+
+runners_live :: proc(r: ^Runtime, space: prim.Id, provider: string) -> []prim.Id {
+	out := make([dynamic]prim.Id, context.temp_allocator)
+	for &row in map_rows(r, runners_object(space), nil) {
+		if len(row.key) != 16 {
+			continue
+		}
+		id: prim.Id
+		copy(id[:], row.key)
+		if id == r.self {
+			if runner_live(r, space, id, provider) {
+				append(&out, id)
+			}
+			continue
+		}
+		if _advert_ok(&row.entry, provider) {
+			append(&out, id)
+		}
+	}
+	return out[:]
 }
 
 @(private)
-_advertise :: proc(r: ^Runtime, space: prim.Id) {
+_advert_ok :: proc(en: ^omap.Entry, provider: string) -> bool {
+	if entry_u64(en, 1) == 0 {
+		return false
+	}
+	if len(provider) == 0 {
+		return true
+	}
+	list, has := omap.entry_register(en, 2)
+	if !has {
+		return true
+	}
+	return _list_has(string(list), provider)
+}
+
+@(private)
+_list_has :: proc(list: string, item: string) -> bool {
+	rest := list
+	for len(rest) > 0 {
+		n := strings.index_byte(rest, '\n')
+		cur := rest if n < 0 else rest[:n]
+		if cur == item {
+			return true
+		}
+		if n < 0 {
+			break
+		}
+		rest = rest[n + 1:]
+	}
+	return false
+}
+
+@(private)
+_providers_local :: proc(r: ^Runtime) -> string {
+	ids := make([dynamic]string, context.temp_allocator)
+	append(&ids, PROVIDER_NATIVE)
+	for d in r.registry.list {
+		desc, ok := _descriptor(r, d.id)
+		if ok && len(desc.argv) > 0 && _exe_found(r, desc.argv[0]) {
+			append(&ids, d.id)
+		}
+	}
+	slice.sort(ids[:])
+	return strings.join(ids[:], "\n", context.temp_allocator)
+}
+
+@(private)
+_exe_found :: proc(r: ^Runtime, name: string) -> bool {
+	vfs := prim.os_vfs()
+	if strings.index_byte(name, '/') >= 0 {
+		return prim.exists(vfs, name)
+	}
+	path := ""
+	found := false
+	for kv in r.cfg.env {
+		if strings.has_prefix(kv, "PATH=") {
+			path = kv[5:]
+			found = true
+		}
+	}
+	if !found {
+		path, _ = prim.getenv("PATH")
+	}
+	rest := path
+	for len(rest) > 0 {
+		n := strings.index_byte(rest, ':')
+		dir := rest if n < 0 else rest[:n]
+		if len(dir) > 0 && prim.exists(vfs, concat(dir, "/", name)) {
+			return true
+		}
+		if n < 0 {
+			break
+		}
+		rest = rest[n + 1:]
+	}
+	return false
+}
+
+@(private)
+_advertise :: proc(r: ^Runtime, space: prim.Id, capacity: int) {
 	me := r.self
+	provs := _providers_local(r)
 	en, ok := map_read(r, runners_object(space), me[:])
-	if ok && entry_u64(&en, 1) == u64(r.cfg.capacity) {
+	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs {
 		return
 	}
-	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(r.cfg.capacity)))
+	if !ok && capacity == 0 {
+		return
+	}
+	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(capacity)), field_bytes(2, transmute([]u8)provs))
+}
+
+pending_named :: proc(space: prim.Id) -> Named {
+	return Named{space, "0ndb:pending", {}}
+}
+
+pending_object :: proc(space: prim.Id) -> Object {
+	return named_obj(pending_named(space))
+}
+
+Pending_Entry :: struct {
+	msg:      Rid,
+	provider: string,
+	since_ms: i64,
+	runner:   prim.Id,
+	assigned: bool,
+}
+
+pending_get :: proc(r: ^Runtime, o: Object) -> (p: Pending_Entry, ok: bool) {
+	id := o.id
+	en, found := map_read(r, pending_object(o.space), id[:])
+	if !found {
+		return {}, false
+	}
+	p.msg = entry_rid(&en, 1)
+	if obj.rid_none(p.msg) {
+		return {}, false
+	}
+	p.provider = entry_str(&en, 2)
+	p.since_ms = i64(entry_u64(&en, 3))
+	p.runner = entry_id(&en, 4)
+	p.assigned = entry_bool(&en, 5)
+	return p, true
+}
+
+@(private)
+_pending_put :: proc(r: ^Runtime, o: Object, p: Pending_Entry) -> bool {
+	if old, ok := pending_get(r, o); ok && old.msg == p.msg && old.provider == p.provider && old.runner == p.runner && old.assigned == p.assigned {
+		return false
+	}
+	id := o.id
+	map_put(r, named_w(r, pending_named(o.space)), id[:], field_rid(1, p.msg), field_bytes(2, transmute([]u8)p.provider), omap.field_u64(3, u64(p.since_ms)), omap.field_id(4, p.runner), omap.field_bool(5, p.assigned))
+	return true
+}
+
+@(private)
+_pending_clear :: proc(r: ^Runtime, o: Object) {
+	if _, ok := pending_get(r, o); !ok {
+		return
+	}
+	id := o.id
+	map_clear(r, named_w(r, pending_named(o.space)), id[:], 1, 2, 3, 4, 5)
+}
+
+@(private)
+_pending_scan :: proc(r: ^Runtime, space: prim.Id) {
+	for &row in map_rows(r, pending_object(space), nil) {
+		if len(row.key) != 16 || obj.rid_none(entry_rid(&row.entry, 1)) {
+			continue
+		}
+		id: prim.Id
+		copy(id[:], row.key)
+		_queue_eval(r, Object{space, id})
+	}
+}
+
+@(private)
+_on_runners :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	r := (^Runtime)(data)
+	for d in deltas {
+		_pending_scan(r, d.object.space)
+		return
+	}
 }

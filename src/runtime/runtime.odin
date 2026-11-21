@@ -56,13 +56,29 @@ Placement_Kind :: enum u8 {
 }
 
 Placement :: struct {
-	kind:   Placement_Kind,
-	object: Object,
-	msg:    Rid,
-	sender: prim.Id,
-	agent:   prim.Id,
-	policy:  []u8,
-	exclude: prim.Id,
+	kind:     Placement_Kind,
+	object:   Object,
+	msg:      Rid,
+	sender:   prim.Id,
+	agent:    prim.Id,
+	provider: string,
+	policy:   []u8,
+	exclude:  prim.Id,
+}
+
+Placement_State :: enum u8 {
+	None,
+	Assigned,
+	Running,
+	Waiting_Runner,
+}
+
+Placement_Info :: struct {
+	state:    Placement_State,
+	msg:      Rid,
+	runner:   prim.Id,
+	provider: string,
+	since_ms: i64,
 }
 
 Scheduler :: struct {
@@ -113,9 +129,10 @@ Homes :: struct {
 }
 
 Hooks :: struct {
-	data:   rawptr,
-	sealed: proc(data: rawptr, r: ^Runtime, o: Object, reply: Rid, status: convo.Seal_Status),
-	event:  proc(data: rawptr, r: ^Runtime, name: string, o: Object),
+	data:      rawptr,
+	sealed:    proc(data: rawptr, r: ^Runtime, o: Object, reply: Rid, status: convo.Seal_Status),
+	event:     proc(data: rawptr, r: ^Runtime, name: string, o: Object),
+	placement: proc(data: rawptr, r: ^Runtime, o: Object, info: Placement_Info),
 }
 
 Config :: struct {
@@ -138,6 +155,7 @@ Config :: struct {
 	warm_max:         int,
 	warm_idle_ms:     i64,
 	interrupt_ms:     i64,
+	claim_wait_ms:    i64,
 	mcp_http:         bool,
 	mcp_port:         int,
 	catalog_command:  []string,
@@ -150,6 +168,7 @@ DEFAULT_WARM_IDLE_MS :: 5 * 60 * 1000
 DEFAULT_WARM_MAX :: 4
 DEFAULT_INTERRUPT_MS :: 10_000
 DEFAULT_CAPACITY :: 16
+DEFAULT_CLAIM_WAIT_MS :: 60 * 1000
 
 Stats :: struct {
 	runs_started:  u64,
@@ -162,6 +181,7 @@ Stats :: struct {
 	schedules:     u64,
 	warmups:       u64,
 	takeovers:     u64,
+	inexact:       u64,
 	timers:        int,
 }
 
@@ -170,6 +190,7 @@ Space_Watch :: struct {
 	space:     prim.Id,
 	catalog:   eng.Sub_Id,
 	schedules: eng.Sub_Id,
+	runners:   eng.Sub_Id,
 	synced:    bool,
 }
 
@@ -181,6 +202,8 @@ Lease_Watch :: struct {
 	seen:     i64,
 	at:       i64,
 	sub:      eng.Sub_Id,
+	runner:   prim.Id,
+	claim:    bool,
 }
 
 @(private)
@@ -270,6 +293,9 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	if r.cfg.capacity <= 0 {
 		r.cfg.capacity = DEFAULT_CAPACITY
 	}
+	if r.cfg.claim_wait_ms <= 0 {
+		r.cfg.claim_wait_ms = DEFAULT_CLAIM_WAIT_MS
+	}
 	r.cfg.work_root = clone(cfg.work_root, allocator)
 	r.cfg.default_provider = clone(cfg.default_provider, allocator)
 	r.cfg.default_model = clone(cfg.default_model, allocator)
@@ -342,6 +368,12 @@ close :: proc(r: ^Runtime) {
 		}
 		if sw.schedules != 0 {
 			eng.unsubscribe(r.e, sw.schedules)
+		}
+		if sw.runners != 0 {
+			eng.unsubscribe(r.e, sw.runners)
+		}
+		if r.cfg.runner {
+			_advertise(r, sw.space, 0)
 		}
 	}
 	for w in r.waits {
@@ -423,11 +455,16 @@ attach :: proc(r: ^Runtime, space: prim.Id) -> Error {
 	if serr == .None {
 		sw.schedules = sid
 	}
+	rid, rerr := eng.subscribe(r.e, runners_object(space), .Map, _on_runners, r)
+	if rerr == .None {
+		sw.runners = rid
+	}
 	append(&r.spaces, sw)
 	if r.cfg.runner {
-		_advertise(r, space)
+		_advertise(r, space, r.cfg.capacity)
 		_recover(r, space)
 	}
+	_pending_scan(r, space)
 	if len(map_rows(r, state_object(r, space), transmute([]u8)string("trig/"), 1)) > 0 {
 		r.triggers = true
 	}
@@ -445,6 +482,12 @@ detach :: proc(r: ^Runtime, space: prim.Id) {
 		}
 		if sw.schedules != 0 {
 			eng.unsubscribe(r.e, sw.schedules)
+		}
+		if sw.runners != 0 {
+			eng.unsubscribe(r.e, sw.runners)
+		}
+		if r.cfg.runner {
+			_advertise(r, space, 0)
 		}
 		ordered_remove(&r.spaces, i)
 		_sched_rearm(r)
@@ -672,7 +715,8 @@ default_scheduler :: proc() -> Scheduler {
 
 @(private)
 _default_place :: proc(data: rawptr, r: ^Runtime, p: ^Placement) -> prim.Id {
-	if !prim.id_is_zero(p.sender) && p.sender != p.exclude && runner_known(r, p.object.space, p.sender) {
+	space := p.object.space
+	if !prim.id_is_zero(p.sender) && p.sender != p.exclude && runner_live(r, space, p.sender, p.provider) {
 		return p.sender
 	}
 	if id, ok := policy_runner(p.policy); ok && id != p.exclude {
@@ -681,10 +725,20 @@ _default_place :: proc(data: rawptr, r: ^Runtime, p: ^Placement) -> prim.Id {
 	if !prim.id_is_zero(r.cfg.default_runner) && r.cfg.default_runner != p.exclude {
 		return r.cfg.default_runner
 	}
-	if p.kind == .Takeover {
-		return r.self if r.cfg.runner else {}
+	if p.kind == .Takeover && runner_live(r, space, r.self, p.provider) {
+		return r.self
 	}
-	return p.sender
+	for id in convo_runners(r, p.object, p.msg) {
+		if id != p.exclude && runner_live(r, space, id, p.provider) {
+			return id
+		}
+	}
+	for id in runners_live(r, space, p.provider) {
+		if id != p.exclude {
+			return id
+		}
+	}
+	return {}
 }
 
 policy_runner :: proc(policy: []u8) -> (id: prim.Id, ok: bool) {

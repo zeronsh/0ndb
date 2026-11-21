@@ -933,30 +933,11 @@ _observe_write :: proc(data: rawptr, w: ^observe.Write) {
 		if !inside {
 			continue
 		}
-		calls := make([dynamic]observe.Tool_Call, context.temp_allocator)
-		idx := make([dynamic]int, context.temp_allocator)
-		for &t, i in run.tools {
-			if t.has_obs && t.scope >= 0 && t.scope < len(run.ws.tools) && run.ws.tools[t.scope].open {
-				append(&calls, t.call)
-				append(&idx, i)
-			}
-		}
-		k, ambiguous := observe.attribute(calls[:], w, pid)
 		m, _, found := observe.router_locate(&r.router, w.path)
-		if k >= 0 && !ambiguous && found {
-			t := run.tools[idx[k]]
-			for mb, mi in run.ws.members {
-				if mb.m == m && t.scope < len(run.ws.tools) {
-					scope = run.ws.tools[t.scope].scopes[mi]
-				}
-			}
-		}
-		if scope == nil && found {
-			for mb in run.ws.members {
-				if mb.m == m {
-					scope = mb.turn
-				}
-			}
+		if found {
+			calls, idx := _open_calls(run)
+			k, ambiguous := observe.attribute(calls, w, pid)
+			scope = _run_scope(run, m, idx[k] if k >= 0 && !ambiguous else -1)
 		}
 		break
 	}
@@ -965,4 +946,49 @@ _observe_write :: proc(data: rawptr, w: ^observe.Write) {
 	} else {
 		observe.route_write(&r.router, w)
 	}
+}
+
+@(private)
+_open_calls :: proc(run: ^Run) -> (calls: []observe.Tool_Call, idx: []int) {
+	c := make([dynamic]observe.Tool_Call, context.temp_allocator)
+	x := make([dynamic]int, context.temp_allocator)
+	for &t, i in run.tools {
+		if t.has_obs && t.scope >= 0 && t.scope < len(run.ws.tools) && run.ws.tools[t.scope].open {
+			append(&c, t.call)
+			append(&x, i)
+		}
+	}
+	return c[:], x[:]
+}
+
+@(private)
+_run_scope :: proc(run: ^Run, m: ^fs.Mount, tool: int) -> ^fs.Scope {
+	for mb, mi in run.ws.members {
+		if mb.m != m {
+			continue
+		}
+		if tool >= 0 {
+			t := run.tools[tool]
+			if t.scope >= 0 && t.scope < len(run.ws.tools) && mi < len(run.ws.tools[t.scope].scopes) {
+				if s := run.ws.tools[t.scope].scopes[mi]; s != nil {
+					return s
+				}
+			}
+		}
+		return mb.turn
+	}
+	return nil
+}
+
+@(private)
+_run_has_mount :: proc(run: ^Run, m: ^fs.Mount) -> bool {
+	if run.ws == nil {
+		return false
+	}
+	for mb in run.ws.members {
+		if mb.m == m {
+			return true
+		}
+	}
+	return false
 }
