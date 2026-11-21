@@ -6,6 +6,7 @@ Verdict :: enum u8 {
 	Accept,
 	Hold,
 	Equivocation,
+	Tampered,
 }
 
 Verify_Request :: struct {
@@ -100,8 +101,11 @@ chain_verify :: proc(cv: ^Chain_Verifier, req: ^Verify_Request) -> Verdict {
 			}
 			req.done = c.pos
 			return .Hold
-		case .Equivocation, .Forged, .Corrupt:
+		case .Equivocation:
 			return .Equivocation
+		case .Forged, .Corrupt:
+			req.done = c.pos
+			return .Tampered
 		case:
 			req.done = c.pos
 			return .Hold

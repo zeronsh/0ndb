@@ -349,7 +349,7 @@ replicator_link_down :: proc(r: ^Replicator, err: Error = .Closed) {
 	was := r.phase
 	_repl_close(r)
 	r.phase = .Stopped
-	if was == .Ready {
+	if was == .Ready || was == .Hello {
 		_emit(r, Repl_Event{kind = .Disconnected, err = err})
 	}
 }
@@ -411,7 +411,7 @@ _repl_fail :: proc(r: ^Replicator, err: Error) {
 	delay := r.backoff * 3 / 4 + r.backoff * i64(u16(jitter[0]) | u16(jitter[1]) << 8) / (2 * 65536)
 	r.backoff = min(r.backoff * 2, BACKOFF_MAX)
 	r.timer = prim.timer(r.loop, delay, r, _on_connect_timeout)
-	if was == .Ready {
+	if was == .Ready || was == .Hello {
 		_emit(r, Repl_Event{kind = .Disconnected, err = err})
 	}
 }

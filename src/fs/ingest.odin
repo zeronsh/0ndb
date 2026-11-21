@@ -287,6 +287,8 @@ Import_State :: struct {
 	chunk:     virtual.Arena,
 	path_buf:  [dynamic]u8,
 	resume:    bool,
+	adopt:     bool,
+	snap:      fstree.Snapshot,
 	dirty_dirs: map[string]bool,
 	packp:     ^odb.Pack_Builder,
 	cur:       ^Pipe_Chunk,
@@ -312,6 +314,20 @@ mount_import :: proc(m: ^Mount) -> Error {
 	context.temp_allocator = virtual.arena_allocator(&st.chunk)
 	empty := shadow_empty(&m.shadow) or_return
 	st.resume = !empty
+	if empty && m.history != nil {
+		if line, has := history_line(m.history, m.line, st.long) or_return; has && len(line) > 0 {
+			lvs := make([dynamic]crdt.Lv, st.long)
+			if crdt.graph_version_lvs(&m.history.g, line, &lvs) == .None {
+				st.snap = version_snapshot(m.history, lvs[:]) or_return
+				st.adopt = true
+				clear(&m.synced)
+				append(&m.synced, ..line)
+			}
+		}
+	}
+	defer if st.adopt {
+		fstree.snapshot_destroy(&st.snap)
+	}
 	m.hold_line = true
 	defer m.hold_line = false
 	builder_init(&st.b, m.history, m.actor)
@@ -394,6 +410,9 @@ mount_import :: proc(m: ^Mount) -> Error {
 			}
 			continue
 		}
+		if st.adopt && import_adopt(&st, it, parent) {
+			continue
+		}
 		if st.resume {
 			have, found := shadow_get(&m.shadow, it.path) or_return
 			if found {
@@ -451,8 +470,51 @@ mount_import :: proc(m: ^Mount) -> Error {
 		mount_commit(m, {message = "0ndb: first mount"}) or_return
 	}
 	m.imported = true
+	if st.adopt {
+		if line, has := history_line(m.history, m.line, context.temp_allocator) or_return; has {
+			clear(&m.synced)
+			materialize_to(m, line, false) or_return
+		}
+	}
 	_heap_release()
 	return mount_settle(m)
+}
+
+@(private)
+import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame) -> bool {
+	m := st.m
+	ino, found, lerr := fstree.lookup(&st.snap, it.path)
+	if lerr != nil || !found {
+		return false
+	}
+	info, ok, ierr := fstree.info(&st.snap, ino, context.temp_allocator)
+	if ierr != nil || !ok || !info.present {
+		return false
+	}
+	want: fstree.Kind
+	#partial switch it.kind {
+	case .Dir:
+		want = .Dir
+	case .File:
+		want = .File
+	case .Symlink:
+		want = .Symlink
+	case:
+		return false
+	}
+	if info.kind != want {
+		return false
+	}
+	st.stack[len(st.stack) - 1].partial = true
+	if want == .Dir {
+		import_shadow(st, it.path, Entry{inode = ino, kind = .Dir, stat = it.stat})
+		wd, _ := watch_dir(m.reg, m, it.path, parent.wd)
+		p, _ := clone_string(it.path, st.long)
+		append(&st.stack, Dir_Frame{path = p, inode = ino, depth = it.depth, wd = wd, partial = true})
+		return true
+	}
+	import_shadow(st, it.path, Entry{inode = ino, kind = want})
+	return true
 }
 
 @(private)
@@ -805,6 +867,7 @@ Change :: struct {
 	target: string,
 	old:    Entry,
 	scope:   ^Scope,
+	actor:   prim.Id,
 	moved:   string,
 	carried: bool,
 }
@@ -835,7 +898,34 @@ Pass :: struct {
 PASS_CHUNK :: 4096
 MOVE_MIN :: 32
 
-mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
+@(private)
+catch_up :: proc(m: ^Mount) -> Error {
+	h := m.history
+	if h == nil {
+		return .None
+	}
+	known := crdt.graph_known(&h.g, m.actor)
+	if known == 0 {
+		return .None
+	}
+	latest, ok := crdt.graph_lv(&h.g, crdt.Op_Id{m.actor, known - 1})
+	if !ok {
+		return .None
+	}
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+		return .Corrupt
+	}
+	if crdt.graph_contains(&h.g, sl[:], latest) {
+		return .None
+	}
+	one := [1]crdt.Lv{latest}
+	both := make([dynamic]crdt.Lv, context.temp_allocator)
+	crdt.version_union(&h.g, sl[:], one[:], &both)
+	return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), true)
+}
+
+mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	long: virtual.Arena
 	if virtual.arena_init_growing(&long, 256 << 10) != nil {
 		return .No_Memory
@@ -853,6 +943,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 	if m.history != nil {
 		defer history_trim(m.history)
 	}
+	catch_up(m) or_return
 	if m.has_git {
 		p.head, _ = git_head(m.vfs, m.git, p.long)
 		p.head_moved = !git_head_equal(p.head, m.head)
@@ -887,8 +978,18 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 		delete(k, m.allocator)
 	}
 	clear(&m.dirty)
+	rescan_was := m.rescan
 	m.rescan = false
 	m.git_moved = false
+	defer if err != .None {
+		for k, v in p.scope_of {
+			if k not_in m.dirty {
+				c, _ := clone_string(k, m.allocator)
+				m.dirty[c] = v
+			}
+		}
+		m.rescan ||= rescan_was || p.full
+	}
 	if p.full {
 		collect_full(&p) or_return
 	} else {
@@ -1129,6 +1230,11 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				}
 			}
 		}
+		if c.scope == nil {
+			if a, ok := m.attrib[c.path]; ok {
+				c.actor = a
+			}
+		}
 	}
 	detect_moves(p)
 	if !final && p.full {
@@ -1181,7 +1287,12 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
 		order := make([dynamic]prim.Id, context.temp_allocator)
 		for c, i in p.changes {
-			actor := m.actor if c.scope == nil else c.scope.actor
+			actor := m.actor
+			if c.scope != nil {
+				actor = c.scope.actor
+			} else if c.actor != {} {
+				actor = c.actor
+			}
 			if _, ok := groups[actor]; !ok {
 				groups[actor] = make([dynamic]int, context.temp_allocator)
 				append(&order, actor)
@@ -1194,6 +1305,11 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			b: Builder
 			builder_init(&b, m.history, actor)
 			emit_order(p, groups[actor][:])
+			if actor != m.actor {
+				for i in groups[actor] {
+					attrib_set(m, p.changes[i].path, actor)
+				}
+			}
 			for i in groups[actor] {
 				emit_change(p, &b, &p.changes[i]) or_return
 			}

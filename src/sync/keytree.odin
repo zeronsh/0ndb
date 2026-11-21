@@ -9,6 +9,13 @@ import "../prim"
 
 KEYS_STREAM :: "keys/"
 KEYS_RECORD :: 2
+KEYS_HEAD_STREAM :: "keyshead/"
+KEYS_HEAD_RECORD :: 3
+
+keys_head_name :: proc(keys_name: string, allocator := context.temp_allocator) -> (string, Error) {
+	seg := keys_name[len(KEYS_STREAM):] if len(keys_name) >= len(KEYS_STREAM) && keys_name[:len(KEYS_STREAM)] == KEYS_STREAM else keys_name
+	return _concat(allocator, KEYS_HEAD_STREAM, seg)
+}
 
 keys_stream_name :: proc(segment: string, allocator := context.temp_allocator) -> (string, Error) {
 	return _concat(allocator, KEYS_STREAM, segment)

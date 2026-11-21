@@ -19,7 +19,12 @@ Redact_Result :: struct {
 	ranges:    []journal.Range,
 }
 
-history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.allocator) -> (res: Redact_Result, err: Error) {
+Redact_Plan :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, ranges: []journal.Range) -> Error,
+}
+
+history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.allocator, plan := Redact_Plan{}) -> (res: Redact_Result, err: Error) {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
 		return {}, .No_Memory
@@ -57,6 +62,13 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 	records := make([dynamic][2]i64, context.temp_allocator)
 	extra := make([dynamic]crdt.Op_Span, context.temp_allocator)
 	own_records(h, all[:], &records, &extra) or_return
+	if plan.call != nil && len(records) > 0 {
+		planned := make([]journal.Range, len(records), context.temp_allocator)
+		for rec, i in records {
+			planned[i] = journal.Range{rec[0], rec[1]}
+		}
+		plan.call(plan.data, planned) or_return
+	}
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
 	res.files = apply_redaction(h, all[:], extra[:], &targets, &protect) or_return
@@ -271,7 +283,7 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 	return files, .None
 }
 
-mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: int, allocator := context.allocator) -> (res: Redact_Result, err: Error) {
+mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: int, allocator := context.allocator, plan := Redact_Plan{}) -> (res: Redact_Result, err: Error) {
 	mount_sync(m) or_return
 	h := m.history
 	e, found := shadow_get(&m.shadow, path) or_return
@@ -294,7 +306,7 @@ mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: 
 		}
 		at += s.len
 	}
-	res = history_redact(h, ids[:], allocator) or_return
+	res = history_redact(h, ids[:], allocator, plan) or_return
 	if mount_wake(m) == .None {
 		m.rescan = false
 	}

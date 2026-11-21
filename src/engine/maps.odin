@@ -145,6 +145,9 @@ map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit:
 
 catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (c: Catalog_Entry, found: bool, err: Error) {
 	sp := _space_open(e, o.space) or_return
+	if !e.in_tick {
+		_catalog_flush(e)
+	}
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
@@ -159,6 +162,9 @@ catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready
 
 catalog_list :: proc(e: ^Engine, space: prim.Id, archived: bool, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Catalog_Row, more: bool, err: Error) {
 	sp := _space_open(e, space) or_return
+	if !e.in_tick {
+		_catalog_flush(e)
+	}
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
@@ -232,6 +238,9 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 	_handle_refresh(h)
 	missing := false
 	if h.w_open {
+		if cerr := omap.writer_commit(&h.mw); cerr != .None && cerr != .Busy {
+			return _oerr(cerr)
+		}
 		if _, err := omap.table_apply(&h.table, e.self, &h.mw.core.jr); err != .None && err != .Missing {
 			return _oerr(err)
 		} else if err == .Missing {

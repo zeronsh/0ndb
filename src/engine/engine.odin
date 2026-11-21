@@ -156,6 +156,7 @@ Config :: struct {
 	http:            http.Client,
 	write_observer:  fs.Write_Observer,
 	watcher:         fs.Watcher,
+	search_options:  search.Options,
 	durability:      Durability,
 	verify_chains:   bool,
 	idle_pageout:    bool,
@@ -625,6 +626,9 @@ _tick_end :: proc(e: ^Engine) {
 	_handles_commit(e)
 	_handles_sweep(e, e.cfg.handle_cache)
 	_durable_begin(e)
+	if e.pk_open && e.pk.poisoned && e.fatal == .None {
+		_fatal(e, .Io)
+	}
 	_settle_arm(e)
 	if (!_tick_pending(e) || pack.pressure(&e.pk)) && e.tick_timer != 0 {
 		prim.timer_cancel(e.loop, e.tick_timer)

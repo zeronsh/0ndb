@@ -73,7 +73,33 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 		l.drop_path = drop_path
 		l.dropping = true
 	}
-	return replicator_publish(r, scope, name, epoch, path, durable)
+	replicator_publish(r, scope, name, epoch, path, durable) or_return
+	return _keys_head_publish(r, scope, name, epoch)
+}
+
+@(private)
+_keys_head_publish :: proc(r: ^Replicator, scope: ^Scope, keys_name: string, epoch: u64) -> Error {
+	hname := keys_head_name(keys_name) or_return
+	hid := stream_id(scope, r.cfg.self, hname, 0)
+	pbuf: prim.Path_Buf = ---
+	path := _keys_path(r, &pbuf, hid)
+	j: journal.Journal
+	if jerr := journal.journal_open(&j, r.vfs, path, {}, context.allocator); jerr != .None {
+		return _from_journal(jerr)
+	}
+	rec: [9]u8
+	rec[0] = KEYS_HEAD_RECORD
+	prim.put_u64le(rec[1:], epoch)
+	_, aerr := journal.journal_append(&j, rec[:])
+	if aerr == .None {
+		aerr = journal.journal_commit(&j)
+	}
+	durable := journal.journal_durable_len(&j)
+	journal.journal_close(&j)
+	if aerr != .None {
+		return _from_journal(aerr)
+	}
+	return replicator_publish(r, scope, hname, 0, path, durable)
 }
 
 replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
@@ -146,7 +172,7 @@ _verdict :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> (v: Verdict, lo,
 	switch v {
 	case .Accept:
 		_verified_add(rm, lo, hi)
-	case .Hold:
+	case .Hold, .Tampered:
 		hi = req.done if req.done > lo && req.done <= hi else lo
 		_verified_add(rm, lo, hi)
 	case .Equivocation:
@@ -559,4 +585,176 @@ _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 	})
 	from := u64(0) if from_start || r.feed_cursor < 0 else u64(r.feed_cursor)
 	client_feed_follow(&r.client, from, pats[:], true)
+}
+
+@(private)
+_is_boundary :: proc(rm: ^Remote, x: i64) -> bool {
+	if x == 0 || x == rm.relay_len {
+		return true
+	}
+	for h in journal.replica_have(&rm.rep) {
+		if h.from == x || h.to == x {
+			return true
+		}
+		if h.from > x {
+			break
+		}
+	}
+	return false
+}
+
+@(private)
+_Check :: enum u8 {
+	Ok,
+	Bad,
+	Unknown,
+}
+
+@(private)
+_Checker :: struct {
+	on:      bool,
+	plain:   bool,
+	skey:    journal.Key_Provider,
+	tree:    journal.Key_Provider,
+	known:   bool,
+	scratch: [dynamic]u8,
+}
+
+@(private)
+_record_check :: proc(k: ^_Checker, rec: []u8, off: i64) -> _Check {
+	body, berr := journal.record_body(rec)
+	if berr != .None {
+		return .Bad
+	}
+	switch journal.classify(rec, off) {
+	case .Invalid:
+		return .Bad
+	case .Redacted:
+		return .Ok
+	case .Plain:
+		return .Ok if !k.on || k.plain || journal.is_sig(body) else .Bad
+	case .Sealed:
+		if !k.on {
+			return .Ok
+		}
+		if k.plain {
+			return .Bad
+		}
+	}
+	for kp, i in ([2]journal.Key_Provider{k.skey, k.tree}) {
+		if kp.key == nil {
+			continue
+		}
+		resize(&k.scratch, len(rec))
+		copy(k.scratch[:], rec)
+		err := journal.open_record(k.scratch[:], off, kp)
+		crypto.zero_explicit(raw_data(k.scratch[:]), len(k.scratch))
+		if err == .None || (err == .No_Key && i == 1) {
+			return .Ok
+		}
+	}
+	return .Bad if k.known else .Unknown
+}
+
+@(private)
+_stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) -> (lo, hi, rest: int, bad: bool) {
+	data := r.stage[:]
+	at := r.stage_at
+	k := _Checker {
+		plain   = rm.plain,
+		known   = true,
+		scratch = make([dynamic]u8, context.temp_allocator),
+	}
+	if r.cfg.keys != nil {
+		k.on = true
+		k.skey = static_provider(&rm.skey)
+		sealing, tree := r.cfg.keys(r.cfg.user, rm.device, rm.name, rm.epoch, rm.id)
+		switch sealing {
+		case .Unknown:
+			k.known = false
+		case .Stream_Key:
+		case .Key_Tree:
+			k.tree = tree
+		}
+	}
+	held := false
+	if _is_boundary(rm, at) {
+		pos := 0
+		for len(data) - pos >= journal.OVERHEAD {
+			n := int(prim.get_u32le(data[pos:]))
+			if n > journal.MAX_BODY {
+				return 0, pos, 0, true
+			}
+			size := n + journal.OVERHEAD
+			if size > len(data) - pos {
+				break
+			}
+			switch _record_check(&k, data[pos:][:size], at + i64(pos)) {
+			case .Ok:
+			case .Bad:
+				return 0, pos, 0, true
+			case .Unknown:
+				held = true
+			}
+			if held {
+				break
+			}
+			pos += size
+		}
+		if held {
+			rm.keys_wait = true
+			return 0, pos, 0, false
+		}
+		if !final {
+			rest = len(data) - pos
+		}
+		return 0, pos, rest, false
+	}
+	if !final {
+		return 0, 0, len(data), false
+	}
+	end := at + i64(len(data))
+	if end != stream_len && !_is_boundary(rm, end) {
+		return
+	}
+	pos := len(data)
+	for pos >= journal.OVERHEAD {
+		n := int(prim.get_u32le(data[pos - 4:]))
+		if n > journal.MAX_BODY {
+			return pos, len(data), 0, true
+		}
+		start := pos - n - journal.OVERHEAD
+		if start < 0 {
+			break
+		}
+		if int(prim.get_u32le(data[start:])) != n {
+			return pos, len(data), 0, true
+		}
+		switch _record_check(&k, data[start:pos], at + i64(start)) {
+		case .Ok:
+		case .Bad:
+			return pos, len(data), 0, true
+		case .Unknown:
+			rm.keys_wait = true
+			return pos, len(data), 0, false
+		}
+		pos = start
+	}
+	return pos, len(data), 0, false
+}
+
+replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) {
+	_enter(r)
+	defer _leave(r)
+	id := stream_id(scope, device, name, epoch)
+	rm, ok := r.remotes[id]
+	if !ok || !rm.keys_wait {
+		return
+	}
+	rm.keys_wait = false
+	if r.phase == .Ready {
+		_remote_pull(r, rm)
+		_remote_settle(r, rm)
+		_repl_flush(r)
+	}
 }

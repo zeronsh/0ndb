@@ -235,6 +235,8 @@ Mount :: struct {
 	restoring:   bool,
 	img:         Mount_Image,
 	mat:         ^Mat_Sync,
+	merge_base:  Version,
+	attrib:      map[string]prim.Id,
 	waits:       [dynamic]Mount_Wait,
 	open_scopes: map[string]^Scope,
 	intents:     [dynamic]Intent,
@@ -365,6 +367,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.lock_fd = fd
 	m.git, m.has_git = git_locate(m.vfs, m.root, allocator)
 	m.waits = make([dynamic]Mount_Wait, allocator)
+	m.attrib = make(map[string]prim.Id, allocator)
 	fresh := load_mount_state(m) or_return
 	image_take(m, &m.img)
 	if h != nil {
@@ -499,6 +502,10 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.waits)
 	image_free(m, &m.img)
+	for k in m.attrib {
+		delete(k, m.allocator)
+	}
+	delete(m.attrib)
 	for u in m.unwatched {
 		delete(u, m.allocator)
 	}
@@ -898,7 +905,15 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 	err: Error
 	if s.mount != nil {
 		err = mount_sync(s.mount)
-		if err == .None && s.mount.db != nil {
+		if err != .None {
+			sm := s.mount
+			for k, v in sm.dirty {
+				if v == s {
+					attrib_set(sm, k, s.actor)
+				}
+			}
+			save_mount_state(sm)
+		} else if s.mount.db != nil {
 			_, err = mount_commit(s.mount, {message = "0ndb: scope"})
 		}
 	}
@@ -981,6 +996,19 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		append(&m.intents, it)
 	}
 	m.imported = prim.read_bool(&rd) if prim.reader_remaining(&rd) > 0 else true
+	if prim.reader_remaining(&rd) > 0 {
+		na := prim.read_uvarint(&rd)
+		if na > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< na {
+			k := prim.read_str(&rd)
+			a := prim.read_id(&rd)
+			if prim.reader_ok(&rd) {
+				attrib_set(m, k, a)
+			}
+		}
+	}
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
 	}
@@ -1034,17 +1062,60 @@ shadow_flush :: proc(m: ^Mount) -> Error {
 	return shadow_persist(&m.shadow)
 }
 
+@(private)
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id) {
+	if p, ok := &m.attrib[path]; ok {
+		p^ = actor
+		return
+	}
+	k, _ := clone_string(path, m.allocator)
+	m.attrib[k] = actor
+}
+
+@(private)
+attrib_prune :: proc(m: ^Mount) {
+	if len(m.attrib) == 0 {
+		return
+	}
+	drop := make([dynamic]string, context.temp_allocator)
+	for k in m.attrib {
+		if k not_in m.dirty {
+			append(&drop, k)
+		}
+	}
+	for k in drop {
+		key, _ := delete_key(&m.attrib, k)
+		delete(key, m.allocator)
+	}
+}
+
 mount_settle :: proc(m: ^Mount) -> Error {
 	if !mount_deferred(m) {
 		shadow_flush(m) or_return
 		clear(&m.intents)
+		attrib_prune(m)
 		return save_mount_state(m)
 	}
 	h := m.history
-	h.mark += 1
-	w := Mount_Wait{mark = h.mark}
-	image_take(m, &w.img)
-	append(&m.waits, w)
+	fp := history_fp(h)
+	if fp == h.mark_fp && h.mark <= h.durable && len(m.waits) == 0 {
+		image_take(m, &m.img)
+		shadow_flush(m) or_return
+		clear(&m.intents)
+		attrib_prune(m)
+		return save_mount_state(m)
+	}
+	if fp != h.mark_fp {
+		h.mark += 1
+		h.mark_fp = fp
+	}
+	if n := len(m.waits); n > 0 && m.waits[n - 1].mark == h.mark {
+		image_take(m, &m.waits[n - 1].img)
+	} else {
+		w := Mount_Wait{mark = h.mark}
+		image_take(m, &w.img)
+		append(&m.waits, w)
+	}
 	m.shadow.hold = true
 	return save_mount_state(m)
 }
@@ -1068,6 +1139,7 @@ mount_ack :: proc(m: ^Mount) -> Error {
 	if len(m.waits) == 0 && m.awake {
 		shadow_flush(m) or_return
 		clear(&m.intents)
+		attrib_prune(m)
 	}
 	return save_mount_state(m)
 }
@@ -1106,6 +1178,11 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		prim.write_uvarint(&w, it.n)
 	}
 	prim.write_bool(&w, img.imported)
+	prim.write_uvarint(&w, u64(len(m.attrib)))
+	for k in sorted_strings(m.attrib) {
+		prim.write_str(&w, k)
+		prim.write_id(&w, m.attrib[k])
+	}
 	p, _ := path_join(m.dir, "mount", context.temp_allocator)
 	return from_prim(prim.replace_atomic(m.vfs, p, buf[:]))
 }

@@ -28,6 +28,34 @@ Error :: enum u8 {
 	Io,
 }
 
+code_error :: proc "contextless" (c: Code) -> Error {
+	switch c {
+	case .None:
+		return .None
+	case .Protocol:
+		return .Protocol
+	case .Auth:
+		return .Auth
+	case .Version:
+		return .Unsupported
+	case .Quota:
+		return .Quota
+	case .Not_Owner:
+		return .Permission
+	case .Too_Large:
+		return .Too_Large
+	case .Io:
+		return .Io
+	case .Busy:
+		return .Busy
+	case .Limit:
+		return .Busy
+	case .Not_Found:
+		return .Not_Found
+	}
+	return .Refused
+}
+
 @(private)
 _from_prim :: proc "contextless" (e: prim.Error) -> Error {
 	#partial switch e {

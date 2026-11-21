@@ -1526,12 +1526,10 @@ _on_probe :: proc(c: ^Conn, rd: ^prim.Reader) {
 	n := 0
 	for _ in 0 ..< count {
 		id := Stream_Id(get_id32(rd))
-		if !_can(c, .Read, cast([32]u8)id) {
-			_reply_refused(c, .Not_Owner, cast([32]u8)id)
-			continue
-		}
 		length: i64
-		if st, ok := sp.streams[id]; ok && st.h != nil && !st.poisoned {
+		if !_can(c, .Read, cast([32]u8)id) {
+			length = 0
+		} else if st, ok := sp.streams[id]; ok && st.h != nil && !st.poisoned {
 			length = _live_len(st)
 		} else {
 			l, exists, err := r.store.stream_probe(r.store.data, sp.ns, id)

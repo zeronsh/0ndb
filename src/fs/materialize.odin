@@ -5,10 +5,12 @@ import "core:slice"
 import "core:io"
 import "core:mem/virtual"
 import "core:strconv"
+import "core:strings"
 import "../crdt"
 import "../fstree"
 import "../odb"
 import "../prim"
+import "../textdiff"
 
 @(private)
 Mat_Item :: struct {
@@ -50,9 +52,24 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	}
 	if len(m.dirty) > 0 || m.rescan {
 		mount_pass(m, false) or_return
-		clear(&sl)
-		crdt.graph_version_lvs(&h.g, m.synced[:], &sl)
 	}
+	materialize_to(m, target, false) or_return
+	return mount_settle(m)
+}
+
+@(private)
+materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
+	h := m.history
+	tl := make([dynamic]crdt.Lv, context.temp_allocator)
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+		return .Corrupt
+	}
+	if crdt.frontier_eq(tl[:], sl[:]) {
+		return .None
+	}
+	m.merge_base = m.synced[:] if merge else nil
+	defer m.merge_base = nil
 	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	crdt.graph_diff(&h.g, sl[:], tl[:], &only_a, &only_b)
@@ -123,7 +140,7 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 		append(&m.synced, ..target)
 	}
 	history_trim(h)
-	return mount_settle(m)
+	return .None
 }
 
 Mat_Sync :: struct {
@@ -235,6 +252,12 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 	}
 	for len(work) > 0 {
 		ino := pop(&work)
+		if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
+			if z, zok, zerr := fstree.lookup(snap, conflict_base(old)); zerr == nil && zok && z != ino && !touched[z] {
+				touched[z] = true
+				append(&work, z)
+			}
+		}
 		info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
 		if ierr != nil {
 			return .Corrupt
@@ -256,6 +279,23 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 		}
 	}
 	return .None
+}
+
+@(private)
+conflict_base :: proc(p: string) -> string {
+	start := 0
+	for i := len(p) - 1; i >= 0; i -= 1 {
+		if p[i] == '/' {
+			start = i + 1
+			break
+		}
+	}
+	for i in start ..< len(p) {
+		if p[i] == '~' && i > start {
+			return p[:i]
+		}
+	}
+	return p
 }
 
 @(private)
@@ -332,8 +372,14 @@ materialize_one :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 @(private)
 materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if it.has_old && !disk_matches(m, it.old, it.entry) {
-		mount_mark(m, it.old)
-		return .None
+		removal := m.merge_base != nil && !it.present && it.entry.kind != .Dir
+		if !removal {
+			if m.merge_base != nil && it.present && it.kind == .File && it.old == it.path && .Opaque not_in it.flags && it.entry.kind == .File {
+				merge_dirty(m, it, tl) or_return
+			}
+			mount_mark(m, it.old)
+			return .None
+		}
 	}
 	abuf: prim.Path_Buf
 	if !it.present {
@@ -465,6 +511,89 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 	mat_ancestors(m, abs)
 	e.oid = oid
 	return .None
+}
+
+@(private)
+merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
+	h := m.history
+	abuf: prim.Path_Buf
+	abs := abs_path(m, it.path, abuf[:])
+	ours, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+	if rerr != .None || textdiff.is_binary(ours) {
+		return .None
+	}
+	base, berr := history_text_at(h, it.inode, m.merge_base, context.temp_allocator)
+	if berr != .None {
+		return .None
+	}
+	ids := crdt.graph_version_ids(&h.g, tl, context.temp_allocator)
+	theirs := history_text_at(h, it.inode, ids, context.temp_allocator) or_return
+	if string(base) == string(theirs) {
+		return .None
+	}
+	merged := merge_union(base, ours, theirs) or_return
+	if string(merged) == string(ours) {
+		return .None
+	}
+	before, serr := prim.lstat(m.vfs, abs)
+	if serr != .None {
+		return .None
+	}
+	mode: u32 = 0o755 if .Exec in it.flags else 0o644
+	tmp := temp_name(m, abs, context.temp_allocator)
+	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
+	if oerr != .None {
+		return from_prim(oerr)
+	}
+	werr := prim.write_at(m.vfs, fd, merged, 0)
+	prim.fchmod(m.vfs, fd, mode)
+	prim.close_file(m.vfs, fd)
+	if werr != .None {
+		prim.remove(m.vfs, tmp)
+		return from_prim(werr)
+	}
+	now, nerr := prim.lstat(m.vfs, abs)
+	if nerr != .None || disk_stat(now) != disk_stat(before) {
+		prim.remove(m.vfs, tmp)
+		return .None
+	}
+	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
+	mat_file(m, abs)
+	return .None
+}
+
+@(private)
+MERGE_OURS :: "0ndb-merge-ours-8f3a1c"
+@(private)
+MERGE_THEIRS :: "0ndb-merge-theirs-8f3a1c"
+
+@(private)
+merge_union :: proc(base, ours, theirs: []u8) -> (out: []u8, err: Error) {
+	res, merr := textdiff.merge3(base, ours, theirs, textdiff.Merge_Options{style = .Merge, ours_label = MERGE_OURS, theirs_label = MERGE_THEIRS}, context.temp_allocator)
+	if merr != nil {
+		return nil, .No_Memory
+	}
+	if res.conflicts == 0 {
+		return res.data, .None
+	}
+	buf := make([dynamic]u8, 0, len(res.data), context.temp_allocator)
+	rest := string(res.data)
+	open_mark := "<<<<<<< " + MERGE_OURS
+	close_mark := ">>>>>>> " + MERGE_THEIRS
+	inside := false
+	for line in strings.split_lines_after_iterator(&rest) {
+		t := strings.trim_right(line, "\r\n")
+		if !inside && t == open_mark {
+			inside = true
+			continue
+		}
+		if inside && (t == "=======" || t == close_mark) {
+			inside = t != close_mark
+			continue
+		}
+		append(&buf, ..transmute([]u8)line)
+	}
+	return buf[:], .None
 }
 
 @(private)

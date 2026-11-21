@@ -30,6 +30,7 @@ Repl_Event_Kind :: enum u8 {
 	Redacted,
 	Local_Redacted,
 	Quarantined,
+	Relay_Misbehaving,
 	Object_Shredded,
 }
 
@@ -67,9 +68,16 @@ Replicator_Config :: struct {
 	padding:      bool,
 	random:       prim.Random,
 	relays:       []Relay_Address,
+	keys:         proc(user: rawptr, device: Device_Id, name: string, epoch: u64, stream: Stream_Id) -> (sealing: Stream_Sealing, tree: journal.Key_Provider),
 	kernel_tls:   bool,
 	on_event:     Repl_Handler,
 	user:         rawptr,
+}
+
+Stream_Sealing :: enum u8 {
+	Unknown,
+	Stream_Key,
+	Key_Tree,
 }
 
 Relay_Address :: struct {
@@ -118,6 +126,7 @@ Local :: struct {
 	drop_id:   Stream_Id,
 	drop_path: string,
 	dropping:  bool,
+	superseded: bool,
 	reaping:   bool,
 	verify:    [dynamic]u8,
 }
@@ -139,6 +148,14 @@ Remote :: struct {
 	probes:    [PROBES]Stream_Id,
 	grouped:   bool,
 	quarantined: bool,
+	keys_wait: bool,
+	scope:     Scope,
+	head_of:   Stream_Id,
+	is_head:   bool,
+	tamper_hold: bool,
+	tamper_seen: bool,
+	plain:     bool,
+	skey:      journal.Key,
 	reaping:   bool,
 	probing:   bool,
 	want_gen:  u64,
@@ -175,6 +192,8 @@ Replicator :: struct {
 	publics:    [dynamic]Public_Key,
 	relay_at:   int,
 	deadline:   prim.Timer,
+	tampered:   bool,
+	tamper_run: int,
 	phase:      Phase,
 	fd:         prim.Fd,
 	watch:      prim.Watch,
@@ -686,6 +705,10 @@ _local_fatal :: proc(r: ^Replicator, l: ^Local, err: Error, length: i64) {
 
 @(private)
 _local_pump :: proc(r: ^Replicator, l: ^Local) {
+	if l.superseded {
+		_local_maybe_free(r, l)
+		return
+	}
 	if r.phase != .Ready || l.fatal || l.blocked || l.retry || l.inflight > 0 || l.verifying || l.ahead > 0 || l.cursor >= l.durable {
 		_local_drop_prev(r, l)
 		_local_maybe_free(r, l)
@@ -786,6 +809,28 @@ _local_drop_prev :: proc(r: ^Replicator, l: ^Local) {
 	if client_drop(&r.client, l.drop_id) != .None {
 		return
 	}
+	if prev, ok := r.locals[l.drop_id]; ok && prev != l {
+		prev.superseded = true
+		prev.durable = prev.cursor
+		prev.retry = false
+		prev.blocked = false
+		if prev.fd >= 0 {
+			prim.close_file(r.vfs, prev.fd)
+			prev.fd = prim.INVALID_FD
+		}
+		_local_maybe_free(r, prev)
+	}
+	if prev, ok := r.locals[l.drop_id]; ok && prev != l {
+		if prev.inflight > 0 {
+			r.uploading -= 1
+			prev.inflight = 0
+		}
+		prev.retry = false
+		prev.verifying = false
+		prev.ahead = 0
+		prev.cursor = prev.durable
+		_local_maybe_free(r, prev)
+	}
 	if len(l.drop_path) > 0 {
 		journal.journal_remove(r.vfs, l.drop_path)
 		delete(l.drop_path, r.allocator)
@@ -882,6 +927,11 @@ _local_verify_next :: proc(r: ^Replicator, l: ^Local) {
 @(private)
 _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 	l.verifying = false
+	if l.superseded {
+		clear(&l.verify)
+		_local_maybe_free(r, l)
+		return
+	}
 	n := l.verify_to - l.verify_at
 	if i64(len(l.verify)) != n {
 		_local_retry(r, l)
@@ -898,9 +948,10 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 	if l.fd < 0 {
 		l.fd, _ = prim.open_file(r.vfs, l.path)
 	}
+	redacted := make([dynamic]journal.Range, context.temp_allocator)
 	if got, err := prim.read_at(r.vfs, l.fd, mine, l.verify_at); err == .None && i64(got) == n && journal.record_bounds(mine) == int(n) {
 		if _wire_form(l, mine, l.verify_at) == .None {
-			ok = _ct_eq(mine, l.verify[:])
+			ok = _records_match(mine, l.verify[:], l.verify_at, &redacted)
 		}
 	}
 	clear(&l.verify)
@@ -908,11 +959,43 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 		_local_fatal(r, l, .Conflict, l.verify_to)
 		return
 	}
+	for g in redacted {
+		_emit(r, Repl_Event{kind = .Local_Redacted, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, from = g.from, to = g.to})
+	}
 	if err := _local_advance(r, l, l.verify_to); err != .None {
 		_local_fatal(r, l, err, l.verify_to)
 		return
 	}
 	_local_verify_next(r, l)
+}
+
+@(private)
+_records_match :: proc(mine, theirs: []u8, base: i64, redacted: ^[dynamic]journal.Range) -> bool {
+	if len(mine) != len(theirs) || journal.record_bounds(theirs) != len(theirs) {
+		return false
+	}
+	pos := 0
+	for pos < len(mine) {
+		n := int(prim.get_u32le(mine[pos:])) + journal.OVERHEAD
+		if n > len(mine) - pos || int(prim.get_u32le(theirs[pos:])) + journal.OVERHEAD != n {
+			return false
+		}
+		a := mine[pos:][:n]
+		b := theirs[pos:][:n]
+		off := base + i64(pos)
+		if !_ct_eq(a, b) {
+			mr := journal.classify(a, off) == .Redacted
+			tr := journal.classify(b, off) == .Redacted
+			if !mr && !tr {
+				return false
+			}
+			if tr && !mr {
+				append(redacted, journal.Range{off, off + i64(n)})
+			}
+		}
+		pos += n
+	}
+	return true
 }
 
 @(private)
@@ -931,6 +1014,13 @@ _on_retry :: proc(l: ^prim.Loop, data: rawptr) {
 	r.retry = 0
 	for _, lo in r.locals {
 		lo.retry = false
+	}
+	for id in _sorted_ids(r.remotes) {
+		if rm, ok := r.remotes[id]; ok && rm.tamper_hold {
+			rm.tamper_hold = false
+			_remote_pull(r, rm)
+			_remote_settle(r, rm)
+		}
 	}
 	_repl_pump(r)
 }
@@ -955,6 +1045,9 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 	rm.device = device
 	rm.epoch = epoch
 	rm.id = id
+	rm.plain = scope.mode == .Transparent
+	rm.skey = stream_key(scope, id)
+	rm.scope = scope^
 	rm.relay_len = -1
 	rm.span_fd = prim.INVALID_FD
 	_span_load(r, rm, path)
@@ -984,10 +1077,12 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 		}
 	}
 	if r.rx_remote == rm {
-		_stage_flush(r)
+		_stage_flush(r, true, -1)
 		r.rx_remote = nil
 	}
 	journal.replica_close(&rm.rep)
+	crypto.zero_explicit(&rm.skey, size_of(rm.skey))
+	scope_clear(&rm.scope)
 	if rm.span_fd >= 0 {
 		prim.close_file(r.vfs, rm.span_fd)
 	}
@@ -1085,7 +1180,7 @@ _remote_follow_send :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
-	if !rm.follow || rm.quarantined || r.phase != .Ready {
+	if !rm.follow || rm.quarantined || rm.keys_wait || rm.tamper_hold || r.phase != .Ready {
 		return
 	}
 	if rm.full {
@@ -1125,12 +1220,26 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
-	if r.phase != .Ready || _covered_inflight(rm, gap) {
+	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || _covered_inflight(rm, gap) {
 		return
 	}
 	fetch := gap
+	if !_is_boundary(rm, fetch.to) {
+		next := rm.relay_len
+		for h in journal.replica_have(&rm.rep) {
+			if h.from >= fetch.to {
+				next = h.from
+				break
+			}
+		}
+		if next > fetch.to {
+			fetch.to = next
+		}
+	}
 	if fetch.to - fetch.from < MIN_FETCH {
 		fetch.from = max(fetch.to - MIN_FETCH, 0)
+	} else if !_is_boundary(rm, fetch.from) && fetch.to - fetch.from > STAGE_MAX {
+		fetch.from = fetch.to - STAGE_MAX
 	}
 	if client_read(&r.client, rm.id, fetch.from, fetch.to) == .None {
 		append(&rm.inflight, fetch)
@@ -1171,6 +1280,9 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 				continue
 			}
 			ordered_remove(&rm.wants, i)
+			if rm.is_head {
+				continue
+			}
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = w.from, length = rm.relay_len})
 			continue
 		}
@@ -1189,7 +1301,16 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 				_quarantine(r, rm, w.from)
 				return
 			}
+			if v == .Tampered {
+				_tamper_persisted(r, rm)
+				i += 1
+				continue
+			}
 			ordered_remove(&rm.wants, i)
+			if rm.is_head {
+				_keys_head_seen(r, rm)
+				continue
+			}
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = to, length = rm.relay_len})
 			continue
 		}
@@ -1210,6 +1331,51 @@ _remote_probe :: proc(r: ^Replicator, rm: ^Remote) {
 	if client_probe(&r.client, ids[:]) == .None {
 		rm.probing = true
 		rm.probe_gen = rm.want_gen
+	}
+	_keys_head_watch(r, rm)
+}
+
+@(private)
+_keys_head_watch :: proc(r: ^Replicator, rm: ^Remote) {
+	if rm.is_head || len(rm.name) <= len(KEYS_STREAM) || rm.name[:len(KEYS_STREAM)] != KEYS_STREAM {
+		return
+	}
+	hname, err := keys_head_name(rm.name)
+	if err != .None {
+		return
+	}
+	head, herr := _remote_get(r, &rm.scope, rm.device, hname, 0)
+	if herr != .None || head == rm {
+		return
+	}
+	head.is_head = true
+	head.head_of = rm.id
+	if head.tail == 0 && len(head.wants) == 0 {
+		head.tail = 64
+		head.want_gen += 1
+		_remote_settle(r, head)
+	}
+}
+
+@(private)
+_keys_head_seen :: proc(r: ^Replicator, head: ^Remote) {
+	target, ok := r.remotes[head.head_of]
+	if !ok {
+		return
+	}
+	rd: journal.Reader
+	journal.replica_reader(&head.rep, &rd, context.temp_allocator)
+	defer journal.reader_close(&rd)
+	if !head.plain {
+		journal.reader_set_keys(&rd, static_provider(&head.skey))
+	}
+	body, _, err := journal.record_before(&rd, journal.replica_length(&head.rep))
+	if err != .None || len(body) != 9 || body[0] != KEYS_HEAD_RECORD {
+		return
+	}
+	epoch := prim.get_u64le(body[1:])
+	if epoch > target.epoch {
+		_emit(r, Repl_Event{kind = .Epoch_Seen, device = target.device, name = target.name, epoch = epoch, stream = stream_id(&target.scope, target.device, target.name, epoch)})
 	}
 }
 
@@ -1233,14 +1399,33 @@ _remote_landed :: proc(r: ^Replicator, rm: ^Remote, from, to: i64, stream_len: i
 }
 
 @(private)
-_stage_flush :: proc(r: ^Replicator) {
+_stage_flush :: proc(r: ^Replicator, final: bool, stream_len: i64) {
 	if len(r.stage) == 0 {
 		return
 	}
-	if rm := r.rx_remote; rm != nil && !rm.quarantined {
-		if err := _stage_write(rm, r.stage_at, r.stage[:]); err != .None {
-			_emit(r, Repl_Event{kind = .Refused, err = _from_journal(err), device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+	rm := r.rx_remote
+	keep := 0
+	if rm != nil && !rm.quarantined {
+		lo, hi, rest, bad := _stage_check(r, rm, final, stream_len)
+		if hi > lo {
+			if err := _stage_write(rm, r.stage_at + i64(lo), r.stage[lo:hi]); err != .None {
+				_emit(r, Repl_Event{kind = .Refused, err = _from_journal(err), device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+			} else if !bad {
+				r.tamper_run = 0
+			}
 		}
+		if bad {
+			_tamper(r, rm)
+		} else {
+			keep = rest
+		}
+	}
+	if keep > 0 {
+		n := len(r.stage) - keep
+		copy(r.stage[:], r.stage[n:])
+		resize(&r.stage, keep)
+		r.stage_at += i64(n)
+		return
 	}
 	r.stage_at += i64(len(r.stage))
 	clear(&r.stage)
@@ -1249,6 +1434,34 @@ _stage_flush :: proc(r: ^Replicator) {
 		r.stage = make([dynamic]u8, r.allocator)
 	}
 }
+
+@(private)
+_tamper :: proc(r: ^Replicator, rm: ^Remote) {
+	r.tamper_run += 1
+	if r.tamper_run == TAMPER_REPORT {
+		_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+	}
+	if len(r.endpoints) > 1 {
+		r.tampered = true
+		return
+	}
+	rm.tamper_hold = true
+	if r.retry == 0 {
+		r.retry = prim.timer(r.loop, RETRY_MS, r, _on_retry)
+	}
+}
+
+@(private)
+_tamper_persisted :: proc(r: ^Replicator, rm: ^Remote) {
+	if rm.tamper_seen {
+		return
+	}
+	rm.tamper_seen = true
+	_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+}
+
+@(private)
+TAMPER_REPORT :: 3
 
 
 
@@ -1264,6 +1477,13 @@ _stage_flush :: proc(r: ^Replicator) {
 _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	id := Stream_Id(ev.id)
 	if ev.first {
+		if rm := r.rx_remote; rm != nil {
+			if rm.id == id && ev.at == r.rx_at {
+				return
+			}
+			_stage_flush(r, true, -1)
+			_remote_landed(r, rm, r.rx_start, r.rx_at, -1)
+		}
 		r.rx_remote = nil
 		r.rx_local = nil
 		r.rx_at = ev.at
@@ -1295,7 +1515,7 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 		} else if r.rx_remote != nil {
 			append(&r.stage, ..ev.data)
 			if len(r.stage) >= STAGE_MAX {
-				_stage_flush(r)
+				_stage_flush(r, false, ev.length)
 			}
 		}
 		r.rx_at += i64(len(ev.data))
@@ -1314,9 +1534,17 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	if rm == nil {
 		return
 	}
-	_stage_flush(r)
+	_stage_flush(r, ev.final, ev.length)
+	if !ev.final {
+		return
+	}
 	r.rx_remote = nil
 	_remote_landed(r, rm, r.rx_start, r.rx_at, ev.length)
+	if rm.full && r.rx_at >= rm.pulled {
+		if c := _contiguous(rm); c < rm.pulled {
+			rm.pulled = c
+		}
+	}
 	if rm.follow && r.rx_at > r.rx_start && !rm.quarantined {
 		v, vlo, vhi := _verdict(r, rm, r.rx_start, r.rx_at)
 		switch v {
@@ -1330,6 +1558,8 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 		case .Equivocation:
 			_quarantine(r, rm, r.rx_start)
 			return
+		case .Tampered:
+			_tamper_persisted(r, rm)
 		}
 	}
 	rm.pulling = false
@@ -1384,7 +1614,9 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	switch ev.kind {
 	case .Welcome:
 		r.phase = .Ready
-		r.backoff = BACKOFF_MIN
+		if r.tamper_run == 0 {
+			r.backoff = BACKOFF_MIN
+		}
 		r.usage = ev.usage
 		r.quota = ev.quota
 		if r.timer != 0 {
@@ -1450,7 +1682,16 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Announce:
 		_on_announce(r, ev)
 	case .Error:
-		return .Auth if ev.code == .Auth else .Refused
+		err := code_error(ev.code)
+		if err == .None {
+			err = .Refused
+		}
+		_emit(r, Repl_Event{kind = .Refused, code = ev.code, err = err})
+		return err
+	}
+	if r.tampered {
+		r.tampered = false
+		return .Corrupt
 	}
 	_repl_pump(r)
 	return .None
@@ -1562,7 +1803,7 @@ _repl_pump :: proc(r: ^Replicator) {
 @(private)
 _repl_reset_state :: proc(r: ^Replicator) {
 	if r.rx_remote != nil {
-		_stage_flush(r)
+		_stage_flush(r, true, -1)
 	}
 	r.rx_remote = nil
 	r.rx_local = nil

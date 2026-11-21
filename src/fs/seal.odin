@@ -114,16 +114,13 @@ seal_checkpoint :: proc(h: ^History, ino: fstree.Inode_Id, eff: []crdt.Lv) -> Er
 	history_unload_files(h)
 	tmp: File_State
 	tmp.inode = ino
-	read_file_record(h, ino, &tmp.rec) or_return
 	defer {
+		fshist.text_drop(&tmp.st)
 		delete(tmp.rec.cp_version)
 		delete(tmp.rec.cp_spans)
 	}
+	read_file_record(h, ino, &tmp.rec) or_return
 	load_text(h, &tmp, eff) or_return
-	defer {
-		crdt.text_destroy(&tmp.text)
-		crdt.log_destroy(&tmp.log)
-	}
 	data := crdt.text_bytes(&tmp.text, context.temp_allocator)
 	oid := from_odb_v(odb.write(h.db, .Blob, data)) or_return
 	history_note_blob(h, oid)

@@ -93,6 +93,7 @@ History :: struct {
 	src_err:    Error,
 	durable:    u64,
 	mark:       u64,
+	mark_fp:    [3]u64,
 	mounts:     [dynamic]^Mount,
 	pins:       [dynamic]odb.Oid,
 	lvidx:      prim.Fd,
@@ -196,6 +197,14 @@ history_durable_mark :: proc "contextless" (h: ^History) -> u64 {
 	return h.mark
 }
 
+@(private)
+history_fp :: proc(h: ^History) -> [3]u64 {
+	if !h.awake {
+		return h.mark_fp
+	}
+	return {u64(journal.journal_durable_len(&h.journal)), h.kv.log_end, h.kv.gen}
+}
+
 history_durable :: proc(h: ^History, mark: u64) -> Error {
 	if mark <= h.durable {
 		return .None
@@ -263,8 +272,10 @@ history_wake :: proc(h: ^History) -> Error {
 	}
 	if err != .None {
 		history_sleep(h)
+		return err
 	}
-	return err
+	h.mark_fp = history_fp(h)
+	return .None
 }
 
 history_sleep :: proc(h: ^History) {
@@ -898,8 +909,14 @@ history_file :: proc(h: ^History, inode: fstree.Inode_Id) -> (f: ^File_State, er
 	f = new(File_State, h.allocator)
 	f.inode = inode
 	f.new_refs = make([dynamic]Op_Ref, h.allocator)
-	read_file_record(h, inode, &f.rec) or_return
-	load_text(h, f, h.g.heads[:]) or_return
+	err = read_file_record(h, inode, &f.rec)
+	if err == .None {
+		err = load_text(h, f, h.g.heads[:])
+	}
+	if err != .None {
+		file_free(h, f)
+		return nil, err
+	}
 	h.files[inode] = f
 	return f, .None
 }
@@ -930,12 +947,9 @@ history_text_at :: proc(h: ^History, inode: fstree.Inode_Id, v: Version, allocat
 		delete(tmp.rec.cp_version)
 		delete(tmp.rec.cp_spans)
 	}
+	defer fshist.text_drop(&tmp.st)
 	if err = load_text(h, &tmp, lvs[:]); err != .None {
 		return nil, err
-	}
-	defer {
-		crdt.text_destroy(&tmp.text)
-		crdt.log_destroy(&tmp.log)
 	}
 	return crdt.text_bytes(&tmp.text, allocator), .None
 }
@@ -978,16 +992,13 @@ history_text_oid :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (oi
 history_text_spans_at :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Lv, allocator := context.allocator) -> (data: []u8, spans: []crdt.Author_Span, err: Error) {
 	tmp: File_State
 	tmp.inode = inode
-	read_file_record(h, inode, &tmp.rec) or_return
 	defer {
+		fshist.text_drop(&tmp.st)
 		delete(tmp.rec.cp_version)
 		delete(tmp.rec.cp_spans)
 	}
+	read_file_record(h, inode, &tmp.rec) or_return
 	load_text(h, &tmp, v) or_return
-	defer {
-		crdt.text_destroy(&tmp.text)
-		crdt.log_destroy(&tmp.log)
-	}
 	return crdt.text_bytes(&tmp.text, allocator), crdt.text_spans(&tmp.text, &h.g, allocator), .None
 }
 
@@ -1538,6 +1549,9 @@ read_stream :: proc(h: ^History, stream: u32, off: i64, buf: ^[dynamic]u8) -> (b
 	clear(buf)
 	if !h.streams.read(h.streams.data, h.stream_ids[stream], off, buf) {
 		return nil, .Not_Found
+	}
+	if len(buf) == 0 {
+		return nil, .Redacted
 	}
 	return buf[:], .None
 }

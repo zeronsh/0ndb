@@ -68,13 +68,14 @@ _index_open :: proc(e: ^Engine) -> Error {
 	}
 	dir := _join(context.temp_allocator, e.pack_root, "search") or_return
 	_perr(prim.mkdir_all(e.vfs, dir, 0o700)) or_return
-	opts := search.Options {
-		vfs         = e.vfs,
-		store_text  = true,
-		embedder    = e.cfg.embedder,
-		kind_names  = KIND_NAMES[:],
-		budget      = e.cfg.search_budget,
-		cache_pages = 32,
+	opts := e.cfg.search_options
+	opts.vfs = e.vfs
+	opts.store_text = true
+	opts.embedder = e.cfg.embedder
+	opts.kind_names = KIND_NAMES[:]
+	opts.budget = e.cfg.search_budget
+	if opts.cache_pages == 0 {
+		opts.cache_pages = 32
 	}
 	rebuilt, err := search.open(&e.index, dir, opts, e.allocator)
 	if err != .None {
