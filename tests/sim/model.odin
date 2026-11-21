@@ -100,6 +100,7 @@ M_Op :: struct {
 	err:     eng.Error,
 	at:      i64,
 	overwrite: bool,
+	gens:    [dynamic]string,
 }
 
 Model :: struct {
@@ -161,6 +162,10 @@ model_destroy :: proc(m: ^Model) {
 			delete(t, a)
 		}
 		delete(op.deletes)
+		for g in op.gens {
+			delete(g, a)
+		}
+		delete(op.gens)
 		delete(op.key, a)
 		delete(op.path, a)
 		free(op, a)
@@ -198,6 +203,7 @@ new_op :: proc(m: ^Model, kind: Op_Kind, n: ^Node, obj: int) -> ^M_Op {
 	op.at = m.w.now
 	op.tokens = make([dynamic]string, a)
 	op.deletes = make([dynamic]string, a)
+	op.gens = make([dynamic]string, a)
 	append(&m.ops, op)
 	m.w.stats.ops += 1
 	return op
@@ -213,6 +219,14 @@ op_done :: proc(op: ^M_Op, tick: u64, err: eng.Error) {
 		op.status = .Uncertain
 		w.stats.io_errors += 1
 		w.nodes[op.node].restart_pending = true
+		return
+	}
+	if err == .Io {
+		op.status = .Uncertain
+		w.stats.ops_failed += 1
+		if !w.nodes[op.node].disk.dead {
+			world_fail(w, "op %d %v on %s failed with Io on a healthy disk", op.idx, op.kind, w.nodes[op.node].name)
+		}
 		return
 	}
 	if err != .None {

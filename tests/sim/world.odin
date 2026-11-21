@@ -113,6 +113,7 @@ World_Stats :: struct {
 	io_errors:    u64,
 	stalls:       u64,
 	conflict_pairs: u64,
+	search_models:  u64,
 }
 
 Config :: struct {
@@ -162,6 +163,12 @@ World :: struct {
 	allocator: runtime.Allocator,
 	phase:     Phase,
 	ctx:       runtime.Context,
+	quarantines: [dynamic]Quarantine,
+}
+
+Quarantine :: struct {
+	node:   int,
+	object: prim.Id,
 }
 
 Phase :: enum u8 {
@@ -313,6 +320,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	w.conns = make([dynamic]^Conn, w.allocator)
 	w.failures = make([dynamic]string, w.allocator)
 	w.log = make([dynamic]string, w.allocator)
+	w.quarantines = make([dynamic]Quarantine, w.allocator)
 	rng_init(&w.rng, cfg.seed, 1)
 	rng_init(&w.net_rng, cfg.seed, 2)
 	rng_init(&w.fault_rng, cfg.seed, 3)
@@ -382,6 +390,7 @@ world_destroy :: proc(w: ^World) {
 		delete(s, w.allocator)
 	}
 	delete(w.log)
+	delete(w.quarantines)
 	model_destroy(&w.model)
 }
 

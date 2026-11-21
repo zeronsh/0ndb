@@ -297,7 +297,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 		return
 	}
 	if err != .None {
-		op.status = .Failed
+		op.status = .Uncertain if err == .Io else .Failed
 		if w.cfg.io_rate > 0 {
 			op.status = .Uncertain
 			n.restart_pending = true
@@ -455,7 +455,7 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 	}
 	root := fmt.aprintf("%s%s-%s-git", WORK_PREFIX, id_short(o.id), n.name, allocator = w.allocator)
 	vfs := disk_vfs(&n.disk)
-	gerr := git_checkout_create(vfs, root, files[:], clock_wall(&n.clock) / 1_000_000_000, rng_u64(&w.rng), &n.clock)
+	gerr := git_checkout_create(vfs, root, files[:], clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng))
 	if n.disk.dead {
 		context = instance_context(&n.inst)
 		node_after(n)
@@ -478,6 +478,8 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 			if merr == .None {
 				op_done(op, 0, .None)
 				op.status = .Acked
+			} else if merr == .Io {
+				op.status = .Uncertain
 			} else {
 				op.status = .Failed
 			}

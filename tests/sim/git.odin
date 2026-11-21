@@ -29,7 +29,7 @@ _write_file :: proc(vfs: prim.Vfs, path: string, data: []u8) -> prim.Error {
 	return err
 }
 
-git_checkout_create :: proc(vfs: prim.Vfs, root: string, files: []Git_File, when_s: i64, temp_seq: u64, clock: ^Node_Clock) -> prim.Error {
+git_checkout_create :: proc(vfs: prim.Vfs, root: string, files: []Git_File, when_s: i64, clock: prim.Clock, random: prim.Random) -> prim.Error {
 	git := strings.concatenate({root, "/.git"}, context.temp_allocator)
 	for d in ([]string{"objects", "refs/heads", "refs/tags"}) {
 		prim.mkdir_all(vfs, strings.concatenate({git, "/", d}, context.temp_allocator), 0o755) or_return
@@ -37,13 +37,10 @@ git_checkout_create :: proc(vfs: prim.Vfs, root: string, files: []Git_File, when
 	_write_file(vfs, strings.concatenate({git, "/HEAD"}, context.temp_allocator), transmute([]u8)string("ref: refs/heads/main\n")) or_return
 	_write_file(vfs, strings.concatenate({git, "/config"}, context.temp_allocator), transmute([]u8)string("[core]\n\trepositoryformatversion = 0\n\tbare = false\n")) or_return
 	db: odb.Odb
-	if err := odb.open(&db, vfs, root); err != .None {
+	if err := odb.open(&db, vfs, root, nil, context.allocator, clock, random); err != .None {
 		return .Io
 	}
 	defer odb.close(&db)
-	db.temp_seq = temp_seq
-	db.clock = clock_wall
-	db.clock_data = clock
 	sorted := make([]Git_File, len(files), context.temp_allocator)
 	copy(sorted, files)
 	slice.sort_by(sorted, proc(a, b: Git_File) -> bool {

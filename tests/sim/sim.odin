@@ -287,6 +287,9 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	if ok {
 		ok = setup_spaces(w)
 	}
+	if ok && env_u64("SIM_BULK", 0) != 0 {
+		setup_bulk(w)
+	}
 	if ok {
 		run_until(w, w.now + 2_000_000_000, true)
 		for n in w.nodes {

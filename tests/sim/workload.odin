@@ -448,6 +448,8 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		}
 		op := new_op(m, .Redact_Msg, n, oi)
 		op.target = t.idx
+		snapshot_search_models(w, n, op)
+		context = instance_context(&n.inst)
 		err := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
 		world_note(w, "%s redact message %s -> %v", n.name, t.token, err)
 		op_result(op, n, err)
@@ -526,6 +528,8 @@ _op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		op := new_op(m, .Redact_Map, n, oi)
 		op.target = t.idx
 		op.key = strings.clone(t.key, w.allocator)
+		snapshot_search_models(w, n, op)
+		context = instance_context(&n.inst)
 		err := eng.map_redact(&n.e, o, transmute([]u8)t.key)
 		world_note(w, "%s redact map key %s -> %v", n.name, t.key, err)
 		op_result(op, n, err)
@@ -574,6 +578,8 @@ _op_text :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 			}
 			op := new_op(m, .Redact_Text, n, oi)
 			append(&op.deletes, strings.clone(t.text, w.allocator))
+			snapshot_search_models(w, n, op)
+			context = instance_context(&n.inst)
 			err := eng.text_redact(&n.e, o, t.pos, len(t.text))
 			world_note(w, "%s redact text %s -> %v", n.name, t.text, err)
 			op_result(op, n, err)
@@ -803,4 +809,39 @@ node_credentials :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bo
 		return c, err == .None
 	}
 	return {}, false
+}
+
+BULK_WORDS :: [?]string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango"}
+
+setup_bulk :: proc(w: ^World) {
+	m := &w.model
+	n := w.nodes[0]
+	r: Rng
+	rng_init(&r, w.cfg.seed, 31)
+	words := BULK_WORDS
+	for t in 0 ..< 20 {
+		op := new_op(m, .Create, n, len(m.objs))
+		op.token = new_token(m, n, "t")
+		b := strings.builder_make(context.temp_allocator)
+		for strings.builder_len(b) < 64 * 1024 {
+			if rng_chance(&r, 1, 40) {
+				tok := new_token(m, n, "x")
+				append(&op.tokens, tok)
+				strings.write_string(&b, tok)
+			} else {
+				strings.write_string(&b, words[rng_int(&r, len(words))])
+			}
+			strings.write_byte(&b, ' ' if rng_chance(&r, 7, 8) else '\n')
+		}
+		ob := M_Obj{kind = .Text, creator = n.idx, op = op.idx}
+		ob.removed = make(map[string]bool, w.allocator)
+		ob.shared = make([dynamic]int, w.allocator)
+		context = instance_context(&n.inst)
+		o, err := eng.text_create(&n.e, m.spaces[0].id, op.token, strings.to_string(b))
+		ob.o = o
+		append(&m.objs, ob)
+		op_result(op, n, err)
+		node_after(n)
+		_ = t
+	}
 }

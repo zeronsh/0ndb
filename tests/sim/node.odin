@@ -76,6 +76,7 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.credentials = eng.Credentials_Source{data = n, produce = node_credentials}
 	cfg.write_observer = sim_observer(n)
 	cfg.watcher = sim_watcher(n)
+	cfg.embedder = sim_embedder()
 	cfg.durability = .Deferred
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
@@ -102,13 +103,6 @@ node_start :: proc(n: ^Node) -> bool {
 		return false
 	}
 	n.e_open = true
-	if db, derr := eng.device_odb(&n.e); derr == .None {
-		seq: [8]u8
-		rng_fill(&n.ids, seq[:])
-		db.temp_seq = transmute(u64)seq
-		db.clock = clock_wall
-		db.clock_data = &n.clock
-	}
 	if n.disk.dead {
 		node_crashed(n)
 		return false
@@ -276,6 +270,7 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	#partial switch ev.kind {
 	case .Durable:
 	case .Quarantined:
+		append(&w.quarantines, Quarantine{node = n.idx, object = ev.object})
 		if w.cfg.byzantine {
 			w.stats.detected += 1
 			world_note(w, "%s quarantined %s from %s (tampering detected)", n.name, id_short(ev.object), id_short(ev.device))

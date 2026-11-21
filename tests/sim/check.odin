@@ -600,6 +600,7 @@ crdt_span :: struct {
 check_redaction :: proc(w: ^World) {
 	m := &w.model
 	secrets := make([dynamic]string, context.temp_allocator)
+	owners := make([dynamic]int, context.temp_allocator)
 	for op in m.ops {
 		if !op_happened(op) {
 			continue
@@ -609,19 +610,21 @@ check_redaction :: proc(w: ^World) {
 			if op.target >= 0 {
 				t := m.ops[op.target]
 				append(&secrets, t.token)
+				append(&owners, op.obj)
 			}
 		case .Redact_Text:
 			for d in op.deletes {
 				append(&secrets, d)
+				append(&owners, op.obj)
 			}
 		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount:
 		}
 	}
-	for s in secrets {
+	for s, si in secrets {
 		needle := transmute([]u8)s
 		for n in w.nodes {
 			if p, found := disk_contains(&n.disk, needle); found {
-				world_fail(w, "redaction: %s still on %s disk in %s", s, n.name, p)
+				redaction_finding(w, n, owners[si], "redaction: %s still on %s disk in %s", s, n.name, p)
 			}
 			if n.alive && n.e_open {
 				context = instance_context(&n.inst)
@@ -630,7 +633,7 @@ check_redaction :: proc(w: ^World) {
 				if err == .None {
 					for h in res.hits {
 						if _snippet_leaks(h.snippet, s[1:len(s) - 1]) {
-							world_fail(w, "redaction: search on %s still returns %s in a snippet (object %s): %q", n.name, s, id_short(h.object), h.snippet)
+							redaction_finding(w, n, owners[si], "redaction: search on %s still returns %s in a snippet (object %s): %q", n.name, s, id_short(h.object), h.snippet)
 						}
 					}
 				}
@@ -641,6 +644,7 @@ check_redaction :: proc(w: ^World) {
 			world_fail(w, "redaction: %s still on relay disk in %s", s, p)
 		}
 	}
+	check_search_models(w, secrets[:], owners[:])
 }
 
 @(private = "file")
@@ -964,7 +968,7 @@ check_relay_redaction :: proc(w: ^World) {
 					if ns == .Redacted && rs != .Redacted {
 						world_fail(w, "relay redaction: relay still holds ciphertext of record %s@%d of %v %s, redacted on %s", id_short(d), off, ob.kind, id_short(ob.o.id), w.nodes[idx].name)
 					} else if ns == .Live && rs == .Redacted {
-						world_fail(w, "redaction: %s still holds record %s@%d of %v %s that the relay has redacted", w.nodes[idx].name, id_short(d), off, ob.kind, id_short(ob.o.id))
+						redaction_finding(w, w.nodes[idx], oi, "redaction: %s still holds record %s@%d of %v %s that the relay has redacted", w.nodes[idx].name, id_short(d), off, ob.kind, id_short(ob.o.id))
 					}
 				}
 			}
