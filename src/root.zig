@@ -64,3 +64,8 @@ pub const sync = struct {
 pub const playground = struct {
     pub const server = @import("playground/server.zig");
 };
+
+pub const thread = struct {
+    pub const model = @import("thread/model.zig");
+    pub const store = @import("thread/store.zig");
+};
