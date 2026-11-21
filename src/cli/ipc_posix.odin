@@ -165,7 +165,7 @@ ignore_broken_pipes :: proc() {
 	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
 }
 
-spawn_daemon :: proc(exe: string, log_path: string) -> bool {
+spawn_daemon :: proc(exe: string, log_path: string, extra: []string = nil) -> bool {
 	fds: [2]posix.FD
 	if posix.pipe(&fds) != .OK {
 		return false
@@ -189,8 +189,13 @@ spawn_daemon :: proc(exe: string, log_path: string) -> bool {
 			posix.dup2(logfd, 2)
 		}
 		posix.setenv("ONDB_READY_FD", strings.clone_to_cstring(fmt.tprintf("%d", fds[1]), context.temp_allocator), true)
-		argv := [3]cstring{strings.clone_to_cstring(exe, context.temp_allocator), "daemon", nil}
-		posix.execv(argv[0], raw_data(argv[:]))
+		argv := make([]cstring, len(extra) + 3, context.temp_allocator)
+		argv[0] = strings.clone_to_cstring(exe, context.temp_allocator)
+		argv[1] = "daemon"
+		for x, i in extra {
+			argv[i + 2] = strings.clone_to_cstring(x, context.temp_allocator)
+		}
+		posix.execv(argv[0], raw_data(argv))
 		posix._exit(127)
 	}
 	posix.close(fds[1])
@@ -264,4 +269,34 @@ mcp_bridge :: proc(sock: Sock) -> int {
 
 watch_fd :: #force_inline proc "contextless" (s: Sock) -> prim.Fd {
 	return prim.Fd(s)
+}
+
+Poll_Item :: struct {
+	fd:    Sock,
+	write: bool,
+	ready: bool,
+}
+
+sock_poll :: proc(items: []Poll_Item, timeout_ms: i64) -> bool {
+	pfds := make([]posix.pollfd, len(items), context.temp_allocator)
+	for it, i in items {
+		pfds[i] = posix.pollfd{fd = it.fd, events = {.IN, .OUT} if it.write else {.IN}}
+	}
+	for {
+		r := posix.poll(raw_data(pfds), posix.nfds_t(len(pfds)), i32(clamp(timeout_ms, 0, i64(max(i32)))))
+		if r < 0 {
+			if posix.errno() == .EINTR {
+				continue
+			}
+			return false
+		}
+		for &it, i in items {
+			it.ready = pfds[i].revents != {}
+		}
+		return true
+	}
+}
+
+signals_sock :: proc(s: ^Signals) -> (Sock, bool) {
+	return Sock(s.fd), s.fd >= 0
 }

@@ -3,3 +3,4 @@
 *.o
 /sim
 *.log
+/bindings/rust/*/target/

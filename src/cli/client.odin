@@ -64,7 +64,7 @@ client_close :: proc(c: ^Client) {
 }
 
 @(private)
-_spawn_daemon :: proc() -> bool {
+_spawn_daemon :: proc(extra: []string = nil) -> bool {
 	exe, eerr := os.get_executable_path(context.temp_allocator)
 	if eerr != nil {
 		return false
@@ -72,7 +72,7 @@ _spawn_daemon :: proc() -> bool {
 	home := home_dir(context.temp_allocator)
 	prim.mkdir_all(prim.os_vfs(), home, 0o700)
 	log_path, _ := prim.path_join(context.temp_allocator, home, "daemon.log")
-	return spawn_daemon(exe, log_path)
+	return spawn_daemon(exe, log_path, extra)
 }
 
 @(private)

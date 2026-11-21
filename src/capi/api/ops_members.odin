@@ -23,10 +23,8 @@ _attach_all :: proc(c: ^Call) {
 _login_out :: proc(o: ^Out, r: eng.Login_Result) {
 	o_enum(o, "path", u64(r.path), LOGIN_PATH_NAMES[:])
 	o_enum(o, "status", u64(r.status), LOGIN_STATUS_NAMES[:])
-	if r.status == .Waiting {
-		c := r.code
-		o_str(o, "code", string(c[:]))
-	}
+	c := r.code
+	o_str(o, "code", string(c[:]) if r.status == .Waiting else "")
 	o_u64(o, "spaces", u64(r.spaces))
 }
 
@@ -67,17 +65,13 @@ op_account_login_recovery :: proc(c: ^Call, o: ^Out) -> Status {
 op_account_state :: proc(c: ^Call, o: ^Out) -> Status {
 	a := eng.account_state(c.api.e)
 	o_bool(o, "signed_in", a.have)
-	if a.have {
-		o_bytes(o, "account", a.sign[:])
-		o_str(o, "subject", a.subject)
-		o_enum(o, "pool", u64(a.pool), POOL_ACCESS_NAMES[:])
-		o_str(o, "relay", a.relay)
-	}
+	o_bytes(o, "account", a.sign[:] if a.have else nil)
+	o_str(o, "subject", a.subject if a.have else "")
+	o_enum(o, "pool", u64(a.pool) if a.have else 0, POOL_ACCESS_NAMES[:])
+	o_str(o, "relay", a.relay if a.have else "")
 	waiting, code, failed := eng.login_waiting(c.api.e)
 	o_bool(o, "waiting", waiting)
-	if waiting {
-		o_str(o, "code", string(code[:]))
-	}
+	o_str(o, "code", string(code[:]) if waiting else "")
 	o_bool(o, "no_approver", failed)
 	return .Ok
 }

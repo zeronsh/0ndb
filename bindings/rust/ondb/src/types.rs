@@ -1,0 +1,530 @@
+use serde::{Deserialize, Serialize};
+
+pub type Id = String;
+pub type Rid = String;
+pub type ObjectRef = String;
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Ack {}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Link {
+    pub space: Option<Id>,
+    pub error: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DaemonStatus {
+    pub version: String,
+    pub proto: u64,
+    pub api: u64,
+    pub pid: u64,
+    pub home: String,
+    pub socket: String,
+    pub uptime_ms: i64,
+    pub rss: i64,
+    pub runner: bool,
+    pub connections: u64,
+    pub local_relay: bool,
+    pub mcp_sessions: u64,
+    pub wakeups: u64,
+    pub timeout_ms: i64,
+    pub host_plugs: Vec<String>,
+    pub hosts: Vec<String>,
+    pub links: Vec<Link>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Identity {
+    pub id: Option<Id>,
+    pub sign: String,
+    #[serde(rename = "box")]
+    pub box_key: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Space {
+    pub id: Option<Id>,
+    pub name: String,
+    pub relay: String,
+    pub relay_key: String,
+    pub mode: String,
+    pub open: bool,
+    pub connected: bool,
+    pub catalog: Option<Id>,
+    pub relay_usage: u64,
+    pub relay_quota: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Spaces {
+    pub spaces: Vec<Space>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SpaceCreated {
+    pub space: Option<Id>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Created {
+    pub object: Option<ObjectRef>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WriteResult {
+    pub item: Option<Rid>,
+    pub off: i64,
+    pub leaf: Option<Rid>,
+    pub tick: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ConvoStatus {
+    pub status: String,
+    pub head: Option<Rid>,
+    pub position: Option<Rid>,
+    pub browsing: bool,
+    pub head_status: String,
+    pub queued: u64,
+    pub waiting: u64,
+    pub intents: u64,
+    pub running: bool,
+    pub awaiting: bool,
+    pub revive: bool,
+    pub head_hlc: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Blob {
+    pub oid: String,
+    pub size: u64,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Block {
+    pub index: u64,
+    pub kind: String,
+    pub failed: bool,
+    pub id: String,
+    pub name: String,
+    pub text: String,
+    pub is_ref: bool,
+    pub blob: Blob,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FileRef {
+    pub mount: String,
+    pub tree: Option<Id>,
+    pub line: Option<Id>,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LineRef {
+    pub mount: String,
+    pub line: Option<Id>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Message {
+    pub id: Option<Rid>,
+    pub role: String,
+    pub author: Option<Id>,
+    pub parent: Option<Rid>,
+    pub depth: i64,
+    pub runner: Option<Id>,
+    pub hlc: u64,
+    pub provider: String,
+    pub model: String,
+    pub native: String,
+    pub intent: Option<Rid>,
+    pub status: String,
+    pub open: bool,
+    pub open_state: String,
+    pub seal: Option<Rid>,
+    pub usage: Usage,
+    pub redacted: bool,
+    pub sibling: u64,
+    pub siblings: u64,
+    pub superseded: bool,
+    pub landed: bool,
+    pub claim: Option<Rid>,
+    pub files: Vec<FileRef>,
+    pub lines: Vec<LineRef>,
+    pub blocks: Vec<Block>,
+}
+
+impl Message {
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter(|b| b.kind == "text")
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Position {
+    pub msg: Option<Rid>,
+    pub seal: Option<Rid>,
+    pub seal_known: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Page {
+    pub messages: Vec<Message>,
+    pub next: Option<Position>,
+    pub more: bool,
+    pub cursor: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Window {
+    pub messages: Vec<Message>,
+    pub anchor: u64,
+    pub older: Option<Position>,
+    pub newer: Option<Position>,
+    pub more_older: bool,
+    pub more_newer: bool,
+    pub leaf: Option<Rid>,
+    pub older_cursor: String,
+    pub newer_cursor: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MessageReply {
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Xref {
+    pub object: Option<Id>,
+    pub msg: Option<Rid>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CatalogRow {
+    pub object: Option<Id>,
+    pub kind: String,
+    pub title: String,
+    pub parent: Xref,
+    pub workspace: Option<Id>,
+    pub agent: Option<Id>,
+    pub status: String,
+    pub activity: u64,
+    pub archived: bool,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CatalogList {
+    pub rows: Vec<CatalogRow>,
+    pub more: bool,
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CatalogEntry {
+    pub object: Option<Id>,
+    pub kind: String,
+    pub title: String,
+    pub parent: Xref,
+    pub workspace: Option<Id>,
+    pub agent: Option<Id>,
+    pub participants: Vec<Id>,
+    pub status: String,
+    pub activity: u64,
+    pub archived: bool,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CatalogGet {
+    pub found: bool,
+    pub entry: CatalogEntry,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Delta {
+    pub kind: String,
+    pub object: Option<ObjectRef>,
+    pub rid: Option<Rid>,
+    pub msg: Option<Rid>,
+    pub record: u64,
+    pub by: Option<Id>,
+    pub local: bool,
+    pub hlc: u64,
+    pub role: serde_json::Value,
+    pub index: u64,
+    pub block: serde_json::Value,
+    pub seal: serde_json::Value,
+    pub status: serde_json::Value,
+    pub usage: Usage,
+    pub text: String,
+    pub key: String,
+    pub tag: u64,
+    pub removed: bool,
+    pub length: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Deltas {
+    pub deltas: Vec<Delta>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Event {
+    pub kind: String,
+    pub space: Option<Id>,
+    pub object: Option<Id>,
+    pub device: Option<Id>,
+    pub tick: u64,
+    pub length: i64,
+    pub status: String,
+    pub detail: String,
+    pub state: String,
+    pub msg: Option<Rid>,
+    pub runner: Option<Id>,
+    pub provider: String,
+    pub since_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Placement {
+    pub state: String,
+    pub msg: Option<Rid>,
+    pub runner: Option<Id>,
+    pub provider: String,
+    pub since_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LoginResult {
+    pub path: String,
+    pub status: String,
+    pub code: String,
+    pub spaces: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AccountState {
+    pub signed_in: bool,
+    pub account: String,
+    pub subject: String,
+    pub pool: String,
+    pub relay: String,
+    pub waiting: bool,
+    pub code: String,
+    pub no_approver: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Approval {
+    pub device: Option<Id>,
+    pub code: String,
+    pub label: String,
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Approvals {
+    pub approvals: Vec<Approval>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Salt {
+    pub salt: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SignedOut {
+    pub spaces: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Receipt {
+    pub receipt: String,
+    pub msg: Option<Rid>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Match {
+    pub start: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Hit {
+    pub object: Option<Id>,
+    pub participant: Option<Id>,
+    pub msg: Option<Rid>,
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub part: u64,
+    pub kind: String,
+    pub title: bool,
+    pub hlc: u64,
+    pub score: f64,
+    pub snippet: String,
+    pub snippet_at: u64,
+    pub matches: Vec<Match>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SearchSource {
+    pub device: Option<Id>,
+    pub local: bool,
+    pub state: String,
+    pub behind: u64,
+    pub hits: u64,
+    pub rejected: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SearchResults {
+    pub hits: Vec<Hit>,
+    pub cursor: String,
+    pub incomplete: bool,
+    pub verified: u64,
+    pub partial: bool,
+    pub behind: u64,
+    pub sources: Vec<SearchSource>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Mounted {
+    pub object: Option<ObjectRef>,
+    pub root: String,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MountedList {
+    pub mounts: Vec<Mounted>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TreeFind {
+    pub object: Option<ObjectRef>,
+    pub root: String,
+    pub rel: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RuntimeStats {
+    pub runner: bool,
+    pub active_runs: u64,
+    pub warm_processes: u64,
+    pub runs_started: u64,
+    pub runs_finished: u64,
+    pub evaluations: u64,
+    pub spawns: u64,
+    pub warm_hits: u64,
+    pub raw_lines: u64,
+    pub tool_calls: u64,
+    pub schedules: u64,
+    pub timers: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct State {
+    pub default_space: Option<Id>,
+    pub current: Option<ObjectRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dir {
+    #[default]
+    Older,
+    Newer,
+}
+
+impl Dir {
+    pub fn name(self) -> &'static str {
+        match self {
+            Dir::Older => "older",
+            Dir::Newer => "newer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PageArgs {
+    pub from: Option<Rid>,
+    pub limit: u64,
+    pub dir: Dir,
+    pub leaf: Option<Rid>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecordArgs {
+    pub source: String,
+    pub external_id: String,
+    pub sequence: u64,
+    pub role: String,
+    pub parent: Option<Rid>,
+    pub text: String,
+    pub status: Option<String>,
+    pub provider: String,
+    pub model: String,
+}

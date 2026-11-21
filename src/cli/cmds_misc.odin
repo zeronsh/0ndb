@@ -23,11 +23,59 @@ cmd_daemon :: proc(a: ^Args) -> int {
 			}
 			fmt.println("stopping")
 			return 0
+		case "start":
+			return _daemon_start(a)
 		case:
-			return usage_error("usage: 0ndb daemon [stop]")
+			return usage_error("usage: 0ndb daemon [start|stop] [daemon flags]")
 		}
 	}
 	return daemon_main(a)
+}
+
+@(private)
+_daemon_start :: proc(a: ^Args) -> int {
+	c: Client
+	if client_connect(&c, false) {
+		r := client_call(&c, `{"op":"daemon.status"}`, 5000)
+		client_close(&c)
+		if a.json {
+			fmt.println(r.payload)
+		} else {
+			fmt.printfln("already running (pid %d)", jint(r.value, "pid"))
+		}
+		return 0
+	}
+	extra := make([dynamic]string, context.temp_allocator)
+	for name, value in a.flags {
+		if name == "json" || name == "timeout" {
+			continue
+		}
+		is_bool := false
+		for b in BOOL_FLAGS {
+			is_bool ||= b == name
+		}
+		if is_bool {
+			if value == "true" {
+				append(&extra, fmt.tprintf("--%s", name))
+			}
+		} else {
+			append(&extra, fmt.tprintf("--%s", name), value)
+		}
+	}
+	if !_spawn_daemon(extra[:]) {
+		return report_error(.Io, "the daemon did not start (see %s)", "daemon.log in the data directory")
+	}
+	if !client_connect(&c, false) {
+		return report_error(.Closed, "the daemon started but its socket is not reachable")
+	}
+	r := client_call(&c, `{"op":"daemon.status"}`, 5000)
+	client_close(&c)
+	if a.json {
+		fmt.println(r.payload)
+	} else {
+		fmt.printfln("started (pid %d)", jint(r.value, "pid"))
+	}
+	return 0
 }
 
 cmd_runner :: proc(a: ^Args) -> int {

@@ -193,6 +193,11 @@
  *                 the bytes the relay stores for the space and its quota,
  *                 as of the last connect)
  *   Identity   := id: id, sign: bytes, box: bytes
+ *   AccountState := signed_in: bool, account: bytes, subject: str,
+ *                 pool: enum pool_access, relay: str, waiting: bool,
+ *                 code: str, no_approver: bool (account fields are empty
+ *                 when signed_in is false, code when waiting is false)
+ *   Approval   := device: id, code: str, label: str, at: ivarint
  *   Span       := lo: uvarint, hi: uvarint, line_lo: uvarint,
  *                 line_hi: uvarint, actor: id, seq: uvarint, op_actor: id,
  *                 op_seq: uvarint, redacted: bool
@@ -967,9 +972,9 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_SPACE_CREATE 7u
 /* account.login(subject: str, label: str, relay: str, relay_key: bytes) -> path:enum login_path status:enum login_status code:str spaces:uvarint */
 #define ONDB_OP_ACCOUNT_LOGIN 8u
-/* account.login_cross_device(subject: str) -> path:enum login_path status:enum login_status spaces:uvarint */
+/* account.login_cross_device(subject: str) -> path:enum login_path status:enum login_status code:str spaces:uvarint */
 #define ONDB_OP_ACCOUNT_LOGIN_CROSS_DEVICE 9u
-/* account.login_recovery(subject: str, key: str) -> path:enum login_path status:enum login_status spaces:uvarint */
+/* account.login_recovery(subject: str, key: str) -> path:enum login_path status:enum login_status code:str spaces:uvarint */
 #define ONDB_OP_ACCOUNT_LOGIN_RECOVERY 10u
 /* account.state() -> AccountState */
 #define ONDB_OP_ACCOUNT_STATE 11u

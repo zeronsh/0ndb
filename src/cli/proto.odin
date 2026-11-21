@@ -16,6 +16,11 @@ Frame_Kind :: enum u8 {
 	Mcp         = 6,
 	Events      = 7,
 	Event       = 8,
+	Cancel      = 9,
+	Plug        = 10,
+	Plug_Reply  = 11,
+	Plug_Cancel = 12,
+	Gap         = 13,
 }
 
 frame_put :: proc(out: ^[dynamic]u8, kind: Frame_Kind, parts: ..[]u8) {

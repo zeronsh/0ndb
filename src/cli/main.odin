@@ -25,7 +25,7 @@ Args :: struct {
 	json:  bool,
 }
 
-BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview", "local", "everywhere", "no-full-index"}
+BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview", "local", "everywhere", "no-full-index", "replace"}
 
 Command :: struct {
 	name:  string,
@@ -35,7 +35,8 @@ Command :: struct {
 }
 
 COMMANDS := []Command {
-	{"daemon", cmd_daemon, "daemon [stop] [--no-runner] [--no-full-index] [--storage auto|stored|until-run|device] [--capacity N] [--provider P] [--model M] [--pool-host]", "run the device daemon in the foreground (engine, runtime, local socket); --no-runner keeps this device from executing runs, so its messages wait for another runner; --no-full-index keeps it from indexing every conversation of its spaces and answering other devices' searches"},
+	{"daemon", cmd_daemon, "daemon [start|stop] [--host-plugs LIST] [--no-runner] [--no-full-index] [--storage auto|stored|until-run|device] [--capacity N] [--provider P] [--model M] [--pool-host]", "run the device daemon in the foreground (engine, runtime, local socket), or start it detached and wait until it serves (start passes its flags through); --host-plugs names the plugs (sealed_store, unlock, credentials, runner_pool or pool_user) a host connection supplies over the socket instead of the built-in references; --no-runner keeps this device from executing runs, so its messages wait for another runner; --no-full-index keeps it from indexing every conversation of its spaces and answering other devices' searches"},
+	{"host", cmd_host, "host [token] [--plugs LIST] [--store DIR] [--passkey FILE] [--credentials-dir DIR] [--pool-card HEX] [--replace] [--json] [--quiet]", "reference host: register with the daemon and answer its plug requests (file account store, software passkey, runner-pool launch tokens, static relay credentials), reconnecting when the daemon restarts; token prints a runner launch token for --plugs runner_pool"},
 	{"relay", cmd_relay, "relay [--listen ADDR]... [--dir DIR] [--open] [--quota BYTES]", "run a relay on files/pack, serving TCP with kernel TLS and Unix sockets"},
 	{"runner", cmd_runner, "runner [--pool-token TOKEN] [--capacity N]", "run a dedicated runner engine in the foreground; with a launch token from a pool host (ONDB_POOL_HOST_SOCK) it enrolls through the pool"},
 	{"record", cmd_record, "record [CONVO] --source S --id EXTERNAL_ID [--seq N] [--role R] [--status S] [--model M] [TEXT|--stdin]", "record a message from an external harness (idempotent)"},

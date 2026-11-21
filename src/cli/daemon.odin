@@ -58,18 +58,34 @@ Daemon :: struct {
 	stopping:   bool,
 	runner:     bool,
 	acct:       ^Acct,
+	hc:         Host_Chan,
+	serial:     u64,
 }
 
 Pending :: struct {
 	conn: ^Conn,
 	tag:  u64,
 	id:   u64,
+	json: bool,
 }
 
 Sub_Tag :: struct {
-	conn: ^Conn,
-	tag:  u64,
-	id:   u64,
+	conn:    ^Conn,
+	tag:     u64,
+	id:      u64,
+	json:    bool,
+	catalog: bool,
+	gap:     bool,
+	compact: bool,
+	object:  api.Object,
+	changed: [dynamic]api.Object,
+}
+
+Ev_Key :: struct {
+	kind:   u64,
+	space:  prim.Id,
+	object: prim.Id,
+	device: prim.Id,
 }
 
 Conn :: struct {
@@ -83,8 +99,23 @@ Conn :: struct {
 	calls:   [dynamic]^Pending,
 	subs:    [dynamic]^Sub_Tag,
 	events:  bool,
+	ev_json: bool,
+	ev_mask: u64,
 	dead:    bool,
+	serial:  u64,
+	plugs:   Host_Plugs,
+	host_json: bool,
+	pushed:  bool,
+	lagging: bool,
+	ev_keys: [dynamic]Ev_Key,
+	ev_last: map[Ev_Key][]u8,
 }
+
+HOST_REGISTER_CODE :: 1009
+CONN_WBUF_MAX :: 2 * FRAME_MAX
+LAG_HIGH :: 1 << 20
+LAG_LOW :: 64 << 10
+GAP_OBJECTS_MAX :: 4096
 
 HOST_OPS := []api.Op {
 	{1000, "daemon.status", {}, "DaemonStatus", op_daemon_status},
@@ -96,6 +127,7 @@ HOST_OPS := []api.Op {
 	{1006, "credentials.add", {{"space", .Id, nil}, {"token", .Bytes, nil}}, "", op_credentials_add},
 	{1007, "verify", {{"root", .Str, nil}}, "files:uvarint mismatches:[str]", op_verify},
 	{1008, "pool.token", {}, "token:str", op_pool_token},
+	{HOST_REGISTER_CODE, "host.register", {{"plugs", .Strs, nil}, {"replace", .Bool, nil}}, "plugs:[str]", op_host_register},
 }
 
 daemon_main :: proc(args: ^Args) -> int {
@@ -124,6 +156,9 @@ daemon_main :: proc(args: ^Args) -> int {
 	ec.events = eng.Event_Hook{data = d, event = _on_event}
 	if !acct_setup(d, &ec, args) {
 		return report_error(.Io, "cannot open the account store")
+	}
+	if !host_plugs_setup(d, &ec, args) {
+		return usage_error("--host-plugs takes a comma-separated list of sealed_store, unlock, credentials and either runner_pool or pool_user")
 	}
 	opts := api.Stack_Options {
 		runtime = true,
@@ -190,6 +225,7 @@ daemon_main :: proc(args: ^Args) -> int {
 		if prim.loop_step(&d.s.loop, true) != .None {
 			break
 		}
+		_flush_pushed(d)
 		if len(d.mcp) > 0 {
 			_mcp_sweep(d)
 		}
@@ -249,21 +285,108 @@ _on_accept :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 			sock_close(cfd)
 			continue
 		}
-		c := new(Conn)
-		c.d = d
-		c.fd = cfd
-		c.rbuf = make([dynamic]u8)
-		c.wbuf = make([dynamic]u8)
-		c.calls = make([dynamic]^Pending)
-		c.subs = make([dynamic]^Sub_Tag)
-		w, err := prim.watch(l, watch_fd(cfd), {.Read}, c, _on_conn)
-		if err != .None {
-			sock_close(cfd)
-			_conn_free(c)
-			continue
+		_conn_new(d, cfd)
+	}
+}
+
+@(private)
+_conn_new :: proc(d: ^Daemon, cfd: Sock) -> ^Conn {
+	c := new(Conn)
+	c.d = d
+	c.fd = cfd
+	d.serial += 1
+	c.serial = d.serial
+	c.rbuf = make([dynamic]u8)
+	c.wbuf = make([dynamic]u8)
+	c.calls = make([dynamic]^Pending)
+	c.subs = make([dynamic]^Sub_Tag)
+	w, err := prim.watch(&d.s.loop, watch_fd(cfd), {.Read}, c, _on_conn)
+	if err != .None {
+		sock_close(cfd)
+		_conn_free(c)
+		return nil
+	}
+	c.watch = w
+	append(&d.conns, c)
+	return c
+}
+
+@(private)
+_conn_version_mismatch :: proc(c: ^Conn) {
+	t := u64_bytes(0)
+	s := [1]u8{u8(api.Status.Unsupported)}
+	buf := make([dynamic]u8, context.temp_allocator)
+	o: api.Out
+	api.out_init(&o, &buf, true)
+	api.o_str(&o, "error", api.STATUS_NAMES[int(api.Status.Unsupported)])
+	api.o_u64(&o, "proto", u64(PROTO_VERSION))
+	c.sniffed = true
+	_conn_write(c, .Result, t[:], s[:], api.out_finish(&o))
+	c.dead = true
+}
+
+@(private)
+_conn_call :: proc(c: ^Conn, payload: []u8) {
+	d := c.d
+	hc := &d.hc
+	tag := prim.get_u64le(payload[:8])
+	json_form := payload[8] & 1 != 0
+	timeout := i64(prim.get_u64le(payload[9:17]))
+	pc := new(Pending)
+	pc.conn = c
+	pc.tag = tag
+	pc.json = json_form
+	prev_c, prev_t, prev_x, prev_f := hc.current, hc.cur_tag, hc.cancelled, hc.failure
+	hc.current, hc.cur_tag, hc.cancelled, hc.failure = c, tag, false, .Ok
+	id, st, out := api.call(&d.s.a, payload[17:], json_form, _on_call_done, pc, timeout, context.temp_allocator)
+	cancelled, failure := hc.cancelled, hc.failure
+	hc.current, hc.cur_tag, hc.cancelled, hc.failure = prev_c, prev_t, prev_x, prev_f
+	if st == .Pending {
+		pc.id = id
+		append(&c.calls, pc)
+		if cancelled {
+			_call_cancel(c, tag)
 		}
-		c.watch = w
-		append(&d.conns, c)
+		return
+	}
+	free(pc)
+	if cancelled {
+		st = .Cancelled
+		out = nil
+	} else if st != .Ok && failure != .Ok {
+		st = failure
+		out = nil
+	}
+	if out == nil && st != .Ok {
+		out = _status_payload(st, json_form)
+	}
+	_send_result(c, tag, st, out)
+}
+
+@(private)
+_status_payload :: proc(st: api.Status, json_form: bool) -> []u8 {
+	buf := make([dynamic]u8, context.temp_allocator)
+	o: api.Out
+	api.out_init(&o, &buf, json_form)
+	if json_form {
+		api.o_str(&o, "error", api.STATUS_NAMES[int(st)])
+	} else {
+		api.o_u64(&o, "status", u64(st))
+	}
+	return api.out_finish(&o)
+}
+
+@(private)
+_call_cancel :: proc(c: ^Conn, tag: u64) {
+	for pc, i in c.calls {
+		if pc.tag == tag {
+			ordered_remove(&c.calls, i)
+			api.cancel(&c.d.s.a, pc.id)
+			json_form := pc.json
+			free(pc)
+			_send_result(c, tag, .Cancelled, _status_payload(.Cancelled, json_form))
+			return
+		}
 	}
 }
 
@@ -318,7 +441,7 @@ _conn_process :: proc(c: ^Conn) -> bool {
 			return true
 		}
 		if c.rbuf[4] != PROTO_VERSION {
-			c.dead = true
+			_conn_version_mismatch(c)
 			return true
 		}
 		remove_range(&c.rbuf, 0, 5)
@@ -342,20 +465,7 @@ _conn_process :: proc(c: ^Conn) -> bool {
 				c.dead = true
 				return true
 			}
-			tag := prim.get_u64le(payload[:8])
-			json_form := payload[8] & 1 != 0
-			timeout := i64(prim.get_u64le(payload[9:17]))
-			pc := new(Pending)
-			pc.conn = c
-			pc.tag = tag
-			id, st, out := api.call(&d.s.a, payload[17:], json_form, _on_call_done, pc, timeout, context.temp_allocator)
-			if st == .Pending {
-				pc.id = id
-				append(&c.calls, pc)
-			} else {
-				free(pc)
-				_send_result(c, tag, st, out)
-			}
+			_conn_call(c, payload)
 		case .Subscribe:
 			if len(payload) < 9 {
 				c.dead = true
@@ -365,29 +475,49 @@ _conn_process :: proc(c: ^Conn) -> bool {
 			st_ := new(Sub_Tag)
 			st_.conn = c
 			st_.tag = tag
-			id, st := api.subscribe(&d.s.a, payload[9:], payload[8] & 1 != 0, _on_sub, st_)
+			st_.json = payload[8] & 1 != 0
+			st_.compact = payload[8] & 2 != 0
+			id, catalog, object, st := api.subscribe_raw(&d.s.a, payload[9:], st_.json, _on_sub, st_)
+			st_.catalog = catalog
+			st_.object = object
 			if st != .Ok {
 				free(st_)
-				_send_result(c, tag, st, nil)
+				_send_result(c, tag, st, _status_payload(st, payload[8] & 1 != 0))
 			} else {
 				st_.id = id
 				append(&c.subs, st_)
 				_send_result(c, tag, .Ok, nil)
 			}
 		case .Unsubscribe:
-			if len(payload) >= 8 {
-				tag := prim.get_u64le(payload[:8])
-				for s, i in c.subs {
-					if s.tag == tag {
-						api.unsubscribe(&d.s.a, s.id)
-						ordered_remove(&c.subs, i)
-						free(s)
-						break
-					}
+			if len(payload) < 8 {
+				c.dead = true
+				return true
+			}
+			tag := prim.get_u64le(payload[:8])
+			st := api.Status.Not_Found
+			for s, i in c.subs {
+				if s.tag == tag {
+					api.unsubscribe(&d.s.a, s.id)
+					ordered_remove(&c.subs, i)
+					_sub_free(s)
+					st = .Ok
+					break
 				}
 			}
+			_send_result(c, tag, st, nil)
 		case .Events:
-			c.events = true
+			flags := payload[0] if len(payload) > 0 else 1
+			c.events = flags & 2 == 0
+			c.ev_json = flags & 1 != 0
+			c.ev_mask = prim.get_u64le(payload[1:9]) if len(payload) >= 9 else max(u64)
+		case .Cancel:
+			if len(payload) < 8 {
+				c.dead = true
+				return true
+			}
+			_call_cancel(c, prim.get_u64le(payload[:8]))
+		case .Plug_Reply:
+			host_plug_reply(d, c, payload)
 		case .Mcp:
 			return !_mcp_handoff(c, payload)
 		case:
@@ -412,6 +542,11 @@ _conn_write :: proc(c: ^Conn, kind: Frame_Kind, parts: ..[]u8) {
 	}
 	frame_put(&c.wbuf, kind, ..parts)
 	_conn_flush(c)
+	if len(c.wbuf) > CONN_WBUF_MAX {
+		fmt.eprintfln("0ndb daemon: dropping a client that stopped reading (%d bytes queued)", len(c.wbuf))
+		c.dead = true
+		_host_schedule_sweep(c.d)
+	}
 }
 
 @(private)
@@ -426,6 +561,9 @@ _conn_flush :: proc(c: ^Conn) {
 			return
 		}
 		remove_range(&c.wbuf, 0, int(n))
+		if c.lagging && len(c.wbuf) <= LAG_LOW {
+			_conn_resume(c)
+		}
 	}
 	want := len(c.wbuf) > 0
 	if want != c.writing && !c.dead {
@@ -456,10 +594,94 @@ _on_call_done :: proc(data: rawptr, id: u64, st: api.Status, payload: []u8) {
 }
 
 @(private)
-_on_sub :: proc(data: rawptr, id: u64, payload: []u8) {
+_on_sub :: proc(data: rawptr, id: u64, deltas: []eng.Delta) {
 	s := (^Sub_Tag)(data)
+	c := s.conn
+	if c.dead {
+		return
+	}
+	if c.lagging || len(c.wbuf) > LAG_HIGH {
+		c.lagging = true
+		if !s.catalog || s.gap {
+			s.gap = true
+			return
+		}
+		for &dl in deltas {
+			seen := false
+			for x in s.changed {
+				seen ||= x == dl.object
+			}
+			if !seen {
+				append(&s.changed, dl.object)
+			}
+		}
+		if len(s.changed) > GAP_OBJECTS_MAX {
+			s.gap = true
+			clear(&s.changed)
+		}
+		return
+	}
 	t := u64_bytes(s.tag)
-	_conn_write(s.conn, .Deltas, t[:], payload)
+	_conn_push(c, .Deltas, t[:], api.encode_deltas_compact(deltas, s.object) if s.json && s.compact else api.encode_deltas(deltas, s.json))
+}
+
+@(private)
+_conn_push :: proc(c: ^Conn, kind: Frame_Kind, parts: ..[]u8) {
+	if c.dead {
+		return
+	}
+	frame_put(&c.wbuf, kind, ..parts)
+	c.pushed = true
+}
+
+@(private)
+_flush_pushed :: proc(d: ^Daemon) {
+	for c in d.conns {
+		if c.pushed && !c.dead {
+			c.pushed = false
+			_conn_flush(c)
+			if c.dead {
+				_host_schedule_sweep(d)
+			}
+		}
+	}
+}
+
+@(private)
+_conn_resume :: proc(c: ^Conn) {
+	c.lagging = false
+	for s in c.subs {
+		if !s.gap && len(s.changed) == 0 {
+			continue
+		}
+		buf := make([dynamic]u8, context.temp_allocator)
+		o: api.Out
+		api.out_init(&o, &buf, s.json)
+		api.o_bool(&o, "full", s.gap)
+		api.o_arr(&o, "objects", len(s.changed))
+		for ob in s.changed {
+			api.o_object(&o, "", ob)
+		}
+		api.o_end(&o)
+		t := u64_bytes(s.tag)
+		frame_put(&c.wbuf, .Gap, t[:], api.out_finish(&o))
+		s.gap = false
+		clear(&s.changed)
+	}
+	for k in c.ev_keys {
+		if p, ok := c.ev_last[k]; ok {
+			frame_put(&c.wbuf, .Event, p)
+			delete(p)
+		}
+	}
+	clear(&c.ev_keys)
+	clear(&c.ev_last)
+}
+
+@(private)
+_sub_free :: proc(s: ^Sub_Tag) {
+	delete(s.changed)
+	free(s)
 }
 
 @(private)
@@ -500,14 +722,38 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	case .Peer_Misbehaving:
 		fmt.eprintfln("0ndb daemon: device %s served bytes of %s that failed verification", hex(ev.device), hex(ev.object))
 	}
-	if len(d.conns) == 0 {
-		return
+	_broadcast_event(d, ev, {}, {})
+}
+
+@(private)
+_broadcast_event :: proc(d: ^Daemon, ev: ^eng.Event, o: api.Object, info: rt.Placement_Info) {
+	jp, bp: []u8
+	key := Ev_Key{kind = api.EVENT_PLACEMENT, space = o.space, object = o.id}
+	if ev != nil {
+		key = Ev_Key{api.event_code(ev.kind), ev.space, ev.object, ev.device}
 	}
-	payload := api.encode_event(ev, true)
 	for c in d.conns {
-		if c.events {
-			_conn_write(c, .Event, payload)
+		if !c.events || c.dead || key.kind >= 64 || c.ev_mask & (u64(1) << key.kind) == 0 {
+			continue
 		}
+		if c.ev_json && jp == nil {
+			jp = api.encode_event(ev, true) if ev != nil else api.encode_placement_event(o, info, true)
+		}
+		if !c.ev_json && bp == nil {
+			bp = api.encode_event(ev, false) if ev != nil else api.encode_placement_event(o, info, false)
+		}
+		p := jp if c.ev_json else bp
+		if c.lagging || len(c.wbuf) > LAG_HIGH {
+			c.lagging = true
+			if old, had := c.ev_last[key]; had {
+				delete(old)
+			} else {
+				append(&c.ev_keys, key)
+			}
+			c.ev_last[key] = clone_bytes(p)
+			continue
+		}
+		_conn_push(c, .Event, p)
 	}
 }
 
@@ -517,15 +763,7 @@ _on_placement :: proc(data: rawptr, o: api.Object, info: rt.Placement_Info) {
 	if info.state == .Waiting_Runner {
 		fmt.eprintfln("0ndb daemon: %s waits for a runner (provider %s)", hex(o.id), info.provider)
 	}
-	if len(d.conns) == 0 {
-		return
-	}
-	payload := api.encode_placement_event(o, info, true)
-	for c in d.conns {
-		if c.events {
-			_conn_write(c, .Event, payload)
-		}
-	}
+	_broadcast_event(d, nil, o, info)
 }
 
 @(private)
@@ -546,6 +784,7 @@ _conn_drop :: proc(c: ^Conn, close_fd: bool) {
 	}
 	c.fd = NO_SOCK
 	c.dead = true
+	host_release(d, c)
 	for pc in c.calls {
 		api.cancel(&d.s.a, pc.id)
 		free(pc)
@@ -553,7 +792,7 @@ _conn_drop :: proc(c: ^Conn, close_fd: bool) {
 	clear(&c.calls)
 	for s in c.subs {
 		api.unsubscribe(&d.s.a, s.id)
-		free(s)
+		_sub_free(s)
 	}
 	clear(&c.subs)
 	_conn_free(c)
@@ -561,6 +800,11 @@ _conn_drop :: proc(c: ^Conn, close_fd: bool) {
 
 @(private)
 _conn_free :: proc(c: ^Conn) {
+	for _, p in c.ev_last {
+		delete(p)
+	}
+	delete(c.ev_last)
+	delete(c.ev_keys)
 	delete(c.rbuf)
 	delete(c.wbuf)
 	delete(c.calls)
@@ -676,6 +920,7 @@ _shutdown :: proc(d: ^Daemon) {
 	}
 	signals_close(&d.sig)
 	_state_save(d)
+	host_plugs_destroy(d)
 	for m in d.mcp {
 		_mcp_close_fds(m.fd, m.out)
 	}
@@ -786,6 +1031,8 @@ _host :: proc(c: ^api.Call) -> ^Daemon {
 op_daemon_status :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	d := _host(c)
 	api.o_str(o, "version", VERSION)
+	api.o_u64(o, "proto", u64(PROTO_VERSION))
+	api.o_u64(o, "api", api.VERSION)
 	api.o_u64(o, "pid", self_pid())
 	api.o_str(o, "home", d.home)
 	api.o_str(o, "socket", d.sock)
@@ -797,6 +1044,18 @@ op_daemon_status :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	api.o_int(o, "mcp_sessions", len(d.mcp))
 	api.o_u64(o, "wakeups", eng.stats(&d.s.e).wakeups)
 	api.o_i64(o, "timeout_ms", prim.loop_timeout_ms(&d.s.loop))
+	enabled := host_plug_names(d.hc.enabled)
+	api.o_arr(o, "host_plugs", len(enabled))
+	for n in enabled {
+		api.o_str(o, "", n)
+	}
+	api.o_end(o)
+	registered := host_plug_names(host_registered(d))
+	api.o_arr(o, "hosts", len(registered))
+	for n in registered {
+		api.o_str(o, "", n)
+	}
+	api.o_end(o)
 	api.o_arr(o, "links", len(d.links))
 	for sp, err in d.links {
 		api.o_obj(o, "")

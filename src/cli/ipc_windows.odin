@@ -269,7 +269,7 @@ _quote_arg :: proc(b: ^[dynamic]u8, arg: string) {
 	append(b, '"')
 }
 
-spawn_daemon :: proc(exe: string, log_path: string) -> bool {
+spawn_daemon :: proc(exe: string, log_path: string, extra: []string = nil) -> bool {
 	sa := win.SECURITY_ATTRIBUTES {
 		nLength        = size_of(win.SECURITY_ATTRIBUTES),
 		bInheritHandle = true,
@@ -322,6 +322,10 @@ spawn_daemon :: proc(exe: string, log_path: string) -> bool {
 	cmd := make([dynamic]u8, context.temp_allocator)
 	_quote_arg(&cmd, exe)
 	append(&cmd, " daemon")
+	for x in extra {
+		append(&cmd, ' ')
+		_quote_arg(&cmd, x)
+	}
 	cmdw := _wide(string(cmd[:]))
 	val: [24]u8
 	win.SetEnvironmentVariableW(_wide("ONDB_READY_FD"), _wide(strconv.write_uint(val[:], u64(uintptr(wr)), 10)))
@@ -476,4 +480,31 @@ _pipe_pair :: proc() -> (r: win.HANDLE, w: win.HANDLE, ok: bool) {
 	mode: u32 = win.PIPE_READMODE_BYTE | 0x1
 	SetNamedPipeHandleState(w, &mode, nil, nil)
 	return r, w, true
+}
+
+Poll_Item :: struct {
+	fd:    Sock,
+	write: bool,
+	ready: bool,
+}
+
+sock_poll :: proc(items: []Poll_Item, timeout_ms: i64) -> bool {
+	pfds := make([]win.WSA_POLLFD, len(items), context.temp_allocator)
+	for it, i in items {
+		pfds[i] = win.WSA_POLLFD {
+			fd     = _s(it.fd),
+			events = win.POLLRDNORM | win.POLLWRNORM if it.write else win.POLLRDNORM,
+		}
+	}
+	if win.WSAPoll(raw_data(pfds), u32(len(pfds)), i32(clamp(timeout_ms, 0, i64(max(i32))))) < 0 {
+		return false
+	}
+	for &it, i in items {
+		it.ready = pfds[i].revents != 0
+	}
+	return true
+}
+
+signals_sock :: proc(s: ^Signals) -> (Sock, bool) {
+	return NO_SOCK, false
 }

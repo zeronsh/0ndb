@@ -371,7 +371,8 @@ follow :: proc(s: ^Session, ob: api.Object, until_idle: bool, sent := "") -> int
 				last_place = t
 			}
 		}
-		client_send(&s.c, .Events)
+		ev_flags := [1]u8{1}
+		client_send(&s.c, .Events, ev_flags[:])
 	}
 	r := req_begin("subscribe")
 	req_str(&r, "object", object_str(ob))
