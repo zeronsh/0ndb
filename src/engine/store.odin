@@ -356,7 +356,12 @@ _durable_begin :: proc(e: ^Engine) {
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
 	append(&e.batches, b)
 	e.stats.commits += 1
-	if err := pack.sync_async(&e.pk, _batch_cb, b); err != .None {
+	err := pack.batch_end_async(&e.pk, _batch_cb, b)
+	if err == .None {
+		_pack_step(e)
+	}
+	pack.batch_begin(&e.pk)
+	if err != .None {
 		if err == .Would_Block {
 			for i := len(e.batches) - 1; i >= 0; i -= 1 {
 				if e.batches[i] == b {
@@ -379,6 +384,16 @@ _durable_begin :: proc(e: ^Engine) {
 	if e.cfg.durability == .Deferred {
 		_pack_poll(e)
 	}
+}
+
+@(private)
+_pack_step :: proc(e: ^Engine) {
+	more, err := pack.step(&e.pk)
+	if err != .None {
+		_fatal(e, _perr(err))
+		return
+	}
+	e.pack_more = more
 }
 
 @(private)

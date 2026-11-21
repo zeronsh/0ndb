@@ -252,6 +252,7 @@ Engine :: struct {
 	index_dirty:  [dynamic]Index_Item,
 	db:           odb.Odb,
 	db_open:      bool,
+	pack_more:    bool,
 	plug:         Plug_State,
 	stats:        Stats,
 	fatal:        Error,
@@ -650,12 +651,16 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 		e.settle_timer = prim.timer(e.loop, e.cfg.settle_ms, e, _on_settle)
 		return
 	}
+
 	_index_settle(e)
 	_checkpoints_write(e)
 	_handles_sweep(e, 0)
 	_spaces_settle(e)
 	_trees_release(e)
 	_durable_begin(e)
+	if e.pack_more {
+		e.settle_timer = prim.timer(e.loop, 0, e, _on_settle)
+	}
 	when !runtime.NO_DEFAULT_TEMP_ALLOCATOR {
 		if context.temp_allocator.data == &runtime.global_default_temp_allocator_data {
 			runtime.default_temp_allocator_destroy(&runtime.global_default_temp_allocator_data)
