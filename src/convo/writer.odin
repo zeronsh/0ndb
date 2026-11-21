@@ -1281,7 +1281,7 @@ _write_digest :: proc(w: ^Writer, full: bool) -> Error {
 		}
 	}
 	digest := Forks{ctx.forks[:], ctx.assigns[:], ctx.mounts[:], ctx.superseded[:], ctx.landed[:], spine, 0, 0, 0}
-	off := _prep_off(w, false) or_return
+	off := _prep_off(w, true) or_return
 	sum := w.sum
 	sum.digest = off
 	if is_full {

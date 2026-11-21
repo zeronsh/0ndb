@@ -305,7 +305,157 @@ unsealed :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Unseal
 	return list[:], .None
 }
 
-page :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocator := context.allocator) -> (p: Page, err: Error) {
+Direction :: enum u8 {
+	Older,
+	Newer,
+}
+
+Window :: struct {
+	messages:   []Message,
+	anchor:     int,
+	older:      Position,
+	newer:      Position,
+	more_older: bool,
+	more_newer: bool,
+	leaf:       Rid,
+}
+
+page :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocator := context.allocator, dir := Direction.Older, leaf := Rid{}) -> (p: Page, err: Error) {
+	if dir == .Newer {
+		return _page_newer(v, t, from, limit, leaf, allocator)
+	}
+	return _page_older(v, t, from, limit, allocator)
+}
+
+page_around :: proc(v: ^obj.View, t: ^Tail, anchor: Rid, before: int, after: int, leaf := Rid{}, allocator := context.allocator) -> (w: Window, err: Error) {
+	if obj.rid_none(anchor) || before < 0 || after < 0 {
+		return w, .Invalid
+	}
+	older, oe := _page_older(v, t, Position{msg = anchor}, before + 1, allocator)
+	newer, ne := _page_newer(v, t, Position{msg = anchor}, after, leaf, allocator)
+	if oe != .None && oe != .Missing {
+		return w, oe
+	}
+	if ne != .None && ne != .Missing {
+		return w, ne
+	}
+	if oe == .Missing || ne == .Missing {
+		return w, .Missing
+	}
+	list := make([]Message, len(older.messages) + len(newer.messages), allocator)
+	for m, i in older.messages {
+		list[len(older.messages) - 1 - i] = m
+	}
+	copy(list[len(older.messages):], newer.messages)
+	w.messages = list
+	w.anchor = len(older.messages) - 1
+	w.older = older.next
+	w.more_older = older.more
+	w.newer = newer.next
+	w.more_newer = newer.more
+	w.leaf = leaf if !obj.rid_none(leaf) else obj.rid(v, t.position)
+	return w, .None
+}
+
+switch_window :: proc(v: ^obj.View, t: ^Tail, sibling: Rid, before: int, after: int, allocator := context.allocator) -> (leaf: Rid, w: Window, err: Error) {
+	le: Error
+	leaf, le = switch_target(v, t, sibling)
+	if le == .Missing {
+		_page_older(v, t, Position{msg = sibling}, before + 1, allocator)
+	}
+	if le != .None {
+		return {}, w, le
+	}
+	w = page_around(v, t, sibling, before, after, leaf, allocator) or_return
+	return leaf, w, .None
+}
+
+@(private)
+_page_newer :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, leaf: Rid, allocator: runtime.Allocator) -> (p: Page, err: Error) {
+	lv := t.position
+	if !obj.rid_none(leaf) {
+		lv = obj.vref(v, leaf) or_return
+	}
+	p.next = from
+	if obj.vref_none(lv) || limit < 0 {
+		return p, .Invalid if limit < 0 else .None
+	}
+	ln, le := _node(v, lv)
+	fv := Vref{}
+	fd: i64
+	floor: prim.Hlc
+	fe := Error.None
+	if !obj.rid_none(from.msg) {
+		fv = obj.vref(v, from.msg) or_return
+		fn: Node
+		fn, fe = _node(v, fv)
+		if fe == .Missing {
+			_prefetch_structure(v, t, fv)
+		}
+		fd = fn.depth
+		floor = fn.hlc
+	}
+	if le != .None {
+		return p, le
+	}
+	if fe != .None {
+		return p, fe
+	}
+	if fd >= ln.depth {
+		return p, .None
+	}
+	top := min(fd + i64(limit), ln.depth)
+	st: Structure
+	if se := structure_load(v, t, floor, &st); se != .None {
+		return p, se
+	}
+	e := Entry{
+		leaf        = lv,
+		leaf_depth  = ln.depth,
+		child_depth = 1,
+	}
+	missing := false
+	if fd > 0 {
+		at, ae := chain_at(v, &st, e, fd)
+		if ae == .Missing {
+			missing = true
+		} else if ae != .None {
+			return p, ae
+		} else if at != fv {
+			return p, .Invalid
+		}
+	}
+	topv := lv
+	if top < ln.depth {
+		at, ae := chain_at(v, &st, e, top)
+		if ae == .Missing {
+			missing = true
+		} else if ae != .None {
+			return p, ae
+		}
+		topv = at
+	}
+	if limit == 0 {
+		p.more = fd < ln.depth
+		return p, .Missing if missing else .None
+	}
+	if missing {
+		_spine_prefetch(v, t, fd + 1, top, floor)
+		return p, .Missing
+	}
+	older := _page_older(v, t, Position{msg = obj.rid(v, topv)}, int(top - fd), allocator) or_return
+	list := make([]Message, len(older.messages), allocator)
+	for m, i in older.messages {
+		list[len(older.messages) - 1 - i] = m
+	}
+	p.messages = list
+	p.next = Position{msg = obj.rid(v, topv)}
+	p.more = top < ln.depth
+	return p, .None
+}
+
+@(private)
+_page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocator := context.allocator) -> (p: Page, err: Error) {
 	cur := Vref{}
 	seal := Vref{}
 	known := false
