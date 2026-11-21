@@ -77,7 +77,6 @@ snapshot_search_models :: proc(w: ^World, n: ^Node, op: ^M_Op) {
 }
 
 check_search_models :: proc(w: ^World, secrets: []string, owners: []int) {
-	m := &w.model
 	for n in w.nodes {
 		if !n.alive || !n.e_open {
 			continue
@@ -101,16 +100,18 @@ check_search_models :: proc(w: ^World, secrets: []string, owners: []int) {
 				}
 			}
 		}
-		for op in m.ops {
-			if op.node != n.idx || !op_happened(op) || len(op.gens) == 0 || op.inc != n.incarnation {
-				continue
-			}
-			for old in op.gens {
-				for nm in names {
-					if nm == old {
-						redaction_finding(w, n, op.obj, "redaction: search %s %s on %s predates redaction op %d and was not retrained", "dictionary" if strings.has_prefix(nm, "zd-") else "codebook", nm, n.name, op.idx)
-					}
+		if n.e.index_open && len(names) > 0 {
+			ix := &n.e.index
+			ix.taint_check = true
+			if terr := search.taint_refresh(ix); terr == .None {
+				if ix.zd_tainted {
+					redaction_finding(w, n, -1, "redaction: search dictionary on %s was trained on redacted content and not retrained (%v)", n.name, names)
 				}
+				if ix.cb_tainted {
+					redaction_finding(w, n, -1, "redaction: search codebook on %s was trained on redacted content and not retrained (%v)", n.name, names)
+				}
+			} else {
+				world_note(w, "%s search taint check: %v", n.name, terr)
 			}
 		}
 		node_after(n)

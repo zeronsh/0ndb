@@ -5,6 +5,7 @@ import "core:slice"
 import "core:strings"
 import "../../src/convo"
 import "../../src/crdt"
+import "../../src/fs"
 import "../../src/journal"
 import eng "../../src/engine"
 import omap "../../src/map"
@@ -533,7 +534,7 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 					if a == op.actor {
 						continue
 					}
-					if op.kind == .Disk_Agent && op.power_crash && unattributed(a) {
+					if op.kind == .Disk_Agent && op.power_crash && fs.is_unattributed(a) {
 						own = true
 						continue
 					}
@@ -1092,9 +1093,12 @@ merged_files :: proc(w: ^World, oi: int, count := false) -> map[string]bool {
 }
 
 @(private = "file")
-_side_has :: proc(spans: []crdt.Op_Span, actor: prim.Id) -> bool {
+_side_has :: proc(spans: []crdt.Op_Span, op: ^M_Op) -> bool {
 	for s in spans {
-		if s.id.actor == actor {
+		if s.id.actor == op.actor {
+			return true
+		}
+		if op.kind == .Disk_Agent && op.power_crash && fs.is_unattributed(s.id.actor) {
 			return true
 		}
 	}
@@ -1131,7 +1135,7 @@ check_conflicts :: proc(w: ^World, oi: int) {
 				if file_base(c.path) != p.a.path {
 					continue
 				}
-				if (_side_has(c.ours, p.a.actor) && _side_has(c.theirs, p.b.actor)) || (_side_has(c.ours, p.b.actor) && _side_has(c.theirs, p.a.actor)) {
+				if (_side_has(c.ours, p.a) && _side_has(c.theirs, p.b)) || (_side_has(c.ours, p.b) && _side_has(c.theirs, p.a)) {
 					found = true
 					break
 				}
@@ -1150,12 +1154,3 @@ file_base :: proc(name: string) -> string {
 	return name
 }
 
-unattributed :: proc(a: prim.Id) -> bool {
-	p := [8]u8{'0', 'n', 'd', 'b', '-', 'u', 'n', 'a'}
-	for i in 0 ..< 8 {
-		if a[i] != p[i] {
-			return false
-		}
-	}
-	return true
-}

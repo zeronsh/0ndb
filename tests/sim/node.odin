@@ -31,6 +31,11 @@ loop_due :: proc(l: ^prim.Loop) -> bool {
 node_start :: proc(n: ^Node) -> bool {
 	w := n.w
 	n.incarnation += 1
+	{
+		context = w.ctx
+		bid := fmt.tprintf("%08x-%04x-4%03x-8%03x-%012x\n", u32(w.cfg.seed), u32(n.idx), u32(n.boot) & 0xfff, u32(n.boot >> 12) & 0xfff, u64(n.boot) * 0x9e3779b1)
+		disk_put_virtual(&n.disk, "/proc/sys/kernel/random/boot_id", transmute([]u8)bid)
+	}
 	rng_init(&n.rng, w.cfg.seed, 1000 + u64(n.idx) * 64 + u64(n.incarnation))
 	rng_init(&n.ids, w.cfg.seed, 9000 + u64(n.idx) * 64 + u64(n.incarnation))
 	if !instance_begin(&n.inst, n.idx) {
@@ -77,6 +82,8 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.write_observer = sim_observer(n)
 	cfg.watcher = sim_watcher(n)
 	cfg.embedder = sim_embedder()
+	cfg.search_options.train_min = w.cfg.train_min
+	cfg.search_options.dict_sample_min = w.cfg.dict_sample_min
 	cfg.durability = .Deferred
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
@@ -184,6 +191,9 @@ node_crashed :: proc(n: ^Node) {
 	context = w.ctx
 	mode := Crash_Mode.Power if rng_chance(&w.fault_rng, 2, 3) else Crash_Mode.Process
 	n.disk.dead = false
+	if mode == .Power {
+		n.boot += 1
+	}
 	world_note(w, "%s crashed at disk op %d (%v)", n.name, n.disk.stats.ops, mode)
 	w.stats.crashes += 1
 	node_kill(n)

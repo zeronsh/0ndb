@@ -1560,3 +1560,27 @@ trace_path :: proc(path: string) -> string {
 	}
 	return out
 }
+
+disk_put_virtual :: proc(d: ^Disk, path: string, data: []u8) {
+	comps := make([dynamic]string, context.temp_allocator)
+	_split(path, &comps)
+	cur := u64(ROOT_INO)
+	for c, i in comps {
+		dir := d.inodes[cur]
+		child, has := dir.entries[c]
+		if !has {
+			kind := Inode_Kind.Dir if i < len(comps) - 1 else Inode_Kind.File
+			n := _inode_new(d, kind, 0o755 if kind == .Dir else 0o444)
+			dir.entries[strings.clone(c, d.allocator)] = n.ino
+			dir.dentries[strings.clone(c, d.allocator)] = n.ino
+			n.nlink = 1
+			child = n.ino
+		}
+		cur = child
+	}
+	n := d.inodes[cur]
+	resize(&n.data, len(data))
+	copy(n.data[:], data)
+	resize(&n.durable, len(data))
+	copy(n.durable[:], data)
+}

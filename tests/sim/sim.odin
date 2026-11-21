@@ -40,6 +40,9 @@ default_config :: proc(seed: u64) -> Config {
 		fault_gap_ms = 2000 + rng_range(&r, 0, 20000),
 		io_rate = u64(rng_range(&r, 200, 5000)) if rng_chance(&r, 1, 5) else 0,
 		byzantine = rng_chance(&r, 1, 6),
+		train_min = 16 + rng_int(&r, 48),
+		bulk = rng_chance(&r, 1, 8),
+		dict_sample_min = 2048 + rng_int(&r, 14336),
 		settle_ms = 200 + rng_range(&r, 0, 1500),
 		trace_limit = 4000,
 	}
@@ -279,7 +282,7 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 		world_destroy(w)
 		free(w, runtime.heap_allocator())
 	}
-	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine)
+	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk)
 	ok := relay_start(&w.relay)
 	for n in w.nodes {
 		ok = ok && node_start(n)
@@ -287,7 +290,7 @@ run_seed :: proc(seed: u64, verbose := false) -> (res: Run_Result) {
 	if ok {
 		ok = setup_spaces(w)
 	}
-	if ok && env_u64("SIM_BULK", 0) != 0 {
+	if ok && env_u64("SIM_BULK", 1 if cfg.bulk else 0) != 0 {
 		setup_bulk(w)
 	}
 	if ok {

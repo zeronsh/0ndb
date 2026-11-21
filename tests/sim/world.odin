@@ -73,6 +73,7 @@ Node :: struct {
 	identity:    osync.Identity,
 	caps:        [8]eng.Cap_Credentials,
 	restart_pending: bool,
+	boot:        u64,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
 	reg:         ^fs.Registry,
@@ -134,6 +135,9 @@ Config :: struct {
 	share_access: eng.Access_Set,
 	io_rate:     u64,
 	byzantine:   bool,
+	train_min:   int,
+	bulk:        bool,
+	dict_sample_min: int,
 	keep_ops:    Filter,
 	keep_faults: Filter,
 }
