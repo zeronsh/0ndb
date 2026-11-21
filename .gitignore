@@ -1,4 +1,8 @@
-/target
+.zig-cache/
+zig-out/
 .0ndb/
+*.0ndb
 node_modules/
 playground/ui/dist/
+*.tsbuildinfo
+skills/
