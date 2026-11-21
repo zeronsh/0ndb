@@ -5,6 +5,7 @@ import "../journal"
 import omap "../map"
 import "../obj"
 import "../prim"
+import osync "../sync"
 
 Op :: enum u8 {
 	None        = 0,
@@ -494,7 +495,11 @@ _redact_seen :: proc(s: ^Session, o: ^Object, vs: int, body: []u8, at: i64) {
 	}
 	hi := min(r.to, journal.replica_length(&tg.data.rep))
 	if hi > from.off {
-		journal.replica_redact(&tg.data.rep, from.off, hi)
+		keys: journal.Key_Provider
+		if tg.tree_ok {
+			keys = osync.keytree_provider(&tg.tree)
+		}
+		journal.replica_redact(&tg.data.rep, from.off, hi, keys)
 	}
 	o.view.segs[from.seg].tail_end = -1
 	_seg_probe(s, o, tg, tg.next.epoch if tg.next != nil else tg.epoch)

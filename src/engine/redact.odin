@@ -294,7 +294,28 @@ _own_puncture :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
 	if t == nil || !_key_live(t, from) {
 		return
 	}
-	if _own_tree_puncture(e, t, from, to) != .None {
+	r := _own_journal_reader(h)
+	if r == nil {
+		return
+	}
+	keep := make([dynamic]i64, context.temp_allocator)
+	pos := from
+	for pos < to {
+		body, next, je := journal.record_at(r, pos)
+		if je == .Redacted {
+			pos = next
+			continue
+		}
+		if je != .None {
+			_log(e, .Warn, "redaction range unreadable; puncture deferred")
+			return
+		}
+		if journal.is_sig(body) {
+			append(&keep, pos)
+		}
+		pos = next
+	}
+	if _own_tree_puncture(e, t, from, to, keep[:]) != .None {
 		return
 	}
 	if err := _own_tree_store(e, t); err == .None {
@@ -393,21 +414,27 @@ _redact_mark_done :: proc(e: ^Engine, key: []u8) {
 }
 
 @(private)
-_redact_finish :: proc(e: ^Engine, h: ^Handle, from, to: i64, target: i64) {
-	r: ^journal.Reader
+_own_journal_reader :: proc(h: ^Handle) -> ^journal.Reader {
 	#partial switch h.kind {
 	case .Conversation:
-		r = &h.cw.core.jr
+		return &h.cw.core.jr if h.w_open else nil
 	case .Map:
-		r = &h.mw.core.jr
+		return &h.mw.core.jr if h.w_open else nil
 	case .Text, .File_Tree:
 		if h.hist == nil || fs.history_wake(h.hist) != .None {
-			return
+			return nil
 		}
 		x := new(journal.Reader, context.temp_allocator)
 		journal.journal_reader(&h.hist.journal, x, context.temp_allocator)
-		r = x
-	case:
+		return x
+	}
+	return nil
+}
+
+@(private)
+_redact_finish :: proc(e: ^Engine, h: ^Handle, from, to: i64, target: i64) {
+	r := _own_journal_reader(h)
+	if r == nil {
 		return
 	}
 	_, _, je := journal.record_at(r, from)

@@ -23,6 +23,7 @@ Remote_Kind :: enum u8 {
 	Segment,
 	Keys,
 	Card,
+	Head,
 }
 
 Remote :: struct {
@@ -37,6 +38,9 @@ Remote :: struct {
 	full:      bool,
 	object:    ^Object,
 	seg:       ^Seg,
+	vlo:       i64,
+	vhi:       i64,
+	tampered:  int,
 }
 
 Seg_Check :: struct {
@@ -48,6 +52,7 @@ Seg :: struct {
 	data:       ^Remote,
 	keys:       ^Remote,
 	next:       ^Remote,
+	head:       ^Remote,
 	probing:    bool,
 	epoch:      u64,
 	tree:       osync.Key_Tree,
@@ -421,6 +426,11 @@ _feed_subscribe :: proc(s: ^Session, from: i64) {
 	}
 	for _, o in s.objects {
 		for sg in o.segs {
+			if sg.head != nil {
+				ph := osync.Feed_Pattern{kind = .Exact}
+				ph.bytes = cast([32]u8)sg.head.id
+				append(&pats, ph)
+			}
 			if !sg.tree_ok {
 				append(&pats, osync.Feed_Pattern{kind = .Exact, bytes = cast([32]u8)sg.keys.id})
 			}
@@ -449,6 +459,8 @@ _remote_get :: proc(s: ^Session, kind: Remote_Kind, scope: ^osync.Scope, device:
 	rm.device = device
 	rm.epoch = epoch
 	rm.relay_len = -1
+	rm.vlo = -1
+	rm.vhi = -1
 	rm.inflight = make([dynamic]journal.Range, s.allocator)
 	h := id
 	path: [2 + 64]u8
@@ -597,6 +609,13 @@ _seen :: proc(s: ^Session, id: osync.Stream_Id, length: i64) {
 				journal.replica_set_length(&rm.rep, length)
 			}
 			_mark(rm)
+			if rm.kind != .Segment && length > _have_end(rm) && len(rm.inflight) == 0 {
+				if rm.follow {
+					_remote_follow(s, rm, false)
+				} else {
+					_remote_tail(s, rm, KEYS_TAIL)
+				}
+			}
 		}
 		return
 	}
@@ -667,11 +686,119 @@ _on_data :: proc(s: ^Session, ev: ^osync.Event) {
 	}
 	switch rm.kind {
 	case .Segment:
+		if rm.seg != nil && rm.seg.in_view {
+			_seg_verify(s, rm.seg)
+		}
 		_mark(rm)
 	case .Keys:
 		_keys_landed(s, rm)
 	case .Card:
 		_card_landed(s, rm)
+	case .Head:
+		_head_landed(s, rm)
+	}
+}
+
+@(private)
+TAMPER_RETRIES :: 3
+
+@(private)
+_tamper_forget :: proc(s: ^Session, rm: ^Remote, from, to: i64) {
+	if to <= from {
+		return
+	}
+	journal.replica_forget(&rm.rep, from, to)
+	rm.vlo = -1
+	rm.vhi = -1
+	rm.tampered += 1
+	if rm.tampered > TAMPER_RETRIES {
+		return
+	}
+	if rm.kind == .Segment {
+		_remote_fetch(s, rm, from, to)
+	} else {
+		_remote_tail(s, rm, to - from)
+	}
+}
+
+@(private)
+_have_from :: proc(rm: ^Remote, at: i64) -> i64 {
+	for h in journal.replica_have(&rm.rep) {
+		if h.from <= at && at <= h.to {
+			return h.from
+		}
+	}
+	return at
+}
+
+@(private)
+_seg_verify :: proc(s: ^Session, sg: ^Seg) {
+	rm := sg.data
+	end := _have_end(rm)
+	if end <= 0 || end != rm.relay_len || !sg.in_view {
+		return
+	}
+	pos := end
+	stop := rm.vhi if rm.vhi >= 0 && rm.vhi <= end else -1
+	low := pos
+	for pos > 0 {
+		if stop >= 0 && pos == stop {
+			pos = rm.vlo
+			low = rm.vlo
+			stop = -1
+			continue
+		}
+		_, off, err := journal.record_before(&sg.jr, pos)
+		#partial switch err {
+		case .None, .Redacted:
+			pos = off
+			low = off
+			continue
+		case .Corrupt, .Forged, .Bad_Offset, .Too_Large:
+			_tamper_forget(s, rm, _have_from(rm, pos), pos)
+			return
+		}
+		break
+	}
+	rm.vlo = low
+	rm.vhi = end
+}
+
+@(private)
+_head_landed :: proc(s: ^Session, rm: ^Remote) {
+	sg := rm.seg
+	if sg == nil || sg.head != rm {
+		return
+	}
+	end := journal.replica_length(&rm.rep)
+	if end <= 0 {
+		return
+	}
+	o := rm.object
+	rd: journal.Reader
+	journal.replica_reader(&rm.rep, &rd, context.temp_allocator)
+	defer journal.reader_close(&rd)
+	key := osync.stream_key(&o.scope, rm.id)
+	defer crypto.zero_explicit(&key, size_of(key))
+	journal.reader_set_keys(&rd, osync.static_provider(&key))
+	body, _, err := journal.record_before(&rd, end)
+	#partial switch err {
+	case .None:
+	case .Missing:
+		_remote_fetch(s, rm, max(end - KEYS_TAIL, 0), end)
+		return
+	case .Corrupt, .Forged, .Bad_Offset, .Too_Large:
+		_tamper_forget(s, rm, 0, _have_end(rm))
+		return
+	case:
+		return
+	}
+	if len(body) != 9 || body[0] != osync.KEYS_HEAD_RECORD {
+		return
+	}
+	epoch := prim.get_u64le(body[1:])
+	if epoch > sg.epoch {
+		_seg_rekey(s, sg, epoch)
 	}
 }
 
@@ -823,6 +950,9 @@ _object_close :: proc(s: ^Session, o: ^Object) {
 		prim.remove(s.vfs, _epoch_path(sg.data, &ebuf))
 		_remote_drop(s, sg.data)
 		_remote_drop(s, sg.keys)
+		if sg.head != nil {
+			_remote_drop(s, sg.head)
+		}
 		if sg.next != nil {
 			_remote_drop(s, sg.next)
 		}
@@ -891,6 +1021,16 @@ _seg_add :: proc(s: ^Session, o: ^Object, device: prim.Id) -> ^Seg {
 		_remote_follow(s, rm, false)
 	}
 	_seg_keys(s, o, sg, _epoch_load(s, rm))
+	hn, _ := osync.keys_head_name(_keys_name(o.name))
+	hm := _remote_get(s, .Head, &o.scope, device, hn, 0)
+	hm.object = o
+	hm.seg = sg
+	sg.head = hm
+	if _have_end(hm) > 0 {
+		_head_landed(s, hm)
+	}
+	_remote_tail(s, hm, KEYS_TAIL)
+	_remote_follow(s, hm, false)
 	_card_want(s, device)
 	o.changed = true
 	return sg
@@ -1006,6 +1146,11 @@ _keys_landed :: proc(s: ^Session, rm: ^Remote) {
 	defer crypto.zero_explicit(&key, size_of(key))
 	journal.reader_set_keys(&rd, osync.static_provider(&key))
 	body, _, err := journal.record_before(&rd, end)
+	#partial switch err {
+	case .Corrupt, .Forged, .Bad_Offset, .Too_Large:
+		_tamper_forget(s, rm, 0, _have_end(rm))
+		return
+	}
 	if err != .None {
 		if err == .Missing {
 			_remote_fetch(s, rm, max(end - KEYS_TAIL, 0), end)
@@ -1052,16 +1197,18 @@ _card_want :: proc(s: ^Session, device: prim.Id) {
 	s.cards[device] = rm
 	if _have_end(rm) > 0 {
 		_card_landed(s, rm)
-		if device in s.identities {
-			return
-		}
 	}
 	_remote_tail(s, rm, CARD_TAIL)
+	_remote_follow(s, rm, false)
 }
 
 @(private)
+CARD_RECORD :: u8(1)
+
+@(private)
 _card_landed :: proc(s: ^Session, rm: ^Remote) {
-	if rm.device in s.identities || journal.replica_length(&rm.rep) == 0 {
+	n := journal.replica_length(&rm.rep)
+	if n == 0 {
 		return
 	}
 	sc := _card_scope(s)
@@ -1072,24 +1219,40 @@ _card_landed :: proc(s: ^Session, rm: ^Remote) {
 	key := osync.stream_key(&sc, rm.id)
 	defer crypto.zero_explicit(&key, size_of(key))
 	journal.reader_set_keys(&rd, osync.static_provider(&key))
-	body, _, err := journal.record_at(&rd, 0)
-	if err == .Missing {
-		_remote_fetch(s, rm, 0, min(journal.replica_length(&rm.rep), CARD_TAIL))
-		return
+	pos: i64
+	learned := make([dynamic]prim.Id, context.temp_allocator)
+	for pos < n {
+		body, next, err := journal.record_at(&rd, pos)
+		#partial switch err {
+		case .None:
+		case .Corrupt, .Forged, .Bad_Offset, .Too_Large:
+			_tamper_forget(s, rm, pos, _have_end(rm))
+			return
+		case .Missing:
+			_remote_fetch(s, rm, pos, n)
+		}
+		if err != .None {
+			break
+		}
+		card := body[1:] if len(body) == 1 + osync.CARD_LEN && body[0] == CARD_RECORD else body
+		id, cerr := osync.card_verify(card)
+		if pos == 0 && (cerr != .None || id.id != rm.device) {
+			return
+		}
+		pos = next
+		if cerr != .None || id.id in s.identities {
+			continue
+		}
+		s.identities[id.id] = id
+		append(&learned, id.id)
 	}
-	if err != .None {
-		return
-	}
-	id, cerr := osync.card_verify(body)
-	if cerr != .None || id.id != rm.device {
-		return
-	}
-	s.identities[rm.device] = id
-	for _, o in s.objects {
-		for sg in o.segs {
-			if sg.device == rm.device {
-				_seg_enter(s, o, sg)
-				o.changed = true
+	for dev in learned {
+		for _, o in s.objects {
+			for sg in o.segs {
+				if sg.device == dev {
+					_seg_enter(s, o, sg)
+					o.changed = true
+				}
 			}
 		}
 	}
@@ -1117,6 +1280,7 @@ _seg_enter :: proc(s: ^Session, o: ^Object, sg: ^Seg) {
 	}
 	sg.in_view = true
 	o.changed = true
+	_seg_verify(s, sg)
 }
 
 @(private)

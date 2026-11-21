@@ -346,6 +346,10 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		if id, kind, ok := _object_of_name(ev.name); ok {
 			_member_seen(e, sp, id, kind, ev.device)
 		}
+	case .Keys_Needed:
+		if id, _, ok := _object_of_name(ev.name); ok {
+			_keys_needed(e, sp, id, ev.device, ev.name)
+		}
 	case .Epoch_Seen:
 		if seg, ok := _keys_target(ev.name); ok {
 			if id, _, ok2 := _object_of_name(seg); ok2 {
@@ -440,25 +444,44 @@ _member_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, device: pr
 @(private)
 _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, seg: string, epoch: u64) {
 	rec, found, err := _rec_get(e, id)
-	if err != .None || !found {
+	if err != .None {
 		return
 	}
-	i := _rec_member(&rec, device)
-	if i < 0 || rec.members[i].keys_epoch >= epoch {
-		return
+	if found {
+		if i := _rec_member(&rec, device); i >= 0 {
+			if rec.members[i].keys_epoch >= epoch {
+				return
+			}
+			rec.members[i].keys_epoch = epoch
+			_rec_put(e, id, &rec)
+		}
 	}
-	rec.members[i].keys_epoch = epoch
-	_rec_put(e, id, &rec)
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
 	stream := osync.stream_id(&sc, device, seg, 0)
-	if rt, ok := sp.remote_trees[stream]; ok {
-		_remote_tree_get(e, sp, &sc, device, seg, epoch)
+	_, had := sp.remote_trees[stream]
+	rt, terr := _remote_tree_get(e, sp, &sc, device, seg, epoch)
+	if terr == .None && had {
 		if h, hok := e.handles[id]; hok {
 			_handle_rekey(h, device, rt)
 		}
 	}
 	_object_changed(e, sp.id, id, .Keys)
+}
+
+@(private)
+_keys_needed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, seg: string) {
+	epoch: u64
+	if rec, found, _ := _rec_get(e, id); found {
+		if i := _rec_member(&rec, device); i >= 0 {
+			epoch = rec.members[i].keys_epoch
+		}
+	}
+	sc := _object_scope(sp, id)
+	defer osync.scope_clear(&sc)
+	if rt, err := _remote_tree_get(e, sp, &sc, device, seg, epoch); err == .None && rt.loaded {
+		osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
+	}
 }
 
 @(private)

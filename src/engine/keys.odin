@@ -117,8 +117,8 @@ _own_tree_uploaded :: proc(e: ^Engine, stream: osync.Stream_Id, length: i64) {
 }
 
 @(private)
-_own_tree_puncture :: proc(e: ^Engine, t: ^Own_Tree, from, to: i64) -> Error {
-	_serr(osync.keytree_puncture(&t.tree, from, to)) or_return
+_own_tree_puncture :: proc(e: ^Engine, t: ^Own_Tree, from, to: i64, keep: []i64) -> Error {
+	_serr(osync.keytree_puncture_except(&t.tree, from, to, keep)) or_return
 	t.dirty = true
 	_touch(e)
 	return .None
