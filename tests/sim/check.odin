@@ -793,7 +793,7 @@ dump_replication :: proc(w: ^World) {
 				return a.name < b.name || (a.name == b.name && id_less(a.device, b.device))
 			})
 			for rm in rms {
-				world_note(w, "  remote dev=%s %s relay_len=%d tail=%d rep_len=%d have=%v wants=%v inflight=%v follow=%v full=%v quar=%v held=%d pulled=%d pulling=%v refs=%d probing=%v keys_wait=%v base=%d pulls=%v unavail=%v", id_short(rm.device), rm.name, rm.relay_len, rm.tail, rm.rep.length, rm.rep.have[:], rm.wants[:], rm.inflight[:], rm.follow, rm.full, rm.quarantined, rm.held, rm.pulled, rm.pulling, rm.refs, rm.probing, rm.keys_wait, rm.base, rm.pulls[:], rm.unavail)
+				world_note(w, "  remote dev=%s %s relay_len=%d tail=%d rep_len=%d have=%v wants=%v inflight=%v follow=%v full=%v quar=%v held=%d pulled=%d pulling=%v refs=%d probing=%v keys_wait=%v kheld=%d base=%d pulls=%v unavail=%v", id_short(rm.device), rm.name, rm.relay_len, rm.tail, rm.rep.length, rm.rep.have[:], rm.wants[:], rm.inflight[:], rm.follow, rm.full, rm.quarantined, rm.held, rm.pulled, rm.pulling, rm.refs, rm.probing, rm.keys_wait, len(rm.kheld), rm.base, rm.pulls[:], rm.unavail)
 			}
 			lls := make([dynamic]^osync.Local, context.temp_allocator)
 			for _, l in r.locals {
