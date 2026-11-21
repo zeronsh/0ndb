@@ -1,5 +1,6 @@
 package fs
 
+import "base:intrinsics"
 import "core:sys/linux"
 import "../prim"
 
@@ -43,4 +44,12 @@ clone_file :: proc(vfs: prim.Vfs, src, dst: string, mode: u32) -> Error {
 	}
 	linux.ftruncate(out_fd, 0)
 	return copy_file_vfs(vfs, src, dst, mode)
+}
+
+@(private)
+HAS_SYNCFS :: true
+
+@(private)
+os_syncfs :: proc(fd: prim.Fd) -> bool {
+	return int(intrinsics.syscall(linux.SYS_syncfs, uintptr(fd))) >= 0
 }

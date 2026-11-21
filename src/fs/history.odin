@@ -61,19 +61,7 @@ History_Options :: struct {
 	keep_at_least: i64,
 	clock:         Clock,
 	random:        prim.Random,
-	sync:          Sync_Hook,
-}
-
-Sync_Hook :: struct {
-	data: rawptr,
-	call: proc(data: rawptr) -> bool,
-}
-
-history_sync :: proc(h: ^History) -> Error {
-	if h.opts.sync.call != nil && !h.opts.sync.call(h.opts.sync.data) {
-		return .Io
-	}
-	return .None
+	deferred:      bool,
 }
 
 History :: struct {
@@ -103,6 +91,9 @@ History :: struct {
 	touched:    [dynamic]fstree.Inode_Id,
 	touched_set: map[fstree.Inode_Id]struct{},
 	src_err:    Error,
+	durable:    u64,
+	mark:       u64,
+	mounts:     [dynamic]^Mount,
 	pins:       [dynamic]odb.Oid,
 	lvidx:      prim.Fd,
 	lvidx_n:    u64,
@@ -124,6 +115,7 @@ history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self:
 		return .No_Memory
 	}
 	h.dir = d
+	h.mounts = make([dynamic]^Mount, allocator)
 	if err := history_wake(h); err != .None {
 		delete(h.dir, allocator)
 		h.dir = ""
@@ -200,8 +192,28 @@ history_id_new :: proc(h: ^History) -> prim.Id {
 	return prim.id_new_with(c, h.opts.random)
 }
 
+history_durable_mark :: proc "contextless" (h: ^History) -> u64 {
+	return h.mark
+}
+
+history_durable :: proc(h: ^History, mark: u64) -> Error {
+	if mark <= h.durable {
+		return .None
+	}
+	h.durable = min(mark, h.mark)
+	err: Error
+	for m in h.mounts {
+		if e := mount_ack(m); e != .None && err == .None {
+			err = e
+		}
+	}
+	return err
+}
+
 history_close :: proc(h: ^History) {
 	history_sleep(h)
+	delete(h.mounts)
+	h.mounts = nil
 	delete(h.dir, h.allocator)
 	h.dir = ""
 }
@@ -1107,22 +1119,26 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 	for t in targets {
 		ino := op_inode(h, t)
 		f := history_file(h, ino) or_return
+		if f.from_cp && !descends_from_cp(h, f, b) {
+			prev := make([dynamic]crdt.Lv, context.temp_allocator)
+			append(&prev, ..f.text.version[:])
+			load_text(h, f, prev[:], true) or_return
+		}
 		append(&f.new_refs, Op_Ref{stream, off, u32(skip), u32(n)})
 		f.dirty = true
 		note_touched(h, ino)
-		if f.from_cp && !descends_from_cp(h, f, b) {
-			load_text(h, f, h.g.heads[:], true) or_return
-			continue
-		}
 		crdt.log_add_batch(&f.log, &h.g, b, t, first, skip)
 	}
 	lvidx_add(h, first, n - skip, stream, off)
 	apply_tree_ops(h, b, first, skip, stream, off) or_return
 	for t in targets {
-		f := h.files[op_inode(h, t)]
-		if e := crdt.text_merge(&f.text, &h.g, &f.log, h.g.heads[:]); e != .None {
+		ino := op_inode(h, t)
+		f := h.files[ino]
+		found := make([dynamic]crdt.Conflict, context.temp_allocator)
+		if e := crdt.text_merge(&f.text, &h.g, &f.log, h.g.heads[:], &found); e != .None {
 			return .Corrupt
 		}
+		record_text_conflicts(h, ino, found[:]) or_return
 	}
 	return .None
 }

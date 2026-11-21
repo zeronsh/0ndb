@@ -233,6 +233,9 @@ Mount :: struct {
 	root_wd:     i32,
 	watched:     bool,
 	restoring:   bool,
+	img:         Mount_Image,
+	mat:         ^Mat_Sync,
+	waits:       [dynamic]Mount_Wait,
 	open_scopes: map[string]^Scope,
 	intents:     [dynamic]Intent,
 	imported:    bool,
@@ -361,7 +364,12 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	}
 	m.lock_fd = fd
 	m.git, m.has_git = git_locate(m.vfs, m.root, allocator)
+	m.waits = make([dynamic]Mount_Wait, allocator)
 	fresh := load_mount_state(m) or_return
+	image_take(m, &m.img)
+	if h != nil {
+		append(&h.mounts, m)
+	}
 	slot := -1
 	for x, i in reg.mounts {
 		if x == nil {
@@ -377,6 +385,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	}
 	m.slot = slot
 	mount_wake(m) or_return
+	m.shadow.hold = mount_deferred(m)
 	mount_git_sources(m) or_return
 	if fresh {
 		save_mount_state(m) or_return
@@ -414,6 +423,38 @@ mount_git_sources :: proc(m: ^Mount) -> Error {
 	return .None
 }
 
+@(private)
+Lost_Range :: struct {
+	actor: u32,
+	from:  u64,
+	to:    u64,
+}
+
+@(private)
+drop_lost :: proc(m: ^Mount, dir: string, lost: []Lost_Range) -> Error {
+	heap := runtime.heap_allocator()
+	kids := make([dynamic]Shadow_Child, heap)
+	defer {
+		shadow_children_free(kids[:], heap)
+		delete(kids)
+	}
+	shadow_children(&m.shadow, dir, &kids, heap) or_return
+	for k in kids {
+		child, _ := path_join(dir, k.name, heap)
+		defer delete(child, heap)
+		if k.entry.kind == .Dir {
+			drop_lost(m, child, lost) or_return
+		}
+		for r in lost {
+			if k.entry.inode.actor == r.actor && k.entry.inode.seq >= r.from && k.entry.inode.seq < r.to {
+				shadow_remove(&m.shadow, child) or_return
+				break
+			}
+		}
+	}
+	return .None
+}
+
 mount_close :: proc(m: ^Mount) {
 	if m.awake && len(m.dirty) > 0 {
 		mount_pass(m, false)
@@ -445,6 +486,19 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.fences)
 	delete(m.intents)
+	if m.history != nil {
+		for x, i in m.history.mounts {
+			if x == m {
+				unordered_remove(&m.history.mounts, i)
+				break
+			}
+		}
+	}
+	for &w in m.waits {
+		image_free(m, &w.img)
+	}
+	delete(m.waits)
+	image_free(m, &m.img)
 	for u in m.unwatched {
 		delete(u, m.allocator)
 	}
@@ -512,10 +566,10 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	if !m.awake {
 		return .None
 	}
-	if len(m.dirty) > 0 || m.rescan {
+	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 {
 		return .Busy
 	}
-	err := shadow_persist(&m.shadow)
+	err := shadow_flush(m)
 	save_mount_state(m)
 	shadow_detach(&m.shadow)
 	ignore_destroy(&m.ignore)
@@ -933,27 +987,125 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	return false, .None
 }
 
+Mount_Image :: struct {
+	synced:     [dynamic]crdt.Op_Id,
+	branch:     string,
+	commit:     string,
+	reflog_pos: i64,
+	stamp:      Index_Stamp,
+	imported:   bool,
+}
+
+Mount_Wait :: struct {
+	mark: u64,
+	img:  Mount_Image,
+}
+
+@(private)
+image_take :: proc(m: ^Mount, img: ^Mount_Image) {
+	image_free(m, img)
+	img.synced = make([dynamic]crdt.Op_Id, m.allocator)
+	append(&img.synced, ..m.synced[:])
+	img.branch, _ = clone_string(m.head.branch, m.allocator)
+	img.commit, _ = clone_string(m.head.commit, m.allocator)
+	img.reflog_pos = m.reflog_pos
+	img.stamp = m.stamp
+	img.imported = m.imported
+}
+
+@(private)
+image_free :: proc(m: ^Mount, img: ^Mount_Image) {
+	delete(img.synced)
+	delete(img.branch, m.allocator)
+	delete(img.commit, m.allocator)
+	img^ = {}
+}
+
+@(private)
+mount_deferred :: proc "contextless" (m: ^Mount) -> bool {
+	return m.history != nil && m.history.opts.deferred
+}
+
+@(private)
+shadow_flush :: proc(m: ^Mount) -> Error {
+	held := m.shadow.hold
+	m.shadow.hold = false
+	defer m.shadow.hold = held
+	return shadow_persist(&m.shadow)
+}
+
+mount_settle :: proc(m: ^Mount) -> Error {
+	if !mount_deferred(m) {
+		shadow_flush(m) or_return
+		clear(&m.intents)
+		return save_mount_state(m)
+	}
+	h := m.history
+	h.mark += 1
+	w := Mount_Wait{mark = h.mark}
+	image_take(m, &w.img)
+	append(&m.waits, w)
+	m.shadow.hold = true
+	return save_mount_state(m)
+}
+
+@(private)
+mount_ack :: proc(m: ^Mount) -> Error {
+	h := m.history
+	n := 0
+	for n < len(m.waits) && m.waits[n].mark <= h.durable {
+		n += 1
+	}
+	if n == 0 {
+		return .None
+	}
+	image_free(m, &m.img)
+	m.img = m.waits[n - 1].img
+	for i in 0 ..< n - 1 {
+		image_free(m, &m.waits[i].img)
+	}
+	remove_range(&m.waits, 0, n)
+	if len(m.waits) == 0 && m.awake {
+		shadow_flush(m) or_return
+		clear(&m.intents)
+	}
+	return save_mount_state(m)
+}
+
 save_mount_state :: proc(m: ^Mount) -> Error {
+	live := Mount_Image {
+		branch     = m.head.branch,
+		commit     = m.head.commit,
+		reflog_pos = m.reflog_pos,
+		stamp      = m.stamp,
+		imported   = m.imported,
+	}
+	synced := m.synced[:]
+	img := &live
+	if mount_deferred(m) {
+		img = &m.img
+		synced = m.img.synced[:]
+	}
 	buf := make([dynamic]u8, context.temp_allocator)
 	vb := make([dynamic]u8, context.temp_allocator)
-	encode_version(&vb, m.synced[:])
+	encode_version(&vb, synced)
 	w := prim.writer(&buf)
 	prim.write_u8(&w, 1)
 	prim.write_id(&w, m.actor)
 	prim.write_bytes(&w, vb[:])
-	prim.write_str(&w, m.head.branch)
-	prim.write_str(&w, m.head.commit)
-	prim.write_ivarint(&w, m.reflog_pos)
-	prim.write_ivarint(&w, m.stamp.mtime_ns)
-	prim.write_ivarint(&w, m.stamp.size)
-	prim.write_uvarint(&w, m.stamp.ino)
+	prim.write_str(&w, img.branch)
+	prim.write_str(&w, img.commit)
+	prim.write_ivarint(&w, img.reflog_pos)
+	prim.write_ivarint(&w, img.stamp.mtime_ns)
+	prim.write_ivarint(&w, img.stamp.size)
+	prim.write_uvarint(&w, img.stamp.ino)
 	prim.write_uvarint(&w, u64(len(m.intents)))
 	for it in m.intents {
 		prim.write_id(&w, it.actor)
 		prim.write_uvarint(&w, it.seq)
 		prim.write_uvarint(&w, it.n)
 	}
-	prim.write_bool(&w, m.imported)
+	prim.write_bool(&w, img.imported)
 	p, _ := path_join(m.dir, "mount", context.temp_allocator)
 	return from_prim(prim.replace_atomic(m.vfs, p, buf[:]))
 }
@@ -965,14 +1117,20 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	h := m.history
 	last: Maybe(crdt.Op_Id)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	lost := make([dynamic]Lost_Range, context.temp_allocator)
 	for it in m.intents {
 		lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq})
 		if !ok {
-			break
+			append(&lost, Lost_Range{crdt.graph_intern(&h.g, it.actor), it.seq, it.seq + it.n})
+			continue
 		}
 		spans := []crdt.Lv_Span{{lv = lv, len = int(it.n)}}
 		spans_touched(h, spans, &touched) or_return
 		last = crdt.Op_Id{it.actor, it.seq + it.n - 1}
+	}
+	if len(lost) > 0 {
+		drop_lost(m, "", lost[:]) or_return
+		shadow_flush(m) or_return
 	}
 	if l, ok := last.?; ok {
 		snap := fstree.current(&h.tree)
@@ -997,12 +1155,13 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			}
 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
-		shadow_persist(&m.shadow) or_return
+		shadow_flush(m) or_return
 		clear(&m.synced)
 		append(&m.synced, l)
 	}
 	clear(&m.intents)
 	history_trim(h)
+	image_take(m, &m.img)
 	return save_mount_state(m)
 }
 

@@ -108,18 +108,123 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 		bm := b.has_old && b.old != b.path
 		return am && !bm
 	})
+	ms := Mat_Sync {
+		files = make([dynamic]string, context.temp_allocator),
+		dirs  = make(map[string]bool, context.temp_allocator),
+	}
+	m.mat = &ms
+	defer m.mat = nil
 	for &it in items {
 		materialize_one(m, &it, tl[:]) or_return
 	}
-	history_sync(m.history) or_return
-	shadow_persist(&m.shadow) or_return
-	clear(&m.intents)
+	mat_barrier(m, &ms) or_return
 	if !m.restoring {
 		clear(&m.synced)
 		append(&m.synced, ..target)
 	}
 	history_trim(h)
-	return save_mount_state(m)
+	return mount_settle(m)
+}
+
+Mat_Sync :: struct {
+	files: [dynamic]string,
+	dirs:  map[string]bool,
+}
+
+@(private)
+MAT_SYNCFS_THRESHOLD :: 128
+
+@(private)
+mat_file :: proc(m: ^Mount, abs: string) {
+	if m.mat == nil {
+		return
+	}
+	p, _ := clone_string(abs, context.temp_allocator)
+	append(&m.mat.files, p)
+	mat_dir(m, path_parent_abs(abs))
+}
+
+@(private)
+mat_dir :: proc(m: ^Mount, dir: string) {
+	if m.mat == nil || m.mat.dirs[dir] {
+		return
+	}
+	d, _ := clone_string(dir, context.temp_allocator)
+	m.mat.dirs[d] = true
+}
+
+@(private)
+mat_ancestors :: proc(m: ^Mount, abs: string) {
+	if m.mat == nil {
+		return
+	}
+	p := path_parent_abs(abs)
+	for len(p) >= len(m.root) {
+		mat_dir(m, p)
+		if len(p) == len(m.root) {
+			break
+		}
+		p = path_parent_abs(p)
+	}
+}
+
+@(private)
+mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
+	if len(ms.files) == 0 && len(ms.dirs) == 0 {
+		return .None
+	}
+	os := m.vfs.procs == prim.os_vfs().procs
+	if HAS_SYNCFS && os && len(ms.files) + len(ms.dirs) > MAT_SYNCFS_THRESHOLD {
+		if fd, e := prim.open_file(m.vfs, m.root, {.Directory}); e == .None {
+			ok := os_syncfs(fd)
+			prim.close_file(m.vfs, fd)
+			if ok {
+				return .None
+			}
+		}
+	}
+	darwin_batch := ODIN_OS == .Darwin && os
+	last := prim.INVALID_FD
+	defer if last != prim.INVALID_FD {
+		prim.close_file(m.vfs, last)
+	}
+	keep :: proc(m: ^Mount, last: ^prim.Fd, fd: prim.Fd) {
+		if last^ != prim.INVALID_FD {
+			prim.close_file(m.vfs, last^)
+		}
+		last^ = fd
+	}
+	for f in ms.files {
+		fd, e := prim.open_file(m.vfs, f)
+		if e == .Not_Found {
+			continue
+		}
+		from_prim(e) or_return
+		se := prim.fullsync(m.vfs, fd) if darwin_batch else prim.datasync(m.vfs, fd)
+		if se != .None {
+			prim.close_file(m.vfs, fd)
+			return from_prim(se)
+		}
+		keep(m, &last, fd)
+	}
+	dirs := sorted_strings(ms.dirs)
+	for d in dirs {
+		fd, e := prim.open_file(m.vfs, d, {.Directory})
+		if e == .Not_Found {
+			continue
+		}
+		from_prim(e) or_return
+		se := prim.fullsync(m.vfs, fd)
+		if se != .None && se != .Invalid {
+			prim.close_file(m.vfs, fd)
+			return from_prim(se)
+		}
+		keep(m, &last, fd)
+	}
+	if darwin_batch && last != prim.INVALID_FD {
+		from_prim(prim.datasync(m.vfs, last)) or_return
+	}
+	return .None
 }
 
 @(private)
@@ -241,6 +346,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		} else {
 			prim.remove(m.vfs, abs)
 		}
+		mat_dir(m, path_parent_abs(abs))
 		return .None if m.restoring else shadow_remove(&m.shadow, it.old)
 	}
 	abs := abs_path(m, it.path, abuf[:])
@@ -255,6 +361,8 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		if err := prim.rename(m.vfs, oabs, abs); err != .None && err != .Not_Found {
 			return from_prim(err)
 		}
+		mat_dir(m, path_parent_abs(oabs))
+		mat_ancestors(m, abs)
 		if m.restoring {
 		} else if it.kind == .Dir {
 			move_shadow_tree(m, it.old, it.path) or_return
@@ -274,6 +382,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		if err := prim.mkdir(m.vfs, abs, 0o755); err != .None && err != .Exists {
 			return from_prim(err)
 		}
+		mat_ancestors(m, abs)
 		if !m.restoring {
 			watch_dir(m.reg, m, it.path, -1)
 		}
@@ -283,6 +392,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		prim.remove(m.vfs, tmp)
 		from_prim(prim.symlink(m.vfs, it.target, tmp)) or_return
 		from_prim(prim.rename(m.vfs, tmp, abs)) or_return
+		mat_ancestors(m, abs)
 		if m.db != nil {
 			e.oid, _ = odb.hash(m.db.format, .Blob, transmute([]u8)it.target)
 		}
@@ -325,6 +435,8 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 			return from_odb(serr) if serr != .None else sink.err
 		}
 		from_prim(prim.rename(m.vfs, tmp, abs)) or_return
+		mat_file(m, abs)
+		mat_ancestors(m, abs)
 		e.oid = odb.Oid(reg.oid)
 		return .None
 	}
@@ -349,6 +461,8 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 		return from_prim(werr)
 	}
 	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
+	mat_file(m, abs)
+	mat_ancestors(m, abs)
 	e.oid = oid
 	return .None
 }

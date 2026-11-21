@@ -76,6 +76,7 @@ Rec :: struct {
 }
 
 Shadow :: struct {
+	hold:       bool,
 	vfs:        prim.Vfs,
 	dir:        string,
 	allocator:  runtime.Allocator,
@@ -398,7 +399,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
-	if len(s.pending) == 0 {
+	if len(s.pending) == 0 || s.hold {
 		return .None
 	}
 	if s.log_fd < 0 {

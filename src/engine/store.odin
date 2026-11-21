@@ -63,6 +63,13 @@ Durable_Batch :: struct {
 	segs:  [dynamic]Dirty_Seg,
 	meta:  bool,
 	cards: [dynamic]Card_Pub,
+	marks: [dynamic]Hist_Mark,
+}
+
+@(private)
+Hist_Mark :: struct {
+	object: prim.Id,
+	mark:   u64,
 }
 
 @(private)
@@ -366,6 +373,12 @@ _durable_begin :: proc(e: ^Engine) {
 	e.reg.meta = false
 	b.cards = e.card_pubs
 	e.card_pubs = make([dynamic]Card_Pub, e.allocator)
+	b.marks = make([dynamic]Hist_Mark, e.allocator)
+	for h in e.lru {
+		if h.hist != nil && fs.history_durable_mark(h.hist) > h.hist.durable {
+			append(&b.marks, Hist_Mark{h.id, fs.history_durable_mark(h.hist)})
+		}
+	}
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
 	append(&e.batches, b)
 	e.stats.commits += 1
@@ -393,6 +406,7 @@ _durable_begin :: proc(e: ^Engine) {
 			}
 			delete(e.card_pubs)
 			e.card_pubs = b.cards
+			delete(b.marks)
 			free(b, e.allocator)
 			return
 		}
@@ -451,6 +465,13 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		for c in b.cards {
 			_card_pub_durable(e, c)
 		}
+		for m in b.marks {
+			if h, ok := e.handles[m.object]; ok && h.hist != nil {
+				if derr := fs.history_durable(h.hist, m.mark); derr != .None {
+					_log(e, .Warn, "mount state persist failed")
+				}
+			}
+		}
 		if len(b.segs) > 0 || b.meta {
 			_emit(e, Event{kind = .Durable, tick = b.tick})
 		}
@@ -465,6 +486,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	}
 	delete(b.segs)
 	delete(b.cards)
+	delete(b.marks)
 	free(b, e.allocator)
 }
 

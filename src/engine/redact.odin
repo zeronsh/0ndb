@@ -116,67 +116,6 @@ _derived_purge :: proc(e: ^Engine, h: ^Handle) {
 }
 
 @(private)
-_relay_zeroed_stream :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, to: i64) {
-	device := osync.stream_device(stream)
-	id: prim.Id
-	kind: Kind
-	epoch: u64
-	found := false
-	if rm, ok := sp.repl.remotes[stream]; ok {
-		id, kind, found = _object_of_name(rm.name)
-		epoch = rm.epoch
-	} else {
-		Acc :: struct {
-			e:      ^Engine,
-			sp:     ^Space,
-			stream: osync.Stream_Id,
-			device: prim.Id,
-			id:     prim.Id,
-			kind:   Kind,
-			found:  bool,
-		}
-		acc := Acc{e = e, sp = sp, stream = stream, device = device}
-		visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
-			a := (^Acc)(data)
-			if len(key) != 16 {
-				return true
-			}
-			rec, err := _rec_decode(value, context.temp_allocator)
-			if err != .None || rec.space != a.sp.id || (rec.kind != .Map && rec.kind != .Conversation) || _rec_member(&rec, a.device) < 0 {
-				return true
-			}
-			x: prim.Id
-			copy(x[:], key)
-			sc := _object_scope(a.sp, x)
-			defer osync.scope_clear(&sc)
-			if osync.stream_id(&sc, a.device, _seg_name(rec.kind, x), 0) != a.stream {
-				return true
-			}
-			a.id, a.kind, a.found = x, rec.kind, true
-			return false
-		}
-		for k, v in e.reg.staged {
-			x := k
-			if !visit(&acc, x[:], v) {
-				break
-			}
-		}
-		if !acc.found {
-			omap.db_scan(&e.reg.db, ROOT_OBJECTS, nil, nil, &acc, visit)
-		}
-		id, kind, found = acc.id, acc.kind, acc.found
-	}
-	if !found {
-		return
-	}
-	sc := _object_scope(sp, id)
-	defer osync.scope_clear(&sc)
-	osync.replicator_zero_replica(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to)
-	_relay_zeroed(e, sp, id, kind)
-	_object_changed(e, sp.id, id, .Redacted)
-}
-
-@(private)
 _relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
 	if kind != .Map && kind != .Conversation {
 		return
@@ -236,6 +175,7 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 			if i := obj.view_find(&h.view, r.seg); i >= 0 {
 				h.view.segs[i].tail_end = -1
 			}
+			_relay_redact_add(e, h, r.seg, r.from, r.to)
 		}
 	}
 	oids := make([dynamic]odb.Oid, context.temp_allocator)
@@ -263,34 +203,39 @@ _own_redacted :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
 			_dirty_keys(e, h.sp, h.id, h.kind, h.scope, h.own_tree)
 		}
 	}
-	_relay_redact_add(e, h, from, to)
+	_relay_redact_add(e, h, e.self, from, to)
 }
 
 @(private)
-_relay_key :: proc(space: prim.Id, object: prim.Id, from: i64) -> (k: [40]u8) {
+_relay_key :: proc(e: ^Engine, space: prim.Id, object: prim.Id, device: prim.Id, from: i64) -> (k: [56]u8, n: int) {
 	a, b := space, object
 	copy(k[:16], a[:])
 	copy(k[16:32], b[:])
-	prim.put_u64le(k[32:], u64(from))
-	return
+	prim.put_u64le(k[32:40], u64(from))
+	if device == e.self {
+		return k, 40
+	}
+	d := device
+	copy(k[40:56], d[:])
+	return k, 56
 }
 
 @(private)
-_relay_redact_add :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
-	k := _relay_key(h.sp.id, h.id, from)
+_relay_redact_add :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64) {
+	k, n := _relay_key(e, h.sp.id, h.id, device, from)
 	v: [9]u8
 	v[0] = u8(h.kind)
 	prim.put_u64le(v[1:], u64(to))
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr == .None {
-		if omap.txn_put(t, ROOT_REDACT, k[:], v[:]) == .None {
+		if omap.txn_put(t, ROOT_REDACT, k[:n], v[:]) == .None {
 			omap.txn_commit(t)
 		} else {
 			omap.txn_abort(t)
 		}
 	}
 	if h.sp.repl_on && h.sp.connected {
-		osync.replicator_redact(&h.sp.repl, &h.scope, e.self, h.name, 0, from, to)
+		osync.replicator_redact(&h.sp.repl, &h.scope, device, h.name, 0, from, to)
 	}
 	_object_changed(e, h.sp.id, h.id, .Redacted)
 }
@@ -305,17 +250,21 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 	acc := Acc{e, sp, object}
 	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		a := (^Acc)(data)
-		if len(key) != 40 || len(value) != 9 || value[0] < 1 || value[0] > u8(max(Kind)) {
+		if (len(key) != 40 && len(key) != 56) || len(value) != 9 || value[0] < 1 || value[0] > u8(max(Kind)) {
 			return true
 		}
 		id: prim.Id
 		copy(id[:], key[16:32])
-		from := i64(prim.get_u64le(key[32:]))
+		device := a.e.self
+		if len(key) == 56 {
+			copy(device[:], key[40:56])
+		}
+		from := i64(prim.get_u64le(key[32:40]))
 		to := i64(prim.get_u64le(value[1:]))
 		sc := _object_scope(a.sp, id)
 		defer osync.scope_clear(&sc)
 		name := _seg_name(Kind(value[0]), id)
-		osync.replicator_redact(&a.sp.repl, &sc, a.e.self, name, 0, from, to)
+		osync.replicator_redact(&a.sp.repl, &sc, device, name, 0, from, to)
 		return true
 	}
 	if !sp.repl_on || !sp.connected {
@@ -332,19 +281,149 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 }
 
 @(private)
-_relay_redact_done :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from: i64) {
-	for _, h in e.handles {
-		if h.sp != sp || osync.stream_id(&h.scope, e.self, h.name, 0) != stream {
-			continue
-		}
-		k := _relay_key(sp.id, h.id, from)
-		t, terr := omap.txn_begin(&e.reg.db)
-		if terr == .None {
-			omap.txn_delete(t, ROOT_REDACT, k[:])
+_relay_redact_done :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, from: i64) {
+	k, n := _relay_key(e, sp.id, id, device, from)
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr == .None {
+		if found, derr := omap.txn_delete(t, ROOT_REDACT, k[:n]); derr == .None && found {
 			omap.txn_commit(t)
+		} else {
+			omap.txn_abort(t)
 		}
+	}
+}
+
+@(private)
+_stream_object :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id) -> (id: prim.Id, kind: Kind, epoch: u64, found: bool) {
+	device := osync.stream_device(stream)
+	if device != e.self {
+		if rm, ok := sp.repl.remotes[stream]; ok {
+			id, kind, found = _object_of_name(rm.name)
+			return id, kind, rm.epoch, found
+		}
+	}
+	for x, h in e.handles {
+		if h.sp == sp && osync.stream_id(&h.scope, device, h.name, 0) == stream {
+			return x, h.kind, 0, true
+		}
+	}
+	Acc :: struct {
+		e:      ^Engine,
+		sp:     ^Space,
+		stream: osync.Stream_Id,
+		device: prim.Id,
+		id:     prim.Id,
+		kind:   Kind,
+		found:  bool,
+	}
+	acc := Acc{e = e, sp = sp, stream = stream, device = device}
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		a := (^Acc)(data)
+		if len(key) != 16 {
+			return true
+		}
+		rec, err := _rec_decode(value, context.temp_allocator)
+		if err != .None || rec.space != a.sp.id {
+			return true
+		}
+		if a.device == a.e.self ? !rec.own : _rec_member(&rec, a.device) < 0 {
+			return true
+		}
+		x: prim.Id
+		copy(x[:], key)
+		sc := _object_scope(a.sp, x)
+		defer osync.scope_clear(&sc)
+		if osync.stream_id(&sc, a.device, _seg_name(rec.kind, x), 0) != a.stream {
+			return true
+		}
+		a.id, a.kind, a.found = x, rec.kind, true
+		return false
+	}
+	for k, v in e.reg.staged {
+		x := k
+		if !visit(&acc, x[:], v) {
+			break
+		}
+	}
+	if !acc.found {
+		omap.db_scan(&e.reg.db, ROOT_OBJECTS, nil, nil, &acc, visit)
+	}
+	return acc.id, acc.kind, 0, acc.found
+}
+
+@(private)
+_relay_redacted_event :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, to: i64) {
+	id, kind, epoch, found := _stream_object(e, sp, stream)
+	if !found {
 		return
 	}
+	device := osync.stream_device(stream)
+	_relay_redact_done(e, sp, id, device, from)
+	if device == e.self {
+		return
+	}
+	sc := _object_scope(sp, id)
+	defer osync.scope_clear(&sc)
+	osync.replicator_zero_replica(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to)
+	_relay_zeroed(e, sp, id, kind)
+	_object_changed(e, sp.id, id, .Redacted)
+}
+
+@(private)
+_local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, to: i64) {
+	id, kind, _, found := _stream_object(e, sp, stream)
+	if !found || (kind != .Conversation && kind != .Map) {
+		return
+	}
+	h, herr := _handle_get(e, Object{sp.id, id}, kind)
+	if herr != .None || !h.w_open {
+		return
+	}
+	w := &h.cw.core if kind == .Conversation else &h.mw.core
+	if journal.journal_commit(&w.j) != .None {
+		return
+	}
+	body, _, je := journal.record_at(&w.jr, from)
+	if je == .Redacted {
+		_relay_redact_done(e, sp, id, e.self, from)
+		return
+	}
+	if je != .None {
+		return
+	}
+	fv := obj.Vref{w.seg, from}
+	target: obj.Vref
+	if kind == .Conversation {
+		if rec, derr := convo.decode_record(body, from, context.temp_allocator); derr == .None {
+			if b, ok := rec.body.(convo.Block); ok {
+				target = obj.Vref{w.seg, b.msg}
+			}
+		}
+		msg := Rid{e.self, target.off}
+		if !obj.vref_none(target) {
+			if t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator); terr == .None {
+				if m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator); merr == .None {
+					_purge_message(e, h, msg, &m)
+				}
+			}
+		}
+		if convo.writer_redact_range(&h.cw, fv, to, target) != .None {
+			return
+		}
+		if !obj.vref_none(target) {
+			_index_purge_message(e, h, msg)
+		} else {
+			_derived_purge(e, h)
+		}
+	} else {
+		if _, werr := obj.writer_redact(w, fv, to, {}); werr != .None {
+			return
+		}
+		_derived_purge(e, h)
+	}
+	_own_redacted(e, h, from, to)
+	_handle_mark(h)
+	_object_changed(e, sp.id, id, .Redacted)
 }
 
 @(private)
@@ -401,8 +480,8 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 			if werr != .None {
 				return .None
 			}
+			_own_redacted(e, h, from.off, r.to)
 		}
-		_own_redacted(e, h, from.off, r.to)
 		_handle_mark(h)
 	} else if h.sp.repl_on {
 		osync.replicator_zero_replica(&h.sp.repl, &h.scope, dev, h.name, 0, from.off, r.to)

@@ -695,7 +695,7 @@ collect_conflicts :: proc(m: ^Merge, tr: ^Tracker, walked: []Walked, theirs: []P
 	marks := make([dynamic]Mark, m.t.allocator)
 	defer delete(marks)
 	for w in walked {
-		if w.flag == FLAG_A {
+		if w.flag & FLAG_A != 0 {
 			mark_piece(m, tr, &marks, w.piece, 0)
 		}
 	}

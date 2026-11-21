@@ -113,7 +113,9 @@ tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT
 	_perr(prim.mkdir_all(e.base, state, 0o700)) or_return
 	mt := new(Mounted, e.allocator)
 	mt.object = o
-	if merr := fs.mount_open(&mt.mount, reg, hist, db, mid, root, state, e.self, opts, e.allocator); merr != .None {
+	mo := opts
+	mo.idle_ms = 0
+	if merr := fs.mount_open(&mt.mount, reg, hist, db, mid, root, state, e.self, mo, e.allocator); merr != .None {
 		free(mt, e.allocator)
 		return nil, _ferr(merr)
 	}
@@ -167,6 +169,9 @@ _mount_touched :: proc(e: ^Engine, mt: ^Mounted) {
 	if h.w_open && _own_len(h) > h.published {
 		_handle_mark(h)
 	}
+	if h.hist != nil && fs.history_durable_mark(h.hist) > h.hist.durable {
+		_touch(e)
+	}
 }
 
 Mount_Done :: struct {
@@ -212,10 +217,18 @@ _mounts_settle :: proc(e: ^Engine) {
 		return
 	}
 	for mt in e.plug.mounts {
+		if len(mt.mount.dirty) == 0 && !mt.mount.rescan {
+			continue
+		}
 		if err := fs.mount_run(&mt.mount); err != .None {
 			_log(e, .Warn, "mount pass failed")
 		}
 		_mount_touched(e, mt)
+	}
+	for m in e.plug.reg.mounts {
+		if m != nil && m.awake {
+			fs.mount_hibernate(m)
+		}
 	}
 }
 

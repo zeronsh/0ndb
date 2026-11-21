@@ -13,6 +13,8 @@ CAP_CREDENTIAL :: u8(2)
 @(private)
 CAP_KEYS_EPOCHS :: 256
 @(private)
+CAP_PROBE_EPOCHS :: 8
+@(private)
 CAP_CACHE :: 1024
 
 Access :: enum u8 {
@@ -258,13 +260,16 @@ _cap_grant_new :: proc(a: ^Cap_Authorizer, c: Capability, key: [32]u8) -> ^Cap_G
 	sc: osync.Scope
 	sc.name_key = c.name_key
 	name := _seg_name(c.kind, c.object)
-	g.suffixes[osync.stream_suffix(&sc, name, 0)] = .Segment
-	g.suffixes[osync.stream_suffix(&sc, CARD_STREAM, 0)] = .Card
-	if cn, err := _concat2(osync.CHECKPOINT_STREAM, name); err == .None {
-		g.suffixes[osync.stream_suffix(&sc, cn, 0)] = .Checkpoint
+	cn, cerr := _concat2(osync.CHECKPOINT_STREAM, name)
+	for ep in 0 ..= CAP_PROBE_EPOCHS {
+		g.suffixes[osync.stream_suffix(&sc, name, u64(ep))] = .Segment
+		g.suffixes[osync.stream_suffix(&sc, CARD_STREAM, u64(ep))] = .Card
+		if cerr == .None {
+			g.suffixes[osync.stream_suffix(&sc, cn, u64(ep))] = .Checkpoint
+		}
 	}
 	if kn, err := _concat2(osync.KEYS_STREAM, name); err == .None {
-		for ep in 0 ..< CAP_KEYS_EPOCHS {
+		for ep in 0 ..< CAP_KEYS_EPOCHS + CAP_PROBE_EPOCHS {
 			g.suffixes[osync.stream_suffix(&sc, kn, u64(ep))] = .Keys
 		}
 	}
@@ -311,7 +316,7 @@ _cap_check :: proc(data: rawptr, p: ^osync.Principal, access: osync.Access, id: 
 	case .Append, .Drop:
 		return own && .Write in c.access
 	case .Redact:
-		return own && (.Redact in c.access || .Write in c.access)
+		return .Redact in c.access || .Write in c.access
 	}
 	return false
 }

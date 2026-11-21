@@ -1,5 +1,6 @@
 package engine
 
+import "base:runtime"
 import "../crdt"
 import "../fs"
 import "../fstree"
@@ -240,7 +241,7 @@ _hist_open :: proc(h: ^Handle) -> Error {
 @(private)
 _hist_options :: proc(h: ^Handle) -> fs.History_Options {
 	e := h.e
-	o := fs.History_Options{clock = _fs_clock(e)}
+	o := fs.History_Options{clock = _fs_clock(e), deferred = e.cfg.durability == .Deferred}
 	if h.sp.repl_on {
 		o.keep_at_least, _ = osync.replicator_floor(&h.sp.repl, &h.scope, h.name, 0)
 	}
@@ -506,4 +507,53 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 	_handle_mark(h)
 	_index_purge_object(e, h)
 	_index_item_add(e, h.sp.id, h.id, h.kind)
+}
+
+Tree_Conflict :: struct {
+	path:   string,
+	start:  int,
+	end:    int,
+	ours:   []crdt.Op_Span,
+	theirs: []crdt.Op_Span,
+}
+
+tree_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
+	return _conflicts(e, o, .File_Tree, allocator, ready)
+}
+
+text_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
+	return _conflicts(e, o, .Text, allocator, ready)
+}
+
+@(private)
+_conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocator, ready: Ready) -> (out: []Tree_Conflict, err: Error) {
+	h := _handle_get(e, o, kind) or_return
+	if rerr := _hist_ready(e, h); rerr != .None {
+		return nil, _pending_result(e, h, rerr, ready)
+	}
+	_hist_catch_up(e, h)
+	list := make([dynamic]fs.Text_Conflict, context.temp_allocator)
+	_ferr(fs.history_text_conflicts(h.hist, &list, allocator)) or_return
+	snap := fstree.current(&h.hist.tree)
+	out = make([]Tree_Conflict, len(list), allocator)
+	for c, i in list {
+		p, ok, perr := fstree.path(&snap, c.inode, context.temp_allocator)
+		if perr == nil && ok {
+			out[i].path = _clone(p, allocator) or_return
+		}
+		out[i].start = c.start
+		out[i].end = c.end
+		out[i].ours = c.ours
+		out[i].theirs = c.theirs
+	}
+	return out, .None
+}
+
+conflicts_clear :: proc(e: ^Engine, o: Object, kind: Kind) -> Error {
+	if kind != .File_Tree && kind != .Text {
+		return .Invalid
+	}
+	h := _handle_get(e, o, kind) or_return
+	_hist_ready(e, h) or_return
+	return _ferr(fs.history_text_conflicts_clear(h.hist))
 }

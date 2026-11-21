@@ -294,6 +294,9 @@ Import_State :: struct {
 }
 
 mount_import :: proc(m: ^Mount) -> Error {
+	held := m.shadow.hold
+	m.shadow.hold = false
+	defer m.shadow.hold = held
 	long: virtual.Arena
 	if virtual.arena_init_growing(&long, 1 << 20) != nil {
 		return .No_Memory
@@ -449,7 +452,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 	}
 	m.imported = true
 	_heap_release()
-	return save_mount_state(m)
+	return mount_settle(m)
 }
 
 @(private)
@@ -718,9 +721,10 @@ import_flush :: proc(st: ^Import_State) -> Error {
 		append(&st.b.imports, Import_File{inode = fstree.ROOT, len = -1})
 	}
 	builder_commit_import(m, &st.b) or_return
-	history_sync(m.history) or_return
-	shadow_persist(&m.shadow) or_return
-	clear(&m.intents)
+	shadow_flush(m) or_return
+	if !mount_deferred(m) {
+		clear(&m.intents)
+	}
 	save_mount_state(m) or_return
 	history_trim(m.history)
 	st.files = 0
@@ -936,13 +940,10 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
 		m.reflog_pos = git_reflog_len(m.vfs, m.git)
 		m.stamp = git_index_stamp(m.vfs, m.git)
 	}
-	history_sync(m.history) or_return
-	shadow_persist(&m.shadow) or_return
-	clear(&m.intents)
 	if len(m.dirty) > 0 {
 		mount_schedule(m, m.opts.settle_ms)
 	}
-	return save_mount_state(m)
+	return mount_settle(m)
 }
 
 @(private)
@@ -1199,10 +1200,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			builder_commit(m, &b) or_return
 		}
 	}
-	history_sync(m.history) or_return
-	shadow_persist(&m.shadow) or_return
-	clear(&m.intents)
-	save_mount_state(m) or_return
+	mount_settle(m) or_return
 	history_trim(m.history)
 	clear(&p.changes)
 	virtual.arena_free_all(&p.chunk)

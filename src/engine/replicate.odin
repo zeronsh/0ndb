@@ -364,11 +364,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		obj_id, _, _ := _object_of_name(ev.name)
 		_emit(e, Event{kind = .Fatal, space = sp.id, object = obj_id, err = _serr(ev.err), length = ev.length})
 	case .Redacted:
-		if osync.stream_device(ev.stream) == e.self {
-			_relay_redact_done(e, sp, ev.stream, ev.from)
-		} else {
-			_relay_zeroed_stream(e, sp, ev.stream, ev.from, ev.to)
-		}
+		_relay_redacted_event(e, sp, ev.stream, ev.from, ev.to)
+	case .Local_Redacted:
+		_local_redacted(e, sp, ev.stream, ev.from, ev.to)
 	}
 }
 
