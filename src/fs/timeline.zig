@@ -436,6 +436,8 @@ fn inspectInodeInView(
     iid: id.InodeId,
     view: text_mod.View,
 ) Allocator.Error!InodeContent {
+    hist.tree.beginPinScope();
+    defer hist.tree.endPinScope();
     if (!try hist.tree.isPresent(allocator, view, iid)) return .absent;
     const inode = hist.tree.get(iid) orelse return .absent;
     switch (inode.kind) {
@@ -445,6 +447,15 @@ fn inspectInodeInView(
             return switch (ck.*) {
                 .text => if (try f.text.readIn(allocator, hist.resolver(), view)) |bytes| .{ .text = bytes } else .absent,
                 .binary => |ref| .{ .binary = ref.oid },
+                .git_binary => |ref| .{ .binary = ref.oid.bytes },
+                .git_lazy => |ref| blk: {
+                    const bytes = (try hist.readGitBlobAlloc(allocator, ref.oid)) orelse break :blk .{ .binary = ref.oid.bytes };
+                    if (std.mem.indexOfScalar(u8, bytes, 0) != null or !std.unicode.utf8ValidateSlice(bytes)) {
+                        allocator.free(bytes);
+                        break :blk .{ .binary = ref.oid.bytes };
+                    }
+                    break :blk .{ .text = bytes };
+                },
             };
         },
         .symlink => |*s| {
