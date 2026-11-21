@@ -89,7 +89,7 @@ pub const ScopeRecord = struct {
 
     pub fn encode(self: *const ScopeRecord, allocator: Allocator, w: *codec.Writer) Allocator.Error!void {
         try w.writeU128(allocator, self.scope_id);
-        try w.writeByte(allocator, @intFromEnum(self.kind));
+        try w.writeByte(allocator, @backingInt(self.kind));
         try w.writeU128(allocator, self.actor);
         try w.writeBytes(allocator, self.label);
         try w.writeU64(allocator, self.started_ms);
@@ -333,6 +333,7 @@ const GitReaderCtx = struct {
 
 const ProcessLockSlot = struct {
     in_use: bool = false,
+    dev: u64 = 0,
     ino: u64 = 0,
     fd: posix.fd_t = -1,
     refs: usize = 0,
@@ -340,6 +341,7 @@ const ProcessLockSlot = struct {
 
 var g_lock_spin: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 var g_lock_slots: [256]ProcessLockSlot = @splat(.{});
+var g_tmp_seq: std.atomic.Value(u64) = .init(1);
 
 fn acquireLockSpin() void {
     while (g_lock_spin.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
@@ -363,12 +365,17 @@ const StateDirLock = struct {
         };
         const ino: u64 = st.inode;
         const fd: posix.fd_t = lock_file.handle;
+        var stx: linux.Statx = undefined;
+        const dev: u64 = if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{}, &stx)) == .SUCCESS)
+            (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor)
+        else
+            0;
 
         acquireLockSpin();
         defer releaseLockSpin();
 
         for (&g_lock_slots, 0..) |*slot, idx| {
-            if (slot.in_use and slot.ino == ino) {
+            if (slot.in_use and slot.ino == ino and slot.dev == dev) {
                 slot.refs += 1;
                 lock_file.close(io);
                 return .{ .slot_idx = idx };
@@ -385,6 +392,7 @@ const StateDirLock = struct {
             if (!slot.in_use) {
                 slot.* = .{
                     .in_use = true,
+                    .dev = dev,
                     .ino = ino,
                     .fd = fd,
                     .refs = 1,
@@ -398,20 +406,17 @@ const StateDirLock = struct {
     fn release(self: *StateDirLock) void {
         if (self.slot_idx) |idx| {
             acquireLockSpin();
-            var close_fd: ?posix.fd_t = null;
             if (g_lock_slots[idx].in_use) {
                 if (g_lock_slots[idx].refs > 1) {
                     g_lock_slots[idx].refs -= 1;
                 } else {
-                    close_fd = g_lock_slots[idx].fd;
+                    const fd = g_lock_slots[idx].fd;
+                    _ = linux.flock(fd, @intCast(posix.LOCK.UN));
+                    _ = linux.close(fd);
                     g_lock_slots[idx] = .{};
                 }
             }
             releaseLockSpin();
-            if (close_fd) |fd| {
-                _ = linux.flock(fd, @intCast(posix.LOCK.UN));
-                _ = linux.close(fd);
-            }
             self.slot_idx = null;
         }
         if (self.direct_fd) |fd| {
@@ -439,7 +444,7 @@ const StatStamp = struct {
             .file => .file,
             .symlink => .symlink,
         };
-        const em: u32 = @intFromEnum(self.mode);
+        const em: u32 = @backingInt(self.mode);
         return entry.kind == ek and
             entry.size == self.size and
             entry.mtime_ns == self.mtime_ns and
@@ -454,6 +459,7 @@ const DiskEntry = union(enum) {
         oid: git_dirs_mod.GitOid,
         len: u64,
         mode: tree_mod.FileMode,
+        is_binary: bool,
         stamp: StatStamp,
     },
     file: struct {
@@ -483,6 +489,7 @@ const DiskReadResult = union(enum) {
         oid: git_dirs_mod.GitOid,
         len: u64,
         mode: tree_mod.FileMode,
+        is_binary: bool,
         stamp: StatStamp,
     },
     file: struct {
@@ -510,6 +517,12 @@ const IgnoreRule = struct {
     negated: bool,
     dir_only: bool,
     anchored: bool,
+    priority: u16,
+};
+
+const NestedIgnoreStamp = struct {
+    size: u64,
+    mtime: i96,
 };
 
 const GitIgnore = struct {
@@ -520,7 +533,7 @@ const GitIgnore = struct {
     exclude_stamp_size: u64 = 0,
     exclude_stamp_mtime: i96 = 0,
     exclude_loaded: bool = false,
-    nested_loaded_dirs: std.StringHashMapUnmanaged(void) = .empty,
+    nested_loaded_dirs: std.StringHashMapUnmanaged(NestedIgnoreStamp) = .empty,
 
     fn deinit(self: *GitIgnore, allocator: Allocator) void {
         self.clear(allocator);
@@ -539,7 +552,15 @@ const GitIgnore = struct {
         self.nested_loaded_dirs.clearRetainingCapacity();
     }
 
-    fn parseRulesInto(self: *GitIgnore, allocator: Allocator, prefix: []const u8, data: []const u8) void {
+    fn nestedPriority(prefix: []const u8) u16 {
+        var depth: u16 = 1;
+        for (prefix) |ch| {
+            if (ch == '/') depth +|= 1;
+        }
+        return 2 +| depth;
+    }
+
+    fn parseRulesInto(self: *GitIgnore, allocator: Allocator, prefix: []const u8, priority: u16, data: []const u8) void {
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |raw_line| {
             var line = std.mem.trimEnd(u8, raw_line, "\r \t");
@@ -576,6 +597,7 @@ const GitIgnore = struct {
                 .negated = negated,
                 .dir_only = dir_only,
                 .anchored = anchored,
+                .priority = priority,
             }) catch {
                 allocator.free(p_dup);
                 allocator.free(dup);
@@ -583,7 +605,7 @@ const GitIgnore = struct {
         }
     }
 
-    fn loadFileRules(self: *GitIgnore, allocator: Allocator, io: Io, dir: Io.Dir, file_rel: []const u8, prefix: []const u8) void {
+    fn loadFileRules(self: *GitIgnore, allocator: Allocator, io: Io, dir: Io.Dir, file_rel: []const u8, prefix: []const u8, priority: u16) void {
         const f = dir.openFile(io, file_rel, .{}) catch return;
         defer f.close(io);
         const st = f.stat(io) catch return;
@@ -591,7 +613,7 @@ const GitIgnore = struct {
         const buf = allocator.alloc(u8, @intCast(st.size)) catch return;
         defer allocator.free(buf);
         const n = f.readPositionalAll(io, buf, 0) catch return;
-        self.parseRulesInto(allocator, prefix, buf[0..n]);
+        self.parseRulesInto(allocator, prefix, priority, buf[0..n]);
     }
 
     fn reloadIfNeeded(self: *GitIgnore, allocator: Allocator, io: Io, work_dir: Io.Dir, common_dir_opt: ?[]const u8) void {
@@ -614,7 +636,26 @@ const GitIgnore = struct {
             self.exclude_loaded and st.size == self.exclude_stamp_size and st.mtime.nanoseconds == self.exclude_stamp_mtime
         else
             !self.exclude_loaded;
-        if (root_same and excl_same and self.nested_loaded_dirs.count() == 0) return;
+        if (root_same and excl_same) {
+            var nested_same = true;
+            var nit = self.nested_loaded_dirs.iterator();
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            while (nit.next()) |kv| {
+                const rel_gi = std.fmt.bufPrint(&path_buf, "{s}/.gitignore", .{kv.key_ptr.*}) catch {
+                    nested_same = false;
+                    break;
+                };
+                const st = work_dir.statFile(io, rel_gi, .{}) catch {
+                    nested_same = false;
+                    break;
+                };
+                if (st.size != kv.value_ptr.size or st.mtime.nanoseconds != kv.value_ptr.mtime) {
+                    nested_same = false;
+                    break;
+                }
+            }
+            if (nested_same) return;
+        }
 
         self.clear(allocator);
 
@@ -623,7 +664,7 @@ const GitIgnore = struct {
             self.exclude_stamp_size = st.size;
             self.exclude_stamp_mtime = st.mtime.nanoseconds;
             if (excl_path) |ep| {
-                self.loadFileRules(allocator, io, Io.Dir.cwd(), ep, "");
+                self.loadFileRules(allocator, io, Io.Dir.cwd(), ep, "", 0);
             }
         } else {
             self.exclude_loaded = false;
@@ -635,7 +676,7 @@ const GitIgnore = struct {
             self.root_loaded = true;
             self.root_stamp_size = st.size;
             self.root_stamp_mtime = st.mtime.nanoseconds;
-            self.loadFileRules(allocator, io, work_dir, ".gitignore", "");
+            self.loadFileRules(allocator, io, work_dir, ".gitignore", "", 1);
         } else {
             self.root_loaded = false;
             self.root_stamp_size = 0;
@@ -649,11 +690,14 @@ const GitIgnore = struct {
         const st = dir.statFile(io, ".gitignore", .{}) catch return;
         if (st.size == 0 or st.size > 512 * 1024) return;
         const key = allocator.dupe(u8, rel_prefix) catch return;
-        self.nested_loaded_dirs.put(allocator, key, {}) catch {
+        self.nested_loaded_dirs.put(allocator, key, .{
+            .size = st.size,
+            .mtime = st.mtime.nanoseconds,
+        }) catch {
             allocator.free(key);
             return;
         };
-        self.loadFileRules(allocator, io, dir, ".gitignore", rel_prefix);
+        self.loadFileRules(allocator, io, dir, ".gitignore", rel_prefix, nestedPriority(rel_prefix));
     }
 
     fn ensureNestedAncestorsLoaded(self: *GitIgnore, allocator: Allocator, io: Io, work_dir: Io.Dir, rel_path: []const u8) void {
@@ -674,6 +718,8 @@ const GitIgnore = struct {
     fn isIgnored(self: *const GitIgnore, rel_path: []const u8, is_dir: bool) bool {
         if (self.rules.items.len == 0) return false;
         var ignored = false;
+        var best_priority: u16 = 0;
+        var matched_any = false;
         for (self.rules.items) |rule| {
             if (rule.dir_only and !is_dir) continue;
             const target_rel: []const u8 = if (rule.prefix.len == 0)
@@ -685,7 +731,11 @@ const GitIgnore = struct {
                 break :blk rel_path[rule.prefix.len + 1 ..];
             };
             if (matchRule(rule, target_rel)) {
-                ignored = !rule.negated;
+                if (!matched_any or rule.priority >= best_priority) {
+                    best_priority = rule.priority;
+                    ignored = !rule.negated;
+                    matched_any = true;
+                }
             }
         }
         return ignored;
@@ -1555,7 +1605,6 @@ pub const Workspace = struct {
         defer wal_dir.close(self.io);
 
         const sealed_seg_max = try self.sealCurrentWalIntoSegments(wal_dir);
-        self.manifest.seg_max_id = sealed_seg_max;
         const wal_cutoff_seq: u64 = if (self.batch_log.next_seq > 0) self.batch_log.next_seq - 1 else self.manifest.wal_base_seq;
 
         var retained_vers: std.ArrayList(Version) = .empty;
@@ -1654,14 +1703,12 @@ pub const Workspace = struct {
             }
         };
         const keep_ctx = KeepCtx{ .loc_map = &loc_to_bid, .pruned = &pruned_set };
-        var prune_res = try self.segments.pruneSegments(keep_ctx);
+        var prune_res = try self.segments.pruneSegmentsDeferred(keep_ctx);
         defer prune_res.deinit(self.allocator);
 
-        const seg_bytes_after = dirTotalBytes(self.io, self.state_dir, "seg");
         stats.removed_segments = prune_res.removed_segments;
         stats.rewritten_segments = prune_res.rewritten_segments;
         stats.pruned_batches = pruned_set.count();
-        stats.reclaimed_batch_bytes = if (seg_bytes_before > seg_bytes_after) seg_bytes_before - seg_bytes_after else 0;
 
         for (prune_res.remaps.items) |rm| {
             if (loc_to_bid.get(.{ .seg_id = rm.old_seg_id, .offset = rm.old_offset })) |bid| {
@@ -1721,57 +1768,6 @@ pub const Workspace = struct {
         const new_stack = try snapshot_mod.SnapshotStack.create(self.allocator, new_base_reader, null);
         errdefer new_stack.release();
 
-        if (policy.force_gc and !self.blob_store.isShared()) {
-            var live_oids: std.AutoHashMapUnmanaged(crypto.Hash, void) = .empty;
-            defer live_oids.deinit(self.allocator);
-
-            try new_stack.collectReferencedBlobOids(self.allocator, &live_oids);
-
-            const seg_ids = try self.segments.listSegmentIds(self.allocator);
-            defer self.allocator.free(seg_ids);
-            for (seg_ids) |sid| {
-                const mf_seg = self.segments.getMapped(sid) catch continue;
-                const data = mf_seg.slice();
-                var off: usize = 0;
-                while (off + log_mod.HEADER_SIZE <= data.len) {
-                    const hdr = log_mod.FrameHeader.decode(data[off..][0..log_mod.HEADER_SIZE]) catch break;
-                    const payload_start = off + log_mod.HEADER_SIZE;
-                    const payload_end = payload_start + hdr.payload_len;
-                    const aligned_end = log_mod.alignUp(payload_end);
-                    if (aligned_end > data.len) break;
-                    if (hdr.kind == FRAME_BATCH) {
-                        var br = codec.Reader.init(data[payload_start..payload_end]);
-                        if (op_mod.Batch.decode(self.allocator, &br)) |b_val| {
-                            var b = b_val;
-                            defer b.deinit(self.allocator);
-                            for (b.ops) |op| {
-                                const maybe_oid: ?id.Oid = switch (op) {
-                                    .create_file => |cf| switch (cf.content) {
-                                        .binary => |x| x.oid,
-                                        .text_blob => |x| x.oid,
-                                        else => null,
-                                    },
-                                    .set_content => |sc| switch (sc.content) {
-                                        .binary => |x| x.oid,
-                                        .text_blob => |x| x.oid,
-                                        else => null,
-                                    },
-                                    else => null,
-                                };
-                                if (maybe_oid) |oid| try live_oids.put(self.allocator, oid, {});
-                            }
-                        } else |_| {}
-                    }
-                    off = aligned_end;
-                }
-            }
-
-            try self.blob_store.sealActivePack();
-            const gc_res = try self.blob_store.gc(&live_oids);
-            stats.removed_blobs = gc_res.removed_blobs;
-            stats.reclaimed_blob_bytes = gc_res.reclaimed_bytes;
-        }
-
         try self.shadow.flushAtomic(self.io, self.state_dir, SHADOW_FILE_NAME);
         self.stat_cache_dirty = false;
 
@@ -1797,7 +1793,7 @@ pub const Workspace = struct {
         new_manifest.delta_blake3 = @splat(0);
         new_manifest.wal_gen = new_wal_gen;
         new_manifest.wal_base_seq = wal_cutoff_seq;
-        new_manifest.seg_max_id = @max(prune_res.max_seg_id, self.manifest.seg_max_id);
+        new_manifest.seg_max_id = @max(prune_res.max_seg_id, @max(sealed_seg_max, self.manifest.seg_max_id));
         new_manifest.pack_max_id = self.blob_store.maxPackId();
         new_manifest.pack_idx_blake3 = self.blob_store.packIdxDigest();
         new_manifest.checkpoint_wall_ms = now_ms;
@@ -1827,6 +1823,70 @@ pub const Workspace = struct {
         if (old_stack) |os| os.release();
 
         self.manifest = new_manifest;
+
+        self.segments.unlinkSegments(prune_res.obsolete_seg_ids.items);
+        const seg_bytes_after = dirTotalBytes(self.io, self.state_dir, "seg");
+        stats.reclaimed_batch_bytes = if (seg_bytes_before > seg_bytes_after) seg_bytes_before - seg_bytes_after else 0;
+
+        if (policy.force_gc and !self.blob_store.isShared()) {
+            var live_oids: std.AutoHashMapUnmanaged(crypto.Hash, void) = .empty;
+            defer live_oids.deinit(self.allocator);
+
+            try new_stack.collectReferencedBlobOids(self.allocator, &live_oids);
+
+            const seg_ids = try self.segments.listSegmentIds(self.allocator);
+            defer self.allocator.free(seg_ids);
+            for (seg_ids) |sid| {
+                const mf_seg = self.segments.getMapped(sid) catch continue;
+                const data = mf_seg.slice();
+                var off: usize = 0;
+                while (off + log_mod.HEADER_SIZE <= data.len) {
+                    const hdr = log_mod.FrameHeader.decode(data[off..][0..log_mod.HEADER_SIZE]) catch break;
+                    const payload_start = off + log_mod.HEADER_SIZE;
+                    const payload_end = payload_start + hdr.payload_len;
+                    const aligned_end = log_mod.alignUp(payload_end);
+                    if (aligned_end > data.len) break;
+                    if (hdr.kind == FRAME_BATCH) {
+                        var br = codec.Reader.init(data[payload_start..payload_end]);
+                        if (op_mod.Batch.decode(self.allocator, &br)) |b_val| {
+                            var b = b_val;
+                            defer b.deinit(self.allocator);
+                            for (b.blobs) |ba| {
+                                try live_oids.put(self.allocator, ba.oid, {});
+                            }
+                            for (b.ops) |op| {
+                                const maybe_oid: ?id.Oid = switch (op) {
+                                    .create_file => |cf| switch (cf.content) {
+                                        .binary => |x| x.oid,
+                                        .text_blob => |x| x.oid,
+                                        else => null,
+                                    },
+                                    .set_content => |sc| switch (sc.content) {
+                                        .binary => |x| x.oid,
+                                        .text_blob => |x| x.oid,
+                                        else => null,
+                                    },
+                                    else => null,
+                                };
+                                if (maybe_oid) |oid| try live_oids.put(self.allocator, oid, {});
+                            }
+                        } else |_| {}
+                    }
+                    off = aligned_end;
+                }
+            }
+
+            try self.blob_store.sealActivePack();
+            const gc_res = try self.blob_store.gc(&live_oids);
+            stats.removed_blobs = gc_res.removed_blobs;
+            stats.reclaimed_blob_bytes = gc_res.reclaimed_bytes;
+            if (gc_res.removed_blobs > 0) {
+                self.manifest.pack_max_id = self.blob_store.maxPackId();
+                self.manifest.pack_idx_blake3 = self.blob_store.packIdxDigest();
+                self.manifest.saveAtomic(self.io, self.state_dir) catch {};
+            }
+        }
+
         manifest_mod.Manifest.gcOrphanFiles(self.allocator, self.io, self.state_dir, self.manifest);
         return stats;
     }
@@ -2083,7 +2143,7 @@ pub const Workspace = struct {
         var entry = shadow_mod.ShadowEntry{
             .inode_id = iid,
             .kind = if (stamp.kind == .symlink) .symlink else .file,
-            .mode = @intFromEnum(stamp.mode),
+            .mode = @backingInt(stamp.mode),
             .size = stamp.size,
             .mtime_ns = stamp.mtime_ns,
             .ino = stamp.ino,
@@ -2157,7 +2217,9 @@ pub const Workspace = struct {
         all_oids.ensureTotalCapacityPrecise(self.allocator, self.pinned_git_oids.count()) catch return;
         var it = self.pinned_git_oids.keyIterator();
         while (it.next()) |k| all_oids.appendAssumeCapacity(k.*);
-        odb.pinOids(all_oids.items) catch {};
+        var ref_buf: [64]u8 = undefined;
+        const pin_ref = std.fmt.bufPrint(&ref_buf, "refs/0ndb/pins/ws-{x:0>32}", .{self.history.history_id}) catch git_odb_mod.DEFAULT_PIN_REF;
+        odb.pinOidsForRef(pin_ref, all_oids.items) catch {};
     }
 
     fn makeFileContentAndMeta(
@@ -2534,17 +2596,26 @@ pub const Workspace = struct {
                     .unchanged => {},
                     .git_clean => |gc| {
                         try self.queueGitPin(gc.oid, &new_pins);
+                        const gc_content: op_mod.Content = if (gc.is_binary)
+                            .{ .git_binary = .{ .oid = gc.oid, .len = gc.len } }
+                        else
+                            .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } };
                         self.history.tree.beginPinScope();
                         const inode_opt = self.history.tree.get(iid);
                         const is_file = if (inode_opt) |in| in.fileConstPtr() != null else false;
+                        const cur_ending = if (inode_opt) |in| blk: {
+                            const fp = in.fileConstPtr() orelse break :blk tree_mod.LineEnding.lf;
+                            break :blk if (fp.line_ending.get()) |le| le.* else tree_mod.LineEnding.lf;
+                        } else tree_mod.LineEnding.lf;
                         const same_git_and_mode = if (inode_opt) |in| blk: {
                             const fp = in.fileConstPtr() orelse break :blk false;
                             const cm = if (fp.mode.get()) |m| m.* else tree_mod.FileMode.regular;
                             if (cm != gc.mode) break :blk false;
+                            if (!gc.is_binary and cur_ending != .lf) break :blk false;
                             const ck = fp.content.get() orelse break :blk false;
                             break :blk switch (ck.*) {
-                                .git_lazy => |r| r.oid.eql(gc.oid) and r.len == gc.len,
-                                .git_binary => |r| r.oid.eql(gc.oid) and r.len == gc.len,
+                                .git_lazy => |r| !gc.is_binary and r.oid.eql(gc.oid) and r.len == gc.len,
+                                .git_binary => |r| gc.is_binary and r.oid.eql(gc.oid) and r.len == gc.len,
                                 else => false,
                             };
                         } else false;
@@ -2552,9 +2623,12 @@ pub const Workspace = struct {
                         if (!same_git_and_mode) {
                             if (is_file) {
                                 try ops.append(self.allocator, .{ .set_mode = .{ .inode = iid, .mode = gc.mode } });
+                                if (!gc.is_binary and cur_ending != .lf) {
+                                    try ops.append(self.allocator, .{ .set_line_ending = .{ .inode = iid, .ending = .lf } });
+                                }
                                 try ops.append(self.allocator, .{ .set_content = .{
                                     .inode = iid,
-                                    .content = .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } },
+                                    .content = gc_content,
                                 } });
                             } else {
                                 try ops.append(self.allocator, .{ .remove = .{ .inode = iid } });
@@ -2566,7 +2640,7 @@ pub const Workspace = struct {
                                     .name = try self.allocator.dupe(u8, base_name),
                                     .mode = gc.mode,
                                     .line_ending = .lf,
-                                    .content = .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } },
+                                    .content = gc_content,
                                 } });
                                 try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = gc.stamp, .iid = new_iid, .git_oid = gc.oid });
                                 continue;
@@ -2633,23 +2707,59 @@ pub const Workspace = struct {
                     .unchanged => {},
                     .git_clean => |gc| {
                         try self.queueGitPin(gc.oid, &new_pins);
+                        const gc_content: op_mod.Content = if (gc.is_binary)
+                            .{ .git_binary = .{ .oid = gc.oid, .len = gc.len } }
+                        else
+                            .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } };
                         var did_rename = false;
                         var target_iid = id.InodeId.ROOT;
                         if (gc.stamp.ino != 0) {
                             if (missing_by_ino.get(gc.stamp.ino)) |maybe_idx| {
                                 if (maybe_idx) |midx| {
                                     if (!renamed_missing[midx]) {
-                                        renamed_missing[midx] = true;
-                                        did_rename = true;
                                         const old_iid = missing_tracked.items[midx].iid;
-                                        target_iid = old_iid;
-                                        const parent_iid = try self.ensureParentDirs(self.disk_actor, base_start_ts, rel, &ops, &pending_dirs);
-                                        const base_name = std.fs.path.basename(rel);
-                                        try ops.append(self.allocator, .{ .rename = .{
-                                            .inode = old_iid,
-                                            .parent = parent_iid,
-                                            .name = try self.allocator.dupe(u8, base_name),
-                                        } });
+                                        self.history.tree.beginPinScope();
+                                        const old_in = self.history.tree.get(old_iid);
+                                        const old_is_file = if (old_in) |in| in.fileConstPtr() != null else false;
+                                        const old_ending = if (old_in) |in| blk: {
+                                            const fp = in.fileConstPtr() orelse break :blk tree_mod.LineEnding.lf;
+                                            break :blk if (fp.line_ending.get()) |le| le.* else tree_mod.LineEnding.lf;
+                                        } else tree_mod.LineEnding.lf;
+                                        const same_old = if (old_in) |in| blk: {
+                                            const fp = in.fileConstPtr() orelse break :blk false;
+                                            const cm = if (fp.mode.get()) |m| m.* else tree_mod.FileMode.regular;
+                                            if (cm != gc.mode) break :blk false;
+                                            if (!gc.is_binary and old_ending != .lf) break :blk false;
+                                            const ck = fp.content.get() orelse break :blk false;
+                                            break :blk switch (ck.*) {
+                                                .git_lazy => |r| !gc.is_binary and r.oid.eql(gc.oid) and r.len == gc.len,
+                                                .git_binary => |r| gc.is_binary and r.oid.eql(gc.oid) and r.len == gc.len,
+                                                else => false,
+                                            };
+                                        } else false;
+                                        self.history.tree.endPinScope();
+                                        if (old_is_file) {
+                                            renamed_missing[midx] = true;
+                                            did_rename = true;
+                                            target_iid = old_iid;
+                                            const parent_iid = try self.ensureParentDirs(self.disk_actor, base_start_ts, rel, &ops, &pending_dirs);
+                                            const base_name = std.fs.path.basename(rel);
+                                            try ops.append(self.allocator, .{ .rename = .{
+                                                .inode = old_iid,
+                                                .parent = parent_iid,
+                                                .name = try self.allocator.dupe(u8, base_name),
+                                            } });
+                                            if (!same_old) {
+                                                try ops.append(self.allocator, .{ .set_mode = .{ .inode = old_iid, .mode = gc.mode } });
+                                                if (!gc.is_binary and old_ending != .lf) {
+                                                    try ops.append(self.allocator, .{ .set_line_ending = .{ .inode = old_iid, .ending = .lf } });
+                                                }
+                                                try ops.append(self.allocator, .{ .set_content = .{
+                                                    .inode = old_iid,
+                                                    .content = gc_content,
+                                                } });
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2663,7 +2773,7 @@ pub const Workspace = struct {
                                 .name = try self.allocator.dupe(u8, base_name),
                                 .mode = gc.mode,
                                 .line_ending = .lf,
-                                .content = .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } },
+                                .content = gc_content,
                             } });
                         }
                         try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = gc.stamp, .iid = target_iid, .git_oid = gc.oid });
@@ -2747,7 +2857,6 @@ pub const Workspace = struct {
         }
 
         for (missing_tracked.items, 0..) |m, idx| {
-            self.removeStatCache(m.rel);
             if (!renamed_missing[idx]) {
                 try ops.append(self.allocator, .{ .remove = .{ .inode = m.iid } });
             }
@@ -2755,11 +2864,13 @@ pub const Workspace = struct {
 
         self.flushGitPins(new_pins.items);
 
-        for (shadow_updates.items) |su| {
-            self.updateShadowForPath(su.rel, su.stamp, su.iid, su.git_oid, su.blob_oid);
+        if (ops.items.len == 0) {
+            for (missing_tracked.items) |m| self.removeStatCache(m.rel);
+            for (shadow_updates.items) |su| {
+                self.updateShadowForPath(su.rel, su.stamp, su.iid, su.git_oid, su.blob_oid);
+            }
+            return null;
         }
-
-        if (ops.items.len == 0) return null;
 
         const batch_parents = try parents.clone(self.allocator);
         const end = base_start_ts + @as(u64, @intCast(ops.items.len)) - 1;
@@ -2777,6 +2888,10 @@ pub const Workspace = struct {
         defer batch.deinit(self.allocator);
 
         _ = try self.commitBatchWithSource(&batch, source);
+        for (missing_tracked.items) |m| self.removeStatCache(m.rel);
+        for (shadow_updates.items) |su| {
+            self.updateShadowForPath(su.rel, su.stamp, su.iid, su.git_oid, su.blob_oid);
+        }
         self.synced_version.deinit(self.allocator);
         self.synced_version = try self.history.headsClone();
         return batch.header.batchId();
@@ -2868,42 +2983,27 @@ pub const Workspace = struct {
             for (scan_dirs) |dir_rel| {
                 if (dir_rel.len == 0 or watch.isIgnoredPath(dir_rel)) continue;
                 self.collectDiskPathsInDir(dir_rel, &candidates) catch {};
-            }
 
-            if (self.shadow.count() > 0) {
-                var sit = try self.shadow.iterateAll(self.allocator);
-                defer sit.deinit();
-                while (try sit.next()) |item| {
-                    for (scan_dirs) |dir_rel| {
-                        if (std.mem.eql(u8, item.rel_path, dir_rel) or
-                            (item.rel_path.len > dir_rel.len and std.mem.startsWith(u8, item.rel_path, dir_rel) and item.rel_path[dir_rel.len] == '/'))
-                        {
-                            if (!candidates.contains(item.rel_path)) {
-                                try candidates.put(self.allocator, try self.allocator.dupe(u8, item.rel_path), {});
-                            }
-                            break;
+                if (try self.history.tree.resolvePath(self.allocator, text_mod.View.EVERYTHING, dir_rel)) |dir_iid| {
+                    self.history.tree.beginPinScope();
+                    const is_dir = if (self.history.tree.get(dir_iid)) |in| in.isDir() else false;
+                    self.history.tree.endPinScope();
+                    if (is_dir) {
+                        var sub_tracked: std.StringHashMapUnmanaged(id.InodeId) = .empty;
+                        defer {
+                            var sit = sub_tracked.keyIterator();
+                            while (sit.next()) |k| self.allocator.free(k.*);
+                            sub_tracked.deinit(self.allocator);
                         }
-                    }
-                }
-            } else {
-                var tracked: std.StringHashMapUnmanaged(id.InodeId) = .empty;
-                defer {
-                    var it = tracked.keyIterator();
-                    while (it.next()) |k| self.allocator.free(k.*);
-                    tracked.deinit(self.allocator);
-                }
-                try self.collectTrackedPaths(id.InodeId.ROOT, "", &tracked);
-                var tit = tracked.keyIterator();
-                while (tit.next()) |k| {
-                    for (scan_dirs) |dir_rel| {
-                        if (std.mem.eql(u8, k.*, dir_rel) or
-                            (k.*.len > dir_rel.len and std.mem.startsWith(u8, k.*, dir_rel) and k.*[dir_rel.len] == '/'))
-                        {
+                        try self.collectTrackedPaths(dir_iid, dir_rel, &sub_tracked);
+                        var sit = sub_tracked.keyIterator();
+                        while (sit.next()) |k| {
                             if (!candidates.contains(k.*)) {
                                 try candidates.put(self.allocator, try self.allocator.dupe(u8, k.*), {});
                             }
-                            break;
                         }
+                    } else if (!candidates.contains(dir_rel)) {
+                        try candidates.put(self.allocator, try self.allocator.dupe(u8, dir_rel), {});
                     }
                 }
             }
@@ -2948,6 +3048,18 @@ pub const Workspace = struct {
             stamp: StatStamp,
             hash: crypto.Hash,
         };
+        const PendingShadow = struct {
+            rel: []const u8,
+            stamp: StatStamp,
+            iid: id.InodeId,
+            git_oid: ?git_dirs_mod.GitOid = null,
+            blob_oid: ?id.Oid = null,
+        };
+        var shadow_updates: std.ArrayList(PendingShadow) = .empty;
+        defer shadow_updates.deinit(self.allocator);
+        var shadow_removals: std.ArrayList([]const u8) = .empty;
+        defer shadow_removals.deinit(self.allocator);
+
         var missing_files: std.ArrayList(MissingFile) = .empty;
         defer missing_files.deinit(self.allocator);
         var added_files: std.ArrayList(AddedFile) = .empty;
@@ -2967,7 +3079,7 @@ pub const Workspace = struct {
             switch (disk_res) {
                 .skipped_oversize, .ignored => {},
                 .missing => {
-                    self.removeStatCache(rel);
+                    try shadow_removals.append(self.allocator, rel);
                     if (existing_iid) |iid| {
                         self.history.tree.beginPinScope();
                         defer self.history.tree.endPinScope();
@@ -2991,13 +3103,58 @@ pub const Workspace = struct {
                 },
                 .git_clean => |gc| {
                     try self.queueGitPin(gc.oid, &new_pins);
+                    const gc_content: op_mod.Content = if (gc.is_binary)
+                        .{ .git_binary = .{ .oid = gc.oid, .len = gc.len } }
+                    else
+                        .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } };
                     if (existing_iid) |iid| {
-                        try ops.append(self.allocator, .{ .set_mode = .{ .inode = iid, .mode = gc.mode } });
-                        try ops.append(self.allocator, .{ .set_content = .{
-                            .inode = iid,
-                            .content = .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } },
-                        } });
-                        self.updateShadowForPath(rel, gc.stamp, iid, gc.oid, null);
+                        self.history.tree.beginPinScope();
+                        const inode_opt = self.history.tree.get(iid);
+                        const is_file = if (inode_opt) |in| in.fileConstPtr() != null else false;
+                        const is_dir = if (inode_opt) |in| in.isDir() else false;
+                        const cur_ending = if (inode_opt) |in| blk: {
+                            const fp = in.fileConstPtr() orelse break :blk tree_mod.LineEnding.lf;
+                            break :blk if (fp.line_ending.get()) |le| le.* else tree_mod.LineEnding.lf;
+                        } else tree_mod.LineEnding.lf;
+                        const same_git_and_mode = if (inode_opt) |in| blk: {
+                            const fp = in.fileConstPtr() orelse break :blk false;
+                            const cm = if (fp.mode.get()) |m| m.* else tree_mod.FileMode.regular;
+                            if (cm != gc.mode) break :blk false;
+                            if (!gc.is_binary and cur_ending != .lf) break :blk false;
+                            const ck = fp.content.get() orelse break :blk false;
+                            break :blk switch (ck.*) {
+                                .git_lazy => |r| !gc.is_binary and r.oid.eql(gc.oid) and r.len == gc.len,
+                                .git_binary => |r| gc.is_binary and r.oid.eql(gc.oid) and r.len == gc.len,
+                                else => false,
+                            };
+                        } else false;
+                        self.history.tree.endPinScope();
+                        if (is_file) {
+                            if (!same_git_and_mode) {
+                                try ops.append(self.allocator, .{ .set_mode = .{ .inode = iid, .mode = gc.mode } });
+                                if (!gc.is_binary and cur_ending != .lf) {
+                                    try ops.append(self.allocator, .{ .set_line_ending = .{ .inode = iid, .ending = .lf } });
+                                }
+                                try ops.append(self.allocator, .{ .set_content = .{
+                                    .inode = iid,
+                                    .content = gc_content,
+                                } });
+                            }
+                            try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = gc.stamp, .iid = iid, .git_oid = gc.oid });
+                        } else if (!is_dir) {
+                            try ops.append(self.allocator, .{ .remove = .{ .inode = iid } });
+                            const parent_iid = try self.ensureParentDirs(self.disk_actor, base_start_ts, rel, &ops, &pending_dirs);
+                            const base_name = std.fs.path.basename(rel);
+                            const new_iid = id.InodeId.init(id.OpId.init(base_start_ts + @as(u64, @intCast(ops.items.len)), self.disk_actor), 0);
+                            try ops.append(self.allocator, .{ .create_file = .{
+                                .parent = parent_iid,
+                                .name = try self.allocator.dupe(u8, base_name),
+                                .mode = gc.mode,
+                                .line_ending = .lf,
+                                .content = gc_content,
+                            } });
+                            try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = gc.stamp, .iid = new_iid, .git_oid = gc.oid });
+                        }
                     } else {
                         const parent_iid = try self.ensureParentDirs(self.disk_actor, base_start_ts, rel, &ops, &pending_dirs);
                         const base_name = std.fs.path.basename(rel);
@@ -3007,9 +3164,9 @@ pub const Workspace = struct {
                             .name = try self.allocator.dupe(u8, base_name),
                             .mode = gc.mode,
                             .line_ending = .lf,
-                            .content = .{ .git_lazy = .{ .oid = gc.oid, .len = gc.len } },
+                            .content = gc_content,
                         } });
-                        self.updateShadowForPath(rel, gc.stamp, new_iid, gc.oid, null);
+                        try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = gc.stamp, .iid = new_iid, .git_oid = gc.oid });
                     }
                 },
                 .file => |df| {
@@ -3021,7 +3178,7 @@ pub const Workspace = struct {
                         self.history.tree.endPinScope();
                         if (is_file) {
                             try self.emitUpdateFileOps(iid, df.bytes, df.mode, &ops, &blobs, &new_pins);
-                            self.updateShadowForPath(rel, df.stamp, iid, null, null);
+                            try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = df.stamp, .iid = iid });
                         } else if (!is_dir) {
                             try ops.append(self.allocator, .{ .remove = .{ .inode = iid } });
                             const parent_iid = try self.ensureParentDirs(self.disk_actor, base_start_ts, rel, &ops, &pending_dirs);
@@ -3035,7 +3192,7 @@ pub const Workspace = struct {
                                 .line_ending = cm.line_ending,
                                 .content = cm.content,
                             } });
-                            self.updateShadowForPath(rel, df.stamp, new_iid, cm.git_oid, cm.blob_oid);
+                            try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = df.stamp, .iid = new_iid, .git_oid = cm.git_oid, .blob_oid = cm.blob_oid });
                         }
                     } else {
                         try added_files.append(self.allocator, .{
@@ -3066,7 +3223,7 @@ pub const Workspace = struct {
                                         .target = try self.allocator.dupe(u8, ds.target),
                                     } });
                                 }
-                                self.updateShadowForPath(rel, ds.stamp, iid, null, null);
+                                try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = ds.stamp, .iid = iid });
                             },
                             .file => {
                                 try ops.append(self.allocator, .{ .remove = .{ .inode = iid } });
@@ -3078,7 +3235,7 @@ pub const Workspace = struct {
                                     .name = try self.allocator.dupe(u8, base_name),
                                     .target = try self.allocator.dupe(u8, ds.target),
                                 } });
-                                self.updateShadowForPath(rel, ds.stamp, new_iid, null, null);
+                                try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = ds.stamp, .iid = new_iid });
                             },
                             .dir => {},
                         };
@@ -3091,7 +3248,7 @@ pub const Workspace = struct {
                             .name = try self.allocator.dupe(u8, base_name),
                             .target = try self.allocator.dupe(u8, ds.target),
                         } });
-                        self.updateShadowForPath(rel, ds.stamp, new_iid, null, null);
+                        try shadow_updates.append(self.allocator, .{ .rel = rel, .stamp = ds.stamp, .iid = new_iid });
                     }
                 },
             }
@@ -3120,7 +3277,7 @@ pub const Workspace = struct {
                     .name = try self.allocator.dupe(u8, base_name),
                 } });
                 try self.emitUpdateFileOps(iid, af.bytes, af.mode, &ops, &blobs, &new_pins);
-                self.updateShadowForPath(af.rel, af.stamp, iid, null, null);
+                try shadow_updates.append(self.allocator, .{ .rel = af.rel, .stamp = af.stamp, .iid = iid });
             } else {
                 const cm = try self.makeFileContentAndMeta(af.bytes, &blobs, &new_pins);
                 const new_iid = id.InodeId.init(id.OpId.init(base_start_ts + @as(u64, @intCast(ops.items.len)), self.disk_actor), 0);
@@ -3131,7 +3288,7 @@ pub const Workspace = struct {
                     .line_ending = cm.line_ending,
                     .content = cm.content,
                 } });
-                self.updateShadowForPath(af.rel, af.stamp, new_iid, cm.git_oid, cm.blob_oid);
+                try shadow_updates.append(self.allocator, .{ .rel = af.rel, .stamp = af.stamp, .iid = new_iid, .git_oid = cm.git_oid, .blob_oid = cm.blob_oid });
             }
         }
 
@@ -3143,7 +3300,13 @@ pub const Workspace = struct {
 
         self.flushGitPins(new_pins.items);
 
-        if (ops.items.len == 0) return null;
+        if (ops.items.len == 0) {
+            for (shadow_removals.items) |rel| self.removeStatCache(rel);
+            for (shadow_updates.items) |su| {
+                self.updateShadowForPath(su.rel, su.stamp, su.iid, su.git_oid, su.blob_oid);
+            }
+            return null;
+        }
 
         const batch_parents = try parents.clone(self.allocator);
         const end = base_start_ts + @as(u64, @intCast(ops.items.len)) - 1;
@@ -3161,6 +3324,10 @@ pub const Workspace = struct {
         defer batch.deinit(self.allocator);
 
         _ = try self.commitBatchWithSource(&batch, source);
+        for (shadow_removals.items) |rel| self.removeStatCache(rel);
+        for (shadow_updates.items) |su| {
+            self.updateShadowForPath(su.rel, su.stamp, su.iid, su.git_oid, su.blob_oid);
+        }
         self.synced_version.deinit(self.allocator);
         self.synced_version = try self.history.headsClone();
         return batch.header.batchId();
@@ -3201,12 +3368,21 @@ pub const Workspace = struct {
                             if (self.git_odb) |odb| {
                                 if (gi.find(rel)) |ie| {
                                     if (ie.isRegularFile() and gi.isStatClean(ie, st, gd.config) and odb.contains(ie.oid)) {
-                                        return .{ .git_clean = .{
-                                            .oid = ie.oid,
-                                            .len = st.size,
-                                            .mode = mode,
-                                            .stamp = stamp,
-                                        } };
+                                        if (odb.readBlobAlloc(self.allocator, ie.oid) catch null) |raw_blob| {
+                                            defer self.allocator.free(raw_blob);
+                                            if (raw_blob.len == st.size) {
+                                                const is_bin = isBinaryBytes(raw_blob);
+                                                if (is_bin or detectLineEnding(raw_blob) == .lf) {
+                                                    return .{ .git_clean = .{
+                                                        .oid = ie.oid,
+                                                        .len = st.size,
+                                                        .mode = mode,
+                                                        .is_binary = is_bin,
+                                                        .stamp = stamp,
+                                                    } };
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3294,30 +3470,35 @@ pub const Workspace = struct {
         return cur;
     }
 
+    fn hasLiveFileInSubtree(self: *const Workspace, dir_iid: id.InodeId) bool {
+        var entries = self.history.tree.listDir(self.allocator, text_mod.View.EVERYTHING, dir_iid) catch return false;
+        defer {
+            for (entries.items) |*e| e.deinit(self.allocator);
+            entries.deinit(self.allocator);
+        }
+        for (entries.items) |entry| {
+            self.history.tree.beginPinScope();
+            const inode_opt = self.history.tree.get(entry.inode_id);
+            const is_dir = if (inode_opt) |in| in.isDir() else false;
+            const exists = inode_opt != null;
+            self.history.tree.endPinScope();
+            if (!exists) continue;
+            if (!is_dir) return true;
+            if (self.hasLiveFileInSubtree(entry.inode_id)) return true;
+        }
+        return false;
+    }
+
     fn hasTrackedUnderDir(
         self: *Workspace,
         dir_rel: []const u8,
         use_shadow_tracking: bool,
         existing_paths: *const std.StringHashMapUnmanaged(id.InodeId),
     ) bool {
-        if (use_shadow_tracking) {
-            if (self.shadow.count() == 0) return false;
-            var sit = self.shadow.iterateAll(self.allocator) catch return false;
-            defer sit.deinit();
-            while (sit.next() catch null) |item| {
-                if (item.rel_path.len > dir_rel.len and std.mem.startsWith(u8, item.rel_path, dir_rel) and item.rel_path[dir_rel.len] == '/') {
-                    return true;
-                }
-            }
-            return false;
-        }
-        var it = existing_paths.keyIterator();
-        while (it.next()) |k| {
-            if (k.*.len > dir_rel.len and std.mem.startsWith(u8, k.*, dir_rel) and k.*[dir_rel.len] == '/') {
-                return true;
-            }
-        }
-        return false;
+        _ = use_shadow_tracking;
+        _ = existing_paths;
+        const dir_iid = (self.history.tree.resolvePath(self.allocator, text_mod.View.EVERYTHING, dir_rel) catch null) orelse return false;
+        return self.hasLiveFileInSubtree(dir_iid);
     }
 
     fn scanDir(
@@ -3433,13 +3614,22 @@ pub const Workspace = struct {
                                 if (self.git_odb) |odb| {
                                     if (gi.find(child_rel)) |ie| {
                                         if (ie.isRegularFile() and gi.isStatClean(ie, st, gd.config) and odb.contains(ie.oid)) {
-                                            try out.put(self.allocator, child_rel, .{ .git_clean = .{
-                                                .oid = ie.oid,
-                                                .len = st.size,
-                                                .mode = mode,
-                                                .stamp = stamp,
-                                            } });
-                                            continue;
+                                            if (odb.readBlobAlloc(self.allocator, ie.oid) catch null) |raw_blob| {
+                                                defer self.allocator.free(raw_blob);
+                                                if (raw_blob.len == st.size) {
+                                                    const is_bin = isBinaryBytes(raw_blob);
+                                                    if (is_bin or detectLineEnding(raw_blob) == .lf) {
+                                                        try out.put(self.allocator, child_rel, .{ .git_clean = .{
+                                                            .oid = ie.oid,
+                                                            .len = st.size,
+                                                            .mode = mode,
+                                                            .is_binary = is_bin,
+                                                            .stamp = stamp,
+                                                        } });
+                                                        continue;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -3544,7 +3734,27 @@ pub const Workspace = struct {
                 w.watchSubdirRecursive(self.io, 1, self.root_path, parent_dir) catch {};
             }
         }
-        const tmp_name = try std.fmt.allocPrint(self.allocator, "{s}.0ndb-tmp", .{rel});
+        const existing_st = self.work_dir.statFile(self.io, rel, .{ .follow_symlinks = false }) catch null;
+        var perm_mode: std.posix.mode_t = if (mode == .executable) 0o755 else 0o644;
+        if (existing_st) |st| {
+            if (st.kind == .file) {
+                const raw: std.posix.mode_t = @intCast(st.permissions.toMode() & 0o777);
+                if (mode == .executable) {
+                    var p = raw | 0o100;
+                    if ((raw & 0o040) != 0) p |= 0o010;
+                    if ((raw & 0o004) != 0) p |= 0o001;
+                    perm_mode = p;
+                } else {
+                    const p = raw & ~@as(std.posix.mode_t, 0o111);
+                    if (p != 0) perm_mode = p;
+                }
+            }
+        }
+        const tmp_name = try std.fmt.allocPrint(self.allocator, "{s}.{d}.{d}.0ndb-tmp", .{
+            rel,
+            linux.getpid(),
+            g_tmp_seq.fetchAdd(1, .monotonic),
+        });
         defer self.allocator.free(tmp_name);
         const f = try self.work_dir.createFile(self.io, tmp_name, .{ .truncate = true });
         var f_closed = false;
@@ -3553,11 +3763,15 @@ pub const Workspace = struct {
             self.work_dir.deleteFile(self.io, tmp_name) catch {};
         }
         try f.writePositionalAll(self.io, bytes, 0);
-        const perm_mode: std.posix.mode_t = if (mode == .executable) 0o755 else 0o644;
         f.setPermissions(self.io, Io.File.Permissions.fromMode(perm_mode)) catch {};
         try f.sync(self.io);
         f.close(self.io);
         f_closed = true;
+        if (existing_st) |st| {
+            if (st.kind == .directory) {
+                self.work_dir.deleteTree(self.io, rel) catch {};
+            }
+        }
         try self.work_dir.rename(tmp_name, self.work_dir, rel, self.io);
         self.recordStatFromDisk(rel);
     }
@@ -3576,11 +3790,21 @@ pub const Workspace = struct {
                 w.watchSubdirRecursive(self.io, 1, self.root_path, parent_dir) catch {};
             }
         }
-        const tmp_name = try std.fmt.allocPrint(self.allocator, "{s}.0ndb-sym-tmp", .{rel});
+        const existing_st = self.work_dir.statFile(self.io, rel, .{ .follow_symlinks = false }) catch null;
+        const tmp_name = try std.fmt.allocPrint(self.allocator, "{s}.{d}.{d}.0ndb-sym-tmp", .{
+            rel,
+            linux.getpid(),
+            g_tmp_seq.fetchAdd(1, .monotonic),
+        });
         defer self.allocator.free(tmp_name);
         self.work_dir.deleteFile(self.io, tmp_name) catch {};
         try self.work_dir.symLink(self.io, target, tmp_name, .{});
         errdefer self.work_dir.deleteFile(self.io, tmp_name) catch {};
+        if (existing_st) |st| {
+            if (st.kind == .directory) {
+                self.work_dir.deleteTree(self.io, rel) catch {};
+            }
+        }
         try self.work_dir.rename(tmp_name, self.work_dir, rel, self.io);
         self.recordStatFromDisk(rel);
     }
@@ -3878,12 +4102,60 @@ pub const Workspace = struct {
         }
     }
 
+    fn hydrateBatchInodesForBids(self: *Workspace, batch_ids: []const id.BatchId) !void {
+        for (batch_ids) |bid| {
+            if (self.history.batch_inodes.contains(bid)) continue;
+            const payload = (try self.readBatchPayloadAlloc(self.allocator, bid)) orelse continue;
+            defer self.allocator.free(payload);
+            var r = codec.Reader.init(payload);
+            var batch = op_mod.Batch.decode(self.allocator, &r) catch continue;
+            defer batch.deinit(self.allocator);
+            var list: std.ArrayList(id.InodeId) = .empty;
+            errdefer list.deinit(self.history.allocator);
+            var seen: std.AutoHashMapUnmanaged(id.InodeId, void) = .empty;
+            defer seen.deinit(self.allocator);
+            for (batch.ops, 0..) |*operation, idx| {
+                const maybe_iid: ?id.InodeId = switch (operation.*) {
+                    .create_dir, .create_file, .create_symlink => id.InodeId.init(batch.header.opId(idx), 0),
+                    .edit_text => |v| v.inode,
+                    .set_content => |v| v.inode,
+                    .set_mode => |v| v.inode,
+                    .set_line_ending => |v| v.inode,
+                    .set_symlink_target => |v| v.inode,
+                    .remove => |v| v.inode,
+                    .restore => |v| v.inode,
+                    .rename => |v| v.inode,
+                    else => null,
+                };
+                if (maybe_iid) |iid| {
+                    if (!seen.contains(iid)) {
+                        try seen.put(self.allocator, iid, {});
+                        try list.append(self.history.allocator, iid);
+                    }
+                }
+            }
+            const slice = try list.toOwnedSlice(self.history.allocator);
+            errdefer self.history.allocator.free(slice);
+            try self.history.batch_inodes.put(self.history.allocator, bid, slice);
+        }
+    }
+
+    fn hydrateBatchInodes(self: *Workspace, target_version: *const Version) !void {
+        var diff_a = try self.history.dag.difference(self.allocator, &self.history.dag.heads, target_version);
+        defer diff_a.deinit(self.allocator);
+        try self.hydrateBatchInodesForBids(diff_a.items);
+        var diff_b = try self.history.dag.difference(self.allocator, target_version, &self.history.dag.heads);
+        defer diff_b.deinit(self.allocator);
+        try self.hydrateBatchInodesForBids(diff_b.items);
+    }
+
     pub fn rollbackToVersionWithSource(self: *Workspace, target_version: *const Version, source: []const u8) !bool {
         if (self.watcher != null) {
             _ = try self.drainWatched("watch");
         } else {
             _ = try self.ingestDiskWithSource("disk");
         }
+        try self.hydrateBatchInodes(target_version);
         var batch = try self.history.buildRollbackBatch(
             self.allocator,
             self.disk_actor,

@@ -49,9 +49,11 @@ pub const PruneResult = struct {
     removed_frames: usize = 0,
     max_seg_id: u32 = 0,
     remaps: std.ArrayList(RemapEntry) = .empty,
+    obsolete_seg_ids: std.ArrayList(u32) = .empty,
 
     pub fn deinit(self: *PruneResult, allocator: Allocator) void {
         self.remaps.deinit(allocator);
+        self.obsolete_seg_ids.deinit(allocator);
     }
 };
 
@@ -274,7 +276,27 @@ pub const SegmentStore = struct {
         }
     }
 
+    pub fn unlinkSegments(self: *SegmentStore, seg_ids: []const u32) void {
+        var deleted_any = false;
+        for (seg_ids) |seg_id| {
+            self.evictMapped(seg_id);
+            var name_buf: [20]u8 = undefined;
+            const fname = segmentFileName(seg_id, &name_buf);
+            self.seg_dir.deleteFile(self.io, fname) catch {};
+            deleted_any = true;
+        }
+        if (deleted_any) {
+            mmap.fsyncDir(self.io, self.seg_dir) catch {};
+        }
+    }
+
     pub fn pruneSegments(self: *SegmentStore, keepFn: anytype) !PruneResult {
+        const res = try self.pruneSegmentsDeferred(keepFn);
+        self.unlinkSegments(res.obsolete_seg_ids.items);
+        return res;
+    }
+
+    pub fn pruneSegmentsDeferred(self: *SegmentStore, keepFn: anytype) !PruneResult {
         var result = PruneResult{};
         errdefer result.deinit(self.allocator);
 
@@ -282,7 +304,7 @@ pub const SegmentStore = struct {
         defer self.allocator.free(seg_ids);
 
         var next_seg_id: u32 = if (seg_ids.len > 0) seg_ids[seg_ids.len - 1] + 1 else 1;
-        var deleted_any = false;
+        var wrote_any = false;
         var highest_live: u32 = 0;
 
         const ScannedFrame = struct {
@@ -350,11 +372,7 @@ pub const SegmentStore = struct {
             }
 
             if (live_count == 0) {
-                self.evictMapped(seg_id);
-                var name_buf: [20]u8 = undefined;
-                const fname = segmentFileName(seg_id, &name_buf);
-                self.seg_dir.deleteFile(self.io, fname) catch {};
-                deleted_any = true;
+                try result.obsolete_seg_ids.append(self.allocator, seg_id);
                 result.removed_segments += 1;
                 result.removed_frames += dead_count;
                 continue;
@@ -384,12 +402,9 @@ pub const SegmentStore = struct {
             var new_name_buf: [20]u8 = undefined;
             const new_fname = segmentFileName(new_seg_id, &new_name_buf);
             try mmap.atomicWriteFile(self.io, self.seg_dir, new_fname, out_buf);
+            wrote_any = true;
 
-            self.evictMapped(seg_id);
-            var old_name_buf: [20]u8 = undefined;
-            const old_fname = segmentFileName(seg_id, &old_name_buf);
-            self.seg_dir.deleteFile(self.io, old_fname) catch {};
-            deleted_any = true;
+            try result.obsolete_seg_ids.append(self.allocator, seg_id);
 
             result.rewritten_segments += 1;
             result.kept_frames += live_count;
@@ -397,7 +412,7 @@ pub const SegmentStore = struct {
             if (new_seg_id > highest_live) highest_live = new_seg_id;
         }
 
-        if (deleted_any) {
+        if (wrote_any) {
             try mmap.fsyncDir(self.io, self.seg_dir);
         }
         result.max_seg_id = highest_live;

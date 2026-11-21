@@ -129,6 +129,11 @@ pub const MemoryGovernor = struct {
     }
 };
 
+const GitOdbPoolEntry = struct {
+    odb: *git_odb.GitOdb,
+    map_refs: usize,
+};
+
 pub const DaemonResources = struct {
     allocator: Allocator,
     io: Io,
@@ -136,7 +141,7 @@ pub const DaemonResources = struct {
     governor: MemoryGovernor,
     blob_pool: *blobs.SharedBlobPool,
     git_odbs_mu: Io.Mutex,
-    git_odbs: std.StringHashMapUnmanaged(*git_odb.GitOdb),
+    git_odbs: std.StringHashMapUnmanaged(GitOdbPoolEntry),
     watcher_mu: Io.Mutex,
     watcher: ?*watch.DaemonWatcher,
 
@@ -189,7 +194,10 @@ pub const DaemonResources = struct {
         var it = self.git_odbs.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
-            entry.value_ptr.*.deinit();
+            var n: usize = 0;
+            while (n < entry.value_ptr.map_refs) : (n += 1) {
+                entry.value_ptr.odb.release();
+            }
         }
         self.git_odbs.deinit(alloc);
 
@@ -218,22 +226,27 @@ pub const DaemonResources = struct {
         self.git_odbs_mu.lockUncancelable(self.io);
         defer self.git_odbs_mu.unlock(self.io);
 
-        if (self.git_odbs.get(canon)) |existing| {
-            existing.retain();
-            return existing;
+        if (self.git_odbs.getPtr(canon)) |existing| {
+            existing.map_refs += 1;
+            existing.odb.retain();
+            return existing.odb;
         }
 
         const odb = try git_odb.GitOdb.open(self.allocator, self.io, canon, format, pin_ref);
-        errdefer odb.deinit();
+        var odb_owned = true;
+        errdefer if (odb_owned) odb.release();
 
         if (self.governor.budget.shared_git_delta_bytes > 0) {
             odb.delta_cache.budget = self.governor.budget.shared_git_delta_bytes;
         }
 
         const key = try self.allocator.dupe(u8, canon);
-        errdefer self.allocator.free(key);
+        var key_owned = true;
+        errdefer if (key_owned) self.allocator.free(key);
 
-        try self.git_odbs.put(self.allocator, key, odb);
+        try self.git_odbs.put(self.allocator, key, .{ .odb = odb, .map_refs = 1 });
+        odb_owned = false;
+        key_owned = false;
         return odb;
     }
 
@@ -241,7 +254,7 @@ pub const DaemonResources = struct {
         var real_buf: [std.fs.max_path_bytes]u8 = undefined;
         const canon = canonicalizePath(self.io, common_dir_path, &real_buf);
 
-        var to_destroy: ?*git_odb.GitOdb = null;
+        var to_release: ?*git_odb.GitOdb = null;
         {
             self.git_odbs_mu.lockUncancelable(self.io);
             defer self.git_odbs_mu.unlock(self.io);
@@ -253,17 +266,19 @@ pub const DaemonResources = struct {
             else
                 return;
 
-            const odb = self.git_odbs.get(lookup_key).?;
-            if (odb.ref_count.fetchSub(1, .acq_rel) == 1) {
+            const entry = self.git_odbs.getPtr(lookup_key).?;
+            to_release = entry.odb;
+            if (entry.map_refs <= 1) {
                 if (self.git_odbs.fetchRemove(lookup_key)) |kv| {
                     self.allocator.free(kv.key);
                 }
-                to_destroy = odb;
+            } else {
+                entry.map_refs -= 1;
             }
         }
 
-        if (to_destroy) |odb| {
-            odb.deinit();
+        if (to_release) |odb| {
+            odb.release();
         }
     }
 
@@ -299,8 +314,8 @@ pub const DaemonResources = struct {
             self.git_odbs_mu.lockUncancelable(self.io);
             defer self.git_odbs_mu.unlock(self.io);
             var it = self.git_odbs.valueIterator();
-            while (it.next()) |odb_ptr| {
-                const odb = odb_ptr.*;
+            while (it.next()) |entry_ptr| {
+                const odb = entry_ptr.odb;
                 odb.lock();
                 total_delta += odb.delta_cache.used;
                 odb.unlock();
@@ -327,7 +342,7 @@ pub const DaemonResources = struct {
             defer self.git_odbs_mu.unlock(self.io);
             var it = self.git_odbs.valueIterator();
             while (it.next()) |odb_ptr| {
-                odb_ptr.*.hibernate();
+                odb_ptr.odb.hibernate();
             }
         }
 
