@@ -75,6 +75,70 @@ it is recorded but never parsed.
 - `list_models(d)` returns request bytes; the answer arrives as a `Models`
   event (ACP agents emit `Models` whenever a session opens).
 
+## Provider registry
+
+Every provider is a `Provider_Descriptor{id, name, argv, protocol,
+capabilities, env, steer, client_meta, undo, store, seed_style,
+seed_budget}`. `protocol` picks the driver family: `Claude_Stream_Json`,
+`Codex_App_Server`, `Pi_Rpc`, `Muse` or `Acp`. For `Codex_App_Server`,
+`Muse` and `Acp`, `argv` is the whole server command (`codex app-server`,
+`muse serve`, `opencode acp`); for `Claude_Stream_Json` and `Pi_Rpc` it is
+the program prefix and the driver appends the protocol flags (stream-json,
+`--mode rpc`, model, resume, ...). `Start_Request.program` replaces
+`argv[0]`; `env` is added to every launch. ACP-only fields: `steer` (`Auto`
+lets the driver detect `midTurnPrompts` / a `steer` command, else it
+cancels and continues), `client_meta` (keys sent as `true` in
+`clientCapabilities._meta`), `undo` (the agent has `/undo N`). `store`
+names how its native sessions are exported (below); `seed_style` /
+`seed_budget` shape the seed fallback.
+
+`builtin(p)` returns the descriptor of each of the nine built-ins (static
+data); `registry_init` registers them; `register(r, desc)` adds or replaces
+a provider by id (the registry owns a copy); `lookup(r, id)` finds one;
+`init_with(d, desc, req)` starts a driver from any descriptor (`init(d,
+provider, req)` is `init_with(d, builtin(provider), req)`).
+
+## Session portability
+
+`export_session(desc, env, session, native_path)` returns a `Port_Plan`
+for moving a provider's own session state to another machine or runner,
+where `env = Port_Env{home, cwd, scratch, env}` describes the provider's
+environment there (`env` holds overrides such as `CLAUDE_CONFIG_DIR`):
+
+1. the host runs `plan.runs` (argv, cwd, env; stdout saved under the bundle
+   key `stdout` when set);
+2. reads `plan.files` (a file or, with `dir`, a tree; `optional` ones may be
+   absent; with `match`, `path` is a directory to search for the file whose
+   path ends with `match`, and the host replaces `path` with what it found);
+3. stores the bytes under each `key` plus `export_manifest(desc, env,
+   session, files)` as the bundle's manifest (JSON: format, provider, store,
+   session, cwd, home, store root, and each file's key, path and path
+   relative to the root).
+
+`import_session(desc, manifest, env)` returns the reverse plan for the
+target environment: write each bundle `key` to `files[i].path` (trees
+recursively), passing `rewrite` files through `apply_rewrites(plan, bytes)`
+(one pass, longest match first, binary files untouched), then run
+`plan.runs`. The native session id to resume is `plan.session`, or
+`import_result(desc, plan, run_outputs)` when the provider assigns a new one.
+`native_path` / `session_path(d)` is the file the driver saw the provider
+report (Codex `thread.path`, Muse `session.path`, Pi `sessionFile`). When a
+provider cannot import (`plan.seeded`, with `reason`), the host starts the
+next driver with `Start_Request.seed` instead: a fresh session seeded with
+the transcript, reported as `Rewound{path = Seeded}`.
+
+| Provider | Native state | Export | Import | Verified |
+|---|---|---|---|---|
+| Claude Code | `$CLAUDE_CONFIG_DIR` or `~/.claude` → `projects/<key>/<session>.jsonl` plus `projects/<key>/<session>/` (sub-agent transcripts, tool results). `<key>` is the absolute cwd with every UTF-16 unit outside `[A-Za-z0-9]` replaced by `-`; longer than 200 → first 200 + `-` + base-36 of `abs(h)`, `h = (h<<5) - h + unit` in 32 bits | copy both | same layout under the new root and key; rewrite old projects dir, key, root, cwd and home in the JSONL; same session id | live: session made in config dir A / cwd A, resumed with `--resume` from config dir B / cwd B and remembered its word |
+| Codex | `$CODEX_HOME` or `~/.codex` → `sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl` (also indexed in `state_5.sqlite`, but resume finds the file by id) | copy the rollout | same relative path under the new root; rewrite cwd/home; same thread id | live: `thread/resume` in a fresh `CODEX_HOME` returned both turns (no model turn: CLI not logged in) |
+| Pi | the session file itself (`~/.pi/agent/sessions/--<cwd without leading /, / \ : → ->--/<time>_<id>.jsonl`, or `PI_CODING_AGENT_SESSION_DIR` / `PI_CODING_AGENT_DIR`) | copy | new sessions dir keyed by the new cwd; rewrite the header `cwd`; **new session id = new path** | live: a session file exported from one agent dir loaded with `--session` from another (no model: no API key) |
+| Muse | `~/.local/share/muse/sessions/YYYY/MM/DD/<id>/session.jsonl` (`session.path`) | copy | same relative path, **byte for byte** (the log is fingerprinted; rewriting it makes resume refuse with "stored session.start fingerprint does not match"); the driver sends `workspaceRoots: [cwd]` on every `turn/start` so the new cwd applies | live: `session/resume` in a fresh HOME, then a turn (fails only on login) |
+| OpenCode | SQLite `$XDG_DATA_HOME/opencode/opencode.db` | run `opencode export <id>` (JSON on stdout) | rewrite `directory` / `path` (cwd without its leading `/`), then `opencode import <file>`; same session id | live: exported from the default data dir, imported into a fresh `XDG_DATA_HOME` and cwd, resumed with `session/resume`, remembered its word |
+| Hermes | SQLite `$HERMES_HOME/state.db` (default `~/.hermes`) | run `hermes sessions export --format trace --session-id <id> --yes <file>` (Claude Code JSONL) | rewrite cwd/home, run `hermes sessions import --from claude <file>`; **new id** parsed from "Imported Claude Code session as <id>" | live: imported into a fresh `HERMES_HOME`, resumed over ACP, answered from the imported history |
+| Cursor | `$CURSOR_CONFIG_DIR`, `$XDG_CONFIG_HOME/cursor` or `~/.cursor` → `chats/<md5(abs cwd)>/<chatId>/store.db` (SQLite) | copy the chat directory | same under the new cwd's md5, byte for byte; same chat id | layout read from the shipped source; not exercised (needs login) |
+| Antigravity | `$GEMINI_HOME` or `~/.gemini` → `antigravity-acp/conversations/<id>.db` (SQLite trajectory) and `<id>.meta` (JSON), `antigravity-acp/brain/<id>/` | copy | same relative paths; rewrite only `.meta`; same id | layout read from the shipped source; not exercised (needs login) |
+| Devin | one shared SQLite `~/.local/share/devin/cli/sessions.db` | none | seed fallback (`plan.seeded`) | — |
+
 ## Claude Code (`claude`, 2.1.330)
 
 - Launch: `claude -p --input-format stream-json --output-format stream-json

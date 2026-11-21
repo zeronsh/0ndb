@@ -5,7 +5,7 @@ import "core:strings"
 
 @(private)
 muse_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
-	append(argv, program(d, "muse"), "serve")
+	base_argv(d, argv)
 	rpc_request(b, request(d, .Initialize), "initialize")
 	f_obj(b, "clientInfo")
 	f_str(b, "name", "ondb")
@@ -107,6 +107,11 @@ muse_write_prompt :: proc(d: ^Driver, b: ^[dynamic]u8, p: ^Prompt) {
 	}
 	close_arr(b)
 	f_str(b, "ifBusy", p.steer ? "steer" : "queue")
+	if d.req.cwd != "" {
+		f_arr(b, "workspaceRoots")
+		w_str(b, d.req.cwd)
+		close_arr(b)
+	}
 	if d.req.effort != "" {
 		f_str(b, "reasoningEffort", d.req.effort)
 	}
@@ -396,6 +401,7 @@ muse_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 			}
 			return
 		}
+		set(d, &d.native_path, get_str(get(result, "session"), "path"))
 		open_session(d, o, get_str(get(result, "session"), "sessionId"))
 		d.ready = true
 		for &q in d.prompts {

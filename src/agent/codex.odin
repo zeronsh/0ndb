@@ -5,7 +5,7 @@ import "core:strings"
 
 @(private)
 codex_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
-	append(argv, program(d, "codex"), "app-server")
+	base_argv(d, argv)
 	rpc_request(b, request(d, .Initialize), "initialize", false)
 	f_obj(b, "clientInfo")
 	f_str(b, "name", "ondb")
@@ -303,6 +303,7 @@ codex_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 			}
 			return
 		}
+		set(d, &d.native_path, get_str(get(result, "thread"), "path"))
 		open_session(d, o, get_str(get(result, "thread"), "id"))
 		d.ready = true
 		codex_flush(d, o)

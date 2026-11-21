@@ -4,22 +4,6 @@ import "core:mem"
 import "core:strings"
 
 @(private)
-seed_budget :: proc(p: Provider, budget: int) -> int {
-	if budget > 0 {
-		return budget
-	}
-	switch p {
-	case .Claude, .Codex, .Muse:
-		return 120_000
-	case .Pi, .Hermes, .Devin, .Antigravity:
-		return 80_000
-	case .Cursor, .OpenCode:
-		return 60_000
-	}
-	return 60_000
-}
-
-@(private)
 clip :: proc(s: string, limit: int) -> (string, bool) {
 	if len(s) <= limit {
 		return s, false
@@ -95,9 +79,9 @@ seed_entry :: proc(b: ^[dynamic]u8, xml: bool, e: Seed_Entry, compact: bool) {
 }
 
 @(private)
-render_seed :: proc(p: Provider, entries: []Seed_Entry, budget: int, allocator: mem.Allocator) -> string {
-	limit := seed_budget(p, budget)
-	xml := p == .Claude
+render_seed :: proc(desc: Provider_Descriptor, entries: []Seed_Entry, budget: int, allocator: mem.Allocator) -> string {
+	limit := budget > 0 ? budget : desc.seed_budget > 0 ? desc.seed_budget : 60_000
+	xml := desc.seed_style == .Xml
 	parts := make([]string, len(entries), context.temp_allocator)
 	used := 0
 	first := len(entries)

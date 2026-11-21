@@ -6,7 +6,8 @@ import "core:strings"
 
 @(private)
 pi_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
-	append(argv, program(d, "pi"), "--mode", "rpc", "--no-themes")
+	base_argv(d, argv)
+	append(argv, "--mode", "rpc", "--no-themes")
 	if d.req.model != "" {
 		append(argv, "--model", d.req.model)
 	}
@@ -386,6 +387,7 @@ pi_response :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 		if file == "" {
 			file = get_str(data, "sessionId")
 		}
+		set(d, &d.native_path, get_str(data, "sessionFile"))
 		open_session(d, o, file)
 		if d.checkpoint == "" && get_u64(data, "messageCount") > 0 {
 			pi_command(d, &o.bytes, .Entries, "get_entries")

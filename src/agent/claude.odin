@@ -6,9 +6,9 @@ import "core:strings"
 
 @(private)
 claude_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
+	base_argv(d, argv)
 	append(
 		argv,
-		program(d, "claude"),
 		"-p",
 		"--input-format",
 		"stream-json",

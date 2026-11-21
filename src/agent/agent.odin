@@ -55,6 +55,7 @@ Notice_Level :: enum u8 {
 Error :: enum u8 {
 	None,
 	Out_Of_Memory,
+	Invalid_Descriptor,
 }
 
 Rewind_Path :: enum u8 {
@@ -104,6 +105,7 @@ Start_Request :: struct {
 	checkpoint:      string,
 	rewind:          Rewind_Target,
 	seed_budget:     int,
+	seed:            []Seed_Entry,
 	env:             []string,
 }
 
@@ -315,7 +317,8 @@ Acp_Steer :: enum u8 {
 }
 
 Driver :: struct {
-	provider:    Provider,
+	desc:        Provider_Descriptor,
+	native_path: string,
 	allocator:   mem.Allocator,
 	req:         Start_Request,
 	session:     string,
@@ -360,19 +363,7 @@ Driver :: struct {
 }
 
 capabilities :: proc(p: Provider) -> Capabilities {
-	switch p {
-	case .Claude:
-		return {.Native_Steer, .Resume, .Fork_At_Message, .Persistent, .List_Models, .Images, .Files}
-	case .Codex, .Pi, .Muse:
-		return {.Native_Steer, .Resume, .Fork_At_Message, .Persistent, .List_Models, .Images}
-	case .Hermes, .Devin:
-		return {.Native_Steer, .Resume, .Fork_At_Message, .Persistent, .List_Models, .Images, .Files}
-	case .OpenCode, .Cursor:
-		return {.Native_Steer, .Resume, .Persistent, .List_Models, .Images, .Files}
-	case .Antigravity:
-		return {.Resume, .Persistent, .List_Models, .Images, .Files}
-	}
-	return {}
+	return builtin(p).capabilities
 }
 
 provider_name :: proc(p: Provider) -> string {
@@ -419,8 +410,19 @@ provider_from_name :: proc(name: string) -> (Provider, bool) {
 }
 
 init :: proc(d: ^Driver, provider: Provider, req: Start_Request, allocator := context.allocator) -> Error {
+	return init_with(d, builtin(provider), req, allocator)
+}
+
+init_with :: proc(d: ^Driver, desc: Provider_Descriptor, req: Start_Request, allocator := context.allocator) -> Error {
 	d^ = {}
-	d.provider = provider
+	if desc.id == "" || len(desc.argv) == 0 {
+		return .Invalid_Descriptor
+	}
+	owned, derr := clone_descriptor(desc, allocator)
+	if derr != .None {
+		return derr
+	}
+	d.desc = owned
 	d.allocator = allocator
 	d.next_id = 1
 	d.pending = make([dynamic]Pending, allocator)
@@ -448,8 +450,16 @@ init :: proc(d: ^Driver, provider: Provider, req: Start_Request, allocator := co
 	d.turns = checkpoint_turns(req.checkpoint)
 	if req.rewind.session != "" {
 		begin_rewind(d, req.rewind.seed)
+	} else if len(req.seed) > 0 && req.resume == "" {
+		set(d, &d.seed, render_seed(d.desc, req.seed, req.seed_budget, context.temp_allocator))
+		d.rewinding = true
+		d.rewind_path = .Seeded
 	}
 	return .None
+}
+
+session_path :: proc(d: ^Driver) -> string {
+	return d.native_path
 }
 
 destroy :: proc(d: ^Driver) {
@@ -472,6 +482,8 @@ destroy :: proc(d: ^Driver) {
 	delete(d.stream_item, a)
 	delete(d.reason_item, a)
 	delete(d.model_opt, a)
+	delete(d.native_path, a)
+	drop_descriptor(&d.desc, a)
 	delete(d.seed, a)
 	delete(d.seed_for, a)
 	delete(d.fallback, a)
@@ -506,19 +518,22 @@ launch :: proc(d: ^Driver, allocator := context.temp_allocator) -> Launch {
 	d.usage = {}
 	argv := make([dynamic]string, allocator)
 	b := make([dynamic]u8, allocator)
-	switch d.provider {
-	case .Claude:
+	switch d.desc.protocol {
+	case .Claude_Stream_Json:
 		claude_launch(d, &argv, &b)
-	case .Codex:
+	case .Codex_App_Server:
 		codex_launch(d, &argv, &b)
-	case .Pi:
+	case .Pi_Rpc:
 		pi_launch(d, &argv, &b)
 	case .Muse:
 		muse_launch(d, &argv, &b)
-	case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+	case .Acp:
 		acp_launch(d, &argv, &b)
 	}
-	return Launch{argv = argv[:], env = d.req.env, cwd = d.req.cwd, stdin = b[:]}
+	env := make([dynamic]string, allocator)
+	append(&env, ..d.desc.env)
+	append(&env, ..d.req.env)
+	return Launch{argv = argv[:], env = env[:], cwd = d.req.cwd, stdin = b[:]}
 }
 
 feed :: proc(d: ^Driver, line: []u8, allocator := context.temp_allocator) -> Output {
@@ -532,16 +547,16 @@ feed :: proc(d: ^Driver, line: []u8, allocator := context.temp_allocator) -> Out
 		notice(&o, .Warning, text)
 		return o
 	}
-	switch d.provider {
-	case .Claude:
+	switch d.desc.protocol {
+	case .Claude_Stream_Json:
 		claude_feed(d, v, &o)
-	case .Codex:
+	case .Codex_App_Server:
 		codex_feed(d, v, &o)
-	case .Pi:
+	case .Pi_Rpc:
 		pi_feed(d, v, &o)
 	case .Muse:
 		muse_feed(d, v, &o)
-	case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+	case .Acp:
 		acp_feed(d, v, &o)
 	}
 	return o
@@ -566,16 +581,16 @@ submit :: proc(d: ^Driver, text, id: string, files: []Attachment, steer: bool, a
 	}
 	add_prompt(d, pid, body, steer, false, "", files)
 	p := &d.prompts[len(d.prompts) - 1]
-	switch d.provider {
-	case .Claude:
+	switch d.desc.protocol {
+	case .Claude_Stream_Json:
 		claude_submit(d, p, &o)
-	case .Codex:
+	case .Codex_App_Server:
 		codex_submit(d, p, &o)
-	case .Pi:
+	case .Pi_Rpc:
 		pi_submit(d, p, &o)
 	case .Muse:
 		muse_submit(d, p, &o)
-	case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+	case .Acp:
 		acp_submit(d, p, &o)
 	}
 	return o
@@ -583,16 +598,16 @@ submit :: proc(d: ^Driver, text, id: string, files: []Attachment, steer: bool, a
 
 interrupt :: proc(d: ^Driver, allocator := context.temp_allocator) -> Output {
 	o := output(allocator)
-	switch d.provider {
-	case .Claude:
+	switch d.desc.protocol {
+	case .Claude_Stream_Json:
 		claude_interrupt(d, &o)
-	case .Codex:
+	case .Codex_App_Server:
 		codex_interrupt(d, &o)
-	case .Pi:
+	case .Pi_Rpc:
 		pi_interrupt(d, &o)
 	case .Muse:
 		muse_interrupt(d, &o)
-	case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+	case .Acp:
 		acp_interrupt(d, &o)
 	}
 	return o
@@ -613,16 +628,16 @@ rewind :: proc(d: ^Driver, target: Rewind_Target, allocator := context.temp_allo
 		set(d, &d.req.rewind.head, d.checkpoint)
 	}
 	begin_rewind(d, target.seed)
-	switch d.provider {
-	case .Claude:
+	switch d.desc.protocol {
+	case .Claude_Stream_Json:
 		claude_rewind(d, &o)
-	case .Codex:
+	case .Codex_App_Server:
 		codex_rewind(d, &o)
-	case .Pi:
+	case .Pi_Rpc:
 		pi_rewind(d, &o)
 	case .Muse:
 		muse_rewind(d, &o)
-	case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+	case .Acp:
 		acp_rewind(d, &o)
 	}
 	return o
@@ -634,16 +649,16 @@ answer_permission :: proc(d: ^Driver, id: string, decision: Decision, allocator 
 		if p.id != id {
 			continue
 		}
-		switch d.provider {
-		case .Claude:
+		switch d.desc.protocol {
+		case .Claude_Stream_Json:
 			claude_answer(d, &p, decision, &o)
-		case .Codex:
+		case .Codex_App_Server:
 			codex_answer(d, &p, decision, &o)
-		case .Pi:
+		case .Pi_Rpc:
 			pi_answer(d, &p, decision, &o)
 		case .Muse:
 			muse_answer(d, &p, decision, &o)
-		case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+		case .Acp:
 			acp_answer(d, &p, decision, &o)
 		}
 		drop_perm(d, &p)
@@ -656,16 +671,16 @@ answer_permission :: proc(d: ^Driver, id: string, decision: Decision, allocator 
 
 list_models :: proc(d: ^Driver, allocator := context.temp_allocator) -> Output {
 	o := output(allocator)
-	switch d.provider {
-	case .Claude:
+	switch d.desc.protocol {
+	case .Claude_Stream_Json:
 		claude_list_models(d, &o)
-	case .Codex:
+	case .Codex_App_Server:
 		codex_list_models(d, &o)
-	case .Pi:
+	case .Pi_Rpc:
 		pi_list_models(d, &o)
 	case .Muse:
 		muse_list_models(d, &o)
-	case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+	case .Acp:
 		acp_list_models(d, &o)
 	}
 	return o
@@ -673,8 +688,7 @@ list_models :: proc(d: ^Driver, allocator := context.temp_allocator) -> Output {
 
 close :: proc(d: ^Driver, allocator := context.temp_allocator) -> Output {
 	o := output(allocator)
-	#partial switch d.provider {
-	case .Antigravity, .Cursor, .Devin, .Hermes, .OpenCode:
+	if d.desc.protocol == .Acp {
 		acp_close(d, &o)
 	}
 	o.close_stdin = true
@@ -700,7 +714,7 @@ process_exited :: proc(d: ^Driver, message: string, allocator := context.temp_al
 	d.ready = false
 	d.running = false
 	d.in_flight = 0
-	if d.provider == .Claude && d.rewinding && d.req.rewind.after != "" && take_fallback(d) {
+	if d.desc.protocol == .Claude_Stream_Json && d.rewinding && d.req.rewind.after != "" && take_fallback(d) {
 		drop_target(d, &d.req.rewind)
 		set(d, &d.req.resume, "")
 		o.restart = true
@@ -998,7 +1012,7 @@ begin_rewind :: proc(d: ^Driver, seed: []Seed_Entry) {
 	d.rewind_path = d.req.rewind.after == "" ? .Fresh : .Native
 	set(d, &d.fallback, "")
 	if len(seed) > 0 && d.req.rewind.after != "" {
-		set(d, &d.fallback, render_seed(d.provider, seed, d.req.seed_budget, context.temp_allocator))
+		set(d, &d.fallback, render_seed(d.desc, seed, d.req.seed_budget, context.temp_allocator))
 	}
 }
 
@@ -1098,8 +1112,10 @@ new_uuid :: proc() -> string {
 }
 
 @(private)
-program :: proc(d: ^Driver, default_name: string) -> string {
-	return d.req.program != "" ? d.req.program : default_name
+base_argv :: proc(d: ^Driver, argv: ^[dynamic]string) {
+	for a, i in d.desc.argv {
+		append(argv, i == 0 && d.req.program != "" ? d.req.program : a)
+	}
 }
 
 @(private)

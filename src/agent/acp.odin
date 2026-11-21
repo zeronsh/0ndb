@@ -6,32 +6,18 @@ import "core:strings"
 
 @(private)
 acp_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
-	#partial switch d.provider {
-	case .Antigravity:
-		append(argv, program(d, "agy_acp_server"))
-		when ODIN_OS == .Linux {
-			append(argv, "--uid=")
-		}
-	case .Cursor:
-		append(argv, program(d, "cursor-agent"), "acp")
-	case .Devin:
-		append(argv, program(d, "devin"), "acp", "--process-model", "in-process")
-	case .Hermes:
-		append(argv, program(d, "hermes"), "acp")
-	case .OpenCode:
-		append(argv, program(d, "opencode"), "acp")
-	}
-	#partial switch d.provider {
-	case .OpenCode:
-		d.steer_mode = .Concurrent
-	case .Cursor:
-		d.steer_mode = .Supersede
-	case .Hermes:
-		d.steer_mode = .Command
-		d.has_undo = true
-	case:
+	base_argv(d, argv)
+	switch d.desc.steer {
+	case .Auto, .Cancel:
 		d.steer_mode = .Cancel
+	case .Concurrent:
+		d.steer_mode = .Concurrent
+	case .Supersede:
+		d.steer_mode = .Supersede
+	case .Command:
+		d.steer_mode = .Command
 	}
+	d.has_undo = d.desc.undo
 	rpc_request(b, request(d, .Initialize), "initialize")
 	f_int(b, "protocolVersion", 1)
 	f_obj(b, "clientCapabilities")
@@ -40,10 +26,11 @@ acp_launch :: proc(d: ^Driver, argv: ^[dynamic]string, b: ^[dynamic]u8) {
 	f_bool(b, "writeTextFile", false)
 	close_obj(b)
 	f_bool(b, "terminal", false)
-	if d.provider == .Devin {
+	if len(d.desc.client_meta) > 0 {
 		f_obj(b, "_meta")
-		f_bool(b, "cognition.ai/revert", true)
-		f_bool(b, "cognition.ai/revertByUserMessageId", true)
+		for k in d.desc.client_meta {
+			f_bool(b, k, true)
+		}
 		close_obj(b)
 	}
 	close_obj(b)
@@ -63,7 +50,7 @@ acp_session_params :: proc(d: ^Driver, b: ^[dynamic]u8) {
 @(private)
 acp_open_session :: proc(d: ^Driver, o: ^Output, method, session: string) {
 	b := &o.bytes
-	d.replaying = method == "session/load" || method == "session/fork"
+	d.replaying = method == "session/load" || method == "session/fork" || method == "session/resume"
 	rpc_request(b, request(d, .Open, session), method)
 	if session != "" {
 		f_str(b, "sessionId", session)
