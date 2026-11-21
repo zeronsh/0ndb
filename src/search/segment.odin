@@ -2,11 +2,14 @@ package search
 
 import "base:runtime"
 import "core:hash/xxhash"
+import "core:slice"
 import "../prim"
 
 SEG_MAGIC :: u64(0x6765_7368_6372_7330)
-SEG_VERSION :: u64(3)
-NFIELDS :: 36
+SEG_VERSION :: u64(9)
+RESTART :: 64
+SUPER_ENTRY :: 12
+NFIELDS :: 40
 FOOTER_SIZE :: (NFIELDS + 3) * 8
 DIR_ENTRY :: 40
 OUT_BUF :: 256 * 1024
@@ -46,9 +49,13 @@ Footer :: struct {
 	vec_dim:    u64,
 	vids_off:   i64,
 	vdata_off:  i64,
-	ivf_off:    i64,
-	ivf_len:    i64,
+	vcodes_off: i64,
+	vrec:       i64,
 	cb_gen:     u64,
+	vec_m:      u64,
+	medoid:     u64,
+	w_first:    u64,
+	w_count:    u64,
 	sum:        u64,
 }
 
@@ -69,11 +76,27 @@ Dir_Entry :: struct {
 }
 
 Term :: struct {
-	count: u32,
-	inl:   [INLINE]u32,
-	off:   i64,
-	plen:  i64,
-	blen:  i64,
+	count:  u32,
+	inl:    [INLINE]u32,
+	vals:   [INLINE]u8,
+	vk:     u8,
+	off:    i64,
+	plen:   i64,
+	blen:   i64,
+	nsuper: u32,
+	lo:     u32,
+	hi:     u32,
+}
+
+List_Out :: struct {
+	count:  u32,
+	inl:    [INLINE]u32,
+	vals:   [INLINE]u8,
+	plen:   i64,
+	blen:   i64,
+	nsuper: u32,
+	lo:     u32,
+	hi:     u32,
 }
 
 nblocks :: proc "contextless" (lo, hi: u64) -> u64 {
@@ -119,9 +142,13 @@ _footer_fields :: proc "contextless" (f: ^Footer) -> [NFIELDS]u64 {
 		f.vec_dim,
 		u64(f.vids_off),
 		u64(f.vdata_off),
-		u64(f.ivf_off),
-		u64(f.ivf_len),
+		u64(f.vcodes_off),
+		u64(f.vrec),
 		f.cb_gen,
+		f.vec_m,
+		f.medoid,
+		f.w_first,
+		f.w_count,
 	}
 }
 
@@ -168,12 +195,19 @@ footer_decode :: proc(b: []u8, size: i64) -> (f: Footer, ok: bool) {
 	f.meta_sum, f.dir_sum = v[27], v[28]
 	f.vec_n, f.vec_dim = v[29], v[30]
 	f.vids_off, f.vdata_off = i64(v[31]), i64(v[32])
-	f.ivf_off, f.ivf_len = i64(v[33]), i64(v[34])
-	f.cb_gen = v[35]
-	if f.vec_n > MAX_DOCS || f.vec_dim > MAX_DIM || (f.vec_n > 0 && f.vec_dim == 0) {
+	f.vcodes_off, f.vrec = i64(v[33]), i64(v[34])
+	f.cb_gen, f.vec_m, f.medoid = v[35], v[36], v[37]
+	f.w_first, f.w_count = v[38], v[39]
+	if f.w_first + f.w_count > f.n_terms {
 		return
 	}
-	vbytes := i64(f.vec_n) * i64(f.vec_dim) * 4
+	if f.vec_n > MAX_DOCS || f.vec_dim > MAX_DIM || (f.vec_n > 0 && f.vec_dim == 0) || f.vec_m > MAX_DIM {
+		return
+	}
+	if f.vec_n > 0 && (f.vrec < i64(f.vec_dim) * 4 || f.vrec > 1 << 20 || (f.vec_m > 0 && f.medoid >= f.vec_n)) {
+		return
+	}
+	vbytes := i64(f.vec_n) * f.vrec
 	if v[2] > 1 || f.hi < f.lo || f.hi > MAX_DOCS + 1 {
 		return
 	}
@@ -195,7 +229,7 @@ footer_decode :: proc(b: []u8, size: i64) -> (f: Footer, ok: bool) {
 		{f.kvs_ix_off, f.kvs_ix_len},
 		{f.vids_off, i64(f.vec_n) * 4},
 		{f.vdata_off, vbytes},
-		{f.ivf_off, f.ivf_len},
+		{f.vcodes_off, i64(f.vec_n) * i64(f.vec_m)},
 	}
 	for s in spans {
 		if s[0] < dir_len || s[1] < 0 || s[0] > limit || s[1] > limit - s[0] {
@@ -466,7 +500,11 @@ _sw_dir_flush :: proc(sw: ^Seg_Writer) {
 	clear(&sw.dirbuf)
 }
 
-sw_term :: proc(sw: ^Seg_Writer, key: []u8, count: u32, inl: []u32, plen, blen: i64) {
+sw_term :: proc(sw: ^Seg_Writer, key: []u8, lo: List_Out) {
+	count := lo.count
+	inl := lo.inl
+	imps := lo.vals
+	plen := lo.plen
 	if count == 0 {
 		return
 	}
@@ -491,15 +529,27 @@ sw_term :: proc(sw: ^Seg_Writer, key: []u8, count: u32, inl: []u32, plen, blen: 
 			prim.write_uvarint(&w, u64(id - prev) if i > 0 else u64(id))
 			prev = id
 		}
+		if val_kind(key[0]) != VAL_NONE {
+			prim.write_raw(&w, imps[:count])
+		}
 	} else {
 		prim.write_uvarint(&w, u64(plen))
-		prim.write_uvarint(&w, u64(blen))
+		prim.write_uvarint(&w, u64(lo.blen))
+		prim.write_uvarint(&w, u64(lo.nsuper))
+		prim.write_uvarint(&w, u64(lo.hi))
+		prim.write_uvarint(&w, u64(lo.hi - lo.lo))
 	}
 	if w.err != .None {
 		sw.out.err = .No_Memory
 	}
 	sw.dprev_len = copy(sw.dprev[:], key)
 	sw.dn += 1
+	if key[0] == NS_WORD {
+		if sw.f.w_count == 0 {
+			sw.f.w_first = sw.f.n_terms
+		}
+		sw.f.w_count += 1
+	}
 	sw.f.n_terms += 1
 	if sw.dn == DICT_BLOCK {
 		sw_dict_flush(sw)
@@ -753,6 +803,7 @@ dc_next :: proc(dc: ^Dict_Cursor) -> bool {
 	}
 	t := Term {
 		count = cnt,
+		vk = val_kind(dc.key[0]),
 	}
 	if cnt <= INLINE {
 		prev := u32(0)
@@ -765,17 +816,35 @@ dc_next :: proc(dc: ^Dict_Cursor) -> bool {
 			prev = v if i == 0 else prev + v
 			t.inl[i] = prev
 		}
+		if t.vk != VAL_NONE {
+			if len(body) - p < int(cnt) {
+				dc.err = .Corrupt
+				return false
+			}
+			for i in 0 ..< int(cnt) {
+				t.vals[i] = min(body[p + i], 15)
+			}
+			p += int(cnt)
+		}
 		t.off = dc.post
+		t.lo = t.inl[0]
+		t.hi = t.inl[cnt - 1]
 	} else {
 		pl, ok1 := uv(body, &p)
 		bl, ok2 := uv(body, &p)
-		if !ok1 || !ok2 || bl > pl || i64(pl) > dc.boff - dc.post {
+		ns, ok3 := uv(body, &p)
+		hi, ok4 := uv32(body, &p)
+		span, ok5 := uv32(body, &p)
+		if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || span > hi || bl > pl || i64(pl) > dc.boff - dc.post || ns * SUPER_ENTRY > pl - bl {
 			dc.err = .Corrupt
 			return false
 		}
+		t.hi = hi
+		t.lo = hi - span
 		t.off = dc.post
 		t.plen = i64(pl)
 		t.blen = i64(bl)
+		t.nsuper = u32(ns)
 		dc.post += i64(pl)
 	}
 	dc.term = t
@@ -832,49 +901,84 @@ Plist :: struct {
 	c:         ^Cache,
 	s:         ^Seg,
 	count:     u32,
-	inl:       [INLINE]u32,
+	vk:        u8,
 	ninl:      int,
+	arr:       []u32,
+	arr_vals:  []u8,
+	blk_base:  i64,
 	blk_off:   i64,
+	skip_base: i64,
 	skip_pos:  i64,
 	skip_end:  i64,
+	super_at:  i64,
+	nsuper:    int,
 	win:       [64]u8,
 	win_at:    i64,
 	win_len:   int,
 	prev:      u32,
 	started:   bool,
 	ids:       [BLOCK]u32,
+	vals:      [BLOCK]u8,
 	n:         int,
+	bmax:      u8,
+	smax:      u8,
 	loaded:    bool,
 	done:      bool,
 	err:       Error,
-	raw:       [BLOCK * 5 + 16]u8,
+	raw:       [BLOCK * 5 + 80]u8,
 }
 
 pl_init :: proc(p: ^Plist, c: ^Cache, s: ^Seg, t: Term) {
 	p.c = c
 	p.s = s
 	p.count = t.count
+	p.vk = t.vk
 	p.ninl = 0
+	p.arr = nil
 	p.loaded = false
 	p.done = false
 	p.started = false
 	p.err = .None
 	p.win_len = 0
+	p.bmax = 15
+	p.smax = 15
 	if t.count <= INLINE {
 		p.ninl = int(t.count)
-		p.inl = t.inl
+		mx := u8(0)
 		for i in 0 ..< p.ninl {
 			p.ids[i] = t.inl[i]
+			p.vals[i] = t.vals[i]
+			if t.vk == VAL_IMPACT {
+				mx = max(mx, t.vals[i])
+			}
 		}
 		p.n = p.ninl
 		p.loaded = p.ninl > 0
+		p.bmax = mx
+		p.smax = mx
 		p.skip_pos = 0
 		p.skip_end = 0
+		p.nsuper = 0
 		return
 	}
+	p.blk_base = t.off
 	p.blk_off = t.off
-	p.skip_pos = t.off + t.blen
-	p.skip_end = t.off + t.plen
+	p.skip_base = t.off + t.blen
+	p.skip_pos = p.skip_base
+	p.nsuper = int(t.nsuper)
+	p.skip_end = t.off + t.plen - i64(p.nsuper) * SUPER_ENTRY
+	p.super_at = p.skip_end
+}
+
+pl_init_array :: proc(p: ^Plist, ids: []u32, vals: []u8, vk: u8) {
+	p^ = {}
+	p.arr = ids
+	p.arr_vals = vals
+	p.count = u32(len(ids))
+	p.vk = vk
+	p.bmax = 15
+	p.smax = 15
+	p.n = -1
 }
 
 @(private)
@@ -904,7 +1008,7 @@ _pl_uv :: proc(p: ^Plist) -> (v: u64, ok: bool) {
 }
 
 @(private)
-_pl_find :: proc "contextless" (p: ^Plist, t: u32) -> u32 {
+_pl_find :: proc "contextless" (p: ^Plist, t: u32) -> int {
 	lo, hi := 0, p.n
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -914,37 +1018,94 @@ _pl_find :: proc "contextless" (p: ^Plist, t: u32) -> u32 {
 			hi = mid
 		}
 	}
-	return p.ids[lo - 1]
+	return lo - 1
+}
+
+@(private)
+_pl_super :: proc(p: ^Plist, t: u32) {
+	lo, hi := 0, p.nsuper
+	b: [SUPER_ENTRY]u8
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if cache_read(p.c, p.s, p.super_at + i64(mid) * SUPER_ENTRY, b[:]) != .None {
+			return
+		}
+		if prim.get_u32le(b[:]) <= t {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo == 0 {
+		return
+	}
+	if cache_read(p.c, p.s, p.super_at + i64(lo - 1) * SUPER_ENTRY, b[:]) != .None {
+		return
+	}
+	skip := p.skip_base + i64(prim.get_u32le(b[4:]))
+	blk := p.blk_base + i64(prim.get_u32le(b[8:]))
+	if skip > p.skip_pos && skip < p.skip_end && blk >= p.blk_off && blk < p.skip_base {
+		p.skip_pos = skip
+		p.blk_off = blk
+		p.started = false
+		p.win_len = 0
+	}
 }
 
 pl_seek :: proc(p: ^Plist, t: u32) -> (id: u32, ok: bool) {
+	if p.arr != nil {
+		lo, hi := 0, len(p.arr)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if p.arr[mid] <= t {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo == 0 {
+			p.done = true
+			p.n = -1
+			return 0, false
+		}
+		p.n = lo - 1
+		return p.arr[lo - 1], true
+	}
 	if p.loaded && p.n > 0 && t >= p.ids[0] {
-		return _pl_find(p, t), true
+		return p.ids[_pl_find(p, t)], true
 	}
 	if p.ninl > 0 || p.done || p.err != .None {
 		p.done = true
 		return 0, false
 	}
+	if p.nsuper > 0 && (!p.started || t < p.prev) {
+		_pl_super(p, t)
+	}
 	for p.skip_pos < p.skip_end {
 		f, ok1 := _pl_uv(p)
 		ln, ok2 := _pl_uv(p)
-		if !ok1 || !ok2 {
+		mb := u64(0xff)
+		if p.vk == VAL_IMPACT && ok1 && ok2 {
+			mb, _ = _pl_uv(p)
+		}
+		if !ok1 || !ok2 || p.err != .None {
 			if p.err == .None {
 				p.err = .Corrupt
 			}
 			break
 		}
 		first: u64
-		if !p.started {
-			first = f
+		if f & 1 == 1 {
+			first = f >> 1
 		} else {
-			if f == 0 || f > u64(p.prev) {
+			d := f >> 1
+			if !p.started || d == 0 || d > u64(p.prev) {
 				p.err = .Corrupt
 				break
 			}
-			first = u64(p.prev) - f
+			first = u64(p.prev) - d
 		}
-		if first > u64(max(u32)) || ln == 0 || ln > len(p.raw) || i64(ln) > p.skip_end - p.blk_off {
+		if first > u64(max(u32)) || ln == 0 || ln > len(p.raw) || i64(ln) > p.skip_base - p.blk_off {
 			p.err = .Corrupt
 			break
 		}
@@ -954,6 +1115,8 @@ pl_seek :: proc(p: ^Plist, t: u32) -> (id: u32, ok: bool) {
 		p.prev = u32(first)
 		at := p.blk_off
 		p.blk_off += i64(ln)
+		p.bmax = u8(mb >> 4) & 15
+		p.smax = u8(mb) & 15
 		if u32(first) > t {
 			continue
 		}
@@ -961,18 +1124,45 @@ pl_seek :: proc(p: ^Plist, t: u32) -> (id: u32, ok: bool) {
 			p.err = e
 			break
 		}
-		n, _, dok := pfor_decode(p.raw[:ln], u32(first), &p.ids)
+		n, used, dok := pfor_decode(p.raw[:ln], u32(first), &p.ids)
 		if !dok || (had && p.ids[n - 1] >= limit) {
 			p.err = .Corrupt
 			break
 		}
+		if p.vk == VAL_IMPACT {
+			if used + (n + 1) / 2 > int(ln) {
+				p.err = .Corrupt
+				break
+			}
+			for k in 0 ..< n {
+				b := p.raw[used + k / 2]
+				p.vals[k] = (b >> 4) if k % 2 == 0 else (b & 15)
+			}
+		}
 		p.n = n
 		p.loaded = true
-		return _pl_find(p, t), true
+		return p.ids[_pl_find(p, t)], true
 	}
 	p.done = true
 	p.loaded = false
 	return 0, false
+}
+
+pl_val :: proc "contextless" (p: ^Plist, id: u32) -> u8 {
+	if p.arr != nil {
+		if p.n >= 0 && p.n < len(p.arr) && p.arr[p.n] == id && p.arr_vals != nil {
+			return p.arr_vals[p.n]
+		}
+		return 0
+	}
+	if !p.loaded || p.n == 0 {
+		return 0
+	}
+	k := _pl_find(p, id)
+	if k >= 0 && p.ids[k] == id {
+		return p.vals[k]
+	}
+	return 0
 }
 
 Field_Bytes :: struct {
@@ -1316,81 +1506,6 @@ doc_load :: proc(c: ^Cache, s: ^Seg, b: ^Doc_Block, blk: u64) -> Error {
 	return .None
 }
 
-frame_write :: proc(w: ^prim.Writer, raw: []u8, table: ^[1 << LZ_HASH_BITS]i32, scratch: ^[dynamic]u8) {
-	clear(scratch)
-	cw := prim.writer(scratch)
-	lz_compress(&cw, raw, table)
-	prim.write_uvarint(w, u64(len(raw)))
-	start: int
-	if cw.err == .None && len(scratch) < len(raw) {
-		prim.write_uvarint(w, u64(len(scratch)))
-		start = len(w.buf)
-		prim.write_raw(w, scratch[:])
-	} else {
-		prim.write_uvarint(w, 0)
-		start = len(w.buf)
-		prim.write_raw(w, raw)
-	}
-	if w.err == .None {
-		prim.write_u32le(w, xxhash.XXH32(w.buf[start:]))
-	}
-}
-
-frame_size :: proc(c: ^Cache, s: ^Seg, at: i64) -> (size: i64, err: Error) {
-	end := s.f.text_off + s.f.text_len
-	if at < s.f.text_off || at >= end {
-		return 0, .Corrupt
-	}
-	hb: [20]u8
-	hn := min(i64(len(hb)), end - at)
-	cache_read(c, s, at, hb[:hn]) or_return
-	pos := 0
-	raw, ok1 := uv(hb[:hn], &pos)
-	clen, ok2 := uv(hb[:hn], &pos)
-	if !ok1 || !ok2 || raw > CHUNK + FRAME || clen > raw {
-		return 0, .Corrupt
-	}
-	size = i64(pos) + i64(clen if clen > 0 else raw) + 4
-	if at + size > end {
-		return 0, .Corrupt
-	}
-	return size, .None
-}
-
-frame_read :: proc(c: ^Cache, s: ^Seg, at: i64, out: ^[dynamic]u8, scratch: ^[dynamic]u8) -> Error {
-	if at < s.f.text_off || at >= s.f.text_off + s.f.text_len {
-		return .Corrupt
-	}
-	end := s.f.text_off + s.f.text_len
-	hb: [20]u8
-	hn := min(i64(len(hb)), end - at)
-	cache_read(c, s, at, hb[:hn]) or_return
-	pos := 0
-	raw, ok1 := uv(hb[:hn], &pos)
-	clen, ok2 := uv(hb[:hn], &pos)
-	if !ok1 || !ok2 || raw > CHUNK + FRAME || clen > raw {
-		return .Corrupt
-	}
-	plen := i64(clen if clen > 0 else raw)
-	if at + i64(pos) + plen + 4 > end {
-		return .Corrupt
-	}
-	if grow(scratch, int(plen) + 4) != nil || grow(out, int(raw)) != nil {
-		return .No_Memory
-	}
-	cache_read(c, s, at + i64(pos), scratch[:]) or_return
-	payload := scratch[:plen]
-	if xxhash.XXH32(payload) != prim.get_u32le(scratch[plen:]) {
-		return .Corrupt
-	}
-	if clen == 0 {
-		copy(out[:], payload)
-	} else if !lz_decompress(out[:], payload) {
-		return .Corrupt
-	}
-	return .None
-}
-
 src_lookup :: proc(c: ^Cache, s: ^Seg, id: prim.Id) -> (pos: i64, found: bool, err: Error) {
 	n := s.f.src_len / SRC_ENTRY
 	lo, hi := i64(0), n
@@ -1445,4 +1560,46 @@ tomb_load :: proc(s: ^Seg, out: ^[dynamic]u32) -> Error {
 		return .Corrupt
 	}
 	return .None
+}
+
+vocab_lists :: proc(trigrams: map[u32][dynamic]u32, sw: ^Seg_Writer, lw: ^List_Writer) -> Error {
+	keys := make([dynamic]u32, 0, len(trigrams), context.temp_allocator)
+	for k in trigrams {
+		append(&keys, k)
+	}
+	slice.sort(keys[:])
+	for k in keys {
+		lst := trigrams[k]
+		lw_begin(lw, VAL_NONE)
+		for i := len(lst) - 1; i >= 0; i -= 1 {
+			if i + 1 < len(lst) && lst[i] == lst[i + 1] {
+				continue
+			}
+			lw_push(lw, lst[i], 0)
+		}
+		lo := lw_end(lw)
+		if lw.err != .None {
+			return lw.err
+		}
+		key := [4]u8{NS_VTRI, u8(k >> 16), u8(k >> 8), u8(k)}
+		sw_term(sw, key[:], lo)
+		if sw.out.err != .None {
+			return sw.out.err
+		}
+	}
+	return .None
+}
+
+token_trigrams :: proc(tok: []u8, out: ^map[u32][dynamic]u32, ord: u32, allocator: runtime.Allocator) {
+	for i := 0; i + 3 <= len(tok); i += 1 {
+		k := u32(tok[i]) << 16 | u32(tok[i + 1]) << 8 | u32(tok[i + 2])
+		lst, found := &out[k]
+		if !found {
+			out[k] = make([dynamic]u32, allocator)
+			lst = &out[k]
+		}
+		if len(lst) == 0 || lst[len(lst) - 1] != ord {
+			append(lst, ord)
+		}
+	}
 }

@@ -8,15 +8,24 @@ MIN_LEVEL_SIZE :: 1024 * 1024
 SMALL_LIST :: 8 * BLOCK
 RS_BUF :: 64 * 1024
 
+Skip :: struct {
+	first: u64,
+	ln:    u64,
+	bmax:  u8,
+}
+
 List_Writer :: struct {
 	sw:      ^Seg_Writer,
 	start:   i64,
 	buf:     [BLOCK]u32,
+	ibuf:    [BLOCK]u8,
 	n:       int,
 	count:   u32,
 	emitted: bool,
+	vk:      u8,
 	last:    u32,
-	skips:   [dynamic][2]u64,
+	first:   u32,
+	skips:   [dynamic]Skip,
 	scratch: [dynamic]u8,
 	err:     Error,
 }
@@ -25,7 +34,7 @@ lw_init :: proc(lw: ^List_Writer, sw: ^Seg_Writer, allocator: runtime.Allocator)
 	lw^ = {
 		sw = sw,
 	}
-	lw.skips = make([dynamic][2]u64, allocator)
+	lw.skips = make([dynamic]Skip, allocator)
 	lw.scratch = make([dynamic]u8, allocator)
 }
 
@@ -34,22 +43,27 @@ lw_destroy :: proc(lw: ^List_Writer) {
 	delete(lw.scratch)
 }
 
-lw_begin :: proc(lw: ^List_Writer) {
+lw_begin :: proc(lw: ^List_Writer, vk: u8) {
 	lw.start = sw_off(lw.sw)
 	lw.n = 0
 	lw.count = 0
 	lw.emitted = false
+	lw.vk = vk
 	lw.err = .None
 	clear(&lw.skips)
 }
 
-lw_push :: proc(lw: ^List_Writer, id: u32) {
+lw_push :: proc(lw: ^List_Writer, id: u32, imp: u8) {
 	if lw.count > 0 && id >= lw.last {
 		lw.err = .Corrupt
 		return
 	}
+	if lw.count == 0 {
+		lw.first = id
+	}
 	lw.last = id
 	lw.buf[lw.n] = id
+	lw.ibuf[lw.n] = min(imp, 15)
 	lw.n += 1
 	lw.count += 1
 	if lw.n == BLOCK {
@@ -67,47 +81,97 @@ _lw_emit :: proc(lw: ^List_Writer) {
 		lw.emitted = true
 	}
 	asc: [BLOCK]u32
+	imp: [BLOCK]u8
+	bmax := u8(0)
 	for i in 0 ..< lw.n {
 		asc[i] = lw.buf[lw.n - 1 - i]
+		imp[i] = lw.ibuf[lw.n - 1 - i]
+		if lw.vk == VAL_IMPACT {
+			bmax = max(bmax, imp[i])
+		}
 	}
 	clear(&lw.scratch)
 	w := prim.writer(&lw.scratch)
 	pfor_encode(&w, asc[:lw.n])
+	if lw.vk == VAL_IMPACT {
+		for i := 0; i < lw.n; i += 2 {
+			lo := imp[i + 1] if i + 1 < lw.n else 0
+			prim.write_u8(&w, imp[i] << 4 | lo)
+		}
+	}
 	if w.err != .None {
 		lw.err = .No_Memory
 		return
 	}
 	sw_write(lw.sw, lw.scratch[:])
-	append(&lw.skips, [2]u64{u64(asc[0]), u64(len(lw.scratch))})
+	append(&lw.skips, Skip{u64(asc[0]), u64(len(lw.scratch)), bmax})
 	lw.n = 0
 }
 
-lw_end :: proc(lw: ^List_Writer) -> (count: u32, inl: [INLINE]u32, plen, blen: i64) {
-	count = lw.count
-	if count == 0 {
+write_skips :: proc(sw: ^Seg_Writer, skips: []Skip, words: bool, scratch: ^[dynamic]u8) -> (nsuper: u32, err: Error) {
+	smax := u8(0)
+	for i := len(skips) - 1; i >= 0; i -= 1 {
+		smax = max(smax, skips[i].bmax)
+		skips[i].bmax = skips[i].bmax << 4 | smax
+	}
+	clear(scratch)
+	w := prim.writer(scratch)
+	supers := make([dynamic][3]u32, context.temp_allocator)
+	prev := u64(0)
+	blk := u64(0)
+	for sk, i in skips {
+		if i % RESTART == 0 {
+			if i > 0 {
+				append(&supers, [3]u32{u32(sk.first), u32(len(scratch)), u32(blk)})
+			}
+			prim.write_uvarint(&w, sk.first << 1 | 1)
+		} else {
+			if sk.first >= prev {
+				return 0, .Corrupt
+			}
+			prim.write_uvarint(&w, (prev - sk.first) << 1)
+		}
+		prim.write_uvarint(&w, sk.ln)
+		if words {
+			prim.write_uvarint(&w, u64(sk.bmax))
+		}
+		prev = sk.first
+		blk += sk.ln
+	}
+	for su in supers {
+		prim.write_u32le(&w, su[0])
+		prim.write_u32le(&w, su[1])
+		prim.write_u32le(&w, su[2])
+	}
+	if w.err != .None {
+		return 0, .No_Memory
+	}
+	sw_write(sw, scratch[:])
+	return u32(len(supers)), .None
+}
+
+lw_end :: proc(lw: ^List_Writer) -> (out: List_Out) {
+	out.count = lw.count
+	if lw.count == 0 {
 		return
 	}
-	if !lw.emitted && count <= INLINE {
+	out.hi = lw.first
+	out.lo = lw.last
+	if !lw.emitted && lw.count <= INLINE {
 		for i in 0 ..< lw.n {
-			inl[i] = lw.buf[lw.n - 1 - i]
+			out.inl[i] = lw.buf[lw.n - 1 - i]
+			out.vals[i] = lw.ibuf[lw.n - 1 - i]
 		}
 		return
 	}
 	_lw_emit(lw)
-	blen = sw_off(lw.sw) - lw.start
-	clear(&lw.scratch)
-	w := prim.writer(&lw.scratch)
-	prev := u64(0)
-	for sk, i in lw.skips {
-		prim.write_uvarint(&w, sk[0] if i == 0 else prev - sk[0])
-		prim.write_uvarint(&w, sk[1])
-		prev = sk[0]
+	out.blen = sw_off(lw.sw) - lw.start
+	ns, err := write_skips(lw.sw, lw.skips[:], lw.vk == VAL_IMPACT, &lw.scratch)
+	if err != .None {
+		lw.err = err
 	}
-	if w.err != .None {
-		lw.err = .No_Memory
-	}
-	sw_write(lw.sw, lw.scratch[:])
-	plen = sw_off(lw.sw) - lw.start
+	out.nsuper = ns
+	out.plen = sw_off(lw.sw) - lw.start
 	return
 }
 
@@ -217,9 +281,7 @@ Merge_Phase :: enum u8 {
 	Kv_Files,
 	Kv_Scopes,
 	Vec_Ids,
-	Vec_Data,
-	Vec_Encode,
-	Ivf,
+	Vec_Graph,
 	Finish,
 }
 
@@ -261,18 +323,16 @@ Merge :: struct {
 	delta:     i64,
 	fraw:      [dynamic]u8,
 	fscratch:  [dynamic]u8,
-	lz:        ^[1 << LZ_HASH_BITS]i32,
 	vdead:     [dynamic][dynamic]u32,
 	vbase:     [dynamic]u32,
-	vdirs:     [dynamic][]u8,
 	vin:       int,
 	vpos:      int,
-	vk:        int,
-	ve:        int,
-	cb:        ^Cb,
-	venc:      [dynamic]Ivf_Entry,
-	vcodes:    [dynamic]u8,
-	vdir:      []u8,
+	vm:        ^Vmerge,
+	work:      int,
+	wmap:      [dynamic][]u32,
+	in_ord:    [dynamic]u32,
+	out_ord:   u32,
+	vtmp:      [dynamic]u32,
 	vbuf:      []u8,
 	kw:        Kv_Writer,
 	arena:     runtime.Arena,
@@ -308,7 +368,7 @@ merge_pick :: proc(ix: ^Index) -> (from, to: int, ok: bool) {
 	}
 	if ix.man.cb_gen != 0 {
 		for s, i in ix.segs {
-			if s.f.vec_n > 0 && s.f.cb_gen != ix.man.cb_gen {
+			if s.f.vec_n >= GRAPH_MIN && s.f.cb_gen != ix.man.cb_gen {
 				return i, i + 1, true
 			}
 		}
@@ -460,6 +520,10 @@ merge_step :: proc(ix: ^Index, budget: i64) -> (more: bool, err: Error) {
 	if ix.broken {
 		return false, .Corrupt
 	}
+	if ix.vtrain != nil {
+		_ = vtrain_step(ix, budget) or_return
+		return true, .None
+	}
 	if ix.merge == nil {
 		from, to, ok := merge_pick(ix)
 		if !ok {
@@ -472,7 +536,8 @@ merge_step :: proc(ix: ^Index, budget: i64) -> (more: bool, err: Error) {
 	}
 	m := ix.merge
 	start := sw_off(&m.sw)
-	for sw_off(&m.sw) - start < budget {
+	work0 := m.work
+	for sw_off(&m.sw) - start + i64(m.work - work0) < budget {
 		done, e := _merge_work(ix, m)
 		if e == .None && m.sw.out.err != .None {
 			e = m.sw.out.err
@@ -559,10 +624,14 @@ _merge_work :: proc(ix: ^Index, m: ^Merge) -> (done: bool, err: Error) {
 			m.phase = .Vec_Ids
 		}
 		return false, .None
-	case .Vec_Ids, .Vec_Data, .Vec_Encode:
-		return false, _merge_vec(m)
-	case .Ivf:
-		return false, _merge_ivf(m)
+	case .Vec_Ids:
+		return false, _merge_vec(ix, m)
+	case .Vec_Graph:
+		fin := vmerge_step(m) or_return
+		if fin {
+			m.phase = .Finish
+		}
+		return false, .None
 	case .Finish:
 		f := sw_finish(&m.sw) or_return
 		prim.close_file(m.sw.out.vfs, m.sw.out.fd)
@@ -686,6 +755,13 @@ _merge_post_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 		}
 	}
 	lw_init(&m.lw, &m.sw, a)
+	m.wmap = make([dynamic][]u32, len(m.segs), a)
+	m.in_ord = make([dynamic]u32, len(m.segs), a)
+	m.vtmp = make([dynamic]u32, a)
+	for &s, i in m.segs {
+		m.wmap[i] = make([]u32, int(s.f.w_count), a)
+		slice.fill(m.wmap[i], max(u32))
+	}
 	sw_post_begin(&m.sw)
 	return .None
 }
@@ -727,7 +803,54 @@ _merge_term :: proc(ix: ^Index, m: ^Merge) -> (fin: bool, err: Error) {
 	if total < SMALL_LIST {
 		fast = false
 	}
-	if fast {
+	vk := val_kind(key[0])
+	words := vk == VAL_IMPACT
+	if key[0] == NS_VTRI {
+		clear(&m.vtmp)
+		for i in 0 ..< nin {
+			if !has[i] {
+				continue
+			}
+			pl_init(&m.pl, &ix.cache, &m.segs[i], terms[i])
+			t := u32(max(u32))
+			for {
+				_, ok := pl_seek(&m.pl, t)
+				if !ok {
+					break
+				}
+				for k := m.pl.n - 1; k >= 0; k -= 1 {
+					o := m.pl.ids[k]
+					if o > t {
+						continue
+					}
+					if int(o) >= len(m.wmap[i]) {
+						return false, .Corrupt
+					}
+					if x := m.wmap[i][o]; x != max(u32) {
+						append(&m.vtmp, x)
+					}
+				}
+				if m.pl.ids[0] == 0 || m.pl.ninl > 0 {
+					break
+				}
+				t = m.pl.ids[0] - 1
+			}
+			if m.pl.err != .None {
+				return false, m.pl.err
+			}
+		}
+		slice.sort(m.vtmp[:])
+		lst := slice.unique(m.vtmp[:])
+		lw_begin(&m.lw, VAL_NONE)
+		for i := len(lst) - 1; i >= 0; i -= 1 {
+			lw_push(&m.lw, lst[i], 0)
+		}
+		lo := lw_end(&m.lw)
+		if m.lw.err != .None {
+			return false, m.lw.err
+		}
+		sw_term(&m.sw, key, lo)
+	} else if fast {
 		start := sw_off(&m.sw)
 		for i := nin - 1; i >= 0; i -= 1 {
 			if !has[i] {
@@ -741,55 +864,64 @@ _merge_term :: proc(ix: ^Index, m: ^Merge) -> (fin: bool, err: Error) {
 			}
 		}
 		blen := sw_off(&m.sw) - start
-		prev := u64(0)
-		any := false
+		clear(&m.lw.skips)
 		for i := nin - 1; i >= 0; i -= 1 {
 			if !has[i] {
 				continue
 			}
 			s := &m.segs[i]
 			t := terms[i]
-			rs_init(&m.rs, s, t.off + t.blen, t.off + t.plen, m.rs_buf)
+			rs_init(&m.rs, s, t.off + t.blen, t.off + t.plen - i64(t.nsuper) * SUPER_ENTRY, m.rs_buf)
 			cur := u64(0)
-			first := true
+			started := false
 			for rs_left(&m.rs) > 0 {
 				f, ok1 := rs_uv(&m.rs)
 				ln, ok2 := rs_uv(&m.rs)
-				if !ok1 || !ok2 {
+				mb := u64(0)
+				ok3 := true
+				if words {
+					mb, ok3 = rs_uv(&m.rs)
+				}
+				if !ok1 || !ok2 || !ok3 {
 					return false, .Corrupt
 				}
-				if first {
-					cur = f
-					first = false
+				if f & 1 == 1 {
+					cur = f >> 1
 				} else {
-					if f == 0 || f > cur {
+					d := f >> 1
+					if !started || d == 0 || d > cur {
 						return false, .Corrupt
 					}
-					cur -= f
+					cur -= d
 				}
-				b: [20]u8
-				n := 0
-				if !any {
-					n += prim.put_uvarint(b[n:], cur)
-				} else {
-					if cur >= prev {
-						return false, .Corrupt
-					}
-					n += prim.put_uvarint(b[n:], prev - cur)
-				}
-				n += prim.put_uvarint(b[n:], ln)
-				sw_write(&m.sw, b[:n])
-				any = true
-				prev = cur
+				started = true
+				append(&m.lw.skips, Skip{cur, ln, u8(mb >> 4) & 15})
 			}
+		}
+		nsuper, serr := write_skips(&m.sw, m.lw.skips[:], words, &m.lw.scratch)
+		if serr != .None {
+			return false, serr
 		}
 		plen := sw_off(&m.sw) - start
 		if total > u64(max(u32)) {
 			return false, .Corrupt
 		}
-		sw_term(&m.sw, key, u32(total), nil, plen, blen)
+		lo := List_Out {
+			count  = u32(total),
+			plen   = plen,
+			blen   = blen,
+			nsuper = nsuper,
+			lo     = max(u32),
+		}
+		for i in 0 ..< nin {
+			if has[i] {
+				lo.lo = min(lo.lo, terms[i].lo)
+				lo.hi = max(lo.hi, terms[i].hi)
+			}
+		}
+		sw_term(&m.sw, key, lo)
 	} else {
-		lw_begin(&m.lw)
+		lw_begin(&m.lw, vk)
 		for i := nin - 1; i >= 0; i -= 1 {
 			if !has[i] {
 				continue
@@ -809,7 +941,7 @@ _merge_term :: proc(ix: ^Index, m: ^Merge) -> (fin: bool, err: Error) {
 					if m.has_dead[i] && _is_dead(m.dead[:], id) {
 						continue
 					}
-					lw_push(&m.lw, id)
+					lw_push(&m.lw, id, m.pl.vals[k])
 				}
 				if m.pl.ids[0] == 0 || m.pl.ninl > 0 {
 					break
@@ -820,11 +952,29 @@ _merge_term :: proc(ix: ^Index, m: ^Merge) -> (fin: bool, err: Error) {
 				return false, m.pl.err
 			}
 		}
-		count, inl, plen, blen := lw_end(&m.lw)
+		lo := lw_end(&m.lw)
 		if m.lw.err != .None {
 			return false, m.lw.err
 		}
-		sw_term(&m.sw, key, count, inl[:], plen, blen)
+		sw_term(&m.sw, key, lo)
+	}
+	if key[0] == NS_WORD {
+		written := m.sw.f.w_count > u64(m.out_ord)
+		for i in 0 ..< nin {
+			if !has[i] {
+				continue
+			}
+			if int(m.in_ord[i]) >= len(m.wmap[i]) {
+				return false, .Corrupt
+			}
+			if written {
+				m.wmap[i][m.in_ord[i]] = m.out_ord
+			}
+			m.in_ord[i] += 1
+		}
+		if written {
+			m.out_ord += 1
+		}
 	}
 	for i in 0 ..< nin {
 		if has[i] {
@@ -1007,10 +1157,9 @@ _merge_text :: proc(ix: ^Index, m: ^Merge) -> Error {
 		if m.fraw == nil {
 			m.fraw = make([dynamic]u8, m.alloc)
 			m.fscratch = make([dynamic]u8, m.alloc)
-			m.lz = new([1 << LZ_HASH_BITS]i32, m.alloc)
 		}
 		size := frame_size(&ix.cache, s, fp) or_return
-		frame_read(&ix.cache, s, fp, &m.fraw, &m.fscratch) or_return
+		frame_read(ix, s, fp, &m.fraw, &m.fscratch) or_return
 		for m.dk < len(dirty) && dirty[m.dk][0] == fp {
 			off, n := int(dirty[m.dk][1]), int(dirty[m.dk][2])
 			if off + n > len(m.fraw) {
@@ -1023,10 +1172,7 @@ _merge_text :: proc(ix: ^Index, m: ^Merge) -> Error {
 		}
 		clear(&m.enc)
 		w := prim.writer(&m.enc)
-		frame_write(&w, m.fraw[:], m.lz, &m.fscratch)
-		if w.err != .None {
-			return .No_Memory
-		}
+		frame_write(ix, &w, m.fraw[:], &m.fscratch) or_return
 		sw_write(&m.sw, m.enc[:])
 		m.delta += i64(len(m.enc)) - size
 		append(&m.remap[m.in_i], [2]i64{fp, m.delta})
@@ -1095,7 +1241,6 @@ _merge_vec_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 	n := len(m.segs)
 	m.vdead = make([dynamic][dynamic]u32, n, a)
 	m.vbase = make([dynamic]u32, n, a)
-	m.vdirs = make([dynamic][]u8, n, a)
 	total := u64(0)
 	for i in 0 ..< n {
 		s := &m.segs[i]
@@ -1129,30 +1274,6 @@ _merge_vec_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 	m.sw.f.vids_off = sw_off(&m.sw)
 	m.vin = 0
 	m.vpos = 0
-	m.venc = make([dynamic]Ivf_Entry, a)
-	m.vcodes = make([dynamic]u8, a)
-	if total > 0 && ix.man.cb_gen != 0 {
-		m.cb = cb_load(ix, ix.man.cb_gen, a) or_return
-		if u64(m.cb.dim) != ix.man.dim {
-			return .Corrupt
-		}
-		for i in 0 ..< n {
-			s := &m.segs[i]
-			if s.f.vec_n == 0 || s.f.ivf_len == 0 || s.f.cb_gen != m.cb.gen {
-				continue
-			}
-			d := make([]u8, m.cb.k * IVF_DIR, a)
-			at := s.f.ivf_off + s.f.ivf_len - i64(len(d))
-			got, e := prim.read_at(s.vfs, s.fd, d, at)
-			if e != .None {
-				return _perr(e)
-			}
-			if got != len(d) || at < s.f.ivf_off {
-				return .Corrupt
-			}
-			m.vdirs[i] = d
-		}
-	}
 	return .None
 }
 
@@ -1171,47 +1292,29 @@ _vdead_before :: proc "contextless" (dead: []u32, p: u32) -> (n: int, is_dead: b
 }
 
 @(private)
-_merge_vec :: proc(m: ^Merge) -> Error {
-	dim := int(m.sw.f.vec_dim)
-	if m.vin >= len(m.segs) || dim == 0 {
+_merge_vec :: proc(ix: ^Index, m: ^Merge) -> Error {
+	if m.vin >= len(m.segs) || m.sw.f.vec_n == 0 {
 		m.vin = 0
 		m.vpos = 0
-		switch m.phase {
-		case .Vec_Ids:
-			m.sw.f.vdata_off = sw_off(&m.sw)
-			m.phase = .Vec_Data
-		case .Vec_Data:
-			m.sw.f.ivf_off = sw_off(&m.sw)
-			m.phase = .Vec_Encode if m.cb != nil else .Finish
-		case .Vec_Encode:
-			slice.sort_by(m.venc[:], proc(x, y: Ivf_Entry) -> bool {
-				return x.list < y.list || (x.list == y.list && x.pos < y.pos)
-			})
-			m.vdir = make([]u8, m.cb.k * IVF_DIR, m.alloc)
-			m.vk = 0
-			m.ve = 0
-			m.phase = .Ivf
-		case .Text, .Docs, .Post, .Src, .Tomb, .Kv_Files, .Kv_Scopes, .Ivf, .Finish:
-		}
+		m.sw.f.vdata_off = sw_off(&m.sw)
+		m.sw.f.vcodes_off = sw_off(&m.sw)
+		vmerge_init(ix, m) or_return
+		m.phase = .Vec_Graph
 		return .None
 	}
 	s := &m.segs[m.vin]
 	n := int(s.f.vec_n)
-	stale := m.cb != nil && (s.f.ivf_len == 0 || s.f.cb_gen != m.cb.gen)
-	if m.vpos >= n || (m.phase == .Vec_Encode && !stale) {
+	if m.vpos >= n {
 		m.vin += 1
 		m.vpos = 0
 		return .None
 	}
-	unit := 4 if m.phase == .Vec_Ids else dim * 4
-	per := max(1, (256 * 1024) / unit)
-	c := min(per, n - m.vpos)
-	if len(m.vbuf) < c * unit {
-		m.vbuf = make([]u8, c * unit, m.alloc)
+	c := min(65536, n - m.vpos)
+	if len(m.vbuf) < c * 4 {
+		m.vbuf = make([]u8, c * 4, m.alloc)
 	}
-	buf := m.vbuf[:c * unit]
-	base := s.f.vids_off if m.phase == .Vec_Ids else s.f.vdata_off
-	got, e := prim.read_at(s.vfs, s.fd, buf, base + i64(m.vpos) * i64(unit))
+	buf := m.vbuf[:c * 4]
+	got, e := prim.read_at(s.vfs, s.fd, buf, s.f.vids_off + i64(m.vpos) * 4)
 	if e != .None {
 		return _perr(e)
 	}
@@ -1220,101 +1323,28 @@ _merge_vec :: proc(m: ^Merge) -> Error {
 	}
 	dead := m.vdead[m.vin][:]
 	for k in 0 ..< c {
-		p := u32(m.vpos + k)
-		before, is_dead := _vdead_before(dead, p)
-		if is_dead {
-			continue
-		}
-		item := buf[k * unit:][:unit]
-		switch m.phase {
-		case .Vec_Ids:
-			sw_meta(&m.sw, item)
-		case .Vec_Data:
-			sw_write(&m.sw, item)
-		case .Vec_Encode:
-			v := slice.reinterpret([]f32, item)
-			out := m.vbase[m.vin] + p - u32(before)
-			kk := cb_assign(m.cb, v)
-			at := len(m.venc)
-			if grow(&m.vcodes, (at + 1) * m.cb.m) != nil {
-				return .No_Memory
-			}
-			cb_encode(m.cb, v, kk, m.vcodes[at * m.cb.m:][:m.cb.m])
-			append(&m.venc, Ivf_Entry{u32(kk), out, u32(at)})
-		case .Text, .Docs, .Post, .Src, .Tomb, .Kv_Files, .Kv_Scopes, .Ivf, .Finish:
+		_, is_dead := _vdead_before(dead, u32(m.vpos + k))
+		if !is_dead {
+			sw_meta(&m.sw, buf[k * 4:][:4])
 		}
 	}
 	m.vpos += c
 	return .None
 }
 
-@(private)
-_merge_ivf :: proc(m: ^Merge) -> Error {
-	cb := m.cb
-	if m.vk >= cb.k {
-		sw_write(&m.sw, m.vdir)
-		m.sw.f.ivf_len = sw_off(&m.sw) - m.sw.f.ivf_off
-		m.sw.f.cb_gen = cb.gen
-		m.phase = .Finish
-		return .None
+compact_step :: proc(ix: ^Index, budget: i64) -> (more: bool, err: Error) {
+	if ix.broken {
+		return false, .Corrupt
 	}
-	k := m.vk
-	m.vk += 1
-	start := sw_off(&m.sw) - m.sw.f.ivf_off
-	count := u32(0)
-	stride := 4 + cb.m
-	for i in 0 ..< len(m.segs) {
-		d := m.vdirs[i]
-		if d == nil {
-			continue
+	if ix.merge == nil && ix.vtrain == nil {
+		if len(ix.segs) < 2 {
+			return false, .None
 		}
-		s := &m.segs[i]
-		off := i64(prim.get_u64le(d[k * IVF_DIR:]))
-		cnt := int(prim.get_u32le(d[k * IVF_DIR + 8:]))
-		if cnt == 0 {
-			continue
-		}
-		nb := cnt * stride
-		if off < 0 || off + i64(nb) > s.f.ivf_len - i64(len(d)) {
-			return .Corrupt
-		}
-		if len(m.vbuf) < nb {
-			m.vbuf = make([]u8, nb, m.alloc)
-		}
-		lst := m.vbuf[:nb]
-		got, e := prim.read_at(s.vfs, s.fd, lst, s.f.ivf_off + off)
-		if e != .None {
-			return _perr(e)
-		}
-		if got != nb {
-			return .Corrupt
-		}
-		dead := m.vdead[i][:]
-		for x in 0 ..< cnt {
-			ent := lst[x * stride:][:stride]
-			p := prim.get_u32le(ent)
-			if u64(p) >= s.f.vec_n {
-				return .Corrupt
-			}
-			before, is_dead := _vdead_before(dead, p)
-			if is_dead {
-				continue
-			}
-			prim.put_u32le(ent, m.vbase[i] + p - u32(before))
-			sw_write(&m.sw, ent)
-			count += 1
+		if e := merge_start(ix, 0, min(len(ix.segs), 64)); e != .None {
+			merge_abort(ix)
+			return false, e
 		}
 	}
-	ent := make([]u8, stride, context.temp_allocator)
-	for m.ve < len(m.venc) && int(m.venc[m.ve].list) == k {
-		x := m.venc[m.ve]
-		prim.put_u32le(ent, x.pos)
-		copy(ent[4:], m.vcodes[int(x.at) * cb.m:][:cb.m])
-		sw_write(&m.sw, ent)
-		count += 1
-		m.ve += 1
-	}
-	prim.put_u64le(m.vdir[k * IVF_DIR:], u64(start))
-	prim.put_u32le(m.vdir[k * IVF_DIR + 8:], count)
-	return .None
+	_ = merge_step(ix, budget) or_return
+	return ix.merge != nil || ix.vtrain != nil || len(ix.segs) > 1, .None
 }

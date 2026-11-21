@@ -19,7 +19,7 @@ MAX_DOCS :: u64(max(u32))
 HEX :: "0123456789abcdef"
 
 MANIFEST_MAGIC :: u64(0x6e61_6d68_6372_7330)
-MANIFEST_VERSION :: u32(2)
+MANIFEST_VERSION :: u32(3)
 
 DEFAULT_BUDGET :: 32 * 1024 * 1024
 DEFAULT_CACHE_PAGES :: 512
@@ -124,6 +124,7 @@ Manifest :: struct {
 	dim:       u64,
 	cb_gen:    u64,
 	cb_n:      u64,
+	zd_gen:    u64,
 	segs:      [dynamic]Seg_Info,
 	obsolete:  [dynamic]u64,
 }
@@ -139,6 +140,8 @@ Index :: struct {
 	mem:       Mem,
 	merge:     ^Merge,
 	cache:     Cache,
+	zstd:      Zstd,
+	vtrain:    ^Vtrain,
 	broken:    bool,
 }
 
@@ -293,6 +296,7 @@ close :: proc(ix: ^Index) {
 	if ix.merge != nil {
 		merge_abort(ix)
 	}
+	vtrain_abort(ix)
 	for &s in ix.segs {
 		seg_close(&s)
 	}
@@ -301,6 +305,7 @@ close :: proc(ix: ^Index) {
 	delete(ix.man.obsolete)
 	mem_destroy(&ix.mem)
 	cache_destroy(&ix.cache)
+	zstd_destroy(&ix.zstd)
 	if ix.lock != prim.INVALID_FD {
 		prim.close_file(ix.vfs, ix.lock)
 	}
@@ -314,6 +319,7 @@ reset :: proc(ix: ^Index) -> Error {
 	if ix.merge != nil {
 		merge_abort(ix)
 	}
+	vtrain_abort(ix)
 	buf: Name_Buf
 	gens := make([dynamic]u64, context.temp_allocator)
 	for s in ix.man.segs {
@@ -342,6 +348,8 @@ reset :: proc(ix: ^Index) -> Error {
 	ix.man.dim = u64(max(ix.opts.embedder.dim, 0))
 	ix.man.cb_gen = 0
 	ix.man.cb_n = 0
+	ix.man.zd_gen = 0
+	zstd_destroy(&ix.zstd)
 	ix.broken = false
 	cache_clear(&ix.cache)
 	mem_reset(&ix.mem, 0)
@@ -391,6 +399,7 @@ _load :: proc(ix: ^Index) -> Error {
 	ix.man.dim = prim.read_u64le(&r)
 	ix.man.cb_gen = prim.read_u64le(&r)
 	ix.man.cb_n = prim.read_u64le(&r)
+	ix.man.zd_gen = prim.read_u64le(&r)
 	if ix.man.dim != u64(max(ix.opts.embedder.dim, 0)) {
 		return .Corrupt
 	}
@@ -470,6 +479,7 @@ manifest_write :: proc(ix: ^Index) -> Error {
 	prim.write_u64le(&w, ix.man.dim)
 	prim.write_u64le(&w, ix.man.cb_gen)
 	prim.write_u64le(&w, ix.man.cb_n)
+	prim.write_u64le(&w, ix.man.zd_gen)
 	prim.write_uvarint(&w, u64(len(ix.man.segs)))
 	for s in ix.man.segs {
 		prim.write_u64le(&w, s.gen)

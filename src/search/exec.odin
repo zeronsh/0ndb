@@ -1,6 +1,7 @@
 package search
 
 import "base:runtime"
+import "core:bytes"
 import "core:hash/xxhash"
 import "core:math"
 import "core:slice"
@@ -13,7 +14,11 @@ MAX_LIMIT :: 1000
 DEFAULT_HALF_LIFE :: i64(30 * 86400 * 1000)
 SNIPPET :: 200
 SNIPPET_LEAD :: 60
-CURSOR_VERSION :: u8(1)
+CURSOR_VERSION :: u8(3)
+VCURSOR_VERSION :: u8(4)
+MAX_CANDS :: 6
+MAX_COLLAPSED :: 4096
+RRF_K :: 60.0
 
 Sort :: enum u8 {
 	Relevance,
@@ -24,6 +29,7 @@ Request :: struct {
 	limit:        int,
 	cursor:       []u8,
 	sort:         Sort,
+	collapse:     bool,
 	now:          prim.Hlc,
 	half_life_ms: i64,
 	participants: Participants,
@@ -32,8 +38,7 @@ Request :: struct {
 	vector:       []f32,
 	semantic:     bool,
 	embed_kind:   u8,
-	nprobe:       int,
-	rerank:       int,
+	beam:         int,
 }
 
 Match :: struct {
@@ -76,6 +81,10 @@ Iter :: struct {
 	kind:  Iter_Kind,
 	pl:    ^Plist,
 	kids:  [dynamic]^Iter,
+	heap:  [dynamic]^Iter,
+	init:  bool,
+	blo:   u32,
+	bhi:   u32,
 	lo:    u32,
 	val:   u32,
 	has:   bool,
@@ -83,10 +92,40 @@ Iter :: struct {
 	count: u32,
 }
 
-Atom_Plan :: struct {
-	kind:  Iter_Kind,
-	terms: [dynamic]Term,
-	extra: [dynamic]Term,
+Handle :: struct {
+	term: Term,
+	ids:  []u32,
+	vals: []u8,
+	mem:  bool,
+}
+
+Atom_Src :: struct {
+	kind:   Iter_Kind,
+	cands:  [dynamic]Handle,
+	checks: [dynamic]Handle,
+	words:  []Handle,
+	has:    []bool,
+	exact:  int,
+	exactu: bool,
+	vunion: ^Iter,
+	tris:   [dynamic]Handle,
+	vtris:  []^Plist,
+	est:    u64,
+	title:  Handle,
+	titled: bool,
+	vcands: []^Plist,
+	vwords: []^Plist,
+}
+
+Src_Plan :: struct {
+	si:    int,
+	seg:   ^Seg,
+	lo:    u64,
+	hi:    u64,
+	dc:    ^Dict_Cursor,
+	atoms: []Atom_Src,
+	mdir:  Dir_Entry,
+	dir:   Dir_Entry,
 }
 
 Entry :: struct {
@@ -94,42 +133,47 @@ Entry :: struct {
 	hlc:   u64,
 	id:    u32,
 	seg:   int,
+	obj:   prim.Id,
 }
 
 @(private)
 Exec :: struct {
-	ix:        ^Index,
-	q:         ^Query,
-	atoms:     [dynamic]^Atom,
-	sort:      Sort,
-	now_ms:    i64,
-	half_life: i64,
-	n_docs:    f64,
-	avgdl:     f64,
-	bm25max:   f64,
-	dead:      []u32,
-	heap:      [dynamic]Entry,
-	k:         int,
-	has_cur:   bool,
-	cur:       Entry,
-	blk:       Doc_Block,
-	text:      [dynamic]u8,
-	folded:    [dynamic]u8,
-	frame:     [dynamic]u8,
-	frame_at:  i64,
-	frame_gen: u64,
-	fscratch:  [dynamic]u8,
-	occ:       [MAX_ATOMS]Occurrences,
-	occ_done:  [MAX_ATOMS]bool,
-	have_text: bool,
-	text_ok:   bool,
-	after:     u64,
-	before:    u64,
-	incomplete: bool,
-	verified:  int,
-	stop:      bool,
-	err:       Error,
-	alloc:     runtime.Allocator,
+	ix:          ^Index,
+	q:           ^Query,
+	atoms:       [dynamic]^Atom,
+	sort:        Sort,
+	collapse:    bool,
+	emitted:     [dynamic]prim.Id,
+	now_ms:      i64,
+	half_life:   i64,
+	n_docs:      f64,
+	bm25max:     f64,
+	dead:        []u32,
+	heap:        [dynamic]Entry,
+	k:           int,
+	has_cur:     bool,
+	cur:         Entry,
+	blk:         Doc_Block,
+	mfields:     [dynamic]Field_Bytes,
+	mmeta:       Doc_Meta,
+	text:        [dynamic]u8,
+	folded:      [dynamic]u8,
+	frame:       [dynamic]u8,
+	frame_at:    i64,
+	frame_gen:   u64,
+	fscratch:    [dynamic]u8,
+	present:     [MAX_ATOMS]i8,
+	occ:         [MAX_ATOMS]Occurrences,
+	have_text:   bool,
+	text_ok:     bool,
+	after:       u64,
+	before:      u64,
+	incomplete:  bool,
+	verified:    int,
+	stop:        bool,
+	err:         Error,
+	srcs:        [dynamic]Src_Plan,
+	alloc:       runtime.Allocator,
 }
 
 @(private)
@@ -144,41 +188,63 @@ _entry_less :: proc "contextless" (a, b: Entry) -> bool {
 }
 
 @(private)
+_sift_down :: proc(h: []Entry, i0: int) {
+	i := i0
+	for {
+		l := 2 * i + 1
+		if l >= len(h) {
+			return
+		}
+		m := l
+		if l + 1 < len(h) && _entry_less(h[l + 1], h[l]) {
+			m = l + 1
+		}
+		if !_entry_less(h[m], h[i]) {
+			return
+		}
+		h[i], h[m] = h[m], h[i]
+		i = m
+	}
+}
+
+@(private)
+_sift_up :: proc(h: []Entry, i0: int) {
+	i := i0
+	for i > 0 {
+		p := (i - 1) / 2
+		if !_entry_less(h[i], h[p]) {
+			return
+		}
+		h[i], h[p] = h[p], h[i]
+		i = p
+	}
+}
+
+@(private)
 _heap_push :: proc(e: ^Exec, x: Entry) {
 	h := &e.heap
+	if e.collapse {
+		for &y, i in h {
+			if y.obj == x.obj {
+				if _entry_less(y, x) {
+					y = x
+					_sift_down(h[:], i)
+					_sift_up(h[:], i)
+				}
+				return
+			}
+		}
+	}
 	if len(h) == e.k {
 		if !_entry_less(h[0], x) {
 			return
 		}
 		h[0] = x
-		i := 0
-		for {
-			l := 2 * i + 1
-			if l >= len(h) {
-				break
-			}
-			m := l
-			if l + 1 < len(h) && _entry_less(h[l + 1], h[l]) {
-				m = l + 1
-			}
-			if !_entry_less(h[m], h[i]) {
-				break
-			}
-			h[i], h[m] = h[m], h[i]
-			i = m
-		}
+		_sift_down(h[:], 0)
 		return
 	}
 	append(h, x)
-	i := len(h) - 1
-	for i > 0 {
-		p := (i - 1) / 2
-		if !_entry_less(h[i], h[p]) {
-			break
-		}
-		h[i], h[p] = h[p], h[i]
-		i = p
-	}
+	_sift_up(h[:], len(h) - 1)
 }
 
 @(private)
@@ -188,6 +254,15 @@ _decay :: proc "contextless" (e: ^Exec, hlc: u64) -> f64 {
 		return 1
 	}
 	return math.pow(2, -f64(age) / f64(e.half_life))
+}
+
+@(private)
+_is_text :: proc "contextless" (a: ^Atom) -> bool {
+	#partial switch a.field {
+	case .Any, .Title, .Body:
+		return true
+	}
+	return false
 }
 
 search :: proc(ix: ^Index, query: string, req: Request, allocator := context.allocator) -> (res: Results, err: Error) {
@@ -205,27 +280,30 @@ search :: proc(ix: ^Index, query: string, req: Request, allocator := context.all
 	e.ix = ix
 	e.alloc = a
 	e.sort = r.sort
+	e.collapse = r.collapse
+	e.emitted = make([dynamic]prim.Id, a)
 	e.k = clamp(r.limit if r.limit > 0 else DEFAULT_LIMIT, 1, MAX_LIMIT) + 1
 	e.half_life = r.half_life_ms if r.half_life_ms > 0 else DEFAULT_HALF_LIFE
 	e.now_ms = i64(u64(r.now) >> 16) if r.now != 0 else prim.now_ms()
-	e.n_docs = max(f64(ix.man.next_doc), 1)
-	e.avgdl = max(f64(ix.man.total_len) / e.n_docs, 1)
+	e.n_docs = max(f64(ix.man.next_doc + u64(len(ix.mem.docs))), 1)
 	e.heap = make([dynamic]Entry, 0, e.k, a)
 	e.before = max(u64)
 	db_init(&e.blk, a)
+	e.mfields = make([dynamic]Field_Bytes, a)
 	e.text = make([dynamic]u8, a)
 	e.folded = make([dynamic]u8, a)
 	e.frame = make([dynamic]u8, a)
 	e.fscratch = make([dynamic]u8, a)
 	e.frame_at = -1
-	if len(r.cursor) >= 18 && r.cursor[0] == CURSOR_VERSION {
-		e.now_ms = i64(prim.get_u64le(r.cursor[10:]))
+	if len(r.cursor) >= 19 && r.cursor[0] == CURSOR_VERSION {
+		e.now_ms = i64(prim.get_u64le(r.cursor[11:]))
 	}
 	q := parse(ix, query, &r, e.now_ms, a) or_return
 	e.q = &q
 	e.atoms = make([dynamic]^Atom, a)
 	for &c in q.clauses {
 		for &at in c.atoms {
+			at.index = len(e.atoms)
 			append(&e.atoms, &at)
 		}
 		if len(c.atoms) == 1 && !c.atoms[0].neg {
@@ -245,34 +323,64 @@ search :: proc(ix: ^Index, query: string, req: Request, allocator := context.all
 	append(&dead, ..ix.mem.dead[:])
 	slice.sort(dead[:])
 	e.dead = slice.unique(dead[:])
-	nseg := len(ix.segs)
-	plans := make([][]Atom_Plan, nseg, a)
-	df := make([]f64, len(e.atoms), a)
-	for si in 0 ..< nseg {
-		plans[si] = _plan_segment(e, &ix.segs[si], df) or_return
+	e.srcs = make([dynamic]Src_Plan, a)
+	for si in 0 ..< len(ix.segs) {
+		s := &ix.segs[si]
+		append(&e.srcs, Src_Plan{si = si, seg = s, lo = s.f.lo, hi = s.f.hi})
+	}
+	if len(ix.mem.docs) > 0 {
+		m := &ix.mem
+		sp := Src_Plan {
+			si = len(ix.segs),
+			lo = m.base,
+			hi = m.base + u64(len(m.docs)),
+		}
+		sp.mdir.min_hlc = max(u64)
+		for &s in ix.segs {
+			sp.mdir.pmax = max(sp.mdir.pmax, s.f.max_hlc)
+		}
+		for d in m.docs {
+			sp.mdir.min_hlc = min(sp.mdir.min_hlc, d.hlc)
+			sp.mdir.max_hlc = max(sp.mdir.max_hlc, d.hlc)
+		}
+		sp.mdir.pmax = max(sp.mdir.pmax, sp.mdir.max_hlc)
+		append(&e.srcs, sp)
+	}
+	for &sp in e.srcs {
+		_plan_source(e, &sp) or_return
 	}
 	qv := _query_vector(e, &r) or_return
 	if len(r.cursor) > 0 && qv == nil {
 		_cursor_decode(e, r.cursor, qhash) or_return
 	} else {
-		for at, i in e.atoms {
+		for at in e.atoms {
 			if _is_text(at) && !at.neg {
-				d := clamp(df[i], 0, e.n_docs)
-				at.idf = math.ln(1 + (e.n_docs - d + 0.5) / (d + 0.5))
+				for &idf, j in at.tok_idf {
+					df := 0.0
+					for &sp in e.srcs {
+						if sp.atoms[at.index].has[j] {
+							df += f64(sp.atoms[at.index].words[j].term.count)
+						}
+					}
+					d := clamp(df, 0, e.n_docs)
+					idf = math.ln(1 + (e.n_docs - d + 0.5) / (d + 0.5)) if df > 0 else 0
+				}
 			}
 		}
 	}
 	for at in e.atoms {
 		if _is_text(at) && !at.neg {
 			at.scored = true
-			e.bm25max += at.idf * (K1 + 1)
+			for idf in at.tok_idf {
+				e.bm25max += idf * (K1 + 1)
+			}
 		}
 	}
 	if qv != nil {
-		return _search_vector(e, qv, plans, &r, qhash, allocator)
+		return _search_vector(e, qv, &r, qhash, allocator)
 	}
-	for si := nseg - 1; si >= 0 && !e.stop; si -= 1 {
-		_run_segment(e, si, plans[si]) or_return
+	for i := len(e.srcs) - 1; i >= 0 && !e.stop; i -= 1 {
+		_run_source(e, &e.srcs[i]) or_return
 	}
 	if e.err != .None {
 		return res, e.err
@@ -290,90 +398,218 @@ search :: proc(ix: ^Index, query: string, req: Request, allocator := context.all
 	res.incomplete = e.incomplete
 	res.verified = e.verified
 	if len(e.heap) > limit {
-		res.cursor = _cursor_encode(e, qhash, e.heap[limit - 1], allocator)
+		for i in 0 ..< n {
+			append(&e.emitted, hits[i].object)
+		}
+		res.cursor = _cursor_encode(e, qhash, e.heap[limit - 1], allocator) or_return
 	}
 	return res, .None
 }
 
 @(private)
-_is_text :: proc "contextless" (a: ^Atom) -> bool {
-	#partial switch a.field {
-	case .Any, .Title, .Body:
-		return true
+_key_fix :: proc "contextless" (key: []u8) -> (k: u64, ok: bool) {
+	if len(key) < 2 || len(key) > 8 {
+		return 0, false
 	}
-	return false
+	switch key[0] {
+	case NS_TRI, NS_KIND, NS_TITLE:
+	case:
+		return 0, false
+	}
+	k = u64(key[0]) << 56
+	for i in 1 ..< len(key) {
+		k |= u64(key[i]) << u64(8 * (len(key) - 1 - i))
+	}
+	return k, true
 }
 
 @(private)
-_plan_segment :: proc(e: ^Exec, s: ^Seg, df: []f64) -> (plans: []Atom_Plan, err: Error) {
-	a := e.alloc
-	plans = make([]Atom_Plan, len(e.atoms), a)
-	dix := dix_load(&e.ix.cache, s, a) or_return
-	pdix := new_clone(dix, a)
-	dc := new(Dict_Cursor, a)
-	dc_init(dc, &e.ix.cache, s, pdix, a)
-	for at, i in e.atoms {
-		p := &plans[i]
-		p.terms = make([dynamic]Term, a)
-		p.extra = make([dynamic]Term, a)
-		p.kind = .All
-		if at.neg {
-			continue
+_mem_handle :: proc(e: ^Exec, ti: u32) -> (h: Handle, err: Error) {
+	m := &e.ix.mem
+	t := &m.terms[ti]
+	vk := mem_term_vk(m, t)
+	ids := make([dynamic]u32, e.alloc)
+	tfs := make([dynamic]u16, e.alloc)
+	mem_decode_chain(m, t, vk != VAL_NONE, &ids, &tfs, false) or_return
+	h.mem = true
+	h.ids = ids[:]
+	h.term.count = u32(len(ids))
+	h.term.vk = vk
+	if vk != VAL_NONE {
+		avgdl := max(f64(e.ix.man.total_len + m.total_len) / e.n_docs, 1)
+		vals := make([]u8, len(ids), e.alloc)
+		for id, i in ids {
+			vals[i] = impact(tfs[i], m.docs[u64(id) - m.base].len, avgdl)
 		}
+		h.vals = vals
+	}
+	return h, .None
+}
+
+@(private)
+_lookup :: proc(e: ^Exec, sp: ^Src_Plan, key: []u8) -> (h: Handle, found: bool, err: Error) {
+	if sp.seg != nil {
+		t, ok := term_lookup(sp.dc, key) or_return
+		return Handle{term = t}, ok, .None
+	}
+	m := &e.ix.mem
+	ti: u32
+	ok: bool
+	if k, fixed := _key_fix(key); fixed {
+		ti, ok = _find_fix(m, k)
+	} else {
+		ti, ok = _find_long(m, key)
+	}
+	if !ok {
+		return h, false, .None
+	}
+	h = _mem_handle(e, ti) or_return
+	return h, h.term.count > 0, .None
+}
+
+@(private)
+_range :: proc(e: ^Exec, sp: ^Src_Plan, p: ^Atom_Src, key: []u8, prefix: bool, nibbles: int) -> Error {
+	if !prefix {
+		h, found := _lookup(e, sp, key) or_return
+		p.kind = .List if found else .Empty
+		if found {
+			append(&p.cands, h)
+		}
+		return .None
+	}
+	p.kind = .Empty
+	full := nibbles / 2 if nibbles > 0 else 0
+	match :: proc(k: []u8, key: []u8, nibbles: int, full: int) -> bool {
+		if len(k) < len(key) || string(k[:len(key)]) != string(key) {
+			return false
+		}
+		if nibbles % 2 == 1 && len(k) <= 1 + full {
+			return false
+		}
+		return true
+	}
+	if sp.seg == nil {
+		m := &e.ix.mem
+		for &t, ti in m.terms {
+			if t.klen == 0 || !match(_long_key(m, &t), key, nibbles, full) {
+				continue
+			}
+			if len(p.cands) >= MAX_RANGE_TERMS {
+				clear(&p.cands)
+				p.kind = .All
+				return .None
+			}
+			h := _mem_handle(e, u32(ti)) or_return
+			if h.term.count > 0 {
+				append(&p.cands, h)
+				p.kind = .Or
+			}
+		}
+		return .None
+	}
+	dc := sp.dc
+	if !dc_seek(dc, key) {
+		return dc.err
+	}
+	for {
+		k := dc_key(dc)
+		if len(k) < len(key) || string(k[:len(key)]) != string(key) {
+			break
+		}
+		if match(k, key, nibbles, full) {
+			if len(p.cands) >= MAX_RANGE_TERMS {
+				clear(&p.cands)
+				p.kind = .All
+				return .None
+			}
+			append(&p.cands, Handle{term = dc.term})
+			p.kind = .Or
+		}
+		if !dc_next(dc) {
+			break
+		}
+	}
+	return dc.err
+}
+
+@(private)
+_plan_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
+	a := e.alloc
+	sp.atoms = make([]Atom_Src, len(e.atoms), a)
+	if sp.seg != nil {
+		dix := dix_load(&e.ix.cache, sp.seg, a) or_return
+		pdix := new_clone(dix, a)
+		sp.dc = new(Dict_Cursor, a)
+		dc_init(sp.dc, &e.ix.cache, sp.seg, pdix, a)
+	}
+	for at, i in e.atoms {
+		p := &sp.atoms[i]
+		p.cands = make([dynamic]Handle, a)
+		p.checks = make([dynamic]Handle, a)
+		p.exact = -1
+		p.kind = .All
 		key: [MAX_KEY]u8
 		switch at.field {
 		case .Any, .Title, .Body:
-			t := at.text
-			if len(t) >= 3 {
-				p.kind = .List
-				mn := f64(max(f64))
-				for k in 0 ..< len(t) - 2 {
-					kk := key32(NS_TRI, t[k], t[k + 1], t[k + 2])
-					dup := false
-					for j in 0 ..< k {
-						if key32(NS_TRI, t[j], t[j + 1], t[j + 2]) == kk {
-							dup = true
-							break
-						}
-					}
-					if dup {
-						continue
-					}
-					kb: [4]u8
-					n := key32_bytes(kk, &kb)
-					term, found := term_lookup(dc, kb[:n]) or_return
-					if !found {
-						p.kind = .Empty
-						mn = 0
-						break
-					}
-					append(&p.terms, term)
-					mn = min(mn, f64(term.count))
+			p.words = make([]Handle, len(at.tokens), a)
+			p.has = make([]bool, len(at.tokens), a)
+			for tok, j in at.tokens {
+				n := word_key(tok, &key)
+				h, found := _lookup(e, sp, key[:n]) or_return
+				p.words[j] = h
+				p.has[j] = found
+				if at.whole && j == 0 {
+					p.exact = 0
 				}
-				df[i] += mn
-			} else if _word_only(t) {
-				kb: [4]u8
-				n := key32_bytes(word_key(t), &kb)
-				term, found := term_lookup(dc, kb[:n]) or_return
-				if found {
+			}
+			if at.word {
+				if p.exact >= 0 && p.has[0] {
 					p.kind = .List
-					append(&p.terms, term)
-					df[i] += f64(term.count)
-				} else {
+					append(&p.cands, p.words[0])
+				} else if p.exact >= 0 {
 					p.kind = .Empty
 				}
-				at.word = true
-			} else {
-				df[i] += f64(s.f.hi - s.f.lo) / 2
+			} else if at.whole && len(at.text) >= 3 {
+				hs, ok := _vocab(e, sp, at.text) or_return
+				if ok {
+					p.exactu = true
+					p.kind = .Or if len(hs) > 0 else .Empty
+					append(&p.cands, ..hs[:])
+					append(&p.checks, ..hs[:])
+					p.tris = make([dynamic]Handle, a)
+					for k in at.keys {
+						kb: [8]u8
+						n := key64_bytes(k, &kb)
+						h, found := _lookup(e, sp, kb[:n]) or_return
+						if found {
+							append(&p.tris, h)
+						}
+					}
+				} else {
+					_tri_plan(e, sp, at, p) or_return
+				}
+			} else if len(at.keys) > 0 {
+				_tri_plan(e, sp, at, p) or_return
 			}
-			if at.field == .Title && p.kind == .List {
-				kb: [4]u8
-				n := key32_bytes(key32(NS_TITLE, 1, 0, 0), &kb)
-				term, found := term_lookup(dc, kb[:n]) or_return
+			if at.field == .Title && p.exactu && p.kind != .Empty {
+				kb: [8]u8
+				n := key64_bytes(key64(NS_TITLE, 1), &kb)
+				h, found := _lookup(e, sp, kb[:n]) or_return
 				if !found {
 					p.kind = .Empty
 				} else {
-					append(&p.terms, term)
+					p.title = h
+					p.titled = true
+				}
+			}
+			if at.field == .Title && p.kind == .List && !p.exactu {
+				kb: [8]u8
+				n := key64_bytes(key64(NS_TITLE, 1), &kb)
+				h, found := _lookup(e, sp, kb[:n]) or_return
+				if !found {
+					p.kind = .Empty
+				} else {
+					append(&p.cands, h)
 				}
 			}
 		case .Named:
@@ -385,24 +621,25 @@ _plan_segment :: proc(e: ^Exec, s: ^Seg, df: []f64) -> (plans: []Atom_Plan, err:
 						key[base] = at.text[k]
 						key[base + 1] = at.text[k + 1]
 						key[base + 2] = at.text[k + 2]
-						term, found := term_lookup(dc, key[:base + 3]) or_return
+						h, found := _lookup(e, sp, key[:base + 3]) or_return
 						if !found {
 							p.kind = .Empty
+							clear(&p.cands)
 							break
 						}
-						append(&p.terms, term)
+						append(&p.cands, h)
 					}
 				}
 			} else if n, ok := field_key(NS_FIELD, at.name, at.text, &key); ok {
-				_range_terms(dc, p, key[:n], at.prefix, 0) or_return
+				_range(e, sp, p, key[:n], at.prefix, 0) or_return
 			}
 		case .Kind:
-			kb: [4]u8
-			n := key32_bytes(key32(NS_KIND, at.kind, 0, 0), &kb)
-			term, found := term_lookup(dc, kb[:n]) or_return
+			kb: [8]u8
+			n := key64_bytes(key64(NS_KIND, u64(at.kind)), &kb)
+			h, found := _lookup(e, sp, kb[:n]) or_return
 			p.kind = .List if found else .Empty
 			if found {
-				append(&p.terms, term)
+				append(&p.cands, h)
 			}
 		case .Object, .From, .Wrote:
 			key[0] = NS_OBJECT if at.field != .From else NS_FROM
@@ -411,111 +648,113 @@ _plan_segment :: proc(e: ^Exec, s: ^Seg, df: []f64) -> (plans: []Atom_Plan, err:
 				for id in at.ids {
 					v := id
 					copy(key[1:], v[:])
-					term, found := term_lookup(dc, key[:17]) or_return
+					h, found := _lookup(e, sp, key[:17]) or_return
 					if found {
-						append(&p.terms, term)
+						append(&p.cands, h)
 						p.kind = .Or
 					}
 				}
 			} else {
 				n := 1 + copy(key[1:], at.text[:at.nibbles / 2])
-				_range_terms(dc, p, key[:n], at.prefix, at.nibbles) or_return
+				_range(e, sp, p, key[:n], at.prefix, at.nibbles) or_return
 			}
 		case .After, .Before:
 		}
-	}
-	return plans, .None
-}
-
-@(private)
-_word_only :: proc "contextless" (t: []u8) -> bool {
-	for c in t {
-		if !is_word(c) {
-			return false
+		if len(p.checks) == 0 {
+			append(&p.checks, ..p.cands[:])
 		}
-	}
-	return len(t) > 0
-}
-
-@(private)
-_range_terms :: proc(dc: ^Dict_Cursor, p: ^Atom_Plan, key: []u8, prefix: bool, nibbles: int) -> Error {
-	if !prefix {
-		term, found := term_lookup(dc, key) or_return
-		p.kind = .List if found else .Empty
-		if found {
-			append(&p.terms, term)
+		p.vcands = make([]^Plist, len(p.checks), a)
+		p.vwords = make([]^Plist, len(p.words), a)
+		for h, j in p.checks {
+			p.vcands[j] = _plist(e, sp, h)
 		}
-		return .None
-	}
-	p.kind = .Empty
-	if !dc_seek(dc, key) {
-		return dc.err
-	}
-	for {
-		k := dc_key(dc)
-		if len(k) < len(key) || string(k[:len(key)]) != string(key) {
-			break
-		}
-		ok := true
-		if nibbles % 2 == 1 {
-			full := nibbles / 2
-			if len(k) <= 1 + full {
-				ok = false
+		for h, j in p.words {
+			if p.has[j] {
+				p.vwords[j] = _plist(e, sp, h)
 			}
 		}
-		if ok {
-			if len(p.terms) >= MAX_RANGE_TERMS {
-				clear(&p.terms)
-				p.kind = .All
-				return .None
-			}
-			append(&p.terms, dc.term)
-			p.kind = .Or
+		p.vtris = make([]^Plist, len(p.tris), a)
+		for h, j in p.tris {
+			p.vtris[j] = _plist(e, sp, h)
 		}
-		if !dc_next(dc) {
-			break
+		for h in p.cands {
+			p.est += u64(h.term.count)
+		}
+		if p.kind == .List && len(p.cands) > 0 {
+			p.est = u64(p.cands[0].term.count)
+		}
+		if p.exactu && len(p.checks) > 0 {
+			u := new(Iter, a)
+			u.kind = .Or
+			u.kids = make([dynamic]^Iter, a)
+			for h in p.checks {
+				append(&u.kids, _iter_list(e, sp, h))
+			}
+			p.vunion = u
 		}
 	}
-	return dc.err
+	return .None
 }
 
 @(private)
-_iter_list :: proc(e: ^Exec, s: ^Seg, t: Term) -> ^Iter {
+_plist :: proc(e: ^Exec, sp: ^Src_Plan, h: Handle) -> ^Plist {
+	p := new(Plist, e.alloc)
+	if h.mem {
+		pl_init_array(p, h.ids, h.vals, h.term.vk)
+	} else {
+		pl_init(p, &e.ix.cache, sp.seg, h.term)
+	}
+	return p
+}
+
+@(private)
+_iter_list :: proc(e: ^Exec, sp: ^Src_Plan, h: Handle) -> ^Iter {
 	it := new(Iter, e.alloc)
 	it.kind = .List
-	it.pl = new(Plist, e.alloc)
-	it.count = t.count
-	pl_init(it.pl, &e.ix.cache, s, t)
+	it.pl = _plist(e, sp, h)
+	it.count = h.term.count
+	it.blo, it.bhi = h.term.lo, h.term.hi
+	if h.mem && len(h.ids) > 0 {
+		it.blo, it.bhi = h.ids[0], h.ids[len(h.ids) - 1]
+	}
 	return it
 }
 
 @(private)
-_iter_atom :: proc(e: ^Exec, s: ^Seg, p: ^Atom_Plan, at: ^Atom) -> ^Iter {
+_iter_atom :: proc(e: ^Exec, sp: ^Src_Plan, p: ^Atom_Src) -> ^Iter {
 	it := new(Iter, e.alloc)
 	it.kind = p.kind
-	it.lo = u32(s.f.lo)
+	it.lo = u32(sp.lo)
 	switch p.kind {
 	case .Empty, .All:
 	case .List, .And:
-		if len(p.terms) == 1 {
-			return _iter_list(e, s, p.terms[0])
+		if len(p.cands) == 1 {
+			return _iter_list(e, sp, p.cands[0])
 		}
 		it.kind = .And
 		it.kids = make([dynamic]^Iter, e.alloc)
-		for t in p.terms {
-			append(&it.kids, _iter_list(e, s, t))
+		for h in p.cands {
+			append(&it.kids, _iter_list(e, sp, h))
 		}
 		slice.sort_by(it.kids[:], proc(x, y: ^Iter) -> bool {
 			return x.count < y.count
 		})
 	case .Or:
 		it.kids = make([dynamic]^Iter, e.alloc)
-		for t in p.terms {
-			append(&it.kids, _iter_list(e, s, t))
+		for h in p.cands {
+			append(&it.kids, _iter_list(e, sp, h))
 		}
 		if len(it.kids) == 0 {
 			it.kind = .Empty
 		}
+	}
+	if p.titled && it.kind != .Empty {
+		w := new(Iter, e.alloc)
+		w.kind = .And
+		w.kids = make([dynamic]^Iter, e.alloc)
+		append(&w.kids, _iter_list(e, sp, p.title))
+		append(&w.kids, it)
+		return w
 	}
 	return it
 }
@@ -556,6 +795,9 @@ _seek :: proc(e: ^Exec, it: ^Iter, t: u32) -> (u32, bool) {
 		}
 		return x, true
 	case .Or:
+		if len(it.kids) > 8 {
+			return _seek_union(e, it, t)
+		}
 		best := u32(0)
 		found := false
 		for kid in it.kids {
@@ -583,34 +825,59 @@ _seek :: proc(e: ^Exec, it: ^Iter, t: u32) -> (u32, bool) {
 }
 
 @(private)
-_run_segment :: proc(e: ^Exec, si: int, plans: []Atom_Plan) -> Error {
-	s := &e.ix.segs[si]
-	if s.f.hi == s.f.lo {
+_source_dir :: proc(e: ^Exec, sp: ^Src_Plan, blk: u64) -> (d: Dir_Entry, err: Error) {
+	if sp.seg == nil {
+		return sp.mdir, .None
+	}
+	return seg_dir(&e.ix.cache, sp.seg, blk)
+}
+
+@(private)
+_remaining_bound :: proc(e: ^Exec, sp: ^Src_Plan) -> f64 {
+	rem := 0.0
+	for at in e.atoms {
+		if !at.scored {
+			continue
+		}
+		p := &sp.atoms[at.index]
+		for idf, j in at.tok_idf {
+			pl := p.vwords[j] if j < len(p.vwords) else nil
+			if pl == nil {
+				continue
+			}
+			rem += idf * (K1 + 1) * f64(pl.smax) / 15
+		}
+	}
+	return rem
+}
+
+@(private)
+_run_source :: proc(e: ^Exec, sp: ^Src_Plan) -> Error {
+	if sp.hi == sp.lo {
 		return .None
 	}
 	a := e.alloc
 	root := new(Iter, a)
 	root.kind = .And
-	root.lo = u32(s.f.lo)
+	root.lo = u32(sp.lo)
 	root.kids = make([dynamic]^Iter, a)
-	idx := 0
+	ests := make([dynamic]u64, a)
+	cis := make([dynamic]^Iter, a)
 	for &c in e.q.clauses {
-		ci: ^Iter
 		all := false
-		empty := 0
+		est := u64(0)
 		kids := make([dynamic]^Iter, a)
 		for &at in c.atoms {
-			p := &plans[idx]
-			idx += 1
-			if p.kind == .All {
+			p := &sp.atoms[at.index]
+			if p.kind == .All || at.neg {
 				all = true
 				continue
 			}
 			if p.kind == .Empty {
-				empty += 1
 				continue
 			}
-			append(&kids, _iter_atom(e, s, p, &at))
+			est += max(p.est, 1)
+			append(&kids, _iter_atom(e, sp, p))
 		}
 		if all {
 			continue
@@ -619,20 +886,38 @@ _run_segment :: proc(e: ^Exec, si: int, plans: []Atom_Plan) -> Error {
 			return .None
 		}
 		if len(kids) == 1 {
-			ci = kids[0]
+			append(&cis, kids[0])
 		} else {
-			ci = new(Iter, a)
+			ci := new(Iter, a)
 			ci.kind = .Or
 			ci.kids = kids
+			append(&cis, ci)
 		}
-		append(&root.kids, ci)
+		append(&ests, est)
+	}
+	if len(cis) > 0 {
+		lo := ests[0]
+		for x in ests {
+			lo = min(lo, x)
+		}
+		for ci, i in cis {
+			if ests[i] <= 4 * lo {
+				append(&root.kids, ci)
+			}
+		}
 	}
 	if len(root.kids) == 0 {
 		root.kind = .All
 	} else if len(root.kids) == 1 {
 		root = root.kids[0]
 	}
-	t := u32(s.f.hi - 1)
+	excl := make([dynamic]^Atom, a)
+	for &c in e.q.clauses {
+		if len(c.atoms) == 1 && c.atoms[0].neg && c.atoms[0].field == .Any {
+			append(&excl, &c.atoms[0])
+		}
+	}
+	t := u32(sp.hi - 1)
 	last_blk := max(u64)
 	for {
 		d, ok := _seek(e, root, t)
@@ -641,17 +926,26 @@ _run_segment :: proc(e: ^Exec, si: int, plans: []Atom_Plan) -> Error {
 		}
 		blk := u64(d) / DOC_BLOCK
 		if blk != last_blk {
-			dir, derr := seg_dir(&e.ix.cache, s, blk)
-			if derr != .None {
-				return derr
+			sp.dir = _source_dir(e, sp, blk) or_return
+			if len(e.heap) == e.k {
+				kth := e.heap[0]
+				stop := false
+				switch e.sort {
+				case .Newest:
+					stop = sp.dir.pmax <= kth.hlc
+				case .Relevance:
+					stop = (1 + _remaining_bound(e, sp)) * _decay(e, sp.dir.pmax) < kth.score
+				}
+				if stop {
+					if e.sort == .Newest {
+						e.stop = true
+					}
+					return .None
+				}
 			}
-			if len(e.heap) == e.k && _bound_fails(e, dir.pmax) {
-				e.stop = true
-				return .None
-			}
-			if dir.max_hlc < e.after || dir.min_hlc >= e.before {
-				start := max(blk * DOC_BLOCK, s.f.lo)
-				if start == s.f.lo {
+			if sp.dir.max_hlc < e.after || sp.dir.min_hlc >= e.before {
+				start := max(blk * DOC_BLOCK, sp.lo)
+				if start == sp.lo || sp.seg == nil {
 					break
 				}
 				t = u32(start - 1)
@@ -659,25 +953,22 @@ _run_segment :: proc(e: ^Exec, si: int, plans: []Atom_Plan) -> Error {
 			}
 			last_blk = blk
 		}
-		_consider(e, si, s, d) or_return
-		if u64(d) == s.f.lo {
+		excluded := false
+		for x in excl {
+			if _verdict(e, sp, x, nil, d) > 0 {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			_consider(e, sp, d) or_return
+		}
+		if u64(d) == sp.lo {
 			break
 		}
 		t = d - 1
 	}
 	return e.err
-}
-
-@(private)
-_bound_fails :: proc(e: ^Exec, pmax: u64) -> bool {
-	kth := e.heap[0]
-	switch e.sort {
-	case .Newest:
-		return pmax <= kth.hlc
-	case .Relevance:
-		return (1 + e.bm25max) * _decay(e, pmax) < kth.score
-	}
-	return false
 }
 
 @(private)
@@ -687,26 +978,72 @@ _dead :: proc(e: ^Exec, id: u32) -> bool {
 }
 
 @(private)
-_fetch_text :: proc(e: ^Exec, s: ^Seg, dm: ^Doc_Meta) -> bool {
+_meta :: proc(e: ^Exec, sp: ^Src_Plan, d: u32) -> (dm: ^Doc_Meta, err: Error) {
+	if sp.seg != nil {
+		doc_load(&e.ix.cache, sp.seg, &e.blk, u64(d) / DOC_BLOCK) or_return
+		return &e.blk.docs[d - e.blk.first], .None
+	}
+	m := &e.ix.mem
+	if u64(d) < m.base || u64(d) - m.base >= u64(len(m.docs)) {
+		return nil, .Corrupt
+	}
+	md := &m.docs[u64(d) - m.base]
+	clear(&e.mfields)
+	for f in 0 ..< int(md.nfields) {
+		fi := m.fidx[int(md.fields_off) + f]
+		append(&e.mfields, Field_Bytes{m.strs[fi[0]], m.strs[fi[1]]})
+	}
+	e.mmeta = Doc_Meta {
+		id          = d,
+		flags       = md.flags,
+		kind        = md.kind,
+		object      = m.ids[md.object],
+		participant = m.ids[md.part_id],
+		hlc         = md.hlc,
+		ref         = m.refs[md.ref_off:][:md.ref_len],
+		part        = md.part,
+		chunk       = md.chunk,
+		len         = md.len,
+		fields      = e.mfields[:],
+		frame       = i64(md.frame),
+		frame_off   = md.frame_off,
+	}
+	return &e.mmeta, .None
+}
+
+@(private)
+_fetch_text :: proc(e: ^Exec, sp: ^Src_Plan, dm: ^Doc_Meta) -> bool {
 	if e.have_text {
 		return e.text_ok
 	}
 	e.have_text = true
 	e.text_ok = false
 	n := int(dm.len)
+	e.verified += 1
+	if grow(&e.text, n) != nil || grow(&e.folded, n) != nil {
+		e.err = .No_Memory
+		return false
+	}
 	if n == 0 {
-		clear(&e.text)
-		clear(&e.folded)
 		e.text_ok = true
 		return true
 	}
-	if e.ix.man.store {
-		if dm.flags & DF_TEXT == 0 {
+	if e.ix.man.store && dm.flags & DF_TEXT == 0 {
+		return false
+	}
+	if e.ix.man.store && sp.seg == nil {
+		m := &e.ix.mem
+		at := int(m.frames[dm.frame]) + int(dm.frame_off)
+		if at + n > len(m.raw) {
+			e.err = .Corrupt
 			return false
 		}
+		copy(e.text[:], m.raw[at:][:n])
+	} else if e.ix.man.store {
+		s := sp.seg
 		if e.frame_at != dm.frame || e.frame_gen != s.gen {
 			e.frame_at = -1
-			if err := frame_read(&e.ix.cache, s, dm.frame, &e.frame, &e.fscratch); err != .None {
+			if err := frame_read(e.ix, s, dm.frame, &e.frame, &e.fscratch); err != .None {
 				e.err = err
 				return false
 			}
@@ -717,16 +1054,8 @@ _fetch_text :: proc(e: ^Exec, s: ^Seg, dm: ^Doc_Meta) -> bool {
 			e.err = .Corrupt
 			return false
 		}
-		if grow(&e.text, n) != nil {
-			e.err = .No_Memory
-			return false
-		}
 		copy(e.text[:], e.frame[dm.frame_off:][:n])
 	} else {
-		if grow(&e.text, n) != nil {
-			e.err = .No_Memory
-			return false
-		}
 		tr := Text_Ref {
 			object = dm.object,
 			ref    = dm.ref,
@@ -741,40 +1070,15 @@ _fetch_text :: proc(e: ^Exec, s: ^Seg, dm: ^Doc_Meta) -> bool {
 			return false
 		}
 	}
-	if grow(&e.folded, n) != nil {
-		e.err = .No_Memory
-		return false
-	}
 	fold_into(e.folded[:], e.text[:])
 	e.text_ok = true
 	return true
 }
 
 @(private)
-_eval :: proc(e: ^Exec, s: ^Seg, dm: ^Doc_Meta, at: ^Atom, i: int, defer_text: bool) -> (val: bool, needs_text: bool) {
+_eval_meta :: proc(e: ^Exec, dm: ^Doc_Meta, at: ^Atom) -> bool {
 	r := false
-	switch at.field {
-	case .Any, .Title, .Body:
-		is_title := dm.flags & DF_TITLE != 0
-		if at.field == .Title && !is_title {
-			return at.neg, false
-		}
-		if at.field == .Body && is_title {
-			return at.neg, false
-		}
-		if defer_text {
-			return false, true
-		}
-		if !e.occ_done[i] {
-			if !_fetch_text(e, s, dm) {
-				e.occ[i] = {}
-				e.occ[i].first = -1
-			} else {
-				e.occ[i] = find_all(e.folded[:], at.text, at.word)
-			}
-			e.occ_done[i] = true
-		}
-		r = e.occ[i].count > 0
+	#partial switch at.field {
 	case .Named:
 		for f in dm.fields {
 			if string(f.name) != string(at.name) {
@@ -809,100 +1113,213 @@ _eval :: proc(e: ^Exec, s: ^Seg, dm: ^Doc_Meta, at: ^Atom, i: int, defer_text: b
 			}
 		}
 	}
-	return r != at.neg, false
+	return r != at.neg
 }
 
 @(private)
-_consider :: proc(e: ^Exec, si: int, s: ^Seg, d: u32) -> Error {
-	blk := u64(d) / DOC_BLOCK
-	doc_load(&e.ix.cache, s, &e.blk, blk) or_return
-	dm := &e.blk.docs[d - e.blk.first]
-	if dm.flags & DF_DELETED != 0 || _dead(e, d) {
-		return .None
+_verdict :: proc(e: ^Exec, sp: ^Src_Plan, at: ^Atom, dm: ^Doc_Meta, d: u32) -> i8 {
+	if dm != nil {
+		is_title := dm.flags & DF_TITLE != 0
+		if (at.field == .Title && !is_title) || (at.field == .Body && is_title) {
+			return -1
+		}
 	}
-	if dm.hlc < e.after || dm.hlc >= e.before {
-		return .None
+	p := &sp.atoms[at.index]
+	switch p.kind {
+	case .Empty:
+		return -1
+	case .All:
+		return 0
+	case .List, .And, .Or:
 	}
-	e.have_text = false
-	for i in 0 ..< len(e.atoms) {
-		e.occ_done[i] = false
-		e.occ[i] = {}
+	if p.exactu {
+		if p.vunion == nil {
+			return -1
+		}
+		if p.exact >= 0 && p.vwords[p.exact] != nil {
+			v, ok := pl_seek(p.vwords[p.exact], d)
+			if ok && v == d {
+				return 1
+			}
+		}
+		for pl in p.vtris {
+			v, ok := pl_seek(pl, d)
+			if !ok || v != d {
+				return -1
+			}
+		}
+		v, ok := _seek(e, p.vunion, d)
+		return 1 if ok && v == d else -1
 	}
-	idx := 0
-	pending := false
+	if p.exact >= 0 {
+		pl := p.vwords[p.exact]
+		if pl != nil {
+			v, ok := pl_seek(pl, d)
+			if ok && v == d {
+				return 1
+			}
+		}
+		if at.word {
+			return -1
+		}
+	}
+	for pl in p.vcands {
+		v, ok := pl_seek(pl, d)
+		if !ok || v != d {
+			return -1
+		}
+	}
+	return 0
+}
+
+@(private)
+_text_present :: proc(e: ^Exec, sp: ^Src_Plan, dm: ^Doc_Meta, at: ^Atom) -> i8 {
+	if !_fetch_text(e, sp, dm) {
+		return -1
+	}
+	o := find_all(e.folded[:], at.text, at.word)
+	e.occ[at.index] = o
+	return 1 if o.count > 0 else -1
+}
+
+@(private)
+_consider :: proc(e: ^Exec, sp: ^Src_Plan, d: u32) -> Error {
 	for &c in e.q.clauses {
+		decided := true
 		ok := false
-		text_wait := false
-		for &at, j in c.atoms {
-			v, nt := _eval(e, s, dm, &at, idx + j, true)
-			if nt {
-				text_wait = true
-			} else if v {
+		for &at in c.atoms {
+			if at.field != .Any {
+				decided = false
+				break
+			}
+			v := _verdict(e, sp, &at, nil, d)
+			if v == 0 {
+				decided = false
+				break
+			}
+			if (v > 0) != at.neg {
 				ok = true
 				break
 			}
 		}
-		idx += len(c.atoms)
-		if !ok && !text_wait {
+		if decided && !ok {
 			return .None
 		}
-		if !ok {
-			pending = true
-		}
 	}
-	e.verified += 1
-	if pending {
-		idx = 0
-		for &c in e.q.clauses {
-			ok := false
-			for &at, j in c.atoms {
-				v, _ := _eval(e, s, dm, &at, idx + j, false)
-				if v {
-					ok = true
-					break
+	bm := 0.0
+	if e.sort == .Relevance && e.bm25max > 0 {
+		for at in e.atoms {
+			if !at.scored {
+				continue
+			}
+			p := &sp.atoms[at.index]
+			for idf, j in at.tok_idf {
+				pl := p.vwords[j] if j < len(p.vwords) else nil
+				if pl == nil || idf == 0 {
+					continue
+				}
+				v, ok := pl_seek(pl, d)
+				if ok && v == d {
+					bm += idf * (K1 + 1) * f64(pl_val(pl, d)) / 15
 				}
 			}
-			idx += len(c.atoms)
-			if !ok {
-				return e.err
-			}
 		}
+		if len(e.heap) == e.k && (1 + bm) * _decay(e, sp.dir.max_hlc) < e.heap[0].score {
+			return .None
+		}
+	}
+	dm := _meta(e, sp, d) or_return
+	if dm.flags & DF_DELETED != 0 || _dead(e, d) || dm.hlc < e.after || dm.hlc >= e.before {
+		return .None
 	}
 	x := Entry {
 		hlc = dm.hlc,
 		id  = d,
-		seg = si,
+		seg = sp.si,
+		obj = dm.object,
 	}
 	if e.sort == .Relevance {
-		bm := 0.0
-		dl := f64(dm.len)
-		for at, i in e.atoms {
-			if !at.scored {
-				continue
-			}
-			if !e.occ_done[i] {
-				v, _ := _eval(e, s, dm, at, i, false)
-				_ = v
-			}
-			tf := e.occ[i].weight
-			if tf > 0 {
-				bm += at.idf * tf * (K1 + 1) / (tf + K1 * (1 - B + B * dl / e.avgdl))
-			}
-		}
 		x.score = (1 + bm) * _decay(e, dm.hlc)
 	}
+	if len(e.heap) == e.k && !_entry_less(e.heap[0], x) {
+		return .None
+	}
 	if e.has_cur && !_entry_less(x, e.cur) {
-		return e.err
+		return .None
+	}
+	if e.collapse {
+		for o in e.emitted {
+			if o == dm.object {
+				return .None
+			}
+		}
+	}
+	e.have_text = false
+	for &c in e.q.clauses {
+		ok := false
+		pending := false
+		for &at in c.atoms {
+			e.present[at.index] = 0
+			if _is_text(&at) {
+				v := _verdict(e, sp, &at, dm, d)
+				e.present[at.index] = v
+				if v == 0 {
+					pending = true
+					continue
+				}
+				if (v > 0) != at.neg {
+					ok = true
+					break
+				}
+			} else if _eval_meta(e, dm, &at) {
+				ok = true
+				break
+			}
+		}
+		if ok {
+			continue
+		}
+		if !pending {
+			return e.err
+		}
+		for &at in c.atoms {
+			if !_is_text(&at) || e.present[at.index] != 0 {
+				continue
+			}
+			v := _text_present(e, sp, dm, &at)
+			if e.err != .None {
+				return e.err
+			}
+			if (v > 0) != at.neg {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return e.err
+		}
 	}
 	_heap_push(e, x)
 	return e.err
 }
 
 @(private)
+_source :: proc(e: ^Exec, si: int) -> ^Src_Plan {
+	for &sp in e.srcs {
+		if sp.si == si {
+			return &sp
+		}
+	}
+	return nil
+}
+
+@(private)
 _make_hit :: proc(e: ^Exec, x: Entry, h: ^Hit, allocator: runtime.Allocator) -> Error {
-	s := &e.ix.segs[x.seg]
-	doc_load(&e.ix.cache, s, &e.blk, u64(x.id) / DOC_BLOCK) or_return
-	dm := &e.blk.docs[x.id - e.blk.first]
+	sp := _source(e, x.seg)
+	if sp == nil {
+		return .Corrupt
+	}
+	dm := _meta(e, sp, x.id) or_return
 	h.object = dm.object
 	h.participant = dm.participant
 	h.ref = make([]u8, len(dm.ref), allocator)
@@ -922,7 +1339,7 @@ _make_hit :: proc(e: ^Exec, x: Entry, h: ^Hit, allocator: runtime.Allocator) -> 
 	h.score = x.score
 	h.doc = x.id
 	e.have_text = false
-	if !_fetch_text(e, s, dm) {
+	if !_fetch_text(e, sp, dm) {
 		h.snippet_at = dm.chunk
 		return .None
 	}
@@ -933,8 +1350,12 @@ _make_hit :: proc(e: ^Exec, x: Entry, h: ^Hit, allocator: runtime.Allocator) -> 
 			continue
 		}
 		o := find_all(e.folded[:], at.text, at.word)
-		if o.first >= 0 && at.idf > best {
-			best = at.idf
+		w := 0.0
+		for idf in at.tok_idf {
+			w += idf
+		}
+		if o.first >= 0 && w > best {
+			best = w
 			center = o.first
 		}
 	}
@@ -957,7 +1378,7 @@ _make_hit :: proc(e: ^Exec, x: Entry, h: ^Hit, allocator: runtime.Allocator) -> 
 	copy(snip, text[start:end])
 	h.snippet = string(snip)
 	h.snippet_at = dm.chunk + u64(start)
-	ms := make([dynamic]Match, allocator)
+	ms := make([dynamic]Match, e.alloc)
 	win := e.folded[start:end]
 	for at in e.atoms {
 		if !_is_text(at) || at.neg || len(at.text) == 0 {
@@ -983,30 +1404,47 @@ _make_hit :: proc(e: ^Exec, x: Entry, h: ^Hit, allocator: runtime.Allocator) -> 
 		}
 		append(&out, m)
 	}
-	delete(ms)
 	h.matches = out[:]
 	return .None
 }
 
 @(private)
-_cursor_encode :: proc(e: ^Exec, qhash: u64, last: Entry, allocator: runtime.Allocator) -> []u8 {
+_cursor_encode :: proc(e: ^Exec, qhash: u64, last: Entry, allocator: runtime.Allocator) -> ([]u8, Error) {
+	if e.collapse && len(e.emitted) > MAX_COLLAPSED {
+		return nil, .Too_Large
+	}
 	out := make([dynamic]u8, allocator)
 	w := prim.writer(&out)
 	prim.write_u8(&w, CURSOR_VERSION)
 	prim.write_u8(&w, u8(e.sort))
+	prim.write_u8(&w, 1 if e.collapse else 0)
 	prim.write_u64le(&w, qhash)
 	prim.write_u64le(&w, u64(e.now_ms))
 	prim.write_u64le(&w, u64(e.half_life))
 	prim.write_u64le(&w, transmute(u64)e.n_docs)
-	prim.write_u64le(&w, transmute(u64)e.avgdl)
-	prim.write_u8(&w, u8(len(e.atoms)))
+	n := 0
 	for at in e.atoms {
-		prim.write_u64le(&w, transmute(u64)at.idf)
+		n += len(at.tok_idf)
+	}
+	prim.write_uvarint(&w, u64(n))
+	for at in e.atoms {
+		for idf in at.tok_idf {
+			prim.write_u64le(&w, transmute(u64)idf)
+		}
 	}
 	prim.write_u64le(&w, transmute(u64)last.score)
 	prim.write_u64le(&w, last.hlc)
 	prim.write_u32le(&w, last.id)
-	return out[:]
+	prim.write_uvarint(&w, u64(len(e.emitted)) if e.collapse else 0)
+	if e.collapse {
+		for o in e.emitted {
+			prim.write_id(&w, o)
+		}
+	}
+	if w.err != .None {
+		return nil, .No_Memory
+	}
+	return out[:], .None
 }
 
 @(private)
@@ -1015,26 +1453,38 @@ _cursor_decode :: proc(e: ^Exec, c: []u8, qhash: u64) -> Error {
 	if prim.read_u8(&r) != CURSOR_VERSION {
 		return .Invalid
 	}
-	if Sort(prim.read_u8(&r)) != e.sort || prim.read_u64le(&r) != qhash {
+	if Sort(prim.read_u8(&r)) != e.sort || (prim.read_u8(&r) == 1) != e.collapse || prim.read_u64le(&r) != qhash {
 		return .Invalid
 	}
 	e.now_ms = i64(prim.read_u64le(&r))
 	e.half_life = i64(prim.read_u64le(&r))
 	e.n_docs = transmute(f64)prim.read_u64le(&r)
-	e.avgdl = transmute(f64)prim.read_u64le(&r)
-	n := int(prim.read_u8(&r))
-	if n != len(e.atoms) || e.half_life <= 0 {
+	n := int(prim.read_uvarint(&r))
+	total := 0
+	for at in e.atoms {
+		total += len(at.tok_idf)
+	}
+	if n != total || e.half_life <= 0 {
 		return .Invalid
 	}
 	for at in e.atoms {
-		at.idf = transmute(f64)prim.read_u64le(&r)
-		if math.is_nan(at.idf) || at.idf < 0 {
-			return .Invalid
+		for &idf in at.tok_idf {
+			idf = transmute(f64)prim.read_u64le(&r)
+			if math.is_nan(idf) || idf < 0 {
+				return .Invalid
+			}
 		}
 	}
 	e.cur.score = transmute(f64)prim.read_u64le(&r)
 	e.cur.hlc = prim.read_u64le(&r)
 	e.cur.id = prim.read_u32le(&r)
+	ne := prim.read_uvarint(&r)
+	if ne > MAX_COLLAPSED {
+		return .Invalid
+	}
+	for _ in 0 ..< ne {
+		append(&e.emitted, prim.read_id(&r))
+	}
 	if !prim.reader_done(&r) {
 		return .Invalid
 	}
@@ -1043,20 +1493,14 @@ _cursor_decode :: proc(e: ^Exec, c: []u8, qhash: u64) -> Error {
 }
 
 @(private)
-_fold_eq :: proc "contextless" (a, b: []u8) -> bool {
-	if len(a) != len(b) {
+_fold_eq :: proc(a, b: []u8) -> bool {
+	if len(a) != len(b) || len(a) > MAX_PATH {
 		return false
 	}
-	for i in 0 ..< len(a) {
-		if fold(a[i]) != b[i] {
-			return false
-		}
-	}
-	return true
+	buf: [MAX_PATH]u8
+	fold_into(buf[:len(a)], a)
+	return string(buf[:len(a)]) == string(b)
 }
-
-VCURSOR_VERSION :: u8(2)
-RRF_K :: 60.0
 
 @(private)
 _query_vector :: proc(e: ^Exec, r: ^Request) -> (qv: []f32, err: Error) {
@@ -1097,28 +1541,19 @@ _query_vector :: proc(e: ^Exec, r: ^Request) -> (qv: []f32, err: Error) {
 }
 
 @(private)
-_vec_ok :: proc(e: ^Exec, si: int, id: u32) -> (ok: bool, err: Error) {
-	s := &e.ix.segs[si]
-	doc_load(&e.ix.cache, s, &e.blk, u64(id) / DOC_BLOCK) or_return
-	dm := &e.blk.docs[id - e.blk.first]
+_vec_ok :: proc(e: ^Exec, sp: ^Src_Plan, id: u32) -> (ok: bool, err: Error) {
+	dm := _meta(e, sp, id) or_return
 	if dm.flags & DF_DELETED != 0 || _dead(e, id) || dm.hlc < e.after || dm.hlc >= e.before {
 		return false, .None
 	}
-	idx := 0
 	for &c in e.q.clauses {
 		pass := false
-		for &at, j in c.atoms {
-			if _is_text(&at) {
-				pass = true
-				break
-			}
-			v, _ := _eval(e, s, dm, &at, idx + j, true)
-			if v {
+		for &at in c.atoms {
+			if _is_text(&at) || _eval_meta(e, dm, &at) {
 				pass = true
 				break
 			}
 		}
-		idx += len(c.atoms)
 		if !pass {
 			return false, .None
 		}
@@ -1126,41 +1561,24 @@ _vec_ok :: proc(e: ^Exec, si: int, id: u32) -> (ok: bool, err: Error) {
 	return true, .None
 }
 
+HYBRID_DEPTH :: 100
+
 @(private)
-_search_vector :: proc(e: ^Exec, qv: []f32, plans: [][]Atom_Plan, r: ^Request, qhash: u64, allocator: runtime.Allocator) -> (res: Results, err: Error) {
-	offset := 0
+_search_vector :: proc(e: ^Exec, qv: []f32, r: ^Request, qhash: u64, allocator: runtime.Allocator) -> (res: Results, err: Error) {
+	limit := e.k - 1
+	has_cur := false
+	cur: Entry
 	if len(r.cursor) > 0 {
 		c := prim.reader(r.cursor)
 		if prim.read_u8(&c) != VCURSOR_VERSION || prim.read_u8(&c) != u8(e.sort) || prim.read_u64le(&c) != qhash {
 			return res, .Invalid
 		}
-		offset = int(prim.read_u32le(&c))
+		cur.score = transmute(f64)prim.read_u64le(&c)
+		cur.id = prim.read_u32le(&c)
 		if !prim.reader_done(&c) {
 			return res, .Invalid
 		}
-	}
-	limit := e.k - 1
-	want := offset + limit + 1
-	vl := make([dynamic]Entry, e.alloc)
-	nprobe := r.nprobe if r.nprobe > 0 else DEFAULT_NPROBE
-	need := want
-	for round in 0 ..< 5 {
-		cand := vec_candidates(e, qv, need, nprobe, r.rerank) or_return
-		clear(&vl)
-		for h in cand {
-			ok := _vec_ok(e, h.seg, h.id) or_return
-			if ok {
-				append(&vl, Entry{score = f64(h.score), id = h.id, seg = h.seg})
-				if len(vl) == want {
-					break
-				}
-			}
-		}
-		if len(vl) >= want || (len(cand) < max(r.rerank, RERANK_MIN, RERANK_FACTOR * need) && nprobe >= MAX_LISTS) || round == 4 {
-			break
-		}
-		need *= 4
-		nprobe = min(nprobe * 4, MAX_LISTS)
+		has_cur = true
 	}
 	has_text := false
 	for at in e.atoms {
@@ -1168,13 +1586,53 @@ _search_vector :: proc(e: ^Exec, qv: []f32, plans: [][]Atom_Plan, r: ^Request, q
 			has_text = true
 		}
 	}
+	vkey_less :: proc "contextless" (a, b: Entry) -> bool {
+		if a.score != b.score {
+			return a.score < b.score
+		}
+		return a.id < b.id
+	}
+	depth := max(HYBRID_DEPTH, 4 * limit) if has_text else limit + 1
+	vl := make([dynamic]Entry, e.alloc)
+	beam := r.beam if r.beam > 0 else DEFAULT_BEAM
+	need := depth
+	for round in 0 ..< 5 {
+		cand := vec_candidates(e, qv, need, beam) or_return
+		clear(&vl)
+		for h in cand {
+			x := Entry{score = f64(h.score), id = h.id, seg = h.seg}
+			if !has_text && has_cur && !vkey_less(x, cur) {
+				continue
+			}
+			sp := _source(e, h.seg)
+			if sp == nil {
+				continue
+			}
+			ok := _vec_ok(e, sp, h.id) or_return
+			if !ok {
+				continue
+			}
+			dm := _meta(e, sp, h.id) or_return
+			x.obj = dm.object
+			x.hlc = dm.hlc
+			append(&vl, x)
+			if len(vl) == depth {
+				break
+			}
+		}
+		if len(vl) >= depth || len(cand) < need || round == 4 {
+			break
+		}
+		need *= 4
+		beam *= 2
+	}
 	all := make([dynamic]Entry, e.alloc)
 	if !has_text {
 		append(&all, ..vl[:])
 	} else {
-		e.k = want
-		for si := len(e.ix.segs) - 1; si >= 0 && !e.stop; si -= 1 {
-			_run_segment(e, si, plans[si]) or_return
+		e.k = depth
+		for i := len(e.srcs) - 1; i >= 0 && !e.stop; i -= 1 {
+			_run_source(e, &e.srcs[i]) or_return
 		}
 		if e.err != .None {
 			return res, e.err
@@ -1185,7 +1643,9 @@ _search_vector :: proc(e: ^Exec, qv: []f32, plans: [][]Atom_Plan, r: ^Request, q
 		fused := make(map[u32]int, e.alloc)
 		for x, rank in vl {
 			fused[x.id] = len(all)
-			append(&all, Entry{score = 1 / (RRF_K + f64(rank + 1)), id = x.id, seg = x.seg})
+			y := x
+			y.score = 1 / (RRF_K + f64(rank + 1))
+			append(&all, y)
 		}
 		for x, rank in e.heap {
 			add := 1 / (RRF_K + f64(rank + 1))
@@ -1193,30 +1653,239 @@ _search_vector :: proc(e: ^Exec, qv: []f32, plans: [][]Atom_Plan, r: ^Request, q
 				all[i].score += add
 			} else {
 				fused[x.id] = len(all)
-				append(&all, Entry{score = add, id = x.id, seg = x.seg})
+				y := x
+				y.score = add
+				append(&all, y)
 			}
 		}
 	}
 	slice.sort_by(all[:], proc(x, y: Entry) -> bool {
-		return _entry_less(y, x)
+		if x.score != y.score {
+			return x.score > y.score
+		}
+		return x.id > y.id
 	})
-	lo := min(offset, len(all))
-	hi := min(offset + limit, len(all))
-	hits := make([]Hit, hi - lo, allocator)
-	for i in lo ..< hi {
-		_make_hit(e, all[i], &hits[i - lo], allocator) or_return
+	kept := make([dynamic]Entry, e.alloc)
+	seen := make(map[prim.Id]bool, e.alloc)
+	for x in all {
+		if has_text && has_cur && !vkey_less(x, cur) {
+			continue
+		}
+		if e.collapse {
+			if x.obj in seen {
+				continue
+			}
+			seen[x.obj] = true
+		}
+		append(&kept, x)
+	}
+	n := min(len(kept), limit)
+	hits := make([]Hit, n, allocator)
+	for i in 0 ..< n {
+		_make_hit(e, kept[i], &hits[i], allocator) or_return
 	}
 	res.hits = hits
 	res.incomplete = e.incomplete
 	res.verified = e.verified
-	if len(all) > offset + limit {
+	if len(kept) > limit {
+		last := kept[limit - 1]
 		out := make([dynamic]u8, allocator)
 		w := prim.writer(&out)
 		prim.write_u8(&w, VCURSOR_VERSION)
 		prim.write_u8(&w, u8(e.sort))
 		prim.write_u64le(&w, qhash)
-		prim.write_u32le(&w, u32(offset + limit))
+		prim.write_u64le(&w, transmute(u64)last.score)
+		prim.write_u32le(&w, last.id)
 		res.cursor = out[:]
 	}
 	return res, .None
+}
+
+@(private)
+_tri_plan :: proc(e: ^Exec, sp: ^Src_Plan, at: ^Atom, p: ^Atom_Src) -> Error {
+	p.kind = .List
+	for k in at.keys {
+		kb: [8]u8
+		n := key64_bytes(k, &kb)
+		h, found := _lookup(e, sp, kb[:n]) or_return
+		if !found {
+			p.kind = .Empty
+			clear(&p.cands)
+			return .None
+		}
+		append(&p.cands, h)
+	}
+	slice.sort_by(p.cands[:], proc(x, y: Handle) -> bool {
+		return x.term.count < y.term.count
+	})
+	append(&p.checks, ..p.cands[:])
+	if len(p.cands) > MAX_CANDS {
+		resize(&p.cands, MAX_CANDS)
+	}
+	return .None
+}
+
+@(private)
+_vocab :: proc(e: ^Exec, sp: ^Src_Plan, text: []u8) -> (hs: [dynamic]Handle, ok: bool, err: Error) {
+	hs = make([dynamic]Handle, e.alloc)
+	if sp.seg == nil {
+		m := &e.ix.mem
+		for &t, ti in m.terms {
+			if t.klen == 0 || m.karena[t.koff] != NS_WORD {
+				continue
+			}
+			k := _long_key(m, &t)
+			if !bytes.contains(k[1:], text) {
+				continue
+			}
+			if len(hs) >= VOCAB_CAP {
+				return hs, false, .None
+			}
+			h := _mem_handle(e, u32(ti)) or_return
+			if h.term.count > 0 {
+				append(&hs, h)
+			}
+		}
+		return hs, true, .None
+	}
+	it := new(Iter, e.alloc)
+	it.kind = .And
+	it.kids = make([dynamic]^Iter, e.alloc)
+	for i := 0; i + 3 <= len(text); i += 1 {
+		key := [4]u8{NS_VTRI, text[i], text[i + 1], text[i + 2]}
+		t, found := term_lookup(sp.dc, key[:]) or_return
+		if !found {
+			return hs, true, .None
+		}
+		append(&it.kids, _iter_list(e, sp, Handle{term = t}))
+	}
+	smallest := max(u32)
+	for kid in it.kids {
+		smallest = min(smallest, kid.count)
+	}
+	if smallest > VOCAB_SCAN {
+		return hs, false, .None
+	}
+	slice.sort_by(it.kids[:], proc(x, y: ^Iter) -> bool {
+		return x.count < y.count
+	})
+	ords := make([dynamic]u32, e.alloc)
+	t := u32(max(u32))
+	for {
+		o, found := _seek(e, it, t)
+		if !found || e.err != .None {
+			break
+		}
+		if len(ords) >= VOCAB_SCAN {
+			return hs, false, .None
+		}
+		append(&ords, o)
+		if o == 0 {
+			break
+		}
+		t = o - 1
+	}
+	slice.reverse(ords[:])
+	dc := new(Dict_Cursor, e.alloc)
+	dc_init(dc, &e.ix.cache, sp.seg, sp.dc.dix, e.alloc)
+	cur := i64(-1)
+	for o in ords {
+		if u64(o) >= sp.seg.f.w_count {
+			return hs, false, .Corrupt
+		}
+		target := i64(sp.seg.f.w_first + u64(o))
+		blk := int(target / DICT_BLOCK)
+		if dc.blk != blk || cur > target || cur < i64(blk) * DICT_BLOCK - 1 {
+			if !dc_load(dc, blk) {
+				return hs, false, dc.err
+			}
+			cur = i64(blk) * DICT_BLOCK - 1
+		}
+		for cur < target {
+			if !dc_next(dc) {
+				return hs, false, dc.err if dc.err != .None else .Corrupt
+			}
+			cur += 1
+		}
+		k := dc_key(dc)
+		if len(k) == 0 || k[0] != NS_WORD {
+			return hs, false, .Corrupt
+		}
+		if bytes.contains(k[1:], text) {
+			if len(hs) >= VOCAB_CAP {
+				return hs, false, .None
+			}
+			append(&hs, Handle{term = dc.term})
+		}
+	}
+	return hs, true, e.err
+}
+
+@(private)
+_seek_union :: proc(e: ^Exec, it: ^Iter, t: u32) -> (u32, bool) {
+	h := &it.heap
+	if !it.init {
+		it.init = true
+		it.heap = make([dynamic]^Iter, 0, len(it.kids), e.alloc)
+		for kid in it.kids {
+			if kid.kind == .List {
+				kid.val = kid.bhi
+				kid.has = false
+			} else {
+				v, ok := _seek(e, kid, t)
+				if !ok {
+					continue
+				}
+				kid.val = v
+				kid.has = true
+			}
+			append(h, kid)
+		}
+		for i := len(h) / 2 - 1; i >= 0; i -= 1 {
+			_iter_sift(h[:], i)
+		}
+	}
+	for len(h) > 0 {
+		top := h[0]
+		if top.val <= t {
+			return top.val, true
+		}
+		if !top.has && t < top.blo {
+			h[0] = h[len(h) - 1]
+			pop(h)
+		} else {
+			v, ok := _seek(e, top, t)
+			if ok {
+				top.val = v
+				top.has = true
+			} else {
+				h[0] = h[len(h) - 1]
+				pop(h)
+			}
+		}
+		if len(h) > 0 {
+			_iter_sift(h[:], 0)
+		}
+	}
+	return 0, false
+}
+
+@(private)
+_iter_sift :: proc(h: []^Iter, i0: int) {
+	i := i0
+	for {
+		l := 2 * i + 1
+		if l >= len(h) {
+			return
+		}
+		m := l
+		if l + 1 < len(h) && h[l + 1].val > h[l].val {
+			m = l + 1
+		}
+		if h[m].val <= h[i].val {
+			return
+		}
+		h[i], h[m] = h[m], h[i]
+		i = m
+	}
 }

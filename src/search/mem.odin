@@ -1,6 +1,7 @@
 package search
 
 import "base:runtime"
+import "core:math"
 import "core:slice"
 import "../prim"
 
@@ -8,12 +9,14 @@ MCHUNK :: 32
 MCHUNK_DATA :: MCHUNK - 4
 
 Mem_Term :: struct {
-	key32: u32,
+	key:   u64,
 	koff:  u32,
 	last:  u32,
+	prev:  u32,
 	count: u32,
 	head:  u32,
 	tail:  u32,
+	acc:   u16,
 	used:  u8,
 	klen:  u8,
 }
@@ -39,8 +42,9 @@ Mem :: struct {
 	allocator: runtime.Allocator,
 	base:      u64,
 	terms:     [dynamic]Mem_Term,
-	t32:       []u32,
-	t32_n:     int,
+	tfix:      []u32,
+	tfix_n:    int,
+	doc_words: [dynamic]u32,
 	tlong:     []u32,
 	tlong_n:   int,
 	karena:    [dynamic]u8,
@@ -58,7 +62,6 @@ Mem :: struct {
 	raw:       [dynamic]u8,
 	frames:    [dynamic]u32,
 	scratch:   [dynamic]u8,
-	lz:        ^[1 << LZ_HASH_BITS]i32,
 	sources:   map[prim.Id]i64,
 	dead:      [dynamic]u32,
 	files:     map[string][]u8,
@@ -73,6 +76,7 @@ mem_init :: proc(m: ^Mem, allocator: runtime.Allocator) -> Error {
 		allocator = allocator,
 	}
 	m.terms = make([dynamic]Mem_Term, allocator)
+	m.doc_words = make([dynamic]u32, allocator)
 	m.karena = make([dynamic]u8, allocator)
 	m.chunks = make([dynamic]u8, allocator)
 	m.docs = make([dynamic]Mem_Doc, allocator)
@@ -93,20 +97,15 @@ mem_init :: proc(m: ^Mem, allocator: runtime.Allocator) -> Error {
 	m.files = make(map[string][]u8, allocator)
 	m.scopes = make(map[prim.Id][]u8, allocator)
 	m.fold = make([dynamic]u8, allocator)
-	lz, err := new([1 << LZ_HASH_BITS]i32, allocator)
-	if err != nil {
-		return .No_Memory
-	}
-	m.lz = lz
 	return _mem_tables(m, 1 << 12, 1 << 8)
 }
 
 @(private)
-_mem_tables :: proc(m: ^Mem, n32, nlong: int) -> Error {
-	delete(m.t32, m.allocator)
+_mem_tables :: proc(m: ^Mem, nfix, nlong: int) -> Error {
+	delete(m.tfix, m.allocator)
 	delete(m.tlong, m.allocator)
 	err: runtime.Allocator_Error
-	m.t32, err = make([]u32, n32, m.allocator)
+	m.tfix, err = make([]u32, nfix, m.allocator)
 	if err != nil {
 		return .No_Memory
 	}
@@ -114,7 +113,7 @@ _mem_tables :: proc(m: ^Mem, n32, nlong: int) -> Error {
 	if err != nil {
 		return .No_Memory
 	}
-	m.t32_n = 0
+	m.tfix_n = 0
 	m.tlong_n = 0
 	return .None
 }
@@ -122,7 +121,8 @@ _mem_tables :: proc(m: ^Mem, n32, nlong: int) -> Error {
 mem_destroy :: proc(m: ^Mem) {
 	mem_reset(m, 0)
 	delete(m.terms)
-	delete(m.t32, m.allocator)
+	delete(m.doc_words)
+	delete(m.tfix, m.allocator)
 	delete(m.tlong, m.allocator)
 	delete(m.karena)
 	delete(m.chunks)
@@ -144,21 +144,21 @@ mem_destroy :: proc(m: ^Mem) {
 	delete(m.files)
 	delete(m.scopes)
 	delete(m.fold)
-	free(m.lz, m.allocator)
 	m^ = {}
 }
 
 mem_reset :: proc(m: ^Mem, base: u64) {
 	m.base = base
 	clear(&m.terms)
-	for &e in m.t32 {
+	for &e in m.tfix {
 		e = 0
 	}
 	for &e in m.tlong {
 		e = 0
 	}
-	m.t32_n = 0
+	m.tfix_n = 0
 	m.tlong_n = 0
+	clear(&m.doc_words)
 	clear(&m.karena)
 	clear(&m.chunks)
 	clear(&m.docs)
@@ -201,7 +201,7 @@ mem_bytes :: proc "contextless" (m: ^Mem) -> int {
 	return(
 		len(m.chunks) +
 		len(m.terms) * size_of(Mem_Term) +
-		(len(m.t32) + len(m.tlong)) * 4 +
+		(len(m.tfix) + len(m.tlong)) * 4 +
 		len(m.docs) * size_of(Mem_Doc) +
 		len(m.refs) +
 		len(m.karena) +
@@ -221,8 +221,35 @@ mem_empty :: proc "contextless" (m: ^Mem) -> bool {
 }
 
 @(private)
-_hash32 :: #force_inline proc "contextless" (k: u32) -> u32 {
-	return k * 0x9E3779B1
+_hash64 :: #force_inline proc "contextless" (k: u64) -> u32 {
+	return u32((k * 0x9E3779B97F4A7C15) >> 32)
+}
+
+@(private)
+_chain_put :: #force_inline proc(m: ^Mem, ti: u32, v: u64) -> Error #no_bounds_check {
+	buf: [10]u8
+	n := prim.put_uvarint(buf[:], v)
+	t := &m.terms[ti]
+	for k in 0 ..< n {
+		if t.head == 0 && t.count == 0 || t.used == MCHUNK_DATA {
+			at := u32(len(m.chunks) / MCHUNK)
+			if grow(&m.chunks, len(m.chunks) + MCHUNK) != nil {
+				return .No_Memory
+			}
+			t = &m.terms[ti]
+			prim.put_u32le(m.chunks[int(at) * MCHUNK:], 0)
+			if t.head == 0 && t.count == 0 {
+				t.head = at + 1
+			} else {
+				prim.put_u32le(m.chunks[int(t.tail - 1) * MCHUNK:], at + 1)
+			}
+			t.tail = at + 1
+			t.used = 0
+		}
+		m.chunks[int(t.tail - 1) * MCHUNK + 4 + int(t.used)] = buf[k]
+		t.used += 1
+	}
+	return .None
 }
 
 @(private)
@@ -233,78 +260,112 @@ _post_term :: #force_inline proc(m: ^Mem, ti: u32, id: u32) -> Error #no_bounds_
 	}
 	delta := id + 1 - t.last
 	t.last = id + 1
-	t.count += 1
-	buf: [5]u8
-	n := prim.put_uvarint(buf[:], u64(delta))
-	for k in 0 ..< n {
-		if t.used == MCHUNK_DATA || t.count == 1 && k == 0 {
-			at := u32(len(m.chunks) / MCHUNK)
-			if grow(&m.chunks, len(m.chunks) + MCHUNK) != nil {
-				return .No_Memory
-			}
-			t = &m.terms[ti]
-			prim.put_u32le(m.chunks[int(at) * MCHUNK:], 0)
-			if t.count == 1 && k == 0 {
-				t.head = at
-			} else {
-				prim.put_u32le(m.chunks[int(t.tail) * MCHUNK:], at)
-			}
-			t.tail = at
-			t.used = 0
+	_chain_put(m, ti, u64(delta)) or_return
+	m.terms[ti].count += 1
+	return .None
+}
+
+@(private)
+_post_word :: #force_inline proc(m: ^Mem, ti: u32, id: u32) -> Error #no_bounds_check {
+	t := &m.terms[ti]
+	if t.last == id + 1 {
+		if t.acc < max(u16) {
+			t.acc += 1
 		}
-		m.chunks[int(t.tail) * MCHUNK + 4 + int(t.used)] = buf[k]
-		t.used += 1
+		return .None
+	}
+	t.last = id + 1
+	t.acc = 1
+	if _, e := append(&m.doc_words, ti); e != nil {
+		return .No_Memory
 	}
 	return .None
 }
 
 @(private)
-_post32 :: proc(m: ^Mem, key: u32, id: u32) -> Error #no_bounds_check {
-	mask := u32(len(m.t32) - 1)
-	h := _hash32(key) & mask
+_end_doc :: proc(m: ^Mem, id: u32) -> Error {
+	for ti in m.doc_words {
+		t := &m.terms[ti]
+		delta := id + 1 - t.prev
+		t.prev = id + 1
+		acc := t.acc
+		_chain_put(m, ti, u64(delta)) or_return
+		_chain_put(m, ti, u64(acc)) or_return
+		m.terms[ti].count += 1
+	}
+	clear(&m.doc_words)
+	return .None
+}
+
+@(private)
+_find_fix :: proc(m: ^Mem, key: u64) -> (ti: u32, found: bool) #no_bounds_check {
+	mask := u32(len(m.tfix) - 1)
+	h := _hash64(key) & mask
 	for {
-		e := m.t32[h]
+		e := m.tfix[h]
 		if e == 0 {
-			break
+			return 0, false
 		}
-		if m.terms[e - 1].key32 == key {
-			return _post_term(m, e - 1, id)
+		if m.terms[e - 1].key == key {
+			return e - 1, true
 		}
 		h = (h + 1) & mask
 	}
-	if (m.t32_n + 1) * 2 > len(m.t32) {
-		_grow32(m) or_return
-		return _post32(m, key, id)
+}
+
+@(private)
+_term_fix :: proc(m: ^Mem, key: u64) -> (ti: u32, err: Error) #no_bounds_check {
+	mask := u32(len(m.tfix) - 1)
+	h := _hash64(key) & mask
+	for {
+		e := m.tfix[h]
+		if e == 0 {
+			break
+		}
+		if m.terms[e - 1].key == key {
+			return e - 1, .None
+		}
+		h = (h + 1) & mask
 	}
-	ti := u32(len(m.terms))
-	if _, e := append(&m.terms, Mem_Term{key32 = key}); e != nil {
-		return .No_Memory
+	if (m.tfix_n + 1) * 2 > len(m.tfix) {
+		_grow_fix(m) or_return
+		return _term_fix(m, key)
 	}
-	m.t32[h] = ti + 1
-	m.t32_n += 1
+	ti = u32(len(m.terms))
+	if _, e := append(&m.terms, Mem_Term{key = key}); e != nil {
+		return 0, .No_Memory
+	}
+	m.tfix[h] = ti + 1
+	m.tfix_n += 1
+	return ti, .None
+}
+
+@(private)
+_post_fix :: #force_inline proc(m: ^Mem, key: u64, id: u32) -> Error {
+	ti := _term_fix(m, key) or_return
 	return _post_term(m, ti, id)
 }
 
 @(private)
-_grow32 :: proc(m: ^Mem) -> Error {
-	n := len(m.t32) * 2
+_grow_fix :: proc(m: ^Mem) -> Error {
+	n := len(m.tfix) * 2
 	nt, err := make([]u32, n, m.allocator)
 	if err != nil {
 		return .No_Memory
 	}
 	mask := u32(n - 1)
-	for e in m.t32 {
+	for e in m.tfix {
 		if e == 0 {
 			continue
 		}
-		h := _hash32(m.terms[e - 1].key32) & mask
+		h := _hash64(m.terms[e - 1].key) & mask
 		for nt[h] != 0 {
 			h = (h + 1) & mask
 		}
 		nt[h] = e
 	}
-	delete(m.t32, m.allocator)
-	m.t32 = nt
+	delete(m.tfix, m.allocator)
+	m.tfix = nt
 	return .None
 }
 
@@ -323,7 +384,23 @@ _long_key :: proc(m: ^Mem, t: ^Mem_Term) -> []u8 {
 }
 
 @(private)
-_post_long :: proc(m: ^Mem, key: []u8, id: u32) -> Error {
+_find_long :: proc(m: ^Mem, key: []u8) -> (ti: u32, found: bool) {
+	mask := u32(len(m.tlong) - 1)
+	h := _hash_bytes(key) & mask
+	for {
+		e := m.tlong[h]
+		if e == 0 {
+			return 0, false
+		}
+		if string(_long_key(m, &m.terms[e - 1])) == string(key) {
+			return e - 1, true
+		}
+		h = (h + 1) & mask
+	}
+}
+
+@(private)
+_term_long :: proc(m: ^Mem, key: []u8) -> (ti: u32, err: Error) {
 	mask := u32(len(m.tlong) - 1)
 	h := _hash_bytes(key) & mask
 	for {
@@ -332,15 +409,15 @@ _post_long :: proc(m: ^Mem, key: []u8, id: u32) -> Error {
 			break
 		}
 		if string(_long_key(m, &m.terms[e - 1])) == string(key) {
-			return _post_term(m, e - 1, id)
+			return e - 1, .None
 		}
 		h = (h + 1) & mask
 	}
 	if (m.tlong_n + 1) * 2 > len(m.tlong) {
 		n := len(m.tlong) * 2
-		nt, err := make([]u32, n, m.allocator)
-		if err != nil {
-			return .No_Memory
+		nt, aerr := make([]u32, n, m.allocator)
+		if aerr != nil {
+			return 0, .No_Memory
 		}
 		nmask := u32(n - 1)
 		for e in m.tlong {
@@ -355,31 +432,43 @@ _post_long :: proc(m: ^Mem, key: []u8, id: u32) -> Error {
 		}
 		delete(m.tlong, m.allocator)
 		m.tlong = nt
-		return _post_long(m, key, id)
+		return _term_long(m, key)
 	}
-	ti := u32(len(m.terms))
+	ti = u32(len(m.terms))
 	koff := u32(len(m.karena))
 	if _, e := append(&m.karena, ..key); e != nil {
-		return .No_Memory
+		return 0, .No_Memory
 	}
-	if _, e := append(&m.terms, Mem_Term{key32 = 0, koff = koff, klen = u8(len(key))}); e != nil {
-		return .No_Memory
+	if _, e := append(&m.terms, Mem_Term{koff = koff, klen = u8(len(key))}); e != nil {
+		return 0, .No_Memory
 	}
 	m.tlong[h] = ti + 1
 	m.tlong_n += 1
-	return _post_term(m, ti, id)
+	return ti, .None
 }
 
 @(private)
-_mem_term_key :: proc(m: ^Mem, t: ^Mem_Term, out: ^[MAX_KEY]u8) -> []u8 {
+_post_long :: proc(m: ^Mem, key: []u8, id: u32) -> Error {
+	ti := _term_long(m, key) or_return
+	return _post_term(m, ti, id)
+}
+
+mem_term_key :: proc(m: ^Mem, t: ^Mem_Term, out: ^[MAX_KEY]u8) -> []u8 {
 	if t.klen > 0 {
 		n := copy(out[:], _long_key(m, t))
 		return out[:n]
 	}
-	kb: [4]u8
-	n := key32_bytes(t.key32, &kb)
+	kb: [8]u8
+	n := key64_bytes(t.key, &kb)
 	copy(out[:], kb[:n])
 	return out[:n]
+}
+
+mem_term_vk :: proc "contextless" (m: ^Mem, t: ^Mem_Term) -> u8 {
+	if t.klen > 0 {
+		return val_kind(m.karena[t.koff])
+	}
+	return val_kind(u8(t.key >> 56))
 }
 
 @(private)
@@ -544,7 +633,7 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 	}
 	if d.title {
 		md.flags |= DF_TITLE
-		_post32(m, key32(NS_TITLE, 1, 0, 0), id) or_return
+		_post_fix(m, key64(NS_TITLE, 1), id) or_return
 	}
 	if len(d.fields) > 0 {
 		md.flags |= DF_FIELDS
@@ -562,11 +651,13 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 			}
 			v := f.value
 			if len(v) >= 3 && substring_field(ix, nm) {
+				fv := make([]u8, len(v), context.temp_allocator)
+				fold_into(fv, transmute([]u8)v)
 				base, _ := field_key(NS_FTRI, nm, nil, &key)
 				for i in 0 ..< len(v) - 2 {
-					key[base] = fold(v[i])
-					key[base + 1] = fold(v[i + 1])
-					key[base + 2] = fold(v[i + 2])
+					key[base] = fv[i]
+					key[base + 1] = fv[i + 1]
+					key[base + 2] = fv[i + 2]
 					_post_long(m, key[:base + 3], id) or_return
 				}
 			}
@@ -599,7 +690,7 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 	pa := d.participant
 	copy(idkey[1:], pa[:])
 	_post_long(m, idkey[:], id) or_return
-	_post32(m, key32(NS_KIND, d.kind, 0, 0), id) or_return
+	_post_fix(m, key64(NS_KIND, u64(d.kind)), id) or_return
 	_index_text(m, text, id) or_return
 	if _, e := append(&m.docs, md); e != nil {
 		return .No_Memory
@@ -611,27 +702,33 @@ _mem_chunk :: proc(ix: ^Index, d: ^Doc, offset: u64, text: []u8, chunked: bool) 
 @(private)
 _index_text :: proc(m: ^Mem, text: []u8, id: u32) -> Error #no_bounds_check {
 	n := len(text)
+	if grow(&m.fold, n) != nil {
+		return .No_Memory
+	}
+	f := m.fold[:n]
+	fold_into(f, text)
 	if n >= 3 {
-		k := u32(fold(text[0])) << 8 | u32(fold(text[1]))
+		k := u64(f[0]) << 8 | u64(f[1])
 		for i in 2 ..< n {
-			k = (k << 8 | u32(fold(text[i]))) & 0xffffff
-			_post32(m, u32(NS_TRI) << 24 | k, id) or_return
+			k = (k << 8 | u64(f[i])) & 0xffffff
+			_post_fix(m, u64(NS_TRI) << 56 | k, id) or_return
 		}
 	}
-	i := 0
-	for i < n {
-		for i < n && !is_word(text[i]) {
-			i += 1
+	w := Word_Iter{t = f}
+	key: [MAX_KEY]u8
+	for {
+		s, e, ok := word_next(&w)
+		if !ok {
+			break
 		}
-		s := i
-		for i < n && is_word(text[i]) {
-			i += 1
+		if e - s > MAX_WORD {
+			continue
 		}
-		if i - s > 0 && i - s <= 2 {
-			_post32(m, word_key(text[s:i]), id) or_return
-		}
+		kn := word_key(f[s:e], &key)
+		ti := _term_long(m, key[:kn]) or_return
+		_post_word(m, ti, id) or_return
 	}
-	return .None
+	return _end_doc(m, id)
 }
 
 mem_kill :: proc(m: ^Mem, id: u32) {
@@ -649,37 +746,59 @@ mem_kill :: proc(m: ^Mem, id: u32) {
 	append(&m.dead, id)
 }
 
-@(private)
-_decode_chain :: proc(m: ^Mem, t: ^Mem_Term, out: ^[dynamic]u32) -> Error {
-	clear(out)
+mem_decode_chain :: proc(m: ^Mem, t: ^Mem_Term, words: bool, ids: ^[dynamic]u32, tfs: ^[dynamic]u16, keep_dead: bool) -> Error {
+	clear(ids)
+	clear(tfs)
+	if t.count == 0 {
+		return .None
+	}
 	c := t.head
 	acc := u32(0)
 	v: u64
 	shift: u64
+	want_tf := false
+	cur := u32(0)
 	left := t.count
-	for left > 0 {
-		base := int(c) * MCHUNK
+	for left > 0 && c != 0 {
+		base := int(c - 1) * MCHUNK
 		limit := MCHUNK_DATA if c != t.tail else int(t.used)
 		for i in 0 ..< limit {
 			b := m.chunks[base + 4 + i]
 			v |= u64(b & 0x7f) << shift
-			if b < 0x80 {
-				acc += u32(v)
-				id := acc - 1
-				if u64(id) < m.base || u64(id) - m.base >= u64(len(m.docs)) {
-					return .Corrupt
+			if b >= 0x80 {
+				shift += 7
+				continue
+			}
+			x := v
+			v = 0
+			shift = 0
+			if want_tf {
+				want_tf = false
+				if keep_dead || m.docs[u64(cur) - m.base].flags & DF_DELETED == 0 {
+					append(ids, cur)
+					append(tfs, u16(min(x, u64(max(u16)))))
 				}
-				if m.docs[u64(id) - m.base].flags & DF_DELETED == 0 {
-					append(out, id)
-				}
-				v = 0
-				shift = 0
 				left -= 1
 				if left == 0 {
 					break
 				}
-			} else {
-				shift += 7
+				continue
+			}
+			acc += u32(x)
+			cur = acc - 1
+			if u64(cur) < m.base || u64(cur) - m.base >= u64(len(m.docs)) {
+				return .Corrupt
+			}
+			if words {
+				want_tf = true
+				continue
+			}
+			if keep_dead || m.docs[u64(cur) - m.base].flags & DF_DELETED == 0 {
+				append(ids, cur)
+			}
+			left -= 1
+			if left == 0 {
+				break
 			}
 		}
 		if left > 0 {
@@ -689,12 +808,22 @@ _decode_chain :: proc(m: ^Mem, t: ^Mem_Term, out: ^[dynamic]u32) -> Error {
 	return .None
 }
 
+impact :: proc "contextless" (tf: u16, dl: u32, avgdl: f64) -> u8 {
+	t := f64(tf)
+	norm := t * (K1 + 1) / (t + K1 * (1 - B + B * f64(dl) / avgdl))
+	q := int(math.round(15 * norm / (K1 + 1)))
+	return u8(clamp(q, 1, 15))
+}
+
 mem_flush :: proc(ix: ^Index) -> Error {
 	m := &ix.mem
 	if mem_empty(m) && len(m.vids) == 0 {
 		return .None
 	}
 	store := ix.opts.store_text
+	if store {
+		zstd_train(ix) or_return
+	}
 	lo := m.base
 	hi := m.base + u64(len(m.docs))
 	base_pmax := u64(0)
@@ -715,10 +844,7 @@ mem_flush :: proc(ix: ^Index) -> Error {
 		fpos[k] = sw_off(&sw)
 		clear(&fbuf)
 		fw := prim.writer(&fbuf)
-		frame_write(&fw, m.raw[m.frames[k]:_frame_end(m, k)], m.lz, &m.scratch)
-		if fw.err != .None {
-			return .No_Memory
-		}
+		frame_write(ix, &fw, m.raw[m.frames[k]:_frame_end(m, k)], &m.scratch) or_return
 		sw_write(&sw, fbuf[:])
 	}
 	sw.f.text_len = sw_off(&sw) - sw.f.text_off
@@ -780,7 +906,7 @@ mem_flush :: proc(ix: ^Index) -> Error {
 	for i in 0 ..< len(m.terms) {
 		order[i] = u32(i)
 		kb: [MAX_KEY]u8
-		k := _mem_term_key(m, &m.terms[i], &kb)
+		k := mem_term_key(m, &m.terms[i], &kb)
 		p: u64
 		for j in 0 ..< 8 {
 			p <<= 8
@@ -801,34 +927,49 @@ mem_flush :: proc(ix: ^Index) -> Error {
 				return c.prefix[a] < c.prefix[b]
 			}
 			ka, kb: [MAX_KEY]u8
-			return key_less(_mem_term_key(c.m, &c.m.terms[a], &ka), _mem_term_key(c.m, &c.m.terms[b], &kb))
+			return key_less(mem_term_key(c.m, &c.m.terms[a], &ka), mem_term_key(c.m, &c.m.terms[b], &kb))
 		}, &sctx)
 	sw_post_begin(&sw)
 	ids := make([dynamic]u32, context.temp_allocator)
+	tfs := make([dynamic]u16, context.temp_allocator)
 	scratch := make([dynamic]u8, context.temp_allocator)
+	avgdl := max(f64(ix.man.total_len + m.total_len) / max(f64(ix.man.next_doc + u64(len(m.docs))), 1), 1)
 	lw: List_Writer
 	lw_init(&lw, &sw, context.temp_allocator)
+	vocab := make(map[u32][dynamic]u32, context.temp_allocator)
+	word_ord := u32(0)
 	for ti in order {
 		t := &m.terms[ti]
-		_decode_chain(m, t, &ids) or_return
+		vk := mem_term_vk(m, t)
+		mem_decode_chain(m, t, vk != VAL_NONE, &ids, &tfs, false) or_return
 		if len(ids) == 0 {
 			continue
 		}
 		kb: [MAX_KEY]u8
-		key := _mem_term_key(m, t, &kb)
-		lw_begin(&lw)
+		key := mem_term_key(m, t, &kb)
+		lw_begin(&lw, vk)
 		for k := len(ids) - 1; k >= 0; k -= 1 {
-			lw_push(&lw, ids[k])
+			v := u8(0)
+			if vk == VAL_IMPACT {
+				v = impact(tfs[k], m.docs[u64(ids[k]) - m.base].len, avgdl)
+			}
+			lw_push(&lw, ids[k], v)
 		}
-		count, inl, plen, blen := lw_end(&lw)
+		lo := lw_end(&lw)
 		if lw.err != .None {
 			return lw.err
 		}
-		sw_term(&sw, key, count, inl[:], plen, blen)
+		before := sw.f.n_terms
+		sw_term(&sw, key, lo)
 		if sw.out.err != .None {
 			return sw.out.err
 		}
+		if vk == VAL_IMPACT && sw.f.n_terms > before {
+			token_trigrams(key[1:], &vocab, word_ord, context.temp_allocator)
+			word_ord += 1
+		}
 	}
+	vocab_lists(vocab, &sw, &lw) or_return
 	sw_post_end(&sw)
 	src := make([dynamic]prim.Id, 0, len(m.sources), context.temp_allocator)
 	for k in m.sources {

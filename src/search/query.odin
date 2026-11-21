@@ -40,6 +40,11 @@ Atom :: struct {
 	refs:    [dynamic]Wrote_Ref,
 	idf:     f64,
 	scored:  bool,
+	keys:    [dynamic]u64,
+	tokens:  [dynamic][]u8,
+	tok_idf: [dynamic]f64,
+	whole:   bool,
+	index:   int,
 }
 
 Clause :: struct {
@@ -185,6 +190,7 @@ _build_atom :: proc(ix: ^Index, a: ^Atom, val: []u8, req: ^Request, now_ms: i64,
 		}
 		a.text = make([]u8, len(val), allocator)
 		fold_into(a.text, val)
+		_text_keys(a, allocator)
 	case .Named:
 		v := val
 		if !a.substr && v[len(v) - 1] == '*' {
@@ -196,6 +202,9 @@ _build_atom :: proc(ix: ^Index, a: ^Atom, val: []u8, req: ^Request, now_ms: i64,
 		}
 		a.text = make([]u8, len(v), allocator)
 		fold_into(a.text, v)
+		a.keys = make([dynamic]u64, allocator)
+		a.tokens = make([dynamic][]u8, allocator)
+		a.tok_idf = make([dynamic]f64, allocator)
 	case .Kind:
 		found := false
 		for k, i in ix.opts.kind_names {
@@ -464,4 +473,45 @@ parse_time :: proc "contextless" (v: string, now_ms: i64) -> (ms: i64, ok: bool)
 		return 0, false
 	}
 	return ms + i64(hh) * 3600000 + i64(mm) * 60000 + i64(ss) * 1000, true
+}
+
+@(private)
+_text_keys :: proc(a: ^Atom, allocator: runtime.Allocator) {
+	t := a.text
+	a.keys = make([dynamic]u64, allocator)
+	a.tokens = make([dynamic][]u8, allocator)
+	a.tok_idf = make([dynamic]f64, allocator)
+	outer: for i := 0; i + 3 <= len(t); i += 1 {
+		k := tri_key(t[i], t[i + 1], t[i + 2])
+		for x in a.keys {
+			if x == k {
+				continue outer
+			}
+		}
+		append(&a.keys, k)
+	}
+	w := Word_Iter{t = t}
+	n := 0
+	for {
+		s, e, ok := word_next(&w)
+		if !ok {
+			break
+		}
+		n += 1
+		if e - s <= MAX_WORD {
+			append(&a.tokens, t[s:e])
+			append(&a.tok_idf, 0)
+		}
+	}
+	all_word := len(t) > 0
+	for c in t {
+		if !is_word(c) {
+			all_word = false
+			break
+		}
+	}
+	a.whole = all_word && n == 1 && len(t) <= MAX_WORD
+	if len(t) < 3 && all_word {
+		a.word = true
+	}
 }

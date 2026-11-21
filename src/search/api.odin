@@ -166,9 +166,7 @@ flush :: proc(ix: ^Index) -> Error {
 	}
 	before := len(ix.segs)
 	mem_flush(ix) or_return
-	if ix.merge == nil {
-		vec_maybe_train(ix) or_return
-	}
+	vec_maybe_train(ix) or_return
 	if len(ix.segs) > before {
 		size := ix.segs[len(ix.segs) - 1].size
 		_, err := merge_step(ix, size * i64(ix.opts.pace))
