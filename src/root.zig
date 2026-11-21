@@ -10,6 +10,10 @@ pub const core = struct {
 };
 
 pub const store = struct {
+    pub const mmap = @import("store/mmap.zig");
+    pub const lru = @import("store/lru.zig");
+    pub const manifest = @import("store/manifest.zig");
+    pub const segments = @import("store/segments.zig");
     pub const codec = @import("store/codec.zig");
     pub const crypto = @import("store/crypto.zig");
     pub const log = @import("store/log.zig");

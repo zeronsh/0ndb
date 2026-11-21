@@ -4,6 +4,7 @@ const Io = std.Io;
 const posix = std.posix;
 const codec = @import("codec.zig");
 const crypto = @import("crypto.zig");
+const mmap = @import("mmap.zig");
 
 pub const MAGIC: [4]u8 = .{ '0', 'N', 'D', 'B' };
 pub const HEADER_SIZE: usize = 32;
@@ -64,11 +65,25 @@ pub const AppendResult = struct {
     payload_offset: u64,
 };
 
-fn alignUp(n: usize) usize {
+pub const BulkFrame = struct {
+    seq: ?u64 = null,
+    kind: u8,
+    flags: u8 = 0,
+    aux: u16 = 0,
+    payload: []const u8,
+};
+
+pub const OpenOptions = struct {
+    durable_sync: bool = true,
+    verify_blake3_on_recover: bool = true,
+    start_offset: u64 = 0,
+};
+
+pub fn alignUp(n: usize) usize {
     return (n + (ALIGN - 1)) & ~(ALIGN - 1);
 }
 
-fn frameCrc(header_bytes: *const [HEADER_SIZE]u8, payload: []const u8) u32 {
+pub fn frameCrc(header_bytes: *const [HEADER_SIZE]u8, payload: []const u8) u32 {
     var c = std.hash.crc.@"CRC-32/ISCSI".init();
     c.update(header_bytes[0..20]);
     c.update(header_bytes[24..32]);
@@ -89,6 +104,30 @@ pub const AppendLog = struct {
     durable_sync: bool,
 
     pub fn open(allocator: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, durable_sync: bool) !AppendLog {
+        return openWithOptions(allocator, io, dir, sub_path, .{
+            .durable_sync = durable_sync,
+            .verify_blake3_on_recover = true,
+            .start_offset = 0,
+        });
+    }
+
+    pub fn openWithoutFullHash(allocator: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, durable_sync: bool) !AppendLog {
+        return openWithOptions(allocator, io, dir, sub_path, .{
+            .durable_sync = durable_sync,
+            .verify_blake3_on_recover = false,
+            .start_offset = 0,
+        });
+    }
+
+    pub fn openTailRecover(allocator: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, durable_sync: bool, start_offset: u64) !AppendLog {
+        return openWithOptions(allocator, io, dir, sub_path, .{
+            .durable_sync = durable_sync,
+            .verify_blake3_on_recover = false,
+            .start_offset = start_offset,
+        });
+    }
+
+    pub fn openWithOptions(allocator: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, opts: OpenOptions) !AppendLog {
         const file = try dir.createFile(io, sub_path, .{
             .read = true,
             .truncate = false,
@@ -106,12 +145,12 @@ pub const AppendLog = struct {
             .mapped_len = 0,
             .retired_maps = .empty,
             .index = .empty,
-            .durable_sync = durable_sync,
+            .durable_sync = opts.durable_sync,
         };
         file_owned = false;
         errdefer self.deinit();
 
-        try self.recover();
+        try self.tailRecover(opts.start_offset, opts.verify_blake3_on_recover);
         return self;
     }
 
@@ -178,7 +217,8 @@ pub const AppendLog = struct {
         self.mapped_len = map_len;
     }
 
-    fn recover(self: *AppendLog) !void {
+    pub fn tailRecover(self: *AppendLog, start_offset: u64, verify_blake3: bool) !void {
+        self.index.clearRetainingCapacity();
         const st = try self.file.stat(self.io);
         const file_size = st.size;
         if (file_size == 0) {
@@ -188,10 +228,13 @@ pub const AppendLog = struct {
         }
 
         const size_usize: usize = @intCast(file_size);
+        const start_usize: usize = @intCast(start_offset);
+        if (start_usize > size_usize) return error.OutOfBounds;
+
         try self.ensureMappedFor(size_usize);
         const mapping = self.mapped orelse return;
 
-        var offset: usize = 0;
+        var offset: usize = start_usize;
         var last_seq: u64 = 0;
         while (offset + HEADER_SIZE <= size_usize) {
             const hdr_ptr: *const [HEADER_SIZE]u8 = @ptrCast(mapping[offset .. offset + HEADER_SIZE].ptr);
@@ -201,9 +244,11 @@ pub const AppendLog = struct {
             if (payload_end > size_usize) break;
             const payload = mapping[payload_start..payload_end];
             if (frameCrc(hdr_ptr, payload) != hdr.crc) break;
-            const h = crypto.hashBytes(payload);
-            const actual_prefix = std.mem.readInt(u64, h[0..8], .little);
-            if (actual_prefix != hdr.hash_prefix) break;
+            if (verify_blake3) {
+                const h = crypto.hashBytes(payload);
+                const actual_prefix = std.mem.readInt(u64, h[0..8], .little);
+                if (actual_prefix != hdr.hash_prefix) break;
+            }
             const aligned_end = alignUp(payload_end);
             if (aligned_end > size_usize) break;
             try self.index.append(self.allocator, .{
@@ -309,18 +354,87 @@ pub const AppendLog = struct {
         };
     }
 
-    fn syncFileData(io: Io, file: Io.File) !void {
-        if (@import("builtin").os.tag == .linux) {
-            while (true) {
-                const rc = std.os.linux.fdatasync(file.handle);
-                switch (std.os.linux.errno(rc)) {
-                    .SUCCESS => return,
-                    .INTR => continue,
-                    else => return file.sync(io),
-                }
-            }
+    pub fn appendFramesBulk(self: *AppendLog, frames: []const BulkFrame) ![]AppendResult {
+        const results = try self.allocator.alloc(AppendResult, frames.len);
+        errdefer self.allocator.free(results);
+        if (frames.len == 0) return results;
+
+        var total_bytes: usize = 0;
+        for (frames) |f| {
+            total_bytes += alignUp(HEADER_SIZE + f.payload.len);
         }
-        try file.sync(io);
+
+        try self.index.ensureUnusedCapacity(self.allocator, frames.len);
+        const buf = try self.allocator.alloc(u8, total_bytes);
+        defer self.allocator.free(buf);
+
+        const base_offset = self.write_offset;
+        var cur_next_seq = self.next_seq;
+        var buf_pos: usize = 0;
+
+        for (frames, 0..) |f, i| {
+            const seq = f.seq orelse cur_next_seq;
+            if (seq >= cur_next_seq) cur_next_seq = seq + 1;
+
+            const h = crypto.hashBytes(f.payload);
+            const prefix = std.mem.readInt(u64, h[0..8], .little);
+            var hdr = FrameHeader{
+                .kind = f.kind,
+                .flags = f.flags,
+                .aux = f.aux,
+                .seq = seq,
+                .payload_len = @intCast(f.payload.len),
+                .crc = 0,
+                .hash_prefix = prefix,
+            };
+            var hdr_bytes = hdr.encode();
+            hdr.crc = frameCrc(&hdr_bytes, f.payload);
+            hdr_bytes = hdr.encode();
+
+            const raw_total = HEADER_SIZE + f.payload.len;
+            const aligned_total = alignUp(raw_total);
+            const pad_len = aligned_total - raw_total;
+
+            @memcpy(buf[buf_pos .. buf_pos + HEADER_SIZE], &hdr_bytes);
+            if (f.payload.len > 0) {
+                @memcpy(buf[buf_pos + HEADER_SIZE .. buf_pos + raw_total], f.payload);
+            }
+            if (pad_len > 0) {
+                @memset(buf[buf_pos + raw_total .. buf_pos + aligned_total], 0);
+            }
+
+            results[i] = .{
+                .seq = seq,
+                .payload_offset = base_offset + buf_pos + HEADER_SIZE,
+            };
+            buf_pos += aligned_total;
+        }
+
+        try self.file.writePositionalAll(self.io, buf, base_offset);
+        if (self.durable_sync) {
+            try self.syncData();
+        }
+
+        var idx_off = base_offset;
+        for (frames, 0..) |f, i| {
+            self.index.appendAssumeCapacity(.{
+                .seq = results[i].seq,
+                .offset = idx_off,
+                .payload_len = @intCast(f.payload.len),
+                .kind = f.kind,
+                .flags = f.flags,
+                .aux = f.aux,
+            });
+            idx_off += alignUp(HEADER_SIZE + f.payload.len);
+        }
+
+        self.write_offset = base_offset + total_bytes;
+        self.next_seq = cur_next_seq;
+        return results;
+    }
+
+    fn syncFileData(io: Io, file: Io.File) !void {
+        try mmap.fdatasyncFile(io, file);
     }
 
     fn syncData(self: *AppendLog) !void {
