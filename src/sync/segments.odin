@@ -20,7 +20,7 @@ Ckpt_Fetch :: struct {
 	suffix:  [16]u8,
 	dest:    string,
 	state:   Fetch_State,
-	wait:    int,
+	list_seq: u64,
 	cands:   [dynamic]Stream_Id,
 	done:    [dynamic]bool,
 	found:   bool,
@@ -34,6 +34,8 @@ Ckpt_Fetch :: struct {
 }
 
 replicator_follow_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, full: bool) -> Error {
+	_enter(r)
+	defer _leave(r)
 	suffix := stream_suffix(scope, name, epoch)
 	if g, ok := r.groups[suffix]; ok {
 		g.full = g.full || full
@@ -67,6 +69,8 @@ replicator_follow_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, 
 }
 
 replicator_unfollow_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64) {
+	_enter(r)
+	defer _leave(r)
 	suffix := stream_suffix(scope, name, epoch)
 	g, ok := r.groups[suffix]
 	if !ok {
@@ -91,6 +95,8 @@ replicator_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: 
 }
 
 replicator_publish_checkpoint :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, history: string, hlc: u64, oid: []u8, meta: []u8, data: []u8 = nil, path: string = "") -> Error {
+	_enter(r)
+	defer _leave(r)
 	if len(oid) == 0 || len(oid) > 32 || len(meta) > journal.MAX_BODY - 64 {
 		return .Invalid
 	}
@@ -151,6 +157,8 @@ replicator_publish_checkpoint :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_
 }
 
 replicator_fetch_checkpoint :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, history: string, dest: string) -> Error {
+	_enter(r)
+	defer _leave(r)
 	f, aerr := new(Ckpt_Fetch, r.allocator)
 	if aerr != nil {
 		return .No_Memory
@@ -219,10 +227,17 @@ _fetch_remove :: proc(r: ^Replicator, f: ^Ckpt_Fetch) {
 }
 
 @(private)
-_list_all :: proc(r: ^Replicator) {
-	if client_list(&r.client, 0) == .None {
-		r.lists_out += 1
+_list_all :: proc(r: ^Replicator) -> bool {
+	return _list_send(r, 0)
+}
+
+@(private)
+_list_send :: proc(r: ^Replicator, since: i64) -> bool {
+	if client_list(&r.client, since) != .None {
+		return false
 	}
+	r.list_sent += 1
+	return true
 }
 
 @(private)
@@ -230,8 +245,7 @@ _fetch_start :: proc(r: ^Replicator, f: ^Ckpt_Fetch) {
 	clear(&f.cands)
 	clear(&f.done)
 	f.state = .Listing
-	_list_all(r)
-	f.wait = r.lists_out
+	f.list_seq = r.list_sent if _list_all(r) else 0
 }
 
 @(private)
@@ -289,16 +303,20 @@ _segments_seen :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 }
 
 @(private)
-_lists_finished :: proc(r: ^Replicator) {
-	r.lists_out = max(r.lists_out - 1, 0)
+_lists_finished :: proc(r: ^Replicator, failed: Error) {
+	if r.list_done < r.list_sent {
+		r.list_done += 1
+	}
 	for i := 0; i < len(r.fetches); {
 		f := r.fetches[i]
 		i += 1
-		if f.state != .Listing {
+		if f.state != .Listing || f.list_seq == 0 || f.list_seq > r.list_done {
 			continue
 		}
-		f.wait -= 1
-		if f.wait > 0 {
+		if failed != .None && f.list_seq == r.list_done {
+			_emit(r, Repl_Event{kind = .Checkpoint_Missing, err = failed, name = f.name})
+			i -= 1
+			_fetch_remove(r, f)
 			continue
 		}
 		if len(f.cands) == 0 {
@@ -428,7 +446,7 @@ _fetch_object_done :: proc(r: ^Replicator, key: Object_Key, kind: Repl_Event_Kin
 
 @(private)
 _fetches_reset :: proc(r: ^Replicator) {
-	r.lists_out = 0
+	r.list_done = r.list_sent
 	for f in r.fetches {
 		if f.state == .Tails {
 			_fetch_release(r, f)

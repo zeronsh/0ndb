@@ -21,14 +21,16 @@ Keyring :: struct {
 
 File_Keyring :: struct {
 	device: Device,
+	random: prim.Random,
 }
 
-file_keyring_open :: proc(k: ^File_Keyring, vfs: prim.Vfs, dir: string) -> Error {
-	d, err := device_load_or_create(vfs, dir)
+file_keyring_open :: proc(k: ^File_Keyring, vfs: prim.Vfs, dir: string, random := prim.Random{}) -> Error {
+	d, err := device_load_or_create(vfs, dir, random)
 	if err != .None {
 		return err
 	}
 	k.device = d
+	k.random = random
 	return .None
 }
 
@@ -69,9 +71,9 @@ card_verify :: proc(card: []u8) -> (id: Identity, err: Error) {
 	return id, .None
 }
 
-seal_key_to :: proc(recipient: ^Identity, key: ^Content_Key, out: ^[WRAP_LEN]u8) -> Error {
+seal_key_to :: proc(recipient: ^Identity, key: ^Content_Key, out: ^[WRAP_LEN]u8, random := prim.Random{}) -> Error {
 	eph: ecdh.Private_Key
-	if !ecdh.private_key_generate(&eph, .X25519) {
+	if !x25519_generate(&eph, random) {
 		return .Invalid
 	}
 	defer ecdh.private_key_clear(&eph)
@@ -176,7 +178,8 @@ _fk_sign :: proc(data: rawptr, msg: []u8, sig: ^[64]u8) -> Error {
 
 @(private)
 _fk_wrap :: proc(data: rawptr, recipient: ^Identity, key: ^Content_Key, out: ^[WRAP_LEN]u8) -> Error {
-	return seal_key_to(recipient, key, out)
+	k := cast(^File_Keyring)data
+	return seal_key_to(recipient, key, out, k.random)
 }
 
 @(private)

@@ -13,6 +13,8 @@ File_Store :: struct {
 	vfs:       prim.Vfs,
 	lay:       Layout,
 	resolver:  Extent_Resolver,
+	random:    prim.Random,
+	clock:     prim.Clock,
 	root:      string,
 	loop:      ^prim.Loop,
 	worker:    Worker,
@@ -39,7 +41,9 @@ _Deferred :: struct {
 
 @(private)
 _Fstream :: struct {
-	busy:   bool,
+	busy:    bool,
+	pins:    int,
+	closing: bool,
 	queue:  [dynamic]_Deferred,
 	ns:     ^_Fns,
 	id:     Stream_Id,
@@ -83,9 +87,11 @@ _Flist :: struct {
 	since: i64,
 }
 
-file_store_init :: proc(fs: ^File_Store, l: ^prim.Loop, vfs: prim.Vfs, root: string, sync_threads := 4, lay := LAYOUT_SECTOR, group := Group_Commit{}, allocator := context.allocator) -> Error {
+file_store_init :: proc(fs: ^File_Store, l: ^prim.Loop, vfs: prim.Vfs, root: string, sync_threads := 4, lay := LAYOUT_SECTOR, group := Group_Commit{}, random := prim.Random{}, clock := prim.Clock{}, allocator := context.allocator) -> Error {
 	fs^ = {
 		vfs       = vfs,
+		random    = random,
+		clock     = clock,
 		lay       = lay,
 		loop      = l,
 		allocator = allocator,
@@ -220,6 +226,15 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 _fs_stream_close :: proc(data: rawptr, s: rawptr) {
 	fs := cast(^File_Store)data
 	st := cast(^_Fstream)s
+	st.closing = true
+	_fs_stream_reap(fs, st)
+}
+
+@(private)
+_fs_stream_reap :: proc(fs: ^File_Store, st: ^_Fstream) {
+	if !st.closing || st.pins > 0 || st.busy || len(st.queue) > 0 {
+		return
+	}
 	delete(st.queue)
 	prim.close_file(fs.vfs, st.fd)
 	free(st, fs.allocator)
@@ -463,7 +478,7 @@ _fs_list_begin :: proc(data: rawptr, h: rawptr, since: i64) -> (it: rawptr, curs
 	l.dir = ns.dir
 	sdir, _ := prim.path_join(context.temp_allocator, ns.dir, "s")
 	l.open = prim.dir_open(fs.vfs, &l.it, sdir, fs.allocator) == .None
-	return l, prim.now_ns() - 2_000_000_000, .None
+	return l, prim.clock_wall_ns(fs.clock) - 2_000_000_000, .None
 }
 
 @(private)
@@ -509,7 +524,7 @@ _fs_put_begin :: proc(data: rawptr, h: rawptr, key: Object_Key, total: i64) -> (
 		return nil, true, .None
 	}
 	tbuf: prim.Path_Buf = ---
-	tmp := tmp_path(&tbuf, ns.dir)
+	tmp := tmp_path(&tbuf, ns.dir, fs.random)
 	fd, oerr := prim.open_file(fs.vfs, tmp, {.Write, .Create, .Exclusive}, 0o600)
 	if oerr != .None {
 		return nil, false, _from_prim(oerr)
@@ -727,29 +742,32 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	if len(job.final) > 0 {
 		delete(job.final, fs.allocator)
 	}
-	target := job.target if job.kind == .Stream_Sync || job.kind == .Redact else nil
+	st := cast(^_Fstream)job.target if job.kind == .Stream_Sync || job.kind == .Redact else nil
 	free(job, fs.allocator)
-	done(ctx, result, value)
-	if target != nil {
-		_fs_next(fs, cast(^_Fstream)target)
+	if st == nil {
+		done(ctx, result, value)
+		return
 	}
+	st.pins += 1
+	done(ctx, result, value)
+	_fs_next(fs, st)
+	st.pins -= 1
+	_fs_stream_reap(fs, st)
 }
 
 @(private)
 _fs_next :: proc(fs: ^File_Store, st: ^_Fstream) {
-	if st.busy || len(st.queue) == 0 {
-		return
+	st.pins += 1
+	for !st.busy && len(st.queue) > 0 {
+		d := st.queue[0]
+		ordered_remove(&st.queue, 0)
+		if d.append != nil {
+			_fs_append_commit(fs, d.append, d.done, d.ctx)
+		} else {
+			_fs_redact(fs, st, d.from, d.to, d.done, d.ctx)
+		}
 	}
-	d := st.queue[0]
-	ordered_remove(&st.queue, 0)
-	if d.append != nil {
-		_fs_append_commit(fs, d.append, d.done, d.ctx)
-	} else {
-		_fs_redact(fs, st, d.from, d.to, d.done, d.ctx)
-	}
-	if !st.busy {
-		_fs_next(fs, st)
-	}
+	st.pins -= 1
 }
 
 @(private)

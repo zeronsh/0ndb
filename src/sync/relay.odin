@@ -27,6 +27,8 @@ Relay_Config :: struct {
 	source_burst:    int,
 	principal_conns: int,
 	kernel_tls:      bool,
+	random:          prim.Random,
+	clock:           prim.Clock,
 }
 
 Relay_Stats :: struct {
@@ -347,7 +349,7 @@ relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := con
 			return _from_prim(lerr)
 		}
 		r.lock = lfd
-		r.key = relay_key_load_or_create(r.vfs, r.root) or_return
+		r.key = relay_key_load_or_create(r.vfs, r.root, r.cfg.random) or_return
 		r.has_key = true
 	}
 	r.cfg.dir = r.root
@@ -397,7 +399,7 @@ relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := con
 		if r.own_pack != nil {
 			group = Group_Commit{data = r.own_pack, begin = _pack_begin, end = _pack_end}
 		}
-		if ferr := file_store_init(fs, l, store_vfs, r.root, threads, lay, group, allocator); ferr != .None {
+		if ferr := file_store_init(fs, l, store_vfs, r.root, threads, lay, group, cfg.random, cfg.clock, allocator); ferr != .None {
 			if r.own_pack != nil {
 				pack.close(r.own_pack)
 				free(r.own_pack, allocator)
@@ -936,7 +938,7 @@ _conn_handshake :: proc(c: ^Conn) {
 	}
 	h: Handshake
 	out: [2 + MSG2_LEN + 16]u8
-	_, keys, err := handshake_respond(&h, &r.key, c.hs[2:need], out[2:])
+	_, keys, err := handshake_respond(&h, &r.key, c.hs[2:need], out[2:], r.cfg.random)
 	if err != .None {
 		_conn_close(c)
 		return
@@ -1152,7 +1154,7 @@ _on_hello :: proc(c: ^Conn, payload: []u8) {
 	b: [FRAME_HEADER + 25]u8
 	frame_header(b[:], .Welcome, 25)
 	b[FRAME_HEADER] = PROTOCOL_VERSION
-	prim.put_u64le(b[FRAME_HEADER + 1:], u64(prim.now_ns()))
+	prim.put_u64le(b[FRAME_HEADER + 1:], u64(prim.clock_wall_ns(c.relay.cfg.clock)))
 	prim.put_u64le(b[FRAME_HEADER + 9:], u64(max(sp.usage, 0)))
 	prim.put_u64le(b[FRAME_HEADER + 17:], u64(sp.quota))
 	_push_small(c, b[:])
@@ -2262,7 +2264,7 @@ SOURCE_TABLE_MAX :: 65536
 
 @(private)
 _source_admit :: proc(r: ^Relay, src: [16]u8) -> bool {
-	now := prim.mono_ns()
+	now := prim.clock_mono_ns(r.cfg.clock)
 	burst := i64(r.cfg.source_burst) * 1_000_000
 	s, ok := r.sources[src]
 	if !ok {

@@ -7,6 +7,7 @@ import "core:crypto/blake2b"
 import "core:crypto/ecdh"
 import "core:crypto/ed25519"
 import "core:crypto/noise"
+import "../prim"
 
 NOISE_PROTOCOL :: "Noise_IK_25519_ChaChaPoly_BLAKE2b"
 NOISE_PROLOGUE :: "0ndb relay 1"
@@ -45,7 +46,7 @@ Tls_Dir :: struct {
 	on:  bool,
 }
 
-handshake_initiate :: proc(h: ^Handshake, static: ^ecdh.Private_Key, relay_public: Public_Key, out: []u8) -> (n: int, err: Error) {
+handshake_initiate :: proc(h: ^Handshake, static: ^ecdh.Private_Key, relay_public: Public_Key, out: []u8, random := prim.Random{}) -> (n: int, err: Error) {
 	if len(out) < MSG1_LEN {
 		return 0, .Invalid
 	}
@@ -55,7 +56,12 @@ handshake_initiate :: proc(h: ^Handshake, static: ^ecdh.Private_Key, relay_publi
 		return 0, .Invalid
 	}
 	defer ecdh.public_key_clear(&rs)
-	if noise.handshake_init(&h.hs, true, transmute([]u8)string(NOISE_PROLOGUE), static, &rs, NOISE_PROTOCOL) != .Ok {
+	e: ecdh.Private_Key
+	if !x25519_generate(&e, random) {
+		return 0, .Invalid
+	}
+	defer ecdh.private_key_clear(&e)
+	if noise.handshake_init(&h.hs, true, transmute([]u8)string(NOISE_PROLOGUE), static, &rs, NOISE_PROTOCOL, nil, &e) != .Ok {
 		noise.handshake_reset(&h.hs)
 		return 0, .Invalid
 	}
@@ -80,12 +86,17 @@ handshake_finish :: proc(h: ^Handshake, msg2: []u8) -> (keys: Session_Keys, err:
 	return _session_keys(&h.hs, true)
 }
 
-handshake_respond :: proc(h: ^Handshake, relay: ^Relay_Key, msg1: []u8, out: []u8) -> (n: int, keys: Session_Keys, err: Error) {
+handshake_respond :: proc(h: ^Handshake, relay: ^Relay_Key, msg1: []u8, out: []u8, random := prim.Random{}) -> (n: int, keys: Session_Keys, err: Error) {
 	defer noise.handshake_reset(&h.hs)
 	if len(msg1) != MSG1_LEN || len(out) < MSG2_LEN + 16 {
 		return 0, {}, .Protocol
 	}
-	if noise.handshake_init(&h.hs, false, transmute([]u8)string(NOISE_PROLOGUE), &relay.private, nil, NOISE_PROTOCOL) != .Ok {
+	e: ecdh.Private_Key
+	if !x25519_generate(&e, random) {
+		return 0, {}, .Invalid
+	}
+	defer ecdh.private_key_clear(&e)
+	if noise.handshake_init(&h.hs, false, transmute([]u8)string(NOISE_PROLOGUE), &relay.private, nil, NOISE_PROTOCOL, nil, &e) != .Ok {
 		return 0, {}, .Invalid
 	}
 	msg, _, st := noise.handshake_responder_step(&h.hs, msg1, nil, out)
@@ -246,4 +257,11 @@ _traffic :: proc(ctx: ^aead.Context) -> (t: Traffic) {
 	copy(t.iv[:], out[36:44])
 	crypto.zero_explicit(&out, size_of(out))
 	return
+}
+
+x25519_generate :: proc(k: ^ecdh.Private_Key, random: prim.Random) -> bool {
+	raw: [32]u8
+	defer crypto.zero_explicit(&raw, size_of(raw))
+	prim.random_fill(random, raw[:])
+	return ecdh.private_key_set_bytes(k, .X25519, raw[:])
 }

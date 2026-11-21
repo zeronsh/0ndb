@@ -1,7 +1,6 @@
 package osync
 
 import "base:runtime"
-import "core:crypto"
 import "core:hash/xxhash"
 import "core:strconv"
 import "core:strings"
@@ -269,11 +268,11 @@ object_path :: proc(buf: ^prim.Path_Buf, space_dir: string, key: Object_Key) -> 
 	return string(buf[:n])
 }
 
-tmp_path :: proc(buf: ^prim.Path_Buf, space_dir: string) -> string {
+tmp_path :: proc(buf: ^prim.Path_Buf, space_dir: string, random: prim.Random) -> string {
 	n := copy(buf[:], space_dir)
 	n += copy(buf[n:], "/t/")
 	r: [12]u8
-	crypto.rand_bytes(r[:])
+	prim.random_fill(random, r[:])
 	n += prim.hex_encode(buf[n:], r[:])
 	return string(buf[:n])
 }

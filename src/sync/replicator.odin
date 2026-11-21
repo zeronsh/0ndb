@@ -80,6 +80,7 @@ Replicator_Config :: struct {
 	verify:       proc(user: rawptr, req: ^Verify_Request) -> Verdict,
 	filtered:     bool,
 	padding:      bool,
+	random:       prim.Random,
 	kernel_tls:   bool,
 	on_event:     Repl_Handler,
 	user:         rawptr,
@@ -146,6 +147,7 @@ Remote :: struct {
 	probes:    [PROBES]Stream_Id,
 	grouped:   bool,
 	quarantined: bool,
+	reaping:   bool,
 	held:      i64,
 	pulled:    i64,
 	pulling:   bool,
@@ -196,7 +198,10 @@ Replicator :: struct {
 	feed_fd:    prim.Fd,
 	feed_seq:   u64,
 	fetches:    [dynamic]^Ckpt_Fetch,
-	lists_out:  int,
+	list_sent:  u64,
+	list_done:  u64,
+	hold:       int,
+	reap:       [dynamic]^Remote,
 	cursor:     i64,
 	listed:     bool,
 	rx_remote:  ^Remote,
@@ -250,7 +255,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 		r.endpoint = endpoint_parse(cfg.relay) or_return
 		if cfg.noise_static != nil {
 			ecdh.private_key_set(&r.static, cfg.noise_static)
-		} else if !ecdh.private_key_generate(&r.static, .X25519) {
+		} else if !x25519_generate(&r.static, cfg.random) {
 			return .Invalid
 		}
 	}
@@ -278,6 +283,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.feed_fd = prim.INVALID_FD
 	_feed_cursor_load(r)
 	r.fetches = make([dynamic]^Ckpt_Fetch, allocator)
+	r.reap = make([dynamic]^Remote, allocator)
 	r.tr.fd = prim.INVALID_FD
 	return .None
 }
@@ -294,6 +300,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 	for _, l in r.locals {
 		_local_free(r, l)
 	}
+	clear(&r.reap)
 	for _, rm in r.remotes {
 		_remote_free(r, rm)
 	}
@@ -311,6 +318,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 		_fetch_free(r, f)
 	}
 	delete(r.fetches)
+	delete(r.reap)
 	ecdh.private_key_clear(&r.static)
 	if r.feed_fd >= 0 {
 		prim.close_file(r.vfs, r.feed_fd)
@@ -324,6 +332,8 @@ replicator_destroy :: proc(r: ^Replicator) {
 }
 
 replicator_start :: proc(r: ^Replicator) {
+	_enter(r)
+	defer _leave(r)
 	if r.phase == .Stopped && !r.external {
 		r.phase = .Waiting
 		_repl_connect(r)
@@ -331,6 +341,8 @@ replicator_start :: proc(r: ^Replicator) {
 }
 
 replicator_stop :: proc(r: ^Replicator) {
+	_enter(r)
+	defer _leave(r)
 	_repl_close(r)
 	if r.timer != 0 {
 		prim.timer_cancel(r.loop, r.timer)
@@ -370,6 +382,8 @@ replicator_floor :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64
 }
 
 replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil) -> Error {
+	_enter(r)
+	defer _leave(r)
 	id := stream_id(scope, r.cfg.self, name, epoch)
 	l, ok := r.locals[id]
 	if !ok {
@@ -386,6 +400,8 @@ replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u
 }
 
 replicator_drop :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64) -> Error {
+	_enter(r)
+	defer _leave(r)
 	id := stream_id(scope, r.cfg.self, name, epoch)
 	if l, ok := r.locals[id]; ok && l.inflight > 0 {
 		return .Busy
@@ -399,6 +415,8 @@ replicator_drop :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64)
 }
 
 replicator_follow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, full: bool) -> Error {
+	_enter(r)
+	defer _leave(r)
 	rm := _remote_get(r, scope, device, name, epoch) or_return
 	was := rm.follow
 	rm.follow = true
@@ -414,6 +432,8 @@ replicator_follow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name
 }
 
 replicator_unfollow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) {
+	_enter(r)
+	defer _leave(r)
 	id := stream_id(scope, device, name, epoch)
 	rm, ok := r.remotes[id]
 	if !ok || !rm.follow {
@@ -434,6 +454,8 @@ replicator_unfollow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, na
 }
 
 replicator_want :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, ranges: []journal.Range) -> Error {
+	_enter(r)
+	defer _leave(r)
 	rm := _remote_get(r, scope, device, name, epoch) or_return
 	for g in ranges {
 		if g.from < 0 || g.to < g.from {
@@ -449,6 +471,8 @@ replicator_want :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: 
 }
 
 replicator_want_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, n: i64 = TAIL_DEFAULT) -> Error {
+	_enter(r)
+	defer _leave(r)
 	rm := _remote_get(r, scope, device, name, epoch) or_return
 	return _remote_want_tail(r, rm, n)
 }
@@ -477,6 +501,8 @@ replicator_acquire :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, nam
 }
 
 replicator_release :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) {
+	_enter(r)
+	defer _leave(r)
 	id := stream_id(scope, device, name, epoch)
 	if rm, ok := r.remotes[id]; ok && rm.refs > 0 {
 		rm.refs -= 1
@@ -497,6 +523,8 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 
 @(private)
 _emit :: proc(r: ^Replicator, ev: Repl_Event) {
+	_enter(r)
+	defer _leave(r)
 	e := ev
 	r.cfg.on_event(r.cfg.user, &e)
 }
@@ -842,6 +870,8 @@ _local_retry :: proc(r: ^Replicator, l: ^Local) {
 @(private)
 _on_retry :: proc(l: ^prim.Loop, data: rawptr) {
 	r := cast(^Replicator)data
+	_enter(r)
+	defer _leave(r)
 	r.retry = 0
 	for _, lo in r.locals {
 		lo.retry = false
@@ -918,8 +948,33 @@ _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
 	if rm.follow || rm.refs > 0 || len(rm.wants) > 0 || len(rm.inflight) > 0 || rm.tail > 0 || r.rx_remote == rm {
 		return
 	}
+	if r.hold > 0 {
+		if !rm.reaping {
+			rm.reaping = true
+			append(&r.reap, rm)
+		}
+		return
+	}
 	delete_key(&r.remotes, rm.id)
 	_remote_free(r, rm)
+}
+
+@(private)
+_enter :: proc(r: ^Replicator) {
+	r.hold += 1
+}
+
+@(private)
+_leave :: proc(r: ^Replicator) {
+	r.hold -= 1
+	if r.hold > 0 {
+		return
+	}
+	for len(r.reap) > 0 {
+		rm := pop(&r.reap)
+		rm.reaping = false
+		_remote_maybe_free(r, rm)
+	}
 }
 
 @(private)
@@ -1205,6 +1260,8 @@ _seen_stream :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 @(private)
 _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	r := cast(^Replicator)user
+	_enter(r)
+	defer _leave(r)
 	switch ev.kind {
 	case .Welcome:
 		r.phase = .Ready
@@ -1225,7 +1282,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		if !ev.more {
 			r.cursor = ev.cursor
 			r.listed = true
-			_lists_finished(r)
+			_lists_finished(r, .None)
 		}
 	case .Appended, .Conflict:
 		if l, ok := r.locals[Stream_Id(ev.id)]; ok {
@@ -1272,6 +1329,11 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		code   = ev.code,
 		stream = id,
 	}
+	if id == reserved_id(LIST_TAG, 0) {
+		_lists_finished(r, .Permission if ev.code == .Not_Owner else .Refused)
+		_emit(r, rv)
+		return
+	}
 	if l, ok := r.locals[id]; ok {
 		if l.inflight > 0 {
 			r.uploading -= 1
@@ -1305,9 +1367,7 @@ _repl_on_ready :: proc(r: ^Replicator) {
 	if r.cfg.filtered {
 		_feed_subscribe(r, r.feed_cursor < 0)
 	} else {
-		if client_list(&r.client, r.cursor if r.listed else 0) == .None {
-			r.lists_out += 1
-		}
+		_list_send(r, r.cursor if r.listed else 0)
 		if r.feed_cursor >= 0 {
 			client_feed_follow(&r.client, u64(r.feed_cursor))
 		} else {

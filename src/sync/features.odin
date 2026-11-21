@@ -43,6 +43,8 @@ keys_record_decode :: proc(t: ^Key_Tree, body: []u8, allocator := context.alloca
 }
 
 replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, tree: ^Key_Tree) -> Error {
+	_enter(r)
+	defer _leave(r)
 	name := keys_stream_name(segment) or_return
 	epoch := tree.version
 	id := stream_id(scope, r.cfg.self, name, epoch)
@@ -80,6 +82,8 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 }
 
 replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
+	_enter(r)
+	defer _leave(r)
 	if r.phase != .Ready {
 		return .Closed
 	}
@@ -89,6 +93,8 @@ replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name
 }
 
 replicator_zero_replica :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
+	_enter(r)
+	defer _leave(r)
 	rm := _remote_get(r, scope, device, name, epoch) or_return
 	defer _remote_maybe_free(r, rm)
 	hi := min(to, journal.replica_length(&rm.rep))

@@ -118,10 +118,10 @@ device_id :: proc(public: Public_Key) -> (id: Device_Id) {
 	return
 }
 
-device_load_or_create :: proc(vfs: prim.Vfs, dir: string) -> (d: Device, err: Error) {
+device_load_or_create :: proc(vfs: prim.Vfs, dir: string, random := prim.Random{}) -> (d: Device, err: Error) {
 	seed: [32]u8
 	defer crypto.zero_explicit(&seed, size_of(seed))
-	_key_load_or_create(vfs, dir, DEVICE_KEY_FILE, KIND_DEVICE, seed[:]) or_return
+	_key_load_or_create(vfs, dir, DEVICE_KEY_FILE, KIND_DEVICE, seed[:], random) or_return
 	return device_from_seed(seed[:])
 }
 
@@ -131,10 +131,10 @@ device_clear :: proc(d: ^Device) {
 	d^ = {}
 }
 
-relay_key_load_or_create :: proc(vfs: prim.Vfs, dir: string) -> (k: Relay_Key, err: Error) {
+relay_key_load_or_create :: proc(vfs: prim.Vfs, dir: string, random := prim.Random{}) -> (k: Relay_Key, err: Error) {
 	raw: [32]u8
 	defer crypto.zero_explicit(&raw, size_of(raw))
-	_key_load_or_create(vfs, dir, RELAY_KEY_FILE, KIND_RELAY, raw[:]) or_return
+	_key_load_or_create(vfs, dir, RELAY_KEY_FILE, KIND_RELAY, raw[:], random) or_return
 	if !ecdh.private_key_set_bytes(&k.private, .X25519, raw[:]) {
 		return {}, .Corrupt
 	}
@@ -147,10 +147,10 @@ relay_key_clear :: proc(k: ^Relay_Key) {
 	k^ = {}
 }
 
-space_new :: proc() -> (s: Space, err: Error) {
+space_new :: proc(random := prim.Random{}) -> (s: Space, err: Error) {
 	secret: Secret
 	defer crypto.zero_explicit(&secret, size_of(secret))
-	crypto.rand_bytes(secret[:])
+	prim.random_fill(random, secret[:])
 	return space_from_secret(secret)
 }
 
@@ -181,14 +181,14 @@ space_scope :: proc(s: ^Space, mode := Encryption_Mode.End_To_End) -> Scope {
 	return scope_make(s.content, mode)
 }
 
-content_key_new :: proc(epoch: u32 = 0) -> (k: Content_Key) {
-	crypto.rand_bytes(k.key[:])
+content_key_new :: proc(epoch: u32 = 0, random := prim.Random{}) -> (k: Content_Key) {
+	prim.random_fill(random, k.key[:])
 	k.epoch = epoch
 	return
 }
 
-content_key_rotate :: proc(prev: Content_Key) -> Content_Key {
-	return content_key_new(prev.epoch + 1)
+content_key_rotate :: proc(prev: Content_Key, random := prim.Random{}) -> Content_Key {
+	return content_key_new(prev.epoch + 1, random)
 }
 
 scope_make :: proc(content: Content_Key, mode := Encryption_Mode.End_To_End) -> (sc: Scope) {
@@ -273,7 +273,7 @@ pairing_addr :: proc "contextless" (p: ^Pairing) -> string {
 	return string(p.relay_addr[:p.addr_len])
 }
 
-pairing_save :: proc(vfs: prim.Vfs, dir: string, p: ^Pairing) -> Error {
+pairing_save :: proc(vfs: prim.Vfs, dir: string, p: ^Pairing, random := prim.Random{}) -> Error {
 	buf: [8 + 1 + 32 + 32 + 2 + MAX_ADDR + 8]u8
 	n := copy(buf[:], KEY_MAGIC)
 	buf[n] = KIND_SPACE
@@ -294,7 +294,7 @@ pairing_save :: proc(vfs: prim.Vfs, dir: string, p: ^Pairing) -> Error {
 	if merr := prim.mkdir_all(vfs, dir, 0o700); merr != .None {
 		return _from_prim(merr)
 	}
-	return _write_private(vfs, path, buf[:n], false)
+	return _write_private(vfs, path, buf[:n], false, random)
 }
 
 pairing_load :: proc(vfs: prim.Vfs, dir: string) -> (p: Pairing, err: Error) {
@@ -335,7 +335,7 @@ _derive :: proc(ikm: []u8, label: string, ctx_bytes: []u8, dst: []u8) {
 }
 
 @(private)
-_key_load_or_create :: proc(vfs: prim.Vfs, dir: string, file: string, kind: u8, out: []u8) -> Error {
+_key_load_or_create :: proc(vfs: prim.Vfs, dir: string, file: string, kind: u8, out: []u8, random: prim.Random) -> Error {
 	path, perr := prim.path_join(context.temp_allocator, dir, file)
 	if perr != .None {
 		return _from_prim(perr)
@@ -349,14 +349,14 @@ _key_load_or_create :: proc(vfs: prim.Vfs, dir: string, file: string, kind: u8, 
 			return _from_prim(merr)
 		}
 		fresh: [32]u8
-		crypto.rand_bytes(fresh[:])
+		prim.random_fill(random, fresh[:])
 		buf: [8 + 1 + 32 + 8]u8
 		n := copy(buf[:], KEY_MAGIC)
 		buf[n] = kind
 		n += 1
 		n += copy(buf[n:], fresh[:])
 		prim.put_u64le(buf[n:], xxhash.XXH3_64_with_seed(buf[:n], KEY_SEED))
-		werr := _write_private(vfs, path, buf[:], true)
+		werr := _write_private(vfs, path, buf[:], true, random)
 		crypto.zero_explicit(&fresh, size_of(fresh))
 		crypto.zero_explicit(&buf, size_of(buf))
 		if werr != .None && werr != .Exists {
@@ -398,10 +398,10 @@ _read_private :: proc(vfs: prim.Vfs, path: string) -> ([]u8, Error) {
 }
 
 @(private)
-_write_private :: proc(vfs: prim.Vfs, path: string, data: []u8, exclusive: bool) -> Error {
+_write_private :: proc(vfs: prim.Vfs, path: string, data: []u8, exclusive: bool, random: prim.Random) -> Error {
 	suffix: [24]u8
 	r: [8]u8
-	crypto.rand_bytes(r[:])
+	prim.random_fill(random, r[:])
 	copy(suffix[:], ".tmp.")
 	prim.hex_encode(suffix[5:21], r[:])
 	tmp, perr := _concat(context.temp_allocator, path, string(suffix[:21]))

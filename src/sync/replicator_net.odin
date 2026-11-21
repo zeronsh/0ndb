@@ -1,7 +1,6 @@
 package osync
 
 import "base:runtime"
-import "core:crypto"
 import csync "core:sync"
 import "core:thread"
 import "../prim"
@@ -71,6 +70,8 @@ _resolver_stop :: proc(r: ^Replicator) {
 @(private)
 _on_resolved :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
 	r := cast(^Replicator)data
+	_enter(r)
+	defer _leave(r)
 	res := &r.resolver
 	_notifier_drain(&res.notifier)
 	csync.mutex_lock(&res.mutex)
@@ -143,7 +144,7 @@ _repl_connected :: proc(r: ^Replicator) {
 		return
 	}
 	buf: [2 + MSG1_LEN]u8
-	n, err := client_begin(&r.client, &r.static, r.cfg.relay_public, buf[:])
+	n, err := client_begin(&r.client, &r.static, r.cfg.relay_public, buf[:], r.cfg.random)
 	if err != .None {
 		_repl_fail(r, err)
 		return
@@ -172,6 +173,8 @@ _repl_hello :: proc(r: ^Replicator) {
 @(private)
 _on_connect_timeout :: proc(l: ^prim.Loop, data: rawptr) {
 	r := cast(^Replicator)data
+	_enter(r)
+	defer _leave(r)
 	r.timer = 0
 	switch r.phase {
 	case .Resolving, .Connecting, .Handshake, .Hello:
@@ -185,6 +188,8 @@ _on_connect_timeout :: proc(l: ^prim.Loop, data: rawptr) {
 @(private)
 _on_repl_io :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
 	r := cast(^Replicator)data
+	_enter(r)
+	defer _leave(r)
 	if r.phase == .Connecting {
 		if .Write not_in events && .Error not_in events && .Hangup not_in events {
 			return
@@ -300,6 +305,8 @@ _repl_flush :: proc(r: ^Replicator) {
 }
 
 replicator_link_up :: proc(r: ^Replicator, binding: []u8 = nil) -> Error {
+	_enter(r)
+	defer _leave(r)
 	if !r.external {
 		return .Invalid
 	}
@@ -311,6 +318,8 @@ replicator_link_up :: proc(r: ^Replicator, binding: []u8 = nil) -> Error {
 }
 
 replicator_input :: proc(r: ^Replicator, data: []u8) -> Error {
+	_enter(r)
+	defer _leave(r)
 	if !r.external || (r.phase != .Hello && r.phase != .Ready) {
 		return .Closed
 	}
@@ -325,10 +334,14 @@ replicator_input :: proc(r: ^Replicator, data: []u8) -> Error {
 }
 
 replicator_writable :: proc(r: ^Replicator) {
+	_enter(r)
+	defer _leave(r)
 	_repl_pump(r)
 }
 
 replicator_link_down :: proc(r: ^Replicator, err: Error = .Closed) {
+	_enter(r)
+	defer _leave(r)
 	if !r.external || r.phase == .Stopped {
 		return
 	}
@@ -381,7 +394,7 @@ _repl_fail :: proc(r: ^Replicator, err: Error) {
 	}
 	r.phase = .Waiting
 	jitter: [2]u8
-	crypto.rand_bytes(jitter[:])
+	prim.random_fill(r.cfg.random, jitter[:])
 	delay := r.backoff * 3 / 4 + r.backoff * i64(u16(jitter[0]) | u16(jitter[1]) << 8) / (2 * 65536)
 	r.backoff = min(r.backoff * 2, BACKOFF_MAX)
 	r.timer = prim.timer(r.loop, delay, r, _on_connect_timeout)

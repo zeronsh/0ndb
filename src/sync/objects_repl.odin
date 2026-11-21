@@ -72,14 +72,20 @@ Part_Ref :: struct {
 }
 
 replicator_put_object :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, oid: []u8, data: []u8) -> Error {
+	_enter(r)
+	defer _leave(r)
 	return _obj_put(r, scope, tree, oid, data, "")
 }
 
 replicator_put_object_file :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, oid: []u8, path: string) -> Error {
+	_enter(r)
+	defer _leave(r)
 	return _obj_put(r, scope, tree, oid, nil, path)
 }
 
 replicator_get_object :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, oid: []u8, dest: string) -> Error {
+	_enter(r)
+	defer _leave(r)
 	j := _obj_new(r, .Get, scope, tree, oid) or_return
 	derr: Error
 	j.dest, derr = _clone_string(dest, r.allocator)
@@ -91,6 +97,8 @@ replicator_get_object :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, oi
 }
 
 replicator_shred_object :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tree, oid: []u8) -> Error {
+	_enter(r)
+	defer _leave(r)
 	j, err := _obj_new(r, .Shred, scope, tree, oid)
 	if err == .Permission {
 		j, err = _obj_new(r, .Shred, scope, nil, oid)
@@ -676,7 +684,7 @@ _objs_on_object :: proc(r: ^Replicator, ev: ^Event) {
 _get_open :: proc(r: ^Replicator, j: ^Obj_Job) -> Error {
 	suffix: [21]u8
 	rb: [8]u8
-	crypto.rand_bytes(rb[:])
+	prim.random_fill(r.cfg.random, rb[:])
 	copy(suffix[:], ".tmp.")
 	prim.hex_encode(suffix[5:], rb[:])
 	tmp := _concat(r.allocator, j.dest, string(suffix[:])) or_return

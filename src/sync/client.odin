@@ -124,13 +124,13 @@ client_begin_plain :: proc(c: ^Client, binding: []u8 = nil) {
 	}
 }
 
-client_begin :: proc(c: ^Client, static: ^ecdh.Private_Key, relay_public: Public_Key, out: []u8) -> (n: int, err: Error) {
+client_begin :: proc(c: ^Client, static: ^ecdh.Private_Key, relay_public: Public_Key, out: []u8, random := prim.Random{}) -> (n: int, err: Error) {
 	client_reset(c)
 	c.unix = false
 	if len(out) < 2 + MSG1_LEN {
 		return 0, .Invalid
 	}
-	m := handshake_initiate(&c.hs, static, relay_public, out[2:]) or_return
+	m := handshake_initiate(&c.hs, static, relay_public, out[2:], random) or_return
 	out[0] = u8(m)
 	out[1] = u8(m >> 8)
 	c.state = .Handshake

@@ -352,12 +352,12 @@ _on_list :: proc(c: ^Conn, rd: ^prim.Reader) {
 		return
 	}
 	if !_can(c, .List, {}) {
-		_reply_refused(c, .Not_Owner, {})
+		_reply_refused(c, .Not_Owner, cast([32]u8)reserved_id(LIST_TAG, 0))
 		return
 	}
 	sp := c.space
 	if _feed_open(r, sp) != .None {
-		_reply_refused(c, .Io, {})
+		_reply_refused(c, .Io, cast([32]u8)reserved_id(LIST_TAG, 0))
 		return
 	}
 	ls, aerr := new(Listing, r.allocator)
@@ -549,9 +549,9 @@ _compact_step :: proc(r: ^Relay, sp: ^Space_State) {
 			if sp.compact_timer != 0 {
 				return
 			}
-			deadline := prim.mono_ns() + COMPACT_SLICE_NS
+			deadline := prim.clock_mono_ns(r.cfg.clock) + COMPACT_SLICE_NS
 			for len(sp.compact_buf) < COMPACT_BATCH {
-				if prim.mono_ns() >= deadline {
+				if prim.clock_mono_ns(r.cfg.clock) >= deadline {
 					sp.compact_timer = prim.timer(r.loop, 0, sp, _compact_resume)
 					return
 				}

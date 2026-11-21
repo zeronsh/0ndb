@@ -46,16 +46,16 @@ keytree_init :: proc(t: ^Key_Tree, root: [32]u8, depth: u8 = KEY_TREE_DEPTH, shi
 	return .None
 }
 
-keytree_new :: proc(t: ^Key_Tree, allocator := context.allocator) -> Error {
+keytree_new :: proc(t: ^Key_Tree, random := prim.Random{}, allocator := context.allocator) -> Error {
 	root: [32]u8
-	crypto.rand_bytes(root[:])
+	prim.random_fill(random, root[:])
 	defer crypto.zero_explicit(&root, size_of(root))
 	return keytree_init(t, root, KEY_TREE_DEPTH, KEY_TREE_SHIFT, allocator)
 }
 
-object_tree_new :: proc(t: ^Key_Tree, allocator := context.allocator) -> Error {
+object_tree_new :: proc(t: ^Key_Tree, random := prim.Random{}, allocator := context.allocator) -> Error {
 	root: [32]u8
-	crypto.rand_bytes(root[:])
+	prim.random_fill(random, root[:])
 	defer crypto.zero_explicit(&root, size_of(root))
 	return keytree_init(t, root, OBJECT_TREE_DEPTH, 0, allocator)
 }
