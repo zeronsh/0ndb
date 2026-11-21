@@ -2574,18 +2574,16 @@ _store_out_schemas :: proc(c: ^Client, list: string) {
 		}
 		name, _ := json_get_string(tool, "name")
 		entry := Out_Schema{name = _clone(c, name)}
-		if schema_dialect_supported(schema) {
-			if !c.reg_ready {
-				if jsonschema.registry_init(&c.schemas) != .None {
-					delete(entry.name, c.allocator)
-					return
-				}
-				c.reg_ready = true
+		if !c.reg_ready {
+			if jsonschema.registry_init(&c.schemas) != .None {
+				delete(entry.name, c.allocator)
+				return
 			}
-			entry.schema, entry.ok = _schema_compile(&c.schemas, schema)
+			c.reg_ready = true
 		}
+		entry.schema, entry.ok = _schema_compile(&c.schemas, schema)
 		if !entry.ok {
-			_emit(c, Event{kind = .Warning, message = "output schema cannot be validated (unsupported dialect or invalid schema)", data = name})
+			_emit(c, Event{kind = .Warning, message = "output schema is not valid JSON", data = name})
 		}
 		append(&c.out_schemas, entry)
 	}

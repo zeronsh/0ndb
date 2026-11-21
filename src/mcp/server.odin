@@ -370,9 +370,6 @@ server_add_tool :: proc(s: ^Server, t: Tool_Def) -> bool {
 	if sc.reason != "" {
 		return false
 	}
-	if !s.cfg.no_validation && !schema_dialect_supported(schema) {
-		return false
-	}
 	for &x in s.tools {
 		if x.name == t.name {
 			_tool_free(s, &x)
