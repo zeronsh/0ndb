@@ -12,7 +12,8 @@ Relay_Storage :: struct {
 	stream_close:    proc(data: rawptr, s: rawptr),
 	stream_probe:    proc(data: rawptr, ns: rawptr, id: Stream_Id) -> (length: i64, exists: bool, err: Error),
 	stream_read:     proc(data: rawptr, s: rawptr, at: i64, dst: []u8) -> (int, Error),
-	stream_fd:       proc(data: rawptr, s: rawptr) -> (fd: prim.Fd, base: i64, ok: bool),
+	stream_extent:   proc(data: rawptr, s: rawptr, at: i64, n: i64) -> (fd: prim.Fd, off: i64, len: i64, ok: bool),
+	stream_hint:     proc(data: rawptr, ns: rawptr, id: Stream_Id) -> (length: i64, exists: bool),
 	append_begin:    proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawptr, err: Error),
 	append_write:    proc(data: rawptr, w: rawptr, bytes: []u8) -> Error,
 	append_commit:   proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawptr),
@@ -28,7 +29,7 @@ Relay_Storage :: struct {
 	put_abort:       proc(data: rawptr, w: rawptr),
 	object_open:     proc(data: rawptr, ns: rawptr, key: Object_Key) -> (o: rawptr, size: i64, err: Error),
 	object_read:     proc(data: rawptr, o: rawptr, at: i64, dst: []u8) -> (int, Error),
-	object_fd:       proc(data: rawptr, o: rawptr) -> (fd: prim.Fd, base: i64, ok: bool),
+	object_extent:   proc(data: rawptr, o: rawptr, at: i64, n: i64) -> (fd: prim.Fd, off: i64, len: i64, ok: bool),
 	object_close:    proc(data: rawptr, o: rawptr),
 	object_remove:   proc(data: rawptr, ns: rawptr, key: Object_Key, done: Storage_Done, ctx: rawptr),
 }

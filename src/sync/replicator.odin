@@ -1136,6 +1136,12 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 		}
 	}
 	rm.pulling = false
+	if ev.length < rm.pulled {
+		rm.pulled = ev.length
+	}
+	if ev.length < rm.relay_len {
+		rm.relay_len = ev.length
+	}
 	if !rm.full && rm.pulled == 0 && rm.relay_len >= 0 {
 		rm.pulled = rm.relay_len
 	}

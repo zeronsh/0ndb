@@ -3,6 +3,17 @@ package osync
 import "../prim"
 
 FEED_COMPACT_DEFAULT :: 64 * 1024 * 1024
+COMPACT_BATCH :: FEED_BATCH * FEED_ENTRY
+COMPACT_SLICE_NS :: 1_000_000
+COMPACT_TAIL :: 64 * FEED_ENTRY
+COMPACT_COPY :: FEED_BATCH * FEED_ENTRY
+
+Compact_Phase :: enum u8 {
+	Idle,
+	Snapshot,
+	Tail,
+	Meta,
+}
 
 Listing :: struct {
 	pos:    i64,
@@ -101,7 +112,7 @@ _feed_wait :: proc(r: ^Relay, sp: ^Space_State, p: ^Pending, length: u64) {
 
 @(private)
 _feed_flush :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.feed_busy || sp.compacting || len(sp.feed_q) == 0 && len(sp.feed_flight) == 0 {
+	if sp.feed_busy || sp.freeze || len(sp.feed_q) == 0 && len(sp.feed_flight) == 0 {
 		return
 	}
 	if _feed_open(r, sp) != .None {
@@ -138,78 +149,7 @@ _feed_flush :: proc(r: ^Relay, sp: ^Space_State) {
 	r.store.append_commit(r.store.data, w, _relay_done, p)
 }
 
-@(private)
-_feed_done :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, result: Error, value: i64) {
-	#partial switch kind {
-	case .Feed:
-		sp.feed_busy = false
-		sp.feed.busy = false
-		if result == .None {
-			sp.feed_len = value
-			sp.feed.length = value
-			clear(&sp.feed_flight)
-			for f in sp.feeders {
-				f.feed_hint = true
-				_conn_kick(f)
-			}
-			_feed_release(r, sp)
-			if r.cfg.feed_compact > 0 && sp.feed_len >= r.cfg.feed_compact {
-				_feed_compact(r, sp)
-			}
-		} else {
-			sp.feed.poisoned = true
-		}
-	case .Compact:
-		sp.next_feed.busy = false
-		if result != .None {
-			_compact_abort(r, sp)
-			return
-		}
-		sp.next_feed.length = value
-		sp.next_len = value
-		m: [16]u8
-		prim.put_u64le(m[0:8], sp.feed_epoch + 1)
-		prim.put_u64le(m[8:16], u64(_feed_end(sp)))
-		w, err := r.store.append_begin(r.store.data, sp.meta.h, sp.meta.length, 16)
-		if err == .None {
-			err = r.store.append_write(r.store.data, w, m[:])
-		}
-		if err != .None {
-			_compact_abort(r, sp)
-			return
-		}
-		_feed_job(r, sp, .Meta, w, sp.meta)
-		return
-	case .Meta:
-		sp.meta.busy = false
-		if result != .None {
-			sp.meta.poisoned = true
-			_compact_abort(r, sp)
-			return
-		}
-		sp.meta.length = value
-		_compact_switch(r, sp)
-	}
-	_feed_flush(r, sp)
-}
 
-@(private)
-_feed_job :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, w: rawptr, st: ^Stream_State) {
-	p, aerr := new(Pending, r.allocator)
-	if aerr != nil {
-		r.store.append_abort(r.store.data, w)
-		_compact_abort(r, sp)
-		return
-	}
-	p^ = {
-		relay = r,
-		kind  = kind,
-		space = sp,
-	}
-	sp.jobs += 1
-	st.busy = true
-	r.store.append_commit(r.store.data, w, _relay_done, p)
-}
 
 @(private)
 _feed_release :: proc(r: ^Relay, sp: ^Space_State) {
@@ -239,143 +179,8 @@ _feed_release :: proc(r: ^Relay, sp: ^Space_State) {
 	}
 }
 
-@(private)
-_feed_compact :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.compacting || sp.feed_busy {
-		return
-	}
-	epoch := sp.feed_epoch + 1
-	next, err := _pin(r, sp, reserved_id(FEED_TAG, epoch))
-	if err != .None {
-		return
-	}
-	if next.length > 0 {
-		next.refs -= 1
-		_stream_maybe_release(r, next)
-		return
-	}
-	count := 0
-	it, _, lerr := r.store.list_begin(r.store.data, sp.ns, 0)
-	if lerr != .None {
-		next.refs -= 1
-		_stream_maybe_release(r, next)
-		return
-	}
-	for {
-		id, ok := r.store.list_next(r.store.data, it)
-		if !ok {
-			break
-		}
-		if !_reserved(cast([32]u8)id) {
-			count += 1
-		}
-	}
-	r.store.list_end(r.store.data, it)
-	sp.compacting = true
-	sp.next_feed = next
-	w, werr := r.store.append_begin(r.store.data, next.h, 0, i64(count * FEED_ENTRY))
-	if werr != .None {
-		_compact_abort(r, sp)
-		return
-	}
-	it, _, lerr = r.store.list_begin(r.store.data, sp.ns, 0)
-	batch := make([dynamic]u8, 0, 64 * 1024, context.temp_allocator)
-	written := 0
-	for lerr == .None && written < count {
-		id, ok := r.store.list_next(r.store.data, it)
-		if !ok {
-			break
-		}
-		if _reserved(cast([32]u8)id) {
-			continue
-		}
-		length := u64(FEED_DROPPED)
-		if st, sok := sp.streams[id]; sok && st.h != nil && !st.dropped {
-			length = u64(st.length)
-		} else if l, exists, perr := r.store.stream_probe(r.store.data, sp.ns, id); perr == .None && exists {
-			length = u64(l)
-		}
-		e: [FEED_ENTRY]u8
-		v := id
-		copy(e[:32], v[:])
-		prim.put_u64le(e[32:], length)
-		append(&batch, ..e[:])
-		written += 1
-		if len(batch) >= 64 * 1024 - FEED_ENTRY {
-			r.store.append_write(r.store.data, w, batch[:])
-			clear(&batch)
-		}
-	}
-	if lerr == .None {
-		r.store.list_end(r.store.data, it)
-	}
-	for written < count {
-		e: [FEED_ENTRY]u8
-		prim.put_u64le(e[32:], FEED_DROPPED)
-		for i in 0 ..< 16 {
-			e[i] = 0xff
-		}
-		append(&batch, ..e[:])
-		written += 1
-	}
-	if len(batch) > 0 {
-		r.store.append_write(r.store.data, w, batch[:])
-	}
-	_feed_job(r, sp, .Compact, w, next)
-}
 
-@(private)
-_compact_abort :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.next_feed != nil {
-		sp.next_feed.busy = false
-		sp.next_feed.refs -= 1
-		_stream_maybe_release(r, sp.next_feed)
-		sp.next_feed = nil
-	}
-	sp.compacting = false
-	_feed_flush(r, sp)
-}
 
-@(private)
-_compact_switch :: proc(r: ^Relay, sp: ^Space_State) {
-	old := sp.feed
-	old_end := _feed_end(sp)
-	sp.feed = sp.next_feed
-	sp.next_feed = nil
-	sp.feed_epoch += 1
-	sp.feed_base = old_end
-	sp.feed_len = sp.next_len
-	sp.compacting = false
-	for f in sp.feeders {
-		if f.feed_off >= old_end {
-			f.feed_off = _feed_end(sp)
-		} else {
-			f.feed_off = sp.feed_base
-		}
-		f.feed_hint = true
-		_conn_kick(f)
-	}
-	old.refs -= 1
-	if old.h != nil && !old.busy {
-		p, aerr := new(Pending, r.allocator)
-		if aerr == nil {
-			p^ = {
-				relay  = r,
-				kind   = .Drop,
-				space  = sp,
-				stream = old,
-				id     = cast([32]u8)old.id,
-			}
-			old.busy = true
-			old.refs += 1
-			sp.jobs += 1
-			p.conn = {max(u32), 0}
-			r.store.drop(r.store.data, sp.ns, old.id, _relay_done, p)
-			return
-		}
-	}
-	_stream_maybe_release(r, old)
-}
 
 @(private)
 _on_feed :: proc(c: ^Conn, rd: ^prim.Reader) {
@@ -573,4 +378,262 @@ _produce_listing :: proc(c: ^Conn) -> bool {
 		_listing_end(c)
 	}
 	return true
+}
+
+@(private)
+_feed_done :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, result: Error, value: i64) {
+	#partial switch kind {
+	case .Feed:
+		sp.feed_busy = false
+		sp.feed.busy = false
+		if result == .None {
+			sp.feed_len = value
+			sp.feed.length = value
+			clear(&sp.feed_flight)
+			for f in sp.feeders {
+				f.feed_hint = true
+				_conn_kick(f)
+			}
+			_feed_release(r, sp)
+			if sp.phase == .Idle && r.cfg.feed_compact > 0 && sp.feed_len >= r.cfg.feed_compact {
+				_compact_start(r, sp)
+			}
+		} else {
+			sp.feed.poisoned = true
+		}
+		_compact_step(r, sp)
+	case .Compact:
+		sp.compact_busy = false
+		sp.next_feed.busy = false
+		if result != .None {
+			_compact_abort(r, sp)
+			return
+		}
+		sp.next_feed.length = value
+		_compact_step(r, sp)
+	case .Meta:
+		sp.compact_busy = false
+		sp.meta.busy = false
+		if result != .None {
+			sp.meta.poisoned = true
+			_compact_abort(r, sp)
+			return
+		}
+		sp.meta.length = value
+		_compact_switch(r, sp)
+	}
+	_feed_flush(r, sp)
+}
+
+@(private)
+_feed_job :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, st: ^Stream_State, data: []u8) -> bool {
+	w, err := r.store.append_begin(r.store.data, st.h, st.length, i64(len(data)))
+	if err == .None {
+		err = r.store.append_write(r.store.data, w, data)
+		if err != .None {
+			r.store.append_abort(r.store.data, w)
+		}
+	}
+	if err != .None {
+		return false
+	}
+	p, aerr := new(Pending, r.allocator)
+	if aerr != nil {
+		r.store.append_abort(r.store.data, w)
+		return false
+	}
+	p^ = {
+		relay = r,
+		kind  = kind,
+		space = sp,
+	}
+	sp.jobs += 1
+	sp.compact_busy = true
+	st.busy = true
+	r.store.append_commit(r.store.data, w, _relay_done, p)
+	return true
+}
+
+@(private)
+_compact_start :: proc(r: ^Relay, sp: ^Space_State) {
+	for e in sp.feed_epoch + 1 ..< sp.feed_epoch + 9 {
+		next, err := _pin(r, sp, reserved_id(FEED_TAG, e))
+		if err != .None {
+			return
+		}
+		if next.length == 0 {
+			it, _, lerr := r.store.list_begin(r.store.data, sp.ns, 0)
+			if lerr != .None {
+				next.refs -= 1
+				_stream_maybe_release(r, next)
+				return
+			}
+			sp.next_feed = next
+			sp.next_epoch = e
+			sp.compact_it = it
+			sp.compact_copied = _feed_end(sp)
+			sp.phase = .Snapshot
+			return
+		}
+		next.refs -= 1
+		_stream_maybe_release(r, next)
+	}
+}
+
+@(private)
+_compact_step :: proc(r: ^Relay, sp: ^Space_State) {
+	for sp.phase != .Idle && !sp.compact_busy {
+		switch sp.phase {
+		case .Idle:
+			return
+		case .Snapshot:
+			if sp.compact_timer != 0 {
+				return
+			}
+			deadline := prim.mono_ns() + COMPACT_SLICE_NS
+			for len(sp.compact_buf) < COMPACT_BATCH {
+				if prim.mono_ns() >= deadline {
+					sp.compact_timer = prim.timer(r.loop, 0, sp, _compact_resume)
+					return
+				}
+				id, ok := r.store.list_next(r.store.data, sp.compact_it)
+				if !ok {
+					r.store.list_end(r.store.data, sp.compact_it)
+					sp.compact_it = nil
+					sp.phase = .Tail
+					break
+				}
+				if _reserved(cast([32]u8)id) {
+					continue
+				}
+				length: i64
+				if st, sok := sp.streams[id]; sok && st.h != nil && !st.dropped {
+					length = st.length
+				} else {
+					l, exists := r.store.stream_hint(r.store.data, sp.ns, id)
+					if !exists || l <= 0 {
+						continue
+					}
+					length = l
+				}
+				e: [FEED_ENTRY]u8
+				v := id
+				copy(e[:32], v[:])
+				prim.put_u64le(e[32:], u64(length))
+				append(&sp.compact_buf, ..e[:])
+			}
+			if len(sp.compact_buf) > 0 {
+				ok := _feed_job(r, sp, .Compact, sp.next_feed, sp.compact_buf[:])
+				clear(&sp.compact_buf)
+				if !ok {
+					_compact_abort(r, sp)
+				}
+				return
+			}
+		case .Tail:
+			avail := _feed_end(sp) - sp.compact_copied
+			if avail > COMPACT_TAIL || (avail > 0 && sp.freeze) {
+				want := min(avail, COMPACT_COPY)
+				buf := make([]u8, int(want), context.temp_allocator)
+				got, err := r.store.stream_read(r.store.data, sp.feed.h, sp.compact_copied - sp.feed_base, buf)
+				if err != .None || i64(got) != want || !_feed_job(r, sp, .Compact, sp.next_feed, buf) {
+					_compact_abort(r, sp)
+					return
+				}
+				sp.compact_copied += want
+				return
+			}
+			if !sp.freeze {
+				if sp.feed_busy {
+					return
+				}
+				sp.freeze = true
+				continue
+			}
+			sp.phase = .Meta
+			m: [16]u8
+			prim.put_u64le(m[0:8], sp.next_epoch)
+			prim.put_u64le(m[8:16], u64(_feed_end(sp)))
+			if !_feed_job(r, sp, .Meta, sp.meta, m[:]) {
+				_compact_abort(r, sp)
+			}
+			return
+		case .Meta:
+			return
+		}
+	}
+}
+
+@(private)
+_compact_resume :: proc(l: ^prim.Loop, data: rawptr) {
+	sp := cast(^Space_State)data
+	sp.compact_timer = 0
+	r := sp.relay
+	_compact_step(r, sp)
+	_feed_flush(r, sp)
+	_reap(r)
+}
+
+@(private)
+_compact_abort :: proc(r: ^Relay, sp: ^Space_State) {
+	if sp.compact_timer != 0 {
+		prim.timer_cancel(r.loop, sp.compact_timer)
+		sp.compact_timer = 0
+	}
+	clear(&sp.compact_buf)
+	if sp.compact_it != nil {
+		r.store.list_end(r.store.data, sp.compact_it)
+		sp.compact_it = nil
+	}
+	if sp.next_feed != nil {
+		sp.next_feed.busy = false
+		sp.next_feed.refs -= 1
+		_stream_maybe_release(r, sp.next_feed)
+		sp.next_feed = nil
+	}
+	sp.phase = .Idle
+	sp.freeze = false
+	_feed_flush(r, sp)
+}
+
+@(private)
+_compact_switch :: proc(r: ^Relay, sp: ^Space_State) {
+	old := sp.feed
+	old_end := _feed_end(sp)
+	sp.feed = sp.next_feed
+	sp.next_feed = nil
+	sp.feed_epoch = sp.next_epoch
+	sp.feed_base = old_end
+	sp.feed_len = sp.feed.length
+	sp.phase = .Idle
+	sp.freeze = false
+	for f in sp.feeders {
+		if f.feed_off >= old_end {
+			f.feed_off = _feed_end(sp)
+		} else {
+			f.feed_off = sp.feed_base
+		}
+		f.feed_hint = true
+		_conn_kick(f)
+	}
+	old.refs -= 1
+	if old.h != nil && !old.busy {
+		p, aerr := new(Pending, r.allocator)
+		if aerr == nil {
+			p^ = {
+				relay  = r,
+				kind   = .Drop,
+				space  = sp,
+				stream = old,
+				id     = cast([32]u8)old.id,
+				conn   = {max(u32), 0},
+			}
+			old.busy = true
+			old.refs += 1
+			sp.jobs += 1
+			r.store.drop(r.store.data, sp.ns, old.id, _relay_done, p)
+			return
+		}
+	}
+	_stream_maybe_release(r, old)
 }

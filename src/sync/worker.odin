@@ -27,6 +27,7 @@ Job :: struct {
 	to:      i64,
 	lay:     Layout,
 	target:  rawptr,
+	ns:      rawptr,
 	done:    Storage_Done,
 	ctx:     rawptr,
 	next:    ^Job,

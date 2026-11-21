@@ -4,9 +4,15 @@ import "base:runtime"
 import "core:hash/xxhash"
 import "../prim"
 
+Extent_Resolver :: struct {
+	data:    rawptr,
+	resolve: proc(data: rawptr, fd: prim.Fd, off: i64, n: i64) -> (prim.Fd, i64, i64, bool),
+}
+
 File_Store :: struct {
 	vfs:       prim.Vfs,
 	lay:       Layout,
+	resolver:  Extent_Resolver,
 	root:      string,
 	loop:      ^prim.Loop,
 	worker:    Worker,
@@ -16,7 +22,10 @@ File_Store :: struct {
 
 @(private)
 _Fns :: struct {
-	dir: string,
+	dir:   string,
+	usage: i64,
+	ufd:   prim.Fd,
+	useq:  u64,
 }
 
 @(private)
@@ -41,6 +50,7 @@ _Fappend :: struct {
 
 @(private)
 _Fput :: struct {
+	ns:     rawptr,
 	fd:     prim.Fd,
 	tmp:    string,
 	final:  string,
@@ -105,7 +115,8 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		stream_close = _fs_stream_close,
 		stream_probe = _fs_stream_probe,
 		stream_read = _fs_stream_read,
-		stream_fd = _fs_stream_fd,
+		stream_extent = _fs_stream_extent,
+		stream_hint = _fs_stream_hint,
 		append_begin = _fs_append_begin,
 		append_write = _fs_append_write,
 		append_commit = _fs_append_commit,
@@ -121,7 +132,7 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		put_abort = _fs_put_abort,
 		object_open = _fs_object_open,
 		object_read = _fs_object_read,
-		object_fd = _fs_object_fd,
+		object_extent = _fs_object_extent,
 		object_close = _fs_object_close,
 		object_remove = _fs_object_remove,
 	}
@@ -131,20 +142,42 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 _fs_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err: Error) {
 	fs := cast(^File_Store)data
 	dir := space_paths(fs.vfs, fs.root, id, fs.allocator) or_return
-	usage, _ = space_usage_scan(fs.vfs, dir, fs.allocator, fs.lay.base)
 	ns, aerr := new(_Fns, fs.allocator)
 	if aerr != nil {
 		delete(dir, fs.allocator)
 		return nil, 0, .No_Memory
 	}
 	ns.dir = dir
-	return ns, usage, .None
+	ns.ufd = prim.INVALID_FD
+	upath, _ := prim.path_join(context.temp_allocator, dir, "usage")
+	tdir, _ := prim.path_join(context.temp_allocator, dir, "t")
+	_clear_tmp(fs.vfs, tdir, fs.allocator)
+	ufd, uerr := prim.open_file(fs.vfs, upath, {.Write}, 0o600)
+	if uerr == .None {
+		newest, _, count, serr := slots_read(fs.vfs, ufd, 64)
+		if serr == .None && count > 0 {
+			ns.ufd = ufd
+			ns.usage = newest.value
+			ns.useq = newest.seq
+			return ns, ns.usage, .None
+		}
+		prim.close_file(fs.vfs, ufd)
+	}
+	ns.usage, _ = space_usage_scan(fs.vfs, dir, fs.allocator, fs.lay.base)
+	if fd, cerr := prim.open_file(fs.vfs, upath, {.Write, .Create}, 0o600); cerr == .None {
+		ns.ufd = fd
+		_usage_save(fs, ns)
+	}
+	return ns, ns.usage, .None
 }
 
 @(private)
 _fs_ns_close :: proc(data: rawptr, h: rawptr) {
 	fs := cast(^File_Store)data
 	ns := cast(^_Fns)h
+	if ns.ufd >= 0 {
+		prim.close_file(fs.vfs, ns.ufd)
+	}
 	delete(ns.dir, fs.allocator)
 	free(ns, fs.allocator)
 }
@@ -196,11 +229,40 @@ _fs_stream_read :: proc(data: rawptr, s: rawptr, at: i64, dst: []u8) -> (int, Er
 }
 
 @(private)
-_fs_stream_fd :: proc(data: rawptr, s: rawptr) -> (fd: prim.Fd, base: i64, ok: bool) {
+_fs_stream_extent :: proc(data: rawptr, s: rawptr, at: i64, n: i64) -> (fd: prim.Fd, off: i64, length: i64, ok: bool) {
 	fs := cast(^File_Store)data
 	st := cast(^_Fstream)s
-	return st.fd, fs.lay.base, fs.vfs.procs == prim.os_vfs().procs
+	return _fs_extent(fs, st.fd, fs.lay.base + at, n)
 }
+
+@(private)
+_fs_extent :: proc(fs: ^File_Store, fd: prim.Fd, off: i64, n: i64) -> (prim.Fd, i64, i64, bool) {
+	if fs.vfs.procs == prim.os_vfs().procs {
+		return fd, off, n, true
+	}
+	if fs.resolver.resolve != nil {
+		return fs.resolver.resolve(fs.resolver.data, fd, off, n)
+	}
+	return prim.INVALID_FD, 0, 0, false
+}
+
+@(private)
+_fs_stream_hint :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64, exists: bool) {
+	fs := cast(^File_Store)data
+	ns := cast(^_Fns)h
+	pbuf: prim.Path_Buf = ---
+	fd, err := prim.open_file(fs.vfs, stream_path(&pbuf, ns.dir, id))
+	if err != .None {
+		return 0, false
+	}
+	defer prim.close_file(fs.vfs, fd)
+	newest, _, count, serr := slots_read(fs.vfs, fd, fs.lay.spacing)
+	if serr != .None || count == 0 {
+		return 0, true
+	}
+	return newest.value, true
+}
+
 
 @(private)
 _fs_append_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawptr, err: Error) {
@@ -314,6 +376,7 @@ _fs_drop :: proc(data: rawptr, h: rawptr, id: Stream_Id, done: Storage_Done, ctx
 		vfs    = fs.vfs,
 		lay    = fs.lay,
 		kind  = .Remove,
+		ns    = h,
 		fd    = prim.INVALID_FD,
 		value = max(size - fs.lay.base, 0),
 		done  = done,
@@ -430,6 +493,7 @@ _fs_put_begin :: proc(data: rawptr, h: rawptr, key: Object_Key, total: i64) -> (
 		return nil, false, .No_Memory
 	}
 	p.fd = fd
+	p.ns = h
 	p.total = total
 	e1, e2: Error
 	p.tmp, e1 = _clone_string(tmp, fs.allocator)
@@ -497,6 +561,7 @@ _fs_put_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawptr)
 		vfs    = fs.vfs,
 		lay    = fs.lay,
 		kind  = .Object_Commit,
+		ns    = p.ns,
 		fd    = p.fd,
 		path  = p.tmp,
 		final = p.final,
@@ -556,6 +621,7 @@ _fs_object_remove :: proc(data: rawptr, h: rawptr, key: Object_Key, done: Storag
 	job^ = {
 		vfs   = fs.vfs,
 		kind  = .Remove,
+		ns    = h,
 		fd    = prim.INVALID_FD,
 		value = st.size,
 		done  = done,
@@ -577,11 +643,12 @@ _fs_object_read :: proc(data: rawptr, o: rawptr, at: i64, dst: []u8) -> (int, Er
 }
 
 @(private)
-_fs_object_fd :: proc(data: rawptr, o: rawptr) -> (fd: prim.Fd, base: i64, ok: bool) {
+_fs_object_extent :: proc(data: rawptr, o: rawptr, at: i64, n: i64) -> (fd: prim.Fd, off: i64, length: i64, ok: bool) {
 	fs := cast(^File_Store)data
 	ob := cast(^_Fobj)o
-	return ob.fd, 0, fs.vfs.procs == prim.os_vfs().procs
+	return _fs_extent(fs, ob.fd, at, n)
 }
+
 
 @(private)
 _fs_object_close :: proc(data: rawptr, o: rawptr) {
@@ -599,6 +666,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	case .Stream_Sync:
 		st := cast(^_Fstream)job.target
 		if job.result == .None {
+			_usage_add(fs, st.ns, job.value - st.length)
 			st.length = job.value
 			st.seq = job.seq
 			st.fresh = false
@@ -607,12 +675,18 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 		if job.existed {
 			value = 0
 		}
+		if job.result == .None && job.ns != nil {
+			_usage_add(fs, cast(^_Fns)job.ns, value)
+		}
 	case .Redact:
 		st := cast(^_Fstream)job.target
 		if job.result == .None {
 			st.seq = job.seq
 		}
 	case .Remove:
+		if job.result == .None && job.ns != nil {
+			_usage_add(fs, cast(^_Fns)job.ns, -value)
+		}
 	}
 	done := job.done
 	ctx := job.ctx
@@ -625,4 +699,22 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	}
 	free(job, fs.allocator)
 	done(ctx, result, value)
+}
+
+@(private)
+_usage_add :: proc(fs: ^File_Store, ns: ^_Fns, delta: i64) {
+	if delta == 0 {
+		return
+	}
+	ns.usage = max(ns.usage + delta, 0)
+	_usage_save(fs, ns)
+}
+
+@(private)
+_usage_save :: proc(fs: ^File_Store, ns: ^_Fns) {
+	if ns.ufd < 0 {
+		return
+	}
+	ns.useq += 1
+	slot_write(fs.vfs, ns.ufd, Slot{seq = ns.useq, value = ns.usage, start = 0}, 64)
 }

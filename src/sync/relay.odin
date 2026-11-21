@@ -111,10 +111,17 @@ Space_State :: struct {
 	feed_flight: [dynamic]u8,
 	feed_wait: [dynamic]^Pending,
 	feed_ready: bool,
-	compacting: bool,
+	phase:    Compact_Phase,
+	relay:    ^Relay,
+	compact_buf: [dynamic]u8,
+	compact_timer: prim.Timer,
+	freeze:   bool,
+	compact_busy: bool,
+	compact_it: rawptr,
+	compact_copied: i64,
+	next_epoch: u64,
 	meta:     ^Stream_State,
 	next_feed: ^Stream_State,
-	next_len: i64,
 }
 
 Stream_State :: struct {
@@ -389,11 +396,19 @@ relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := con
 			group = Group_Commit{data = r.own_pack, begin = _pack_begin, end = _pack_end}
 		}
 		if ferr := file_store_init(fs, l, store_vfs, r.root, threads, lay, group, allocator); ferr != .None {
+			if r.own_pack != nil {
+				pack.close(r.own_pack)
+				free(r.own_pack, allocator)
+				r.own_pack = nil
+			}
 			free(fs, allocator)
 			return ferr
 		}
 		r.own_store = fs
 		r.store = file_store(fs)
+		if r.own_pack != nil {
+			fs.resolver = _pack_resolver(r.own_pack)
+		}
 	}
 	if cfg.authorizer.authorize != nil {
 		r.auth = cfg.authorizer
@@ -433,6 +448,12 @@ relay_destroy :: proc(r: ^Relay) {
 	}
 	_reap(r)
 	for _, sp in r.spaces {
+		if sp.compact_timer != 0 {
+			prim.timer_cancel(r.loop, sp.compact_timer)
+		}
+		if sp.compact_it != nil {
+			r.store.list_end(r.store.data, sp.compact_it)
+		}
 		for _, st in sp.streams {
 			if st.h != nil {
 				r.store.stream_close(r.store.data, st.h)
@@ -1162,6 +1183,8 @@ _space_get :: proc(r: ^Relay, id: Space_Id) -> (sp: ^Space_State, err: Error) {
 	sp.feeders = make([dynamic]^Conn, r.allocator)
 	sp.feed_q = make([dynamic]u8, r.allocator)
 	sp.feed_flight = make([dynamic]u8, r.allocator)
+	sp.compact_buf = make([dynamic]u8, r.allocator)
+	sp.relay = r
 	sp.feed_wait = make([dynamic]^Pending, r.allocator)
 	r.spaces[id] = sp
 	return sp, .None
@@ -1169,7 +1192,7 @@ _space_get :: proc(r: ^Relay, id: Space_Id) -> (sp: ^Space_State, err: Error) {
 
 @(private)
 _space_release :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || sp.compacting || len(sp.feed_q) > 0 || len(sp.feed_wait) > 0 || len(sp.streams) > _owned_streams(sp) {
+	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || sp.phase != .Idle || len(sp.feed_q) > 0 || len(sp.feed_wait) > 0 || len(sp.streams) > _owned_streams(sp) {
 		return
 	}
 	for st in ([]^Stream_State{sp.feed, sp.meta}) {
@@ -1192,6 +1215,7 @@ _space_release :: proc(r: ^Relay, sp: ^Space_State) {
 	delete(sp.feeders)
 	delete(sp.feed_q)
 	delete(sp.feed_flight)
+	delete(sp.compact_buf)
 	delete(sp.feed_wait)
 	r.store.namespace_close(r.store.data, sp.ns)
 	free(sp, r.allocator)
@@ -2141,8 +2165,8 @@ _out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
 			for o.left > 0 {
 				k := int(min(o.left, SENDFILE_CHUNK))
 				w: int
-				if fd, base, ok := r.store.stream_fd(r.store.data, st.h); ok && _c_zero_copy(c) {
-					w = _c_sendfile(c, fd, base + o.at, k) or_return
+				if fd, off, ext, ok := r.store.stream_extent(r.store.data, st.h, o.at, i64(k)); ok && ext > 0 && _c_zero_copy(c) {
+					w = _c_sendfile(c, fd, off, int(min(ext, i64(k)))) or_return
 				} else {
 					w = _c_copy(c, r.store.stream_read, st.h, o.at, k) or_return
 				}
@@ -2178,8 +2202,8 @@ _out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
 		for o.left > 0 {
 			k := int(min(o.left, SENDFILE_CHUNK))
 			w: int
-			if fd, base, ok := r.store.object_fd(r.store.data, o.obj); ok && _c_zero_copy(c) {
-				w = _c_sendfile(c, fd, base + o.at, k) or_return
+			if fd, off, ext, ok := r.store.object_extent(r.store.data, o.obj, o.at, i64(k)); ok && ext > 0 && _c_zero_copy(c) {
+				w = _c_sendfile(c, fd, off, int(min(ext, i64(k)))) or_return
 			} else {
 				w = _c_copy(c, r.store.object_read, o.obj, o.at, k) or_return
 			}
@@ -2293,4 +2317,16 @@ _pack_begin :: proc(data: rawptr) {
 @(private)
 _pack_end :: proc(data: rawptr) -> Error {
 	return _from_prim(pack.batch_end(cast(^pack.Pack)data))
+}
+
+@(private)
+_pack_resolver :: proc(p: ^pack.Pack) -> Extent_Resolver {
+	when #defined(pack.extent) {
+		return Extent_Resolver{data = p, resolve = proc(data: rawptr, fd: prim.Fd, off: i64, n: i64) -> (prim.Fd, i64, i64, bool) {
+			ph, ok := pack.extent(cast(^pack.Pack)data, fd, off, n)
+			return ph.fd, ph.off, ph.len, ok
+		}}
+	} else {
+		return {}
+	}
 }

@@ -359,3 +359,20 @@ _redact_records :: proc(vfs: prim.Vfs, fd: prim.Fd, from, to: i64, base: i64) ->
 	}
 	return .None
 }
+
+@(private)
+_clear_tmp :: proc(vfs: prim.Vfs, tdir: string, allocator: runtime.Allocator) {
+	d: prim.Dir
+	if prim.dir_open(vfs, &d, tdir, allocator) != .None {
+		return
+	}
+	defer prim.dir_close(vfs, &d)
+	for {
+		e, ok, derr := prim.dir_next(vfs, &d)
+		if !ok || derr != .None {
+			return
+		}
+		p, _ := prim.path_join(context.temp_allocator, tdir, e.name)
+		prim.remove(vfs, p)
+	}
+}
