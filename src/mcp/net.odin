@@ -83,52 +83,6 @@ _cloexec_nonblock :: proc "contextless" (fd: posix.FD) {
 	prim.set_nonblocking(prim.Fd(fd))
 }
 
-net_connect :: proc(host: string, port: int) -> (fd: prim.Fd, pending: bool, err: prim.Error) {
-	res, rerr := _resolve(host, port, false)
-	if rerr != .None {
-		return prim.INVALID_FD, false, rerr
-	}
-	defer posix.freeaddrinfo(res)
-	last := prim.Error.Not_Found
-	for ai := res; ai != nil; ai = ai.ai_next {
-		s := posix.socket(ai.ai_family, .STREAM, .IP)
-		if s < 0 {
-			last = _net_error(posix.errno())
-			continue
-		}
-		_cloexec_nonblock(s)
-		one: c.int = 1
-		if ai.ai_family == .INET || ai.ai_family == .INET6 {
-			posix.setsockopt(s, c.int(posix.Protocol.TCP), posix.Sock_Option(posix.TCP_NODELAY), &one, size_of(one))
-		}
-		when ODIN_OS == .Darwin {
-			posix.setsockopt(s, posix.SOL_SOCKET, posix.Sock_Option(0x1022), &one, size_of(one))
-		}
-		if posix.connect(s, ai.ai_addr, ai.ai_addrlen) == .OK {
-			return prim.Fd(s), false, .None
-		}
-		e := posix.errno()
-		if e == .EINPROGRESS || e == .EINTR {
-			return prim.Fd(s), true, .None
-		}
-		last = _net_error(e)
-		posix.close(s)
-	}
-	return prim.INVALID_FD, false, last
-}
-
-net_socket_error :: proc "contextless" (fd: prim.Fd) -> prim.Error {
-	v: c.int
-	l := posix.socklen_t(size_of(v))
-	if posix.getsockopt(posix.FD(fd), posix.SOL_SOCKET, .ERROR, &v, &l) != .OK {
-		return _net_error(posix.errno())
-	}
-	if v != 0 {
-		return _net_error(posix.Errno(v))
-	}
-	return .None
-}
-
 net_listen :: proc(host: string, port: int) -> (fd: prim.Fd, bound: int, err: prim.Error) {
 	res, rerr := _resolve(host, port, true)
 	if rerr != .None {

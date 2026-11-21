@@ -14,6 +14,30 @@ Http_Server_Config :: struct {
 	resource_metadata: string,
 	max_body:          int,
 	max_sessions:      int,
+	no_resume:         bool,
+	stream_poll_ms:    i64,
+	retry_ms:          i64,
+	log_bytes:         int,
+	logs_per_session:  int,
+}
+
+@(private)
+Hs_Log_Event :: struct {
+	seq:  u64,
+	data: []u8,
+}
+
+@(private)
+Hs_Log :: struct {
+	conn:   Conn_Id,
+	stream: Stream_Id,
+	seq:    u64,
+	first:  u64,
+	events: [dynamic]Hs_Log_Event,
+	bytes:  int,
+	done:   bool,
+	primed: bool,
+	used:   i64,
 }
 
 @(private)
@@ -51,6 +75,7 @@ Hs_Conn :: struct {
 	is_get:      bool,
 	closed:      bool,
 	needs_next:  bool,
+	poll_t:      prim.Timer,
 }
 
 Http_Server :: struct {
@@ -67,6 +92,7 @@ Http_Server :: struct {
 	loopback:  bool,
 	dead:      [dynamic]^Hs_Conn,
 	kick:      prim.Timer,
+	logs:      [dynamic]^Hs_Log,
 }
 
 http_server_open :: proc(hs: ^Http_Server, s: ^Server, loop: ^prim.Loop, cfg: Http_Server_Config) -> prim.Error {
@@ -86,6 +112,15 @@ http_server_open :: proc(hs: ^Http_Server, s: ^Server, loop: ^prim.Loop, cfg: Ht
 	if hs.cfg.max_sessions <= 0 {
 		hs.cfg.max_sessions = 256
 	}
+	if hs.cfg.retry_ms <= 0 {
+		hs.cfg.retry_ms = 1000
+	}
+	if hs.cfg.log_bytes <= 0 {
+		hs.cfg.log_bytes = 4 << 20
+	}
+	if hs.cfg.logs_per_session <= 0 {
+		hs.cfg.logs_per_session = 32
+	}
 	h := hs.cfg.host
 	hs.loopback = h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]"
 	fd, port, err := net_listen(hs.cfg.host, hs.cfg.port)
@@ -102,6 +137,7 @@ http_server_open :: proc(hs: ^Http_Server, s: ^Server, loop: ^prim.Loop, cfg: Ht
 	hs.lw = w
 	hs.conns = make([dynamic]^Hs_Conn, s.allocator)
 	hs.dead = make([dynamic]^Hs_Conn, s.allocator)
+	hs.logs = make([dynamic]^Hs_Log, s.allocator)
 	hs.sessions = make([dynamic]Hs_Session, s.allocator)
 	hs.modern = server_conn_open(s, Server_Sink{data = hs, send = _hs_sink}, true)
 	hs.next_stream = 1
@@ -137,6 +173,10 @@ http_server_close :: proc(hs: ^Http_Server) {
 		hs.kick = 0
 	}
 	_hs_reap(hs)
+	for len(hs.logs) > 0 {
+		_hs_log_drop(hs, 0)
+	}
+	delete(hs.logs)
 	delete(hs.conns)
 	delete(hs.sessions)
 	delete(hs.dead)
@@ -181,6 +221,10 @@ _hs_kick :: proc(hs: ^Http_Server) {
 
 @(private)
 _hs_finish :: proc(tc: ^Hs_Conn) {
+	if tc.poll_t != 0 {
+		prim.timer_cancel(tc.hs.loop, tc.poll_t)
+		tc.poll_t = 0
+	}
 	tc.state = .Finishing
 	tc.stream = 0
 	tc.needs_next = true
@@ -237,6 +281,10 @@ _hs_close_conn :: proc(tc: ^Hs_Conn) {
 	if tc.w != 0 {
 		prim.unwatch(hs.loop, tc.w)
 		tc.w = 0
+	}
+	if tc.poll_t != 0 {
+		prim.timer_cancel(hs.loop, tc.poll_t)
+		tc.poll_t = 0
 	}
 	net_close(tc.fd)
 	if (tc.state == .Waiting || tc.state == .Streaming) && tc.stream != 0 {
@@ -463,6 +511,14 @@ _hs_drop_session :: proc(hs: ^Http_Server, i: int) {
 	if s.get != nil {
 		_hs_close_conn(s.get)
 	}
+	j := 0
+	for j < len(hs.logs) {
+		if hs.logs[j].conn == s.conn {
+			_hs_log_drop(hs, j)
+			continue
+		}
+		j += 1
+	}
 	server_conn_close(hs.server, s.conn)
 	delete(s.id, hs.server.allocator)
 }
@@ -518,17 +574,31 @@ _hs_request :: proc(tc: ^Hs_Conn) {
 			_hs_simple(tc, 406, "")
 			return
 		}
+		sess.used = prim.mono_ns()
+		if last, has_last := http_header(headers, "last-event-id"); has_last && !hs.cfg.no_resume {
+			_hs_resume(tc, sess, last)
+			return
+		}
 		if sess.get != nil {
 			_hs_simple(tc, 409, _hs_error_body(JSONRPC_INVALID_REQUEST, "a stream is already open for this session"))
 			return
 		}
-		sess.used = prim.mono_ns()
 		sess.get = tc
 		tc.is_get = true
 		tc.mcp = sess.conn
 		tc.stream = 0
 		tc.state = .Streaming
 		_hs_sse_head(tc)
+		if _hs_resumable(hs, sess.conn) {
+			log := _hs_log(hs, sess.conn, 0, true)
+			ev := make(Buf, context.temp_allocator)
+			_hs_event_id(&ev, 0, log.seq)
+			append(&ev, "data: \n\n")
+			frame := make(Buf, context.temp_allocator)
+			http_write_chunk(&frame, ev[:])
+			_hs_write(tc, frame[:])
+		}
+		_hs_arm_poll(tc)
 		return
 	case "DELETE":
 		if !has_sid {
@@ -637,7 +707,233 @@ _hs_request :: proc(tc: ^Hs_Conn) {
 	} else if res == .Rejected && tc.state == .Waiting {
 		tc.stream = 0
 		_hs_simple(tc, 400, "")
+	} else if res == .Request && tc.state == .Waiting && hs.cfg.stream_poll_ms > 0 && _hs_resumable(hs, conn) {
+		log := _hs_log(hs, conn, tc.stream, true)
+		_hs_start_sse(tc, log)
+		_hs_arm_poll(tc)
 	}
+}
+
+@(private)
+_hs_resumable :: proc(hs: ^Http_Server, conn: Conn_Id) -> bool {
+	return !hs.cfg.no_resume && conn != hs.modern && server_conn_version(hs.server, conn) >= .V2025_03_26
+}
+
+@(private)
+_hs_log :: proc(hs: ^Http_Server, conn: Conn_Id, stream: Stream_Id, create: bool) -> ^Hs_Log {
+	for l in hs.logs {
+		if l.conn == conn && l.stream == stream {
+			l.used = prim.mono_ns()
+			return l
+		}
+	}
+	if !create {
+		return nil
+	}
+	count := 0
+	for l in hs.logs {
+		if l.conn == conn {
+			count += 1
+		}
+	}
+	for count >= hs.cfg.logs_per_session {
+		oldest := -1
+		for l, i in hs.logs {
+			if l.conn == conn && l.stream != 0 && (oldest < 0 || (l.done && !hs.logs[oldest].done) || (l.done == hs.logs[oldest].done && l.used < hs.logs[oldest].used)) {
+				oldest = i
+			}
+		}
+		if oldest < 0 {
+			break
+		}
+		_hs_log_drop(hs, oldest)
+		count -= 1
+	}
+	l := new(Hs_Log, hs.server.allocator)
+	l.conn = conn
+	l.stream = stream
+	l.first = 1
+	l.used = prim.mono_ns()
+	l.events = make([dynamic]Hs_Log_Event, hs.server.allocator)
+	append(&hs.logs, l)
+	return l
+}
+
+@(private)
+_hs_log_drop :: proc(hs: ^Http_Server, i: int) {
+	l := hs.logs[i]
+	ordered_remove(&hs.logs, i)
+	for e in l.events {
+		delete(e.data, hs.server.allocator)
+	}
+	delete(l.events)
+	free(l, hs.server.allocator)
+}
+
+@(private)
+_hs_log_append :: proc(hs: ^Http_Server, l: ^Hs_Log, body: []u8) -> u64 {
+	l.seq += 1
+	data := make([]u8, len(body), hs.server.allocator)
+	copy(data, body)
+	append(&l.events, Hs_Log_Event{seq = l.seq, data = data})
+	l.bytes += len(body)
+	for l.bytes > hs.cfg.log_bytes && len(l.events) > 1 {
+		e := l.events[0]
+		l.bytes -= len(e.data)
+		delete(e.data, hs.server.allocator)
+		ordered_remove(&l.events, 0)
+		l.first = l.events[0].seq
+	}
+	return l.seq
+}
+
+@(private)
+_hs_event_id :: proc(b: ^Buf, stream: Stream_Id, seq: u64) {
+	append(b, "id: ")
+	w_int(b, i64(stream))
+	append(b, '-')
+	w_int(b, i64(seq))
+	append(b, '\n')
+}
+
+@(private)
+_hs_start_sse :: proc(tc: ^Hs_Conn, log: ^Hs_Log) {
+	tc.state = .Streaming
+	_hs_sse_head(tc)
+	_hs_arm_poll(tc)
+	if log == nil || log.primed || server_conn_version(tc.hs.server, tc.mcp) < .V2025_11_25 {
+		return
+	}
+	log.primed = true
+	ev := make(Buf, context.temp_allocator)
+	_hs_event_id(&ev, log.stream, 0)
+	append(&ev, "data: \n\n")
+	frame := make(Buf, context.temp_allocator)
+	http_write_chunk(&frame, ev[:])
+	_hs_write(tc, frame[:])
+}
+
+@(private)
+_hs_write_event :: proc(tc: ^Hs_Conn, stream: Stream_Id, seq: u64, body: []u8, final: bool) {
+	ev := make(Buf, 0, len(body) + 48, context.temp_allocator)
+	if seq > 0 {
+		_hs_event_id(&ev, stream, seq)
+	}
+	append(&ev, "event: message\ndata: ")
+	append(&ev, ..body)
+	append(&ev, "\n\n")
+	frame := make(Buf, 0, len(ev) + 16, context.temp_allocator)
+	http_write_chunk(&frame, ev[:])
+	if final {
+		append(&frame, "0\r\n\r\n")
+	}
+	_hs_write(tc, frame[:])
+	if final && !tc.closed {
+		_hs_finish(tc)
+	}
+}
+
+@(private)
+_hs_arm_poll :: proc(tc: ^Hs_Conn) {
+	hs := tc.hs
+	if hs.cfg.stream_poll_ms <= 0 || !_hs_resumable(hs, tc.mcp) || tc.poll_t != 0 {
+		return
+	}
+	tc.poll_t = prim.timer(hs.loop, hs.cfg.stream_poll_ms, tc, proc(l: ^prim.Loop, data: rawptr) {
+		tc := (^Hs_Conn)(data)
+		tc.poll_t = 0
+		if tc.closed || tc.state != .Streaming {
+			return
+		}
+		b := make(Buf, context.temp_allocator)
+		append(&b, "retry: ")
+		w_int(&b, tc.hs.cfg.retry_ms)
+		append(&b, "\n\n")
+		frame := make(Buf, context.temp_allocator)
+		http_write_chunk(&frame, b[:])
+		append(&frame, "0\r\n\r\n")
+		if tc.is_get {
+			for &s in tc.hs.sessions {
+				if s.get == tc {
+					s.get = nil
+				}
+			}
+		}
+		_hs_write(tc, frame[:])
+		if !tc.closed {
+			_hs_finish(tc)
+		}
+	})
+}
+
+@(private)
+_hs_resume :: proc(tc: ^Hs_Conn, sess: ^Hs_Session, last: string) {
+	hs := tc.hs
+	dash := strings.index_byte(last, '-')
+	stream_n, sok := i64(0), false
+	seq_n, qok := i64(0), false
+	if dash > 0 {
+		stream_n, sok = json_int(last[:dash])
+		seq_n, qok = json_int(last[dash + 1:])
+	}
+	if !sok || !qok || stream_n < 0 || seq_n < 0 {
+		_hs_simple(tc, 400, _hs_error_body(JSONRPC_INVALID_REQUEST, "invalid Last-Event-ID"))
+		return
+	}
+	stream := Stream_Id(stream_n)
+	log := _hs_log(hs, sess.conn, stream, stream == 0)
+	if log == nil || (u64(seq_n) + 1 < log.first && len(log.events) > 0) || u64(seq_n) > log.seq {
+		_hs_simple(tc, 400, _hs_error_body(JSONRPC_INVALID_REQUEST, "stream cannot be resumed"))
+		return
+	}
+	if stream == 0 {
+		if sess.get != nil {
+			old := sess.get
+			sess.get = nil
+			_hs_close_conn(old)
+		}
+		sess.get = tc
+		tc.is_get = true
+	} else {
+		for x in hs.conns {
+			if x != tc && x.mcp == sess.conn && x.stream == stream && (x.state == .Waiting || x.state == .Streaming) {
+				_hs_close_conn(x)
+				break
+			}
+		}
+		tc.is_get = false
+	}
+	tc.mcp = sess.conn
+	tc.stream = stream
+	tc.state = .Streaming
+	_hs_sse_head(tc)
+	count := 0
+	for e in log.events {
+		if e.seq > u64(seq_n) {
+			count += 1
+		}
+	}
+	sent := 0
+	for e in log.events {
+		if e.seq <= u64(seq_n) {
+			continue
+		}
+		sent += 1
+		_hs_write_event(tc, stream, e.seq, e.data, log.done && sent == count && stream != 0)
+		if tc.closed || tc.state != .Streaming {
+			return
+		}
+	}
+	if log.done && stream != 0 && tc.state == .Streaming {
+		frame := make(Buf, context.temp_allocator)
+		append(&frame, "0\r\n\r\n")
+		_hs_write(tc, frame[:])
+		if !tc.closed {
+			_hs_finish(tc)
+		}
+		return
+	}
+	_hs_arm_poll(tc)
 }
 
 @(private)
@@ -676,7 +972,28 @@ _hs_find :: proc(hs: ^Http_Server, conn: Conn_Id, stream: Stream_Id) -> ^Hs_Conn
 _hs_sink :: proc(data: rawptr, s: ^Server, conn: Conn_Id, stream: Stream_Id, body: []u8, final: bool, status: int) {
 	hs := (^Http_Server)(data)
 	tc := _hs_find(hs, conn, stream)
-	if tc == nil || tc.closed {
+	if tc != nil && tc.closed {
+		tc = nil
+	}
+	if _hs_resumable(hs, conn) && !(tc != nil && tc.state == .Waiting && final) {
+		log := _hs_log(hs, conn, stream, true)
+		seq := _hs_log_append(hs, log, body)
+		if final && stream != 0 {
+			log.done = true
+		}
+		if tc == nil {
+			return
+		}
+		if tc.state == .Waiting {
+			_hs_start_sse(tc, log)
+			if tc.closed {
+				return
+			}
+		}
+		_hs_write_event(tc, stream, seq, body, final && !tc.is_get)
+		return
+	}
+	if tc == nil {
 		return
 	}
 	if tc.state == .Waiting && final {

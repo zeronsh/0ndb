@@ -4,6 +4,8 @@ import "base:runtime"
 import "core:encoding/base64"
 import "core:strconv"
 import "core:strings"
+import "../http"
+import "../jsonschema"
 import "../prim"
 
 Transport_Kind :: enum u8 {
@@ -56,10 +58,7 @@ Watch_Flag :: enum u8 {
 
 Watch_Flags :: bit_set[Watch_Flag;u8]
 
-Header :: struct {
-	name:  string,
-	value: string,
-}
+Header :: http.Header
 
 Outgoing_Kind :: enum u8 {
 	Request,
@@ -101,6 +100,10 @@ Event_Kind :: enum u8 {
 	Notification,
 	Stderr,
 	Auth_Required,
+	Authorize,
+	Authorized,
+	Task,
+	Task_Status,
 	Warning,
 }
 
@@ -145,6 +148,8 @@ Client_Config :: struct {
 	max_pages:          int,
 	watch:              Watch_Flags,
 	log_level:          Log_Level,
+	tasks:              bool,
+	no_validation:      bool,
 }
 
 DEFAULT_PROBE_TIMEOUT_MS :: 30_000
@@ -199,6 +204,20 @@ Pending :: struct {
 	retry_url:   bool,
 	refresh:     Call,
 	waiting:     bool,
+	task_id:     string,
+	task_phase:  Task_Phase,
+	task_due:    i64,
+	task_poll:   i64,
+	task_seen:   [dynamic]string,
+	task_status: Task_Status,
+}
+
+@(private)
+Task_Phase :: enum u8 {
+	None,
+	Wait,
+	Get,
+	Update,
 }
 
 @(private)
@@ -253,6 +272,17 @@ Client :: struct {
 	legacy_level:  Log_Level,
 	probe_tried:   Versions,
 	internal:      [dynamic]Call,
+	ext_buf:       string,
+	schemas:       jsonschema.Registry,
+	reg_ready:     bool,
+	out_schemas:   [dynamic]Out_Schema,
+}
+
+@(private)
+Out_Schema :: struct {
+	name:   string,
+	schema: jsonschema.Schema,
+	ok:     bool,
 }
 
 client_init :: proc(c: ^Client, cfg: Client_Config, sink: Client_Sink, allocator := context.allocator) {
@@ -290,6 +320,21 @@ client_init :: proc(c: ^Client, cfg: Client_Config, sink: Client_Sink, allocator
 	c.tool_headers = make([dynamic]Tool_Headers, allocator)
 	c.sub_uris = make([dynamic]string, allocator)
 	c.internal = make([dynamic]Call, allocator)
+	c.out_schemas = make([dynamic]Out_Schema, allocator)
+	if c.cfg.tasks && !client_has_tasks(c.cfg.capabilities) {
+		b := make(Buf, allocator)
+		inner := json_trim(c.cfg.capabilities.extensions)
+		append(&b, '{')
+		w_str(&b, TASKS_EXTENSION)
+		append(&b, ":{}")
+		if len(inner) > 2 && inner[0] == '{' {
+			append(&b, ',')
+			append(&b, inner[1:len(inner) - 1])
+		}
+		append(&b, '}')
+		c.ext_buf = string(b[:])
+		c.cfg.capabilities.extensions = c.ext_buf
+	}
 }
 
 client_destroy :: proc(c: ^Client) {
@@ -308,6 +353,9 @@ client_destroy :: proc(c: ^Client) {
 	}
 	delete(c.sub_uris)
 	delete(c.internal)
+	delete(c.ext_buf, c.allocator)
+	_out_schemas_clear(c)
+	delete(c.out_schemas)
 	for &lc in c.caches {
 		delete(lc.json, c.allocator)
 	}
@@ -371,6 +419,11 @@ _pending_free :: proc(c: ^Client, p: ^Pending) {
 	delete(p.name, c.allocator)
 	delete(p.state, c.allocator)
 	delete(p.last_cursor, c.allocator)
+	delete(p.task_id, c.allocator)
+	for k in p.task_seen {
+		delete(k, c.allocator)
+	}
+	delete(p.task_seen)
 	for &s in p.inputs {
 		_input_slot_free(c, &s)
 	}
@@ -549,6 +602,13 @@ client_transport_lost :: proc(c: ^Client, reason: string) {
 		if p.op == .Discover || p.op == .Initialize || p.op == .Listen || p.op == .Set_Level || p.op == .Ping {
 			ordered_remove(&c.pending, i)
 			_pending_free(c, p)
+			continue
+		}
+		if p.task_id != "" {
+			p.sent = false
+			p.task_phase = .None
+			p.deadline = 0
+			i += 1
 			continue
 		}
 		if p.sent {
@@ -1066,6 +1126,12 @@ client_cancel :: proc(c: ^Client, call: Call, reason := "") -> bool {
 	if p == nil {
 		return false
 	}
+	if p.task_id != "" {
+		_task_cancel(c, p)
+		_detach(c, p)
+		_pending_free(c, p)
+		return true
+	}
 	_abort(c, p, reason)
 	_detach(c, p)
 	_pending_free(c, p)
@@ -1092,7 +1158,11 @@ client_answer :: proc(c: ^Client, input: Input, result: string) -> bool {
 			if s.id == input && !s.answered {
 				s.response = _clone(c, r)
 				s.answered = true
-				_maybe_retry(c, p)
+				if p.task_id != "" {
+					_task_answered(c, p)
+				} else {
+					_maybe_retry(c, p)
+				}
 				return true
 			}
 		}
@@ -1161,6 +1231,12 @@ client_next_deadline :: proc(c: ^Client) -> (deadline: i64, ok: bool) {
 		deadline = c.listen_retry
 		ok = true
 	}
+	for p in c.pending {
+		if p.task_phase == .Wait && c.state == .Ready && (!ok || p.task_due < deadline) {
+			deadline = p.task_due
+			ok = true
+		}
+	}
 	return
 }
 
@@ -1169,6 +1245,22 @@ client_tick :: proc(c: ^Client) {
 	if c.listen_retry > 0 && now >= c.listen_retry {
 		c.listen_retry = 0
 		_resubscribe(c)
+	}
+	if c.state == .Ready {
+		due := make([dynamic]^Pending, context.temp_allocator)
+		for p in c.pending {
+			if p.task_phase == .Wait && now >= p.task_due {
+				append(&due, p)
+			}
+		}
+		for p in due {
+			for q in c.pending {
+				if q == p && p.task_phase == .Wait {
+					_task_get(c, p)
+					break
+				}
+			}
+		}
 	}
 	for {
 		var_p: ^Pending
@@ -1536,6 +1628,18 @@ _on_result :: proc(c: ^Client, p: ^Pending, result: string) {
 		return
 	case .Raw, .Tools_List, .Tools_Call, .Resources_List, .Resource_Templates_List, .Resources_Read, .Prompts_List, .Prompts_Get, .Complete, .Subscribe, .Unsubscribe:
 	}
+	if p.task_id != "" {
+		_on_task_response(c, p, result)
+		return
+	}
+	if rt == "task" {
+		if p.op != .Tools_Call || !client_has_tasks(c.cfg.capabilities) {
+			_fail(c, p, "server returned a task for a request that cannot carry one")
+			return
+		}
+		_on_task_created(c, p, result)
+		return
+	}
 	if rt == "input_required" {
 		if p.op != .Tools_Call && p.op != .Prompts_Get && p.op != .Resources_Read && p.op != .Raw {
 			_fail(c, p, "input_required is not allowed for this request")
@@ -1562,6 +1666,12 @@ _on_result :: proc(c: ^Client, p: ^Pending, result: string) {
 		_on_page(c, p, result, "prompts")
 		return
 	case .Raw, .Discover, .Initialize, .Tools_Call, .Resources_Read, .Prompts_Get, .Complete, .Subscribe, .Unsubscribe, .Listen, .Set_Level, .Ping:
+	}
+	if p.op == .Tools_Call {
+		if why, ok := _check_tool_result(c, p.name, result); !ok {
+			_fail(c, p, why)
+			return
+		}
 	}
 	call, op := p.call, p.op
 	_detach(c, p)
@@ -1676,6 +1786,7 @@ _on_page :: proc(c: ^Client, p: ^Pending, result: string, field: string) {
 	out := string(b[:])
 	if p.op == .Tools_List {
 		_store_tool_headers(c, out)
+		_store_out_schemas(c, out)
 	}
 	lc := &c.caches[p.op]
 	delete(lc.json, c.allocator)
@@ -1830,6 +1941,12 @@ _become_ready :: proc(c: ^Client) {
 			}
 		}
 		if still && !p.sent {
+			if p.task_id != "" {
+				p.task_phase = .Wait
+				p.task_due = _now(c)
+				p.sent = true
+				continue
+			}
 			_dispatch(c, p)
 		}
 	}
@@ -1936,6 +2053,14 @@ _on_notification :: proc(c: ^Client, m: ^Message) {
 	case "notifications/resources/updated":
 		uri, _ := json_get_string(params, "uri")
 		_emit(c, Event{kind = .Resource_Updated, message = uri})
+	case "notifications/tasks":
+		tid, _ := json_get_string(params, "taskId")
+		for p in c.pending {
+			if p.task_id != "" && p.task_id == tid && p.task_phase == .Wait {
+				_task_handle(c, p, params)
+				return
+			}
+		}
 	case "notifications/elicitation/complete":
 		eid, _ := json_get_string(params, "elicitationId")
 		_emit(c, Event{kind = .Elicitation_Complete, message = eid})
@@ -2084,6 +2209,10 @@ client_stream_lost :: proc(c: ^Client, id: i64) {
 		_pending_free(c, p)
 		c.era = .Legacy
 		_send_initialize(c)
+		return
+	}
+	if p.task_id != "" {
+		_task_wait(c, p)
 		return
 	}
 	p.attempts += 1
@@ -2415,5 +2544,49 @@ client_fail_request :: proc(c: ^Client, id: i64, code: i64, message: string, dat
 	_pending_free(c, p)
 	if call != 0 {
 		_emit(c, Event{kind = .Error, call = call, op = op, local = true, code = code, message = message, data = data})
+	}
+}
+
+@(private)
+_out_schemas_clear :: proc(c: ^Client) {
+	for o in c.out_schemas {
+		delete(o.name, c.allocator)
+	}
+	clear(&c.out_schemas)
+	if c.reg_ready {
+		jsonschema.registry_destroy(&c.schemas)
+		c.reg_ready = false
+	}
+}
+
+@(private)
+_store_out_schemas :: proc(c: ^Client, list: string) {
+	_out_schemas_clear(c)
+	if c.cfg.no_validation {
+		return
+	}
+	arr, _ := json_get_array(list, "tools")
+	it, _ := json_array(arr)
+	for tool in json_next_item(&it) {
+		schema, has := json_get_object(tool, "outputSchema")
+		if !has {
+			continue
+		}
+		name, _ := json_get_string(tool, "name")
+		entry := Out_Schema{name = _clone(c, name)}
+		if schema_dialect_supported(schema) {
+			if !c.reg_ready {
+				if jsonschema.registry_init(&c.schemas) != .None {
+					delete(entry.name, c.allocator)
+					return
+				}
+				c.reg_ready = true
+			}
+			entry.schema, entry.ok = _schema_compile(&c.schemas, schema)
+		}
+		if !entry.ok {
+			_emit(c, Event{kind = .Warning, message = "output schema cannot be validated (unsupported dialect or invalid schema)", data = name})
+		}
+		append(&c.out_schemas, entry)
 	}
 }

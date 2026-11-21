@@ -5,6 +5,7 @@ import "core:encoding/base64"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
+import "../jsonschema"
 
 Ref :: distinct u64
 
@@ -49,6 +50,8 @@ Tool_Def :: struct {
 	handler:       Request_Handler,
 	data:          rawptr,
 	param_headers: bool,
+	schema:        jsonschema.Schema,
+	validate:      bool,
 }
 
 Server_Handlers :: struct {
@@ -79,6 +82,11 @@ Server_Config :: struct {
 	resources_list_changed: bool,
 	prompts_list_changed: bool,
 	omit_server_info:   bool,
+	tasks:              bool,
+	task_ttl_ms:        i64,
+	task_poll_ms:       i64,
+	max_tasks:          int,
+	no_validation:      bool,
 	extensions:         string,
 	experimental:       string,
 	handlers:           Server_Handlers,
@@ -126,6 +134,9 @@ Active :: struct {
 	sub_uris:   [dynamic]string,
 	in_handler: bool,
 	done:       bool,
+	task:       ^Server_Task,
+	sub_tasks:  [dynamic]string,
+	tool_input: string,
 }
 
 @(private)
@@ -160,6 +171,11 @@ Server :: struct {
 	next_ref:  u64,
 	next_conn: u64,
 	caps:      Server_Capabilities,
+	tasks:     [dynamic]^Server_Task,
+	ext_buf:   string,
+	schemas:   jsonschema.Registry,
+	reg_ready: bool,
+	dead:      int,
 }
 
 Feed_Result :: enum u8 {
@@ -187,6 +203,16 @@ server_init :: proc(s: ^Server, cfg: Server_Config, allocator := context.allocat
 	s.conns = make([dynamic]^Conn, allocator)
 	s.next_ref = 1
 	s.next_conn = 1
+	s.tasks = make([dynamic]^Server_Task, allocator)
+	if s.cfg.task_ttl_ms == 0 {
+		s.cfg.task_ttl_ms = 3_600_000
+	}
+	if s.cfg.task_poll_ms <= 0 {
+		s.cfg.task_poll_ms = 1000
+	}
+	if s.cfg.max_tasks <= 0 {
+		s.cfg.max_tasks = 10_000
+	}
 	_server_caps(s)
 }
 
@@ -219,10 +245,33 @@ _server_caps :: proc(s: ^Server) {
 	if s.cfg.logging {
 		c += {.Logging}
 	}
-	s.caps = Server_Capabilities{caps = c, extensions = s.cfg.extensions, experimental = s.cfg.experimental}
+	ext := s.cfg.extensions
+	if s.cfg.tasks {
+		b := make(Buf, s.allocator)
+		inner := json_trim(ext)
+		append(&b, '{')
+		w_str(&b, TASKS_EXTENSION)
+		append(&b, ":{}")
+		if len(inner) > 2 && inner[0] == '{' {
+			append(&b, ',')
+			append(&b, inner[1:len(inner) - 1])
+		}
+		append(&b, '}')
+		s.ext_buf = string(b[:])
+		ext = s.ext_buf
+	}
+	s.caps = Server_Capabilities{caps = c, extensions = ext, experimental = s.cfg.experimental}
 }
 
 server_destroy :: proc(s: ^Server) {
+	for t in s.tasks {
+		_task_free(s, t)
+	}
+	delete(s.tasks)
+	delete(s.ext_buf, s.allocator)
+	if s.reg_ready {
+		jsonschema.registry_destroy(&s.schemas)
+	}
 	for a in s.actives {
 		_active_free(s, a)
 	}
@@ -273,6 +322,10 @@ _active_free :: proc(s: ^Server, a: ^Active) {
 		delete(u, s.allocator)
 	}
 	delete(a.sub_uris)
+	for u in a.sub_tasks {
+		delete(u, s.allocator)
+	}
+	delete(a.sub_tasks)
 	free(a, s.allocator)
 }
 
@@ -315,15 +368,26 @@ server_add_tool :: proc(s: ^Server, t: Tool_Def) -> bool {
 	if sc.reason != "" {
 		return false
 	}
+	if !s.cfg.no_validation && !schema_dialect_supported(schema) {
+		return false
+	}
 	for &x in s.tools {
 		if x.name == t.name {
 			_tool_free(s, &x)
+			s.dead += 1
 			x = _tool_clone(s, t, schema)
+			if !_tool_compile(s, &x) {
+				return false
+			}
 			_tools_changed(s)
 			return true
 		}
 	}
 	nt := _tool_clone(s, t, schema)
+	if !_tool_compile(s, &nt) {
+		_tool_free(s, &nt)
+		return false
+	}
 	idx, _ := slice.binary_search_by(s.tools[:], nt.name, proc(a: Tool_Def, name: string) -> slice.Ordering {
 		return slice.cmp(a.name, name)
 	})
@@ -354,6 +418,7 @@ server_remove_tool :: proc(s: ^Server, name: string) -> bool {
 		if t.name == name {
 			_tool_free(s, &t)
 			ordered_remove(&s.tools, i)
+			s.dead += 1
 			_tools_changed(s)
 			return true
 		}
@@ -508,6 +573,14 @@ server_conn_legacy :: proc(s: ^Server, id: Conn_Id) -> bool {
 	return c != nil && c.legacy
 }
 
+server_conn_version :: proc(s: ^Server, id: Conn_Id) -> Version {
+	c := _conn(s, id)
+	if c == nil || !c.legacy {
+		return .None
+	}
+	return c.version
+}
+
 server_conn_initialized :: proc(s: ^Server, id: Conn_Id) -> bool {
 	c := _conn(s, id)
 	return c != nil && c.legacy && c.initialized
@@ -540,7 +613,7 @@ server_conn_close :: proc(s: ^Server, id: Conn_Id) {
 server_stream_closed :: proc(s: ^Server, conn: Conn_Id, stream: Stream_Id) {
 	refs := make([dynamic]Ref, context.temp_allocator)
 	for a in s.actives {
-		if a.conn == conn && a.stream == stream && stream != 0 {
+		if a.conn == conn && a.stream == stream && stream != 0 && a.task == nil {
 			append(&refs, a.ref)
 		}
 	}
@@ -790,7 +863,7 @@ _header_check :: proc(s: ^Server, http: ^Http_Meta, m: ^Message, version: string
 	if hm != m.method {
 		return "Mcp-Method header does not match the request body", false
 	}
-	needs_name := m.method == "tools/call" || m.method == "resources/read" || m.method == "prompts/get"
+	needs_name := m.method == "tools/call" || m.method == "resources/read" || m.method == "prompts/get" || m.method == "tasks/get" || m.method == "tasks/update" || m.method == "tasks/cancel"
 	hn, has_n := http_header(http.headers, "mcp-name")
 	if needs_name && !has_n {
 		return "missing Mcp-Name header", false
@@ -965,6 +1038,9 @@ _on_client_request :: proc(s: ^Server, c: ^Conn, stream: Stream_Id, m: ^Message,
 			tool = _find_tool(s, req.name)
 		}
 		name_src := req.uri if m.method == "resources/read" else req.name
+		if strings.has_prefix(m.method, "tasks/") {
+			name_src, _ = json_get_string(req.params, "taskId")
+		}
 		if reason, ok := _header_check(s, http, m, version_name(req.version), name_src, tool); !ok {
 			_reply_error(s, c.id, stream, m.id, MCP_HEADER_MISMATCH, reason, "", 400)
 			return
@@ -1071,6 +1147,13 @@ _dispatch_request :: proc(s: ^Server, c: ^Conn, stream: Stream_Id, m: ^Message, 
 		}
 		_send_result(s, c.id, stream, m.id, "{}")
 		return
+	case "tasks/get", "tasks/update", "tasks/cancel":
+		if !modern || !s.cfg.tasks {
+			_reply_error(s, c.id, stream, m.id, JSONRPC_METHOD_NOT_FOUND, "method not found", "", status_nf)
+			return
+		}
+		_on_task_request(s, c, stream, m, req)
+		return
 	case "subscriptions/listen":
 		if !modern {
 			_reply_error(s, c.id, stream, m.id, JSONRPC_METHOD_NOT_FOUND, "method not found", "", status_nf)
@@ -1093,6 +1176,15 @@ _dispatch_request :: proc(s: ^Server, c: ^Conn, stream: Stream_Id, m: ^Message, 
 		}
 		if req.arguments == "" {
 			req.arguments = "{}"
+		}
+		if ok, why := _tool_validate(s, tool, req.arguments); !ok {
+			b := make(Buf, context.temp_allocator)
+			append(&b, `{"content":[{"type":"text","text":`)
+			w_str(&b, strings.concatenate({"Invalid arguments for tool ", req.name, ": ", why}, context.temp_allocator))
+			append(&b, `}],"isError":true`)
+			_write_result_tail(s, &b, modern)
+			_send_result(s, c.id, stream, m.id, string(b[:]))
+			return
 		}
 		_start(s, c, stream, m, req, tool.handler, tool.data)
 		return
@@ -1354,6 +1446,21 @@ _on_listen :: proc(s: ^Server, c: ^Conn, stream: Stream_Id, m: ^Message, req: ^R
 	a.sub_tools = json_get_bool(filt, "toolsListChanged") && .Tools_List_Changed in caps
 	a.sub_prompts = json_get_bool(filt, "promptsListChanged") && .Prompts_List_Changed in caps
 	a.sub_resources = json_get_bool(filt, "resourcesListChanged") && .Resources_List_Changed in caps
+	a.sub_tasks = make([dynamic]string, s.allocator)
+	if ids, iok := json_get_array(filt, "taskIds"); iok {
+		if !s.cfg.tasks || !client_has_tasks(req.client) {
+			_active_free(s, a)
+			_reply_error(s, c.id, stream, m.id, MCP_MISSING_CLIENT_CAPABILITY, "Missing required client capability", TASKS_REQUIRED_DATA, 400 if c.http else 200)
+			return
+		}
+		it, _ := json_array(ids)
+		for v in json_next_item(&it) {
+			tid, tok := json_string(v)
+			if tok && _task_visible(s, tid, req.authorization) != nil {
+				append(&a.sub_tasks, _sclone(s, tid))
+			}
+		}
+	}
 	if arr, aok := json_get_array(filt, "resourceSubscriptions"); aok && .Resources_Subscribe in caps {
 		it, _ := json_array(arr)
 		for v in json_next_item(&it) {
@@ -1382,6 +1489,20 @@ _on_listen :: proc(s: ^Server, c: ^Conn, stream: Stream_Id, m: ^Message, req: ^R
 	}
 	if a.sub_resources {
 		add(&b, &first, "resourcesListChanged")
+	}
+	if len(a.sub_tasks) > 0 {
+		if !first {
+			append(&b, ',')
+		}
+		first = false
+		append(&b, `"taskIds":[`)
+		for u, i in a.sub_tasks {
+			if i > 0 {
+				append(&b, ',')
+			}
+			w_str(&b, u)
+		}
+		append(&b, ']')
 	}
 	if len(a.sub_uris) > 0 {
 		if !first {
@@ -1422,6 +1543,10 @@ _finish_raw :: proc(s: ^Server, a: ^Active, body: []u8) {
 
 @(private)
 _finish_error :: proc(s: ^Server, a: ^Active, code: i64, message: string, data: string) {
+	if a.task != nil {
+		_task_fail(s, a, code, message, data)
+		return
+	}
 	b := make(Buf, context.temp_allocator)
 	write_response_error(&b, a.id, code, message, data)
 	status := 200
@@ -1440,6 +1565,9 @@ server_result :: proc(s: ^Server, ref: Ref, members: string) -> bool {
 	a := _active(s, ref)
 	if a == nil || a.kind != .Call {
 		return false
+	}
+	if a.task != nil {
+		return _task_complete(s, a, members)
 	}
 	b := make(Buf, 0, len(members) + 128, context.temp_allocator)
 	append(&b, `{"jsonrpc":"2.0","id":`)
@@ -1522,6 +1650,9 @@ server_error :: proc(s: ^Server, ref: Ref, code: i64, message: string, data := "
 	if a == nil || a.kind != .Call {
 		return false
 	}
+	if a.task != nil {
+		return _task_fail(s, a, code, message, json_trim(data))
+	}
 	_finish_error(s, a, code, message, json_trim(data))
 	return true
 }
@@ -1575,6 +1706,12 @@ server_input_required :: proc(s: ^Server, ref: Ref, input_requests: string, requ
 	if count == 0 && !has_state {
 		_finish_error(s, a, JSONRPC_INTERNAL_ERROR, "input_required needs inputRequests or requestState", "")
 		return false
+	}
+	if a.task != nil {
+		if missing != {} {
+			return _task_fail(s, a, MCP_MISSING_CLIENT_CAPABILITY, "Missing required client capability", "")
+		}
+		return _task_input(s, a, reqs, request_state, has_state)
 	}
 	if missing != {} {
 		d := make(Buf, context.temp_allocator)
@@ -1649,7 +1786,7 @@ server_input_required :: proc(s: ^Server, ref: Ref, input_requests: string, requ
 
 server_progress :: proc(s: ^Server, ref: Ref, progress: f64, total: f64 = -1, message := "") -> bool {
 	a := _active(s, ref)
-	if a == nil || a.progress == "" {
+	if a == nil || a.progress == "" || a.task != nil {
 		return false
 	}
 	if a.has_prog && progress <= a.last_prog {
@@ -1677,7 +1814,7 @@ server_log :: proc(s: ^Server, ref: Ref, level: Log_Level, data: string, logger 
 		return false
 	}
 	a := _active(s, ref)
-	if a == nil {
+	if a == nil || a.task != nil {
 		return false
 	}
 	threshold := a.log_level
@@ -1715,4 +1852,50 @@ server_request_client :: proc(s: ^Server, ref: Ref) -> (caps: Client_Capabilitie
 		return
 	}
 	return a.caps, a.version, true
+}
+
+@(private)
+_tool_compile :: proc(s: ^Server, t: ^Tool_Def) -> bool {
+	t.validate = false
+	if s.cfg.no_validation {
+		return true
+	}
+	if s.reg_ready && s.dead > 16 && s.dead > len(s.tools) {
+		jsonschema.registry_destroy(&s.schemas)
+		s.reg_ready = false
+		s.dead = 0
+		for &x in s.tools {
+			if &x != t {
+				x.validate = false
+				if !s.reg_ready {
+					if jsonschema.registry_init(&s.schemas) != .None {
+						return false
+					}
+					s.reg_ready = true
+				}
+				x.schema, x.validate = _schema_compile(&s.schemas, x.input_schema)
+			}
+		}
+	}
+	if !s.reg_ready {
+		if jsonschema.registry_init(&s.schemas) != .None {
+			return false
+		}
+		s.reg_ready = true
+	}
+	compiled, ok := _schema_compile(&s.schemas, t.input_schema)
+	if !ok {
+		return false
+	}
+	t.schema = compiled
+	t.validate = true
+	return true
+}
+
+@(private)
+_tool_validate :: proc(s: ^Server, t: ^Tool_Def, arguments: string) -> (bool, string) {
+	if !t.validate {
+		return true, ""
+	}
+	return _schema_check(t.schema, arguments)
 }

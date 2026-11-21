@@ -2,14 +2,16 @@ package mcp
 
 import "base:runtime"
 import "core:strings"
+import "../http"
 import "../prim"
 
 Http_Client_Config :: struct {
 	url:             string,
 	headers:         []Header,
-	http:            Http,
+	http:            http.Client,
 	head_timeout_ms: i64,
 	max_body:        int,
+	oauth:           ^Oauth_Config,
 }
 
 DEFAULT_HEAD_TIMEOUT_MS :: 30_000
@@ -27,17 +29,22 @@ Http_Stream_Kind :: enum u8 {
 @(private)
 Http_Stream :: struct {
 	hc:        ^Http_Client,
-	handle:    Http_Handle,
+	handle:    http.Id,
+	req_body:  []u8,
+	parts:     [1][]u8,
+	fail_err:  http.Error,
 	kind:      Http_Stream_Kind,
 	id:        i64,
 	status:    int,
 	sse:       bool,
 	body:      Buf,
-	parser:    Sse_Parser,
+	parser:    http.Sse,
 	init:      bool,
 	www_auth:  string,
 	head_seen: bool,
 	json:      bool,
+	resume_from: string,
+	resumes:   int,
 	too_big:   bool,
 	dead:      bool,
 }
@@ -46,7 +53,7 @@ Http_Client :: struct {
 	client:       Client,
 	loop:         ^prim.Loop,
 	allocator:    runtime.Allocator,
-	http:         Http,
+	http:         http.Client,
 	url:          string,
 	endpoint:     string,
 	headers:      [dynamic]Header,
@@ -63,11 +70,13 @@ Http_Client :: struct {
 	reconnect_t:  prim.Timer,
 	backoff:      i64,
 	auth_wait:    [dynamic]i64,
+	resume_wait:  [dynamic]^Hc_Resume,
 	handler:      Event_Handler,
 	head_timeout: i64,
 	max_body:     int,
 	closing:      bool,
 	down:         bool,
+	oauth:        ^Oauth,
 }
 
 http_client_open :: proc(hc: ^Http_Client, loop: ^prim.Loop, cfg: Http_Client_Config, client_cfg: Client_Config, handler: Event_Handler, allocator := context.allocator) {
@@ -83,6 +92,7 @@ http_client_open :: proc(hc: ^Http_Client, loop: ^prim.Loop, cfg: Http_Client_Co
 	}
 	hc.streams = make([dynamic]^Http_Stream, allocator)
 	hc.auth_wait = make([dynamic]i64, allocator)
+	hc.resume_wait = make([dynamic]^Hc_Resume, allocator)
 	hc.handler = handler
 	hc.head_timeout = cfg.head_timeout_ms if cfg.head_timeout_ms > 0 else DEFAULT_HEAD_TIMEOUT_MS
 	hc.max_body = cfg.max_body if cfg.max_body > 0 else DEFAULT_MAX_BODY
@@ -91,6 +101,9 @@ http_client_open :: proc(hc: ^Http_Client, loop: ^prim.Loop, cfg: Http_Client_Co
 	ccfg := client_cfg
 	ccfg.transport = .Http
 	client_init(&hc.client, ccfg, Client_Sink{data = hc, send = _hc_send, event = _hc_event}, allocator)
+	if cfg.oauth != nil {
+		_oa_init(hc, cfg.oauth^)
+	}
 	client_start(&hc.client)
 	_hc_arm(hc)
 }
@@ -170,16 +183,52 @@ _hc_free_stream :: proc(hc: ^Http_Client, s: ^Http_Stream) {
 		hc.get = nil
 	}
 	delete(s.body)
+	delete(s.req_body, hc.allocator)
 	if s.sse {
-		sse_destroy(&s.parser)
+		http.sse_destroy(&s.parser)
 	}
 	delete(s.www_auth, hc.allocator)
+	delete(s.resume_from, hc.allocator)
 	free(s, hc.allocator)
 }
 
 @(private)
-_hc_sink :: proc(s: ^Http_Stream) -> Http_Sink {
-	return Http_Sink{data = s, head = _hc_on_head, body = _hc_on_body, done = _hc_on_done}
+_hc_start :: proc(hc: ^Http_Client, s: ^Http_Stream, method: string, url: string, headers: []Header, body: []u8) {
+	req := http.Request {
+		method     = method,
+		url        = url,
+		headers    = headers,
+		connect_ms = hc.head_timeout,
+	}
+	if len(body) > 0 {
+		s.req_body = make([]u8, len(body), hc.allocator)
+		copy(s.req_body, body)
+		s.parts[0] = s.req_body
+		req.body = s.parts[:]
+	}
+	id, err := http.start(&hc.http, &req, http.Sink{data = s, head = _hc_on_head, body = _hc_on_body, done = _hc_on_done})
+	if err == .None {
+		s.handle = id
+		return
+	}
+	s.fail_err = err
+	prim.timer(hc.loop, 0, s, proc(l: ^prim.Loop, data: rawptr) {
+		s := (^Http_Stream)(data)
+		for x in s.hc.streams {
+			if x == s {
+				_hc_on_done(s, 0, s.fail_err, "")
+				return
+			}
+		}
+	})
+}
+
+@(private)
+_hc_cancel :: proc(hc: ^Http_Client, s: ^Http_Stream) {
+	if s.handle != 0 {
+		http.cancel(&hc.http, s.handle)
+		s.handle = 0
+	}
 }
 
 @(private)
@@ -189,9 +238,7 @@ _hc_send :: proc(data: rawptr, c: ^Client, m: ^Outgoing) {
 	case .Abort:
 		for s in hc.streams {
 			if (s.kind == .Request || s.kind == .Resume) && s.id == m.id {
-				if hc.http.cancel != nil {
-					hc.http.cancel(hc.http.data, s.handle)
-				}
+				_hc_cancel(hc, s)
 				_hc_free_stream(hc, s)
 				break
 			}
@@ -227,14 +274,7 @@ _hc_send :: proc(data: rawptr, c: ^Client, m: ^Outgoing) {
 	kind := Http_Stream_Kind.Request if m.kind == .Request else Http_Stream_Kind.Message
 	s := _hc_new_stream(hc, kind, m.id)
 	s.init = m.initialize
-	req := Http_Request {
-		method     = "POST",
-		url        = hc.endpoint,
-		headers    = headers[:],
-		body       = m.body,
-		timeout_ms = hc.head_timeout,
-	}
-	s.handle = hc.http.start(hc.http.data, &req, _hc_sink(s))
+	_hc_start(hc, s, "POST", hc.endpoint, headers[:], m.body)
 	_hc_arm(hc)
 }
 
@@ -255,17 +295,47 @@ _hc_open_get :: proc(hc: ^Http_Client, old: bool) {
 	}
 	s := _hc_new_stream(hc, .Old_Sse if old else .Get, 0)
 	hc.get = s
-	req := Http_Request {
-		method     = "GET",
-		url        = hc.url,
-		headers    = headers[:],
-		timeout_ms = hc.head_timeout,
-	}
-	s.handle = hc.http.start(hc.http.data, &req, _hc_sink(s))
+	_hc_start(hc, s, "GET", hc.url, headers[:], nil)
 }
 
 @(private)
-_hc_open_resume :: proc(hc: ^Http_Client, id: i64, last_id: string) {
+Hc_Resume :: struct {
+	hc:      ^Http_Client,
+	id:      i64,
+	last:    string,
+	resumes: int,
+	timer:   prim.Timer,
+}
+
+@(private)
+_hc_schedule_resume :: proc(hc: ^Http_Client, id: i64, last: string, retry: i64, resumes: int) {
+	if retry <= 0 {
+		_hc_open_resume(hc, id, last, resumes)
+		return
+	}
+	r := new(Hc_Resume, hc.allocator)
+	r^ = {hc = hc, id = id, last = strings.clone(last, hc.allocator), resumes = resumes}
+	append(&hc.resume_wait, r)
+	r_t := prim.timer(hc.loop, retry, r, proc(l: ^prim.Loop, data: rawptr) {
+		r := (^Hc_Resume)(data)
+		hc := r.hc
+		for x, i in hc.resume_wait {
+			if x == r {
+				ordered_remove(&hc.resume_wait, i)
+				break
+			}
+		}
+		if !hc.closing && client_awaiting(&hc.client, r.id) {
+			_hc_open_resume(hc, r.id, r.last, r.resumes)
+		}
+		delete(r.last, hc.allocator)
+		free(r, hc.allocator)
+	})
+	r.timer = r_t
+}
+
+@(private)
+_hc_open_resume :: proc(hc: ^Http_Client, id: i64, last_id: string, resumes: int) {
 	headers := make([dynamic]Header, context.temp_allocator)
 	_hc_base_headers(hc, &headers, "text/event-stream")
 	if v := hc.client.version; v >= .V2025_06_18 {
@@ -273,17 +343,13 @@ _hc_open_resume :: proc(hc: ^Http_Client, id: i64, last_id: string) {
 	}
 	append(&headers, Header{"Last-Event-ID", last_id})
 	s := _hc_new_stream(hc, .Resume, id)
-	req := Http_Request {
-		method     = "GET",
-		url        = hc.url,
-		headers    = headers[:],
-		timeout_ms = hc.head_timeout,
-	}
-	s.handle = hc.http.start(hc.http.data, &req, _hc_sink(s))
+	s.resume_from = strings.clone(last_id, hc.allocator)
+	s.resumes = resumes
+	_hc_start(hc, s, "GET", hc.url, headers[:], nil)
 }
 
 @(private)
-_hc_on_head :: proc(data: rawptr, status: int, headers: []Header) {
+_hc_on_head :: proc(data: rawptr, hid: http.Id, status: int, headers: []Header) {
 	s := (^Http_Stream)(data)
 	hc := s.hc
 	s.status = status
@@ -299,7 +365,7 @@ _hc_on_head :: proc(data: rawptr, status: int, headers: []Header) {
 	s.json = strings.has_prefix(strings.to_lower(ct, context.temp_allocator), "application/json")
 	if status >= 200 && status < 300 && strings.has_prefix(strings.to_lower(ct, context.temp_allocator), "text/event-stream") {
 		s.sse = true
-		sse_init(&s.parser, hc.allocator)
+		http.sse_init(&s.parser, hc.allocator, hc.max_body)
 		if s.kind == .Get {
 			hc.get_backoff = 1000
 		}
@@ -307,52 +373,80 @@ _hc_on_head :: proc(data: rawptr, status: int, headers: []Header) {
 }
 
 @(private)
-_hc_on_body :: proc(data: rawptr, chunk: []u8) {
+_hc_on_body :: proc(data: rawptr, hid: http.Id, chunk: []u8) -> bool {
 	s := (^Http_Stream)(data)
 	hc := s.hc
 	if s.sse {
-		if !sse_feed(&s.parser, chunk, s, _hc_on_sse) {
-			s.too_big = true
+		http.sse_feed(&s.parser, chunk)
+		for {
+			ev, ok := http.sse_next(&s.parser)
+			if !ok {
+				break
+			}
+			if !_hc_on_sse(s, ev) {
+				return true
+			}
 		}
-		return
+		if s.parser.overflow {
+			s.too_big = true
+			return false
+		}
+		return true
 	}
 	if len(s.body) + len(chunk) > hc.max_body {
 		s.too_big = true
-		return
+		return false
 	}
 	append(&s.body, ..chunk)
+	return true
 }
 
 @(private)
-_hc_on_sse :: proc(data: rawptr, e: ^Sse_Event) {
-	s := (^Http_Stream)(data)
+_hc_sse_retry :: proc(s: ^Http_Stream) -> i64 {
+	if !s.sse || s.parser.retry_ms < 0 {
+		return 0
+	}
+	return i64(s.parser.retry_ms)
+}
+
+@(private)
+_hc_sse_last :: proc(s: ^Http_Stream) -> string {
+	if !s.sse {
+		return ""
+	}
+	return strings.clone(string(s.parser.id_buf[:]), context.temp_allocator)
+}
+
+@(private)
+_hc_on_sse :: proc(s: ^Http_Stream, e: http.Sse_Event) -> bool {
 	hc := s.hc
+	name := e.name if e.name != "" else "message"
 	if s.kind == .Get && e.id != "" {
 		delete(hc.get_last_id, hc.allocator)
 		hc.get_last_id = strings.clone(e.id, hc.allocator)
 	}
-	if s.kind == .Old_Sse && e.event == "endpoint" {
-		ep := url_resolve(hc.url, strings.trim_space(e.data), hc.allocator)
+	if s.kind == .Old_Sse && name == "endpoint" {
+		ep := url_resolve(hc.url, strings.trim_space(string(e.data)), hc.allocator)
 		if u, ok := url_parse(ep); ok {
 			b, _ := url_parse(hc.url)
 			if u.origin != b.origin {
 				delete(ep, hc.allocator)
 				client_close(&hc.client, "HTTP+SSE endpoint is on a different origin")
-				return
+				return false
 			}
 		}
 		delete(hc.endpoint, hc.allocator)
 		hc.endpoint = ep
 		client_sse_ready(&hc.client)
 		_hc_arm(hc)
-		return
+		return true
 	}
-	if e.event != "message" {
-		return
+	if name != "message" {
+		return true
 	}
-	text := json_trim(e.data)
+	text := json_trim(string(e.data))
 	if len(text) == 0 {
-		return
+		return true
 	}
 	related: i64 = 0
 	if s.kind == .Request || s.kind == .Resume {
@@ -360,10 +454,16 @@ _hc_on_sse :: proc(data: rawptr, e: ^Sse_Event) {
 	}
 	client_receive(&hc.client, transmute([]u8)text, related)
 	_hc_arm(hc)
+	for x in hc.streams {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
-_hc_on_done :: proc(data: rawptr, err: Http_Error) {
+_hc_on_done :: proc(data: rawptr, hid: http.Id, err: http.Error, detail: string) {
 	s := (^Http_Stream)(data)
 	hc := s.hc
 	c := &hc.client
@@ -396,11 +496,21 @@ _hc_on_done :: proc(data: rawptr, err: Http_Error) {
 		return
 	}
 	if status == 401 || status == 403 {
-		e := Event{kind = .Auth_Required, code = i64(status), message = s.www_auth}
+		www := strings.clone(s.www_auth, context.temp_allocator)
+		_hc_free_stream(hc, s)
+		if hc.oauth != nil {
+			if kind == .Request || kind == .Resume {
+				append(&hc.auth_wait, id)
+			}
+			if http_client_oauth_challenge(hc, status, www) {
+				return
+			}
+			pop(&hc.auth_wait)
+		}
+		e := Event{kind = .Auth_Required, code = i64(status), message = www}
 		if kind == .Request {
 			append(&hc.auth_wait, id)
 		}
-		_hc_free_stream(hc, s)
 		_hc_event(hc, c, &e)
 		return
 	}
@@ -431,22 +541,34 @@ _hc_on_done :: proc(data: rawptr, err: Http_Error) {
 			}
 			return
 		}
-		last := strings.clone(sse_last_id(&s.parser), context.temp_allocator)
+		last := _hc_sse_last(s)
+		retry := _hc_sse_retry(s)
 		_hc_free_stream(hc, s)
 		if client_awaiting(c, id) {
 			if c.era == .Legacy && last != "" {
-				_hc_open_resume(hc, id, last)
+				_hc_schedule_resume(hc, id, last, retry, 0)
 				return
 			}
 			client_stream_lost(c, id)
 		}
 	case .Resume:
-		last := strings.clone(sse_last_id(&s.parser), context.temp_allocator) if s.sse else ""
+		last := ""
+		retry: i64 = 0
+		progressed := false
+		if s.sse {
+			last = _hc_sse_last(s)
+			retry = _hc_sse_retry(s)
+			progressed = last != "" && last != s.resume_from
+		}
+		if last == "" {
+			last = strings.clone(s.resume_from, context.temp_allocator)
+		}
+		resumes := 0 if progressed else s.resumes + 1
 		ok := s.sse && status >= 200 && status < 300
 		_hc_free_stream(hc, s)
 		if client_awaiting(c, id) {
-			if ok && last != "" {
-				_hc_open_resume(hc, id, last)
+			if ok && last != "" && resumes < 5 {
+				_hc_schedule_resume(hc, id, last, retry, resumes)
 				return
 			}
 			client_stream_lost(c, id)
@@ -461,12 +583,13 @@ _hc_on_done :: proc(data: rawptr, err: Http_Error) {
 		}
 		_hc_free_stream(hc, s)
 	case .Get:
+		retry := _hc_sse_retry(s)
 		_hc_free_stream(hc, s)
 		if status == 405 || (status >= 400 && status < 500) {
 			hc.get_disabled = true
 			return
 		}
-		_hc_schedule_get(hc)
+		_hc_schedule_get(hc, retry)
 	case .Old_Sse:
 		_hc_free_stream(hc, s)
 		if status < 200 || status >= 300 {
@@ -480,9 +603,7 @@ _hc_on_done :: proc(data: rawptr, err: Http_Error) {
 @(private)
 _hc_close_get :: proc(hc: ^Http_Client) {
 	if hc.get != nil {
-		if hc.http.cancel != nil {
-			hc.http.cancel(hc.http.data, hc.get.handle)
-		}
+		_hc_cancel(hc, hc.get)
 		_hc_free_stream(hc, hc.get)
 	}
 	if hc.get_t != 0 {
@@ -492,12 +613,16 @@ _hc_close_get :: proc(hc: ^Http_Client) {
 }
 
 @(private)
-_hc_schedule_get :: proc(hc: ^Http_Client) {
+_hc_schedule_get :: proc(hc: ^Http_Client, retry: i64 = 0) {
 	if hc.closing || hc.get_disabled || hc.client.state != .Ready || hc.client.era != .Legacy || hc.old_sse || hc.get_t != 0 {
 		return
 	}
 	delay := hc.get_backoff
-	hc.get_backoff = min(hc.get_backoff * 2, RESTART_MAX_MS)
+	if retry > 0 {
+		delay = retry
+	} else {
+		hc.get_backoff = min(hc.get_backoff * 2, RESTART_MAX_MS)
+	}
 	hc.get_t = prim.timer(hc.loop, delay, hc, proc(l: ^prim.Loop, data: rawptr) {
 		hc := (^Http_Client)(data)
 		hc.get_t = 0
@@ -515,9 +640,7 @@ _hc_transport_down :: proc(hc: ^Http_Client, reason: string) {
 	hc.down = true
 	for len(hc.streams) > 0 {
 		s := hc.streams[len(hc.streams) - 1]
-		if hc.http.cancel != nil {
-			hc.http.cancel(hc.http.data, s.handle)
-		}
+		_hc_cancel(hc, s)
 		_hc_free_stream(hc, s)
 	}
 	_hc_close_get(hc)
@@ -583,14 +706,22 @@ http_client_close :: proc(hc: ^Http_Client) {
 	}
 	client_close(&hc.client, "client closed")
 	hc.closing = true
+	if hc.oauth != nil && hc.oauth.handle != 0 {
+		http.cancel(&hc.http, hc.oauth.handle)
+		hc.oauth.handle = 0
+	}
 	for len(hc.streams) > 0 {
 		s := hc.streams[len(hc.streams) - 1]
-		if hc.http.cancel != nil {
-			hc.http.cancel(hc.http.data, s.handle)
-		}
+		_hc_cancel(hc, s)
 		_hc_free_stream(hc, s)
 	}
 	_hc_close_get(hc)
+	for r in hc.resume_wait {
+		prim.timer_cancel(hc.loop, r.timer)
+		delete(r.last, hc.allocator)
+		free(r, hc.allocator)
+	}
+	clear(&hc.resume_wait)
 	for t in ([]prim.Timer{hc.timer, hc.reconnect_t}) {
 		if t != 0 {
 			prim.timer_cancel(hc.loop, t)
@@ -604,18 +735,20 @@ http_client_close :: proc(hc: ^Http_Client) {
 		if v := hc.client.version; v >= .V2025_06_18 {
 			append(&headers, Header{"MCP-Protocol-Version", version_name(v)})
 		}
-		req := Http_Request {
+		req := http.Request {
 			method     = "DELETE",
 			url        = hc.url,
 			headers    = headers[:],
+			connect_ms = hc.head_timeout,
 			timeout_ms = hc.head_timeout,
 		}
-		hc.http.start(hc.http.data, &req, {})
+		http.start(&hc.http, &req, {})
 	}
 }
 
 http_client_destroy :: proc(hc: ^Http_Client) {
 	http_client_close(hc)
+	_oa_destroy(hc)
 	client_destroy(&hc.client)
 	delete(hc.url, hc.allocator)
 	delete(hc.endpoint, hc.allocator)
@@ -628,5 +761,6 @@ http_client_destroy :: proc(hc: ^Http_Client) {
 	delete(hc.headers)
 	delete(hc.streams)
 	delete(hc.auth_wait)
+	delete(hc.resume_wait)
 	hc^ = {}
 }
