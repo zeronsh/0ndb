@@ -93,6 +93,7 @@
  *   mode          0 end_to_end, 1 transparent
  *   unit          0 lines, 1 bytes
  *   sort          0 relevance, 1 newest
+ *   dir           0 older, 1 newer
  *   member_role   1 tree, 2 document, 3 memory
  *   intent        23 assign, 25 queue, 26 steer, 27 edit_queued, 28 cancel,
  *                 29 interrupt, 30 answer, 37 await
@@ -126,6 +127,14 @@
  *                 claim: rid, files: [File], lines: [Line], blocks: [Block]
  *   Position   := msg: rid, seal: rid, seal_known: bool
  *   Page       := messages: [Message], next: Position, more: bool
+ *                 (dir older: newest first, toward the root; dir newer:
+ *                 oldest first, toward leaf or the reader's position;
+ *                 pass next back as from/from_seal/from_known to continue)
+ *   Window     := messages: [Message] (oldest first), anchor: uvarint (index
+ *                 of the anchor in messages), older: Position, newer: Position,
+ *                 more_older: bool, more_newer: bool, leaf: rid (page from
+ *                 older with dir older and from newer with dir newer and this
+ *                 leaf to extend the window; since 1.2)
  *   Attachment := name: str, mime: str, oid: bytes, size: uvarint
  *   Intent     := item: rid, latest: rid, kind: enum intent, by: id,
  *                 stamp: uvarint, text: str, target: rid, allow: bool,
@@ -225,7 +234,7 @@ extern "C" {
 #endif
 
 #define ONDB_ABI_MAJOR 1u
-#define ONDB_ABI_MINOR 1u
+#define ONDB_ABI_MINOR 2u
 #define ONDB_ABI_VERSION ((ONDB_ABI_MAJOR << 16) | ONDB_ABI_MINOR)
 
 typedef struct ondb ondb;
@@ -836,7 +845,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_CONVO_CREATE 30u
 /* convo.status(object: object) -> Status */
 #define ONDB_OP_CONVO_STATUS 31u
-/* convo.page(object: object, from: rid, from_seal: rid, from_known: bool, limit: uvarint) -> Page */
+/* convo.page(object: object, from: rid, from_seal: rid, from_known: bool, limit: uvarint, dir: enum{older,newer}, leaf: rid) -> Page */
 #define ONDB_OP_CONVO_PAGE 32u
 /* convo.message(object: object, msg: rid) -> message:Message */
 #define ONDB_OP_CONVO_MESSAGE 33u
@@ -854,6 +863,10 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_CONVO_COMPACTIONS 39u
 /* convo.unsealed(object: object) -> unsealed:[Unsealed] */
 #define ONDB_OP_CONVO_UNSEALED 40u
+/* convo.window(object: object, anchor: rid, before: uvarint, after: uvarint, leaf: rid) -> Window */
+#define ONDB_OP_CONVO_WINDOW 41u
+/* convo.peek_switch(object: object, sibling: rid, before: uvarint, after: uvarint) -> Window */
+#define ONDB_OP_CONVO_PEEK_SWITCH 42u
 /* send(object: object, text: str, parent: rid, role: enum{user,assistant,system,tool}, provider: str, model: str, attachments: attachments) -> Result */
 #define ONDB_OP_SEND 50u
 /* queue(object: object, text: str, attachments: attachments) -> Result */
@@ -976,7 +989,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_RUNTIME_DETACH 201u
 /* runtime.stats() -> RuntimeStats */
 #define ONDB_OP_RUNTIME_STATS 202u
-/* models() -> Models */
+/* models(live: bool, refresh: bool) -> Models */
 #define ONDB_OP_MODELS 203u
 /* agent.resolve(object: object, provider: str, model: str) -> AgentInfo */
 #define ONDB_OP_AGENT_RESOLVE 204u

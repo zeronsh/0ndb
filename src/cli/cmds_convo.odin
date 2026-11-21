@@ -166,26 +166,48 @@ cmd_switch :: proc(a: ^Args) -> int {
 	target: api.Rid
 	switch rest[0] {
 	case "next", "prev":
-		sr := req_begin("convo.status")
-		req_str(&sr, "object", object_str(ob))
-		st := must(s, req_end(&sr))
-		pos := jstr(st, "position")
-		if len(pos) == 0 {
-			return report_error(.Not_Found, "the conversation is empty")
+		fork := ""
+		for m in page(s, ob, 4096) {
+			if jint(m, "siblings") > 1 {
+				fork = jstr(m, "id")
+				break
+			}
+		}
+		if len(fork) == 0 {
+			return report_error(.Not_Found, "the current branch has no fork")
 		}
 		lr := req_begin("convo.siblings")
 		req_str(&lr, "object", object_str(ob))
-		req_str(&lr, "msg", pos)
+		req_str(&lr, "msg", fork)
 		v := must(s, req_end(&lr))
 		list := jarr(v, "siblings")
 		at := int(jint(v, "at")) - 1
 		if len(list) < 2 || at < 0 {
-			return report_error(.Not_Found, "the current message has no siblings")
+			return report_error(.Not_Found, "the current branch has no fork")
 		}
 		i := (at + 1) % len(list) if rest[0] == "next" else (at + len(list) - 1) % len(list)
 		target, _ = api.parse_rid(jtext(list[i]))
 	case:
 		target = resolve_msg(s, ob, rest[0])
+	}
+	if flag_bool(a, "preview") {
+		n := int(parse_int_flag(a, "limit", 10))
+		pr := req_begin("convo.peek_switch")
+		req_str(&pr, "object", object_str(ob))
+		req_str(&pr, "sibling", rid_str(target))
+		req_int(&pr, "before", i64(max(n / 2, 0)))
+		req_int(&pr, "after", i64(max(n - n / 2 - 1, 0)))
+		pv := must(s, req_end(&pr), "cannot preview the branch")
+		if a.json {
+			print_json(pv)
+			return 0
+		}
+		self := jstr(must(s, `{"op":"identity"}`), "id")
+		_hint(a, "older", jbool(pv, "more_older"), jget(pv, "older"))
+		_print_list(a, jarr(pv, "messages")[:], self, int(jint(pv, "anchor")))
+		_hint(a, "newer", jbool(pv, "more_newer"), jget(pv, "newer"), jstr(pv, "leaf"))
+		fmt.printfln("preview only: switching would put you at %s", short_rid(jstr(pv, "leaf")))
+		return 0
 	}
 	r := req_begin("switch")
 	req_str(&r, "object", object_str(ob))
@@ -217,27 +239,116 @@ cmd_back :: proc(a: ^Args) -> int {
 	return 0
 }
 
+cursor_text :: proc(pos: json.Value) -> string {
+	return fmt.tprintf("%s,%s,%d", jstr(pos, "msg"), jstr(pos, "seal"), 1 if jbool(pos, "seal_known") else 0)
+}
+
+@(private)
+_cursor_req :: proc(r: ^Request, cursor: string) {
+	parts := strings.split(cursor, ",", context.temp_allocator)
+	if len(parts) != 3 {
+		fail(.Usage, "%q is not a cursor (use the one 0ndb log printed)", cursor)
+	}
+	if _, ok := api.parse_rid(parts[0]); !ok {
+		fail(.Usage, "%q is not a cursor (use the one 0ndb log printed)", cursor)
+	}
+	req_str(r, "from", parts[0])
+	req_opt(r, "from_seal", parts[1])
+	req_bool(r, "from_known", parts[2] == "1")
+}
+
+@(private)
+_print_list :: proc(a: ^Args, msgs: []json.Value, self: string, anchor := -1) {
+	for m, i in msgs {
+		if a.json {
+			print_json(m)
+		} else {
+			print_message(m, self, "▶" if i == anchor else "●")
+		}
+	}
+}
+
+@(private)
+_hint :: proc(a: ^Args, label: string, more: bool, pos: json.Value, leaf := "") {
+	if more && !a.json {
+		fmt.printfln("  … %s: 0ndb log --%s %s%s", label, label, cursor_text(pos), fmt.tprintf(" --leaf %s", leaf) if len(leaf) > 0 && label == "newer" else "")
+	}
+}
+
 cmd_log :: proc(a: ^Args) -> int {
 	s := session(a)
 	ob, _ := _convo_and_rest(s, a, 0)
-	n := 20
-	if v, ok := flag_value(a, "limit"); ok {
-		x, xok := strconv.parse_int(v)
-		if !xok || x <= 0 {
-			return usage_error("-n takes a positive number")
-		}
-		n = x
+	n := int(parse_int_flag(a, "limit", 20))
+	if n <= 0 {
+		return usage_error("-n takes a positive number")
 	}
-	msgs := page(s, ob, n)
 	self := jstr(must(s, `{"op":"identity"}`), "id")
-	if a.json {
-		for i := len(msgs) - 1; i >= 0; i -= 1 {
-			print_json(msgs[i])
+	leaf := ""
+	if l, ok := flag_value(a, "leaf"); ok {
+		leaf = rid_str(resolve_msg(s, ob, l))
+	}
+	if anchor, ok := flag_value(a, "around"); ok {
+		r := req_begin("convo.window")
+		req_str(&r, "object", object_str(ob))
+		req_str(&r, "anchor", rid_str(resolve_msg(s, ob, anchor)))
+		req_int(&r, "before", i64(n / 2))
+		req_int(&r, "after", i64(max(n - n / 2 - 1, 0)))
+		req_opt(&r, "leaf", leaf)
+		v := must(s, req_end(&r), "cannot read the window")
+		if a.json {
+			print_json(v)
+			return 0
 		}
-	} else {
-		for i := len(msgs) - 1; i >= 0; i -= 1 {
-			print_message(msgs[i], self)
+		_hint(a, "older", jbool(v, "more_older"), jget(v, "older"))
+		_print_list(a, jarr(v, "messages")[:], self, int(jint(v, "anchor")))
+		_hint(a, "newer", jbool(v, "more_newer"), jget(v, "newer"), jstr(v, "leaf"))
+		return 0
+	}
+	older, has_older := flag_value(a, "older")
+	newer, has_newer := flag_value(a, "newer")
+	if has_older || has_newer {
+		if has_older && has_newer {
+			return usage_error("use either --older or --newer")
 		}
+		r := req_begin("convo.page")
+		req_str(&r, "object", object_str(ob))
+		req_int(&r, "limit", i64(n))
+		_cursor_req(&r, older if has_older else newer)
+		req_str(&r, "dir", "older" if has_older else "newer")
+		req_opt(&r, "leaf", leaf)
+		v := must(s, req_end(&r), "cannot read the conversation")
+		msgs := jarr(v, "messages")
+		if has_older {
+			for i in 0 ..< len(msgs) / 2 {
+				msgs[i], msgs[len(msgs) - 1 - i] = msgs[len(msgs) - 1 - i], msgs[i]
+			}
+		}
+		if a.json {
+			print_json(v)
+			return 0
+		}
+		if has_older {
+			_hint(a, "older", jbool(v, "more"), jget(v, "next"))
+		}
+		_print_list(a, msgs[:], self)
+		if has_newer {
+			_hint(a, "newer", jbool(v, "more"), jget(v, "next"), leaf)
+		}
+		return 0
+	}
+	r := req_begin("convo.page")
+	req_str(&r, "object", object_str(ob))
+	req_int(&r, "limit", i64(n))
+	v := must(s, req_end(&r), "cannot read the conversation")
+	msgs := jarr(v, "messages")
+	for i in 0 ..< len(msgs) / 2 {
+		msgs[i], msgs[len(msgs) - 1 - i] = msgs[len(msgs) - 1 - i], msgs[i]
+	}
+	if !a.json {
+		_hint(a, "older", jbool(v, "more"), jget(v, "next"))
+	}
+	_print_list(a, msgs[:], self)
+	if !a.json {
 		ir := req_begin("convo.intents")
 		req_str(&ir, "object", object_str(ob))
 		if iv := call(s, req_end(&ir)); iv.status == .Ok {

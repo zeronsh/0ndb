@@ -18,6 +18,7 @@ CONDITION_NAMES := [3]string{"", "any", "all"}
 MODE_NAMES := [2]string{"end_to_end", "transparent"}
 UNIT_NAMES := [2]string{"lines", "bytes"}
 SORT_NAMES := [2]string{"relevance", "newest"}
+DIR_NAMES := [2]string{"older", "newer"}
 EVENT_NAMES := [10]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure"}
 DELTA_NAMES := [19]string{"message", "block", "chunk", "seal", "leaf", "intent", "run", "mount", "record", "status", "field", "element", "counter", "catalog", "text", "files", "redacted", "members", "quarantined"}
 INTENT_NAMES := [44]string {
@@ -363,4 +364,18 @@ emit_results :: proc(o: ^Out, r: ^search.Results) {
 
 valid_utf8 :: proc(b: []u8) -> bool {
 	return utf8.valid_string(string(b))
+}
+
+emit_window :: proc(o: ^Out, w: ^convo.Window) {
+	o_arr(o, "messages", len(w.messages))
+	for &m in w.messages {
+		emit_message(o, "", &m)
+	}
+	o_end(o)
+	o_int(o, "anchor", w.anchor)
+	emit_position(o, "older", w.older)
+	emit_position(o, "newer", w.newer)
+	o_bool(o, "more_older", w.more_older)
+	o_bool(o, "more_newer", w.more_newer)
+	o_rid(o, "leaf", w.leaf)
 }

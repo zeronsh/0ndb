@@ -67,7 +67,7 @@ indent :: proc(s: string, prefix: string) -> string {
 	return strings.to_string(b)
 }
 
-print_message :: proc(m: json.Value, self: string) {
+print_message :: proc(m: json.Value, self: string, mark := "●") {
 	role := jstr(m, "role")
 	who := role
 	author := jstr(m, "author")
@@ -89,7 +89,7 @@ print_message :: proc(m: json.Value, self: string) {
 		extra = strings.concatenate({extra, " · redacted"}, context.temp_allocator)
 	}
 	marker := "" if state == "done" else fmt.tprintf(" · %s", state)
-	fmt.printfln("● %s · %s%s%s · %s", who, ago(hlc_ms(jint(m, "hlc"))), marker, extra, short_rid(jstr(m, "id")))
+	fmt.printfln("%s %s · %s%s%s · %s", mark, who, ago(hlc_ms(jint(m, "hlc"))), marker, extra, short_rid(jstr(m, "id")))
 	for b in jarr(m, "blocks") {
 		print_block(b)
 	}

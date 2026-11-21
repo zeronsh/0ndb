@@ -435,6 +435,18 @@ cmd_mount :: proc(a: ^Args) -> int {
 		return usage_error("usage: 0ndb mount DIR [--tree T] [--convo C] [--name NAME] | mount ls | mount rm DIR")
 	}
 	root := abs_path(a.pos[0])
+	convo: api.Object
+	has_convo := false
+	if c, ok := flag_value(a, "convo"); ok {
+		convo = resolve_object(s, c)
+		cr := req_begin("catalog.get")
+		req_str(&cr, "object", object_str(convo))
+		cv := must(s, req_end(&cr), "cannot read the catalog")
+		if !jbool(cv, "found") || jstr(jget(cv, "entry"), "kind") != "conversation" {
+			fail(.Usage, "%s is not a conversation", c)
+		}
+		has_convo = true
+	}
 	tree: api.Object
 	if t, ok := flag_value(a, "tree"); ok {
 		tree = resolve_object(s, t)
@@ -451,10 +463,9 @@ cmd_mount :: proc(a: ^Args) -> int {
 	req_str(&mr, "root", root)
 	must(s, req_end(&mr), fmt.tprintf("cannot mount %s", root))
 	name := flag_string(a, "name", root[strings.last_index_byte(root, '/') + 1:])
-	if c, ok := flag_value(a, "convo"); ok {
-		ob := resolve_object(s, c)
+	if has_convo {
 		cr := req_begin("mount")
-		req_str(&cr, "object", object_str(ob))
+		req_str(&cr, "object", object_str(convo))
 		req_str(&cr, "name", name)
 		req_str(&cr, "tree", hex(tree.id))
 		req_str(&cr, "path", name)

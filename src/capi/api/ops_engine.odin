@@ -204,11 +204,30 @@ op_convo_page :: proc(c: ^Call, o: ^Out) -> Status {
 	if limit <= 0 {
 		limit = 32
 	}
-	p, err := eng.convo_page(c.api.e, a_object(c, "object"), from, min(limit, 4096), context.temp_allocator, ready(c))
+	dir := convo.Direction(min(a_u64(c, "dir"), 1))
+	p, err := eng.convo_page(c.api.e, a_object(c, "object"), from, min(limit, 4096), context.temp_allocator, ready(c), dir, a_rid(c, "leaf"))
 	if err != .None {
 		return pend(c, err)
 	}
 	emit_page(o, &p)
+	return .Ok
+}
+
+op_convo_window :: proc(c: ^Call, o: ^Out) -> Status {
+	w, err := eng.convo_window(c.api.e, a_object(c, "object"), a_rid(c, "anchor"), min(a_int(c, "before", 16), 4096), min(a_int(c, "after", 16), 4096), a_rid(c, "leaf"), context.temp_allocator, ready(c))
+	if err != .None {
+		return pend(c, err)
+	}
+	emit_window(o, &w)
+	return .Ok
+}
+
+op_convo_peek_switch :: proc(c: ^Call, o: ^Out) -> Status {
+	_, w, err := eng.convo_peek_switch(c.api.e, a_object(c, "object"), a_rid(c, "sibling"), min(a_int(c, "before", 16), 4096), min(a_int(c, "after", 16), 4096), context.temp_allocator, ready(c))
+	if err != .None {
+		return pend(c, err)
+	}
+	emit_window(o, &w)
 	return .Ok
 }
 

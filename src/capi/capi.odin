@@ -6,7 +6,7 @@ import "./api"
 import eng "../engine"
 
 ABI_MAJOR :: 1
-ABI_MINOR :: 1
+ABI_MINOR :: 2
 
 FLAG_JSON :: u32(1)
 

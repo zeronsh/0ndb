@@ -26,7 +26,7 @@ Args :: struct {
 	json:  bool,
 }
 
-BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh"}
+BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview"}
 
 Command :: struct {
 	name:  string,
@@ -50,9 +50,9 @@ COMMANDS := []Command {
 	{"queue", cmd_queue, "queue [CONVO] TEXT", "queue a message for after the running turn"},
 	{"steer", cmd_steer, "steer [CONVO] TEXT", "steer the running turn"},
 	{"edit", cmd_edit, "edit [CONVO] ITEM TEXT", "edit a queued message"},
-	{"switch", cmd_switch, "switch [CONVO] SIBLING|next|prev", "switch to a sibling branch"},
+	{"switch", cmd_switch, "switch [CONVO] SIBLING|next|prev [--preview] [-n N]", "switch to a sibling branch, or preview it without switching"},
 	{"back", cmd_back, "back [CONVO] MSG", "go back to a message (restores mounted files)"},
-	{"log", cmd_log, "log [CONVO] [-n N] [--follow]", "print a conversation"},
+	{"log", cmd_log, "log [CONVO] [-n N] [--follow] [--around MSG] [--older CURSOR | --newer CURSOR] [--leaf MSG]", "print a conversation, a window around a message, or one page from a cursor"},
 	{"show", cmd_show, "show OBJECT|MSG [CONVO]", "show an object or a message"},
 	{"search", cmd_search, "search QUERY [--limit N] [--semantic] [--newest]", "search everything indexed on this device"},
 	{"interrupt", cmd_interrupt, "interrupt [CONVO]", "interrupt the running turn"},
