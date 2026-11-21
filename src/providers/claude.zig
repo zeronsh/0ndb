@@ -9,6 +9,8 @@ pub const ClaudeRun = struct {
     pipe: rpc.SubprocessPipe,
     pending: std.ArrayList(iface.Event),
     seen_session_id: bool,
+    turn_in_flight: bool,
+    emitted_eof_error: bool,
     closed: bool,
 
     pub fn start(allocator: Allocator, io: Io, req: iface.StartRequest) !iface.RunHandle {
@@ -50,6 +52,8 @@ pub const ClaudeRun = struct {
             .pipe = try rpc.SubprocessPipe.spawn(allocator, io, argv.items, req.cwd),
             .pending = .empty,
             .seen_session_id = false,
+            .turn_in_flight = false,
+            .emitted_eof_error = false,
             .closed = false,
         };
         return .{ .ptr = self, .vtable = &vtable };
@@ -75,6 +79,8 @@ pub const ClaudeRun = struct {
     fn sendImpl(ptr: *anyopaque, prompt: []const u8) anyerror!void {
         const self: *ClaudeRun = @ptrCast(@alignCast(ptr));
         try self.writeUserMsg(prompt);
+        self.turn_in_flight = true;
+        self.emitted_eof_error = false;
     }
 
     fn steerImpl(ptr: *anyopaque, prompt: []const u8, _: ?[]const u8) anyerror!iface.SteerOutcome {
@@ -87,14 +93,27 @@ pub const ClaudeRun = struct {
         const self: *ClaudeRun = @ptrCast(@alignCast(ptr));
         while (true) {
             if (self.pending.items.len > 0) {
-                return self.pending.orderedRemove(0);
+                const ev = self.pending.orderedRemove(0);
+                if (ev.kind == .turn_ended) self.turn_in_flight = false;
+                return ev;
             }
-            var raw_line = try self.pipe.readNextLine(-1) orelse return null;
+            var raw_line = try self.pipe.readNextLine(-1) orelse {
+                if (self.turn_in_flight and !self.emitted_eof_error) {
+                    self.turn_in_flight = false;
+                    self.emitted_eof_error = true;
+                    const msg = try self.pipe.formatCrashMessage(self.allocator, "claude");
+                    return .{ .kind = .{ .turn_ended = .{ .ok = false, .err_msg = msg } } };
+                }
+                return null;
+            };
             defer raw_line.deinit(self.allocator);
             if (raw_line.is_stderr) {
+                const kind_s = try self.allocator.dupe(u8, "stderr");
+                errdefer self.allocator.free(kind_s);
+                const raw_s = try self.allocator.dupe(u8, raw_line.bytes);
                 return .{
-                    .kind = .{ .other = .{ .kind = try self.allocator.dupe(u8, "stderr") } },
-                    .raw = try self.allocator.dupe(u8, raw_line.bytes),
+                    .kind = .{ .other = .{ .kind = kind_s } },
+                    .raw = raw_s,
                 };
             }
             const trimmed = std.mem.trim(u8, raw_line.bytes, " \t\r\n");
@@ -114,6 +133,7 @@ pub const ClaudeRun = struct {
             self.closed = true;
             for (self.pending.items) |*ev| ev.deinit(self.allocator);
             self.pending.deinit(self.allocator);
+            self.pipe.closeStdinGraceful(500);
             self.pipe.deinit();
             self.allocator.destroy(self);
         }
@@ -122,9 +142,13 @@ pub const ClaudeRun = struct {
 
 pub fn parseStreamLine(allocator: Allocator, line: []const u8, seen_session_id: *bool, out: *std.ArrayList(iface.Event)) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+        const kind_s = try allocator.dupe(u8, "unparsed");
+        errdefer allocator.free(kind_s);
+        const raw_s = try allocator.dupe(u8, line);
+        errdefer allocator.free(raw_s);
         try out.append(allocator, .{
-            .kind = .{ .other = .{ .kind = try allocator.dupe(u8, "unparsed") } },
-            .raw = try allocator.dupe(u8, line),
+            .kind = .{ .other = .{ .kind = kind_s } },
+            .raw = raw_s,
         });
         return;
     };
@@ -177,11 +201,15 @@ pub fn parseStreamLine(allocator: Allocator, line: []const u8, seen_session_id: 
                     } else if (std.mem.eql(u8, ct, "tool_use")) {
                         const tid = rpc.jsonStr(rpc.jsonObjGet(c, "id")) orelse "";
                         const name = rpc.jsonStr(rpc.jsonObjGet(c, "name")) orelse "tool";
+                        const tid_c = try allocator.dupe(u8, tid);
+                        errdefer allocator.free(tid_c);
+                        const name_c = try allocator.dupe(u8, name);
+                        errdefer allocator.free(name_c);
                         const input_json = try rpc.stringifyJsonValue(allocator, rpc.jsonObjGet(c, "input"));
                         errdefer allocator.free(input_json);
                         try out.append(allocator, .{ .kind = .{ .tool_started = .{
-                            .id = try allocator.dupe(u8, tid),
-                            .name = try allocator.dupe(u8, name),
+                            .id = tid_c,
+                            .name = name_c,
                             .input_json = input_json,
                         } } });
                     }
@@ -190,19 +218,34 @@ pub fn parseStreamLine(allocator: Allocator, line: []const u8, seen_session_id: 
         }
     } else if (std.mem.eql(u8, ty, "user")) {
         const msg = rpc.jsonObjGet(root, "message");
+        const tool_res = rpc.jsonObjGet(root, "tool_use_result");
         if (rpc.jsonObjGet(msg, "content")) |content_val| {
             if (content_val == .array) {
                 for (content_val.array.items) |c| {
                     const ct = rpc.jsonStr(rpc.jsonObjGet(c, "type")) orelse "";
                     if (std.mem.eql(u8, ct, "tool_result")) {
                         const tid = rpc.jsonStr(rpc.jsonObjGet(c, "tool_use_id")) orelse "";
+                        const tid_c = try allocator.dupe(u8, tid);
+                        errdefer allocator.free(tid_c);
                         const output = try rpc.extractTextOrJson(allocator, rpc.jsonObjGet(c, "content"));
                         errdefer allocator.free(output);
+                        const stdout_c: ?[]u8 = if (rpc.jsonStr(rpc.jsonObjGet(tool_res, "stdout"))) |s|
+                            try allocator.dupe(u8, s)
+                        else
+                            null;
+                        errdefer if (stdout_c) |s| allocator.free(s);
+                        const stderr_c: ?[]u8 = if (rpc.jsonStr(rpc.jsonObjGet(tool_res, "stderr"))) |s|
+                            try allocator.dupe(u8, s)
+                        else
+                            null;
+                        errdefer if (stderr_c) |s| allocator.free(s);
                         const is_err = rpc.jsonBool(rpc.jsonObjGet(c, "is_error")) orelse false;
                         try out.append(allocator, .{ .kind = .{ .tool_finished = .{
-                            .id = try allocator.dupe(u8, tid),
+                            .id = tid_c,
                             .output = output,
                             .is_error = is_err,
+                            .stdout = stdout_c,
+                            .stderr = stderr_c,
                         } } });
                     }
                 }
@@ -218,16 +261,26 @@ pub fn parseStreamLine(allocator: Allocator, line: []const u8, seen_session_id: 
         const sub = rpc.jsonStr(rpc.jsonObjGet(root, "subtype")) orelse "";
         const is_err = rpc.jsonBool(rpc.jsonObjGet(root, "is_error")) orelse false;
         const ok = std.mem.eql(u8, sub, "success") and !is_err;
+        const cost_usd = rpc.jsonF64(rpc.jsonObjGet(root, "total_cost_usd")) orelse
+            rpc.jsonF64(rpc.jsonObjGet(root, "cost_usd"));
         if (rpc.jsonObjGet(root, "usage")) |u| {
             try out.append(allocator, .{ .kind = .{ .usage = .{
                 .input_tokens = rpc.jsonU64(rpc.jsonObjGet(u, "input_tokens")) orelse 0,
                 .output_tokens = rpc.jsonU64(rpc.jsonObjGet(u, "output_tokens")) orelse 0,
+                .cost_usd = cost_usd,
+            } } });
+        } else if (cost_usd != null) {
+            try out.append(allocator, .{ .kind = .{ .usage = .{
+                .input_tokens = 0,
+                .output_tokens = 0,
+                .cost_usd = cost_usd,
             } } });
         }
         const err_msg: ?[]u8 = if (!ok)
             try allocator.dupe(u8, rpc.jsonStr(rpc.jsonObjGet(root, "result")) orelse sub)
         else
             null;
+        errdefer if (err_msg) |m| allocator.free(m);
         try out.append(allocator, .{ .kind = .{ .turn_ended = .{ .ok = ok, .err_msg = err_msg } } });
     }
 

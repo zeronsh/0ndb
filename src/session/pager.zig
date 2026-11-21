@@ -6,8 +6,10 @@ const blobs_mod = @import("../store/blobs.zig");
 const model = @import("model.zig");
 
 pub const PAGE_MAGIC = [4]u8{ '0', 'P', 'A', 'G' };
-pub const PAGE_VERSION: u8 = 1;
+pub const PAGE_VERSION: u8 = 2;
 pub const DEFAULT_PAGE_SIZE: usize = 32;
+pub const MAX_PAGE_MESSAGES: usize = 4096;
+const MIN_ENCODED_MSG_BYTES: usize = 64;
 
 pub const MessagePage = struct {
     thread_id: u128,
@@ -42,21 +44,24 @@ pub const MessagePage = struct {
         const magic = try r.readFixed(4);
         if (!std.mem.eql(u8, magic, &PAGE_MAGIC)) return error.InvalidPageMagic;
         const ver = try r.readU8();
-        if (ver != PAGE_VERSION) return error.UnsupportedPageVersion;
+        if (ver != 1 and ver != PAGE_VERSION) return error.UnsupportedPageVersion;
         const tid = try r.readU128();
-        const has_prev = try r.readU8();
-        const prev: ?id.PageId = if (has_prev != 0) (try r.readFixed(32)).* else null;
-        const has_head = try r.readU8();
-        const head: ?u128 = if (has_head != 0) try r.readU128() else null;
+        const has_prev = try model.decodeFlag(&r);
+        const prev: ?id.PageId = if (has_prev) (try r.readFixed(32)).* else null;
+        const has_head = try model.decodeFlag(&r);
+        const head: ?u128 = if (has_head) try r.readU128() else null;
         const count = try r.readU32();
-        const msgs = try allocator.alloc(model.Message, count);
+        if (count > MAX_PAGE_MESSAGES) return error.CorruptRecord;
+        const count_usize: usize = @intCast(count);
+        if (count_usize * MIN_ENCODED_MSG_BYTES > r.remaining()) return error.CorruptRecord;
+        const msgs = try allocator.alloc(model.Message, count_usize);
         var decoded: usize = 0;
         errdefer {
             for (msgs[0..decoded]) |*m| m.deinit(allocator);
             allocator.free(msgs);
         }
-        for (0..count) |i| {
-            msgs[i] = try model.Message.decode(allocator, &r);
+        for (0..count_usize) |i| {
+            msgs[i] = try model.Message.decodeEx(allocator, &r, ver >= 2);
             decoded += 1;
         }
         return .{
@@ -105,7 +110,7 @@ pub fn sealBranchChain(
     page_size: usize,
 ) !?id.PageId {
     if (branch_messages.len == 0) return null;
-    const chunk = if (page_size == 0) DEFAULT_PAGE_SIZE else page_size;
+    const chunk = if (page_size == 0) DEFAULT_PAGE_SIZE else @min(page_size, MAX_PAGE_MESSAGES);
     var prev: ?id.PageId = null;
     var off: usize = 0;
     while (off < branch_messages.len) {

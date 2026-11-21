@@ -17,10 +17,32 @@ pub const REC_ROLLBACK_COMMIT: u8 = 7;
 pub const REC_SUMMARY_DELTA: u8 = 8;
 pub const REC_TOOL_CALL: u8 = 9;
 
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
+pub const TOOL_TRUNCATION_MARKER: []const u8 = "\n... [truncated]";
+
 pub const BranchKey = struct {
     thread_id: u128,
     parent_msg_id: u128,
 };
+
+fn clipUtf8Boundary(s: []const u8, max_bytes: usize) usize {
+    if (s.len <= max_bytes) return s.len;
+    var end = max_bytes;
+    while (end > 0 and (s[end] & 0xC0) == 0x80) {
+        end -= 1;
+    }
+    return end;
+}
+
+fn dupeCapped(allocator: Allocator, s: []const u8, max_bytes: usize) Allocator.Error![]u8 {
+    if (s.len <= max_bytes) return allocator.dupe(u8, s);
+    const keep_limit = if (max_bytes > TOOL_TRUNCATION_MARKER.len) max_bytes - TOOL_TRUNCATION_MARKER.len else 0;
+    const cut = clipUtf8Boundary(s, keep_limit);
+    const out = try allocator.alloc(u8, cut + TOOL_TRUNCATION_MARKER.len);
+    @memcpy(out[0..cut], s[0..cut]);
+    @memcpy(out[cut..], TOOL_TRUNCATION_MARKER);
+    return out;
+}
 
 pub const SessionJournal = struct {
     allocator: Allocator,
@@ -72,7 +94,7 @@ pub const SessionJournal = struct {
         errdefer self.deinit();
 
         try self.replay();
-        try self.markInterruptedOnBoot();
+        _ = try self.resumeInterrupted();
         return self;
     }
 
@@ -134,12 +156,18 @@ pub const SessionJournal = struct {
             var r = codec.Reader.init(view.payload);
             switch (view.header.kind) {
                 REC_THREAD_UPSERT => {
-                    const t = try model.Thread.decode(self.allocator, &r);
+                    var t = try model.Thread.decode(self.allocator, &r);
+                    var owned = true;
+                    errdefer if (owned) t.deinit(self.allocator);
                     try self.applyThread(t);
+                    owned = false;
                 },
                 REC_MSG_APPEND, REC_MSG_UPDATE => {
-                    const m = try model.Message.decode(self.allocator, &r);
+                    var m = try model.Message.decode(self.allocator, &r);
+                    var owned = true;
+                    errdefer if (owned) m.deinit(self.allocator);
                     try self.applyMessage(m);
+                    owned = false;
                 },
                 REC_BRANCH_CHOICE => {
                     const tid = try r.readU128();
@@ -148,14 +176,20 @@ pub const SessionJournal = struct {
                     try self.branch_choices.put(self.allocator, .{ .thread_id = tid, .parent_msg_id = parent }, child);
                 },
                 REC_QUEUE_UPSERT => {
-                    const q = try model.QueueItem.decode(self.allocator, &r);
+                    var q = try model.QueueItem.decode(self.allocator, &r);
+                    var owned = true;
+                    errdefer if (owned) q.deinit(self.allocator);
                     try self.applyQueueItem(q);
+                    owned = false;
                 },
                 REC_ROLLBACK_BEGIN => {
-                    const intent = try model.RollbackIntent.decode(self.allocator, &r);
+                    var intent = try model.RollbackIntent.decode(self.allocator, &r);
+                    var owned = true;
+                    errdefer if (owned) intent.deinit(self.allocator);
                     const gop = try self.pending_rollbacks.getOrPut(self.allocator, intent.intent_id);
                     if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
                     gop.value_ptr.* = intent;
+                    owned = false;
                 },
                 REC_ROLLBACK_COMMIT => {
                     const iid = try r.readU128();
@@ -168,15 +202,19 @@ pub const SessionJournal = struct {
                     self.summary_log_seq = view.header.seq;
                 },
                 REC_TOOL_CALL => {
-                    const tc = try model.ToolCallRecord.decode(self.allocator, &r);
+                    var tc = try model.ToolCallRecord.decode(self.allocator, &r);
+                    var owned = true;
+                    errdefer if (owned) tc.deinit(self.allocator);
                     try self.applyToolCall(tc);
+                    owned = false;
                 },
                 else => {},
             }
         }
     }
 
-    fn markInterruptedOnBoot(self: *SessionJournal) !void {
+    pub fn resumeInterrupted(self: *SessionJournal) !usize {
+        var recovered: usize = 0;
         var to_interrupt: std.ArrayList(u128) = .empty;
         defer to_interrupt.deinit(self.allocator);
         {
@@ -193,6 +231,7 @@ pub const SessionJournal = struct {
                 m.status = .interrupted;
                 m.updated_ms = now;
                 try self.writeMessageRecord(REC_MSG_UPDATE, m);
+                recovered += 1;
             }
         }
         var q_requeue: std.ArrayList(u128) = .empty;
@@ -210,6 +249,7 @@ pub const SessionJournal = struct {
                 q.status = .pending;
                 q.updated_ms = now;
                 try self.writeQueueRecord(q);
+                recovered += 1;
             }
         }
         var t_fix: std.ArrayList(u128) = .empty;
@@ -224,11 +264,14 @@ pub const SessionJournal = struct {
         }
         for (t_fix.items) |tid| {
             if (self.threads.getPtr(tid)) |t| {
+                t.queued_count = self.countPendingQueue(tid);
                 t.status = if (t.queued_count > 0) .queued else .interrupted;
                 t.updated_ms = now;
                 try self.writeThreadRecord(t);
+                recovered += 1;
             }
         }
+        return recovered;
     }
 
     fn applyThread(self: *SessionJournal, t: model.Thread) !void {
@@ -239,30 +282,43 @@ pub const SessionJournal = struct {
 
     fn applyMessage(self: *SessionJournal, m: model.Message) !void {
         const existed = self.messages.contains(m.msg_id);
-        const gop = try self.messages.getOrPut(self.allocator, m.msg_id);
-        if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
-        gop.value_ptr.* = m;
+        try self.messages.ensureUnusedCapacity(self.allocator, 1);
 
+        var idx_list: ?*std.ArrayList(u128) = null;
         if (!existed) {
             if (m.parent_id) |pid| {
                 const c = try self.children_index.getOrPut(self.allocator, pid);
                 if (!c.found_existing) c.value_ptr.* = .empty;
-                try c.value_ptr.append(self.allocator, m.msg_id);
+                try c.value_ptr.ensureUnusedCapacity(self.allocator, 1);
+                idx_list = c.value_ptr;
             } else {
                 const r = try self.root_messages.getOrPut(self.allocator, m.thread_id);
                 if (!r.found_existing) r.value_ptr.* = .empty;
-                try r.value_ptr.append(self.allocator, m.msg_id);
+                try r.value_ptr.ensureUnusedCapacity(self.allocator, 1);
+                idx_list = r.value_ptr;
             }
+        }
+
+        const gop = self.messages.getOrPutAssumeCapacity(m.msg_id);
+        if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
+        gop.value_ptr.* = m;
+
+        if (idx_list) |list| {
+            list.appendAssumeCapacity(m.msg_id);
         }
     }
 
     fn applyQueueItem(self: *SessionJournal, q: model.QueueItem) !void {
         const existed = self.queue_items.contains(q.item_id);
-        const gop = try self.queue_items.getOrPut(self.allocator, q.item_id);
+        try self.queue_items.ensureUnusedCapacity(self.allocator, 1);
+        if (!existed) {
+            try self.queue_order.ensureUnusedCapacity(self.allocator, 1);
+        }
+        const gop = self.queue_items.getOrPutAssumeCapacity(q.item_id);
         if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
         gop.value_ptr.* = q;
         if (!existed) {
-            try self.queue_order.append(self.allocator, q.item_id);
+            self.queue_order.appendAssumeCapacity(q.item_id);
         }
     }
 
@@ -370,12 +426,11 @@ pub const SessionJournal = struct {
     }
 
     fn applyToolCall(self: *SessionJournal, tc: model.ToolCallRecord) !void {
-        var owned = tc;
-        errdefer owned.deinit(self.allocator);
-        const gop = try self.tool_calls.getOrPut(self.allocator, owned.msg_id);
+        const gop = try self.tool_calls.getOrPut(self.allocator, tc.msg_id);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         for (gop.value_ptr.items) |*existing| {
-            if (std.mem.eql(u8, existing.call_id, owned.call_id)) {
+            if (std.mem.eql(u8, existing.call_id, tc.call_id)) {
+                var owned = tc;
                 if (owned.name.len > 0) {
                     self.allocator.free(existing.name);
                     existing.name = owned.name;
@@ -392,14 +447,14 @@ pub const SessionJournal = struct {
                     owned.output = &.{};
                 }
                 existing.is_error = owned.is_error;
-                if (owned.call_id.len > 0) self.allocator.free(owned.call_id);
+                self.allocator.free(owned.call_id);
                 if (owned.name.len > 0) self.allocator.free(owned.name);
                 if (owned.input_json.len > 0) self.allocator.free(owned.input_json);
                 if (owned.output.len > 0) self.allocator.free(owned.output);
                 return;
             }
         }
-        try gop.value_ptr.append(self.allocator, owned);
+        try gop.value_ptr.append(self.allocator, tc);
     }
 
     pub fn putToolCall(
@@ -411,18 +466,24 @@ pub const SessionJournal = struct {
         output: []const u8,
         is_error: bool,
     ) !void {
+        const cid = try self.allocator.dupe(u8, call_id);
+        errdefer self.allocator.free(cid);
+        const nm = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(nm);
+        const inp = try dupeCapped(self.allocator, input_json, MAX_TOOL_OUTPUT_BYTES);
+        errdefer self.allocator.free(inp);
+        const out = try dupeCapped(self.allocator, output, MAX_TOOL_OUTPUT_BYTES);
+        errdefer self.allocator.free(out);
+
         const rec = model.ToolCallRecord{
             .msg_id = msg_id,
-            .call_id = try self.allocator.dupe(u8, call_id),
-            .name = try self.allocator.dupe(u8, name),
-            .input_json = try self.allocator.dupe(u8, input_json),
-            .output = try self.allocator.dupe(u8, output),
+            .call_id = cid,
+            .name = nm,
+            .input_json = inp,
+            .output = out,
             .is_error = is_error,
         };
-        errdefer {
-            var r = rec;
-            r.deinit(self.allocator);
-        }
+
         var w = codec.Writer{};
         defer w.deinit(self.allocator);
         try rec.encode(self.allocator, &w);

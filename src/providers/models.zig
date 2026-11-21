@@ -5,6 +5,10 @@ const iface = @import("interface.zig");
 const rpc = @import("json_rpc.zig");
 const acp = @import("acp.zig");
 
+const MAX_STDOUT_LINES: usize = 64;
+const MAX_STDERR_LINES: usize = 4096;
+const DISCOVERY_TIMEOUT_MS: u64 = 15_000;
+
 pub const ModelCatalog = struct {
     models: []iface.ModelInfo,
     note: ?[]u8,
@@ -23,9 +27,12 @@ pub const ModelCatalog = struct {
             allocator.free(list);
         }
         for (self.models, 0..) |m, i| {
+            const id_copy = try allocator.dupe(u8, m.id);
+            errdefer allocator.free(id_copy);
+            const name_copy = try allocator.dupe(u8, m.name);
             list[i] = .{
-                .id = try allocator.dupe(u8, m.id),
-                .name = try allocator.dupe(u8, m.name),
+                .id = id_copy,
+                .name = name_copy,
                 .is_default = m.is_default,
             };
             built += 1;
@@ -46,6 +53,7 @@ pub fn discover(allocator: Allocator, io: Io, provider: iface.ProviderId) !Model
         .opencode => discoverAcp(allocator, io, acp.OPENCODE_PROFILE.argv, "opencode"),
         .cursor => discoverAcp(allocator, io, acp.CURSOR_PROFILE.argv, "cursor"),
         .devin => discoverAcp(allocator, io, acp.DEVIN_PROFILE.argv, "devin"),
+        .grok => discoverAcp(allocator, io, acp.GROK_PROFILE.argv, "grok"),
         .muse => discoverMuse(allocator),
     };
 }
@@ -66,16 +74,8 @@ fn discoverMock(allocator: Allocator) !ModelCatalog {
         for (list.items) |*m| m.deinit(allocator);
         list.deinit(allocator);
     }
-    try list.append(allocator, .{
-        .id = try allocator.dupe(u8, "sim-native-v1"),
-        .name = try allocator.dupe(u8, "Native Mid-Turn Steer"),
-        .is_default = true,
-    });
-    try list.append(allocator, .{
-        .id = try allocator.dupe(u8, "sim-fallback-v1"),
-        .name = try allocator.dupe(u8, "Interrupt & Resume Steer"),
-        .is_default = false,
-    });
+    try appendModelInfo(allocator, &list, "sim-native-v1", "Native Mid-Turn Steer", true);
+    try appendModelInfo(allocator, &list, "sim-fallback-v1", "Interrupt & Resume Steer", false);
     return .{ .models = try list.toOwnedSlice(allocator), .note = null };
 }
 
@@ -91,11 +91,7 @@ fn discoverClaude(allocator: Allocator) !ModelCatalog {
         .{ .id = "haiku", .name = "Claude Haiku", .def = false },
     };
     for (presets) |p| {
-        try list.append(allocator, .{
-            .id = try allocator.dupe(u8, p.id),
-            .name = try allocator.dupe(u8, p.name),
-            .is_default = p.def,
-        });
+        try appendModelInfo(allocator, &list, p.id, p.name, p.def);
     }
     return .{ .models = try list.toOwnedSlice(allocator), .note = null };
 }
@@ -106,12 +102,26 @@ fn discoverMuse(allocator: Allocator) !ModelCatalog {
         for (list.items) |*m| m.deinit(allocator);
         list.deinit(allocator);
     }
-    try list.append(allocator, .{
-        .id = try allocator.dupe(u8, "default"),
-        .name = try allocator.dupe(u8, "Muse Default"),
-        .is_default = true,
-    });
+    try appendModelInfo(allocator, &list, "default", "Muse Default", true);
     return .{ .models = try list.toOwnedSlice(allocator), .note = null };
+}
+
+fn appendModelInfo(
+    allocator: Allocator,
+    list: *std.ArrayList(iface.ModelInfo),
+    id_str: []const u8,
+    name_str: []const u8,
+    is_default: bool,
+) !void {
+    const id_copy = try allocator.dupe(u8, id_str);
+    errdefer allocator.free(id_copy);
+    const name_copy = try allocator.dupe(u8, name_str);
+    errdefer allocator.free(name_copy);
+    try list.append(allocator, .{
+        .id = id_copy,
+        .name = name_copy,
+        .is_default = is_default,
+    });
 }
 
 fn discoverCodex(allocator: Allocator, io: Io) !ModelCatalog {
@@ -135,11 +145,17 @@ fn discoverCodex(allocator: Allocator, io: Io) !ModelCatalog {
     var note: ?[]u8 = null;
     errdefer if (note) |n| allocator.free(n);
 
-    var lines_seen: usize = 0;
-    while (lines_seen < 64) : (lines_seen += 1) {
-        var line = (pipe.readNextLine(15000) catch null) orelse break;
+    const deadline = rpc.monotonicMs(io) +| DISCOVERY_TIMEOUT_MS;
+    var stdout_seen: usize = 0;
+    var stderr_seen: usize = 0;
+    while (stdout_seen < MAX_STDOUT_LINES and stderr_seen < MAX_STDERR_LINES) {
+        var line = (pipe.readLineDeadline(deadline) catch null) orelse break;
         defer line.deinit(allocator);
-        if (line.is_stderr) continue;
+        if (line.is_stderr) {
+            stderr_seen += 1;
+            continue;
+        }
+        stdout_seen += 1;
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line.bytes, .{}) catch continue;
         defer parsed.deinit();
         const rid = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "id")) orelse continue;
@@ -159,11 +175,7 @@ fn discoverCodex(allocator: Allocator, io: Io) !ModelCatalog {
                     rpc.jsonStr(rpc.jsonObjGet(item, "id")) orelse continue;
                 const dname = rpc.jsonStr(rpc.jsonObjGet(item, "displayName")) orelse mid;
                 const is_def = rpc.jsonBool(rpc.jsonObjGet(item, "isDefault")) orelse false;
-                try list.append(allocator, .{
-                    .id = try allocator.dupe(u8, mid),
-                    .name = try allocator.dupe(u8, dname),
-                    .is_default = is_def,
-                });
+                try appendModelInfo(allocator, &list, mid, dname, is_def);
             }
         }
         break;
@@ -197,13 +209,19 @@ fn discoverPi(allocator: Allocator, io: Io) !ModelCatalog {
         list.deinit(allocator);
     }
 
+    const deadline = rpc.monotonicMs(io) +| DISCOVERY_TIMEOUT_MS;
     var got_state = false;
     var got_models = false;
-    var lines_seen: usize = 0;
-    while (lines_seen < 64 and (!got_state or !got_models)) : (lines_seen += 1) {
-        var line = (pipe.readNextLine(15000) catch null) orelse break;
+    var stdout_seen: usize = 0;
+    var stderr_seen: usize = 0;
+    while (stdout_seen < MAX_STDOUT_LINES and stderr_seen < MAX_STDERR_LINES and (!got_state or !got_models)) {
+        var line = (pipe.readLineDeadline(deadline) catch null) orelse break;
         defer line.deinit(allocator);
-        if (line.is_stderr) continue;
+        if (line.is_stderr) {
+            stderr_seen += 1;
+            continue;
+        }
+        stdout_seen += 1;
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line.bytes, .{}) catch continue;
         defer parsed.deinit();
         const t = rpc.jsonStr(rpc.jsonObjGet(parsed.value, "type")) orelse continue;
@@ -212,8 +230,14 @@ fn discoverPi(allocator: Allocator, io: Io) !ModelCatalog {
         if (std.mem.eql(u8, rid, "1")) {
             got_state = true;
             const mobj = rpc.jsonObjGet(rpc.jsonObjGet(parsed.value, "data"), "model");
-            if (rpc.jsonStr(rpc.jsonObjGet(mobj, "provider"))) |cp| cur_prov = try allocator.dupe(u8, cp);
-            if (rpc.jsonStr(rpc.jsonObjGet(mobj, "id"))) |ci| cur_id = try allocator.dupe(u8, ci);
+            if (rpc.jsonStr(rpc.jsonObjGet(mobj, "provider"))) |cp| {
+                if (cur_prov) |old| allocator.free(old);
+                cur_prov = try allocator.dupe(u8, cp);
+            }
+            if (rpc.jsonStr(rpc.jsonObjGet(mobj, "id"))) |ci| {
+                if (cur_id) |old| allocator.free(old);
+                cur_id = try allocator.dupe(u8, ci);
+            }
         } else if (std.mem.eql(u8, rid, "2")) {
             got_models = true;
             const models_v = rpc.jsonObjGet(rpc.jsonObjGet(parsed.value, "data"), "models") orelse continue;
@@ -278,13 +302,16 @@ fn discoverAcp(allocator: Allocator, io: Io, argv: []const []const u8, slug: []c
     var last_stderr: ?[]u8 = null;
     defer if (last_stderr) |s| allocator.free(s);
 
+    const deadline = rpc.monotonicMs(io) +| DISCOVERY_TIMEOUT_MS;
     var can_delete = false;
     var initialized = false;
-    var step: usize = 0;
-    while (step < 64) : (step += 1) {
-        var line = (pipe.readNextLine(15000) catch null) orelse break;
+    var stdout_seen: usize = 0;
+    var stderr_seen: usize = 0;
+    while (stdout_seen < MAX_STDOUT_LINES and stderr_seen < MAX_STDERR_LINES) {
+        var line = (pipe.readLineDeadline(deadline) catch null) orelse break;
         defer line.deinit(allocator);
         if (line.is_stderr) {
+            stderr_seen += 1;
             const trimmed = std.mem.trim(u8, line.bytes, " \t\r\n");
             const is_noise = trimmed.len == 0 or
                 std.mem.startsWith(u8, trimmed, "/") or
@@ -298,6 +325,7 @@ fn discoverAcp(allocator: Allocator, io: Io, argv: []const []const u8, slug: []c
             }
             continue;
         }
+        stdout_seen += 1;
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line.bytes, .{}) catch continue;
         defer parsed.deinit();
         const rid = rpc.jsonU64(rpc.jsonObjGet(parsed.value, "id")) orelse continue;
@@ -373,11 +401,7 @@ fn parseAcpModels(allocator: Allocator, res: std.json.Value, out: *std.ArrayList
                 for (values.array.items) |entry| {
                     const val = rpc.jsonStr(rpc.jsonObjGet(entry, "value")) orelse continue;
                     const name = rpc.jsonStr(rpc.jsonObjGet(entry, "name")) orelse val;
-                    try out.append(allocator, .{
-                        .id = try allocator.dupe(u8, val),
-                        .name = try allocator.dupe(u8, name),
-                        .is_default = std.mem.eql(u8, val, cur),
-                    });
+                    try appendModelInfo(allocator, out, val, name, std.mem.eql(u8, val, cur));
                 }
                 if (out.items.len > 0) return;
             }
@@ -392,11 +416,7 @@ fn parseAcpModels(allocator: Allocator, res: std.json.Value, out: *std.ArrayList
             const val = rpc.jsonStr(rpc.jsonObjGet(entry, "modelId")) orelse
                 rpc.jsonStr(rpc.jsonObjGet(entry, "id")) orelse continue;
             const name = rpc.jsonStr(rpc.jsonObjGet(entry, "name")) orelse val;
-            try out.append(allocator, .{
-                .id = try allocator.dupe(u8, val),
-                .name = try allocator.dupe(u8, name),
-                .is_default = std.mem.eql(u8, val, cur),
-            });
+            try appendModelInfo(allocator, out, val, name, std.mem.eql(u8, val, cur));
         }
     }
 }
