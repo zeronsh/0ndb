@@ -1,0 +1,33 @@
+package osync
+
+import "../prim"
+
+Storage_Done :: #type proc(ctx: rawptr, result: Error, value: i64)
+
+Relay_Storage :: struct {
+	data:            rawptr,
+	namespace_open:  proc(data: rawptr, ns: Space_Id) -> (h: rawptr, usage: i64, err: Error),
+	namespace_close: proc(data: rawptr, h: rawptr),
+	stream_open:     proc(data: rawptr, ns: rawptr, id: Stream_Id, create: bool) -> (s: rawptr, length: i64, err: Error),
+	stream_close:    proc(data: rawptr, s: rawptr),
+	stream_probe:    proc(data: rawptr, ns: rawptr, id: Stream_Id) -> (length: i64, exists: bool, err: Error),
+	stream_read:     proc(data: rawptr, s: rawptr, at: i64, dst: []u8) -> (int, Error),
+	stream_fd:       proc(data: rawptr, s: rawptr) -> (fd: prim.Fd, base: i64, ok: bool),
+	append_begin:    proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawptr, err: Error),
+	append_write:    proc(data: rawptr, w: rawptr, bytes: []u8) -> Error,
+	append_commit:   proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawptr),
+	append_abort:    proc(data: rawptr, w: rawptr),
+	drop:            proc(data: rawptr, ns: rawptr, id: Stream_Id, done: Storage_Done, ctx: rawptr),
+	redact:          proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, ctx: rawptr),
+	list_begin:      proc(data: rawptr, ns: rawptr, since: i64) -> (it: rawptr, cursor: i64, err: Error),
+	list_next:       proc(data: rawptr, it: rawptr) -> (id: Stream_Id, ok: bool),
+	list_end:        proc(data: rawptr, it: rawptr),
+	put_begin:       proc(data: rawptr, ns: rawptr, key: Object_Key, total: i64) -> (w: rawptr, exists: bool, err: Error),
+	put_write:       proc(data: rawptr, w: rawptr, bytes: []u8) -> Error,
+	put_commit:      proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawptr),
+	put_abort:       proc(data: rawptr, w: rawptr),
+	object_open:     proc(data: rawptr, ns: rawptr, key: Object_Key) -> (o: rawptr, size: i64, err: Error),
+	object_read:     proc(data: rawptr, o: rawptr, at: i64, dst: []u8) -> (int, Error),
+	object_fd:       proc(data: rawptr, o: rawptr) -> (fd: prim.Fd, base: i64, ok: bool),
+	object_close:    proc(data: rawptr, o: rawptr),
+}

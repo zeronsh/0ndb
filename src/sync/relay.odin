@@ -1,0 +1,2304 @@
+package osync
+
+import "base:runtime"
+import "../prim"
+
+Relay_Config :: struct {
+	vfs:             prim.Vfs,
+	dir:             string,
+	listen:          []string,
+	allow_file:      string,
+	open:            bool,
+	default_quota:   i64,
+	authorizer:      Authorizer,
+	storage:         Relay_Storage,
+	max_conns:       int,
+	max_pending:     int,
+	max_space_conns: int,
+	max_follows:     int,
+	handshake_ms:    i64,
+	sync_threads:    int,
+	kernel_tls:      bool,
+}
+
+Relay_Stats :: struct {
+	conns:      int,
+	pending:    int,
+	ready:      int,
+	kernel_tls: int,
+	spaces:     int,
+	streams:    int,
+	accepted:   u64,
+	appends:    u64,
+	bytes_in:   u64,
+	bytes_out:  u64,
+}
+
+Conn_Ref :: struct {
+	slot: u32,
+	gen:  u32,
+}
+
+Link :: struct {
+	data:     rawptr,
+	send:     proc(data: rawptr, bytes: []u8, more: bool) -> (int, Error),
+	sendfile: proc(data: rawptr, fd: prim.Fd, off: i64, n: int) -> (int, Error),
+	close:    proc(data: rawptr),
+	pause:    proc(data: rawptr, paused: bool),
+}
+
+Relay :: struct {
+	vfs:        prim.Vfs,
+	loop:       ^prim.Loop,
+	cfg:        Relay_Config,
+	root:       string,
+	lock:       prim.Fd,
+	key:        Relay_Key,
+	has_key:    bool,
+	store:      Relay_Storage,
+	own_store:  ^File_Store,
+	auth:       Authorizer,
+	own_auth:   ^Space_Authorizer,
+	listeners:  [dynamic]^Listener,
+	conns:      [dynamic]^Conn,
+	gens:       [dynamic]u32,
+	free:       [dynamic]u32,
+	spaces:     map[Space_Id]^Space_State,
+	rscratch:   []u8,
+	wscratch:   []u8,
+	graveyard:  [dynamic]^Conn,
+	stats:      Relay_Stats,
+	allocator:  runtime.Allocator,
+}
+
+Listener :: struct {
+	relay: ^Relay,
+	fd:    prim.Fd,
+	watch: prim.Watch,
+	unix:  bool,
+	path:  string,
+}
+
+Space_State :: struct {
+	id:       Space_Id,
+	ns:       rawptr,
+	quota:    i64,
+	usage:    i64,
+	reserved: i64,
+	streams:  map[Stream_Id]^Stream_State,
+	watchers: [dynamic]^Conn,
+	conns:    int,
+	jobs:     int,
+	feed:     ^Stream_State,
+	feed_len: i64,
+	feed_q:   [dynamic]u8,
+	feed_busy: bool,
+	feeders:  [dynamic]^Conn,
+}
+
+Stream_State :: struct {
+	space:     ^Space_State,
+	id:        Stream_Id,
+	h:         rawptr,
+	length:    i64,
+	refs:      int,
+	followers: [dynamic]^Conn,
+	busy:      bool,
+	poisoned:  bool,
+	dropped:   bool,
+}
+
+Conn_State :: enum u8 {
+	Handshake,
+	Hello,
+	Ready,
+}
+
+Sub :: struct {
+	stream: ^Stream_State,
+	offset: i64,
+}
+
+Op_Kind :: enum u8 {
+	None,
+	Append,
+	Put,
+	Discard,
+}
+
+Op :: struct {
+	kind:   Op_Kind,
+	stream: ^Stream_State,
+	w:      rawptr,
+	total:  i64,
+	failed: Error,
+	key:    Object_Key,
+	reply:  Kind,
+	code:   Code,
+	id:     [32]u8,
+	len:    i64,
+}
+
+Out_Kind :: enum u8 {
+	Bytes,
+	Data,
+	Object,
+}
+
+Out :: struct {
+	kind:    Out_Kind,
+	small:   [64]u8,
+	hlen:    int,
+	hpos:    int,
+	buf:     []u8,
+	stream:  ^Stream_State,
+	at:      i64,
+	to:      i64,
+	left:    i64,
+	started: bool,
+	key:     Object_Key,
+	obj:     rawptr,
+}
+
+Listing :: struct {
+	it:     rawptr,
+	cursor: i64,
+	done:   bool,
+}
+
+Conn :: struct {
+	relay:     ^Relay,
+	ref:       Conn_Ref,
+	fd:        prim.Fd,
+	watch:     prim.Watch,
+	timer:     prim.Timer,
+	state:     Conn_State,
+	local:     bool,
+	external:  bool,
+	link:      Link,
+	tr:        Transport,
+	hs:        [2 + MSG1_LEN]u8,
+	hs_have:   int,
+	binding:   [HASH_LEN]u8,
+	bind_len:  int,
+	principal: Principal,
+	space:     ^Space_State,
+	parser:    Parser,
+	op:        Op,
+	out:       [dynamic]Out,
+	out_head:  int,
+	subs:      [dynamic]Sub,
+	rr:        int,
+	scan:      bool,
+	listing:   ^Listing,
+	stash:     [dynamic]u8,
+	inflight:  int,
+	paused:    bool,
+	feeding:   bool,
+	pumping:   bool,
+	again:     bool,
+	closing:   bool,
+	dead:      bool,
+	watching:  bool,
+	counted:   bool,
+	blocked:   bool,
+	feed_on:   bool,
+	feed_off:  i64,
+	feed_hint: bool,
+}
+
+@(private)
+Pending_Kind :: enum u8 {
+	Append,
+	Put,
+	Drop,
+	Redact,
+	Feed,
+}
+
+@(private)
+Pending :: struct {
+	relay:  ^Relay,
+	kind:   Pending_Kind,
+	conn:   Conn_Ref,
+	stream: ^Stream_State,
+	space:  ^Space_State,
+	total:  i64,
+	from:   i64,
+	id:     [32]u8,
+}
+
+@(private)
+MAX_INFLIGHT :: 32
+@(private)
+MAX_OUT :: 256
+@(private)
+SENDFILE_CHUNK :: 1 << 20
+@(private)
+RSCRATCH :: 256 * 1024
+@(private)
+WSCRATCH :: 64 * 1024
+
+relay_config :: proc(dir: string) -> Relay_Config {
+	return Relay_Config {
+		dir = dir,
+		max_conns = 100_000,
+		max_pending = 1024,
+		max_space_conns = 4096,
+		max_follows = 16384,
+		handshake_ms = 10_000,
+		sync_threads = 4,
+		kernel_tls = true,
+	}
+}
+
+relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := context.allocator) -> (err: Error) {
+	r^ = {
+		loop      = l,
+		cfg       = cfg,
+		lock      = prim.INVALID_FD,
+		allocator = allocator,
+	}
+	r.vfs = cfg.vfs if cfg.vfs.procs != nil else prim.os_vfs()
+	if r.cfg.max_conns <= 0 {
+		r.cfg.max_conns = 100_000
+	}
+	if r.cfg.max_pending <= 0 {
+		r.cfg.max_pending = 1024
+	}
+	if r.cfg.max_space_conns <= 0 {
+		r.cfg.max_space_conns = 4096
+	}
+	if r.cfg.max_follows <= 0 {
+		r.cfg.max_follows = 16384
+	}
+	if r.cfg.handshake_ms <= 0 {
+		r.cfg.handshake_ms = 10_000
+	}
+	r.cfg.listen = nil
+	r.listeners = make([dynamic]^Listener, allocator)
+	r.conns = make([dynamic]^Conn, allocator)
+	r.gens = make([dynamic]u32, allocator)
+	r.free = make([dynamic]u32, allocator)
+	r.graveyard = make([dynamic]^Conn, allocator)
+	r.spaces = make(map[Space_Id]^Space_State, allocator)
+	defer if err != .None {
+		relay_destroy(r)
+	}
+	if len(cfg.dir) > 0 {
+		r.root = _clone_string(cfg.dir, allocator) or_return
+		if merr := prim.mkdir_all(r.vfs, r.root, 0o700); merr != .None {
+			return _from_prim(merr)
+		}
+		lock_path, _ := prim.path_join(context.temp_allocator, r.root, "relay.lock")
+		lfd, lerr := prim.lock_file(r.vfs, lock_path)
+		if lerr != .None {
+			return _from_prim(lerr)
+		}
+		r.lock = lfd
+		r.key = relay_key_load_or_create(r.vfs, r.root) or_return
+		r.has_key = true
+	}
+	r.cfg.dir = r.root
+	rs, e1 := make([]u8, RSCRATCH, allocator)
+	ws, e2 := make([]u8, WSCRATCH, allocator)
+	r.rscratch = rs
+	r.wscratch = ws
+	if e1 != nil || e2 != nil {
+		return .No_Memory
+	}
+	if cfg.storage.data != nil {
+		r.store = cfg.storage
+	} else {
+		if len(r.root) == 0 {
+			return .Invalid
+		}
+		fs, aerr := new(File_Store, allocator)
+		if aerr != nil {
+			return .No_Memory
+		}
+		if ferr := file_store_init(fs, l, r.vfs, r.root, cfg.sync_threads, allocator); ferr != .None {
+			free(fs, allocator)
+			return ferr
+		}
+		r.own_store = fs
+		r.store = file_store(fs)
+	}
+	if cfg.authorizer.authorize != nil {
+		r.auth = cfg.authorizer
+	} else {
+		sa, aerr := new(Space_Authorizer, allocator)
+		if aerr != nil {
+			return .No_Memory
+		}
+		allow_path := cfg.allow_file
+		if len(allow_path) == 0 && len(r.root) > 0 {
+			allow_path, _ = prim.path_join(context.temp_allocator, r.root, "allow")
+		}
+		if aerr2 := space_authorizer_init(sa, r.vfs, allow_path, cfg.open, cfg.default_quota, allocator); aerr2 != .None {
+			free(sa, allocator)
+			return aerr2
+		}
+		r.own_auth = sa
+		r.auth = space_authorizer(sa)
+	}
+	_raise_nofile()
+	return .None
+}
+
+relay_destroy :: proc(r: ^Relay) {
+	for ln in r.listeners {
+		_listener_close(r, ln)
+	}
+	delete(r.listeners)
+	for c in r.conns {
+		if c != nil {
+			_conn_close(c)
+		}
+	}
+	if r.own_store != nil {
+		worker_destroy(&r.own_store.worker)
+		r.own_store.worker = {}
+	}
+	_reap(r)
+	for _, sp in r.spaces {
+		for _, st in sp.streams {
+			if st.h != nil {
+				r.store.stream_close(r.store.data, st.h)
+			}
+			delete(st.followers)
+			free(st, r.allocator)
+		}
+		delete(sp.streams)
+		delete(sp.watchers)
+		if sp.ns != nil {
+			r.store.namespace_close(r.store.data, sp.ns)
+		}
+		free(sp, r.allocator)
+	}
+	delete(r.spaces)
+	delete(r.conns)
+	delete(r.gens)
+	delete(r.free)
+	delete(r.graveyard)
+	if r.own_store != nil {
+		delete(r.own_store.scratch, r.allocator)
+		delete(r.own_store.root, r.allocator)
+		free(r.own_store, r.allocator)
+	}
+	if r.own_auth != nil {
+		space_authorizer_destroy(r.own_auth)
+		free(r.own_auth, r.allocator)
+	}
+	if r.rscratch != nil {
+		delete(r.rscratch, r.allocator)
+	}
+	if r.wscratch != nil {
+		delete(r.wscratch, r.allocator)
+	}
+	relay_key_clear(&r.key)
+	if r.lock >= 0 {
+		prim.close_file(r.vfs, r.lock)
+	}
+	if len(r.root) > 0 {
+		delete(r.root, r.allocator)
+	}
+	r^ = {}
+}
+
+relay_public_key :: proc "contextless" (r: ^Relay) -> Public_Key {
+	return r.key.public
+}
+
+relay_stats :: proc "contextless" (r: ^Relay) -> Relay_Stats {
+	s := r.stats
+	s.spaces = len(r.spaces)
+	return s
+}
+
+relay_listen :: proc(r: ^Relay, addr: string) -> Error {
+	ep := endpoint_parse(addr) or_return
+	if ep.family == .Host {
+		ep = endpoint_resolve(&ep) or_return
+	}
+	if ep.family != .Unix && !r.has_key {
+		return .Invalid
+	}
+	fd := _listen(&ep) or_return
+	ln, aerr := new(Listener, r.allocator)
+	if aerr != nil {
+		prim.close(fd)
+		return .No_Memory
+	}
+	ln.relay = r
+	ln.fd = fd
+	ln.unix = ep.family == .Unix
+	if ln.unix {
+		ln.path, _ = _clone_string(string(ep.path[:ep.path_len]), r.allocator)
+		_tighten_mode(prim.os_vfs(), ln.path)
+	}
+	w, werr := prim.watch(r.loop, fd, {.Read}, ln, _on_listen)
+	if werr != .None {
+		prim.close(fd)
+		if len(ln.path) > 0 {
+			delete(ln.path, r.allocator)
+		}
+		free(ln, r.allocator)
+		return _from_prim(werr)
+	}
+	ln.watch = w
+	if _, e := append(&r.listeners, ln); e != nil {
+		_listener_close(r, ln)
+		return .No_Memory
+	}
+	return .None
+}
+
+relay_adopt :: proc(r: ^Relay, fd: prim.Fd, unix: bool, initial: []u8 = nil) -> Error {
+	c := _conn_new(r, fd, unix) or_return
+	if len(initial) > 0 {
+		if _, e := append(&c.stash, ..initial); e != nil {
+			_conn_close(c)
+			_reap(r)
+			return .No_Memory
+		}
+	}
+	_conn_read(c)
+	_conn_pump(c)
+	_reap(r)
+	return .None
+}
+
+relay_attach :: proc(r: ^Relay, link: Link, local: bool, binding: []u8 = nil) -> (ref: Conn_Ref, err: Error) {
+	c := _conn_alloc(r) or_return
+	c.external = true
+	c.link = link
+	c.local = local
+	c.fd = prim.INVALID_FD
+	c.state = .Hello
+	c.bind_len = copy(c.binding[:], binding)
+	if len(binding) > HASH_LEN {
+		buf: [16 + HASH_LEN]u8
+		m := hello_message(binding, &buf)
+		c.bind_len = copy(c.binding[:], m[16:])
+	}
+	if !local {
+		c.timer = prim.timer(r.loop, r.cfg.handshake_ms, c, _on_conn_timeout)
+	}
+	return c.ref, .None
+}
+
+relay_input :: proc(r: ^Relay, ref: Conn_Ref, data: []u8) -> Error {
+	c := _conn_lookup(r, ref)
+	if c == nil {
+		return .Closed
+	}
+	r.stats.bytes_in += u64(len(data))
+	if c.paused || len(c.stash) > 0 {
+		if _, e := append(&c.stash, ..data); e != nil {
+			_conn_close(c)
+			_reap(r)
+			return .No_Memory
+		}
+	} else {
+		_feed(c, data)
+	}
+	_conn_pump(c)
+	dead := c.dead
+	_reap(r)
+	return .Closed if dead else .None
+}
+
+relay_writable :: proc(r: ^Relay, ref: Conn_Ref) {
+	if c := _conn_lookup(r, ref); c != nil {
+		_conn_pump(c)
+	}
+	_reap(r)
+}
+
+relay_detach :: proc(r: ^Relay, ref: Conn_Ref) {
+	if c := _conn_lookup(r, ref); c != nil {
+		c.link.close = nil
+		_conn_close(c)
+	}
+	_reap(r)
+}
+
+relay_stream_changed :: proc(r: ^Relay, space: Space_Id, id: Stream_Id, length: i64) {
+	sp, ok := r.spaces[space]
+	if !ok {
+		return
+	}
+	st, sok := sp.streams[id]
+	if !sok || st.busy || length <= st.length {
+		return
+	}
+	st.length = length
+	for f in st.followers {
+		f.scan = true
+		_conn_kick(f)
+	}
+	_reap(r)
+}
+
+relay_run :: proc(cfg: Relay_Config) -> Error {
+	l: prim.Loop
+	if err := prim.loop_init(&l); err != .None {
+		return _from_prim(err)
+	}
+	defer prim.loop_destroy(&l)
+	r: Relay
+	relay_init(&r, &l, cfg) or_return
+	defer relay_destroy(&r)
+	for a in cfg.listen {
+		relay_listen(&r, a) or_return
+	}
+	return _from_prim(prim.loop_run(&l))
+}
+
+@(private)
+_listener_close :: proc(r: ^Relay, ln: ^Listener) {
+	if ln.watch != 0 {
+		prim.unwatch(r.loop, ln.watch)
+	}
+	prim.close(ln.fd)
+	if ln.unix && len(ln.path) > 0 {
+		prim.remove(prim.os_vfs(), ln.path)
+		delete(ln.path, r.allocator)
+	}
+	free(ln, r.allocator)
+}
+
+@(private)
+_on_listen :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
+	ln := cast(^Listener)data
+	r := ln.relay
+	for {
+		cfd, err := _accept(ln.fd)
+		if err != .None {
+			break
+		}
+		r.stats.accepted += 1
+		if r.stats.conns >= r.cfg.max_conns || (!ln.unix && r.stats.pending >= r.cfg.max_pending) {
+			prim.close(cfd)
+			continue
+		}
+		if ln.unix && !_peer_is_self(cfd) {
+			prim.close(cfd)
+			continue
+		}
+		_conn_new(r, cfd, ln.unix)
+	}
+	_reap(r)
+}
+
+@(private)
+_conn_alloc :: proc(r: ^Relay) -> (c: ^Conn, err: Error) {
+	slot: u32
+	if n := len(r.free); n > 0 {
+		slot = r.free[n - 1]
+		pop(&r.free)
+	} else {
+		if _, e := append(&r.conns, nil); e != nil {
+			return nil, .No_Memory
+		}
+		if _, e := append(&r.gens, 0); e != nil {
+			pop(&r.conns)
+			return nil, .No_Memory
+		}
+		slot = u32(len(r.conns) - 1)
+	}
+	nc, aerr := new(Conn, r.allocator)
+	if aerr != nil {
+		append(&r.free, slot)
+		return nil, .No_Memory
+	}
+	c = nc
+	r.gens[slot] += 1
+	r.conns[slot] = c
+	c.relay = r
+	c.ref = {slot, r.gens[slot]}
+	c.fd = prim.INVALID_FD
+	c.tr.fd = prim.INVALID_FD
+	parser_init(&c.parser, true, r.allocator)
+	c.out = make([dynamic]Out, r.allocator)
+	c.subs = make([dynamic]Sub, r.allocator)
+	c.stash = make([dynamic]u8, r.allocator)
+	r.stats.conns += 1
+	r.stats.pending += 1
+	c.counted = true
+	return c, .None
+}
+
+@(private)
+_conn_new :: proc(r: ^Relay, fd: prim.Fd, unix: bool) -> (c: ^Conn, err: Error) {
+	c, err = _conn_alloc(r)
+	if err != .None {
+		prim.close(fd)
+		return nil, err
+	}
+	c.fd = fd
+	c.local = unix
+	c.state = .Hello if unix else .Handshake
+	transport_init_plain(&c.tr, fd, r.allocator)
+	if !unix {
+		_tune_tcp(fd)
+	}
+	w, werr := prim.watch(r.loop, fd, {.Read, .Write}, c, _on_conn)
+	if werr != .None {
+		_conn_close(c)
+		return nil, _from_prim(werr)
+	}
+	c.watch = w
+	c.timer = prim.timer(r.loop, r.cfg.handshake_ms, c, _on_conn_timeout)
+	return c, .None
+}
+
+@(private)
+_on_conn_timeout :: proc(l: ^prim.Loop, data: rawptr) {
+	c := cast(^Conn)data
+	c.timer = 0
+	if c.state != .Ready {
+		_conn_close(c)
+	}
+	_reap(c.relay)
+}
+
+@(private)
+_on_conn :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
+	c := cast(^Conn)data
+	r := c.relay
+	if .Read in events || .Hangup in events || .Error in events {
+		_conn_read(c)
+	}
+	_conn_pump(c)
+	_reap(r)
+}
+
+@(private)
+_reap :: proc(r: ^Relay) {
+	for c in r.graveyard {
+		parser_destroy(&c.parser)
+		delete(c.out)
+		delete(c.subs)
+		delete(c.stash)
+		free(c, r.allocator)
+	}
+	clear(&r.graveyard)
+}
+
+@(private)
+_conn_lookup :: proc "contextless" (r: ^Relay, ref: Conn_Ref) -> ^Conn {
+	if int(ref.slot) >= len(r.conns) || r.gens[ref.slot] != ref.gen {
+		return nil
+	}
+	c := r.conns[ref.slot]
+	if c == nil || c.dead {
+		return nil
+	}
+	return c
+}
+
+@(private)
+_conn_close :: proc(c: ^Conn) {
+	if c.dead {
+		return
+	}
+	r := c.relay
+	c.dead = true
+	if c.timer != 0 {
+		prim.timer_cancel(r.loop, c.timer)
+		c.timer = 0
+	}
+	if c.watch != 0 {
+		prim.unwatch(r.loop, c.watch)
+		c.watch = 0
+	}
+	_op_abort(c)
+	for &s in c.subs {
+		_remove_conn(&s.stream.followers, c)
+		_stream_unref(r, s.stream)
+	}
+	clear(&c.subs)
+	for i in c.out_head ..< len(c.out) {
+		_out_release(r, &c.out[i])
+	}
+	clear(&c.out)
+	c.out_head = 0
+	if c.listing != nil {
+		_listing_end(c)
+	}
+	sp := c.space
+	if sp != nil {
+		if c.watching {
+			_remove_conn(&sp.watchers, c)
+		}
+		if c.feed_on {
+			_remove_conn(&sp.feeders, c)
+		}
+		sp.conns -= 1
+		c.space = nil
+		_space_release(r, sp)
+	}
+	if c.external {
+		if c.link.close != nil {
+			c.link.close(c.link.data)
+		}
+	} else {
+		transport_close(&c.tr)
+	}
+	c.fd = prim.INVALID_FD
+	if c.counted {
+		r.stats.conns -= 1
+		switch c.state {
+		case .Ready:
+			r.stats.ready -= 1
+		case .Handshake, .Hello:
+			r.stats.pending -= 1
+		}
+		if c.tr.ktx || c.tr.krx {
+			r.stats.kernel_tls -= 1
+		}
+		c.counted = false
+	}
+	r.conns[c.ref.slot] = nil
+	append(&r.free, c.ref.slot)
+	append(&r.graveyard, c)
+}
+
+@(private)
+_remove_conn :: proc(list: ^[dynamic]^Conn, c: ^Conn) {
+	for i := 0; i < len(list); i += 1 {
+		if list[i] == c {
+			unordered_remove(list, i)
+			return
+		}
+	}
+}
+
+@(private)
+_conn_ready :: proc(c: ^Conn) {
+	r := c.relay
+	c.state = .Ready
+	r.stats.pending -= 1
+	r.stats.ready += 1
+	if c.timer != 0 {
+		prim.timer_cancel(r.loop, c.timer)
+		c.timer = 0
+	}
+}
+
+@(private)
+_conn_handshake :: proc(c: ^Conn) {
+	r := c.relay
+	need := 2 + MSG1_LEN
+	for c.hs_have < need {
+		want := 2 if c.hs_have < 2 else need
+		n, err := _recv(c.fd, c.hs[c.hs_have:want])
+		if err == .Would_Block {
+			return
+		}
+		if err != .None {
+			_conn_close(c)
+			return
+		}
+		c.hs_have += n
+		if c.hs_have == 2 && int(c.hs[0]) | int(c.hs[1]) << 8 != MSG1_LEN {
+			_conn_close(c)
+			return
+		}
+	}
+	h: Handshake
+	out: [2 + MSG2_LEN + 16]u8
+	_, keys, err := handshake_respond(&h, &r.key, c.hs[2:need], out[2:])
+	if err != .None {
+		_conn_close(c)
+		return
+	}
+	defer session_keys_clear(&keys)
+	out[0] = u8(MSG2_LEN)
+	out[1] = 0
+	w, serr := _send(c.fd, out[:2 + MSG2_LEN], false)
+	if serr != .None || w != 2 + MSG2_LEN {
+		_conn_close(c)
+		return
+	}
+	transport_init_secure(&c.tr, c.fd, &keys, r.cfg.kernel_tls, r.allocator)
+	if c.tr.ktx || c.tr.krx {
+		r.stats.kernel_tls += 1
+	}
+	c.bind_len = copy(c.binding[:], keys.hash[:])
+	c.state = .Hello
+}
+
+@(private)
+_conn_read :: proc(c: ^Conn) {
+	r := c.relay
+	if c.dead {
+		return
+	}
+	if c.state == .Handshake {
+		_conn_handshake(c)
+		if c.dead || c.state == .Handshake {
+			return
+		}
+	}
+	if len(c.stash) > 0 && !c.paused {
+		tmp := c.stash
+		c.stash = make([dynamic]u8, r.allocator)
+		_feed(c, tmp[:])
+		delete(tmp)
+	}
+	if c.external {
+		return
+	}
+	for !c.dead && !c.paused && !c.closing {
+		n, err := transport_recv(&c.tr, r.rscratch)
+		if err == .Would_Block {
+			break
+		}
+		if err != .None {
+			_conn_close(c)
+			return
+		}
+		r.stats.bytes_in += u64(n)
+		_feed(c, r.rscratch[:n])
+	}
+}
+
+@(private)
+_should_pause :: proc "contextless" (c: ^Conn) -> bool {
+	return c.inflight >= MAX_INFLIGHT || len(c.out) - c.out_head >= MAX_OUT || c.listing != nil
+}
+
+@(private)
+_set_paused :: proc(c: ^Conn, p: bool) {
+	c.paused = p
+	if c.external && c.link.pause != nil && c.blocked != p {
+		c.blocked = p
+		c.link.pause(c.link.data, p)
+	}
+}
+
+@(private)
+_feed :: proc(c: ^Conn, data: []u8) {
+	c.feeding = true
+	defer c.feeding = false
+	pos := 0
+	for !c.dead && !c.closing {
+		if _should_pause(c) {
+			if pos < len(data) {
+				if _, e := append(&c.stash, ..data[pos:]); e != nil {
+					_conn_close(c)
+					return
+				}
+			}
+			_set_paused(c, true)
+			return
+		}
+		it, used, err := parser_next(&c.parser, data[pos:])
+		pos += used
+		if err != .None {
+			_fail(c, .Too_Large if err == .Too_Large else .Protocol)
+			return
+		}
+		if it.kind == .None {
+			break
+		}
+		_handle(c, &it)
+	}
+	parser_release(&c.parser)
+}
+
+@(private)
+_fail :: proc(c: ^Conn, code: Code) {
+	if c.dead || c.closing {
+		return
+	}
+	_op_abort(c)
+	b: [FRAME_HEADER + 1]u8
+	frame_header(b[:], .Error, 1)
+	b[FRAME_HEADER] = u8(code)
+	_push_small(c, b[:])
+	c.closing = true
+	c.paused = true
+}
+
+@(private)
+_handle :: proc(c: ^Conn, it: ^Item) {
+	if c.state != .Ready {
+		if it.kind == .Control && it.frame == .Hello && c.state == .Hello {
+			_on_hello(c, it.data)
+		} else {
+			_fail(c, .Protocol)
+		}
+		return
+	}
+	switch it.kind {
+	case .None:
+	case .Control:
+		rd := prim.reader(it.data)
+		#partial switch it.frame {
+		case .List:
+			_on_list(c, &rd)
+		case .Read:
+			_on_read(c, &rd, false)
+		case .Tail:
+			_on_read(c, &rd, true)
+		case .Follow:
+			_on_follow(c, &rd)
+		case .Unfollow:
+			_on_unfollow(c, &rd)
+		case .Get:
+			_on_get(c, &rd)
+		case .Drop:
+			_on_drop(c, &rd)
+		case .Redact:
+			_on_redact(c, &rd)
+		case .Feed:
+			_on_feed(c, &rd)
+		case:
+			_fail(c, .Protocol)
+		}
+	case .Bulk_Begin:
+		rd := prim.reader(it.data)
+		#partial switch it.frame {
+		case .Append:
+			_on_append_begin(c, &rd, i64(it.total))
+		case .Put:
+			_on_put_begin(c, &rd, i64(it.total))
+		case:
+			_fail(c, .Protocol)
+		}
+	case .Bulk_Data:
+		_on_bulk_data(c, it.data)
+	case .Bulk_End:
+		_on_bulk_end(c)
+	}
+}
+
+@(private)
+_on_hello :: proc(c: ^Conn, payload: []u8) {
+	r := c.relay
+	if len(payload) < 1 || len(payload) > 1 + CREDENTIAL_MAX {
+		_fail(c, .Protocol)
+		return
+	}
+	if payload[0] != PROTOCOL_VERSION {
+		_fail(c, .Version)
+		return
+	}
+	p: Principal
+	if code := r.auth.authorize(r.auth.data, payload[1:], c.binding[:c.bind_len], c.local, &p); code != .None {
+		_fail(c, code)
+		return
+	}
+	sp, err := _space_get(r, p.namespace)
+	if err != .None {
+		_fail(c, .Io)
+		return
+	}
+	if sp.conns >= r.cfg.max_space_conns {
+		_space_release(r, sp)
+		_fail(c, .Limit)
+		return
+	}
+	sp.quota = p.quota
+	sp.conns += 1
+	c.space = sp
+	c.principal = p
+	_conn_ready(c)
+	b: [FRAME_HEADER + 25]u8
+	frame_header(b[:], .Welcome, 25)
+	b[FRAME_HEADER] = PROTOCOL_VERSION
+	prim.put_u64le(b[FRAME_HEADER + 1:], u64(prim.now_ns()))
+	prim.put_u64le(b[FRAME_HEADER + 9:], u64(max(sp.usage, 0)))
+	prim.put_u64le(b[FRAME_HEADER + 17:], u64(sp.quota))
+	_push_small(c, b[:])
+}
+
+@(private)
+_can :: proc(c: ^Conn, access: Access, id: [32]u8) -> bool {
+	if id == cast([32]u8)FEED_ID {
+		return false
+	}
+	return principal_allows(&c.principal, access, id)
+}
+
+@(private)
+_space_get :: proc(r: ^Relay, id: Space_Id) -> (sp: ^Space_State, err: Error) {
+	if existing, ok := r.spaces[id]; ok {
+		return existing, .None
+	}
+	ns, usage := r.store.namespace_open(r.store.data, id) or_return
+	aerr: runtime.Allocator_Error
+	sp, aerr = new(Space_State, r.allocator)
+	if aerr != nil {
+		r.store.namespace_close(r.store.data, ns)
+		return nil, .No_Memory
+	}
+	sp.id = id
+	sp.ns = ns
+	sp.usage = usage
+	sp.streams = make(map[Stream_Id]^Stream_State, r.allocator)
+	sp.watchers = make([dynamic]^Conn, r.allocator)
+	sp.feeders = make([dynamic]^Conn, r.allocator)
+	sp.feed_q = make([dynamic]u8, r.allocator)
+	r.spaces[id] = sp
+	return sp, .None
+}
+
+@(private)
+_space_release :: proc(r: ^Relay, sp: ^Space_State) {
+	if sp.conns > 0 || sp.jobs > 0 || sp.feed_busy || len(sp.feed_q) > 0 || len(sp.streams) > (1 if sp.feed != nil else 0) {
+		return
+	}
+	if sp.feed != nil {
+		st := sp.feed
+		sp.feed = nil
+		delete_key(&sp.streams, st.id)
+		if st.h != nil {
+			r.store.stream_close(r.store.data, st.h)
+		}
+		delete(st.followers)
+		free(st, r.allocator)
+		r.stats.streams -= 1
+	}
+	delete_key(&r.spaces, sp.id)
+	delete(sp.streams)
+	delete(sp.watchers)
+	delete(sp.feeders)
+	delete(sp.feed_q)
+	r.store.namespace_close(r.store.data, sp.ns)
+	free(sp, r.allocator)
+}
+
+@(private)
+_stream_get :: proc(r: ^Relay, sp: ^Space_State, id: Stream_Id, create: bool) -> (^Stream_State, Error) {
+	st, ok := sp.streams[id]
+	if ok {
+		if st.poisoned && !st.busy {
+			if st.h != nil {
+				r.store.stream_close(r.store.data, st.h)
+				st.h = nil
+			}
+			h, length, err := r.store.stream_open(r.store.data, sp.ns, id, false)
+			if err != .None && err != .Not_Found {
+				return nil, err
+			}
+			st.h = h if err == .None else nil
+			st.length = length if err == .None else 0
+			st.poisoned = false
+		}
+		if create && st.h == nil {
+			h, length, err := r.store.stream_open(r.store.data, sp.ns, id, true)
+			if err != .None {
+				return nil, err
+			}
+			st.h = h
+			st.length = length
+		}
+		return st, .None
+	}
+	h, length, err := r.store.stream_open(r.store.data, sp.ns, id, create)
+	if err != .None && err != .Not_Found {
+		return nil, err
+	}
+	nst, aerr := new(Stream_State, r.allocator)
+	if aerr != nil {
+		if err == .None {
+			r.store.stream_close(r.store.data, h)
+		}
+		return nil, .No_Memory
+	}
+	nst.space = sp
+	nst.id = id
+	if err == .None {
+		nst.h = h
+		nst.length = length
+	}
+	nst.followers = make([dynamic]^Conn, r.allocator)
+	sp.streams[id] = nst
+	r.stats.streams += 1
+	return nst, .None
+}
+
+@(private)
+_stream_ref :: proc "contextless" (st: ^Stream_State) {
+	st.refs += 1
+}
+
+@(private)
+_stream_unref :: proc(r: ^Relay, st: ^Stream_State) {
+	st.refs -= 1
+	_stream_maybe_release(r, st)
+}
+
+@(private)
+_stream_maybe_release :: proc(r: ^Relay, st: ^Stream_State) {
+	if st.refs > 0 || st.busy {
+		return
+	}
+	sp := st.space
+	if cur, ok := sp.streams[st.id]; ok && cur == st {
+		delete_key(&sp.streams, st.id)
+	}
+	if st.h != nil {
+		r.store.stream_close(r.store.data, st.h)
+	}
+	delete(st.followers)
+	free(st, r.allocator)
+	r.stats.streams -= 1
+	_space_release(r, sp)
+}
+
+@(private)
+_live_len :: proc "contextless" (st: ^Stream_State) -> i64 {
+	return st.length if st.h != nil && !st.dropped else 0
+}
+
+@(private)
+_push :: proc(c: ^Conn, o: Out) -> bool {
+	if c.dead {
+		return false
+	}
+	if c.out_head > 0 && c.out_head == len(c.out) {
+		clear(&c.out)
+		c.out_head = 0
+	}
+	if _, e := append(&c.out, o); e != nil {
+		_conn_close(c)
+		return false
+	}
+	return true
+}
+
+@(private)
+_push_small :: proc(c: ^Conn, frame: []u8) {
+	o: Out
+	o.kind = .Bytes
+	if len(frame) <= len(o.small) {
+		o.hlen = copy(o.small[:], frame)
+	} else {
+		b, e := make([]u8, len(frame), c.relay.allocator)
+		if e != nil {
+			_conn_close(c)
+			return
+		}
+		copy(b, frame)
+		o.buf = b
+	}
+	_push(c, o)
+}
+
+@(private)
+_push_buf :: proc(c: ^Conn, buf: []u8) {
+	o: Out
+	o.kind = .Bytes
+	o.buf = buf
+	if !_push(c, o) {
+		delete(buf, c.relay.allocator)
+	}
+}
+
+@(private)
+_reply_len :: proc(c: ^Conn, k: Kind, id: [32]u8, length: i64) {
+	b: [FRAME_HEADER + 40]u8
+	frame_header(b[:], k, 40)
+	v := id
+	copy(b[FRAME_HEADER:], v[:])
+	prim.put_u64le(b[FRAME_HEADER + 32:], u64(length))
+	_push_small(c, b[:])
+}
+
+@(private)
+_reply_id :: proc(c: ^Conn, k: Kind, id: [32]u8) {
+	b: [FRAME_HEADER + 32]u8
+	frame_header(b[:], k, 32)
+	v := id
+	copy(b[FRAME_HEADER:], v[:])
+	_push_small(c, b[:])
+}
+
+@(private)
+_reply_refused :: proc(c: ^Conn, code: Code, id: [32]u8) {
+	b: [FRAME_HEADER + 33]u8
+	frame_header(b[:], .Refused, 33)
+	b[FRAME_HEADER] = u8(code)
+	v := id
+	copy(b[FRAME_HEADER + 1:], v[:])
+	_push_small(c, b[:])
+}
+
+@(private)
+_out_release :: proc(r: ^Relay, o: ^Out) {
+	if o.buf != nil {
+		delete(o.buf, r.allocator)
+		o.buf = nil
+	}
+	if o.stream != nil {
+		_stream_unref(r, o.stream)
+		o.stream = nil
+	}
+	if o.obj != nil {
+		r.store.object_close(r.store.data, o.obj)
+		o.obj = nil
+	}
+}
+
+@(private)
+_on_list :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	since := i64(prim.read_u64le(rd))
+	if !prim.reader_done(rd) {
+		_fail(c, .Protocol)
+		return
+	}
+	if !_can(c, .List, {}) {
+		_reply_refused(c, .Not_Owner, {})
+		return
+	}
+	ls, aerr := new(Listing, r.allocator)
+	if aerr != nil {
+		_conn_close(c)
+		return
+	}
+	it, cursor, err := r.store.list_begin(r.store.data, c.space.ns, since)
+	if err != .None {
+		ls.done = true
+	}
+	ls.it = it
+	ls.cursor = cursor
+	c.listing = ls
+}
+
+@(private)
+_listing_end :: proc(c: ^Conn) {
+	r := c.relay
+	if c.listing.it != nil {
+		r.store.list_end(r.store.data, c.listing.it)
+	}
+	free(c.listing, r.allocator)
+	c.listing = nil
+}
+
+@(private)
+_produce_listing :: proc(c: ^Conn) -> bool {
+	r := c.relay
+	ls := c.listing
+	head := FRAME_HEADER + 8 + 1 + 2
+	buf, aerr := make([]u8, head + LIST_BATCH * 40, r.allocator)
+	if aerr != nil {
+		_conn_close(c)
+		return false
+	}
+	count := 0
+	done := ls.done
+	for !done && count < LIST_BATCH {
+		id, ok := r.store.list_next(r.store.data, ls.it)
+		if !ok {
+			done = true
+			break
+		}
+		if !_can(c, .Read, cast([32]u8)id) {
+			continue
+		}
+		length: i64
+		if st, sok := c.space.streams[id]; sok && st.h != nil && !st.dropped && !st.poisoned {
+			length = st.length
+		} else {
+			l, exists, ferr := r.store.stream_probe(r.store.data, c.space.ns, id)
+			if ferr != .None || !exists {
+				continue
+			}
+			length = l
+		}
+		if length <= 0 {
+			continue
+		}
+		e := buf[head + count * 40:]
+		v := id
+		copy(e[:32], v[:])
+		prim.put_u64le(e[32:], u64(length))
+		count += 1
+	}
+	payload := 8 + 1 + 2 + count * 40
+	frame_header(buf, .Listing, payload)
+	prim.put_u64le(buf[FRAME_HEADER:], u64(ls.cursor))
+	buf[FRAME_HEADER + 8] = 0 if done else 1
+	buf[FRAME_HEADER + 9] = u8(count)
+	buf[FRAME_HEADER + 10] = u8(count >> 8)
+	_push_buf(c, buf[:FRAME_HEADER + payload])
+	if done && c.listing != nil {
+		_listing_end(c)
+	}
+	return true
+}
+
+@(private)
+_on_read :: proc(c: ^Conn, rd: ^prim.Reader, tail: bool) {
+	r := c.relay
+	id := Stream_Id(get_id32(rd))
+	a := prim.read_u64le(rd)
+	b: u64
+	if !tail {
+		b = prim.read_u64le(rd)
+	}
+	if !prim.reader_done(rd) || a > u64(max(i64)) || b > u64(max(i64)) {
+		_fail(c, .Protocol)
+		return
+	}
+	if !_can(c, .Read, cast([32]u8)id) {
+		_reply_refused(c, .Not_Owner, cast([32]u8)id)
+		return
+	}
+	st, err := _stream_get(r, c.space, id, false)
+	if err != .None {
+		_reply_refused(c, .Io, cast([32]u8)id)
+		return
+	}
+	length := _live_len(st)
+	from, to: i64
+	if tail {
+		from = max(length - i64(a), 0)
+		to = length
+	} else {
+		from = i64(a)
+		to = clamp(i64(b), from, max(length, from))
+		if from > length {
+			to = from
+		}
+	}
+	o: Out
+	o.kind = .Data
+	o.stream = st
+	o.at = from
+	o.to = to
+	_stream_ref(st)
+	if !_push(c, o) {
+		_stream_unref(r, st)
+	}
+}
+
+@(private)
+_on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	flags := prim.read_u8(rd)
+	count := int(prim.read_u16le(rd))
+	if !prim.reader_ok(rd) || count > FOLLOW_BATCH || prim.reader_remaining(rd) != count * 40 {
+		_fail(c, .Protocol)
+		return
+	}
+	if flags & FOLLOW_WATCH != 0 && !c.watching {
+		if _, e := append(&c.space.watchers, c); e != nil {
+			_conn_close(c)
+			return
+		}
+		c.watching = true
+	}
+	buf, aerr := make([]u8, FRAME_HEADER + 2 + count * 40, r.allocator)
+	if aerr != nil {
+		_conn_close(c)
+		return
+	}
+	n := 0
+	for _ in 0 ..< count {
+		id := Stream_Id(get_id32(rd))
+		off := prim.read_u64le(rd)
+		if !_can(c, .Read, cast([32]u8)id) {
+			_reply_refused(c, .Not_Owner, cast([32]u8)id)
+			continue
+		}
+		st, err := _stream_get(r, c.space, id, false)
+		if err != .None {
+			_reply_refused(c, .Io, cast([32]u8)id)
+			continue
+		}
+		length := _live_len(st)
+		offset := length if off == FOLLOW_END else i64(min(off, u64(max(i64))))
+		found := false
+		for &s in c.subs {
+			if s.stream == st {
+				s.offset = offset
+				found = true
+				break
+			}
+		}
+		if !found {
+			if len(c.subs) >= r.cfg.max_follows {
+				_reply_refused(c, .Limit, cast([32]u8)id)
+				_stream_maybe_release(r, st)
+				continue
+			}
+			if _, e := append(&c.subs, Sub{st, offset}); e != nil {
+				_stream_maybe_release(r, st)
+				delete(buf, r.allocator)
+				_conn_close(c)
+				return
+			}
+			if _, e := append(&st.followers, c); e != nil {
+				pop(&c.subs)
+				_stream_maybe_release(r, st)
+				delete(buf, r.allocator)
+				_conn_close(c)
+				return
+			}
+			_stream_ref(st)
+		}
+		e := buf[FRAME_HEADER + 2 + n * 40:]
+		v := id
+		copy(e[:32], v[:])
+		prim.put_u64le(e[32:], u64(length))
+		n += 1
+	}
+	frame_header(buf, .Length, 2 + n * 40)
+	buf[FRAME_HEADER] = u8(n)
+	buf[FRAME_HEADER + 1] = u8(n >> 8)
+	_push_buf(c, buf[:FRAME_HEADER + 2 + n * 40])
+	c.scan = true
+}
+
+@(private)
+_on_unfollow :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	count := int(prim.read_u16le(rd))
+	if !prim.reader_ok(rd) || count > FOLLOW_BATCH || prim.reader_remaining(rd) != count * 32 {
+		_fail(c, .Protocol)
+		return
+	}
+	for _ in 0 ..< count {
+		id := Stream_Id(get_id32(rd))
+		for i := 0; i < len(c.subs); i += 1 {
+			st := c.subs[i].stream
+			if st.id == id {
+				unordered_remove(&c.subs, i)
+				_remove_conn(&st.followers, c)
+				_stream_unref(r, st)
+				break
+			}
+		}
+	}
+}
+
+@(private)
+_on_get :: proc(c: ^Conn, rd: ^prim.Reader) {
+	count := int(prim.read_u16le(rd))
+	if !prim.reader_ok(rd) || count > GET_BATCH || prim.reader_remaining(rd) != count * 32 {
+		_fail(c, .Protocol)
+		return
+	}
+	for _ in 0 ..< count {
+		key := Object_Key(get_id32(rd))
+		if !_can(c, .Get, cast([32]u8)key) {
+			_reply_refused(c, .Not_Owner, cast([32]u8)key)
+			continue
+		}
+		o: Out
+		o.kind = .Object
+		o.key = key
+		if !_push(c, o) {
+			return
+		}
+	}
+}
+
+@(private)
+_pending_new :: proc(c: ^Conn, kind: Pending_Kind, st: ^Stream_State, total: i64, id: [32]u8) -> ^Pending {
+	r := c.relay
+	p, aerr := new(Pending, r.allocator)
+	if aerr != nil {
+		return nil
+	}
+	p^ = {
+		relay  = r,
+		kind   = kind,
+		conn   = c.ref,
+		stream = st,
+		space  = c.space,
+		total  = total,
+		id     = id,
+	}
+	if st != nil {
+		_stream_ref(st)
+	}
+	c.space.jobs += 1
+	c.inflight += 1
+	return p
+}
+
+@(private)
+_on_drop :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	id := Stream_Id(get_id32(rd))
+	if !prim.reader_done(rd) {
+		_fail(c, .Protocol)
+		return
+	}
+	if !_can(c, .Drop, cast([32]u8)id) {
+		_reply_refused(c, .Not_Owner, cast([32]u8)id)
+		return
+	}
+	st, err := _stream_get(r, c.space, id, false)
+	if err != .None {
+		_reply_refused(c, .Io, cast([32]u8)id)
+		return
+	}
+	if st.busy {
+		_reply_refused(c, .Busy, cast([32]u8)id)
+		_stream_maybe_release(r, st)
+		return
+	}
+	p := _pending_new(c, .Drop, st, 0, cast([32]u8)id)
+	if p == nil {
+		_stream_maybe_release(r, st)
+		_reply_refused(c, .Io, cast([32]u8)id)
+		return
+	}
+	st.busy = true
+	r.store.drop(r.store.data, c.space.ns, id, _relay_done, p)
+}
+
+@(private)
+_reply_redacted :: proc(c: ^Conn, id: [32]u8, from, to: i64) {
+	b: [FRAME_HEADER + 48]u8
+	frame_header(b[:], .Redacted, 48)
+	v := id
+	copy(b[FRAME_HEADER:], v[:])
+	prim.put_u64le(b[FRAME_HEADER + 32:], u64(from))
+	prim.put_u64le(b[FRAME_HEADER + 40:], u64(to))
+	_push_small(c, b[:])
+}
+
+@(private)
+_on_redact :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	id := Stream_Id(get_id32(rd))
+	from := prim.read_u64le(rd)
+	to := prim.read_u64le(rd)
+	if !prim.reader_done(rd) || from > u64(max(i64)) || to > u64(max(i64)) || to < from {
+		_fail(c, .Protocol)
+		return
+	}
+	if !_can(c, .Redact, cast([32]u8)id) {
+		_reply_refused(c, .Not_Owner, cast([32]u8)id)
+		return
+	}
+	st, err := _stream_get(r, c.space, id, false)
+	if err != .None {
+		_reply_refused(c, .Io, cast([32]u8)id)
+		return
+	}
+	lo := min(i64(from), _live_len(st))
+	hi := min(i64(to), _live_len(st))
+	if hi <= lo || st.h == nil {
+		_reply_redacted(c, cast([32]u8)id, i64(from), i64(to))
+		_stream_maybe_release(r, st)
+		return
+	}
+	if st.busy {
+		_reply_refused(c, .Busy, cast([32]u8)id)
+		_stream_maybe_release(r, st)
+		return
+	}
+	p := _pending_new(c, .Redact, st, hi, cast([32]u8)id)
+	if p == nil {
+		_reply_refused(c, .Io, cast([32]u8)id)
+		_stream_maybe_release(r, st)
+		return
+	}
+	p.from = lo
+	st.busy = true
+	r.store.redact(r.store.data, st.h, lo, hi, _relay_done, p)
+}
+
+@(private)
+_on_append_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
+	r := c.relay
+	id := Stream_Id(get_id32(rd))
+	at_raw := prim.read_u64le(rd)
+	c.op = Op {
+		kind  = .Discard,
+		id    = cast([32]u8)id,
+		total = total,
+	}
+	if !prim.reader_ok(rd) || at_raw > u64(max(i64)) {
+		_fail(c, .Protocol)
+		return
+	}
+	at := i64(at_raw)
+	sp := c.space
+	if !_can(c, .Append, cast([32]u8)id) {
+		c.op.reply, c.op.code = .Refused, .Not_Owner
+		return
+	}
+	if sp.quota > 0 && sp.usage + sp.reserved + total > sp.quota {
+		c.op.reply, c.op.code = .Refused, .Quota
+		return
+	}
+	st, err := _stream_get(r, sp, id, at == 0)
+	if err != .None {
+		c.op.reply, c.op.code = .Refused, .Io
+		return
+	}
+	length := _live_len(st)
+	if st.busy || st.h == nil || st.dropped || at != st.length {
+		c.op.reply, c.op.len = .Conflict, length
+		_stream_maybe_release(r, st)
+		return
+	}
+	if total == 0 {
+		c.op.reply, c.op.len = .Appended, length
+		_stream_maybe_release(r, st)
+		return
+	}
+	w, werr := r.store.append_begin(r.store.data, st.h, at, total)
+	if werr != .None {
+		if werr == .Conflict {
+			c.op.reply, c.op.len = .Conflict, length
+		} else {
+			c.op.reply, c.op.code = .Refused, .Io
+		}
+		_stream_maybe_release(r, st)
+		return
+	}
+	sp.reserved += total
+	st.busy = true
+	_stream_ref(st)
+	c.op.kind = .Append
+	c.op.stream = st
+	c.op.w = w
+}
+
+@(private)
+_on_put_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
+	r := c.relay
+	key := Object_Key(get_id32(rd))
+	c.op = Op {
+		kind  = .Discard,
+		id    = cast([32]u8)key,
+		key   = key,
+		total = total,
+	}
+	sp := c.space
+	if !_can(c, .Put, cast([32]u8)key) {
+		c.op.reply, c.op.code = .Refused, .Not_Owner
+		return
+	}
+	if sp.quota > 0 && sp.usage + sp.reserved + total > sp.quota {
+		c.op.reply, c.op.code = .Refused, .Quota
+		return
+	}
+	w, exists, err := r.store.put_begin(r.store.data, sp.ns, key, total)
+	if exists {
+		c.op.reply = .Stored
+		return
+	}
+	if err != .None {
+		c.op.reply, c.op.code = .Refused, .Io
+		return
+	}
+	sp.reserved += total
+	c.op.kind = .Put
+	c.op.w = w
+}
+
+@(private)
+_on_bulk_data :: proc(c: ^Conn, data: []u8) {
+	r := c.relay
+	op := &c.op
+	switch op.kind {
+	case .None, .Discard:
+	case .Append:
+		if op.failed == .None {
+			op.failed = r.store.append_write(r.store.data, op.w, data)
+		}
+	case .Put:
+		if op.failed == .None {
+			op.failed = r.store.put_write(r.store.data, op.w, data)
+		}
+	}
+}
+
+@(private)
+_on_bulk_end :: proc(c: ^Conn) {
+	r := c.relay
+	op := c.op
+	c.op = {}
+	switch op.kind {
+	case .None:
+	case .Discard:
+		switch op.reply {
+		case .Refused:
+			_reply_refused(c, op.code, op.id)
+		case .Conflict, .Appended:
+			_reply_len(c, op.reply, op.id, op.len)
+		case .Stored:
+			_reply_id(c, .Stored, op.id)
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce:
+		}
+	case .Append:
+		st := op.stream
+		p := _pending_new(c, .Append, st, op.total, op.id)
+		_stream_unref(r, st)
+		if p == nil {
+			r.store.append_abort(r.store.data, op.w)
+			c.space.reserved -= op.total
+			st.busy = false
+			st.poisoned = true
+			_reply_refused(c, .Io, op.id)
+			_stream_maybe_release(r, st)
+			return
+		}
+		r.stats.appends += 1
+		r.store.append_commit(r.store.data, op.w, _relay_done, p)
+	case .Put:
+		p := _pending_new(c, .Put, nil, op.total, op.id)
+		if p == nil {
+			r.store.put_abort(r.store.data, op.w)
+			c.space.reserved -= op.total
+			_reply_refused(c, .Io, op.id)
+			return
+		}
+		r.store.put_commit(r.store.data, op.w, _relay_done, p)
+	}
+}
+
+@(private)
+_op_abort :: proc(c: ^Conn) {
+	r := c.relay
+	op := &c.op
+	switch op.kind {
+	case .None, .Discard:
+	case .Append:
+		r.store.append_abort(r.store.data, op.w)
+		c.space.reserved -= op.total
+		op.stream.busy = false
+		op.stream.poisoned = true
+		_stream_unref(r, op.stream)
+	case .Put:
+		r.store.put_abort(r.store.data, op.w)
+		c.space.reserved -= op.total
+	}
+	c.op = {}
+	parser_reset(&c.parser)
+}
+
+@(private)
+_relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
+	p := cast(^Pending)ctx
+	r := p.relay
+	c := _conn_lookup(r, p.conn)
+	sp := p.space
+	switch p.kind {
+	case .Append:
+		st := p.stream
+		st.busy = false
+		sp.reserved -= p.total
+		if result == .None {
+			was := st.length
+			st.length = value
+			sp.usage += p.total
+			if c != nil {
+				_reply_len(c, .Appended, p.id, st.length)
+			}
+			if was == 0 {
+				for w in sp.watchers {
+					if _can(w, .Read, p.id) {
+						_reply_len(w, .Created, p.id, st.length)
+						_conn_kick(w)
+					}
+				}
+			}
+			for f in st.followers {
+				f.scan = true
+				_conn_kick(f)
+			}
+			_feed_add(r, sp, p.id, u64(st.length))
+		} else {
+			st.poisoned = true
+			if c != nil {
+				_reply_refused(c, .Quota if result == .No_Space else .Io, p.id)
+			}
+		}
+	case .Put:
+		sp.reserved -= p.total
+		if result == .None {
+			sp.usage += value
+			if c != nil {
+				_reply_id(c, .Stored, p.id)
+			}
+		} else if c != nil {
+			_reply_refused(c, .Quota if result == .No_Space else .Io, p.id)
+		}
+	case .Redact:
+		p.stream.busy = false
+		if c != nil {
+			if result == .None {
+				_reply_redacted(c, p.id, p.from, p.total)
+			} else {
+				_reply_refused(c, .Io, p.id)
+			}
+		}
+	case .Drop:
+		st := p.stream
+		st.busy = false
+		if result == .None {
+			sp.usage = max(sp.usage - value, 0)
+			st.dropped = true
+			if cur, ok := sp.streams[st.id]; ok && cur == st {
+				delete_key(&sp.streams, st.id)
+			}
+			for f in st.followers {
+				for i := 0; i < len(f.subs); i += 1 {
+					if f.subs[i].stream == st {
+						unordered_remove(&f.subs, i)
+						st.refs -= 1
+						break
+					}
+				}
+				if f != c {
+					_reply_id(f, .Dropped, p.id)
+					_conn_kick(f)
+				}
+			}
+			clear(&st.followers)
+			for w in sp.watchers {
+				if w != c && _can(w, .Read, p.id) {
+					_reply_id(w, .Dropped, p.id)
+					_conn_kick(w)
+				}
+			}
+			if c != nil {
+				_reply_id(c, .Dropped, p.id)
+			}
+			_feed_add(r, sp, p.id, FEED_DROPPED)
+		} else if c != nil {
+			_reply_refused(c, .Io, p.id)
+		}
+	case .Feed:
+		sp.feed_busy = false
+		if result == .None {
+			sp.feed_len = value
+			if sp.feed != nil {
+				sp.feed.length = value
+			}
+			for f in sp.feeders {
+				f.feed_hint = true
+				_conn_kick(f)
+			}
+		} else if sp.feed != nil {
+			sp.feed.poisoned = true
+		}
+		_feed_flush(r, sp)
+	}
+	if p.stream != nil {
+		_stream_unref(r, p.stream)
+	}
+	sp.jobs -= 1
+	free(p, r.allocator)
+	if c != nil {
+		c.inflight -= 1
+		_conn_kick(c)
+	}
+	_space_release(r, sp)
+	_reap(r)
+}
+
+@(private)
+_conn_kick :: proc(c: ^Conn) {
+	if c.dead {
+		return
+	}
+	if c.feeding || c.pumping {
+		c.again = true
+		return
+	}
+	_conn_pump(c)
+}
+
+@(private)
+_conn_pump :: proc(c: ^Conn) {
+	if c.pumping {
+		c.again = true
+		return
+	}
+	c.pumping = true
+	defer c.pumping = false
+	for !c.dead {
+		c.again = false
+		_conn_write(c)
+		if c.dead {
+			return
+		}
+		if c.paused && !c.closing && !_should_pause(c) {
+			_set_paused(c, false)
+			_conn_read(c)
+			continue
+		}
+		if !c.again {
+			return
+		}
+	}
+}
+
+@(private)
+_c_send :: proc(c: ^Conn, data: []u8, more: bool) -> (int, Error) {
+	if c.external {
+		return c.link.send(c.link.data, data, more)
+	}
+	return transport_send(&c.tr, data, more)
+}
+
+@(private)
+_c_zero_copy :: proc "contextless" (c: ^Conn) -> bool {
+	return !c.external || c.link.sendfile != nil
+}
+
+@(private)
+_c_sendfile :: proc(c: ^Conn, fd: prim.Fd, off: i64, n: int) -> (int, Error) {
+	if !c.external {
+		return transport_sendfile(&c.tr, fd, off, n, c.relay.wscratch)
+	}
+	return c.link.sendfile(c.link.data, fd, off, n)
+}
+
+@(private)
+_c_copy :: proc(c: ^Conn, read: proc(data: rawptr, h: rawptr, at: i64, dst: []u8) -> (int, Error), h: rawptr, at: i64, n: int) -> (int, Error) {
+	r := c.relay
+	k := min(n, len(r.wscratch))
+	got, rerr := read(r.store.data, h, at, r.wscratch[:k])
+	if rerr != .None {
+		return 0, rerr
+	}
+	if got < k {
+		return 0, .Corrupt
+	}
+	return _c_send(c, r.wscratch[:k], k < n)
+}
+
+@(private)
+_conn_write :: proc(c: ^Conn) {
+	r := c.relay
+	if c.dead || c.state == .Handshake {
+		return
+	}
+	for !c.dead {
+		if !c.external && transport_pending(&c.tr) {
+			err := transport_flush(&c.tr)
+			if err == .Would_Block {
+				return
+			}
+			if err != .None {
+				_conn_close(c)
+				return
+			}
+		}
+		if c.out_head == len(c.out) {
+			if c.out_head > 0 {
+				clear(&c.out)
+				c.out_head = 0
+			}
+			if c.closing {
+				_conn_close(c)
+				return
+			}
+			if !_produce(c) {
+				break
+			}
+			continue
+		}
+		o := &c.out[c.out_head]
+		done, err := _out_step(c, o)
+		if err == .Would_Block {
+			return
+		}
+		if err != .None {
+			_conn_close(c)
+			return
+		}
+		if done {
+			_out_release(r, o)
+			c.out_head += 1
+		}
+	}
+}
+
+@(private)
+_produce :: proc(c: ^Conn) -> bool {
+	if c.state != .Ready {
+		return false
+	}
+	if c.scan {
+		n := len(c.subs)
+		for k in 0 ..< n {
+			i := (c.rr + k) % n
+			s := &c.subs[i]
+			st := s.stream
+			if st.dropped || st.h == nil || st.length <= s.offset {
+				continue
+			}
+			o: Out
+			o.kind = .Data
+			o.stream = st
+			o.at = s.offset
+			o.to = min(st.length, s.offset + DATA_MAX)
+			s.offset = o.to
+			_stream_ref(st)
+			c.rr = (i + 1) % n
+			if !_push(c, o) {
+				_stream_unref(c.relay, st)
+				return false
+			}
+			return true
+		}
+		c.scan = false
+	}
+	if c.feed_on && c.feed_hint {
+		if _produce_feed(c) {
+			return true
+		}
+		c.feed_hint = false
+	}
+	if c.listing != nil {
+		return _produce_listing(c)
+	}
+	return false
+}
+
+@(private)
+_out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
+	r := c.relay
+	switch o.kind {
+	case .Bytes:
+		data := o.buf if o.buf != nil else o.small[:o.hlen]
+		for o.hpos < len(data) {
+			n := _c_send(c, data[o.hpos:], c.out_head + 1 < len(c.out)) or_return
+			o.hpos += n
+			r.stats.bytes_out += u64(n)
+		}
+		return true, .None
+	case .Data:
+		st := o.stream
+		for {
+			if o.hpos == o.hlen && o.left == 0 {
+				if o.started && o.at >= o.to {
+					return true, .None
+				}
+				n := min(o.to - o.at, DATA_MAX)
+				frame_header(o.small[:], .Data, DATA_FIXED + int(n))
+				v := st.id
+				copy(o.small[FRAME_HEADER:], v[:])
+				prim.put_u64le(o.small[FRAME_HEADER + 32:], u64(o.at))
+				prim.put_u64le(o.small[FRAME_HEADER + 40:], u64(max(_live_len(st), o.to)))
+				o.hlen = FRAME_HEADER + DATA_FIXED
+				o.hpos = 0
+				o.left = n
+				o.started = true
+			}
+			for o.hpos < o.hlen {
+				n := _c_send(c, o.small[o.hpos:o.hlen], o.left > 0) or_return
+				o.hpos += n
+			}
+			for o.left > 0 {
+				k := int(min(o.left, SENDFILE_CHUNK))
+				w: int
+				if fd, base, ok := r.store.stream_fd(r.store.data, st.h); ok && _c_zero_copy(c) {
+					w = _c_sendfile(c, fd, base + o.at, k) or_return
+				} else {
+					w = _c_copy(c, r.store.stream_read, st.h, o.at, k) or_return
+				}
+				o.at += i64(w)
+				o.left -= i64(w)
+				r.stats.bytes_out += u64(w)
+			}
+		}
+	case .Object:
+		if !o.started {
+			o.started = true
+			v := o.key
+			ob, size, oerr := r.store.object_open(r.store.data, c.space.ns, o.key)
+			if oerr != .None || size > i64(OBJECT_MAX) {
+				if oerr == .None {
+					r.store.object_close(r.store.data, ob)
+				}
+				frame_header(o.small[:], .Missing, 32)
+				copy(o.small[FRAME_HEADER:], v[:])
+				o.hlen = FRAME_HEADER + 32
+			} else {
+				o.obj = ob
+				o.left = size
+				frame_header(o.small[:], .Object, OBJECT_FIXED + int(size))
+				copy(o.small[FRAME_HEADER:], v[:])
+				o.hlen = FRAME_HEADER + OBJECT_FIXED
+			}
+		}
+		for o.hpos < o.hlen {
+			n := _c_send(c, o.small[o.hpos:o.hlen], o.left > 0) or_return
+			o.hpos += n
+		}
+		for o.left > 0 {
+			k := int(min(o.left, SENDFILE_CHUNK))
+			w: int
+			if fd, base, ok := r.store.object_fd(r.store.data, o.obj); ok && _c_zero_copy(c) {
+				w = _c_sendfile(c, fd, base + o.at, k) or_return
+			} else {
+				w = _c_copy(c, r.store.object_read, o.obj, o.at, k) or_return
+			}
+			o.at += i64(w)
+			o.left -= i64(w)
+			r.stats.bytes_out += u64(w)
+		}
+		return true, .None
+	}
+	return true, .None
+}
+
+@(private)
+_clone_string :: proc(s: string, allocator: runtime.Allocator) -> (string, Error) {
+	b, e := make([]u8, len(s), allocator)
+	if e != nil {
+		return "", .No_Memory
+	}
+	copy(b, s)
+	return string(b), .None
+}
+
+@(private)
+_feed_open :: proc(r: ^Relay, sp: ^Space_State) -> Error {
+	if sp.feed != nil && !sp.feed.poisoned {
+		return .None
+	}
+	st := _stream_get(r, sp, FEED_ID, true) or_return
+	if sp.feed == nil {
+		st.refs += 1
+	}
+	sp.feed = st
+	sp.feed_len = st.length
+	return .None
+}
+
+@(private)
+_feed_add :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, length: u64) {
+	e: [FEED_ENTRY]u8
+	v := id
+	copy(e[:32], v[:])
+	prim.put_u64le(e[32:], length)
+	append(&sp.feed_q, ..e[:])
+	_feed_flush(r, sp)
+}
+
+@(private)
+_feed_flush :: proc(r: ^Relay, sp: ^Space_State) {
+	if sp.feed_busy || len(sp.feed_q) == 0 {
+		return
+	}
+	if _feed_open(r, sp) != .None {
+		clear(&sp.feed_q)
+		return
+	}
+	st := sp.feed
+	w, err := r.store.append_begin(r.store.data, st.h, st.length, i64(len(sp.feed_q)))
+	if err == .None {
+		err = r.store.append_write(r.store.data, w, sp.feed_q[:])
+		if err != .None {
+			r.store.append_abort(r.store.data, w)
+		}
+	}
+	clear(&sp.feed_q)
+	if err != .None {
+		st.poisoned = true
+		return
+	}
+	p, aerr := new(Pending, r.allocator)
+	if aerr != nil {
+		r.store.append_abort(r.store.data, w)
+		st.poisoned = true
+		return
+	}
+	p^ = {
+		relay = r,
+		kind  = .Feed,
+		space = sp,
+	}
+	sp.jobs += 1
+	sp.feed_busy = true
+	r.store.append_commit(r.store.data, w, _relay_done, p)
+}
+
+@(private)
+_on_feed :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	from := prim.read_u64le(rd)
+	if !prim.reader_done(rd) {
+		_fail(c, .Protocol)
+		return
+	}
+	sp := c.space
+	if _feed_open(r, sp) != .None {
+		_reply_refused(c, .Io, cast([32]u8)FEED_ID)
+		return
+	}
+	end := sp.feed_len
+	off := end if from == FEED_DROPPED || from > u64(end) else i64(from - from % FEED_ENTRY)
+	if !c.feed_on {
+		if _, e := append(&sp.feeders, c); e != nil {
+			_conn_close(c)
+			return
+		}
+	}
+	c.feed_on = true
+	c.feed_off = off
+	c.feed_hint = true
+	_announce(c, off, off, nil)
+}
+
+@(private)
+_announce :: proc(c: ^Conn, from, next: i64, entries: []u8) {
+	r := c.relay
+	n := len(entries) / FEED_ENTRY
+	buf, aerr := make([]u8, FRAME_HEADER + 18 + len(entries), r.allocator)
+	if aerr != nil {
+		_conn_close(c)
+		return
+	}
+	frame_header(buf, .Announce, 18 + len(entries))
+	prim.put_u64le(buf[FRAME_HEADER:], u64(from))
+	prim.put_u64le(buf[FRAME_HEADER + 8:], u64(next))
+	buf[FRAME_HEADER + 16] = u8(n)
+	buf[FRAME_HEADER + 17] = u8(n >> 8)
+	copy(buf[FRAME_HEADER + 18:], entries)
+	_push_buf(c, buf)
+}
+
+@(private)
+_produce_feed :: proc(c: ^Conn) -> bool {
+	r := c.relay
+	sp := c.space
+	if sp.feed == nil || sp.feed.h == nil || c.feed_off >= sp.feed_len {
+		return false
+	}
+	want := min(sp.feed_len - c.feed_off, FEED_BATCH * FEED_ENTRY)
+	raw, aerr := make([]u8, int(want), context.temp_allocator)
+	if aerr != nil {
+		return false
+	}
+	got, err := r.store.stream_read(r.store.data, sp.feed.h, c.feed_off, raw)
+	if err != .None || i64(got) != want {
+		return false
+	}
+	keep := 0
+	for i := 0; i + FEED_ENTRY <= got; i += FEED_ENTRY {
+		id: [32]u8
+		copy(id[:], raw[i:i + 32])
+		if principal_allows(&c.principal, .Read, id) {
+			if keep != i {
+				copy(raw[keep:], raw[i:i + FEED_ENTRY])
+			}
+			keep += FEED_ENTRY
+		}
+	}
+	from := c.feed_off
+	c.feed_off += want
+	_announce(c, from, c.feed_off, raw[:keep])
+	return true
+}
