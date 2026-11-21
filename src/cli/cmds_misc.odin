@@ -107,10 +107,21 @@ cmd_status :: proc(a: ^Args) -> int {
 	fmt.printfln("device   %s", jstr(id, "id"))
 	fmt.printfln("home     %s", jstr(d, "home"))
 	def := jstr(st, "default_space")
+	reasons := make(map[string]string, context.temp_allocator)
+	for l in jarr(d, "links") {
+		reasons[jstr(l, "space")] = jstr(l, "reason")
+	}
 	for x in jarr(sp, "spaces") {
 		conn := "local only"
 		if len(jstr(x, "relay")) > 0 {
-			conn = fmt.tprintf("%s %s", jstr(x, "relay"), "connected" if jbool(x, "connected") else "offline")
+			state := "connected"
+			if !jbool(x, "connected") {
+				state = "offline"
+				if why, ok := reasons[jstr(x, "id")]; ok {
+					state = fmt.tprintf("offline: %s", why)
+				}
+			}
+			conn = fmt.tprintf("%s %s", jstr(x, "relay"), state)
 		}
 		mark := " (default)" if jstr(x, "id") == def else ""
 		fmt.printfln("space    %s %q · %s%s", short(jstr(x, "id")), jstr(x, "name"), conn, mark)

@@ -54,6 +54,7 @@ Daemon :: struct {
 	state:      State,
 	caps:       [dynamic]^Cap_Entry,
 	mcp:        [dynamic]Mcp_Session,
+	links:      map[prim.Id]eng.Error,
 	started:    i64,
 	stopping:   bool,
 	runner:     bool,
@@ -106,6 +107,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	d.lfd = -1
 	d.sig.fd = -1
 	d.conns = make([dynamic]^Conn)
+	d.links = make(map[prim.Id]eng.Error)
 	d.caps = make([dynamic]^Cap_Entry)
 	d.mcp = make([dynamic]Mcp_Session)
 	d.state.mounts = make([dynamic]Mount_Entry)
@@ -502,9 +504,14 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	d := (^Daemon)(data)
 	#partial switch ev.kind {
 	case .Connected:
+		delete_key(&d.links, ev.space)
 		fmt.eprintfln("0ndb daemon: space %s connected", hex(ev.space))
 	case .Disconnected:
-		fmt.eprintfln("0ndb daemon: space %s disconnected", hex(ev.space))
+		prev, had := d.links[ev.space]
+		d.links[ev.space] = ev.err
+		if !had || prev != ev.err {
+			fmt.eprintfln("0ndb daemon: space %s disconnected: %s", hex(ev.space), link_reason(ev.err))
+		}
 	case .Quarantined, .Refused, .Fatal, .Failure:
 		fmt.eprintfln("0ndb daemon: %s space %s object %s (%s)", api.EVENT_NAMES[int(ev.kind)], hex(ev.space), hex(ev.object), api.STATUS_NAMES[int(api.status_of(ev.err))])
 	}
@@ -784,6 +791,15 @@ op_daemon_status :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	api.o_int(o, "mcp_sessions", len(d.mcp))
 	api.o_u64(o, "wakeups", eng.stats(&d.s.e).wakeups)
 	api.o_i64(o, "timeout_ms", prim.loop_timeout_ms(&d.s.loop))
+	api.o_arr(o, "links", len(d.links))
+	for sp, err in d.links {
+		api.o_obj(o, "")
+		api.o_id(o, "space", sp)
+		api.o_str(o, "error", api.STATUS_NAMES[int(api.status_of(err))])
+		api.o_str(o, "reason", link_reason(err))
+		api.o_end(o)
+	}
+	api.o_end(o)
 	return .Ok
 }
 
@@ -879,4 +895,20 @@ op_credentials_add :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	ce.token = clone_bytes(token)
 	append(&d.caps, ce)
 	return .Ok
+}
+
+link_reason :: proc(err: eng.Error) -> string {
+	#partial switch err {
+	case .None, .Closed:
+		return "connection closed"
+	case .Offline:
+		return "relay unreachable"
+	case .Permission:
+		return "the relay rejected these credentials"
+	case .Unsupported:
+		return "the relay speaks a different protocol version"
+	case .Corrupt:
+		return "the relay sent malformed or tampered data"
+	}
+	return "the relay refused the connection (credentials, quota or protocol version)"
 }

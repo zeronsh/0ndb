@@ -48,6 +48,7 @@ Emit :: struct {
 }
 
 Wire_Ctx :: struct {
+	h: ^Handle,
 	w: C_Wire,
 }
 
@@ -148,6 +149,7 @@ wire_model :: proc(h: ^Handle, w: ^C_Wire, a: model.Api) -> (m: model.Model, ok:
 	}
 	if ctx == nil {
 		ctx = new(Wire_Ctx, h.allocator)
+		ctx.h = h
 		ctx.w = tmp
 		append(&h.rt.wires, ctx)
 	}
@@ -402,7 +404,8 @@ _wire_auth :: proc(m: ^model.Model, cfg: ^model.Config, opts: ^model.Request_Opt
 		if colon <= 0 {
 			continue
 		}
-		append(dst, model.Header{name = strings.trim_space(line[:colon]), value = strings.trim_space(line[colon + 1:])})
+		h := (^Wire_Ctx)(m.data).h
+		append(dst, model.Header{name = _intern(h, strings.trim_space(line[:colon])), value = _intern(h, strings.trim_space(line[colon + 1:]))})
 	}
 }
 

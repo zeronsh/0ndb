@@ -20,9 +20,16 @@
  *
  * Memory
  *   Buffers returned through out-parameters are owned by the caller and are
- *   released with ondb_free. Buffers passed to callbacks are borrowed and valid
- *   only for the duration of the callback. Plug tables are copied at open; the
- *   ud pointers they carry must stay valid until ondb_close returns.
+ *   released with ondb_free; they never alias engine memory. Buffers and
+ *   strings passed to callbacks (done, subscription, event, post and every
+ *   plug function) are borrowed and valid only for the duration of that
+ *   callback. Plug tables are copied at open; the ud pointers they carry must
+ *   stay valid until ondb_close returns.
+ *   Allocations from the default temp allocator do not survive a loop pump:
+ *   the engine releases that allocator at settle. Copy anything you keep
+ *   across ondb_step (or the engine thread's run) into your own allocator.
+ *   This is why every borrowed buffer above must be copied before the
+ *   callback returns if it is needed later.
  *
  * Versioning
  *   ondb_abi_version() returns (major << 16) | minor. A major change breaks the
@@ -462,7 +469,7 @@ typedef struct ondb_http_request {
 	size_t url_len;
 	const ondb_header *headers;
 	size_t header_count;
-	const ondb_slice *body; /* gathered body pieces, valid until done */
+	const ondb_slice *body; /* gathered body pieces; like every field here, valid only during start: copy what you send later */
 	size_t body_count;
 	int64_t body_len;
 	int32_t streamed; /* nonzero: pull the body with ondb_http_read */
