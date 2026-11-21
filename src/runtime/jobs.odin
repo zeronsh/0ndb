@@ -3,7 +3,6 @@ package rt
 import eng "../engine"
 import "../fs"
 import "../prim"
-import "core:sys/posix"
 
 Job_Done :: #type proc(j: ^Job, status: prim.Exit_Status)
 
@@ -226,43 +225,7 @@ run_blocking :: proc(r: ^Runtime, argv: []string, cwd: string) -> (status: prim.
 	defer prim.child_close(&child)
 	prim.child_close_stdin(&child)
 	buf := make([dynamic]u8, context.temp_allocator)
-	tmp: [16384]u8
-	fds: [2]posix.pollfd
-	nfd := 0
-	if child.stdout >= 0 {
-		fds[nfd] = posix.pollfd{fd = posix.FD(child.stdout), events = {.IN}}
-		nfd += 1
-	}
-	if child.stderr >= 0 {
-		fds[nfd] = posix.pollfd{fd = posix.FD(child.stderr), events = {.IN}}
-		nfd += 1
-	}
-	open_fds := nfd
-	for open_fds > 0 {
-		if posix.poll(raw_data(fds[:]), posix.nfds_t(nfd), -1) < 0 {
-			if posix.errno() == .EINTR {
-				continue
-			}
-			break
-		}
-		for k in 0 ..< nfd {
-			if fds[k].fd < 0 || fds[k].revents == {} {
-				continue
-			}
-			n, rerr := prim.read(prim.Fd(fds[k].fd), tmp[:])
-			if rerr == .Interrupted || rerr == .Would_Block {
-				continue
-			}
-			if rerr != .None || n <= 0 {
-				fds[k].fd = -1
-				open_fds -= 1
-				continue
-			}
-			if prim.Fd(fds[k].fd) == child.stdout && len(buf) < JOB_OUTPUT_LIMIT {
-				append(&buf, ..tmp[:min(n, JOB_OUTPUT_LIMIT - len(buf))])
-			}
-		}
-	}
+	prim.child_drain(&child, &buf, JOB_OUTPUT_LIMIT)
 	st, _, rerr := prim.reap(child.pid, true)
 	if rerr != .None {
 		return {}, buf[:], .Io

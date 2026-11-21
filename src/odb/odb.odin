@@ -328,7 +328,7 @@ add_dir :: proc(db: ^Odb, path: string, extra: bool, depth: int) {
 		}
 		target: string
 		cerr: Error
-		if l[0] == '/' {
+		if prim.is_abs(l) {
 			target, cerr = clean(l, db.allocator)
 		} else {
 			joined := join3(path, "/", l, db.allocator) or_continue
@@ -406,7 +406,7 @@ git_dir_at :: proc(vfs: prim.Vfs, dir: string, allocator: runtime.Allocator) -> 
 	}
 	resolved: string
 	cerr: Error
-	if target[0] == '/' {
+	if prim.is_abs(target) {
 		resolved, cerr = clean(target, allocator)
 	} else {
 		joined := join3(dir, "/", target, allocator) or_else ""
@@ -454,7 +454,7 @@ resolve_common_dir :: proc(vfs: prim.Vfs, git_dir: string, allocator: runtime.Al
 	if len(target) == 0 {
 		return clean(git_dir, allocator)
 	}
-	if target[0] == '/' {
+	if prim.is_abs(target) {
 		return clean(target, allocator)
 	}
 	joined := join3(git_dir, "/", target, allocator) or_return
@@ -475,7 +475,7 @@ parent_dir :: proc(path: string) -> string {
 clean :: proc(path: string, allocator: runtime.Allocator) -> (cleaned: string, err: Error) {
 	p := path
 	abs: string
-	if len(p) == 0 || p[0] != '/' {
+	if !prim.is_abs(p) {
 		cwd, werr := os.get_working_directory(allocator)
 		if werr != nil {
 			return "", .Io
@@ -490,6 +490,14 @@ clean :: proc(path: string, allocator: runtime.Allocator) -> (cleaned: string, e
 	out, cerr := os.clean_path(p, allocator)
 	if cerr != nil {
 		return "", .Out_Of_Memory
+	}
+	when ODIN_OS == .Windows {
+		b := transmute([]u8)out
+		for i in 0 ..< len(b) {
+			if b[i] == '\\' {
+				b[i] = '/'
+			}
+		}
 	}
 	return out, .None
 }

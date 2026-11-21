@@ -1,4 +1,4 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package prim
 
 import "base:intrinsics"
@@ -60,6 +60,7 @@ _Slot :: struct {
 	next_free: u32,
 	kind:      _Slot_Kind,
 	events:    Events,
+	os:        _Slot_Os,
 }
 
 @(private)
@@ -256,7 +257,7 @@ unwatch :: proc(l: ^Loop, w: Watch) {
 	if s == nil {
 		return
 	}
-	_os_unwatch(l, s.fd, s.events)
+	_os_unwatch(l, s.fd, s.events, u64(w))
 	_slot_free(l, _handle_index(u64(w)))
 }
 

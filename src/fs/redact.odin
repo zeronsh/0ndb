@@ -141,19 +141,65 @@ replace_record :: proc(h: ^History, off: i64, spans: []crdt.Op_Span) -> Error {
 		ops[i].content = c
 	}
 	b.ops = ops
+	orig := u64(off)
+	kind := body[0]
+	if body[0] == REC_REPLACE {
+		o, n := prim.get_uvarint(body[1:])
+		if n <= 0 || 1 + n >= len(body) {
+			return .Corrupt
+		}
+		orig = o
+		kind = body[1 + n]
+	}
 	clear(&h.io)
 	w := prim.writer(&h.io)
 	prim.write_u8(&w, REC_REPLACE)
-	prim.write_uvarint(&w, u64(off))
-	prim.write_u8(&w, body[0])
+	prim.write_uvarint(&w, orig)
+	prim.write_u8(&w, kind)
 	if crdt.batch_encode(&b, &h.io, &h.dict) != .None {
 		return .Too_Large
 	}
 	new_off, jerr := journal.journal_append(&h.journal, h.io[:])
-	if jerr != .None || journal.journal_commit(&h.journal) != .None {
-		return .Io
+	if jerr != .None {
+		return from_journal(jerr)
 	}
-	return remap_ref(h, 0, u64(off), u64(new_off), inodes[:])
+	if cerr := journal.journal_commit(&h.journal); cerr != .None {
+		return from_journal(cerr)
+	}
+	return replace_chain(h, 0, orig, u64(off), u64(new_off), inodes[:])
+}
+
+@(private)
+replace_key :: proc(stream: u32, orig: u64) -> []u8 {
+	out := make([]u8, 15, context.temp_allocator)
+	out[0] = 'r'
+	out[1] = 'p'
+	out[2] = ':'
+	prim.put_u32le(out[3:7], stream)
+	prim.put_u64le(out[7:15], orig)
+	return out
+}
+
+@(private)
+replace_chain :: proc(h: ^History, stream: u32, orig: u64, prev: u64, new_off: u64, inodes: []fstree.Inode_Id) -> Error {
+	key := replace_key(stream, orig)
+	last := prev
+	if data, found := kv_get(&h.kv, key, context.temp_allocator) or_return; found && len(data) == 8 {
+		last = prim.get_u64le(data)
+	}
+	froms := [3]u64{orig, prev, last}
+	for f, i in froms {
+		seen := false
+		for j in 0 ..< i {
+			seen ||= froms[j] == f
+		}
+		if !seen && f != new_off {
+			remap_ref(h, stream, f, new_off, inodes) or_return
+		}
+	}
+	v: [8]u8
+	prim.put_u64le(v[:], new_off)
+	return kv_put(&h.kv, key, v[:])
 }
 
 @(private)
@@ -184,7 +230,7 @@ own_records :: proc(h: ^History, spans: []crdt.Op_Span, records: ^[dynamic][2]i6
 				continue
 			}
 			if jerr != .None {
-				return .Corrupt
+				return from_journal(jerr)
 			}
 			if len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT) {
 				b, derr := crdt.batch_decode(body[1:], context.temp_allocator, &h.dict)
@@ -260,11 +306,10 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 		}
 		if h.db != nil {
 			data := crdt.text_bytes(&f.text, context.temp_allocator)
-			oid, werr := odb.write(h.db, .Blob, data)
+			oid, werr := history_stage_blob(h, data)
 			if werr != .None {
-				return files, from_odb(werr)
+				return files, werr
 			}
-			history_note_blob(h, oid)
 			append(protect, oid)
 			clear(&f.rec.cp_version)
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))

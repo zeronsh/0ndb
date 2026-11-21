@@ -2,7 +2,6 @@ package observe
 
 import "base:runtime"
 import "core:strings"
-import "core:sys/posix"
 import "../fs"
 import "../prim"
 
@@ -149,25 +148,16 @@ _router_add :: proc(r: ^Router, m: ^fs.Mount) {
 }
 
 real_path :: proc(path: string, allocator := context.allocator) -> (real: string, dev: u64, ino: u64, ok: bool) {
-	buf: prim.Path_Buf
-	cp, err := prim.cpath(path, &buf)
+	res, err := prim.real_path(path, allocator)
 	if err != .None {
 		return
 	}
-	out: [prim.PATH_MAX + 1]u8
-	res := posix.realpath(cp, raw_data(out[:]))
-	if res == nil {
+	st, serr := prim.stat(prim.os_vfs(), res)
+	if serr != .None {
+		delete(res, allocator)
 		return
 	}
-	st: posix.stat_t
-	if posix.stat(res, &st) != .OK {
-		return
-	}
-	s, aerr := strings.clone(string(res), allocator)
-	if aerr != nil {
-		return
-	}
-	return s, u64(st.st_dev), u64(st.st_ino), true
+	return res, st.dev, st.ino, true
 }
 
 under :: proc "contextless" (path: string, root: string) -> (rel: string, ok: bool) {

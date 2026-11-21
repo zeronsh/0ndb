@@ -34,7 +34,18 @@ cpath :: proc "contextless" (path: string, buf: ^Path_Buf) -> (cstring, Error) {
 	return cstring(&buf[0]), .None
 }
 
+is_abs :: proc "contextless" (path: string) -> bool {
+	when ODIN_OS == .Windows {
+		return _is_abs_windows(path)
+	} else {
+		return len(path) > 0 && path[0] == '/'
+	}
+}
+
 dir_name :: proc "contextless" (path: string) -> string {
+	when ODIN_OS == .Windows {
+		return _dir_name_windows(path)
+	}
 	end := len(path)
 	for end > 1 && path[end - 1] == '/' {
 		end -= 1
@@ -108,15 +119,18 @@ mkdir_all :: proc(vfs: Vfs, path: string, mode: u32 = 0o755) -> Error {
 		return .None
 	}
 	i := 0
+	when ODIN_OS == .Windows {
+		i = _root_len_windows(path)
+	}
 	for i < len(path) {
 		j := i
-		for j < len(path) && path[j] == '/' {
+		for j < len(path) && _path_sep(path[j]) {
 			j += 1
 		}
-		for j < len(path) && path[j] != '/' {
+		for j < len(path) && !_path_sep(path[j]) {
 			j += 1
 		}
-		if j > 0 && path[j - 1] != '/' {
+		if j > 0 && !_path_sep(path[j - 1]) {
 			err := mkdir(vfs, path[:j], mode)
 			if err != .None && err != .Exists {
 				return err
@@ -128,6 +142,15 @@ mkdir_all :: proc(vfs: Vfs, path: string, mode: u32 = 0o755) -> Error {
 		return .Not_Dir
 	}
 	return .None
+}
+
+@(private)
+_path_sep :: #force_inline proc "contextless" (c: u8) -> bool {
+	when ODIN_OS == .Windows {
+		return c == '/' || c == '\\'
+	} else {
+		return c == '/'
+	}
 }
 
 @(private)

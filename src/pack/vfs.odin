@@ -436,7 +436,7 @@ _symlink_target :: proc(p: ^Pack, path: string, inum: u64) -> (target: string, t
 		return "", .Io
 	}
 	t := string(ino.target[:ino.tlen])
-	if len(t) > 0 && t[0] == '/' {
+	if prim.is_abs(t) {
 		out := make([]u8, len(t), context.temp_allocator)
 		copy(out, t)
 		return string(out), .None
@@ -719,6 +719,16 @@ _v_sync :: proc(data: rawptr, fd: prim.Fd) -> Error {
 	h := _handle(p, fd)
 	if h == nil {
 		return .Invalid
+	}
+	if p.batch > 0 && !h.dir && h.oi.ino.kind == .External && h.oi.real_fd >= 0 {
+		if p.poisoned {
+			return .Io
+		}
+		if e := _sync(p, h.oi.real_fd); e != .None {
+			_suspect_record(p, []u64{h.oi.inum})
+			return _poison(p, e)
+		}
+		return .None
 	}
 	return sync(p)
 }

@@ -6,6 +6,8 @@ import "core:sys/posix"
 @(private)
 MAX_EVENTS :: 64
 
+_Slot_Os :: struct {}
+
 _Loop_Os :: struct {
 	epfd:      linux.Fd,
 	wakefd:    linux.Fd,
@@ -151,7 +153,7 @@ _os_modify :: proc(l: ^Loop, fd: Fd, old, next: Events, h: u64) -> Error {
 }
 
 @(private)
-_os_unwatch :: proc(l: ^Loop, fd: Fd, events: Events) {
+_os_unwatch :: proc(l: ^Loop, fd: Fd, events: Events, h: u64) {
 	linux.epoll_ctl(l.os.epfd, .DEL, linux.Fd(fd), nil)
 }
 

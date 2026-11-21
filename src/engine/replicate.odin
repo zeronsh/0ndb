@@ -376,7 +376,17 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 	case .Relay_Misbehaving:
 		obj_id, _, _ := _object_of_name(ev.name)
 		_emit(e, Event{kind = .Relay_Misbehaving, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err)})
+	case .Presence:
+		_emit(e, Event{kind = .Presence, space = sp.id, device = ev.device, tick = u64(ev.from), length = ev.length})
 	}
+}
+
+presence :: proc(e: ^Engine, space: prim.Id, device: prim.Id) -> (up: bool, since: i64, known: bool) {
+	sp, ok := e.spaces[space]
+	if !ok || !sp.repl_on || !sp.connected {
+		return false, 0, false
+	}
+	return osync.replicator_presence(&sp.repl, device)
 }
 
 @(private)

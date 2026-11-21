@@ -565,11 +565,19 @@ merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 @(private)
 MERGE_OURS :: "0ndb-merge-ours-8f3a1c"
 @(private)
+MERGE_BASE :: "0ndb-merge-base-8f3a1c"
+@(private)
 MERGE_THEIRS :: "0ndb-merge-theirs-8f3a1c"
 
 @(private)
 merge_union :: proc(base, ours, theirs: []u8) -> (out: []u8, err: Error) {
-	res, merr := textdiff.merge3(base, ours, theirs, textdiff.Merge_Options{style = .Merge, ours_label = MERGE_OURS, theirs_label = MERGE_THEIRS}, context.temp_allocator)
+	opts := textdiff.Merge_Options {
+		style        = .Diff3,
+		ours_label   = MERGE_OURS,
+		base_label   = MERGE_BASE,
+		theirs_label = MERGE_THEIRS,
+	}
+	res, merr := textdiff.merge3(base, ours, theirs, opts, context.temp_allocator)
 	if merr != nil {
 		return nil, .No_Memory
 	}
@@ -577,21 +585,65 @@ merge_union :: proc(base, ours, theirs: []u8) -> (out: []u8, err: Error) {
 		return res.data, .None
 	}
 	buf := make([dynamic]u8, 0, len(res.data), context.temp_allocator)
+	o_lines := make([dynamic]string, context.temp_allocator)
+	b_lines := make([dynamic]string, context.temp_allocator)
+	t_lines := make([dynamic]string, context.temp_allocator)
+	Section :: enum {
+		Outside,
+		Ours,
+		Base,
+		Theirs,
+	}
+	sec := Section.Outside
 	rest := string(res.data)
-	open_mark := "<<<<<<< " + MERGE_OURS
-	close_mark := ">>>>>>> " + MERGE_THEIRS
-	inside := false
 	for line in strings.split_lines_after_iterator(&rest) {
 		t := strings.trim_right(line, "\r\n")
-		if !inside && t == open_mark {
-			inside = true
-			continue
+		switch sec {
+		case .Outside:
+			if t == "<<<<<<< " + MERGE_OURS {
+				sec = .Ours
+				clear(&o_lines)
+				clear(&b_lines)
+				clear(&t_lines)
+				continue
+			}
+			append(&buf, ..transmute([]u8)line)
+		case .Ours:
+			if t == "||||||| " + MERGE_BASE {
+				sec = .Base
+				continue
+			}
+			append(&o_lines, line)
+		case .Base:
+			if t == "=======" {
+				sec = .Theirs
+				continue
+			}
+			append(&b_lines, line)
+		case .Theirs:
+			if t == ">>>>>>> " + MERGE_THEIRS {
+				sec = .Outside
+				for l in t_lines {
+					append(&buf, ..transmute([]u8)l)
+				}
+				used := make([]bool, len(b_lines), context.temp_allocator)
+				for l in o_lines {
+					in_base := false
+					for bl, k in b_lines {
+						if !used[k] && bl == l {
+							used[k] = true
+							in_base = true
+							break
+						}
+					}
+					if !in_base {
+						append(&buf, ..transmute([]u8)l)
+					}
+				}
+				continue
+			}
+			append(&t_lines, line)
 		}
-		if inside && (t == "=======" || t == close_mark) {
-			inside = t != close_mark
-			continue
-		}
-		append(&buf, ..transmute([]u8)line)
 	}
 	return buf[:], .None
 }

@@ -1,6 +1,5 @@
 package rt
 
-import "core:sys/posix"
 import "core:strings"
 import "../agent"
 import "../convo"
@@ -926,9 +925,7 @@ _env_merge :: proc(env: []string, allocator := context.temp_allocator) -> []stri
 		return nil
 	}
 	out := make([dynamic]string, allocator)
-	base := posix.environ
-	for i := 0; base != nil && base[i] != nil; i += 1 {
-		s := string(base[i])
+	for s in prim.environ(context.temp_allocator) {
 		eq := strings.index_byte(s, '=')
 		name := s[:eq] if eq >= 0 else s
 		over := false

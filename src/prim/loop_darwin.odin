@@ -7,6 +7,8 @@ import "core:sys/posix"
 @(private)
 MAX_EVENTS :: 64
 
+_Slot_Os :: struct {}
+
 _Loop_Os :: struct {
 	kq:     posix.FD,
 	events: [MAX_EVENTS]kqueue.KEvent,
@@ -129,7 +131,7 @@ _os_watch :: proc(l: ^Loop, fd: Fd, events: Events, h: u64) -> Error {
 		return .None
 	}
 	if _, err := kqueue.kevent(l.os.kq, changes[:n], nil, nil); err != .NONE {
-		_os_unwatch(l, fd, events)
+		_os_unwatch(l, fd, events, h)
 		return _error(err)
 	}
 	return .None
@@ -137,12 +139,12 @@ _os_watch :: proc(l: ^Loop, fd: Fd, events: Events, h: u64) -> Error {
 
 @(private)
 _os_modify :: proc(l: ^Loop, fd: Fd, old, next: Events, h: u64) -> Error {
-	_os_unwatch(l, fd, old - next)
+	_os_unwatch(l, fd, old - next, h)
 	return _os_watch(l, fd, next - old, h)
 }
 
 @(private)
-_os_unwatch :: proc(l: ^Loop, fd: Fd, events: Events) {
+_os_unwatch :: proc(l: ^Loop, fd: Fd, events: Events, h: u64) {
 	if .Read in events {
 		kqueue.kevent(l.os.kq, {_kev(fd, .Read, {.Delete}, 0)}, nil, nil)
 	}

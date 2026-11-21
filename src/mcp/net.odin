@@ -1,3 +1,4 @@
+#+build linux, darwin
 package mcp
 
 import "core:c"

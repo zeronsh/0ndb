@@ -8,7 +8,6 @@ import "../fstree"
 import "../odb"
 import "../prim"
 import "core:sync"
-import "core:sys/posix"
 
 SHADOW_MAGIC :: u64(0x3164_6873_6264_6e30)
 SHADOW_IDX_MAGIC :: u64(0x3178_6469_6264_6e30)
@@ -1426,14 +1425,14 @@ idx_map :: proc(s: ^Shadow) {
 	if s.map_lock != nil {
 		sync.mutex_lock(s.map_lock)
 	}
-	p := posix.mmap(nil, uint(size), {.READ, .WRITE}, {.SHARED}, posix.FD(s.idx_fd), 0)
-	if p == posix.MAP_FAILED {
+	p, merr := prim.map_file(s.idx_fd, int(size), true)
+	if merr != .None {
 		if s.map_lock != nil {
 			sync.mutex_unlock(s.map_lock)
 		}
 		return
 	}
-	s.mapped = ([^]u8)(p)[:size]
+	s.mapped = p
 }
 
 @(private = "file")
@@ -1441,7 +1440,7 @@ idx_unmap :: proc(s: ^Shadow) {
 	if s.mapped == nil {
 		return
 	}
-	posix.munmap(raw_data(s.mapped), uint(len(s.mapped)))
+	prim.unmap_file(s.mapped)
 	s.mapped = nil
 	if s.map_lock != nil {
 		sync.mutex_unlock(s.map_lock)

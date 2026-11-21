@@ -94,6 +94,7 @@ History :: struct {
 	durable:    u64,
 	mark:       u64,
 	mark_fp:    [3]u64,
+	staged:     [dynamic]Staged_Blob,
 	mounts:     [dynamic]^Mount,
 	pins:       [dynamic]odb.Oid,
 	lvidx:      prim.Fd,
@@ -116,6 +117,7 @@ history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self:
 		return .No_Memory
 	}
 	h.dir = d
+	h.staged = make([dynamic]Staged_Blob, allocator)
 	h.mounts = make([dynamic]^Mount, allocator)
 	if err := history_wake(h); err != .None {
 		delete(h.dir, allocator)
@@ -193,6 +195,29 @@ history_id_new :: proc(h: ^History) -> prim.Id {
 	return prim.id_new_with(c, h.opts.random)
 }
 
+@(private)
+from_journal :: proc "contextless" (e: journal.Error) -> Error {
+	#partial switch e {
+	case .None:
+		return .None
+	case .Io:
+		return .Io
+	case .No_Space:
+		return .No_Space
+	case .No_Memory:
+		return .No_Memory
+	case .Permission:
+		return .Permission
+	case .Busy:
+		return .Busy
+	case .Not_Found:
+		return .Not_Found
+	case .Redacted:
+		return .Redacted
+	}
+	return .Corrupt
+}
+
 history_durable_mark :: proc "contextless" (h: ^History) -> u64 {
 	return h.mark
 }
@@ -210,6 +235,7 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 		return .None
 	}
 	h.durable = min(mark, h.mark)
+	history_flush_staged(h, h.durable) or_return
 	err: Error
 	for m in h.mounts {
 		if e := mount_ack(m); e != .None && err == .None {
@@ -223,6 +249,11 @@ history_close :: proc(h: ^History) {
 	history_sleep(h)
 	delete(h.mounts)
 	h.mounts = nil
+	for x in h.staged {
+		delete(x.data, h.allocator)
+	}
+	delete(h.staged)
+	h.staged = nil
 	delete(h.dir, h.allocator)
 	h.dir = ""
 }
@@ -872,7 +903,70 @@ history_persist :: proc(h: ^History) -> Error {
 	}
 	prim.write_uvarint(&w, h.moves_count)
 	kv_put(&h.kv, transmute([]u8)string("s"), buf[:]) or_return
-	return kv_commit(&h.kv)
+	kv_commit(&h.kv) or_return
+	if !h.opts.deferred {
+		return history_flush_staged(h, max(u64))
+	}
+	return .None
+}
+
+Staged_Blob :: struct {
+	oid:  odb.Oid,
+	data: []u8,
+	mark: u64,
+}
+
+history_stage_blob :: proc(h: ^History, data: []u8) -> (oid: odb.Oid, err: Error) {
+	if h.db == nil {
+		return {}, .Invalid
+	}
+	oid = from_odb_v(odb.hash(h.db.format, .Blob, data)) or_return
+	if odb.exists(h.db, oid) {
+		return oid, .None
+	}
+	for s in h.staged {
+		if s.oid == oid {
+			return oid, .None
+		}
+	}
+	copy_data := make([]u8, len(data), h.allocator)
+	copy(copy_data, data)
+	if h.opts.deferred {
+		h.mark += 1
+	}
+	append(&h.staged, Staged_Blob{oid, copy_data, h.mark})
+	return oid, .None
+}
+
+@(private)
+history_staged_data :: proc(h: ^History, oid: odb.Oid) -> ([]u8, bool) {
+	for s in h.staged {
+		if s.oid == oid {
+			return s.data, true
+		}
+	}
+	return nil, false
+}
+
+history_flush_staged :: proc(h: ^History, upto: u64) -> Error {
+	if len(h.staged) == 0 {
+		return .None
+	}
+	i := 0
+	for i < len(h.staged) {
+		s := h.staged[i]
+		if s.mark > upto {
+			i += 1
+			continue
+		}
+		if h.db != nil {
+			_ = from_odb_v(odb.write(h.db, .Blob, s.data)) or_return
+			history_note_blob(h, s.oid)
+		}
+		delete(s.data, h.allocator)
+		ordered_remove(&h.staged, i)
+	}
+	return .None
 }
 
 history_unload_files :: proc(h: ^History) {
@@ -1498,6 +1592,9 @@ load_text :: proc(h: ^History, f: ^File_State, v: []crdt.Lv, full := false) -> E
 			if h.db == nil {
 				return nil, .Not_Found
 			}
+			if d, ok := history_staged_data(h, odb.Oid(oid)); ok && i64(len(d)) == size {
+				return d, .None
+			}
 			t, d, rerr := odb.read(h.db, odb.Oid(oid), allocator)
 			if rerr != .None || t != .Blob || i64(len(d)) != size {
 				return nil, .Not_Found
@@ -1537,7 +1634,7 @@ read_stream :: proc(h: ^History, stream: u32, off: i64, buf: ^[dynamic]u8) -> (b
 			return nil, .Redacted
 		}
 		if jerr != .None {
-			return nil, .Corrupt
+			return nil, from_journal(jerr)
 		}
 		clear(buf)
 		append(buf, ..b)
@@ -1565,9 +1662,8 @@ persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error 
 	clear(&f.new_refs)
 	if f.loaded && f.rec.ops - f.rec.cp_count >= CHECKPOINT_OPS && h.db != nil {
 		data := crdt.text_bytes(&f.text, context.temp_allocator)
-		oid, werr := odb.write(h.db, .Blob, data)
+		oid, werr := history_stage_blob(h, data)
 		if werr == .None {
-			history_note_blob(h, oid)
 			history_note_file_blob(h, id, oid, crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			clear(&f.rec.cp_version)
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))
@@ -1747,7 +1843,7 @@ replay_own :: proc(h: ^History) -> Error {
 			continue
 		}
 		if jerr != .None {
-			return .Corrupt
+			return from_journal(jerr)
 		}
 		if len(body) > 0 && body[0] == REC_ACTORS {
 			rd := prim.reader(body[1:])
@@ -1990,7 +2086,7 @@ apply_replace_record :: proc(h: ^History, stream: u32, body: []u8, off: u64) -> 
 			append(&inodes, op_inode(h, op.target))
 		}
 	}
-	return remap_ref(h, stream, old, off, inodes[:])
+	return replace_chain(h, stream, old, old, off, inodes[:])
 }
 
 REC_ALIAS :: fshist.REC_ALIAS

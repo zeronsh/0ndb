@@ -121,6 +121,7 @@ Event_Kind :: enum u8 {
 	Object_Seen,
 	Failure,
 	Relay_Misbehaving,
+	Presence,
 }
 
 Event :: struct {

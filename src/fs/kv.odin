@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:hash/xxhash"
 import "core:strconv"
 import "core:sync"
-import "core:sys/posix"
 import "../prim"
 
 KV_MAGIC :: u64(0x3167_6f6c_7662_6430)
@@ -849,14 +848,14 @@ kv_map :: proc(kv: ^Kv) {
 	if kv.map_lock != nil {
 		sync.mutex_lock(kv.map_lock)
 	}
-	p := posix.mmap(nil, uint(size), {.READ, .WRITE}, {.SHARED}, posix.FD(kv.idx_fd), 0)
-	if p == posix.MAP_FAILED {
+	p, merr := prim.map_file(kv.idx_fd, int(size), true)
+	if merr != .None {
 		if kv.map_lock != nil {
 			sync.mutex_unlock(kv.map_lock)
 		}
 		return
 	}
-	kv.mapped = ([^]u8)(p)[:size]
+	kv.mapped = p
 }
 
 @(private = "file")
@@ -864,7 +863,7 @@ kv_unmap :: proc(kv: ^Kv) {
 	if kv.mapped == nil {
 		return
 	}
-	posix.munmap(raw_data(kv.mapped), uint(len(kv.mapped)))
+	prim.unmap_file(kv.mapped)
 	kv.mapped = nil
 	if kv.map_lock != nil {
 		sync.mutex_unlock(kv.map_lock)

@@ -194,7 +194,7 @@ sync_dir :: proc(vfs: Vfs, path: string) -> Error {
 	if err != .None {
 		return err
 	}
-	err = fullsync(vfs, fd)
+	err = datasync(vfs, fd) when ODIN_OS == .Darwin else fullsync(vfs, fd)
 	close_file(vfs, fd)
 	return err
 }

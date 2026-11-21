@@ -513,9 +513,10 @@ apply_record :: proc(r: ^Reader, si: u32, off: u64, body: []u8) -> (n: int, err:
 		if !ok {
 			return 0, .Corrupt
 		}
+		prev, had := r.replaced[Rec_Key{si, old}]
 		r.replaced[Rec_Key{si, old}] = off
 		for &e in r.lvidx {
-			if e.stream == si && e.off == old {
+			if e.stream == si && (e.off == old || (had && e.off == prev)) {
 				e.off = off
 			}
 		}

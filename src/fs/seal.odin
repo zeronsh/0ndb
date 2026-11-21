@@ -5,7 +5,6 @@ import "../crdt"
 import "../fshist"
 import "../fstree"
 import "../journal"
-import "../odb"
 
 REC_SEAL :: fshist.REC_SEAL
 
@@ -122,8 +121,7 @@ seal_checkpoint :: proc(h: ^History, ino: fstree.Inode_Id, eff: []crdt.Lv) -> Er
 	read_file_record(h, ino, &tmp.rec) or_return
 	load_text(h, &tmp, eff) or_return
 	data := crdt.text_bytes(&tmp.text, context.temp_allocator)
-	oid := from_odb_v(odb.write(h.db, .Blob, data)) or_return
-	history_note_blob(h, oid)
+	oid := history_stage_blob(h, data) or_return
 	history_note_file_blob(h, ino, oid, crdt.graph_version_ids(&h.g, eff, context.temp_allocator))
 	count: u32
 	for count < tmp.rec.ops {
