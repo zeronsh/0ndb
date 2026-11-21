@@ -190,10 +190,14 @@ end :: proc(v: ^View, s: int) -> i64 {
 	return journal.reader_end(jr)
 }
 
+own :: proc "contextless" (v: ^View, s: int) -> bool {
+	return v.w != nil && s == v.w.seg
+}
+
 want :: proc(v: ^View, s: int, from, to: i64) {
 	a := max(from, 0)
 	b := to
-	if b <= a {
+	if b <= a || own(v, s) {
 		return
 	}
 	if jr := v.segs[s].jr; jr != nil && jr.replica != nil {
@@ -224,6 +228,9 @@ get :: proc(v: ^View, s: int, off: i64, hint_from: i64 = -1, hint_to: i64 = 0) -
 		return nil, off, .Unknown_Segment
 	}
 	if off >= journal.reader_end(jr) {
+		if own(v, s) {
+			return nil, off, .Not_Found
+		}
 		want(v, s, off, off + MSG_GUESS)
 		return nil, off, .Missing
 	}
@@ -382,6 +389,9 @@ resolve :: proc(v: ^View, s: int, r: Ref) -> (out: Vref, err: Error) {
 		}
 	}
 	if r.off >= end(v, t) {
+		if own(v, t) {
+			return {}, .Not_Found
+		}
 		want(v, t, r.off, r.off + MSG_GUESS)
 		return {}, .Missing
 	}
