@@ -209,7 +209,7 @@ warmer_fire :: proc(l: ^prim.Loop, data: rawptr) {
 	w := (^Warmer)(data)
 	w.timer = 0
 	w.timer_at = 0
-	now := prim.mono_ns()
+	now := prim.loop_now_ns(w.loop)
 	for len(w.heap) > 0 && w.heap[0].at <= now {
 		s := heap_pop(w)
 		if !warmer_live(w, s) {

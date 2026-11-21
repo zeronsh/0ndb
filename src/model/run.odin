@@ -228,10 +228,15 @@ run_on_body :: proc(r: ^Run, chunk: []u8, now: i64, out: ^Output) -> bool {
 		}
 		return true
 	}
-	clear(&r.deltas)
-	r.model.parse(&r.model, &r.stream, chunk, &r.deltas)
-	for &d in r.deltas {
-		on_delta(r, &d, out)
+	stream_feed(&r.stream, chunk)
+	for r.stream.failure.class == .None {
+		clear(&r.deltas)
+		if !r.model.next(&r.model, &r.stream, &r.deltas) {
+			break
+		}
+		for &d in r.deltas {
+			on_delta(r, &d, out)
+		}
 	}
 	if r.stream.failure.class != .None {
 		f := r.stream.failure

@@ -283,7 +283,7 @@ Model :: struct {
 	encode:     proc(m: ^Model, cfg: ^Config, msg: ^Message, t: ^Transcript),
 	head:       proc(m: ^Model, cfg: ^Config, ctx: ^Context, opts: ^Request_Opts, dst: ^[dynamic]u8),
 	tail:       proc(m: ^Model, cfg: ^Config, kind: Request_Kind, dst: ^[dynamic]u8),
-	parse:      proc(m: ^Model, s: ^Stream, chunk: []u8, out: ^[dynamic]Delta),
+	next:       proc(m: ^Model, s: ^Stream, out: ^[dynamic]Delta) -> bool,
 	finish:     proc(m: ^Model, s: ^Stream, t: ^Transcript, partial: bool) -> bool,
 	classify:   proc(m: ^Model, status: int, headers: []Header, body: []u8) -> Failure,
 	marker:     proc(m: ^Model, cfg: ^Config) -> string,

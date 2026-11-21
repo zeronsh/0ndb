@@ -1,5 +1,6 @@
 package model
 
+import "base:runtime"
 import "core:math/rand"
 
 stream_init :: proc(s: ^Stream, allocator := context.allocator) {
@@ -314,4 +315,38 @@ contains_fold :: proc(hay, needle: string) -> bool {
 		}
 	}
 	return false
+}
+
+stream_feed :: proc(s: ^Stream, chunk: []u8) {
+	sse_feed(&s.sse, chunk)
+}
+
+model_parse :: proc(m: ^Model, s: ^Stream, chunk: []u8, out: ^[dynamic]Delta, allocator := context.temp_allocator) {
+	stream_feed(s, chunk)
+	batch := make([dynamic]Delta, context.temp_allocator)
+	for {
+		clear(&batch)
+		if !m.next(m, s, &batch) {
+			return
+		}
+		for d in batch {
+			c := d
+			c.id = own_str(d.id, allocator)
+			c.name = own_str(d.name, allocator)
+			c.text = own_str(d.text, allocator)
+			c.failure.code = own_str(d.failure.code, allocator)
+			c.failure.message = own_str(d.failure.message, allocator)
+			append(out, c)
+		}
+	}
+}
+
+@(private)
+own_str :: proc(s: string, allocator: runtime.Allocator) -> string {
+	if s == "" {
+		return ""
+	}
+	b := make([]u8, len(s), allocator)
+	copy(b, s)
+	return string(b)
 }

@@ -48,26 +48,26 @@ session_open :: proc(rn: ^Runner, cfg: Config, model: Model, on_event: Event_Pro
 
 session_start :: proc(s: ^Session, ctx: ^Context, turn: string) {
 	out := output_make()
-	run_start(&s.run, ctx, turn, prim.mono_ns(), &out)
+	run_start(&s.run, ctx, turn, prim.loop_now_ns(s.runner.loop), &out)
 	apply(s, &out)
 }
 
 session_steer :: proc(s: ^Session, id: string, text: string, files: []agent.Attachment = nil) -> bool {
 	out := output_make()
-	ok := run_steer(&s.run, id, text, files, prim.mono_ns(), &out)
+	ok := run_steer(&s.run, id, text, files, prim.loop_now_ns(s.runner.loop), &out)
 	apply(s, &out)
 	return ok
 }
 
 session_interrupt :: proc(s: ^Session) {
 	out := output_make()
-	run_interrupt(&s.run, prim.mono_ns(), &out)
+	run_interrupt(&s.run, prim.loop_now_ns(s.runner.loop), &out)
 	apply(s, &out)
 }
 
 session_tool_done :: proc(s: ^Session, id: string, content: []Block, is_error := false) {
 	out := output_make()
-	run_tool_done(&s.run, id, content, is_error, prim.mono_ns(), &out)
+	run_tool_done(&s.run, id, content, is_error, prim.loop_now_ns(s.runner.loop), &out)
 	apply(s, &out)
 }
 
@@ -131,7 +131,7 @@ apply :: proc(s: ^Session, out: ^Output) {
 			if err != .None {
 				s.http_id = 0
 				nested := output_make()
-				run_on_done(&s.run, err, http_error_text(err), prim.mono_ns(), &nested)
+				run_on_done(&s.run, err, http_error_text(err), prim.loop_now_ns(s.runner.loop), &nested)
 				apply(s, &nested)
 			} else {
 				s.http_id = id
@@ -187,7 +187,7 @@ on_timer :: proc(l: ^prim.Loop, data: rawptr) {
 	s.timer = 0
 	s.timer_at = 0
 	out := output_make()
-	run_tick(&s.run, prim.mono_ns(), &out)
+	run_tick(&s.run, prim.loop_now_ns(s.runner.loop), &out)
 	apply(s, &out)
 }
 
@@ -198,7 +198,7 @@ sink_head :: proc(data: rawptr, id: Http_Id, status: int, headers: []Header) {
 		return
 	}
 	out := output_make()
-	run_on_head(&s.run, status, headers, prim.mono_ns(), &out)
+	run_on_head(&s.run, status, headers, prim.loop_now_ns(s.runner.loop), &out)
 	apply(s, &out)
 }
 
@@ -209,7 +209,7 @@ sink_body :: proc(data: rawptr, id: Http_Id, chunk: []u8) -> bool {
 		return false
 	}
 	out := output_make()
-	keep := run_on_body(&s.run, chunk, prim.mono_ns(), &out)
+	keep := run_on_body(&s.run, chunk, prim.loop_now_ns(s.runner.loop), &out)
 	if !keep && s.http_id == id {
 		s.http_id = 0
 	}
@@ -225,6 +225,6 @@ sink_done :: proc(data: rawptr, id: Http_Id, err: Http_Error, detail: string) {
 	}
 	s.http_id = 0
 	out := output_make()
-	run_on_done(&s.run, err, detail, prim.mono_ns(), &out)
+	run_on_done(&s.run, err, detail, prim.loop_now_ns(s.runner.loop), &out)
 	apply(s, &out)
 }

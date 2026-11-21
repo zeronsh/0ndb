@@ -6,7 +6,7 @@ anthropic_model :: proc() -> Model {
 		encode = anthropic_encode,
 		head = anthropic_head,
 		tail = json_tail,
-		parse = anthropic_parse,
+		next = anthropic_next,
 		finish = anthropic_finish,
 		classify = anthropic_classify,
 		marker = anthropic_marker,
@@ -444,18 +444,22 @@ anthropic_scan_native :: proc(t: ^Transcript, base: int, role: Role) {
 }
 
 @(private)
-anthropic_parse :: proc(m: ^Model, s: ^Stream, chunk: []u8, out: ^[dynamic]Delta) {
-	sse_feed(&s.sse, chunk)
+anthropic_next :: proc(m: ^Model, s: ^Stream, out: ^[dynamic]Delta) -> bool {
 	for {
 		ev, ok := sse_next(&s.sse)
 		if !ok {
-			break
+			if s.sse.overflow && s.failure.class == .None {
+				stream_fail(s, out, .Malformed, "overflow", "stream event exceeds the size limit")
+				return true
+			}
+			return false
 		}
 		clear(&s.scratch)
+		reserve(&s.scratch, len(ev.data))
 		anthropic_event(s, ev, out)
-	}
-	if s.sse.overflow {
-		stream_fail(s, out, .Malformed, "overflow", "stream event exceeds the size limit")
+		if len(out) > 0 {
+			return true
+		}
 	}
 }
 

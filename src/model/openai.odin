@@ -6,7 +6,7 @@ responses_model :: proc() -> Model {
 		encode = responses_encode,
 		head = responses_head,
 		tail = json_tail,
-		parse = responses_parse,
+		next = responses_next,
 		finish = responses_finish,
 		classify = openai_classify,
 		marker = no_marker,
@@ -289,18 +289,22 @@ responses_part :: proc(t: ^Transcript, blk: ^Block) -> bool {
 }
 
 @(private)
-responses_parse :: proc(m: ^Model, s: ^Stream, chunk: []u8, out: ^[dynamic]Delta) {
-	sse_feed(&s.sse, chunk)
+responses_next :: proc(m: ^Model, s: ^Stream, out: ^[dynamic]Delta) -> bool {
 	for {
 		ev, ok := sse_next(&s.sse)
 		if !ok {
-			break
+			if s.sse.overflow && s.failure.class == .None {
+				stream_fail(s, out, .Malformed, "overflow", "stream event exceeds the size limit")
+				return true
+			}
+			return false
 		}
 		clear(&s.scratch)
+		reserve(&s.scratch, len(ev.data))
 		responses_event(s, ev, out)
-	}
-	if s.sse.overflow {
-		stream_fail(s, out, .Malformed, "overflow", "stream event exceeds the size limit")
+		if len(out) > 0 {
+			return true
+		}
 	}
 }
 
