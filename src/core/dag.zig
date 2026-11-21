@@ -77,6 +77,64 @@ pub const ActorRun = struct {
     batch_idx: u32,
 };
 
+pub const BatchLocation = struct {
+    seg_id: u32 = 0,
+    offset: u64 = 0,
+    len: u32 = 0,
+    flags: u16 = 0,
+};
+
+pub const BatchMeta = struct {
+    actor: id.ActorId,
+    start: id.Lamport,
+    end: id.Lamport,
+    wall_ms: u64,
+    batch_idx: u32,
+    log_seg: u32 = 0,
+    log_off: u64 = 0,
+    log_len: u32 = 0,
+    flags: u16 = 0,
+};
+
+pub const DagSource = struct {
+    ptr: *const anyopaque,
+    batchCountFn: *const fn (ptr: *const anyopaque) usize,
+    getBatchMetaFn: *const fn (ptr: *const anyopaque, bid: id.BatchId) ?BatchMeta,
+    appendParentsFn: *const fn (ptr: *const anyopaque, allocator: Allocator, bid: id.BatchId, out: *std.ArrayList(id.BatchId)) Allocator.Error!bool,
+    parentsEqualFn: *const fn (ptr: *const anyopaque, bid: id.BatchId, parents: *const Version) bool,
+    actorRangeOverlapsFn: *const fn (ptr: *const anyopaque, actor: id.ActorId, start: id.Lamport, end: id.Lamport) bool,
+    findActorRunFn: *const fn (ptr: *const anyopaque, op: id.OpId) ?ActorRun,
+    appendAllBatchIdsFn: *const fn (ptr: *const anyopaque, allocator: Allocator, out: *std.ArrayList(id.BatchId)) Allocator.Error!void,
+
+    pub fn batchCount(self: DagSource) usize {
+        return self.batchCountFn(self.ptr);
+    }
+
+    pub fn getBatchMeta(self: DagSource, bid: id.BatchId) ?BatchMeta {
+        return self.getBatchMetaFn(self.ptr, bid);
+    }
+
+    pub fn appendParents(self: DagSource, allocator: Allocator, bid: id.BatchId, out: *std.ArrayList(id.BatchId)) Allocator.Error!bool {
+        return self.appendParentsFn(self.ptr, allocator, bid, out);
+    }
+
+    pub fn parentsEqual(self: DagSource, bid: id.BatchId, parents: *const Version) bool {
+        return self.parentsEqualFn(self.ptr, bid, parents);
+    }
+
+    pub fn actorRangeOverlaps(self: DagSource, actor: id.ActorId, start: id.Lamport, end: id.Lamport) bool {
+        return self.actorRangeOverlapsFn(self.ptr, actor, start, end);
+    }
+
+    pub fn findActorRun(self: DagSource, op: id.OpId) ?ActorRun {
+        return self.findActorRunFn(self.ptr, op);
+    }
+
+    pub fn appendAllBatchIds(self: DagSource, allocator: Allocator, out: *std.ArrayList(id.BatchId)) Allocator.Error!void {
+        return self.appendAllBatchIdsFn(self.ptr, allocator, out);
+    }
+};
+
 pub const CompiledView = struct {
     dag: *const Dag,
     min_unobserved: id.Lamport,
@@ -136,6 +194,8 @@ pub const Dag = struct {
     headers: std.AutoHashMapUnmanaged(id.BatchId, BatchHeader) = .empty,
     batch_indices: std.AutoHashMapUnmanaged(id.BatchId, u32) = .empty,
     by_actor: std.AutoHashMapUnmanaged(id.ActorId, std.ArrayList(ActorRun)) = .empty,
+    batch_locations: std.AutoHashMapUnmanaged(id.BatchId, BatchLocation) = .empty,
+    source: ?DagSource = null,
     heads: Version = Version.ROOT,
     horizon: Version = Version.ROOT,
     max_ts: id.Lamport = 0,
@@ -153,20 +213,154 @@ pub const Dag = struct {
             list.deinit(allocator);
         }
         self.by_actor.deinit(allocator);
+        self.batch_locations.deinit(allocator);
         self.heads.deinit(allocator);
         self.horizon.deinit(allocator);
+        self.source = null;
+    }
+
+    pub fn setSource(self: *Dag, src: ?DagSource) void {
+        self.source = src;
+    }
+
+    pub fn clearOverlayAfterCheckpoint(self: *Dag, allocator: Allocator) void {
+        var hit = self.headers.valueIterator();
+        while (hit.next()) |h| {
+            h.deinit(allocator);
+        }
+        self.headers.clearRetainingCapacity();
+        self.batch_indices.clearRetainingCapacity();
+        var ait = self.by_actor.valueIterator();
+        while (ait.next()) |list| {
+            list.deinit(allocator);
+        }
+        self.by_actor.clearRetainingCapacity();
+        self.batch_locations.clearRetainingCapacity();
+    }
+
+    pub fn setHorizon(self: *Dag, allocator: Allocator, new_horizon: *const Version) Allocator.Error!void {
+        const cloned = try new_horizon.clone(allocator);
+        self.horizon.deinit(allocator);
+        self.horizon = cloned;
+    }
+
+    pub fn setBatchLocation(self: *Dag, allocator: Allocator, bid: id.BatchId, loc: BatchLocation) Allocator.Error!void {
+        try self.batch_locations.put(allocator, bid, loc);
+    }
+
+    pub fn getBatchLocation(self: *const Dag, bid: id.BatchId) ?BatchLocation {
+        if (self.batch_locations.get(bid)) |loc| return loc;
+        if (self.source) |src| {
+            if (src.getBatchMeta(bid)) |m| {
+                return .{
+                    .seg_id = m.log_seg,
+                    .offset = m.log_off,
+                    .len = m.log_len,
+                    .flags = m.flags,
+                };
+            }
+        }
+        return null;
     }
 
     pub fn count(self: *const Dag) usize {
-        return self.headers.count();
+        var n: usize = self.headers.count();
+        if (self.source) |src| {
+            n += src.batchCount();
+        }
+        return n;
     }
 
     pub fn containsBatch(self: *const Dag, bid: id.BatchId) bool {
-        return self.headers.contains(bid);
+        if (self.headers.contains(bid)) return true;
+        if (self.source) |src| return src.getBatchMeta(bid) != null;
+        return false;
     }
 
     pub fn getHeader(self: *const Dag, bid: id.BatchId) ?*const BatchHeader {
         return self.headers.getPtr(bid);
+    }
+
+    pub fn getBatchMeta(self: *const Dag, bid: id.BatchId) ?BatchMeta {
+        if (self.headers.getPtr(bid)) |h| {
+            const loc = self.batch_locations.get(bid) orelse BatchLocation{};
+            return .{
+                .actor = h.actor,
+                .start = h.start,
+                .end = h.end,
+                .wall_ms = h.wall_ms,
+                .batch_idx = self.batch_indices.get(bid) orelse 0,
+                .log_seg = loc.seg_id,
+                .log_off = loc.offset,
+                .log_len = loc.len,
+                .flags = loc.flags,
+            };
+        }
+        if (self.source) |src| return src.getBatchMeta(bid);
+        return null;
+    }
+
+    pub fn getHeaderAlloc(self: *const Dag, allocator: Allocator, bid: id.BatchId) Allocator.Error!?BatchHeader {
+        if (self.headers.getPtr(bid)) |h| return try h.clone(allocator);
+        if (self.source) |src| {
+            const meta = src.getBatchMeta(bid) orelse return null;
+            var plist: std.ArrayList(id.BatchId) = .empty;
+            defer plist.deinit(allocator);
+            _ = try src.appendParents(allocator, bid, &plist);
+            var parents = Version{};
+            errdefer parents.deinit(allocator);
+            for (plist.items) |p| try parents.insert(allocator, p);
+            return .{
+                .actor = meta.actor,
+                .start = meta.start,
+                .end = meta.end,
+                .parents = parents,
+                .wall_ms = meta.wall_ms,
+            };
+        }
+        return null;
+    }
+
+    pub fn collectAllBatchIds(self: *const Dag, allocator: Allocator) Allocator.Error!std.ArrayList(id.BatchId) {
+        var out: std.ArrayList(id.BatchId) = .empty;
+        errdefer out.deinit(allocator);
+        if (self.source) |src| {
+            try src.appendAllBatchIds(allocator, &out);
+        }
+        var it = self.headers.keyIterator();
+        while (it.next()) |k| {
+            if (self.source) |src| {
+                if (src.getBatchMeta(k.*) != null) continue;
+            }
+            try out.append(allocator, k.*);
+        }
+        return out;
+    }
+
+    fn appendParentsOf(self: *const Dag, allocator: Allocator, bid: id.BatchId, out: *std.ArrayList(id.BatchId)) Allocator.Error!void {
+        if (self.headers.getPtr(bid)) |h| {
+            try out.appendSlice(allocator, h.parents.slice());
+            return;
+        }
+        if (self.source) |src| {
+            _ = try src.appendParents(allocator, bid, out);
+        }
+    }
+
+    fn batchIdxOfId(self: *const Dag, bid: id.BatchId) ?u32 {
+        if (self.batch_indices.get(bid)) |bidx| return bidx;
+        if (self.source) |src| {
+            if (src.getBatchMeta(bid)) |m| return m.batch_idx;
+        }
+        return null;
+    }
+
+    fn batchStartOfId(self: *const Dag, bid: id.BatchId) ?id.Lamport {
+        if (self.headers.getPtr(bid)) |h| return h.start;
+        if (self.source) |src| {
+            if (src.getBatchMeta(bid)) |m| return m.start;
+        }
+        return null;
     }
 
     pub const MAX_SAFE_LAMPORT: id.Lamport = std.math.maxInt(id.Lamport) - (1 << 20);
@@ -183,8 +377,16 @@ pub const Dag = struct {
             }
             return error.Overlap;
         }
+        if (self.source) |src| {
+            if (src.getBatchMeta(bid)) |existing| {
+                if (existing.start == h.start and src.parentsEqual(bid, &h.parents)) {
+                    return true;
+                }
+                return error.Overlap;
+            }
+        }
         for (h.parents.slice()) |p| {
-            if (!self.headers.contains(p)) return error.MissingParents;
+            if (!self.containsBatch(p)) return error.MissingParents;
         }
         const parent_max = h.parents.maxTs();
         if (h.start <= parent_max) return error.LamportViolation;
@@ -192,6 +394,11 @@ pub const Dag = struct {
         if (self.by_actor.getPtr(h.actor)) |runs| {
             const idx = lowerBoundRuns(runs.items, h.start);
             if (idx < runs.items.len and runs.items[idx].start <= h.end) {
+                return error.Overlap;
+            }
+        }
+        if (self.source) |src| {
+            if (src.actorRangeOverlaps(h.actor, h.start, h.end)) {
                 return error.Overlap;
             }
         }
@@ -229,23 +436,37 @@ pub const Dag = struct {
     }
 
     pub fn batchOf(self: *const Dag, op: id.OpId) ?id.BatchId {
-        const runs = self.by_actor.getPtr(op.actor) orelse return null;
-        const idx = lowerBoundRuns(runs.items, op.ts);
-        if (idx >= runs.items.len) return null;
-        const run = runs.items[idx];
-        if (op.ts >= run.start and op.ts <= run.end) {
-            return id.OpId.init(run.end, op.actor);
+        if (self.by_actor.getPtr(op.actor)) |runs| {
+            const idx = lowerBoundRuns(runs.items, op.ts);
+            if (idx < runs.items.len) {
+                const run = runs.items[idx];
+                if (op.ts >= run.start and op.ts <= run.end) {
+                    return id.OpId.init(run.end, op.actor);
+                }
+            }
+        }
+        if (self.source) |src| {
+            if (src.findActorRun(op)) |run| {
+                return id.OpId.init(run.end, op.actor);
+            }
         }
         return null;
     }
 
     pub fn batchIndexOf(self: *const Dag, op: id.OpId) ?u32 {
-        const runs = self.by_actor.getPtr(op.actor) orelse return null;
-        const idx = lowerBoundRuns(runs.items, op.ts);
-        if (idx >= runs.items.len) return null;
-        const run = runs.items[idx];
-        if (op.ts >= run.start and op.ts <= run.end) {
-            return run.batch_idx;
+        if (self.by_actor.getPtr(op.actor)) |runs| {
+            const idx = lowerBoundRuns(runs.items, op.ts);
+            if (idx < runs.items.len) {
+                const run = runs.items[idx];
+                if (op.ts >= run.start and op.ts <= run.end) {
+                    return run.batch_idx;
+                }
+            }
+        }
+        if (self.source) |src| {
+            if (src.findActorRun(op)) |run| {
+                return run.batch_idx;
+            }
         }
         return null;
     }
@@ -270,8 +491,8 @@ pub const Dag = struct {
 
         var min_ts: id.Lamport = std.math.maxInt(id.Lamport);
         for (diff_batches.items) |bid| {
-            if (self.headers.getPtr(bid)) |h| {
-                if (h.start < min_ts) min_ts = h.start;
+            if (self.batchStartOfId(bid)) |st| {
+                if (st < min_ts) min_ts = st;
             } else if (bid.ts < min_ts) {
                 min_ts = bid.ts;
             }
@@ -285,7 +506,7 @@ pub const Dag = struct {
                 .inline_len = 0,
             };
             for (diff_batches.items) |bid| {
-                if (self.batch_indices.get(bid)) |bidx| {
+                if (self.batchIdxOfId(bid)) |bidx| {
                     cv.inline_ids[cv.inline_len] = bidx;
                     cv.inline_len += 1;
                 }
@@ -297,10 +518,12 @@ pub const Dag = struct {
         const bits = try allocator.alloc(u64, words);
         @memset(bits, 0);
         for (diff_batches.items) |bid| {
-            if (self.batch_indices.get(bid)) |bidx| {
+            if (self.batchIdxOfId(bid)) |bidx| {
                 const w = bidx >> 6;
-                const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bidx & 63));
-                bits[w] |= mask;
+                if (w < bits.len) {
+                    const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bidx & 63));
+                    bits[w] |= mask;
+                }
             }
         }
         return .{
@@ -321,8 +544,8 @@ pub const Dag = struct {
         }
         var min_ts: id.Lamport = std.math.maxInt(id.Lamport);
         for (excluded) |bid| {
-            if (self.headers.getPtr(bid)) |h| {
-                if (h.start < min_ts) min_ts = h.start;
+            if (self.batchStartOfId(bid)) |st| {
+                if (st < min_ts) min_ts = st;
             } else if (bid.ts < min_ts) {
                 min_ts = bid.ts;
             }
@@ -335,7 +558,7 @@ pub const Dag = struct {
                 .inline_len = 0,
             };
             for (excluded) |bid| {
-                if (self.batch_indices.get(bid)) |bidx| {
+                if (self.batchIdxOfId(bid)) |bidx| {
                     cv.inline_ids[cv.inline_len] = bidx;
                     cv.inline_len += 1;
                 }
@@ -346,10 +569,12 @@ pub const Dag = struct {
         const bits = try allocator.alloc(u64, words);
         @memset(bits, 0);
         for (excluded) |bid| {
-            if (self.batch_indices.get(bid)) |bidx| {
+            if (self.batchIdxOfId(bid)) |bidx| {
                 const w = bidx >> 6;
-                const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bidx & 63));
-                bits[w] |= mask;
+                if (w < bits.len) {
+                    const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bidx & 63));
+                    bits[w] |= mask;
+                }
             }
         }
         return .{
@@ -373,9 +598,7 @@ pub const Dag = struct {
             if (cur.ts <= target.ts) continue;
             const gop = try seen.getOrPut(allocator, cur);
             if (gop.found_existing) continue;
-            if (self.headers.getPtr(cur)) |h| {
-                try stack.appendSlice(allocator, h.parents.slice());
-            }
+            try self.appendParentsOf(allocator, cur, &stack);
         }
         return false;
     }
@@ -408,6 +631,8 @@ pub const Dag = struct {
         defer done.deinit(allocator);
         var heap = std.PriorityQueue(id.BatchId, void, OrderCtx.cmp).empty;
         defer heap.deinit(allocator);
+        var parents_tmp: std.ArrayList(id.BatchId) = .empty;
+        defer parents_tmp.deinit(allocator);
         var outside: usize = 0;
 
         for (b.slice()) |h| {
@@ -426,10 +651,10 @@ pub const Dag = struct {
                 outside -= 1;
                 try out.append(allocator, cur);
             }
-            if (self.headers.getPtr(cur)) |h| {
-                for (h.parents.slice()) |p| {
-                    try pushDiff(allocator, p, in_b, &state, &heap, &outside);
-                }
+            parents_tmp.clearRetainingCapacity();
+            try self.appendParentsOf(allocator, cur, &parents_tmp);
+            for (parents_tmp.items) |p| {
+                try pushDiff(allocator, p, in_b, &state, &heap, &outside);
             }
         }
         self.topoSortSlice(out.items);
@@ -440,8 +665,8 @@ pub const Dag = struct {
         const Ctx = struct {
             dag: *const Dag,
             fn lessThan(ctx: @This(), lhs: id.BatchId, rhs: id.BatchId) bool {
-                const ls = if (ctx.dag.headers.getPtr(lhs)) |h| h.start else lhs.ts;
-                const rs = if (ctx.dag.headers.getPtr(rhs)) |h| h.start else rhs.ts;
+                const ls = ctx.dag.batchStartOfId(lhs) orelse lhs.ts;
+                const rs = ctx.dag.batchStartOfId(rhs) orelse rhs.ts;
                 if (ls != rs) return ls < rs;
                 return lhs.actor < rhs.actor;
             }
@@ -454,8 +679,8 @@ pub const Dag = struct {
         defer diff.deinit(allocator);
         var min_ts: id.Lamport = std.math.maxInt(id.Lamport);
         for (diff.items) |bid| {
-            if (self.headers.getPtr(bid)) |h| {
-                if (h.start < min_ts) min_ts = h.start;
+            if (self.batchStartOfId(bid)) |st| {
+                if (st < min_ts) min_ts = st;
             } else if (bid.ts < min_ts) {
                 min_ts = bid.ts;
             }
@@ -473,9 +698,7 @@ pub const Dag = struct {
         while (stack.pop()) |cur| {
             const gop = try seen.getOrPut(allocator, cur);
             if (gop.found_existing) continue;
-            if (self.headers.getPtr(cur)) |h| {
-                try stack.appendSlice(allocator, h.parents.slice());
-            }
+            try self.appendParentsOf(allocator, cur, &stack);
         }
         return seen;
     }
@@ -512,13 +735,15 @@ pub const Dag = struct {
 
         var non_maximal: std.AutoHashMapUnmanaged(id.BatchId, void) = .empty;
         defer non_maximal.deinit(allocator);
+        var parents_tmp: std.ArrayList(id.BatchId) = .empty;
+        defer parents_tmp.deinit(allocator);
         var cit = common.keyIterator();
         while (cit.next()) |k| {
-            if (self.headers.getPtr(k.*)) |h| {
-                for (h.parents.slice()) |p| {
-                    if (common.contains(p)) {
-                        try non_maximal.put(allocator, p, {});
-                    }
+            parents_tmp.clearRetainingCapacity();
+            try self.appendParentsOf(allocator, k.*, &parents_tmp);
+            for (parents_tmp.items) |p| {
+                if (common.contains(p)) {
+                    try non_maximal.put(allocator, p, {});
                 }
             }
         }

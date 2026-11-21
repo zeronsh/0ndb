@@ -217,6 +217,33 @@ pub const AppendLog = struct {
         self.mapped_len = map_len;
     }
 
+    fn isAllZero(bytes: []const u8) bool {
+        for (bytes) |b| {
+            if (b != 0) return false;
+        }
+        return true;
+    }
+
+    fn hasValidFrameAfter(mapping: []const u8, start: usize, size_usize: usize) bool {
+        var pos = alignUp(start);
+        while (pos + HEADER_SIZE <= size_usize) : (pos += ALIGN) {
+            if (!std.mem.eql(u8, mapping[pos .. pos + 4], &MAGIC)) continue;
+            const hdr_ptr: *const [HEADER_SIZE]u8 = @ptrCast(mapping[pos .. pos + HEADER_SIZE].ptr);
+            const hdr = FrameHeader.decode(hdr_ptr) catch continue;
+            const p_start = pos + HEADER_SIZE;
+            const p_end = std.math.add(usize, p_start, hdr.payload_len) catch continue;
+            if (p_end > size_usize) continue;
+            const a_end = alignUp(p_end);
+            if (a_end > size_usize) continue;
+            if (frameCrc(hdr_ptr, mapping[p_start..p_end]) == hdr.crc) return true;
+        }
+        return false;
+    }
+
+    pub fn recover(self: *AppendLog) !void {
+        return self.tailRecover(0, true);
+    }
+
     pub fn tailRecover(self: *AppendLog, start_offset: u64, verify_blake3: bool) !void {
         self.index.clearRetainingCapacity();
         const st = try self.file.stat(self.io);
@@ -238,19 +265,30 @@ pub const AppendLog = struct {
         var last_seq: u64 = 0;
         while (offset + HEADER_SIZE <= size_usize) {
             const hdr_ptr: *const [HEADER_SIZE]u8 = @ptrCast(mapping[offset .. offset + HEADER_SIZE].ptr);
-            const hdr = FrameHeader.decode(hdr_ptr) catch break;
+            const hdr = FrameHeader.decode(hdr_ptr) catch {
+                if (isAllZero(mapping[offset..size_usize])) break;
+                if (hasValidFrameAfter(mapping, offset + ALIGN, size_usize)) return error.CorruptLog;
+                break;
+            };
             const payload_start = offset + HEADER_SIZE;
-            const payload_end = payload_start + hdr.payload_len;
+            const payload_end = std.math.add(usize, payload_start, hdr.payload_len) catch break;
             if (payload_end > size_usize) break;
-            const payload = mapping[payload_start..payload_end];
-            if (frameCrc(hdr_ptr, payload) != hdr.crc) break;
-            if (verify_blake3) {
-                const h = crypto.hashBytes(payload);
-                const actual_prefix = std.mem.readInt(u64, h[0..8], .little);
-                if (actual_prefix != hdr.hash_prefix) break;
-            }
             const aligned_end = alignUp(payload_end);
             if (aligned_end > size_usize) break;
+            const payload = mapping[payload_start..payload_end];
+            const crc_ok = frameCrc(hdr_ptr, payload) == hdr.crc;
+            var blake_ok = true;
+            if (crc_ok and verify_blake3) {
+                const h = crypto.hashBytes(payload);
+                const actual_prefix = std.mem.readInt(u64, h[0..8], .little);
+                blake_ok = (actual_prefix == hdr.hash_prefix);
+            }
+            if (!crc_ok or !blake_ok) {
+                if (aligned_end < size_usize and !isAllZero(mapping[aligned_end..size_usize])) {
+                    return error.CorruptLog;
+                }
+                break;
+            }
             try self.index.append(self.allocator, .{
                 .seq = hdr.seq,
                 .offset = offset,
