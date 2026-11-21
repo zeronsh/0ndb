@@ -47,6 +47,15 @@ log_init :: proc(log: ^Text_Log, allocator := context.allocator, content := Cont
 	log.copies = copies
 }
 
+log_clone :: proc(dst: ^Text_Log, src: ^Text_Log, allocator := context.allocator) {
+	log_init(dst, allocator, src.content, src.copies)
+	append(&dst.entries, ..src.entries[:])
+	append(&dst.bytes, ..src.bytes[:])
+	append(&dst.refs, ..src.refs[:])
+	append(&dst.authors, ..src.authors[:])
+	dst.floor = src.floor
+}
+
 log_destroy :: proc(log: ^Text_Log) {
 	delete(log.entries)
 	delete(log.bytes)

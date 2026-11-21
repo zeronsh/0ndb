@@ -214,8 +214,13 @@ apply_batch :: proc(t: ^testing.T, r: ^Replica, b: ^crdt.Batch, collect: bool) -
 	}
 	for f in 0 ..< FILES {
 		file := &r.files[f]
-		e := crdt.text_merge(&file.text, &r.g, &file.log, r.g.heads[:], &r.conflicts if collect else nil)
+		before := crdt.text_bytes(&file.text)
+		defer delete(before)
+		db: crdt.Delta_Builder
+		crdt.delta_builder_init(&db, context.temp_allocator)
+		e := crdt.text_merge(&file.text, &r.g, &file.log, r.g.heads[:], &r.conflicts if collect else nil, delta_sink(&db))
 		testing.expect_value(t, e, crdt.Error.None)
+		check_delta(t, &file.text, &r.g, &db, before)
 		size := crdt.text_len(&file.text)
 		for c in r.conflicts {
 			testing.expect(t, 0 <= c.start && c.start <= c.end && c.end <= size, "conflict region out of range")
@@ -225,6 +230,92 @@ apply_batch :: proc(t: ^testing.T, r: ^Replica, b: ^crdt.Batch, collect: bool) -
 	}
 	flush(r)
 	return .None if skip + valid == n else .Invalid
+}
+
+delta_sink :: proc(db: ^crdt.Delta_Builder) -> crdt.Text_Sink {
+	return crdt.Text_Sink {
+		data = db,
+		insert = proc(data: rawptr, pos: int, bytes: []u8, author: crdt.Op_Id) {
+			b := (^crdt.Delta_Builder)(data)
+			c := make([]u8, len(bytes), b.allocator)
+			copy(c, bytes)
+			crdt.delta_step_insert(b, pos, c, author.actor)
+		},
+		delete = proc(data: rawptr, pos: int, bytes: []u8) {
+			b := (^crdt.Delta_Builder)(data)
+			c := make([]u8, len(bytes), b.allocator)
+			copy(c, bytes)
+			crdt.delta_step_delete(b, pos, c)
+		},
+	}
+}
+
+Check_Reader :: struct {
+	t: ^crdt.Text,
+	g: ^crdt.Graph,
+}
+
+check_delta :: proc(t: ^testing.T, text: ^crdt.Text, g: ^crdt.Graph, db: ^crdt.Delta_Builder, before: []u8) {
+	after := crdt.text_bytes(text, context.temp_allocator)
+	cr := Check_Reader{text, g}
+	rd := crdt.Text_Reader {
+		data = &cr,
+		read = proc(data: rawptr, pos: int, dst: []u8) -> int {
+			return crdt.text_read((^Check_Reader)(data).t, pos, dst)
+		},
+		author = proc(data: rawptr, pos: int) -> prim.Id {
+			c := (^Check_Reader)(data)
+			a, _, _ := crdt.text_author(c.t, c.g, pos)
+			return a.actor
+		},
+		len = len(after),
+	}
+	regions := crdt.delta_regions(db, context.temp_allocator)
+	wide := crdt.delta_widen(regions, &rd, context.temp_allocator)
+	for utf16 in ([]bool{false, true}) {
+		ops := make([dynamic]crdt.Delta_Op, context.temp_allocator)
+		crdt.delta_emit(wide, utf16, proc(data: rawptr, pos: int) -> int {
+			return crdt.text_units_at((^crdt.Text)(data), pos)
+		}, text, &ops)
+		if !utf16 {
+			got, ok := crdt.delta_apply(before, ops[:], context.temp_allocator)
+			testing.expect(t, ok && string(got) == string(after), "delta does not replay to the merged text")
+		}
+		if utf16 {
+			old_units, new_units := 0, 0
+			for o in ops {
+				switch o.kind {
+				case .Retain:
+					old_units += o.n
+					new_units += o.n
+				case .Delete:
+					old_units += o.n
+				case .Insert:
+					new_units += o.n
+				}
+			}
+			testing.expect(t, crdt.units(before) - old_units == crdt.units(after) - new_units, "utf16 delta lengths disagree")
+		}
+	}
+	for &r in wide {
+		if len(r.ins) > 0 {
+			at := r.new
+			for o in r.ins {
+				testing.expect(t, string(after[at:][:o.n]) == string(o.text), "region insert text mismatch")
+				at += o.n
+			}
+		}
+	}
+	if len(after) > 0 {
+		for k in 0 ..< 4 {
+			p := (len(after) * k) / 4
+			testing.expect_value(t, crdt.text_units_at(text, p), crdt.units(after[:p]))
+		}
+		testing.expect_value(t, crdt.text_units(text), crdt.units(after))
+		u := crdt.text_units(text) / 2
+		b := crdt.text_byte_at(text, u)
+		testing.expect(t, crdt.units(after[:b]) <= u, "byte_at overshoots")
+	}
 }
 
 hostile :: proc(id: prim.Id) -> bool {
@@ -396,7 +487,7 @@ send :: proc(rs: []Replica, from: int, b: ^crdt.Batch, rng: ^Rng) {
 	}
 }
 
-LETTERS := [?]string{"abcdefgh", "ijklmnop", "qrstuvwx", "ABCDEFGH", "IJKLMNOP", "QRSTUVWX"}
+LETTERS := [?]string{"abcdefgh", "ijklmnop", "qrstuvwx", "ABCDEFGH", "IJKLMNOP", "ab\xc3\xa9\xe2\x82\xac\xf0\x9d\x84\x9e"}
 
 pick_pos :: proc(rng: ^Rng, size: int) -> int {
 	switch below(rng, 6) {
@@ -851,6 +942,60 @@ exchange :: proc(t: ^testing.T, rs: []Replica) {
 			deliver_one(t, &r, &rng)
 		}
 		testing.expect_value(t, len(r.pending), 0)
+	}
+}
+
+random_delta :: proc(rng: ^Rng, size: int, tag: u8) -> []crdt.Delta_Op {
+	out := make([dynamic]crdt.Delta_Op, context.temp_allocator)
+	at := 0
+	for at < size || chance(rng, 30) {
+		if chance(rng, 25) {
+			break
+		}
+		switch below(rng, 3) {
+		case 0:
+			n := min(1 + below(rng, 4), size - at)
+			crdt.delta_push(&out, crdt.Delta_Op{kind = .Retain, n = n})
+			at += n
+		case 1:
+			n := min(1 + below(rng, 3), size - at)
+			crdt.delta_push(&out, crdt.Delta_Op{kind = .Delete, n = n})
+			at += n
+		case 2:
+			n := 1 + below(rng, 3)
+			txt := make([]u8, n, context.temp_allocator)
+			for &c in txt {
+				c = tag + u8(below(rng, 3))
+			}
+			crdt.delta_push(&out, crdt.Delta_Op{kind = .Insert, n = n, text = txt})
+		}
+	}
+	return out[:]
+}
+
+@(test)
+deltas :: proc(t: ^testing.T) {
+	rng := Rng{7}
+	for _ in 0 ..< 20000 {
+		size := below(&rng, 12)
+		doc := make([]u8, size, context.temp_allocator)
+		for &c in doc {
+			c = 'a' + u8(below(&rng, 26))
+		}
+		a := random_delta(&rng, size, 'A')
+		b := random_delta(&rng, size, '0')
+		a2 := make([dynamic]crdt.Delta_Op, context.temp_allocator)
+		b2 := make([dynamic]crdt.Delta_Op, context.temp_allocator)
+		crdt.delta_transform(a, b, false, &a2, &b2)
+		da, ok1 := crdt.delta_apply(doc, a, context.temp_allocator)
+		db, ok2 := crdt.delta_apply(doc, b, context.temp_allocator)
+		x, ok3 := crdt.delta_apply(da, b2[:], context.temp_allocator)
+		y, ok4 := crdt.delta_apply(db, a2[:], context.temp_allocator)
+		testing.expect(t, ok1 && ok2 && ok3 && ok4 && string(x) == string(y), "transform does not converge")
+		p := below(&rng, size + 1)
+		pa := crdt.delta_transform_pos(a, p, false, false)
+		testing.expect(t, pa >= 0 && pa <= len(da), "transformed position out of range")
+		free_all(context.temp_allocator)
 	}
 }
 
