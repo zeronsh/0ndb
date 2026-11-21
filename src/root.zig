@@ -81,4 +81,5 @@ pub const playground = struct {
 pub const thread = struct {
     pub const model = @import("thread/model.zig");
     pub const store = @import("thread/store.zig");
+    pub const runtime = @import("thread/runtime.zig");
 };

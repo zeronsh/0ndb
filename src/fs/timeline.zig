@@ -6,6 +6,7 @@ const diff_mod = @import("../core/diff.zig");
 const text_mod = @import("../core/text.zig");
 const history_mod = @import("../core/history.zig");
 const workspace = @import("workspace.zig");
+const space_mod = @import("../space/space.zig");
 
 pub const ChangeKind = enum {
     added,
@@ -478,6 +479,9 @@ fn compareTouchedInodes(
         out.deinit(allocator);
     }
 
+    hist.tree.beginPinScope();
+    defer hist.tree.endPinScope();
+
     for (inodes) |iid| {
         const inode = hist.tree.get(iid) orelse continue;
         if (inode.isDir()) continue;
@@ -569,15 +573,41 @@ fn buildScopeLookup(
     return map;
 }
 
-pub fn listEntries(
+fn resolveTouchedInodesForBatch(
     allocator: Allocator,
-    ws: *workspace.Workspace,
+    hist: *history_mod.History,
+    sp_opt: ?*space_mod.Space,
+    bid: id.BatchId,
+    owned_out: *?[]id.InodeId,
+) ![]const id.InodeId {
+    if (hist.batch_inodes.get(bid)) |inodes| return inodes;
+    if (sp_opt) |sp| {
+        var map = try sp.collectTouchedInodes(allocator, &.{bid});
+        defer map.deinit(allocator);
+        if (map.count() == 0) return &.{};
+        const slice = try allocator.alloc(id.InodeId, map.count());
+        var i: usize = 0;
+        var mit = map.keyIterator();
+        while (mit.next()) |k| : (i += 1) {
+            slice[i] = k.*;
+        }
+        owned_out.* = slice;
+        return slice;
+    }
+    return &.{};
+}
+
+fn listEntriesForHistory(
+    allocator: Allocator,
+    hist: *history_mod.History,
+    sp_opt: ?*space_mod.Space,
+    scope_map: ?*const std.AutoHashMapUnmanaged(id.BatchId, *const workspace.ScopeRecord),
     before: ?id.BatchId,
     limit: usize,
 ) ![]TimelineEntry {
     if (limit == 0) return try allocator.alloc(TimelineEntry, 0);
 
-    var all_ids = try ws.history.dag.difference(allocator, &ws.history.dag.heads, &version.Version.ROOT);
+    var all_ids = try hist.dag.difference(allocator, &hist.dag.heads, &version.Version.ROOT);
     defer all_ids.deinit(allocator);
     std.mem.reverse(id.BatchId, all_ids.items);
 
@@ -592,9 +622,6 @@ pub fn listEntries(
         }
     }
 
-    var scope_map = try buildScopeLookup(allocator, ws);
-    defer scope_map.deinit(allocator);
-
     var out: std.ArrayList(TimelineEntry) = .empty;
     errdefer {
         for (out.items) |*e| e.deinit(allocator);
@@ -603,19 +630,22 @@ pub fn listEntries(
 
     for (all_ids.items[start_idx..]) |bid| {
         if (out.items.len >= limit) break;
-        const touched = ws.history.batch_inodes.get(bid) orelse continue;
+        var owned_touched: ?[]id.InodeId = null;
+        defer if (owned_touched) |ot| allocator.free(ot);
+        const touched = try resolveTouchedInodesForBatch(allocator, hist, sp_opt, bid, &owned_touched);
         if (touched.len == 0) continue;
-        const hdr = ws.history.dag.getHeader(bid) orelse continue;
+        var hdr = (try hist.dag.getHeaderAlloc(allocator, bid)) orelse continue;
+        defer hdr.deinit(allocator);
 
-        var before_cv = try ws.history.dag.compileView(allocator, &hdr.parents);
+        var before_cv = try hist.dag.compileView(allocator, &hdr.parents);
         defer before_cv.deinit(allocator);
         const after_ver = version.Version.single(bid);
-        var after_cv = try ws.history.dag.compileView(allocator, &after_ver);
+        var after_cv = try hist.dag.compileView(allocator, &after_ver);
         defer after_cv.deinit(allocator);
 
         const files = try compareTouchedInodes(
             allocator,
-            &ws.history,
+            hist,
             touched,
             before_cv.view(),
             after_cv.view(),
@@ -636,7 +666,7 @@ pub fn listEntries(
             total_removed +|= f.removed_lines;
         }
 
-        const sc_opt = scope_map.get(bid);
+        const sc_opt = if (scope_map) |sm| sm.get(bid) else null;
         const scope_id: ?u64 = if (sc_opt) |sc| @truncate(sc.scope_id) else null;
         const scope_label: ?[]u8 = if (sc_opt) |sc| try allocator.dupe(u8, sc.label) else null;
         errdefer if (scope_label) |lbl| allocator.free(lbl);
@@ -658,25 +688,56 @@ pub fn listEntries(
     return out.toOwnedSlice(allocator);
 }
 
-pub fn unifiedDiff(
+pub fn listEntries(
     allocator: Allocator,
     ws: *workspace.Workspace,
+    before: ?id.BatchId,
+    limit: usize,
+) ![]TimelineEntry {
+    if (limit == 0) return try allocator.alloc(TimelineEntry, 0);
+    var scope_map = try buildScopeLookup(allocator, ws);
+    defer scope_map.deinit(allocator);
+    return listEntriesForHistory(allocator, &ws.history, null, &scope_map, before, limit);
+}
+
+pub fn listEntriesForSpace(
+    allocator: Allocator,
+    sp: *space_mod.Space,
+    before: ?id.BatchId,
+    limit: usize,
+) ![]TimelineEntry {
+    return listEntriesForHistory(allocator, &sp.history, sp, null, before, limit);
+}
+
+fn unifiedDiffForHistory(
+    allocator: Allocator,
+    hist: *history_mod.History,
+    sp_opt: ?*space_mod.Space,
     batch_ids: []const id.BatchId,
 ) ![]u8 {
     if (batch_ids.len == 0) return try allocator.alloc(u8, 0);
 
     var touched_set: std.AutoArrayHashMapUnmanaged(id.InodeId, void) = .empty;
     defer touched_set.deinit(allocator);
-    for (batch_ids) |bid| {
-        if (ws.history.batch_inodes.get(bid)) |inodes| {
-            for (inodes) |iid| {
-                try touched_set.put(allocator, iid, {});
+    if (sp_opt) |sp| {
+        var collected = try sp.collectTouchedInodes(allocator, batch_ids);
+        defer collected.deinit(allocator);
+        var cit = collected.keyIterator();
+        while (cit.next()) |iid| {
+            try touched_set.put(allocator, iid.*, {});
+        }
+    } else {
+        for (batch_ids) |bid| {
+            if (hist.batch_inodes.get(bid)) |inodes| {
+                for (inodes) |iid| {
+                    try touched_set.put(allocator, iid, {});
+                }
             }
         }
     }
     if (touched_set.count() == 0) return try allocator.alloc(u8, 0);
 
-    var before_cv = try ws.history.dag.compileExcluding(allocator, batch_ids);
+    var before_cv = try hist.dag.compileExcluding(allocator, batch_ids);
     defer before_cv.deinit(allocator);
     const before_view = before_cv.view();
     const after_view = text_mod.View.EVERYTHING;
@@ -697,20 +758,23 @@ pub fn unifiedDiff(
         parts.deinit(allocator);
     }
 
+    hist.tree.beginPinScope();
+    defer hist.tree.endPinScope();
+
     for (touched_set.keys()) |iid| {
-        const inode = ws.history.tree.get(iid) orelse continue;
+        const inode = hist.tree.get(iid) orelse continue;
         if (inode.isDir()) continue;
 
-        var old_c = try inspectInodeInView(allocator, &ws.history, iid, before_view);
+        var old_c = try inspectInodeInView(allocator, hist, iid, before_view);
         defer old_c.deinit(allocator);
-        var new_c = try inspectInodeInView(allocator, &ws.history, iid, after_view);
+        var new_c = try inspectInodeInView(allocator, hist, iid, after_view);
         defer new_c.deinit(allocator);
 
         if (old_c == .absent and new_c == .absent) continue;
 
-        const old_path_opt = if (old_c != .absent) try ws.history.tree.pathOf(allocator, before_view, iid) else null;
+        const old_path_opt = if (old_c != .absent) try hist.tree.pathOf(allocator, before_view, iid) else null;
         defer if (old_path_opt) |p| allocator.free(p);
-        const new_path_opt = if (new_c != .absent) try ws.history.tree.pathOf(allocator, after_view, iid) else null;
+        const new_path_opt = if (new_c != .absent) try hist.tree.pathOf(allocator, after_view, iid) else null;
         defer if (new_path_opt) |p| allocator.free(p);
 
         const sort_path = new_path_opt orelse old_path_opt orelse continue;
@@ -767,9 +831,28 @@ pub fn unifiedDiff(
     return out;
 }
 
-pub fn foreignChanges(
+pub fn unifiedDiff(
     allocator: Allocator,
     ws: *workspace.Workspace,
+    batch_ids: []const id.BatchId,
+) ![]u8 {
+    return unifiedDiffForHistory(allocator, &ws.history, null, batch_ids);
+}
+
+pub fn unifiedDiffForSpace(
+    allocator: Allocator,
+    sp: *space_mod.Space,
+    batch_ids: []const id.BatchId,
+) ![]u8 {
+    return unifiedDiffForHistory(allocator, &sp.history, sp, batch_ids);
+}
+
+fn foreignChangesForHistory(
+    allocator: Allocator,
+    hist: *history_mod.History,
+    sp_opt: ?*space_mod.Space,
+    scope_map: ?*const std.AutoHashMapUnmanaged(id.BatchId, *const workspace.ScopeRecord),
+    own_scope_batches: ?*const std.AutoHashMapUnmanaged(id.BatchId, void),
     since_version: ?version.Version,
     exclude_actor: id.ActorId,
 ) ![]ForeignChange {
@@ -777,27 +860,14 @@ pub fn foreignChanges(
     defer known.deinit(allocator);
     if (since_version) |sv| {
         for (sv.slice()) |bid| {
-            if (ws.history.dag.containsBatch(bid)) {
+            if (hist.dag.containsBatch(bid)) {
                 try known.insert(allocator, bid);
             }
         }
     }
 
-    var diff_ids = try ws.history.dag.difference(allocator, &ws.history.dag.heads, &known);
+    var diff_ids = try hist.dag.difference(allocator, &hist.dag.heads, &known);
     defer diff_ids.deinit(allocator);
-
-    var own_scope_batches: std.AutoHashMapUnmanaged(id.BatchId, void) = .empty;
-    defer own_scope_batches.deinit(allocator);
-    var scope_map = try buildScopeLookup(allocator, ws);
-    defer scope_map.deinit(allocator);
-
-    for (ws.scopes.items) |*sc| {
-        if (sc.actor == exclude_actor) {
-            for (sc.batches.items) |bid| {
-                try own_scope_batches.put(allocator, bid, {});
-            }
-        }
-    }
 
     var out: std.ArrayList(ForeignChange) = .empty;
     errdefer {
@@ -806,24 +876,29 @@ pub fn foreignChanges(
     }
 
     for (diff_ids.items) |bid| {
-        const hdr = ws.history.dag.getHeader(bid) orelse continue;
+        var hdr = (try hist.dag.getHeaderAlloc(allocator, bid)) orelse continue;
+        defer hdr.deinit(allocator);
         if (hdr.actor == exclude_actor) continue;
-        if (own_scope_batches.contains(bid)) continue;
-        const touched = ws.history.batch_inodes.get(bid) orelse continue;
+        if (own_scope_batches) |osb| {
+            if (osb.contains(bid)) continue;
+        }
+        var owned_touched: ?[]id.InodeId = null;
+        defer if (owned_touched) |ot| allocator.free(ot);
+        const touched = try resolveTouchedInodesForBatch(allocator, hist, sp_opt, bid, &owned_touched);
         if (touched.len == 0) continue;
 
-        const eff_actor = if (scope_map.get(bid)) |sc| sc.actor else hdr.actor;
+        const eff_actor = if (scope_map) |sm| (if (sm.get(bid)) |sc| sc.actor else hdr.actor) else hdr.actor;
         if (eff_actor == exclude_actor) continue;
 
-        var before_cv = try ws.history.dag.compileView(allocator, &hdr.parents);
+        var before_cv = try hist.dag.compileView(allocator, &hdr.parents);
         defer before_cv.deinit(allocator);
         const after_ver = version.Version.single(bid);
-        var after_cv = try ws.history.dag.compileView(allocator, &after_ver);
+        var after_cv = try hist.dag.compileView(allocator, &after_ver);
         defer after_cv.deinit(allocator);
 
         const files = try compareTouchedInodes(
             allocator,
-            &ws.history,
+            hist,
             touched,
             before_cv.view(),
             after_cv.view(),
@@ -847,6 +922,53 @@ pub fn foreignChanges(
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+pub fn foreignChanges(
+    allocator: Allocator,
+    ws: *workspace.Workspace,
+    since_version: ?version.Version,
+    exclude_actor: id.ActorId,
+) ![]ForeignChange {
+    var own_scope_batches: std.AutoHashMapUnmanaged(id.BatchId, void) = .empty;
+    defer own_scope_batches.deinit(allocator);
+    var scope_map = try buildScopeLookup(allocator, ws);
+    defer scope_map.deinit(allocator);
+
+    for (ws.scopes.items) |*sc| {
+        if (sc.actor == exclude_actor) {
+            for (sc.batches.items) |bid| {
+                try own_scope_batches.put(allocator, bid, {});
+            }
+        }
+    }
+
+    return foreignChangesForHistory(
+        allocator,
+        &ws.history,
+        null,
+        &scope_map,
+        &own_scope_batches,
+        since_version,
+        exclude_actor,
+    );
+}
+
+pub fn foreignChangesForSpace(
+    allocator: Allocator,
+    sp: *space_mod.Space,
+    since_version: ?version.Version,
+    exclude_actor: id.ActorId,
+) ![]ForeignChange {
+    return foreignChangesForHistory(
+        allocator,
+        &sp.history,
+        sp,
+        null,
+        null,
+        since_version,
+        exclude_actor,
+    );
 }
 
 fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
