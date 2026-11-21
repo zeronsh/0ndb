@@ -161,6 +161,8 @@ Pack :: struct {
 	filters_cold:  bool,
 	dirsync_pending: bool,
 	pressure:      bool,
+	want_flush:    bool,
+	cscan:         [dynamic]Scan,
 	bcache:        []Bc_Entry,
 	tick:          u64,
 	scratch:       [dynamic]u8,
@@ -520,6 +522,9 @@ _inode_store :: proc(p: ^Pack, inum: u64, old: ^Inode, new: ^Inode, erase := Era
 		vn += prim.put_uvarint(vb[vn:], u64(ph.len))
 		_put(p, _skey(sb[:], inum, ph.cont, ph.off), vb[:vn], false) or_return
 		stale = true
+	}
+	if erase.on && !destroy && p.compacting != 0 {
+		append(&p.cscan, Scan{inum = inum, lo = erase.lo, hi = erase.hi})
 	}
 	if stale && (destroy || erase.on) {
 		lo := erase.lo if !destroy else 0

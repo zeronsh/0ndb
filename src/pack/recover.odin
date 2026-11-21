@@ -39,6 +39,9 @@ open :: proc(p: ^Pack, base: prim.Vfs, root: string, opts := DEFAULT_OPTIONS, al
 	p.fl.zjobs = make([dynamic]Zero_Job, allocator)
 	p.fl.syncs = make([dynamic]Cont_Fd, allocator)
 	p.fl.newc_fd = prim.INVALID_FD
+	p.fl.scan_fd = prim.INVALID_FD
+	p.fl.scans = make([dynamic]Scan, allocator)
+	p.cscan = make([dynamic]Scan, allocator)
 	p.fl.busy = make([dynamic]u32, allocator)
 	p.fl.run_fd = prim.INVALID_FD
 	p.ext_dirty = make([dynamic]u64, allocator)
@@ -81,6 +84,8 @@ _release :: proc(p: ^Pack) {
 	delete(p.fl.zjobs)
 	delete(p.fl.syncs)
 	delete(p.fl.busy)
+	delete(p.fl.scans)
+	delete(p.cscan)
 	if len(p.waiters) > 0 {
 		_fail_waiters(p, .Io)
 	}

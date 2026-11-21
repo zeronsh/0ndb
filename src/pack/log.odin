@@ -302,6 +302,11 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 	clear(&fl.zjobs)
 	clear(&fl.syncs)
 	clear(&fl.busy)
+	clear(&fl.scans)
+	if fl.scan_fd >= 0 {
+		prim.close_file(p.base, fl.scan_fd)
+		fl.scan_fd = prim.INVALID_FD
+	}
 	fl.newc_fd = prim.INVALID_FD
 	fl.dirsync = false
 	del_id := fl.del_id
@@ -478,13 +483,40 @@ _collect_zeros :: proc(p: ^Pack, upto: u64) -> Error {
 
 @(private)
 _zeros_waiting :: proc "contextless" (p: ^Pack) -> bool {
-	return len(p.zeros) > 0
+	return len(p.zeros) > 0 || len(p.cscan) > 0
+}
+
+@(private)
+_collect_scans :: proc(p: ^Pack) -> Error {
+	if len(p.cscan) == 0 {
+		return .None
+	}
+	if p.compacting == 0 || _cont_index(p, p.compacting) < 0 {
+		clear(&p.cscan)
+		return .None
+	}
+	pb: prim.Path_Buf
+	fd, err := prim.open_file(p.base, _phys_path(p, &pb, 'c', u64(p.compacting)), {.Write})
+	if err == .Not_Found {
+		clear(&p.cscan)
+		return .None
+	}
+	if err != .None {
+		return _poison(p, err)
+	}
+	p.fl.scan_fd = fd
+	append(&p.fl.scans, ..p.cscan[:])
+	clear(&p.cscan)
+	return .None
 }
 
 @(private)
 _urgent_inflight :: proc "contextless" (p: ^Pack) -> bool {
 	if !p.fl.on {
 		return false
+	}
+	if len(p.fl.scans) > 0 {
+		return true
 	}
 	for z in p.fl.zjobs {
 		if z.urgent {
@@ -508,7 +540,8 @@ _commit :: proc(p: ^Pack) -> Error {
 	_drain(p) or_return
 	wrote := _commit_write(p) or_return
 	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
-	if !wrote && len(p.fl.zjobs) == 0 {
+	_collect_scans(p) or_return
+	if !wrote && len(p.fl.zjobs) == 0 && p.fl.scan_fd < 0 {
 		return .None
 	}
 	p.fl.kind = .Commit
@@ -652,12 +685,6 @@ sync :: proc(p: ^Pack) -> Error {
 _sync_all :: proc(p: ^Pack) -> Error {
 	_drain(p) or_return
 	_commit(p) or_return
-	if _has_urgent(p) {
-		for p.compacting != 0 {
-			_compact_work(p, max(i64), false) or_return
-			_drain(p) or_return
-		}
-	}
 	for _zeros_waiting(p) {
 		p.force = true
 		_commit(p) or_return
@@ -680,7 +707,7 @@ sync_async :: proc(p: ^Pack, done: Sync_Done, data: rawptr) -> Error {
 		}
 		return .None
 	}
-	urgent := _has_urgent(p) || _urgent_inflight(p)
+	urgent := _has_urgent(p) || _urgent_inflight(p) || len(p.cscan) > 0
 	pending := p.nrec > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending
 	target := p.seq if pending else (p.fl.seq if p.fl.on else 0)
 	if !urgent && (target == 0 || target <= p.durable_seq) {
@@ -701,13 +728,8 @@ _advance :: proc(p: ^Pack) -> Error {
 	if p.fl.on {
 		return .None
 	}
-	if _has_urgent(p) && p.compacting != 0 {
-		_compact_work(p, 4 * 1024 * 1024, false) or_return
-		if p.fl.on {
-			return .None
-		}
-		p.force = true
-		return _start_async(p)
+	if p.want_flush {
+		return _flush_start(p)
 	}
 	if _zeros_waiting(p) {
 		p.force = true
@@ -732,7 +754,8 @@ _start_async :: proc(p: ^Pack) -> Error {
 	}
 	wrote := _commit_write(p) or_return
 	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
-	if !wrote && len(p.fl.zjobs) == 0 {
+	_collect_scans(p) or_return
+	if !wrote && len(p.fl.zjobs) == 0 && p.fl.scan_fd < 0 {
 		return .None
 	}
 	p.fl.kind = .Commit
@@ -752,7 +775,7 @@ poll :: proc(p: ^Pack) -> Error {
 		return e
 	}
 	_fire_waiters(p)
-	if _over_budget(p, 1) {
+	if p.want_flush || _over_budget(p, 1) {
 		if e := _flush_start(p); e != .None {
 			_fail_waiters(p, e)
 			return e
@@ -792,7 +815,7 @@ _async :: #force_inline proc "contextless" (p: ^Pack) -> bool {
 
 @(private)
 _fire_waiters :: proc(p: ^Pack) {
-	urgent := _has_urgent(p) || _urgent_inflight(p) || (p.compacting != 0 && _has_urgent(p))
+	urgent := _has_urgent(p) || _urgent_inflight(p) || len(p.cscan) > 0
 	i := 0
 	for i < len(p.waiters) {
 		w := p.waiters[i]
@@ -865,6 +888,21 @@ _flush_start :: proc(p: ^Pack) -> Error {
 	}
 	wrote := _commit_write(p) or_return
 	fl_seq := p.seq - 1 if wrote else p.durable_seq
+	p.want_flush = false
+	if _async(p) {
+		for z in p.zeros {
+			if z.need > fl_seq {
+				if !wrote {
+					p.force = true
+					_commit_write(p) or_return
+				}
+				_collect_zeros(p, p.seq - 1) or_return
+				p.want_flush = true
+				p.fl.kind = .Commit
+				return _submit(p)
+			}
+		}
+	}
 	for z in p.zeros {
 		if z.need > fl_seq {
 			if wrote {

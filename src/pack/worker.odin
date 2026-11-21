@@ -25,6 +25,13 @@ Zero_Job :: struct {
 }
 
 @(private)
+Scan :: struct {
+	inum: u64,
+	lo:   i64,
+	hi:   i64,
+}
+
+@(private)
 Cont_Fd :: struct {
 	fd:   prim.Fd,
 	cont: u32,
@@ -64,6 +71,8 @@ Inflight :: struct {
 	crec_off: i64,
 	ccont:    u32,
 	cpos:     i64,
+	scans:    [dynamic]Scan,
+	scan_fd:  prim.Fd,
 	del_id:   u32,
 	del_path: prim.Path_Buf,
 	del_len:  int,
@@ -256,6 +265,11 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 		fl.nsync += 1
 		prim.datasync(base, c.fd) or_return
 	}
+	if fl.scan_fd >= 0 && len(fl.scans) > 0 {
+		_scan_erase(base, fl.scan_fd, fl.scans[:]) or_return
+		fl.nsync += 1
+		prim.datasync(base, fl.scan_fd) or_return
+	}
 	switch fl.kind {
 	case .Commit:
 	case .Super:
@@ -371,4 +385,69 @@ _worker_stop :: proc(p: ^Pack) {
 	thread.destroy(w.th)
 	free(w, p.allocator)
 	p.worker = nil
+}
+
+@(private)
+_scan_erase :: proc(base: prim.Vfs, fd: prim.Fd, scans: []Scan) -> Error {
+	size := prim.file_size(base, fd) or_return
+	CHUNK :: 1 << 20
+	buf := make([]u8, CHUNK + MAX_RECORD, runtime.heap_allocator())
+	defer delete(buf, runtime.heap_allocator())
+	start: i64 = 0
+	have := 0
+	pos: i64 = CONT_HDR
+	for pos + REC_HDR <= size {
+		if pos < start || pos + REC_HDR > start + i64(have) {
+			n, err := prim.read_at(base, fd, buf[:CHUNK], pos)
+			if err != .None {
+				return err
+			}
+			start = pos
+			have = n
+			if have < REC_HDR {
+				break
+			}
+		}
+		h := buf[pos - start:]
+		ln := i64(prim.get_u32le(h[0:4]))
+		kind := h[4]
+		if ln > MAX_RECORD || pos + REC_HDR + ln > size {
+			break
+		}
+		if kind == R_DATA {
+			if pos + REC_HDR + ln > start + i64(have) {
+				n, err := prim.read_at(base, fd, buf[:REC_HDR + int(ln)], pos)
+				if err != .None {
+					return err
+				}
+				if n < REC_HDR + int(ln) {
+					break
+				}
+				start = pos
+				have = n
+			}
+			body := buf[pos - start + REC_HDR:][:ln]
+			inum, n1 := prim.get_uvarint(body)
+			foff, n2 := prim.get_uvarint(body[max(n1, 0):])
+			if n1 <= 0 || n2 <= 0 {
+				break
+			}
+			plen := ln - i64(n1 + n2)
+			pstart := pos + REC_HDR + i64(n1 + n2)
+			for s in scans {
+				if s.inum != inum {
+					continue
+				}
+				lo := max(s.lo, i64(foff))
+				hi := min(s.hi, i64(foff) + plen)
+				if lo < hi {
+					_zero_range(base, fd, pstart + (lo - i64(foff)), hi - lo) or_return
+				}
+			}
+		} else if kind != R_PUT && kind != R_DEL && kind != R_NEXT && kind != R_COMMIT {
+			break
+		}
+		pos += REC_HDR + ln
+	}
+	return .None
 }

@@ -288,13 +288,22 @@ _maybe_flush :: proc(p: ^Pack) -> Error {
 		return _flush(p)
 	}
 	if p.fl.on {
-		if !_over_budget(p, 4) {
-			p.pressure = true
-			return .None
-		}
-		_drain(p) or_return
+		p.pressure = true
+		return .None
 	}
 	return _flush_start(p)
+}
+
+@(private)
+_admit :: proc(p: ^Pack) -> Error {
+	if p.poisoned {
+		return .Io
+	}
+	if _async(p) && p.fl.on && _over_budget(p, 4) {
+		p.pressure = true
+		return .Would_Block
+	}
+	return .None
 }
 
 pressure :: proc "contextless" (p: ^Pack) -> bool {
@@ -324,6 +333,11 @@ _v_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 	}
 	if p.poisoned {
 		return prim.INVALID_FD, .Io
+	}
+	if .Create in flags || .Truncate in flags {
+		if e := _admit(p); e != .None {
+			return prim.INVALID_FD, e
+		}
 	}
 	return _open_rel(p, path, rel, flags, mode, 0)
 }
@@ -527,9 +541,7 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 	if h == nil || off < 0 || !h.write || h.dir {
 		return .Invalid
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	if len(src) == 0 {
 		return .None
 	}
@@ -660,9 +672,7 @@ _v_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> Error {
 	if h == nil || size < 0 || !h.write || h.dir {
 		return .Invalid
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	_truncate(p, h, size) or_return
 	return _maybe_flush(p)
 }
@@ -677,9 +687,7 @@ _v_punch_hole :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> Error {
 	if h == nil || off < 0 || size < 0 || !h.write || h.dir {
 		return .Invalid
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	if size == 0 {
 		return .None
 	}
@@ -881,9 +889,7 @@ _v_unlink :: proc(data: rawptr, path: string) -> Error {
 	if !inside {
 		return prim.remove(p.base, path)
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	parent, name, inum, kind := _resolve(p, rel) or_return
 	if parent == 0 || kind == .Dir {
 		return .Is_Dir
@@ -901,9 +907,7 @@ _v_rmdir :: proc(data: rawptr, path: string) -> Error {
 	if !inside {
 		return prim.remove_dir(p.base, path)
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	parent, name, inum, kind := _resolve(p, rel) or_return
 	if parent == 0 {
 		return .Busy
@@ -929,9 +933,7 @@ _v_mkdir :: proc(data: rawptr, path: string, mode: u32) -> Error {
 	if !inside {
 		return prim.mkdir(p.base, path, mode)
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	parent, name := _walk(p, rel) or_return
 	if parent == 0 {
 		return .Exists
@@ -955,9 +957,7 @@ _v_symlink :: proc(data: rawptr, target: string, path: string) -> Error {
 	if !inside {
 		return prim.symlink(p.base, target, path)
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	if len(target) > MAX_SYMLINK || len(target) == 0 {
 		return .Name_Too_Long if len(target) > 0 else .Invalid
 	}
@@ -1003,6 +1003,7 @@ _v_readlink :: proc(data: rawptr, path: string, buf: []u8) -> (rn: int, rerr: Er
 
 @(private)
 _set_meta :: proc(p: ^Pack, inum: u64, mode: u32, set_mode: bool, mtime: i64) -> Error {
+	_admit(p) or_return
 	if inum == ROOT_INO {
 		return .None
 	}
@@ -1063,9 +1064,7 @@ _v_rename :: proc(data: rawptr, old: string, new: string) -> Error {
 	if oin != nin {
 		return .Unsupported
 	}
-	if p.poisoned {
-		return .Io
-	}
+	_admit(p) or_return
 	sp, sname, sinum, skind := _resolve(p, orel) or_return
 	if sp == 0 {
 		return .Busy
