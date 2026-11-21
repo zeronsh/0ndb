@@ -411,3 +411,10 @@ abs_path :: proc(p: string) -> string {
 	}
 	return strings.concatenate({"/", strings.join(out[:], "/", context.temp_allocator)}, context.temp_allocator)
 }
+
+placement :: proc(s: ^Session, ob: api.Object) -> (json.Value, bool) {
+	r := req_begin("placement")
+	req_str(&r, "object", object_str(ob))
+	v := call(s, req_end(&r))
+	return v.value, v.status == .Ok
+}

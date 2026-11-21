@@ -14,6 +14,12 @@ Stack_Options :: struct {
 	attach:  bool,
 	rt_cfg:  rt.Config,
 	host:    Host,
+	placement: Placement_Hook,
+}
+
+Placement_Hook :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, o: Object, info: rt.Placement_Info),
 }
 
 Stack :: struct {
@@ -29,6 +35,7 @@ Stack :: struct {
 	obs:       Observer,
 	obs_on:    bool,
 	spawner:   rt.Spawner,
+	placement: Placement_Hook,
 	thread:    ^thread.Thread,
 	running:   bool,
 	stop_mu:   sync.Mutex,
@@ -64,6 +71,11 @@ stack_open :: proc(s: ^Stack, ec: eng.Config, opts: Stack_Options, allocator := 
 	rp: ^rt.Runtime
 	if opts.runtime {
 		rc := opts.rt_cfg
+		if opts.placement.call != nil && rc.hooks.placement == nil {
+			s.placement = opts.placement
+			rc.hooks.data = s
+			rc.hooks.placement = _on_placement
+		}
 		if rc.secrets.get == nil {
 			rc.secrets = rt.Secrets{get = _env_secret}
 		}
@@ -166,6 +178,14 @@ _stack_thread :: proc(t: ^thread.Thread) {
 stack_attach_space :: proc(s: ^Stack, space: prim.Id) {
 	if s.r_on {
 		rt.attach(&s.r, space)
+	}
+}
+
+@(private)
+_on_placement :: proc(data: rawptr, r: ^rt.Runtime, o: Object, info: rt.Placement_Info) {
+	s := (^Stack)(data)
+	if s.placement.call != nil {
+		s.placement.call(s.placement.data, o, info)
 	}
 }
 

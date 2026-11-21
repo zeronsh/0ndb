@@ -19,7 +19,8 @@ MODE_NAMES := [2]string{"end_to_end", "transparent"}
 UNIT_NAMES := [2]string{"lines", "bytes"}
 SORT_NAMES := [2]string{"relevance", "newest"}
 DIR_NAMES := [2]string{"older", "newer"}
-EVENT_NAMES := [10]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure"}
+EVENT_PLACEMENT :: u64(10)
+EVENT_NAMES := [11]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement"}
 DELTA_NAMES := [19]string{"message", "block", "chunk", "seal", "leaf", "intent", "run", "mount", "record", "status", "field", "element", "counter", "catalog", "text", "files", "redacted", "members", "quarantined"}
 INTENT_NAMES := [44]string {
 	25 = "queue",

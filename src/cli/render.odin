@@ -179,3 +179,21 @@ row :: proc(cells: ..string) -> []string {
 	copy(out, cells)
 	return out
 }
+
+placement_text :: proc(p: json.Value, cur_hint := true) -> string {
+	switch jstr(p, "state") {
+	case "running":
+		return "running"
+	case "assigned":
+		return fmt.tprintf("assigned to %s", short(jstr(p, "runner")))
+	case "waiting_runner":
+		prov := jstr(p, "provider")
+		since := jint(p, "since_ms")
+		label := fmt.tprintf("waiting for a runner (provider %s)", prov if len(prov) > 0 else "default")
+		if since > 0 {
+			label = fmt.tprintf("%s since %s", label, ago(since))
+		}
+		return label
+	}
+	return ""
+}

@@ -103,7 +103,8 @@
  *                 17 members, 18 quarantined
  *   event         0 connected, 1 disconnected, 2 durable, 3 uploaded,
  *                 4 quarantined, 5 refused, 6 fatal, 7 space_joined,
- *                 8 object_seen, 9 failure
+ *                 8 object_seen, 9 failure, 10 placement (since 1.4)
+ *   placement     0 none, 1 assigned, 2 running, 3 waiting_runner
  *
  * Shared payload structures
  *   Result     := item: rid, off: ivarint, leaf: rid, tick: uvarint
@@ -202,7 +203,12 @@
  *   Deltas     := deltas: [Delta]
  *   Event      := kind: enum event, space: id, object: id, device: id,
  *                 tick: uvarint, length: ivarint, status: enum status,
- *                 detail: str
+ *                 detail: str, Placement (since 1.4; zero unless kind is
+ *                 placement, delivered whenever a conversation's placement
+ *                 changes when the runtime is enabled)
+ *   Placement  := state: enum placement, msg: rid, runner: id, provider: str,
+ *                 since_ms: ivarint (waiting_runner: no live runner for the
+ *                 provider has claimed msg since since_ms)
  *   Description := version: uvarint, ops: [ {code: uvarint, name: str,
  *                 args: [ {name: str, type: str, values: strs} ],
  *                 result: str} ]
@@ -241,7 +247,7 @@ extern "C" {
 #endif
 
 #define ONDB_ABI_MAJOR 1u
-#define ONDB_ABI_MINOR 3u
+#define ONDB_ABI_MINOR 4u
 #define ONDB_ABI_VERSION ((ONDB_ABI_MAJOR << 16) | ONDB_ABI_MINOR)
 
 typedef struct ondb ondb;
@@ -1030,6 +1036,8 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_AGENT_ACTOR 219u
 /* wake(object: object) -> {} */
 #define ONDB_OP_WAKE 220u
+/* placement(object: object) -> Placement */
+#define ONDB_OP_PLACEMENT 221u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

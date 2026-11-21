@@ -36,7 +36,7 @@ Command :: struct {
 }
 
 COMMANDS := []Command {
-	{"daemon", cmd_daemon, "daemon [stop] [--no-runner] [--capacity N] [--provider P] [--model M]", "run the device daemon in the foreground (engine, runtime, local socket)"},
+	{"daemon", cmd_daemon, "daemon [stop] [--no-runner] [--capacity N] [--provider P] [--model M] [--join CODE]", "run the device daemon in the foreground (engine, runtime, local socket); --no-runner keeps this device from executing runs, so its messages wait for another runner"},
 	{"relay", cmd_relay, "relay [--listen ADDR]... [--dir DIR] [--open] [--quota BYTES]", "run a relay on files/pack, serving TCP with kernel TLS and Unix sockets"},
 	{"runner", cmd_runner, "runner [--join CODE] [--capacity N]", "run a dedicated runner engine in the foreground"},
 	{"record", cmd_record, "record [CONVO] --source S --id EXTERNAL_ID [--seq N] [--role R] [--status S] [--model M] [TEXT|--stdin]", "record a message from an external harness (idempotent)"},

@@ -126,6 +126,7 @@ daemon_main :: proc(args: ^Args) -> int {
 		attach  = true,
 		host    = api.Host{data = d, ops = HOST_OPS},
 	}
+	opts.placement = api.Placement_Hook{data = d, call = _on_placement}
 	opts.rt_cfg.runner = d.runner
 	if v, ok := flag_value(args, "capacity"); ok {
 		n, nok := strconv.parse_int(v)
@@ -519,6 +520,23 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		return
 	}
 	payload := api.encode_event(ev, true)
+	for c in d.conns {
+		if c.events {
+			_conn_write(c, .Event, payload)
+		}
+	}
+}
+
+@(private)
+_on_placement :: proc(data: rawptr, o: api.Object, info: rt.Placement_Info) {
+	d := (^Daemon)(data)
+	if info.state == .Waiting_Runner {
+		fmt.eprintfln("0ndb daemon: %s waits for a runner (provider %s)", hex(o.id), info.provider)
+	}
+	if len(d.conns) == 0 {
+		return
+	}
+	payload := api.encode_placement_event(o, info, true)
 	for c in d.conns {
 		if c.events {
 			_conn_write(c, .Event, payload)

@@ -1,7 +1,6 @@
 package api
 
 import "core:strings"
-import "core:sys/posix"
 import "../../agent"
 import eng "../../engine"
 import "../../prim"
@@ -193,9 +192,9 @@ _probe_on_out :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr)
 _probe_on_err :: proc(l: ^prim.Loop, fd: prim.Fd, ev: prim.Events, data: rawptr) {
 	buf: [4096]u8
 	for {
-		n := posix.read(posix.FD(fd), raw_data(buf[:]), len(buf))
-		if n <= 0 {
-			if n == 0 {
+		n, rerr := prim.read(fd, buf[:])
+		if rerr != .None || n <= 0 {
+			if rerr == .None && n == 0 {
 				p := (^Probe)(data)
 				if p.w_err != 0 {
 					prim.unwatch(l, p.w_err)
@@ -276,8 +275,7 @@ _probe_free :: proc(p: ^Probe) {
 	}
 	if p.child.pid > 0 {
 		prim.child_kill(&p.child, .Kill)
-		status: i32
-		posix.waitpid(posix.pid_t(p.child.pid), &status, {})
+		prim.reap(p.child.pid, true)
 	}
 	prim.child_close(&p.child)
 	if p.lb.data != nil {
@@ -295,9 +293,7 @@ _env_merge :: proc(env: []string) -> []string {
 		return nil
 	}
 	out := make([dynamic]string, context.temp_allocator)
-	base := posix.environ
-	for i := 0; base != nil && base[i] != nil; i += 1 {
-		s := string(base[i])
+	for s in prim.environ(context.temp_allocator) {
 		eq := strings.index_byte(s, '=')
 		name := s[:eq] if eq >= 0 else s
 		over := false

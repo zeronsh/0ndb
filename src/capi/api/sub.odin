@@ -1,6 +1,7 @@
 package api
 
 import eng "../../engine"
+import rt "../../runtime"
 
 Sub_Proc :: #type proc(data: rawptr, id: u64, payload: []u8)
 
@@ -94,5 +95,23 @@ encode_event :: proc(ev: ^eng.Event, json_form: bool, allocator := context.temp_
 	o_i64(&o, "length", ev.length)
 	o_enum(&o, "status", u64(status_of(ev.err)), STATUS_NAMES[:])
 	o_str(&o, "detail", ev.detail)
+	emit_placement(&o, &rt.Placement_Info{})
+	return out_finish(&o)
+}
+
+encode_placement_event :: proc(ob: Object, info: rt.Placement_Info, json_form: bool, allocator := context.temp_allocator) -> []u8 {
+	buf := make([dynamic]u8, allocator)
+	o: Out
+	out_init(&o, &buf, json_form)
+	o_enum(&o, "kind", EVENT_PLACEMENT, EVENT_NAMES[:])
+	o_id(&o, "space", ob.space)
+	o_id(&o, "object", ob.id)
+	o_id(&o, "device", {})
+	o_u64(&o, "tick", 0)
+	o_i64(&o, "length", 0)
+	o_enum(&o, "status", 0, STATUS_NAMES[:])
+	o_str(&o, "detail", "")
+	x := info
+	emit_placement(&o, &x)
 	return out_finish(&o)
 }

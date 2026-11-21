@@ -4,9 +4,10 @@ import "base:runtime"
 import "core:sync"
 import "./api"
 import eng "../engine"
+import rt "../runtime"
 
 ABI_MAJOR :: 1
-ABI_MINOR :: 3
+ABI_MINOR :: 4
 
 FLAG_JSON :: u32(1)
 
@@ -200,6 +201,7 @@ ondb_open :: proc "c" (cfg: ^Config, out: ^^Handle) -> i32 {
 		}
 		opts = o
 	}
+	opts.placement = api.Placement_Hook{data = h, call = _on_placement}
 	if st := api.stack_open(&h.s, ec, opts, h.allocator); st != .Ok {
 		_handle_free(h)
 		return i32(st)
@@ -474,6 +476,16 @@ ondb_describe :: proc "c" (h: ^Handle, flags: u32, out: ^[^]u8, out_len: ^uint) 
 	out^ = raw_data(b)
 	out_len^ = uint(len(b))
 	return 0
+}
+
+@(private)
+_on_placement :: proc(data: rawptr, o: api.Object, info: rt.Placement_Info) {
+	h := (^Handle)(data)
+	if h.events.event == nil {
+		return
+	}
+	b := api.encode_placement_event(o, info, h.flags & CFG_EVENTS_JSON != 0)
+	h.events.event(h.events.ud, raw_data(b), uint(len(b)))
 }
 
 @(private)

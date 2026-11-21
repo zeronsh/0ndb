@@ -363,6 +363,16 @@ follow :: proc(s: ^Session, ob: api.Object, until_idle: bool, sent := "") -> int
 		st := jstr(must(s, req_end(&sr)), "status")
 		seen_running = st == "running" || st == "queued" || st == "awaiting_permission"
 	}
+	last_place := ""
+	if until_idle {
+		if p, ok := placement(s, ob); ok && !s.a.json {
+			if t := placement_text(p); jstr(p, "state") == "waiting_runner" {
+				fmt.printfln("  ⧗ %s", t)
+				last_place = t
+			}
+		}
+		client_send(&s.c, .Events)
+	}
 	r := req_begin("subscribe")
 	req_str(&r, "object", object_str(ob))
 	req_str(&r, "kind", "conversation")
@@ -378,6 +388,18 @@ follow :: proc(s: ^Session, ob: api.Object, until_idle: bool, sent := "") -> int
 		if k == .Result && len(p) >= 9 && prim.get_u64le(p[:8]) == tag {
 			if api.Status(p[8]) != .Ok {
 				return report_error(api.Status(p[8]), "cannot follow the conversation")
+			}
+			continue
+		}
+		if k == .Event {
+			ev, eerr := json.parse(p, json.DEFAULT_SPECIFICATION, true, context.temp_allocator)
+			if eerr == .None && jstr(ev, "kind") == "placement" && jstr(ev, "object") == hex(ob.id) {
+				if s.a.json {
+					fmt.println(string(p))
+				} else if t := placement_text(ev); len(t) > 0 && t != last_place && jstr(ev, "state") != "running" {
+					fmt.printfln("  ⧗ %s", t)
+					last_place = t
+				}
 			}
 			continue
 		}

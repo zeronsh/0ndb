@@ -36,6 +36,7 @@ RUNTIME_OPS := []Op {
 	{218, "trigger.watch", {OBJ}, "", op_trigger_watch},
 	{219, "agent.actor", {{"agent", .Id, nil}}, "actor:id", op_agent_actor},
 	{220, "wake", {OBJ}, "", op_wake},
+	{221, "placement", {OBJ}, "Placement", op_placement},
 }
 
 @(private)
@@ -593,6 +594,37 @@ op_agent_actor :: proc(c: ^Call, o: ^Out) -> Status {
 		return .Unsupported
 	}
 	o_id(o, "actor", rt.agent_actor(r, a_id(c, "agent")))
+	return .Ok
+}
+
+PLACEMENT_NAMES := [4]string{"none", "assigned", "running", "waiting_runner"}
+
+emit_placement :: proc(o: ^Out, info: ^rt.Placement_Info) {
+	o_enum(o, "state", u64(info.state), PLACEMENT_NAMES[:])
+	o_rid(o, "msg", info.msg)
+	o_id(o, "runner", info.runner)
+	o_str(o, "provider", info.provider)
+	o_i64(o, "since_ms", info.since_ms)
+}
+
+op_placement :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	ob := a_object(c, "object")
+	info, err := rt.placement_status(r, ob)
+	if err == .Pending {
+		eng.convo_status(c.api.e, ob, ready(c))
+		if c.waiting {
+			return .Pending
+		}
+		return .Missing
+	}
+	if err != .None {
+		return _rterr(err)
+	}
+	emit_placement(o, &info)
 	return .Ok
 }
 

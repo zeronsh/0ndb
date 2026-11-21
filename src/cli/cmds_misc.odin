@@ -135,7 +135,13 @@ cmd_status :: proc(a: ^Args) -> int {
 		fmt.printfln("runtime  %s · %d running · %d warm · %d runs started", role, jint(rr.value, "active_runs"), jint(rr.value, "warm_processes"), jint(rr.value, "runs_started"))
 	}
 	if cur, ok := api.parse_object(jstr(st, "current")); ok {
-		fmt.printfln("current  %s", short(hex(cur.id)))
+		line := short(hex(cur.id))
+		if p, pok := placement(s, cur); pok {
+			if t := placement_text(p); len(t) > 0 {
+				line = fmt.tprintf("%s · %s", line, t)
+			}
+		}
+		fmt.printfln("current  %s", line)
 	}
 	fmt.printfln("engine   %d open objects · %d subscriptions · %d pending reads", jint(es, "handles"), jint(es, "subs"), jint(es, "pending"))
 	return 0
@@ -170,7 +176,7 @@ cmd_ls :: proc(a: ^Args) -> int {
 	}
 	cur := jstr(must(s, `{"op":"state.get"}`), "current")
 	tbl := make([dynamic][]string, context.temp_allocator)
-	append(&tbl, row("", "ID", "KIND", "STATUS", "ACTIVE", "TITLE"))
+	append(&tbl, row("", "ID", "KIND", "STATUS", "ACTIVE", "TITLE", "PLACEMENT"))
 	for x in out {
 		id := jstr(x, "object")
 		mark := "*" if len(cur) == 65 && cur[33:] == id else ""
@@ -179,7 +185,14 @@ cmd_ls :: proc(a: ^Args) -> int {
 		if p := jstr(jget(x, "parent"), "object"); len(p) > 0 {
 			title = fmt.tprintf("%s (task of %s)", title, short(p))
 		}
-		append(&tbl, row(mark, short(id), jstr(x, "kind"), status, ago(jint(x, "activity")), one_line(title, 60)))
+		place := ""
+		if jstr(x, "kind") == "conversation" {
+			xo, _ := prim.id_parse(id)
+			if p, ok := placement(s, api.Object{space, xo}); ok {
+				place = placement_text(p)
+			}
+		}
+		append(&tbl, row(mark, short(id), jstr(x, "kind"), status, ago(jint(x, "activity")), one_line(title, 60), place))
 	}
 	if len(out) == 0 {
 		fmt.println("nothing here yet (0ndb new TITLE)")
