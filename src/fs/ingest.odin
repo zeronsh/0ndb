@@ -320,7 +320,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 		frame_free(&f)
 	}
 	if m.has_git && m.db != nil {
-		if index_open(&st.index, m.vfs, m.git.dir, m.db.format, st.long) == .None {
+		if index_open(&st.index, m.vfs, m.git.dir, m.git_format, st.long) == .None {
 			st.has_index = true
 			st.index_mtime = index_file_mtime_ns(&st.index)
 			if err := index_advance(&st); err != .None {
@@ -619,7 +619,7 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		}
 		inode := builder_tree(&st.b, fstree.Op_Create{parent = parent.inode, name = it.name, kind = .Symlink, target = target})
 		oid: odb.Oid
-		if tracked && index_clean(e, stat, kind, st.index_mtime) {
+		if tracked && m.git_refs && index_clean(e, stat, kind, st.index_mtime) {
 			oid = e.oid
 		} else if m.db != nil {
 			mark_dirty_dirs(st, it.path)
@@ -639,7 +639,7 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	}
 	oid: odb.Oid
 	binary := false
-	clean := tracked && index_clean(e, stat, kind, st.index_mtime)
+	clean := tracked && m.git_refs && index_clean(e, stat, kind, st.index_mtime)
 	if !clean {
 		mark_dirty_dirs(st, it.path)
 	}
@@ -759,7 +759,10 @@ builder_commit_import :: proc(m: ^Mount, b: ^Builder) -> Error {
 
 @(private)
 import_cache_tree :: proc(m: ^Mount, dirty: ^map[string]bool) -> Error {
-	ct, err := index_cache_tree(m.vfs, m.git.dir, m.db.format, context.temp_allocator)
+	if !m.git_refs {
+		return .None
+	}
+	ct, err := index_cache_tree(m.vfs, m.git.dir, m.git_format, context.temp_allocator)
 	if err != .None {
 		return .None
 	}

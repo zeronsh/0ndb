@@ -61,6 +61,7 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	spans_touched(h, only_b[:], &touched) or_return
 	snap := version_snapshot(h, tl[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
+	displaced_touch(m, &snap, &touched) or_return
 	items := make([dynamic]Mat_Item, context.temp_allocator)
 	for ino in sorted_inodes(touched) {
 		it := Mat_Item {
@@ -100,7 +101,12 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 		if !a.present {
 			return count_depth(a.old) > count_depth(b.old)
 		}
-		return a.depth < b.depth
+		if a.depth != b.depth {
+			return a.depth < b.depth
+		}
+		am := a.has_old && a.old != a.path
+		bm := b.has_old && b.old != b.path
+		return am && !bm
 	})
 	for &it in items {
 		materialize_one(m, &it, tl[:]) or_return
@@ -113,6 +119,37 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	}
 	history_trim(h)
 	return save_mount_state(m)
+}
+
+@(private)
+displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.Inode_Id]bool) -> Error {
+	work := make([dynamic]fstree.Inode_Id, context.temp_allocator)
+	for ino in touched {
+		append(&work, ino)
+	}
+	for len(work) > 0 {
+		ino := pop(&work)
+		info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
+		if ierr != nil {
+			return .Corrupt
+		}
+		if !ok || !info.present {
+			continue
+		}
+		p, pok, perr := fstree.path(snap, ino, context.temp_allocator)
+		if perr != nil {
+			return .Corrupt
+		}
+		if !pok {
+			continue
+		}
+		e, found := shadow_get(&m.shadow, p) or_return
+		if found && e.inode != ino && !touched[e.inode] {
+			touched[e.inode] = true
+			append(&work, e.inode)
+		}
+	}
+	return .None
 }
 
 @(private)

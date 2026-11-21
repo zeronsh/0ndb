@@ -1,6 +1,7 @@
 package fs
 
 import "base:runtime"
+import "core:mem/virtual"
 import "core:strconv"
 import "../crdt"
 import "../fstree"
@@ -39,10 +40,24 @@ Fence_Proc :: #type proc(m: ^Mount, data: rawptr, err: Error)
 
 @(private)
 Fence :: struct {
-	name:    string,
-	arrived: bool,
-	cb:      Fence_Proc,
-	data:    rawptr,
+	name:     string,
+	arrived:  bool,
+	observed: bool,
+	token:    u64,
+	cb:       Fence_Proc,
+	data:     rawptr,
+}
+
+@(private)
+fence_ready :: proc "contextless" (f: Fence) -> bool {
+	return f.arrived && f.observed
+}
+
+@(private)
+Fence_Token :: struct {
+	reg:   ^Registry,
+	m:     ^Mount,
+	token: u64,
 }
 
 Registry :: struct {
@@ -56,6 +71,7 @@ Registry :: struct {
 	on_ready:  proc(m: ^Mount, data: rawptr),
 	ready_data: rawptr,
 	observer:  Write_Observer,
+	fence_token: u64,
 	watcher:   Watcher,
 	random:    prim.Random,
 	os_ready:  bool,
@@ -179,6 +195,7 @@ Write_Observer :: struct {
 	start:   proc(data: rawptr, reg: ^Registry) -> Error,
 	stop:    proc(data: rawptr, reg: ^Registry),
 	changed: proc(data: rawptr, m: ^Mount, rel: string) -> (^Scope, bool),
+	fence:   proc(data: rawptr, reg: ^Registry, done: proc(data: rawptr), done_data: rawptr),
 }
 
 Mount :: struct {
@@ -197,6 +214,8 @@ Mount :: struct {
 	lock_fd:     prim.Fd,
 	git:         Git_Dirs,
 	has_git:     bool,
+	git_refs:    bool,
+	git_format:  odb.Hash_Format,
 	head:        Git_Head,
 	reflog_pos:  i64,
 	stamp:       Index_Stamp,
@@ -358,6 +377,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	}
 	m.slot = slot
 	mount_wake(m) or_return
+	mount_git_sources(m) or_return
 	if fresh {
 		save_mount_state(m) or_return
 		mount_import(m) or_return
@@ -372,6 +392,25 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	mount_materialize(m) or_return
 	ok = true
 	mount_touch(m)
+	return .None
+}
+
+@(private)
+mount_git_sources :: proc(m: ^Mount) -> Error {
+	if !m.has_git || m.db == nil {
+		return .None
+	}
+	f := git_object_format(m.vfs, m.git.common)
+	m.git_format = f
+	if f != m.db.format || (m.history.db != nil && f != m.history.db.format) {
+		return .None
+	}
+	objects, _ := path_join(m.git.common, "objects", context.temp_allocator)
+	if e := odb.add_object_dir(m.db, objects); e != .None && e != .Not_Found {
+		return .None
+	}
+	history_add_source(m.history, objects) or_return
+	m.git_refs = true
 	return .None
 }
 
@@ -531,7 +570,9 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 		for &f in m.fences {
 			if f.name == name {
 				f.arrived = true
-				mount_schedule(m, 0)
+				if f.observed {
+					mount_schedule(m, 0)
+				}
 				return
 			}
 		}
@@ -628,7 +669,7 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 mount_run :: proc(m: ^Mount) -> Error {
 	fence := false
 	for f in m.fences {
-		if f.arrived {
+		if fence_ready(f) {
 			fence = true
 		}
 	}
@@ -640,7 +681,7 @@ mount_run :: proc(m: ^Mount) -> Error {
 		i := 0
 		for i < len(m.fences) {
 			f := m.fences[i]
-			if f.arrived {
+			if fence_ready(f) {
 				if f.cb != nil {
 					f.cb(m, f.data, err)
 				}
@@ -666,7 +707,7 @@ mount_fence :: proc(m: ^Mount, cb: Fence_Proc, data: rawptr) -> Error {
 	n += copy(name[n:], hex[:])
 	name[n] = '-'
 	copy(name[n + 1:], num)
-	append(&m.fences, Fence{name = string(name), cb = cb, data = data})
+	append(&m.fences, Fence{name = string(name), cb = cb, data = data, observed = true})
 	p, _ := path_join(m.root, string(name), context.temp_allocator)
 	fd, err := prim.open_file(m.vfs, p, {.Write, .Create, .Truncate}, 0o600)
 	if err != .None {
@@ -678,9 +719,60 @@ mount_fence :: proc(m: ^Mount, cb: Fence_Proc, data: rawptr) -> Error {
 	prim.remove(m.vfs, p)
 	if !m.watched {
 		m.fences[len(m.fences) - 1].arrived = true
+	}
+	observer_fence(m, len(m.fences) - 1)
+	if fence_ready(m.fences[len(m.fences) - 1]) {
 		mount_schedule(m, 0)
 	}
 	return .None
+}
+
+@(private)
+observer_wait :: proc(reg: ^Registry) -> Error {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena, 64 << 10) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&arena)
+	context.temp_allocator = virtual.arena_allocator(&arena)
+	return from_prim(prim.loop_step(reg.loop, true))
+}
+
+@(private)
+observer_fence :: proc(m: ^Mount, i: int) {
+	reg := m.reg
+	obs := reg.observer
+	if obs.fence == nil || reg.loop == nil {
+		return
+	}
+	reg.fence_token += 1
+	t := new(Fence_Token, reg.allocator)
+	if t == nil {
+		return
+	}
+	t^ = {reg, m, reg.fence_token}
+	m.fences[i].token = t.token
+	m.fences[i].observed = false
+	obs.fence(obs.data, reg, proc(data: rawptr) {
+		t := (^Fence_Token)(data)
+		reg := t.reg
+		defer free(t, reg.allocator)
+		for mm in reg.mounts {
+			if mm != t.m {
+				continue
+			}
+			for &f in mm.fences {
+				if f.token == t.token {
+					f.observed = true
+					if f.arrived {
+						mount_schedule(mm, 0)
+					}
+					return
+				}
+			}
+			return
+		}
+	}, t)
 }
 
 mount_sync :: proc(m: ^Mount) -> Error {
@@ -708,10 +800,16 @@ mount_sync :: proc(m: ^Mount) -> Error {
 	for !done {
 		registry_poll(m.reg) or_return
 		arrived := false
+		waiting := false
 		for f in m.fences {
-			arrived ||= f.arrived
+			arrived ||= fence_ready(f)
+			waiting ||= f.arrived && !f.observed
 		}
-		if arrived || !m.watched {
+		if arrived {
+			mount_run(m) or_return
+		} else if waiting {
+			observer_wait(m.reg) or_return
+		} else if !m.watched {
 			mount_run(m) or_return
 		} else if !m.reg.os_ready || m.reg.watcher.wait == nil || !m.reg.watcher.wait(m.reg.watcher.data, m.reg, 2000) {
 			m.rescan = true

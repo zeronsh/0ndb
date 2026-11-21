@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "core:strings"
+import "../odb"
 import "../prim"
 
 Git_Dirs :: struct {
@@ -322,4 +323,23 @@ git_special_head :: proc(vfs: prim.Vfs, g: Git_Dirs, name: string, allocator := 
 		out = out[:i]
 	}
 	return out, true
+}
+
+git_object_format :: proc(vfs: prim.Vfs, common: string) -> odb.Hash_Format {
+	p, _ := path_join(common, "config", context.temp_allocator)
+	text, err := prim.read_file(vfs, p, context.temp_allocator)
+	if err != .None {
+		return .Sha1
+	}
+	s := string(text)
+	for line in strings.split_lines_iterator(&s) {
+		l := strings.trim_space(line)
+		if !strings.has_prefix(strings.to_lower(l, context.temp_allocator), "objectformat") {
+			continue
+		}
+		if eq := strings.index_byte(l, '='); eq >= 0 && strings.to_lower(strings.trim_space(l[eq + 1:]), context.temp_allocator) == "sha256" {
+			return .Sha256
+		}
+	}
+	return .Sha1
 }
