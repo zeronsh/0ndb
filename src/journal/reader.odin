@@ -23,6 +23,7 @@ Reader :: struct {
 	win_len:    int,
 	win_off:    i64,
 	out:        []u8,
+	scan:       []u8,
 	missing:    Range,
 	allocator:  runtime.Allocator,
 }
@@ -99,6 +100,10 @@ reader_close :: proc(r: ^Reader) {
 		_zero(r.out)
 		delete(r.out, r.allocator)
 	}
+	if r.scan != nil {
+		_zero(r.scan)
+		delete(r.scan, r.allocator)
+	}
 	delete(r.span_links)
 	delete(r.span_offs)
 	r^ = {
@@ -116,7 +121,10 @@ reader_end :: proc "contextless" (r: ^Reader) -> i64 {
 	return r.end
 }
 
+JOURNAL_POISON :: #config(JOURNAL_POISON, false)
+
 record_at :: proc(r: ^Reader, off: i64) -> (body: []u8, next: i64, err: Error) {
+	_poison(r)
 	end := reader_end(r)
 	if off == end {
 		return nil, off, .Eof
@@ -138,6 +146,7 @@ record_at :: proc(r: ^Reader, off: i64) -> (body: []u8, next: i64, err: Error) {
 }
 
 record_before :: proc(r: ^Reader, end_off: i64) -> (body: []u8, off: i64, err: Error) {
+	_poison(r)
 	end := reader_end(r)
 	if end_off == 0 {
 		return nil, 0, .Eof
@@ -348,7 +357,12 @@ _find_span :: proc(r: ^Reader, from: i64) -> Error {
 			first := _fetch(r, pos + HEADER, pos + HEADER + 1, true) or_return
 			if first[0] == SIG_KIND {
 				rec := _fetch(r, pos, end, true) or_return
-				if b, kind, err := _decode(r, rec, pos); err == .None && kind == .Plain && is_sig(b) {
+				out := r.out
+				r.out = r.scan
+				b, kind, err := _decode(r, rec, pos)
+				r.scan = r.out
+				r.out = out
+				if err == .None && kind == .Plain && is_sig(b) {
 					return _check_sig_record(r, b, pos)
 				}
 			}
@@ -430,7 +444,16 @@ _fetch :: proc(r: ^Reader, from, to: i64, forward: bool) -> ([]u8, Error) {
 			r.win_len = 0
 		}
 		if from >= j.durable {
-			return j.pending[from - j.durable:to - j.durable], .None
+			when JOURNAL_POISON {
+				if we := _window(r, int(to - from)); we != .None {
+					return nil, we
+				}
+				r.win_len = 0
+				copy(r.win, j.pending[from - j.durable:to - j.durable])
+				return r.win[:to - from], .None
+			} else {
+				return j.pending[from - j.durable:to - j.durable], .None
+			}
 		}
 		file_end = j.durable
 		if to > file_end {
@@ -496,4 +519,20 @@ _window :: proc(r: ^Reader, size: int) -> Error {
 	}
 	r.win = win
 	return .None
+}
+
+@(private)
+_poison :: proc "contextless" (r: ^Reader) {
+	when JOURNAL_POISON {
+		for &b in r.win {
+			b = 0xa5
+		}
+		r.win_len = 0
+		for &b in r.out {
+			b = 0xa5
+		}
+		for &b in r.scan {
+			b = 0xa5
+		}
+	}
 }
