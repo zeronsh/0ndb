@@ -99,6 +99,7 @@ History :: struct {
 	blob_cache: odb.Oid,
 	blob_data:  []u8,
 	touched:    [dynamic]fstree.Inode_Id,
+	touched_set: map[fstree.Inode_Id]struct{},
 	pins:       [dynamic]odb.Oid,
 	lvidx:      prim.Fd,
 	lvidx_n:    u64,
@@ -153,6 +154,7 @@ history_wake :: proc(h: ^History) -> Error {
 	h.moves = make([dynamic]fstree.Move_Ref, h.allocator)
 	h.io = make([dynamic]u8, h.allocator)
 	h.touched = make([dynamic]fstree.Inode_Id, h.allocator)
+	h.touched_set = make(map[fstree.Inode_Id]struct{}, h.allocator)
 	h.pins = make([dynamic]odb.Oid, h.allocator)
 	h.markers = make([dynamic]Git_Marker, h.allocator)
 	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
@@ -198,6 +200,7 @@ history_sleep :: proc(h: ^History) {
 	delete(h.moves)
 	delete(h.io)
 	delete(h.touched)
+	delete(h.touched_set)
 	delete(h.pins)
 	markers_clear(h)
 	delete(h.markers)
@@ -671,6 +674,12 @@ history_trim :: proc(h: ^History) {
 	crdt.graph_trim(&h.g)
 	fstree.trim(&h.tree, 64)
 	clear(&h.touched)
+	if len(h.touched_set) > 4096 {
+		delete(h.touched_set)
+		h.touched_set = make(map[fstree.Inode_Id]struct{}, h.allocator)
+	} else {
+		clear(&h.touched_set)
+	}
 	markers_clear(h)
 	shrink(&h.io)
 }
@@ -693,13 +702,27 @@ history_text_at :: proc(h: ^History, inode: fstree.Inode_Id, v: Version, allocat
 	if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
 		return nil, .Not_Found
 	}
-	f := history_file(h, inode) or_return
-	if crdt.frontier_eq(f.text.version[:], lvs[:]) {
-		return crdt.text_bytes(&f.text, allocator), .None
-	}
 	tmp: File_State
 	tmp.inode = inode
-	tmp.rec = f.rec
+	owned := false
+	if f, ok := h.files[inode]; ok {
+		if f.loaded && crdt.frontier_eq(f.text.version[:], lvs[:]) {
+			return crdt.text_bytes(&f.text, allocator), .None
+		}
+		tmp.rec = f.rec
+		tmp.new_refs = f.new_refs
+	} else {
+		owned = true
+		if err = read_file_record(h, inode, &tmp.rec); err != .None {
+			delete(tmp.rec.cp_version)
+			delete(tmp.rec.cp_spans)
+			return nil, err
+		}
+	}
+	defer if owned {
+		delete(tmp.rec.cp_version)
+		delete(tmp.rec.cp_spans)
+	}
 	if err = load_text(h, &tmp, lvs[:]); err != .None {
 		return nil, err
 	}
@@ -708,6 +731,41 @@ history_text_at :: proc(h: ^History, inode: fstree.Inode_Id, v: Version, allocat
 		crdt.log_destroy(&tmp.log)
 	}
 	return crdt.text_bytes(&tmp.text, allocator), .None
+}
+
+history_text_oid :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (oid: odb.Oid, ok: bool, err: Error) {
+	if h.db == nil {
+		return {}, false, .None
+	}
+	rec: File_Record
+	refs := 0
+	owned := false
+	defer if owned {
+		delete(rec.cp_version)
+		delete(rec.cp_spans)
+	}
+	if f, cached := h.files[inode]; cached {
+		rec = f.rec
+		refs = len(f.new_refs)
+	} else {
+		owned = true
+		read_file_record(h, inode, &rec) or_return
+	}
+	if !rec.has_cp || refs != 0 || rec.ops != rec.cp_count || rec.cp_len <= 0 {
+		return {}, false, .None
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
+		return {}, false, .None
+	}
+	cpv := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, rec.cp_version[:], &cpv) != .None {
+		return {}, false, .None
+	}
+	if !crdt.graph_contains_all(&h.g, lvs[:], cpv[:]) || !odb.exists(h.db, rec.cp_text) {
+		return {}, false, .None
+	}
+	return rec.cp_text, true, .None
 }
 
 history_text_spans_at :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Lv, allocator := context.allocator) -> (data: []u8, spans: []crdt.Author_Span, err: Error) {
@@ -786,8 +844,16 @@ history_blob_at :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Lv) -> (r
 }
 
 history_blob :: proc(h: ^History, inode: fstree.Inode_Id) -> (reg: Blob_Reg, found: bool, err: Error) {
-	f := history_file(h, inode) or_return
-	return f.rec.blob, f.rec.has_blob, .None
+	if f, ok := h.files[inode]; ok {
+		return f.rec.blob, f.rec.has_blob, .None
+	}
+	rec: File_Record
+	defer {
+		delete(rec.cp_version)
+		delete(rec.cp_spans)
+	}
+	read_file_record(h, inode, &rec) or_return
+	return rec.blob, rec.has_blob, .None
 }
 
 history_markers :: proc(h: ^History) -> []Git_Marker {
@@ -969,11 +1035,10 @@ apply_tree_ops :: proc(h: ^History, b: ^crdt.Batch, first: crdt.Lv, skip: int, s
 
 @(private)
 note_touched :: proc(h: ^History, ino: fstree.Inode_Id) {
-	for x in h.touched {
-		if x == ino {
-			return
-		}
+	if ino in h.touched_set {
+		return
 	}
+	h.touched_set[ino] = {}
 	append(&h.touched, ino)
 }
 
@@ -1084,48 +1149,61 @@ blob_newer :: proc(a, b: Blob_Reg) -> bool {
 	return a.seq > b.seq
 }
 
-encode_tree_op :: proc(h: ^History, buf: ^[dynamic]u8, op: fstree.Op) {
+Local_Actor :: struct {
+	ix:    u32,
+	actor: prim.Id,
+	on:    bool,
+}
+
+encode_tree_op :: proc(h: ^History, buf: ^[dynamic]u8, op: fstree.Op, la := Local_Actor{}) {
 	w := prim.writer(buf)
-	put :: proc(h: ^History, w: ^prim.Writer, id: fstree.Inode_Id) {
-		o := inode_op(h, id)
+	put :: proc(h: ^History, w: ^prim.Writer, id: fstree.Inode_Id, la: Local_Actor) {
+		o: crdt.Op_Id
+		if id == fstree.ROOT {
+			o = {}
+		} else if la.on && id.actor == la.ix {
+			o = crdt.Op_Id{la.actor, id.seq}
+		} else {
+			o = inode_op(h, id)
+		}
 		prim.write_id(w, o.actor)
 		prim.write_uvarint(w, o.seq)
 	}
 	switch o in op {
 	case fstree.Op_Create:
 		prim.write_u8(&w, TOP_CREATE)
-		put(h, &w, o.parent)
+		put(h, &w, o.parent, la)
 		prim.write_u8(&w, u8(o.kind))
 		prim.write_u8(&w, transmute(u8)o.flags)
 		prim.write_str(&w, o.name)
 		prim.write_str(&w, o.target)
 	case fstree.Op_Move:
 		prim.write_u8(&w, TOP_MOVE)
-		put(h, &w, o.inode)
-		put(h, &w, o.parent)
+		put(h, &w, o.inode, la)
+		put(h, &w, o.parent, la)
 		prim.write_str(&w, o.name)
 	case fstree.Op_Remove:
 		prim.write_u8(&w, TOP_REMOVE)
-		put(h, &w, o.inode)
+		put(h, &w, o.inode, la)
 	case fstree.Op_Restore:
 		prim.write_u8(&w, TOP_RESTORE)
-		put(h, &w, o.inode)
+		put(h, &w, o.inode, la)
 	case fstree.Op_Set_Flags:
 		prim.write_u8(&w, TOP_FLAGS)
-		put(h, &w, o.inode)
+		put(h, &w, o.inode, la)
 		prim.write_u8(&w, transmute(u8)o.mask)
 		prim.write_u8(&w, transmute(u8)o.value)
 	case fstree.Op_Set_Target:
 		prim.write_u8(&w, TOP_TARGET)
-		put(h, &w, o.inode)
+		put(h, &w, o.inode, la)
 		prim.write_str(&w, o.target)
 	}
 }
 
-encode_content_op :: proc(h: ^History, buf: ^[dynamic]u8, inode: fstree.Inode_Id, oid: odb.Oid, size: i64) {
+encode_content_op :: proc(h: ^History, buf: ^[dynamic]u8, inode: fstree.Inode_Id, oid: odb.Oid, size: i64, la := Local_Actor{}) {
 	w := prim.writer(buf)
 	prim.write_u8(&w, TOP_CONTENT)
-	o := inode_op(h, inode)
+	o := crdt.Op_Id{la.actor, inode.seq} if la.on && inode.actor == la.ix else inode_op(h, inode)
 	prim.write_id(&w, o.actor)
 	prim.write_uvarint(&w, o.seq)
 	n := h.db.format == .Sha256 ? 32 : 20 if h.db != nil else 20

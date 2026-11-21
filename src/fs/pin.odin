@@ -169,7 +169,7 @@ mount_commit :: proc(m: ^Mount, info: Commit_Info) -> (commit: odb.Oid, err: Err
 }
 
 @(private)
-dir_tree :: proc(m: ^Mount, dir: string) -> (oid: odb.Oid, nonempty: bool, err: Error) {
+dir_tree :: proc(m: ^Mount, dir: string, pack: ^odb.Pack_Builder = nil) -> (oid: odb.Oid, nonempty: bool, err: Error) {
 	self, found := shadow_get(&m.shadow, dir) or_return
 	if found && self.kind == .Dir && self.oid != {} {
 		return self.oid, true, .None
@@ -201,7 +201,7 @@ dir_tree :: proc(m: ^Mount, dir: string) -> (oid: odb.Oid, nonempty: bool, err: 
 		switch e.kind {
 		case .Dir:
 			c, _ := clone_string(child, heap)
-			sub, any, serr := dir_tree(m, c)
+			sub, any, serr := dir_tree(m, c, pack)
 			delete(c, heap)
 			serr or_return
 			if !any {
@@ -224,7 +224,11 @@ dir_tree :: proc(m: ^Mount, dir: string) -> (oid: odb.Oid, nonempty: bool, err: 
 		return {}, false, .None
 	}
 	odb.tree_sort(entries[:])
-	oid = from_odb_v(odb.write_tree(m.db, entries[:])) or_return
+	if pack != nil {
+		oid = from_odb_v(odb.pack_add_tree(pack, entries[:])) or_return
+	} else {
+		oid = from_odb_v(odb.write_tree(m.db, entries[:])) or_return
+	}
 	if found && self.kind == .Dir {
 		self.oid = oid
 		shadow_put(&m.shadow, dir, self) or_return
@@ -241,6 +245,12 @@ ensure_blob :: proc(m: ^Mount, rel: string, e: ^Entry) -> Error {
 		return .None
 	}
 	h := m.history
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch, 64 << 10) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&scratch)
+	context.temp_allocator = virtual.arena_allocator(&scratch)
 	if .Opaque in tree_flags(h, e.inode) {
 		reg, has := history_blob(h, e.inode) or_return
 		if has && odb.exists(m.db, reg.oid) {
@@ -248,6 +258,10 @@ ensure_blob :: proc(m: ^Mount, rel: string, e: ^Entry) -> Error {
 			return .None
 		}
 	} else {
+		if oid, ok := history_text_oid(h, e.inode, m.synced[:]) or_return; ok {
+			e.oid = oid
+			return .None
+		}
 		text, terr := history_text_at(h, e.inode, m.synced[:], context.temp_allocator)
 		if terr == .None {
 			oid := from_odb_v(odb.write(m.db, .Blob, text)) or_return

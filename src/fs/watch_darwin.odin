@@ -270,10 +270,6 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 	return .None
 }
 
-@(private)
-_parent_pid :: proc(pid: prim.Pid) -> (prim.Pid, bool) {
-	return 0, false
-}
 
 @(private)
 _heap_release :: proc() {

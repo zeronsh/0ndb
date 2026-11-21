@@ -52,7 +52,7 @@ mount_fork :: proc(src: ^Mount, dst: ^Mount, id: prim.Id, root: string, state_di
 	sp, _ := path_join(state_dir, "shadow", context.temp_allocator)
 	fmt_ := src.db.format if src.db != nil else odb.Hash_Format.Sha1
 	sh: Shadow
-	shadow_open(&sh, vfs, sp, fmt_, context.temp_allocator) or_return
+	shadow_open(&sh, vfs, sp, fmt_, runtime.heap_allocator()) or_return
 	err := clone_tree(src, &sh, root, "")
 	if err == .None {
 		err = shadow_persist(&sh)

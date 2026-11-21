@@ -3,6 +3,7 @@ package fs
 import "base:runtime"
 import "core:hash/xxhash"
 import "core:strconv"
+import "core:sync"
 import "core:sys/posix"
 import "../prim"
 
@@ -34,6 +35,7 @@ Kv :: struct {
 	probe:     [dynamic]u8,
 	out:       [dynamic]u8,
 	mapped:    []u8,
+	map_lock:  ^sync.Mutex,
 }
 
 @(private = "file")
@@ -775,14 +777,46 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 	kv_map(kv)
 	end := kv.log_end
 	off := u64(KV_LOG_HEADER)
-	for off < end {
-		r, rerr := kv_read(kv, off, &kv.buf)
-		if rerr == .Corrupt {
-			break
+	win := make([dynamic]u8, context.temp_allocator)
+	win_off := off
+	win_len := u64(0)
+	scan: for off < end {
+		if off + 8 > win_off + win_len || off + 8 + u64(prim.get_u32le(win[off - win_off:][:4])) > win_off + win_len {
+			want := min(u64(1 << 20), end - off)
+			if off + 8 <= win_off + win_len {
+				n := u64(prim.get_u32le(win[off - win_off:][:4]))
+				if n > KV_MAX_RECORD {
+					break scan
+				}
+				want = min(max(want, 8 + n), end - off)
+			}
+			resize(&win, int(want))
+			got, rerr := prim.read_at(kv.vfs, kv.log_fd, win[:want], i64(off))
+			if rerr != .None {
+				return false, from_prim(rerr)
+			}
+			win_off = off
+			win_len = u64(got)
+			if win_len < 8 {
+				break scan
+			}
+			n := u64(prim.get_u32le(win[0:4]))
+			if n > KV_MAX_RECORD || 8 + n > win_len {
+				break scan
+			}
 		}
-		if rerr != .None {
-			return false, rerr
+		rec := win[off - win_off:]
+		n := u64(prim.get_u32le(rec[0:4]))
+		body := rec[8:][:n]
+		if u32(xxhash.XXH3_64_with_seed(body, off)) != prim.get_u32le(rec[4:8]) {
+			break scan
 		}
+		r, derr := kv_decode(body)
+		if derr != .None {
+			break scan
+		}
+		r.off = off
+		r.size = 8 + n
 		kv_apply(kv, r) or_return
 		off += r.size
 		if kv.used * 8 > kv.cap * 7 {
@@ -812,8 +846,14 @@ kv_map :: proc(kv: ^Kv) {
 		return
 	}
 	size := KV_HEADER + kv.cap * KV_SLOT
+	if kv.map_lock != nil {
+		sync.mutex_lock(kv.map_lock)
+	}
 	p := posix.mmap(nil, uint(size), {.READ, .WRITE}, {.SHARED}, posix.FD(kv.idx_fd), 0)
 	if p == posix.MAP_FAILED {
+		if kv.map_lock != nil {
+			sync.mutex_unlock(kv.map_lock)
+		}
 		return
 	}
 	kv.mapped = ([^]u8)(p)[:size]
@@ -826,4 +866,7 @@ kv_unmap :: proc(kv: ^Kv) {
 	}
 	posix.munmap(raw_data(kv.mapped), uint(len(kv.mapped)))
 	kv.mapped = nil
+	if kv.map_lock != nil {
+		sync.mutex_unlock(kv.map_lock)
+	}
 }

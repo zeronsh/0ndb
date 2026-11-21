@@ -7,6 +7,7 @@ import "core:strconv"
 import "../fstree"
 import "../odb"
 import "../prim"
+import "core:sync"
 import "core:sys/posix"
 
 SHADOW_MAGIC :: u64(0x3164_6873_6264_6e30)
@@ -97,6 +98,8 @@ Shadow :: struct {
 	out:        [dynamic]u8,
 	probe_del:  bool,
 	mapped:     []u8,
+	map_lock:   ^sync.Mutex,
+	lock:       ^sync.Mutex,
 }
 
 shadow_open :: proc(s: ^Shadow, vfs: prim.Vfs, dir: string, format: odb.Hash_Format, allocator := context.allocator) -> Error {
@@ -204,6 +207,12 @@ shadow_reserve :: proc(s: ^Shadow, n: u64) -> Error {
 }
 
 shadow_get :: proc(s: ^Shadow, path: string) -> (e: Entry, found: bool, err: Error) {
+	if s.lock != nil {
+		sync.mutex_lock(s.lock)
+	}
+	defer if s.lock != nil {
+		sync.mutex_unlock(s.lock)
+	}
 	if i, ok := s.index[path]; ok {
 		p := s.pending[i]
 		return p.entry, !p.del, .None
@@ -220,6 +229,12 @@ shadow_get :: proc(s: ^Shadow, path: string) -> (e: Entry, found: bool, err: Err
 }
 
 shadow_by_inode :: proc(s: ^Shadow, inode: fstree.Inode_Id, allocator := context.allocator) -> (path: string, e: Entry, found: bool, err: Error) {
+	if s.lock != nil {
+		sync.mutex_lock(s.lock)
+	}
+	defer if s.lock != nil {
+		sync.mutex_unlock(s.lock)
+	}
 	if i, ok := s.by_inode[inode]; ok {
 		p := s.pending[i]
 		if !p.del && p.entry.inode == inode {
@@ -261,14 +276,32 @@ shadow_by_inode :: proc(s: ^Shadow, inode: fstree.Inode_Id, allocator := context
 }
 
 shadow_put :: proc(s: ^Shadow, path: string, e: Entry) -> Error {
+	if s.lock != nil {
+		sync.mutex_lock(s.lock)
+	}
+	defer if s.lock != nil {
+		sync.mutex_unlock(s.lock)
+	}
 	return pending_set(s, path, false, e)
 }
 
 shadow_remove :: proc(s: ^Shadow, path: string) -> Error {
+	if s.lock != nil {
+		sync.mutex_lock(s.lock)
+	}
+	defer if s.lock != nil {
+		sync.mutex_unlock(s.lock)
+	}
 	return pending_set(s, path, true, {})
 }
 
 shadow_append :: proc(s: ^Shadow, path: string, e: Entry) -> Error {
+	if s.lock != nil {
+		sync.mutex_lock(s.lock)
+	}
+	defer if s.lock != nil {
+		sync.mutex_unlock(s.lock)
+	}
 	p, aerr := clone_string(path, s.allocator)
 	if aerr != nil {
 		return .No_Memory
@@ -285,6 +318,12 @@ shadow_pending_count :: proc "contextless" (s: ^Shadow) -> int {
 }
 
 shadow_children :: proc(s: ^Shadow, dir: string, out: ^[dynamic]Shadow_Child, allocator := context.allocator) -> Error {
+	if s.lock != nil {
+		sync.mutex_lock(s.lock)
+	}
+	defer if s.lock != nil {
+		sync.mutex_unlock(s.lock)
+	}
 	_, slot, ok := find_path(s, dir, path_hash(dir)) or_return
 	off := slot.head if ok else 0
 	steps: u64
@@ -353,6 +392,12 @@ shadow_children_free :: proc(list: []Shadow_Child, allocator := context.allocato
 }
 
 shadow_persist :: proc(s: ^Shadow) -> Error {
+	if s.lock != nil {
+		sync.mutex_lock(s.lock)
+	}
+	defer if s.lock != nil {
+		sync.mutex_unlock(s.lock)
+	}
 	if len(s.pending) == 0 {
 		return .None
 	}
@@ -477,6 +522,9 @@ shadow_checkpoint :: proc(s: ^Shadow) -> Error {
 }
 
 shadow_compact :: proc(s: ^Shadow) -> Error {
+	held := s.lock
+	s.lock = nil
+	defer s.lock = held
 	if len(s.pending) > 0 {
 		shadow_persist(s) or_return
 	}
@@ -1237,6 +1285,27 @@ recount :: proc(s: ^Shadow) -> Error {
 	}
 	s.used = used
 	s.inode_used = inode_used
+	live: u64
+	pos = 0
+	total = s.cap * SHADOW_PATH_SLOT
+	for pos < total {
+		n := min(u64(len(block)), total - pos)
+		got, rerr := prim.read_at(s.vfs, s.idx_fd, block[:n], i64(SHADOW_HEADER + pos))
+		if rerr != .None || u64(got) != n {
+			return .Corrupt if rerr == .None else from_prim(rerr)
+		}
+		for k: u64 = 0; k < n; k += SHADOW_PATH_SLOT {
+			if prim.get_u64le(block[k:k + 8]) == 0 {
+				continue
+			}
+			r, err := read_rec(s, prim.get_u64le(block[k + 8:k + 16]), &s.scratch)
+			if err == .None && !r.del {
+				live += 1
+			}
+		}
+		pos += n
+	}
+	s.live = live
 	return .None
 }
 
@@ -1353,8 +1422,14 @@ idx_map :: proc(s: ^Shadow) {
 		return
 	}
 	size := SHADOW_HEADER + s.cap * (SHADOW_PATH_SLOT + SHADOW_INODE_SLOT)
+	if s.map_lock != nil {
+		sync.mutex_lock(s.map_lock)
+	}
 	p := posix.mmap(nil, uint(size), {.READ, .WRITE}, {.SHARED}, posix.FD(s.idx_fd), 0)
 	if p == posix.MAP_FAILED {
+		if s.map_lock != nil {
+			sync.mutex_unlock(s.map_lock)
+		}
 		return
 	}
 	s.mapped = ([^]u8)(p)[:size]
@@ -1367,6 +1442,9 @@ idx_unmap :: proc(s: ^Shadow) {
 	}
 	posix.munmap(raw_data(s.mapped), uint(len(s.mapped)))
 	s.mapped = nil
+	if s.map_lock != nil {
+		sync.mutex_unlock(s.map_lock)
+	}
 }
 
 @(private = "file")

@@ -60,9 +60,10 @@ Registry :: struct {
 }
 
 Write_Observer :: struct {
-	data:  rawptr,
-	start: proc(data: rawptr, reg: ^Registry) -> Error,
-	stop:  proc(data: rawptr, reg: ^Registry),
+	data:    rawptr,
+	start:   proc(data: rawptr, reg: ^Registry) -> Error,
+	stop:    proc(data: rawptr, reg: ^Registry),
+	changed: proc(data: rawptr, m: ^Mount, rel: string) -> (^Scope, bool),
 }
 
 Mount :: struct {
@@ -99,6 +100,7 @@ Mount :: struct {
 	watched:     bool,
 	last_activity: i64,
 	restoring:   bool,
+	open_scopes: map[string]^Scope,
 	intents:     [dynamic]Intent,
 	imported:    bool,
 	hold_line:   bool,
@@ -205,6 +207,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.line, _ = clone_string(opts.line, allocator)
 	m.synced = make([dynamic]crdt.Op_Id, allocator)
 	m.dirty = make(map[string]^Scope, allocator)
+	m.open_scopes = make(map[string]^Scope, allocator)
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
 	m.unwatched = make([dynamic]string, allocator)
@@ -292,6 +295,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(k, m.allocator)
 	}
 	delete(m.dirty)
+	for k in m.open_scopes {
+		delete(k, m.allocator)
+	}
+	delete(m.open_scopes)
 	delete(m.synced)
 	git_head_destroy(&m.head, m.allocator)
 	if m.has_git {
@@ -411,11 +418,23 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 		return
 	}
 	s := scope
-	if s == nil {
+	explicit := scope != nil
+	if !explicit {
+		if os, open := m.open_scopes[rel]; open {
+			s = os
+			explicit = true
+		} else if obs := m.reg.observer; obs.changed != nil {
+			if cs, found := obs.changed(obs.data, m, rel); found {
+				s = cs
+				explicit = true
+			}
+		}
+	}
+	if !explicit && !observer_installed(m.reg) {
 		s = active_scope(m)
 	}
 	if v, ok := &m.dirty[rel]; ok {
-		if s != nil {
+		if explicit || (!observer_installed(m.reg) && s != nil) {
 			v^ = s
 		}
 	} else {
@@ -423,6 +442,37 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 		m.dirty[k] = s
 	}
 	mount_schedule(m, m.opts.settle_ms)
+}
+
+mount_mark_observed :: proc(m: ^Mount, rel: string, scope: ^Scope) {
+	if path_internal(rel) {
+		mount_mark(m, rel)
+		return
+	}
+	if v, ok := &m.open_scopes[rel]; ok {
+		v^ = scope
+	} else {
+		k, _ := clone_string(rel, m.allocator)
+		m.open_scopes[k] = scope
+	}
+	if v, ok := &m.dirty[rel]; ok {
+		v^ = scope
+	} else {
+		k, _ := clone_string(rel, m.allocator)
+		m.dirty[k] = scope
+	}
+	mount_schedule(m, m.opts.settle_ms)
+}
+
+mount_closed :: proc(m: ^Mount, rel: string) {
+	if _, ok := m.open_scopes[rel]; ok {
+		k, _ := delete_key(&m.open_scopes, rel)
+		delete(k, m.allocator)
+	}
+}
+
+observer_installed :: proc(reg: ^Registry) -> bool {
+	return reg.observer.start != nil || reg.observer.changed != nil
 }
 
 mount_mark_rescan :: proc(m: ^Mount) {
@@ -595,37 +645,15 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 				m.dirty[k] = nil
 			}
 		}
+		for k, v in m.open_scopes {
+			if v == s {
+				m.open_scopes[k] = nil
+			}
+		}
 	}
 	delete(s.pids)
 	free(s, reg.allocator)
 	return err
-}
-
-scope_for_pid :: proc(reg: ^Registry, pid: prim.Pid) -> ^Scope {
-	cur := pid
-	for _ in 0 ..< 64 {
-		if cur <= 1 {
-			return nil
-		}
-		for i := len(reg.scopes) - 1; i >= 0; i -= 1 {
-			s := reg.scopes[i]
-			for p in s.pids {
-				if p == cur {
-					return s
-				}
-			}
-		}
-		parent, ok := _parent_pid(cur)
-		if !ok {
-			return nil
-		}
-		cur = parent
-	}
-	return nil
-}
-
-mount_observed_write :: proc(m: ^Mount, pid: prim.Pid, rel: string) {
-	mount_mark(m, rel, scope_for_pid(m.reg, pid))
 }
 
 @(private)

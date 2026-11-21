@@ -1,7 +1,6 @@
 package fs
 
 import "core:c"
-import "core:strconv"
 import "core:sync"
 import "core:sys/linux"
 import "../prim"
@@ -347,62 +346,22 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 			if len(name) == 0 {
 				continue
 			}
-			if len(dir) == 0 {
-				mount_mark(m, name)
-			} else {
+			rel := name
+			if len(dir) > 0 {
 				full := make([]u8, len(dir) + 1 + len(name), context.temp_allocator)
 				copy(full, dir)
 				full[len(dir)] = '/'
 				copy(full[len(dir) + 1:], name)
-				mount_mark(m, string(full))
+				rel = string(full)
+			}
+			mount_mark(m, rel)
+			if .CLOSE_WRITE in mask {
+				mount_closed(m, rel)
 			}
 		}
 	}
 }
 
-@(private)
-_parent_pid :: proc(pid: prim.Pid) -> (prim.Pid, bool) {
-	digits: [24]u8
-	num := strconv.write_int(digits[:], i64(pid), 10)
-	pbuf: [64]u8
-	p, ok := path_join_buf(pbuf[:], "/proc", num, "stat")
-	if !ok {
-		return 0, false
-	}
-	cbuf: prim.Path_Buf
-	cp, _ := prim.cpath(p, &cbuf)
-	fd, errno := linux.open(cp, {.CLOEXEC})
-	if errno != .NONE {
-		return 0, false
-	}
-	defer linux.close(fd)
-	buf: [512]u8
-	n, rerr := linux.read(fd, buf[:])
-	if rerr != .NONE || n <= 0 {
-		return 0, false
-	}
-	s := string(buf[:n])
-	close := -1
-	for i := len(s) - 1; i >= 0; i -= 1 {
-		if s[i] == ')' {
-			close = i
-			break
-		}
-	}
-	if close < 0 || close + 4 >= len(s) {
-		return 0, false
-	}
-	rest := s[close + 4:]
-	end := 0
-	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
-		end += 1
-	}
-	v, vok := strconv.parse_int(rest[:end], 10)
-	if !vok {
-		return 0, false
-	}
-	return prim.Pid(v), true
-}
 
 foreign import libc "system:c"
 

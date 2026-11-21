@@ -20,6 +20,7 @@ Builder :: struct {
 	ops:     [dynamic]crdt.Op_Run,
 	imports: [dynamic]Import_File,
 	git:     bool,
+	local:   bool,
 }
 
 @(private)
@@ -60,14 +61,14 @@ builder_opaque :: proc(b: ^Builder, payload: []u8) -> fstree.Inode_Id {
 @(private)
 builder_tree :: proc(b: ^Builder, op: fstree.Op) -> fstree.Inode_Id {
 	buf := make([dynamic]u8, context.temp_allocator)
-	encode_tree_op(b.h, &buf, op)
+	encode_tree_op(b.h, &buf, op, Local_Actor{b.aix, b.actor, b.local})
 	return builder_opaque(b, buf[:])
 }
 
 @(private)
 builder_content :: proc(b: ^Builder, inode: fstree.Inode_Id, oid: odb.Oid, size: i64) {
 	buf := make([dynamic]u8, context.temp_allocator)
-	encode_content_op(b.h, &buf, inode, oid, size)
+	encode_content_op(b.h, &buf, inode, oid, size, Local_Actor{b.aix, b.actor, b.local})
 	builder_opaque(b, buf[:])
 }
 
@@ -199,10 +200,12 @@ set_line :: proc(m: ^Mount) -> Error {
 
 @(private)
 Dir_Frame :: struct {
-	path:  string,
-	inode: fstree.Inode_Id,
-	depth: int,
-	wd:    i32,
+	path:    string,
+	inode:   fstree.Inode_Id,
+	depth:   int,
+	wd:      i32,
+	kids:    [dynamic]odb.Tree_Entry,
+	partial: bool,
 }
 
 @(private)
@@ -285,6 +288,9 @@ Import_State :: struct {
 	path_buf:  [dynamic]u8,
 	resume:    bool,
 	dirty_dirs: map[string]bool,
+	packp:     ^odb.Pack_Builder,
+	cur:       ^Pipe_Chunk,
+	pipe:      ^Pipe,
 }
 
 mount_import :: proc(m: ^Mount) -> Error {
@@ -309,7 +315,10 @@ mount_import :: proc(m: ^Mount) -> Error {
 	st.stack = make([dynamic]Dir_Frame, st.long)
 	st.path_buf = make([dynamic]u8, st.long)
 	st.dirty_dirs = make(map[string]bool, st.long)
-	append(&st.stack, Dir_Frame{path = "", inode = fstree.ROOT, depth = 0, wd = m.root_wd})
+	append(&st.stack, Dir_Frame{path = "", inode = fstree.ROOT, depth = 0, wd = m.root_wd, partial = true})
+	defer for &f in st.stack {
+		frame_free(&f)
+	}
 	if m.has_git && m.db != nil {
 		if index_open(&st.index, m.vfs, m.git.dir, m.db.format, st.long) == .None {
 			st.has_index = true
@@ -327,14 +336,23 @@ mount_import :: proc(m: ^Mount) -> Error {
 	defer if m.db != nil {
 		odb.bulk_end(m.db, bulk_prev)
 	}
-	if !m.has_git && m.db != nil {
-		if odb.pack_begin(&st.pack, m.db) == .None {
-			st.use_pack = true
-			odb.pack_set_local(&st.pack, true)
-		}
+	st.use_pack = !m.has_git && m.db != nil
+	pipe := new(Pipe, runtime.heap_allocator())
+	if pipe == nil {
+		return .No_Memory
 	}
-	defer if st.use_pack {
-		odb.pack_abort(&st.pack)
+	defer free(pipe, runtime.heap_allocator())
+	pipe_start(&st, pipe) or_return
+	defer if st.cur != nil {
+		chunk_free(st.cur)
+		st.cur = nil
+	}
+	defer if st.pipe != nil {
+		pipe_finish(&st)
+	}
+	context.temp_allocator = runtime.Allocator{chunk_allocator_proc, &st} if st.cur != nil else virtual.arena_allocator(&st.chunk)
+	if st.pipe != nil {
+		pipe_builder(&st)
 	}
 	sc: Scanner
 	sopts := Scan_Options {
@@ -355,7 +373,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 			break
 		}
 		for len(st.stack) > 1 && st.stack[len(st.stack) - 1].depth >= it.depth {
-			pop(&st.stack)
+			import_dir_pop(&st) or_return
 		}
 		parent := st.stack[len(st.stack) - 1]
 		tracked := false
@@ -376,10 +394,11 @@ mount_import :: proc(m: ^Mount) -> Error {
 		if st.resume {
 			have, found := shadow_get(&m.shadow, it.path) or_return
 			if found {
+				st.stack[len(st.stack) - 1].partial = true
 				if it.kind == .Dir && have.kind == .Dir {
 					wd, _ := watch_dir(m.reg, m, it.path, parent.wd)
 					p, _ := clone_string(it.path, st.long)
-					append(&st.stack, Dir_Frame{path = p, inode = have.inode, depth = it.depth, wd = wd})
+					append(&st.stack, Dir_Frame{path = p, inode = have.inode, depth = it.depth, wd = wd, partial = true})
 				} else if it.kind == .Dir {
 					scan_skip(&sc)
 				}
@@ -397,12 +416,25 @@ mount_import :: proc(m: ^Mount) -> Error {
 			import_file(&st, it, parent, tracked, &entry) or_return
 		case .Missing, .Other:
 		}
-		chunk := m.opts.import_chunk * 4 if st.use_pack else m.opts.import_chunk
-		if st.b.n > 0 && (st.files >= chunk || shadow_pending_count(&m.shadow) >= 65536) {
+		chunk := m.opts.import_chunk
+		if st.pipe != nil {
+			if st.b.n > 0 && (st.files >= chunk || len(st.cur.shadow) >= 65536) {
+				pipe_rotate(&st, false) or_return
+				pipe_builder(&st)
+			}
+		} else if st.b.n > 0 && (st.files >= chunk || shadow_pending_count(&m.shadow) >= 65536) {
 			import_flush(&st) or_return
 		}
 	}
-	import_flush(&st) or_return
+	if st.pipe != nil {
+		for len(st.stack) > 1 {
+			import_dir_pop(&st) or_return
+		}
+		pipe_rotate(&st, true) or_return
+		pipe_finish(&st) or_return
+	} else {
+		import_flush(&st) or_return
+	}
 	m.hold_line = false
 	set_line(m) or_return
 	if m.has_git && m.db != nil {
@@ -502,7 +534,7 @@ import_tracked_under :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Fram
 						break
 					}
 					created := builder_tree(&st.b, fstree.Op_Create{parent = pino, name = path_name(next), kind = .Dir})
-					shadow_append(&m.shadow, next, Entry{inode = created, kind = .Dir, stat = disk_stat(dst)}) or_return
+					import_shadow(st, next, Entry{inode = created, kind = .Dir, stat = disk_stat(dst)}) or_return
 					dirs[clone_string(next, context.temp_allocator) or_else ""] = created
 					pino = created
 				}
@@ -550,7 +582,7 @@ import_dir :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, sc: ^Sc
 		return .None
 	}
 	inode := builder_tree(&st.b, fstree.Op_Create{parent = parent.inode, name = name, kind = .Dir})
-	shadow_append(&m.shadow, it.path, Entry{inode = inode, kind = .Dir, stat = it.stat}) or_return
+	import_shadow(st, it.path, Entry{inode = inode, kind = .Dir, stat = it.stat}) or_return
 	wd, _ := watch_dir(m.reg, m, it.path, parent.wd)
 	p, _ := clone_string(it.path, st.long)
 	append(&st.stack, Dir_Frame{path = p, inode = inode, depth = it.depth, wd = wd})
@@ -591,9 +623,10 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 			oid = e.oid
 		} else if m.db != nil {
 			mark_dirty_dirs(st, it.path)
-			oid, _ = odb.hash(m.db.format, .Blob, transmute([]u8)target)
+			oid, _ = odb.write(m.db, .Blob, transmute([]u8)target)
 		}
-		shadow_append(&m.shadow, it.path, Entry{inode = inode, kind = .Symlink, stat = stat, oid = oid}) or_return
+		import_shadow(st, it.path, Entry{inode = inode, kind = .Symlink, stat = stat, oid = oid}) or_return
+		frame_add(st, it.name, oid, odb.MODE_LINK)
 		st.files += 1
 		return .None
 	}
@@ -616,7 +649,7 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	} else {
 		if it.has_data && st.use_pack {
 			binary = it.binary
-			o, perr := odb.pack_add(&st.pack, .Blob, it.data)
+			o, perr := odb.pack_add(st.packp, .Blob, it.data)
 			if perr != .None {
 				return .None
 			}
@@ -631,7 +664,7 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 				}
 				binary = b
 			}
-			o, werr := store_file(m, abs, &st.pack if st.use_pack else nil, false)
+			o, werr := store_file(m, abs, st.packp if st.use_pack else nil, false)
 			if werr != .None {
 				return .None
 			}
@@ -647,14 +680,11 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	} else if stat.size > 0 {
 		first, last := builder_insert_ref(&st.b, inode, 0, oid, int(stat.size))
 		append(&st.b.imports, Import_File{inode = inode, oid = oid, len = stat.size, first = first, last = last})
-		if !clean {
-			lv := [1]crdt.Op_Id{last}
-			history_note_file_blob(m.history, inode, oid, lv[:])
-		}
 	} else {
 		append(&st.b.imports, Import_File{inode = inode, oid = oid, len = 0, last = crdt.Op_Id{st.b.actor, inode.seq}})
 	}
-	shadow_append(&m.shadow, it.path, Entry{inode = inode, kind = .File, stat = stat, oid = oid}) or_return
+	import_shadow(st, it.path, Entry{inode = inode, kind = .File, stat = stat, oid = oid}) or_return
+	frame_add(st, it.name, oid, odb.MODE_EXEC if stat.mode & 0o100 != 0 else odb.MODE_FILE)
 	st.files += 1
 	return .None
 }
