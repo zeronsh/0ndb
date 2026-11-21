@@ -11,6 +11,10 @@ anthropic_model :: proc() -> Model {
 		classify = anthropic_classify,
 		marker = anthropic_marker,
 		auth = anthropic_auth,
+		compacted = anthropic_compacted,
+		state_code = anthropic_state_code,
+		warm_usage = anthropic_warm_usage,
+		warm_tail = anthropic_warm_tail,
 	}
 }
 
@@ -36,23 +40,32 @@ anthropic_marker :: proc(m: ^Model, cfg: ^Config) -> string {
 }
 
 @(private)
-anthropic_auth :: proc(m: ^Model, cfg: ^Config, dst: ^[dynamic]string) {
+anthropic_auth :: proc(m: ^Model, cfg: ^Config, opts: ^Request_Opts, dst: ^[dynamic]Header) {
 	betas := make([dynamic]u8, context.temp_allocator)
-	if cfg.bearer {
-		append(dst, concat({OPENAI_AUTH_HEADER, cfg.api_key}))
-		append(&betas, "oauth-2025-04-20")
-	} else if cfg.api_key != "" {
-		append(dst, concat({ANTHROPIC_KEY_HEADER, cfg.api_key}))
-	}
-	append(dst, ANTHROPIC_VERSION_HEADER)
-	if anthropic_fallback(cfg) {
-		if len(betas) > 0 {
-			append(&betas, ',')
+	add :: proc(b: ^[dynamic]u8, v: string) {
+		if len(b) > 0 {
+			append(b, ',')
 		}
-		append(&betas, ANTHROPIC_FALLBACK_BETA)
+		append(b, v)
+	}
+	if cfg.bearer {
+		append(dst, Header{OPENAI_AUTH_HEADER, concat({BEARER_PREFIX, cfg.api_key})})
+		add(&betas, "oauth-2025-04-20")
+	} else if cfg.api_key != "" {
+		append(dst, Header{ANTHROPIC_KEY_HEADER, cfg.api_key})
+	}
+	append(dst, Header{ANTHROPIC_VERSION_HEADER, ANTHROPIC_VERSION})
+	if anthropic_fallback(cfg) && opts.kind != .Keepalive {
+		add(&betas, ANTHROPIC_FALLBACK_BETA)
+	}
+	if opts.op != .None {
+		add(&betas, ANTHROPIC_THREAD_BETA)
+	}
+	if opts.compaction || opts.server_compact {
+		add(&betas, ANTHROPIC_COMPACT_BETA)
 	}
 	if len(betas) > 0 {
-		append(dst, concat({ANTHROPIC_BETA_HEADER, string(betas[:])}))
+		append(dst, Header{ANTHROPIC_BETA_HEADER, string(betas[:])})
 	}
 }
 
@@ -77,13 +90,16 @@ anthropic_fallback :: proc(cfg: ^Config) -> bool {
 }
 
 @(private)
-anthropic_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, kind: Request_Kind, dst: ^[dynamic]u8) {
+anthropic_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, opts: ^Request_Opts, dst: ^[dynamic]u8) {
 	b := dst
+	keep := opts.kind == .Keepalive
 	w_raw(b, `{"model":`)
 	w_str(b, cfg.spec.id)
 	w_raw(b, `,"max_tokens":`)
-	w_uint(b, max_tokens(cfg))
-	w_raw(b, `,"stream":true`)
+	w_uint(b, keep ? 0 : max_tokens(cfg))
+	if !keep {
+		w_raw(b, `,"stream":true`)
+	}
 	sp := cfg.spec
 	if sp.thinking == .Adaptive_Always || sp.thinking == .Adaptive {
 		switch cfg.display {
@@ -102,13 +118,34 @@ anthropic_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, kind: Request_Kin
 			w_byte(b, '}')
 		}
 	}
-	if anthropic_fallback(cfg) {
+	if anthropic_fallback(cfg) && !keep {
 		w_byte(b, ',')
 		w_raw(b, ANTHROPIC_FALLBACK_FIELD)
 	}
-	if !cfg.explicit_cache {
+	if !cfg.explicit_cache && !keep {
 		w_byte(b, ',')
 		w_raw(b, cfg.cache_ttl == .Long ? ANTHROPIC_AUTO_CACHE_LONG : ANTHROPIC_AUTO_CACHE_SHORT)
+	}
+	switch opts.op {
+	case .None:
+	case .Create:
+		w_byte(b, ',')
+		w_raw(b, ANTHROPIC_THREAD_CREATE)
+	case .Continue:
+		w_byte(b, ',')
+		w_raw(b, ANTHROPIC_THREAD_CONTINUE)
+		w_str(b, opts.prev)
+		w_byte(b, '}')
+	}
+	if opts.server_compact {
+		w_byte(b, ',')
+		w_raw(b, ANTHROPIC_COMPACT_FIELD)
+		w_str(b, COMPACT_PROMPT)
+		w_byte(b, '}')
+	}
+	if opts.op == .Continue {
+		w_raw(b, `,"messages":[`)
+		return
 	}
 	marker := anthropic_marker(m, cfg)
 	if ctx.system != "" {
@@ -393,6 +430,9 @@ anthropic_scan_native :: proc(t: ^Transcript, base: int, role: Role) {
 			t.positions += 1
 		}
 		prev = ty
+		if ty == ANTHROPIC_COMPACTION_BLOCK {
+			t.compaction = true
+		}
 		switch ty {
 		case "text", "image", "document", "tool_use", "tool_result":
 			el_off := int(uintptr(raw_data(el)) - uintptr(raw_data(content))) + content_off
@@ -557,6 +597,26 @@ j_get_or :: proc "contextless" (obj: []u8, key: string) -> []u8 {
 
 @(private)
 anthropic_usage :: proc(s: ^Stream, u: []u8, out: ^[dynamic]Delta) {
+	cu, fell := anthropic_usage_of(u)
+	if fell {
+		s.fell_back = true
+	}
+	usage_merge(&s.usage, cu)
+	append(out, Delta{kind = .Usage, usage = s.usage})
+}
+
+@(private)
+anthropic_warm_usage :: proc(m: ^Model, body: []u8) -> Call_Usage {
+	u, ok := j_get(body, "usage")
+	if !ok {
+		return {}
+	}
+	cu, _ := anthropic_usage_of(u)
+	return cu
+}
+
+@(private)
+anthropic_usage_of :: proc(u: []u8) -> (Call_Usage, bool) {
 	cu := Call_Usage {
 		input      = j_get_u64(u, "input_tokens"),
 		output     = j_get_u64(u, "output_tokens"),
@@ -573,8 +633,28 @@ anthropic_usage :: proc(s: ^Stream, u: []u8, out: ^[dynamic]Delta) {
 	if od, ok := j_get(u, "output_tokens_details"); ok && !j_is_null(od) {
 		cu.reasoning = j_get_u64(od, "thinking_tokens")
 	}
-	usage_merge(&s.usage, cu)
-	append(out, Delta{kind = .Usage, usage = s.usage})
+	fell := false
+	if its, ok := j_get(u, "iterations"); ok {
+		if it, aok := j_array(its); aok {
+			sum: Call_Usage
+			for el in j_next(&it) {
+				if j_get_raw_str(el, "type") == "fallback_message" {
+					fell = true
+				}
+				sum.input += j_get_u64(el, "input_tokens")
+				sum.output += j_get_u64(el, "output_tokens")
+				sum.cache_read += j_get_u64(el, "cache_read_input_tokens")
+				sum.cache_write += j_get_u64(el, "cache_creation_input_tokens")
+			}
+			if cu.input + cu.output + cu.cache_read + cu.cache_write == 0 {
+				cu.input = sum.input
+				cu.output = sum.output
+				cu.cache_read = sum.cache_read
+				cu.cache_write = sum.cache_write
+			}
+		}
+	}
+	return cu, fell
 }
 
 @(private)
@@ -594,6 +674,8 @@ anthropic_stop :: proc(r: string) -> Stop_Reason {
 		return .Refusal
 	case "model_context_window_exceeded":
 		return .Context_Exceeded
+	case "compaction":
+		return .Compaction
 	}
 	return .Other
 }
@@ -702,6 +784,7 @@ anthropic_finish :: proc(m: ^Model, s: ^Stream, t: ^Transcript, partial: bool) -
 			w_raw(b, `,"signature":`)
 			w_str(b, string(a.sig[:]))
 			w_byte(b, '}')
+			a.kept = true
 			t.text_bytes += len(a.text) + len(a.sig)
 		case .Tool_Call:
 			if partial || !a.complete {
@@ -720,6 +803,9 @@ anthropic_finish :: proc(m: ^Model, s: ^Stream, t: ^Transcript, partial: bool) -
 				splice_input(b, a.raw[:], a.text[:])
 			} else {
 				append(b, ..a.raw[:])
+			}
+			if string(a.type[:]) == ANTHROPIC_COMPACTION_BLOCK {
+				t.compaction = true
 			}
 			t.text_bytes += len(a.raw) + len(a.text)
 		}
@@ -763,4 +849,56 @@ splice_input :: proc(b: ^[dynamic]u8, raw: []u8, input: []u8) {
 		append(b, "{}")
 	}
 	append(b, ..raw[off + len(v):])
+}
+
+@(private)
+anthropic_compacted :: proc(m: ^Model, s: ^Stream, t: ^Transcript, summary: ^[dynamic]u8) -> bool {
+	for i in 0 ..< s.used {
+		a := &s.blocks[i]
+		if a.kind != .Other || !a.complete || string(a.type[:]) != ANTHROPIC_COMPACTION_BLOCK {
+			continue
+		}
+		scratch := make([dynamic]u8, context.temp_allocator)
+		append(summary, j_get_str(a.raw[:], "content", &scratch))
+		item_begin(t)
+		b := &t.buf
+		w_raw(b, `{"role":"user","content":[`)
+		append(b, ..a.raw[:])
+		w_raw(b, `,{"type":"text","text":`)
+		w_str(b, COMPACT_RESUME_TEXT)
+		w_byte(b, '}')
+		t.mark = len(b) - 1
+		w_raw(b, `]}`)
+		t.positions += 2
+		t.text_bytes += len(a.raw) + len(COMPACT_RESUME_TEXT)
+		t.compaction = true
+		t.last_role = .User
+		t.has_last = true
+		return true
+	}
+	return false
+}
+
+@(private)
+anthropic_state_code :: proc(m: ^Model, f: Failure) -> State_Fault {
+	for c in ANTHROPIC_STATE_RESET_CODES {
+		if f.code == c {
+			return .Replay
+		}
+	}
+	for c in ANTHROPIC_STATE_OFF_CODES {
+		if f.code == c {
+			return .Disable
+		}
+	}
+	return .None
+}
+
+anthropic_warm_tail :: proc(t: ^Transcript, dst: ^[dynamic]u8) {
+	if t.items > 0 {
+		append(dst, ',')
+	}
+	w_raw(dst, `{"role":"user","content":[{"type":"text","text":`)
+	w_str(dst, ANTHROPIC_KEEPALIVE_TEXT)
+	w_raw(dst, `}]}`)
 }

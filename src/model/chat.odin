@@ -19,7 +19,7 @@ chat_model :: proc() -> Model {
 }
 
 @(private)
-chat_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, kind: Request_Kind, dst: ^[dynamic]u8) {
+chat_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, opts: ^Request_Opts, dst: ^[dynamic]u8) {
 	b := dst
 	w_raw(b, `{"model":`)
 	w_str(b, cfg.spec.id)

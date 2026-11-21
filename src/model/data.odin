@@ -24,6 +24,12 @@ Effort :: enum u8 {
 	Max,
 }
 
+Server_State :: enum u8 {
+	None,
+	Thread,
+	Response,
+}
+
 Cache_Ttl :: enum u8 {
 	Short,
 	Long,
@@ -52,17 +58,31 @@ Spec :: struct {
 	system_messages:   bool,
 	explicit_cache:    bool,
 	forced_tool_error: bool,
+	server_state:      Server_State,
+	server_compact:    bool,
+	keepalive:         bool,
 }
 
 ANTHROPIC_URL :: "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION :: "2026-10-21"
-ANTHROPIC_VERSION_HEADER :: "anthropic-version: " + ANTHROPIC_VERSION
-ANTHROPIC_KEY_HEADER :: "x-api-key: "
-ANTHROPIC_BETA_HEADER :: "anthropic-beta: "
+ANTHROPIC_VERSION_HEADER :: "anthropic-version"
+ANTHROPIC_KEY_HEADER :: "x-api-key"
+ANTHROPIC_BETA_HEADER :: "anthropic-beta"
 ANTHROPIC_FALLBACK_BETA :: "server-side-fallback-2026-07-01"
 ANTHROPIC_FALLBACK_FIELD :: `"fallbacks":"default"`
 ANTHROPIC_AUTO_CACHE_SHORT :: `"cache_control":{"type":"ephemeral"}`
 ANTHROPIC_AUTO_CACHE_LONG :: `"cache_control":{"type":"ephemeral","ttl":"1h"}`
+ANTHROPIC_THREAD_BETA :: "message-threads-2026-08-12"
+ANTHROPIC_COMPACT_BETA :: "compact-2026-09-04"
+ANTHROPIC_THREAD_CREATE :: `"thread":{"type":"create"}`
+ANTHROPIC_THREAD_CONTINUE :: `"thread":{"type":"continue","previous_message_id":`
+ANTHROPIC_COMPACT_FIELD :: `"compaction":{"type":"summarize","instructions":`
+ANTHROPIC_COMPACTION_BLOCK :: "compaction"
+ANTHROPIC_STATE_RESET_CODES :: [?]string{"thread_not_found", "thread_already_continued", "thread_continue_in_flight"}
+ANTHROPIC_STATE_OFF_CODES :: [?]string{"thread_unsupported_request", "thread_fingerprint_mismatch"}
+ANTHROPIC_KEEPALIVE_TEXT :: "warmup"
+ANTHROPIC_CACHE_SHORT_MS :: 5 * 60 * 1000
+ANTHROPIC_CACHE_LONG_MS :: 60 * 60 * 1000
 ANTHROPIC_SPEND_CAP_CODE :: "enforced_spend_limit_reached"
 ANTHROPIC_MAX_BREAKPOINTS :: 4
 ANTHROPIC_LOOKBACK_POSITIONS :: 20
@@ -83,7 +103,8 @@ RESUME_PROMPT :: "Your previous response was interrupted by a network failure an
 
 OPENAI_RESPONSES_URL :: "https://api.openai.com/v1/responses"
 OPENAI_CHAT_URL :: "https://api.openai.com/v1/chat/completions"
-OPENAI_AUTH_HEADER :: "authorization: Bearer "
+OPENAI_AUTH_HEADER :: "authorization"
+BEARER_PREFIX :: "Bearer "
 OPENAI_INCLUDE_REASONING :: `"include":["reasoning.encrypted_content"]`
 OPENAI_EVENT_CREATED :: "response.created"
 OPENAI_EVENT_ITEM_ADDED :: "response.output_item.added"
@@ -97,6 +118,9 @@ OPENAI_EVENT_COMPLETED :: "response.completed"
 OPENAI_EVENT_INCOMPLETE :: "response.incomplete"
 OPENAI_EVENT_FAILED :: "response.failed"
 OPENAI_EVENT_ERROR :: "error"
+OPENAI_STATE_RESET_CODES :: [?]string{"previous_response_not_found"}
+OPENAI_COMPACTION_TRIGGER :: `{"type":"compaction_trigger"}`
+OPENAI_COMPACTION_ITEM :: "compaction"
 OPENAI_CHAT_DONE :: "[DONE]"
 OPENAI_LONG_CONTEXT_TOKENS :: 272_000
 
@@ -106,8 +130,8 @@ HEADER_SHOULD_RETRY :: "x-should-retry"
 HEADER_REQUEST_ID :: "request-id"
 HEADER_X_REQUEST_ID :: "x-request-id"
 HEADER_CONTENT_TYPE :: "content-type"
-CONTENT_TYPE_JSON :: "content-type: application/json"
-ACCEPT_SSE :: "accept: text/event-stream"
+HEADER_ACCEPT :: "accept"
+JSON_MEDIA_TYPE :: "application/json"
 SSE_MEDIA_TYPE :: "text/event-stream"
 
 RETRYABLE_STATUS :: [?]int{408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529}
@@ -115,6 +139,7 @@ RETRYABLE_STATUS :: [?]int{408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524
 COMPACT_PROMPT :: "The conversation so far is about to be replaced by a summary because it is approaching the context limit. Write that summary now. Do not call any tools. Preserve, in order: the user's goals and every explicit instruction or constraint; decisions made and why; the current state of the work, including files, identifiers, commands and results that later steps depend on; tool calls whose results still matter and what they returned; open questions; and the exact next steps. Quote the most recent user request verbatim. Be complete but dense; omit pleasantries."
 COMPACT_PREAMBLE :: "This conversation was compacted. Summary of everything before this point:\n\n"
 COMPACT_RESUME :: "\n\nContinue the work from where it left off."
+COMPACT_RESUME_TEXT :: "The conversation before this point was compacted into the summary above. Continue the work from where it left off."
 
 CHARS_PER_TOKEN :: 3
 
@@ -132,6 +157,9 @@ MODELS := [?]Spec {
 		server_fallback = true,
 		system_messages = true,
 		forced_tool_error = true,
+		server_state = .Thread,
+		server_compact = true,
+		keepalive = true,
 	},
 	{
 		id = "claude-opus-5-5",
@@ -145,6 +173,9 @@ MODELS := [?]Spec {
 		server_fallback = true,
 		system_messages = true,
 		forced_tool_error = true,
+		server_state = .Thread,
+		server_compact = true,
+		keepalive = true,
 	},
 	{
 		id = "claude-sonnet-5-5",
@@ -158,6 +189,9 @@ MODELS := [?]Spec {
 		server_fallback = true,
 		system_messages = true,
 		forced_tool_error = true,
+		server_state = .Thread,
+		server_compact = true,
+		keepalive = true,
 	},
 	{
 		id = "claude-haiku-5-5",
@@ -171,6 +205,9 @@ MODELS := [?]Spec {
 		long_threshold = 100_000,
 		long_price = {input = 0.50, output = 2.50, cache_read = 0.05, cache_write = 0.625, cache_write2 = 1},
 		system_messages = true,
+		server_state = .Thread,
+		server_compact = true,
+		keepalive = true,
 	},
 	{
 		id = "claude-opus-5",
@@ -183,6 +220,9 @@ MODELS := [?]Spec {
 		price = {input = 5, output = 25, cache_read = 0.50, cache_write = 6.25, cache_write2 = 10},
 		server_fallback = true,
 		system_messages = true,
+		server_state = .Thread,
+		server_compact = true,
+		keepalive = true,
 	},
 	{
 		id = "claude-sonnet-5",
@@ -193,6 +233,9 @@ MODELS := [?]Spec {
 		default_effort = .High,
 		min_cache_tokens = 1024,
 		price = {input = 2, output = 10, cache_read = 0.20, cache_write = 2.50, cache_write2 = 4},
+		server_state = .Thread,
+		server_compact = true,
+		keepalive = true,
 	},
 	{
 		id = "claude-opus-4-8",
@@ -204,6 +247,9 @@ MODELS := [?]Spec {
 		min_cache_tokens = 1024,
 		price = {input = 5, output = 25, cache_read = 0.50, cache_write = 6.25, cache_write2 = 10},
 		system_messages = true,
+		server_state = .Thread,
+		server_compact = true,
+		keepalive = true,
 	},
 	{
 		id = "claude-haiku-4-5",
@@ -213,6 +259,8 @@ MODELS := [?]Spec {
 		thinking = .Budget,
 		min_cache_tokens = 4096,
 		price = {input = 1, output = 5, cache_read = 0.10, cache_write = 1.25, cache_write2 = 2},
+		server_state = .Thread,
+		keepalive = true,
 	},
 	{
 		id = "gpt-6.2-astra",
@@ -225,6 +273,8 @@ MODELS := [?]Spec {
 		long_threshold = OPENAI_LONG_CONTEXT_TOKENS,
 		long_price = {input = 16, output = 60, cache_read = 0.80, cache_write = 20, cache_write2 = 40},
 		explicit_cache = true,
+		server_state = .Response,
+		server_compact = true,
 	},
 	{
 		id = "gpt-6.2-sol",
@@ -237,6 +287,8 @@ MODELS := [?]Spec {
 		long_threshold = OPENAI_LONG_CONTEXT_TOKENS,
 		long_price = {input = 4, output = 15, cache_read = 0.20, cache_write = 5, cache_write2 = 10},
 		explicit_cache = true,
+		server_state = .Response,
+		server_compact = true,
 	},
 	{
 		id = "gpt-6-luna",
@@ -249,6 +301,8 @@ MODELS := [?]Spec {
 		long_threshold = OPENAI_LONG_CONTEXT_TOKENS,
 		long_price = {input = 0.20, output = 0.75, cache_read = 0.02, cache_write = 0.25, cache_write2 = 0.50},
 		explicit_cache = true,
+		server_state = .Response,
+		server_compact = true,
 	},
 }
 

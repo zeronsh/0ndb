@@ -11,6 +11,9 @@ responses_model :: proc() -> Model {
 		classify = openai_classify,
 		marker = no_marker,
 		auth = openai_auth,
+		trigger = responses_trigger,
+		compacted = responses_compacted,
+		state_code = responses_state_code,
 	}
 }
 
@@ -20,18 +23,23 @@ no_marker :: proc(m: ^Model, cfg: ^Config) -> string {
 }
 
 @(private)
-openai_auth :: proc(m: ^Model, cfg: ^Config, dst: ^[dynamic]string) {
+openai_auth :: proc(m: ^Model, cfg: ^Config, opts: ^Request_Opts, dst: ^[dynamic]Header) {
 	if cfg.api_key != "" {
-		append(dst, concat({OPENAI_AUTH_HEADER, cfg.api_key}))
+		append(dst, Header{OPENAI_AUTH_HEADER, concat({BEARER_PREFIX, cfg.api_key})})
 	}
 }
 
 @(private)
-responses_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, kind: Request_Kind, dst: ^[dynamic]u8) {
+responses_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, opts: ^Request_Opts, dst: ^[dynamic]u8) {
 	b := dst
 	w_raw(b, `{"model":`)
 	w_str(b, cfg.spec.id)
-	w_raw(b, `,"stream":true,"store":false,`)
+	w_raw(b, opts.op == .None ? `,"stream":true,"store":false,` : `,"stream":true,"store":true,`)
+	if opts.op == .Continue {
+		w_raw(b, `"previous_response_id":`)
+		w_str(b, opts.prev)
+		w_byte(b, ',')
+	}
 	w_raw(b, OPENAI_INCLUDE_REASONING)
 	w_raw(b, `,"max_output_tokens":`)
 	w_uint(b, max_tokens(cfg))
@@ -83,7 +91,7 @@ responses_head :: proc(m: ^Model, cfg: ^Config, ctx: ^Context, kind: Request_Kin
 		w_byte(b, ']')
 	}
 	w_raw(b, `,"input":[`)
-	if ctx.system != "" {
+	if ctx.system != "" && opts.op != .Continue {
 		w_raw(b, `{"role":"developer","content":[{"type":"input_text","text":`)
 		w_str(b, ctx.system)
 		w_raw(b, `}]},`)
@@ -530,6 +538,9 @@ responses_finish :: proc(m: ^Model, s: ^Stream, t: ^Transcript, partial: bool) -
 			continue
 		}
 		item_begin(t)
+		if a.kind == .Thinking {
+			a.kept = true
+		}
 		if a.complete && len(a.raw) > 0 {
 			append(b, ..a.raw[:])
 		} else {
@@ -564,4 +575,46 @@ responses_keep :: proc(a: ^Acc, partial: bool, last: bool) -> bool {
 		return a.complete && !partial
 	}
 	return false
+}
+
+@(private)
+responses_trigger :: proc(m: ^Model, cfg: ^Config, t: ^Transcript) {
+	item_begin(t)
+	w_raw(&t.buf, OPENAI_COMPACTION_TRIGGER)
+}
+
+@(private)
+responses_compacted :: proc(m: ^Model, s: ^Stream, t: ^Transcript, summary: ^[dynamic]u8) -> bool {
+	for i in 0 ..< s.used {
+		a := &s.blocks[i]
+		if a.kind != .Other || !a.complete || string(a.type[:]) != OPENAI_COMPACTION_ITEM {
+			continue
+		}
+		item_begin(t)
+		append(&t.buf, ..a.raw[:])
+		item_begin(t)
+		w_raw(&t.buf, `{"role":"user","content":[{"type":"input_text","text":`)
+		w_str(&t.buf, COMPACT_RESUME_TEXT)
+		w_raw(&t.buf, `}]}`)
+		t.positions += 2
+		t.text_bytes += len(a.raw) + len(COMPACT_RESUME_TEXT)
+		t.compaction = true
+		t.last_role = .User
+		t.has_last = true
+		return true
+	}
+	return false
+}
+
+@(private)
+responses_state_code :: proc(m: ^Model, f: Failure) -> State_Fault {
+	for c in OPENAI_STATE_RESET_CODES {
+		if f.code == c {
+			return .Replay
+		}
+	}
+	if f.code == "" && contains_fold(f.message, "previous_response") {
+		return .Replay
+	}
+	return .None
 }

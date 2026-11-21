@@ -3,6 +3,8 @@ package model
 import "base:runtime"
 import "core:strings"
 import "../agent"
+import "../http"
+import "../jsonschema"
 
 Phase :: enum u8 {
 	Idle,
@@ -68,6 +70,17 @@ Run :: struct {
 	compacted:   bool,
 	last_status: int,
 	last_reason: string,
+	srv_mode:    Server_State,
+	srv_id:      [dynamic]u8,
+	srv_off:     int,
+	srv_replay:  bool,
+	call_op:     Server_Op,
+	srv_compact: bool,
+	no_srv_comp: bool,
+	last_call:   i64,
+	schemas:     jsonschema.Registry,
+	schema_on:   bool,
+	compiled:    map[string]jsonschema.Schema,
 }
 
 RUN_MAX_ERROR_BODY :: 1 << 20
@@ -82,9 +95,9 @@ run_init :: proc(r: ^Run, cfg: Config, model: Model, allocator := context.alloca
 	r.cfg.api_key = strings.clone(cfg.api_key)
 	r.cfg.cache_key = strings.clone(cfg.cache_key)
 	r.cfg.spec.id = strings.clone(cfg.spec.id)
-	hs := make([]string, len(cfg.headers))
+	hs := make([]Header, len(cfg.headers))
 	for h, i in cfg.headers {
-		hs[i] = strings.clone(h)
+		hs[i] = Header{strings.clone(h.name), strings.clone(h.value)}
 	}
 	r.cfg.headers = hs
 	r.model = model
@@ -99,6 +112,7 @@ run_init :: proc(r: ^Run, cfg: Config, model: Model, allocator := context.alloca
 	r.pending = make([dynamic]Pending_Tool)
 	r.steer = make([dynamic]Steer_Item)
 	r.started = make([dynamic]int)
+	r.srv_id = make([dynamic]u8)
 	stream_init(&r.stream, allocator)
 }
 
@@ -109,7 +123,8 @@ run_destroy :: proc(r: ^Run) {
 	delete(r.cfg.cache_key)
 	delete(r.cfg.spec.id)
 	for h in r.cfg.headers {
-		delete(h)
+		delete(h.name)
+		delete(h.value)
 	}
 	delete(r.cfg.headers)
 	drop_context(r)
@@ -126,7 +141,12 @@ run_destroy :: proc(r: ^Run) {
 	clear_steer(r)
 	delete(r.steer)
 	delete(r.started)
+	delete(r.srv_id)
 	delete(r.turn)
+	if r.schema_on {
+		jsonschema.registry_destroy(&r.schemas)
+		delete(r.compiled)
+	}
 	stream_destroy(&r.stream)
 	r^ = {}
 }
@@ -151,28 +171,9 @@ run_transcript :: proc(r: ^Run) -> []u8 {
 
 run_start :: proc(r: ^Run, ctx: ^Context, turn: string, now: i64, out: ^Output) {
 	context.allocator = r.allocator
-	drop_context(r)
-	r.ctx.system = strings.clone(ctx.system)
-	tools := make([]Tool_Def, len(ctx.tools))
-	for t, i in ctx.tools {
-		tools[i] = Tool_Def {
-			name        = strings.clone(t.name),
-			description = strings.clone(t.description),
-			schema      = strings.clone(t.schema),
-			strict      = t.strict,
-			eager       = t.eager,
-		}
-	}
-	r.ctx.tools = tools
+	load_context(r, ctx)
 	delete(r.turn)
 	r.turn = strings.clone(turn)
-	clear(&r.t.buf)
-	r.t = Transcript {
-		buf = r.t.buf,
-	}
-	for &m in ctx.messages {
-		r.model.encode(&r.model, &r.cfg, &m, &r.t)
-	}
 	r.t.prev_mark = r.t.mark
 	r.t.prev_pos = r.t.positions
 	r.began = now
@@ -362,6 +363,12 @@ stop_active :: proc(r: ^Run, now: i64, why: string, out: ^Output) {
 		if r.kind == .Normal && r.emitted {
 			commit_partial(r, out)
 		}
+		if r.kind == .Normal {
+			drop_reasoning(r, out, .Interrupted)
+		}
+		if r.call_op != .None {
+			srv_clear(r, out)
+		}
 		close_started(r, out, why)
 	case .Tools:
 		for &p in r.pending {
@@ -402,33 +409,7 @@ dup :: proc(out: ^Output, s: string) -> string {
 
 @(private)
 http_error_text :: proc(err: Http_Error) -> string {
-	switch err {
-	case .None:
-		return ""
-	case .Cancelled:
-		return "the request was cancelled"
-	case .Dns:
-		return "the host name could not be resolved"
-	case .Connect:
-		return "the connection could not be established"
-	case .Tls:
-		return "the TLS handshake failed"
-	case .Timeout:
-		return "the request timed out"
-	case .Stalled:
-		return "the stream stalled"
-	case .Reset:
-		return "the connection was reset"
-	case .Protocol:
-		return "the server violated the HTTP protocol"
-	case .Too_Large:
-		return "the response was too large"
-	case .No_Memory:
-		return "out of memory"
-	case .Other:
-		return "the request failed"
-	}
-	return "the request failed"
+	return http.error_text(err)
 }
 
 @(private)
@@ -543,50 +524,74 @@ call :: proc(r: ^Run, now: i64, kind: Request_Kind, out: ^Output) {
 		}
 	}
 	r.kind = k
+	opts := Request_Opts {
+		kind       = k,
+		compaction = r.t.compaction,
+	}
+	server_compact := k == .Compact && r.cfg.spec.server_compact && !r.cfg.client_compact && !r.no_srv_comp && r.model.compacted != nil
+	opts.server_compact = server_compact && r.model.trigger == nil
+	if k == .Normal && r.srv_mode != .None {
+		opts.op = len(r.srv_id) > 0 ? .Continue : .Create
+		opts.prev = string(r.srv_id[:])
+	}
+	r.call_op = opts.op
+	r.srv_compact = server_compact
 	clear(&r.head)
-	r.model.head(&r.model, &r.cfg, &r.ctx, k, &r.head)
+	r.model.head(&r.model, &r.cfg, &r.ctx, &opts, &r.head)
 	clear(&r.tailbuf)
 	r.model.tail(&r.model, &r.cfg, k, &r.tailbuf)
 	clear(&r.extra)
-	if k == .Compact {
+	if k == .Compact && (!server_compact || r.model.trigger != nil) {
 		saved := r.t
 		r.t.buf = r.extra
 		r.t.items = 1
-		msg := Message {
-			role   = .User,
-			blocks = []Block{Text{text = COMPACT_PROMPT}},
+		if server_compact {
+			r.model.trigger(&r.model, &r.cfg, &r.t)
+		} else {
+			msg := Message {
+				role   = .User,
+				blocks = []Block{Text{text = COMPACT_PROMPT}},
+			}
+			r.model.encode(&r.model, &r.cfg, &msg, &r.t)
 		}
-		r.model.encode(&r.model, &r.cfg, &msg, &r.t)
 		r.extra = r.t.buf
 		r.t = saved
 	}
 	clear(&r.segs)
 	append(&r.segs, r.head[:])
-	marker := r.model.marker(&r.model, &r.cfg)
 	buf := r.t.buf[:]
-	marks: [2]int
-	nm := 0
-	if marker != "" {
-		if r.t.positions - r.t.prev_pos > 15 && r.t.prev_mark > 0 && r.t.prev_mark != r.t.mark {
-			marks[nm] = r.t.prev_mark
-			nm += 1
+	if opts.op == .Continue {
+		delta := buf[min(r.srv_off, len(buf)):]
+		if len(delta) > 0 && delta[0] == ',' {
+			delta = delta[1:]
 		}
-		if (r.cfg.explicit_cache || k == .Compact) && r.t.mark > 0 {
-			marks[nm] = r.t.mark
-			nm += 1
+		append(&r.segs, delta)
+	} else {
+		marker := r.model.marker(&r.model, &r.cfg)
+		marks: [2]int
+		nm := 0
+		if marker != "" && opts.op == .None {
+			if r.t.positions - r.t.prev_pos > 15 && r.t.prev_mark > 0 && r.t.prev_mark != r.t.mark {
+				marks[nm] = r.t.prev_mark
+				nm += 1
+			}
+			if (r.cfg.explicit_cache || k == .Compact) && r.t.mark > 0 {
+				marks[nm] = r.t.mark
+				nm += 1
+			}
 		}
+		at := 0
+		for i in 0 ..< nm {
+			m := marks[i]
+			if m <= at || m >= len(buf) {
+				continue
+			}
+			append(&r.segs, buf[at:m])
+			append(&r.segs, transmute([]u8)marker)
+			at = m
+		}
+		append(&r.segs, buf[at:])
 	}
-	at := 0
-	for i in 0 ..< nm {
-		m := marks[i]
-		if m <= at || m >= len(buf) {
-			continue
-		}
-		append(&r.segs, buf[at:m])
-		append(&r.segs, transmute([]u8)marker)
-		at = m
-	}
-	append(&r.segs, buf[at:])
 	if len(r.extra) > 0 {
 		append(&r.segs, r.extra[:])
 	}
@@ -596,9 +601,10 @@ call :: proc(r: ^Run, now: i64, kind: Request_Kind, out: ^Output) {
 		r.t.prev_pos = r.t.positions
 		r.steps += 1
 	}
-	headers := make([dynamic]string, out.allocator)
-	append(&headers, CONTENT_TYPE_JSON, ACCEPT_SSE)
-	r.model.auth(&r.model, &r.cfg, &headers)
+	r.last_call = now
+	headers := make([dynamic]Header, out.allocator)
+	append(&headers, Header{HEADER_CONTENT_TYPE, JSON_MEDIA_TYPE}, Header{HEADER_ACCEPT, SSE_MEDIA_TYPE})
+	r.model.auth(&r.model, &r.cfg, &opts, &headers)
 	for h in r.cfg.headers {
 		append(&headers, h)
 	}
@@ -652,6 +658,9 @@ on_delta :: proc(r: ^Run, d: ^Delta, out: ^Output) {
 		}
 	case .Thinking:
 		if d.text != "" {
+			if d.index >= 0 && d.index < r.stream.used {
+				r.stream.blocks[d.index].emitted = true
+			}
 			emit(out, agent.Reasoning_Delta{text = dup(out, d.text)})
 		}
 	case .Tool_Input:
@@ -720,6 +729,23 @@ fail_call :: proc(r: ^Run, f: Failure, now: i64, out: ^Output) {
 	context.allocator = r.allocator
 	account(r, out)
 	r.last_status = f.status
+	if r.call_op != .None && r.model.state_code != nil {
+		fault := r.model.state_code(&r.model, f)
+		if fault != .None {
+			if fault == .Disable || r.srv_replay || r.call_op == .Create {
+				r.srv_mode = .None
+			}
+			r.srv_replay = true
+			srv_clear(r, out)
+			call(r, now, r.kind, out)
+			return
+		}
+	}
+	if r.kind == .Compact && r.srv_compact && (f.class == .Invalid || f.class == .Too_Long) {
+		r.no_srv_comp = true
+		call(r, now, .Compact, out)
+		return
+	}
 	if r.kind == .Normal && f.class == .Too_Long && !r.compacted && r.t.items > 1 {
 		call(r, now, .Compact, out)
 		return
@@ -729,10 +755,14 @@ fail_call :: proc(r: ^Run, f: Failure, now: i64, out: ^Output) {
 	max_wait := retry.max_wait_ms > 0 ? retry.max_wait_ms : 600_000
 	max_resumes := retry.resumes > 0 ? retry.resumes : 5
 	resumed := false
+	if r.kind == .Normal && r.emitted && r.call_op != .None {
+		srv_clear(r, out)
+	}
 	if r.kind == .Normal && r.emitted {
 		if r.resumes >= max_resumes {
 			close_started(r, out, "the response stream failed")
 			commit_partial(r, out)
+			drop_reasoning(r, out, .Stream_Failed)
 			finish_failed(r, out, failure_text(f, out))
 			return
 		}
@@ -751,6 +781,9 @@ fail_call :: proc(r: ^Run, f: Failure, now: i64, out: ^Output) {
 		}
 	} else {
 		close_started(r, out, "the response stream failed")
+	}
+	if r.kind == .Normal {
+		drop_reasoning(r, out, .Stream_Failed)
 	}
 	if failure_retryable(f) && r.attempt < max_attempts && f.retry_after <= max_wait {
 		r.attempt += 1
@@ -792,43 +825,32 @@ complete :: proc(r: ^Run, now: i64, out: ^Output) {
 	r.attempt = 0
 	s := &r.stream
 	if r.kind == .Compact {
-		summary := make([dynamic]u8, out.allocator)
-		for i in 0 ..< s.used {
-			a := &s.blocks[i]
-			if a.kind == .Text && len(a.text) > 0 {
-				if len(summary) > 0 {
-					append(&summary, "\n\n")
-				}
-				append(&summary, ..a.text[:])
-			}
-		}
-		if len(summary) == 0 {
-			finish_failed(r, out, "compaction produced no summary")
-			return
-		}
-		emit(out, Compacted{summary = string(summary[:]), items = r.t.items})
-		clear(&r.t.buf)
-		r.t = Transcript {
-			buf = r.t.buf,
-		}
-		text := concat({COMPACT_PREAMBLE, string(summary[:]), COMPACT_RESUME})
-		msg := Message {
-			role   = .User,
-			blocks = []Block{Text{text = text}},
-		}
-		r.model.encode(&r.model, &r.cfg, &msg, &r.t)
-		commit(r, 0, 0, true, out)
-		r.t.prev_mark = r.t.mark
-		r.t.prev_pos = r.t.positions
-		r.last_ctx = 0
-		r.compacted = true
-		call(r, now, .Normal, out)
+		compact_done(r, now, out)
 		return
 	}
 	start := len(r.t.buf)
 	items := r.t.items
 	if r.model.finish(&r.model, s, &r.t, false) {
 		commit(r, start, items, false, out)
+	}
+	drop_reasoning(r, out, .Not_Replayable)
+	if r.call_op != .None {
+		#partial switch s.stop {
+		case .End_Turn, .Tool_Use, .Pause_Turn, .Stop_Sequence:
+			if !s.fell_back && len(s.msg_id) > 0 {
+				clear(&r.srv_id)
+				append(&r.srv_id, ..s.msg_id[:])
+				r.srv_off = len(r.t.buf)
+				if r.call_op == .Continue {
+					r.srv_replay = false
+				}
+				emit(out, Server_Session{id = dup(out, string(r.srv_id[:])), state = r.srv_mode})
+			} else {
+				srv_clear(r, out)
+			}
+		case:
+			srv_clear(r, out)
+		}
 	}
 	r.last_ctx = u != {} ? usage_total(u) : 0
 	r.last_text = r.t.text_bytes
@@ -853,6 +875,8 @@ complete :: proc(r: ^Run, now: i64, out: ^Output) {
 		call(r, now, .Normal, out)
 	case .Context_Exceeded:
 		call(r, now, .Compact, out)
+	case .Compaction:
+		after_turn(r, now, out)
 	case .Refusal:
 		detail := string(s.detail[:])
 		emit(out, agent.Notice{level = .Warning, text = concat({"the model declined to continue", detail != "" ? ": " : "", detail})})
@@ -932,10 +956,22 @@ collect_tools :: proc(r: ^Run, out: ^Output) -> int {
 		if len(input) == 0 {
 			delete(p.input)
 			p.input = strings.clone("{}")
-		} else if !j_valid(input) || !j_is_object(input) {
+			input = transmute([]u8)string("{}")
+		}
+		if !j_valid(input) || !j_is_object(input) {
 			p.done = true
 			p.is_error = true
 			msg := "INVALID_JSON: the tool input was not a complete JSON object; call the tool again with valid input."
+			blocks := make([]Block, 1)
+			blocks[0] = Text {
+				text = strings.clone(msg),
+			}
+			p.content = blocks
+			emit(out, agent.Tool_Finished{id = dup(out, p.id), output = msg, is_error = true})
+		} else if problem := check_input(r, p.name, input); problem != "" {
+			p.done = true
+			p.is_error = true
+			msg := concat({"INVALID_INPUT: the tool input does not match the tool's input schema (", problem, "); call the tool again with valid input."})
 			blocks := make([]Block, 1)
 			blocks[0] = Text {
 				text = strings.clone(msg),
@@ -994,6 +1030,9 @@ finish :: proc(r: ^Run, status: agent.Turn_Status, out: ^Output) {
 	}
 	clear_steer(r)
 	clear_pending(r)
+	if status == .Done && r.cfg.keepalive.enabled && r.cfg.spec.keepalive && r.steps > 0 {
+		emit(out, Keepalive_Due{at = keepalive_next(&r.cfg, r.last_call), until = r.last_call + keepalive_window(&r.cfg) * 1_000_000})
+	}
 	emit(out, agent.Turn_Finished{status = status})
 	settle(r)
 }
@@ -1106,4 +1145,160 @@ blocks_text :: proc(bs: []Block, allocator: runtime.Allocator) -> string {
 		}
 	}
 	return string(b[:])
+}
+
+@(private)
+srv_clear :: proc(r: ^Run, out: ^Output) {
+	if len(r.srv_id) == 0 {
+		return
+	}
+	clear(&r.srv_id)
+	r.srv_off = 0
+	emit(out, Server_Session{state = r.srv_mode})
+}
+
+@(private)
+drop_reasoning :: proc(r: ^Run, out: ^Output, reason: Drop_Reason) {
+	s := &r.stream
+	for i in 0 ..< s.used {
+		a := &s.blocks[i]
+		if a.kind == .Thinking && a.emitted && !a.kept && len(a.text) > 0 {
+			emit(out, Reasoning_Dropped{text = dup(out, string(a.text[:])), reason = reason})
+			a.emitted = false
+		}
+	}
+}
+
+@(private)
+compact_done :: proc(r: ^Run, now: i64, out: ^Output) {
+	s := &r.stream
+	summary := make([dynamic]u8, out.allocator)
+	nt := Transcript {
+		buf = make([dynamic]u8, r.allocator),
+	}
+	server := false
+	if r.srv_compact {
+		if r.model.compacted(&r.model, s, &nt, &summary) {
+			server = true
+		} else {
+			delete(nt.buf)
+			r.no_srv_comp = true
+			call(r, now, .Compact, out)
+			return
+		}
+	} else {
+		for i in 0 ..< s.used {
+			a := &s.blocks[i]
+			if a.kind == .Text && len(a.text) > 0 {
+				if len(summary) > 0 {
+					append(&summary, "\n\n")
+				}
+				append(&summary, ..a.text[:])
+			}
+		}
+		if len(summary) == 0 {
+			delete(nt.buf)
+			finish_failed(r, out, "compaction produced no summary")
+			return
+		}
+		text := concat({COMPACT_PREAMBLE, string(summary[:]), COMPACT_RESUME})
+		msg := Message {
+			role   = .User,
+			blocks = []Block{Text{text = text}},
+		}
+		r.model.encode(&r.model, &r.cfg, &msg, &nt)
+	}
+	emit(out, Compacted{summary = string(summary[:]), items = r.t.items, server = server})
+	delete(r.t.buf)
+	r.t = nt
+	commit(r, 0, 0, true, out)
+	r.t.prev_mark = r.t.mark
+	r.t.prev_pos = r.t.positions
+	r.last_ctx = 0
+	r.last_text = 0
+	r.last_media = 0
+	r.compacted = true
+	srv_clear(r, out)
+	call(r, now, .Normal, out)
+}
+
+@(private)
+load_context :: proc(r: ^Run, ctx: ^Context) {
+	context.allocator = r.allocator
+	drop_context(r)
+	r.ctx.system = strings.clone(ctx.system)
+	tools := make([]Tool_Def, len(ctx.tools))
+	for t, i in ctx.tools {
+		tools[i] = Tool_Def {
+			name        = strings.clone(t.name),
+			description = strings.clone(t.description),
+			schema      = strings.clone(t.schema),
+			strict      = t.strict,
+			eager       = t.eager,
+		}
+	}
+	r.ctx.tools = tools
+	clear(&r.t.buf)
+	r.t = Transcript {
+		buf = r.t.buf,
+	}
+	r.srv_mode = r.cfg.stateless ? .None : r.cfg.spec.server_state
+	if r.model.api == .OpenAI_Chat || (r.srv_mode == .Thread && r.model.api != .Anthropic) || (r.srv_mode == .Response && r.model.api != .OpenAI_Responses) {
+		r.srv_mode = .None
+	}
+	clear(&r.srv_id)
+	r.srv_off = 0
+	r.srv_replay = false
+	r.no_srv_comp = false
+	resume := r.srv_mode != .None && ctx.server_id != "" && ctx.server_after >= 0 && ctx.server_after <= len(ctx.messages)
+	for &m, i in ctx.messages {
+		if resume && i == ctx.server_after {
+			r.srv_off = len(r.t.buf)
+		}
+		r.model.encode(&r.model, &r.cfg, &m, &r.t)
+	}
+	if resume {
+		if ctx.server_after == len(ctx.messages) {
+			r.srv_off = len(r.t.buf)
+		}
+		append(&r.srv_id, ctx.server_id)
+	}
+}
+
+@(private)
+check_input :: proc(r: ^Run, name: string, input: []u8) -> string {
+	def: ^Tool_Def
+	for &t in r.ctx.tools {
+		if t.name == name {
+			def = &t
+			break
+		}
+	}
+	if def == nil || def.strict || def.schema == "" {
+		return ""
+	}
+	if !r.schema_on {
+		if jsonschema.registry_init(&r.schemas) != .None {
+			return ""
+		}
+		r.compiled = make(map[string]jsonschema.Schema, r.allocator)
+		r.schema_on = true
+	}
+	sch, ok := r.compiled[def.name]
+	if !ok {
+		compiled, err := jsonschema.compile(&r.schemas, transmute([]u8)def.schema)
+		if err != .None {
+			return ""
+		}
+		r.compiled[def.name] = compiled
+		sch = compiled
+	}
+	msg := make([dynamic]u8, context.temp_allocator)
+	if jsonschema.validate(sch, input, &msg) {
+		return ""
+	}
+	if len(msg) == 0 {
+		return "validation failed"
+	}
+	return string(msg[:])
 }

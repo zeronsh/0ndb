@@ -70,9 +70,11 @@ Tool_Def :: struct {
 }
 
 Context :: struct {
-	system:   string,
-	tools:    []Tool_Def,
-	messages: []Message,
+	system:       string,
+	tools:        []Tool_Def,
+	messages:     []Message,
+	server_id:    string,
+	server_after: int,
 }
 
 Thinking_Display :: enum u8 {
@@ -88,6 +90,12 @@ Budget :: struct {
 	wall_ms:  i64,
 }
 
+Keepalive :: struct {
+	enabled:   bool,
+	window_ms: i64,
+	margin_ms: i64,
+}
+
 Retry :: struct {
 	attempts:    int,
 	base_ms:     i64,
@@ -101,7 +109,7 @@ Config :: struct {
 	url:              string,
 	api_key:          string,
 	bearer:           bool,
-	headers:          []string,
+	headers:          []Header,
 	max_tokens:       u64,
 	effort:           Effort,
 	display:          Thinking_Display,
@@ -116,6 +124,9 @@ Config :: struct {
 	compact_tokens:   u64,
 	connect_ms:       i64,
 	stall_ms:         i64,
+	stateless:        bool,
+	client_compact:   bool,
+	keepalive:        Keepalive,
 }
 
 Stop_Reason :: enum u8 {
@@ -127,6 +138,7 @@ Stop_Reason :: enum u8 {
 	Pause_Turn,
 	Refusal,
 	Context_Exceeded,
+	Compaction,
 	Other,
 }
 
@@ -197,6 +209,8 @@ Acc :: struct {
 	kind:     Block_Kind,
 	index:    int,
 	complete: bool,
+	kept:     bool,
+	emitted:  bool,
 	id:       [dynamic]u8,
 	name:     [dynamic]u8,
 	type:     [dynamic]u8,
@@ -220,6 +234,7 @@ Stream :: struct {
 	failure:  Failure,
 	fail_msg: [dynamic]u8,
 	chat_open: int,
+	fell_back: bool,
 }
 
 Transcript :: struct {
@@ -234,24 +249,51 @@ Transcript :: struct {
 	media_tok:  u64,
 	last_role:  Role,
 	has_last:   bool,
+	compaction: bool,
 }
 
 Request_Kind :: enum u8 {
 	Normal,
 	Compact,
+	Keepalive,
+}
+
+Server_Op :: enum u8 {
+	None,
+	Create,
+	Continue,
+}
+
+Request_Opts :: struct {
+	kind:           Request_Kind,
+	op:             Server_Op,
+	prev:           string,
+	server_compact: bool,
+	compaction:     bool,
 }
 
 Model :: struct {
 	data:       rawptr,
 	api:        Api,
 	encode:     proc(m: ^Model, cfg: ^Config, msg: ^Message, t: ^Transcript),
-	head:       proc(m: ^Model, cfg: ^Config, ctx: ^Context, kind: Request_Kind, dst: ^[dynamic]u8),
+	head:       proc(m: ^Model, cfg: ^Config, ctx: ^Context, opts: ^Request_Opts, dst: ^[dynamic]u8),
 	tail:       proc(m: ^Model, cfg: ^Config, kind: Request_Kind, dst: ^[dynamic]u8),
 	parse:      proc(m: ^Model, s: ^Stream, chunk: []u8, out: ^[dynamic]Delta),
 	finish:     proc(m: ^Model, s: ^Stream, t: ^Transcript, partial: bool) -> bool,
 	classify:   proc(m: ^Model, status: int, headers: []Header, body: []u8) -> Failure,
 	marker:     proc(m: ^Model, cfg: ^Config) -> string,
-	auth:       proc(m: ^Model, cfg: ^Config, dst: ^[dynamic]string),
+	auth:       proc(m: ^Model, cfg: ^Config, opts: ^Request_Opts, dst: ^[dynamic]Header),
+	trigger:    proc(m: ^Model, cfg: ^Config, t: ^Transcript),
+	compacted:  proc(m: ^Model, s: ^Stream, t: ^Transcript, summary: ^[dynamic]u8) -> bool,
+	state_code: proc(m: ^Model, f: Failure) -> State_Fault,
+	warm_usage: proc(m: ^Model, body: []u8) -> Call_Usage,
+	warm_tail:  proc(t: ^Transcript, dst: ^[dynamic]u8),
+}
+
+State_Fault :: enum u8 {
+	None,
+	Replay,
+	Disable,
 }
 
 Raw :: struct {
@@ -268,6 +310,28 @@ Transcript_Item :: struct {
 Compacted :: struct {
 	summary: string,
 	items:   int,
+	server:  bool,
+}
+
+Drop_Reason :: enum u8 {
+	Stream_Failed,
+	Interrupted,
+	Not_Replayable,
+}
+
+Reasoning_Dropped :: struct {
+	text:   string,
+	reason: Drop_Reason,
+}
+
+Server_Session :: struct {
+	id:    string,
+	state: Server_State,
+}
+
+Keepalive_Due :: struct {
+	at:    i64,
+	until: i64,
 }
 
 Retrying :: struct {
@@ -308,6 +372,9 @@ Event :: union {
 	Compacted,
 	Retrying,
 	Budget_Exceeded,
+	Reasoning_Dropped,
+	Server_Session,
+	Keepalive_Due,
 }
 
 Http_Start :: struct {

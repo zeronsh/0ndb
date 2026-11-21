@@ -1,5 +1,5 @@
 #+build linux, darwin, freebsd, openbsd, netbsd
-package model
+package http
 
 import "base:runtime"
 import "core:c"
@@ -7,13 +7,13 @@ import "core:strings"
 import curl "vendor:curl"
 import "../prim"
 
-Curl_Http :: struct {
+Curl :: struct {
 	loop:      ^prim.Loop,
 	multi:     ^curl.CURLM,
 	timer:     prim.Timer,
 	ctx:       runtime.Context,
 	allocator: runtime.Allocator,
-	live:      map[Http_Id]^Curl_Transfer,
+	live:      map[Id]^Curl_Transfer,
 	pool:      [dynamic]^curl.CURL,
 	adds:      [dynamic]^Curl_Transfer,
 	kills:     [dynamic]^Curl_Transfer,
@@ -28,11 +28,13 @@ Curl_Http :: struct {
 
 @(private)
 Curl_Transfer :: struct {
-	owner:     ^Curl_Http,
-	id:        Http_Id,
+	owner:     ^Curl,
+	id:        Id,
 	easy:      ^curl.CURL,
-	sink:      Http_Sink,
+	sink:      Sink,
 	body:      [][]u8,
+	reader:    Body_Reader,
+	paused:    bool,
 	seg:       int,
 	seg_off:   int,
 	slist:     ^curl.slist,
@@ -46,7 +48,7 @@ Curl_Transfer :: struct {
 	errbuf:    [curl.ERROR_SIZE]u8,
 }
 
-curl_http_init :: proc(h: ^Curl_Http, l: ^prim.Loop, allocator := context.allocator) -> bool {
+curl_init :: proc(h: ^Curl, l: ^prim.Loop, allocator := context.allocator) -> bool {
 	h^ = {}
 	h.loop = l
 	h.allocator = allocator
@@ -62,7 +64,7 @@ curl_http_init :: proc(h: ^Curl_Http, l: ^prim.Loop, allocator := context.alloca
 	if h.multi == nil {
 		return false
 	}
-	h.live = make(map[Http_Id]^Curl_Transfer, allocator)
+	h.live = make(map[Id]^Curl_Transfer, allocator)
 	h.pool = make([dynamic]^curl.CURL, allocator)
 	h.adds = make([dynamic]^Curl_Transfer, allocator)
 	h.kills = make([dynamic]^Curl_Transfer, allocator)
@@ -75,7 +77,7 @@ curl_http_init :: proc(h: ^Curl_Http, l: ^prim.Loop, allocator := context.alloca
 	return true
 }
 
-curl_http_ca_file :: proc(h: ^Curl_Http, path: string) {
+curl_ca_file :: proc(h: ^Curl, path: string) {
 	if h.ca_file != nil {
 		delete(h.ca_file, h.allocator)
 		h.ca_file = nil
@@ -85,8 +87,8 @@ curl_http_ca_file :: proc(h: ^Curl_Http, path: string) {
 	}
 }
 
-curl_http_destroy :: proc(h: ^Curl_Http) {
-	ids := make([dynamic]Http_Id, context.temp_allocator)
+curl_destroy :: proc(h: ^Curl) {
+	ids := make([dynamic]Id, context.temp_allocator)
 	for id in h.live {
 		append(&ids, id)
 	}
@@ -114,29 +116,43 @@ curl_http_destroy :: proc(h: ^Curl_Http) {
 	h^ = {}
 }
 
-curl_http :: proc(h: ^Curl_Http) -> Http {
-	return Http{data = h, start = curl_start_proc, cancel = curl_cancel_proc}
+curl_client :: proc(h: ^Curl) -> Client {
+	return Client{data = h, start = curl_start_proc, cancel = curl_cancel_proc, resume = curl_resume_proc}
 }
 
-curl_http_active :: proc(h: ^Curl_Http) -> int {
+curl_active :: proc(h: ^Curl) -> int {
 	return len(h.live)
 }
 
-curl_http_sockets :: proc(h: ^Curl_Http) -> int {
+curl_sockets :: proc(h: ^Curl) -> int {
 	return h.sockets
 }
 
 @(private)
-curl_start_proc :: proc(data: rawptr, req: ^Http_Request, sink: Http_Sink) -> (Http_Id, Http_Error) {
-	return curl_start((^Curl_Http)(data), req, sink)
+curl_start_proc :: proc(data: rawptr, req: ^Request, sink: Sink) -> (Id, Error) {
+	return curl_start((^Curl)(data), req, sink)
 }
 
 @(private)
-curl_cancel_proc :: proc(data: rawptr, id: Http_Id) {
-	curl_cancel((^Curl_Http)(data), id)
+curl_cancel_proc :: proc(data: rawptr, id: Id) {
+	curl_cancel((^Curl)(data), id)
 }
 
-curl_start :: proc(h: ^Curl_Http, req: ^Http_Request, sink: Http_Sink) -> (Http_Id, Http_Error) {
+@(private)
+curl_resume_proc :: proc(data: rawptr, id: Id) {
+	curl_resume((^Curl)(data), id)
+}
+
+curl_resume :: proc(h: ^Curl, id: Id) {
+	t, ok := h.live[id]
+	if !ok || !t.paused || !t.added {
+		return
+	}
+	t.paused = false
+	curl.easy_pause(t.easy, curl.PAUSE_CONT)
+}
+
+curl_start :: proc(h: ^Curl, req: ^Request, sink: Sink) -> (Id, Error) {
 	context = h.ctx
 	t := new(Curl_Transfer, h.allocator)
 	if t == nil {
@@ -144,9 +160,10 @@ curl_start :: proc(h: ^Curl_Http, req: ^Http_Request, sink: Http_Sink) -> (Http_
 	}
 	h.next += 1
 	t.owner = h
-	t.id = Http_Id(h.next)
+	t.id = Id(h.next)
 	t.sink = sink
 	t.body = req.body
+	t.reader = req.reader
 	t.head_buf = make([dynamic]u8, h.allocator)
 	t.head_idx = make([dynamic][4]u32, h.allocator)
 	e: ^curl.CURL
@@ -163,7 +180,7 @@ curl_start :: proc(h: ^Curl_Http, req: ^Http_Request, sink: Http_Sink) -> (Http_
 	t.url = strings.clone_to_cstring(req.url, h.allocator)
 	sl: ^curl.slist
 	for hd in req.headers {
-		cs := strings.clone_to_cstring(hd, context.temp_allocator)
+		cs := strings.clone_to_cstring(strings.concatenate({hd.name, ": ", hd.value}, context.temp_allocator), context.temp_allocator)
 		nl := curl.slist_append(sl, cs)
 		if nl == nil {
 			curl.slist_free_all(sl)
@@ -172,7 +189,8 @@ curl_start :: proc(h: ^Curl_Http, req: ^Http_Request, sink: Http_Sink) -> (Http_
 		}
 		sl = nl
 	}
-	if len(req.body) > 0 || req.method == "POST" {
+	has_body := len(req.body) > 0 || req.reader.read != nil || req.method == "POST" || req.method == "PUT" || req.method == "PATCH"
+	if has_body {
 		nl := curl.slist_append(sl, "Expect:")
 		if nl != nil {
 			sl = nl
@@ -183,7 +201,21 @@ curl_start :: proc(h: ^Curl_Http, req: ^Http_Request, sink: Http_Sink) -> (Http_
 	curl.easy_setopt(e, .HTTPHEADER, sl)
 	curl.easy_setopt(e, .PRIVATE, rawptr(t))
 	curl.easy_setopt(e, .NOSIGNAL, c.long(1))
-	curl.easy_setopt(e, .HTTP_VERSION, c.long(curl.HTTP_VERSION_2TLS))
+	switch req.version {
+	case .Auto, .Http2:
+		curl.easy_setopt(e, .HTTP_VERSION, c.long(curl.HTTP_VERSION_2TLS))
+	case .Http1:
+		curl.easy_setopt(e, .HTTP_VERSION, c.long(curl.HTTP_VERSION_1_1))
+	case .Http2_Prior_Knowledge:
+		curl.easy_setopt(e, .HTTP_VERSION, c.long(curl.HTTP_VERSION_2_PRIOR_KNOWLEDGE))
+	}
+	if req.timeout_ms > 0 {
+		curl.easy_setopt(e, .TIMEOUT_MS, c.long(req.timeout_ms))
+	}
+	if req.follow {
+		curl.easy_setopt(e, .FOLLOWLOCATION, c.long(1))
+		curl.easy_setopt(e, .MAXREDIRS, c.long(10))
+	}
 	curl.easy_setopt(e, .PIPEWAIT, c.long(1))
 	curl.easy_setopt(e, .TCP_KEEPALIVE, c.long(1))
 	curl.easy_setopt(e, .TCP_KEEPIDLE, c.long(30))
@@ -209,15 +241,22 @@ curl_start :: proc(h: ^Curl_Http, req: ^Http_Request, sink: Http_Sink) -> (Http_
 		curl.easy_setopt(e, .LOW_SPEED_LIMIT, c.long(1))
 		curl.easy_setopt(e, .LOW_SPEED_TIME, c.long(max(req.stall_ms / 1000, 1)))
 	}
-	if len(req.body) > 0 || req.method == "POST" {
+	if has_body {
 		curl.easy_setopt(e, .POST, c.long(1))
 		curl.easy_setopt(e, .READFUNCTION, curl_on_read)
 		curl.easy_setopt(e, .READDATA, rawptr(t))
-		curl.easy_setopt(e, .SEEKFUNCTION, curl_on_seek)
-		curl.easy_setopt(e, .SEEKDATA, rawptr(t))
-		curl.easy_setopt(e, .POSTFIELDSIZE_LARGE, i64(body_len(req.body)))
-	} else if req.method != "" && req.method != "GET" {
+		if req.reader.read == nil {
+			curl.easy_setopt(e, .SEEKFUNCTION, curl_on_seek)
+			curl.easy_setopt(e, .SEEKDATA, rawptr(t))
+			curl.easy_setopt(e, .POSTFIELDSIZE_LARGE, i64(body_len(req.body)))
+		} else {
+			curl.easy_setopt(e, .POSTFIELDSIZE_LARGE, req.body_len > 0 ? req.body_len : i64(-1))
+		}
+	}
+	if req.method != "" && req.method != "GET" && req.method != "POST" {
 		curl.easy_setopt(e, .CUSTOMREQUEST, strings.clone_to_cstring(req.method, context.temp_allocator))
+	} else if req.method == "GET" && has_body {
+		curl.easy_setopt(e, .CUSTOMREQUEST, cstring("GET"))
 	}
 	h.live[t.id] = t
 	if h.depth > 0 {
@@ -230,7 +269,7 @@ curl_start :: proc(h: ^Curl_Http, req: ^Http_Request, sink: Http_Sink) -> (Http_
 	return t.id, .None
 }
 
-curl_cancel :: proc(h: ^Curl_Http, id: Http_Id) {
+curl_cancel :: proc(h: ^Curl, id: Id) {
 	context = h.ctx
 	t, ok := h.live[id]
 	if !ok {
@@ -246,7 +285,7 @@ curl_cancel :: proc(h: ^Curl_Http, id: Http_Id) {
 }
 
 @(private)
-curl_add :: proc(h: ^Curl_Http, t: ^Curl_Transfer) -> bool {
+curl_add :: proc(h: ^Curl, t: ^Curl_Transfer) -> bool {
 	if curl.multi_add_handle(h.multi, t.easy) != .OK {
 		return false
 	}
@@ -255,7 +294,7 @@ curl_add :: proc(h: ^Curl_Http, t: ^Curl_Transfer) -> bool {
 }
 
 @(private)
-curl_retire :: proc(h: ^Curl_Http, t: ^Curl_Transfer) {
+curl_retire :: proc(h: ^Curl, t: ^Curl_Transfer) {
 	if t.added {
 		curl.multi_remove_handle(h.multi, t.easy)
 		t.added = false
@@ -264,7 +303,7 @@ curl_retire :: proc(h: ^Curl_Http, t: ^Curl_Transfer) {
 }
 
 @(private)
-curl_free_transfer :: proc(h: ^Curl_Http, t: ^Curl_Transfer) {
+curl_free_transfer :: proc(h: ^Curl, t: ^Curl_Transfer) {
 	if t.easy != nil {
 		if len(h.pool) < h.pool_max {
 			curl.easy_reset(t.easy)
@@ -283,7 +322,7 @@ curl_free_transfer :: proc(h: ^Curl_Http, t: ^Curl_Transfer) {
 }
 
 @(private)
-curl_flush :: proc(h: ^Curl_Http) {
+curl_flush :: proc(h: ^Curl) {
 	for len(h.kills) > 0 || len(h.adds) > 0 {
 		for len(h.kills) > 0 {
 			t := pop(&h.kills)
@@ -315,7 +354,7 @@ curl_flush :: proc(h: ^Curl_Http) {
 }
 
 @(private)
-curl_drive :: proc(h: ^Curl_Http, fd: curl.socket_t, flags: c.int) {
+curl_drive :: proc(h: ^Curl, fd: curl.socket_t, flags: c.int) {
 	running: c.int
 	h.depth += 1
 	curl.multi_socket_action(h.multi, fd, flags, &running)
@@ -325,7 +364,7 @@ curl_drive :: proc(h: ^Curl_Http, fd: curl.socket_t, flags: c.int) {
 }
 
 @(private)
-curl_reap :: proc(h: ^Curl_Http) {
+curl_reap :: proc(h: ^Curl) {
 	for {
 		left: c.int
 		msg := curl.multi_info_read(h.multi, &left)
@@ -363,7 +402,7 @@ curl_reap :: proc(h: ^Curl_Http) {
 }
 
 @(private)
-curl_error :: proc(t: ^Curl_Transfer, r: curl.code) -> (Http_Error, string) {
+curl_error :: proc(t: ^Curl_Transfer, r: curl.code) -> (Error, string) {
 	msg := string(cstring(&t.errbuf[0]))
 	if msg == "" && r != .E_OK {
 		msg = string(curl.easy_strerror(r))
@@ -388,7 +427,14 @@ curl_error :: proc(t: ^Curl_Transfer, r: curl.code) -> (Http_Error, string) {
 		return .Protocol, msg
 	case .E_OUT_OF_MEMORY:
 		return .No_Memory, msg
-	case .E_WRITE_ERROR, .E_ABORTED_BY_CALLBACK:
+	case .E_READ_ERROR, .E_ABORTED_BY_CALLBACK:
+		if t.reader.read != nil {
+			return .Body, msg
+		}
+		return .Cancelled, msg
+	case .E_UNSUPPORTED_PROTOCOL, .E_URL_MALFORMAT:
+		return .Unsupported, msg
+	case .E_WRITE_ERROR:
 		return .Cancelled, msg
 	}
 	return .Other, msg
@@ -505,6 +551,28 @@ curl_on_read :: proc "c" (buffer: [^]u8, size: c.size_t, nitems: c.size_t, userd
 		return curl.READFUNC_ABORT
 	}
 	room := int(size * nitems)
+	if t.reader.read != nil {
+		context = t.owner.ctx
+		n, st := t.reader.read(t.reader.data, t.id, buffer[:room])
+		switch st {
+		case .Data:
+			if n == 0 {
+				t.paused = true
+				return curl.READFUNC_PAUSE
+			}
+			return c.size_t(min(n, room))
+		case .Wait:
+			if n > 0 {
+				return c.size_t(min(n, room))
+			}
+			t.paused = true
+			return curl.READFUNC_PAUSE
+		case .End:
+			return c.size_t(min(n, room))
+		case .Fail:
+			return curl.READFUNC_ABORT
+		}
+	}
 	w := 0
 	for w < room && t.seg < len(t.body) {
 		src := t.body[t.seg][t.seg_off:]
@@ -545,7 +613,7 @@ curl_on_seek :: proc "c" (userdata: rawptr, offset: curl.off_t, origin: c.int) -
 
 @(private)
 curl_on_socket :: proc "c" (easy: ^curl.CURL, s: curl.socket_t, what: c.int, userp: rawptr, socketp: rawptr) -> c.int {
-	h := (^Curl_Http)(userp)
+	h := (^Curl)(userp)
 	context = h.ctx
 	w := prim.Watch(uintptr(socketp))
 	if what == curl.POLL_REMOVE {
@@ -578,7 +646,7 @@ curl_on_socket :: proc "c" (easy: ^curl.CURL, s: curl.socket_t, what: c.int, use
 
 @(private)
 curl_on_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
-	h := (^Curl_Http)(data)
+	h := (^Curl)(data)
 	flags: c.int
 	if .Read in events || .Hangup in events {
 		flags |= curl.CSELECT_IN
@@ -594,7 +662,7 @@ curl_on_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: raw
 
 @(private)
 curl_on_timer :: proc "c" (multi: ^curl.CURLM, timeout_ms: c.long, userp: rawptr) -> c.int {
-	h := (^Curl_Http)(userp)
+	h := (^Curl)(userp)
 	context = h.ctx
 	if h.timer != 0 {
 		prim.timer_cancel(h.loop, h.timer)
@@ -608,7 +676,7 @@ curl_on_timer :: proc "c" (multi: ^curl.CURLM, timeout_ms: c.long, userp: rawptr
 
 @(private)
 curl_on_tick :: proc(l: ^prim.Loop, data: rawptr) {
-	h := (^Curl_Http)(data)
+	h := (^Curl)(data)
 	h.timer = 0
 	curl_drive(h, curl.SOCKET_TIMEOUT, 0)
 }

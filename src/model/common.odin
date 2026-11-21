@@ -30,6 +30,7 @@ stream_reset :: proc(s: ^Stream) {
 	s.started = false
 	s.failure = {}
 	s.chat_open = 0
+	s.fell_back = false
 }
 
 stream_trim :: proc(s: ^Stream, keep: int) {
@@ -81,6 +82,8 @@ acc_clear :: proc(a: ^Acc) {
 	clear(&a.sig)
 	clear(&a.raw)
 	a.complete = false
+	a.kept = false
+	a.emitted = false
 	a.kind = .Other
 	a.index = 0
 }
