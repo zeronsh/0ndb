@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const id = @import("id.zig");
-const codec = @import("../store/codec.zig");
+const codec = @import("codec.zig");
 
 pub const INLINE_CAP: usize = 4;
 pub const MAX_VERSION_ENTRIES: usize = 65536;
