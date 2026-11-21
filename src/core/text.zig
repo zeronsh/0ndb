@@ -272,18 +272,65 @@ pub const Fragment = struct {
 pub const LEAF_CAP: usize = 48;
 pub const BRANCH_CAP: usize = 32;
 
-const NodeKind = enum(u8) {
+pub const DiskNodeRef = struct {
+    id: u31,
+    is_delta: bool = false,
+
+    pub const NONE_RAW: u32 = 0xFFFF_FFFF;
+
+    pub inline fn toRaw(self: DiskNodeRef) u32 {
+        return @as(u32, self.id) | (if (self.is_delta) @as(u32, 0x8000_0000) else @as(u32, 0));
+    }
+
+    pub inline fn fromRaw(raw: u32) ?DiskNodeRef {
+        if (raw == NONE_RAW) return null;
+        return .{
+            .id = @truncate(raw & 0x7FFF_FFFF),
+            .is_delta = (raw & 0x8000_0000) != 0,
+        };
+    }
+
+    pub inline fn eql(self: DiskNodeRef, other: DiskNodeRef) bool {
+        return self.id == other.id and self.is_delta == other.is_delta;
+    }
+};
+
+pub const NodeSource = struct {
+    ptr: *const anyopaque,
+    loadNodeFn: *const fn (ptr: *const anyopaque, allocator: Allocator, ref: DiskNodeRef) Allocator.Error!?*Node,
+    widthInDiskFn: *const fn (ptr: *const anyopaque, ref: DiskNodeRef, view: View) u64,
+    countLinesDiskFn: *const fn (ptr: *const anyopaque, ref: DiskNodeRef, resolver: ContentResolver, nl: *usize, last_nl: *bool) void,
+
+    pub fn loadNode(self: NodeSource, allocator: Allocator, ref: DiskNodeRef) Allocator.Error!?*Node {
+        return self.loadNodeFn(self.ptr, allocator, ref);
+    }
+
+    pub fn widthInDisk(self: NodeSource, ref: DiskNodeRef, view: View) u64 {
+        return self.widthInDiskFn(self.ptr, ref, view);
+    }
+
+    pub fn countLinesDisk(self: NodeSource, ref: DiskNodeRef, resolver: ContentResolver, nl: *usize, last_nl: *bool) void {
+        self.countLinesDiskFn(self.ptr, ref, resolver, nl, last_nl);
+    }
+};
+
+pub const ChildSlot = union(enum) {
+    resident: *Node,
+    disk: DiskNodeRef,
+};
+
+pub const NodeKind = enum(u8) {
     leaf,
     branch,
 };
 
-const BranchData = struct {
+pub const BranchData = struct {
     summaries: [BRANCH_CAP]FragSummary,
     counts: [BRANCH_CAP]usize,
-    children: [BRANCH_CAP]*Node,
+    children: [BRANCH_CAP]ChildSlot,
 };
 
-const NodeData = union {
+pub const NodeData = union {
     leaf: []Fragment,
     branch: *BranchData,
 };
@@ -296,15 +343,22 @@ fn leafCapFor(n: usize) usize {
     return LEAF_CAP;
 }
 
-const Node = struct {
+const BranchEntry = struct {
+    slot: ChildSlot,
+    summary: FragSummary,
+    count: usize,
+};
+
+pub const Node = struct {
     refcount: std.atomic.Value(u32),
     kind: NodeKind,
     len: u8,
+    persisted: ?DiskNodeRef,
     summary: FragSummary,
     item_count: usize,
     data: NodeData,
 
-    fn createLeaf(allocator: Allocator, items: []const Fragment) Allocator.Error!*Node {
+    pub fn createLeaf(allocator: Allocator, items: []const Fragment) Allocator.Error!*Node {
         const n = try allocator.create(Node);
         errdefer allocator.destroy(n);
         const cap = leafCapFor(items.len);
@@ -312,6 +366,7 @@ const Node = struct {
         n.refcount = std.atomic.Value(u32).init(1);
         n.kind = .leaf;
         n.len = @intCast(items.len);
+        n.persisted = null;
         n.item_count = items.len;
         n.summary = .{};
         n.data = .{ .leaf = buf };
@@ -322,18 +377,19 @@ const Node = struct {
         return n;
     }
 
-    fn createBranch(allocator: Allocator, children: []const *Node) Allocator.Error!*Node {
+    pub fn createBranch(allocator: Allocator, children: []const *Node) Allocator.Error!*Node {
         const n = try allocator.create(Node);
         errdefer allocator.destroy(n);
         const bd = try allocator.create(BranchData);
         n.refcount = std.atomic.Value(u32).init(1);
         n.kind = .branch;
         n.len = @intCast(children.len);
+        n.persisted = null;
         n.item_count = 0;
         n.summary = .{};
         n.data = .{ .branch = bd };
         for (children, 0..) |c, i| {
-            n.data.branch.children[i] = c;
+            n.data.branch.children[i] = .{ .resident = c };
             n.data.branch.summaries[i] = c.summary;
             n.data.branch.counts[i] = c.item_count;
             n.summary.add(c.summary);
@@ -342,12 +398,50 @@ const Node = struct {
         return n;
     }
 
-    inline fn retain(self: *Node) *Node {
+    pub fn createBranchFromSlots(
+        allocator: Allocator,
+        slots: []const ChildSlot,
+        summaries: []const FragSummary,
+        counts: []const usize,
+    ) Allocator.Error!*Node {
+        const n = try allocator.create(Node);
+        errdefer allocator.destroy(n);
+        const bd = try allocator.create(BranchData);
+        n.refcount = std.atomic.Value(u32).init(1);
+        n.kind = .branch;
+        n.len = @intCast(slots.len);
+        n.persisted = null;
+        n.item_count = 0;
+        n.summary = .{};
+        n.data = .{ .branch = bd };
+        for (slots, 0..) |slot, i| {
+            n.data.branch.children[i] = slot;
+            n.data.branch.summaries[i] = summaries[i];
+            n.data.branch.counts[i] = counts[i];
+            n.summary.add(summaries[i]);
+            n.item_count += counts[i];
+        }
+        return n;
+    }
+
+    fn createBranchFromEntries(allocator: Allocator, entries: []const BranchEntry) Allocator.Error!*Node {
+        var slots: [BRANCH_CAP]ChildSlot = undefined;
+        var sums: [BRANCH_CAP]FragSummary = undefined;
+        var cnts: [BRANCH_CAP]usize = undefined;
+        for (entries, 0..) |e, i| {
+            slots[i] = e.slot;
+            sums[i] = e.summary;
+            cnts[i] = e.count;
+        }
+        return createBranchFromSlots(allocator, slots[0..entries.len], sums[0..entries.len], cnts[0..entries.len]);
+    }
+
+    pub inline fn retain(self: *Node) *Node {
         _ = self.refcount.fetchAdd(1, .monotonic);
         return self;
     }
 
-    fn release(self: *Node, allocator: Allocator) void {
+    pub fn release(self: *Node, allocator: Allocator) void {
         if (self.refcount.fetchSub(1, .acq_rel) == 1) {
             switch (self.kind) {
                 .leaf => {
@@ -357,8 +451,11 @@ const Node = struct {
                     allocator.free(self.data.leaf);
                 },
                 .branch => {
-                    for (self.data.branch.children[0..self.len]) |c| {
-                        c.release(allocator);
+                    for (self.data.branch.children[0..self.len]) |slot| {
+                        switch (slot) {
+                            .resident => |c| c.release(allocator),
+                            .disk => {},
+                        }
                     }
                     allocator.destroy(self.data.branch);
                 },
@@ -367,8 +464,11 @@ const Node = struct {
         }
     }
 
-    fn makeUnique(self: *Node, allocator: Allocator) Allocator.Error!*Node {
-        if (self.refcount.load(.acquire) == 1) return self;
+    pub fn makeUnique(self: *Node, allocator: Allocator) Allocator.Error!*Node {
+        if (self.refcount.load(.acquire) == 1) {
+            self.persisted = null;
+            return self;
+        }
         const copy = switch (self.kind) {
             .leaf => blk: {
                 var items: [LEAF_CAP]Fragment = undefined;
@@ -383,21 +483,49 @@ const Node = struct {
                 break :blk try Node.createLeaf(allocator, items[0..built]);
             },
             .branch => blk: {
-                var children: [BRANCH_CAP]*Node = undefined;
-                for (self.data.branch.children[0..self.len], 0..) |c, i| {
-                    children[i] = c.retain();
+                var slots: [BRANCH_CAP]ChildSlot = undefined;
+                for (self.data.branch.children[0..self.len], 0..) |slot, i| {
+                    slots[i] = switch (slot) {
+                        .resident => |c| .{ .resident = c.retain() },
+                        .disk => |ref| .{ .disk = ref },
+                    };
                 }
                 errdefer {
-                    for (children[0..self.len]) |c| c.release(allocator);
+                    for (slots[0..self.len]) |slot| {
+                        switch (slot) {
+                            .resident => |c| c.release(allocator),
+                            .disk => {},
+                        }
+                    }
                 }
-                break :blk try Node.createBranch(allocator, children[0..self.len]);
+                break :blk try Node.createBranchFromSlots(
+                    allocator,
+                    slots[0..self.len],
+                    self.data.branch.summaries[0..self.len],
+                    self.data.branch.counts[0..self.len],
+                );
             },
         };
         self.release(allocator);
         return copy;
     }
 
+    pub fn ensureChild(self: *Node, idx: usize, allocator: Allocator, source: ?NodeSource) Allocator.Error!?*Node {
+        switch (self.data.branch.children[idx]) {
+            .resident => |c| return c,
+            .disk => |ref| {
+                const src = source orelse return null;
+                const loaded = (try src.loadNode(allocator, ref)) orelse return null;
+                self.data.branch.children[idx] = .{ .resident = loaded };
+                self.data.branch.summaries[idx] = loaded.summary;
+                self.data.branch.counts[idx] = loaded.item_count;
+                return loaded;
+            },
+        }
+    }
+
     fn recomputeLeaf(self: *Node) void {
+        self.persisted = null;
         self.summary = .{};
         self.item_count = self.len;
         for (self.data.leaf[0..self.len]) |*f| {
@@ -406,18 +534,23 @@ const Node = struct {
     }
 
     fn recomputeBranch(self: *Node) void {
+        self.persisted = null;
         self.summary = .{};
         self.item_count = 0;
         for (0..self.len) |i| {
-            const c = self.data.branch.children[i];
-            self.data.branch.summaries[i] = c.summary;
-            self.data.branch.counts[i] = c.item_count;
-            self.summary.add(c.summary);
-            self.item_count += c.item_count;
+            switch (self.data.branch.children[i]) {
+                .resident => |c| {
+                    self.data.branch.summaries[i] = c.summary;
+                    self.data.branch.counts[i] = c.item_count;
+                },
+                .disk => {},
+            }
+            self.summary.add(self.data.branch.summaries[i]);
+            self.item_count += self.data.branch.counts[i];
         }
     }
 
-    fn widthIn(self: *const Node, view: View) u64 {
+    fn widthIn(self: *const Node, view: View, source: ?NodeSource) u64 {
         if (self.summary.max_ts < view.min_unobserved) return self.summary.visible;
         var sum: u64 = 0;
         switch (self.kind) {
@@ -427,11 +560,18 @@ const Node = struct {
                 }
             },
             .branch => {
-                for (self.data.branch.children[0..self.len], self.data.branch.summaries[0..self.len]) |c, s| {
+                for (self.data.branch.children[0..self.len], self.data.branch.summaries[0..self.len]) |slot, s| {
                     if (s.max_ts < view.min_unobserved) {
                         sum += s.visible;
                     } else {
-                        sum += c.widthIn(view);
+                        switch (slot) {
+                            .resident => |c| sum += c.widthIn(view, source),
+                            .disk => |ref| {
+                                if (source) |src| {
+                                    sum += src.widthInDisk(ref, view);
+                                }
+                            },
+                        }
                     }
                 }
             },
@@ -506,22 +646,38 @@ fn writeLeafAndSplit(allocator: Allocator, node: *Node, buf: []const Fragment) A
     return right;
 }
 
+fn branchEntryAt(node: *const Node, idx: usize) BranchEntry {
+    const slot = node.data.branch.children[idx];
+    return switch (slot) {
+        .resident => |c| .{ .slot = slot, .summary = c.summary, .count = c.item_count },
+        .disk => .{ .slot = slot, .summary = node.data.branch.summaries[idx], .count = node.data.branch.counts[idx] },
+    };
+}
+
 fn insertChildInBranch(allocator: Allocator, node: *Node, at: usize, child: *Node) Allocator.Error!?*Node {
-    var tmp: [BRANCH_CAP + 1]*Node = undefined;
+    var tmp: [BRANCH_CAP + 1]BranchEntry = undefined;
     const old_len: usize = node.len;
-    for (0..at) |i| tmp[i] = node.data.branch.children[i];
-    tmp[at] = child;
-    for (at..old_len) |i| tmp[i + 1] = node.data.branch.children[i];
+    for (0..at) |i| tmp[i] = branchEntryAt(node, i);
+    tmp[at] = .{ .slot = .{ .resident = child }, .summary = child.summary, .count = child.item_count };
+    for (at..old_len) |i| tmp[i + 1] = branchEntryAt(node, i);
     const new_len = old_len + 1;
     if (new_len <= BRANCH_CAP) {
-        for (0..new_len) |i| node.data.branch.children[i] = tmp[i];
+        for (0..new_len) |i| {
+            node.data.branch.children[i] = tmp[i].slot;
+            node.data.branch.summaries[i] = tmp[i].summary;
+            node.data.branch.counts[i] = tmp[i].count;
+        }
         node.len = @intCast(new_len);
         node.recomputeBranch();
         return null;
     }
     const mid = new_len / 2;
-    const right = try Node.createBranch(allocator, tmp[mid..new_len]);
-    for (0..mid) |i| node.data.branch.children[i] = tmp[i];
+    const right = try Node.createBranchFromEntries(allocator, tmp[mid..new_len]);
+    for (0..mid) |i| {
+        node.data.branch.children[i] = tmp[i].slot;
+        node.data.branch.summaries[i] = tmp[i].summary;
+        node.data.branch.counts[i] = tmp[i].count;
+    }
     node.len = @intCast(mid);
     node.recomputeBranch();
     return right;
@@ -533,6 +689,7 @@ fn nodeInsertFast(
     pos: u64,
     frag: Fragment,
     resolver: ?ContentResolver,
+    source: ?NodeSource,
 ) Allocator.Error!?*Node {
     node_slot.* = try node_slot.*.makeUnique(allocator);
     const node = node_slot.*;
@@ -648,7 +805,8 @@ fn nodeInsertFast(
                 }
                 acc += w;
             }
-            const split_right = try nodeInsertFast(allocator, &node.data.branch.children[target_idx], local_pos, frag, resolver);
+            _ = (try node.ensureChild(target_idx, allocator, source)) orelse return null;
+            const split_right = try nodeInsertFast(allocator, &node.data.branch.children[target_idx].resident, local_pos, frag, resolver, source);
             if (split_right) |r| {
                 errdefer r.release(allocator);
                 return try insertChildInBranch(allocator, node, target_idx + 1, r);
@@ -666,6 +824,7 @@ fn nodeDeleteFast(
     rem: *u64,
     op: id.OpId,
     resolver: ?ContentResolver,
+    source: ?NodeSource,
 ) Allocator.Error!?*Node {
     if (rem.* == 0) return null;
     node_slot.* = try node_slot.*.makeUnique(allocator);
@@ -772,7 +931,7 @@ fn nodeDeleteFast(
         .branch => {
             var acc: u64 = 0;
             var i: usize = 0;
-            var extra_splits: [BRANCH_CAP * 2]*Node = undefined;
+            var extra_splits: [BRANCH_CAP * 2]BranchEntry = undefined;
             var new_count: usize = 0;
             var extra_only: [BRANCH_CAP]*Node = undefined;
             var extra_only_len: usize = 0;
@@ -784,30 +943,44 @@ fn nodeDeleteFast(
                 const w = node.data.branch.summaries[i].visible;
                 if (rem.* > 0 and w > 0 and acc + w > pos) {
                     const local_pos = if (pos > acc) pos - acc else 0;
-                    const split_r = try nodeDeleteFast(allocator, &node.data.branch.children[i], local_pos, rem, op, resolver);
-                    extra_splits[new_count] = node.data.branch.children[i];
+                    _ = (try node.ensureChild(i, allocator, source)) orelse {
+                        extra_splits[new_count] = branchEntryAt(node, i);
+                        new_count += 1;
+                        acc += w;
+                        continue;
+                    };
+                    const split_r = try nodeDeleteFast(allocator, &node.data.branch.children[i].resident, local_pos, rem, op, resolver, source);
+                    extra_splits[new_count] = branchEntryAt(node, i);
                     new_count += 1;
                     if (split_r) |r| {
-                        extra_splits[new_count] = r;
+                        extra_splits[new_count] = .{ .slot = .{ .resident = r }, .summary = r.summary, .count = r.item_count };
                         new_count += 1;
                         extra_only[extra_only_len] = r;
                         extra_only_len += 1;
                     }
                 } else {
-                    extra_splits[new_count] = node.data.branch.children[i];
+                    extra_splits[new_count] = branchEntryAt(node, i);
                     new_count += 1;
                 }
                 acc += w;
             }
             if (new_count <= BRANCH_CAP) {
-                for (0..new_count) |k| node.data.branch.children[k] = extra_splits[k];
+                for (0..new_count) |k| {
+                    node.data.branch.children[k] = extra_splits[k].slot;
+                    node.data.branch.summaries[k] = extra_splits[k].summary;
+                    node.data.branch.counts[k] = extra_splits[k].count;
+                }
                 node.len = @intCast(new_count);
                 node.recomputeBranch();
                 return null;
             }
             const mid = new_count / 2;
-            const right = try Node.createBranch(allocator, extra_splits[mid..new_count]);
-            for (0..mid) |k| node.data.branch.children[k] = extra_splits[k];
+            const right = try Node.createBranchFromEntries(allocator, extra_splits[mid..new_count]);
+            for (0..mid) |k| {
+                node.data.branch.children[k] = extra_splits[k].slot;
+                node.data.branch.summaries[k] = extra_splits[k].summary;
+                node.data.branch.counts[k] = extra_splits[k].count;
+            }
             node.len = @intCast(mid);
             node.recomputeBranch();
             return right;
@@ -826,12 +999,13 @@ fn nodeInsertInView(
     placed: *bool,
     is_rightmost: bool,
     resolver: ?ContentResolver,
+    source: ?NodeSource,
 ) Allocator.Error!?*Node {
     if (placed.*) return null;
     const peek = node_slot.*;
     switch (peek.kind) {
         .leaf => {
-            const leaf_w = peek.widthIn(view);
+            const leaf_w = peek.widthIn(view, source);
             if (!is_rightmost and acc.* + leaf_w < pos) {
                 acc.* += leaf_w;
                 return null;
@@ -951,7 +1125,10 @@ fn nodeInsertInView(
                 const cur_node = node_slot.*;
                 const child_is_last = is_rightmost and (i + 1 == cur_node.len);
                 const s = cur_node.data.branch.summaries[i];
-                const cw = if (s.max_ts < view.min_unobserved) s.visible else cur_node.data.branch.children[i].widthIn(view);
+                const cw = if (s.max_ts < view.min_unobserved) s.visible else switch (cur_node.data.branch.children[i]) {
+                    .resident => |c| c.widthIn(view, source),
+                    .disk => |ref| if (source) |src| src.widthInDisk(ref, view) else 0,
+                };
                 if (!child_is_last and acc.* + cw < pos) {
                     acc.* += cw;
                     continue;
@@ -961,9 +1138,10 @@ fn nodeInsertInView(
                     made_unique = true;
                 }
                 const node = node_slot.*;
+                _ = (try node.ensureChild(i, allocator, source)) orelse continue;
                 const split_right = try nodeInsertInView(
                     allocator,
-                    &node.data.branch.children[i],
+                    &node.data.branch.children[i].resident,
                     pos,
                     frag,
                     op,
@@ -972,6 +1150,7 @@ fn nodeInsertInView(
                     placed,
                     child_is_last,
                     resolver,
+                    source,
                 );
                 if (split_right) |r| {
                     errdefer r.release(allocator);
@@ -997,12 +1176,13 @@ fn nodeDeleteInView(
     view: View,
     acc: *u64,
     resolver: ?ContentResolver,
+    source: ?NodeSource,
 ) Allocator.Error!?*Node {
     if (rem.* == 0) return null;
     const peek = node_slot.*;
     switch (peek.kind) {
         .leaf => {
-            const leaf_w = peek.widthIn(view);
+            const leaf_w = peek.widthIn(view, source);
             if (leaf_w == 0 or acc.* + leaf_w <= pos) {
                 acc.* += leaf_w;
                 return null;
@@ -1107,7 +1287,7 @@ fn nodeDeleteInView(
         },
         .branch => {
             var made_unique = false;
-            var extra_splits: [BRANCH_CAP * 2]*Node = undefined;
+            var extra_splits: [BRANCH_CAP * 2]BranchEntry = undefined;
             var new_count: usize = 0;
             var extra_only: [BRANCH_CAP]*Node = undefined;
             var extra_only_len: usize = 0;
@@ -1119,30 +1299,39 @@ fn nodeDeleteInView(
             while (i < node_slot.*.len) : (i += 1) {
                 const cur_node = node_slot.*;
                 const s = cur_node.data.branch.summaries[i];
-                const cw = if (s.max_ts < view.min_unobserved) s.visible else cur_node.data.branch.children[i].widthIn(view);
+                const cw = if (s.max_ts < view.min_unobserved) s.visible else switch (cur_node.data.branch.children[i]) {
+                    .resident => |c| c.widthIn(view, source),
+                    .disk => |ref| if (source) |src| src.widthInDisk(ref, view) else 0,
+                };
                 if (rem.* > 0 and cw > 0 and acc.* + cw > pos) {
                     if (!made_unique) {
                         node_slot.* = try node_slot.*.makeUnique(allocator);
                         made_unique = true;
                         for (0..i) |k| {
-                            extra_splits[k] = node_slot.*.data.branch.children[k];
+                            extra_splits[k] = branchEntryAt(node_slot.*, k);
                         }
                     }
                     const node = node_slot.*;
-                    const split_r = try nodeDeleteInView(allocator, &node.data.branch.children[i], pos, rem, op, view, acc, resolver);
-                    extra_splits[new_count] = node.data.branch.children[i];
+                    _ = (try node.ensureChild(i, allocator, source)) orelse {
+                        extra_splits[new_count] = branchEntryAt(node, i);
+                        new_count += 1;
+                        acc.* += cw;
+                        continue;
+                    };
+                    const split_r = try nodeDeleteInView(allocator, &node.data.branch.children[i].resident, pos, rem, op, view, acc, resolver, source);
+                    extra_splits[new_count] = branchEntryAt(node, i);
                     new_count += 1;
                     if (split_r) |r| {
-                        extra_splits[new_count] = r;
+                        extra_splits[new_count] = .{ .slot = .{ .resident = r }, .summary = r.summary, .count = r.item_count };
                         new_count += 1;
                         extra_only[extra_only_len] = r;
                         extra_only_len += 1;
                     }
                 } else {
                     if (made_unique) {
-                        extra_splits[new_count] = node_slot.*.data.branch.children[i];
+                        extra_splits[new_count] = branchEntryAt(node_slot.*, i);
                     } else {
-                        extra_splits[new_count] = cur_node.data.branch.children[i];
+                        extra_splits[new_count] = branchEntryAt(cur_node, i);
                     }
                     new_count += 1;
                     acc.* += cw;
@@ -1151,14 +1340,22 @@ fn nodeDeleteInView(
             if (!made_unique) return null;
             const node = node_slot.*;
             if (new_count <= BRANCH_CAP) {
-                for (0..new_count) |k| node.data.branch.children[k] = extra_splits[k];
+                for (0..new_count) |k| {
+                    node.data.branch.children[k] = extra_splits[k].slot;
+                    node.data.branch.summaries[k] = extra_splits[k].summary;
+                    node.data.branch.counts[k] = extra_splits[k].count;
+                }
                 node.len = @intCast(new_count);
                 node.recomputeBranch();
                 return null;
             }
             const mid = new_count / 2;
-            const right = try Node.createBranch(allocator, extra_splits[mid..new_count]);
-            for (0..mid) |k| node.data.branch.children[k] = extra_splits[k];
+            const right = try Node.createBranchFromEntries(allocator, extra_splits[mid..new_count]);
+            for (0..mid) |k| {
+                node.data.branch.children[k] = extra_splits[k].slot;
+                node.data.branch.summaries[k] = extra_splits[k].summary;
+                node.data.branch.counts[k] = extra_splits[k].count;
+            }
             node.len = @intCast(mid);
             node.recomputeBranch();
             return right;
@@ -1228,20 +1425,44 @@ const PendingSplice = struct {
 
 pub const Text = struct {
     root: ?*Node = null,
+    disk_root: ?DiskNodeRef = null,
+    disk_summary: FragSummary = .{},
+    disk_item_count: usize = 0,
+    node_source: ?NodeSource = null,
 
     pub fn deinit(self: *Text, allocator: Allocator) void {
         if (self.root) |r| {
             r.release(allocator);
             self.root = null;
         }
+        self.disk_root = null;
+        self.disk_summary = .{};
+        self.disk_item_count = 0;
+        self.node_source = null;
     }
 
     pub fn share(self: *const Text) Text {
-        return .{ .root = if (self.root) |r| r.retain() else null };
+        return .{
+            .root = if (self.root) |r| r.retain() else null,
+            .disk_root = self.disk_root,
+            .disk_summary = self.disk_summary,
+            .disk_item_count = self.disk_item_count,
+            .node_source = self.node_source,
+        };
     }
 
     pub fn clone(self: *const Text, _: Allocator) Allocator.Error!Text {
         return self.share();
+    }
+
+    pub fn fromDiskRoot(ref: DiskNodeRef, sum: FragSummary, item_count: usize, source: ?NodeSource) Text {
+        return .{
+            .root = null,
+            .disk_root = ref,
+            .disk_summary = sum,
+            .disk_item_count = item_count,
+            .node_source = source,
+        };
     }
 
     pub fn fromInsertion(allocator: Allocator, ins: id.OpId, part: u32, off: u64, len: u64, bytes_opt: ?[]const u8) Allocator.Error!Text {
@@ -1271,29 +1492,157 @@ pub const Text = struct {
         return .{ .root = try buildTree(allocator, &arr) };
     }
 
+    pub fn replaceWithLazyInsertion(
+        self: *Text,
+        allocator: Allocator,
+        op: id.OpId,
+        base_view: View,
+        len: u64,
+        resolver: ?ContentResolver,
+    ) (TextError || Allocator.Error)!void {
+        const vis_len = self.lenIn(base_view);
+        if (vis_len > 0) {
+            const del_sp = [_]diff.Splice{.{ .at = 0, .del = vis_len, .ins = 0 }};
+            try self.apply(allocator, op, base_view, &del_sp, "", resolver);
+        }
+        if (len == 0) return;
+        _ = try self.ensureRoot(allocator);
+        const frag = Fragment{
+            .ins = op,
+            .part = 0,
+            .newlines = 0,
+            .off = 0,
+            .len = len,
+            .ends_with_nl = false,
+            .newlines_known = false,
+        };
+        if (self.root == null) {
+            const arr = [_]Fragment{frag};
+            self.root = try Node.createLeaf(allocator, &arr);
+            return;
+        }
+        const sum = self.summary();
+        if (sum.max_ts < @min(base_view.min_unobserved, op.ts)) {
+            if (try nodeInsertFast(allocator, &(self.root.?), 0, frag, resolver, self.node_source)) |right| {
+                errdefer right.release(allocator);
+                const pair = [_]*Node{ self.root.?, right };
+                self.root = try Node.createBranch(allocator, &pair);
+            }
+            return;
+        }
+        const WithoutCtx = struct {
+            base: View,
+            op: id.OpId,
+            fn observes(ptr: *const anyopaque, candidate: id.OpId) bool {
+                const ctx: *const @This() = @ptrCast(@alignCast(ptr));
+                if (candidate.eql(ctx.op)) return false;
+                return ctx.base.observes(candidate);
+            }
+        };
+        const wctx = WithoutCtx{ .base = base_view, .op = op };
+        const view = View{
+            .ptr = &wctx,
+            .observesFn = WithoutCtx.observes,
+            .min_unobserved = @min(base_view.min_unobserved, op.ts),
+        };
+        var acc: u64 = 0;
+        var placed = false;
+        if (try nodeInsertInView(allocator, &(self.root.?), 0, frag, op, view, &acc, &placed, true, resolver, self.node_source)) |right| {
+            errdefer right.release(allocator);
+            const pair = [_]*Node{ self.root.?, right };
+            self.root = try Node.createBranch(allocator, &pair);
+        }
+    }
+
+    pub fn summary(self: *const Text) FragSummary {
+        if (self.root) |r| return r.summary;
+        if (self.disk_root != null) return self.disk_summary;
+        return .{};
+    }
+
     pub fn visibleLen(self: *const Text) u64 {
-        const r = self.root orelse return 0;
-        return r.summary.visible;
+        return self.summary().visible;
     }
 
     pub fn lineCount(self: *const Text) usize {
-        const r = self.root orelse return 0;
-        if (r.summary.visible == 0) return 0;
-        const nl: usize = @intCast(r.summary.visible_newlines);
-        return if (r.summary.ends_with_nl) nl else nl + 1;
+        const s = self.summary();
+        if (s.visible == 0) return 0;
+        const nl: usize = @intCast(s.visible_newlines);
+        return if (s.ends_with_nl) nl else nl + 1;
+    }
+
+    pub fn ensureRoot(self: *Text, allocator: Allocator) Allocator.Error!?*Node {
+        if (self.root) |r| return r;
+        const ref = self.disk_root orelse return null;
+        const src = self.node_source orelse return null;
+        const loaded = (try src.loadNode(allocator, ref)) orelse return null;
+        self.root = loaded;
+        self.disk_root = null;
+        return loaded;
+    }
+
+    pub fn ensureNewlines(self: *Text, allocator: Allocator, resolver: ContentResolver) Allocator.Error!void {
+        if (!self.summary().unknown_newlines) return;
+        _ = (try self.ensureRoot(allocator)) orelse return;
+        try ensureNewlinesNode(allocator, &(self.root.?), resolver, self.node_source);
+    }
+
+    fn ensureNewlinesNode(
+        allocator: Allocator,
+        node_slot: **Node,
+        resolver: ContentResolver,
+        source: ?NodeSource,
+    ) Allocator.Error!void {
+        if (!node_slot.*.summary.unknown_newlines) return;
+        node_slot.* = try node_slot.*.makeUnique(allocator);
+        const node = node_slot.*;
+        switch (node.kind) {
+            .leaf => {
+                var changed = false;
+                for (node.data.leaf[0..node.len]) |*f| {
+                    if (!f.isVisible() or f.len == 0 or f.newlines_known) continue;
+                    if (resolver.resolve(f.key())) |bytes| {
+                        const st: usize = @intCast(f.off);
+                        const en: usize = @intCast(f.off + f.len);
+                        if (en <= bytes.len) {
+                            const sl = bytes[st..en];
+                            f.newlines = countNewlinesSlice(sl);
+                            f.ends_with_nl = sl.len > 0 and sl[sl.len - 1] == '\n';
+                            f.newlines_known = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if (changed) node.recomputeLeaf();
+            },
+            .branch => {
+                for (0..node.len) |i| {
+                    if (!node.data.branch.summaries[i].unknown_newlines) continue;
+                    _ = (try node.ensureChild(i, allocator, source)) orelse continue;
+                    try ensureNewlinesNode(allocator, &node.data.branch.children[i].resident, resolver, source);
+                }
+                node.recomputeBranch();
+            },
+        }
     }
 
     pub fn countLines(self: *const Text, resolver: ContentResolver) usize {
-        const r = self.root orelse return 0;
-        if (r.summary.visible == 0) return 0;
-        if (!r.summary.unknown_newlines) return self.lineCount();
+        const s = self.summary();
+        if (s.visible == 0) return 0;
+        if (!s.unknown_newlines) return self.lineCount();
         var nl: usize = 0;
         var last_nl = false;
-        countLinesNode(r, resolver, &nl, &last_nl);
+        if (self.root) |r| {
+            countLinesNode(r, resolver, self.node_source, &nl, &last_nl);
+        } else if (self.disk_root) |ref| {
+            if (self.node_source) |src| {
+                src.countLinesDisk(ref, resolver, &nl, &last_nl);
+            }
+        }
         return if (last_nl) nl else nl + 1;
     }
 
-    fn countLinesNode(node: *const Node, resolver: ContentResolver, nl: *usize, last_nl: *bool) void {
+    fn countLinesNode(node: *const Node, resolver: ContentResolver, source: ?NodeSource, nl: *usize, last_nl: *bool) void {
         if (node.summary.visible == 0) return;
         if (!node.summary.unknown_newlines) {
             nl.* += @intCast(node.summary.visible_newlines);
@@ -1319,21 +1668,39 @@ pub const Text = struct {
                 }
             },
             .branch => {
-                for (node.data.branch.children[0..node.len]) |c| {
-                    countLinesNode(c, resolver, nl, last_nl);
+                for (node.data.branch.children[0..node.len], node.data.branch.summaries[0..node.len]) |slot, cs| {
+                    if (cs.visible == 0) continue;
+                    if (!cs.unknown_newlines) {
+                        nl.* += @intCast(cs.visible_newlines);
+                        last_nl.* = cs.ends_with_nl;
+                        continue;
+                    }
+                    switch (slot) {
+                        .resident => |c| countLinesNode(c, resolver, source, nl, last_nl),
+                        .disk => |ref| {
+                            if (source) |src| {
+                                src.countLinesDisk(ref, resolver, nl, last_nl);
+                            }
+                        },
+                    }
                 }
             },
         }
     }
 
     pub fn lenIn(self: *const Text, view: View) u64 {
-        const r = self.root orelse return 0;
-        return r.widthIn(view);
+        if (self.root) |r| return r.widthIn(view, self.node_source);
+        if (self.disk_root) |ref| {
+            if (self.disk_summary.max_ts < view.min_unobserved) return self.disk_summary.visible;
+            if (self.node_source) |src| return src.widthInDisk(ref, view);
+        }
+        return 0;
     }
 
     pub fn fragmentCount(self: *const Text) usize {
-        const r = self.root orelse return 0;
-        return r.item_count;
+        if (self.root) |r| return r.item_count;
+        if (self.disk_root != null) return self.disk_item_count;
+        return 0;
     }
 
     pub fn read(self: *const Text, allocator: Allocator, resolver: ContentResolver) Allocator.Error!?[]u8 {
@@ -1343,13 +1710,28 @@ pub const Text = struct {
     pub fn readIn(self: *const Text, allocator: Allocator, resolver: ContentResolver, view: View) Allocator.Error!?[]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
-        const r = self.root orelse return try out.toOwnedSlice(allocator);
-        if (view.min_unobserved == std.math.maxInt(u64) and r.summary.visible > 0) {
-            try out.ensureTotalCapacity(allocator, @intCast(r.summary.visible));
+        if (self.root) |r| {
+            if (view.min_unobserved == std.math.maxInt(u64) and r.summary.visible > 0) {
+                try out.ensureTotalCapacity(allocator, @intCast(r.summary.visible));
+            }
+            if (!try appendNodeBytes(allocator, r, resolver, self.node_source, view, &out)) {
+                out.deinit(allocator);
+                return null;
+            }
+            return try out.toOwnedSlice(allocator);
         }
-        if (!try appendNodeBytes(allocator, r, resolver, view, &out)) {
-            out.deinit(allocator);
-            return null;
+        if (self.disk_root) |ref| {
+            const src = self.node_source orelse return null;
+            const r = (try src.loadNode(allocator, ref)) orelse return null;
+            defer r.release(allocator);
+            if (view.min_unobserved == std.math.maxInt(u64) and r.summary.visible > 0) {
+                try out.ensureTotalCapacity(allocator, @intCast(r.summary.visible));
+            }
+            if (!try appendNodeBytes(allocator, r, resolver, self.node_source, view, &out)) {
+                out.deinit(allocator);
+                return null;
+            }
+            return try out.toOwnedSlice(allocator);
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -1363,15 +1745,28 @@ pub const Text = struct {
     ) Allocator.Error!?[]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
-        const r = self.root orelse return try out.toOwnedSlice(allocator);
-        if (max_bytes == 0 or start_byte >= r.summary.visible) return try out.toOwnedSlice(allocator);
-        const actual = @min(max_bytes, r.summary.visible - start_byte);
+        const sum = self.summary();
+        if (max_bytes == 0 or start_byte >= sum.visible) return try out.toOwnedSlice(allocator);
+        const actual = @min(max_bytes, sum.visible - start_byte);
         try out.ensureTotalCapacity(allocator, @intCast(actual));
         var pos: u64 = 0;
         var rem: u64 = actual;
-        if (!try appendByteRangeNode(allocator, r, resolver, start_byte, &pos, &rem, &out)) {
-            out.deinit(allocator);
-            return null;
+        if (self.root) |r| {
+            if (!try appendByteRangeNode(allocator, r, resolver, self.node_source, start_byte, &pos, &rem, &out)) {
+                out.deinit(allocator);
+                return null;
+            }
+            return try out.toOwnedSlice(allocator);
+        }
+        if (self.disk_root) |ref| {
+            const src = self.node_source orelse return null;
+            const r = (try src.loadNode(allocator, ref)) orelse return null;
+            defer r.release(allocator);
+            if (!try appendByteRangeNode(allocator, r, resolver, self.node_source, start_byte, &pos, &rem, &out)) {
+                out.deinit(allocator);
+                return null;
+            }
+            return try out.toOwnedSlice(allocator);
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -1380,6 +1775,7 @@ pub const Text = struct {
         allocator: Allocator,
         node: *const Node,
         resolver: ContentResolver,
+        source: ?NodeSource,
         start_byte: u64,
         pos: *u64,
         rem: *u64,
@@ -1411,9 +1807,24 @@ pub const Text = struct {
                 }
             },
             .branch => {
-                for (node.data.branch.children[0..node.len]) |c| {
+                for (node.data.branch.children[0..node.len], node.data.branch.summaries[0..node.len]) |slot, cs| {
                     if (rem.* == 0) break;
-                    if (!try appendByteRangeNode(allocator, c, resolver, start_byte, pos, rem, out)) return false;
+                    if (cs.visible == 0) continue;
+                    if (pos.* + cs.visible <= start_byte) {
+                        pos.* += cs.visible;
+                        continue;
+                    }
+                    switch (slot) {
+                        .resident => |c| {
+                            if (!try appendByteRangeNode(allocator, c, resolver, source, start_byte, pos, rem, out)) return false;
+                        },
+                        .disk => |ref| {
+                            const src = source orelse return false;
+                            const loaded = (try src.loadNode(allocator, ref)) orelse return false;
+                            defer loaded.release(allocator);
+                            if (!try appendByteRangeNode(allocator, loaded, resolver, source, start_byte, pos, rem, out)) return false;
+                        },
+                    }
                 }
             },
         }
@@ -1429,14 +1840,26 @@ pub const Text = struct {
     ) Allocator.Error!?[]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
-        const r = self.root orelse return try out.toOwnedSlice(allocator);
-        if (max_lines == 0 or r.summary.visible == 0) return try out.toOwnedSlice(allocator);
+        if (max_lines == 0 or self.summary().visible == 0) return try out.toOwnedSlice(allocator);
         var cur_line: usize = 0;
         var emitted_lines: usize = 0;
         var done = false;
-        if (!try appendLineRangeNode(allocator, r, resolver, start_line, max_lines, &cur_line, &emitted_lines, &done, &out)) {
-            out.deinit(allocator);
-            return null;
+        if (self.root) |r| {
+            if (!try appendLineRangeNode(allocator, r, resolver, self.node_source, start_line, max_lines, &cur_line, &emitted_lines, &done, &out)) {
+                out.deinit(allocator);
+                return null;
+            }
+            return try out.toOwnedSlice(allocator);
+        }
+        if (self.disk_root) |ref| {
+            const src = self.node_source orelse return null;
+            const r = (try src.loadNode(allocator, ref)) orelse return null;
+            defer r.release(allocator);
+            if (!try appendLineRangeNode(allocator, r, resolver, self.node_source, start_line, max_lines, &cur_line, &emitted_lines, &done, &out)) {
+                out.deinit(allocator);
+                return null;
+            }
+            return try out.toOwnedSlice(allocator);
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -1445,6 +1868,7 @@ pub const Text = struct {
         allocator: Allocator,
         node: *const Node,
         resolver: ContentResolver,
+        source: ?NodeSource,
         start_line: usize,
         max_lines: usize,
         cur_line: *usize,
@@ -1504,9 +1928,27 @@ pub const Text = struct {
                 }
             },
             .branch => {
-                for (node.data.branch.children[0..node.len]) |c| {
+                for (node.data.branch.children[0..node.len], node.data.branch.summaries[0..node.len]) |slot, cs| {
                     if (done.*) break;
-                    if (!try appendLineRangeNode(allocator, c, resolver, start_line, max_lines, cur_line, emitted_lines, done, out)) return false;
+                    if (cs.visible == 0) continue;
+                    if (!cs.unknown_newlines) {
+                        const sub_nl: usize = @intCast(cs.visible_newlines);
+                        if (cur_line.* + sub_nl < start_line) {
+                            cur_line.* += sub_nl;
+                            continue;
+                        }
+                    }
+                    switch (slot) {
+                        .resident => |c| {
+                            if (!try appendLineRangeNode(allocator, c, resolver, source, start_line, max_lines, cur_line, emitted_lines, done, out)) return false;
+                        },
+                        .disk => |ref| {
+                            const src = source orelse return false;
+                            const loaded = (try src.loadNode(allocator, ref)) orelse return false;
+                            defer loaded.release(allocator);
+                            if (!try appendLineRangeNode(allocator, loaded, resolver, source, start_line, max_lines, cur_line, emitted_lines, done, out)) return false;
+                        },
+                    }
                 }
             },
         }
@@ -1517,6 +1959,7 @@ pub const Text = struct {
         allocator: Allocator,
         node: *const Node,
         resolver: ContentResolver,
+        source: ?NodeSource,
         view: View,
         out: *std.ArrayList(u8),
     ) Allocator.Error!bool {
@@ -1533,8 +1976,19 @@ pub const Text = struct {
                 }
             },
             .branch => {
-                for (node.data.branch.children[0..node.len]) |c| {
-                    if (!try appendNodeBytes(allocator, c, resolver, view, out)) return false;
+                for (node.data.branch.children[0..node.len], node.data.branch.summaries[0..node.len]) |slot, cs| {
+                    if (cs.max_ts < view.min_unobserved and cs.visible == 0) continue;
+                    switch (slot) {
+                        .resident => |c| {
+                            if (!try appendNodeBytes(allocator, c, resolver, source, view, out)) return false;
+                        },
+                        .disk => |ref| {
+                            const src = source orelse return false;
+                            const loaded = (try src.loadNode(allocator, ref)) orelse return false;
+                            defer loaded.release(allocator);
+                            if (!try appendNodeBytes(allocator, loaded, resolver, source, view, out)) return false;
+                        },
+                    }
                 }
             },
         }
@@ -1548,7 +2002,14 @@ pub const Text = struct {
             out.deinit(allocator);
         }
         if (self.root) |r| {
-            try collectVisibleNode(allocator, r, view, &out);
+            try collectVisibleNode(allocator, r, self.node_source, view, &out);
+        } else if (self.disk_root) |ref| {
+            if (self.node_source) |src| {
+                if (try src.loadNode(allocator, ref)) |r| {
+                    defer r.release(allocator);
+                    try collectVisibleNode(allocator, r, self.node_source, view, &out);
+                }
+            }
         }
         return out;
     }
@@ -1556,6 +2017,7 @@ pub const Text = struct {
     fn collectVisibleNode(
         allocator: Allocator,
         node: *const Node,
+        source: ?NodeSource,
         view: View,
         out: *std.ArrayList(Fragment),
     ) Allocator.Error!void {
@@ -1569,8 +2031,19 @@ pub const Text = struct {
                 }
             },
             .branch => {
-                for (node.data.branch.children[0..node.len]) |c| {
-                    try collectVisibleNode(allocator, c, view, out);
+                for (node.data.branch.children[0..node.len], node.data.branch.summaries[0..node.len]) |slot, cs| {
+                    if (cs.max_ts < view.min_unobserved and cs.visible == 0) continue;
+                    switch (slot) {
+                        .resident => |c| try collectVisibleNode(allocator, c, source, view, out),
+                        .disk => |ref| {
+                            if (source) |src| {
+                                if (try src.loadNode(allocator, ref)) |loaded| {
+                                    defer loaded.release(allocator);
+                                    try collectVisibleNode(allocator, loaded, source, view, out);
+                                }
+                            }
+                        },
+                    }
                 }
             },
         }
@@ -1583,15 +2056,25 @@ pub const Text = struct {
         from_view: View,
         to_view: View,
     ) (DiffError || Allocator.Error)!ViewDiff {
-        const r = self.root orelse return .{};
+        const cutoff = @min(from_view.min_unobserved, to_view.min_unobserved);
+        const sum = self.summary();
+        if (sum.total == 0 or sum.max_ts < cutoff) return .{};
         var pending: std.ArrayList(PendingSplice) = .empty;
         defer {
             for (pending.items) |*p| p.text.deinit(allocator);
             pending.deinit(allocator);
         }
         var from_pos: u64 = 0;
-        const cutoff = @min(from_view.min_unobserved, to_view.min_unobserved);
-        try diffViewsNode(allocator, r, resolver, from_view, to_view, cutoff, &from_pos, &pending);
+        if (self.root) |r| {
+            try diffViewsNode(allocator, r, resolver, self.node_source, from_view, to_view, cutoff, &from_pos, &pending);
+        } else if (self.disk_root) |ref| {
+            const src = self.node_source orelse return error.MissingBlob;
+            const r = (try src.loadNode(allocator, ref)) orelse return error.MissingBlob;
+            defer r.release(allocator);
+            try diffViewsNode(allocator, r, resolver, self.node_source, from_view, to_view, cutoff, &from_pos, &pending);
+        } else {
+            return .{};
+        }
         if (pending.items.len == 0) return .{};
 
         var out = try allocator.alloc(TextSplice, pending.items.len);
@@ -1628,6 +2111,7 @@ pub const Text = struct {
         allocator: Allocator,
         node: *const Node,
         resolver: ContentResolver,
+        source: ?NodeSource,
         from_view: View,
         to_view: View,
         cutoff: u64,
@@ -1693,8 +2177,20 @@ pub const Text = struct {
                 }
             },
             .branch => {
-                for (node.data.branch.children[0..node.len]) |c| {
-                    try diffViewsNode(allocator, c, resolver, from_view, to_view, cutoff, from_pos, pending);
+                for (node.data.branch.children[0..node.len], node.data.branch.summaries[0..node.len]) |slot, cs| {
+                    if (cs.max_ts < cutoff) {
+                        from_pos.* += cs.visible;
+                        continue;
+                    }
+                    switch (slot) {
+                        .resident => |c| try diffViewsNode(allocator, c, resolver, source, from_view, to_view, cutoff, from_pos, pending),
+                        .disk => |ref| {
+                            const src = source orelse return error.MissingBlob;
+                            const loaded = (try src.loadNode(allocator, ref)) orelse return error.MissingBlob;
+                            defer loaded.release(allocator);
+                            try diffViewsNode(allocator, loaded, resolver, source, from_view, to_view, cutoff, from_pos, pending);
+                        },
+                    }
                 }
             },
         }
@@ -1722,10 +2218,11 @@ pub const Text = struct {
         inserted_bytes: []const u8,
         resolver: ?ContentResolver,
     ) Allocator.Error!void {
+        _ = try self.ensureRoot(allocator);
         if (s.ins > 0) {
             const frag = makeFragment(op, 0, s.ins, inserted_bytes);
             if (self.root != null) {
-                if (try nodeInsertFast(allocator, &(self.root.?), s.at, frag, resolver)) |right| {
+                if (try nodeInsertFast(allocator, &(self.root.?), s.at, frag, resolver, self.node_source)) |right| {
                     errdefer right.release(allocator);
                     const pair = [_]*Node{ self.root.?, right };
                     self.root = try Node.createBranch(allocator, &pair);
@@ -1738,7 +2235,7 @@ pub const Text = struct {
         if (s.del > 0) {
             if (self.root != null) {
                 var rem = s.del;
-                if (try nodeDeleteFast(allocator, &(self.root.?), s.at + s.ins, &rem, op, resolver)) |right| {
+                if (try nodeDeleteFast(allocator, &(self.root.?), s.at + s.ins, &rem, op, resolver, self.node_source)) |right| {
                     errdefer right.release(allocator);
                     const pair = [_]*Node{ self.root.?, right };
                     self.root = try Node.createBranch(allocator, &pair);
@@ -1766,12 +2263,15 @@ pub const Text = struct {
         if (used_check != inserted_bytes.len) return error.LengthMismatch;
         if (splices.len == 0) return;
 
-        const fast_eligible = splices.len == 1 and (if (self.root) |r| r.summary.max_ts < @min(base_view.min_unobserved, op.ts) else true);
+        const sum = self.summary();
+        const fast_eligible = splices.len == 1 and (sum.total == 0 or sum.max_ts < @min(base_view.min_unobserved, op.ts));
         if (fast_eligible) {
             if (floor > self.visibleLen()) return error.OutOfBounds;
             try self.applyFast(allocator, op, splices[0], inserted_bytes, resolver);
             return;
         }
+
+        _ = try self.ensureRoot(allocator);
 
         const WithoutCtx = struct {
             base: View,
@@ -1799,7 +2299,7 @@ pub const Text = struct {
                 if (self.root != null) {
                     var acc: u64 = 0;
                     var placed = false;
-                    if (try nodeInsertInView(allocator, &(self.root.?), s.at, frag, op, view, &acc, &placed, true, resolver)) |right| {
+                    if (try nodeInsertInView(allocator, &(self.root.?), s.at, frag, op, view, &acc, &placed, true, resolver, self.node_source)) |right| {
                         errdefer right.release(allocator);
                         const pair = [_]*Node{ self.root.?, right };
                         self.root = try Node.createBranch(allocator, &pair);
@@ -1814,7 +2314,7 @@ pub const Text = struct {
                 if (self.root != null) {
                     var rem = s.del;
                     var acc: u64 = 0;
-                    if (try nodeDeleteInView(allocator, &(self.root.?), s.at, &rem, op, view, &acc, resolver)) |right| {
+                    if (try nodeDeleteInView(allocator, &(self.root.?), s.at, &rem, op, view, &acc, resolver, self.node_source)) |right| {
                         errdefer right.release(allocator);
                         const pair = [_]*Node{ self.root.?, right };
                         self.root = try Node.createBranch(allocator, &pair);

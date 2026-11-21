@@ -11,6 +11,7 @@ const op_mod = @import("../core/op.zig");
 const model = @import("../session/model.zig");
 const pager = @import("../session/pager.zig");
 const ws_mod = @import("../fs/workspace.zig");
+const git_dirs_mod = @import("../fs/git_dirs.zig");
 const wire = @import("wire.zig");
 
 pub const SenderKey = struct {
@@ -202,16 +203,36 @@ const IntegrateOutcome = enum {
     waiting_blob,
 };
 
-fn opReferencedBlob(op: op_mod.Op) ?struct { oid: id.Oid, is_text_blob: bool } {
+const OpBlobRef = union(enum) {
+    blake3: struct { oid: id.Oid, is_text_blob: bool },
+    git: git_dirs_mod.GitOid,
+};
+
+fn gitBlobLookupOid(git_oid: git_dirs_mod.GitOid) [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update("0ndb-git-blob-v1:");
+    hasher.update(git_oid.slice());
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+fn opReferencedBlob(op: op_mod.Op) ?OpBlobRef {
     return switch (op) {
         .create_file => |cf| switch (cf.content) {
-            .binary => |b| .{ .oid = b.oid, .is_text_blob = false },
-            .text_blob => |b| .{ .oid = b.oid, .is_text_blob = true },
+            .binary => |b| .{ .blake3 = .{ .oid = b.oid, .is_text_blob = false } },
+            .text_blob => |b| .{ .blake3 = .{ .oid = b.oid, .is_text_blob = true } },
+            .git_text_blob => |g| .{ .git = g.oid },
+            .git_binary => |g| .{ .git = g.oid },
+            .git_lazy => |g| .{ .git = g.oid },
             .text_inline => null,
         },
         .set_content => |sc| switch (sc.content) {
-            .binary => |b| .{ .oid = b.oid, .is_text_blob = false },
-            .text_blob => |b| .{ .oid = b.oid, .is_text_blob = true },
+            .binary => |b| .{ .blake3 = .{ .oid = b.oid, .is_text_blob = false } },
+            .text_blob => |b| .{ .blake3 = .{ .oid = b.oid, .is_text_blob = true } },
+            .git_text_blob => |g| .{ .git = g.oid },
+            .git_binary => |g| .{ .git = g.oid },
+            .git_lazy => |g| .{ .git = g.oid },
             .text_inline => null,
         },
         else => null,
@@ -719,6 +740,34 @@ pub const SyncClient = struct {
         return plain;
     }
 
+    pub fn putEncryptedGitBlob(self: *SyncClient, topic: [32]u8, git_oid: git_dirs_mod.GitOid, plaintext: []const u8) !void {
+        const key_oid = gitBlobLookupOid(git_oid);
+        try self.putEncryptedBlob(topic, key_oid, plaintext);
+    }
+
+    pub fn getEncryptedGitBlob(self: *SyncClient, allocator: Allocator, topic: [32]u8, git_oid: git_dirs_mod.GitOid) !?[]u8 {
+        const key_oid = gitBlobLookupOid(git_oid);
+        const lookup_id = crypto.deriveBlobLookupId(self.master_key, topic, key_oid);
+        var req: [64]u8 = undefined;
+        @memcpy(req[0..32], &topic);
+        @memcpy(req[32..64], &lookup_id);
+        try wire.writeFrameBlocking(self.allocator, self.fd, .get_blob, 0, &req);
+
+        var resp = try self.readRpcResponse();
+        defer resp.deinit(self.allocator);
+        if (resp.op != .blob_data or resp.payload.len < 33) return error.GetBlobFailed;
+        if (resp.payload[32] == 0) return null;
+        var key = crypto.deriveTopicKey(self.master_key, topic);
+        defer crypto.zeroize(&key);
+        const aad = buildBlobAad(topic, key_oid);
+        const plain = try crypto.open(allocator, key, &aad, resp.payload[33..]);
+        errdefer allocator.free(plain);
+        const fmt: git_dirs_mod.ObjectFormat = if (git_oid.len == 32) .sha256 else .sha1;
+        const actual = git_dirs_mod.GitOid.ofBlob(fmt, plain);
+        if (!actual.eql(git_oid)) return error.HashMismatch;
+        return plain;
+    }
+
     pub fn pushSessionSummary(self: *SyncClient, vault_id: u128, summary: *const model.SessionSummary) !u64 {
         const topic = id.catalogStreamId(vault_id);
         var w = codec.Writer{};
@@ -1026,15 +1075,18 @@ pub const SyncClient = struct {
         try self.authorizeTopic(topic, wire.PERM_WRITE);
         const st = try self.getOrLoadWorkspaceState(ws);
         var pushed: usize = 0;
-        const n = ws.batch_log.count();
-        for (0..n) |i| {
-            const view = try ws.batch_log.readAt(i);
-            if (view.header.kind != ws_mod.FRAME_BATCH) continue;
-            var r = codec.Reader.init(view.payload);
+
+        var all_bids = try ws.history.dag.collectAllBatchIds(self.allocator);
+        defer all_bids.deinit(self.allocator);
+        ws.history.dag.topoSortSlice(all_bids.items);
+
+        for (all_bids.items) |bid| {
+            if (st.pushed_batches.contains(bid)) continue;
+            const raw_payload = (try ws.readBatchPayloadAlloc(self.allocator, bid)) orelse continue;
+            defer self.allocator.free(raw_payload);
+            var r = codec.Reader.init(raw_payload);
             var batch = try op_mod.Batch.decode(self.allocator, &r);
             defer batch.deinit(self.allocator);
-            const bid = batch.header.batchId();
-            if (st.pushed_batches.contains(bid)) continue;
 
             for (batch.blobs) |b| {
                 if (!st.uploaded_blobs.contains(b.oid)) {
@@ -1044,15 +1096,29 @@ pub const SyncClient = struct {
             }
             for (batch.ops) |op| {
                 if (opReferencedBlob(op)) |ref| {
-                    if (!st.uploaded_blobs.contains(ref.oid)) {
-                        if (try ws.blob_store.get(self.allocator, ref.oid)) |raw| {
-                            defer self.allocator.free(raw);
-                            try self.putEncryptedBlob(topic, ref.oid, raw);
-                            try st.uploaded_blobs.put(self.allocator, ref.oid, {});
-                        } else if (ws.history.resolveBlob(ref.oid)) |raw| {
-                            try self.putEncryptedBlob(topic, ref.oid, raw);
-                            try st.uploaded_blobs.put(self.allocator, ref.oid, {});
-                        }
+                    switch (ref) {
+                        .blake3 => |br| {
+                            if (!st.uploaded_blobs.contains(br.oid)) {
+                                if (try ws.blob_store.get(self.allocator, br.oid)) |raw| {
+                                    defer self.allocator.free(raw);
+                                    try self.putEncryptedBlob(topic, br.oid, raw);
+                                    try st.uploaded_blobs.put(self.allocator, br.oid, {});
+                                } else if (ws.history.resolveBlob(br.oid)) |raw| {
+                                    try self.putEncryptedBlob(topic, br.oid, raw);
+                                    try st.uploaded_blobs.put(self.allocator, br.oid, {});
+                                }
+                            }
+                        },
+                        .git => |git_oid| {
+                            const key_oid = gitBlobLookupOid(git_oid);
+                            if (!st.uploaded_blobs.contains(key_oid)) {
+                                if (try ws.history.readGitBlobAlloc(self.allocator, git_oid)) |raw| {
+                                    defer self.allocator.free(raw);
+                                    try self.putEncryptedGitBlob(topic, git_oid, raw);
+                                    try st.uploaded_blobs.put(self.allocator, key_oid, {});
+                                }
+                            }
+                        },
                     }
                 }
             }
@@ -1067,7 +1133,7 @@ pub const SyncClient = struct {
                 try stripped.encode(self.allocator, &w);
                 _ = try self.putEncryptedFrame(topic, w.items());
             } else {
-                _ = try self.putEncryptedFrame(topic, view.payload);
+                _ = try self.putEncryptedFrame(topic, raw_payload);
             }
             try st.pushed_batches.put(self.allocator, bid, {});
             pushed += 1;
@@ -1097,27 +1163,35 @@ pub const SyncClient = struct {
             if (!ws.blob_store.exists(b.oid)) {
                 try ws.blob_store.putVerified(b.oid, b.data);
             }
-            if (!ws.history.blobs.contains(b.oid)) {
-                try ws.history.putBlob(b.oid, b.data);
-            }
         }
         for (batch.ops) |op| {
             if (opReferencedBlob(op)) |ref| {
-                if (!ws.blob_store.exists(ref.oid)) {
-                    const raw_opt = self.getEncryptedBlob(self.allocator, topic, ref.oid) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => return .waiting_blob,
-                    };
-                    const raw = raw_opt orelse return .waiting_blob;
-                    defer self.allocator.free(raw);
-                    try ws.blob_store.putVerified(ref.oid, raw);
-                    if (ref.is_text_blob and !ws.history.blobs.contains(ref.oid)) {
-                        try ws.history.putBlob(ref.oid, raw);
-                    }
-                } else if (ref.is_text_blob and !ws.history.blobs.contains(ref.oid)) {
-                    const raw = (try ws.blob_store.get(self.allocator, ref.oid)) orelse return .waiting_blob;
-                    defer self.allocator.free(raw);
-                    try ws.history.putBlob(ref.oid, raw);
+                switch (ref) {
+                    .blake3 => |br| {
+                        if (!ws.blob_store.exists(br.oid)) {
+                            const raw_opt = self.getEncryptedBlob(self.allocator, topic, br.oid) catch |err| switch (err) {
+                                error.OutOfMemory => return err,
+                                else => return .waiting_blob,
+                            };
+                            const raw = raw_opt orelse return .waiting_blob;
+                            defer self.allocator.free(raw);
+                            try ws.blob_store.putVerified(br.oid, raw);
+                        }
+                    },
+                    .git => |git_oid| {
+                        const local = ws.history.readGitBlobAlloc(self.allocator, git_oid) catch null;
+                        if (local) |buf| {
+                            self.allocator.free(buf);
+                        } else {
+                            const raw_opt = self.getEncryptedGitBlob(self.allocator, topic, git_oid) catch |err| switch (err) {
+                                error.OutOfMemory => return err,
+                                else => return .waiting_blob,
+                            };
+                            const raw = raw_opt orelse return .waiting_blob;
+                            defer self.allocator.free(raw);
+                            try ws.blob_store.putGitFallback(git_oid.slice(), raw);
+                        }
+                    },
                 }
             }
         }

@@ -4,6 +4,8 @@ const id = @import("id.zig");
 const text_mod = @import("text.zig");
 const Text = text_mod.Text;
 const View = text_mod.View;
+const git_dirs = @import("../fs/git_dirs.zig");
+const lru = @import("../store/lru.zig");
 
 pub const FileMode = enum(u8) {
     regular = 0,
@@ -24,9 +26,20 @@ pub const BlobRef = struct {
     }
 };
 
+pub const GitBlobRef = struct {
+    oid: git_dirs.GitOid,
+    len: u64,
+
+    pub fn eql(self: GitBlobRef, other: GitBlobRef) bool {
+        return self.len == other.len and self.oid.eql(other.oid);
+    }
+};
+
 pub const ContentKind = union(enum) {
     text,
     binary: BlobRef,
+    git_binary: GitBlobRef,
+    git_lazy: GitBlobRef,
 };
 
 pub const Placement = struct {
@@ -175,6 +188,29 @@ pub const Inode = struct {
             else => null,
         };
     }
+
+    pub fn approxBytes(self: *const Inode) usize {
+        var bytes: usize = @sizeOf(Inode);
+        bytes += self.placement.entries.items.len * @sizeOf(Lww(Placement).Entry);
+        for (self.placement.entries.items) |e| bytes += e.value.name.len;
+        bytes += self.alive.entries.items.len * @sizeOf(Lww(bool).Entry);
+        switch (self.kind) {
+            .dir => {},
+            .file => |*f| {
+                bytes += f.content.entries.items.len * @sizeOf(Lww(ContentKind).Entry);
+                bytes += f.mode.entries.items.len * @sizeOf(Lww(FileMode).Entry);
+                bytes += f.line_ending.entries.items.len * @sizeOf(Lww(LineEnding).Entry);
+                if (f.text.root != null) {
+                    bytes += f.text.fragmentCount() * 64 + 128;
+                }
+            },
+            .symlink => |*s| {
+                bytes += s.entries.items.len * @sizeOf(Lww([]u8).Entry);
+                for (s.entries.items) |e| bytes += e.value.len;
+            },
+        }
+        return bytes;
+    }
 };
 
 pub const DirEntry = struct {
@@ -186,13 +222,78 @@ pub const DirEntry = struct {
     }
 };
 
+pub const DIR_NAME_FLAG_CONFLICT: u8 = 1;
+pub const DIR_NAME_FLAG_TOMBSTONE: u8 = 2;
+
+pub const DirNameLookup = struct {
+    child_id: id.InodeId,
+    kind: u8,
+    flags: u8,
+};
+
+pub const InodeSource = struct {
+    ptr: *const anyopaque,
+    loadInodeFn: *const fn (ptr: *const anyopaque, allocator: Allocator, iid: id.InodeId) Allocator.Error!?*Inode,
+    hasInodeFn: *const fn (ptr: *const anyopaque, iid: id.InodeId) bool,
+    collectDirChildrenFn: *const fn (ptr: *const anyopaque, allocator: Allocator, dir: id.InodeId, out: *std.ArrayList(id.InodeId)) Allocator.Error!void,
+    lookupDirNameFn: *const fn (ptr: *const anyopaque, parent: id.InodeId, name: []const u8) ?DirNameLookup,
+
+    pub fn loadInode(self: InodeSource, allocator: Allocator, iid: id.InodeId) Allocator.Error!?*Inode {
+        return self.loadInodeFn(self.ptr, allocator, iid);
+    }
+
+    pub fn hasInode(self: InodeSource, iid: id.InodeId) bool {
+        return self.hasInodeFn(self.ptr, iid);
+    }
+
+    pub fn collectDirChildren(self: InodeSource, allocator: Allocator, dir: id.InodeId, out: *std.ArrayList(id.InodeId)) Allocator.Error!void {
+        return self.collectDirChildrenFn(self.ptr, allocator, dir, out);
+    }
+
+    pub fn lookupDirName(self: InodeSource, parent: id.InodeId, name: []const u8) ?DirNameLookup {
+        return self.lookupDirNameFn(self.ptr, parent, name);
+    }
+};
+
+pub const DEFAULT_CLEAN_CACHE_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_CLEAN_CACHE_ENTRIES: usize = 8192;
+
+fn inodeCacheSize(val: *Inode) usize {
+    return val.approxBytes();
+}
+
+fn inodeCacheDeinit(allocator: Allocator, val: *Inode) void {
+    val.deinit(allocator);
+    allocator.destroy(val);
+}
+
+const CleanCache = lru.LruCache(id.InodeId, *Inode, inodeCacheSize, inodeCacheDeinit);
+
+const CleanCacheBox = struct {
+    allocator: Allocator,
+    cache: CleanCache,
+};
+
 pub const Tree = struct {
     inodes: std.AutoHashMapUnmanaged(id.InodeId, *Inode) = .empty,
     children: std.AutoHashMapUnmanaged(id.InodeId, std.AutoArrayHashMapUnmanaged(id.InodeId, void)) = .empty,
+    dirty_dirs: std.AutoHashMapUnmanaged(id.InodeId, void) = .empty,
+    source: ?InodeSource = null,
+    clean_cache_box: ?*CleanCacheBox = null,
 
     pub fn init(allocator: Allocator) Allocator.Error!Tree {
         var t = Tree{};
         errdefer t.deinit(allocator);
+        const box = try allocator.create(CleanCacheBox);
+        box.* = .{
+            .allocator = allocator,
+            .cache = CleanCache.init(allocator, .{
+                .budget_bytes = DEFAULT_CLEAN_CACHE_BYTES,
+                .max_entries = DEFAULT_CLEAN_CACHE_ENTRIES,
+            }),
+        };
+        t.clean_cache_box = box;
+
         const root = try allocator.create(Inode);
         errdefer {
             root.deinit(allocator);
@@ -219,18 +320,147 @@ pub const Tree = struct {
             set.deinit(allocator);
         }
         self.children.deinit(allocator);
+        self.dirty_dirs.deinit(allocator);
+        if (self.clean_cache_box) |box| {
+            box.cache.deinit();
+            allocator.destroy(box);
+            self.clean_cache_box = null;
+        }
+        self.source = null;
+    }
+
+    pub fn setSource(self: *Tree, src: ?InodeSource) void {
+        self.source = src;
+        if (self.clean_cache_box) |box| {
+            if (box.cache.pin_depth == 0) {
+                box.cache.clear();
+            }
+        }
+    }
+
+    pub fn setCleanCacheBudget(self: *Tree, budget_bytes: usize, max_entries: usize) void {
+        if (self.clean_cache_box) |box| {
+            box.cache.budget_bytes = budget_bytes;
+            box.cache.max_entries = max_entries;
+            box.cache.evictToBudget();
+        }
+    }
+
+    pub fn beginPinScope(self: *const Tree) void {
+        if (self.clean_cache_box) |box| {
+            box.cache.beginPinScope();
+        }
+    }
+
+    pub fn endPinScope(self: *const Tree) void {
+        if (self.clean_cache_box) |box| {
+            box.cache.endPinScope();
+        }
+    }
+
+    pub fn evictClean(self: *Tree) void {
+        if (self.clean_cache_box) |box| {
+            if (box.cache.pin_depth == 0) {
+                box.cache.clear();
+            }
+        }
+    }
+
+    pub fn hibernate(self: *Tree) void {
+        self.evictClean();
+    }
+
+    pub fn dirtyInodesCount(self: *const Tree) usize {
+        return self.inodes.count();
+    }
+
+    pub fn cleanCachedInodesCount(self: *const Tree) usize {
+        if (self.clean_cache_box) |box| return box.cache.count();
+        return 0;
+    }
+
+    pub fn loadedInodesCount(self: *const Tree) usize {
+        return self.dirtyInodesCount() + self.cleanCachedInodesCount();
+    }
+
+    pub fn clearDirtyAfterCheckpoint(self: *Tree, allocator: Allocator) void {
+        var it = self.inodes.valueIterator();
+        while (it.next()) |ptr| {
+            ptr.*.deinit(allocator);
+            allocator.destroy(ptr.*);
+        }
+        self.inodes.clearRetainingCapacity();
+        var cit = self.children.valueIterator();
+        while (cit.next()) |set| {
+            set.deinit(allocator);
+        }
+        self.children.clearRetainingCapacity();
+        self.dirty_dirs.clearRetainingCapacity();
+        self.evictClean();
+    }
+
+    pub fn markDirtyDir(self: *Tree, allocator: Allocator, dir: id.InodeId) Allocator.Error!void {
+        try self.dirty_dirs.put(allocator, dir, {});
+    }
+
+    pub fn markDirty(self: *Tree, allocator: Allocator, iid: id.InodeId) Allocator.Error!void {
+        if (self.getMut(iid)) |inode| {
+            for (inode.placement.entries.items) |e| {
+                try self.dirty_dirs.put(allocator, e.value.parent, {});
+            }
+        }
     }
 
     pub fn get(self: *const Tree, iid: id.InodeId) ?*const Inode {
-        return self.inodes.get(iid);
+        if (self.inodes.get(iid)) |ptr| return ptr;
+        if (self.clean_cache_box) |box| {
+            if (box.cache.get(iid)) |ptr_ptr| return ptr_ptr.*;
+            if (self.source) |src| {
+                const loaded = (src.loadInode(box.allocator, iid) catch return null) orelse return null;
+                const slot = box.cache.put(iid, loaded) catch {
+                    loaded.deinit(box.allocator);
+                    box.allocator.destroy(loaded);
+                    return null;
+                };
+                return slot.*;
+            }
+        }
+        return null;
     }
 
     pub fn getMut(self: *Tree, iid: id.InodeId) ?*Inode {
-        return self.inodes.get(iid);
+        if (self.inodes.get(iid)) |ptr| return ptr;
+        if (self.clean_cache_box) |box| {
+            if (box.cache.take(iid)) |taken| {
+                self.inodes.put(box.allocator, iid, taken) catch {
+                    taken.deinit(box.allocator);
+                    box.allocator.destroy(taken);
+                    return null;
+                };
+                return taken;
+            }
+            if (self.source) |src| {
+                const loaded = (src.loadInode(box.allocator, iid) catch return null) orelse return null;
+                self.inodes.put(box.allocator, iid, loaded) catch {
+                    loaded.deinit(box.allocator);
+                    box.allocator.destroy(loaded);
+                    return null;
+                };
+                return loaded;
+            }
+        }
+        return null;
     }
 
     pub fn contains(self: *const Tree, iid: id.InodeId) bool {
-        return self.inodes.contains(iid);
+        if (self.inodes.contains(iid)) return true;
+        if (self.clean_cache_box) |box| {
+            if (box.cache.contains(iid)) return true;
+        }
+        if (self.source) |src| {
+            return src.hasInode(iid);
+        }
+        return false;
     }
 
     pub fn addChildRef(self: *Tree, allocator: Allocator, dir: id.InodeId, child: id.InodeId) Allocator.Error!void {
@@ -239,11 +469,15 @@ pub const Tree = struct {
             gop.value_ptr.* = .empty;
         }
         try gop.value_ptr.put(allocator, child, {});
+        try self.dirty_dirs.put(allocator, dir, {});
     }
 
     pub fn insertInode(self: *Tree, allocator: Allocator, inode: *Inode) Allocator.Error!void {
         for (inode.placement.entries.items) |e| {
             try self.addChildRef(allocator, e.value.parent, inode.inode_id);
+        }
+        if (self.clean_cache_box) |box| {
+            _ = box.cache.remove(inode.inode_id);
         }
         if (try self.inodes.fetchPut(allocator, inode.inode_id, inode)) |old| {
             old.value.deinit(allocator);
@@ -253,14 +487,47 @@ pub const Tree = struct {
 
     pub fn place(self: *Tree, allocator: Allocator, iid: id.InodeId, op: id.OpId, parent: id.InodeId, name: []const u8) Allocator.Error!void {
         try self.addChildRef(allocator, parent, iid);
-        const inode = self.inodes.get(iid) orelse return;
+        const inode = self.getMut(iid) orelse return;
+        for (inode.placement.entries.items) |e| {
+            try self.dirty_dirs.put(allocator, e.value.parent, {});
+        }
         const owned = try allocator.dupe(u8, name);
         errdefer allocator.free(owned);
         try inode.placement.set(allocator, op, .{ .parent = parent, .name = owned });
     }
 
+    fn collectDirChildrenUnion(
+        self: *const Tree,
+        allocator: Allocator,
+        dir: id.InodeId,
+        out: *std.ArrayList(id.InodeId),
+    ) Allocator.Error!void {
+        if (self.source) |src| {
+            try src.collectDirChildren(allocator, dir, out);
+        }
+        if (self.children.getPtr(dir)) |kids| {
+            if (out.items.len == 0) {
+                try out.appendSlice(allocator, kids.keys());
+            } else {
+                var seen: std.AutoHashMapUnmanaged(id.InodeId, void) = .empty;
+                defer seen.deinit(allocator);
+                try seen.ensureTotalCapacity(allocator, @intCast(out.items.len + kids.count()));
+                for (out.items) |k| try seen.put(allocator, k, {});
+                for (kids.keys()) |k| {
+                    if (!seen.contains(k)) {
+                        try seen.put(allocator, k, {});
+                        try out.append(allocator, k);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn placementIn(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!?*const Lww(Placement).Entry {
         if (iid.isRoot()) return null;
+        self.beginPinScope();
+        defer self.endPinScope();
+
         var demoted: std.AutoHashMapUnmanaged(id.InodeId, usize) = .empty;
         defer demoted.deinit(allocator);
 
@@ -308,14 +575,18 @@ pub const Tree = struct {
 
     pub fn isPresent(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!bool {
         if (iid.isRoot()) return true;
+        self.beginPinScope();
+        defer self.endPinScope();
         const inode = self.get(iid) orelse return false;
         if (inode.placement.getIn(view) == null) return false;
         if (inode.alive.getIn(view)) |a| {
             if (a.*) return true;
         }
         if (!inode.isDir()) return false;
-        const set = self.children.getPtr(iid) orelse return false;
-        for (set.keys()) |child| {
+        var kids: std.ArrayList(id.InodeId) = .empty;
+        defer kids.deinit(allocator);
+        try self.collectDirChildrenUnion(allocator, iid, &kids);
+        for (kids.items) |child| {
             const entry = try self.placementIn(allocator, view, child) orelse continue;
             if (entry.value.parent.eql(iid) and try self.isPresent(allocator, view, child)) return true;
         }
@@ -323,13 +594,19 @@ pub const Tree = struct {
     }
 
     pub fn listDir(self: *const Tree, allocator: Allocator, view: View, dir: id.InodeId) Allocator.Error!std.ArrayList(DirEntry) {
+        self.beginPinScope();
+        defer self.endPinScope();
         var out: std.ArrayList(DirEntry) = .empty;
         errdefer {
             for (out.items) |*e| e.deinit(allocator);
             out.deinit(allocator);
         }
 
-        const kids = self.children.getPtr(dir) orelse return out;
+        var kids: std.ArrayList(id.InodeId) = .empty;
+        defer kids.deinit(allocator);
+        try self.collectDirChildrenUnion(allocator, dir, &kids);
+        if (kids.items.len == 0) return out;
+
         const Candidate = struct {
             name: []const u8,
             op: id.OpId,
@@ -342,7 +619,7 @@ pub const Tree = struct {
             by_name.deinit(allocator);
         }
 
-        for (kids.keys()) |child| {
+        for (kids.items) |child| {
             const entry = try self.placementIn(allocator, view, child) orelse continue;
             const p = &entry.value;
             if (!p.parent.eql(dir)) continue;
@@ -387,10 +664,20 @@ pub const Tree = struct {
 
     pub fn resolvePath(self: *const Tree, allocator: Allocator, view: View, rel_path: []const u8) Allocator.Error!?id.InodeId {
         if (rel_path.len == 0) return id.InodeId.ROOT;
+        const fast_view = (self.source != null and view.min_unobserved == std.math.maxInt(u64));
         var cur = id.InodeId.ROOT;
         var it = std.mem.splitScalar(u8, rel_path, '/');
         while (it.next()) |part| {
             if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+            if (fast_view and !self.dirty_dirs.contains(cur)) {
+                const src = self.source.?;
+                const lookup = src.lookupDirName(cur, part) orelse return null;
+                if ((lookup.flags & DIR_NAME_FLAG_TOMBSTONE) != 0) return null;
+                if ((lookup.flags & DIR_NAME_FLAG_CONFLICT) == 0 and !self.inodes.contains(lookup.child_id)) {
+                    cur = lookup.child_id;
+                    continue;
+                }
+            }
             var entries = try self.listDir(allocator, view, cur);
             defer {
                 for (entries.items) |*e| e.deinit(allocator);
@@ -410,6 +697,8 @@ pub const Tree = struct {
 
     pub fn pathOf(self: *const Tree, allocator: Allocator, view: View, iid: id.InodeId) Allocator.Error!?[]u8 {
         if (iid.isRoot()) return try allocator.dupe(u8, "");
+        self.beginPinScope();
+        defer self.endPinScope();
         var parts: std.ArrayList([]u8) = .empty;
         defer {
             for (parts.items) |part| allocator.free(part);
@@ -424,18 +713,19 @@ pub const Tree = struct {
             const entry = try self.placementIn(allocator, view, cur) orelse return null;
             const p = &entry.value;
             var has_winner_before = false;
-            if (self.children.getPtr(p.parent)) |siblings| {
-                for (siblings.keys()) |sib| {
-                    if (sib.eql(cur)) continue;
-                    const sib_entry = try self.placementIn(allocator, view, sib) orelse continue;
-                    if (!sib_entry.value.parent.eql(p.parent)) continue;
-                    if (!std.mem.eql(u8, sib_entry.value.name, p.name)) continue;
-                    if (!try self.isPresent(allocator, view, sib)) continue;
-                    const ord = sib_entry.op.order(entry.op);
-                    if (ord == .gt or (ord == .eq and sib.order(cur) == .lt)) {
-                        has_winner_before = true;
-                        break;
-                    }
+            var siblings: std.ArrayList(id.InodeId) = .empty;
+            defer siblings.deinit(allocator);
+            try self.collectDirChildrenUnion(allocator, p.parent, &siblings);
+            for (siblings.items) |sib| {
+                if (sib.eql(cur)) continue;
+                const sib_entry = try self.placementIn(allocator, view, sib) orelse continue;
+                if (!sib_entry.value.parent.eql(p.parent)) continue;
+                if (!std.mem.eql(u8, sib_entry.value.name, p.name)) continue;
+                if (!try self.isPresent(allocator, view, sib)) continue;
+                const ord = sib_entry.op.order(entry.op);
+                if (ord == .gt or (ord == .eq and sib.order(cur) == .lt)) {
+                    has_winner_before = true;
+                    break;
                 }
             }
             const display_name = if (has_winner_before) blk: {

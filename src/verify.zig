@@ -1695,6 +1695,7 @@ fn runDaemonWatcherSuite(allocator: std.mem.Allocator, io: std.Io) !void {
         fwatcher.removeMount(100);
         try testing.expectEqual(@as(usize, 0), fwatcher.activeWatches());
     }
+    try runZeroReplayScaleAndGcSuite(allocator, io);
 }
 
 const FuzzFileSnap = struct {
@@ -1788,9 +1789,11 @@ fn collectLiveTreeSnap(
                 const ck = if (f.content.get()) |c| c.* else ondb.core.tree.ContentKind.text;
                 const mode = if (f.mode.get()) |m| m.* else ondb.core.tree.FileMode.regular;
                 const le = if (f.line_ending.get()) |l| l.* else ondb.core.tree.LineEnding.lf;
-                const is_bin = ck == .binary;
+                const is_bin = ck == .binary or ck == .git_binary;
                 const data = switch (ck) {
-                    .binary => |bref| try allocator.dupe(u8, hist.resolveBlob(bref.oid) orelse ""),
+                    .binary => |bref| (try hist.readBlobAlloc(allocator, bref.oid)) orelse try allocator.dupe(u8, ""),
+                    .git_binary => |gref| (try hist.readGitBlobAlloc(allocator, gref.oid)) orelse try allocator.dupe(u8, ""),
+                    .git_lazy => |gref| (try hist.readGitBlobAlloc(allocator, gref.oid)) orelse try allocator.dupe(u8, ""),
                     .text => (try f.text.readIn(allocator, res, ondb.core.text.View.EVERYTHING)) orelse try allocator.dupe(u8, ""),
                 };
                 errdefer allocator.free(data);
@@ -7442,5 +7445,391 @@ fn runTimelineAndRemoteSuite(allocator: std.mem.Allocator, io: std.Io) !void {
         const xml_esc = try timeline.formatWorkspaceChangesXml(allocator, &escaped_arr);
         defer allocator.free(xml_esc);
         try testing.expect(std.mem.indexOf(u8, xml_esc, "path=\"a&amp;b&lt;c&gt;&quot;d.txt\"") != null);
+    }
+}
+
+fn runZeroReplayScaleAndGcSuite(allocator: std.mem.Allocator, io: std.Io) !void {
+    const base_tmp = "/tmp/0ndb-verify-zero-replay-engine";
+    std.Io.Dir.cwd().deleteTree(io, base_tmp) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, base_tmp) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base_tmp);
+
+    {
+        const work_dir = "/tmp/0ndb-verify-zero-replay-engine/scale_work";
+        const state_dir = "/tmp/0ndb-verify-zero-replay-engine/scale_state";
+        try std.Io.Dir.cwd().createDirPath(io, work_dir);
+
+        var d: usize = 0;
+        while (d < 20) : (d += 1) {
+            var dir_buf: [128]u8 = undefined;
+            const sub_path = try std.fmt.bufPrint(&dir_buf, "{s}/dir_{d:0>2}", .{ work_dir, d });
+            try std.Io.Dir.cwd().createDirPath(io, sub_path);
+            var fidx: usize = 0;
+            while (fidx < 50) : (fidx += 1) {
+                var rel_buf: [64]u8 = undefined;
+                const rel = try std.fmt.bufPrint(&rel_buf, "dir_{d:0>2}/file_{d:0>2}.txt", .{ d, fidx });
+                var body_buf: [96]u8 = undefined;
+                const body = try std.fmt.bufPrint(&body_buf, "dir={d:0>2} file={d:0>2}\nline-two\n", .{ d, fidx });
+                try writeTestFile(io, work_dir, rel, body, false);
+            }
+        }
+
+        {
+            var ws = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9101);
+            defer ws.deinit();
+            const bid = try ws.ingestDisk();
+            try testing.expect(bid != null);
+            try ws.checkpoint(.major);
+        }
+
+        {
+            var ws2 = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9101);
+            defer ws2.deinit();
+
+            try testing.expect(ws2.history.tree.loadedInodesCount() < 64);
+
+            const resolved = try ws2.history.tree.resolvePath(
+                allocator,
+                ondb.core.text.View.EVERYTHING,
+                "dir_10/file_25.txt",
+            );
+            try testing.expect(resolved != null);
+            try testing.expect(ws2.history.tree.loadedInodesCount() < 64);
+
+            const content = (try ws2.history.readFileAt(allocator, "dir_10/file_25.txt", &ws2.history.dag.heads)).?;
+            defer allocator.free(content);
+            try testing.expectEqualStrings("dir=10 file=25\nline-two\n", content);
+            try testing.expect(ws2.history.tree.loadedInodesCount() < 64);
+
+            _ = try ws2.writeFileDirect(9001, "dir_10/file_25.txt", "edited-in-delta\nline2\n");
+            try ws2.checkpoint(.minor);
+        }
+
+        {
+            var ws3 = try ondb.fs.workspace.Workspace.open(allocator, io, work_dir, state_dir, 9101);
+            defer ws3.deinit();
+
+            try testing.expect(ws3.history.tree.loadedInodesCount() < 64);
+
+            const edited = (try ws3.history.readFileAt(allocator, "dir_10/file_25.txt", &ws3.history.dag.heads)).?;
+            defer allocator.free(edited);
+            try testing.expectEqualStrings("edited-in-delta\nline2\n", edited);
+
+            const untouched = (try ws3.history.readFileAt(allocator, "dir_03/file_12.txt", &ws3.history.dag.heads)).?;
+            defer allocator.free(untouched);
+            try testing.expectEqualStrings("dir=03 file=12\nline-two\n", untouched);
+
+            ws3.hibernate();
+            try testing.expectEqual(@as(usize, 0), ws3.history.tree.cleanCachedInodesCount());
+
+            const refaulted = (try ws3.history.readFileAt(allocator, "dir_03/file_12.txt", &ws3.history.dag.heads)).?;
+            defer allocator.free(refaulted);
+            try testing.expectEqualStrings("dir=03 file=12\nline-two\n", refaulted);
+        }
+    }
+
+    {
+        const git_work = "/tmp/0ndb-verify-zero-replay-engine/git_work";
+        const git_state = "/tmp/0ndb-verify-zero-replay-engine/git_state";
+        try std.Io.Dir.cwd().createDirPath(io, git_work);
+        try std.Io.Dir.cwd().createDirPath(io, "/tmp/0ndb-verify-zero-replay-engine/git_work/src");
+
+        const init_out = try runGitTestCmd(allocator, io, git_work, &.{"init"});
+        allocator.free(init_out);
+
+        var fi: usize = 0;
+        while (fi < 60) : (fi += 1) {
+            var rel_buf: [64]u8 = undefined;
+            const rel = try std.fmt.bufPrint(&rel_buf, "src/f_{d:0>2}.txt", .{fi});
+            var body_buf: [128]u8 = undefined;
+            const body = try std.fmt.bufPrint(&body_buf, "git-pinned-file-{d:0>2}\nsecond line\n", .{fi});
+            try writeTestFile(io, git_work, rel, body, false);
+        }
+
+        const add_out = try runGitTestCmd(allocator, io, git_work, &.{ "add", "." });
+        allocator.free(add_out);
+        const ci_out = try runGitTestCmd(allocator, io, git_work, &.{ "commit", "-m", "initial" });
+        allocator.free(ci_out);
+        const gc_out = try runGitTestCmd(allocator, io, git_work, &.{ "gc", "--quiet" });
+        allocator.free(gc_out);
+
+        {
+            var gws = try ondb.fs.workspace.Workspace.open(allocator, io, git_work, git_state, 9102);
+            defer gws.deinit();
+            const bid = try gws.ingestDisk();
+            try testing.expect(bid != null);
+
+            const iid10 = (try gws.history.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "src/f_10.txt")).?;
+            gws.history.tree.beginPinScope();
+            const in10 = gws.history.tree.get(iid10).?;
+            const ck10 = in10.fileConstPtr().?.content.get().?.*;
+            gws.history.tree.endPinScope();
+            try testing.expect(ck10 == .git_lazy);
+
+            const raw10 = (try gws.history.readFileAt(allocator, "src/f_10.txt", &gws.history.dag.heads)).?;
+            defer allocator.free(raw10);
+            try testing.expectEqualStrings("git-pinned-file-10\nsecond line\n", raw10);
+
+            _ = try gws.writeFileDirect(9002, "src/f_10.txt", "hydrated-edit-10\nsecond line\n");
+
+            const iid20 = (try gws.history.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "src/f_20.txt")).?;
+            gws.history.tree.beginPinScope();
+            const in20 = gws.history.tree.get(iid20).?;
+            const ck20 = in20.fileConstPtr().?.content.get().?.*;
+            gws.history.tree.endPinScope();
+            try testing.expect(ck20 == .git_lazy);
+
+            try gws.checkpoint(.major);
+        }
+
+        {
+            var gws2 = try ondb.fs.workspace.Workspace.open(allocator, io, git_work, git_state, 9102);
+            defer gws2.deinit();
+
+            const raw10 = (try gws2.history.readFileAt(allocator, "src/f_10.txt", &gws2.history.dag.heads)).?;
+            defer allocator.free(raw10);
+            try testing.expectEqualStrings("hydrated-edit-10\nsecond line\n", raw10);
+
+            const raw20 = (try gws2.history.readFileAt(allocator, "src/f_20.txt", &gws2.history.dag.heads)).?;
+            defer allocator.free(raw20);
+            try testing.expectEqualStrings("git-pinned-file-20\nsecond line\n", raw20);
+
+            const iid20 = (try gws2.history.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "src/f_20.txt")).?;
+            gws2.history.tree.beginPinScope();
+            const in20 = gws2.history.tree.get(iid20).?;
+            const ck20 = in20.fileConstPtr().?.content.get().?.*;
+            gws2.history.tree.endPinScope();
+            try testing.expect(ck20 == .git_lazy);
+        }
+
+        const fsck_out = try runGitTestCmd(allocator, io, git_work, &.{ "fsck", "--full", "--strict" });
+        allocator.free(fsck_out);
+    }
+
+    {
+        const gc_work = "/tmp/0ndb-verify-zero-replay-engine/gc_work";
+        const gc_state = "/tmp/0ndb-verify-zero-replay-engine/gc_state";
+        try std.Io.Dir.cwd().createDirPath(io, gc_work);
+
+        var ws = try ondb.fs.workspace.Workspace.open(allocator, io, gc_work, gc_state, 9103);
+        defer ws.deinit();
+
+        const blob_len: usize = 24 * 1024;
+        const bin_buf = try allocator.alloc(u8, blob_len);
+        defer allocator.free(bin_buf);
+        const txt_buf = try allocator.alloc(u8, blob_len);
+        defer allocator.free(txt_buf);
+
+        var pinned_ver = ondb.core.version.Version.ROOT;
+        defer pinned_ver.deinit(allocator);
+        var pinned_bin: []u8 = &.{};
+        defer if (pinned_bin.len > 0) allocator.free(pinned_bin);
+        var pinned_txt: []u8 = &.{};
+        defer if (pinned_txt.len > 0) allocator.free(pinned_txt);
+
+        var iter: usize = 0;
+        while (iter < 52) : (iter += 1) {
+            bin_buf[0] = 0;
+            bin_buf[1] = 0xFF;
+            bin_buf[2] = @intCast(iter & 0xFF);
+            var k: usize = 3;
+            while (k < blob_len) : (k += 1) {
+                bin_buf[k] = @truncate((k * 31 + iter * 17) ^ 0x5A);
+            }
+            const ch: u8 = @intCast('a' + (iter % 26));
+            var t: usize = 0;
+            while (t < blob_len) : (t += 1) {
+                txt_buf[t] = if ((t + 1) % 64 == 0) '\n' else ch;
+            }
+            const tag_hdr = try std.fmt.bufPrint(txt_buf[0..16], "iter-{d:0>4}-data\n", .{iter});
+            _ = tag_hdr;
+
+            _ = try ws.writeFileDirect(9003, "big.bin", bin_buf);
+            _ = try ws.writeFileDirect(9003, "big.txt", txt_buf);
+
+            if (iter == 25) {
+                pinned_ver = try ws.history.dag.heads.clone(allocator);
+                try ws.retainVersion(&pinned_ver);
+                pinned_bin = try allocator.dupe(u8, bin_buf);
+                pinned_txt = try allocator.dupe(u8, txt_buf);
+            }
+        }
+
+        const stats1 = try ws.compactWithPolicy(.{
+            .retain_latest_batches = 0,
+            .retain_ms = 0,
+            .force_gc = true,
+        });
+        try testing.expect(stats1.pruned_batches >= 40);
+        try testing.expect(stats1.reclaimed_batch_bytes > 0);
+        try testing.expect(stats1.removed_blobs >= 20);
+        try testing.expect(stats1.reclaimed_blob_bytes > 0);
+
+        const pbin_read = (try ws.history.readFileAt(allocator, "big.bin", &pinned_ver)).?;
+        defer allocator.free(pbin_read);
+        try testing.expectEqualSlices(u8, pinned_bin, pbin_read);
+
+        const ptxt_read = (try ws.history.readFileAt(allocator, "big.txt", &pinned_ver)).?;
+        defer allocator.free(ptxt_read);
+        try testing.expectEqualSlices(u8, pinned_txt, ptxt_read);
+
+        const lbin_read = (try ws.history.readFileAt(allocator, "big.bin", &ws.history.dag.heads)).?;
+        defer allocator.free(lbin_read);
+        try testing.expectEqualSlices(u8, bin_buf, lbin_read);
+
+        const ltxt_read = (try ws.history.readFileAt(allocator, "big.txt", &ws.history.dag.heads)).?;
+        defer allocator.free(ltxt_read);
+        try testing.expectEqualSlices(u8, txt_buf, ltxt_read);
+
+        ws.releaseVersion(&pinned_ver);
+        const stats2 = try ws.compactWithPolicy(.{
+            .retain_latest_batches = 0,
+            .retain_ms = 0,
+            .force_gc = true,
+        });
+        try testing.expect(stats2.pruned_batches >= 40);
+        try testing.expect(stats2.reclaimed_batch_bytes > 0);
+        try testing.expect(stats2.removed_blobs >= 20);
+        try testing.expect(stats2.reclaimed_blob_bytes > 0);
+
+        const final_bin = (try ws.history.readFileAt(allocator, "big.bin", &ws.history.dag.heads)).?;
+        defer allocator.free(final_bin);
+        try testing.expectEqualSlices(u8, bin_buf, final_bin);
+
+        const final_txt = (try ws.history.readFileAt(allocator, "big.txt", &ws.history.dag.heads)).?;
+        defer allocator.free(final_txt);
+        try testing.expectEqualSlices(u8, txt_buf, final_txt);
+    }
+
+    {
+        const log_dir_path = "/tmp/0ndb-verify-zero-replay-engine/log_safety";
+        try std.Io.Dir.cwd().createDirPath(io, log_dir_path);
+        var log_dir = try std.Io.Dir.cwd().openDir(io, log_dir_path, .{ .iterate = true });
+        defer log_dir.close(io);
+
+        {
+            var al = try ondb.store.log.AppendLog.open(allocator, io, log_dir, "mid.0ndb", true);
+            defer al.deinit();
+            _ = try al.append(1, 0, 0, "frame-zero-payload");
+            _ = try al.append(1, 0, 0, "frame-one-payload");
+            _ = try al.append(1, 0, 0, "frame-two-payload");
+            _ = try al.append(1, 0, 0, "frame-three-payload");
+            _ = try al.append(1, 0, 0, "frame-four-payload");
+            try al.sync();
+        }
+
+        const before_size = (try log_dir.statFile(io, "mid.0ndb", .{})).size;
+        {
+            const f = try log_dir.openFile(io, "mid.0ndb", .{ .mode = .read_write });
+            defer f.close(io);
+            var frame1_probe: [1]u8 = undefined;
+            const corrupt_off: u64 = 120;
+            _ = try f.readPositionalAll(io, &frame1_probe, corrupt_off);
+            frame1_probe[0] ^= 0xFF;
+            try f.writePositionalAll(io, &frame1_probe, corrupt_off);
+        }
+
+        try testing.expectError(
+            error.CorruptLog,
+            ondb.store.log.AppendLog.open(allocator, io, log_dir, "mid.0ndb", true),
+        );
+        const after_size = (try log_dir.statFile(io, "mid.0ndb", .{})).size;
+        try testing.expectEqual(before_size, after_size);
+
+        {
+            var al2 = try ondb.store.log.AppendLog.open(allocator, io, log_dir, "eof.0ndb", true);
+            defer al2.deinit();
+            _ = try al2.append(1, 0, 0, "keep-0");
+            _ = try al2.append(1, 0, 0, "keep-1");
+            _ = try al2.append(1, 0, 0, "torn-tail-frame-bytes");
+            try al2.sync();
+        }
+        const eof_size = (try log_dir.statFile(io, "eof.0ndb", .{})).size;
+        {
+            const f = try log_dir.openFile(io, "eof.0ndb", .{ .mode = .read_write });
+            defer f.close(io);
+            try f.setLength(io, eof_size - 5);
+        }
+        {
+            var al3 = try ondb.store.log.AppendLog.open(allocator, io, log_dir, "eof.0ndb", true);
+            defer al3.deinit();
+            try testing.expectEqual(@as(usize, 2), al3.count());
+        }
+    }
+
+    {
+        const safe_work = "/tmp/0ndb-verify-zero-replay-engine/safe_work";
+        const safe_state = "/tmp/0ndb-verify-zero-replay-engine/safe_state";
+        try std.Io.Dir.cwd().createDirPath(io, "/tmp/0ndb-verify-zero-replay-engine/safe_work/sub");
+
+        try writeTestFile(io, safe_work, "tracked.txt", "hello tracked\n", false);
+        try writeTestFile(io, safe_work, "run.sh", "#!/bin/sh\necho ok\n", true);
+        try writeTestFile(io, safe_work, "sub/.gitignore", "*.tmp\n", false);
+        try writeTestFile(io, safe_work, "sub/keep.txt", "kept\n", false);
+        try writeTestFile(io, safe_work, "sub/skip.tmp", "ignored\n", false);
+
+        var sws = try ondb.fs.workspace.Workspace.open(allocator, io, safe_work, safe_state, 9104);
+        defer sws.deinit();
+        _ = try sws.ingestDisk();
+
+        const keep_iid = try sws.history.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "sub/keep.txt");
+        try testing.expect(keep_iid != null);
+        const skip_iid = try sws.history.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "sub/skip.tmp");
+        try testing.expect(skip_iid == null);
+
+        var base_v = try sws.history.dag.heads.clone(allocator);
+        defer base_v.deinit(allocator);
+        var edit_res = try sws.writeFileAtBase(9004, "run.sh", &base_v, "#!/bin/sh\necho updated\n", "test");
+        edit_res.deinit(allocator);
+
+        const sh_iid = (try sws.history.tree.resolvePath(allocator, ondb.core.text.View.EVERYTHING, "run.sh")).?;
+        sws.history.tree.beginPinScope();
+        const sh_mode = sws.history.tree.get(sh_iid).?.fileConstPtr().?.mode.get().?.*;
+        sws.history.tree.endPinScope();
+        try testing.expectEqual(ondb.core.tree.FileMode.executable, sh_mode);
+
+        try writeTestFile(io, safe_work, "untracked_local.txt", "do not delete\n", false);
+        try sws.materializeToDisk();
+        var sdir = try std.Io.Dir.cwd().openDir(io, safe_work, .{});
+        defer sdir.close(io);
+        _ = try sdir.statFile(io, "untracked_local.txt", .{});
+
+        try sws.materializeToDiskWithOptions(.{ .force = true });
+        try testing.expectError(error.FileNotFound, sdir.statFile(io, "untracked_local.txt", .{}));
+    }
+
+    {
+        const pool_dir = "/tmp/0ndb-verify-zero-replay-engine/daemon_pool";
+        const w1 = "/tmp/0ndb-verify-zero-replay-engine/shared_w1";
+        const s1 = "/tmp/0ndb-verify-zero-replay-engine/shared_s1";
+        const w2 = "/tmp/0ndb-verify-zero-replay-engine/shared_w2";
+        const s2 = "/tmp/0ndb-verify-zero-replay-engine/shared_s2";
+        try std.Io.Dir.cwd().createDirPath(io, w1);
+        try std.Io.Dir.cwd().createDirPath(io, w2);
+
+        const resources = try ondb.fs.pool.DaemonResources.init(allocator, io, pool_dir, .{});
+        defer resources.deinit();
+
+        var ws_a = try ondb.fs.workspace.Workspace.openWithResources(allocator, io, w1, s1, 9105, resources);
+        defer ws_a.deinit();
+        var ws_b = try ondb.fs.workspace.Workspace.openWithResources(allocator, io, w2, s2, 9106, resources);
+        defer ws_b.deinit();
+
+        try testing.expect(ws_a.blob_store.isShared());
+        try testing.expect(ws_b.blob_store.isShared());
+
+        const shared_payload = try allocator.alloc(u8, 20 * 1024);
+        defer allocator.free(shared_payload);
+        @memset(shared_payload, 'Z');
+
+        _ = try ws_a.writeFileDirect(9010, "shared.txt", shared_payload);
+        _ = try ws_b.writeFileDirect(9011, "shared.txt", shared_payload);
+
+        const ra = (try ws_a.history.readFileAt(allocator, "shared.txt", &ws_a.history.dag.heads)).?;
+        defer allocator.free(ra);
+        const rb = (try ws_b.history.readFileAt(allocator, "shared.txt", &ws_b.history.dag.heads)).?;
+        defer allocator.free(rb);
+        try testing.expectEqualSlices(u8, shared_payload, ra);
+        try testing.expectEqualSlices(u8, shared_payload, rb);
     }
 }

@@ -12,6 +12,8 @@ const tree_mod = @import("tree.zig");
 const Tree = tree_mod.Tree;
 const op_mod = @import("op.zig");
 const diff = @import("diff.zig");
+const git_dirs = @import("../fs/git_dirs.zig");
+const lru = @import("../store/lru.zig");
 
 pub const IntegrateError = error{
     MissingParents,
@@ -65,19 +67,98 @@ pub const LogSliceReader = struct {
     }
 };
 
+pub const ExternalGitReader = struct {
+    ptr: *anyopaque,
+    readAllocFn: *const fn (ptr: *anyopaque, allocator: Allocator, oid: git_dirs.GitOid) Allocator.Error!?[]u8,
+    readCachedFn: *const fn (ptr: *anyopaque, oid: git_dirs.GitOid) ?[]const u8,
+    containsFn: *const fn (ptr: *anyopaque, oid: git_dirs.GitOid) bool,
+
+    pub fn readAlloc(self: ExternalGitReader, allocator: Allocator, oid: git_dirs.GitOid) Allocator.Error!?[]u8 {
+        return self.readAllocFn(self.ptr, allocator, oid);
+    }
+
+    pub fn readCached(self: ExternalGitReader, oid: git_dirs.GitOid) ?[]const u8 {
+        return self.readCachedFn(self.ptr, oid);
+    }
+
+    pub fn contains(self: ExternalGitReader, oid: git_dirs.GitOid) bool {
+        return self.containsFn(self.ptr, oid);
+    }
+};
+
+pub const ExternalBlobReader = struct {
+    ptr: *anyopaque,
+    readAllocFn: *const fn (ptr: *anyopaque, allocator: Allocator, oid: id.Oid) Allocator.Error!?[]u8,
+    existsFn: *const fn (ptr: *anyopaque, oid: id.Oid) bool,
+
+    pub fn readAlloc(self: ExternalBlobReader, allocator: Allocator, oid: id.Oid) Allocator.Error!?[]u8 {
+        return self.readAllocFn(self.ptr, allocator, oid);
+    }
+
+    pub fn exists(self: ExternalBlobReader, oid: id.Oid) bool {
+        return self.existsFn(self.ptr, oid);
+    }
+};
+
+pub const InsertionLookup = union(enum) {
+    inline_bytes: []const u8,
+    blob_oid: id.Oid,
+    git_oid: git_dirs.GitOid,
+};
+
+pub const InsertionSource = struct {
+    ptr: *const anyopaque,
+    lookupFn: *const fn (ptr: *const anyopaque, key: id.InsertionKey) ?InsertionLookup,
+
+    pub fn lookup(self: InsertionSource, key: id.InsertionKey) ?InsertionLookup {
+        return self.lookupFn(self.ptr, key);
+    }
+};
+
 pub const InsertionStorage = union(enum) {
     owned: []u8,
     log_span: struct {
         offset: u64,
         len: u32,
     },
+    blob_ref: id.Oid,
+    git_blob: git_dirs.GitOid,
 
     pub fn deinit(self: *InsertionStorage, allocator: Allocator) void {
         switch (self.*) {
             .owned => |b| allocator.free(b),
-            .log_span => {},
+            .log_span, .blob_ref, .git_blob => {},
         }
     }
+};
+
+const ReadCacheKey = struct {
+    kind: u8,
+    len: u8,
+    bytes: [32]u8,
+
+    fn forBlob(oid: id.Oid) ReadCacheKey {
+        return .{ .kind = 1, .len = 32, .bytes = oid };
+    }
+
+    fn forGit(oid: git_dirs.GitOid) ReadCacheKey {
+        return .{ .kind = 2, .len = oid.len, .bytes = oid.bytes };
+    }
+};
+
+fn sliceSizeFn(s: []u8) usize {
+    return s.len;
+}
+
+fn sliceDeinitFn(allocator: Allocator, s: []u8) void {
+    allocator.free(s);
+}
+
+const ExternalReadCache = lru.LruCache(ReadCacheKey, []u8, sliceSizeFn, sliceDeinitFn);
+
+const ReadCacheBox = struct {
+    allocator: Allocator,
+    cache: ExternalReadCache,
 };
 
 pub const BlameLine = struct {
@@ -159,20 +240,40 @@ pub const History = struct {
     batch_inodes: std.AutoHashMapUnmanaged(id.BatchId, []id.InodeId),
     meta: std.StringHashMapUnmanaged(tree_mod.Lww(?[]u8)),
     log_reader: ?LogSliceReader = null,
+    git_reader: ?ExternalGitReader = null,
+    blob_reader: ?ExternalBlobReader = null,
+    insertion_source: ?InsertionSource = null,
+    node_source: ?text_mod.NodeSource = null,
+    read_cache_box: ?*ReadCacheBox = null,
     poisoned: bool = false,
 
     pub fn init(allocator: Allocator, history_id: u128) Allocator.Error!History {
+        var t = try Tree.init(allocator);
+        errdefer t.deinit(allocator);
+        const box = try allocator.create(ReadCacheBox);
+        box.* = .{
+            .allocator = allocator,
+            .cache = ExternalReadCache.init(allocator, .{
+                .budget_bytes = 4 * 1024 * 1024,
+                .max_entries = 512,
+            }),
+        };
         return .{
             .allocator = allocator,
             .history_id = history_id,
             .dag = .{},
-            .tree = try Tree.init(allocator),
+            .tree = t,
             .insertions = .empty,
             .blobs = .empty,
             .insertion_blobs = .empty,
             .batch_inodes = .empty,
             .meta = .empty,
             .log_reader = null,
+            .git_reader = null,
+            .blob_reader = null,
+            .insertion_source = null,
+            .node_source = null,
+            .read_cache_box = box,
             .poisoned = false,
         };
     }
@@ -196,10 +297,85 @@ pub const History = struct {
             kv.value_ptr.deinit(self.allocator);
         }
         self.meta.deinit(self.allocator);
+        if (self.read_cache_box) |box| {
+            box.cache.deinit();
+            self.allocator.destroy(box);
+            self.read_cache_box = null;
+        }
     }
 
     pub fn setLogReader(self: *History, reader: ?LogSliceReader) void {
         self.log_reader = reader;
+    }
+
+    pub fn setGitReader(self: *History, reader: ?ExternalGitReader) void {
+        self.git_reader = reader;
+    }
+
+    pub fn setBlobReader(self: *History, reader: ?ExternalBlobReader) void {
+        self.blob_reader = reader;
+    }
+
+    pub fn attachSnapshotSources(
+        self: *History,
+        dag_src: ?dag_mod.DagSource,
+        inode_src: ?tree_mod.InodeSource,
+        node_src: ?text_mod.NodeSource,
+        ins_src: ?InsertionSource,
+    ) void {
+        self.dag.setSource(dag_src);
+        self.tree.setSource(inode_src);
+        self.node_source = node_src;
+        self.insertion_source = ins_src;
+    }
+
+    pub fn attachSnapshotStack(self: *History, stack_opt: anytype) void {
+        const T = @TypeOf(stack_opt);
+        if (T == @TypeOf(null)) {
+            self.attachSnapshotSources(null, null, null, null);
+            return;
+        }
+        const stack = switch (@typeInfo(T)) {
+            .optional => stack_opt orelse {
+                self.attachSnapshotSources(null, null, null, null);
+                return;
+            },
+            else => stack_opt,
+        };
+        self.attachSnapshotSources(
+            stack.dagSource(),
+            stack.inodeSource(),
+            stack.nodeSource(),
+            stack.insertionSource(),
+        );
+    }
+
+    pub fn markDirty(self: *History, iid: id.InodeId) Allocator.Error!void {
+        try self.tree.markDirty(self.allocator, iid);
+    }
+
+    pub fn clearReadCache(self: *History) void {
+        if (self.read_cache_box) |box| {
+            box.cache.clear();
+        }
+    }
+
+    pub fn hibernate(self: *History) void {
+        self.tree.hibernate();
+        self.clearReadCache();
+    }
+
+    pub fn clearDirtyAfterCheckpoint(self: *History) void {
+        self.tree.clearDirtyAfterCheckpoint(self.allocator);
+        self.dag.clearOverlayAfterCheckpoint(self.allocator);
+        var iit = self.insertions.valueIterator();
+        while (iit.next()) |s| s.deinit(self.allocator);
+        self.insertions.clearRetainingCapacity();
+        self.insertion_blobs.clearRetainingCapacity();
+        var bit = self.blobs.valueIterator();
+        while (bit.next()) |s| s.deinit(self.allocator);
+        self.blobs.clearRetainingCapacity();
+        self.clearReadCache();
     }
 
     pub fn pinBatchToLog(
@@ -222,7 +398,7 @@ pub const History = struct {
                             const log_bytes = lr.read(payload_base_offset + sp.offset, sp.len) orelse break :blk false;
                             break :blk std.mem.eql(u8, b, log_bytes);
                         },
-                        .log_span => false,
+                        .log_span, .blob_ref, .git_blob => false,
                     },
                     else => false,
                 };
@@ -255,7 +431,7 @@ pub const History = struct {
         var iit = self.insertions.valueIterator();
         while (iit.next()) |slot| {
             switch (slot.*) {
-                .owned => {},
+                .owned, .blob_ref, .git_blob => {},
                 .log_span => |sp| {
                     const bytes = lr.read(sp.offset, sp.len) orelse return error.LogReadFailed;
                     const copy = try self.allocator.dupe(u8, bytes);
@@ -266,7 +442,7 @@ pub const History = struct {
         var bit = self.blobs.valueIterator();
         while (bit.next()) |slot| {
             switch (slot.*) {
-                .owned => {},
+                .owned, .blob_ref, .git_blob => {},
                 .log_span => |sp| {
                     const bytes = lr.read(sp.offset, sp.len) orelse return error.LogReadFailed;
                     const copy = try self.allocator.dupe(u8, bytes);
@@ -282,14 +458,14 @@ pub const History = struct {
         while (iit.next()) |s| {
             switch (s.*) {
                 .owned => |b| total += b.len,
-                .log_span => {},
+                .log_span, .blob_ref, .git_blob => {},
             }
         }
         var bit = self.blobs.valueIterator();
         while (bit.next()) |s| {
             switch (s.*) {
                 .owned => |b| total += b.len,
-                .log_span => {},
+                .log_span, .blob_ref, .git_blob => {},
             }
         }
         return total;
@@ -299,6 +475,8 @@ pub const History = struct {
         return switch (s) {
             .owned => |b| b,
             .log_span => |sp| if (self.log_reader) |lr| lr.read(sp.offset, sp.len) else null,
+            .blob_ref => |oid| self.resolveBlob(oid),
+            .git_blob => |goid| self.resolveGitBlob(goid),
         };
     }
 
@@ -313,14 +491,74 @@ pub const History = struct {
         const self: *const History = @ptrCast(@alignCast(ptr));
         if (self.insertions.get(key)) |s| return self.resolveStorage(s);
         if (self.insertion_blobs.get(key)) |oid| {
-            if (self.blobs.get(oid)) |bs| return self.resolveStorage(bs);
+            if (self.resolveBlob(oid)) |b| return b;
+        }
+        if (self.insertion_source) |src| {
+            if (src.lookup(key)) |found| {
+                return switch (found) {
+                    .inline_bytes => |b| b,
+                    .blob_oid => |oid| self.resolveBlob(oid),
+                    .git_oid => |goid| self.resolveGitBlob(goid),
+                };
+            }
         }
         return null;
     }
 
     pub fn resolveBlob(self: *const History, oid: id.Oid) ?[]const u8 {
-        const s = self.blobs.get(oid) orelse return null;
-        return self.resolveStorage(s);
+        if (self.blobs.get(oid)) |s| {
+            return self.resolveStorage(s);
+        }
+        if (self.read_cache_box) |box| {
+            const ckey = ReadCacheKey.forBlob(oid);
+            if (box.cache.get(ckey)) |slot| return slot.*;
+            if (self.blob_reader) |br| {
+                const loaded = (br.readAlloc(box.allocator, oid) catch return null) orelse return null;
+                const slot = box.cache.put(ckey, loaded) catch {
+                    box.allocator.free(loaded);
+                    return null;
+                };
+                return slot.*;
+            }
+        }
+        return null;
+    }
+
+    pub fn resolveGitBlob(self: *const History, goid: git_dirs.GitOid) ?[]const u8 {
+        if (self.read_cache_box) |box| {
+            const ckey = ReadCacheKey.forGit(goid);
+            if (box.cache.get(ckey)) |slot| return slot.*;
+            if (self.git_reader) |gr| {
+                if (gr.readCached(goid)) |cached| return cached;
+                const loaded = (gr.readAlloc(box.allocator, goid) catch return null) orelse return null;
+                const slot = box.cache.put(ckey, loaded) catch {
+                    box.allocator.free(loaded);
+                    return null;
+                };
+                return slot.*;
+            }
+        } else if (self.git_reader) |gr| {
+            return gr.readCached(goid);
+        }
+        return null;
+    }
+
+    pub fn readBlobAlloc(self: *const History, allocator: Allocator, oid: id.Oid) Allocator.Error!?[]u8 {
+        if (self.blobs.get(oid)) |s| {
+            if (self.resolveStorage(s)) |b| return try allocator.dupe(u8, b);
+        }
+        if (self.blob_reader) |br| {
+            return try br.readAlloc(allocator, oid);
+        }
+        return null;
+    }
+
+    pub fn readGitBlobAlloc(self: *const History, allocator: Allocator, goid: git_dirs.GitOid) Allocator.Error!?[]u8 {
+        if (self.git_reader) |gr| {
+            return try gr.readAlloc(allocator, goid);
+        }
+        if (self.resolveGitBlob(goid)) |b| return try allocator.dupe(u8, b);
+        return null;
     }
 
     pub fn putBlob(self: *History, oid: id.Oid, data: []const u8) Allocator.Error!void {
@@ -904,6 +1142,7 @@ pub const History = struct {
                 if (v.inode.isRoot()) return error.CannotModifyRoot;
                 const inode = try self.requireKnown(view, v.inode);
                 mutated.* = true;
+                try self.tree.markDirty(self.allocator, v.inode);
                 if (inode.isDir()) {
                     try self.removeDirSubtree(v.inode, op_id, view, touched);
                 } else {
@@ -914,12 +1153,30 @@ pub const History = struct {
             .restore => |v| {
                 const inode = try self.requireKnown(view, v.inode);
                 mutated.* = true;
+                try self.tree.markDirty(self.allocator, v.inode);
                 try inode.alive.set(self.allocator, op_id, true);
                 if (!v.inode.isRoot()) try touched.put(self.allocator, v.inode, {});
             },
             .edit_text => |v| {
                 const inode = try self.requireKnown(view, v.inode);
                 const f = inode.filePtr() orelse return error.NotAFile;
+                if (f.content.nthIn(view, 0)) |ck_entry| {
+                    if (ck_entry.value == .git_lazy) {
+                        const ref = ck_entry.value.git_lazy;
+                        mutated.* = true;
+                        if (ref.len > 0) {
+                            const lazy_key = id.InsertionKey{ .op = ck_entry.op, .part = 0 };
+                            if (try self.insertions.fetchPut(self.allocator, lazy_key, .{ .git_blob = ref.oid })) |prev| {
+                                var old = prev.value;
+                                old.deinit(self.allocator);
+                            }
+                            f.text.deinit(self.allocator);
+                            f.text = try Text.fromInsertion(self.allocator, ck_entry.op, 0, 0, ref.len, null);
+                            f.text.node_source = self.node_source;
+                        }
+                        try f.content.set(self.allocator, op_id, .text);
+                    }
+                }
                 f.text.apply(self.allocator, op_id, view, v.splices, v.text, self.resolver()) catch |err| switch (err) {
                     error.Unordered => return error.Unordered,
                     error.OutOfBounds => return error.OutOfBounds,
@@ -1007,6 +1264,7 @@ pub const History = struct {
 
         while (stack.pop()) |cur_iid| {
             const cur = self.tree.getMut(cur_iid) orelse continue;
+            try self.tree.markDirty(self.allocator, cur_iid);
             try cur.alive.set(self.allocator, op_id, false);
             if (!cur_iid.isRoot()) try touched.put(self.allocator, cur_iid, {});
             if (!cur.isDir()) continue;
@@ -1053,6 +1311,32 @@ pub const History = struct {
             .binary => |ref| {
                 mutated.* = true;
                 try f.content.set(self.allocator, op_id, .{ .binary = ref });
+            },
+            .git_text_blob => |ref| {
+                mutated.* = true;
+                try f.content.set(self.allocator, op_id, .text);
+                if (ref.len > 0) {
+                    const key = id.InsertionKey{ .op = op_id, .part = 0 };
+                    if (try self.insertions.fetchPut(self.allocator, key, .{ .git_blob = ref.oid })) |prev| {
+                        var old = prev.value;
+                        old.deinit(self.allocator);
+                    }
+                }
+                f.text.replaceWithLazyInsertion(self.allocator, op_id, view, ref.len, self.resolver()) catch |err| return switch (err) {
+                    error.Unordered => error.Unordered,
+                    error.OutOfBounds => error.OutOfBounds,
+                    error.LengthMismatch => error.LengthMismatch,
+                    error.InvalidSplice => error.InvalidSplice,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            },
+            .git_binary => |ref| {
+                mutated.* = true;
+                try f.content.set(self.allocator, op_id, .{ .git_binary = ref });
+            },
+            .git_lazy => |ref| {
+                mutated.* = true;
+                try f.content.set(self.allocator, op_id, .{ .git_lazy = ref });
             },
         }
     }
@@ -1114,10 +1398,33 @@ pub const History = struct {
             .binary => |ref| {
                 try f.content.set(self.allocator, op_id, .{ .binary = ref });
             },
+            .git_text_blob => |ref| {
+                try f.content.set(self.allocator, op_id, .text);
+                if (ref.len > 0) {
+                    const key = id.InsertionKey{ .op = op_id, .part = 0 };
+                    if (try self.insertions.fetchPut(self.allocator, key, .{ .git_blob = ref.oid })) |prev| {
+                        var old = prev.value;
+                        old.deinit(self.allocator);
+                    }
+                    f.text.deinit(self.allocator);
+                    f.text = try Text.fromInsertion(self.allocator, op_id, 0, 0, ref.len, null);
+                    f.text.node_source = self.node_source;
+                } else {
+                    f.text.deinit(self.allocator);
+                }
+            },
+            .git_binary => |ref| {
+                try f.content.set(self.allocator, op_id, .{ .git_binary = ref });
+            },
+            .git_lazy => |ref| {
+                try f.content.set(self.allocator, op_id, .{ .git_lazy = ref });
+            },
         }
     }
 
     pub fn readInodeInView(self: *const History, allocator: Allocator, iid: id.InodeId, view: View) Allocator.Error!?[]u8 {
+        self.tree.beginPinScope();
+        defer self.tree.endPinScope();
         const inode = self.tree.get(iid) orelse return null;
         const alive = inode.alive.getIn(view) orelse return null;
         if (!alive.*) return null;
@@ -1125,7 +1432,9 @@ pub const History = struct {
         const ck = f.content.getIn(view) orelse return null;
         return switch (ck.*) {
             .text => try f.text.readIn(allocator, self.resolver(), view),
-            .binary => |ref| if (self.resolveBlob(ref.oid)) |b| try allocator.dupe(u8, b) else null,
+            .binary => |ref| try self.readBlobAlloc(allocator, ref.oid),
+            .git_binary => |ref| try self.readGitBlobAlloc(allocator, ref.oid),
+            .git_lazy => |ref| try self.readGitBlobAlloc(allocator, ref.oid),
         };
     }
 
@@ -1140,13 +1449,17 @@ pub const History = struct {
             defer cv.deinit(allocator);
             return self.readFileInView(allocator, rel_path, cv.view());
         }
+        self.tree.beginPinScope();
+        defer self.tree.endPinScope();
         const iid = try self.tree.resolvePath(allocator, View.EVERYTHING, rel_path) orelse return null;
         const inode = self.tree.get(iid) orelse return null;
         const f = inode.fileConstPtr() orelse return null;
         const ck = f.content.get() orelse return null;
         return switch (ck.*) {
             .text => try f.text.read(allocator, self.resolver()),
-            .binary => |ref| if (self.resolveBlob(ref.oid)) |b| try allocator.dupe(u8, b) else null,
+            .binary => |ref| try self.readBlobAlloc(allocator, ref.oid),
+            .git_binary => |ref| try self.readGitBlobAlloc(allocator, ref.oid),
+            .git_lazy => |ref| try self.readGitBlobAlloc(allocator, ref.oid),
         };
     }
 
@@ -1157,18 +1470,88 @@ pub const History = struct {
         start_line: usize,
         max_lines: usize,
     ) Allocator.Error!?[]u8 {
+        self.tree.beginPinScope();
+        defer self.tree.endPinScope();
         const iid = try self.tree.resolvePath(allocator, View.EVERYTHING, rel_path) orelse return null;
         const inode = self.tree.get(iid) orelse return null;
         const f = inode.fileConstPtr() orelse return null;
         const ck = f.content.get() orelse return null;
-        if (ck.* != .text) return null;
-        return try f.text.readLineRange(allocator, self.resolver(), start_line, max_lines);
+        switch (ck.*) {
+            .text => return try f.text.readLineRange(allocator, self.resolver(), start_line, max_lines),
+            .git_lazy => |ref| {
+                const raw = (try self.readGitBlobAlloc(allocator, ref.oid)) orelse return null;
+                defer allocator.free(raw);
+                var out: std.ArrayList(u8) = .empty;
+                errdefer out.deinit(allocator);
+                if (max_lines == 0 or raw.len == 0) return try out.toOwnedSlice(allocator);
+                var cur_line: usize = 0;
+                var idx: usize = 0;
+                while (idx < raw.len and cur_line < start_line) : (idx += 1) {
+                    if (raw[idx] == '\n') cur_line += 1;
+                }
+                if (cur_line < start_line) return try out.toOwnedSlice(allocator);
+                const start_idx = idx;
+                var emitted: usize = 0;
+                while (idx < raw.len) : (idx += 1) {
+                    if (raw[idx] == '\n') {
+                        emitted += 1;
+                        if (emitted >= max_lines) {
+                            idx += 1;
+                            break;
+                        }
+                    }
+                }
+                if (idx > start_idx) try out.appendSlice(allocator, raw[start_idx..idx]);
+                return try out.toOwnedSlice(allocator);
+            },
+            .binary, .git_binary => return null,
+        }
     }
 
     pub fn blameFile(self: *const History, allocator: Allocator, rel_path: []const u8) Allocator.Error!?std.ArrayList(BlameLine) {
+        self.tree.beginPinScope();
+        defer self.tree.endPinScope();
         const iid = try self.tree.resolvePath(allocator, View.EVERYTHING, rel_path) orelse return null;
         const inode = self.tree.get(iid) orelse return null;
         const f = inode.fileConstPtr() orelse return null;
+        if (f.content.nthIn(View.EVERYTHING, 0)) |ck_entry| {
+            if (ck_entry.value == .git_lazy) {
+                const ref = ck_entry.value.git_lazy;
+                const raw = (try self.readGitBlobAlloc(allocator, ref.oid)) orelse return null;
+                defer allocator.free(raw);
+                var out: std.ArrayList(BlameLine) = .empty;
+                errdefer {
+                    for (out.items) |*l| l.deinit(allocator);
+                    out.deinit(allocator);
+                }
+                const batch = self.dag.batchOf(ck_entry.op);
+                var cur_line: std.ArrayList(u8) = .empty;
+                defer cur_line.deinit(allocator);
+                var line_no: usize = 1;
+                for (raw) |ch| {
+                    if (ch == '\n') {
+                        try out.append(allocator, .{
+                            .line_no = line_no,
+                            .op = ck_entry.op,
+                            .batch = batch,
+                            .text = try cur_line.toOwnedSlice(allocator),
+                        });
+                        line_no += 1;
+                    } else {
+                        try cur_line.append(allocator, ch);
+                    }
+                }
+                if (cur_line.items.len > 0) {
+                    try out.append(allocator, .{
+                        .line_no = line_no,
+                        .op = ck_entry.op,
+                        .batch = batch,
+                        .text = try cur_line.toOwnedSlice(allocator),
+                    });
+                }
+                return out;
+            }
+        }
         var spans = try f.text.collectVisibleSpans(allocator, View.EVERYTHING);
         defer {
             for (spans.items) |*s| s.deinit(allocator);
@@ -1281,7 +1664,7 @@ pub const History = struct {
                     .binary => |tref| {
                         const same = switch (now_ck) {
                             .binary => |nref| nref.eql(tref),
-                            .text => false,
+                            else => false,
                         };
                         if (!same) {
                             var already_attached = false;
@@ -1313,9 +1696,27 @@ pub const History = struct {
                             try ops.append(allocator, .{ .set_content = .{ .inode = iid, .content = .{ .binary = tref } } });
                         }
                     },
+                    .git_binary => |tref| {
+                        const same = switch (now_ck) {
+                            .git_binary => |nref| nref.eql(tref),
+                            else => false,
+                        };
+                        if (!same) {
+                            try ops.append(allocator, .{ .set_content = .{ .inode = iid, .content = .{ .git_binary = tref } } });
+                        }
+                    },
+                    .git_lazy => |tref| {
+                        const same = switch (now_ck) {
+                            .git_lazy => |nref| nref.eql(tref),
+                            else => false,
+                        };
+                        if (!same) {
+                            try ops.append(allocator, .{ .set_content = .{ .inode = iid, .content = .{ .git_lazy = tref } } });
+                        }
+                    },
                     .text => {
                         switch (now_ck) {
-                            .binary => {
+                            .binary, .git_binary, .git_lazy => {
                                 const tgt_text = (try f.text.readIn(allocator, res, target_view)) orelse return error.MissingBlob;
                                 errdefer allocator.free(tgt_text);
                                 try ops.append(allocator, .{ .set_content = .{

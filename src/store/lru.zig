@@ -138,6 +138,16 @@ pub fn LruCacheContext(
             return true;
         }
 
+        pub fn take(self: *Self, key: K) ?V {
+            const kv = self.map.fetchRemove(key) orelse return null;
+            const node = kv.value;
+            self.unlink(node);
+            self.used_bytes -= self.entryBytes(&node.value);
+            const val = node.value;
+            self.allocator.destroy(node);
+            return val;
+        }
+
         pub fn evictToBudget(self: *Self) void {
             self.evictToBudgetExcluding(null);
         }

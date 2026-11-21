@@ -4,6 +4,7 @@ const id = @import("id.zig");
 const dag = @import("dag.zig");
 const diff = @import("diff.zig");
 const tree = @import("tree.zig");
+const git_dirs = @import("../fs/git_dirs.zig");
 const codec = @import("../store/codec.zig");
 const crypto = @import("../store/crypto.zig");
 
@@ -12,10 +13,30 @@ pub const MAX_OPS_PER_BATCH: usize = 1 << 20;
 pub const MAX_BLOBS_PER_BATCH: usize = 1 << 16;
 pub const MAX_SPLICES_PER_OP: usize = 1 << 20;
 
+fn encodeGitBlobRef(allocator: Allocator, w: *codec.Writer, r: tree.GitBlobRef) Allocator.Error!void {
+    try w.writeByte(allocator, r.oid.len);
+    try w.writeRaw(allocator, r.oid.slice());
+    try w.writeVarint(allocator, r.len);
+}
+
+fn decodeGitBlobRef(r: *codec.Reader) codec.DecodeError!tree.GitBlobRef {
+    const oid_len = try r.readByte();
+    const oid = switch (oid_len) {
+        20 => git_dirs.GitOid.fromSlice(try r.readFixed(20)) catch return error.InvalidData,
+        32 => git_dirs.GitOid.fromSlice(try r.readFixed(32)) catch return error.InvalidData,
+        else => return error.InvalidData,
+    };
+    const len = try r.readVarint();
+    return .{ .oid = oid, .len = len };
+}
+
 pub const Content = union(enum) {
     text_inline: []u8,
     text_blob: tree.BlobRef,
     binary: tree.BlobRef,
+    git_text_blob: tree.GitBlobRef,
+    git_binary: tree.GitBlobRef,
+    git_lazy: tree.GitBlobRef,
 
     pub fn deinit(self: *Content, allocator: Allocator) void {
         switch (self.*) {
@@ -29,6 +50,9 @@ pub const Content = union(enum) {
             .text_inline => |b| .{ .text_inline = try allocator.dupe(u8, b) },
             .text_blob => |r| .{ .text_blob = r },
             .binary => |r| .{ .binary = r },
+            .git_text_blob => |r| .{ .git_text_blob = r },
+            .git_binary => |r| .{ .git_binary = r },
+            .git_lazy => |r| .{ .git_lazy = r },
         };
     }
 
@@ -48,6 +72,18 @@ pub const Content = union(enum) {
                 try w.writeRaw(allocator, &r.oid);
                 try w.writeU64(allocator, r.len);
             },
+            .git_text_blob => |r| {
+                try w.writeByte(allocator, 3);
+                try encodeGitBlobRef(allocator, w, r);
+            },
+            .git_binary => |r| {
+                try w.writeByte(allocator, 4);
+                try encodeGitBlobRef(allocator, w, r);
+            },
+            .git_lazy => |r| {
+                try w.writeByte(allocator, 5);
+                try encodeGitBlobRef(allocator, w, r);
+            },
         }
     }
 
@@ -57,6 +93,9 @@ pub const Content = union(enum) {
             0 => .{ .text_inline = try r.readBytesAlloc(allocator) },
             1 => .{ .text_blob = .{ .oid = (try r.readFixed(32)).*, .len = try r.readU64() } },
             2 => .{ .binary = .{ .oid = (try r.readFixed(32)).*, .len = try r.readU64() } },
+            3 => .{ .git_text_blob = try decodeGitBlobRef(r) },
+            4 => .{ .git_binary = try decodeGitBlobRef(r) },
+            5 => .{ .git_lazy = try decodeGitBlobRef(r) },
             else => error.InvalidData,
         };
     }

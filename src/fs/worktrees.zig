@@ -678,10 +678,11 @@ pub const Worktrees = struct {
         var ours_only_ids: std.ArrayList(id.BatchId) = .empty;
         defer ours_only_ids.deinit(self.allocator);
         {
-            var hit = fork_ws.history.dag.headers.keyIterator();
-            while (hit.next()) |bid| {
-                if (!src_ws.history.dag.containsBatch(bid.*)) {
-                    try ours_only_ids.append(self.allocator, bid.*);
+            var all_bids = try fork_ws.history.dag.collectAllBatchIds(self.allocator);
+            defer all_bids.deinit(self.allocator);
+            for (all_bids.items) |bid| {
+                if (!src_ws.history.dag.containsBatch(bid)) {
+                    try ours_only_ids.append(self.allocator, bid);
                 }
             }
         }

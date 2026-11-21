@@ -19,6 +19,7 @@ pub const store = struct {
     pub const log = @import("store/log.zig");
     pub const blobs = @import("store/blobs.zig");
     pub const shadow = @import("store/shadow.zig");
+    pub const snapshot = @import("store/snapshot.zig");
 };
 
 pub const fs = struct {
