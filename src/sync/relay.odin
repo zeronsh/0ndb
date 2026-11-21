@@ -1,8 +1,10 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package osync
 
 import "base:runtime"
 import "core:strings"
+import "core:mem"
+import "core:slice"
 import "../pack"
 import "../prim"
 
@@ -135,6 +137,13 @@ Space_State :: struct {
 	redlog_busy: bool,
 	compact_red: i64,
 	compact_red_end: i64,
+	present:  map[Device_Id]Presence_Entry,
+}
+
+@(private)
+Presence_Entry :: struct {
+	conns: int,
+	since: i64,
 }
 
 Stream_State :: struct {
@@ -245,6 +254,8 @@ Conn :: struct {
 	feed_told: i64,
 	feed_hint: bool,
 	filter:    ^Feed_Filter,
+	presence:  bool,
+	present:   bool,
 	source:    [16]u8,
 	sourced:   bool,
 	pkey:      [32]u8,
@@ -892,6 +903,7 @@ _conn_close :: proc(c: ^Conn) {
 	}
 	sp := c.space
 	if sp != nil {
+		_presence_leave(r, sp, c)
 		if c.watching {
 			_remove_conn(&sp.watchers, c)
 		}
@@ -927,6 +939,91 @@ _conn_close :: proc(c: ^Conn) {
 	r.conns[c.ref.slot] = nil
 	append(&r.free, c.ref.slot)
 	append(&r.graveyard, c)
+}
+
+@(private)
+_presence_join :: proc(r: ^Relay, sp: ^Space_State, c: ^Conn) {
+	d := c.principal.participant
+	e := sp.present[d]
+	e.conns += 1
+	c.present = true
+	if e.conns == 1 {
+		e.since = prim.clock_mono_ns(r.cfg.clock)
+		sp.present[d] = e
+		_presence_send(r, sp, c, d, true, e.since)
+		return
+	}
+	sp.present[d] = e
+}
+
+@(private)
+_presence_leave :: proc(r: ^Relay, sp: ^Space_State, c: ^Conn) {
+	if !c.present {
+		return
+	}
+	c.present = false
+	d := c.principal.participant
+	e, ok := sp.present[d]
+	if !ok {
+		return
+	}
+	e.conns -= 1
+	if e.conns > 0 {
+		sp.present[d] = e
+		return
+	}
+	delete_key(&sp.present, d)
+	_presence_send(r, sp, c, d, false, prim.clock_mono_ns(r.cfg.clock))
+}
+
+@(private)
+_presence_send :: proc(r: ^Relay, sp: ^Space_State, from: ^Conn, d: Device_Id, up: bool, at: i64) {
+	b: [FRAME_HEADER + 3 + PRESENCE_ENTRY]u8
+	frame_header(b[:], .Presence, 3 + PRESENCE_ENTRY)
+	b[FRAME_HEADER] = 0
+	b[FRAME_HEADER + 1] = 1
+	b[FRAME_HEADER + 2] = 0
+	e := b[FRAME_HEADER + 3:]
+	v := d
+	copy(e[:16], v[:])
+	e[16] = 1 if up else 0
+	prim.put_u64le(e[17:], u64(at))
+	for f in sp.feeders {
+		if f != from && f.presence && _can(f, .List, {}) {
+			_push_small(f, b[:])
+			_conn_kick(f)
+		}
+	}
+}
+
+@(private)
+_presence_snapshot :: proc(r: ^Relay, sp: ^Space_State, c: ^Conn) {
+	n := len(sp.present)
+	buf, aerr := make([]u8, FRAME_HEADER + 3 + n * PRESENCE_ENTRY, r.allocator)
+	if aerr != nil {
+		_conn_close(c)
+		return
+	}
+	ids := make([dynamic]Device_Id, 0, n, context.temp_allocator)
+	for d in sp.present {
+		append(&ids, d)
+	}
+	slice.sort_by(ids[:], proc(a, b: Device_Id) -> bool {
+		x, y := a, b
+		return mem.compare(x[:], y[:]) < 0
+	})
+	frame_header(buf, .Presence, 3 + n * PRESENCE_ENTRY)
+	buf[FRAME_HEADER] = PRESENCE_SNAPSHOT
+	buf[FRAME_HEADER + 1] = u8(n)
+	buf[FRAME_HEADER + 2] = u8(n >> 8)
+	for d, i in ids {
+		e := buf[FRAME_HEADER + 3 + i * PRESENCE_ENTRY:]
+		v := d
+		copy(e[:16], v[:])
+		e[16] = 1
+		prim.put_u64le(e[17:], u64(sp.present[d].since))
+	}
+	_push_buf(c, buf)
 }
 
 @(private)
@@ -1203,6 +1300,7 @@ _on_hello :: proc(c: ^Conn, payload: []u8) {
 	c.pcounted = true
 	c.principal = p
 	_conn_ready(c)
+	_presence_join(r, sp, c)
 	b: [FRAME_HEADER + 25]u8
 	frame_header(b[:], .Welcome, 25)
 	b[FRAME_HEADER] = PROTOCOL_VERSION
@@ -1247,6 +1345,7 @@ _space_get :: proc(r: ^Relay, id: Space_Id) -> (sp: ^Space_State, err: Error) {
 	sp.redlog_qp = make([dynamic]^Pending, r.allocator)
 	sp.redlog_flight = make([dynamic]u8, r.allocator)
 	sp.redlog_fp = make([dynamic]^Pending, r.allocator)
+	sp.present = make(map[Device_Id]Presence_Entry, r.allocator)
 	r.spaces[id] = sp
 	return sp, .None
 }
@@ -1283,6 +1382,7 @@ _space_release :: proc(r: ^Relay, sp: ^Space_State) {
 	delete(sp.redlog_qp)
 	delete(sp.redlog_flight)
 	delete(sp.redlog_fp)
+	delete(sp.present)
 	r.store.namespace_close(r.store.data, sp.ns)
 	free(sp, r.allocator)
 }
@@ -1900,7 +2000,7 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_len(c, op.reply, op.id, op.len)
 		case .Stored:
 			_reply_id(c, .Stored, op.id)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed:
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence:
 		}
 	case .Append:
 		st := op.stream

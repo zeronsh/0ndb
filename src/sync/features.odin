@@ -1,4 +1,4 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package osync
 
 import "core:crypto"
@@ -692,7 +692,7 @@ _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 		return mem.compare(x[:], y[:]) < 0
 	})
 	from := u64(0) if from_start || r.feed_cursor < 0 else u64(r.feed_cursor)
-	client_feed_follow(&r.client, from, pats[:], true)
+	client_feed_follow(&r.client, from, pats[:], true, false, true)
 }
 
 @(private)

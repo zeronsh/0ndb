@@ -1,4 +1,4 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package osync
 
 import "base:runtime"
@@ -393,6 +393,10 @@ _on_feed :: proc(c: ^Conn, rd: ^prim.Reader) {
 	c.feed_off = off
 	c.feed_told = off
 	c.feed_hint = true
+	if flags & FEED_PRESENCE != 0 && _can(c, .List, {}) {
+		c.presence = true
+		_presence_snapshot(r, sp, c)
+	}
 	_announce(c, off, off, nil)
 }
 

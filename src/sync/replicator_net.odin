@@ -1,4 +1,4 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package osync
 
 import "base:runtime"
@@ -356,6 +356,9 @@ replicator_link_down :: proc(r: ^Replicator, err: Error = .Closed) {
 
 @(private)
 _repl_close :: proc(r: ^Replicator) {
+	if r.presence != nil {
+		clear(&r.presence)
+	}
 	if r.deadline != 0 {
 		prim.timer_cancel(r.loop, r.deadline)
 		r.deadline = 0

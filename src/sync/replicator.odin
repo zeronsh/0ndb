@@ -1,4 +1,4 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package osync
 
 import "base:runtime"
@@ -32,6 +32,7 @@ Repl_Event_Kind :: enum u8 {
 	Quarantined,
 	Relay_Misbehaving,
 	Keys_Needed,
+	Presence,
 	Object_Shredded,
 }
 
@@ -79,6 +80,12 @@ Stream_Sealing :: enum u8 {
 	Unknown,
 	Stream_Key,
 	Key_Tree,
+}
+
+Presence_State :: struct {
+	up:    bool,
+	since: i64,
+	seen:  bool,
 }
 
 Relay_Address :: struct {
@@ -197,6 +204,7 @@ Replicator :: struct {
 	relay_at:   int,
 	deadline:   prim.Timer,
 	tampered:   bool,
+	presence:   map[Device_Id]Presence_State,
 	read_reqs:  int,
 	read_bytes: i64,
 	tamper_run: int,
@@ -323,6 +331,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	_feed_cursor_load(r)
 	r.fetches = make([dynamic]^Ckpt_Fetch, allocator)
 	r.reap = make([dynamic]^Remote, allocator)
+	r.presence = make(map[Device_Id]Presence_State, allocator)
 	r.reap_local = make([dynamic]^Local, allocator)
 	r.tr.fd = prim.INVALID_FD
 	return .None
@@ -361,6 +370,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.fetches)
 	delete(r.reap)
 	delete(r.reap_local)
+	delete(r.presence)
 	delete(r.endpoints)
 	delete(r.publics)
 	if r.deadline != 0 {
@@ -1140,6 +1150,51 @@ _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
 	_remote_free(r, rm)
 }
 
+replicator_presence :: proc(r: ^Replicator, device: Device_Id) -> (up: bool, since: i64, known: bool) {
+	p, ok := r.presence[device]
+	return p.up, p.since, ok
+}
+
+@(private)
+_on_presence :: proc(r: ^Replicator, ev: ^Event) {
+	if ev.at < 0 {
+		if ev.first {
+			for _, &p in r.presence {
+				p.seen = false
+			}
+			return
+		}
+		gone := make([dynamic]Device_Id, context.temp_allocator)
+		for d, p in r.presence {
+			if !p.seen && p.up {
+				append(&gone, d)
+			}
+		}
+		slice.sort_by(gone[:], proc(a, b: Device_Id) -> bool {
+			x, y := a, b
+			return mem.compare(x[:], y[:]) < 0
+		})
+		for d in gone {
+			p := r.presence[d]
+			p.up = false
+			r.presence[d] = p
+			_emit(r, Repl_Event{kind = .Presence, device = d, from = 0, length = p.since})
+		}
+		return
+	}
+	d: Device_Id
+	copy(d[:], ev.id[:16])
+	if d == r.cfg.self {
+		return
+	}
+	up := ev.at != 0
+	old, had := r.presence[d]
+	r.presence[d] = Presence_State{up = up, since = ev.length, seen = true}
+	if !had || old.up != up || old.since != ev.length {
+		_emit(r, Repl_Event{kind = .Presence, device = d, from = 1 if up else 0, length = ev.length})
+	}
+}
+
 @(private)
 DEADLINE_TICK_MS :: 10_000
 
@@ -1753,6 +1808,8 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_objs_on_missing(r, Object_Key(ev.id))
 	case .Forgotten:
 		_objs_on_forgotten(r, Object_Key(ev.id))
+	case .Presence:
+		_on_presence(r, ev)
 	case .Probed:
 		if rm, ok := r.remotes[Stream_Id(ev.id)]; ok {
 			if rm.probing {
@@ -1851,9 +1908,9 @@ _repl_on_ready :: proc(r: ^Replicator) {
 	} else {
 		_list_send(r, r.cursor if r.listed else 0)
 		if r.feed_cursor >= 0 {
-			client_feed_follow(&r.client, u64(r.feed_cursor))
+			client_feed_follow(&r.client, u64(r.feed_cursor), nil, false, false, true)
 		} else {
-			client_feed_follow(&r.client, FEED_DROPPED)
+			client_feed_follow(&r.client, FEED_DROPPED, nil, false, false, true)
 		}
 	}
 	_fetches_ready(r)

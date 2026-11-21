@@ -30,6 +30,7 @@ Event_Kind :: enum u8 {
 	Announce,
 	Forgotten,
 	Probed,
+	Presence,
 }
 
 Event :: struct {
@@ -482,7 +483,7 @@ client_redact :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
 	return .None
 }
 
-client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil, filtered := false, additive := false) -> Error {
+client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil, filtered := false, additive := false, presence := false) -> Error {
 	if len(patterns) > FEED_PATTERNS_MAX {
 		return .Too_Large
 	}
@@ -495,13 +496,15 @@ client_feed_follow :: proc(c: ^Client, from: u64, patterns: []Feed_Pattern = nil
 		w := prim.writer(b)
 		prim.write_u64le(&w, from)
 		if filtered || len(patterns) > 0 {
-			prim.write_u8(&w, FEED_FILTERED | (FEED_ADD if additive || !first else 0))
+			prim.write_u8(&w, FEED_FILTERED | (FEED_ADD if additive || !first else 0) | (FEED_PRESENCE if presence else 0))
 			prim.write_u16le(&w, u16(n))
 			for p in rest[:n] {
 				prim.write_u8(&w, u8(p.kind))
 				k := p.bytes
 				prim.write_raw(&w, k[:32] if p.kind == .Exact else k[:16])
 			}
+		} else if presence {
+			prim.write_u8(&w, FEED_PRESENCE)
 		}
 		frame_end(b, start, &w) or_return
 		if !((additive || !first) && c.feed_on) {
@@ -763,6 +766,29 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		_await_done(c, ev.id)
 		ev.at = get_i64(&r)
 		ev.length = get_i64(&r)
+	case .Presence:
+		flags := prim.read_u8(&r)
+		n := int(prim.read_u16le(&r))
+		if !prim.reader_ok(&r) || prim.reader_remaining(&r) != n * PRESENCE_ENTRY {
+			return .Protocol
+		}
+		snapshot := flags & PRESENCE_SNAPSHOT != 0
+		if snapshot {
+			e := Event{kind = .Presence, first = true, at = -1}
+			handler(user, &e) or_return
+		}
+		for _ in 0 ..< n {
+			e := Event{kind = .Presence}
+			prim.read_fixed(&r, e.id[:16])
+			e.at = i64(prim.read_u8(&r))
+			e.length = get_i64(&r)
+			handler(user, &e) or_return
+		}
+		if snapshot {
+			e := Event{kind = .Presence, last = true, at = -1}
+			handler(user, &e) or_return
+		}
+		return .None
 	case .Length, .Probed:
 		n := int(prim.read_u16le(&r))
 		if prim.reader_remaining(&r) != n * 40 {

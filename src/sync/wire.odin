@@ -54,6 +54,7 @@ Kind :: enum u8 {
 	Announce  = 0x8f,
 	Forgotten = 0x90,
 	Probed    = 0x91,
+	Presence  = 0x92,
 }
 
 Code :: enum u8 {
@@ -87,6 +88,9 @@ FEED_PATTERNS_FRAME :: 1900
 FEED_SKIP_REPORT :: 16 * FEED_BATCH * FEED_ENTRY
 FEED_FILTERED :: 1
 FEED_ADD :: 2
+FEED_PRESENCE :: 4
+PRESENCE_ENTRY :: 16 + 1 + 8
+PRESENCE_SNAPSHOT :: 1
 
 Feed_Pattern_Kind :: enum u8 {
 	Prefix = 1,
@@ -256,7 +260,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 		}
 	} else {
 		#partial switch k {
-		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed:
+		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence:
 		case .Data:
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
 		case .Object:
