@@ -697,6 +697,16 @@ _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 
 @(private)
 _is_boundary :: proc(rm: ^Remote, x: i64) -> bool {
+	for c in rm.claims {
+		if c == x {
+			return true
+		}
+	}
+	return _proven_boundary(rm, x)
+}
+
+@(private)
+_proven_boundary :: proc(rm: ^Remote, x: i64) -> bool {
 	if x == 0 || x == rm.relay_len {
 		return true
 	}
@@ -792,13 +802,18 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 	}
 	held := false
 	if _is_boundary(rm, at) {
+		claimed := !_proven_boundary(rm, at)
 		pos := 0
 		for len(data) - pos >= journal.OVERHEAD {
 			n := int(prim.get_u32le(data[pos:]))
-			if n > journal.MAX_BODY {
+			size := n + journal.OVERHEAD
+			if n > journal.MAX_BODY || (size <= len(data) - pos && int(prim.get_u32le(data[pos + size - 4:])) != n) {
+				if pos == 0 && claimed {
+					_unclaim(rm, at)
+					return
+				}
 				return 0, pos, 0, true
 			}
-			size := n + journal.OVERHEAD
 			if size > len(data) - pos {
 				break
 			}

@@ -150,6 +150,9 @@ Remote :: struct {
 	grouped:   bool,
 	quarantined: bool,
 	keys_wait: bool,
+	claims:    [dynamic]i64,
+	backward:  bool,
+	last_from: i64,
 	scope:     Scope,
 	head_keys: string,
 	head_min:  u64,
@@ -194,6 +197,8 @@ Replicator :: struct {
 	relay_at:   int,
 	deadline:   prim.Timer,
 	tampered:   bool,
+	read_reqs:  int,
+	read_bytes: i64,
 	tamper_run: int,
 	phase:      Phase,
 	fd:         prim.Fd,
@@ -514,18 +519,23 @@ replicator_want :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: 
 	}
 	rm := _remote_get(r, scope, device, name, epoch) or_return
 	for g in ranges {
-		dup := false
-		for w in rm.wants {
-			if w.from <= g.from && w.to >= g.to {
-				dup = true
+		rm.backward = g.from < rm.last_from
+		rm.last_from = g.from
+		_claim(rm, g.from)
+		_claim(rm, g.to)
+		merged := false
+		for &w in rm.wants {
+			if w.from <= g.to && g.from <= w.to {
+				w.from = min(w.from, g.from)
+				w.to = max(w.to, g.to)
+				merged = true
 				break
 			}
 		}
-		if dup {
-			continue
-		}
-		if _, e := append(&rm.wants, g); e != nil {
-			return .No_Memory
+		if !merged {
+			if _, e := append(&rm.wants, g); e != nil {
+				return .No_Memory
+			}
 		}
 		if rm.relay_len < 0 || g.to > rm.relay_len {
 			rm.want_gen += 1
@@ -546,6 +556,7 @@ replicator_want_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, n
 @(private)
 _remote_want_tail :: proc(r: ^Replicator, rm: ^Remote, n: i64) -> Error {
 	rm.tail = max(rm.tail, max(n, 1))
+	rm.backward = true
 	rm.want_gen += 1
 	_remote_settle(r, rm)
 	_repl_flush(r)
@@ -1067,6 +1078,7 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 	rm.wants = make([dynamic]journal.Range, r.allocator)
 	rm.inflight = make([dynamic]journal.Range, r.allocator)
 	rm.verified = make([dynamic]journal.Range, r.allocator)
+	rm.claims = make([dynamic]i64, r.allocator)
 	nerr, perr: Error
 	rm.name, nerr = _clone_string(name, r.allocator)
 	rm.path, perr = _clone_string(path, r.allocator)
@@ -1106,6 +1118,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 	delete(rm.wants)
 	delete(rm.inflight)
 	delete(rm.verified)
+	delete(rm.claims)
 	delete(rm.name, r.allocator)
 	delete(rm.path, r.allocator)
 	free(rm, r.allocator)
@@ -1240,26 +1253,76 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || _covered_inflight(rm, gap) {
 		return
 	}
-	fetch := gap
-	if !_is_boundary(rm, fetch.to) {
-		next := rm.relay_len
-		for h in journal.replica_have(&rm.rep) {
-			if h.from >= fetch.to {
-				next = h.from
-				break
-			}
-		}
-		if next > fetch.to {
-			fetch.to = next
+	prev_end := i64(0)
+	next_start := rm.relay_len if rm.relay_len >= gap.to else gap.to
+	for h in journal.replica_have(&rm.rep) {
+		if h.to <= gap.from {
+			prev_end = max(prev_end, h.to)
+		} else if h.from >= gap.to {
+			next_start = h.from
+			break
 		}
 	}
+	fetch := gap
 	if fetch.to - fetch.from < MIN_FETCH {
-		fetch.from = max(fetch.to - MIN_FETCH, 0)
-	} else if !_is_boundary(rm, fetch.from) && fetch.to - fetch.from > STAGE_MAX {
-		fetch.from = fetch.to - STAGE_MAX
+		if rm.backward {
+			fetch.from = max(fetch.to - MIN_FETCH, prev_end)
+			fetch.to = max(fetch.to, min(fetch.from + MIN_FETCH, next_start))
+		} else {
+			fetch.to = max(fetch.to, min(fetch.from + MIN_FETCH, next_start))
+			fetch.from = min(fetch.from, max(fetch.to - MIN_FETCH, prev_end))
+		}
+	}
+	if !_is_boundary(rm, fetch.from) && !_is_boundary(rm, fetch.to) {
+		if rm.backward && next_start > fetch.to && next_start - fetch.from <= STAGE_MAX {
+			fetch.to = next_start
+		} else {
+			fetch.from = prev_end
+		}
+	}
+	if fetch.to - fetch.from > STAGE_MAX {
+		if rm.backward && _is_boundary(rm, fetch.to) || !_is_boundary(rm, fetch.from) {
+			fetch.from = fetch.to - STAGE_MAX
+		} else {
+			fetch.to = fetch.from + STAGE_MAX
+		}
 	}
 	if client_read(&r.client, rm.id, fetch.from, fetch.to) == .None {
 		append(&rm.inflight, fetch)
+		r.read_reqs += 1
+	}
+}
+
+replicator_read_counters :: proc "contextless" (r: ^Replicator) -> (requests: int, bytes: i64) {
+	return r.read_reqs, r.read_bytes
+}
+
+@(private)
+CLAIMS_MAX :: 64
+
+@(private)
+_claim :: proc(rm: ^Remote, x: i64) {
+	if x <= 0 {
+		return
+	}
+	for c in rm.claims {
+		if c == x {
+			return
+		}
+	}
+	if len(rm.claims) >= CLAIMS_MAX {
+		ordered_remove(&rm.claims, 0)
+	}
+	append(&rm.claims, x)
+}
+
+@(private)
+_unclaim :: proc(rm: ^Remote, x: i64) {
+	for c, i in rm.claims {
+		if c == x {
+			ordered_remove(&rm.claims, i)
+			return
+		}
 	}
 }
 
@@ -1553,6 +1616,7 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 				append(&l.verify, ..ev.data)
 			}
 		} else if r.rx_remote != nil {
+			r.read_bytes += i64(len(ev.data))
 			append(&r.stage, ..ev.data)
 			if len(r.stage) >= STAGE_MAX {
 				_stage_flush(r, false, ev.length)
