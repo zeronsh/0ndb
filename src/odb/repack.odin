@@ -1,16 +1,14 @@
 package odb
 
-import "base:runtime"
 import "core:c"
 import "core:encoding/endian"
 import hashing "core:hash"
 import "core:io"
-import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:sync"
-import "core:time"
 import zlib "vendor:zlib"
+import "../prim"
 
 Repack_Options :: struct {
 	small_pack_bytes: i64,
@@ -36,6 +34,7 @@ Repack_Stats :: struct {
 	packs_removed:  int,
 	packed_dropped: int,
 	loosened:       int,
+	pinned_hits:    int,
 	bytes_before:   i64,
 	bytes_after:    i64,
 }
@@ -65,20 +64,21 @@ Rev_Entry :: struct {
 Source :: struct {
 	pack:  ^Pack,
 	base:  string,
-	mtime: time.Time,
+	mtime: i64,
 	rev:   []Rev_Entry,
 }
 
 @(private)
 Loosen :: struct {
 	oid:   Oid,
-	mtime: time.Time,
+	mtime: i64,
 }
 
 @(private)
 Prune_Filter :: struct {
 	reachable: ^map[Oid]struct{},
-	cutoff:    time.Time,
+	drop:      ^map[Oid]struct{},
+	cutoff:    i64,
 }
 
 @(private)
@@ -135,9 +135,15 @@ repack_run :: proc(db: ^Odb, opts: Repack_Options, filter: ^Prune_Filter) -> (st
 	}
 	a := db.allocator
 	lock_buf: [PATH_MAX]u8
-	lock_path := concat_into(lock_buf[:], db.dirs[0].path, "/pack/0ndb-repack.lock") or_return
-	repack_lock(lock_path) or_return
-	defer os.remove(lock_path)
+	lock_path := concat_into(lock_buf[:], db.dirs[0].path, "/info/0ndb-repack.lock") or_return
+	prim.mkdir_all(db.vfs, parent_dir(lock_path))
+	lock_fd, lerr := prim.lock_file(db.vfs, lock_path)
+	if lerr != .None {
+		return {}, perr(lerr)
+	}
+	defer prim.close_file(db.vfs, lock_fd)
+	mapped := bulk_begin(db)
+	defer bulk_end(db, mapped)
 
 	s := Repack_State{db = db, opts = opts, filter = filter}
 	s.opts.window = clamp(s.opts.window, 0, 256)
@@ -223,26 +229,6 @@ write_new_pack :: proc(s: ^Repack_State) -> (checksum: Oid, err: Error) {
 }
 
 @(private)
-repack_lock :: proc(path: string) -> Error {
-	for attempt in 0 ..< 2 {
-		f, err := os.open(path, {.Write, .Create, .Excl}, os.perm_number(0o644))
-		if err == nil {
-			os.close(f)
-			return .None
-		}
-		if err != .Exist || attempt > 0 {
-			return .Locked if err == .Exist else map_os_error(err)
-		}
-		mtime, merr := os.modification_time_by_path(path)
-		if merr != nil || time.since(mtime) < time.Hour {
-			return .Locked
-		}
-		os.remove(path)
-	}
-	return .Locked
-}
-
-@(private)
 repack_cleanup :: proc(s: ^Repack_State) {
 	a := s.db.allocator
 	for &w in s.window {
@@ -282,7 +268,7 @@ sources_stored :: proc(s: ^Repack_State) -> bool {
 	for src in s.sources {
 		pb: [PATH_MAX]u8
 		path := concat_into(pb[:], src.base, ".pack") or_else ""
-		if path != "" && pack_file_is_stored(path) {
+		if path != "" && pack_file_is_stored(s.db.vfs, path) {
 			return true
 		}
 	}
@@ -290,14 +276,14 @@ sources_stored :: proc(s: ^Repack_State) -> bool {
 }
 
 @(private)
-pack_file_is_stored :: proc(path: string) -> bool {
-	f, err := os.open(path)
-	if err != nil {
+pack_file_is_stored :: proc(vfs: prim.Vfs, path: string) -> bool {
+	fd, err := prim.open_file(vfs, path)
+	if err != .None {
 		return false
 	}
-	defer os.close(f)
+	defer prim.close_file(vfs, fd)
 	buf: [64]u8
-	n, _ := os.read_at(f, buf[:], 12)
+	n, _ := prim.read_at(vfs, fd, buf[:], 12)
 	p := 0
 	for p < n && buf[p] & 0x80 != 0 {
 		p += 1
@@ -311,6 +297,9 @@ keep_object :: proc(s: ^Repack_State, oid: Oid) -> bool {
 	if s.filter == nil {
 		return true
 	}
+	if s.filter.drop != nil {
+		return oid not_in s.filter.drop^
+	}
 	return oid in s.filter.reachable^
 }
 
@@ -318,35 +307,50 @@ keep_object :: proc(s: ^Repack_State, oid: Oid) -> bool {
 collect_loose :: proc(s: ^Repack_State) -> Error {
 	db := s.db
 	hex_len := oid_size(db.format) * 2
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	ta := context.temp_allocator
 	for i in 0 ..< 256 {
 		pb: [PATH_MAX]u8
 		fan := [2]u8{HEX_DIGITS[i >> 4], HEX_DIGITS[i & 15]}
 		dir := concat_into(pb[:], db.dirs[0].path, "/", string(fan[:])) or_return
-		entries, err := os.read_all_directory_by_path(dir, ta)
-		if err != nil {
+		d: prim.Dir
+		if prim.dir_open(db.vfs, &d, dir, db.allocator) != .None {
 			continue
 		}
-		for e in entries {
-			if len(e.name) != hex_len - 2 || e.type != .Regular {
+		defer prim.dir_close(db.vfs, &d)
+		for {
+			e, ok, derr := prim.dir_next(db.vfs, &d)
+			if !ok || derr != .None {
+				break
+			}
+			if len(e.name) != hex_len - 2 || (e.kind != .File && e.kind != .Unknown) {
 				continue
 			}
 			hb: [MAX_HEX]u8
 			copy(hb[:], fan[:])
 			copy(hb[2:], e.name)
-			oid, _, ok := oid_from_hex(string(hb[:hex_len]))
-			if !ok {
+			oid, _, oid_ok := oid_from_hex(string(hb[:hex_len]))
+			if !oid_ok {
+				continue
+			}
+			fb: [PATH_MAX]u8
+			fpath := concat_into(fb[:], dir, "/", e.name) or_continue
+			st, serr := prim.lstat(db.vfs, fpath)
+			if serr != .None || st.kind != .File {
 				continue
 			}
 			s.loose_seen[oid] = {}
-			if !keep_object(s, oid) {
-				if time.diff(e.modification_time, s.filter.cutoff) > 0 {
+			if s.filter != nil && s.filter.drop != nil {
+				if oid in s.filter.drop^ {
 					append(&s.drop_loose, oid)
 				}
 				continue
 			}
-			s.stats.bytes_before += e.size
+			if !keep_object(s, oid) {
+				if st.mtime_ns < s.filter.cutoff {
+					append(&s.drop_loose, oid)
+				}
+				continue
+			}
+			s.stats.bytes_before += st.size
 			add_candidate(s, oid, -1, 0, 0)
 		}
 	}
@@ -379,24 +383,36 @@ collect_packs :: proc(s: ^Repack_State) -> Error {
 	for p in d.packs {
 		pb: [PATH_MAX]u8
 		keep := concat_into(pb[:], p.base, ".keep") or_return
-		if os.exists(keep) {
-			continue
-		}
+		pinned := prim.exists(db.vfs, keep)
 		promisor := concat_into(pb[:], p.base, ".promisor") or_return
-		if os.exists(promisor) {
+		pinned = pinned || prim.exists(db.vfs, promisor)
+		if s.filter != nil && s.filter.drop != nil {
+			hits := 0
+			for oid in s.filter.drop^ {
+				if _, found := pack_find(p, oid); found {
+					hits += 1
+				}
+			}
+			if hits == 0 {
+				continue
+			}
+			if pinned {
+				s.stats.pinned_hits += hits
+				continue
+			}
+		} else if pinned {
 			continue
 		}
 		pack_path := concat_into(pb[:], p.base, ".pack") or_return
-		fi, err := os.stat(pack_path, context.temp_allocator)
-		if err != nil {
+		st, err := prim.stat(db.vfs, pack_path)
+		if err != .None {
 			continue
 		}
-		size, mtime := fi.size, fi.modification_time
-		os.file_info_delete(fi, context.temp_allocator)
-		if s.filter == nil && size >= s.opts.small_pack_bytes && !pack_file_is_stored(pack_path) {
+		size, mtime := st.size, st.mtime_ns
+		if s.filter == nil && size >= s.opts.small_pack_bytes && !pack_file_is_stored(db.vfs, pack_path) {
 			continue
 		}
-		pack_open_data(p, pb[:]) or_return
+		pack_open_data(db, p) or_return
 		rev, rerr := make([]Rev_Entry, p.count, db.allocator)
 		if rerr != nil {
 			return .Out_Of_Memory
@@ -423,7 +439,7 @@ collect_packs :: proc(s: ^Repack_State) -> Error {
 		for r in rev {
 			oid := pack_oid_at(p, int(r.pos))
 			if !keep_object(s, oid) {
-				if time.diff(mtime, s.filter.cutoff) > 0 {
+				if s.filter.drop != nil || mtime < s.filter.cutoff {
 					s.stats.packed_dropped += 1
 				} else if oid not_in s.loose_seen {
 					append(&s.loosen, Loosen{oid, mtime})
@@ -498,13 +514,14 @@ put_ofs :: proc(w: ^Buf_Writer, rel: i64) {
 
 @(private)
 try_reuse :: proc(s: ^Repack_State, i: int) -> bool {
+	db := s.db
 	o := &s.objects[i]
 	if o.src < 0 {
 		return false
 	}
 	src := &s.sources[o.src]
 	p := src.pack
-	h, herr := pack_entry_header(p, o.src_off)
+	h, herr := pack_entry_header(db, p, o.src_off)
 	if herr != .None {
 		return false
 	}
@@ -512,22 +529,20 @@ try_reuse :: proc(s: ^Repack_State, i: int) -> bool {
 	if ri < 0 {
 		return false
 	}
-	end := len(p.data) - p.hsz
+	limit := p.size - i64(p.hsz)
+	end := limit
 	if ri + 1 < len(src.rev) {
-		end = int(src.rev[ri + 1].offset)
+		end = src.rev[ri + 1].offset
 	}
-	if end <= h.start || end > len(p.data) - p.hsz {
+	if end <= h.start || end > limit {
 		return false
 	}
-	raw := p.data[o.src_off:end]
-	if hashing.crc32(raw) != endian.unchecked_get_u32be(p.idx[p.crcs + int(o.src_pos) * 4:]) {
-		return false
-	}
-	comp := p.data[h.start:end]
+	head: [8]u8
+	first := pack_view(db, p, h.start, 3, head[:]) or_else nil
 	base := -1
 	switch h.kind {
 	case 1 ..= 4:
-		if len(comp) >= 3 && comp[0] == 0x78 && comp[2] & 0x06 == 0 {
+		if len(first) < 3 || (first[0] == 0x78 && first[2] & 0x06 == 0) {
 			return false
 		}
 	case OBJ_OFS_DELTA, OBJ_REF_DELTA:
@@ -557,12 +572,35 @@ try_reuse :: proc(s: ^Repack_State, i: int) -> bool {
 	if base >= 0 {
 		bw_write(&s.b.w, pack_entry_head(hb[:], OBJ_OFS_DELTA, h.size))
 		put_ofs(&s.b.w, start - s.objects[base].offset)
-		o.depth = s.objects[base].depth + 1
-		s.stats.deltas += 1
 	} else {
 		bw_write(&s.b.w, pack_entry_head(hb[:], h.kind, h.size))
 	}
-	bw_write(&s.b.w, comp)
+	crc: u32
+	buf: [IO_CHUNK]u8
+	pos := o.src_off
+	for pos < end {
+		chunk, verr := pack_view(db, p, pos, int(min(end - pos, i64(len(buf)))), buf[:])
+		if verr != .None || len(chunk) == 0 {
+			pack_rewind(&s.b, start)
+			return false
+		}
+		crc = hashing.crc32(chunk, crc)
+		if pos + i64(len(chunk)) > h.start {
+			skip := max(h.start - pos, 0)
+			bw_write(&s.b.w, chunk[skip:])
+		}
+		pos += i64(len(chunk))
+	}
+	if s.b.w.err != .None || crc != endian.unchecked_get_u32be(p.idx[p.crcs + int(o.src_pos) * 4:]) {
+		if s.b.w.err == .None {
+			pack_rewind(&s.b, start)
+		}
+		return false
+	}
+	if base >= 0 {
+		o.depth = s.objects[base].depth + 1
+		s.stats.deltas += 1
+	}
 	o.offset = start
 	o.written = true
 	s.stats.reused += 1
@@ -766,9 +804,8 @@ verify_new_pack :: proc(s: ^Repack_State, checksum: Oid) -> Error {
 		}
 		qb: [PATH_MAX]u8
 		pack_path := concat_into(qb[:], base, ".pack") or_return
-		if info, err := os.stat(pack_path, context.temp_allocator); err == nil {
-			s.stats.bytes_after = info.size
-			os.file_info_delete(info, context.temp_allocator)
+		if st, err := prim.stat(db.vfs, pack_path); err == .None {
+			s.stats.bytes_after = st.size
 		}
 		return .None
 	}
@@ -785,7 +822,7 @@ loosen_young :: proc(s: ^Repack_State) -> Error {
 		err or_return
 		pb: [PATH_MAX]u8
 		path := loose_path(pb[:], db.dirs[0].path, l.oid, db.format) or_return
-		os.change_times(path, l.mtime, l.mtime)
+		set_mtime(db, path, l.mtime)
 		s.stats.loosened += 1
 	}
 	return .None
@@ -805,7 +842,7 @@ remove_replaced :: proc(s: ^Repack_State, checksum: Oid, have_new: bool) {
 		for ext in ([]string{".idx", ".pack", ".rev", ".bitmap", ".mtimes"}) {
 			pb: [PATH_MAX]u8
 			path := concat_into(pb[:], src.base, ext) or_continue
-			os.remove(path)
+			prim.remove(db.vfs, path)
 		}
 		s.stats.packs_removed += 1
 	}
@@ -827,7 +864,7 @@ remove_replaced :: proc(s: ^Repack_State, checksum: Oid, have_new: bool) {
 		pb: [PATH_MAX]u8
 		fan := [2]u8{HEX_DIGITS[i >> 4], HEX_DIGITS[i & 15]}
 		dir := concat_into(pb[:], db.dirs[0].path, "/", string(fan[:])) or_continue
-		if os.remove(dir) == nil {
+		if prim.remove_dir(db.vfs, dir) == .None {
 			track(db, "", db.dirs[0].path)
 		}
 	}
@@ -843,7 +880,7 @@ remove_loose :: proc(s: ^Repack_State, oid: Oid) {
 	db := s.db
 	pb: [PATH_MAX]u8
 	path := loose_path(pb[:], db.dirs[0].path, oid, db.format) or_else ""
-	if path != "" && os.remove(path) == nil {
+	if path != "" && prim.remove(db.vfs, path) == .None {
 		s.stats.loose_removed += 1
 		track(db, "", parent_dir(path))
 	}

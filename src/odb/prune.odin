@@ -1,9 +1,7 @@
 package odb
 
-import "base:runtime"
-import "core:os"
 import "core:strings"
-import "core:time"
+import "../prim"
 
 Prune_Stats :: struct {
 	reachable: int,
@@ -22,8 +20,8 @@ prune :: proc(db: ^Odb, roots: []Oid, grace_seconds: i64, opts := DEFAULT_REPACK
 	append(&start, ..roots)
 	collect_ref_roots(db, &start) or_return
 	mark(db, start[:], &reachable) or_return
-	cutoff := time.time_add(time.now(), -time.Duration(grace_seconds) * time.Second)
-	filter := Prune_Filter{&reachable, cutoff}
+	cutoff := now_ns(db) - grace_seconds * 1_000_000_000
+	filter := Prune_Filter{reachable = &reachable, cutoff = cutoff}
 	stats.reachable = len(reachable)
 	stats.repack = repack_run(db, opts, &filter) or_return
 	return stats, .None
@@ -39,9 +37,9 @@ collect_ref_roots :: proc(db: ^Odb, out: ^[dynamic]Oid) -> Error {
 	walk_refs(db, db.common_dir, "refs", out) or_return
 	pb: [PATH_MAX]u8
 	path := concat_into(pb[:], db.common_dir, "/packed-refs") or_return
-	data, rerr := os.read_entire_file_from_path(path, db.allocator)
-	if rerr != nil {
-		return .None if rerr == .Not_Exist else .Io
+	data, rerr := vfs_read_file(db.vfs, path, db.allocator)
+	if rerr != .None {
+		return .None if rerr == .Not_Found else rerr
 	}
 	defer delete(data, db.allocator)
 	text := string(data)
@@ -64,19 +62,40 @@ collect_ref_roots :: proc(db: ^Odb, out: ^[dynamic]Oid) -> Error {
 
 @(private)
 walk_refs :: proc(db: ^Odb, root, rel: string, out: ^[dynamic]Oid) -> Error {
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	ta := context.temp_allocator
-	dir := strings.concatenate({root, "/", rel}, ta)
-	entries, err := os.read_all_directory_by_path(dir, ta)
-	if err != nil {
-		return .None if err == .Not_Exist else .Io
+	db_buf: [PATH_MAX]u8
+	dir := concat_into(db_buf[:], root, "/", rel) or_return
+	d: prim.Dir
+	if e := prim.dir_open(db.vfs, &d, dir, db.allocator); e != .None {
+		return .None if e == .Not_Found else perr(e)
 	}
-	for e in entries {
-		name := strings.concatenate({rel, "/", e.name}, ta)
-		#partial switch e.type {
-		case .Directory:
+	defer prim.dir_close(db.vfs, &d)
+	for {
+		e, ok, derr := prim.dir_next(db.vfs, &d)
+		if derr != .None {
+			return perr(derr)
+		}
+		if !ok {
+			break
+		}
+		if e.name == "." || e.name == ".." {
+			continue
+		}
+		nb: [PATH_MAX]u8
+		name := concat_into(nb[:], rel, "/", e.name) or_return
+		kind := e.kind
+		if kind == .Unknown {
+			fb: [PATH_MAX]u8
+			full := concat_into(fb[:], root, "/", name) or_return
+			st, serr := prim.lstat(db.vfs, full)
+			if serr != .None {
+				continue
+			}
+			kind = st.kind
+		}
+		#partial switch kind {
+		case .Dir:
 			walk_refs(db, root, name, out) or_return
-		case .Regular:
+		case .File:
 			if strings.has_suffix(e.name, ".lock") || !ref_name_valid(name) {
 				continue
 			}

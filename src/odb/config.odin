@@ -1,7 +1,7 @@
 package odb
 
 import "base:runtime"
-import "core:os"
+import "../prim"
 import "core:strings"
 
 config_lookup :: proc(text: string, section, key: string) -> (value: string, found: bool) {
@@ -52,12 +52,15 @@ config_lookup :: proc(text: string, section, key: string) -> (value: string, fou
 }
 
 @(private)
-read_object_format :: proc(common_dir: string, allocator: runtime.Allocator) -> (format: Hash_Format, err: Error) {
+read_object_format :: proc(vfs: prim.Vfs, common_dir: string, allocator: runtime.Allocator) -> (format: Hash_Format, err: Error) {
 	buf: [PATH_MAX]u8
 	path := concat_into(buf[:], common_dir, "/config") or_return
-	text, rerr := os.read_entire_file_from_path(path, allocator)
-	if rerr != nil {
+	text, rerr := vfs_read_file(vfs, path, allocator)
+	if rerr == .Not_Found {
 		return .Sha1, .None
+	}
+	if rerr != .None {
+		return .Sha1, rerr
 	}
 	defer delete(text, allocator)
 	value, found := config_lookup(string(text), "extensions", "objectformat")

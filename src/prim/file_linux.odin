@@ -24,6 +24,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	symlink    = _os_symlink,
 	readlink   = _os_readlink,
 	fchmod     = _os_fchmod,
+	set_times  = _os_set_times,
 	dir_open   = _os_dir_open,
 	dir_next   = _os_dir_next,
 	dir_close  = _os_dir_close,
@@ -506,4 +507,18 @@ _platform_data_dir :: proc(allocator: runtime.Allocator) -> (dir: string, err: E
 	}
 	home := _home() or_return
 	return path_join(allocator, home, ".local/share/0ndb")
+}
+
+@(private)
+_os_set_times :: proc(data: rawptr, path: string, atime_ns: i64, mtime_ns: i64) -> Error {
+	buf: Path_Buf = ---
+	p := cpath(path, &buf) or_return
+	if atime_ns < 0 || mtime_ns < 0 {
+		return .Invalid
+	}
+	times := [2]linux.Time_Spec{
+		{time_sec = uint(atime_ns / 1_000_000_000), time_nsec = uint(atime_ns % 1_000_000_000)},
+		{time_sec = uint(mtime_ns / 1_000_000_000), time_nsec = uint(mtime_ns % 1_000_000_000)},
+	}
+	return _error(linux.utimensat(linux.AT_FDCWD, p, &times[0], {}))
 }

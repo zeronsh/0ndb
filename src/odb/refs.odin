@@ -1,7 +1,7 @@
 package odb
 
 import "base:runtime"
-import "core:os"
+import "../prim"
 import "core:strings"
 
 @(private)
@@ -44,15 +44,15 @@ ref_base_dir :: proc(db: ^Odb, name: string) -> string {
 }
 
 @(private)
-read_small :: proc(path: string, buf: []u8) -> (text: string, err: Error) {
-	f, oerr := os.open(path)
-	if oerr != nil {
-		return "", map_os_error(oerr)
+read_small :: proc(vfs: prim.Vfs, path: string, buf: []u8) -> (text: string, err: Error) {
+	fd, oerr := prim.open_file(vfs, path)
+	if oerr != .None {
+		return "", perr(oerr)
 	}
-	defer os.close(f)
-	n, rerr := os.read_full(f, buf)
-	if rerr != nil && rerr != .EOF && rerr != .Unexpected_EOF {
-		return "", .Io
+	defer prim.close_file(vfs, fd)
+	n, rerr := prim.read_at(vfs, fd, buf, 0)
+	if rerr != .None {
+		return "", perr(rerr)
 	}
 	if n == len(buf) {
 		return "", .Too_Large
@@ -77,11 +77,11 @@ read_loose_ref :: proc(db: ^Odb, name: string, v: ^Ref_Value) -> Error {
 	}
 	pb: [PATH_MAX]u8
 	path := concat_into(pb[:], ref_base_dir(db, name), "/", name) or_return
-	if os.is_directory(path) {
+	if prim.is_dir(db.vfs, path) {
 		return .None
 	}
 	buf: [REF_FILE_MAX]u8
-	text, err := read_small(path, buf[:])
+	text, err := read_small(db.vfs, path, buf[:])
 	if err == .Not_Found {
 		return .None
 	}
@@ -109,10 +109,11 @@ read_loose_ref :: proc(db: ^Odb, name: string, v: ^Ref_Value) -> Error {
 read_packed_ref :: proc(db: ^Odb, name: string, v: ^Ref_Value) -> Error {
 	pb: [PATH_MAX]u8
 	path := concat_into(pb[:], db.common_dir, "/packed-refs") or_return
-	data, rerr := os.read_entire_file_from_path(path, db.allocator)
-	if rerr != nil {
+	data, rerr := vfs_read_file(db.vfs, path, db.allocator)
+	if rerr == .Not_Found {
 		return .None
 	}
+	rerr or_return
 	defer delete(data, db.allocator)
 	text := string(data)
 	for line in strings.split_lines_iterator(&text) {
@@ -199,7 +200,8 @@ read_head :: proc(db: ^Odb, allocator := context.allocator) -> (branch: string, 
 
 @(private)
 Ref_Lock :: struct {
-	f:         ^os.File,
+	fd:        prim.Fd,
+	held:      bool,
 	path_buf:  [PATH_MAX]u8,
 	lock_buf:  [PATH_MAX]u8,
 	path:      string,
@@ -217,25 +219,26 @@ ref_lock :: proc(db: ^Odb, name: string, l: ^Ref_Lock) -> Error {
 	l.path = concat_into(l.path_buf[:], base, "/", name) or_return
 	l.lock_path = concat_into(l.lock_buf[:], l.path, ".lock") or_return
 	parent := parent_dir(l.path)
-	l.created = !os.is_directory(parent)
+	l.created = !prim.is_dir(db.vfs, parent)
 	l.base = base
-	if e := os.make_directory_all(parent); e != nil && e != .Exist {
-		return .Io
+	if e := prim.mkdir_all(db.vfs, parent); e != .None {
+		return perr(e)
 	}
-	f, err := os.open(l.lock_path, {.Write, .Create, .Excl}, os.perm_number(0o644))
-	if err != nil {
-		return .Locked if err == .Exist else map_os_error(err)
+	fd, err := prim.open_file(db.vfs, l.lock_path, {.Write, .Create, .Exclusive}, 0o644)
+	if err != .None {
+		return .Locked if err == .Exists else perr(err)
 	}
-	l.f = f
+	l.fd = fd
+	l.held = true
 	return .None
 }
 
 @(private)
-ref_unlock :: proc(l: ^Ref_Lock) {
-	if l.f != nil {
-		os.close(l.f)
-		l.f = nil
-		os.remove(l.lock_path)
+ref_unlock :: proc(db: ^Odb, l: ^Ref_Lock) {
+	if l.held {
+		prim.close_file(db.vfs, l.fd)
+		l.held = false
+		prim.remove(db.vfs, l.lock_path)
 	}
 }
 
@@ -263,24 +266,24 @@ update_ref :: proc(db: ^Odb, name: string, new: Oid, expected: Maybe(Oid) = nil)
 	}
 	l: Ref_Lock
 	ref_lock(db, name, &l) or_return
-	defer ref_unlock(&l)
+	defer ref_unlock(db, &l)
 	ref_check_expected(db, name, expected) or_return
 	hb: [MAX_HEX + 1]u8
 	hex_buf: [MAX_HEX]u8
 	hex := oid_to_string(new, db.format, &hex_buf)
 	n := copy(hb[:], hex)
 	hb[n] = '\n'
-	if _, err := os.write(l.f, hb[:n + 1]); err != nil {
-		return .Io
+	if e := prim.write_at(db.vfs, l.fd, hb[:n + 1], 0); e != .None {
+		return perr(e)
 	}
-	if db.sync_writes && os.sync(l.f) != nil {
-		return .Io
+	if db.sync_writes {
+		perr(prim.datasync(db.vfs, l.fd)) or_return
 	}
-	os.close(l.f)
-	l.f = nil
-	if os.rename(l.lock_path, l.path) != nil {
-		os.remove(l.lock_path)
-		return .Io
+	prim.close_file(db.vfs, l.fd)
+	l.held = false
+	if e := prim.rename(db.vfs, l.lock_path, l.path); e != .None {
+		prim.remove(db.vfs, l.lock_path)
+		return perr(e)
 	}
 	track_tree(db, l.path, l.base, l.created)
 	return .None
@@ -289,7 +292,7 @@ update_ref :: proc(db: ^Odb, name: string, new: Oid, expected: Maybe(Oid) = nil)
 delete_ref :: proc(db: ^Odb, name: string, expected: Maybe(Oid) = nil) -> Error {
 	l: Ref_Lock
 	ref_lock(db, name, &l) or_return
-	defer ref_unlock(&l)
+	defer ref_unlock(db, &l)
 	current := ref_check_expected(db, name, expected) or_return
 	if !current.found {
 		return .Not_Found
@@ -297,8 +300,8 @@ delete_ref :: proc(db: ^Odb, name: string, expected: Maybe(Oid) = nil) -> Error 
 	if ref_base_dir(db, name) == db.common_dir {
 		remove_packed_ref(db, name) or_return
 	}
-	if e := os.remove(l.path); e != nil && e != .Not_Exist {
-		return .Io
+	if e := prim.remove(db.vfs, l.path); e != .None && e != .Not_Found {
+		return perr(e)
 	}
 	track(db, "", parent_dir(l.path))
 	return .None
@@ -308,37 +311,40 @@ delete_ref :: proc(db: ^Odb, name: string, expected: Maybe(Oid) = nil) -> Error 
 remove_packed_ref :: proc(db: ^Odb, name: string) -> Error {
 	pb, lb: [PATH_MAX]u8
 	path := concat_into(pb[:], db.common_dir, "/packed-refs") or_return
-	data, rerr := os.read_entire_file_from_path(path, db.allocator)
-	if rerr != nil {
+	data, rerr := vfs_read_file(db.vfs, path, db.allocator)
+	if rerr == .Not_Found {
 		return .None
 	}
+	rerr or_return
 	defer delete(data, db.allocator)
 	if !packed_refs_has(string(data), name) {
 		return .None
 	}
 	lock_path := concat_into(lb[:], path, ".lock") or_return
-	f, err := os.open(lock_path, {.Write, .Create, .Excl}, os.perm_number(0o644))
-	if err != nil {
-		return .Locked if err == .Exist else map_os_error(err)
+	fd, err := prim.open_file(db.vfs, lock_path, {.Write, .Create, .Exclusive}, 0o644)
+	if err != .None {
+		return .Locked if err == .Exists else perr(err)
 	}
-	fresh, ferr := os.read_entire_file_from_path(path, db.allocator)
-	if ferr != nil {
-		os.close(f)
-		os.remove(lock_path)
-		return .Io
+	fresh, ferr := vfs_read_file(db.vfs, path, db.allocator)
+	if ferr != .None {
+		prim.close_file(db.vfs, fd)
+		prim.remove(db.vfs, lock_path)
+		return ferr
 	}
 	defer delete(fresh, db.allocator)
 	out := rewrite_packed_refs(string(fresh), name, db.allocator)
 	defer delete(out, db.allocator)
-	_, werr := os.write(f, transmute([]u8)out)
-	serr: os.Error
-	if werr == nil && db.sync_writes {
-		serr = os.sync(f)
+	werr := prim.write_at(db.vfs, fd, transmute([]u8)out, 0)
+	if werr == .None && db.sync_writes {
+		werr = prim.datasync(db.vfs, fd)
 	}
-	os.close(f)
-	if werr != nil || serr != nil || os.rename(lock_path, path) != nil {
-		os.remove(lock_path)
-		return .Io
+	prim.close_file(db.vfs, fd)
+	if werr == .None {
+		werr = prim.rename(db.vfs, lock_path, path)
+	}
+	if werr != .None {
+		prim.remove(db.vfs, lock_path)
+		return perr(werr)
 	}
 	track(db, path, db.common_dir)
 	return .None

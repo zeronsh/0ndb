@@ -1,12 +1,13 @@
 package odb
 
 import "base:runtime"
+import "core:crypto"
 import "core:io"
 import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:time"
+import "../prim"
 
 DEFAULT_CACHE_LIMIT :: 8 * 1024 * 1024
 DEFAULT_DELTA_LIMIT :: 256 * 1024 * 1024
@@ -17,9 +18,6 @@ CACHE_SLOTS :: 32
 
 @(private)
 PATH_MAX :: 4096
-
-@(private)
-MAP_THRESHOLD :: 1024 * 1024
 
 @(private)
 IO_CHUNK :: 64 * 1024
@@ -44,6 +42,11 @@ Cache_Entry :: struct {
 
 Odb :: struct {
 	allocator:      runtime.Allocator,
+	vfs:            prim.Vfs,
+	use_mmap:       bool,
+	clock:          proc(data: rawptr) -> i64,
+	clock_data:     rawptr,
+	temp_seq:       u64,
 	format:         Hash_Format,
 	dirs:           [dynamic]Object_Dir,
 	git_dir:        string,
@@ -72,9 +75,13 @@ Location :: struct {
 }
 
 @(private)
-init :: proc(db: ^Odb, allocator: runtime.Allocator) {
+init :: proc(db: ^Odb, vfs: prim.Vfs, allocator: runtime.Allocator) {
 	db^ = {}
 	db.allocator = allocator
+	db.vfs = vfs
+	seed: [8]u8
+	crypto.rand_bytes(seed[:])
+	db.temp_seq = transmute(u64)seed
 	db.dirs = make([dynamic]Object_Dir, allocator)
 	db.pending_files = make([dynamic]string, allocator)
 	db.pending_dirs = make([dynamic]string, allocator)
@@ -83,16 +90,16 @@ init :: proc(db: ^Odb, allocator: runtime.Allocator) {
 	db.two_pass_size = DEFAULT_TWO_PASS_SIZE
 }
 
-open :: proc(db: ^Odb, worktree: string, extra_dirs: []string = nil, allocator := context.allocator) -> Error {
-	init(db, allocator)
-	git_dir, common_dir, err := discover(worktree, allocator)
+open :: proc(db: ^Odb, vfs: prim.Vfs, worktree: string, extra_dirs: []string = nil, allocator := context.allocator) -> Error {
+	init(db, vfs, allocator)
+	git_dir, common_dir, err := discover(vfs, worktree, allocator)
 	if err != .None {
 		close(db)
 		return err
 	}
 	db.git_dir = git_dir
 	db.common_dir = common_dir
-	format, ferr := read_object_format(common_dir, allocator)
+	format, ferr := read_object_format(vfs, common_dir, allocator)
 	if ferr != .None {
 		close(db)
 		return ferr
@@ -103,7 +110,7 @@ open :: proc(db: ^Odb, worktree: string, extra_dirs: []string = nil, allocator :
 		close(db)
 		return jerr
 	}
-	if !os.is_directory(objects) {
+	if !prim.is_dir(vfs, objects) {
 		delete(objects, allocator)
 		close(db)
 		return .Not_Repository
@@ -118,8 +125,8 @@ open :: proc(db: ^Odb, worktree: string, extra_dirs: []string = nil, allocator :
 	return .None
 }
 
-open_store :: proc(db: ^Odb, dir: string, extra_dirs: []string = nil, format := Hash_Format.Sha1, allocator := context.allocator) -> Error {
-	init(db, allocator)
+open_store :: proc(db: ^Odb, vfs: prim.Vfs, dir: string, extra_dirs: []string = nil, format := Hash_Format.Sha1, allocator := context.allocator) -> Error {
+	init(db, vfs, allocator)
 	db.store = true
 	err := init_store(db, dir, format)
 	if err == .None {
@@ -147,29 +154,29 @@ init_store :: proc(db: ^Odb, dir: string, format: Hash_Format) -> Error {
 	db.common_dir = common
 	for sub in ([]string{"", "/objects", "/objects/pack", "/objects/info", "/refs", "/refs/heads", "/refs/tags"}) {
 		p := join2(root, sub, a) or_return
-		e := os.make_directory_all(p)
+		e := prim.mkdir_all(db.vfs, p)
 		delete(p, a)
-		if e != nil && e != .Exist {
-			return .Io
+		if e != .None {
+			return perr(e)
 		}
 	}
 	head := join2(root, "/HEAD", a) or_return
 	defer delete(head, a)
-	if !os.exists(head) {
-		write_atomic(head, transmute([]u8)string("ref: refs/heads/main\n"), db.sync_writes) or_return
+	if !prim.exists(db.vfs, head) {
+		write_atomic(db, head, transmute([]u8)string("ref: refs/heads/main\n")) or_return
 		track(db, head, root, parent_dir(root))
 	}
 	config := join2(root, "/config", a) or_return
 	defer delete(config, a)
-	if !os.exists(config) {
+	if !prim.exists(db.vfs, config) {
 		text := "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"
 		if format == .Sha256 {
 			text = "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
 		}
-		write_atomic(config, transmute([]u8)text, db.sync_writes) or_return
+		write_atomic(db, config, transmute([]u8)text) or_return
 		track(db, config, root)
 	}
-	db.format = read_object_format(root, a) or_return
+	db.format = read_object_format(db.vfs, root, a) or_return
 	objects := join2(root, "/objects", a) or_return
 	add_dir(db, objects, false, 0)
 	return .None
@@ -179,11 +186,11 @@ add_object_dir :: proc(db: ^Odb, path: string) -> Error {
 	sync.mutex_lock(&db.mutex)
 	defer sync.mutex_unlock(&db.mutex)
 	p := clean(path, db.allocator) or_return
-	if !os.is_directory(p) {
+	if !prim.is_dir(db.vfs, p) {
 		delete(p, db.allocator)
 		return .Not_Found
 	}
-	if f, known := detect_dir_format(p, db.allocator); known && f != db.format {
+	if f, known := detect_dir_format(db.vfs, p, db.allocator); known && f != db.format {
 		delete(p, db.allocator)
 		return .Invalid
 	}
@@ -192,32 +199,38 @@ add_object_dir :: proc(db: ^Odb, path: string) -> Error {
 }
 
 @(private)
-detect_dir_format :: proc(objects: string, allocator: runtime.Allocator) -> (format: Hash_Format, known: bool) {
+detect_dir_format :: proc(vfs: prim.Vfs, objects: string, allocator: runtime.Allocator) -> (format: Hash_Format, known: bool) {
 	parent := parent_dir(objects)
 	buf: [PATH_MAX]u8
-	if config, err := concat_into(buf[:], parent, "/config"); err == .None && os.exists(config) {
-		f, ferr := read_object_format(parent, allocator)
+	if config, err := concat_into(buf[:], parent, "/config"); err == .None && prim.exists(vfs, config) {
+		f, ferr := read_object_format(vfs, parent, allocator)
 		if ferr != .None {
 			return .Sha1, true
 		}
 		return f, true
 	}
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	for i in 0 ..< 256 {
 		fan := [2]u8{HEX_DIGITS[i >> 4], HEX_DIGITS[i & 15]}
 		dir := concat_into(buf[:], objects, "/", string(fan[:])) or_continue
-		entries, rerr := os.read_all_directory_by_path(dir, context.temp_allocator)
-		if rerr != nil {
+		d: prim.Dir
+		if prim.dir_open(vfs, &d, dir, allocator) != .None {
 			continue
 		}
-		for e in entries {
+		for {
+			e, ok, derr := prim.dir_next(vfs, &d)
+			if !ok || derr != .None {
+				break
+			}
 			switch len(e.name) {
 			case 38:
+				prim.dir_close(vfs, &d)
 				return .Sha1, true
 			case 62:
+				prim.dir_close(vfs, &d)
 				return .Sha256, true
 			}
 		}
+		prim.dir_close(vfs, &d)
 	}
 	return .Sha1, false
 }
@@ -255,13 +268,31 @@ trim :: proc(db: ^Odb) {
 	}
 }
 
+bulk_begin :: proc(db: ^Odb) -> bool {
+	sync.mutex_lock(&db.mutex)
+	defer sync.mutex_unlock(&db.mutex)
+	was := db.use_mmap
+	db.use_mmap = true
+	return was
+}
+
+bulk_end :: proc(db: ^Odb, previous := false) {
+	if previous {
+		return
+	}
+	sync.mutex_lock(&db.mutex)
+	db.use_mmap = false
+	sync.mutex_unlock(&db.mutex)
+	trim(db)
+}
+
 primary_dir :: proc(db: ^Odb) -> string {
 	return db.dirs[0].path if len(db.dirs) > 0 else ""
 }
 
 @(private)
 pack_free :: proc(db: ^Odb, p: ^Pack) {
-	pack_close(p)
+	pack_close(db, p)
 	delete(p.base, db.allocator)
 	free(p, db.allocator)
 }
@@ -283,8 +314,8 @@ add_dir :: proc(db: ^Odb, path: string, extra: bool, depth: int) {
 		return
 	}
 	defer delete(alt_path, db.allocator)
-	text, rerr := os.read_entire_file_from_path(alt_path, db.allocator)
-	if rerr != nil {
+	text, rerr := vfs_read_file(db.vfs, alt_path, db.allocator)
+	if rerr != .None {
 		return
 	}
 	defer delete(text, db.allocator)
@@ -306,7 +337,7 @@ add_dir :: proc(db: ^Odb, path: string, extra: bool, depth: int) {
 		if cerr != .None {
 			continue
 		}
-		if !os.is_directory(target) {
+		if !prim.is_dir(db.vfs, target) {
 			delete(target, db.allocator)
 			continue
 		}
@@ -315,16 +346,16 @@ add_dir :: proc(db: ^Odb, path: string, extra: bool, depth: int) {
 }
 
 @(private)
-discover :: proc(worktree: string, allocator: runtime.Allocator) -> (git_dir, common_dir: string, err: Error) {
+discover :: proc(vfs: prim.Vfs, worktree: string, allocator: runtime.Allocator) -> (git_dir, common_dir: string, err: Error) {
 	start := clean(worktree, allocator) or_return
 	defer delete(start, allocator)
 	dir := start
 	for {
-		if gd, ok := git_dir_at(dir, allocator); ok {
+		if gd, ok := git_dir_at(vfs, dir, allocator); ok {
 			git_dir = gd
 			break
 		}
-		if is_git_dir(dir) {
+		if is_git_dir(vfs, dir) {
 			git_dir = strings.clone(dir, allocator) or_else ""
 			if git_dir == "" {
 				return "", "", .Out_Of_Memory
@@ -337,7 +368,7 @@ discover :: proc(worktree: string, allocator: runtime.Allocator) -> (git_dir, co
 		}
 		dir = parent
 	}
-	common_dir, err = resolve_common_dir(git_dir, allocator)
+	common_dir, err = resolve_common_dir(vfs, git_dir, allocator)
 	if err != .None {
 		delete(git_dir, allocator)
 		return "", "", err
@@ -346,21 +377,21 @@ discover :: proc(worktree: string, allocator: runtime.Allocator) -> (git_dir, co
 }
 
 @(private)
-git_dir_at :: proc(dir: string, allocator: runtime.Allocator) -> (string, bool) {
+git_dir_at :: proc(vfs: prim.Vfs, dir: string, allocator: runtime.Allocator) -> (string, bool) {
 	dot := join2(dir, "/.git", allocator) or_else ""
 	if dot == "" {
 		return "", false
 	}
-	if os.is_directory(dot) {
-		if is_git_dir(dot) {
+	if prim.is_dir(vfs, dot) {
+		if is_git_dir(vfs, dot) {
 			return dot, true
 		}
 		delete(dot, allocator)
 		return "", false
 	}
 	defer delete(dot, allocator)
-	text, rerr := os.read_entire_file_from_path(dot, allocator)
-	if rerr != nil {
+	text, rerr := vfs_read_file(vfs, dot, allocator)
+	if rerr != .None {
 		return "", false
 	}
 	defer delete(text, allocator)
@@ -387,7 +418,7 @@ git_dir_at :: proc(dir: string, allocator: runtime.Allocator) -> (string, bool) 
 	if cerr != .None {
 		return "", false
 	}
-	if !is_git_dir(resolved) {
+	if !is_git_dir(vfs, resolved) {
 		delete(resolved, allocator)
 		return "", false
 	}
@@ -395,26 +426,26 @@ git_dir_at :: proc(dir: string, allocator: runtime.Allocator) -> (string, bool) 
 }
 
 @(private)
-is_git_dir :: proc(dir: string) -> bool {
+is_git_dir :: proc(vfs: prim.Vfs, dir: string) -> bool {
 	buf: [PATH_MAX]u8
 	head := concat_into(buf[:], dir, "/HEAD") or_else ""
-	if head == "" || !os.exists(head) {
+	if head == "" || !prim.exists(vfs, head) {
 		return false
 	}
 	common := concat_into(buf[:], dir, "/commondir") or_else ""
-	if common != "" && os.exists(common) {
+	if common != "" && prim.exists(vfs, common) {
 		return true
 	}
 	objects := concat_into(buf[:], dir, "/objects") or_else ""
-	return objects != "" && os.is_directory(objects)
+	return objects != "" && prim.is_dir(vfs, objects)
 }
 
 @(private)
-resolve_common_dir :: proc(git_dir: string, allocator: runtime.Allocator) -> (dir: string, err: Error) {
+resolve_common_dir :: proc(vfs: prim.Vfs, git_dir: string, allocator: runtime.Allocator) -> (dir: string, err: Error) {
 	path := join2(git_dir, "/commondir", allocator) or_return
 	defer delete(path, allocator)
-	text, rerr := os.read_entire_file_from_path(path, allocator)
-	if rerr != nil {
+	text, rerr := vfs_read_file(vfs, path, allocator)
+	if rerr != .None {
 		return clean(git_dir, allocator)
 	}
 	defer delete(text, allocator)
@@ -495,18 +526,16 @@ loose_path :: proc(buf: []u8, dir: string, oid: Oid, format: Hash_Format) -> (st
 
 @(private)
 scan_packs :: proc(db: ^Odb, d: ^Object_Dir) -> bool {
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	ta := context.temp_allocator
-	pack_dir := join2(d.path, "/pack", ta) or_else ""
+	buf: [PATH_MAX]u8
+	pack_dir := concat_into(buf[:], d.path, "/pack") or_else ""
 	if pack_dir == "" {
 		return false
 	}
-	fi, serr := os.stat(pack_dir, ta)
-	mtime: i64 = -1
-	if serr == nil {
-		mtime = time.to_unix_nanoseconds(fi.modification_time)
+	mtime, have := vfs_mtime(db.vfs, pack_dir)
+	if !have {
+		mtime = -1
 	}
-	racy := mtime >= 0 && time.to_unix_nanoseconds(time.now()) - mtime < 2 * i64(time.Second)
+	racy := mtime >= 0 && now_ns(db) - mtime < 2_000_000_000
 	if d.scanned && mtime == d.pack_mtime && !racy {
 		return false
 	}
@@ -515,27 +544,31 @@ scan_packs :: proc(db: ^Odb, d: ^Object_Dir) -> bool {
 	for p in d.packs {
 		p.present = false
 	}
-	if serr == nil {
-		entries, rerr := os.read_all_directory_by_path(pack_dir, ta)
-		if rerr == nil {
-			for e in entries {
-				if !strings.has_prefix(e.name, "pack-") || !strings.has_suffix(e.name, ".idx") {
-					continue
-				}
-				base := join3(pack_dir, "/", e.name[:len(e.name) - 4], ta) or_continue
-				known := false
-				for p in d.packs {
-					if p.base == base {
-						p.present = true
-						known = true
-						break
-					}
-				}
-				if !known {
-					load_pack(db, d, base)
+	dir: prim.Dir
+	if have && prim.dir_open(db.vfs, &dir, pack_dir, db.allocator) == .None {
+		for {
+			e, ok, derr := prim.dir_next(db.vfs, &dir)
+			if !ok || derr != .None {
+				break
+			}
+			if !strings.has_prefix(e.name, "pack-") || !strings.has_suffix(e.name, ".idx") {
+				continue
+			}
+			nb: [PATH_MAX]u8
+			base := concat_into(nb[:], pack_dir, "/", e.name[:len(e.name) - 4]) or_continue
+			known := false
+			for p in d.packs {
+				if p.base == base {
+					p.present = true
+					known = true
+					break
 				}
 			}
+			if !known {
+				load_pack(db, d, base)
+			}
 		}
+		prim.dir_close(db.vfs, &dir)
 	}
 	i := 0
 	for i < len(d.packs) {
@@ -558,25 +591,33 @@ load_pack :: proc(db: ^Odb, d: ^Object_Dir, base: string) -> ^Pack {
 	if idx_path == "" {
 		return nil
 	}
-	idx, merr := virtual.map_file_from_path(idx_path, {.Read})
-	if merr != .None {
-		return nil
-	}
 	p, aerr := new(Pack, db.allocator)
 	if aerr != nil {
-		virtual.unmap_file(idx)
 		return nil
 	}
-	p.idx = idx
+	p.fd = prim.INVALID_FD
 	p.hsz = oid_size(db.format)
-	if !pack_validate_idx(p) {
-		virtual.unmap_file(idx)
-		free(p, db.allocator)
-		return nil
+	if db.use_mmap && vfs_is_os(db.vfs) {
+		idx, merr := virtual.map_file_from_path(idx_path, {.Read})
+		if merr != .None {
+			free(p, db.allocator)
+			return nil
+		}
+		p.idx, p.idx_mapped = idx, true
+	} else {
+		idx, rerr := vfs_read_file(db.vfs, idx_path, db.allocator)
+		if rerr != .None {
+			free(p, db.allocator)
+			return nil
+		}
+		p.idx = idx
 	}
 	cloned, cerr := strings.clone(base, db.allocator)
-	if cerr != nil {
-		virtual.unmap_file(idx)
+	if cerr != nil || !pack_validate_idx(p) {
+		if cerr == nil {
+			delete(cloned, db.allocator)
+		}
+		pack_close(db, p)
 		free(p, db.allocator)
 		return nil
 	}
@@ -621,7 +662,7 @@ locate :: proc(db: ^Odb, oid: Oid, primary_only := false) -> (loc: Location) {
 			continue
 		}
 		path, err := loose_path(buf[:], d.path, oid, db.format)
-		if err == .None && os.exists(path) {
+		if err == .None && prim.exists(db.vfs, path) {
 			return {dir = di, loose = true, found = true}
 		}
 	}
@@ -654,28 +695,26 @@ exists_for_write :: proc(db: ^Odb, oid: Oid) -> bool {
 	if !loc.found {
 		return false
 	}
-	now := time.now()
+	now := now_ns(db)
 	buf: [PATH_MAX]u8
 	if loc.loose {
 		path, err := loose_path(buf[:], db.dirs[loc.dir].path, oid, db.format)
 		if err != .None {
 			return true
 		}
-		if os.change_times(path, now, now) != nil {
+		st, serr := prim.stat(db.vfs, path)
+		if serr != .None || st.size == 0 {
 			return false
 		}
-		fi, serr := os.stat(path, context.temp_allocator)
-		if serr != nil {
+		if !set_mtime(db, path, now) {
 			return false
 		}
-		size := fi.size
-		os.file_info_delete(fi, context.temp_allocator)
-		return size > 0
+		return true
 	}
 	if !loc.pack.freshened {
 		loc.pack.freshened = true
 		if path, err := concat_into(buf[:], loc.pack.base, ".pack"); err == .None {
-			os.change_times(path, now, now)
+			set_mtime(db, path, now)
 		}
 	}
 	return true
@@ -717,60 +756,15 @@ read_header :: proc(db: ^Odb, oid: Oid) -> (type: Object_Type, size: i64, err: E
 }
 
 @(private)
-Loaded_File :: struct {
-	data:   []u8,
-	mapped: bool,
-}
-
-@(private)
-load_file :: proc(path: string, allocator: runtime.Allocator) -> (lf: Loaded_File, err: Error) {
-	f, oerr := os.open(path)
-	if oerr != nil {
-		return lf, map_os_error(oerr)
-	}
-	defer os.close(f)
-	size, serr := os.file_size(f)
-	if serr != nil || size < 0 {
-		return lf, .Io
-	}
-	if size >= MAP_THRESHOLD {
-		data, merr := virtual.map_file_from_file(f, {.Read})
-		if merr != .None {
-			return lf, .Io
-		}
-		return {data = data, mapped = true}, .None
-	}
-	data, aerr := make([]u8, int(size), allocator)
-	if aerr != nil {
-		return lf, .Out_Of_Memory
-	}
-	n, rerr := os.read_full(f, data)
-	if rerr != nil || n != len(data) {
-		delete(data, allocator)
-		return lf, .Io
-	}
-	return {data = data}, .None
-}
-
-@(private)
-unload_file :: proc(lf: Loaded_File, allocator: runtime.Allocator) {
-	if lf.mapped {
-		virtual.unmap_file(lf.data)
-	} else {
-		delete(lf.data, allocator)
-	}
-}
-
-@(private)
 read_loose :: proc(db: ^Odb, path: string, allocator: runtime.Allocator) -> (type: Object_Type, data: []u8, err: Error) {
-	lf := load_file(path, db.allocator) or_return
-	defer unload_file(lf, db.allocator)
+	raw := vfs_read_file(db.vfs, path, db.allocator) or_return
+	defer delete(raw, db.allocator)
 	hdr: [64]u8
-	n := inflate_prefix(lf.data, hdr[:]) or_return
+	n := inflate_prefix(raw, hdr[:]) or_return
 	size, hlen: int
 	{
 		t, s, h := parse_object_header(hdr[:n]) or_return
-		if s > i64(max(int) - 64) || !inflate_plausible(s, len(lf.data)) {
+		if s > i64(max(int) - 64) || !inflate_plausible(s, len(raw)) {
 			return .None, nil, .Corrupt
 		}
 		type, size, hlen = t, int(s), h
@@ -779,7 +773,7 @@ read_loose :: proc(db: ^Odb, path: string, allocator: runtime.Allocator) -> (typ
 	if aerr != nil {
 		return .None, nil, .Out_Of_Memory
 	}
-	if e := inflate_exact(lf.data, out); e != .None {
+	if e := inflate_exact(raw, out); e != .None {
 		delete(out, allocator)
 		return .None, nil, e
 	}
@@ -789,15 +783,15 @@ read_loose :: proc(db: ^Odb, path: string, allocator: runtime.Allocator) -> (typ
 
 @(private)
 loose_header :: proc(db: ^Odb, path: string) -> (type: Object_Type, size: i64, err: Error) {
-	f, oerr := os.open(path)
-	if oerr != nil {
-		return .None, 0, map_os_error(oerr)
+	fd, oerr := prim.open_file(db.vfs, path)
+	if oerr != .None {
+		return .None, 0, perr(oerr)
 	}
-	defer os.close(f)
+	defer prim.close_file(db.vfs, fd)
 	src: [512]u8
-	n, rerr := os.read_full(f, src[:])
-	if rerr != nil && rerr != .EOF && rerr != .Unexpected_EOF {
-		return .None, 0, .Io
+	n, rerr := prim.read_at(db.vfs, fd, src[:], 0)
+	if rerr != .None {
+		return .None, 0, perr(rerr)
 	}
 	hdr: [64]u8
 	m, ierr := inflate_prefix(src[:n], hdr[:])
@@ -835,13 +829,13 @@ read_packed :: proc(db: ^Odb, pack: ^Pack, offset: i64, allocator: runtime.Alloc
 			type, base, base_from_cache = e.type, e.data, true
 			break
 		}
-		pack_open_data(cur, buf[:]) or_return
-		h := pack_entry_header(cur, cur_off) or_return
+		pack_open_data(db, cur) or_return
+		h := pack_entry_header(db, cur, cur_off) or_return
 		if h.kind <= 4 {
 			if len(links) > 0 && h.size > db.delta_limit {
 				return .None, nil, .Too_Large
 			}
-			if h.size > i64(max(int)) || !inflate_plausible(h.size, len(pack_entry_src(cur, h))) {
+			if h.size > i64(max(int)) || !inflate_plausible(h.size, pack_compressed_avail(cur, h)) {
 				return .None, nil, .Corrupt
 			}
 			alloc := allocator if len(links) == 0 else db.allocator
@@ -849,7 +843,7 @@ read_packed :: proc(db: ^Odb, pack: ^Pack, offset: i64, allocator: runtime.Alloc
 			if aerr != nil {
 				return .None, nil, .Out_Of_Memory
 			}
-			if e := inflate_exact(pack_entry_src(cur, h), out); e != .None {
+			if e := pack_inflate_exact(db, cur, h, out); e != .None {
 				delete(out, alloc)
 				return .None, nil, e
 			}
@@ -859,7 +853,7 @@ read_packed :: proc(db: ^Odb, pack: ^Pack, offset: i64, allocator: runtime.Alloc
 		if h.size > db.delta_limit {
 			return .None, nil, .Too_Large
 		}
-		if !inflate_plausible(h.size, len(pack_entry_src(cur, h))) {
+		if !inflate_plausible(h.size, pack_compressed_avail(cur, h)) {
 			return .None, nil, .Corrupt
 		}
 		append(&links, Link{cur, cur_off, h})
@@ -900,7 +894,7 @@ read_packed :: proc(db: ^Odb, pack: ^Pack, offset: i64, allocator: runtime.Alloc
 			return .None, nil, .Out_Of_Memory
 		}
 		defer delete(delta, db.allocator)
-		inflate_exact(pack_entry_src(link.pack, link.header), delta) or_return
+		pack_inflate_exact(db, link.pack, link.header, delta) or_return
 		base_size, result_size, pos := delta_sizes(delta) or_return
 		if base_size != i64(len(base)) {
 			return .None, nil, .Corrupt
@@ -944,8 +938,8 @@ packed_header :: proc(db: ^Odb, pack: ^Pack, offset: i64) -> (type: Object_Type,
 			}
 			return e.type, size, .None
 		}
-		pack_open_data(cur, buf[:]) or_return
-		h := pack_entry_header(cur, cur_off) or_return
+		pack_open_data(db, cur) or_return
+		h := pack_entry_header(db, cur, cur_off) or_return
 		if h.kind <= 4 {
 			if size < 0 {
 				size = h.size
@@ -954,7 +948,7 @@ packed_header :: proc(db: ^Odb, pack: ^Pack, offset: i64) -> (type: Object_Type,
 		}
 		if size < 0 {
 			prefix: [32]u8
-			n, ierr := inflate_prefix(pack_entry_src(cur, h), prefix[:])
+			n, ierr := pack_inflate_prefix(db, cur, h, prefix[:])
 			if ierr != .None && n == 0 {
 				return .None, 0, ierr
 			}
@@ -1119,17 +1113,20 @@ strip_writer_proc :: proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i
 
 @(private)
 File_Source :: struct {
-	f:   ^os.File,
+	vfs: prim.Vfs,
+	fd:  prim.Fd,
+	pos: i64,
 	buf: []u8,
 }
 
 @(private)
 file_source_refill :: proc(data: rawptr) -> ([]u8, Error) {
 	fs := (^File_Source)(data)
-	n, err := os.read(fs.f, fs.buf)
-	if err != nil && err != .EOF {
-		return nil, .Io
+	n, err := prim.read_at(fs.vfs, fs.fd, fs.buf, fs.pos)
+	if err != .None {
+		return nil, perr(err)
 	}
+	fs.pos += i64(n)
 	return fs.buf[:n], .None
 }
 
@@ -1143,17 +1140,17 @@ stream :: proc(db: ^Odb, oid: Oid, w: io.Writer) -> (type: Object_Type, size: i6
 	buf: [PATH_MAX]u8
 	if loc.loose {
 		path := loose_path(buf[:], db.dirs[loc.dir].path, oid, db.format) or_return
-		f, oerr := os.open(path)
-		if oerr != nil {
-			return .None, 0, map_os_error(oerr)
+		fd, oerr := prim.open_file(db.vfs, path)
+		if oerr != .None {
+			return .None, 0, perr(oerr)
 		}
-		defer os.close(f)
+		defer prim.close_file(db.vfs, fd)
 		mem_buf, aerr := make([]u8, STREAM_BUFFER_SIZE + IO_CHUNK, db.allocator)
 		if aerr != nil {
 			return .None, 0, .Out_Of_Memory
 		}
 		defer delete(mem_buf, db.allocator)
-		src := File_Source{f, mem_buf[STREAM_BUFFER_SIZE:]}
+		src := File_Source{db.vfs, fd, 0, mem_buf[STREAM_BUFFER_SIZE:]}
 		sw := Strip_Writer{inner = w}
 		sink := io.Stream{procedure = strip_writer_proc, data = &sw}
 		_, e := inflate_to_writer(nil, file_source_refill, &src, sink, -1, mem_buf[:STREAM_BUFFER_SIZE])
@@ -1165,15 +1162,15 @@ stream :: proc(db: ^Odb, oid: Oid, w: io.Writer) -> (type: Object_Type, size: i6
 		}
 		return sw.type, sw.size, .None
 	}
-	pack_open_data(loc.pack, buf[:]) or_return
-	h := pack_entry_header(loc.pack, loc.offset) or_return
+	pack_open_data(db, loc.pack) or_return
+	h := pack_entry_header(db, loc.pack, loc.offset) or_return
 	if h.kind <= 4 {
 		window, aerr := make([]u8, STREAM_BUFFER_SIZE, db.allocator)
 		if aerr != nil {
 			return .None, 0, .Out_Of_Memory
 		}
 		defer delete(window, db.allocator)
-		inflate_to_writer(pack_entry_src(loc.pack, h), nil, nil, w, h.size, window) or_return
+		pack_inflate_to_writer(db, loc.pack, h, w, window) or_return
 		return Object_Type(h.kind), h.size, .None
 	}
 	t, data := read_packed(db, loc.pack, loc.offset, db.allocator) or_return
@@ -1200,10 +1197,10 @@ write_loose_data :: proc(db: ^Odb, oid: Oid, type: Object_Type, data: []u8) -> (
 	hbuf: [32]u8
 	header := object_header(hbuf[:], type, i64(len(data)))
 	tmp_buf: [PATH_MAX]u8
-	f, tmp_path := create_temp(db.dirs[0].path, "tmp_obj_", tmp_buf[:]) or_return
+	fd, tmp_path := create_temp(db, db.dirs[0].path, "tmp_obj_", tmp_buf[:]) or_return
 	stack: [IO_CHUNK]u8
 	total := zlib_stored_size(i64(len(header) + len(data)))
-	w := Buf_Writer{f = f, buf = stack[:min(i64(IO_CHUNK), total)]}
+	w := Buf_Writer{vfs = db.vfs, fd = fd, buf = stack[:min(i64(IO_CHUNK), total)]}
 	z: Zstream
 	z_begin(&w, &z, i64(len(header) + len(data)))
 	err = z_write(&w, &z, header)
@@ -1216,21 +1213,21 @@ write_loose_data :: proc(db: ^Odb, oid: Oid, type: Object_Type, data: []u8) -> (
 	if err == .None {
 		err = bw_flush(&w)
 	}
-	finish_temp(db, f, tmp_path, err) or_return
+	finish_temp(db, fd, tmp_path, err) or_return
 	return install_loose(db, tmp_path, oid)
 }
 
 @(private)
-finish_temp :: proc(db: ^Odb, f: ^os.File, path: string, err: Error) -> Error {
+finish_temp :: proc(db: ^Odb, fd: prim.Fd, path: string, err: Error) -> Error {
 	err := err
-	if err == .None && db.sync_writes && os.sync(f) != nil {
-		err = .Io
+	if err == .None && db.sync_writes {
+		err = perr(prim.datasync(db.vfs, fd))
 	}
-	if os.close(f) != nil && err == .None {
-		err = .Io
+	if e := prim.close_file(db.vfs, fd); e != .None && err == .None {
+		err = perr(e)
 	}
 	if err != .None {
-		os.remove(path)
+		prim.remove(db.vfs, path)
 	}
 	return err
 }
@@ -1239,61 +1236,58 @@ finish_temp :: proc(db: ^Odb, f: ^os.File, path: string, err: Error) -> Error {
 install_loose :: proc(db: ^Odb, tmp_path: string, oid: Oid) -> Error {
 	dir := db.dirs[0].path
 	buf: [PATH_MAX]u8
-	final, perr := loose_path(buf[:], dir, oid, db.format)
-	if perr != .None {
-		os.remove(tmp_path)
-		return perr
+	final, lerr := loose_path(buf[:], dir, oid, db.format)
+	if lerr != .None {
+		prim.remove(db.vfs, tmp_path)
+		return lerr
 	}
 	fan := final[:len(final) - (oid_size(db.format) * 2 - 1)]
-	e := os.make_directory(fan, os.perm_number(0o777))
-	if e != nil && e != .Exist {
-		os.remove(tmp_path)
-		return .Io
+	created, merr := vfs_mkdir(db, fan)
+	if merr != .None {
+		prim.remove(db.vfs, tmp_path)
+		return merr
 	}
-	created := e == nil
-	if os.rename(tmp_path, final) != nil {
-		created = os.make_directory(fan, os.perm_number(0o777)) == nil || created
-		if os.rename(tmp_path, final) != nil {
-			os.remove(tmp_path)
-			return .Io
+	if prim.rename(db.vfs, tmp_path, final) != .None {
+		again, _ := vfs_mkdir(db, fan)
+		created = created || again
+		if e := prim.rename(db.vfs, tmp_path, final); e != .None {
+			prim.remove(db.vfs, tmp_path)
+			return perr(e)
 		}
 	}
 	track(db, final, fan, dir if created else "")
 	return .None
 }
 
-hash_file :: proc(path: string, format := Hash_Format.Sha1, mode := Hash_Mode.Fast) -> (oid: Oid, err: Error) {
-	f, oerr := os.open(path)
-	if oerr != nil {
-		return {}, map_os_error(oerr)
+hash_file :: proc(vfs: prim.Vfs, path: string, format := Hash_Format.Sha1, mode := Hash_Mode.Fast) -> (oid: Oid, err: Error) {
+	fd, oerr := prim.open_file(vfs, path)
+	if oerr != .None {
+		return {}, perr(oerr)
 	}
-	defer os.close(f)
-	size, serr := os.file_size(f)
-	if serr != nil {
-		return {}, .Io
-	}
+	defer prim.close_file(vfs, fd)
+	size := vfs_size(vfs, fd) or_return
 	h: Hasher
 	hasher_init(&h, format, mode)
 	hasher_header(&h, .Blob, size)
 	buf: [IO_CHUNK]u8
-	total: i64
+	pos: i64
 	for {
-		n, rerr := os.read(f, buf[:])
+		n, rerr := prim.read_at(vfs, fd, buf[:], pos)
+		if rerr != .None {
+			return {}, perr(rerr)
+		}
 		if n > 0 {
-			total += i64(n)
-			if total > size {
+			pos += i64(n)
+			if pos > size {
 				return {}, .Changed
 			}
 			hasher_update(&h, buf[:n])
 		}
-		if rerr == .EOF || (rerr == nil && n == 0) {
+		if n < len(buf) {
 			break
 		}
-		if rerr != nil {
-			return {}, .Io
-		}
 	}
-	if total != size {
+	if pos != size {
 		return {}, .Changed
 	}
 	return hasher_final(&h)
@@ -1303,29 +1297,23 @@ write_file :: proc(db: ^Odb, path: string) -> (oid: Oid, err: Error) {
 	if len(db.dirs) == 0 {
 		return {}, .Invalid
 	}
-	f, oerr := os.open(path)
-	if oerr != nil {
-		return {}, map_os_error(oerr)
+	fd, oerr := prim.open_file(db.vfs, path)
+	if oerr != .None {
+		return {}, perr(oerr)
 	}
-	defer os.close(f)
-	size, serr := os.file_size(f)
-	if serr != nil {
-		return {}, .Io
-	}
+	defer prim.close_file(db.vfs, fd)
+	size := vfs_size(db.vfs, fd) or_return
 	expected: Maybe(Oid)
 	if size >= db.two_pass_size {
-		first := hash_file(path, db.format) or_return
+		first := hash_file(db.vfs, path, db.format) or_return
 		if exists_for_write(db, first) {
 			return first, .None
 		}
 		expected = first
-		if _, e := os.seek(f, 0, .Start); e != nil {
-			return {}, .Io
-		}
 	}
 	tmp_buf: [PATH_MAX]u8
-	tmp, tmp_path := create_temp(db.dirs[0].path, "tmp_obj_", tmp_buf[:]) or_return
-	oid, err = write_file_body(db, f, size, tmp)
+	tmp, tmp_path := create_temp(db, db.dirs[0].path, "tmp_obj_", tmp_buf[:]) or_return
+	oid, err = write_file_body(db, fd, size, tmp)
 	if err == .None {
 		if e, ok := expected.?; ok && e != oid {
 			err = .Changed
@@ -1333,36 +1321,38 @@ write_file :: proc(db: ^Odb, path: string) -> (oid: Oid, err: Error) {
 	}
 	finish_temp(db, tmp, tmp_path, err) or_return
 	if expected == nil && exists_for_write(db, oid) {
-		os.remove(tmp_path)
+		prim.remove(db.vfs, tmp_path)
 		return oid, .None
 	}
 	return oid, install_loose(db, tmp_path, oid)
 }
 
 @(private)
-write_file_body :: proc(db: ^Odb, f: ^os.File, size: i64, tmp: ^os.File) -> (oid: Oid, err: Error) {
+write_file_body :: proc(db: ^Odb, fd: prim.Fd, size: i64, tmp: prim.Fd) -> (oid: Oid, err: Error) {
 	h: Hasher
 	hasher_init(&h, db.format)
 	hbuf: [32]u8
 	header := object_header(hbuf[:], .Blob, size)
 	hasher_update(&h, header)
 	wstack: [IO_CHUNK]u8
-	w := Buf_Writer{f = tmp, buf = wstack[:]}
+	w := Buf_Writer{vfs = db.vfs, fd = tmp, buf = wstack[:]}
 	z: Zstream
 	z_begin(&w, &z, i64(len(header)) + size)
 	z_write(&w, &z, header) or_return
 	rbuf: [IO_CHUNK]u8
+	pos: i64
 	for {
-		n, rerr := os.read(f, rbuf[:])
+		n, rerr := prim.read_at(db.vfs, fd, rbuf[:], pos)
+		if rerr != .None {
+			return {}, perr(rerr)
+		}
 		if n > 0 {
+			pos += i64(n)
 			hasher_update(&h, rbuf[:n])
 			z_write(&w, &z, rbuf[:n]) or_return
 		}
-		if rerr == .EOF || (rerr == nil && n == 0) {
+		if n < len(rbuf) {
 			break
-		}
-		if rerr != nil {
-			return {}, .Io
 		}
 	}
 	z_end(&w, &z) or_return
@@ -1371,24 +1361,19 @@ write_file_body :: proc(db: ^Odb, f: ^os.File, size: i64, tmp: ^os.File) -> (oid
 }
 
 @(private)
-write_atomic :: proc(path: string, data: []u8, durable: bool) -> Error {
+write_atomic :: proc(db: ^Odb, path: string, data: []u8) -> Error {
 	buf: [PATH_MAX]u8
 	dir := parent_dir(path)
-	f, tmp_path := create_temp(dir, ".tmp_", buf[:]) or_return
-	_, werr := os.write(f, data)
-	serr: os.Error
-	if werr == nil && durable {
-		serr = os.sync(f)
+	fd, tmp_path := create_temp(db, dir, ".tmp_", buf[:]) or_return
+	err := perr(prim.write_at(db.vfs, fd, data, 0))
+	if err == .None {
+		err = perr(prim.fchmod(db.vfs, fd, 0o644))
 	}
-	os.close(f)
-	if werr != nil || serr != nil {
-		os.remove(tmp_path)
-		return .Io
+	finish_temp(db, fd, tmp_path, err) or_return
+	if e := prim.rename(db.vfs, tmp_path, path); e != .None {
+		prim.remove(db.vfs, tmp_path)
+		return perr(e)
 	}
-	os.change_mode(tmp_path, os.perm_number(0o644))
-	if os.rename(tmp_path, path) != nil {
-		os.remove(tmp_path)
-		return .Io
-	}
+	track(db, path, dir)
 	return .None
 }

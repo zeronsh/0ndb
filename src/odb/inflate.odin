@@ -497,9 +497,11 @@ inflate_run :: proc(s: ^Inflater) -> (status: Inflate_Status, err: Error) {
 }
 
 @(private)
-inflate_prefix :: proc(src: []u8, out: []u8) -> (n: int, err: Error) {
+inflate_prefix :: proc(src: []u8, out: []u8, refill: Refill_Proc = nil, refill_data: rawptr = nil) -> (n: int, err: Error) {
 	s: Inflater
 	s.src = src
+	s.refill = refill
+	s.refill_data = refill_data
 	s.out = out
 	s.limit = -1
 	_, err = inflate_run(&s)
@@ -507,9 +509,11 @@ inflate_prefix :: proc(src: []u8, out: []u8) -> (n: int, err: Error) {
 }
 
 @(private)
-inflate_exact :: proc(src: []u8, out: []u8) -> Error {
+inflate_exact :: proc(src: []u8, out: []u8, refill: Refill_Proc = nil, refill_data: rawptr = nil) -> Error {
 	s: Inflater
 	s.src = src
+	s.refill = refill
+	s.refill_data = refill_data
 	s.out = out
 	s.limit = -1
 	status, err := inflate_run(&s)

@@ -1,22 +1,23 @@
 package odb
 
-import "base:runtime"
-import "core:crypto"
 import hashing "core:hash"
-import "core:os"
+import "core:sync"
+import "../prim"
 
 @(private)
 STORED_BLOCK :: 65535
 
 @(private)
 Buf_Writer :: struct {
-	f:      ^os.File,
-	buf:    []u8,
-	n:      int,
-	pos:    i64,
-	crc:    u32,
-	sha:    ^Hasher,
-	err:    Error,
+	vfs: prim.Vfs,
+	fd:  prim.Fd,
+	buf: []u8,
+	n:   int,
+	off: i64,
+	pos: i64,
+	crc: u32,
+	sha: ^Hasher,
+	err: Error,
 }
 
 @(private)
@@ -25,10 +26,11 @@ bw_flush :: proc(w: ^Buf_Writer) -> Error {
 		return w.err
 	}
 	if w.n > 0 {
-		if _, err := os.write(w.f, w.buf[:w.n]); err != nil {
-			w.err = .Io
+		if e := prim.write_at(w.vfs, w.fd, w.buf[:w.n], w.off); e != .None {
+			w.err = perr(e)
 			return w.err
 		}
+		w.off += i64(w.n)
 		w.n = 0
 	}
 	return .None
@@ -111,49 +113,27 @@ z_end :: proc(w: ^Buf_Writer, z: ^Zstream) -> Error {
 }
 
 @(private)
-create_temp :: proc(dir, prefix: string, buf: []u8) -> (f: ^os.File, path: string, err: Error) {
-	for _ in 0 ..< 16 {
-		rnd: [6]u8
-		crypto.rand_bytes(rnd[:])
+create_temp :: proc(db: ^Odb, dir, prefix: string, buf: []u8) -> (fd: prim.Fd, path: string, err: Error) {
+	for _ in 0 ..< 64 {
+		seq := sync.atomic_add(&db.temp_seq, 1)
 		n := copy(buf, dir)
 		n += copy(buf[n:], "/")
 		n += copy(buf[n:], prefix)
-		for b in rnd {
-			if n + 2 > len(buf) {
-				return nil, "", .Invalid
+		for i in 0 ..< 16 {
+			if n >= len(buf) {
+				return prim.INVALID_FD, "", .Invalid
 			}
-			buf[n] = HEX_DIGITS[b >> 4]
-			buf[n + 1] = HEX_DIGITS[b & 15]
-			n += 2
+			buf[n] = HEX_DIGITS[(seq >> uint(60 - i * 4)) & 15]
+			n += 1
 		}
 		path = string(buf[:n])
-		ferr: os.Error
-		f, ferr = os.open(path, {.Read, .Write, .Create, .Excl, .Trunc}, os.perm_number(0o444))
-		if ferr == nil {
+		f, e := prim.open_file(db.vfs, path, {.Write, .Create, .Exclusive}, 0o444)
+		if e == .None {
 			return f, path, .None
 		}
-		if ferr != .Exist {
-			return nil, "", map_os_error(ferr)
+		if e != .Exists {
+			return prim.INVALID_FD, "", perr(e)
 		}
 	}
-	return nil, "", .Io
-}
-
-@(private)
-map_os_error :: proc(err: os.Error) -> Error {
-	if err == nil {
-		return .None
-	}
-	#partial switch e in err {
-	case os.General_Error:
-		#partial switch e {
-		case .Not_Exist:
-			return .Not_Found
-		case .Exist:
-			return .Invalid
-		}
-	case runtime.Allocator_Error:
-		return .Out_Of_Memory
-	}
-	return .Io
+	return prim.INVALID_FD, "", .Io
 }

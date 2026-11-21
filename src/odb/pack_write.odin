@@ -1,9 +1,9 @@
 package odb
 
 import "core:encoding/endian"
-import "core:os"
 import "core:slice"
 import "core:sync"
+import "../prim"
 
 @(private)
 Pack_Entry :: struct {
@@ -14,7 +14,7 @@ Pack_Entry :: struct {
 
 Pack_Builder :: struct {
 	db:       ^Odb,
-	f:        ^os.File,
+	fd:       prim.Fd,
 	path_buf: [PATH_MAX]u8,
 	path:     string,
 	w:        Buf_Writer,
@@ -31,21 +31,19 @@ pack_begin :: proc(b: ^Pack_Builder, db: ^Odb) -> Error {
 	b.db = db
 	dir_buf: [PATH_MAX]u8
 	dir := concat_into(dir_buf[:], db.dirs[0].path, "/pack") or_return
-	if e := os.make_directory(dir, os.perm_number(0o777)); e != nil && e != .Exist {
-		return .Io
-	} else if e == nil {
+	if created := vfs_mkdir(db, dir) or_return; created {
 		track(db, "", db.dirs[0].path)
 	}
-	f, path := create_temp(dir, "tmp_pack_", b.path_buf[:]) or_return
-	b.f = f
+	fd, path := create_temp(db, dir, "tmp_pack_", b.path_buf[:]) or_return
+	b.fd = fd
 	b.path = path
 	buf, aerr := make([]u8, IO_CHUNK, db.allocator)
 	if aerr != nil {
-		os.close(f)
-		os.remove(path)
+		prim.close_file(db.vfs, fd)
+		prim.remove(db.vfs, path)
 		return .Out_Of_Memory
 	}
-	b.w = Buf_Writer{f = f, buf = buf}
+	b.w = Buf_Writer{vfs = db.vfs, fd = fd, buf = buf}
 	b.entries = make([dynamic]Pack_Entry, db.allocator)
 	b.seen = make(map[Oid]i32, db.allocator)
 	b.active = true
@@ -67,8 +65,8 @@ pack_abort :: proc(b: ^Pack_Builder) {
 	if !b.active {
 		return
 	}
-	os.close(b.f)
-	os.remove(b.path)
+	prim.close_file(b.db.vfs, b.fd)
+	prim.remove(b.db.vfs, b.path)
 	pack_release(b)
 }
 
@@ -134,18 +132,15 @@ pack_add_file :: proc(b: ^Pack_Builder, path: string) -> (oid: Oid, err: Error) 
 	if !b.active {
 		return {}, .Invalid
 	}
-	f, oerr := os.open(path)
-	if oerr != nil {
-		return {}, map_os_error(oerr)
-	}
-	defer os.close(f)
-	size, serr := os.file_size(f)
-	if serr != nil {
-		return {}, .Io
-	}
 	db := b.db
+	fd, oerr := prim.open_file(db.vfs, path)
+	if oerr != .None {
+		return {}, perr(oerr)
+	}
+	defer prim.close_file(db.vfs, fd)
+	size := vfs_size(db.vfs, fd) or_return
 	if size >= db.two_pass_size {
-		first := hash_file(path, db.format) or_return
+		first := hash_file(db.vfs, path, db.format) or_return
 		if pack_has(b, first) {
 			return first, .None
 		}
@@ -160,17 +155,20 @@ pack_add_file :: proc(b: ^Pack_Builder, path: string) -> (oid: Oid, err: Error) 
 	z: Zstream
 	z_begin(&b.w, &z, size)
 	rbuf: [IO_CHUNK]u8
+	rpos: i64
 	for err == .None {
-		n, rerr := os.read(f, rbuf[:])
+		n, rerr := prim.read_at(db.vfs, fd, rbuf[:], rpos)
+		if rerr != .None {
+			err = perr(rerr)
+			break
+		}
 		if n > 0 {
+			rpos += i64(n)
 			hasher_update(&h, rbuf[:n])
 			err = z_write(&b.w, &z, rbuf[:n])
 		}
-		if rerr == .EOF || (rerr == nil && n == 0) {
+		if n < len(rbuf) {
 			break
-		}
-		if rerr != nil {
-			err = .Io
 		}
 	}
 	if err == .None {
@@ -194,15 +192,12 @@ pack_add_file :: proc(b: ^Pack_Builder, path: string) -> (oid: Oid, err: Error) 
 @(private)
 pack_rewind :: proc(b: ^Pack_Builder, offset: i64) -> Error {
 	bw_flush(&b.w) or_return
-	if os.truncate(b.f, offset) != nil {
-		b.w.err = .Io
-		return .Io
-	}
-	if _, e := os.seek(b.f, offset, .Start); e != nil {
-		b.w.err = .Io
-		return .Io
+	if e := prim.truncate(b.db.vfs, b.fd, offset); e != .None {
+		b.w.err = perr(e)
+		return b.w.err
 	}
 	b.w.pos = offset
+	b.w.off = offset
 	return .None
 }
 
@@ -221,16 +216,14 @@ pack_finish :: proc(b: ^Pack_Builder) -> (checksum: Oid, err: Error) {
 	bw_flush(&b.w) or_return
 	count: [4]u8
 	endian.unchecked_put_u32be(count[:], u32(len(b.entries)))
-	if _, e := os.write_at(b.f, count[:], 8); e != nil {
-		return {}, .Io
-	}
+	perr(prim.write_at(db.vfs, b.fd, count[:], 8)) or_return
 	h: Hasher
 	hasher_init(&h, db.format)
 	end := b.w.pos
 	pos: i64
 	for pos < end {
-		n, e := os.read_at(b.f, b.w.buf[:min(i64(len(b.w.buf)), end - pos)], pos)
-		if e != nil || n <= 0 {
+		n, e := prim.read_at(db.vfs, b.fd, b.w.buf[:min(i64(len(b.w.buf)), end - pos)], pos)
+		if e != .None || n <= 0 {
 			return {}, .Io
 		}
 		hasher_update(&h, b.w.buf[:n])
@@ -238,20 +231,18 @@ pack_finish :: proc(b: ^Pack_Builder) -> (checksum: Oid, err: Error) {
 	}
 	checksum = hasher_final(&h) or_return
 	hsz := oid_size(db.format)
-	if _, e := os.write_at(b.f, checksum[:hsz], end); e != nil {
-		return {}, .Io
-	}
-	if db.sync_writes && os.sync(b.f) != nil {
-		return {}, .Io
+	perr(prim.write_at(db.vfs, b.fd, checksum[:hsz], end)) or_return
+	if db.sync_writes {
+		perr(prim.datasync(db.vfs, b.fd)) or_return
 	}
 	idx_buf: [PATH_MAX]u8
 	idx_tmp := write_idx(db, b.entries[:], checksum, b.w.buf, idx_buf[:]) or_return
 	final_err := install_pack(db, b.path, idx_tmp, checksum)
-	os.close(b.f)
-	b.f = nil
+	prim.close_file(db.vfs, b.fd)
+	b.fd = prim.INVALID_FD
 	if final_err != .None {
-		os.remove(b.path)
-		os.remove(idx_tmp)
+		prim.remove(db.vfs, b.path)
+		prim.remove(db.vfs, idx_tmp)
 		pack_release(b)
 		return {}, final_err
 	}
@@ -266,11 +257,11 @@ write_idx :: proc(db: ^Odb, entries: []Pack_Entry, checksum: Oid, buf: []u8, pat
 	})
 	dir_buf: [PATH_MAX]u8
 	dir := concat_into(dir_buf[:], db.dirs[0].path, "/pack") or_return
-	f, p := create_temp(dir, "tmp_idx_", path_buf) or_return
+	f, p := create_temp(db, dir, "tmp_idx_", path_buf) or_return
 	hsz := oid_size(db.format)
 	h: Hasher
 	hasher_init(&h, db.format)
-	w := Buf_Writer{f = f, buf = buf, sha = &h}
+	w := Buf_Writer{vfs = db.vfs, fd = f, buf = buf, sha = &h}
 	tmp: [8]u8
 	bw_write(&w, {0xff, 't', 'O', 'c', 0, 0, 0, 2})
 	j := 0
@@ -321,14 +312,10 @@ install_pack :: proc(db: ^Odb, pack_tmp, idx_tmp: string, checksum: Oid) -> Erro
 	b1, b2: [PATH_MAX]u8
 	pack_path := concat_into(b1[:], db.dirs[0].path, "/pack/pack-", hex, ".pack") or_return
 	idx_path := concat_into(b2[:], db.dirs[0].path, "/pack/pack-", hex, ".idx") or_return
-	if os.rename(pack_tmp, pack_path) != nil {
-		return .Io
-	}
-	if os.rename(idx_tmp, idx_path) != nil {
-		return .Io
-	}
+	perr(prim.rename(db.vfs, pack_tmp, pack_path)) or_return
+	perr(prim.rename(db.vfs, idx_tmp, idx_path)) or_return
 	if db.sync_writes {
-		sync_dir(parent_dir(pack_path))
+		prim.sync_dir(db.vfs, parent_dir(pack_path))
 	}
 	sync.mutex_lock(&db.mutex)
 	defer sync.mutex_unlock(&db.mutex)
@@ -336,14 +323,4 @@ install_pack :: proc(db: ^Odb, pack_tmp, idx_tmp: string, checksum: Oid) -> Erro
 	track_locked(db, idx_path)
 	db.dirs[0].scanned = false
 	return .None
-}
-
-@(private)
-sync_dir :: proc(dir: string) {
-	f, err := os.open(dir)
-	if err != nil {
-		return
-	}
-	os.sync(f)
-	os.close(f)
 }

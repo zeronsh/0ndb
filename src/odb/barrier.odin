@@ -1,10 +1,10 @@
 package odb
 
 import "base:runtime"
-import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:sync"
+import "../prim"
 
 @(private)
 track :: proc(db: ^Odb, file: string, dirs: ..string) {
@@ -66,7 +66,7 @@ barrier :: proc(db: ^Odb) -> Error {
 	defer delete(uf, db.allocator)
 	defer delete(ud, db.allocator)
 	roots := [2]string{primary_dir(db), db.common_dir}
-	err := sync_paths(uf, ud, roots[:])
+	err := sync_paths(db, uf, ud, roots[:])
 	if err != .None {
 		sync.mutex_lock(&db.mutex)
 		for f in uf {
@@ -120,10 +120,83 @@ pending_clear :: proc(db: ^Odb) {
 }
 
 @(private)
-open_for_sync :: proc(path: string) -> (^os.File, Error) {
-	f, err := os.open(path)
-	if err != nil {
-		return nil, .Not_Found if err == .Not_Exist else .Io
+SYNCFS_THRESHOLD :: 128
+
+@(private)
+sync_one :: proc(db: ^Odb, path: string, dir: bool, data_only: bool) -> (fd: prim.Fd, kept: bool, err: Error) {
+	flags := prim.Open_Flags{.Directory} if dir else prim.Open_Flags{}
+	f, e := prim.open_file(db.vfs, path, flags)
+	if e == .Not_Found {
+		return prim.INVALID_FD, false, .None
 	}
-	return f, .None
+	if e != .None {
+		return prim.INVALID_FD, false, perr(e)
+	}
+	se := prim.datasync(db.vfs, f) if data_only else prim.fullsync(db.vfs, f)
+	if se != .None && !(dir && se == .Invalid) {
+		prim.close_file(db.vfs, f)
+		return prim.INVALID_FD, false, perr(se)
+	}
+	return f, true, .None
+}
+
+@(private)
+sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
+	if HAS_SYNCFS && vfs_is_os(db.vfs) && len(files) + len(dirs) > SYNCFS_THRESHOLD {
+		done := 0
+		for r in roots {
+			if r == "" {
+				continue
+			}
+			fd, e := prim.open_file(db.vfs, r, {.Directory})
+			if e != .None {
+				continue
+			}
+			ok := os_syncfs(fd)
+			prim.close_file(db.vfs, fd)
+			if !ok {
+				return .Io
+			}
+			done += 1
+		}
+		if done > 0 {
+			return .None
+		}
+	}
+	darwin_batch := ODIN_OS == .Darwin && vfs_is_os(db.vfs)
+	last := prim.INVALID_FD
+	defer if last != prim.INVALID_FD {
+		prim.close_file(db.vfs, last)
+	}
+	for list, li in ([][]string{files, dirs}) {
+		for p in list {
+			data_only := li == 0 && !darwin_batch
+			fd, kept := sync_one(db, p, li == 1, data_only) or_return
+			if !kept {
+				continue
+			}
+			if last != prim.INVALID_FD {
+				prim.close_file(db.vfs, last)
+			}
+			last = fd
+		}
+	}
+	if darwin_batch {
+		if last == prim.INVALID_FD {
+			for r in roots {
+				if r == "" {
+					continue
+				}
+				fd, e := prim.open_file(db.vfs, r, {.Directory})
+				if e == .None {
+					last = fd
+					break
+				}
+			}
+		}
+		if last != prim.INVALID_FD {
+			perr(prim.datasync(db.vfs, last)) or_return
+		}
+	}
+	return .None
 }

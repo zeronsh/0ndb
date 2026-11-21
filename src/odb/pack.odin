@@ -1,7 +1,9 @@
 package odb
 
 import "core:encoding/endian"
+import "core:io"
 import "core:mem/virtual"
+import "../prim"
 
 @(private)
 IDX_HEADER :: 8 + 256 * 4
@@ -17,27 +19,31 @@ OBJ_REF_DELTA :: 7
 
 @(private)
 Pack :: struct {
-	id:      u32,
-	hsz:     int,
-	base:    string,
-	idx:     []u8,
-	data:    []u8,
-	count:   int,
-	names:   int,
-	crcs:    int,
-	offs32:  int,
-	offs64:  int,
-	n64:     int,
-	failed:  bool,
-	present: bool,
-	freshened: bool,
+	id:         u32,
+	hsz:        int,
+	base:       string,
+	idx:        []u8,
+	idx_mapped: bool,
+	data:       []u8,
+	fd:         prim.Fd,
+	size:       i64,
+	opened:     bool,
+	count:      int,
+	names:      int,
+	crcs:       int,
+	offs32:     int,
+	offs64:     int,
+	n64:        int,
+	failed:     bool,
+	present:    bool,
+	freshened:  bool,
 }
 
 @(private)
 Entry_Header :: struct {
 	kind:     u8,
 	size:     i64,
-	start:    int,
+	start:    i64,
 	base_off: i64,
 	base_oid: Oid,
 }
@@ -142,65 +148,120 @@ pack_offset_at :: proc(p: ^Pack, i: int) -> (i64, Error) {
 }
 
 @(private)
-pack_open_data :: proc(p: ^Pack, path_buf: []u8) -> Error {
-	if p.data != nil {
+pack_open_data :: proc(db: ^Odb, p: ^Pack) -> Error {
+	if p.opened {
 		return .None
 	}
 	if p.failed {
 		return .Corrupt
 	}
-	path := concat_into(path_buf, p.base, ".pack") or_return
-	data, merr := virtual.map_file_from_path(path, {.Read})
-	if merr != .None {
-		p.failed = true
-		return .Not_Found if merr == .Open_Failure else .Io
+	buf: [PATH_MAX]u8
+	path := concat_into(buf[:], p.base, ".pack") or_return
+	if db.use_mmap && vfs_is_os(db.vfs) {
+		data, merr := virtual.map_file_from_path(path, {.Read})
+		if merr != .None {
+			p.failed = true
+			return .Not_Found if merr == .Open_Failure else .Io
+		}
+		p.data = data
+		p.size = i64(len(data))
+	} else {
+		fd, e := prim.open_file(db.vfs, path)
+		if e != .None {
+			p.failed = true
+			return perr(e)
+		}
+		size, serr := vfs_size(db.vfs, fd)
+		if serr != .None {
+			prim.close_file(db.vfs, fd)
+			return serr
+		}
+		p.fd = fd
+		p.size = size
 	}
-	ok := len(data) >= 12 + p.hsz && string(data[:4]) == "PACK"
+	p.opened = true
+	head: [12]u8
+	tail: [32]u8
+	ok := p.size >= i64(12 + p.hsz)
 	if ok {
-		version := endian.unchecked_get_u32be(data[4:])
-		ok = (version == 2 || version == 3) && int(endian.unchecked_get_u32be(data[8:])) == p.count
-	}
-	if ok {
-		ok = string(data[len(data) - p.hsz:]) == string(p.idx[len(p.idx) - 2 * p.hsz:][:p.hsz])
+		h, herr := pack_view(db, p, 0, 12, head[:], true)
+		t, terr := pack_view(db, p, p.size - i64(p.hsz), p.hsz, tail[:], true)
+		ok = herr == .None && terr == .None && len(h) == 12 && len(t) == p.hsz && string(h[:4]) == "PACK"
+		if ok {
+			version := endian.unchecked_get_u32be(h[4:])
+			ok = (version == 2 || version == 3) && int(endian.unchecked_get_u32be(h[8:])) == p.count
+			ok = ok && string(t) == string(p.idx[len(p.idx) - 2 * p.hsz:][:p.hsz])
+		}
 	}
 	if !ok {
-		virtual.unmap_file(data)
+		pack_close(db, p)
 		p.failed = true
 		return .Corrupt
 	}
-	p.data = data
 	return .None
 }
 
 @(private)
-pack_close :: proc(p: ^Pack) {
+pack_view :: proc(db: ^Odb, p: ^Pack, off: i64, n: int, buf: []u8, whole := false) -> ([]u8, Error) {
+	end := p.size if whole else p.size - i64(p.hsz)
+	if off < 0 || off > end {
+		return nil, .Corrupt
+	}
+	k := int(min(i64(n), end - off))
+	if p.data != nil {
+		return p.data[off:off + i64(k)], .None
+	}
+	k = min(k, len(buf))
+	got, e := prim.read_at(db.vfs, p.fd, buf[:k], off)
+	if e != .None {
+		return nil, perr(e)
+	}
+	return buf[:got], .None
+}
+
+@(private)
+pack_close :: proc(db: ^Odb, p: ^Pack) {
 	if p.data != nil {
 		virtual.unmap_file(p.data)
 		p.data = nil
 	}
+	if p.opened && p.fd != prim.INVALID_FD && p.fd != 0 {
+		prim.close_file(db.vfs, p.fd)
+	}
+	p.fd = prim.INVALID_FD
+	p.opened = false
 	if p.idx != nil {
-		virtual.unmap_file(p.idx)
+		if p.idx_mapped {
+			virtual.unmap_file(p.idx)
+		} else {
+			delete(p.idx, db.allocator)
+		}
 		p.idx = nil
 	}
 }
 
 @(private)
-pack_entry_header :: proc(p: ^Pack, offset: i64) -> (h: Entry_Header, err: Error) #no_bounds_check {
-	end := len(p.data) - p.hsz
-	if offset < 12 || offset >= i64(end) {
+pack_entry_header :: proc(db: ^Odb, p: ^Pack, offset: i64) -> (h: Entry_Header, err: Error) #no_bounds_check {
+	end := p.size - i64(p.hsz)
+	if offset < 12 || offset >= end {
 		return h, .Corrupt
 	}
-	pos := int(offset)
-	c := p.data[pos]
+	buf: [96]u8
+	d := pack_view(db, p, offset, len(buf), buf[:]) or_return
+	pos := 0
+	if pos >= len(d) {
+		return h, .Corrupt
+	}
+	c := d[pos]
 	pos += 1
 	h.kind = (c >> 4) & 7
 	size := u64(c & 15)
 	shift: uint = 4
 	for c & 0x80 != 0 {
-		if pos >= end || shift > 56 {
+		if pos >= len(d) || shift > 56 {
 			return h, .Corrupt
 		}
-		c = p.data[pos]
+		c = d[pos]
 		pos += 1
 		size |= u64(c & 0x7f) << shift
 		shift += 7
@@ -212,17 +273,17 @@ pack_entry_header :: proc(p: ^Pack, offset: i64) -> (h: Entry_Header, err: Error
 	switch h.kind {
 	case 1 ..= 4:
 	case OBJ_OFS_DELTA:
-		if pos >= end {
+		if pos >= len(d) {
 			return h, .Corrupt
 		}
-		c = p.data[pos]
+		c = d[pos]
 		pos += 1
 		rel := u64(c & 0x7f)
 		for c & 0x80 != 0 {
-			if pos >= end || rel >= 1 << 56 {
+			if pos >= len(d) || rel >= 1 << 56 {
 				return h, .Corrupt
 			}
-			c = p.data[pos]
+			c = d[pos]
 			pos += 1
 			rel = ((rel + 1) << 7) | u64(c & 0x7f)
 		}
@@ -231,24 +292,77 @@ pack_entry_header :: proc(p: ^Pack, offset: i64) -> (h: Entry_Header, err: Error
 		}
 		h.base_off = offset - i64(rel)
 	case OBJ_REF_DELTA:
-		if pos + p.hsz > end {
+		if pos + p.hsz > len(d) {
 			return h, .Corrupt
 		}
-		copy(h.base_oid[:p.hsz], p.data[pos:pos + p.hsz])
+		copy(h.base_oid[:p.hsz], d[pos:pos + p.hsz])
 		pos += p.hsz
 	case:
 		return h, .Corrupt
 	}
-	if pos >= end {
+	h.start = offset + i64(pos)
+	if h.start >= end {
 		return h, .Corrupt
 	}
-	h.start = pos
 	return h, .None
 }
 
 @(private)
-pack_entry_src :: proc(p: ^Pack, h: Entry_Header) -> []u8 {
-	return p.data[h.start:len(p.data) - p.hsz]
+pack_compressed_avail :: proc(p: ^Pack, h: Entry_Header) -> int {
+	return int(p.size - i64(p.hsz) - h.start)
+}
+
+@(private)
+Pack_Src :: struct {
+	db:  ^Odb,
+	p:   ^Pack,
+	pos:  i64,
+	buf:  []u8,
+	full: []u8,
+}
+
+@(private)
+pack_src_refill :: proc(data: rawptr) -> (chunk: []u8, err: Error) {
+	ps := (^Pack_Src)(data)
+	chunk = pack_view(ps.db, ps.p, ps.pos, len(ps.buf), ps.buf) or_return
+	ps.pos += i64(len(chunk))
+	if ps.full != nil {
+		ps.buf = ps.full
+	}
+	return chunk, .None
+}
+
+@(private)
+pack_inflate_exact :: proc(db: ^Odb, p: ^Pack, h: Entry_Header, out: []u8) -> Error {
+	if p.data != nil {
+		return inflate_exact(p.data[h.start:p.size - i64(p.hsz)], out)
+	}
+	buf: [IO_CHUNK]u8
+	first := clamp(len(out) + 64, 256, IO_CHUNK)
+	ps := Pack_Src{db, p, h.start, buf[:first], buf[:]}
+	return inflate_exact(nil, out, pack_src_refill, &ps)
+}
+
+@(private)
+pack_inflate_prefix :: proc(db: ^Odb, p: ^Pack, h: Entry_Header, out: []u8) -> (int, Error) {
+	if p.data != nil {
+		return inflate_prefix(p.data[h.start:p.size - i64(p.hsz)], out)
+	}
+	buf: [512]u8
+	ps := Pack_Src{db, p, h.start, buf[:], nil}
+	return inflate_prefix(nil, out, pack_src_refill, &ps)
+}
+
+@(private)
+pack_inflate_to_writer :: proc(db: ^Odb, p: ^Pack, h: Entry_Header, w: io.Writer, window: []u8) -> Error {
+	if p.data != nil {
+		_, err := inflate_to_writer(p.data[h.start:p.size - i64(p.hsz)], nil, nil, w, h.size, window)
+		return err
+	}
+	buf: [IO_CHUNK]u8
+	ps := Pack_Src{db, p, h.start, buf[:], nil}
+	_, err := inflate_to_writer(nil, pack_src_refill, &ps, w, h.size, window)
+	return err
 }
 
 @(private)

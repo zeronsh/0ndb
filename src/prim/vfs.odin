@@ -61,6 +61,7 @@ Vfs_Procs :: struct {
 	symlink:    proc(data: rawptr, target: string, path: string) -> Error,
 	readlink:   proc(data: rawptr, path: string, buf: []u8) -> (int, Error),
 	fchmod:     proc(data: rawptr, fd: Fd, mode: u32) -> Error,
+	set_times:  proc(data: rawptr, path: string, atime_ns: i64, mtime_ns: i64) -> Error,
 	dir_open:   proc(data: rawptr, d: ^Dir, path: string) -> Error,
 	dir_next:   proc(data: rawptr, d: ^Dir) -> (Dir_Entry, bool, Error),
 	dir_close:  proc(data: rawptr, d: ^Dir),
@@ -140,6 +141,10 @@ readlink :: #force_inline proc(vfs: Vfs, path: string, buf: []u8) -> (int, Error
 
 fchmod :: #force_inline proc(vfs: Vfs, fd: Fd, mode: u32) -> Error {
 	return vfs.procs.fchmod(vfs.data, fd, mode)
+}
+
+set_times :: #force_inline proc(vfs: Vfs, path: string, atime_ns: i64, mtime_ns: i64) -> Error {
+	return vfs.procs.set_times(vfs.data, path, atime_ns, mtime_ns)
 }
 
 dir_open :: proc(vfs: Vfs, d: ^Dir, path: string, allocator := context.allocator) -> Error {
