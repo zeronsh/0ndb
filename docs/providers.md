@@ -139,6 +139,62 @@ the transcript, reported as `Rewound{path = Seeded}`.
 | Antigravity | `$GEMINI_HOME` or `~/.gemini` → `antigravity-acp/conversations/<id>.db` (SQLite trajectory) and `<id>.meta` (JSON), `antigravity-acp/brain/<id>/` | copy | same relative paths; rewrite only `.meta`; same id | layout read from the shipped source; not exercised (needs login) |
 | Devin | one shared SQLite `~/.local/share/devin/cli/sessions.db` | none | seed fallback (`plan.seeded`) | — |
 
+## Deletion (purge)
+
+`purge(d, env, targets)` (or `purge_session(desc, env, session,
+native_path, targets)`) returns a `Purge_Plan` that removes redacted content
+from the provider's own stored state. A `Purge_Target` is a native message
+range (`from`..`to` inclusive in the provider's own order, `to` empty for one
+message, `keep_from` to start after `from`) and/or a literal `text` to scrub
+everywhere. The host stops the provider process, then executes
+`plan.steps` in order:
+
+- `Edit` (a file or a tree; with `match`, search under `path`): replace each
+  file with `purge_bytes(plan, bytes)`;
+- `Scrub`: replace each file with `purge_text(plan, bytes)` (literal texts
+  only; used for logs);
+- `Run`: run `argv` in `cwd` with `env`; stdout is kept under `key`;
+- `Write`: write `purge_bytes(plan, output of key)` to `path`;
+- `Delete`: remove `path` (a file or a tree; `optional` may be absent);
+- `Sql`: update the SQLite database at `path`. Preferred: run the provider's
+  own Python, `<interpreter> -I -c <script> <args...>`, where `script` uses
+  the `sqlite3` module and the values arrive as parameters (`args`: database,
+  table, column, the texts as a JSON array, the replacement; bound with `?`,
+  never interpolated). The interpreter is found from the provider's launcher
+  (`launcher`, e.g. `hermes` on `PATH`): the host reads the file and calls
+  `launcher_interpreter(text) -> (interpreter, next)`, which returns a
+  `#!...python...` shebang (also through `env`), or the absolute target of
+  the first `exec /path ...` line (an interpreter when its name starts with
+  `python`, otherwise the next launcher to read). Only when no interpreter is
+  found does the host fall back to `sqlite3 <path> <sql>` with the
+  equivalent escaped SQL.
+
+Afterwards the driver is relaunched with `resume = purge_result(desc, plan,
+run_outputs)`; when `plan.seeded` is set (the format cannot be rewritten),
+the native session has been deleted and the host starts a fresh one with
+`Start_Request.seed` (the already redacted transcript).
+
+`purge_bytes` understands each format and keeps the session resumable:
+entries in a range keep their ids, parent links, roles, tool ids and names,
+but every text, tool input and tool output becomes `[redacted]` (tool inputs
+`{}`, Codex arguments `"{}"`); thinking/reasoning blocks (their signatures
+would no longer verify), images, documents and files are dropped, and an
+emptied content array gets one `[redacted]` text block. Codex reasoning
+items in a range are dropped. Literal texts are replaced by `[redacted]` in
+every string of every entry, and a thinking block that contains one is
+dropped. Untouched lines keep their exact bytes.
+
+| Provider | How | Message ids for ranges | Verified |
+|---|---|---|---|
+| Claude Code | edit the transcript JSONL and the session's folder (sub-agents, tool results) in place, delete `file-history/<session>` | transcript `uuid`s (prompt uuid = our message id; checkpoint = last entry) | live: after purging a turn and its passphrase, no byte of it remained under the config dir, `--resume` worked, the model still knew the earlier word and only saw `[redacted]` |
+| Codex | edit the rollout JSONL (the only file holding message text; the SQLite stores hold none) | turn ids | not exercised (not logged in) |
+| Pi | edit the session JSONL | entry ids | not exercised (no API key) |
+| OpenCode | `opencode export`, redact, `opencode session delete`, `opencode import` (same id), `opencode db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"`, scrub `log/` (its log records prompts) | OpenCode message ids (`msg_...`, the `messageId` of agent chunks) | live: no trace in the data dir afterwards; the session resumed and answered with the earlier word and `[redacted]` |
+| Hermes | `hermes sessions export --format trace`, redact, `hermes sessions delete --yes`, `hermes sessions import --from claude` (new id), SQL on `state.db` through Hermes's own Python (its launcher chain here: `/usr/local/bin/hermes` → `.../ascii-harnesses/bin/hermes` → `.hermes/bin/hermes`, a shell script that `exec`s `~/.hermes/tools/python-3.14.9.../bin/python3`): Hermes keeps each turn's `final_response` in `state_meta` admission receipts even after a delete (by design, for exact retries), so those values are scrubbed with `replace(...)`; then `hermes sessions optimize --force` (VACUUM) and scrub `logs/` and `sessions/` | none over ACP: purge by text (the host passes the redacted texts) | live, with no `sqlite3` on `PATH`: no trace in the Hermes home (files and every SQLite cell); the imported session resumed |
+| Muse | seeded: delete the session folder (its log is fingerprinted) | — | not exercised |
+| Cursor, Antigravity | seeded: delete the chat folder / trajectory, sidecar and brain | — | not exercised |
+| Devin | seeded: `devin rm <session>` | — | not exercised |
+
 ## Claude Code (`claude`, 2.1.330)
 
 - Launch: `claude -p --input-format stream-json --output-format stream-json

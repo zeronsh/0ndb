@@ -327,8 +327,15 @@ store_root :: proc(store: Store, env: Port_Env) -> string {
 		return join(parts, context.temp_allocator)
 	}
 	switch store {
-	case .None, .OpenCode_Cli, .Hermes_Cli:
+	case .None:
 		return ""
+	case .OpenCode_Cli:
+		if v := env_get(env.env, "XDG_DATA_HOME"); v != "" {
+			return join({v, "opencode"}, context.temp_allocator)
+		}
+		return join({env.home, ".local", "share", "opencode"}, context.temp_allocator)
+	case .Hermes_Cli:
+		return pick(env, "HERMES_HOME", {env.home, ".hermes"})
 	case .Claude_Projects:
 		return pick(env, "CLAUDE_CONFIG_DIR", {env.home, ".claude"})
 	case .Codex_Rollouts:
