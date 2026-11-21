@@ -543,6 +543,11 @@ simulate :: proc(t: ^testing.T) {
 					sg := failure_signature(pick)
 					st.sig_len = copy(st.sig[:], sg)
 				}
+				line := a.failures[0]
+				if nl := strings.index_byte(line, '\n'); nl >= 0 {
+					line = line[:nl]
+				}
+				st.first_len = copy(st.first[:], line)
 			}
 			b := transmute([size_of(Wire_Stats)]u8)st
 			posix.write(posix.FD(fd), raw_data(b[:]), len(b))
@@ -570,6 +575,13 @@ simulate :: proc(t: ^testing.T) {
 	}
 	failed := make([dynamic]u64, runtime.heap_allocator())
 	defer delete(failed)
+	firsts := make([dynamic]string, runtime.heap_allocator())
+	defer {
+		for f in firsts {
+			delete(f, runtime.heap_allocator())
+		}
+		delete(firsts)
+	}
 	total: Run_Result
 	start := time.tick_now()
 	for seed, i in seeds {
@@ -578,6 +590,8 @@ simulate :: proc(t: ^testing.T) {
 		if !ok {
 			fmt.eprintf("sim: seed %d FAILED (%s). Reproduce: SIM_SEED=%d odin test tests/sim -o:speed\n", seed, why, seed)
 			append(&failed, seed)
+			first := string(st.first[:st.first_len]) if st.first_len > 0 else why
+			append(&firsts, fmt.aprintf("%d -> %s", seed, first, allocator = runtime.heap_allocator()))
 		}
 		total.stats.events += st.stats.events
 		total.stats.steps += st.stats.steps
@@ -598,6 +612,9 @@ simulate :: proc(t: ^testing.T) {
 	total.wall_ns = i64(time.tick_since(start))
 	print_stats(&total)
 	fmt.eprintf("sim: %d seeds, %d failed %v\n", len(seeds), len(failed), failed[:])
+	for f in firsts {
+		fmt.eprintf("sim: %s\n", f)
+	}
 	testing.expect(t, len(failed) == 0)
 }
 
@@ -653,6 +670,8 @@ Wire_Stats :: struct {
 	faults:   int,
 	sig_len:  int,
 	sig:      [240]u8,
+	first_len: int,
+	first:    [240]u8,
 }
 
 failure_signature :: proc(f: string) -> string {
@@ -857,7 +876,14 @@ _ddmin :: proc(s: ^Shrinker, set: ^[dynamic]int, other: []int, is_ops: bool) {
 }
 
 shrink :: proc(seed: u64) -> bool {
-	st, ok, why := run_child(seed, false)
+	resume := make([dynamic]string, context.temp_allocator)
+	if v, has := os.lookup_env("SIM_KEEP_OPS", context.temp_allocator); has {
+		append(&resume, fmt.tprintf("SIM_KEEP_OPS=%s", v))
+	}
+	if v, has := os.lookup_env("SIM_KEEP_FAULTS", context.temp_allocator); has {
+		append(&resume, fmt.tprintf("SIM_KEEP_FAULTS=%s", v))
+	}
+	st, ok, why := run_child(seed, false, resume[:])
 	if ok {
 		fmt.eprintf("sim: seed %d passes; nothing to shrink\n", seed)
 		return true
@@ -871,11 +897,19 @@ shrink :: proc(seed: u64) -> bool {
 	fmt.eprintf("sim: shrinking seed %d (%d ops, %d faults) for failure: %s\n", seed, st.ops, st.faults, s.sig)
 	ops := make([dynamic]int, context.temp_allocator)
 	faults := make([dynamic]int, context.temp_allocator)
+	start_ops := filter_parse("SIM_KEEP_OPS")
+	start_faults := filter_parse("SIM_KEEP_FAULTS")
+	defer delete(start_ops.keep)
+	defer delete(start_faults.keep)
 	for i in 0 ..< st.ops {
-		append(&ops, i)
+		if filter_keeps(&start_ops, i) {
+			append(&ops, i)
+		}
 	}
 	for i in 0 ..< st.faults {
-		append(&faults, i)
+		if filter_keeps(&start_faults, i) {
+			append(&faults, i)
+		}
 	}
 	_ddmin(&s, &faults, ops[:], false)
 	_ddmin(&s, &ops, faults[:], true)
