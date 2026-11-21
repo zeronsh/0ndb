@@ -32,7 +32,18 @@ text_drop :: proc(st: ^Text_State) {
 }
 
 text_load :: proc(src: ^Text_Source, st: ^Text_State, inode: fstree.Inode_Id, target: crdt.Op_Id, rec: ^File_Record, extra: []Op_Ref, v: []crdt.Lv, full := false) -> Error {
+	next: Text_State
+	if err := _text_build(src, &next, inode, target, rec, extra, v, full); err != .None {
+		text_drop(&next)
+		return err
+	}
 	text_drop(st)
+	st^ = next
+	return .None
+}
+
+@(private = "file")
+_text_build :: proc(src: ^Text_Source, st: ^Text_State, inode: fstree.Inode_Id, target: crdt.Op_Id, rec: ^File_Record, extra: []Op_Ref, v: []crdt.Lv, full: bool) -> Error {
 	if rec.has_cp && !full {
 		ok := text_load_checkpoint(src, st, inode, target, rec, extra, v) or_return
 		if ok {
