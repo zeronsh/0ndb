@@ -383,7 +383,7 @@ match_command :: proc(calls: []Tool_Call, cmdline: []u8) -> (index: int, ambiguo
 	for &c, i in calls {
 		score := 0
 		for cmd in c.commands {
-			if len(cmd) > score && (strings.contains(line, cmd) || strings.contains(flat, cmd) || strings.contains(line, _shell_quoted(cmd))) {
+			if len(cmd) > score && (strings.contains(line, cmd) || strings.contains(flat, cmd) || strings.contains(line, _shell_quoted(cmd)) || strings.contains(line, _shell_quoted_dq(cmd))) {
 				score = len(cmd)
 			}
 		}
@@ -399,6 +399,12 @@ match_command :: proc(calls: []Tool_Call, cmdline: []u8) -> (index: int, ambiguo
 		}
 	}
 	return
+}
+
+@(private)
+_shell_quoted_dq :: proc(s: string) -> string {
+	out, _ := strings.replace_all(s, "'", "'\"'\"'", context.temp_allocator)
+	return out
 }
 
 @(private)

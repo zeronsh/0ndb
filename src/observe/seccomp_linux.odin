@@ -101,7 +101,12 @@ Tree :: struct {
 	space_fd: i32,
 	ready_fd: i32,
 	sock:     i32,
+	flush_fd: i32,
 	unsignaled: int,
+	recv:     u64,
+	handled:  u64,
+	flush_req: u32,
+	delivered: u64,
 	ring:     Ring,
 	thread:   ^thread.Thread,
 	alloc:    runtime.Allocator,
@@ -140,6 +145,7 @@ Supervisor :: struct {
 	wake_watch: prim.Watch,
 	snap_mu:    sync.Mutex,
 	snap:       [dynamic]Root,
+	fences:     [dynamic]^Fence,
 	self:       prim.Pid,
 	mnt_ns:     [64]u8,
 	mnt_ns_len: int,
@@ -203,6 +209,7 @@ supervisor_init :: proc(s: ^Supervisor, loop: ^prim.Loop, opts := DEFAULT_SUPERV
 	}
 	s.wake_watch = ww
 	s.snap = make([dynamic]Root, allocator)
+	s.fences = make([dynamic]^Fence, allocator)
 	s.self = prim.Pid(linux.getpid())
 	pp: Proc_Path
 	n, e := _sys_readlinkat(AT_FDCWD, _pp_proc(&pp, i64(s.self), "/ns/mnt"), s.mnt_ns[:])
@@ -245,6 +252,10 @@ supervisor_destroy :: proc(s: ^Supervisor) {
 	_sys_close(s.wake_fd)
 	_roots_clear(s)
 	delete(s.snap)
+	for f in s.fences {
+		_fence_free(s, f)
+	}
+	delete(s.fences)
 	if s.prog != nil {
 		delete(s.prog, s.allocator)
 	}
@@ -426,6 +437,7 @@ spawn_with :: proc(s: ^Supervisor, argv: []string, opts: Spawn_Options) -> (chil
 		stop_fd  = -1,
 		space_fd = -1,
 		ready_fd = -1,
+		flush_fd = -1,
 	}
 	router_refresh(&s.router)
 	_roots_publish(s)
@@ -680,6 +692,8 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) -> bool {
 		intrinsics.volatile_store(&sh.state, 0)
 		return true
 	}
+	intrinsics.atomic_add_explicit(&t.recv, 1, .Seq_Cst)
+	defer intrinsics.atomic_add_explicit(&t.handled, 1, .Seq_Cst)
 	n := (^Notif)(&sh.notif)
 	_stat_add(&s.stats.notifications)
 	tid := i32(n.pid)
@@ -1095,5 +1109,109 @@ _control :: proc(s: ^Supervisor, t: ^Tree, n: ^Notif, call: Call, tid: i32, tgid
 			pe.cwd = -1
 			pe.nocwd = true
 		}
+	}
+}
+
+Fence_Proc :: #type proc(data: rawptr)
+
+@(private)
+Fence_Entry :: struct {
+	tree: ^Tree,
+	slot: u32,
+	snap: u64,
+	head: u64,
+	took: bool,
+	done: bool,
+}
+
+@(private)
+Fence :: struct {
+	entries: [dynamic]Fence_Entry,
+	cb:      Fence_Proc,
+	data:    rawptr,
+}
+
+supervisor_fence :: proc(s: ^Supervisor, cb: Fence_Proc, data: rawptr) {
+	f, err := new(Fence, s.allocator)
+	if err != nil {
+		cb(data)
+		return
+	}
+	f.cb = cb
+	f.data = data
+	f.entries = make([dynamic]Fence_Entry, s.allocator)
+	for t, i in s.trees {
+		if t == nil {
+			continue
+		}
+		append(&f.entries, Fence_Entry{tree = t, slot = u32(i), snap = intrinsics.atomic_load_explicit(&t.recv, .Seq_Cst)})
+	}
+	_drain_all(s)
+	if _fence_check(s, f) {
+		_fence_free(s, f)
+		cb(data)
+		return
+	}
+	append(&s.fences, f)
+	for e in f.entries {
+		if !e.done {
+			intrinsics.atomic_store_explicit(&e.tree.flush_req, 1, .Seq_Cst)
+			_efd_signal(e.tree.flush_fd)
+		}
+	}
+}
+
+supervisor_pending_fences :: proc(s: ^Supervisor) -> int {
+	return len(s.fences)
+}
+
+@(private)
+_fence_free :: proc(s: ^Supervisor, f: ^Fence) {
+	delete(f.entries)
+	free(f, s.allocator)
+}
+
+@(private)
+_fence_check :: proc(s: ^Supervisor, f: ^Fence) -> bool {
+	all := true
+	for &e in f.entries {
+		if e.done {
+			continue
+		}
+		t := e.tree
+		if int(e.slot) >= len(s.trees) || s.trees[e.slot] != t {
+			e.done = true
+			continue
+		}
+		if !e.took {
+			if intrinsics.atomic_load_explicit(&t.handled, .Seq_Cst) < e.snap {
+				all = false
+				continue
+			}
+			e.head = intrinsics.atomic_load_explicit(&t.ring.head, .Seq_Cst)
+			e.took = true
+		}
+		if t.delivered >= e.head {
+			e.done = true
+		} else {
+			all = false
+		}
+	}
+	return all
+}
+
+@(private)
+_fences_run :: proc(s: ^Supervisor) {
+	i := 0
+	for i < len(s.fences) {
+		f := s.fences[i]
+		if !_fence_check(s, f) {
+			i += 1
+			continue
+		}
+		ordered_remove(&s.fences, i)
+		cb, data := f.cb, f.data
+		_fence_free(s, f)
+		cb(data)
 	}
 }

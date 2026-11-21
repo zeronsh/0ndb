@@ -159,8 +159,8 @@ _worker_main :: proc(t: ^Tree) {
 		return
 	}
 	for {
-		pf := [2]Pollfd{{fd = t.fd, events = POLLIN}, {fd = t.stop_fd, events = POLLIN}}
-		n, e := _sys_poll(&pf[0], 2, WAKE_DELAY_MS if t.unsignaled > 0 else -1)
+		pf := [3]Pollfd{{fd = t.fd, events = POLLIN}, {fd = t.stop_fd, events = POLLIN}, {fd = t.flush_fd, events = POLLIN}}
+		n, e := _sys_poll(&pf[0], 3, WAKE_DELAY_MS if t.unsignaled > 0 else -1)
 		if e == EINTR {
 			continue
 		}
@@ -171,11 +171,25 @@ _worker_main :: proc(t: ^Tree) {
 			_flush_wake(t)
 			continue
 		}
+		if pf[2].revents != 0 {
+			_efd_drain(t.flush_fd)
+		}
+		if intrinsics.atomic_exchange_explicit(&t.flush_req, 0, .Seq_Cst) != 0 {
+			t.unsignaled += 1
+			_flush_wake(t)
+		}
+		if pf[0].revents == 0 {
+			continue
+		}
 		if pf[0].revents & POLLIN != 0 {
 			if !_handle_one(t.sup, t) {
 				break
 			}
 			runtime.free_all(context.temp_allocator)
+			if intrinsics.atomic_exchange_explicit(&t.flush_req, 0, .Seq_Cst) != 0 {
+				t.unsignaled += 1
+				_flush_wake(t)
+			}
 			continue
 		}
 		if pf[0].revents & (POLLHUP | POLLERR | POLLNVAL) != 0 {
@@ -193,7 +207,8 @@ _worker_start :: proc(s: ^Supervisor, t: ^Tree) -> prim.Error {
 	t.stop_fd = _eventfd()
 	t.space_fd = _eventfd()
 	t.ready_fd = _eventfd()
-	if t.stop_fd < 0 || t.space_fd < 0 || t.ready_fd < 0 {
+	t.flush_fd = _eventfd()
+	if t.stop_fd < 0 || t.space_fd < 0 || t.ready_fd < 0 || t.flush_fd < 0 {
 		return .Too_Many_Files
 	}
 	buf, berr := make([]u8, RING_SIZE, t.alloc)
@@ -240,6 +255,7 @@ _worker_free :: proc(t: ^Tree) {
 	_sys_close(t.stop_fd)
 	_sys_close(t.space_fd)
 	_sys_close(t.ready_fd)
+	_sys_close(t.flush_fd)
 }
 
 @(private)
@@ -263,6 +279,16 @@ _on_wake :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) 
 			_tree_free(s, t, true)
 		}
 	}
+	_fences_run(s)
+}
+
+@(private)
+_drain_all :: proc(s: ^Supervisor) {
+	for t in s.trees {
+		if t != nil {
+			_ring_drain(s, t)
+		}
+	}
 }
 
 @(private)
@@ -277,12 +303,13 @@ _ring_drain :: proc(s: ^Supervisor, t: ^Tree) {
 		resize(&rec, int(n))
 		_ring_get(r, tail + 4, rec[:])
 		tail += 4 + u64(n)
+		_deliver_record(s, rec[:])
+		t.delivered = tail
 		intrinsics.atomic_store_explicit(&r.tail, tail, .Seq_Cst)
 		intrinsics.atomic_thread_fence(.Seq_Cst)
 		if intrinsics.atomic_exchange_explicit(&r.waiting, 0, .Seq_Cst) == 1 {
 			_efd_signal(t.space_fd)
 		}
-		_deliver_record(s, rec[:])
 		head = intrinsics.atomic_load_explicit(&r.head, .Seq_Cst)
 	}
 }
