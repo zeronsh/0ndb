@@ -476,24 +476,6 @@ _card_publish_object :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> Error {
 }
 
 @(private)
-CARD_RECORD :: u8(1)
-
-@(private)
-_card_record :: proc(card: []u8) -> (out: [1 + osync.CARD_LEN]u8) {
-	out[0] = CARD_RECORD
-	copy(out[1:], card)
-	return
-}
-
-@(private)
-_card_body :: proc(body: []u8) -> []u8 {
-	if len(body) == 1 + osync.CARD_LEN && body[0] == CARD_RECORD {
-		return body[1:]
-	}
-	return body
-}
-
-@(private)
 _card_publish_in :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, path: string) -> Error {
 	dir := prim.dir_name(path)
 	_perr(prim.mkdir_all(e.vfs, dir, 0o700)) or_return
@@ -505,7 +487,7 @@ _card_publish_in :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, path: stri
 			journal.journal_close(&j)
 			return _serr(cerr)
 		}
-		rec := _card_record(card[:])
+		rec := osync.card_record(card[:])
 		if _, aerr := journal.journal_append(&j, rec[:]); aerr != .None {
 			journal.journal_close(&j)
 			return _jerr(aerr)
@@ -620,7 +602,7 @@ _card_learn :: proc(e: ^Engine, sp: ^Space, device: prim.Id, stream: osync.Strea
 		if rerr != .None {
 			break
 		}
-		body = _card_body(body)
+		body = osync.card_record_body(body)
 		id, cerr := osync.card_verify(body)
 		if first && (cerr != .None || id.id != device) {
 			return
@@ -710,7 +692,7 @@ _card_relay :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id) {
 		if rerr != .None {
 			break
 		}
-		if string(_card_body(body)) == string(card) {
+		if string(osync.card_record_body(body)) == string(card) {
 			journal.reader_close(&r)
 			journal.journal_close(&j)
 			return
@@ -718,7 +700,7 @@ _card_relay :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id) {
 		pos = next
 	}
 	journal.reader_close(&r)
-	rec := _card_record(card)
+	rec := osync.card_record(card)
 	_, aerr := journal.journal_append(&j, rec[:])
 	if aerr == .None {
 		aerr = journal.journal_commit(&j)

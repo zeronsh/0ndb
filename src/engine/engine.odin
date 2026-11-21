@@ -157,6 +157,7 @@ Config :: struct {
 	http:            http.Client,
 	write_observer:  fs.Write_Observer,
 	watcher:         fs.Watcher,
+	boot_id:         Boot_Source,
 	search_options:  search.Options,
 	durability:      Durability,
 	verify_chains:   bool,

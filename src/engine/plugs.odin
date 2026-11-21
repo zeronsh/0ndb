@@ -20,6 +20,30 @@ Mounted :: struct {
 	mount:  fs.Mount,
 }
 
+Boot_Source :: struct {
+	data:    rawptr,
+	boot_id: proc(data: rawptr) -> prim.Id,
+}
+
+boot_id :: proc(e: ^Engine) -> prim.Id {
+	if e.cfg.boot_id.boot_id != nil {
+		return e.cfg.boot_id.boot_id(e.cfg.boot_id.data)
+	}
+	return os_boot_id()
+}
+
+os_boot_id :: proc() -> (id: prim.Id) {
+	raw := _os_boot_raw()
+	if len(raw) == 0 {
+		return
+	}
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	blake2b.update(&ctx, raw)
+	blake2b.final(&ctx, id[:])
+	return
+}
+
 default_spawner :: proc "contextless" () -> Spawner {
 	return Spawner{spawn = _default_spawn}
 }
@@ -84,6 +108,7 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 		run := _join(context.temp_allocator, e.dir, "run") or_return
 		_ferr(fs.registry_init(&e.plug.reg, e.base, run, e.allocator)) or_return
 		e.plug.reg_on = true
+		fs.registry_set_boot(&e.plug.reg, boot_id(e))
 		if e.cfg.watcher.start != nil {
 			_ferr(fs.registry_set_watcher(&e.plug.reg, e.cfg.watcher)) or_return
 		}

@@ -516,6 +516,9 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 		if (len(key) != 40 && len(key) != 56) || (len(value) != 9 && len(value) != 17) || value[0] & 0x7f < 1 || value[0] & 0x7f > u8(max(Kind)) {
 			return true
 		}
+		if len(key) == 40 && value[0] & 0x80 == 0 {
+			return true
+		}
 		id: prim.Id
 		copy(id[:], key[16:32])
 		device := a.e.self
@@ -894,6 +897,9 @@ _hist_replacement :: proc(h: ^Handle, s: ^Seg, off: i64) -> (synth: []u8, st: Re
 			continue
 		}
 		kind := body[1 + n]
+		if kind == fs.REC_REPLACE {
+			kind = fs.REC_BATCH
+		}
 		if kind != fs.REC_BATCH && kind != fs.REC_IMPORT {
 			return nil, .Absent
 		}
@@ -901,6 +907,11 @@ _hist_replacement :: proc(h: ^Handle, s: ^Seg, off: i64) -> (synth: []u8, st: Re
 		out[0] = kind
 		copy(out[1:], body[1 + n + 1:])
 		return out, .Found
+	}
+	if h.sp.repl_on && osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0) > end {
+		r := [1]journal.Range{{end, osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0)}}
+		osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
+		return nil, .Missing
 	}
 	return nil, .Absent
 }
