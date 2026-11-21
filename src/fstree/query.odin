@@ -578,6 +578,34 @@ path :: proc(s: ^Snapshot, id: Inode_Id, allocator := context.allocator) -> (out
 	if cur != ROOT {
 		return
 	}
+	out = join_reversed(parts[:], allocator) or_return
+	return out, true, nil
+}
+
+last_path :: proc(s: ^Snapshot, id: Inode_Id, allocator := context.allocator) -> (out: string, ok: bool, err: Error) {
+	parts := make([dynamic]string, context.temp_allocator)
+	cur := id
+	for _ in 0 ..< MAX_DEPTH {
+		if cur == ROOT {
+			break
+		}
+		p, placed := snap_parent(s, cur) or_return
+		if !placed {
+			return
+		}
+		name, shown := display_name(s, cur, context.temp_allocator) or_return
+		append(&parts, name if shown else p.name) or_return
+		cur = p.parent
+	}
+	if cur != ROOT {
+		return
+	}
+	out = join_reversed(parts[:], allocator) or_return
+	return out, true, nil
+}
+
+@(private)
+join_reversed :: proc(parts: []string, allocator: runtime.Allocator) -> (out: string, err: Error) {
 	b := strings.builder_make(allocator) or_return
 	for i := len(parts) - 1; i >= 0; i -= 1 {
 		strings.write_string(&b, parts[i])
@@ -585,7 +613,7 @@ path :: proc(s: ^Snapshot, id: Inode_Id, allocator := context.allocator) -> (out
 			strings.write_byte(&b, '/')
 		}
 	}
-	return strings.to_string(b), true, nil
+	return strings.to_string(b), nil
 }
 
 lookup :: proc(s: ^Snapshot, p: string) -> (id: Inode_Id, ok: bool, err: Error) {
