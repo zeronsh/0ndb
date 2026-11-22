@@ -275,7 +275,7 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 		}
 		home := ""
 		if single && r.cfg.homes.home != nil {
-			if h, ok := r.cfg.homes.home(r.cfg.homes.data, m.tree, context.temp_allocator); ok && !worktree_dir_busy(r, h, ws) {
+			if h, ok := r.cfg.homes.home(r.cfg.homes.data, m.tree, context.temp_allocator); ok && !worktree_dir_busy(r, h, ws) && _home_on_line(r, h, m.line) {
 				home = h
 			}
 		}
@@ -305,6 +305,20 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 		}
 	}
 	return ws, .None
+}
+
+@(private)
+_home_on_line :: proc(r: ^Runtime, home: string, line: prim.Id) -> bool {
+	reg, err := eng.registry(r.e)
+	if err != .None {
+		return true
+	}
+	for m in reg.mounts {
+		if m != nil && m.root == home {
+			return m.line == line_name(line)
+		}
+	}
+	return true
 }
 
 @(private)

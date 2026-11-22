@@ -253,6 +253,30 @@ impl Client {
         self.subscribe_with(&Value::Object(m), SubKind::Runners, |sub, _| Ok(sub))
     }
 
+    pub fn task_changes(&self, task: &str, caller: Option<&str>, diff: bool, max_chars: Option<u64>) -> Pending<ForkDiff> {
+        let mut m = Map::new();
+        m.insert("op".into(), "task.changes".into());
+        m.insert("object".into(), task.into());
+        put(&mut m, "caller", caller);
+        m.insert("diff".into(), diff.into());
+        if let Some(n) = max_chars {
+            m.insert("max_chars".into(), n.into());
+        }
+        self.call(&Value::Object(m))
+    }
+
+    pub fn subscribe_fork_diff(&self, task: &str, caller: Option<&str>, diff: bool, max_chars: Option<u64>) -> Pending<Subscription> {
+        let mut m = Map::new();
+        m.insert("op".into(), "subscribe.fork_diff".into());
+        m.insert("object".into(), task.into());
+        put(&mut m, "caller", caller);
+        m.insert("diff".into(), diff.into());
+        if let Some(n) = max_chars {
+            m.insert("max_chars".into(), n.into());
+        }
+        self.subscribe_with(&Value::Object(m), SubKind::ForkDiff, |sub, _| Ok(sub))
+    }
+
     pub fn takeover_get(&self, object: &str, level: &str) -> Pending<TakeoverPolicy> {
         self.call(&json!({"op": "takeover.get", "object": object, "level": level}))
     }

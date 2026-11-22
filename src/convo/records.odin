@@ -161,6 +161,13 @@ Redact_Msg :: struct {
 	msg: Ref,
 }
 
+HOLD_ALL :: "*"
+
+Hold :: struct {
+	key:    string,
+	reason: string,
+}
+
 Interrupt :: struct {
 	msg: Ref,
 }
@@ -279,6 +286,7 @@ Body :: union {
 	Spine,
 	Files,
 	Redact_Msg,
+	Hold,
 }
 
 Record :: struct {
@@ -318,6 +326,8 @@ body_kind :: proc "contextless" (b: Body) -> Kind {
 		return .Cancel
 	case Redact_Msg:
 		return .Redact_Msg
+	case Hold:
+		return .Hold
 	case Interrupt:
 		return .Interrupt
 	case Answer:
@@ -354,7 +364,7 @@ body_kind :: proc "contextless" (b: Body) -> Kind {
 
 is_event_kind :: proc "contextless" (k: Kind) -> bool {
 	#partial switch k {
-	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded, .Spine, .Redact_Msg:
+	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded, .Spine, .Redact_Msg, .Hold:
 		return true
 	}
 	return false
@@ -362,7 +372,7 @@ is_event_kind :: proc "contextless" (k: Kind) -> bool {
 
 is_intent_kind :: proc "contextless" (k: Kind) -> bool {
 	#partial switch k {
-	case .Queue, .Steer, .Interrupt, .Answer, .Await:
+	case .Queue, .Steer, .Interrupt, .Answer, .Await, .Hold:
 		return true
 	}
 	return false
@@ -613,6 +623,9 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		obj.tw_ref(w, 1, off, v.item)
 	case Redact_Msg:
 		obj.tw_ref(w, 1, off, v.msg)
+	case Hold:
+		obj.tw_str(w, 1, v.key)
+		obj.tw_str(w, 2, v.reason)
 	case Interrupt:
 		obj.tw_ref(w, 1, off, v.msg)
 	case Answer:
@@ -1257,6 +1270,17 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 			}
 		}
 		d.bad ||= obj.ref_none(v.msg)
+		rec.body = v
+	case .Hold:
+		v: Hold
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				v.key = obj.dec_str(&d)
+			case 2:
+				v.reason = obj.dec_str(&d)
+			}
+		}
 		rec.body = v
 	case .Interrupt:
 		v: Interrupt

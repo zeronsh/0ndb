@@ -141,6 +141,7 @@ pub struct ConvoStatus {
     pub awaiting: bool,
     pub revive: bool,
     pub head_hlc: u64,
+    pub held: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -399,6 +400,21 @@ pub struct Runner {
 #[serde(default)]
 pub struct Runners {
     pub runners: Vec<Runner>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FileChange {
+    pub mount: String,
+    pub path: String,
+    pub change: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ForkDiff {
+    pub changes: Vec<FileChange>,
+    pub diff: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

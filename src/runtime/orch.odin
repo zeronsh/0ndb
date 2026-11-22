@@ -17,10 +17,14 @@ import "../textdiff"
 @(private)
 KEY_TASK :: "task"
 
+HOLD_LAND :: "land"
+
 Task_Info :: struct {
 	budget:    Budget,
 	cancelled: bool,
 	reason:    string,
+	isolate:   Isolate,
+	conflicts: []string,
 }
 
 Await_Wait :: struct {
@@ -43,6 +47,7 @@ Task_Status :: enum u8 {
 	Completed,
 	Failed,
 	Cancelled,
+	Held,
 }
 
 TASK_STATUS_NAMES := [Task_Status]string {
@@ -52,6 +57,7 @@ TASK_STATUS_NAMES := [Task_Status]string {
 	.Completed = "completed",
 	.Failed    = "failed",
 	.Cancelled = "cancelled",
+	.Held      = "held",
 }
 
 task_get :: proc(r: ^Runtime, o: Object) -> (t: Task_Info, found: bool) {
@@ -63,6 +69,10 @@ task_get :: proc(r: ^Runtime, o: Object) -> (t: Task_Info, found: bool) {
 	t.budget = budget_parse(entry_bytes(&en, 1))
 	t.cancelled = entry_bool(&en, 2)
 	t.reason = entry_str(&en, 3)
+	t.isolate = Isolate(min(entry_u64(&en, 4), u64(max(Isolate))))
+	if c := entry_str(&en, 5); len(c) > 0 {
+		t.conflicts = strings.split(c, "\n", context.temp_allocator)
+	}
 	return t, true
 }
 
@@ -93,6 +103,8 @@ task_status :: proc(r: ^Runtime, o: Object) -> (s: Task_Status, summary: string,
 		return .Running, "", true
 	case .Interrupted:
 		return .Failed, _last_reply_text(r, o, 600), true
+	case .Held:
+		return .Held, hold_reason(r, o), true
 	case .Idle:
 	}
 	if obj.rid_none(st.head) {
@@ -249,6 +261,12 @@ _orch_spawn :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value, 
 		reply_done(r, rep, "the task could not be created", "", true)
 		return
 	}
+	iso := Isolate.Unset
+	if jhas(v, "isolate") {
+		iso = .Yes if jbool(v, "isolate") else .No
+	} else if ca, cok := agent_resolve(r, child, "", "", context.temp_allocator); cok {
+		iso = ca.isolate
+	}
 	mounts, _ := eng.convo_mounts(r.e, caller, context.temp_allocator)
 	wanted := jarr(v, "mounts")
 	for m in mounts {
@@ -268,6 +286,13 @@ _orch_spawn :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value, 
 			if !found {
 				continue
 			}
+		}
+		switch iso {
+		case .Yes:
+			share = false
+		case .No:
+			share = true
+		case .Unset:
 		}
 		line := m.line
 		if !share {
@@ -298,7 +323,7 @@ _orch_spawn :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value, 
 	} else if a != nil {
 		budget = budget_min(budget, a.budget)
 	}
-	map_put(r, meta_w(r, child), transmute([]u8)string(KEY_TASK), field_bytes(1, budget_encode(budget)), omap.field_bool(2, false))
+	map_put(r, meta_w(r, child), transmute([]u8)string(KEY_TASK), field_bytes(1, budget_encode(budget)), omap.field_bool(2, false), omap.field_u64(4, u64(iso)))
 	text := goal
 	if c := jstr(v, "context"); len(c) > 0 {
 		text = concat(goal, "\n\n", c)
@@ -499,7 +524,7 @@ _orch_wait :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) -> u6
 	all := jstr(v, "condition") != "any"
 	statuses := _status_set(jstrs(v, "statuses"))
 	if statuses == {} {
-		statuses = {.Completed, .Failed, .Cancelled}
+		statuses = {.Completed, .Failed, .Cancelled, .Held}
 	}
 	cond: convo.Condition = .All if all else .Any
 	timeout := jint(v, "timeout_seconds", -1)
@@ -836,6 +861,13 @@ _orch_result :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
 	if c, found, _ := eng.catalog_get(r.e, o, context.temp_allocator); found && len(c.usage) > 0 {
 		_usage_json(&b, c.usage)
 	}
+	if t, tok := task_get(r, o); tok && len(t.conflicts) > 0 {
+		jw_karr(&b, "land_conflicts")
+		for c in t.conflicts {
+			jw_item_str(&b, c)
+		}
+		jw_end(&b)
+	}
 	jw_kbool(&b, "truncated", truncated)
 	append(&b, '}')
 	reply_done(r, rep, result, string(b[:]), false)
@@ -864,99 +896,12 @@ File_Change :: struct {
 
 task_changes :: proc(r: ^Runtime, caller: Object, task: Object, want_diff: bool, max_chars: int) -> (out: []File_Change, diff: string) {
 	context = eng.context_for(r.e)
-	list := make([dynamic]File_Change, context.temp_allocator)
-	db := make(Buf, context.temp_allocator)
-	kms, kerr := eng.convo_mounts(r.e, task, context.temp_allocator)
-	if kerr != .None {
+	fd, err := fork_diff_open(r, caller, task, want_diff, max_chars)
+	if err != .None {
 		return nil, ""
 	}
-	cms, _ := eng.convo_mounts(r.e, caller, context.temp_allocator)
-	for km in kms {
-		base_line := ""
-		for cm in cms {
-			if cm.name == km.name && cm.tree == km.tree {
-				base_line = line_name(cm.line)
-			}
-		}
-		if len(base_line) == 0 || base_line == line_name(km.line) {
-			continue
-		}
-		tree := Object{task.space, km.tree}
-		h, herr := eng.tree_history(r.e, tree)
-		if herr != .None {
-			continue
-		}
-		defer eng.tree_release(r.e, tree)
-		ours, f1, _ := fs.history_line(h, base_line, context.temp_allocator)
-		theirs, f2, _ := fs.history_line(h, line_name(km.line), context.temp_allocator)
-		if !f1 || !f2 {
-			continue
-		}
-		ol := make([dynamic]crdt.Lv, context.temp_allocator)
-		tl := make([dynamic]crdt.Lv, context.temp_allocator)
-		if crdt.graph_version_lvs(&h.g, ours, &ol) != .None || crdt.graph_version_lvs(&h.g, theirs, &tl) != .None {
-			continue
-		}
-		only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
-		only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
-		crdt.graph_diff(&h.g, ol[:], tl[:], &only_a, &only_b)
-		touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
-		_spans_touched(h, only_b[:], &touched)
-		sa, saerr := fs.version_snapshot(h, ol[:])
-		if saerr != .None {
-			continue
-		}
-		sb, sberr := fs.version_snapshot(h, tl[:])
-		if sberr != .None {
-			fstree.snapshot_destroy(&sa)
-			continue
-		}
-		for ino in _sorted_inodes(touched) {
-			ia, oka, _ := fstree.info(&sa, ino, context.temp_allocator)
-			ib, okb, _ := fstree.info(&sb, ino, context.temp_allocator)
-			pa := oka && ia.present
-			pb := okb && ib.present
-			change := ""
-			path := ""
-			switch {
-			case !pa && pb:
-				change = "added"
-				path, _, _ = fstree.path(&sb, ino, context.temp_allocator)
-			case pa && !pb:
-				change = "deleted"
-				path, _, _ = fstree.path(&sa, ino, context.temp_allocator)
-			case pa && pb:
-				p1, _, _ := fstree.path(&sa, ino, context.temp_allocator)
-				p2, _, _ := fstree.path(&sb, ino, context.temp_allocator)
-				path = p2
-				change = "renamed" if p1 != p2 else "modified"
-			case:
-				continue
-			}
-			if (pa && ia.kind == .Dir) || (pb && ib.kind == .Dir) {
-				continue
-			}
-			append(&list, File_Change{mount = km.name, path = path, change = change})
-			if want_diff && len(db) < max_chars {
-				a: []u8
-				bb: []u8
-				if pa {
-					a, _ = fs.history_text_at(h, ino, ours, context.temp_allocator)
-				}
-				if pb {
-					bb, _ = fs.history_text_at(h, ino, theirs, context.temp_allocator)
-				}
-				if txt, _, derr := textdiff.unified(a, bb, textdiff.DEFAULT_UNIFIED, context.temp_allocator); derr == nil {
-					append(&db, concat("--- a/", km.name, "/", path, "\n+++ b/", km.name, "/", path, "\n"))
-					append(&db, ..txt)
-				}
-			}
-		}
-		fstree.snapshot_destroy(&sa)
-		fstree.snapshot_destroy(&sb)
-	}
-	d, _ := utf8_clip(string(db[:]), max_chars)
-	return list[:], d
+	defer fork_diff_close(fd)
+	return fork_diff_result(fd, context.temp_allocator)
 }
 
 @(private)
@@ -1012,6 +957,24 @@ _orch_merge :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
 	}
 	dry := jbool(v, "dry_run")
 	only := jstrs(v, "mounts")
+	if t, tok := task_get(r, task); tok && len(t.conflicts) > 0 {
+		b := make(Buf, context.temp_allocator)
+		append(&b, '{')
+		jw_kbool(&b, "landed", false)
+		jw_kbool(&b, "held", true)
+		jw_karr(&b, "conflicts")
+		for c in t.conflicts {
+			jw_open(&b)
+			jw_kstr(&b, "path", c)
+			jw_close(&b)
+		}
+		jw_end(&b)
+		jw_karr(&b, "mounts")
+		jw_end(&b)
+		append(&b, '}')
+		reply_done(r, rep, "the task is held with land conflicts in its fork; resolve them there first", string(b[:]), false)
+		return
+	}
 	kms, _ := eng.convo_mounts(r.e, task, context.temp_allocator)
 	cms, _ := eng.convo_mounts(r.e, caller, context.temp_allocator)
 	b := make(Buf, context.temp_allocator)

@@ -70,6 +70,7 @@ Agent_Info :: struct {
 	triggers:        [][]u8,
 	setup:           string,
 	linked:          []string,
+	isolate:         Isolate,
 }
 
 agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", allocator := context.allocator) -> (a: Agent_Info, ok: bool) {
@@ -172,6 +173,9 @@ agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", al
 		a.catalog = jbool(opts, "catalog", a.catalog)
 		a.effort = clone(jstr(opts, "effort"), allocator)
 		a.compact_at = jf64(opts, "compact_at")
+		if jhas(opts, "isolate") {
+			a.isolate = .Yes if jbool(opts, "isolate") else .No
+		}
 	}
 	a.budget = budget_parse(def.budget)
 	mcps := make([dynamic]Mcp_Spec, allocator)

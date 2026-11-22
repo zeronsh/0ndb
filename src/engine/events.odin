@@ -463,6 +463,9 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 		d.msg = _resolve_rid(h, vs, b.request) or_return
 	case convo.Await:
 		d.kind = .Intent
+	case convo.Hold:
+		d.kind = .Intent
+		d.text = _tmp_bytes(transmute([]u8)b.reason)
 	case convo.Assign:
 		d.kind = .Run
 		d.msg = _resolve_rid(h, vs, b.msg) or_return
