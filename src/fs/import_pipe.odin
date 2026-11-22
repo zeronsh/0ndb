@@ -411,7 +411,11 @@ pipe_stage_a :: proc(p: ^Pipe, c: ^Pipe_Chunk) -> Error {
 		serr := save_mount_state(m)
 		sync.mutex_unlock(&p.state)
 		serr or_return
-		history_commit_import(h, &batch) or_return
+		line: Maybe(string)
+		if !m.hold_line {
+			line = m.line
+		}
+		history_commit_import(h, &batch, line) or_return
 		sync.mutex_lock(&p.state)
 		clear(&m.synced)
 		append(&m.synced, crdt.Op_Id{m.actor, c.seq0 + u64(c.n) - 1})

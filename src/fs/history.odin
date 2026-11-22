@@ -939,7 +939,7 @@ Import_File :: struct {
 	last:   crdt.Op_Id,
 }
 
-history_commit_import :: proc(h: ^History, b: ^crdt.Batch) -> (off: i64, err: Error) {
+history_commit_import :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, b, &parents)
 	if gerr != .None || skip != 0 {
@@ -948,9 +948,19 @@ history_commit_import :: proc(h: ^History, b: ^crdt.Batch) -> (off: i64, err: Er
 	if !import_valid(h, b) {
 		return 0, .Invalid
 	}
-	off = journal_batch(h, b, REC_IMPORT) or_return
+	lkey, lver: []u8
+	if lname, has_line := line.?; has_line {
+		lkey, lver = line_after(h, lname, parents[:], crdt.Op_Id{b.actor, b.seq + u64(crdt.batch_len(b)) - 1}) or_return
+	}
+	off = journal_batch(h, b, REC_IMPORT, lver == nil) or_return
+	if lver != nil {
+		journal_line(h, line.?, lver) or_return
+	}
 	import_apply(h, b, 0, u64(off)) or_return
 	history_own_applied(h)
+	if lver != nil {
+		kv_put(&h.kv, lkey, lver) or_return
+	}
 	return off, history_persist(h)
 }
 
@@ -1043,16 +1053,7 @@ history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = 
 	}
 	o := journal_batch(h, b, REC_BATCH, lver == nil) or_return
 	if lver != nil {
-		clear(&h.io)
-		w := prim.writer(&h.io)
-		prim.write_u8(&w, REC_LINE)
-		prim.write_str(&w, lname)
-		prim.write_bytes(&w, lver)
-		if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
-			journal.journal_abort(&h.journal)
-			return 0, .Io
-		}
-		journal_seal(h) or_return
+		journal_line(h, lname, lver) or_return
 	}
 	apply_batch(h, b, 0, u64(o)) or_return
 	history_own_applied(h)
@@ -1115,6 +1116,20 @@ line_after :: proc(h: ^History, name: string, parents: []crdt.Lv, last: crdt.Op_
 	buf := make([dynamic]u8, context.temp_allocator)
 	encode_version(&buf, out[:])
 	return key, buf[:], .None
+}
+
+@(private)
+journal_line :: proc(h: ^History, name: string, version: []u8) -> Error {
+	clear(&h.io)
+	w := prim.writer(&h.io)
+	prim.write_u8(&w, REC_LINE)
+	prim.write_str(&w, name)
+	prim.write_bytes(&w, version)
+	if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
+		journal.journal_abort(&h.journal)
+		return .Io
+	}
+	return journal_seal(h)
 }
 
 @(private)

@@ -348,8 +348,6 @@ mount_import :: proc(m: ^Mount) -> Error {
 	defer if st.adopt || st.resync {
 		fstree.snapshot_destroy(&st.snap)
 	}
-	m.hold_line = true
-	defer m.hold_line = false
 	builder_init(&st.b, m.history, m.actor)
 	st.stack = make([dynamic]Dir_Frame, st.long)
 	st.path_buf = make([dynamic]u8, st.long)
@@ -478,8 +476,9 @@ mount_import :: proc(m: ^Mount) -> Error {
 	} else {
 		import_flush(&st) or_return
 	}
-	m.hold_line = false
-	set_line(m) or_return
+	if !m.hold_line {
+		set_line(m) or_return
+	}
 	if m.has_git && m.db != nil {
 		for st.have_entry {
 			mark_dirty_dirs(&st, st.entry.path)
@@ -994,12 +993,13 @@ builder_commit_import :: proc(m: ^Mount, b: ^Builder) -> Error {
 	}
 	append(&m.intents, Intent{b.actor, b.seq0, u64(b.n)})
 	save_mount_state(m) or_return
-	history_commit_import(h, &batch) or_return
+	line: Maybe(string)
+	if !m.hold_line {
+		line = m.line
+	}
+	history_commit_import(h, &batch, line) or_return
 	clear(&m.synced)
 	append(&m.synced, crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1})
-	if !m.hold_line {
-		set_line(m) or_return
-	}
 	builder_reset(b)
 	return .None
 }
