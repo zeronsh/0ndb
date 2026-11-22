@@ -730,6 +730,7 @@ pub struct Spans {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Blame {
+    pub line: String,
     pub text: String,
     pub spans: Vec<Span>,
 }
@@ -738,6 +739,20 @@ pub struct Blame {
 #[serde(default)]
 pub struct TreeList {
     pub names: Vec<String>,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TreeText {
+    pub text: String,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TreeWritten {
+    pub line: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

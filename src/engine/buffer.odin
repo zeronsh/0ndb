@@ -236,6 +236,7 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 	_buffer_follow(e, h)
 	_hist_catch_up(e, h)
 	inode: fstree.Inode_Id
+	tree_at: Tree_At
 	if kind == .Text {
 		id, found := _text_inode(h) or_return
 		if !found {
@@ -243,7 +244,8 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 		}
 		inode = id
 	} else {
-		snap := fstree.current(&h.hist.tree)
+		tree_at = _tree_at(e, h, opts.line) or_return
+		snap := tree_at.snap
 		id, ok, lerr := fstree.lookup(&snap, opts.path)
 		if lerr != nil {
 			return {}, .Corrupt
@@ -273,14 +275,8 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 	b.ready = opts.ready
 	b.hist = h.hist
 	line := opts.line
-	if kind == .File_Tree && len(line) == 0 {
-		line = fs.DEFAULT_MOUNT.line
-		for mt in e.plug.mounts {
-			if mt.object.id == o.id {
-				line = mt.mount.line
-				break
-			}
-		}
+	if kind == .File_Tree {
+		line = tree_at.line
 	}
 	b.line = _clone(line, e.allocator) or_return
 	b.actor = opts.actor if opts.actor != {} else editor_actor(e, b.line)

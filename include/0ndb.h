@@ -1260,13 +1260,13 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TEXT_REDACT 87u
 /* tree.create(space: id, title: str) -> object:object */
 #define ONDB_OP_TREE_CREATE 88u
-/* tree.read(object: object, path: str) -> text:str */
+/* tree.read(object: object, path: str, line: str) -> text:str line:str */
 #define ONDB_OP_TREE_READ 89u
-/* tree.list(object: object, path: str) -> names:[str] */
+/* tree.list(object: object, path: str, line: str) -> names:[str] line:str */
 #define ONDB_OP_TREE_LIST 90u
-/* tree.write(object: object, path: str, text: str) -> {} */
+/* tree.write(object: object, path: str, text: str, line: str) -> line:str */
 #define ONDB_OP_TREE_WRITE 91u
-/* tree.remove(object: object, path: str) -> {} */
+/* tree.remove(object: object, path: str, line: str) -> line:str */
 #define ONDB_OP_TREE_REMOVE 92u
 /* tree.mount(object: object, root: str) -> {} */
 #define ONDB_OP_TREE_MOUNT 93u
@@ -1274,7 +1274,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TREE_UNMOUNT 94u
 /* tree.mounts() -> mounts:[Mounted] */
 #define ONDB_OP_TREE_MOUNTS 95u
-/* tree.blame(object: object, path: str) -> text:str spans:[Span] */
+/* tree.blame(object: object, path: str, line: str) -> line:str text:str spans:[Span] */
 #define ONDB_OP_TREE_BLAME 96u
 /* tree.sync(object: object, root: str) -> {} */
 #define ONDB_OP_TREE_SYNC 97u

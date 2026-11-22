@@ -2482,6 +2482,15 @@ indexer. Live buffers (`buffer_open`, `buffer_read`, `buffer_edit`,
 through the subscription callback path at the end of each tick. Several engines can share a process to use several cores, each
 owning a shard of objects.
 
+Tree API ops (`tree_read`, `tree_list`, `tree_write`, `tree_remove`,
+`tree_blame`, `buffer_open`) act on one line of the tree: an explicit `line`,
+else the line of this device's mount of the tree if one is live, else
+`main`, and every result names the line it used. A read sees the tree at
+that line's version and a write is parented on it and advances it, so an
+edit on a device whose folder is on a feature branch lands on that branch.
+When the line is at the history's heads (the only case with one line), the
+loaded state is used directly, exactly as before.
+
 ## capi
 
 ABI 2.0: ops are numbered contiguously from 1 in table order (the header op
