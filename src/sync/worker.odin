@@ -190,7 +190,11 @@ _worker_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: raw
 		for j in jobs {
 			_job_run(j)
 		}
-		if w.group.end != nil {
+		if w.group.end_async != nil {
+			g := new(Worker_Group, w.allocator)
+			g^ = {w = w, jobs = jobs}
+			w.group.end_async(w.group.data, _worker_group_done, g)
+		} else if w.group.end != nil {
 			if gerr := w.group.end(w.group.data); gerr != .None {
 				for j in jobs {
 					if j.result == .None {
@@ -199,11 +203,13 @@ _worker_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: raw
 				}
 			}
 		}
-		for j in jobs {
-			w.inflight -= 1
-			w.on_done(w.data, j)
+		if w.group.end_async == nil {
+			for j in jobs {
+				w.inflight -= 1
+				w.on_done(w.data, j)
+			}
+			delete(jobs)
 		}
-		delete(jobs)
 	}
 	csync.mutex_lock(&w.mutex)
 	list := w.done
@@ -310,7 +316,29 @@ worker_busy :: proc "contextless" (w: ^Worker) -> bool {
 }
 
 Group_Commit :: struct {
-	data:  rawptr,
-	begin: proc(data: rawptr),
-	end:   proc(data: rawptr) -> Error,
+	data:      rawptr,
+	begin:     proc(data: rawptr),
+	end:       proc(data: rawptr) -> Error,
+	end_async: proc(data: rawptr, done: proc(ctx: rawptr, err: Error), ctx: rawptr),
+}
+
+@(private)
+Worker_Group :: struct {
+	w:    ^Worker,
+	jobs: [dynamic]^Job,
+}
+
+@(private)
+_worker_group_done :: proc(ctx: rawptr, err: Error) {
+	g := cast(^Worker_Group)ctx
+	w := g.w
+	for j in g.jobs {
+		if err != .None && j.result == .None {
+			j.result = err
+		}
+		w.inflight -= 1
+		w.on_done(w.data, j)
+	}
+	delete(g.jobs)
+	free(g, w.allocator)
 }
