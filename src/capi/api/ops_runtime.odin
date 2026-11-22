@@ -42,6 +42,7 @@ RUNTIME_OPS := []Op {
 	{163, "subscribe.runners", {SPACE, OBJ}, "Runners", nil},
 	{171, "line.hold", {{"tree", .Object, nil}, {"line", .Str, nil}, {"reason", .Enum, HOLD_REASON_NAMES[:]}}, "held:uvarint", op_line_hold},
 	{172, "line.resume", {{"tree", .Object, nil}, {"line", .Str, nil}}, "resumed:uvarint", op_line_resume},
+	{175, "quiesce", {{"off", .Bool, nil}, {"lift_ms", .U64, nil}}, "accepted:bool reason:enum", op_quiesce},
 }
 
 op_line_hold :: proc(c: ^Call, o: ^Out) -> Status {

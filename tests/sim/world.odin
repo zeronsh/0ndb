@@ -8,6 +8,7 @@ import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/pack"
 import "../../src/prim"
+import rt "../../src/runtime"
 import osync "../../src/sync"
 
 EPOCH_NS :: i64(1_790_000_000) * 1_000_000_000
@@ -37,6 +38,8 @@ Ev_Kind :: enum u8 {
 	Pack_Job,
 	Stream_Step,
 	Git_Fetch,
+	Sim_Http,
+	Quiesce_Step,
 }
 
 Sim_Event :: struct {
@@ -101,6 +104,9 @@ Node :: struct {
 	api:         api.Api,
 	api_on:      bool,
 	agent_pending: [dynamic]Agent_Pending,
+	rt:          rt.Runtime,
+	rt_on:       bool,
+	http:        Sim_Http,
 }
 
 Relay_Node :: struct {
@@ -247,6 +253,7 @@ World :: struct {
 	buf_group: u64,
 	streams:   [dynamic]^M_Stream,
 	watches:   [dynamic]^Watch,
+	quiesce:   Quiesce_World,
 	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
 	remote:    Sim_Remote,
 }
@@ -462,6 +469,7 @@ world_destroy :: proc(w: ^World) {
 			agent_pending_free(w, pa)
 		}
 		delete(n.agent_pending)
+		delete(n.http.reqs)
 		delete(n.name, w.allocator)
 		free(n, w.allocator)
 	}
@@ -501,6 +509,7 @@ world_destroy :: proc(w: ^World) {
 	}
 	delete(w.live)
 	streams_destroy(w)
+	quiesce_destroy(w)
 	model_destroy(&w.model)
 	remote_destroy(w)
 }

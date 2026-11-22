@@ -261,6 +261,14 @@ impl Client {
         self.call(&json!({"op": "takeover.set", "object": object, "level": level, "policy": policy}))
     }
 
+    pub fn quiesce(&self, off: bool, lift_ms: Option<u64>) -> Pending<Quiesced> {
+        let mut m = Map::new();
+        m.insert("op".into(), "quiesce".into());
+        m.insert("off".into(), off.into());
+        put(&mut m, "lift_ms", lift_ms);
+        self.call_timeout(&Value::Object(m), 120_000)
+    }
+
     pub fn runtime_stats(&self) -> Pending<RuntimeStats> {
         self.call(&json!({"op": "runtime.stats"}))
     }
