@@ -518,14 +518,16 @@ _advertise :: proc(r: ^Runtime, space: prim.Id, capacity: int) {
 	me := r.self
 	provs := _providers_local(r)
 	pool := u64(1) if r.cfg.pool else 0
+	signed := _providers_signed_in(r, provs)
+	pool_id := _pool_of(r, space)
 	en, ok := map_read(r, runners_object(space), me[:])
-	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs && entry_u64(&en, 3) == pool {
+	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs && entry_u64(&en, 3) == pool && entry_str(&en, 4) == signed && entry_str(&en, 5) == r.cfg.name && entry_id(&en, 6) == pool_id {
 		return
 	}
 	if !ok && capacity == 0 {
 		return
 	}
-	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(capacity)), field_bytes(2, transmute([]u8)provs), omap.field_u64(3, pool))
+	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(capacity)), field_bytes(2, transmute([]u8)provs), omap.field_u64(3, pool), field_bytes(4, transmute([]u8)signed), omap.field_str(5, r.cfg.name), omap.field_id(6, pool_id))
 }
 
 runner_pool :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
@@ -569,6 +571,7 @@ Pending_Entry :: struct {
 	since_ms: i64,
 	runner:   prim.Id,
 	assigned: bool,
+	idle:     bool,
 }
 
 pending_get :: proc(r: ^Runtime, o: Object) -> (p: Pending_Entry, ok: bool) {
@@ -585,26 +588,28 @@ pending_get :: proc(r: ^Runtime, o: Object) -> (p: Pending_Entry, ok: bool) {
 	p.since_ms = i64(entry_u64(&en, 3))
 	p.runner = entry_id(&en, 4)
 	p.assigned = entry_bool(&en, 5)
+	p.idle = entry_bool(&en, 6)
 	return p, true
 }
 
 @(private)
 _pending_put :: proc(r: ^Runtime, o: Object, p: Pending_Entry) -> bool {
-	if old, ok := pending_get(r, o); ok && old.msg == p.msg && old.provider == p.provider && old.runner == p.runner && old.assigned == p.assigned {
+	if old, ok := pending_get(r, o); ok && old.msg == p.msg && old.provider == p.provider && old.runner == p.runner && old.assigned == p.assigned && old.idle == p.idle {
 		return false
 	}
 	id := o.id
-	map_put(r, named_w(r, pending_named(o.space)), id[:], field_rid(1, p.msg), field_bytes(2, transmute([]u8)p.provider), omap.field_u64(3, u64(p.since_ms)), omap.field_id(4, p.runner), omap.field_bool(5, p.assigned))
+	map_put(r, named_w(r, pending_named(o.space)), id[:], field_rid(1, p.msg), field_bytes(2, transmute([]u8)p.provider), omap.field_u64(3, u64(p.since_ms)), omap.field_id(4, p.runner), omap.field_bool(5, p.assigned), omap.field_bool(6, p.idle))
 	return true
 }
 
 @(private)
 _pending_clear :: proc(r: ^Runtime, o: Object) {
+	_asks_drop(r, o)
 	if _, ok := pending_get(r, o); !ok {
 		return
 	}
 	id := o.id
-	map_clear(r, named_w(r, pending_named(o.space)), id[:], 1, 2, 3, 4, 5)
+	map_clear(r, named_w(r, pending_named(o.space)), id[:], 1, 2, 3, 4, 5, 6)
 }
 
 @(private)
@@ -627,6 +632,8 @@ _on_runners :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng
 	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
 	for d in deltas {
+		_asks_forget(r, d.object.space)
+		_runners_changed(r, d.object.space)
 		_pending_scan(r, d.object.space)
 		return
 	}

@@ -66,6 +66,7 @@ Agent_Info :: struct {
 	memory:          []prim.Id,
 	workspace:       prim.Id,
 	policy:          []u8,
+	takeover:        eng.Takeover,
 	triggers:        [][]u8,
 	setup:           string,
 	linked:          []string,
@@ -114,6 +115,10 @@ agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", al
 	}
 	prov := pick(provider, settings.provider, def.provider, ws.provider if has_ws else "", r.cfg.default_provider)
 	mdl := pick(model_id, settings.model, def.model, ws.model if has_ws else "", r.cfg.default_model)
+	a.takeover = def.takeover if has_def && def.takeover != .Default else (ws.takeover if has_ws else .Default)
+	if c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator); cerr == .None && found && c.takeover != 0 && c.takeover <= u8(max(eng.Takeover)) {
+		a.takeover = eng.Takeover(c.takeover)
+	}
 	if len(prov) == 0 && !has_def {
 		return a, false
 	}

@@ -137,7 +137,15 @@ The idle and streaming figures come from `bindings/rust/ondb/examples/bench.rs`
   cursors, `convo.message`, `convo.siblings` and `switch`/`back` for branches,
   `convo.status` and `status` deltas for running, queued, awaiting permission,
   waiting for a runner. `placement` and `placement` events say which device
-  runs the next turn. Recipes: `docs/daemon-protocol.md` 7.
+  runs the next turn, or that the conversation is `idle` because its last
+  runner stopped. Recipes: `docs/daemon-protocol.md` 7.
+- Device switcher: `runners(space, object)` (and `subscribe.runners`) lists
+  each device and each pool once, with `online`/`offline`/`wakeable`,
+  providers installed and signed in, and the current and last runner;
+  `assign(object, runner)` resumes the conversation there, continuing a
+  cut-off turn with its full context. `takeover.set` picks what happens when
+  a runner goes away: `default` (devices: the conversation goes idle; pool
+  runners: a placement request naming the runner), `auto` or `never`.
 - Folders and repositories: `mount.add(object, root)` keeps a folder synced as
   a tree; `mount` attaches a tree to a conversation so its runs edit it;
   `tree.find(path)` maps a path to its tree; `convo.files_at`, `go_back` and
@@ -285,7 +293,11 @@ any user device online. Pieces:
 - Placement: a conversation's run goes to a pool runner when it is assigned
   (`assign`) or when the placement policy picks it; `placement` events report
   `waiting_runner` until one claims the run, which is when provisioning should
-  start a sandbox.
+  start a sandbox. When the conversation last ran on a pool runner that has
+  gone to sleep, the request names that runner (`runner`): wake it (its disk
+  keeps the checkout and caches; on wake it asks the pool host to renew its
+  lapsed lease, `Runner_Pool.renew`, and takes the work) or launch another and `assign` it. `assign(object,
+  pool)` from a UI ("continue in Cloud") is the same request.
 
 ```rust
 struct Sandboxes { tokens: TokenVerifier, pool_identity: ondb::PublicIdentity }

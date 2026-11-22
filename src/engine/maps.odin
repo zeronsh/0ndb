@@ -33,6 +33,7 @@ Catalog_Update :: struct {
 	has_usage:   bool,
 	role:        string,
 	storage:     Storage_Class,
+	takeover:    Takeover,
 }
 
 CATALOG_ROLE :: u32(32)
@@ -470,6 +471,9 @@ _catalog_set :: proc(e: ^Engine, c: Cmd_Catalog_Set) -> Error {
 	if .Storage in c.set {
 		u.storage = c.storage
 	}
+	if .Takeover in c.set {
+		u.takeover = c.takeover
+	}
 	return .None
 }
 
@@ -534,6 +538,9 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	}
 	if .Storage in u.set {
 		append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Storage), u64(u.storage)))
+	}
+	if .Takeover in u.set {
+		append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Takeover), u64(u.takeover)))
 	}
 	if u.activity {
 		append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Activity), u64(_wall_ms(e))))

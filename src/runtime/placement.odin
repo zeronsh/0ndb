@@ -49,8 +49,9 @@ _evaluate_sender :: proc(r: ^Runtime, o: Object) {
 			if it.kind != .Queue && it.kind != .Steer {
 				continue
 			}
-			if it.by == r.self && prim.id_is_zero(place_intent(r, o, &it)) {
-				_placement_waiting(r, o, it.item, _intent_provider(r, o), {})
+			if it.by == r.self {
+				_, verdict, on := _intent_target(r, o, v, &t, &it)
+				_report(r, o, it.item, _intent_provider(r, o), verdict, on)
 			}
 			return
 		}
@@ -154,9 +155,9 @@ placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: 
 			}
 			info.msg = it.item
 			info.provider = _intent_provider(r, o)
-			info.runner = place_intent(r, o, &it)
-			info.state = .Waiting_Runner if prim.id_is_zero(info.runner) else .Assigned
-			if has && pend.msg == it.item {
+			x, verdict, on := _intent_target(r, o, v, &t, &it)
+			_verdict_info(&info, x, verdict, on)
+			if has && pend.msg == info.msg {
 				info.since_ms = pend.since_ms
 			}
 			return info, .None
@@ -164,47 +165,37 @@ placement_status :: proc(r: ^Runtime, o: Object) -> (info: Placement_Info, err: 
 	}
 	head, hm, dead, uok := _unanswered(r, o, v, &t)
 	if !uok {
+		info.last_runner = last_runner(r, o, v, &t, {})
+		if !prim.id_is_zero(info.last_runner) {
+			info.state = .Idle
+		}
 		return info, .None
 	}
-	a, _ := agent_resolve(r, o, hm.provider, hm.model, context.temp_allocator)
 	info.msg = head
-	info.provider = placement_provider(&a)
-	exclude := dead
-	if as, aerr := convo.assignee(v, &t, head); aerr == .None && !prim.id_is_zero(as) && as != dead {
-		overdue := !runner_live(r, o.space, as, info.provider)
-		for w in r.leases {
-			if w.claim && w.object == o && w.msg == head && w.runner == as && wall_ms(r) >= w.seen + r.cfg.claim_wait_ms {
-				overdue = true
-			}
-		}
-		if !overdue {
-			info.state = .Assigned
-			info.runner = as
-			return info, .None
-		}
-		exclude = as
+	x, _, verdict, on, provider := _message_target(r, o, v, &t, &hm, dead, true)
+	info.provider = provider
+	_verdict_info(&info, x, verdict, on)
+	if has && pend.msg == info.msg {
+		info.since_ms = pend.since_ms
 	}
-	p := Placement {
-		kind     = .Message,
-		object   = o,
-		msg      = head,
-		sender   = hm.author,
-		agent    = a.object.id,
-		provider = info.provider,
-		policy   = a.policy,
-		exclude  = exclude,
-	}
-	info.runner = place(r, &p)
-	if prim.id_is_zero(info.runner) {
-		info.state = .Waiting_Runner
-		info.runner = exclude
-		if has && pend.msg == head {
-			info.since_ms = pend.since_ms
-		}
-		return info, .None
-	}
-	info.state = .Assigned
 	return info, .None
+}
+
+@(private)
+_verdict_info :: proc(info: ^Placement_Info, x: prim.Id, verdict: Verdict, on: prim.Id) {
+	switch verdict {
+	case .Placing:
+		info.state = .Placing
+	case .Idle:
+		info.state = .Idle
+		info.last_runner = on
+	case .Wait:
+		info.state = .Waiting_Runner
+		info.runner = on
+	case .Run:
+		info.state = .Assigned
+		info.runner = x
+	}
 }
 
 @(private)

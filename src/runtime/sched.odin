@@ -117,8 +117,7 @@ _sched_rearm :: proc(r: ^Runtime) {
 				if next <= 0 {
 					continue
 				}
-				creator := entry_id(&row.entry, 2)
-				if !prim.id_is_zero(creator) && creator != r.self && runner_known(r, sw.space, creator) {
+				if !_sched_fires(r, sw.space, &row) {
 					continue
 				}
 				if at == 0 || next < at {
@@ -153,8 +152,7 @@ _on_sched_timer :: proc(l: ^prim.Loop, data: rawptr) {
 			if next <= 0 || next > now || len(row.key) < 17 {
 				continue
 			}
-			creator := entry_id(&row.entry, 2)
-			if !prim.id_is_zero(creator) && creator != r.self && runner_known(r, sw.space, creator) {
+			if !_sched_fires(r, sw.space, &row) {
 				continue
 			}
 			owner := Object{space = sw.space}
@@ -169,6 +167,57 @@ _on_sched_timer :: proc(l: ^prim.Loop, data: rawptr) {
 		}
 	}
 	_sched_rearm(r)
+}
+
+@(private)
+_sched_fires :: proc(r: ^Runtime, space: prim.Id, row: ^omap.Row) -> bool {
+	creator := entry_id(&row.entry, 2)
+	if prim.id_is_zero(creator) || creator == r.self || len(row.key) < 17 {
+		return true
+	}
+	if runner_known(r, space, creator) {
+		return false
+	}
+	owner := Object{space = space}
+	copy(owner.id[:], row.key[:16])
+	s, found := schedule_get(r, owner, string(row.key[16:]))
+	if !found || prim.id_is_zero(s.conversation) {
+		return true
+	}
+	target := Object{space, s.conversation}
+	a, _ := agent_resolve(r, target, "", "", context.temp_allocator)
+	p := Placement {
+		kind     = .Schedule,
+		object   = target,
+		sender   = creator,
+		agent    = a.object.id,
+		provider = placement_provider(&a),
+		policy   = a.policy,
+		exclude  = creator,
+	}
+	x, decided := place_decided(r, &p)
+	return decided && x == r.self && takeover_moves(r, space, a.takeover, creator, x)
+}
+
+@(private)
+_sched_reown :: proc(r: ^Runtime, o: Object, runner: prim.Id) {
+	for &row in map_rows(r, schedules_object(o.space), nil, 1 << 20) {
+		if len(row.key) < 17 {
+			continue
+		}
+		creator := entry_id(&row.entry, 2)
+		if prim.id_is_zero(creator) || creator == runner || runner_known(r, o.space, creator) {
+			continue
+		}
+		owner := Object{space = o.space}
+		copy(owner.id[:], row.key[:16])
+		s, found := schedule_get(r, owner, string(row.key[16:]))
+		if !found || s.conversation != o.id {
+			continue
+		}
+		s.creator = runner
+		schedule_put(r, &s)
+	}
 }
 
 @(private)

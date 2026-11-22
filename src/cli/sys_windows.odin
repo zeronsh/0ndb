@@ -1,6 +1,7 @@
 package main
 
 import "base:intrinsics"
+import "core:strings"
 import win "core:sys/windows"
 import "../prim"
 
@@ -129,4 +130,12 @@ rss_bytes :: proc() -> i64 {
 idle_release :: proc() {
 	_heap_compact()
 	win.SetProcessWorkingSetSizeEx(win.GetCurrentProcess(), ~uint(0), ~uint(0), 0)
+}
+
+sys_hostname :: proc(allocator := context.allocator) -> string {
+	v, ok := prim.getenv("COMPUTERNAME")
+	if !ok {
+		return ""
+	}
+	return strings.clone(v, allocator)
 }

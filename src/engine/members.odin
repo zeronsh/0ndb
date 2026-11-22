@@ -1,5 +1,6 @@
 package engine
 
+import "base:runtime"
 import "core:crypto"
 import "../journal"
 import "../obj"
@@ -70,6 +71,7 @@ Member_Info :: struct {
 	removed:   bool,
 	in_tree:   bool,
 	self:      bool,
+	label:     string,
 }
 
 Members_Status :: struct {
@@ -743,6 +745,7 @@ space_members :: proc(e: ^Engine, space: prim.Id, allocator := context.allocator
 			expires  = x.expires,
 			removed  = !osync.member_active(&x, _now_ms(e)),
 			self     = x.device == e.self,
+			label    = _clone_str_or_empty(string(x.label), allocator),
 		}
 		if has_tree {
 			_, info.in_tree = osync.tree_find_leaf(&t, x.sign)
@@ -990,4 +993,10 @@ _tree_maybe_stale :: proc(sp: ^Space, rt: ^Remote_Tree) -> bool {
 @(private)
 _members_change_all :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, data: rawptr) -> ([]u8, Error), data: rawptr, commit: bool) -> Error {
 	return _members_change(e, sp, build, data, commit)
+}
+
+@(private)
+_clone_str_or_empty :: proc(s: string, allocator: runtime.Allocator) -> string {
+	out, _ := _clone(s, allocator)
+	return out
 }

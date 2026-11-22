@@ -142,6 +142,7 @@ Catalog_Field :: enum u8 {
 	Workspace,
 	Agent,
 	Storage,
+	Takeover,
 }
 
 Catalog_Fields :: bit_set[Catalog_Field;u8]
@@ -156,6 +157,7 @@ Cmd_Catalog_Set :: struct {
 	workspace: prim.Id,
 	agent:     prim.Id,
 	storage:   Storage_Class,
+	takeover:  Takeover,
 }
 
 Command :: union {
