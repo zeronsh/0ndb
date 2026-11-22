@@ -116,6 +116,10 @@ History :: struct {
 	lvidx_n:    u64,
 	rebuilding: bool,
 	own_wait:   bool,
+	own_next:   map[prim.Id]u64,
+	seals:      u64,
+	mark_taken: u64,
+	held:       [dynamic]Kv_Group,
 	markers:    [dynamic]Git_Marker,
 	views:      [dynamic]^Text_View,
 }
@@ -301,20 +305,30 @@ history_durable_mark :: proc "contextless" (h: ^History) -> u64 {
 	return h.mark
 }
 
+history_mark_take :: proc "contextless" (h: ^History) -> u64 {
+	h.mark_taken = h.mark
+	return h.mark
+}
+
 @(private)
 history_fp :: proc(h: ^History) -> [3]u64 {
 	if !h.awake {
 		return h.mark_fp
 	}
-	return {u64(journal.journal_durable_len(&h.journal)), h.kv.log_end, h.kv.gen}
+	return {u64(journal.journal_durable_len(&h.journal)), h.seals, 0}
 }
 
 history_durable :: proc(h: ^History, mark: u64) -> Error {
 	if mark <= h.durable {
-		return .None
+		return history_commit_groups(h)
 	}
+	prev := h.durable
 	h.durable = min(mark, h.mark)
 	history_flush_staged(h, h.durable) or_return
+	if cerr := history_commit_groups(h); cerr != .None {
+		h.durable = prev
+		return cerr
+	}
 	err: Error
 	for m in h.mounts {
 		if e := mount_ack(m); e != .None && err == .None {
@@ -324,8 +338,38 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 	return err
 }
 
+@(private)
+history_commit_groups :: proc(h: ^History) -> Error {
+	if h.awake {
+		if len(h.kv.groups) == 0 || h.kv.groups[0].mark > h.durable {
+			return .None
+		}
+		from_prim(prim.datasync(h.vfs, h.lvidx)) or_return
+		return kv_commit_upto(&h.kv, h.durable)
+	}
+	if len(h.held) == 0 || h.held[0].mark > h.durable {
+		return .None
+	}
+	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
+	if fd, oerr := prim.open_file(h.vfs, lp, {.Write}, 0o600); oerr == .None {
+		serr := prim.datasync(h.vfs, fd)
+		prim.close_file(h.vfs, fd)
+		from_prim(serr) or_return
+	}
+	kv: Kv
+	kv_open(&kv, h.vfs, h.dir, "state", h.allocator) or_return
+	kv_groups_give(&kv, h.held)
+	err := kv_commit_upto(&kv, h.durable)
+	h.held = kv_groups_take(&kv)
+	kv_close(&kv)
+	return err
+}
+
 history_close :: proc(h: ^History) {
 	history_sleep(h)
+	kv_groups_free(&h.kv, &h.held, h.allocator)
+	delete(h.own_next)
+	h.own_next = nil
 	delete(h.mounts)
 	h.mounts = nil
 	for x in h.staged {
@@ -347,6 +391,10 @@ history_wake :: proc(h: ^History) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	from_prim(prim.mkdir_all(h.vfs, h.dir, 0o700)) or_return
 	kv_open(&h.kv, h.vfs, h.dir, "state", h.allocator) or_return
+	if h.held != nil {
+		kv_groups_give(&h.kv, h.held)
+		h.held = nil
+	}
 	history_attach_sources(h)
 	jpath, _ := path_join(h.dir, "fs.journal", context.temp_allocator)
 	jopts := journal.Options{keep_at_least = h.opts.keep_at_least}
@@ -391,6 +439,7 @@ history_wake :: proc(h: ^History) -> Error {
 			if h.rebuilding {
 				return .Corrupt
 			}
+			kv_groups_free(&h.kv, &h.held, h.allocator)
 			history_wipe(h) or_return
 			h.rebuilding = true
 			defer h.rebuilding = false
@@ -410,14 +459,75 @@ history_wake :: proc(h: ^History) -> Error {
 
 @(private)
 HIST_STAMP :: "j"
+@(private)
+HIST_ACTORS :: "ga"
+@(private)
+HIST_EPOCH :: "ge"
+
+history_epoch :: proc(h: ^History) -> u64 {
+	if !h.awake {
+		return 0
+	}
+	v, found, err := kv_get(&h.kv, transmute([]u8)string(HIST_EPOCH), context.temp_allocator)
+	if err != .None || !found || len(v) != 8 {
+		return 0
+	}
+	return prim.get_u64le(v)
+}
+
+@(private)
+history_saved_actors :: proc(h: ^History, allocator := context.temp_allocator) -> (ids: []prim.Id, found: bool, err: Error) {
+	data, has := kv_get(&h.kv, transmute([]u8)string(HIST_ACTORS), context.temp_allocator) or_return
+	if !has {
+		return nil, false, .None
+	}
+	rd := prim.reader(data)
+	n := prim.read_uvarint(&rd)
+	if n > u64(len(data)) {
+		return nil, false, .Corrupt
+	}
+	out := make([]prim.Id, int(n), allocator)
+	for &id in out {
+		id = prim.read_id(&rd)
+	}
+	if !prim.reader_ok(&rd) {
+		return nil, false, .Corrupt
+	}
+	return out, true, .None
+}
+
+history_interning_kept :: proc(h: ^History) -> (kept: bool, err: Error) {
+	if !h.awake {
+		return true, .None
+	}
+	ids, found := history_saved_actors(h) or_return
+	if !found {
+		return true, .None
+	}
+	if len(ids) > len(h.g.actors) {
+		return false, .None
+	}
+	for id, i in ids {
+		if h.g.actors[i] != id {
+			return false, .None
+		}
+	}
+	return true, .None
+}
 
 history_kv_commit :: proc(h: ^History) -> Error {
-	if len(h.kv.order) > 0 {
-		b: [8]u8
-		prim.put_u64le(b[:], u64(journal.journal_durable_len(&h.journal)))
-		kv_put(&h.kv, transmute([]u8)string(HIST_STAMP), b[:]) or_return
+	if len(h.kv.order) == 0 {
+		return .None
 	}
-	return kv_commit(&h.kv)
+	b: [8]u8
+	prim.put_u64le(b[:], u64(journal.journal_durable_len(&h.journal)))
+	kv_put(&h.kv, transmute([]u8)string(HIST_STAMP), b[:]) or_return
+	if h.mark <= h.mark_taken {
+		h.mark += 1
+	}
+	kv_seal(&h.kv, h.mark)
+	h.seals += 1
+	return .None
 }
 
 @(private)
@@ -496,6 +606,26 @@ history_wipe :: proc(h: ^History) -> Error {
 	kv: Kv
 	kv_open(&kv, h.vfs, h.dir, "state", h.allocator) or_return
 	defer kv_close(&kv)
+	if meta, found, gerr := kv_get(&kv, transmute([]u8)string("g"), context.temp_allocator); gerr == .None && found {
+		tg: crdt.Graph
+		if crdt.graph_open(&tg, meta, {}, h.allocator) == .None {
+			ab := make([dynamic]u8, context.temp_allocator)
+			aw := prim.writer(&ab)
+			prim.write_uvarint(&aw, u64(len(tg.actors)))
+			for id in tg.actors {
+				prim.write_id(&aw, id)
+			}
+			crdt.graph_destroy(&tg)
+			kv_put(&kv, transmute([]u8)string(HIST_ACTORS), ab[:]) or_return
+		}
+	}
+	eb: [8]u8
+	if old, found, gerr := kv_get(&kv, transmute([]u8)string(HIST_EPOCH), context.temp_allocator); gerr == .None && found && len(old) == 8 {
+		prim.put_u64le(eb[:], prim.get_u64le(old) + 1)
+	} else {
+		prim.put_u64le(eb[:], 1)
+	}
+	kv_put(&kv, transmute([]u8)string(HIST_EPOCH), eb[:]) or_return
 	keys := make([dynamic][]u8, context.temp_allocator)
 	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		if history_derived_key(key) {
@@ -532,6 +662,8 @@ history_sleep :: proc(h: ^History) {
 	}
 	delete(h.rdicts)
 	journal.journal_close(&h.journal)
+	kv_groups_free(&h.kv, &h.held, h.allocator)
+	h.held = kv_groups_take(&h.kv)
 	kv_close(&h.kv)
 	prim.close_file(h.vfs, h.lvidx)
 	h.lvidx = prim.INVALID_FD
@@ -686,7 +818,7 @@ history_contains :: proc(h: ^History, v: Version, id: crdt.Op_Id) -> bool {
 }
 
 history_next_seq :: proc(h: ^History, actor: prim.Id) -> u64 {
-	return crdt.graph_known(&h.g, actor)
+	return max(crdt.graph_known(&h.g, actor), h.own_next[actor] if h.own_wait else 0)
 }
 
 history_lamport_after :: proc(h: ^History, parents: Version) -> u64 {
@@ -2104,6 +2236,10 @@ load_state :: proc(h: ^History) -> Error {
 		}
 	} else {
 		crdt.graph_init(&h.g, h.allocator, src)
+		ids, has := history_saved_actors(h) or_return
+		for id in ids[:len(ids) if has else 0] {
+			crdt.graph_intern(&h.g, id)
+		}
 	}
 	tsrc := fstree.Source {
 		data       = h,
@@ -2191,7 +2327,10 @@ replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: b
 	if gerr == .Missing {
 		return true, .None
 	}
-	if gerr != .None || skip >= crdt.batch_len(&b) {
+	if gerr != .None {
+		return false, .Corrupt
+	}
+	if skip >= crdt.batch_len(&b) {
 		return false, .None
 	}
 	if kind == REC_IMPORT {
@@ -2210,6 +2349,45 @@ replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: b
 replay_pause :: proc(h: ^History, off: i64) -> Error {
 	h.applied[0] = off
 	h.own_wait = true
+	if h.own_next == nil {
+		h.own_next = make(map[prim.Id]u64, 4, h.allocator)
+	}
+	r: journal.Reader
+	journal.journal_reader(&h.journal, &r, context.temp_allocator)
+	defer journal.reader_close(&r)
+	end := journal.journal_durable_len(&h.journal)
+	dict: crdt.Actor_Dict
+	crdt.dict_init(&dict, context.temp_allocator)
+	for id in h.dict.ids {
+		crdt.dict_add(&dict, id)
+	}
+	for at := off; at < end; {
+		body, next, jerr := journal.record_at(&r, at)
+		if jerr != .None && jerr != .Redacted {
+			return from_journal(jerr)
+		}
+		if next <= at {
+			return .Corrupt
+		}
+		if jerr == .None && len(body) > 0 && body[0] == REC_ACTORS {
+			rd := prim.reader(body[1:])
+			n := prim.read_uvarint(&rd)
+			for _ in 0 ..< min(n, u64(len(body))) {
+				crdt.dict_add(&dict, prim.read_id(&rd))
+			}
+		} else if jerr == .None && len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT || body[0] == REC_REPLACE) {
+			payload, ok := batch_payload(body)
+			if ok {
+				if b, derr := crdt.batch_decode(payload, context.temp_allocator, &dict); derr == .None {
+					n := b.seq + u64(crdt.batch_len(&b))
+					if n > h.own_next[b.actor] {
+						h.own_next[b.actor] = n
+					}
+				}
+			}
+		}
+		at = next
+	}
 	err := history_persist(h)
 	history_unload_files(h)
 	return err

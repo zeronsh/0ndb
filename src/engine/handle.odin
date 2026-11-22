@@ -648,6 +648,9 @@ _handles_commit :: proc(e: ^Engine) {
 
 @(private)
 _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
+	if h.hist != nil && !e.closing && fs.history_durable_mark(h.hist) > h.hist.durable {
+		return .Busy
+	}
 	if err := _handle_commit(e, h); err == .Busy && !e.closing {
 		return err
 	}

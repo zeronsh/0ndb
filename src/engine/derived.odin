@@ -447,6 +447,9 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 	h := _handle_get(e, o, kind) or_return
 	_hist_ready(e, h) or_return
 	hist := h.hist
+	if kept := _ferr2(fs.history_interning_kept(hist)) or_return; !kept {
+		append(notes, fmt.tprintf("history %s: actor interning order differs from the order saved before its rebuild", prim.id_hex(o.id)))
+	}
 	if ahead := _ferr2(fs.history_derived_ahead(hist)) or_return; ahead {
 		append(notes, fmt.tprintf("history %s: state or lv.idx is ahead of its own journal after open", prim.id_hex(o.id)))
 		return .None

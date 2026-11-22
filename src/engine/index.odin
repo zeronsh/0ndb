@@ -172,6 +172,13 @@ _index_durable_advanced :: proc(e: ^Engine) {
 }
 
 @(private)
+_tree_lv_source :: proc "contextless" (epoch: u64) -> prim.Id {
+	id := TREE_LV_SOURCE
+	prim.put_u64le(id[8:], prim.get_u64le(id[8:]) ~ epoch)
+	return id
+}
+
+@(private)
 _source_id :: proc(object: prim.Id, device: prim.Id) -> (id: prim.Id) {
 	ctx: blake2b.Context
 	blake2b.init(&ctx, 16)
@@ -619,7 +626,7 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 	if h.hist == nil || !h.hist.awake {
 		return 0, false
 	}
-	src := _source_id(h.id, TREE_LV_SOURCE)
+	src := _source_id(h.id, _tree_lv_source(fs.history_epoch(h.hist)))
 	pos, perr := search.position(&e.index, src)
 	if perr != .None {
 		return 0, false

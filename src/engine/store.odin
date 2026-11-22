@@ -370,7 +370,7 @@ _durable_begin :: proc(e: ^Engine) {
 	b.marks = make([dynamic]Hist_Mark, e.allocator)
 	for h in e.lru {
 		if h.hist != nil && fs.history_durable_mark(h.hist) > h.hist.durable {
-			append(&b.marks, Hist_Mark{h.id, fs.history_durable_mark(h.hist)})
+			append(&b.marks, Hist_Mark{h.id, fs.history_mark_take(h.hist)})
 		}
 	}
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
