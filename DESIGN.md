@@ -1036,6 +1036,22 @@ checkpoint bundles, as before, plus:
   cares about; ten million objects cost nothing until touched.
 - Partial replication is the default: a participant holds exactly the
   objects (and ranges) it has used.
+- **An open handle is eventually fresh.** Every open object handle follows
+  its members' segments: maps, texts and trees fully, conversations by length
+  only (`full = false`), with or without a subscription. A length beyond the
+  replica raises its logical length (`Grew`) and moves the view's tail, so the
+  next read fetches the new records; a non-fresh read still never waits on
+  the network for them. Without this, a conversation replica fetched
+  mid-stream was served stale forever, because every later handle reopened
+  the non-empty replica and nothing asked the relay again. Handles close when
+  the engine settles (only pinned ones stay), and closing unfollows, so while
+  idle there is no follow state and nothing is armed. Measured per followed
+  segment while its handle is open: on the device, a 33-byte feed pattern in
+  filtered feeds plus one 40-byte `Follow` entry on open and one `Unfollow`
+  entry on close (the 1168-byte `Remote` and its replica are already held by
+  the open handle); on the relay, a 16-byte `Sub` and an 8-byte follower
+  pointer per connection, plus one resident 120-byte `Stream_State` and its
+  store stream (an open file on the file store) shared by all followers.
 - **Direct messages.** A participant can send an opaque frame to another
   participant of the same space by device id. The relay delivers it to one
   live connection of that device or answers `Undelivered` at once; it keeps

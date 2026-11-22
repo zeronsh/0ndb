@@ -187,11 +187,10 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 	if o.id != sp.catalog {
 		_catalog_members(e, h)
 	}
-	if kind != .Conversation {
-		_group_follow(h, true)
-		for s in h.segs {
-			_follow(e, h, s, true)
-		}
+	full := kind != .Conversation
+	_group_follow(h, full)
+	for s in h.segs {
+		_follow(e, h, s, full)
 	}
 	return h, .None
 }
@@ -432,6 +431,9 @@ _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 		seg.tree = rt
 	}
 	append(&h.segs, seg)
+	if h.kind == .Conversation {
+		_follow(e, h, seg, false)
+	}
 	if journal.replica_length(rep) == 0 {
 		seg.waiting = !osync.replicator_confirmed_empty(&sp.repl, &h.scope, device, h.name, 0)
 		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
