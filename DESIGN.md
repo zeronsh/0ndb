@@ -945,11 +945,14 @@ concurrent typing is never lost or reverted.
   growing while the relay keeps tampering; it is never fatal and arms no
   timer of its own. A local record that fails its own check is local
   corruption: it is never sealed or uploaded and the stream stops with
-  `Corrupt`. Two different records that are both valid, or a relay length
-  past the local durable length, can only come from a second device writing
-  under this device id (a restored backup or a VM snapshot of the device):
-  the stream stops with `Conflict`, surfaced as a fatal event whose detail
-  says a clone is suspected. A relay-side redaction of an own record is
+  `Corrupt`. A relay that reports more of the stream than is durable
+  locally, which a correct device never causes, is read back from the local
+  durable length: bytes that open as this device's own sealed writes, or two
+  different records that are both valid, can only come from a second device
+  writing under this device id (a restored backup or a VM snapshot of the
+  device), and the stream stops with `Conflict`, surfaced as a fatal event
+  whose detail says a clone is suspected. A claimed length the relay cannot
+  serve, or bytes that do not open, are tampering like any other. A relay-side redaction of an own record is
   tolerated and applied locally (`Local_Redacted`).
 - Redaction punches holes in extents and erases every copy: stale extents of
   the file, copies a defragmentation made and superseded within one write
