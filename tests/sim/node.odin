@@ -215,6 +215,7 @@ node_crashed :: proc(n: ^Node) {
 	}
 	world_note(w, "%s crashed at disk op %d (%v)", n.name, n.disk.stats.ops, mode)
 	w.stats.crashes += 1
+	promos_crashed(w, n)
 	node_kill(n)
 	disk_crash(&n.disk, mode, &w.fault_rng)
 	model_node_crashed(&w.model, n, mode)
@@ -231,6 +232,7 @@ node_crash_now :: proc(n: ^Node, mode: Crash_Mode, salt: u64) {
 	}
 	world_note(w, "%s crashed right after returning a message id (%v)", n.name, mode)
 	w.stats.crashes += 1
+	promos_crashed(w, n)
 	node_kill(n)
 	r: Rng
 	rng_init(&r, w.cfg.seed, 4_000_000 + salt)
