@@ -728,7 +728,7 @@ impl LiveBuffer {
                 self.state().receive(&ev)
             }
             SubItem::Gap(_) => Some(Change::Reopen),
-            SubItem::Deltas(_) => None,
+            SubItem::Deltas(_) | SubItem::Runners(_) => None,
         }
     }
 

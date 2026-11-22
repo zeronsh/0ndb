@@ -82,7 +82,7 @@ fn main() -> ondb::Result<()> {
         match sub.blocking_recv_timeout(Duration::from_secs(5)) {
             Some(SubItem::Deltas(ds)) => seen += ds.iter().filter(|d| d.kind == "message").count(),
             Some(SubItem::Gap(g)) => println!("gap {g:?}"),
-            Some(SubItem::Raw(_)) => {}
+            Some(_) => {}
             None => break,
         }
     }

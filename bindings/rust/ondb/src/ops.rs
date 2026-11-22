@@ -1,6 +1,6 @@
 use serde_json::{json, Map, Value};
 
-use crate::conn::{Client, Pending, Subscription};
+use crate::conn::{Client, Pending, SubKind, Subscription};
 use crate::types::*;
 
 fn put(m: &mut Map<String, Value>, k: &str, v: Option<impl Into<Value>>) {
@@ -249,7 +249,7 @@ impl Client {
         m.insert("op".into(), "subscribe.runners".into());
         m.insert("space".into(), space.into());
         put(&mut m, "object", object);
-        self.subscribe_raw_with(&Value::Object(m), |sub, _| Ok(sub))
+        self.subscribe_with(&Value::Object(m), SubKind::Runners, |sub, _| Ok(sub))
     }
 
     pub fn takeover_get(&self, object: &str, level: &str) -> Pending<TakeoverPolicy> {
@@ -282,6 +282,38 @@ impl Client {
 
     pub fn convo_mount(&self, object: &str, name: &str, tree: &str, path: &str) -> Pending<WriteResult> {
         self.call(&json!({"op": "mount", "object": object, "name": name, "tree": tree, "path": path}))
+    }
+
+    pub fn search_with(&self, a: &SearchArgs) -> Pending<SearchResults> {
+        let mut m = Map::new();
+        m.insert("op".into(), "search".into());
+        m.insert("query".into(), a.query.as_str().into());
+        if a.limit > 0 {
+            m.insert("limit".into(), a.limit.into());
+        }
+        put(&mut m, "space", a.space.as_deref());
+        put(&mut m, "cursor", a.cursor.as_deref());
+        put(&mut m, "sort", a.sort.as_deref());
+        put(&mut m, "scope", a.scope.as_deref());
+        if a.semantic {
+            m.insert("semantic".into(), true.into());
+        }
+        if a.collapse {
+            m.insert("collapse".into(), true.into());
+        }
+        self.call(&Value::Object(m))
+    }
+
+    pub fn text_create(&self, space: &str, title: &str, initial: &str) -> Pending<Created> {
+        self.call(&json!({"op": "text.create", "space": space, "title": title, "initial": initial}))
+    }
+
+    pub fn tree_create(&self, space: &str, title: &str) -> Pending<Created> {
+        self.call(&json!({"op": "tree.create", "space": space, "title": title}))
+    }
+
+    pub fn object_uploaded(&self, object: &str) -> Pending<Uploaded> {
+        self.call(&json!({"op": "object.uploaded", "object": object}))
     }
 
     pub fn search(&self, query: &str, space: Option<&str>, limit: u64) -> Pending<SearchResults> {

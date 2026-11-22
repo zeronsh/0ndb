@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use crate::chan::{Next, Queue, QueueState};
 use crate::error::{Error, Result, Status};
 use crate::frame::{self, Frame, FrameReader};
-use crate::types::{Delta, Deltas, Event};
+use crate::types::{Delta, Deltas, Event, Runners};
 
 #[cfg(unix)]
 pub(crate) type Sock = std::os::unix::net::UnixStream;
@@ -152,9 +152,11 @@ pub struct Gap {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SubItem {
     Deltas(Vec<Delta>),
     Gap(Gap),
+    Runners(Runners),
     Raw(Vec<u8>),
 }
 
@@ -162,11 +164,13 @@ pub enum SubItem {
 pub enum SubKind {
     Object,
     Catalog,
+    Runners,
     Raw,
 }
 
 struct SubEntry {
     req: Vec<u8>,
+    object: Option<String>,
     kind: SubKind,
     queue: Arc<Queue<SubItem>>,
     tag: u64,
@@ -354,6 +358,7 @@ impl Client {
             id,
             SubEntry {
                 req: body.clone(),
+                object: req.get("object").and_then(|o| o.as_str()).map(String::from),
                 kind,
                 queue: queue.clone(),
                 tag,
@@ -799,7 +804,17 @@ fn dispatch(inner: &Inner, link: &Link, f: Frame) {
                 push_raw(&e.queue, f.payload[8..].to_vec(), inner.opts.queue_limit);
                 return;
             }
-            let Ok(d) = serde_json::from_slice::<Deltas>(&f.payload[8..]) else { return };
+            if e.kind == SubKind::Runners {
+                let Ok(r) = serde_json::from_slice::<Runners>(&f.payload[8..]) else { return };
+                push_runners(&e.queue, r);
+                return;
+            }
+            let Ok(mut d) = serde_json::from_slice::<Deltas>(&f.payload[8..]) else { return };
+            if let Some(o) = &e.object {
+                for x in d.deltas.iter_mut().filter(|x| x.object.is_none()) {
+                    x.object = Some(o.clone());
+                }
+            }
             push_deltas(&e.queue, e.kind == SubKind::Catalog, d.deltas, inner.opts.queue_limit);
         }
         frame::GAP => {
@@ -885,6 +900,13 @@ fn push_deltas(q: &Queue<SubItem>, catalog: bool, deltas: Vec<Delta>, limit: usi
         g.items = kept;
         g.dropping = true;
     }
+    q.notify(g);
+}
+
+fn push_runners(q: &Queue<SubItem>, r: Runners) {
+    let mut g = q.lock();
+    g.items.retain(|i| !matches!(i, SubItem::Runners(_)));
+    g.items.push_back(SubItem::Runners(r));
     q.notify(g);
 }
 

@@ -141,14 +141,14 @@ fn stream(c: &Client, provider: &str, model: &str, prompt: &str) -> ondb::Result
                         chunks += 1;
                         text_bytes += d.text.len() as u64;
                     }
-                    if d.kind == "seal" && d.msg != sent.item && d.role != serde_json::json!("user") && d.usage.output > 0 {
+                    if d.kind == "seal" && d.msg != sent.item && d.role != "user" && d.usage.output > 0 {
                         out_tokens = d.usage.output;
                         break 'outer;
                     }
                 }
             }
             Some(SubItem::Gap(g)) => println!("gap {g:?}"),
-            Some(SubItem::Raw(_)) => {}
+            Some(_) => {}
             None => break,
         }
     }
