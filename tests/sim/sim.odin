@@ -459,6 +459,7 @@ finish :: proc(w: ^World) {
 	if w.cfg.verbose {
 		before = loop_snapshot(w, "before the final check")
 	}
+	check_archive_cipher(w)
 	if !check_convergence(w, true) && w.cfg.verbose {
 		dump_replication(w, before)
 	}

@@ -90,6 +90,7 @@ Replicator_Config :: struct {
 	archive_min:  i64,
 	archive_group: int,
 	archive_level: int,
+	archive_keys: proc(user: rawptr, name: string, id: Stream_Id, use: proc(data: rawptr, keys: journal.Key_Provider, shift: u8), data: rawptr) -> bool,
 }
 
 Stream_Sealing :: enum u8 {
@@ -327,6 +328,7 @@ Replicator :: struct {
 	live_rx:    Live_Rx,
 	live_sent:  i64,
 	live_recv:  i64,
+	trims:      map[Stream_Id]i64,
 	allocator:  runtime.Allocator,
 }
 
@@ -417,6 +419,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.serves = make([dynamic]Serve_Req, allocator)
 	r.parked = make([dynamic]Serve_Req, allocator)
 	r.promos = make([dynamic]^Promotion, allocator)
+	r.trims = make(map[Stream_Id]i64, allocator)
 	r.tr.fd = prim.INVALID_FD
 	return .None
 }
@@ -463,6 +466,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 		_promotion_free(r, pr)
 	}
 	delete(r.promos)
+	delete(r.trims)
 	delete(r.endpoints)
 	delete(r.publics)
 	if r.deadline != 0 {
@@ -732,14 +736,6 @@ _remote_want_tail :: proc(r: ^Replicator, rm: ^Remote, n: i64) -> Error {
 replicator_confirmed_empty :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
 	rm, ok := r.remotes[stream_id(scope, device, name, epoch)]
 	return ok && rm.empty_ok && journal.replica_length(&rm.rep) == 0
-}
-
-replicator_pending :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
-	id := stream_id(scope, device, name, epoch)
-	if rm, ok := r.remotes[id]; ok {
-		return rm.tail > 0 || len(rm.wants) > 0
-	}
-	return false
 }
 
 replicator_acquire :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> (^journal.Replica, Error) {
@@ -1493,6 +1489,19 @@ _contiguous :: proc(rm: ^Remote) -> i64 {
 }
 
 @(private)
+_suffix_contiguous :: proc(rm: ^Remote) -> i64 {
+	if !rm.trimmed || rm.base <= 0 {
+		return _contiguous(rm)
+	}
+	for h in journal.replica_have(&rm.rep) {
+		if h.from <= rm.base && h.to > rm.base {
+			return h.to
+		}
+	}
+	return rm.base
+}
+
+@(private)
 _remote_follow_send :: proc(r: ^Replicator, rm: ^Remote) {
 	rm.pulled = _contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
 	_remote_pull(r, rm)
@@ -1578,11 +1587,11 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 		}
 	}
 	if fetch.from < rm.base && rm.trimmed {
-		_arc_want(r, rm, fetch.from, min(fetch.to, rm.base))
-		if fetch.to <= rm.base {
+		_arc_want(r, rm, max(gap.from, fetch.from), min(max(gap.to, fetch.from), rm.base))
+		if gap.to <= rm.base {
 			return
 		}
-		fetch.from = rm.base
+		fetch.from = max(rm.base, gap.from)
 	}
 	if fetch.from < rm.base {
 		_pull_range(r, rm, fetch.from, min(fetch.to, rm.base))
@@ -2035,7 +2044,7 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	r.rx_remote = nil
 	_remote_landed(r, rm, r.rx_start, r.rx_at, ev.length)
 	if rm.full && r.rx_at >= rm.pulled {
-		if c := _contiguous(rm); c < rm.pulled {
+		if c := _suffix_contiguous(rm); c < rm.pulled {
 			rm.pulled = c
 		}
 	}
@@ -2166,7 +2175,9 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Direct, .Undelivered:
 		_on_direct_event(r, ev)
 	case .Noted:
-		_on_noted(r, ev)
+		if !_arc_trim_reply(r, Stream_Id(ev.id), false) {
+			_on_noted(r, ev)
+		}
 	case .Hollow:
 		_on_hollow(r, ev)
 	case .Pulled:
@@ -2257,6 +2268,9 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		return
 	}
 	if _promote_on_refused(r, id, ev.code) {
+		return
+	}
+	if _arc_trim_reply(r, id, true) {
 		return
 	}
 	if l, ok := r.locals[id]; ok {

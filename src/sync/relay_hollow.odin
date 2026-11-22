@@ -479,4 +479,15 @@ _trim_done :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn, p: ^Pending, resu
 	if c != nil {
 		_reply_hollow(c, .Noted, p.id, st.base, st.length)
 	}
+	for f in st.followers {
+		for &sub in f.subs {
+			if sub.stream == st && sub.offset < st.base {
+				sub.offset = st.base
+				if f != c {
+					_reply_hollow(f, .Trimmed, p.id, st.base, st.length)
+				}
+				_conn_kick(f)
+			}
+		}
+	}
 }

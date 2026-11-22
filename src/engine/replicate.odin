@@ -1,5 +1,6 @@
 package engine
 
+import "core:crypto"
 import "../journal"
 import "../prim"
 import osync "../sync"
@@ -26,6 +27,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		archive_min  = e.cfg.archive_min if e.cfg.archive_min != 0 else osync.ARCHIVE_MIN_DEFAULT,
 		archive_group = e.cfg.archive_group,
 		archive_level = e.cfg.archive_level,
+		archive_keys = _repl_archive_keys,
 	}
 	creds_ok := false
 	if e.cfg.credentials.produce != nil {
@@ -771,4 +773,30 @@ _verify_plain :: proc(sp: ^Space, req: ^osync.Verify_Request, seg: string) -> os
 		_held_add(e, sp, req.device, req.name)
 	}
 	return verdict
+}
+
+@(private)
+_repl_archive_keys :: proc(user: rawptr, name: string, id: osync.Stream_Id, use: proc(data: rawptr, keys: journal.Key_Provider, shift: u8), data: rawptr) -> bool {
+	sp := (^Space)(user)
+	e := sp.e
+	obj_id, kind, ok := _object_of_name(name)
+	if !ok {
+		return false
+	}
+	sc := _object_scope(sp, obj_id)
+	defer osync.scope_clear(&sc)
+	if sc.mode == .Transparent {
+		use(data, {}, 0)
+		return true
+	}
+	t, err := _own_tree_get(e, sp, obj_id, kind, &sc, false)
+	if err != .None {
+		k := osync.stream_key(&sc, id)
+		defer crypto.zero_explicit(&k, size_of(k))
+		use(data, osync.static_provider(&k), 0)
+		return true
+	}
+	defer _own_tree_unref(e, t)
+	use(data, osync.keytree_provider(&t.tree), t.tree.shift)
+	return true
 }

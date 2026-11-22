@@ -43,6 +43,22 @@ Wipe :: struct {
 	sid:  osync.Stream_Id,
 }
 
+check_archive_cipher :: proc(w: ^World) {
+	m := &w.model
+	for n in w.nodes {
+		if !n.alive || !n.e_open {
+			continue
+		}
+		for _, oi in m.objs {
+			if obj_exists(m, oi) && _reader(w, oi, n.idx) {
+				for x in _restored_segs(w, n, oi) {
+					_compare_cipher(w, n, x)
+				}
+			}
+		}
+	}
+}
+
 check_archive_reread :: proc(w: ^World) {
 	m := &w.model
 	best := -1
