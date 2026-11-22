@@ -66,7 +66,6 @@ History_Options :: struct {
 	keep_at_least: i64,
 	clock:         Clock,
 	random:        prim.Random,
-	deferred:      bool,
 	hold:          Hold,
 }
 
@@ -286,7 +285,7 @@ history_rebind :: proc(h: ^History, streams: Stream_Source, opts: History_Option
 	h.streams = streams
 	a, aok := h.opts.chain.?
 	b, bok := opts.chain.?
-	if aok != bok || (aok && a != b) || h.opts.keep_at_least != opts.keep_at_least || h.opts.deferred != opts.deferred {
+	if aok != bok || (aok && a != b) || h.opts.keep_at_least != opts.keep_at_least {
 		return history_reconfigure(h, opts)
 	}
 	old := h.opts.hold
@@ -1075,11 +1074,7 @@ history_persist :: proc(h: ^History) -> Error {
 	}
 	prim.write_uvarint(&w, h.moves_count)
 	kv_put(&h.kv, transmute([]u8)string("s"), buf[:]) or_return
-	kv_commit(&h.kv) or_return
-	if !h.opts.deferred {
-		return history_flush_staged(h, max(u64))
-	}
-	return .None
+	return kv_commit(&h.kv)
 }
 
 Staged_Blob :: struct {
@@ -1103,9 +1098,7 @@ history_stage_blob :: proc(h: ^History, data: []u8) -> (oid: odb.Oid, err: Error
 	}
 	copy_data := make([]u8, len(data), h.allocator)
 	copy(copy_data, data)
-	if h.opts.deferred {
-		h.mark += 1
-	}
+	h.mark += 1
 	append(&h.staged, Staged_Blob{oid, copy_data, h.mark})
 	return oid, .None
 }

@@ -442,16 +442,5 @@ pipe_stage_b :: proc(p: ^Pipe, c: ^Pipe_Chunk) -> Error {
 		}
 	}
 	shadow_persist(&m.shadow) or_return
-	if mount_deferred(m) {
-		return .None
-	}
-	sync.mutex_lock(&p.state)
-	defer sync.mutex_unlock(&p.state)
-	for it, i in m.intents {
-		if it.seq == c.seq0 && it.actor == m.actor {
-			ordered_remove(&m.intents, i)
-			break
-		}
-	}
-	return save_mount_state(m)
+	return .None
 }

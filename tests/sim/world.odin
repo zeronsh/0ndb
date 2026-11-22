@@ -25,6 +25,7 @@ Ev_Kind :: enum u8 {
 	Relay_Restart,
 	Heal,
 	Watch,
+	Pack_Job,
 }
 
 Sim_Event :: struct {
@@ -66,6 +67,7 @@ Node :: struct {
 	key_open:    bool,
 	rng:         Rng,
 	ids:         Rng,
+	pack_rng:    Rng,
 	conns:       [dynamic]^Conn,
 	partitioned: bool,
 	durable:     u64,
@@ -155,6 +157,7 @@ Config :: struct {
 	keep_ops:    Filter,
 	keep_faults: Filter,
 	storage:     eng.Storage_Mode,
+	durability:  eng.Durability,
 }
 
 World :: struct {

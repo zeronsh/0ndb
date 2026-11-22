@@ -21,6 +21,12 @@ Options :: struct {
 	wake:           proc(data: rawptr),
 	wake_data:      rawptr,
 	deferred_sync:  bool,
+	worker:         Worker_Hook,
+}
+
+Worker_Hook :: struct {
+	data:   rawptr,
+	submit: proc(data: rawptr),
 }
 
 DEFAULT_OPTIONS :: Options {
@@ -142,6 +148,8 @@ Pack :: struct {
 	fl:            Inflight,
 	waiters:       [dynamic]Waiter,
 	worker:        ^Worker,
+	hook_ran:      bool,
+	hook_err:      Error,
 	log_since_ck:  i64,
 	mem:           Mem,
 	runs:          [dynamic]^Run,
