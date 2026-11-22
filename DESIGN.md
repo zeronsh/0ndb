@@ -485,13 +485,18 @@ equal in both directions.
   shadow, the mount state (synced frontier, journal position), staged blobs
   and materialization wait for that batch in every durability mode: a pass
   records an image under the history's mark and writes it when the mark is
-  acknowledged. Recovery from the mount's own intents (at open, or when a
-  pass retries an import that did not finish) goes through the same wait:
-  the intents stay in the saved state until the image that covers them is
-  written. The mount state also records the shadow's generation and
-  log end it was saved against; on open a longer shadow is truncated back
-  to that end, so shadow and synced frontier are always one saved state and
-  a crash between the shadow flush and the state save is undone.
+  acknowledged. The history's derived state (graph, actor interning, which
+  the shadow's inode ids refer to) is committed into the pack only once that
+  batch completes, so it is durable one batch later; the history counts a
+  mark as settled when that later batch completes too, and mount images wait
+  for settled, not for durable. Recovery from the mount's own intents (at
+  open, or when a pass retries an import that did not finish) goes through
+  the same wait: the intents stay in the saved state until the image that
+  covers them is written. The mount state also records the shadow's
+  generation and log end it was saved against; on open a longer shadow is
+  truncated back to that end, so shadow and synced frontier are always one
+  saved state and a crash between the shadow flush and the state save is
+  undone.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,
