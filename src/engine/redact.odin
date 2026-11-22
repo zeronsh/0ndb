@@ -254,7 +254,7 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 	if msg.seg == e.self {
 		sum := convo.writer_summary(&h.cw)
 		if convo.summary_find(&sum, msg.off) >= 0 {
-			if _, serr := convo.writer_seal(&h.cw, msg, .Cancelled); serr != .None {
+			if _, serr := convo.writer_seal(&h.cw, msg, .Cancelled); serr != .None && !_store_err(e, _oerr(serr)) {
 				_log(e, .Warn, "sealing a redacted open message failed")
 			}
 		}
@@ -303,7 +303,9 @@ _apply_remote_redact_msg :: proc(e: ^Engine, h: ^Handle, vs: int, body: []u8, at
 		if err == .Missing {
 			return .Missing
 		}
-		_log(e, .Warn, "applying a message redaction failed")
+		if !_store_err(e, err) {
+			_log(e, .Warn, "applying a message redaction failed")
+		}
 	}
 	return .None
 }

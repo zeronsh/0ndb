@@ -787,6 +787,7 @@ _tick_end :: proc(e: ^Engine) {
 	_content_events_process(e)
 	_waiters_run(e)
 	_remote_step(e)
+	_catalog_reconcile(e)
 	_catalog_flush(e)
 	_budget_flush(e)
 	_mounts_commit(e)
@@ -810,7 +811,7 @@ _tick_end :: proc(e: ^Engine) {
 	_durable_begin(e)
 	_leave_step(e)
 	_refused_step(e)
-	if e.pk_open && e.pk.poisoned && e.fatal == .None {
+	if e.fatal == .None && (e.pk_open && e.pk.poisoned || e.reg.open && e.reg.db.poisoned) {
 		_fatal(e, .Io)
 	}
 	_settle_arm(e)

@@ -126,6 +126,7 @@ _promo_mark :: proc(e: ^Engine, space, object: prim.Id, from: i64, on: bool) {
 	k := _promo_key(space, object)
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	v: [8]u8
@@ -138,9 +139,10 @@ _promo_mark :: proc(e: ^Engine, space, object: prim.Id, from: i64, on: bool) {
 	}
 	if err != .None {
 		omap.txn_abort(t)
+		_reg_fail(e, .Io)
 		return
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)
@@ -313,7 +315,9 @@ _promote :: proc(e: ^Engine, o: Object, from: i64, froms: map[prim.Id]i64) -> Er
 			if h.own_tree != nil {
 				var_tree = &h.own_tree.tree
 			}
-			osync.replicator_publish(&sp.repl, &sc, name, 0, path, n, var_tree, false)
+			if perr := osync.replicator_publish(&sp.repl, &sc, name, 0, path, n, var_tree, false); perr != .None {
+				_store_err(e, _serr(perr))
+			}
 		}
 	}
 	if path, perr := _own_path_of(e, o.id, rec.kind); perr == .None && prim.exists(e.vfs, path) {

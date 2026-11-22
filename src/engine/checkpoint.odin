@@ -86,13 +86,15 @@ _ckpt_put :: proc(e: ^Engine, id: prim.Id, length: i64, oid: [32]u8) {
 	copy(v[8:], o[:])
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	if omap.txn_put(t, ROOT_CKPT, k[:], v[:]) != .None {
 		omap.txn_abort(t)
+		_reg_fail(e, .Io)
 		return
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 	e.reg.meta = true
 }
 

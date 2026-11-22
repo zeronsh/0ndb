@@ -356,7 +356,7 @@ _reg_put :: proc(e: ^Engine, root: int, key: []u8, value: []u8) -> Error {
 		omap.txn_abort(t)
 		return _oerr(err)
 	}
-	return _oerr(omap.txn_commit(t))
+	return _reg_commit(e, t)
 }
 
 @(private)
@@ -369,7 +369,7 @@ _reg_del :: proc(e: ^Engine, root: int, key: []u8) -> Error {
 		omap.txn_abort(t)
 		return _oerr(err)
 	}
-	return _oerr(omap.txn_commit(t))
+	return _reg_commit(e, t)
 }
 
 @(private)

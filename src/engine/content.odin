@@ -142,13 +142,15 @@ _content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, m
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	if omap.txn_put(t, ROOT_OWNED, k[:], v[:]) != .None {
 		omap.txn_abort(t)
+		_reg_fail(e, .Io)
 		return
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)

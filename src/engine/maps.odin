@@ -6,6 +6,7 @@ import "core:strings"
 import "../convo"
 import omap "../map"
 import "../obj"
+import "../pack"
 import "../prim"
 import osync "../sync"
 
@@ -370,7 +371,9 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 				if h.w_open && i == 0 && !omap.table_poisoned(&h.table) {
 					return _oerr(err)
 				}
-				_log(e, .Warn, "map apply failed")
+				if !_store_err(e, _oerr(err)) {
+					_log(e, .Warn, "map apply failed")
+				}
 			}
 		}
 		if !omap.table_poisoned(&h.table) {
@@ -553,12 +556,75 @@ _catalog_flush :: proc(e: ^Engine) {
 				continue
 			}
 		} else if err != .None {
-			_log(e, .Warn, "catalog update failed")
+			_fatal(e, err)
 		}
 		delete(u.title, e.allocator)
 		delete(u.role, e.allocator)
 		delete(u.remote, e.allocator)
 		free(u, e.allocator)
+	}
+}
+
+@(private)
+_catalog_reconcile :: proc(e: ^Engine) {
+	if !e.pk_open || !pack.unclean(&e.pk) || !e.reg.open {
+		return
+	}
+	for id in _sorted_keys(e.spaces) {
+		sp := e.spaces[id]
+		if sp.cat_checked || !sp.open || sp.keyless {
+			continue
+		}
+		sp.cat_checked = true
+		_catalog_reconcile_space(e, sp)
+	}
+}
+
+@(private)
+_catalog_reconcile_space :: proc(e: ^Engine, sp: ^Space) {
+	objects, err := _reg_collect(e, ROOT_OBJECTS)
+	if err != .None {
+		_fatal(e, err)
+		return
+	}
+	h: ^Handle
+	for &f in objects {
+		if f.klen != 16 {
+			continue
+		}
+		rec, derr := _rec_decode(f.value, context.temp_allocator)
+		if derr != .None || !rec.own || rec.space != sp.id {
+			continue
+		}
+		id: prim.Id
+		copy(id[:], f.key[:16])
+		if id == sp.catalog {
+			continue
+		}
+		if _, queued := e.catalog_q[id]; queued {
+			continue
+		}
+		if h == nil {
+			hh, herr := _catalog_handle(e, sp)
+			if herr != .None {
+				return
+			}
+			if merr := _map_sync(e, hh); merr != .None && merr != .Missing {
+				return
+			}
+			h = hh
+		}
+		_, found, gerr := omap.catalog_get(&h.table, id, context.temp_allocator)
+		if gerr != .None || found {
+			continue
+		}
+		u := _catalog_q(e, sp.id, id, rec.kind)
+		if u == nil {
+			continue
+		}
+		u.created = true
+		u.participant = true
+		u.status = rec.kind == .Conversation
 	}
 }
 

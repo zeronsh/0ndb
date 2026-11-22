@@ -153,14 +153,23 @@ _notices_start :: proc(e: ^Engine) {
 	if journal.journal_len(&j) == 0 {
 		hello := make([dynamic]u8, context.temp_allocator)
 		if osync.notice_hello_encode(e.identity, e.account.cert, &hello) == .None {
-			journal.journal_append(&j, hello[:])
-			journal.journal_commit(&j)
+			_, aerr := journal.journal_append(&j, hello[:])
+			if aerr == .None {
+				aerr = journal.journal_commit(&j)
+			}
+			if aerr != .None {
+				journal.journal_close(&j)
+				_store_err(e, _jerr(aerr))
+				return
+			}
 		}
 	}
 	durable := journal.journal_durable_len(&j)
 	journal.journal_close(&j)
 	_notices_own_scan(e, path)
-	osync.replicator_publish(&e.approvals.rv.repl, &n.scope, osync.NOTICES_STREAM, n.epoch, path, durable)
+	if perr := osync.replicator_publish(&e.approvals.rv.repl, &n.scope, osync.NOTICES_STREAM, n.epoch, path, durable); perr != .None {
+		_store_err(e, _serr(perr))
+	}
 	_notices_follow(e)
 }
 
@@ -523,7 +532,9 @@ _notices_append :: proc(e: ^Engine, body: []u8) -> Error {
 	durable := journal.journal_durable_len(&j)
 	journal.journal_close(&j)
 	_jerr(cerr) or_return
-	osync.replicator_publish(&e.approvals.rv.repl, &n.scope, osync.NOTICES_STREAM, n.epoch, path, durable)
+	if perr := osync.replicator_publish(&e.approvals.rv.repl, &n.scope, osync.NOTICES_STREAM, n.epoch, path, durable); perr != .None {
+		_store_err(e, _serr(perr))
+	}
 	return .None
 }
 
@@ -614,11 +625,19 @@ _notices_rotate :: proc(e: ^Engine, path: string) {
 	}
 	hello := make([dynamic]u8, context.temp_allocator)
 	osync.notice_hello_encode(e.identity, e.account.cert, &hello)
-	journal.journal_append(&j, hello[:])
+	_, cerr := journal.journal_append(&j, hello[:])
 	for b in keep {
-		journal.journal_append(&j, b)
+		if cerr != .None {
+			break
+		}
+		_, cerr = journal.journal_append(&j, b)
 	}
-	cerr := journal.journal_commit(&j)
+	if cerr == .None {
+		cerr = journal.journal_commit(&j)
+	}
+	if cerr != .None {
+		_store_err(e, _jerr(cerr))
+	}
 	durable := journal.journal_durable_len(&j)
 	journal.journal_close(&j)
 	if cerr != .None || _notices_epoch_store(e, next) != .None {
@@ -628,7 +647,9 @@ _notices_rotate :: proc(e: ^Engine, path: string) {
 	n.epoch = next
 	n.stale = true
 	_notices_own_scan(e, npath)
-	osync.replicator_publish(&e.approvals.rv.repl, &n.scope, osync.NOTICES_STREAM, next, npath, durable)
+	if perr := osync.replicator_publish(&e.approvals.rv.repl, &n.scope, osync.NOTICES_STREAM, next, npath, durable); perr != .None {
+		_store_err(e, _serr(perr))
+	}
 }
 
 @(private)

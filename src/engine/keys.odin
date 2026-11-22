@@ -141,8 +141,13 @@ _own_tree_legacy_drop :: proc(e: ^Engine, object: prim.Id) {
 		return
 	}
 	if size, serr := prim.file_size(e.vfs, fd); serr == .None && size > 0 {
-		prim.zero_range(e.vfs, fd, 0, size)
-		prim.datasync(e.vfs, fd)
+		zerr := prim.zero_range(e.vfs, fd, 0, size)
+		if zerr == .None {
+			zerr = prim.datasync(e.vfs, fd)
+		}
+		if zerr != .None {
+			_store_err(e, _perr(zerr))
+		}
 	}
 	prim.close_file(e.vfs, fd)
 	prim.remove(e.vfs, path)

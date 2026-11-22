@@ -200,7 +200,9 @@ _members_stream_append :: proc(e: ^Engine, sp: ^Space, raws: [][]u8) -> Error {
 	_jerr(cerr) or_return
 	if sp.repl_on {
 		ms := osync.members_scope(sp.id)
-		osync.replicator_publish(&sp.repl, &ms, osync.MEMBERS_STREAM, 0, path, n)
+		if perr := osync.replicator_publish(&sp.repl, &ms, osync.MEMBERS_STREAM, 0, path, n); perr != .None {
+			_store_err(e, _serr(perr))
+		}
 	}
 	return .None
 }
@@ -221,7 +223,9 @@ _members_publish :: proc(e: ^Engine, sp: ^Space) {
 	n := journal.journal_durable_len(&j)
 	journal.journal_close(&j)
 	ms := osync.members_scope(sp.id)
-	osync.replicator_publish(&sp.repl, &ms, osync.MEMBERS_STREAM, 0, path, n)
+	if perr := osync.replicator_publish(&sp.repl, &ms, osync.MEMBERS_STREAM, 0, path, n); perr != .None {
+		_store_err(e, _serr(perr))
+	}
 }
 
 @(private)
