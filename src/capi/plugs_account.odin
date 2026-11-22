@@ -24,6 +24,7 @@ C_Plug_Reply :: struct {
 	prf:            [32]u8,
 	ecosystem:      i32,
 	lease_ms:       u64,
+	runner:         [16]u8,
 }
 
 C_Unlock :: struct {
@@ -59,6 +60,7 @@ Plug_Kind :: enum u8 {
 	Unlock,
 	Pool,
 	Credentials,
+	Scheduler,
 }
 
 Plug_State :: enum u8 {
@@ -83,6 +85,7 @@ Plug_Call :: struct {
 	prf:        [32]u8,
 	ecosystem:  i32,
 	lease_ms:   u64,
+	runner:     [16]u8,
 }
 
 Account_Plugs :: struct {
@@ -186,6 +189,7 @@ _pc_reply :: proc(pc: ^Plug_Call, reply: ^osync.Plug_Reply) -> osync.Error {
 	}
 	reply.ecosystem = osync.Ecosystem(pc.ecosystem)
 	reply.lease_ms = pc.lease_ms
+	reply.runner = prim.Id(pc.runner)
 	return .None
 }
 
@@ -231,8 +235,11 @@ ondb_plug_done :: proc "c" (pc: ^Plug_Call, status: i32, reply: ^C_Plug_Reply) -
 			if sz >= offset_of(C_Plug_Reply, lease_ms) {
 				pc.ecosystem = reply.ecosystem
 			}
-			if sz >= size_of(C_Plug_Reply) {
+			if sz >= offset_of(C_Plug_Reply, runner) {
 				pc.lease_ms = reply.lease_ms
+			}
+			if sz >= size_of(C_Plug_Reply) {
+				pc.runner = reply.runner
 			}
 		}
 		if pc.state == .Inline {
@@ -321,6 +328,11 @@ _pc_cancel :: proc(p: ^Account_Plugs, done: osync.Plug_Done) {
 		c := &p.h.plugs.credentials
 		if c.cancel != nil {
 			c.cancel(c.ud, target)
+		}
+	case .Scheduler:
+		s := &p.h.rt.scheduler
+		if s.cancel != nil {
+			s.cancel(s.ud, target)
 		}
 	}
 }
