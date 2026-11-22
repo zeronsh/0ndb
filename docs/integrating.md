@@ -86,6 +86,23 @@ being the one that claims), and its output streams to every device.
 Stopping. `daemon.stop` (or `0ndb daemon stop`) for updates and sign-out
 flows; otherwise leave it running.
 
+Sleeping. A host that stops the machine itself (a cloud sandbox idling out)
+asks first with `quiesce`: it is declined (`run_active`, `queued`) while a
+turn runs or a message waits for this runner, and otherwise answers only once
+everything is durable and the relay holds every relay-stored byte, or
+declines with `relay` when it cannot. From the accept until the stop (or the
+lift, 3 minutes by default) no turn starts; sends wait in their conversation
+for the woken machine. Stop only on `accepted`.
+
+```rust
+let q = client.quiesce(false, None).await?;
+if q.accepted {
+    stop_the_machine();
+} else {
+    eprintln!("not now: {}", q.reason);
+}
+```
+
 ## 3. Event-driven by construction
 
 - The daemon writes only when state changes: one Deltas frame per

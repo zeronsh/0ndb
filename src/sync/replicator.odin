@@ -2322,3 +2322,33 @@ _repl_reset_state :: proc(r: ^Replicator) {
 	_objs_reset(r)
 	_fetches_reset(r)
 }
+
+replicator_live :: proc "contextless" (r: ^Replicator) -> bool {
+	return r.phase == .Ready
+}
+
+replicator_unsettled :: proc(r: ^Replicator) -> (pending: bool, broken: bool) {
+	if r.phase != .Ready {
+		return true, true
+	}
+	for _, l in r.locals {
+		if l.superseded || l.hollow {
+			continue
+		}
+		if l.fatal || l.blocked {
+			return true, true
+		}
+		if l.floor < l.durable || l.inflight > 0 || l.verifying || l.ahead > 0 || l.dropping {
+			pending = true
+		}
+	}
+	for j in r.objs.jobs {
+		if j.op == .Put && !j.failed {
+			pending = true
+		}
+	}
+	if r.objs.active != nil && r.objs.active.op == .Put {
+		pending = true
+	}
+	return pending, false
+}
