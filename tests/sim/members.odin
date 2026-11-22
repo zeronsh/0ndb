@@ -325,9 +325,12 @@ _sleep_wake :: proc(w: ^World, space: prim.Id, o: eng.Object) {
 		b_text := fmt.aprintf("after-wake-%d", i, allocator = w.allocator)
 		defer delete(a_text, w.allocator)
 		defer delete(b_text, w.allocator)
+		p_text := fmt.aprintf("pending-at-refusal-%d", i, allocator = w.allocator)
+		defer delete(p_text, w.allocator)
 		asleep, _ := _send(w, M_A, o, a_text)
 		_settle(w, 2000)
 		_up(w, M_RUNNER)
+		pending, pok := _send(w, M_RUNNER, o, p_text)
 		_settle(w, 4000)
 		if st, serr := _status(w, M_RUNNER, space); serr != .None || st.removed || st.revoked || !st.lapsed {
 			_fail(w, "wake %d: a lapsed runner is not held as lapsed: %v %v", i, serr, st)
@@ -341,6 +344,9 @@ _sleep_wake :: proc(w: ^World, space: prim.Id, o: eng.Object) {
 		}
 		if !_wait_read(w, M_RUNNER, o, asleep, a_text, 20_000) {
 			_fail(w, "wake %d: access did not return after the pool renewed the lease", i)
+		}
+		if !pok || !_wait_read(w, M_A, o, pending, p_text, 20_000) {
+			_fail(w, "wake %d: a write the runner made as it was refused did not reach n0 after renewal", i)
 		}
 		woke, wok := _send(w, M_RUNNER, o, b_text)
 		if !wok || !_wait_read(w, M_A, o, woke, b_text, 20_000) {

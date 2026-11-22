@@ -197,7 +197,7 @@ _leave_resume :: proc(e: ^Engine) {
 @(private)
 _leave_step :: proc(e: ^Engine) {
 	for id in e.leave_ready {
-		if sp, ok := e.spaces[id]; ok && sp.repl_on {
+		if sp, ok := e.spaces[id]; ok && sp.repl_on && _space_drain(e, sp) {
 			_repl_stop(e, sp)
 		}
 	}
@@ -270,7 +270,7 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 	}
 	_index_purge_ids(e, objs)
 	if sp.open {
-		_space_unload(e, sp)
+		_space_unload(e, sp, true)
 	}
 	for k, t in e.own_trees {
 		if t.space == id {
@@ -310,7 +310,7 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 	_registry_drop_space(e, id, objs) or_return
 	_oerr(omap.db_compact(&e.reg.db)) or_return
 	delete_key(&e.spaces, id)
-	_space_free(e, sp)
+	_space_free(e, sp, true)
 	_waiters_fail_space(e, id, .Permission)
 	_leave_waits_fail(e, id)
 	ent, _ := _left_get(e, id)

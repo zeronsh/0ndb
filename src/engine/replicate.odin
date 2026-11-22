@@ -6,6 +6,7 @@ import osync "../sync"
 
 @(private)
 _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
+	sp.draining = false
 	hx := prim.id_hex(sp.id)
 	dir := _join(context.temp_allocator, e.pack_root, "sync", string(hx[:])) or_return
 	cfg := osync.Replicator_Config {
@@ -92,6 +93,7 @@ _repl_stop :: proc(e: ^Engine, sp: ^Space) {
 	if !sp.repl_on {
 		return
 	}
+	_handles_close_space(e, sp)
 	if sp.conn != nil && e.cfg.transport.close != nil {
 		{
 			context = _outer(e)
@@ -847,7 +849,12 @@ _refused_step :: proc(e: ^Engine) {
 	clear(&e.refused_stop)
 	for id in ids {
 		if sp, ok := e.spaces[id]; ok && sp.refused && sp.repl_on {
-			_repl_stop(e, sp)
+			if _space_drain(e, sp) {
+				_repl_stop(e, sp)
+			} else {
+				append(&e.drain_wait, id)
+				_touch(e)
+			}
 		}
 	}
 }
@@ -858,6 +865,7 @@ _space_unrefuse :: proc(e: ^Engine, sp: ^Space) {
 		return
 	}
 	sp.refused = false
+	sp.draining = false
 	sp.mem.revoked = false
 	sp.backoff = 0
 	sp.refusals = 0

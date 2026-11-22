@@ -72,6 +72,7 @@ Space :: struct {
 	reopen:       prim.Timer,
 	backoff:      i64,
 	refused:      bool,
+	draining:     bool,
 	refusals:     int,
 	admitted:     bool,
 	attempt:      bool,
@@ -449,13 +450,12 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 }
 
 @(private)
-_space_unload :: proc(e: ^Engine, sp: ^Space) {
-	for h in e.lru {
-		if h.sp == sp {
-			h.pins = 0
-		}
+_space_unload :: proc(e: ^Engine, sp: ^Space, discard := false) {
+	if !discard && !e.closing && !e.in_tick && e.pk_open {
+		flush(e)
+		_space_drain(e, sp)
 	}
-	_handles_sweep_space(e, sp)
+	_handles_close_space(e, sp)
 	_catalog_table_close(sp)
 	if sp.repl_on {
 		_repl_stop(e, sp)
@@ -512,9 +512,9 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 }
 
 @(private)
-_space_free :: proc(e: ^Engine, sp: ^Space) {
+_space_free :: proc(e: ^Engine, sp: ^Space, discard := false) {
 	if sp.open {
-		_space_unload(e, sp)
+		_space_unload(e, sp, discard)
 	}
 	delete(sp.name, e.allocator)
 	delete(sp.relay, e.allocator)
