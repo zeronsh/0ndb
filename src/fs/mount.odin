@@ -1653,7 +1653,6 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	}
 	if len(lost) > 0 {
 		drop_lost(m, "", lost[:]) or_return
-		shadow_flush(m) or_return
 	}
 	if l, ok := last.?; ok {
 		snap := fstree.current(&h.tree)
@@ -1678,7 +1677,6 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			}
 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
-		shadow_flush(m) or_return
 		one := [1]crdt.Lv{}
 		if lv, known := crdt.graph_lv(&h.g, l); known {
 			one[0] = lv
@@ -1689,12 +1687,9 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			append(&m.synced, ..v)
 		}
 	}
-	clear(&m.intents)
 	m.jpend = mount_jlen(m)
-	m.jpos = m.jpend
 	history_trim(h)
-	image_take(m, &m.img)
-	return save_mount_state(m)
+	return mount_settle(m)
 }
 
 note_unwatched :: proc(m: ^Mount, rel: string) {
