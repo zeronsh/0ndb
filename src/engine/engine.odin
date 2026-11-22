@@ -265,6 +265,8 @@ Stats :: struct {
 	fetched_bytes:  u64,
 	remote_skipped:  u64,
 	remote_rewrites: u64,
+	restores_written: u64,
+	restores_read:    u64,
 	git_fetches:     u64,
 	git_objects:     u64,
 	over_budget:     u64,
@@ -553,6 +555,10 @@ stats :: proc(e: ^Engine) -> Stats {
 	s.subs = len(e.subs)
 	for _, sp in e.spaces {
 		s.fetched_bytes += sp.repl.fetched_bytes
+		if sp.repl_on {
+			s.restores_written += sp.repl.restores_written
+			s.restores_read += sp.repl.restores_read
+		}
 	}
 	return s
 }
