@@ -127,7 +127,12 @@
  *                 4 recovery
  *   login_status  0 done, 1 waiting, 2 no_approver
  *   pool_access   0 off, 1 everything, 2 workspace, 3 only_sent
- *   placement     0 none, 1 assigned, 2 running, 3 waiting_runner
+ *   placement     0 none, 1 assigned, 2 running, 3 waiting_runner, 4 idle,
+ *                 5 placing
+ *   takeover      0 default, 1 auto, 2 never
+ *   takeover_level 0 conversation, 1 agent, 2 workspace
+ *   runner_kind   0 device, 1 pool
+ *   runner_state  0 offline, 1 online, 2 wakeable
  *
  * Shared payload structures
  *   Result     := item: rid, off: ivarint, leaf: rid, tick: uvarint
@@ -190,7 +195,7 @@
  *   CatalogEntry := object: id, kind: enum kind, title: str, parent: Xref,
  *                 workspace: id, agent: id, participants: ids,
  *                 status: enum convo_status, activity: uvarint,
- *                 archived: bool, pinned: bool
+ *                 archived: bool, pinned: bool, takeover: enum takeover
  *   Space      := id: id, name: str, relay: str, relay_key: bytes,
  *                 mode: enum mode, open: bool, connected: bool, catalog: id,
  *                 relay_usage: uvarint, relay_quota: uvarint (
@@ -233,11 +238,11 @@
  *                 runner_policy: bytes, setup: str, access: bytes,
  *                 members: [ {object: id, kind: enum kind,
  *                 role: enum member_role, mount: str, path: str} ],
- *                 linked: strs
+ *                 linked: strs, takeover: enum takeover
  *   Agent      := name: str, instructions: str, driver: str, provider: str,
  *                 model: str, options: bytes, budget: bytes, workspace: id,
  *                 runner_policy: bytes, tools: [bytes], memory: ids,
- *                 triggers: [bytes]
+ *                 triggers: [bytes], takeover: enum takeover
  *   Delta      := kind: enum delta, object: object, rid: rid, msg: rid,
  *                 record: uvarint, by: id, local: bool, hlc: uvarint,
  *                 role: enum role, index: uvarint, block: enum block,
@@ -263,8 +268,17 @@
  *                 peer_misbehaving carries the device whose served bytes
  *                 failed verification
  *   Placement  := state: enum placement, msg: rid, runner: id, provider: str,
- *                 since_ms: ivarint (waiting_runner: no live runner for the
- *                 provider has claimed msg since since_ms)
+ *                 since_ms: ivarint, last_runner: id (assigned and running:
+ *                 runner runs msg; waiting_runner: msg waits since since_ms
+ *                 for runner, a pool runner the host may wake or a pool, or
+ *                 for any runner when runner is zero; idle: nothing moves on
+ *                 its own, msg is set when its turn was cut off on
+ *                 last_runner; placing: the scheduler plug has not answered)
+ *   Runner     := device: id, name: str, kind: enum runner_kind,
+ *                 state: enum runner_state, providers: strs,
+ *                 signed_in: strs, current: bool, last: bool (a pool is one
+ *                 entry: device is its member id, name its label)
+ *   Runners    := runners: [Runner]
  *   Description := version: uvarint, ops: [ {code: uvarint, name: str,
  *                 args: [ {name: str, type: str, values: strs} ],
  *                 result: str} ]
@@ -1107,6 +1121,10 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_SPACE_SET_RELAY 43u
 /* space.relay_account(space: id, refresh: bool) -> RelayAccount */
 #define ONDB_OP_SPACE_RELAY_ACCOUNT 140u
+/* takeover.get(object: object, level: enum{conversation,agent,workspace}) -> policy:enum takeover effective:enum takeover */
+#define ONDB_OP_TAKEOVER_GET 160u
+/* takeover.set(object: object, level: enum{conversation,agent,workspace}, policy: enum{default,auto,never}) -> {} */
+#define ONDB_OP_TAKEOVER_SET 161u
 /* space.open(space: id) -> {} */
 #define ONDB_OP_SPACE_OPEN 44u
 /* space.close(space: id) -> {} */
@@ -1227,7 +1245,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_OBJECT_UPLOADED 142u
 /* catalog.usage(object: object) -> Usage */
 #define ONDB_OP_CATALOG_USAGE 101u
-/* catalog.set(object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id) -> Result */
+/* catalog.set(object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id, takeover: enum{default,auto,never}) -> Result */
 #define ONDB_OP_CATALOG_SET 102u
 /* search(query: str, limit: uvarint, cursor: bytes, sort: enum{relevance,newest}, semantic: bool, collapse: bool, space: id, scope: enum{auto,local,everywhere}) -> Results */
 #define ONDB_OP_SEARCH 103u
@@ -1303,6 +1321,10 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_WAKE 138u
 /* placement(object: object) -> Placement */
 #define ONDB_OP_PLACEMENT 139u
+/* runners(space: id, object: object) -> Runners */
+#define ONDB_OP_RUNNERS 162u
+/* subscribe.runners(space: id, object: object) -> Runners */
+#define ONDB_OP_SUBSCRIBE_RUNNERS 163u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

@@ -137,3 +137,15 @@ idle_release :: proc() {
 		}
 	}
 }
+
+sys_hostname :: proc(allocator := context.allocator) -> string {
+	buf: [256]u8
+	if posix.gethostname(raw_data(buf[:]), len(buf) - 1) != .OK {
+		return ""
+	}
+	n := 0
+	for n < len(buf) && buf[n] != 0 {
+		n += 1
+	}
+	return strings.clone(string(buf[:n]), allocator)
+}

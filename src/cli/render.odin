@@ -190,10 +190,19 @@ placement_text :: proc(p: json.Value, cur_hint := true) -> string {
 		prov := jstr(p, "provider")
 		since := jint(p, "since_ms")
 		label := fmt.tprintf("waiting for a runner (provider %s)", prov if len(prov) > 0 else "default")
+		if r := jstr(p, "runner"); len(r) > 0 {
+			label = fmt.tprintf("waiting for runner %s", short(r))
+		}
 		if since > 0 {
 			label = fmt.tprintf("%s since %s", label, ago(since))
 		}
 		return label
+	case "idle":
+		if last := jstr(p, "last_runner"); len(last) > 0 && len(jstr(p, "msg")) > 0 {
+			return fmt.tprintf("idle: its runner %s stopped (0ndb resume moves it)", short(last))
+		}
+	case "placing":
+		return "placing"
 	}
 	return ""
 }

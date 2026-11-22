@@ -782,7 +782,7 @@ runner capacity and settings.
 
 A workspace is a map: name, members (file trees with default mount names
 and paths, documents, memory objects), defaults (agent, provider, model,
-runner policy), setup (`.agents/setup`, linked ignored files) and access.
+runner policy, takeover policy), setup (`.agents/setup`, linked ignored files) and access.
 Conversations may belong to a workspace or not, and mount any subset of its
 file trees (or trees from elsewhere). A runner materializes a conversation's
 mounts side by side under one root it gives the agent as its working
@@ -794,8 +794,8 @@ right tree.
 
 An agent is a map: instructions, driver (a harness provider or the native
 model loop) with model and options, tools (built-ins, MCP servers), memory
-(objects it reads and writes), triggers, budgets, default workspace and
-runner policy. Conversations name the agent that answers them.
+(objects it reads and writes), triggers, budgets, default workspace,
+runner policy and takeover policy. Conversations name the agent that answers them.
 
 - **Persistent assistants.** Triggers start runs without a person present:
   `Channel` messages (the embedder's ingress adapters deliver inbound
@@ -834,8 +834,10 @@ report by sealing results that the captain's runs see.
 - Budgets and cancellation flow down the task tree; usage and status roll up
   through the catalog. Agent-to-agent messages are records written into the
   recipient's conversation by the sender.
-- Placement of every run is the embedder's `Scheduler`; runners advertise
-  capacity in a map.
+- Placement of every run is the embedder's `Scheduler` (a host plug over
+  the C ABI and the daemon, answered asynchronously); runners advertise
+  capacity, installed and signed-in providers, a display name and their
+  pool in the `0ndb:runners` map.
 
 ## Moving between devices and runners
 
@@ -844,6 +846,45 @@ workspace, its mounted trees (checkpoint plus tail), its memory, and the
 provider's native session (exported into an object after each turn, imported
 by the next runner). A run moves by assignment; the new runner fetches only
 what it touches, tail first.
+
+Moving work to another device is intentional. A stopped runner is usually
+stopped on purpose, so when one goes away its work does not follow the next
+live runner by default:
+
+- **Takeover policy** `default | auto | never`, stored on the conversation's
+  catalog row, the agent and the workspace (most specific wins). Under
+  `default` a device runner's work goes *idle*: placement reports `idle`
+  with `last_runner`, the cut-off message stays where it was, and a normal
+  placement event lets UIs refresh. A pool runner's work becomes a
+  placement request naming that runner (`waiting_runner`); the scheduler
+  answers it, the reference answer being the same runner, whose sandbox
+  keeps the checkout and build caches, for the host to wake; a host may
+  name another runner. `auto` hands the work to the scheduler with the
+  runner excluded; `never` waits for the same runner. The policy covers
+  message runs, claims that were never taken up, queued intents and
+  scheduled runs (which fire on the runner that created them). Revival of a
+  runner's own cut-off turn after it restarts is not a move and always
+  proceeds.
+- **Placement** prefers the conversation's last runner (the newest
+  assignee, else the newest message's runner), and for a child conversation
+  with none of its own its parent's, so side chats see the same files. The
+  `Placement` handed to the scheduler carries `prefer` and `exclude`.
+- **Resume** is `assign(conversation, runner)` without a message: the
+  runtime assigns the cut-off message (a turn mid-flight continues on that
+  runner with full context) or the head, and moves the conversation's
+  schedules whose creator is gone. Assigning a pool's member id records a
+  request: the pool runner that last ran the conversation takes it, any
+  other waits for the host to assign a concrete runner.
+- **Runner directory** (`runners`, `subscribe.runners`): one entry per
+  device and one per pool, never per pool machine, with state `online`,
+  `offline` or `wakeable` (a member pool whose host can start or resume a
+  runner), providers installed and signed in, and whether it is the
+  conversation's current or last runner. Pushed on advert, presence and
+  placement changes; nothing polls.
+- **Sleep and wake.** A sleeping pool runner's lease lapses. On wake its
+  pool readmits it with an ephemeral lease token on its existing `Add` (see
+  Runner pools), without enrolling again and without a membership record;
+  its queued work runs once it is admitted.
 
 ## search
 

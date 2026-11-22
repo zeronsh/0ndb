@@ -330,6 +330,7 @@ pub struct Event {
     pub runner: Option<Id>,
     pub provider: String,
     pub since_ms: i64,
+    pub last_runner: Option<Id>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -340,6 +341,33 @@ pub struct Placement {
     pub runner: Option<Id>,
     pub provider: String,
     pub since_ms: i64,
+    pub last_runner: Option<Id>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Runner {
+    pub device: Id,
+    pub name: String,
+    pub kind: String,
+    pub state: String,
+    pub providers: Vec<String>,
+    pub signed_in: Vec<String>,
+    pub current: bool,
+    pub last: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Runners {
+    pub runners: Vec<Runner>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TakeoverPolicy {
+    pub policy: String,
+    pub effective: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

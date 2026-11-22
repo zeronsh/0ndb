@@ -214,6 +214,10 @@ daemon_main :: proc(args: ^Args) -> int {
 	opts.rt_cfg.homes = rt.Homes{data = d, home = _home_of}
 	opts.rt_cfg.default_provider = flag_string(args, "provider")
 	opts.rt_cfg.default_model = flag_string(args, "model")
+	opts.rt_cfg.name = flag_string(args, "name")
+	if len(opts.rt_cfg.name) == 0 {
+		opts.rt_cfg.name = sys_hostname(context.temp_allocator)
+	}
 	if st := api.stack_open(&d.s, ec, opts); st != .Ok {
 		if st == .Busy {
 			return report_error(.Busy, "another daemon is running for %s", d.home)
@@ -478,7 +482,7 @@ _conn_process :: proc(c: ^Conn) -> bool {
 			st_.tag = tag
 			st_.json = payload[8] & 1 != 0
 			st_.compact = payload[8] & 2 != 0
-			id, catalog, object, st := api.subscribe_raw(&d.s.a, payload[9:], st_.json, _on_sub, st_)
+			id, catalog, object, st := api.subscribe_raw(&d.s.a, payload[9:], st_.json, _on_sub, st_, _on_sub_payload)
 			st_.catalog = catalog
 			st_.object = object
 			if st != .Ok {
@@ -624,6 +628,16 @@ _on_sub :: proc(data: rawptr, id: u64, deltas: []eng.Delta) {
 	}
 	t := u64_bytes(s.tag)
 	_conn_push(c, .Deltas, t[:], api.encode_deltas_compact(deltas, s.object) if s.json && s.compact else api.encode_deltas(deltas, s.json))
+}
+
+@(private)
+_on_sub_payload :: proc(data: rawptr, id: u64, payload: []u8) {
+	s := (^Sub_Tag)(data)
+	if s.conn.dead {
+		return
+	}
+	t := u64_bytes(s.tag)
+	_conn_push(s.conn, .Deltas, t[:], payload)
 }
 
 @(private)

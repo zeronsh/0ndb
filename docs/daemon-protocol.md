@@ -160,13 +160,18 @@ plug is cancelled at once and the host receives `Plug_Cancel` for the request
 
 ## 5. Subscriptions
 
-`Subscribe(tag, flags, request)` takes one of two requests:
+`Subscribe(tag, flags, request)` takes one of three requests:
 
 - `{"op":"subscribe","object":O,"kind":"conversation"|"map"|"text"|"tree"}`:
   changes to one object.
 - `{"op":"subscribe.catalog","space":S}`: changes to the catalog of a space
   (the session list: every conversation, map, text and tree, with titles,
   status, activity, archived and pinned flags).
+- `{"op":"subscribe.runners","space":S[,"object":C]}`: the runner directory
+  of a space (or of conversation `C`, which adds `current` and `last`). Each
+  frame carries the whole `Runners` payload (the `runners` op's result), not
+  deltas, and is pushed when a runner's advert or presence changes, or when
+  `C`'s placement changes. Read the first state with `runners`.
 
 The daemon answers `Result(tag, ok)` (or an error with the usual payload),
 then sends `Deltas(tag, Deltas)` frames until `Unsubscribe(tag)`, which it
@@ -235,7 +240,7 @@ kinds by code, bit i for code i; absent means all. Each event is one
 Event := kind: enum event, space: id, object: id, device: id, tick: uvarint,
          length: ivarint, status: enum status, detail: str,
          state: enum placement, msg: rid, runner: id, provider: str,
-         since_ms: ivarint
+         since_ms: ivarint, last_runner: id
 ```
 
 Event codes: 0 connected, 1 disconnected, 2 durable, 3 uploaded,
@@ -246,7 +251,7 @@ Event codes: 0 connected, 1 disconnected, 2 durable, 3 uploaded,
 21 access_revoked, 22 runner_enrolled, 23 runner_anomaly,
 24 approval_requested, 25 login_done, 26 login_failed, 27 lease_lapsed. The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
-conversation's next run is, or that it waits for a runner), `presence`
+conversation's next run is; see "Placement" below), `presence`
 (device up or down, `tick` 1 or 0), `connected`/`disconnected` (relay link of
 a space), `approval_requested`, `login_done` and `login_failed` (sign-in),
 `access_revoked`. `durable` and `uploaded` fire once per committed tick and
@@ -254,6 +259,44 @@ per upload; a UI should leave them out of its mask (the Rust client does).
 Conversation status (idle, running, queued, awaiting_permission, ...)
 arrives as `status` deltas of the conversation subscription and as the row
 status in catalog deltas, not as events.
+
+Placement. `state` is one of `none` (the conversation never ran),
+`assigned` (`runner` will run `msg`), `running` (`runner` runs it), `idle`
+(nothing will move on its own: at rest, or `msg` was cut off because
+`last_runner` stopped and the takeover policy keeps the work there),
+`waiting_runner` (a placement request: `msg` waits for `runner`, a pool
+runner the host may wake or a pool, or for any runner when `runner` is
+null) and `placing` (the scheduler has not answered yet). An
+idle conversation continues on its last runner when that runner returns
+(the same runner revives its own cut-off turn after a restart) or wherever
+`assign(object, runner)` sends it.
+
+Takeover policy. `takeover.set(object, level, policy)` stores `default`,
+`auto` or `never` on a conversation (in its catalog row), an agent or a
+workspace; the most specific setting wins and `takeover.get` returns the
+stored and the effective value. Under `default` a device runner that goes
+away leaves its work idle; a pool runner that goes away leaves a placement
+request naming it (`waiting_runner`), which the scheduler answers (the
+reference answer is the same runner, for the host to wake; a host may name
+another). `auto` continues on another runner; `never` waits for the same
+runner. Revival on the same runner after a restart always proceeds, and
+scheduled runs fire on the runner that created them under the policy of
+their conversation. Placement prefers the conversation's last runner, and a
+child conversation's parent's runner when it has none of its own.
+
+Runner directory. `runners(space[, object])` lists every runner of the
+space for a device switcher: devices one per entry, each pool once (its
+`device` is the pool's member id and `name` its label). `Runner := device:
+id, name: str, kind: enum{device,pool}, state: enum{offline,online,wakeable},
+providers: strs, signed_in: strs, current: bool, last: bool`. A pool is
+`online` while any of its runners is, else `wakeable` while the pool is a
+member. `providers` lists the harnesses installed (a pool: offered by any of
+its runners) and `signed_in` those with credentials present. Resuming is
+`assign(object, runner)` without `msg`: a turn cut off mid-flight continues
+on `runner` with its full context, otherwise the next turn runs there, and
+the conversation's schedules whose creator is gone move with it. Assigning
+a pool records a placement request: the pool's runner that last ran the
+conversation takes it, any other needs the host to assign a concrete runner.
 
 ## 7. Recipes for a live UI
 
@@ -533,6 +576,7 @@ up exist only over the socket.
 |---|---|---|---|
 | 4 | `subscribe` | object: object, kind: enum conversation|map|text|tree | Deltas |
 | 5 | `subscribe.catalog` | space: id | Deltas |
+| 163 | `subscribe.runners` | space: id, object: object | Runners (whole payload per frame) |
 
 ### Accounts, devices, members and runner pools
 
@@ -628,7 +672,7 @@ up exist only over the socket.
 | 70 | `mount` | object: object, name: str, tree: id, line: id, path: str | Result |
 | 71 | `unmount` | object: object, name: str | Result |
 | 72 | `await` | object: object, tasks: ids, condition: enum any|all, deadline: uvarint, expr: str | Result |
-| 73 | `assign` | object: object, msg: rid, runner: id | Result |
+| 73 | `assign` | object: object, msg: rid, runner: id | Result (without `msg`: resume the conversation on `runner`, empty result) |
 | 74 | `redact` | object: object, msg: rid | Result |
 | 124 | `record` | object: object, source: str, external_id: str, sequence: uvarint, role: enum user|assistant|system|tool, parent: rid, blocks: blocks, status: enum open|done|interrupted|failed|cancelled, input: uvarint, output: uvarint, cache_read: uvarint, cache_write: uvarint, provider: str, model: str, native: str | receipt:enum msg:rid |
 | 131 | `land` | tree: object, from: str, into: str, dry: bool | landed:bool files:uvarint conflicts:strs |
@@ -674,7 +718,7 @@ up exist only over the socket.
 | 141 | `catalog.find` | space: id, text: str | rows:[CatalogRow] |
 | 142 | `object.uploaded` | object: object | uploaded:bool dropped:bool |
 | 101 | `catalog.usage` | object: object | Usage |
-| 102 | `catalog.set` | object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id | Result |
+| 102 | `catalog.set` | object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id, takeover: enum{default,auto,never} | Result |
 
 ### Search
 
@@ -707,6 +751,8 @@ up exist only over the socket.
 | 118 | `agent.remove` | object: object, tag: uvarint, element: bytes | {} |
 | 123 | `agent.resolve` | object: object, provider: str, model: str | AgentInfo |
 | 137 | `agent.actor` | agent: id | actor:id |
+| 160 | `takeover.get` | object: object, level: enum{conversation,agent,workspace} | policy: enum takeover, effective: enum takeover |
+| 161 | `takeover.set` | object: object, level: enum{conversation,agent,workspace}, policy: enum{default,auto,never} | {} |
 
 ### Runtime
 
@@ -726,6 +772,7 @@ up exist only over the socket.
 | 135 | `event.deliver` | space: id, agent: id, name: str, payload: str | {} |
 | 136 | `trigger.watch` | object: object | {} |
 | 139 | `placement` | object: object | Placement |
+| 162 | `runners` | space: id, object: object | runners:[Runner] |
 
 ### Daemon host ops (only over the socket)
 

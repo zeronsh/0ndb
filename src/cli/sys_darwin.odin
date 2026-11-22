@@ -1,5 +1,6 @@
 package main
 
+import "core:strings"
 import "core:sys/kqueue"
 import "core:sys/posix"
 import "../prim"
@@ -95,4 +96,16 @@ rss_bytes :: proc() -> i64 {
 
 idle_release :: proc() {
 	malloc_zone_pressure_relief(nil, 0)
+}
+
+sys_hostname :: proc(allocator := context.allocator) -> string {
+	buf: [256]u8
+	if posix.gethostname(raw_data(buf[:]), len(buf) - 1) != .OK {
+		return ""
+	}
+	n := 0
+	for n < len(buf) && buf[n] != 0 {
+		n += 1
+	}
+	return strings.clone(string(buf[:n]), allocator)
 }
