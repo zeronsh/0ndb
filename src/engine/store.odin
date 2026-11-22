@@ -504,6 +504,9 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		}
 		for &d in b.segs {
 			_publish(e, &d)
+			if d.kind == .File_Tree && d.length > 0 {
+				_content_durable(e, d.space, d.object, d.length)
+			}
 			if d.kind == .Conversation && d.length > 0 {
 				_draft_settle(e, d.object, d.length)
 			}

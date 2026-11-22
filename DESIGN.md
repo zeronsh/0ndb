@@ -1617,6 +1617,15 @@ Relay cost tracks the reachable information, not the activity. Items marked
   ids never change. The relay never reads below `base`: reads, tails and
   follows are clamped and preceded by a `Hollow` frame with `base` and
   `length`. Feed compaction keeps the hollow flag.
+- **Content uploads follow durability.** Each owned file tree keeps an upload
+  mark and a target in the registry (`ROOT_OWNED`). When the batch holding
+  tree records becomes durable the target rises to that length, whether or
+  not the space replicates yet; uploads always run from the mark to the
+  target and move the mark only when every blob in range is stored, and a
+  replication start resumes every tree whose target is past its mark. A tree
+  written while local-only is therefore uploaded in full on sign-in. Nothing
+  lowers a target: setting a mark keeps it, and the open-time audit clamps
+  both to the recovered stream.
 - **Content budget.** Large content is content-op (opaque) blobs: binaries
   and files over the mount's large limit. A device uploads such a blob, when
   it is not remote-backed, only while the space's budget allows
