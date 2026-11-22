@@ -98,15 +98,14 @@ view_descends :: proc(h: ^History, v: ^Text_View, b: ^crdt.Batch) -> bool {
 
 @(private)
 view_load :: proc(h: ^History, view: ^Text_View, lvs: []crdt.Lv) -> Error {
-	fshist.text_drop(&view.st)
 	full := view.full
-	view.stale = false
-	view.full = false
 	if view.cp == nil {
 		view.cp = make([dynamic]crdt.Op_Id, h.allocator)
 	}
-	clear(&view.cp)
 	if f, ok := h.files[view.inode]; ok && f.loaded && !full && crdt.frontier_eq(f.text.version[:], lvs) {
+		fshist.text_drop(&view.st)
+		view.stale = false
+		clear(&view.cp)
 		append(&view.cp, ..f.rec.cp_version[:])
 		if !f.dirty && len(f.new_refs) == 0 {
 			view.st = f.st
@@ -143,6 +142,10 @@ view_load :: proc(h: ^History, view: ^Text_View, lvs: []crdt.Lv) -> Error {
 		fshist.text_drop(&tmp.st)
 		return err
 	}
+	fshist.text_drop(&view.st)
+	view.stale = false
+	view.full = false
+	clear(&view.cp)
 	if tmp.from_cp {
 		append(&view.cp, ..tmp.rec.cp_version[:])
 	}
@@ -176,7 +179,7 @@ history_view_advance_ex :: proc(h: ^History, view: ^Text_View, target: Version, 
 		old = crdt.text_bytes(&view.text, context.temp_allocator)
 	}
 	if lerr := view_load(h, view, lvs[:]); lerr != .None {
-		return true, lerr
+		return false, lerr
 	}
 	if sink.insert != nil && sink.delete != nil {
 		nw := crdt.text_bytes(&view.text, context.temp_allocator)

@@ -7,6 +7,7 @@ import "../crdt"
 import "../fs"
 import "../fstree"
 import "../prim"
+import osync "../sync"
 
 Buffer_Id :: distinct u64
 
@@ -491,6 +492,17 @@ View_Reader :: struct {
 }
 
 @(private)
+_buffer_unavailable :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
+	b.dirty = true
+	if h.sp.repl_on {
+		for sg in h.segs {
+			osync.replicator_follow(&h.sp.repl, &h.scope, sg.device, h.name, 0, true)
+		}
+	}
+	return .Missing
+}
+
+@(private)
 _buffer_view_ready :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	_hist_ready(e, h) or_return
 	if b.hist != h.hist {
@@ -499,7 +511,9 @@ _buffer_view_ready :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	if b.view.stale {
 		st: Sink_State
 		crdt.delta_builder_init(&st.db, context.temp_allocator)
-		_ferr(fs.history_view_advance(h.hist, b.view, b.version[:], _sink(&st))) or_return
+		if aerr := fs.history_view_advance(h.hist, b.view, b.version[:], _sink(&st)); aerr != .None {
+			return _buffer_unavailable(e, b, h)
+		}
 		if st.db.steps > 0 {
 			b.dirty = true
 			return _buffer_emit(e, b, &st)
@@ -521,7 +535,9 @@ _buffer_advance :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	target := _buffer_target(b, h) or_return
 	st: Sink_State
 	crdt.delta_builder_init(&st.db, context.temp_allocator)
-	_ferr(fs.history_view_advance(h.hist, b.view, target, _sink(&st))) or_return
+	if aerr := fs.history_view_advance(h.hist, b.view, target, _sink(&st)); aerr != .None {
+		return _buffer_unavailable(e, b, h)
+	}
 	clear(&b.version)
 	append(&b.version, ..target)
 	if st.db.steps == 0 {
