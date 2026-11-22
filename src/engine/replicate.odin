@@ -499,6 +499,13 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		sp.connected = true
 		sp.attempt = false
 		sp.offline = false
+		for _, rt in sp.remote_trees {
+			if !rt.loaded {
+				rt.requested = false
+				rt.absent = false
+				rt.retries = 0
+			}
+		}
 		_fresh_waiters_wake(e, sp)
 		sp.backoff = 0
 		sp.refusals = 0
@@ -728,7 +735,18 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 				if !xok || x.loaded || x.epoch != epoch {
 					return
 				}
-				x.requested = false
+				if !_remote_tree_stalled(sp, x) {
+					x.retries = 0
+					x.requested = false
+				} else if x.retries < KEYS_RETRIES {
+					x.retries += 1
+					x.requested = false
+				} else {
+					_remote_tree_load(e, sp, x)
+					if !x.loaded {
+						return
+					}
+				}
 			} else {
 				rec.members[i].keys_epoch = epoch
 				_rec_put(e, id, &rec)
