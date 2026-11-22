@@ -632,8 +632,9 @@ _remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, e
 	}
 	if seg, ok := _keys_target(name); ok {
 		if rt := _remote_tree_by_keys(sp, device, name); rt != nil && !rt.loaded && epoch >= rt.epoch {
-			if epoch > rt.epoch || length > 0 {
+			if epoch > rt.epoch || length > rt.asked {
 				rt.requested = false
+				rt.absent = false
 			}
 			rt.epoch = epoch
 			_remote_tree_load(e, sp, rt)
@@ -705,7 +706,11 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 				if !xok || x.loaded || x.epoch != epoch {
 					return
 				}
+				if x.requested && osync.replicator_relay_length(&sp.repl, &x.scope, x.device, x.keys_name, x.epoch) <= x.asked {
+					return
+				}
 				x.requested = false
+				x.absent = false
 			} else {
 				rec.members[i].keys_epoch = epoch
 				_rec_put(e, id, &rec)
