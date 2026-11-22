@@ -5,7 +5,6 @@ import "core:crypto"
 import "../journal"
 import "../prim"
 
-CHECKPOINT_STREAM :: "ckpt/"
 CHECKPOINT_RECORD :: 1
 CHECKPOINT_TAIL :: 4096
 

@@ -1210,7 +1210,9 @@ relay) computes the same roster:
   per granted object. Credential type 3 carries up to 16 tokens for one
   space and grantee: `3 | n u8 | token × n | sign [32] | sig [64]` (type 2
   stays the single-token form). The relay authorizer verifies every token
-  and grants the union, keeping per-stream access per object. The CLI
+  and grants the union, keeping per-stream access per object; the
+  credential formats and the admitted stream set are specified in
+  `docs/relay-protocol.md` section 6.5 (`sync/cap_auth.odin`). The CLI
   daemon keeps every token of a space in its credentials file.
   `accept_share` reopens an already open guest space so the link
   re-authenticates with the new token.

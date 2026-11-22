@@ -103,7 +103,7 @@ Relay_Node :: struct {
 	rng:    Rng,
 	public: osync.Public_Key,
 	mauth:  osync.Member_Authorizer,
-	cauth:  eng.Cap_Authorizer,
+	cauth:  osync.Cap_Authorizer,
 }
 
 World_Stats :: struct {

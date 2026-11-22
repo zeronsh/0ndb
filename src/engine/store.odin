@@ -259,20 +259,7 @@ _rec_member :: proc(rec: ^Obj_Rec, device: prim.Id) -> int {
 
 @(private)
 _seg_name :: proc(kind: Kind, id: prim.Id, allocator := context.temp_allocator) -> string {
-	b := make([]u8, 1 + prim.ID_HEX_LEN, allocator)
-	switch kind {
-	case .Conversation:
-		b[0] = 'c'
-	case .Map:
-		b[0] = 'm'
-	case .Text:
-		b[0] = 't'
-	case .File_Tree:
-		b[0] = 'f'
-	}
-	h := prim.id_hex(id)
-	copy(b[1:], h[:])
-	return string(b)
+	return osync.object_segment_name(u8(kind), id, allocator)
 }
 
 @(private)
