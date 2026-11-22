@@ -982,6 +982,32 @@ checkpoint bundles, as before, plus:
   live connection of that device or answers `Undelivered` at once; it keeps
   no state beyond delivery and cannot read the payload, which the endpoints
   encrypt end to end. Cross-device search and sign-in approvals use it.
+- **Connection liveness.** Two mechanisms, neither of which wakes an idle
+  device:
+  - *Dead peers* are the kernel's job: every relay socket gets TCP keepalive
+    (idle 120 s, interval 30 s, 4 probes on Linux, macOS and Windows) and on
+    Linux `TCP_USER_TIMEOUT` 240 s, so a vanished relay, a half-open
+    connection or a dropped NAT mapping closes the link within minutes, idle
+    or not.
+  - *A relay that stops answering* is caught by the request deadline: while
+    the client awaits anything (Hello, an append's acknowledgement, a read,
+    list, probe, get, put, feed or account request) the replicator arms a
+    10 s tick, and a request that makes no progress for more than a full
+    tick while queued output is not draining fails the link with `Timeout`,
+    20 to 30 s after it was sent. The replicator then reconnects with
+    backoff and republishes unacknowledged appends from the durable journals.
+    With nothing awaited the tick is cancelled, so this is a heartbeat only
+    while requests are outstanding. A device that sends its first request
+    after a long idle is covered the same way.
+
+  Limitation, by design: an idle connection to a relay process that is
+  frozen while its kernel still acknowledges packets (stopped, or wedged
+  without crashing) is not noticed, since keepalive succeeds and nothing
+  is awaited. Live pushes (feed, presence, direct messages) stop until this
+  device sends a request or the relay recovers. Nothing is lost: every
+  write is in a durable journal and the feed resumes from its cursor, and a
+  relay in that state serves no one. Closing the gap would need a ping
+  while idle, which the idle rule rules out.
 
 ### Membership and key epochs
 
