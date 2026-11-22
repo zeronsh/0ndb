@@ -13,7 +13,8 @@ ROLE_NAMES := [5]string{"", "user", "assistant", "system", "tool"}
 BLOCK_NAMES := [12]string{"", "text", "reasoning", "tool_call", "tool_result", "image", "error", "notice", "permission", "permission_answer", "question", "file"}
 SEAL_NAMES := [5]string{"open", "done", "interrupted", "failed", "cancelled"}
 CONVO_STATUS_NAMES := [8]string{"idle", "running", "queued", "awaiting_permission", "failed", "interrupted", "waiting", "reviving"}
-OPEN_STATE_NAMES := [2]string{"running", "revive"}
+OPEN_STATE_NAMES := [3]string{"running", "revive", "held"}
+#assert(len(OPEN_STATE_NAMES) == len(convo.Open_State))
 CONDITION_NAMES := [3]string{"", "any", "all"}
 MODE_NAMES := [2]string{"end_to_end", "transparent"}
 UNIT_NAMES := [2]string{"lines", "bytes"}
