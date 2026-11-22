@@ -414,7 +414,9 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
 	if pa.hold && !n.disk.dead {
 		fs.scope_write_base(pa.scope, pa.name, from)
-		fs.scope_write_end(pa.scope, pa.name)
+		if rng_chance(&w.rng, 1, 2) {
+			fs.scope_write_end(pa.scope, pa.name)
+		}
 	}
 	serr := fs.Error.None
 	if !n.disk.dead {
