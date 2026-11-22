@@ -207,6 +207,26 @@ journal_abort :: proc(j: ^Journal) {
 	}
 }
 
+Pending_Mark :: struct {
+	durable: i64,
+	pending: int,
+	links:   int,
+}
+
+journal_pending_mark :: proc "contextless" (j: ^Journal) -> Pending_Mark {
+	return {j.durable, len(j.pending), len(j.links)}
+}
+
+journal_rewind :: proc(j: ^Journal, m: Pending_Mark) -> bool {
+	journal_abort(j)
+	if j.durable != m.durable || len(j.pending) < m.pending || len(j.links) < m.links {
+		return false
+	}
+	resize(&j.pending, m.pending)
+	resize(&j.links, m.links)
+	return true
+}
+
 journal_commit :: proc(j: ^Journal) -> Error {
 	if j.fd < 0 {
 		return .Invalid

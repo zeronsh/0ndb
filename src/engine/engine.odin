@@ -211,6 +211,7 @@ Config :: struct {
 	content_budget:  i64,
 	always_on:       bool,
 	holder_budget:   i64,
+	history_fault:   fs.Persist_Fault,
 	user:            rawptr,
 }
 

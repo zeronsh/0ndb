@@ -689,9 +689,17 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		actors: [dynamic]prim.Id,
 	}
 	present := make(map[string]Seen, context.temp_allocator)
-	collect :: proc(present: ^map[string]Seen, data: []u8, spans: []crdt_span, file: string) {
+	Twice :: struct {
+		file: string,
+		tok:  string,
+	}
+	twice := make([dynamic]Twice, context.temp_allocator)
+	collect :: proc(present: ^map[string]Seen, twice: ^[dynamic]Twice, data: []u8, spans: []crdt_span, file: string) {
 		toks := parse_tokens(data)
 		for t in toks {
+			if old, dup := present[t.text]; dup && old.file == file {
+				append(twice, Twice{file, t.text})
+			}
 			s := Seen{file = file, actors = make([dynamic]prim.Id, context.temp_allocator)}
 			at := 0
 			for sp in spans {
@@ -731,7 +739,7 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		if total != len(data) {
 			world_fail(w, "attribution: text %s on %s has %d bytes but spans cover %d", id_short(ob.o.id), n.name, len(data), total)
 		}
-		collect(&present, data, spans[:], "")
+		collect(&present, &twice, data, spans[:], "")
 	} else {
 		names, _ := eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
 		for nm in names {
@@ -744,7 +752,7 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			if total != len(data) {
 				world_fail(w, "attribution: %s/%s on %s has %d bytes but spans cover %d", id_short(ob.o.id), nm, n.name, len(data), total)
 			}
-			collect(&present, data, spans, nm)
+			collect(&present, &twice, data, spans, nm)
 		}
 	}
 	merged := merged_files(w, oi, true) if ob.kind == .Tree else nil
@@ -826,6 +834,14 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 					world_fail(w, "model: token %s from a failed op is present on %s", tok, n.name)
 				}
 			}
+		}
+	}
+	for d in twice {
+		if merged != nil && file_base(d.file) in merged {
+			continue
+		}
+		if _token_op(m, oi, d.tok) != nil {
+			world_fail(w, "exactly-once: token %s appears more than once in %s/%s on %s", d.tok, id_short(ob.o.id), d.file, n.name)
 		}
 	}
 	keys := make([dynamic]string, context.temp_allocator)

@@ -489,7 +489,16 @@ equal in both directions.
   the shadow's inode ids refer to) is committed into the pack only once that
   batch completes, so it is durable one batch later; the history counts a
   mark as settled when that later batch completes too, and mount images wait
-  for settled, not for durable. Recovery from the mount's own intents (at
+  for settled, not for durable. A local commit happens once its journal
+  records are sealed. A failure before that drops the records it appended (and
+  the actor ids they introduced) and reports the batch not committed; a
+  failure after it (apply, line, persisting the derived state) never reports
+  failure, because the caller would ingest the same disk change again.
+  Instead the history reloads from its sealed state and replays the journal,
+  keeping its in-memory actor interning order, so the batch is applied once.
+  Derived state that failed to persist is never sealed partially (a seal
+  first finishes the persist), and the history does not settle while a
+  persist or a reload is outstanding. Recovery from the mount's own intents (at
   open, or when a pass retries an import that did not finish) goes through
   the same wait: the intents stay in the saved state until the image that
   covers them is written. The mount state also records the shadow's

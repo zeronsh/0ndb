@@ -374,6 +374,15 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 	return true
 }
 
+_agent_scope_close :: proc(w: ^World, n: ^Node, s: ^fs.Scope) -> fs.Error {
+	if w.cfg.persist_fault && rng_chance(&w.fault_rng, 1, 3) {
+		n.persist_fail = 1
+	}
+	err := fs.scope_close(n.reg, s)
+	n.persist_fail = 0
+	return err
+}
+
 agent_finish :: proc(w: ^World, n: ^Node) {
 	m := &w.model
 	pa := pop(&n.agent_pending)
@@ -435,7 +444,7 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	notes := _base_notes(w)
 	serr := fs.Error.None
 	if !n.disk.dead {
-		serr = fs.scope_close(n.reg, pa.scope)
+		serr = _agent_scope_close(w, n, pa.scope)
 		_forget_scope(w, n, pa.scope)
 	}
 	if pinned && err == .None && serr == .None && !n.disk.dead && _base_notes(w) == notes {
@@ -529,7 +538,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), atomic)
 	serr := fs.Error.None
 	if agent && !n.disk.dead {
-		serr = fs.scope_close(n.reg, scope)
+		serr = _agent_scope_close(w, n, scope)
 		_forget_scope(w, n, scope)
 	}
 	world_note(w, "%s %s(actor %s) %s %s/%s replaced %v wrote %v -> %v %v", n.name, "agent" if agent else "person", id_short(op.actor), "overwrite" if overwrite else "append", id_short(m.objs[sm.oi].o.id), name, op.deletes[:], op.tokens[:], err, serr)

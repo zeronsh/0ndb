@@ -391,7 +391,7 @@ _hist_open :: proc(h: ^Handle) -> Error {
 @(private)
 _hist_options :: proc(h: ^Handle) -> fs.History_Options {
 	e := h.e
-	o := fs.History_Options{clock = _fs_clock(e), random = e.cfg.random}
+	o := fs.History_Options{clock = _fs_clock(e), random = e.cfg.random, fault = e.cfg.history_fault}
 	if h.sp.repl_on {
 		o.keep_at_least, _ = osync.replicator_floor(&h.sp.repl, &h.scope, h.name, 0)
 	}

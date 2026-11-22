@@ -72,6 +72,12 @@ History_Options :: struct {
 	clock:         Clock,
 	random:        prim.Random,
 	hold:          Hold,
+	fault:         Persist_Fault,
+}
+
+Persist_Fault :: struct {
+	data: rawptr,
+	fail: proc(data: rawptr) -> bool,
 }
 
 @(private)
@@ -123,6 +129,8 @@ History :: struct {
 	lvidx_n:    u64,
 	rebuilding: bool,
 	own_wait:   bool,
+	persist_due: bool,
+	keep_actors: [dynamic]prim.Id,
 	replay_repl: map[i64]i64,
 	own_next:   map[prim.Id]u64,
 	own_paused: i64,
@@ -388,6 +396,10 @@ history_fp :: proc(h: ^History) -> [3]u64 {
 }
 
 history_durable :: proc(h: ^History, mark: u64) -> Error {
+	perr: Error
+	if h.awake && h.persist_due {
+		perr = history_persist(h)
+	}
 	prev := h.durable
 	if mark > h.durable {
 		h.durable = min(mark, h.mark)
@@ -410,7 +422,7 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 		h.kv_upto = h.durable
 	} else if h.kv_at != 0 {
 		h.kv_upto = h.durable
-	} else {
+	} else if !h.persist_due && h.keep_actors == nil {
 		h.settled = h.durable
 	}
 	err: Error
@@ -419,7 +431,7 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 			err = e
 		}
 	}
-	return err
+	return err if err != .None else perr
 }
 
 @(private)
@@ -451,6 +463,8 @@ history_commit_groups :: proc(h: ^History) -> (committed: bool, err: Error) {
 
 history_close :: proc(h: ^History) {
 	history_sleep(h)
+	delete(h.keep_actors)
+	h.keep_actors = nil
 	kv_groups_free(&h.kv, &h.held, h.allocator)
 	delete(h.own_next)
 	h.own_next = nil
@@ -520,6 +534,11 @@ history_wake :: proc(h: ^History) -> Error {
 	h.lvidx_n = u64(lsize) / LVIDX_REC
 	h.awake = true
 	err := load_state(h)
+	if err == .None {
+		for id in h.keep_actors {
+			crdt.graph_intern(&h.g, id)
+		}
+	}
 	if err == .None || err == .Corrupt {
 		ahead := err == .Corrupt
 		if !ahead {
@@ -546,6 +565,8 @@ history_wake :: proc(h: ^History) -> Error {
 		return err
 	}
 	h.mark_fp = history_fp(h)
+	delete(h.keep_actors)
+	h.keep_actors = nil
 	return .None
 }
 
@@ -608,6 +629,9 @@ history_interning_kept :: proc(h: ^History) -> (kept: bool, err: Error) {
 }
 
 history_kv_commit :: proc(h: ^History) -> Error {
+	if h.persist_due {
+		return history_persist(h)
+	}
 	if len(h.kv.order) == 0 {
 		return .None
 	}
@@ -777,6 +801,7 @@ history_sleep :: proc(h: ^History) {
 		h.blob_data = nil
 	}
 	h.awake = false
+	h.persist_due = false
 }
 
 history_heads :: proc(h: ^History, allocator := context.allocator) -> Version {
@@ -973,16 +998,32 @@ history_commit_import :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) =
 	if lname, has_line := line.?; has_line {
 		lkey, lver = line_after(h, lname, parents[:], crdt.Op_Id{b.actor, b.seq + u64(crdt.batch_len(b)) - 1}) or_return
 	}
-	off = journal_batch(h, b, REC_IMPORT, lver == nil) or_return
-	if lver != nil {
-		journal_line(h, line.?, lver) or_return
+	jm := journal.journal_pending_mark(&h.journal)
+	dn := len(h.dict.ids)
+	off, err = journal_batch(h, b, REC_IMPORT, lver == nil)
+	if err == .None && lver != nil {
+		err = journal_line(h, line.?, lver)
 	}
-	import_apply(h, b, 0, u64(off)) or_return
+	if err != .None {
+		if journal_unwind(h, jm, dn) {
+			return 0, err
+		}
+		history_reload(h)
+		return off, .None
+	}
+	if import_apply(h, b, 0, u64(off)) != .None {
+		history_reload(h)
+		return off, .None
+	}
 	history_own_applied(h)
-	if lver != nil {
-		kv_put(&h.kv, lkey, lver) or_return
+	if lver != nil && kv_put(&h.kv, lkey, lver) != .None {
+		history_reload(h)
+		return off, .None
 	}
-	return off, history_persist(h)
+	if history_persist(h) != .None {
+		history_reload(h)
+	}
+	return off, .None
 }
 
 @(private)
@@ -1072,16 +1113,54 @@ history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = 
 	if has_line {
 		lkey, lver = line_after(h, lname, parents[:], crdt.Op_Id{b.actor, b.seq + u64(n) - 1}) or_return
 	}
-	o := journal_batch(h, b, REC_BATCH, lver == nil) or_return
-	if lver != nil {
-		journal_line(h, lname, lver) or_return
+	jm := journal.journal_pending_mark(&h.journal)
+	dn := len(h.dict.ids)
+	o, jerr := journal_batch(h, b, REC_BATCH, lver == nil)
+	if jerr == .None && lver != nil {
+		jerr = journal_line(h, lname, lver)
 	}
-	apply_batch(h, b, 0, u64(o)) or_return
+	if jerr != .None {
+		if journal_unwind(h, jm, dn) {
+			return 0, jerr
+		}
+		history_reload(h)
+		return o, .None
+	}
+	if apply_batch(h, b, 0, u64(o)) != .None {
+		history_reload(h)
+		return o, .None
+	}
 	history_own_applied(h)
-	if lver != nil {
-		kv_put(&h.kv, lkey, lver) or_return
+	if lver != nil && kv_put(&h.kv, lkey, lver) != .None {
+		history_reload(h)
+		return o, .None
 	}
-	return o, history_persist(h)
+	if history_persist(h) != .None {
+		history_reload(h)
+	}
+	return o, .None
+}
+
+@(private)
+journal_unwind :: proc(h: ^History, jm: journal.Pending_Mark, dn: int) -> bool {
+	if !journal.journal_rewind(&h.journal, jm) {
+		return false
+	}
+	for len(h.dict.ids) > dn {
+		delete_key(&h.dict.index, pop(&h.dict.ids))
+	}
+	return true
+}
+
+@(private)
+history_reload :: proc(h: ^History) {
+	if h.keep_actors == nil {
+		h.keep_actors = make([dynamic]prim.Id, h.allocator)
+	}
+	clear(&h.keep_actors)
+	append(&h.keep_actors, ..h.g.actors[:])
+	history_sleep(h)
+	history_wake(h)
 }
 
 history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent) -> Error {
@@ -1400,6 +1479,7 @@ admit_import :: proc(h: ^History, si: u32, off: i64, body: []u8, dict: ^crdt.Act
 
 history_persist :: proc(h: ^History) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	h.persist_due = true
 	buf := make([dynamic]u8, context.temp_allocator)
 	keys := make([dynamic]crdt.Page_Key, context.temp_allocator)
 	crdt.graph_dirty(&h.g, &keys)
@@ -1444,6 +1524,9 @@ history_persist :: proc(h: ^History) -> Error {
 		}
 	}
 	fstree.mark_persisted(&h.tree)
+	if f := h.opts.fault; f.fail != nil && f.fail(f.data) {
+		return .Io
+	}
 	persist_moves(h) or_return
 	pins_persist(h) or_return
 	for id in sorted_inodes(h.files) {
@@ -1472,6 +1555,7 @@ history_persist :: proc(h: ^History) -> Error {
 	}
 	prim.write_uvarint(&w, h.moves_count)
 	kv_put(&h.kv, transmute([]u8)string("s"), buf[:]) or_return
+	h.persist_due = false
 	return history_kv_commit(h)
 }
 
@@ -2317,8 +2401,11 @@ checkpoint_due :: proc(f: ^File_State) -> bool {
 
 @(private)
 persist_file :: proc(h: ^History, id: fstree.Inode_Id, f: ^File_State) -> Error {
-	for ref in f.new_refs {
-		write_op_ref(h, id, f.rec.ops, ref) or_return
+	for ref, i in f.new_refs {
+		if e := write_op_ref(h, id, f.rec.ops, ref); e != .None {
+			remove_range(&f.new_refs, 0, i)
+			return e
+		}
 		f.rec.ops += 1
 	}
 	clear(&f.new_refs)
@@ -2405,14 +2492,20 @@ persist_moves :: proc(h: ^History) -> Error {
 	if len(h.moves) == 0 {
 		return .None
 	}
-	for m in h.moves {
+	for m, i in h.moves {
 		chunk := h.moves_count / MOVES_CHUNK
 		key := moves_key(chunk)
-		data, _ := kv_get(&h.kv, key, context.temp_allocator) or_return
+		data, _, gerr := kv_get(&h.kv, key, context.temp_allocator)
 		buf := make([dynamic]u8, 0, len(data) + 32, context.temp_allocator)
 		append(&buf, ..data)
 		fshist.encode_move(&buf, m)
-		kv_put(&h.kv, key, buf[:]) or_return
+		if gerr == .None {
+			gerr = kv_put(&h.kv, key, buf[:])
+		}
+		if gerr != .None {
+			remove_range(&h.moves, 0, i)
+			return gerr
+		}
 		h.moves_count += 1
 	}
 	clear(&h.moves)
