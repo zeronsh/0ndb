@@ -7,7 +7,6 @@ import "core:strconv"
 import "core:sync"
 import "core:testing"
 import "../../src/convo"
-import omap "../../src/map"
 import eng "../../src/engine"
 import "../../src/prim"
 import osync "../../src/sync"
@@ -1587,7 +1586,7 @@ _leave_case :: proc(w: ^World) {
 		return
 	}
 	_settle(w, 3000)
-	x_row := _own_key_row(w, M_X, o.id)
+	x_row := own_key_row(w, M_X, o.id)
 	if len(x_row) == 0 {
 		_fail(w, "leave: n%d has no own key tree row for the conversation it wrote to", M_X)
 		return
@@ -1610,25 +1609,4 @@ _leave_case :: proc(w: ^World) {
 	}
 	_leaver_gone(w, M_D, sid, o, secret, d_disk, "device-leave", true)
 	_converged(w, sid, {M_A, M_C}, "after leave")
-}
-
-@(private = "file")
-_own_key_row :: proc(w: ^World, idx: int, object: prim.Id) -> []u8 {
-	n := w.nodes[idx]
-	context = instance_context(&n.inst)
-	defer node_after(n)
-	db: omap.Db
-	if omap.db_open(&db, eng.vfs(&n.e), fmt.tprintf("%s/registry", n.e.pack_root), context.temp_allocator) != .None {
-		return nil
-	}
-	defer omap.db_close(&db)
-	key: [17]u8
-	o := object
-	copy(key[:16], o[:])
-	key[16] = 'k'
-	v, found, err := omap.db_get(&db, 0, key[:], w.allocator)
-	if err != .None || !found {
-		return nil
-	}
-	return v
 }

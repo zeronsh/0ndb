@@ -842,6 +842,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	e.settling = false
 	_spaces_settle(e)
 	_trees_release(e)
+	_registry_scrub(e)
 	_durable_begin(e)
 	if e.pack_more {
 		e.settle_timer = prim.timer(e.loop, 0, e, _on_settle)
