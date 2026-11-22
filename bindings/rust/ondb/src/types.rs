@@ -602,3 +602,170 @@ pub struct RecordArgs {
     pub provider: String,
     pub model: String,
 }
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Register {
+    pub tag: u64,
+    pub hlc: u64,
+    pub by: Option<Id>,
+    pub value: String,
+}
+
+impl Register {
+    pub fn bytes(&self) -> Vec<u8> {
+        crate::codec::unhex(&self.value).unwrap_or_default()
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes()).into_owned()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Element {
+    pub tag: u64,
+    pub value: String,
+    pub live: u64,
+}
+
+impl Element {
+    pub fn bytes(&self) -> Vec<u8> {
+        crate::codec::unhex(&self.value).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Counter {
+    pub tag: u64,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Entry {
+    pub key: String,
+    pub registers: Vec<Register>,
+    pub elements: Vec<Element>,
+    pub counters: Vec<Counter>,
+}
+
+impl Entry {
+    pub fn key_bytes(&self) -> Vec<u8> {
+        crate::codec::unhex(&self.key).unwrap_or_default()
+    }
+
+    pub fn register(&self, tag: u64) -> Option<&Register> {
+        self.registers.iter().filter(|r| r.tag == tag).max_by_key(|r| r.hlc).filter(|r| !r.value.is_empty())
+    }
+
+    pub fn elements(&self, tag: u64) -> impl Iterator<Item = &Element> {
+        self.elements.iter().filter(move |e| e.tag == tag && e.live > 0)
+    }
+
+    pub fn counter(&self, tag: u64) -> i64 {
+        self.counters.iter().find(|c| c.tag == tag).map(|c| c.value).unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MapGet {
+    pub found: bool,
+    pub entry: Entry,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MapScan {
+    pub rows: Vec<Entry>,
+    pub more: bool,
+    pub next: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub tag: u64,
+    pub value: Vec<u8>,
+}
+
+impl Field {
+    pub fn bytes(tag: u64, value: &[u8]) -> Field {
+        Field { tag, value: value.to_vec() }
+    }
+
+    pub fn text(tag: u64, value: &str) -> Field {
+        Field { tag, value: value.as_bytes().to_vec() }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Text {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Span {
+    pub lo: u64,
+    pub hi: u64,
+    pub line_lo: u64,
+    pub line_hi: u64,
+    pub actor: Option<Id>,
+    pub seq: u64,
+    pub op_actor: Option<Id>,
+    pub op_seq: u64,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Spans {
+    pub spans: Vec<Span>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Blame {
+    pub text: String,
+    pub spans: Vec<Span>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TreeList {
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CatalogRows {
+    pub rows: Vec<CatalogRow>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Device {
+    pub device: Option<Id>,
+    pub kind: String,
+    pub method: String,
+    pub spaces: u64,
+    pub removed: bool,
+    #[serde(rename = "self")]
+    pub this_device: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Devices {
+    pub devices: Vec<Device>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SearchMode {
+    pub mode: String,
+}

@@ -1,5 +1,6 @@
 use serde_json::{json, Map, Value};
 
+use crate::codec::hex;
 use crate::conn::{Client, Pending, SubKind, Subscription};
 use crate::types::*;
 
@@ -310,6 +311,107 @@ impl Client {
 
     pub fn tree_create(&self, space: &str, title: &str) -> Pending<Created> {
         self.call(&json!({"op": "tree.create", "space": space, "title": title}))
+    }
+
+    pub fn subscribe_object(&self, object: &str, kind: &str) -> Pending<Subscription> {
+        self.subscribe(&json!({"op": "subscribe", "object": object, "kind": kind}), false)
+    }
+
+    pub fn map_create(&self, space: &str, title: &str) -> Pending<Created> {
+        self.call(&json!({"op": "map.create", "space": space, "title": title}))
+    }
+
+    pub fn map_get(&self, object: &str, key: &[u8]) -> Pending<MapGet> {
+        self.call(&json!({"op": "map.get", "object": object, "key": hex(key)}))
+    }
+
+    pub fn map_scan(&self, object: &str, prefix: &[u8], after: Option<&str>, limit: u64) -> Pending<MapScan> {
+        let mut m = Map::new();
+        m.insert("op".into(), "map.scan".into());
+        m.insert("object".into(), object.into());
+        m.insert("prefix".into(), hex(prefix).into());
+        if limit > 0 {
+            m.insert("limit".into(), limit.into());
+        }
+        put(&mut m, "after", after.filter(|a| !a.is_empty()));
+        self.call(&Value::Object(m))
+    }
+
+    pub fn map_set(&self, object: &str, key: &[u8], fields: &[Field]) -> Pending<WriteResult> {
+        let fs: Vec<Value> = fields.iter().map(|f| json!({"tag": f.tag, "value": hex(&f.value)})).collect();
+        self.call(&json!({"op": "map.set", "object": object, "key": hex(key), "fields": fs}))
+    }
+
+    pub fn map_delete(&self, object: &str, key: &[u8], tags: &[u64]) -> Pending<WriteResult> {
+        self.call(&json!({"op": "map.delete", "object": object, "key": hex(key), "tags": tags}))
+    }
+
+    pub fn map_add(&self, object: &str, key: &[u8], tag: u64, element: &[u8]) -> Pending<WriteResult> {
+        self.call(&json!({"op": "map.add", "object": object, "key": hex(key), "tag": tag, "element": hex(element)}))
+    }
+
+    pub fn map_remove(&self, object: &str, key: &[u8], tag: u64, element: &[u8]) -> Pending<WriteResult> {
+        self.call(&json!({"op": "map.remove", "object": object, "key": hex(key), "tag": tag, "element": hex(element)}))
+    }
+
+    pub fn map_redact(&self, object: &str, key: &[u8]) -> Pending<Ack> {
+        self.call(&json!({"op": "map.redact", "object": object, "key": hex(key)}))
+    }
+
+    pub fn text_read(&self, object: &str) -> Pending<Text> {
+        self.call(&json!({"op": "text.read", "object": object}))
+    }
+
+    pub fn text_spans(&self, object: &str) -> Pending<Spans> {
+        self.call(&json!({"op": "text.spans", "object": object}))
+    }
+
+    pub fn text_edit(&self, object: &str, pos: u64, remove: u64, insert: &str) -> Pending<WriteResult> {
+        self.call(&json!({"op": "text.edit", "object": object, "pos": pos, "remove": remove, "insert": insert}))
+    }
+
+    pub fn text_redact(&self, object: &str, pos: u64, len: u64) -> Pending<Ack> {
+        self.call(&json!({"op": "text.redact", "object": object, "pos": pos, "len": len}))
+    }
+
+    pub fn tree_read(&self, object: &str, path: &str) -> Pending<Text> {
+        self.call(&json!({"op": "tree.read", "object": object, "path": path}))
+    }
+
+    pub fn tree_list(&self, object: &str, path: &str) -> Pending<TreeList> {
+        self.call(&json!({"op": "tree.list", "object": object, "path": path}))
+    }
+
+    pub fn tree_write(&self, object: &str, path: &str, text: &str) -> Pending<Ack> {
+        self.call(&json!({"op": "tree.write", "object": object, "path": path, "text": text}))
+    }
+
+    pub fn tree_remove(&self, object: &str, path: &str) -> Pending<Ack> {
+        self.call(&json!({"op": "tree.remove", "object": object, "path": path}))
+    }
+
+    pub fn tree_blame(&self, object: &str, path: &str) -> Pending<Blame> {
+        self.call(&json!({"op": "tree.blame", "object": object, "path": path}))
+    }
+
+    pub fn tree_sync(&self, object: &str, root: &str) -> Pending<Ack> {
+        self.call(&json!({"op": "tree.sync", "object": object, "root": root}))
+    }
+
+    pub fn catalog_find(&self, space: &str, text: &str) -> Pending<CatalogRows> {
+        self.call(&json!({"op": "catalog.find", "space": space, "text": text}))
+    }
+
+    pub fn account_devices(&self) -> Pending<Devices> {
+        self.call(&json!({"op": "account.devices"}))
+    }
+
+    pub fn search_mode(&self, space: &str, mode: Option<&str>) -> Pending<SearchMode> {
+        let mut m = Map::new();
+        m.insert("op".into(), "search.mode".into());
+        m.insert("space".into(), space.into());
+        put(&mut m, "mode", mode);
+        self.call(&Value::Object(m))
     }
 
     pub fn object_uploaded(&self, object: &str) -> Pending<Uploaded> {

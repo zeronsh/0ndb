@@ -216,6 +216,8 @@
  *                 code: str, no_approver: bool (account fields are empty
  *                 when signed_in is false, code when waiting is false)
  *   Approval   := device: id, code: str, label: str, at: ivarint
+ *   Device     := device: id, kind: enum member_kind, method: enum enroll,
+ *                 spaces: uvarint, removed: bool, self: bool
  *   Span       := lo: uvarint, hi: uvarint, line_lo: uvarint,
  *                 line_hi: uvarint, actor: id, seq: uvarint, op_actor: id,
  *                 op_seq: uvarint, redacted: bool
