@@ -972,6 +972,10 @@ _undo_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, g: ^Undo_Group) -> (inve
 					if !own {
 						missing := crdt.Op_Id{r.id.actor, cur}
 						p, aerr := crdt.anchor_resolve(text, gr, &b.view.log, crdt.Anchor{id = missing, bias = .Before})
+						if aerr == .Missing_Ops {
+							fp, ferr := fs.history_view_anchor_full(b.hist, b.view, crdt.Anchor{id = missing, bias = .Before})
+							p, aerr = fp, .None if ferr == .None else .Unknown
+						}
 						if aerr == .None && !crdt.graph_redacted_any(gr, missing.actor, missing.seq, int(until - cur)) {
 							data := make([]u8, int(until - cur), context.temp_allocator)
 							got := fs.history_op_content(b.hist, missing, data)
@@ -1118,7 +1122,13 @@ _resolve_one :: proc(b: ^Buffer, a: Anchor) -> int {
 		return 0 if a.offset == 0 else _length(b)
 	}
 	p, err := crdt.anchor_resolve(&b.view.text, &b.hist.g, &b.view.log, a)
-	if err != .None {
+	if err == .Missing_Ops {
+		fp, ferr := fs.history_view_anchor_full(b.hist, b.view, a)
+		if ferr != .None {
+			return -1
+		}
+		p = fp
+	} else if err != .None {
 		return -1
 	}
 	return _to_units(b, p)

@@ -837,7 +837,10 @@ anchor_resolve :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, a: Anchor) -> (int, 
 		return 0, .Unknown
 	}
 	i := log_find(log, lv)
-	if i >= len(log.entries) || log.entries[i].lv > lv || !is_insert(log.entries[i].kind) {
+	if i >= len(log.entries) || log.entries[i].lv > lv {
+		return 0, .Missing_Ops
+	}
+	if !is_insert(log.entries[i].kind) {
 		return 0, .Unknown
 	}
 	m := Merge {
