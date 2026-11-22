@@ -1,5 +1,7 @@
 package rt
 
+import "base:runtime"
+
 import "core:slice"
 import "../agent"
 import "../convo"
@@ -11,6 +13,10 @@ import "../odb"
 import "../prim"
 
 REVIVE_PROMPT :: "Your previous turn was cut off by a restart of the machine running you. Continue the task from exactly where you left off; do not repeat work that is already done."
+
+RESUME_PROMPT :: "Your previous turn was paused because the folder was switched to another branch. It is back on the branch you were working on; continue the task from exactly where you left off and do not repeat work that is already done."
+
+RESUME_MOVED_PROMPT :: "Your previous turn was paused because the folder was switched to another branch. It is back on the branch you were working on, but the branch moved while you were paused (new commits or a reset), so re-read any file you rely on before changing it; then continue the task from where you left off."
 
 evaluate :: proc(r: ^Runtime, o: Object) {
 	context = eng.context_for(r.e)
@@ -44,6 +50,9 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	if _revive_pending(r, o, v) {
+		return
+	}
+	if ent, held := state_run_get(r, o); held && ent.hold != 0 && run_find(r, o) == nil {
 		return
 	}
 	if !runners_loaded(r, o, true) {
@@ -330,7 +339,7 @@ _on_renew :: proc(l: ^prim.Loop, data: rawptr) {
 		return
 	}
 	if w := _writer(run); w != nil {
-		if _, err := convo.writer_claim(w, run.user, r.cfg.lease_ms, run.lines); err == .Not_Assigned {
+		if _, err := convo.writer_claim(w, run.user, r.cfg.lease_ms, run.lines, run.bound); err == .Not_Assigned {
 			run.superseded = true
 			run_notice(run, "this turn was reassigned to another runner")
 			run_interrupt(run)
@@ -804,7 +813,9 @@ start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
 		}
 	}
 	lines := _new_lines(r, o, run)
-	claim, cerr := convo.writer_claim(w, user, r.cfg.lease_ms, lines)
+	run.bound = _bound_lines(r, o, run.alloc)
+	eng.catalog_lines(r.e, o, convo.binds_encode(run.bound))
+	claim, cerr := convo.writer_claim(w, user, r.cfg.lease_ms, lines, run.bound)
 	if cerr != .None {
 		_run_free(run)
 		return .Not_Assigned if cerr == .Not_Assigned else .Engine
@@ -900,7 +911,7 @@ _ensure_reply :: proc(run: ^Run, files: []convo.File_Delta) -> Error {
 	}
 	run.reply = reply
 	run_raw_owner(run)
-	state_run_put(r, Run_Entry{object = o, user = run.user, reply = run.reply, claim = run.claim, agent = run.ai.object.id, lines = lines_encode(run.lines)})
+	state_run_put(r, Run_Entry{object = o, user = run.user, reply = run.reply, claim = run.claim, agent = run.ai.object.id, lines = lines_encode(run.lines), bound = convo.binds_encode(run.bound)})
 	eng.touched(r.e, o)
 	eng.catalog_usage(r.e, o, {})
 	return .None
@@ -1038,6 +1049,43 @@ _new_lines :: proc(r: ^Runtime, o: Object, run: ^Run) -> []convo.Line {
 		out[i] = convo.Line{mount = clone(m.name, run.alloc), line = new_id(r)}
 	}
 	return out
+}
+
+@(private)
+_bound_lines :: proc(r: ^Runtime, o: Object, allocator: runtime.Allocator) -> []convo.Line_Bind {
+	ms, err := eng.convo_mounts(r.e, o, context.temp_allocator)
+	if err != .None || len(ms) == 0 {
+		return nil
+	}
+	out := make([]convo.Line_Bind, len(ms), allocator)
+	for m, i in ms {
+		key := line_name(m.line)
+		if r.cfg.homes.home != nil {
+			if h, ok := r.cfg.homes.home(r.cfg.homes.data, m.tree, context.temp_allocator); ok {
+				key = dir_line_key(eng.base_vfs(r.e), h, key)
+			}
+		}
+		out[i] = convo.Line_Bind{mount = clone(m.name, allocator), tree = m.tree, line = clone(key, allocator)}
+	}
+	return out
+}
+
+dir_line_key :: proc(vfs: prim.Vfs, dir: string, fallback: string) -> string {
+	g, found := fs.git_locate(vfs, dir, context.temp_allocator)
+	if !found {
+		return fallback
+	}
+	h, ok := fs.git_head(vfs, g, context.temp_allocator)
+	if !ok {
+		return fallback
+	}
+	if len(h.branch) > 0 {
+		return concat("git:", h.branch)
+	}
+	if len(h.commit) > 0 {
+		return concat("git:detached:", h.commit)
+	}
+	return fallback
 }
 
 lines_encode :: proc(lines: []convo.Line) -> []u8 {
@@ -1231,6 +1279,9 @@ _recover :: proc(r: ^Runtime, space: prim.Id) {
 			state_run_clear(r, ent.object)
 			continue
 		}
+		if ent.hold != 0 {
+			continue
+		}
 		convo.writer_interrupt_open(w, now)
 		eng.touched(r.e, ent.object)
 		if _replicated(r, ent.object.space) && _follow_start(r, ent.object) {
@@ -1372,7 +1423,12 @@ _revive :: proc(r: ^Runtime, ent: Run_Entry, lines: []convo.Line) -> Error {
 	for l, i in lines {
 		owned[i] = convo.Line{mount = clone(l.mount, run.alloc), line = l.line}
 	}
-	claim, cerr := convo.writer_claim(w, ent.user, r.cfg.lease_ms, owned)
+	run.bound = convo.binds_decode(ent.bound, run.alloc)
+	if ent.hold != 0 {
+		run.text = RESUME_MOVED_PROMPT if _line_moved(r, ent) else RESUME_PROMPT
+	}
+	eng.catalog_lines(r.e, o, convo.binds_encode(run.bound))
+	claim, cerr := convo.writer_claim(w, ent.user, r.cfg.lease_ms, owned, run.bound)
 	if cerr != .None {
 		_run_free(run)
 		return .Not_Assigned

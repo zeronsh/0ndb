@@ -857,6 +857,26 @@ worktree_finish :: proc(ws: ^Worktree, run: ^Run, land: bool) -> []convo.File_De
 	return files[:]
 }
 
+worktree_hold :: proc(ws: ^Worktree, run: ^Run) {
+	r := ws.r
+	reg, rerr := eng.registry(r.e)
+	for &t in ws.tools {
+		if t.open && rerr == .None {
+			t.open = false
+			t.closing = true
+		}
+		_tool_scopes_close(ws, &t)
+	}
+	clear(&ws.tools)
+	for &mb in ws.members {
+		if mb.turn != nil && rerr == .None {
+			fs.scope_close(reg, mb.turn)
+			mb.turn = nil
+		}
+	}
+	ws.busy = false
+}
+
 worktree_close :: proc(ws: ^Worktree) {
 	r := ws.r
 	for &t in ws.tools {

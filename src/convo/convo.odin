@@ -1,6 +1,7 @@
 package convo
 
 import "../obj"
+import "core:strings"
 import "../prim"
 
 MAX_OPEN :: 8
@@ -99,6 +100,20 @@ Seal_Status :: enum u8 {
 Open_State :: enum u8 {
 	Running = 0,
 	Revive  = 1,
+	Held    = 2,
+}
+
+Hold_Reason :: enum u8 {
+	None           = 0,
+	Branch_Changed = 1,
+	Branch_Deleted = 2,
+	Undo           = 3,
+}
+
+Line_Bind :: struct {
+	mount: string,
+	tree:  prim.Id,
+	line:  string,
 }
 
 Outcome :: enum u8 {
@@ -376,7 +391,7 @@ decode_summary :: proc "contextless" (extra: []u8, off: i64, s: ^Summary) -> boo
 			last := obj.read_ref(&fr, off) or_return
 			blocks := prim.read_uvarint(&fr)
 			st := prim.read_uvarint(&fr)
-			if fr.err != .None || m.seg != 0 || last.seg != 0 || obj.ref_none(m) || (last.off != 0 && last.off <= m.off) || blocks > u64(max(u32)) || st & 3 > 1 || st >> 2 > 63 {
+			if fr.err != .None || m.seg != 0 || last.seg != 0 || obj.ref_none(m) || (last.off != 0 && last.off <= m.off) || blocks > u64(max(u32)) || st & 3 > 2 || st >> 2 > 63 {
 				return false
 			}
 			s.open[s.open_len] = Open{m.off, last.off, u32(blocks), Open_State(st & 3), u8(st >> 2)}
@@ -390,4 +405,41 @@ decode_summary :: proc "contextless" (extra: []u8, off: i64, s: ^Summary) -> boo
 		s.digest_len = s.base_len
 	}
 	return r.err == .None
+}
+
+binds_encode :: proc(binds: []Line_Bind) -> []u8 {
+	if len(binds) == 0 {
+		return nil
+	}
+	b := make([dynamic]u8, context.temp_allocator)
+	w := prim.writer(&b)
+	prim.write_uvarint(&w, u64(len(binds)))
+	for x in binds {
+		prim.write_str(&w, x.mount)
+		prim.write_id(&w, x.tree)
+		prim.write_str(&w, x.line)
+	}
+	return b[:]
+}
+
+binds_decode :: proc(b: []u8, allocator := context.temp_allocator) -> []Line_Bind {
+	if len(b) == 0 {
+		return nil
+	}
+	rd := prim.reader(b)
+	n := prim.read_uvarint(&rd)
+	if n > 4096 {
+		return nil
+	}
+	out := make([dynamic]Line_Bind, 0, int(n), allocator)
+	for _ in 0 ..< n {
+		m := prim.read_str(&rd)
+		t := prim.read_id(&rd)
+		l := prim.read_str(&rd)
+		if !prim.reader_ok(&rd) {
+			return nil
+		}
+		append(&out, Line_Bind{mount = strings.clone(m, allocator), tree = t, line = strings.clone(l, allocator)})
+	}
+	return out[:]
 }

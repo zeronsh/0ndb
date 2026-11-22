@@ -133,6 +133,7 @@ Claim :: struct {
 	lease:      u64,
 	assign_hlc: prim.Hlc,
 	lines:      []Line,
+	bound:      []Line_Bind,
 }
 
 Queue :: struct {
@@ -232,6 +233,8 @@ Interrupted :: struct {
 	last_block: i64,
 	attempt:    u8,
 	revive:     bool,
+	reason:     Hold_Reason,
+	line:       string,
 }
 
 Revived :: struct {
@@ -428,6 +431,18 @@ _put_files :: proc(w: ^prim.Writer, tag: u32, files: []File_Delta) {
 }
 
 @(private)
+_put_binds :: proc(w: ^prim.Writer, tag: u32, binds: []Line_Bind) {
+	for b in binds {
+		lb := make([dynamic]u8, context.temp_allocator)
+		lw := prim.writer(&lb)
+		obj.tw_str(&lw, 1, b.mount)
+		obj.tw_str(&lw, 2, b.line)
+		obj.tw_id(&lw, 3, b.tree)
+		_nested(w, tag, lb[:])
+	}
+}
+
+@(private)
 _put_lines :: proc(w: ^prim.Writer, tag: u32, lines: []Line) {
 	for l in lines {
 		lb := make([dynamic]u8, context.temp_allocator)
@@ -582,6 +597,7 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		obj.tw_uv(w, 3, v.lease)
 		obj.tw_u64(w, 4, u64(v.assign_hlc))
 		_put_lines(w, 5, v.lines)
+		_put_binds(w, 6, v.bound)
 	case Queue:
 		obj.tw_str(w, 1, v.text)
 		_put_atts(w, 2, v.attachments)
@@ -648,6 +664,8 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		obj.tw_ref(w, 2, off, Ref{0, v.last_block})
 		obj.tw_uv(w, 3, u64(v.attempt))
 		obj.tw_bool(w, 4, v.revive)
+		obj.tw_uv(w, 5, u64(v.reason))
+		obj.tw_str(w, 6, v.line)
 	case Revived:
 		obj.tw_ref(w, 1, off, Ref{0, v.msg})
 		obj.tw_uv(w, 2, u64(v.attempt))
@@ -806,6 +824,23 @@ _get_line :: proc(d: ^obj.Dec, off: i64) -> (l: Line) {
 		}
 	}
 	d.bad ||= !obj.dec_ok(&ld)
+	return
+}
+
+@(private)
+_get_bind :: proc(d: ^obj.Dec, off: i64) -> (b: Line_Bind) {
+	bd := obj.dec_init(obj.dec_bytes(d), off)
+	for obj.dec_next(&bd) {
+		switch bd.f.tag {
+		case 1:
+			b.mount = obj.dec_str(&bd)
+		case 2:
+			b.line = obj.dec_str(&bd)
+		case 3:
+			b.tree = obj.dec_id(&bd)
+		}
+	}
+	d.bad ||= !obj.dec_ok(&bd)
 	return
 }
 
@@ -1140,6 +1175,7 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 	case .Claim:
 		v: Claim
 		lines := make([dynamic]Line, allocator)
+		binds := make([dynamic]Line_Bind, allocator)
 		for obj.dec_next(&d) {
 			switch d.f.tag {
 			case 1:
@@ -1152,9 +1188,12 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				v.assign_hlc = obj.dec_hlc(&d)
 			case 5:
 				append(&lines, _get_line(&d, off))
+			case 6:
+				append(&binds, _get_bind(&d, off))
 			}
 		}
 		v.lines = lines[:]
+		v.bound = binds[:]
 		d.bad ||= obj.ref_none(v.msg)
 		rec.body = v
 	case .Queue:
@@ -1378,6 +1417,12 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				v.attempt = u8(min(obj.dec_uv(&d), 63))
 			case 4:
 				v.revive = obj.dec_uv(&d) != 0
+			case 5:
+				r := obj.dec_uv(&d)
+				d.bad ||= r > u64(max(Hold_Reason))
+				v.reason = Hold_Reason(min(r, u64(max(Hold_Reason))))
+			case 6:
+				v.line = obj.dec_str(&d)
 			}
 		}
 		d.bad ||= v.msg == 0 || (v.last_block != 0 && v.last_block <= v.msg)

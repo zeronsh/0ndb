@@ -644,6 +644,7 @@ _proc_event :: proc(p: ^Proc, e: agent.Event) {
 		run.steps += 1
 		run.cur = -1
 		_run_budget_check(run)
+		run_hold_check(run)
 	case agent.Text_Delta:
 		run_text(run, .Text, ev.text)
 	case agent.Reasoning_Delta:
