@@ -834,6 +834,10 @@ _local_open :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, id:
 		_local_free(r, l)
 		return nil, .No_Memory
 	}
+	if cur, ok := r.locals[id]; ok {
+		_local_free(r, l)
+		return cur, .None
+	}
 	r.locals[id] = l
 	return l, .None
 }
@@ -1285,6 +1289,10 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 	if nerr != .None || perr != .None {
 		_remote_free(r, rm)
 		return nil, .No_Memory
+	}
+	if cur, ok := r.remotes[id]; ok {
+		_remote_free(r, rm)
+		return cur, .None
 	}
 	_pending_apply(r, rm)
 	for i in 0 ..< PROBES {

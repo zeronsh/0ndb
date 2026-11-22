@@ -244,7 +244,7 @@ _chain_save :: proc(e: ^Engine, space: prim.Id, c: ^Snap_Chain, sources: []Snap_
 			return _oerr(err)
 		}
 	}
-	return _oerr(omap.txn_commit(t))
+	return _reg_commit(e, t)
 }
 
 @(private)
@@ -1210,15 +1210,17 @@ _snap_forget_all :: proc(e: ^Engine) {
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	for k in c.keys {
 		if _, err := omap.txn_delete(t, ROOT_SEARCH, k); err != .None {
 			omap.txn_abort(t)
+			_reg_fail(e, .Io)
 			return
 		}
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)

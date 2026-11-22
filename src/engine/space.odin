@@ -33,6 +33,7 @@ Space_Info :: struct {
 Space :: struct {
 	e:            ^Engine,
 	id:           prim.Id,
+	cat_checked:  bool,
 	link:         Link,
 	name:         string,
 	relay:        string,
@@ -433,7 +434,7 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	sp.open = true
 	_cards_load(e, sp)
 	if !sp.refused && len(sp.relay) > 0 {
-		if rerr := _repl_start(e, sp); rerr != .None {
+		if rerr := _repl_start(e, sp); rerr != .None && !_store_err(e, rerr) {
 			_log(e, .Warn, "replicator start failed")
 		}
 	}
@@ -1043,13 +1044,15 @@ _card_store :: proc(e: ^Engine, sp: ^Space, card: []u8) {
 	k := _card_key(sp, id.id)
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	if omap.txn_put(t, ROOT_CARDS, k[:], card) != .None {
 		omap.txn_abort(t)
+		_reg_fail(e, .Io)
 		return
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)
@@ -1064,13 +1067,15 @@ _owned_add :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	if omap.txn_put(t, ROOT_OWNED, k[:], v[:]) != .None {
 		omap.txn_abort(t)
+		_reg_fail(e, .Io)
 		return
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)

@@ -549,7 +549,9 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 					break
 				}
 				if aerr != .None {
-					_log(e, .Warn, "history admit failed")
+					if !_store_err(e, _ferr(aerr)) {
+						_log(e, .Warn, "history admit failed")
+					}
 					break
 				}
 				progress = true
@@ -561,7 +563,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 			break
 		}
 	}
-	if rerr := fs.history_resume(hist); rerr != .None {
+	if rerr := fs.history_resume(hist); rerr != .None && !_store_err(e, _ferr(rerr)) {
 		_log(e, .Warn, "history replay failed")
 	}
 	return
@@ -594,7 +596,9 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 	ctx := Text_Plan{e = e, h = h}
 	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator, _text_plan(&ctx))
 	if err != .None {
-		_log(e, .Warn, "own history redaction failed")
+		if !_store_err(e, _ferr(err)) {
+			_log(e, .Warn, "own history redaction failed")
+		}
 		return
 	}
 	for r in res.ranges {

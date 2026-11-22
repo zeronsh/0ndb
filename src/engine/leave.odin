@@ -398,7 +398,7 @@ _registry_drop_space :: proc(e: ^Engine, space: prim.Id, objs: map[prim.Id]bool)
 		omap.txn_abort(t)
 		return .Io
 	}
-	return _oerr(omap.txn_commit(t))
+	return _reg_commit(e, t)
 }
 
 @(private)
