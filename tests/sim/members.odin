@@ -1657,6 +1657,12 @@ membership :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
+Dir_Woke :: struct {
+	fired: bool,
+	err:   eng.Error,
+}
+
+@(private = "file")
 _directory_case :: proc(w: ^World, space: prim.Id, o: eng.Object) {
 	a := w.nodes[M_A]
 	dir := _up(w, M_DIR)
@@ -1684,9 +1690,34 @@ _directory_case :: proc(w: ^World, space: prim.Id, o: eng.Object) {
 	person, _ := osync.device_from_seed(seed[:])
 	pid := osync.device_identity(&person)
 	{
+		woke := new(Dir_Woke, w.allocator)
+		ready := eng.Ready{data = woke, call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+			x := (^Dir_Woke)(data)
+			x.fired = true
+			x.err = err
+		}}
 		context = instance_context(&dir.inst)
-		derr := eng.directory_add(&dir.e, space, pid, .Member, {x.identity})
+		derr := eng.directory_add(&dir.e, space, pid, .Member, {x.identity}, ready)
 		node_after(dir)
+		context = w.ctx
+		if derr == .Pending {
+			for _ in 0 ..< 300 {
+				if woke.fired {
+					break
+				}
+				_settle(w, 100)
+			}
+			derr = woke.err if woke.fired else .Pending
+			if derr == .None {
+				context = instance_context(&dir.inst)
+				derr = eng.directory_add(&dir.e, space, pid, .Member, {x.identity})
+				node_after(dir)
+				context = w.ctx
+			}
+		}
+		if woke.fired || derr != .Pending {
+			free(woke, w.allocator)
+		}
 		if derr != .None {
 			_fail(w, "directory add: %v", derr)
 			return

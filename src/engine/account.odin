@@ -727,7 +727,7 @@ account_passkey_add_prf :: proc(e: ^Engine, credential: []u8, prf: [32]u8, label
 	return _with_finish(j)
 }
 
-directory_add :: proc(e: ^Engine, space: prim.Id, person: osync.Identity, role: osync.Role = .Member, devices: []osync.Identity = nil) -> Error {
+directory_add :: proc(e: ^Engine, space: prim.Id, person: osync.Identity, role: osync.Role = .Member, devices: []osync.Identity = nil, ready: Ready = {}) -> Error {
 	context = context_for(e)
 	sp := _space_open(e, space) or_return
 	dc := Dir_Ctx{person = person, role = role, devices = devices}
@@ -755,10 +755,10 @@ directory_add :: proc(e: ^Engine, space: prim.Id, person: osync.Identity, role: 
 		}
 		return last, .None
 	}
-	return _members_change_all(e, sp, build, &dc, false)
+	return _members_change_all(e, sp, build, &dc, false, ready)
 }
 
-directory_remove :: proc(e: ^Engine, space: prim.Id, person: osync.Public_Key) -> Error {
+directory_remove :: proc(e: ^Engine, space: prim.Id, person: osync.Public_Key, ready: Ready = {}) -> Error {
 	context = context_for(e)
 	sp := _space_open(e, space) or_return
 	dc := Dir_Ctx{person = osync.Identity{sign = person}}
@@ -783,7 +783,7 @@ directory_remove :: proc(e: ^Engine, space: prim.Id, person: osync.Public_Key) -
 		}
 		return last, .None
 	}
-	return _members_change_all(e, sp, build, &dc, true)
+	return _members_change_all(e, sp, build, &dc, true, ready)
 }
 
 @(private)
