@@ -41,7 +41,18 @@ Registry :: struct {
 	staged:  map[prim.Id][]u8,
 	sstaged: map[prim.Id][]u8,
 	kstaged: map[prim.Id][]u8,
+	hold:    map[prim.Id]u64,
+	early:   map[prim.Id]bool,
+	cat_done: map[prim.Id]bool,
+	owned:   [dynamic]Owned_Pend,
 	meta:    bool,
+}
+
+@(private)
+Owned_Pend :: struct {
+	key:  [32]u8,
+	kind: Kind,
+	seq:  u64,
 }
 
 @(private)
@@ -88,6 +99,10 @@ _registry_open :: proc(e: ^Engine) -> Error {
 	_oerr(omap.db_open(&e.reg.db, e.base, path, e.allocator)) or_return
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
+	e.reg.hold = make(map[prim.Id]u64, e.allocator)
+	e.reg.early = make(map[prim.Id]bool, e.allocator)
+	e.reg.cat_done = make(map[prim.Id]bool, e.allocator)
+	e.reg.owned = make([dynamic]Owned_Pend, e.allocator)
 	e.reg.sstaged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.kstaged = make(map[prim.Id][]u8, e.allocator)
 	return .None
@@ -104,6 +119,21 @@ _registry_migrate :: proc(e: ^Engine, path: string) -> Error {
 		_perr(prim.replace_atomic(e.base, path, data)) or_return
 	}
 	return _perr(prim.remove(e.vfs, old))
+}
+
+@(private)
+_reg_ready :: proc(e: ^Engine) -> bool {
+	for _, seq in e.reg.hold {
+		if seq <= e.durable_seq {
+			return true
+		}
+	}
+	for o in e.reg.owned {
+		if o.seq <= e.durable_seq {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -150,6 +180,10 @@ _registry_close :: proc(e: ^Engine) {
 		delete(v, e.allocator)
 	}
 	delete(e.reg.staged)
+	delete(e.reg.hold)
+	delete(e.reg.early)
+	delete(e.reg.cat_done)
+	delete(e.reg.owned)
 	delete(e.reg.sstaged)
 	delete(e.reg.kstaged)
 	omap.db_close(&e.reg.db)
@@ -158,17 +192,65 @@ _registry_close :: proc(e: ^Engine) {
 
 @(private)
 _registry_flush :: proc(e: ^Engine) -> Error {
-	if !e.reg.open || (len(e.reg.staged) == 0 && len(e.reg.sstaged) == 0 && len(e.reg.kstaged) == 0) {
+	if !e.reg.open {
+		return .None
+	}
+	ready := make([dynamic]prim.Id, context.temp_allocator)
+	early := make([dynamic]prim.Id, context.temp_allocator)
+	for k in _sorted_keys(e.reg.staged) {
+		if seq, held := e.reg.hold[k]; !held || seq <= e.durable_seq {
+			append(&ready, k)
+		} else if !e.reg.early[k] {
+			append(&early, k)
+		}
+	}
+	owned := 0
+	for o in e.reg.owned {
+		if o.seq <= e.durable_seq {
+			owned += 1
+		}
+	}
+	if len(ready) == 0 && len(early) == 0 && owned == 0 && len(e.reg.sstaged) == 0 && len(e.reg.kstaged) == 0 {
 		return .None
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
 		return _oerr(terr)
 	}
-	for k in _sorted_keys(e.reg.staged) {
-		v := e.reg.staged[k]
+	for k in ready {
+		key := k
+		if err := omap.txn_put(t, ROOT_OBJECTS, key[:], e.reg.staged[k]); err != .None {
+			omap.txn_abort(t)
+			return _oerr(err)
+		}
+	}
+	for k in early {
+		rec, derr := _rec_decode(e.reg.staged[k], context.temp_allocator)
+		if derr != .None {
+			omap.txn_abort(t)
+			return derr
+		}
+		rec.own = false
+		v, verr := _rec_encode(&rec, context.temp_allocator)
+		if verr != .None {
+			omap.txn_abort(t)
+			return verr
+		}
 		key := k
 		if err := omap.txn_put(t, ROOT_OBJECTS, key[:], v); err != .None {
+			omap.txn_abort(t)
+			return _oerr(err)
+		}
+	}
+	for &o in e.reg.owned {
+		if o.seq > e.durable_seq {
+			continue
+		}
+		if old, found, gerr := omap.txn_get(t, ROOT_OWNED, o.key[:], context.temp_allocator); gerr == .None && found && len(old) > 0 && old[0] == u8(o.kind) {
+			continue
+		}
+		v := [1]u8{u8(o.kind)}
+		if err := omap.txn_put(t, ROOT_OWNED, o.key[:], v[:]); err != .None {
 			omap.txn_abort(t)
 			return _oerr(err)
 		}
@@ -192,8 +274,22 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 		return err
 	}
 	e.reg.meta = true
-	for _, v in e.reg.staged {
-		delete(v, e.allocator)
+	for k in ready {
+		delete(e.reg.staged[k], e.allocator)
+		delete_key(&e.reg.staged, k)
+		delete_key(&e.reg.hold, k)
+		delete_key(&e.reg.early, k)
+	}
+	for k in early {
+		e.reg.early[k] = true
+	}
+	i := 0
+	for i < len(e.reg.owned) {
+		if e.reg.owned[i].seq <= e.durable_seq {
+			ordered_remove(&e.reg.owned, i)
+		} else {
+			i += 1
+		}
 	}
 	for _, v in e.reg.sstaged {
 		delete(v, e.allocator)
@@ -202,7 +298,6 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 		crypto.zero_explicit(raw_data(v), len(v))
 		delete(v, e.allocator)
 	}
-	clear(&e.reg.staged)
 	clear(&e.reg.sstaged)
 	clear(&e.reg.kstaged)
 	return .None
@@ -229,10 +324,37 @@ _rec_get :: proc(e: ^Engine, id: prim.Id, allocator := context.temp_allocator) -
 @(private)
 _rec_put :: proc(e: ^Engine, id: prim.Id, rec: ^Obj_Rec) -> Error {
 	buf := _rec_encode(rec, e.allocator) or_return
+	was_own := false
 	if old, ok := e.reg.staged[id]; ok {
+		if string(old) == string(buf) {
+			delete(buf, e.allocator)
+			return .None
+		}
+		if prev, perr := _rec_decode(old, context.temp_allocator); perr == .None {
+			was_own = prev.own
+		}
 		delete(old, e.allocator)
+	} else {
+		key := id
+		if v, hit, gerr := omap.db_get(&e.reg.db, ROOT_OBJECTS, key[:], context.temp_allocator); gerr == .None && hit {
+			if string(v) == string(buf) {
+				delete(buf, e.allocator)
+				return .None
+			}
+			if prev, perr := _rec_decode(v, context.temp_allocator); perr == .None {
+				was_own = prev.own
+			}
+		}
 	}
 	e.reg.staged[id] = buf
+	delete_key(&e.reg.early, id)
+	if !rec.own {
+		delete_key(&e.reg.hold, id)
+	} else if !was_own {
+		if _, held := e.reg.hold[id]; !held {
+			e.reg.hold[id] = e.batch_seq + 1
+		}
+	}
 	_touch(e)
 	return .None
 }
@@ -527,6 +649,19 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		_fatal(e, err)
 	} else {
 		e.durable_seq = max(e.durable_seq, b.seq)
+		if _reg_ready(e) {
+			if rerr := _registry_flush(e); rerr != .None && rerr != .Busy {
+				_fatal(e, rerr)
+			}
+			if _reg_ready(e) {
+				_touch(e)
+			}
+		}
+		if e.fatal == .None {
+			for _, h in e.handles {
+				_table_publish(e, h)
+			}
+		}
 		e.stats.durable += 1
 		if len(e.drain_wait) > 0 {
 			append(&e.refused_stop, ..e.drain_wait[:])

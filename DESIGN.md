@@ -1024,6 +1024,26 @@ concurrent typing is never lost or reverted.
   inside containers was measured and rejected (an omap table under random
   puts wrote 1.7-2x the bytes with 2-2.4x the p99 batch latency, and inside
   files cap near 16 MB).
+  - Add before use: nothing outside the inline batch becomes durable before
+    the batch state it names. A registry object row whose `own` bit turns on
+    is staged with the sequence of the batch open when it was written: until
+    that batch is durable the row commits with `own` still off (members, key
+    epochs and scan positions are derived from feeds and replicas whose
+    cursors live in the pack, so they must not wait), and the full row
+    commits once the batch is durable. Owned entries are queued the same
+    way. Key trees and space rows commit at once, so an own key tree is
+    durable before any own segment byte. A crash after the batch but before the row
+    leaves an own segment without `own`, and creating the writer adopts that
+    segment. A copy-on-write omap file inside the pack (map tables) writes
+    and syncs its pages at commit but keeps the new meta page in memory,
+    tagged with the open batch; the meta is written and synced only once that
+    batch is durable, after the registry rows that batch made eligible, so a
+    crash at any point leaves the previous meta valid. At most two pending
+    metas are kept per file (the oldest unpublished one and the newest), the
+    newest eligible one is the one written, and compaction waits while any is
+    pending. Journals use sized external files (committed size in the
+    inode). Small sidecars (replica `.have`, floor slots) are inline or
+    replaced by rename, which is batch metadata.
   - Registry: on an unclean open, before spaces load, `own` and the owned
     entry of an object whose own segment is absent or empty are cleared (not
     created yet), content and promotion marks are clamped to the recovered
