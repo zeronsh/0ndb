@@ -2283,6 +2283,9 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 		}
 		builder_tree(b, fstree.Op_Remove{inode = c.old.inode})
 		shadow_remove(&m.shadow, c.path) or_return
+		if shadow_has_losers(m, c.path) or_return {
+			mount_reshow_add(m, c.path)
+		}
 	case .Create:
 		parent, ok := parent_inode(p, c.path)
 		if !ok {
@@ -2770,4 +2773,17 @@ tree_flags :: proc(h: ^History, inode: fstree.Inode_Id) -> fstree.Flags {
 		return {}
 	}
 	return n.flags
+}
+
+@(private)
+shadow_has_losers :: proc(m: ^Mount, rel: string) -> (found: bool, err: Error) {
+	kids := make([dynamic]Shadow_Child, context.temp_allocator)
+	shadow_children(&m.shadow, path_parent(rel), &kids, context.temp_allocator) or_return
+	name := path_name(rel)
+	for k in kids {
+		if len(k.name) > len(name) && k.name[len(name)] == '~' && k.name[:len(name)] == name {
+			return true, .None
+		}
+	}
+	return false, .None
 }
