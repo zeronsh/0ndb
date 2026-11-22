@@ -486,6 +486,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_adoption_window(w, mw)
 	_short_id_wait(w, mw.owned[len(mw.owned) - 1])
 	_short_id_instant(w, mw.owned[len(mw.owned) - 1])
+	_upload_wait_case(w, mw.owned[len(mw.owned) - 1])
 
 	_down(w, M_A)
 	_down(w, M_B)
@@ -1109,6 +1110,60 @@ _short_id_instant :: proc(w: ^World, sid: prim.Id) {
 		_fail(w, "instant: n0 cannot read what n1 sent through the short id")
 	}
 	world_note(w, "instant short id: %d lookups before n1 knew of it, %d waits", unknown, waited)
+}
+
+@(private = "file")
+_upload_wait_case :: proc(w: ^World, sid: prim.Id) {
+	a := w.nodes[M_A]
+	fp := new(Window_Probe, w.allocator)
+	ready := eng.Ready {
+		data = fp,
+		call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+			p := (^Window_Probe)(data)
+			p.fired += 1
+			p.err = err
+		},
+	}
+	context = instance_context(&a.inst)
+	o, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "uploaded"})
+	up0, e0 := eng.upload_wait(&a.e, o, ready)
+	node_after(a)
+	if oerr != .None || up0 || e0 != .Pending {
+		_fail(w, "upload: a fresh create while connected should wait for the relay: create %v uploaded=%v %v", oerr, up0, e0)
+		return
+	}
+	for _ in 0 ..< 300 {
+		if fp.fired > 0 {
+			break
+		}
+		_settle(w, 100)
+	}
+	free_probe := fp.fired == 1
+	if fp.fired != 1 || fp.err != .None {
+		_fail(w, "upload: wait finished %d/%v", fp.fired, fp.err)
+		return
+	}
+	context = instance_context(&a.inst)
+	up1, e1 := eng.upload_wait(&a.e, o)
+	node_after(a)
+	if !up1 || e1 != .None {
+		_fail(w, "upload: after the relay acknowledged the create, uploaded=%v %v", up1, e1)
+		return
+	}
+	if free_probe {
+		free(fp, w.allocator)
+	}
+	_down(w, M_A)
+	a = _up(w, M_A)
+	context = instance_context(&a.inst)
+	eng.space_open(&a.e, sid)
+	o2, oerr2 := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "uploaded-offline"})
+	up2, e2 := eng.upload_wait(&a.e, o2, eng.Ready{data = nil, call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}})
+	node_after(a)
+	if oerr2 != .None || up2 || e2 != .None {
+		_fail(w, "upload: without a relay connection the create should answer at once with uploaded=false: %v uploaded=%v %v", oerr2, up2, e2)
+	}
+	_settle(w, 3000)
 }
 
 @(private = "file")

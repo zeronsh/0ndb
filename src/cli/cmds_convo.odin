@@ -58,6 +58,13 @@ cmd_new :: proc(a: ^Args) -> int {
 		sv := must(s, req_end(&sr), "cannot send")
 		msg = jstr(sv, "item")
 	}
+	ur := req_begin("object.uploaded")
+	req_str(&ur, "object", object_str(ob))
+	if uv := call(s, req_end(&ur)); uv.status != .Ok {
+		fmt.eprintfln("0ndb: created locally, but the relay did not take the upload (%v)", uv.status)
+	} else if jbool(uv.value, "dropped") {
+		fmt.eprintln("0ndb: created locally; the relay connection dropped before it was uploaded, so other devices see it once it reconnects")
+	}
 	if a.json {
 		out := make([dynamic]u8, context.temp_allocator)
 		append(&out, `{"object":`)

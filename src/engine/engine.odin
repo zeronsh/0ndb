@@ -865,7 +865,13 @@ _emit :: proc(e: ^Engine, ev: Event) {
 		_space_waits_wake(e, ev.space)
 	}
 	if ev.kind == .Caught_Up || ev.kind == .Disconnected || ev.kind == .Access_Revoked {
-		_space_waits_wake(e, ev.space, true)
+		_space_waits_wake(e, ev.space, .Catalog)
+	}
+	if ev.kind == .Uploaded || ev.kind == .Disconnected || ev.kind == .Access_Revoked {
+		_space_waits_wake(e, ev.space, .Upload)
+	}
+	if ev.kind == .Refused && len(e.space_waits) > 0 {
+		_space_waits_refused(e, ev.space, ev.err if ev.err != .None else .Limit)
 	}
 	if e.cfg.events.event != nil {
 		x := ev

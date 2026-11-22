@@ -1214,6 +1214,8 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_CATALOG_LIST 100u
 /* catalog.find(space: id, text: str) -> rows:[CatalogRow] */
 #define ONDB_OP_CATALOG_FIND 141u
+/* object.uploaded(object: object) -> uploaded:bool dropped:bool */
+#define ONDB_OP_OBJECT_UPLOADED 142u
 /* catalog.usage(object: object) -> Usage */
 #define ONDB_OP_CATALOG_USAGE 101u
 /* catalog.set(object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id) -> Result */
