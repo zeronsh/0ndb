@@ -1,0 +1,936 @@
+package sim
+
+import "core:fmt"
+import "core:strings"
+import "../../src/convo"
+import eng "../../src/engine"
+import omap "../../src/map"
+import "../../src/obj"
+import "../../src/prim"
+import osync "../../src/sync"
+
+setup_spaces :: proc(w: ^World) -> bool {
+	m := &w.model
+	n0 := w.nodes[0]
+	for s in 0 ..< w.cfg.spaces {
+		context = instance_context(&n0.inst)
+		id, err := eng.space_create(&n0.e, fmt.tprintf("space%d", s), "relay", w.relay.public)
+		if err != .None {
+			world_fail(w, "space_create failed: %v", err)
+			return false
+		}
+		if oerr := eng.space_open(&n0.e, id); oerr != .None {
+			world_fail(w, "space_open failed: %v", oerr)
+			return false
+		}
+		node_after(n0)
+		sp := M_Space{id = id}
+		sp.members = make([dynamic]int, w.allocator)
+		sp.guests = make([dynamic]int, w.allocator)
+		append(&sp.members, 0)
+		append(&m.spaces, sp)
+	}
+	for i in 1 ..< len(w.nodes) {
+		n := w.nodes[i]
+		for &sp, s in m.spaces {
+			if !(s == i % len(m.spaces) || rng_chance(&w.rng, 1, 2)) {
+				continue
+			}
+			proof: []u8
+			{
+				context = instance_context(&n0.inst)
+				p, aerr := eng.member_add(&n0.e, sp.id, n.identity, .Device, .Admin, .Approval, 0, w.allocator)
+				if aerr != .None {
+					world_fail(w, "%s member_add for %s failed: %v", n0.name, n.name, aerr)
+					return false
+				}
+				proof = p
+				node_after(n0)
+			}
+			context = instance_context(&n.inst)
+			_, err := eng.space_join_enrollment(&n.e, sp.id, proof, fmt.tprintf("space%d", s), "relay", w.relay.public)
+			if err != .None {
+				world_fail(w, "%s space_join_enrollment failed: %v", n.name, err)
+				return false
+			}
+			if oerr := eng.space_open(&n.e, sp.id); oerr != .None {
+				world_fail(w, "%s space_open failed: %v", n.name, oerr)
+				return false
+			}
+			node_after(n)
+			append(&sp.members, i)
+		}
+	}
+	return true
+}
+
+space_member :: proc(sp: ^M_Space, idx: int) -> bool {
+	for x in sp.members {
+		if x == idx {
+			return true
+		}
+	}
+	return false
+}
+
+space_guest :: proc(sp: ^M_Space, idx: int) -> bool {
+	for x in sp.guests {
+		if x == idx {
+			return true
+		}
+	}
+	return false
+}
+
+space_index :: proc(m: ^Model, id: prim.Id) -> int {
+	for sp, i in m.spaces {
+		if sp.id == id {
+			return i
+		}
+	}
+	return -1
+}
+
+obj_reader :: proc(m: ^Model, oi: int, idx: int) -> bool {
+	ob := &m.objs[oi]
+	si := space_index(m, ob.o.space)
+	if si >= 0 && space_member(&m.spaces[si], idx) {
+		return true
+	}
+	for x in ob.shared {
+		if x == idx {
+			return true
+		}
+	}
+	return false
+}
+
+@(private = "file")
+_visible :: proc(w: ^World, n: ^Node, oi: int) -> bool {
+	m := &w.model
+	ob := &m.objs[oi]
+	cop := m.ops[ob.op]
+	if cop.status == .Lost || cop.status == .Failed {
+		return false
+	}
+	if ob.creator == n.idx && cop.inc == n.incarnation {
+		return true
+	}
+	context = instance_context(&n.inst)
+	_, found, err := eng.catalog_get(&n.e, ob.o, context.temp_allocator)
+	node_after(n)
+	return err == .None && found
+}
+
+pick_obj :: proc(w: ^World, n: ^Node, kind: M_Kind) -> int {
+	return _pick_obj(w, n, kind)
+}
+
+node_use :: proc(n: ^Node, id: prim.Id) {
+	if n.used == nil {
+		n.used = make(map[prim.Id]bool)
+	}
+	n.used[id] = true
+}
+
+@(private = "file")
+_pick_obj :: proc(w: ^World, n: ^Node, kind: M_Kind) -> int {
+	m := &w.model
+	cands := make([dynamic]int, context.temp_allocator)
+	for ob, i in m.objs {
+		if ob.kind == kind && obj_reader(m, i, n.idx) {
+			append(&cands, i)
+		}
+	}
+	for _ in 0 ..< 3 {
+		if len(cands) == 0 || !n.alive {
+			return -1
+		}
+		k := rng_int(&w.rng, len(cands))
+		oi := cands[k]
+		if _visible(w, n, oi) {
+			node_use(n, m.objs[oi].o.id)
+			return oi
+		}
+		unordered_remove(&cands, k)
+	}
+	return -1
+}
+
+@(private = "file")
+_pick_space :: proc(w: ^World, n: ^Node) -> int {
+	m := &w.model
+	cands := make([dynamic]int, context.temp_allocator)
+	for &sp, i in m.spaces {
+		if space_member(&sp, n.idx) {
+			append(&cands, i)
+		}
+	}
+	if len(cands) == 0 {
+		return -1
+	}
+	return cands[rng_int(&w.rng, len(cands))]
+}
+
+@(private = "file")
+_pick_op :: proc(m: ^Model, r: ^Rng, oi: int, kinds: bit_set[Op_Kind], need_rid: bool) -> ^M_Op {
+	cands := make([dynamic]^M_Op, context.temp_allocator)
+	for op in m.ops {
+		if op.obj == oi && op.kind in kinds && op_maybe(op) && (!need_rid || !obj.rid_none(op.rid)) {
+			append(&cands, op)
+		}
+	}
+	if len(cands) == 0 {
+		return nil
+	}
+	return cands[rng_int(r, len(cands))]
+}
+
+Tok :: struct {
+	text: string,
+	pos:  int,
+}
+
+parse_tokens :: proc(data: []u8, allocator := context.temp_allocator) -> []Tok {
+	out := make([dynamic]Tok, allocator)
+	i := 0
+	for i < len(data) {
+		if data[i] != '<' {
+			i += 1
+			continue
+		}
+		j := i + 1
+		for j < len(data) && data[j] != '>' && data[j] != '<' {
+			j += 1
+		}
+		if j < len(data) && data[j] == '>' {
+			append(&out, Tok{text = string(data[i:j + 1]), pos = i})
+			i = j + 1
+		} else {
+			i = j
+		}
+	}
+	return out[:]
+}
+
+workload_step :: proc(w: ^World) {
+	alive := make([dynamic]^Node, context.temp_allocator)
+	for n in w.nodes {
+		if n.alive {
+			append(&alive, n)
+		}
+	}
+	if len(alive) == 0 {
+		return
+	}
+	n := alive[rng_int(&w.rng, len(alive))]
+	weights := [?]int{
+		6,
+		20,
+		4,
+		3,
+		2,
+		2,
+		2,
+		2,
+		2,
+		1,
+		1,
+		1,
+		2,
+		1,
+		10,
+		6,
+		4,
+		2,
+		2,
+		4,
+		12,
+		5,
+		8,
+		1,
+		3,
+		3,
+		2,
+		2,
+		2,
+		2,
+		2,
+		6,
+		6,
+		2,
+		3,
+		3 if w.cfg.storage == .Device_Until_Run else 0,
+		6,
+		5,
+		3,
+		10,
+		3,
+		2,
+		2,
+		3,
+		1,
+	}
+	#assert(len(weights) == len(Op_Kind))
+	for k in w.cfg.disabled {
+		weights[int(k)] = 0
+	}
+	k := Op_Kind(rng_pick(&w.rng, weights[:]))
+	switch k {
+	case .Create:
+		_op_create(w, n)
+	case .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Redact_Msg:
+		_op_convo(w, n, k)
+	case .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Redact_Map:
+		_op_map(w, n, k)
+	case .Text_Insert, .Text_Delete, .Redact_Text:
+		_op_text(w, n, k)
+	case .Tree_Write, .Tree_Remove:
+		_op_tree(w, n, k)
+	case .Catalog, .Usage:
+		_op_catalog(w, n, k)
+	case .Share:
+		_op_share(w, n)
+	case .Mount_Tree:
+		op_mount(w, n)
+	case .Disk_Agent, .Disk_Person:
+		op_disk_edit(w, n, k == .Disk_Agent)
+	case .Git_Mount:
+		op_git_mount(w, n)
+	case .Search_Peer:
+		op_search_peer(w, n)
+	case .Promote:
+		op_promote(w, n)
+	case .Read_Live:
+		op_live_read(w, n)
+	case .Stream:
+		if oi := _pick_obj(w, n, .Convo); oi >= 0 {
+			op_stream(w, n, oi)
+		}
+	case .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+		op_buffer(w, n, k)
+	}
+	node_after(n)
+}
+
+@(private = "file")
+_op_create :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	si := _pick_space(w, n)
+	if si < 0 {
+		return
+	}
+	space := m.spaces[si].id
+	kind := M_Kind(rng_int(&w.rng, 4))
+	op := new_op(m, .Create, n, len(m.objs))
+	op.token = new_token(m, n, "t")
+	ob := M_Obj{kind = kind, creator = n.idx, op = op.idx}
+	ob.removed = make(map[string]bool, w.allocator)
+	ob.shared = make([dynamic]int, w.allocator)
+	context = instance_context(&n.inst)
+	o: eng.Object
+	err: eng.Error
+	switch kind {
+	case .Convo:
+		o, err = eng.convo_create(&n.e, space, eng.Convo_Settings{title = op.token})
+	case .Map:
+		o, err = eng.map_create(&n.e, space, op.token)
+	case .Text:
+		init := new_token(m, n, "x")
+		append(&op.tokens, init)
+		o, err = eng.text_create(&n.e, space, op.token, init)
+	case .Tree:
+		o, err = eng.tree_create(&n.e, space, op.token)
+	}
+	ob.o = o
+	append(&m.objs, ob)
+	world_note(w, "%s create %v %s -> %v", n.name, kind, id_short(o.id), err)
+	op_result(op, n, err)
+}
+
+probe_reuse :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	i := 0
+	for i < len(m.probes) {
+		old := m.ops[m.probes[i]]
+		if old.node != n.idx {
+			i += 1
+			continue
+		}
+		ordered_remove(&m.probes, i)
+		if !n.alive || !obj_exists(m, old.obj) {
+			continue
+		}
+		w.stats.rid_probes += 1
+		o := m.objs[old.obj].o
+		{
+			context = instance_context(&n.inst)
+			op := new_op(m, .Send, n, old.obj)
+			op.token = new_token(m, n, "m")
+			rid, err := eng.convo_send(&n.e, o, msg_body(op.token), {}, nil, op_done_handle(op))
+			if err != .Pending {
+				op.rid = rid
+			}
+			op_result(op, n, err)
+			if err == .None && rid.seg == old.rid.seg && rid.off == old.rid.off {
+				w.stats.rid_reused += 1
+				world_note(w, "%s reused offset %d of lost %s for %s", n.name, rid.off, old.token, op.token)
+			}
+			msg, merr := eng.convo_message(&n.e, o, convo.Position{msg = old.rid}, context.temp_allocator)
+			if merr == .None && !msg.redacted && (msg.author != old.actor || msg_text(msg) != msg_body(old.token)) {
+				world_fail(w, "rid: id of unacknowledged message %s names %q on %s after a crash", old.token, msg_text(msg), n.name)
+			}
+		}
+		node_after(n)
+	}
+}
+
+@(private = "file")
+_known_msg :: proc(w: ^World, n: ^Node, oi: int) -> ^M_Op {
+	return _pick_op(&w.model, &w.rng, oi, {.Send}, true)
+}
+
+@(private = "file")
+_op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
+	m := &w.model
+	oi := _pick_obj(w, n, .Convo)
+	if oi < 0 {
+		return
+	}
+	o := m.objs[oi].o
+	context = instance_context(&n.inst)
+	switch k {
+	case .Send:
+		op := new_op(m, .Send, n, oi)
+		op.token = new_token(m, n, "m")
+		parent: eng.Rid
+		if rng_chance(&w.rng, 1, 4) {
+			if p := _known_msg(w, n, oi); p != nil {
+				parent = p.rid
+			}
+		}
+		rid, err := eng.convo_send(&n.e, o, msg_body(op.token), parent, nil, op_done_handle(op))
+		if err != .Pending {
+			op.rid = rid
+		}
+		world_note(w, "%s send %s on %s -> %v", n.name, op.token, id_short(o.id), err)
+		op_result(op, n, err)
+		if w.cfg.rid_probe && err == .None && op.status == .Done && !n.probed && op.nseq >= 3 && w.cfg.crash_rate > 0 {
+			n.probed = true
+			w.probe_crash = n.idx
+		}
+	case .Queue:
+		op := new_op(m, .Queue, n, oi)
+		op.token = new_token(m, n, "q")
+		rid, err := eng.convo_queue(&n.e, o, op.token, nil, op_done_handle(op))
+		if err != .Pending {
+			op.rid = rid
+		}
+		op_result(op, n, err)
+	case .Steer:
+		op := new_op(m, .Steer, n, oi)
+		op.token = new_token(m, n, "s")
+		rid, err := eng.convo_steer(&n.e, o, op.token, {}, op_done_handle(op))
+		if err != .Pending {
+			op.rid = rid
+		}
+		op_result(op, n, err)
+	case .Edit:
+		t := _pick_op(m, &w.rng, oi, {.Queue}, true)
+		if t == nil {
+			return
+		}
+		op := new_op(m, .Edit, n, oi)
+		op.token = new_token(m, n, "e")
+		op.target = t.idx
+		err := eng.convo_edit(&n.e, o, t.rid, op.token, op_done_handle(op))
+		op_result(op, n, err)
+	case .Cancel:
+		t := _pick_op(m, &w.rng, oi, {.Queue, .Steer}, true)
+		if t == nil {
+			return
+		}
+		op := new_op(m, .Cancel, n, oi)
+		op.target = t.idx
+		err := eng.convo_cancel(&n.e, o, t.rid, op_done_handle(op))
+		op_result(op, n, err)
+	case .Interrupt:
+		op := new_op(m, .Interrupt, n, oi)
+		rid, err := eng.convo_interrupt(&n.e, o, {}, op_done_handle(op))
+		if err != .Pending {
+			op.rid = rid
+		}
+		op_result(op, n, err)
+	case .Switch:
+		t := _known_msg(w, n, oi)
+		if t == nil {
+			return
+		}
+		op := new_op(m, .Switch, n, oi)
+		op.target = t.idx
+		_, err := eng.convo_switch(&n.e, o, t.rid, op_done_handle(op))
+		op_result(op, n, err)
+	case .Back:
+		t := _known_msg(w, n, oi)
+		if t == nil {
+			return
+		}
+		op := new_op(m, .Back, n, oi)
+		op.target = t.idx
+		err := eng.convo_back(&n.e, o, t.rid, op_done_handle(op))
+		op_result(op, n, err)
+	case .Follow:
+		op := new_op(m, .Follow, n, oi)
+		err := eng.convo_follow(&n.e, o, op_done_handle(op))
+		op_result(op, n, err)
+	case .Answer:
+		t := _pick_op(m, &w.rng, oi, {.Send, .Interrupt}, true)
+		if t == nil {
+			return
+		}
+		op := new_op(m, .Answer, n, oi)
+		op.token = new_token(m, n, "a")
+		op.target = t.idx
+		rid, err := eng.convo_answer(&n.e, o, t.rid, rng_chance(&w.rng, 1, 2), op.token, op_done_handle(op))
+		if err != .Pending {
+			op.rid = rid
+		}
+		op_result(op, n, err)
+	case .Assign:
+		t := _known_msg(w, n, oi)
+		if t == nil {
+			return
+		}
+		op := new_op(m, .Assign, n, oi)
+		op.target = t.idx
+		runner := w.nodes[rng_int(&w.rng, len(w.nodes))].identity.id
+		_, err := eng.exec(&n.e, eng.Cmd_Assign{object = o, msg = t.rid, runner = runner}, op_done_handle(op))
+		op_result(op, n, err)
+	case .Mount:
+		ti := _pick_obj(w, n, .Tree)
+		if ti < 0 {
+			return
+		}
+		op := new_op(m, .Mount, n, oi)
+		op.key = strings.clone(fmt.tprintf("m%d", rng_int(&w.rng, 3)), w.allocator)
+		op.target = ti
+		line := prim.Id{}
+		line[0] = u8(1 + rng_int(&w.rng, 3))
+		err := eng.convo_mount(&n.e, o, op.key, m.objs[ti].o.id, line, fmt.tprintf("/w/%s", op.key), op_done_handle(op))
+		op_result(op, n, err)
+	case .Unmount:
+		op := new_op(m, .Unmount, n, oi)
+		op.key = strings.clone(fmt.tprintf("m%d", rng_int(&w.rng, 3)), w.allocator)
+		err := eng.convo_unmount(&n.e, o, op.key, op_done_handle(op))
+		op_result(op, n, err)
+	case .Redact_Msg:
+		t := _pick_op(m, &w.rng, oi, {.Send, .Stream}, true)
+		if t == nil || t.status == .Uncertain {
+			return
+		}
+		op := new_op(m, .Redact_Msg, n, oi)
+		op.target = t.idx
+		snapshot_search_models(w, n, op)
+		context = instance_context(&n.inst)
+		err := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
+		world_note(w, "%s redact message %s -> %v", n.name, t.token, err)
+		op_result(op, n, err)
+	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	}
+}
+
+@(private = "file")
+_op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
+	m := &w.model
+	oi := _pick_obj(w, n, .Map)
+	if oi < 0 {
+		return
+	}
+	o := m.objs[oi].o
+	context = instance_context(&n.inst)
+	switch k {
+	case .Map_Set:
+		op := new_op(m, .Map_Set, n, oi)
+		op.token = new_token(m, n, "v")
+		op.key = strings.clone(fmt.tprintf("u/%s", op.token), w.allocator)
+		f := [1]omap.Field{{tag = 1, value = transmute([]u8)op.token}}
+		off, err := eng.map_set(&n.e, o, transmute([]u8)op.key, f[:], op_done_handle(op))
+		if err == .None {
+			op.rid = eng.Rid{op.actor, off, 0}
+		}
+		op_result(op, n, err)
+	case .Map_Hot:
+		op := new_op(m, .Map_Hot, n, oi)
+		op.token = new_token(m, n, "h")
+		op.key = strings.clone(fmt.tprintf("h/%d", rng_int(&w.rng, 3)), w.allocator)
+		f := [2]omap.Field{{tag = 1, value = transmute([]u8)op.token}, {tag = 2, value = transmute([]u8)op.token}}
+		_, err := eng.map_set(&n.e, o, transmute([]u8)op.key, f[:1 + rng_int(&w.rng, 2)], op_done_handle(op))
+		op_result(op, n, err)
+	case .Map_Add:
+		op := new_op(m, .Map_Add, n, oi)
+		op.token = new_token(m, n, "el")
+		op.key = strings.clone(fmt.tprintf("s/%d", rng_int(&w.rng, 2)), w.allocator)
+		rid, err := eng.map_add(&n.e, o, transmute([]u8)op.key, 5, transmute([]u8)op.token, op_done_handle(op))
+		if err != .Pending {
+			op.rid = rid
+		}
+		op_result(op, n, err)
+	case .Map_Remove:
+		t := _pick_op(m, &w.rng, oi, {.Map_Add}, false)
+		if t == nil {
+			return
+		}
+		op := new_op(m, .Map_Remove, n, oi)
+		op.target = t.idx
+		op.key = strings.clone(t.key, w.allocator)
+		err := eng.map_remove(&n.e, o, transmute([]u8)t.key, 5, transmute([]u8)t.token, op_done_handle(op))
+		op_result(op, n, err)
+	case .Map_Delete:
+		op := new_op(m, .Map_Delete, n, oi)
+		op.key = strings.clone(fmt.tprintf("h/%d", rng_int(&w.rng, 3)), w.allocator)
+		tags := [1]u32{2}
+		err := eng.map_delete(&n.e, o, transmute([]u8)op.key, tags[:], op_done_handle(op))
+		op_result(op, n, err)
+	case .Count:
+		mw, err := eng.map_writer(&n.e, o)
+		if err != .None {
+			return
+		}
+		op := new_op(m, .Count, n, oi)
+		op.key = strings.clone(fmt.tprintf("c/%d", rng_int(&w.rng, 2)), w.allocator)
+		op.delta = rng_range(&w.rng, 1, 1000)
+		if rng_chance(&w.rng, 1, 3) {
+			op.delta = -op.delta
+		}
+		_, cerr := omap.count(mw, transmute([]u8)op.key, 7, op.delta)
+		eng.touched(&n.e, o)
+		op_result(op, n, cerr == .None ? .None : .Invalid)
+	case .Redact_Map:
+		t := _pick_op(m, &w.rng, oi, {.Map_Set}, false)
+		if t == nil || t.node != n.idx || t.status == .Uncertain {
+			return
+		}
+		op := new_op(m, .Redact_Map, n, oi)
+		op.target = t.idx
+		op.key = strings.clone(t.key, w.allocator)
+		snapshot_search_models(w, n, op)
+		context = instance_context(&n.inst)
+		err := eng.map_redact(&n.e, o, transmute([]u8)t.key)
+		world_note(w, "%s redact map key %s -> %v", n.name, t.key, err)
+		op_result(op, n, err)
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	}
+}
+
+@(private = "file")
+_op_text :: proc(w: ^World, n: ^Node, k: Op_Kind) {
+	m := &w.model
+	oi := _pick_obj(w, n, .Text)
+	if oi < 0 {
+		return
+	}
+	o := m.objs[oi].o
+	context = instance_context(&n.inst)
+	data, rerr := eng.text_read(&n.e, o, context.temp_allocator)
+	if rerr != .None {
+		return
+	}
+	toks := parse_tokens(data)
+	switch k {
+	case .Text_Insert:
+		pos := len(data)
+		if len(toks) > 0 && rng_chance(&w.rng, 2, 3) {
+			t := toks[rng_int(&w.rng, len(toks))]
+			pos = t.pos if rng_chance(&w.rng, 1, 2) else t.pos + len(t.text)
+		} else if rng_chance(&w.rng, 1, 3) {
+			pos = 0
+		}
+		op := new_op(m, .Text_Insert, n, oi)
+		tok := new_token(m, n, "x")
+		append(&op.tokens, tok)
+		err := eng.text_edit(&n.e, o, pos, 0, tok, op_done_handle(op))
+		world_note(w, "%s text %s insert %s at %d of %q -> %v", n.name, id_short(o.id), tok, pos, string(data), err)
+		op_result(op, n, err)
+	case .Text_Delete, .Redact_Text:
+		if len(toks) == 0 {
+			return
+		}
+		t := toks[rng_int(&w.rng, len(toks))]
+		if k == .Redact_Text {
+			src := _token_op(m, oi, t.text)
+			if src == nil || src.status == .Uncertain {
+				return
+			}
+			op := new_op(m, .Redact_Text, n, oi)
+			append(&op.deletes, strings.clone(t.text, w.allocator))
+			snapshot_search_models(w, n, op)
+			context = instance_context(&n.inst)
+			err := eng.text_redact(&n.e, o, t.pos, len(t.text))
+			world_note(w, "%s redact text %s -> %v", n.name, t.text, err)
+			op_result(op, n, err)
+			return
+		}
+		op := new_op(m, .Text_Delete, n, oi)
+		append(&op.deletes, strings.clone(t.text, w.allocator))
+		err := eng.text_edit(&n.e, o, t.pos, len(t.text), "", op_done_handle(op))
+		world_note(w, "%s text %s delete %s at %d of %q -> %v", n.name, id_short(o.id), t.text, t.pos, string(data), err)
+		op_result(op, n, err)
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	}
+}
+
+_token_op :: proc(m: ^Model, oi: int, tok: string) -> ^M_Op {
+	for op in m.ops {
+		if op.obj != oi {
+			continue
+		}
+		for t in op.tokens {
+			if t == tok {
+				return op
+			}
+		}
+	}
+	return nil
+}
+
+TREE_PATHS :: [?]string{"a.txt", "b.txt", "c.txt"}
+
+@(private = "file")
+_op_tree :: proc(w: ^World, n: ^Node, k: Op_Kind) {
+	m := &w.model
+	oi := _pick_obj(w, n, .Tree)
+	if oi < 0 {
+		return
+	}
+	o := m.objs[oi].o
+	paths := TREE_PATHS
+	path := paths[rng_int(&w.rng, len(paths))]
+	context = instance_context(&n.inst)
+	data, rerr := eng.tree_read(&n.e, o, path, context.temp_allocator)
+	if rerr != .None && rerr != .Not_Found {
+		return
+	}
+	switch k {
+	case .Tree_Write:
+		op := new_op(m, .Tree_Write, n, oi)
+		op.path = strings.clone(path, w.allocator)
+		for t in parse_tokens(data) {
+			append(&op.deletes, strings.clone(t.text, w.allocator))
+		}
+		b := strings.builder_make(context.temp_allocator)
+		for _ in 0 ..< 1 + rng_int(&w.rng, 3) {
+			tok := new_token(m, n, "f")
+			append(&op.tokens, tok)
+			strings.write_string(&b, tok)
+			strings.write_byte(&b, '\n')
+		}
+		err := eng.tree_write(&n.e, o, path, transmute([]u8)strings.to_string(b))
+		world_note(w, "%s tree_write %s/%s saw %v wrote %v -> %v", n.name, id_short(o.id), path, op.deletes[:], op.tokens[:], err)
+		op_result(op, n, err)
+	case .Tree_Remove:
+		if rerr == .Not_Found {
+			return
+		}
+		op := new_op(m, .Tree_Remove, n, oi)
+		op.path = strings.clone(path, w.allocator)
+		for t in parse_tokens(data) {
+			append(&op.deletes, strings.clone(t.text, w.allocator))
+		}
+		if !(path in m.objs[oi].removed) {
+			m.objs[oi].removed[strings.clone(path, w.allocator)] = true
+		}
+		err := eng.tree_remove(&n.e, o, path)
+		world_note(w, "%s tree_remove %s/%s saw %v -> %v", n.name, id_short(o.id), path, op.deletes[:], err)
+		op_result(op, n, err)
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	}
+}
+
+@(private = "file")
+_op_catalog :: proc(w: ^World, n: ^Node, k: Op_Kind) {
+	m := &w.model
+	kind := M_Kind(rng_int(&w.rng, 4))
+	oi := _pick_obj(w, n, kind)
+	if oi < 0 {
+		return
+	}
+	o := m.objs[oi].o
+	context = instance_context(&n.inst)
+	if k == .Usage {
+		if kind != .Convo {
+			return
+		}
+		op := new_op(m, .Usage, n, oi)
+		op.delta = rng_range(&w.rng, 1, 500)
+		eng.catalog_usage(&n.e, o, convo.Usage{input = u64(op.delta)})
+		op_result(op, n, .None)
+		return
+	}
+	op := new_op(m, .Catalog, n, oi)
+	op.token = new_token(m, n, "c")
+	c := eng.Cmd_Catalog_Set{object = o, title = op.token, archived = rng_chance(&w.rng, 1, 4), pinned = rng_chance(&w.rng, 1, 3)}
+	c.set = {.Title}
+	if rng_chance(&w.rng, 1, 2) {
+		c.set += {.Archived, .Pinned}
+	}
+	err := eng.catalog_set(&n.e, c, op_done_handle(op))
+	op_result(op, n, err)
+}
+
+@(private = "file")
+_op_share :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	kind := M_Kind(rng_int(&w.rng, 3))
+	oi := _pick_obj(w, n, kind)
+	if oi < 0 {
+		return
+	}
+	ob := &m.objs[oi]
+	si := space_index(m, ob.o.space)
+	if si < 0 || !space_member(&m.spaces[si], n.idx) {
+		return
+	}
+	cands := make([dynamic]int, context.temp_allocator)
+	for x in w.nodes {
+		if !space_member(&m.spaces[si], x.idx) && !obj_reader(m, oi, x.idx) && x.identity.id != {} && !_has_grant(m, x.idx, ob.o.space) {
+			append(&cands, x.idx)
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	to := cands[rng_int(&w.rng, len(cands))]
+	context = instance_context(&n.inst)
+	access := w.cfg.share_access
+	if access == {} {
+		access = {.Read} if rng_chance(&w.rng, 1, 3) else {.Read, .Write}
+	}
+	share, err := eng.share_object(&n.e, ob.o, w.nodes[to].identity, access)
+	world_note(w, "%s share %s with %s -> %v", n.name, id_short(ob.o.id), w.nodes[to].name, err)
+	if err != .None {
+		return
+	}
+	kinds := [M_Kind]eng.Kind{.Convo = .Conversation, .Map = .Map, .Text = .Text, .Tree = .File_Tree}
+	tok, terr := eng.capability_issue(&n.e, eng.Capability{space = ob.o.space, grantee = w.nodes[to].identity.id, object = ob.o.id, kind = kinds[ob.kind], access = access}, context.temp_allocator)
+	if terr != .None {
+		world_fail(w, "%s capability_issue failed: %v", n.name, terr)
+		return
+	}
+	ps := Pending_Share{share = share, to = to, obj = oi}
+	copy(ps.token[:], tok)
+	op := new_op(m, .Share, n, oi)
+	op.target = to
+	op_result(op, n, .None)
+	append(&m.shares, ps)
+	append(&m.grants, ps)
+	schedule(w, Sim_Event{at = w.now + rng_range(&w.rng, 1, 500) * 1_000_000, kind = .Op, arg = 1})
+}
+
+deliver_shares :: proc(w: ^World) {
+	m := &w.model
+	i := 0
+	for i < len(m.shares) {
+		ps := m.shares[i]
+		n := w.nodes[ps.to]
+		if !n.alive {
+			i += 1
+			continue
+		}
+		ordered_remove(&m.shares, i)
+		si := space_index(m, ps.share.space)
+		context = instance_context(&n.inst)
+		if !space_member(&m.spaces[si], n.idx) {
+			err := eng.space_join_shared(&n.e, ps.share.space, fmt.tprintf("guest%d", si), "relay", w.relay.public)
+			if err != .None && err != .Exists {
+				world_fail(w, "%s space_join_shared failed: %v", n.name, err)
+				node_after(n)
+				continue
+			}
+			if err == .None {
+				oerr := eng.space_open(&n.e, ps.share.space)
+				if oerr != .None {
+					world_note(w, "%s space_open (guest) -> %v", n.name, oerr)
+				}
+			}
+			if !space_guest(&m.spaces[si], n.idx) {
+				append(&m.spaces[si].guests, n.idx)
+			}
+		}
+		err := eng.accept_share(&n.e, ps.share)
+		node_after(n)
+		world_note(w, "%s accept share %s -> %v", n.name, id_short(ps.share.object), err)
+		if err == .None {
+			already := false
+			for x in m.objs[ps.obj].shared {
+				already ||= x == n.idx
+			}
+			if !already {
+				append(&m.objs[ps.obj].shared, n.idx)
+				append(&m.accepted, ps)
+			}
+		} else if n.alive {
+			world_fail(w, "%s accept_share failed: %v", n.name, err)
+		}
+	}
+}
+
+_has_grant :: proc(m: ^Model, idx: int, space: prim.Id) -> bool {
+	for g in m.grants {
+		if g.to == idx && g.share.space == space {
+			return true
+		}
+	}
+	return false
+}
+
+node_credentials :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool) {
+	n := (^Node)(data)
+	m := &n.w.model
+	for &g in m.grants {
+		if g.to != n.idx || g.share.space != space {
+			continue
+		}
+		slot := space_index(m, space)
+		if slot < 0 || slot >= len(n.caps) {
+			return {}, false
+		}
+		c, err := eng.capability_credentials(&n.caps[slot], osync.file_keyring(&n.keyring), g.token[:])
+		return c, err == .None
+	}
+	return {}, false
+}
+
+BULK_WORDS :: [?]string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango"}
+
+setup_bulk :: proc(w: ^World) {
+	m := &w.model
+	n := w.nodes[0]
+	r: Rng
+	rng_init(&r, w.cfg.seed, 31)
+	words := BULK_WORDS
+	for t in 0 ..< 20 {
+		op := new_op(m, .Create, n, len(m.objs))
+		op.token = new_token(m, n, "t")
+		b := strings.builder_make(context.temp_allocator)
+		for strings.builder_len(b) < 64 * 1024 {
+			if rng_chance(&r, 1, 40) {
+				tok := new_token(m, n, "x")
+				append(&op.tokens, tok)
+				strings.write_string(&b, tok)
+			} else {
+				strings.write_string(&b, words[rng_int(&r, len(words))])
+			}
+			strings.write_byte(&b, ' ' if rng_chance(&r, 7, 8) else '\n')
+		}
+		ob := M_Obj{kind = .Text, creator = n.idx, op = op.idx}
+		ob.removed = make(map[string]bool, w.allocator)
+		ob.shared = make([dynamic]int, w.allocator)
+		context = instance_context(&n.inst)
+		o, err := eng.text_create(&n.e, m.spaces[0].id, op.token, strings.to_string(b))
+		ob.o = o
+		append(&m.objs, ob)
+		op_result(op, n, err)
+		node_after(n)
+		_ = t
+	}
+}

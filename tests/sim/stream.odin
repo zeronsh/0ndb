@@ -60,6 +60,7 @@ _words :: proc(r: ^Rng, n: int) -> string {
 op_stream :: proc(w: ^World, n: ^Node, oi: int) {
 	m := &w.model
 	o := m.objs[oi].o
+	node_use(n, o.id)
 	op := new_op(m, .Stream, n, oi)
 	op.token = new_token(m, n, "d")
 	st := new(M_Stream, w.allocator)
@@ -219,6 +220,7 @@ watch_start :: proc(w: ^World, n: ^Node, oi: int) {
 	if !n.alive {
 		return
 	}
+	node_use(n, w.model.objs[oi].o.id)
 	x := new(Watch, w.allocator)
 	x.w = w
 	x.node = n.idx

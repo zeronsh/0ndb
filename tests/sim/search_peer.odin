@@ -70,6 +70,7 @@ _peer_done :: proc(data: rawptr, e: ^eng.Engine, res: ^eng.Result, err: eng.Erro
 			x.matches = nil
 			x.fields = nil
 			append(&q.hits, x)
+			node_use(q.n, h.object)
 			oi := _obj_of(m, h.object)
 			if oi >= 0 && !obj_reader(m, oi, q.n.idx) {
 				world_fail(w, "search: peer query on %s returned object %s it cannot read", q.n.name, id_short(h.object))
