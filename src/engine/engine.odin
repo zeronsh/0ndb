@@ -201,6 +201,7 @@ Config :: struct {
 	runner_pool:     Runner_Pool,
 	runner_alarm:    int,
 	approver:        bool,
+	notices_rotate:  i64,
 	seed_guard:      osync.Seed_Guard,
 	storage:         Storage_Mode,
 	storage_policy:  Storage_Policy,
@@ -276,6 +277,7 @@ Engine :: struct {
 	identity:     osync.Identity,
 	account:      Account_State,
 	approvals:    Approvals,
+	notices:      Notices,
 	self:         prim.Id,
 	hlc:          prim.Hlc,
 	reg:          Registry,
@@ -423,6 +425,9 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	_spaces_load(e) or_return
 	_account_load(e)
 	_redact_recover(e)
+	if e.account.have {
+		_touch(e)
+	}
 	return .None
 }
 
@@ -822,6 +827,9 @@ _fatal :: proc(e: ^Engine, err: Error) {
 
 @(private)
 _emit :: proc(e: ^Engine, ev: Event) {
+	if ev.kind == .Space_Joined || ev.kind == .Members_Changed {
+		_notices_space_changed(e, ev.space)
+	}
 	if e.cfg.events.event != nil {
 		x := ev
 		{

@@ -62,6 +62,9 @@ _rv_open :: proc(e: ^Engine, account: osync.Public_Key, relay: string, relay_pub
 	e.approvals.rv = sp
 	ms := osync.members_scope(osync.Space_Id(sp.id))
 	osync.replicator_follow_segments(&sp.repl, &ms, osync.MEMBERS_STREAM, 0, false)
+	if !requester {
+		_notices_start(e)
+	}
 	if e.cfg.transport.open != nil {
 		conn, err := _transport_open(e, sp)
 		if err != .None {
@@ -81,6 +84,7 @@ _rv_close :: proc(e: ^Engine) {
 	if sp == nil {
 		return
 	}
+	_notices_stop(e)
 	e.approvals.rv = nil
 	_repl_stop(e, sp)
 	sp.open = false
@@ -95,6 +99,10 @@ _rv_on_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	sp := (^Space)(user)
 	e := sp.e
 	context = context_for(e)
+	if _notices_on_event(e, ev) {
+		_touch(e)
+		return
+	}
 	#partial switch ev.kind {
 	case .Direct:
 		if u64(ev.length) != osync.APPROVE_TAG {
@@ -107,6 +115,7 @@ _rv_on_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 		append(&e.approvals.inbox, Inbound{from = prim.Id(ev.device), kind = .Presence, up = ev.from == 1})
 	case .Connected:
 		sp.connected = true
+		_notices_connected(e)
 		append(&e.approvals.inbox, Inbound{kind = .Connected})
 	case .Disconnected:
 		sp.connected = false
@@ -214,6 +223,7 @@ _code_eq :: proc(code: []u8, text: string) -> bool {
 
 @(private)
 _approvals_step :: proc(e: ^Engine) {
+	_notices_step(e)
 	if len(e.approvals.inbox) == 0 {
 		_approvals_check(e)
 		return

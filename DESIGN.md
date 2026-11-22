@@ -1124,6 +1124,55 @@ memory only while enrolling or approving and is cleared afterwards.
   cert | sealed bundle | device sig`, the bundle sealed to the account box and
   holding `(space id, name, relay, relay pub, anchor id, anchor lamport)`,
   where the anchor is the account's own `Add` in that space.
+- **Account notices** carry spaces created or joined after sign-in to the
+  account's other signed-in devices live, since no device holds the account
+  key to read the manifest again. Every signed-in device keeps the account
+  link open (the keyless pseudo-space in the account namespace, the same
+  connection as presence and approvals) and writes its own stream there,
+  `stream_id(notices_scope(account), device, "notices", epoch)`, an
+  ordinary journal with the device's signed chain (seed = the stream id,
+  plaintext). The relay lets account principals read every stream of the
+  namespace and append only to their own (`docs/relay-protocol.md` 6.3).
+  Records (`sync/notices.odin`):
+
+  ```
+  HELLO   1 | device sign [32] | device box [32] | device cert [64]
+  JOIN    2 | target device [16] | space [16]
+            | bytes(seal(target box, ctx "0ndb notice",
+                         name str | relay str | relay pub [32] | proof bytes))
+  REMOVED 3 | device [16]
+  ```
+
+  Every epoch begins with `HELLO`. A reader acts on a stream only after its
+  first record is a `HELLO` whose key hashes to the stream's device id and
+  whose cert verifies against the account, and only on records covered by
+  that key's chain signatures. In each account space the lowest device id
+  among non-removed admins with a verified `HELLO` (or this device) is the
+  announcer: for every known account device that the space has never added,
+  it appends `Add{device, admin, method account}` and a `JOIN` whose proof
+  is that `Add`; for one added but never seen writing, it repeats the
+  existing `Add` as the proof. The target adopts a `JOIN` by
+  `space_join_enrollment` and opening the space, so the runtime then
+  attaches and advertises it like any joined space; a space it already
+  holds (joined, removed or revoked) is left alone, so replays change
+  nothing. `device_remove` appends `REMOVED`; every reader stops trusting
+  that device's stream, no announcer adds it again, and announcers remove
+  it from spaces where it is still present, which starts a new key epoch
+  there as usual.
+
+  **Bounded growth.** Before an append would take the current epoch past
+  64 KiB (`Config.notices_rotate`), the device writes epoch + 1 as one
+  signed commit: `HELLO`, then the snapshot of its outstanding records
+  (every `REMOVED`, and each `JOIN` whose target is not removed and has not
+  yet written to that space's membership), and drops the old epoch once
+  the new one is uploaded. It skips the rotation when the snapshot would be
+  more than half the limit. Readers follow the segment groups of epochs
+  `{0, 1}` and each known device's current epoch and the next one, move to
+  a newer epoch as soon as it appears, and on every connection list the
+  namespace and match unknown streams against the next 64 epochs of their
+  device, so missing rotations while offline is harmless. Nothing is
+  timed: each step reacts to the link, a membership change or a local
+  write, so an idle device has no wakeups.
 - **Sign-in, chosen automatically in this order** (`account_login`):
   1. a registered passkey on this device unlocks the account through the
      `Unlock` plug (PRF over a per-wrapper salt; `Local`);

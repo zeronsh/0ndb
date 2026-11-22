@@ -36,6 +36,7 @@ Mem_World :: struct {
 	pool_inbox: [dynamic]Pool_Note,
 	token_ok:   i64,
 	rng:        Rng,
+	owned:      [dynamic]prim.Id,
 }
 
 Mem_Plug :: struct {
@@ -189,6 +190,7 @@ _node_cfg :: proc(n: ^Node, cfg: ^eng.Config) {
 	cfg.unlock = osync.Unlock{data = p, unlock = _unlock, register = _register}
 	cfg.sealed_store = osync.Sealed_Store{data = p, get = _store_get, put = _store_put, add = _store_add}
 	cfg.approver = true
+	cfg.notices_rotate = 2048
 	if n.idx == M_POOL {
 		cfg.runner_pool = eng.Runner_Pool{data = p, identity = _pool_identity, verify = _pool_verify}
 	} else {
@@ -361,6 +363,7 @@ membership_run :: proc(seed: u64) -> (res: Mem_Result) {
 	mw.record = make([dynamic]u8)
 	mw.entries = make([dynamic][]u8)
 	mw.pool_inbox = make([dynamic]Pool_Note)
+	mw.owned = make([dynamic]prim.Id)
 	rng_init(&mw.rng, seed, 4242)
 	_mw = mw
 	w.node_cfg = _node_cfg
@@ -376,6 +379,7 @@ membership_run :: proc(seed: u64) -> (res: Mem_Result) {
 			delete(x.proof, w.allocator)
 		}
 		delete(mw.pool_inbox)
+		delete(mw.owned)
 		free(mw)
 		world_destroy(w)
 		free(w)
@@ -428,6 +432,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 			return
 		}
 		spaces[i] = id
+		append(&mw.owned, id)
 		o, oerr := eng.convo_create(&a.e, id, eng.Convo_Settings{title = "c"})
 		if oerr != .None {
 			_fail(w, "convo_create: %v", oerr)
@@ -477,6 +482,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 		}
 	}
 	_converged(w, spaces[0], {M_A, M_B}, "after approval")
+	_live_space(w, mw, M_A, {M_B}, "live-from-a")
 
 	_down(w, M_A)
 	_down(w, M_B)
@@ -617,7 +623,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 		context = instance_context(&d.inst)
 		dr, derr := eng.account_login_recovery(&d.e, M_SUBJECT, recovery)
 		node_after(d)
-		if derr != .None || dr.spaces != 2 {
+		if derr != .None || dr.spaces != len(mw.owned) {
 			_fail(w, "recovery sign-in with every device offline: %v spaces=%d", derr, dr.spaces)
 		}
 	}
@@ -630,6 +636,14 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_up(w, M_B)
 	_up(w, M_C)
 	_settle(w, 3000)
+	_live_space(w, mw, M_C, {M_A, M_B, M_D}, "live-from-c")
+	_down(w, M_D)
+	if _, o, r, ok := _live_space(w, mw, M_A, {M_B, M_C}, "live-while-d-down"); ok {
+		_up(w, M_D)
+		if !_wait_read(w, M_D, o, r, "live-while-d-down", 30_000) {
+			_fail(w, "n5 never opened the space created while it was offline")
+		}
+	}
 	b := w.nodes[M_B]
 	x_card: [osync.CARD_LEN]u8
 	{
@@ -777,6 +791,95 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_settle(w, 3000)
 	_converged(w, spaces[0], {M_A, M_C, M_D}, "final")
 	_converged(w, spaces[1], {M_A, M_C, M_D}, "final space1")
+	_every_device_opens(w, mw, {M_A, M_B, M_C, M_D})
+	{
+		context = instance_context(&a.inst)
+		_, rerr := eng.device_remove(&a.e, w.nodes[M_B].identity.id)
+		node_after(a)
+		if rerr != .None {
+			_fail(w, "device_remove: %v", rerr)
+		}
+	}
+	_settle(w, 3000)
+	if id, _, _, ok := _live_space(w, mw, M_C, {M_A, M_D}, "after-device-remove"); ok {
+		_settle(w, 3000)
+		b := w.nodes[M_B]
+		context = instance_context(&b.inst)
+		for x in eng.space_list(&b.e, context.temp_allocator) {
+			if x.id == id {
+				_fail(w, "the removed n1 was handed a space created after its removal")
+			}
+		}
+		node_after(b)
+	}
+}
+
+@(private = "file")
+_live_space :: proc(w: ^World, mw: ^Mem_World, from: int, readers: []int, name: string) -> (id: prim.Id, o: eng.Object, r: eng.Rid, ok: bool) {
+	n := _up(w, from)
+	context = instance_context(&n.inst)
+	sid, cerr := eng.space_create(&n.e, name, "relay", w.relay.public)
+	if cerr != .None {
+		node_after(n)
+		_fail(w, "%s: space_create on n%d: %v", name, from, cerr)
+		return
+	}
+	obj, oerr := eng.convo_create(&n.e, sid, eng.Convo_Settings{title = name})
+	node_after(n)
+	append(&mw.owned, sid)
+	if oerr != .None {
+		_fail(w, "%s: convo_create on n%d: %v", name, from, oerr)
+		return
+	}
+	rid, sent := _send(w, from, obj, name)
+	if !sent {
+		_fail(w, "%s: send on n%d", name, from)
+		return
+	}
+	for idx in readers {
+		if !_wait_read(w, idx, obj, rid, name, 30_000) {
+			_fail(w, "%s: signed-in n%d never opened the space n%d created", name, idx, from)
+		}
+	}
+	return sid, obj, rid, true
+}
+
+@(private = "file")
+_every_device_opens :: proc(w: ^World, mw: ^Mem_World, idxs: []int) {
+	missing := 0
+	who := 0
+	what: prim.Id
+	for _ in 0 ..< 200 {
+		missing = 0
+		for idx in idxs {
+			n := w.nodes[idx]
+			if !n.alive {
+				continue
+			}
+			context = instance_context(&n.inst)
+			list := eng.space_list(&n.e, context.temp_allocator)
+			for s in mw.owned {
+				found := false
+				for x in list {
+					if x.id == s && x.open {
+						found = true
+					}
+				}
+				if !found {
+					missing += 1
+					who = idx
+					what = s
+				}
+			}
+			node_after(n)
+		}
+		context = w.ctx
+		if missing == 0 {
+			return
+		}
+		_settle(w, 100)
+	}
+	_fail(w, "%d account spaces were never opened by a signed-in device, e.g. n%d %s", missing, who, id_short(what))
 }
 
 @(test)
