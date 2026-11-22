@@ -304,10 +304,29 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 	_registry_drop_space(e, id, objs) or_return
 	delete_key(&e.spaces, id)
 	_space_free(e, sp)
+	_waiters_fail_space(e, id, .Permission)
+	_leave_waits_fail(e, id)
 	ent, _ := _left_get(e, id)
 	_left_set(e, Left_Entry{space = id, state = LEFT_DONE, target = ent.target}) or_return
 	_emit(e, Event{kind = .Space_Left, space = id})
 	return .None
+}
+
+@(private)
+_leave_waits_fail :: proc(e: ^Engine, space: prim.Id) {
+	fail := make([dynamic]Space_Wait, context.temp_allocator)
+	for i := 0; i < len(e.space_waits); {
+		w := e.space_waits[i]
+		if w.space == space {
+			ordered_remove(&e.space_waits, i)
+			append(&fail, w)
+			continue
+		}
+		i += 1
+	}
+	for w in fail {
+		_space_wait_finish(e, w, .Permission)
+	}
 }
 
 @(private)
