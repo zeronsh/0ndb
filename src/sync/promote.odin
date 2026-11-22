@@ -24,7 +24,6 @@ Promotion :: struct {
 	length:   i64,
 	state:    Promotion_State,
 	sent:     i64,
-	hollow:   bool,
 	uploaded: i64,
 }
 
@@ -140,7 +139,6 @@ _promote_on_noted :: proc(r: ^Replicator, id: Stream_Id, base, length: i64) {
 	if p == nil || p.state == .Done {
 		return
 	}
-	p.hollow = true
 	if p.state == .Filling && base < p.base {
 		p.uploaded += p.base - base
 	}
@@ -150,22 +148,28 @@ _promote_on_noted :: proc(r: ^Replicator, id: Stream_Id, base, length: i64) {
 }
 
 @(private)
-_promote_on_probed :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
-	p, _ := _promotion_find(r, id)
-	if p == nil || p.state != .Probe || p.sent != -1 {
-		return
-	}
-	if !p.hollow {
-		p.base = 0
-		p.length = length
-	}
-	p.state = .Ready
-}
-
-@(private)
 _promote_on_refused :: proc(r: ^Replicator, id: Stream_Id, code: Code) -> bool {
 	p, _ := _promotion_find(r, id)
-	if p == nil || p.state != .Filling {
+	if p == nil {
+		return false
+	}
+	if p.state == .Probe && p.sent == -1 {
+		#partial switch code {
+		case .Not_Found:
+			p.base = 0
+			p.length = 0
+			_promotion_done(r, p, true)
+		case .Busy, .Io:
+			p.sent = 0
+			if r.retry == 0 {
+				r.retry = prim.timer(r.loop, RETRY_MS, r, _on_retry)
+			}
+		case:
+			_promotion_done(r, p, false)
+		}
+		return true
+	}
+	if p.state != .Filling {
 		return false
 	}
 	if code == .Busy || code == .Io {
@@ -194,18 +198,8 @@ _promotions_pump :: proc(r: ^Replicator) {
 		p := r.promos[i]
 		switch p.state {
 		case .Probe:
-			if p.sent != -1 && !_own_busy(r, p) {
-				p.hollow = false
-				if p.own {
-					if client_note(&r.client, p.id, 0) == .None {
-						p.sent = -1
-					}
-				} else {
-					ids := [1]Stream_Id{p.id}
-					if client_probe(&r.client, ids[:]) == .None {
-						p.sent = -1
-					}
-				}
+			if p.sent != -1 && !_own_busy(r, p) && client_fill_ask(&r.client, p.id) == .None {
+				p.sent = -1
 			}
 		case .Retry:
 			p.state = .Ready

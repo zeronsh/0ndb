@@ -129,7 +129,6 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 	}
 	rm, ok := r.remotes[id]
 	if !ok {
-		_promote_on_noted(r, id, ev.base, ev.length)
 		return
 	}
 	_remote_base(r, rm, ev.base, ev.length)

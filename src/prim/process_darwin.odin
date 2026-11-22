@@ -245,3 +245,17 @@ reap :: proc "contextless" (pid: Pid, block := false) -> (status: Exit_Status, d
 	}
 	return _decode_wait(u32(st)), true, .None
 }
+
+self_pid :: proc "contextless" () -> Pid {
+	return Pid(posix.getpid())
+}
+
+process_alive :: proc "contextless" (pid: Pid) -> bool {
+	if pid <= 0 {
+		return false
+	}
+	if posix.kill(posix.pid_t(pid), posix.Signal(0)) == .OK {
+		return true
+	}
+	return posix.errno() == .EPERM
+}

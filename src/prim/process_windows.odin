@@ -804,3 +804,19 @@ spawn :: proc(
 	}
 	return child, .None
 }
+
+self_pid :: proc "contextless" () -> Pid {
+	return Pid(win.GetCurrentProcessId())
+}
+
+process_alive :: proc "contextless" (pid: Pid) -> bool {
+	if pid <= 0 {
+		return false
+	}
+	p := win.OpenProcess(SYNCHRONIZE, false, u32(pid))
+	if p == nil {
+		return win.GetLastError() != ERROR_INVALID_PARAMETER
+	}
+	defer win.CloseHandle(p)
+	return win.WaitForSingleObject(p, 0) != 0
+}

@@ -110,6 +110,7 @@ Disk :: struct {
 	wall:      proc(data: rawptr) -> i64,
 	wall_data: rawptr,
 	crash_at:  u64,
+	crash_ref_lock: u64,
 	dead:      bool,
 	fail_sync: u64,
 	fail_rate: u64,
@@ -507,6 +508,10 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 	d.trace = mix_str(d.trace, trace_path(path))
 	if d.verbose {
 		fmt.eprintf("dop %s open %s\n", d.name, path)
+	}
+	if d.crash_ref_lock > 0 && .Create in flags && .Exclusive in flags && strings.contains(path, "/refs/0ndb/") && strings.has_suffix(path, ".lock") {
+		d.crash_at = d.stats.ops + d.crash_ref_lock
+		d.crash_ref_lock = 0
 	}
 	lk, err := _lookup(d, path, true)
 	if err != .None {

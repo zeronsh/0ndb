@@ -5,6 +5,7 @@ import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 import eng "../../src/engine"
+import "../../src/odb"
 import "../../src/pack"
 import "../../src/prim"
 import osync "../../src/sync"
@@ -75,6 +76,16 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.write_observer = sim_observer(n)
 	cfg.watcher = sim_watcher(n)
 	cfg.embedder = sim_embedder()
+	prim.put_u64le(cfg.instance[0:8], w.cfg.seed)
+	prim.put_u64le(cfg.instance[8:16], u64(n.idx) << 32 | u64(n.incarnation))
+	cfg.lock_liveness = odb.Lock_Liveness{data = w, alive = proc(data: rawptr, owner: odb.Lock_Owner) -> bool {
+		for x in (^World)(data).nodes {
+			if x.alive && x.e_open && x.e.instance == owner.instance {
+				return true
+			}
+		}
+		return false
+	}}
 	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
 		return {}
 	}}

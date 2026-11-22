@@ -61,6 +61,9 @@ Odb :: struct {
 	tick:           u64,
 	next_pack:      u32,
 	mutex:          sync.Mutex,
+	lock_owner:     Lock_Owner,
+	lock_live:      Lock_Liveness,
+	lock_marked:    bool,
 }
 
 @(private)

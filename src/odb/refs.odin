@@ -200,18 +200,139 @@ read_head :: proc(db: ^Odb, allocator := context.allocator) -> (branch: string, 
 
 @(private)
 Ref_Lock :: struct {
-	fd:        prim.Fd,
-	held:      bool,
-	path_buf:  [PATH_MAX]u8,
-	lock_buf:  [PATH_MAX]u8,
-	path:      string,
-	lock_path: string,
-	base:      string,
-	created:   bool,
+	fd:          prim.Fd,
+	held:        bool,
+	marked:      bool,
+	path_buf:    [PATH_MAX]u8,
+	lock_buf:    [PATH_MAX]u8,
+	marker_buf:  [PATH_MAX]u8,
+	path:        string,
+	lock_path:   string,
+	marker_path: string,
+	base:        string,
+	created:     bool,
+}
+
+Lock_Owner :: struct {
+	boot:     prim.Id,
+	pid:      i64,
+	instance: prim.Id,
+}
+
+Lock_Liveness :: struct {
+	data:  rawptr,
+	alive: proc(data: rawptr, owner: Lock_Owner) -> bool,
+}
+
+set_lock_owner :: proc(db: ^Odb, owner: Lock_Owner, live: Lock_Liveness) {
+	db.lock_owner = owner
+	db.lock_live = live
+	db.lock_marked = true
 }
 
 @(private)
-ref_lock :: proc(db: ^Odb, name: string, l: ^Ref_Lock) -> Error {
+MARKER_MAGIC :: "0ndblck1"
+
+@(private)
+MARKER_SIZE :: len(MARKER_MAGIC) + 16 + 8 + 16 + 1 + MAX_HEX + 1
+
+@(private)
+Lock_Marker :: struct {
+	owner: Lock_Owner,
+	value: [MAX_HEX + 1]u8,
+	vlen:  int,
+}
+
+@(private)
+marker_write :: proc(db: ^Odb, l: ^Ref_Lock, mk: Lock_Marker, sync_parent: bool) -> Error {
+	buf: [MARKER_SIZE]u8
+	copy(buf[:], MARKER_MAGIC)
+	at := len(MARKER_MAGIC)
+	b := mk.owner.boot
+	copy(buf[at:], b[:])
+	at += 16
+	prim.put_u64le(buf[at:], u64(mk.owner.pid))
+	at += 8
+	ins := mk.owner.instance
+	copy(buf[at:], ins[:])
+	at += 16
+	buf[at] = u8(mk.vlen)
+	at += 1
+	v := mk.value
+	copy(buf[at:], v[:mk.vlen])
+	fd, err := prim.open_file(db.vfs, l.marker_path, {.Write, .Create, .Truncate}, 0o644)
+	if err != .None {
+		return perr(err)
+	}
+	werr := prim.write_at(db.vfs, fd, buf[:], 0)
+	if werr == .None {
+		werr = prim.datasync(db.vfs, fd)
+	}
+	prim.close_file(db.vfs, fd)
+	if werr != .None {
+		return perr(werr)
+	}
+	if sync_parent {
+		return perr(prim.sync_dir(db.vfs, parent_dir(l.marker_path)))
+	}
+	return .None
+}
+
+@(private)
+marker_read :: proc(db: ^Odb, l: ^Ref_Lock) -> (mk: Lock_Marker, ok: bool) {
+	buf: [MARKER_SIZE + 1]u8
+	fd, err := prim.open_file(db.vfs, l.marker_path)
+	if err != .None {
+		return
+	}
+	n, rerr := prim.read_at(db.vfs, fd, buf[:], 0)
+	prim.close_file(db.vfs, fd)
+	if rerr != .None || n != MARKER_SIZE || string(buf[:len(MARKER_MAGIC)]) != MARKER_MAGIC {
+		return
+	}
+	at := len(MARKER_MAGIC)
+	copy(mk.owner.boot[:], buf[at:at + 16])
+	at += 16
+	mk.owner.pid = i64(prim.get_u64le(buf[at:]))
+	at += 8
+	copy(mk.owner.instance[:], buf[at:at + 16])
+	at += 16
+	mk.vlen = int(buf[at])
+	at += 1
+	if mk.vlen > len(mk.value) {
+		return
+	}
+	copy(mk.value[:], buf[at:at + mk.vlen])
+	return mk, true
+}
+
+@(private)
+lock_stale :: proc(db: ^Odb, l: ^Ref_Lock) -> bool {
+	mk, ok := marker_read(db, l)
+	if !ok {
+		return false
+	}
+	content: [MAX_HEX + 2]u8
+	fd, oerr := prim.open_file(db.vfs, l.lock_path)
+	if oerr != .None {
+		return false
+	}
+	n, rerr := prim.read_at(db.vfs, fd, content[:], 0)
+	prim.close_file(db.vfs, fd)
+	if rerr != .None || (n != 0 && string(content[:n]) != string(mk.value[:mk.vlen])) {
+		return false
+	}
+	if mk.owner.boot != db.lock_owner.boot {
+		return true
+	}
+	if db.lock_live.alive == nil {
+		return false
+	}
+	return !db.lock_live.alive(db.lock_live.data, mk.owner)
+}
+
+@(private)
+ref_lock :: proc(db: ^Odb, name: string, l: ^Ref_Lock, value: []u8 = nil) -> Error {
 	if !ref_name_valid(name) {
 		return .Invalid
 	}
@@ -224,12 +345,36 @@ ref_lock :: proc(db: ^Odb, name: string, l: ^Ref_Lock) -> Error {
 	if e := prim.mkdir_all(db.vfs, parent); e != .None {
 		return perr(e)
 	}
+	if db.lock_marked {
+		l.marker_path = concat_into(l.marker_buf[:], l.lock_path, ".0ndb") or_return
+		if _, serr := prim.lstat(db.vfs, l.lock_path); serr == .None {
+			if !lock_stale(db, l) {
+				return .Locked
+			}
+			prim.remove(db.vfs, l.lock_path)
+			prim.remove(db.vfs, l.marker_path)
+			perr(prim.sync_dir(db.vfs, parent)) or_return
+		}
+		if len(value) > MAX_HEX + 1 {
+			return .Invalid
+		}
+		intent := Lock_Marker{owner = db.lock_owner, vlen = len(value)}
+		copy(intent.value[:], value)
+		marker_write(db, l, intent, true) or_return
+	}
 	fd, err := prim.open_file(db.vfs, l.lock_path, {.Write, .Create, .Exclusive}, 0o644)
 	if err != .None {
+		if db.lock_marked {
+			prim.remove(db.vfs, l.marker_path)
+		}
 		return .Locked if err == .Exists else perr(err)
 	}
 	l.fd = fd
 	l.held = true
+	l.marked = db.lock_marked
+	if len(value) > 0 {
+		perr(prim.write_at(db.vfs, fd, value, 0)) or_return
+	}
 	return .None
 }
 
@@ -240,7 +385,13 @@ ref_unlock :: proc(db: ^Odb, l: ^Ref_Lock) {
 		l.held = false
 		prim.remove(db.vfs, l.lock_path)
 	}
+	if l.marked {
+		l.marked = false
+		prim.remove(db.vfs, l.marker_path)
+	}
 }
+
+
 
 @(private)
 ref_check_expected :: proc(db: ^Odb, name: string, expected: Maybe(Oid)) -> (current: Ref_Value, err: Error) {
@@ -264,18 +415,15 @@ update_ref :: proc(db: ^Odb, name: string, new: Oid, expected: Maybe(Oid) = nil)
 	if new == ZERO_OID {
 		return .Invalid
 	}
-	l: Ref_Lock
-	ref_lock(db, name, &l) or_return
-	defer ref_unlock(db, &l)
-	ref_check_expected(db, name, expected) or_return
 	hb: [MAX_HEX + 1]u8
 	hex_buf: [MAX_HEX]u8
 	hex := oid_to_string(new, db.format, &hex_buf)
 	n := copy(hb[:], hex)
 	hb[n] = '\n'
-	if e := prim.write_at(db.vfs, l.fd, hb[:n + 1], 0); e != .None {
-		return perr(e)
-	}
+	l: Ref_Lock
+	ref_lock(db, name, &l, hb[:n + 1]) or_return
+	defer ref_unlock(db, &l)
+	ref_check_expected(db, name, expected) or_return
 	if db.sync_writes {
 		perr(prim.datasync(db.vfs, l.fd)) or_return
 	}

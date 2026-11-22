@@ -237,6 +237,7 @@ inject_fault :: proc(w: ^World, r: ^Rng) {
 		w.cfg.fault_rate * 2,
 		w.cfg.fault_rate * 2,
 		1,
+		w.cfg.crash_rate,
 	}
 	k := rng_pick(r, weights[:])
 	n := w.nodes[rng_int(r, len(w.nodes))]
@@ -284,6 +285,11 @@ inject_fault :: proc(w: ^World, r: ^Rng) {
 	case 6:
 		if n.alive {
 			n.disk.fail_sync = 0
+		}
+	case 7:
+		if n.alive {
+			n.disk.crash_ref_lock = 1 + u64(rng_range(r, 0, 6))
+			world_note(w, "%s armed crash %d disk ops after its next refs/0ndb lock", n.name, n.disk.crash_ref_lock)
 		}
 	}
 }

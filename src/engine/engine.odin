@@ -176,6 +176,8 @@ Config :: struct {
 	write_observer:  fs.Write_Observer,
 	watcher:         fs.Watcher,
 	boot_id:         Boot_Source,
+	lock_liveness:   odb.Lock_Liveness,
+	instance:        prim.Id,
 	search_options:  search.Options,
 	durability:      Durability,
 	verify_chains:   bool,
@@ -248,6 +250,7 @@ Stats :: struct {
 
 Engine :: struct {
 	cfg:          Config,
+	instance:     prim.Id,
 	unavailable:  map[prim.Id][dynamic]prim.Id,
 	allocator:    runtime.Allocator,
 	dir:          string,
@@ -418,6 +421,10 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	}
 	e.identity = osync.keyring_identity(&e.keyring)
 	e.self = e.identity.id
+	e.instance = e.cfg.instance
+	if e.instance == {} {
+		prim.random_fill(e.cfg.random, e.instance[:])
+	}
 	_registry_open(e) or_return
 	_registry_recover(e) or_return
 	_spaces_load(e) or_return

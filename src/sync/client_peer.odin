@@ -24,6 +24,21 @@ client_trim :: proc(c: ^Client, id: Stream_Id, base: i64) -> Error {
 	return .None
 }
 
+client_fill_ask :: proc(c: ^Client, id: Stream_Id) -> Error {
+	b := _client_buf(c)
+	start := len(b)
+	if rerr := resize(b, start + FRAME_HEADER + FILL_FIXED); rerr != nil {
+		resize(b, start)
+		return .No_Memory
+	}
+	frame_header(b[start:], .Fill, FILL_FIXED)
+	sid := id
+	copy(b[start + FRAME_HEADER:], sid[:])
+	prim.put_u64le(b[start + FRAME_HEADER + 32:], 0)
+	_await_add(c, cast([32]u8)id)
+	return .None
+}
+
 client_fill_reserve :: proc(c: ^Client, id: Stream_Id, at: i64, n: int) -> (dst: []u8, err: Error) {
 	if n <= 0 || n > APPEND_MAX {
 		return nil, .Too_Large

@@ -198,6 +198,11 @@ device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
 		if oerr := odb.open_store(&e.db, e.base, dir, nil, .Sha1, e.allocator, e.cfg.clock, e.cfg.random); oerr != .None {
 			return nil, _derr(oerr)
 		}
+		live := e.cfg.lock_liveness
+		if live.alive == nil {
+			live = odb.Lock_Liveness{data = e, alive = _lock_alive}
+		}
+		odb.set_lock_owner(&e.db, odb.Lock_Owner{boot = boot_id(e), pid = i64(prim.self_pid()), instance = e.instance}, live)
 		e.db_open = true
 	}
 	return &e.db, .None
@@ -470,7 +475,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 					continue
 				}
 				if rerr == .Missing {
-					r := [1]journal.Range{{pos, end}}
+					r := [1]journal.Range{s.jr.missing}
 					if h.sp.repl_on {
 						osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
 					}
@@ -609,4 +614,13 @@ conflicts_clear :: proc(e: ^Engine, o: Object, kind: Kind) -> Error {
 	h := _handle_get(e, o, kind) or_return
 	_hist_ready(e, h) or_return
 	return _ferr(fs.history_text_conflicts_clear(h.hist))
+}
+
+@(private)
+_lock_alive :: proc(data: rawptr, owner: odb.Lock_Owner) -> bool {
+	e := (^Engine)(data)
+	if prim.Pid(owner.pid) == prim.self_pid() {
+		return owner.instance != e.instance
+	}
+	return prim.process_alive(prim.Pid(owner.pid))
 }
