@@ -38,6 +38,7 @@ Tier_Kind :: enum u8 {
 	Redact = 6,
 	Trim   = 7,
 	Evict  = 8,
+	Redacting = 9,
 	Dirty  = 0x10,
 	Clean  = 0x11,
 	Flushed = 0x12,
@@ -102,6 +103,7 @@ Tier_Space :: struct {
 	ev_fly:    [dynamic]Tier_Ev,
 	evicting:  int,
 	thawing:   map[Stream_Id]int,
+	redacting: map[Stream_Id]int,
 }
 
 @(private)
@@ -265,6 +267,7 @@ _tier_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err
 	sp.ev_q = make([dynamic]Tier_Ev, t.allocator)
 	sp.ev_fly = make([dynamic]Tier_Ev, t.allocator)
 	sp.thawing = make(map[Stream_Id]int, t.allocator)
+	sp.redacting = make(map[Stream_Id]int, t.allocator)
 	t.spaces[id] = sp
 	if lerr := _tier_load(sp); lerr != .None {
 		delete_key(&t.spaces, id)
@@ -309,6 +312,7 @@ _tier_space_free :: proc(t: ^Tier_Store, sp: ^Tier_Space) {
 	delete(sp.ev_q)
 	delete(sp.ev_fly)
 	delete(sp.thawing)
+	delete(sp.redacting)
 	if sp.man != nil {
 		t.inner.stream_close(t.inner.data, sp.man)
 	}
@@ -402,11 +406,19 @@ _tier_load :: proc(sp: ^Tier_Space) -> Error {
 }
 
 @(private)
+Tier_Red_Key :: struct {
+	id: Stream_Id,
+	at: i64,
+	n:  i64,
+}
+
+@(private)
 _tier_rescan :: proc(sp: ^Tier_Space, manifest: []u8) {
 	t := sp.t
 	covered := make(map[Stream_Id][2]i64, context.temp_allocator)
 	gone := make(map[Stream_Id]bool, context.temp_allocator)
 	objs := make(map[Object_Key]bool, context.temp_allocator)
+	pend := make(map[Tier_Red_Key]int, context.temp_allocator)
 	for i := 0; i + TIER_RECORD <= len(manifest); i += TIER_RECORD {
 		r := manifest[i:][:TIER_RECORD]
 		id: Stream_Id
@@ -438,6 +450,24 @@ _tier_rescan :: proc(sp: ^Tier_Space, manifest: []u8) {
 			objs[cast(Object_Key)id] = true
 		case .Forget:
 			objs[cast(Object_Key)id] = false
+		case .Redacting:
+			pend[Tier_Red_Key{id, at, n}] += 1
+		case .Redact:
+			if k := (Tier_Red_Key{id, at, n}); pend[k] > 0 {
+				pend[k] -= 1
+			}
+		}
+	}
+	for k, c in pend {
+		for _ in 0 ..< c {
+			s := sp.segs[k.id]
+			if s.redacts == nil {
+				s.redacts = make([dynamic][2]i64, t.allocator)
+			}
+			append(&s.redacts, [2]i64{k.at, k.at + k.n})
+			sp.segs[k.id] = s
+			sp.redacting[k.id] += 1
+			_tier_dirty(sp, 0)
 		}
 	}
 	it, _, lerr := t.inner.list_begin(t.inner.data, sp.ns, 0)
@@ -677,6 +707,9 @@ _tier_job_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	j := cast(^Tier_Job)ctx
 	sp := j.sp
 	t := sp.t
+	if result != .None && j.kind == .Redact {
+		_tier_unredact(sp, cast(Stream_Id)j.id, 1)
+	}
 	if result == .None {
 		id := cast(Stream_Id)j.id
 		switch j.kind {
@@ -722,10 +755,23 @@ _tier_job_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			sp.usage -= value
 			sp.objs[cast(Object_Key)j.id] = false
 			_tier_dirty(sp, 0)
-		case .None, .Dirty, .Clean, .Flushed, .Evict:
+		case .None, .Dirty, .Clean, .Flushed, .Evict, .Redacting:
 		}
 	}
 	done, cctx, gate := j.done, j.ctx, j.gate
+	if j.kind == .Redact && result == .None {
+		r: [TIER_RECORD]u8
+		r[0] = u8(Tier_Kind.Redacting)
+		copy(r[8:40], j.id[:])
+		prim.put_u64le(r[40:], u64(j.at))
+		prim.put_u64le(r[48:], u64(j.n))
+		prim.put_u64le(r[56:], sp.seq)
+		append(&sp.man_q, ..r[:])
+		append(&sp.ev_q, Tier_Ev{id = cast(Stream_Id)j.id, hold = Tier_Hold{done = done, ctx = cctx, result = result, value = value}})
+		free(j, t.allocator)
+		_tier_man_flush(sp)
+		return
+	}
 	free(j, t.allocator)
 	if gate && sp.mark != .Marked {
 		append(&sp.man_wait, Tier_Hold{done = done, ctx = cctx, result = result, value = value})
@@ -988,6 +1034,9 @@ _tier_put_done :: proc(ctx: rawptr, result: Error, value: i64) {
 		sp.account.writes += 1
 		sp.account.write_bytes += u64(f.n)
 		append(&sp.man_q, ..f.entries[:])
+		for id, g in f.segs {
+			_tier_unredact(sp, id, len(g.redacts))
+		}
 		_tier_cold_note(sp, f.entries[:], f.segs)
 		for _, &g in f.segs {
 			delete(g.redacts)
@@ -1173,12 +1222,24 @@ _tier_drop :: proc(data: rawptr, ns: rawptr, id: Stream_Id, done: Storage_Done, 
 _tier_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, ctx: rawptr) {
 	t := cast(^Tier_Store)data
 	ts := cast(^Tier_Stream)s
+	ts.sp.redacting[ts.id] += 1
 	j := _tier_job(ts.sp, .Redact, cast([32]u8)ts.id, from, to - from, done, ctx)
 	if c := _tier_cold_of(ts); c != nil && from < c.upto {
 		_tier_thaw_start(t, ts, c, from, to, j)
 		return
 	}
 	t.inner.redact(t.inner.data, ts.h, from, to, _tier_job_done, j)
+}
+
+@(private)
+_tier_unredact :: proc(sp: ^Tier_Space, id: Stream_Id, n: int) {
+	if n <= 0 {
+		return
+	}
+	sp.redacting[id] -= n
+	if sp.redacting[id] <= 0 {
+		delete_key(&sp.redacting, id)
+	}
 }
 
 @(private)
