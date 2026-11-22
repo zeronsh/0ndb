@@ -306,6 +306,7 @@ impl Client {
     }
 
     pub fn convo_mount(&self, object: &str, name: &str, tree: &str, path: &str) -> Pending<WriteResult> {
+        let tree = tree.rsplit('/').next().unwrap_or(tree);
         self.call(&json!({"op": "mount", "object": object, "name": name, "tree": tree, "path": path}))
     }
 
