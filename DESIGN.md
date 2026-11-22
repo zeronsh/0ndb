@@ -551,6 +551,28 @@ equal in both directions.
   nothing seems to vanish. `carry = true` gives a 0ndb switch git's semantics;
   `.Fork` moves held runs into an isolated fork of the old line that lands on
   completion; `.Stop` cancels them. The default is never asked.
+- **Git's lock and our handles**: 0ndb never holds a handle on anything
+  under `.git` or the work tree across a loop turn. Windows refuses to
+  rename onto a file that another process has open, even with
+  `FILE_SHARE_DELETE`, and git's retries are short. A daemon holding
+  `.git/index` while git renamed `index.lock` onto it left `git checkout`
+  failing with `unable to write new index file`: the work tree was
+  switched, but the index and HEAD were not. The index reader therefore
+  reopens the index by path for each window it reads (1 MiB), checks it is
+  the same file (size, mtime, inode), and closes it again; a replaced index
+  ends the scan with `.Changed`. Tree reads open with
+  `FILE_SHARE_READ|WRITE|DELETE` and close before returning. On every OS,
+  while `.git/index.lock` exists and its creator is alive, the mount runs
+  one pass (paths dirtied before the lock) and then no batches until the
+  lock disappears or the creator exits. Lock-gone schedules the next batch;
+  fences still run. The creator is a `git` process found by a bounded
+  process scan: one holding the lock open or with its cwd at the
+  repository (`/proc` on Linux, libproc on macOS, Restart Manager and
+  `git.exe` on Windows), watched by child watch. A lock with no live
+  creator is stale: batches run as usual and the mount shows a passive
+  `stale .git/index.lock` status. `git commit` keeps the lock for the whole
+  editor session, so batches wait for the editor too. Nothing is lost:
+  dirty paths stay marked.
 - **Raw checkouts** (planned) follow git's write order (`builtin/checkout.c`:
   `merge_working_tree` takes `.git/index.lock`, `unpack_trees` unlinks then
   writes working files, `write_locked_index` renames the lock; only then

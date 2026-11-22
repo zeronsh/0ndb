@@ -83,7 +83,7 @@ window_live :: proc(w: ^Window) -> int {
 }
 
 window_observer :: proc(w: ^Window) -> fs.Write_Observer {
-	return fs.Write_Observer{data = w, start = _window_start, stop = _window_stop, changed = _window_hook, fence = _window_fence}
+	return fs.Write_Observer{data = w, start = _window_start, stop = _window_stop, changed = _window_hook, fence = _window_fence, lock_procs = _window_lock_procs}
 }
 
 window_changed :: proc(w: ^Window, m: ^fs.Mount, rel: string) -> (scope: ^fs.Scope, found: bool) {
@@ -155,4 +155,9 @@ _window_hook :: proc(data: rawptr, m: ^fs.Mount, rel: string) -> (^fs.Scope, boo
 @(private)
 _window_fence :: proc(data: rawptr, reg: ^fs.Registry, done: proc(data: rawptr), done_data: rawptr) {
 	done(done_data)
+}
+
+@(private)
+_window_lock_procs :: proc(data: rawptr, lock: string, roots: []string, allocator: runtime.Allocator) -> []fs.Git_Proc {
+	return _win_lock_procs(lock, roots, allocator)
 }

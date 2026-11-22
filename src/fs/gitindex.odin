@@ -4,6 +4,7 @@ import "base:intrinsics"
 import "base:runtime"
 import "core:bytes"
 import "core:encoding/endian"
+import "core:strings"
 import "core:sync"
 import "core:thread"
 import "../odb"
@@ -74,7 +75,7 @@ Cache_Tree :: struct {
 }
 
 @(private = "file")
-INDEX_WINDOW :: 256 * 1024
+INDEX_WINDOW :: 1024 * 1024
 
 @(private = "file")
 INDEX_HEADER :: 12
@@ -92,9 +93,18 @@ INDEX_NO_BIT :: max(int)
 INDEX_THREAD_MIN :: 4 * 1024 * 1024
 
 @(private = "file")
+Index_Ident :: struct {
+	size:     i64,
+	mtime_ns: i64,
+	ino:      u64,
+	dev:      u64,
+}
+
+@(private = "file")
 Index_Hash_Job :: struct {
 	vfs:    prim.Vfs,
-	fd:     prim.Fd,
+	file:   string,
+	ident:  Index_Ident,
 	limit:  i64,
 	format: odb.Hash_Format,
 	buf:    []u8,
@@ -107,8 +117,8 @@ Index_Hash_Job :: struct {
 @(private = "file")
 Index_Cursor :: struct {
 	vfs:         prim.Vfs,
-	fd:          prim.Fd,
-	owns_fd:     bool,
+	file:        string,
+	ident:       Index_Ident,
 	buf:         []u8,
 	base:        i64,
 	pos:         int,
@@ -256,11 +266,7 @@ idx_open :: proc(r: ^Index_Reader, git_dir: string, format: odb.Hash_Format, all
 	r.main.vfs = r.vfs
 	idx_cursor_open(&r.main, path, format, allocator) or_return
 	r.version = r.main.version
-	st, serr := prim.fstat(r.vfs, r.main.fd)
-	if serr != .None {
-		return from_prim(serr)
-	}
-	r.mtime_ns = st.mtime_ns
+	r.mtime_ns = r.main.ident.mtime_ns
 	start, has_link, found := idx_eoie(&r.main)
 	if (found && !has_link) || (!found && !idx_has_shared(r.vfs, git_dir, allocator)) {
 		r.eoie_start = start
@@ -510,6 +516,30 @@ idx_has_shared :: proc(vfs: prim.Vfs, git_dir: string, allocator: runtime.Alloca
 }
 
 @(private = "file")
+idx_pread :: proc(vfs: prim.Vfs, file: string, id: Index_Ident, dst: []u8, off: i64) -> (int, Error) {
+	fd, oerr := prim.open_file(vfs, file)
+	if oerr == .Not_Found {
+		return 0, .Changed
+	}
+	if oerr != .None {
+		return 0, from_prim(oerr)
+	}
+	defer prim.close_file(vfs, fd)
+	st, serr := prim.fstat(vfs, fd)
+	if serr != .None {
+		return 0, from_prim(serr)
+	}
+	if (Index_Ident{size = st.size, mtime_ns = st.mtime_ns, ino = st.ino, dev = st.dev}) != id {
+		return 0, .Changed
+	}
+	n, rerr := prim.read_at(vfs, fd, dst, off)
+	if rerr != .None {
+		return 0, from_prim(rerr)
+	}
+	return n, .None
+}
+
+@(private = "file")
 idx_cursor_open :: proc(c: ^Index_Cursor, path: string, format: odb.Hash_Format, allocator: runtime.Allocator) -> Error {
 	vfs := c.vfs
 	c^ = {}
@@ -517,29 +547,37 @@ idx_cursor_open :: proc(c: ^Index_Cursor, path: string, format: odb.Hash_Format,
 	c.allocator = allocator
 	c.format = format
 	c.hs = odb.oid_size(format)
-	c.fd = prim.INVALID_FD
 	fd, oerr := prim.open_file(c.vfs, path)
 	if oerr != .None {
 		return from_prim(oerr)
 	}
-	c.fd = fd
-	c.owns_fd = true
-	size, serr := prim.file_size(c.vfs, fd)
+	st, serr := prim.fstat(c.vfs, fd)
 	if serr != .None {
+		prim.close_file(c.vfs, fd)
 		return from_prim(serr)
 	}
-	if size < i64(INDEX_HEADER + c.hs) {
-		return .Corrupt
-	}
-	c.limit = size - i64(c.hs)
+	c.ident = Index_Ident{size = st.size, mtime_ns = st.mtime_ns, ino = st.ino, dev = st.dev}
 	hdr: [INDEX_HEADER]u8
 	n, rerr := prim.read_at(c.vfs, fd, hdr[:], 0)
+	if st.size >= i64(INDEX_HEADER + c.hs) && rerr == .None && n == INDEX_HEADER {
+		n, rerr = prim.read_at(c.vfs, fd, c.trailer[:c.hs], st.size - i64(c.hs))
+	}
+	prim.close_file(c.vfs, fd)
+	if st.size < i64(INDEX_HEADER + c.hs) {
+		return .Corrupt
+	}
 	if rerr != .None {
 		return from_prim(rerr)
 	}
-	if n != INDEX_HEADER || endian.unchecked_get_u32be(hdr[0:]) != INDEX_SIGNATURE {
+	if n != c.hs || endian.unchecked_get_u32be(hdr[0:]) != INDEX_SIGNATURE {
 		return .Corrupt
 	}
+	file, ferr := strings.clone(path, allocator)
+	if ferr != nil {
+		return .No_Memory
+	}
+	c.file = file
+	c.limit = st.size - i64(c.hs)
 	c.version = endian.unchecked_get_u32be(hdr[4:])
 	if c.version < 2 {
 		return .Corrupt
@@ -552,13 +590,6 @@ idx_cursor_open :: proc(c: ^Index_Cursor, path: string, format: odb.Hash_Format,
 		return .Corrupt
 	}
 	c.count = int(count)
-	n, rerr = prim.read_at(c.vfs, fd, c.trailer[:c.hs], c.limit)
-	if rerr != .None {
-		return from_prim(rerr)
-	}
-	if n != c.hs {
-		return .Corrupt
-	}
 	c.skip_hash = c.trailer == {}
 	return idx_cursor_alloc(c, c.limit)
 }
@@ -583,7 +614,12 @@ idx_cursor_alloc :: proc(c: ^Index_Cursor, span: i64) -> Error {
 idx_cursor_share :: proc(dst, src: ^Index_Cursor) -> Error {
 	dst^ = {}
 	dst.vfs = src.vfs
-	dst.fd = src.fd
+	file, ferr := strings.clone(src.file, src.allocator)
+	if ferr != nil {
+		return .No_Memory
+	}
+	dst.file = file
+	dst.ident = src.ident
 	dst.allocator = src.allocator
 	dst.format = src.format
 	dst.hs = src.hs
@@ -601,8 +637,8 @@ idx_cursor_close :: proc(c: ^Index_Cursor) {
 		sync.atomic_store(&c.job.stop, true)
 		idx_job_end(c)
 	}
-	if c.owns_fd {
-		prim.close_file(c.vfs, c.fd)
+	if len(c.file) > 0 {
+		delete(c.file, c.allocator)
 	}
 	if c.buf != nil {
 		delete(c.buf, c.allocator)
@@ -651,7 +687,8 @@ idx_job_start :: proc(c: ^Index_Cursor) -> Error {
 		return .No_Memory
 	}
 	job.vfs = c.vfs
-	job.fd = c.fd
+	job.file = c.file
+	job.ident = c.ident
 	job.limit = c.limit
 	job.format = c.format
 	job.buf = buf
@@ -675,9 +712,9 @@ idx_job_run :: proc(job: ^Index_Hash_Job) {
 			return
 		}
 		n := int(min(i64(len(job.buf)), job.limit - off))
-		got, err := prim.read_at(job.vfs, job.fd, job.buf[:n], off)
+		got, err := idx_pread(job.vfs, job.file, job.ident, job.buf[:n], off)
 		if err != .None {
-			job.err = from_prim(err)
+			job.err = err
 			return
 		}
 		if got != n {
@@ -751,9 +788,9 @@ idx_avail :: proc(c: ^Index_Cursor, n: int) -> (have: int, err: Error) {
 		c.buf = buf
 	}
 	to_read := int(min(i64(len(c.buf) - c.len), c.limit - (c.base + i64(c.len))))
-	got, rerr := prim.read_at(c.vfs, c.fd, c.buf[c.len:c.len + to_read], c.base + i64(c.len))
+	got, rerr := idx_pread(c.vfs, c.file, c.ident, c.buf[c.len:c.len + to_read], c.base + i64(c.len))
 	if rerr != .None {
-		return 0, from_prim(rerr)
+		return 0, rerr
 	}
 	if got != to_read {
 		return 0, .Corrupt
@@ -1111,7 +1148,7 @@ idx_eoie :: proc(c: ^Index_Cursor) -> (start: i64, has_link: bool, ok: bool) {
 	}
 	at := c.limit - 32
 	tail: [32]u8
-	if n, err := prim.read_at(c.vfs, c.fd, tail[:], at); err != .None || n != 32 {
+	if n, err := idx_pread(c.vfs, c.file, c.ident, tail[:], at); err != .None || n != 32 {
 		return
 	}
 	if string(tail[:4]) != "EOIE" || endian.unchecked_get_u32be(tail[4:]) != 24 {
@@ -1129,7 +1166,7 @@ idx_eoie :: proc(c: ^Index_Cursor) -> (start: i64, has_link: bool, ok: bool) {
 			return
 		}
 		hdr: [8]u8
-		if n, err := prim.read_at(c.vfs, c.fd, hdr[:], p); err != .None || n != 8 {
+		if n, err := idx_pread(c.vfs, c.file, c.ident, hdr[:], p); err != .None || n != 8 {
 			return
 		}
 		odb.hasher_update(&h, hdr[:])
