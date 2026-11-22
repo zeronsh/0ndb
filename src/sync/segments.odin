@@ -391,8 +391,7 @@ _fetch_check :: proc(r: ^Replicator) {
 				f.done[k] = true
 			} else if err == .Missing {
 				pending = true
-				gap := []journal.Range{missing}
-				append(&rm.wants, ..gap)
+				_want_add(rm, missing)
 				_remote_settle(r, rm)
 			} else {
 				f.done[k] = true

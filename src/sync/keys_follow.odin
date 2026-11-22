@@ -102,7 +102,7 @@ _kwait_head_want :: proc(r: ^Replicator, head: ^Remote) {
 	if _, missing := journal.replica_missing(&head.rep, from, n); !missing {
 		return
 	}
-	append(&head.wants, journal.Range{from, n})
+	_want_add(head, journal.Range{from, n})
 }
 
 @(private)
