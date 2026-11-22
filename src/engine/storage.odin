@@ -1,8 +1,10 @@
 package engine
 
 import "core:crypto"
+import "../convo"
 import "../journal"
 import omap "../map"
+import "../obj"
 import "../prim"
 import osync "../sync"
 
@@ -22,6 +24,7 @@ Storage_Mode :: enum u8 {
 Storage_Policy :: struct {
 	data:     rawptr,
 	classify: proc(data: rawptr, e: ^Engine, space: prim.Id, object: prim.Id, kind: Kind, recorded: Storage_Class) -> Storage_Class,
+	budget:   proc(data: rawptr, e: ^Engine, space: prim.Id) -> i64,
 }
 
 Storage_Stats :: struct {
@@ -186,6 +189,102 @@ _promo_settled :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind) {
 
 object_promote :: proc(e: ^Engine, o: Object, from: i64 = 0) -> Error {
 	context = context_for(e)
+	return _promote(e, o, from, nil)
+}
+
+object_promote_run :: proc(e: ^Engine, o: Object, msg: Rid = {}) -> Error {
+	context = context_for(e)
+	rec, found := _rec_get(e, o.id) or_return
+	if !found {
+		return .Not_Found
+	}
+	froms := make(map[prim.Id]i64, context.temp_allocator)
+	#partial switch rec.kind {
+	case .Conversation:
+		if !obj.rid_none(msg) && _convo_needed(e, o, msg, &froms) != .None {
+			clear(&froms)
+		}
+		for m in rec.members {
+			if _, has := froms[m.device]; !has {
+				froms[m.device] = max(i64)
+			}
+		}
+		if _, has := froms[e.self]; !has {
+			froms[e.self] = max(i64)
+		}
+	case .File_Tree, .Text:
+		if h, ok := e.handles[o.id]; ok && h.w_open && h.hist != nil && h.sp.repl_on {
+			n := _own_len(h)
+			last, prev, had := _ckpt_get(e, h.id)
+			if !had || last < n {
+				if _checkpoint_write(e, h, n, prev, had) == .None {
+					last = n
+				}
+			}
+			if l2, _, ok2 := _ckpt_get(e, h.id); ok2 && l2 > 0 {
+				froms[e.self] = l2
+				_content_mark_put(e, h.sp.id, h.id, h.kind, min(_content_mark_get(e, h.sp, h.id), l2))
+			}
+		}
+	}
+	err := _promote(e, o, 0, froms)
+	if err == .None && (rec.kind == .File_Tree || rec.kind == .Text) {
+		_catalog_flush(e)
+		if h, ok := e.handles[o.id]; ok && h.w_open {
+			if mark, has := froms[e.self]; has {
+				_content_mark_put(e, h.sp.id, h.id, h.kind, mark)
+			}
+			_content_publish(e, h)
+		}
+	}
+	return err
+}
+
+@(private)
+_convo_needed :: proc(e: ^Engine, o: Object, msg: Rid, froms: ^map[prim.Id]i64) -> Error {
+	h := _handle_get(e, o, .Conversation) or_return
+	_handle_refresh(h)
+	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
+	if terr != .None {
+		return .Missing
+	}
+	pos := convo.Position{msg = msg}
+	for _ in 0 ..< 1 << 16 {
+		pg, perr := convo.page(&h.view, &t, pos, 256, context.temp_allocator)
+		if perr != .None {
+			return .Missing
+		}
+		for m in pg.messages {
+			cur, has := froms[m.id.seg]
+			if !has || m.id.off < cur {
+				froms[m.id.seg] = m.id.off
+			}
+		}
+		if !pg.more || len(pg.messages) == 0 {
+			return .None
+		}
+		pos = pg.next
+	}
+	return .None
+}
+
+@(private)
+_promote_from :: proc(froms: map[prim.Id]i64, device: prim.Id, from: i64, length: i64) -> i64 {
+	if froms == nil {
+		return from
+	}
+	f, has := froms[device]
+	if !has {
+		return 0
+	}
+	if f == max(i64) {
+		return max(length - 1, 0)
+	}
+	return f
+}
+
+@(private)
+_promote :: proc(e: ^Engine, o: Object, from: i64, froms: map[prim.Id]i64) -> Error {
 	sp := _space_open(e, o.space) or_return
 	rec, found := _rec_get(e, o.id) or_return
 	if !found {
@@ -218,13 +317,18 @@ object_promote :: proc(e: ^Engine, o: Object, from: i64 = 0) -> Error {
 		}
 	}
 	if path, perr := _own_path_of(e, o.id, rec.kind); perr == .None && prim.exists(e.vfs, path) {
-		_serr(osync.replicator_promote(&sp.repl, &sc, e.self, name, 0, path, from)) or_return
+		own_len: i64
+		if h, ok := e.handles[o.id]; ok && h.w_open {
+			own_len = _own_len(h)
+		}
+		_serr(osync.replicator_promote(&sp.repl, &sc, e.self, name, 0, path, _promote_from(froms, e.self, from, own_len))) or_return
 	}
 	for m in rec.members {
 		if m.device == e.self {
 			continue
 		}
-		_serr(osync.replicator_promote(&sp.repl, &sc, m.device, name, 0, "", from)) or_return
+		rl := osync.replicator_relay_length(&sp.repl, &sc, osync.Device_Id(m.device), name, 0)
+		_serr(osync.replicator_promote(&sp.repl, &sc, m.device, name, 0, "", _promote_from(froms, m.device, from, rl))) or_return
 	}
 	_touch(e)
 	return .None
