@@ -156,6 +156,10 @@ Cancel :: struct {
 	item: Ref,
 }
 
+Redact_Msg :: struct {
+	msg: Ref,
+}
+
 Interrupt :: struct {
 	msg: Ref,
 }
@@ -271,6 +275,7 @@ Body :: union {
 	Recorded,
 	Spine,
 	Files,
+	Redact_Msg,
 }
 
 Record :: struct {
@@ -308,6 +313,8 @@ body_kind :: proc "contextless" (b: Body) -> Kind {
 		return .Edit_Queued
 	case Cancel:
 		return .Cancel
+	case Redact_Msg:
+		return .Redact_Msg
 	case Interrupt:
 		return .Interrupt
 	case Answer:
@@ -344,7 +351,7 @@ body_kind :: proc "contextless" (b: Body) -> Kind {
 
 is_event_kind :: proc "contextless" (k: Kind) -> bool {
 	#partial switch k {
-	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded, .Spine:
+	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded, .Spine, .Redact_Msg:
 		return true
 	}
 	return false
@@ -588,6 +595,8 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		_put_atts(w, 3, v.attachments)
 	case Cancel:
 		obj.tw_ref(w, 1, off, v.item)
+	case Redact_Msg:
+		obj.tw_ref(w, 1, off, v.msg)
 	case Interrupt:
 		obj.tw_ref(w, 1, off, v.msg)
 	case Answer:
@@ -1200,6 +1209,15 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 			}
 		}
 		d.bad ||= obj.ref_none(v.item)
+		rec.body = v
+	case .Redact_Msg:
+		v: Redact_Msg
+		for obj.dec_next(&d) {
+			if d.f.tag == 1 {
+				v.msg = obj.dec_ref(&d)
+			}
+		}
+		d.bad ||= obj.ref_none(v.msg)
 		rec.body = v
 	case .Interrupt:
 		v: Interrupt

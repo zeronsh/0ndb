@@ -1506,13 +1506,29 @@ Relay cost tracks the reachable information, not the activity. Items marked
     nonce) pair ever carries two plaintexts. The simulator's cipher watch
     taps `Live`, `Lived` and draft `Serve`/`Served` frames as their own
     channel per (segment, msg) and reports any reuse.
-  - *Redaction.* Redacting a message flushes any open block into the
-    segment (so the redaction covers it), zero-fills the message's draft
-    records, punctures cell `c` in the writer's tree and republishes the
-    tree. Every captured draft ciphertext of that message, on any wire, is
-    then undecryptable everywhere, exactly like its Blocks. A reader drops
-    its view when the redaction arrives or its draft key stops deriving.
-    The relay never held the draft, so nothing is redacted there.
+  - *Redaction.* Drafts never reach a search index: indexers read only
+    segment records, so the index can hold only text that was finalized
+    into Blocks. Redacting a message whose writer is this device flushes
+    any open block into the segment, zero-fills the message's draft
+    records, punctures cell `c` in the writer's tree, republishes the
+    tree, redacts every Block of the message and, if the message is still
+    open, seals it `Cancelled`. Nothing of it can be written afterwards,
+    by the stream or by crash recovery: zero-filled draft records are
+    skipped when the writer reopens. Redacting another device's message
+    also appends `Redact_Msg{msg}` (convo kind 44) to the redactor's
+    segment, next to the `Redact` records for the Blocks it can see. A
+    message that is still streaming may have none of its text in the
+    segment yet, and a redactor's replica may lag. The writer applies
+    `Redact_Msg` in the durable remote-record scan (`_scan_object`, the
+    same persisted cursor that applies remote `Redact` records). It runs
+    the own-message redaction above, which covers draft text, blocks the
+    redactor never saw and blocks written later. Every other device purges
+    its index for the message and drops its view. Before this,
+    redacting an open message from another device left its later Blocks
+    unredacted and indexed everywhere (sim `SIM_STORAGE=device
+    SIM_SEED=3`). Captured draft ciphertext is undecryptable everywhere
+    once the cell is punctured. The relay never held the draft, so
+    nothing is redacted there.
   - *What a draft promises.* Every byte a reader sees in a draft was
     durable in the writer's draft journal before it was sent, and its Msg
     record was durable in the segment. The sealed block is a function of

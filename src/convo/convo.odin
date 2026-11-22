@@ -56,6 +56,7 @@ Kind :: enum u8 {
 	Recorded    = 41,
 	Spine       = 42,
 	Files       = 43,
+	Redact_Msg  = 44,
 }
 
 Role :: enum u8 {
