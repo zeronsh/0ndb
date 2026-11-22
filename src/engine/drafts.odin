@@ -205,17 +205,35 @@ _draft_apply :: proc(h: ^Handle, device: prim.Id, at, next: i64, body: []u8) -> 
 }
 
 @(private)
+Draft_Mark :: struct {
+	gen:  u64,
+	view: i64,
+	dur:  i64,
+	pub:  i64,
+}
+
+@(private)
 _draft_own_feed :: proc(e: ^Engine, h: ^Handle) {
 	if h.kind != .Conversation || !h.w_open {
 		return
 	}
 	w := &h.cw
 	gen := convo.writer_draft_gen(w)
+	if !h.dloaded {
+		h.dloaded = true
+		if m, ok := e.draft_marks[h.id]; ok && m.gen == gen {
+			h.dgen = gen
+			h.drep = m.view
+			h.ddur = m.dur
+			h.dpub = m.pub
+		}
+	}
 	if gen != h.dgen {
 		h.dgen = gen
 		h.dview = 0
 		h.ddur = 0
 		h.dpub = 0
+		h.drep = 0
 	}
 	end := convo.writer_draft_durable(w)
 	if end <= h.dview {
@@ -237,12 +255,13 @@ _draft_own_feed :: proc(e: ^Engine, h: ^Handle) {
 		if je != .None {
 			break
 		}
-		if ok, _ := _draft_apply(h, e.self, pos, next, body); ok {
+		if ok, _ := _draft_apply(h, e.self, pos, next, body); ok && next > h.drep {
 			changed = true
 		}
 		pos = next
 	}
 	h.dview = pos
+	h.drep = max(h.drep, pos)
 	if pos > h.dpub {
 		append(&e.draft_dirty, Draft_Pub{object = h.id, gen = gen, end = pos})
 		h.dpub = pos
