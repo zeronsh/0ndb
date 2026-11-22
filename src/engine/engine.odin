@@ -396,6 +396,8 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	if opts.clock.mono_ns == nil && opts.clock.wall_ns == nil {
 		opts.clock = cfg.clock
 	}
+	opts.before_commit = _pack_before_commit
+	opts.before_data = e
 	if cfg.durability == .Deferred {
 		opts.deferred_sync = true
 		opts.wake = nil

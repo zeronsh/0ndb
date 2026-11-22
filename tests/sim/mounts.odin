@@ -145,8 +145,12 @@ node_mounts_drop :: proc(w: ^World, n: ^Node) {
 }
 
 node_remount :: proc(w: ^World, n: ^Node) {
-	for mm in w.model.mounts {
+	m := &w.model
+	i := 0
+	for i < len(m.mounts) {
+		mm := m.mounts[i]
 		if mm.node != n.idx || !n.alive {
+			i += 1
 			continue
 		}
 		if err := node_mount(w, n, mm.oi, mm.root); err != .None && n.alive {
@@ -156,8 +160,16 @@ node_remount :: proc(w: ^World, n: ^Node) {
 				node_after(n)
 				return
 			}
+			cop := m.ops[m.objs[mm.oi].op]
+			if err == .Not_Found && cop.node == n.idx && !op_happened(cop) {
+				world_note(w, "%s drops mount %s: its tree's creation was not acknowledged and did not survive", n.name, mm.root)
+				delete(mm.root, w.allocator)
+				ordered_remove(&m.mounts, i)
+				continue
+			}
 			world_fail(w, "%s could not remount %s after restart: %v", n.name, mm.root, err)
 		}
+		i += 1
 	}
 }
 
@@ -384,6 +396,9 @@ check_mounts :: proc(w: ^World) {
 			slice.sort(names)
 			want := strings.builder_make(context.temp_allocator)
 			for nm in names {
+				if strings.has_prefix(nm, ".") {
+					continue
+				}
 				data, _ := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator)
 				fmt.sbprintf(&want, "%s=%q\n", nm, string(data))
 			}
