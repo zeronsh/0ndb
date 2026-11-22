@@ -71,6 +71,7 @@ Space :: struct {
 	refused:      bool,
 	refusals:     int,
 	admitted:     bool,
+	fresh:        bool,
 }
 
 @(private)
@@ -258,6 +259,7 @@ _catalog_id :: proc(space: prim.Id) -> (id: prim.Id) {
 @(private)
 _space_register :: proc(e: ^Engine, id: prim.Id, name: string, relay: string, relay_public: osync.Public_Key, mode: osync.Encryption_Mode, keyless: bool) -> (sp: ^Space, err: Error) {
 	sp = new(Space, e.allocator)
+	sp.fresh = true
 	sp.e = e
 	sp.id = id
 	sp.mode = mode

@@ -1607,6 +1607,9 @@ _leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret:
 			_fail(w, "%s: n%d is not idle after the erase: %d wakeups in 30 s, armed: %s", what, idx, w1 - w0, armed_timers(&ln.inst.loop))
 		}
 	}
+	quiet := attaches_snapshot(w)
+	_settle(w, 60_000)
+	check_reconnects(w, quiet, fmt.tprintf("the minute after %s", what))
 	if p, found := disk_contains(&w.nodes[idx].disk, transmute([]u8)secret); on_disk && found {
 		_fail(w, "%s: %s still on n%d disk after leaving, in %s", what, secret, idx, p)
 	}
@@ -1618,6 +1621,9 @@ _leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret:
 	_down(w, idx)
 	_up(w, idx)
 	_settle(w, 3000)
+	quiet2 := attaches_snapshot(w)
+	_settle(w, 60_000)
+	check_reconnects(w, quiet2, fmt.tprintf("the minute after %s's restart", what))
 	if has, left := _has_space(w, idx, space); has || !left {
 		_fail(w, "%s: n%d got the space back after a restart (listed=%v tombstone=%v)", what, idx, has, left)
 	}

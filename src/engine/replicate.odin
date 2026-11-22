@@ -421,6 +421,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		sp.backoff = 0
 		sp.refusals = 0
 		sp.admitted = true
+		sp.fresh = false
 		sp.mem.creds.renewal = .None
 		_emit(e, Event{kind = .Connected, space = sp.id})
 		_pending_republish(e, sp)
@@ -431,17 +432,18 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_held_scan(e, sp)
 	case .Disconnected:
 		sp.connected = false
-		if ev.err == .Auth && _leave_refused(e, sp) {
+		denied := ev.err == .Auth || ev.err == .Permission
+		if denied && _leave_refused(e, sp) {
 			sp.mem.revoked = true
 			_space_refuse(e, sp)
-		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.creds.renewal == .Attached {
+		} else if denied && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.creds.renewal == .Attached {
 			_link_schedule(e, sp)
-		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.lapsed && sp.mem.creds.renewal != .Presented {
+		} else if denied && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.lapsed && sp.mem.creds.renewal != .Presented {
 			_lease_wanted(e, sp)
-		} else if ev.err == .Auth && !sp.admitted && !sp.mem.removed && !sp.mem.revoked && sp.mem.creds.renewal != .Presented && sp.refusals < AUTH_LAG_RETRIES {
+		} else if denied && sp.fresh && !sp.admitted && !sp.mem.removed && !sp.mem.revoked && sp.mem.creds.renewal != .Presented && sp.refusals < AUTH_LAG_RETRIES {
 			sp.refusals += 1
 			_link_schedule(e, sp)
-		} else if ev.err == .Auth {
+		} else if denied {
 			if !sp.keyless && sp.mem.loaded && !sp.mem.revoked {
 				sp.mem.revoked = true
 				_emit(e, Event{kind = .Access_Revoked, space = sp.id, device = e.self, err = .Permission})
@@ -798,6 +800,7 @@ _space_unrefuse :: proc(e: ^Engine, sp: ^Space) {
 	sp.mem.revoked = false
 	sp.backoff = 0
 	sp.refusals = 0
+	sp.fresh = true
 	if sp.open && !sp.repl_on && (len(sp.relay) > 0 || e.cfg.transport.open != nil) {
 		if err := _repl_start(e, sp); err != .None {
 			_log(e, .Warn, "replicator start failed")
