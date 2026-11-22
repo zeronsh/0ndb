@@ -349,6 +349,7 @@ Engine :: struct {
 	git:          Git_State,
 	budget:       Budget_State,
 	card_pubs:    [dynamic]Card_Pub,
+	settles:      [dynamic]Settle_Done,
 	stats:        Stats,
 	fatal:        Error,
 }
@@ -407,6 +408,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	_git_init(e)
 	_budget_init(e)
 	e.card_pubs = make([dynamic]Card_Pub, e.allocator)
+	e.settles = make([dynamic]Settle_Done, e.allocator)
 	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
 	e.index_dirty = make([dynamic]Index_Item, e.allocator)
 	defer if err != .None {
@@ -480,6 +482,7 @@ close :: proc(e: ^Engine) -> Error {
 	}
 	e.closing = true
 	err := flush(e)
+	_settle_abort(e)
 	_teardown(e)
 	return err
 }
@@ -825,6 +828,7 @@ _tick_end :: proc(e: ^Engine) {
 		_fatal(e, .Io)
 	}
 	_settle_arm(e)
+	_settle_check(e)
 	if (!_tick_pending(e) || pack.pressure(&e.pk)) && e.tick_timer != 0 {
 		prim.timer_cancel(e.loop, e.tick_timer)
 		e.tick_timer = 0
@@ -1034,6 +1038,7 @@ _teardown :: proc(e: ^Engine) {
 	_budget_destroy(e)
 	_content_destroy(e)
 	delete(e.card_pubs)
+	delete(e.settles)
 	for _, u in e.catalog_q {
 		delete(u.title, e.allocator)
 		delete(u.role, e.allocator)
