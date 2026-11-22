@@ -373,12 +373,23 @@ _quiesce_relay_check :: proc(w: ^World, n: ^Node) {
 			continue
 		}
 		for id, l in sp.repl.locals {
-			if l.superseded || l.hollow || l.durable <= 0 {
+			if l.superseded || l.hollow {
+				continue
+			}
+			want := l.durable
+			if len(l.path) > 0 {
+				context = instance_context(&n.inst)
+				if st, err := prim.stat(n.e.vfs, l.path); err == .None {
+					want = max(want, st.size)
+				}
+				node_after(n)
+			}
+			if want <= 0 {
 				continue
 			}
 			length, base, exists := _quiesce_relay_probe(w, sid, id)
-			if !exists || length < l.durable {
-				world_fail(w, "quiesce: %s accepted but the relay holds %d of %d durable bytes of %s (base %d, %s)", n.name, length, l.durable, stream_short(id), base, l.name)
+			if !exists || length < want {
+				world_fail(w, "quiesce: %s accepted but the relay holds %d of %d durable bytes of %s (base %d, %s)", n.name, length, want, stream_short(id), base, l.name)
 			}
 		}
 	}

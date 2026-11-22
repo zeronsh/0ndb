@@ -1,6 +1,5 @@
 package engine
 
-import "../prim"
 import osync "../sync"
 
 Settle_Result :: enum u8 {
@@ -67,22 +66,6 @@ _settle_state :: proc(e: ^Engine) -> (res: Settle_Result, ready: bool) {
 			return .Settled, false
 		}
 	}
-	for k in e.rlog.pend {
-		x := k
-		sp: ^Space
-		for _, s in e.spaces {
-			id := s.id
-			if string(x[:16]) == string(id[:]) {
-				sp = s
-			}
-		}
-		if sp == nil || !sp.open || !sp.repl_on {
-			return .Relay, true
-		}
-		if !_settle_published(e, sp, x) {
-			return .Settled, false
-		}
-	}
 	for _, sp in e.spaces {
 		if !sp.open || !sp.repl_on {
 			continue
@@ -107,20 +90,4 @@ _settle_abort :: proc(e: ^Engine) {
 		context = _outer(e)
 		d.call(d.data, e, .Relay)
 	}
-}
-
-@(private)
-_settle_published :: proc(e: ^Engine, sp: ^Space, key: [32]u8) -> bool {
-	k := key
-	id: prim.Id
-	copy(id[:], k[16:])
-	rec, found, err := _rec_get(e, id)
-	if err != .None || !found {
-		return false
-	}
-	sc := _object_scope(sp, id)
-	defer osync.scope_clear(&sc)
-	sid := osync.stream_id(&sc, e.self, _seg_name(rec.kind, id), 0)
-	_, ok := sp.repl.locals[sid]
-	return ok
 }

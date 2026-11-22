@@ -368,8 +368,10 @@ _on_engine_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		case .Presence:
 			_presence_changed(r, ev.space, ev.device, ev.tick != 0)
 		case .Connected:
+			_readvertise(r, ev.space)
 			_pending_scan(r, ev.space)
 		case .Caught_Up:
+			_readvertise(r, ev.space)
 			for w in r.revives {
 				if w.object.space == ev.space {
 					_queue_eval(r, w.object)
@@ -721,6 +723,19 @@ _on_catalog :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng
 		_queue_eval(r, o)
 		_await_touched(r, o)
 		_trigger_touched(r, o)
+	}
+}
+
+@(private)
+_readvertise :: proc(r: ^Runtime, space: prim.Id) {
+	if !r.cfg.runner {
+		return
+	}
+	for sw in r.spaces {
+		if sw.space == space {
+			_advertise(r, space, r.cfg.capacity)
+			return
+		}
 	}
 }
 
