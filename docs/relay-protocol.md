@@ -305,10 +305,23 @@ log in storage is the source of truth; an implementation without a cache
 
 `request` and `account` principals live in the namespace
 `BLAKE2b-128("0ndb account namespace" ‖ account)` with `id[6] = id[6] & 0x0f
-| 0x80`. They may only use `List` with the zero id: follow presence and send
-and receive direct messages; every other request is refused `Not_Owner`. A
-`request` principal (a device asking to be approved) may hold at most 2
-connections. `account` principals must present a valid device cert.
+| 0x80`. A `request` principal (a device asking to be approved) may only use
+`List` with the zero id (follow presence, send and receive direct messages)
+and may hold at most 2 connections; every other request is refused
+`Not_Owner`.
+
+An `account` principal must present a device cert by the namespace's
+account (`cert = Ed25519(account, "0ndb device cert\0" ‖ sign)`); a cert by
+any other key is refused `Auth`. That cert is the only input to its access,
+so the relay keeps no account state: it grants `List`, `Read` and `Get` on
+every stream of the namespace, and `Append` and `Drop` on its own streams
+(the id's first 16 bytes equal its device id). `Put`, `Forget`, `Fill` and
+`Redact` are refused `Not_Owner`. The namespace is accounted like an admitted
+space: its quota is the relay's default quota, or 4 MiB when the relay sets
+none, and appends beyond it are refused `Quota`. Devices use these streams
+for their signed account notices (`DESIGN.md`, Accounts) and bound them
+themselves by rotating epochs, so the quota is a backstop, not a limit
+reached in practice.
 
 ### 6.4 Embedder authorizer
 
@@ -842,7 +855,8 @@ storage completion as an input, which every sans-IO relay does.
 | pipe | Pull, Pulled, Serve, Served, FINAL, NONE, closed pipe, absent and self holders, duplicate tag, wrong requester, holder disconnect |
 | presence | snapshot, up and down per device across connections, Direct, Undelivered |
 | membership | Add appended to a members segment admits; a non-member's proof is ignored; a Remove revokes the live connection and later Hellos |
-| account | request and account principals: no reads, presence, direct messages both ways, 2-connection limit, broken cert |
+| account | request and account principals: requester reads refused, presence, direct messages both ways, 2-connection limit, broken cert |
+| account_streams | account principals: own appends acknowledged once durable, reads and follows of another device's stream, Not_Owner for appends and drops on another device's stream and for objects, Quota over the namespace quota, requester reads refused, a cert by another account refused, another account's device confined to its own namespace |
 | embedder | embedder authorizer principals with read-only and own-append access |
 | malformed | oversize control frame, unknown kind, relay kind from a client, short payload, count mismatches, inverted Redact, short bulk header, NONE with bytes, oversize Direct, second Hello, Note beyond 2^62; bytes after the Error ignored; Read with to < from |
 | compaction | feed folding with a redaction, followers jumping to the new end, a late reader starting at the new start, Listing after compaction |
@@ -868,6 +882,11 @@ writer's own stream, so a relay needs no archive tier and never holds plain
 or rearranged bytes. `Trimmed` only tells the reader where to look.
 
 ## 14. Changes in this revision
+
+- `account` principals may read every stream of their account namespace and
+  append to and drop their own, within the namespace quota (section 6.3);
+  before, they could only use presence and direct messages. Their Welcome now
+  carries that quota. New vector `account_streams`.
 
 - `Trim` (bit 1) and `Trimmed` (bit 2) were added (section 8.14); the
   reserved design changed in three places: only the owner trims (a member's

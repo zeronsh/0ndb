@@ -37,6 +37,7 @@ scenarios :: proc() -> []Scenario {
 		{"presence", "Presence snapshots and up/down transitions per device across several connections; direct messages and Undelivered.", sc_presence},
 		{"membership", "Authorization follows the signed membership log: an Add appended to a members stream admits, a proof by a non-member is ignored, a Remove revokes live connections.", sc_membership},
 		{"account", "Account namespace: request and account credentials may only see presence and exchange direct messages; requesters are limited to two connections.", sc_account},
+		{"account_streams", "Account namespace streams: account credentials read every stream in their account's namespace and append or drop only their own, within the namespace quota; request credentials still cannot read; a cert by another account is refused.", sc_account_streams},
 		{"embedder", "An embedder authorizer maps unknown credential types to principals; the relay enforces the access it grants.", sc_embedder},
 		{"malformed", "Malformed input is fatal: oversize frames, unknown kinds, relay-only kinds, short payloads, count mismatches, inverted ranges, bad bulk headers, oversize direct payloads, a second Hello; bytes after the error are ignored.", sc_malformed},
 		{"compaction", "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base.", sc_compaction},
@@ -809,6 +810,44 @@ sc_account :: proc(v: ^Vector) {
 	c := account_cred(account, phone, binding("badcert"))
 	c[40] ~= 1
 	send(v, "badcert", hello(c), "account credential with a broken device cert")
+}
+
+sc_account_streams :: proc(v: ^Vector) {
+	cfg := default_config()
+	cfg.quota = 200
+	vector_config(v, cfg)
+	account, other, laptop, phone, tablet := key_make(5), key_make(10), key_make(6), key_make(7), key_make(9)
+	ns := osync.account_namespace(account.pub)
+	vector_track(v, ns)
+	notices := stream(phone, 1)
+	connect(v, "phone")
+	send(v, "phone", hello(account_cred(account, phone, binding("phone"))), "account credential")
+	send(v, "phone", f_append(notices, 0, rec("notice one", 0)), "append to its own stream")
+	durable(v, "acknowledged once durable")
+	connect(v, "tablet")
+	send(v, "tablet", hello(account_cred(account, tablet, binding("tablet"))), "a second device of the same account")
+	send(v, "tablet", f_read(notices, 0, 100), "reads the phone's stream")
+	send(v, "tablet", f_follow(false, {notices, 0}), "follows the phone's stream")
+	send(v, "phone", f_append(notices, i64(len(rec("notice one", 0))), rec("notice two", i64(len(rec("notice one", 0))))), "a live append reaches the follower")
+	durable(v)
+	send(v, "tablet", f_append(stream(phone, 2), 0, rec("forged", 0)), "appending to another device's stream is refused")
+	send(v, "tablet", frame(.Drop, ids(notices)), "dropping another device's stream is refused")
+	send(v, "tablet", f_put(okey(1), transmute([]u8)string("x")), "objects are refused")
+	send(v, "phone", f_append(stream(phone, 3), 0, make([]u8, 300, context.temp_allocator)), "an append over the namespace quota is refused")
+	connect(v, "requester")
+	send(v, "requester", hello(request_cred(account, laptop, binding("requester"))), "request credential")
+	send(v, "requester", f_read(notices, 0, 100), "a requester still cannot read")
+	connect(v, "wrong")
+	msg: [17 + 32]u8
+	copy(msg[:], "0ndb device cert\x00")
+	d := tablet.pub
+	copy(msg[17:], d[:])
+	cert: [64]u8
+	other.ms.sign(other.ms.data, msg[:], &cert)
+	send(v, "wrong", hello(cat(one(osync.ACCOUNT_CREDENTIAL), ids(account.pub), cert[:], ids(tablet.pub), sign_hello(tablet, binding("wrong")))), "a device cert signed by another account is refused")
+	connect(v, "elsewhere")
+	send(v, "elsewhere", hello(account_cred(other, laptop, binding("elsewhere"))), "a device of another account")
+	send(v, "elsewhere", f_read(notices, 0, 100), "sees only its own account's namespace")
 }
 
 sc_embedder :: proc(v: ^Vector) {

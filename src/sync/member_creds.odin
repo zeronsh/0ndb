@@ -6,6 +6,7 @@ import "../prim"
 MEMBER_CREDENTIAL :: u8(4)
 REQUEST_CREDENTIAL :: u8(5)
 ACCOUNT_CREDENTIAL :: u8(6)
+ACCOUNT_NAMESPACE_QUOTA :: i64(4 << 20)
 MEMBER_PROOFS_MAX :: 8
 
 account_namespace :: proc(account: Public_Key) -> (id: Space_Id) {

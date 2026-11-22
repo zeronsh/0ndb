@@ -1,0 +1,133 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "account_streams",
+  "summary": "Account namespace streams: account credentials read every stream in their account's namespace and append or drop only their own, within the namespace quota; request credentials still cannot read; a cert by another account is refused.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 200, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "phone", "local": false, "binding": "b09a6d515c2f2f75c5c9681b9ea663f0d4f75f8c1937282e5b1770acc04c9daeb9741eb9a4020ccfb0efd215ef45d7af62c3c7a38383fa8f3b3067d3625f2dee",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "phone", "bytes": "c20000000103066e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1226f0eaa6192f6cfa272bec45eabd718dece67c3757bb631c7bf161a608ab570b72e4efad839cafe5e9696f5ae9c334ab917696e93b0d2fa401457f08d09ab0cea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22ceb91b3782d4e727738ded04450feb46327c317445638d25c76158f09d293775055a2620380bef9d6683c6a4237c2179911d387fe6ce3d902ca2e94c3d0e57409", "comment": "account credential",
+     "out": {
+       "phone": [
+         {"kind": "Welcome", "frame": "2100000081030000faed517286180000000000000000c8000000000000000f00000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "phone", "bytes": "4a00000003325308b1bb839e483c0e959c664067d90101010101010101010101010101010100000000000000000a000000e87992b47c1d506fd302c0d2a9a609346e6f74696365206f6e650a000000", "comment": "append to its own stream",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable", "comment": "acknowledged once durable",
+     "out": {
+       "phone": [
+         {"kind": "Appended", "frame": "2800000083325308b1bb839e483c0e959c664067d9010101010101010101010101010101012200000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "356e1848d0768b9c4de4cfe752898446", "id": "325308b1bb839e483c0e959c664067d901010101010101010101010101010101", "at": 0, "len": 34, "result": "None"}]},
+    {"step": "connect", "conn": "tablet", "local": false, "binding": "d198ce1dd152e7acb7519763f278ad3d4d1f58ded0da520da0bc35d50779c38f3d2cfa3379a78fef8d3054d9ab6eb70ad9ea2b89f2376f36d1135e3524d696ed",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "tablet", "bytes": "c20000000103066e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf193628bc82572f8c769770ab94bbee1f0569d46655df60d30853f5328e0e78aae583bcf8837b317a50e48524610ef6108ccf9fcf41fbeb0229cbdb863e123cd0cfd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618433b1b70c50d0da991cbb7376ca06242e74efe5dd171bc8655ad5a2975b92781e209e4eeaf72bf93f2b048759e4733a9cf9e6a24da4f87d95f4d0d63b94f0203", "comment": "a second device of the same account",
+     "out": {
+       "tablet": [
+         {"kind": "Welcome", "frame": "2100000081030000faed517286182200000000000000c8000000000000000f00000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "tablet", "bytes": "3000000004325308b1bb839e483c0e959c664067d90101010101010101010101010101010100000000000000006400000000000000", "comment": "reads the phone's stream",
+     "out": {
+       "tablet": [
+         {"kind": "Data", "frame": "5200000085325308b1bb839e483c0e959c664067d901010101010101010101010101010101000000000000000022000000000000800a000000e87992b47c1d506fd302c0d2a9a609346e6f74696365206f6e650a000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "tablet", "bytes": "2b00000006000100325308b1bb839e483c0e959c664067d9010101010101010101010101010101010000000000000000", "comment": "follows the phone's stream",
+     "out": {
+       "tablet": [
+         {"kind": "Length", "frame": "2a000000890100325308b1bb839e483c0e959c664067d9010101010101010101010101010101012200000000000000"},
+         {"kind": "Data", "frame": "5200000085325308b1bb839e483c0e959c664067d901010101010101010101010101010101000000000000000022000000000000000a000000e87992b47c1d506fd302c0d2a9a609346e6f74696365206f6e650a000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "phone", "bytes": "4a00000003325308b1bb839e483c0e959c664067d90101010101010101010101010101010122000000000000000a00000099c7b51e9f3a9de750e7811e065642c56e6f746963652074776f0a000000", "comment": "a live append reaches the follower",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable",
+     "out": {
+       "phone": [
+         {"kind": "Appended", "frame": "2800000083325308b1bb839e483c0e959c664067d9010101010101010101010101010101014400000000000000"}],
+       "tablet": [
+         {"kind": "Data", "frame": "5200000085325308b1bb839e483c0e959c664067d901010101010101010101010101010101220000000000000044000000000000000a00000099c7b51e9f3a9de750e7811e065642c56e6f746963652074776f0a000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "356e1848d0768b9c4de4cfe752898446", "id": "325308b1bb839e483c0e959c664067d901010101010101010101010101010101", "at": 34, "len": 34, "result": "None"}]},
+    {"step": "send", "conn": "tablet", "bytes": "4600000003325308b1bb839e483c0e959c664067d90202020202020202020202020202020200000000000000000600000071ca191244faed28430fe6e6f985d930666f7267656406000000", "comment": "appending to another device's stream is refused",
+     "out": {
+       "tablet": [
+         {"kind": "Refused", "frame": "210000008c05325308b1bb839e483c0e959c664067d902020202020202020202020202020202"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "tablet", "bytes": "200000000a325308b1bb839e483c0e959c664067d901010101010101010101010101010101", "comment": "dropping another device's stream is refused",
+     "out": {
+       "tablet": [
+         {"kind": "Refused", "frame": "210000008c05325308b1bb839e483c0e959c664067d901010101010101010101010101010101"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "tablet", "bytes": "2100000008010003020504070609080b0a0d0c0f0e111013121514171619181b1a1d1c1f1e78", "comment": "objects are refused",
+     "out": {
+       "tablet": [
+         {"kind": "Refused", "frame": "210000008c05010003020504070609080b0a0d0c0f0e111013121514171619181b1a1d1c1f1e"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "phone", "bytes": "5401000003325308b1bb839e483c0e959c664067d9030303030303030303030303030303030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "comment": "an append over the namespace quota is refused",
+     "out": {
+       "phone": [
+         {"kind": "Refused", "frame": "210000008c04325308b1bb839e483c0e959c664067d903030303030303030303030303030303"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "requester", "local": false, "binding": "a1b321ea12691101aaba18a8fe5a41ac9576c3611c155f65faa1d72ecffda16a7adf1db445414979ef5a42f2b6c5b3b8bbad0c0ed5c028c9c230228a1e87d3d4",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester", "bytes": "820000000103056e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf18a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17dc1010e84463a65c55456b09ee7661ce337b6476a1192102f952cc3774227df7fa657341e4f20d4252bb34e719f927a8f35c3a665835a18d744a73e35e985a0e", "comment": "request credential",
+     "out": {
+       "requester": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618440000000000000000000000000000000f00000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester", "bytes": "3000000004325308b1bb839e483c0e959c664067d90101010101010101010101010101010100000000000000006400000000000000", "comment": "a requester still cannot read",
+     "out": {
+       "requester": [
+         {"kind": "Refused", "frame": "210000008c05325308b1bb839e483c0e959c664067d901010101010101010101010101010101"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "wrong", "local": false, "binding": "5836ab4a0d1c5149f80fc57a4b12c7b7b669840013e848e9b32062b01774f3d75c1e7a7e0e5b270c9ec08b002d68e28b52ff6b7faae520984f4654cb4eaec250",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "wrong", "bytes": "c20000000103066e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1509eb70dc7184ac3897f1b550a4000f26e9aa266e10f21805b2c2c48082439fc3d4ff08a52b29b416c139139fbaff2217b49f7589d10fdce1d68f88c763a6a0ffd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618641fc026cdfaf843d963cabc73c0812e7b7f8e9e4c98ff42878103349b5a2377039555c1f9e371f2cf2bb63e6379dc7f4ff1b5a48d6d79d4236e0f410f6dda0d", "comment": "a device cert signed by another account is refused",
+     "out": {
+       "wrong": [
+         {"kind": "Error", "frame": "010000008d02"}]},
+     "closed": ["wrong"],
+     "store": []},
+    {"step": "connect", "conn": "elsewhere", "local": false, "binding": "f44f641eebb9f7bd3a34fde2dcace3fdadad8103137a8cf1d1339a0c464942d4eee50eede2ee4dfc872b67e1bc24916f12127a2bb6996ced68c7d5f3a32e0df9",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "elsewhere", "bytes": "c200000001030643a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c3bf39ccebe807ca60cbb0bd136e310d2f9e236bb103b325d03b4e6f102d8a3c3819e369c9f47357cf48f8e5aea3ff31296ef2c3faf4b1af1609a1b868dcfae0f8a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f170c46d9090fd094fa70a71c48675f80265821f7035868d006a1dda7cfdb514df189df7711cf411db6c9a6beb330281a871a04a7404b0625c7ebc4ed766ee7320a", "comment": "a device of another account",
+     "out": {
+       "elsewhere": [
+         {"kind": "Welcome", "frame": "2100000081030000faed517286180000000000000000c8000000000000000f00000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "elsewhere", "bytes": "3000000004325308b1bb839e483c0e959c664067d90101010101010101010101010101010100000000000000006400000000000000", "comment": "sees only its own account's namespace",
+     "out": {
+       "elsewhere": [
+         {"kind": "Data", "frame": "3000000085325308b1bb839e483c0e959c664067d90101010101010101010101010101010100000000000000000000000000000080"}]},
+     "closed": [],
+     "store": []}
+  ],
+  "state": {
+  }
+}

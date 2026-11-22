@@ -216,7 +216,7 @@ _authorize_account :: proc(a: ^Member_Authorizer, credential: []u8, binding: []u
 	p^ = Principal {
 		namespace   = account_namespace(account),
 		participant = device_id(sign),
-		quota       = 0,
+		quota       = a.default_quota if a.default_quota > 0 else ACCOUNT_NAMESPACE_QUOTA,
 		check       = _account_check,
 		data        = a,
 	}
@@ -230,7 +230,15 @@ _request_check :: proc(data: rawptr, p: ^Principal, access: Access, id: [32]u8) 
 
 @(private)
 _account_check :: proc(data: rawptr, p: ^Principal, access: Access, id: [32]u8) -> bool {
-	return access == .List && id == {}
+	#partial switch access {
+	case .List, .Read, .Get:
+		return true
+	case .Append, .Drop:
+		x := id
+		pid := p.participant
+		return string(x[:16]) == string(pid[:])
+	}
+	return false
 }
 
 @(private)
