@@ -223,8 +223,10 @@ _susp_gate :: proc(g: ^Susp_Gates, roots: []prim.Pid, root: string, exempt: []pr
 			if !iok {
 				continue
 			}
-			if info.status != SSTOP {
-				r := Susp_Rec{pid = i32(p), start_sec = info.start_sec, start_us = info.start_us}
+			r := Susp_Rec{pid = i32(p), start_sec = info.start_sec, start_us = info.start_us}
+			if _susp_held_elsewhere(g, r, 0) {
+				append(&sg.recs, r)
+			} else if info.status != SSTOP {
 				if _susp_hold(g, r) {
 					if posix.kill(posix.pid_t(p), .SIGSTOP) == .OK {
 						append(&sg.recs, r)
@@ -260,6 +262,9 @@ _susp_ungate :: proc(g: ^Susp_Gates, id: u32) {
 			continue
 		}
 		for r in sg.recs {
+			if _susp_held_elsewhere(g, r, id) {
+				continue
+			}
 			if stopped, same := _susp_same(r); same && stopped {
 				posix.kill(posix.pid_t(r.pid), .SIGCONT)
 			}
@@ -269,6 +274,21 @@ _susp_ungate :: proc(g: ^Susp_Gates, id: u32) {
 		unordered_remove(&g.gates, i)
 		return
 	}
+}
+
+@(private)
+_susp_held_elsewhere :: proc(g: ^Susp_Gates, r: Susp_Rec, except: u32) -> bool {
+	for sg in g.gates {
+		if sg.id == except {
+			continue
+		}
+		for x in sg.recs {
+			if x.pid == r.pid && x.start_sec == r.start_sec && x.start_us == r.start_us {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 @(private)

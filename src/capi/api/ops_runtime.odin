@@ -40,7 +40,7 @@ RUNTIME_OPS := []Op {
 	{139, "placement", {OBJ}, "Placement", op_placement},
 	{162, "runners", {SPACE, OBJ}, "Runners", op_runners},
 	{163, "subscribe.runners", {SPACE, OBJ}, "Runners", nil},
-	{171, "line.hold", {{"tree", .Object, nil}, {"line", .Str, nil}, {"reason", .Enum, HOLD_REASON_NAMES[:]}}, "held:uvarint", op_line_hold},
+	{171, "line.hold", {{"tree", .Object, nil}, {"line", .Str, nil}, {"reason", .Enum, HOLD_REASON_NAMES[:]}, {"wait", .Bool, nil}}, "held:uvarint sealed:bool", op_line_hold},
 	{172, "line.resume", {{"tree", .Object, nil}, {"line", .Str, nil}}, "resumed:uvarint", op_line_resume},
 	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
 }
@@ -50,6 +50,11 @@ op_line_hold :: proc(c: ^Call, o: ^Out) -> Status {
 	if r == nil {
 		return .Unsupported
 	}
+	if c.stage == 1 {
+		o_int(o, "held", int(c.scratch[0]))
+		o_bool(o, "sealed", c.scratch[1] == 1)
+		return .Ok
+	}
 	line := a_str(c, "line")
 	if len(line) == 0 {
 		return .Invalid
@@ -58,8 +63,37 @@ op_line_hold :: proc(c: ^Call, o: ^Out) -> Status {
 	if reason == .None {
 		reason = .Branch_Changed
 	}
-	o_int(o, "held", rt.runtime_hold_line(r, a_object(c, "tree").id, line, reason))
-	return .Ok
+	if !a_bool(c, "wait") {
+		o_int(o, "held", rt.runtime_hold_line(r, a_object(c, "tree").id, line, reason))
+		return .Ok
+	}
+	c.scratch[2] = 1
+	c.in_exec = true
+	c.scratch[0] = u64(rt.runtime_hold_line(r, a_object(c, "tree").id, line, reason, _line_hold_done, c))
+	c.scratch[2] = 0
+	if c.stage == 1 {
+		c.in_exec = false
+		o_int(o, "held", int(c.scratch[0]))
+		o_bool(o, "sealed", c.scratch[1] == 1)
+		return .Ok
+	}
+	return .Pending
+}
+
+@(private)
+_line_hold_done :: proc(data: rawptr, ok: bool) {
+	c := (^Call)(data)
+	c.scratch[1] = 1 if ok else 0
+	c.stage = 1
+	if c.scratch[2] == 1 {
+		return
+	}
+	c.in_exec = false
+	if c.orphan {
+		_call_free(c)
+		return
+	}
+	_rerun(c)
 }
 
 op_line_resume :: proc(c: ^Call, o: ^Out) -> Status {

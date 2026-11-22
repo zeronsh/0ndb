@@ -280,6 +280,7 @@ Runtime :: struct {
 	prev_events: eng.Event_Hook,
 	hooked:      bool,
 	asks:        [dynamic]Ask,
+	hold_waits:  [dynamic]^Hold_Wait,
 	stats:       Stats,
 }
 
@@ -437,6 +438,7 @@ close :: proc(r: ^Runtime) {
 		run := r.runs[len(r.runs) - 1]
 		_run_abandon(run)
 	}
+	_hold_waits_close(r)
 	for len(r.procs) > 0 {
 		_proc_free(r.procs[len(r.procs) - 1], true)
 	}
