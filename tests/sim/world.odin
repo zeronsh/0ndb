@@ -72,6 +72,7 @@ Node :: struct {
 	alive:       bool,
 	connects:    int,
 	connect_fault: Connect_Fault,
+	persist_fail: int,
 	unavailable: int,
 	incarnation: int,
 	inst:        Instance,
@@ -178,6 +179,7 @@ Config :: struct {
 	storage:     eng.Storage_Mode,
 	durability:  eng.Durability,
 	promote:     i64,
+	persist_fault: bool,
 }
 
 World :: struct {

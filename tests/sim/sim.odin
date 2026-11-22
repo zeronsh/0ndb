@@ -47,6 +47,7 @@ default_config :: proc(seed: u64) -> Config {
 		trace_limit = 4000,
 		storage = .Device if rng_chance(&r, 1, 3) else .Device_Until_Run if rng_chance(&r, 1, 3) else .Auto,
 		durability = .Async if rng_chance(&r, 1, 2) else .Deferred,
+		persist_fault = rng_chance(&r, 1, 4),
 	}
 }
 
@@ -319,6 +320,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		cfg.durability = mode
 	}
 	cfg.promote = i64(env_u64("SIM_PROMOTE", u64(cfg.promote)))
+	cfg.persist_fault = env_u64("SIM_PERSIST_FAULT", 1 if cfg.persist_fault else 0) != 0
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
 	cfg.keep_faults = filter_parse("SIM_KEEP_FAULTS")
 	if f, ok := os.lookup_env("SIM_FAULTS", context.temp_allocator); ok && f == "0" {

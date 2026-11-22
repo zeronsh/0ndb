@@ -5,6 +5,7 @@ import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 import eng "../../src/engine"
+import "../../src/fs"
 import "../../src/pack"
 import "../../src/prim"
 import osync "../../src/sync"
@@ -74,6 +75,7 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.credentials = eng.Credentials_Source{data = n, produce = node_credentials}
 	cfg.write_observer = sim_observer(n)
 	cfg.watcher = sim_watcher(n)
+	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail}
 	cfg.embedder = sim_embedder()
 	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
 		return {}
@@ -703,6 +705,18 @@ STAT_TIER_COLD_READS: Stat
 STAT_TIER_THAWS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
+STAT_PERSIST_FAULTS: Stat
+
+_persist_fail :: proc(data: rawptr) -> bool {
+	n := (^Node)(data)
+	if n.persist_fail <= 0 {
+		return false
+	}
+	n.persist_fail -= 1
+	stat_add(n.w, STAT_PERSIST_FAULTS)
+	world_note(n.w, "%s history persist fails (injected)", n.name)
+	return true
+}
 
 @(init)
 _node_stats :: proc "contextless" () {
@@ -717,6 +731,8 @@ _node_stats :: proc "contextless" () {
 		res.stats.extra[int(STAT_TIER_FAILED_READS)] += w.relay.slow.failed
 	})
 	register_stat_line(40)
+	register_stat_line(45)
+	STAT_PERSIST_FAULTS = register_stat(45, 0, "history_persist_faults")
 	STAT_TIER_EVICTIONS = register_stat(40, 0, "relay_evictions")
 	STAT_TIER_COLD_READS = register_stat(40, 1, "relay_cold_reads")
 	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
