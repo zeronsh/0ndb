@@ -263,6 +263,14 @@ Session list. `catalog.list(space, archived, after, limit)` pages rows
 X call `catalog.get(X)` (or apply the delta's fields); on a Gap re-get the
 listed objects.
 
+Resolving a short id or title. `catalog.find(space, text)` returns every row
+whose hex object id starts or ends with `text` (case-insensitive) or whose
+title equals it. When nothing matches it waits only while the space's catalog
+is behind the relay (a catalog segment the relay holds more of than is
+applied, or the feed not yet caught up since connecting); once caught up it
+answers with whatever matches, possibly nothing. Without a relay connection it
+answers at once.
+
 Open a conversation at the bottom. Subscribe to the conversation, read
 `convo.status` and take `position` (the reader's message; `head` when it is
 null), then `convo.window(object, anchor: position, before: N)`: the
@@ -641,6 +649,7 @@ up exist only over the socket.
 |---|---|---|---|
 | 99 | `catalog.get` | object: object | found:bool entry:CatalogEntry |
 | 100 | `catalog.list` | space: id, archived: bool, after: bytes, limit: uvarint | rows:[CatalogRow] more:bool next:bytes |
+| 141 | `catalog.find` | space: id, text: str | rows:[CatalogRow] |
 | 101 | `catalog.usage` | object: object | Usage |
 | 102 | `catalog.set` | object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id | Result |
 

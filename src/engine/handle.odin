@@ -120,6 +120,7 @@ _object_changed :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Change_Ki
 	c.space = space
 	c.kinds += {kind}
 	e.changed[id] = c
+	_space_waits_catalog_changed(e, space, id)
 	_touch(e)
 }
 

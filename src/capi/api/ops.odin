@@ -113,6 +113,7 @@ OPS := []Op {
 	{99, "catalog.get", {OBJ}, "found:bool entry:CatalogEntry", op_catalog_get},
 	{100, "catalog.list", {SPACE, {"archived", .Bool, nil}, {"after", .Bytes, nil}, {"limit", .U64, nil}}, "rows:[CatalogRow] more:bool next:bytes", op_catalog_list},
 	{101, "catalog.usage", {OBJ}, "Usage", op_catalog_usage},
+	{141, "catalog.find", {SPACE, TEXT}, "rows:[CatalogRow]", op_catalog_find},
 	{102, "catalog.set", {OBJ, {"set", .U64, nil}, {"title", .Str, nil}, {"archived", .Bool, nil}, {"pinned", .Bool, nil}, {"parent", .Object, nil}, {"parent_msg", .Rid, nil}, {"workspace", .Id, nil}, {"agent", .Id, nil}}, RESULT, op_catalog_set},
 	{103, "search", {{"query", .Str, nil}, {"limit", .U64, nil}, {"cursor", .Bytes, nil}, {"sort", .Enum, SORT_NAMES[:]}, {"semantic", .Bool, nil}, {"collapse", .Bool, nil}, SPACE, {"scope", .Enum, SCOPE_NAMES[:]}}, "Results", op_search},
 	{104, "search.mode", {SPACE, {"mode", .Enum, SEARCH_MODE_NAMES[:]}}, "mode:enum", op_search_mode},

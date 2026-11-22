@@ -1,6 +1,8 @@
 package engine
 
 import "core:crypto/blake2b"
+import "core:mem/virtual"
+import "core:strings"
 import "../convo"
 import omap "../map"
 import "../obj"
@@ -203,6 +205,55 @@ catalog_list :: proc(e: ^Engine, space: prim.Id, archived: bool, after: ^Map_Cur
 		return r, m, _wait(e, h, ready)
 	}
 	return r, m, .None
+}
+
+catalog_find :: proc(e: ^Engine, space: prim.Id, text: string, allocator := context.allocator, ready: Ready = {}) -> (rows: []Catalog_Row, err: Error) {
+	context = context_for(e)
+	sp := _space_open(e, space) or_return
+	if ready.call != nil && _space_settling(e, sp) {
+		return nil, _space_wait(e, sp, ready, nil)
+	}
+	if !e.in_tick {
+		_catalog_flush(e)
+	}
+	h := _catalog_handle(e, sp) or_return
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return nil, merr
+	}
+	part := strings.to_lower(text, context.temp_allocator)
+	out := make([dynamic]Catalog_Row, allocator)
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch) != nil {
+		return nil, .No_Memory
+	}
+	defer virtual.arena_destroy(&scratch)
+	for archived in ([]bool{false, true}) {
+		cur: Map_Cursor
+		for {
+			page, more, lerr := omap.catalog_list(&h.table, archived, &cur, 4096, virtual.arena_allocator(&scratch))
+			if lerr != .None {
+				return nil, _oerr(lerr)
+			}
+			for &r in page {
+				hx := prim.id_hex(r.object)
+				x := string(hx[:])
+				if (len(part) > 0 && (strings.has_prefix(x, part) || strings.has_suffix(x, part))) || (len(text) > 0 && r.title == text) {
+					m := r
+					m.title = strings.clone(r.title, allocator)
+					append(&out, m)
+				}
+			}
+			virtual.arena_free_all(&scratch)
+			if !more {
+				break
+			}
+		}
+	}
+	if len(out) == 0 && ready.call != nil && sp.repl_on && sp.connected && (!osync.replicator_caught_up(&sp.repl) || _handle_waiting(h, ready.fresh)) {
+		return nil, _space_wait_catalog(e, sp, ready)
+	}
+	return out[:], .None
 }
 
 catalog_usage :: proc(e: ^Engine, o: Object, usage: convo.Usage) {
