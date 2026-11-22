@@ -2697,29 +2697,8 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, path: st
 			emit_insert(m, b, inode, pre + w.w1, data[w.w1:r.b1]) or_return
 			continue
 		}
-		hk := hunks[i]
-		if hk.a_len != hk.b_len || hk.a_len == 0 {
-			builder_delete(b, inode, pre + r.b0, r.a1 - r.a0)
-			emit_insert(m, b, inode, pre + r.b0, data[r.b0:r.b1]) or_return
-			continue
-		}
-		for k in 0 ..< int(hk.a_len) {
-			oa0 := int(la.offs[int(hk.a_start) + k])
-			oa1 := int(la.offs[int(hk.a_start) + k + 1])
-			nb0 := int(lb.offs[int(hk.b_start) + k])
-			nb1 := int(lb.offs[int(hk.b_start) + k + 1])
-			sub, serr := textdiff.byte_diff(old[oa0:oa1], data[nb0:nb1], context.temp_allocator)
-			if serr != nil {
-				builder_delete(b, inode, pre + nb0, oa1 - oa0)
-				emit_insert(m, b, inode, pre + nb0, data[nb0:nb1]) or_return
-				continue
-			}
-			for ed in sub {
-				pos := nb0 + int(ed.pos)
-				builder_delete(b, inode, pre + pos, int(ed.del))
-				emit_insert(m, b, inode, pre + pos, data[pos:][:ed.ins]) or_return
-			}
-		}
+		builder_delete(b, inode, pre + r.b0, r.a1 - r.a0)
+		emit_insert(m, b, inode, pre + r.b0, data[r.b0:r.b1]) or_return
 	}
 	return .None
 }

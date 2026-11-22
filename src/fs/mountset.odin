@@ -218,7 +218,7 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 		cerr or_return
 		want, spans, werr := history_text_spans_at(h, ino, tl[:], context.temp_allocator)
 		werr or_return
-		edits, derr := textdiff.byte_diff(cur, want, context.temp_allocator)
+		edits, derr := textdiff.line_edits(cur, want, context.temp_allocator)
 		if derr != nil {
 			builder_delete(&b, ino, 0, len(cur))
 			builder_copy_spans(&b, ino, 0, spans, 0, len(want))
