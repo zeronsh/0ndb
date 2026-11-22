@@ -512,7 +512,6 @@ View_Reader :: struct {
 
 @(private)
 _buffer_unavailable :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
-	b.dirty = true
 	_hist_fetch_full(e, h)
 	return .Missing
 }
