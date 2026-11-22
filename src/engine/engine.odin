@@ -182,7 +182,6 @@ Config :: struct {
 	search_options:  search.Options,
 	durability:      Durability,
 	verify_chains:   bool,
-	idle_pageout:    bool,
 	page_heap:       bool,
 	system_heap:     bool,
 	kernel_tls:      bool,
@@ -858,9 +857,6 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	if !e.pack_more {
 		_pages_release(&e.pages)
 		_heap_release(e)
-		if e.cfg.idle_pageout {
-			_pageout(e)
-		}
 	}
 }
 

@@ -413,7 +413,7 @@ enum ondb_io_error {
 #define ONDB_NO_SEARCH (1u << 3)   /* no derived search indexes */
 #define ONDB_DEFERRED (1u << 4)    /* the embedder makes writes durable (ondb "flush" op) */
 #define ONDB_EVENTS_JSON (1u << 5) /* deliver Event payloads as JSON */
-#define ONDB_IDLE_PAGEOUT (1u << 6) /* when idle, return heap and page out clean code pages */
+#define ONDB_IDLE_PAGEOUT (1u << 6) /* ignored: an idle engine always returns heap and never pages out code */
 #define ONDB_SEARCH_FULL (1u << 7) /* keep a full search index of every space and serve peer queries */
 #define ONDB_STORAGE_SHIFT 8       /* bits 8-9: storage mode: */
 #define ONDB_STORAGE_AUTO 0u       /*   relay stores conversations and metadata (default) */

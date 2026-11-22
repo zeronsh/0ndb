@@ -16,7 +16,3 @@ _heap_release :: proc(e: ^Engine) {
 		malloc_zone_pressure_relief(nil, 0)
 	}
 }
-
-@(private)
-_pageout :: proc(e: ^Engine) {
-}
