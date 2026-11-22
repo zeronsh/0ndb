@@ -48,4 +48,5 @@ Relay_Storage :: struct {
 	object_remove:   proc(data: rawptr, ns: rawptr, key: Object_Key, done: Storage_Done, ctx: rawptr),
 	account:         proc(data: rawptr, ns: rawptr) -> Store_Account,
 	objects:         proc(data: rawptr, ns: rawptr, out: ^[dynamic]Object_Key) -> Error,
+	atomic:          bool,
 }

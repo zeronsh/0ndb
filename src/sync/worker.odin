@@ -58,6 +58,8 @@ Worker :: struct {
 	inflight:  int,
 	group:     Group_Commit,
 	before:    proc(data: rawptr),
+	prepare:   proc(data: rawptr),
+	prep_data: rawptr,
 	allocator: runtime.Allocator,
 }
 
@@ -170,6 +172,9 @@ _worker_main :: proc(data: rawptr) {
 _worker_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: rawptr) {
 	w := cast(^Worker)data
 	_notifier_drain(&w.notifier)
+	if len(w.inline_q) > 0 && w.prepare != nil {
+		w.prepare(w.prep_data)
+	}
 	if len(w.inline_q) > 0 {
 		jobs := w.inline_q
 		w.inline_q = make([dynamic]^Job, w.allocator)

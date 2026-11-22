@@ -174,6 +174,7 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		object_close = _fs_object_close,
 		object_remove = _fs_object_remove,
 		objects = _fs_objects,
+		atomic = fs.pack != nil,
 	}
 }
 

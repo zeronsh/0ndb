@@ -263,6 +263,10 @@ _relay_own_storage :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config) -> (stor
 	if r.own_pack != nil {
 		fs.resolver = _pack_resolver(r.own_pack)
 		fs.pack = r.own_pack
+		fs.worker.prepare = proc(data: rawptr) {
+			relay_core_prepare(&(cast(^Relay)data).core)
+		}
+		fs.worker.prep_data = r
 	}
 	return file_store(fs), .None
 }

@@ -6,6 +6,7 @@ import "core:strings"
 import api "../../src/capi/api"
 import eng "../../src/engine"
 import "../../src/fs"
+import "../../src/pack"
 import "../../src/prim"
 import osync "../../src/sync"
 
@@ -98,6 +99,8 @@ Relay_Node :: struct {
 	inst:   Instance,
 	r:      osync.Relay_Core,
 	fs:     osync.File_Store,
+	pk:     pack.Pack,
+	packed: bool,
 	wake:   prim.Timer,
 	r_on:   bool,
 	rng:    Rng,

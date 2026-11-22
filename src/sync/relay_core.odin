@@ -68,6 +68,7 @@ Relay_Core_Config :: struct {
 }
 
 Relay_Core :: struct {
+	feed_held:  [dynamic]Space_Id,
 	cfg:        Relay_Core_Config,
 	store:      Relay_Storage,
 	auth:       Authorizer,
@@ -85,6 +86,7 @@ Relay_Core :: struct {
 }
 
 Space_State :: struct {
+	held:     bool,
 	id:       Space_Id,
 	ns:       rawptr,
 	quota:    i64,
@@ -149,6 +151,7 @@ Stream_State :: struct {
 	poisoned:  bool,
 	dropped:   bool,
 	trimmed:   bool,
+	redacting: int,
 }
 
 Sub :: struct {
@@ -235,6 +238,7 @@ Pending :: struct {
 	need:   i64,
 	length: i64,
 	id:     [32]u8,
+	early:  bool,
 }
 
 @(private)
@@ -329,6 +333,7 @@ relay_core_init :: proc(r: ^Relay_Core, cfg: Relay_Core_Config, allocator := con
 		return .Invalid
 	}
 	r.conns = make([dynamic]^Conn, allocator)
+	r.feed_held = make([dynamic]Space_Id, allocator)
 	r.gens = make([dynamic]u32, allocator)
 	r.free = make([dynamic]u32, allocator)
 	r.graveyard = make([dynamic]^Conn, allocator)
@@ -374,6 +379,7 @@ relay_core_destroy :: proc(r: ^Relay_Core) {
 	delete(r.spaces)
 	delete(r.principals)
 	delete(r.conns)
+	delete(r.feed_held)
 	delete(r.gens)
 	delete(r.free)
 	delete(r.graveyard)
@@ -402,8 +408,24 @@ relay_core_stats :: proc "contextless" (r: ^Relay_Core) -> Relay_Stats {
 	return s
 }
 
+relay_core_prepare :: proc(r: ^Relay_Core) {
+	if len(r.feed_held) == 0 {
+		return
+	}
+	held := make([dynamic]Space_Id, 0, len(r.feed_held), context.temp_allocator)
+	append(&held, ..r.feed_held[:])
+	clear(&r.feed_held)
+	for id in held {
+		if sp, ok := r.spaces[id]; ok && sp.held {
+			sp.held = false
+			_feed_flush(r, sp)
+		}
+	}
+	_reap(r)
+}
+
 relay_core_quiet :: proc "contextless" (r: ^Relay_Core) -> bool {
-	if len(r.yielded) > 0 {
+	if len(r.yielded) > 0 || len(r.feed_held) > 0 {
 		return false
 	}
 	for c in r.conns {
@@ -1646,6 +1668,7 @@ _on_redact :: proc(c: ^Conn, rd: ^prim.Reader) {
 		return
 	}
 	p.from = i64(from)
+	st.redacting += 1
 	r.store.redact(r.store.data, st.h, i64(from), i64(to), _relay_done, p)
 }
 
@@ -1801,6 +1824,10 @@ _on_bulk_end :: proc(c: ^Conn) {
 			return
 		}
 		r.stats.appends += 1
+		if r.store.atomic && op.failed == .None && st.redacting == 0 {
+			p.early = true
+			p.need = _feed_hold(r, c.space, op.id, u64(st.length + op.total))
+		}
 		r.store.append_commit(r.store.data, op.w, _relay_done, p)
 	case .Put:
 		p := _pending_new(c, .Put, nil, op.total, op.id)
@@ -1881,11 +1908,19 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 				_conn_kick(f)
 			}
 			_relay_observe(r, sp, st, was, value)
-			_feed_wait(r, sp, p, u64(st.length))
+			if p.early {
+				append(&sp.feed_wait, p)
+				_feed_release(r, sp)
+			} else {
+				_feed_wait(r, sp, p, u64(st.length))
+			}
 			_reap(r)
 			return
 		} else {
 			st.poisoned = true
+			if p.early {
+				_feed_unhold(sp, p.need, st.length)
+			}
 			if c != nil {
 				_reply_refused(c, .Quota if result == .No_Space else .Io, p.id)
 			}
@@ -1901,6 +1936,7 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			_reply_refused(c, .Quota if result == .No_Space else .Io, p.id)
 		}
 	case .Redact:
+		p.stream.redacting -= 1
 		if result == .None {
 			_redlog_add(r, sp, p)
 			_reap(r)
