@@ -305,6 +305,7 @@ Replicator :: struct {
 	peer_tampered: int,
 	promos:     [dynamic]^Promotion,
 	lives:      map[Stream_Id]Live_Sub,
+	interests:  map[Stream_Id]bool,
 	dflights:   [dynamic]Draft_Flight,
 	live_rx:    Live_Rx,
 	live_sent:  i64,
@@ -2132,6 +2133,10 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		}
 	case .Lived:
 		_on_lived(r, ev)
+	case .Watched:
+		if _, ok := r.interests[Stream_Id(ev.id)]; ok {
+			r.interests[Stream_Id(ev.id)] = ev.final
+		}
 	case .Probed:
 		if Stream_Id(ev.id) == reserved_id(FEED_TAG, 0) {
 			r.feed_target = ev.length

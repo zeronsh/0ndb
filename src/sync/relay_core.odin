@@ -128,6 +128,7 @@ Space_State :: struct {
 	pipes:    [dynamic]Pipe,
 	live:     [dynamic]^Conn,
 	livers:   map[Stream_Id][dynamic]^Conn,
+	interest: map[Stream_Id][dynamic]^Conn,
 	count:    Relay_Space_Stats,
 }
 
@@ -269,6 +270,7 @@ Conn :: struct {
 	out_head:  int,
 	subs:      [dynamic]Sub,
 	lives:     [dynamic]Stream_Id,
+	interests: [dynamic]Stream_Id,
 	rr:        int,
 	scan:      bool,
 	listing:   ^Listing,
@@ -613,6 +615,7 @@ _reap :: proc(r: ^Relay_Core) {
 		delete(c.out)
 		delete(c.subs)
 		delete(c.lives)
+		delete(c.interests)
 		delete(c.stash)
 		free(c, r.allocator)
 	}
@@ -1072,6 +1075,7 @@ _space_get :: proc(r: ^Relay_Core, id: Space_Id) -> (sp: ^Space_State, err: Erro
 	sp.present = make(map[Device_Id]Presence_Entry, r.allocator)
 	sp.pipes = make([dynamic]Pipe, r.allocator)
 	sp.livers = make(map[Stream_Id][dynamic]^Conn, r.allocator)
+	sp.interest = make(map[Stream_Id][dynamic]^Conn, r.allocator)
 	sp.live = make([dynamic]^Conn, r.allocator)
 	r.spaces[id] = sp
 	return sp, .None
@@ -1115,6 +1119,10 @@ _space_release :: proc(r: ^Relay_Core, sp: ^Space_State) {
 		delete(l)
 	}
 	delete(sp.livers)
+	for _, l in sp.interest {
+		delete(l)
+	}
+	delete(sp.interest)
 	delete(sp.live)
 	r.store.namespace_close(r.store.data, sp.ns)
 	free(sp, r.allocator)
@@ -1785,7 +1793,7 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_id(c, .Stored, op.id)
 		case .Noted:
 			_reply_hollow(c, .Noted, op.id, op.base, op.len)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered, .Note, .Fill, .Pull, .Serve, .Hollow, .Pulled, .Served, .Unserved, .Account, .Accounted, .Trim, .Trimmed, .Live, .Lived:
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered, .Note, .Fill, .Pull, .Serve, .Hollow, .Pulled, .Served, .Unserved, .Account, .Accounted, .Trim, .Trimmed, .Live, .Lived, .Watched:
 		}
 	case .Append:
 		st := op.stream

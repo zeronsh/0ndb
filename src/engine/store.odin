@@ -499,7 +499,12 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		if _trees_waiting(e) {
 			_touch(e)
 		}
-		for p in b.drafts {
+		outer: for p, i in b.drafts {
+			for q in b.drafts[i + 1:] {
+				if q.object == p.object && q.gen == p.gen && q.end >= p.end {
+					continue outer
+				}
+			}
 			_draft_publish(e, p)
 		}
 		for &d in b.segs {

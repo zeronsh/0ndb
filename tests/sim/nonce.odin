@@ -184,6 +184,7 @@ _frame :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8, down: bool) {
 		at, body, src = i64(prim.get_u64le(payload[40:48])), payload[LIVE_FIXED:], .Live
 		w.cipher.drafts += 1
 		w.stats.draft_frames += 1
+		w.stats.draft_up_bytes += u64(FRAME_HEADER + len(payload))
 	case down && kind == KIND_LIVED && len(payload) >= LIVE_FIXED && !w.cfg.byzantine:
 		copy(sid[:], payload[:32])
 		sid = draft_sid(sid, prim.get_u64le(payload[32:40]))

@@ -148,6 +148,7 @@ World_Stats :: struct {
 	seg_delta_bytes: u64,
 	draft_checked:  u64,
 	draft_frames:   u64,
+	draft_up_bytes: u64,
 	remote_draft_bytes: u64,
 }
 

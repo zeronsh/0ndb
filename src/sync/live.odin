@@ -70,6 +70,47 @@ replicator_live_follow :: proc(r: ^Replicator, sc: ^Scope, device: Device_Id, na
 	return .None
 }
 
+replicator_live_watched :: proc(r: ^Replicator, sc: ^Scope, name: string, epoch: u64) -> bool {
+	if !replicator_live_on(r) {
+		return false
+	}
+	if r.features & FEATURE_LIVE_WATCH == 0 {
+		return true
+	}
+	_enter(r)
+	defer _leave(r)
+	if r.interests == nil {
+		r.interests = make(map[Stream_Id]bool, r.allocator)
+	}
+	id := stream_id(sc, r.cfg.self, name, epoch)
+	if on, ok := r.interests[id]; ok {
+		return on
+	}
+	r.interests[id] = false
+	ids := [1]Stream_Id{id}
+	client_live_interest(&r.client, ids[:])
+	_repl_flush(r)
+	return false
+}
+
+replicator_live_unwatch :: proc(r: ^Replicator, sc: ^Scope, name: string, epoch: u64) {
+	if r.interests == nil {
+		return
+	}
+	_enter(r)
+	defer _leave(r)
+	id := stream_id(sc, r.cfg.self, name, epoch)
+	if _, ok := r.interests[id]; !ok {
+		return
+	}
+	delete_key(&r.interests, id)
+	if replicator_live_on(r) && r.features & FEATURE_LIVE_WATCH != 0 {
+		ids := [1]Stream_Id{id}
+		client_live_interest(&r.client, ids[:], false)
+		_repl_flush(r)
+	}
+}
+
 replicator_live_send :: proc(r: ^Replicator, sc: ^Scope, name: string, epoch: u64, msg, at: i64, data: []u8) -> bool {
 	if !replicator_live_on(r) || client_queued(&r.client) >= OUT_HIGH {
 		return false
@@ -180,14 +221,25 @@ _live_clone :: proc(s: string, r: ^Replicator) -> (string, Error) {
 
 @(private)
 _lives_resend :: proc(r: ^Replicator) {
-	if !replicator_live_on(r) || len(r.lives) == 0 {
+	if !replicator_live_on(r) {
 		return
 	}
 	ids := make([dynamic]Stream_Id, context.temp_allocator)
 	for id in r.lives {
 		append(&ids, id)
 	}
-	client_follow_live(&r.client, ids[:])
+	if len(ids) > 0 {
+		client_follow_live(&r.client, ids[:])
+	}
+	if r.features & FEATURE_LIVE_WATCH == 0 || len(r.interests) == 0 {
+		return
+	}
+	clear(&ids)
+	for id, &on in r.interests {
+		on = false
+		append(&ids, id)
+	}
+	client_live_interest(&r.client, ids[:])
 }
 
 @(private)
@@ -199,6 +251,7 @@ _lives_reset :: proc(r: ^Replicator) {
 
 @(private)
 _lives_destroy :: proc(r: ^Replicator) {
+	delete(r.interests)
 	for _, s in r.lives {
 		delete(s.name, r.allocator)
 	}
