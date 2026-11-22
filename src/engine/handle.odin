@@ -688,6 +688,9 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 		osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
 	}
 	_drafts_free(h)
+	if h.kind == .Conversation && h.sp.repl_on {
+		osync.replicator_live_unwatch(&h.sp.repl, &h.scope, h.name, 0)
+	}
 	for s in h.segs {
 		journal.reader_close(&s.jr)
 		if h.sp.repl_on && s.live && !_subscribed(e, h.id) {

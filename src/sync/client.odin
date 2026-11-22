@@ -40,6 +40,7 @@ Event_Kind :: enum u8 {
 	Unserved,
 	Accounted,
 	Lived,
+	Watched,
 }
 
 Event :: struct {
@@ -846,6 +847,10 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.length = get_i64(&r)
 	case .Directed, .Undelivered:
 		return _client_direct_event(it, handler, user)
+	case .Watched:
+		ev.kind = .Watched
+		ev.id = get_id32(&r)
+		ev.final = prim.read_u8(&r) != 0
 	case .Noted, .Hollow, .Trimmed:
 		ev.kind = .Noted if it.frame == .Noted else .Hollow
 		ev.trimmed = it.frame == .Trimmed

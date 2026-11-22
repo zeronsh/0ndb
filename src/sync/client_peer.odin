@@ -145,6 +145,25 @@ client_live :: proc(c: ^Client, id: Stream_Id, msg, at: i64, data: []u8) -> Erro
 	return .None
 }
 
+client_live_interest :: proc(c: ^Client, ids: []Stream_Id, on := true) -> Error {
+	rest := ids
+	for len(rest) > 0 {
+		n := min(len(rest), FOLLOW_BATCH)
+		b := _client_buf(c)
+		start := frame_begin(b, .Follow) or_return
+		w := prim.writer(b)
+		prim.write_u8(&w, FOLLOW_LIVE)
+		prim.write_u16le(&w, u16(n))
+		for id in rest[:n] {
+			put_id(&w, cast([32]u8)id)
+			prim.write_u64le(&w, LIVE_INTEREST if on else LIVE_INTEREST_END)
+		}
+		frame_end(b, start, &w) or_return
+		rest = rest[n:]
+	}
+	return .None
+}
+
 client_follow_live :: proc(c: ^Client, ids: []Stream_Id, on := true) -> Error {
 	rest := ids
 	for len(rest) > 0 {
