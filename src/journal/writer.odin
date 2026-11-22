@@ -45,7 +45,7 @@ journal_open :: proc(j: ^Journal, vfs: prim.Vfs, path: string, opts := Options{}
 		return rerr
 	}
 	j.redact_path = redact_path
-	fd, oerr := prim.open_file(vfs, path, {.Write}, 0o600)
+	fd, oerr := prim.open_file(vfs, path, {.Write, .Group_Visible}, 0o600)
 	if oerr == .Not_Found {
 		if opts.keep_at_least > 0 {
 			_release(j)
@@ -57,7 +57,7 @@ journal_open :: proc(j: ^Journal, vfs: prim.Vfs, path: string, opts := Options{}
 				return _err(e)
 			}
 		}
-		fd, oerr = prim.open_file(vfs, path, {.Write, .Create, .Exclusive}, 0o600)
+		fd, oerr = prim.open_file(vfs, path, {.Write, .Create, .Exclusive, .Group_Visible}, 0o600)
 		if oerr == .None && .Durable_Dir_Ops_With_Data not_in prim.file_caps(vfs, fd) {
 			if serr := prim.sync_dir(vfs, prim.dir_name(path)); serr != .None {
 				prim.close_file(vfs, fd)

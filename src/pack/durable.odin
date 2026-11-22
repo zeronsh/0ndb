@@ -45,6 +45,9 @@ _current_size :: proc(p: ^Pack, inum: u64) -> (size: i64, err: Error) {
 	if !found {
 		return 0, .Not_Found
 	}
+	if ino.kind == .External && ino.sized {
+		return ino.size, .None
+	}
 	if ino.kind == .External {
 		pb: prim.Path_Buf
 		st := prim.stat(p.base, _phys_path(p, &pb, 'x', inum)) or_return
@@ -143,4 +146,23 @@ _ext_before :: proc(p: ^Pack, oi: ^Open_Inode) -> (i64, Error) {
 		return pd.steps[n - 1].size if n > 0 else pd.base, .None
 	}
 	return _perr_size(prim.file_size(p.base, oi.real_fd))
+}
+
+@(private)
+_mark_sized :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
+	old := oi.ino
+	oi.ino.sized = true
+	oi.ino.size = _perr_size(prim.file_size(p.base, oi.real_fd)) or_return
+	return _inode_store(p, oi.inum, &old, &oi.ino)
+}
+
+@(private)
+_ext_commit_size :: proc(p: ^Pack, oi: ^Open_Inode, size: i64) -> Error {
+	if oi.ino.size == size {
+		return .None
+	}
+	old := oi.ino
+	oi.ino.size = size
+	oi.ino.mtime = _now(p)
+	return _inode_store(p, oi.inum, &old, &oi.ino)
 }
