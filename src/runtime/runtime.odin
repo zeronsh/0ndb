@@ -379,6 +379,7 @@ _on_engine_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		case .Connected:
 			_pending_scan(r, ev.space)
 		case .Caught_Up:
+			readvertise(r, ev.space)
 			for w in r.revives {
 				if w.object.space == ev.space {
 					_queue_eval(r, w.object)
@@ -454,9 +455,6 @@ close :: proc(r: ^Runtime) {
 		}
 		if sw.runners != 0 {
 			eng.unsubscribe(r.e, sw.runners)
-		}
-		if r.cfg.runner {
-			_advertise(r, sw.space, 0)
 		}
 	}
 	for w in r.waits {

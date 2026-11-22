@@ -520,7 +520,11 @@ _advertise :: proc(r: ^Runtime, space: prim.Id, capacity: int) {
 	pool := u64(1) if r.cfg.pool else 0
 	signed := _providers_signed_in(r, provs)
 	pool_id := _pool_of(r, space)
-	en, ok := map_read(r, runners_object(space), me[:])
+	en, found, gerr := eng.map_get(r.e, runners_object(space), me[:], context.temp_allocator)
+	if gerr == .Pending {
+		return
+	}
+	ok := gerr == .None && found && entry_live(&en)
 	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs && entry_u64(&en, 3) == pool && entry_str(&en, 4) == signed && entry_str(&en, 5) == r.cfg.name && entry_id(&en, 6) == pool_id {
 		return
 	}
@@ -633,6 +637,7 @@ _on_runners :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng
 	r := (^Runtime)(data)
 	for d in deltas {
 		_asks_forget(r, d.object.space)
+		readvertise(r, d.object.space)
 		_runners_changed(r, d.object.space)
 		_pending_scan(r, d.object.space)
 		return

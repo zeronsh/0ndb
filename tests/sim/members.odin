@@ -344,6 +344,25 @@ _sleep_wake :: proc(w: ^World, space: prim.Id, o: eng.Object) {
 	if aerr != .None || after.records != before.records {
 		_fail(w, "the membership log grew with sleep/wake cycles: %d -> %d records, %d -> %d members", before.records, after.records, before.members, after.members)
 	}
+	for i in 0 ..< 6 {
+		_advance(w, i64(M_LEASE_MS) / 2)
+		if !_renew(w) {
+			_fail(w, "awake %d: the pool did not renew the runner", i)
+			return
+		}
+		_settle(w, 2000)
+		text := fmt.aprintf("awake-%d", i, allocator = w.allocator)
+		defer delete(text, w.allocator)
+		x, xok := _send(w, M_RUNNER, o, text)
+		if !xok || !_wait_read(w, M_A, o, x, text, 20_000) {
+			_fail(w, "awake %d: a runner kept alive by pool leases could not write", i)
+		}
+	}
+	_settle(w, 3000)
+	up, uerr := _status(w, M_A, space)
+	if uerr != .None || up.records != before.records {
+		_fail(w, "the membership log grew with runner uptime: %d -> %d records", before.records, up.records)
+	}
 }
 
 @(private = "file")
