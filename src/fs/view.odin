@@ -35,6 +35,34 @@ history_view_open :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (v
 	return view, .None
 }
 
+history_view_anchor_full :: proc(h: ^History, view: ^Text_View, a: crdt.Anchor) -> (pos: int, err: Error) {
+	tmp: File_State
+	tmp.inode = view.inode
+	owned := false
+	if f, ok := h.files[view.inode]; ok {
+		tmp.rec = f.rec
+		tmp.new_refs = f.new_refs
+	} else {
+		owned = true
+		if rerr := read_file_record(h, view.inode, &tmp.rec); rerr != .None {
+			delete(tmp.rec.cp_version)
+			delete(tmp.rec.cp_spans)
+			return 0, rerr
+		}
+	}
+	defer if owned {
+		delete(tmp.rec.cp_version)
+		delete(tmp.rec.cp_spans)
+	}
+	defer fshist.text_drop(&tmp.st)
+	load_text(h, &tmp, view.text.version[:], true) or_return
+	p, aerr := crdt.anchor_resolve(&tmp.text, &h.g, &tmp.log, a)
+	if aerr != .None {
+		return 0, .Not_Found
+	}
+	return p, .None
+}
+
 history_view_close :: proc(h: ^History, view: ^Text_View) {
 	for x, i in h.views {
 		if x == view {

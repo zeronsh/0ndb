@@ -452,12 +452,16 @@ check_buffers :: proc(w: ^World) {
 		}
 		node_after(n)
 	}
+	Seen :: struct {
+		node: string,
+		text: string,
+		pos:  int,
+	}
 	for a in w.anchors {
 		if !obj_exists(m, a.oi) {
 			continue
 		}
-		ref := -2
-		refn := ""
+		seen := make([dynamic]Seen, context.temp_allocator)
 		for idx in readers_of(w, a.oi) {
 			n := w.nodes[idx]
 			if !n.alive || !n.e_open {
@@ -470,10 +474,11 @@ check_buffers :: proc(w: ^World) {
 				continue
 			}
 			pos, _, _, rerr := eng.buffer_resolve(&n.e, info.id, info.rev, []eng.Anchor{a.anchor}, context.temp_allocator)
-			text := string(info.page)
+			text := strings.clone(string(info.page), w.allocator)
 			eng.buffer_close(&n.e, info.id)
 			node_after(n)
 			if rerr != .None {
+				delete(text, w.allocator)
 				continue
 			}
 			p := pos[0]
@@ -481,19 +486,20 @@ check_buffers :: proc(w: ^World) {
 			if at >= 0 && p < 0 {
 				world_fail(w, "anchor: %s for %s is present on %s but its anchor does not resolve", a.token, id_short(m.objs[a.oi].o.id), n.name)
 			}
-			if p < 0 {
-				continue
-			}
-			if at >= 0 && p != at {
+			if at >= 0 && p >= 0 && p != at {
 				world_fail(w, "anchor: %s for %s resolves to %d on %s but the token is at %d", a.token, id_short(m.objs[a.oi].o.id), p, n.name, at)
 			}
-			if ref == -2 {
-				ref = p
-				refn = n.name
-			} else if p != ref {
-				world_fail(w, "anchor: %s for %s resolves to %d on %s but %d on %s", a.token, id_short(m.objs[a.oi].o.id), p, n.name, ref, refn)
+			for x in seen {
+				if x.text == text && x.pos != p {
+					world_fail(w, "anchor: %s for %s resolves to %d on %s but %d on %s, which shows the same text", a.token, id_short(m.objs[a.oi].o.id), p, n.name, x.pos, x.node)
+					break
+				}
 			}
+			append(&seen, Seen{n.name, text, p})
 			w.stats.anchors_checked += 1
+		}
+		for x in seen {
+			delete(x.text, w.allocator)
 		}
 	}
 }
