@@ -772,18 +772,22 @@ deliver_shares :: proc(w: ^World) {
 		ordered_remove(&m.shares, i)
 		si := space_index(m, ps.share.space)
 		context = instance_context(&n.inst)
-		if !space_member(&m.spaces[si], n.idx) && !space_guest(&m.spaces[si], n.idx) {
+		if !space_member(&m.spaces[si], n.idx) {
 			err := eng.space_join_shared(&n.e, ps.share.space, fmt.tprintf("guest%d", si))
 			if err != .None && err != .Exists {
 				world_fail(w, "%s space_join_shared failed: %v", n.name, err)
 				node_after(n)
 				continue
 			}
-			oerr := eng.space_open(&n.e, ps.share.space)
-			if oerr != .None {
-				world_note(w, "%s space_open (guest) -> %v", n.name, oerr)
+			if err == .None {
+				oerr := eng.space_open(&n.e, ps.share.space)
+				if oerr != .None {
+					world_note(w, "%s space_open (guest) -> %v", n.name, oerr)
+				}
 			}
-			append(&m.spaces[si].guests, n.idx)
+			if !space_guest(&m.spaces[si], n.idx) {
+				append(&m.spaces[si].guests, n.idx)
+			}
 		}
 		err := eng.accept_share(&n.e, ps.share)
 		node_after(n)

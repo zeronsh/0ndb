@@ -62,6 +62,7 @@ Counter :: struct {
 	by:  prim.Id,
 	p:   u64,
 	n:   u64,
+	at:  i64,
 }
 
 Register :: struct {
@@ -276,7 +277,7 @@ entry_elements :: proc(e: ^Entry, tag: u32, allocator := context.temp_allocator)
 	return out[:]
 }
 
-ENTRY_FORMAT :: 3
+ENTRY_FORMAT :: 4
 
 encode_entry :: proc(buf: ^[dynamic]u8, e: ^Entry) -> Error {
 	devs := make([dynamic]prim.Id, context.temp_allocator)
@@ -339,6 +340,7 @@ encode_entry :: proc(buf: ^[dynamic]u8, e: ^Entry) -> Error {
 		prim.write_uvarint(&w, dev(&devs, c.by))
 		prim.write_uvarint(&w, c.p)
 		prim.write_uvarint(&w, c.n)
+		prim.write_uvarint(&w, u64(c.at))
 	}
 	if w.err != .None {
 		return .No_Memory
@@ -428,11 +430,13 @@ decode_entry :: proc(key: []u8, data: []u8, allocator := context.temp_allocator)
 		di := prim.read_uvarint(&r)
 		c.p = prim.read_uvarint(&r)
 		c.n = prim.read_uvarint(&r)
-		if t > u64(max(u32)) || di >= nd {
+		ca := prim.read_uvarint(&r)
+		if t > u64(max(u32)) || di >= nd || ca > u64(max(i64)) {
 			return e, .Corrupt
 		}
 		c.tag = u32(t)
 		c.by = devs[di]
+		c.at = i64(ca)
 	}
 	if r.err != .None || !prim.reader_done(&r) {
 		return e, .Corrupt
@@ -512,7 +516,7 @@ apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.
 		if k < 0 {
 			list := make([dynamic]Counter, 0, len(e.counters) + 1, allocator)
 			append(&list, ..e.counters)
-			append(&list, Counter{tag = v.tag, by = by})
+			append(&list, Counter{tag = v.tag, by = by, at = -1})
 			slice.sort_by(list[:], _counter_less)
 			e.counters = list[:]
 			for c, i in e.counters {
@@ -528,6 +532,11 @@ apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.
 			e.counters = list
 		}
 		c := &e.counters[k]
+		if at.off <= c.at {
+			return changed
+		}
+		c.at = at.off
+		changed = true
 		if v.delta > 0 {
 			c.p = _sat_add(c.p, u64(v.delta))
 			changed = true
@@ -819,6 +828,7 @@ entry_join :: proc(a, b: ^Entry, allocator := context.temp_allocator) -> (out: E
 		} else {
 			cs[k].p = _sat_add(cs[k].p, c.p)
 			cs[k].n = _sat_add(cs[k].n, c.n)
+			cs[k].at = max(cs[k].at, c.at)
 		}
 	}
 	slice.sort_by(cs[:], _counter_less)

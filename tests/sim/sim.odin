@@ -429,6 +429,7 @@ finish :: proc(w: ^World) {
 	if !check_convergence(w, true) && w.cfg.verbose {
 		dump_replication(w)
 	}
+	check_map_reapply(w)
 	check_redaction(w)
 	cipher_scan_relay(w)
 	cipher_resolve(w)

@@ -32,6 +32,7 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
 	history_wake(h) or_return
+	redact_preflight(h, spans) or_return
 	all := make([dynamic]crdt.Op_Span, context.temp_allocator)
 	for sp in spans {
 		if sp.len <= 0 {
@@ -144,19 +145,35 @@ replace_record :: proc(h: ^History, off: i64, spans: []crdt.Op_Span) -> Error {
 	b.ops = ops
 	orig := u64(off)
 	kind := body[0]
+	prevs: []u8
 	if body[0] == REC_REPLACE {
-		o, n := prim.get_uvarint(body[1:])
-		if n <= 0 || 1 + n >= len(body) {
+		r, rok := replace_decode(body)
+		if !rok {
 			return .Corrupt
 		}
-		orig = o
-		kind = body[1 + n]
+		orig = r.orig
+		kind = r.kind
+		prevs = r.prevs
 	}
 	clear(&h.io)
 	w := prim.writer(&h.io)
 	prim.write_u8(&w, REC_REPLACE)
 	prim.write_uvarint(&w, orig)
-	prim.write_u8(&w, kind)
+	if orig == u64(off) {
+		prim.write_u8(&w, kind)
+	} else {
+		count := 1
+		rest := prevs
+		for len(rest) > 0 {
+			_, n := prim.get_uvarint(rest)
+			rest = rest[n:]
+			count += 1
+		}
+		prim.write_u8(&w, kind | fshist.REPLACE_PREVS)
+		prim.write_uvarint(&w, u64(count))
+		prim.write_raw(&w, prevs)
+		prim.write_uvarint(&w, u64(off))
+	}
 	if crdt.batch_encode(&b, &h.io, &h.dict) != .None {
 		return .Too_Large
 	}
@@ -253,9 +270,31 @@ own_records :: proc(h: ^History, spans: []crdt.Op_Span, records: ^[dynamic][2]i6
 }
 
 @(private)
-apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span, targets: ^[dynamic]odb.Oid, protect: ^[dynamic]odb.Oid) -> (files: int, err: Error) {
-	views_stale(h)
+redact_preflight :: proc(h: ^History, spans: []crdt.Op_Span) -> Error {
+	p: crdt.Redact_Preview
+	all := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	for sp in spans {
+		if sp.len > 0 {
+			append(&all, sp)
+			crdt.graph_redact_preview(&h.g, &p, sp.id.actor, sp.id.seq, sp.len, &all)
+		}
+	}
+	records := make([dynamic][2]i64, context.temp_allocator)
+	also := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	own_records(h, all[:], &records, &also) or_return
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	targets := make([dynamic]odb.Oid, context.temp_allocator)
+	redaction_touched(h, all[:], also[:], &touched, &targets, true) or_return
+	for ino in sorted_inodes(touched) {
+		history_unload_files(h)
+		history_file(h, ino) or_return
+	}
+	history_unload_files(h)
+	return .None
+}
+
+@(private)
+redaction_touched :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span, touched: ^map[fstree.Inode_Id]bool, targets: ^[dynamic]odb.Oid, strict: bool) -> Error {
 	for x in also {
 		touched[op_inode(h, x.id)] = false
 	}
@@ -272,6 +311,9 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 				break
 			}
 			b, berr := history_read_batch(h, stream, off, context.temp_allocator)
+			if strict && berr == .Not_Found {
+				return .Not_Found
+			}
 			if berr == .None {
 				pos: u64
 				for op in b.ops {
@@ -292,6 +334,14 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 			got += max(n - (lv - first), 1)
 		}
 	}
+	return .None
+}
+
+@(private)
+apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span, targets: ^[dynamic]odb.Oid, protect: ^[dynamic]odb.Oid) -> (files: int, err: Error) {
+	views_stale(h)
+	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	redaction_touched(h, spans, also, &touched, targets, false) or_return
 	for ino in sorted_inodes(touched) {
 		secret := touched[ino]
 		history_unload_files(h)
@@ -361,7 +411,7 @@ mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: 
 }
 
 @(private)
-apply_redact_record :: proc(h: ^History, body: []u8) -> Error {
+apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Error {
 	rd := prim.reader(body[1:])
 	n := prim.read_uvarint(&rd)
 	if n > u64(len(body)) {
@@ -379,6 +429,9 @@ apply_redact_record :: proc(h: ^History, body: []u8) -> Error {
 	}
 	if !prim.reader_ok(&rd) {
 		return .Corrupt
+	}
+	if preflight {
+		redact_preflight(h, spans[:]) or_return
 	}
 	for sp in spans {
 		crdt.graph_redact(&h.g, sp.id.actor, sp.id.seq, sp.len)

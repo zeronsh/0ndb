@@ -583,8 +583,40 @@ graph_redact :: proc(g: ^Graph, actor: prim.Id, seq: u64, n: int, added: ^[dynam
 	return redact_closure(g, graph_intern(g, actor), seq, n, added)
 }
 
+Redact_Preview :: struct {
+	reds: map[u32][dynamic]Seq_Range,
+}
+
+graph_redact_preview :: proc(g: ^Graph, p: ^Redact_Preview, actor: prim.Id, seq: u64, n: int, added: ^[dynamic]Op_Span) {
+	if n <= 0 || n > MAX_RUN || seq >= MAX_COUNTER - u64(n) {
+		return
+	}
+	ix, ok := graph_actor(g, actor)
+	if !ok {
+		append(added, Op_Span{Op_Id{actor, seq}, n})
+		return
+	}
+	if p.reds == nil {
+		p.reds = make(map[u32][dynamic]Seq_Range, context.temp_allocator)
+	}
+	redact_closure(g, ix, seq, n, added, p)
+}
+
 @(private)
-redact_closure :: proc(g: ^Graph, actor: u32, seq: u64, n: int, added: ^[dynamic]Op_Span) -> bool {
+red_list :: proc(g: ^Graph, actor: u32, p: ^Redact_Preview) -> ^[dynamic]Seq_Range {
+	if p == nil {
+		return &g.seqs[actor].red
+	}
+	if _, ok := p.reds[actor]; !ok {
+		l := make([dynamic]Seq_Range, 0, len(g.seqs[actor].red), context.temp_allocator)
+		append(&l, ..g.seqs[actor].red[:])
+		p.reds[actor] = l
+	}
+	return &p.reds[actor]
+}
+
+@(private)
+redact_closure :: proc(g: ^Graph, actor: u32, seq: u64, n: int, added: ^[dynamic]Op_Span, p: ^Redact_Preview = nil) -> bool {
 	work := make([dynamic]Red_Work, g.allocator)
 	defer delete(work)
 	gaps := make([dynamic]Seq_Range, g.allocator)
@@ -593,7 +625,7 @@ redact_closure :: proc(g: ^Graph, actor: u32, seq: u64, n: int, added: ^[dynamic
 	changed := false
 	for len(work) > 0 {
 		w := pop(&work)
-		rs := &g.seqs[w.actor].red
+		rs := red_list(g, w.actor, p)
 		clear(&gaps)
 		cur := w.seq
 		end := w.seq + u64(w.len)

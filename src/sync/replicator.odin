@@ -936,6 +936,10 @@ _local_ack :: proc(r: ^Replicator, l: ^Local, ev: ^Event) {
 	r.uploading -= 1
 	expect := l.cursor + l.inflight
 	l.inflight = 0
+	if l.superseded {
+		_local_maybe_free(r, l)
+		return
+	}
 	if ev.kind == .Appended && ev.length == expect {
 		if err := _local_advance(r, l, expect); err != .None {
 			_local_fatal(r, l, err, ev.length)

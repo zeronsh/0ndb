@@ -311,7 +311,7 @@ _hist_read :: proc(data: rawptr, stream: prim.Id, off: i64, out: ^[dynamic]u8) -
 		body, _, err := journal.record_at(&s.jr, off)
 		if err == .Redacted {
 			synth, st := _hist_replacement(h, s, off)
-			if st == .Missing {
+			if st != .Found {
 				return false
 			}
 			clear(out)

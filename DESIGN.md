@@ -577,9 +577,15 @@ running on it is a record in it.
 
 ## Maps (`map`)
 
-A map holds keyed last-writer-wins registers (by `(hlc, participant)`) and
-add-wins sets, per field. Materialized views (copy-on-write B+ trees,
-rebuildable) give any secondary ordering as a paged range read. Maps are the
+A map holds keyed last-writer-wins registers (by `(hlc, participant)`),
+add-wins sets and counters, per field. Materialized views (copy-on-write B+
+trees, rebuildable) give any secondary ordering as a paged range read.
+Applying a record to a view is idempotent by construction: registers are
+last-writer-wins, set elements carry their record ids, and a counter keeps one
+contribution per source device (its running sum and the offset of the last
+record folded in), so a record at or below that offset changes nothing and the
+value is the sum over sources. A view may re-read any stream from any offset,
+from the local journal or a replica, any number of times. Maps are the
 catalog, workspaces, agent definitions, memory facts, routes, schedules,
 runner capacity and settings.
 

@@ -128,6 +128,32 @@ table_consumed :: proc(t: ^Table, seg: prim.Id) -> (off: i64, err: Error) {
 	return i64(x), .None
 }
 
+table_rewind :: proc(t: ^Table) -> Error {
+	if table_poisoned(t) {
+		return .None
+	}
+	segs := make([dynamic][]u8, context.temp_allocator)
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		l := (^[dynamic][]u8)(data)
+		k := make([]u8, len(key), context.temp_allocator)
+		copy(k, key)
+		append(l, k)
+		return true
+	}
+	db_scan(&t.db, ROOT_CONSUMED, nil, nil, &segs, visit) or_return
+	if len(segs) == 0 {
+		return .None
+	}
+	txn := txn_begin(&t.db) or_return
+	for k in segs {
+		if _, e := txn_delete(txn, ROOT_CONSUMED, k); e != .None {
+			txn_abort(txn)
+			return _fault(t, e)
+		}
+	}
+	return _fault(t, txn_commit(txn))
+}
+
 table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
 	if table_poisoned(t) {
 		if e := table_reset(t); e != .None {

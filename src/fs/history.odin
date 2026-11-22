@@ -919,7 +919,7 @@ history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (ad
 		return 0, history_persist(h)
 	}
 	if body[0] == REC_REDACT {
-		apply_redact_record(h, body) or_return
+		apply_redact_record(h, body, true) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
@@ -2208,6 +2208,9 @@ crdt_oid :: proc "contextless" (o: odb.Oid, format: odb.Hash_Format) -> (out: cr
 }
 
 REC_REPLACE :: fshist.REC_REPLACE
+Replace :: fshist.Replace
+replace_decode :: fshist.replace_decode
+replace_supersedes :: fshist.replace_supersedes
 
 batch_payload :: proc(body: []u8) -> (payload: []u8, ok: bool) {
 	return fshist.batch_payload(body)

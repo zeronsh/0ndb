@@ -118,6 +118,15 @@ map_writer :: proc(e: ^Engine, o: Object) -> (w: ^omap.Writer, err: Error) {
 	return &h.mw, .None
 }
 
+map_reapply :: proc(e: ^Engine, o: Object) -> Error {
+	context = context_for(e)
+	h := _handle_get(e, o, .Map) or_return
+	_map_table(e, h) or_return
+	_oerr(omap.table_rewind(&h.table)) or_return
+	merr := _map_sync(e, h)
+	return merr if merr != .Missing else .None
+}
+
 map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator, ready: Ready = {}) -> (entry: Map_Entry, found: bool, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .Map) or_return

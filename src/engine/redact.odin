@@ -878,28 +878,24 @@ _hist_replacement :: proc(h: ^Handle, s: ^Seg, off: i64) -> (synth: []u8, st: Re
 		if rerr == .Redacted || journal.is_sig(body) || len(body) < 3 || body[0] != fs.REC_REPLACE {
 			continue
 		}
-		old, n := prim.get_uvarint(body[1:])
-		if n <= 0 || 1 + n + 1 > len(body) || old != u64(off) {
+		rp, ok := fs.replace_decode(body)
+		if !ok || !fs.replace_supersedes(rp, u64(off)) {
 			continue
 		}
-		kind := body[1 + n]
-		if kind == fs.REC_REPLACE {
-			kind = fs.REC_BATCH
-		}
+		kind := fs.REC_BATCH if rp.kind == fs.REC_REPLACE else rp.kind
 		if kind != fs.REC_BATCH && kind != fs.REC_IMPORT {
 			return nil, .Absent
 		}
-		out := make([]u8, len(body) - n - 1, context.temp_allocator)
+		out := make([]u8, 1 + len(rp.payload), context.temp_allocator)
 		out[0] = kind
-		copy(out[1:], body[1 + n + 1:])
+		copy(out[1:], rp.payload)
 		return out, .Found
 	}
 	if h.sp.repl_on && osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0) > end {
 		r := [1]journal.Range{{end, osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0)}}
 		osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
-		return nil, .Missing
 	}
-	return nil, .Absent
+	return nil, .Missing
 }
 
 @(private)

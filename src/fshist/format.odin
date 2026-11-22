@@ -143,13 +143,70 @@ batch_payload :: proc(body: []u8) -> (payload: []u8, ok: bool) {
 	case REC_BATCH, REC_IMPORT:
 		return body[1:], true
 	case REC_REPLACE:
-		_, n := prim.get_uvarint(body[1:])
-		if n <= 0 || 1 + n + 1 > len(body) {
-			return nil, false
-		}
-		return body[1 + n + 1:], true
+		r, rok := replace_decode(body)
+		return r.payload, rok
 	}
 	return nil, false
+}
+
+REPLACE_PREVS :: u8(0x80)
+
+Replace :: struct {
+	orig:    u64,
+	kind:    u8,
+	prevs:   []u8,
+	payload: []u8,
+}
+
+replace_decode :: proc(body: []u8) -> (r: Replace, ok: bool) {
+	if len(body) < 3 || body[0] != REC_REPLACE {
+		return {}, false
+	}
+	orig, n := prim.get_uvarint(body[1:])
+	if n <= 0 || 1 + n >= len(body) {
+		return {}, false
+	}
+	at := 1 + n
+	k := body[at]
+	at += 1
+	r.orig = orig
+	r.kind = k & ~REPLACE_PREVS
+	if k & REPLACE_PREVS != 0 {
+		c, cn := prim.get_uvarint(body[at:])
+		if cn <= 0 || c > u64(len(body)) {
+			return {}, false
+		}
+		at += cn
+		start := at
+		for _ in 0 ..< c {
+			_, pn := prim.get_uvarint(body[at:])
+			if pn <= 0 {
+				return {}, false
+			}
+			at += pn
+		}
+		r.prevs = body[start:at]
+	}
+	r.payload = body[at:]
+	return r, true
+}
+
+replace_supersedes :: proc(r: Replace, off: u64) -> bool {
+	if r.orig == off {
+		return true
+	}
+	rest := r.prevs
+	for len(rest) > 0 {
+		v, n := prim.get_uvarint(rest)
+		if n <= 0 {
+			return false
+		}
+		if v == off {
+			return true
+		}
+		rest = rest[n:]
+	}
+	return false
 }
 
 replace_old :: proc(body: []u8) -> (old: u64, ok: bool) {

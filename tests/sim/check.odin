@@ -317,6 +317,37 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 	return
 }
 
+check_map_reapply :: proc(w: ^World) {
+	m := &w.model
+	for _, oi in m.objs {
+		if !obj_exists(m, oi) || m.objs[oi].kind != .Map {
+			continue
+		}
+		rs := readers_of(w, oi)
+		if len(rs) == 0 {
+			continue
+		}
+		n := w.nodes[rs[int(m.objs[oi].o.id[0]) % len(rs)]]
+		before := digest_object(w, n, oi)
+		defer delete(before.text, w.allocator)
+		if !before.complete {
+			continue
+		}
+		context = instance_context(&n.inst)
+		err := eng.map_reapply(&n.e, m.objs[oi].o)
+		node_after(n)
+		if err != .None {
+			world_fail(w, "idempotence: %s could not re-apply Map %s: %v", n.name, id_short(m.objs[oi].o.id), err)
+			continue
+		}
+		after := digest_object(w, n, oi)
+		defer delete(after.text, w.allocator)
+		if after.text != before.text {
+			world_fail(w, "idempotence: re-applying every record of Map %s on %s changed it:\n--- before\n%s--- after\n%s", id_short(m.objs[oi].o.id), n.name, before.text, after.text)
+		}
+	}
+}
+
 check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 	m := &w.model
 	ob := &m.objs[oi]
@@ -384,6 +415,9 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 				if present {
 					world_fail(w, "redaction: map key %s still readable on %s", op.key, n.name)
 				}
+				continue
+			}
+			if !present && redaction_maybe(m, op) {
 				continue
 			}
 			switch op.status {
