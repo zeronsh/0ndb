@@ -446,6 +446,9 @@ relay_crashed :: proc(rn: ^Relay_Node) {
 }
 
 relay_after :: proc(rn: ^Relay_Node) {
+	if rn.alive {
+		free_all(region_allocator(&rn.inst.temp))
+	}
 	if rn.alive && rn.disk.dead {
 		relay_crashed(rn)
 	}
