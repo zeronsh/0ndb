@@ -380,9 +380,11 @@ mat_blocker :: proc(m: ^Mount, it: ^Mat_Item) -> (path: string, blocked: bool) {
 	if it.has_old && it.entry.kind != .Dir && !disk_matches(m, it.old, it.entry) {
 		return it.old, true
 	}
-	if it.present && it.kind != .Dir && (!it.has_old || it.old != it.path) && probe(m, it.path).kind != .Missing {
-		if _, known, _ := shadow_get(&m.shadow, it.path); !known {
-			return it.path, true
+	if it.present && it.kind != .Dir && (!it.has_old || it.old != it.path) {
+		if d, _ := probe(m, it.path); d.kind != .Missing {
+			if _, known, _ := shadow_get(&m.shadow, it.path); !known {
+				return it.path, true
+			}
 		}
 	}
 	return "", false
@@ -477,7 +479,7 @@ collect_touched :: proc(h: ^History, b: ^crdt.Batch, first: crdt.Lv, from: crdt.
 
 @(private)
 disk_matches :: proc(m: ^Mount, rel: string, e: Entry) -> bool {
-	d := probe(m, rel)
+	d, _ := probe(m, rel)
 	if d.kind == .Missing {
 		return true
 	}
@@ -542,7 +544,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		return .None
 	}
 	if it.has_old && it.old != it.path {
-		if !disk_matches(m, it.path, Entry{kind = it.kind}) && probe(m, it.path).kind != .Missing {
+		if d, _ := probe(m, it.path); !disk_matches(m, it.path, Entry{kind = it.kind}) && d.kind != .Missing {
 			mount_mark(m, it.path)
 			return .None
 		}
@@ -560,9 +562,11 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		} else {
 			shadow_remove(&m.shadow, it.old) or_return
 		}
-	} else if !it.has_old && probe(m, it.path).kind != .Missing && it.kind != .Dir {
-		mount_mark(m, it.path)
-		return .None
+	} else if !it.has_old && it.kind != .Dir {
+		if d, _ := probe(m, it.path); d.kind != .Missing {
+			mount_mark(m, it.path)
+			return .None
+		}
 	}
 	e := it.entry
 	e.inode = it.inode

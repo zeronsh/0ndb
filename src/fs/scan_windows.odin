@@ -95,7 +95,14 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 			}
 			tbuf: [prim.PATH_MAX]u8
 			tn, lerr := prim.readlink(sc.vfs, p, tbuf[:])
-			if lerr != .None || tn <= 0 || tn >= len(tbuf) {
+			if lerr == .Not_Found || lerr == .Not_Dir {
+				r.kind = .Missing
+				continue
+			}
+			if lerr != .None {
+				return from_prim(lerr)
+			}
+			if tn <= 0 || tn >= len(tbuf) {
 				r.kind = .Other
 				continue
 			}
@@ -103,7 +110,7 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 			r.target_len = u32(tn)
 			append(&t.names, ..tbuf[:tn])
 		case r.kind == .File && name == ".gitignore" && gitignore^ == nil && r.stat.size < 8 << 20:
-			data, ok := read_rel(dir, name, int(r.stat.size), sc.allocator)
+			data, ok := read_rel(dir, name, int(r.stat.size), sc.allocator) or_return
 			if ok {
 				gitignore^ = data
 			}
@@ -112,7 +119,7 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 			start := len(t.names)
 			size := int(r.stat.size)
 			resize(&t.names, start + size + 1)
-			if !read_rel_into(dir, string(nbuf[:own]), t.names[start:]) {
+			if ok, _ := read_rel_into(dir, string(nbuf[:own]), t.names[start:]); !ok {
 				resize(&t.names, start)
 				continue
 			}
@@ -127,29 +134,36 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 }
 
 @(private)
-read_rel_into :: proc(dir: win.HANDLE, name: string, out: []u8) -> bool {
+read_rel_into :: proc(dir: win.HANDLE, name: string, out: []u8) -> (bool, Error) {
 	h, err := nt_open_rel(dir, name, NT_FILE_READ_DATA | NT_SYNCHRONIZE, NT_FILE_NON_DIRECTORY_FILE | NT_FILE_SYNCHRONOUS_IO_NONALERT | NT_FILE_SEQUENTIAL_ONLY | NT_FILE_OPEN_REPARSE_POINT)
+	if err == .Not_Found || err == .Not_Dir {
+		return false, .None
+	}
 	if err != .None {
-		return false
+		return false, err
 	}
 	defer win.CloseHandle(h)
 	n := 0
 	for n < len(out) {
 		got: u32
-		if !win.ReadFile(h, &out[n], u32(min(len(out) - n, 1 << 30)), &got, nil) || got == 0 {
+		if !win.ReadFile(h, &out[n], u32(min(len(out) - n, 1 << 30)), &got, nil) {
+			return false, .Io
+		}
+		if got == 0 {
 			break
 		}
 		n += int(got)
 	}
-	return n == len(out) - 1
+	return n == len(out) - 1, .None
 }
 
 @(private)
-read_rel :: proc(dir: win.HANDLE, name: string, size: int, allocator: runtime.Allocator) -> ([]u8, bool) {
+read_rel :: proc(dir: win.HANDLE, name: string, size: int, allocator: runtime.Allocator) -> ([]u8, bool, Error) {
 	buf := make([]u8, size + 1, allocator)
-	if !read_rel_into(dir, name, buf) {
+	ok, err := read_rel_into(dir, name, buf)
+	if !ok {
 		delete(buf, allocator)
-		return nil, false
+		return nil, false, err
 	}
-	return buf[:size], true
+	return buf[:size], true, .None
 }
