@@ -144,6 +144,47 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 	return out, .None
 }
 
+@(private)
+_tree_dirs :: proc(e: ^Engine, h: ^Handle, dir: string) -> (id: fstree.Inode_Id, err: Error) {
+	id = fstree.ROOT
+	start := 0
+	for i in 0 ..= len(dir) {
+		if i < len(dir) && dir[i] != '/' {
+			continue
+		}
+		part := dir[start:i]
+		start = i + 1
+		if len(part) == 0 || part == "." {
+			continue
+		}
+		if part == ".." {
+			return id, .Invalid
+		}
+		snap := fstree.current(&h.hist.tree)
+		next, found, lerr := fstree.lookup_child(&snap, id, part)
+		if lerr != nil {
+			return id, .Corrupt
+		}
+		if !found {
+			_hist_tree_op(e, h, fstree.Op_Create{parent = id, name = part, kind = .Dir}, "") or_return
+			snap = fstree.current(&h.hist.tree)
+			next, found, lerr = fstree.lookup_child(&snap, id, part)
+			if lerr != nil || !found {
+				return id, .Corrupt
+			}
+		}
+		n, gerr := fstree.get(&h.hist.tree, next)
+		if gerr != nil || n == nil {
+			return id, .Corrupt
+		}
+		if n.kind != .Dir {
+			return id, .Invalid
+		}
+		id = next
+	}
+	return id, .None
+}
+
 tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8) -> Error {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
@@ -159,17 +200,13 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8) -> Error {
 		name := path
 		for i := len(path) - 1; i >= 0; i -= 1 {
 			if path[i] == '/' {
-				pid, pok, perr := fstree.lookup(&snap, path[:i])
-				if perr != nil {
-					return .Corrupt
-				}
-				if !pok {
-					return .Not_Found
-				}
-				parent = pid
+				parent = _tree_dirs(e, h, path[:i]) or_return
 				name = path[i + 1:]
 				break
 			}
+		}
+		if len(name) == 0 || name == "." || name == ".." {
+			return .Invalid
 		}
 		_hist_tree_op(e, h, fstree.Op_Create{parent = parent, name = name, kind = .File}, string(data)) or_return
 		_handle_mark(h)
