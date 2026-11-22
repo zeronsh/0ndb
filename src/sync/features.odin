@@ -707,6 +707,12 @@ _span_load :: proc(r: ^Replicator, rm: ^Remote, replica_path: string) {
 		}
 		best = seq
 		rm.span_seq = seq
+		rm.empty_ok = rec[96] & SPAN_EMPTY != 0
+		if rec[96] & SPAN_NONE != 0 {
+			rm.span = {}
+			rm.span_ok = false
+			continue
+		}
 		rm.span.off = i64(prim.get_u64le(rec[8:]))
 		rm.span.end = i64(prim.get_u64le(rec[16:]))
 		rm.span.range_start = i64(prim.get_u64le(rec[24:]))
@@ -720,7 +726,13 @@ _span_load :: proc(r: ^Replicator, rm: ^Remote, replica_path: string) {
 SPAN_SEED :: 0x7370_616e
 
 @(private)
-_span_save :: proc(r: ^Replicator, rm: ^Remote) {
+SPAN_EMPTY :: u8(1)
+
+@(private)
+SPAN_NONE :: u8(2)
+
+@(private)
+_span_save :: proc(r: ^Replicator, rm: ^Remote, durable := true) {
 	if rm.span_fd < 0 {
 		return
 	}
@@ -732,8 +744,9 @@ _span_save :: proc(r: ^Replicator, rm: ^Remote) {
 	prim.put_u64le(rec[24:], u64(rm.span.range_start))
 	copy(rec[32:64], rm.span.prev_head[:])
 	copy(rec[64:96], rm.span.head[:])
+	rec[96] = (SPAN_EMPTY if rm.empty_ok else 0) | (0 if rm.span_ok else SPAN_NONE)
 	prim.put_u64le(rec[112:], xxhash.XXH3_64_with_seed(rec[:112], SPAN_SEED))
-	if prim.write_at(r.vfs, rm.span_fd, rec[:], i64(rm.span_seq & 1) * SPAN_REC) == .None {
+	if prim.write_at(r.vfs, rm.span_fd, rec[:], i64(rm.span_seq & 1) * SPAN_REC) == .None && durable {
 		prim.datasync(r.vfs, rm.span_fd)
 	}
 }

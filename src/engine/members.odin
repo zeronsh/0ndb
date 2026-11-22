@@ -957,6 +957,16 @@ _tree_maybe_stale :: proc(sp: ^Space, rt: ^Remote_Tree) -> bool {
 			tag = x.tag
 		}
 	}
+	if id, _, ok := _object_of_name(rt.name); ok {
+		if g, found := sp.grant_epochs[id]; found {
+			for x in g {
+				if x.number >= newest {
+					newest = x.number
+					tag = x.tag
+				}
+			}
+		}
+	}
 	zero: osync.Epoch_Tag
 	return rt.tree.epoch != zero && tag != zero && rt.tree.epoch != tag
 }

@@ -196,9 +196,15 @@ _promotions_pump :: proc(r: ^Replicator) {
 		case .Probe:
 			if p.sent != -1 && !_own_busy(r, p) {
 				p.hollow = false
-				ids := [1]Stream_Id{p.id}
-				if client_probe(&r.client, ids[:]) == .None {
-					p.sent = -1
+				if p.own {
+					if client_note(&r.client, p.id, 0) == .None {
+						p.sent = -1
+					}
+				} else {
+					ids := [1]Stream_Id{p.id}
+					if client_probe(&r.client, ids[:]) == .None {
+						p.sent = -1
+					}
 				}
 			}
 		case .Retry:
