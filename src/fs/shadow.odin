@@ -91,6 +91,7 @@ Shadow :: struct {
 	used:       u64,
 	inode_used: u64,
 	covered:    u64,
+	idx_lost:   bool,
 	log_end:    u64,
 	live:       u64,
 	garbage:    u64,
@@ -142,6 +143,7 @@ shadow_attach :: proc(s: ^Shadow) -> Error {
 	s.scratch = make([dynamic]u8, s.allocator)
 	s.probe = make([dynamic]u8, s.allocator)
 	s.out = make([dynamic]u8, s.allocator)
+	s.idx_lost = false
 	err := open_gen(s)
 	if err != .None {
 		shadow_detach(s)
@@ -1221,7 +1223,13 @@ write_header :: proc(s: ^Shadow, clean: bool) {
 
 @(private = "file")
 checkpoint :: proc(s: ^Shadow) -> Error {
-	from_prim(prim.datasync(s.vfs, s.idx_fd)) or_return
+	if s.idx_lost {
+		return .None
+	}
+	if err := from_prim(prim.datasync(s.vfs, s.idx_fd)); err != .None {
+		s.idx_lost = true
+		return err
+	}
 	s.covered = s.log_end
 	write_header(s, false)
 	return .None
