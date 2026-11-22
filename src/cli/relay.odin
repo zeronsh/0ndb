@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import "../capi/api"
 import eng "../engine"
 import "../fs"
@@ -22,6 +23,51 @@ Relay_Main :: struct {
 	sig:      Signals,
 	stopping: bool,
 	active:   bool,
+	slow:     Slow_Objects,
+}
+
+OBJECTS_DELAY_MS :: #config(ONDB_OBJECTS_DELAY_MS, 0)
+OBJECTS_BLOCK_MS :: #config(ONDB_OBJECTS_BLOCK_MS, 0)
+
+Slow_Objects :: struct {
+	inner: osync.Object_Store,
+	loop:  ^prim.Loop,
+}
+
+Slow_Read :: struct {
+	req:  ^osync.Object_Read,
+	err:  osync.Error,
+	data: []u8,
+}
+
+_slow_put :: proc(data: rawptr, key: string, bytes: []u8, done: osync.Storage_Done, ctx: rawptr) {
+	so := (^Slow_Objects)(data)
+	so.inner.put(so.inner.data, key, bytes, done, ctx)
+}
+
+_slow_read :: proc(data: rawptr, req: ^osync.Object_Read) {
+	so := (^Slow_Objects)(data)
+	q := new(Slow_Read)
+	q.req = req
+	inner := osync.Object_Read{key = req.key, off = req.off, n = req.n, ctx = q, done = proc(r: ^osync.Object_Read, err: osync.Error, bytes: []u8) {
+		q := (^Slow_Read)(r.ctx)
+		q.err = err
+		q.data = make([]u8, len(bytes))
+		copy(q.data, bytes)
+	}}
+	so.inner.read(so.inner.data, &inner)
+	finish :: proc(l: ^prim.Loop, data: rawptr) {
+		q := (^Slow_Read)(data)
+		osync.object_read_done(q.req, q.err, q.data)
+		delete(q.data)
+		free(q)
+	}
+	if OBJECTS_BLOCK_MS > 0 {
+		time.sleep(OBJECTS_BLOCK_MS * time.Millisecond)
+		finish(so.loop, q)
+	} else {
+		prim.timer(so.loop, OBJECTS_DELAY_MS, q, finish)
+	}
 }
 
 cmd_relay :: proc(a: ^Args) -> int {
@@ -104,6 +150,10 @@ cmd_relay :: proc(a: ^Args) -> int {
 		}
 		m.objects = osync.Dir_Object_Store{vfs = prim.os_vfs(), root = strings.clone(odir)}
 		cfg.objects = osync.dir_object_store(&m.objects)
+		when OBJECTS_DELAY_MS > 0 || OBJECTS_BLOCK_MS > 0 {
+			m.slow = Slow_Objects{inner = cfg.objects, loop = &m.loop}
+			cfg.objects = osync.Object_Store{data = &m.slow, put = _slow_put, read = _slow_read}
+		}
 		if v, vok := flag_value(a, "flush-ms"); vok {
 			n, nok := strconv.parse_i64(v)
 			if !nok || n <= 0 {
