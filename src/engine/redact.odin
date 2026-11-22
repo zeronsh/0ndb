@@ -300,6 +300,9 @@ _apply_remote_redact_msg :: proc(e: ^Engine, h: ^Handle, vs: int, body: []u8, at
 		return .None
 	}
 	if err := _redact_message(e, h, rid); err != .None {
+		if err == .Missing {
+			return .Missing
+		}
 		_log(e, .Warn, "applying a message redaction failed")
 	}
 	return .None
