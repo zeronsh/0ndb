@@ -116,6 +116,7 @@ History :: struct {
 	lvidx_n:    u64,
 	rebuilding: bool,
 	own_wait:   bool,
+	replay_repl: map[i64]i64,
 	own_next:   map[prim.Id]u64,
 	seals:      u64,
 	mark_taken: u64,
@@ -2111,7 +2112,11 @@ read_stream :: proc(h: ^History, stream: u32, off: i64, buf: ^[dynamic]u8) -> (b
 		defer journal.reader_close(&r)
 		b, _, jerr := journal.record_at(&r, off)
 		if jerr == .Redacted {
-			return nil, .Redacted
+			at, ok := h.replay_repl[off]
+			if !ok {
+				return nil, .Redacted
+			}
+			b, _, jerr = journal.record_at(&r, at)
 		}
 		if jerr != .None {
 			return nil, from_journal(jerr)
@@ -2407,7 +2412,7 @@ replay_own :: proc(h: ^History) -> Error {
 	for off := h.applied[0]; off < end; {
 		body, next, jerr := journal.record_at(&r, off)
 		if jerr == .None && len(body) > 0 && body[0] == REC_REPLACE {
-			if x, ok := replace_decode(body); ok && i64(x.orig) >= h.applied[0] {
+			if x, ok := replace_decode(body); ok {
 				repl[i64(x.orig)] = off
 			}
 		} else if jerr != .None && jerr != .Redacted {
@@ -2418,6 +2423,8 @@ replay_own :: proc(h: ^History) -> Error {
 		}
 		off = next
 	}
+	h.replay_repl = repl
+	defer h.replay_repl = nil
 	off := h.applied[0]
 	for off < end {
 		body, next, jerr := journal.record_at(&r, off)
