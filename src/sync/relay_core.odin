@@ -2032,6 +2032,11 @@ _conn_write :: proc(c: ^Conn) {
 			}
 			continue
 		}
+		if c.out_head > 0 && c.out_head * 2 >= len(c.out) {
+			n := copy(c.out[:], c.out[c.out_head:])
+			resize(&c.out, n)
+			c.out_head = 0
+		}
 		o := &c.out[c.out_head]
 		done, err := _out_step(c, o)
 		if err == .Would_Block {
