@@ -419,6 +419,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_held_scan(e, sp)
 	case .Disconnected:
 		sp.connected = false
+		if ev.err == .Auth {
+			_leave_refused(e, sp)
+		}
 		if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked {
 			sp.mem.revoked = true
 			_emit(e, Event{kind = .Access_Revoked, space = sp.id, device = e.self, err = .Permission})
@@ -428,6 +431,10 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_emit(e, Event{kind = .Disconnected, space = sp.id, err = _serr(ev.err)})
 	case .Uploaded:
 		_own_tree_uploaded(e, ev.stream, ev.length)
+		if ev.name == osync.MEMBERS_STREAM {
+			_leave_uploaded(e, sp, ev.length)
+			return
+		}
 		if id, kind, ok := _object_of_name(ev.name); ok {
 			_pending_settle(e, sp, id, kind)
 			_emit(e, Event{kind = .Uploaded, space = sp.id, object = id, length = ev.length})
@@ -485,6 +492,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 	case .Presence:
 		_emit(e, Event{kind = .Presence, space = sp.id, device = ev.device, tick = u64(ev.from), length = ev.length})
 		_remote_presence(e, sp, ev.device, ev.from != 0)
+		_members_presence(e, sp)
 	case .Caught_Up:
 		if !sp.keyless {
 			_members_caught_up(e, sp)

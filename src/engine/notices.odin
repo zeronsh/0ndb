@@ -422,6 +422,9 @@ _notices_read :: proc(e: ^Engine, device: prim.Id) {
 @(private)
 _notices_adopt :: proc(e: ^Engine, nt: ^osync.Notice) {
 	sid := prim.Id(nt.space)
+	if space_left(e, sid) {
+		return
+	}
 	if sp, ok := e.spaces[sid]; ok && !sp.keyless {
 		return
 	}
@@ -698,6 +701,9 @@ _notices_reconcile :: proc(e: ^Engine) {
 @(private)
 _notices_reconcile_space :: proc(e: ^Engine, sp: ^Space, peers: []osync.Identity) {
 	n := &e.notices
+	if space_left(e, sp.id) {
+		return
+	}
 	m: osync.Membership
 	if _members_load(e, sp, &m) != .None {
 		return

@@ -244,12 +244,12 @@ Event codes: 0 connected, 1 disconnected, 2 durable, 3 uploaded,
 14 indexer_wanted, 15 unavailable, 16 available, 17 promoted,
 18 peer_misbehaving, 19 members_changed, 20 epoch_changed,
 21 access_revoked, 22 runner_enrolled, 23 runner_anomaly,
-24 approval_requested, 25 login_done, 26 login_failed. The meaning of each
+24 approval_requested, 25 login_done, 26 login_failed, 27 space_left. The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
 conversation's next run is, or that it waits for a runner), `presence`
 (device up or down, `tick` 1 or 0), `connected`/`disconnected` (relay link of
 a space), `approval_requested`, `login_done` and `login_failed` (sign-in),
-`access_revoked`. `durable` and `uploaded` fire once per committed tick and
+`access_revoked`, `space_left` (a left space is erased). `durable` and `uploaded` fire once per committed tick and
 per upload; a UI should leave them out of its mask (the Rust client does).
 Conversation status (idle, running, queued, awaiting_permission, ...)
 arrives as `status` deltas of the conversation subscription and as the row
@@ -529,6 +529,7 @@ up exist only over the socket.
 | 23 | `member.remove` | space: id, device: id | {} |
 | 24 | `member.add` | space: id, card: bytes, kind: enum device|account|recovery|custodian|pool|runner|guest|directory, role: enum owner|admin|member|reader, lease_ms: uvarint | proof:bytes |
 | 25 | `space.rotate` | space: id | {} |
+| 170 | `space.leave` | space: id, device_only: bool | removed:uvarint skipped:uvarint |
 | 26 | `space.pool` | space: id, on: bool | {} |
 | 27 | `space.join_enrollment` | space: id, proof: bytes, name: str, relay: str, relay_key: bytes | space:id |
 | 28 | `account.join_space` | space: id | {} |

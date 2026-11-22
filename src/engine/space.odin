@@ -137,6 +137,9 @@ space_join_enrollment :: proc(e: ^Engine, space: prim.Id, proof: []u8, name := "
 			_members_ingest(e, sp, [][]u8{proof})
 		}
 	}
+	if _leave_cancel(e, sp.id) {
+		_account_manifest_add(e, sp)
+	}
 	return sp.id, .None
 }
 

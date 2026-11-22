@@ -305,6 +305,10 @@ impl Client {
         self.call(&json!({"op": "account.passkey_add", "label": label, "credential": credential_hex, "prf": prf_hex}))
     }
 
+    pub fn space_leave(&self, space: &str, device_only: bool) -> Pending<SpaceLeft> {
+        self.call(&json!({"op": "space.leave", "space": space, "device_only": device_only}))
+    }
+
     pub fn sign_out(&self, keep_relay: bool) -> Pending<SignedOut> {
         self.call(&json!({"op": "account.sign_out", "keep_relay": keep_relay}))
     }

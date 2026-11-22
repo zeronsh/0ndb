@@ -36,6 +36,7 @@ OPS := []Op {
 	{23, "member.remove", {SPACE, {"device", .Id, nil}}, "", op_member_remove},
 	{24, "member.add", {SPACE, {"card", .Bytes, nil}, {"kind", .Enum, MEMBER_KIND_NAMES[:]}, {"role", .Enum, MEMBER_ROLE_NAMES[:]}, {"lease_ms", .U64, nil}}, "proof:bytes", op_member_add},
 	{25, "space.rotate", {SPACE}, "", op_space_rotate},
+	{170, "space.leave", {SPACE, {"device_only", .Bool, nil}}, "removed:uvarint skipped:uvarint", op_space_leave},
 	{26, "space.pool", {SPACE, {"on", .Bool, nil}}, "", op_space_pool},
 	{27, "space.join_enrollment", {SPACE, {"proof", .Bytes, nil}, {"name", .Str, nil}, {"relay", .Str, nil}, {"relay_key", .Bytes, nil}}, "space:id", op_space_join_enrollment},
 	{28, "account.join_space", {SPACE}, "", op_account_join_space},

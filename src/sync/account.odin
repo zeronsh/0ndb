@@ -477,6 +477,7 @@ Manifest_Entry :: struct {
 	anchor:         Record_Id,
 	anchor_lamport: u64,
 	author:         Public_Key,
+	left:           bool,
 }
 
 manifest_entry_encode :: proc(account: Identity, device: ^Keyring, cert: [64]u8, me: Manifest_Entry, out: ^[dynamic]u8, random := prim.Random{}) -> Error {
@@ -489,6 +490,9 @@ manifest_entry_encode :: proc(account: Identity, device: ^Keyring, cert: [64]u8,
 	prim.write_raw(&w, x.relay_public[:])
 	prim.write_raw(&w, x.anchor[:])
 	prim.write_u64le(&w, me.anchor_lamport)
+	if me.left {
+		prim.write_u8(&w, 1)
+	}
 	if w.err != .None {
 		return .No_Memory
 	}
@@ -540,6 +544,9 @@ manifest_entry_decode :: proc(data: []u8, account: Public_Key, keyring: ^Keyring
 	prim.read_fixed(&pr, me.relay_public[:])
 	prim.read_fixed(&pr, me.anchor[:])
 	me.anchor_lamport = prim.read_u64le(&pr)
+	if prim.reader_remaining(&pr) > 0 {
+		me.left = prim.read_u8(&pr) == 1
+	}
 	if !prim.reader_ok(&pr) || !prim.reader_done(&pr) {
 		return .Corrupt
 	}

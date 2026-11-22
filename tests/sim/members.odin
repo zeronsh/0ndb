@@ -793,6 +793,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_converged(w, spaces[0], {M_A, M_C, M_D}, "final")
 	_converged(w, spaces[1], {M_A, M_C, M_D}, "final space1")
 	_every_device_opens(w, mw, {M_A, M_B, M_C, M_D})
+	_leave_case(w)
 	{
 		context = instance_context(&a.inst)
 		_, rerr := eng.device_remove(&a.e, w.nodes[M_B].identity.id)
@@ -1069,4 +1070,137 @@ _directory_case :: proc(w: ^World, space: prim.Id, o: eng.Object) {
 	if !_wait_read(w, M_D, o, after, "directory-after", 20_000) {
 		_fail(w, "n5 cannot read after the directory removal")
 	}
+}
+
+@(private = "file")
+_has_space :: proc(w: ^World, idx: int, space: prim.Id) -> (has: bool, left: bool) {
+	n := w.nodes[idx]
+	if !n.alive {
+		return false, false
+	}
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	for x in eng.space_list(&n.e, context.temp_allocator) {
+		if x.id == space {
+			has = true
+		}
+	}
+	return has, eng.space_left(&n.e, space)
+}
+
+@(private = "file")
+_leave :: proc(w: ^World, idx: int, space: prim.Id, only_device: bool) -> (eng.Leave_Result, eng.Error) {
+	n := w.nodes[idx]
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	return eng.space_leave(&n.e, space, only_device)
+}
+
+@(private = "file")
+_leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret: string, on_disk: bool, what: string) {
+	gone := false
+	for _ in 0 ..< 200 {
+		if has, left := _has_space(w, idx, space); !has && left {
+			gone = true
+			break
+		}
+		_settle(w, 100)
+	}
+	if !gone {
+		has, left := _has_space(w, idx, space)
+		_fail(w, "%s: n%d still holds the space after leaving (listed=%v tombstone=%v)", what, idx, has, left)
+		return
+	}
+	_settle(w, 5000)
+	if p, found := disk_contains(&w.nodes[idx].disk, transmute([]u8)secret); on_disk && found {
+		_fail(w, "%s: %s still on n%d disk after leaving, in %s", what, secret, idx, p)
+	}
+	_down(w, idx)
+	_up(w, idx)
+	_settle(w, 3000)
+	if has, left := _has_space(w, idx, space); has || !left {
+		_fail(w, "%s: n%d got the space back after a restart (listed=%v tombstone=%v)", what, idx, has, left)
+	}
+	after := fmt.aprintf("after-%s", what, allocator = w.allocator)
+	r, ok := _send(w, M_A, o, after)
+	if !ok {
+		_fail(w, "%s: n0 cannot write after the leave", what)
+		return
+	}
+	_settle(w, 3000)
+	if t, rerr := _read(w, idx, o, r); rerr == .None && t == after {
+		_fail(w, "%s: n%d read data written after it left", what, idx)
+	}
+	readers := [2]int{M_C, M_D}
+	for x in readers {
+		if x != idx && !_wait_read(w, x, o, r, after, 20_000) {
+			_fail(w, "%s: remaining n%d cannot read after the leave | %s", what, x, _roster(w, x, space))
+		}
+	}
+	a := w.nodes[M_A]
+	context = instance_context(&a.inst)
+	list, lerr := eng.space_members(&a.e, space, context.temp_allocator)
+	st, _ := eng.space_members_status(&a.e, space)
+	node_after(a)
+	context = w.ctx
+	if lerr != .None || !st.eligible {
+		_fail(w, "%s: n0 has no eligible epoch after the leave: %v eligible=%v", what, lerr, st.eligible)
+	}
+	for x in list {
+		if x.device == w.nodes[idx].identity.id && (!x.removed || x.in_tree) {
+			_fail(w, "%s: n%d is still a member of the new epoch (removed=%v in_tree=%v)", what, idx, x.removed, x.in_tree)
+		}
+	}
+}
+
+@(private = "file")
+_leave_case :: proc(w: ^World) {
+	a := _up(w, M_A)
+	x := _up(w, M_X)
+	_up(w, M_C)
+	_up(w, M_D)
+	context = instance_context(&a.inst)
+	sid, cerr := eng.space_create(&a.e, "leave", "relay", w.relay.public)
+	o, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "leave"})
+	proof, aerr := eng.member_add(&a.e, sid, x.identity, .Device, .Member, .Approval, 0, w.allocator)
+	node_after(a)
+	if cerr != .None || oerr != .None || aerr != .None {
+		_fail(w, "leave: setup %v %v %v", cerr, oerr, aerr)
+		return
+	}
+	context = instance_context(&x.inst)
+	eng.space_join_enrollment(&x.e, sid, proof, "leave", "relay", w.relay.public)
+	eng.space_open(&x.e, sid)
+	node_after(x)
+	context = w.ctx
+	secret := "leave-secret-before"
+	r, ok := _send(w, M_A, o, secret)
+	if !ok {
+		_fail(w, "leave: send")
+		return
+	}
+	for idx in ([3]int{M_X, M_C, M_D}) {
+		if !_wait_read(w, idx, o, r, secret, 30_000) {
+			_fail(w, "leave: n%d cannot read before leaving", idx)
+			return
+		}
+	}
+	if _, lerr := _leave(w, M_A, sid, false); lerr != .Permission {
+		_fail(w, "leave: the last owner's person left without transferring ownership: %v", lerr)
+	}
+	_, x_disk := disk_contains(&x.disk, transmute([]u8)secret)
+	res, lerr := _leave(w, M_X, sid, false)
+	if lerr != .None || res.removed != 1 {
+		_fail(w, "leave: n%d leave %v removed=%d", M_X, lerr, res.removed)
+		return
+	}
+	_leaver_gone(w, M_X, sid, o, secret, x_disk, "member-leave")
+	_, d_disk := disk_contains(&w.nodes[M_D].disk, transmute([]u8)secret)
+	res, lerr = _leave(w, M_D, sid, true)
+	if lerr != .None || res.removed != 1 {
+		_fail(w, "leave: n%d device-only leave %v removed=%d", M_D, lerr, res.removed)
+		return
+	}
+	_leaver_gone(w, M_D, sid, o, secret, d_disk, "device-leave")
+	_converged(w, sid, {M_A, M_C}, "after leave")
 }

@@ -1061,15 +1061,46 @@ Commit := base epoch id [32] (zero for epoch 0) | number u32 | history bool
 - Epoch number is base + 1. The **effective epoch** is the highest number,
   ties to the latest in resolution order. It is *eligible* when every leaf in
   its tree is still an active member. A member writes only under an eligible
-  epoch it holds; if the newest epoch is ineligible (a pending removal) or
-  the member's own leaf is missing, it commits, but only once its membership
-  log has caught up (relay caught-up and every announced members stream read)
-  so joiners do not fork the epoch chain needlessly. Members keep path
+  epoch it holds; if there is no epoch or the member's own leaf is missing,
+  it commits; if the newest epoch is ineligible (a pending removal), one
+  elected member commits: among the active leaf members of that epoch's tree
+  that are present (this device, or `up` in relay presence), the lowest
+  device id with role admin or owner, else the lowest device id. The others
+  wait and re-elect on every presence change, so the election moves on when
+  the elected member goes down. Every commit waits until the member's
+  membership log has caught up (relay caught-up and every announced members
+  stream read) so joiners do not fork the epoch chain needlessly. Members keep path
   secrets for the newest 64 epoch numbers so late concurrent commits still
   open; older ones are reached through back links.
 - Remove is always followed by a commit by the remover, so the new epoch is
   sealed only to the remaining members. `0ndb rotate` / `space_rotate`
   commits with no membership change (suspected compromise).
+- **Leaving.** `space_leave` (`0ndb leave SPACE`) appends a self-signed
+  `Remove` for this device and, unless `device_only`, for every active
+  device of the same signed-in account (`person` = the account and method
+  `account`, `genesis` or `recovery`) that this device's role may remove
+  (owners any, admins non-owners; the rest are reported as skipped). It is
+  refused with `Permission` when no active owner would remain outside the
+  leaving set; an account-wide leave counts the account's own key and
+  devices as leaving. The leaver cannot commit for others, so it appends no
+  commit; the newest epoch turns ineligible and the elected member rotates.
+  The leaver records `(space, leaving, members stream length)` in
+  `pack/left` (write to a temporary file, sync, rename, sync the directory).
+  Once the relay holds the removal (its upload floor of the members stream
+  reaches that length, or it refuses this device with `Auth`, which it does
+  only after observing the removal), the engine erases the space at the end
+  of a tick with no durable batch in flight: it unmounts the space's trees,
+  deletes every object of the space from the search index and scrubs it,
+  zero-fills, syncs and removes every object directory, the members
+  directory, the card and the search snapshots, drops the registry rows
+  (objects, owned, grants, space), marks the entry `done` and emits
+  `Space_Left`. Pack zero-fill makes the erase redaction-grade. A restart
+  in the `leaving` state resumes the wait. The entry stays as a tombstone:
+  notice adoption, account-notice reconciliation and account sign-in skip a
+  tombstoned space, and an account-wide leave also appends a manifest entry
+  with `left` set so the account's other and future devices skip it. An
+  explicit `space_join_enrollment` clears the tombstone and appends a fresh
+  manifest entry.
 
 **What is encrypted under what.** N derives the space's stream naming scope
 (`HKDF(N, "0ndb space names")`) and, through it, every object's naming and
@@ -1161,8 +1192,12 @@ memory only while enrolling or approving and is cleared afterwards.
 - **Manifest.** When a device creates or joins a space for the account it
   appends a manifest entry through `Sealed_Store.add`: `device sign | device
   cert | sealed bundle | device sig`, the bundle sealed to the account box and
-  holding `(space id, name, relay, relay pub, anchor id, anchor lamport)`,
-  where the anchor is the account's own `Add` in that space.
+  holding `(space id, name, relay, relay pub, anchor id, anchor lamport
+  [, left u8])`, where the anchor is the account's own `Add` in that space.
+  The last entry per space wins; one with `left = 1` (appended by an
+  account-wide `space_leave`) means the account left it, and sign-in skips
+  it. Older readers reject the trailing byte as malformed and skip the
+  entry.
 - **Account notices** carry spaces created or joined after sign-in to the
   account's other signed-in devices live, since no device holds the account
   key to read the manifest again. Every signed-in device keeps the account

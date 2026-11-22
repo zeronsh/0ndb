@@ -262,9 +262,18 @@ _account_adopt_begin :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Re
 	akr := osync.account_keyring(a)
 	signer := osync.account_signer(a)
 	e.approvals.path = path
+	decoded := make([dynamic]osync.Manifest_Entry, context.temp_allocator)
+	last := make(map[prim.Id]int, context.temp_allocator)
 	for raw in entries {
 		me: osync.Manifest_Entry
 		if osync.manifest_entry_decode(raw, rec.sign, &akr, &me, context.temp_allocator) != .None {
+			continue
+		}
+		last[prim.Id(me.space)] = len(decoded)
+		append(&decoded, me)
+	}
+	for me, i in decoded {
+		if last[prim.Id(me.space)] != i || me.left || space_left(e, prim.Id(me.space)) {
 			continue
 		}
 		if sp, ok := e.spaces[prim.Id(me.space)]; ok && !sp.keyless {
@@ -347,6 +356,26 @@ _account_manifest_add :: proc(e: ^Engine, sp: ^Space) {
 		relay_public   = sp.relay_public,
 		anchor         = anchor,
 		anchor_lamport = m.records[ri].lamport,
+	}
+	out := make([dynamic]u8, context.temp_allocator)
+	acc := osync.identity_of(e.account.sign, e.account.box)
+	if osync.manifest_entry_encode(acc, &e.keyring, e.account.cert, me, &out, e.cfg.random) != .None {
+		return
+	}
+	list := _manifest_pending_load(e)
+	append(&list, out[:])
+	_manifest_pending_store(e, list[:])
+	_manifest_issue(e, out[:])
+}
+
+@(private)
+_account_manifest_leave :: proc(e: ^Engine, sp: ^Space) {
+	if !e.account.have || e.cfg.sealed_store.add == nil {
+		return
+	}
+	me := osync.Manifest_Entry {
+		space = osync.Space_Id(sp.id),
+		left  = true,
 	}
 	out := make([dynamic]u8, context.temp_allocator)
 	acc := osync.identity_of(e.account.sign, e.account.box)
