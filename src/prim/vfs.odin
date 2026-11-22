@@ -60,6 +60,7 @@ Vfs_Procs :: struct {
 	write_at:   proc(data: rawptr, fd: Fd, src: []u8, off: i64) -> Error,
 	datasync:   proc(data: rawptr, fd: Fd) -> Error,
 	fullsync:   proc(data: rawptr, fd: Fd) -> Error,
+	barrier:    proc(data: rawptr, fd: Fd) -> Error,
 	truncate:   proc(data: rawptr, fd: Fd, size: i64) -> Error,
 	punch_hole: proc(data: rawptr, fd: Fd, off: i64, size: i64) -> Error,
 	lock:       proc(data: rawptr, fd: Fd) -> Error,
@@ -103,6 +104,13 @@ datasync :: #force_inline proc(vfs: Vfs, fd: Fd) -> Error {
 
 fullsync :: #force_inline proc(vfs: Vfs, fd: Fd) -> Error {
 	return vfs.procs.fullsync(vfs.data, fd)
+}
+
+barrier :: proc(vfs: Vfs, fd: Fd) -> Error {
+	if vfs.procs.barrier != nil {
+		return vfs.procs.barrier(vfs.data, fd)
+	}
+	return vfs.procs.datasync(vfs.data, fd)
 }
 
 truncate :: #force_inline proc(vfs: Vfs, fd: Fd, size: i64) -> Error {
@@ -207,6 +215,19 @@ is_dir :: proc(vfs: Vfs, path: string) -> bool {
 exists :: proc(vfs: Vfs, path: string) -> bool {
 	_, err := lstat(vfs, path)
 	return err == .None
+}
+
+barrier_dir :: proc(vfs: Vfs, path: string) -> Error {
+	when ODIN_OS != .Darwin {
+		return sync_dir(vfs, path)
+	}
+	fd, err := open_file(vfs, path, {.Directory})
+	if err != .None {
+		return err
+	}
+	err = barrier(vfs, fd)
+	close_file(vfs, fd)
+	return err
 }
 
 sync_dir :: proc(vfs: Vfs, path: string) -> Error {
