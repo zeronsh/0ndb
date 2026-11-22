@@ -1297,15 +1297,58 @@ Relay cost tracks the reachable information, not the activity. Items marked
   devices, is replicated to the account's always-on devices (which advertise
   themselves as holders), and is served by the peer pipe. Only reads of those
   exact files can then be unavailable; everything else materializes.
-- **Git-backed trees** (planned). A blob is *remote-backed* when it is
-  reachable from a remote-tracking ref of a remote the workspace shares; tree
-  history records reference it (`Insert_Ref`) and its bytes are never
-  uploaded. Anything else (uncommitted and unpushed content) is uploaded as
-  today, so a later push strands nothing. A device or runner materializing
-  the tree fetches remote-backed objects from the remote itself (credentials
-  from the `Credentials` plug) and the rest from the relay. When a remote
-  rewrites history, blobs that became unreachable and were never uploaded
-  are uploaded on demand while a holder is online and reported otherwise.
+- **Git-backed trees.** A blob is *remote-backed* when it is reachable from
+  a remote-tracking ref (`refs/remotes/<remote>/*`) of a remote configured
+  in the tree's repository; tree history records reference it (`Insert_Ref`,
+  content ops) and its bytes are never uploaded, neither as a content object
+  nor inside a checkpoint bundle (the bundle lists it in a `CKPT_REMOTE`
+  frame instead). Anything else (uncommitted and unpushed content) is
+  uploaded, so a later push strands nothing.
+  - *Reachability* (`fs/remote.odin`) is tracked per repository under
+    `$DATA/remotes/<hash of the common dir>/`: `state` (HEAD, every tracking
+    tip, up to 64 anchor commits) and `oids`, the sorted set of tree and blob
+    ids in the anchors' root trees. Anchors are the tips and the merge bases
+    of HEAD with each tip (a date-ordered walk capped at 20 000 commits).
+    Unchanged refs cost reading the refs (under 0.3 ms on git/git); a new tip
+    or a moved HEAD walks only subtrees not yet in the set (13 ms for a local
+    commit on git/git, 0.47 s for the first build of its 8 tips); merge bases
+    are recomputed only for new or moved tips unless HEAD jumped. A tip that
+    is no longer a descendant of its previous value (force-push, prune)
+    rebuilds the set from the current anchors only. The test is sound, not
+    complete: a blob found only in older history counts as not remote-backed
+    and is uploaded.
+  - *Where readers learn the remote.* The writer records the public URLs of
+    the remotes whose tips it used (userinfo stripped, one per line) in the
+    tree's catalog entry (tag 33), so a reader knows the remote before it
+    admits any record and independent of record order.
+  - *Fetching.* A reader that admits a record whose blobs are missing asks
+    the relay first (it answers `Missing` at once for remote-backed blobs);
+    the blobs the relay lacks are queued, and once per tick the engine starts
+    one `Git_Remote.fetch` per (tree, URL) with every queued oid. Protocol v2
+    fails a whole fetch when the server lacks any wanted object, so a failed
+    batch is split in halves and retried down to single objects. The reference plug runs
+    `git --git-dir=$DATA/objects fetch --stdin <url>` with the oids on stdin
+    (protocol v2 serves any existing object by id; negotiation `noop`,
+    auto-gc and maintenance off, objects fsynced), so the device store, which
+    is a bare repository, receives exactly the wanted blobs as one pack.
+    `Git_Credentials.env` adds environment for the child (an
+    `http.extraHeader` through `GIT_CONFIG_*`, `GIT_SSH_COMMAND`); without it
+    git uses the user's own credential helpers, and prompting is disabled.
+    Whatever the remote did not return goes to the next URL, then the relay,
+    then the object pipe.
+  - *Rewrites.* Blobs that a rewrite made unreachable stay on their holders
+    (the scope commit chain pins them) and are pulled through the object
+    pipe on demand; with no holder online the read reports `Unavailable`.
+  - *Measured* (one loaded Linux host, loopback relay, local bare remote).
+    git/git (4876 files, 50.6 MB, two unpushed commits and four uncommitted
+    edits): the tree costs the relay 0.59 MB instead of 56.7 MB; a fresh
+    device with the writer offline materializes it in 6.7 s, 4752 blobs in
+    one pack from the remote and the edits from the relay. A small pushed
+    repository with two untracked 24 MiB binaries and a 30 MiB budget: the
+    relay stores 25.4 MB (one binary); an always-on device pulls the other
+    through the pipe in under 0.6 s; with the writer offline a fresh device
+    gets it from the always-on device; with every holder offline everything
+    but that file materializes and it arrives 3 ms after a holder returns.
 - **Storage classes and modes.** Each object has a class: `stored` (segments
   on the relay) or `device` (the relay keeps only segment lengths). The class
   is the catalog field `storage` (tag 12: 1 device, 2 stored, absent: policy),
@@ -1328,6 +1371,39 @@ Relay cost tracks the reachable information, not the activity. Items marked
   ids never change. The relay never reads below `base`: reads, tails and
   follows are clamped and preceded by a `Hollow` frame with `base` and
   `length`. Feed compaction keeps the hollow flag.
+- **Content budget.** Large content is content-op (opaque) blobs: binaries
+  and files over the mount's large limit. A device uploads such a blob, when
+  it is not remote-backed, only while the space's budget allows
+  (`Config.content_budget`, default 1 GiB, or `Storage_Policy.budget`).
+  Usage is space-wide: every device keeps its own row in the space map
+  `0ndb:holders` (tag 1 flags, bit 0 *always-on*; tag 2 bytes it stored on
+  the relay under the budget) and a device sums the rows before uploading,
+  so concurrent devices can overshoot by at most one blob each. Over-budget
+  blobs stay on their devices and are served by the object pipe.
+  Devices with `Config.always_on` advertise themselves in the same map, and
+  every reader adds them to a blob's holders; an always-on device fetches
+  the large content of every tree it follows, so it holds a copy once it has
+  read the records. Records are admitted without their opaque blobs:
+  materialization skips exactly those files (they are recorded as *absent*
+  in the mount state and retried when content arrives, before any disk
+  change, so a skipped move never leaves a path the shadow does not know),
+  and only those files wait.
+- **Object pipe.** A content get that the relay answers `Missing` becomes a
+  pull from the blob's holders: the tree's participants and the always-on
+  devices, filtered by presence. It uses the existing `Pull`/`Serve` frames
+  with the object's (part) key in the `segment` field; the relay forwards
+  them like a segment pull and reads nothing. The holder resolves the key
+  through its registry of objects it chose not to upload (remote-backed,
+  device-only, over budget; one entry per key and per part of a chunked
+  object), seals exactly the sealed chunks of the requested aligned range as
+  a `Put` would (blobs of 8 MiB and more are streamed once into
+  `$DATA/serve/` and read by range) and answers in at most 256 KiB frames
+  without record framing, 127 sealed chunks per pull. The reader decrypts
+  and verifies each chunk with the object key exactly as a relay-served
+  object; a bad holder is skipped and `Peer_Misbehaving` reported. With no
+  holder online the engine emits `Unavailable{object, device}` per holder
+  and keeps the read pending; a presence `up` re-pulls. Device-only trees
+  upload neither blobs nor checkpoints.
 - **Peer serving.** A reader that needs a range below `base` pulls it from a
   holder: the segment's writer or another device with segments in the same
   object, filtered by presence. Up to four 1 MiB pulls per segment are in
@@ -1353,12 +1429,17 @@ Relay cost tracks the reachable information, not the activity. Items marked
   and `Available{object}` follows; nothing polls and no timer is armed.
 - **Promotion** (`until_run`). When the runtime assigns a run to a pool
   runner (its advert in the runners map carries field 3 `pool`), the
-  assigning device promotes the conversation and every mounted tree: it
-  records `storage = stored` in the catalog, switches its own segment to
-  appends, and fills every segment it holds backward from the relay's
-  `base`, tail first, down to the requested offset (today the start of what
-  it holds; (planned) the oldest record on the answered message's path and,
-  for a tree, the newest checkpoint). Pending promotions are durable in the
+  assigning device promotes the conversation and every mounted tree
+  (`object_promote_run`): it records `storage = stored` in the catalog,
+  switches its own segment to appends, and fills every segment it holds
+  backward from the relay's `base`, tail first, down to exactly what the run
+  reads. For the conversation that is, per segment, the oldest record on the
+  answered message's path (walked with `page`), and the segment's last
+  record (its tail summary) for segments with no message on the path. For a
+  tree the device writes and publishes a checkpoint at its current length,
+  fills its own segment from that length, and uploads the blobs referenced
+  from there on that are not remote-backed; the checkpoint bundle carries
+  the rest. Pending promotions are durable in the
   registry and resume after a restart. A writer that still notes a filled
   segment gets `Noted` with `base < length` and switches to appends.
 - **Redaction** is metadata: it is applied to the stored suffix (if any) and
@@ -1670,7 +1751,9 @@ Client to relay:
   answers `Noted` with the current `base` and stores nothing (the uploader
   resumes from there); quota applies as for appends.
 - `Pull` (0x13, 72 bytes): `holder:device, tag:u64, segment, from:u64,
-  to:u64`. Requires `Read` access to `segment`. If `holder` has no live
+  to:u64`. `segment` may also be a content object's (part) key; the relay
+  does not distinguish the two and the holder resolves it, so the object
+  pipe needs no further frames. Requires `Read` access to `segment`. If `holder` has no live
   connection in the space the relay answers `Unserved` at once; otherwise it
   records a pipe `(requester, tag, holder, segment)` and sends `Pulled` to
   one live connection of the holder. At most 64 pipes per requester.

@@ -206,6 +206,8 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		pack_job_event(w, w.nodes[ev.node], ev.gen)
 	case .Stream_Step:
 		stream_step(w, int(ev.arg))
+	case .Git_Fetch:
+		remote_event(w, ev)
 	case .Heal:
 		n := w.nodes[ev.node]
 		if n.partitioned {
@@ -463,6 +465,9 @@ finish :: proc(w: ^World) {
 	}
 	check_live_reads(w)
 	check_idle(w)
+	if len(w.failures) == 0 && !w.aborted && w.cfg.storage == .Auto && !w.cfg.byzantine && env_u64("SIM_MOVE", 1) != 0 {
+		check_move(w)
+	}
 	if len(w.failures) == 0 && !w.aborted {
 		check_close(w)
 	}

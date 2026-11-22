@@ -183,6 +183,14 @@ daemon_main :: proc(args: ^Args) -> int {
 			return usage_error("--storage takes auto, stored, until-run or device")
 		}
 	}
+	if v, ok := flag_value(args, "content-budget"); ok {
+		n, nok := strconv.parse_i64(v)
+		if !nok || n == 0 {
+			return usage_error("--content-budget takes a byte count (negative: nothing is relay-stored)")
+		}
+		ec.content_budget = n
+	}
+	ec.always_on = flag_bool(args, "always-on")
 	if v, ok := flag_value(args, "capacity"); ok {
 		n, nok := strconv.parse_int(v)
 		if !nok || n <= 0 {
