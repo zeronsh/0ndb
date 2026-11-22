@@ -186,7 +186,7 @@ catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready
 		return c, false, merr
 	}
 	c, found = _oerr2(omap.catalog_get(&h.table, o.id, allocator)) or_return
-	if !found && (merr == .Missing || _handle_waiting(h, ready.fresh)) && ready.call != nil {
+	if (!found || c.kind == obj.Kind(0)) && (merr == .Missing || _handle_waiting(h, ready.fresh)) && ready.call != nil {
 		return c, false, _wait(e, h, ready)
 	}
 	return c, found, .None
