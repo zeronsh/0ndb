@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:time"
 import eng "../../src/engine"
@@ -560,7 +561,7 @@ free_result :: proc(res: ^Run_Result) {
 
 @(test)
 simulate :: proc(t: ^testing.T) {
-	hermetic_env()
+	sync.mutex_guard(&serial)
 	verbose := env_u64("SIM_VERBOSE", 0) != 0
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 && env_u64("SIM_SHRINK", 0) != 0 {
 		seed, _ := strconv.parse_u64(s)
@@ -708,7 +709,11 @@ simulate :: proc(t: ^testing.T) {
 	testing.expect(t, len(failed) == 0)
 }
 
-hermetic_env :: proc() {
+serial: sync.Mutex
+
+@(init)
+hermetic_env :: proc "contextless" () {
+	context = runtime.default_context()
 	_ = os.set_env("HOME", "/home/sim")
 	_ = os.set_env("XDG_CONFIG_HOME", "/home/sim/.config")
 	_ = os.set_env("GIT_CONFIG_SYSTEM", "/etc/gitconfig")
