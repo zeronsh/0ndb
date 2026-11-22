@@ -105,6 +105,15 @@ _promotion_free :: proc(r: ^Replicator, p: ^Promotion) {
 }
 
 @(private)
+_own_busy :: proc(r: ^Replicator, p: ^Promotion) -> bool {
+	if !p.own {
+		return false
+	}
+	l, ok := r.locals[p.id]
+	return ok && (l.noting || l.inflight > 0 || l.cursor < l.durable)
+}
+
+@(private)
 _promotion_find :: proc(r: ^Replicator, id: Stream_Id) -> (^Promotion, int) {
 	for p, i in r.promos {
 		if p.id == id {
@@ -185,7 +194,7 @@ _promotions_pump :: proc(r: ^Replicator) {
 		p := r.promos[i]
 		switch p.state {
 		case .Probe:
-			if p.sent != -1 {
+			if p.sent != -1 && !_own_busy(r, p) {
 				p.hollow = false
 				ids := [1]Stream_Id{p.id}
 				if client_probe(&r.client, ids[:]) == .None {
@@ -210,17 +219,15 @@ _promotions_pump :: proc(r: ^Replicator) {
 
 @(private)
 _promote_step :: proc(r: ^Replicator, p: ^Promotion) {
+	if _own_busy(r, p) {
+		return
+	}
 	if p.base <= p.target || p.base <= 0 {
 		_promotion_done(r, p, true)
 		return
 	}
 	if client_queued(&r.client) >= OUT_HIGH {
 		return
-	}
-	if p.own {
-		if l, ok := r.locals[p.id]; ok && (l.inflight > 0 || l.noting) {
-			return
-		}
 	}
 	fd, oerr := prim.open_file(r.vfs, p.path)
 	if oerr != .None {

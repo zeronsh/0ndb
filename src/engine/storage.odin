@@ -54,7 +54,7 @@ _storage_class :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind) -> S
 	case .Auto, .Stored:
 		return .Stored
 	case .Device_Until_Run:
-		return .Stored if recorded == .Stored else .Device
+		return .Stored if recorded == .Stored || _promo_marked(e, sp.id, object) else .Device
 	case .Device:
 		return .Device
 	}
@@ -141,6 +141,13 @@ _promo_mark :: proc(e: ^Engine, space, object: prim.Id, from: i64, on: bool) {
 }
 
 @(private)
+_promo_marked :: proc(e: ^Engine, space, object: prim.Id) -> bool {
+	k := _promo_key(space, object)
+	_, found, err := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator)
+	return err == .None && found
+}
+
+@(private)
 _promo_resume :: proc(e: ^Engine, sp: ^Space) {
 	Acc :: struct {
 		ids:   [dynamic]prim.Id,
@@ -168,9 +175,13 @@ _promo_resume :: proc(e: ^Engine, sp: ^Space) {
 _promo_settled :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind) {
 	sc := _object_scope(sp, object)
 	defer osync.scope_clear(&sc)
-	if !osync.replicator_promoting(&sp.repl, &sc, _seg_name(kind, object)) {
-		_promo_mark(e, sp.id, object, 0, false)
+	if osync.replicator_promoting(&sp.repl, &sc, _seg_name(kind, object)) {
+		return
 	}
+	if _storage_recorded(e, sp, object) != .Stored {
+		return
+	}
+	_promo_mark(e, sp.id, object, 0, false)
 }
 
 object_promote :: proc(e: ^Engine, o: Object, from: i64 = 0) -> Error {
