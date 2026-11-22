@@ -523,6 +523,12 @@ concurrent typing is never lost or reverted.
   one or two preads.
 - Redaction punches holes in extents; the simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
+- A promoted stream's own file is written outside the container commit, so
+  after power loss a promoted file (the registry) can hold state that refers
+  to container records which never became durable. A registry entry saying
+  this device owns a writer whose segment is missing therefore names a
+  segment that was never durable, uploaded or acknowledged; the engine
+  recreates the writer instead of failing the object.
 
 ## Objects
 

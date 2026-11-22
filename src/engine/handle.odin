@@ -166,7 +166,7 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 	}
 	if found {
 		h.created = rec.created
-		if rec.own {
+		if rec.own && !_writer_lost(h) {
 			h.own = true
 			_handle_open_writer(h) or_return
 		}
@@ -279,6 +279,19 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 }
 
 @(private)
+_writer_lost :: proc(h: ^Handle) -> bool {
+	if h.kind != .Conversation && h.kind != .Map {
+		return false
+	}
+	path, err := _seg_path(h.e, h.id)
+	if err != .None || prim.exists(h.e.vfs, path) {
+		return false
+	}
+	_log(h.e, .Warn, "owned writer segment was lost before it became durable; recreating it")
+	return true
+}
+
+@(private)
 _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, settings: []u8 = nil) -> Error {
 	if h.w_open {
 		return .None
@@ -290,7 +303,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 		}
 	}
 	rec, found := _rec_get(e, h.id) or_return
-	if found && rec.own {
+	if found && rec.own && !_writer_lost(h) {
 		h.own = true
 		return _handle_open_writer(h)
 	}
