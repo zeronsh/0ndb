@@ -2,6 +2,8 @@ package sim
 
 import "core:fmt"
 import "core:mem/virtual"
+import "core:slice"
+import "core:strings"
 import eng "../../src/engine"
 import "../../src/pack"
 import "../../src/prim"
@@ -260,11 +262,71 @@ node_after :: proc(n: ^Node) {
 			n.durable = t
 			model_durable(&n.w.model, n, t)
 		}
+		note_sent(n)
 	}
 	if len(n.mounts) > 0 {
 		context = instance_context(&n.inst)
 		check_synced_disk(n.w, n)
 	}
+}
+
+note_sent :: proc(n: ^Node) {
+	w := n.w
+	if n.sent == nil {
+		n.sent = make(map[string]i64, w.allocator)
+	}
+	note :: proc(n: ^Node, r: ^osync.Replicator) {
+		for _, l in r.locals {
+			end := l.cursor + l.inflight
+			if end > n.sent[l.path] {
+				if d, derr := eng.durable_len(&n.e, l.path); derr == .None && end > d {
+					world_fail(n.w, "publish: %s handed bytes up to %d of %s to the relay with only %d durable", n.name, end, l.path, d)
+				}
+			}
+			if prev, ok := n.sent[l.path]; ok {
+				if end > prev {
+					n.sent[l.path] = end
+				}
+			} else if end > 0 {
+				n.sent[strings.clone(l.path, n.w.allocator)] = end
+			}
+		}
+	}
+	for _, sp in n.e.spaces {
+		if sp.repl_on {
+			note(n, &sp.repl)
+		}
+	}
+	if rv := n.e.approvals.rv; rv != nil && rv.repl_on {
+		note(n, &rv.repl)
+	}
+}
+
+check_sent :: proc(n: ^Node) {
+	w := n.w
+	if n.sent == nil {
+		return
+	}
+	keys := make([dynamic]string, context.temp_allocator)
+	for k in n.sent {
+		append(&keys, k)
+	}
+	slice.sort(keys[:])
+	{
+		context = instance_context(&n.inst)
+		for k in keys {
+			sent := n.sent[k]
+			got, err := eng.durable_len(&n.e, k)
+			if err == .None && got < sent {
+				world_fail(w, "publish: %s sent bytes up to %d of %s but recovered only %d after a crash", n.name, sent, k, got)
+			}
+		}
+	}
+	node_after(n)
+	for k in n.sent {
+		delete(k, w.allocator)
+	}
+	clear(&n.sent)
 }
 
 node_drain :: proc(n: ^Node) -> bool {

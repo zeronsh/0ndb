@@ -21,6 +21,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		on_event     = _on_repl_event,
 		user         = sp,
 		keys         = _repl_keys,
+		durable      = _repl_durable,
 	}
 	creds_ok := false
 	if e.cfg.credentials.produce != nil {
@@ -274,6 +275,14 @@ Need :: struct {
 	kind:   Need_Kind,
 	device: prim.Id,
 	name:   string,
+}
+
+@(private)
+_repl_durable :: proc(user: rawptr, path: string) -> (length: i64, ok: bool) {
+	sp := (^Space)(user)
+	context = context_for(sp.e)
+	n, err := durable_len(sp.e, path)
+	return n, err == .None
 }
 
 @(private)

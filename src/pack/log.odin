@@ -369,6 +369,7 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 		p.last_cont = fl.cont
 		p.last_start = fl.start
 		p.durable_seq = fl.seq
+		_pend_trim(p)
 		if fl.ccont != 0 && fl.ccont == p.compacting {
 			p.compact_resume = max(p.compact_resume, fl.cpos)
 		}
