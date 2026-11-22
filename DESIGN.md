@@ -582,7 +582,10 @@ concurrent typing is never lost or reverted.
     still rebuilds at wake: derived keys are dropped, keys that no record
     carries (sources, pins, blob versions, mount aliases and conflicts) are
     kept, and the history replays its journal and streams. Replay applies a
-    redacted batch's replacement in its place, pauses at an own batch whose
+    redacted batch's replacement in its place (and serves any read of a
+    zero-filled own record from its replacement while replaying, so a
+    replayed redaction never loads a file without the batch it redacted),
+    pauses at an own batch whose
     parents are remote until those arrive (own sequence numbers in the
     paused region stay reserved, so local writes meanwhile never reuse an
     op id), and treats any other refusal of an own batch as corruption. A
