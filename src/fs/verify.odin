@@ -6,6 +6,18 @@ import "../fstree"
 import "../prim"
 
 mount_synced_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+	return verify_mount(m, true, out, allocator)
+}
+
+mount_shadow_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+	if len(m.intents) > 0 || !m.imported {
+		return .None
+	}
+	return verify_mount(m, false, out, allocator)
+}
+
+@(private = "file")
+verify_mount :: proc(m: ^Mount, disk: bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	h := m.history
 	if h == nil || !m.awake || m.rescan || len(m.fences) > 0 || m.restoring || m.adopting || m.adopt_pending || len(m.unwatched) > 0 {
 		return .None
@@ -17,7 +29,7 @@ mount_synced_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := c
 	snap := version_snapshot(h, lvs[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
 	seen := make(map[string]bool, context.temp_allocator)
-	verify_tree(m, &snap, fstree.ROOT, "", &seen, out, allocator) or_return
+	verify_tree(m, &snap, fstree.ROOT, "", disk, &seen, out, allocator) or_return
 	return verify_shadow(m, "", &seen, out, allocator)
 }
 
@@ -40,7 +52,7 @@ verify_skip :: proc(m: ^Mount, p: string) -> bool {
 }
 
 @(private = "file")
-verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, disk: bool, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
 	if kerr != nil {
 		return .Corrupt
@@ -55,6 +67,12 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 		if !found || e.inode != c.inode {
 			append(out, fmt.aprintf("%s: synced inode %v, shadow %v (found %v)", p, c.inode, e.inode, found, allocator = allocator))
 		}
+		if !disk {
+			if c.kind == .Dir {
+				verify_tree(m, snap, c.inode, p, disk, seen, out, allocator) or_return
+			}
+			continue
+		}
 		d := probe(m, p) or_return
 		switch c.kind {
 		case .Dir:
@@ -62,7 +80,7 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 				append(out, fmt.aprintf("%s: synced directory, disk %v", p, d.kind, allocator = allocator))
 				continue
 			}
-			verify_tree(m, snap, c.inode, p, seen, out, allocator) or_return
+			verify_tree(m, snap, c.inode, p, disk, seen, out, allocator) or_return
 		case .File:
 			if d.kind != .File {
 				append(out, fmt.aprintf("%s: synced file, disk %v", p, d.kind, allocator = allocator))

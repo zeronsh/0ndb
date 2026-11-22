@@ -1516,10 +1516,9 @@ shadow_rollback :: proc(s: ^Shadow, end: u64) -> Error {
 	if s.log_fd < 0 || end < SHADOW_LOG_HEADER || end >= s.log_end {
 		return .None
 	}
-	from_prim(prim.truncate(s.vfs, s.log_fd, i64(end))) or_return
-	from_prim(prim.datasync(s.vfs, s.log_fd)) or_return
 	s.log_end = end
-	return rebuild_index(s, s.cap)
+	rebuild_index(s, s.cap) or_return
+	return shadow_compact(s)
 }
 
 shadow_wants_compact :: proc "contextless" (s: ^Shadow) -> bool {
