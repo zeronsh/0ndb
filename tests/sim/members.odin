@@ -1476,7 +1476,7 @@ _leave :: proc(w: ^World, idx: int, space: prim.Id, only_device: bool) -> (eng.L
 }
 
 @(private = "file")
-_leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret: string, on_disk: bool, what: string) {
+_leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret: string, on_disk: bool, what: string, idle: bool) {
 	gone := false
 	for _ in 0 ..< 200 {
 		if has, left := _has_space(w, idx, space); !has && left {
@@ -1491,6 +1491,15 @@ _leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret:
 		return
 	}
 	_settle(w, 5000)
+	if idle {
+		ln := w.nodes[idx]
+		w0 := eng.stats(&ln.e).wakeups
+		_settle(w, 30_000)
+		w1 := eng.stats(&ln.e).wakeups
+		if w1 != w0 || loop_armed(&ln.inst.loop) > 0 {
+			_fail(w, "%s: n%d is not idle after the erase: %d wakeups in 30 s, armed: %s", what, idx, w1 - w0, armed_timers(&ln.inst.loop))
+		}
+	}
 	if p, found := disk_contains(&w.nodes[idx].disk, transmute([]u8)secret); on_disk && found {
 		_fail(w, "%s: %s still on n%d disk after leaving, in %s", what, secret, idx, p)
 	}
@@ -1573,13 +1582,13 @@ _leave_case :: proc(w: ^World) {
 		_fail(w, "leave: n%d leave %v removed=%d", M_X, lerr, res.removed)
 		return
 	}
-	_leaver_gone(w, M_X, sid, o, secret, x_disk, "member-leave")
+	_leaver_gone(w, M_X, sid, o, secret, x_disk, "member-leave", false)
 	_, d_disk := disk_contains(&w.nodes[M_D].disk, transmute([]u8)secret)
 	res, lerr = _leave(w, M_D, sid, true)
 	if lerr != .None || res.removed != 1 {
 		_fail(w, "leave: n%d device-only leave %v removed=%d", M_D, lerr, res.removed)
 		return
 	}
-	_leaver_gone(w, M_D, sid, o, secret, d_disk, "device-leave")
+	_leaver_gone(w, M_D, sid, o, secret, d_disk, "device-leave", true)
 	_converged(w, sid, {M_A, M_C}, "after leave")
 }
