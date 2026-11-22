@@ -166,6 +166,27 @@ _keys_head_write :: proc(r: ^Replicator, scope: ^Scope, keys_name: string, epoch
 	return hname, durable, .None
 }
 
+replicator_keys_published :: proc(r: ^Replicator, scope: ^Scope, segment: string, tree: ^Key_Tree) -> bool {
+	name, nerr := keys_stream_name(segment)
+	if nerr != .None {
+		return false
+	}
+	if floor, ferr := replicator_floor(r, scope, name, tree.version); ferr != .None || floor <= 0 {
+		return false
+	}
+	hname, herr := keys_head_name(name)
+	if herr != .None {
+		return false
+	}
+	hfloor, hferr := replicator_floor(r, scope, hname, 0)
+	if hferr != .None || hfloor <= 0 {
+		return false
+	}
+	pbuf: prim.Path_Buf = ---
+	st, serr := prim.stat(r.vfs, _keys_path(r, &pbuf, stream_id(scope, r.cfg.self, hname, 0)))
+	return serr == .None && hfloor >= st.size
+}
+
 replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
 	_enter(r)
 	defer _leave(r)
@@ -466,10 +487,11 @@ _quarantine :: proc(r: ^Replicator, rm: ^Remote, at: i64) {
 	clear(&rm.wants)
 	clear(&rm.inflight)
 	rm.tail = 0
-	if rm.follow && r.phase == .Ready {
+	if _following(rm) && r.phase == .Ready {
 		ids := [1]Stream_Id{rm.id}
 		client_unfollow(&r.client, ids[:])
 	}
+	_kwait_release(r, rm)
 	_emit(r, Repl_Event{kind = .Quarantined, err = .Conflict, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = at, length = rm.relay_len})
 }
 
@@ -720,7 +742,7 @@ _span_save :: proc(r: ^Replicator, rm: ^Remote) {
 _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 	pats := make([dynamic]Feed_Pattern, context.temp_allocator)
 	for id, rm in r.remotes {
-		if rm.follow && !rm.grouped {
+		if _following(rm) && !rm.grouped {
 			append(&pats, Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
 		}
 	}
@@ -934,6 +956,7 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	}
 	_pending_apply(r, rm)
 	rm.keys_wait = false
+	_kwait_release(r, rm)
 	_held_apply(r, rm)
 	if r.phase == .Ready {
 		_remote_pull(r, rm)

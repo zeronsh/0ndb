@@ -379,6 +379,9 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	}
 	_rec_put(e, h.id, &rec) or_return
 	_dirty_keys(e, h.sp, h.id, h.kind, h.scope, h.own_tree)
+	if h.own_tree != nil {
+		_pending_set(e, h.sp.id, h.id, 0)
+	}
 	_handle_mark(h)
 	if h.id != h.sp.catalog {
 		_catalog_participant(e, h.sp, h.id, h.kind)
@@ -567,11 +570,8 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 		if !s.in_view && s.tree != nil && !s.tree.absent {
 			return true
 		}
-		if s.follow && h.kind != .Conversation && h.sp.repl_on && h.sp.connected {
-			n := osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0)
-			if n > 0 && !_replica_covers(s.rep, n) {
-				return true
-			}
+		if s.follow && h.kind != .Conversation && h.sp.repl_on && h.sp.connected && osync.replicator_catching_up(&h.sp.repl, &h.scope, s.device, h.name, 0) {
+			return true
 		}
 	}
 	return false

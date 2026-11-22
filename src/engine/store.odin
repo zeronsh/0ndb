@@ -290,12 +290,28 @@ _dirty_add :: proc(e: ^Engine, h: ^Handle, path: string, length: i64) {
 			if d.tree == nil {
 				d.tree = _own_tree_ref(e, h)
 			}
+			d.keys ||= _keys_unconfirmed(e, h.sp, &h.scope, h.name, d.tree)
 			return
 		}
 	}
 	tr := _own_tree_ref(e, h)
-	append(&e.dirty, Dirty_Seg{space = h.sp.id, object = h.id, kind = h.kind, scope = h.scope, name = _clone(h.name, e.allocator) or_else "", path = _clone(path, e.allocator) or_else "", length = length, tree = tr})
+	append(&e.dirty, Dirty_Seg{space = h.sp.id, object = h.id, kind = h.kind, scope = h.scope, name = _clone(h.name, e.allocator) or_else "", path = _clone(path, e.allocator) or_else "", length = length, tree = tr, keys = _keys_unconfirmed(e, h.sp, &h.scope, h.name, tr)})
 	_touch(e)
+}
+
+@(private)
+_keys_unconfirmed :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, name: string, t: ^Own_Tree) -> bool {
+	if t == nil || !sp.repl_on {
+		return false
+	}
+	if t.keys_ok == t.tree.version + 1 {
+		return false
+	}
+	if osync.replicator_keys_published(&sp.repl, scope, name, &t.tree) {
+		t.keys_ok = t.tree.version + 1
+		return false
+	}
+	return true
 }
 
 @(private)
