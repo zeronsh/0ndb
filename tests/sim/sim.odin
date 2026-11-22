@@ -455,6 +455,7 @@ finish :: proc(w: ^World) {
 	}
 	check_streams(w)
 	check_map_reapply(w)
+	check_buffers(w)
 	check_redaction(w)
 	cipher_scan_relay(w)
 	cipher_resolve(w)
@@ -699,6 +700,9 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.stalls += st.stats.stalls
 		total.stats.conflict_pairs += st.stats.conflict_pairs
 		total.stats.live_reads += st.stats.live_reads
+		total.stats.buffers += st.stats.buffers
+		total.stats.bursts += st.stats.bursts
+		total.stats.anchors_checked += st.stats.anchors_checked
 		total.stats.live_waited += st.stats.live_waited
 		total.stats.live_data += st.stats.live_data
 		total.stats.live_absent += st.stats.live_absent
@@ -873,6 +877,7 @@ print_stats :: proc(r: ^Run_Result) {
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
 	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d expected_conflicts=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, r.stats.conflict_pairs, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
 	fmt.eprintf("sim: interactive_reads=%d waited=%d data=%d absent=%d quarantined=%d closed=%d dropped_by_crash=%d max_wait_ms=%d rid_probes=%d rid_reused=%d\n", r.stats.live_reads, r.stats.live_waited, r.stats.live_data, r.stats.live_absent, r.stats.live_quarantined, r.stats.live_closed, r.stats.live_dropped, r.stats.live_wait_ms, r.stats.rid_probes, r.stats.rid_reused)
+	fmt.eprintf("sim: buffers_opened=%d bursts=%d anchors_checked=%d\n", r.stats.buffers, r.stats.bursts, r.stats.anchors_checked)
 	fmt.eprintf("sim: streamed=%d draft_frames=%d draft_deltas=%d draft_delta_bytes=%d remote_draft_bytes=%d segment_delta_bytes=%d draft_blocks_checked=%d\n", r.stats.stream_bytes, r.stats.draft_frames, r.stats.draft_deltas, r.stats.draft_delta_bytes, r.stats.remote_draft_bytes, r.stats.seg_delta_bytes, r.stats.draft_checked)
 }
 
