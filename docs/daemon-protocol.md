@@ -515,7 +515,7 @@ mounted tree, with surgical deltas. Ops are named (their codes come from
 | `buffer.ack` | buffer, rev | {} |
 | `buffer.undo`, `buffer.redo` | buffer | done: bool |
 | `buffer.anchors` | buffer, rev, positions: uvarints, bias: enum{before, after} | anchors: strs |
-| `buffer.resolve` | buffer, anchors: strs | positions: [ivarint] (-1 unknown), rev, ack |
+| `buffer.resolve` | buffer, anchors: strs, rev | positions: [ivarint] (-1 unknown), rev, ack |
 | `buffer.cursors` | buffer, rev, ranges: uvarints (anchor, head pairs) | {} (ephemeral) |
 | `buffer.text` | buffer | rev, text |
 
@@ -544,12 +544,17 @@ your text at that rev plus your earlier edits, so several can be in flight.
 On each delta event, drop your edits with seq <= the event's `ack`;
 transform the incoming delta over the remaining ones with your edit as the
 first argument (your insert goes first at equal positions; deletes of the
-same range cancel), apply it, and set `rev`. Positions the daemon returns
-(`read`'s `from`, `resolve`, cursors) are as of `ack`: map them through your
-edits with seq > ack. An edit's result can arrive before delta events the
+same range cancel), apply it, and set `rev`. Positions in cursors events and in
+`read`'s `from` are as of the event's or reply's `rev` and `ack`: map them
+through your edits with seq > ack. `resolve` takes the `rev` you have
+applied and answers in your coordinates at that rev plus every edit you sent
+before it, so map its positions through what you applied since you sent it
+(later edits and deltas). An edit's result can arrive before delta events the
 daemon produced before applying that edit (results are written at once,
-buffer events as the connection drains), so the ack in an edit result only
-confirms delivery: keep the edit until an event's ack covers it. A `conflict`
+buffer events as the connection drains): the result carries `ack` and the
+`rev` it reflects, so drop edits with seq <= that ack once you have applied
+the delta numbered `rev` (at once if you already have). Without that, a
+buffer nobody else edits would keep every edit unacknowledged. A `conflict`
 status means reopen. Anchors are strings:
 `s`, `e`, or `<actor hex>.<seq>[.<offset>].<b|a>`. The reference clients are
 `LiveBuffer` in `web/0ndb.js` and `ondb::LiveBuffer` in the Rust crate.

@@ -1376,7 +1376,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_BUFFER_REDO 155u
 /* buffer.anchors(buffer: uvarint, rev: uvarint, positions: uvarints, bias: enum{before,after}) -> anchors:strs */
 #define ONDB_OP_BUFFER_ANCHORS 156u
-/* buffer.resolve(buffer: uvarint, anchors: strs) -> positions:[ivarint] rev:uvarint ack:uvarint */
+/* buffer.resolve(buffer: uvarint, anchors: strs, rev: uvarint) -> positions:[ivarint] rev:uvarint ack:uvarint */
 #define ONDB_OP_BUFFER_RESOLVE 157u
 /* buffer.cursors(buffer: uvarint, rev: uvarint, ranges: uvarints) -> {} */
 #define ONDB_OP_BUFFER_CURSORS 158u

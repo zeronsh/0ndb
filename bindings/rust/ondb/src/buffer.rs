@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,14 @@ impl Anchor {
             offset,
             after,
         })
+    }
+
+    pub fn sticks_forward(&self) -> bool {
+        match self {
+            Anchor::Start => false,
+            Anchor::End => true,
+            Anchor::At { after, .. } => !after,
+        }
     }
 
     pub fn text(&self) -> String {
@@ -341,16 +349,28 @@ pub struct BufferState {
     pub line: String,
     rev: u64,
     seq: u64,
+    ack: u64,
     pending: VecDeque<Unacked>,
+    acks: VecDeque<(u64, u64)>,
     doc: Vec<u32>,
+    own_text: bool,
+    page: Option<String>,
+    length: u64,
+    ver: u64,
+    log: VecDeque<(u64, Vec<Op>)>,
+    watch: BTreeMap<u64, usize>,
     cursors: Vec<CursorSet>,
     closed: bool,
 }
 
 impl BufferState {
     pub fn from_open(open: &BufferEvent, units: Units) -> BufferState {
-        let mut doc = units.units(&open.text);
-        if (doc.len() as u64) < open.length {
+        BufferState::from_open_with(open, units, false)
+    }
+
+    pub fn from_open_with(open: &BufferEvent, units: Units, own_text: bool) -> BufferState {
+        let mut doc = if own_text { Vec::new() } else { units.units(&open.text) };
+        if !own_text && (doc.len() as u64) < open.length {
             doc.resize(open.length as usize, HOLE);
         }
         BufferState {
@@ -360,8 +380,16 @@ impl BufferState {
             line: open.line.clone(),
             rev: open.rev,
             seq: 0,
+            ack: 0,
             pending: VecDeque::new(),
+            acks: VecDeque::new(),
             doc,
+            own_text,
+            page: if own_text { Some(open.text.clone()) } else { None },
+            length: open.length,
+            ver: 0,
+            log: VecDeque::new(),
+            watch: BTreeMap::new(),
             cursors: Vec::new(),
             closed: false,
         }
@@ -372,15 +400,31 @@ impl BufferState {
     }
 
     pub fn len(&self) -> u64 {
-        self.doc.len() as u64
+        self.length
     }
 
     pub fn is_empty(&self) -> bool {
-        self.doc.is_empty()
+        self.length == 0
+    }
+
+    pub fn mirrors_text(&self) -> bool {
+        !self.own_text
+    }
+
+    pub fn take_page(&mut self) -> Option<String> {
+        self.page.take()
     }
 
     pub fn unacked(&self) -> usize {
         self.pending.len()
+    }
+
+    pub fn sent(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn acked_seq(&self) -> u64 {
+        self.ack
     }
 
     pub fn is_closed(&self) -> bool {
@@ -425,7 +469,82 @@ impl BufferState {
         }
     }
 
+    pub fn slice(&self, from: u64, to: u64) -> String {
+        let to = (to as usize).min(self.doc.len());
+        let from = (from as usize).min(to);
+        let part = &self.doc[from..to];
+        match self.units {
+            Units::Bytes => {
+                let b: Vec<u8> = part.iter().filter(|u| **u != HOLE).map(|u| *u as u8).collect();
+                String::from_utf8_lossy(&b).into_owned()
+            }
+            Units::Utf16 => {
+                let v: Vec<u16> = part.iter().filter(|u| **u != HOLE).map(|u| *u as u16).collect();
+                String::from_utf16_lossy(&v)
+            }
+        }
+    }
+
+    pub fn unit(&self, at: u64) -> Option<u32> {
+        self.doc.get(at as usize).copied().filter(|u| *u != HOLE)
+    }
+
+    fn watch_begin(&mut self) -> u64 {
+        *self.watch.entry(self.ver).or_insert(0) += 1;
+        self.ver
+    }
+
+    fn watch_end(&mut self, ver: u64, positions: &[i64], after: &[bool]) -> Vec<i64> {
+        let units = self.units;
+        let out = positions
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if *p < 0 {
+                    return *p;
+                }
+                let a = after.get(i).copied().unwrap_or(false);
+                let mut q = *p as u64;
+                for (v, ops) in self.log.iter() {
+                    if *v > ver {
+                        q = transform_position(units, ops, q, a);
+                    }
+                }
+                q as i64
+            })
+            .collect();
+        if let Some(n) = self.watch.get_mut(&ver) {
+            *n -= 1;
+            if *n == 0 {
+                self.watch.remove(&ver);
+            }
+        }
+        match self.watch.keys().next().copied() {
+            Some(low) => {
+                while self.log.front().is_some_and(|(v, _)| *v <= low) {
+                    self.log.pop_front();
+                }
+            }
+            None => self.log.clear(),
+        }
+        out
+    }
+
     fn apply(&mut self, ops: &[Op]) {
+        self.ver += 1;
+        if !self.watch.is_empty() {
+            self.log.push_back((self.ver, ops.to_vec()));
+        }
+        for o in ops {
+            match o {
+                Op::Retain(_) => {}
+                Op::Delete(n) => self.length = self.length.saturating_sub(*n),
+                Op::Insert(t) => self.length += self.units.len_of(t),
+            }
+        }
+        if self.own_text {
+            return;
+        }
         let mut at = 0usize;
         for o in ops {
             match o {
@@ -446,6 +565,7 @@ impl BufferState {
     }
 
     fn acked(&mut self, ack: u64) {
+        self.ack = self.ack.max(ack);
         while self.pending.front().is_some_and(|p| p.seq <= ack) {
             self.pending.pop_front();
         }
@@ -462,6 +582,14 @@ impl BufferState {
             }
         }
         p as i64
+    }
+
+    pub fn edit_result(&mut self, rev: u64, ack: u64) {
+        if rev <= self.rev {
+            self.acked(ack);
+        } else {
+            self.acks.push_back((rev, ack));
+        }
     }
 
     pub fn edit(&mut self, edits: &[TextEdit]) -> Result<Option<EditRequest>> {
@@ -490,7 +618,7 @@ impl BufferState {
 
     pub fn fill(&mut self, from: i64, ack: u64, text: &str) {
         let at = self.local(from, ack, false);
-        if at < 0 {
+        if at < 0 || self.own_text {
             return;
         }
         for (k, x) in self.units.units(text).into_iter().enumerate() {
@@ -513,6 +641,13 @@ impl BufferState {
                 }
                 self.apply(&d);
                 self.rev = ev.rev;
+                while let Some(&(rev, ack)) = self.acks.front() {
+                    if rev > self.rev {
+                        break;
+                    }
+                    self.acks.pop_front();
+                    self.acked(ack);
+                }
                 let units = self.units;
                 for c in self.cursors.iter_mut() {
                     for r in c.ranges.iter_mut() {
@@ -554,6 +689,7 @@ pub struct OpenArgs {
     pub units: Units,
     pub actor: Option<String>,
     pub page: u64,
+    pub own_text: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -564,6 +700,8 @@ pub struct ReadReply {
     pub from: i64,
     pub length: u64,
     pub text: String,
+    #[serde(skip)]
+    pub local: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -577,6 +715,7 @@ pub struct TextReply {
 #[serde(default)]
 struct AckReply {
     ack: u64,
+    rev: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -595,7 +734,6 @@ struct AnchorsReply {
 #[serde(default)]
 struct ResolveReply {
     positions: Vec<i64>,
-    ack: u64,
 }
 
 pub struct LiveBuffer {
@@ -622,13 +760,14 @@ impl LiveBuffer {
             req["page"] = json!(args.page);
         }
         let units = args.units;
+        let own_text = args.own_text;
         let c2 = client.clone();
         client.subscribe_raw_with(&req, move |sub, open| {
             let ev: BufferEvent = serde_json::from_slice(open)?;
             Ok(LiveBuffer {
                 client: c2,
                 sub,
-                state: Arc::new(Mutex::new(BufferState::from_open(&ev, units))),
+                state: Arc::new(Mutex::new(BufferState::from_open_with(&ev, units, own_text))),
                 inflight: Mutex::new(Vec::new()),
                 failed: Mutex::new(None),
             })
@@ -641,6 +780,10 @@ impl LiveBuffer {
 
     pub fn with_state<T>(&self, f: impl FnOnce(&BufferState) -> T) -> T {
         f(&self.state())
+    }
+
+    pub fn take_page(&self) -> Option<String> {
+        self.state().take_page()
     }
 
     pub fn id(&self) -> u64 {
@@ -778,7 +921,11 @@ impl LiveBuffer {
             }
         };
         let body = json!({"op": "buffer.edit", "buffer": id, "rev": req.rev, "group": group, "pos": req.pos, "del": req.del, "ins": req.ins});
-        let p = self.client.call_then::<AckReply, u64>(&body, |r| r.ack);
+        let state = self.state.clone();
+        let p = self.client.call_then::<AckReply, u64>(&body, move |r| {
+            state.lock().unwrap_or_else(|e| e.into_inner()).edit_result(r.rev, r.ack);
+            r.ack
+        });
         self.inflight.lock().unwrap_or_else(|e| e.into_inner()).push(p);
         Ok(Some(req.seq))
     }
@@ -789,8 +936,10 @@ impl LiveBuffer {
             (st.id, st.rev)
         };
         let state = self.state.clone();
-        self.client.call_then::<ReadReply, ReadReply>(&json!({"op": "buffer.read", "buffer": id, "rev": rev, "from": from, "len": len}), move |r| {
-            state.lock().unwrap_or_else(|e| e.into_inner()).fill(r.from, r.ack, &r.text);
+        self.client.call_then::<ReadReply, ReadReply>(&json!({"op": "buffer.read", "buffer": id, "rev": rev, "from": from, "len": len}), move |mut r| {
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            r.local = st.local(r.from, r.ack, false);
+            st.fill(r.from, r.ack, &r.text);
             r
         })
     }
@@ -816,13 +965,28 @@ impl LiveBuffer {
     }
 
     pub fn resolve(&self, anchors: &[Anchor]) -> Pending<Vec<i64>> {
-        let id = self.state().id;
+        let (id, rev, ver) = {
+            let mut st = self.state();
+            let ver = st.watch_begin();
+            (st.id, st.rev, ver)
+        };
         let state = self.state.clone();
         let list: Vec<String> = anchors.iter().map(Anchor::text).collect();
-        self.client.call_then::<ResolveReply, Vec<i64>>(&json!({"op": "buffer.resolve", "buffer": id, "anchors": list}), move |r| {
-            let st = state.lock().unwrap_or_else(|e| e.into_inner());
-            r.positions.iter().map(|p| st.local(*p, r.ack, false)).collect()
-        })
+        let after: Vec<bool> = anchors.iter().map(Anchor::sticks_forward).collect();
+        let token = Arc::new(Mutex::new(Some(ver)));
+        let (state2, token2) = (self.state.clone(), token.clone());
+        let mut p = self.client.call_then::<ResolveReply, Vec<i64>>(&json!({"op": "buffer.resolve", "buffer": id, "rev": rev, "anchors": list}), move |r| {
+            match token.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                Some(v) => state.lock().unwrap_or_else(|e| e.into_inner()).watch_end(v, &r.positions, &after),
+                None => r.positions,
+            }
+        });
+        p.on_drop(move || {
+            if let Some(v) = token2.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                state2.lock().unwrap_or_else(|e| e.into_inner()).watch_end(v, &[], &[]);
+            }
+        });
+        p
     }
 
     pub fn set_cursors(&self, ranges: &[Range]) -> Pending<crate::types::Ack> {

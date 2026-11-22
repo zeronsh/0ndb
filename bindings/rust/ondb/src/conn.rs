@@ -330,6 +330,7 @@ impl Client {
             tag,
             finish: Some(finish),
             err: None,
+            abandon: None,
             _t: PhantomData,
         }
     }
@@ -388,6 +389,7 @@ impl Client {
             tag,
             finish: Some(done),
             err: None,
+            abandon: None,
             _t: PhantomData,
         }
     }
@@ -485,6 +487,7 @@ pub struct Pending<T> {
     tag: u64,
     finish: Option<Finish<T>>,
     err: Option<Error>,
+    abandon: Option<Box<dyn FnOnce() + Send>>,
     _t: PhantomData<fn() -> T>,
 }
 
@@ -496,6 +499,7 @@ impl<T> Pending<T> {
             tag: 0,
             finish: None,
             err: Some(e),
+            abandon: None,
             _t: PhantomData,
         }
     }
@@ -537,6 +541,10 @@ impl<T> Pending<T> {
 
     pub fn cancel(self) {}
 
+    pub(crate) fn on_drop(&mut self, f: impl FnOnce() + Send + 'static) {
+        self.abandon = Some(Box::new(f));
+    }
+
     pub fn try_take(&mut self) -> Option<Result<T>> {
         if let Some(e) = self.err.take() {
             return Some(Err(e));
@@ -568,6 +576,9 @@ impl<T> Future for Pending<T> {
 
 impl<T> Drop for Pending<T> {
     fn drop(&mut self) {
+        if let Some(f) = self.abandon.take() {
+            f();
+        }
         if self.slot.is_none() {
             return;
         }

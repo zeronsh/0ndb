@@ -355,7 +355,7 @@ _anchor :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer) {
 	if err != .None {
 		return
 	}
-	pos, _, _, rerr := eng.buffer_resolve(&n.e, b.id, list, context.temp_allocator)
+	pos, _, _, rerr := eng.buffer_resolve(&n.e, b.id, b.rev, list, context.temp_allocator)
 	if rerr == .None && pos[0] != t.pos {
 		world_fail(w, "anchor: %s buffer %d anchor for %s at %d resolves to %d", n.name, b.id, t.text, t.pos, pos[0])
 	}
@@ -469,7 +469,7 @@ check_buffers :: proc(w: ^World) {
 				node_after(n)
 				continue
 			}
-			pos, _, _, rerr := eng.buffer_resolve(&n.e, info.id, []eng.Anchor{a.anchor}, context.temp_allocator)
+			pos, _, _, rerr := eng.buffer_resolve(&n.e, info.id, info.rev, []eng.Anchor{a.anchor}, context.temp_allocator)
 			text := string(info.page)
 			eng.buffer_close(&n.e, info.id)
 			node_after(n)
