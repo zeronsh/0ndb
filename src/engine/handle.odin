@@ -518,10 +518,12 @@ _handle_probe :: proc(h: ^Handle) {
 		}
 		s.probed = true
 		s.probing = true
-		if osync.replicator_fresh_tail(&sp.repl, &h.scope, s.device, h.name, 0) {
+		switch osync.replicator_fresh_tail(&sp.repl, &h.scope, s.device, h.name, 0) {
+		case .Probed:
 			h.e.stats.fetches += 1
 			h.e.stats.probes += 1
-		} else {
+		case .Waiting:
+		case .Current:
 			s.probing = false
 		}
 	}

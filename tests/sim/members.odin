@@ -587,6 +587,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_short_id_wait(w, mw.owned[len(mw.owned) - 1])
 	_short_id_instant(w, mw.owned[len(mw.owned) - 1])
 	_upload_wait_case(w, mw.owned[len(mw.owned) - 1])
+	_fresh_unfollowed(w, mw)
 
 	_down(w, M_A)
 	_down(w, M_B)
@@ -1737,4 +1738,54 @@ _own_key_row :: proc(w: ^World, idx: int, object: prim.Id) -> []u8 {
 		return nil
 	}
 	return v
+}
+
+@(private = "file")
+FRESH_POLL_MAX :: 32
+
+@(private = "file")
+_fresh_unfollowed :: proc(w: ^World, mw: ^Mem_World) {
+	_, o, _, live := _live_space(w, mw, M_A, {M_B}, "fresh-unfollowed")
+	if !live {
+		return
+	}
+	run_until(w, w.now + 5_000 * 1_000_000, false)
+	r2, sent := _send(w, M_A, o, "fresh-unfollowed-2")
+	if !sent {
+		_fail(w, "fresh-unfollowed: second send on n0")
+		return
+	}
+	run_until(w, w.now + 5_000 * 1_000_000, false)
+	b := w.nodes[M_B]
+	if !b.alive || !b.e_open {
+		_fail(w, "fresh-unfollowed: n1 is down")
+		return
+	}
+	before := b.e.stats.probes
+	links := b.connects
+	polls := 0
+	for polls < FRESH_POLL_MAX {
+		polls += 1
+		context = instance_context(&b.inst)
+		ready := eng.Ready{call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}, fresh = true}
+		st, err := eng.convo_status(&b.e, o, ready)
+		node_after(b)
+		context = w.ctx
+		if err == .None {
+			if st.head != r2 {
+				_fail(w, "fresh-unfollowed: a fresh read on n1 completed without n0's newer message (head %v, want %v) after %d polls", st.head, r2, polls)
+			}
+			probes := b.e.stats.probes - before
+			if probes > u64(1 + b.connects - links) {
+				_fail(w, "fresh-unfollowed: n1 needed %d probes over %d new connections for one segment", probes, b.connects - links)
+			}
+			return
+		}
+		if err != .Missing && err != .Pending && err != .Busy {
+			_fail(w, "fresh-unfollowed: fresh read on n1 failed: %v", err)
+			return
+		}
+		run_until(w, w.now + 2_000 * 1_000_000, false)
+	}
+	_fail(w, "fresh-unfollowed: n1 polled %d fresh reads without completing (%d probes)", polls, b.e.stats.probes - before)
 }

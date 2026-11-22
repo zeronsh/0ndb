@@ -750,22 +750,44 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 	return -1
 }
 
-replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> (probed: bool) {
+Fresh_Tail :: enum u8 {
+	Current,
+	Waiting,
+	Probed,
+}
+
+replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> Fresh_Tail {
 	_enter(r)
 	defer _leave(r)
-	rm, err := _remote_get(r, scope, device, name, epoch)
+	got, err := _remote_get(r, scope, device, name, epoch)
 	if err != .None {
-		return false
+		return .Current
 	}
-	if ans, answered := r.answers[rm.id]; answered && r.phase == .Ready {
-		if ans > rm.relay_len {
-			_seen_stream(r, rm.id, ans)
-			_repl_flush(r)
-		}
-		return false
+	id := got.id
+	ans, answered := r.answers[id]
+	if !answered || r.phase != .Ready {
+		_remote_want_tail(r, got, TAIL_DEFAULT)
+		return .Probed
 	}
-	_remote_want_tail(r, rm, TAIL_DEFAULT)
-	return true
+	if rm, ok := r.remotes[id]; ok && ans > rm.relay_len {
+		_seen_stream(r, id, ans)
+	}
+	rm, ok := r.remotes[id]
+	if !ok || rm.relay_len <= 0 {
+		_repl_flush(r)
+		return .Current
+	}
+	if _, missing := journal.replica_missing(&rm.rep, max(rm.relay_len - TAIL_DEFAULT, 0), rm.relay_len); !missing {
+		_repl_flush(r)
+		return .Current
+	}
+	rm.tail = max(rm.tail, TAIL_DEFAULT)
+	rm.backward = true
+	rm.want_gen += 1
+	rm.fresh_gen = rm.want_gen
+	_remote_settle(r, rm)
+	_repl_flush(r)
+	return .Waiting
 }
 
 @(private)
