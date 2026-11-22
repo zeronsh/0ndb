@@ -1275,6 +1275,14 @@ checkpoint bundles, as before, plus:
   transport). An `Offline` answer emits `Unavailable` per remote segment.
   Local-only spaces and objects whose only segment is the device's own
   read locally as before.
+  Replication of a space stops (a refusal, a lapsed lease, a leave) only
+  once the space is drained: it is marked draining so no handle acquires
+  a replica, its handles close through the normal path, which commits
+  their own writes, and a handle that cannot close yet (an untaken history
+  mark, a commit under pack pressure) holds the stop until a later durable
+  batch retries it. The replicator, which owns every replica, is destroyed
+  only when no handle holds one, so a refusal that is later lifted keeps
+  every own write, and only the erase of a left space discards.
 - **Direct messages.** A participant can send an opaque frame to another
   participant of the same space by device id. The relay delivers it to one
   live connection of that device or answers `Undelivered` at once; it keeps

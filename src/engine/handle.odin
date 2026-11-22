@@ -410,7 +410,7 @@ _handle_mark :: proc(h: ^Handle) {
 _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 	e := h.e
 	sp := h.sp
-	if device == e.self || !sp.repl_on {
+	if device == e.self || !sp.repl_on || sp.draining {
 		return
 	}
 	for s in h.segs {
@@ -765,6 +765,48 @@ _handles_sweep :: proc(e: ^Engine, keep: int) {
 			i += 1
 			continue
 		}
+		if _handle_close(e, h) != .None {
+			i += 1
+		}
+	}
+}
+
+@(private)
+_space_drain :: proc(e: ^Engine, sp: ^Space) -> (drained: bool) {
+	sp.draining = true
+	i := 0
+	for i < len(e.lru) {
+		h := e.lru[i]
+		if h.sp != sp || len(h.segs) == 0 {
+			i += 1
+			continue
+		}
+		h.pins = 0
+		if _handle_close(e, h) != .None {
+			i += 1
+		}
+	}
+	for h in e.lru {
+		if h.sp == sp && len(h.segs) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+_handles_close_space :: proc(e: ^Engine, sp: ^Space) {
+	was := e.closing
+	e.closing = true
+	defer e.closing = was
+	i := 0
+	for i < len(e.lru) {
+		h := e.lru[i]
+		if h.sp != sp {
+			i += 1
+			continue
+		}
+		h.pins = 0
 		if _handle_close(e, h) != .None {
 			i += 1
 		}

@@ -304,6 +304,7 @@ Engine :: struct {
 	own_trees:    map[osync.Stream_Id]^Own_Tree,
 	leave_ready:  [dynamic]prim.Id,
 	refused_stop: [dynamic]prim.Id,
+	drain_wait:   [dynamic]prim.Id,
 	waiters:      [dynamic]^Waiter,
 	space_waits:  [dynamic]Space_Wait,
 	space_woke:   bool,
@@ -389,6 +390,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, e.allocator)
 	e.leave_ready = make([dynamic]prim.Id, e.allocator)
 	e.refused_stop = make([dynamic]prim.Id, e.allocator)
+	e.drain_wait = make([dynamic]prim.Id, e.allocator)
 	e.waiters = make([dynamic]^Waiter, e.allocator)
 	e.space_waits = make([dynamic]Space_Wait, e.allocator)
 	e.held = make([dynamic]^Pending_Cmd, e.allocator)
@@ -1011,6 +1013,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.own_trees)
 	delete(e.leave_ready)
 	delete(e.refused_stop)
+	delete(e.drain_wait)
 	for p in e.held {
 		_cmd_fail(e, p, .Closed)
 	}
