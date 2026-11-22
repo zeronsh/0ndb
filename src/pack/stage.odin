@@ -112,7 +112,9 @@ _stage_sync :: proc(p: ^Pack, h: ^Handle) -> Error {
 		clear(&st.data)
 	}
 	if oi.ino.kind == .External && st.hi > 0 {
-		if e := _sync(p, oi.real_fd); e != .None {
+		if _async(p) {
+			oi.dirty = true
+		} else if e := _sync(p, oi.real_fd); e != .None {
 			_suspect_record(p, []u64{oi.inum})
 			return _poison(p, e)
 		}

@@ -496,6 +496,14 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 		if w.cfg.promote > 0 {
 			opts.promote_size = w.cfg.promote
 		}
+		rn.async = w.cfg.seed % 3 != 0
+		if rn.async {
+			opts.worker = pack.Worker_Hook{data = rn, submit = _relay_pack_submit}
+			opts.wake = proc(data: rawptr) {
+				prim.wake(&(^Relay_Node)(data).inst.loop)
+			}
+			opts.wake_data = rn
+		}
 		if perr := prim.mkdir_all(vfs, RELAY_DIR + "/spaces", 0o700); perr != .None {
 			err = .Io
 		} else if perr = pack.open(&rn.pk, vfs, RELAY_DIR + "/spaces", opts); perr != .None {
@@ -513,6 +521,15 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 				end = proc(data: rawptr) -> osync.Error {
 					return .None if pack.batch_end((^pack.Pack)(data)) == .None else .Io
 				},
+			}
+			if rn.async {
+				group.end_async = _relay_end_async
+				prim.loop_on_wake(&rn.inst.loop, proc(l: ^prim.Loop, data: rawptr) {
+					rn := (^Relay_Node)(data)
+					if rn.packed {
+						pack.poll(&rn.pk)
+					}
+				}, rn)
 			}
 		}
 	}
@@ -590,6 +607,45 @@ _relay_spaces :: proc(vfs: prim.Vfs) -> []osync.Space_Id {
 	return ids[:]
 }
 
+@(private = "file")
+Relay_Group :: struct {
+	done: proc(ctx: rawptr, err: osync.Error),
+	ctx:  rawptr,
+}
+
+@(private = "file")
+_relay_end_async :: proc(data: rawptr, done: proc(ctx: rawptr, err: osync.Error), ctx: rawptr) {
+	g := new(Relay_Group)
+	g^ = {done = done, ctx = ctx}
+	if err := pack.batch_end_async((^pack.Pack)(data), proc(d: rawptr, err: prim.Error) {
+		g := (^Relay_Group)(d)
+		done, ctx := g.done, g.ctx
+		free(g)
+		done(ctx, .None if err == .None else .Io)
+	}, g); err != .None {
+		free(g)
+		done(ctx, .Io)
+	}
+}
+
+@(private = "file")
+_relay_pack_submit :: proc(data: rawptr) {
+	rn := (^Relay_Node)(data)
+	w := rn.w
+	delay := i64(0) if rng_chance(&rn.rng, 1, 4) else rng_range(&rn.rng, 0, 20_000_000)
+	schedule(w, Sim_Event{at = w.now + delay, kind = .Relay_Pack_Job, gen = u64(w.stats.relay_crash)})
+}
+
+relay_pack_job :: proc(rn: ^Relay_Node, gen: u64) {
+	w := rn.w
+	if !rn.alive || !rn.packed || !rn.async || gen != u64(w.stats.relay_crash) {
+		return
+	}
+	context = instance_context(&rn.inst)
+	pack.worker_run(&rn.pk)
+	relay_after(rn)
+}
+
 relay_kill :: proc(rn: ^Relay_Node) {
 	context = rn.w.ctx
 	conns_drop_relay(rn.w)
@@ -602,6 +658,7 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.fs = {}
 	rn.pk = {}
 	rn.packed = false
+	rn.async = false
 	stat_add(rn.w, STAT_TIER_EVICTIONS, rn.ts.evictions)
 	stat_add(rn.w, STAT_TIER_COLD_READS, rn.ts.cold_reads)
 	stat_add(rn.w, STAT_TIER_THAWS, rn.ts.thaws)
