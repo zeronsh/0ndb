@@ -482,3 +482,44 @@ git_dirty_paths :: proc(vfs: prim.Vfs, root: string) -> map[string]bool {
 	}
 	return out
 }
+
+git_head_line :: proc(vfs: prim.Vfs, root: string) -> string {
+	git := strings.concatenate({root, "/.git"}, context.temp_allocator)
+	data, err := prim.read_file(vfs, strings.concatenate({git, "/HEAD"}, context.temp_allocator), context.temp_allocator)
+	if err != .None {
+		return ""
+	}
+	s := strings.trim_space(string(data))
+	if !strings.has_prefix(s, "ref:") {
+		return strings.concatenate({"git:detached:", s}, context.temp_allocator)
+	}
+	ref := strings.trim_space(s[4:])
+	if ref == "refs/heads/main" {
+		return ""
+	}
+	return strings.concatenate({"git:", ref}, context.temp_allocator)
+}
+
+git_branches_other :: proc(vfs: prim.Vfs, root: string) -> []string {
+	out := make([dynamic]string, context.temp_allocator)
+	git := strings.concatenate({root, "/.git"}, context.temp_allocator)
+	cur, _ := _git_head_ref(vfs, git)
+	d: prim.Dir
+	d.allocator = context.temp_allocator
+	if prim.dir_open(vfs, &d, strings.concatenate({git, "/refs/heads"}, context.temp_allocator), context.temp_allocator) != .None {
+		return out[:]
+	}
+	defer prim.dir_close(vfs, &d)
+	for {
+		de, more, err := prim.dir_next(vfs, &d)
+		if err != .None || !more {
+			break
+		}
+		if de.name == "." || de.name == ".." || strings.concatenate({"refs/heads/", de.name}, context.temp_allocator) == cur {
+			continue
+		}
+		append(&out, strings.clone(de.name, context.temp_allocator))
+	}
+	slice.sort(out[:])
+	return out[:]
+}
