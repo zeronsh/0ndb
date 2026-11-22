@@ -2424,6 +2424,35 @@ history_own_applied :: proc(h: ^History) {
 }
 
 @(private)
+replay_record :: proc(h: ^History, body: []u8, off: i64) -> (wait: bool, err: Error) {
+	switch body[0] {
+	case REC_ACTORS:
+		rd := prim.reader(body[1:])
+		n := prim.read_uvarint(&rd)
+		for _ in 0 ..< n {
+			crdt.dict_add(&h.dict, prim.read_id(&rd))
+		}
+		return false, .None
+	case REC_BATCH, REC_IMPORT:
+		return replay_batch(h, body[0], body[1:], off)
+	case REC_REDACT:
+		err = apply_redact_record(h, body, true)
+	case REC_REPLACE:
+		err = apply_replace_record(h, 0, body, u64(off))
+	case REC_SEAL:
+		err = apply_seal_record(h, 0, body)
+	case REC_LINE:
+		err = apply_line_record(h, h.self, body)
+	case REC_ACTOR:
+		err = apply_actor_record(h, h.self, body)
+	}
+	if err == .Not_Found {
+		return true, .None
+	}
+	return false, err
+}
+
+@(private)
 replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: bool, err: Error) {
 	b, derr := crdt.batch_decode(payload, context.temp_allocator, &h.dict)
 	if derr != .None {
@@ -2562,24 +2591,8 @@ replay_own :: proc(h: ^History) -> Error {
 		if jerr != .None {
 			return from_journal(jerr)
 		}
-		if len(body) > 0 && body[0] == REC_ACTORS {
-			rd := prim.reader(body[1:])
-			n := prim.read_uvarint(&rd)
-			for _ in 0 ..< n {
-				crdt.dict_add(&h.dict, prim.read_id(&rd))
-			}
-		} else if len(body) > 0 && body[0] == REC_REDACT {
-			apply_redact_record(h, body) or_return
-		} else if len(body) > 0 && body[0] == REC_REPLACE {
-			apply_replace_record(h, 0, body, u64(off)) or_return
-		} else if len(body) > 0 && body[0] == REC_SEAL {
-			apply_seal_record(h, 0, body) or_return
-		} else if len(body) > 0 && body[0] == REC_LINE {
-			apply_line_record(h, h.self, body) or_return
-		} else if len(body) > 0 && body[0] == REC_ACTOR {
-			apply_actor_record(h, h.self, body) or_return
-		} else if len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT) {
-			if wait := replay_batch(h, body[0], body[1:], off) or_return; wait {
+		if len(body) > 0 {
+			if wait := replay_record(h, body, off) or_return; wait {
 				return replay_pause(h, off)
 			}
 		}
