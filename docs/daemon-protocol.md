@@ -166,7 +166,8 @@ plug is cancelled at once and the host receives `Plug_Cancel` for the request
   changes to one object.
 - `{"op":"subscribe.catalog","space":S}`: changes to the catalog of a space
   (the session list: every conversation, map, text and tree, with titles,
-  status, activity, archived and pinned flags).
+  status, activity, archived and pinned flags). Each `catalog` delta's
+  `object` is the row that changed; read its fields with `catalog.get`.
 - `{"op":"subscribe.runners","space":S[,"object":C]}`: the runner directory
   of a space (or of conversation `C`, which adds `current` and `last`). Each
   frame carries the whole `Runners` payload (the `runners` op's result), not
@@ -302,9 +303,10 @@ conversation takes it, any other needs the host to assign a concrete runner.
 
 Session list. `catalog.list(space, archived, after, limit)` pages rows
 (`rows`, `more`, `next`; pass `next` as `after`). Subscribe to
-`subscribe.catalog(space)` first, then list; on a `catalog` delta for object
-X call `catalog.get(X)` (or apply the delta's fields); on a Gap re-get the
-listed objects.
+`subscribe.catalog(space)` first, then list. A `catalog` delta names the row
+that changed in `object` (an object of the space; one delta per row per
+frame) and carries no field values: call `catalog.get(object)` and replace
+the row. On a Gap re-get the listed objects.
 
 Resolving a short id or title. `catalog.find(space, text)` returns every row
 whose hex object id starts or ends with `text` (case-insensitive) or whose
