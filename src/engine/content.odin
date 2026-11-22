@@ -369,6 +369,16 @@ _content_events_process :: proc(e: ^Engine) {
 }
 
 @(private)
+_content_pending :: proc(e: ^Engine, object: prim.Id) -> bool {
+	for _, w in e.content.waits {
+		if w.object == object && w.attempts < CONTENT_RETRIES {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
 _content_waiting :: proc(e: ^Engine, oid: odb.Oid) -> bool {
 	w, ok := e.content.waits[oid]
 	return ok && w.inflight
