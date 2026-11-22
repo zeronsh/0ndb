@@ -24,6 +24,7 @@ Arc_Read :: struct {
 	seal_at: i64,
 	driving: bool,
 	fresh_need: u64,
+	redacts: [dynamic]journal.Range,
 }
 
 @(private)
@@ -261,6 +262,7 @@ _Build_Ctx :: struct {
 	l:    ^Local,
 	j:    ^journal.Journal,
 	from: i64,
+	stop: i64,
 	head: journal.Hash,
 	out:  _Built,
 	err:  Error,
@@ -270,19 +272,19 @@ _Build_Ctx :: struct {
 @(private)
 _arc_build_use :: proc(data: rawptr, keys: journal.Key_Provider, shift: u8) {
 	c := cast(^_Build_Ctx)data
-	c.out, c.err = _arc_build(c.r, c.l, c.j, c.from, c.head, keys, shift)
+	c.out, c.err = _arc_build(c.r, c.l, c.j, c.from, c.head, keys, shift, c.stop)
 	c.ran = true
 }
 
 @(private)
-_arc_build_keyed :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, head: journal.Hash) -> (out: _Built, err: Error) {
+_arc_build_keyed :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, head: journal.Hash, stop: i64 = 0) -> (out: _Built, err: Error) {
 	if l.plain {
-		return _arc_build(r, l, j, from, head, {}, 0)
+		return _arc_build(r, l, j, from, head, {}, 0, stop)
 	}
 	if r.cfg.archive_keys == nil {
-		return _arc_build(r, l, j, from, head, static_provider(&l.key), 0)
+		return _arc_build(r, l, j, from, head, static_provider(&l.key), 0, stop)
 	}
-	c := _Build_Ctx{r = r, l = l, j = j, from = from, head = head}
+	c := _Build_Ctx{r = r, l = l, j = j, from = from, head = head, stop = stop}
 	if !r.cfg.archive_keys(r.cfg.user, l.name, l.id, _arc_build_use, &c) || !c.ran {
 		return {first = from, end = from}, .Busy
 	}
@@ -290,13 +292,16 @@ _arc_build_keyed :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i
 }
 
 @(private)
-_arc_build :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, head: journal.Hash, keys: journal.Key_Provider, shift: u8) -> (out: _Built, err: Error) {
+_arc_build :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, head: journal.Hash, keys: journal.Key_Provider, shift: u8, stop: i64 = 0) -> (out: _Built, err: Error) {
 	rd: journal.Reader
 	if journal.reader_open(&rd, r.vfs, l.path, context.temp_allocator) != .None {
 		return {}, .Io
 	}
 	defer journal.reader_close(&rd)
 	limit := min(l.floor, journal.reader_end(&rd))
+	if stop > 0 {
+		limit = min(stop, journal.reader_end(&rd))
+	}
 	b: arc.Builder
 	arc.builder_init(&b, from, head, context.temp_allocator)
 	defer arc.builder_destroy(&b)
@@ -306,7 +311,7 @@ _arc_build :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, he
 	mode := arc.Mode.Plain if l.plain else arc.Mode.Sealed
 	pos := from
 	span_start := from
-	for pos < limit && arc.builder_raw(&b) < group_raw {
+	for pos < limit && (stop > 0 || arc.builder_raw(&b) < group_raw) {
 		body, nxt, rerr := journal.record_at(&rd, pos)
 		if rerr == .Redacted {
 			append(&span, _Span_Rec{off = pos, size = nxt - pos, rdx = true})
@@ -321,7 +326,7 @@ _arc_build :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, he
 			pos = nxt
 			continue
 		}
-		if nxt >= limit {
+		if nxt > limit || (stop <= 0 && nxt == limit) {
 			break
 		}
 		info, _, perr := journal.parse_sig(body, pos, &links)
@@ -448,6 +453,7 @@ _arc_release :: proc(r: ^Replicator, rm: ^Remote) {
 	}
 	delete(a.index)
 	delete(a.wants)
+	delete(a.redacts)
 	free(a, r.allocator)
 }
 
@@ -477,7 +483,7 @@ _arm_want :: proc(r: ^Replicator, arm: ^Remote, from, to: i64) {
 @(private)
 _arc_drive :: proc(r: ^Replicator, rm: ^Remote) {
 	a := rm.arc
-	if a == nil || a.arm == nil || len(a.wants) == 0 || r.phase != .Ready || a.driving {
+	if a == nil || a.arm == nil || (len(a.wants) == 0 && len(a.redacts) == 0) || r.phase != .Ready || a.driving {
 		return
 	}
 	a.driving = true
@@ -495,6 +501,22 @@ _arc_drive :: proc(r: ^Replicator, rm: ^Remote) {
 		if !_arc_load(r, rm) {
 			return
 		}
+	}
+	if len(a.redacts) > 0 {
+		for x in a.redacts {
+			for e in a.index {
+				if e.first < x.to && x.from < e.end {
+					client_redact(&r.client, arm.id, e.arc_off, e.arc_off + e.arc_len)
+					if journal.replica_covers(&arm.rep, e.arc_off, e.arc_off + e.arc_len) {
+						journal.replica_redact(&arm.rep, e.arc_off, e.arc_off + e.arc_len, {})
+					}
+				}
+			}
+		}
+		clear(&a.redacts)
+	}
+	if len(a.wants) == 0 {
+		return
 	}
 	keys, sealed, ok := _arc_keys(r, rm)
 	if !ok {
@@ -793,4 +815,164 @@ _arc_trim_reply :: proc(r: ^Replicator, id: Stream_Id, refused: bool) -> bool {
 		}
 	}
 	return true
+}
+
+@(private)
+_arc_reader :: proc(r: ^Replicator, rm: ^Remote) -> ^Arc_Read {
+	if rm.arc != nil {
+		return rm.arc
+	}
+	name, nerr := arc.stream_name(rm.name)
+	if nerr != .None {
+		return nil
+	}
+	arm, err := _remote_get(r, &rm.scope, rm.device, name, rm.epoch)
+	if err != .None {
+		return nil
+	}
+	na, aerr := new(Arc_Read, r.allocator)
+	if aerr != nil {
+		return nil
+	}
+	na.arm = arm
+	na.index = make([dynamic]arc.Seal_Entry, r.allocator)
+	na.wants = make([dynamic]journal.Range, r.allocator)
+	na.redacts = make([dynamic]journal.Range, r.allocator)
+	arm.refs += 1
+	arm.plain = true
+	arm.arc_of = rm
+	rm.arc = na
+	return na
+}
+
+@(private)
+_arc_redact_remote :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
+	if !rm.trimmed || from >= rm.base || to <= from {
+		return
+	}
+	a := _arc_reader(r, rm)
+	if a == nil {
+		return
+	}
+	append(&a.redacts, journal.Range{from, min(to, rm.base)})
+	a.loaded = false
+	_arc_drive(r, rm)
+}
+
+@(private)
+_arc_invalidate :: proc(r: ^Replicator, arm: ^Remote) {
+	if up := arm.arc_of; up != nil && up.arc != nil {
+		up.arc.loaded = false
+	}
+}
+
+@(private)
+_arc_redact_own :: proc(r: ^Replicator, l: ^Local, from, to: i64) {
+	if !l.archive || to <= from || from >= l.arc_sealed || r.cfg.signer.sign == nil {
+		return
+	}
+	name, nerr := arc.stream_name(l.name)
+	if nerr != .None {
+		return
+	}
+	scope := l.scope
+	aid := stream_id(&scope, r.cfg.self, name, l.epoch)
+	pbuf: prim.Path_Buf = ---
+	path := _arc_path(r, &pbuf, aid)
+	chain := journal.Chain {
+		seed   = chain_seed(aid),
+		signer = r.cfg.signer,
+	}
+	j: journal.Journal
+	if journal.journal_open(&j, r.vfs, path, journal.Options{chain = &chain}, context.temp_allocator) != .None {
+		return
+	}
+	defer journal.journal_close(&j)
+	seal: arc.Seal
+	seal.entries = make([dynamic]arc.Seal_Entry, context.temp_allocator)
+	full := make([dynamic]arc.Seal_Entry, context.temp_allocator)
+	seal_at, _, have, lerr := _arc_last_seal(&j, &seal, &full)
+	if lerr != .None || !have {
+		return
+	}
+	index := make([dynamic]arc.Seal_Entry, context.temp_allocator)
+	for e in full {
+		append(&index, e)
+	}
+	if !seal.full {
+		arc.seal_merge(&index, seal.entries[:])
+	}
+	rd: journal.Reader
+	journal.journal_reader(&j, &rd, context.temp_allocator)
+	fresh := make([dynamic]arc.Seal_Entry, context.temp_allocator)
+	old := make([dynamic]journal.Range, context.temp_allocator)
+	for e in index {
+		if !(e.first < to && from < e.end) {
+			continue
+		}
+		body, _, rerr := journal.record_at(&rd, e.arc_off)
+		if rerr != .None {
+			continue
+		}
+		g, perr := arc.group_parse(body, e.arc_off)
+		if perr != .None {
+			continue
+		}
+		head := g.head_before
+		built, berr := _arc_build_keyed(r, l, &j, e.first, head, e.end)
+		if berr != .None || built.first != e.first || built.end != e.end || built.head != g.head_after {
+			continue
+		}
+		append(&fresh, built.entry)
+		append(&old, journal.Range{e.arc_off, e.arc_off + e.arc_len})
+	}
+	journal.reader_close(&rd)
+	if len(fresh) == 0 {
+		return
+	}
+	delta := make([dynamic]arc.Seal_Entry, context.temp_allocator)
+	if !seal.full {
+		for e in seal.entries {
+			append(&delta, e)
+		}
+	}
+	arc.seal_merge(&delta, fresh[:])
+	ns: arc.Seal
+	ns.base = seal.base
+	ns.head = seal.head
+	if len(full) == 0 || len(delta) * 2 >= len(full) {
+		arc.seal_merge(&full, delta[:])
+		ns.full = true
+		ns.entries = full
+	} else {
+		ns.full_at = seal.full_at if !seal.full else seal_at
+		ns.entries = delta
+	}
+	sb := make([dynamic]u8, context.temp_allocator)
+	if arc.seal_encode(&sb, &ns) != .None {
+		return
+	}
+	if _, aerr := journal.journal_append(&j, sb[:]); aerr != .None || journal.journal_commit(&j) != .None {
+		return
+	}
+	for o in old {
+		journal.journal_redact(&j, o.from, o.to)
+		if r.phase == .Ready {
+			client_redact(&r.client, aid, o.from, o.to)
+		}
+	}
+	al, ok := r.locals[aid]
+	if !ok {
+		nl, oerr := _local_open(r, &scope, name, l.epoch, aid, path)
+		if oerr != .None {
+			return
+		}
+		al = nl
+	}
+	al.plain = true
+	al.arc_child = true
+	al.trim_for = l.id
+	al.durable = max(al.durable, journal.journal_durable_len(&j))
+	al.blocked = false
+	_local_pump(r, al)
 }
