@@ -286,11 +286,21 @@ redact_preflight :: proc(h: ^History, spans: []crdt.Op_Span) -> Error {
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	redaction_touched(h, all[:], also[:], &touched, &targets, true) or_return
 	for ino in sorted_inodes(touched) {
+		redaction_file(h, ino) or_return
+	}
+	return .None
+}
+
+@(private)
+redaction_file :: proc(h: ^History, ino: fstree.Inode_Id) -> (f: ^File_State, err: Error) {
+	if cached, ok := h.files[ino]; ok {
+		delete_key(&h.files, ino)
 		history_unload_files(h)
-		history_file(h, ino) or_return
+		h.files[ino] = cached
+		return cached, .None
 	}
 	history_unload_files(h)
-	return .None
+	return history_file(h, ino)
 }
 
 @(private)
@@ -344,8 +354,7 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 	redaction_touched(h, spans, also, &touched, targets, false) or_return
 	for ino in sorted_inodes(touched) {
 		secret := touched[ino]
-		history_unload_files(h)
-		f := history_file(h, ino) or_return
+		f := redaction_file(h, ino) or_return
 		for sp in spans {
 			crdt.text_redact(&f.text, &h.g, sp.id.actor, sp.id.seq, sp.len)
 			crdt.log_redact(&f.log, &h.g, sp.id.actor, sp.id.seq, sp.len)
