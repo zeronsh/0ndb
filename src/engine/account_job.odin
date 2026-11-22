@@ -31,6 +31,7 @@ Job_Kind :: enum u8 {
 	Grant,
 	Manifest,
 	Enroll,
+	Renew,
 }
 
 @(private)
@@ -52,6 +53,7 @@ Plug_Call :: enum u8 {
 	Register,
 	Verify,
 	Attest,
+	Renew,
 }
 
 @(private)
@@ -255,6 +257,10 @@ _job_plug :: proc(j: ^Acct_Job, call: Plug_Call) {
 			if e.cfg.runner_pool.attest != nil {
 				err = e.cfg.runner_pool.attest(e.cfg.runner_pool.data, j.evidence, j.runner, &reply, done)
 			}
+		case .Renew:
+			if e.cfg.runner_pool.renew != nil {
+				err = e.cfg.runner_pool.renew(e.cfg.runner_pool.data, j.runner, &reply, done)
+			}
 		case .None:
 			err = .None
 		}
@@ -292,7 +298,7 @@ _job_take :: proc(j: ^Acct_Job, err: osync.Error, reply: ^osync.Plug_Reply) {
 		j.pcred = _job_bytes(j, reply.credential)
 		j.pprf = reply.prf
 		j.peco = reply.ecosystem
-	case .Verify:
+	case .Verify, .Renew:
 		j.lease = reply.lease_ms
 	}
 }
@@ -402,6 +408,8 @@ _job_step :: proc(j: ^Acct_Job) {
 		_job_manifest(j)
 	case .Enroll:
 		_job_enroll(j)
+	case .Renew:
+		_job_renew(j)
 	}
 }
 
@@ -842,6 +850,29 @@ _job_enroll :: proc(j: ^Acct_Job) {
 		j.stage = 3
 	case 3:
 		en, err := _pool_enrollment(e, j.runner, j.lease, j.alloc)
+		if err != .None {
+			_job_finish(j, err)
+			return
+		}
+		j.res.enrollment = en
+		_job_finish(j, .None)
+	case:
+		_job_finish(j, .Invalid)
+	}
+}
+
+@(private)
+_job_renew :: proc(j: ^Acct_Job) {
+	switch j.stage {
+	case 0:
+		j.stage = 1
+		_job_plug(j, .Renew)
+	case 1:
+		if j.perr != .None || j.lease == 0 {
+			_job_finish(j, .Permission)
+			return
+		}
+		en, err := _pool_renewal(j.e, j.runner, j.lease, j.alloc)
 		if err != .None {
 			_job_finish(j, err)
 			return

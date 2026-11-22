@@ -133,6 +133,9 @@ pub trait RunnerPool: Send + Sync + 'static {
     fn attest(&self, _evidence: &[u8], _runner: &PublicIdentity, _cancel: &CancelToken) -> PlugResult<()> {
         Ok(())
     }
+    fn renew(&self, _runner: &PublicIdentity, _cancel: &CancelToken) -> PlugResult<u64> {
+        Err(PlugError::PERMISSION)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -518,6 +521,16 @@ fn run(p: &Plugs, body: &[u8], cancel: &CancelToken) -> PlugResult<Writer> {
             } else {
                 pool.attest(&data, &runner, cancel)?;
             }
+        }
+        15 => {
+            let pool = p.pool.as_ref().ok_or(PlugError::UNSUPPORTED)?;
+            let sign = arr32(&r.bytes()).ok_or(bad)?;
+            let box_key = arr32(&r.bytes()).ok_or(bad)?;
+            if !r.done() {
+                return Err(bad);
+            }
+            let lease = pool.renew(&PublicIdentity { sign, box_key }, cancel)?;
+            w.uvarint(lease);
         }
         10 => {
             let user = p.user.as_ref().ok_or(PlugError::UNSUPPORTED)?;

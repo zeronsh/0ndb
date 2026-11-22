@@ -325,6 +325,39 @@ op_runner_enroll :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
+op_runner_renewal_request :: proc(c: ^Call, o: ^Out) -> Status {
+	req, err := eng.runner_renewal_request(c.api.e, context.temp_allocator)
+	if err != .None {
+		return status_of(err)
+	}
+	o_bytes(o, "request", req)
+	return .Ok
+}
+
+op_pool_renew :: proc(c: ^Call, o: ^Out) -> Status {
+	if c.stage == 0 {
+		en, err := eng.pool_renew(c.api.e, a_bytes(c, "request"), virtual.arena_allocator(&c.arena), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+		c.account.enrollment = en
+	}
+	if c.err != .None {
+		return status_of(c.err)
+	}
+	o_bytes(o, "renewal", c.account.enrollment)
+	return .Ok
+}
+
+op_runner_renew :: proc(c: ^Call, o: ^Out) -> Status {
+	n, err := eng.runner_renew(c.api.e, a_bytes(c, "renewal"))
+	if err != .None {
+		return status_of(err)
+	}
+	o_u64(o, "spaces", u64(n))
+	return .Ok
+}
+
 op_lease_renew :: proc(c: ^Call, o: ^Out) -> Status {
 	o_u64(o, "renewed", u64(eng.lease_renew(c.api.e)))
 	return .Ok

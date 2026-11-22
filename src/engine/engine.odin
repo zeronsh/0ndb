@@ -139,6 +139,7 @@ Event_Kind :: enum u8 {
 	Available,
 	Promoted,
 	Peer_Misbehaving,
+	Lease_Lapsed,
 }
 
 Event :: struct {

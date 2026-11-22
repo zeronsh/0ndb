@@ -384,6 +384,8 @@ _ref_run :: proc(h: ^Ref_Host, fn: ^Plug_Fn, req: ^api.Call, o: ^api.Out) -> api
 			return .Permission
 		}
 		api.o_u64(o, "lease_ms", POOL_LEASE_MS)
+	case PLUG_POOL_RENEW:
+		api.o_u64(o, "lease_ms", POOL_LEASE_MS)
 	case PLUG_POOL_ATTEST:
 	case PLUG_USER_JOINED:
 		sp := api.a_id(req, "space")

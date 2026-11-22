@@ -117,7 +117,7 @@
  *                 16 available, 17 promoted, 18 peer_misbehaving,
  *                 19 members_changed, 20 epoch_changed, 21 access_revoked,
  *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
- *                 25 login_done, 26 login_failed
+ *                 25 login_done, 26 login_failed, 27 lease_lapsed
  *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
  *                 5 runner, 6 guest, 7 directory
  *   member_role   0 owner, 1 admin, 2 member, 3 reader
@@ -472,7 +472,7 @@ typedef struct ondb_keyring {
 
 /* Asynchronous plug calls. Every request-reply plug function (credentials
    produce, unlock, enroll, sealed store get/put/add, runner pool
-   verify/attest) receives an ondb_plug_call handle and completes it with
+   verify/attest/renew) receives an ondb_plug_call handle and completes it with
    exactly one ondb_plug_done, either before returning (a synchronous answer)
    or later from any thread. status is an ondb_status: ONDB_OK, or
    ONDB_NOT_FOUND, ONDB_CONFLICT, ONDB_PERMISSION, ONDB_UNSUPPORTED,
@@ -481,7 +481,7 @@ typedef struct ondb_keyring {
    set size = sizeof(ondb_plug_reply) and only the fields the function
    answers: record and entries (each entry a u32le length then the entry) for
    get, credential and prf for unlock, credential, prf and ecosystem for
-   enroll, lease_ms for verify, credential for produce. The optional cancel
+   enroll, lease_ms for verify and renew, credential for produce. The optional cancel
    member of each table tells the embedder that the engine no longer waits
    for that call (the user cancelled, a deadline passed, the engine closed);
    ondb_plug_done must still be called once for it, and its answer is
@@ -919,7 +919,9 @@ typedef struct ondb_sealed_store {
    synchronously (0 on success; its private key lives with the host, e.g. a
    KMS behind the keyring plug of the host's engine). verify checks a launch
    token for a runner and answers its lease_ms (ONDB_PERMISSION to refuse);
-   attest optionally checks evidence; both are asynchronous. joined tells the
+   attest optionally checks evidence; renew (may be NULL) readmits a runner
+   whose lease lapsed: answer lease_ms when the machine is still valid,
+   ONDB_PERMISSION when it is gone; all three are asynchronous. joined tells the
    host that a user device added the pool to a space (proof is the pool's
    Add record, to pass to space.join_enrollment on the host). A host-held
    directory admin uses the same keyring and the directory.* ops. */
@@ -931,6 +933,7 @@ typedef struct ondb_runner_pool {
 	void (*attest)(void *ud, const uint8_t *evidence, size_t evidence_len, const ondb_identity *runner, ondb_plug_call *call);
 	void (*joined)(void *ud, const uint8_t space[16], const char *name, size_t name_len, const char *relay, size_t relay_len, const uint8_t relay_key[32], const uint8_t *proof, size_t proof_len);
 	void (*cancel)(void *ud, ondb_plug_call *call);
+	void (*renew)(void *ud, const ondb_identity *runner, ondb_plug_call *call);
 } ondb_runner_pool;
 
 typedef struct ondb_config {
@@ -1070,6 +1073,12 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_POOL_ENROLL 29u
 /* runner.enroll(enrollment: bytes) -> spaces:uvarint */
 #define ONDB_OP_RUNNER_ENROLL 30u
+/* runner.renewal_request() -> request:bytes */
+#define ONDB_OP_RUNNER_RENEWAL_REQUEST 145u
+/* pool.renew(request: bytes) -> renewal:bytes */
+#define ONDB_OP_POOL_RENEW 146u
+/* runner.renew(renewal: bytes) -> spaces:uvarint */
+#define ONDB_OP_RUNNER_RENEW 147u
 /* lease.renew() -> renewed:uvarint */
 #define ONDB_OP_LEASE_RENEW 31u
 /* account.login_prf(subject: str, credential: bytes, prf: bytes, label: str, relay: str, relay_key: bytes) -> path:enum login_path status:enum login_status code:str spaces:uvarint */

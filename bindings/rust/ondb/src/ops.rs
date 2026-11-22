@@ -212,6 +212,18 @@ impl Client {
         self.subscribe(&json!({"op": "subscribe.catalog", "space": space}), true)
     }
 
+    pub fn runner_renewal_request(&self) -> Pending<Value> {
+        self.call(&json!({"op": "runner.renewal_request"}))
+    }
+
+    pub fn pool_renew(&self, request: &str) -> Pending<Value> {
+        self.call(&json!({"op": "pool.renew", "request": request}))
+    }
+
+    pub fn runner_renew(&self, renewal: &str) -> Pending<Value> {
+        self.call(&json!({"op": "runner.renew", "renewal": renewal}))
+    }
+
     pub fn placement(&self, object: &str) -> Pending<Placement> {
         self.call(&json!({"op": "placement", "object": object}))
     }
