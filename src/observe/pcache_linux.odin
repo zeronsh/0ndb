@@ -20,6 +20,7 @@ Pentry :: struct {
 	exec_tid:  i32,
 	args:      []u8,
 	args_ok:   bool,
+	git:       i8,
 	n:         int,
 	lineage:   [MAX_LINEAGE]prim.Pid,
 }
@@ -181,6 +182,39 @@ _pcache_drop_cwds :: proc(t: ^Tree) {
 		_sys_close(e.cwd)
 		e.cwd = -1
 	}
+}
+
+@(private)
+_pcache_git :: proc(t: ^Tree, lineage: []prim.Pid) -> bool {
+	for pid in lineage {
+		if pid == t.root {
+			continue
+		}
+		e := t.pc.procs[pid]
+		if e != nil && e.git != 0 && e.exec_tid == 0 {
+			if e.git > 0 {
+				return true
+			}
+			continue
+		}
+		pp: Proc_Path
+		buf: [32]u8
+		n, ok := _read_small(_pp_proc(&pp, i64(pid), "/comm"), buf[:])
+		if !ok {
+			continue
+		}
+		for n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == 0) {
+			n -= 1
+		}
+		is_git := string(buf[:n]) == "git"
+		if e != nil && e.exec_tid == 0 {
+			e.git = 1 if is_git else -1
+		}
+		if is_git {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)

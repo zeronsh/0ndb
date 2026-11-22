@@ -116,6 +116,8 @@ op_tree_mounts :: proc(c: ^Call, o: ^Out) -> Status {
 		o_object(o, "object", m.object)
 		o_str(o, "root", m.root)
 		o_str(o, "line", m.mount.line)
+		o_bool(o, "gated", fs.mount_gated(m.mount))
+		o_u64(o, "gate_overruns", fs.mount_gate_overruns(m.mount))
 		o_str(o, "status", "stale .git/index.lock" if fs.mount_lock_stale(m.mount) else "")
 		o_end(o)
 	}
