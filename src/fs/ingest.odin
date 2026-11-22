@@ -280,6 +280,7 @@ index_clean :: proc(e: ^Index_Entry, st: Stat, kind: Disk_Kind, index_mtime: i64
 
 @(private)
 Import_State :: struct {
+	resync:     bool,
 	m:         ^Mount,
 	b:         Builder,
 	stack:     [dynamic]Dir_Frame,
@@ -336,8 +337,15 @@ mount_import :: proc(m: ^Mount) -> Error {
 				append(&m.synced, ..line)
 			}
 		}
+	} else if !empty && m.history != nil && len(m.synced) > 0 {
+		lvs := make([dynamic]crdt.Lv, st.long)
+		if crdt.graph_version_lvs(&m.history.g, m.synced[:], &lvs) == .None {
+			st.snap = version_snapshot(m.history, lvs[:]) or_return
+			st.line = lvs[:]
+			st.resync = true
+		}
 	}
-	defer if st.adopt {
+	defer if st.adopt || st.resync {
 		fstree.snapshot_destroy(&st.snap)
 	}
 	m.hold_line = true
@@ -422,9 +430,6 @@ mount_import :: proc(m: ^Mount) -> Error {
 			}
 			continue
 		}
-		if st.adopt && import_adopt(&st, it, parent, tracked, &entry) {
-			continue
-		}
 		if st.resume {
 			have, found := shadow_get(&m.shadow, it.path) or_return
 			if found {
@@ -438,6 +443,9 @@ mount_import :: proc(m: ^Mount) -> Error {
 				}
 				continue
 			}
+		}
+		if (st.adopt || st.resync) && import_adopt(&st, it, parent, tracked, &entry) {
+			continue
 		}
 		switch it.kind {
 		case .Dir:
@@ -1151,6 +1159,16 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 }
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
+	if !m.imported && !m.importing {
+		m.importing = true
+		ierr := mount_recover(m)
+		if ierr == .None {
+			ierr = mount_import(m)
+		}
+		m.importing = false
+		ierr or_return
+		return mount_pass(m, true, false)
+	}
 	attr_begin(m)
 	defer attr_end(m)
 	long: virtual.Arena
