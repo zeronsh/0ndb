@@ -325,8 +325,12 @@ mount_import :: proc(m: ^Mount) -> Error {
 	context.temp_allocator = virtual.arena_allocator(&st.chunk)
 	empty := shadow_empty(&m.shadow) or_return
 	st.resume = !empty
-	if empty && m.history != nil {
-		if line, has := history_line(m.history, m.line, st.long) or_return; has && len(line) > 0 {
+	if (empty || m.import_retry) && m.history != nil {
+		line, has := history_line(m.history, m.line, st.long) or_return
+		if m.import_retry {
+			line, has = history_heads(m.history, st.long), true
+		}
+		if has && len(line) > 0 {
 			lvs := make([dynamic]crdt.Lv, st.long)
 			if crdt.graph_version_lvs(&m.history.g, line, &lvs) == .None {
 				st.snap = version_snapshot(m.history, lvs[:]) or_return
@@ -483,6 +487,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 		mount_commit(m, {message = "0ndb: first mount"}) or_return
 	}
 	m.imported = true
+	m.import_retry = false
 	if st.adopt {
 		if line, has := history_line(m.history, m.line, context.temp_allocator) or_return; has {
 			clear(&m.synced)

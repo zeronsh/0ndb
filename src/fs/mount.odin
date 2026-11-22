@@ -315,6 +315,7 @@ Mount :: struct {
 	unwatched:   [dynamic]string,
 	attrs:       ^Attr_Ctx,
 	collided:    [dynamic]string,
+	import_retry: bool,
 	absent:      [dynamic]string,
 	link_mode:   Link_Mode,
 	gitlinks:    []Gitlink,
@@ -484,6 +485,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 			return err
 		}
 		m.rescan = true
+		m.import_retry = !m.imported
 		mount_schedule(m, 0)
 	}
 	ok = true
@@ -1004,7 +1006,13 @@ mount_run :: proc(m: ^Mount) -> Error {
 			fence = true
 		}
 	}
-	err := mount_pass(m, false, !fence)
+	err: Error
+	if m.import_retry {
+		err = mount_import(m)
+	}
+	if err == .None {
+		err = mount_pass(m, false, !fence)
+	}
 	if err == .None {
 		err = mount_materialize(m)
 	}
