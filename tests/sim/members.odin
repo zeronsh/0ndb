@@ -1334,6 +1334,52 @@ _upload_wait_case :: proc(w: ^World, sid: prim.Id) {
 }
 
 @(private = "file")
+_send_wait :: proc(w: ^World, idx: int, o: eng.Object, text: string) -> (r: eng.Rid, ok: bool) {
+	n := w.nodes[idx]
+	if !n.alive {
+		return {}, false
+	}
+	p := new(Window_Probe, w.allocator)
+	done := eng.Done {
+		data = p,
+		call = proc(data: rawptr, e: ^eng.Engine, res: ^eng.Result, err: eng.Error) {
+			q := (^Window_Probe)(data)
+			q.fired += 1
+			q.err = err
+			q.rid = res.item
+		},
+	}
+	context = instance_context(&n.inst)
+	rid, err := eng.convo_send(&n.e, o, text, done = done)
+	node_after(n)
+	if err == .None {
+		free(p, w.allocator)
+		return rid, true
+	}
+	if err != .Pending {
+		world_note(w, "send_wait: n%d send returned %v", idx, err)
+		free(p, w.allocator)
+		return {}, false
+	}
+	for _ in 0 ..< 300 {
+		if p.fired > 0 {
+			break
+		}
+		_settle(w, 100)
+	}
+	if p.fired == 0 {
+		world_note(w, "send_wait: n%d send never completed", idx)
+		return {}, false
+	}
+	if p.err != .None {
+		world_note(w, "send_wait: n%d send failed: %v", idx, p.err)
+	}
+	r, ok = p.rid, p.err == .None
+	free(p, w.allocator)
+	return
+}
+
+@(private = "file")
 _guest_credentials :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool) {
 	p := (^Mem_Plug)(data)
 	mw := p.mw
@@ -1417,6 +1463,22 @@ _grant_case :: proc(w: ^World, mw: ^Mem_World) {
 	}
 	if !_guest_reads(w, o1, r1, "one-0", 20_000) {
 		_fail(w, "grant: the guest cannot read the first shared conversation")
+		return
+	}
+	if !_wait_read(w, M_B, o1, r1, "one-0", 20_000) {
+		_fail(w, "grant: n1 never saw the shared conversation")
+		return
+	}
+	_down(w, M_A)
+	rb, bok := _send_wait(w, M_B, o1, "from-another-member")
+	read := bok && _guest_reads(w, o1, rb, "from-another-member", 20_000)
+	a = _up(w, M_A)
+	if !bok {
+		_fail(w, "grant: n1 could not write the shared conversation")
+		return
+	}
+	if !read {
+		_fail(w, "grant: with the sharer offline, the guest cannot read a member who first wrote the shared conversation after the share (writer card never reached the guest)")
 		return
 	}
 	if !_grant_share(w, mw, sid, o2) {
