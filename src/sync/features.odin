@@ -487,6 +487,7 @@ _quarantine :: proc(r: ^Replicator, rm: ^Remote, at: i64) {
 	clear(&rm.wants)
 	clear(&rm.inflight)
 	rm.tail = 0
+	rm.pushed = false
 	if _following(rm) && r.phase == .Ready {
 		ids := [1]Stream_Id{rm.id}
 		client_unfollow(&r.client, ids[:])

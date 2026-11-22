@@ -299,6 +299,8 @@ _segments_seen :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 					}
 				}
 				replicator_follow(r, &g.scope, dev, g.name, g.epoch, g.full)
+				rm.live = g.live
+				_push_follow(r, rm)
 			}
 			_emit(r, Repl_Event{kind = .Segment_Seen, device = dev, name = g.name, epoch = g.epoch, stream = id, length = length})
 		}

@@ -226,6 +226,8 @@ Remote :: struct {
 	refused:   [dynamic]Device_Id,
 	carry:     [dynamic]u8,
 	carry_at:  i64,
+	live:      bool,
+	pushed:    bool,
 }
 
 Group :: struct {
@@ -234,6 +236,7 @@ Group :: struct {
 	epoch:   u64,
 	suffix:  [16]u8,
 	full:    bool,
+	live:    bool,
 	members: [dynamic]Device_Id,
 }
 
@@ -255,6 +258,9 @@ Replicator :: struct {
 	read_reqs:  int,
 	read_bytes: i64,
 	fetched_bytes: u64,
+	ahead_n:    u64,
+	ahead_id:   Stream_Id,
+	ahead_to:   i64,
 	tamper_run: int,
 	phase:      Phase,
 	cred_gen:   u64,
@@ -654,6 +660,14 @@ replicator_unfollow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, na
 		return
 	}
 	rm.follow = false
+	rm.live = false
+	if rm.pushed {
+		rm.pushed = false
+		if r.phase == .Ready && (r.cfg.filtered || rm.kfollow) {
+			ids := [1]Stream_Id{id}
+			client_unfollow(&r.client, ids[:])
+		}
+	}
 	if rm.kfollow {
 		_remote_maybe_free(r, rm)
 		return
@@ -2264,6 +2278,10 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 		}
 		if rm := r.rx_remote; rm != nil {
 			if rm.id == id && ev.at == r.rx_at {
+				if ev.length > rm.relay_len {
+					rm.relay_len = ev.length
+					journal.replica_set_length(&rm.rep, ev.length)
+				}
 				return
 			}
 			if len(r.stage) > 0 && !rm.quarantined && len(r.stage) <= STAGE_MAX {
@@ -2330,6 +2348,10 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	}
 	rm := r.rx_remote
 	if rm == nil {
+		return
+	}
+	if !ev.final && rm.pushed {
+		_pushed_landed(r, rm, ev.length)
 		return
 	}
 	_stage_flush(r, ev.final, ev.length)
@@ -2647,6 +2669,7 @@ _repl_on_ready :: proc(r: ^Replicator) {
 	for id in ids {
 		if rm, ok := r.remotes[id]; ok && _following(rm) {
 			_remote_follow_send(r, rm)
+			_push_follow(r, rm)
 		}
 	}
 	for id in ids {
@@ -2722,6 +2745,7 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		rm.probing = false
 		rm.retry_hold = false
 		rm.denied = false
+		rm.pushed = false
 	}
 	clear(&r.serves)
 	clear(&r.parked)

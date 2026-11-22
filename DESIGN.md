@@ -2661,6 +2661,18 @@ Relay cost tracks the reachable information, not the activity. Items marked
   empty `Data` announcing the length. A follower may therefore hold bytes past
   the relay's durable length. A crash loses them only on the relay, and the
   writer's resend brings back identical bytes (relay-protocol.md 7.1.1).
+- **Device follows**: a device's replicator follows a remote segment on the
+  relay (`Follow` at the end) only while an open handle wants it. The
+  engine's handle open and close set this through
+  `replicator_live_segments`. The follow ends when the handle closes, so an
+  idle device holds no follows. Pushed Data lands up to its last whole record
+  through the same staging, record checks and `_verdict` as a read, and is
+  then announced as `Grew`. The later feed entry finds nothing missing, so no
+  `Read` follows. Bytes past the announced length stay in the replica, and a
+  resend after a relay crash rewrites only what is missing. The sim's
+  `early_push_crash` crashes the relay whenever a device holds pushed bytes
+  that the relay has not yet committed. It then checks that every replica
+  matches the relay's durable stream byte for byte.
 - **Relay writes** are host-chosen and never protocol-visible: an append is
   acknowledged once durable in the host's durable buffer (group-committed
   local files for the reference relay, Durable Object storage for a DO host).
