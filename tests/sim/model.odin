@@ -290,7 +290,11 @@ model_node_crashed :: proc(m: ^Model, n: ^Node, mode: Crash_Mode) {
 		case .Issued, .Done:
 			op.status = .Uncertain
 			op.power_crash = mode == .Power
-		case .Acked, .Observed, .Uncertain, .Lost, .Failed:
+		case .Uncertain:
+			if op.inc == n.incarnation && mode == .Power {
+				op.power_crash = true
+			}
+		case .Acked, .Observed, .Lost, .Failed:
 		}
 	}
 }
