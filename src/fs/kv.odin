@@ -30,6 +30,7 @@ Kv :: struct {
 	log_end:   u64,
 	covered:   u64,
 	marked:    bool,
+	clean_disk: bool,
 	pending:   map[string]Kv_Pending,
 	order:     [dynamic]string,
 	groups:    [dynamic]Kv_Group,
@@ -190,6 +191,11 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 	want := kv_cap_for(kv.used + u64(len(kv.order)) + 1)
 	if want > kv.cap {
 		kv_rebuild(kv, want) or_return
+	}
+	if kv.clean_disk {
+		kv_write_header(kv, false)
+		from_prim(prim.datasync(kv.vfs, kv.idx_fd)) or_return
+		kv.clean_disk = false
 	}
 	clear(&kv.out)
 	start := kv.log_end
@@ -780,7 +786,7 @@ kv_open_gen :: proc(kv: ^Kv) -> Error {
 		kv.idx_fd = ifd
 		if clean, valid := kv_load_header(kv); valid {
 			if clean && kv.covered == kv.log_end {
-				kv_write_header(kv, false)
+				kv.clean_disk = true
 				return .None
 			}
 			return kv_recover(kv)
@@ -1015,6 +1021,7 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 	kv.covered = kv.log_end
 	kv_write_header(kv, false)
 	from_prim(prim.rename(kv.vfs, tmp_path, idx_path)) or_return
+	kv.clean_disk = false
 	ok = true
 	if saved.idx_fd >= 0 {
 		prim.close_file(kv.vfs, saved.idx_fd)

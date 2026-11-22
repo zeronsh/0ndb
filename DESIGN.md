@@ -596,6 +596,10 @@ concurrent typing is never lost or reverted.
   - `.children` slots: before the first slot write after a sync the header is
     rewritten as dirty and synced; a clean header means the slots reflect
     exactly `covered`, a dirty one is rebuilt at open.
+  - fs kv index: the same rule. After an open that trusts a clean header, the
+    header is rewritten dirty and synced before the first slot write, so a
+    clean header on disk never sits over slots that name log records a crash
+    dropped.
   - fs history: the state kv is written only after what it reflects is
     durable. Each persist seals its writes into a group under the history's
     current mark (a new mark once the engine has taken the previous one for
