@@ -145,6 +145,25 @@ _tree_remote_urls :: proc(e: ^Engine, space: prim.Id, object: prim.Id, allocator
 }
 
 @(private)
+_tree_remote_key :: proc(space, object: prim.Id) -> (k: [33]u8) {
+	a, b := space, object
+	copy(k[:16], a[:])
+	copy(k[16:32], b[:])
+	k[32] = 'r'
+	return
+}
+
+@(private)
+_tree_remote_stored :: proc(e: ^Engine, space, object: prim.Id) -> string {
+	k := _tree_remote_key(space, object)
+	v, found, err := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator)
+	if err != .None || !found {
+		return ""
+	}
+	return string(v)
+}
+
+@(private)
 _tree_remote_note :: proc(e: ^Engine, sp: ^Space, object: prim.Id, urls: string) {
 	cur := _tree_remote_urls(e, sp.id, object)
 	joined := strings.join(cur, "\n", context.temp_allocator)
