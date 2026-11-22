@@ -828,6 +828,11 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 	stale := attributed && !a.used && a.actor != scope.actor
 	pending, dirty := m.dirty[rel]
 	other := dirty && pending != scope
+	owned := attributed && !a.used && a.actor == scope.actor
+	if !stale && !dirty && !owned && m.open_scopes[rel] != scope && mount_disk_unseen(m, rel) {
+		other = true
+		pending = nil
+	}
 	if stale || other {
 		if o := m.open_scopes[rel]; o != nil && o != scope {
 			m.open_scopes[rel] = nil
@@ -852,6 +857,19 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 	}
 	attrib_set(m, rel, scope.actor)
 	return attrib_log_append(m, rel, scope.actor)
+}
+
+@(private)
+mount_disk_unseen :: proc(m: ^Mount, rel: string) -> bool {
+	e, found, serr := shadow_get(&m.shadow, rel)
+	if serr != .None {
+		return false
+	}
+	if found {
+		return !disk_matches(m, rel, e)
+	}
+	d, perr := probe(m, rel)
+	return perr == .None && d.kind != .Missing
 }
 
 @(private)
