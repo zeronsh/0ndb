@@ -304,6 +304,7 @@ Engine :: struct {
 	tick:         u64,
 	tick_timer:   prim.Timer,
 	settle_timer: prim.Timer,
+	settling:     bool,
 	in_tick:      bool,
 	closing:      bool,
 	dirty:        [dynamic]Dirty_Seg,
@@ -814,12 +815,14 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 		return
 	}
 
+	e.settling = true
 	_redact_settle(e)
 	_mounts_settle(e)
 	_full_settle(e)
 	_index_settle(e)
 	_checkpoints_write(e)
 	_handles_sweep(e, 0)
+	e.settling = false
 	_spaces_settle(e)
 	_trees_release(e)
 	_durable_begin(e)
