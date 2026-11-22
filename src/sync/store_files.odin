@@ -1076,6 +1076,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 		if job.result == .None && job.ns != nil {
 			_usage_add(fs, cast(^_Fns)job.ns, -value)
 		}
+	case .Object_Put:
 	}
 	done := job.done
 	ctx := job.ctx

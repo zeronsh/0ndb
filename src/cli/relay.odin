@@ -45,6 +45,11 @@ _slow_put :: proc(data: rawptr, key: string, bytes: []u8, done: osync.Storage_Do
 	so.inner.put(so.inner.data, key, bytes, done, ctx)
 }
 
+_slow_drain :: proc(data: rawptr) {
+	so := (^Slow_Objects)(data)
+	so.inner.drain(so.inner.data)
+}
+
 _slow_read :: proc(data: rawptr, req: ^osync.Object_Read) {
 	so := (^Slow_Objects)(data)
 	q := new(Slow_Read)
@@ -148,11 +153,13 @@ cmd_relay :: proc(a: ^Args) -> int {
 		if prim.mkdir_all(prim.os_vfs(), odir, 0o700) != .None {
 			return report_error(.Io, "cannot create %s", odir)
 		}
-		m.objects = osync.Dir_Object_Store{vfs = prim.os_vfs(), root = strings.clone(odir)}
+		if oerr := osync.dir_object_store_init(&m.objects, &m.loop, prim.os_vfs(), odir); oerr != .None {
+			return report_error(.Io, "cannot open the object store in %s (%v)", odir, oerr)
+		}
 		cfg.objects = osync.dir_object_store(&m.objects)
 		when OBJECTS_DELAY_MS > 0 || OBJECTS_BLOCK_MS > 0 {
 			m.slow = Slow_Objects{inner = cfg.objects, loop = &m.loop}
-			cfg.objects = osync.Object_Store{data = &m.slow, put = _slow_put, read = _slow_read}
+			cfg.objects = osync.Object_Store{data = &m.slow, put = _slow_put, read = _slow_read, drain = _slow_drain}
 		}
 		if v, vok := flag_value(a, "flush-ms"); vok {
 			n, nok := strconv.parse_i64(v)
@@ -240,6 +247,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	osync.member_authorizer_destroy(&m.ma)
 	osync.allow_destroy(&m.al)
 	signals_close(&m.sig)
+	osync.dir_object_store_destroy(&m.objects)
 	prim.loop_destroy(&m.loop)
 	fmt.printfln("relay stopped (%d appends, %s in, %s out, %d object-store writes, %s)", st.appends, bytes_human(i64(st.bytes_in)), bytes_human(i64(st.bytes_out)), m.objects.puts, bytes_human(i64(m.objects.bytes)))
 	if m.objects.gets > 0 {

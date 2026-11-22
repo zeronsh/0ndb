@@ -532,11 +532,12 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	store := osync.file_store(&rn.fs)
 	if err == .None && rn.packed && w.cfg.seed % 4 == 0 {
 		prim.mkdir_all(vfs, RELAY_DIR + "/objects", 0o700)
-		rn.objs = osync.Dir_Object_Store{vfs = vfs, root = RELAY_DIR + "/objects"}
 		rn.slow = Sim_Objects{inner = osync.dir_object_store(&rn.objs), loop = &rn.inst.loop, slow_ms = 200, fail = 5}
 		rng_init(&rn.slow.rng, w.cfg.seed, 991 + u64(w.stats.relay_crash))
 		tc := osync.Tier_Config{objects = sim_objects(&rn.slow), window_ms = 500, max_ms = 5000, hot = 4096}
-		if terr := osync.tier_store_init(&rn.ts, &rn.inst.loop, store, tc, node_clock(&rn.clock)); terr != .None {
+		if oerr := osync.dir_object_store_init(&rn.objs, &rn.inst.loop, vfs, RELAY_DIR + "/objects", 0); oerr != .None {
+			err = oerr
+		} else if terr := osync.tier_store_init(&rn.ts, &rn.inst.loop, store, tc, node_clock(&rn.clock)); terr != .None {
 			err = terr
 		} else {
 			rn.tiered = true
@@ -646,6 +647,9 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	stat_add(rn.w, STAT_TIER_THAWS, rn.ts.thaws)
 	stat_add(rn.w, STAT_TIER_SLOW_READS, rn.slow.reads)
 	stat_add(rn.w, STAT_TIER_FAILED_READS, rn.slow.failed)
+	sim_objects_cut(&rn.slow)
+	stat_add(rn.w, STAT_TIER_PUTS, rn.slow.puts)
+	stat_add(rn.w, STAT_TIER_PUTS_CUT, rn.slow.cut)
 	rn.ts = {}
 	rn.objs = {}
 	rn.slow = {}
@@ -762,6 +766,8 @@ STAT_TIER_COLD_READS: Stat
 STAT_TIER_THAWS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
+STAT_TIER_PUTS: Stat
+STAT_TIER_PUTS_CUT: Stat
 STAT_PERSIST_FAULTS: Stat
 
 _persist_fail :: proc(data: rawptr) -> bool {
@@ -786,6 +792,7 @@ _node_stats :: proc "contextless" () {
 		res.stats.extra[int(STAT_TIER_THAWS)] += w.relay.ts.thaws
 		res.stats.extra[int(STAT_TIER_SLOW_READS)] += w.relay.slow.reads
 		res.stats.extra[int(STAT_TIER_FAILED_READS)] += w.relay.slow.failed
+		res.stats.extra[int(STAT_TIER_PUTS)] += w.relay.slow.puts
 	})
 	register_stat_line(40)
 	register_stat_line(45)
@@ -795,4 +802,6 @@ _node_stats :: proc "contextless" () {
 	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
 	STAT_TIER_SLOW_READS = register_stat(40, 3, "object_reads")
 	STAT_TIER_FAILED_READS = register_stat(40, 4, "object_read_faults")
+	STAT_TIER_PUTS = register_stat(40, 5, "object_puts")
+	STAT_TIER_PUTS_CUT = register_stat(40, 6, "object_puts_cut")
 }

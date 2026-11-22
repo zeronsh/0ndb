@@ -14,6 +14,7 @@ Job_Kind :: enum u8 {
 	Trim,
 	Evict,
 	Restore,
+	Object_Put,
 }
 
 Job :: struct {
@@ -45,6 +46,7 @@ Job :: struct {
 Worker :: struct {
 	mutex:     csync.Mutex,
 	cond:      csync.Cond,
+	finished:  csync.Cond,
 	queue:     ^Job,
 	tail:      ^Job,
 	done:      ^Job,
@@ -136,6 +138,24 @@ worker_submit :: proc(w: ^Worker, job: ^Job) -> Error {
 				thread.destroy(t)
 			}
 		} else if len(w.threads) == 0 {
+			csync.mutex_lock(&w.mutex)
+			prev: ^Job
+			for x := w.queue; x != nil; x = x.next {
+				if x == job {
+					if prev == nil {
+						w.queue = x.next
+					} else {
+						prev.next = x.next
+					}
+					if w.tail == job {
+						w.tail = prev
+					}
+					break
+				}
+				prev = x
+			}
+			w.inflight -= 1
+			csync.mutex_unlock(&w.mutex)
 			return .No_Memory
 		}
 	}
@@ -166,6 +186,7 @@ _worker_main :: proc(data: rawptr) {
 		csync.mutex_lock(&w.mutex)
 		job.next = w.done
 		w.done = job
+		csync.cond_broadcast(&w.finished)
 		csync.mutex_unlock(&w.mutex)
 		_notifier_signal(&w.notifier)
 	}
@@ -300,6 +321,11 @@ _job_run :: proc(job: ^Job) {
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
 		}
+	case .Object_Put:
+		job.result = _from_prim(prim.mkdir_all(job.vfs, prim.dir_name(path), 0o700))
+		if job.result == .None {
+			job.result = _from_prim(prim.replace_atomic(job.vfs, path, job.data))
+		}
 	case .Remove:
 		job.result = _from_prim(prim.remove(job.vfs, path))
 		if job.result == .Not_Found {
@@ -308,6 +334,20 @@ _job_run :: proc(job: ^Job) {
 		if job.result == .None {
 			job.result = _from_prim(prim.sync_dir(job.vfs, prim.dir_name(path)))
 		}
+	}
+}
+
+worker_drain :: proc(w: ^Worker) {
+	assert(w.group.end_async == nil, "a worker whose group commits complete asynchronously cannot be drained")
+	for w.inflight > 0 {
+		if len(w.inline_q) == 0 {
+			csync.mutex_lock(&w.mutex)
+			for w.done == nil {
+				csync.cond_wait(&w.finished, &w.mutex)
+			}
+			csync.mutex_unlock(&w.mutex)
+		}
+		_worker_ready(w.loop, prim.INVALID_FD, {}, w)
 	}
 }
 

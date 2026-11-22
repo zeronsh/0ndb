@@ -1735,9 +1735,16 @@ device cert = Ed25519(account, "0ndb device cert\0" ‖ device sign)
 A member hello carries the records that admit it (the genesis for a founder;
 the `Add` that enrolled it), so a joiner never races its approver's upload. A
 proof is ingested only if it is the space's genesis or its author is an
-active member. The authorizer keeps, per space, the record set (a derived
-file of records under the relay dir, reconciled against the members streams
-in relay storage when the space is loaded) and the resolved roster. Every
+active member. The authorizer keeps, per space, the record set and the
+resolved roster. The members streams in relay storage are the durable
+source: a space is loaded by ingesting every stream in its namespace with
+the members suffix, and a file of records under the relay dir is only a
+cache, appended without fsync and verified record by record on load. A
+record lost with that file is either in a members stream whose append was
+acknowledged (the authorizer observes an append only once it is durable,
+so a `Remove` it acted on survives a crash) or still carried as a hello
+proof by the device it admits, which appends that proof to its own members
+stream as it joins and presents it until then. Every
 access (`List`, `Read`, `Append` own streams, `Redact`, `Put`, `Get`,
 `Fill`, presence, follow, direct messages) checks the roster live, so a
 removed or expired principal is refused at its next request. When an append
@@ -2553,10 +2560,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   thread, and the group's acknowledgements go out when that commit completes
   through the loop's wake. The loop keeps serving reads and other spaces
   meanwhile, the next group stages behind the commit in flight, and the pack
-  never runs two commits at once. On a disk with 20 to 40 ms fsyncs, other
-  clients' p99 during a device's cold sync fell from 181 ms to 56 ms (the rest
-  is the member authorizer's roster fsync and the local object store's
-  atomic writes, both still on the loop)
+  never runs two commits at once. The local object store (`--objects`) is
+  asynchronous like an R2 PUT: a put copies its bytes, writes them atomically
+  on its own worker thread and completes back on the loop, and the relay
+  drains outstanding puts before it closes the tier. The member authorizer's
+  record file is a cache written without fsync (see Relay authorizer). On a
+  disk with 20 to 40 ms fsyncs, other clients' p99 during a device's cold
+  sync fell from 181 ms to 56 ms with the off-loop commit and to under 1 ms
+  with both of these,
   and any object-store flush is coalesced per space and asynchronous. With
   `--objects` the reference relay's tiered store writes one batch object per
   space once the space has been quiet for `--flush-ms` (default 30000), its
