@@ -42,6 +42,7 @@ Repl_Event_Kind :: enum u8 {
 	Promoted,
 	Draft,
 	Draft_Pulled,
+	Listed,
 }
 
 Repl_Event :: struct {
@@ -274,6 +275,7 @@ Replicator :: struct {
 	fetches:    [dynamic]^Ckpt_Fetch,
 	list_sent:  u64,
 	list_done:  u64,
+	list_report: u64,
 	hold:       int,
 	reap:       [dynamic]^Remote,
 	reap_local: [dynamic]^Local,
@@ -492,6 +494,20 @@ replicator_account :: proc(r: ^Replicator) -> Error {
 	_enter(r)
 	defer _leave(r)
 	client_account(&r.client) or_return
+	_repl_flush(r)
+	return .None
+}
+
+replicator_list :: proc(r: ^Replicator) -> Error {
+	if r.phase != .Ready {
+		return .Busy
+	}
+	_enter(r)
+	defer _leave(r)
+	if !_list_send(r, 0) {
+		return .No_Memory
+	}
+	r.list_report = r.list_sent
 	_repl_flush(r)
 	return .None
 }
@@ -2057,14 +2073,21 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_repl_on_ready(r)
 		_lives_resend(r)
 	case .Listing:
+		report := r.list_report != 0 && r.list_report == r.list_done + 1
 		for i in 0 ..< listing_count(ev) {
 			l := listing_entry(ev, i)
 			_seen_stream(r, l.stream, l.length)
+			if report {
+				_emit(r, Repl_Event{kind = .Listed, device = stream_device(l.stream), stream = l.stream, length = l.length})
+			}
 		}
 		if !ev.more {
 			r.cursor = ev.cursor
 			r.listed = true
 			_lists_finished(r, .None)
+			if report {
+				r.list_report = 0
+			}
 			_caught_check(r)
 		}
 	case .Appended, .Conflict:

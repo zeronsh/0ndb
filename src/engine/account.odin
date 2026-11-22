@@ -297,6 +297,7 @@ _account_adopt_begin :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Re
 @(private)
 _account_adopt_end :: proc(e: ^Engine, path: Login_Path, spaces: int) {
 	_account_adopt_local(e)
+	e.notices.tried = false
 	if spaces == 0 {
 		_emit(e, Event{kind = .Login_Done, length = i64(path)})
 	}
@@ -635,6 +636,7 @@ device_remove :: proc(e: ^Engine, device: prim.Id) -> (removed: int, err: Error)
 			removed += 1
 		}
 	}
+	_notices_device_removed(e, device)
 	if removed == 0 {
 		return 0, .Not_Found
 	}
