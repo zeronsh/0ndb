@@ -147,6 +147,7 @@ Local :: struct {
 	blocked:   bool,
 	retry:     bool,
 	verifying: bool,
+	beyond:    bool,
 	verify_at: i64,
 	verify_to: i64,
 	ahead:     i64,
@@ -1150,7 +1151,7 @@ _local_conflict :: proc(r: ^Replicator, l: ^Local, relay_len: i64) {
 	case relay_len == l.cursor:
 		_local_retry(r, l)
 	case relay_len > l.durable:
-		_local_fatal(r, l, .Conflict, relay_len)
+		_local_beyond(r, l, relay_len)
 	case:
 		l.ahead = relay_len
 		_local_verify_next(r, l)
@@ -1180,10 +1181,6 @@ _local_verify_next :: proc(r: ^Replicator, l: ^Local) {
 	span := l.ahead - l.cursor
 	want := min(span, UPLOAD_CHUNK)
 	first := i64(prim.get_u32le(head[:])) + journal.OVERHEAD
-	if first > span {
-		_local_fatal(r, l, .Conflict, l.ahead)
-		return
-	}
 	want = max(want, first)
 	buf, aerr := make([]u8, int(want), context.temp_allocator)
 	if aerr != nil {
@@ -1201,6 +1198,7 @@ _local_verify_next :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	l.verifying = true
+	l.beyond = false
 	l.verify_at = l.cursor
 	l.verify_to = l.cursor + i64(k)
 	clear(&l.verify)
@@ -1208,17 +1206,59 @@ _local_verify_next :: proc(r: ^Replicator, l: ^Local) {
 }
 
 @(private)
+_local_beyond :: proc(r: ^Replicator, l: ^Local, relay_len: i64) {
+	l.ahead = 0
+	l.verifying = true
+	l.beyond = true
+	l.verify_at = l.durable
+	l.verify_to = min(relay_len, l.durable + UPLOAD_CHUNK)
+	clear(&l.verify)
+	client_read(&r.client, l.id, l.verify_at, l.verify_to)
+}
+
+@(private)
+_local_tampered :: proc(r: ^Replicator, l: ^Local) {
+	clear(&l.verify)
+	l.verifying = false
+	l.beyond = false
+	r.tamper_run += 1
+	r.tampered = true
+	_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, from = l.verify_at, to = l.verify_to})
+}
+
+@(private)
+_local_beyond_done :: proc(r: ^Replicator, l: ^Local) {
+	k := journal.record_bounds(l.verify[:])
+	if k == 0 || !_own_writes(l, l.verify[:k], l.verify_at) {
+		_local_tampered(r, l)
+		return
+	}
+	clear(&l.verify)
+	l.beyond = false
+	_local_fatal(r, l, .Conflict, l.verify_at + i64(k))
+}
+
+@(private)
 _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 	l.verifying = false
 	if l.superseded {
 		clear(&l.verify)
+		l.beyond = false
 		_local_maybe_free(r, l)
 		return
 	}
+	if l.beyond {
+		_local_beyond_done(r, l)
+		return
+	}
 	n := l.verify_to - l.verify_at
-	if i64(len(l.verify)) != n || _tree_missing(l) {
+	if _tree_missing(l) {
 		_local_retry(r, l)
 		clear(&l.verify)
+		return
+	}
+	if i64(len(l.verify)) != n {
+		_local_tampered(r, l)
 		return
 	}
 	mine, aerr := make([]u8, int(n), context.temp_allocator)
@@ -1236,13 +1276,12 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 		local = _wire_form(l, mine, l.verify_at)
 	}
 	if local != .None || !_records_match(mine, l.verify[:], l.verify_at, &redacted) {
-		relay := _own_writes(l, l.verify[:], l.verify_at)
+		if !_own_writes(l, l.verify[:], l.verify_at) {
+			_local_tampered(r, l)
+			return
+		}
 		clear(&l.verify)
 		switch {
-		case !relay:
-			r.tamper_run += 1
-			r.tampered = true
-			_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, from = l.verify_at, to = l.verify_to})
 		case local == .Corrupt:
 			_local_fatal(r, l, .Corrupt, l.verify_to)
 		case local != .None:
@@ -2358,6 +2397,10 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 			l.inflight = 0
 		}
 		rv.name, rv.epoch, rv.device = l.name, l.epoch, r.cfg.self
+		if l.verifying && l.beyond {
+			_local_tampered(r, l)
+			return
+		}
 		#partial switch ev.code {
 		case .Not_Owner:
 			_local_fatal(r, l, .Permission, -1)
@@ -2470,6 +2513,7 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		l.inflight = 0
 		l.noting = false
 		l.verifying = false
+		l.beyond = false
 		l.ahead = 0
 		clear(&l.verify)
 	}
