@@ -34,6 +34,7 @@ Phys :: struct {
 Inode :: struct {
 	kind:   Kind,
 	stale:  bool,
+	sized:  bool,
 	mode:   u32,
 	mtime:  i64,
 	size:   i64,
@@ -48,7 +49,7 @@ _inode_encode :: proc(ino: ^Inode, out: ^[dynamic]u8) -> bool {
 	clear(out)
 	w := prim.writer(out)
 	prim.write_u8(&w, u8(ino.kind))
-	prim.write_u8(&w, 1 if ino.stale else 0)
+	prim.write_u8(&w, (1 if ino.stale else 0) | (2 if ino.sized && ino.kind == .External else 0))
 	prim.write_uvarint(&w, u64(ino.mode))
 	prim.write_uvarint(&w, u64(max(ino.mtime, 0)))
 	#partial switch ino.kind {
@@ -65,6 +66,10 @@ _inode_encode :: proc(ino: ^Inode, out: ^[dynamic]u8) -> bool {
 		}
 	case .Symlink:
 		prim.write_bytes(&w, ino.target[:ino.tlen])
+	case .External:
+		if ino.sized {
+			prim.write_uvarint(&w, u64(ino.size))
+		}
 	}
 	return w.err == .None
 }
@@ -74,10 +79,11 @@ _inode_decode :: proc(b: []u8, ino: ^Inode) -> bool {
 	r := prim.reader(b)
 	ino.kind = Kind(prim.read_u8(&r))
 	flags := prim.read_u8(&r)
-	if flags > 1 {
+	if flags > 3 {
 		return false
 	}
-	ino.stale = flags == 1
+	ino.stale = flags & 1 != 0
+	ino.sized = flags & 2 != 0
 	mode := prim.read_uvarint(&r)
 	mtime := prim.read_uvarint(&r)
 	if r.err != .None || mode > u64(max(u32)) || mtime > u64(max(i64)) {
@@ -119,8 +125,19 @@ _inode_decode :: proc(b: []u8, ino: ^Inode) -> bool {
 			return false
 		}
 		ino.tlen = copy(ino.target[:], t)
-	case .Dir, .External:
+	case .External:
+		if ino.sized {
+			size := prim.read_uvarint(&r)
+			if r.err != .None || size > u64(max(i64)) {
+				return false
+			}
+			ino.size = i64(size)
+		}
+	case .Dir:
 	case .None:
+		return false
+	}
+	if ino.sized && ino.kind != .External {
 		return false
 	}
 	return prim.reader_done(&r)

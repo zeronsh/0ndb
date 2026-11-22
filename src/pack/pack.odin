@@ -98,6 +98,7 @@ Open_Inode :: struct {
 	unlinked: bool,
 	dirty:    bool,
 	pinned:   int,
+	ext_base: i64,
 }
 
 @(private)
@@ -107,6 +108,7 @@ Handle :: struct {
 	dir:   bool,
 	oi:    ^Open_Inode,
 	inum:  u64,
+	stage: ^Stage,
 }
 
 @(private)

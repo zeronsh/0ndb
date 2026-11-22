@@ -581,6 +581,15 @@ concurrent typing is never lost or reverted.
   commit job that runs at a scheduled later time. Compaction rewrites cold
   containers so each stream's extents stay contiguous, keeping page reads to
   one or two preads.
+- A staged handle (`pack.stage`) gives one writer commit scoping: its writes
+  stay out of the log until that handle's own sync, which applies them inside
+  the current batch, so no other commit can make them durable; closing it
+  unsynced discards them. A small file promoted through a staged handle
+  becomes a sized external file: the inode records the size of the last
+  staged sync (written after the file's fsync, in the same commit), staged
+  bytes past it go straight to the file, and the first open after a crash
+  truncates the file back to that size. Only staged syncs and truncation
+  change the recorded size.
 - The unit of durability is the batch, not the tick: settle commits a batch
   of its own under the tick of the one before it. Every enqueued batch takes
   the next batch sequence; a command's result carries (as `tick`) the
@@ -2047,9 +2056,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   group commit, not per append; the feed is folded when it exceeds twice its
   last folded size (64 KiB floor); and the relay's pack rolls its active
   container when half of it is garbage, so compaction reclaims it promptly.
-  (planned) Pack-backed relay streams need no length slots once the pack
-  buffers appends until their own commit, so a partial append can never
-  become durable through another space's commit.
+  Pack-backed relay streams write appended and filled content through a
+  staged pack handle, so a partial append can never become durable through
+  another space's commit, and keep no length slot: a stream's length is its
+  size. Only based (hollow or filled) and trimmed streams keep slots, for
+  `base` and the trim flag. Measured on 2769 appends of 1.6 KB: across 40
+  small streams the relay writes 14.23 MB instead of 14.48 MB (89 B less per
+  append); into one promoted stream 5.57 MB instead of 5.61 MB (the 45-byte
+  slot per append becomes a committed-size inode record).
 - **Relay writes** are host-chosen and never protocol-visible: an append is
   acknowledged once durable in the host's durable buffer (group-committed
   local files for the reference relay, Durable Object storage for a DO host)

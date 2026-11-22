@@ -244,6 +244,7 @@ _relay_own_storage :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config) -> (stor
 		store_vfs = pack.vfs(pk)
 		threads = 0
 		lay = LAYOUT_COMPACT
+		lay.exact = true
 	}
 	group: Group_Commit
 	if r.own_pack != nil {
@@ -261,6 +262,7 @@ _relay_own_storage :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config) -> (stor
 	r.own_store = fs
 	if r.own_pack != nil {
 		fs.resolver = _pack_resolver(r.own_pack)
+		fs.pack = r.own_pack
 	}
 	return file_store(fs), .None
 }

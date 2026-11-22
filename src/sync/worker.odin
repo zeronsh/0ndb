@@ -31,6 +31,7 @@ Job :: struct {
 	to:      i64,
 	lay:     Layout,
 	trimmed: bool,
+	slot:    bool,
 	target:  rawptr,
 	ns:      rawptr,
 	done:    Storage_Done,
@@ -250,7 +251,9 @@ _job_run :: proc(job: ^Job) {
 			job.result = _from_prim(prim.sync_dir(job.vfs, prim.dir_name(final)))
 		}
 	case .Redact:
-		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value, base = job.base, trimmed = job.trimmed}, job.lay.spacing)
+		if job.slot {
+			job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value, base = job.base, trimmed = job.trimmed}, job.lay.spacing)
+		}
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
 		}
