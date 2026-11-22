@@ -493,6 +493,15 @@ equal in both directions.
   moving `synced`; the pass then materializes `synced` united with that
   batch, which rewrites the file with both the agent's edit and everything
   concurrent, and the CRDT reports overlapping edits as conflict regions.
+  A pin names the inode it read, and the edits go to that inode whatever
+  the path holds when the write is ingested. If the inode was removed after
+  the pin (and perhaps a new file created at the path), the edits are
+  concurrent with the remove and the remove wins, as it does over any
+  concurrent edit whichever reaches a device first: the edits stay in
+  history on the removed inode, credited to the actor, and the path is
+  materialized to the merged version (absent, or the new file), so bytes
+  the agent only carried over from its base are never recreated under its
+  name. A pinned inode that is live at another path is not used.
   Without a pin, or when the hash differs, ingestion is as above, and the
   mount reports each outcome (merged, current, mismatch, not text) to the
   registry's base hook. Each pin also appends a durable observation to the
