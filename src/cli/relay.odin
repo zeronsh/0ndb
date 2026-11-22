@@ -21,11 +21,8 @@ Relay_Main :: struct {
 	objects:  osync.Dir_Object_Store,
 	sig:      Signals,
 	stopping: bool,
-	settle:   prim.Timer,
-	settling: bool,
+	active:   bool,
 }
-
-RELAY_SETTLE_MS :: 2000
 
 cmd_relay :: proc(a: ^Args) -> int {
 	home := home_dir(context.temp_allocator)
@@ -162,23 +159,16 @@ cmd_relay :: proc(a: ^Args) -> int {
 		fmt.printfln("object store %s · one write per space per %d ms or %d MiB", m.objects.root, cfg.flush_ms if cfg.flush_ms > 0 else osync.TIER_WINDOW_DEFAULT, (cfg.flush_bytes if cfg.flush_bytes > 0 else osync.TIER_BYTES_DEFAULT) >> 20)
 	}
 	os.flush(os.stdout)
+	m.active = true
 	for !m.stopping {
+		if m.active && prim.loop_idle(&m.loop) && osync.relay_quiet(&m.relay) {
+			m.active = false
+			idle_release()
+		}
 		if prim.loop_step(&m.loop, true) != .None {
 			break
 		}
-		if m.settling {
-			m.settling = false
-			continue
-		}
-		if m.settle != 0 {
-			prim.timer_cancel(&m.loop, m.settle)
-		}
-		m.settle = prim.timer(&m.loop, RELAY_SETTLE_MS, m, proc(l: ^prim.Loop, data: rawptr) {
-			x := (^Relay_Main)(data)
-			x.settle = 0
-			x.settling = true
-			idle_release()
-		})
+		m.active = true
 	}
 	st := osync.relay_stats(&m.relay)
 	osync.relay_destroy(&m.relay)

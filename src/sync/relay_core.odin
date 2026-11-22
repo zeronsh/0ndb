@@ -395,6 +395,21 @@ relay_core_stats :: proc "contextless" (r: ^Relay_Core) -> Relay_Stats {
 	return s
 }
 
+relay_core_quiet :: proc "contextless" (r: ^Relay_Core) -> bool {
+	if len(r.yielded) > 0 {
+		return false
+	}
+	for c in r.conns {
+		if c == nil || c.dead {
+			continue
+		}
+		if c.op.kind != .None || c.inflight > 0 || c.out_head < len(c.out) || c.listing != nil || !parser_idle(&c.parser) {
+			return false
+		}
+	}
+	return true
+}
+
 relay_core_space_stats :: proc(r: ^Relay_Core, space: Space_Id) -> (st: Relay_Space_Stats, ok: bool) {
 	if sp, loaded := r.spaces[space]; loaded {
 		st = sp.count

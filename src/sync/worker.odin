@@ -52,6 +52,7 @@ Worker :: struct {
 	on_done:   proc(data: rawptr, job: ^Job),
 	data:      rawptr,
 	inline_q:  [dynamic]^Job,
+	inflight:  int,
 	group:     Group_Commit,
 	before:    proc(data: rawptr),
 	allocator: runtime.Allocator,
@@ -102,6 +103,7 @@ worker_submit :: proc(w: ^Worker, job: ^Job) -> Error {
 		if _, e := append(&w.inline_q, job); e != nil {
 			return .No_Memory
 		}
+		w.inflight += 1
 		if len(w.inline_q) == 1 {
 			_notifier_signal(&w.notifier)
 		}
@@ -114,6 +116,7 @@ worker_submit :: proc(w: ^Worker, job: ^Job) -> Error {
 		w.tail.next = job
 	}
 	w.tail = job
+	w.inflight += 1
 	spawn := w.idle == 0 && len(w.threads) < w.limit
 	csync.cond_signal(&w.cond)
 	csync.mutex_unlock(&w.mutex)
@@ -186,6 +189,7 @@ _worker_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: raw
 			}
 		}
 		for j in jobs {
+			w.inflight -= 1
 			w.on_done(w.data, j)
 		}
 		delete(jobs)
@@ -204,6 +208,7 @@ _worker_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: raw
 	for rev != nil {
 		nxt := rev.next
 		rev.next = nil
+		w.inflight -= 1
 		w.on_done(w.data, rev)
 		rev = nxt
 	}
@@ -262,6 +267,10 @@ _job_run :: proc(job: ^Job) {
 			job.result = _from_prim(prim.sync_dir(job.vfs, prim.dir_name(path)))
 		}
 	}
+}
+
+worker_busy :: proc "contextless" (w: ^Worker) -> bool {
+	return w.inflight > 0
 }
 
 Group_Commit :: struct {

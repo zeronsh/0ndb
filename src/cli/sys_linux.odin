@@ -93,7 +93,7 @@ foreign libc {
 
 idle_release :: proc() {
 	malloc_trim(0)
-	fd, oerr := linux.open("/proc/self/maps", {})
+	fd, oerr := linux.open("/proc/self/smaps", {})
 	if oerr != .NONE {
 		return
 	}
@@ -110,27 +110,30 @@ idle_release :: proc() {
 		}
 		append(&buf, ..chunk[:n])
 	}
-	advice := linux.MAdvice.PAGEOUT
+	lo, hi: u64
 	text := string(buf[:])
 	for line in strings.split_lines_iterator(&text) {
+		if strings.has_prefix(line, "Anonymous:") {
+			if hi > lo && strings.trim_space(line[len("Anonymous:"):]) == "0 kB" {
+				linux.madvise(rawptr(uintptr(lo)), uint(hi - lo), .DONTNEED)
+			}
+			lo, hi = 0, 0
+			continue
+		}
 		sp := strings.index_byte(line, ' ')
 		dash := strings.index_byte(line, '-')
-		slash := strings.index_byte(line, '/')
-		if dash <= 0 || sp <= dash || slash < 0 || len(line) < sp + 5 {
+		if dash <= 0 || sp <= dash || len(line) < sp + 5 || line[sp - 1] == ':' {
 			continue
 		}
+		lo, hi = 0, 0
 		perms := line[sp + 1:sp + 5]
-		if perms[1] == 'w' || (perms[0] != 'r' && perms[2] != 'x') {
+		if (perms != "r-xp" && perms != "r--p") || strings.index_byte(line, '/') < 0 {
 			continue
 		}
-		lo, lok := strconv.parse_u64_of_base(line[:dash], 16)
-		hi, hok := strconv.parse_u64_of_base(line[dash + 1:sp], 16)
-		if !lok || !hok || hi <= lo {
-			continue
-		}
-		if linux.madvise(rawptr(uintptr(lo)), uint(hi - lo), advice) == .EINVAL && advice == .PAGEOUT {
-			advice = .COLD
-			linux.madvise(rawptr(uintptr(lo)), uint(hi - lo), advice)
+		a, aok := strconv.parse_u64_of_base(line[:dash], 16)
+		b, bok := strconv.parse_u64_of_base(line[dash + 1:sp], 16)
+		if aok && bok {
+			lo, hi = a, b
 		}
 	}
 }
