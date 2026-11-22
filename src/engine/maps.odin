@@ -163,6 +163,9 @@ map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit:
 catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (c: Catalog_Entry, found: bool, err: Error) {
 	context = context_for(e)
 	sp := _space_open(e, o.space) or_return
+	if ready.call != nil && _space_settling(e, sp) {
+		return c, false, _space_wait(e, sp, ready, nil)
+	}
 	if !e.in_tick {
 		_catalog_flush(e)
 	}
@@ -181,6 +184,9 @@ catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready
 catalog_list :: proc(e: ^Engine, space: prim.Id, archived: bool, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Catalog_Row, more: bool, err: Error) {
 	context = context_for(e)
 	sp := _space_open(e, space) or_return
+	if ready.call != nil && _space_settling(e, sp) {
+		return nil, false, _space_wait(e, sp, ready, nil)
+	}
 	if !e.in_tick {
 		_catalog_flush(e)
 	}
