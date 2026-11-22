@@ -130,6 +130,10 @@ History :: struct {
 	seals:      u64,
 	mark_taken: u64,
 	held:       [dynamic]Kv_Group,
+	group_lvs:  [dynamic][2]u64,
+	durable_lv: u64,
+	lv_known:   bool,
+	lv_epoch:   u64,
 	markers:    [dynamic]Git_Marker,
 	views:      [dynamic]^Text_View,
 	scan:       Scan_Cache,
@@ -413,6 +417,7 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 	} else {
 		h.settled = h.durable
 	}
+	history_lvs_durable(h)
 	err: Error
 	for m in h.mounts {
 		if e := mount_ack(m); e != .None && err == .None {
@@ -449,11 +454,24 @@ history_commit_groups :: proc(h: ^History) -> (committed: bool, err: Error) {
 	return true, err
 }
 
+@(private)
+history_lvs_durable :: proc(h: ^History) {
+	n := 0
+	for n < len(h.group_lvs) && h.group_lvs[n][0] <= h.settled {
+		h.durable_lv = h.group_lvs[n][1]
+		h.lv_known = true
+		n += 1
+	}
+	remove_range(&h.group_lvs, 0, n)
+}
+
 history_close :: proc(h: ^History) {
 	history_sleep(h)
 	kv_groups_free(&h.kv, &h.held, h.allocator)
 	delete(h.own_next)
 	h.own_next = nil
+	delete(h.group_lvs)
+	h.group_lvs = nil
 	delete(h.mounts)
 	h.mounts = nil
 	for v in h.views {
@@ -532,6 +550,8 @@ history_wake :: proc(h: ^History) -> Error {
 				return .Corrupt
 			}
 			kv_groups_free(&h.kv, &h.held, h.allocator)
+			clear(&h.group_lvs)
+			h.lv_known = false
 			history_wipe(h) or_return
 			h.rebuilding = true
 			defer h.rebuilding = false
@@ -545,6 +565,11 @@ history_wake :: proc(h: ^History) -> Error {
 		history_sleep(h)
 		return err
 	}
+	if !h.lv_known {
+		h.durable_lv = u64(h.g.next)
+		h.lv_known = true
+	}
+	h.lv_epoch = history_epoch(h)
 	h.mark_fp = history_fp(h)
 	return .None
 }
@@ -619,7 +644,39 @@ history_kv_commit :: proc(h: ^History) -> Error {
 	}
 	kv_seal(&h.kv, h.mark)
 	h.seals += 1
+	if n := len(h.group_lvs); n > 0 && h.group_lvs[n - 1][0] == h.mark {
+		h.group_lvs[n - 1][1] = u64(h.g.next)
+	} else {
+		if h.group_lvs == nil {
+			h.group_lvs = make([dynamic][2]u64, h.allocator)
+		}
+		append(&h.group_lvs, [2]u64{h.mark, u64(h.g.next)})
+	}
 	return .None
+}
+
+history_durable_lv :: proc "contextless" (h: ^History) -> (lv: u64, epoch: u64, known: bool) {
+	return h.durable_lv, h.lv_epoch, h.lv_known
+}
+
+history_committed_lv :: proc(vfs: prim.Vfs, dir: string, allocator := context.allocator) -> (lv: u64, err: Error) {
+	if !prim.exists(vfs, dir) {
+		return 0, .None
+	}
+	kv: Kv
+	kv_open(&kv, vfs, dir, "state", allocator) or_return
+	defer kv_close(&kv)
+	meta, found := kv_get(&kv, transmute([]u8)string("g"), context.temp_allocator) or_return
+	if !found {
+		return 0, .None
+	}
+	tg: crdt.Graph
+	if crdt.graph_open(&tg, meta, {}, allocator) != .None {
+		return 0, .Corrupt
+	}
+	lv = u64(tg.next)
+	crdt.graph_destroy(&tg)
+	return lv, .None
 }
 
 @(private)

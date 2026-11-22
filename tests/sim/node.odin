@@ -699,6 +699,15 @@ STAT_TIER_FAILED_READS: Stat
 
 @(init)
 _node_stats :: proc "contextless" () {
+	register_final_check(130, proc(w: ^World) {
+		for n in w.nodes {
+			if n.alive && n.e_open {
+				context = instance_context(&n.inst)
+				check_derived(n, "quiesce")
+				node_after(n)
+			}
+		}
+	})
 	register_restarted(10, proc(w: ^World, n: ^Node) {
 		check_sent(n)
 	})

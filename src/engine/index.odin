@@ -10,6 +10,7 @@ import "../fs"
 import "../fstree"
 import "../journal"
 import omap "../map"
+import "../pack"
 import "../obj"
 import "../prim"
 import "../search"
@@ -160,8 +161,100 @@ _ix_busy :: proc(e: ^Engine, err: search.Error) -> bool {
 }
 
 @(private)
+SEARCH_KEY_DESC :: u8(0xf9)
+
+@(private)
+Source_Desc :: struct {
+	space:  prim.Id,
+	object: prim.Id,
+	device: prim.Id,
+	kind:   Kind,
+	lv:     bool,
+	epoch:  u64,
+}
+
+@(private)
+_source_note :: proc(e: ^Engine, src: prim.Id, d: Source_Desc) {
+	k: [17]u8
+	k[0] = SEARCH_KEY_DESC
+	s := src
+	copy(k[1:], s[:])
+	if _, found, err := omap.db_get(&e.reg.db, ROOT_SEARCH, k[:], context.temp_allocator); err != .None || found {
+		return
+	}
+	v: [58]u8
+	a, b, c := d.space, d.object, d.device
+	copy(v[0:16], a[:])
+	copy(v[16:32], b[:])
+	copy(v[32:48], c[:])
+	v[48] = u8(d.kind)
+	v[49] = 1 if d.lv else 0
+	prim.put_u64le(v[50:58], d.epoch)
+	_reg_put(e, ROOT_SEARCH, k[:], v[:])
+}
+
+@(private)
+_source_desc :: proc(e: ^Engine, src: prim.Id) -> (d: Source_Desc, ok: bool) {
+	k: [17]u8
+	k[0] = SEARCH_KEY_DESC
+	s := src
+	copy(k[1:], s[:])
+	v, found, err := omap.db_get(&e.reg.db, ROOT_SEARCH, k[:], context.temp_allocator)
+	if err != .None || !found || len(v) != 58 || v[48] < 1 || v[48] > u8(max(Kind)) {
+		return
+	}
+	copy(d.space[:], v[0:16])
+	copy(d.object[:], v[16:32])
+	copy(d.device[:], v[32:48])
+	d.kind = Kind(v[48])
+	d.lv = v[49] == 1
+	d.epoch = prim.get_u64le(v[50:58])
+	return d, true
+}
+
+@(private)
+_source_durable :: proc(e: ^Engine, src: prim.Id) -> i64 {
+	d, ok := _source_desc(e, src)
+	if !ok {
+		return 0
+	}
+	if d.lv {
+		if h, hok := e.handles[d.object]; hok && h.hist != nil {
+			if lv, epoch, known := fs.history_durable_lv(h.hist); known {
+				return i64(lv) if epoch == d.epoch else max(i64)
+			}
+		}
+		dir, derr := _obj_dir(e, d.object)
+		if derr != .None {
+			return 0
+		}
+		hdir, jerr := _join(context.temp_allocator, dir, "hist")
+		if jerr != .None {
+			return 0
+		}
+		lv, lerr := fs.history_committed_lv(e.vfs, hdir, e.allocator)
+		if lerr != .None {
+			return 0
+		}
+		return i64(lv)
+	}
+	if d.device != e.self {
+		return max(i64)
+	}
+	path, perr := _own_stream_path(e, d.object, d.kind)
+	if perr != .None {
+		return 0
+	}
+	n, err := pack.durable_size(&e.pk, path)
+	if err != .None {
+		return 0
+	}
+	return n
+}
+
+@(private)
 _index_durable :: proc(data: rawptr, source: prim.Id) -> i64 {
-	return max(i64)
+	return _source_durable((^Engine)(data), source)
 }
 
 @(private)
@@ -472,6 +565,9 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 	if perr != .None {
 		return
 	}
+	if pos == 0 {
+		_source_note(e, src, Source_Desc{space = h.sp.id, object = h.id, device = device, kind = h.kind})
+	}
 	end := journal.reader_end(r)
 	tail_ok := false
 	t: convo.Tail
@@ -632,6 +728,9 @@ _index_text :: proc(e: ^Engine, h: ^Handle) {
 		return
 	}
 	src := _source_id(h.id, e.self)
+	if p, _ := search.position(&e.index, src); p == 0 {
+		_source_note(e, src, Source_Desc{space = h.sp.id, object = h.id, device = e.self, kind = h.kind})
+	}
 	slot := transmute([]u8)string("text")
 	doc := search.Doc {
 		object      = h.id,
@@ -652,10 +751,14 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 	if h.hist == nil || !h.hist.awake {
 		return 0, false
 	}
-	src := _source_id(h.id, _tree_lv_source(fs.history_epoch(h.hist)))
+	epoch := fs.history_epoch(h.hist)
+	src := _source_id(h.id, _tree_lv_source(epoch))
 	pos, perr := search.position(&e.index, src)
 	if perr != .None {
 		return 0, false
+	}
+	if pos == 0 {
+		_source_note(e, src, Source_Desc{space = h.sp.id, object = h.id, device = TREE_LV_SOURCE, kind = h.kind, lv = true, epoch = epoch})
 	}
 	end := fs.history_lv_end(h.hist)
 	if i64(end) <= pos {
