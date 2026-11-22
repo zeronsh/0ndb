@@ -107,24 +107,37 @@ _content_tree :: proc(scope: ^osync.Scope, t: ^osync.Key_Tree) -> Error {
 }
 
 @(private)
-_content_mark_get :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> i64 {
-	k := _pending_key(sp.id, id)
+_content_marks :: proc(e: ^Engine, space: prim.Id, id: prim.Id) -> (mark: i64, target: i64) {
+	k := _pending_key(space, id)
 	v, found, err := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator)
 	if err != .None || !found || len(v) != 9 && len(v) != 17 {
-		return 0
+		return 0, 0
 	}
-	return i64(prim.get_u64le(v[1:]))
+	mark = i64(prim.get_u64le(v[1:]))
+	target = mark
+	if len(v) == 17 {
+		target = max(mark, i64(prim.get_u64le(v[9:])))
+	}
+	return mark, target
+}
+
+@(private)
+_content_mark_get :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> i64 {
+	mark, _ := _content_marks(e, sp.id, id)
+	return mark
 }
 
 @(private)
 _content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, mark: i64, target: i64 = -1) {
+	_, stored := _content_marks(e, space, id)
+	want := max(target, stored)
 	k := _pending_key(space, id)
 	buf: [17]u8
 	buf[0] = u8(kind)
 	prim.put_u64le(buf[1:], u64(mark))
 	v := buf[:9]
-	if target > mark {
-		prim.put_u64le(buf[9:], u64(target))
+	if want > mark {
+		prim.put_u64le(buf[9:], u64(want))
 		v = buf[:]
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
@@ -139,15 +152,39 @@ _content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, m
 }
 
 @(private)
+_content_durable :: proc(e: ^Engine, space: prim.Id, id: prim.Id, length: i64) {
+	mark, target := _content_marks(e, space, id)
+	if length > target {
+		_content_mark_put(e, space, id, .File_Tree, mark, length)
+	}
+	sp, ok := e.spaces[space]
+	if ok && sp.repl_on {
+		_content_kick(e, sp, id)
+	}
+}
+
+@(private)
+_content_kick :: proc(e: ^Engine, sp: ^Space, id: prim.Id) {
+	h, err := _handle_get(e, Object{sp.id, id}, .File_Tree)
+	if err != .None {
+		return
+	}
+	if _hist_ready(e, h) != .None || _handle_create_writer(h) != .None {
+		return
+	}
+	_content_publish(e, h)
+}
+
+@(private)
 _content_publish :: proc(e: ^Engine, h: ^Handle) {
 	if h.kind != .File_Tree || !h.sp.repl_on || h.hist == nil || !h.hist.awake || !h.w_open {
 		return
 	}
-	end := _own_len(h)
 	if m, busy := e.content.marks[h.id]; busy && m.pending > 0 {
 		return
 	}
-	from := _content_mark_get(e, h.sp, h.id)
+	from, end := _content_marks(e, h.sp.id, h.id)
+	end = min(end, _own_len(h))
 	if from >= end {
 		return
 	}
@@ -256,14 +293,7 @@ _content_resume :: proc(e: ^Engine, sp: ^Space) {
 	s := sp.id
 	omap.db_scan(&e.reg.db, ROOT_OWNED, s[:], s[:], &acc, visit)
 	for id in acc.ids {
-		h, err := _handle_get(e, Object{sp.id, id}, .File_Tree)
-		if err != .None {
-			continue
-		}
-		if _hist_ready(e, h) != .None || _handle_create_writer(h) != .None {
-			continue
-		}
-		_content_publish(e, h)
+		_content_kick(e, sp, id)
 	}
 }
 
@@ -448,10 +478,18 @@ _content_uploaded :: proc(e: ^Engine, up: Content_Up, stored: bool) {
 	if m.pending > 0 {
 		return
 	}
-	if !m.failed {
-		_content_mark_put(e, m.space, up.object, .File_Tree, m.target)
-	}
+	space, target := m.space, m.target
+	failed := m.failed
 	delete_key(&e.content.marks, up.object)
+	if failed {
+		return
+	}
+	_content_mark_put(e, space, up.object, .File_Tree, target)
+	if _, stored := _content_marks(e, space, up.object); stored > target {
+		if sp, found := e.spaces[space]; found && sp.repl_on {
+			_content_kick(e, sp, up.object)
+		}
+	}
 }
 
 @(private)

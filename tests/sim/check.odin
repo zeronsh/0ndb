@@ -1502,3 +1502,20 @@ pair_resolver :: proc(w: ^World, oi: int, p: Pair) -> ^M_Op {
 	}
 	return nil
 }
+
+check_uploaded :: proc(w: ^World) {
+	for n in w.nodes {
+		if !n.alive {
+			continue
+		}
+		context = instance_context(&n.inst)
+		notes, err := eng.verify_uploaded(&n.e, context.temp_allocator)
+		if err != .None {
+			world_fail(w, "uploaded: %s verify failed: %v", n.name, err)
+		}
+		for x in notes {
+			world_fail(w, "%s %s", n.name, x)
+		}
+		node_after(n)
+	}
+}

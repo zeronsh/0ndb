@@ -165,9 +165,13 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 				append(notes, fmt.tprintf("registry: content mark %d/%d of %v %s is past its own stream's %d bytes", mark, target, kind, prim.id_hex(id), n))
 			}
 			if fixes != nil {
-				v := make([]u8, 9, context.temp_allocator)
+				m2, t2 := min(mark, n), min(target, n)
+				v := make([]u8, 17 if t2 > m2 else 9, context.temp_allocator)
 				v[0] = f.value[0]
-				prim.put_u64le(v[1:], u64(min(mark, n)))
+				prim.put_u64le(v[1:], u64(m2))
+				if t2 > m2 {
+					prim.put_u64le(v[9:], u64(t2))
+				}
 				append(fixes, Reg_Fix{root = ROOT_OWNED, key = f.key, klen = 32, value = v})
 			}
 		} else if f.key[32] == 'p' && len(f.value) == 8 {
