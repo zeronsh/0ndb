@@ -308,6 +308,7 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 		delete_key(&e.reg.sstaged, id)
 	}
 	_registry_drop_space(e, id, objs) or_return
+	_oerr(omap.db_compact(&e.reg.db)) or_return
 	delete_key(&e.spaces, id)
 	_space_free(e, sp)
 	_waiters_fail_space(e, id, .Permission)

@@ -7,6 +7,7 @@ import "core:strconv"
 import "core:sync"
 import "core:testing"
 import "../../src/convo"
+import omap "../../src/map"
 import eng "../../src/engine"
 import "../../src/prim"
 import osync "../../src/sync"
@@ -1476,7 +1477,7 @@ _leave :: proc(w: ^World, idx: int, space: prim.Id, only_device: bool) -> (eng.L
 }
 
 @(private = "file")
-_leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret: string, on_disk: bool, what: string, idle: bool) {
+_leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret: string, on_disk: bool, what: string, idle: bool, key_row: []u8 = nil) {
 	gone := false
 	for _ in 0 ..< 200 {
 		if has, left := _has_space(w, idx, space); !has && left {
@@ -1502,6 +1503,11 @@ _leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret:
 	}
 	if p, found := disk_contains(&w.nodes[idx].disk, transmute([]u8)secret); on_disk && found {
 		_fail(w, "%s: %s still on n%d disk after leaving, in %s", what, secret, idx, p)
+	}
+	if len(key_row) > 0 {
+		if p, found := disk_contains(&w.nodes[idx].disk, key_row); found {
+			_fail(w, "%s: n%d's own key tree for the conversation is still on its disk after leaving, in %s", what, idx, p)
+		}
 	}
 	_down(w, idx)
 	_up(w, idx)
@@ -1576,13 +1582,26 @@ _leave_case :: proc(w: ^World) {
 	if _, lerr := _leave(w, M_A, sid, false); lerr != .Permission {
 		_fail(w, "leave: the last owner's person left without transferring ownership: %v", lerr)
 	}
+	if _, xok := _send(w, M_X, o, "leave-member-wrote"); !xok {
+		_fail(w, "leave: n%d cannot write before leaving", M_X)
+		return
+	}
+	_settle(w, 3000)
+	x_row := _own_key_row(w, M_X, o.id)
+	if len(x_row) == 0 {
+		_fail(w, "leave: n%d has no own key tree row for the conversation it wrote to", M_X)
+		return
+	}
+	if _, found := disk_contains(&x.disk, x_row); !found {
+		_fail(w, "leave: n%d's own key tree row is not visible on its disk before leaving (the check would be vacuous)", M_X)
+	}
 	_, x_disk := disk_contains(&x.disk, transmute([]u8)secret)
 	res, lerr := _leave(w, M_X, sid, false)
 	if lerr != .None || res.removed != 1 {
 		_fail(w, "leave: n%d leave %v removed=%d", M_X, lerr, res.removed)
 		return
 	}
-	_leaver_gone(w, M_X, sid, o, secret, x_disk, "member-leave", false)
+	_leaver_gone(w, M_X, sid, o, secret, x_disk, "member-leave", false, x_row)
 	_, d_disk := disk_contains(&w.nodes[M_D].disk, transmute([]u8)secret)
 	res, lerr = _leave(w, M_D, sid, true)
 	if lerr != .None || res.removed != 1 {
@@ -1591,4 +1610,25 @@ _leave_case :: proc(w: ^World) {
 	}
 	_leaver_gone(w, M_D, sid, o, secret, d_disk, "device-leave", true)
 	_converged(w, sid, {M_A, M_C}, "after leave")
+}
+
+@(private = "file")
+_own_key_row :: proc(w: ^World, idx: int, object: prim.Id) -> []u8 {
+	n := w.nodes[idx]
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	db: omap.Db
+	if omap.db_open(&db, eng.vfs(&n.e), fmt.tprintf("%s/registry", n.e.pack_root), context.temp_allocator) != .None {
+		return nil
+	}
+	defer omap.db_close(&db)
+	key: [17]u8
+	o := object
+	copy(key[:16], o[:])
+	key[16] = 'k'
+	v, found, err := omap.db_get(&db, 0, key[:], w.allocator)
+	if err != .None || !found {
+		return nil
+	}
+	return v
 }
