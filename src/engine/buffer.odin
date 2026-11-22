@@ -132,6 +132,9 @@ Buffer :: struct {
 	mine:       [dynamic][2]Anchor,
 	mine_dirty: bool,
 	mine_seq:   u64,
+	ovl:        [dynamic]^Ovl,
+	oc:         [dynamic]crdt.Delta_Op,
+	held:       [dynamic]Ready,
 }
 
 editor_actor :: proc(e: ^Engine, line := "") -> (id: prim.Id) {
@@ -167,6 +170,9 @@ _to_bytes :: proc(b: ^Buffer, u: int) -> int {
 	if b.units == .Bytes {
 		return u
 	}
+	if _ovl_on(b) {
+		return _disp_byte_at(b, u)
+	}
 	return crdt.text_byte_at(&b.view.text, u)
 }
 
@@ -175,11 +181,17 @@ _to_units :: proc(b: ^Buffer, pos: int) -> int {
 	if b.units == .Bytes {
 		return pos
 	}
+	if _ovl_on(b) {
+		return _disp_units_at(b, pos)
+	}
 	return crdt.text_units_at(&b.view.text, pos)
 }
 
 @(private)
 _length :: proc(b: ^Buffer) -> int {
+	if _ovl_on(b) {
+		return _disp_len(b) if b.units == .Bytes else _disp_units(b)
+	}
 	if b.units == .Bytes {
 		return crdt.text_len(&b.view.text)
 	}
@@ -302,6 +314,7 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 	b.id = Buffer_Id(e.next_buffer)
 	h.pins += 1
 	append(&e.buffers, b)
+	_buffer_live_follow(e, h, true)
 	info.id = b.id
 	info.length = _length(b)
 	info.actor = b.actor
@@ -333,12 +346,34 @@ buffer_close :: proc(e: ^Engine, id: Buffer_Id) {
 		if b.mine_seq > 0 {
 			_cursors_publish(e, b, h, nil)
 		}
+		others := false
+		for x in e.buffers {
+			if x.object.id == h.id {
+				others = true
+				break
+			}
+		}
+		if !others {
+			_buffer_live_follow(e, h, false)
+		}
 	}
 	_buffer_free(e, b)
 }
 
 @(private)
 _buffer_free :: proc(e: ^Engine, b: ^Buffer) {
+	for o in b.ovl {
+		_ovl_free(e, o)
+	}
+	delete(b.ovl)
+	_ops_release(e, &b.oc)
+	for r in b.held {
+		if r.call != nil {
+			context = _outer(e)
+			r.call(r.data, e, .Closed)
+		}
+	}
+	delete(b.held)
 	if b.view != nil && b.hist != nil {
 		fs.history_view_close(b.hist, b.view)
 	}
@@ -524,6 +559,10 @@ _buffer_view_ready :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 		if aerr := fs.history_view_advance(h.hist, b.view, b.version[:], _sink(&st)); aerr != .None {
 			return _buffer_unavailable(e, b, h)
 		}
+		if _ovl_on(b) {
+			_ovl_advanced(e, b, _regions_bytes(crdt.delta_regions(&st.db, context.temp_allocator))[:])
+			return .None
+		}
 		if st.db.steps > 0 {
 			b.dirty = true
 			return _buffer_emit(e, b, &st)
@@ -542,6 +581,7 @@ _buffer_advance :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	}
 	_buffer_follow(e, h)
 	_hist_catch_up(e, h)
+	_buffer_live_follow(e, h, true)
 	target := _buffer_target(b, h) or_return
 	st: Sink_State
 	crdt.delta_builder_init(&st.db, context.temp_allocator)
@@ -550,6 +590,10 @@ _buffer_advance :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	}
 	clear(&b.version)
 	append(&b.version, ..target)
+	if _ovl_on(b) {
+		_ovl_advanced(e, b, _regions_bytes(crdt.delta_regions(&st.db, context.temp_allocator))[:])
+		return .None
+	}
 	if st.db.steps == 0 {
 		return .None
 	}
@@ -636,6 +680,7 @@ _buffers_tick :: proc(e: ^Engine) {
 			_cursors_publish(e, b, h, b.mine[:])
 		}
 	}
+	_buffers_wake(e)
 }
 
 buffer_kick :: proc(e: ^Engine, id: Buffer_Id) {
@@ -715,7 +760,11 @@ buffer_read :: proc(e: ^Engine, id: Buffer_Id, rev: u64, from: int, n: int, allo
 	lo := _to_bytes(b, at)
 	hi := _to_bytes(b, end)
 	r.text = make([]u8, hi - lo, allocator)
-	crdt.text_read(&b.view.text, lo, r.text)
+	if _ovl_on(b) {
+		_disp_read(b, lo, r.text)
+	} else {
+		crdt.text_read(&b.view.text, lo, r.text)
+	}
 	r.rev = b.rev
 	r.ack = b.recv
 	r.from = at
@@ -823,9 +872,13 @@ _commit_runs :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, x: ^Built, seq0: u64) -
 	if b.kind == .File_Tree {
 		line = b.line
 	}
-	if _, cerr := fs.history_commit_local(hist, &batch, line); cerr != .None {
+	ff := _log_frontier(b)
+	flen := crdt.text_len(&b.view.text)
+	off, cerr := fs.history_commit_local(hist, &batch, line)
+	if cerr != .None {
 		return {}, _ferr(cerr)
 	}
+	_buffer_live_send(e, b, h, &batch, off, ff, flen)
 	if b.kind == .File_Tree {
 		_mounts_wake(e, h.id)
 	}
@@ -863,7 +916,7 @@ _group_keep :: proc(e: ^Engine, stack: ^[dynamic]Undo_Group, g: ^Undo_Group, id:
 	append(stack, ng)
 }
 
-buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, group: u64 = 0) -> (ack: u64, applied: u64, err: Error) {
+buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, group: u64 = 0, ready: Ready = {}) -> (ack: u64, applied: u64, err: Error) {
 	context = context_for(e)
 	b := _buffer_find(e, id)
 	if b == nil {
@@ -876,6 +929,9 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	_buffer_writer(e, b, h) or_return
 	if _buffer_find(e, id) != b {
 		return 0, 0, .Closed
+	}
+	if _ovl_on(b) || len(b.held) > 0 {
+		_buffer_hold(e, b, ready) or_return
 	}
 	scratch := virtual.arena_temp_begin(&e.temp)
 	defer virtual.arena_temp_end(scratch)
@@ -1040,7 +1096,7 @@ _own_insert :: proc(g: ^Undo_Group, actor: prim.Id, seq: u64, end: u64) -> (own:
 }
 
 @(private)
-_undo_step :: proc(e: ^Engine, id: Buffer_Id, redo: bool) -> (done: bool, err: Error) {
+_undo_step :: proc(e: ^Engine, id: Buffer_Id, redo: bool, ready: Ready = {}) -> (done: bool, err: Error) {
 	context = context_for(e)
 	b := _buffer_find(e, id)
 	if b == nil {
@@ -1058,6 +1114,9 @@ _undo_step :: proc(e: ^Engine, id: Buffer_Id, redo: bool) -> (done: bool, err: E
 	if _buffer_find(e, id) != b || len(from) == 0 {
 		return false, .Closed
 	}
+	if _ovl_on(b) || len(b.held) > 0 {
+		_buffer_hold(e, b, ready) or_return
+	}
 	scratch := virtual.arena_temp_begin(&e.temp)
 	defer virtual.arena_temp_end(scratch)
 	g := pop(from)
@@ -1071,12 +1130,12 @@ _undo_step :: proc(e: ^Engine, id: Buffer_Id, redo: bool) -> (done: bool, err: E
 	return true, .None
 }
 
-buffer_undo :: proc(e: ^Engine, id: Buffer_Id) -> (done: bool, err: Error) {
-	return _undo_step(e, id, false)
+buffer_undo :: proc(e: ^Engine, id: Buffer_Id, ready: Ready = {}) -> (done: bool, err: Error) {
+	return _undo_step(e, id, false, ready)
 }
 
-buffer_redo :: proc(e: ^Engine, id: Buffer_Id) -> (done: bool, err: Error) {
-	return _undo_step(e, id, true)
+buffer_redo :: proc(e: ^Engine, id: Buffer_Id, ready: Ready = {}) -> (done: bool, err: Error) {
+	return _undo_step(e, id, true, ready)
 }
 
 Anchor :: crdt.Anchor
@@ -1098,6 +1157,9 @@ buffer_anchors :: proc(e: ^Engine, id: Buffer_Id, rev: u64, positions: []int, bi
 	for p, i in positions {
 		u := clamp(_map_pos(b, p, bias == .After), 0, total)
 		pos := _to_bytes(b, u)
+		if _ovl_on(b) {
+			pos = crdt.delta_untransform_pos(b.oc[:], pos, bias == .Before, false)
+		}
 		if bias == .Before && pos >= crdt.text_len(&b.view.text) {
 			out[i] = ANCHOR_END
 			continue
@@ -1120,6 +1182,9 @@ _resolve_one :: proc(b: ^Buffer, a: Anchor) -> int {
 	p, err := crdt.anchor_resolve(&b.view.text, &b.hist.g, &b.view.log, a)
 	if err != .None {
 		return -1
+	}
+	if _ovl_on(b) {
+		p = crdt.delta_transform_pos(b.oc[:], p, a.bias == .Before, false)
 	}
 	return _to_units(b, p)
 }
@@ -1155,5 +1220,8 @@ buffer_text :: proc(e: ^Engine, id: Buffer_Id, allocator := context.allocator) -
 	}
 	h := _handle_get(e, b.object, b.kind) or_return
 	_buffer_view_ready(e, b, h) or_return
+	if _ovl_on(b) {
+		return _disp_bytes(b, allocator), b.rev, .None
+	}
 	return crdt.text_bytes(&b.view.text, allocator), b.rev, .None
 }
