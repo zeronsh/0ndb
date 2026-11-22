@@ -220,6 +220,9 @@ claude_feed :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 						parent = dup(o, parent),
 					},
 				)
+				if path := claude_write_path(c); path != "" {
+					emit(o, File_Write_Begin{tool = dup(o, get_str(c, "id")), path = dup(o, path)})
+				}
 			}
 		}
 	case "user":
@@ -235,8 +238,13 @@ claude_feed :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 			accept_prompt(d, o, u, u)
 			return
 		}
+		based := false
 		for c in get_arr(get(v, "message"), "content") {
 			if get_str(c, "type") == "tool_result" {
+				if !based {
+					based = true
+					claude_file_base(get_str(c, "tool_use_id"), get(v, "tool_use_result"), o)
+				}
 				emit(
 					o,
 					Tool_Finished {
@@ -445,4 +453,38 @@ claude_mcp_config :: proc(d: ^Driver) -> string {
 	}
 	append(&b, "}}")
 	return string(b[:])
+}
+
+@(private)
+claude_write_path :: proc(c: json.Value) -> string {
+	switch get_str(c, "name") {
+	case "Edit", "Write", "MultiEdit":
+		return get_str(get(c, "input"), "file_path")
+	case "NotebookEdit":
+		return get_str(get(c, "input"), "notebook_path")
+	}
+	return ""
+}
+
+@(private)
+claude_file_base :: proc(tool: string, r: json.Value, o: ^Output) {
+	if tool == "" {
+		return
+	}
+	if orig, ok := get(r, "originalFile").(json.String); ok {
+		if path := get_str(r, "filePath"); path != "" {
+			emit(o, File_Base{tool = dup(o, tool), path = dup(o, path), base = dup(o, string(orig)), kind = .Write})
+		}
+		return
+	}
+	f := get(r, "file")
+	content, cok := get(f, "content").(json.String)
+	path := get_str(f, "filePath")
+	if get_str(r, "type") != "text" || !cok || path == "" {
+		return
+	}
+	if get_u64(f, "startLine") > 1 || get_u64(f, "numLines") < get_u64(f, "totalLines") {
+		return
+	}
+	emit(o, File_Base{tool = dup(o, tool), path = dup(o, path), base = dup(o, string(content)), kind = .Read})
 }
