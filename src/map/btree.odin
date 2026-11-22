@@ -89,6 +89,7 @@ db_open :: proc(db: ^Db, vfs: prim.Vfs, path: string, allocator := context.alloc
 		fd        = prim.INVALID_FD,
 		allocator = allocator,
 	}
+	_compact_recover(vfs, path) or_return
 	fd, oerr := prim.open_file(vfs, path, {.Write})
 	if oerr == .None {
 		size, serr := prim.file_size(vfs, fd)
@@ -457,12 +458,17 @@ db_compact :: proc(db: ^Db) -> Error {
 	if err := prim.datasync(db.vfs, fd); err != .None {
 		return obj.perr(err)
 	}
-	if err := prim.rename(db.vfs, tmp, db.path); err != .None {
-		return obj.perr(err)
-	}
 	ok = true
+	if err := _zero_file(db.vfs, db.fd); err != .None {
+		db.poisoned = true
+		return err
+	}
 	prim.close_file(db.vfs, db.fd)
 	db.fd = fd
+	if err := prim.rename(db.vfs, tmp, db.path); err != .None {
+		db.poisoned = true
+		return obj.perr(err)
+	}
 	db.meta = m
 	db.cache_no = {}
 	if err := prim.sync_dir(db.vfs, prim.dir_name(db.path)); err != .None {
@@ -1432,4 +1438,71 @@ _db_init :: proc(vfs: prim.Vfs, path: string) -> Error {
 		return err
 	}
 	return obj.perr(prim.sync_dir(vfs, prim.dir_name(path)))
+}
+
+@(private)
+_zero_file :: proc(vfs: prim.Vfs, fd: prim.Fd) -> Error {
+	size, serr := prim.file_size(vfs, fd)
+	if serr != .None {
+		return obj.perr(serr)
+	}
+	zeros := make([]u8, WRITE_CHUNK * PAGE, context.temp_allocator)
+	head := min(size, 2 * PAGE)
+	if head > 0 {
+		obj.perr(prim.write_at(vfs, fd, zeros[:head], 0)) or_return
+		obj.perr(prim.datasync(vfs, fd)) or_return
+	}
+	for off := head; off < size; {
+		n := min(size - off, i64(len(zeros)))
+		obj.perr(prim.write_at(vfs, fd, zeros[:n], off)) or_return
+		off += n
+	}
+	return obj.perr(prim.datasync(vfs, fd))
+}
+
+@(private)
+_file_valid :: proc(vfs: prim.Vfs, path: string) -> bool {
+	fd, oerr := prim.open_file(vfs, path, {})
+	if oerr != .None {
+		return false
+	}
+	defer prim.close_file(vfs, fd)
+	size, serr := prim.file_size(vfs, fd)
+	if serr != .None {
+		return false
+	}
+	for slot in 0 ..< 2 {
+		if m, ok := _meta_read(vfs, fd, slot); ok && m.pages >= 2 && i64(m.pages) * PAGE <= size {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_compact_recover :: proc(vfs: prim.Vfs, path: string) -> Error {
+	buf: prim.Path_Buf
+	if len(path) + 8 >= len(buf) {
+		return .None
+	}
+	n := copy(buf[:], path)
+	n += copy(buf[n:], ".compact")
+	tmp := string(buf[:n])
+	if !prim.exists(vfs, tmp) {
+		return .None
+	}
+	if !_file_valid(vfs, path) && _file_valid(vfs, tmp) {
+		obj.perr(prim.rename(vfs, tmp, path)) or_return
+		return obj.perr(prim.sync_dir(vfs, prim.dir_name(path)))
+	}
+	fd, oerr := prim.open_file(vfs, tmp, {.Write})
+	if oerr == .None {
+		zerr := _zero_file(vfs, fd)
+		prim.close_file(vfs, fd)
+		zerr or_return
+	}
+	if err := prim.remove(vfs, tmp); err != .None && err != .Not_Found {
+		return obj.perr(err)
+	}
+	return .None
 }

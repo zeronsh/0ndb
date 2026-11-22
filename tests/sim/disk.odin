@@ -102,6 +102,8 @@ Disk_Stats :: struct {
 Disk :: struct {
 	quiet:     bool,
 	probe:     int,
+	freed_prefix: string,
+	freed:     [dynamic][]u8,
 	name:      string,
 	inodes:    map[u64]^Inode,
 	next_ino:  u64,
@@ -187,6 +189,11 @@ disk_destroy :: proc(d: ^Disk) {
 		_meta_free(d, m)
 	}
 	delete(d.meta)
+	for b in d.freed {
+		delete(b, d.allocator)
+	}
+	delete(d.freed)
+	delete(d.freed_prefix, d.allocator)
 	delete(d.name, d.allocator)
 	d^ = {}
 }
@@ -1035,6 +1042,7 @@ _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 	_event(d, old)
 	_event(d, new)
 	if replaced != 0 {
+		_freed_note(d, new, replaced)
 		_maybe_orphan(d, replaced)
 	}
 	return .None
@@ -1064,6 +1072,7 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 		return .Is_Dir
 	}
 	dir := d.inodes[lk.parent]
+	_freed_note(d, path, lk.ino)
 	ino := _unlink_entry(d, dir, lk.name)
 	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0, gone = ino})
 	_maybe_orphan(d, ino)
@@ -1818,4 +1827,45 @@ disk_probe_write :: proc(d: ^Disk, path: string, off: i64, src: []u8, durable :=
 		copy(n.durable[off:], src)
 	}
 	return true
+}
+
+@(private = "file")
+_freed_note :: proc(d: ^Disk, path: string, ino: u64) {
+	if len(d.freed_prefix) == 0 || !strings.has_prefix(path, d.freed_prefix) {
+		return
+	}
+	n, ok := d.inodes[ino]
+	if !ok || n.kind != .File {
+		return
+	}
+	for src in ([2][]u8{n.data[:], n.durable[:]}) {
+		if len(src) == 0 {
+			continue
+		}
+		b := make([]u8, len(src), d.allocator)
+		copy(b, src)
+		append(&d.freed, b)
+	}
+}
+
+disk_probe_keep_freed :: proc(d: ^Disk, prefix: string) {
+	if d.freed == nil {
+		d.freed = make([dynamic][]u8, d.allocator)
+	}
+	delete(d.freed_prefix, d.allocator)
+	d.freed_prefix = strings.clone(prefix, d.allocator)
+}
+
+disk_probe_freed_contains :: proc(d: ^Disk, needle: []u8) -> bool {
+	if len(needle) == 0 {
+		return false
+	}
+	for b in d.freed {
+		for i := 0; i + len(needle) <= len(b); i += 1 {
+			if string(b[i:][:len(needle)]) == string(needle) {
+				return true
+			}
+		}
+	}
+	return false
 }
