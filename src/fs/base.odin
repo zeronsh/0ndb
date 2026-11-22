@@ -355,7 +355,6 @@ _base_version :: proc(m: ^Mount, c: ^Change) -> (v: []crdt.Op_Id, pinned: bool) 
 		return nil, false
 	}
 	h := m.history
-	defer _pin_drop(s, c.path)
 	if p.has_write && p.has_base {
 		if t, err := history_text_at(h, c.old.inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
 			return _base_parents(m, s.actor, c.old.inode, p.write[:], p.base_hash), true
@@ -415,6 +414,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		v, pinned := _base_version(m, &c)
 		if v == nil {
 			if pinned {
+				_pin_drop(c.scope, c.path)
 				_base_note(m, c.path, .Mismatch)
 			}
 			append(&keep, c)
@@ -423,11 +423,13 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		vl := make([dynamic]crdt.Lv, context.temp_allocator)
 		sl := make([dynamic]crdt.Lv, context.temp_allocator)
 		if crdt.graph_version_lvs(&h.g, v, &vl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+			_pin_drop(c.scope, c.path)
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
 			continue
 		}
 		if crdt.frontier_eq(vl[:], sl[:]) {
+			_pin_drop(c.scope, c.path)
 			_base_note(m, c.path, .Current)
 			append(&keep, c)
 			continue
@@ -445,14 +447,17 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			continue
 		}
 		done, rerr := rebase_commit(p, &c, v)
-		if rerr == .Reloading {
+		#partial switch rerr {
+		case .None:
+		case .Reloading, .Io, .No_Space:
 			return rerr
-		}
-		if rerr != .None {
+		case:
+			_pin_drop(c.scope, c.path)
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
 			continue
 		}
+		_pin_drop(c.scope, c.path)
 		if !done {
 			_base_note(m, c.path, .Not_Text)
 			append(&keep, c)
