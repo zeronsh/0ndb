@@ -55,7 +55,7 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 		if !found || e.inode != c.inode {
 			append(out, fmt.aprintf("%s: synced inode %v, shadow %v (found %v)", p, c.inode, e.inode, found, allocator = allocator))
 		}
-		d := probe(m, p)
+		d := probe(m, p) or_return
 		switch c.kind {
 		case .Dir:
 			if d.kind != .Dir {

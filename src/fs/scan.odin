@@ -566,9 +566,12 @@ read_dir_vfs :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, giti
 			continue
 		}
 		st, serr := prim.lstat(sc.vfs, p)
-		if serr != .None {
-			r.kind = .Missing if serr == .Not_Found else .Other
+		if serr == .Not_Found || serr == .Not_Dir {
+			r.kind = .Missing
 			continue
+		}
+		if serr != .None {
+			return from_prim(serr)
 		}
 		r.kind = disk_kind(st.kind)
 		r.stat = disk_stat(st)
@@ -576,7 +579,14 @@ read_dir_vfs :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, giti
 		if r.kind == .Symlink {
 			tbuf: [prim.PATH_MAX]u8
 			n, lerr := prim.readlink(sc.vfs, p, tbuf[:])
-			if lerr != .None || n <= 0 || n >= len(tbuf) {
+			if lerr == .Not_Found || lerr == .Not_Dir {
+				r.kind = .Missing
+				continue
+			}
+			if lerr != .None {
+				return from_prim(lerr)
+			}
+			if n <= 0 || n >= len(tbuf) {
 				r.kind = .Other
 				continue
 			}
@@ -587,6 +597,8 @@ read_dir_vfs :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, giti
 			data, rerr := prim.read_file(sc.vfs, p, sc.allocator)
 			if rerr == .None {
 				gitignore^ = data
+			} else if rerr != .Not_Found && rerr != .Not_Dir {
+				return from_prim(rerr)
 			}
 		}
 	}
