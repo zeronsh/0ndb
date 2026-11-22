@@ -99,6 +99,7 @@ node_start :: proc(n: ^Node) -> bool {
 	}
 	cfg.storage = w.cfg.storage
 	cfg.git_remote = sim_git_remote(n)
+	cfg.http = sim_http_client(n)
 	if w.node_cfg != nil {
 		w.node_cfg(n, &cfg)
 	}
@@ -155,6 +156,9 @@ node_start :: proc(n: ^Node) -> bool {
 	if n.alive {
 		node_remount(w, n)
 	}
+	if n.alive {
+		quiesce_runtime_start(n)
+	}
 	return n.alive
 }
 
@@ -197,6 +201,7 @@ node_kill :: proc(n: ^Node) {
 	live_kill(n)
 	buffers_drop(w, n)
 	watches_node_killed(w, n)
+	quiesce_runtime_kill(n)
 	conns_drop_node(w, n)
 	node_mounts_drop(w, n)
 	n.alive = false
