@@ -321,6 +321,15 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 	scope := fs.scope_open(n.reg, sm.m, sid, actor)
 	if hold {
 		fs.scope_write_begin(scope, name)
+		for other in paths {
+			if other == name {
+				continue
+			}
+			if data, oerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", other}, context.temp_allocator), context.temp_allocator); oerr == .None && len(data) > 0 {
+				fs.scope_read_base(scope, other, data)
+				break
+			}
+		}
 		if !fs.scope_pinned(scope, name) {
 			world_note(w, "%s agent hold on %s/%s pinned nothing (not in the shadow)", n.name, id_short(o.id), name)
 		} else if hist, herr := eng.tree_history(&n.e, o); herr == .None {
@@ -340,19 +349,23 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 	} else {
 		fs.scope_read_base(scope, name, base)
 	}
-	kop := new_op(m, .Tree_Write, n, sm.oi)
-	kop.path = strings.clone(name, w.allocator)
-	b := strings.builder_make(context.temp_allocator)
-	strings.write_bytes(&b, cur)
-	if len(cur) > 0 && cur[len(cur) - 1] != '\n' {
+	tok := ""
+	kerr := eng.Error.None
+	if fs.scope_pinned(scope, name) {
+		kop := new_op(m, .Tree_Write, n, sm.oi)
+		kop.path = strings.clone(name, w.allocator)
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_bytes(&b, cur)
+		if len(cur) > 0 && cur[len(cur) - 1] != '\n' {
+			strings.write_byte(&b, '\n')
+		}
+		tok = new_token(m, n, "k")
+		append(&kop.tokens, tok)
+		strings.write_string(&b, tok)
 		strings.write_byte(&b, '\n')
+		kerr = eng.tree_write(&n.e, o, name, transmute([]u8)strings.to_string(b))
+		op_result(kop, n, kerr)
 	}
-	tok := new_token(m, n, "k")
-	append(&kop.tokens, tok)
-	strings.write_string(&b, tok)
-	strings.write_byte(&b, '\n')
-	kerr := eng.tree_write(&n.e, o, name, transmute([]u8)strings.to_string(b))
-	op_result(kop, n, kerr)
 	if n.agent_pending == nil {
 		n.agent_pending = make([dynamic]Agent_Pending, w.allocator)
 	}
@@ -418,10 +431,15 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 			fs.scope_write_end(pa.scope, pa.name)
 		}
 	}
+	pinned := !n.disk.dead && fs.scope_pinned(pa.scope, pa.name)
+	notes := _base_notes(w)
 	serr := fs.Error.None
 	if !n.disk.dead {
 		serr = fs.scope_close(n.reg, pa.scope)
 		_forget_scope(w, n, pa.scope)
+	}
+	if pinned && err == .None && serr == .None && !n.disk.dead && _base_notes(w) == notes {
+		world_fail(w, "agent base: %s pinned write to %s/%s reported no outcome", n.name, id_short(m.objs[pa.oi].o.id), pa.name)
 	}
 	world_note(w, "%s agent(actor %s) writes %s/%s from %s base, wrote %v -> %v %v", n.name, id_short(pa.actor), id_short(m.objs[pa.oi].o.id), pa.name, "current" if pa.hold else "read", op.tokens[:], err, serr)
 	if n.disk.dead {
@@ -751,6 +769,10 @@ check_synced_disk :: proc(w: ^World, n: ^Node) {
 			world_fail(w, "mount: %s %s synced version is not what is on disk: %s", n.name, sm.root, x)
 		}
 	}
+}
+
+_base_notes :: proc(w: ^World) -> u64 {
+	return stat_get(&w.stats, STAT_BASE_MERGED) + stat_get(&w.stats, STAT_BASE_CURRENT) + stat_get(&w.stats, STAT_BASE_MISMATCH) + stat_get(&w.stats, STAT_BASE_OTHER)
 }
 
 STAT_BASE_MERGED: Stat
