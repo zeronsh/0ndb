@@ -33,12 +33,12 @@ mount_find :: proc(a: ^Api, ob: Object, root: string) -> ^Mounted {
 }
 
 mount_open :: proc(a: ^Api, ob: Object, root: string) -> (m: ^Mounted, st: Status) {
-	if len(root) == 0 || root[0] != '/' {
+	if !prim.is_abs(root) {
 		return nil, .Invalid
 	}
 	clean := strings.trim_right(root, "/")
-	if len(clean) == 0 {
-		clean = "/"
+	if len(clean) == 0 || (len(clean) == 2 && clean[1] == ':') {
+		clean = root[:len(clean) + 1]
 	}
 	if x := mount_find(a, ob, clean); x != nil {
 		return x, .Ok
