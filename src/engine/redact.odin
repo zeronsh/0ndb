@@ -193,7 +193,6 @@ _index_reindex :: proc(e: ^Engine, h: ^Handle) {
 		search.advance(&e.index, _source_id(h.id, s.device), 0)
 	}
 	search.erase(&e.index)
-	_snap_dirty(e, h.sp)
 	_index_item_add(e, h.sp.id, h.id, h.kind)
 }
 
@@ -667,7 +666,6 @@ _stream_object :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id) -> (id: 
 
 @(private)
 _relay_redacted_event :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, to: i64) {
-	_snap_redaction_seen(e, sp, stream, from, to)
 	id, kind, epoch, found := _stream_object(e, sp, stream)
 	if !found {
 		return
@@ -678,7 +676,7 @@ _relay_redacted_event :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, f
 		return
 	}
 	if kind == .Conversation {
-		_snap_relay_zeroed(e, sp, id, device, from, to)
+		_index_relay_zeroed(e, sp, id, device, from, to)
 	}
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
@@ -689,7 +687,6 @@ _relay_redacted_event :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, f
 
 @(private)
 _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, to: i64) {
-	_snap_redaction_seen(e, sp, stream, from, to)
 	id, kind, _, found := _stream_object(e, sp, stream)
 	if !found || (kind != .Conversation && kind != .Map) {
 		return
@@ -891,7 +888,6 @@ _index_purge_message :: proc(e: ^Engine, h: ^Handle, msg: Msg_Pos) {
 	src := _source_id(h.id, msg.seg)
 	pos, _ := search.position(&e.index, src)
 	search.redact(&e.index, src, pos, h.id, ref[:])
-	_snap_dirty(e, h.sp)
 }
 
 @(private)
@@ -915,7 +911,6 @@ _index_purge_messages :: proc(e: ^Engine, h: ^Handle, msgs: []Msg_Pos) {
 		search.delete_record(&e.index, src, pos, h.id, ref[:])
 	}
 	search.erase(&e.index)
-	_snap_dirty(e, h.sp)
 }
 
 @(private)
@@ -930,7 +925,6 @@ _index_purge_object :: proc(e: ^Engine, h: ^Handle) {
 	pos, _ := search.position(&e.index, src)
 	search.delete_content(&e.index, src, pos, h.id)
 	search.erase(&e.index)
-	_snap_dirty(e, h.sp)
 }
 
 @(private)

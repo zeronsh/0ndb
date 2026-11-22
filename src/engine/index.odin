@@ -90,14 +90,14 @@ _index_open :: proc(e: ^Engine) -> Error {
 		return _xerr(err)
 	}
 	e.index_open = true
+	if !rebuilt && _search_restore_interrupted(e) {
+		search.reset(&e.index)
+		rebuilt = true
+	}
 	if rebuilt {
-		_remote(e).rebuilt = true
-		_snap_forget_all(e)
-		k := [1]u8{SEARCH_KEY_REBUILT}
-		v := [1]u8{1}
-		_reg_put(e, ROOT_SEARCH, k[:], v[:])
 		_index_all(e)
 	}
+	_search_drop_markers(e) or_return
 	return .None
 }
 
@@ -304,7 +304,7 @@ _index_step :: proc(e: ^Engine) {
 			return
 		}
 		sp, ok := e.spaces[it.space]
-		if !ok || !sp.open || _snap_park(e, it) {
+		if !ok || !sp.open {
 			continue
 		}
 		h, err := _handle_get(e, Object{it.space, it.object}, it.kind)
@@ -469,9 +469,6 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 	pos, perr := search.position(&e.index, src)
 	if perr != .None {
 		return
-	}
-	if pos == 0 {
-		_snap_source(e, h, device)
 	}
 	end := journal.reader_end(r)
 	tail_ok := false

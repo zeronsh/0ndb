@@ -149,12 +149,7 @@ Remote_State :: struct {
 	timer:      prim.Timer,
 	timer_at:   i64,
 	current:    ^Remote_Q,
-	restores:   map[prim.Id]^Snap_Restore,
-	parked:     [dynamic]Index_Item,
-	decided:    map[prim.Id]bool,
-	rebuilt:    bool,
-	restore_ms: i64,
-	restore_docs: int,
+	retired:    map[prim.Id]bool,
 	stats:      Search_Stats,
 }
 
@@ -254,14 +249,7 @@ _remote :: proc(e: ^Engine) -> ^Remote_State {
 		r.skip = make(map[prim.Id]bool, e.allocator)
 		r.behind = make(map[prim.Id]int, e.allocator)
 		r.advertised = make(map[prim.Id]int, e.allocator)
-		r.restores = make(map[prim.Id]^Snap_Restore, e.allocator)
-		r.parked = make([dynamic]Index_Item, e.allocator)
-		r.decided = make(map[prim.Id]bool, e.allocator)
-		if e.reg.open {
-			k := [1]u8{SEARCH_KEY_REBUILT}
-			_, hit, _ := omap.db_get(&e.reg.db, ROOT_SEARCH, k[:], context.temp_allocator)
-			r.rebuilt = hit
-		}
+		r.retired = make(map[prim.Id]bool, e.allocator)
 	}
 	return r
 }
@@ -283,12 +271,7 @@ _remote_close :: proc(e: ^Engine) {
 	for m in r.inbox {
 		delete(m.payload, e.allocator)
 	}
-	for _, rs in r.restores {
-		_snap_restore_free(e, rs)
-	}
-	delete(r.restores)
-	delete(r.parked)
-	delete(r.decided)
+	delete(r.retired)
 	delete(r.queries)
 	delete(r.inbox)
 	delete(r.modes)
@@ -490,7 +473,6 @@ _full_step :: proc(e: ^Engine) {
 	if !r.init || !e.cfg.search {
 		return
 	}
-	_snap_step(e)
 	for i := 0; i < len(r.active); {
 		a := r.active[i]
 		sp, ok := e.spaces[a.space]
@@ -527,11 +509,7 @@ _full_step :: proc(e: ^Engine) {
 	}
 	for sid in _sorted_keys(e.spaces) {
 		sp := e.spaces[sid]
-		if !sp.open || !sp.connected || !_full_on(e, sp) || sid in r.restores {
-			continue
-		}
-		if r.rebuilt && !r.decided[sid] {
-			_snap_restore_maybe(e, sp)
+		if !sp.open || !sp.connected || !_full_on(e, sp) {
 			continue
 		}
 		Walk :: struct {
@@ -623,7 +601,6 @@ _full_kick :: proc(e: ^Engine, sp: ^Space) {
 	r := _remote(e)
 	clear(&r.skip)
 	if _full_on(e, sp) {
-		_snap_kick(e, sp)
 		_touch(e)
 	}
 }
@@ -654,8 +631,8 @@ _full_settle :: proc(e: ^Engine) {
 	}
 	for sid in _sorted_keys(e.spaces) {
 		sp := e.spaces[sid]
-		if sp.open && sp.connected && _full_on(e, sp) {
-			_snap_settle(e, sp)
+		if sp.open && sp.connected {
+			_search_retire(e, sp)
 		}
 	}
 }
@@ -675,7 +652,7 @@ _indexer_advertise :: proc(e: ^Engine, sp: ^Space, behind: int) -> Error {
 	}
 	_, err := map_set(e, o, me[:], fields[:])
 	if err == .Pending || err == .None {
-		k := _snap_key(SEARCH_KEY_ADVERTISED, sp.id)
+		k := _search_key(SEARCH_KEY_ADVERTISED, sp.id)
 		v := [1]u8{1}
 		_reg_put(e, ROOT_SEARCH, k[:], v[:])
 		return .None
@@ -685,7 +662,7 @@ _indexer_advertise :: proc(e: ^Engine, sp: ^Space, behind: int) -> Error {
 
 @(private)
 _indexer_retract :: proc(e: ^Engine, sp: ^Space) {
-	k := _snap_key(SEARCH_KEY_ADVERTISED, sp.id)
+	k := _search_key(SEARCH_KEY_ADVERTISED, sp.id)
 	if _, hit, _ := omap.db_get(&e.reg.db, ROOT_SEARCH, k[:], context.temp_allocator); !hit {
 		return
 	}
@@ -1858,11 +1835,6 @@ _remote_pending :: proc(e: ^Engine) -> bool {
 	}
 	for q in r.queries {
 		if (q.ready_now || q.due) && !q.finished {
-			return true
-		}
-	}
-	for _, rs in r.restores {
-		if rs.failed || rs.importing || (rs.head && len(rs.oids) == 0) {
 			return true
 		}
 	}

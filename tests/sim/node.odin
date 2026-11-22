@@ -86,7 +86,6 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.search_full = n.idx % 2 == 0
 	cfg.search_hedge_ms = 200
 	cfg.search_deadline_ms = 2000
-	cfg.search_snapshot_min = 512
 	cfg.pack_options = pack.DEFAULT_OPTIONS
 	cfg.pack_options.clock = node_clock(&n.clock)
 	cfg.use_pack_options = true

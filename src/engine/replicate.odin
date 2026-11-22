@@ -324,12 +324,10 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	context = context_for(e)
 	#partial switch ev.kind {
 	case .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed:
-		if !_snap_object_event(e, sp, ev) {
-			_content_on_event(e, sp, ev)
-		}
+		_content_on_event(e, sp, ev)
 		return
 	case .Checkpoint, .Checkpoint_Missing:
-		if _snap_checkpoint_event(e, sp, ev) {
+		if _search_retired_checkpoint(e, ev) {
 			return
 		}
 	case .Device_Seen, .Dropped, .Object_Shredded:

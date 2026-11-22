@@ -197,7 +197,6 @@ Config :: struct {
 	search_remote:   Search_Remote,
 	search_hedge_ms: i64,
 	search_deadline_ms: i64,
-	search_snapshot_min: int,
 	unlock:          osync.Unlock,
 	sealed_store:    osync.Sealed_Store,
 	runner_pool:     Runner_Pool,

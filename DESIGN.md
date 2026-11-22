@@ -1015,28 +1015,19 @@ what it holds, so search reaches across devices:
   deadline; the first answer wins. With no indexer online the local results
   return at once, marked partial, and the engine emits `Indexer_Wanted` so a
   host can start one. Timers exist only while a query is in flight.
-- *Snapshots.* An indexer checkpoints its index through the checkpoint
-  machinery (`ckpt/0ndb:search`, one stream per indexer, newest record
-  wins). Each record lists a chain of deltas; each delta is a bare search
-  segment (stored text and document metadata, no postings) holding the
-  conversation documents and titles of one document-id range, plus
-  `(object, device, position)` coverage entries for the sources it
-  advanced. Blobs are content-addressed and sealed with a key tree derived
-  from the space's object key, so only space members can read them.
-  Snapshots are taken only at settle, once the indexer has caught up and
-  the new text exceeds max(16 KiB, 1/8 of the chain); a new delta merges
-  with the newest ones while they are no more than twice its size (and
-  under 32 MiB), so each byte is rewritten O(log n) times and the chain is
-  never rewritten whole. A fresh or wiped full indexer holds its indexing
-  until it has decided to restore: it fetches the newest record and its
-  deltas and imports them (re-tokenized, raising each source's position),
-  adopts the chain, then catches up from the announce feed. The import is
-  crash-safe: a registry marker lets a restart undo a partial import. A
-  restored device also replays redaction ranges it has seen in the feed
-  over the imported documents. Redaction marks the chain dirty; at the next
-  settle every delta whose live document count dropped is rebuilt from the
-  local index, published, and the old blob is shredded (deleted on the
-  relay, its key cell punctured) and the superseded records zero-filled.
+- *No snapshots.* Nothing about an index is shipped to the relay. Every
+  member device and runner can read the content it indexes, and rebuilding
+  costs well under a second of CPU per megabyte of text (2,769 messages,
+  2.3 MB, index from scratch in about a quarter of a second), so a fresh or
+  wiped indexer rebuilds from content, while devices without a full index
+  search through peer queries; runners keep a persistent local index like
+  any device. (Snapshots were measured at 1.75x the information of the
+  conversations they indexed, plus merge rewrites and checkpoint
+  zero-fills, to save one download at restore.) A device upgraded from a
+  version that published snapshots retires them once per space: it shreds
+  its snapshot objects, zero-fills its `ckpt/0ndb:search` records and drops
+  their registry rows; an interrupted snapshot import found at open
+  rebuilds the index.
 - *Plug.* `Search_Remote` routes peer queries to an embedder's own hosted
   indexer instead of the relay path; its answers are verified the same way.
 
@@ -1294,8 +1285,8 @@ Commit := base epoch id [32] (zero for epoch 0) | number u32 | history bool
   of a tick with no durable batch in flight: it unmounts the space's trees,
   deletes every object of the space from the search index and scrubs it,
   zero-fills, syncs and removes every object directory, the members
-  directory, the card and the search snapshots, drops the registry rows
-  (objects, owned, grants, space), marks the entry `done` and emits
+  directory, the card and any retired search snapshot files, drops the
+  registry rows (objects, owned, grants, space), marks the entry `done` and emits
   `Space_Left`. Pack zero-fill makes the erase redaction-grade. A restart
   in the `leaving` state resumes the wait. The entry stays as a tombstone:
   notice adoption, account-notice reconciliation and account sign-in skip a

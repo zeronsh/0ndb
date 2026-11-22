@@ -849,7 +849,7 @@ crdt_span :: struct {
 }
 
 check_redaction :: proc(w: ^World) {
-	check_snapshot_restore(w)
+	check_index_rebuild(w)
 	m := &w.model
 	secrets := make([dynamic]string, context.temp_allocator)
 	owners := make([dynamic]int, context.temp_allocator)
