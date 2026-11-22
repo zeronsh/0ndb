@@ -31,11 +31,12 @@ Flag :: enum u8 {
 	Exec,
 	Crlf,
 	Opaque,
+	Git_Clean,
 }
 
 Flags :: bit_set[Flag;u8]
 
-ALL_FLAGS :: Flags{.Exec, .Crlf, .Opaque}
+ALL_FLAGS :: Flags{.Exec, .Crlf, .Opaque, .Git_Clean}
 
 Op_Create :: struct {
 	parent: Inode_Id,

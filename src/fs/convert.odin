@@ -1607,13 +1607,20 @@ index_has_crlf :: proc(m: ^Mount, rel: string) -> bool {
 	return !text_is_binary(s) && s.crlf > 0
 }
 
+conv_on :: proc(m: ^Mount, inode: fstree.Inode_Id, has_inode: bool) -> bool {
+	if m.has_git {
+		return true
+	}
+	return has_inode && m.history != nil && .Git_Clean in tree_flags(m.history, inode)
+}
+
 eol_clean :: proc(m: ^Mount, rel: string, data: []u8, inode := fstree.Inode_Id{}, has_old := false, allocator := context.temp_allocator) -> ([]u8, bool) {
-	if !m.has_git {
+	if !conv_on(m, inode, has_old) {
 		return data, true
 	}
 	attr_begin(m)
 	defer attr_end(m)
-	cv := conv_attrs(m, rel)
+	cv := conv_attrs(m, rel, true)
 	out: Spool
 	switch clean_convert(m, rel, cv, Conv_Source{kind = .Data, data = data}, &out, -1, allocator) {
 	case .Same:
@@ -1625,37 +1632,38 @@ eol_clean :: proc(m: ^Mount, rel: string, data: []u8, inode := fstree.Inode_Id{}
 	return out.mem[:], true
 }
 
-eol_smudge_to :: proc(m: ^Mount, rel: string, data: []u8, out: io.Stream) -> bool {
-	if !m.has_git {
+eol_smudge_to :: proc(m: ^Mount, rel: string, data: []u8, out: io.Stream, inode := fstree.Inode_Id{}, has_inode := false) -> bool {
+	if !conv_on(m, inode, has_inode) {
 		_, err := io.write(out, data)
 		return err == nil
 	}
 	attr_begin(m)
 	defer attr_end(m)
-	cv := conv_attrs(m, rel)
+	cv := conv_attrs(m, rel, true)
 	return smudge_convert(m, rel, cv, Conv_Source{kind = .Data, data = data}, out)
 }
 
-eol_smudge :: proc(m: ^Mount, rel: string, data: []u8, allocator := context.temp_allocator) -> []u8 {
-	if !m.has_git || len(data) == 0 {
+eol_smudge :: proc(m: ^Mount, rel: string, data: []u8, allocator := context.temp_allocator, inode := fstree.Inode_Id{}, has_inode := false) -> []u8 {
+	if !conv_on(m, inode, has_inode) || len(data) == 0 {
 		return data
 	}
 	sink := Buf_Sink{buf = make([dynamic]u8, 0, len(data), allocator)}
-	if !eol_smudge_to(m, rel, data, io.Stream{procedure = buf_sink_proc, data = &sink}) {
+	if !eol_smudge_to(m, rel, data, io.Stream{procedure = buf_sink_proc, data = &sink}, inode, has_inode) {
 		return data
 	}
 	return sink.buf[:]
 }
 
-eol_smudge_blob :: proc(m: ^Mount, rel: string, oid: odb.Oid, out: io.Stream, rewind: Smudge_Rewind, rewind_data: rawptr) -> bool {
+eol_smudge_blob :: proc(m: ^Mount, rel: string, oid: odb.Oid, out: io.Stream, rewind: Smudge_Rewind, rewind_data: rawptr, inode := fstree.Inode_Id{}, has_inode := false) -> bool {
 	cv: Conv
-	if m.has_git {
+	on := conv_on(m, inode, has_inode)
+	if on {
 		attr_begin(m)
-		cv = conv_attrs(m, rel)
+		cv = conv_attrs(m, rel, true)
 	} else {
 		cv.action = .Binary
 	}
-	defer if m.has_git {
+	defer if on {
 		attr_end(m)
 	}
 	return smudge_convert(m, rel, cv, Conv_Source{kind = .Blob, oid = oid}, out, rewind, rewind_data)
@@ -1668,12 +1676,12 @@ Large_Clean :: enum u8 {
 }
 
 store_large_clean :: proc(m: ^Mount, rel: string, abs: string, old := fstree.Inode_Id{}, has_old := false) -> (oid: odb.Oid, size: i64, status: Large_Clean, err: Error) {
-	if !m.has_git || m.db == nil {
+	if !conv_on(m, old, has_old) || m.db == nil {
 		return {}, 0, .Raw, .None
 	}
 	attr_begin(m)
 	defer attr_end(m)
-	cv := conv_attrs(m, rel)
+	cv := conv_attrs(m, rel, true)
 	fd, oerr := prim.open_file(m.vfs, abs)
 	if oerr != .None {
 		return {}, 0, .Failed, from_prim(oerr)
