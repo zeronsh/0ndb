@@ -370,6 +370,39 @@ _send :: proc(w: ^World, idx: int, o: eng.Object, text: string) -> (r: eng.Rid, 
 }
 
 @(private = "file")
+_send_wait :: proc(w: ^World, idx: int, o: eng.Object, text: string, ms: i64) -> (r: eng.Rid, ok: bool) {
+	n := w.nodes[idx]
+	if !n.alive {
+		return {}, false
+	}
+	p := new(Window_Probe, w.allocator)
+	defer free(p, w.allocator)
+	done := eng.Done {
+		data = p,
+		call = proc(data: rawptr, e: ^eng.Engine, res: ^eng.Result, err: eng.Error) {
+			x := (^Window_Probe)(data)
+			x.fired += 1
+			x.err = err
+			x.rid = res.item
+		},
+	}
+	context = instance_context(&n.inst)
+	rid, err := eng.convo_send(&n.e, o, text, done = done)
+	node_after(n)
+	context = w.ctx
+	if err != .Pending {
+		return rid, err == .None
+	}
+	for _ in 0 ..< int(ms / 100) {
+		if p.fired > 0 {
+			break
+		}
+		_settle(w, 100)
+	}
+	return p.rid, p.fired > 0 && p.err == .None
+}
+
+@(private = "file")
 _status :: proc(w: ^World, idx: int, space: prim.Id) -> (s: eng.Members_Status, err: eng.Error) {
 	n := w.nodes[idx]
 	if !n.alive {
@@ -1625,7 +1658,7 @@ _leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret:
 		_fail(w, "%s: n%d got the space back after a restart (listed=%v tombstone=%v)", what, idx, has, left)
 	}
 	after := fmt.aprintf("after-%s", what, allocator = w.allocator)
-	r, ok := _send(w, M_A, o, after)
+	r, ok := _send_wait(w, M_A, o, after, 20_000)
 	if !ok {
 		_fail(w, "%s: n0 cannot write after the leave", what)
 		return
