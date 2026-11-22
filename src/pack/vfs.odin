@@ -408,8 +408,14 @@ _open_rel :: proc(p: ^Pack, path: string, rel: string, flags: prim.Open_Flags, m
 		_oi_release(p, oi)
 		return prim.INVALID_FD, herr
 	}
-	p.handles[idx] = Handle{used = true, write = .Write in flags, oi = oi, inum = inum}
+	p.handles[idx] = Handle{used = true, write = .Write in flags, oi = oi, inum = inum, sized = .Group_Visible in flags && .Write in flags}
 	fd := VFD_BASE + prim.Fd(idx)
+	if p.handles[idx].sized && oi.ino.kind == .External && !oi.ino.sized {
+		if e := _mark_sized(p, oi); e != .None {
+			_v_close(p, fd)
+			return prim.INVALID_FD, e
+		}
+	}
 	if found && .Truncate in flags && .Write in flags {
 		if e := _truncate(p, &p.handles[idx], 0); e != .None {
 			_v_close(p, fd)
@@ -559,7 +565,12 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 	if h.stage != nil {
 		return _stage_write(p, h, src, off)
 	}
-	return _write(p, h.oi, src, off)
+	_write(p, h.oi, src, off, h.sized) or_return
+	if h.sized && h.oi.ino.kind == .External && h.oi.ino.sized {
+		_ext_commit_size(p, h.oi, max(h.oi.ino.size, off + i64(len(src)))) or_return
+		return _maybe_flush(p)
+	}
+	return .None
 }
 
 @(private)
@@ -797,7 +808,9 @@ _v_sync :: proc(data: rawptr, fd: prim.Fd) -> Error {
 			_suspect_record(p, []u64{h.oi.inum})
 			return _poison(p, e)
 		}
-		_pend_synced(p, h.oi.inum)
+		if !h.oi.ino.sized {
+			_pend_synced(p, h.oi.inum)
+		}
 		return .None
 	}
 	return sync(p)

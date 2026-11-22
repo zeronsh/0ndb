@@ -110,6 +110,7 @@ Handle :: struct {
 	oi:    ^Open_Inode,
 	inum:  u64,
 	stage: ^Stage,
+	sized: bool,
 }
 
 @(private)

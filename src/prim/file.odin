@@ -11,6 +11,7 @@ Open_Flag :: enum u8 {
 	Append,
 	Nonblock,
 	Directory,
+	Group_Visible,
 }
 
 Open_Flags :: bit_set[Open_Flag;u8]
