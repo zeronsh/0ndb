@@ -1175,6 +1175,9 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			}
 			continue
 		}
+		if a.used && !m.lost {
+			continue
+		}
 		file := (c.kind == .Modify || c.kind == .Create) && c.disk == .File && c.moved == ""
 		if !file || a.oid == {} || m.db == nil || !odb.exists(m.db, a.oid) {
 			c.actor = unattributed_actor(m.actor) if m.lost else a.actor
