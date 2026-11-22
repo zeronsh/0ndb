@@ -257,6 +257,36 @@ single_edit :: proc "contextless" (old, new: []u8) -> (at: int, del: int, ins: i
 	return p, len(old) - p - s, len(new) - p - s, true
 }
 
+single_edit_aligned :: proc "contextless" (old, new: []u8) -> (at: int, del: int, ins: int, ok: bool) {
+	at, del, ins, ok = single_edit(old, new)
+	if !ok || (del > 0) == (ins > 0) {
+		return
+	}
+	long := old if del > 0 else new
+	n := del if del > 0 else ins
+	lo, hi := at, at
+	for lo > 0 && long[lo - 1] == long[lo - 1 + n] {
+		lo -= 1
+	}
+	for hi + n < len(long) && long[hi] == long[hi + n] {
+		hi += 1
+	}
+	if lo == hi {
+		return
+	}
+	for pos := hi; pos >= lo; pos -= 1 {
+		if (pos == 0 || long[pos - 1] == '\n') && !continuation(long, pos + n) {
+			return pos, del, ins, true
+		}
+	}
+	for pos := hi; pos >= lo; pos -= 1 {
+		if (pos + n == len(long) || long[pos + n] == '\n') && !continuation(long, pos) {
+			return pos, del, ins, true
+		}
+	}
+	return 0, 0, 0, false
+}
+
 @(private)
 common_suffix :: proc "contextless" (a, b: []u8) -> int {
 	n := min(len(a), len(b))
