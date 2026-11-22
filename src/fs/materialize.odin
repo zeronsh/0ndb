@@ -47,7 +47,7 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
 		return .Corrupt
 	}
-	if crdt.frontier_eq(tl[:], sl[:]) {
+	if crdt.frontier_eq(tl[:], sl[:]) && !mount_absent_ready(m) {
 		return .None
 	}
 	if len(m.dirty) > 0 || m.rescan {
@@ -73,7 +73,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
 		return .Corrupt
 	}
-	if crdt.frontier_eq(tl[:], sl[:]) {
+	if crdt.frontier_eq(tl[:], sl[:]) && len(m.absent) == 0 {
 		return .None
 	}
 	m.merge_base = m.synced[:] if merge else nil
@@ -96,6 +96,13 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		delete(c, m.allocator)
 	}
 	clear(&m.collided)
+	for a in m.absent {
+		if ino, ok, lerr := fstree.lookup(&snap, a); lerr == nil && ok {
+			touched[ino] = true
+		}
+		delete(a, m.allocator)
+	}
+	clear(&m.absent)
 	items := make([dynamic]Mat_Item, context.temp_allocator)
 	for ino in sorted_inodes(touched) {
 		it := Mat_Item {
@@ -473,6 +480,13 @@ disk_matches :: proc(m: ^Mount, rel: string, e: Entry) -> bool {
 
 @(private)
 materialize_one :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
+	if it.present && it.kind == .File && .Opaque in it.flags && m.db != nil && !m.restoring {
+		reg, has, berr := history_blob_at(m.history, it.inode, tl)
+		if berr == .None && has && !odb.exists(m.db, odb.Oid(reg.oid)) {
+			mount_absent_add(m, it.path)
+			return .None
+		}
+	}
 	if m.adopting && it.present && it.has_old && it.old == it.path && it.kind == .File && it.entry.kind == .File && it.entry.oid != {} && disk_matches(m, it.path, it.entry) {
 		return .None
 	}
@@ -887,4 +901,37 @@ version_snapshot :: proc(h: ^History, lvs: []crdt.Lv) -> (snap: fstree.Snapshot,
 		return {}, .Corrupt
 	}
 	return s, .None
+}
+
+mount_absent_add :: proc(m: ^Mount, path: string) {
+	for a in m.absent {
+		if a == path {
+			return
+		}
+	}
+	p, _ := clone_string(path, m.allocator)
+	append(&m.absent, p)
+}
+
+mount_absent :: proc(m: ^Mount) -> []string {
+	return m.absent[:]
+}
+
+@(private)
+mount_absent_ready :: proc(m: ^Mount) -> bool {
+	if len(m.absent) == 0 || m.db == nil || m.history == nil {
+		return false
+	}
+	snap := fstree.current(&m.history.tree)
+	for a in m.absent {
+		ino, ok, lerr := fstree.lookup(&snap, a)
+		if lerr != nil || !ok {
+			return true
+		}
+		reg, has, berr := history_blob(m.history, ino)
+		if berr != .None || !has || odb.exists(m.db, odb.Oid(reg.oid)) {
+			return true
+		}
+	}
+	return false
 }

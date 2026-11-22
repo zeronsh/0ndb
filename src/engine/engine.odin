@@ -204,6 +204,10 @@ Config :: struct {
 	seed_guard:      osync.Seed_Guard,
 	storage:         Storage_Mode,
 	storage_policy:  Storage_Policy,
+	git_remote:      Git_Remote,
+	git_credentials: Git_Credentials,
+	content_budget:  i64,
+	always_on:       bool,
 	user:            rawptr,
 }
 
@@ -240,6 +244,11 @@ Stats :: struct {
 	fetches:     u64,
 	indexed:     u64,
 	wakeups:     u64,
+	remote_skipped:  u64,
+	remote_rewrites: u64,
+	git_fetches:     u64,
+	git_objects:     u64,
+	over_budget:     u64,
 }
 
 Engine :: struct {
@@ -309,6 +318,8 @@ Engine :: struct {
 	outer:        runtime.Context,
 	outer_set:    bool,
 	content:      Content_State,
+	git:          Git_State,
+	budget:       Budget_State,
 	card_pubs:    [dynamic]Card_Pub,
 	stats:        Stats,
 	fatal:        Error,
@@ -337,7 +348,10 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	if e.cfg.search_budget <= 0 {
 		e.cfg.search_budget = DEFAULT_SEARCH_BUDGET
 	}
-	e.base = cfg.vfs if cfg.vfs.procs != nil else prim.os_vfs()
+	if e.cfg.git_remote.fetch == nil {
+		e.cfg.git_remote = default_git_remote()
+	}
+	e.base =cfg.vfs if cfg.vfs.procs != nil else prim.os_vfs()
 	e.dir = _clone(cfg.dir, e.allocator) or_return
 	e.pack_root = _join(e.allocator, e.dir, "pack") or_return
 	e.spaces = make(map[prim.Id]^Space, e.allocator)
@@ -357,6 +371,8 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.batches = make([dynamic]^Durable_Batch, e.allocator)
 	e.changed = make(map[prim.Id]Change, e.allocator)
 	_content_init(e)
+	_git_init(e)
+	_budget_init(e)
 	e.card_pubs = make([dynamic]Card_Pub, e.allocator)
 	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
 	e.index_dirty = make([dynamic]Index_Item, e.allocator)
@@ -713,6 +729,7 @@ _tick_end :: proc(e: ^Engine) {
 	_waiters_run(e)
 	_remote_step(e)
 	_catalog_flush(e)
+	_budget_flush(e)
 	_mounts_commit(e)
 	_handles_commit(e)
 	_mounts_changed(e)
@@ -722,6 +739,7 @@ _tick_end :: proc(e: ^Engine) {
 	_handles_commit(e)
 	_index_durable_advanced(e)
 	_handles_sweep(e, e.cfg.handle_cache)
+	_git_flush(e)
 	_durable_begin(e)
 	if e.pk_open && e.pk.poisoned && e.fatal == .None {
 		_fatal(e, .Io)
@@ -906,11 +924,14 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.dirty)
 	delete(e.batches)
 	delete(e.changed)
+	_git_destroy(e)
+	_budget_destroy(e)
 	_content_destroy(e)
 	delete(e.card_pubs)
 	for _, u in e.catalog_q {
 		delete(u.title, e.allocator)
 		delete(u.role, e.allocator)
+		delete(u.remote, e.allocator)
 		free(u, e.allocator)
 	}
 	delete(e.catalog_q)

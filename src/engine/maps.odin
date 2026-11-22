@@ -33,6 +33,8 @@ Catalog_Update :: struct {
 	has_usage:   bool,
 	role:        string,
 	storage:     Storage_Class,
+	remote:      string,
+	set_remote:  bool,
 }
 
 CATALOG_ROLE :: u32(32)
@@ -451,6 +453,7 @@ _catalog_flush :: proc(e: ^Engine) {
 		}
 		delete(u.title, e.allocator)
 		delete(u.role, e.allocator)
+		delete(u.remote, e.allocator)
 		free(u, e.allocator)
 	}
 }
@@ -497,6 +500,9 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	}
 	if len(u.role) > 0 {
 		append(&fields, omap.field_str(CATALOG_ROLE, u.role))
+	}
+	if u.set_remote {
+		append(&fields, omap.field_str(CATALOG_REMOTE, u.remote))
 	}
 	if u.status && u.kind == .Conversation {
 		if ch, err := _handle_get(e, Object{u.space, id}, .Conversation); err == .None {

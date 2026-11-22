@@ -18,6 +18,8 @@ CKPT_FS :: u8(1)
 @(private)
 CKPT_OBJECT :: u8(2)
 @(private)
+CKPT_REMOTE :: u8(3)
+@(private)
 CKPT_DOMAIN :: "0ndb checkpoint tree v1"
 
 @(private)
@@ -28,6 +30,7 @@ Ckpt_Wait :: struct {
 	scope:  osync.Scope,
 	tree:   osync.Key_Tree,
 	dest:   string,
+	need:   [dynamic]odb.Oid,
 }
 
 @(private)
@@ -38,6 +41,7 @@ Ckpt_Sink :: struct {
 	hash: blake2b.Context,
 	err:  fs.Error,
 	db:   ^odb.Odb,
+	tr:   ^Tree_Reach,
 }
 
 @(private)
@@ -98,6 +102,9 @@ _checkpoints_write :: proc(e: ^Engine) {
 		if (h.kind != .Text && h.kind != .File_Tree) || !h.w_open || h.hist == nil || !h.hist.awake || !h.sp.repl_on || !h.sp.connected {
 			continue
 		}
+		if _storage_class(e, h.sp, h.id, h.kind) == .Device {
+			continue
+		}
 		n := _own_len(h)
 		last, prev, had := _ckpt_get(e, h.id)
 		if n - max(last, 0) < CKPT_MIN_BYTES {
@@ -117,7 +124,11 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 	if oerr != .None {
 		return _perr(oerr)
 	}
+	tr := _tree_reach(e, h)
 	sink := Ckpt_Sink{e = e, fd = fd, db = h.hist.db}
+	if tr.ok {
+		sink.tr = &tr
+	}
 	blake2b.init(&sink.hash, 32)
 	werr := fs.history_persist(h.hist)
 	if werr == .None {
@@ -195,6 +206,11 @@ _ckpt_sink_object :: proc(data: rawptr, oid: odb.Oid) {
 	if s.err != .None || s.db == nil {
 		return
 	}
+	if s.tr != nil && fs.remote_reach_has(&s.tr.reach, oid) {
+		o := oid
+		_ckpt_emit(s, CKPT_REMOTE, o[:odb.oid_size(s.db.format)])
+		return
+	}
 	t, body, err := odb.read(s.db, oid, context.temp_allocator)
 	if err != .None {
 		return
@@ -250,6 +266,7 @@ _ckpt_fetch_start :: proc(e: ^Engine, h: ^Handle) -> bool {
 _ckpt_wait_free :: proc(e: ^Engine, w: ^Ckpt_Wait) {
 	osync.keytree_destroy(&w.tree)
 	osync.scope_clear(&w.scope)
+	delete(w.need)
 	delete(w.name, e.allocator)
 	delete(w.dest, e.allocator)
 	free(w, e.allocator)
@@ -272,27 +289,110 @@ _ckpt_arrived :: proc(e: ^Engine, sp: ^Space, name: string, ok: bool) {
 		seg = seg[len(osync.CHECKPOINT_STREAM):]
 	}
 	for w, i in sp.ckpts {
-		if w.name != seg {
+		if w.name != seg || w.need != nil {
+			continue
+		}
+		if ok && _ckpt_hold(e, sp, w) {
+			return
+		}
+		ordered_remove(&sp.ckpts, i)
+		_ckpt_finish(e, sp, w, ok)
+		return
+	}
+}
+
+@(private)
+_ckpt_finish :: proc(e: ^Engine, sp: ^Space, w: ^Ckpt_Wait, ok: bool) {
+	loaded := false
+	if ok {
+		if err := _ckpt_load(e, sp, w); err != .None {
+			_log(e, .Warn, "checkpoint load failed")
+		} else {
+			loaded = true
+		}
+	}
+	if !loaded {
+		_ckpt_put(e, w.object, -1, {})
+	}
+	prim.remove(e.vfs, w.dest)
+	if h, hok := e.handles[w.object]; hok {
+		_hist_catch_up(e, h)
+	}
+	_object_changed(e, sp.id, w.object, .Data)
+	_ckpt_wait_free(e, w)
+}
+
+@(private)
+_ckpt_hold :: proc(e: ^Engine, sp: ^Space, w: ^Ckpt_Wait) -> bool {
+	db, derr := device_odb(e)
+	if derr != .None {
+		return false
+	}
+	fd, oerr := prim.open_file(e.vfs, w.dest)
+	if oerr != .None {
+		return false
+	}
+	defer prim.close_file(e.vfs, fd)
+	size, serr := prim.file_size(e.vfs, fd)
+	if serr != .None {
+		return false
+	}
+	need := make([dynamic]odb.Oid, e.allocator)
+	pos: i64
+	for pos + 5 <= size {
+		head: [5]u8
+		n, rerr := prim.read_at(e.vfs, fd, head[:], pos)
+		if rerr != .None || n != 5 {
+			break
+		}
+		k := i64(prim.get_u32le(head[1:]))
+		if head[0] == CKPT_REMOTE && (k == 20 || k == 32) {
+			oid: odb.Oid
+			if got, gerr := prim.read_at(e.vfs, fd, oid[:k], pos + 5); gerr == .None && i64(got) == k && !odb.exists(db, oid) {
+				append(&need, oid)
+			}
+		}
+		pos += 5 + k
+	}
+	h, hok := e.handles[w.object]
+	if len(need) == 0 || !hok {
+		delete(need)
+		return false
+	}
+	w.need = need
+	for oid in need {
+		_content_fetch(e, h, fs.Content_Ref{oid = oid, len = odb.oid_size(db.format)})
+	}
+	return true
+}
+
+@(private)
+_ckpt_content :: proc(e: ^Engine, space: prim.Id, object: prim.Id) {
+	sp, ok := e.spaces[space]
+	if !ok {
+		return
+	}
+	db, derr := device_odb(e)
+	if derr != .None {
+		return
+	}
+	for i := 0; i < len(sp.ckpts); i += 1 {
+		w := sp.ckpts[i]
+		if w.object != object || w.need == nil {
+			continue
+		}
+		for j := 0; j < len(w.need); {
+			if odb.exists(db, w.need[j]) {
+				unordered_remove(&w.need, j)
+				continue
+			}
+			j += 1
+		}
+		if len(w.need) > 0 {
 			continue
 		}
 		ordered_remove(&sp.ckpts, i)
-		loaded := false
-		if ok {
-			if err := _ckpt_load(e, sp, w); err != .None {
-				_log(e, .Warn, "checkpoint load failed")
-			} else {
-				loaded = true
-			}
-		}
-		if !loaded {
-			_ckpt_put(e, w.object, -1, {})
-		}
-		prim.remove(e.vfs, w.dest)
-		if h, hok := e.handles[w.object]; hok {
-			_hist_catch_up(e, h)
-		}
-		_object_changed(e, sp.id, w.object, .Data)
-		_ckpt_wait_free(e, w)
+		_ckpt_finish(e, sp, w, true)
 		return
 	}
 }
@@ -367,6 +467,10 @@ _ckpt_source_read :: proc(data: rawptr, out: ^[dynamic]u8) -> (ok: bool, err: fs
 		switch head[0] {
 		case CKPT_FS:
 			return true, .None
+		case CKPT_REMOTE:
+			if len(out) != 20 && len(out) != 32 {
+				return false, .Corrupt
+			}
 		case CKPT_OBJECT:
 			if len(out) < 1 || out[0] == 0 || out[0] > u8(max(odb.Object_Type)) {
 				return false, .Corrupt

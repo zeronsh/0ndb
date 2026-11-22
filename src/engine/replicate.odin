@@ -39,6 +39,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		cfg.verify = _verify
 	}
 	cfg.seal = _repl_seal
+	cfg.object_source = _repl_object_source
 	if e.cfg.transport.open != nil {
 		cfg.link = osync.Client_Link{data = sp, send = _link_send, close = _link_close}
 	}
@@ -295,6 +296,10 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 		return
 	case .Direct, .Undelivered:
 		_remote_on_repl(e, sp, ev)
+		return
+	}
+	if ev.kind == .Unavailable && len(ev.oid) > 0 {
+		_content_unavailable(e, sp, ev)
 		return
 	}
 	name, _ := _clone(ev.name, e.allocator)

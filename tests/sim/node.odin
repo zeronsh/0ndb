@@ -88,6 +88,7 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.pack_options.clock = node_clock(&n.clock)
 	cfg.use_pack_options = true
 	cfg.storage = w.cfg.storage
+	cfg.git_remote = sim_git_remote(n)
 	if w.node_cfg != nil {
 		w.node_cfg(n, &cfg)
 	}

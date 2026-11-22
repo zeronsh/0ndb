@@ -25,6 +25,7 @@ Ev_Kind :: enum u8 {
 	Relay_Restart,
 	Heal,
 	Watch,
+	Git_Fetch,
 }
 
 Sim_Event :: struct {
@@ -188,6 +189,7 @@ World :: struct {
 	promos:    [dynamic]Promo_Rec,
 	live:      [dynamic]^Live_Read,
 	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
+	remote:    Sim_Remote,
 }
 
 Quarantine :: struct {
@@ -353,6 +355,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	rng_init(&w.fault_rng, cfg.seed, 3)
 	rng_init(&w.sched_rng, cfg.seed, 4)
 	model_init(&w.model, w)
+	remote_init(w)
 	w.relay.w = w
 	disk_init(&w.relay.disk, "relay", w.allocator)
 	w.relay.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -5_000_000_000, 5_000_000_000)}
@@ -426,6 +429,7 @@ world_destroy :: proc(w: ^World) {
 	}
 	delete(w.live)
 	model_destroy(&w.model)
+	remote_destroy(w)
 }
 
 loop_deadline :: proc(l: ^prim.Loop) -> (at: i64, ok: bool) {

@@ -1,6 +1,7 @@
 package engine
 
 import "core:crypto/blake2b"
+import "core:mem/virtual"
 import "core:slice"
 import "core:unicode/utf8"
 import "../convo"
@@ -539,6 +540,8 @@ _index_text :: proc(e: ^Engine, h: ^Handle) {
 
 @(private)
 _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bool) {
+	scratch := virtual.arena_temp_begin(&e.temp)
+	defer virtual.arena_temp_end(scratch)
 	_hist_catch_up(e, h)
 	if h.hist == nil || !h.hist.awake {
 		return 0, false

@@ -519,18 +519,18 @@ runner_pool :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {
 }
 
 @(private)
-_promote_for_run :: proc(r: ^Runtime, o: Object, runner: prim.Id) {
+_promote_for_run :: proc(r: ^Runtime, o: Object, msg: Rid, runner: prim.Id) {
 	if !runner_pool(r, o.space, runner) {
 		return
 	}
 	if c, err := eng.storage_class(r.e, o); err != .None || c != .Device {
 		return
 	}
-	eng.object_promote(r.e, o)
+	eng.object_promote_run(r.e, o, msg)
 	if ms, err := eng.convo_mounts(r.e, o, context.temp_allocator); err == .None {
 		for m in ms {
 			if !m.removed {
-				eng.object_promote(r.e, Object{o.space, m.tree})
+				eng.object_promote_run(r.e, Object{o.space, m.tree})
 			}
 		}
 	}

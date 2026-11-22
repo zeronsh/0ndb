@@ -79,6 +79,7 @@ Replicator_Config :: struct {
 	keys:         proc(user: rawptr, device: Device_Id, name: string, epoch: u64, stream: Stream_Id) -> (sealing: Stream_Sealing, tree: journal.Key_Provider),
 	kernel_tls:   bool,
 	seal:         proc(user: rawptr, name: string, id: Stream_Id, data: []u8, off: i64) -> Error,
+	object_source: proc(user: rawptr, key: Object_Key, allocator: runtime.Allocator) -> (Object_Source, bool),
 	on_event:     Repl_Handler,
 	user:         rawptr,
 }
