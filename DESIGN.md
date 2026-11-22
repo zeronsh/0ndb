@@ -1157,6 +1157,50 @@ relay) computes the same roster:
 - Expiry and leases are wall-clock checks against `expires`; a runner's
   `Renew` extends to at most `record time + lease_ms`.
 
+**Grants to guests** (`engine/grants.odin`, `sync/grants.odin`).
+- **The share.** `share_object` hands the recipient an out-of-band share: the
+  object key and the object keys of the epochs known at share time, wrapped
+  to the recipient, plus a capability for the relay.
+- **The grant record.** The share also appends `Add{kind guest, method
+  grant, scope [object], role reader or member by access}` to the space's
+  membership, so every member knows the grant. Scoped members are not tree
+  leaves and don't count toward epoch eligibility, so a grant never forces a
+  rotation.
+- **Re-wrap.** Whenever a member's membership pass sees a current epoch
+  (after a local change or a remote resolve), the member elected as for
+  rotation does the re-wrap (`_members_elected`: lowest present admin leaf
+  of that epoch's tree, else lowest present leaf). For every active scoped
+  guest, and every object in its scope that has no wrap for that epoch
+  yet, it appends a record to its own stream `grantkeys/<object hex>`
+  (object scope, epoch 0, in the writer's namespace):
+
+  ```
+  1 | grantee sign [32] | epoch tag [12]
+    | bytes(seal(grantee box, ctx "0ndb grant key" ‖ object,
+                 number u32 ‖ object_epoch_key [32]))
+  ```
+
+  There is one stream per (writing member, object), holding the wraps for
+  every grantee and epoch of that object, so it grows with
+  epochs × grantees. A guest's capability admits its object's grantkeys
+  streams for reading.
+- **The guest.** A guest follows the object's grantkeys group and opens the
+  wraps addressed to its key. It adds each new epoch tag to its persisted
+  grant epochs and unlocks held key trees on any new grant epoch, not only
+  on space epochs.
+- **Revocation must rotate.** `share_revoke(object, grantee)` removes the
+  guest, and the revoker commits a new space epoch at once. The guest still
+  holds the current epoch's object key, so without the rotation it would
+  keep opening new writes. Normal rotation ignores scoped members;
+  revocation is the exception. Removing the guest is the only thing that
+  stops re-wraps; grants survive their sharer leaving the space.
+- **Expiry is not revocation.** When a grant's capability expires, the relay
+  refuses the guest at once, but cryptographically the guest keeps the
+  object keys it already holds until the next epoch advance. A guest member
+  whose `expires` has passed gets no further wraps.
+- **Pre-release format.** Grants made before this design carry no `Add` and
+  are not re-wrapped; there is no migration.
+
 **Ratchet tree** (`sync/ratchet.odin`). Epoch keys use a TreeKEM-style
 left-balanced binary tree (RFC 9420 array indexing, width a power of two)
 whose leaves are the leaf-capable members (device, account, recovery,

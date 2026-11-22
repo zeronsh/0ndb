@@ -546,6 +546,7 @@ _members_settle :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 	_members_maybe_commit(e, sp, m)
 	_members_runner_watch(e, sp, m)
 	_pool_reseal(e, sp, m)
+	_grants_rewrap(e, sp, m)
 	if sp.mem.me == .Runner {
 		_lease_arm(e)
 	}
@@ -761,6 +762,7 @@ _members_change :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: ^Spa
 	_members_emit(e, sp, &m, raws[:]) or_return
 	sp.mem.records = len(m.records)
 	_members_adopt(e, sp, &m)
+	_grants_rewrap(e, sp, &m)
 	_members_secrets_store(e, sp, &m)
 	_emit(e, Event{kind = .Members_Changed, space = sp.id, length = i64(len(m.roster.members))})
 	_touch(e)
