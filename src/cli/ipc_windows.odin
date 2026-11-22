@@ -81,6 +81,11 @@ _wsa_up :: proc "contextless" () {
 	win.WSAStartup(0x0202, &wsa)
 }
 
+sock_path_max :: proc() -> int {
+	sa: _Sun
+	return len(sa.path) - 1
+}
+
 @(private)
 _sun :: proc(path: string) -> (sa: _Sun, ok: bool) {
 	if len(path) == 0 || len(path) >= len(sa.path) {

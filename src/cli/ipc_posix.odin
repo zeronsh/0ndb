@@ -19,6 +19,11 @@ Io_State :: enum u8 {
 	Fail,
 }
 
+sock_path_max :: proc() -> int {
+	addr: posix.sockaddr_un
+	return len(addr.sun_path) - 1
+}
+
 sock_connect :: proc(path: string) -> (fd: Sock, ok: bool) {
 	fd = posix.socket(.UNIX, .STREAM)
 	if fd < 0 {
