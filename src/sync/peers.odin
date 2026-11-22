@@ -129,6 +129,13 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 		return
 	}
 	_remote_base(r, rm, ev.base, ev.length)
+	for x, i in rm.refused {
+		if x == rm.device {
+			unordered_remove(&rm.refused, i)
+			rm.unavail = false
+			break
+		}
+	}
 	for i := 0; i < len(rm.inflight); {
 		f := &rm.inflight[i]
 		if f.from >= 0 && f.from < ev.base {
@@ -464,7 +471,7 @@ _peer_tampered :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 
 @(private)
 _on_pulled :: proc(r: ^Replicator, ev: ^Event) {
-	if len(r.serves) >= 4096 {
+	if len(r.serves) + len(r.parked) >= 4096 {
 		_serve_none(r, Serve_Req{requester = ev.device, tag = ev.tag, id = Stream_Id(ev.id)})
 		return
 	}
@@ -483,24 +490,49 @@ _serve_none :: proc(r: ^Replicator, q: Serve_Req) {
 
 @(private)
 _serves_pump :: proc(r: ^Replicator) {
-	for len(r.serves) > 0 && r.phase == .Ready && client_queued(&r.client) < OUT_HIGH {
+	if r.phase != .Ready {
+		return
+	}
+	for i := 0; i < len(r.parked) && client_queued(&r.client) < OUT_HIGH; {
+		q := r.parked[i]
+		if _serve(r, q) == .Later {
+			i += 1
+			continue
+		}
+		ordered_remove(&r.parked, i)
+	}
+	for len(r.serves) > 0 && client_queued(&r.client) < OUT_HIGH {
 		q := r.serves[0]
 		ordered_remove(&r.serves, 0)
-		if !_serve(r, q) {
-			_serve_none(r, q)
+		if _serve(r, q) == .Later {
+			append(&r.parked, q)
 		}
 	}
 }
 
 @(private)
-_serve :: proc(r: ^Replicator, q: Serve_Req) -> bool {
-	if q.to <= q.from || q.to - q.from > SERVE_SPAN_MAX {
-		return false
+Serve_Result :: enum u8 {
+	Done,
+	Later,
+}
+
+@(private)
+_serve :: proc(r: ^Replicator, q: Serve_Req) -> Serve_Result {
+	if q.to > q.from && q.to - q.from <= SERVE_SPAN_MAX {
+		if stream_device(q.id) != r.cfg.self {
+			if _serve_replica(r, q) {
+				return .Done
+			}
+		} else if l, has := r.locals[q.id]; has && q.from >= l.floor {
+			if q.from < l.durable && !l.fatal && !l.superseded && !l.blocked {
+				return .Later
+			}
+		} else if _serve_own(r, q) {
+			return .Done
+		}
 	}
-	if stream_device(q.id) == r.cfg.self {
-		return _serve_own(r, q)
-	}
-	return _serve_replica(r, q)
+	_serve_none(r, q)
+	return .Done
 }
 
 @(private)
