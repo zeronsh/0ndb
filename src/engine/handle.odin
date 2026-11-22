@@ -259,12 +259,18 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 	switch h.kind {
 	case .Conversation:
 		path := _seg_path(e, h.id) or_return
+		if !prim.exists(e.vfs, path) {
+			return .None
+		}
 		opts := _journal_opts(h)
 		_, err := convo.writer_open(&h.cw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator, _obj_clock(e))
 		_oerr(err) or_return
 		h.published = obj.writer_durable(&h.cw.core)
 	case .Map:
 		path := _seg_path(e, h.id) or_return
+		if !prim.exists(e.vfs, path) {
+			return .None
+		}
 		opts := _journal_opts(h)
 		_, err := omap.writer_open(&h.mw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator, _obj_clock(e))
 		_oerr(err) or_return
@@ -292,7 +298,10 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	rec, found := _rec_get(e, h.id) or_return
 	if found && rec.own {
 		h.own = true
-		return _handle_open_writer(h)
+		_handle_open_writer(h) or_return
+		if h.w_open {
+			return .None
+		}
 	}
 	if !found {
 		rec = Obj_Rec{space = h.sp.id, kind = h.kind, members = make([dynamic]Member, context.temp_allocator)}
@@ -305,6 +314,14 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	created := hlc_now(e)
 	if h.created == 0 {
 		h.created = created
+	}
+	if !rec.own && !((h.kind == .Text || h.kind == .File_Tree) && _ckpt_waiting(h)) {
+		rec.own = true
+		if rec.created == 0 {
+			rec.created = h.created
+		}
+		_rec_put(e, h.id, &rec) or_return
+		_registry_flush(e) or_return
 	}
 	switch h.kind {
 	case .Conversation:
