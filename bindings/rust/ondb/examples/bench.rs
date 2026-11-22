@@ -56,7 +56,7 @@ fn latency(c: &Client) -> ondb::Result<()> {
     let space = c.space_list().wait()?.spaces.into_iter().find_map(|s| s.id).expect("a space");
     let rows = c.catalog_list(&space, false, None, 50).wait()?.rows;
     if let Some(r) = rows.first() {
-        let ob = format!("{space}/{}", r.object.clone().unwrap_or_default());
+        let ob = r.object.clone().unwrap_or_default();
         let mut v = Vec::new();
         for _ in 0..2000 {
             let t = Instant::now();
@@ -86,7 +86,7 @@ fn idle(c: &Client, secs: u64) -> ondb::Result<()> {
     let st = c.daemon_status().wait()?;
     let space = c.space_list().wait()?.spaces.into_iter().find_map(|s| s.id).expect("a space");
     let rows = c.catalog_list(&space, false, None, 50).wait()?.rows;
-    let ob = format!("{space}/{}", rows.first().and_then(|r| r.object.clone()).expect("a conversation"));
+    let ob = rows.first().and_then(|r| r.object.clone()).expect("a conversation");
     let _cat = c.subscribe_catalog(&space).wait()?;
     let _conv = c.subscribe_conversation(&ob).wait()?;
     let _ev = c.events()?;

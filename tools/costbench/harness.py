@@ -457,7 +457,7 @@ def s4_catalog():
     spaces = c.call("space.list")
     sp = spaces["spaces"][0].get("id") or spaces["spaces"][0].get("space")
     rows = c.call("catalog.list", space=sp, limit=100).get("rows", [])
-    objs = [sp + "/" + r["object"] for r in rows if r.get("kind") == "conversation"]
+    objs = [r["object"] for r in rows if r.get("kind") == "conversation"]
     steps = int(os.environ.get("COST_CATALOG_STEPS", "1000"))
     sm = Sampler(relay, steps)
     records = []

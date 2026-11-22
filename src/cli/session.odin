@@ -247,6 +247,14 @@ catalog_rows :: proc(s: ^Session, space: prim.Id, archived := false, limit := 10
 	return out
 }
 
+row_id :: proc(row: json.Value) -> string {
+	o := jstr(row, "object")
+	if i := strings.last_index_byte(o, '/'); i >= 0 {
+		return o[i + 1:]
+	}
+	return o
+}
+
 resolve_object :: proc(s: ^Session, text: string) -> api.Object {
 	if ob, ok := api.parse_object(text); ok {
 		return ob
@@ -276,7 +284,7 @@ resolve_object :: proc(s: ^Session, text: string) -> api.Object {
 	req_str(&r, "text", text)
 	v := must(s, req_end(&r), "cannot search the catalog")
 	for row in jarr(v, "rows") {
-		x, _ := prim.id_parse(jstr(row, "object"))
+		x, _ := prim.id_parse(row_id(row))
 		if n == 0 || x != match.id {
 			n += 1
 		}
