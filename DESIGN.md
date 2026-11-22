@@ -408,7 +408,10 @@ equal in both directions.
   and conflict regions as that device.
 - **Commit protocol**: each batch a mount commits carries one opaque
   mount-mark op (tag 18 plus a random per-mount nonce) and, unless the line
-  is held, the mount's line record, in the same journal commit. Nothing is
+  is held, the mount's line record, in the same journal commit. Import
+  batches carry the line record the same way and never hold the line, so a
+  failed import leaves a subset of the checkout visible alike through the
+  API and every mount of that line, and the next open finishes it. Nothing is
   written before the commit; the mount state records the journal position
   it reflects, and after a crash the mount finds its own committed batches
   by scanning its stream from there for its mark. The mount state alternates
