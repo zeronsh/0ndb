@@ -1215,6 +1215,7 @@ scope_add_pid :: proc(s: ^Scope, pid: prim.Pid) {
 
 scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 	err: Error
+	scope_unhold(s)
 	if s.mount != nil {
 		err = mount_sync(s.mount)
 		if err != .None {

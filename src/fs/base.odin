@@ -282,11 +282,17 @@ scope_pins_free :: proc(s: ^Scope) {
 @(private)
 scope_release :: proc(s: ^Scope) {
 	scope_pins_free(s)
+	if scope_unhold(s) {
+		mount_schedule(s.mount, 0)
+	}
+}
+
+@(private)
+scope_unhold :: proc(s: ^Scope) -> (released: bool) {
 	m := s.mount
 	if m == nil {
-		return
+		return false
 	}
-	released := false
 	i := 0
 	for i < len(m.holds) {
 		if m.holds[i].scope == s {
@@ -297,9 +303,7 @@ scope_release :: proc(s: ^Scope) {
 		}
 		i += 1
 	}
-	if released {
-		mount_schedule(m, 0)
-	}
+	return
 }
 
 @(private)
