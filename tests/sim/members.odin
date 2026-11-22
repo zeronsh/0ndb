@@ -1611,6 +1611,9 @@ _leaver_gone :: proc(w: ^World, idx: int, space: prim.Id, o: eng.Object, secret:
 		_fail(w, "%s: %s still on n%d disk after leaving, in %s", what, secret, idx, p)
 	}
 	if len(key_row) > 0 {
+		if disk_probe_freed_contains(&w.nodes[idx].disk, key_row) {
+			_fail(w, "%s: n%d's own key tree for the conversation survives in freed blocks of a replaced or removed registry file", what, idx)
+		}
 		if p, found := disk_contains(&w.nodes[idx].disk, key_row); found {
 			_fail(w, "%s: n%d's own key tree for the conversation is still on its disk after leaving, in %s", what, idx, p)
 		}
@@ -1659,6 +1662,7 @@ _leave_case :: proc(w: ^World) {
 	x := _up(w, M_X)
 	_up(w, M_C)
 	_up(w, M_D)
+	disk_probe_keep_freed(&x.disk, fmt.tprintf("%s/registry", x.e.dir))
 	context = instance_context(&a.inst)
 	sid, cerr := eng.space_create(&a.e, "leave", "relay", w.relay.public)
 	o, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "leave"})
