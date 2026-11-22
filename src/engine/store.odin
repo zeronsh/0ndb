@@ -493,7 +493,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	} else {
 		e.durable_seq = max(e.durable_seq, b.seq)
 		e.stats.durable += 1
-		if _trees_waiting(e) {
+		if _trees_waiting(e) || len(e.leave_ready) > 0 {
 			_touch(e)
 		}
 		for p in b.drafts {

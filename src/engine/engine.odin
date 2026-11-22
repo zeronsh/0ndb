@@ -303,6 +303,7 @@ Engine :: struct {
 	lru:          [dynamic]^Handle,
 	own_trees:    map[osync.Stream_Id]^Own_Tree,
 	leave_ready:  [dynamic]prim.Id,
+	refused_stop: [dynamic]prim.Id,
 	waiters:      [dynamic]^Waiter,
 	space_waits:  [dynamic]Space_Wait,
 	space_woke:   bool,
@@ -385,6 +386,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.lru = make([dynamic]^Handle, e.allocator)
 	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, e.allocator)
 	e.leave_ready = make([dynamic]prim.Id, e.allocator)
+	e.refused_stop = make([dynamic]prim.Id, e.allocator)
 	e.waiters = make([dynamic]^Waiter, e.allocator)
 	e.space_waits = make([dynamic]Space_Wait, e.allocator)
 	e.held = make([dynamic]^Pending_Cmd, e.allocator)
@@ -783,6 +785,7 @@ _tick_end :: proc(e: ^Engine) {
 	_git_flush(e)
 	_durable_begin(e)
 	_leave_step(e)
+	_refused_step(e)
 	if e.pk_open && e.pk.poisoned && e.fatal == .None {
 		_fatal(e, .Io)
 	}
@@ -795,7 +798,7 @@ _tick_end :: proc(e: ^Engine) {
 
 @(private)
 _tick_pending :: proc(e: ^Engine) -> bool {
-	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || len(e.leave_ready) > 0 || _remote_pending(e) {
+	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || len(e.leave_ready) > 0 || len(e.refused_stop) > 0 || _remote_pending(e) {
 		return true
 	}
 	for _, sp in e.spaces {
@@ -977,6 +980,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.lru)
 	delete(e.own_trees)
 	delete(e.leave_ready)
+	delete(e.refused_stop)
 	for p in e.held {
 		_cmd_fail(e, p, .Closed)
 	}

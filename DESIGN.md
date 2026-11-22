@@ -1274,9 +1274,20 @@ access (`List`, `Read`, `Append` own streams, `Redact`, `Put`, `Get`,
 removed or expired principal is refused at its next request. When an append
 to a members stream lands, the relay hands the bytes to the authorizer
 (`Authorizer.observe`); principals that stop being active are failed with
-`Auth` on every connection (`relay_revoke`). The engine marks the space
-revoked on an `Auth` failure, fails pending reads with `Permission`, stops
-reconnecting and emits `Access_Revoked`. Request principals may only send
+`Auth` on every connection (`relay_revoke`). On an `Auth` failure the engine
+marks the space refused: a member it had loaded is marked revoked, pending
+reads fail with `Permission` and `Access_Revoked` is emitted, and the
+space's replicator stops at the end of the tick with nothing armed. Two
+cases retry first. A runner with a fresh lease token presents it once, and a
+lapsed runner asks its pool. A space that has not completed a hello in this
+process, and whose own removal it does not know, may be refused only
+because the relay has not yet ingested the records that admit it, so it
+retries with the link backoff (250 ms doubling to 30 s, reset only by a
+completed hello, not by the transport coming up), at most 6 times. A
+refused space reconnects only on information that could admit it: a
+members record it had not seen (a `JOIN` proof, an explicit join), an
+account sign-in that lists the space, a new lease token, an accepted share,
+a relay change, or a restart. Request principals may only send
 direct messages and see presence in the account namespace
 `BLAKE2b-128("0ndb account namespace" ‖ account sign)`; account principals
 (devices with a cert) likewise. Third-party capability tokens are signed by

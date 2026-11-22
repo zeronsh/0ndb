@@ -111,6 +111,7 @@ accept_share :: proc(e: ^Engine, share: Share) -> Error {
 	}
 	_oerr(omap.txn_commit(t)) or_return
 	_share_epochs_store(e, sp, &s) or_return
+	_space_unrefuse(e, sp)
 	if sp.open {
 		sp.grants[s.object] = key
 		sp.grant_access[s.object] = s.access

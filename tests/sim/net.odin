@@ -383,6 +383,7 @@ net_event :: proc(w: ^World, ev: ^Sim_Event) {
 		c.attached = true
 		c.state = .Up
 		c.backoff = 50_000_000
+		n.attaches[c.space] += 1
 		c.last_node = w.now
 		c.last_relay = w.now
 		_node_link(n, c, .Up)
@@ -525,4 +526,29 @@ byzantine_flush :: proc(w: ^World) {
 		}
 		clear(&c.byz_hold)
 	}
+}
+
+RECONNECT_QUIET_MAX :: 2
+
+attaches_snapshot :: proc(w: ^World) -> []map[prim.Id]int {
+	out := make([]map[prim.Id]int, len(w.nodes), w.allocator)
+	for n, i in w.nodes {
+		out[i] = make(map[prim.Id]int, w.allocator)
+		for k, v in n.attaches {
+			out[i][k] = v
+		}
+	}
+	return out
+}
+
+check_reconnects :: proc(w: ^World, before: []map[prim.Id]int, what: string) {
+	for n, i in w.nodes {
+		for k, v in n.attaches {
+			if d := v - before[i][k]; d > RECONNECT_QUIET_MAX {
+				world_fail(w, "reconnects: %s attached to space %s %d times during %s with no membership change", n.name, id_short(k), d, what)
+			}
+		}
+		delete(before[i])
+	}
+	delete(before, w.allocator)
 }
