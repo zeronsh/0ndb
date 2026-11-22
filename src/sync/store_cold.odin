@@ -26,6 +26,7 @@ Tier_Ev :: struct {
 	id:   Stream_Id,
 	upto: i64,
 	thaw: ^Tier_Thaw,
+	hold: Tier_Hold,
 }
 
 @(private)
@@ -184,7 +185,7 @@ _tier_cold_note :: proc(sp: ^Tier_Space, entries: []u8, segs: map[Stream_Id]Tier
 		if c, ok := sp.cold[id]; ok {
 			append(&c.recs, Tier_Rec{at = at, n = n, seq = prim.get_u64le(r[56:]), off = prim.get_u32le(r[4:])})
 		}
-		if !_reserved(cast([32]u8)id) && sp.thawing[id] == 0 && len(segs[id].redacts) == 0 {
+		if !_reserved(cast([32]u8)id) && sp.thawing[id] == 0 && sp.redacting[id] == 0 && len(segs[id].redacts) == 0 {
 			hi[id] = max(hi[id], at + n)
 		}
 	}
@@ -254,11 +255,15 @@ _tier_ev_done :: proc(sp: ^Tier_Space, result: Error) {
 	copy(evs, sp.ev_fly[:])
 	clear(&sp.ev_fly)
 	for ev in evs {
+		if ev.hold.done != nil {
+			ev.hold.done(ev.hold.ctx, ev.hold.result if result == .None else .Io, ev.hold.value)
+			continue
+		}
 		if ev.thaw != nil {
 			_tier_thaw_lowered(ev.thaw, result)
 			continue
 		}
-		if result != .None || sp.thawing[ev.id] > 0 {
+		if result != .None || sp.thawing[ev.id] > 0 || sp.redacting[ev.id] > 0 {
 			continue
 		}
 		if c, ok := sp.cold[ev.id]; ok {
