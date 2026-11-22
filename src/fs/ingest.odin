@@ -1072,6 +1072,8 @@ Pass :: struct {
 	changes:    [dynamic]Change,
 	seen:       map[string]bool,
 	young:      [dynamic]string,
+	holding:    [dynamic]string,
+	rebased:    [dynamic]crdt.Op_Id,
 	scope_of:   map[string]^Scope,
 	cutoff:     i64,
 	now:        i64,
@@ -1275,6 +1277,8 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	p.held_c = make(map[string]bool, p.long)
 	p.seen = make(map[string]bool, p.long)
 	p.young = make([dynamic]string, p.long)
+	p.holding = make([dynamic]string, p.long)
+	p.rebased = make([dynamic]crdt.Op_Id, p.long)
 	p.scope_of = make(map[string]^Scope, p.long)
 	p.settle = settle && !p.git_wrote
 	p.now = history_wall_ns(m.history)
@@ -1337,6 +1341,14 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
 	}
+	for y in p.holding {
+		if y in m.dirty {
+			continue
+		}
+		k, _ := clone_string(y, m.allocator)
+		m.dirty[k] = p.scope_of[y]
+	}
+	rebase_materialize(m, p.rebased[:]) or_return
 	if p.head_moved && m.has_git && !p.git_wrote {
 		b: Builder
 		builder_init(&b, m.history, m.actor)
@@ -1355,7 +1367,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		m.reflog_pos = git_reflog_len(m.vfs, m.git)
 		m.stamp = git_index_stamp(m.vfs, m.git)
 	}
-	if len(m.dirty) > 0 {
+	if len(m.dirty) > len(p.holding) {
 		mount_schedule(m, m.opts.settle_ms)
 	}
 	m.passes += 1
@@ -1602,6 +1614,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			commit_bounded(p, m.actor, all[lo:min(lo + PASS_CHUNK, len(all))], marker) or_return
 		}
 	} else {
+		rebase_changes(p) or_return
 		attribute_changes(p) or_return
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
 		order := make([dynamic]prim.Id, context.temp_allocator)
@@ -1739,6 +1752,10 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		compare_dir(p, rel) or_return
 	case d.kind == .File:
 		if d.stat != e.stat {
+			if mount_held(m, rel) {
+				append(&p.holding, clone_string(rel, p.long) or_else "")
+				return .None
+			}
 			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now {
 				append(&p.young, clone_string(rel, p.long) or_else "")
 				return .None
