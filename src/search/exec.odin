@@ -48,6 +48,7 @@ Match :: struct {
 }
 
 Hit :: struct {
+	space:       prim.Id,
 	object:      prim.Id,
 	participant: prim.Id,
 	ref:         []u8,

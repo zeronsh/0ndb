@@ -42,7 +42,7 @@ search_query :: proc(e: ^Engine, query: string, req: search.Request, allocator :
 	}
 	_index_open(e) or_return
 	r, serr := search.search(&e.index, query, req, allocator)
-	r.hits = _hit_gens(e, r.hits, allocator)
+	r.hits = _hit_gens(e, r.hits, {}, allocator)
 	return r, _xerr(serr)
 }
 
@@ -225,10 +225,15 @@ _gen_ref :: proc(r: Rid, allocator := context.allocator) -> []u8 {
 }
 
 @(private)
-_hit_gens :: proc(e: ^Engine, hits: []search.Hit, allocator := context.allocator) -> []search.Hit {
+_hit_gens :: proc(e: ^Engine, hits: []search.Hit, space: prim.Id, allocator := context.allocator) -> []search.Hit {
 	n := 0
 	for h in hits {
 		x := h
+		sid, known := _hit_space(e, h.object)
+		if !known || (!prim.id_is_zero(space) && sid != space) {
+			continue
+		}
+		x.space = sid
 		if len(h.ref) == 24 && h.kind == u8(Kind.Conversation) {
 			pos, _ := ref_rid(h.ref)
 			r, ok := _rid_in(e, h.object, .Conversation, pos.seg, pos.off)
@@ -241,6 +246,28 @@ _hit_gens :: proc(e: ^Engine, hits: []search.Hit, allocator := context.allocator
 		n += 1
 	}
 	return hits[:n]
+}
+
+@(private)
+_hit_space :: proc(e: ^Engine, id: prim.Id) -> (space: prim.Id, ok: bool) {
+	if rec, found, rerr := _rec_get(e, id); rerr == .None && found {
+		return rec.space, true
+	}
+	for sid in _sorted_keys(e.spaces) {
+		sp := e.spaces[sid]
+		if sp.keyless {
+			continue
+		}
+		ch, cerr := _catalog_handle(e, sp)
+		if cerr != .None {
+			continue
+		}
+		_map_sync(e, ch)
+		if _, found, gerr := omap.catalog_get(&ch.table, id, context.temp_allocator); gerr == .None && found {
+			return sid, true
+		}
+	}
+	return {}, false
 }
 
 @(private)

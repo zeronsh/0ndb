@@ -248,7 +248,7 @@ cmd_search :: proc(a: ^Args) -> int {
 		fmt.println("no matches")
 	}
 	for h in hits {
-		where_ := short(jstr(h, "object"))
+		where_ := short(row_id(h))
 		if m := jstr(h, "msg"); len(m) > 0 {
 			where_ = fmt.tprintf("%s %s", where_, short_rid(m))
 		}

@@ -481,7 +481,7 @@ pub struct Match {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Hit {
-    pub object: Option<Id>,
+    pub object: Option<ObjectRef>,
     pub participant: Option<Id>,
     pub msg: Option<Rid>,
     #[serde(rename = "ref")]
