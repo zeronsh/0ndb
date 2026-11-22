@@ -674,6 +674,16 @@ _buffer_sync :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 }
 
 @(private)
+_buffer_writer :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
+	if h.w_open {
+		return .None
+	}
+	_handle_create_writer(h) or_return
+	_buffer_view_ready(e, b, h) or_return
+	return _buffer_sync(e, b, h)
+}
+
+@(private)
 _buffer_base :: proc(e: ^Engine, b: ^Buffer, rev: u64) -> Error {
 	if rev > b.rev {
 		return .Invalid
@@ -867,6 +877,7 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	_buffer_base(e, b, rev) or_return
 	_buffer_view_ready(e, b, h) or_return
 	_buffer_sync(e, b, h) or_return
+	_buffer_writer(e, b, h) or_return
 	if _buffer_find(e, id) != b {
 		return 0, 0, .Closed
 	}
@@ -1047,6 +1058,7 @@ _undo_step :: proc(e: ^Engine, id: Buffer_Id, redo: bool) -> (done: bool, err: E
 	h := _handle_get(e, b.object, b.kind) or_return
 	_buffer_view_ready(e, b, h) or_return
 	_buffer_sync(e, b, h) or_return
+	_buffer_writer(e, b, h) or_return
 	if _buffer_find(e, id) != b || len(from) == 0 {
 		return false, .Closed
 	}
