@@ -369,6 +369,10 @@ _find_span :: proc(r: ^Reader, from: i64) -> Error {
 		}
 		pos = end
 	}
+	if r.replica != nil {
+		r.missing = Range{limit, limit + HEADER}
+		return .Missing
+	}
 	return .Unverified
 }
 
