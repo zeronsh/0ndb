@@ -2,6 +2,7 @@ package engine
 
 import "core:crypto"
 import "core:crypto/blake2b"
+import "core:strings"
 import "../fs"
 import "../journal"
 import omap "../map"
@@ -128,7 +129,7 @@ _content_mark_get :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> i64 {
 }
 
 @(private)
-_content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, mark: i64, target: i64 = -1) {
+_content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, mark: i64, target: i64 = -1, urls: string = "", set_urls := false) {
 	_, stored := _content_marks(e, space, id)
 	want := max(target, stored)
 	k := _pending_key(space, id)
@@ -149,6 +150,14 @@ _content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, m
 		omap.txn_abort(t)
 		_reg_fail(e, .Io)
 		return
+	}
+	if set_urls && _tree_remote_stored(e, space, id) != urls {
+		rk := _tree_remote_key(space, id)
+		if omap.txn_put(t, ROOT_OWNED, rk[:], transmute([]u8)urls) != .None {
+			omap.txn_abort(t)
+			_reg_fail(e, .Io)
+			return
+		}
 	}
 	_reg_commit(e, t)
 }
@@ -269,31 +278,44 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 	_serve_register(e, h, held[:])
 	if mark.pending == 0 {
 		if !mark.failed {
-			_content_mark_put(e, h.sp.id, h.id, h.kind, pos)
+			_content_mark_put(e, h.sp.id, h.id, h.kind, pos, -1, tr.urls, tr.ok)
 		}
 		return
 	}
 	e.content.marks[h.id] = mark
-	_content_mark_put(e, h.sp.id, h.id, h.kind, from, pos)
+	_content_mark_put(e, h.sp.id, h.id, h.kind, from, pos, tr.urls, tr.ok)
 }
 
 @(private)
 _content_resume :: proc(e: ^Engine, sp: ^Space) {
-	Acc :: struct {
-		ids: [dynamic]prim.Id,
+	Remote :: struct {
+		id:   prim.Id,
+		urls: string,
 	}
-	acc := Acc{ids = make([dynamic]prim.Id, context.temp_allocator)}
+	Acc :: struct {
+		ids:     [dynamic]prim.Id,
+		remotes: [dynamic]Remote,
+	}
+	acc := Acc{ids = make([dynamic]prim.Id, context.temp_allocator), remotes = make([dynamic]Remote, context.temp_allocator)}
 	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		a := (^Acc)(data)
 		if len(key) == 32 && len(value) == 17 && value[0] == u8(Kind.File_Tree) && prim.get_u64le(value[9:]) > prim.get_u64le(value[1:]) {
 			id: prim.Id
 			copy(id[:], key[16:])
 			append(&a.ids, id)
+		} else if len(key) == 33 && key[32] == 'r' && len(value) > 0 {
+			x := Remote{}
+			copy(x.id[:], key[16:32])
+			x.urls = strings.clone(string(value), context.temp_allocator)
+			append(&a.remotes, x)
 		}
 		return true
 	}
 	s := sp.id
 	omap.db_scan(&e.reg.db, ROOT_OWNED, s[:], s[:], &acc, visit)
+	for x in acc.remotes {
+		_tree_remote_note(e, sp, x.id, x.urls)
+	}
 	for id in acc.ids {
 		_content_kick(e, sp, id)
 	}

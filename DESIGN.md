@@ -1661,7 +1661,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   - *Where readers learn the remote.* The writer records the public URLs of
     the remotes whose tips it used (userinfo stripped, one per line) in the
     tree's catalog entry (tag 33), so a reader knows the remote before it
-    admits any record and independent of record order.
+    admits any record and independent of record order. The catalog write
+    goes through the catalog queue and lands with a later batch, while the
+    tree's content mark (the own-stream offset up to which its blobs are
+    handled) commits at once in the registry; so the same registry
+    transaction that advances the mark past a remote-skipped blob also
+    stores the URLs (`ROOT_OWNED`, key space ‖ tree ‖ `r`), and opening the
+    space re-notes them into the catalog. A crash between the two can no
+    longer leave a blob that is neither uploaded nor findable on a remote.
   - *Fetching.* A reader that admits a record whose blobs are missing asks
     the relay first (it answers `Missing` at once for remote-backed blobs);
     the blobs the relay lacks are queued, and once per tick the engine starts
