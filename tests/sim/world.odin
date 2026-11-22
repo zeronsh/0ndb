@@ -12,9 +12,17 @@ import osync "../../src/sync"
 
 EPOCH_NS :: i64(1_790_000_000) * 1_000_000_000
 
+Connect_Fault :: enum u8 {
+	None,
+	Refused,
+	Timeout,
+	Close_Early,
+}
+
 Ev_Kind :: enum u8 {
 	Op,
 	Connect,
+	Connect_Fail,
 	To_Relay,
 	To_Node,
 	Fin_To_Node,
@@ -63,6 +71,8 @@ Node :: struct {
 	clock:       Node_Clock,
 	alive:       bool,
 	connects:    int,
+	connect_fault: Connect_Fault,
+	unavailable: int,
 	incarnation: int,
 	inst:        Instance,
 	e:           eng.Engine,

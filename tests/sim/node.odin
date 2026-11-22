@@ -427,6 +427,9 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	case .Disconnected:
 		world_note(w, "%s disconnected %s", n.name, id_short(ev.space))
 	case .Unavailable, .Available, .Promoted, .Peer_Misbehaving:
+		if ev.kind == .Unavailable {
+			n.unavailable += 1
+		}
 		world_note(w, "%s %v %s device %s length %d %v", n.name, ev.kind, id_short(ev.object), id_short(ev.device), ev.length, ev.err)
 	}
 }

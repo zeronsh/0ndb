@@ -656,6 +656,9 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_upload_wait_case(w, mw.owned[len(mw.owned) - 1])
 	_fresh_unfollowed(w, mw)
 	_fresh_link_down(w, mw)
+	_fresh_offline(w, mw, .Refused)
+	_fresh_offline(w, mw, .Timeout)
+	_fresh_offline(w, mw, .Close_Early)
 
 	_down(w, M_A)
 	_down(w, M_B)
@@ -2018,4 +2021,69 @@ _fresh_link_down :: proc(w: ^World, mw: ^Mem_World) {
 		run_until(w, w.now + 2_000 * 1_000_000, false)
 	}
 	_fail(w, "fresh-link-down: after the partition healed n1 polled %d fresh reads without completing", FRESH_POLL_MAX)
+}
+
+@(private = "file")
+_fresh_offline :: proc(w: ^World, mw: ^Mem_World, fault: Connect_Fault) {
+	name := "fresh-offline-refused"
+	switch fault {
+	case .None, .Refused:
+	case .Timeout:
+		name = "fresh-offline-timeout"
+	case .Close_Early:
+		name = "fresh-offline-close-early"
+	}
+	_, o, _, live := _live_space(w, mw, M_A, {M_B}, name)
+	if !live {
+		return
+	}
+	run_until(w, w.now + 5_000 * 1_000_000, false)
+	r2, sent := _send(w, M_A, o, "fresh-offline-2")
+	if !sent {
+		_fail(w, "%s: second send on n0", name)
+		return
+	}
+	run_until(w, w.now + 5_000 * 1_000_000, false)
+	b := w.nodes[M_B]
+	before := b.unavailable
+	b.connect_fault = fault
+	b.partitioned = true
+	for c in b.conns {
+		conn_reset(c, true)
+	}
+	offline := false
+	for polls in 1 ..= 10 {
+		st, err := _fresh_status(w, M_B, o)
+		if err == .None {
+			_fail(w, "%s: with n1 cut off a fresh read on n1 completed from local data (head %v) at poll %d", name, st.head, polls)
+			break
+		}
+		if err == .Offline {
+			offline = true
+			break
+		}
+		if err != .Pending && err != .Missing {
+			_fail(w, "%s: fresh read on n1 while cut off failed: %v", name, err)
+			break
+		}
+		run_until(w, w.now + 2_000 * 1_000_000, false)
+	}
+	if !offline {
+		_fail(w, "%s: a fresh read on n1 never answered Offline while every connect attempt failed", name)
+	} else if b.unavailable == before {
+		_fail(w, "%s: n1 answered Offline without an Unavailable event", name)
+	}
+	b.connect_fault = .None
+	b.partitioned = false
+	for _ in 1 ..= FRESH_POLL_MAX {
+		st, err := _fresh_status(w, M_B, o)
+		if err == .None {
+			if st.head != r2 {
+				_fail(w, "%s: after the partition healed a fresh read on n1 completed without n0's newer message (head %v, want %v)", name, st.head, r2)
+			}
+			return
+		}
+		run_until(w, w.now + 2_000 * 1_000_000, false)
+	}
+	_fail(w, "%s: after the partition healed n1 polled %d fresh reads without completing", name, FRESH_POLL_MAX)
 }
