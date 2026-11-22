@@ -114,6 +114,7 @@ _on_noted :: proc(r: ^Replicator, ev: ^Event) {
 		} else if ev.length < l.cursor && ev.base < ev.length {
 			l.cursor = ev.length
 		}
+		_promote_on_noted(r, id, ev.base, ev.length)
 		_local_pump(r, l)
 		return
 	}

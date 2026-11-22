@@ -289,6 +289,9 @@ _cap_grant_new :: proc(a: ^Cap_Authorizer, c: Capability, key: [32]u8) -> ^Cap_G
 			g.suffixes[osync.stream_suffix(&sc, kn, u64(ep))] = .Keys
 		}
 	}
+	if hn, err := _concat2(osync.KEYS_HEAD_STREAM, name); err == .None {
+		g.suffixes[osync.stream_suffix(&sc, hn, 0)] = .Keys
+	}
 	osync.scope_clear(&sc)
 	a.grants[key] = g
 	return g

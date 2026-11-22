@@ -432,7 +432,7 @@ _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 	}
 	append(&h.segs, seg)
 	if journal.replica_length(rep) == 0 {
-		seg.waiting = true
+		seg.waiting = !osync.replicator_confirmed_empty(&sp.repl, &h.scope, device, h.name, 0)
 		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
 		e.stats.fetches += 1
 	}

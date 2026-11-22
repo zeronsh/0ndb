@@ -205,6 +205,7 @@ Remote :: struct {
 	verified:  [dynamic]journal.Range,
 	span:      journal.Sig_Info,
 	span_ok:   bool,
+	empty_ok:  bool,
 	span_fd:   prim.Fd,
 	span_seq:  u64,
 	base:      i64,
@@ -690,6 +691,11 @@ _remote_want_tail :: proc(r: ^Replicator, rm: ^Remote, n: i64) -> Error {
 	_remote_settle(r, rm)
 	_repl_flush(r)
 	return .None
+}
+
+replicator_confirmed_empty :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
+	rm, ok := r.remotes[stream_id(scope, device, name, epoch)]
+	return ok && rm.empty_ok && journal.replica_length(&rm.rep) == 0
 }
 
 replicator_acquire :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> (^journal.Replica, Error) {
@@ -1587,6 +1593,15 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 	if rm.tail > 0 && fresh {
 		append(&rm.wants, journal.Range{max(rm.relay_len - rm.tail, 0), rm.relay_len})
 		rm.tail = 0
+	}
+	if fresh && rm.relay_len == 0 && journal.replica_length(&rm.rep) == 0 {
+		if !rm.empty_ok {
+			rm.empty_ok = true
+			_span_save(r, rm, false)
+		}
+	} else if rm.empty_ok && (rm.relay_len > 0 || journal.replica_length(&rm.rep) > 0) {
+		rm.empty_ok = false
+		_span_save(r, rm, false)
 	}
 	if rm.relay_len < 0 {
 		_remote_maybe_free(r, rm)
