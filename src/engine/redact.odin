@@ -24,7 +24,7 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	if !found {
 		return .Missing
 	}
-	f := _ferr2(fs.history_file(h.hist, inode)) or_return
+	f := _hist_file(e, h, inode) or_return
 	spans := crdt.text_spans(&f.text, &h.hist.g, context.temp_allocator)
 	ops := make([dynamic]crdt.Op_Span, context.temp_allocator)
 	at := 0

@@ -7,7 +7,6 @@ import "../crdt"
 import "../fs"
 import "../fstree"
 import "../prim"
-import osync "../sync"
 
 Buffer_Id :: distinct u64
 
@@ -494,11 +493,7 @@ View_Reader :: struct {
 @(private)
 _buffer_unavailable :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	b.dirty = true
-	if h.sp.repl_on {
-		for sg in h.segs {
-			osync.replicator_follow(&h.sp.repl, &h.scope, sg.device, h.name, 0, true)
-		}
-	}
+	_hist_fetch_full(e, h)
 	return .Missing
 }
 

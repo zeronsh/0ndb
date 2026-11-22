@@ -44,7 +44,10 @@ text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: 
 	if !found {
 		return nil, _pending_result(e, h, .Missing, ready)
 	}
-	f := _ferr2(fs.history_file(h.hist, inode)) or_return
+	f, ferr := _hist_file(e, h, inode)
+	if ferr != .None {
+		return nil, _pending_result(e, h, ferr, ready)
+	}
 	data = crdt.text_bytes(&f.text, allocator)
 	if blocked && ready.call != nil {
 		return data, _wait(e, h, ready)
@@ -63,7 +66,10 @@ text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 	if !found {
 		return nil, _pending_result(e, h, .Missing, ready)
 	}
-	f := _ferr2(fs.history_file(h.hist, inode)) or_return
+	f, ferr := _hist_file(e, h, inode)
+	if ferr != .None {
+		return nil, _pending_result(e, h, ferr, ready)
+	}
 	spans = crdt.text_spans(&f.text, &h.hist.g, allocator)
 	fs.history_present_spans(h.hist, spans)
 	if blocked && ready.call != nil {
@@ -90,7 +96,10 @@ tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 		}
 		return nil, .Not_Found
 	}
-	f := _ferr2(fs.history_file(h.hist, id)) or_return
+	f, ferr := _hist_file(e, h, id)
+	if ferr != .None {
+		return nil, _pending_result(e, h, ferr, ready)
+	}
 	data = crdt.text_bytes(&f.text, allocator)
 	if blocked && ready.call != nil {
 		return data, _wait(e, h, ready)
@@ -165,7 +174,7 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8) -> Error {
 		_handle_mark(h)
 		return .None
 	}
-	f := _ferr2(fs.history_file(h.hist, id)) or_return
+	f := _hist_file(e, h, id) or_return
 	cur := crdt.text_len(&f.text)
 	_hist_text_edit(e, h, id, 0, cur, string(data)) or_return
 	_handle_mark(h)
@@ -236,6 +245,26 @@ _derr :: proc "contextless" (err: odb.Error) -> Error {
 @(private)
 _ferr2 :: proc(v: $T, err: fs.Error) -> (T, Error) {
 	return v, _ferr(err)
+}
+
+@(private)
+_hist_file :: proc(e: ^Engine, h: ^Handle, inode: fstree.Inode_Id) -> (f: ^fs.File_State, err: Error) {
+	ff, ferr := fs.history_file(h.hist, inode)
+	if ferr == .Not_Found {
+		_hist_fetch_full(e, h)
+		return nil, .Missing
+	}
+	return ff, _ferr(ferr)
+}
+
+@(private)
+_hist_fetch_full :: proc(e: ^Engine, h: ^Handle) {
+	if !h.sp.repl_on {
+		return
+	}
+	for sg in h.segs {
+		osync.replicator_follow(&h.sp.repl, &h.scope, sg.device, h.name, 0, true)
+	}
 }
 
 @(private)
