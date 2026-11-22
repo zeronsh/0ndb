@@ -476,21 +476,48 @@ import_segment :: proc(ix: ^Index, path: string, keep: Export_Keep, on_source: E
 	return res, .None
 }
 
-has_object :: proc(ix: ^Index, object: prim.Id) -> (found: bool, err: Error) {
-	if _, ok := ix.mem.id_map[object]; ok {
-		return true, .None
+has_content :: proc(ix: ^Index, object: prim.Id) -> (found: bool, err: Error) {
+	m := &ix.mem
+	if oi, ok := m.id_map[object]; ok {
+		for d in m.docs {
+			if d.object == oi && d.flags & (DF_TITLE | DF_DELETED) == 0 {
+				return true, .None
+			}
+		}
 	}
 	key: [17]u8
 	key[0] = NS_OBJECT
 	o := object
 	copy(key[1:], o[:])
+	blk: Doc_Block
+	db_init(&blk, context.temp_allocator)
 	for &s in ix.segs {
 		dix := dix_load(&ix.cache, &s, context.temp_allocator) or_return
 		dc: Dict_Cursor
 		dc_init(&dc, &ix.cache, &s, &dix, context.temp_allocator)
-		_, hit := term_lookup(&dc, key[:]) or_return
-		if hit {
-			return true, .None
+		t, hit := term_lookup(&dc, key[:]) or_return
+		if !hit {
+			continue
+		}
+		pl := new(Plist, context.temp_allocator)
+		pl_init(pl, &ix.cache, &s, t)
+		x := u32(max(u32))
+		for {
+			v, ok := pl_seek(pl, x)
+			if !ok {
+				break
+			}
+			doc_load(&ix.cache, &s, &blk, u64(v) / DOC_BLOCK) or_return
+			if blk.docs[v - blk.first].flags & (DF_TITLE | DF_DELETED) == 0 {
+				return true, .None
+			}
+			if v == 0 {
+				break
+			}
+			x = v - 1
+		}
+		if pl.err != .None {
+			return false, pl.err
 		}
 	}
 	return false, .None

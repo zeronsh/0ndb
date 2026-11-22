@@ -372,6 +372,7 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 	t: convo.Tail
 	for pos < end {
 		if used >= budget {
+			_ix_busy(e, search.advance(&e.index, src, pos))
 			return used, true
 		}
 		body, next, je := journal.record_at(r, pos)

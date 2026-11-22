@@ -19,6 +19,8 @@ SEARCH_KEY_REDACT :: u8(0xf6)
 @(private)
 SEARCH_KEY_REBUILT :: u8(0xf7)
 @(private)
+SEARCH_KEY_ADVERTISED :: u8(0xf8)
+@(private)
 SNAP_HISTORY :: "0ndb:search"
 @(private)
 SNAP_DOMAIN :: "0ndb search snapshot v1"
@@ -990,7 +992,7 @@ _snap_local :: proc(rs: ^Snap_Restore, object: prim.Id) -> bool {
 	if v, ok := rs.local[object]; ok {
 		return v
 	}
-	found, _ := search.has_object(&rs.e.index, object)
+	found, _ := search.has_content(&rs.e.index, object)
 	rs.local[object] = found
 	return found
 }

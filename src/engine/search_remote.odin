@@ -189,6 +189,7 @@ Full_Active :: struct {
 	kind:     Kind,
 	progress: i64,
 	stall:    int,
+	probed:   bool,
 }
 
 @(private)
@@ -201,9 +202,10 @@ Flight :: struct {
 
 @(private)
 Pending_Ref :: struct {
-	ref:   Remote_Ref,
-	state: u8,
-	tries: u8,
+	ref:     Remote_Ref,
+	state:   u8,
+	tries:   u8,
+	waiting: bool,
 }
 
 @(private)
@@ -235,6 +237,7 @@ Remote_Q :: struct {
 	finished:    bool,
 	ready_now:   bool,
 	awaiting:    bool,
+	due:         bool,
 	plug:        bool,
 	result:      Search_Result,
 }
@@ -495,7 +498,8 @@ _full_step :: proc(e: ^Engine) {
 			unordered_remove(&r.active, i)
 			continue
 		}
-		done, progress := _full_check(e, sp, a.object, a.kind)
+		done, progress := _full_check(e, sp, a.object, a.kind, !a.probed)
+		r.active[i].probed = true
 		if done {
 			k := _full_key(a.space, a.object)
 			_reg_del(e, ROOT_SEARCH, k[:])
@@ -573,7 +577,7 @@ _full_step :: proc(e: ^Engine) {
 }
 
 @(private)
-_full_check :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) -> (done: bool, progress: i64) {
+_full_check :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, probe: bool) -> (done: bool, progress: i64) {
 	h, err := _handle_get(e, Object{sp.id, id}, kind)
 	if err != .None {
 		return err == .Not_Found || err == .Invalid, 0
@@ -605,7 +609,7 @@ _full_check :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) -> (done: b
 			done = false
 		}
 	}
-	if _ckpt_waiting(h) {
+	if _ckpt_waiting(h) || probe {
 		done = false
 	}
 	return
@@ -626,9 +630,16 @@ _full_kick :: proc(e: ^Engine, sp: ^Space) {
 
 @(private)
 _full_settle :: proc(e: ^Engine) {
+	_full_step(e)
 	for sid in _sorted_keys(e.spaces) {
 		sp := e.spaces[sid]
-		if !sp.open || !sp.connected || !_full_on(e, sp) {
+		if !sp.open || !sp.connected {
+			continue
+		}
+		if !_full_on(e, sp) {
+			if e.cfg.search {
+				_indexer_retract(e, sp)
+			}
 			continue
 		}
 		r := _remote(e)
@@ -663,10 +674,31 @@ _indexer_advertise :: proc(e: ^Engine, sp: ^Space, behind: int) -> Error {
 		omap.field_u64(INDEXER_TAG_BEHIND, u64(max(behind, 0))),
 	}
 	_, err := map_set(e, o, me[:], fields[:])
-	if err == .Pending {
+	if err == .Pending || err == .None {
+		k := _snap_key(SEARCH_KEY_ADVERTISED, sp.id)
+		v := [1]u8{1}
+		_reg_put(e, ROOT_SEARCH, k[:], v[:])
 		return .None
 	}
 	return err
+}
+
+@(private)
+_indexer_retract :: proc(e: ^Engine, sp: ^Space) {
+	k := _snap_key(SEARCH_KEY_ADVERTISED, sp.id)
+	if _, hit, _ := omap.db_get(&e.reg.db, ROOT_SEARCH, k[:], context.temp_allocator); !hit {
+		return
+	}
+	o, oerr := map_named(e, sp.id, INDEXERS_NAME)
+	if oerr != .None {
+		return
+	}
+	me := e.self
+	fields := [1]omap.Field{omap.field_u64(INDEXER_TAG_FLAGS, 0)}
+	if _, err := map_set(e, o, me[:], fields[:]); err == .None || err == .Pending {
+		_reg_del(e, ROOT_SEARCH, k[:])
+		delete_key(&_remote(e).advertised, sp.id)
+	}
 }
 
 @(private)
@@ -907,7 +939,7 @@ _cursor_split :: proc(q: ^Remote_Q, c: []u8) -> bool {
 @(private)
 _q_next :: proc(e: ^Engine, q: ^Remote_Q, sp: ^Space) -> (sent: bool, pending: bool) {
 	list: []Indexer
-	list, pending = _indexers(e, sp, context.temp_allocator, Ready{data = rawptr(uintptr(q.id)), call = _q_ready})
+	list, pending = _indexers(e, sp, context.temp_allocator, Ready{data = _q_ready_data(q.id, READY_NO_REF), call = _q_ready})
 	if q.peer_pin != {} {
 		for x, i in list {
 			if x.device == q.peer_pin && i > 0 {
@@ -1218,9 +1250,11 @@ _remote_step :: proc(e: ^Engine) {
 		}
 		if q.ready_now {
 			_q_finish(e, q, .Ok)
-		} else if q.answered {
+		} else if q.answered && q.due {
+			q.due = false
 			_q_verify(e, q)
-		} else if q.awaiting {
+		} else if q.awaiting && q.due {
+			q.due = false
 			if sp, ok := e.spaces[q.space]; ok {
 				_q_start(e, q, sp)
 			}
@@ -1284,6 +1318,19 @@ _remote_answer_in :: proc(e: ^Engine, sp: ^Space, q: ^Remote_Q, slot: int, paylo
 
 @(private)
 _q_accept :: proc(e: ^Engine, q: ^Remote_Q, from: prim.Id, ans: Remote_Answer, plug: bool) {
+	if ans.state == .Denied && !plug {
+		for &x in q.flights {
+			if x.live && x.device == from {
+				crypto.zero_explicit(&x.key, size_of(x.key))
+				x = {}
+			}
+		}
+		append(&q.sources, Search_Source{device = from, state = .Denied})
+		if sp, ok := e.spaces[q.space]; ok {
+			_q_retry(e, q, sp, .Offline)
+		}
+		return
+	}
 	for &x in q.flights {
 		crypto.zero_explicit(&x.key, size_of(x.key))
 		x = {}
@@ -1294,6 +1341,11 @@ _q_accept :: proc(e: ^Engine, q: ^Remote_Q, from: prim.Id, ans: Remote_Answer, p
 	q.hedge_at = 0
 	if ans.state != .Ok {
 		append(&q.sources, Search_Source{device = from, state = ans.state, behind = ans.behind})
+		if plug {
+			q.ready_now = true
+			_touch(e)
+			return
+		}
 		_q_finish(e, q, ans.state)
 		return
 	}
@@ -1305,24 +1357,48 @@ _q_accept :: proc(e: ^Engine, q: ^Remote_Q, from: prim.Id, ans: Remote_Answer, p
 		}
 		append(&q.refs, Pending_Ref{ref = x})
 	}
+	if plug {
+		q.answer.refs = nil
+		q.answer.cursor = slice.clone(ans.cursor, q.alloc)
+		q.answer.marks = slice.clone(ans.marks, q.alloc)
+		q.due = true
+		_touch(e)
+		return
+	}
 	_q_verify(e, q)
 }
 
 @(private)
+READY_NO_REF :: 127
+
+@(private)
+_q_ready_data :: proc "contextless" (id: u64, ref: int) -> rawptr {
+	return rawptr(uintptr(id << 7 | u64(ref & 127)))
+}
+
+@(private)
 _q_ready :: proc(data: rawptr, e: ^Engine, err: Error) {
-	id := u64(uintptr(data))
-	q := _q_find(e, id)
+	x := u64(uintptr(data))
+	q := _q_find(e, x >> 7)
 	if q == nil || q.finished {
 		return
 	}
+	if i := int(x & 127); i < len(q.refs) {
+		q.refs[i].waiting = false
+	}
+	q.due = true
 	_touch(e)
 }
 
 @(private)
 _q_verify :: proc(e: ^Engine, q: ^Remote_Q) {
 	pending := 0
-	for &p in q.refs {
+	for &p, i in q.refs {
 		if p.state != 0 {
+			continue
+		}
+		if p.waiting {
+			pending += 1
 			continue
 		}
 		r := p.ref
@@ -1333,7 +1409,7 @@ _q_verify :: proc(e: ^Engine, q: ^Remote_Q) {
 		rid: Rid
 		copy(rid.seg[:], r.ref[:16])
 		rid.off = i64(prim.get_u64le(r.ref[16:]))
-		ready := Ready{data = rawptr(uintptr(q.id)), call = _q_ready}
+		ready := Ready{data = _q_ready_data(q.id, i), call = _q_ready}
 		m, err := convo_message(e, Object{q.space, r.object}, convo.Position{msg = rid}, q.alloc, ready)
 		if err == .Pending {
 			p.tries += 1
@@ -1341,6 +1417,7 @@ _q_verify :: proc(e: ^Engine, q: ^Remote_Q) {
 				p.state = 2
 				continue
 			}
+			p.waiting = true
 			pending += 1
 			continue
 		}
@@ -1596,9 +1673,10 @@ _answer_decode :: proc(b: []u8, allocator: runtime.Allocator) -> (a: Remote_Answ
 
 @(private)
 _remote_serve :: proc(e: ^Engine, sp: ^Space, from: prim.Id, tag: u64, payload: []u8) {
-	if !_full_on(e, sp) || _index_open(e) != .None {
+	if len(payload) < osync.WRAP_LEN + chacha20poly1305.TAG_SIZE {
 		return
 	}
+	serving := _full_on(e, sp) && _index_open(e) == .None
 	ck: osync.Content_Key
 	if e.keyring.unwrap(e.keyring.data, payload[:osync.WRAP_LEN], &ck) != .None {
 		return
@@ -1645,6 +1723,13 @@ _remote_serve :: proc(e: ^Engine, sp: ^Space, from: prim.Id, tag: u64, payload: 
 	}
 	want := _member_proof(sp, payload[:osync.WRAP_LEN], e.self)
 	member := !sp.keyless && crypto.compare_constant_time(want[:], proof[:]) == 1
+	if !serving {
+		deny := [?]u8{REMOTE_VERSION, REMOTE_ANSWER, u8(Search_State.Denied), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+		reply: [len(deny) + chacha20poly1305.TAG_SIZE]u8
+		_aead_seal(key[:], 1, REMOTE_AD_ANSWER, reply[:len(deny)], reply[len(deny):], deny[:])
+		osync.replicator_direct(&sp.repl, osync.Device_Id(from), tag, reply[:])
+		return
+	}
 	limit = clamp(limit, 1, REMOTE_REF_MAX)
 	req := search.Request{limit = min(limit + skip, search.MAX_LIMIT), cursor = cursor, sort = sort, now = now}
 	res, serr := search.search(&e.index, query, req, context.temp_allocator)
@@ -1756,7 +1841,7 @@ _remote_pending :: proc(e: ^Engine) -> bool {
 		return true
 	}
 	for q in r.queries {
-		if q.ready_now && !q.finished {
+		if (q.ready_now || q.due) && !q.finished {
 			return true
 		}
 	}

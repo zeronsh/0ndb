@@ -732,7 +732,13 @@ what it holds, so search reaches across devices:
   the ordinary replicator, conversations and titles first, file trees only
   when configured. Nothing per object stays in memory between events and
   nothing wakes it at rest. It advertises itself in the space's
-  `0ndb:indexers` map: its card (for encryption) and its coverage.
+  `0ndb:indexers` map: its card (for encryption) and its coverage. A
+  device that leaves full mode retracts the entry, and until the retraction
+  reaches a requester it answers queries with `Denied`, so the requester
+  moves to the next indexer instead of waiting. An object counts as indexed
+  only against the relay's length learned after the indexer started
+  following it, and the check repeats at settle, so the last messages of a
+  burst are never missed.
 - *Peer query.* A requester sends one end-to-end encrypted query (an
   ephemeral X25519 key against the indexer's card, so only that device can
   read it) through the relay's direct-message path to an online indexer and
@@ -756,13 +762,28 @@ what it holds, so search reaches across devices:
   deadline; the first answer wins. With no indexer online the local results
   return at once, marked partial, and the engine emits `Indexer_Wanted` so a
   host can start one. Timers exist only while a query is in flight.
-- *Snapshots.* An indexer checkpoints its index as an ordinary encrypted
-  object of the space: each immutable index segment once, then a small
-  manifest naming the live segments and their exact per-source coverage.
-  Snapshots are incremental and taken only at settle. A fresh indexer
-  restores the newest manifest and catches up from there. Redaction
-  supersedes the manifest and zero-fills and punctures the segments that
-  covered the redacted record. Only space members can read a snapshot.
+- *Snapshots.* An indexer checkpoints its index through the checkpoint
+  machinery (`ckpt/0ndb:search`, one stream per indexer, newest record
+  wins). Each record lists a chain of deltas; each delta is a bare search
+  segment (stored text and document metadata, no postings) holding the
+  conversation documents and titles of one document-id range, plus
+  `(object, device, position)` coverage entries for the sources it
+  advanced. Blobs are content-addressed and sealed with a key tree derived
+  from the space's object key, so only space members can read them.
+  Snapshots are taken only at settle, once the indexer has caught up and
+  the new text exceeds max(16 KiB, 1/8 of the chain); a new delta merges
+  with the newest ones while they are no more than twice its size (and
+  under 32 MiB), so each byte is rewritten O(log n) times and the chain is
+  never rewritten whole. A fresh or wiped full indexer holds its indexing
+  until it has decided to restore: it fetches the newest record and its
+  deltas and imports them (re-tokenized, raising each source's position),
+  adopts the chain, then catches up from the announce feed. The import is
+  crash-safe: a registry marker lets a restart undo a partial import. A
+  restored device also replays redaction ranges it has seen in the feed
+  over the imported documents. Redaction marks the chain dirty; at the next
+  settle every delta whose live document count dropped is rebuilt from the
+  local index, published, and the old blob is shredded (deleted on the
+  relay, its key cell punctured) and the superseded records zero-filled.
 - *Plug.* `Search_Remote` routes peer queries to an embedder's own hosted
   indexer instead of the relay path; its answers are verified the same way.
 
