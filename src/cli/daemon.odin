@@ -43,6 +43,7 @@ Daemon :: struct {
 	engine_dir: string,
 	sock:       string,
 	state_path: string,
+	state_durable: [dynamic]u8,
 	lfd:        Sock,
 	lwatch:     prim.Watch,
 	sig:        Signals,
@@ -1047,6 +1048,13 @@ _state_load :: proc(d: ^Daemon) {
 			}
 		}
 	}
+	mw := prim.writer(&d.state_durable)
+	prim.write_uvarint(&mw, u64(len(d.state.mounts)))
+	for m in d.state.mounts {
+		prim.write_id(&mw, m.object.space)
+		prim.write_id(&mw, m.object.id)
+		prim.write_str(&mw, m.root)
+	}
 	dir := _caps_dir(d)
 	h, derr := os.open(dir)
 	if derr != nil {
@@ -1079,13 +1087,43 @@ _state_save :: proc(d: ^Daemon) {
 	prim.write_id(&w, d.state.default_space)
 	prim.write_id(&w, d.state.current.space)
 	prim.write_id(&w, d.state.current.id)
+	mounts_at := len(buf)
 	prim.write_uvarint(&w, u64(len(d.state.mounts)))
 	for m in d.state.mounts {
 		prim.write_id(&w, m.object.space)
 		prim.write_id(&w, m.object.id)
 		prim.write_str(&w, m.root)
 	}
-	prim.replace_atomic(prim.os_vfs(), d.state_path, buf[:])
+	if w.err != .None {
+		return
+	}
+	mounts := buf[mounts_at:]
+	if string(mounts) != string(d.state_durable[:]) {
+		if prim.replace_atomic(prim.os_vfs(), d.state_path, buf[:]) == .None {
+			clear(&d.state_durable)
+			append(&d.state_durable, ..mounts)
+		}
+		return
+	}
+	_state_replace_quiet(d.state_path, buf[:])
+}
+
+@(private)
+_state_replace_quiet :: proc(path: string, data: []u8) {
+	vfs := prim.os_vfs()
+	tmp, terr := strings.concatenate({path, ".tmp"}, context.temp_allocator)
+	if terr != nil {
+		return
+	}
+	fd, oerr := prim.open_file(vfs, tmp, {.Write, .Create, .Truncate})
+	if oerr != .None {
+		return
+	}
+	werr := prim.write_at(vfs, fd, data, 0)
+	prim.close_file(vfs, fd)
+	if werr != .None || prim.rename(vfs, tmp, path) != .None {
+		prim.remove(vfs, tmp)
+	}
 }
 
 @(private)
