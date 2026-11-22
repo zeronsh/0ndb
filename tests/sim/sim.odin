@@ -291,6 +291,8 @@ inject_fault :: proc(w: ^World, r: ^Rng) {
 }
 
 run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label := "first", quiet := false) -> (res: Run_Result) {
+	saved := sim_globals()
+	defer sim_globals_set(saved)
 	cfg := default_config(seed)
 	cfg.verbose = verbose
 	cfg.quiet = quiet
@@ -578,7 +580,8 @@ free_result :: proc(res: ^Run_Result) {
 
 @(test)
 simulate :: proc(t: ^testing.T) {
-	sync.mutex_guard(&serial)
+	test_begin(t)
+	defer test_end(t)
 	verbose := env_u64("SIM_VERBOSE", 0) != 0
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 && env_u64("SIM_SHRINK", 0) != 0 {
 		seed, _ := strconv.parse_u64(s)
@@ -652,11 +655,12 @@ simulate :: proc(t: ^testing.T) {
 	seeds := make([dynamic]u64, runtime.heap_allocator())
 	defer delete(seeds)
 	probe := ""
+	child_env: []string
 	if count > 0 {
 		if _, set := os.lookup_env("SIM_RID_PROBE", context.temp_allocator); !set {
-			os.set_env("SIM_RID_PROBE", "1")
-		}
-		if env_u64("SIM_RID_PROBE", 0) != 0 {
+			child_env = []string{"SIM_RID_PROBE=1"}
+			probe = "SIM_RID_PROBE=1 "
+		} else if env_u64("SIM_RID_PROBE", 0) != 0 {
 			probe = "SIM_RID_PROBE=1 "
 		}
 		base := env_u64("SIM_BASE", u64(time.now()._nsec))
@@ -684,7 +688,7 @@ simulate :: proc(t: ^testing.T) {
 	every := max(env_u64("SIM_REPLAY_EVERY", 1), 1)
 	for seed, i in seeds {
 		replay := count == 0 || u64(i) % every == 0
-		st, ok, why := run_child(seed, replay)
+		st, ok, why := run_child(seed, replay, add = child_env)
 		if !ok {
 			fmt.eprintf("sim: seed %d FAILED (%s). Reproduce: %sSIM_SEED=%d odin test tests/sim -o:speed\n", seed, why, probe, seed)
 			append(&failed, seed)
@@ -846,7 +850,7 @@ _hexrun :: proc(s: string) -> int {
 	return n
 }
 
-run_child :: proc(seed: u64, replay: bool, extra: []string = nil) -> (st: Wire_Stats, ok: bool, why: string) {
+run_child :: proc(seed: u64, replay: bool, extra: []string = nil, add: []string = nil) -> (st: Wire_Stats, ok: bool, why: string) {
 	env := make([dynamic]string, context.temp_allocator)
 	environ, _ := os.environ(context.temp_allocator)
 	for kv in environ {
@@ -858,6 +862,9 @@ run_child :: proc(seed: u64, replay: bool, extra: []string = nil) -> (st: Wire_S
 	append(&env, fmt.tprintf("SIM_SEED=%d", seed))
 	append(&env, fmt.tprintf("SIM_REPLAY=%d", 1 if replay else 0))
 	for x in extra {
+		append(&env, x)
+	}
+	for x in add {
 		append(&env, x)
 	}
 	buf: [size_of(Wire_Stats)]u8

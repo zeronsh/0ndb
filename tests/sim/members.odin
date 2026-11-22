@@ -4,7 +4,6 @@ import "core:crypto/blake2b"
 import "core:fmt"
 import "core:os"
 import "core:strconv"
-import "core:sync"
 import "core:testing"
 import "../../src/convo"
 import omap "../../src/map"
@@ -64,6 +63,14 @@ Mem_Result :: struct {
 
 @(private = "file")
 _mw: ^Mem_World
+
+members_world :: proc() -> ^Mem_World {
+	return _mw
+}
+
+members_world_set :: proc(mw: ^Mem_World) {
+	_mw = mw
+}
 
 @(private = "file")
 _prf :: proc(seed: []u8, salt: [32]u8, out: ^[32]u8) {
@@ -1594,7 +1601,8 @@ membership :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		return
 	}
-	sync.mutex_guard(&serial)
+	test_begin(t)
+	defer test_end(t)
 	from: u64 = 1
 	count: u64 = 6
 	if s, ok := os.lookup_env("SIM_MEMBER_SEED", context.temp_allocator); ok && len(s) > 0 {
