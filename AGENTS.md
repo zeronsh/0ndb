@@ -43,6 +43,15 @@
   (`C:\Users\wing_\dev\...` on Windows); `home-laptop` has little free disk.
 - Work lands as small PRs into `odin-rewrite`; the coordinator verifies and
   merges them.
+- Before opening or updating a PR, rebase it onto the current
+  `origin/odin-rewrite` (a new branch name, never a force-push), run
+  `tools/gate.sh <scratch dir>` in that checkout and paste its summary block,
+  unedited, into the PR body. A PR whose summary is not `result: PASS` on a
+  base at most a few commits old is not ready. The gate builds with private
+  `-out` paths and takes about 15 minutes on 8 cores.
+- `tools/gate-bisect.sh '<env>' <base> <commit>...` builds every point in
+  parallel and runs one failing seed on each, for finding which commit
+  breaks a seed.
 
 ## Rules
 
