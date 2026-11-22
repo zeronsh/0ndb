@@ -354,6 +354,9 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 	p.recovering = false
 	p.unclean = !sb.clean
 	_suspect_repair(p) or_return
+	for id in ext_ids {
+		_ext_trim(p, id) or_return
+	}
 	if !sb.clean {
 		for id in ext_ids {
 			xb: prim.Path_Buf

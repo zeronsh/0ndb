@@ -225,6 +225,11 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 	if p.nrec == 0 && !p.force {
 		return false, .None
 	}
+	if p.opts.before_commit != nil {
+		if berr := p.opts.before_commit(p.opts.before_data); berr != .None {
+			return false, _poison(p, berr)
+		}
+	}
 	p.force = false
 	if p.dirsync_pending {
 		p.fl.dirsync = true

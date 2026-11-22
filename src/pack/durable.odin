@@ -45,6 +45,9 @@ _current_size :: proc(p: ^Pack, inum: u64) -> (size: i64, err: Error) {
 	if !found {
 		return 0, .Not_Found
 	}
+	if ino.kind == .External && ino.size >= 0 {
+		return ino.size, .None
+	}
 	if ino.kind == .External {
 		pb: prim.Path_Buf
 		st := prim.stat(p.base, _phys_path(p, &pb, 'x', inum)) or_return
@@ -143,4 +146,52 @@ _ext_before :: proc(p: ^Pack, oi: ^Open_Inode) -> (i64, Error) {
 		return pd.steps[n - 1].size if n > 0 else pd.base, .None
 	}
 	return _perr_size(prim.file_size(p.base, oi.real_fd))
+}
+
+@(private)
+_mark_visible :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
+	old := oi.ino
+	oi.ino.visible = true
+	if oi.ino.kind == .External {
+		oi.ino.size = _perr_size(prim.file_size(p.base, oi.real_fd)) or_return
+	}
+	return _inode_store(p, oi.inum, &old, &oi.ino)
+}
+
+@(private)
+_ext_commit_size :: proc(p: ^Pack, oi: ^Open_Inode, size: i64) -> Error {
+	if oi.ino.size == size {
+		return .None
+	}
+	old := oi.ino
+	oi.ino.size = size
+	oi.ino.mtime = _now(p)
+	return _inode_store(p, oi.inum, &old, &oi.ino)
+}
+
+@(private)
+_ext_trim :: proc(p: ^Pack, inum: u64) -> Error {
+	ino: Inode
+	found := _inode_load(p, inum, &ino) or_return
+	if !found || ino.kind != .External || !ino.visible || ino.size < 0 {
+		return .None
+	}
+	pb: prim.Path_Buf
+	fd, oerr := prim.open_file(p.base, _phys_path(p, &pb, 'x', inum), {.Write})
+	if oerr == .Not_Found {
+		return .None if ino.size == 0 else .Io
+	}
+	if oerr != .None {
+		return oerr
+	}
+	defer prim.close_file(p.base, fd)
+	size := prim.file_size(p.base, fd) or_return
+	if size < ino.size {
+		return .Io
+	}
+	if size > ino.size {
+		prim.truncate(p.base, fd, ino.size) or_return
+		_sync(p, fd) or_return
+	}
+	return .None
 }

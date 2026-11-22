@@ -380,6 +380,7 @@ _open_rel :: proc(p: ^Pack, path: string, rel: string, flags: prim.Open_Flags, m
 		}
 		ino: Inode
 		ino.kind = .File
+		ino.visible = .Group_Visible in flags
 		ino.mode = 0o100000 | (mode & 0o7777)
 		ino.mtime = _now(p)
 		n, cerr := _create(p, parent, name, &ino)
@@ -399,6 +400,12 @@ _open_rel :: proc(p: ^Pack, path: string, rel: string, flags: prim.Open_Flags, m
 	}
 	p.handles[idx] = Handle{used = true, write = .Write in flags, oi = oi, inum = inum}
 	fd := VFD_BASE + prim.Fd(idx)
+	if .Group_Visible in flags && !oi.ino.visible && .Write in flags {
+		if e := _mark_visible(p, oi); e != .None {
+			_v_close(p, fd)
+			return prim.INVALID_FD, e
+		}
+	}
 	if found && .Truncate in flags && .Write in flags {
 		if e := _truncate(p, &p.handles[idx], 0); e != .None {
 			_v_close(p, fd)
@@ -550,7 +557,12 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 		before := _ext_before(p, oi) or_return
 		oi.dirty = true
 		prim.write_at(p.base, oi.real_fd, src, off) or_return
-		_pend_note(p, oi.inum, before, max(before, off + i64(len(src))))
+		after := max(before, off + i64(len(src)))
+		_pend_note(p, oi.inum, before, after)
+		if oi.ino.visible {
+			_ext_commit_size(p, oi, after) or_return
+			return _maybe_flush(p)
+		}
 		return .None
 	}
 	old := oi.ino
@@ -634,7 +646,9 @@ _promote :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
 	old := oi.ino
 	oi.ino.kind = .External
 	oi.ino.n = 0
-	oi.ino.size = 0
+	if !oi.ino.visible {
+		oi.ino.size = 0
+	}
 	_inode_store(p, oi.inum, &old, &oi.ino) or_return
 	oi.real_fd = fd
 	oi.dirty = true
@@ -655,6 +669,9 @@ _truncate :: proc(p: ^Pack, h: ^Handle, size: i64) -> Error {
 		oi.dirty = true
 		prim.truncate(p.base, oi.real_fd, size) or_return
 		_pend_note(p, oi.inum, before, size)
+		if oi.ino.visible {
+			return _ext_commit_size(p, oi, size)
+		}
 		return .None
 	}
 	if size == oi.ino.size {
@@ -751,7 +768,9 @@ _v_sync :: proc(data: rawptr, fd: prim.Fd) -> Error {
 			_suspect_record(p, []u64{h.oi.inum})
 			return _poison(p, e)
 		}
-		_pend_synced(p, h.oi.inum)
+		if !h.oi.ino.visible {
+			_pend_synced(p, h.oi.inum)
+		}
 		return .None
 	}
 	return sync(p)
