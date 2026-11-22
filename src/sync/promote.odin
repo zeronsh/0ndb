@@ -25,6 +25,7 @@ Promotion :: struct {
 	state:    Promotion_State,
 	sent:     i64,
 	uploaded: i64,
+	trimmed:  bool,
 }
 
 @(private)
@@ -148,6 +149,16 @@ _promote_on_noted :: proc(r: ^Replicator, id: Stream_Id, base, length: i64) {
 }
 
 @(private)
+_promote_on_trimmed :: proc(r: ^Replicator, id: Stream_Id, base: i64) {
+	p, _ := _promotion_find(r, id)
+	if p == nil || p.state == .Done {
+		return
+	}
+	p.trimmed = true
+	p.base = base
+}
+
+@(private)
 _promote_on_refused :: proc(r: ^Replicator, id: Stream_Id, code: Code) -> bool {
 	p, _ := _promotion_find(r, id)
 	if p == nil {
@@ -222,7 +233,11 @@ _promote_step :: proc(r: ^Replicator, p: ^Promotion) {
 	if _own_busy(r, p) {
 		return
 	}
-	if p.base <= p.target || p.base <= 0 {
+	if p.base <= p.target || p.base <= 0 || p.trimmed {
+		_promotion_done(r, p, true)
+		return
+	}
+	if l, has := r.locals[p.id]; has && p.own && l.arc_sealed > 0 && p.base <= l.arc_sealed {
 		_promotion_done(r, p, true)
 		return
 	}
