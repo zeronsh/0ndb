@@ -344,6 +344,8 @@ Replicator :: struct {
 	live_recv:  i64,
 	trims:      map[Stream_Id]i64,
 	arc_dir:    bool,
+	restores_written: u64,
+	restores_read:    u64,
 	allocator:  runtime.Allocator,
 }
 

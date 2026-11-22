@@ -242,6 +242,9 @@ cmd_relay :: proc(a: ^Args) -> int {
 	signals_close(&m.sig)
 	prim.loop_destroy(&m.loop)
 	fmt.printfln("relay stopped (%d appends, %s in, %s out, %d object-store writes, %s)", st.appends, bytes_human(i64(st.bytes_in)), bytes_human(i64(st.bytes_out)), m.objects.puts, bytes_human(i64(m.objects.bytes)))
+	if m.objects.rewrites > 0 {
+		fmt.printfln("object-store rewrites %d (%s)", m.objects.rewrites, bytes_human(i64(m.objects.rewrite_bytes)))
+	}
 	if m.objects.gets > 0 {
 		fmt.printfln("object-store reads %d (%s)", m.objects.gets, bytes_human(i64(m.objects.get_bytes)))
 	}

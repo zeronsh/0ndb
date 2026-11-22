@@ -111,6 +111,8 @@ _repl_stop :: proc(e: ^Engine, sp: ^Space) {
 		prim.timer_cancel(e.loop, sp.reopen)
 		sp.reopen = 0
 	}
+	e.stats.restores_written += sp.repl.restores_written
+	e.stats.restores_read += sp.repl.restores_read
 	osync.replicator_stop(&sp.repl)
 	osync.replicator_destroy(&sp.repl)
 	sp.repl_on = false
