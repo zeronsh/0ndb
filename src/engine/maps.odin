@@ -249,50 +249,75 @@ _map_table :: proc(e: ^Engine, h: ^Handle) -> Error {
 		_oerr(omap.table_open(&h.table, e.vfs, path, nil, e.allocator)) or_return
 	}
 	h.table_open = true
-	own := obj.writer_durable(&h.mw.core) if h.w_open else (_own_stream_len(e, h.id, .Map) or_return)
-	if cur, cerr := omap.table_consumed(&h.table, e.self); cerr != .None || cur > own {
-		return _oerr(omap.table_reset(&h.table))
-	}
 	return .None
 }
 
 @(private)
+_map_own_source :: proc(e: ^Engine, h: ^Handle) -> (src: omap.Source, err: Error) {
+	if h.w_open {
+		return omap.Source{seg = e.self, reader = &h.mw.core.jr}, .None
+	}
+	return omap.Source{seg = e.self, upto = _own_stream_len(e, h.id, .Map) or_return}, .None
+}
+
+@(private)
 _map_own_check :: proc(e: ^Engine, h: ^Handle) -> Error {
-	return _map_table(e, h)
+	_map_table(e, h) or_return
+	own := _map_own_source(e, h) or_return
+	sources := [1]omap.Source{own}
+	return _oerr(omap.table_prepare(&h.table, sources[:]))
 }
 
 @(private)
 _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 	_map_table(e, h) or_return
 	_handle_refresh(h)
-	missing := false
 	if h.w_open {
 		if cerr := omap.writer_commit(&h.mw); cerr != .None && cerr != .Busy {
 			return _oerr(cerr)
 		}
-		if _, err := omap.table_apply(&h.table, e.self, &h.mw.core.jr); err != .None && err != .Missing {
-			return _oerr(err)
-		} else if err == .Missing {
-			missing = true
+	}
+	sources := make([dynamic]omap.Source, context.temp_allocator)
+	append(&sources, _map_own_source(e, h) or_return)
+	for s in h.segs {
+		if s.in_view {
+			append(&sources, omap.Source{seg = s.device, reader = &s.jr})
 		}
 	}
-	for s in h.segs {
-		if !s.in_view {
-			missing = true
-			continue
+	for _ in 0 ..< 2 {
+		_oerr(omap.table_prepare(&h.table, sources[:])) or_return
+		missing := false
+		for s in h.segs {
+			if !s.in_view {
+				missing = true
+			}
 		}
-		if _, err := omap.table_apply(&h.table, s.device, &s.jr); err != .None {
+		for src, i in sources {
+			if src.reader == nil {
+				continue
+			}
+			_, err := omap.table_apply(&h.table, src.seg, src.reader)
 			if err == .Missing {
 				missing = true
 				if h.sp.repl_on {
-					_follow(e, h, s, true)
+					for s in h.segs {
+						if s.device == src.seg {
+							_follow(e, h, s, true)
+						}
+					}
 				}
-				continue
+			} else if err != .None {
+				if h.w_open && i == 0 && !omap.table_poisoned(&h.table) {
+					return _oerr(err)
+				}
+				_log(e, .Warn, "map apply failed")
 			}
-			_log(e, .Warn, "map apply failed")
+		}
+		if !omap.table_poisoned(&h.table) {
+			return .Missing if missing else .None
 		}
 	}
-	return .Missing if missing else .None
+	return .Io
 }
 
 @(private)

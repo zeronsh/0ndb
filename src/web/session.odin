@@ -1372,9 +1372,15 @@ _settle :: proc(s: ^Session) {
 			continue
 		}
 		if o.table_ok {
+			sources := make([dynamic]omap.Source, context.temp_allocator)
 			for sg in o.segs {
 				if sg.in_view {
-					omap.table_apply(&o.table, sg.device, &sg.jr)
+					append(&sources, omap.Source{seg = sg.device, reader = &sg.jr})
+				}
+			}
+			if omap.table_prepare(&o.table, sources[:]) == .None {
+				for src in sources {
+					omap.table_apply(&o.table, src.seg, src.reader)
 				}
 			}
 		}
