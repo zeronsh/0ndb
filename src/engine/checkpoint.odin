@@ -102,12 +102,12 @@ _checkpoints_write :: proc(e: ^Engine) {
 		if (h.kind != .Text && h.kind != .File_Tree) || !h.w_open || h.hist == nil || !h.hist.awake || !h.sp.repl_on || !h.sp.connected {
 			continue
 		}
-		if _storage_class(e, h.sp, h.id, h.kind) == .Device {
-			continue
-		}
 		n := _own_len(h)
 		last, prev, had := _ckpt_get(e, h.id)
 		if n - max(last, 0) < CKPT_MIN_BYTES {
+			continue
+		}
+		if _storage_class(e, h.sp, h.id, h.kind) == .Device {
 			continue
 		}
 		if err := _checkpoint_write(e, h, n, prev, had); err != .None {
