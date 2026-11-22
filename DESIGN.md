@@ -84,6 +84,7 @@ src/
   prim/      ids, hlc, codec, Vfs, event loop, processes
   pack/      container Vfs: millions of small streams in shared files, one fsync per tick
   journal/   the record log format (local, replica, wire), recovery, redaction, signed chains
+  arc/       segment archives: grouped, compressed, sealed groups of records, seals, verification
   obj/       objects and segments: refs, segment tables, links, missing ranges, keys, redaction
   convo/     the conversation kind: message trees, blocks, branches, runs, intents, compaction
   map/       the map kind: registers, sets, materialized ordered views
@@ -1460,42 +1461,84 @@ Relay cost tracks the reachable information, not the activity. Items marked
   gets one Block per block and one signature per commit instead of a chunk
   and a signature every 50 ms (about 300 B of framing and signature per
   tick today, 6 KB per second of streaming).
-- **Segment archives** (planned). A writer periodically archives a prefix
-  `[0, B)` of each of its segments (conversations, maps, texts alike), `B`
-  a record boundary at or below what the relay acknowledged. The archive is
-  the writer's own stream `arc/<segment>`: group records of consecutive
-  segment records, each `Group{first offset, count, H, zstd(len ‖ body)*}`
-  with groups of 256 KiB raw compressed at a high level off the hot path,
-  signature records elided, sealed per record from the archive's own key
-  tree, and an archive seal carrying the segment's chain head at `B` and
-  signed by the writer. `H` folds the per-record chain commitments of the
-  group. Once the relay acknowledged the seal, the writer sends
-  `Trim{segment, B}`, and the relay drops `[0, B)` of the stored segment
-  (its `base` becomes `B`, as for hollow segments). Mapping: none is
-  needed. Offsets are the record ids, the archive reproduces every archived
-  record's exact stored body at its original offset and length, and a
-  reader below `base` materializes records from the archive into its sparse
-  replica, verified against `H` and the archive seal; elided signature
-  records materialize as redacted-form placeholders, since the archive seal
-  replaces their role and they carry no content. So every Ref, chain
-  position and CRDT position resolves to the same bytes before and after.
-  Crash safety: `Trim` is sent only after the seal is durable on the relay
-  and is idempotent; a crash before it leaves the segment whole and the
-  archive is resumed or redone. Redaction: a record inside a group cannot
-  be zero-filled alone, so the redactor (any member: it holds the keys)
-  writes `Restore{group ref, the group without that record, the removed
-  record's commitment}` into its own segment of the object, then the group
-  is zero-filled and its key punctured everywhere; readers of the other
-  records of that group resolve them through the restore, verifying them
-  against `H`, and the writer's next archive absorbs the restore. Nothing
-  other than the redacted record is lost and its bytes exist nowhere.
-  Projected for the transcript: the segment's 6.53 MB archive to 1.3 MB at
-  level 3 and 0.9 to 1.1 MB at level 19, the two maps to 34 KB together,
-  with the feed folded relative to its snapshot size (below) and the pack's
-  active container compacted, about 1.0 to 1.2 MB on the relay, 1.3 to 1.6
-  times the text's zstd size. Every version reachable from a message is
-  kept; superseded run lines and runs, deleted forks and redacted content
-  are collected the same way. Cold-tier movement is a `Relay_Storage` hint.
+- **Segment archives.** A writer archives a closed prefix `[0, B)` of each
+  of its segments (conversations, maps, texts and trees alike) into its own
+  archive stream `arc/<segment>` (same device and epoch, so any reader
+  derives its id), then drops the stored prefix with `Trim`. No mapping
+  exists: offsets stay the record ids, and the archive reproduces every
+  archived record's exact stored body at its original offset and length.
+  The format (`src/arc`, built):
+  - *Group* record: kind 1, version, `first`, `end`, record count, the
+    segment chain heads before `first` and after `end`, mode (plain for
+    transparent spaces, sealed otherwise), the key-tree cell shift and a
+    16-byte random salt, then one zstd frame (level 19), sealed with
+    ChaCha20-Poly1305 under the group key with the header as associated
+    data. The frame holds a metadata section (per record: kind and stored
+    length; for a redacted record its 32-byte chain commitment; for a
+    record whose body ends in a per-record zstd frame, the raw prefix and
+    the inflated length; small structured bodies verbatim) followed by a
+    data section of inflated text, so text compresses against text. A body
+    is stored inflated only if recompressing it with the pinned zstd at the
+    per-record level reproduces the stored frame byte for byte, checked
+    when archiving; otherwise it is kept verbatim. Signature records are
+    elided (kind and length only): they are not part of the chain, and the
+    writer-signed archive replaces their role. Groups close at 1 MiB of
+    raw content.
+  - *Group key*: BLAKE2b over the domain, `first`, `end` and the key of
+    every key-tree cell in `[first, end)`, then keyed BLAKE2b of the salt.
+    A redaction punctures a record's cell, so after any redaction inside a
+    group its key is underivable on every device and the relay never had
+    it; the salt makes every (key, nonce) pair unique even if a group is
+    re-archived with different compression. Readers need no layout before
+    decrypting. Correction of the earlier design: a key from the group's
+    record keys alone cannot be derived without knowing which records the
+    group holds; the cell grid needs nothing but the range.
+  - *Seal* record: kind 2, `B`, the segment chain head at `B`, and the group
+    index (first, end, archive offset per group, delta coded). A seal holds
+    every entry since the last full seal and is full again once its delta
+    reaches half the full index, so a reader finds any group with two reads
+    (the tail and the last full seal) and the index costs O(groups)
+    overall. A later entry for the same `first` supersedes an earlier one.
+  - The archive stream itself is an ordinary chained, signed journal
+    (plain at the journal layer, since groups carry their own AEAD), so
+    the relay can withhold but not alter it, and it is never archived.
+  - *Verification*: a reader opens a group, recomputes each body's chain
+    commitment with the segment's keys, takes redacted records'
+    commitments from the group, folds from `head_before` and must reach
+    `head_after`; the seal's head must equal the head of the stored suffix
+    at `B` (the first stored signature's `prev_head`). Two different heads
+    are equivocation.
+  - *Materialization*: verified records are written into the reader's
+    sparse replica in wire form (resealed per record with the segment key
+    at the same offset, which reproduces the writer's ciphertext exactly),
+    signature records as redacted-form placeholders; the replica records
+    the range as archive-verified so chain checks there use the archive.
+    Paging both ways is unchanged.
+  - Measured on a 4.16 MB synthetic tool-heavy transcript (2,769 messages,
+    sequential repository source and agent text; zstd -3 1.03 MB, -19
+    0.77 MB) recorded through `0ndb record`: the conversation segment's
+    3.92 MB (0.81 MB of it signature records) archives to 1.20 MB in
+    5 groups (1.30 MB with 256 KiB groups, 1.22 MB at level 9), the
+    catalog's 713 KB to 7.6 KB; every record round-trips byte for byte.
+    Archiving costs 80 ms per MB of segment (most of it the
+    recompression check), reading 30 ms per MB, both off the append path.
+  The rest is the planned integration. Runs start once enough acknowledged
+  bytes accumulate past the last seal; `B` is a commit boundary strictly
+  below the relay's length, so a trimmed segment always keeps one stored
+  commit and never looks device-only. `Trim{segment, B}` is sent only once
+  the seal is durable on the relay and is idempotent, so a crash anywhere
+  leaves the segment whole and the run is resumed or redone. Redaction: a
+  record inside a group cannot be zero-filled alone, so the redactor (any
+  member: it holds the keys) writes `Restore{group ref, the group without
+  that record, the removed record's commitment}` into its own segment of
+  the object, then the group is zero-filled and its key punctured
+  everywhere; readers of the other records of that group resolve them
+  through the restore, verifying them against `head_after`, and the
+  writer's next archive absorbs the restore. Nothing other than the
+  redacted record is lost and its bytes exist nowhere. Every version
+  reachable from a message is kept; superseded run lines and runs,
+  deleted forks and redacted content are collected the same way.
+  Cold-tier movement is a `Relay_Storage` hint.
 - **Relay write amplification.** The usage counter is written once per
   group commit, not per append; the feed is folded when it exceeds twice its
   last folded size (64 KiB floor); and the relay's pack rolls its active
