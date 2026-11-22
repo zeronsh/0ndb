@@ -875,33 +875,38 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	defer virtual.arena_temp_end(scratch)
 	ops := _edits_delta(b, edits) or_return
 	cur := ops[:]
-	for &s in b.sent {
+	moved := make([][]crdt.Delta_Op, len(b.sent), context.temp_allocator)
+	for s, i in b.sent {
 		a2 := make([dynamic]crdt.Delta_Op, context.temp_allocator)
 		b2 := make([dynamic]crdt.Delta_Op, context.temp_allocator)
 		crdt.delta_transform(cur, s.ops, _utf16(b), &a2, &b2)
-		nops, nbytes := _ops_clone(e, b2[:])
+		moved[i] = b2[:]
+		cur = a2[:]
+	}
+	x: Built
+	_built_init(&x)
+	committed := false
+	last: crdt.Op_Id
+	if len(cur) > 0 {
+		_handle_create_writer(h) or_return
+		seq0 := fs.history_next_seq(h.hist, b.actor)
+		_delta_runs(b, cur, seq0, &x) or_return
+		if len(x.runs) > 0 {
+			last = _commit_runs(e, b, h, &x, seq0) or_return
+			committed = true
+		}
+	}
+	for &s, i in b.sent {
+		nops, nbytes := _ops_clone(e, moved[i])
 		_ops_free(e, s.ops)
 		b.sent_bytes += nbytes - s.bytes
 		s.ops = nops
 		s.bytes = nbytes
-		cur = a2[:]
 	}
 	b.recv += 1
-	if len(cur) == 0 {
+	if !committed {
 		return b.recv, b.rev, .None
 	}
-	_handle_create_writer(h) or_return
-	seq0 := fs.history_next_seq(h.hist, b.actor)
-	x: Built
-	_built_init(&x)
-	if derr := _delta_runs(b, cur, seq0, &x); derr != .None {
-		b.recv -= 1
-		return 0, 0, derr
-	}
-	if len(x.runs) == 0 {
-		return b.recv, b.rev, .None
-	}
-	last := _commit_runs(e, b, h, &x, seq0) or_return
 	v := [1]crdt.Op_Id{last}
 	reloaded, aerr := fs.history_view_advance_ex(h.hist, b.view, v[:], {})
 	clear(&b.version)
