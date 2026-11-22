@@ -205,6 +205,9 @@ registry_notify :: proc(reg: ^Registry, path: string, kind: Watch_Kind) {
 		if m.has_git && (path_under(path, m.git.dir) || (len(m.git.common) > 0 && path_under(path, m.git.common))) {
 			name := path_name(path)
 			parent := path_parent(path)
+			if parent == m.git.dir && name == "index.lock" {
+				mount_git_lock(m, kind != .Gone && prim.exists(m.vfs, path))
+			}
 			if (parent == m.git.dir || parent == m.git.common) && (name == "HEAD" || name == "index" || name == "ORIG_HEAD" || name == "MERGE_HEAD") {
 				mount_mark_git(m)
 			}
@@ -247,6 +250,7 @@ Write_Observer :: struct {
 	stop:    proc(data: rawptr, reg: ^Registry),
 	changed: proc(data: rawptr, m: ^Mount, rel: string) -> (^Scope, bool),
 	fence:   proc(data: rawptr, reg: ^Registry, done: proc(data: rawptr), done_data: rawptr),
+	lock_procs: proc(data: rawptr, lock: string, roots: []string, allocator: runtime.Allocator) -> []Git_Proc,
 }
 
 Mount :: struct {
@@ -278,6 +282,10 @@ Mount :: struct {
 	rescan:      bool,
 	git_moved:   bool,
 	fence_seq:   u64,
+	git_locked:  bool,
+	lock_first:  bool,
+	lock_stale:  bool,
+	lock_watches: [dynamic]Lock_Watch,
 	conv_seq:    u64,
 	fences:      [dynamic]Fence,
 	timer:       prim.Timer,
@@ -482,6 +490,11 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.slot = slot
 	mount_wake(m) or_return
 	mount_shadow_reconcile(m) or_return
+	if m.has_git {
+		if lock, lerr := path_join(m.git.dir, "index.lock", context.temp_allocator); lerr == nil && prim.exists(m.vfs, lock) {
+			mount_git_lock(m, true)
+		}
+	}
 	m.shadow.hold = true
 	m.clean = false
 	save_mount_state(m) or_return
@@ -572,6 +585,9 @@ drop_lost :: proc(m: ^Mount, dir: string, lost: []Lost_Range) -> Error {
 }
 
 mount_close :: proc(m: ^Mount) {
+	mount_unlock(m)
+	delete(m.lock_watches)
+	m.lock_watches = nil
 	if m.awake && len(m.dirty) > 0 {
 		mount_pass(m, false)
 	}
@@ -1030,6 +1046,9 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 	}
 	m.timer = prim.timer(m.reg.loop, delay_ms, m, proc(l: ^prim.Loop, data: rawptr) {
 		mm := (^Mount)(data)
+		if mount_lock_held(mm) {
+			return
+		}
 		if mm.reg.on_ready != nil {
 			mm.reg.on_ready(mm, mm.reg.ready_data)
 		} else {
@@ -1039,6 +1058,7 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 }
 
 mount_run :: proc(m: ^Mount) -> Error {
+	m.lock_first = false
 	fence := false
 	for f in m.fences {
 		if fence_ready(f) {

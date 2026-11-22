@@ -254,6 +254,9 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 			continue
 		}
 		if m.has_git && (strings.has_prefix(p, m.git.dir) || strings.has_prefix(p, m.git.common)) {
+			if path_parent(p) == m.git.dir && path_name(p) == "index.lock" {
+				mount_git_lock(m, prim.exists(m.vfs, p))
+			}
 			mount_mark_git(m)
 			continue
 		}
