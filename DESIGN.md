@@ -2350,12 +2350,17 @@ Relay cost tracks the reachable information, not the activity. Items marked
   the two leaves bytes in both places, never in neither). An open stream
   builds its cold index (watermark and `Seg` records) from the manifest on
   first use and keeps it current while open; reads below the watermark are
-  ranged GETs from the batch objects, `sendfile` is refused there, and a
+  ranged GETs from the batch objects (asynchronous: `Object_Store.read`
+  completes later, the connection that needs the block is parked and
+  resumed through `Relay_Storage.on_ready`, concurrent reads of a 256 KiB
+  block share one request), `sendfile` is refused there, and a
   redaction reaching below it first restores the range into the pack from
   the objects, lowers the watermark durably, then redacts as before. A
   redaction is acknowledged only once a `Redacting` record naming its range
-  is durable in the manifest; the flush that rewrites the batch objects
-  holding the range writes the matching `Redact` entry, and a restart
+  is durable in the manifest; once every batch object holding the range is
+  rewritten (the rewrite's GET and PUT are asynchronous, serialized per
+  object, and a rewrite that keeps failing re-queues the redaction for the
+  next flush) the tier appends the matching `Redacted` record, and a restart
   re-queues every `Redacting` record without one, so a crash between the
   acknowledgement and the rewrite cannot leave the old bytes in the object
   store. A stream is never evicted while a redaction of it is in progress

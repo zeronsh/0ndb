@@ -51,4 +51,5 @@ Relay_Storage :: struct {
 	account:         proc(data: rawptr, ns: rawptr) -> Store_Account,
 	objects:         proc(data: rawptr, ns: rawptr, out: ^[dynamic]Object_Key) -> Error,
 	atomic:          bool,
+	on_ready:        proc(data: rawptr, cb: proc(ctx: rawptr), ctx: rawptr),
 }

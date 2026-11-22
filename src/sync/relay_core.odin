@@ -69,6 +69,7 @@ Relay_Core_Config :: struct {
 
 Relay_Core :: struct {
 	feed_held:  [dynamic]Space_Id,
+	parked:     [dynamic]Conn_Ref,
 	cfg:        Relay_Core_Config,
 	store:      Relay_Storage,
 	auth:       Authorizer,
@@ -298,6 +299,7 @@ Conn :: struct {
 	pcounted:  bool,
 	piped:     i64,
 	pipe_wait: bool,
+	parked:    bool,
 	pipe_on:   Conn_Ref,
 }
 
@@ -334,6 +336,10 @@ relay_core_init :: proc(r: ^Relay_Core, cfg: Relay_Core_Config, allocator := con
 	}
 	r.conns = make([dynamic]^Conn, allocator)
 	r.feed_held = make([dynamic]Space_Id, allocator)
+	r.parked = make([dynamic]Conn_Ref, allocator)
+	if r.store.on_ready != nil {
+		r.store.on_ready(r.store.data, _core_store_ready, r)
+	}
 	r.gens = make([dynamic]u32, allocator)
 	r.free = make([dynamic]u32, allocator)
 	r.graveyard = make([dynamic]^Conn, allocator)
@@ -380,6 +386,7 @@ relay_core_destroy :: proc(r: ^Relay_Core) {
 	delete(r.principals)
 	delete(r.conns)
 	delete(r.feed_held)
+	delete(r.parked)
 	delete(r.gens)
 	delete(r.free)
 	delete(r.graveyard)
@@ -408,6 +415,24 @@ relay_core_stats :: proc "contextless" (r: ^Relay_Core) -> Relay_Stats {
 	return s
 }
 
+@(private)
+_core_store_ready :: proc(ctx: rawptr) {
+	r := cast(^Relay_Core)ctx
+	if len(r.parked) == 0 {
+		return
+	}
+	refs := make([]Conn_Ref, len(r.parked), context.temp_allocator)
+	copy(refs, r.parked[:])
+	clear(&r.parked)
+	for ref in refs {
+		if c := _conn_lookup(r, ref); c != nil && c.parked {
+			c.parked = false
+			_conn_kick(c)
+		}
+	}
+	_reap(r)
+}
+
 relay_core_prepare :: proc(r: ^Relay_Core) {
 	if len(r.feed_held) == 0 {
 		return
@@ -425,7 +450,7 @@ relay_core_prepare :: proc(r: ^Relay_Core) {
 }
 
 relay_core_quiet :: proc "contextless" (r: ^Relay_Core) -> bool {
-	if len(r.yielded) > 0 || len(r.feed_held) > 0 {
+	if len(r.yielded) > 0 || len(r.feed_held) > 0 || len(r.parked) > 0 {
 		return false
 	}
 	for c in r.conns {
@@ -2128,6 +2153,13 @@ _conn_write :: proc(c: ^Conn) {
 		o := &c.out[c.out_head]
 		done, err := _out_step(c, o)
 		if err == .Would_Block {
+			return
+		}
+		if err == .Pending {
+			if !c.parked {
+				c.parked = true
+				append(&r.parked, c.ref)
+			}
 			return
 		}
 		if err != .None {

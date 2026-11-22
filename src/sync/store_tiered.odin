@@ -8,9 +8,9 @@ import "../prim"
 
 Object_Store :: struct {
 	data: rawptr,
-	put:       proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx: rawptr),
-	get:       proc(data: rawptr, key: string, allocator: runtime.Allocator) -> ([]u8, Error),
-	get_range: proc(data: rawptr, key: string, off: i64, dst: []u8) -> (int, Error),
+	put:    proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx: rawptr),
+	read:   proc(data: rawptr, req: ^Object_Read),
+	cancel: proc(data: rawptr, req: ^Object_Read),
 }
 
 Tier_Config :: struct {
@@ -39,6 +39,7 @@ Tier_Kind :: enum u8 {
 	Trim   = 7,
 	Evict  = 8,
 	Redacting = 9,
+	Redacted = 10,
 	Dirty  = 0x10,
 	Clean  = 0x11,
 	Flushed = 0x12,
@@ -53,6 +54,15 @@ Tier_Store :: struct {
 	spaces:    map[Space_Id]^Tier_Space,
 	cold_reads: u64,
 	cold_bytes: u64,
+	blocks:     map[Tier_Block_Key]^Tier_Fetch,
+	cache:      i64,
+	tick:       u64,
+	inflight:   int,
+	gets:       u64,
+	get_bytes:  u64,
+	ready_cb:   proc(ctx: rawptr),
+	ready_ctx:  rawptr,
+	rewrites:   map[string]^Tier_Rewrite,
 	evictions:  u64,
 	thaws:      u64,
 	allocator: runtime.Allocator,
@@ -105,6 +115,7 @@ Tier_Space :: struct {
 	evicting:  int,
 	thawing:   map[Stream_Id]int,
 	redacting: map[Stream_Id]int,
+	rewriting: map[Stream_Id]int,
 }
 
 @(private)
@@ -167,6 +178,8 @@ tier_store_init :: proc(t: ^Tier_Store, l: ^prim.Loop, inner: Relay_Storage, cfg
 		t.cfg.max_bytes = TIER_BYTES_DEFAULT
 	}
 	t.spaces = make(map[Space_Id]^Tier_Space, allocator)
+	t.blocks = make(map[Tier_Block_Key]^Tier_Fetch, allocator)
+	t.rewrites = make(map[string]^Tier_Rewrite, allocator)
 	return .None
 }
 
@@ -178,6 +191,9 @@ tier_store_destroy :: proc(t: ^Tier_Store) {
 		_tier_space_free(t, sp)
 	}
 	delete(t.spaces)
+	_tier_cache_drop(t)
+	delete(t.blocks)
+	delete(t.rewrites)
 	t^ = {}
 }
 
@@ -241,7 +257,15 @@ tier_store :: proc(t: ^Tier_Store) -> Relay_Storage {
 		account = _tier_account,
 		objects = _tier_objects,
 		atomic = t.inner.atomic,
+		on_ready = _tier_on_ready,
 	}
+}
+
+@(private)
+_tier_on_ready :: proc(data: rawptr, cb: proc(ctx: rawptr), ctx: rawptr) {
+	t := cast(^Tier_Store)data
+	t.ready_cb = cb
+	t.ready_ctx = ctx
 }
 
 @(private)
@@ -269,6 +293,7 @@ _tier_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err
 	sp.ev_fly = make([dynamic]Tier_Ev, t.allocator)
 	sp.thawing = make(map[Stream_Id]int, t.allocator)
 	sp.redacting = make(map[Stream_Id]int, t.allocator)
+	sp.rewriting = make(map[Stream_Id]int, t.allocator)
 	t.spaces[id] = sp
 	if lerr := _tier_load(sp); lerr != .None {
 		delete_key(&t.spaces, id)
@@ -328,6 +353,7 @@ _tier_space_free :: proc(t: ^Tier_Store, sp: ^Tier_Space) {
 	delete(sp.ev_fly)
 	delete(sp.thawing)
 	delete(sp.redacting)
+	delete(sp.rewriting)
 	if sp.man != nil {
 		t.inner.stream_close(t.inner.data, sp.man)
 	}
@@ -467,7 +493,7 @@ _tier_rescan :: proc(sp: ^Tier_Space, manifest: []u8) {
 			objs[cast(Object_Key)id] = false
 		case .Redacting:
 			pend[Tier_Red_Key{id, at, n}] += 1
-		case .Redact:
+		case .Redacted:
 			if k := (Tier_Red_Key{id, at, n}); pend[k] > 0 {
 				pend[k] -= 1
 			}
@@ -692,6 +718,7 @@ _tier_man_done :: proc(ctx: rawptr, result: Error, value: i64) {
 
 @(private)
 _tier_release_held :: proc(sp: ^Tier_Space, result: Error) {
+	assert(sp.holds > 0 || sp.refs > 0, "tier waiters released without the space held")
 	if len(sp.man_wait) == 0 {
 		return
 	}
@@ -773,7 +800,7 @@ _tier_job_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			sp.usage -= value
 			sp.objs[cast(Object_Key)j.id] = false
 			_tier_dirty(sp, 0)
-		case .None, .Dirty, .Clean, .Flushed, .Evict, .Redacting:
+		case .None, .Dirty, .Clean, .Flushed, .Evict, .Redacting, .Redacted:
 		}
 	}
 	done, cctx, gate := j.done, j.ctx, j.gate
@@ -966,17 +993,53 @@ _tier_entry_f :: proc(f: ^Tier_Flight, kind: Tier_Kind, id: [32]u8, at, n: i64, 
 	append(&f.entries, ..r[:])
 }
 
+TIER_REWRITE_TRIES :: 8
+
+@(private)
+Tier_Red_Done :: struct {
+	sp:     ^Tier_Space,
+	id:     Stream_Id,
+	at:     i64,
+	n:      i64,
+	left:   int,
+	failed: bool,
+}
+
+@(private)
+Tier_Patch :: struct {
+	rd:   ^Tier_Red_Done,
+	id:   Stream_Id,
+	off:  i64,
+	data: []u8,
+}
+
+@(private)
+Tier_Rewrite :: struct {
+	alloc:   runtime.Allocator,
+	t:       ^Tier_Store,
+	sp:      ^Tier_Space,
+	key:     string,
+	seq:     u64,
+	req:     Object_Read,
+	busy:    bool,
+	tries:   int,
+	patches: [dynamic]Tier_Patch,
+	next:    [dynamic]Tier_Patch,
+}
+
 @(private)
 _tier_rewrite :: proc(sp: ^Tier_Space, id: Stream_Id, rng: [2]i64) -> int {
 	t := sp.t
-	if sp.man_len == 0 || t.cfg.objects.get == nil {
+	if sp.man_len == 0 || t.cfg.objects.read == nil {
 		return 0
 	}
-	raw := make([]u8, int(sp.man_len), context.temp_allocator)
-	got, rerr := t.inner.stream_read(t.inner.data, sp.man, 0, raw)
-	if rerr != .None || got != len(raw) {
+	raw, ok := _tier_manifest(sp)
+	if !ok {
 		return 0
 	}
+	rd := new(Tier_Red_Done, t.allocator)
+	rd^ = {sp = sp, id = id, at = rng[0], n = rng[1] - rng[0], left = 1}
+	sp.evicting += 1
 	n := 0
 	want := id
 	for i := 0; i + TIER_RECORD <= len(raw); i += TIER_RECORD {
@@ -990,28 +1053,164 @@ _tier_rewrite :: proc(sp: ^Tier_Space, id: Stream_Id, rng: [2]i64) -> int {
 		if hi <= lo {
 			continue
 		}
-		seq := prim.get_u64le(r[56:])
-		off := i64(prim.get_u32le(r[4:]))
-		key := _tier_key(sp.id, seq)
-		data, gerr := t.cfg.objects.get(t.cfg.objects.data, key, context.temp_allocator)
-		if gerr != .None || off + (hi - at) > i64(len(data)) {
-			continue
-		}
-		fresh, fat, fok := _tier_read(sp, id, lo, hi)
+		fresh, fat, fok := _tier_read(sp, id, lo, hi, t.allocator)
 		if !fok || fat != lo || i64(len(fresh)) != hi - lo {
-			fresh = make([]u8, int(hi - lo), context.temp_allocator)
+			delete(fresh, t.allocator)
+			fresh = make([]u8, int(hi - lo), t.allocator)
 		}
-		copy(data[off + (lo - at):], fresh)
-		t.cfg.objects.put(t.cfg.objects.data, key, data, _tier_rewrite_done, sp)
-		sp.account.writes += 1
-		sp.account.write_bytes += u64(len(data))
+		_tier_rewrite_add(sp, prim.get_u64le(r[56:]), Tier_Patch{rd = rd, id = id, off = i64(prim.get_u32le(r[4:])) + (lo - at), data = fresh})
+		rd.left += 1
 		n += 1
 	}
+	_tier_red_part(rd, .None)
 	return n
 }
 
 @(private)
+_tier_red_part :: proc(rd: ^Tier_Red_Done, result: Error) {
+	sp := rd.sp
+	t := sp.t
+	if result != .None && !rd.failed {
+		rd.failed = true
+		g := sp.segs[rd.id]
+		if g.redacts == nil {
+			g.redacts = make([dynamic][2]i64, t.allocator)
+		}
+		append(&g.redacts, [2]i64{rd.at, rd.at + rd.n})
+		sp.segs[rd.id] = g
+		sp.redacting[rd.id] += 1
+		_tier_dirty(sp, 0)
+	}
+	rd.left -= 1
+	if rd.left > 0 {
+		return
+	}
+	if !rd.failed {
+		r: [TIER_RECORD]u8
+		r[0] = u8(Tier_Kind.Redacted)
+		v := rd.id
+		copy(r[8:40], v[:])
+		prim.put_u64le(r[40:], u64(rd.at))
+		prim.put_u64le(r[48:], u64(rd.n))
+		prim.put_u64le(r[56:], sp.seq)
+		append(&sp.man_q, ..r[:])
+		_tier_man_flush(sp)
+	}
+	free(rd, t.allocator)
+	sp.evicting -= 1
+}
+
+@(private)
+_tier_rewrite_add :: proc(sp: ^Tier_Space, seq: u64, pt: Tier_Patch) {
+	t := sp.t
+	key := _tier_key(sp.id, seq)
+	rw, ok := t.rewrites[key]
+	if !ok {
+		rw = new(Tier_Rewrite, t.allocator)
+		rw.t, rw.sp, rw.alloc, rw.seq = t, sp, t.allocator, seq
+		rw.key, _ = _clone_string(key, t.allocator)
+		rw.patches = make([dynamic]Tier_Patch, t.allocator)
+		rw.next = make([dynamic]Tier_Patch, t.allocator)
+		t.rewrites[rw.key] = rw
+		sp.evicting += 1
+	}
+	sp.rewriting[pt.id] += 1
+	if rw.busy {
+		append(&rw.next, pt)
+		return
+	}
+	append(&rw.patches, pt)
+	_tier_rewrite_start(rw)
+}
+
+@(private)
+_tier_rewrite_orphan :: proc(rw: ^Tier_Rewrite) {
+	for pt in rw.patches {
+		delete(pt.data, rw.alloc)
+	}
+	for pt in rw.next {
+		delete(pt.data, rw.alloc)
+	}
+	delete(rw.key, rw.alloc)
+	delete(rw.patches)
+	delete(rw.next)
+	free(rw, rw.alloc)
+}
+
+@(private)
+_tier_rewrite_start :: proc(rw: ^Tier_Rewrite) {
+	t := rw.t
+	rw.busy = true
+	rw.req = Object_Read{key = rw.key, off = 0, n = -1, done = _tier_rewrite_read, ctx = rw}
+	t.cfg.objects.read(t.cfg.objects.data, &rw.req)
+}
+
+@(private)
+_tier_rewrite_read :: proc(req: ^Object_Read, err: Error, bytes: []u8) {
+	rw := cast(^Tier_Rewrite)req.ctx
+	t := rw.t
+	sp := rw.sp
+	if t == nil {
+		_tier_rewrite_orphan(rw)
+		return
+	}
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
+	if err != .None {
+		rw.tries += 1
+		if rw.tries < TIER_REWRITE_TRIES {
+			_tier_rewrite_start(rw)
+		} else {
+			_tier_rewrite_done(rw, err, 0)
+		}
+		return
+	}
+	rw.tries = 0
+	data := make([]u8, len(bytes), context.temp_allocator)
+	copy(data, bytes)
+	for pt in rw.patches {
+		if pt.off + i64(len(pt.data)) <= i64(len(data)) {
+			copy(data[pt.off:], pt.data)
+		}
+	}
+	sp.account.writes += 1
+	sp.account.write_bytes += u64(len(data))
+	t.cfg.objects.put(t.cfg.objects.data, rw.key, data, _tier_rewrite_done, rw)
+}
+
+@(private)
 _tier_rewrite_done :: proc(ctx: rawptr, result: Error, value: i64) {
+	rw := cast(^Tier_Rewrite)ctx
+	t := rw.t
+	sp := rw.sp
+	if t == nil {
+		_tier_rewrite_orphan(rw)
+		return
+	}
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
+	_tier_blocks_forget(t, sp.id, rw.seq)
+	for pt in rw.patches {
+		_tier_red_part(pt.rd, result)
+		delete(pt.data, t.allocator)
+		sp.rewriting[pt.id] -= 1
+		if sp.rewriting[pt.id] <= 0 {
+			delete_key(&sp.rewriting, pt.id)
+		}
+	}
+	clear(&rw.patches)
+	rw.busy = false
+	if len(rw.next) > 0 {
+		rw.patches, rw.next = rw.next, rw.patches
+		_tier_rewrite_start(rw)
+		return
+	}
+	delete_key(&t.rewrites, rw.key)
+	delete(rw.key, t.allocator)
+	delete(rw.patches)
+	delete(rw.next)
+	free(rw, t.allocator)
+	sp.evicting -= 1
 }
 
 @(private)
@@ -1380,22 +1579,33 @@ Dir_Object_Store :: struct {
 }
 
 dir_object_store :: proc(d: ^Dir_Object_Store) -> Object_Store {
-	return Object_Store{data = d, put = _dir_put, get = _dir_get, get_range = _dir_get_range}
+	return Object_Store{data = d, put = _dir_put, read = _dir_read}
 }
 
 @(private)
-_dir_get_range :: proc(data: rawptr, key: string, off: i64, dst: []u8) -> (int, Error) {
+_dir_read :: proc(data: rawptr, req: ^Object_Read) {
 	d := cast(^Dir_Object_Store)data
-	path, _ := prim.path_join(context.temp_allocator, d.root, key)
+	path, _ := prim.path_join(context.temp_allocator, d.root, req.key)
 	fd, oerr := prim.open_file(d.vfs, path)
 	if oerr != .None {
-		return 0, _from_prim(oerr)
+		object_read_done(req, _from_prim(oerr), nil)
+		return
 	}
 	defer prim.close_file(d.vfs, fd)
+	n := req.n
+	if n < 0 {
+		size, serr := prim.file_size(d.vfs, fd)
+		if serr != .None {
+			object_read_done(req, _from_prim(serr), nil)
+			return
+		}
+		n = max(size - req.off, 0)
+	}
+	buf := make([]u8, int(n), context.temp_allocator)
+	got, rerr := prim.read_at(d.vfs, fd, buf, req.off)
 	d.gets += 1
-	d.get_bytes += u64(len(dst))
-	n, rerr := prim.read_at(d.vfs, fd, dst, off)
-	return n, _from_prim(rerr)
+	d.get_bytes += u64(max(got, 0))
+	object_read_done(req, _from_prim(rerr), buf[:max(got, 0)])
 }
 
 @(private)
@@ -1415,10 +1625,3 @@ _dir_put :: proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx
 	done(ctx, .None, i64(len(bytes)))
 }
 
-@(private)
-_dir_get :: proc(data: rawptr, key: string, allocator: runtime.Allocator) -> ([]u8, Error) {
-	d := cast(^Dir_Object_Store)data
-	path, _ := prim.path_join(context.temp_allocator, d.root, key)
-	b, err := prim.read_file(d.vfs, path, allocator)
-	return b, _from_prim(err)
-}

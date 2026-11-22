@@ -35,6 +35,7 @@ Tier_Thaw :: struct {
 	from: i64,
 	to:   i64,
 	low:  i64,
+	high: i64,
 	job:  ^Tier_Job,
 }
 
@@ -52,7 +53,7 @@ _tier_hot :: proc "contextless" (t: ^Tier_Store) -> i64 {
 
 @(private)
 _tier_cold_on :: proc "contextless" (t: ^Tier_Store) -> bool {
-	return t.cfg.hot >= 0 && t.inner.evict != nil && t.inner.restore != nil && (t.cfg.objects.get_range != nil || t.cfg.objects.get != nil)
+	return t.cfg.hot >= 0 && t.inner.evict != nil && t.inner.restore != nil && t.cfg.objects.read != nil
 }
 
 @(private)
@@ -127,46 +128,6 @@ _tier_cold_of :: proc(ts: ^Tier_Stream) -> ^Tier_Cold {
 }
 
 @(private)
-_tier_cold_read :: proc(sp: ^Tier_Space, c: ^Tier_Cold, at: i64, dst: []u8) -> Error {
-	t := sp.t
-	pos := at
-	end := at + i64(len(dst))
-	for pos < end {
-		rec: Tier_Rec
-		found := false
-		#reverse for r in c.recs {
-			if r.at <= pos && pos < r.at + r.n {
-				rec, found = r, true
-				break
-			}
-		}
-		if !found {
-			return .Io
-		}
-		n := min(end, rec.at + rec.n) - pos
-		out := dst[pos - at:][:n]
-		key := _tier_key(sp.id, rec.seq)
-		off := i64(rec.off) + pos - rec.at
-		if t.cfg.objects.get_range != nil {
-			got, err := t.cfg.objects.get_range(t.cfg.objects.data, key, off, out)
-			if err != .None || got != len(out) {
-				return .Io
-			}
-		} else {
-			data, err := t.cfg.objects.get(t.cfg.objects.data, key, context.temp_allocator)
-			if err != .None || off + n > i64(len(data)) {
-				return .Io
-			}
-			copy(out, data[off:][:n])
-		}
-		t.cold_reads += 1
-		t.cold_bytes += u64(n)
-		pos += n
-	}
-	return .None
-}
-
-@(private)
 _tier_cold_note :: proc(sp: ^Tier_Space, entries: []u8, segs: map[Stream_Id]Tier_Seg) {
 	t := sp.t
 	if !_tier_cold_on(t) {
@@ -185,7 +146,7 @@ _tier_cold_note :: proc(sp: ^Tier_Space, entries: []u8, segs: map[Stream_Id]Tier
 		if c, ok := sp.cold[id]; ok {
 			append(&c.recs, Tier_Rec{at = at, n = n, seq = prim.get_u64le(r[56:]), off = prim.get_u32le(r[4:])})
 		}
-		if !_reserved(cast([32]u8)id) && sp.thawing[id] == 0 && sp.redacting[id] == 0 && len(segs[id].redacts) == 0 {
+		if !_reserved(cast([32]u8)id) && sp.thawing[id] == 0 && sp.redacting[id] == 0 && sp.rewriting[id] == 0 && len(segs[id].redacts) == 0 {
 			hi[id] = max(hi[id], at + n)
 		}
 	}
@@ -263,7 +224,7 @@ _tier_ev_done :: proc(sp: ^Tier_Space, result: Error) {
 			_tier_thaw_lowered(ev.thaw, result)
 			continue
 		}
-		if result != .None || sp.thawing[ev.id] > 0 || sp.redacting[ev.id] > 0 {
+		if result != .None || sp.thawing[ev.id] > 0 || sp.redacting[ev.id] > 0 || sp.rewriting[ev.id] > 0 {
 			continue
 		}
 		if c, ok := sp.cold[ev.id]; ok {
@@ -310,17 +271,37 @@ _tier_thaw_start :: proc(t: ^Tier_Store, ts: ^Tier_Stream, c: ^Tier_Cold, from, 
 		t.inner.redact(t.inner.data, ts.h, from, to, _tier_job_done, job)
 		return
 	}
-	bytes := make([]u8, int(c.upto - low), context.temp_allocator)
-	if err := _tier_cold_read(sp, c, low, bytes); err != .None {
-		_tier_job_done(job, err, 0)
-		return
-	}
 	th := new(Tier_Thaw, t.allocator)
-	th^ = {ts = ts, from = from, to = to, low = low, job = job}
+	th^ = {ts = ts, from = from, to = to, low = low, high = c.upto, job = job}
 	sp.evicting += 1
 	sp.thawing[ts.id] += 1
 	t.thaws += 1
-	t.inner.restore(t.inner.data, ts.h, low, bytes, _tier_thaw_restored, th)
+	_tier_cold_fetch(sp, c, low, c.upto - low, _tier_thaw_fetched, th)
+}
+
+@(private)
+_tier_thaw_fetched :: proc(ctx: rawptr, rg: ^Tier_Range, err: Error) {
+	th := cast(^Tier_Thaw)ctx
+	sp := th.ts.sp
+	t := sp.t
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
+	e := err
+	bytes: []u8
+	if e == .None {
+		bytes = make([]u8, int(th.high - th.low), context.temp_allocator)
+		if c := th.ts.cold; c != nil {
+			e = _tier_cold_read(sp, c, th.low, bytes)
+		} else {
+			e = .Io
+		}
+	}
+	_tier_range_end(rg)
+	if e != .None {
+		_tier_thaw_end(th, e if e != .Pending else .Io)
+		return
+	}
+	t.inner.restore(t.inner.data, th.ts.h, th.low, bytes, _tier_thaw_restored, th)
 }
 
 @(private)
@@ -347,28 +328,32 @@ _tier_thaw_lowered :: proc(th: ^Tier_Thaw, result: Error) {
 	if c := th.ts.cold; c != nil {
 		c.upto = min(c.upto, th.low)
 	}
-	job := th.job
-	ts := th.ts
-	from, to := th.from, th.to
-	_tier_thaw_end(th, .None)
-	t.inner.redact(t.inner.data, ts.h, from, to, _tier_job_done, job)
+	t.inner.redact(t.inner.data, th.ts.h, th.from, th.to, _tier_thaw_redacted, th)
 }
 
 @(private)
-_tier_thaw_end :: proc(th: ^Tier_Thaw, result: Error) {
+_tier_thaw_redacted :: proc(ctx: rawptr, result: Error, value: i64) {
+	th := cast(^Tier_Thaw)ctx
+	sp := th.ts.sp
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
+	_tier_thaw_end(th, result, value)
+}
+
+@(private)
+_tier_thaw_end :: proc(th: ^Tier_Thaw, result: Error, value: i64 = 0) {
 	sp := th.ts.sp
 	t := sp.t
 	job := th.job
 	id := th.ts.id
 	free(th, t.allocator)
-	sp.evicting -= 1
 	sp.thawing[id] -= 1
 	if sp.thawing[id] <= 0 {
 		delete_key(&sp.thawing, id)
 	}
-	if result != .None {
-		_tier_job_done(job, result, 0)
-	}
+	assert(sp.holds > 0 || sp.refs > 0, "a tier thaw ended without its space held")
+	_tier_job_done(job, result, value)
+	sp.evicting -= 1
 }
 
 @(private)
