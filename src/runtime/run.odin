@@ -82,6 +82,11 @@ Run :: struct {
 	sealed:       bool,
 	pinned:       bool,
 	lines:        []convo.Line,
+	bound:        []convo.Line_Bind,
+	hold:         convo.Hold_Reason,
+	hold_line:    string,
+	hold_commit:  string,
+	holding:      bool,
 	revive_of:    Rid,
 	renew_timer:  prim.Timer,
 }
@@ -389,6 +394,47 @@ run_tool_finished :: proc(run: ^Run, id: string, output: string, is_error: bool)
 	}
 	run_block(run, .Tool_Result, transmute([]u8)output, id, name, is_error)
 	run.cur = -1
+	run_hold_check(run)
+}
+
+run_bound_to :: proc(run: ^Run, tree: prim.Id, line: string) -> bool {
+	return binds_have(run.bound, tree, line)
+}
+
+binds_have :: proc(binds: []convo.Line_Bind, tree: prim.Id, line: string) -> bool {
+	for b in binds {
+		if b.tree == tree && b.line == line {
+			return true
+		}
+	}
+	return false
+}
+
+run_hold_request :: proc(run: ^Run, reason: convo.Hold_Reason, line: string) {
+	if run.state == .Finished || run.hold != .None {
+		return
+	}
+	run.hold = reason
+	run.hold_line = clone(line, run.alloc)
+	if run.cur < 0 {
+		run_hold_check(run)
+	}
+}
+
+run_hold_check :: proc(run: ^Run) {
+	if run.hold == .None || run.holding || run.interrupting || run.state != .Running {
+		return
+	}
+	run.holding = true
+	switch run.hold {
+	case .Branch_Deleted:
+		run_notice(run, concat("held: branch ", run.hold_line, " deleted"))
+	case .Undo:
+		run_notice(run, "held: undo")
+	case .Branch_Changed, .None:
+		run_notice(run, concat("held: the folder left ", run.hold_line, "; this turn resumes when it returns"))
+	}
+	run_interrupt(run)
 }
 
 run_permission :: proc(run: ^Run, id, tool, title, input: string, answered: bool) {
@@ -522,6 +568,10 @@ _finish_fenced :: proc(r: ^Runtime, o: Object, arg: int, err: Error) {
 @(private)
 _run_finish_tail :: proc(run: ^Run) {
 	r := run.r
+	if run.holding && !run.superseded {
+		_run_hold_tail(run)
+		return
+	}
 	files: []convo.File_Delta
 	if run.ws != nil {
 		files = worktree_finish(run.ws, run, !run.superseded)
@@ -568,6 +618,39 @@ _run_finish_tail :: proc(run: ^Run) {
 	run.ws = nil
 	_run_free(run)
 	_queue_eval(r, o)
+}
+
+@(private)
+_run_hold_tail :: proc(run: ^Run) {
+	r := run.r
+	if run.ws != nil {
+		worktree_hold(run.ws, run)
+	}
+	if w := _writer(run); w != nil {
+		convo.writer_hold(w, run.reply, run.hold, run.hold_line)
+		run.sealed = true
+	}
+	state_run_put(r, Run_Entry{object = run.o, user = run.user, reply = run.reply, claim = run.claim, agent = run.ai.object.id, lines = lines_encode(run.lines), bound = convo.binds_encode(run.bound), hold = u8(run.hold), hold_line = run.hold_line, hold_commit = run.hold_commit})
+	run_raw_commit(run)
+	eng.catalog_usage(r.e, run.o, run.usage)
+	usage_rollup(r, run.o, run.usage)
+	r.stats.runs_held += 1
+	p := run.proc_
+	if p != nil {
+		proc_turn_done(p, run)
+	}
+	if run.native != nil {
+		native_done(run.native, run)
+	}
+	kept := false
+	for x in r.procs {
+		kept ||= x == p && x.ws == run.ws
+	}
+	if run.ws != nil && !kept {
+		worktree_close(run.ws)
+	}
+	run.ws = nil
+	_run_free(run)
 }
 
 @(private)

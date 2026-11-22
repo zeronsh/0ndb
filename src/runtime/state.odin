@@ -21,6 +21,10 @@ Run_Entry :: struct {
 	claim:  Rid,
 	agent:  prim.Id,
 	lines:  []u8,
+	bound:  []u8,
+	hold:   u8,
+	hold_line: string,
+	hold_commit: string,
 }
 
 Named :: struct {
@@ -279,7 +283,7 @@ _eerr :: proc "contextless" (err: eng.Error) -> Error {
 state_run_put :: proc(r: ^Runtime, ent: Run_Entry) -> Error {
 	so := state_w(r, ent.object.space)
 	id := ent.object.id
-	return map_put(r, so, key_of(KEY_RUN, id[:]), field_rid(1, ent.user), field_rid(2, ent.reply), field_rid(3, ent.claim), omap.field_id(4, ent.agent), field_bytes(5, ent.lines))
+	return map_put(r, so, key_of(KEY_RUN, id[:]), field_rid(1, ent.user), field_rid(2, ent.reply), field_rid(3, ent.claim), omap.field_id(4, ent.agent), field_bytes(5, ent.lines), field_bytes(6, ent.bound), field_bytes(7, []u8{ent.hold}), field_bytes(8, transmute([]u8)ent.hold_line), field_bytes(9, transmute([]u8)ent.hold_commit))
 }
 
 state_run_get :: proc(r: ^Runtime, o: Object) -> (ent: Run_Entry, found: bool) {
@@ -294,12 +298,18 @@ state_run_get :: proc(r: ^Runtime, o: Object) -> (ent: Run_Entry, found: bool) {
 	ent.claim = entry_rid(&en, 3)
 	ent.agent = entry_id(&en, 4)
 	ent.lines = entry_bytes(&en, 5)
+	ent.bound = entry_bytes(&en, 6)
+	if hb := entry_bytes(&en, 7); len(hb) == 1 {
+		ent.hold = hb[0]
+	}
+	ent.hold_line = string(entry_bytes(&en, 8))
+	ent.hold_commit = string(entry_bytes(&en, 9))
 	return ent, !prim.id_is_zero(ent.reply.seg)
 }
 
 state_run_clear :: proc(r: ^Runtime, o: Object) {
 	id := o.id
-	map_clear(r, state_object(r, o.space), key_of(KEY_RUN, id[:]), 1, 2, 3, 4, 5)
+	map_clear(r, state_object(r, o.space), key_of(KEY_RUN, id[:]), 1, 2, 3, 4, 5, 6, 7, 8, 9)
 }
 
 state_runs :: proc(r: ^Runtime, space: prim.Id) -> []Run_Entry {
@@ -317,6 +327,12 @@ state_runs :: proc(r: ^Runtime, space: prim.Id) -> []Run_Entry {
 		ent.claim = entry_rid(&row.entry, 3)
 		ent.agent = entry_id(&row.entry, 4)
 		ent.lines = entry_bytes(&row.entry, 5)
+		ent.bound = entry_bytes(&row.entry, 6)
+		if hb := entry_bytes(&row.entry, 7); len(hb) == 1 {
+			ent.hold = hb[0]
+		}
+		ent.hold_line = string(entry_bytes(&row.entry, 8))
+		ent.hold_commit = string(entry_bytes(&row.entry, 9))
 		if !prim.id_is_zero(ent.reply.seg) {
 			append(&out, ent)
 		}

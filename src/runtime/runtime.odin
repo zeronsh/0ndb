@@ -185,6 +185,8 @@ DEFAULT_CLAIM_WAIT_MS :: 60 * 1000
 Stats :: struct {
 	runs_started:  u64,
 	runs_finished: u64,
+	runs_held:     u64,
+	runs_resumed:  u64,
 	evaluations:   u64,
 	spawns:        u64,
 	warm_hits:     u64,

@@ -498,6 +498,10 @@ vfs :: proc "contextless" (e: ^Engine) -> prim.Vfs {
 	return e.vfs
 }
 
+base_vfs :: proc "contextless" (e: ^Engine) -> prim.Vfs {
+	return e.base
+}
+
 stats :: proc(e: ^Engine) -> Stats {
 	context = context_for(e)
 	s := e.stats
@@ -1030,6 +1034,7 @@ _teardown :: proc(e: ^Engine) {
 		delete(u.title, e.allocator)
 		delete(u.role, e.allocator)
 		delete(u.remote, e.allocator)
+		delete(u.lines, e.allocator)
 		free(u, e.allocator)
 	}
 	delete(e.catalog_q)

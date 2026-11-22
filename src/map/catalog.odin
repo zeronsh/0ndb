@@ -20,6 +20,7 @@ Catalog_Tag :: enum u32 {
 	Takeover     = 13,
 	Provider     = 14,
 	Unanswered   = 15,
+	Lines        = 16,
 }
 
 Catalog_Entry :: struct {
@@ -39,6 +40,7 @@ Catalog_Entry :: struct {
 	takeover:     u8,
 	provider:     string,
 	unanswered:   bool,
+	lines:        []u8,
 }
 
 CATALOG_BY_ACTIVITY :: 0
@@ -152,6 +154,8 @@ catalog_decode :: proc(e: ^Entry, allocator := context.allocator) -> (c: Catalog
 		case .Unanswered:
 			x, _ := value_u64(r.value)
 			c.unanswered = x != 0
+		case .Lines:
+			c.lines = obj.clone_bytes(r.value, allocator) or_return
 		}
 	}
 	c.kind = row.kind

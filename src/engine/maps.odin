@@ -39,6 +39,8 @@ Catalog_Update :: struct {
 	remote:      string,
 	set_remote:  bool,
 	takeover:    Takeover,
+	lines:       []u8,
+	set_lines:   bool,
 }
 
 CATALOG_ROLE :: u32(32)
@@ -296,6 +298,25 @@ _catalog_behind :: proc(e: ^Engine, sp: ^Space, h: ^Handle, fresh: bool) -> bool
 		}
 	}
 	return false
+}
+
+catalog_lines :: proc(e: ^Engine, o: Object, lines: []u8) {
+	context = context_for(e)
+	u := _catalog_q(e, o.space, o.id, .Conversation)
+	if u == nil {
+		return
+	}
+	delete(u.lines, e.allocator)
+	u.lines = nil
+	if len(lines) > 0 {
+		b, aerr := make([]u8, len(lines), e.allocator)
+		if aerr != nil {
+			return
+		}
+		copy(b, lines)
+		u.lines = b
+	}
+	u.set_lines = true
 }
 
 catalog_usage :: proc(e: ^Engine, o: Object, usage: convo.Usage) {
@@ -599,6 +620,7 @@ _catalog_flush :: proc(e: ^Engine) {
 		delete(u.title, e.allocator)
 		delete(u.role, e.allocator)
 		delete(u.remote, e.allocator)
+		delete(u.lines, e.allocator)
 		free(u, e.allocator)
 	}
 }
@@ -714,6 +736,9 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	}
 	if u.set_remote {
 		append(&fields, omap.field_str(CATALOG_REMOTE, u.remote))
+	}
+	if u.set_lines {
+		append(&fields, omap.Field{tag = u32(omap.Catalog_Tag.Lines), value = u.lines})
 	}
 	cur: omap.Catalog_Entry
 	found := false

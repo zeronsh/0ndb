@@ -14,6 +14,7 @@ API_NAMES := [3]string{"anthropic", "openai_responses", "openai_chat"}
 PROTOCOL_NAMES := [5]string{"claude_stream_json", "codex_app_server", "pi_rpc", "muse", "acp"}
 DRIVER_NAMES := [2]string{"harness", "native"}
 RECEIPT_NAMES := [4]string{"", "recorded", "duplicate", "superseded"}
+HOLD_REASON_NAMES := [4]string{"", "branch_changed", "branch_deleted", "undo"}
 
 RUNTIME_OPS := []Op {
 	{119, "runtime.attach", {SPACE}, "", op_runtime_attach},
@@ -39,6 +40,38 @@ RUNTIME_OPS := []Op {
 	{139, "placement", {OBJ}, "Placement", op_placement},
 	{162, "runners", {SPACE, OBJ}, "Runners", op_runners},
 	{163, "subscribe.runners", {SPACE, OBJ}, "Runners", nil},
+	{171, "line.hold", {{"tree", .Object, nil}, {"line", .Str, nil}, {"reason", .Enum, HOLD_REASON_NAMES[:]}}, "held:uvarint", op_line_hold},
+	{172, "line.resume", {{"tree", .Object, nil}, {"line", .Str, nil}}, "resumed:uvarint", op_line_resume},
+}
+
+op_line_hold :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	line := a_str(c, "line")
+	if len(line) == 0 {
+		return .Invalid
+	}
+	reason := convo.Hold_Reason(min(a_u64(c, "reason"), u64(max(convo.Hold_Reason))))
+	if reason == .None {
+		reason = .Branch_Changed
+	}
+	o_int(o, "held", rt.runtime_hold_line(r, a_object(c, "tree").id, line, reason))
+	return .Ok
+}
+
+op_line_resume :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	line := a_str(c, "line")
+	if len(line) == 0 {
+		return .Invalid
+	}
+	o_int(o, "resumed", rt.runtime_resume_line(r, a_object(c, "tree").id, line))
+	return .Ok
 }
 
 @(private)
@@ -111,6 +144,8 @@ op_runtime_stats :: proc(c: ^Call, o: ^Out) -> Status {
 	o_int(o, "warm_processes", rt.warm_processes(r))
 	o_u64(o, "runs_started", s.runs_started)
 	o_u64(o, "runs_finished", s.runs_finished)
+	o_u64(o, "runs_held", s.runs_held)
+	o_u64(o, "runs_resumed", s.runs_resumed)
 	o_u64(o, "evaluations", s.evaluations)
 	o_u64(o, "spawns", s.spawns)
 	o_u64(o, "warm_hits", s.warm_hits)

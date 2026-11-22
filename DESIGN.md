@@ -919,18 +919,27 @@ running on it is a record in it.
   `Cancel`, `Interrupt`, `Answer` (permissions and questions), `Assign`.
   There is no command stream; another device's intent is a record in the
   conversation it targets.
-- Runs: `Claim{msg, runner, lease, lines}` when a runner starts, `Unqueue`
-  for what it consumed, `Seal` when done, `Superseded` when a reassignment
-  made a duplicate. Each run writes its own lines of every mounted tree and
-  fast-forwards the conversation's lines on success (`Landed{run}`), all
-  mounts together. (planned, replacing run lines) A run is bound to the
-  (mount, line) of each mounted tree it started on and writes on that line
-  live, `Landed{run}` recording its result; only a duplicate claim's run
-  writes on its own run line, dropped when `Superseded`, and an isolated
-  task's run writes on its fork's lines. A run whose line is not the one on
-  disk is held (`Interrupted{reason = branch_changed | branch_deleted | undo,
-  line}`) and resumes with native session resume when its line returns, with
-  a note saying what changed meanwhile, if anything.
+- Runs: `Claim{msg, runner, lease, lines, bound}` when a runner starts,
+  `Unqueue` for what it consumed, `Seal` when done, `Superseded` when a
+  reassignment made a duplicate. Each run writes its own lines of every
+  mounted tree and fast-forwards the conversation's lines on success
+  (`Landed{run}`), all mounts together. `bound` is the (mount, tree, line)
+  of each mounted tree as the run starts: the branch key of a folder's git
+  checkout (`git:refs/heads/<name>`, `git:detached:<commit>`), else the
+  conversation's line; the catalog row carries the same binding (tag 16). A
+  run whose line leaves the disk is held at its next tool boundary (after a
+  tool result, or before the next model step): the harness is interrupted,
+  its native session kept, and `Interrupted{msg, last_block, attempt,
+  revive, reason = branch_changed | branch_deleted | undo, line}` puts the
+  reply in the `Held` open state, which crash recovery never revives and
+  which keeps the conversation from starting another run. When the line
+  returns (`line.resume`, or the line-switch event) the run is revived with
+  native session resume and a note saying whether the branch moved
+  meanwhile. Holding touches neither the mount's line nor the disk.
+  (planned, replacing run lines) A run writes on its bound line live,
+  `Landed{run}` recording its result; only a duplicate claim's run writes on
+  its own run line, dropped when `Superseded`, and an isolated task's run
+  writes on its fork's lines.
 - Mounts: `Mount{name, tree, line, path}` and `Unmount{name}` change which
   file trees a conversation works on; zero, one or many, from any
   workspace. Going back to a message restores every mounted tree (and each

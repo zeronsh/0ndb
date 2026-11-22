@@ -59,6 +59,8 @@ Message :: struct {
 	status:      Seal_Status,
 	open:        bool,
 	open_state:  Open_State,
+	hold_reason: Hold_Reason,
+	hold_line:   string,
 	seal:        Rid,
 	last_block:  i64,
 	usage:       Usage,
@@ -1163,7 +1165,11 @@ _apply_seal :: proc(body: []u8, off: i64, m: i64, msg: ^Message, allocator: runt
 		}
 		msg.status = .Interrupted
 		msg.last_block = r.last_block
-		if r.revive {
+		if r.reason != .None {
+			msg.open_state = .Held
+			msg.hold_reason = r.reason
+			msg.hold_line = obj.clone_str(r.line, allocator) or_return
+		} else if r.revive {
 			msg.open_state = .Revive
 		}
 		return .None

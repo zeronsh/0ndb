@@ -490,6 +490,7 @@ _native_event :: proc(n: ^Native, e: model.Event) {
 	case agent.Message_Started:
 		run.steps += 1
 		run.cur = -1
+		run_hold_check(run)
 	case agent.Text_Delta:
 		run_text(run, .Text, ev.text)
 	case agent.Reasoning_Delta:

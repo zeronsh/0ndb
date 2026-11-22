@@ -718,6 +718,8 @@ up exist only over the socket.
 | 74 | `redact` | object: object, msg: rid | Result |
 | 124 | `record` | object: object, source: str, external_id: str, sequence: uvarint, role: enum user|assistant|system|tool, parent: rid, blocks: blocks, status: enum open|done|interrupted|failed|cancelled, input: uvarint, output: uvarint, cache_read: uvarint, cache_write: uvarint, provider: str, model: str, native: str | receipt:enum msg:rid |
 | 131 | `land` | tree: object, from: str, into: str, dry: bool | landed:bool files:uvarint conflicts:strs |
+| 171 | `line.hold` | tree: object, line: str, reason: enum branch_changed|branch_deleted|undo | held:uvarint |
+| 172 | `line.resume` | tree: object, line: str | resumed:uvarint |
 | 132 | `go_back` | object: object, msg: rid | {} |
 | 133 | `revert` | object: object, msg: rid | reverted:[str] |
 | 138 | `wake` | object: object | {} |

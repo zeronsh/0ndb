@@ -429,7 +429,7 @@ writer_assign :: proc(w: ^Writer, msg: Rid, runner: prim.Id) -> (off: i64, err: 
 	return _event(w, Assign{msg = r, runner = runner, hlc = obj.now(&w.core)})
 }
 
-writer_claim :: proc(w: ^Writer, msg: Rid, lease_ms: u64, lines: []Line = nil) -> (claim: Rid, err: Error) {
+writer_claim :: proc(w: ^Writer, msg: Rid, lease_ms: u64, lines: []Line = nil, bound: []Line_Bind = nil) -> (claim: Rid, err: Error) {
 	_prepare(w, false) or_return
 	v := w.core.v
 	x := _msg_at(v, msg) or_return
@@ -442,7 +442,7 @@ writer_claim :: proc(w: ^Writer, msg: Rid, lease_ms: u64, lines: []Line = nil) -
 		return {}, .Not_Assigned
 	}
 	r := obj.local(&w.core, x) or_return
-	off := _event(w, Claim{msg = r, runner = w.core.id, lease = lease_ms, assign_hlc = ahlc, lines = lines}) or_return
+	off := _event(w, Claim{msg = r, runner = w.core.id, lease = lease_ms, assign_hlc = ahlc, lines = lines, bound = bound}) or_return
 	return Rid{w.core.id, off, w.core.gen}, .None
 }
 
@@ -602,6 +602,37 @@ writer_interrupt_open :: proc(w: ^Writer, now_ms: i64) -> (count: int, err: Erro
 	}
 }
 
+writer_hold :: proc(w: ^Writer, msg: Rid, reason: Hold_Reason, line: string) -> (off: i64, err: Error) {
+	m := _own_msg(w, msg) or_return
+	if reason == .None {
+		return 0, .Invalid
+	}
+	_flush(w) or_return
+	i := _running(w, m) or_return
+	o := w.sum.open[i]
+	off = _prep_off(w, false) or_return
+	sum := w.sum
+	sum.open[i].state = .Held
+	sum.last_seal = off
+	_append(w, &sum, Interrupted{msg = o.msg, last_block = o.last, attempt = o.attempt, revive = true, reason = reason, line = line}) or_return
+	_update(w, {key = _ckey(Ref{0, o.msg}), seal = off}) or_return
+	return off, .None
+}
+
+writer_held :: proc(w: ^Writer) -> (out: [MAX_OPEN]Rid, n: int) {
+	for o in summary_open(&w.sum) {
+		if o.state == .Held {
+			r, re := obj.rid(w.core.v, Vref{w.core.seg, o.msg})
+			if re != .None {
+				continue
+			}
+			out[n] = r
+			n += 1
+		}
+	}
+	return
+}
+
 writer_revivable :: proc(w: ^Writer) -> (out: [MAX_OPEN]Rid, n: int) {
 	for o in summary_open(&w.sum) {
 		if o.state == .Revive {
@@ -619,7 +650,7 @@ writer_revivable :: proc(w: ^Writer) -> (out: [MAX_OPEN]Rid, n: int) {
 writer_revive :: proc(w: ^Writer, msg: Rid, spec: Msg_Spec) -> (reply: Rid, err: Error) {
 	m := _own_msg(w, msg) or_return
 	i := summary_find(&w.sum, m)
-	if i < 0 || w.sum.open[i].state != .Revive {
+	if i < 0 || (w.sum.open[i].state != .Revive && w.sum.open[i].state != .Held) {
 		return {}, .Invalid
 	}
 	attempt := w.sum.open[i].attempt
@@ -641,7 +672,7 @@ writer_revive :: proc(w: ^Writer, msg: Rid, spec: Msg_Spec) -> (reply: Rid, err:
 writer_decline :: proc(w: ^Writer, msg: Rid) -> (off: i64, err: Error) {
 	m := _own_msg(w, msg) or_return
 	i := summary_find(&w.sum, m)
-	if i < 0 || w.sum.open[i].state != .Revive {
+	if i < 0 || (w.sum.open[i].state != .Revive && w.sum.open[i].state != .Held) {
 		return 0, .Invalid
 	}
 	_flush(w) or_return
