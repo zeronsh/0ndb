@@ -353,6 +353,7 @@ _approvals_direct :: proc(e: ^Engine, from: prim.Id, data: []u8) {
 			return
 		}
 		j.subject = _job_str(j, e.account.subject)
+		j.label = _job_str(j, e.approvals.label)
 		if osync.account_key_from_seed(&j.key, a.seed, e.cfg.random) != .None {
 			_job_free(j)
 			return

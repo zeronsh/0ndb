@@ -217,9 +217,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	opts.rt_cfg.default_model = flag_string(args, "model")
 	opts.rt_cfg.scheduler = host_scheduler(d)
 	opts.rt_cfg.name = flag_string(args, "name")
-	if len(opts.rt_cfg.name) == 0 {
-		opts.rt_cfg.name = sys_hostname(context.temp_allocator)
-	}
+	opts.rt_cfg.host_name = sys_hostname(context.temp_allocator)
 	if st := api.stack_open(&d.s, ec, opts); st != .Ok {
 		if st == .Busy {
 			return report_error(.Busy, "another daemon is running for %s", d.home)
@@ -796,6 +794,7 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	case .Approval_Requested:
 		fmt.eprintfln("0ndb daemon: device %s asks to sign in (0ndb approve %s)", hex(ev.device), ev.detail)
 	case .Login_Done:
+		api.stack_signed_in(&d.s)
 		fmt.eprintfln("0ndb daemon: signed in")
 	case .Login_Failed:
 		fmt.eprintfln("0ndb daemon: sign-in did not complete: %s", ev.detail)

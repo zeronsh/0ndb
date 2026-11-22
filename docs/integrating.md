@@ -176,7 +176,8 @@ PRF outputs and a recovery key, plus a manifest of the account's spaces)
 lives on the app's account server; the server stores ciphertext only and
 never sees a key. Signing in on a device:
 
-1. `account.login(subject, label, relay, relay_key)`: the daemon fetches the
+1. `account.login(subject, label, relay, relay_key)`: `label` names this
+   device to approvers and in device switchers. The daemon fetches the
    record (`sealed_store.get`). With none it creates the account, registers a
    passkey (`unlock.register`) and stores the record (`sealed_store.put`):
    `path: created`.

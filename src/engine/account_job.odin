@@ -552,7 +552,7 @@ _job_adopt :: proc(j: ^Acct_Job) {
 	e := j.e
 	switch j.stage {
 	case STAGE_ADOPT:
-		n, err := _account_adopt_begin(e, j.subject, &j.rec, j.entries, &j.key, j.path)
+		n, err := _account_adopt_begin(e, j.subject, j.label, &j.rec, j.entries, &j.key, j.path)
 		if err != .None {
 			_job_finish(j, err)
 			return

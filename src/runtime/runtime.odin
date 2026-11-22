@@ -158,6 +158,7 @@ Config :: struct {
 	homes:            Homes,
 	hooks:            Hooks,
 	name:             string,
+	host_name:        string,
 	default_provider: string,
 	default_model:    string,
 	default_runner:   prim.Id,
@@ -311,6 +312,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	r.cfg.work_root = clone(cfg.work_root, allocator)
 	r.cfg.default_provider = clone(cfg.default_provider, allocator)
 	r.cfg.name = clone(cfg.name, allocator)
+	r.cfg.host_name = clone(cfg.host_name, allocator)
 	r.cfg.default_model = clone(cfg.default_model, allocator)
 	r.cfg.home_dir = clone(cfg.home_dir if len(cfg.home_dir) > 0 else _home_default(cfg.env), allocator)
 	if len(cfg.env) > 0 {
@@ -506,6 +508,7 @@ close :: proc(r: ^Runtime) {
 	delete(r.cfg.work_root, r.allocator)
 	delete(r.cfg.default_provider, r.allocator)
 	delete(r.cfg.name, r.allocator)
+	delete(r.cfg.host_name, r.allocator)
 	delete(r.cfg.default_model, r.allocator)
 	delete(r.cfg.home_dir, r.allocator)
 	for s in r.cfg.env {
@@ -517,6 +520,26 @@ close :: proc(r: ^Runtime) {
 	}
 	delete(r.cfg.catalog_command, r.allocator)
 	r.opened = false
+}
+
+runner_name :: proc(r: ^Runtime) -> string {
+	if len(r.cfg.name) > 0 {
+		return r.cfg.name
+	}
+	if acct := eng.account_state(r.e); acct.have && len(acct.label) > 0 {
+		return acct.label
+	}
+	return r.cfg.host_name
+}
+
+readvertise_all :: proc(r: ^Runtime) {
+	context = eng.context_for(r.e)
+	if !r.cfg.runner {
+		return
+	}
+	for sw in r.spaces {
+		_advertise(r, sw.space, r.cfg.capacity)
+	}
 }
 
 readvertise :: proc(r: ^Runtime, space: prim.Id) {

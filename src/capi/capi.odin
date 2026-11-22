@@ -514,6 +514,9 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	if ev.kind == .Space_Joined || ev.kind == .Members_Changed || ev.kind == .Epoch_Changed {
 		api.stack_space_joined(&h.s, ev.space)
 	}
+	if ev.kind == .Login_Done {
+		api.stack_signed_in(&h.s)
+	}
 	if h.events.event == nil {
 		return
 	}
