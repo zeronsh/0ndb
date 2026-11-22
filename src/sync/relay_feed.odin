@@ -298,12 +298,16 @@ _feed_release :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	end := _feed_end(sp)
 	for i := 0; i < len(sp.feed_wait); {
 		p := sp.feed_wait[i]
-		if p.need > end {
+		c := _conn_lookup(r, p.conn)
+		if p.need > end || !_append_turn(c, p) {
 			i += 1
 			continue
 		}
 		ordered_remove(&sp.feed_wait, i)
-		c := _conn_lookup(r, p.conn)
+		_append_settled(c, p)
+		if p.seq != 0 && c != nil {
+			i = 0
+		}
 		if c != nil {
 			#partial switch p.kind {
 			case .Drop:
