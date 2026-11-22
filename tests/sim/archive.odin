@@ -1,5 +1,7 @@
 package sim
 
+import "core:fmt"
+
 import eng "../../src/engine"
 import "../../src/journal"
 import "../../src/prim"
@@ -340,11 +342,15 @@ _compare_trusted :: proc(w: ^World, n: ^Node, rm: ^osync.Remote, im: ^Cipher_Ima
 
 STAT_TRIMS: Stat
 STAT_TRIMMED: Stat
+STAT_RESTORES_WRITTEN: Stat
+STAT_RESTORES_READ: Stat
+STAT_RESTORE_SCENARIOS: Stat
 STAT_REREADS: Stat
 STAT_REREAD_BYTES: Stat
 
 @(init)
 _archive_hooks :: proc "contextless" () {
+	register_final_check(90, check_restore_offline_writer)
 	register_final_check(95, check_archive_cipher)
 	register_final_check(96, check_archive_streams)
 	register_final_check(200, check_archive_reread)
@@ -352,9 +358,288 @@ _archive_hooks :: proc "contextless" () {
 		res.stats.extra[int(STAT_TRIMS)] += w.relay.r.stats.trims
 		res.stats.extra[int(STAT_TRIMMED)] += w.relay.r.stats.trimmed
 	})
-	register_stat_line(70)
-	STAT_TRIMS = register_stat(70, 0, "trims")
-	STAT_TRIMMED = register_stat(70, 1, "trimmed_bytes")
-	STAT_REREADS = register_stat(70, 2, "archive_rereads")
-	STAT_REREAD_BYTES = register_stat(70, 3, "reread_bytes")
+	register_stat_line(77)
+	STAT_TRIMS = register_stat(77, 0, "trims")
+	STAT_TRIMMED = register_stat(77, 1, "trimmed_bytes")
+	STAT_REREADS = register_stat(77, 2, "archive_rereads")
+	STAT_REREAD_BYTES = register_stat(77, 3, "reread_bytes")
+	STAT_RESTORE_SCENARIOS = register_stat(77, 4, "restore_scenarios")
+	STAT_RESTORES_WRITTEN = register_stat(77, 5, "restores_written")
+	STAT_RESTORES_READ = register_stat(77, 6, "restores_read")
+}
+
+@(private = "file")
+Restore_Pick :: struct {
+	oi:   int,
+	wn:   ^Node,
+	rn:   ^Node,
+	t:    ^M_Op,
+	base: i64,
+	dev:  prim.Id,
+}
+
+@(private = "file")
+_node_of :: proc(w: ^World, dev: prim.Id) -> ^Node {
+	for n in w.nodes {
+		if n.alive && n.e_open && eng.self(&n.e) == dev {
+			return n
+		}
+	}
+	return nil
+}
+
+@(private = "file")
+_msg_redacted :: proc(m: ^Model, idx: int) -> bool {
+	for op in m.ops {
+		if op.kind == .Redact_Msg && op.target == idx {
+			return true
+		}
+	}
+	return false
+}
+
+@(private = "file")
+_online :: proc(n: ^Node) -> bool {
+	return n.alive && n.e_open && !n.partitioned
+}
+
+@(private = "file")
+_restore_pick :: proc(w: ^World) -> (p: Restore_Pick, ok: bool) {
+	m := &w.model
+	for _, oi in m.objs {
+		ob := &m.objs[oi]
+		if !obj_exists(m, oi) || ob.kind != .Convo {
+			continue
+		}
+		readers := readers_of(w, oi)
+		for ri in readers {
+			rn := w.nodes[ri]
+			if !_online(rn) {
+				continue
+			}
+			context = instance_context(&rn.inst)
+			h := _archive_handle(rn, ob)
+			node_after(rn)
+			if h == nil {
+				continue
+			}
+			for s in h.segs {
+				if s.device == eng.self(&rn.e) {
+					continue
+				}
+				sid := osync.stream_id(&h.scope, s.device, h.name, 0)
+				_, base, trimmed, exists := relay_stream_state(w, ob.o.space, sid)
+				if !exists || !trimmed || base <= 0 {
+					continue
+				}
+				wn := _node_of(w, s.device)
+				if wn == nil || wn == rn || !_online(wn) {
+					continue
+				}
+				for t in m.ops {
+					if t.obj != oi || t.kind != .Send || t.node != wn.idx || t.rid.seg != s.device || t.rid.off >= base {
+						continue
+					}
+					if (t.status != .Done && t.status != .Acked && t.status != .Observed) || _msg_redacted(m, t.idx) {
+						continue
+					}
+					return Restore_Pick{oi = oi, wn = wn, rn = rn, t = t, base = base, dev = s.device}, true
+				}
+			}
+		}
+	}
+	return
+}
+
+@(private = "file")
+_restore_counts :: proc(n: ^Node) -> (written, read: u64) {
+	context = instance_context(&n.inst)
+	st := eng.stats(&n.e)
+	node_after(n)
+	return st.restores_written, st.restores_read
+}
+
+check_restore_offline_writer :: proc(w: ^World) {
+	if w.aborted || len(w.failures) > 0 || w.cfg.archive_min < 0 {
+		return
+	}
+	p, ok := _restore_pick(w)
+	if !ok {
+		return
+	}
+	m := &w.model
+	ob := &m.objs[p.oi]
+	space := ob.o.space
+	stat_add(w, STAT_RESTORE_SCENARIOS)
+	p.wn.partitioned = true
+	for c in p.wn.conns {
+		conn_reset(c, true)
+	}
+	world_note(w, "restore: %s offline; %s redacts %s's message %s at %d below the trimmed base %d; a new device reads it", p.wn.name, p.rn.name, p.wn.name, p.t.token, p.t.rid.off, p.base)
+	written0, _ := _restore_counts(p.rn)
+	op := new_op(m, .Redact_Msg, p.rn, p.oi)
+	op.target = p.t.idx
+	snapshot_search_models(w, p.rn, op)
+	{
+		context = instance_context(&p.rn.inst)
+		err := eng.convo_redact(&p.rn.e, ob.o, p.t.rid, op_done_handle(op))
+		op_result(op, p.rn, err)
+		node_after(p.rn)
+		if err != .None {
+			world_fail(w, "restore: %s could not redact %s: %v", p.rn.name, p.t.token, err)
+			return
+		}
+	}
+	written: u64
+	for _ in 0 ..< 6 {
+		run_until(w, w.now + 60_000_000_000, true)
+		if len(w.failures) > 0 || w.aborted {
+			return
+		}
+		if wr, _ := _restore_counts(p.rn); wr > written0 {
+			written = wr - written0
+			break
+		}
+	}
+	if written == 0 {
+		world_fail(w, "restore: %s redacted %s's archived message %s with the writer offline but wrote no Restore", p.rn.name, p.wn.name, p.t.token)
+		return
+	}
+	stat_add(w, STAT_RESTORES_WRITTEN, written)
+	run_until(w, w.now + 60_000_000_000, true)
+	ref := digest_object(w, p.rn, p.oi)
+	if !ref.complete {
+		world_fail(w, "restore: %s cannot read %v %s after its redaction (%s)", p.rn.name, ob.kind, id_short(ob.o.id), ref.why)
+		return
+	}
+	defer delete(ref.text, w.allocator)
+	tn := _new_reader(w, p.rn, space)
+	if tn == nil {
+		return
+	}
+	run_until(w, w.now + 60_000_000_000, true)
+	offline := make([dynamic]^Node, w.allocator)
+	defer delete(offline)
+	for n in w.nodes {
+		if n == tn || n.partitioned || !n.alive {
+			continue
+		}
+		n.partitioned = true
+		for c in n.conns {
+			conn_reset(c, true)
+		}
+		append(&offline, n)
+	}
+	got: Digest
+	for _ in 0 ..< 12 {
+		run_until(w, w.now + 120_000_000_000, true)
+		if len(w.failures) > 0 || w.aborted {
+			return
+		}
+		got = digest_object(w, tn, p.oi)
+		if got.complete {
+			break
+		}
+	}
+	if !got.complete {
+		world_fail(w, "restore: new device %s could not read %v %s through the Restore with every other device offline (%s)", tn.name, ob.kind, id_short(ob.o.id), got.why)
+		return
+	}
+	if _strip_catalog(got.text) != _strip_catalog(ref.text) {
+		world_fail(w, "restore: %v %s on %s read through the Restore differs from the redactor %s:\n--- %s\n%s--- %s\n%s", ob.kind, id_short(ob.o.id), tn.name, p.rn.name, p.rn.name, ref.text, tn.name, got.text)
+	}
+	delete(got.text, w.allocator)
+	_, read := _restore_counts(tn)
+	if read == 0 {
+		world_fail(w, "restore: new device %s read %s's trimmed prefix with every other device offline without resolving a Restore", tn.name, p.wn.name)
+	}
+	stat_add(w, STAT_RESTORES_READ, read)
+	check_archive_streams(w)
+	live_close(tn)
+	{
+		context = instance_context(&tn.inst)
+		eng.close(&tn.e)
+	}
+	node_kill(tn)
+	world_note(w, "restore: %s wrote %d Restores, new device %s resolved %d", p.rn.name, written, tn.name, read)
+	for n in offline {
+		n.partitioned = false
+	}
+	p.wn.partitioned = false
+	for _ in 0 ..< 6 {
+		idle := run_until(w, w.now + 120_000_000_000, true)
+		if len(w.failures) > 0 || w.aborted {
+			return
+		}
+		if idle && check_convergence(w, false) {
+			break
+		}
+	}
+	check_convergence(w, true)
+}
+
+@(private = "file")
+_new_reader :: proc(w: ^World, sponsor: ^Node, space: prim.Id) -> ^Node {
+	m := &w.model
+	si := -1
+	for &sp, i in m.spaces {
+		if sp.id == space {
+			si = i
+		}
+	}
+	if si < 0 {
+		return nil
+	}
+	nn := new(Node, w.allocator)
+	nn.w = w
+	nn.idx = len(w.nodes)
+	nn.name = fmt.aprintf("rd%d", nn.idx, allocator = w.allocator)
+	disk_init(&nn.disk, nn.name, w.allocator)
+	nn.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -30_000_000_000, 30_000_000_000)}
+	nn.disk.wall = clock_wall
+	nn.disk.wall_data = &nn.clock
+	rng_init(&nn.disk.fail_rng, w.cfg.seed, 6000 + u64(nn.idx))
+	nn.conns = make([dynamic]^Conn, w.allocator)
+	nn.mounts = make([dynamic]Sim_Mount, w.allocator)
+	nn.writers = make(map[string]Writer_Info, w.allocator)
+	append(&w.nodes, nn)
+	if !node_start(nn) {
+		world_fail(w, "restore: %s could not start", nn.name)
+		return nil
+	}
+	proof: []u8
+	{
+		context = instance_context(&sponsor.inst)
+		pr, aerr := eng.member_add(&sponsor.e, space, nn.identity, .Device, .Admin, .Approval, 0, w.allocator)
+		node_after(sponsor)
+		if aerr != .None {
+			world_fail(w, "restore: %s member_add for %s failed: %v", sponsor.name, nn.name, aerr)
+			return nil
+		}
+		proof = pr
+	}
+	context = instance_context(&nn.inst)
+	if _, err := eng.space_join_enrollment(&nn.e, space, proof, fmt.tprintf("space%d", si), "relay", w.relay.public); err != .None {
+		world_fail(w, "restore: %s space_join_enrollment failed: %v", nn.name, err)
+		return nil
+	}
+	if err := eng.space_open(&nn.e, space); err != .None {
+		world_fail(w, "restore: %s space_open failed: %v", nn.name, err)
+		return nil
+	}
+	node_after(nn)
+	return nn
+}
+
+@(private = "file")
+_strip_catalog :: proc(text: string) -> string {
+	if len(text) < 8 || text[:8] != "catalog " {
+		return text
+	}
+	for i in 0 ..< len(text) {
+		if text[i] == '\n' {
+			return text[i + 1:]
+		}
+	}
+	return ""
 }
