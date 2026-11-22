@@ -947,9 +947,9 @@ Conv :: struct {
 	driver:   ^Filter_Driver,
 }
 
-conv_attrs :: proc(m: ^Mount, rel: string) -> (cv: Conv) {
+conv_attrs :: proc(m: ^Mount, rel: string, flagged := false) -> (cv: Conv) {
 	cv.action = .Binary
-	if !m.has_git {
+	if !m.has_git && !flagged {
 		return
 	}
 	owned := m.attrs == nil
