@@ -402,11 +402,7 @@ _own_puncture :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
 	if _own_tree_puncture(e, t, from, to, keep[:]) != .None {
 		return
 	}
-	if err := _own_tree_store(e, t); err == .None {
-		t.dirty = false
-	} else if err != .Busy {
-		_fatal(e, err)
-	}
+	_own_tree_punctured(e, t)
 	_dirty_keys(e, h.sp, h.id, h.kind, h.scope, t)
 }
 
