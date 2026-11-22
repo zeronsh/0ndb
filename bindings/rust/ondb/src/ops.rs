@@ -308,34 +308,4 @@ impl Client {
     pub fn sign_out(&self, keep_relay: bool) -> Pending<SignedOut> {
         self.call(&json!({"op": "account.sign_out", "keep_relay": keep_relay}))
     }
-
-    pub fn buffer_open(&self, object: &str, path: Option<&str>, units: crate::Units) -> Pending<Value> {
-        let mut m = Map::new();
-        m.insert("op".into(), "buffer.open".into());
-        m.insert("object".into(), object.into());
-        m.insert("units".into(), units.name().into());
-        put(&mut m, "path", path);
-        self.call(&Value::Object(m))
-    }
-
-    pub fn buffer_read(&self, buffer: &str, rev: u64, from: u64, len: u64) -> Pending<Value> {
-        self.call(&json!({"op": "buffer.read", "buffer": buffer, "rev": rev, "from": from, "len": len}))
-    }
-
-    pub fn buffer_edit(&self, buffer: &str, out: &crate::Outgoing, group: u64) -> Pending<Value> {
-        let edits: Vec<Value> = out.edits.iter().map(|e| json!({"pos": e.pos, "del": e.del, "ins": e.ins})).collect();
-        self.call(&json!({"op": "buffer.edit", "buffer": buffer, "rev": out.base, "edits": edits, "group": group}))
-    }
-
-    pub fn buffer_undo(&self, buffer: &str) -> Pending<Value> {
-        self.call(&json!({"op": "buffer.undo", "buffer": buffer}))
-    }
-
-    pub fn buffer_redo(&self, buffer: &str) -> Pending<Value> {
-        self.call(&json!({"op": "buffer.redo", "buffer": buffer}))
-    }
-
-    pub fn buffer_close(&self, buffer: &str) -> Pending<Value> {
-        self.call(&json!({"op": "buffer.close", "buffer": buffer}))
-    }
 }

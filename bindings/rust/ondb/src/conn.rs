@@ -155,11 +155,19 @@ pub struct Gap {
 pub enum SubItem {
     Deltas(Vec<Delta>),
     Gap(Gap),
+    Raw(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubKind {
+    Object,
+    Catalog,
+    Raw,
 }
 
 struct SubEntry {
     req: Vec<u8>,
-    catalog: bool,
+    kind: SubKind,
     queue: Arc<Queue<SubItem>>,
     tag: u64,
 }
@@ -323,6 +331,14 @@ impl Client {
     }
 
     pub fn subscribe(&self, req: &serde_json::Value, catalog: bool) -> Pending<Subscription> {
+        self.subscribe_with(req, if catalog { SubKind::Catalog } else { SubKind::Object }, |sub, _| Ok(sub))
+    }
+
+    pub fn subscribe_raw_with<T: Send + 'static>(&self, req: &serde_json::Value, finish: impl FnOnce(Subscription, &[u8]) -> Result<T> + Send + 'static) -> Pending<T> {
+        self.subscribe_with(req, SubKind::Raw, finish)
+    }
+
+    pub fn subscribe_with<T: Send + 'static>(&self, req: &serde_json::Value, kind: SubKind, finish: impl FnOnce(Subscription, &[u8]) -> Result<T> + Send + 'static) -> Pending<T> {
         let body = serde_json::to_vec(req).unwrap_or_default();
         let link = match self.link() {
             Ok(l) => l,
@@ -338,22 +354,23 @@ impl Client {
             id,
             SubEntry {
                 req: body.clone(),
-                catalog,
+                kind,
                 queue: queue.clone(),
                 tag,
             },
         );
-        let f = frame::encode(frame::SUBSCRIBE, &[&tag.to_le_bytes(), &[frame::FLAG_JSON | frame::FLAG_COMPACT], &body]);
+        let flags = if kind == SubKind::Raw { frame::FLAG_JSON } else { frame::FLAG_JSON | frame::FLAG_COMPACT };
+        let f = frame::encode(frame::SUBSCRIBE, &[&tag.to_le_bytes(), &[flags], &body]);
         let weak = Arc::downgrade(&self.inner);
         let fail_weak = weak.clone();
-        let finish: Finish<Subscription> = Box::new(move |st, _| {
+        let done: Finish<T> = Box::new(move |st, payload| {
             if st != Status::OK {
                 if let Some(inner) = fail_weak.upgrade() {
                     inner.subs.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 }
                 return Err(Error::Status(st));
             }
-            Ok(Subscription { id, queue, inner: weak })
+            finish(Subscription { id, queue, inner: weak }, &payload)
         });
         if let Err(e) = link.send(&f) {
             link.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&tag);
@@ -364,10 +381,15 @@ impl Client {
             slot: Some(slot),
             link: Arc::downgrade(&link),
             tag,
-            finish: Some(finish),
+            finish: Some(done),
             err: None,
             _t: PhantomData,
         }
+    }
+
+    pub fn call_then<R: DeserializeOwned + Send + 'static, T: Send + 'static>(&self, req: &serde_json::Value, map: impl FnOnce(R) -> T + Send + 'static) -> Pending<T> {
+        let body = serde_json::to_vec(req).unwrap_or_default();
+        self.start(&body, true, 0, Box::new(move |st, p| decode_json::<R>(st, p).map(map)))
     }
 
     pub fn events(&self) -> Result<Events> {
@@ -507,6 +529,15 @@ impl<T> Pending<T> {
     }
 
     pub fn cancel(self) {}
+
+    pub fn try_take(&mut self) -> Option<Result<T>> {
+        if let Some(e) = self.err.take() {
+            return Some(Err(e));
+        }
+        let slot = self.slot.clone()?;
+        let r = slot.try_pop()?;
+        Some(self.complete(Some(r)))
+    }
 }
 
 impl<T> Unpin for Pending<T> {}
@@ -715,6 +746,16 @@ fn resubscribe(inner: &Arc<Inner>) -> Result<()> {
     }
     let mut subs = inner.subs.lock().unwrap_or_else(|e| e.into_inner());
     for (id, e) in subs.iter_mut() {
+        if e.kind == SubKind::Raw {
+            let mut g = e.queue.lock();
+            g.items.push_back(SubItem::Gap(Gap {
+                reason: GapReason::Reconnected,
+                full: true,
+                objects: Vec::new(),
+            }));
+            e.queue.notify(g);
+            continue;
+        }
         let tag = link.tag();
         e.tag = tag;
         link.tags.lock().unwrap_or_else(|e| e.into_inner()).insert(tag, *id);
@@ -750,11 +791,14 @@ fn dispatch(inner: &Inner, link: &Link, f: Frame) {
         }
         frame::DELTAS => {
             let Some(id) = link.tags.lock().unwrap_or_else(|e| e.into_inner()).get(&tag).copied() else { return };
-            let Ok(d) = serde_json::from_slice::<Deltas>(&f.payload[8..]) else { return };
             let subs = inner.subs.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(e) = subs.get(&id) {
-                push_deltas(&e.queue, e.catalog, d.deltas, inner.opts.queue_limit);
+            let Some(e) = subs.get(&id) else { return };
+            if e.kind == SubKind::Raw {
+                push_raw(&e.queue, f.payload[8..].to_vec(), inner.opts.queue_limit);
+                return;
             }
+            let Ok(d) = serde_json::from_slice::<Deltas>(&f.payload[8..]) else { return };
+            push_deltas(&e.queue, e.kind == SubKind::Catalog, d.deltas, inner.opts.queue_limit);
         }
         frame::GAP => {
             let Some(id) = link.tags.lock().unwrap_or_else(|e| e.into_inner()).get(&tag).copied() else { return };
@@ -837,6 +881,24 @@ fn push_deltas(q: &Queue<SubItem>, catalog: bool, deltas: Vec<Delta>, limit: usi
             objects: if catalog { objects } else { Vec::new() },
         }));
         g.items = kept;
+        g.dropping = true;
+    }
+    q.notify(g);
+}
+
+fn push_raw(q: &Queue<SubItem>, payload: Vec<u8>, limit: usize) {
+    let mut g = q.lock();
+    if g.dropping {
+        return;
+    }
+    g.items.push_back(SubItem::Raw(payload));
+    if g.items.len() > limit {
+        g.items.clear();
+        g.items.push_back(SubItem::Gap(Gap {
+            reason: GapReason::Overflow,
+            full: true,
+            objects: Vec::new(),
+        }));
         g.dropping = true;
     }
     q.notify(g);

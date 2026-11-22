@@ -315,16 +315,40 @@ impl ondb::RunnerPool for Sandboxes {
 
 ## 8. Live editor buffers
 
-A buffer surface for editors (open a file or text, pipelined edits against
-the client's revision, undo/redo, anchors, cursors, Buffer and Cursors delta
-events) is landing from another workstream; its op table is not final. The
-Rust crate already has the client side: `ondb::Buffer` keeps the text in
-bytes or UTF-16 units, applies local edits at once (`edit` returns the
-`Outgoing { base, edits }` to send with `buffer.edit`), transforms the
-in-flight edits against remote deltas (`receive`), acknowledges by revision
-(`ack`), and keeps `Anchor`s stable across both. The op wrappers
-(`buffer_open`, `buffer_edit`, ...) use the planned names and will be
-finalized with the table.
+Editors open a text object, or a file of a mounted tree by path, as a live
+buffer and edit it surgically: LSP-style edits, pipelined, merged with every
+other writer (other editors, agents, other devices) and streamed back as
+retain/delete/insert deltas. The wire surface is `docs/daemon-protocol.md`
+section 9. In Rust, `ondb::LiveBuffer` does the client side:
+
+```rust
+let mut buf = ondb::LiveBuffer::open(&client, &ondb::OpenArgs {
+    object: notes.clone(), units: ondb::Units::Utf16, ..Default::default()
+}).await?;
+buf.edit(&[ondb::TextEdit { pos: 0, del: 0, ins: "# ".into() }], 1)?;
+while let Some(change) = buf.recv().await {
+    match change {
+        ondb::Change::Delta { ops, .. } => editor.apply(&ondb::ops_to_edits(&ops)),
+        ondb::Change::Cursors(c) => editor.show_cursors(&c),
+        ondb::Change::Reopen | ondb::Change::Closed(_) => break,
+    }
+}
+```
+
+`edit` applies locally at once, sends without waiting and returns the edit's
+sequence number; acknowledgements are absorbed as they arrive (`flush_blocking`
+waits for all of them, and an edit the daemon refuses surfaces as
+`Change::Closed` with its status on the next `recv`); incoming deltas are transformed
+over the unacknowledged edits, so the text never jumps. `read` and
+`load_all_blocking` fill a large file's unloaded ranges, `anchors`/`resolve`
+give positions that survive every edit, `set_cursors` publishes this editor's
+selections, `undo`/`redo` act on this actor's edit groups. `Reopen` means the
+connection or the client queue lost events and the buffer must be opened
+again; `Closed` carries the daemon's status (`conflict` also means reopen).
+Measured against the live-buffer daemon: two actors on one connection
+sending about 345 random edits each run (multi-byte and astral characters,
+UTF-16 units), with up to dozens in flight, converged byte-for-byte with the
+daemon's text, and anchors moved with a concurrent insert.
 
 ## 9. Try it today
 

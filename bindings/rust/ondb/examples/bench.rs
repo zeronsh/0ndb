@@ -148,6 +148,7 @@ fn stream(c: &Client, provider: &str, model: &str, prompt: &str) -> ondb::Result
                 }
             }
             Some(SubItem::Gap(g)) => println!("gap {g:?}"),
+            Some(SubItem::Raw(_)) => {}
             None => break,
         }
     }

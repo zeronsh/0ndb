@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use common::{arg_or_env, DirStore, TestPasskey};
-use ondb::{Autostart, Client, Dir, HostBuilder, Options, PageArgs, SubItem};
+use ondb::{Autostart, Client, Dir, HostBuilder, Options, PageArgs};
 
 fn main() -> ondb::Result<()> {
     let home = PathBuf::from(arg_or_env(1, "ONDB_HOME", "/tmp/ondb-sync-check"));
@@ -40,7 +40,7 @@ fn main() -> ondb::Result<()> {
             return Err(ondb::Error::Status(ondb::Status::TIMEOUT));
         }
         match sub.blocking_recv_timeout(left) {
-            Some(SubItem::Deltas(_)) | Some(SubItem::Gap(_)) => {}
+            Some(_) => {}
             None => return Err(ondb::Error::Status(ondb::Status::TIMEOUT)),
         }
     };

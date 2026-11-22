@@ -121,7 +121,7 @@ in the header; readers must ignore trailing bytes.
 
 The `describe` op returns the full table (codes, names, argument names and
 types, enum value names, result layouts) for mechanical binding generation;
-section 11 is that table.
+section 12 is that table.
 
 Timeouts. `timeout_ms` 0 means none. A read that waits for remote data
 (a page of a conversation that lives on another device) completes when the
@@ -404,7 +404,54 @@ provider evaluates the passkey PRF) does not need the `unlock` plug: it reads
 `account.passkey_add(label, credential, prf)` adds such a passkey to a
 signed-in account.
 
-## 9. MCP hand-off
+## 9. Live buffers
+
+A live buffer is an editor's view of one text object, or of one file of a
+mounted tree, with surgical deltas. Ops are named (their codes come from
+`describe`):
+
+| op | arguments | result |
+|---|---|---|
+| `buffer.open` (a subscription) | object, path: str, line: str, units: enum{bytes, utf16}, actor: id, page: uvarint | the subscription's Result payload is the open BufferEvent |
+| `buffer.read` | buffer, rev, from, len | rev, ack, from, length, text |
+| `buffer.edit` | buffer, rev, pos: uvarints, del: uvarints, ins: strs, group | ack |
+| `buffer.ack` | buffer, rev | {} |
+| `buffer.undo`, `buffer.redo` | buffer | done: bool |
+| `buffer.anchors` | buffer, rev, positions: uvarints, bias: enum{before, after} | anchors: strs |
+| `buffer.resolve` | buffer, anchors: strs | positions: [ivarint] (-1 unknown), rev, ack |
+| `buffer.cursors` | buffer, rev, ranges: uvarints (anchor, head pairs) | {} (ephemeral) |
+| `buffer.text` | buffer | rev, text |
+
+`BufferEvent := kind: enum{open, delta, cursors, closed}, buffer: uvarint,
+rev, ack, length, text, more, actor: id, line: str, ops: [{kind:
+enum{retain, delete, insert}, n, text, author: id}], cursors: [{device,
+actor, ranges: [{anchor: ivarint, head: ivarint}]}], status`. Every Deltas
+frame of the subscription carries one BufferEvent (not a Deltas list).
+Unsubscribing closes the buffer.
+
+Positions count `units` (bytes, or UTF-16 code units); text is always valid
+UTF-8 widened to whole code points, and an insert's `n` counts units. `open`
+returns the first `page` units of text, the full `length`, and `more` when
+the rest must be fetched with `buffer.read`.
+
+Client rule (Jupiter). Number your edits 1, 2, ... and keep the
+unacknowledged ones as deltas. Send each `buffer.edit` with the `rev` of the
+last delta you applied; its edits are sorted, non-overlapping, and refer to
+your text at that rev plus your earlier edits, so several can be in flight.
+On each delta event, drop your edits with seq <= the event's `ack`;
+transform the incoming delta over the remaining ones with your edit as the
+first argument (your insert goes first at equal positions; deletes of the
+same range cancel), apply it, and set `rev`. Positions the daemon returns
+(`read`'s `from`, `resolve`, cursors) are as of `ack`: map them through your
+edits with seq > ack. An edit's result can arrive before delta events the
+daemon produced before applying that edit (results are written at once,
+buffer events as the connection drains), so the ack in an edit result only
+confirms delivery: keep the edit until an event's ack covers it. A `conflict`
+status means reopen. Anchors are strings:
+`s`, `e`, or `<actor hex>.<seq>[.<offset>].<b|a>`. The reference clients are
+`LiveBuffer` in `web/0ndb.js` and `ondb::LiveBuffer` in the Rust crate.
+
+## 10. MCP hand-off
 
 `Mcp(space, object)` turns the connection into a stdio MCP session for the
 orchestration catalog with the given conversation as the caller: the daemon
@@ -412,7 +459,7 @@ answers `Result(0, ok)` with an empty payload, and from then on the bytes in
 both directions are MCP JSON-RPC lines, not frames. `0ndb mcp` bridges this
 to a harness's stdio.
 
-## 10. Versioning
+## 11. Versioning
 
 - Protocol version (the hello byte, `proto` in `daemon.status`): changes only
   when the framing changes incompatibly. New frame kinds are added only in
@@ -432,7 +479,7 @@ rss, runner, connections, local_relay, mcp_sessions, wakeups, timeout_ms
 (-1 when no timer is armed), host_plugs: [str] (enabled), host_pending, hosts: [str]
 (currently registered), links: [{space, error, reason}]`.
 
-## 11. Op reference
+## 12. Op reference
 
 Generated from `describe`. Argument types: `str`, `bytes`, `bool`, `uvarint`,
 `ivarint`, `f64`, `id`, `rid`, `object`, `enum` (accepted names listed),
