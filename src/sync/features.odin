@@ -193,7 +193,32 @@ replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name
 	if r.phase != .Ready {
 		return .Closed
 	}
-	client_redact(&r.client, stream_id(scope, device, name, epoch), from, to) or_return
+	id := stream_id(scope, device, name, epoch)
+	if device == r.cfg.self {
+		client_redact(&r.client, id, from, to) or_return
+		l, ok := r.locals[id]
+		opened := false
+		if !ok {
+			l, opened = _arc_own_open(r, scope, name, epoch, id)
+		}
+		if l != nil {
+			_arc_redact_own(r, l, from, to)
+			if opened {
+				_local_maybe_free(r, l)
+			}
+		}
+	} else {
+		queued := false
+		if _arc_on(r) {
+			if rm, rerr := _remote_get(r, scope, device, name, epoch); rerr == .None {
+				queued = _arc_redact_remote(r, rm, from, to)
+				_remote_maybe_free(r, rm)
+			}
+		}
+		if !queued {
+			client_redact(&r.client, id, from, to) or_return
+		}
+	}
 	_repl_flush(r)
 	return .None
 }
@@ -641,6 +666,8 @@ _replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
 		return
 	}
 	if rm, ok := r.remotes[id]; ok {
+		_arc_invalidate(r, rm)
+		_arc_wipe_remote(r, rm, from, to)
 		hi := min(to, journal.replica_length(&rm.rep))
 		if hi > from {
 			keys, known := _remote_keys(r, rm)

@@ -244,7 +244,7 @@ _read :: proc(r: ^Reader, off, end: i64, forward: bool) -> (body: []u8, err: Err
 		}
 		return nil, derr
 	}
-	if r.chained {
+	if r.chained && !(r.replica != nil && replica_trusted(r.replica, off, end)) {
 		if kind == .Plain && is_sig(b) {
 			return b, _check_sig_record(r, b, off)
 		}
