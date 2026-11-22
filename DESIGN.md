@@ -857,7 +857,12 @@ checkpoint bundles, as before, plus:
   no socket, loop or timer and builds for `js_wasm32`. `0ndb relay`
   (`relay.odin`) is the socket host (Noise, WebSocket, kernel TLS, `sendfile`,
   rate limits, the pack); the simulator drives the core directly, so every
-  host gets the same guarantees. `docs/relay-protocol.md` is the normative
+  host gets the same guarantees. The socket host arms no timer of its own:
+  when its loop has nothing armed or pending and `relay_quiet` holds (no
+  handshake, partial frame, queued output, storage job or yielded work), it
+  releases memory once (heap trim, and on Linux `MADV_DONTNEED` on clean
+  file mappings, so code comes back as minor faults from the page cache) and
+  sleeps until the next event. `docs/relay-protocol.md` is the normative
   protocol, so a relay can be implemented anywhere (a Durable Object per
   space, a small TypeScript server), and `docs/relay-vectors/` holds
   byte-exact transcripts produced and checked by `tools/relayvec`, natively

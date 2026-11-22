@@ -360,6 +360,21 @@ relay_stats :: proc "contextless" (r: ^Relay) -> Relay_Stats {
 	return s
 }
 
+relay_quiet :: proc "contextless" (r: ^Relay) -> bool {
+	if r.shaking > 0 || r.wake_timer != 0 || r.pack_timer != 0 || !relay_core_quiet(&r.core) {
+		return false
+	}
+	if r.own_store != nil && worker_busy(&r.own_store.worker) {
+		return false
+	}
+	for s in r.socks {
+		if !s.dead && transport_pending(&s.tr) {
+			return false
+		}
+	}
+	return true
+}
+
 relay_space_stats :: proc(r: ^Relay, space: Space_Id) -> (Relay_Space_Stats, bool) {
 	return relay_core_space_stats(&r.core, space)
 }
