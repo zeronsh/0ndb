@@ -78,6 +78,7 @@ Vfs_Procs :: struct {
 	dir_close:  proc(data: rawptr, d: ^Dir),
 	caps:       proc(data: rawptr, fd: Fd) -> Vfs_Caps,
 	writeout:   proc(data: rawptr, fd: Fd) -> Error,
+	exchange:   proc(data: rawptr, a: string, b: string) -> Error,
 }
 
 open_file :: #force_inline proc(vfs: Vfs, path: string, flags: Open_Flags = {}, mode: u32 = 0o644) -> (Fd, Error) {
@@ -126,6 +127,13 @@ lstat :: #force_inline proc(vfs: Vfs, path: string) -> (Stat, Error) {
 
 rename :: #force_inline proc(vfs: Vfs, old: string, new: string) -> Error {
 	return vfs.procs.rename(vfs.data, old, new)
+}
+
+rename_exchange :: proc(vfs: Vfs, a: string, b: string) -> Error {
+	if vfs.procs.exchange == nil {
+		return .Unsupported
+	}
+	return vfs.procs.exchange(vfs.data, a, b)
 }
 
 remove :: #force_inline proc(vfs: Vfs, path: string) -> Error {

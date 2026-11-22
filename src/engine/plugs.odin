@@ -276,7 +276,7 @@ _mounts_wake :: proc(e: ^Engine, object: prim.Id) {
 	}
 	for mt in e.plug.mounts {
 		if mt.object.id == object {
-			fs.mount_schedule(&mt.mount, 0)
+			fs.mount_schedule(&mt.mount, fs.mount_coalesce_ms(&mt.mount))
 		}
 	}
 }

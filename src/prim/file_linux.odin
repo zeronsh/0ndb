@@ -28,6 +28,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	dir_open   = _os_dir_open,
 	dir_next   = _os_dir_next,
 	dir_close  = _os_dir_close,
+	exchange   = _os_exchange,
 }
 
 @(private)
@@ -339,6 +340,15 @@ _os_rename :: proc(data: rawptr, old: string, new: string) -> Error {
 	pa := cpath(old, &a) or_return
 	pb := cpath(new, &b) or_return
 	return _error(linux.rename(pa, pb))
+}
+
+@(private)
+_os_exchange :: proc(data: rawptr, a: string, b: string) -> Error {
+	x: Path_Buf = ---
+	y: Path_Buf = ---
+	pa := cpath(a, &x) or_return
+	pb := cpath(b, &y) or_return
+	return _error(linux.renameat2(linux.AT_FDCWD, pa, linux.AT_FDCWD, pb, {.EXCHANGE}))
 }
 
 @(private)
