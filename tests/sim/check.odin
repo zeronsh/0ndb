@@ -1534,6 +1534,30 @@ check_uploaded :: proc(w: ^World) {
 	}
 }
 
+check_own_tail :: proc(w: ^World, n: ^Node) {
+	if !n.alive || !w.relay.alive {
+		return
+	}
+	context = instance_context(&n.inst)
+	own, err := eng.own_lengths(&n.e, context.temp_allocator)
+	node_after(n)
+	if err != .None {
+		world_fail(w, "own tail: %s could not list its own streams: %v", n.name, err)
+		return
+	}
+	for o in own {
+		length, _, exists := relay_probe(w, o.space, o.stream)
+		if exists && length > o.durable {
+			world_fail(w, "own tail: the relay holds %d bytes of %s's own %v %s, which has only %d durable locally", length, n.name, o.kind, id_short(o.object), o.durable)
+		}
+	}
+}
+
+check_own_tails :: proc(w: ^World) {
+	for n in w.nodes {
+		check_own_tail(w, n)
+	}
+}
 
 FRESH_POLLS :: 32
 FRESH_STEP :: i64(2_000_000_000)
@@ -1618,6 +1642,8 @@ _check_stats :: proc "contextless" () {
 	register_final_check(80, check_relay_redaction)
 	register_final_check(90, check_relay_plaintext)
 	register_final_check(120, check_uploaded)
+	register_final_check(121, check_own_tails)
+	register_restarted(5, check_own_tail)
 	register_stat_line(60)
 	STAT_FRESH_POLLS = register_stat(60, 0, "fresh_polls")
 	STAT_FRESH_PROBED = register_stat(60, 1, "fresh_probed")

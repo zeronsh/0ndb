@@ -123,7 +123,7 @@ check_relay_storage :: proc(w: ^World) {
 		promoted := _promoted(w, oi)
 		for n in w.nodes {
 			sid := osync.stream_id(&scope, n.identity.id, string(name), 0)
-			length, base, exists := _relay_probe(w, ob.o.space, sid)
+			length, base, exists := relay_probe(w, ob.o.space, sid)
 			if !exists || length == 0 {
 				continue
 			}
@@ -139,7 +139,7 @@ check_relay_storage :: proc(w: ^World) {
 			}
 			pn := w.nodes[p.node]
 			sid := osync.stream_id(&scope, pn.identity.id, string(name), 0)
-			length, base, exists := _relay_probe(w, ob.o.space, sid)
+			length, base, exists := relay_probe(w, ob.o.space, sid)
 			if exists && length > 0 && base != 0 {
 				world_fail(w, "relay storage: promoted %v %s segment of promoter %s is stored only from %d of %d", ob.kind, id_short(ob.o.id), pn.name, base, length)
 			}
@@ -163,8 +163,7 @@ _storage_prefix :: proc(k: M_Kind) -> u8 {
 	return 'm'
 }
 
-@(private = "file")
-_relay_probe :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> (length, base: i64, exists: bool) {
+relay_probe :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> (length, base: i64, exists: bool) {
 	rn := &w.relay
 	context = instance_context(&rn.inst)
 	defer relay_after(rn)
