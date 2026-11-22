@@ -54,6 +54,7 @@ Seg :: struct {
 	waiting: bool,
 	probing: bool,
 	probed:  bool,
+	empty:   bool,
 	follow:  bool,
 	check:   Seg_Check,
 	chain:   journal.Chain,
@@ -410,7 +411,8 @@ _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 	}
 	append(&h.segs, seg)
 	if journal.replica_length(rep) == 0 {
-		seg.waiting = true
+		seg.empty = osync.stream_id(&h.scope, device, h.name, 0) in sp.empty_segs
+		seg.waiting = !seg.empty
 		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
 		e.stats.fetches += 1
 	}
@@ -462,9 +464,10 @@ _seg_sig_verify :: proc(data: rawptr, msg: []u8, sig: []u8) -> bool {
 }
 
 @(private)
-_handle_remote_grew :: proc(h: ^Handle, device: prim.Id) {
+_handle_remote_grew :: proc(h: ^Handle, device: prim.Id, length: i64) {
 	for s in h.segs {
 		if s.device == device {
+			s.empty = length == 0 && journal.replica_length(s.rep) == 0
 			s.waiting = false
 			s.probing = false
 			if !s.in_view && s.tree != nil && !s.tree.loaded {
@@ -552,6 +555,9 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 		_handle_probe(h)
 	}
 	for s in h.segs {
+		if s.empty && !(fresh && s.probing) {
+			continue
+		}
 		if s.waiting || (fresh && s.probing) {
 			return true
 		}
@@ -766,7 +772,7 @@ _replica_covers :: proc(rep: ^journal.Replica, n: i64) -> bool {
 
 @(private)
 _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tries := 0) -> Error {
-	fetched := _handle_want(h)
+	fetched := _handle_want(h) || _content_pending(e, h.id)
 	if !fetched && h.sp.repl_on {
 		for sg in h.segs {
 			if !sg.in_view {
