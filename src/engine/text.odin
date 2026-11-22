@@ -509,6 +509,9 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 			break
 		}
 	}
+	if rerr := fs.history_resume(hist); rerr != .None {
+		_log(e, .Warn, "history replay failed")
+	}
 }
 
 @(private)

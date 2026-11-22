@@ -447,6 +447,7 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 	h := _handle_get(e, o, kind) or_return
 	_hist_ready(e, h) or_return
 	hist := h.hist
+	_ferr(fs.history_resume(hist)) or_return
 	if kept := _ferr2(fs.history_interning_kept(hist)) or_return; !kept {
 		append(notes, fmt.tprintf("history %s: actor interning order differs from the order saved before its rebuild", prim.id_hex(o.id)))
 	}

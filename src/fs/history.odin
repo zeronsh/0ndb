@@ -2338,16 +2338,28 @@ replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: b
 	if skip >= crdt.batch_len(&b) {
 		return false, .None
 	}
+	aerr: Error
 	if kind == REC_IMPORT {
-		import_apply(h, &b, 0, u64(off)) or_return
+		aerr = import_apply(h, &b, 0, u64(off))
 	} else {
-		apply_batch(h, &b, 0, u64(off)) or_return
+		aerr = apply_batch(h, &b, 0, u64(off))
 	}
+	if kind != REC_IMPORT && aerr == .Not_Found {
+		return true, .None
+	}
+	aerr or_return
 	history_persist(h) or_return
 	history_unload_files(h)
 	crdt.graph_trim(&h.g)
 	fstree.trim(&h.tree, 64)
 	return false, .None
+}
+
+history_resume :: proc(h: ^History) -> Error {
+	if !h.awake || !h.own_wait {
+		return .None
+	}
+	return replay_own(h)
 }
 
 @(private)
