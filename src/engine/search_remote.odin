@@ -813,10 +813,9 @@ search_everywhere :: proc(e: ^Engine, space: prim.Id, query: string, req: search
 		}
 		if serr == .None {
 			q.local = res
-			q.local.hits = _hit_gens(e, q.local.hits, q.alloc)
+			q.local.hits = _hit_gens(e, q.local.hits, q.space, q.alloc)
 			if q.local_skip > 0 {
-				n := min(q.local_skip, len(res.hits))
-				q.local.hits = res.hits[n:]
+				q.local.hits = q.local.hits[min(q.local_skip, len(q.local.hits)):]
 			}
 		}
 	}
@@ -1449,6 +1448,7 @@ _q_verify :: proc(e: ^Engine, q: ^Remote_Q) {
 		p.state = 1
 		_remote(e).stats.verified += 1
 		append(&q.verified, search.Hit {
+			space = q.space,
 			object = r.object,
 			participant = m.author,
 			ref = _gen_ref(rid, q.alloc),
@@ -1744,7 +1744,22 @@ _remote_serve :: proc(e: ^Engine, sp: ^Space, from: prim.Id, tag: u64, payload: 
 	state := Search_State.Ok if serr == .None else .Failed
 	prim.write_u8(&w, u8(state))
 	prim.write_u32le(&w, u32(min(_remote(e).behind[sp.id], int(max(u32)))))
-	hits := res.hits[min(skip, len(res.hits)):] if serr == .None else nil
+	kept := make([dynamic]search.Hit, context.temp_allocator)
+	if serr == .None {
+		for h in res.hits {
+			if h.kind != u8(Kind.Conversation) || len(h.ref) != 24 {
+				continue
+			}
+			if sid, known := _hit_space(e, h.object); !known || sid != sp.id {
+				continue
+			}
+			if !member && !_remote_participant(e, h.object, from) {
+				continue
+			}
+			append(&kept, h)
+		}
+	}
+	hits := kept[min(skip, len(kept)):]
 	prim.write_u16le(&w, u16(len(res.cursor)))
 	prim.write_raw(&w, res.cursor)
 	count_at := len(out)
@@ -1752,11 +1767,8 @@ _remote_serve :: proc(e: ^Engine, sp: ^Space, from: prim.Id, tag: u64, payload: 
 	count := 0
 	objects := make([dynamic]prim.Id, context.temp_allocator)
 	for h in hits {
-		if count >= limit || h.kind != u8(Kind.Conversation) || len(h.ref) != 24 {
-			continue
-		}
-		if !member && !_remote_participant(e, h.object, from) {
-			continue
+		if count >= limit {
+			break
 		}
 		pin := h.object
 		prim.write_raw(&w, pin[:])

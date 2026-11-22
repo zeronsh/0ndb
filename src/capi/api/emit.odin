@@ -455,7 +455,7 @@ emit_results :: proc(o: ^Out, r: ^search.Results) {
 	o_arr(o, "hits", len(r.hits))
 	for &h in r.hits {
 		o_obj(o, "")
-		o_id(o, "object", h.object)
+		o_object(o, "object", Object{h.space, h.object})
 		o_id(o, "participant", h.participant)
 		if r, ok := eng.ref_rid(h.ref); ok && len(h.ref) == 32 {
 			o_rid(o, "msg", r)

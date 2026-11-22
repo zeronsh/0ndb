@@ -220,7 +220,7 @@
  *                 line_hi: uvarint, actor: id, seq: uvarint, op_actor: id,
  *                 op_seq: uvarint, redacted: bool
  *   Mounted    := object: object, root: str, line: str
- *   Hit        := object: id, participant: id, msg: rid, ref: bytes,
+ *   Hit        := object: object, participant: id, msg: rid, ref: bytes,
  *                 part: uvarint, kind: enum kind, title: bool, hlc: uvarint,
  *                 score: f64, snippet: str, snippet_at: uvarint,
  *                 matches: [ {start: uvarint, len: uvarint} ]
