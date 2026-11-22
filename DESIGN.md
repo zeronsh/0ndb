@@ -1392,7 +1392,11 @@ Relay cost tracks the reachable information, not the activity. Items marked
   appends, and fills every segment it holds backward from the relay's
   `base`, tail first, down to the requested offset (today the start of what
   it holds; (planned) the oldest record on the answered message's path and,
-  for a tree, the newest checkpoint). Pending promotions are durable in the
+  for a tree, the newest checkpoint). The base comes only from `Noted`
+  answers to the promotion's own `Fill` frames, starting with an empty one;
+  `Not_Found` means there is nothing to fill. A lost or withheld frame
+  therefore stalls a promotion until the reconnect re-asks, and never makes
+  it report a hollow segment as stored. Pending promotions are durable in the
   registry and resume after a restart. A writer that still notes a filled
   segment gets `Noted` with `base < length` and switches to appends.
 - **Redaction** is metadata: it is applied to the stored suffix (if any) and
@@ -1718,7 +1722,8 @@ Client to relay:
   `n <= APPEND_MAX`. Members only (`Fill` access: the space credential, not a
   share grant). On success `base = at`; reply `Noted`. A mismatched `at`
   answers `Noted` with the current `base` and stores nothing (the uploader
-  resumes from there); quota applies as for appends.
+  resumes from there); quota applies as for appends. An empty `Fill` is
+  always mismatched: it is how a promotion asks for the base.
 - `Pull` (0x13, 72 bytes): `holder:device, tag:u64, segment, from:u64,
   to:u64`. Requires `Read` access to `segment`. If `holder` has no live
   connection in the space the relay answers `Unserved` at once; otherwise it
