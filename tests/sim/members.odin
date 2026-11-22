@@ -1271,6 +1271,40 @@ _upload_wait_case :: proc(w: ^World, sid: prim.Id) {
 	if free_probe {
 		free(fp, w.allocator)
 	}
+	cancelled := new(Window_Probe, w.allocator)
+	cready := eng.Ready {
+		data = cancelled,
+		call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+			p := (^Window_Probe)(data)
+			p.fired += 1
+		},
+	}
+	context = instance_context(&a.inst)
+	oc, ocerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "uploaded-cancelled"})
+	upc, ec := eng.upload_wait(&a.e, oc, cready)
+	eng.cancel_waits(&a.e, cancelled)
+	node_after(a)
+	if ocerr != .None || upc || ec != .Pending {
+		_fail(w, "upload: second create should wait: %v uploaded=%v %v", ocerr, upc, ec)
+		return
+	}
+	uploaded := false
+	for _ in 0 ..< 300 {
+		context = instance_context(&a.inst)
+		up, _ := eng.upload_wait(&a.e, oc)
+		node_after(a)
+		if up {
+			uploaded = true
+			break
+		}
+		_settle(w, 100)
+	}
+	_settle(w, 500)
+	if !uploaded || cancelled.fired != 0 {
+		_fail(w, "upload: a cancelled wait fired %d times (uploaded=%v); its caller is gone", cancelled.fired, uploaded)
+		return
+	}
+	free(cancelled, w.allocator)
 	_down(w, M_A)
 	a = _up(w, M_A)
 	context = instance_context(&a.inst)
