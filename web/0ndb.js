@@ -75,6 +75,7 @@ export class Ondb {
   _env() {
     return {
       rand_bytes: (ptr, len) => crypto.getRandomValues(new Uint8Array(this.x.memory.buffer, ptr, len)),
+      time_now: () => BigInt(Date.now()),
       write: (fd, ptr, len) => console.error(dec.decode(new Uint8Array(this.x.memory.buffer, ptr, len))),
     };
   }
