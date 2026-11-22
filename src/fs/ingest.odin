@@ -2697,6 +2697,11 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, path: st
 			emit_insert(m, b, inode, pre + w.w1, data[w.w1:r.b1]) or_return
 			continue
 		}
+		if at, del, ins, ok := textdiff.single_edit(old[r.a0:r.a1], data[r.b0:r.b1]); ok {
+			builder_delete(b, inode, pre + r.b0 + at, del)
+			emit_insert(m, b, inode, pre + r.b0 + at, data[r.b0 + at:][:ins]) or_return
+			continue
+		}
 		builder_delete(b, inode, pre + r.b0, r.a1 - r.a0)
 		emit_insert(m, b, inode, pre + r.b0, data[r.b0:r.b1]) or_return
 	}

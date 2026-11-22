@@ -272,8 +272,9 @@ A git object database in git's formats.
 Histogram diff over lines (with Myers fallback), unified-diff rendering,
 three-way merge (diff3 with conflict markers), and a blame walker that maps
 lines through a chain of revisions. Pure functions over byte slices.
-`line_edits` emits whole-line edits and is what every writer of CRDT ops from
-two whole states uses; `byte_diff` refines inside changed lines and serves
+`line_edits` emits whole-line edits (narrowed to the edit itself when a hunk
+is one contiguous insertion or deletion, `single_edit`) and is what every
+writer of CRDT ops from two whole states uses; `byte_diff` refines inside changed lines and serves
 only display deltas, which are never stored.
 
 ## crdt
@@ -377,13 +378,17 @@ equal in both directions.
   shadow-guided rescan.
 - **Ingestion**: for each dirty path compare the stat signature, read only
   changed files, diff against the shadow text by lines (histogram diff; a
-  changed hunk is a whole-line delete and insert) and append the resulting
+  changed hunk is a whole-line delete and insert, unless its new text is the
+  old text with one contiguous insertion or deletion, which leaves every
+  other byte where it was and is emitted exactly) and append the resulting
   ops as one batch parented on the mount's synced version, credited to the
   actor/scope active at the time of the write (or the writer pid's scope).
   Every source that diffs two whole states is line-granular the same way:
   disk passes, imports, `tree_write` (whole-file) and version restore. A
   snapshot carries no edit intent, so the CRDT never claims a byte inside a
-  rewritten line was kept: a concurrent writer that deletes the old line
+  rewritten line was kept (a single insertion or deletion is not a rewrite:
+  the bytes it keeps are observed, not inferred, so appending to an
+  unterminated last line keeps that line's authors): a concurrent writer that deletes the old line
   would otherwise leave the "kept" bytes deleted and the inserted ones
   joined into text nobody wrote (a broken token, a lost line end). Only
   inputs with positional intent stay character-granular: `buffer_edit` and
