@@ -193,8 +193,11 @@ the subscription is acknowledged, and apply deltas on top (section 7).
 Coalescing. The engine delivers deltas once per tick, after the tick's
 records are committed: one Deltas frame per subscription per tick, never a
 frame per record. Consecutive text of one block within a tick is already
-joined into one `chunk` delta. All frames pushed in one daemon loop step
-(Deltas, Event, Gap) are flushed together in one write. Nothing is sent while
+joined into one `chunk` delta. Live-buffer frames are written as soon as
+the tick has advanced its buffers, and the subscription frames of a tick in
+one write as soon as their delivery ends, both before the tick goes on to
+its durability work. Other frames pushed in a daemon loop
+step (Event, Gap) are flushed together at the end of the step. Nothing is sent while
 nothing changes; there is no heartbeat on local sockets.
 
 `Deltas := deltas: [Delta]` (the `Delta` structure of the header): `kind`

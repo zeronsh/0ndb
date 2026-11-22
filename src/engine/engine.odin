@@ -321,6 +321,7 @@ Engine :: struct {
 	tick:         u64,
 	tick_timer:   prim.Timer,
 	tick_hook:    Tick_Hook,
+	deliver_hook: Tick_Hook,
 	tick_wanted:  bool,
 	settle_timer: prim.Timer,
 	settling:     bool,
@@ -747,6 +748,19 @@ Tick_Hook :: struct {
 	call: proc(data: rawptr, e: ^Engine),
 }
 
+set_deliver_hook :: proc(e: ^Engine, hook: Tick_Hook) {
+	e.deliver_hook = hook
+}
+
+@(private)
+_deliver_hook :: proc(e: ^Engine) {
+	if e.deliver_hook.call != nil {
+		hook := e.deliver_hook
+		context = _outer(e)
+		hook.call(hook.data, e)
+	}
+}
+
 set_tick_hook :: proc(e: ^Engine, hook: Tick_Hook) {
 	e.tick_hook = hook
 }
@@ -808,7 +822,9 @@ _tick_end :: proc(e: ^Engine) {
 	_handles_commit(e)
 	_mounts_changed(e)
 	_buffers_tick(e)
+	_deliver_hook(e)
 	_subs_deliver(e)
+	_deliver_hook(e)
 	if e.tick_hook.call != nil {
 		hook := e.tick_hook
 		{
