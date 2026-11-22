@@ -13,6 +13,17 @@ client_note :: proc(c: ^Client, id: Stream_Id, length: i64) -> Error {
 	return .None
 }
 
+client_trim :: proc(c: ^Client, id: Stream_Id, base: i64) -> Error {
+	b := _client_buf(c)
+	start := frame_begin(b, .Trim) or_return
+	w := prim.writer(b)
+	put_id(&w, cast([32]u8)id)
+	prim.write_u64le(&w, u64(max(base, 0)))
+	frame_end(b, start, &w) or_return
+	_await_add(c, cast([32]u8)id)
+	return .None
+}
+
 client_fill_reserve :: proc(c: ^Client, id: Stream_Id, at: i64, n: int) -> (dst: []u8, err: Error) {
 	if n <= 0 || n > APPEND_MAX {
 		return nil, .Too_Large

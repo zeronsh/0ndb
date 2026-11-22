@@ -40,6 +40,7 @@ _Deferred :: struct {
 	to:     i64,
 	done:   Storage_Done,
 	ctx:    rawptr,
+	trim:   bool,
 }
 
 @(private)
@@ -55,6 +56,7 @@ _Fstream :: struct {
 	base:   i64,
 	seq:    u64,
 	fresh:  bool,
+	trimmed: bool,
 }
 
 @(private)
@@ -153,6 +155,8 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		note = _fs_note,
 		drop = _fs_drop,
 		redact = _fs_redact,
+		trim = _fs_trim,
+		stream_trimmed = _fs_stream_trimmed,
 		list_begin = _fs_list_begin,
 		list_next = _fs_list_next,
 		list_end = _fs_list_end,
@@ -242,6 +246,7 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 		base   = f.base,
 		seq    = f.seq,
 		fresh  = f.fresh,
+		trimmed = f.trimmed,
 	}
 	return st, f.length, .None
 }
@@ -249,6 +254,55 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 @(private)
 _fs_stream_base :: proc(data: rawptr, s: rawptr) -> i64 {
 	return (cast(^_Fstream)s).base
+}
+
+@(private)
+_fs_stream_trimmed :: proc(data: rawptr, s: rawptr) -> bool {
+	return (cast(^_Fstream)s).trimmed
+}
+
+@(private)
+_fs_trim :: proc(data: rawptr, s: rawptr, base: i64, done: Storage_Done, ctx: rawptr) {
+	fs := cast(^File_Store)data
+	st := cast(^_Fstream)s
+	if st.busy {
+		if _, e := append(&st.queue, _Deferred{trim = true, from = base, done = done, ctx = ctx}); e != nil {
+			done(ctx, .No_Memory, 0)
+		}
+		return
+	}
+	if base >= st.length {
+		done(ctx, .Conflict, 0)
+		return
+	}
+	if base <= st.base {
+		done(ctx, .None, 0)
+		return
+	}
+	job, jerr := new(Job, fs.allocator)
+	if jerr != nil {
+		done(ctx, .No_Memory, 0)
+		return
+	}
+	st.busy = true
+	job^ = {
+		vfs    = fs.vfs,
+		lay    = fs.lay,
+		kind   = .Trim,
+		fd     = st.fd,
+		value  = st.length,
+		base   = base,
+		from   = st.base,
+		delta  = st.base - base,
+		seq    = st.seq + 1,
+		target = st,
+		done   = done,
+		ctx    = ctx,
+	}
+	if err := worker_submit(&fs.worker, job); err != .None {
+		job.result = err
+		_fs_job_done(fs, job)
+	}
 }
 
 @(private)
@@ -425,7 +479,7 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 	}
 	new_len := a.at + a.total
 	new_base := st.base
-	slot := Slot{seq = st.seq + 1, value = new_len, start = a.at, hash = xxhash.XXH64_digest(&a.hash), base = st.base}
+	slot := Slot{seq = st.seq + 1, value = new_len, start = a.at, hash = xxhash.XXH64_digest(&a.hash), base = st.base, trimmed = st.trimmed}
 	switch {
 	case a.note:
 		if st.base != st.length || a.at < st.length {
@@ -557,6 +611,7 @@ _fs_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, c
 		value  = st.length,
 		base   = st.base,
 		seq    = st.seq + 1,
+		trimmed = st.trimmed,
 		from   = lo,
 		to     = hi,
 		target = st,
@@ -876,6 +931,16 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 		if job.result == .None {
 			st.seq = job.seq
 		}
+	case .Trim:
+		st := cast(^_Fstream)job.target
+		st.busy = false
+		if job.result == .None {
+			_usage_add(fs, st.ns, job.delta)
+			st.base = job.base
+			st.seq = job.seq
+			st.trimmed = true
+			value = -job.delta
+		}
 	case .Remove:
 		if job.result == .None && job.ns != nil {
 			_usage_add(fs, cast(^_Fns)job.ns, -value)
@@ -890,7 +955,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	if len(job.final) > 0 {
 		delete(job.final, fs.allocator)
 	}
-	st := cast(^_Fstream)job.target if job.kind == .Stream_Sync || job.kind == .Redact else nil
+	st := cast(^_Fstream)job.target if job.kind == .Stream_Sync || job.kind == .Redact || job.kind == .Trim else nil
 	free(job, fs.allocator)
 	if st == nil {
 		done(ctx, result, value)
@@ -911,6 +976,8 @@ _fs_next :: proc(fs: ^File_Store, st: ^_Fstream) {
 		ordered_remove(&st.queue, 0)
 		if d.append != nil {
 			_fs_append_commit(fs, d.append, d.done, d.ctx)
+		} else if d.trim {
+			_fs_trim(fs, st, d.from, d.done, d.ctx)
 		} else {
 			_fs_redact(fs, st, d.from, d.to, d.done, d.ctx)
 		}

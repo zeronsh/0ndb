@@ -192,7 +192,9 @@ relay is 25 bytes and has no `features`).
 | bit | feature |
 |---|---|
 | 0 | `Account` / `Accounted` (section 8.13) |
-| 1, 2 | reserved: `Trim` and reads below `base` (section 13) |
+| 1 | `Trim` (section 8.14) |
+| 2 | reads below a trimmed `base`: `Trimmed` (section 8.14) |
+| 3 | reserved: live drafts (`Live` / `Lived`) |
 
 The signature in every built-in credential is Ed25519 over the **hello
 message** `"0ndb hello 1" ‖ 00 00 00 00 ‖ B`, where `B` is the 64-byte binding,
@@ -393,8 +395,8 @@ Data := id | at u64 | word u64 | bytes      word = length | FINAL (bit 63)
 
 `Read` access, else `Refused Not_Owner`. `Tail` reads `[max(length - n, 0),
 length)`. `Read` clamps `to` to `max(length, from)`; `to < from` reads
-nothing. For a based segment the relay first sends `Hollow` and raises
-`from` to `base`. The answer is one or more `Data` frames of at most 4 MiB
+nothing. For a based segment the relay first sends `Hollow` (`Trimmed` if the
+base is a trim, section 8.14) and raises `from` to `base`. The answer is one or more `Data` frames of at most 4 MiB
 covering the range in order; the last carries `FINAL`. A read entirely past
 the end answers one empty `Data` at `from` with `FINAL`. `length` in each
 frame is the segment's current length, or the end of the frame's bytes if
@@ -410,7 +412,7 @@ Unfollow := count u16 | id*
 ```
 
 Per entry: `Read` access (else `Refused Not_Owner`), follow limit (16384 per
-connection, else `Refused Limit`), `Hollow` if based. `offset = 2^64 - 1`
+connection, else `Refused Limit`), `Hollow` (or `Trimmed`) if based. `offset = 2^64 - 1`
 means "from the current end". Following an already-followed segment moves its
 offset. The relay then sends one `Length` for the accepted entries and pushes
 `Data` (without `FINAL`) from each offset as bytes become durable, round
@@ -539,7 +541,8 @@ Probed := count u16 | (id | length u64)*
 
 Per id: the feed id `ffff..ff 01 00..00` answers the feed end (needs `List`);
 an id without `Read` access answers length 0; otherwise the current length,
-preceded by `Hollow(id, base, length)` if `base > 0`. A storage error for one
+preceded by `Hollow(id, base, length)` if `base > 0` (`Trimmed` with the same
+fields if the base is a trim). A storage error for one
 id answers `Refused Io` for it and omits it.
 
 ### 8.11 Device-only segments: Note (0x11), Fill (0x12), Hollow
@@ -559,8 +562,8 @@ the other followers. Otherwise nothing changes and `Noted` shows the current
 `base < length` and switches to appends). `Busy` while a write is in flight.
 
 `Fill` needs `Fill` and quota. A segment the relay does not have is `Refused
-Not_Found`; `Busy` while a write is in flight. If `at + n != base` the relay
-stores nothing and answers `Noted` with the current `base` so the uploader
+Not_Found`; `Busy` while a write is in flight. If `at + n != base`, or the
+base is a trim (section 8.14), the relay stores nothing and answers `Noted` with the current `base` so the uploader
 resumes from there. Otherwise, once durable, `base = at` and the filler gets
 `Noted`.
 
@@ -609,7 +612,37 @@ accepted but not yet flushed; `day` is UTC days since 1970 and `day_bytes`
 the client bytes accepted that day; `total_bytes` all client bytes accepted.
 Clients send it only on demand (the C API's `space.relay_account`).
 
-### 8.14 Presence and direct messages
+### 8.14 Trim (0x16, feature bit 1) and Trimmed (feature bit 2)
+
+```
+Trim    := id | base u64            (base <= 2^62)
+Trimmed := id | base u64 | length u64
+```
+
+A writer that has archived a prefix `[0, base)` of its segment into its own
+archive stream (`DESIGN.md`, Segment archives) drops the stored copy of that
+prefix with `Trim`. Checks in order: `Append` access on `id` (own segments
+only), else `Refused Not_Owner`; a segment the relay does not have, or a
+dropped one, is `Refused Not_Found`; `Busy` while a write is in flight; a
+`base` at or past the length is `Refused Protocol` (a trim always leaves at
+least one byte stored, so a trimmed segment never looks device-only); a
+`base` at or below the current base changes nothing and answers `Noted` at
+once (trim never lowers `base`, and repeating one is harmless). Otherwise the
+relay raises `base`, marks the base as a trim, frees `[old base, base)` and,
+once durable, answers `Noted(id, base, length)`. Usage drops by the freed
+bytes. Trim appends no feed entry: no follower holds less afterwards, and a
+new feed word would be read as a length by version-3 clients.
+
+The relay never reads the trimmed bytes again. Wherever it would send `Hollow`
+for a segment whose base is a trim (before `Data`, `Length` and `Probed`), it
+sends `Trimmed` with the same fields instead, telling the reader that an
+archive covers `[0, base)` and that it reads those offsets from the writer's
+archive stream rather than from peers. `Fill` below a trim stores nothing and
+answers `Noted` with the current base. Redaction clamps to the stored suffix
+as before; the redactor removes archived copies itself (`DESIGN.md`,
+Restore).
+
+### 8.15 Presence and direct messages
 
 ```
 Presence    := flags u8 (bit 0 snapshot) | count u16 | (dev | up u8 | since u64)*
@@ -685,7 +718,7 @@ optional zero-copy path used only when both exist; the correctness path is
 
 `Relay_Storage` reads (`stream_open`, `stream_read`, `stream_probe`,
 `object_open`, `list_*`) are synchronous; writes (`append_commit`, `note`,
-`fill`, `redact`, `drop`, `put_commit`, `object_remove`) complete through a
+`fill`, `redact`, `trim`, `drop`, `put_commit`, `object_remove`) complete through a
 callback that may run later, and the core acknowledges only then. A Durable
 Object implements reads with its synchronous SQLite storage and completes
 writes when the storage transaction commits; `Mem_Store`
@@ -750,6 +783,7 @@ storage completion as an input, which every sans-IO relay does.
 | drop | Busy while writing, Not_Owner, Dropped to the owner after the feed entry, once to a follower that also watches, FEED_DROPPED in the feed |
 | redact | reader refusal, misaligned range refused with no change, zero-fill with tag, redaction pair in the feed, missing segment |
 | hollow | Note, Noted, Hollow to followers and readers, Fill by a member, mismatched Fill, reader refusal, Append after the stored suffix, Note on stored content, Fill on a missing segment |
+| trim | Trim by the owner acknowledged once durable, member and reader refusals, repeated and lower bases, base at the length refused, Trimmed before Data, Probed and Length, Fill below a trim, appends after a trim, redaction clamped to the stored suffix, missing segment |
 | pipe | Pull, Pulled, Serve, Served, FINAL, NONE, closed pipe, absent and self holders, duplicate tag, wrong requester, holder disconnect |
 | presence | snapshot, up and down per device across connections, Direct, Undelivered |
 | membership | Add appended to a members segment admits; a non-member's proof is ignored; a Remove revokes the live connection and later Hellos |
@@ -763,16 +797,27 @@ storage completion as an input, which every sans-IO relay does.
 
 New frames are additive and gated by a Welcome feature bit; a client never
 sends a frame the relay did not advertise, and a relay answers an unknown
-kind with `Error Protocol`. Reserved:
+kind with `Error Protocol`. A relay sends a new relay kind only about state a
+client of that feature created (a `Trimmed` only for segments a writer
+trimmed). Assigned so far:
 
-- **Trim** (bit 1, kind 0x16): `id | base u64`, for a member with `Append` on
-  its own segment or `Fill` access, raises `base` and drops stored content
-  below it once a segment archive covers it. Acknowledged with `Noted` once
-  durable; it never lowers `base`, and the feed entry carries the new base.
-- **Reads below base** (bit 2): `Read` of a range below `base` answered from a
-  host archive tier instead of being clamped, preceded by `Hollow` as today.
+| bit | client kinds | relay kinds | other |
+|---|---|---|---|
+| 1 | `Trim` 0x16 | | |
+| 2 | | `Trimmed` 0x9c | |
+| 3 (live drafts, reserved) | `Live` 0x17 | `Lived` 0x9b | Follow flag bit 1 `LIVE`, Pull `from` bit 63 `DRAFT` |
+
+Reads below a trimmed base are not served by the relay: the archive is the
+writer's own stream, so a relay needs no archive tier and never holds plain
+or rearranged bytes. `Trimmed` only tells the reader where to look.
 
 ## 14. Changes in this revision
+
+- `Trim` (bit 1) and `Trimmed` (bit 2) were added (section 8.14); the
+  reserved design changed in three places: only the owner trims (a member's
+  `Fill` access does not let it trim someone else's segment), Trim appends no
+  feed entry, and reads below base go to the writer's archive stream rather
+  than to a relay archive tier. Welcome `features` is 7.
 
 Found while specifying and while running the vectors natively and under
 wasm, and fixed in the reference core:

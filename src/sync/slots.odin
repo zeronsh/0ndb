@@ -24,6 +24,8 @@ SLOT_MAGIC_BASED :: 0x6573_6273_6264_6e30
 SLOT_BYTES :: 48
 @(private)
 SLOT_BASED_BYTES :: 64
+@(private)
+SLOT_TRIMMED :: u64(1) << 63
 
 Slot :: struct {
 	seq:   u64,
@@ -32,6 +34,7 @@ Slot :: struct {
 	hash:  u64,
 	base:  i64,
 	end:   i64,
+	trimmed: bool,
 }
 
 slot_end :: proc "contextless" (s: Slot) -> i64 {
@@ -39,7 +42,7 @@ slot_end :: proc "contextless" (s: Slot) -> i64 {
 }
 
 slot_write :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot, spacing: i64 = SLOT_SPACING) -> Error {
-	if s.base == 0 && slot_end(s) == s.value {
+	if s.base == 0 && slot_end(s) == s.value && !s.trimmed {
 		b: [SLOT_BYTES]u8
 		prim.put_u64le(b[0:], SLOT_MAGIC)
 		prim.put_u64le(b[8:], s.seq)
@@ -55,7 +58,7 @@ slot_write :: proc(vfs: prim.Vfs, fd: prim.Fd, s: Slot, spacing: i64 = SLOT_SPAC
 	prim.put_u64le(b[16:], u64(s.value))
 	prim.put_u64le(b[24:], u64(s.start))
 	prim.put_u64le(b[32:], s.hash)
-	prim.put_u64le(b[40:], u64(s.base))
+	prim.put_u64le(b[40:], u64(s.base) | (SLOT_TRIMMED if s.trimmed else 0))
 	prim.put_u64le(b[48:], u64(slot_end(s)))
 	prim.put_u64le(b[56:], xxhash.XXH3_64_with_seed(b[:56], SLOT_SEED))
 	return _from_prim(prim.write_at(vfs, fd, b[:], i64(s.seq & 1) * spacing))
@@ -114,6 +117,8 @@ _slot_decode :: proc(b: []u8) -> (s: Slot, ok: bool) {
 	if based {
 		base = prim.get_u64le(b[40:])
 		end = prim.get_u64le(b[48:])
+		s.trimmed = base & SLOT_TRIMMED != 0
+		base &~= SLOT_TRIMMED
 	}
 	if v > u64(max(i64)) || st > end || end > v || base > v || s.seq == 0 {
 		return {}, false

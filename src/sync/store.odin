@@ -13,6 +13,7 @@ Stream_File :: struct {
 	base:   i64,
 	seq:    u64,
 	fresh:  bool,
+	trimmed: bool,
 }
 
 stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u8, lay := LAYOUT_SECTOR) -> (f: Stream_File, err: Error) {
@@ -31,7 +32,7 @@ stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u
 	if f.fresh {
 		return f, .None
 	}
-	f.length, f.base, f.seq, err = stream_file_recover(vfs, fd, scratch, lay)
+	f.length, f.base, f.seq, f.trimmed, err = stream_file_recover(vfs, fd, scratch, lay)
 	if err != .None {
 		prim.close_file(vfs, fd)
 		f.fd = prim.INVALID_FD
@@ -45,19 +46,19 @@ stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u
 	return f, .None
 }
 
-stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, seq: u64, err: Error) {
+stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, seq: u64, trimmed: bool, err: Error) {
 	newest, older, count := slots_read(vfs, fd, lay.spacing) or_return
 	if count == 0 {
-		return 0, 0, 0, .None
+		return 0, 0, 0, false, .None
 	}
 	ok := _chunk_verify(vfs, fd, newest, scratch, lay.base) or_return
 	if ok {
-		return newest.value, newest.base, newest.seq, .None
+		return newest.value, newest.base, newest.seq, newest.trimmed, .None
 	}
 	if count == 2 && older.seq + 1 == newest.seq {
-		return older.value, older.base, older.seq, .None
+		return older.value, older.base, older.seq, older.trimmed, .None
 	}
-	return 0, 0, 0, .None
+	return 0, 0, 0, false, .None
 }
 
 stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, exists: bool, err: Error) {
@@ -69,7 +70,7 @@ stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8, lay := LAYO
 		return 0, 0, false, _from_prim(oerr)
 	}
 	defer prim.close_file(vfs, fd)
-	length, base, _, err = stream_file_recover(vfs, fd, scratch, lay)
+	length, base, _, _, err = stream_file_recover(vfs, fd, scratch, lay)
 	return length, base, err == .None, err
 }
 

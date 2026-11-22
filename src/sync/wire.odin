@@ -43,6 +43,7 @@ Kind :: enum u8 {
 	Pull      = 0x13,
 	Serve     = 0x14,
 	Account   = 0x15,
+	Trim      = 0x16,
 	Welcome   = 0x81,
 	Listing   = 0x82,
 	Appended  = 0x83,
@@ -69,6 +70,7 @@ Kind :: enum u8 {
 	Served    = 0x98,
 	Unserved  = 0x99,
 	Accounted = 0x9a,
+	Trimmed   = 0x9c,
 }
 
 Code :: enum u8 {
@@ -124,7 +126,10 @@ BULK_FIXED_MAX :: SERVE_FIXED
 ACCOUNT_TAG :: 5
 ACCOUNTED_LEN :: 14 * 8
 FEATURE_ACCOUNT :: u64(1)
-RELAY_FEATURES :: FEATURE_ACCOUNT
+FEATURE_TRIM :: u64(2)
+FEATURE_BELOW_BASE :: u64(4)
+RELAY_FEATURES :: FEATURE_ACCOUNT | FEATURE_TRIM | FEATURE_BELOW_BASE
+TRIM_LEN :: 32 + 8
 
 Feed_Pattern_Kind :: enum u8 {
 	Prefix = 1,
@@ -284,7 +289,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 	bulk := false
 	if p.relay {
 		#partial switch k {
-		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Direct, .Note, .Pull, .Account:
+		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Direct, .Note, .Pull, .Account, .Trim:
 		case .Append:
 			bulk, fixed, limit = true, APPEND_FIXED, APPEND_MAX
 		case .Fill:
@@ -298,7 +303,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 		}
 	} else {
 		#partial switch k {
-		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Directed, .Undelivered, .Noted, .Hollow, .Pulled, .Unserved, .Accounted:
+		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Directed, .Undelivered, .Noted, .Hollow, .Pulled, .Unserved, .Accounted, .Trimmed:
 		case .Data:
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
 		case .Served:
