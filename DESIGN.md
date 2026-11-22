@@ -3216,7 +3216,17 @@ Relay cost tracks the reachable information, not the activity. Items marked
   after it, 10 with coalescing).
 - **Relay writes** are host-chosen and never protocol-visible: an append is
   acknowledged once durable in the host's durable buffer (group-committed
-  local files for the reference relay, Durable Object storage for a DO host)
+  local files for the reference relay, Durable Object storage for a DO host).
+  The reference relay commits each worker group off its loop: the group's
+  jobs stage into the pack, `batch_end_async` hands the commit (and the
+  fsync of any promoted file a staged sync dirtied) to the pack's worker
+  thread, and the group's acknowledgements go out when that commit completes
+  through the loop's wake. The loop keeps serving reads and other spaces
+  meanwhile, the next group stages behind the commit in flight, and the pack
+  never runs two commits at once. On a disk with 20 to 40 ms fsyncs, other
+  clients' p99 during a device's cold sync fell from 181 ms to 56 ms (the rest
+  is the member authorizer's roster fsync and the local object store's
+  atomic writes, both still on the loop)
   and any object-store flush is coalesced per space and asynchronous. With
   `--objects` the reference relay's tiered store writes one batch object per
   space once the space has been quiet for `--flush-ms` (default 30000), its

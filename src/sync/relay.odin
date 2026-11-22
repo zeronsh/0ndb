@@ -58,6 +58,9 @@ Relay :: struct {
 	scratch:    []u8,
 	wake_timer: prim.Timer,
 	pack_timer: prim.Timer,
+	prev_wake:  prim.Wake_Proc,
+	prev_data:  rawptr,
+	waking:     bool,
 	shaking:    int,
 	kernel:     int,
 	accepted:   u64,
@@ -241,6 +244,8 @@ _relay_own_storage :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config) -> (stor
 		}
 		popts := pack.DEFAULT_OPTIONS
 		popts.roll_min = RELAY_PACK_ROLL
+		popts.wake = _relay_pack_wake
+		popts.wake_data = r
 		if oerr := pack.open(pk, r.vfs, proot, popts, allocator); oerr != .None {
 			free(pk, allocator)
 			free(fs, allocator)
@@ -254,7 +259,10 @@ _relay_own_storage :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config) -> (stor
 	}
 	group: Group_Commit
 	if r.own_pack != nil {
-		group = Group_Commit{data = r, begin = _pack_begin, end = _pack_end}
+		group = Group_Commit{data = r, begin = _pack_begin, end = _pack_end, end_async = _pack_end_async}
+		r.prev_wake, r.prev_data = l.wake_cb, l.wake_data
+		prim.loop_on_wake(l, _relay_on_wake, r)
+		r.waking = true
 	}
 	if ferr := file_store_init(fs, l, store_vfs, r.root, threads, lay, group, cfg.random, cfg.clock, allocator); ferr != .None {
 		if r.own_pack != nil {
@@ -310,6 +318,13 @@ relay_destroy :: proc(r: ^Relay) {
 	relay_core_close_all(&r.core)
 	if r.own_tier != nil {
 		tier_store_flush_all(r.own_tier)
+	}
+	if r.own_pack != nil {
+		pack.sync(r.own_pack)
+	}
+	if r.waking && r.loop != nil {
+		prim.loop_on_wake(r.loop, r.prev_wake, r.prev_data)
+		r.waking = false
 	}
 	if r.own_store != nil {
 		worker_destroy(&r.own_store.worker)
@@ -895,6 +910,58 @@ _pack_end :: proc(data: rawptr) -> Error {
 		r.pack_timer = prim.timer(r.loop, 0, r, _on_pack_timer)
 	}
 	return err
+}
+
+@(private)
+Relay_Commit :: struct {
+	r:    ^Relay,
+	done: proc(ctx: rawptr, err: Error),
+	ctx:  rawptr,
+}
+
+@(private)
+_pack_end_async :: proc(data: rawptr, done: proc(ctx: rawptr, err: Error), ctx: rawptr) {
+	r := cast(^Relay)data
+	g := new(Relay_Commit, r.allocator)
+	g^ = {r = r, done = done, ctx = ctx}
+	if err := pack.batch_end_async(r.own_pack, _relay_commit_done, g); err != .None {
+		free(g, r.allocator)
+		done(ctx, _from_prim(err))
+		return
+	}
+	if r.pack_timer == 0 && r.loop != nil {
+		r.pack_timer = prim.timer(r.loop, 0, r, _on_pack_timer)
+	}
+}
+
+@(private)
+_relay_commit_done :: proc(data: rawptr, err: prim.Error) {
+	g := cast(^Relay_Commit)data
+	done, ctx := g.done, g.ctx
+	free(g, g.r.allocator)
+	done(ctx, _from_prim(err))
+}
+
+@(private)
+_relay_pack_wake :: proc(data: rawptr) {
+	r := cast(^Relay)data
+	if r.loop != nil {
+		prim.wake(r.loop)
+	}
+}
+
+@(private)
+_relay_on_wake :: proc(l: ^prim.Loop, data: rawptr) {
+	r := cast(^Relay)data
+	if r.prev_wake != nil {
+		r.prev_wake(l, r.prev_data)
+	}
+	if r.own_pack != nil {
+		pack.poll(r.own_pack)
+		if r.pack_timer == 0 {
+			r.pack_timer = prim.timer(r.loop, 0, r, _on_pack_timer)
+		}
+	}
 }
 
 @(private)
