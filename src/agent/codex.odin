@@ -466,6 +466,16 @@ codex_item_started :: proc(d: ^Driver, item: json.Value, o: ^Output) {
 		input = to_json(item)
 	}
 	emit(o, Tool_Started{id = dup(o, id), name = dup(o, name), input = dup(o, input)})
+	if kind == "fileChange" {
+		for c in get_arr(item, "changes") {
+			if path := get_str(c, "path"); path != "" {
+				emit(o, File_Write_Begin{tool = dup(o, id), path = dup(o, path)})
+			}
+			if to := get_str(get(c, "kind"), "move_path"); to != "" {
+				emit(o, File_Write_Begin{tool = dup(o, id), path = dup(o, to)})
+			}
+		}
+	}
 }
 
 @(private)
