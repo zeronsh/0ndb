@@ -143,7 +143,9 @@ The idle and streaming figures come from `bindings/rust/ondb/examples/bench.rs`
   each device and each pool once, with `online`/`offline`/`wakeable`,
   providers installed and signed in, and the current and last runner;
   `assign(object, runner)` resumes the conversation there, continuing a
-  cut-off turn with its full context. `takeover.set` picks what happens when
+  cut-off turn with its full context. In Rust, `subscribe_runners` yields
+  `SubItem::Runners` frames, keeps only the newest one queued, and is
+  re-subscribed after a reconnect. `takeover.set` picks what happens when
   a runner goes away: `default` (devices: the conversation goes idle; pool
   runners: a placement request naming the runner), `auto` or `never`.
 - Folders and repositories: `mount.add(object, root)` keeps a folder synced as

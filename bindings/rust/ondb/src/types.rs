@@ -37,6 +37,33 @@ pub struct DaemonStatus {
     pub host_pending: u64,
     pub hosts: Vec<String>,
     pub links: Vec<Link>,
+    pub timers: Vec<ArmedTimer>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ArmedTimer {
+    pub site: String,
+    pub due_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Uploaded {
+    pub uploaded: bool,
+    pub dropped: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchArgs {
+    pub query: String,
+    pub space: Option<String>,
+    pub limit: u64,
+    pub cursor: Option<String>,
+    pub sort: Option<String>,
+    pub semantic: bool,
+    pub collapse: bool,
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -295,17 +322,28 @@ pub struct Delta {
     pub by: Option<Id>,
     pub local: bool,
     pub hlc: u64,
-    pub role: serde_json::Value,
+    pub role: String,
     pub index: u64,
-    pub block: serde_json::Value,
-    pub seal: serde_json::Value,
-    pub status: serde_json::Value,
+    pub block: String,
+    #[serde(default = "seal_open")]
+    pub seal: String,
+    #[serde(default = "status_idle")]
+    pub status: String,
     pub usage: Usage,
     pub text: String,
     pub key: String,
     pub tag: u64,
     pub removed: bool,
     pub length: i64,
+    pub draft: bool,
+}
+
+fn seal_open() -> String {
+    "open".into()
+}
+
+fn status_idle() -> String {
+    "idle".into()
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
