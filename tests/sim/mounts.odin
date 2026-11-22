@@ -36,7 +36,19 @@ sim_watcher :: proc(n: ^Node) -> fs.Watcher {
 }
 
 sim_observer :: proc(n: ^Node) -> fs.Write_Observer {
-	return fs.Write_Observer{data = n, start = _o_start, changed = _o_changed}
+	return fs.Write_Observer{data = n, start = _o_start, changed = _o_changed, opened = _o_opened}
+}
+
+@(private = "file")
+_o_opened :: proc(data: rawptr, m: ^fs.Mount) {
+	n := (^Node)(data)
+	out := make([dynamic]string, context.temp_allocator)
+	if fs.mount_shadow_mismatches(m, &out, context.temp_allocator) != .None {
+		return
+	}
+	for x in out {
+		world_fail(n.w, "mount open: %s %s synced version and shadow disagree: %s", n.name, m.root, x)
+	}
 }
 
 @(private = "file")

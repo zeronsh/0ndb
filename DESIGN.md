@@ -503,9 +503,12 @@ equal in both directions.
   the same wait: the intents stay in the saved state until the image that
   covers them is written. The mount state also records the shadow's
   generation and log end it was saved against; on open a longer shadow is
-  truncated back to that end, so shadow and synced frontier are always one
+  rolled back to that end, so shadow and synced frontier are always one
   saved state and a crash between the shadow flush and the state save is
-  undone. Attributions follow the same checkpoint-plus-log rule: each
+  undone. The rollback rebuilds the shadow as of that end and writes it as a
+  new generation; it never truncates the log in place, because a lost size
+  change or a lost index rename would bring the old tail (and an index that
+  describes it) back after a later crash. Attributions follow the same checkpoint-plus-log rule: each
   observed write is appended to `attrib.log` before the write proceeds, an
   image carries a snapshot of the attribution map (which entries a pass
   consumed or pruned) and the log offset it covers, and the mount state saves

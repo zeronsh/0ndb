@@ -259,6 +259,7 @@ Write_Observer :: struct {
 	gate:       proc(data: rawptr, root: string, exempt: []prim.Pid) -> (u32, bool),
 	ungate:     proc(data: rawptr, id: u32),
 	gate_max_ms: i64,
+	opened:     proc(data: rawptr, m: ^Mount),
 }
 
 Mount :: struct {
@@ -507,6 +508,9 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.slot = slot
 	mount_wake(m) or_return
 	mount_shadow_reconcile(m) or_return
+	if reg.observer.opened != nil {
+		reg.observer.opened(reg.observer.data, m)
+	}
 	if m.has_git {
 		if lock, lerr := path_join(m.git.dir, "index.lock", context.temp_allocator); lerr == nil && prim.exists(m.vfs, lock) {
 			mount_git_lock(m, true)
