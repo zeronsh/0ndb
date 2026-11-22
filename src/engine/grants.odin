@@ -112,6 +112,7 @@ _grantkeys_path :: proc(e: ^Engine, space: prim.Id, object: prim.Id) -> (path: s
 
 @(private)
 _grants_rewrap :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
+	sp.mem.rewrap_wait = false
 	if sp.keyless || !sp.repl_on {
 		return
 	}
@@ -135,7 +136,17 @@ _grants_rewrap :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 	if _, in_tree := osync.tree_find_leaf(&t, e.identity.sign); !in_tree {
 		return
 	}
+	guests := false
+	for &x in m.roster.members {
+		if x.kind == .Guest && len(x.scope) > 0 && osync.member_active(&x, now) {
+			guests = true
+		}
+	}
+	if !guests {
+		return
+	}
 	if !_members_elected(e, sp, m, &t, now) {
+		sp.mem.rewrap_wait = true
 		return
 	}
 	tag := osync.epoch_tag(cur.number, cur.id)
