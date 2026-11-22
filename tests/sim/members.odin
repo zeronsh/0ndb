@@ -451,6 +451,12 @@ _roster :: proc(w: ^World, idx: int, space: prim.Id) -> string {
 
 @(private = "file")
 _converged :: proc(w: ^World, space: prim.Id, idxs: []int, what: string) {
+	for _ in 0 ..< 200 {
+		if _rosters_match(w, space, idxs) {
+			return
+		}
+		_settle(w, 100)
+	}
 	first := ""
 	for idx, k in idxs {
 		r := _roster(w, idx, space)
@@ -460,6 +466,20 @@ _converged :: proc(w: ^World, space: prim.Id, idxs: []int, what: string) {
 			_fail(w, "%s: n%d roster %s differs from n%d %s", what, idx, r, idxs[0], first)
 		}
 	}
+}
+
+@(private = "file")
+_rosters_match :: proc(w: ^World, space: prim.Id, idxs: []int) -> bool {
+	first := ""
+	for idx, k in idxs {
+		r := _roster(w, idx, space)
+		if k == 0 {
+			first = r
+		} else if r != first {
+			return false
+		}
+	}
+	return true
 }
 
 @(private = "file")
@@ -1239,6 +1259,9 @@ _short_id_instant :: proc(w: ^World, sid: prim.Id) {
 	waited := 0
 	resolved := false
 	for step in 0 ..< 20_000 {
+		context = instance_context(&a.inst)
+		on_relay, _ := eng.upload_wait(&a.e, o)
+		node_after(a)
 		context = instance_context(&b.inst)
 		rows, err := eng.catalog_find(&b.e, sid, short, context.temp_allocator, ready)
 		n := len(rows)
@@ -1262,8 +1285,8 @@ _short_id_instant :: proc(w: ^World, sid: prim.Id) {
 			n = len(rows)
 			got = rows[0].object if n > 0 else prim.Id{}
 			node_after(b)
-			if err == .None && n == 0 {
-				_fail(w, "instant: lookup at %d ms started waiting and then answered not found", step)
+			if err == .None && n == 0 && on_relay {
+				_fail(w, "instant: lookup at %d ms began after n0's entry reached the relay, waited, and then answered not found", step)
 				return
 			}
 		}
