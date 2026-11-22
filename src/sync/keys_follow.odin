@@ -157,6 +157,9 @@ _kwait_sync :: proc(r: ^Replicator) {
 _kfollow_on :: proc(r: ^Replicator, rm: ^Remote) {
 	was := _following(rm)
 	rm.kfollow = true
+	if rm.is_head {
+		_kwait_head_landed(r, rm)
+	}
 	if was {
 		return
 	}
