@@ -124,6 +124,9 @@ _on_noted :: proc(r: ^Replicator, ev: ^Event) {
 @(private)
 _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 	id := Stream_Id(ev.id)
+	if ev.trimmed {
+		_promote_on_trimmed(r, id, ev.base)
+	}
 	if l, lok := r.locals[id]; lok && l.verifying && ev.base > l.verify_at {
 		_local_verify_hollow(r, l, ev.base)
 	}
@@ -131,6 +134,7 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 	if !ok {
 		return
 	}
+	rm.trimmed = ev.trimmed
 	_remote_base(r, rm, ev.base, ev.length)
 	for x, i in rm.refused {
 		if x == rm.device {
@@ -149,6 +153,11 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 			f.from = ev.base
 		}
 		i += 1
+	}
+	if rm.full && rm.trimmed && _following(rm) {
+		if c := _contiguous(rm); c < rm.base {
+			_read_range(r, rm, c, rm.base)
+		}
 	}
 	_remote_pull(r, rm)
 	_remote_settle(r, rm)
@@ -593,7 +602,7 @@ _serve_replica :: proc(r: ^Replicator, q: Serve_Req) -> bool {
 	defer if opened {
 		journal.replica_close(&tmp)
 	}
-	if !journal.replica_covers(rep, q.from, q.to) {
+	if !journal.replica_covers(rep, q.from, q.to) || _replica_any_trusted(rep, q.from, q.to) {
 		return false
 	}
 	buf, aerr := make([]u8, int(q.to - q.from), context.temp_allocator)
@@ -817,4 +826,14 @@ _serve_send :: proc(r: ^Replicator, q: Serve_Req, at: i64, data: []u8, length: i
 			return
 		}
 	}
+}
+
+@(private)
+_replica_any_trusted :: proc(rep: ^journal.Replica, from, to: i64) -> bool {
+	for t in rep.trusted {
+		if t.from < to && from < t.to {
+			return true
+		}
+	}
+	return false
 }

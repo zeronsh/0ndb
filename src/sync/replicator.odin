@@ -88,6 +88,12 @@ Replicator_Config :: struct {
 	on_event:     Repl_Handler,
 	user:         rawptr,
 	durable:      proc(user: rawptr, path: string) -> (length: i64, ok: bool),
+	signer:       journal.Signer,
+	archive_min:  i64,
+	archive_group: int,
+	archive_level: int,
+	archive_keys: proc(user: rawptr, name: string, id: Stream_Id, use: proc(data: rawptr, keys: journal.Key_Provider, shift: u8), data: rawptr) -> bool,
+	archive_collect: proc(user: rawptr, name: string, offs: []i64, bodies: [][]u8, gone: []bool),
 }
 
 Stream_Sealing :: enum u8 {
@@ -167,6 +173,18 @@ Local :: struct {
 	verify:    [dynamic]u8,
 	hollow:    bool,
 	noting:    bool,
+	repl:      ^Replicator,
+	scope:     Scope,
+	archive:   bool,
+	arc_sealed: i64,
+	arc_timer: prim.Timer,
+	arc_child: bool,
+	trim_for:  Stream_Id,
+	trim_base: i64,
+	trim_at:   i64,
+	trim_sent: i64,
+	rst_on:    bool,
+	rst_of:    Stream_Id,
 }
 
 Remote :: struct {
@@ -226,6 +244,10 @@ Remote :: struct {
 	refused:   [dynamic]Device_Id,
 	carry:     [dynamic]u8,
 	carry_at:  i64,
+	trimmed:   bool,
+	arc:       ^Arc_Read,
+	arc_of:    ^Remote,
+	arc_broken: [dynamic]journal.Range,
 }
 
 Group :: struct {
@@ -319,6 +341,8 @@ Replicator :: struct {
 	live_rx:    Live_Rx,
 	live_sent:  i64,
 	live_recv:  i64,
+	trims:      map[Stream_Id]i64,
+	arc_dir:    bool,
 	allocator:  runtime.Allocator,
 }
 
@@ -410,6 +434,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.serves = make([dynamic]Serve_Req, allocator)
 	r.parked = make([dynamic]Serve_Req, allocator)
 	r.promos = make([dynamic]^Promotion, allocator)
+	r.trims = make(map[Stream_Id]i64, allocator)
 	r.tr.fd = prim.INVALID_FD
 	return .None
 }
@@ -457,6 +482,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 		_promotion_free(r, pr)
 	}
 	delete(r.promos)
+	delete(r.trims)
 	delete(r.endpoints)
 	delete(r.publics)
 	if r.deadline != 0 {
@@ -581,7 +607,7 @@ _limit :: proc(r: ^Replicator, l: ^Local) -> i64 {
 	return max(min(l.durable, n), l.cursor)
 }
 
-replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil, hollow := false) -> Error {
+replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil, hollow := false, archive := false) -> Error {
 	_enter(r)
 	defer _leave(r)
 	id := stream_id(scope, r.cfg.self, name, epoch)
@@ -598,6 +624,7 @@ replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u
 	if !l.noting {
 		l.hollow = hollow
 	}
+	l.archive = archive
 	l.durable = max(l.durable, durable)
 	l.blocked = false
 	_local_pump(r, l)
@@ -882,7 +909,10 @@ _local_open :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, id:
 	if count > 0 {
 		l.floor = newest.value
 		l.floor_seq = newest.seq
+		l.arc_sealed = newest.start
 	}
+	l.repl = r
+	l.scope = scope^
 	l.cursor = l.floor
 	l.durable = l.floor
 	l.recheck = -1
@@ -916,6 +946,8 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 	if l.floor_fd >= 0 {
 		prim.close_file(r.vfs, l.floor_fd)
 	}
+	_arc_free_local(r, l)
+	scope_clear(&l.scope)
 	crypto.zero_explicit(&l.key, size_of(l.key))
 	if len(l.drop_path) > 0 {
 		delete(l.drop_path, r.allocator)
@@ -928,7 +960,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
-	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l {
+	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l || l.arc_timer != 0 {
 		return
 	}
 	if r.hold > 0 {
@@ -1070,12 +1102,15 @@ _local_advance :: proc(r: ^Replicator, l: ^Local, to: i64) -> Error {
 	l.cursor = to
 	if to > l.floor {
 		seq := l.floor_seq + 1
-		slot_write(r.vfs, l.floor_fd, Slot{seq = seq, value = to, start = 0}) or_return
+		slot_write(r.vfs, l.floor_fd, Slot{seq = seq, value = to, start = min(l.arc_sealed, to)}) or_return
 		_from_prim(prim.sync_owed(r.vfs, l.floor_fd, &l.floor_owed)) or_return
 		l.floor = to
 		l.floor_seq = seq
 	}
-	_emit(r, Repl_Event{kind = .Uploaded, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, length = to})
+	if !l.arc_child && !l.rst_on {
+		_emit(r, Repl_Event{kind = .Uploaded, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, length = to})
+	}
+	_arc_advanced(r, l)
 	return .None
 }
 
@@ -1635,7 +1670,12 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 		_stage_flush(r, true, -1)
 		r.rx_remote = nil
 	}
+	_arc_release(r, rm)
+	if up := rm.arc_of; up != nil && up.arc != nil && up.arc.arm == rm {
+		up.arc.arm = nil
+	}
 	journal.replica_close(&rm.rep)
+	delete(rm.arc_broken)
 	delete(rm.kheld)
 	crypto.zero_explicit(&rm.skey, size_of(rm.skey))
 	scope_clear(&rm.scope)
@@ -1659,7 +1699,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
-	if _following(rm) || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm {
+	if _following(rm) || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm || (rm.arc != nil && (len(rm.arc.wants) > 0 || len(rm.arc.redacts) > 0 || len(rm.arc.pend) > 0 || len(rm.arc.wipes) > 0)) {
 		return
 	}
 	if r.hold > 0 {
@@ -1803,6 +1843,19 @@ _contiguous :: proc(rm: ^Remote) -> i64 {
 }
 
 @(private)
+_suffix_contiguous :: proc(rm: ^Remote) -> i64 {
+	if !rm.trimmed || rm.base <= 0 {
+		return _contiguous(rm)
+	}
+	for h in journal.replica_have(&rm.rep) {
+		if h.from <= rm.base && h.to > rm.base {
+			return h.to
+		}
+	}
+	return rm.base
+}
+
+@(private)
 _remote_follow_send :: proc(r: ^Replicator, rm: ^Remote) {
 	rm.pulled = _contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
 	_remote_pull(r, rm)
@@ -1897,6 +1950,13 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 			fetch.to = fetch.from + STAGE_MAX
 		}
 	}
+	if fetch.from < rm.base && rm.trimmed {
+		_arc_want(r, rm, max(gap.from, fetch.from), min(max(gap.to, fetch.from), rm.base))
+		if gap.to <= rm.base {
+			return
+		}
+		fetch.from = max(rm.base, gap.from)
+	}
 	if fetch.from < rm.base {
 		_pull_range(r, rm, fetch.from, min(fetch.to, rm.base))
 		if fetch.to <= rm.base {
@@ -1984,6 +2044,10 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 		_remote_maybe_free(r, rm)
 		return
 	}
+	settled := false
+	defer if settled || (rm.arc_of != nil && len(rm.wants) == 0) {
+		_arc_arm_settled(r, rm)
+	}
 	for i := 0; i < len(rm.wants); {
 		w := rm.wants[i]
 		to := min(w.to, rm.relay_len)
@@ -1994,7 +2058,8 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 				continue
 			}
 			ordered_remove(&rm.wants, i)
-			if rm.is_head {
+			if rm.is_head || rm.arc_of != nil {
+				settled = true
 				continue
 			}
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = w.from, length = rm.relay_len})
@@ -2023,6 +2088,10 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 			ordered_remove(&rm.wants, i)
 			if rm.is_head {
 				_keys_head_seen(r, rm)
+				continue
+			}
+			if rm.arc_of != nil {
+				settled = true
 				continue
 			}
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = to, length = rm.relay_len})
@@ -2339,7 +2408,7 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	r.rx_remote = nil
 	_remote_landed(r, rm, r.rx_start, r.rx_at, ev.length)
 	if rm.full && r.rx_at >= rm.pulled {
-		if c := _contiguous(rm); c < rm.pulled {
+		if c := _suffix_contiguous(rm); c < rm.pulled {
 			rm.pulled = c
 		}
 	}
@@ -2477,7 +2546,9 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Direct, .Undelivered:
 		_on_direct_event(r, ev)
 	case .Noted:
-		_on_noted(r, ev)
+		if !_arc_trim_reply(r, Stream_Id(ev.id), false) {
+			_on_noted(r, ev)
+		}
 	case .Hollow:
 		_on_hollow(r, ev)
 	case .Pulled:
@@ -2578,6 +2649,9 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		return
 	}
 	if _promote_on_refused(r, id, ev.code) {
+		return
+	}
+	if _arc_trim_reply(r, id, true) {
 		return
 	}
 	if l, ok := r.locals[id]; ok {
