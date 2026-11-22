@@ -1512,6 +1512,20 @@ history_trim :: proc(h: ^History) {
 	shrink(&h.io)
 }
 
+history_file_loaded :: proc(h: ^History, inode: fstree.Inode_Id) -> bool {
+	_, ok := h.files[inode]
+	return ok
+}
+
+history_file_release :: proc(h: ^History, inode: fstree.Inode_Id) {
+	f, ok := h.files[inode]
+	if !ok || f.dirty {
+		return
+	}
+	delete_key(&h.files, inode)
+	file_free(h, f)
+}
+
 history_file :: proc(h: ^History, inode: fstree.Inode_Id) -> (f: ^File_State, err: Error) {
 	if s, ok := h.files[inode]; ok {
 		return s, .None

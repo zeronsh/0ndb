@@ -666,9 +666,13 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 		if lerr != nil || !ok {
 			continue
 		}
+		had := fs.history_file_loaded(h.hist, id)
 		f, ferr := fs.history_file(h.hist, id)
 		if ferr != .None {
 			continue
+		}
+		defer if !had {
+			fs.history_file_release(h.hist, id)
 		}
 		data := crdt.text_bytes(&f.text, sa)
 		spans := crdt.text_spans(&f.text, &h.hist.g, sa)
