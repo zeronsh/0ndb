@@ -70,6 +70,11 @@ barrier :: proc(db: ^Odb) -> Error {
 	if err != .None {
 		sync.mutex_lock(&db.mutex)
 		for f in uf {
+			if is_loose_object(db, f) {
+				prim.remove(db.vfs, f)
+				track_locked(db, "", parent_dir(f))
+				continue
+			}
 			track_locked(db, f)
 		}
 		for d in ud {
@@ -86,6 +91,31 @@ barrier :: proc(db: ^Odb) -> Error {
 	delete(files)
 	delete(dirs)
 	return err
+}
+
+@(private)
+is_loose_object :: proc(db: ^Odb, path: string) -> bool {
+	n := oid_size(db.format) * 2
+	for d in db.dirs {
+		if len(path) != len(d.path) + n + 2 || !strings.has_prefix(path, d.path) || path[len(d.path)] != '/' {
+			continue
+		}
+		rest := path[len(d.path) + 1:]
+		if rest[2] != '/' {
+			continue
+		}
+		hex := true
+		for c, k in transmute([]u8)rest {
+			if k != 2 && !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				hex = false
+				break
+			}
+		}
+		if hex {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
