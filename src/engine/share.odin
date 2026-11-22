@@ -184,6 +184,7 @@ space_join_shared :: proc(e: ^Engine, space: prim.Id, name := "", relay := "", r
 	sp.e = e
 	sp.id = space
 	sp.keyless = true
+	sp.fresh = true
 	sp.catalog = _catalog_id(space)
 	sp.name = _clone(name, e.allocator) or_return
 	sp.relay = _clone(relay, e.allocator) or_return
