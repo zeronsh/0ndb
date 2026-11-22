@@ -43,6 +43,15 @@ history_view_close :: proc(h: ^History, view: ^Text_View) {
 	free(view, h.allocator)
 }
 
+history_owns :: proc(h: ^History, id: crdt.Op_Id) -> bool {
+	lv, ok := crdt.graph_lv(&h.g, id)
+	if !ok {
+		return false
+	}
+	_, _, stream, _, found := history_batch_at(h, lv)
+	return found && stream == 0
+}
+
 history_op_content :: proc(h: ^History, src: crdt.Op_Id, dst: []u8) -> int {
 	authors := make([dynamic]crdt.Author_Span, context.temp_allocator)
 	return copy_read_depth(h, src, dst, &authors, 0)
