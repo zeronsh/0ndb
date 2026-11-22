@@ -377,7 +377,13 @@ equal in both directions.
   parented on the mount's synced version, credited to the actor/scope active
   at the time of the write (or the writer pid's scope). Background passes
   defer files younger than a settle delay; scope ends, fences and shutdown
-  ingest everything.
+  ingest everything. Changes no scope claims belong to the mount's ingestion
+  actor, `blake2b-128("0ndb ingestion actor" || device || mount id)`, never
+  to the device's own API writes, so disk changes concurrent with them stay
+  representable. Opening a mount appends one `REC_ACTOR` record (tag 9:
+  kind, actor, mount id) to the device's stream; every replica checks the
+  actor against that stream's device and presents the actor's edits in blame
+  and conflict regions as that device.
 - **Commit protocol**: each batch a mount commits carries one opaque
   mount-mark op (tag 18 plus a random per-mount nonce) and, unless the line
   is held, the mount's line record, in the same journal commit. Nothing is
@@ -393,7 +399,11 @@ equal in both directions.
   acknowledged.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
-  shadow is ingested first, never overwritten. Only durable history is
+  shadow, or untracked content where an inode must land, is ingested first,
+  never overwritten, and the plan is rebuilt from the new synced version.
+  If ingesting changes nothing (an ignored file in the way), nothing is
+  written and the path is reported as a collision. The synced version never
+  claims anything the disk does not hold. Only durable history is
   materialized, so a crash never leaves disk content the history lacks.
   Writes are temp + rename, with modes and symlinks.
 - **Large files** (over a size limit) are opaque content referenced by git

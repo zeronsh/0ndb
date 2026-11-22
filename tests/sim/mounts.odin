@@ -13,9 +13,10 @@ WORK_PREFIX :: "/work/"
 WATCH_OVERFLOW :: 256
 
 Sim_Mount :: struct {
-	oi:   int,
-	root: string,
-	m:    ^fs.Mount,
+	oi:      int,
+	root:    string,
+	m:       ^fs.Mount,
+	checked: u64,
 }
 
 M_Mount :: struct {
@@ -355,6 +356,7 @@ tree_file_spans :: proc(n: ^Node, o: eng.Object, path: string) -> []crdt_span {
 		return nil
 	}
 	raw := crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
+	fs.history_present_spans(hist, raw)
 	out := make([]crdt_span, len(raw), context.temp_allocator)
 	for s, i in raw {
 		out[i] = crdt_span{actor = s.id.actor, len = s.len}
@@ -500,5 +502,27 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 		append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = root})
 	} else if n.alive && !(w.cfg.io_rate > 0 && (merr == .Io || merr == .No_Space)) {
 		world_fail(w, "%s mounting git checkout failed: %v", n.name, merr)
+	}
+}
+
+check_synced_disk :: proc(w: ^World, n: ^Node) {
+	if !n.alive || !n.e_open || len(n.disk.events) > 0 || n.watch_scheduled || n.disk.dead {
+		return
+	}
+	for &sm in n.mounts {
+		if sm.m == nil || sm.m.passes == sm.checked {
+			continue
+		}
+		sm.checked = sm.m.passes
+		out := make([dynamic]string, context.temp_allocator)
+		n.disk.quiet = true
+		err := fs.mount_synced_mismatches(sm.m, &out, context.temp_allocator)
+		n.disk.quiet = false
+		if err != .None {
+			continue
+		}
+		for x in out {
+			world_fail(w, "mount: %s %s synced version is not what is on disk: %s", n.name, sm.root, x)
+		}
 	}
 }

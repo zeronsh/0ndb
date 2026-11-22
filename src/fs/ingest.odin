@@ -1274,6 +1274,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	if len(m.dirty) > 0 {
 		mount_schedule(m, m.opts.settle_ms)
 	}
+	m.passes += 1
 	return mount_settle(m)
 }
 

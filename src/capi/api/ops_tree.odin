@@ -211,6 +211,7 @@ op_tree_blame :: proc(c: ^Call, o: ^Out) -> Status {
 		}
 		data = crdt.text_bytes(&f.text, context.temp_allocator)
 		spans = crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
+		fs.history_present_spans(hist, spans)
 	}
 	emit_spans(o, data, spans)
 	return .Ok

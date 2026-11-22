@@ -100,6 +100,7 @@ Disk_Stats :: struct {
 }
 
 Disk :: struct {
+	quiet:     bool,
 	name:      string,
 	inodes:    map[u64]^Inode,
 	next_ino:  u64,
@@ -259,6 +260,9 @@ _now :: proc(d: ^Disk) -> i64 {
 _enter :: proc(d: ^Disk, op: u64) -> bool {
 	if d.dead {
 		return false
+	}
+	if d.quiet {
+		return true
 	}
 	d.stats.ops += 1
 	d.trace = mix64(d.trace, op)
@@ -578,7 +582,7 @@ _d_close :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		}
 		_maybe_orphan(d, of.ino)
 	}
-	if d.dead {
+	if d.dead || d.quiet {
 		return .None
 	}
 	d.stats.ops += 1

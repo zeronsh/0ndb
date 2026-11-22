@@ -60,7 +60,9 @@ text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 		return nil, _pending_result(e, h, .Missing, ready)
 	}
 	f := _ferr2(fs.history_file(h.hist, inode)) or_return
-	return crdt.text_spans(&f.text, &h.hist.g, allocator), .None
+	out := crdt.text_spans(&f.text, &h.hist.g, allocator)
+	fs.history_present_spans(h.hist, out)
+	return out, .None
 }
 
 tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
@@ -585,6 +587,16 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 		out[i].end = c.end
 		out[i].ours = c.ours
 		out[i].theirs = c.theirs
+		for &x in out[i].ours {
+			if o, owned := fs.history_actor_owner(h.hist, x.id.actor); owned {
+				x.id.actor = o
+			}
+		}
+		for &x in out[i].theirs {
+			if o, owned := fs.history_actor_owner(h.hist, x.id.actor); owned {
+				x.id.actor = o
+			}
+		}
 	}
 	return out, .None
 }
