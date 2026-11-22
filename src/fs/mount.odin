@@ -192,7 +192,7 @@ registry_notify :: proc(reg: ^Registry, path: string, kind: Watch_Kind) {
 	if kind == .Overflow {
 		for m in reg.mounts {
 			if m != nil {
-				mount_mark_rescan(m)
+				mount_events_lost(m)
 			}
 		}
 		return
@@ -999,6 +999,18 @@ observer_installed :: proc(reg: ^Registry) -> bool {
 mount_mark_rescan :: proc(m: ^Mount) {
 	m.rescan = true
 	mount_schedule(m, m.opts.settle_ms)
+}
+
+mount_events_lost :: proc(m: ^Mount) {
+	mount_mark_rescan(m)
+	ready := false
+	for &f in m.fences {
+		f.arrived = true
+		ready ||= fence_ready(f)
+	}
+	if ready {
+		mount_schedule(m, 0)
+	}
 }
 
 mount_mark_git :: proc(m: ^Mount) {
