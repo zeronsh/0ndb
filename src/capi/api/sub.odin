@@ -10,6 +10,8 @@ Sub_Proc :: #type proc(data: rawptr, id: u64, payload: []u8)
 Raw_Sub_Proc :: #type proc(data: rawptr, id: u64, deltas: []eng.Delta)
 Sub_Ready :: #type proc(data: rawptr) -> bool
 
+Open_Proc :: #type proc(data: rawptr, id: u64, status: Status, open: []u8)
+
 Sub :: struct {
 	api:    ^Api,
 	id:     u64,
@@ -25,6 +27,9 @@ Sub :: struct {
 	runners: bool,
 	space:  prim.Id,
 	placed: bool,
+	opening: bool,
+	opened: Open_Proc,
+	req:    []u8,
 }
 
 subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, data: rawptr, payload: Sub_Proc = nil) -> (id: u64, catalog: bool, object: Object, status: Status) {
@@ -44,21 +49,24 @@ subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, da
 subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, data: rawptr) -> (id: u64, status: Status) {
 	open: []u8
 	id, status, open = subscribe_open(a, req, json_form, cb, data)
+	if status == .Pending {
+		status = .Ok
+	}
 	if status == .Ok && len(open) > 0 {
 		cb(data, id, open)
 	}
 	return
 }
 
-subscribe_open :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, data: rawptr, ready: Sub_Ready = nil) -> (id: u64, status: Status, open: []u8) {
+subscribe_open :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, data: rawptr, ready: Sub_Ready = nil, opened: Open_Proc = nil) -> (id: u64, status: Status, open: []u8) {
 	if cb == nil {
 		return 0, .Invalid, nil
 	}
-	return _subscribe(a, req, json_form, cb, nil, data, ready)
+	return _subscribe(a, req, json_form, cb, nil, data, ready, opened)
 }
 
 @(private)
-_subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_Sub_Proc, data: rawptr, ready: Sub_Ready = nil) -> (id: u64, status: Status, open: []u8) {
+_subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_Sub_Proc, data: rawptr, ready: Sub_Ready = nil, opened: Open_Proc = nil) -> (id: u64, status: Status, open: []u8) {
 	c: Call
 	c.api = a
 	c.json = json_form
@@ -94,12 +102,20 @@ _subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_S
 	if buffer {
 		a.next_sub += 1
 		s.id = a.next_sub
+		s.object = a_object(&c, "object")
+		s.opened = opened
 		open, err = _buffer_open(a, &c, s)
+		if err == .Pending {
+			s.opening = true
+			s.req = make([]u8, len(req), a.allocator)
+			copy(s.req, req)
+			append(&a.subs, s)
+			return s.id, .Pending, nil
+		}
 		if err != .None {
 			free(s, a.allocator)
 			return 0, status_of(err), nil
 		}
-		s.object = a_object(&c, "object")
 		append(&a.subs, s)
 		return s.id, .Ok, open
 	}
@@ -250,6 +266,9 @@ unsubscribe :: proc(a: ^Api, id: u64) {
 			ordered_remove(&a.subs, i)
 			if s.placed {
 				placement_unwatch(a, s.object)
+			}
+			if s.req != nil {
+				delete(s.req, a.allocator)
 			}
 			if s.buffer != 0 {
 				eng.buffer_close(a.e, s.buffer)
