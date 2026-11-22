@@ -129,7 +129,7 @@ check_relay_storage :: proc(w: ^World) {
 			}
 			hollow_bytes += base
 			stored_bytes += length - base
-			if !promoted && base != length {
+			if !promoted && base != length && !trimmed_at(w, ob.o.space, sid) {
 				world_fail(w, "relay storage: device-only %v %s segment of %s holds %d content bytes on the relay (base %d, length %d)", ob.kind, id_short(ob.o.id), n.name, length - base, base, length)
 			}
 		}
@@ -140,7 +140,8 @@ check_relay_storage :: proc(w: ^World) {
 			pn := w.nodes[p.node]
 			sid := osync.stream_id(&scope, pn.identity.id, string(name), 0)
 			length, base, exists := _relay_probe(w, ob.o.space, sid)
-			if exists && length > 0 && base != 0 {
+			_, _, trimmed, _ := relay_stream_state(w, ob.o.space, sid)
+			if exists && length > 0 && base != 0 && !trimmed {
 				world_fail(w, "relay storage: promoted %v %s segment of promoter %s is stored only from %d of %d", ob.kind, id_short(ob.o.id), pn.name, base, length)
 			}
 		}
@@ -195,4 +196,9 @@ _relay_probe :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> (length,
 @(init)
 _storage_hooks :: proc "contextless" () {
 	register_final_check(100, check_relay_storage)
+}
+
+trimmed_at :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> bool {
+	_, _, trimmed, _ := relay_stream_state(w, space, id)
+	return trimmed
 }

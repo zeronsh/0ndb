@@ -178,6 +178,8 @@ Config :: struct {
 	storage:     eng.Storage_Mode,
 	durability:  eng.Durability,
 	promote:     i64,
+	archive_min: i64,
+	archive_group: int,
 }
 
 World :: struct {

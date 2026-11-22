@@ -25,6 +25,7 @@ Promotion :: struct {
 	state:    Promotion_State,
 	sent:     i64,
 	uploaded: i64,
+	trimmed:  bool,
 }
 
 @(private)
@@ -142,9 +143,22 @@ _promote_on_noted :: proc(r: ^Replicator, id: Stream_Id, base, length: i64) {
 	if p.state == .Filling && base < p.base {
 		p.uploaded += p.base - base
 	}
+	if p.state == .Filling && base >= p.base && base > 0 {
+		p.trimmed = true
+	}
 	p.base = base
 	p.length = length
 	p.state = .Ready
+}
+
+@(private)
+_promote_on_trimmed :: proc(r: ^Replicator, id: Stream_Id, base: i64) {
+	p, _ := _promotion_find(r, id)
+	if p == nil || p.state == .Done {
+		return
+	}
+	p.trimmed = true
+	p.base = base
 }
 
 @(private)
@@ -222,7 +236,11 @@ _promote_step :: proc(r: ^Replicator, p: ^Promotion) {
 	if _own_busy(r, p) {
 		return
 	}
-	if p.base <= p.target || p.base <= 0 {
+	if p.base <= p.target || p.base <= 0 || p.trimmed {
+		_promotion_done(r, p, true)
+		return
+	}
+	if l, has := r.locals[p.id]; has && p.own && l.arc_sealed > 0 && p.base <= l.arc_sealed {
 		_promotion_done(r, p, true)
 		return
 	}
@@ -240,6 +258,15 @@ _promote_step :: proc(r: ^Replicator, p: ^Promotion) {
 		_promotion_done(r, p, false)
 		return
 	}
+	if l, has := r.locals[p.id]; has && start < l.arc_sealed {
+		_promotion_done(r, p, true)
+		return
+	}
+	if rm, has := r.remotes[p.id]; has && rm.trimmed {
+		_promotion_done(r, p, true)
+		return
+	}
+	assert(!p.trimmed, "fill below a trimmed base")
 	n := int(p.base - start)
 	dst, err := client_fill_reserve(&r.client, p.id, start, n)
 	if err != .None {

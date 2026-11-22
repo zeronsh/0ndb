@@ -127,6 +127,10 @@ _own_tree_get :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind, scope
 	t = x
 	t.refs = 1
 	e.own_trees[stream] = t
+	when ODIN_DEBUG {
+		e.own_live[object] += 1
+		assert(e.own_live[object] == 1, "two live own key trees for one object")
+	}
 	return t, .None
 }
 
@@ -248,6 +252,12 @@ _own_tree_store :: proc(e: ^Engine, t: ^Own_Tree) -> Error {
 
 @(private)
 _own_tree_free :: proc(e: ^Engine, t: ^Own_Tree) {
+	when ODIN_DEBUG {
+		e.own_live[t.object] -= 1
+		if e.own_live[t.object] <= 0 {
+			delete_key(&e.own_live, t.object)
+		}
+	}
 	osync.keytree_destroy(&t.tree)
 	free(t, e.allocator)
 }
