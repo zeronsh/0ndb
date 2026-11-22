@@ -260,6 +260,27 @@ check_integrity_line :: proc(w: ^World, n: ^Node, oi: int, line: string, known: 
 	}
 }
 
+resolve_uncertain :: proc(w: ^World) {
+	m := &w.model
+	for op in m.ops {
+		if op.status != .Uncertain || !(op.kind == .Send || op.kind == .Stream) {
+			continue
+		}
+		n := w.nodes[op.node]
+		if !n.alive || !n.e_open {
+			continue
+		}
+		context = instance_context(&n.inst)
+		p := op_presence(m, n, op)
+		if p == .Absent {
+			op.status = .Lost
+			world_note(w, "%s op %d %v %s resolved lost on its writer", n.name, op.idx, op.kind, op.token)
+		} else if p == .Present {
+			op.status = .Observed
+		}
+	}
+}
+
 stall :: proc(w: ^World, format: string, args: ..any) {
 	if w.cfg.byzantine {
 		w.stats.stalls += 1
@@ -272,6 +293,7 @@ stall :: proc(w: ^World, format: string, args: ..any) {
 check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 	m := &w.model
 	converged = true
+	resolve_uncertain(w)
 	known := known_tokens(m)
 	for _, oi in m.objs {
 		if !obj_exists(m, oi) {
