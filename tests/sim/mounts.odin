@@ -550,3 +550,136 @@ check_synced_disk :: proc(w: ^World, n: ^Node) {
 		}
 	}
 }
+
+op_git_switch :: proc(w: ^World) {
+	r := &w.git_rng
+	Cand :: struct {
+		n:  ^Node,
+		mi: int,
+	}
+	cands := make([dynamic]Cand, context.temp_allocator)
+	for n in w.nodes {
+		if !n.alive || !n.e_open {
+			continue
+		}
+		for sm, i in n.mounts {
+			if sm.m != nil && sm.m.has_git {
+				append(&cands, Cand{n, i})
+			}
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	c := cands[rng_int(r, len(cands))]
+	n := c.n
+	sm := n.mounts[c.mi]
+	m := &w.model
+	vfs := disk_vfs(&n.disk)
+	git := strings.concatenate({sm.root, "/.git"}, context.temp_allocator)
+	for name in ([]string{"index.lock", "HEAD.lock"}) {
+		p := strings.concatenate({git, "/", name}, context.temp_allocator)
+		if prim.exists(vfs, p) {
+			prim.remove(vfs, p)
+			world_note(w, "%s removes a stale %s in %s", n.name, name, sm.root)
+		}
+	}
+	if n.disk.dead {
+		context = instance_context(&n.inst)
+		node_after(n)
+		return
+	}
+	force := rng_chance(r, 1, 4)
+	dirty := git_dirty_paths(vfs, sm.root)
+	files := make([dynamic]Git_File, context.temp_allocator)
+	removed := make([dynamic]string, context.temp_allocator)
+	paths := TREE_PATHS
+	for p in paths {
+		if !(rng_chance(r, 1, 2) || (force && dirty[p])) {
+			continue
+		}
+		if rng_chance(r, 1, 6) && !(force && dirty[p]) {
+			append(&removed, p)
+			continue
+		}
+		b := strings.builder_make(context.temp_allocator)
+		for _ in 0 ..< 1 + rng_int(r, 2) {
+			strings.write_string(&b, new_token(m, n, "s"))
+			strings.write_byte(&b, '\n')
+		}
+		append(&files, Git_File{name = p, data = transmute([]u8)strings.to_string(b)})
+	}
+	if len(files) == 0 && len(removed) == 0 {
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, new_token(m, n, "s"))
+		strings.write_byte(&b, '\n')
+		append(&files, Git_File{name = paths[rng_int(r, len(paths))], data = transmute([]u8)strings.to_string(b)})
+	}
+	w.git_branches += 1
+	branch := fmt.tprintf("sw%d", w.git_branches)
+	when_s := clock_wall(&n.clock) / 1_000_000_000
+	pushed := make([dynamic]odb.Oid, context.temp_allocator)
+	berr := git_branch_commit(vfs, sm.root, branch, files[:], removed[:], when_s, node_clock(&n.clock), rng_random(r), &pushed)
+	if berr == .None && !n.disk.dead && prim.exists(vfs, strings.concatenate({git, "/refs/remotes/origin/main"}, context.temp_allocator)) {
+		remote_push(w, n, sm.root, pushed[:])
+	}
+	if n.disk.dead || berr != .None {
+		world_note(w, "%s git branch %s in %s -> %v", n.name, branch, sm.root, berr)
+		context = instance_context(&n.inst)
+		if !n.disk.dead && w.cfg.io_rate == 0 {
+			world_fail(w, "%s could not commit git branch %s: %v", n.name, branch, berr)
+		}
+		node_after(n)
+		return
+	}
+	changes := make([dynamic]Git_Change, context.temp_allocator)
+	res, cerr := git_checkout(vfs, sm.root, branch, force, when_s, node_clock(&n.clock), rng_random(r), &changes)
+	if res == .Done {
+		w.stats.git_checkouts += 1
+	} else if res == .Refused {
+		w.stats.git_refused += 1
+	}
+	names := make([dynamic]string, context.temp_allocator)
+	for ch in changes {
+		append(&names, strings.concatenate({"-" if ch.gone else "", ch.name}, context.temp_allocator))
+	}
+	world_note(w, "%s git checkout%s %s in %s -> %v %v changed %v", n.name, " -f" if force else "", branch, sm.root, res, cerr, names[:])
+	if res == .Done && cerr == .None && !n.disk.dead {
+		for ch in changes {
+			got, gerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), context.temp_allocator)
+			if ch.gone != (gerr == .Not_Found) || (!ch.gone && string(got) != string(ch.new)) {
+				world_fail(w, "%s git checkout %s left %s as %q (%v), not %q", n.name, branch, ch.name, string(got), gerr, string(ch.new))
+			}
+		}
+	}
+	for ch in changes {
+		op := new_op(m, .Tree_Remove if ch.gone else .Disk_Person, n, sm.oi)
+		op.path = strings.clone(ch.name, w.allocator)
+		op.overwrite = !ch.gone && len(ch.old) > 0
+		for t in parse_tokens(ch.old) {
+			append(&op.deletes, strings.clone(t.text, w.allocator))
+		}
+		for t in parse_tokens(ch.new) {
+			append(&op.tokens, strings.clone(t.text, w.allocator))
+		}
+		_writer_set(w, n, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), Writer_Info{})
+		if n.disk.dead {
+			continue
+		}
+		if cerr != .None {
+			op.status = .Uncertain
+			continue
+		}
+		op_done(op, 0, .None)
+		op.status = .Acked
+	}
+	context = instance_context(&n.inst)
+	if cerr != .None && !n.disk.dead {
+		if w.cfg.io_rate > 0 {
+			n.restart_pending = true
+		} else {
+			world_fail(w, "%s git checkout %s failed: %v", n.name, branch, cerr)
+		}
+	}
+	node_after(n)
+}

@@ -53,7 +53,7 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
 		return .Corrupt
 	}
-	if crdt.frontier_eq(tl[:], sl[:]) && !mount_absent_ready(m) {
+	if crdt.frontier_eq(tl[:], sl[:]) && !mount_absent_ready(m) && len(m.reshow) == 0 {
 		return .None
 	}
 	if len(m.dirty) > 0 || m.rescan {
@@ -79,7 +79,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
 		return .Corrupt
 	}
-	if crdt.frontier_eq(tl[:], sl[:]) && len(m.absent) == 0 {
+	if crdt.frontier_eq(tl[:], sl[:]) && len(m.absent) == 0 && len(m.reshow) == 0 {
 		return .None
 	}
 	m.merge_base = m.synced[:] if merge else nil
@@ -112,6 +112,13 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		delete(a, m.allocator)
 	}
 	clear(&m.absent)
+	for r in m.reshow {
+		if ino, ok, lerr := fstree.lookup(&snap, r); lerr == nil && ok {
+			touched[ino] = true
+		}
+		delete(r, m.allocator)
+	}
+	clear(&m.reshow)
 	items := make([dynamic]Mat_Item, context.temp_allocator)
 	for ino in sorted_inodes(touched) {
 		it := Mat_Item {
@@ -1198,6 +1205,16 @@ mount_absent_add :: proc(m: ^Mount, path: string) {
 	}
 	p, _ := clone_string(path, m.allocator)
 	append(&m.absent, p)
+}
+
+mount_reshow_add :: proc(m: ^Mount, path: string) {
+	for r in m.reshow {
+		if r == path {
+			return
+		}
+	}
+	p, _ := clone_string(path, m.allocator)
+	append(&m.reshow, p)
 }
 
 mount_absent :: proc(m: ^Mount) -> []string {
