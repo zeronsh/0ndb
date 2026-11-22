@@ -287,12 +287,13 @@ _tier_evicted :: proc(ctx: rawptr, result: Error, value: i64) {
 	e := cast(^Tier_Evicting)ctx
 	sp := e.sp
 	t := sp.t
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
 	if e.own {
 		t.inner.stream_close(t.inner.data, e.h)
 	}
 	free(e, t.allocator)
 	sp.evicting -= 1
-	_tier_maybe_release(sp)
 }
 
 @(private)
@@ -321,6 +322,8 @@ _tier_thaw_start :: proc(t: ^Tier_Store, ts: ^Tier_Stream, c: ^Tier_Cold, from, 
 _tier_thaw_restored :: proc(ctx: rawptr, result: Error, value: i64) {
 	th := cast(^Tier_Thaw)ctx
 	sp := th.ts.sp
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
 	if result != .None {
 		_tier_thaw_end(th, result)
 		return
@@ -361,7 +364,6 @@ _tier_thaw_end :: proc(th: ^Tier_Thaw, result: Error) {
 	if result != .None {
 		_tier_job_done(job, result, 0)
 	}
-	_tier_maybe_release(sp)
 }
 
 @(private)
