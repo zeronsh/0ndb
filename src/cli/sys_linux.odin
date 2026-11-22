@@ -149,3 +149,25 @@ sys_hostname :: proc(allocator := context.allocator) -> string {
 	}
 	return strings.clone(string(buf[:n]), allocator)
 }
+
+@(private = "file")
+_note: string
+
+@(private = "file")
+_note_prev: proc "c" (posix.Signal)
+
+@(private = "file")
+_note_handler :: proc "c" (sig: posix.Signal) {
+	posix.write(posix.STDERR_FILENO, raw_data(_note), uint(len(_note)))
+	posix._exit(130)
+}
+
+interrupt_note_on :: proc(note: string) {
+	_note = note
+	_note_prev = posix.signal(.SIGINT, _note_handler)
+}
+
+interrupt_note_off :: proc() {
+	posix.signal(.SIGINT, _note_prev)
+	_note = ""
+}

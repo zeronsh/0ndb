@@ -1,6 +1,5 @@
 package main
 
-import "core:c/libc"
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
@@ -81,8 +80,8 @@ cmd_new :: proc(a: ^Args) -> int {
 
 @(private)
 _await_upload :: proc(s: ^Session, ob: api.Object) {
-	prev := libc.signal(libc.SIGINT, _upload_interrupted)
-	defer libc.signal(libc.SIGINT, prev)
+	interrupt_note_on("\n0ndb: interrupted before the relay confirmed the upload; it is saved on this device and uploads in the background\n")
+	defer interrupt_note_off()
 	r := req_begin("object.uploaded")
 	req_str(&r, "object", object_str(ob))
 	v := client_call(&s.c, req_end(&r), 0)
@@ -91,13 +90,6 @@ _await_upload :: proc(s: ^Session, ob: api.Object) {
 	} else if jbool(v.value, "dropped") {
 		fmt.eprintln("0ndb: saved on this device; the relay connection dropped before the upload was confirmed, so other devices see it once it reconnects")
 	}
-}
-
-@(private)
-_upload_interrupted :: proc "c" (sig: libc.int) {
-	msg := "\n0ndb: interrupted before the relay confirmed the upload; it is saved on this device and uploads in the background\n"
-	libc.fwrite(raw_data(msg), 1, len(msg), libc.stderr)
-	libc._Exit(130)
 }
 
 @(private)

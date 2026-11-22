@@ -139,3 +139,26 @@ sys_hostname :: proc(allocator := context.allocator) -> string {
 	}
 	return strings.clone(v, allocator)
 }
+
+@(private = "file")
+_note: string
+
+@(private = "file")
+_note_handler :: proc "system" (ev: u32) -> win.BOOL {
+	if ev != win.CTRL_C_EVENT && ev != win.CTRL_BREAK_EVENT {
+		return false
+	}
+	got: u32
+	win.WriteFile(win.GetStdHandle(win.STD_ERROR_HANDLE), raw_data(_note), u32(len(_note)), &got, nil)
+	win.ExitProcess(130)
+}
+
+interrupt_note_on :: proc(note: string) {
+	_note = note
+	win.SetConsoleCtrlHandler(_note_handler, true)
+}
+
+interrupt_note_off :: proc() {
+	win.SetConsoleCtrlHandler(_note_handler, false)
+	_note = ""
+}
