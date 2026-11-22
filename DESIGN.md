@@ -524,6 +524,15 @@ concurrent typing is never lost or reverted.
   one or two preads.
 - Redaction punches holes in extents; the simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
+- A small stream whose extent count passes 32 is defragmented by merging,
+  repeatedly, the window of adjacent extents with the fewest bytes rewritten
+  per extent freed, until 24 remain. Merging a fixed window of 16 instead
+  always swallowed the previous merge once fewer than 16 fresh extents
+  existed, copying the stream once per 15 appends (quadratic): the relay
+  feed's 40-byte appends wrote 57 times its size into the container before
+  promotion. The ratio policy is tiered: 7 times for 40-byte appends (of
+  which 2.2 is the data and its length slot), 2.9 for 300-byte, 1.9 for
+  1.5 KB appends.
 
 ## Objects
 
@@ -1137,14 +1146,15 @@ Relay cost tracks the reachable information, not the activity. Items marked
 
 - **Default policy.** Conversations, maps and all metadata are relay-stored,
   so any conversation can move to a new runner with every original device
-  offline. (planned) Record bodies are zstd-compressed before sealing, with
-  per-space dictionaries trained and versioned like search dictionaries,
-  where that measurably helps. Measured on a real tool-heavy agent
+  offline. Record bodies are zstd-compressed (level 3, no dictionary) in the
+  obj envelope before sealing, so offsets and lengths are identical
+  everywhere and each record stays its own redaction unit; content
+  dictionaries are not used for relay records because a trained dictionary
+  would retain redacted text. Measured on a real tool-heavy agent
   transcript (2769 messages, 4.4 MB of text): zstd alone gives 0.75 MB
-  (level 3) to 0.60 MB (level 19); recording it today grows the pack-backed
-  relay by about 32 MB (record framing, catalog activity churn and pack
-  garbage before compaction), which is what compaction, thinning and
-  compression must close. A 12-message chat is 3.8 KB of text, 1.6 KB
+  (level 3) to 0.60 MB (level 19). Recording it grew the pack-backed relay
+  by 34.5 MB, attributed below under "Cost tracks reachable information".
+  A 12-message chat is 3.8 KB of text, 1.6 KB
   compressed. File trees of git repositories store on the
   relay only what the git remote lacks (below). Large unique content that is
   in no git remote is relay-stored up to a per-space budget
@@ -1231,15 +1241,134 @@ Relay cost tracks the reachable information, not the activity. Items marked
   with user-space TLS. A read waiting on an offline holder completed 15 to
   110 ms after the holder reconnected. A 64 MiB promotion was then read by a
   new device with the writer offline in 0.5 to 0.7 s.
-- **Cost tracks reachable information** (planned). File edits stay CRDT
-  deltas (a full-file rewrite with a small change stores the change). After
-  a seal, a conversation's streaming chunks are compacted into the final
-  block through a new stream epoch; refs into the old epoch resolve through
-  a recorded mapping, and the old epoch is dropped after the new one is
-  uploaded. Every version reachable from a message is kept; intermediate
-  states between message boundaries are merged after a window, keeping
-  per-author spans. Superseded run lines and runs, deleted forks and redacted
-  content are collected. Cold-tier movement is a `Relay_Storage` hint.
+- **Cost tracks reachable information.** Measured attribution of the
+  transcript above (2769 messages recorded one `record` call each, so one
+  commit per message; pack-backed reference relay; bytes on the relay after
+  minus before):
+
+  | Item | HEAD | after defrag fix |
+  |---|---|---|
+  | Conversation segment: Block 4.68 MB (4.40 MB text + 0.29 MB framing), Msg 0.38, Seal 0.30, Recorded 0.33, Spine and Forks 0.015, signature records 0.81 (one per commit, 294 B) | 6.53 MB | 6.53 MB |
+  | Catalog map: 2771 Activity puts 0.18 MB + 2772 signature records 0.53 MB | 0.71 MB | 0.71 MB |
+  | Placement `pending` map: 2215 puts and clears 0.31 MB + signatures 0.43 MB | 0.74 MB | 0.74 MB |
+  | Announce feed: 40 B per append, folded only at 64 MiB | 0.30 MB | 0.31 MB |
+  | Keys, cards, key trees, slots | < 3 KB | < 3 KB |
+  | Pack container: small-stream rewrites by defragmentation | about 19.4 MB | about 2.0 MB |
+  | Pack container: pre-promotion copies, length slots, usage file, inode, stale and commit records | 6.5 MB | 7.2 MB |
+  | Pack index runs and superblock | 0.43 MB | 0.46 MB |
+  | Total | 34.5 MB | 17.8 MB |
+
+  Not on the relay: raw provider lines (the local `raw/<object>` journal is
+  never published; drivers re-read it locally) and padding (off by
+  default). The 24-byte record envelope is 5% of the segment. The pack
+  container is garbage that compaction reclaims once a container is no
+  longer active (live ratio under one half), so it is bounded rather than
+  cumulative, but it is written per append: each relay append writes the
+  data, the stream's length slot, the feed entry, its slot and the usage
+  file, each with an inode record. Everything in the first four rows is
+  cumulative: it grows with activity and is never collected. Catalog
+  Activity puts are also the change trigger runtimes evaluate on (catalog
+  deltas queue evaluation), so they cannot be thinned: a 60 s grain cut the
+  relay to 9.4 MB and stopped placement evaluation entirely. The cumulative
+  rows are what segment archives (below) collect.
+
+  Compression of the whole history is what the reachable information costs:
+  the segment's non-signature records concatenated compress to 1.12 MB at
+  zstd level 3 and 0.89 MB at level 19 (1.5 and 1.2 times the 0.75 MB of
+  the bare text), the catalog's 712 KB to 7.6 KB and the pending map's
+  735 KB to 26 KB. Per-message compression without a dictionary gives
+  2.28 MB for the text alone, a self-trained 110 KB dictionary 1.43 MB, and
+  groups of 64 KiB, 256 KiB and 1 MiB of consecutive messages 1.02, 0.85
+  and 0.79 MB. The target of 1 to 1.5 times the text's zstd size is
+  therefore reachable only with cross-record compression of history plus
+  collection of the cumulative rows; per-record compression of the live
+  tail is a constant factor on top.
+- **Per-record compression.** Every obj record whose fields are at least
+  128 bytes is compressed on its own with the pinned zstd (level 3, no
+  dictionary) before it is appended: leading fields under 64 bytes stay
+  raw (links tag 6 their length) and the rest is one frame (links tag 5 its
+  raw length), kept only if it saves an eighth. The stored form is the only
+  form, so the local journal, the wire (ChaCha20 over the same bytes), the
+  relay and replicas keep identical offsets and lengths; chain links,
+  signatures, tags, fetches and redaction act on stored bytes, and
+  redaction still zero-fills the whole record, which is the redaction
+  unit, so it stays exact. Readers inflate in `convo.decode_env` and
+  `map.decode_body`; decoding is size-checked and bounded. The browser
+  links a wasm32 build of the same zstd (68 KB). Measured on the
+  transcript: Block records 4.68 to 2.59 MB, relay 17.8 to 15.9 MB;
+  compress 7.6 ms and inflate 2.6 ms per MB.
+- **No content dictionaries.** A trained zstd dictionary copies verbatim
+  segments of its samples, so redacting a sampled message would leave its
+  bytes in the dictionary, and retiring the dictionary makes every record
+  compressed with it unreadable unless it is rewritten, which durable
+  records never are. Dictionaries are therefore not used for relay records;
+  cross-record redundancy is captured by segment archives instead, whose
+  redaction is exact (below).
+- **Live drafts** (planned). Streaming text never enters a segment as
+  chunks. While a block streams, its text is appended to the writer's draft
+  stream `draft/<segment>` epoch `e` (`Draft{msg, block index, offset in
+  block, bytes}`), committed per tick like any journal, uploaded and
+  followed live by viewers exactly as segments are, so other devices see
+  the same latency as today. The segment receives the finished Block
+  records at block end and the Seal at message end. When the writer has no
+  open block it drops draft epoch `e` from the relay (`client_drop`, as key
+  stream epochs already do) and the next stream opens `e + 1`. Proof
+  obligations: (1) no durable record ever holds a Ref into a draft (Blocks
+  chain only to the message and to earlier Blocks of the segment), so
+  dropping a draft epoch invalidates nothing reachable; (2) offsets stay
+  identical because drafts are an ordinary stream and segments only ever
+  receive appends; (3) nothing is lost on a crash: every byte a viewer saw
+  was durable in the draft first, and recovery (`Interrupted`) appends each
+  unsealed message's draft text as its final Blocks before sealing it, so
+  the segment ends with exactly what was streamed; (4) redaction of an open
+  message zero-fills its draft records as well as its segment records. Cost:
+  the relay holds only the drafts of currently open blocks; the segment
+  gets one Block per block and one signature per commit instead of a chunk
+  and a signature every 50 ms (about 300 B of framing and signature per
+  tick today, 6 KB per second of streaming).
+- **Segment archives** (planned). A writer periodically archives a prefix
+  `[0, B)` of each of its segments (conversations, maps, texts alike), `B`
+  a record boundary at or below what the relay acknowledged. The archive is
+  the writer's own stream `arc/<segment>`: group records of consecutive
+  segment records, each `Group{first offset, count, H, zstd(len ‖ body)*}`
+  with groups of 256 KiB raw compressed at a high level off the hot path,
+  signature records elided, sealed per record from the archive's own key
+  tree, and an archive seal carrying the segment's chain head at `B` and
+  signed by the writer. `H` folds the per-record chain commitments of the
+  group. Once the relay acknowledged the seal, the writer sends
+  `Trim{segment, B}`, and the relay drops `[0, B)` of the stored segment
+  (its `base` becomes `B`, as for hollow segments). Mapping: none is
+  needed. Offsets are the record ids, the archive reproduces every archived
+  record's exact stored body at its original offset and length, and a
+  reader below `base` materializes records from the archive into its sparse
+  replica, verified against `H` and the archive seal; elided signature
+  records materialize as redacted-form placeholders, since the archive seal
+  replaces their role and they carry no content. So every Ref, chain
+  position and CRDT position resolves to the same bytes before and after.
+  Crash safety: `Trim` is sent only after the seal is durable on the relay
+  and is idempotent; a crash before it leaves the segment whole and the
+  archive is resumed or redone. Redaction: a record inside a group cannot
+  be zero-filled alone, so the redactor (any member: it holds the keys)
+  writes `Restore{group ref, the group without that record, the removed
+  record's commitment}` into its own segment of the object, then the group
+  is zero-filled and its key punctured everywhere; readers of the other
+  records of that group resolve them through the restore, verifying them
+  against `H`, and the writer's next archive absorbs the restore. Nothing
+  other than the redacted record is lost and its bytes exist nowhere.
+  Projected for the transcript: the segment's 6.53 MB archive to 1.3 MB at
+  level 3 and 0.9 to 1.1 MB at level 19, the two maps to 34 KB together,
+  with the feed folded relative to its snapshot size (below) and the pack's
+  active container compacted, about 1.0 to 1.2 MB on the relay, 1.3 to 1.6
+  times the text's zstd size. Every version reachable from a message is
+  kept; superseded run lines and runs, deleted forks and redacted content
+  are collected the same way. Cold-tier movement is a `Relay_Storage` hint.
+- **Relay write amplification.** The usage counter is written once per
+  group commit, not per append; the feed is folded when it exceeds twice its
+  last folded size (64 KiB floor); and the relay's pack rolls its active
+  container when half of it is garbage, so compaction reclaims it promptly.
+  (planned) Pack-backed relay streams need no length slots once the pack
+  buffers appends until their own commit, so a partial append can never
+  become durable through another space's commit.
 - **Relay writes** are host-chosen and never protocol-visible: an append is
   acknowledged once durable in the host's durable buffer (group-committed
   local files for the reference relay, Durable Object storage for a DO host)
