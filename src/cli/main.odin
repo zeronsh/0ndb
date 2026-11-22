@@ -25,7 +25,7 @@ Args :: struct {
 	json:  bool,
 }
 
-BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview", "local", "everywhere", "no-full-index", "replace", "always-on"}
+BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview", "local", "everywhere", "no-full-index", "replace", "always-on", "device-only"}
 
 Command :: struct {
 	name:  string,
@@ -47,6 +47,7 @@ COMMANDS := []Command {
 	{"devices", cmd_devices, "devices [remove DEVICE | forget-passkey CREDENTIAL]", "list this account's devices, runners and passkeys; remove a device (every space starts a new key epoch without it)"},
 	{"members", cmd_members, "members [--space S]", "list a space's members, how each enrolled, and the current key epoch"},
 	{"remove", cmd_remove, "remove DEVICE [--space S]", "remove a device from every space (or one space) and start a new key epoch"},
+	{"leave", cmd_leave, "leave SPACE [--device-only]", "leave a shared space: remove your devices from it and erase its local copies once the relay has the removal"},
 	{"rotate", cmd_rotate, "rotate [--space S]", "start a new key epoch now (after a suspected compromise)"},
 	{"recovery-key", cmd_recovery_key, "recovery-key", "create the account recovery key (settings; login --recovery uses it with no other device online)"},
 	{"pool", cmd_pool, "pool token | on | off [--space S]", "print a runner launch token (pool host), or include or remove cloud runners for a space"},

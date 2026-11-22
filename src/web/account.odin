@@ -70,6 +70,8 @@ session_open_account :: proc(s: ^Session, record: []u8, entries: []u8, credentia
 	akr := osync.account_keyring(s.member.account)
 	chosen: osync.Manifest_Entry
 	found := false
+	decoded := make([dynamic]osync.Manifest_Entry, context.temp_allocator)
+	last := make(map[prim.Id]int, context.temp_allocator)
 	pos := 0
 	for pos + 4 <= len(entries) {
 		n := int(prim.get_u32le(entries[pos:]))
@@ -78,13 +80,17 @@ session_open_account :: proc(s: ^Session, record: []u8, entries: []u8, credentia
 		}
 		me: osync.Manifest_Entry
 		if osync.manifest_entry_decode(entries[pos + 4:][:n], rec.sign, &akr, &me, s.allocator) == .None {
-			zero: prim.Id
-			if !found && (space == zero || prim.Id(me.space) == space) {
-				chosen = me
-				found = true
-			}
+			last[prim.Id(me.space)] = len(decoded)
+			append(&decoded, me)
 		}
 		pos += 4 + n
+	}
+	zero: prim.Id
+	for me, i in decoded {
+		if !found && !me.left && last[prim.Id(me.space)] == i && (space == zero || prim.Id(me.space) == space) {
+			chosen = me
+			found = true
+		}
 	}
 	if !found {
 		return .Not_Found

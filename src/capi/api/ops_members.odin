@@ -272,6 +272,16 @@ op_space_rotate :: proc(c: ^Call, o: ^Out) -> Status {
 	return status_of(eng.space_rotate(c.api.e, a_id(c, "space")))
 }
 
+op_space_leave :: proc(c: ^Call, o: ^Out) -> Status {
+	res, err := eng.space_leave(c.api.e, a_id(c, "space"), a_bool(c, "device_only"))
+	if err != .None {
+		return status_of(err)
+	}
+	o_u64(o, "removed", u64(res.removed))
+	o_u64(o, "skipped", u64(res.skipped))
+	return .Ok
+}
+
 op_space_pool :: proc(c: ^Call, o: ^Out) -> Status {
 	if c.stage == 0 {
 		err := eng.space_pool_set(c.api.e, a_id(c, "space"), a_bool(c, "on"), account_done(c))

@@ -486,6 +486,28 @@ cmd_remove :: proc(a: ^Args) -> int {
 	return 0
 }
 
+cmd_leave :: proc(a: ^Args) -> int {
+	if len(a.pos) != 1 {
+		return usage_error("usage: 0ndb leave SPACE [--device-only]")
+	}
+	s := session(a)
+	r := req_begin("space.leave")
+	req_str(&r, "space", resolve_space(s, a.pos[0]))
+	if flag_bool(a, "device-only") {
+		req_bool(&r, "device_only", true)
+	}
+	v := must(s, req_end(&r), "cannot leave that space")
+	if a.json {
+		print_json(v)
+		return 0
+	}
+	fmt.printfln("left: removed %d of your devices; local copies are erased once the relay has the removal", jint(v, "removed"))
+	if n := jint(v, "skipped"); n > 0 {
+		fmt.printfln("%d of your devices stay members: your role cannot remove them", n)
+	}
+	return 0
+}
+
 cmd_rotate :: proc(a: ^Args) -> int {
 	s := session(a)
 	space := default_space(s, false)

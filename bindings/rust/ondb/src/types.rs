@@ -421,6 +421,13 @@ pub struct SignedOut {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
+pub struct SpaceLeft {
+    pub removed: u64,
+    pub skipped: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Receipt {
     pub receipt: String,
     pub msg: Option<Rid>,

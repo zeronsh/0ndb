@@ -780,6 +780,8 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		fmt.eprintfln("0ndb daemon: %s promoted segment of %s (%d bytes uploaded)", hex(ev.object), hex(ev.device), ev.length)
 	case .Peer_Misbehaving:
 		fmt.eprintfln("0ndb daemon: device %s served bytes of %s that failed verification", hex(ev.device), hex(ev.object))
+	case .Space_Left:
+		fmt.eprintfln("0ndb daemon: left space %s; its local copies are erased", hex(ev.space))
 	}
 	_broadcast_event(d, ev, {}, {})
 }
