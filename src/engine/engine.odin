@@ -204,6 +204,9 @@ Config :: struct {
 	seed_guard:      osync.Seed_Guard,
 	storage:         Storage_Mode,
 	storage_policy:  Storage_Policy,
+	archive_min:     i64,
+	archive_group:   int,
+	archive_level:   int,
 	user:            rawptr,
 }
 

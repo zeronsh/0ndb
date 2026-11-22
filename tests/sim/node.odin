@@ -81,6 +81,9 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.durability = w.cfg.durability
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
+	cfg.archive_min = w.cfg.archive_min
+	cfg.archive_group = w.cfg.archive_group
+	cfg.archive_level = 3
 	cfg.search_full = n.idx % 2 == 0
 	cfg.search_hedge_ms = 200
 	cfg.search_deadline_ms = 2000
@@ -427,6 +430,8 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.alive = false
 	rn.r_on = false
 	instance_kill(&rn.inst)
+	rn.w.stats.trims += rn.r.stats.trims
+	rn.w.stats.trimmed += rn.r.stats.trimmed
 	rn.r = {}
 	rn.fs = {}
 	rn.wake = 0

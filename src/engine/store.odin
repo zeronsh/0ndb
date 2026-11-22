@@ -517,7 +517,8 @@ _publish :: proc(e: ^Engine, d: ^Dirty_Seg) {
 			d.tree.refs += 1
 		}
 		hollow := _storage_class(e, sp, d.object, d.kind) == .Device
-		err := osync.replicator_publish(&sp.repl, &d.scope, d.name, 0, d.path, d.length, var_tree, hollow)
+		_, _, archive := _object_of_name(d.name)
+		err := osync.replicator_publish(&sp.repl, &d.scope, d.name, 0, d.path, d.length, var_tree, hollow, archive && !hollow && e.cfg.archive_min >= 0)
 		if err != .None {
 			if d.tree != nil {
 				d.tree.upload_refs -= 1

@@ -21,6 +21,10 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		on_event     = _on_repl_event,
 		user         = sp,
 		keys         = _repl_keys,
+		signer       = osync.keyring_signer(&e.keyring),
+		archive_min  = e.cfg.archive_min if e.cfg.archive_min != 0 else osync.ARCHIVE_MIN_DEFAULT,
+		archive_group = e.cfg.archive_group,
+		archive_level = e.cfg.archive_level,
 	}
 	creds_ok := false
 	if e.cfg.credentials.produce != nil {
@@ -597,6 +601,12 @@ _repl_keys :: proc(user: rawptr, device: prim.Id, name: string, epoch: u64, stre
 _verify :: proc(user: rawptr, req: ^osync.Verify_Request) -> osync.Verdict {
 	sp := (^Space)(user)
 	e := sp.e
+	if seg, archived := osync.archive_target(req.name); archived {
+		if _, _, ok := _object_of_name(seg); ok {
+			return _verify_plain(sp, req, seg)
+		}
+		return .Tampered
+	}
 	if _, _, ok := _object_of_name(req.name); !ok {
 		return .Accept
 	}
@@ -653,4 +663,31 @@ _transport_open :: proc(e: ^Engine, sp: ^Space) -> (rawptr, Error) {
 _transport_send :: proc(e: ^Engine, sp: ^Space, bytes: []u8) -> (int, Error) {
 	context = _outer(e)
 	return e.cfg.transport.send(e.cfg.transport.data, sp.conn, bytes)
+}
+
+@(private)
+_verify_plain :: proc(sp: ^Space, req: ^osync.Verify_Request, seg: string) -> osync.Verdict {
+	e := sp.e
+	if !(req.device in sp.identities) {
+		_held_add(e, sp, req.device, req.name)
+		_need_add(e, sp, .Card, req.device, seg)
+		return .Hold
+	}
+	cv := osync.Chain_Verifier {
+		data = sp,
+		identity = proc(data: rawptr, device: prim.Id) -> (osync.Identity, bool) {
+			x := (^Space)(data)
+			id, ok := x.identities[device]
+			return id, ok
+		},
+		seed = proc(data: rawptr, stream: osync.Stream_Id) -> journal.Hash {
+			return osync.chain_seed(stream)
+		},
+		keyring = e.keyring,
+	}
+	verdict := osync.chain_verify(&cv, req)
+	if verdict == .Hold {
+		_held_add(e, sp, req.device, req.name)
+	}
+	return verdict
 }

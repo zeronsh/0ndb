@@ -224,7 +224,7 @@ prev :: proc(c: ^Cursor) -> (body: []u8, off: i64, ok: bool) {
 _read :: proc(r: ^Reader, off, end: i64, forward: bool) -> (body: []u8, err: Error) {
 	rec := _fetch(r, off, end, forward) or_return
 	b, kind := _decode(r, rec, off) or_return
-	if r.chained {
+	if r.chained && !(r.replica != nil && replica_trusted(r.replica, off, end)) {
 		if kind == .Plain && is_sig(b) {
 			return b, _check_sig_record(r, b, off)
 		}

@@ -24,6 +24,8 @@ Relay_Stats :: struct {
 	piped_bytes: u64,
 	lived:      u64,
 	lived_bytes: u64,
+	trims:      u64,
+	trimmed:    u64,
 }
 
 Relay_Space_Stats :: struct {

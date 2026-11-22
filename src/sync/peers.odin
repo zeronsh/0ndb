@@ -128,6 +128,7 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 		_promote_on_noted(r, id, ev.base, ev.length)
 		return
 	}
+	rm.trimmed = ev.trimmed
 	_remote_base(r, rm, ev.base, ev.length)
 	for x, i in rm.refused {
 		if x == rm.device {
