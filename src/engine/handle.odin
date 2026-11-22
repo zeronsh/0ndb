@@ -163,7 +163,7 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 	e.handles[o.id] = h
 	append(&e.lru, h)
 	e.stats.opened += 1
-	if e.settle_timer == 0 && !e.in_tick {
+	if e.settle_timer == 0 && !e.in_tick && !e.settling {
 		_settle_arm(e)
 	}
 	defer if err != .None {
