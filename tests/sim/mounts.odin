@@ -145,8 +145,11 @@ node_mounts_drop :: proc(w: ^World, n: ^Node) {
 }
 
 node_remount :: proc(w: ^World, n: ^Node) {
-	for mm in w.model.mounts {
+	m := &w.model
+	for i := 0; i < len(m.mounts); {
+		mm := m.mounts[i]
 		if mm.node != n.idx || !n.alive {
+			i += 1
 			continue
 		}
 		if err := node_mount(w, n, mm.oi, mm.root); err != .None && n.alive {
@@ -156,8 +159,15 @@ node_remount :: proc(w: ^World, n: ^Node) {
 				node_after(n)
 				return
 			}
+			ob := &m.objs[mm.oi]
+			if err == .Not_Found && ob.creator == n.idx && m.ops[ob.op].status == .Uncertain {
+				world_note(w, "%s mount %s is gone with its unacknowledged tree %s", n.name, mm.root, id_short(ob.o.id))
+				ordered_remove(&m.mounts, i)
+				continue
+			}
 			world_fail(w, "%s could not remount %s after restart: %v", n.name, mm.root, err)
 		}
+		i += 1
 	}
 }
 
