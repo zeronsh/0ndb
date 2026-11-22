@@ -724,7 +724,7 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 				esc := _object_scope(sp, id)
 				defer osync.scope_clear(&esc)
 				x, xok := sp.remote_trees[osync.stream_id(&esc, device, seg, 0)]
-				if !xok || x.loaded || x.epoch != epoch {
+				if !xok || x.loaded || x.epoch != epoch || _remote_tree_stalled(sp, x) {
 					return
 				}
 				x.requested = false
