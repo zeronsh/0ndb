@@ -48,6 +48,11 @@ verify_skip :: proc(m: ^Mount, p: string) -> bool {
 			return true
 		}
 	}
+	for r in m.reshow {
+		if path_at_or_under(p, r) || path_at_or_under(conflict_base(p), r) {
+			return true
+		}
+	}
 	return false
 }
 
