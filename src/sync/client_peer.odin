@@ -94,3 +94,57 @@ client_serve_commit :: proc(c: ^Client, reserved: int, used: int, word: u64) {
 	prim.put_u64le(b[start + FRAME_HEADER + 64:], word)
 	resize(b, len(b) - (reserved - u))
 }
+
+client_pull_draft :: proc(c: ^Client, holder: Device_Id, tag: u64, id: Stream_Id, msg, from: i64) -> Error {
+	if msg < 0 || u64(msg) >= DRAFT_MSG_MAX || from < 0 || u64(from) >= DRAFT_MSG_MAX {
+		return .Invalid
+	}
+	b := _client_buf(c)
+	start := frame_begin(b, .Pull) or_return
+	w := prim.writer(b)
+	h := holder
+	prim.write_raw(&w, h[:])
+	prim.write_u64le(&w, tag)
+	put_id(&w, cast([32]u8)id)
+	prim.write_u64le(&w, PULL_DRAFT | u64(msg))
+	prim.write_u64le(&w, u64(from))
+	return frame_end(b, start, &w)
+}
+
+client_live :: proc(c: ^Client, id: Stream_Id, msg, at: i64, data: []u8) -> Error {
+	if len(data) == 0 || len(data) > LIVE_MAX || msg < 0 || at < 0 || u64(msg) >= DRAFT_MSG_MAX || u64(at) >= DRAFT_MSG_MAX {
+		return .Invalid
+	}
+	b := _client_buf(c)
+	start := len(b)
+	if rerr := resize(b, start + FRAME_HEADER + LIVE_FIXED + len(data)); rerr != nil {
+		resize(b, start)
+		return .No_Memory
+	}
+	frame_header(b[start:], .Live, LIVE_FIXED + len(data))
+	sid := id
+	copy(b[start + FRAME_HEADER:], sid[:])
+	prim.put_u64le(b[start + FRAME_HEADER + 32:], u64(msg))
+	prim.put_u64le(b[start + FRAME_HEADER + 40:], u64(at))
+	copy(b[start + FRAME_HEADER + LIVE_FIXED:], data)
+	return .None
+}
+
+client_follow_live :: proc(c: ^Client, ids: []Stream_Id) -> Error {
+	rest := ids
+	for len(rest) > 0 {
+		n := min(len(rest), FOLLOW_BATCH)
+		b := _client_buf(c)
+		start := frame_begin(b, .Follow) or_return
+		w := prim.writer(b)
+		prim.write_u8(&w, FOLLOW_LIVE)
+		prim.write_u16le(&w, u16(n))
+		for id in rest[:n] {
+			put_id(&w, cast([32]u8)id)
+			prim.write_u64le(&w, 0)
+		}
+		frame_end(b, start, &w) or_return
+		rest = rest[n:]
+	}
+	return .None
+}

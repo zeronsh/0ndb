@@ -44,6 +44,7 @@ Kind :: enum u8 {
 	Serve     = 0x14,
 	Account   = 0x15,
 	Trim      = 0x16,
+	Live      = 0x17,
 	Welcome   = 0x81,
 	Listing   = 0x82,
 	Appended  = 0x83,
@@ -70,6 +71,7 @@ Kind :: enum u8 {
 	Served    = 0x98,
 	Unserved  = 0x99,
 	Accounted = 0x9a,
+	Lived     = 0x9b,
 	Trimmed   = 0x9c,
 }
 
@@ -128,8 +130,14 @@ ACCOUNTED_LEN :: 14 * 8
 FEATURE_ACCOUNT :: u64(1)
 FEATURE_TRIM :: u64(2)
 FEATURE_BELOW_BASE :: u64(4)
-RELAY_FEATURES :: FEATURE_ACCOUNT | FEATURE_TRIM | FEATURE_BELOW_BASE
+RELAY_FEATURES :: FEATURE_ACCOUNT | FEATURE_TRIM | FEATURE_BELOW_BASE | FEATURE_LIVE
 TRIM_LEN :: 32 + 8
+FEATURE_LIVE :: u64(1) << 3
+FOLLOW_LIVE :: 2
+LIVE_FIXED :: 32 + 8 + 8
+LIVE_MAX :: SERVE_MAX
+PULL_DRAFT :: u64(1) << 63
+DRAFT_MSG_MAX :: u64(1) << 62
 
 Feed_Pattern_Kind :: enum u8 {
 	Prefix = 1,
@@ -296,6 +304,8 @@ _parser_header :: proc(p: ^Parser) -> Error {
 			bulk, fixed, limit = true, FILL_FIXED, APPEND_MAX
 		case .Serve:
 			bulk, fixed, limit = true, SERVE_FIXED, SERVE_MAX
+		case .Live:
+			bulk, fixed, limit = true, LIVE_FIXED, LIVE_MAX
 		case .Put:
 			bulk, fixed, limit = true, PUT_FIXED, OBJECT_MAX
 		case:
@@ -308,6 +318,8 @@ _parser_header :: proc(p: ^Parser) -> Error {
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
 		case .Served:
 			bulk, fixed, limit = true, SERVE_FIXED, SERVE_MAX
+		case .Lived:
+			bulk, fixed, limit = true, LIVE_FIXED, LIVE_MAX
 		case .Object:
 			bulk, fixed, limit = true, OBJECT_FIXED, OBJECT_MAX
 		case:

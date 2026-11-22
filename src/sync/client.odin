@@ -39,6 +39,7 @@ Event_Kind :: enum u8 {
 	Served,
 	Unserved,
 	Accounted,
+	Lived,
 }
 
 Event :: struct {
@@ -718,6 +719,17 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		if it.frame != .Served {
 			ev.id = get_id32(&r)
 		}
+		if it.frame == .Lived {
+			ev.kind = .Lived
+			ev.tag = prim.read_u64le(&r)
+			ev.at = get_i64(&r)
+			if !prim.reader_done(&r) {
+				return .Protocol
+			}
+			c.bulk = ev
+			c.bulk.first = false
+			return handler(user, &ev)
+		}
 		#partial switch it.frame {
 		case .Data:
 			ev.kind = .Data
@@ -757,7 +769,7 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		ev := c.bulk
 		ev.last = true
 		c.bulk = {}
-		if ev.kind == .Served {
+		if ev.kind == .Served || ev.kind == .Lived {
 			return handler(user, &ev)
 		}
 		if ev.kind == .Object || ev.final {

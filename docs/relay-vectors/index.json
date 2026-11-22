@@ -18,5 +18,6 @@
   {"name": "malformed", "steps": 39, "summary": "Malformed input is fatal: oversize frames, unknown kinds, relay-only kinds, short payloads, count mismatches, inverted ranges, bad bulk headers, oversize direct payloads, a second Hello; bytes after the error are ignored."},
   {"name": "compaction", "steps": 34, "summary": "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base."},
   {"name": "trim", "steps": 25, "summary": "Trim drops stored content below a base an archive covers: owner only, acknowledged once durable, idempotent, never lowers base, refused at or past the length; readers, probes and follows get Trimmed; Fill below a trim stores nothing."},
-  {"name": "limits", "steps": 10, "summary": "Per-principal connection limit and per-connection follow limit."}
+  {"name": "limits", "steps": 10, "summary": "Per-principal connection limit and per-connection follow limit."},
+  {"name": "live", "steps": 22, "summary": "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow, draft pulls through the peer pipe, malformed Live."}
 ]
