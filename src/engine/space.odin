@@ -931,10 +931,22 @@ _pending_recover :: proc(e: ^Engine, sp: ^Space) {
 			continue
 		}
 		sc := _object_scope(sp, o.id)
-		floor, ferr := osync.replicator_floor(&sp.repl, &sc, _seg_name(o.kind, o.id), 0)
-		osync.scope_clear(&sc)
-		if ferr != .None || st.size <= floor {
+		defer osync.scope_clear(&sc)
+		name := _seg_name(o.kind, o.id)
+		floor, ferr := osync.replicator_floor(&sp.repl, &sc, name, 0)
+		if ferr != .None {
 			continue
+		}
+		if st.size <= floor {
+			t, terr := _own_tree_get(e, sp, o.id, o.kind, &sc, false)
+			if terr != .None {
+				continue
+			}
+			unconfirmed := _keys_unconfirmed(e, sp, &sc, name, t)
+			_own_tree_unref(e, t)
+			if !unconfirmed {
+				continue
+			}
 		}
 		_rlog_pend_set(e, k, RLOG_UNKNOWN)
 	}
