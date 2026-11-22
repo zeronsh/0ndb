@@ -120,6 +120,11 @@ _tier_cold_unref :: proc(sp: ^Tier_Space, id: Stream_Id, c: ^Tier_Cold) {
 }
 
 @(private)
+_tier_pinned :: proc "contextless" (sp: ^Tier_Space, id: Stream_Id) -> bool {
+	return _reserved(cast([32]u8)id) || stream_id_suffix(id) == sp.pin
+}
+
+@(private)
 _tier_cold_of :: proc(ts: ^Tier_Stream) -> ^Tier_Cold {
 	if ts.cold == nil && _tier_cold_on(ts.sp.t) && !_reserved(cast([32]u8)ts.id) {
 		ts.cold = _tier_cold_ref(ts.sp, ts.id)
@@ -146,7 +151,7 @@ _tier_cold_note :: proc(sp: ^Tier_Space, entries: []u8, segs: map[Stream_Id]Tier
 		if c, ok := sp.cold[id]; ok {
 			append(&c.recs, Tier_Rec{at = at, n = n, seq = prim.get_u64le(r[56:]), off = prim.get_u32le(r[4:])})
 		}
-		if !_reserved(cast([32]u8)id) && sp.thawing[id] == 0 && sp.redacting[id] == 0 && sp.rewriting[id] == 0 && len(segs[id].redacts) == 0 {
+		if !_tier_pinned(sp, id) && sp.thawing[id] == 0 && sp.redacting[id] == 0 && sp.rewriting[id] == 0 && len(segs[id].redacts) == 0 {
 			hi[id] = max(hi[id], at + n)
 		}
 	}
@@ -224,7 +229,7 @@ _tier_ev_done :: proc(sp: ^Tier_Space, result: Error) {
 			_tier_thaw_lowered(ev.thaw, result)
 			continue
 		}
-		if result != .None || sp.thawing[ev.id] > 0 || sp.redacting[ev.id] > 0 || sp.rewriting[ev.id] > 0 {
+		if result != .None || _tier_pinned(sp, ev.id) || sp.thawing[ev.id] > 0 || sp.redacting[ev.id] > 0 || sp.rewriting[ev.id] > 0 {
 			continue
 		}
 		if c, ok := sp.cold[ev.id]; ok {

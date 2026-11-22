@@ -1116,6 +1116,12 @@ _relay_records :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id, out: ^map
 	rn := &w.relay
 	context = instance_context(&rn.inst)
 	defer relay_after(rn)
+	was := rn.slow.inline
+	rn.slow.inline = true
+	defer rn.slow.inline = was
+	if rn.tiered {
+		sim_objects_flush(&rn.slow)
+	}
 	r := &rn.r
 	st := r.store
 	ns: rawptr
@@ -1142,6 +1148,10 @@ _relay_records :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id, out: ^map
 	pos := st.stream_base(st.data, sh)
 	for pos + 24 <= length {
 		got, rerr := st.stream_read(st.data, sh, pos, hdr[:])
+		if rerr == .Pending {
+			world_fail(w, "relay redaction: a cold read of stream %x at %d is still pending during the check", id[0], pos)
+			break
+		}
 		if rerr != .None || got != len(hdr) {
 			break
 		}
@@ -1154,7 +1164,11 @@ _relay_records :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id, out: ^map
 		if tag == journal.redacted_tag(pos, int(n)) {
 			out[pos] = .Redacted
 			body := make([]u8, n, context.temp_allocator)
-			if bgot, berr := st.stream_read(st.data, sh, pos + 20, body); berr == .None && i64(bgot) == n {
+			bgot, berr := st.stream_read(st.data, sh, pos + 20, body)
+			if berr == .Pending {
+				world_fail(w, "relay redaction: a cold read of stream %x at %d is still pending during the check", id[0], pos + 20)
+			}
+			if berr == .None && i64(bgot) == n {
 				for b in body {
 					if b != 0 {
 						append(zeros_bad, pos)

@@ -925,7 +925,10 @@ is parked: the core stops writing that connection, the block's completion
 calls the readiness hook the core registered (`Relay_Storage.on_ready`) and
 the core resumes every parked connection, so a slow object store delays
 only the clients that read cold bytes. Redaction below the watermark and
-rewrites chain through the same completions.
+rewrites chain through the same completions. Streams a host reads
+synchronously are never evicted: reserved streams (feed, redaction log,
+manifest) and members streams, which the authorizer reads whole to build a
+space's roster, are pinned by class whatever their length.
 
 ## 12. Conformance vectors
 

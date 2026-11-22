@@ -2364,7 +2364,12 @@ Relay cost tracks the reachable information, not the activity. Items marked
   re-queues every `Redacting` record without one, so a crash between the
   acknowledgement and the rewrite cannot leave the old bytes in the object
   store. A stream is never evicted while a redaction of it is in progress
-  or not yet rewritten into the objects. Slotted
+  or not yet rewritten into the objects. Streams the core or the authorizer
+  read synchronously are pinned by class and never evicted, whatever their
+  length: reserved streams (feed, redaction log, tier manifest) and every
+  device's members stream (recognized by the space's members suffix), so
+  authorization never waits on the object store. Every other read of a
+  stream goes through the parked asynchronous path. Slotted
   (based or trimmed) streams stay whole in the pack. Measured with
   `tools/costbench` s1 (1062 transcript messages): the relay's pack on disk
   drops from 4.71 MB to 3.60 MB, the 1.23 MB conversation segment holding
