@@ -598,9 +598,11 @@ concurrent typing is never lost or reverted.
     redacted batch's replacement in its place (and serves any read of a
     zero-filled own record from its replacement while replaying, so a
     replayed redaction never loads a file without the batch it redacted),
-    pauses at an own batch whose files cannot be loaded yet (a remote
-    stream its text depends on is not readable at wake) and resumes when a
-    catch-up next runs, and pauses at an own batch whose
+    pauses at any own record (a batch, a redaction, a seal) that answers
+    Not_Found because what it reads is not readable yet (a remote stream
+    its text depends on, at wake); each such record loads before it
+    mutates or is idempotent on rerun, and replay resumes when a catch-up
+    next runs; it also pauses at an own batch whose
     parents are remote until those arrive (own sequence numbers in the
     paused region stay reserved, so local writes meanwhile never reuse an
     op id), and treats any other refusal of an own batch as corruption. A
