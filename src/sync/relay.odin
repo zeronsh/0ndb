@@ -327,7 +327,17 @@ relay_destroy :: proc(r: ^Relay) {
 		r.waking = false
 	}
 	if r.own_store != nil {
-		worker_destroy(&r.own_store.worker)
+		w := &r.own_store.worker
+		for i := 0; i < 64 && (len(w.inline_q) > 0 || w.inflight > 0); i += 1 {
+			_worker_ready(w.loop, prim.INVALID_FD, {}, w)
+			if r.own_pack != nil {
+				pack.sync(r.own_pack)
+			}
+		}
+		worker_destroy(w)
+		if r.own_pack != nil {
+			pack.sync(r.own_pack)
+		}
 		r.own_store.worker = {}
 	}
 	if r.wake_timer != 0 {
