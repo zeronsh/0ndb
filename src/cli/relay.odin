@@ -62,7 +62,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 			fmt.println(hex_of(k[:]))
 			return 0
 		case:
-			return usage_error("usage: 0ndb relay [allow SPACE [QUOTA] | key] [--listen ADDR,...] [--dir DIR] [--open] [--quota BYTES] [--objects DIR [--flush-ms MS] [--flush-mb MB] [--hot-kb KB]]")
+			return usage_error("usage: 0ndb relay [allow SPACE [QUOTA] | key] [--listen ADDR,...] [--dir DIR] [--open] [--quota BYTES] [--objects DIR [--flush-ms MS] [--flush-max-ms MS] [--flush-mb MB] [--hot-kb KB]]")
 		}
 	}
 	m := new(Relay_Main)
@@ -110,6 +110,13 @@ cmd_relay :: proc(a: ^Args) -> int {
 				return usage_error("--flush-ms takes a positive number of milliseconds")
 			}
 			cfg.flush_ms = n
+		}
+		if v, vok := flag_value(a, "flush-max-ms"); vok {
+			n, nok := strconv.parse_i64(v)
+			if !nok || n <= 0 {
+				return usage_error("--flush-max-ms takes a positive number of milliseconds")
+			}
+			cfg.flush_max_ms = n
 		}
 		if v, vok := flag_value(a, "flush-mb"); vok {
 			n, nok := strconv.parse_i64(v)
@@ -163,7 +170,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	fmt.printfln("relay key %s", hex_of(k[:]))
 	fmt.printfln("mode %s · kernel tls %v · storage pack in %s", "open" if cfg.open else "allow-list", cfg.kernel_tls, dir)
 	if cfg.objects.put != nil {
-		fmt.printfln("object store %s · one write per space per %d ms or %d MiB · pack keeps %d KiB per stream", m.objects.root, cfg.flush_ms if cfg.flush_ms > 0 else osync.TIER_WINDOW_DEFAULT, (cfg.flush_bytes if cfg.flush_bytes > 0 else osync.TIER_BYTES_DEFAULT) >> 20, (cfg.hot if cfg.hot > 0 else osync.TIER_HOT_DEFAULT) >> 10 if cfg.hot >= 0 else -1)
+		fmt.printfln("object store %s · one write per space after %d ms quiet, %d ms at most, or %d MiB · pack keeps %d KiB per stream", m.objects.root, cfg.flush_ms if cfg.flush_ms > 0 else osync.TIER_WINDOW_DEFAULT, cfg.flush_max_ms if cfg.flush_max_ms > 0 else max(osync.TIER_MAX_DEFAULT, cfg.flush_ms), (cfg.flush_bytes if cfg.flush_bytes > 0 else osync.TIER_BYTES_DEFAULT) >> 20, (cfg.hot if cfg.hot > 0 else osync.TIER_HOT_DEFAULT) >> 10 if cfg.hot >= 0 else -1)
 	}
 	os.flush(os.stdout)
 	m.active = true

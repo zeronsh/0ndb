@@ -16,6 +16,7 @@ Object_Store :: struct {
 Tier_Config :: struct {
 	objects:   Object_Store,
 	window_ms: i64,
+	max_ms:    i64,
 	max_bytes: i64,
 	hot:       i64,
 }
@@ -23,7 +24,8 @@ Tier_Config :: struct {
 TIER_MANIFEST_TAG :: 16
 TIER_RECORD :: 64
 TIER_MAGIC :: "0ndbbat1"
-TIER_WINDOW_DEFAULT :: 2000
+TIER_WINDOW_DEFAULT :: 30_000
+TIER_MAX_DEFAULT :: 600_000
 TIER_BYTES_DEFAULT :: 8 << 20
 
 Tier_Kind :: enum u8 {
@@ -90,6 +92,7 @@ Tier_Space :: struct {
 	objs:      map[Object_Key]bool,
 	bytes:     i64,
 	since:     i64,
+	last:      i64,
 	seq:       u64,
 	dirty:     bool,
 	flushing:  bool,
@@ -153,6 +156,9 @@ tier_store_init :: proc(t: ^Tier_Store, l: ^prim.Loop, inner: Relay_Storage, cfg
 	}
 	if t.cfg.window_ms <= 0 {
 		t.cfg.window_ms = TIER_WINDOW_DEFAULT
+	}
+	if t.cfg.max_ms <= 0 {
+		t.cfg.max_ms = max(TIER_MAX_DEFAULT, t.cfg.window_ms)
 	}
 	if t.cfg.max_bytes <= 0 {
 		t.cfg.max_bytes = TIER_BYTES_DEFAULT
@@ -508,9 +514,10 @@ _tier_seg :: proc(sp: ^Tier_Space, id: Stream_Id, lo, hi: i64) {
 @(private)
 _tier_dirty :: proc(sp: ^Tier_Space, n: i64) {
 	t := sp.t
+	sp.last = prim.clock_mono_ns(t.clock)
 	if !sp.dirty {
 		sp.dirty = true
-		sp.since = prim.clock_mono_ns(t.clock)
+		sp.since = sp.last
 		_tier_arm(t)
 	}
 	sp.bytes += n
@@ -528,7 +535,7 @@ _tier_arm :: proc(t: ^Tier_Store) {
 	due := max(i64)
 	for _, sp in t.spaces {
 		if sp.dirty && !sp.flushing {
-			due = min(due, sp.since + t.cfg.window_ms * 1_000_000)
+			due = min(due, _tier_due(t, sp))
 		}
 	}
 	if t.timer != 0 {
@@ -543,13 +550,18 @@ _tier_arm :: proc(t: ^Tier_Store) {
 }
 
 @(private)
+_tier_due :: proc "contextless" (t: ^Tier_Store, sp: ^Tier_Space) -> i64 {
+	return min(sp.last + t.cfg.window_ms * 1_000_000, sp.since + t.cfg.max_ms * 1_000_000)
+}
+
+@(private)
 _tier_on_timer :: proc(l: ^prim.Loop, data: rawptr) {
 	t := cast(^Tier_Store)data
 	t.timer = 0
 	now := prim.clock_mono_ns(t.clock)
 	list := make([dynamic]^Tier_Space, context.temp_allocator)
 	for _, sp in t.spaces {
-		if sp.dirty && !sp.flushing && now >= sp.since + t.cfg.window_ms * 1_000_000 {
+		if sp.dirty && !sp.flushing && now >= _tier_due(t, sp) {
 			append(&list, sp)
 		}
 	}
@@ -970,6 +982,7 @@ _tier_put_done :: proc(ctx: rawptr, result: Error, value: i64) {
 		sp.bytes += f.pending
 		sp.dirty = true
 		sp.since = prim.clock_mono_ns(t.clock)
+		sp.last = sp.since
 	} else {
 		sp.seq = f.seq
 		sp.account.writes += 1
