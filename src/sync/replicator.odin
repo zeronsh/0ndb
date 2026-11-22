@@ -269,6 +269,9 @@ Replicator :: struct {
 	stage_at:   i64,
 	usage:      i64,
 	quota:      i64,
+	features:   u64,
+	account:    Relay_Space_Stats,
+	accounted:  bool,
 	pumping:    bool,
 	serves:     [dynamic]Serve_Req,
 	pull_tag:   u64,
@@ -451,6 +454,17 @@ replicator_stop :: proc(r: ^Replicator) {
 	}
 	_resolver_stop(r)
 	r.phase = .Stopped
+}
+
+replicator_account :: proc(r: ^Replicator) -> Error {
+	if r.phase != .Ready || r.features & FEATURE_ACCOUNT == 0 {
+		return .Unsupported if r.phase == .Ready else .Busy
+	}
+	_enter(r)
+	defer _leave(r)
+	client_account(&r.client) or_return
+	_repl_flush(r)
+	return .None
 }
 
 replicator_ready :: proc "contextless" (r: ^Replicator) -> bool {
@@ -1946,6 +1960,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		}
 		r.usage = ev.usage
 		r.quota = ev.quota
+		r.features = ev.tag
 		if r.timer != 0 {
 			prim.timer_cancel(r.loop, r.timer)
 			r.timer = 0
@@ -1989,6 +2004,11 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_on_pulled(r, ev)
 	case .Served:
 		_on_served(r, ev)
+	case .Accounted:
+		if st, ok := accounted_decode(ev.data); ok {
+			r.account = st
+			r.accounted = true
+		}
 	case .Unserved:
 		_on_unserved(r, ev)
 	case .Probed:
@@ -2051,6 +2071,9 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		kind   = .Refused,
 		code   = ev.code,
 		stream = id,
+	}
+	if id == reserved_id(ACCOUNT_TAG, 0) {
+		return
 	}
 	if id == reserved_id(LIST_TAG, 0) {
 		_lists_finished(r, .Permission if ev.code == .Not_Owner else .Refused)

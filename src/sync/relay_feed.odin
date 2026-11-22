@@ -1,11 +1,10 @@
-#+build linux, darwin, windows
 package osync
 
 import "base:runtime"
 
 import "../prim"
 
-FEED_COMPACT_DEFAULT :: 64 * 1024 * 1024
+FEED_COMPACT_DEFAULT :: 64 * 1024
 COMPACT_BATCH :: FEED_BATCH * FEED_ENTRY
 COMPACT_SLICE_NS :: 1_000_000
 COMPACT_TAIL :: 64 * FEED_ENTRY
@@ -51,14 +50,14 @@ _owned_streams :: proc "contextless" (sp: ^Space_State) -> int {
 }
 
 @(private)
-_pin :: proc(r: ^Relay, sp: ^Space_State, id: Stream_Id) -> (st: ^Stream_State, err: Error) {
+_pin :: proc(r: ^Relay_Core, sp: ^Space_State, id: Stream_Id) -> (st: ^Stream_State, err: Error) {
 	st = _stream_get(r, sp, id, true) or_return
 	st.refs += 1
 	return st, .None
 }
 
 @(private)
-_feed_open :: proc(r: ^Relay, sp: ^Space_State) -> Error {
+_feed_open :: proc(r: ^Relay_Core, sp: ^Space_State) -> Error {
 	if sp.feed_ready {
 		if sp.feed.poisoned && !sp.feed.busy {
 			_stream_get(r, sp, sp.feed.id, true) or_return
@@ -90,7 +89,7 @@ _feed_end :: proc "contextless" (sp: ^Space_State) -> i64 {
 }
 
 @(private)
-_feed_add :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, length: u64) -> i64 {
+_feed_add :: proc(r: ^Relay_Core, sp: ^Space_State, id: [32]u8, length: u64) -> i64 {
 	e: [FEED_ENTRY]u8
 	v := id
 	copy(e[:32], v[:])
@@ -102,7 +101,7 @@ _feed_add :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, length: u64) -> i64 {
 }
 
 @(private)
-_feed_add_redaction :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, from, to: i64) -> i64 {
+_feed_add_redaction :: proc(r: ^Relay_Core, sp: ^Space_State, id: [32]u8, from, to: i64) -> i64 {
 	e: [2 * FEED_ENTRY]u8
 	v := id
 	copy(e[:32], v[:])
@@ -117,7 +116,7 @@ _feed_add_redaction :: proc(r: ^Relay, sp: ^Space_State, id: [32]u8, from, to: i
 
 
 @(private)
-_redlog_open :: proc(r: ^Relay, sp: ^Space_State) -> Error {
+_redlog_open :: proc(r: ^Relay_Core, sp: ^Space_State) -> Error {
 	if sp.redlog != nil {
 		if sp.redlog.poisoned && !sp.redlog.busy {
 			_stream_get(r, sp, sp.redlog.id, true) or_return
@@ -129,7 +128,7 @@ _redlog_open :: proc(r: ^Relay, sp: ^Space_State) -> Error {
 }
 
 @(private)
-_redlog_add :: proc(r: ^Relay, sp: ^Space_State, p: ^Pending) {
+_redlog_add :: proc(r: ^Relay_Core, sp: ^Space_State, p: ^Pending) {
 	rec: [REDLOG_RECORD]u8
 	copy(rec[:32], p.id[:])
 	prim.put_u64le(rec[32:], u64(p.from))
@@ -140,7 +139,7 @@ _redlog_add :: proc(r: ^Relay, sp: ^Space_State, p: ^Pending) {
 }
 
 @(private)
-_redlog_fail :: proc(r: ^Relay, sp: ^Space_State, ps: ^[dynamic]^Pending) {
+_redlog_fail :: proc(r: ^Relay_Core, sp: ^Space_State, ps: ^[dynamic]^Pending) {
 	for p in ps {
 		if c := _conn_lookup(r, p.conn); c != nil {
 			_reply_refused(c, .Io, p.id)
@@ -157,7 +156,7 @@ _redlog_fail :: proc(r: ^Relay, sp: ^Space_State, ps: ^[dynamic]^Pending) {
 }
 
 @(private)
-_redlog_flush :: proc(r: ^Relay, sp: ^Space_State) {
+_redlog_flush :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	if sp.redlog_busy || len(sp.redlog_q) == 0 {
 		return
 	}
@@ -203,7 +202,7 @@ _redlog_flush :: proc(r: ^Relay, sp: ^Space_State) {
 }
 
 @(private)
-_redlog_done :: proc(r: ^Relay, sp: ^Space_State, result: Error, value: i64) {
+_redlog_done :: proc(r: ^Relay_Core, sp: ^Space_State, result: Error, value: i64) {
 	sp.redlog_busy = false
 	st := sp.redlog
 	st.busy = false
@@ -225,14 +224,14 @@ _redlog_done :: proc(r: ^Relay, sp: ^Space_State, result: Error, value: i64) {
 }
 
 @(private)
-_feed_wait :: proc(r: ^Relay, sp: ^Space_State, p: ^Pending, length: u64) {
+_feed_wait :: proc(r: ^Relay_Core, sp: ^Space_State, p: ^Pending, length: u64) {
 	p.need = _feed_add(r, sp, p.id, length)
 	append(&sp.feed_wait, p)
 	_feed_release(r, sp)
 }
 
 @(private)
-_feed_flush :: proc(r: ^Relay, sp: ^Space_State) {
+_feed_flush :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	if sp.feed_busy || sp.freeze || len(sp.feed_q) == 0 && len(sp.feed_flight) == 0 {
 		return
 	}
@@ -273,7 +272,7 @@ _feed_flush :: proc(r: ^Relay, sp: ^Space_State) {
 
 
 @(private)
-_feed_release :: proc(r: ^Relay, sp: ^Space_State) {
+_feed_release :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	end := _feed_end(sp)
 	for i := 0; i < len(sp.feed_wait); {
 		p := sp.feed_wait[i]
@@ -585,7 +584,7 @@ _produce_listing :: proc(c: ^Conn) -> bool {
 }
 
 @(private)
-_feed_done :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, result: Error, value: i64) {
+_feed_done :: proc(r: ^Relay_Core, sp: ^Space_State, kind: Pending_Kind, result: Error, value: i64) {
 	#partial switch kind {
 	case .Feed:
 		sp.feed_busy = false
@@ -599,7 +598,7 @@ _feed_done :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, result: Erro
 				_conn_kick(f)
 			}
 			_feed_release(r, sp)
-			if sp.phase == .Idle && r.cfg.feed_compact > 0 && sp.feed_len >= r.cfg.feed_compact {
+			if sp.phase == .Idle && r.cfg.feed_compact > 0 && sp.feed_len >= max(r.cfg.feed_compact, 2 * sp.feed_folded) {
 				_compact_start(r, sp)
 			}
 		} else {
@@ -630,7 +629,7 @@ _feed_done :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, result: Erro
 }
 
 @(private)
-_feed_job :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, st: ^Stream_State, data: []u8) -> bool {
+_feed_job :: proc(r: ^Relay_Core, sp: ^Space_State, kind: Pending_Kind, st: ^Stream_State, data: []u8) -> bool {
 	w, err := r.store.append_begin(r.store.data, st.h, st.length, i64(len(data)))
 	if err == .None {
 		err = r.store.append_write(r.store.data, w, data)
@@ -659,7 +658,7 @@ _feed_job :: proc(r: ^Relay, sp: ^Space_State, kind: Pending_Kind, st: ^Stream_S
 }
 
 @(private)
-_compact_start :: proc(r: ^Relay, sp: ^Space_State) {
+_compact_start :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	for e in sp.feed_epoch + 1 ..< sp.feed_epoch + 9 {
 		next, err := _pin(r, sp, reserved_id(FEED_TAG, e))
 		if err != .None {
@@ -685,19 +684,19 @@ _compact_start :: proc(r: ^Relay, sp: ^Space_State) {
 }
 
 @(private)
-_compact_step :: proc(r: ^Relay, sp: ^Space_State) {
+_compact_step :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	for sp.phase != .Idle && !sp.compact_busy {
 		switch sp.phase {
 		case .Idle:
 			return
 		case .Snapshot:
-			if sp.compact_timer != 0 {
+			if sp.compact_yield {
 				return
 			}
 			deadline := prim.clock_mono_ns(r.cfg.clock) + COMPACT_SLICE_NS
 			for len(sp.compact_buf) < COMPACT_BATCH {
-				if prim.clock_mono_ns(r.cfg.clock) >= deadline {
-					sp.compact_timer = prim.timer(r.loop, 0, sp, _compact_resume)
+				if r.cfg.wake != nil && prim.clock_mono_ns(r.cfg.clock) >= deadline {
+					_core_yield(r, sp)
 					return
 				}
 				id, ok := r.store.list_next(r.store.data, sp.compact_it)
@@ -719,7 +718,7 @@ _compact_step :: proc(r: ^Relay, sp: ^Space_State) {
 				if st, sok := sp.streams[id]; sok && st.h != nil && !st.dropped {
 					length, base = st.length, st.base
 				} else {
-					l, b, exists := r.store.stream_hint(r.store.data, sp.ns, id)
+					l, b, exists := _stream_hint(r, sp.ns, id)
 					if !exists || l <= 0 {
 						continue
 					}
@@ -802,21 +801,17 @@ _compact_step :: proc(r: ^Relay, sp: ^Space_State) {
 }
 
 @(private)
-_compact_resume :: proc(l: ^prim.Loop, data: rawptr) {
-	sp := cast(^Space_State)data
-	sp.compact_timer = 0
-	r := sp.relay
-	_compact_step(r, sp)
-	_feed_flush(r, sp)
-	_reap(r)
+_stream_hint :: proc(r: ^Relay_Core, ns: rawptr, id: Stream_Id) -> (length: i64, base: i64, exists: bool) {
+	if r.store.stream_hint != nil {
+		return r.store.stream_hint(r.store.data, ns, id)
+	}
+	l, b, e, err := r.store.stream_probe(r.store.data, ns, id)
+	return l, b, e && err == .None
 }
 
 @(private)
-_compact_abort :: proc(r: ^Relay, sp: ^Space_State) {
-	if sp.compact_timer != 0 {
-		prim.timer_cancel(r.loop, sp.compact_timer)
-		sp.compact_timer = 0
-	}
+_compact_abort :: proc(r: ^Relay_Core, sp: ^Space_State) {
+	_core_unyield(r, sp)
 	clear(&sp.compact_buf)
 	if sp.compact_it != nil {
 		r.store.list_end(r.store.data, sp.compact_it)
@@ -834,7 +829,7 @@ _compact_abort :: proc(r: ^Relay, sp: ^Space_State) {
 }
 
 @(private)
-_compact_switch :: proc(r: ^Relay, sp: ^Space_State) {
+_compact_switch :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	old := sp.feed
 	old_end := _feed_end(sp)
 	sp.feed = sp.next_feed
@@ -842,6 +837,7 @@ _compact_switch :: proc(r: ^Relay, sp: ^Space_State) {
 	sp.feed_epoch = sp.next_epoch
 	sp.feed_base = old_end
 	sp.feed_len = sp.feed.length
+	sp.feed_folded = sp.feed_len
 	sp.phase = .Idle
 	sp.freeze = false
 	for f in sp.feeders {

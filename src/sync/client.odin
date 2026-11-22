@@ -38,6 +38,7 @@ Event_Kind :: enum u8 {
 	Pulled,
 	Served,
 	Unserved,
+	Accounted,
 }
 
 Event :: struct {
@@ -547,6 +548,15 @@ client_forget :: proc(c: ^Client, keys: []Object_Key) -> Error {
 	return .None
 }
 
+client_account :: proc(c: ^Client) -> Error {
+	b := _client_buf(c)
+	start := frame_begin(b, .Account) or_return
+	w := prim.writer(b)
+	frame_end(b, start, &w) or_return
+	_await_add(c, cast([32]u8)reserved_id(ACCOUNT_TAG, 0))
+	return .None
+}
+
 client_drop :: proc(c: ^Client, id: Stream_Id) -> Error {
 	b := _client_buf(c)
 	start := frame_begin(b, .Drop) or_return
@@ -749,6 +759,9 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.time = get_i64(&r)
 		ev.usage = get_i64(&r)
 		ev.quota = get_i64(&r)
+		if prim.reader_remaining(&r) >= 8 {
+			ev.tag = prim.read_u64le(&r)
+		}
 	case .Listing:
 		ev.kind = .Listing
 		ev.cursor = i64(prim.read_u64le(&r))
@@ -809,6 +822,13 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.id = get_id32(&r)
 		ev.at = get_i64(&r)
 		ev.length = get_i64(&r)
+	case .Accounted:
+		ev.kind = .Accounted
+		if len(it.data) < ACCOUNTED_LEN {
+			return .Protocol
+		}
+		ev.data = it.data
+		_await_done(c, cast([32]u8)reserved_id(ACCOUNT_TAG, 0))
 	case .Unserved:
 		ev.kind = .Unserved
 		prim.read_fixed(&r, ev.device[:])

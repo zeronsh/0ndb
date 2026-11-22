@@ -1,10 +1,9 @@
-#+build linux, darwin, windows
 package osync
 
 RELAY_OBSERVE_MAX :: 1 << 20
 
 @(private)
-_relay_observe :: proc(r: ^Relay, sp: ^Space_State, st: ^Stream_State, from, to: i64) {
+_relay_observe :: proc(r: ^Relay_Core, sp: ^Space_State, st: ^Stream_State, from, to: i64) {
 	if r.auth.observe == nil || to <= from || to - from > RELAY_OBSERVE_MAX || st.h == nil {
 		return
 	}
@@ -24,7 +23,7 @@ _relay_observe :: proc(r: ^Relay, sp: ^Space_State, st: ^Stream_State, from, to:
 	}
 }
 
-relay_revoke :: proc(r: ^Relay, space: Space_Id, participant: Device_Id) -> int {
+relay_revoke :: proc(r: ^Relay_Core, space: Space_Id, participant: Device_Id) -> int {
 	n := 0
 	for c in r.conns {
 		if c == nil || c.dead || c.closing || c.space == nil {

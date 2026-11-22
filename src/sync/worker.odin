@@ -53,6 +53,7 @@ Worker :: struct {
 	data:      rawptr,
 	inline_q:  [dynamic]^Job,
 	group:     Group_Commit,
+	before:    proc(data: rawptr),
 	allocator: runtime.Allocator,
 }
 
@@ -168,6 +169,9 @@ _worker_ready :: proc(l: ^prim.Loop, fd: prim.Fd, events: prim.Events, data: raw
 		w.inline_q = make([dynamic]^Job, w.allocator)
 		if w.group.begin != nil {
 			w.group.begin(w.group.data)
+		}
+		if w.before != nil {
+			w.before(w.data)
 		}
 		for j in jobs {
 			_job_run(j)

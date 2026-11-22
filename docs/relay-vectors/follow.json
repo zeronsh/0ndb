@@ -1,0 +1,115 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "follow",
+  "summary": "Follow, watch (Created), live Data pushes, FOLLOW_END, Unfollow and reserved stream ids.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "alice", "local": false, "binding": "b1fa710aa2a09775cd76b02f8eeafb272113b72286d0b923dbdc29c2892d9939f40f70a50b1b37825aad4f0b3a3e746214e6a000b103f023869da841b7d63535",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "64010000010304ae0845c662458fe5c3f634540dc3d8e58a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca6f60bc1e1e13de231d22bca579443bdad450a0b381d376355ce88c7e553eee70ea4aa0c8e5ebcc102f5cd29463a4d2169b021062a90a1dce5616c295efedc0701ef014d0101131415161718191a1b1c1d1e1f2021228a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000a8da769b010000718a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000079e84601e9dc05232731b299169f8dcf29392f098b0866458e5b39b5a5539f9ef045124e1de06aad741761ea9b7c9765464cbd9287ce2e753beae20595aa0f02", "comment": "Hello",
+     "out": {
+       "alice": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "bob", "local": false, "binding": "2ca338b55373211d8e822b62ef7e3e60dd75617ca279815ca1051ffa58bd3b8eab687570ab0aab51a75df1ba38dca13dbf46749df30826eb75cd0c68ce4abf83",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "84010000010304ae0845c662458fe5c3f634540dc3d8e58139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394e9bf63416c205cb0e4c7bb19a3f5f50201117f175e15a44f20a7bc67174e322ec275377872c7058c47e0e2132a23145c857c343e375425f7e281ca9f829cc503018f024d0102ae0845c662458fe5c3f634540dc3d8e58a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c010187881bea022fadb8c6237ae26263d65c3a774d6fccd84a8c5ea6a447bcabc3d900a8da769b010000718139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394000201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006d9d3e5f1de014cfe23dafd863ca2c385b2f16f05953aa170b8ba5db742485a0ad18bed44708f48d52b7330b7e27a4abd1359d71b134904d488b8cdbcb66c40a", "comment": "Hello",
+     "out": {
+       "bob": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4400000003ccf77c94730e0988a300194c0f423579010101010101010101010101010101010000000000000000040000004e9cf27e9268a667a43452f19b1833ef7a65726f04000000",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579010101010101010101010101010101011c00000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "ae0845c662458fe5c3f634540dc3d8e5", "id": "ccf77c94730e0988a300194c0f42357901010101010101010101010101010101", "at": 0, "len": 28, "result": "None"}]},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006010100ccf77c94730e0988a300194c0f423579010101010101010101010101010101010000000000000000", "comment": "Follow with watch from 0",
+     "out": {
+       "bob": [
+         {"kind": "Length", "frame": "2a000000890100ccf77c94730e0988a300194c0f423579010101010101010101010101010101011c00000000000000"},
+         {"kind": "Data", "frame": "4c00000085ccf77c94730e0988a300194c0f4235790101010101010101010101010101010100000000000000001c00000000000000040000004e9cf27e9268a667a43452f19b1833ef7a65726f04000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4300000003ccf77c94730e0988a300194c0f423579010101010101010101010101010101011c0000000000000003000000f92509c5f10e83c5c19eccdb9c99aa506f6e6503000000",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable", "comment": "followers get the new bytes",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579010101010101010101010101010101013700000000000000"}],
+       "bob": [
+         {"kind": "Data", "frame": "4b00000085ccf77c94730e0988a300194c0f423579010101010101010101010101010101011c00000000000000370000000000000003000000f92509c5f10e83c5c19eccdb9c99aa506f6e6503000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "ae0845c662458fe5c3f634540dc3d8e5", "id": "ccf77c94730e0988a300194c0f42357901010101010101010101010101010101", "at": 28, "len": 27, "result": "None"}]},
+    {"step": "send", "conn": "alice", "bytes": "4a00000003ccf77c94730e0988a300194c0f4235790202020202020202020202020202020200000000000000000a00000081a63087996b7e299aeb607fd4f9a4d56e65772073747265616d0a000000",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable", "comment": "watchers get Created",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579020202020202020202020202020202022200000000000000"}],
+       "bob": [
+         {"kind": "Created", "frame": "280000008accf77c94730e0988a300194c0f423579020202020202020202020202020202022200000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "ae0845c662458fe5c3f634540dc3d8e5", "id": "ccf77c94730e0988a300194c0f42357902020202020202020202020202020202", "at": 0, "len": 34, "result": "None"}]},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006000100ccf77c94730e0988a300194c0f42357902020202020202020202020202020202ffffffffffffffff", "comment": "Follow from the end",
+     "out": {
+       "bob": [
+         {"kind": "Length", "frame": "2a000000890100ccf77c94730e0988a300194c0f423579020202020202020202020202020202022200000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4400000003ccf77c94730e0988a300194c0f423579020202020202020202020202020202022200000000000000040000000c4d5f46d9167349441c9d68de234eba6d6f726504000000",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579020202020202020202020202020202023e00000000000000"}],
+       "bob": [
+         {"kind": "Data", "frame": "4c00000085ccf77c94730e0988a300194c0f4235790202020202020202020202020202020222000000000000003e00000000000000040000000c4d5f46d9167349441c9d68de234eba6d6f726504000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "ae0845c662458fe5c3f634540dc3d8e5", "id": "ccf77c94730e0988a300194c0f42357902020202020202020202020202020202", "at": 34, "len": 28, "result": "None"}]},
+    {"step": "send", "conn": "bob", "bytes": "22000000070100ccf77c94730e0988a300194c0f42357901010101010101010101010101010101", "comment": "Unfollow",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4600000003ccf77c94730e0988a300194c0f42357901010101010101010101010101010101370000000000000006000000165011b0cc8c703c167c90951f28c61f756e7365656e06000000",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable", "comment": "an unfollowed stream sends nothing",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579010101010101010101010101010101015500000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "ae0845c662458fe5c3f634540dc3d8e5", "id": "ccf77c94730e0988a300194c0f42357901010101010101010101010101010101", "at": 55, "len": 30, "result": "None"}]},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006000100ffffffffffffffffffffffffffffffff010000000000000000000000000000000000000000000000", "comment": "Follow a reserved id",
+     "out": {
+       "bob": [
+         {"kind": "Refused", "frame": "210000008c05ffffffffffffffffffffffffffffffff01000000000000000000000000000000"},
+         {"kind": "Length", "frame": "02000000890000"}]},
+     "closed": [],
+     "store": []}
+  ],
+  "state": {
+  }
+}

@@ -54,6 +54,7 @@ OPS := []Op {
 	{41, "space.list", {}, "spaces:[Space]", op_space_list},
 	{42, "space.info", {SPACE}, "space:Space", op_space_info},
 	{43, "space.set_relay", {SPACE, {"relay", .Str, nil}, {"relay_key", .Bytes, nil}}, "", op_space_set_relay},
+	{140, "space.relay_account", {SPACE, {"refresh", .Bool, nil}}, "RelayAccount", op_space_relay_account},
 	{44, "space.open", {SPACE}, "", op_space_open},
 	{45, "space.close", {SPACE}, "", op_space_close},
 	{46, "space.join_shared", {SPACE, {"name", .Str, nil}, {"relay", .Str, nil}, {"relay_key", .Bytes, nil}}, "", op_space_join_shared},

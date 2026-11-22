@@ -42,6 +42,7 @@ Kind :: enum u8 {
 	Fill      = 0x12,
 	Pull      = 0x13,
 	Serve     = 0x14,
+	Account   = 0x15,
 	Welcome   = 0x81,
 	Listing   = 0x82,
 	Appended  = 0x83,
@@ -67,6 +68,7 @@ Kind :: enum u8 {
 	Pulled    = 0x97,
 	Served    = 0x98,
 	Unserved  = 0x99,
+	Accounted = 0x9a,
 }
 
 Code :: enum u8 {
@@ -119,6 +121,10 @@ SERVE_LEN_MASK :: SERVE_NONE - 1
 PIPES_MAX :: 64
 PIPE_HIGH :: 4 * SERVE_MAX
 BULK_FIXED_MAX :: SERVE_FIXED
+ACCOUNT_TAG :: 5
+ACCOUNTED_LEN :: 14 * 8
+FEATURE_ACCOUNT :: u64(1)
+RELAY_FEATURES :: FEATURE_ACCOUNT
 
 Feed_Pattern_Kind :: enum u8 {
 	Prefix = 1,
@@ -278,7 +284,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 	bulk := false
 	if p.relay {
 		#partial switch k {
-		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Direct, .Note, .Pull:
+		case .Hello, .List, .Read, .Tail, .Follow, .Unfollow, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Direct, .Note, .Pull, .Account:
 		case .Append:
 			bulk, fixed, limit = true, APPEND_FIXED, APPEND_MAX
 		case .Fill:
@@ -292,7 +298,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 		}
 	} else {
 		#partial switch k {
-		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Directed, .Undelivered, .Noted, .Hollow, .Pulled, .Unserved:
+		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Directed, .Undelivered, .Noted, .Hollow, .Pulled, .Unserved, .Accounted:
 		case .Data:
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
 		case .Served:
@@ -365,6 +371,27 @@ reserved_id :: proc "contextless" (tag: u8, epoch: u64) -> (id: Stream_Id) {
 	id[16] = tag
 	prim.put_u64le(id[24:], epoch)
 	return
+}
+
+accounted_encode :: proc "contextless" (s: Relay_Space_Stats, out: []u8) {
+	v := [14]u64{u64(max(s.stored, 0)), u64(max(s.quota, 0)), s.appends, s.bytes_in, s.notes, s.fills, s.pulls, s.piped_bytes, s.store.writes, s.store.write_bytes, u64(max(s.store.pending, 0)), u64(max(s.store.day, 0)), s.store.day_bytes, s.store.total_bytes}
+	for x, i in v {
+		prim.put_u64le(out[i * 8:], x)
+	}
+}
+
+accounted_decode :: proc "contextless" (data: []u8) -> (s: Relay_Space_Stats, ok: bool) {
+	if len(data) < ACCOUNTED_LEN {
+		return
+	}
+	v: [14]u64
+	for i in 0 ..< 14 {
+		v[i] = min(prim.get_u64le(data[i * 8:]), u64(max(i64)))
+	}
+	s.stored, s.quota = i64(v[0]), i64(v[1])
+	s.appends, s.bytes_in, s.notes, s.fills, s.pulls, s.piped_bytes = v[2], v[3], v[4], v[5], v[6], v[7]
+	s.store = {writes = v[8], write_bytes = v[9], pending = i64(v[10]), day = i64(v[11]), day_bytes = v[12], total_bytes = v[13]}
+	return s, true
 }
 
 feed_length :: proc "contextless" (word: u64) -> (length: i64, hollow: bool, ok: bool) {

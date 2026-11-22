@@ -19,16 +19,18 @@ File_Store :: struct {
 	root:      string,
 	loop:      ^prim.Loop,
 	worker:    Worker,
+	udirty:    [dynamic]^_Fns,
 	scratch:   []u8,
 	allocator: runtime.Allocator,
 }
 
 @(private)
 _Fns :: struct {
-	dir:   string,
-	usage: i64,
-	ufd:   prim.Fd,
-	useq:  u64,
+	dir:    string,
+	usage:  i64,
+	ufd:    prim.Fd,
+	useq:   u64,
+	udirty: bool,
 }
 
 @(private)
@@ -117,11 +119,15 @@ file_store_init :: proc(fs: ^File_Store, l: ^prim.Loop, vfs: prim.Vfs, root: str
 		return err
 	}
 	fs.worker.group = group
+	fs.worker.before = _fs_usage_flush
+	fs.udirty = make([dynamic]^_Fns, allocator)
 	return .None
 }
 
 file_store_destroy :: proc(fs: ^File_Store) {
 	worker_destroy(&fs.worker)
+	_fs_usage_flush(fs)
+	delete(fs.udirty)
 	delete(fs.scratch, fs.allocator)
 	delete(fs.root, fs.allocator)
 	fs^ = {}
@@ -159,6 +165,7 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		object_extent = _fs_object_extent,
 		object_close = _fs_object_close,
 		object_remove = _fs_object_remove,
+		objects = _fs_objects,
 	}
 }
 
@@ -199,6 +206,15 @@ _fs_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err: 
 _fs_ns_close :: proc(data: rawptr, h: rawptr) {
 	fs := cast(^File_Store)data
 	ns := cast(^_Fns)h
+	if ns.udirty {
+		_usage_save(fs, ns)
+		for i := 0; i < len(fs.udirty); i += 1 {
+			if fs.udirty[i] == ns {
+				unordered_remove(&fs.udirty, i)
+				break
+			}
+		}
+	}
 	if ns.ufd >= 0 {
 		prim.close_file(fs.vfs, ns.ufd)
 	}
@@ -765,6 +781,50 @@ _fs_object_remove :: proc(data: rawptr, h: rawptr, key: Object_Key, done: Storag
 }
 
 @(private)
+_fs_objects :: proc(data: rawptr, h: rawptr, out: ^[dynamic]Object_Key) -> Error {
+	fs := cast(^File_Store)data
+	ns := cast(^_Fns)h
+	odir, _ := prim.path_join(context.temp_allocator, ns.dir, "o")
+	top: prim.Dir
+	if prim.dir_open(fs.vfs, &top, odir, fs.allocator) != .None {
+		return .None
+	}
+	defer prim.dir_close(fs.vfs, &top)
+	for {
+		e, more, err := prim.dir_next(fs.vfs, &top)
+		if !more || err != .None {
+			break
+		}
+		if len(e.name) != 2 {
+			continue
+		}
+		sub, _ := prim.path_join(context.temp_allocator, odir, e.name)
+		d: prim.Dir
+		if prim.dir_open(fs.vfs, &d, sub, fs.allocator) != .None {
+			continue
+		}
+		for {
+			f, fmore, ferr := prim.dir_next(fs.vfs, &d)
+			if !fmore || ferr != .None {
+				break
+			}
+			name := [64]u8{}
+			if len(f.name) != 62 {
+				continue
+			}
+			copy(name[:2], e.name)
+			copy(name[2:], f.name)
+			k: Object_Key
+			if prim.hex_decode(k[:], name[:]) {
+				append(out, k)
+			}
+		}
+		prim.dir_close(fs.vfs, &d)
+	}
+	return .None
+}
+
+@(private)
 _fs_object_read :: proc(data: rawptr, o: rawptr, at: i64, dst: []u8) -> (int, Error) {
 	fs := cast(^File_Store)data
 	ob := cast(^_Fobj)o
@@ -864,7 +924,24 @@ _usage_add :: proc(fs: ^File_Store, ns: ^_Fns, delta: i64) {
 		return
 	}
 	ns.usage = max(ns.usage + delta, 0)
-	_usage_save(fs, ns)
+	if fs.worker.limit > 0 {
+		_usage_save(fs, ns)
+		return
+	}
+	if !ns.udirty {
+		ns.udirty = true
+		append(&fs.udirty, ns)
+	}
+}
+
+@(private)
+_fs_usage_flush :: proc(data: rawptr) {
+	fs := cast(^File_Store)data
+	for ns in fs.udirty {
+		ns.udirty = false
+		_usage_save(fs, ns)
+	}
+	clear(&fs.udirty)
 }
 
 @(private)

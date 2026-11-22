@@ -101,6 +101,7 @@ src/
   capi/      the C ABI (`lib0ndb`, `0ndb.h`)
   cli/       the reference consumer
 tests/       convergence, fstree, sim
+tools/       relayvec: relay conformance vectors (docs/relay-vectors) and their checker
 ```
 
 Packages import each other with relative paths. Build:
@@ -729,6 +730,19 @@ Mechanisms behind plug points (`Keyring`, `Credentials`, `Transport`,
 with sharing by wrapping, relay redaction, signed chains, padding and
 checkpoint bundles, as before, plus:
 
+- **The relay is a sans-IO core with thin hosts.** `Relay_Core`
+  (`relay_core.odin`, `relay_feed.odin`, `relay_hollow.odin`,
+  `relay_direct.odin`, `relay_revoke.odin`) takes connections, bytes, storage
+  completions and a clock, and emits bytes and `Relay_Storage` calls; it owns
+  no socket, loop or timer and builds for `js_wasm32`. `0ndb relay`
+  (`relay.odin`) is the socket host (Noise, WebSocket, kernel TLS, `sendfile`,
+  rate limits, the pack); the simulator drives the core directly, so every
+  host gets the same guarantees. `docs/relay-protocol.md` is the normative
+  protocol, so a relay can be implemented anywhere (a Durable Object per
+  space, a small TypeScript server), and `docs/relay-vectors/` holds
+  byte-exact transcripts produced and checked by `tools/relayvec`, natively
+  and under wasm.
+
 - **Announce feeds.** For each space the relay core keeps an append-only feed
   of `(segment, new length)` entries, one per append, filtered per principal
   by its capabilities when served. A participant follows one feed per space
@@ -1198,10 +1212,16 @@ Relay cost tracks the reachable information, not the activity. Items marked
 - **Relay writes** are host-chosen and never protocol-visible: an append is
   acknowledged once durable in the host's durable buffer (group-committed
   local files for the reference relay, Durable Object storage for a DO host)
-  and any object-store flush is coalesced per space and asynchronous. The
-  relay counts per space stored bytes, notes, fills, pulls and forwarded
-  bytes (`Relay_Stats`); (planned) object-store writes and bytes per day
-  through a relay query and the C API.
+  and any object-store flush is coalesced per space and asynchronous. With
+  `--objects` the reference relay's tiered store writes one batch object per
+  space per window (`--flush-ms`, default 2000) or every `--flush-mb` MiB
+  (default 8); a per-space manifest in the pack, marked dirty in the same
+  group commit as a window's first change, makes the tier crash-safe, and a
+  redaction rewrites the batch objects that hold the range. The relay counts
+  per space stored bytes, appends, notes, fills, pulls, piped bytes,
+  object-store writes and bytes, pending bytes and client bytes per UTC day
+  (`Relay_Space_Stats`), served to members by the `Account` frame (feature
+  bit 0 of `Welcome`) and to embedders by the C API op `space.relay_account`.
 
 ### Relay messages for storage classes
 

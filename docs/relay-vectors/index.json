@@ -1,0 +1,21 @@
+[
+  {"name": "hello", "steps": 19, "summary": "Hello acceptance and every rejection: version, signature binding, unknown credential, non-member, frame before Hello, empty Hello, local sockets skip the signature, inadmissible proof."},
+  {"name": "append", "steps": 19, "summary": "Appends are acknowledged only once durable; conflicts, zero-length appends, ownership, reads, tails, reads past the end and frames split across deliveries."},
+  {"name": "quota", "steps": 10, "summary": "Quota refusals for appends and objects count stored bytes plus in-flight reservations; Account reports the space's accounting."},
+  {"name": "follow", "steps": 18, "summary": "Follow, watch (Created), live Data pushes, FOLLOW_END, Unfollow and reserved stream ids."},
+  {"name": "feed", "steps": 25, "summary": "The announce feed: snapshot from 0, live entries, resume at aligned and unaligned offsets, past-the-end, filters and additive filters."},
+  {"name": "list", "steps": 10, "summary": "Listing returns each stream once, newest first, with its current length."},
+  {"name": "probe", "steps": 6, "summary": "Probe answers lengths for streams, unknown streams and the feed, preceded by Hollow for based segments."},
+  {"name": "objects", "steps": 13, "summary": "Put, deduplicated Put, Get, Missing, Forget and reader refusals."},
+  {"name": "drop", "steps": 18, "summary": "Drop notifies followers and watchers once, appends FEED_DROPPED, refuses non-owners and busy streams."},
+  {"name": "redact", "steps": 16, "summary": "Redaction zero-fills whole records in place, keeps offsets, logs the range in the feed, refuses readers and misaligned ranges."},
+  {"name": "hollow", "steps": 21, "summary": "Hollow segments: Note, Noted, Hollow to followers and readers, Fill backward, mismatched Fill, appends after a hollow prefix."},
+  {"name": "pipe", "steps": 18, "summary": "Peer pipe: Pull, Pulled, Serve, Served, final, none, unmatched frames, absent and self holders, duplicate tags, holder disconnect."},
+  {"name": "presence", "steps": 17, "summary": "Presence snapshots and up/down transitions per device across several connections; direct messages and Undelivered."},
+  {"name": "membership", "steps": 16, "summary": "Authorization follows the signed membership log: an Add appended to a members stream admits, a proof by a non-member is ignored, a Remove revokes live connections."},
+  {"name": "account", "steps": 15, "summary": "Account namespace: request and account credentials may only see presence and exchange direct messages; requesters are limited to two connections."},
+  {"name": "embedder", "steps": 16, "summary": "An embedder authorizer maps unknown credential types to principals; the relay enforces the access it grants."},
+  {"name": "malformed", "steps": 39, "summary": "Malformed input is fatal: oversize frames, unknown kinds, relay-only kinds, short payloads, count mismatches, inverted ranges, bad bulk headers, oversize direct payloads, a second Hello; bytes after the error are ignored."},
+  {"name": "compaction", "steps": 34, "summary": "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base."},
+  {"name": "limits", "steps": 10, "summary": "Per-principal connection limit and per-connection follow limit."}
+]

@@ -29,6 +29,19 @@ _active_id :: #force_inline proc "contextless" (p: ^Pack) -> u32 {
 }
 
 @(private)
+_active_garbage :: proc "contextless" (p: ^Pack) -> bool {
+	if p.active < 0 || p.opts.compact_ratio <= 0 {
+		return false
+	}
+	data := _log_tail(p) - CONT_HDR
+	if data < p.opts.container_size / 16 {
+		return false
+	}
+	live := max(p.conts[p.active].live, 0)
+	return 1.0 - f64(live) / f64(data) >= p.opts.compact_ratio
+}
+
+@(private)
 _log_tail :: #force_inline proc "contextless" (p: ^Pack) -> i64 {
 	return p.buf_base + i64(len(p.buf))
 }
@@ -218,7 +231,7 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 		p.dirsync_pending = false
 	}
 	next := -1
-	if _log_tail(p) + 64 >= p.opts.container_size {
+	if _log_tail(p) + 64 >= p.opts.container_size || _active_garbage(p) {
 		idx, nerr := _new_container(p, true)
 		if nerr != .None {
 			return false, _poison(p, nerr)

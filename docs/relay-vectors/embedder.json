@@ -1,0 +1,98 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "embedder",
+  "summary": "An embedder authorizer maps unknown credential types to principals; the relay enforces the access it grants.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "alice", "local": false, "binding": "b1fa710aa2a09775cd76b02f8eeafb272113b72286d0b923dbdc29c2892d9939f40f70a50b1b37825aad4f0b3a3e746214e6a000b103f023869da841b7d63535",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "64010000010304a690e6e323c88fc604a7dc2602c4b4e28a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca6f60bc1e1e13de231d22bca579443bdad450a0b381d376355ce88c7e553eee70ea4aa0c8e5ebcc102f5cd29463a4d2169b021062a90a1dce5616c295efedc0701ef014d01011e1f202122232425262728292a2b2c2d8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000a8da769b010000718a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006661378334f3b03735791a0bbffc5e044e77152857c1e88980e0d6f7973cbac059ccc8f910f56969b40d3cc07a1c66dc6bd8230c88d3bfa11eb1b5223b8b950f", "comment": "Hello",
+     "out": {
+       "alice": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4700000003ccf77c94730e0988a300194c0f42357901010101010101010101010101010101000000000000000007000000df64ea5469dbdb836e0f91c4a983637a76697369626c6507000000",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579010101010101010101010101010101011f00000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "a690e6e323c88fc604a7dc2602c4b4e2", "id": "ccf77c94730e0988a300194c0f42357901010101010101010101010101010101", "at": 0, "len": 31, "result": "None"}]},
+    {"step": "connect", "conn": "reader", "local": false, "binding": "44216deda19509f8a529a8c11c1e84334de8457bcba69785cddfd8e3c27192bb1074f5d744f8ede708a2a901fbc49f65c6f491a73a9e7884212cf7c59086fe87",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "reader", "bytes": "2300000001037ea690e6e323c88fc604a7dc2602c4b4e2ea5c789d478cc0b4e499f59d5a18720c01", "comment": "embedder credential granting read",
+     "out": {
+       "reader": [
+         {"kind": "Welcome", "frame": "2100000081030000faed517286181f0000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "reader", "bytes": "3000000004ccf77c94730e0988a300194c0f4235790101010101010101010101010101010100000000000000006400000000000000", "comment": "read is granted",
+     "out": {
+       "reader": [
+         {"kind": "Data", "frame": "4f00000085ccf77c94730e0988a300194c0f4235790101010101010101010101010101010100000000000000001f0000000000008007000000df64ea5469dbdb836e0f91c4a983637a76697369626c6507000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "reader", "bytes": "4100000003ea5c789d478cc0b4e499f59d5a18720c0101010101010101010101010101010100000000000000000100000011cdb280646cf0eaeeee22ecc001745c7801000000", "comment": "append is not",
+     "out": {
+       "reader": [
+         {"kind": "Refused", "frame": "210000008c05ea5c789d478cc0b4e499f59d5a18720c01010101010101010101010101010101"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "reader", "bytes": "2100000008010003020504070609080b0a0d0c0f0e111013121514171619181b1a1d1c1f1e78", "comment": "objects are not",
+     "out": {
+       "reader": [
+         {"kind": "Refused", "frame": "210000008c05010003020504070609080b0a0d0c0f0e111013121514171619181b1a1d1c1f1e"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "writer", "local": false, "binding": "c63182c6c701c56e445b92d704d5e1212ff60a2422dd8ed05dbd6662676df57e8d52545880ec3e8686d9b8f978f0200572803d06195073fc5c3a9b1289c5d704",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "writer", "bytes": "2300000001037ea690e6e323c88fc604a7dc2602c4b4e2ea5c789d478cc0b4e499f59d5a18720c06", "comment": "embedder credential granting own appends and objects",
+     "out": {
+       "writer": [
+         {"kind": "Welcome", "frame": "2100000081030000faed517286181f0000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "writer", "bytes": "4400000003ea5c789d478cc0b4e499f59d5a18720c0101010101010101010101010101010100000000000000000400000045092a7b3de7b26f8187fc85aafbb7756d696e6504000000", "comment": "append to its own stream",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "writer", "bytes": "2100000008010003020504070609080b0a0d0c0f0e111013121514171619181b1a1d1c1f1e78", "comment": "Put",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable",
+     "out": {
+       "writer": [
+         {"kind": "Stored", "frame": "2000000086010003020504070609080b0a0d0c0f0e111013121514171619181b1a1d1c1f1e"},
+         {"kind": "Appended", "frame": "2800000083ea5c789d478cc0b4e499f59d5a18720c010101010101010101010101010101011c00000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "a690e6e323c88fc604a7dc2602c4b4e2", "id": "ea5c789d478cc0b4e499f59d5a18720c01010101010101010101010101010101", "at": 0, "len": 28, "result": "None"},
+       {"op": "put", "space": "a690e6e323c88fc604a7dc2602c4b4e2", "id": "010003020504070609080b0a0d0c0f0e111013121514171619181b1a1d1c1f1e", "at": 0, "len": 1, "result": "None"}]},
+    {"step": "send", "conn": "writer", "bytes": "3000000004ccf77c94730e0988a300194c0f4235790101010101010101010101010101010100000000000000006400000000000000", "comment": "read is not granted",
+     "out": {
+       "writer": [
+         {"kind": "Refused", "frame": "210000008c05ccf77c94730e0988a300194c0f42357901010101010101010101010101010101"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "writer", "bytes": "0000000015", "comment": "Account needs List access",
+     "out": {
+       "writer": [
+         {"kind": "Refused", "frame": "210000008c05ffffffffffffffffffffffffffffffff05000000000000000000000000000000"}]},
+     "closed": [],
+     "store": []}
+  ],
+  "state": {
+  }
+}

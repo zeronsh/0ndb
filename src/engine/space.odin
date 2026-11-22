@@ -208,6 +208,21 @@ space_catalog :: proc(e: ^Engine, id: prim.Id) -> Object {
 	return Object{id, _catalog_id(id)}
 }
 
+space_relay_account :: proc(e: ^Engine, id: prim.Id, refresh: bool) -> (st: osync.Relay_Space_Stats, seen: bool, err: Error) {
+	context = context_for(e)
+	sp, ok := e.spaces[id]
+	if !ok {
+		return {}, false, .Not_Found
+	}
+	if !sp.repl_on {
+		return {}, false, .None
+	}
+	if refresh {
+		osync.replicator_account(&sp.repl)
+	}
+	return sp.repl.account, sp.repl.accounted, .None
+}
+
 @(private)
 _space_info :: proc(sp: ^Space) -> Space_Info {
 	info := Space_Info{id = sp.id, name = sp.name, relay = sp.relay, relay_public = sp.relay_public, mode = sp.mode, open = sp.open, connected = sp.connected, catalog = sp.catalog}

@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "../capi/api"
 import eng "../engine"
@@ -17,6 +18,7 @@ Relay_Main :: struct {
 	al:       osync.Allow,
 	ma:       osync.Member_Authorizer,
 	ca:       eng.Cap_Authorizer,
+	objects:  osync.Dir_Object_Store,
 	sig:      Signals,
 	stopping: bool,
 	settle:   prim.Timer,
@@ -63,7 +65,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 			fmt.println(hex_of(k[:]))
 			return 0
 		case:
-			return usage_error("usage: 0ndb relay [allow SPACE [QUOTA] | key] [--listen ADDR,...] [--dir DIR] [--open] [--quota BYTES]")
+			return usage_error("usage: 0ndb relay [allow SPACE [QUOTA] | key] [--listen ADDR,...] [--dir DIR] [--open] [--quota BYTES] [--objects DIR [--flush-ms MS] [--flush-mb MB]]")
 		}
 	}
 	m := new(Relay_Main)
@@ -99,6 +101,27 @@ cmd_relay :: proc(a: ^Args) -> int {
 	cfg.open = flag_bool(a, "open")
 	cfg.default_quota = quota
 	cfg.authorizer = eng.cap_authorizer(&m.ca)
+	if odir, ok := flag_value(a, "objects"); ok {
+		if prim.mkdir_all(prim.os_vfs(), odir, 0o700) != .None {
+			return report_error(.Io, "cannot create %s", odir)
+		}
+		m.objects = osync.Dir_Object_Store{vfs = prim.os_vfs(), root = strings.clone(odir)}
+		cfg.objects = osync.dir_object_store(&m.objects)
+		if v, vok := flag_value(a, "flush-ms"); vok {
+			n, nok := strconv.parse_i64(v)
+			if !nok || n <= 0 {
+				return usage_error("--flush-ms takes a positive number of milliseconds")
+			}
+			cfg.flush_ms = n
+		}
+		if v, vok := flag_value(a, "flush-mb"); vok {
+			n, nok := strconv.parse_i64(v)
+			if !nok || n <= 0 {
+				return usage_error("--flush-mb takes a positive number of MiB")
+			}
+			cfg.flush_bytes = n << 20
+		}
+	}
 	if ierr := osync.relay_init(&m.relay, &m.loop, cfg); ierr != .None {
 		if ierr == .Busy {
 			return report_error(.Busy, "another relay is running in %s", dir)
@@ -135,6 +158,9 @@ cmd_relay :: proc(a: ^Args) -> int {
 	fmt.printfln("0ndb relay %s on %s", VERSION, strings.join(all[:], " ", context.temp_allocator))
 	fmt.printfln("relay key %s", hex_of(k[:]))
 	fmt.printfln("mode %s · kernel tls %v · storage pack in %s", "open" if cfg.open else "allow-list", cfg.kernel_tls, dir)
+	if cfg.objects.put != nil {
+		fmt.printfln("object store %s · one write per space per %d ms or %d MiB", m.objects.root, cfg.flush_ms if cfg.flush_ms > 0 else osync.TIER_WINDOW_DEFAULT, (cfg.flush_bytes if cfg.flush_bytes > 0 else osync.TIER_BYTES_DEFAULT) >> 20)
+	}
 	os.flush(os.stdout)
 	for !m.stopping {
 		if prim.loop_step(&m.loop, true) != .None {
@@ -161,7 +187,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	osync.allow_destroy(&m.al)
 	signals_close(&m.sig)
 	prim.loop_destroy(&m.loop)
-	fmt.printfln("relay stopped (%d appends, %s in, %s out)", st.appends, bytes_human(i64(st.bytes_in)), bytes_human(i64(st.bytes_out)))
+	fmt.printfln("relay stopped (%d appends, %s in, %s out, %d object-store writes, %s)", st.appends, bytes_human(i64(st.bytes_in)), bytes_human(i64(st.bytes_out)), m.objects.puts, bytes_human(i64(m.objects.bytes)))
 	return 0
 }
 

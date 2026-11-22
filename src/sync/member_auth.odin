@@ -1,4 +1,3 @@
-#+build linux, darwin, windows
 package osync
 
 import "base:runtime"
@@ -49,6 +48,9 @@ member_authorizer_init :: proc(a: ^Member_Authorizer, vfs: prim.Vfs, dir: string
 	a.dir = _clone_string(dir, allocator) or_return
 	a.spaces = make(map[Space_Id]^Auth_Space, allocator)
 	a.revoked = make([dynamic]Device_Id, allocator)
+	if len(dir) == 0 {
+		return .None
+	}
 	if err := prim.mkdir_all(vfs, dir, 0o700); err != .None {
 		return _from_prim(err)
 	}
@@ -351,6 +353,9 @@ _auth_path :: proc(a: ^Member_Authorizer, space: Space_Id) -> string {
 
 @(private)
 _auth_persist :: proc(a: ^Member_Authorizer, s: ^Auth_Space, raw: []u8) -> Error {
+	if len(a.dir) == 0 {
+		return .None
+	}
 	path := _auth_path(a, s.id)
 	fd, oerr := prim.open_file(a.vfs, path, {.Write, .Create}, 0o600)
 	if oerr != .None {
@@ -404,7 +409,11 @@ _auth_space :: proc(a: ^Member_Authorizer, space: Space_Id) -> ^Auth_Space {
 	s.used = a.tick
 	membership_init(&s.m, space, a.allocator)
 	s.devices = make(map[Device_Id]int, a.allocator)
-	data, err := prim.read_file(a.vfs, _auth_path(a, space), context.temp_allocator)
+	data: []u8
+	err := prim.Error.Not_Found
+	if len(a.dir) > 0 {
+		data, err = prim.read_file(a.vfs, _auth_path(a, space), context.temp_allocator)
+	}
 	if err == .None {
 		pos := 0
 		for pos + 4 <= len(data) {
@@ -502,48 +511,4 @@ member_authorizer_active :: proc(a: ^Member_Authorizer, space: Space_Id, sign: P
 	}
 	m := &s.m.roster.members[idx]
 	return m.sign == sign && member_active(m, _now(a)) && m.role <= .Member && m.kind != .Runner && m.kind != .Guest
-}
-
-Relay_Auth :: struct {
-	allow:   Allow,
-	members: Member_Authorizer,
-}
-
-relay_auth_new :: proc(vfs: prim.Vfs, root: string, cfg: Relay_Config, store: Relay_Storage, allocator := context.allocator) -> (ra: ^Relay_Auth, err: Error) {
-	aerr: runtime.Allocator_Error
-	ra, aerr = new(Relay_Auth, allocator)
-	if aerr != nil {
-		return nil, .No_Memory
-	}
-	allow_path := cfg.allow_file
-	if len(allow_path) == 0 && len(root) > 0 {
-		allow_path, _ = prim.path_join(context.temp_allocator, root, "allow")
-	}
-	ap := _clone_string(allow_path, allocator) or_return
-	allow_init(&ra.allow, vfs, ap, allocator)
-	dir := "members"
-	if len(root) > 0 {
-		dir, _ = prim.path_join(context.temp_allocator, root, "members")
-	}
-	if e := member_authorizer_init(&ra.members, vfs, dir, {}, cfg.open, cfg.default_quota, cfg.clock, &ra.allow, allocator); e != .None {
-		allow_destroy(&ra.allow)
-		delete(ap, allocator)
-		free(ra, allocator)
-		return nil, e
-	}
-	ra.members.store = store
-	return ra, .None
-}
-
-relay_auth_free :: proc(ra: ^Relay_Auth, allocator := context.allocator) {
-	member_authorizer_destroy(&ra.members)
-	if len(ra.allow.path) > 0 {
-		delete(ra.allow.path, allocator)
-	}
-	allow_destroy(&ra.allow)
-	free(ra, allocator)
-}
-
-relay_storage :: proc "contextless" (r: ^Relay) -> Relay_Storage {
-	return r.store
 }

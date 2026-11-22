@@ -1,0 +1,115 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "append",
+  "summary": "Appends are acknowledged only once durable; conflicts, zero-length appends, ownership, reads, tails, reads past the end and frames split across deliveries.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "alice", "local": false, "binding": "b1fa710aa2a09775cd76b02f8eeafb272113b72286d0b923dbdc29c2892d9939f40f70a50b1b37825aad4f0b3a3e746214e6a000b103f023869da841b7d63535",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "6401000001030434349a2080558d96be4ecb2ef07c22f28a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca6f60bc1e1e13de231d22bca579443bdad450a0b381d376355ce88c7e553eee70ea4aa0c8e5ebcc102f5cd29463a4d2169b021062a90a1dce5616c295efedc0701ef014d01011112131415161718191a1b1c1d1e1f208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000a8da769b010000718a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c24ac25e20b498b7c8d158d50032e988a641cbe57487df996450d4c765e8dd56329cdfdea00aeb376099fd92e801065ed0c5cabd69d613ec54e1e29f0c36b004", "comment": "Hello",
+     "out": {
+       "alice": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "7100000003ccf77c94730e0988a300194c0f4235790101010101010101010101010101010100000000000000000c0000001446816d4f5f319f58cc5419cac9aedc6669727374207265636f72640c0000000d000000cec300f2654263fa45e5b2d1eeb67d557365636f6e64207265636f72640d000000", "comment": "Append two records at 0",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable", "comment": "Appended only after the write is durable",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579010101010101010101010101010101014900000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "34349a2080558d96be4ecb2ef07c22f2", "id": "ccf77c94730e0988a300194c0f42357901010101010101010101010101010101", "at": 0, "len": 73, "result": "None"}]},
+    {"step": "send", "conn": "alice", "bytes": "4500000003ccf77c94730e0988a300194c0f4235790101010101010101010101010101010100000000000000000500000072980561574c4049bd94fafe9a0c5281616761696e05000000", "comment": "Append at a stale offset",
+     "out": {
+       "alice": [
+         {"kind": "Conflict", "frame": "2800000084ccf77c94730e0988a300194c0f423579010101010101010101010101010101014900000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "durable", "comment": "the conflict re-announces the current length",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4300000003ccf77c94730e0988a300194c0f4235790202020202020202020202020202020205000000000000000300000020e84af0b1edf0700a245ebc5a0c802867617003000000", "comment": "Append at a non-zero offset to a new stream",
+     "out": {
+       "alice": [
+         {"kind": "Conflict", "frame": "2800000084ccf77c94730e0988a300194c0f423579020202020202020202020202020202020000000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "2800000003ccf77c94730e0988a300194c0f423579010101010101010101010101010101014900000000000000", "comment": "zero-length Append at the current length",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579010101010101010101010101010101014900000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "3000000004ccf77c94730e0988a300194c0f4235790101010101010101010101010101010100000000000000004900000000000000", "comment": "Read the whole stream",
+     "out": {
+       "alice": [
+         {"kind": "Data", "frame": "7900000085ccf77c94730e0988a300194c0f42357901010101010101010101010101010101000000000000000049000000000000800c0000001446816d4f5f319f58cc5419cac9aedc6669727374207265636f72640c0000000d000000cec300f2654263fa45e5b2d1eeb67d557365636f6e64207265636f72640d000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "3000000004ccf77c94730e0988a300194c0f4235790101010101010101010101010101010104000000000000001e00000000000000", "comment": "Read a sub-range",
+     "out": {
+       "alice": [
+         {"kind": "Data", "frame": "4a00000085ccf77c94730e0988a300194c0f42357901010101010101010101010101010101040000000000000049000000000000801446816d4f5f319f58cc5419cac9aedc6669727374207265636f"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "3000000004ccf77c94730e0988a300194c0f423579010101010101010101010101010101014e000000000000005200000000000000", "comment": "Read past the end",
+     "out": {
+       "alice": [
+         {"kind": "Data", "frame": "3000000085ccf77c94730e0988a300194c0f423579010101010101010101010101010101014e000000000000004900000000000080"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "2800000005ccf77c94730e0988a300194c0f423579010101010101010101010101010101010a00000000000000", "comment": "Tail 10 bytes",
+     "out": {
+       "alice": [
+         {"kind": "Data", "frame": "3a00000085ccf77c94730e0988a300194c0f423579010101010101010101010101010101013f0000000000000049000000000000807265636f72640d000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "3000000004ccf77c94730e0988a300194c0f4235790909090909090909090909090909090900000000000000006400000000000000", "comment": "Read a stream that does not exist",
+     "out": {
+       "alice": [
+         {"kind": "Data", "frame": "3000000085ccf77c94730e0988a300194c0f4235790909090909090909090909090909090900000000000000000000000000000080"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4800000003901205fc248766135dbfb4be1b06ca03010101010101010101010101010101010000000000000000080000006b89836286cdb597686214d01806ef0f6e6f74206d696e6508000000", "comment": "Append to another device's stream",
+     "out": {
+       "alice": [
+         {"kind": "Refused", "frame": "210000008c05901205fc248766135dbfb4be1b06ca0301010101010101010101010101010101"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4c0000", "comment": "first 3 bytes of an Append",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "0003ccf77c94730e0988a300194c0f4235790101010101010101010101010101010149000000000000000c0000005e", "comment": "header rest and part of the body",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "5a9a4c58437562303612cb2e4be8767468697264207265636f72640c000000", "comment": "the rest of the body",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "durable",
+     "out": {
+       "alice": [
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579010101010101010101010101010101016d00000000000000"}]},
+     "closed": [],
+     "store": [
+       {"op": "append", "space": "34349a2080558d96be4ecb2ef07c22f2", "id": "ccf77c94730e0988a300194c0f42357901010101010101010101010101010101", "at": 73, "len": 36, "result": "None"}]},
+    {"step": "send", "conn": "alice", "bytes": "3000000004ccf77c94730e0988a300194c0f423579010101010101010101010101010101014900000000000000ad000000000000002800000005ccf77c94730e0988a300194c0f423579010101010101010101010101010101010100000000000000", "comment": "two requests in one delivery",
+     "out": {
+       "alice": [
+         {"kind": "Data", "frame": "5400000085ccf77c94730e0988a300194c0f4235790101010101010101010101010101010149000000000000006d000000000000800c0000005e5a9a4c58437562303612cb2e4be8767468697264207265636f72640c000000"},
+         {"kind": "Data", "frame": "3100000085ccf77c94730e0988a300194c0f423579010101010101010101010101010101016c000000000000006d0000000000008000"}]},
+     "closed": [],
+     "store": []}
+  ],
+  "state": {
+  }
+}

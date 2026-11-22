@@ -1,0 +1,102 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "presence",
+  "summary": "Presence snapshots and up/down transitions per device across several connections; direct messages and Undelivered.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "alice", "local": false, "binding": "b1fa710aa2a09775cd76b02f8eeafb272113b72286d0b923dbdc29c2892d9939f40f70a50b1b37825aad4f0b3a3e746214e6a000b103f023869da841b7d63535",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "64010000010304f05d2a387ddb8cd65c7fd2396e5c49db8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca6f60bc1e1e13de231d22bca579443bdad450a0b381d376355ce88c7e553eee70ea4aa0c8e5ebcc102f5cd29463a4d2169b021062a90a1dce5616c295efedc0701ef014d01011c1d1e1f202122232425262728292a2b8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000a8da769b010000718a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c17829be3b74aa3ca169d7ef4da350e656c9430a67ff772de76c4f8d1c62802225c88856955b4ecd5f7bd1c6d67ff3347d4980275961f50fce5d4b157eebb50b", "comment": "Hello",
+     "out": {
+       "alice": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "090000000cffffffffffffffff04", "comment": "Feed from the end with presence",
+     "out": {
+       "alice": [
+         {"kind": "Presence", "frame": "1c00000092010100ccf77c94730e0988a300194c0f4235790100ca9a3b00000000"},
+         {"kind": "Announce", "frame": "120000008f000000000000000000000000000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "clock", "wall_ms": 1767225601000, "mono_ms": 2000,
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "bob", "local": false, "binding": "2ca338b55373211d8e822b62ef7e3e60dd75617ca279815ca1051ffa58bd3b8eab687570ab0aab51a75df1ba38dca13dbf46749df30826eb75cd0c68ce4abf83",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "84010000010304f05d2a387ddb8cd65c7fd2396e5c49db8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394e9bf63416c205cb0e4c7bb19a3f5f50201117f175e15a44f20a7bc67174e322ec275377872c7058c47e0e2132a23145c857c343e375425f7e281ca9f829cc503018f024d0102f05d2a387ddb8cd65c7fd2396e5c49db8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0101f9c7f04205301c1a8b50448fce87e52f7557e1a2b4f8dfd759015e2c0805829200a8da769b010000718139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394000201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003aec712af26cb07445ed2a92b46b0f31188042799a64846109c4c9a4d94af144766269f5c11cd07a6947fe8feab83d076d909ac46372042f753a70f40a0dc406", "comment": "Hello",
+     "out": {
+       "alice": [
+         {"kind": "Presence", "frame": "1c00000092000100901205fc248766135dbfb4be1b06ca03010094357700000000"}],
+       "bob": [
+         {"kind": "Welcome", "frame": "21000000810300ca942952728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "090000000cffffffffffffffff04", "comment": "bob follows presence",
+     "out": {
+       "bob": [
+         {"kind": "Presence", "frame": "3500000092010200901205fc248766135dbfb4be1b06ca03010094357700000000ccf77c94730e0988a300194c0f4235790100ca9a3b00000000"},
+         {"kind": "Announce", "frame": "120000008f000000000000000000000000000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2300000010ccf77c94730e0988a300194c0f423579050000000000000068656c6c6f20616c696365", "comment": "Direct to a present device",
+     "out": {
+       "alice": [
+         {"kind": "Directed", "frame": "2300000093901205fc248766135dbfb4be1b06ca03050000000000000068656c6c6f20616c696365"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2300000010bc98bdfcc6b2fb6af8d25570b3b82ab9060000000000000068656c6c6f206361726f6c", "comment": "Direct to an absent device",
+     "out": {
+       "bob": [
+         {"kind": "Undelivered", "frame": "1800000094bc98bdfcc6b2fb6af8d25570b3b82ab90600000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "alice2", "local": false, "binding": "7ac68b7e598cf82865afd45388c30b459f43787972d486798147405d325db02d028bbed6ec34f7bfe7286573edba71f0fb8fb3d5657c5a2d7d1e1eb19e93e4ed",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice2", "bytes": "64010000010304f05d2a387ddb8cd65c7fd2396e5c49db8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c21993445960bc880dcdd82b5287c47595ad415c0c52c865b6d44356bb54c396fb35883e78affd744ef639239efa3891274d02cb07e98a482eec42122e912310101ef014d01011c1d1e1f202122232425262728292a2b8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000a8da769b010000718a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c17829be3b74aa3ca169d7ef4da350e656c9430a67ff772de76c4f8d1c62802225c88856955b4ecd5f7bd1c6d67ff3347d4980275961f50fce5d4b157eebb50b", "comment": "Hello",
+     "out": {
+       "alice2": [
+         {"kind": "Welcome", "frame": "21000000810300ca942952728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "1d00000010ccf77c94730e0988a300194c0f4235790700000000000000616761696e", "comment": "Direct goes to a connection that follows presence",
+     "out": {
+       "alice": [
+         {"kind": "Directed", "frame": "1d00000093901205fc248766135dbfb4be1b06ca030700000000000000616761696e"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "bob2", "local": false, "binding": "5b91be13609c86d1a3280f229aeacddd9b2b9415bf155783f110827ec9130c06c1f8a1dbf5539f6fa40b017864e2b81b3656b75f6339dbef354e7d0cf9df11b8",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob2", "bytes": "84010000010304f05d2a387ddb8cd65c7fd2396e5c49db8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394bcd6a10abc951ad4d6dcf406c7e68dd7a083200418e2360d562b58e63bd4a980023cf654565d3eea08828f8257e4764a4b6a4446799dbc3984cd4306d849cb00018f024d0102f05d2a387ddb8cd65c7fd2396e5c49db8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0101f9c7f04205301c1a8b50448fce87e52f7557e1a2b4f8dfd759015e2c0805829200a8da769b010000718139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394000201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003aec712af26cb07445ed2a92b46b0f31188042799a64846109c4c9a4d94af144766269f5c11cd07a6947fe8feab83d076d909ac46372042f753a70f40a0dc406", "comment": "Hello",
+     "out": {
+       "bob2": [
+         {"kind": "Welcome", "frame": "21000000810300ca942952728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "close", "conn": "bob",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "clock", "wall_ms": 1767225605000, "mono_ms": 6000,
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "close", "conn": "bob2",
+     "out": {
+       "alice": [
+         {"kind": "Presence", "frame": "1c00000092000100901205fc248766135dbfb4be1b06ca030000bca06501000000"}]},
+     "closed": [],
+     "store": []}
+  ],
+  "state": {
+  }
+}

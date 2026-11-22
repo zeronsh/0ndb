@@ -1,4 +1,3 @@
-#+build linux, darwin, windows
 package osync
 
 import "../prim"
@@ -144,7 +143,7 @@ _fill_end :: proc(c: ^Conn, op: ^Op) {
 }
 
 @(private)
-_hollow_done :: proc(r: ^Relay, sp: ^Space_State, c: ^Conn, p: ^Pending, result: Error, value: i64) -> (handed: bool) {
+_hollow_done :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn, p: ^Pending, result: Error, value: i64) -> (handed: bool) {
 	st := p.stream
 	st.busy = false
 	if p.kind == .Fill {
@@ -168,12 +167,15 @@ _hollow_done :: proc(r: ^Relay, sp: ^Space_State, c: ^Conn, p: ^Pending, result:
 	if p.kind == .Fill {
 		sp.usage += p.total
 		r.stats.fills += 1
+		sp.count.fills += 1
+		sp.count.bytes_in += u64(p.total)
 		if c != nil {
 			_reply_hollow(c, .Noted, p.id, st.base, st.length)
 		}
 		return false
 	}
 	r.stats.notes += 1
+	sp.count.notes += 1
 	for f in st.followers {
 		if f != c {
 			_reply_hollow(f, .Hollow, p.id, st.base, st.length)
@@ -258,6 +260,7 @@ _on_pull :: proc(c: ^Conn, rd: ^prim.Reader) {
 	_push_small(h, b[:])
 	_conn_kick(h)
 	r.stats.pulls += 1
+	sp.count.pulls += 1
 }
 
 @(private)
@@ -343,6 +346,7 @@ _serve_end :: proc(c: ^Conn, op: ^Op) {
 	q.piped += i64(len(buf))
 	r.stats.served += 1
 	r.stats.piped_bytes += u64(len(buf))
+	sp.count.piped_bytes += u64(len(buf))
 	_conn_kick(q)
 	if q.piped >= PIPE_HIGH && !q.dead {
 		c.pipe_wait = true
@@ -360,7 +364,7 @@ _pipe_drained :: proc(c: ^Conn, n: int) {
 }
 
 @(private)
-_pipe_release_holders :: proc(r: ^Relay, sp: ^Space_State, q: ^Conn) {
+_pipe_release_holders :: proc(r: ^Relay_Core, sp: ^Space_State, q: ^Conn) {
 	for h in sp.live {
 		if h.pipe_wait && h.pipe_on == q.ref && !h.dead {
 			h.pipe_wait = false
@@ -370,7 +374,7 @@ _pipe_release_holders :: proc(r: ^Relay, sp: ^Space_State, q: ^Conn) {
 }
 
 @(private)
-_pipes_conn_closed :: proc(r: ^Relay, sp: ^Space_State, c: ^Conn) {
+_pipes_conn_closed :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn) {
 	if c.pipe_wait {
 		c.pipe_wait = false
 	}

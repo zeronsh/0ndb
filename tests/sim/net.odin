@@ -470,7 +470,7 @@ _to_relay :: proc(w: ^World, c: ^Conn, bytes: []u8) {
 @(private = "file")
 _relay_attach :: proc(w: ^World, c: ^Conn) -> (osync.Conn_Ref, osync.Error) {
 	context = instance_context(&w.relay.inst)
-	ref, err := osync.relay_attach(&w.relay.r, osync.Link{data = c, send = _r_send, sendfile = _r_sendfile, close = _r_close, pause = _r_pause}, true)
+	ref, err := osync.relay_core_attach(&w.relay.r, osync.Link{data = c, send = _r_send, sendfile = _r_sendfile, close = _r_close, pause = _r_pause}, true)
 	relay_after(&w.relay)
 	return ref, err
 }
@@ -478,21 +478,21 @@ _relay_attach :: proc(w: ^World, c: ^Conn) -> (osync.Conn_Ref, osync.Error) {
 @(private = "file")
 _relay_input :: proc(w: ^World, c: ^Conn, bytes: []u8) {
 	context = instance_context(&w.relay.inst)
-	osync.relay_input(&w.relay.r, c.ref, bytes)
+	osync.relay_core_input(&w.relay.r, c.ref, bytes)
 	relay_after(&w.relay)
 }
 
 @(private = "file")
 _relay_writable :: proc(w: ^World, c: ^Conn) {
 	context = instance_context(&w.relay.inst)
-	osync.relay_writable(&w.relay.r, c.ref)
+	osync.relay_core_writable(&w.relay.r, c.ref)
 	relay_after(&w.relay)
 }
 
 @(private = "file")
 _relay_detach :: proc(w: ^World, c: ^Conn) {
 	context = instance_context(&w.relay.inst)
-	osync.relay_detach(&w.relay.r, c.ref)
+	osync.relay_core_detach(&w.relay.r, c.ref)
 	relay_after(&w.relay)
 }
 

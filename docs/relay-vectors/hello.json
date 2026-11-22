@@ -1,0 +1,106 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "hello",
+  "summary": "Hello acceptance and every rejection: version, signature binding, unknown credential, non-member, frame before Hello, empty Hello, local sockets skip the signature, inadmissible proof.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "alice", "local": false, "binding": "b1fa710aa2a09775cd76b02f8eeafb272113b72286d0b923dbdc29c2892d9939f40f70a50b1b37825aad4f0b3a3e746214e6a000b103f023869da841b7d63535",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "64010000010304b0414a78e1638e7b74d6a321cc085d2d8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca6f60bc1e1e13de231d22bca579443bdad450a0b381d376355ce88c7e553eee70ea4aa0c8e5ebcc102f5cd29463a4d2169b021062a90a1dce5616c295efedc0701ef014d0101101112131415161718191a1b1c1d1e1f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000a8da769b010000718a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000094c003d54746d328a2fc0c0e3f8a17e6f060a468159be74f4d4b8ddd2b1da26c462e4b8f8a55b06a284bc409fa2f4b78a670f4f79acc04824a6efa1dc4ac502", "comment": "Hello",
+     "out": {
+       "alice": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "version", "local": false, "binding": "cd3ee989a48aa4a410948f4e1b395b17a769f57f980fb1058665a3b04c02590e54795373ecf5537e6095aea5dc41617b47189ecbcd2e431d50c7bc9d86a7d03f",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "version", "bytes": "73000000010204b0414a78e1638e7b74d6a321cc085d2d8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5cfe25a11ce70a5f6d075aaf9008c0215ae1238aa4a20fb84eb37436951dcc7beededd67646f1bc67f1b531081296c89db7d40f1cb27374782672bd04d8e384c0800", "comment": "Hello with protocol version 2",
+     "out": {
+       "version": [
+         {"kind": "Error", "frame": "010000008d03"}]},
+     "closed": ["version"],
+     "store": []},
+    {"step": "connect", "conn": "binding", "local": false, "binding": "bb296ce9da6f8a96ff81ec26591b61b1787b416fb69f18635118460f67edaa183d27a0fea98d314f2da087b1fde6c4301efbba27e160e3012d026f69b0470e24",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "binding", "bytes": "73000000010304b0414a78e1638e7b74d6a321cc085d2d8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c761f988d0d117a2e05ff996c34f33f2ed8f613110589ac75d6f9488c9b5fee073b363b4191b04b2db3003c8f036b91ccab1fc938ea2051e6268125ca3953580400", "comment": "Hello signed over another connection's binding",
+     "out": {
+       "binding": [
+         {"kind": "Error", "frame": "010000008d02"}]},
+     "closed": ["binding"],
+     "store": []},
+    {"step": "connect", "conn": "unknown", "local": false, "binding": "9573cbb1ffe2b6e71a11f86b0755b3f4127154afde8d1de0fa2202a50eebe3dc95ea06a923a1163f8663f102a3964e4d4ccf4b7cc52867a13998f51edbaab7b9",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "unknown", "bytes": "220000000103098a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c", "comment": "Hello with an unknown credential type",
+     "out": {
+       "unknown": [
+         {"kind": "Error", "frame": "010000008d02"}]},
+     "closed": ["unknown"],
+     "store": []},
+    {"step": "connect", "conn": "stranger", "local": false, "binding": "99ac8c5720d4cd25eedb7c99aa2eec5295feee8113b43054f3a2d02f8acd212071ddf6bbaea9d37a3f7ca043b759a89b5153809419f24815e174dbb80f117579",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "stranger", "bytes": "73000000010304b0414a78e1638e7b74d6a321cc085d2d8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394f4fcd0a57e7449fd238789e06912dfeb276e3103117a19686de440af3a3076839e4a3949d009c2a11bc8733f2f0474797b87401ac85db336961ec8e7e262080d00", "comment": "Hello by a device that is not a member",
+     "out": {
+       "stranger": [
+         {"kind": "Error", "frame": "010000008d02"}]},
+     "closed": ["stranger"],
+     "store": []},
+    {"step": "connect", "conn": "early", "local": false, "binding": "004983eca520e6e02ae4d9b81cbe7532067d1e6499328270ba33b2f1d02c11f1beaf24b5e8e84786310647efc7fcd4b4b22e4f2a1ccc5c1eb507ecce03fb75fd",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "early", "bytes": "08000000020000000000000000", "comment": "List before Hello",
+     "out": {
+       "early": [
+         {"kind": "Error", "frame": "010000008d01"}]},
+     "closed": ["early"],
+     "store": []},
+    {"step": "connect", "conn": "empty", "local": false, "binding": "6f2302e48daee420f3f1ef4d90efe4a91e8fa51bb4b30ca7b26deba50cbe2d2ec6d238c7d0eabe6eb973b59a0da0897fe125ecb89b0ef7010bdc58fdd2f90331",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "empty", "bytes": "0000000001", "comment": "empty Hello",
+     "out": {
+       "empty": [
+         {"kind": "Error", "frame": "010000008d01"}]},
+     "closed": ["empty"],
+     "store": []},
+    {"step": "connect", "conn": "local", "local": true, "binding": "8edc1df21bc381e975561073a5c5c8cf66c563e3a35daa457405b629aa9f3c6d7c083c95f5a4d0f01bd89bd59f23d731916d2f6b942df0956f0b27a648da6ca3",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "local", "bytes": "73000000010304b0414a78e1638e7b74d6a321cc085d2d8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "comment": "Hello on a local socket with a zero signature",
+     "out": {
+       "local": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "forged", "local": false, "binding": "6983fd7398be1cb1a9e371b28da08a1942df29227b2eba6b37407ecca2f92110b8b56ce5f21da4219ccc55ae9ec41d912a03fdfa1e15c0ab1949c97e73503982",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "forged", "bytes": "84010000010304b0414a78e1638e7b74d6a321cc085d2dca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c2582b32a6d570fb000af4e93158fcf7e4c5b78b4e431d0f9d1b669dbc7d1948c8bfc053a052c6e5e73663888aac297f83587a21692758ff02f7f2b7c1edb0507018f024d0102b0414a78e1638e7b74d6a321cc085d2dca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c0101384ee15fd3a892a7fe7aa6979f29b194ecb52ce7d2f0789f1885cf393a6a899400a8da769b01000071ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7cca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002521224194f8a7b78d01f6499324e5a1ab79a90267d12d67dc9a82e5edae4a4e1fcdc17900a19e7b460d0b802d91495f036c68cc2b7ca711f367173e2c3bdd0d", "comment": "Hello whose proof is an Add signed by a non-member",
+     "out": {
+       "forged": [
+         {"kind": "Error", "frame": "010000008d02"}]},
+     "closed": ["forged"],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "020000000e0000", "comment": "empty Probe after the rejections",
+     "out": {
+       "alice": [
+         {"kind": "Probed", "frame": "02000000910000"}]},
+     "closed": [],
+     "store": []}
+  ],
+  "state": {
+  }
+}

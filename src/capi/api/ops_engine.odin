@@ -112,6 +112,29 @@ op_space_set_relay :: proc(c: ^Call, o: ^Out) -> Status {
 	return status_of(eng.space_set_relay(c.api.e, a_id(c, "space"), a_str(c, "relay"), rk))
 }
 
+op_space_relay_account :: proc(c: ^Call, o: ^Out) -> Status {
+	s, seen, err := eng.space_relay_account(c.api.e, a_id(c, "space"), a_bool(c, "refresh"))
+	if err != .None {
+		return status_of(err)
+	}
+	o_bool(o, "accounted", seen)
+	o_u64(o, "stored", u64(max(s.stored, 0)))
+	o_u64(o, "quota", u64(max(s.quota, 0)))
+	o_u64(o, "appends", s.appends)
+	o_u64(o, "bytes_in", s.bytes_in)
+	o_u64(o, "notes", s.notes)
+	o_u64(o, "fills", s.fills)
+	o_u64(o, "pulls", s.pulls)
+	o_u64(o, "piped_bytes", s.piped_bytes)
+	o_u64(o, "store_writes", s.store.writes)
+	o_u64(o, "store_bytes", s.store.write_bytes)
+	o_u64(o, "pending", u64(max(s.store.pending, 0)))
+	o_u64(o, "day", u64(max(s.store.day, 0)))
+	o_u64(o, "day_bytes", s.store.day_bytes)
+	o_u64(o, "total_bytes", s.store.total_bytes)
+	return .Ok
+}
+
 op_space_open :: proc(c: ^Call, o: ^Out) -> Status {
 	return status_of(eng.space_open(c.api.e, a_id(c, "space")))
 }

@@ -192,6 +192,15 @@
  *                 relay_usage: uvarint, relay_quota: uvarint (
  *                 the bytes the relay stores for the space and its quota,
  *                 as of the last connect)
+ *   RelayAccount := accounted: bool, stored: uvarint, quota: uvarint,
+ *                 appends: uvarint, bytes_in: uvarint, notes: uvarint,
+ *                 fills: uvarint, pulls: uvarint, piped_bytes: uvarint,
+ *                 store_writes: uvarint, store_bytes: uvarint,
+ *                 pending: uvarint, day: uvarint, day_bytes: uvarint,
+ *                 total_bytes: uvarint (since 2.0: the relay's accounting
+ *                 for the space as of its last Accounted reply; counters
+ *                 since the relay loaded the space, store_* from its
+ *                 object-store tier, day = UTC days since 1970)
  *   Identity   := id: id, sign: bytes, box: bytes
  *   AccountState := signed_in: bool, account: bytes, subject: str,
  *                 pool: enum pool_access, relay: str, waiting: bool,
@@ -1042,6 +1051,8 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_SPACE_INFO 42u
 /* space.set_relay(space: id, relay: str, relay_key: bytes) -> {} */
 #define ONDB_OP_SPACE_SET_RELAY 43u
+/* space.relay_account(space: id, refresh: bool) -> RelayAccount */
+#define ONDB_OP_SPACE_RELAY_ACCOUNT 140u
 /* space.open(space: id) -> {} */
 #define ONDB_OP_SPACE_OPEN 44u
 /* space.close(space: id) -> {} */

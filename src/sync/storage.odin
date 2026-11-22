@@ -1,7 +1,15 @@
-#+build linux, darwin, windows
 package osync
 
 import "../prim"
+
+Store_Account :: struct {
+	writes:      u64,
+	write_bytes: u64,
+	pending:     i64,
+	day:         i64,
+	day_bytes:   u64,
+	total_bytes: u64,
+}
 
 Storage_Done :: #type proc(ctx: rawptr, result: Error, value: i64)
 
@@ -36,4 +44,6 @@ Relay_Storage :: struct {
 	object_extent:   proc(data: rawptr, o: rawptr, at: i64, n: i64) -> (fd: prim.Fd, off: i64, len: i64, ok: bool),
 	object_close:    proc(data: rawptr, o: rawptr),
 	object_remove:   proc(data: rawptr, ns: rawptr, key: Object_Key, done: Storage_Done, ctx: rawptr),
+	account:         proc(data: rawptr, ns: rawptr) -> Store_Account,
+	objects:         proc(data: rawptr, ns: rawptr, out: ^[dynamic]Object_Key) -> Error,
 }

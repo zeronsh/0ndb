@@ -359,29 +359,32 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	}
 	rn.inst.loop_on = true
 	prim.loop_set_clock(&rn.inst.loop, node_clock(&rn.clock))
-	cfg := osync.relay_config(RELAY_DIR)
-	cfg.vfs = disk_vfs(&rn.disk)
-	cfg.open = true
-	cfg.default_quota = 1 << 30
-	cfg.sync_threads = 0
-	cfg.kernel_tls = false
-	cfg.random = rng_random(&rn.rng)
-	cfg.clock = node_clock(&rn.clock)
-	if serr := osync.member_authorizer_init(&rn.mauth, cfg.vfs, RELAY_DIR + "/members", {}, true, cfg.default_quota, node_clock(&rn.clock)); serr != .None {
+	vfs := disk_vfs(&rn.disk)
+	quota := i64(1 << 30)
+	if serr := osync.member_authorizer_init(&rn.mauth, vfs, RELAY_DIR + "/members", {}, true, quota, node_clock(&rn.clock)); serr != .None {
 		world_fail(w, "relay authorizer init failed: %v", serr)
 		instance_kill(&rn.inst)
 		return false
 	}
-	eng.cap_authorizer_init(&rn.cauth, osync.member_authorizer(&rn.mauth), cfg.default_quota, node_clock(&rn.clock))
+	eng.cap_authorizer_init(&rn.cauth, osync.member_authorizer(&rn.mauth), quota, node_clock(&rn.clock))
 	rn.cauth.issuer_data = &rn.mauth
 	rn.cauth.issuer_ok = proc(data: rawptr, space: prim.Id, issuer: osync.Public_Key) -> bool {
 		return osync.member_authorizer_active((^osync.Member_Authorizer)(data), osync.Space_Id(space), issuer)
 	}
-	cfg.authorizer = eng.cap_authorizer(&rn.cauth)
 	rn.alive = true
-	err := osync.relay_init(&rn.r, &rn.inst.loop, cfg)
+	prim.random_fill(rng_random(&rn.rng), rn.public[:])
+	err := osync.file_store_init(&rn.fs, &rn.inst.loop, vfs, RELAY_DIR, 0, osync.LAYOUT_SECTOR, {}, rng_random(&rn.rng), node_clock(&rn.clock))
 	if err == .None {
-		osync.member_authorizer_set_storage(&rn.mauth, osync.relay_storage(&rn.r))
+		cc := osync.relay_core_config()
+		cc.storage = osync.file_store(&rn.fs)
+		cc.authorizer = eng.cap_authorizer(&rn.cauth)
+		cc.clock = node_clock(&rn.clock)
+		cc.wake = _relay_wake
+		cc.wake_data = rn
+		err = osync.relay_core_init(&rn.r, cc)
+	}
+	if err == .None {
+		osync.member_authorizer_set_storage(&rn.mauth, rn.r.store)
 	}
 	if rn.disk.dead {
 		relay_crashed(rn)
@@ -394,7 +397,6 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 		return false
 	}
 	rn.r_on = true
-	rn.public = osync.relay_public_key(&rn.r)
 	world_note(w, "relay up")
 	return true
 }
@@ -406,8 +408,25 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.r_on = false
 	instance_kill(&rn.inst)
 	rn.r = {}
+	rn.fs = {}
+	rn.wake = 0
 	rn.mauth = {}
 	rn.cauth = {}
+}
+
+@(private = "file")
+_relay_wake :: proc(data: rawptr) {
+	rn := (^Relay_Node)(data)
+	if rn.wake == 0 {
+		rn.wake = prim.timer(&rn.inst.loop, 0, rn, _relay_woken)
+	}
+}
+
+@(private = "file")
+_relay_woken :: proc(l: ^prim.Loop, data: rawptr) {
+	rn := (^Relay_Node)(data)
+	rn.wake = 0
+	osync.relay_core_resume(&rn.r)
 }
 
 relay_crashed :: proc(rn: ^Relay_Node) {

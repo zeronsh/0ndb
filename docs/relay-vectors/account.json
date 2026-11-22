@@ -1,0 +1,94 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "account",
+  "summary": "Account namespace: request and account credentials may only see presence and exchange direct messages; requesters are limited to two connections.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "requester", "local": false, "binding": "a1b321ea12691101aaba18a8fe5a41ac9576c3611c155f65faa1d72ecffda16a7adf1db445414979ef5a42f2b6c5b3b8bbad0c0ed5c028c9c230228a1e87d3d4",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester", "bytes": "820000000103056e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf18a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17dc1010e84463a65c55456b09ee7661ce337b6476a1192102f952cc3774227df7fa657341e4f20d4252bb34e719f927a8f35c3a665835a18d744a73e35e985a0e", "comment": "request credential",
+     "out": {
+       "requester": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester", "bytes": "30000000041b6e5eb88d069963fd6f008b28cadf9c0101010101010101010101010101010100000000000000000a00000000000000", "comment": "a requester cannot read",
+     "out": {
+       "requester": [
+         {"kind": "Refused", "frame": "210000008c051b6e5eb88d069963fd6f008b28cadf9c01010101010101010101010101010101"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester", "bytes": "090000000cffffffffffffffff04", "comment": "a requester may follow presence",
+     "out": {
+       "requester": [
+         {"kind": "Presence", "frame": "1c000000920101001b6e5eb88d069963fd6f008b28cadf9c0100ca9a3b00000000"},
+         {"kind": "Announce", "frame": "120000008f000000000000000000000000000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "approver", "local": false, "binding": "56e8fa48494563abc6314cf5d0970cb661b224f523957e14774037a1ef8b43c8a166a82f46a7750a15c28ce2a4bc5560b76b69a25f4fdbcbbc82c9d3ac116cb9",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "approver", "bytes": "c20000000103066e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1226f0eaa6192f6cfa272bec45eabd718dece67c3757bb631c7bf161a608ab570b72e4efad839cafe5e9696f5ae9c334ab917696e93b0d2fa401457f08d09ab0cea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c4128cc8c08fd76ea4647ab91c05cf9c650bed25657d5b5fd329193cd3cb53e590ea6dbe45c92c71af9eecb304c3b07d17ebe0c4020f2f23667018253f3d89e0c", "comment": "account credential",
+     "out": {
+       "requester": [
+         {"kind": "Presence", "frame": "1c00000092000100325308b1bb839e483c0e959c664067d90100ca9a3b00000000"}],
+       "approver": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "approver", "bytes": "090000000cffffffffffffffff04", "comment": "the approver follows presence",
+     "out": {
+       "approver": [
+         {"kind": "Presence", "frame": "35000000920102001b6e5eb88d069963fd6f008b28cadf9c0100ca9a3b00000000325308b1bb839e483c0e959c664067d90100ca9a3b00000000"},
+         {"kind": "Announce", "frame": "120000008f000000000000000000000000000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester", "bytes": "1f00000010325308b1bb839e483c0e959c664067d9010000000000000052455155455354", "comment": "request to the approver",
+     "out": {
+       "approver": [
+         {"kind": "Directed", "frame": "1f000000931b6e5eb88d069963fd6f008b28cadf9c010000000000000052455155455354"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "approver", "bytes": "1d000000101b6e5eb88d069963fd6f008b28cadf9c01000000000000004752414e54", "comment": "grant to the requester",
+     "out": {
+       "requester": [
+         {"kind": "Directed", "frame": "1d00000093325308b1bb839e483c0e959c664067d901000000000000004752414e54"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "requester2", "local": false, "binding": "f7648d6fd97167bc5fe9fad5af3a6d1c4fdfe25630275da0e32430b091d6eed7adfbb4a955d334f50d47eb6148b2cc70fd82145cd3809425f7a0b81389742e5e",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester2", "bytes": "820000000103056e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf18a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17da939735b04b256ae38f89c79b71314c943c8c581ff39dfb0549e629581e49e99f82a0160a8cfd8d409262eec5385a80f7998efeca701f6ba70abfa414ef4a03", "comment": "second requester connection",
+     "out": {
+       "requester2": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000000100000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "requester3", "local": false, "binding": "84b3fa268ba1bfc66abe83293bb65d2ccd4cc3ee85f86c197a6a3b1f0ea296b85010683e89dfc5e1aa65eb223ea2c9df8b30e121d8bb02627fc389bf12d22bf1",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "requester3", "bytes": "820000000103056e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf18a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17b921aa2a320c59294dbb23f8552b3d59004971c437a77197fe1f7191006dd2976c13577f08f7191f2de79df1a8f4e411f23cbeb38c8d9d28a9f2b8ed9f43910f", "comment": "third requester connection",
+     "out": {
+       "requester3": [
+         {"kind": "Error", "frame": "010000008d09"}]},
+     "closed": ["requester3"],
+     "store": []},
+    {"step": "connect", "conn": "badcert", "local": false, "binding": "375d51d72464d5b53185fb28b45a7db2cd1e04f97e58f2c235d9624f1043bd9f5028c39e9dfb74e3726bc68d93e3411e29324e178aaec4d9e018893f01844dbb",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "badcert", "bytes": "c20000000103066e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1226f0eaa6192f6cea272bec45eabd718dece67c3757bb631c7bf161a608ab570b72e4efad839cafe5e9696f5ae9c334ab917696e93b0d2fa401457f08d09ab0cea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c73e3962d26c05b98778494826ddfcde615ddd88f0000b84f49ec7b20ad4e86d9a2c0159fce0ccad3f539a30915a7582c96ea5edaace9947df15d1e0f0445c407", "comment": "account credential with a broken device cert",
+     "out": {
+       "badcert": [
+         {"kind": "Error", "frame": "010000008d02"}]},
+     "closed": ["badcert"],
+     "store": []}
+  ],
+  "state": {
+  }
+}
