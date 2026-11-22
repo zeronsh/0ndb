@@ -176,7 +176,7 @@ _token_exact :: proc(snippet: string, tok: string) -> bool {
 	}
 }
 
-check_snapshot_restore :: proc(w: ^World) {
+check_index_rebuild :: proc(w: ^World) {
 	target: ^Node
 	for n in w.nodes {
 		if n.alive && n.e_open && n.idx % 2 == 0 {
@@ -228,7 +228,7 @@ check_snapshot_restore :: proc(w: ^World) {
 	osync.file_keyring_close(&n.keyring)
 	n.key_open = false
 	node_kill(n)
-	world_note(w, "%s search index wiped (%d files) for snapshot restore", n.name, wiped)
+	world_note(w, "%s search index wiped (%d files) for a rebuild from content", n.name, wiped)
 	schedule(w, Sim_Event{at = w.now + 200_000_000, kind = .Restart, node = n.idx})
 	for round := 0; round < 16 && !(n.alive && n.e_open); round += 1 {
 		run_until(w, w.now + 1_000_000_000, false)
@@ -237,32 +237,24 @@ check_snapshot_restore :: proc(w: ^World) {
 		world_fail(w, "search: %s did not restart after its index was wiped", n.name)
 		return
 	}
+	started := w.now
+	rebuilt := false
 	for round := 0; round < 32; round += 1 {
 		run_until(w, w.now + 2_000_000_000, false)
 		if !n.alive || !n.e_open {
 			return
 		}
-		busy := false
-		for id in spaces {
-			context = instance_context(&n.inst)
-			info := eng.search_snapshot_info(&n.e, id)
-			node_after(n)
-			if info.restoring {
-				busy = true
-			}
-		}
+		context = instance_context(&n.inst)
+		busy := eng.search_indexing(&n.e)
+		node_after(n)
 		if !busy && round >= 2 {
+			rebuilt = true
 			break
 		}
 	}
-	for id in spaces {
-		context = instance_context(&n.inst)
-		info := eng.search_snapshot_info(&n.e, id)
-		node_after(n)
-		world_note(w, "%s snapshot after restore: entries %d docs %d restoring %v restored %d in %d ms", n.name, info.entries, info.docs, info.restoring, info.restored, info.restore_ms)
-		if info.restoring {
-			world_fail(w, "search: snapshot restore on %s never finished", n.name)
-		}
+	world_note(w, "%s search index rebuilt from content in %d ms", n.name, (w.now - started) / 1_000_000)
+	if !rebuilt {
+		world_fail(w, "search: rebuild of the wiped index on %s never finished", n.name)
 	}
 	run_until(w, w.now + 30_000_000_000, true)
 }
