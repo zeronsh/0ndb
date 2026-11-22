@@ -60,6 +60,8 @@ hunk_edits :: proc(old, new: []u8, refine: bool, allocator: runtime.Allocator) -
 		}
 		if refine {
 			refine_hunk(&out, old, new, hunk, scratch_is_result) or_return
+		} else if at, del, ins, ok := single_edit(old[hunk.a0:hunk.a1], new[hunk.b0:hunk.b1]); ok {
+			append(&out, Byte_Edit{u32(hunk.b0 + at), u32(del), u32(ins)}) or_return
 		} else {
 			append(&out, span_edit(hunk)) or_return
 		}

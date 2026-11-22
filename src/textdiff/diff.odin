@@ -241,6 +241,18 @@ common_prefix :: proc "contextless" (a, b: []u8) -> int {
 	return i
 }
 
+single_edit :: proc "contextless" (old, new: []u8) -> (at: int, del: int, ins: int, ok: bool) {
+	p := common_prefix(old, new)
+	s := common_suffix(old[p:], new[p:])
+	if p + s == len(old) {
+		return p, 0, len(new) - p - s, true
+	}
+	if p + s == len(new) {
+		return p, len(old) - p - s, 0, true
+	}
+	return 0, 0, 0, false
+}
+
 @(private)
 common_suffix :: proc "contextless" (a, b: []u8) -> int {
 	n := min(len(a), len(b))
