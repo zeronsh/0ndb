@@ -180,6 +180,7 @@ _authorize_member :: proc(a: ^Member_Authorizer, credential: []u8, binding: []u8
 		check       = _member_check,
 		data        = a,
 		until       = until,
+		lapsed      = _member_lapsed,
 	}
 	return .None
 }
@@ -252,6 +253,21 @@ _account_check :: proc(data: rawptr, p: ^Principal, access: Access, id: [32]u8) 
 		return string(x[:16]) == string(pid[:])
 	}
 	return false
+}
+
+@(private)
+_member_lapsed :: proc(data: rawptr, p: ^Principal) -> bool {
+	a := cast(^Member_Authorizer)data
+	s := _auth_space(a, p.namespace)
+	if s == nil {
+		return false
+	}
+	idx, found := s.devices[p.participant]
+	if !found {
+		return false
+	}
+	m := &s.m.roster.members[idx]
+	return m.kind == .Runner && !m.removed && !member_active(m, _now(a)) && p.until <= _now(a)
 }
 
 @(private)

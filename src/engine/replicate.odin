@@ -172,7 +172,7 @@ _link_possible :: proc(e: ^Engine, sp: ^Space) -> bool {
 	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.mem.revoked || sp.refused {
 		return false
 	}
-	return !(sp.mem.lapsed && sp.mem.creds.until <= _now_ms(e))
+	return !(_lapsed_now(e, sp) && sp.mem.creds.until <= _now_ms(e))
 }
 
 @(private)
@@ -518,7 +518,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 			_space_refuse(e, sp)
 		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.creds.renewal == .Attached {
 			_link_schedule(e, sp)
-		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.lapsed && sp.mem.creds.renewal != .Presented {
+		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && _lapsed_now(e, sp) && sp.mem.creds.renewal != .Presented {
 			_lease_wanted(e, sp)
 		} else if ev.err == .Auth && !sp.admitted && !sp.mem.removed && !sp.mem.revoked && sp.mem.creds.renewal != .Presented && sp.refusals < AUTH_LAG_RETRIES {
 			sp.refusals += 1
