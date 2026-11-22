@@ -860,7 +860,11 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		prim.read_fixed(&r, ev.device[:])
 		ev.tag = prim.read_u64le(&r)
 		ev.id = get_id32(&r)
-		ev.at = get_i64(&r)
+		from := prim.read_u64le(&r)
+		if from & PULL_DRAFT == 0 && from > u64(max(i64)) {
+			return .Protocol
+		}
+		ev.at = cast(i64)from
 		ev.length = get_i64(&r)
 	case .Accounted:
 		ev.kind = .Accounted
