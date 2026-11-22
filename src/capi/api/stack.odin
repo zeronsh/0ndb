@@ -78,6 +78,7 @@ stack_open :: proc(s: ^Stack, ec: eng.Config, opts: Stack_Options, allocator := 
 			rc.hooks.data = s
 			rc.hooks.placement = _on_placement
 			rc.hooks.runners = _on_runners
+			rc.hooks.observed = _on_observed
 		}
 		if rc.secrets.get == nil {
 			rc.secrets = rt.Secrets{get = _env_secret}
@@ -207,6 +208,14 @@ stack_attach_space :: proc(s: ^Stack, space: prim.Id) {
 @(private)
 _on_placement :: proc(data: rawptr, r: ^rt.Runtime, o: Object, info: rt.Placement_Info) {
 	s := (^Stack)(data)
+	if s.a_on && !placement_note(&s.a, o, info) {
+		return
+	}
+	_placement_emit(s, o, info)
+}
+
+@(private)
+_placement_emit :: proc(s: ^Stack, o: Object, info: rt.Placement_Info) {
 	if s.placement.call != nil {
 		s.placement.call(s.placement.data, o, info)
 	}
@@ -216,10 +225,33 @@ _on_placement :: proc(data: rawptr, r: ^rt.Runtime, o: Object, info: rt.Placemen
 }
 
 @(private)
+_on_observed :: proc(data: rawptr, r: ^rt.Runtime, o: Object) {
+	s := (^Stack)(data)
+	if !s.a_on {
+		return
+	}
+	if info, changed := placement_changed(&s.a, o); changed {
+		_placement_emit(s, o, info)
+	}
+}
+
+@(private)
 _on_runners :: proc(data: rawptr, r: ^rt.Runtime, space: prim.Id) {
 	s := (^Stack)(data)
-	if s.a_on {
-		runners_notify(&s.a, space)
+	if !s.a_on {
+		return
+	}
+	runners_notify(&s.a, space)
+	objs := make([dynamic]Object, context.temp_allocator)
+	for o in s.a.placed {
+		if o.space == space {
+			append(&objs, o)
+		}
+	}
+	for o in objs {
+		if info, changed := placement_changed(&s.a, o); changed {
+			_placement_emit(s, o, info)
+		}
 	}
 }
 

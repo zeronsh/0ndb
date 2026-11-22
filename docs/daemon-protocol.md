@@ -272,6 +272,16 @@ idle conversation continues on its last runner when that runner returns
 (the same runner revives its own cut-off turn after a restart) or wherever
 `assign(object, runner)` sends it.
 
+When placement events fire. For every conversation a client of this daemon
+observes (a conversation subscription, or a `subscribe.runners` naming it),
+each change of its placement is reported once, whichever device caused it:
+`assigned`, `running` with the runner that runs it, `idle` with
+`last_runner`, `waiting_runner` and `placing`. The same change pushes a
+runners frame to subscriptions naming the conversation. Changes are found
+from the conversation's catalog row changes and runner presence, never by
+polling. For conversations nobody observes, only this device's own
+placement decisions are reported.
+
 Takeover policy. `takeover.set(object, level, policy)` stores `default`,
 `auto` or `never` on a conversation (in its catalog row), an agent or a
 workspace; the most specific setting wins and `takeover.get` returns the

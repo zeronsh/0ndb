@@ -120,6 +120,12 @@ Api :: struct {
 	mounts:    [dynamic]^Mounted,
 	models:    Models_Cache,
 	closing:   bool,
+	placed:    map[Object]Placed,
+}
+
+Placed :: struct {
+	info: rt.Placement_Info,
+	refs: int,
 }
 
 Call :: struct {
@@ -158,6 +164,7 @@ init :: proc(a: ^Api, e: ^eng.Engine, r: ^rt.Runtime = nil, host: Host = {}, all
 	a.calls = make([dynamic]^Call, allocator)
 	a.subs = make([dynamic]^Sub, allocator)
 	a.mounts = make([dynamic]^Mounted, allocator)
+	a.placed = make(map[Object]Placed, allocator)
 }
 
 destroy :: proc(a: ^Api) {
@@ -174,6 +181,7 @@ destroy :: proc(a: ^Api) {
 	delete(a.calls)
 	delete(a.subs)
 	delete(a.mounts)
+	delete(a.placed)
 }
 
 find_op :: proc(a: ^Api, name: string, code: u16) -> ^Op {
