@@ -347,6 +347,7 @@ Mount :: struct {
 	collided:    [dynamic]string,
 	absent:      [dynamic]string,
 	holds:       [dynamic]Path_Hold,
+	reshow:      [dynamic]string,
 	link_mode:   Link_Mode,
 	gitlinks:    []Gitlink,
 }
@@ -464,6 +465,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.collided = make([dynamic]string, allocator)
 	m.absent = make([dynamic]string, allocator)
 	m.holds = make([dynamic]Path_Hold, allocator)
+	m.reshow = make([dynamic]string, allocator)
 	ok := false
 	defer if !ok {
 		mount_close(m)
@@ -686,6 +688,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(x.path, m.allocator)
 	}
 	delete(m.holds)
+	for c in m.reshow {
+		delete(c, m.allocator)
+	}
+	delete(m.reshow)
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
@@ -1456,6 +1462,18 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	if prim.reader_remaining(&rd) > 0 {
 		m.log_at = prim.read_ivarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		nr := prim.read_uvarint(&rd)
+		if nr > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< nr {
+			r := prim.read_str(&rd)
+			if prim.reader_ok(&rd) {
+				mount_reshow_add(m, r)
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1721,6 +1739,10 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_uvarint(&w, m.shadow_mark.end)
 	prim.write_bool(&w, img.adopt_pending)
 	prim.write_ivarint(&w, 0 if covered else img.log_at)
+	prim.write_uvarint(&w, u64(len(m.reshow)))
+	for r in m.reshow {
+		prim.write_str(&w, r)
+	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None
