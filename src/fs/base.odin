@@ -348,21 +348,83 @@ _base_note :: proc(m: ^Mount, rel: string, note: Base_Note) {
 }
 
 @(private)
-_base_version :: proc(m: ^Mount, c: ^Change) -> (v: []crdt.Op_Id, pinned: bool) {
-	s := c.scope
-	p := _pin(s, c.path, false)
+_change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.Id, observed: bool) {
+	if c.scope != nil {
+		if x := _pin(c.scope, c.path, false); x != nil && (x.has_read || x.has_write) {
+			return x, c.scope.actor, false
+		}
+		return nil, {}, false
+	}
+	a, ok := m.attrib[c.path]
+	if !ok || a.used || m.history == nil || c.old.kind != .File {
+		return nil, {}, false
+	}
+	o, found := _observed(m.history, a.actor, c.old.inode)
+	if !found {
+		return nil, {}, false
+	}
+	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
+	append(&buf.read, ..o.version)
+	buf.read_hash = o.hash
+	buf.has_read = true
+	return buf, a.actor, true
+}
+
+@(private)
+_observed :: proc(h: ^History, actor: prim.Id, inode: fstree.Inode_Id) -> (o: fshist.Observe_Op, found: bool) {
+	want := inode_op(h, inode)
+	known := crdt.graph_known(&h.g, actor)
+	seq := known
+	for seq > 0 {
+		lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, seq - 1})
+		if !ok {
+			return
+		}
+		first, _, stream, off, bok := history_batch_at(h, lv)
+		if !bok {
+			return
+		}
+		b, berr := history_read_batch(h, stream, off, context.temp_allocator)
+		if berr == .None {
+			for op in b.ops {
+				if op.kind == .Opaque && len(op.content) > 0 && op.content[0] == fshist.TOP_OBSERVE {
+					if x, dok := fshist.decode_observe(op.content); dok && x.kind == .Read && x.inode == want {
+						o = x
+						found = true
+					}
+				}
+			}
+			if found {
+				return
+			}
+		}
+		back := u64(lv - first) + 1
+		seq = seq - min(seq, back)
+	}
+	return
+}
+
+@(private)
+_change_pin_drop :: proc(m: ^Mount, c: ^Change, observed: bool) {
+	if !observed && c.scope != nil {
+		_pin_drop(c.scope, c.path)
+	}
+}
+
+@(private)
+_base_version :: proc(m: ^Mount, c: ^Change, p: ^Pin, actor: prim.Id) -> (v: []crdt.Op_Id, pinned: bool) {
 	if p == nil {
 		return nil, false
 	}
 	h := m.history
 	if p.has_write && p.has_base {
 		if t, err := history_text_at(h, c.old.inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
-			return _base_parents(m, s.actor, c.old.inode, p.write[:], p.base_hash), true
+			return _base_parents(m, actor, c.old.inode, p.write[:], p.base_hash), true
 		}
 	}
 	if p.has_read {
 		if t, err := history_text_at(h, c.old.inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
-			return _base_parents(m, s.actor, c.old.inode, p.read[:], p.read_hash), true
+			return _base_parents(m, actor, c.old.inode, p.read[:], p.read_hash), true
 		}
 	}
 	return nil, p.has_read || p.has_base
@@ -403,18 +465,22 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 	h := m.history
 	keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
 	for &c in p.changes {
-		if c.scope == nil || c.kind != .Modify || c.disk != .File || c.moved != "" || c.old.kind != .File {
-			if c.scope != nil && scope_pinned(c.scope, c.path) {
-				_pin_drop(c.scope, c.path)
-				_base_note(m, c.path, .Mismatch)
-			}
+		pbuf: Pin
+		pin, actor, observed := _change_pin(m, &c, &pbuf)
+		if pin == nil {
 			append(&keep, c)
 			continue
 		}
-		v, pinned := _base_version(m, &c)
+		if c.kind != .Modify || c.disk != .File || c.moved != "" || c.old.kind != .File {
+			_change_pin_drop(m, &c, observed)
+			_base_note(m, c.path, .Mismatch)
+			append(&keep, c)
+			continue
+		}
+		v, pinned := _base_version(m, &c, pin, actor)
 		if v == nil {
 			if pinned {
-				_pin_drop(c.scope, c.path)
+				_change_pin_drop(m, &c, observed)
 				_base_note(m, c.path, .Mismatch)
 			}
 			append(&keep, c)
@@ -423,41 +489,35 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		vl := make([dynamic]crdt.Lv, context.temp_allocator)
 		sl := make([dynamic]crdt.Lv, context.temp_allocator)
 		if crdt.graph_version_lvs(&h.g, v, &vl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
-			_pin_drop(c.scope, c.path)
+			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
 			continue
 		}
 		if crdt.frontier_eq(vl[:], sl[:]) {
-			_pin_drop(c.scope, c.path)
+			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Current)
 			append(&keep, c)
 			continue
 		}
-		off_line := false
-		for lv in vl {
-			if !crdt.graph_contains(&h.g, sl[:], lv) {
-				off_line = true
-				break
-			}
-		}
-		if off_line {
+		if _off_line(m, vl[:], sl[:]) {
+			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
 			continue
 		}
-		done, rerr := rebase_commit(p, &c, v)
+		done, rerr := rebase_commit(p, &c, v, actor)
 		#partial switch rerr {
 		case .None:
 		case .Reloading, .Io, .No_Space:
 			return rerr
 		case:
-			_pin_drop(c.scope, c.path)
+			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
 			continue
 		}
-		_pin_drop(c.scope, c.path)
+		_change_pin_drop(m, &c, observed)
 		if !done {
 			_base_note(m, c.path, .Not_Text)
 			append(&keep, c)
@@ -471,7 +531,26 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 }
 
 @(private)
-rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id) -> (done: bool, err: Error) {
+_off_line :: proc(m: ^Mount, vl: []crdt.Lv, sl: []crdt.Lv) -> bool {
+	h := m.history
+	ll := make([dynamic]crdt.Lv, context.temp_allocator)
+	if lv, found, lerr := history_line(h, m.line, context.temp_allocator); lerr == .None && found {
+		if crdt.graph_version_lvs(&h.g, lv, &ll) != .None {
+			return true
+		}
+	} else {
+		append(&ll, ..sl)
+	}
+	for x in vl {
+		if !crdt.graph_contains(&h.g, ll[:], x) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, actor: prim.Id) -> (done: bool, err: Error) {
 	m := p.m
 	h := m.history
 	data, oid, binary, ok := read_content(m, c.path, c.stat, c.old.inode, true) or_return
@@ -480,7 +559,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id) -> (done: bool, err
 	}
 	old := history_text_at(h, c.old.inode, v, context.temp_allocator) or_return
 	b: Builder
-	builder_init(&b, h, c.scope.actor)
+	builder_init(&b, h, actor)
 	shadow_txn_begin(&m.shadow)
 	err = emit_text_edits(m, &b, c.old.inode, c.path, old, data)
 	ne := c.old
@@ -499,7 +578,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id) -> (done: bool, err
 		return false, err
 	}
 	shadow_txn_end(&m.shadow)
-	attrib_set(m, c.path, c.scope.actor, true)
+	attrib_set(m, c.path, actor, true)
 	if has {
 		append(&p.rebased, head)
 	}
