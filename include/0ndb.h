@@ -486,7 +486,7 @@ typedef struct ondb_keyring {
 
 /* Asynchronous plug calls. Every request-reply plug function (credentials
    produce, unlock, enroll, sealed store get/put/add, runner pool
-   verify/attest/renew) receives an ondb_plug_call handle and completes it with
+   verify/attest/renew, scheduler place) receives an ondb_plug_call handle and completes it with
    exactly one ondb_plug_done, either before returning (a synchronous answer)
    or later from any thread. status is an ondb_status: ONDB_OK, or
    ONDB_NOT_FOUND, ONDB_CONFLICT, ONDB_PERMISSION, ONDB_UNSUPPORTED,
@@ -495,7 +495,7 @@ typedef struct ondb_keyring {
    set size = sizeof(ondb_plug_reply) and only the fields the function
    answers: record and entries (each entry a u32le length then the entry) for
    get, credential and prf for unlock, credential, prf and ecosystem for
-   enroll, lease_ms for verify and renew, credential for produce. The optional cancel
+   enroll, lease_ms for verify and renew, credential for produce, runner for place. The optional cancel
    member of each table tells the embedder that the engine no longer waits
    for that call (the user cancelled, a deadline passed, the engine closed);
    ondb_plug_done must still be called once for it, and its answer is
@@ -513,6 +513,7 @@ typedef struct ondb_plug_reply {
 	uint8_t prf[32];
 	int32_t ecosystem;
 	uint64_t lease_ms;
+	uint8_t runner[16];
 } ondb_plug_reply;
 
 int ondb_plug_done(ondb_plug_call *call, int status, const ondb_plug_reply *reply);
@@ -832,7 +833,7 @@ typedef struct ondb_channels {
 } ondb_channels;
 
 typedef struct ondb_placement {
-	uint32_t kind; /* 0 message, 1 intent, 2 revive, 3 schedule, 4 channel */
+	uint32_t kind; /* 0 message, 1 takeover, 2 intent, 3 revive, 4 schedule, 5 channel */
 	uint8_t space[16];
 	uint8_t object[16];
 	uint8_t msg_seg[16];
@@ -841,14 +842,24 @@ typedef struct ondb_placement {
 	uint8_t agent[16];
 	const uint8_t *policy;
 	size_t policy_len;
+	uint64_t msg_gen;
+	uint8_t exclude[16]; /* a runner the work must leave */
+	uint8_t prefer[16];  /* the runner it last ran on, or the parent conversation's */
+	const char *provider;
+	size_t provider_len;
 } ondb_placement;
 
-/* Run placement: return nonzero and fill runner with the device that runs
-   it; return 0 for the reference policy. */
+/* Run placement, asynchronous (see ondb_plug_call): complete with ONDB_OK and
+   reply runner set to the device or pool runner that runs it (all zero keeps
+   the work waiting), or with ONDB_NOT_FOUND (or any error) for the
+   reference policy. The runtime keeps the answer per placement and asks
+   again when a runner's presence or advert changes; the conversation's
+   placement is "placing" until the answer arrives. cancel may be NULL. */
 typedef struct ondb_scheduler {
 	uint32_t size;
 	void *ud;
-	int (*place)(void *ud, const ondb_placement *p, uint8_t runner[16]);
+	void (*place)(void *ud, const ondb_placement *p, ondb_plug_call *call);
+	void (*cancel)(void *ud, ondb_plug_call *call);
 } ondb_scheduler;
 
 /* Secrets such as ANTHROPIC_API_KEY. Return 0 when found. When absent the
@@ -884,6 +895,7 @@ typedef struct ondb_runtime {
 	const ondb_channels *channels;
 	const ondb_scheduler *scheduler;
 	const ondb_secrets *secrets;
+	const char *name; /* this runner's display name in the runner directory */
 } ondb_runtime;
 
 /* Any plug pointer may be NULL to use the reference implementation. */

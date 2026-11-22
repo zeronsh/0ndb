@@ -6,6 +6,7 @@ import "core:strings"
 import "../capi/api"
 import eng "../engine"
 import "../prim"
+import rt "../runtime"
 import osync "../sync"
 
 Host_Plug :: enum u8 {
@@ -14,6 +15,7 @@ Host_Plug :: enum u8 {
 	Runner_Pool,
 	Pool_User,
 	Credentials,
+	Scheduler,
 }
 
 Host_Plugs :: bit_set[Host_Plug;u8]
@@ -24,6 +26,7 @@ HOST_PLUG_NAMES := [Host_Plug]string {
 	.Runner_Pool  = "runner_pool",
 	.Pool_User    = "pool_user",
 	.Credentials  = "credentials",
+	.Scheduler    = "scheduler",
 }
 
 UNLOCK_MODE_NAMES := []string{"local", "cross_device"}
@@ -52,6 +55,12 @@ PLUG_POOL_ATTEST :: 8
 PLUG_USER_JOINED :: 10
 PLUG_CRED_PRODUCE :: 12
 PLUG_POOL_RENEW :: 15
+PLUG_SCHED_PLACE :: 14
+
+@(private, rodata)
+REFERENCE_MARK := [1]u8{1}
+
+PLACEMENT_KIND_NAMES := []string{"message", "takeover", "intent", "revive", "schedule", "channel"}
 
 PLUG_FNS := []Plug_Fn {
 	{PLUG_STORE_GET, "sealed_store.get", .Sealed_Store, 15_000, true, {{"subject", .Bytes, nil}}, {{"record", .Bytes, nil}, {"entries", .Strs, nil}}},
@@ -64,6 +73,7 @@ PLUG_FNS := []Plug_Fn {
 	{PLUG_POOL_RENEW, "runner_pool.renew", .Runner_Pool, 15_000, true, {{"sign", .Bytes, nil}, {"box", .Bytes, nil}}, {{"lease_ms", .U64, nil}}},
 	{PLUG_USER_JOINED, "pool_user.joined", .Pool_User, 0, false, {{"space", .Id, nil}, {"name", .Str, nil}, {"relay", .Str, nil}, {"relay_key", .Bytes, nil}, {"proof", .Bytes, nil}}, {}},
 	{PLUG_CRED_PRODUCE, "credentials.produce", .Credentials, 5_000, false, {{"space", .Id, nil}, {"binding", .Bytes, nil}}, {{"credential", .Bytes, nil}}},
+	{PLUG_SCHED_PLACE, "scheduler.place", .Scheduler, 30_000, false, {{"kind", .Enum, PLACEMENT_KIND_NAMES}, {"object", .Object, nil}, {"msg", .Rid, nil}, {"sender", .Id, nil}, {"agent", .Id, nil}, {"provider", .Str, nil}, {"policy", .Bytes, nil}, {"exclude", .Id, nil}, {"prefer", .Id, nil}}, {{"runner", .Id, nil}, {"reference", .Bool, nil}}},
 }
 
 Plug_Enum :: struct {
@@ -79,6 +89,8 @@ Plug_Value :: union {
 	prim.Id,
 	[][]u8,
 	Plug_Enum,
+	api.Object,
+	api.Rid,
 }
 
 Plug_Field :: struct {
@@ -167,6 +179,63 @@ host_plugs_setup :: proc(d: ^Daemon, ec: ^eng.Config, args: ^Args) -> bool {
 		ec.credentials = eng.Credentials_Source{data = d, produce = _hp_cred_source}
 	}
 	return true
+}
+
+host_scheduler :: proc(d: ^Daemon) -> rt.Scheduler {
+	if .Scheduler not_in d.hc.enabled {
+		return {}
+	}
+	return rt.Scheduler{data = d, place = _hp_sched_reference, ask = _hp_sched_ask, cancel = _hp_sched_cancel}
+}
+
+@(private)
+Sched_Req :: struct {
+	d:     ^Daemon,
+	token: u64,
+}
+
+@(private)
+_hp_sched_reference :: proc(data: rawptr, r: ^rt.Runtime, p: ^rt.Placement) -> prim.Id {
+	return rt.default_scheduler().place(nil, r, p)
+}
+
+@(private)
+_hp_sched_ask :: proc(data: rawptr, r: ^rt.Runtime, p: ^rt.Placement, token: u64) {
+	d := (^Daemon)(data)
+	sr := new(Sched_Req)
+	sr^ = Sched_Req{d, token}
+	fields := []Plug_Field{{"kind", Plug_Enum{u64(p.kind), PLACEMENT_KIND_NAMES}}, {"object", p.object}, {"msg", p.msg}, {"sender", p.sender}, {"agent", p.agent}, {"provider", p.provider}, {"policy", p.policy}, {"exclude", p.exclude}, {"prefer", p.prefer}}
+	if err := _plug_issue(d, PLUG_SCHED_PLACE, fields, osync.Plug_Done{data = sr, call = _hp_sched_done}); err != .Pending {
+		empty: osync.Plug_Reply
+		_hp_sched_done(sr, err, &empty)
+	}
+}
+
+@(private)
+_hp_sched_done :: proc(data: rawptr, err: osync.Error, reply: ^osync.Plug_Reply) {
+	sr := (^Sched_Req)(data)
+	d, token := sr.d, sr.token
+	free(sr)
+	if d.s.r_on {
+		rt.placed(&d.s.r, token, reply.runner, err == .None && len(reply.record) == 0)
+	}
+}
+
+@(private)
+_hp_sched_cancel :: proc(data: rawptr, r: ^rt.Runtime, token: u64) {
+	d := (^Daemon)(data)
+	for x in d.hc.reqs {
+		if x.fn.code != PLUG_SCHED_PLACE {
+			continue
+		}
+		sr := (^Sched_Req)(x.done.data)
+		if sr.token == token {
+			_req_remove(x)
+			_req_free(x)
+			free(sr)
+			return
+		}
+	}
 }
 
 host_plugs_destroy :: proc(d: ^Daemon) {
@@ -358,6 +427,10 @@ _plug_encode :: proc(fn: ^Plug_Fn, fields: []Plug_Field, json_form: bool) -> []u
 			api.o_id(&o, f.name, v)
 		case Plug_Enum:
 			api.o_enum(&o, f.name, v.v, v.names)
+		case api.Object:
+			api.o_object(&o, f.name, v)
+		case api.Rid:
+			api.o_rid(&o, f.name, v)
 		case [][]u8:
 			api.o_arr(&o, f.name, len(v))
 			for b in v {
@@ -567,6 +640,12 @@ _plug_reply :: proc(fn: ^Plug_Fn, out: ^api.Call, reply: ^osync.Plug_Reply) -> o
 		}
 	case PLUG_POOL_VERIFY, PLUG_POOL_RENEW:
 		reply.lease_ms = api.a_u64(out, "lease_ms")
+	case PLUG_SCHED_PLACE:
+		if api.a_bool(out, "reference") {
+			reply.record = REFERENCE_MARK[:]
+		} else {
+			reply.runner = api.a_id(out, "runner")
+		}
 	case PLUG_CRED_PRODUCE:
 		cred := api.a_bytes(out, "credential")
 		if len(cred) == 0 || len(cred) > osync.CREDENTIAL_MAX {
