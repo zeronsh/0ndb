@@ -5,7 +5,6 @@ import "../journal"
 import omap "../map"
 import "../obj"
 import "../prim"
-import osync "../sync"
 
 Delta_Kind :: enum u8 {
 	Message,
@@ -114,17 +113,6 @@ unsubscribe :: proc(e: ^Engine, id: Sub_Id) {
 		if !_subscribed(e, s.object.id) && !s.catalog {
 			if h, err := _handle_get(e, s.object, s.kind); err == .None && h.sp.repl_on && h.kind == .Conversation {
 				_draft_live(e, h, false)
-				if h.grouped && !h.own {
-					osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
-					h.grouped = false
-				}
-				for sg in h.segs {
-					if h.own {
-						break
-					}
-					osync.replicator_unfollow(&h.sp.repl, &h.scope, sg.device, h.name, 0)
-					sg.follow = false
-				}
 			}
 		}
 		_sub_free(e, s)
