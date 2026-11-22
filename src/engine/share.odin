@@ -77,6 +77,7 @@ share_object :: proc(e: ^Engine, o: Object, recipient: osync.Identity, access :=
 		}
 	}
 	if sp, ok := e.spaces[o.space]; ok && sp.open {
+		_grant_member_add(e, sp, r, o.id, access)
 		_card_publish_object(e, sp, o.id)
 		_shared_follow(e, sp, o.id, rec.kind)
 		for m in rec.members {
@@ -131,6 +132,7 @@ accept_share :: proc(e: ^Engine, share: Share) -> Error {
 	_rec_put(e, s.object, &rec) or_return
 	if sp.open {
 		_shared_follow(e, sp, s.object, s.kind)
+		_grantkeys_follow(e, sp, s.object)
 	}
 	return .None
 }

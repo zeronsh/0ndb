@@ -41,6 +41,7 @@ Space :: struct {
 	keys:         osync.Space,
 	mem:          Space_Members,
 	grant_epochs: map[prim.Id][dynamic]Space_Epoch,
+	grantkeys_seen: map[[32]u8]i64,
 	scope:        osync.Scope,
 	open:         bool,
 	repl:         osync.Replicator,
@@ -415,6 +416,7 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 		_members_restore(e, sp)
 	}
 	sp.grant_epochs = make(map[prim.Id][dynamic]Space_Epoch, e.allocator)
+	sp.grantkeys_seen = make(map[[32]u8]i64, e.allocator)
 	sp.grants = make(map[prim.Id]osync.Content_Key, e.allocator)
 	sp.grant_access = make(map[prim.Id]Access_Set, e.allocator)
 	_grants_load(e, sp)
@@ -492,6 +494,7 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 		delete(g)
 	}
 	delete(sp.grant_epochs)
+	delete(sp.grantkeys_seen)
 	_members_free(e, sp)
 	osync.space_clear(&sp.keys)
 	osync.scope_clear(&sp.scope)

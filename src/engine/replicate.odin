@@ -73,11 +73,13 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 	if !sp.keyless {
 		_catalog_follow(e, sp)
 		_held_follow(e, sp)
+		_grantkeys_publish_all(e, sp)
 	} else {
 		for id in _sorted_keys(sp.grants) {
 			if rec, found, _ := _rec_get(e, id); found {
 				_shared_follow(e, sp, id, rec.kind)
 			}
+			_grantkeys_follow(e, sp, id)
 		}
 	}
 	_pending_republish(e, sp)
@@ -470,10 +472,18 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 			_members_remote(e, sp, ev.device, ev.length)
 			return
 		}
+		if obj, ok := _grantkeys_object(ev.name); ok {
+			_grantkeys_read(e, sp, ev.device, obj)
+			return
+		}
 		_remote_changed(e, sp, ev.device, ev.name, ev.epoch, ev.length, ev.stream)
 	case .Segment_Seen:
 		if ev.name == osync.MEMBERS_STREAM {
 			_members_seen(e, sp, ev.device, ev.length)
+			return
+		}
+		if obj, ok := _grantkeys_object(ev.name); ok {
+			_grantkeys_seen(e, sp, ev.device, obj)
 			return
 		}
 		if id, kind, ok := _object_of_name(ev.name); ok {

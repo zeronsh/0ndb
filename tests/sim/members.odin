@@ -21,7 +21,8 @@ M_D :: 5
 M_THIEF :: 6
 M_X :: 7
 M_DIR :: 8
-M_NODES :: 9
+M_GUEST :: 9
+M_NODES :: 10
 M_SUBJECT :: "user@sim"
 M_LEASE_MS :: u64(10 * 60 * 1000)
 
@@ -38,6 +39,10 @@ Mem_World :: struct {
 	token_ok:   i64,
 	rng:        Rng,
 	owned:      [dynamic]prim.Id,
+	guest_space: prim.Id,
+	guest_token: [eng.CAPABILITY_LEN]u8,
+	guest_cc:    eng.Cap_Credentials,
+	guest_ok:    bool,
 }
 
 Mem_Plug :: struct {
@@ -198,6 +203,9 @@ _node_cfg :: proc(n: ^Node, cfg: ^eng.Config) {
 	cfg.sealed_store = osync.Sealed_Store{data = p, get = _store_get, put = _store_put, add = _store_add}
 	cfg.approver = true
 	cfg.notices_rotate = 2048
+	if n.idx == M_GUEST {
+		cfg.credentials = eng.Credentials_Source{data = p, produce = _guest_credentials}
+	}
 	if n.idx == M_POOL {
 		cfg.runner_pool = eng.Runner_Pool{data = p, identity = _pool_identity, verify = _pool_verify, renew = _pool_renew}
 	} else {
@@ -480,7 +488,7 @@ membership_run :: proc(seed: u64) -> (res: Mem_Result) {
 		return
 	}
 	for i in 0 ..< M_NODES {
-		if i != M_THIEF && i != M_X && i != M_DIR && !node_start(w.nodes[i]) {
+		if i != M_THIEF && i != M_X && i != M_DIR && i != M_GUEST && !node_start(w.nodes[i]) {
 			append(&res.failures, fmt.aprintf("n%d start", i))
 			return
 		}
@@ -574,6 +582,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	}
 	_converged(w, spaces[0], {M_A, M_B}, "after approval")
 	_live_space(w, mw, M_A, {M_B}, "live-from-a")
+	_grant_case(w, mw)
 	_adoption_window(w, mw)
 	_short_id_wait(w, mw.owned[len(mw.owned) - 1])
 	_short_id_instant(w, mw.owned[len(mw.owned) - 1])
@@ -1321,6 +1330,100 @@ _upload_wait_case :: proc(w: ^World, sid: prim.Id) {
 		_fail(w, "upload: without a relay connection the create should answer at once with uploaded=false: %v uploaded=%v %v", oerr2, up2, e2)
 	}
 	_settle(w, 3000)
+}
+
+@(private = "file")
+_guest_credentials :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool) {
+	p := (^Mem_Plug)(data)
+	mw := p.mw
+	if !mw.guest_ok || space != mw.guest_space {
+		return {}, false
+	}
+	n := mw.w.nodes[p.idx]
+	c, err := eng.capability_credentials(&mw.guest_cc, osync.file_keyring(&n.keyring), mw.guest_token[:])
+	return c, err == .None
+}
+
+@(private = "file")
+_guest_reads :: proc(w: ^World, o: eng.Object, r: eng.Rid, want: string, ms: i64) -> bool {
+	return _wait_read(w, M_GUEST, o, r, want, ms)
+}
+
+@(private = "file")
+_grant_case :: proc(w: ^World, mw: ^Mem_World) {
+	a := w.nodes[M_A]
+	context = instance_context(&a.inst)
+	sid, cerr := eng.space_create(&a.e, "granted", "relay", w.relay.public)
+	o, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "granted"})
+	node_after(a)
+	if cerr != .None || oerr != .None {
+		_fail(w, "grant: create %v %v", cerr, oerr)
+		return
+	}
+	append(&mw.owned, sid)
+	r0, _ := _send(w, M_A, o, "grant-0")
+	g := _up(w, M_GUEST)
+	context = instance_context(&a.inst)
+	share, serr := eng.share_object(&a.e, o, g.identity, {.Read})
+	tok, terr := eng.capability_issue(&a.e, eng.Capability{space = sid, grantee = g.identity.id, object = o.id, kind = .Conversation, access = {.Read}}, context.temp_allocator)
+	if serr == .None && terr == .None {
+		copy(mw.guest_token[:], tok)
+	}
+	node_after(a)
+	if serr != .None || terr != .None {
+		_fail(w, "grant: share %v capability %v", serr, terr)
+		return
+	}
+	mw.guest_space = sid
+	mw.guest_ok = true
+	context = instance_context(&g.inst)
+	jerr := eng.space_join_shared(&g.e, sid, "guest")
+	eng.space_open(&g.e, sid)
+	aerr := eng.accept_share(&g.e, share)
+	node_after(g)
+	if jerr != .None || aerr != .None {
+		_fail(w, "grant: guest join %v accept %v", jerr, aerr)
+		return
+	}
+	if !_guest_reads(w, o, r0, "grant-0", 20_000) {
+		_fail(w, "grant: the guest cannot read the shared conversation")
+		return
+	}
+	for i in 1 ..= 3 {
+		context = instance_context(&a.inst)
+		rerr := eng.space_rotate(&a.e, sid)
+		node_after(a)
+		if rerr != .None {
+			_fail(w, "grant: rotate %d: %v", i, rerr)
+			return
+		}
+		_settle(w, 1000)
+		texts := [4]string{"grant-0", "grant-1", "grant-2", "grant-3"}
+		text := texts[i]
+		ri, _ := _send(w, M_A, o, text)
+		if !_guest_reads(w, o, ri, text, 20_000) {
+			context = instance_context(&a.inst)
+			st, _ := eng.space_members_status(&a.e, sid)
+			node_after(a)
+			_fail(w, "grant: after epoch advance %d (epoch %d) the guest with an unrevoked grant cannot read %q", i, st.epoch, text)
+			return
+		}
+	}
+	context = instance_context(&a.inst)
+	verr := eng.share_revoke(&a.e, o, g.identity.id)
+	node_after(a)
+	if verr != .None {
+		_fail(w, "grant: revoke: %v", verr)
+		return
+	}
+	_settle(w, 2000)
+	rs, _ := _send(w, M_A, o, "after-revoke")
+	_settle(w, 5000)
+	if t, rerr := _read(w, M_GUEST, o, rs); rerr == .None && t == "after-revoke" {
+		_fail(w, "grant: a revoked guest decrypted a record written after the revoke, although only its relay access was left")
+	}
+	mw.guest_ok = false
+	_down(w, M_GUEST)
 }
 
 @(private = "file")

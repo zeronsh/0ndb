@@ -145,6 +145,7 @@ Cap_Class :: enum u8 {
 	Keys,
 	Checkpoint,
 	Card,
+	Grant_Keys,
 }
 
 @(private)
@@ -292,6 +293,7 @@ _cap_grant_new :: proc(a: ^Cap_Authorizer, c: Capability, key: [32]u8) -> ^Cap_G
 	if hn, err := _concat2(osync.KEYS_HEAD_STREAM, name); err == .None {
 		g.suffixes[osync.stream_suffix(&sc, hn, 0)] = .Keys
 	}
+	g.suffixes[osync.stream_suffix(&sc, osync.grant_keys_name(c.object), 0)] = .Grant_Keys
 	osync.scope_clear(&sc)
 	a.grants[key] = g
 	return g
