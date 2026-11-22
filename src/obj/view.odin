@@ -342,7 +342,8 @@ get_before :: proc(v: ^View, s: int, off: i64, after: i64, hint_from: i64 = -1) 
 record_before :: proc(v: ^View, s: int, end_off: i64) -> (body: []u8, off: i64, err: Error) {
 	b, o, je := jrec_before(v.segs[s].jr, end_off)
 	if je == .Missing {
-		want(v, s, max(end_off - TAIL_GUESS, 0), end_off)
+		jr := v.segs[s].jr
+		want(v, s, min(max(end_off - TAIL_GUESS, 0), jr.missing.from), max(end_off, jr.missing.to))
 		return nil, end_off, .Missing
 	}
 	if je != .None {
@@ -381,7 +382,7 @@ tail :: proc(v: ^View, s: int) -> (sg: ^View_Seg, ok: bool, err: Error) {
 	for pos > 0 {
 		body, off, je := jrec_before(sg.jr, pos)
 		if je == .Missing {
-			want(v, s, pos - suggested_tail(pos), pos)
+			want(v, s, min(pos - suggested_tail(pos), sg.jr.missing.from), max(pos, sg.jr.missing.to))
 			return sg, false, .Missing
 		}
 		if je != .None {
