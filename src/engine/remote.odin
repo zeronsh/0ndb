@@ -33,8 +33,15 @@ Git_Remote :: struct {
 }
 
 Git_Credentials :: struct {
+	data:   rawptr,
+	env:    proc(data: rawptr, url: string, allocator: runtime.Allocator) -> []string,
+	begin:  proc(data: rawptr, url: string, done: Git_Cred_Done) -> Error,
+	cancel: proc(data: rawptr, done: Git_Cred_Done),
+}
+
+Git_Cred_Done :: struct {
 	data: rawptr,
-	env:  proc(data: rawptr, url: string, allocator: runtime.Allocator) -> []string,
+	call: proc(data: rawptr, err: Error, env: []string),
 }
 
 @(private)
@@ -61,6 +68,8 @@ Git_Req :: struct {
 	oids:   [dynamic]odb.Oid,
 	env:    [dynamic]string,
 	done:   bool,
+	e:      ^Engine,
+	creds:  bool,
 }
 
 @(private)
@@ -73,7 +82,12 @@ _git_init :: proc(e: ^Engine) {
 @(private)
 _git_destroy :: proc(e: ^Engine) {
 	for q in e.git.reqs {
-		if !q.done && e.cfg.git_remote.cancel != nil {
+		if q.creds {
+			if e.cfg.git_credentials.cancel != nil {
+				context = _outer(e)
+				e.cfg.git_credentials.cancel(e.cfg.git_credentials.data, Git_Cred_Done{q, _git_cred_done})
+			}
+		} else if !q.done && e.cfg.git_remote.cancel != nil {
 			context = _outer(e)
 			e.cfg.git_remote.cancel(e.cfg.git_remote.data, e, &q.fetch)
 		}
@@ -319,6 +333,7 @@ _git_flush :: proc(e: ^Engine) {
 @(private)
 _git_req_new :: proc(e: ^Engine, space, object: prim.Id, url: int, link: string) -> ^Git_Req {
 	q := new(Git_Req, e.allocator)
+	q.e = e
 	q.space = space
 	q.object = object
 	q.url = url
@@ -334,20 +349,57 @@ _git_start :: proc(e: ^Engine, q: ^Git_Req, db: ^odb.Odb) {
 	q.fetch.git_dir = gd
 	q.fetch.format = db.format
 	q.fetch.oids = q.oids[:]
-	if e.cfg.git_credentials.env != nil {
+	append(&e.git.reqs, q)
+	e.stats.git_fetches += 1
+	if e.cfg.git_credentials.begin != nil {
+		q.creds = true
+		berr: Error
+		{
+			context = _outer(e)
+			berr = e.cfg.git_credentials.begin(e.cfg.git_credentials.data, q.fetch.url, Git_Cred_Done{q, _git_cred_done})
+		}
+		if berr == .None || !q.creds {
+			return
+		}
+		q.creds = false
+	} else if e.cfg.git_credentials.env != nil {
 		extra: []string
 		{
 			context = _outer(e)
 			extra = e.cfg.git_credentials.env(e.cfg.git_credentials.data, q.fetch.url, context.temp_allocator)
 		}
-		for s in extra {
-			c, _ := _clone(s, e.allocator)
-			append(&q.env, c)
-		}
+		_git_env_add(e, q, extra)
 	}
+	_git_launch(e, q)
+}
+
+@(private)
+_git_env_add :: proc(e: ^Engine, q: ^Git_Req, extra: []string) {
+	for s in extra {
+		c, _ := _clone(s, e.allocator)
+		append(&q.env, c)
+	}
+}
+
+@(private)
+_git_cred_done :: proc(data: rawptr, err: Error, env: []string) {
+	q := (^Git_Req)(data)
+	e := q.e
+	context = context_for(e)
+	if !q.creds {
+		return
+	}
+	q.creds = false
+	if err == .None {
+		_git_env_add(e, q, env)
+	}
+	_git_launch(e, q)
+	_touch(e)
+}
+
+@(private)
+_git_launch :: proc(e: ^Engine, q: ^Git_Req) {
 	q.fetch.env = q.env[:]
-	append(&e.git.reqs, q)
-	e.stats.git_fetches += 1
 	ferr: Error
 	{
 		context = _outer(e)
