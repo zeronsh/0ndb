@@ -312,7 +312,9 @@ conversation takes it, any other needs the host to assign a concrete runner.
 ## 7. Recipes for a live UI
 
 Session list. `catalog.list(space, archived, after, limit)` pages rows
-(`rows`, `more`, `next`; pass `next` as `after`). Subscribe to
+(`rows`, `more`, `next`; pass `next` as `after`). A row's `object` is the
+full object (`space/id` in JSON), as in deltas and every op argument; so is
+the `object` of `catalog.find`, `task.children` and `catalog.get` results. Subscribe to
 `subscribe.catalog(space)` first, then list. A `catalog` delta names the row
 that changed in `object` (an object of the space; one delta per row per
 frame) and carries no field values: call `catalog.get(object)` and replace

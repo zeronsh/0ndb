@@ -189,10 +189,10 @@
  *   Counter    := tag: uvarint, value: ivarint
  *   Entry      := key: bytes, registers: [Register], elements: [Element],
  *                 counters: [Counter]
- *   CatalogRow := object: id, kind: enum kind, title: str, parent: Xref,
+ *   CatalogRow := object: object, kind: enum kind, title: str, parent: Xref,
  *                 workspace: id, agent: id, status: enum convo_status,
  *                 activity: uvarint, archived: bool, pinned: bool
- *   CatalogEntry := object: id, kind: enum kind, title: str, parent: Xref,
+ *   CatalogEntry := object: object, kind: enum kind, title: str, parent: Xref,
  *                 workspace: id, agent: id, participants: ids,
  *                 status: enum convo_status, activity: uvarint,
  *                 archived: bool, pinned: bool, takeover: enum takeover

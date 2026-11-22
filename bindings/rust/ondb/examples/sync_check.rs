@@ -33,7 +33,7 @@ fn main() -> ondb::Result<()> {
     let object = loop {
         let rows = client.catalog_list(&space, false, None, 200).wait()?.rows;
         if let Some(r) = rows.iter().find(|r| r.title == title) {
-            break format!("{space}/{}", r.object.clone().unwrap_or_default());
+            break r.object.clone().unwrap_or_default();
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {

@@ -195,7 +195,7 @@ cmd_ls :: proc(a: ^Args) -> int {
 	tbl := make([dynamic][]string, context.temp_allocator)
 	append(&tbl, row("", "ID", "KIND", "STATUS", "ACTIVE", "TITLE", "PLACEMENT"))
 	for x in out {
-		id := jstr(x, "object")
+		id := row_id(x)
 		mark := "*" if len(cur) == 65 && cur[33:] == id else ""
 		status := jstr(x, "status") if jstr(x, "kind") == "conversation" else ""
 		title := jstr(x, "title")
@@ -328,7 +328,7 @@ cmd_models :: proc(a: ^Args) -> int {
 _marked :: proc(s: ^Session, field: string) -> [dynamic]json.Value {
 	out := make([dynamic]json.Value, context.temp_allocator)
 	for row in catalog_rows(s, default_space(s)) {
-		if jstr(row, "kind") == "map" && jstr(row, field) == jstr(row, "object") {
+		if jstr(row, "kind") == "map" && jstr(row, field) == row_id(row) {
 			append(&out, row)
 		}
 	}
@@ -369,7 +369,7 @@ cmd_agent :: proc(a: ^Args) -> int {
 			return 0
 		}
 		for row in rows {
-			fmt.printfln("%s  %s", short(jstr(row, "object")), jstr(row, "title"))
+			fmt.printfln("%s  %s", short(row_id(row)), jstr(row, "title"))
 		}
 	case "show":
 		if len(a.pos) < 2 {
@@ -425,7 +425,7 @@ cmd_workspace :: proc(a: ^Args) -> int {
 			return 0
 		}
 		for row in rows {
-			fmt.printfln("%s  %s", short(jstr(row, "object")), jstr(row, "title"))
+			fmt.printfln("%s  %s", short(row_id(row)), jstr(row, "title"))
 		}
 	case "show":
 		if len(a.pos) < 2 {
@@ -715,7 +715,7 @@ actor_names :: proc(s: ^Session) -> map[string]string {
 	}
 	for row in _marked(s, "agent") {
 		r := req_begin("agent.actor")
-		req_str(&r, "agent", jstr(row, "object"))
+		req_str(&r, "agent", row_id(row))
 		v := call(s, req_end(&r))
 		if v.status == .Ok {
 			out[jstr(v.value, "actor")] = jstr(row, "title")

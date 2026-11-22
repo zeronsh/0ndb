@@ -314,7 +314,7 @@ op_task_children :: proc(c: ^Call, o: ^Out) -> Status {
 		if i >= limit {
 			break
 		}
-		emit_catalog_row(o, &k)
+		emit_catalog_row(o, parent.space, &k)
 	}
 	o_end(o)
 	return .Ok

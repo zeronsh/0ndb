@@ -268,7 +268,7 @@ pub struct Xref {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CatalogRow {
-    pub object: Option<Id>,
+    pub object: Option<ObjectRef>,
     pub kind: String,
     pub title: String,
     pub parent: Xref,
@@ -291,7 +291,7 @@ pub struct CatalogList {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CatalogEntry {
-    pub object: Option<Id>,
+    pub object: Option<ObjectRef>,
     pub kind: String,
     pub title: String,
     pub parent: Xref,

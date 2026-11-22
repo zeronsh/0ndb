@@ -570,12 +570,13 @@ op_tree_remove :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_catalog_get :: proc(c: ^Call, o: ^Out) -> Status {
-	en, found, err := eng.catalog_get(c.api.e, a_object(c, "object"), context.temp_allocator, ready(c))
+	ob := a_object(c, "object")
+	en, found, err := eng.catalog_get(c.api.e, ob, context.temp_allocator, ready(c))
 	if err != .None {
 		return pend(c, err)
 	}
 	o_bool(o, "found", found)
-	emit_catalog_entry(o, "entry", &en)
+	emit_catalog_entry(o, "entry", ob.space, &en)
 	return .Ok
 }
 
@@ -586,13 +587,14 @@ op_catalog_list :: proc(c: ^Call, o: ^Out) -> Status {
 		limit = 64
 	}
 	pc := &cur
-	rows, more, err := eng.catalog_list(c.api.e, a_id(c, "space"), a_bool(c, "archived"), pc, min(limit, 4096), context.temp_allocator, ready(c))
+	space := a_id(c, "space")
+	rows, more, err := eng.catalog_list(c.api.e, space, a_bool(c, "archived"), pc, min(limit, 4096), context.temp_allocator, ready(c))
 	if err != .None {
 		return pend(c, err)
 	}
 	o_arr(o, "rows", len(rows))
 	for &r in rows {
-		emit_catalog_row(o, &r)
+		emit_catalog_row(o, space, &r)
 	}
 	o_end(o)
 	o_bool(o, "more", more)
@@ -601,13 +603,14 @@ op_catalog_list :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_catalog_find :: proc(c: ^Call, o: ^Out) -> Status {
-	rows, err := eng.catalog_find(c.api.e, a_id(c, "space"), a_str(c, "text"), context.temp_allocator, ready(c))
+	space := a_id(c, "space")
+	rows, err := eng.catalog_find(c.api.e, space, a_str(c, "text"), context.temp_allocator, ready(c))
 	if err != .None {
 		return pend(c, err)
 	}
 	o_arr(o, "rows", len(rows))
 	for &r in rows {
-		emit_catalog_row(o, &r)
+		emit_catalog_row(o, space, &r)
 	}
 	o_end(o)
 	return .Ok

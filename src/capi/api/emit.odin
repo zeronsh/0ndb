@@ -388,9 +388,9 @@ emit_xref :: proc(o: ^Out, name: string, x: eng.Rid, object: prim.Id) {
 	o_end(o)
 }
 
-emit_catalog_row :: proc(o: ^Out, r: ^omap.Catalog_Row) {
+emit_catalog_row :: proc(o: ^Out, space: prim.Id, r: ^omap.Catalog_Row) {
 	o_obj(o, "")
-	o_id(o, "object", r.object)
+	o_object(o, "object", Object{space, r.object})
 	o_enum(o, "kind", u64(r.kind), KIND_NAMES[:])
 	o_str(o, "title", r.title)
 	emit_xref(o, "parent", r.parent.rid, r.parent.object)
@@ -403,9 +403,9 @@ emit_catalog_row :: proc(o: ^Out, r: ^omap.Catalog_Row) {
 	o_end(o)
 }
 
-emit_catalog_entry :: proc(o: ^Out, name: string, c: ^omap.Catalog_Entry) {
+emit_catalog_entry :: proc(o: ^Out, name: string, space: prim.Id, c: ^omap.Catalog_Entry) {
 	o_obj(o, name)
-	o_id(o, "object", c.object)
+	o_object(o, "object", Object{space, c.object})
 	o_enum(o, "kind", u64(c.kind), KIND_NAMES[:])
 	o_str(o, "title", c.title)
 	emit_xref(o, "parent", c.parent.rid, c.parent.object)
