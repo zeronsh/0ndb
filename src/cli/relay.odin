@@ -268,8 +268,13 @@ op_verify :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 				}
 			}
 			got, derr := prim.read_file(prim.os_vfs(), disk, context.temp_allocator)
-			if derr != .None || string(got) != string(want) {
+			if derr != .None {
 				append(bad, p)
+			} else if string(got) != string(want) {
+				clean, cok := fs.eol_clean(m.mount, p, got)
+				if !cok || string(clean) != string(want) {
+					append(bad, p)
+				}
 			}
 		}
 		return .Ok
