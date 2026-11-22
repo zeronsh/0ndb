@@ -1146,7 +1146,7 @@ concurrent_pairs :: proc(w: ^World, oi: int) -> []Pair {
 	}
 	for a in ops {
 		for b in ops {
-			if a.node == b.node || a.path != b.path || a.at > b.at || (a.at == b.at && a.idx >= b.idx) {
+			if (a.node == b.node && (a.kind == .Tree_Write) == (b.kind == .Tree_Write)) || a.path != b.path || a.at > b.at || (a.at == b.at && a.idx >= b.idx) {
 				continue
 			}
 			live := true
