@@ -60,6 +60,7 @@ Group :: struct {
 	mode:        Mode,
 	shift:       u8,
 	salt:        [SALT]u8,
+	holes:       []Cells,
 	header:      []u8,
 	payload:     []u8,
 }
@@ -77,10 +78,16 @@ Builder :: struct {
 	allocator:   runtime.Allocator,
 }
 
+Cells :: struct {
+	from: i64,
+	to:   i64,
+}
+
 Seal_Entry :: struct {
 	first:   i64,
 	end:     i64,
 	arc_off: i64,
+	arc_len: i64,
 }
 
 Seal :: struct {
@@ -205,9 +212,22 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 	prim.write_raw(&w, b.head[:])
 	prim.write_u8(&w, u8(mode))
 	s := salt
+	holes: []Cells
 	if mode == .Sealed {
+		if keys.key == nil || shift > 30 {
+			resize(out, start)
+			return .No_Key
+		}
+		holes = cell_holes(keys, b.first, b.pos, shift)
 		prim.write_u8(&w, shift)
 		prim.write_raw(&w, s[:])
+		prim.write_uvarint(&w, u64(len(holes)))
+		prev: i64
+		for h in holes {
+			prim.write_uvarint(&w, u64(h.from - prev))
+			prim.write_uvarint(&w, u64(h.to - h.from))
+			prev = h.to
+		}
 	}
 	if w.err != .None {
 		return .No_Memory
@@ -244,7 +264,7 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 		resize(out, start + header_len + n)
 		return .None
 	}
-	k, kerr := group_key(keys, b.first, b.pos, shift, s)
+	k, kerr := group_key(keys, b.first, b.pos, shift, s, holes)
 	if kerr != .None {
 		resize(out, start)
 		return kerr
@@ -262,7 +282,27 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 	return .None
 }
 
-group_key :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, salt: [SALT]u8) -> (k: journal.Key, err: Error) {
+cell_holes :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, allocator := context.temp_allocator) -> []Cells {
+	out := make([dynamic]Cells, allocator)
+	lo := first >> shift
+	hi := (end - 1) >> shift
+	for c := lo; c <= hi; c += 1 {
+		rk: journal.Key
+		ok := keys.key(keys.data, c << shift, &rk)
+		_wipe(rk[:])
+		if ok {
+			continue
+		}
+		if len(out) > 0 && out[len(out) - 1].to == c {
+			out[len(out) - 1].to = c + 1
+		} else {
+			append(&out, Cells{c, c + 1})
+		}
+	}
+	return out[:]
+}
+
+group_key :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, salt: [SALT]u8, holes: []Cells) -> (k: journal.Key, err: Error) {
 	if keys.key == nil || shift > 30 || end <= first {
 		return {}, .No_Key
 	}
@@ -273,8 +313,15 @@ group_key :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, salt: 
 	prim.put_u64le(b[0:8], u64(first))
 	prim.put_u64le(b[8:16], u64(end))
 	blake2b.update(&ctx, b[:])
-	step := i64(1) << shift
-	for off := first &~ (step - 1); off < end; off += step {
+	hi := 0
+	for c := first >> shift; c <= (end - 1) >> shift; c += 1 {
+		for hi < len(holes) && holes[hi].to <= c {
+			hi += 1
+		}
+		if hi < len(holes) && holes[hi].from <= c {
+			continue
+		}
+		off := c << shift
 		rk: journal.Key
 		if !keys.key(keys.data, off, &rk) {
 			_wipe(rk[:])
@@ -319,7 +366,26 @@ group_parse :: proc(body: []u8, arc_off: i64) -> (g: Group, err: Error) {
 	if g.mode == .Sealed {
 		g.shift = prim.read_u8(&r)
 		prim.read_fixed(&r, g.salt[:])
-		if r.err != .None || g.shift > 30 || prim.reader_remaining(&r) < TAG {
+		nh := prim.read_uvarint(&r)
+		if r.err != .None || g.shift > 30 || nh > u64(prim.reader_remaining(&r) / 2) {
+			return {}, .Corrupt
+		}
+		holes := make([]Cells, int(nh), context.temp_allocator)
+		prev: i64
+		lo := g.first >> g.shift
+		top := ((g.end - 1) >> g.shift) + 1
+		for i in 0 ..< int(nh) {
+			gap := prim.read_uvarint(&r)
+			n := prim.read_uvarint(&r)
+			from := prev + i64(gap)
+			holes[i] = Cells{from, from + i64(n)}
+			if r.err != .None || n == 0 || from < lo || holes[i].to > top || (i > 0 && gap == 0) {
+				return {}, .Corrupt
+			}
+			prev = holes[i].to
+		}
+		g.holes = holes
+		if prim.reader_remaining(&r) < TAG {
 			return {}, .Corrupt
 		}
 	}
@@ -332,7 +398,7 @@ group_open :: proc(g: ^Group, keys: journal.Key_Provider, allocator := context.t
 	plain := g.payload
 	if g.mode == .Sealed {
 		frame := g.payload[:len(g.payload) - TAG]
-		k := group_key(keys, g.first, g.end, g.shift, g.salt) or_return
+		k := group_key(keys, g.first, g.end, g.shift, g.salt, g.holes) or_return
 		buf, aerr := make([]u8, len(frame), context.temp_allocator)
 		if aerr != nil {
 			_wipe(k[:])
@@ -511,7 +577,21 @@ entry_record :: proc(e: ^Entry, out: []u8, keys: journal.Key_Provider, sealed: b
 	prim.put_u32le(rec[journal.HEADER + e.len:], u32(e.len))
 	body := rec[journal.HEADER:][:e.len]
 	switch e.kind {
-	case .Sig, .Redacted:
+	case .Sig:
+		_wipe(body)
+		if e.len > 0 {
+			body[0] = journal.SIG_KIND
+			tag := journal.local_tag(body, e.off)
+			copy(rec[4:journal.HEADER], tag[:])
+			if !sealed || journal.seal_record(rec, e.off, keys) == .None {
+				return .None
+			}
+		}
+		_wipe(body)
+		tag := journal.redacted_tag(e.off, e.len)
+		copy(rec[4:journal.HEADER], tag[:])
+		return .None
+	case .Redacted:
 		_wipe(body)
 		tag := journal.redacted_tag(e.off, e.len)
 		copy(rec[4:journal.HEADER], tag[:])
@@ -542,6 +622,7 @@ seal_encode :: proc(out: ^[dynamic]u8, s: ^Seal) -> Error {
 		prim.write_ivarint(&w, e.first - prev.end)
 		prim.write_uvarint(&w, u64(e.end - e.first))
 		prim.write_ivarint(&w, e.arc_off - prev.arc_off)
+		prim.write_uvarint(&w, u64(e.arc_len))
 		prev = e
 	}
 	return .None if w.err == .None else .No_Memory
@@ -556,7 +637,7 @@ seal_parse :: proc(body: []u8, s: ^Seal) -> Error {
 	prim.read_fixed(&r, s.head[:])
 	full := prim.read_uvarint(&r)
 	count := prim.read_uvarint(&r)
-	if r.err != .None || base > u64(SPAN_MAX) || count > u64(prim.reader_remaining(&r) / 3) {
+	if r.err != .None || base > u64(SPAN_MAX) || count > u64(prim.reader_remaining(&r) / 4) {
 		return .Corrupt
 	}
 	s.base = i64(base)
@@ -569,7 +650,8 @@ seal_parse :: proc(body: []u8, s: ^Seal) -> Error {
 		e.first = prev.end + prim.read_ivarint(&r)
 		e.end = e.first + i64(prim.read_uvarint(&r))
 		e.arc_off = prev.arc_off + prim.read_ivarint(&r)
-		if r.err != .None || e.first < 0 || e.end <= e.first || e.end > s.base || e.arc_off < 0 {
+		e.arc_len = i64(prim.read_uvarint(&r))
+		if r.err != .None || e.first < 0 || e.end <= e.first || e.end > s.base || e.arc_off < 0 || e.arc_len < journal.OVERHEAD || e.arc_len > i64(journal.MAX_BODY) + journal.OVERHEAD {
 			return .Corrupt
 		}
 		append(&s.entries, e)

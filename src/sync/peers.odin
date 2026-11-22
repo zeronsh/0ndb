@@ -131,6 +131,7 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 	if !ok {
 		return
 	}
+	rm.trimmed = ev.trimmed
 	_remote_base(r, rm, ev.base, ev.length)
 	for x, i in rm.refused {
 		if x == rm.device {

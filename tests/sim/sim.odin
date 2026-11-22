@@ -47,6 +47,8 @@ default_config :: proc(seed: u64) -> Config {
 		trace_limit = 4000,
 		storage = .Device if rng_chance(&r, 1, 3) else .Device_Until_Run if rng_chance(&r, 1, 3) else .Auto,
 		durability = .Async if rng_chance(&r, 1, 2) else .Deferred,
+		archive_min = -1 if rng_chance(&r, 1, 5) else i64(512 + rng_int(&r, 16 * 1024)),
+		archive_group = 2048 + rng_int(&r, 64 * 1024),
 	}
 }
 
@@ -319,6 +321,11 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		cfg.durability = mode
 	}
 	cfg.promote = i64(env_u64("SIM_PROMOTE", u64(cfg.promote)))
+	if v, ok := os.lookup_env("SIM_ARCHIVE", context.temp_allocator); ok {
+		if n, nok := strconv.parse_i64(v); nok {
+			cfg.archive_min = n
+		}
+	}
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
 	cfg.keep_faults = filter_parse("SIM_KEEP_FAULTS")
 	if f, ok := os.lookup_env("SIM_FAULTS", context.temp_allocator); ok && f == "0" {
@@ -363,6 +370,8 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	}
 	res.trace = w.trace
 	res.stats = w.stats
+	res.stats.trims += w.relay.r.stats.trims
+	res.stats.trimmed += w.relay.r.stats.trimmed
 	res.op_events = w.op_index
 	res.fault_events = w.fault_index
 	res.sim_ns = w.now
@@ -463,6 +472,10 @@ finish :: proc(w: ^World) {
 	check_relay_storage(w)
 	check_mounts(w)
 	if w.aborted {
+		return
+	}
+	check_archive_reread(w)
+	if w.aborted || len(w.failures) > 0 {
 		return
 	}
 	idle := run_until(w, w.now + 600_000_000_000, true)
@@ -688,6 +701,10 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.ops += st.stats.ops
 		total.stats.crashes += st.stats.crashes
 		total.stats.relay_crash += st.stats.relay_crash
+		total.stats.trims += st.stats.trims
+		total.stats.trimmed += st.stats.trimmed
+		total.stats.rereads += st.stats.rereads
+		total.stats.reread_bytes += st.stats.reread_bytes
 		total.stats.resets += st.stats.resets
 		total.stats.partitions += st.stats.partitions
 		total.stats.engine_close += st.stats.engine_close
@@ -869,6 +886,7 @@ run_child :: proc(seed: u64, replay: bool, extra: []string = nil) -> (st: Wire_S
 print_stats :: proc(r: ^Run_Result) {
 	secs := f64(r.wall_ns) / 1e9
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
+	fmt.eprintf("sim: trims=%d trimmed_bytes=%d archive_rereads=%d reread_bytes=%d\n", r.stats.trims, r.stats.trimmed, r.stats.rereads, r.stats.reread_bytes)
 	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d expected_conflicts=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, r.stats.conflict_pairs, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
 	fmt.eprintf("sim: interactive_reads=%d waited=%d data=%d absent=%d quarantined=%d closed=%d dropped_by_crash=%d max_wait_ms=%d rid_probes=%d rid_reused=%d\n", r.stats.live_reads, r.stats.live_waited, r.stats.live_data, r.stats.live_absent, r.stats.live_quarantined, r.stats.live_closed, r.stats.live_dropped, r.stats.live_wait_ms, r.stats.rid_probes, r.stats.rid_reused)
 	fmt.eprintf("sim: streamed=%d draft_frames=%d draft_deltas=%d draft_delta_bytes=%d remote_draft_bytes=%d segment_delta_bytes=%d draft_blocks_checked=%d\n", r.stats.stream_bytes, r.stats.draft_frames, r.stats.draft_deltas, r.stats.draft_delta_bytes, r.stats.remote_draft_bytes, r.stats.seg_delta_bytes, r.stats.draft_checked)

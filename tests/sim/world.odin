@@ -107,6 +107,10 @@ Relay_Node :: struct {
 
 World_Stats :: struct {
 	events:       u64,
+	trims:        u64,
+	trimmed:      u64,
+	rereads:      u64,
+	reread_bytes: u64,
 	steps:        u64,
 	ops:          u64,
 	ops_failed:   u64,
@@ -174,6 +178,8 @@ Config :: struct {
 	storage:     eng.Storage_Mode,
 	durability:  eng.Durability,
 	promote:     i64,
+	archive_min: i64,
+	archive_group: int,
 }
 
 World :: struct {

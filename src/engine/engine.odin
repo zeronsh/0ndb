@@ -213,6 +213,9 @@ Config :: struct {
 	content_budget:  i64,
 	always_on:       bool,
 	holder_budget:   i64,
+	archive_min:     i64,
+	archive_group:   int,
+	archive_level:   int,
 	user:            rawptr,
 }
 

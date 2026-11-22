@@ -474,6 +474,8 @@ _trim_done :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn, p: ^Pending, resu
 	sp.usage = max(sp.usage - value, 0)
 	st.base = r.store.stream_base(r.store.data, st.h)
 	st.trimmed = true
+	r.stats.trims += 1
+	r.stats.trimmed += u64(max(value, 0))
 	if c != nil {
 		_reply_hollow(c, .Noted, p.id, st.base, st.length)
 	}

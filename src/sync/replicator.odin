@@ -86,6 +86,10 @@ Replicator_Config :: struct {
 	on_event:     Repl_Handler,
 	user:         rawptr,
 	durable:      proc(user: rawptr, path: string) -> (length: i64, ok: bool),
+	signer:       journal.Signer,
+	archive_min:  i64,
+	archive_group: int,
+	archive_level: int,
 }
 
 Stream_Sealing :: enum u8 {
@@ -159,6 +163,16 @@ Local :: struct {
 	verify:    [dynamic]u8,
 	hollow:    bool,
 	noting:    bool,
+	repl:      ^Replicator,
+	scope:     Scope,
+	archive:   bool,
+	arc_sealed: i64,
+	arc_timer: prim.Timer,
+	arc_child: bool,
+	trim_for:  Stream_Id,
+	trim_base: i64,
+	trim_at:   i64,
+	trim_sent: i64,
 }
 
 Remote :: struct {
@@ -218,6 +232,10 @@ Remote :: struct {
 	refused:   [dynamic]Device_Id,
 	carry:     [dynamic]u8,
 	carry_at:  i64,
+	trimmed:   bool,
+	arc:       ^Arc_Read,
+	arc_of:    ^Remote,
+	arc_broken: [dynamic]journal.Range,
 }
 
 Group :: struct {
@@ -371,7 +389,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.dir = _clone_string(cfg.dir, allocator) or_return
 	r.cfg.dir = r.dir
 	r.cfg.relay = ""
-	for sub in ([]string{"up", "replicas", "ckpt"}) {
+	for sub in ([]string{"up", "replicas", "ckpt", "arc"}) {
 		p, perr := prim.path_join(context.temp_allocator, r.dir, sub)
 		if perr != .None {
 			return _from_prim(perr)
@@ -569,7 +587,7 @@ _limit :: proc(r: ^Replicator, l: ^Local) -> i64 {
 	return max(min(l.durable, n), l.cursor)
 }
 
-replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil, hollow := false) -> Error {
+replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil, hollow := false, archive := false) -> Error {
 	_enter(r)
 	defer _leave(r)
 	id := stream_id(scope, r.cfg.self, name, epoch)
@@ -583,6 +601,7 @@ replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u
 	if !l.noting {
 		l.hollow = hollow
 	}
+	l.archive = archive
 	l.durable = max(l.durable, durable)
 	l.blocked = false
 	_local_pump(r, l)
@@ -715,6 +734,14 @@ replicator_confirmed_empty :: proc(r: ^Replicator, scope: ^Scope, device: Device
 	return ok && rm.empty_ok && journal.replica_length(&rm.rep) == 0
 }
 
+replicator_pending :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
+	id := stream_id(scope, device, name, epoch)
+	if rm, ok := r.remotes[id]; ok {
+		return rm.tail > 0 || len(rm.wants) > 0
+	}
+	return false
+}
+
 replicator_acquire :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> (^journal.Replica, Error) {
 	rm, err := _remote_get(r, scope, device, name, epoch)
 	if err != .None {
@@ -813,7 +840,10 @@ _local_open :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, id:
 	if count > 0 {
 		l.floor = newest.value
 		l.floor_seq = newest.seq
+		l.arc_sealed = newest.start
 	}
+	l.repl = r
+	l.scope = scope^
 	l.cursor = l.floor
 	l.durable = l.floor
 	l.epoch = epoch
@@ -841,6 +871,8 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 	if l.floor_fd >= 0 {
 		prim.close_file(r.vfs, l.floor_fd)
 	}
+	_arc_free_local(r, l)
+	scope_clear(&l.scope)
 	crypto.zero_explicit(&l.key, size_of(l.key))
 	if len(l.drop_path) > 0 {
 		delete(l.drop_path, r.allocator)
@@ -853,7 +885,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
-	if l.fatal || l.inflight > 0 || l.verifying || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l {
+	if l.fatal || l.inflight > 0 || l.verifying || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l || l.arc_timer != 0 {
 		return
 	}
 	if r.hold > 0 {
@@ -975,10 +1007,13 @@ _local_advance :: proc(r: ^Replicator, l: ^Local, to: i64) -> Error {
 	if to > l.floor {
 		l.floor = to
 		l.floor_seq += 1
-		slot_write(r.vfs, l.floor_fd, Slot{seq = l.floor_seq, value = to, start = 0}) or_return
+		slot_write(r.vfs, l.floor_fd, Slot{seq = l.floor_seq, value = to, start = min(l.arc_sealed, to)}) or_return
 		_from_prim(prim.datasync(r.vfs, l.floor_fd)) or_return
 	}
-	_emit(r, Repl_Event{kind = .Uploaded, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, length = to})
+	if !l.arc_child {
+		_emit(r, Repl_Event{kind = .Uploaded, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, length = to})
+	}
+	_arc_advanced(r, l)
 	return .None
 }
 
@@ -1285,7 +1320,12 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 		_stage_flush(r, true, -1)
 		r.rx_remote = nil
 	}
+	_arc_release(r, rm)
+	if up := rm.arc_of; up != nil && up.arc != nil && up.arc.arm == rm {
+		up.arc.arm = nil
+	}
 	journal.replica_close(&rm.rep)
+	delete(rm.arc_broken)
 	delete(rm.kheld)
 	crypto.zero_explicit(&rm.skey, size_of(rm.skey))
 	scope_clear(&rm.scope)
@@ -1309,7 +1349,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
-	if _following(rm) || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm {
+	if _following(rm) || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm || (rm.arc != nil && len(rm.arc.wants) > 0) {
 		return
 	}
 	if r.hold > 0 {
@@ -1537,6 +1577,13 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 			fetch.to = fetch.from + STAGE_MAX
 		}
 	}
+	if fetch.from < rm.base && rm.trimmed {
+		_arc_want(r, rm, fetch.from, min(fetch.to, rm.base))
+		if fetch.to <= rm.base {
+			return
+		}
+		fetch.from = rm.base
+	}
 	if fetch.from < rm.base {
 		_pull_range(r, rm, fetch.from, min(fetch.to, rm.base))
 		if fetch.to <= rm.base {
@@ -1624,6 +1671,10 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 		_remote_maybe_free(r, rm)
 		return
 	}
+	settled := false
+	defer if settled || (rm.arc_of != nil && len(rm.wants) == 0) {
+		_arc_arm_settled(r, rm)
+	}
 	for i := 0; i < len(rm.wants); {
 		w := rm.wants[i]
 		to := min(w.to, rm.relay_len)
@@ -1634,7 +1685,8 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 				continue
 			}
 			ordered_remove(&rm.wants, i)
-			if rm.is_head {
+			if rm.is_head || rm.arc_of != nil {
+				settled = true
 				continue
 			}
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = w.from, length = rm.relay_len})
@@ -1663,6 +1715,10 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 			ordered_remove(&rm.wants, i)
 			if rm.is_head {
 				_keys_head_seen(r, rm)
+				continue
+			}
+			if rm.arc_of != nil {
+				settled = true
 				continue
 			}
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = to, length = rm.relay_len})

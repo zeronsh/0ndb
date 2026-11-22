@@ -615,7 +615,7 @@ _card_publish_in :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, path: stri
 
 @(private)
 _card_want :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string) {
-	if !sp.keyless {
+	if !sp.keyless && !osync.replicator_pending(&sp.repl, &sp.scope, device, CARD_STREAM, 0) {
 		osync.replicator_want_tail(&sp.repl, &sp.scope, device, CARD_STREAM, 0, 4096)
 	}
 	id, _, ok := _object_of_name(name)
@@ -643,7 +643,7 @@ _card_watch :: proc(e: ^Engine, sp: ^Space, sc: ^osync.Scope, device: prim.Id, f
 	}
 	if follow {
 		osync.replicator_follow(&sp.repl, sc, device, CARD_STREAM, 0, true)
-	} else {
+	} else if !osync.replicator_pending(&sp.repl, sc, device, CARD_STREAM, 0) {
 		osync.replicator_want_tail(&sp.repl, sc, device, CARD_STREAM, 0, 4096)
 	}
 }
