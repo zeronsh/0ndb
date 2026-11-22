@@ -431,6 +431,14 @@ equal in both directions.
   never overwritten, and the plan is rebuilt from the new synced version.
   Untracked content that is exactly the inode at the target version (what a
   truncated shadow forgot) is adopted: a shadow entry, no write, no ingest.
+  A first mount of a folder whose tree already has content adopts against
+  the tree's line: the disk is imported onto the line's inodes, then the
+  line is materialized. The mount state carries an adopt-pending flag,
+  written before the synced version takes the line and cleared only with
+  the image saved after that materialization; while it is set, the synced
+  version is not trusted, and every open, pass or materialization finishes
+  the adopt first, so a failure in between never leaves the synced version
+  claiming files the disk lacks.
   If ingesting changes nothing (an ignored file in the way), nothing is
   written and the path is reported as a collision. The synced version never
   claims anything the disk does not hold. Only durable history is

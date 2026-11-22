@@ -7,7 +7,7 @@ import "../prim"
 
 mount_synced_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	h := m.history
-	if h == nil || !m.awake || m.rescan || len(m.fences) > 0 || m.restoring || m.adopting || len(m.unwatched) > 0 {
+	if h == nil || !m.awake || m.rescan || len(m.fences) > 0 || m.restoring || m.adopting || m.adopt_pending || len(m.unwatched) > 0 {
 		return .None
 	}
 	lvs := make([dynamic]crdt.Lv, context.temp_allocator)

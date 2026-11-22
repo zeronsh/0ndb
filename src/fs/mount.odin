@@ -313,6 +313,7 @@ Mount :: struct {
 	jpos:        i64,
 	jpend:       i64,
 	imported:    bool,
+	adopt_pending: bool,
 	hold_line:   bool,
 	alias:       [dynamic]Version,
 	unwatched:   [dynamic]string,
@@ -1333,6 +1334,9 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		m.shadow_mark.gen = prim.read_uvarint(&rd)
 		m.shadow_mark.end = prim.read_uvarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		m.adopt_pending = prim.read_bool(&rd)
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1386,6 +1390,7 @@ Mount_Image :: struct {
 	reflog_pos: i64,
 	stamp:      Index_Stamp,
 	imported:   bool,
+	adopt_pending: bool,
 }
 
 Mount_Wait :: struct {
@@ -1403,6 +1408,7 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	img.reflog_pos = m.reflog_pos
 	img.stamp = m.stamp
 	img.imported = m.imported
+	img.adopt_pending = m.adopt_pending
 	img.jpos = m.jpend
 }
 
@@ -1579,6 +1585,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	}
 	prim.write_uvarint(&w, m.shadow_mark.gen)
 	prim.write_uvarint(&w, m.shadow_mark.end)
+	prim.write_bool(&w, img.adopt_pending)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		attrib_log_reset(m)
