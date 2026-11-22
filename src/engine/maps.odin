@@ -254,10 +254,48 @@ catalog_find :: proc(e: ^Engine, space: prim.Id, text: string, allocator := cont
 			}
 		}
 	}
-	if len(out) == 0 && ready.call != nil && sp.repl_on && sp.connected && (!osync.replicator_caught_up(&sp.repl) || _handle_waiting(h, ready.fresh)) {
+	if len(out) == 0 && ready.call != nil && _catalog_behind(e, sp, h, ready.fresh) {
 		return nil, _space_wait_on(e, sp, ready, .Catalog)
 	}
 	return out[:], .None
+}
+
+@(private)
+_catalog_behind :: proc(e: ^Engine, sp: ^Space, h: ^Handle, fresh: bool) -> bool {
+	if !sp.repl_on || !sp.connected {
+		return false
+	}
+	if !osync.replicator_caught_up(&sp.repl) || _handle_waiting(h, fresh) {
+		return true
+	}
+	known := make([dynamic]prim.Id, context.temp_allocator)
+	for d in osync.replicator_segments(&sp.repl, &h.scope, h.name, 0) {
+		append(&known, prim.Id(d))
+	}
+	if rec, found, err := _rec_get(e, h.id); err == .None && found {
+		for m in rec.members {
+			append(&known, m.device)
+		}
+	}
+	for d in known {
+		if d == e.self {
+			continue
+		}
+		seg: ^Seg
+		for s in h.segs {
+			if s.device == d {
+				seg = s
+			}
+		}
+		n := osync.replicator_relay_length(&sp.repl, &h.scope, osync.Device_Id(d), h.name, 0)
+		if seg == nil || n < 0 {
+			return true
+		}
+		if n > 0 && (!seg.in_view || seg.rep == nil || !_replica_covers(seg.rep, n)) {
+			return true
+		}
+	}
+	return false
 }
 
 catalog_usage :: proc(e: ^Engine, o: Object, usage: convo.Usage) {
