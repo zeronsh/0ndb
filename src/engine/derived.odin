@@ -43,6 +43,12 @@ _owns_segment :: proc "contextless" (kind: Kind) -> bool {
 }
 
 @(private)
+_own_keyed :: proc(e: ^Engine, id: prim.Id) -> (keyed: bool, err: Error) {
+	path := _keys_path(e, id) or_return
+	return prim.exists(e.vfs, path), .None
+}
+
+@(private)
 Reg_Fact :: struct {
 	key:   [33]u8,
 	klen:  int,
@@ -104,15 +110,22 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 		id: prim.Id
 		copy(id[:], f.key[:16])
 		rec, derr := _rec_decode(f.value, context.temp_allocator)
-		if derr != .None || !rec.own || !_owns_segment(rec.kind) {
+		if derr != .None || !rec.own {
 			continue
 		}
-		n := own_len(e, &lens, id, rec.kind) or_return
-		if n > 0 {
-			continue
+		keyed := _own_keyed(e, id) or_return
+		if keyed {
+			if !_owns_segment(rec.kind) {
+				continue
+			}
+			n := own_len(e, &lens, id, rec.kind) or_return
+			if n > 0 {
+				continue
+			}
 		}
 		if notes != nil {
-			append(notes, fmt.tprintf("registry: %v %s is marked own but its own segment is absent", rec.kind, prim.id_hex(id)))
+			what := "own segment" if keyed else "own key tree"
+			append(notes, fmt.tprintf("registry: %v %s is marked own but its %s is absent", rec.kind, prim.id_hex(id), what))
 		}
 		if fixes != nil {
 			rec.own = false
@@ -133,9 +146,11 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 			}
 			kind := Kind(f.value[0])
 			n := own_len(e, &lens, id, kind) or_return
-			if _owns_segment(kind) && n == 0 {
+			keyed := _own_keyed(e, id) or_return
+			if !keyed || (_owns_segment(kind) && n == 0) {
 				if notes != nil {
-					append(notes, fmt.tprintf("registry: owned %v %s has no own segment", kind, prim.id_hex(id)))
+					what := "own segment" if keyed else "own key tree"
+					append(notes, fmt.tprintf("registry: owned %v %s has no %s", kind, prim.id_hex(id), what))
 				}
 				if fixes != nil {
 					append(fixes, Reg_Fix{root = ROOT_OWNED, key = f.key, klen = 32, del = true})

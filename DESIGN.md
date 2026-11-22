@@ -555,8 +555,12 @@ concurrent typing is never lost or reverted.
   puts wrote 1.7-2x the bytes with 2-2.4x the p99 batch latency, and inside
   files cap near 16 MB).
   - Registry: on an unclean open, before spaces load, `own` and the owned
-    entry of an object whose own segment is absent or empty are cleared (not
-    created yet), content and promotion marks are clamped to the recovered
+    entry of an object whose own key tree file is absent, or (conversation,
+    map) whose own segment is absent or empty, are cleared (not created yet).
+    The key tree is written before ownership, but inside a batch its sync is
+    the container commit while a promoted registry's flush is durable at
+    once, so ownership can name a key tree that never became durable; every
+    kind is checked. Content and promotion marks are clamped to the recovered
     own stream, and a checkpoint length past it is dropped. Legacy registry
     rows migrated into the redaction log are deleted only after the batch
     holding their replacement records is durable.
