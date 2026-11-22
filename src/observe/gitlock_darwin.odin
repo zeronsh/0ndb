@@ -3,6 +3,7 @@ package observe
 
 import "base:runtime"
 import "core:c"
+import "core:strings"
 import "../fs"
 import "../prim"
 
@@ -60,6 +61,7 @@ _darwin_lock_procs :: proc(lock: string, roots: []string, allocator: runtime.All
 		return out[:]
 	}
 	fds := make([]Proc_Fdinfo, 1024, context.temp_allocator)
+	ab := make([]u8, 64 << 10, context.temp_allocator)
 	cb: [MAXPATHLEN]u8
 	for i in 0 ..< min(int(n), len(pids)) {
 		pid := prim.Pid(pids[i])
@@ -104,7 +106,11 @@ _darwin_lock_procs :: proc(lock: string, roots: []string, allocator: runtime.All
 		if !holder && !near {
 			continue
 		}
-		append(&out, fs.Git_Proc{pid = pid, holder = holder})
+		argv: []string
+		if args, aok := process_args(pid, ab); aok {
+			argv = strings.split(strings.clone(string(args), allocator), "\x00", allocator)
+		}
+		append(&out, fs.Git_Proc{pid = pid, argv = argv, holder = holder})
 	}
 	return out[:]
 }

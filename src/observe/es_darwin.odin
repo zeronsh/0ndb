@@ -248,7 +248,7 @@ endpoint_stats :: proc(e: ^Endpoint) -> Stats {
 }
 
 endpoint_observer :: proc(e: ^Endpoint) -> fs.Write_Observer {
-	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop, changed = _es_changed, fence = _es_fence, lock_procs = _libproc_lock_procs}
+	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop, changed = _es_changed, fence = _es_fence, gate = _es_gate, ungate = _es_ungate, gate_max_ms = SUSP_GATE_MAX_MS, lock_procs = _libproc_lock_procs}
 }
 
 @(private)
@@ -543,4 +543,21 @@ _es_fence :: proc(data: rawptr, reg: ^fs.Registry, done: proc(data: rawptr), don
 		_es_on_pipe(e.loop, prim.Fd(e.pipe[0]), {.Read}, e)
 	}
 	done(done_data)
+}
+
+@(private)
+_es_gate :: proc(data: rawptr, root: string, exempt: []prim.Pid) -> (u32, bool) {
+	e := (^Endpoint)(data)
+	if e.fallback == nil {
+		return 0, false
+	}
+	return _libproc_gate(e.fallback, root, exempt)
+}
+
+@(private)
+_es_ungate :: proc(data: rawptr, id: u32) {
+	e := (^Endpoint)(data)
+	if e.fallback != nil {
+		_libproc_ungate(e.fallback, id)
+	}
 }

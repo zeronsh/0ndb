@@ -3,7 +3,29 @@ package fs
 import "base:runtime"
 import "core:strconv"
 import "core:strings"
+import "core:sys/linux"
 import "../prim"
+
+git_pid_alive :: proc(pid: prim.Pid) -> bool {
+	if pid <= 0 {
+		return false
+	}
+	return linux.kill(linux.Pid(pid), linux.Signal(0)) != .ESRCH
+}
+
+git_proc_argv :: proc(pid: prim.Pid, allocator := context.temp_allocator) -> []string {
+	buf: [64]u8
+	path := _proc_path(buf[:], pid, "cmdline")
+	data := _proc_read(path, allocator)
+	if len(data) == 0 {
+		return nil
+	}
+	s := string(data)
+	if s[len(s) - 1] == 0 {
+		s = s[:len(s) - 1]
+	}
+	return strings.split(s, "\x00", allocator)
+}
 
 git_lock_procs :: proc(lock: string, roots: []string, allocator := context.temp_allocator) -> []Git_Proc {
 	vfs := prim.os_vfs()
@@ -39,7 +61,7 @@ git_lock_procs :: proc(lock: string, roots: []string, allocator := context.temp_
 			}
 		}
 		if holder || near {
-			append(&out, Git_Proc{pid = pid, holder = holder})
+			append(&out, Git_Proc{pid = pid, argv = git_proc_argv(pid, allocator), holder = holder})
 		}
 	}
 	return out[:]

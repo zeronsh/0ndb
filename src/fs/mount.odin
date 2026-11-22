@@ -255,6 +255,10 @@ Write_Observer :: struct {
 	changed: proc(data: rawptr, m: ^Mount, rel: string) -> (^Scope, bool),
 	fence:   proc(data: rawptr, reg: ^Registry, done: proc(data: rawptr), done_data: rawptr),
 	lock_procs: proc(data: rawptr, lock: string, roots: []string, allocator: runtime.Allocator) -> []Git_Proc,
+	lock_creator: proc(data: rawptr, path: string) -> (prim.Pid, bool),
+	gate:       proc(data: rawptr, root: string, exempt: []prim.Pid) -> (u32, bool),
+	ungate:     proc(data: rawptr, id: u32),
+	gate_max_ms: i64,
 }
 
 Mount :: struct {
@@ -289,6 +293,9 @@ Mount :: struct {
 	git_locked:  bool,
 	lock_first:  bool,
 	lock_stale:  bool,
+	gate_id:     u32,
+	gate_timer:  prim.Timer,
+	gate_overruns: u64,
 	lock_watches: [dynamic]Lock_Watch,
 	conv_seq:    u64,
 	fences:      [dynamic]Fence,

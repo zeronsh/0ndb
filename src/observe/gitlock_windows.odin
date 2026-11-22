@@ -8,6 +8,7 @@ import win "core:sys/windows"
 import "../fs"
 import "../prim"
 
+foreign import ntdll_query "system:ntdll.lib"
 foreign import rstrtmgr "system:Rstrtmgr.lib"
 
 @(private)
@@ -25,6 +26,16 @@ RM_PROCESS_INFO :: struct {
 	AppStatus:           u32,
 	TSSessionId:         u32,
 	bRestartable:        i32,
+}
+
+@(private)
+PROCESS_COMMAND_LINE_INFORMATION :: u32(60)
+
+@(private)
+@(default_calling_convention = "system")
+foreign ntdll_query {
+	@(link_name = "NtQueryInformationProcess")
+	_nt_query_process :: proc(h: win.HANDLE, class: u32, info: rawptr, length: u32, ret: ^u32) -> i32 ---
 }
 
 @(private)
@@ -93,6 +104,57 @@ _rm_holders :: proc(lock: string) -> []prim.Pid {
 }
 
 @(private)
+_win_cmdline :: proc(pid: prim.Pid, allocator: runtime.Allocator) -> []string {
+	h := win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION, false, u32(pid))
+	if h == nil {
+		return nil
+	}
+	defer win.CloseHandle(h)
+	buf := make([]u8, 32 << 10, context.temp_allocator)
+	ret: u32
+	if _nt_query_process(h, PROCESS_COMMAND_LINE_INFORMATION, raw_data(buf), u32(len(buf)), &ret) < 0 {
+		return nil
+	}
+	length := int((^u16)(raw_data(buf))^) / 2
+	ptr := (^[^]u16)(&buf[8])^
+	if ptr == nil || length <= 0 {
+		return nil
+	}
+	u := make([]u8, length * 4, context.temp_allocator)
+	k := utf16.decode_to_utf8(u, ptr[:length])
+	return _split_cmdline(string(u[:k]), allocator)
+}
+
+@(private)
+_split_cmdline :: proc(s: string, allocator: runtime.Allocator) -> []string {
+	out := make([dynamic]string, allocator)
+	b := strings.builder_make(context.temp_allocator)
+	quoted := false
+	has := false
+	for i := 0; i < len(s); i += 1 {
+		ch := s[i]
+		switch {
+		case ch == '"':
+			quoted = !quoted
+			has = true
+		case (ch == ' ' || ch == '\t') && !quoted:
+			if has {
+				append(&out, strings.clone(strings.to_string(b), allocator))
+				strings.builder_reset(&b)
+				has = false
+			}
+		case:
+			strings.write_byte(&b, ch)
+			has = true
+		}
+	}
+	if has {
+		append(&out, strings.clone(strings.to_string(b), allocator))
+	}
+	return out[:]
+}
+
+@(private)
 _win_lock_procs :: proc(lock: string, roots: []string, allocator: runtime.Allocator) -> []fs.Git_Proc {
 	out := make([dynamic]fs.Git_Proc, allocator)
 	holders := _rm_holders(lock)
@@ -108,7 +170,11 @@ _win_lock_procs :: proc(lock: string, roots: []string, allocator: runtime.Alloca
 		if len(holders) > 0 && !holder {
 			continue
 		}
-		append(&out, fs.Git_Proc{pid = pid, holder = holder})
+		argv := _win_cmdline(pid, allocator)
+		if len(argv) > 0 {
+			argv[0] = "git"
+		}
+		append(&out, fs.Git_Proc{pid = pid, argv = argv, holder = holder})
 	}
 	return out[:]
 }
