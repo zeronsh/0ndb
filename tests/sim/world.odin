@@ -145,6 +145,7 @@ Config :: struct {
 	window:      int,
 	settle_ms:   i64,
 	verbose:     bool,
+	quiet:       bool,
 	trace_limit: int,
 	disabled:    bit_set[Op_Kind],
 	share_access: eng.Access_Set,
@@ -230,7 +231,7 @@ world_note :: proc(w: ^World, format: string, args: ..any) {
 	context = w.ctx
 	s := fmt.tprintf(format, ..args)
 	w.trace = mix_str(w.trace, s)
-	if w.cfg.verbose {
+	if w.cfg.verbose && !w.cfg.quiet {
 		fmt.eprintf("[%9.3f] %s\n", f64(w.now) / 1e6, s)
 	}
 	if len(w.log) < w.cfg.trace_limit {
@@ -369,7 +370,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.name = fmt.aprintf("n%d", i, allocator = w.allocator)
 		disk_init(&n.disk, n.name, w.allocator)
 		n.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -30_000_000_000, 30_000_000_000)}
-		n.disk.verbose = cfg.verbose
+		n.disk.verbose = cfg.verbose && !cfg.quiet
 		n.disk.fail_rate = cfg.io_rate
 		rng_init(&n.disk.fail_rng, cfg.seed, 5000 + u64(i))
 		n.disk.wall = clock_wall
