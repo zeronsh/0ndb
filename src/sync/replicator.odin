@@ -264,6 +264,7 @@ Replicator :: struct {
 	locals:     map[Stream_Id]^Local,
 	remotes:    map[Stream_Id]^Remote,
 	probes:     map[Stream_Id]^Remote,
+	answers:    map[Stream_Id]i64,
 	devices:    map[Device_Id]bool,
 	objs:       Objects,
 	uploading:  int,
@@ -386,6 +387,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.locals = make(map[Stream_Id]^Local, allocator)
 	r.remotes = make(map[Stream_Id]^Remote, allocator)
 	r.probes = make(map[Stream_Id]^Remote, allocator)
+	r.answers = make(map[Stream_Id]i64, allocator)
 	r.devices = make(map[Device_Id]bool, allocator)
 	_objs_init(r)
 	r.stage = make([dynamic]u8, allocator)
@@ -427,6 +429,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.locals)
 	delete(r.remotes)
 	delete(r.probes)
+	delete(r.answers)
 	delete(r.devices)
 	delete(r.stage)
 	for _, g in r.groups {
@@ -747,12 +750,37 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 	return -1
 }
 
-replicator_current :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
-	id := stream_id(scope, device, name, epoch)
-	if rm, ok := r.remotes[id]; ok {
-		return rm.follow
+replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> (probed: bool) {
+	_enter(r)
+	defer _leave(r)
+	rm, err := _remote_get(r, scope, device, name, epoch)
+	if err != .None {
+		return false
 	}
-	return false
+	if ans, answered := r.answers[rm.id]; answered && r.phase == .Ready {
+		if ans > rm.relay_len {
+			_seen_stream(r, rm.id, ans)
+			_repl_flush(r)
+		}
+		return false
+	}
+	_remote_want_tail(r, rm, TAIL_DEFAULT)
+	return true
+}
+
+@(private)
+_answer :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
+	prev, had := r.answers[id]
+	r.answers[id] = max(prev, length) if had else length
+	if had || !r.cfg.filtered || r.phase != .Ready {
+		return
+	}
+	if rm, ok := r.remotes[id]; ok && (rm.grouped || _following(rm)) {
+		return
+	}
+	pat := [1]Feed_Pattern{{kind = .Exact, bytes = cast([32]u8)id}}
+	from := u64(r.feed_cursor) if r.feed_cursor >= 0 else 0
+	client_feed_follow(&r.client, from, pat[:], true, true)
 }
 
 
@@ -2058,6 +2086,12 @@ _seen_stream :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 		r.devices[dev] = true
 		_emit(r, Repl_Event{kind = .Device_Seen, device = dev, stream = id, length = length})
 	}
+	answered := id in r.answers
+	if answered {
+		_answer(r, id, length)
+	} else if rm, ok := r.remotes[id]; ok && _following(rm) {
+		_answer(r, id, length)
+	}
 	if rm, ok := r.remotes[id]; ok {
 		if length > rm.relay_len {
 			rm.relay_len = length
@@ -2067,7 +2101,7 @@ _seen_stream :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 			if rm.is_head && rm.kfollow {
 				_kwait_head_want(r, rm)
 			}
-			if _following(rm) && !rm.full {
+			if (_following(rm) || answered) && !rm.full {
 				_emit(r, Repl_Event{kind = .Grew, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = length, to = length, length = length})
 			}
 		}
@@ -2090,6 +2124,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	defer _leave(r)
 	switch ev.kind {
 	case .Welcome:
+		clear(&r.answers)
 		r.phase = .Ready
 		if r.tamper_run == 0 {
 			r.backoff = BACKOFF_MIN
@@ -2172,6 +2207,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 				rm.probing = false
 				rm.fresh_gen = rm.probe_gen
 			}
+			_answer(r, rm.id, ev.length)
 			rm.relay_len = ev.length
 			if ev.length > journal.replica_length(&rm.rep) {
 				journal.replica_set_length(&rm.rep, ev.length)

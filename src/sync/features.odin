@@ -756,9 +756,12 @@ _span_save :: proc(r: ^Replicator, rm: ^Remote, durable := true) {
 _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 	pats := make([dynamic]Feed_Pattern, context.temp_allocator)
 	for id, rm in r.remotes {
-		if _following(rm) && !rm.grouped {
+		if _following(rm) && !rm.grouped && !(id in r.answers) {
 			append(&pats, Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
 		}
+	}
+	for id in r.answers {
+		append(&pats, Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
 	}
 	for suffix in r.groups {
 		p := Feed_Pattern{kind = .Suffix}

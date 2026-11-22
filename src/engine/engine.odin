@@ -246,6 +246,7 @@ Stats :: struct {
 	pending:     int,
 	subs:        int,
 	fetches:     u64,
+	probes:      u64,
 	indexed:     u64,
 	wakeups:     u64,
 	live_bytes:  u64,
