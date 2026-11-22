@@ -155,18 +155,36 @@ table_rewind :: proc(t: ^Table) -> Error {
 	return _fault(t, txn_commit(txn))
 }
 
-table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
-	if table_poisoned(t) {
-		if e := table_reset(t); e != .None {
-			t.poisoned = true
-			return 0, e
+table_prepare :: proc(t: ^Table, sources: []Source) -> Error {
+	reset := table_poisoned(t)
+	for src in sources {
+		limit, bounded := src.upto.?
+		if src.reader != nil {
+			limit = min(limit, durable_end(src.reader)) if bounded else durable_end(src.reader)
+		} else if !bounded {
+			continue
+		}
+		if cur, ce := table_consumed(t, src.seg); ce != .None || cur > limit {
+			reset = true
 		}
 	}
+	if !reset {
+		return .None
+	}
+	if e := table_reset(t); e != .None {
+		t.poisoned = true
+		return e
+	}
+	return .None
+}
+
+table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
+	if table_poisoned(t) {
+		return 0, .Io
+	}
 	if cur, ce := table_consumed(t, seg); ce == .None && cur > durable_end(r) {
-		if e := table_reset(t); e != .None {
-			t.poisoned = true
-			return 0, e
-		}
+		t.poisoned = true
+		return 0, .Io
 	}
 	pos, err = _table_apply(t, seg, r)
 	if err != .None && err != .Missing {
