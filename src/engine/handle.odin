@@ -149,6 +149,7 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 	h.name = _clone(_seg_name(kind, o.id), e.allocator) or_return
 	if kind == .Conversation || kind == .Map {
 		obj.view_init(&h.view, o.id, e.allocator)
+		h.view.self = e.self
 		h.view_init = true
 	}
 	e.handles[o.id] = h
