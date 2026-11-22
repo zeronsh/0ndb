@@ -843,6 +843,15 @@ worktree_finish :: proc(ws: ^Worktree, run: ^Run, land: bool) -> []convo.File_De
 			end = fs.mount_synced(m)
 		}
 		if land {
+			if cur, cfound, _ := fs.history_line(h, conv, context.temp_allocator); cfound {
+				a := make([dynamic]crdt.Lv, context.temp_allocator)
+				b := make([dynamic]crdt.Lv, context.temp_allocator)
+				if crdt.graph_version_lvs(&h.g, cur, &a) == .None && crdt.graph_version_lvs(&h.g, end, &b) == .None {
+					both := make([dynamic]crdt.Lv, context.temp_allocator)
+					crdt.version_union(&h.g, a[:], b[:], &both)
+					end = crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
+				}
+			}
 			fs.history_set_line(h, conv, end)
 			append(&files, convo.File_Delta{mount = mb.name, tree = mb.tree, line = mb.conv_line, version = version_encode(end, m.head.branch, m.head.commit)})
 		}
