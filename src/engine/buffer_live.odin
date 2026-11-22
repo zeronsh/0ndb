@@ -636,7 +636,7 @@ _live_aad :: proc(stream: osync.Stream_Id, object: prim.Id, hdr: []u8) -> []u8 {
 @(private)
 _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, off: i64, ff: []crdt.Op_Id, flen: int) {
 	sp := h.sp
-	if !sp.repl_on || !osync.replicator_live_on(&sp.repl) || e.cfg.buffer_live_off {
+	if !sp.repl_on || e.cfg.buffer_live_off || !osync.replicator_live_ready(&sp.repl, &h.scope, h.name, 0) {
 		return
 	}
 	body := make([dynamic]u8, context.temp_allocator)

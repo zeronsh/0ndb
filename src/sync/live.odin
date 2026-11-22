@@ -70,6 +70,16 @@ replicator_live_follow :: proc(r: ^Replicator, sc: ^Scope, device: Device_Id, na
 	return .None
 }
 
+replicator_live_ready :: proc(r: ^Replicator, sc: ^Scope, name: string, epoch: u64) -> bool {
+	if !replicator_live_on(r) {
+		return false
+	}
+	_enter(r)
+	defer _leave(r)
+	l, ok := r.locals[stream_id(sc, r.cfg.self, name, epoch)]
+	return ok && !l.fatal && l.cursor > 0
+}
+
 replicator_live_send :: proc(r: ^Replicator, sc: ^Scope, name: string, epoch: u64, msg, at: i64, data: []u8) -> bool {
 	if !replicator_live_on(r) || client_queued(&r.client) >= OUT_HIGH {
 		return false

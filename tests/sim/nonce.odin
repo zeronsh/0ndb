@@ -55,6 +55,7 @@ Cipher_Inject :: enum u8 {
 	Append,
 	Served,
 	Relay_Storage,
+	Buffer_Live,
 }
 
 Cipher_Pending :: struct {
@@ -165,6 +166,13 @@ _buffer_seal_observe :: proc(w: ^World, sid: osync.Stream_Id, frame: []u8, who: 
 		return
 	}
 	w.cipher.bufseal[k] = h
+	if w.cipher.inject == .Buffer_Live && !w.cipher.injected && len(frame) > 26 {
+		w.cipher.injected = true
+		forged := slice.clone(frame, context.temp_allocator)
+		forged[len(forged) - 1] ~= 0x5a
+		world_note(w, "crypto: injected a second buffer live frame on stream %s at offset %d", stream_short(sid), i64(prim.get_u64le(frame[17:25])))
+		_buffer_seal_observe(w, sid, forged, "injected")
+	}
 }
 
 tap_feed :: proc(w: ^World, c: ^Conn, t: ^Tap, bytes: []u8, down: bool) {
