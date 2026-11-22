@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "core:slice"
+import "core:strings"
 import "../crdt"
 import "../fshist"
 import "../fstree"
@@ -113,6 +114,8 @@ History :: struct {
 	pins:       [dynamic]odb.Oid,
 	lvidx:      prim.Fd,
 	lvidx_n:    u64,
+	rebuilding: bool,
+	own_wait:   bool,
 	markers:    [dynamic]Git_Marker,
 	views:      [dynamic]^Text_View,
 }
@@ -190,7 +193,7 @@ history_add_source :: proc(h: ^History, objects: string) -> Error {
 	w := prim.writer(&buf)
 	prim.write_str(&w, objects)
 	kv_put(&h.kv, transmute([]u8)string("src"), buf[:]) or_return
-	return kv_commit(&h.kv)
+	return history_kv_commit(h)
 }
 
 history_wall_ns :: proc(h: ^History) -> i64 {
@@ -377,6 +380,23 @@ history_wake :: proc(h: ^History) -> Error {
 	h.lvidx_n = u64(lsize) / LVIDX_REC
 	h.awake = true
 	err := load_state(h)
+	if err == .None || err == .Corrupt {
+		ahead := err == .Corrupt
+		if !ahead {
+			a, aerr := history_ahead(h, true)
+			ahead, err = a, aerr
+		}
+		if err == .None && ahead {
+			history_sleep(h)
+			if h.rebuilding {
+				return .Corrupt
+			}
+			history_wipe(h) or_return
+			h.rebuilding = true
+			defer h.rebuilding = false
+			return history_wake(h)
+		}
+	}
 	if err == .None {
 		err = replay_own(h)
 	}
@@ -386,6 +406,116 @@ history_wake :: proc(h: ^History) -> Error {
 	}
 	h.mark_fp = history_fp(h)
 	return .None
+}
+
+@(private)
+HIST_STAMP :: "j"
+
+history_kv_commit :: proc(h: ^History) -> Error {
+	if len(h.kv.order) > 0 {
+		b: [8]u8
+		prim.put_u64le(b[:], u64(journal.journal_durable_len(&h.journal)))
+		kv_put(&h.kv, transmute([]u8)string(HIST_STAMP), b[:]) or_return
+	}
+	return kv_commit(&h.kv)
+}
+
+@(private)
+history_ahead :: proc(h: ^History, fix: bool) -> (ahead: bool, err: Error) {
+	stamp, found := kv_get(&h.kv, transmute([]u8)string(HIST_STAMP), context.temp_allocator) or_return
+	if found && (len(stamp) != 8 || i64(prim.get_u64le(stamp)) > journal.journal_durable_len(&h.journal)) {
+		return true, .None
+	}
+	end := u64(h.g.next)
+	lo, hi := u64(0), h.lvidx_n
+	b: [LVIDX_REC]u8
+	for lo < hi {
+		mid := (lo + hi) / 2
+		got, rerr := prim.read_at(h.vfs, h.lvidx, b[:], i64(mid * LVIDX_REC))
+		if rerr != .None || got != LVIDX_REC {
+			return true, .None
+		}
+		if prim.get_u64le(b[0:8]) < end {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return end > 0, .None
+	}
+	got, rerr := prim.read_at(h.vfs, h.lvidx, b[:], i64((lo - 1) * LVIDX_REC))
+	if rerr != .None || got != LVIDX_REC || prim.get_u64le(b[0:8]) + u64(prim.get_u32le(b[12:16])) != end {
+		return true, .None
+	}
+	if lo < h.lvidx_n {
+		if !fix {
+			return true, .None
+		}
+		from_prim(prim.truncate(h.vfs, h.lvidx, i64(lo * LVIDX_REC))) or_return
+		h.lvidx_n = lo
+	}
+	return false, .None
+}
+
+history_derived_ahead :: proc(h: ^History) -> (ahead: bool, err: Error) {
+	if !h.awake {
+		return false, .None
+	}
+	return history_ahead(h, false)
+}
+
+@(private)
+history_derived_key :: proc(k: []u8) -> bool {
+	s := string(k)
+	switch {
+	case s == "g" || s == "s" || s == HIST_STAMP || s == "seal":
+		return true
+	case len(k) == 10 && (strings.has_prefix(s, "gp") || strings.has_prefix(s, "mv")):
+		return true
+	case len(k) == 13 && k[0] == 'f':
+		return true
+	case len(k) == 14 && (strings.has_prefix(s, "ti") || strings.has_prefix(s, "fb")):
+		return true
+	case len(k) == 18 && strings.has_prefix(s, "fo"):
+		return true
+	case len(k) == 22 && strings.has_prefix(s, "tn"):
+		return true
+	case len(k) == 7 && strings.has_prefix(s, "seal:"):
+		return true
+	case len(k) == 15 && strings.has_prefix(s, "rp:"):
+		return true
+	case strings.has_prefix(s, "l:") || strings.has_prefix(s, "L:") || strings.has_prefix(s, "P:"):
+		return true
+	}
+	return false
+}
+
+@(private)
+history_wipe :: proc(h: ^History) -> Error {
+	kv: Kv
+	kv_open(&kv, h.vfs, h.dir, "state", h.allocator) or_return
+	defer kv_close(&kv)
+	keys := make([dynamic][]u8, context.temp_allocator)
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		if history_derived_key(key) {
+			k := make([]u8, len(key), context.temp_allocator)
+			copy(k, key)
+			append((^[dynamic][]u8)(data), k)
+		}
+		return true
+	}
+	kv_each(&kv, &keys, visit) or_return
+	for k in keys {
+		kv_del(&kv, k) or_return
+	}
+	kv_commit(&kv) or_return
+	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
+	fd, oerr := prim.open_file(h.vfs, lp, {.Write, .Create}, 0o600)
+	from_prim(oerr) or_return
+	defer prim.close_file(h.vfs, fd)
+	from_prim(prim.truncate(h.vfs, fd, 0)) or_return
+	return from_prim(prim.datasync(h.vfs, fd))
 }
 
 history_sleep :: proc(h: ^History) {
@@ -500,9 +630,9 @@ history_set_line :: proc(h: ^History, name: string, v: Version) -> Error {
 		return .Io
 	}
 	stream_index(h, h.self)
-	h.applied[0] = journal.journal_durable_len(&h.journal)
+	history_own_applied(h)
 	kv_put(&h.kv, key, buf[:]) or_return
-	return kv_commit(&h.kv)
+	return history_kv_commit(h)
 }
 
 @(private)
@@ -614,7 +744,7 @@ history_commit_import :: proc(h: ^History, b: ^crdt.Batch) -> (off: i64, err: Er
 	}
 	off = journal_batch(h, b, REC_IMPORT) or_return
 	import_apply(h, b, 0, u64(off)) or_return
-	h.applied[0] = journal.journal_durable_len(&h.journal)
+	history_own_applied(h)
 	return off, history_persist(h)
 }
 
@@ -719,7 +849,7 @@ history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = 
 		journal_seal(h) or_return
 	}
 	apply_batch(h, b, 0, u64(o)) or_return
-	h.applied[0] = journal.journal_durable_len(&h.journal)
+	history_own_applied(h)
 	if lver != nil {
 		kv_put(&h.kv, lkey, lver) or_return
 	}
@@ -979,6 +1109,10 @@ history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (ad
 	if int(si) < len(h.applied) && h.applied[si] < off + 1 {
 		h.applied[si] = off + 1
 	}
+	if h.own_wait && si != 0 {
+		history_persist(h) or_return
+		return valid, replay_own(h)
+	}
 	return valid, history_persist(h)
 }
 
@@ -1003,6 +1137,10 @@ admit_import :: proc(h: ^History, si: u32, off: i64, body: []u8, dict: ^crdt.Act
 	import_apply(h, &b, si, u64(off)) or_return
 	if int(si) < len(h.applied) && h.applied[si] < off + 1 {
 		h.applied[si] = off + 1
+	}
+	if h.own_wait && si != 0 {
+		history_persist(h) or_return
+		return n, replay_own(h)
 	}
 	return n, history_persist(h)
 }
@@ -1081,7 +1219,7 @@ history_persist :: proc(h: ^History) -> Error {
 	}
 	prim.write_uvarint(&w, h.moves_count)
 	kv_put(&h.kv, transmute([]u8)string("s"), buf[:]) or_return
-	return kv_commit(&h.kv)
+	return history_kv_commit(h)
 }
 
 Staged_Blob :: struct {
@@ -2036,19 +2174,89 @@ stream_dict :: proc(h: ^History, i: u32) -> ^crdt.Actor_Dict {
 	return &h.rdicts[i]
 }
 
+history_own_applied :: proc(h: ^History) {
+	if !h.own_wait {
+		h.applied[0] = journal.journal_durable_len(&h.journal)
+	}
+}
+
+@(private)
+replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: bool, err: Error) {
+	b, derr := crdt.batch_decode(payload, context.temp_allocator, &h.dict)
+	if derr != .None {
+		return false, .Corrupt
+	}
+	parents := make([dynamic]crdt.Lv, context.temp_allocator)
+	skip, gerr := crdt.graph_check(&h.g, &b, &parents)
+	if gerr == .Missing {
+		return true, .None
+	}
+	if gerr != .None || skip >= crdt.batch_len(&b) {
+		return false, .None
+	}
+	if kind == REC_IMPORT {
+		import_apply(h, &b, 0, u64(off)) or_return
+	} else {
+		apply_batch(h, &b, 0, u64(off)) or_return
+	}
+	history_persist(h) or_return
+	history_unload_files(h)
+	crdt.graph_trim(&h.g)
+	fstree.trim(&h.tree, 64)
+	return false, .None
+}
+
+@(private)
+replay_pause :: proc(h: ^History, off: i64) -> Error {
+	h.applied[0] = off
+	h.own_wait = true
+	err := history_persist(h)
+	history_unload_files(h)
+	return err
+}
+
 @(private)
 replay_own :: proc(h: ^History) -> Error {
 	end := journal.journal_durable_len(&h.journal)
 	if h.applied[0] >= end {
+		h.own_wait = false
 		return .None
 	}
 	r: journal.Reader
 	journal.journal_reader(&h.journal, &r, context.temp_allocator)
 	defer journal.reader_close(&r)
+	repl := make(map[i64]i64, 4, context.temp_allocator)
+	for off := h.applied[0]; off < end; {
+		body, next, jerr := journal.record_at(&r, off)
+		if jerr == .None && len(body) > 0 && body[0] == REC_REPLACE {
+			if x, ok := replace_decode(body); ok && i64(x.orig) >= h.applied[0] {
+				repl[i64(x.orig)] = off
+			}
+		} else if jerr != .None && jerr != .Redacted {
+			break
+		}
+		if next <= off {
+			break
+		}
+		off = next
+	}
 	off := h.applied[0]
 	for off < end {
 		body, next, jerr := journal.record_at(&r, off)
 		if jerr == .Redacted && next > off {
+			if at, ok := repl[off]; ok {
+				rb, _, rerr := journal.record_at(&r, at)
+				if rerr != .None {
+					return from_journal(rerr)
+				}
+				x, xok := replace_decode(rb)
+				if !xok {
+					return .Corrupt
+				}
+				if wait := replay_batch(h, x.kind, x.payload, off) or_return; wait {
+					return replay_pause(h, off)
+				}
+			}
 			off = next
 			continue
 		}
@@ -2072,26 +2280,13 @@ replay_own :: proc(h: ^History) -> Error {
 		} else if len(body) > 0 && body[0] == REC_ACTOR {
 			apply_actor_record(h, h.self, body) or_return
 		} else if len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT) {
-			b, derr := crdt.batch_decode(body[1:], context.temp_allocator, &h.dict)
-			if derr != .None {
-				return .Corrupt
-			}
-			parents := make([dynamic]crdt.Lv, context.temp_allocator)
-			skip, gerr := crdt.graph_check(&h.g, &b, &parents)
-			if gerr == .None && skip < crdt.batch_len(&b) {
-				if body[0] == REC_IMPORT {
-					import_apply(h, &b, 0, u64(off)) or_return
-				} else {
-					apply_batch(h, &b, 0, u64(off)) or_return
-				}
-				history_persist(h) or_return
-				history_unload_files(h)
-				crdt.graph_trim(&h.g)
-				fstree.trim(&h.tree, 64)
+			if wait := replay_batch(h, body[0], body[1:], off) or_return; wait {
+				return replay_pause(h, off)
 			}
 		}
 		off = next
 	}
+	h.own_wait = false
 	h.applied[0] = end
 	err := history_persist(h)
 	history_unload_files(h)
@@ -2376,6 +2571,6 @@ history_alias :: proc(h: ^History, sources: []string, commit: string, v: Version
 	if journal.journal_commit(&h.journal) != .None {
 		return .Io
 	}
-	h.applied[0] = journal.journal_durable_len(&h.journal)
+	history_own_applied(h)
 	return .None
 }

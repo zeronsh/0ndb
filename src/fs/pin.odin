@@ -166,7 +166,7 @@ mount_commit :: proc(m: ^Mount, info: Commit_Info) -> (commit: odb.Oid, err: Err
 	ref := history_pin_ref(m.history, rbuf[:])
 	commit_on_ref(m.db, ref, tree, ci, "0ndb snapshot", history_wall_ms(m.history) / 1000) or_return
 	history_pins_flush(m.history, info) or_return
-	kv_commit(&m.history.kv) or_return
+	history_kv_commit(m.history) or_return
 	c, _ := odb.read_ref(m.db, ref)
 	return c, .None
 }

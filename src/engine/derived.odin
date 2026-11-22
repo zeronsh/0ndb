@@ -1,6 +1,10 @@
 package engine
 
 import "core:fmt"
+import "core:strings"
+import "../crdt"
+import "../fs"
+import "../fstree"
 import "../convo"
 import "../journal"
 import omap "../map"
@@ -266,6 +270,10 @@ verify_derived :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []
 			if verr := _convo_verify(e, Object{rec.space, id}, &out); verr != .None && verr != .Missing && verr != .Not_Found && verr != .Permission {
 				return nil, verr
 			}
+		case .Text, .File_Tree:
+			if verr := _hist_verify(e, Object{rec.space, id}, rec.kind, &out); verr != .None && verr != .Missing && verr != .Not_Found && verr != .Permission {
+				return nil, verr
+			}
 		case .Map:
 			if verr := _map_verify(e, Object{rec.space, id}, &out); verr != .None && verr != .Missing && verr != .Not_Found && verr != .Permission {
 				return nil, verr
@@ -409,4 +417,134 @@ _convo_verify :: proc(e: ^Engine, o: Object, notes: ^[dynamic]string) -> Error {
 @(private)
 _oerr2_str :: proc(s: string, err: obj.Error) -> (string, Error) {
 	return s, _oerr(err)
+}
+
+@(private)
+_tree_digest :: proc(hist: ^fs.History, out: ^strings.Builder) -> Error {
+	snap := fstree.current(&hist.tree)
+	walk :: proc(hist: ^fs.History, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, out: ^strings.Builder) -> Error {
+		kids, cerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
+		if cerr != nil {
+			return .Corrupt
+		}
+		for k in kids {
+			p := fmt.tprintf("%s/%s", prefix, k.name)
+			if k.kind == .Dir {
+				fmt.sbprintf(out, "%s/\n", p)
+				walk(hist, snap, k.inode, p, out) or_return
+				continue
+			}
+			f := _ferr2(fs.history_file(hist, k.inode)) or_return
+			fmt.sbprintf(out, "%s %v %x\n", p, k.kind, crdt.text_bytes(&f.text, context.temp_allocator))
+		}
+		return .None
+	}
+	return walk(hist, &snap, fstree.ROOT, "", out)
+}
+
+@(private)
+_hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string) -> Error {
+	h := _handle_get(e, o, kind) or_return
+	_hist_ready(e, h) or_return
+	hist := h.hist
+	if ahead := _ferr2(fs.history_derived_ahead(hist)) or_return; ahead {
+		append(notes, fmt.tprintf("history %s: state or lv.idx is ahead of its own journal after open", prim.id_hex(o.id)))
+		return .None
+	}
+	src := hist.dir
+	vdir := _join(context.temp_allocator, e.pack_root, "verify") or_return
+	hx := prim.id_hex(o.id)
+	scratch := _join(context.temp_allocator, vdir, string(hx[:])) or_return
+	_perr(prim.mkdir_all(e.vfs, scratch, 0o700)) or_return
+	names := []string{"fs.journal", "fs.journal.redact"}
+	for n in names {
+		from := _join(context.temp_allocator, src, n) or_return
+		to := _join(context.temp_allocator, scratch, n) or_return
+		prim.remove(e.vfs, to)
+		if !prim.exists(e.vfs, from) {
+			continue
+		}
+		data := _perr2(prim.read_file(e.vfs, from, context.temp_allocator)) or_return
+		if n == "fs.journal" {
+			data = data[:min(i64(len(data)), journal.journal_durable_len(&hist.journal))]
+		}
+		_perr(prim.replace_atomic(e.vfs, to, data)) or_return
+	}
+	defer {
+		d := prim.Dir{}
+		if prim.dir_open(e.vfs, &d, scratch, context.temp_allocator) == .None {
+			for {
+				ent, more, derr := prim.dir_next(e.vfs, &d)
+				if derr != .None || !more {
+					break
+				}
+				if p, jerr := _join(context.temp_allocator, scratch, ent.name); jerr == .None {
+					prim.remove(e.vfs, p)
+				}
+			}
+			prim.dir_close(e.vfs, &d)
+		}
+		prim.remove_dir(e.vfs, scratch)
+	}
+	db := device_odb(e) or_return
+	opts := _hist_options(h)
+	opts.keep_at_least = 0
+	re := _ferr2(fs.history_create(e.vfs, scratch, o.id, e.self, db, fs.Stream_Source{data = h, read = _hist_read}, e.allocator, opts)) or_return
+	defer fs.history_release(re)
+	limits := make(map[prim.Id]i64, 8, context.temp_allocator)
+	for id, i in hist.stream_ids {
+		if i > 0 && i < len(hist.applied) {
+			limits[id] = hist.applied[i]
+		}
+	}
+	positions := make(map[prim.Id]i64, 8, context.temp_allocator)
+	for {
+		progress := false
+		for s in h.segs {
+			limit := limits[s.device]
+			pos := positions[s.device]
+			for pos < limit {
+				body, next, rerr := journal.record_at(&s.jr, pos)
+				if rerr == .Redacted {
+					return .None
+				}
+				if rerr != .None {
+					return .None
+				}
+				if !journal.is_sig(body) {
+					owned := make([]u8, len(body), context.temp_allocator)
+					copy(owned, body)
+					if _, aerr := fs.history_admit(re, s.device, pos, owned); aerr == .Not_Found {
+						break
+					} else if aerr != .None {
+						return .None
+					}
+				}
+				pos = next
+				progress = true
+			}
+			positions[s.device] = pos
+		}
+		if !progress {
+			break
+		}
+	}
+	for id, limit in limits {
+		if positions[id] < limit {
+			return .None
+		}
+	}
+	have := strings.builder_make(context.temp_allocator)
+	want := strings.builder_make(context.temp_allocator)
+	_tree_digest(hist, &have) or_return
+	_tree_digest(re, &want) or_return
+	if strings.to_string(have) != strings.to_string(want) {
+		append(notes, fmt.tprintf("history %s differs from a rebuild of its journal and streams (applied %v/%v streams %v/%v journal %d/%d heads %v/%v dir %s):\n--- have\n%s--- rebuilt\n%s", prim.id_hex(o.id), hist.applied[:], re.applied[:], len(hist.stream_ids), len(re.stream_ids), journal.journal_durable_len(&hist.journal), journal.journal_durable_len(&re.journal), fs.history_heads(hist, context.temp_allocator), fs.history_heads(re, context.temp_allocator), src, strings.to_string(have), strings.to_string(want)))
+	}
+	return .None
+}
+
+@(private)
+_perr2 :: proc(v: $T, err: prim.Error) -> (T, Error) {
+	return v, _perr(err)
 }

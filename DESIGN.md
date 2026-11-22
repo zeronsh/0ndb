@@ -566,9 +566,19 @@ concurrent typing is never lost or reverted.
   - `.children` slots: before the first slot write after a sync the header is
     rewritten as dirty and synced; a clean header means the slots reflect
     exactly `covered`, a dirty one is rebuilt at open.
+  - fs history: the state kv commits atomically (each commit ends with a
+    marker record; recovery keeps whole commits only) and every commit
+    carries the own journal length as its stamp; `lv.idx` must cover exactly
+    the graph's lv range. At wake, a stamp past the recovered journal or an
+    `lv.idx` that is short is a rebuild (an `lv.idx` that is long is cut back
+    to the graph): derived keys are dropped, keys that no record carries
+    (sources, pins, blob versions, mount aliases and conflicts) are kept, and
+    the history replays its journal and streams. Replay applies a redacted
+    batch's replacement in its place, and pauses at an own batch whose
+    parents are remote until those arrive instead of dropping it.
   The simulator checks all of this after every engine open: registry facts
-  against the own streams, and every map table and `.children` file against a
-  rebuild of its sources cut at the positions it consumed. `SIM_PROMOTE`
+  against the own streams, and every map table, `.children` file and fs
+  history against a rebuild of its sources cut at the positions it consumed. `SIM_PROMOTE`
   shrinks the promotion size so derived files are promoted.
 - Redaction punches holes in extents; the simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.

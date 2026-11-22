@@ -26,7 +26,7 @@ history_seal :: proc(h: ^History, v: Version) -> Error {
 		return .Io
 	}
 	apply_seal(h, 0, v) or_return
-	h.applied[0] = journal.journal_durable_len(&h.journal)
+	history_own_applied(h)
 	return history_persist(h)
 }
 

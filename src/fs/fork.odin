@@ -345,7 +345,7 @@ record_conflict :: proc(m: ^Mount, inode: fstree.Inode_Id, path: string) -> Erro
 	prim.write_u64le(&w, inode.seq)
 	kv_put(&h.kv, transmute([]u8)list_key, buf[:]) or_return
 	kv_put(&h.kv, conflict_key(m, inode), transmute([]u8)path) or_return
-	return kv_commit(&h.kv)
+	return history_kv_commit(h)
 }
 
 mount_conflicts :: proc(m: ^Mount, out: ^[dynamic]Land_Conflict, allocator := context.allocator) -> Error {
@@ -387,7 +387,7 @@ list_conflicts :: proc(m: ^Mount, out: ^[dynamic]Land_Conflict, allocator: runti
 		} else {
 			kv_put(&h.kv, transmute([]u8)list_key, keep[:]) or_return
 		}
-		kv_commit(&h.kv) or_return
+		history_kv_commit(h) or_return
 	}
 	return .None
 }
