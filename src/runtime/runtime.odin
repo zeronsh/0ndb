@@ -504,6 +504,19 @@ close :: proc(r: ^Runtime) {
 	r.opened = false
 }
 
+readvertise :: proc(r: ^Runtime, space: prim.Id) {
+	context = eng.context_for(r.e)
+	if !r.cfg.runner {
+		return
+	}
+	for sw in r.spaces {
+		if sw.space == space {
+			_advertise(r, space, r.cfg.capacity)
+			return
+		}
+	}
+}
+
 attach :: proc(r: ^Runtime, space: prim.Id) -> Error {
 	context = eng.context_for(r.e)
 	for sw in r.spaces {

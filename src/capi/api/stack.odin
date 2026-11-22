@@ -39,11 +39,13 @@ Stack :: struct {
 	thread:    ^thread.Thread,
 	running:   bool,
 	stop_mu:   sync.Mutex,
+	joined:    [dynamic]prim.Id,
 }
 
 stack_open :: proc(s: ^Stack, ec: eng.Config, opts: Stack_Options, allocator := context.allocator) -> (st: Status) {
 	s^ = {
 		allocator = allocator,
+		joined    = make([dynamic]prim.Id, allocator),
 	}
 	defer if st != .Ok {
 		stack_close(s)
@@ -130,6 +132,8 @@ stack_close :: proc(s: ^Stack) -> Status {
 		prim.loop_destroy(&s.loop)
 		s.loop_on = false
 	}
+	delete(s.joined)
+	s.joined = nil
 	return status_of(err)
 }
 
@@ -172,7 +176,25 @@ _stack_thread :: proc(t: ^thread.Thread) {
 		if prim.loop_step(&s.loop, true) != .None {
 			break
 		}
+		stack_attach_joined(s)
 	}
+}
+
+stack_space_joined :: proc(s: ^Stack, space: prim.Id) {
+	append(&s.joined, space)
+}
+
+stack_attach_joined :: proc(s: ^Stack) {
+	if len(s.joined) == 0 {
+		return
+	}
+	if s.r_on {
+		for id in s.joined {
+			rt.attach(&s.r, id)
+			rt.readvertise(&s.r, id)
+		}
+	}
+	clear(&s.joined)
 }
 
 stack_attach_space :: proc(s: ^Stack, space: prim.Id) {

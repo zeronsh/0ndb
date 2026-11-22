@@ -348,7 +348,9 @@ ondb_step :: proc "c" (h: ^Handle, block: i32) -> i32 {
 		return i32(api.Status.Busy)
 	}
 	context = _ctx()
-	return i32(api.status_of(eng.step(&h.s.e, block != 0)))
+	err := eng.step(&h.s.e, block != 0)
+	api.stack_attach_joined(&h.s)
+	return i32(api.status_of(err))
 }
 
 @(private)
@@ -510,6 +512,9 @@ _on_placement :: proc(data: rawptr, o: api.Object, info: rt.Placement_Info) {
 @(private)
 _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	h := (^Handle)(data)
+	if ev.kind == .Space_Joined || ev.kind == .Members_Changed || ev.kind == .Epoch_Changed {
+		api.stack_space_joined(&h.s, ev.space)
+	}
 	if h.events.event == nil {
 		return
 	}
