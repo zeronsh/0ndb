@@ -191,6 +191,13 @@ daemon_main :: proc(args: ^Args) -> int {
 		ec.content_budget = n
 	}
 	ec.always_on = flag_bool(args, "always-on")
+	if v, ok := flag_value(args, "holder-budget"); ok {
+		n, nok := strconv.parse_i64(v)
+		if !nok || n == 0 {
+			return usage_error("--holder-budget takes a byte count (negative: no limit)")
+		}
+		ec.holder_budget = n
+	}
 	if v, ok := flag_value(args, "capacity"); ok {
 		n, nok := strconv.parse_int(v)
 		if !nok || n <= 0 {

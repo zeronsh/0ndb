@@ -71,6 +71,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 	_content_resume(e, sp)
 	if !sp.keyless {
 		_catalog_follow(e, sp)
+		_held_follow(e, sp)
 	} else {
 		for id in _sorted_keys(sp.grants) {
 			if rec, found, _ := _rec_get(e, id); found {
@@ -381,6 +382,8 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_relay_redact_resend(e, sp)
 		_full_kick(e, sp)
 		_drafts_reconnected(e, sp)
+		_held_follow(e, sp)
+		_held_scan(e, sp)
 	case .Disconnected:
 		sp.connected = false
 		if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked {

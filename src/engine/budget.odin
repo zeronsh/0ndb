@@ -14,18 +14,21 @@ DEFAULT_CONTENT_BUDGET :: i64(1) << 30
 Budget_State :: struct {
 	added:      map[prim.Id]i64,
 	advertised: map[prim.Id]bool,
+	held:       [dynamic]Held_Note,
 }
 
 @(private)
 _budget_init :: proc(e: ^Engine) {
 	e.budget.added = make(map[prim.Id]i64, e.allocator)
 	e.budget.advertised = make(map[prim.Id]bool, e.allocator)
+	e.budget.held = make([dynamic]Held_Note, e.allocator)
 }
 
 @(private)
 _budget_destroy :: proc(e: ^Engine) {
 	delete(e.budget.added)
 	delete(e.budget.advertised)
+	delete(e.budget.held)
 }
 
 @(private)
@@ -117,6 +120,7 @@ _budget_take :: proc(e: ^Engine, sp: ^Space, size: i64) -> bool {
 
 @(private)
 _budget_flush :: proc(e: ^Engine) {
+	_held_flush(e)
 	for id in _sorted_keys(e.spaces) {
 		sp := e.spaces[id]
 		if !sp.open || sp.keyless {
