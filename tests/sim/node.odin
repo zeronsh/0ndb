@@ -504,7 +504,9 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	if err == .None && rn.packed && w.cfg.seed % 4 == 0 {
 		prim.mkdir_all(vfs, RELAY_DIR + "/objects", 0o700)
 		rn.objs = osync.Dir_Object_Store{vfs = vfs, root = RELAY_DIR + "/objects"}
-		tc := osync.Tier_Config{objects = osync.dir_object_store(&rn.objs), window_ms = 500, max_ms = 5000, hot = 4096}
+		rn.slow = Sim_Objects{inner = osync.dir_object_store(&rn.objs), loop = &rn.inst.loop, slow_ms = 200, fail = 5}
+		rng_init(&rn.slow.rng, w.cfg.seed, 991 + u64(w.stats.relay_crash))
+		tc := osync.Tier_Config{objects = sim_objects(&rn.slow), window_ms = 500, max_ms = 5000, hot = 4096}
 		if terr := osync.tier_store_init(&rn.ts, &rn.inst.loop, store, tc, node_clock(&rn.clock)); terr != .None {
 			err = terr
 		} else {
@@ -573,8 +575,11 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.w.stats.tier_evictions += rn.ts.evictions
 	rn.w.stats.tier_cold_reads += rn.ts.cold_reads
 	rn.w.stats.tier_thaws += rn.ts.thaws
+	rn.w.stats.tier_slow_reads += rn.slow.reads
+	rn.w.stats.tier_failed_reads += rn.slow.failed
 	rn.ts = {}
 	rn.objs = {}
+	rn.slow = {}
 	rn.tiered = false
 	rn.wake = 0
 	rn.mauth = {}

@@ -892,6 +892,41 @@ hot tail (`--hot-kb`, default 256 KiB): bytes already durable in the object
 store are punched out of it and read back with ranged GETs, which is
 invisible to clients except as latency. Idle, nothing is armed.
 
+#### Object store interface
+
+A host gives the tier an `Object_Store` (`src/sync/store_tiered.odin`,
+`store_fetch.odin`). Writes and reads are asynchronous; nothing in it may
+block the host's loop.
+
+- `put(key, bytes, done, ctx)` stores a whole object (a batch, or a batch
+  rewritten after a redaction) and calls `done(ctx, result, size)` exactly
+  once. The bytes are the caller's until `put` returns.
+- `read(req)` starts a read of `req.key` from `req.off`, `req.n` bytes, or
+  to the end of the object when `req.n < 0`, and completes it with exactly
+  one `object_read_done(req, result, bytes)`, either before `read` returns
+  (a local directory answers at once) or later. `bytes` may be shorter than
+  `req.n` at the end of the object and stays the host's: it is copied
+  before `object_read_done` returns. Completion must happen on the thread
+  that drives the relay core; a host whose I/O completes elsewhere hands the
+  result to that thread first. A missing object completes with `Not_Found`,
+  any other failure with `Io`.
+- `cancel(req)` (optional) tells the host the tier no longer waits for
+  `req`, when the tier is destroyed; the host still completes it once and
+  the answer is ignored. `req` stays valid until then.
+
+A Durable Object or an R2-backed host implements `read` with one
+`fetch` (an R2 `get` with a range) and completes it from the promise's
+continuation; `put` is one R2 `put`. The tier reads cold bytes in 256 KiB
+blocks of a batch object; concurrent readers of a block share one request,
+completed blocks stay in a 4 MiB cache (a redaction's rewrite of an object
+invalidates its blocks), and a failed block is retried up to three times
+before the read fails. A client read that reaches a block still in flight
+is parked: the core stops writing that connection, the block's completion
+calls the readiness hook the core registered (`Relay_Storage.on_ready`) and
+the core resumes every parked connection, so a slow object store delays
+only the clients that read cold bytes. Redaction below the watermark and
+rewrites chain through the same completions.
+
 ## 12. Conformance vectors
 
 `docs/relay-vectors/*.json` are produced by `tools/relayvec` (`relayvec
