@@ -450,6 +450,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 			_space_refuse(e, sp)
 		}
 		_probes_settle(e, sp)
+		_unknown_waiters_wake(e, sp)
 		_emit(e, Event{kind = .Disconnected, space = sp.id, err = _serr(ev.err)})
 	case .Uploaded:
 		_own_tree_uploaded(e, ev.stream, ev.length)
@@ -530,6 +531,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		if !sp.keyless {
 			_members_caught_up(e, sp)
 		}
+		_unknown_waiters_wake(e, sp)
 		_emit(e, Event{kind = .Caught_Up, space = sp.id, length = ev.length})
 	case .Unavailable:
 		_unavailable_note(e, sp, ev)

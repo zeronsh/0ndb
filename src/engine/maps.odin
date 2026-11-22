@@ -830,6 +830,7 @@ _catalog_members :: proc(e: ^Engine, h: ^Handle) {
 	if gerr != .None || !found {
 		return
 	}
+	h.cat_known = true
 	for p in c.participants {
 		if p != e.self {
 			_member_seen(e, sp, h.id, h.kind, p)
