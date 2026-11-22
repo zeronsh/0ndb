@@ -455,7 +455,10 @@ equal in both directions.
   shadow, the mount state (synced frontier, journal position), staged blobs
   and materialization wait for that batch in every durability mode: a pass
   records an image under the history's mark and writes it when the mark is
-  acknowledged. The mount state also records the shadow's generation and
+  acknowledged. Recovery from the mount's own intents (at open, or when a
+  pass retries an import that did not finish) goes through the same wait:
+  the intents stay in the saved state until the image that covers them is
+  written. The mount state also records the shadow's generation and
   log end it was saved against; on open a longer shadow is truncated back
   to that end, so shadow and synced frontier are always one saved state and
   a crash between the shadow flush and the state save is undone.
