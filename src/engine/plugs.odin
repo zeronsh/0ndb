@@ -254,7 +254,7 @@ _mounts_settle :: proc(e: ^Engine) {
 		return
 	}
 	for mt in e.plug.mounts {
-		if len(mt.mount.dirty) == 0 && !mt.mount.rescan || mt.mount.gate_on {
+		if len(mt.mount.dirty) == 0 && !mt.mount.rescan || fs.mount_gate_held(&mt.mount) {
 			continue
 		}
 		if err := fs.mount_run(&mt.mount); err != .None {

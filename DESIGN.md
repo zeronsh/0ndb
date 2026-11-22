@@ -523,14 +523,47 @@ equal in both directions.
   `logs/HEAD` and renames `HEAD.lock` onto `HEAD`): every working-tree write
   precedes any HEAD or reflog signal, and a checkout without `-f` carries a
   dirty tracked file or refuses, never overwrites it. So the mount gates on
-  the lock: when `index.lock` appears, the write observer stops answering
-  write-intent opens from the process trees of runs bound to the mount, and
-  every path dirtied before the lock event is ingested onto the current line
-  without the settle delay. The gate is bounded by events, never by time: it
-  lifts when the lock disappears or when the process that created it (known
-  to the write observer) exits, watched by child watch or pidfd; a stale
-  lock with no live holder behaves as ungated and shows a passive `stale
-  .git/index.lock` status. When the lock goes, HEAD, its target and the
+  the lock: when `index.lock` appears, writes from the process trees of runs
+  bound to the mount wait, and every path dirtied before the lock event is
+  ingested onto the current line without the settle delay. After that one
+  pass, no batch runs on the gated mount until the gate lifts. The lift
+  schedules the next batch, so the batch never reads a half-written checkout
+  and never delays the lift. The gate is bounded by events, never by time: it
+  lifts when the lock disappears or when the process that created it exits,
+  watched by child watch or pidfd. The creator is the observer's
+  `O_CREAT|O_EXCL` record of the lock. Failing that, it is a bounded process
+  scan for a `git` holding the lock open or with its cwd at the repository;
+  `git checkout` keeps the lock's fd open for the whole working-tree update.
+  A lock with no live creator is stale: it behaves as ungated and shows a
+  passive `stale .git/index.lock` status. Only working-tree writers gate.
+  The subcommand is read after `-C`, `-c` and the other valued options, and
+  aliases are resolved from the repository's and user's config. Unknown
+  subcommands, `!` aliases and unreadable command lines gate. Index-only
+  commands (`commit`, `add`, `status`, …) do not. `git commit` drops its lock
+  fd before hooks and the editor run, and a gate would stall the run for the
+  whole editor session. Writes from git's own process subtree (hooks) are
+  git writes, never credited to a run's scope. Each OS gates its own way:
+  - **Linux**: the seccomp supervisor parks write-intent opens under the
+    mount root, except from the creator's subtree, and continues them on
+    lift. The keeper's parked set keeps its guarantee: a dead supervisor
+    continues every parked notification, so no run stays blocked. Reads,
+    network and writes elsewhere go on.
+  - **macOS**: the bound runs' process trees whose cwd is under the mount
+    get `SIGSTOP`, then `SIGCONT` on lift; 0ndb's own processes and the
+    creator's subtree are never stopped. Reads and network pause too,
+    bounded by git's own runtime. A git/git checkout between v1.6.0 and
+    v2.47.0 pauses 0.4–0.6 s, well inside any provider stream's idle
+    timeout.
+  - **Windows**: no gate. Suspension is a kernel APC that can land inside a
+    non-critical-region kernel wait, such as a filter driver waiting on its
+    user-mode service, and a thread frozen there can deadlock git or the
+    daemon's own loop. Without a minifilter there is no safe pre-open hook.
+    Runs are held at the protocol level (`Interrupted{reason =
+    branch_changed}` at the next tool boundary) once the switch is
+    classified, and run writes that land inside the lock window are
+    classified on the next pass like a tool that bypasses the lock. The
+    stale-lock status still shows.
+  When the lock goes, HEAD, its target and the
   reflog tail decide: a changed branch or detached commit with a
   `checkout:`/`switch:` entry is a line switch A→B (git's writes are one
   git-op batch on B, carried dirty files are ingested onto A and onto B as a

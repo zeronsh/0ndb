@@ -138,9 +138,6 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 		return
 	}
 	obs := m.reg.observer
-	if obs.gate == nil || m.reg.loop == nil {
-		return
-	}
 	lock, jerr := path_join(m.git.dir, "index.lock", context.temp_allocator)
 	if jerr != nil {
 		return
@@ -167,6 +164,9 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 		return
 	}
 	m.lock_stale = false
+	if obs.gate == nil || m.reg.loop == nil {
+		return
+	}
 	gates := false
 	configs := _gate_configs(m)
 	pids := make([dynamic]prim.Pid, context.temp_allocator)
@@ -183,6 +183,8 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 	}
 	m.gate_id = id
 	m.gate_on = true
+	m.gate_first = true
+	mount_schedule(m, 0)
 	if m.gate_watches == nil {
 		m.gate_watches = make([dynamic]Gate_Watch, m.allocator)
 	}
@@ -219,7 +221,12 @@ mount_ungate :: proc(m: ^Mount) {
 	}
 	clear(&m.gate_watches)
 	m.gate_on = false
+	m.gate_first = false
 	m.gate_id = 0
+}
+
+mount_gate_held :: proc "contextless" (m: ^Mount) -> bool {
+	return m.gate_on && !m.gate_first
 }
 
 mount_lock_stale :: proc "contextless" (m: ^Mount) -> bool {

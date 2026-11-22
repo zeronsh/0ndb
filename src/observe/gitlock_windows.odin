@@ -8,7 +8,7 @@ import win "core:sys/windows"
 import "../fs"
 import "../prim"
 
-foreign import ntdll_gate "system:ntdll.lib"
+foreign import ntdll_query "system:ntdll.lib"
 foreign import rstrtmgr "system:Rstrtmgr.lib"
 
 @(private)
@@ -33,9 +33,7 @@ PROCESS_COMMAND_LINE_INFORMATION :: u32(60)
 
 @(private)
 @(default_calling_convention = "system")
-foreign ntdll_gate {
-	NtSuspendProcess :: proc(h: win.HANDLE) -> i32 ---
-	NtResumeProcess :: proc(h: win.HANDLE) -> i32 ---
+foreign ntdll_query {
 	@(link_name = "NtQueryInformationProcess")
 	_nt_query_process :: proc(h: win.HANDLE, class: u32, info: rawptr, length: u32, ret: ^u32) -> i32 ---
 }
@@ -47,18 +45,6 @@ foreign rstrtmgr {
 	RmRegisterResources :: proc(session: u32, nfiles: u32, files: [^][^]u16, napps: u32, apps: rawptr, nservices: u32, services: rawptr) -> u32 ---
 	RmGetList :: proc(session: u32, needed: ^u32, count: ^u32, infos: [^]RM_PROCESS_INFO, reasons: ^u32) -> u32 ---
 	RmEndSession :: proc(session: u32) -> u32 ---
-}
-
-@(private)
-Win_Susp :: struct {
-	id:      u32,
-	handles: [dynamic]win.HANDLE,
-}
-
-@(private)
-Win_Gates :: struct {
-	gates: [dynamic]Win_Susp,
-	next:  u32,
 }
 
 @(private)
@@ -88,68 +74,6 @@ _exe_name :: proc(e: ^win.PROCESSENTRY32W) -> string {
 	buf := make([]u8, n * 4, context.temp_allocator)
 	k := utf16.decode_to_utf8(buf, e.szExeFile[:n])
 	return strings.to_lower(string(buf[:k]), context.temp_allocator)
-}
-
-@(private)
-_win_gate :: proc(g: ^Win_Gates, roots: []prim.Pid, exempt: []prim.Pid, allocator: runtime.Allocator) -> (id: u32, ok: bool) {
-	self := prim.Pid(win.GetCurrentProcessId())
-	entries := _snapshot(context.temp_allocator)
-	sg := Win_Susp{handles = make([dynamic]win.HANDLE, allocator)}
-	queue := make([dynamic]prim.Pid, context.temp_allocator)
-	seen := make(map[prim.Pid]bool, context.temp_allocator)
-	for r in roots {
-		append(&queue, r)
-	}
-	walk: for len(queue) > 0 {
-		p := pop(&queue)
-		if p <= 4 || p == self || seen[p] {
-			continue
-		}
-		seen[p] = true
-		for x in exempt {
-			if x == p {
-				continue walk
-			}
-		}
-		if h := win.OpenProcess(win.PROCESS_SUSPEND_RESUME, false, u32(p)); h != nil {
-			if NtSuspendProcess(h) >= 0 {
-				append(&sg.handles, h)
-			} else {
-				win.CloseHandle(h)
-			}
-		}
-		for &e in entries {
-			if prim.Pid(e.th32ParentProcessID) == p && prim.Pid(e.th32ProcessID) != p {
-				append(&queue, prim.Pid(e.th32ProcessID))
-			}
-		}
-	}
-	g.next += 1
-	if g.next == 0 {
-		g.next = 1
-	}
-	sg.id = g.next
-	if g.gates == nil {
-		g.gates = make([dynamic]Win_Susp, allocator)
-	}
-	append(&g.gates, sg)
-	return sg.id, true
-}
-
-@(private)
-_win_ungate :: proc(g: ^Win_Gates, id: u32) {
-	for &sg, i in g.gates {
-		if sg.id != id {
-			continue
-		}
-		for h in sg.handles {
-			NtResumeProcess(h)
-			win.CloseHandle(h)
-		}
-		delete(sg.handles)
-		unordered_remove(&g.gates, i)
-		return
-	}
 }
 
 @(private)

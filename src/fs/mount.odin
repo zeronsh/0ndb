@@ -287,6 +287,7 @@ Mount :: struct {
 	fence_seq:   u64,
 	gate_id:     u32,
 	gate_on:     bool,
+	gate_first:  bool,
 	lock_stale:  bool,
 	gate_watches: [dynamic]Gate_Watch,
 	conv_seq:    u64,
@@ -1037,7 +1038,7 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 	}
 	m.timer = prim.timer(m.reg.loop, delay_ms, m, proc(l: ^prim.Loop, data: rawptr) {
 		mm := (^Mount)(data)
-		if mm.gate_on {
+		if mount_gate_held(mm) {
 			return
 		}
 		if mm.reg.on_ready != nil {
@@ -1049,6 +1050,7 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 }
 
 mount_run :: proc(m: ^Mount) -> Error {
+	m.gate_first = false
 	fence := false
 	for f in m.fences {
 		if fence_ready(f) {
