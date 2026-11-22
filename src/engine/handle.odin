@@ -857,6 +857,10 @@ _waiters_run :: proc(e: ^Engine) {
 		i += 1
 	}
 	for w in ready {
+		if w.cmd != nil && _object_blocked(e, w.object) {
+			append(&e.waiters, w)
+			continue
+		}
 		if h, ok := e.handles[w.object]; ok {
 			_handle_refresh(h)
 			c := e.changed[w.object]

@@ -228,6 +228,17 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 	}
 	st: Cmd_State
 	h: ^Handle
+	if len(e.held) > 0 || _object_blocked(e, _cmd_object(cmd).id) {
+		p := new(Pending_Cmd, e.allocator)
+		if virtual.arena_init_growing(&p.arena) != nil {
+			free(p, e.allocator)
+			return res, .No_Memory
+		}
+		p.cmd = _cmd_clone(cmd, virtual.arena_allocator(&p.arena))
+		p.done = done
+		_queue_behind(e, p)
+		return res, .Pending
+	}
 	res, h, err = _cmd_run(e, cmd, &st)
 	busy := err == .Busy && pack.pressure(&e.pk)
 	if !busy && (err != .Missing || h == nil) {
@@ -742,7 +753,43 @@ _held_retry :: proc(e: ^Engine) {
 	list := e.held
 	e.held = make([dynamic]^Pending_Cmd, e.allocator)
 	for p in list {
+		if len(e.held) > 0 || _object_blocked(e, _cmd_object(p.cmd).id) {
+			_queue_behind(e, p)
+			continue
+		}
 		_cmd_retry(e, p, 0)
 	}
 	delete(list)
+}
+
+@(private)
+_object_blocked :: proc(e: ^Engine, obj: prim.Id) -> bool {
+	for p in e.held {
+		if _cmd_object(p.cmd).id == obj {
+			return true
+		}
+	}
+	for w in e.waiters {
+		if w.cmd != nil && w.object == obj {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_queue_behind :: proc(e: ^Engine, p: ^Pending_Cmd) {
+	obj := _cmd_object(p.cmd).id
+	for w in e.waiters {
+		if w.cmd != nil && w.object == obj {
+			n := new(Waiter, e.allocator)
+			n.space = w.space
+			n.object = obj
+			n.cmd = p
+			n.tick = e.tick
+			append(&e.waiters, n)
+			return
+		}
+	}
+	append(&e.held, p)
 }
