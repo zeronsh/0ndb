@@ -26,7 +26,11 @@ Fpunchhole :: struct {
 @(private)
 foreign libc {
 	flock :: proc(fd: posix.FD, op: c.int) -> c.int ---
+	renamex_np :: proc(from: cstring, to: cstring, flags: c.uint) -> c.int ---
 }
+
+@(private)
+RENAME_SWAP :: 0x2
 
 @(rodata)
 OS_VFS_PROCS := Vfs_Procs {
@@ -52,6 +56,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	dir_open   = _os_dir_open,
 	dir_next   = _os_dir_next,
 	dir_close  = _os_dir_close,
+	exchange   = _os_exchange,
 }
 
 @(private)
@@ -410,6 +415,18 @@ _os_rename :: proc(data: rawptr, old: string, new: string) -> Error {
 	pa := cpath(old, &a) or_return
 	pb := cpath(new, &b) or_return
 	if posix.rename(pa, pb) != 0 {
+		return _errno()
+	}
+	return .None
+}
+
+@(private)
+_os_exchange :: proc(data: rawptr, a: string, b: string) -> Error {
+	x: Path_Buf = ---
+	y: Path_Buf = ---
+	pa := cpath(a, &x) or_return
+	pb := cpath(b, &y) or_return
+	if renamex_np(pa, pb, RENAME_SWAP) != 0 {
 		return _errno()
 	}
 	return .None

@@ -78,6 +78,9 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	}
 	m.merge_base = m.synced[:] if merge else nil
 	defer m.merge_base = nil
+	if m.mat_retries == 0 {
+		m.mat_bytes = 0
+	}
 	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	crdt.graph_diff(&h.g, sl[:], tl[:], &only_a, &only_b)
@@ -197,6 +200,19 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		return berr
 	}
 	mat_owed_clear(m)
+	if ms.raced && !merge && !m.restoring && m.mat_retries < MAT_RACE_RETRIES {
+		m.mat = nil
+		m.mat_retries += 1
+		defer m.mat_retries -= 1
+		mount_pass(m, false) or_return
+		one := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, m.synced[:], &one) != .None {
+			return .Corrupt
+		}
+		both := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.version_union(&h.g, tl[:], one[:], &both)
+		return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), false)
+	}
 	if !m.restoring {
 		clear(&m.synced)
 		append(&m.synced, ..target)
@@ -209,6 +225,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 Mat_Sync :: struct {
 	files: [dynamic]string,
 	dirs:  map[string]bool,
+	raced: bool,
 }
 
 @(private)
@@ -317,6 +334,20 @@ mat_rewrite :: proc(m: ^Mount, abs: string, ms: ^Mat_Sync) -> Error {
 
 @(private)
 MAT_SYNCFS_THRESHOLD :: 128
+
+@(private)
+MAT_RACE_RETRIES :: 8
+
+mount_coalesce_ms :: proc(m: ^Mount) -> i64 {
+	return min(i64(m.mat_bytes >> 17), 200)
+}
+
+@(private)
+mat_raced :: proc(m: ^Mount) {
+	if m.mat != nil {
+		m.mat.raced = true
+	}
+}
 
 @(private)
 mat_file :: proc(m: ^Mount, abs: string) {
@@ -697,6 +728,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 			if m.merge_base != nil && it.present && it.kind == .File && it.old == it.path && .Opaque not_in it.flags && it.entry.kind == .File {
 				merge_dirty(m, it, tl) or_return
 			}
+			mat_raced(m)
 			mount_mark(m, it.old)
 			return .None
 		}
@@ -796,8 +828,20 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		}
 	case .File:
 		ensure_parent(m, abs) or_return
-		write_file_content(m, it, abs, tl, &e) or_return
+		ours, raced := write_file_content(m, it, abs, tl, &e) or_return
 		attr_invalidate(m, it.path)
+		if raced {
+			mat_raced(m)
+			mount_mark(m, it.path)
+			return .None
+		}
+		if ours != 0 && it.has_old && it.entry.stat.ino != 0 {
+			if st, serr := prim.lstat(m.vfs, abs); serr == .None && st.ino != ours {
+				mat_raced(m)
+				mount_mark(m, it.path)
+				return .None
+			}
+		}
 	}
 	if st, serr := prim.lstat(m.vfs, abs); serr == .None {
 		e.stat = disk_stat(st)
@@ -809,63 +853,106 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 }
 
 @(private)
-write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv, e: ^Entry) -> Error {
+write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv, e: ^Entry) -> (ours: u64, raced: bool, err: Error) {
 	h := m.history
 	mode: u32 = 0o755 if .Exec in it.flags else 0o644
 	tmp := temp_name(m, abs, context.temp_allocator)
 	if .Opaque in it.flags {
 		reg, has := history_blob_at(h, it.inode, tl) or_return
 		if !has || m.db == nil {
-			return .None
+			return 0, false, .None
 		}
 		if e.oid == odb.Oid(reg.oid) && it.has_old && it.old == it.path {
-			return set_mode(m, abs, mode)
+			return 0, false, set_mode(m, abs, mode)
 		}
 		fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
 		if oerr != .None {
-			return from_prim(oerr)
+			return 0, false, from_prim(oerr)
 		}
 		sink := Fd_Sink{m.vfs, fd, 0, .None}
 		out := io.Stream{procedure = fd_sink_proc, data = &sink}
 		sok := eol_smudge_blob(m, it.path, odb.Oid(reg.oid), out, fd_sink_rewind, &sink, it.inode, true)
 		prim.fchmod(m.vfs, fd, mode)
+		ours = tmp_ino(m, fd)
 		prim.close_file(m.vfs, fd)
 		if !sok || sink.err != .None {
 			prim.remove(m.vfs, tmp)
-			return sink.err if sink.err != .None else .Io
+			return 0, false, sink.err if sink.err != .None else .Io
 		}
-		from_prim(prim.rename(m.vfs, tmp, abs)) or_return
+		if mat_replace(m, it, tmp, abs, ours) or_return {
+			return 0, true, .None
+		}
 		mat_file(m, abs)
 		mat_ancestors(m, abs)
 		e.oid = odb.Oid(reg.oid)
-		return .None
+		return ours, false, .None
 	}
 	ids := crdt.graph_version_ids(&h.g, tl, context.temp_allocator)
 	data := history_text_at(h, it.inode, ids, context.temp_allocator) or_return
+	m.mat_bytes += len(data)
 	oid: odb.Oid
 	if m.db != nil {
 		oid, _ = odb.hash(m.db.format, .Blob, data)
 		if oid == e.oid && it.has_old && it.old == it.path {
-			return set_mode(m, abs, mode)
+			return 0, false, set_mode(m, abs, mode)
 		}
 	}
 	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
 	if oerr != .None {
-		return from_prim(oerr)
+		return 0, false, from_prim(oerr)
 	}
 	sink := Fd_Sink{m.vfs, fd, 0, .None}
 	sok := eol_smudge_to(m, it.path, data, io.Stream{procedure = fd_sink_proc, data = &sink}, it.inode, true)
 	prim.fchmod(m.vfs, fd, mode)
+	ours = tmp_ino(m, fd)
 	prim.close_file(m.vfs, fd)
 	if !sok || sink.err != .None {
 		prim.remove(m.vfs, tmp)
-		return sink.err if sink.err != .None else .Io
+		return 0, false, sink.err if sink.err != .None else .Io
 	}
-	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
+	if mat_replace(m, it, tmp, abs, ours) or_return {
+		return 0, true, .None
+	}
 	mat_file(m, abs)
 	mat_ancestors(m, abs)
 	e.oid = oid
-	return .None
+	return ours, false, .None
+}
+
+@(private)
+mat_replace :: proc(m: ^Mount, it: ^Mat_Item, tmp, abs: string, ours: u64) -> (raced: bool, err: Error) {
+	if !it.has_old {
+		return false, from_prim(prim.rename(m.vfs, tmp, abs))
+	}
+	if !disk_matches(m, it.old, it.entry) {
+		prim.remove(m.vfs, tmp)
+		return true, .None
+	}
+	if it.old != it.path || it.entry.kind != .File || ours == 0 || it.entry.stat.ino == 0 {
+		return false, from_prim(prim.rename(m.vfs, tmp, abs))
+	}
+	if prim.rename_exchange(m.vfs, tmp, abs) != .None {
+		return false, from_prim(prim.rename(m.vfs, tmp, abs))
+	}
+	st, serr := prim.lstat(m.vfs, tmp)
+	if serr == .None && (st.ino != it.entry.stat.ino || st.size != it.entry.stat.size || st.mtime_ns != it.entry.stat.mtime_ns) {
+		if cur, cerr := prim.lstat(m.vfs, abs); cerr == .None && cur.ino == ours {
+			prim.rename_exchange(m.vfs, tmp, abs)
+		}
+		prim.remove(m.vfs, tmp)
+		return true, .None
+	}
+	prim.remove(m.vfs, tmp)
+	return false, .None
+}
+
+@(private)
+tmp_ino :: proc(m: ^Mount, fd: prim.Fd) -> u64 {
+	st, err := prim.fstat(m.vfs, fd)
+	if err != .None {
+		return 0
+	}
+	return st.ino
 }
 
 @(private)

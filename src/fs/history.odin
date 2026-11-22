@@ -1517,7 +1517,7 @@ history_unload_files :: proc(h: ^History) {
 }
 
 history_trim :: proc(h: ^History) {
-	history_unload_files(h)
+	history_unload_unviewed(h)
 	crdt.graph_trim(&h.g)
 	fstree.trim(&h.tree, 64)
 	clear(&h.touched)
@@ -1529,6 +1529,32 @@ history_trim :: proc(h: ^History) {
 	}
 	markers_clear(h)
 	shrink(&h.io)
+}
+
+@(private)
+history_unload_unviewed :: proc(h: ^History) {
+	if len(h.views) == 0 {
+		history_unload_files(h)
+		return
+	}
+	drop := make([dynamic]fstree.Inode_Id, 0, len(h.files), context.temp_allocator)
+	outer: for ino in h.files {
+		for v in h.views {
+			if v.inode == ino {
+				continue outer
+			}
+		}
+		append(&drop, ino)
+	}
+	for ino in drop {
+		file_free(h, h.files[ino])
+		delete_key(&h.files, ino)
+	}
+	if h.blob_data != nil {
+		delete(h.blob_data, h.allocator)
+		h.blob_data = nil
+	}
+	h.blob_cache = {}
 }
 
 history_file_loaded :: proc(h: ^History, inode: fstree.Inode_Id) -> bool {
