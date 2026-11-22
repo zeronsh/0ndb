@@ -63,13 +63,14 @@ def free_port():
     return p
 
 
-def du(path):
+def du(path, disk=False):
     total = 0
     files = 0
     for root, _, names in os.walk(path):
         for n in names:
             try:
-                total += os.path.getsize(os.path.join(root, n))
+                st = os.stat(os.path.join(root, n))
+                total += st.st_blocks * 512 if disk else st.st_size
                 files += 1
             except OSError:
                 pass
@@ -146,7 +147,11 @@ class Relay:
         self.proc.wait(timeout=60)
         log = open(os.path.join(self.dir, "relay.log")).read()
         m = re.search(r"relay stopped \((\d+) appends, ([^,]+) in, ([^,]+) out, (\d+) object-store writes, ([^)]+)\)", log)
-        return dict(appends=int(m.group(1)), bytes_in=m.group(2), bytes_out=m.group(3), puts=int(m.group(4)), put_bytes=m.group(5)) if m else {}
+        row = dict(appends=int(m.group(1)), bytes_in=m.group(2), bytes_out=m.group(3), puts=int(m.group(4)), put_bytes=m.group(5)) if m else {}
+        g = re.search(r"object-store reads (\d+) \(([^)]+)\)", log)
+        if g:
+            row.update(gets=int(g.group(1)), get_bytes=g.group(2))
+        return row
 
 
 class Device:
@@ -237,8 +242,9 @@ def pack_breakdown(spaces):
 def measure(relay, info, extra=None, sampler=None):
     st = relay.stop()
     pack, _ = du(os.path.join(relay.dir, "relay", "spaces"))
+    disk, _ = du(os.path.join(relay.dir, "relay", "spaces"), disk=True)
     obj, files = du(os.path.join(relay.dir, "objects"))
-    row = dict(pack_bytes=pack, object_files=files, object_live_bytes=obj, info_bytes=info)
+    row = dict(pack_bytes=pack, pack_disk_bytes=disk, object_files=files, object_live_bytes=obj, info_bytes=info)
     row.update(st)
     row.update(extra or {})
     if sampler:

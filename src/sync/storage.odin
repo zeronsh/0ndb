@@ -33,6 +33,8 @@ Relay_Storage :: struct {
 	drop:            proc(data: rawptr, ns: rawptr, id: Stream_Id, done: Storage_Done, ctx: rawptr),
 	redact:          proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, ctx: rawptr),
 	trim:            proc(data: rawptr, s: rawptr, base: i64, done: Storage_Done, ctx: rawptr),
+	evict:           proc(data: rawptr, s: rawptr, upto: i64, done: Storage_Done, ctx: rawptr),
+	restore:         proc(data: rawptr, s: rawptr, at: i64, bytes: []u8, done: Storage_Done, ctx: rawptr),
 	stream_trimmed:  proc(data: rawptr, s: rawptr) -> bool,
 	list_begin:      proc(data: rawptr, ns: rawptr, since: i64) -> (it: rawptr, cursor: i64, err: Error),
 	list_next:       proc(data: rawptr, it: rawptr) -> (id: Stream_Id, ok: bool),
