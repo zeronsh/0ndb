@@ -194,6 +194,8 @@ Config :: struct {
 	durability:  eng.Durability,
 	promote:     i64,
 	persist_fault: bool,
+	archive_min: i64,
+	archive_group: int,
 }
 
 World :: struct {
