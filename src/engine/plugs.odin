@@ -1,6 +1,7 @@
 package engine
 
 import "core:crypto/blake2b"
+import "core:fmt"
 import "../fs"
 import "../http"
 import "../prim"
@@ -112,6 +113,7 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 		run := _join(context.temp_allocator, e.dir, "run") or_return
 		_ferr(fs.registry_init(&e.plug.reg, e.base, run, e.allocator, e.cfg.random)) or_return
 		e.plug.reg_on = true
+		fs.registry_set_base_note(&e.plug.reg, _on_base_note, e)
 		fs.registry_set_boot(&e.plug.reg, boot_id(e))
 		if e.cfg.watcher.start != nil {
 			_ferr(fs.registry_set_watcher(&e.plug.reg, e.cfg.watcher)) or_return
@@ -327,4 +329,20 @@ _plugs_close :: proc(e: ^Engine) {
 		http.curl_destroy(&e.plug.curl)
 		e.plug.curl_on = false
 	}
+}
+
+@(private)
+_on_base_note :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, data: rawptr) {
+	e := (^Engine)(data)
+	switch note {
+	case .Merged:
+		e.stats.base_merged += 1
+	case .Current:
+		e.stats.base_current += 1
+	case .Mismatch:
+		e.stats.base_mismatch += 1
+	case .Not_Text:
+		e.stats.base_not_text += 1
+	}
+	_log(e, .Debug, fmt.tprintf("agent write base for %s: %v", rel, note))
 }

@@ -244,6 +244,23 @@ Notice :: struct {
 	text:  string,
 }
 
+File_Write_Begin :: struct {
+	tool: string,
+	path: string,
+}
+
+File_Base_Kind :: enum u8 {
+	Read,
+	Write,
+}
+
+File_Base :: struct {
+	tool: string,
+	path: string,
+	base: string,
+	kind: File_Base_Kind,
+}
+
 Event :: union {
 	Session_Started,
 	Session_Failed,
@@ -264,6 +281,8 @@ Event :: union {
 	Rewound,
 	Models,
 	Notice,
+	File_Write_Begin,
+	File_Base,
 }
 
 Output :: struct {

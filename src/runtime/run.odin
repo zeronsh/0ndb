@@ -55,6 +55,7 @@ Run :: struct {
 	cur:          i64,
 	cur_kind:     convo.Block_Kind,
 	tools:        [dynamic]Run_Tool,
+	file_holds:   [dynamic]File_Hold,
 	perms:        [dynamic]Run_Perm,
 	steered:      [dynamic]Rid,
 	usage:        convo.Usage,
