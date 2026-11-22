@@ -83,7 +83,7 @@ _evaluate_sender :: proc(r: ^Runtime, o: Object) {
 		eng.touched(r.e, o)
 		_claim_overdue(r, o, msg, x, provider)
 	}
-	_promote_for_run(r, o, x)
+	_promote_for_run(r, o, msg, x)
 	if _pending_put(r, o, Pending_Entry{msg = msg, provider = provider, since_ms = wall_ms(r), runner = x, assigned = true}) {
 		_placement_hook(r, o, Placement_Info{state = .Assigned, msg = msg, runner = x, provider = provider, since_ms = wall_ms(r)})
 	}

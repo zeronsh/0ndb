@@ -331,6 +331,10 @@ _pull_drop :: proc(r: ^Replicator, rm: ^Remote, i: int) {
 
 @(private)
 _on_unserved :: proc(r: ^Replicator, ev: ^Event) {
+	if _pipe_on_unserved(r, ev) {
+		_repl_flush(r)
+		return
+	}
 	rm, ok := r.remotes[Stream_Id(ev.id)]
 	if !ok {
 		return
@@ -380,6 +384,7 @@ _peers_presence :: proc(r: ^Replicator, d: Device_Id, up: bool) {
 			_remote_pull_retry(r, rm)
 		}
 	}
+	_pipe_presence(r, d, up)
 	_repl_flush(r)
 }
 
@@ -423,6 +428,9 @@ _read_range :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
 
 @(private)
 _on_served :: proc(r: ^Replicator, ev: ^Event) {
+	if _pipe_on_served(r, ev) {
+		return
+	}
 	rm, ok := r.remotes[Stream_Id(ev.id)]
 	if ev.first {
 		if !ok {
@@ -540,7 +548,7 @@ Serve_Result :: enum u8 {
 _serve :: proc(r: ^Replicator, q: Serve_Req) -> Serve_Result {
 	if q.to > q.from && q.to - q.from <= SERVE_SPAN_MAX {
 		if stream_device(q.id) != r.cfg.self {
-			if _serve_replica(r, q) {
+			if _serve_replica(r, q) || _serve_object(r, q) {
 				return .Done
 			}
 		} else if l, has := r.locals[q.id]; has && q.from >= l.floor {

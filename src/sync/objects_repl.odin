@@ -51,6 +51,16 @@ Obj_Job :: struct {
 	sink_pos:  i64,
 	failed:    bool,
 	sent:      bool,
+	holders:   [dynamic]Device_Id,
+	refused:   [dynamic]Device_Id,
+	piping:    bool,
+	p_holder:  Device_Id,
+	p_tag:     u64,
+	p_part:    i64,
+	p_at:      i64,
+	p_total:   i64,
+	p_open:    bool,
+	p_unavail: bool,
 }
 
 Objects :: struct {
@@ -63,6 +73,8 @@ Objects :: struct {
 	rx:     ^Obj_Job,
 	rx_part: i64,
 	flying: int,
+	pulls:  map[u64]^Obj_Job,
+	prx:    ^Obj_Job,
 }
 
 Part_Ref :: struct {
@@ -153,6 +165,8 @@ _obj_new :: proc(r: ^Replicator, op: Obj_Op, scope: ^Scope, tree: ^Key_Tree, oid
 	nj.next = -1
 	nj.flying = make([dynamic]i64, r.allocator)
 	nj.acked = make([dynamic]u64, r.allocator)
+	nj.holders = make([dynamic]Device_Id, r.allocator)
+	nj.refused = make([dynamic]Device_Id, r.allocator)
 	crypto.zero_explicit(&ckey, size_of(ckey))
 	return nj, .None
 }
@@ -214,6 +228,7 @@ _objs_init :: proc(r: ^Replicator) {
 	r.objs.puts = make(map[Object_Key]Part_Ref, r.allocator)
 	r.objs.gets = make(map[Object_Key]Part_Ref, r.allocator)
 	r.objs.forgets = make(map[Object_Key]Part_Ref, r.allocator)
+	r.objs.pulls = make(map[u64]^Obj_Job, r.allocator)
 }
 
 @(private)
@@ -226,6 +241,7 @@ _objs_destroy :: proc(r: ^Replicator) {
 	delete(r.objs.puts)
 	delete(r.objs.gets)
 	delete(r.objs.forgets)
+	delete(r.objs.pulls)
 	r.objs = {}
 }
 
@@ -258,6 +274,8 @@ _obj_free :: proc(r: ^Replicator, j: ^Obj_Job) {
 	crypto.zero_explicit(&j.ckey, size_of(j.ckey))
 	delete(j.flying)
 	delete(j.acked)
+	delete(j.holders)
+	delete(j.refused)
 	free(j, r.allocator)
 }
 
@@ -267,6 +285,13 @@ _obj_finish :: proc(r: ^Replicator, j: ^Obj_Job, kind: Repl_Event_Kind, err: Err
 	_obj_unmap(&r.objs.gets, j)
 	_obj_unmap(&r.objs.forgets, j)
 	r.objs.flying -= len(j.flying)
+	if j.p_tag != 0 {
+		delete_key(&r.objs.pulls, j.p_tag)
+		j.p_tag = 0
+	}
+	if r.objs.prx == j {
+		r.objs.prx = nil
+	}
 	if r.objs.active == j {
 		r.objs.active = nil
 	}
@@ -575,6 +600,9 @@ _objs_on_missing :: proc(r: ^Replicator, key: Object_Key) {
 		_shred_forget(r, j)
 		return
 	}
+	if !j.piping && _pipe_start(r, j) {
+		return
+	}
 	_obj_finish(r, j, .Object_Missing, .Not_Found)
 }
 
@@ -799,6 +827,7 @@ _obj_sink :: proc(user: rawptr, plain: []u8) -> Error {
 
 @(private)
 _objs_reset :: proc(r: ^Replicator) {
+	_pipe_on_reset(r)
 	if j := r.objs.active; j != nil {
 		object_sealer_reset(&j.sealer)
 	}
