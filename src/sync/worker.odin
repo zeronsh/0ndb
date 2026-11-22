@@ -12,6 +12,8 @@ Job_Kind :: enum u8 {
 	Remove,
 	Redact,
 	Trim,
+	Evict,
+	Restore,
 }
 
 Job :: struct {
@@ -32,6 +34,7 @@ Job :: struct {
 	lay:     Layout,
 	trimmed: bool,
 	slot:    bool,
+	data:    []u8,
 	target:  rawptr,
 	ns:      rawptr,
 	done:    Storage_Done,
@@ -276,6 +279,18 @@ _job_run :: proc(job: ^Job) {
 		if job.result == .None && job.base > job.from {
 			job.result = _from_prim(prim.zero_range(job.vfs, job.fd, job.lay.base + job.from, job.base - job.from))
 		}
+		if job.result == .None {
+			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
+		}
+	case .Evict:
+		if job.value > job.from {
+			job.result = _from_prim(prim.punch_hole(job.vfs, job.fd, job.lay.base + job.from, job.value - job.from))
+		}
+		if job.result == .None {
+			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
+		}
+	case .Restore:
+		job.result = _from_prim(prim.write_at(job.vfs, job.fd, job.data, job.lay.base + job.from))
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
 		}

@@ -8,14 +8,16 @@ import "../prim"
 
 Object_Store :: struct {
 	data: rawptr,
-	put:  proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx: rawptr),
-	get:  proc(data: rawptr, key: string, allocator: runtime.Allocator) -> ([]u8, Error),
+	put:       proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx: rawptr),
+	get:       proc(data: rawptr, key: string, allocator: runtime.Allocator) -> ([]u8, Error),
+	get_range: proc(data: rawptr, key: string, off: i64, dst: []u8) -> (int, Error),
 }
 
 Tier_Config :: struct {
 	objects:   Object_Store,
 	window_ms: i64,
 	max_bytes: i64,
+	hot:       i64,
 }
 
 TIER_MANIFEST_TAG :: 16
@@ -33,6 +35,7 @@ Tier_Kind :: enum u8 {
 	Forget = 5,
 	Redact = 6,
 	Trim   = 7,
+	Evict  = 8,
 	Dirty  = 0x10,
 	Clean  = 0x11,
 	Flushed = 0x12,
@@ -45,6 +48,10 @@ Tier_Store :: struct {
 	clock:     prim.Clock,
 	timer:     prim.Timer,
 	spaces:    map[Space_Id]^Tier_Space,
+	cold_reads: u64,
+	cold_bytes: u64,
+	evictions:  u64,
+	thaws:      u64,
 	allocator: runtime.Allocator,
 }
 
@@ -87,6 +94,11 @@ Tier_Space :: struct {
 	dirty:     bool,
 	flushing:  bool,
 	account:   Store_Account,
+	cold:      map[Stream_Id]^Tier_Cold,
+	ev_q:      [dynamic]Tier_Ev,
+	ev_fly:    [dynamic]Tier_Ev,
+	evicting:  int,
+	thawing:   map[Stream_Id]int,
 }
 
 @(private)
@@ -99,9 +111,10 @@ Tier_Hold :: struct {
 
 @(private)
 Tier_Stream :: struct {
-	sp: ^Tier_Space,
-	id: Stream_Id,
-	h:  rawptr,
+	sp:   ^Tier_Space,
+	id:   Stream_Id,
+	h:    rawptr,
+	cold: ^Tier_Cold,
 }
 
 @(private)
@@ -242,6 +255,10 @@ _tier_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err
 	sp.open = make(map[Stream_Id]rawptr, t.allocator)
 	sp.man_q = make([dynamic]u8, t.allocator)
 	sp.man_wait = make([dynamic]Tier_Hold, t.allocator)
+	sp.cold = make(map[Stream_Id]^Tier_Cold, t.allocator)
+	sp.ev_q = make([dynamic]Tier_Ev, t.allocator)
+	sp.ev_fly = make([dynamic]Tier_Ev, t.allocator)
+	sp.thawing = make(map[Stream_Id]int, t.allocator)
 	t.spaces[id] = sp
 	if lerr := _tier_load(sp); lerr != .None {
 		delete_key(&t.spaces, id)
@@ -261,7 +278,7 @@ _tier_ns_close :: proc(data: rawptr, h: rawptr) {
 @(private)
 _tier_maybe_release :: proc(sp: ^Tier_Space) {
 	t := sp.t
-	if sp.refs > 0 || sp.dirty || sp.flushing || sp.man_busy || len(sp.man_q) > 0 || len(sp.man_wait) > 0 || len(sp.open) > 0 {
+	if sp.refs > 0 || sp.dirty || sp.flushing || sp.man_busy || len(sp.man_q) > 0 || len(sp.man_wait) > 0 || len(sp.open) > 0 || sp.evicting > 0 || len(sp.ev_q) > 0 || len(sp.ev_fly) > 0 {
 		return
 	}
 	delete_key(&t.spaces, sp.id)
@@ -278,6 +295,14 @@ _tier_space_free :: proc(t: ^Tier_Store, sp: ^Tier_Space) {
 	delete(sp.open)
 	delete(sp.man_q)
 	delete(sp.man_wait)
+	for _, c in sp.cold {
+		delete(c.recs)
+		free(c, t.allocator)
+	}
+	delete(sp.cold)
+	delete(sp.ev_q)
+	delete(sp.ev_fly)
+	delete(sp.thawing)
 	if sp.man != nil {
 		t.inner.stream_close(t.inner.data, sp.man)
 	}
@@ -513,7 +538,7 @@ _tier_arm :: proc(t: ^Tier_Store) {
 	if due == max(i64) {
 		return
 	}
-	wait := max((due - prim.clock_mono_ns(t.clock)) / 1_000_000, 0)
+	wait := max((due - prim.clock_mono_ns(t.clock) + 999_999) / 1_000_000, 0)
 	t.timer = prim.timer(t.loop, wait, t, _tier_on_timer)
 }
 
@@ -567,6 +592,9 @@ _tier_man_flush :: proc(sp: ^Tier_Space) {
 		if sp.mark == .Pending {
 			sp.mark = .Clean
 		}
+		append(&sp.ev_fly, ..sp.ev_q[:])
+		clear(&sp.ev_q)
+		_tier_ev_done(sp, err)
 		_tier_release_held(sp, err)
 		return
 	}
@@ -576,6 +604,8 @@ _tier_man_flush :: proc(sp: ^Tier_Space) {
 	}
 	sp.man_dirty = carries
 	clear(&sp.man_q)
+	append(&sp.ev_fly, ..sp.ev_q[:])
+	clear(&sp.ev_q)
 	sp.man_busy = true
 	t.inner.append_commit(t.inner.data, w, _tier_man_done, sp)
 }
@@ -588,6 +618,7 @@ _tier_man_done :: proc(ctx: rawptr, result: Error, value: i64) {
 		sp.usage += value - sp.man_len
 		sp.man_len = value
 	}
+	_tier_ev_done(sp, result)
 	if sp.man_dirty {
 		sp.man_dirty = false
 		if result == .None {
@@ -657,6 +688,7 @@ _tier_job_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			_tier_dirty(sp, 0)
 		case .Drop:
 			sp.usage -= value
+			_tier_cold_drop(sp, id)
 			g := sp.segs[id]
 			delete(g.redacts)
 			sp.segs[id] = Tier_Seg{dropped = true}
@@ -678,7 +710,7 @@ _tier_job_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			sp.usage -= value
 			sp.objs[cast(Object_Key)j.id] = false
 			_tier_dirty(sp, 0)
-		case .None, .Dirty, .Clean, .Flushed:
+		case .None, .Dirty, .Clean, .Flushed, .Evict:
 		}
 	}
 	done, cctx, gate := j.done, j.ctx, j.gate
@@ -943,6 +975,7 @@ _tier_put_done :: proc(ctx: rawptr, result: Error, value: i64) {
 		sp.account.writes += 1
 		sp.account.write_bytes += u64(f.n)
 		append(&sp.man_q, ..f.entries[:])
+		_tier_cold_note(sp, f.entries[:], f.segs)
 		for _, &g in f.segs {
 			delete(g.redacts)
 		}
@@ -986,6 +1019,9 @@ _tier_stream_close :: proc(data: rawptr, s: rawptr) {
 	if cur, ok := sp.open[ts.id]; ok && cur == ts.h {
 		delete_key(&sp.open, ts.id)
 	}
+	if ts.cold != nil {
+		_tier_cold_unref(sp, ts.id, ts.cold)
+	}
 	t.inner.stream_close(t.inner.data, ts.h)
 	free(ts, t.allocator)
 	_tier_maybe_release(sp)
@@ -1006,16 +1042,33 @@ _tier_stream_base :: proc(data: rawptr, s: rawptr) -> i64 {
 @(private)
 _tier_stream_read :: proc(data: rawptr, s: rawptr, at: i64, dst: []u8) -> (int, Error) {
 	t := cast(^Tier_Store)data
-	return t.inner.stream_read(t.inner.data, (cast(^Tier_Stream)s).h, at, dst)
+	ts := cast(^Tier_Stream)s
+	c := _tier_cold_of(ts)
+	if c == nil || at >= c.upto || len(dst) == 0 {
+		return t.inner.stream_read(t.inner.data, ts.h, at, dst)
+	}
+	cold := int(min(i64(len(dst)), c.upto - at))
+	if err := _tier_cold_read(ts.sp, c, at, dst[:cold]); err != .None {
+		return 0, err
+	}
+	if cold == len(dst) {
+		return cold, .None
+	}
+	n, err := t.inner.stream_read(t.inner.data, ts.h, at + i64(cold), dst[cold:])
+	return cold + n, err
 }
 
 @(private)
 _tier_stream_extent :: proc(data: rawptr, s: rawptr, at: i64, n: i64) -> (fd: prim.Fd, off: i64, length: i64, ok: bool) {
 	t := cast(^Tier_Store)data
+	ts := cast(^Tier_Stream)s
 	if t.inner.stream_extent == nil {
 		return prim.INVALID_FD, 0, 0, false
 	}
-	return t.inner.stream_extent(t.inner.data, (cast(^Tier_Stream)s).h, at, n)
+	if c := _tier_cold_of(ts); c != nil && at < c.upto {
+		return prim.INVALID_FD, 0, 0, false
+	}
+	return t.inner.stream_extent(t.inner.data, ts.h, at, n)
 }
 
 @(private)
@@ -1108,6 +1161,10 @@ _tier_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done,
 	t := cast(^Tier_Store)data
 	ts := cast(^Tier_Stream)s
 	j := _tier_job(ts.sp, .Redact, cast([32]u8)ts.id, from, to - from, done, ctx)
+	if c := _tier_cold_of(ts); c != nil && from < c.upto {
+		_tier_thaw_start(t, ts, c, from, to, j)
+		return
+	}
 	t.inner.redact(t.inner.data, ts.h, from, to, _tier_job_done, j)
 }
 
@@ -1225,10 +1282,27 @@ Dir_Object_Store :: struct {
 	root:  string,
 	puts:  u64,
 	bytes: u64,
+	gets:      u64,
+	get_bytes: u64,
 }
 
 dir_object_store :: proc(d: ^Dir_Object_Store) -> Object_Store {
-	return Object_Store{data = d, put = _dir_put, get = _dir_get}
+	return Object_Store{data = d, put = _dir_put, get = _dir_get, get_range = _dir_get_range}
+}
+
+@(private)
+_dir_get_range :: proc(data: rawptr, key: string, off: i64, dst: []u8) -> (int, Error) {
+	d := cast(^Dir_Object_Store)data
+	path, _ := prim.path_join(context.temp_allocator, d.root, key)
+	fd, oerr := prim.open_file(d.vfs, path)
+	if oerr != .None {
+		return 0, _from_prim(oerr)
+	}
+	defer prim.close_file(d.vfs, fd)
+	d.gets += 1
+	d.get_bytes += u64(len(dst))
+	n, rerr := prim.read_at(d.vfs, fd, dst, off)
+	return n, _from_prim(rerr)
 }
 
 @(private)

@@ -2142,7 +2142,23 @@ Relay cost tracks the reachable information, not the activity. Items marked
   space per window (`--flush-ms`, default 2000) or every `--flush-mb` MiB
   (default 8); a per-space manifest in the pack, marked dirty in the same
   group commit as a window's first change, makes the tier crash-safe, and a
-  redaction rewrites the batch objects that hold the range. The relay counts
+  redaction rewrites the batch objects that hold the range. The pack is a
+  hot cache, not a second copy: once a batch object and the manifest records
+  naming it are durable, the tier appends an `Evict` record (stream, offset)
+  for each stream it carried, keeping the last `--hot-kb` (default 256 KiB)
+  plus anything the manifest does not cover contiguously from the stream's
+  base, and only then punches that prefix out of the pack (a crash between
+  the two leaves bytes in both places, never in neither). An open stream
+  builds its cold index (watermark and `Seg` records) from the manifest on
+  first use and keeps it current while open; reads below the watermark are
+  ranged GETs from the batch objects, `sendfile` is refused there, and a
+  redaction reaching below it first restores the range into the pack from
+  the objects, lowers the watermark durably, then redacts as before. Slotted
+  (based or trimmed) streams stay whole in the pack. Measured with
+  `tools/costbench` s1 (1062 transcript messages): the relay's pack on disk
+  drops from 4.71 MB to 3.60 MB, the 1.23 MB conversation segment holding
+  0.27 MB (its hot tail); the rest is container garbage awaiting compaction.
+  The relay counts
   per space stored bytes, appends, notes, fills, pulls, piped bytes,
   object-store writes and bytes, pending bytes and client bytes per UTC day
   (`Relay_Space_Stats`), served to members by the `Account` frame (feature

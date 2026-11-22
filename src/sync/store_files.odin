@@ -43,6 +43,9 @@ _Deferred :: struct {
 	done:   Storage_Done,
 	ctx:    rawptr,
 	trim:   bool,
+	evict:  bool,
+	data:   []u8,
+	keep:   bool,
 }
 
 @(private)
@@ -160,6 +163,8 @@ file_store :: proc(fs: ^File_Store) -> Relay_Storage {
 		drop = _fs_drop,
 		redact = _fs_redact,
 		trim = _fs_trim,
+		evict = _fs_evict,
+		restore = _fs_restore,
 		stream_trimmed = _fs_stream_trimmed,
 		list_begin = _fs_list_begin,
 		list_next = _fs_list_next,
@@ -305,6 +310,78 @@ _fs_trim :: proc(data: rawptr, s: rawptr, base: i64, done: Storage_Done, ctx: ra
 		done   = done,
 		ctx    = ctx,
 	}
+	if err := worker_submit(&fs.worker, job); err != .None {
+		job.result = err
+		_fs_job_done(fs, job)
+	}
+}
+
+@(private)
+_fs_evict :: proc(data: rawptr, s: rawptr, upto: i64, done: Storage_Done, ctx: rawptr) {
+	fs := cast(^File_Store)data
+	st := cast(^_Fstream)s
+	if !fs.lay.exact || st.slotted {
+		done(ctx, .None, 0)
+		return
+	}
+	if st.busy {
+		if _, e := append(&st.queue, _Deferred{evict = true, from = upto, done = done, ctx = ctx}); e != nil {
+			done(ctx, .No_Memory, 0)
+		}
+		return
+	}
+	hi := min(upto, st.length)
+	if hi <= st.base {
+		done(ctx, .None, 0)
+		return
+	}
+	job, jerr := new(Job, fs.allocator)
+	if jerr != nil {
+		done(ctx, .No_Memory, 0)
+		return
+	}
+	st.busy = true
+	job^ = {vfs = fs.vfs, lay = fs.lay, kind = .Evict, fd = st.fd, from = st.base, value = hi, target = st, done = done, ctx = ctx}
+	if err := worker_submit(&fs.worker, job); err != .None {
+		job.result = err
+		_fs_job_done(fs, job)
+	}
+}
+
+@(private)
+_fs_restore :: proc(data: rawptr, s: rawptr, at: i64, bytes: []u8, done: Storage_Done, ctx: rawptr) {
+	fs := cast(^File_Store)data
+	own, aerr := make([]u8, len(bytes), fs.allocator)
+	if aerr != nil {
+		done(ctx, .No_Memory, 0)
+		return
+	}
+	copy(own, bytes)
+	_fs_restore_owned(fs, cast(^_Fstream)s, at, own, done, ctx)
+}
+
+@(private)
+_fs_restore_owned :: proc(fs: ^File_Store, st: ^_Fstream, at: i64, own: []u8, done: Storage_Done, ctx: rawptr) {
+	if st.busy {
+		if _, e := append(&st.queue, _Deferred{keep = true, from = at, data = own, done = done, ctx = ctx}); e != nil {
+			delete(own, fs.allocator)
+			done(ctx, .No_Memory, 0)
+		}
+		return
+	}
+	if at < st.base || at + i64(len(own)) > st.length {
+		delete(own, fs.allocator)
+		done(ctx, .Conflict, 0)
+		return
+	}
+	job, jerr := new(Job, fs.allocator)
+	if jerr != nil {
+		delete(own, fs.allocator)
+		done(ctx, .No_Memory, 0)
+		return
+	}
+	st.busy = true
+	job^ = {vfs = fs.vfs, lay = fs.lay, kind = .Restore, fd = st.fd, from = at, data = own, target = st, done = done, ctx = ctx}
 	if err := worker_submit(&fs.worker, job); err != .None {
 		job.result = err
 		_fs_job_done(fs, job)
@@ -987,6 +1064,14 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 			st.slotted = true
 			value = -job.delta
 		}
+	case .Evict, .Restore:
+		st := cast(^_Fstream)job.target
+		st.busy = false
+		if job.data != nil {
+			delete(job.data, fs.allocator)
+			job.data = nil
+		}
+		value = 0
 	case .Remove:
 		if job.result == .None && job.ns != nil {
 			_usage_add(fs, cast(^_Fns)job.ns, -value)
@@ -1001,7 +1086,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	if len(job.final) > 0 {
 		delete(job.final, fs.allocator)
 	}
-	st := cast(^_Fstream)job.target if job.kind == .Stream_Sync || job.kind == .Redact || job.kind == .Trim else nil
+	st := cast(^_Fstream)job.target if job.kind == .Stream_Sync || job.kind == .Redact || job.kind == .Trim || job.kind == .Evict || job.kind == .Restore else nil
 	free(job, fs.allocator)
 	if st == nil {
 		done(ctx, result, value)
@@ -1024,6 +1109,10 @@ _fs_next :: proc(fs: ^File_Store, st: ^_Fstream) {
 			_fs_append_commit(fs, d.append, d.done, d.ctx)
 		} else if d.trim {
 			_fs_trim(fs, st, d.from, d.done, d.ctx)
+		} else if d.evict {
+			_fs_evict(fs, st, d.from, d.done, d.ctx)
+		} else if d.keep {
+			_fs_restore_owned(fs, st, d.from, d.data, d.done, d.ctx)
 		} else {
 			_fs_redact(fs, st, d.from, d.to, d.done, d.ctx)
 		}
