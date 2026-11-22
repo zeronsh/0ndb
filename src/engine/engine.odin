@@ -908,6 +908,7 @@ _emit :: proc(e: ^Engine, ev: Event) {
 	}
 	if ev.kind == .Members_Changed || ev.kind == .Epoch_Changed || ev.kind == .Access_Revoked {
 		_space_waits_wake(e, ev.space)
+		_space_waits_wake(e, ev.space, .Members)
 	}
 	if ev.kind == .Caught_Up || ev.kind == .Disconnected || ev.kind == .Access_Revoked {
 		_space_waits_wake(e, ev.space, .Catalog)

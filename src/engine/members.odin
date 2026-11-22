@@ -741,12 +741,18 @@ _members_proof :: proc(e: ^Engine, sp: ^Space, raw: []u8) {
 }
 
 @(private)
-_members_change :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, data: rawptr) -> ([]u8, Error), data: rawptr, commit: bool) -> Error {
+_members_change :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, data: rawptr) -> ([]u8, Error), data: rawptr, commit: bool, ready: Ready = {}) -> Error {
 	m: osync.Membership
 	_members_load(e, sp, &m) or_return
 	defer osync.membership_destroy(&m)
-	if osync.membership_resolve(&m) != .None {
-		return .Corrupt
+	if rerr := osync.membership_resolve(&m); rerr != .None {
+		if rerr != .Not_Found {
+			return .Corrupt
+		}
+		if ready.call == nil {
+			return .Pending
+		}
+		return _space_wait_on(e, sp, ready, .Members)
 	}
 	osync.membership_open(&m, osync.Opener{keyring = &e.keyring, self = e.identity})
 	raws := make([dynamic][]u8, context.temp_allocator)
@@ -1063,8 +1069,8 @@ _tree_maybe_stale :: proc(sp: ^Space, rt: ^Remote_Tree) -> bool {
 }
 
 @(private)
-_members_change_all :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, data: rawptr) -> ([]u8, Error), data: rawptr, commit: bool) -> Error {
-	return _members_change(e, sp, build, data, commit)
+_members_change_all :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, data: rawptr) -> ([]u8, Error), data: rawptr, commit: bool, ready: Ready = {}) -> Error {
+	return _members_change(e, sp, build, data, commit, ready)
 }
 
 @(private)

@@ -7,6 +7,7 @@ Space_Wait_Kind :: enum u8 {
 	Settling,
 	Catalog,
 	Upload,
+	Members,
 }
 
 @(private)

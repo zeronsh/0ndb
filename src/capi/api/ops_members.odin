@@ -398,7 +398,7 @@ op_directory_add :: proc(c: ^Call, o: ^Out) -> Status {
 		append(&devs, id)
 	}
 	role := osync.Role(min(max(a_u64(c, "role"), 1), u64(max(osync.Role))))
-	return status_of(eng.directory_add(c.api.e, a_id(c, "space"), person, role, devs[:]))
+	return pend(c, eng.directory_add(c.api.e, a_id(c, "space"), person, role, devs[:], ready(c)))
 }
 
 op_directory_remove :: proc(c: ^Call, o: ^Out) -> Status {
@@ -408,7 +408,7 @@ op_directory_remove :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	k: osync.Public_Key
 	copy(k[:], b)
-	return status_of(eng.directory_remove(c.api.e, a_id(c, "space"), k))
+	return pend(c, eng.directory_remove(c.api.e, a_id(c, "space"), k, ready(c)))
 }
 
 op_account_login_prf :: proc(c: ^Call, o: ^Out) -> Status {
