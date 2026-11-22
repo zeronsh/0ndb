@@ -430,6 +430,11 @@ mount_import :: proc(m: ^Mount) -> Error {
 			}
 			continue
 		}
+		if it.kind == .Dir && tracked && entry.mode & 0o170000 == 0o160000 {
+			import_gitlink(&st, it, parent) or_return
+			scan_skip(&sc)
+			continue
+		}
 		if st.resume {
 			have, found := shadow_get(&m.shadow, it.path) or_return
 			if found {
@@ -449,10 +454,6 @@ mount_import :: proc(m: ^Mount) -> Error {
 		}
 		switch it.kind {
 		case .Dir:
-			if tracked && entry.mode & 0o170000 == 0o160000 {
-				scan_skip(&sc)
-				continue
-			}
 			import_dir(&st, it, parent, &sc) or_return
 		case .File, .Symlink:
 			import_file(&st, it, parent, tracked, &entry) or_return
@@ -720,6 +721,30 @@ nested_repo :: proc(m: ^Mount, rel: string) -> bool {
 }
 
 @(private)
+import_gitlink :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame) -> Error {
+	m := st.m
+	if !fstree.valid_name(it.name) {
+		return .None
+	}
+	if st.resume {
+		if _, found := shadow_get(&m.shadow, it.path) or_return; found {
+			st.stack[len(st.stack) - 1].partial = true
+			return .None
+		}
+	}
+	if st.adopt || st.resync {
+		if ino, found, lerr := fstree.lookup(&st.snap, it.path); lerr == nil && found {
+			if info, ok, ierr := fstree.info(&st.snap, ino, context.temp_allocator); ierr == nil && ok && info.present && info.kind == .Dir {
+				st.stack[len(st.stack) - 1].partial = true
+				return import_shadow(st, it.path, Entry{inode = ino, kind = .Dir, stat = it.stat})
+			}
+		}
+	}
+	inode := builder_tree(&st.b, fstree.Op_Create{parent = parent.inode, name = it.name, kind = .Dir})
+	return import_shadow(st, it.path, Entry{inode = inode, kind = .Dir, stat = it.stat})
+}
+
+@(private)
 import_dir :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, sc: ^Scanner) -> Error {
 	m := st.m
 	name := it.name
@@ -792,6 +817,9 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	exec := exec_bit(m, stat, tracked && e.mode & 0o170000 == 0o100000 && e.mode & 0o111 != 0)
 	if exec {
 		flags += {.Exec}
+	}
+	if m.has_git {
+		flags += {.Git_Clean}
 	}
 	oid: odb.Oid
 	binary := false
@@ -2309,6 +2337,9 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 		if binary {
 			flags += {.Opaque}
 		}
+		if m.has_git {
+			flags += {.Git_Clean}
+		}
 		if (binary || len(data) > m.opts.inline_limit) && data != nil {
 			store_blob(m, data) or_return
 		}
@@ -2449,6 +2480,9 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	exec := exec_bit(m, c.stat, .Exec in old_flags)
 	if exec != (.Exec in old_flags) {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Exec}, value = {.Exec} if exec else {}})
+	}
+	if m.has_git && .Git_Clean not_in old_flags {
+		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Git_Clean}, value = {.Git_Clean}})
 	}
 	if oid == e.oid && m.db != nil {
 		return shadow_put(&m.shadow, path, ne)

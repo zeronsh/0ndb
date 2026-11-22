@@ -659,7 +659,7 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 		}
 		sink := Fd_Sink{m.vfs, fd, 0, .None}
 		out := io.Stream{procedure = fd_sink_proc, data = &sink}
-		sok := eol_smudge_blob(m, it.path, odb.Oid(reg.oid), out, fd_sink_rewind, &sink)
+		sok := eol_smudge_blob(m, it.path, odb.Oid(reg.oid), out, fd_sink_rewind, &sink, it.inode, true)
 		prim.fchmod(m.vfs, fd, mode)
 		prim.close_file(m.vfs, fd)
 		if !sok || sink.err != .None {
@@ -686,7 +686,7 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 		return from_prim(oerr)
 	}
 	sink := Fd_Sink{m.vfs, fd, 0, .None}
-	sok := eol_smudge_to(m, it.path, data, io.Stream{procedure = fd_sink_proc, data = &sink})
+	sok := eol_smudge_to(m, it.path, data, io.Stream{procedure = fd_sink_proc, data = &sink}, it.inode, true)
 	prim.fchmod(m.vfs, fd, mode)
 	prim.close_file(m.vfs, fd)
 	if !sok || sink.err != .None {
@@ -736,7 +736,7 @@ merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if oerr != .None {
 		return from_prim(oerr)
 	}
-	werr := prim.write_at(m.vfs, fd, eol_smudge(m, it.path, merged), 0)
+	werr := prim.write_at(m.vfs, fd, eol_smudge(m, it.path, merged, context.temp_allocator, it.inode, true), 0)
 	prim.fchmod(m.vfs, fd, mode)
 	prim.close_file(m.vfs, fd)
 	if werr != .None {
