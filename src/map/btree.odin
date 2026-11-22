@@ -725,7 +725,7 @@ _meta_encode :: proc(b: []u8, m: ^Meta) {
 		prim.put_u64le(b[SCRUB_AT + 16 + 16 * i:], s.count)
 	}
 	end := SCRUB_AT + 8 + 16 * n
-	prim.put_u64le(b[end:], xxhash.XXH3_64_with_seed(b[SCRUB_AT:end], DB_MAGIC))
+	prim.put_u64le(b[end:], xxhash.XXH3_64_with_seed(b[SCRUB_AT:end], DB_MAGIC ~ m.txn))
 }
 
 @(private)
@@ -767,7 +767,7 @@ _meta_read :: proc(vfs: prim.Vfs, fd: prim.Fd, slot: int) -> (m: Meta, ok: bool)
 		c := int(prim.get_u64le(b[SCRUB_AT:]))
 		if c > 0 && c <= SCRUB_MAX {
 			end := SCRUB_AT + 8 + 16 * c
-			if xxhash.XXH3_64_with_seed(b[SCRUB_AT:end], DB_MAGIC) == prim.get_u64le(b[end:]) {
+			if xxhash.XXH3_64_with_seed(b[SCRUB_AT:end], DB_MAGIC ~ m.txn) == prim.get_u64le(b[end:]) {
 				for i in 0 ..< c {
 					s := Scrub{page = prim.get_u64le(b[SCRUB_AT + 8 + 16 * i:]), count = prim.get_u64le(b[SCRUB_AT + 16 + 16 * i:])}
 					if s.page >= 2 && s.count > 0 && s.page + s.count <= m.pages {
