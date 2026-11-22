@@ -15,6 +15,28 @@ position :: proc(ix: ^Index, source: prim.Id) -> (pos: i64, err: Error) {
 	return 0, .None
 }
 
+sources_flushed :: proc(ix: ^Index, data: rawptr, visit: proc(data: rawptr, source: prim.Id, pos: i64) -> bool) -> Error {
+	seen := make(map[prim.Id]bool, 64, context.temp_allocator)
+	b: [SRC_ENTRY]u8
+	for i := len(ix.segs) - 1; i >= 0; i -= 1 {
+		s := &ix.segs[i]
+		n := s.f.src_len / SRC_ENTRY
+		for k in 0 ..< n {
+			cache_read(&ix.cache, s, s.f.src_off + k * SRC_ENTRY, b[:]) or_return
+			src: prim.Id
+			copy(src[:], b[:16])
+			if src in seen {
+				continue
+			}
+			seen[src] = true
+			if !visit(data, src, i64(prim.get_u64le(b[16:]))) {
+				return .None
+			}
+		}
+	}
+	return .None
+}
+
 pending :: proc "contextless" (ix: ^Index) -> int {
 	return mem_bytes(&ix.mem)
 }

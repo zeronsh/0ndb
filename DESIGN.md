@@ -974,6 +974,15 @@ content is purged from every index.
 Indexes are never durable ahead of their sources: a flush that would persist
 a source position past that source's durable end is deferred, and on open an
 index whose recorded position is beyond a source's durable end is rebuilt.
+Each source's descriptor (space, object, device, kind; for a tree's lv
+source the history epoch) is kept in the registry under `ROOT_SEARCH` key
+`0xf9 || source`. An own convo or map segment and a text journal are
+durable to their pack durable size; a tree's lv source is durable to the
+lv end of the last settled history kv group (its kv commit is itself
+durable), and is unbounded once the history's epoch has moved on (the
+rebuild gives it a new source). A replica source is unbounded: its offsets
+are global and chain-verified, so an index can only hold what the chain
+already holds.
 Dictionaries and codebooks record the documents they were trained on and
 retrain when any of them is deleted. Stored text frames are zstd level 6,
 with trained dictionaries, through one pinned zstd (`src/zstd`, 1.5.7)
