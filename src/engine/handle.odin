@@ -77,6 +77,7 @@ Handle :: struct {
 	view_init:  bool,
 	segs:       [dynamic]^Seg,
 	cat_known:  bool,
+	create_err: Error,
 	own:        bool,
 	created:    prim.Hlc,
 	w_open:     bool,
@@ -133,6 +134,9 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 		}
 		x.used = e.tick
 		_lru_touch(e, x)
+		if x.create_err != .None && len(x.segs) == 0 && !x.own && !x.cat_known {
+			return x, x.create_err
+		}
 		return x, .None
 	}
 	sp := _space_open(e, o.space) or_return
@@ -622,7 +626,8 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 		if !s.in_view && s.tree != nil && !s.tree.absent {
 			return true
 		}
-		if s.follow && h.kind != .Conversation && h.sp.repl_on && h.sp.connected && osync.replicator_catching_up(&h.sp.repl, &h.scope, s.device, h.name, 0) {
+		unreadable := !s.in_view && s.tree != nil && s.tree.absent
+		if s.follow && !unreadable && h.kind != .Conversation && h.sp.repl_on && h.sp.connected && osync.replicator_catching_up(&h.sp.repl, &h.scope, s.device, h.name, 0) {
 			return true
 		}
 	}
@@ -892,9 +897,12 @@ _waiters_run :: proc(e: ^Engine) {
 		c, ok := e.changed[w.object]
 		woke := ok && c.kinds & {.Data, .Keys, .Members, .Redacted, .Quarantined} != {}
 		if !woke {
-			if h, hok := e.handles[w.object]; hok && !h.cat_known && len(h.segs) == 0 {
-				if _, cok := e.changed[h.sp.catalog]; cok {
-					woke = true
+			h, hok := e.handles[w.object]
+			if !hok || (!h.cat_known && len(h.segs) == 0) {
+				if sp, sok := e.spaces[w.space]; sok {
+					if _, cok := e.changed[sp.catalog]; cok {
+						woke = true
+					}
 				}
 			}
 		}
@@ -986,7 +994,7 @@ _pending_result :: proc(e: ^Engine, h: ^Handle, err: Error, ready: Ready) -> Err
 @(private)
 _handle_unknown :: proc(h: ^Handle) -> bool {
 	sp := h.sp
-	if len(h.segs) > 0 || h.own || h.cat_known || !sp.repl_on || sp.keyless || h.id == sp.catalog {
+	if len(h.segs) > 0 || h.own || h.cat_known || h.create_err != .None || !sp.repl_on || sp.keyless || h.id == sp.catalog {
 		return false
 	}
 	if _, granted := sp.grants[h.id]; granted {
@@ -1009,7 +1017,7 @@ _unknown_waiters_wake :: proc(e: ^Engine, sp: ^Space) {
 		if w.space != sp.id {
 			continue
 		}
-		if h, ok := e.handles[w.object]; ok && !h.cat_known && len(h.segs) == 0 {
+		if h, ok := e.handles[w.object]; !ok || (!h.cat_known && len(h.segs) == 0) {
 			_object_changed(e, sp.id, w.object, .Data)
 		}
 	}

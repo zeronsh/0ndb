@@ -106,7 +106,10 @@ map_create :: proc(e: ^Engine, space: prim.Id, title := "", settings: []u8 = nil
 	context = context_for(e)
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Map) or_return
-	_handle_create_writer(h, {}, settings) or_return
+	if err = _handle_create_writer(h, {}, settings); err != .None {
+		h.create_err = err
+		return
+	}
 	_catalog_created(e, h, title, {}, {}, {})
 	return o, .None
 }

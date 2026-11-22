@@ -31,7 +31,10 @@ convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}, 
 	}
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Conversation) or_return
-	_handle_create_writer(h, settings) or_return
+	if err = _handle_create_writer(h, settings); err != .None {
+		h.create_err = err
+		return
+	}
 	_catalog_created(e, h, settings.title, settings.parent, settings.workspace, settings.agent)
 	return o, .None
 }
