@@ -1,6 +1,7 @@
 package journal
 
 import "core:hash/xxhash"
+import "core:slice"
 import "../prim"
 
 @(private)
@@ -203,9 +204,31 @@ _redact_logged :: proc(t: ^_Redact_Target, intent_path: string, offs: []i64) -> 
 	if .Atomic_Group_Commit in prim.file_caps(t.vfs, t.fd) {
 		return _redact_apply(t, offs)
 	}
-	_intent_write(t.vfs, intent_path, offs) or_return
-	_redact_apply(t, offs) or_return
+	all := _intent_merge(t, intent_path, offs) or_return
+	_intent_write(t.vfs, intent_path, all) or_return
+	_redact_apply(t, all) or_return
 	return _err(prim.remove(t.vfs, intent_path))
+}
+
+@(private)
+_intent_merge :: proc(t: ^_Redact_Target, intent_path: string, offs: []i64) -> (all: []i64, err: Error) {
+	prev, present := _intent_read(t.vfs, intent_path) or_return
+	if !present || len(prev) == 0 {
+		return offs, .None
+	}
+	merged := make([dynamic]i64, 0, len(prev) + len(offs), context.temp_allocator)
+	append(&merged, ..prev[:])
+	append(&merged, ..offs)
+	slice.sort(merged[:])
+	n := 0
+	for v, i in merged {
+		if i > 0 && v == merged[n - 1] {
+			continue
+		}
+		merged[n] = v
+		n += 1
+	}
+	return merged[:n], .None
 }
 
 @(private)
