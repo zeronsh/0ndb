@@ -1311,6 +1311,7 @@ Clean_Result :: enum u8 {
 	Same,
 	Changed,
 	Failed,
+	Io,
 }
 
 @(private)
@@ -1336,6 +1337,8 @@ clean_convert :: proc(m: ^Mount, rel: string, cv: Conv, src: Conv_Source, out: ^
 		if filter_apply(m, cv.driver, .Clean, rel, source_input(src), spool_stream(a)) && !a.bad {
 			cur = spool_source(a)
 			final = a
+		} else if a.bad {
+			return .Io
 		} else if cv.driver.required {
 			return .Failed
 		}
@@ -1351,14 +1354,17 @@ clean_convert :: proc(m: ^Mount, rel: string, cv: Conv, src: Conv_Source, out: ^
 		ok := !es.failed && source_feed(m, cur, io.Stream{procedure = enc_stage_proc, data = &es})
 		failed := es.failed
 		enc_stage_destroy(&es)
-		if !ok || failed || b.bad {
+		if failed {
 			return .Failed
+		}
+		if !ok || b.bad {
+			return .Io
 		}
 		cur = spool_source(b)
 		final = b
 	} else if eol {
 		if !source_feed(m, cur, io.Stream{procedure = stat_stage_proc, data = &stats}) {
-			return .Failed
+			return .Io
 		}
 	}
 	convert := false
@@ -1430,7 +1436,7 @@ clean_convert :: proc(m: ^Mount, rel: string, cv: Conv, src: Conv_Source, out: ^
 			delete(cr.buf, runtime.heap_allocator())
 		}
 		if !ok || c.bad {
-			return .Failed
+			return .Io
 		}
 		final = c
 	}
@@ -1612,7 +1618,7 @@ eol_clean :: proc(m: ^Mount, rel: string, data: []u8, inode := fstree.Inode_Id{}
 	switch clean_convert(m, rel, cv, Conv_Source{kind = .Data, data = data}, &out, -1, allocator) {
 	case .Same:
 		return data, true
-	case .Failed:
+	case .Failed, .Io:
 		return nil, false
 	case .Changed:
 	}
@@ -1661,25 +1667,27 @@ Large_Clean :: enum u8 {
 	Failed,
 }
 
-store_large_clean :: proc(m: ^Mount, rel: string, abs: string, old := fstree.Inode_Id{}, has_old := false) -> (oid: odb.Oid, size: i64, status: Large_Clean) {
+store_large_clean :: proc(m: ^Mount, rel: string, abs: string, old := fstree.Inode_Id{}, has_old := false) -> (oid: odb.Oid, size: i64, status: Large_Clean, err: Error) {
 	if !m.has_git || m.db == nil {
-		return {}, 0, .Raw
+		return {}, 0, .Raw, .None
 	}
 	attr_begin(m)
 	defer attr_end(m)
 	cv := conv_attrs(m, rel)
 	fd, oerr := prim.open_file(m.vfs, abs)
 	if oerr != .None {
-		return {}, 0, .Failed
+		return {}, 0, .Failed, from_prim(oerr)
 	}
 	defer prim.close_file(m.vfs, fd)
 	out: Spool
 	r := clean_convert(m, rel, cv, Conv_Source{kind = .Fd, fd = fd, vfs = m.vfs}, &out, SPOOL_MEM, runtime.heap_allocator())
 	switch r {
 	case .Same:
-		return {}, 0, .Raw
+		return {}, 0, .Raw, .None
 	case .Failed:
-		return {}, 0, .Failed
+		return {}, 0, .Failed, .None
+	case .Io:
+		return {}, 0, .Failed, .Io
 	case .Changed:
 	}
 	defer spool_destroy(&out)
@@ -1696,8 +1704,8 @@ store_large_clean :: proc(m: ^Mount, rel: string, abs: string, old := fstree.Ino
 		o, werr = odb.write(m.db, .Blob, out.mem[:])
 	}
 	if werr != .None {
-		return {}, 0, .Failed
+		return {}, 0, .Failed, from_odb(werr)
 	}
 	history_note_blob(m.history, o)
-	return o, out.size, .Stored
+	return o, out.size, .Stored, .None
 }
