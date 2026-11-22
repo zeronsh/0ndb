@@ -1099,6 +1099,18 @@ checkpoint bundles, as before, plus:
   though handles close at every settle. A follow alone is not an answer: a
   conversation followed by length learns lengths only from later feed
   entries, so its first fresh read still probes.
+- **A fresh read never answers from local data while the link is down.**
+  For a space with a relay and an object with segments of other devices, a
+  fresh read on a disconnected space reconnects at once (the backoff timer
+  is replaced by an immediate attempt) and stays pending; `Connected` wakes
+  the space's fresh waiters and the retried read probes as above. A
+  connection attempt that fails (the transport does not open, or the link
+  closes before `Connected`) marks the space offline until the next
+  `Connected` and answers every fresh waiter in it with `Offline`; so does
+  a space that cannot connect at all (revoked, refused, lapsed lease, no
+  transport). An `Offline` answer emits `Unavailable` per remote segment.
+  Local-only spaces and objects whose only segment is the device's own
+  read locally as before.
 - **Direct messages.** A participant can send an opaque frame to another
   participant of the same space by device id. The relay delivers it to one
   live connection of that device or answers `Undelivered` at once; it keeps

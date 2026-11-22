@@ -149,6 +149,7 @@ link_down :: proc(e: ^Engine, link: Link) {
 	if sp := _link_space(e, link); sp != nil {
 		osync.replicator_link_down(&sp.repl)
 		sp.connected = false
+		_link_attempt_failed(e, sp)
 		_touch(e)
 	}
 }
@@ -161,11 +162,63 @@ LINK_BACKOFF_MIN :: 250
 LINK_BACKOFF_MAX :: 30_000
 
 @(private)
-_link_schedule :: proc(e: ^Engine, sp: ^Space) {
-	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.reopen != 0 || sp.mem.revoked || sp.refused {
+_link_possible :: proc(e: ^Engine, sp: ^Space) -> bool {
+	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.mem.revoked || sp.refused {
+		return false
+	}
+	return !(sp.mem.lapsed && sp.mem.creds.until <= _now_ms(e))
+}
+
+@(private)
+_link_now :: proc(e: ^Engine, sp: ^Space) {
+	if sp.conn != nil || !_link_possible(e, sp) {
 		return
 	}
-	if sp.mem.lapsed && sp.mem.creds.until <= _now_ms(e) {
+	if sp.reopen != 0 {
+		prim.timer_cancel(e.loop, sp.reopen)
+	}
+	sp.reopen = prim.timer(e.loop, 0, sp, _link_reopen)
+}
+
+@(private)
+_link_attempt_failed :: proc(e: ^Engine, sp: ^Space) {
+	if !sp.attempt {
+		return
+	}
+	sp.attempt = false
+	sp.offline = true
+	_fresh_waiters_fail(e, sp)
+}
+
+@(private)
+_fresh_waiters_fail :: proc(e: ^Engine, sp: ^Space) {
+	for i := 0; i < len(e.waiters); {
+		w := e.waiters[i]
+		if w.space != sp.id || w.cmd != nil || !w.ready.fresh {
+			i += 1
+			continue
+		}
+		ordered_remove(&e.waiters, i)
+		if w.ready.call != nil {
+			context = _outer(e)
+			w.ready.call(w.ready.data, e, .Offline)
+		}
+		free(w, e.allocator)
+	}
+}
+
+@(private)
+_fresh_waiters_wake :: proc(e: ^Engine, sp: ^Space) {
+	for w in e.waiters {
+		if w.space == sp.id && w.cmd == nil && w.ready.fresh {
+			_object_changed(e, sp.id, w.object, .Data)
+		}
+	}
+}
+
+@(private)
+_link_schedule :: proc(e: ^Engine, sp: ^Space) {
+	if sp.reopen != 0 || !_link_possible(e, sp) {
 		return
 	}
 	base := max(sp.backoff, LINK_BACKOFF_MIN)
@@ -187,10 +240,13 @@ _link_reopen :: proc(l: ^prim.Loop, data: rawptr) {
 	}
 	conn, err := _transport_open(e, sp)
 	if err != .None {
+		sp.attempt = true
+		_link_attempt_failed(e, sp)
 		_link_schedule(e, sp)
 		return
 	}
 	sp.conn = conn
+	sp.attempt = true
 }
 
 @(private)
@@ -234,6 +290,7 @@ _link_close :: proc(data: rawptr) {
 	}
 	sp.conn = nil
 	sp.connected = false
+	_link_attempt_failed(e, sp)
 	_link_schedule(e, sp)
 }
 
@@ -418,6 +475,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 	#partial switch ev.kind {
 	case .Connected:
 		sp.connected = true
+		sp.attempt = false
+		sp.offline = false
+		_fresh_waiters_wake(e, sp)
 		sp.backoff = 0
 		sp.refusals = 0
 		sp.admitted = true
@@ -449,6 +509,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 			}
 			_space_refuse(e, sp)
 		}
+		_link_attempt_failed(e, sp)
 		_probes_settle(e, sp)
 		_emit(e, Event{kind = .Disconnected, space = sp.id, err = _serr(ev.err)})
 	case .Uploaded:

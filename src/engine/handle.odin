@@ -507,6 +507,29 @@ _handle_remote_grew :: proc(h: ^Handle, device: prim.Id) {
 }
 
 @(private)
+_fresh_link :: proc(h: ^Handle) -> bool {
+	sp := h.sp
+	e := h.e
+	if !sp.repl_on || sp.connected {
+		return false
+	}
+	remote := false
+	for s in h.segs {
+		if s.device != e.self {
+			remote = true
+			break
+		}
+	}
+	if !remote {
+		return false
+	}
+	if !sp.offline {
+		_link_now(e, sp)
+	}
+	return true
+}
+
+@(private)
 _handle_probe :: proc(h: ^Handle) {
 	sp := h.sp
 	if !sp.repl_on || !sp.connected {
@@ -584,6 +607,9 @@ _handle_refresh :: proc(h: ^Handle) {
 _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 	if fresh {
 		_handle_probe(h)
+		if _fresh_link(h) {
+			return true
+		}
 	}
 	for s in h.segs {
 		if s.waiting || (fresh && s.probing) {
@@ -807,7 +833,15 @@ _replica_covers :: proc(rep: ^journal.Replica, n: i64) -> bool {
 
 @(private)
 _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tries := 0) -> Error {
-	fetched := _handle_want(h) || _content_pending(e, h.id)
+	if ready.fresh && cmd == nil && _fresh_link(h) && (h.sp.offline || !_link_possible(e, h.sp)) {
+		for s in h.segs {
+			if s.device != e.self {
+				_emit(e, Event{kind = .Unavailable, space = h.sp.id, object = h.id, device = s.device, length = journal.replica_length(s.rep)})
+			}
+		}
+		return .Offline
+	}
+	fetched := _handle_want(h) || _content_pending(e, h.id) || (ready.fresh && _fresh_link(h))
 	if !fetched && h.sp.repl_on {
 		for sg in h.segs {
 			if !sg.in_view {

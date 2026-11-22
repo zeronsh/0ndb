@@ -621,6 +621,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_short_id_instant(w, mw.owned[len(mw.owned) - 1])
 	_upload_wait_case(w, mw.owned[len(mw.owned) - 1])
 	_fresh_unfollowed(w, mw)
+	_fresh_link_down(w, mw)
 
 	_down(w, M_A)
 	_down(w, M_B)
@@ -1847,4 +1848,61 @@ _fresh_unfollowed :: proc(w: ^World, mw: ^Mem_World) {
 		run_until(w, w.now + 2_000 * 1_000_000, false)
 	}
 	_fail(w, "fresh-unfollowed: n1 polled %d fresh reads without completing (%d probes)", polls, b.e.stats.probes - before)
+}
+
+@(private = "file")
+_fresh_status :: proc(w: ^World, idx: int, o: eng.Object) -> (st: eng.Convo_Status, err: eng.Error) {
+	n := w.nodes[idx]
+	if !n.alive || !n.e_open {
+		return st, .Offline
+	}
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	ready := eng.Ready{call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}, fresh = true}
+	return eng.convo_status(&n.e, o, ready)
+}
+
+@(private = "file")
+_fresh_link_down :: proc(w: ^World, mw: ^Mem_World) {
+	_, o, _, live := _live_space(w, mw, M_A, {M_B}, "fresh-link-down")
+	if !live {
+		return
+	}
+	run_until(w, w.now + 5_000 * 1_000_000, false)
+	r2, sent := _send(w, M_A, o, "fresh-link-down-2")
+	if !sent {
+		_fail(w, "fresh-link-down: second send on n0")
+		return
+	}
+	run_until(w, w.now + 5_000 * 1_000_000, false)
+	b := w.nodes[M_B]
+	b.partitioned = true
+	for c in b.conns {
+		conn_reset(c, true)
+	}
+	run_until(w, w.now + 2_000 * 1_000_000, false)
+	for polls in 1 ..= 5 {
+		st, err := _fresh_status(w, M_B, o)
+		if err == .None {
+			_fail(w, "fresh-link-down: with n1 cut off a fresh read on n1 completed from local data (head %v) at poll %d", st.head, polls)
+			break
+		}
+		if err != .Pending && err != .Missing && err != .Offline {
+			_fail(w, "fresh-link-down: fresh read on n1 while cut off failed: %v", err)
+			break
+		}
+		run_until(w, w.now + 2_000 * 1_000_000, false)
+	}
+	b.partitioned = false
+	for _ in 1 ..= FRESH_POLL_MAX {
+		st, err := _fresh_status(w, M_B, o)
+		if err == .None {
+			if st.head != r2 {
+				_fail(w, "fresh-link-down: after the partition healed a fresh read on n1 completed without n0's newer message (head %v, want %v)", st.head, r2)
+			}
+			return
+		}
+		run_until(w, w.now + 2_000 * 1_000_000, false)
+	}
+	_fail(w, "fresh-link-down: after the partition healed n1 polled %d fresh reads without completing", FRESH_POLL_MAX)
 }
