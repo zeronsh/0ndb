@@ -195,6 +195,8 @@ Config :: struct {
 	promote:     i64,
 	persist_fault: bool,
 	index_trust: bool,
+	archive_min: i64,
+	archive_group: int,
 }
 
 World :: struct {
