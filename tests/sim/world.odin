@@ -90,6 +90,7 @@ Node :: struct {
 	watch_scheduled: bool,
 	api:         api.Api,
 	api_on:      bool,
+	agent_pending: [dynamic]Agent_Pending,
 }
 
 Relay_Node :: struct {
@@ -118,6 +119,10 @@ World_Stats :: struct {
 	buffers:      u64,
 	bursts:       u64,
 	anchors_checked: u64,
+	base_merged:  u64,
+	base_current: u64,
+	base_mismatch: u64,
+	base_other:   u64,
 	events:       u64,
 	steps:        u64,
 	ops:          u64,
@@ -443,6 +448,10 @@ world_destroy :: proc(w: ^World) {
 		disk_destroy(&n.disk)
 		delete(n.conns)
 		delete(n.attaches)
+		for pa in n.agent_pending {
+			agent_pending_free(w, pa)
+		}
+		delete(n.agent_pending)
 		delete(n.name, w.allocator)
 		free(n, w.allocator)
 	}

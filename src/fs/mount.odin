@@ -37,6 +37,8 @@ Scope :: struct {
 	pids:   [dynamic]prim.Pid,
 	mount:  ^Mount,
 	closed: bool,
+	pins:   [dynamic]Pin,
+	allocator: runtime.Allocator,
 }
 
 Fence_Proc :: #type proc(m: ^Mount, data: rawptr, err: Error)
@@ -81,6 +83,8 @@ Registry :: struct {
 	boot:      prim.Id,
 	on_eol:    Eol_Warning_Proc,
 	eol_data:  rawptr,
+	on_base:   Base_Proc,
+	base_data: rawptr,
 }
 
 @(private)
@@ -323,6 +327,7 @@ Mount :: struct {
 	attrs:       ^Attr_Ctx,
 	collided:    [dynamic]string,
 	absent:      [dynamic]string,
+	holds:       [dynamic]Path_Hold,
 	link_mode:   Link_Mode,
 	gitlinks:    []Gitlink,
 }
@@ -375,6 +380,7 @@ registry_destroy :: proc(reg: ^Registry) {
 		reg.watcher.stop(reg.watcher.data, reg)
 	}
 	for s in reg.scopes {
+		scope_pins_free(s)
 		delete(s.pids)
 		free(s, reg.allocator)
 	}
@@ -438,6 +444,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.unwatched = make([dynamic]string, allocator)
 	m.collided = make([dynamic]string, allocator)
 	m.absent = make([dynamic]string, allocator)
+	m.holds = make([dynamic]Path_Hold, allocator)
 	ok := false
 	defer if !ok {
 		mount_close(m)
@@ -644,6 +651,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(c, m.allocator)
 	}
 	delete(m.absent)
+	for x in m.holds {
+		delete(x.path, m.allocator)
+	}
+	delete(m.holds)
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
@@ -1190,6 +1201,8 @@ scope_open :: proc(reg: ^Registry, m: ^Mount, id: prim.Id, actor: prim.Id, pids:
 	s.id = id
 	s.actor = actor
 	s.mount = m
+	s.allocator = reg.allocator
+	s.pins = make([dynamic]Pin, reg.allocator)
 	s.pids = make([dynamic]prim.Pid, reg.allocator)
 	append(&s.pids, ..pids)
 	append(&reg.scopes, s)
@@ -1250,6 +1263,7 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 			}
 		}
 	}
+	scope_release(s)
 	delete(s.pids)
 	free(s, reg.allocator)
 	return err

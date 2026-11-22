@@ -34,6 +34,22 @@ TOP_TARGET :: u8(6)
 TOP_CONTENT :: u8(16)
 TOP_GIT :: u8(17)
 TOP_MOUNT :: u8(18)
+TOP_OBSERVE :: u8(19)
+
+OBSERVE_VERSION :: u8(1)
+
+Observe_Kind :: enum u8 {
+	Read        = 0,
+	Write_Begin = 1,
+}
+
+Observe_Op :: struct {
+	kind:    Observe_Kind,
+	inode:   crdt.Op_Id,
+	path:    string,
+	version: []crdt.Op_Id,
+	hash:    [32]u8,
+}
 
 OPS_CHUNK :: 256
 MOVES_CHUNK :: 512
@@ -542,6 +558,50 @@ encode_git_op :: proc(buf: ^[dynamic]u8, kind, branch, commit: string) {
 	prim.write_str(&w, kind)
 	prim.write_str(&w, branch)
 	prim.write_str(&w, commit)
+}
+
+encode_observe :: proc(buf: ^[dynamic]u8, o: Observe_Op) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, TOP_OBSERVE)
+	prim.write_u8(&w, OBSERVE_VERSION)
+	prim.write_u8(&w, u8(o.kind))
+	prim.write_id(&w, o.inode.actor)
+	prim.write_uvarint(&w, o.inode.seq)
+	prim.write_str(&w, o.path)
+	prim.write_uvarint(&w, u64(len(o.version)))
+	for v in o.version {
+		prim.write_id(&w, v.actor)
+		prim.write_uvarint(&w, v.seq)
+	}
+	h := o.hash
+	prim.write_raw(&w, h[:])
+}
+
+decode_observe :: proc(content: []u8, allocator := context.temp_allocator) -> (o: Observe_Op, ok: bool) {
+	r := prim.reader(content)
+	if prim.read_u8(&r) != TOP_OBSERVE || prim.read_u8(&r) != OBSERVE_VERSION {
+		return o, false
+	}
+	k := prim.read_u8(&r)
+	if k > u8(max(Observe_Kind)) {
+		return o, false
+	}
+	o.kind = Observe_Kind(k)
+	o.inode.actor = prim.read_id(&r)
+	o.inode.seq = prim.read_uvarint(&r)
+	o.path = prim.read_str(&r)
+	n := prim.read_uvarint(&r)
+	if !prim.reader_ok(&r) || n > u64(prim.reader_remaining(&r)) {
+		return o, false
+	}
+	v := make([]crdt.Op_Id, int(n), allocator)
+	for i in 0 ..< int(n) {
+		v[i].actor = prim.read_id(&r)
+		v[i].seq = prim.read_uvarint(&r)
+	}
+	o.version = v
+	prim.read_fixed(&r, o.hash[:])
+	return o, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
 }
 
 decode_opaque :: proc(content: []u8, data: rawptr, inode_of: Inode_Of) -> (out: Opaque, ok: bool) {

@@ -79,6 +79,16 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
 		return .Corrupt
 	}
+	target := target
+	if len(m.holds) > 0 {
+		reduced, changed := hold_target(m, tl[:], sl[:]) or_return
+		if changed {
+			r := make([dynamic]crdt.Lv, context.temp_allocator)
+			append(&r, ..reduced)
+			tl = r
+			target = crdt.graph_version_ids(&h.g, tl[:], context.temp_allocator)
+		}
+	}
 	if crdt.frontier_eq(tl[:], sl[:]) && len(m.absent) == 0 {
 		return .None
 	}
