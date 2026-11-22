@@ -342,6 +342,9 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	if ok {
 		ok = setup_spaces(w)
 	}
+	if ok {
+		ok = quiesce_setup(w)
+	}
 	if ok && env_u64("SIM_BULK", 1 if cfg.bulk else 0) != 0 {
 		setup_bulk(w)
 	}
@@ -483,6 +486,7 @@ check_close :: proc(w: ^World) {
 			continue
 		}
 		live_close(n)
+		quiesce_runtime_close(n)
 		context = instance_context(&n.inst)
 		err := eng.close(&n.e)
 		n.e_open = false
