@@ -79,6 +79,7 @@ Tier_Space :: struct {
 	id:        Space_Id,
 	ns:        rawptr,
 	refs:      int,
+	holds:     int,
 	usage:     i64,
 	man:       rawptr,
 	man_len:   i64,
@@ -282,6 +283,19 @@ _tier_ns_close :: proc(data: rawptr, h: rawptr) {
 }
 
 @(private)
+_tier_hold :: proc(sp: ^Tier_Space) {
+	sp.refs += 1
+	sp.holds += 1
+}
+
+@(private)
+_tier_unhold :: proc(sp: ^Tier_Space) {
+	sp.holds -= 1
+	sp.refs -= 1
+	_tier_maybe_release(sp)
+}
+
+@(private)
 _tier_maybe_release :: proc(sp: ^Tier_Space) {
 	t := sp.t
 	if sp.refs > 0 || sp.dirty || sp.flushing || sp.man_busy || len(sp.man_q) > 0 || len(sp.man_wait) > 0 || len(sp.open) > 0 || sp.evicting > 0 || len(sp.ev_q) > 0 || len(sp.ev_fly) > 0 {
@@ -293,6 +307,7 @@ _tier_maybe_release :: proc(sp: ^Tier_Space) {
 
 @(private)
 _tier_space_free :: proc(t: ^Tier_Store, sp: ^Tier_Space) {
+	assert(sp.holds == 0, "a tier space was freed while a completion callback held it")
 	for _, &g in sp.segs {
 		delete(g.redacts)
 	}
@@ -625,6 +640,8 @@ _tier_man_flush :: proc(sp: ^Tier_Space) {
 @(private)
 _tier_man_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	sp := cast(^Tier_Space)ctx
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
 	sp.man_busy = false
 	if result == .None {
 		sp.usage += value - sp.man_len
@@ -641,7 +658,6 @@ _tier_man_done :: proc(ctx: rawptr, result: Error, value: i64) {
 		_tier_release_held(sp, result)
 	}
 	_tier_man_flush(sp)
-	_tier_maybe_release(sp)
 }
 
 @(private)
@@ -677,6 +693,8 @@ _tier_job_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	j := cast(^Tier_Job)ctx
 	sp := j.sp
 	t := sp.t
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
 	if result == .None {
 		id := cast(Stream_Id)j.id
 		switch j.kind {
@@ -955,6 +973,8 @@ _tier_put_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	f := cast(^Tier_Flight)ctx
 	sp := f.sp
 	t := sp.t
+	_tier_hold(sp)
+	defer _tier_unhold(sp)
 	sp.flushing = false
 	if result != .None {
 		for id, g in f.segs {
@@ -1010,7 +1030,6 @@ _tier_put_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	if sp.bytes >= t.cfg.max_bytes {
 		_tier_flush(sp)
 	}
-	_tier_maybe_release(sp)
 }
 
 @(private)
