@@ -1541,7 +1541,6 @@ history_trim :: proc(h: ^History) {
 	shrink(&h.io)
 }
 
-@(private)
 history_unload_unviewed :: proc(h: ^History) {
 	if len(h.views) == 0 {
 		history_unload_files(h)

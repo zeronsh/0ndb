@@ -546,6 +546,9 @@ _text_edit :: proc(e: ^Engine, h: ^Handle, pos: int, remove: int, insert: string
 }
 
 @(private)
+CATCH_UP_LAZY :: 32
+
+@(private)
 _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 	if h.kind != .Text && h.kind != .File_Tree {
 		return
@@ -581,6 +584,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 	}
 	rec: virtual.Arena
 	defer virtual.arena_destroy(&rec)
+	admitted := 0
 	for {
 		progress := false
 		for s in h.segs {
@@ -622,7 +626,13 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 					blocked = true
 					break
 				}
+				admitted += 1
+				if admitted == CATCH_UP_LAZY {
+					fs.history_unload_unviewed(hist)
+				}
+				merge_scratch := virtual.arena_temp_begin(&e.temp)
 				_, aerr := fs.history_admit(hist, s.device, pos, owned)
+				virtual.arena_temp_end(merge_scratch)
 				if aerr == .None && len(owned) > 0 && owned[0] == fs.REC_REDACT {
 					_hist_redact_own(e, h, owned)
 				}
