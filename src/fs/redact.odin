@@ -362,15 +362,14 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 		if secret && f.rec.has_cp && f.rec.cp_len > 0 {
 			append(targets, odb.Oid(f.rec.cp_text))
 		}
-		if secret {
-			blob_versions_hit(h, ino, spans, targets) or_return
-		}
+		blob_versions_hit(h, ino, spans, targets) or_return
 		if h.db != nil {
 			data := crdt.text_bytes(&f.text, context.temp_allocator)
 			oid, werr := history_stage_blob(h, data)
 			if werr != .None {
 				return files, werr
 			}
+			history_note_file_blob(h, ino, oid, crdt.text_version(&f.text, &h.g, context.temp_allocator))
 			append(protect, oid)
 			clear(&f.rec.cp_version)
 			append(&f.rec.cp_version, ..crdt.text_version(&f.text, &h.g, context.temp_allocator))
