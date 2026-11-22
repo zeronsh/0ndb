@@ -56,6 +56,7 @@ Space_Members :: struct {
 	caught:      bool,
 	deferred:    bool,
 	elect_wait:  bool,
+	rewrap_wait: bool,
 	want:        map[prim.Id]i64,
 }
 
@@ -653,7 +654,7 @@ _members_elected :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, t: ^osync
 
 @(private)
 _members_presence :: proc(e: ^Engine, sp: ^Space) {
-	if sp.open && !sp.keyless && sp.mem.elect_wait && _members_ready(sp) {
+	if sp.open && !sp.keyless && (sp.mem.elect_wait || sp.mem.rewrap_wait) && _members_ready(sp) {
 		_members_recheck(e, sp)
 	}
 }
