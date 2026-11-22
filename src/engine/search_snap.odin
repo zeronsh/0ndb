@@ -807,6 +807,9 @@ _snap_restore_maybe :: proc(e: ^Engine, sp: ^Space) {
 
 @(private)
 _snap_restore_free :: proc(e: ^Engine, rs: ^Snap_Restore) {
+	if sp, ok := e.spaces[rs.space]; ok && sp.repl_on {
+		osync.replicator_cancel_checkpoint(&sp.repl, &rs.tree)
+	}
 	osync.keytree_destroy(&rs.tree)
 	for p in rs.paths {
 		if len(p) > 0 {
