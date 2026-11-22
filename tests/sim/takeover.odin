@@ -47,6 +47,7 @@ _rt_start :: proc(n: ^Node) {
 	cfg.runner = n.idx != T_CLIENT
 	cfg.pool = n.idx == T_POOL_A || n.idx == T_POOL_B
 	cfg.name = fmt.tprintf("n%d", n.idx)
+	cfg.capacity = 8
 	cfg.scheduler = rt.Scheduler{data = n, place = rt.default_scheduler().place, ask = _ask}
 	if err := rt.open(&n.rt, &n.e, cfg, context.allocator); err != .None {
 		_fail(n.w, "%s runtime open: %v", n.name, err)
@@ -169,6 +170,19 @@ _replies :: proc(w: ^World, o: eng.Object, msg: eng.Rid) -> (runners: [dynamic]p
 	if serr != .None {
 		return
 	}
+	if hm, herr := eng.convo_message(&n.e, o, convo.Position{msg = st.head}, context.temp_allocator); herr == .None && hm.role == .Assistant && hm.parent == msg {
+		append(&runners, hm.runner)
+	}
+	if list, uerr := eng.convo_unsealed(&n.e, o, context.temp_allocator); uerr == .None {
+		for u in list {
+			if u.msg == st.head {
+				continue
+			}
+			if m, merr := eng.convo_message(&n.e, o, convo.Position{msg = u.msg}, context.temp_allocator); merr == .None && m.role == .Assistant && m.parent == msg {
+				append(&runners, m.runner)
+			}
+		}
+	}
 	pos := convo.Position{msg = st.head}
 	for _ in 0 ..< 32 {
 		if obj.rid_none(pos.msg) {
@@ -179,7 +193,7 @@ _replies :: proc(w: ^World, o: eng.Object, msg: eng.Rid) -> (runners: [dynamic]p
 			break
 		}
 		for m in pg.messages {
-			if m.role == .Assistant && m.parent == msg {
+			if m.role == .Assistant && m.parent == msg && m.id != st.head {
 				append(&runners, m.runner)
 			}
 		}
@@ -391,7 +405,15 @@ _scenario :: proc(w: ^World, tw: ^T_World) {
 		_down(w, T_POOL_A)
 		x, moved := _wait_moved(w, o, msg, T_POOL_A, 10_000)
 		if !moved || x != _id(w, T_POOL_B) {
-			_fail(w, "default pool: the host's answer n4 did not take the turn (moved %v to %s)", moved, id_short(x))
+			n4 := w.nodes[T_POOL_B]
+			context = instance_context(&n4.inst)
+			cur, last, _ := rt.runner_of(&n4.rt, o)
+			info, _ := rt.placement_status(&n4.rt, o)
+			active := rt.active_runs(&n4.rt)
+			node_after(n4)
+			context = w.ctx
+			p := _placement(w, o)
+			_fail(w, "default pool: the host's answer n4 did not take the turn (moved %v to %s; n4 active %d cur %s last %s placement %v runner %s; n0 placement %v runner %s)", moved, id_short(x), active, id_short(cur), id_short(last), info.state, id_short(info.runner), p.state, id_short(p.runner))
 		}
 		if tw.asked == asked {
 			_fail(w, "default pool: the scheduler plug was never asked")
