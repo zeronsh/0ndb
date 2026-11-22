@@ -313,7 +313,7 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 			if .Q_OVERFLOW in mask {
 				for m in reg.mounts {
 					if m != nil {
-						mount_mark_rescan(m)
+						mount_events_lost(m)
 					}
 				}
 				continue

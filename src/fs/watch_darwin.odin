@@ -250,7 +250,7 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 		}
 		m := reg.mounts[slot]
 		if rescan {
-			mount_mark_rescan(m)
+			mount_events_lost(m)
 			continue
 		}
 		if m.has_git && (strings.has_prefix(p, m.git.dir) || strings.has_prefix(p, m.git.common)) {
