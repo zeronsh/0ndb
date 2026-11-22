@@ -52,6 +52,7 @@ Space :: struct {
 	identities:   map[prim.Id]osync.Identity,
 	held:         [dynamic]Held,
 	remote_trees: map[osync.Stream_Id]^Remote_Tree,
+	empty_segs:   map[osync.Stream_Id]bool,
 	table:        omap.Table,
 	table_open:   bool,
 	card_ok:      bool,
@@ -387,6 +388,7 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	sp.identities = make(map[prim.Id]osync.Identity, e.allocator)
 	sp.held = make([dynamic]Held, e.allocator)
 	sp.remote_trees = make(map[osync.Stream_Id]^Remote_Tree, e.allocator)
+	sp.empty_segs = make(map[osync.Stream_Id]bool, e.allocator)
 	sp.events = make([dynamic]Repl_Ev, e.allocator)
 	sp.needs = make([dynamic]Need, e.allocator)
 	sp.ckpts = make([dynamic]^Ckpt_Wait, e.allocator)
@@ -420,6 +422,7 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 		_remote_tree_free(e, rt)
 	}
 	delete(sp.remote_trees)
+	delete(sp.empty_segs)
 	for hd in sp.held {
 		delete(hd.name, e.allocator)
 	}
@@ -493,6 +496,7 @@ _spaces_settle :: proc(e: ^Engine) {
 		for k, rt in sp.remote_trees {
 			if rt.refs == 0 {
 				delete_key(&sp.remote_trees, k)
+				_remote_tree_unwatch(sp, rt)
 				_remote_tree_free(e, rt)
 			}
 		}

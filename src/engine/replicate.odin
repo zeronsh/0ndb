@@ -486,6 +486,9 @@ _remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, e
 			if epoch > rt.epoch || length > 0 {
 				rt.requested = false
 			}
+			if epoch != rt.epoch {
+				_remote_tree_unwatch(sp, rt)
+			}
 			rt.epoch = epoch
 			_remote_tree_load(e, sp, rt)
 			if rt.loaded {
@@ -504,8 +507,13 @@ _remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, e
 	if !ok {
 		return
 	}
+	if length == 0 {
+		sp.empty_segs[stream] = true
+	} else if stream in sp.empty_segs {
+		delete_key(&sp.empty_segs, stream)
+	}
 	if h, hok := e.handles[id]; hok {
-		_handle_remote_grew(h, device)
+		_handle_remote_grew(h, device, length)
 	}
 	_unavailable_clear(e, sp, id)
 	_content_data_arrived(e, id)
