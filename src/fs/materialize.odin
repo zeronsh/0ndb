@@ -37,6 +37,12 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	mount_wake(m) or_return
+	if m.adopt_pending {
+		if !m.imported {
+			return .None
+		}
+		return adopt_finish(m)
+	}
 	h := m.history
 	target, found := history_line(h, m.line, context.temp_allocator) or_return
 	if !found {

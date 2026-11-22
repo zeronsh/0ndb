@@ -326,13 +326,18 @@ mount_import :: proc(m: ^Mount) -> Error {
 	context.temp_allocator = virtual.arena_allocator(&st.chunk)
 	empty := shadow_empty(&m.shadow) or_return
 	st.resume = !empty
-	if empty && m.history != nil && len(m.synced) == 0 {
+	if m.history != nil && (m.adopt_pending || (empty && len(m.synced) == 0)) {
 		if line, has := history_line(m.history, m.line, st.long) or_return; has && len(line) > 0 {
 			lvs := make([dynamic]crdt.Lv, st.long)
 			if crdt.graph_version_lvs(&m.history.g, line, &lvs) == .None {
 				st.snap = version_snapshot(m.history, lvs[:]) or_return
 				st.line = lvs[:]
 				st.adopt = true
+				if !m.adopt_pending {
+					m.adopt_pending = true
+					m.img.adopt_pending = true
+					save_mount_state(m) or_return
+				}
 				clear(&m.synced)
 				append(&m.synced, ..line)
 			}
@@ -490,17 +495,26 @@ mount_import :: proc(m: ^Mount) -> Error {
 		mount_commit(m, {message = "0ndb: first mount"}) or_return
 	}
 	m.imported = true
-	if st.adopt {
-		if line, has := history_line(m.history, m.line, context.temp_allocator) or_return; has {
-			clear(&m.synced)
-			m.adopting = true
-			merr := materialize_to(m, line, false)
-			m.adopting = false
-			merr or_return
-		}
-	}
+	adopt_finish(m) or_return
 	_heap_release()
 	return mount_settle(m)
+}
+
+@(private)
+adopt_finish :: proc(m: ^Mount) -> Error {
+	if !m.adopt_pending {
+		return .None
+	}
+	line, has := history_line(m.history, m.line, context.temp_allocator) or_return
+	if has {
+		clear(&m.synced)
+		m.adopting = true
+		merr := materialize_to(m, line, false)
+		m.adopting = false
+		merr or_return
+	}
+	m.adopt_pending = false
+	return .None
 }
 
 @(private)
@@ -1215,6 +1229,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		ierr or_return
 		return mount_pass(m, true, false)
 	}
+	adopt_finish(m) or_return
 	attr_begin(m)
 	defer attr_end(m)
 	long: virtual.Arena
