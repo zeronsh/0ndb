@@ -97,6 +97,7 @@ node_start :: proc(n: ^Node) -> bool {
 		cfg.pack_options.worker = pack.Worker_Hook{data = n, submit = _pack_submit}
 	}
 	cfg.storage = w.cfg.storage
+	cfg.git_remote = sim_git_remote(n)
 	if w.node_cfg != nil {
 		w.node_cfg(n, &cfg)
 	}

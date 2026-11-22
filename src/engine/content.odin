@@ -35,6 +35,15 @@ Content_Wait :: struct {
 	attempts: int,
 	timer:    prim.Timer,
 	path:     string,
+	url:      int,
+	stage:    Content_Stage,
+}
+
+@(private)
+Content_Stage :: enum u8 {
+	Relay,
+	Remote,
+	Holders,
 }
 
 @(private)
@@ -175,9 +184,32 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 		osync.keytree_destroy(&tree)
 	}
 	mark := Content_Mark{space = h.sp.id, target = pos}
+	tr := _tree_reach(e, h) if len(refs) > 0 else Tree_Reach{}
+	if tr.ok {
+		_tree_remote_note(e, h.sp, h.id, tr.urls)
+	}
+	device := _storage_class(e, h.sp, h.id, h.kind) == .Device
+	held := make([dynamic]fs.Content_Ref, context.temp_allocator)
 	for ref in refs {
 		if _, up := e.content.ups[ref.oid]; up {
 			continue
+		}
+		if tr.ok && fs.remote_reach_has(&tr.reach, ref.oid) {
+			e.stats.remote_skipped += 1
+			append(&held, ref)
+			continue
+		}
+		if device {
+			append(&held, ref)
+			continue
+		}
+		if ref.opaque {
+			_, size, herr := odb.read_header(db, ref.oid)
+			if herr != .None || !_budget_take(e, h.sp, size) {
+				e.stats.over_budget += 1
+				append(&held, ref)
+				continue
+			}
 		}
 		t, data, rerr := odb.read(db, ref.oid, context.temp_allocator)
 		if rerr != .None || t != .Blob {
@@ -192,6 +224,7 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 		e.content.ups[ref.oid] = Content_Up{space = h.sp.id, object = h.id}
 		mark.pending += 1
 	}
+	_serve_register(e, h, held[:])
 	if mark.pending == 0 {
 		if !mark.failed {
 			_content_mark_put(e, h.sp.id, h.id, h.kind, pos)
@@ -249,7 +282,7 @@ _content_missing :: proc(e: ^Engine, h: ^Handle, device: prim.Id, body: []u8) ->
 		if odb.exists(db, ref.oid) {
 			continue
 		}
-		missing = true
+		missing ||= !ref.opaque
 		if h.sp.repl_on {
 			_content_fetch(e, h, ref)
 		}
@@ -313,8 +346,19 @@ _content_request :: proc(e: ^Engine, w: ^Content_Wait) -> bool {
 	defer if tp != nil {
 		osync.keytree_destroy(&tree)
 	}
+	if w.stage == .Remote {
+		if _git_wanted(e, w) {
+			w.inflight = true
+			return true
+		}
+		w.stage = .Holders
+	}
+	holders: []osync.Device_Id
+	if w.stage == .Holders {
+		holders = _content_holders(e, sp, w.object)
+	}
 	oid := w.oid
-	if osync.replicator_get_object(&sp.repl, &h.scope, tp, oid[:w.n], w.path) != .None {
+	if osync.replicator_get_object_from(&sp.repl, &h.scope, tp, oid[:w.n], w.path, holders) != .None {
 		return false
 	}
 	w.inflight = true
@@ -361,6 +405,12 @@ _content_events_process :: proc(e: ^Engine) {
 				_content_arrived(e, w, ev.path)
 			case .Object_Missing, .Object_Failed:
 				w.inflight = false
+				if w.stage == .Relay && ev.kind == .Object_Missing {
+					w.stage = .Remote
+					if _content_request(e, w) {
+						break
+					}
+				}
 				_content_retry(e, w)
 			}
 		}
@@ -420,7 +470,16 @@ _content_arrived :: proc(e: ^Engine, w: ^Content_Wait, path: string) {
 		return
 	}
 	space, object := w.space, w.object
+	ref := fs.Content_Ref{oid = w.oid, len = w.n}
 	_content_forget(e, w)
+	if h, herr := _handle_get(e, Object{space, object}, .File_Tree); herr == .None {
+		refs := [1]fs.Content_Ref{ref}
+		_serve_register(e, h, refs[:])
+	}
+	if sp, sok := e.spaces[space]; sok {
+		_unavailable_clear(e, sp, object)
+	}
+	_ckpt_content(e, space, object)
 	_object_changed(e, space, object, .Data)
 }
 
@@ -437,6 +496,9 @@ _content_forget :: proc(e: ^Engine, w: ^Content_Wait) {
 @(private)
 _content_retry :: proc(e: ^Engine, w: ^Content_Wait) {
 	w.attempts += 1
+	if w.attempts == CONTENT_RETRIES {
+		_log(e, .Warn, "content fetch gave up: no relay copy, remote or holder had it")
+	}
 	if w.attempts >= CONTENT_RETRIES || w.timer != 0 || e.closing {
 		return
 	}
@@ -456,6 +518,12 @@ _content_retry :: proc(e: ^Engine, w: ^Content_Wait) {
 
 @(private)
 _content_data_arrived :: proc(e: ^Engine, object: prim.Id) {
+	for sid in _sorted_keys(e.spaces) {
+		sp := e.spaces[sid]
+		if sp.open && object == named_id(sp.id, HOLDERS_NAME) {
+			_content_holders_changed(e, sp)
+		}
+	}
 	for _, w in e.content.waits {
 		if w.object == object && !w.inflight && w.timer == 0 {
 			w.attempts = 0

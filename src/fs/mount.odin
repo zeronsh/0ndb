@@ -316,6 +316,7 @@ Mount :: struct {
 	unwatched:   [dynamic]string,
 	attrs:       ^Attr_Ctx,
 	collided:    [dynamic]string,
+	absent:      [dynamic]string,
 	link_mode:   Link_Mode,
 	gitlinks:    []Gitlink,
 }
@@ -430,6 +431,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.intents = make([dynamic]Intent, allocator)
 	m.unwatched = make([dynamic]string, allocator)
 	m.collided = make([dynamic]string, allocator)
+	m.absent = make([dynamic]string, allocator)
 	ok := false
 	defer if !ok {
 		mount_close(m)
@@ -628,6 +630,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(c, m.allocator)
 	}
 	delete(m.collided)
+	for c in m.absent {
+		delete(c, m.allocator)
+	}
+	delete(m.absent)
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
@@ -1305,6 +1311,18 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	if prim.reader_remaining(&rd) > 0 {
 		m.log_gen = prim.read_uvarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		na := prim.read_uvarint(&rd)
+		if na > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< na {
+			a := prim.read_str(&rd)
+			if prim.reader_ok(&rd) {
+				mount_absent_add(m, a)
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1527,6 +1545,10 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_ivarint(&w, m.jpos)
 	gen := m.log_gen + 1 if m.log_len > 0 else m.log_gen
 	prim.write_uvarint(&w, gen)
+	prim.write_uvarint(&w, u64(len(m.absent)))
+	for a in m.absent {
+		prim.write_str(&w, a)
+	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		attrib_log_reset(m)
