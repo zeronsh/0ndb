@@ -1517,7 +1517,7 @@ attrib_prune :: proc(m: ^Mount) {
 mount_settle :: proc(m: ^Mount) -> Error {
 	h := m.history
 	fp := history_fp(h)
-	if fp == h.mark_fp && h.mark <= h.durable && len(m.waits) == 0 {
+	if fp == h.mark_fp && h.mark <= h.settled && len(m.waits) == 0 {
 		image_take(m, &m.img)
 		shadow_flush(m) or_return
 		clear(&m.intents)
@@ -1548,7 +1548,7 @@ mount_ack :: proc(m: ^Mount) -> Error {
 		mount_schedule(m, 0)
 	}
 	n := 0
-	for n < len(m.waits) && m.waits[n].mark <= h.durable {
+	for n < len(m.waits) && m.waits[n].mark <= h.settled {
 		n += 1
 	}
 	if n == 0 {

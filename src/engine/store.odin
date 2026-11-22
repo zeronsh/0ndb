@@ -556,6 +556,9 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 				if derr := fs.history_durable(h.hist, m.mark); derr != .None {
 					_log(e, .Warn, "mount state persist failed")
 				}
+				if fs.history_durable_mark(h.hist) > h.hist.durable {
+					_touch(e)
+				}
 			}
 		}
 		if len(b.segs) > 0 || b.meta {

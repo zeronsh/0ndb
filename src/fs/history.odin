@@ -111,6 +111,9 @@ History :: struct {
 	refs:       int,
 	owned:      bool,
 	durable:    u64,
+	settled:    u64,
+	kv_at:      u64,
+	kv_upto:    u64,
 	mark:       u64,
 	mark_fp:    [3]u64,
 	staged:     [dynamic]Staged_Blob,
@@ -385,15 +388,30 @@ history_fp :: proc(h: ^History) -> [3]u64 {
 }
 
 history_durable :: proc(h: ^History, mark: u64) -> Error {
-	if mark <= h.durable {
-		return history_commit_groups(h)
-	}
 	prev := h.durable
-	h.durable = min(mark, h.mark)
-	history_flush_staged(h, h.durable) or_return
-	if cerr := history_commit_groups(h); cerr != .None {
+	if mark > h.durable {
+		h.durable = min(mark, h.mark)
+		history_flush_staged(h, h.durable) or_return
+	}
+	if h.kv_at != 0 && h.kv_at <= h.durable {
+		h.settled = max(h.settled, h.kv_upto)
+		h.kv_at = 0
+	}
+	committed, cerr := history_commit_groups(h)
+	if cerr != .None {
 		h.durable = prev
 		return cerr
+	}
+	if committed {
+		if h.mark <= h.mark_taken {
+			h.mark += 1
+		}
+		h.kv_at = h.mark
+		h.kv_upto = h.durable
+	} else if h.kv_at != 0 {
+		h.kv_upto = h.durable
+	} else {
+		h.settled = h.durable
 	}
 	err: Error
 	for m in h.mounts {
@@ -405,16 +423,16 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 }
 
 @(private)
-history_commit_groups :: proc(h: ^History) -> Error {
+history_commit_groups :: proc(h: ^History) -> (committed: bool, err: Error) {
 	if h.awake {
 		if len(h.kv.groups) == 0 || h.kv.groups[0].mark > h.durable {
-			return .None
+			return false, .None
 		}
 		from_prim(prim.datasync(h.vfs, h.lvidx)) or_return
-		return kv_commit_upto(&h.kv, h.durable)
+		return true, kv_commit_upto(&h.kv, h.durable)
 	}
 	if len(h.held) == 0 || h.held[0].mark > h.durable {
-		return .None
+		return false, .None
 	}
 	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
 	if fd, oerr := prim.open_file(h.vfs, lp, {.Write}, 0o600); oerr == .None {
@@ -425,10 +443,10 @@ history_commit_groups :: proc(h: ^History) -> Error {
 	kv: Kv
 	kv_open(&kv, h.vfs, h.dir, "state", h.allocator) or_return
 	kv_groups_give(&kv, h.held)
-	err := kv_commit_upto(&kv, h.durable)
+	err = kv_commit_upto(&kv, h.durable)
 	h.held = kv_groups_take(&kv)
 	kv_close(&kv)
-	return err
+	return true, err
 }
 
 history_close :: proc(h: ^History) {
