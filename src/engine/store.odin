@@ -297,12 +297,28 @@ _dirty_add :: proc(e: ^Engine, h: ^Handle, path: string, length: i64) {
 			if d.tree == nil {
 				d.tree = _own_tree_ref(e, h)
 			}
+			d.keys ||= _keys_unconfirmed(e, h.sp, &h.scope, h.name, d.tree)
 			return
 		}
 	}
 	tr := _own_tree_ref(e, h)
-	append(&e.dirty, Dirty_Seg{space = h.sp.id, object = h.id, kind = h.kind, scope = h.scope, name = _clone(h.name, e.allocator) or_else "", path = _clone(path, e.allocator) or_else "", length = length, tree = tr})
+	append(&e.dirty, Dirty_Seg{space = h.sp.id, object = h.id, kind = h.kind, scope = h.scope, name = _clone(h.name, e.allocator) or_else "", path = _clone(path, e.allocator) or_else "", length = length, tree = tr, keys = _keys_unconfirmed(e, h.sp, &h.scope, h.name, tr)})
 	_touch(e)
+}
+
+@(private)
+_keys_unconfirmed :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, name: string, t: ^Own_Tree) -> bool {
+	if t == nil || !sp.repl_on {
+		return false
+	}
+	if t.keys_ok == t.tree.version + 1 {
+		return false
+	}
+	if osync.replicator_keys_published(&sp.repl, scope, name, &t.tree) {
+		t.keys_ok = t.tree.version + 1
+		return false
+	}
+	return true
 }
 
 @(private)
@@ -359,6 +375,7 @@ _durable_begin :: proc(e: ^Engine) {
 			return
 		}
 	}
+	_keys_stage(e)
 	b := new(Durable_Batch, e.allocator)
 	b.e = e
 	b.tick = e.tick
@@ -370,7 +387,7 @@ _durable_begin :: proc(e: ^Engine) {
 	b.marks = make([dynamic]Hist_Mark, e.allocator)
 	for h in e.lru {
 		if h.hist != nil && fs.history_durable_mark(h.hist) > h.hist.durable {
-			append(&b.marks, Hist_Mark{h.id, fs.history_durable_mark(h.hist)})
+			append(&b.marks, Hist_Mark{h.id, fs.history_mark_take(h.hist)})
 		}
 	}
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
@@ -470,6 +487,14 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 				_draft_settle(e, d.object, d.length)
 			}
 		}
+		for _, sp in e.spaces {
+			if sp.repl_on {
+				osync.replicator_durable(&sp.repl)
+			}
+		}
+		if rv := e.approvals.rv; rv != nil && rv.repl_on {
+			osync.replicator_durable(&rv.repl)
+		}
 		for c in b.cards {
 			_card_pub_durable(e, c)
 		}
@@ -497,6 +522,27 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	delete(b.marks)
 	delete(b.drafts)
 	free(b, e.allocator)
+	if len(e.settles) > 0 {
+		_touch(e)
+	}
+}
+
+@(private)
+_keys_stage :: proc(e: ^Engine) {
+	for &d in e.dirty {
+		if !d.keys || d.tree == nil || d.tree.dirty {
+			continue
+		}
+		sp, ok := e.spaces[d.space]
+		if !ok || !sp.repl_on {
+			continue
+		}
+		okey, sealed := _object_epoch_key(sp, d.object, d.tree.tree.epoch)
+		if sp.mode != .End_To_End || sealed {
+			osync.replicator_stage_keys(&sp.repl, &d.scope, d.name, &d.tree.tree, &okey if sealed else nil)
+		}
+		crypto.zero_explicit(&okey, size_of(okey))
+	}
 }
 
 @(private)
@@ -764,4 +810,13 @@ _sorted_keys :: proc(m: map[$K]$V) -> []K {
 		return runtime.memory_compare(&x, &y, size_of(K)) < 0
 	})
 	return keys
+}
+
+durable_len :: proc(e: ^Engine, path: string) -> (size: i64, err: Error) {
+	context = context_for(e)
+	if !e.pk_open {
+		return 0, .Invalid
+	}
+	n, perr := pack.durable_size(&e.pk, path)
+	return n, _perr(perr)
 }

@@ -190,6 +190,7 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		n := w.nodes[ev.node]
 		if !n.alive {
 			if node_start(n) {
+				check_sent(n)
 				model_after_restart(&w.model, n)
 				probe_reuse(w, n)
 				stream_after_restart(w, n)
@@ -206,6 +207,10 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		pack_job_event(w, w.nodes[ev.node], ev.gen)
 	case .Stream_Step:
 		stream_step(w, int(ev.arg))
+	case .Sim_Http:
+		sim_http_event(w, ev)
+	case .Quiesce_Step:
+		quiesce_event(w, ev)
 	case .Heal:
 		n := w.nodes[ev.node]
 		if n.partitioned {
@@ -302,14 +307,18 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	cfg.mem_max = env_u64("SIM_MEM_MAX", 1500)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
 	if v, ok := os.lookup_env("SIM_STORAGE", context.temp_allocator); ok {
-		if mode, mok := storage_mode_of(v); mok {
-			cfg.storage = mode
+		mode, mok := storage_mode_of(v)
+		if !mok {
+			fmt.panicf("SIM_STORAGE=%q is not one of auto, stored, until-run, device", v)
 		}
+		cfg.storage = mode
 	}
 	if v, ok := os.lookup_env("SIM_DURABILITY", context.temp_allocator); ok {
-		if mode, mok := durability_of(v); mok {
-			cfg.durability = mode
+		mode, mok := durability_of(v)
+		if !mok {
+			fmt.panicf("SIM_DURABILITY=%q is not one of async, deferred", v)
 		}
+		cfg.durability = mode
 	}
 	cfg.promote = i64(env_u64("SIM_PROMOTE", u64(cfg.promote)))
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
@@ -334,6 +343,9 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	}
 	if ok {
 		ok = setup_spaces(w)
+	}
+	if ok {
+		ok = quiesce_setup(w)
 	}
 	if ok && env_u64("SIM_BULK", 1 if cfg.bulk else 0) != 0 {
 		setup_bulk(w)
@@ -417,6 +429,7 @@ finish :: proc(w: ^World) {
 	for n in w.nodes {
 		if !n.alive && len(w.failures) == 0 {
 			if node_start(n) {
+				check_sent(n)
 				model_after_restart(&w.model, n)
 				stream_after_restart(w, n)
 			}
@@ -446,6 +459,7 @@ finish :: proc(w: ^World) {
 		dump_replication(w, before)
 	}
 	check_streams(w)
+	check_quiesce(w)
 	check_map_reapply(w)
 	check_redaction(w)
 	cipher_scan_relay(w)
@@ -474,6 +488,7 @@ check_close :: proc(w: ^World) {
 			continue
 		}
 		live_close(n)
+		quiesce_runtime_close(n)
 		context = instance_context(&n.inst)
 		err := eng.close(&n.e)
 		n.e_open = false

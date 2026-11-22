@@ -547,10 +547,14 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 		_promote(p, oi) or_return
 	}
 	if oi.ino.kind == .External {
+		before := _ext_before(p, oi) or_return
 		oi.dirty = true
-		return prim.write_at(p.base, oi.real_fd, src, off)
+		prim.write_at(p.base, oi.real_fd, src, off) or_return
+		_pend_note(p, oi.inum, before, max(before, off + i64(len(src))))
+		return .None
 	}
 	old := oi.ino
+	_pend_note(p, oi.inum, old.size, max(old.size, off + i64(len(src))))
 	ph := _log_data(p, oi.inum, off, src) or_return
 	nw := &oi.ino
 	scratch: Phys_List
@@ -562,7 +566,7 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 	nw.size = max(nw.size, off + i64(len(src)))
 	nw.mtime = _now(p)
 	if nw.n > MAX_EXTENTS {
-		if e := _defrag(p, oi, MAX_EXTENTS * 3 / 4); e != .None {
+		if e := _defrag(p, oi, &old, MAX_EXTENTS * 3 / 4); e != .None {
 			oi.ino = old
 			return e
 		}
@@ -572,7 +576,7 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 }
 
 @(private)
-_defrag :: proc(p: ^Pack, oi: ^Open_Inode, keep: int) -> Error {
+_defrag :: proc(p: ^Pack, oi: ^Open_Inode, orig: ^Inode, keep: int) -> Error {
 	ino := &oi.ino
 	for ino.n > max(keep, 1) {
 		best, best_w := -1, 0
@@ -604,11 +608,26 @@ _defrag :: proc(p: ^Pack, oi: ^Open_Inode, keep: int) -> Error {
 		ph := _log_data(p, oi.inum, from, buf) or_return
 		scratch: Phys_List
 		_ext_remove(ino, from, to, &scratch)
+		for x in scratch.a[:scratch.n] {
+			if !_phys_within(orig, x) {
+				_defer_zero(p, x, false)
+			}
+		}
 		if !_ext_insert(ino, Extent{off = from, len = to - from, cont = ph.cont, coff = ph.off}) {
 			return .Io
 		}
 	}
 	return .None
+}
+
+@(private)
+_phys_within :: proc "contextless" (ino: ^Inode, x: Phys) -> bool {
+	for e in ino.ext[:ino.n] {
+		if e.cont == x.cont && x.off >= e.coff && x.off + x.len <= e.coff + e.len {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -647,13 +666,17 @@ _truncate :: proc(p: ^Pack, h: ^Handle, size: i64) -> Error {
 		_promote(p, oi) or_return
 	}
 	if oi.ino.kind == .External {
+		before := _ext_before(p, oi) or_return
 		oi.dirty = true
-		return prim.truncate(p.base, oi.real_fd, size)
+		prim.truncate(p.base, oi.real_fd, size) or_return
+		_pend_note(p, oi.inum, before, size)
+		return .None
 	}
 	if size == oi.ino.size {
 		return .None
 	}
 	old := oi.ino
+	_pend_note(p, oi.inum, old.size, size)
 	scratch: Phys_List
 	_ext_remove(&oi.ino, size, max(i64), &scratch)
 	oi.ino.size = size
@@ -743,6 +766,7 @@ _v_sync :: proc(data: rawptr, fd: prim.Fd) -> Error {
 			_suspect_record(p, []u64{h.oi.inum})
 			return _poison(p, e)
 		}
+		_pend_synced(p, h.oi.inum)
 		return .None
 	}
 	return sync(p)

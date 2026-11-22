@@ -389,6 +389,9 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	}
 	_rec_put(e, h.id, &rec) or_return
 	_dirty_keys(e, h.sp, h.id, h.kind, h.scope, h.own_tree)
+	if h.own_tree != nil {
+		_pending_set(e, h.sp.id, h.id, 0)
+	}
 	_handle_mark(h)
 	if h.id != h.sp.catalog {
 		_catalog_participant(e, h.sp, h.id, h.kind)
@@ -429,7 +432,7 @@ _handle_add_member :: proc(h: ^Handle, device: prim.Id, keys_epoch: u64) {
 	}
 	append(&h.segs, seg)
 	if journal.replica_length(rep) == 0 {
-		seg.waiting = true
+		seg.waiting = !osync.replicator_confirmed_empty(&sp.repl, &h.scope, device, h.name, 0)
 		osync.replicator_want_tail(&sp.repl, &h.scope, device, h.name, 0)
 		e.stats.fetches += 1
 	}
@@ -583,11 +586,8 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 		if !s.in_view && s.tree != nil && !s.tree.absent {
 			return true
 		}
-		if s.follow && h.kind != .Conversation && h.sp.repl_on && h.sp.connected {
-			n := osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0)
-			if n > 0 && !_replica_covers(s.rep, n) {
-				return true
-			}
+		if s.follow && h.kind != .Conversation && h.sp.repl_on && h.sp.connected && osync.replicator_catching_up(&h.sp.repl, &h.scope, s.device, h.name, 0) {
+			return true
 		}
 	}
 	return false
@@ -648,6 +648,9 @@ _handles_commit :: proc(e: ^Engine) {
 
 @(private)
 _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
+	if h.hist != nil && !e.closing && fs.history_durable_mark(h.hist) > h.hist.durable {
+		return .Busy
+	}
 	if err := _handle_commit(e, h); err == .Busy && !e.closing {
 		return err
 	}

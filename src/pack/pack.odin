@@ -161,6 +161,7 @@ Pack :: struct {
 	handles:       [dynamic]Handle,
 	free_handles:  [dynamic]int,
 	open_inodes:   map[u64]^Open_Inode,
+	pend:          map[u64]^Pend,
 	dcache:        [DCACHE]Dcache_Entry,
 	poisoned:      bool,
 	recovering:    bool,
@@ -532,6 +533,11 @@ _inode_store :: proc(p: ^Pack, inum: u64, old: ^Inode, new: ^Inode, erase := Era
 		vn += prim.put_uvarint(vb[vn:], u64(ph.len))
 		_put(p, _skey(sb[:], inum, ph.cont, ph.off), vb[:vn], false) or_return
 		stale = true
+	}
+	if erase.on && !destroy {
+		for &z in p.zeros {
+			z.urgent = true
+		}
 	}
 	if erase.on && !destroy && p.compacting != 0 {
 		append(&p.cscan, Scan{inum = inum, lo = erase.lo, hi = erase.hi})

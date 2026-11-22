@@ -15,7 +15,7 @@ storage_mode_of :: proc(s: string) -> (m: eng.Storage_Mode, ok: bool) {
 		return .Auto, true
 	case "stored":
 		return .Stored, true
-	case "until-run":
+	case "until-run", "until_run":
 		return .Device_Until_Run, true
 	case "device":
 		return .Device, true

@@ -83,6 +83,7 @@ Replicator_Config :: struct {
 	seal:         proc(user: rawptr, name: string, id: Stream_Id, data: []u8, off: i64) -> Error,
 	on_event:     Repl_Handler,
 	user:         rawptr,
+	durable:      proc(user: rawptr, path: string) -> (length: i64, ok: bool),
 }
 
 Stream_Sealing :: enum u8 {
@@ -190,6 +191,11 @@ Remote :: struct {
 	skey:      journal.Key,
 	reaping:   bool,
 	probing:   bool,
+	kfollow:   bool,
+	kwait_head: Stream_Id,
+	kstream:   Stream_Id,
+	retry_hold: bool,
+	denied:    bool,
 	want_gen:  u64,
 	probe_gen: u64,
 	fresh_gen: u64,
@@ -199,6 +205,7 @@ Remote :: struct {
 	verified:  [dynamic]journal.Range,
 	span:      journal.Sig_Info,
 	span_ok:   bool,
+	empty_ok:  bool,
 	span_fd:   prim.Fd,
 	span_seq:  u64,
 	base:      i64,
@@ -284,6 +291,7 @@ Replicator :: struct {
 	account:    Relay_Space_Stats,
 	accounted:  bool,
 	pumping:    bool,
+	kwait_dirty: bool,
 	serves:     [dynamic]Serve_Req,
 	parked:     [dynamic]Serve_Req,
 	pull_tag:   u64,
@@ -409,6 +417,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 	for _, rm in r.remotes {
 		_remote_free(r, rm)
 	}
+	r.kwait_dirty = false
 	_objs_destroy(r)
 	delete(r.locals)
 	delete(r.remotes)
@@ -512,6 +521,37 @@ replicator_floor :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64
 	return newest.value, .None
 }
 
+replicator_durable :: proc(r: ^Replicator) {
+	list := make([dynamic]^Local, context.temp_allocator)
+	for _, l in r.locals {
+		if l.cursor < l.durable && l.inflight == 0 && !l.fatal && !l.blocked && !l.retry && !l.verifying && l.ahead == 0 && !l.dropping {
+			append(&list, l)
+		}
+	}
+	if len(list) == 0 || r.phase != .Ready {
+		return
+	}
+	_enter(r)
+	defer _leave(r)
+	for l in list {
+		_local_pump(r, l)
+	}
+	_repl_flush(r)
+}
+
+
+@(private)
+_limit :: proc(r: ^Replicator, l: ^Local) -> i64 {
+	if r.cfg.durable == nil {
+		return l.cursor
+	}
+	n, ok := r.cfg.durable(r.cfg.user, l.path)
+	if !ok {
+		return l.cursor
+	}
+	return max(min(l.durable, n), l.cursor)
+}
+
 replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil, hollow := false) -> Error {
 	_enter(r)
 	defer _leave(r)
@@ -582,6 +622,10 @@ replicator_unfollow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, na
 		return
 	}
 	rm.follow = false
+	if rm.kfollow {
+		_remote_maybe_free(r, rm)
+		return
+	}
 	rm.full = false
 	if r.phase == .Ready {
 		if r.cfg.filtered {
@@ -647,6 +691,11 @@ _remote_want_tail :: proc(r: ^Replicator, rm: ^Remote, n: i64) -> Error {
 	_remote_settle(r, rm)
 	_repl_flush(r)
 	return .None
+}
+
+replicator_confirmed_empty :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
+	rm, ok := r.remotes[stream_id(scope, device, name, epoch)]
+	return ok && rm.empty_ok && journal.replica_length(&rm.rep) == 0
 }
 
 replicator_acquire :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> (^journal.Replica, Error) {
@@ -821,11 +870,12 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 		_local_maybe_free(r, l)
 		return
 	}
-	if r.uploading >= MAX_UPLOADS || client_queued(&r.client) >= OUT_HIGH {
+	limit := _limit(r, l)
+	if l.cursor >= limit || r.uploading >= MAX_UPLOADS || client_queued(&r.client) >= OUT_HIGH {
 		return
 	}
 	if l.hollow {
-		_local_note(r, l)
+		_local_note(r, l, limit)
 		return
 	}
 	if l.fd < 0 {
@@ -842,12 +892,15 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	first := i64(prim.get_u32le(head[:])) + journal.OVERHEAD
-	want := min(l.durable - l.cursor, UPLOAD_CHUNK)
+	want := min(limit - l.cursor, UPLOAD_CHUNK)
 	if first > want {
 		want = first
 	}
 	if first > l.durable - l.cursor || want > APPEND_MAX {
 		_local_fatal(r, l, .Corrupt, -1)
+		return
+	}
+	if first > limit - l.cursor {
 		return
 	}
 	dst, rerr := client_append_reserve(&r.client, l.id, l.cursor, int(want))
@@ -1144,8 +1197,9 @@ _on_retry :: proc(l: ^prim.Loop, data: rawptr) {
 		lo.retry = false
 	}
 	for id in _sorted_ids(r.remotes) {
-		if rm, ok := r.remotes[id]; ok && rm.tamper_hold {
+		if rm, ok := r.remotes[id]; ok && (rm.tamper_hold || rm.retry_hold) {
 			rm.tamper_hold = false
+			rm.retry_hold = false
 			_remote_pull(r, rm)
 			_remote_settle(r, rm)
 		}
@@ -1204,6 +1258,7 @@ _remote_get :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: stri
 
 @(private)
 _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
+	_kwait_release(r, rm)
 	for p in rm.probes {
 		if cur, ok := r.probes[p]; ok && cur == rm {
 			delete_key(&r.probes, p)
@@ -1237,7 +1292,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
-	if rm.follow || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm {
+	if _following(rm) || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm {
 		return
 	}
 	if r.hold > 0 {
@@ -1355,6 +1410,9 @@ _leave :: proc(r: ^Replicator) {
 	if r.hold > 0 {
 		return
 	}
+	if r.kwait_dirty {
+		_kwait_sync(r)
+	}
 	_deadline_sync(r)
 	for len(r.reap) > 0 {
 		rm := pop(&r.reap)
@@ -1385,7 +1443,7 @@ _remote_follow_send :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
-	if !rm.follow || rm.quarantined || rm.keys_wait || rm.tamper_hold || r.phase != .Ready {
+	if !_following(rm) || rm.quarantined || rm.keys_wait || rm.tamper_hold || rm.retry_hold || r.phase != .Ready {
 		return
 	}
 	if rm.full {
@@ -1425,7 +1483,7 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
-	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || _covered_inflight(rm, gap) {
+	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || rm.retry_hold || _covered_inflight(rm, gap) {
 		return
 	}
 	prev_end := i64(0)
@@ -1473,6 +1531,8 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 	if client_read(&r.client, rm.id, fetch.from, fetch.to) == .None {
 		append(&rm.inflight, fetch)
 		r.read_reqs += 1
+	} else {
+		_remote_hold_retry(r, rm)
 	}
 }
 
@@ -1533,6 +1593,15 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 	if rm.tail > 0 && fresh {
 		append(&rm.wants, journal.Range{max(rm.relay_len - rm.tail, 0), rm.relay_len})
 		rm.tail = 0
+	}
+	if fresh && rm.relay_len == 0 && journal.replica_length(&rm.rep) == 0 {
+		if !rm.empty_ok {
+			rm.empty_ok = true
+			_span_save(r, rm, false)
+		}
+	} else if rm.empty_ok && (rm.relay_len > 0 || journal.replica_length(&rm.rep) > 0) {
+		rm.empty_ok = false
+		_span_save(r, rm, false)
 	}
 	if rm.relay_len < 0 {
 		_remote_maybe_free(r, rm)
@@ -1645,6 +1714,7 @@ _keys_needed :: proc(r: ^Replicator, rm: ^Remote) {
 	if kn, err := keys_stream_name(rm.name); err == .None {
 		_keys_head_start(r, &rm.scope, rm.device, kn, 0)
 	}
+	_kwait_hold(r, rm)
 }
 
 @(private)
@@ -1652,18 +1722,8 @@ _keys_head_seen :: proc(r: ^Replicator, head: ^Remote) {
 	if len(head.head_keys) == 0 {
 		return
 	}
-	rd: journal.Reader
-	journal.replica_reader(&head.rep, &rd, context.temp_allocator)
-	defer journal.reader_close(&rd)
-	if !head.plain {
-		journal.reader_set_keys(&rd, static_provider(&head.skey))
-	}
-	body, _, err := journal.record_before(&rd, journal.replica_length(&head.rep))
-	if err != .None || len(body) != 9 || body[0] != KEYS_HEAD_RECORD {
-		return
-	}
-	epoch := prim.get_u64le(body[1:])
-	if epoch >= head.head_min {
+	epoch, ok := _keys_head_epoch(r, head)
+	if ok && epoch >= head.head_min {
 		_emit(r, Repl_Event{kind = .Epoch_Seen, device = head.device, name = head.head_keys, epoch = epoch, stream = stream_id(&head.scope, head.device, head.head_keys, epoch)})
 	}
 }
@@ -1906,7 +1966,12 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 			rm.pulled = c
 		}
 	}
-	if rm.follow && r.rx_at > r.rx_start && !rm.quarantined {
+	if rm.is_head && rm.kfollow {
+		_kwait_head_landed(r, rm)
+	} else if rm.kfollow {
+		_kwait_keys_landed(r, rm)
+	}
+	if _following(rm) && r.rx_at > r.rx_start && !rm.quarantined {
 		v, vlo, vhi := _verdict(r, rm, r.rx_start, r.rx_at)
 		switch v {
 		case .Accept:
@@ -1951,7 +2016,10 @@ _seen_stream :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 			if length > journal.replica_length(&rm.rep) {
 				journal.replica_set_length(&rm.rep, length)
 			}
-			if rm.follow && !rm.full {
+			if rm.is_head && rm.kfollow {
+				_kwait_head_want(r, rm)
+			}
+			if _following(rm) && !rm.full {
 				_emit(r, Repl_Event{kind = .Grew, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = length, to = length, length = length})
 			}
 		}
@@ -2139,6 +2207,12 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		clear(&rm.inflight)
 		rm.probing = false
 		rm.pulling = false
+		rm.pulled = _contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
+		if ev.code == .Not_Owner {
+			_remote_deny(r, rm)
+		} else {
+			_remote_hold_retry(r, rm)
+		}
 		rv.name, rv.epoch, rv.device = rm.name, rm.epoch, rm.device
 	}
 	_emit(r, rv)
@@ -2164,7 +2238,7 @@ _repl_on_ready :: proc(r: ^Replicator) {
 	_fetches_ready(r)
 	ids := _sorted_ids(r.remotes)
 	for id in ids {
-		if rm, ok := r.remotes[id]; ok && rm.follow {
+		if rm, ok := r.remotes[id]; ok && _following(rm) {
 			_remote_follow_send(r, rm)
 		}
 	}
@@ -2237,6 +2311,8 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		clear(&rm.carry)
 		rm.pulling = false
 		rm.probing = false
+		rm.retry_hold = false
+		rm.denied = false
 	}
 	clear(&r.serves)
 	clear(&r.parked)
@@ -2245,4 +2321,34 @@ _repl_reset_state :: proc(r: ^Replicator) {
 	_promotions_reset(r)
 	_objs_reset(r)
 	_fetches_reset(r)
+}
+
+replicator_live :: proc "contextless" (r: ^Replicator) -> bool {
+	return r.phase == .Ready
+}
+
+replicator_unsettled :: proc(r: ^Replicator) -> (pending: bool, broken: bool) {
+	if r.phase != .Ready {
+		return true, true
+	}
+	for _, l in r.locals {
+		if l.superseded || l.hollow {
+			continue
+		}
+		if l.fatal || l.blocked {
+			return true, true
+		}
+		if l.floor < l.durable || l.inflight > 0 || l.verifying || l.ahead > 0 || l.dropping {
+			pending = true
+		}
+	}
+	for j in r.objs.jobs {
+		if j.op == .Put && !j.failed {
+			pending = true
+		}
+	}
+	if r.objs.active != nil && r.objs.active.op == .Put {
+		pending = true
+	}
+	return pending, false
 }

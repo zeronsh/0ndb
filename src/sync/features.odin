@@ -40,47 +40,7 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 	id := stream_id(scope, r.cfg.self, name, epoch)
 	pbuf: prim.Path_Buf = ---
 	path := _keys_path(r, &pbuf, id)
-	body := make([dynamic]u8, context.temp_allocator)
-	if seal != nil {
-		keys_record_seal(tree, seal, id, &body) or_return
-	} else {
-		append(&body, KEYS_RECORD)
-		keytree_encode(tree, &body) or_return
-	}
-	defer crypto.zero_explicit(raw_data(body), len(body))
-	floor := replicator_floor(r, scope, name, epoch) or_return
-	if floor > 0 {
-		same := false
-		rd: journal.Reader
-		if journal.reader_open(&rd, r.vfs, path, context.temp_allocator) == .None {
-			c := journal.cursor(&rd, 0)
-			if b, _, ok := journal.next(&c); ok {
-				same = string(b) == string(body[:])
-			}
-			journal.reader_close(&rd)
-		}
-		if !same {
-			return .Conflict
-		}
-	} else {
-		journal.journal_remove(r.vfs, path)
-	}
-	j: journal.Journal
-	if jerr := journal.journal_open(&j, r.vfs, path, {}, context.allocator); jerr != .None {
-		return _from_journal(jerr)
-	}
-	aerr: journal.Error
-	if journal.journal_durable_len(&j) == 0 {
-		_, aerr = journal.journal_append(&j, body[:])
-		if aerr == .None {
-			aerr = journal.journal_commit(&j)
-		}
-	}
-	durable := journal.journal_durable_len(&j)
-	journal.journal_close(&j)
-	if aerr != .None {
-		return _from_journal(aerr)
-	}
+	durable := _keys_write(r, scope, name, epoch, id, path, tree, seal) or_return
 	if epoch > 0 {
 		l, ok := r.locals[id]
 		if !ok {
@@ -103,29 +63,128 @@ replicator_publish_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, 
 	return _keys_head_publish(r, scope, name, epoch)
 }
 
-@(private)
-_keys_head_publish :: proc(r: ^Replicator, scope: ^Scope, keys_name: string, epoch: u64) -> Error {
-	hname := keys_head_name(keys_name) or_return
-	hid := stream_id(scope, r.cfg.self, hname, 0)
+replicator_stage_keys :: proc(r: ^Replicator, scope: ^Scope, segment: string, tree: ^Key_Tree, seal: ^[32]u8 = nil) -> Error {
+	_enter(r)
+	defer _leave(r)
+	name := keys_stream_name(segment) or_return
+	epoch := tree.version
+	id := stream_id(scope, r.cfg.self, name, epoch)
 	pbuf: prim.Path_Buf = ---
-	path := _keys_path(r, &pbuf, hid)
+	path := _keys_path(r, &pbuf, id)
+	_keys_write(r, scope, name, epoch, id, path, tree, seal) or_return
+	hpb: prim.Path_Buf = ---
+	_, _ = _keys_head_write(r, scope, name, epoch, &hpb) or_return
+	return .None
+}
+
+@(private)
+_keys_write :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, id: Stream_Id, path: string, tree: ^Key_Tree, seal: ^[32]u8) -> (durable: i64, err: Error) {
+	body := make([dynamic]u8, context.temp_allocator)
+	if seal != nil {
+		keys_record_seal(tree, seal, id, &body) or_return
+	} else {
+		append(&body, KEYS_RECORD)
+		keytree_encode(tree, &body) or_return
+	}
+	defer crypto.zero_explicit(raw_data(body), len(body))
+	floor := replicator_floor(r, scope, name, epoch) or_return
+	same := false
+	rd: journal.Reader
+	if journal.reader_open(&rd, r.vfs, path, context.temp_allocator) == .None {
+		c := journal.cursor(&rd, 0)
+		if b, _, ok := journal.next(&c); ok {
+			same = _keys_same(b, tree, seal, id, body[:])
+		}
+		journal.reader_close(&rd)
+	}
+	if !same {
+		if floor > 0 {
+			return 0, .Conflict
+		}
+		journal.journal_remove(r.vfs, path)
+	}
 	j: journal.Journal
 	if jerr := journal.journal_open(&j, r.vfs, path, {}, context.allocator); jerr != .None {
-		return _from_journal(jerr)
+		return 0, _from_journal(jerr)
+	}
+	aerr: journal.Error
+	if journal.journal_durable_len(&j) == 0 {
+		_, aerr = journal.journal_append(&j, body[:])
+		if aerr == .None {
+			aerr = journal.journal_commit(&j)
+		}
+	}
+	durable = journal.journal_durable_len(&j)
+	journal.journal_close(&j)
+	if aerr != .None {
+		return 0, _from_journal(aerr)
+	}
+	return durable, .None
+}
+
+@(private)
+_keys_head_publish :: proc(r: ^Replicator, scope: ^Scope, keys_name: string, epoch: u64) -> Error {
+	pbuf: prim.Path_Buf = ---
+	hname, durable := _keys_head_write(r, scope, keys_name, epoch, &pbuf) or_return
+	hid := stream_id(scope, r.cfg.self, hname, 0)
+	return replicator_publish(r, scope, hname, 0, _keys_path(r, &pbuf, hid), durable)
+}
+
+@(private)
+_keys_head_write :: proc(r: ^Replicator, scope: ^Scope, keys_name: string, epoch: u64, pbuf: ^prim.Path_Buf) -> (hname: string, durable: i64, err: Error) {
+	hname = keys_head_name(keys_name) or_return
+	hid := stream_id(scope, r.cfg.self, hname, 0)
+	path := _keys_path(r, pbuf, hid)
+	j: journal.Journal
+	if jerr := journal.journal_open(&j, r.vfs, path, {}, context.allocator); jerr != .None {
+		return hname, 0, _from_journal(jerr)
 	}
 	rec: [9]u8
 	rec[0] = KEYS_HEAD_RECORD
 	prim.put_u64le(rec[1:], epoch)
-	_, aerr := journal.journal_append(&j, rec[:])
-	if aerr == .None {
-		aerr = journal.journal_commit(&j)
+	have := false
+	if end := journal.journal_durable_len(&j); end > 0 {
+		rd: journal.Reader
+		journal.journal_reader(&j, &rd, context.temp_allocator)
+		if b, _, berr := journal.record_before(&rd, end); berr == .None {
+			have = string(b) == string(rec[:])
+		}
+		journal.reader_close(&rd)
 	}
-	durable := journal.journal_durable_len(&j)
+	aerr: journal.Error
+	if !have {
+		_, aerr = journal.journal_append(&j, rec[:])
+		if aerr == .None {
+			aerr = journal.journal_commit(&j)
+		}
+	}
+	durable = journal.journal_durable_len(&j)
 	journal.journal_close(&j)
 	if aerr != .None {
-		return _from_journal(aerr)
+		return hname, 0, _from_journal(aerr)
 	}
-	return replicator_publish(r, scope, hname, 0, path, durable)
+	return hname, durable, .None
+}
+
+replicator_keys_published :: proc(r: ^Replicator, scope: ^Scope, segment: string, tree: ^Key_Tree) -> bool {
+	name, nerr := keys_stream_name(segment)
+	if nerr != .None {
+		return false
+	}
+	if floor, ferr := replicator_floor(r, scope, name, tree.version); ferr != .None || floor <= 0 {
+		return false
+	}
+	hname, herr := keys_head_name(name)
+	if herr != .None {
+		return false
+	}
+	hfloor, hferr := replicator_floor(r, scope, hname, 0)
+	if hferr != .None || hfloor <= 0 {
+		return false
+	}
+	pbuf: prim.Path_Buf = ---
+	st, serr := prim.stat(r.vfs, _keys_path(r, &pbuf, stream_id(scope, r.cfg.self, hname, 0)))
+	return serr == .None && hfloor >= st.size
 }
 
 replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
@@ -428,10 +487,11 @@ _quarantine :: proc(r: ^Replicator, rm: ^Remote, at: i64) {
 	clear(&rm.wants)
 	clear(&rm.inflight)
 	rm.tail = 0
-	if rm.follow && r.phase == .Ready {
+	if _following(rm) && r.phase == .Ready {
 		ids := [1]Stream_Id{rm.id}
 		client_unfollow(&r.client, ids[:])
 	}
+	_kwait_release(r, rm)
 	_emit(r, Repl_Event{kind = .Quarantined, err = .Conflict, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = at, length = rm.relay_len})
 }
 
@@ -647,6 +707,12 @@ _span_load :: proc(r: ^Replicator, rm: ^Remote, replica_path: string) {
 		}
 		best = seq
 		rm.span_seq = seq
+		rm.empty_ok = rec[96] & SPAN_EMPTY != 0
+		if rec[96] & SPAN_NONE != 0 {
+			rm.span = {}
+			rm.span_ok = false
+			continue
+		}
 		rm.span.off = i64(prim.get_u64le(rec[8:]))
 		rm.span.end = i64(prim.get_u64le(rec[16:]))
 		rm.span.range_start = i64(prim.get_u64le(rec[24:]))
@@ -660,7 +726,13 @@ _span_load :: proc(r: ^Replicator, rm: ^Remote, replica_path: string) {
 SPAN_SEED :: 0x7370_616e
 
 @(private)
-_span_save :: proc(r: ^Replicator, rm: ^Remote) {
+SPAN_EMPTY :: u8(1)
+
+@(private)
+SPAN_NONE :: u8(2)
+
+@(private)
+_span_save :: proc(r: ^Replicator, rm: ^Remote, durable := true) {
 	if rm.span_fd < 0 {
 		return
 	}
@@ -672,8 +744,9 @@ _span_save :: proc(r: ^Replicator, rm: ^Remote) {
 	prim.put_u64le(rec[24:], u64(rm.span.range_start))
 	copy(rec[32:64], rm.span.prev_head[:])
 	copy(rec[64:96], rm.span.head[:])
+	rec[96] = (SPAN_EMPTY if rm.empty_ok else 0) | (0 if rm.span_ok else SPAN_NONE)
 	prim.put_u64le(rec[112:], xxhash.XXH3_64_with_seed(rec[:112], SPAN_SEED))
-	if prim.write_at(r.vfs, rm.span_fd, rec[:], i64(rm.span_seq & 1) * SPAN_REC) == .None {
+	if prim.write_at(r.vfs, rm.span_fd, rec[:], i64(rm.span_seq & 1) * SPAN_REC) == .None && durable {
 		prim.datasync(r.vfs, rm.span_fd)
 	}
 }
@@ -682,7 +755,7 @@ _span_save :: proc(r: ^Replicator, rm: ^Remote) {
 _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 	pats := make([dynamic]Feed_Pattern, context.temp_allocator)
 	for id, rm in r.remotes {
-		if rm.follow && !rm.grouped {
+		if _following(rm) && !rm.grouped {
 			append(&pats, Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
 		}
 	}
@@ -896,10 +969,31 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	}
 	_pending_apply(r, rm)
 	rm.keys_wait = false
+	_kwait_release(r, rm)
 	_held_apply(r, rm)
 	if r.phase == .Ready {
 		_remote_pull(r, rm)
 		_remote_settle(r, rm)
 		_repl_flush(r)
 	}
+}
+
+@(private)
+_keys_same :: proc(existing: []u8, tree: ^Key_Tree, seal: ^[32]u8, id: Stream_Id, body: []u8) -> bool {
+	if seal == nil {
+		return string(existing) == string(body)
+	}
+	t: Key_Tree
+	if keys_record_open(&t, existing, seal, id, tree.version) != .None {
+		return false
+	}
+	defer keytree_destroy(&t)
+	a := make([dynamic]u8, context.temp_allocator)
+	b := make([dynamic]u8, context.temp_allocator)
+	defer crypto.zero_explicit(raw_data(a), len(a))
+	defer crypto.zero_explicit(raw_data(b), len(b))
+	if keytree_encode(&t, &a) != .None || keytree_encode(tree, &b) != .None {
+		return false
+	}
+	return string(a[:]) == string(b[:])
 }

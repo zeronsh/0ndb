@@ -32,6 +32,7 @@ Kv :: struct {
 	marked:    bool,
 	pending:   map[string]Kv_Pending,
 	order:     [dynamic]string,
+	groups:    [dynamic]Kv_Group,
 	buf:       [dynamic]u8,
 	probe:     [dynamic]u8,
 	out:       [dynamic]u8,
@@ -43,6 +44,13 @@ Kv :: struct {
 Kv_Pending :: struct {
 	value: []u8,
 	del:   bool,
+}
+
+@(private)
+Kv_Group :: struct {
+	mark:    u64,
+	pending: map[string]Kv_Pending,
+	order:   [dynamic]string,
 }
 
 @(private = "file")
@@ -111,6 +119,7 @@ kv_detach :: proc(kv: ^Kv) {
 	kv.log_fd = prim.INVALID_FD
 	kv.idx_fd = prim.INVALID_FD
 	kv_pending_clear(kv)
+	kv_groups_free(kv, &kv.groups, kv.allocator)
 	delete(kv.pending)
 	delete(kv.order)
 	delete(kv.buf)
@@ -136,7 +145,7 @@ kv_dirty :: proc "contextless" (kv: ^Kv) -> bool {
 }
 
 kv_get :: proc(kv: ^Kv, key: []u8, allocator := context.allocator) -> (value: []u8, found: bool, err: Error) {
-	if p, ok := kv.pending[string(key)]; ok {
+	if p, ok := kv_queued(kv, key); ok {
 		if p.del {
 			return nil, false, .None
 		}
@@ -237,9 +246,137 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 }
 
 kv_each :: proc(kv: ^Kv, data: rawptr, visit: proc(data: rawptr, key: []u8, value: []u8) -> bool) -> Error {
-	if len(kv.order) > 0 {
-		kv_commit(kv) or_return
+	if len(kv.groups) == 0 {
+		if len(kv.order) > 0 {
+			kv_commit(kv) or_return
+		}
+		return kv_each_committed(kv, data, visit)
 	}
+	seen := make(map[string]bool, 64, context.temp_allocator)
+	visit_one :: proc(seen: ^map[string]bool, k: string, p: Kv_Pending, data: rawptr, visit: proc(data: rawptr, key: []u8, value: []u8) -> bool) -> bool {
+		if k in seen {
+			return true
+		}
+		seen[k] = true
+		if p.del {
+			return true
+		}
+		return visit(data, transmute([]u8)k, p.value)
+	}
+	#reverse for k in kv.order {
+		if !visit_one(&seen, k, kv.pending[k], data, visit) {
+			return .None
+		}
+	}
+	#reverse for &g in kv.groups {
+		#reverse for k in g.order {
+			if !visit_one(&seen, k, g.pending[k], data, visit) {
+				return .None
+			}
+		}
+	}
+	Wrap :: struct {
+		seen:  ^map[string]bool,
+		data:  rawptr,
+		visit: proc(data: rawptr, key: []u8, value: []u8) -> bool,
+	}
+	wr := Wrap{&seen, data, visit}
+	return kv_each_committed(kv, &wr, proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		w := (^Wrap)(data)
+		if string(key) in w.seen {
+			return true
+		}
+		return w.visit(w.data, key, value)
+	})
+}
+
+@(private)
+kv_queued :: proc(kv: ^Kv, key: []u8) -> (p: Kv_Pending, ok: bool) {
+	if x, has := kv.pending[string(key)]; has {
+		return x, true
+	}
+	#reverse for &g in kv.groups {
+		if x, has := g.pending[string(key)]; has {
+			return x, true
+		}
+	}
+	return {}, false
+}
+
+kv_seal :: proc(kv: ^Kv, mark: u64) {
+	if len(kv.order) == 0 {
+		return
+	}
+	n := len(kv.groups)
+	if n > 0 && kv.groups[n - 1].mark == mark {
+		g := &kv.groups[n - 1]
+		for k in kv.order {
+			p := kv.pending[k]
+			if old, has := &g.pending[k]; has {
+				delete(old.value, kv.allocator)
+				old^ = p
+				delete(k, kv.allocator)
+			} else {
+				g.pending[k] = p
+				append(&g.order, k)
+			}
+		}
+		clear(&kv.pending)
+		clear(&kv.order)
+		return
+	}
+	append(&kv.groups, Kv_Group{mark, kv.pending, kv.order})
+	kv.pending = make(map[string]Kv_Pending, kv.allocator)
+	kv.order = make([dynamic]string, kv.allocator)
+}
+
+kv_commit_upto :: proc(kv: ^Kv, mark: u64) -> Error {
+	if len(kv.groups) == 0 || kv.groups[0].mark > mark {
+		return .None
+	}
+	cur_p, cur_o := kv.pending, kv.order
+	defer {
+		kv.pending, kv.order = cur_p, cur_o
+	}
+	for len(kv.groups) > 0 && kv.groups[0].mark <= mark {
+		kv.pending, kv.order = kv.groups[0].pending, kv.groups[0].order
+		if err := kv_commit(kv); err != .None {
+			kv.groups[0].pending, kv.groups[0].order = kv.pending, kv.order
+			return err
+		}
+		delete(kv.pending)
+		delete(kv.order)
+		ordered_remove(&kv.groups, 0)
+	}
+	return .None
+}
+
+kv_groups_take :: proc(kv: ^Kv) -> (groups: [dynamic]Kv_Group) {
+	groups = kv.groups
+	kv.groups = nil
+	return
+}
+
+kv_groups_give :: proc(kv: ^Kv, groups: [dynamic]Kv_Group) {
+	kv.groups = groups
+}
+
+kv_groups_free :: proc(kv: ^Kv, groups: ^[dynamic]Kv_Group, allocator: runtime.Allocator) {
+	for &g in groups {
+		for k in g.order {
+			p := g.pending[k]
+			delete(p.value, allocator)
+			delete(k, allocator)
+		}
+		delete(g.pending)
+		delete(g.order)
+	}
+	delete(groups^)
+	groups^ = nil
+}
+
+@(private = "file")
+kv_each_committed :: proc(kv: ^Kv, data: rawptr, visit: proc(data: rawptr, key: []u8, value: []u8) -> bool) -> Error {
 	off := u64(KV_LOG_HEADER)
 	for off < kv.log_end {
 		r := kv_read(kv, off, &kv.buf) or_return
@@ -296,7 +433,7 @@ kv_compact :: proc(kv: ^Kv) -> Error {
 		err: Error,
 	}
 	c := Copy{&n, .None}
-	kv_each(kv, &c, proc(data: rawptr, key: []u8, value: []u8) -> bool {
+	kv_each_committed(kv, &c, proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		c := (^Copy)(data)
 		c.err = kv_put(c.dst, key, value)
 		if c.err == .None && len(c.dst.order) >= 4096 {
@@ -314,11 +451,14 @@ kv_compact :: proc(kv: ^Kv) -> Error {
 	kv_detach(&n)
 	old_log := kv_path(kv, kv.gen, "log", context.temp_allocator)
 	old_idx := kv_path(kv, kv.gen, "idx", context.temp_allocator)
+	held := kv_groups_take(kv)
 	kv_detach(kv)
 	prim.remove(kv.vfs, old_log)
 	prim.remove(kv.vfs, old_idx)
 	kv.gen = n.gen
-	return kv_attach(kv)
+	err := kv_attach(kv)
+	kv_groups_give(kv, held)
+	return err
 }
 
 @(private = "file")

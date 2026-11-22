@@ -567,21 +567,55 @@ concurrent typing is never lost or reverted.
   - `.children` slots: before the first slot write after a sync the header is
     rewritten as dirty and synced; a clean header means the slots reflect
     exactly `covered`, a dirty one is rebuilt at open.
-  - fs history: the state kv commits atomically (each commit ends with a
-    marker record; recovery keeps whole commits only) and every commit
-    carries the own journal length as its stamp; `lv.idx` must cover exactly
-    the graph's lv range. At wake, a stamp past the recovered journal or an
-    `lv.idx` that is short is a rebuild (an `lv.idx` that is long is cut back
-    to the graph): derived keys are dropped, keys that no record carries
-    (sources, pins, blob versions, mount aliases and conflicts) are kept, and
-    the history replays its journal and streams. Replay applies a redacted
-    batch's replacement in its place, and pauses at an own batch whose
-    parents are remote until those arrive instead of dropping it.
+  - fs history: the state kv is written only after what it reflects is
+    durable. Each persist seals its writes into a group under the history's
+    current mark (a new mark once the engine has taken the previous one for
+    a batch); reads see the open writes, then the queued groups newest
+    first, then disk. When the batch carrying a mark completes, the groups
+    up to it are committed in order, each atomically (a marker record ends
+    every commit; recovery keeps whole commits only), after `lv.idx` is
+    synced. Groups outlive sleep, and a handle whose history awaits
+    durability is not closed, so a crash only ever leaves the kv behind its
+    journal, which replay closes. Every commit also carries the own journal
+    length as a stamp, and `lv.idx` must cover exactly the graph's lv range;
+    a stamp past the recovered journal, a short `lv.idx` or a corrupt state
+    still rebuilds at wake: derived keys are dropped, keys that no record
+    carries (sources, pins, blob versions, mount aliases and conflicts) are
+    kept, and the history replays its journal and streams. Replay applies a
+    redacted batch's replacement in its place, pauses at an own batch whose
+    parents are remote until those arrive (own sequence numbers in the
+    paused region stay reserved, so local writes meanwhile never reuse an
+    op id), and treats any other refusal of an own batch as corruption. A
+    rebuild keeps meaning: the graph's actor order is saved before the wipe
+    and interned first, so every persisted inode id and lv names the same
+    actor afterwards, and a rebuild epoch moves the search index's per-tree
+    lv source so the tree is reindexed.
   The simulator checks all of this after every engine open: registry facts
   against the own streams, and every map table, `.children` file and fs
   history against a rebuild of its sources cut at the positions it consumed. `SIM_PROMOTE`
   shrinks the promotion size so derived files are promoted.
-- Redaction punches holes in extents; the simulator substitutes its own disk
+- `pack.durable_size(path)` (engine wrapper `durable_len`) is the one answer
+  to "how much of this stream is on disk": the longest prefix guaranteed to
+  survive a crash. A container stream's write counts once its commit group
+  is durable, a promoted stream's once its file is fsynced, a truncate
+  counts at once; bookkeeping exists only for streams written since the
+  last durable group.
+- Nothing is published or announced beyond that length. The replicator
+  takes it from the store through `Replicator_Config.durable` on every
+  upload and every note, never from the writer, so no stream kind (own
+  segments, keys and keys-head, members, cards, checkpoint streams, promoted
+  objects) can put a non-durable byte on the wire, and a wire nonce (the
+  record offset) is never used for two different plaintexts after a crash.
+  The engine re-pumps waiting streams when a batch becomes durable, and
+  stages each tick's keys and keys-head records before the batch ends so
+  they are durable with the data they open and still reach the relay first.
+  The simulator checks it at every step (no byte handed to the relay beyond
+  the store's durable length) and after every restart (every stream recovers
+  at least what it sent).
+- Redaction punches holes in extents and erases every copy: stale extents of
+  the file, copies a defragmentation made and superseded within one write
+  (zeroed as garbage), and the garbage of deleted files, whose pending zeros a
+  redaction makes urgent. The simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
 - A small stream whose extent count passes 32 is defragmented by merging,
   repeatedly, the window of adjacent extents with the fewest bytes rewritten
@@ -1814,4 +1848,4 @@ The reference consumer, assembled from the default plug implementations:
 members | remove | rotate | recovery-key | pool | pair | join | status | ls |
 new | send | queue | steer | edit | switch | back | log | show | search |
 interrupt | models | agent | task | workspace | mount | schedule | blame |
-revert | land | share | redact | verify`.
+revert | land | share | redact | verify | quiesce`.

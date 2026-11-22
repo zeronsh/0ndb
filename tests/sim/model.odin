@@ -63,6 +63,8 @@ Op_Kind :: enum u8 {
 	Promote,
 	Read_Live,
 	Stream,
+	Run_Queue,
+	Quiesce,
 }
 
 M_Space :: struct {
@@ -397,6 +399,21 @@ op_presence :: proc(m: ^Model, n: ^Node, op: ^M_Op) -> Presence {
 			return .Absent
 		}
 		return .Present
+	case .Stream:
+		if obj.rid_none(op.rid) {
+			return .Unknown
+		}
+		msg, err := eng.convo_message(&n.e, o, convo.Position{msg = op.rid}, context.temp_allocator)
+		if err == .Missing || err == .Pending || err == .Busy {
+			return .Unknown
+		}
+		if err != .None || msg.author != op.actor || msg.role != .Assistant {
+			return .Absent
+		}
+		if msg.redacted || len(msg.blocks) == 0 {
+			return .Present
+		}
+		return .Present if strings.has_prefix(string(msg.blocks[0].text), op.token) else .Absent
 	case .Map_Set:
 		en, found, err := eng.map_get(&n.e, o, transmute([]u8)op.key, context.temp_allocator)
 		if err != .None {
@@ -430,7 +447,7 @@ model_after_restart :: proc(m: ^Model, n: ^Node) {
 	}
 	last_present := make(map[Per]int, context.temp_allocator)
 	for op in m.ops {
-		if op.node != n.idx || !(op.kind == .Send || op.kind == .Map_Set || op.kind == .Create) {
+		if op.node != n.idx || !(op.kind == .Send || op.kind == .Stream || op.kind == .Map_Set || op.kind == .Create) {
 			continue
 		}
 		if op.status == .Lost || op.status == .Failed || op.status == .Issued {
@@ -466,7 +483,7 @@ model_after_restart :: proc(m: ^Model, n: ^Node) {
 		}
 	}
 	for op in m.ops {
-		if op.node != n.idx || !(op.kind == .Send || op.kind == .Map_Set) {
+		if op.node != n.idx || !(op.kind == .Send || op.kind == .Stream || op.kind == .Map_Set) {
 			continue
 		}
 		if op.status == .Lost {

@@ -192,6 +192,8 @@ Stats :: struct {
 	warmups:       u64,
 	takeovers:     u64,
 	inexact:       u64,
+	quiesces:      u64,
+	quiesce_held:  u64,
 	timers:        int,
 }
 
@@ -272,6 +274,7 @@ Runtime :: struct {
 	leases:      [dynamic]Lease_Watch,
 	follows:     [dynamic]Follow,
 	revives:     [dynamic]Revive_Wait,
+	quiesce:     Quiesce_State,
 	lease_timer: prim.Timer,
 	lease_at:    i64,
 	prev_events: eng.Event_Hook,
@@ -473,6 +476,7 @@ close :: proc(r: ^Runtime) {
 	if r.lease_timer != 0 {
 		prim.timer_cancel(l, r.lease_timer)
 	}
+	_quiesce_destroy(r)
 	for w in r.leases {
 		if w.sub != 0 {
 			eng.unsubscribe(r.e, w.sub)
@@ -606,6 +610,9 @@ stats :: proc(r: ^Runtime) -> Stats {
 		n += 1
 	}
 	if r.lease_timer != 0 {
+		n += 1
+	}
+	if r.quiesce.timer != 0 {
 		n += 1
 	}
 	s.timers = n

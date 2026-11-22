@@ -21,6 +21,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		on_event     = _on_repl_event,
 		user         = sp,
 		keys         = _repl_keys,
+		durable      = _repl_durable,
 	}
 	creds_ok := false
 	if e.cfg.credentials.produce != nil {
@@ -245,6 +246,30 @@ _object_of_name :: proc(name: string) -> (id: prim.Id, kind: Kind, ok: bool) {
 }
 
 @(private)
+_keys_segment :: proc(name: string) -> (seg: string, ok: bool) {
+	if seg, ok = _keys_target(name); ok {
+		return
+	}
+	if len(name) > len(osync.KEYS_HEAD_STREAM) && name[:len(osync.KEYS_HEAD_STREAM)] == osync.KEYS_HEAD_STREAM {
+		return name[len(osync.KEYS_HEAD_STREAM):], true
+	}
+	return "", false
+}
+
+@(private)
+_pending_settle :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
+	sc := _object_scope(sp, id)
+	defer osync.scope_clear(&sc)
+	name := _seg_name(kind, id)
+	if t, ok := e.own_trees[osync.stream_id(&sc, e.self, name, 0)]; ok && _keys_unconfirmed(e, sp, &sc, name, t) {
+		return
+	}
+	if floor, ferr := osync.replicator_floor(&sp.repl, &sc, name, 0); ferr == .None {
+		_pending_clear(e, sp.id, id, floor)
+	}
+}
+
+@(private)
 _keys_target :: proc(name: string) -> (seg: string, ok: bool) {
 	if len(name) > len(osync.KEYS_STREAM) && name[:len(osync.KEYS_STREAM)] == osync.KEYS_STREAM {
 		return name[len(osync.KEYS_STREAM):], true
@@ -277,6 +302,14 @@ Need :: struct {
 	kind:   Need_Kind,
 	device: prim.Id,
 	name:   string,
+}
+
+@(private)
+_repl_durable :: proc(user: rawptr, path: string) -> (length: i64, ok: bool) {
+	sp := (^Space)(user)
+	context = context_for(sp.e)
+	n, err := durable_len(sp.e, path)
+	return n, err == .None
 }
 
 @(private)
@@ -395,9 +428,13 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_emit(e, Event{kind = .Disconnected, space = sp.id, err = _serr(ev.err)})
 	case .Uploaded:
 		_own_tree_uploaded(e, ev.stream, ev.length)
-		if id, _, ok := _object_of_name(ev.name); ok {
-			_pending_clear(e, sp.id, id, ev.length)
+		if id, kind, ok := _object_of_name(ev.name); ok {
+			_pending_settle(e, sp, id, kind)
 			_emit(e, Event{kind = .Uploaded, space = sp.id, object = id, length = ev.length})
+		} else if seg, kok := _keys_segment(ev.name); kok {
+			if kid, kkind, ook := _object_of_name(seg); ook {
+				_pending_settle(e, sp, kid, kkind)
+			}
 		}
 	case .Grew, .Present:
 		if ev.name == osync.MEMBERS_STREAM {
@@ -554,11 +591,21 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 	}
 	if found {
 		if i := _rec_member(&rec, device); i >= 0 {
-			if rec.members[i].keys_epoch >= epoch {
+			if rec.members[i].keys_epoch > epoch {
 				return
 			}
-			rec.members[i].keys_epoch = epoch
-			_rec_put(e, id, &rec)
+			if rec.members[i].keys_epoch == epoch {
+				esc := _object_scope(sp, id)
+				defer osync.scope_clear(&esc)
+				x, xok := sp.remote_trees[osync.stream_id(&esc, device, seg, 0)]
+				if !xok || x.loaded || x.epoch != epoch {
+					return
+				}
+				x.requested = false
+			} else {
+				rec.members[i].keys_epoch = epoch
+				_rec_put(e, id, &rec)
+			}
 		}
 	}
 	sc := _object_scope(sp, id)
@@ -584,7 +631,7 @@ _keys_needed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, seg: 
 	}
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
-	if rt, err := _remote_tree_get(e, sp, &sc, device, seg, epoch); err == .None && rt.loaded {
+	if rt, err := _remote_tree_get(e, sp, &sc, device, seg, epoch); err == .None && rt.loaded && !_tree_maybe_stale(sp, rt) {
 		osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
 	}
 }

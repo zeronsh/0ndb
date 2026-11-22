@@ -39,6 +39,7 @@ RUNTIME_OPS := []Op {
 	{139, "placement", {OBJ}, "Placement", op_placement},
 	{143, "runners", {SPACE, OBJ}, "Runners", op_runners},
 	{144, "subscribe.runners", {SPACE, OBJ}, "Runners", nil},
+	{151, "quiesce", {{"off", .Bool, nil}, {"lift_ms", .U64, nil}}, "accepted:bool reason:enum", op_quiesce},
 }
 
 @(private)
