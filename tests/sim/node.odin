@@ -500,9 +500,22 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 		}
 		rn.fs.worker.prep_data = rn
 	}
+	store := osync.file_store(&rn.fs)
+	if err == .None && rn.packed && w.cfg.seed % 4 == 0 {
+		prim.mkdir_all(vfs, RELAY_DIR + "/objects", 0o700)
+		rn.objs = osync.Dir_Object_Store{vfs = vfs, root = RELAY_DIR + "/objects"}
+		tc := osync.Tier_Config{objects = osync.dir_object_store(&rn.objs), window_ms = 500, hot = 4096}
+		if terr := osync.tier_store_init(&rn.ts, &rn.inst.loop, store, tc, node_clock(&rn.clock)); terr != .None {
+			err = terr
+		} else {
+			rn.tiered = true
+			store = osync.tier_store(&rn.ts)
+			osync.tier_store_sweep(&rn.ts, _relay_spaces(vfs))
+		}
+	}
 	if err == .None {
 		cc := osync.relay_core_config()
-		cc.storage = osync.file_store(&rn.fs)
+		cc.storage = store
 		cc.authorizer = eng.cap_authorizer(&rn.cauth)
 		cc.clock = node_clock(&rn.clock)
 		cc.wake = _relay_wake
@@ -527,6 +540,26 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	return true
 }
 
+@(private = "file")
+_relay_spaces :: proc(vfs: prim.Vfs) -> []osync.Space_Id {
+	ids := make([dynamic]osync.Space_Id, context.temp_allocator)
+	d: prim.Dir
+	if prim.dir_open(vfs, &d, RELAY_DIR + "/spaces", context.temp_allocator) != .None {
+		return nil
+	}
+	defer prim.dir_close(vfs, &d)
+	for {
+		e, more, derr := prim.dir_next(vfs, &d)
+		if !more || derr != .None {
+			break
+		}
+		if id, ok := prim.id_parse(e.name); ok {
+			append(&ids, osync.Space_Id(id))
+		}
+	}
+	return ids[:]
+}
+
 relay_kill :: proc(rn: ^Relay_Node) {
 	context = rn.w.ctx
 	conns_drop_relay(rn.w)
@@ -537,6 +570,12 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.fs = {}
 	rn.pk = {}
 	rn.packed = false
+	rn.w.stats.tier_evictions += rn.ts.evictions
+	rn.w.stats.tier_cold_reads += rn.ts.cold_reads
+	rn.w.stats.tier_thaws += rn.ts.thaws
+	rn.ts = {}
+	rn.objs = {}
+	rn.tiered = false
 	rn.wake = 0
 	rn.mauth = {}
 	rn.cauth = {}

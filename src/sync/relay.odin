@@ -34,6 +34,7 @@ Relay_Config :: struct {
 	objects:         Object_Store,
 	flush_ms:        i64,
 	flush_bytes:     i64,
+	hot:             i64,
 }
 
 Relay :: struct {
@@ -175,7 +176,7 @@ relay_init :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config, allocator := con
 		if aerr != nil {
 			return .No_Memory
 		}
-		if terr := tier_store_init(ts, l, store, Tier_Config{objects = cfg.objects, window_ms = cfg.flush_ms, max_bytes = cfg.flush_bytes}, cfg.clock, allocator); terr != .None {
+		if terr := tier_store_init(ts, l, store, Tier_Config{objects = cfg.objects, window_ms = cfg.flush_ms, max_bytes = cfg.flush_bytes, hot = cfg.hot}, cfg.clock, allocator); terr != .None {
 			free(ts, allocator)
 			return terr
 		}

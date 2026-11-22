@@ -62,7 +62,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 			fmt.println(hex_of(k[:]))
 			return 0
 		case:
-			return usage_error("usage: 0ndb relay [allow SPACE [QUOTA] | key] [--listen ADDR,...] [--dir DIR] [--open] [--quota BYTES] [--objects DIR [--flush-ms MS] [--flush-mb MB]]")
+			return usage_error("usage: 0ndb relay [allow SPACE [QUOTA] | key] [--listen ADDR,...] [--dir DIR] [--open] [--quota BYTES] [--objects DIR [--flush-ms MS] [--flush-mb MB] [--hot-kb KB]]")
 		}
 	}
 	m := new(Relay_Main)
@@ -118,6 +118,13 @@ cmd_relay :: proc(a: ^Args) -> int {
 			}
 			cfg.flush_bytes = n << 20
 		}
+		if v, vok := flag_value(a, "hot-kb"); vok {
+			n, nok := strconv.parse_i64(v)
+			if !nok {
+				return usage_error("--hot-kb takes a number of KiB, or -1 to keep everything in the pack")
+			}
+			cfg.hot = n << 10 if n > 0 else n
+		}
 	}
 	if ierr := osync.relay_init(&m.relay, &m.loop, cfg); ierr != .None {
 		if ierr == .Busy {
@@ -156,7 +163,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	fmt.printfln("relay key %s", hex_of(k[:]))
 	fmt.printfln("mode %s · kernel tls %v · storage pack in %s", "open" if cfg.open else "allow-list", cfg.kernel_tls, dir)
 	if cfg.objects.put != nil {
-		fmt.printfln("object store %s · one write per space per %d ms or %d MiB", m.objects.root, cfg.flush_ms if cfg.flush_ms > 0 else osync.TIER_WINDOW_DEFAULT, (cfg.flush_bytes if cfg.flush_bytes > 0 else osync.TIER_BYTES_DEFAULT) >> 20)
+		fmt.printfln("object store %s · one write per space per %d ms or %d MiB · pack keeps %d KiB per stream", m.objects.root, cfg.flush_ms if cfg.flush_ms > 0 else osync.TIER_WINDOW_DEFAULT, (cfg.flush_bytes if cfg.flush_bytes > 0 else osync.TIER_BYTES_DEFAULT) >> 20, (cfg.hot if cfg.hot > 0 else osync.TIER_HOT_DEFAULT) >> 10 if cfg.hot >= 0 else -1)
 	}
 	os.flush(os.stdout)
 	m.active = true
@@ -178,6 +185,9 @@ cmd_relay :: proc(a: ^Args) -> int {
 	signals_close(&m.sig)
 	prim.loop_destroy(&m.loop)
 	fmt.printfln("relay stopped (%d appends, %s in, %s out, %d object-store writes, %s)", st.appends, bytes_human(i64(st.bytes_in)), bytes_human(i64(st.bytes_out)), m.objects.puts, bytes_human(i64(m.objects.bytes)))
+	if m.objects.gets > 0 {
+		fmt.printfln("object-store reads %d (%s)", m.objects.gets, bytes_human(i64(m.objects.get_bytes)))
+	}
 	return 0
 }
 

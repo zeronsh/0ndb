@@ -824,7 +824,10 @@ whichever comes first. A per-space manifest in the pack records a `DIRTY`
 mark in the same group commit as the first change of a window and what each
 batch flushed, so a crash never loses an acknowledged change from the object
 tier (a dirty space is rescanned on start); a redaction rewrites the earlier
-batch objects that hold the range. Idle, nothing is armed.
+batch objects that hold the range. The pack then keeps only each stream's
+hot tail (`--hot-kb`, default 256 KiB): bytes already durable in the object
+store are punched out of it and read back with ranged GETs, which is
+invisible to clients except as latency. Idle, nothing is armed.
 
 ## 12. Conformance vectors
 
