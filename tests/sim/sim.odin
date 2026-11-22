@@ -201,6 +201,8 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		if !w.relay.alive {
 			relay_start(&w.relay)
 		}
+	case .Relay_Pack_Job:
+		relay_pack_job(&w.relay, ev.gen)
 	case .Watch:
 		watch_event(w, w.nodes[ev.node])
 	case .Pack_Job:
@@ -336,7 +338,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		world_destroy(w)
 		free(w, runtime.heap_allocator())
 	}
-	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v storage=%v durability=%v promote=%d relay_pack=%v relay_tier=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk, cfg.storage, cfg.durability, cfg.promote, seed % 2 == 0, seed % 4 == 0)
+	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v storage=%v durability=%v promote=%d relay_pack=%v relay_tier=%v relay_async=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk, cfg.storage, cfg.durability, cfg.promote, seed % 2 == 0, seed % 4 == 0, seed % 2 == 0 && seed % 3 != 0)
 	ok := relay_start(&w.relay)
 	for n in w.nodes {
 		ok = ok && node_start(n)
