@@ -39,13 +39,17 @@ text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: 
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	_hist_catch_up(e, h)
+	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
 	inode, found := _text_inode(h) or_return
 	if !found {
 		return nil, _pending_result(e, h, .Missing, ready)
 	}
 	f := _ferr2(fs.history_file(h.hist, inode)) or_return
-	return crdt.text_bytes(&f.text, allocator), .None
+	data = crdt.text_bytes(&f.text, allocator)
+	if blocked && ready.call != nil {
+		return data, _wait(e, h, ready)
+	}
+	return data, .None
 }
 
 text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (spans: []crdt.Author_Span, err: Error) {
@@ -54,15 +58,18 @@ text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	_hist_catch_up(e, h)
+	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
 	inode, found := _text_inode(h) or_return
 	if !found {
 		return nil, _pending_result(e, h, .Missing, ready)
 	}
 	f := _ferr2(fs.history_file(h.hist, inode)) or_return
-	out := crdt.text_spans(&f.text, &h.hist.g, allocator)
-	fs.history_present_spans(h.hist, out)
-	return out, .None
+	spans = crdt.text_spans(&f.text, &h.hist.g, allocator)
+	fs.history_present_spans(h.hist, spans)
+	if blocked && ready.call != nil {
+		return spans, _wait(e, h, ready)
+	}
+	return spans, .None
 }
 
 tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
@@ -71,17 +78,24 @@ tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	_hist_catch_up(e, h)
+	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
 	snap := fstree.current(&h.hist.tree)
 	id, ok, lerr := fstree.lookup(&snap, path)
 	if lerr != nil {
 		return nil, .Corrupt
 	}
 	if !ok {
+		if blocked && ready.call != nil {
+			return nil, _wait(e, h, ready)
+		}
 		return nil, .Not_Found
 	}
 	f := _ferr2(fs.history_file(h.hist, id)) or_return
-	return crdt.text_bytes(&f.text, allocator), .None
+	data = crdt.text_bytes(&f.text, allocator)
+	if blocked && ready.call != nil {
+		return data, _wait(e, h, ready)
+	}
+	return data, .None
 }
 
 tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}) -> (names: []string, err: Error) {
@@ -90,7 +104,7 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	_hist_catch_up(e, h)
+	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
 	snap := fstree.current(&h.hist.tree)
 	dir := fstree.ROOT
 	if len(path) > 0 && path != "/" {
@@ -99,6 +113,9 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 			return nil, .Corrupt
 		}
 		if !ok {
+			if blocked && ready.call != nil {
+				return nil, _wait(e, h, ready)
+			}
 			return nil, .Not_Found
 		}
 		dir = id
@@ -110,6 +127,9 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 	out := make([]string, len(kids), allocator)
 	for k, i in kids {
 		out[i] = _clone(k.name, allocator) or_return
+	}
+	if blocked && ready.call != nil {
+		return out, _wait(e, h, ready)
 	}
 	return out, .None
 }
@@ -418,7 +438,7 @@ _text_edit :: proc(e: ^Engine, h: ^Handle, pos: int, remove: int, insert: string
 }
 
 @(private)
-_hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
+_hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 	if h.kind != .Text && h.kind != .File_Tree {
 		return
 	}
@@ -470,6 +490,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 					continue
 				}
 				if rerr == .Missing {
+					blocked = true
 					r := [1]journal.Range{s.jr.missing}
 					if h.sp.repl_on {
 						osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
@@ -487,6 +508,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 				owned := make([]u8, len(body), context.temp_allocator)
 				copy(owned, body)
 				if _content_missing(e, h, s.device, owned) {
+					blocked = true
 					break
 				}
 				_, aerr := fs.history_admit(hist, s.device, pos, owned)
@@ -494,6 +516,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 					_hist_redact_own(e, h, owned)
 				}
 				if aerr == .Not_Found {
+					blocked = true
 					break
 				}
 				if aerr != .None {
@@ -509,6 +532,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 			break
 		}
 	}
+	return
 }
 
 @(private)
