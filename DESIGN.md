@@ -1331,24 +1331,36 @@ Relay cost tracks the reachable information, not the activity. Items marked
     (protocol v2 serves any existing object by id; negotiation `noop`,
     auto-gc and maintenance off, objects fsynced), so the device store, which
     is a bare repository, receives exactly the wanted blobs as one pack.
-    `Git_Credentials.env` adds environment for the child (an
-    `http.extraHeader` through `GIT_CONFIG_*`, `GIT_SSH_COMMAND`); without it
+    The `Git_Credentials` plug adds environment for the child (an
+    `http.extraHeader` through `GIT_CONFIG_*`, `GIT_SSH_COMMAND`), either
+    synchronously (`env`) or as a resumable request (`begin` with a
+    completion, `cancel` on shutdown; the fetch starts when it completes,
+    and a refused request starts it without extra environment); without it
     git uses the user's own credential helpers, and prompting is disabled.
     Whatever the remote did not return goes to the next URL, then the relay,
     then the object pipe.
   - *Rewrites.* Blobs that a rewrite made unreachable stay on their holders
     (the scope commit chain pins them) and are pulled through the object
     pipe on demand; with no holder online the read reports `Unavailable`.
-  - *Measured* (one loaded Linux host, loopback relay, local bare remote).
-    git/git (4876 files, 50.6 MB, two unpushed commits and four uncommitted
-    edits): the tree costs the relay 0.59 MB instead of 56.7 MB; a fresh
-    device with the writer offline materializes it in 6.7 s, 4752 blobs in
-    one pack from the remote and the edits from the relay. A small pushed
-    repository with two untracked 24 MiB binaries and a 30 MiB budget: the
-    relay stores 25.4 MB (one binary); an always-on device pulls the other
-    through the pipe in under 0.6 s; with the writer offline a fresh device
-    gets it from the always-on device; with every holder offline everything
-    but that file materializes and it arrives 3 ms after a holder returns.
+  - *Measured* (Linux, loopback relay, local bare remote; three devices
+    on one host, the writer stopped before the fresh device starts).
+    git/git (4876 files, 62 MB, two unpushed commits and four uncommitted
+    edits): the relay holds 2.85 MB instead of 108.5 MB; a fresh device with the writer offline
+    materializes it in 3.4 s, about 4750 blobs in one 13 MB pack from the
+    remote and the edits from the relay (2.9 s from the relay alone without
+    deduplication). A GitHub checkout (75 files, one uncommitted edit, https
+    remote, no credentials): the relay holds 104 KB and a fresh device with
+    the writer offline materializes it in 0.43 s from github.com. A small
+    pushed repository with two untracked 24 MiB binaries and a 30 MiB
+    budget: the relay stores 25.5 MB (one binary); an idle always-on device
+    (no mount, the tree never opened) holds the other 0.26 s after it signs
+    in, pulled through the pipe; with the writer offline a fresh device
+    materializes everything, that binary from the always-on device, in
+    0.45 s; with every holder offline everything but that file materializes
+    and it arrives 0.23 s after the always-on device's daemon starts again.
+    The git/git and GitHub fresh-device trees are byte-identical to the
+    writer's checkout, CRLF (`eol=crlf`) files and the uninitialized
+    submodule's empty directory included.
 - **Storage classes and modes.** Each object has a class: `stored` (segments
   on the relay) or `device` (the relay keeps only segment lengths). The class
   is the catalog field `storage` (tag 12: 1 device, 2 stored, absent: policy),
@@ -1381,13 +1393,31 @@ Relay cost tracks the reachable information, not the activity. Items marked
   so concurrent devices can overshoot by at most one blob each. Over-budget
   blobs stay on their devices and are served by the object pipe.
   Devices with `Config.always_on` advertise themselves in the same map, and
-  every reader adds them to a blob's holders; an always-on device fetches
-  the large content of every tree it follows, so it holds a copy once it has
-  read the records. Records are admitted without their opaque blobs:
+  every reader adds them to a blob's holders. A writer that keeps a blob off
+  the relay for the budget records it in the space map `0ndb:held` (key: the
+  blob id; tag 1 the tree, tag 2 the size). An always-on device follows that
+  map's segments in every space it belongs to, without opening the trees,
+  and whenever it grows (and on connect) pulls each listed blob it lacks
+  through the usual content path (relay, remote, then the pipe), up to
+  `Config.holder_budget` bytes (default 8 GiB, negative: no limit); arrivals
+  are registered for serving. Nothing polls: the work runs on the map's
+  growth and on reconnects. Records are admitted without their opaque blobs:
   materialization skips exactly those files (they are recorded as *absent*
   in the mount state and retried when content arrives, before any disk
   change, so a skipped move never leaves a path the shadow does not know),
   and only those files wait.
+- **Checkout form.** A writer mounted in a git checkout records file
+  contents in git's clean form (attributes, `core.autocrlf`, filters) and
+  marks each such file with the fstree flag `Git_Clean` (bit 3), setting it
+  on files it creates and on files it rewrites that lack it. Any mount
+  applies the checkout conversions to flagged files when it materializes
+  them and the clean conversions when it ingests them, with the tree's
+  `.gitattributes` and the device's own git configuration, even when its
+  directory is not a git checkout, so a fresh device writes the same bytes
+  as `git checkout` there; unflagged files are written as stored. A gitlink
+  in the writer's index is recorded as an empty directory that ingest never
+  descends into, which is what `git checkout` leaves for a submodule that is
+  not initialized.
 - **Object pipe.** A content get that the relay answers `Missing` becomes a
   pull from the blob's holders: the tree's participants and the always-on
   devices, filtered by presence. It uses the existing `Pull`/`Serve` frames
