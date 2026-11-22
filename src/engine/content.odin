@@ -207,6 +207,9 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 			_, size, herr := odb.read_header(db, ref.oid)
 			if herr != .None || !_budget_take(e, h.sp, size) {
 				e.stats.over_budget += 1
+				if herr == .None {
+					_held_note(e, h, ref, size)
+				}
 				append(&held, ref)
 				continue
 			}
@@ -522,6 +525,9 @@ _content_data_arrived :: proc(e: ^Engine, object: prim.Id) {
 		sp := e.spaces[sid]
 		if sp.open && object == named_id(sp.id, HOLDERS_NAME) {
 			_content_holders_changed(e, sp)
+		}
+		if sp.open && object == named_id(sp.id, HELD_NAME) {
+			_held_scan(e, sp)
 		}
 	}
 	for _, w in e.content.waits {
