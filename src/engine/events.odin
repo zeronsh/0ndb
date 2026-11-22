@@ -49,6 +49,7 @@ Delta :: struct {
 	tag:    u32,
 	removed: bool,
 	length: i64,
+	draft:  bool,
 }
 
 Sub_Id :: distinct u64
@@ -73,6 +74,7 @@ Sub :: struct {
 	status:     convo.Status,
 	has_status: bool,
 	primed:     bool,
+	drafts:     [dynamic]Sub_Draft,
 }
 
 subscribe :: proc(e: ^Engine, o: Object, kind: Kind, cb: Sub_Proc, data: rawptr) -> (id: Sub_Id, err: Error) {
@@ -90,6 +92,7 @@ subscribe :: proc(e: ^Engine, o: Object, kind: Kind, cb: Sub_Proc, data: rawptr)
 	s.cb = cb
 	s.data = data
 	s.cursors = make([dynamic]Sub_Cursor, e.allocator)
+	s.drafts = make([dynamic]Sub_Draft, e.allocator)
 	_sub_prime(e, s, h)
 	append(&e.subs, s)
 	return s.id, .None
@@ -110,6 +113,7 @@ unsubscribe :: proc(e: ^Engine, id: Sub_Id) {
 		ordered_remove(&e.subs, i)
 		if !_subscribed(e, s.object.id) && !s.catalog {
 			if h, err := _handle_get(e, s.object, s.kind); err == .None && h.sp.repl_on && h.kind == .Conversation {
+				_draft_live(e, h, false)
 				if h.grouped && !h.own {
 					osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
 					h.grouped = false
@@ -141,6 +145,7 @@ _subscribed :: proc(e: ^Engine, id: prim.Id) -> bool {
 @(private)
 _sub_free :: proc(e: ^Engine, s: ^Sub) {
 	delete(s.cursors)
+	delete(s.drafts)
 	free(s, e.allocator)
 }
 
@@ -178,6 +183,8 @@ _sub_prime :: proc(e: ^Engine, s: ^Sub, h: ^Handle) {
 			s.status = t.status
 			s.has_status = true
 		}
+		_sub_drafts_prime(e, s, h)
+		_draft_live(e, h, true)
 	}
 	s.primed = true
 }
@@ -260,6 +267,9 @@ _sub_collect :: proc(e: ^Engine, s: ^Sub, kinds: Change_Kinds, out: ^[dynamic]De
 				append(out, Delta{kind = .Members, object = s.object, by = sg.device})
 			}
 		}
+		if h.kind == .Conversation {
+			_draft_live(e, h, true)
+		}
 	}
 	if .Quarantined in kinds {
 		append(out, Delta{kind = .Quarantined, object = s.object})
@@ -269,6 +279,10 @@ _sub_collect :: proc(e: ^Engine, s: ^Sub, kinds: Change_Kinds, out: ^[dynamic]De
 	}
 	switch h.kind {
 	case .Conversation, .Map:
+		if h.kind == .Conversation {
+			_draft_live(e, h, true)
+			_drafts_prune(e, h)
+		}
 		if r := _own_reader(h); r != nil {
 			if _sub_cursor(s, e.self) == nil {
 				append(&s.cursors, Sub_Cursor{e.self, 0})
@@ -281,6 +295,7 @@ _sub_collect :: proc(e: ^Engine, s: ^Sub, kinds: Change_Kinds, out: ^[dynamic]De
 			}
 		}
 		if h.kind == .Conversation {
+			_sub_drafts(e, s, h, out)
 			if t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator); terr == .None {
 				if !s.has_status || t.status != s.status {
 					if head, herr := convo.tail_head(&h.view, &t); herr == .None {
@@ -391,7 +406,7 @@ _rid_or_missing :: proc(v: ^obj.View, x: obj.Vref) -> (Rid, obj.Error) {
 
 @(private)
 _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, at: i64, body: []u8, local: bool, out: ^[dynamic]Delta) -> obj.Error {
-	rec, err := convo.decode_record(body, at, context.temp_allocator)
+	rec, err := convo.decode_record(_tmp_bytes(body), at, context.temp_allocator)
 	if err != .None {
 		return .None
 	}
@@ -408,10 +423,11 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 		d.index = b.index
 		d.block = b.kind
 		d.text = _tmp_bytes(b.data)
-		if .Start in b.flags {
-			d.kind = .Block
-		} else {
-			d.kind = .Chunk
+		d.kind = .Block if .Start in b.flags else .Chunk
+		if !_sub_block_delta(e, s, h, &d, device, b.msg, .Start in b.flags) {
+			return .None
+		}
+		if d.kind == .Chunk {
 			if n := len(out); n > 0 {
 				p := &out[n - 1]
 				if (p.kind == .Chunk || p.kind == .Block) && p.msg == d.msg && p.index == d.index {
@@ -427,6 +443,8 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 	case convo.Seal:
 		d.kind = .Seal
 		d.msg = _rid_or_missing(&h.view, obj.Vref{vs, b.msg}) or_return
+		_sub_drafts_forget(s, device, b.msg)
+		_draft_closed(h, device, b.msg)
 		d.seal = b.status
 		d.usage = b.usage
 		d.hlc = b.hlc
@@ -475,6 +493,8 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 	case convo.Interrupted:
 		d.kind = .Seal
 		d.msg = _rid_or_missing(&h.view, obj.Vref{vs, b.msg}) or_return
+		_sub_drafts_forget(s, device, b.msg)
+		_draft_closed(h, device, b.msg)
 		d.seal = .Interrupted
 	case convo.Revived:
 		d.kind = .Run

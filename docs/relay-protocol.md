@@ -421,8 +421,8 @@ offset. The relay then sends one `Length` for the accepted entries and pushes
 `Data` (without `FINAL`) from each offset as bytes become durable, round
 robin across segments in chunks of at most 4 MiB. With the watch flag the
 connection also receives `Created` for every new segment it can read.
-`Unfollow` stops pushes and ends live interest (section 8.16) in each id; it
-has no reply. A count that does not match the payload is `Error Protocol`.
+`Unfollow` stops pushes; it has no reply and leaves live interest (section
+8.16) alone. A count that does not match the payload is `Error Protocol`.
 A Follow with the LIVE flag (feature bit 3) is handled entirely by section
 8.16 and reads no storage.
 
@@ -681,7 +681,7 @@ end (sign-in approvals and cross-device search use it).
 ### 8.16 Live drafts: Live (0x17), Lived (0x9b), feature bit 3
 
 ```
-Follow (LIVE) := 2 | count u16 (<= 1024) | (id | offset u64)*     offset ignored
+Follow (LIVE) := 2 | count u16 (<= 1024) | (id | offset u64)*     offset 2^64 - 1 removes
 Live          := id | msg u64 | at u64 | bytes (<= 256 KiB)       (bulk)
 Lived         := id | msg u64 | at u64 | bytes                    (bulk)
 ```
@@ -690,11 +690,15 @@ A draft is the live preview of a message that a segment's writer is still
 streaming. It is never stored: the relay forwards it, keeps no copy, writes
 nothing, appends no feed entry and acknowledges nothing.
 
-- `Follow` with flag LIVE registers *live interest* in each id: `Read`
-  access, else `Refused Not_Owner`; the follow limit counts live interests
-  together with follows, else `Refused Limit`. A repeated id is registered
-  once. There is no `Length` reply and no storage read; the watch flag is
-  ignored. Live interest ends with `Unfollow` or when the connection closes.
+- `Follow` with flag LIVE registers *live interest* in each id whose offset
+  is not `2^64 - 1`: `Read` access, else `Refused Not_Owner`; the follow
+  limit counts live interests together with follows, else `Refused Limit`.
+  A repeated id is registered once. An entry with offset `2^64 - 1` removes
+  the live interest instead. There is no `Length` reply and no storage
+  read; the watch flag is ignored. Live interest ends only through such an
+  entry or when the connection closes: `Unfollow` concerns read follows,
+  which a client manages independently (a reader's replicator unfollows a
+  segment it no longer reads while a live view of it stays open).
 - `Live` needs `Append` access on `id` (the writer's own segment), else the
   content is consumed and the answer is `Refused Not_Owner`. `msg` and `at`
   must be below `2^62`, else `Error Protocol`. The relay sends `Lived` with
@@ -843,7 +847,7 @@ storage completion as an input, which every sans-IO relay does.
 | malformed | oversize control frame, unknown kind, relay kind from a client, short payload, count mismatches, inverted Redact, short bulk header, NONE with bytes, oversize Direct, second Hello, Note beyond 2^62; bytes after the Error ignored; Read with to < from |
 | compaction | feed folding with a redaction, followers jumping to the new end, a late reader starting at the new start, Listing after compaction |
 | limits | per-principal connection limit, per-connection follow limit |
-| live | LIVE follows without Length or storage, Live forwarded unstored to live followers only, a repeated id registered once, Refused for a non-owner, Unfollow, draft pulls answered through the pipe and with NONE, live interest dropped on close, Error for `msg >= 2^62` |
+| live | LIVE follows without Length or storage, Live forwarded unstored to live followers only, a repeated id registered once, Refused for a non-owner, Unfollow leaving live interest, removal by a LIVE entry with offset 2^64 - 1, draft pulls answered through the pipe and with NONE, live interest dropped on close, Error for `msg >= 2^62` |
 
 ## 13. Extensions
 
@@ -887,3 +891,7 @@ wasm, and fixed in the reference core:
   draft pulls, so streaming text reaches other devices without the relay
   storing a byte of it. `Pull` previously rejected any `from` above
   `2^63 - 1`; with bit 3 it accepts draft pulls. Welcome `features` is 15.
+  Live interest first ended with `Unfollow`; a reader's replicator unfollows
+  segments it stops reading while its live view stays open, which silently
+  cut readers off, so removal is now an explicit LIVE entry with offset
+  `2^64 - 1`.

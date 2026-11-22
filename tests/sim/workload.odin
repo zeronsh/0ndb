@@ -250,6 +250,7 @@ workload_step :: proc(w: ^World) {
 		3,
 		3 if w.cfg.storage == .Device_Until_Run else 0,
 		6,
+		5,
 	}
 	#assert(len(weights) == len(Op_Kind))
 	for k in w.cfg.disabled {
@@ -283,6 +284,10 @@ workload_step :: proc(w: ^World) {
 		op_promote(w, n)
 	case .Read_Live:
 		op_live_read(w, n)
+	case .Stream:
+		if oi := _pick_obj(w, n, .Convo); oi >= 0 {
+			op_stream(w, n, oi)
+		}
 	}
 	node_after(n)
 }
@@ -498,7 +503,7 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.convo_unmount(&n.e, o, op.key, op_done_handle(op))
 		op_result(op, n, err)
 	case .Redact_Msg:
-		t := _known_msg(w, n, oi)
+		t := _pick_op(m, &w.rng, oi, {.Send, .Stream}, true)
 		if t == nil || t.status == .Uncertain {
 			return
 		}
@@ -509,7 +514,7 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
 		world_note(w, "%s redact message %s -> %v", n.name, t.token, err)
 		op_result(op, n, err)
-	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
+	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream:
 	}
 }
 
@@ -592,7 +597,7 @@ _op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.map_redact(&n.e, o, transmute([]u8)t.key)
 		world_note(w, "%s redact map key %s -> %v", n.name, t.key, err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream:
 	}
 }
 
@@ -649,7 +654,7 @@ _op_text :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.text_edit(&n.e, o, t.pos, len(t.text), "", op_done_handle(op))
 		world_note(w, "%s text %s delete %s at %d of %q -> %v", n.name, id_short(o.id), t.text, t.pos, string(data), err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream:
 	}
 }
 
@@ -716,7 +721,7 @@ _op_tree :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.tree_remove(&n.e, o, path)
 		world_note(w, "%s tree_remove %s/%s saw %v -> %v", n.name, id_short(o.id), path, op.deletes[:], err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream:
 	}
 }
 

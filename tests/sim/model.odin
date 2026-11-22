@@ -62,6 +62,7 @@ Op_Kind :: enum u8 {
 	Search_Peer,
 	Promote,
 	Read_Live,
+	Stream,
 }
 
 M_Space :: struct {

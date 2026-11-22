@@ -555,3 +555,26 @@ _ggm :: proc(seed: ^[32]u8) -> (left, right: [32]u8) {
 	crypto.zero_explicit(&out, size_of(out))
 	return
 }
+
+draft_key :: proc(keys: journal.Key_Provider, msg: i64) -> (key: journal.Key, ok: bool) {
+	if keys.key == nil || msg <= 0 {
+		return
+	}
+	base: journal.Key
+	if !keys.key(keys.data, (msg >> 4 + 1) << 4, &base) {
+		return
+	}
+	defer crypto.zero_explicit(&base, size_of(base))
+	m: [8]u8
+	prim.put_u64le(m[:], u64(msg))
+	_derive(base[:], "0ndb draft key", m[:], key[:])
+	return key, true
+}
+
+draft_puncture :: proc(t: ^Key_Tree, msg: i64) -> Error {
+	if msg <= 0 {
+		return .Invalid
+	}
+	cell := u64((msg >> 4 + 1) << 4) >> t.shift
+	return keytree_puncture_cells(t, cell, cell)
+}

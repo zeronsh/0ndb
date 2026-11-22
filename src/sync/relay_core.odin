@@ -1514,7 +1514,6 @@ _on_unfollow :: proc(c: ^Conn, rd: ^prim.Reader) {
 	}
 	for _ in 0 ..< count {
 		id := Stream_Id(get_id32(rd))
-		_live_unfollow(c, id)
 		for i := 0; i < len(c.subs); i += 1 {
 			st := c.subs[i].stream
 			if st.id == id {

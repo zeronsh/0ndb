@@ -1,7 +1,7 @@
 {
   "format": "0ndb relay vectors 1",
   "name": "live",
-  "summary": "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow, draft pulls through the peer pipe, malformed Live.",
+  "summary": "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow leaving live interest, LIVE removal, draft pulls through the peer pipe, malformed Live.",
   "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
   "steps": [
     {"step": "connect", "conn": "alice", "local": false, "binding": "b1fa710aa2a09775cd76b02f8eeafb272113b72286d0b923dbdc29c2892d9939f40f70a50b1b37825aad4f0b3a3e746214e6a000b103f023869da841b7d63535",
@@ -66,7 +66,19 @@
          {"kind": "Refused", "frame": "210000008c05ccf77c94730e0988a300194c0f42357904040404040404040404040404040404"}]},
      "closed": [],
      "store": []},
-    {"step": "send", "conn": "bob", "bytes": "22000000070100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404", "comment": "Unfollow ends live interest",
+    {"step": "send", "conn": "bob", "bytes": "22000000070100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404", "comment": "Unfollow ends read follows only: live interest stays",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "5100000017ccf77c94730e0988a300194c0f4235790404040404040404040404040404040460000000000000000000000000000000090000007da218745d551aa1f7f9a2d068755abf6472616674206f6e6509000000", "comment": "bob and carol still receive it",
+     "out": {
+       "bob": [
+         {"kind": "Lived", "frame": "510000009bccf77c94730e0988a300194c0f4235790404040404040404040404040404040460000000000000000000000000000000090000007da218745d551aa1f7f9a2d068755abf6472616674206f6e6509000000"}],
+       "carol": [
+         {"kind": "Lived", "frame": "510000009bccf77c94730e0988a300194c0f4235790404040404040404040404040404040460000000000000000000000000000000090000007da218745d551aa1f7f9a2d068755abf6472616674206f6e6509000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404ffffffffffffffff", "comment": "a LIVE Follow entry with offset 2^64 - 1 ends live interest",
      "out": {},
      "closed": [],
      "store": []},

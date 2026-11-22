@@ -130,7 +130,7 @@ client_live :: proc(c: ^Client, id: Stream_Id, msg, at: i64, data: []u8) -> Erro
 	return .None
 }
 
-client_follow_live :: proc(c: ^Client, ids: []Stream_Id) -> Error {
+client_follow_live :: proc(c: ^Client, ids: []Stream_Id, on := true) -> Error {
 	rest := ids
 	for len(rest) > 0 {
 		n := min(len(rest), FOLLOW_BATCH)
@@ -141,7 +141,7 @@ client_follow_live :: proc(c: ^Client, ids: []Stream_Id) -> Error {
 		prim.write_u16le(&w, u16(n))
 		for id in rest[:n] {
 			put_id(&w, cast([32]u8)id)
-			prim.write_u64le(&w, 0)
+			prim.write_u64le(&w, 0 if on else FOLLOW_END)
 		}
 		frame_end(b, start, &w) or_return
 		rest = rest[n:]

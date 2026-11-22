@@ -187,7 +187,10 @@ nothing changes; there is no heartbeat on local sockets.
 field, element, counter, catalog, text, files, redacted, members,
 quarantined), `object`, `rid` (the record), `msg`, `record`, `by`, `local`,
 `hlc`, `role`, `index`, `block`, `seal`, `status`, `usage`, `text`, `key`,
-`tag`, `removed`, `length`.
+`tag`, `removed`, `length`, and in JSON `draft: true` on `block` and `chunk`
+deltas whose text came from a live draft rather than the segment (no `rid`).
+Each byte of a block is delivered once, whichever source brings it first; the
+sealed block holds exactly the concatenated text.
 
 Compact deltas (flags bit 1, JSON only): fields equal to their zero value
 (0, false, empty, null, the first enum name) are omitted, and `object` is

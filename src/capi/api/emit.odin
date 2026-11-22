@@ -323,6 +323,9 @@ emit_delta :: proc(o: ^Out, d: ^eng.Delta) {
 	o_u64(o, "tag", u64(d.tag))
 	o_bool(o, "removed", d.removed)
 	o_i64(o, "length", d.length)
+	if o.json && d.draft {
+		o_bool(o, "draft", true)
+	}
 	o_end(o)
 }
 

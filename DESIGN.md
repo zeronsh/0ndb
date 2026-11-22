@@ -1399,28 +1399,116 @@ Relay cost tracks the reachable information, not the activity. Items marked
   records never are. Dictionaries are therefore not used for relay records;
   cross-record redundancy is captured by segment archives instead, whose
   redaction is exact (below).
-- **Live drafts** (planned). Streaming text never enters a segment as
-  chunks. While a block streams, its text is appended to the writer's draft
-  stream `draft/<segment>` epoch `e` (`Draft{msg, block index, offset in
-  block, bytes}`), committed per tick like any journal, uploaded and
-  followed live by viewers exactly as segments are, so other devices see
-  the same latency as today. The segment receives the finished Block
-  records at block end and the Seal at message end. When the writer has no
-  open block it drops draft epoch `e` from the relay (`client_drop`, as key
-  stream epochs already do) and the next stream opens `e + 1`. Proof
-  obligations: (1) no durable record ever holds a Ref into a draft (Blocks
-  chain only to the message and to earlier Blocks of the segment), so
-  dropping a draft epoch invalidates nothing reachable; (2) offsets stay
-  identical because drafts are an ordinary stream and segments only ever
-  receive appends; (3) nothing is lost on a crash: every byte a viewer saw
-  was durable in the draft first, and recovery (`Interrupted`) appends each
-  unsealed message's draft text as its final Blocks before sealing it, so
-  the segment ends with exactly what was streamed; (4) redaction of an open
-  message zero-fills its draft records as well as its segment records. Cost:
-  the relay holds only the drafts of currently open blocks; the segment
-  gets one Block per block and one signature per commit instead of a chunk
-  and a signature every 50 ms (about 300 B of framing and signature per
-  tick today, 6 KB per second of streaming).
+- **Live drafts.** Streaming text never enters a segment as chunks and the
+  relay never stores a byte of it. A draft is the live preview of a message
+  its writer is still streaming. The sealed Blocks in the conversation
+  segment are the only durable copy.
+  - *Writer.* `convo.Writer` keeps one local draft journal per segment
+    (`<segment>.draft`, a pack stream, in the journal record format). Every
+    group commit appends the open block's new bytes as a
+    `Draft{msg, prev, block index, offset in block, start meta, bytes}`
+    record, where `prev` is the offset of the message's previous draft
+    record. The segment commits first and the draft commits second, in the
+    same tick, so a draft record is never durable before its Msg record. A
+    block's text reaches the segment only at block end (the next block,
+    flush or seal) as ordinary Block records, plus a 16 KiB `CHUNK_MAX`
+    overflow that bounds the writer's buffer. Any other record the writer
+    appends mid-block first flushes the block. Once the batch is durable,
+    the engine reads the new draft records, seals each one end to end
+    (ChaCha20-Poly1305, nonce = draft offset) under the message's draft key
+    and sends `Live(segment id, msg, at, records)` (relay protocol 8.15).
+    It sends only durable bytes. Once a seal or `Interrupted` is durable,
+    its message leaves the draft. When no live message remains, the draft
+    journal is removed and its generation bumped (pack zero-fills a
+    destroyed stream's extents).
+  - *Relay.* `Live` is forwarded at once as `Lived` to every connection
+    with live interest in that segment (`Follow` with the LIVE flag), and
+    nothing else happens: no storage, no feed entry, no acknowledgement, no
+    fsync. Streaming therefore costs the relay zero stored bytes, and the
+    relay's group commit leaves the token path. A token used to reach a
+    reader after the writer's tick commit, the relay fsync, a feed
+    `Announce`, the reader's `Read` and `Data`. Now it arrives after the
+    writer's tick commit plus one forward.
+  - *Readers.* A subscribed conversation live-follows every other
+    participant's segment. Incoming records are opened with the draft key
+    and must chain by `prev`. A reader that joins mid-stream, reconnects,
+    restarts, or sees a gap (an unknown key, or a `Lived` the relay skipped
+    under backpressure) fetches the missing records with a draft pull: a
+    `Pull` whose `from` is `DRAFT | msg`, answered by the writer over the
+    peer pipe from its draft journal. The answer starts at the first record
+    of the block still open and contains only durable bytes. Drafts live
+    only in reader memory, as `Draft_View` per open message and capped at
+    4 MiB. A reader never writes a draft to disk. Subscription deltas merge
+    segment and draft text per block: a block's text is the contiguous
+    union of prefixes from both sources, and each byte is delivered once
+    whichever source brings it first. A view is dropped when the segment
+    shows the message closed (seal, `Interrupted`, or revival declined),
+    or when its draft key stops deriving (redaction).
+  - *Draft key.* `draft_key(msg) = HKDF(K(c), "0ndb draft key" ‖ u64 msg)`,
+    where `K` is the segment's key provider (the writer's GGM key tree, or
+    the stream key) and `c = (msg >> 4 + 1) << 4` is the cell right after
+    the one where the Msg record starts. Proof that it never collides with
+    a real record's key:
+    1. A record's key is `K` of the cell that holds its start offset.
+    2. The writer drafts a message only if its Msg record is at least
+       `DRAFT_MSG_MIN` = 32 bytes long (otherwise the message streams the
+       old way, as chunks in the segment). The record therefore covers
+       `[msg, msg + 32)`, which includes all of cell `c`, since `c ≤ msg + 16`
+       and `c + 16 ≤ msg + 32`.
+    3. So no record starts in cell `c`, and `K(c)` is never used directly.
+    4. `draft_key` is HKDF of `K(c)` with a label no record key uses, and
+       distinct messages have distinct cells `c`.
+
+    Within one message the draft nonce is the draft offset, unique because
+    the draft journal is append-only and only durable records are ever
+    sealed. A reset journal restarts offsets only after every message in it
+    has closed, and a closed message never streams again. So no (key,
+    nonce) pair ever carries two plaintexts. The simulator's cipher watch
+    taps `Live`, `Lived` and draft `Serve`/`Served` frames as their own
+    channel per (segment, msg) and reports any reuse.
+  - *Redaction.* Redacting a message flushes any open block into the
+    segment (so the redaction covers it), zero-fills the message's draft
+    records, punctures cell `c` in the writer's tree and republishes the
+    tree. Every captured draft ciphertext of that message, on any wire, is
+    then undecryptable everywhere, exactly like its Blocks. A reader drops
+    its view when the redaction arrives or its draft key stops deriving.
+    The relay never held the draft, so nothing is redacted there.
+  - *What a draft promises.* Every byte a reader sees in a draft was
+    durable in the writer's draft journal before it was sent, and its Msg
+    record was durable in the segment. The sealed block is a function of
+    the segment alone: Blocks chain only to their message and earlier
+    Blocks, and no segment record refers to a draft offset. So a lost,
+    dropped or never-seen draft changes nothing durable, and readers that
+    saw draft text converge on the sealed block because both are prefixes
+    of one buffer. A draft is a preview, not a durable record. If the
+    writer's disk is destroyed mid-stream, its preview is gone, and with it
+    the only device that could have sealed the message.
+  - *Writer crash.* `writer_open` replays the draft journal. Each still-open
+    message's draft text beyond what its Blocks hold is appended as final
+    Blocks before anything else is written. Recovery's `Interrupted` (and
+    the revival's new reply, which reads this transcript; the provider's
+    raw lines stay local and resume its native session) therefore ends with
+    exactly the text readers saw. A reader of a writer that died keeps its
+    preview, with no timer and no pending read, until the segment shows
+    `Interrupted` or the revived run's seal. It never waits on a draft:
+    pulls to an absent writer are answered `Unserved` at once.
+  - *Measured* (reference relay on loopback, two daemons on one Linux host,
+    `0ndb log --follow` on the reading device). A scripted Claude stream-json
+    provider sends 40 text deltas per second, about 470 B/s of text. Before,
+    with chunks in the segment, the relay's stored bytes grew 12.0 KB per
+    streaming second (180 KB for a 15 s turn) and its disk 85 KB per second.
+    With drafts the turn costs a constant 10.2 KB (the user message, the
+    final compressed Block, the seal, signatures and catalog) at 15 s,
+    11.2 KB at 30 s and 17.8 KB at 60 s. The only growth is the final text
+    itself, compressed, as 16 KiB overflow Blocks: about 0.17 KB per
+    streaming second and no framing. End-to-end token latency from the
+    provider line on the writer to the reader's delta: p50 12.5 ms and p90
+    15.5 ms before, 3.7 ms and 5.1 ms after; p50 4.4 ms over a 60 s
+    stream. With real Claude (haiku, a 350-word answer), cross-device
+    latency (the same byte offset on the writer's and the reader's
+    subscriptions): p50 10.6 ms and p90 17.2 ms before, 2.6 ms and 6.0 ms
+    after. The relay grew 375 KB versus 312 KB for that turn; about 300 KB
+    of both is outside the stream.
 - **Segment archives** (planned). A writer periodically archives a prefix
   `[0, B)` of each of its segments (conversations, maps, texts alike), `B`
   a record boundary at or below what the relay acknowledged. The archive is
