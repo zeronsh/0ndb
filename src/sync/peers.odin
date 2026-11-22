@@ -123,6 +123,9 @@ _on_noted :: proc(r: ^Replicator, ev: ^Event) {
 @(private)
 _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 	id := Stream_Id(ev.id)
+	if l, lok := r.locals[id]; lok && l.verifying && ev.base > l.verify_at {
+		_local_verify_hollow(r, l, ev.base)
+	}
 	rm, ok := r.remotes[id]
 	if !ok {
 		_promote_on_noted(r, id, ev.base, ev.length)
@@ -149,6 +152,23 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 	}
 	_remote_pull(r, rm)
 	_remote_settle(r, rm)
+}
+
+@(private)
+_local_verify_hollow :: proc(r: ^Replicator, l: ^Local, base: i64) {
+	l.verifying = false
+	clear(&l.verify)
+	if r.rx_local == l {
+		r.rx_local = nil
+	}
+	to := min(base, l.ahead)
+	if to > l.cursor {
+		if err := _local_advance(r, l, to); err != .None {
+			_local_fatal(r, l, err, to)
+			return
+		}
+	}
+	_local_verify_next(r, l)
 }
 
 @(private)
