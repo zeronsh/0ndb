@@ -43,6 +43,8 @@ Space :: struct {
 	mem:          Space_Members,
 	grant_epochs: map[prim.Id][dynamic]Space_Epoch,
 	grantkeys_seen: map[[32]u8]i64,
+	granted:      map[prim.Id]bool,
+	carded:       map[prim.Id]bool,
 	scope:        osync.Scope,
 	open:         bool,
 	repl:         osync.Replicator,
@@ -418,6 +420,8 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	}
 	sp.grant_epochs = make(map[prim.Id][dynamic]Space_Epoch, e.allocator)
 	sp.grantkeys_seen = make(map[[32]u8]i64, e.allocator)
+	sp.granted = make(map[prim.Id]bool, e.allocator)
+	sp.carded = make(map[prim.Id]bool, e.allocator)
 	sp.grants = make(map[prim.Id]osync.Content_Key, e.allocator)
 	sp.grant_access = make(map[prim.Id]Access_Set, e.allocator)
 	_grants_load(e, sp)
@@ -496,6 +500,8 @@ _space_unload :: proc(e: ^Engine, sp: ^Space) {
 	}
 	delete(sp.grant_epochs)
 	delete(sp.grantkeys_seen)
+	delete(sp.granted)
+	delete(sp.carded)
 	_members_free(e, sp)
 	osync.space_clear(&sp.keys)
 	osync.scope_clear(&sp.scope)
@@ -633,7 +639,7 @@ _card_want :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string) {
 	}
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
-	_card_watch(e, sp, &sc, device, false)
+	_card_watch(e, sp, &sc, device, sp.keyless)
 	rec, found, _ := _rec_get(e, id)
 	if found {
 		for m in rec.members {

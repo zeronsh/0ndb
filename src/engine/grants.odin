@@ -358,3 +358,38 @@ _grant_epoch_append :: proc(e: ^Engine, sp: ^Space, object: prim.Id, tag: osync.
 	append(&buf, ..wrapped[:])
 	return prim.replace_atomic(e.vfs, path, buf[:]) == .None
 }
+
+@(private)
+_grant_cards :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
+	if sp.keyless || !sp.repl_on {
+		return
+	}
+	now := _now_ms(e)
+	clear(&sp.granted)
+	for &x in m.roster.members {
+		if x.kind != .Guest || len(x.scope) == 0 || !osync.member_active(&x, now) {
+			continue
+		}
+		for o in x.scope {
+			sp.granted[o] = true
+		}
+	}
+	for o in _sorted_keys(sp.granted) {
+		if o in sp.carded {
+			continue
+		}
+		if rec, found, err := _rec_get(e, o); err == .None && found && rec.own {
+			_grant_card_written(e, sp, o)
+		}
+	}
+}
+
+@(private)
+_grant_card_written :: proc(e: ^Engine, sp: ^Space, object: prim.Id) {
+	if sp.keyless || !(object in sp.granted) || object in sp.carded {
+		return
+	}
+	if _card_publish_object(e, sp, object) == .None {
+		sp.carded[object] = true
+	}
+}
