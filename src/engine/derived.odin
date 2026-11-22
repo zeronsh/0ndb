@@ -12,6 +12,7 @@ import omap "../map"
 import "../obj"
 import "../pack"
 import "../prim"
+import "../search"
 import osync "../sync"
 
 @(private)
@@ -311,6 +312,21 @@ verify_derived :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []
 				return nil, verr
 			}
 		}
+	}
+	if e.cfg.search && e.index_open {
+		Ix_Check :: struct {
+			e:   ^Engine,
+			out: ^[dynamic]string,
+		}
+		ic := Ix_Check{e, &out}
+		visit :: proc(data: rawptr, src: prim.Id, pos: i64) -> bool {
+			c := (^Ix_Check)(data)
+			if d := _source_durable(c.e, src); pos > d {
+				append(c.out, fmt.tprintf("search: index source %x is at %d past its durable %d", src, pos, d))
+			}
+			return true
+		}
+		_xerr(search.sources_flushed(&e.index, &ic, visit)) or_return
 	}
 	res := make([]string, len(out), allocator)
 	for s, i in out {

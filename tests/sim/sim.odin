@@ -472,6 +472,13 @@ finish :: proc(w: ^World) {
 	check_relay_storage(w)
 	check_mounts(w)
 	check_uploaded(w)
+	for n in w.nodes {
+		if n.alive && n.e_open {
+			context = instance_context(&n.inst)
+			check_derived(n, "quiesce")
+			node_after(n)
+		}
+	}
 	if w.aborted {
 		return
 	}
