@@ -303,14 +303,18 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	cfg.mem_max = env_u64("SIM_MEM_MAX", 1500)
 	cfg.byzantine = env_u64("SIM_BYZANTINE", 1 if cfg.byzantine else 0) != 0
 	if v, ok := os.lookup_env("SIM_STORAGE", context.temp_allocator); ok {
-		if mode, mok := storage_mode_of(v); mok {
-			cfg.storage = mode
+		mode, mok := storage_mode_of(v)
+		if !mok {
+			fmt.panicf("SIM_STORAGE=%q is not one of auto, stored, until-run, device", v)
 		}
+		cfg.storage = mode
 	}
 	if v, ok := os.lookup_env("SIM_DURABILITY", context.temp_allocator); ok {
-		if mode, mok := durability_of(v); mok {
-			cfg.durability = mode
+		mode, mok := durability_of(v)
+		if !mok {
+			fmt.panicf("SIM_DURABILITY=%q is not one of async, deferred", v)
 		}
+		cfg.durability = mode
 	}
 	cfg.promote = i64(env_u64("SIM_PROMOTE", u64(cfg.promote)))
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
