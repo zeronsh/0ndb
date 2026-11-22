@@ -76,6 +76,7 @@ Handle :: struct {
 	view:       obj.View,
 	view_init:  bool,
 	segs:       [dynamic]^Seg,
+	cat_known:  bool,
 	own:        bool,
 	created:    prim.Hlc,
 	w_open:     bool,
@@ -611,6 +612,9 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 			return true
 		}
 	}
+	if _handle_unknown(h) {
+		return true
+	}
 	for s in h.segs {
 		if s.waiting || (fresh && s.probing) {
 			return true
@@ -886,7 +890,15 @@ _waiters_run :: proc(e: ^Engine) {
 	for i < len(e.waiters) {
 		w := e.waiters[i]
 		c, ok := e.changed[w.object]
-		if ok && c.kinds & {.Data, .Keys, .Members, .Redacted, .Quarantined} != {} {
+		woke := ok && c.kinds & {.Data, .Keys, .Members, .Redacted, .Quarantined} != {}
+		if !woke {
+			if h, hok := e.handles[w.object]; hok && !h.cat_known && len(h.segs) == 0 {
+				if _, cok := e.changed[h.sp.catalog]; cok {
+					woke = true
+				}
+			}
+		}
+		if woke {
 			ordered_remove(&e.waiters, i)
 			append(&ready, w)
 			continue
@@ -969,4 +981,36 @@ _pending_result :: proc(e: ^Engine, h: ^Handle, err: Error, ready: Ready) -> Err
 		return .Missing
 	}
 	return _wait(e, h, ready)
+}
+
+@(private)
+_handle_unknown :: proc(h: ^Handle) -> bool {
+	sp := h.sp
+	if len(h.segs) > 0 || h.own || h.cat_known || !sp.repl_on || sp.keyless || h.id == sp.catalog {
+		return false
+	}
+	if _, granted := sp.grants[h.id]; granted {
+		return false
+	}
+	_catalog_members(h.e, h)
+	if len(h.segs) > 0 || h.cat_known || !sp.connected {
+		return false
+	}
+	if !osync.replicator_caught_up(&sp.repl) {
+		return true
+	}
+	ch, cerr := _catalog_handle(h.e, sp)
+	return cerr == .None && _handle_waiting(ch)
+}
+
+@(private)
+_unknown_waiters_wake :: proc(e: ^Engine, sp: ^Space) {
+	for w in e.waiters {
+		if w.space != sp.id {
+			continue
+		}
+		if h, ok := e.handles[w.object]; ok && !h.cat_known && len(h.segs) == 0 {
+			_object_changed(e, sp.id, w.object, .Data)
+		}
+	}
 }
