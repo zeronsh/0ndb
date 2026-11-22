@@ -1,6 +1,7 @@
 package engine
 
 import "core:crypto/blake2b"
+import "core:mem/virtual"
 import "core:slice"
 import "core:unicode/utf8"
 import "../convo"
@@ -622,6 +623,9 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 		return 0, false
 	}
 	to := min(end, crdt.Lv(pos) + TREE_LV_CHUNK)
+	if first, n, _, _, found := fs.history_batch_at(h.hist, to - 1); found {
+		to = min(end, first + n)
+	}
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	if fs.history_touched_between(h.hist, crdt.Lv(pos), to, &touched) != .None {
 		return 1, false
@@ -633,10 +637,17 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 	slice.sort_by(ids[:], proc(a, b: fstree.Inode_Id) -> bool {
 		return a.actor < b.actor || a.actor == b.actor && a.seq < b.seq
 	})
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch) != nil {
+		return 1, false
+	}
+	defer virtual.arena_destroy(&scratch)
+	sa := virtual.arena_allocator(&scratch)
 	snap := fstree.current(&h.hist.tree)
 	for id in ids {
+		defer virtual.arena_free_all(&scratch)
 		used += 1
-		path, ok, lerr := fstree.path(&snap, id, context.temp_allocator)
+		path, ok, lerr := fstree.path(&snap, id, sa)
 		if lerr != nil || !ok {
 			continue
 		}
@@ -644,9 +655,9 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 		if ferr != .None {
 			continue
 		}
-		data := crdt.text_bytes(&f.text, context.temp_allocator)
-		spans := crdt.text_spans(&f.text, &h.hist.g, context.temp_allocator)
-		out := make([dynamic]search.Span, context.temp_allocator)
+		data := crdt.text_bytes(&f.text, sa)
+		spans := crdt.text_spans(&f.text, &h.hist.g, sa)
+		out := make([dynamic]search.Span, sa)
 		at := 0
 		line: u32 = 1
 		for s in spans {
