@@ -766,9 +766,9 @@ _mounts_stats :: proc "contextless" () {
 	STAT_BASE_CURRENT = register_stat(50, 1, "current")
 	STAT_BASE_MISMATCH = register_stat(50, 2, "mismatch")
 	STAT_BASE_OTHER = register_stat(50, 3, "other")
-	STAT_GIT_CHECKOUTS = register_stat(60, 0, "git_checkouts")
-	STAT_GIT_REFUSED = register_stat(60, 1, "git_refused")
-	register_stat_line(60)
+	STAT_GIT_CHECKOUTS = register_stat(65, 0, "checkouts")
+	STAT_GIT_REFUSED = register_stat(65, 1, "refused")
+	register_stat_line(65, "git")
 	register_op(200, "git_switch", _git_switch_weight, op_git_switch)
 }
 
