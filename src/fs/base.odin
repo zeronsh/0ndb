@@ -23,14 +23,16 @@ registry_set_base_note :: proc(reg: ^Registry, cb: Base_Proc, data: rawptr) {
 
 @(private)
 Pin :: struct {
-	path:      string,
-	read:      [dynamic]crdt.Op_Id,
-	read_hash: [32]u8,
-	has_read:  bool,
-	write:     [dynamic]crdt.Op_Id,
-	base_hash: [32]u8,
-	has_write: bool,
-	has_base:  bool,
+	path:        string,
+	read:        [dynamic]crdt.Op_Id,
+	read_inode:  fstree.Inode_Id,
+	read_hash:   [32]u8,
+	has_read:    bool,
+	write:       [dynamic]crdt.Op_Id,
+	write_inode: fstree.Inode_Id,
+	base_hash:   [32]u8,
+	has_write:   bool,
+	has_base:    bool,
 }
 
 @(private)
@@ -148,6 +150,7 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 	p := _pin(s, rel, true)
 	clear(&p.read)
 	append(&p.read, ..m.synced[:])
+	p.read_inode = inode
 	p.read_hash = hash
 	p.has_read = true
 	return .None
@@ -234,6 +237,7 @@ scope_write_begin :: proc(s: ^Scope, rel: string) {
 	p := _pin(s, rel, true)
 	clear(&p.write)
 	append(&p.write, ..m.synced[:])
+	p.write_inode = inode
 	p.has_write = true
 }
 
@@ -356,23 +360,23 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 		return nil, {}, false
 	}
 	a, ok := m.attrib[c.path]
-	if !ok || a.used || m.history == nil || c.old.kind != .File {
+	if !ok || a.used || m.history == nil {
 		return nil, {}, false
 	}
-	o, found := _observed(m.history, a.actor, c.old.inode)
+	o, found := _observed(m.history, a.actor, c.path)
 	if !found {
 		return nil, {}, false
 	}
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
 	append(&buf.read, ..o.version)
+	buf.read_inode = op_inode(m.history, o.inode)
 	buf.read_hash = o.hash
 	buf.has_read = true
 	return buf, a.actor, true
 }
 
 @(private)
-_observed :: proc(h: ^History, actor: prim.Id, inode: fstree.Inode_Id) -> (o: fshist.Observe_Op, found: bool) {
-	want := inode_op(h, inode)
+_observed :: proc(h: ^History, actor: prim.Id, rel: string) -> (o: fshist.Observe_Op, found: bool) {
 	known := crdt.graph_known(&h.g, actor)
 	seq := known
 	for seq > 0 {
@@ -388,7 +392,7 @@ _observed :: proc(h: ^History, actor: prim.Id, inode: fstree.Inode_Id) -> (o: fs
 		if berr == .None {
 			for op in b.ops {
 				if op.kind == .Opaque && len(op.content) > 0 && op.content[0] == fshist.TOP_OBSERVE {
-					if x, dok := fshist.decode_observe(op.content); dok && x.kind == .Read && x.inode == want {
+					if x, dok := fshist.decode_observe(op.content); dok && x.kind == .Read && x.path == rel {
 						o = x
 						found = true
 					}
@@ -412,22 +416,22 @@ _change_pin_drop :: proc(m: ^Mount, c: ^Change, observed: bool) {
 }
 
 @(private)
-_base_version :: proc(m: ^Mount, c: ^Change, p: ^Pin, actor: prim.Id) -> (v: []crdt.Op_Id, pinned: bool) {
+_base_version :: proc(m: ^Mount, p: ^Pin, actor: prim.Id) -> (v: []crdt.Op_Id, inode: fstree.Inode_Id, pinned: bool) {
 	if p == nil {
-		return nil, false
+		return nil, {}, false
 	}
 	h := m.history
 	if p.has_write && p.has_base {
-		if t, err := history_text_at(h, c.old.inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
-			return _base_parents(m, actor, c.old.inode, p.write[:], p.base_hash), true
+		if t, err := history_text_at(h, p.write_inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
+			return _base_parents(m, actor, p.write_inode, p.write[:], p.base_hash), p.write_inode, true
 		}
 	}
 	if p.has_read {
-		if t, err := history_text_at(h, c.old.inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
-			return _base_parents(m, actor, c.old.inode, p.read[:], p.read_hash), true
+		if t, err := history_text_at(h, p.read_inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
+			return _base_parents(m, actor, p.read_inode, p.read[:], p.read_hash), p.read_inode, true
 		}
 	}
-	return nil, p.has_read || p.has_base
+	return nil, {}, p.has_read || p.has_base
 }
 
 @(private)
@@ -471,13 +475,18 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
-		if c.kind != .Modify || c.disk != .File || c.moved != "" || c.old.kind != .File {
+		if c.disk != .File || c.moved != "" || (c.kind != .Modify && c.kind != .Create) || (c.kind == .Modify && c.old.kind != .File) {
 			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
 			continue
 		}
-		v, pinned := _base_version(m, &c, pin, actor)
+		v, inode, pinned := _base_version(m, pin, actor)
+		if v != nil && (c.kind != .Modify || inode != c.old.inode) {
+			if _, _, elsewhere, serr := shadow_by_inode(&m.shadow, inode, context.temp_allocator); serr != .None || elsewhere {
+				v = nil
+			}
+		}
 		if v == nil {
 			if pinned {
 				_change_pin_drop(m, &c, observed)
@@ -494,7 +503,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
-		if crdt.frontier_eq(vl[:], sl[:]) {
+		if c.kind == .Modify && inode == c.old.inode && crdt.frontier_eq(vl[:], sl[:]) {
 			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Current)
 			append(&keep, c)
@@ -506,7 +515,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
-		done, rerr := rebase_commit(p, &c, v, actor)
+		done, rerr := rebase_commit(p, &c, v, inode, actor)
 		#partial switch rerr {
 		case .None:
 		case .Reloading, .Io, .No_Space:
@@ -550,19 +559,19 @@ _off_line :: proc(m: ^Mount, vl: []crdt.Lv, sl: []crdt.Lv) -> bool {
 }
 
 @(private)
-rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, actor: prim.Id) -> (done: bool, err: Error) {
+rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode_Id, actor: prim.Id) -> (done: bool, err: Error) {
 	m := p.m
 	h := m.history
-	data, oid, binary, ok := read_content(m, c.path, c.stat, c.old.inode, true) or_return
-	if !ok || binary || .Opaque in tree_flags(h, c.old.inode) {
+	data, oid, binary, ok := read_content(m, c.path, c.stat, inode, true) or_return
+	if !ok || binary || .Opaque in tree_flags(h, inode) {
 		return false, .None
 	}
-	old := history_text_at(h, c.old.inode, v, context.temp_allocator) or_return
+	old := history_text_at(h, inode, v, context.temp_allocator) or_return
 	b: Builder
 	builder_init(&b, h, actor)
 	shadow_txn_begin(&m.shadow)
-	err = emit_text_edits(m, &b, c.old.inode, c.path, old, data)
-	ne := c.old
+	err = emit_text_edits(m, &b, inode, c.path, old, data)
+	ne := c.old if c.kind == .Modify && c.old.inode == inode else Entry{inode = inode, kind = .File}
 	ne.stat = c.stat
 	ne.oid = oid
 	if err == .None {
