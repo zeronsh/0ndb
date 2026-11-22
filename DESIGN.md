@@ -415,7 +415,9 @@ equal in both directions.
   read whose content equals the file at `synced` (`scope_read_base`), and
   at a write tool's start (`scope_write_begin`), which also holds the path
   until the tool finishes (`scope_write_end`, or the scope closing; never a
-  timer): a pass leaves the held path dirty, and materialization advances
+  timer): a pass leaves the holding scope's own change to the held path
+  dirty (a change by anyone else is ingested at once, as it was written, so
+  the hold never reorders other writers), and materialization advances
   only to the largest version whose batches since `synced` neither touch a
   held file nor descend from one that does, so the disk under a write in
   progress never moves. The write's reported original (`scope_write_base`)

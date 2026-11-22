@@ -236,6 +236,19 @@ scope_pinned :: proc(s: ^Scope, rel: string) -> bool {
 	return p != nil && (p.has_read || p.has_write)
 }
 
+@(private)
+mount_held_by :: proc(m: ^Mount, rel: string, s: ^Scope) -> bool {
+	if s == nil {
+		return false
+	}
+	for h in m.holds {
+		if h.path == rel && h.scope == s {
+			return true
+		}
+	}
+	return false
+}
+
 mount_held :: proc(m: ^Mount, rel: string) -> bool {
 	for h in m.holds {
 		if h.path == rel {

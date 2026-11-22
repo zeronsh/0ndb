@@ -1752,7 +1752,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		compare_dir(p, rel) or_return
 	case d.kind == .File:
 		if d.stat != e.stat {
-			if mount_held(m, rel) {
+			if mount_held_by(m, rel, p.scope_of[rel]) {
 				append(&p.holding, clone_string(rel, p.long) or_else "")
 				return .None
 			}
