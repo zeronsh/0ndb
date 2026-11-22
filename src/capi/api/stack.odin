@@ -40,6 +40,7 @@ Stack :: struct {
 	running:   bool,
 	stop_mu:   sync.Mutex,
 	joined:    [dynamic]prim.Id,
+	signed_in: bool,
 }
 
 stack_open :: proc(s: ^Stack, ec: eng.Config, opts: Stack_Options, allocator := context.allocator) -> (st: Status) {
@@ -186,7 +187,17 @@ stack_space_joined :: proc(s: ^Stack, space: prim.Id) {
 	append(&s.joined, space)
 }
 
+stack_signed_in :: proc(s: ^Stack) {
+	s.signed_in = true
+}
+
 stack_attach_joined :: proc(s: ^Stack) {
+	if s.signed_in {
+		s.signed_in = false
+		if s.r_on {
+			rt.readvertise_all(&s.r)
+		}
+	}
 	if len(s.joined) == 0 {
 		return
 	}

@@ -297,7 +297,9 @@ child conversation's parent's runner when it has none of its own.
 
 Runner directory. `runners(space[, object])` lists every runner of the
 space for a device switcher: devices one per entry, each pool once (its
-`device` is the pool's member id and `name` its label). `Runner := device:
+`device` is the pool's member id and `name` its label). A device's `name`
+is the daemon's `--name`, else the `label` it signed in with, else its host
+name; it is advertised again when sign-in completes. `Runner := device:
 id, name: str, kind: enum{device,pool}, state: enum{offline,online,wakeable},
 providers: strs, signed_in: strs, current: bool, last: bool`. A pool is
 `online` while any of its runners is, else `wakeable` while the pool is a

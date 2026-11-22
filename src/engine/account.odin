@@ -6,7 +6,7 @@ import osync "../sync"
 @(private)
 ACCOUNT_FILE :: "account"
 @(private)
-ACCOUNT_FILE_VERSION :: 1
+ACCOUNT_FILE_VERSION :: 2
 
 Account_State :: struct {
 	sign:         osync.Public_Key,
@@ -18,6 +18,7 @@ Account_State :: struct {
 	relay_public: osync.Public_Key,
 	subject:      string,
 	cert:         [64]u8,
+	label:        string,
 	have:         bool,
 }
 
@@ -124,7 +125,8 @@ _account_load :: proc(e: ^Engine) {
 		return
 	}
 	r := prim.reader(data)
-	if prim.read_u8(&r) != ACCOUNT_FILE_VERSION {
+	version := prim.read_u8(&r)
+	if version != 1 && version != ACCOUNT_FILE_VERSION {
 		return
 	}
 	a: Account_State
@@ -137,12 +139,14 @@ _account_load :: proc(e: ^Engine) {
 	prim.read_fixed(&r, a.relay_public[:])
 	subject := prim.read_str(&r)
 	prim.read_fixed(&r, a.cert[:])
+	label := prim.read_str(&r) if version >= 2 else ""
 	if !prim.reader_ok(&r) || p > u8(max(osync.Pool_Access)) {
 		return
 	}
 	a.pool = osync.Pool_Access(p)
 	a.relay, _ = _clone(relay, e.allocator)
 	a.subject, _ = _clone(subject, e.allocator)
+	a.label, _ = _clone(label, e.allocator)
 	a.have = true
 	e.account = a
 }
@@ -162,6 +166,7 @@ _account_store :: proc(e: ^Engine) -> Error {
 	prim.write_raw(&w, a.relay_public[:])
 	prim.write_str(&w, a.subject)
 	prim.write_raw(&w, a.cert[:])
+	prim.write_str(&w, a.label)
 	if w.err != .None {
 		return .No_Memory
 	}
@@ -189,6 +194,7 @@ _account_close :: proc(e: ^Engine) {
 	delete(e.approvals.label, e.allocator)
 	delete(e.account.relay, e.allocator)
 	delete(e.account.subject, e.allocator)
+	delete(e.account.label, e.allocator)
 	e.approvals = {}
 	e.account = {}
 }
@@ -243,9 +249,11 @@ account_login_recovery :: proc(e: ^Engine, subject: string, recovery: string, do
 }
 
 @(private)
-_account_adopt_begin :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Record, entries: [][]u8, a: ^osync.Account_Key, path: Login_Path) -> (spaces: int, err: Error) {
+_account_adopt_begin :: proc(e: ^Engine, subject: string, label: string, rec: ^osync.Account_Record, entries: [][]u8, a: ^osync.Account_Key, path: Login_Path) -> (spaces: int, err: Error) {
 	delete(e.account.relay, e.allocator)
 	delete(e.account.subject, e.allocator)
+	kept := e.account.label
+	defer delete(kept, e.allocator)
 	e.account = Account_State {
 		sign         = rec.sign,
 		box          = rec.box,
@@ -258,6 +266,7 @@ _account_adopt_begin :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Re
 	}
 	e.account.relay = _clone(rec.relay, e.allocator) or_return
 	e.account.subject = _clone(subject, e.allocator) or_return
+	e.account.label = _clone(label if len(label) > 0 else kept, e.allocator) or_return
 	_account_store(e) or_return
 	akr := osync.account_keyring(a)
 	signer := osync.account_signer(a)
@@ -830,6 +839,7 @@ account_sign_out :: proc(e: ^Engine, detach := true) -> (spaces: int, err: Error
 	}
 	delete(e.account.relay, e.allocator)
 	delete(e.account.subject, e.allocator)
+	delete(e.account.label, e.allocator)
 	e.account = {}
 	path := _account_path(e) or_return
 	prim.remove(e.vfs, path)

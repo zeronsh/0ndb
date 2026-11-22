@@ -520,14 +520,15 @@ _advertise :: proc(r: ^Runtime, space: prim.Id, capacity: int) {
 	pool := u64(1) if r.cfg.pool else 0
 	signed := _providers_signed_in(r, provs)
 	pool_id := _pool_of(r, space)
+	name := runner_name(r)
 	en, ok := map_read(r, runners_object(space), me[:])
-	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs && entry_u64(&en, 3) == pool && entry_str(&en, 4) == signed && entry_str(&en, 5) == r.cfg.name && entry_id(&en, 6) == pool_id {
+	if ok && entry_u64(&en, 1) == u64(capacity) && entry_str(&en, 2) == provs && entry_u64(&en, 3) == pool && entry_str(&en, 4) == signed && entry_str(&en, 5) == name && entry_id(&en, 6) == pool_id {
 		return
 	}
 	if !ok && capacity == 0 {
 		return
 	}
-	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(capacity)), field_bytes(2, transmute([]u8)provs), omap.field_u64(3, pool), field_bytes(4, transmute([]u8)signed), omap.field_str(5, r.cfg.name), omap.field_id(6, pool_id))
+	map_put(r, named_w(r, runners_named(space)), me[:], omap.field_u64(1, u64(capacity)), field_bytes(2, transmute([]u8)provs), omap.field_u64(3, pool), field_bytes(4, transmute([]u8)signed), omap.field_str(5, name), omap.field_id(6, pool_id))
 }
 
 runner_pool :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {

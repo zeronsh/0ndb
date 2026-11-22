@@ -314,7 +314,7 @@ cmd_login :: proc(a: ^Args) -> int {
 	} else {
 		r = req_begin("account.login")
 		req_str(&r, "subject", subject)
-		req_str(&r, "label", flag_string(a, "label", "0ndb cli"))
+		req_str(&r, "label", flag_string(a, "label", sys_hostname(context.temp_allocator)))
 		req_opt(&r, "relay", flag_string(a, "relay"))
 		req_opt(&r, "relay_key", flag_string(a, "relay-key"))
 	}
