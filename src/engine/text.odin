@@ -553,7 +553,7 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 		if !prim.reader_ok(&rd) || l == 0 || l > crdt.MAX_RUN {
 			return
 		}
-		if a == e.self {
+		if a == e.self || fs.history_owns(h.hist, crdt.Op_Id{a, seq}) {
 			append(&own, crdt.Op_Span{crdt.Op_Id{a, seq}, int(l)})
 		}
 	}
