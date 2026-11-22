@@ -998,6 +998,7 @@ _mounts_stats :: proc "contextless" () {
 	register_op(200, "git_switch", _git_switch_weight, op_git_switch)
 	register_op(210, "line_switch", _git_switch_weight, op_line_switch)
 	STAT_LINE_SWITCHES = register_stat(65, 2, "line_switches")
+	register_op(10, "agent_chain", proc(w: ^World) -> int {return 3}, op_agent_chain)
 }
 
 STAT_LINE_SWITCHES: Stat
@@ -1323,6 +1324,96 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 		}
 	}
 	node_after(n)
+}
+
+op_agent_chain :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	live := make([dynamic]int, context.temp_allocator)
+	for sm, i in n.mounts {
+		if sm.m != nil {
+			append(&live, i)
+		}
+	}
+	if len(live) == 0 || n.reg == nil {
+		return
+	}
+	sm := n.mounts[live[rng_int(&w.rng, len(live))]]
+	paths := TREE_PATHS
+	name := paths[rng_int(&w.rng, len(paths))]
+	abs := strings.concatenate({sm.root, "/", name}, context.temp_allocator)
+	vfs := disk_vfs(&n.disk)
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	scope := fs.scope_open(n.reg, sm.m, sid, actor)
+	if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None || n.disk.dead {
+		fs.scope_close(n.reg, scope)
+		return
+	}
+	cur, rerr := prim.read_file(vfs, abs, context.temp_allocator)
+	if rerr != .None || len(cur) == 0 || n.disk.dead {
+		fs.scope_close(n.reg, scope)
+		return
+	}
+	fs.scope_write_begin(scope, name)
+	if !fs.scope_pinned(scope, name) {
+		fs.scope_close(n.reg, scope)
+		return
+	}
+	chained := false
+	for other in paths {
+		if other == name {
+			continue
+		}
+		data, derr := prim.read_file(vfs, strings.concatenate({sm.root, "/", other}, context.temp_allocator), context.temp_allocator)
+		if derr == .None && len(data) > 0 {
+			fs.scope_read_base(scope, other, data)
+			chained = fs.scope_pinned(scope, other)
+			break
+		}
+	}
+	op := new_op(m, .Disk_Agent, n, sm.oi)
+	op.path = strings.clone(name, w.allocator)
+	op.actor = actor
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_bytes(&b, cur)
+	if cur[len(cur) - 1] != '\n' {
+		strings.write_byte(&b, '\n')
+	}
+	for _ in 0 ..< 1 + rng_int(&w.rng, 2) {
+		tok := new_token(m, n, "a")
+		append(&op.tokens, tok)
+		strings.write_string(&b, tok)
+		strings.write_byte(&b, '\n')
+	}
+	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = true})
+	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
+	if n.disk.dead {
+		node_crashed(n)
+		return
+	}
+	fs.scope_write_base(scope, name, cur)
+	fs.scope_write_end(scope, name)
+	good := stat_get(&w.stats, STAT_BASE_MERGED) + stat_get(&w.stats, STAT_BASE_CURRENT)
+	bad := stat_get(&w.stats, STAT_BASE_MISMATCH) + stat_get(&w.stats, STAT_BASE_OTHER)
+	serr := fs.scope_close(n.reg, scope)
+	_forget_scope(w, n, scope)
+	world_note(w, "%s agent chain(actor %s) %s/%s chained=%v wrote %v -> %v %v", n.name, id_short(actor), id_short(m.objs[sm.oi].o.id), name, chained, op.tokens[:], err, serr)
+	if n.disk.dead {
+		return
+	}
+	if err != .None || serr != .None {
+		op.status = .Uncertain
+		n.restart_pending = true
+		return
+	}
+	op_done(op, eng.pending_seq(&n.e), .None)
+	gained := stat_get(&w.stats, STAT_BASE_MERGED) + stat_get(&w.stats, STAT_BASE_CURRENT) - good
+	lost := stat_get(&w.stats, STAT_BASE_MISMATCH) + stat_get(&w.stats, STAT_BASE_OTHER) - bad
+	if gained != 1 || lost != 0 {
+		world_fail(w, "agent chain: %s write to %s/%s based on its own pin fell back (chained=%v, ok %d, fallback %d)", n.name, id_short(m.objs[sm.oi].o.id), name, chained, gained, lost)
+	}
 }
 
 STAT_ATTRIB_CRASH: Stat
