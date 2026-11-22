@@ -156,6 +156,13 @@ The idle and streaming figures come from `bindings/rust/ondb/examples/bench.rs`
   re-subscribed after a reconnect. `takeover.set` picks what happens when
   a runner goes away: `default` (devices: the conversation goes idle; pool
   runners: a placement request naming the runner), `auto` or `never`.
+  Placement events carry the latest state, not every transition, so a
+  switcher must not rely on seeing `running`. A turn that finishes on
+  another device before its start reaches this one arrives as `assigned`
+  then `idle`, with `last_runner` naming the device that ran it. This
+  happens whenever a turn is shorter than the trip between devices. Show
+  the runner from `runner` while `running` and
+  from `last_runner` once `idle`.
 - Folders and repositories: `mount.add(object, root)` keeps a folder synced as
   a tree; `mount` attaches a tree to a conversation so its runs edit it;
   `tree.find(path)` maps a path to its tree; `tree.write(path, text)` creates
