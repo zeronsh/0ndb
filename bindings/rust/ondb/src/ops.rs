@@ -374,24 +374,50 @@ impl Client {
         self.call(&json!({"op": "text.redact", "object": object, "pos": pos, "len": len}))
     }
 
-    pub fn tree_read(&self, object: &str, path: &str) -> Pending<Text> {
-        self.call(&json!({"op": "tree.read", "object": object, "path": path}))
+    pub fn tree_read(&self, object: &str, path: &str, line: Option<&str>) -> Pending<TreeText> {
+        let mut m = Map::new();
+        m.insert("op".into(), "tree.read".into());
+        m.insert("object".into(), object.into());
+        m.insert("path".into(), path.into());
+        put(&mut m, "line", line);
+        self.call(&Value::Object(m))
     }
 
-    pub fn tree_list(&self, object: &str, path: &str) -> Pending<TreeList> {
-        self.call(&json!({"op": "tree.list", "object": object, "path": path}))
+    pub fn tree_list(&self, object: &str, path: &str, line: Option<&str>) -> Pending<TreeList> {
+        let mut m = Map::new();
+        m.insert("op".into(), "tree.list".into());
+        m.insert("object".into(), object.into());
+        m.insert("path".into(), path.into());
+        put(&mut m, "line", line);
+        self.call(&Value::Object(m))
     }
 
-    pub fn tree_write(&self, object: &str, path: &str, text: &str) -> Pending<Ack> {
-        self.call(&json!({"op": "tree.write", "object": object, "path": path, "text": text}))
+    pub fn tree_write(&self, object: &str, path: &str, text: &str, line: Option<&str>) -> Pending<TreeWritten> {
+        let mut m = Map::new();
+        m.insert("op".into(), "tree.write".into());
+        m.insert("object".into(), object.into());
+        m.insert("path".into(), path.into());
+        m.insert("text".into(), text.into());
+        put(&mut m, "line", line);
+        self.call(&Value::Object(m))
     }
 
-    pub fn tree_remove(&self, object: &str, path: &str) -> Pending<Ack> {
-        self.call(&json!({"op": "tree.remove", "object": object, "path": path}))
+    pub fn tree_remove(&self, object: &str, path: &str, line: Option<&str>) -> Pending<TreeWritten> {
+        let mut m = Map::new();
+        m.insert("op".into(), "tree.remove".into());
+        m.insert("object".into(), object.into());
+        m.insert("path".into(), path.into());
+        put(&mut m, "line", line);
+        self.call(&Value::Object(m))
     }
 
-    pub fn tree_blame(&self, object: &str, path: &str) -> Pending<Blame> {
-        self.call(&json!({"op": "tree.blame", "object": object, "path": path}))
+    pub fn tree_blame(&self, object: &str, path: &str, line: Option<&str>) -> Pending<Blame> {
+        let mut m = Map::new();
+        m.insert("op".into(), "tree.blame".into());
+        m.insert("object".into(), object.into());
+        m.insert("path".into(), path.into());
+        put(&mut m, "line", line);
+        self.call(&Value::Object(m))
     }
 
     pub fn tree_sync(&self, object: &str, root: &str) -> Pending<Ack> {

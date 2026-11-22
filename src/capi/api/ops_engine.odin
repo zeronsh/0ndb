@@ -541,16 +541,21 @@ op_tree_create :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_tree_read :: proc(c: ^Call, o: ^Out) -> Status {
-	data, err := eng.tree_read(c.api.e, a_object(c, "object"), a_str(c, "path"), context.temp_allocator, ready(c))
+	ob := a_object(c, "object")
+	line := a_str(c, "line")
+	data, err := eng.tree_read(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line)
 	if err != .None {
 		return pend(c, err)
 	}
 	o_text(o, "text", data)
+	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
 	return .Ok
 }
 
 op_tree_list :: proc(c: ^Call, o: ^Out) -> Status {
-	names, err := eng.tree_list(c.api.e, a_object(c, "object"), a_str(c, "path"), context.temp_allocator, ready(c))
+	ob := a_object(c, "object")
+	line := a_str(c, "line")
+	names, err := eng.tree_list(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line)
 	if err != .None {
 		return pend(c, err)
 	}
@@ -559,15 +564,28 @@ op_tree_list :: proc(c: ^Call, o: ^Out) -> Status {
 		o_str(o, "", n)
 	}
 	o_end(o)
+	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
 	return .Ok
 }
 
 op_tree_write :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.tree_write(c.api.e, a_object(c, "object"), a_str(c, "path"), a_bytes(c, "text")))
+	ob := a_object(c, "object")
+	line := a_str(c, "line")
+	if err := eng.tree_write(c.api.e, ob, a_str(c, "path"), a_bytes(c, "text"), line); err != .None {
+		return status_of(err)
+	}
+	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
+	return .Ok
 }
 
 op_tree_remove :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.tree_remove(c.api.e, a_object(c, "object"), a_str(c, "path")))
+	ob := a_object(c, "object")
+	line := a_str(c, "line")
+	if err := eng.tree_remove(c.api.e, ob, a_str(c, "path"), line); err != .None {
+		return status_of(err)
+	}
+	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
+	return .Ok
 }
 
 op_catalog_get :: proc(c: ^Call, o: ^Out) -> Status {

@@ -4,7 +4,6 @@ import "core:strings"
 import "../../crdt"
 import eng "../../engine"
 import "../../fs"
-import "../../fstree"
 import "../../prim"
 
 Mounted :: struct {
@@ -184,35 +183,16 @@ emit_spans :: proc(o: ^Out, data: []u8, spans: []crdt.Author_Span) {
 op_tree_blame :: proc(c: ^Call, o: ^Out) -> Status {
 	ob := a_object(c, "object")
 	path := a_str(c, "path")
+	line := a_str(c, "line")
 	if m := mount_find(c.api, ob, ""); m != nil {
 		context = eng.context_for(c.api.e)
 		fs.mount_sync(m.mount)
 	}
-	hist, err := eng.tree_history(c.api.e, ob)
+	data, spans, err := eng.tree_blame(c.api.e, ob, path, context.temp_allocator, line)
 	if err != .None {
 		return status_of(err)
 	}
-	defer eng.tree_release(c.api.e, ob)
-	snap := fstree.current(&hist.tree)
-	id, found, lerr := fstree.lookup(&snap, path)
-	if lerr != nil {
-		return .Corrupt
-	}
-	if !found {
-		return .Not_Found
-	}
-	data: []u8
-	spans: []crdt.Author_Span
-	{
-		context = eng.context_for(c.api.e)
-		f, ferr := fs.history_file(hist, id)
-		if ferr != .None {
-			return .Io
-		}
-		data = crdt.text_bytes(&f.text, context.temp_allocator)
-		spans = crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
-		fs.history_present_spans(hist, spans)
-	}
+	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
 	emit_spans(o, data, spans)
 	return .Ok
 }

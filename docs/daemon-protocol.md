@@ -742,14 +742,14 @@ up exist only over the socket.
 | 86 | `text.edit` | object: object, pos: uvarint, remove: uvarint, insert: str | Result |
 | 87 | `text.redact` | object: object, pos: uvarint, len: uvarint | {} |
 | 88 | `tree.create` | space: id, title: str | object:object |
-| 89 | `tree.read` | object: object, path: str | text:str |
-| 90 | `tree.list` | object: object, path: str | names:[str] |
-| 91 | `tree.write` | object: object, path: str, text: str | {} |
-| 92 | `tree.remove` | object: object, path: str | {} |
+| 89 | `tree.read` | object: object, path: str, line: str | text:str line:str |
+| 90 | `tree.list` | object: object, path: str, line: str | names:[str] line:str |
+| 91 | `tree.write` | object: object, path: str, text: str, line: str | line:str |
+| 92 | `tree.remove` | object: object, path: str, line: str | line:str |
 | 93 | `tree.mount` | object: object, root: str | {} |
 | 94 | `tree.unmount` | object: object, root: str | {} |
 | 95 | `tree.mounts` | – | mounts:[Mounted] |
-| 96 | `tree.blame` | object: object, path: str | text:str spans:[Span] |
+| 96 | `tree.blame` | object: object, path: str, line: str | line:str text:str spans:[Span] |
 | 97 | `tree.sync` | object: object, root: str | {} |
 | 98 | `tree.find` | path: str | object:object root:str rel:str |
 

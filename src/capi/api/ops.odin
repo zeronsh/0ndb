@@ -7,6 +7,7 @@ ATTS :: Arg{"attachments", .Attachments, nil}
 MSG :: Arg{"msg", .Rid, nil}
 KEY :: Arg{"key", .Bytes, nil}
 KEY_STR :: Arg{"key", .Str, nil}
+LINE :: Arg{"line", .Str, nil}
 
 RESULT :: "Result"
 
@@ -106,14 +107,14 @@ OPS := []Op {
 	{86, "text.edit", {OBJ, {"pos", .U64, nil}, {"remove", .U64, nil}, {"insert", .Str, nil}}, RESULT, op_text_edit},
 	{87, "text.redact", {OBJ, {"pos", .U64, nil}, {"len", .U64, nil}}, "", op_text_redact},
 	{88, "tree.create", {SPACE, {"title", .Str, nil}}, "object:object", op_tree_create},
-	{89, "tree.read", {OBJ, {"path", .Str, nil}}, "text:str", op_tree_read},
-	{90, "tree.list", {OBJ, {"path", .Str, nil}}, "names:[str]", op_tree_list},
-	{91, "tree.write", {OBJ, {"path", .Str, nil}, TEXT}, "", op_tree_write},
-	{92, "tree.remove", {OBJ, {"path", .Str, nil}}, "", op_tree_remove},
+	{89, "tree.read", {OBJ, {"path", .Str, nil}, LINE}, "text:str line:str", op_tree_read},
+	{90, "tree.list", {OBJ, {"path", .Str, nil}, LINE}, "names:[str] line:str", op_tree_list},
+	{91, "tree.write", {OBJ, {"path", .Str, nil}, TEXT, LINE}, "line:str", op_tree_write},
+	{92, "tree.remove", {OBJ, {"path", .Str, nil}, LINE}, "line:str", op_tree_remove},
 	{93, "tree.mount", {OBJ, {"root", .Str, nil}}, "", op_tree_mount},
 	{94, "tree.unmount", {OBJ, {"root", .Str, nil}}, "", op_tree_unmount},
 	{95, "tree.mounts", {}, "mounts:[Mounted]", op_tree_mounts},
-	{96, "tree.blame", {OBJ, {"path", .Str, nil}}, "text:str spans:[Span]", op_tree_blame},
+	{96, "tree.blame", {OBJ, {"path", .Str, nil}, LINE}, "line:str text:str spans:[Span]", op_tree_blame},
 	{97, "tree.sync", {OBJ, {"root", .Str, nil}}, "", op_tree_sync},
 	{98, "tree.find", {{"path", .Str, nil}}, "object:object root:str rel:str", op_tree_find},
 	{99, "catalog.get", {OBJ}, "found:bool entry:CatalogEntry", op_catalog_get},
