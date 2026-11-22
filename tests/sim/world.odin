@@ -77,6 +77,7 @@ Node :: struct {
 	caps:        [8]eng.Cap_Credentials,
 	restart_pending: bool,
 	probed:      bool,
+	sent:        map[string]i64,
 	boot:        u64,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
@@ -395,6 +396,10 @@ world_destroy :: proc(w: ^World) {
 		node_mounts_drop(w, n)
 		delete(n.mounts)
 		delete(n.writers)
+		for k in n.sent {
+			delete(k, w.allocator)
+		}
+		delete(n.sent)
 		disk_destroy(&n.disk)
 		delete(n.conns)
 		delete(n.name, w.allocator)

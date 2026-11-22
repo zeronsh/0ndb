@@ -547,10 +547,14 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 		_promote(p, oi) or_return
 	}
 	if oi.ino.kind == .External {
+		before := _ext_before(p, oi) or_return
 		oi.dirty = true
-		return prim.write_at(p.base, oi.real_fd, src, off)
+		prim.write_at(p.base, oi.real_fd, src, off) or_return
+		_pend_note(p, oi.inum, before, max(before, off + i64(len(src))))
+		return .None
 	}
 	old := oi.ino
+	_pend_note(p, oi.inum, old.size, max(old.size, off + i64(len(src))))
 	ph := _log_data(p, oi.inum, off, src) or_return
 	nw := &oi.ino
 	scratch: Phys_List
@@ -647,13 +651,17 @@ _truncate :: proc(p: ^Pack, h: ^Handle, size: i64) -> Error {
 		_promote(p, oi) or_return
 	}
 	if oi.ino.kind == .External {
+		before := _ext_before(p, oi) or_return
 		oi.dirty = true
-		return prim.truncate(p.base, oi.real_fd, size)
+		prim.truncate(p.base, oi.real_fd, size) or_return
+		_pend_note(p, oi.inum, before, size)
+		return .None
 	}
 	if size == oi.ino.size {
 		return .None
 	}
 	old := oi.ino
+	_pend_note(p, oi.inum, old.size, size)
 	scratch: Phys_List
 	_ext_remove(&oi.ino, size, max(i64), &scratch)
 	oi.ino.size = size
@@ -743,6 +751,7 @@ _v_sync :: proc(data: rawptr, fd: prim.Fd) -> Error {
 			_suspect_record(p, []u64{h.oi.inum})
 			return _poison(p, e)
 		}
+		_pend_synced(p, h.oi.inum)
 		return .None
 	}
 	return sync(p)

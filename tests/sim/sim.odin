@@ -189,6 +189,7 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		n := w.nodes[ev.node]
 		if !n.alive {
 			if node_start(n) {
+				check_sent(n)
 				model_after_restart(&w.model, n)
 				probe_reuse(w, n)
 				requeue_shares(w, n)
@@ -412,6 +413,7 @@ finish :: proc(w: ^World) {
 	for n in w.nodes {
 		if !n.alive && len(w.failures) == 0 {
 			if node_start(n) {
+				check_sent(n)
 				model_after_restart(&w.model, n)
 			}
 		}

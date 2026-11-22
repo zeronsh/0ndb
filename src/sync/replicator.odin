@@ -81,6 +81,7 @@ Replicator_Config :: struct {
 	seal:         proc(user: rawptr, name: string, id: Stream_Id, data: []u8, off: i64) -> Error,
 	on_event:     Repl_Handler,
 	user:         rawptr,
+	durable:      proc(user: rawptr, path: string) -> (length: i64, ok: bool),
 }
 
 Stream_Sealing :: enum u8 {
@@ -504,6 +505,37 @@ replicator_floor :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64
 	return newest.value, .None
 }
 
+replicator_durable :: proc(r: ^Replicator) {
+	list := make([dynamic]^Local, context.temp_allocator)
+	for _, l in r.locals {
+		if l.cursor < l.durable && l.inflight == 0 && !l.fatal && !l.blocked && !l.retry && !l.verifying && l.ahead == 0 && !l.dropping {
+			append(&list, l)
+		}
+	}
+	if len(list) == 0 || r.phase != .Ready {
+		return
+	}
+	_enter(r)
+	defer _leave(r)
+	for l in list {
+		_local_pump(r, l)
+	}
+	_repl_flush(r)
+}
+
+
+@(private)
+_limit :: proc(r: ^Replicator, l: ^Local) -> i64 {
+	if r.cfg.durable == nil {
+		return l.cursor
+	}
+	n, ok := r.cfg.durable(r.cfg.user, l.path)
+	if !ok {
+		return l.cursor
+	}
+	return max(min(l.durable, n), l.cursor)
+}
+
 replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, durable: i64, tree: ^Key_Tree = nil, hollow := false) -> Error {
 	_enter(r)
 	defer _leave(r)
@@ -813,11 +845,12 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 		_local_maybe_free(r, l)
 		return
 	}
-	if r.uploading >= MAX_UPLOADS || client_queued(&r.client) >= OUT_HIGH {
+	limit := _limit(r, l)
+	if l.cursor >= limit || r.uploading >= MAX_UPLOADS || client_queued(&r.client) >= OUT_HIGH {
 		return
 	}
 	if l.hollow {
-		_local_note(r, l)
+		_local_note(r, l, limit)
 		return
 	}
 	if l.fd < 0 {
@@ -834,12 +867,15 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	first := i64(prim.get_u32le(head[:])) + journal.OVERHEAD
-	want := min(l.durable - l.cursor, UPLOAD_CHUNK)
+	want := min(limit - l.cursor, UPLOAD_CHUNK)
 	if first > want {
 		want = first
 	}
 	if first > l.durable - l.cursor || want > APPEND_MAX {
 		_local_fatal(r, l, .Corrupt, -1)
+		return
+	}
+	if first > limit - l.cursor {
 		return
 	}
 	dst, rerr := client_append_reserve(&r.client, l.id, l.cursor, int(want))
