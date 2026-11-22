@@ -142,6 +142,7 @@ Event_Kind :: enum u8 {
 	Peer_Misbehaving,
 	Lease_Lapsed,
 	Space_Left,
+	Line_Switched,
 }
 
 Event :: struct {

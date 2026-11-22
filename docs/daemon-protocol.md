@@ -262,7 +262,9 @@ Event codes: 0 connected, 1 disconnected, 2 durable, 3 uploaded,
 14 indexer_wanted, 15 unavailable, 16 available, 17 promoted,
 18 peer_misbehaving, 19 members_changed, 20 epoch_changed,
 21 access_revoked, 22 runner_enrolled, 23 runner_anomaly,
-24 approval_requested, 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left. The meaning of each
+24 approval_requested, 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left,
+29 line_switched (a mount's tree moved lines on a branch switch: `object` is the
+tree, `detail` is `<from line>\n<to line>`). The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
 conversation's next run is; see "Placement" below), `presence`
 (device up or down, `tick` 1 or 0), `connected`/`disconnected` (relay link of

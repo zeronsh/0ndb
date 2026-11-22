@@ -57,7 +57,11 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	if len(m.dirty) > 0 || m.rescan {
+		line_was, _ := clone_string(m.line, context.temp_allocator)
 		mount_pass(m, false) or_return
+		if m.line != line_was {
+			return mount_materialize(m)
+		}
 	}
 	if !mount_durable_now(m) {
 		return .None
@@ -170,7 +174,11 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			}
 		}
 		if held {
+			line_was, _ := clone_string(m.line, context.temp_allocator)
 			mount_pass(m, false) or_return
+			if m.line != line_was {
+				return .None
+			}
 			one := make([dynamic]crdt.Lv, context.temp_allocator)
 			if crdt.graph_version_lvs(&h.g, m.synced[:], &one) != .None {
 				return .Corrupt
@@ -227,7 +235,11 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		m.mat = nil
 		m.mat_retries += 1
 		defer m.mat_retries -= 1
+		line_was, _ := clone_string(m.line, context.temp_allocator)
 		mount_pass(m, false) or_return
+		if m.line != line_was {
+			return .None
+		}
 		one := make([dynamic]crdt.Lv, context.temp_allocator)
 		if crdt.graph_version_lvs(&h.g, m.synced[:], &one) != .None {
 			return .Corrupt

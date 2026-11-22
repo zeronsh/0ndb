@@ -491,6 +491,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	}
 	op := new_op(m, .Disk_Agent if agent else .Disk_Person, n, sm.oi)
 	op.path = strings.clone(name, w.allocator)
+	op.line = strings.clone(git_head_line(vfs, sm.root), w.allocator)
 	overwrite := len(old) == 0 || rng_chance(&w.rng, 1, 3)
 	op.overwrite = overwrite && len(old) > 0
 	b := strings.builder_make(context.temp_allocator)
@@ -571,30 +572,6 @@ _forget_scope :: proc(w: ^World, n: ^Node, scope: ^fs.Scope) {
 		owned, _ := delete_key(&n.writers, k)
 		delete(owned, w.allocator)
 	}
-}
-
-tree_file_spans :: proc(n: ^Node, o: eng.Object, path: string) -> []crdt_span {
-	hist, err := eng.tree_history(&n.e, o)
-	if err != .None {
-		return nil
-	}
-	defer eng.tree_release(&n.e, o)
-	snap := fstree.current(&hist.tree)
-	id, ok, lerr := fstree.lookup(&snap, path)
-	if lerr != nil || !ok {
-		return nil
-	}
-	f, ferr := fs.history_file(hist, id)
-	if ferr != .None {
-		return nil
-	}
-	raw := crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
-	fs.history_present_spans(hist, raw)
-	out := make([]crdt_span, len(raw), context.temp_allocator)
-	for s, i in raw {
-		out[i] = crdt_span{actor = s.id.actor, len = s.len}
-	}
-	return out
 }
 
 check_mounts :: proc(w: ^World) {
@@ -834,44 +811,89 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 	}
 	force := rng_chance(r, 1, 4)
 	dirty := git_dirty_paths(vfs, sm.root)
-	files := make([dynamic]Git_File, context.temp_allocator)
-	removed := make([dynamic]string, context.temp_allocator)
 	paths := TREE_PATHS
-	for p in paths {
-		if !(rng_chance(r, 1, 2) || (force && dirty[p])) {
-			continue
+	when_s := clock_wall(&n.clock) / 1_000_000_000
+	from_line := git_head_line(vfs, sm.root)
+	existing := git_branches_other(vfs, sm.root)
+	branch: string
+	if len(existing) > 0 && rng_chance(r, 1, 3) {
+		branch = existing[rng_int(r, len(existing))]
+	} else {
+		files := make([dynamic]Git_File, context.temp_allocator)
+		removed := make([dynamic]string, context.temp_allocator)
+		for p in paths {
+			if !(rng_chance(r, 1, 2) || (force && dirty[p])) {
+				continue
+			}
+			if rng_chance(r, 1, 6) && !(force && dirty[p]) {
+				append(&removed, p)
+				continue
+			}
+			b := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< 1 + rng_int(r, 2) {
+				strings.write_string(&b, new_token(m, n, "s"))
+				strings.write_byte(&b, '\n')
+			}
+			append(&files, Git_File{name = p, data = transmute([]u8)strings.to_string(b)})
 		}
-		if rng_chance(r, 1, 6) && !(force && dirty[p]) {
-			append(&removed, p)
-			continue
-		}
-		b := strings.builder_make(context.temp_allocator)
-		for _ in 0 ..< 1 + rng_int(r, 2) {
+		if len(files) == 0 && len(removed) == 0 {
+			b := strings.builder_make(context.temp_allocator)
 			strings.write_string(&b, new_token(m, n, "s"))
 			strings.write_byte(&b, '\n')
+			append(&files, Git_File{name = paths[rng_int(r, len(paths))], data = transmute([]u8)strings.to_string(b)})
 		}
-		append(&files, Git_File{name = p, data = transmute([]u8)strings.to_string(b)})
+		branch = fmt.tprintf("sw%d", m.tok)
+		pushed := make([dynamic]odb.Oid, context.temp_allocator)
+		berr := git_branch_commit(vfs, sm.root, branch, files[:], removed[:], when_s, node_clock(&n.clock), rng_random(r), &pushed)
+		if berr == .None && !n.disk.dead && prim.exists(vfs, strings.concatenate({git, "/refs/remotes/origin/main"}, context.temp_allocator)) {
+			remote_push(w, n, sm.root, pushed[:])
+		}
+		if n.disk.dead || berr != .None {
+			world_note(w, "%s git branch %s in %s -> %v", n.name, branch, sm.root, berr)
+			context = instance_context(&n.inst)
+			if !n.disk.dead && w.cfg.io_rate == 0 {
+				world_fail(w, "%s could not commit git branch %s: %v", n.name, branch, berr)
+			}
+			node_after(n)
+			return
+		}
 	}
-	if len(files) == 0 && len(removed) == 0 {
-		b := strings.builder_make(context.temp_allocator)
-		strings.write_string(&b, new_token(m, n, "s"))
-		strings.write_byte(&b, '\n')
-		append(&files, Git_File{name = paths[rng_int(r, len(paths))], data = transmute([]u8)strings.to_string(b)})
+	key := "" if branch == "main" else strings.concatenate({"git:refs/heads/", branch}, context.temp_allocator)
+	base_line := key
+	known := key == ""
+	for l in m.objs[sm.oi].lines {
+		known ||= l == key
 	}
-	branch := fmt.tprintf("sw%d", m.tok)
-	when_s := clock_wall(&n.clock) / 1_000_000_000
-	pushed := make([dynamic]odb.Oid, context.temp_allocator)
-	berr := git_branch_commit(vfs, sm.root, branch, files[:], removed[:], when_s, node_clock(&n.clock), rng_random(r), &pushed)
-	if berr == .None && !n.disk.dead && prim.exists(vfs, strings.concatenate({git, "/refs/remotes/origin/main"}, context.temp_allocator)) {
-		remote_push(w, n, sm.root, pushed[:])
+	if !known {
+		base_line = from_line
 	}
-	if n.disk.dead || berr != .None {
-		world_note(w, "%s git branch %s in %s -> %v", n.name, branch, sm.root, berr)
+	old_disk := make(map[string][]u8, context.temp_allocator)
+	base := make(map[string][]u8, context.temp_allocator)
+	{
 		context = instance_context(&n.inst)
-		if !n.disk.dead && w.cfg.io_rate == 0 {
-			world_fail(w, "%s could not commit git branch %s: %v", n.name, branch, berr)
+		for i := len(n.agent_pending) - 1; i >= 0; i -= 1 {
+			pa := n.agent_pending[i]
+			if pa.root != sm.root || pa.inc != n.incarnation {
+				continue
+			}
+			fs.scope_close(n.reg, pa.scope)
+			_forget_scope(w, n, pa.scope)
+			world_note(w, "%s agent(actor %s) on %s is held for the branch switch; its scope ends", n.name, id_short(pa.actor), sm.root)
+			ordered_remove(&n.agent_pending, i)
+			agent_pending_free(w, pa)
+		}
+		fs.mount_sync(sm.m)
+		for p in paths {
+			if d, derr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator); derr == .None {
+				old_disk[p] = d
+			}
+			if d, terr := eng.tree_read(&n.e, m.objs[sm.oi].o, p, context.temp_allocator, {}, line_eng(base_line)); terr == .None {
+				base[p] = d
+			}
 		}
 		node_after(n)
+	}
+	if n.disk.dead || !n.alive {
 		return
 	}
 	changes := make([dynamic]Git_Change, context.temp_allocator)
@@ -886,34 +908,77 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 		append(&names, strings.concatenate({"-" if ch.gone else "", ch.name}, context.temp_allocator))
 	}
 	world_note(w, "%s git checkout%s %s in %s -> %v %v changed %v", n.name, " -f" if force else "", branch, sm.root, res, cerr, names[:])
-	if res == .Done && cerr == .None && !n.disk.dead {
+	if res != .Done {
+		context = instance_context(&n.inst)
+		node_after(n)
+		return
+	}
+	obj_add_line(m, sm.oi, key)
+	if cerr == .None && !n.disk.dead {
 		for ch in changes {
 			got, gerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), context.temp_allocator)
 			if ch.gone != (gerr == .Not_Found) || (!ch.gone && string(got) != string(ch.new)) {
 				world_fail(w, "%s git checkout %s left %s as %q (%v), not %q", n.name, branch, ch.name, string(got), gerr, string(ch.new))
 			}
 		}
-	}
-	for ch in changes {
-		op := new_op(m, .Tree_Remove if ch.gone else .Disk_Person, n, sm.oi)
-		op.path = strings.clone(ch.name, w.allocator)
-		op.overwrite = !ch.gone && len(ch.old) > 0
-		for t in parse_tokens(ch.old) {
-			append(&op.deletes, strings.clone(t.text, w.allocator))
+		for p in paths {
+			after, aerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator)
+			had_base := p in base
+			gone := aerr == .Not_Found
+			if (gone && !had_base) || (!gone && had_base && string(after) == string(base[p])) {
+				continue
+			}
+			op := new_op(m, .Tree_Remove if gone else .Disk_Person, n, sm.oi)
+			op.line = strings.clone(key, w.allocator)
+			op.path = strings.clone(p, w.allocator)
+			op.overwrite = !gone && had_base
+			kept := make(map[string]bool, context.temp_allocator)
+			if !gone {
+				for t in parse_tokens(after) {
+					kept[t.text] = true
+					append(&op.tokens, strings.clone(t.text, w.allocator))
+				}
+			}
+			for src in ([2][]u8{base[p], old_disk[p]}) {
+				for t in parse_tokens(src) {
+					if !kept[t.text] {
+						kept[t.text] = true
+						append(&op.deletes, strings.clone(t.text, w.allocator))
+					}
+				}
+			}
+			_writer_set(w, n, strings.concatenate({sm.root, "/", p}, context.temp_allocator), Writer_Info{})
+			op_done(op, 0, .None)
+			op.status = .Acked
 		}
-		for t in parse_tokens(ch.new) {
-			append(&op.tokens, strings.clone(t.text, w.allocator))
-		}
-		_writer_set(w, n, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), Writer_Info{})
+	} else {
+		lines := make([dynamic]string, context.temp_allocator)
 		if n.disk.dead {
-			continue
+			append(&lines, key)
+			if from_line != key {
+				append(&lines, from_line)
+			}
+		} else {
+			append(&lines, git_head_line(vfs, sm.root))
 		}
-		if cerr != .None {
-			op.status = .Uncertain
-			continue
+		for ln in lines {
+			for ch in changes {
+				op := new_op(m, .Tree_Remove if ch.gone else .Disk_Person, n, sm.oi)
+				op.line = strings.clone(ln, w.allocator)
+				op.path = strings.clone(ch.name, w.allocator)
+				op.overwrite = !ch.gone && len(ch.old) > 0
+				for t in parse_tokens(ch.old) {
+					append(&op.deletes, strings.clone(t.text, w.allocator))
+				}
+				for t in parse_tokens(ch.new) {
+					append(&op.tokens, strings.clone(t.text, w.allocator))
+				}
+				_writer_set(w, n, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), Writer_Info{})
+				if !n.disk.dead {
+					op.status = .Uncertain
+				}
+			}
 		}
-		op_done(op, 0, .None)
-		op.status = .Acked
 	}
 	context = instance_context(&n.inst)
 	if cerr != .None && !n.disk.dead {

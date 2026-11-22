@@ -423,6 +423,18 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
+		off_line := false
+		for lv in vl {
+			if !crdt.graph_contains(&h.g, sl[:], lv) {
+				off_line = true
+				break
+			}
+		}
+		if off_line {
+			_base_note(m, c.path, .Mismatch)
+			append(&keep, c)
+			continue
+		}
 		done, rerr := rebase_commit(p, &c, v)
 		if rerr != .None {
 			_base_note(m, c.path, .Mismatch)

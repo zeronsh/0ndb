@@ -2,6 +2,7 @@ package engine
 
 import "core:crypto/blake2b"
 import "core:fmt"
+import "core:strings"
 import "../fs"
 import "../http"
 import "../prim"
@@ -123,6 +124,7 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 				_log(e, .Warn, "write observer unavailable")
 			}
 		}
+		fs.registry_set_line_hooks(&e.plug.reg, _on_mount_line, nil, e)
 		if aerr := fs.registry_attach(&e.plug.reg, e.loop, _on_mount_ready, e); aerr != .None {
 			return nil, _ferr(aerr)
 		}
@@ -345,4 +347,25 @@ _on_base_note :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, data: rawpt
 		e.stats.base_not_text += 1
 	}
 	_log(e, .Debug, fmt.tprintf("agent write base for %s: %v", rel, note))
+}
+
+@(private)
+_on_mount_line :: proc(m: ^fs.Mount, from, to: string, data: rawptr) {
+	e := (^Engine)(data)
+	context = context_for(e)
+	for mt in e.plug.mounts {
+		if &mt.mount == m {
+			detail := strings.concatenate({from, "\n", to}, context.temp_allocator)
+			_emit(e, Event{kind = .Line_Switched, space = mt.object.space, object = mt.object.id, detail = detail})
+			return
+		}
+	}
+}
+
+line_switch_parts :: proc(ev: ^Event) -> (from, to: string) {
+	i := strings.index_byte(ev.detail, '\n')
+	if i < 0 {
+		return "", ev.detail
+	}
+	return ev.detail[:i], ev.detail[i + 1:]
 }
