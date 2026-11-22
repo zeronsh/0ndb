@@ -751,6 +751,7 @@ _card_known :: proc(e: ^Engine, sp: ^Space, device: prim.Id) {
 			}
 		}
 	}
+	_space_waits_wake(e, sp.id, .Catalog)
 	if objs, ok := sp.card_relay[device]; ok {
 		delete_key(&sp.card_relay, device)
 		for id in objs {

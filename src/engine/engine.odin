@@ -827,7 +827,7 @@ _tick_end :: proc(e: ^Engine) {
 
 @(private)
 _tick_pending :: proc(e: ^Engine) -> bool {
-	if e.tick_wanted || len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || len(e.leave_ready) > 0 || len(e.refused_stop) > 0 || _remote_pending(e) {
+	if e.tick_wanted || e.space_woke || len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || len(e.leave_ready) > 0 || len(e.refused_stop) > 0 || _remote_pending(e) {
 		return true
 	}
 	for _, sp in e.spaces {
