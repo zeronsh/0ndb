@@ -159,8 +159,8 @@ _worker_main :: proc(t: ^Tree) {
 		return
 	}
 	for {
-		pf := [3]Pollfd{{fd = t.fd, events = POLLIN}, {fd = t.stop_fd, events = POLLIN}, {fd = t.flush_fd, events = POLLIN}}
-		n, e := _sys_poll(&pf[0], 3, WAKE_DELAY_MS if t.unsignaled > 0 else -1)
+		pf := [4]Pollfd{{fd = t.fd, events = POLLIN}, {fd = t.stop_fd, events = POLLIN}, {fd = t.flush_fd, events = POLLIN}, {fd = t.gate_fd, events = POLLIN}}
+		n, e := _sys_poll(&pf[0], 4, WAKE_DELAY_MS if t.unsignaled > 0 else -1)
 		if e == EINTR {
 			continue
 		}
@@ -173,6 +173,10 @@ _worker_main :: proc(t: ^Tree) {
 		}
 		if pf[2].revents != 0 {
 			_efd_drain(t.flush_fd)
+		}
+		if pf[3].revents != 0 {
+			_efd_drain(t.gate_fd)
+			_release_parked(t.sup, t, false)
 		}
 		if intrinsics.atomic_exchange_explicit(&t.flush_req, 0, .Seq_Cst) != 0 {
 			t.unsignaled += 1
@@ -196,6 +200,7 @@ _worker_main :: proc(t: ^Tree) {
 			break
 		}
 	}
+	_release_parked(t.sup, t, true)
 	intrinsics.atomic_store_explicit(&t.ended, 1, .Seq_Cst)
 	t.unsignaled += 1
 	_flush_wake(t)
@@ -208,7 +213,8 @@ _worker_start :: proc(s: ^Supervisor, t: ^Tree) -> prim.Error {
 	t.space_fd = _eventfd()
 	t.ready_fd = _eventfd()
 	t.flush_fd = _eventfd()
-	if t.stop_fd < 0 || t.space_fd < 0 || t.ready_fd < 0 || t.flush_fd < 0 {
+	t.gate_fd = _eventfd()
+	if t.stop_fd < 0 || t.space_fd < 0 || t.ready_fd < 0 || t.flush_fd < 0 || t.gate_fd < 0 {
 		return .Too_Many_Files
 	}
 	buf, berr := make([]u8, RING_SIZE, t.alloc)
@@ -256,6 +262,7 @@ _worker_free :: proc(t: ^Tree) {
 	_sys_close(t.space_fd)
 	_sys_close(t.ready_fd)
 	_sys_close(t.flush_fd)
+	_sys_close(t.gate_fd)
 }
 
 @(private)
@@ -319,7 +326,7 @@ _encode_write :: proc(buf: ^[dynamic]u8, w: ^Write) {
 	clear(buf)
 	pw := prim.writer(buf)
 	prim.write_u8(&pw, u8(w.op))
-	prim.write_u8(&pw, u8(w.exact))
+	prim.write_u8(&pw, u8(w.exact) | (2 if w.git else 0))
 	prim.write_u32le(&pw, w.flags)
 	prim.write_u32le(&pw, u32(w.tid))
 	prim.write_u32le(&pw, u32(w.pid))
@@ -339,7 +346,9 @@ _deliver_record :: proc(s: ^Supervisor, rec: []u8) {
 	rd := prim.reader(rec)
 	w: Write
 	w.op = Op(prim.read_u8(&rd))
-	w.exact = prim.read_u8(&rd) != 0
+	bits := prim.read_u8(&rd)
+	w.exact = bits & 1 != 0
+	w.git = bits & 2 != 0
 	w.flags = prim.read_u32le(&rd)
 	w.tid = prim.Pid(i32(prim.read_u32le(&rd)))
 	w.pid = prim.Pid(i32(prim.read_u32le(&rd)))
