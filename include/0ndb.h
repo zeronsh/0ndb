@@ -117,7 +117,7 @@
  *                 16 available, 17 promoted, 18 peer_misbehaving,
  *                 19 members_changed, 20 epoch_changed, 21 access_revoked,
  *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
- *                 25 login_done, 26 login_failed, 27 lease_lapsed
+ *                 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left
  *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
  *                 5 runner, 6 guest, 7 directory
  *   member_role   0 owner, 1 admin, 2 member, 3 reader
@@ -1116,6 +1116,8 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_MEMBER_ADD 24u
 /* space.rotate(space: id) -> {} */
 #define ONDB_OP_SPACE_ROTATE 25u
+/* space.leave(space: id, device_only: bool) -> removed:uvarint skipped:uvarint */
+#define ONDB_OP_SPACE_LEAVE 170u
 /* space.pool(space: id, on: bool) -> {} */
 #define ONDB_OP_SPACE_POOL 26u
 /* space.join_enrollment(space: id, proof: bytes, name: str, relay: str, relay_key: bytes) -> space:id */

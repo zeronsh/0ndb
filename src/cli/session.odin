@@ -159,6 +159,22 @@ spaces :: proc(s: ^Session) -> json.Array {
 	return jarr(must(s, `{"op":"space.list"}`), "spaces")
 }
 
+resolve_space :: proc(s: ^Session, v: string) -> string {
+	found := 0
+	hit: string
+	for sp in spaces(s) {
+		id := jstr(sp, "id")
+		if id_matches(id, v) || jstr(sp, "name") == v {
+			hit = id
+			found += 1
+		}
+	}
+	if found != 1 {
+		fail(.Usage, "%q matches %d spaces", v, found)
+	}
+	return hit
+}
+
 default_space :: proc(s: ^Session, create := false) -> prim.Id {
 	if s.resolved {
 		return s.space

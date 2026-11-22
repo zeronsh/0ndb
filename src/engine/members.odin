@@ -55,6 +55,7 @@ Space_Members :: struct {
 	member:      bool,
 	caught:      bool,
 	deferred:    bool,
+	elect_wait:  bool,
 	want:        map[prim.Id]i64,
 }
 
@@ -582,13 +583,19 @@ _members_maybe_commit :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 	if err != .None {
 		return
 	}
-	need := st.epoch < 0 || !st.eligible
-	if !need && st.epoch >= 0 {
+	need := st.epoch < 0
+	sp.mem.elect_wait = false
+	if st.epoch >= 0 {
 		t: osync.Ratchet_Tree
 		if osync.roster_leaves(&m.roster, st.epoch, &t, context.temp_allocator) == .None {
 			if _, in_tree := osync.tree_find_leaf(&t, e.identity.sign); !in_tree {
 				need = true
+			} else if !st.eligible {
+				need = _members_elected(e, sp, m, &t, now)
+				sp.mem.elect_wait = !need
 			}
+		} else if !st.eligible {
+			need = true
 		}
 	}
 	if !need {
@@ -601,6 +608,47 @@ _members_maybe_commit :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 	}
 	_members_emit(e, sp, m, [][]u8{raw})
 	_members_adopt(e, sp, m)
+}
+
+@(private)
+_members_elected :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, t: ^osync.Ratchet_Tree, now: u64) -> bool {
+	best: prim.Id
+	best_admin := false
+	have := false
+	for &x in m.roster.members {
+		if !osync.member_active(&x, now) || !osync.member_leaf_kind(x.kind) || len(x.scope) > 0 {
+			continue
+		}
+		if _, ok := osync.tree_find_leaf(t, x.sign); !ok {
+			continue
+		}
+		d := prim.Id(x.device)
+		if d != e.self {
+			if !sp.repl_on {
+				continue
+			}
+			if up, _, _ := osync.replicator_presence(&sp.repl, d); !up {
+				continue
+			}
+		}
+		admin := x.role <= .Admin
+		if have && best_admin && !admin {
+			continue
+		}
+		if !have || (admin && !best_admin) || _id_lt(d, best) {
+			best = d
+			best_admin = admin
+			have = true
+		}
+	}
+	return have && best == e.self
+}
+
+@(private)
+_members_presence :: proc(e: ^Engine, sp: ^Space) {
+	if sp.open && !sp.keyless && sp.mem.elect_wait && _members_ready(sp) {
+		_members_recheck(e, sp)
+	}
 }
 
 @(private)
