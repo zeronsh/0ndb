@@ -37,6 +37,8 @@ RUNTIME_OPS := []Op {
 	{137, "agent.actor", {{"agent", .Id, nil}}, "actor:id", op_agent_actor},
 	{138, "wake", {OBJ}, "", op_wake},
 	{139, "placement", {OBJ}, "Placement", op_placement},
+	{162, "runners", {SPACE, OBJ}, "Runners", op_runners},
+	{163, "subscribe.runners", {SPACE, OBJ}, "Runners", nil},
 }
 
 @(private)
@@ -606,7 +608,7 @@ op_agent_actor :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
-PLACEMENT_NAMES := [4]string{"none", "assigned", "running", "waiting_runner"}
+PLACEMENT_NAMES := [6]string{"none", "assigned", "running", "waiting_runner", "idle", "placing"}
 
 emit_placement :: proc(o: ^Out, info: ^rt.Placement_Info) {
 	o_enum(o, "state", u64(info.state), PLACEMENT_NAMES[:])
@@ -614,6 +616,59 @@ emit_placement :: proc(o: ^Out, info: ^rt.Placement_Info) {
 	o_id(o, "runner", info.runner)
 	o_str(o, "provider", info.provider)
 	o_i64(o, "since_ms", info.since_ms)
+	o_id(o, "last_runner", info.last_runner)
+}
+
+emit_runners :: proc(o: ^Out, list: []rt.Runner_Entry) {
+	o_arr(o, "runners", len(list))
+	for &x in list {
+		o_obj(o, "")
+		o_id(o, "device", x.device)
+		o_str(o, "name", x.name)
+		o_enum(o, "kind", u64(x.kind), RUNNER_KIND_NAMES[:])
+		o_enum(o, "state", u64(x.state), RUNNER_STATE_NAMES[:])
+		_emit_lines(o, "providers", x.providers)
+		_emit_lines(o, "signed_in", x.signed_in)
+		o_bool(o, "current", x.current)
+		o_bool(o, "last", x.last)
+		o_end(o)
+	}
+	o_end(o)
+}
+
+@(private)
+_emit_lines :: proc(o: ^Out, name: string, list: string) {
+	parts := strings.split(list, "\n", context.temp_allocator) if len(list) > 0 else nil
+	o_arr(o, name, len(parts))
+	for p in parts {
+		o_str(o, "", p)
+	}
+	o_end(o)
+}
+
+runners_space :: proc(c: ^Call) -> (space: prim.Id, ob: Object) {
+	ob = a_object(c, "object")
+	space = a_id(c, "space")
+	if prim.id_is_zero(space) {
+		space = ob.space
+	}
+	if ob.space != space {
+		ob = {}
+	}
+	return
+}
+
+op_runners :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	space, ob := runners_space(c)
+	if prim.id_is_zero(space) {
+		return .Invalid
+	}
+	emit_runners(o, rt.runner_directory(r, space, ob, context.temp_allocator))
+	return .Ok
 }
 
 op_placement :: proc(c: ^Call, o: ^Out) -> Status {

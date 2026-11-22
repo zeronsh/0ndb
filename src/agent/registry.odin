@@ -49,6 +49,13 @@ Provider_Descriptor :: struct {
 	store:        Store,
 	seed_style:   Seed_Style,
 	seed_budget:  int,
+	auth_env:     []string,
+	auth_files:   []Auth_Probe,
+}
+
+Auth_Probe :: struct {
+	path:     string,
+	contains: string,
 }
 
 Registry :: struct {
@@ -58,6 +65,33 @@ Registry :: struct {
 
 @(private, rodata)
 ARGV_CLAUDE := [?]string{"claude"}
+
+@(private, rodata)
+AUTH_ENV_CLAUDE := [?]string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"}
+
+@(private, rodata)
+AUTH_FILES_CLAUDE := [?]Auth_Probe{{".claude/.credentials.json", ""}, {".claude.json", "\"oauthAccount\""}}
+
+@(private, rodata)
+AUTH_ENV_CODEX := [?]string{"OPENAI_API_KEY", "CODEX_API_KEY"}
+
+@(private, rodata)
+AUTH_FILES_CODEX := [?]Auth_Probe{{".codex/auth.json", ""}}
+
+@(private, rodata)
+AUTH_ENV_PI := [?]string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"}
+
+@(private, rodata)
+AUTH_FILES_PI := [?]Auth_Probe{{".pi/agent/auth.json", ""}}
+
+@(private, rodata)
+AUTH_ENV_CURSOR := [?]string{"CURSOR_API_KEY"}
+
+@(private, rodata)
+AUTH_FILES_CURSOR := [?]Auth_Probe{{".cursor/cli-config.json", "\"authInfo\""}}
+
+@(private, rodata)
+AUTH_FILES_OPENCODE := [?]Auth_Probe{{".local/share/opencode/auth.json", ""}}
 
 @(private, rodata)
 ARGV_CODEX := [?]string{"codex", "app-server"}
@@ -103,6 +137,8 @@ builtin :: proc(p: Provider) -> Provider_Descriptor {
 			store = .Claude_Projects,
 			seed_style = .Xml,
 			seed_budget = 120_000,
+			auth_env = AUTH_ENV_CLAUDE[:],
+			auth_files = AUTH_FILES_CLAUDE[:],
 		}
 	case .Codex:
 		return {
@@ -113,6 +149,8 @@ builtin :: proc(p: Provider) -> Provider_Descriptor {
 			capabilities = {.Native_Steer, .Resume, .Fork_At_Message, .Persistent, .List_Models, .Images},
 			store = .Codex_Rollouts,
 			seed_budget = 120_000,
+			auth_env = AUTH_ENV_CODEX[:],
+			auth_files = AUTH_FILES_CODEX[:],
 		}
 	case .Pi:
 		return {
@@ -123,6 +161,8 @@ builtin :: proc(p: Provider) -> Provider_Descriptor {
 			capabilities = {.Native_Steer, .Resume, .Fork_At_Message, .Persistent, .List_Models, .Images},
 			store = .Pi_Sessions,
 			seed_budget = 80_000,
+			auth_env = AUTH_ENV_PI[:],
+			auth_files = AUTH_FILES_PI[:],
 		}
 	case .Muse:
 		return {
@@ -155,6 +195,8 @@ builtin :: proc(p: Provider) -> Provider_Descriptor {
 			steer = .Supersede,
 			store = .Cursor_Chats,
 			seed_budget = 60_000,
+			auth_env = AUTH_ENV_CURSOR[:],
+			auth_files = AUTH_FILES_CURSOR[:],
 		}
 	case .Devin:
 		return {
@@ -188,6 +230,7 @@ builtin :: proc(p: Provider) -> Provider_Descriptor {
 			steer = .Concurrent,
 			store = .OpenCode_Cli,
 			seed_budget = 60_000,
+			auth_files = AUTH_FILES_OPENCODE[:],
 		}
 	}
 	return {}
@@ -282,6 +325,20 @@ clone_descriptor :: proc(desc: Provider_Descriptor, allocator: mem.Allocator) ->
 	if out.client_meta, err = clone_strings(desc.client_meta, allocator); err != .None {
 		return {}, err
 	}
+	if out.auth_env, err = clone_strings(desc.auth_env, allocator); err != .None {
+		return {}, err
+	}
+	out.auth_files = nil
+	if len(desc.auth_files) > 0 {
+		files, merr := make([]Auth_Probe, len(desc.auth_files), allocator)
+		if merr != nil {
+			return {}, .Out_Of_Memory
+		}
+		for f, i in desc.auth_files {
+			files[i] = Auth_Probe{strings.clone(f.path, allocator), strings.clone(f.contains, allocator)}
+		}
+		out.auth_files = files
+	}
 	return out, .None
 }
 
@@ -292,5 +349,11 @@ drop_descriptor :: proc(desc: ^Provider_Descriptor, allocator: mem.Allocator) {
 	drop_strings(desc.argv, allocator)
 	drop_strings(desc.env, allocator)
 	drop_strings(desc.client_meta, allocator)
+	drop_strings(desc.auth_env, allocator)
+	for f in desc.auth_files {
+		delete(f.path, allocator)
+		delete(f.contains, allocator)
+	}
+	delete(desc.auth_files, allocator)
 	desc^ = {}
 }

@@ -65,6 +65,7 @@ Placement :: struct {
 	provider: string,
 	policy:   []u8,
 	exclude:  prim.Id,
+	prefer:   prim.Id,
 }
 
 Placement_State :: enum u8 {
@@ -72,19 +73,24 @@ Placement_State :: enum u8 {
 	Assigned,
 	Running,
 	Waiting_Runner,
+	Idle,
+	Placing,
 }
 
 Placement_Info :: struct {
 	state:    Placement_State,
 	msg:      Rid,
 	runner:   prim.Id,
-	provider: string,
-	since_ms: i64,
+	provider:    string,
+	since_ms:    i64,
+	last_runner: prim.Id,
 }
 
 Scheduler :: struct {
-	data:  rawptr,
-	place: proc(data: rawptr, r: ^Runtime, p: ^Placement) -> prim.Id,
+	data:   rawptr,
+	place:  proc(data: rawptr, r: ^Runtime, p: ^Placement) -> prim.Id,
+	ask:    proc(data: rawptr, r: ^Runtime, p: ^Placement, token: u64),
+	cancel: proc(data: rawptr, r: ^Runtime, token: u64),
 }
 
 Model_Plug :: struct {
@@ -134,6 +140,7 @@ Hooks :: struct {
 	sealed:    proc(data: rawptr, r: ^Runtime, o: Object, reply: Rid, status: convo.Seal_Status),
 	event:     proc(data: rawptr, r: ^Runtime, name: string, o: Object),
 	placement: proc(data: rawptr, r: ^Runtime, o: Object, info: Placement_Info),
+	runners:   proc(data: rawptr, r: ^Runtime, space: prim.Id),
 }
 
 Config :: struct {
@@ -149,6 +156,7 @@ Config :: struct {
 	secrets:          Secrets,
 	homes:            Homes,
 	hooks:            Hooks,
+	name:             string,
 	default_provider: string,
 	default_model:    string,
 	default_runner:   prim.Id,
@@ -268,6 +276,7 @@ Runtime :: struct {
 	lease_at:    i64,
 	prev_events: eng.Event_Hook,
 	hooked:      bool,
+	asks:        [dynamic]Ask,
 	stats:       Stats,
 }
 
@@ -301,6 +310,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	}
 	r.cfg.work_root = clone(cfg.work_root, allocator)
 	r.cfg.default_provider = clone(cfg.default_provider, allocator)
+	r.cfg.name = clone(cfg.name, allocator)
 	r.cfg.default_model = clone(cfg.default_model, allocator)
 	r.cfg.home_dir = clone(cfg.home_dir if len(cfg.home_dir) > 0 else _home_default(cfg.env), allocator)
 	if len(cfg.env) > 0 {
@@ -337,6 +347,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	r.leases = make([dynamic]Lease_Watch, allocator)
 	r.follows = make([dynamic]Follow, allocator)
 	r.revives = make([dynamic]Revive_Wait, allocator)
+	r.asks = make([dynamic]Ask, allocator)
 	agent.registry_init(&r.registry, allocator)
 	r.prev_events = e.cfg.events
 	e.cfg.events = eng.Event_Hook{data = r, event = _on_engine_event}
@@ -389,6 +400,9 @@ _presence_changed :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, up: bool
 	if !attached {
 		return
 	}
+	_asks_forget(r, space)
+	_runners_changed(r, space)
+	_sched_rearm(r)
 	if up {
 		_pending_scan(r, space)
 		return
@@ -474,6 +488,7 @@ close :: proc(r: ^Runtime) {
 	}
 	delete(r.follows)
 	delete(r.revives)
+	_asks_close(r)
 	if r.warmer_on {
 		model.warmer_destroy(&r.warmer)
 	}
@@ -491,6 +506,7 @@ close :: proc(r: ^Runtime) {
 	delete(r.clients)
 	delete(r.cfg.work_root, r.allocator)
 	delete(r.cfg.default_provider, r.allocator)
+	delete(r.cfg.name, r.allocator)
 	delete(r.cfg.default_model, r.allocator)
 	delete(r.cfg.home_dir, r.allocator)
 	for s in r.cfg.env {
@@ -827,6 +843,9 @@ default_scheduler :: proc() -> Scheduler {
 _default_place :: proc(data: rawptr, r: ^Runtime, p: ^Placement) -> prim.Id {
 	context = eng.context_for(r.e)
 	space := p.object.space
+	if !prim.id_is_zero(p.prefer) && p.prefer != p.exclude && (runner_live(r, space, p.prefer, p.provider) || (runner_pool(r, space, p.prefer) && !runner_live(r, space, p.prefer, "")) || is_pool_id(r, space, p.prefer)) {
+		return p.prefer
+	}
 	if !prim.id_is_zero(p.sender) && p.sender != p.exclude && runner_live(r, space, p.sender, p.provider) {
 		return p.sender
 	}
@@ -871,7 +890,8 @@ policy_runner :: proc(policy: []u8) -> (id: prim.Id, ok: bool) {
 }
 
 place :: proc(r: ^Runtime, p: ^Placement) -> prim.Id {
-	return r.cfg.scheduler.place(r.cfg.scheduler.data, r, p)
+	x, _ := place_decided(r, p)
+	return x
 }
 
 @(private)

@@ -22,13 +22,15 @@ Sub :: struct {
 	catalog: bool,
 	object: Object,
 	ready:  Sub_Ready,
+	runners: bool,
+	space:  prim.Id,
 }
 
-subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, data: rawptr) -> (id: u64, catalog: bool, object: Object, status: Status) {
+subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, data: rawptr, payload: Sub_Proc = nil) -> (id: u64, catalog: bool, object: Object, status: Status) {
 	if raw == nil {
 		return 0, false, {}, .Invalid
 	}
-	id, status, _ = _subscribe(a, req, json_form, nil, raw, data)
+	id, status, _ = _subscribe(a, req, json_form, payload, raw, data)
 	for s in a.subs {
 		if s.id == id {
 			catalog = s.catalog
@@ -73,6 +75,9 @@ _subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_S
 			return 0, .Unsupported, nil
 		}
 		buffer = true
+	case "subscribe.runners":
+		id, status = _subscribe_runners(a, &c, json_form, cb, data)
+		return id, status, nil
 	case:
 		return 0, .Bad_Request, nil
 	}
@@ -118,13 +123,64 @@ _subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_S
 	return s.id, .Ok, nil
 }
 
+@(private)
+_subscribe_runners :: proc(a: ^Api, c: ^Call, json_form: bool, cb: Sub_Proc, data: rawptr) -> (id: u64, status: Status) {
+	if a.r == nil {
+		return 0, .Unsupported
+	}
+	if cb == nil {
+		return 0, .Bad_Request
+	}
+	space, ob := runners_space(c)
+	if prim.id_is_zero(space) {
+		return 0, .Invalid
+	}
+	s := new(Sub, a.allocator)
+	s.api = a
+	s.json = json_form
+	s.cb = cb
+	s.data = data
+	s.runners = true
+	s.space = space
+	s.object = ob
+	a.next_sub += 1
+	s.id = a.next_sub
+	append(&a.subs, s)
+	return s.id, .Ok
+}
+
+runners_notify :: proc(a: ^Api, space: prim.Id, object: Object = {}) {
+	if a.r == nil {
+		return
+	}
+	ids := make([dynamic]u64, context.temp_allocator)
+	for s in a.subs {
+		if s.runners && s.space == space && (prim.id_is_zero(object.id) || s.object == object) {
+			append(&ids, s.id)
+		}
+	}
+	for id in ids {
+		for s in a.subs {
+			if s.id != id {
+				continue
+			}
+			buf := make([dynamic]u8, context.temp_allocator)
+			o: Out
+			out_init(&o, &buf, s.json)
+			emit_runners(&o, rt.runner_directory(a.r, s.space, s.object, context.temp_allocator))
+			s.cb(s.data, s.id, out_finish(&o))
+			break
+		}
+	}
+}
+
 unsubscribe :: proc(a: ^Api, id: u64) {
 	for s, i in a.subs {
 		if s.id == id {
 			ordered_remove(&a.subs, i)
 			if s.buffer != 0 {
 				eng.buffer_close(a.e, s.buffer)
-			} else {
+			} else if s.engine != 0 {
 				eng.unsubscribe(a.e, s.engine)
 			}
 			free(s, a.allocator)

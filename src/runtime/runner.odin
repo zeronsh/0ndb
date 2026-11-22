@@ -83,9 +83,9 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			if busy {
 				break
 			}
-			x := place_intent(r, o, &it)
-			if prim.id_is_zero(x) {
-				_placement_waiting(r, o, it.item, _intent_provider(r, o), {})
+			x, verdict, on := _intent_target(r, o, v, &t, &it)
+			if _report(r, o, it.item, _intent_provider(r, o), verdict, on) {
+				return
 			}
 			if x != r.self {
 				return
@@ -133,12 +133,18 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			lease_watch(r, o, expires)
 			return
 		}
-		a, ok := agent_resolve(r, o, hm.provider, hm.model, context.temp_allocator)
-		if !ok {
-			return
-		}
 		um, uerr := convo.message(v, &t, convo.Position{msg = hm.parent}, context.temp_allocator)
 		if uerr != .None {
+			return
+		}
+		if aerr == .None && !prim.id_is_zero(assignee) && assignee != hm.runner {
+			if _placed_here(r, o, v, &t, &um, hm.runner) {
+				start_run(r, o, hm.parent)
+			}
+			return
+		}
+		a, ok := agent_resolve(r, o, hm.provider, hm.model, context.temp_allocator)
+		if !ok {
 			return
 		}
 		p := Placement {
@@ -149,11 +155,11 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			agent    = a.object.id,
 			provider = placement_provider(&a),
 			policy   = a.policy,
-			exclude  = hm.runner,
+			prefer   = hm.runner,
 		}
-		x := place(r, &p)
-		if prim.id_is_zero(x) {
-			_placement_waiting(r, o, hm.parent, p.provider, hm.runner)
+		x, verdict, on := _decide(r, o, &a, &p, hm.runner)
+		if _report(r, o, hm.parent, p.provider, verdict, on) {
+			return
 		}
 		if x == r.self && start_run(r, o, hm.parent) == .None {
 			r.stats.takeovers += 1
@@ -356,25 +362,160 @@ _intent_provider :: proc(r: ^Runtime, o: Object) -> string {
 }
 
 @(private)
-_placed_here :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message) -> bool {
-	x, _ := _place_message(r, o, v, t, m)
+_placed_here :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message, dead: prim.Id = {}) -> bool {
+	x, _ := _place_message(r, o, v, t, m, dead)
 	return x == r.self
 }
 
+Verdict :: enum u8 {
+	Run,
+	Wait,
+	Idle,
+	Placing,
+}
+
 @(private)
-_place_message :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message, dead: prim.Id = {}) -> (runner: prim.Id, assignee: prim.Id) {
+_decide :: proc(r: ^Runtime, o: Object, a: ^Agent_Info, p: ^Placement, from: prim.Id) -> (runner: prim.Id, verdict: Verdict, on: prim.Id) {
+	space := o.space
+	if prim.id_is_zero(from) {
+		x, ok := place_decided(r, p)
+		if !ok {
+			return {}, .Placing, {}
+		}
+		if prim.id_is_zero(x) {
+			return {}, .Wait, {}
+		}
+		return _settle(r, space, x)
+	}
+	pool_id := is_pool_id(r, space, from)
+	pool := pool_id || runner_pool(r, space, from)
+	policy := a.takeover
+	if pool_id {
+		policy = .Default
+	}
+	switch policy {
+	case .Auto:
+		p.exclude = from
+		x, ok := place_decided(r, p)
+		if !ok {
+			return {}, .Placing, {}
+		}
+		if prim.id_is_zero(x) {
+			return {}, .Wait, from
+		}
+		return _settle(r, space, x)
+	case .Never:
+		if !pool {
+			return {}, .Idle, from
+		}
+		p.prefer = from
+		p.exclude = {}
+		if _, ok := place_decided(r, p); !ok {
+			return {}, .Placing, {}
+		}
+		return {}, .Wait, from
+	case .Default:
+		if !pool {
+			return {}, .Idle, from
+		}
+		p.prefer = from
+		p.exclude = {}
+		x, ok := place_decided(r, p)
+		if !ok {
+			return {}, .Placing, {}
+		}
+		if prim.id_is_zero(x) || x == from {
+			return {}, .Wait, from
+		}
+		return _settle(r, space, x)
+	}
+	return {}, .Wait, from
+}
+
+@(private)
+_settle :: proc(r: ^Runtime, space: prim.Id, x: prim.Id) -> (runner: prim.Id, verdict: Verdict, on: prim.Id) {
+	if is_pool_id(r, space, x) || (runner_pool(r, space, x) && !runner_live(r, space, x, "")) {
+		return {}, .Wait, x
+	}
+	return x, .Run, {}
+}
+
+@(private)
+_report :: proc(r: ^Runtime, o: Object, msg: Rid, provider: string, verdict: Verdict, on: prim.Id) -> bool {
+	switch verdict {
+	case .Run:
+		return false
+	case .Wait:
+		_placement_waiting(r, o, msg, provider, on)
+	case .Idle:
+		_placement_idle(r, o, msg, provider, on)
+	case .Placing:
+	}
+	return true
+}
+
+@(private)
+_pool_takes :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, as: prim.Id) -> bool {
+	if !r.cfg.runner || !r.cfg.pool || !is_pool_id(r, o.space, as) {
+		return false
+	}
+	mine, ok := runner_pool_id(r, o.space, r.self)
+	return ok && mine == as && last_runner(r, o, v, t, {}, true) == r.self
+}
+
+@(private)
+_intent_target :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, it: ^convo.Intent) -> (runner: prim.Id, verdict: Verdict, on: prim.Id) {
+	a, _ := agent_resolve(r, o, "", "", context.temp_allocator)
+	home := last_runner(r, o, v, t, {})
+	if _pool_takes(r, o, v, t, home) {
+		return r.self, .Run, {}
+	}
+	p := Placement {
+		kind     = .Intent,
+		object   = o,
+		msg      = it.item,
+		sender   = it.by,
+		agent    = a.object.id,
+		provider = placement_provider(&a),
+		policy   = a.policy,
+		prefer   = home,
+	}
+	return _decide(r, o, &a, &p, _gone(r, o.space, home))
+}
+
+@(private)
+_gone :: proc(r: ^Runtime, space: prim.Id, id: prim.Id) -> prim.Id {
+	if prim.id_is_zero(id) || id == r.self {
+		return {}
+	}
+	if is_pool_id(r, space, id) || runner_gone(r, space, id) {
+		return id
+	}
+	return {}
+}
+
+@(private)
+_message_target :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message, dead: prim.Id, probe: bool) -> (runner: prim.Id, assignee: prim.Id, verdict: Verdict, on: prim.Id, provider: string) {
 	a, _ := agent_resolve(r, o, m.provider, m.model, context.temp_allocator)
-	provider := placement_provider(&a)
-	exclude := dead
+	provider = placement_provider(&a)
+	from := dead
 	if as, aerr := convo.assignee(v, t, m.id); aerr == .None && !prim.id_is_zero(as) {
 		assignee = as
 		if as == r.self && r.cfg.runner && as != dead {
-			return as, as
+			return as, as, .Run, {}, provider
 		}
-		if as != dead && !_claim_overdue(r, o, m.id, as, provider) {
-			return as, as
+		if as != dead && _pool_takes(r, o, v, t, as) {
+			return r.self, as, .Run, {}, provider
 		}
-		exclude = as
+		overdue := _claim_overdue_probe(r, o, m.id, as, provider) if probe else _claim_overdue(r, o, m.id, as, provider)
+		if as != dead && !overdue {
+			return as, as, .Run, {}, provider
+		}
+		from = as
+	}
+	home := last_runner(r, o, v, t, m.parent)
+	if prim.id_is_zero(from) {
+		from = _gone(r, o.space, home)
 	}
 	p := Placement {
 		kind     = .Message,
@@ -384,13 +525,32 @@ _place_message :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: 
 		agent    = a.object.id,
 		provider = provider,
 		policy   = a.policy,
-		exclude  = exclude,
+		prefer   = home if prim.id_is_zero(from) else from,
 	}
-	runner = place(r, &p)
-	if prim.id_is_zero(runner) {
-		_placement_waiting(r, o, m.id, provider, exclude)
+	runner, verdict, on = _decide(r, o, &a, &p, from)
+	return
+}
+
+@(private)
+_place_message :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail, m: ^convo.Message, dead: prim.Id = {}) -> (runner: prim.Id, assignee: prim.Id) {
+	x, as, verdict, on, provider := _message_target(r, o, v, t, m, dead, false)
+	if _report(r, o, m.id, provider, verdict, on) {
+		return {}, as
 	}
-	return runner, assignee
+	return x, as
+}
+
+@(private)
+_claim_overdue_probe :: proc(r: ^Runtime, o: Object, msg: Rid, runner: prim.Id, provider: string) -> bool {
+	if !runner_live(r, o.space, runner, provider) {
+		return true
+	}
+	for w in r.leases {
+		if w.claim && w.object == o && w.msg == msg && w.runner == runner && wall_ms(r) >= w.seen + r.cfg.claim_wait_ms {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -597,6 +757,7 @@ start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
 		return .Not_Assigned if cerr == .Not_Assigned else .Engine
 	}
 	run.claim = claim
+	_asks_drop(r, o)
 	_pending_put(r, o, Pending_Entry{msg = user, provider = placement_provider(&run.ai), since_ms = wall_ms(r), runner = r.self, assigned = true})
 	_claim_prune(r, o, {})
 	if exhausted {
@@ -1138,18 +1299,6 @@ _revive :: proc(r: ^Runtime, ent: Run_Entry, lines: []convo.Line) -> Error {
 	if !ok {
 		_run_free(run)
 		return .Not_Found
-	}
-	p := Placement {
-		kind   = .Revive,
-		object = o,
-		msg    = ent.reply,
-		sender = r.self,
-		agent  = a.object.id,
-		policy = a.policy,
-	}
-	if place(r, &p) != r.self {
-		_run_free(run)
-		return .Not_Assigned
 	}
 	if assignee, aerr := convo.assignee(v, &t, ent.user); aerr == .None && !prim.id_is_zero(assignee) && assignee != r.self {
 		_run_free(run)

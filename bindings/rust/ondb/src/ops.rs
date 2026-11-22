@@ -232,6 +232,34 @@ impl Client {
         self.call(&json!({"op": "assign", "object": object, "msg": msg, "runner": runner}))
     }
 
+    pub fn resume(&self, object: &str, runner: &str) -> Pending<Ack> {
+        self.call(&json!({"op": "assign", "object": object, "runner": runner}))
+    }
+
+    pub fn runners(&self, space: &str, object: Option<&str>) -> Pending<Runners> {
+        let mut m = Map::new();
+        m.insert("op".into(), "runners".into());
+        m.insert("space".into(), space.into());
+        put(&mut m, "object", object);
+        self.call(&Value::Object(m))
+    }
+
+    pub fn subscribe_runners(&self, space: &str, object: Option<&str>) -> Pending<Subscription> {
+        let mut m = Map::new();
+        m.insert("op".into(), "subscribe.runners".into());
+        m.insert("space".into(), space.into());
+        put(&mut m, "object", object);
+        self.subscribe_raw_with(&Value::Object(m), |sub, _| Ok(sub))
+    }
+
+    pub fn takeover_get(&self, object: &str, level: &str) -> Pending<TakeoverPolicy> {
+        self.call(&json!({"op": "takeover.get", "object": object, "level": level}))
+    }
+
+    pub fn takeover_set(&self, object: &str, level: &str, policy: &str) -> Pending<Ack> {
+        self.call(&json!({"op": "takeover.set", "object": object, "level": level, "policy": policy}))
+    }
+
     pub fn runtime_stats(&self) -> Pending<RuntimeStats> {
         self.call(&json!({"op": "runtime.stats"}))
     }
