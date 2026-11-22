@@ -1119,7 +1119,21 @@ _short_id_wait :: proc(w: ^World, sid: prim.Id) {
 		_fail(w, "short id: n0 create: %v", oerr)
 		return
 	}
-	_settle(w, 1000)
+	uploaded := false
+	for _ in 0 ..< 300 {
+		context = instance_context(&a.inst)
+		up, _ := eng.upload_wait(&a.e, o)
+		node_after(a)
+		if up {
+			uploaded = true
+			break
+		}
+		_settle(w, 100)
+	}
+	if !uploaded {
+		_fail(w, "short id: n0's conversation never reached the relay")
+		return
+	}
 	hx := prim.id_hex(o.id)
 	short := string(hx[24:])
 	fp := new(Window_Probe, w.allocator)
