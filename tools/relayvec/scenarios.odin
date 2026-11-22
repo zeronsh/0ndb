@@ -37,6 +37,7 @@ scenarios :: proc() -> []Scenario {
 		{"presence", "Presence snapshots and up/down transitions per device across several connections; direct messages and Undelivered.", sc_presence},
 		{"membership", "Authorization follows the signed membership log: an Add appended to a members stream admits, a proof by a non-member is ignored, a Remove revokes live connections.", sc_membership},
 		{"account", "Account namespace: request and account credentials may only see presence and exchange direct messages; requesters are limited to two connections.", sc_account},
+		{"capability", "Capability credentials: a type 2 token admits one object's streams with its access; a type 3 credential admits the union of up to 16 tokens with per-object access; one token in type 3, more than 16 tokens, tokens of two spaces, an issuer who is not an active member and an expired token are refused.", sc_capability},
 		{"account_streams", "Account namespace streams: account credentials read every stream in their account's namespace and append or drop only their own, within the namespace quota; request credentials still cannot read; a cert by another account is refused.", sc_account_streams},
 		{"embedder", "An embedder authorizer maps unknown credential types to principals; the relay enforces the access it grants.", sc_embedder},
 		{"malformed", "Malformed input is fatal: oversize frames, unknown kinds, relay-only kinds, short payloads, count mismatches, inverted ranges, bad bulk headers, oversize direct payloads, a second Hello; bytes after the error are ignored.", sc_malformed},
@@ -940,4 +941,96 @@ sc_limits :: proc(v: ^Vector) {
 	send(v, "a1", f_follow(false, {stream(alice, 1), 0}, {stream(alice, 2), 0}, {stream(alice, 3), 0}), "three follows with a limit of two")
 	disconnect(v, "a2")
 	join(v, "a4", sp, alice, sp.genesis)
+}
+
+cap_token :: proc(issuer: ^Key, space: osync.Space_Id, grantee: ^Key, object: prim.Id, access: u8, name_key: [32]u8, expires: i64 = 0) -> []u8 {
+	t := osync.Cap_Token {
+		space    = prim.Id(space),
+		grantee  = prim.Id(grantee.dev),
+		object   = object,
+		kind     = 1,
+		access   = access,
+		expires  = expires,
+		name_key = name_key,
+		issuer   = issuer.pub,
+	}
+	body := make([dynamic]u8, context.temp_allocator)
+	osync.cap_token_body(t, &body)
+	sig: [64]u8
+	issuer.ms.sign(issuer.ms.data, body[:], &sig)
+	return cat(body[:], sig[:])
+}
+
+cap_cred :: proc(k: ^Key, b: []u8, tokens: ..[]u8) -> []u8 {
+	if len(tokens) == 1 {
+		return cat(one(osync.CAP_CREDENTIAL), tokens[0], ids(k.pub), sign_hello(k, b))
+	}
+	parts := make([dynamic][]u8, context.temp_allocator)
+	append(&parts, one(osync.CAP_CREDENTIALS), one(u8(len(tokens))))
+	for t in tokens {
+		append(&parts, t)
+	}
+	append(&parts, ids(k.pub), sign_hello(k, b))
+	return cat(..parts[:])
+}
+
+cap_stream :: proc(k: ^Key, name_key: [32]u8, object: prim.Id) -> [32]u8 {
+	sc: osync.Scope
+	sc.name_key = name_key
+	return cast([32]u8)osync.stream_id(&sc, k.dev, osync.object_segment_name(1, object), 0)
+}
+
+sc_capability :: proc(v: ^Vector) {
+	alice, guest, mallory := key_make(1), key_make(11), key_make(4)
+	sp := space_make(v, alice, 0x2c)
+	m := osync.members_stream(sp.id, alice.dev)
+	join(v, "alice", sp, alice, sp.genesis)
+	g := rec(string(sp.genesis), 0)
+	send(v, "alice", f_append(cast([32]u8)m, 0, g), "alice uploads the genesis, so she is an active member who may issue capabilities")
+	durable(v)
+	oa, ob: prim.Id
+	nka, nkb: [32]u8
+	for i in 0 ..< 16 {
+		oa[i] = 0xa1
+		ob[i] = 0xb2
+	}
+	for i in 0 ..< 32 {
+		nka[i] = 0x5a
+		nkb[i] = 0x5b
+	}
+	sa, sb := cap_stream(alice, nka, oa), cap_stream(alice, nkb, ob)
+	send(v, "alice", f_append(sa, 0, rec("in-a", 0)), "alice writes object A")
+	send(v, "alice", f_append(sb, 0, rec("in-b", 0)), "alice writes object B")
+	durable(v)
+	ta := cap_token(alice, sp.id, guest, oa, osync.CAP_READ, nka)
+	tb := cap_token(alice, sp.id, guest, ob, osync.CAP_READ | osync.CAP_WRITE, nkb)
+	connect(v, "one")
+	send(v, "one", hello(cap_cred(guest, binding("one"), ta)), "type 2: one read-only token for object A")
+	send(v, "one", f_read(sa, 0, 64), "A's segment is readable")
+	send(v, "one", f_read(sb, 0, 64), "B is not in the token: Not_Owner")
+	send(v, "one", f_append(cap_stream(guest, nka, oa), 0, rec("mine", 0)), "a read-only token cannot append: Not_Owner")
+	connect(v, "union")
+	send(v, "union", hello(cap_cred(guest, binding("union"), ta, tb)), "type 3: A read-only and B read-write")
+	send(v, "union", f_read(sa, 0, 64), "A is readable")
+	send(v, "union", f_read(sb, 0, 64), "B is readable")
+	send(v, "union", f_append(cap_stream(guest, nkb, ob), 0, rec("mine-b", 0)), "B's access admits an own append")
+	durable(v, "acknowledged once durable")
+	send(v, "union", f_append(cap_stream(guest, nka, oa), 0, rec("mine-a", 0)), "A's access still refuses appends: Not_Owner")
+	connect(v, "single")
+	single := cat(one(osync.CAP_CREDENTIALS), one(1), ta, ids(guest.pub), sign_hello(guest, binding("single")))
+	send(v, "single", hello(single), "type 3 with one token is malformed: Auth")
+	connect(v, "many")
+	many := make([dynamic][]u8, context.temp_allocator)
+	for _ in 0 ..< osync.CAP_TOKENS_MAX + 1 {
+		append(&many, ta)
+	}
+	send(v, "many", hello(cap_cred(guest, binding("many"), ..many[:])), "more than 16 tokens: Auth")
+	other := space_make(v, alice, 0x2d)
+	tother := cap_token(alice, other.id, guest, ob, osync.CAP_READ, nkb)
+	connect(v, "mixed")
+	send(v, "mixed", hello(cap_cred(guest, binding("mixed"), ta, tother)), "tokens of two spaces: Auth")
+	connect(v, "forged")
+	send(v, "forged", hello(cap_cred(guest, binding("forged"), cap_token(mallory, sp.id, guest, oa, osync.CAP_READ, nka))), "issuer is not an active member: Auth")
+	connect(v, "expired")
+	send(v, "expired", hello(cap_cred(guest, binding("expired"), cap_token(alice, sp.id, guest, oa, osync.CAP_READ, nka, v.cfg.wall_ms - 1))), "expired token: Auth")
 }

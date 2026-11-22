@@ -9,6 +9,7 @@ import "../journal"
 import "../prim"
 
 KEYS_STREAM :: "keys/"
+CHECKPOINT_STREAM :: "ckpt/"
 KEYS_RECORD :: 2
 KEYS_HEAD_STREAM :: "keyshead/"
 KEYS_HEAD_RECORD :: 3
