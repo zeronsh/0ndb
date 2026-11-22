@@ -237,7 +237,10 @@
  *   Stats      := ticks, commits, durable, handles, opened, evicted, pending,
  *                 subs, fetches, indexed, wakeups, calls, mounts,
  *                 fetched_bytes: uvarint (bytes received into the
- *                 replicas of the open spaces since each opened)
+ *                 replicas of the open spaces since each opened),
+ *                 base_merged, base_current, base_mismatch,
+ *                 base_not_text: uvarint (agent writes with a reported
+ *                 base: merged from it, base still current, fallbacks)
  *   Workspace  := name: str, agent: id, provider: str, model: str,
  *                 runner_policy: bytes, setup: str, access: bytes,
  *                 members: [ {object: id, kind: enum kind,

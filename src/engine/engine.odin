@@ -261,6 +261,10 @@ Stats :: struct {
 	buffers:     int,
 	buffer_deltas: u64,
 	buffer_edits: u64,
+	base_merged:  u64,
+	base_current: u64,
+	base_mismatch: u64,
+	base_not_text: u64,
 }
 
 Engine :: struct {
