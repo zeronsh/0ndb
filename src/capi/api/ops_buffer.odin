@@ -292,9 +292,9 @@ op_buffer_edit :: proc(c: ^Call, o: ^Out) -> Status {
 		}
 		edits[i] = eng.Buffer_Edit{int(pos[i]), int(del[i]), transmute([]u8)ins[i]}
 	}
-	ack, rev, err := eng.buffer_edit(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")), a_u64(c, "rev"), edits, a_u64(c, "group"))
+	ack, rev, err := eng.buffer_edit(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")), a_u64(c, "rev"), edits, a_u64(c, "group"), ready(c))
 	if err != .None {
-		return status_of(err)
+		return pend(c, err)
 	}
 	o_u64(o, "ack", ack)
 	o_u64(o, "rev", rev)
@@ -306,18 +306,18 @@ op_buffer_ack :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_buffer_undo :: proc(c: ^Call, o: ^Out) -> Status {
-	done, err := eng.buffer_undo(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")))
+	done, err := eng.buffer_undo(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")), ready(c))
 	if err != .None {
-		return status_of(err)
+		return pend(c, err)
 	}
 	o_bool(o, "done", done)
 	return .Ok
 }
 
 op_buffer_redo :: proc(c: ^Call, o: ^Out) -> Status {
-	done, err := eng.buffer_redo(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")))
+	done, err := eng.buffer_redo(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")), ready(c))
 	if err != .None {
-		return status_of(err)
+		return pend(c, err)
 	}
 	o_bool(o, "done", done)
 	return .Ok

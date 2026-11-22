@@ -572,7 +572,11 @@ buffer events as the connection drains): the result carries `ack` and the
 the delta numbered `rev` (at once if you already have). Without that, a
 buffer nobody else edits would keep every edit unacknowledged. A `conflict`
 status means reopen. Anchors are strings:
-`s`, `e`, or `<actor hex>.<seq>[.<offset>].<b|a>`. The reference clients are
+`s`, `e`, or `<actor hex>.<seq>[.<offset>].<b|a>`. Another device's edit can reach the buffer
+ahead of its durability (live edits); while one is shown, `buffer.edit`,
+`buffer.undo` and `buffer.redo` stay pending until its durable record
+arrives (a few milliseconds) and then answer in order, so keep pipelining.
+The reference clients are
 `LiveBuffer` in `web/0ndb.js` and `ondb::LiveBuffer` in the Rust crate.
 
 ## 10. MCP hand-off

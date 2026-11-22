@@ -243,7 +243,12 @@ _edit :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer, pos: int, del: int, ins: stri
 	}
 	crdt.delta_trim(&ops)
 	context = instance_context(&n.inst)
-	ack, applied, err := eng.buffer_edit(&n.e, b.id, b.rev, []eng.Buffer_Edit{{pos, del, transmute([]u8)ins}}, group)
+	held := eng.Ready{call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}}
+	ack, applied, err := eng.buffer_edit(&n.e, b.id, b.rev, []eng.Buffer_Edit{{pos, del, transmute([]u8)ins}}, group, held)
+	if err == .Pending {
+		stat_add(w, STAT_BLIVE_HELD)
+		return .Busy
+	}
 	if err != .None {
 		return err
 	}
@@ -442,6 +447,9 @@ check_buffers :: proc(w: ^World) {
 			continue
 		}
 		_check_client(w, n, b)
+		if k := eng.buffer_overlay(&n.e, b.id); k > 0 {
+			world_fail(w, "buffer: %s buffer %d still shows %d live batches after settle", n.name, b.id, k)
+		}
 		if m.objs[b.oi].kind == .Text && obj_exists(m, b.oi) {
 			context = instance_context(&n.inst)
 			view, _, verr := eng.buffer_text(&n.e, b.id, context.temp_allocator)
@@ -451,6 +459,14 @@ check_buffers :: proc(w: ^World) {
 			}
 		}
 		node_after(n)
+	}
+	stat_add(w, STAT_BLIVE_SEALS, w.cipher.bufseals)
+	for n in w.nodes {
+		if n.alive && n.e_open {
+			stat_add(w, STAT_BLIVE_APPLIED, n.e.stats.buffer_live_applied)
+			stat_add(w, STAT_BLIVE_CONFIRMED, n.e.stats.buffer_live_confirmed)
+			stat_add(w, STAT_BLIVE_DROPPED, n.e.stats.buffer_live_dropped)
+		}
 	}
 	Seen :: struct {
 		node: string,
@@ -507,6 +523,11 @@ check_buffers :: proc(w: ^World) {
 STAT_BUFFERS: Stat
 STAT_BURSTS: Stat
 STAT_ANCHORS_CHECKED: Stat
+STAT_BLIVE_APPLIED: Stat
+STAT_BLIVE_CONFIRMED: Stat
+STAT_BLIVE_DROPPED: Stat
+STAT_BLIVE_HELD: Stat
+STAT_BLIVE_SEALS: Stat
 
 @(init)
 _buffers_stats :: proc "contextless" () {
@@ -515,4 +536,9 @@ _buffers_stats :: proc "contextless" () {
 	STAT_BUFFERS = register_stat(30, 0, "buffers_opened")
 	STAT_BURSTS = register_stat(30, 1, "bursts")
 	STAT_ANCHORS_CHECKED = register_stat(30, 2, "anchors_checked")
+	STAT_BLIVE_APPLIED = register_stat(30, 3, "live_applied")
+	STAT_BLIVE_CONFIRMED = register_stat(30, 4, "live_confirmed")
+	STAT_BLIVE_DROPPED = register_stat(30, 5, "live_dropped")
+	STAT_BLIVE_HELD = register_stat(30, 6, "live_held")
+	STAT_BLIVE_SEALS = register_stat(30, 7, "live_seals")
 }
