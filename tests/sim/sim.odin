@@ -308,6 +308,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 			cfg.durability = mode
 		}
 	}
+	cfg.promote = i64(env_u64("SIM_PROMOTE", u64(cfg.promote)))
 	cfg.keep_ops = filter_parse("SIM_KEEP_OPS")
 	cfg.keep_faults = filter_parse("SIM_KEEP_FAULTS")
 	if f, ok := os.lookup_env("SIM_FAULTS", context.temp_allocator); ok && f == "0" {
@@ -323,7 +324,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		world_destroy(w)
 		free(w, runtime.heap_allocator())
 	}
-	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v storage=%v durability=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk, cfg.storage, cfg.durability)
+	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v storage=%v durability=%v promote=%d", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk, cfg.storage, cfg.durability, cfg.promote)
 	ok := relay_start(&w.relay)
 	for n in w.nodes {
 		ok = ok && node_start(n)

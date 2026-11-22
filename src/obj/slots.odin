@@ -18,6 +18,8 @@ SLOT_MIN_SLOTS :: 1024
 SLOT_SEED :: 0x6b69_6473
 @(private)
 SLOT_COPY :: 2048
+@(private)
+SLOT_DIRTY :: max(i64)
 
 Slots :: struct {
 	vfs:       prim.Vfs,
@@ -28,6 +30,7 @@ Slots :: struct {
 	used:      u64,
 	covered:   i64,
 	synced:    i64,
+	marked:    bool,
 	allocator: runtime.Allocator,
 }
 
@@ -81,6 +84,7 @@ slots_open :: proc(c: ^Slots, vfs: prim.Vfs, path: string, owner: prim.Id, alloc
 	}
 	c.covered = i64(cov)
 	c.synced = c.covered
+	c.marked = c.covered == SLOT_DIRTY
 	return .None
 }
 
@@ -140,6 +144,7 @@ slots_put :: proc(c: ^Slots, key: u64, child: i64, seal: i64) -> Error {
 		return .Invalid
 	}
 	if (c.used + 1) * 2 > c.slots {
+		_slots_mark(c) or_return
 		_slots_grow(c) or_return
 	}
 	for {
@@ -148,6 +153,7 @@ slots_put :: proc(c: ^Slots, key: u64, child: i64, seal: i64) -> Error {
 		for _ in 0 ..< c.slots {
 			s, empty := _slot_read(c.vfs, c.fd, i) or_return
 			if empty {
+				_slots_mark(c) or_return
 				_slot_write(c.vfs, c.fd, i, Slot{key, max(child, 0), max(seal, 0)}) or_return
 				c.used += 1
 				return .None
@@ -155,18 +161,20 @@ slots_put :: proc(c: ^Slots, key: u64, child: i64, seal: i64) -> Error {
 			if s.key == key {
 				next := Slot{key, max(s.child, child), seal if seal > 0 else s.seal}
 				if next != s {
+					_slots_mark(c) or_return
 					_slot_write(c.vfs, c.fd, i, next) or_return
 				}
 				return .None
 			}
 			i = (i + 1) & mask
 		}
+		_slots_mark(c) or_return
 		_slots_grow(c) or_return
 	}
 }
 
 slots_sync :: proc(c: ^Slots) -> Error {
-	if c.covered == c.synced {
+	if c.covered == c.synced && !c.marked {
 		return .None
 	}
 	if err := prim.datasync(c.vfs, c.fd); err != .None {
@@ -179,6 +187,20 @@ slots_sync :: proc(c: ^Slots) -> Error {
 		return perr(err)
 	}
 	c.synced = c.covered
+	c.marked = false
+	return .None
+}
+
+@(private)
+_slots_mark :: proc(c: ^Slots) -> Error {
+	if c.marked {
+		return .None
+	}
+	_header_write(c.vfs, c.fd, c.owner, c.slots, c.used, SLOT_DIRTY) or_return
+	if err := prim.datasync(c.vfs, c.fd); err != .None {
+		return perr(err)
+	}
+	c.marked = true
 	return .None
 }
 
@@ -325,7 +347,7 @@ _slots_grow :: proc(c: ^Slots) -> Error {
 	if slots > 1 << 40 {
 		return .Limit
 	}
-	nfd := _slots_blank(c.vfs, tmp, c.owner, slots, c.covered) or_return
+	nfd := _slots_blank(c.vfs, tmp, c.owner, slots, SLOT_DIRTY) or_return
 	ok := false
 	defer if !ok {
 		prim.close_file(c.vfs, nfd)
@@ -361,7 +383,7 @@ _slots_grow :: proc(c: ^Slots) -> Error {
 			used += 1
 		}
 	}
-	if e := _header_write(c.vfs, nfd, c.owner, slots, used, c.covered); e != .None {
+	if e := _header_write(c.vfs, nfd, c.owner, slots, used, SLOT_DIRTY); e != .None {
 		return e
 	}
 	if e := prim.datasync(c.vfs, nfd); e != .None {
@@ -378,6 +400,19 @@ _slots_grow :: proc(c: ^Slots) -> Error {
 	c.synced = c.covered
 	if e := prim.sync_dir(c.vfs, prim.dir_name(c.path)); e != .None {
 		return perr(e)
+	}
+	return .None
+}
+
+slots_each :: proc(c: ^Slots, data: rawptr, visit: proc(data: rawptr, key: u64, child, seal: i64) -> bool) -> Error {
+	for i in 0 ..< c.slots {
+		s, empty := _slot_read(c.vfs, c.fd, i) or_return
+		if empty {
+			continue
+		}
+		if !visit(data, s.key, s.child, s.seal) {
+			return .None
+		}
 	}
 	return .None
 }

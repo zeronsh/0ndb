@@ -49,6 +49,7 @@ Row :: struct {
 Source :: struct {
 	seg:    prim.Id,
 	reader: ^journal.Reader,
+	upto:   Maybe(i64),
 }
 
 table_open :: proc(t: ^Table, vfs: prim.Vfs, path: string, defs: []Index_Def = nil, allocator := context.allocator) -> Error {
@@ -185,7 +186,7 @@ durable_end :: proc "contextless" (r: ^journal.Reader) -> i64 {
 _table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
 	limit := durable_end(r)
 	if db_count(&t.db, ROOT_CONSUMED) == 0 && db_count(&t.db, ROOT_ENTRIES) == 0 && db_count(&t.db, ROOT_PENDING) == 0 && limit >= REBUILD_MIN {
-		src := [1]Source{{seg, r}}
+		src := [1]Source{{seg = seg, reader = r}}
 		_table_rebuild(t, src[:]) or_return
 		return table_consumed(t, seg)
 	}
@@ -489,6 +490,9 @@ _rebuild_cleanup :: proc(rb: ^Rebuild) {
 _rebuild_source :: proc(rb: ^Rebuild, i: int, s: Source) -> Error {
 	pos: i64
 	limit := durable_end(s.reader)
+	if u, ok := s.upto.?; ok {
+		limit = min(limit, u)
+	}
 	for pos < limit {
 		body, next, e := journal.record_at(s.reader, pos)
 		if e == .Eof {
@@ -680,6 +684,7 @@ _merge_entries :: proc(rb: ^Rebuild, b: ^Builder) -> Error {
 				n += 1
 			}
 		}
+		same &&= n == len(e.elements)
 		e.elements = e.elements[:n]
 		if len(e.registers) == 0 && len(e.elements) == 0 && len(e.counters) == 0 {
 			return .None

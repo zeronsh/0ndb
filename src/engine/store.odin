@@ -167,7 +167,18 @@ _rec_get :: proc(e: ^Engine, id: prim.Id, allocator := context.temp_allocator) -
 
 @(private)
 _rec_put :: proc(e: ^Engine, id: prim.Id, rec: ^Obj_Rec) -> Error {
-	buf := make([dynamic]u8, e.allocator)
+	buf := _rec_encode(rec, e.allocator) or_return
+	if old, ok := e.reg.staged[id]; ok {
+		delete(old, e.allocator)
+	}
+	e.reg.staged[id] = buf
+	_touch(e)
+	return .None
+}
+
+@(private)
+_rec_encode :: proc(rec: ^Obj_Rec, allocator: runtime.Allocator) -> (out: []u8, err: Error) {
+	buf := make([dynamic]u8, allocator)
 	w := prim.writer(&buf)
 	prim.write_u8(&w, REC_VERSION)
 	prim.write_id(&w, rec.space)
@@ -182,14 +193,9 @@ _rec_put :: proc(e: ^Engine, id: prim.Id, rec: ^Obj_Rec) -> Error {
 	}
 	if w.err != .None {
 		delete(buf)
-		return .No_Memory
+		return nil, .No_Memory
 	}
-	if old, ok := e.reg.staged[id]; ok {
-		delete(old, e.allocator)
-	}
-	e.reg.staged[id] = buf[:]
-	_touch(e)
-	return .None
+	return buf[:], .None
 }
 
 @(private)

@@ -163,6 +163,7 @@ Config :: struct {
 	keep_faults: Filter,
 	storage:     eng.Storage_Mode,
 	durability:  eng.Durability,
+	promote:     i64,
 }
 
 World :: struct {
