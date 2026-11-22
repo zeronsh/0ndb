@@ -1,8 +1,10 @@
 package fs
 
+import "core:slice"
 import "../crdt"
 import "../fshist"
 import "../fstree"
+import "../prim"
 import "../textdiff"
 
 Text_View :: struct {
@@ -11,6 +13,8 @@ Text_View :: struct {
 	stale:    bool,
 	full:     bool,
 	cp:       [dynamic]crdt.Op_Id,
+	prev:     [dynamic]crdt.Author_Span,
+	has_prev: bool,
 }
 
 history_view_open :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (view: ^Text_View, err: Error) {
@@ -40,6 +44,7 @@ history_view_close :: proc(h: ^History, view: ^Text_View) {
 	}
 	fshist.text_drop(&view.st)
 	delete(view.cp)
+	delete(view.prev)
 	free(view, h.allocator)
 }
 
@@ -66,9 +71,22 @@ views_stale :: proc(h: ^History, inode: Maybe(fstree.Inode_Id) = nil) {
 	only, one := inode.?
 	for v in h.views {
 		if !one || v.inode == only {
-			v.stale = true
+			view_mark_stale(h, v)
 		}
 	}
+}
+
+@(private)
+view_mark_stale :: proc(h: ^History, v: ^Text_View) {
+	if !v.stale && v.loaded && !v.has_prev {
+		if v.prev == nil {
+			v.prev = make([dynamic]crdt.Author_Span, h.allocator)
+		}
+		clear(&v.prev)
+		append(&v.prev, ..crdt.text_spans(&v.text, &h.g, context.temp_allocator))
+		v.has_prev = true
+	}
+	v.stale = true
 }
 
 @(private)
@@ -78,7 +96,7 @@ views_feed :: proc(h: ^History, ino: fstree.Inode_Id, b: ^crdt.Batch, target: cr
 			continue
 		}
 		if v.from_cp && !view_descends(h, v, b) {
-			v.stale = true
+			view_mark_stale(h, v)
 			v.full = true
 			continue
 		}
@@ -183,9 +201,156 @@ history_view_advance_ex :: proc(h: ^History, view: ^Text_View, target: Version, 
 	}
 	if sink.insert != nil && sink.delete != nil {
 		nw := crdt.text_bytes(&view.text, context.temp_allocator)
-		view_diff_feed(h, view, old, nw, sink)
+		if view.has_prev {
+			view_identity_feed(h, view, old, view.prev[:], nw, sink)
+		} else {
+			view_diff_feed(h, view, old, nw, sink)
+		}
 	}
+	view.has_prev = false
+	clear(&view.prev)
 	return true, .None
+}
+
+@(private)
+Id_Run :: struct {
+	seq: u64,
+	len: int,
+}
+
+@(private)
+id_index :: proc(spans: []crdt.Author_Span) -> map[prim.Id][dynamic]Id_Run {
+	m := make(map[prim.Id][dynamic]Id_Run, 16, context.temp_allocator)
+	for sp in spans {
+		list, ok := m[sp.op.actor]
+		if !ok {
+			list = make([dynamic]Id_Run, context.temp_allocator)
+		}
+		append(&list, Id_Run{sp.op.seq, sp.len})
+		m[sp.op.actor] = list
+	}
+	for _, &list in m {
+		slice.sort_by(list[:], proc(a, b: Id_Run) -> bool {
+			return a.seq < b.seq
+		})
+	}
+	return m
+}
+
+@(private)
+id_presence :: proc(m: ^map[prim.Id][dynamic]Id_Run, id: crdt.Op_Id, limit: int) -> (present: bool, n: int) {
+	list, ok := m[id.actor]
+	if !ok {
+		return false, limit
+	}
+	lo, hi := 0, len(list)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if list[mid].seq + u64(list[mid].len) <= id.seq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < len(list) && list[lo].seq <= id.seq {
+		return true, min(limit, int(list[lo].seq + u64(list[lo].len) - id.seq))
+	}
+	if lo < len(list) {
+		return false, min(limit, int(list[lo].seq - id.seq))
+	}
+	return false, limit
+}
+
+@(private)
+view_identity_feed :: proc(h: ^History, view: ^Text_View, old: []u8, prev: []crdt.Author_Span, nw: []u8, sink: crdt.Text_Sink) {
+	cur := crdt.text_spans(&view.text, &h.g, context.temp_allocator)
+	in_new := id_index(cur)
+	in_old := id_index(prev)
+	oi, oo, ob := 0, 0, 0
+	ni, no, nb := 0, 0, 0
+	p := 0
+	for oi < len(prev) || ni < len(cur) {
+		if oi < len(prev) {
+			sp := prev[oi]
+			id := crdt.Op_Id{sp.op.actor, sp.op.seq + u64(oo)}
+			present, k := id_presence(&in_new, id, sp.len - oo)
+			if !present {
+				sink.delete(sink.data, p, old[ob:ob + k])
+				ob += k
+				oo += k
+				if oo == sp.len {
+					oi += 1
+					oo = 0
+				}
+				continue
+			}
+		}
+		if ni < len(cur) {
+			sp := cur[ni]
+			id := crdt.Op_Id{sp.op.actor, sp.op.seq + u64(no)}
+			present, k := id_presence(&in_old, id, sp.len - no)
+			if !present {
+				author := crdt.Op_Id{sp.id.actor, sp.id.seq + u64(no)}
+				sink.insert(sink.data, p, nw[nb:nb + k], author)
+				p += k
+				nb += k
+				no += k
+				if no == sp.len {
+					ni += 1
+					no = 0
+				}
+				continue
+			}
+		}
+		if oi >= len(prev) || ni >= len(cur) {
+			break
+		}
+		a := prev[oi]
+		c := cur[ni]
+		k := min(a.len - oo, c.len - no)
+		if a.op.actor != c.op.actor || a.op.seq + u64(oo) != c.op.seq + u64(no) {
+			sink.delete(sink.data, p, old[ob:ob + k])
+			ob += k
+			oo += k
+			if oo == a.len {
+				oi += 1
+				oo = 0
+			}
+			continue
+		}
+		t := 0
+		for t < k {
+			same := old[ob + t] == nw[nb + t]
+			u := t + 1
+			for u < k && (old[ob + u] == nw[nb + u]) == same {
+				u += 1
+			}
+			if !same {
+				sink.delete(sink.data, p, old[ob + t:ob + u])
+				sink.insert(sink.data, p, nw[nb + t:nb + u], crdt.Op_Id{c.id.actor, c.id.seq + u64(no + t)})
+			}
+			p += u - t
+			t = u
+		}
+		ob += k
+		nb += k
+		oo += k
+		no += k
+		if oo == a.len {
+			oi += 1
+			oo = 0
+		}
+		if no == c.len {
+			ni += 1
+			no = 0
+		}
+	}
+	if ob < len(old) {
+		sink.delete(sink.data, p, old[ob:])
+	}
+	if nb < len(nw) {
+		sink.insert(sink.data, p, nw[nb:], {})
+	}
 }
 
 @(private)
