@@ -2124,7 +2124,6 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 			_remote_pull(r, rm)
 			_remote_settle(r, rm)
 		}
-		_promote_on_probed(r, Stream_Id(ev.id), ev.length)
 		if _, known := r.remotes[Stream_Id(ev.id)]; known || ev.length > 0 {
 			_seen_stream(r, Stream_Id(ev.id), ev.length)
 		}
