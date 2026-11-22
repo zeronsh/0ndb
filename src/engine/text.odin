@@ -470,7 +470,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) {
 					continue
 				}
 				if rerr == .Missing {
-					r := [1]journal.Range{{pos, end}}
+					r := [1]journal.Range{s.jr.missing}
 					if h.sp.repl_on {
 						osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
 					}
