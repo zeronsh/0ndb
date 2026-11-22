@@ -209,6 +209,9 @@ vref :: proc(v: ^View, m: Rid) -> (r: Vref, err: Error) {
 	}
 	i := view_find(v, m.seg)
 	if i < 0 {
+		if !prim.id_is_zero(v.self) && m.seg == v.self {
+			return {}, .Not_Found
+		}
 		unknown(v, m.seg)
 		return {}, .Unknown_Segment
 	}

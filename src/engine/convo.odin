@@ -173,6 +173,11 @@ convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := c
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
+	if pos.msg.seg == e.self {
+		if _, verr := obj.vref(&h.view, pos.msg); verr == .Not_Found {
+			return m, .Not_Found
+		}
+	}
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
 	if terr != .None {
 		return m, _pending_result(e, h, _oerr(terr), ready)
