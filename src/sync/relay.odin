@@ -100,6 +100,8 @@ Sock :: struct {
 	dead:     bool,
 }
 
+RELAY_PACK_ROLL :: 256 << 10
+
 relay_config :: proc(dir: string) -> Relay_Config {
 	return Relay_Config {
 		dir = dir,
@@ -236,7 +238,9 @@ _relay_own_storage :: proc(r: ^Relay, l: ^prim.Loop, cfg: Relay_Config) -> (stor
 			free(fs, allocator)
 			return {}, _from_prim(merr)
 		}
-		if oerr := pack.open(pk, r.vfs, proot, pack.DEFAULT_OPTIONS, allocator); oerr != .None {
+		popts := pack.DEFAULT_OPTIONS
+		popts.roll_min = RELAY_PACK_ROLL
+		if oerr := pack.open(pk, r.vfs, proot, popts, allocator); oerr != .None {
 			free(pk, allocator)
 			free(fs, allocator)
 			return {}, _from_prim(oerr)
