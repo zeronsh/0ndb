@@ -252,6 +252,7 @@ Stats :: struct {
 	draft_bytes: u64,
 	draft_pulls: u64,
 	draft_rejected: u64,
+	fetched_bytes:  u64,
 	remote_skipped:  u64,
 	remote_rewrites: u64,
 	git_fetches:     u64,
@@ -504,6 +505,9 @@ stats :: proc(e: ^Engine) -> Stats {
 	s.buffers = len(e.buffers)
 	s.pending = len(e.waiters)
 	s.subs = len(e.subs)
+	for _, sp in e.spaces {
+		s.fetched_bytes += sp.repl.fetched_bytes
+	}
 	return s
 }
 

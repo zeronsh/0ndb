@@ -39,6 +39,7 @@ op_stats :: proc(c: ^Call, o: ^Out) -> Status {
 	o_u64(o, "wakeups", s.wakeups)
 	o_int(o, "calls", len(c.api.calls))
 	o_int(o, "mounts", len(c.api.mounts))
+	o_u64(o, "fetched_bytes", s.fetched_bytes)
 	return .Ok
 }
 

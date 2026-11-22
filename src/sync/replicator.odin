@@ -247,6 +247,7 @@ Replicator :: struct {
 	present_ok: bool,
 	read_reqs:  int,
 	read_bytes: i64,
+	fetched_bytes: u64,
 	tamper_run: int,
 	phase:      Phase,
 	cred_gen:   u64,
@@ -1807,7 +1808,7 @@ _stage_flush :: proc(r: ^Replicator, final: bool, stream_len: i64) {
 			_hold_unchecked(r, rm, lo, hi, bad)
 		}
 		if hi > lo {
-			if err := _stage_write(rm, r.stage_at + i64(lo), r.stage[lo:hi]); err != .None {
+			if err := _stage_write(r, rm, r.stage_at + i64(lo), r.stage[lo:hi]); err != .None {
 				_emit(r, Repl_Event{kind = .Refused, err = _from_journal(err), device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
 			} else if !bad {
 				r.tamper_run = 0
@@ -1872,7 +1873,7 @@ _held_apply :: proc(r: ^Replicator, rm: ^Remote) {
 	rm.kheld = make([dynamic]u8, r.allocator)
 	lo, hi, _, bad := _stage_check(r, rm, true, rm.relay_len)
 	if !bad && hi > lo {
-		if err := _stage_write(rm, r.stage_at + i64(lo), r.stage[lo:hi]); err == .None {
+		if err := _stage_write(r, rm, r.stage_at + i64(lo), r.stage[lo:hi]); err == .None {
 			_remote_landed(r, rm, r.stage_at + i64(lo), r.stage_at + i64(hi), rm.relay_len)
 		}
 	}

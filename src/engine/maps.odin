@@ -677,20 +677,28 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	if u.set_remote {
 		append(&fields, omap.field_str(CATALOG_REMOTE, u.remote))
 	}
+	cur: omap.Catalog_Entry
+	found := false
+	if u.participant || (u.status && u.kind == .Conversation) {
+		_map_sync(e, h)
+		cur, found, _ = omap.catalog_get(&h.table, id, context.temp_allocator)
+	}
 	if u.status && u.kind == .Conversation {
 		if ch, err := _handle_get(e, Object{u.space, id}, .Conversation); err == .None {
 			_handle_refresh(ch)
 			t, terr := convo.view_tail(&ch.view, e.self, context.temp_allocator)
 			if terr == .None {
 				append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Status), u64(t.status)))
+				if prov, waiting, pok := _catalog_provider(e, Object{u.space, id}, ch, &t); pok {
+					if prov != cur.provider {
+						append(&fields, omap.field_str(u32(omap.Catalog_Tag.Provider), prov))
+					}
+					if waiting != cur.unanswered {
+						append(&fields, omap.field_bool(u32(omap.Catalog_Tag.Unanswered), waiting))
+					}
+				}
 			}
 		}
-	}
-	cur: omap.Catalog_Entry
-	found := false
-	if u.participant {
-		_map_sync(e, h)
-		cur, found, _ = omap.catalog_get(&h.table, id, context.temp_allocator)
 	}
 	kb: [16]u8
 	key := omap.catalog_key(id, &kb)
@@ -720,6 +728,27 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	}
 	_handle_mark(h)
 	return .None
+}
+
+@(private)
+_catalog_provider :: proc(e: ^Engine, o: Object, h: ^Handle, t: ^convo.Tail) -> (provider: string, unanswered: bool, ok: bool) {
+	if head, herr := convo.tail_head(&h.view, t); herr == .None && !obj.rid_none(head) {
+		m, merr := convo.message(&h.view, t, convo.Position{msg = head}, context.temp_allocator)
+		if merr != .None {
+			return "", false, false
+		}
+		if m.role == .User || m.role == .System {
+			unanswered = !m.open && m.status == .Done
+			if len(m.provider) > 0 {
+				return m.provider, unanswered, true
+			}
+		}
+	}
+	s, serr := convo_settings(e, o, context.temp_allocator)
+	if serr != .None {
+		return "", false, false
+	}
+	return s.provider, unanswered, true
 }
 
 USAGE_TAG :: u32(64)

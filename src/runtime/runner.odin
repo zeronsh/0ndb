@@ -17,6 +17,9 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	if r.closing {
 		return
 	}
+	if !_candidate(r, o) {
+		return
+	}
 	if !r.cfg.runner {
 		_evaluate_sender(r, o)
 		return
@@ -350,6 +353,56 @@ place_intent :: proc(r: ^Runtime, o: Object, it: ^convo.Intent) -> prim.Id {
 		policy   = a.policy,
 	}
 	return place(r, &p)
+}
+
+@(private)
+_candidate :: proc(r: ^Runtime, o: Object) -> bool {
+	c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator)
+	if cerr != .None || !found || c.kind != .Conversation {
+		return false
+	}
+	for p in c.participants {
+		if p == r.self {
+			return true
+		}
+	}
+	if !r.cfg.runner {
+		return false
+	}
+	if run_find(r, o) != nil {
+		return true
+	}
+	if p, ok := pending_get(r, o); ok && p.runner == r.self {
+		return true
+	}
+	#partial switch convo.Status(min(c.status, u64(max(convo.Status)))) {
+	case .Running, .Queued, .Awaiting_Permission, .Waiting, .Reviving:
+	case:
+		if !c.unanswered {
+			return false
+		}
+	}
+	prov := c.provider
+	if len(prov) == 0 && !prim.id_is_zero(c.agent) {
+		if def, derr := eng.agent_get(r.e, Object{o.space, c.agent}, context.temp_allocator); derr == .None {
+			prov = def.provider
+			if len(prov) == 0 {
+				if _, known := _descriptor(r, def.driver); known {
+					prov = def.driver
+				}
+			}
+		}
+	}
+	if len(prov) == 0 {
+		prov = r.cfg.default_provider
+	}
+	if len(prov) == 0 {
+		return true
+	}
+	if _, known := _descriptor(r, prov); !known {
+		return true
+	}
+	return _list_has(_providers_local(r), prov)
 }
 
 @(private)
