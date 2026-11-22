@@ -9,6 +9,11 @@ import "../prim"
 Error :: obj.Error
 Rid :: obj.Rid
 
+Dot :: struct {
+	seg: prim.Id,
+	off: i64,
+}
+
 MAX_KEY_LEN :: 200
 MAX_FIELDS :: 256
 MAX_TOMBS :: 4096
@@ -41,7 +46,7 @@ Del :: struct {
 	key:     []u8,
 	tag:     u32,
 	element: []u8,
-	removed: []Rid,
+	removed: []Dot,
 }
 
 Count :: struct {
@@ -75,8 +80,8 @@ Register :: struct {
 Element :: struct {
 	tag:   u32,
 	value: []u8,
-	live:  []Rid,
-	dead:  []Rid,
+	live:  []Dot,
+	dead:  []Dot,
 }
 
 Entry :: struct {
@@ -166,7 +171,7 @@ decode_body :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> 
 		key, elem: []u8
 		tag: u32
 		has := false
-		removed := make([dynamic]Rid, allocator)
+		removed := make([dynamic]Dot, allocator)
 		for obj.dec_next(&d) {
 			switch d.f.tag {
 			case 1:
@@ -187,7 +192,7 @@ decode_body :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> 
 				if !prim.reader_done(&r) || off == 0 || off > u64(max(i64)) || len(removed) >= MAX_TOMBS {
 					d.bad = true
 				} else {
-					append(&removed, Rid{id, i64(off)})
+					append(&removed, Dot{id, i64(off)})
 				}
 			}
 		}
@@ -327,7 +332,7 @@ encode_entry :: proc(buf: ^[dynamic]u8, e: ^Entry) -> Error {
 	for el in e.elements {
 		prim.write_uvarint(&w, u64(el.tag))
 		prim.write_bytes(&w, el.value)
-		for list in ([2][]Rid{el.live, el.dead}) {
+		for list in ([2][]Dot{el.live, el.dead}) {
 			prim.write_uvarint(&w, u64(len(list)))
 			for r in list {
 				prim.write_uvarint(&w, dev(&devs, r.seg))
@@ -404,7 +409,7 @@ decode_entry :: proc(key: []u8, data: []u8, allocator := context.temp_allocator)
 			if r.err != .None || n * 2 > u64(prim.reader_remaining(&r)) {
 				return e, .Corrupt
 			}
-			list := make([]Rid, int(n), allocator)
+			list := make([]Dot, int(n), allocator)
 			for &x in list {
 				di := prim.read_uvarint(&r)
 				off := prim.read_uvarint(&r)
@@ -448,7 +453,7 @@ decode_entry :: proc(key: []u8, data: []u8, allocator := context.temp_allocator)
 	return e, .None
 }
 
-apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.temp_allocator) -> (changed: bool) {
+apply :: proc(e: ^Entry, by: prim.Id, at: Dot, body: Body, allocator := context.temp_allocator) -> (changed: bool) {
 	switch v in body {
 	case Put:
 		regs := make([dynamic]Register, 0, len(e.registers) + len(v.fields), allocator)
@@ -482,7 +487,7 @@ apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.
 		if _rid_in(el.live, at) || _rid_in(el.dead, at) {
 			return false
 		}
-		live := make([dynamic]Rid, allocator)
+		live := make([dynamic]Dot, allocator)
 		append(&live, ..el.live)
 		append(&live, at)
 		el.live = live[:]
@@ -490,8 +495,8 @@ apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.
 	case Del:
 		k := _element(e, v.tag, v.element, allocator)
 		el := &e.elements[k]
-		live := make([dynamic]Rid, allocator)
-		dead := make([dynamic]Rid, allocator)
+		live := make([dynamic]Dot, allocator)
+		dead := make([dynamic]Dot, allocator)
 		append(&dead, ..el.dead)
 		for r in v.removed {
 			if !_rid_in(dead[:], r) {
@@ -560,7 +565,7 @@ apply :: proc(e: ^Entry, by: prim.Id, at: Rid, body: Body, allocator := context.
 }
 
 @(private)
-_rid_in :: proc "contextless" (list: []Rid, r: Rid) -> bool {
+_rid_in :: proc "contextless" (list: []Dot, r: Dot) -> bool {
 	for x in list {
 		if x == r {
 			return true
@@ -598,12 +603,12 @@ Writer :: struct {
 	core: obj.Writer,
 }
 
-writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> Error {
-	return obj.writer_create(&w.core, v, vfs, path, object, .Map, participant, created, settings, opts, allocator, clock)
+writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, gen: u64, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> Error {
+	return obj.writer_create(&w.core, v, vfs, path, object, .Map, participant, gen, created, settings, opts, allocator, clock)
 }
 
-writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> (head: obj.Head, err: Error) {
-	return obj.writer_open(&w.core, v, vfs, path, object, .Map, participant, opts, allocator, clock)
+writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, gen: u64, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> (head: obj.Head, err: Error) {
+	return obj.writer_open(&w.core, v, vfs, path, object, .Map, participant, gen, opts, allocator, clock)
 }
 
 writer_close :: proc(w: ^Writer) -> Error {
@@ -636,10 +641,10 @@ add :: proc(w: ^Writer, key: []u8, tag: u32, element: []u8) -> (id: Rid, err: Er
 		return {}, .Invalid
 	}
 	off := _append(w, Add{key, tag, element}) or_return
-	return Rid{w.core.id, off}, .None
+	return Rid{w.core.id, off, w.core.gen}, .None
 }
 
-del :: proc(w: ^Writer, key: []u8, tag: u32, element: []u8, observed: []Rid) -> (off: i64, err: Error) {
+del :: proc(w: ^Writer, key: []u8, tag: u32, element: []u8, observed: []Dot) -> (off: i64, err: Error) {
 	if len(key) == 0 || len(key) > MAX_KEY_LEN || len(observed) > MAX_TOMBS {
 		return 0, .Invalid
 	}
@@ -782,15 +787,15 @@ entry_join :: proc(a, b: ^Entry, allocator := context.temp_allocator) -> (out: E
 			append(&els, el)
 			continue
 		}
-		live := make([dynamic]Rid, 0, len(els[k].live) + len(el.live), allocator)
-		dead := make([dynamic]Rid, 0, len(els[k].dead) + len(el.dead), allocator)
+		live := make([dynamic]Dot, 0, len(els[k].live) + len(el.live), allocator)
+		dead := make([dynamic]Dot, 0, len(els[k].dead) + len(el.dead), allocator)
 		append(&dead, ..els[k].dead)
 		for r in el.dead {
 			if !_rid_in(dead[:], r) {
 				append(&dead, r)
 			}
 		}
-		for list in ([2][]Rid{els[k].live, el.live}) {
+		for list in ([2][]Dot{els[k].live, el.live}) {
 			for r in list {
 				if !_rid_in(dead[:], r) && !_rid_in(live[:], r) {
 					append(&live, r)

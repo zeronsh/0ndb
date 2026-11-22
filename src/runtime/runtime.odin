@@ -647,6 +647,8 @@ rid_text :: proc(rid: Rid, allocator := context.temp_allocator) -> string {
 	append(&b, string(h[:]))
 	append(&b, ':')
 	jw_int(&b, rid.off)
+	append(&b, ':')
+	jw_int(&b, i64(rid.gen))
 	return string(b[:])
 }
 
@@ -659,13 +661,23 @@ parse_rid :: proc(s: string) -> (rid: Rid, ok: bool) {
 		return {}, false
 	}
 	n: i64
+	gen: u64
+	second := false
 	for c in s[33:] {
+		if c == ':' && !second {
+			second = true
+			continue
+		}
 		if c < '0' || c > '9' {
 			return {}, false
 		}
-		n = n * 10 + i64(c - '0')
+		if second {
+			gen = gen * 10 + u64(c - '0')
+		} else {
+			n = n * 10 + i64(c - '0')
+		}
 	}
-	return Rid{seg, n}, true
+	return Rid{seg, n, gen}, true
 }
 
 @(private)

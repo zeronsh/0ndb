@@ -263,7 +263,8 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 			return .None
 		}
 		opts := _journal_opts(h)
-		_, err := convo.writer_open(&h.cw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator, _obj_clock(e))
+		gen := _gen_take(e) or_return
+		_, err := convo.writer_open(&h.cw, &h.view, e.vfs, path, h.id, e.self, gen, opts, e.allocator, _obj_clock(e))
 		_oerr(err) or_return
 		h.published = obj.writer_durable(&h.cw.core)
 	case .Map:
@@ -272,7 +273,8 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 			return .None
 		}
 		opts := _journal_opts(h)
-		_, err := omap.writer_open(&h.mw, &h.view, e.vfs, path, h.id, e.self, opts, e.allocator, _obj_clock(e))
+		gen := _gen_take(e) or_return
+		_, err := omap.writer_open(&h.mw, &h.view, e.vfs, path, h.id, e.self, gen, opts, e.allocator, _obj_clock(e))
 		_oerr(err) or_return
 		h.published = obj.writer_durable(&h.mw.core)
 	case .Text, .File_Tree:
@@ -327,11 +329,13 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	case .Conversation:
 		path := _seg_path(e, h.id) or_return
 		opts := _journal_opts(h)
-		_oerr(convo.writer_create(&h.cw, &h.view, e.vfs, path, h.id, e.self, created, convo_settings, opts, e.allocator, _obj_clock(e))) or_return
+		gen := _gen_take(e) or_return
+		_oerr(convo.writer_create(&h.cw, &h.view, e.vfs, path, h.id, e.self, gen, created, convo_settings, opts, e.allocator, _obj_clock(e))) or_return
 	case .Map:
 		path := _seg_path(e, h.id) or_return
 		opts := _journal_opts(h)
-		_oerr(omap.writer_create(&h.mw, &h.view, e.vfs, path, h.id, e.self, created, settings, opts, e.allocator, _obj_clock(e))) or_return
+		gen := _gen_take(e) or_return
+		_oerr(omap.writer_create(&h.mw, &h.view, e.vfs, path, h.id, e.self, gen, created, settings, opts, e.allocator, _obj_clock(e))) or_return
 	case .Text, .File_Tree:
 		if _ckpt_waiting(h) {
 			return .Missing

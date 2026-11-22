@@ -100,6 +100,7 @@ catalog_fields :: proc(c: Catalog_Entry, allocator := context.temp_allocator) ->
 		prim.write_id(&w, c.parent.object)
 		prim.write_id(&w, c.parent.rid.seg)
 		prim.write_uvarint(&w, u64(max(c.parent.rid.off, 0)))
+		prim.write_uvarint(&w, c.parent.rid.gen)
 		append(&out, Field{tag = u32(Catalog_Tag.Parent), value = b[:]})
 	}
 	if !prim.id_is_zero(c.workspace) {
@@ -200,6 +201,9 @@ _catalog_field :: proc(row: ^Catalog_Row, tag: u32, v: []u8, allocator: runtime.
 		row.parent.object = prim.read_id(&pr)
 		row.parent.rid.seg = prim.read_id(&pr)
 		row.parent.rid.off = i64(min(prim.read_uvarint(&pr), u64(max(i64))))
+		if prim.reader_remaining(&pr) > 0 {
+			row.parent.rid.gen = prim.read_uvarint(&pr)
+		}
 	case .Workspace:
 		row.workspace, _ = value_id(v)
 	case .Agent:

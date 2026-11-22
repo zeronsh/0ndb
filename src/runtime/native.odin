@@ -819,11 +819,15 @@ _warm_context :: proc(r: ^Runtime, o: Object, cfg: ^model.Config, ctx: ^model.Co
 	if terr != .None {
 		return false
 	}
+	user, uerr := convo.tail_head(v, &t)
+	if uerr != .None {
+		return false
+	}
 	fake := Run {
 		r     = r,
 		o     = o,
 		ai    = a,
-		user  = convo.tail_head(v, &t),
+		user  = user,
 		alloc = context.temp_allocator,
 	}
 	n := Native {

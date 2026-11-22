@@ -3,6 +3,7 @@ package api
 import "base:runtime"
 import "core:encoding/json"
 import "core:strconv"
+import "core:strings"
 import "../../convo"
 import eng "../../engine"
 import omap "../../map"
@@ -111,7 +112,8 @@ decode_binary :: proc(op: ^Op, r: ^prim.Reader, a: ^Args, allocator: runtime.All
 			v = prim.read_id(r)
 		case .Rid:
 			seg := prim.read_id(r)
-			v = Rid{seg, prim.read_ivarint(r)}
+			off := prim.read_ivarint(r)
+			v = Rid{seg, off, prim.read_uvarint(r)}
 		case .Object:
 			sp := prim.read_id(r)
 			v = Object{sp, prim.read_id(r)}
@@ -394,11 +396,21 @@ parse_rid :: proc(s: string) -> (r: Rid, ok: bool) {
 		return {}, false
 	}
 	seg := prim.id_parse(s[:32]) or_return
-	n, nok := strconv.parse_i64(s[33:])
+	rest := s[33:]
+	gen: u64
+	if i := strings.index_byte(rest, ':'); i >= 0 {
+		g, gok := strconv.parse_u64_of_base(rest[i + 1:], 10)
+		if !gok {
+			return {}, false
+		}
+		gen = g
+		rest = rest[:i]
+	}
+	n, nok := strconv.parse_i64_of_base(rest, 10)
 	if !nok {
 		return {}, false
 	}
-	return Rid{seg, n}, true
+	return Rid{seg, n, gen}, true
 }
 
 parse_object :: proc(s: string) -> (ob: Object, ok: bool) {

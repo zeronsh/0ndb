@@ -118,7 +118,7 @@ _trigger_touched :: proc(r: ^Runtime, o: Object) {
 	if !r.cfg.runner || !r.triggers {
 		return
 	}
-	oid16 := rid_bytes(Rid{o.id, 0})[:16]
+	oid16 := rid_bytes(Rid{o.id, 0, 0})[:16]
 	en, ok := map_read(r, state_object(r, o.space), key_of("trig/", oid16))
 	if !ok {
 		return

@@ -201,6 +201,7 @@ o_rid :: proc(o: ^Out, name: string, r: Rid) {
 		x := r.seg
 		prim.write_raw(&o.w, x[:])
 		prim.write_ivarint(&o.w, r.off)
+		prim.write_uvarint(&o.w, r.gen)
 	}
 }
 
@@ -289,6 +290,8 @@ rid_text :: proc(buf: ^[dynamic]u8, r: Rid) {
 	append(buf, ':')
 	b: [32]u8
 	append(buf, strconv.write_int(b[:], r.off, 10))
+	append(buf, ':')
+	append(buf, strconv.write_uint(b[:], r.gen, 10))
 }
 
 object_text :: proc(buf: ^[dynamic]u8, ob: Object) {

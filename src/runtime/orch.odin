@@ -151,8 +151,8 @@ _last_reply_text :: proc(r: ^Runtime, o: Object, limit: int) -> string {
 	if terr != .None {
 		return ""
 	}
-	head := convo.tail_head(v, &t)
-	if obj.rid_none(head) {
+	head, herr := convo.tail_head(v, &t)
+	if herr != .None || obj.rid_none(head) {
 		return ""
 	}
 	m, merr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator)
@@ -1175,7 +1175,7 @@ _orch_history :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
 		if c, found, _ := eng.catalog_get(r.e, Object{caller.space, h.object}, context.temp_allocator); found {
 			jw_kstr(&b, "title", c.title)
 		}
-		if len(h.ref) == 24 {
+		if len(h.ref) == 32 {
 			if rid, rok := rid_from_bytes(h.ref); rok {
 				jw_kstr(&b, "message", rid_text(rid))
 			}

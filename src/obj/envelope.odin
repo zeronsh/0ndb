@@ -9,6 +9,7 @@ Links :: struct {
 	stamp: prim.Hlc,
 	zraw:  i64,
 	zhead: i64,
+	gen:   u64,
 	extra: []u8,
 }
 
@@ -54,6 +55,7 @@ encode_links :: proc(w: ^prim.Writer, off: i64, l: ^Links) {
 	tw_u64(&lw, 4, u64(l.stamp))
 	tw_uv(&lw, ZIP_TAG, u64(max(l.zraw, 0)))
 	tw_uv(&lw, ZIP_HEAD_TAG, u64(max(l.zhead, 0)))
+	tw_uv(&lw, GEN_TAG, l.gen)
 	prim.write_raw(&lw, l.extra)
 	if lw.err != .None {
 		w.err = lw.err
@@ -110,6 +112,11 @@ decode_envelope :: proc "contextless" (body: []u8, off: i64) -> (e: Envelope, er
 				return e, .Corrupt
 			}
 			e.links.zhead = i64(f.uv)
+		case GEN_TAG:
+			if f.ty != F_UV {
+				return e, .Corrupt
+			}
+			e.links.gen = f.uv
 		case:
 			return e, .Unsupported
 		}
@@ -124,9 +131,9 @@ decode_envelope :: proc "contextless" (body: []u8, off: i64) -> (e: Envelope, er
 	return e, .None
 }
 
-encode_head :: proc(w: ^prim.Writer, h: ^Head) {
+encode_head :: proc(w: ^prim.Writer, h: ^Head, gen: u64) {
 	prim.write_u8(w, RECORD_HEAD)
-	l: Links
+	l := Links{gen = gen}
 	encode_links(w, 0, &l)
 	tw_id(w, 1, h.object)
 	tw_uv(w, 2, u64(h.kind))

@@ -235,7 +235,7 @@ view_tail :: proc(v: ^obj.View, self: prim.Id = {}, allocator := context.allocat
 	if !obj.vref_none(t.head) {
 		msg := Message{}
 		hs := Vref{}
-		if _, e := _seal_info(v, t.head, Position{}, &msg, &hs); e == .Missing {
+		if _, e := _seal_info(v, t.head, {}, false, &msg, &hs); e == .Missing {
 			missing = true
 		} else if e != .None {
 			return t, e
@@ -308,11 +308,11 @@ derive_status :: proc "contextless" (t: ^Tail) -> Status {
 	return .Idle
 }
 
-tail_head :: proc "contextless" (v: ^obj.View, t: ^Tail) -> Rid {
+tail_head :: proc(v: ^obj.View, t: ^Tail) -> (Rid, Error) {
 	return obj.rid(v, t.head)
 }
 
-tail_position :: proc "contextless" (v: ^obj.View, t: ^Tail) -> Rid {
+tail_position :: proc(v: ^obj.View, t: ^Tail) -> (Rid, Error) {
 	return obj.rid(v, t.position)
 }
 
@@ -324,7 +324,8 @@ unsealed :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Unseal
 			continue
 		}
 		for o in summary_open(&sum) {
-			append(&list, Unsealed{Rid{v.segs[s].id, o.msg}, o.state, o.attempt})
+			r := obj.rid(v, Vref{s, o.msg}) or_return
+			append(&list, Unsealed{r, o.state, o.attempt})
 		}
 	}
 	return list[:], .None
@@ -378,7 +379,10 @@ page_around :: proc(v: ^obj.View, t: ^Tail, anchor: Rid, before: int, after: int
 	w.more_older = older.more
 	w.newer = newer.next
 	w.more_newer = newer.more
-	w.leaf = leaf if !obj.rid_none(leaf) else obj.rid(v, t.position)
+	w.leaf = leaf
+	if obj.rid_none(leaf) {
+		w.leaf = obj.rid(v, t.position) or_return
+	}
 	return w, .None
 }
 
@@ -468,13 +472,14 @@ _page_newer :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, leaf: Ri
 		_spine_prefetch(v, t, fd + 1, top, floor)
 		return p, .Missing
 	}
-	older := _page_older(v, t, Position{msg = obj.rid(v, topv)}, int(top - fd), allocator) or_return
+	top_rid := obj.rid(v, topv) or_return
+	older := _page_older(v, t, Position{msg = top_rid}, int(top - fd), allocator) or_return
 	list := make([]Message, len(older.messages), allocator)
 	for m, i in older.messages {
 		list[len(older.messages) - 1 - i] = m
 	}
 	p.messages = list
-	p.next = Position{msg = obj.rid(v, topv)}
+	p.next = Position{msg = top_rid}
 	p.more = top < ln.depth
 	return p, .None
 }
@@ -484,8 +489,10 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 	cur := Vref{}
 	seal := Vref{}
 	known := false
+	next := from
 	if obj.rid_none(from.msg) {
 		cur = t.position
+		next = Position{msg = obj.rid(v, cur) or_return}
 	} else {
 		cur = _msg_at(v, from.msg) or_return
 		known = from.seal_known
@@ -494,7 +501,7 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 		}
 	}
 	if limit <= 0 || obj.vref_none(cur) {
-		p.next = Position{obj.rid(v, cur), obj.rid(v, seal), known}
+		p.next = next
 		p.more = !obj.vref_none(cur)
 		return p, .None
 	}
@@ -502,12 +509,11 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 	missing := false
 	prev_depth: i64 = -1
 	floor := max(prim.Hlc)
+	open_parent := false
 	for !obj.vref_none(cur) && len(out) < limit {
-		msg := Message{
-			id = obj.rid(v, cur),
-		}
+		msg := Message{}
 		below := obj.end(v, cur.seg)
-		re := _resolve_body(v, cur, Position{obj.rid(v, cur), obj.rid(v, seal), known}, &msg, &below, allocator)
+		re := _resolve_body(v, cur, seal, known, &msg, &below, allocator)
 		if re != .None && re != .Missing && re != .Unknown_Segment {
 			return p, re
 		}
@@ -532,7 +538,20 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 		if prev_depth >= 0 && prev_depth != m.depth + 1 {
 			return p, .Corrupt
 		}
-		_fill_message(v, cur, &m, &msg, allocator) or_return
+		if fe := _fill_message(v, cur, body, &m, &msg, allocator); fe != .None {
+			if fe != .Missing {
+				return p, fe
+			}
+			missing = true
+			break
+		}
+		here := Position{msg.id, msg.seal if known && !obj.vref_none(seal) else {}, known}
+		if open_parent {
+			out[len(out) - 1].parent = here.msg
+			out[len(out) - 1].parent_seal = here.seal
+			open_parent = false
+		}
+		next = here
 		floor = min(floor, m.hlc)
 		prev_depth = m.depth
 		parent, pe := obj.resolve(v, cur.seg, m.parent)
@@ -541,11 +560,37 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 		if pe != .None || pse != .None {
 			missing = true
 			cur = {}
+			next = {}
 			break
 		}
 		cur = parent
 		seal = pseal
 		known = obj.vref_none(parent) || !obj.vref_none(pseal)
+		open_parent = !obj.vref_none(parent)
+		if !open_parent {
+			next = Position{{}, {}, known}
+		}
+	}
+	if open_parent && len(out) > 0 {
+		last := &out[len(out) - 1]
+		pr, pre := obj.rid(v, cur)
+		ps: Rid
+		pse := Error.None
+		if pre == .None && known && !obj.vref_none(seal) {
+			ps, pse = obj.rid(v, seal)
+		}
+		switch {
+		case pre == .None && pse == .None:
+			last.parent = pr
+			last.parent_seal = ps
+			next = Position{pr, ps, known}
+		case pre == .Missing || pse == .Missing:
+			missing = true
+			pop(&out)
+			cur = {}
+		case:
+			return p, pre if pre != .None else pse
+		}
 	}
 	if !obj.vref_none(cur) && len(out) > 0 {
 		if n, e := _node(v, cur); e == .None {
@@ -566,8 +611,8 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 		}
 	}
 	p.messages = out[:]
-	p.next = Position{obj.rid(v, cur), obj.rid(v, seal), known}
-	p.more = !obj.vref_none(cur)
+	p.next = next
+	p.more = !obj.rid_none(next.msg)
 	if missing {
 		return p, .Missing
 	}
@@ -603,7 +648,7 @@ siblings :: proc(v: ^obj.View, t: ^Tail, msg: Rid, allocator := context.allocato
 	kids := one[0].kids[:]
 	out := make([]Rid, len(kids), allocator)
 	for k, i in kids {
-		out[i] = obj.rid(v, k.child)
+		out[i] = obj.rid(v, k.child) or_return
 		if k.child == x {
 			pos = i + 1
 		}
@@ -649,13 +694,13 @@ switch_target :: proc(v: ^obj.View, t: ^Tail, s: Rid) -> (leaf: Rid, err: Error)
 			if missing {
 				return {}, .Missing
 			}
-			return obj.rid(v, e.leaf), .None
+			return obj.rid(v, e.leaf)
 		}
 	}
 	if missing {
 		return {}, .Missing
 	}
-	return obj.rid(v, sv), .None
+	return obj.rid(v, sv)
 }
 
 assignee :: proc(v: ^obj.View, t: ^Tail, msg: Rid) -> (runner: prim.Id, err: Error) {
@@ -770,9 +815,9 @@ compactions :: proc(v: ^obj.View, floor: prim.Hlc, allocator := context.allocato
 		from := obj.resolve(a.v, s, c.from) or_return
 		to := obj.resolve(a.v, s, c.to) or_return
 		item := Compaction{
-			at    = Rid{a.v.segs[s].id, off},
-			from  = obj.rid(a.v, from),
-			to    = obj.rid(a.v, to),
+			at    = obj.rid(a.v, Vref{s, off}) or_return,
+			from  = obj.rid(a.v, from) or_return,
+			to    = obj.rid(a.v, to) or_return,
 			stamp = rec.stamp,
 		}
 		item.summary = obj.clone_str(c.summary, a.allocator) or_return
@@ -797,8 +842,8 @@ intents :: proc(v: ^obj.View, allocator := context.allocator) -> (items: []Inten
 	out := make([]Intent, len(pend), allocator)
 	for p, i in pend {
 		it := &out[i]
-		it.item = obj.rid(v, p.item)
-		it.latest = obj.rid(v, p.latest)
+		it.item = obj.rid(v, p.item) or_return
+		it.latest = obj.rid(v, p.latest) or_return
 		it.kind = p.kind
 		it.by = obj.seg_id(v, p.item)
 		it.stamp = p.stamp
@@ -815,20 +860,20 @@ intents :: proc(v: ^obj.View, allocator := context.allocator) -> (items: []Inten
 			it.text = obj.clone_str(r.text, allocator) or_return
 			it.attachments = _clone_atts(r.attachments, allocator) or_return
 			if t, e := obj.resolve(v, p.latest.seg, r.msg); e == .None {
-				it.target = obj.rid(v, t)
+				it.target = obj.rid(v, t) or_return
 			}
 		case Edit_Queued:
 			it.text = obj.clone_str(r.text, allocator) or_return
 			it.attachments = _clone_atts(r.attachments, allocator) or_return
 		case Interrupt:
 			if t, e := obj.resolve(v, p.latest.seg, r.msg); e == .None {
-				it.target = obj.rid(v, t)
+				it.target = obj.rid(v, t) or_return
 			}
 		case Answer:
 			it.allow = r.allow
 			it.text = obj.clone_str(r.text, allocator) or_return
 			if t, e := obj.resolve(v, p.latest.seg, r.request); e == .None {
-				it.target = obj.rid(v, t)
+				it.target = obj.rid(v, t) or_return
 			}
 		case Await:
 			it.condition = r.condition
@@ -1010,8 +1055,8 @@ _pend_less :: proc(v: ^obj.View, a, b: Pend) -> bool {
 }
 
 @(private)
-_fill_message :: proc(v: ^obj.View, at: Vref, m: ^Msg, msg: ^Message, allocator: runtime.Allocator) -> Error {
-	msg.id = obj.rid(v, at)
+_fill_message :: proc(v: ^obj.View, at: Vref, body: []u8, m: ^Msg, msg: ^Message, allocator: runtime.Allocator) -> Error {
+	msg.id = obj.rid_body(v, at, body)
 	msg.role = m.role
 	msg.author = m.author
 	msg.depth = m.depth
@@ -1030,17 +1075,11 @@ _fill_message :: proc(v: ^obj.View, at: Vref, m: ^Msg, msg: ^Message, allocator:
 		}
 		msg.files = files
 	}
-	if p, e := obj.resolve(v, at.seg, m.parent); e == .None {
-		msg.parent = obj.rid(v, p)
-	}
-	if p, e := obj.resolve(v, at.seg, m.parent_seal); e == .None {
-		msg.parent_seal = obj.rid(v, p)
-	}
 	if p, e := obj.resolve(v, at.seg, m.intent); e == .None {
-		msg.intent = obj.rid(v, p)
+		msg.intent = obj.rid(v, p) or_return
 	}
 	if m.claim != 0 {
-		msg.claim = Rid{v.segs[at.seg].id, m.claim}
+		msg.claim = obj.rid(v, Vref{at.seg, m.claim}) or_return
 	}
 	msg.sibling = 1
 	msg.siblings = 1
@@ -1048,16 +1087,15 @@ _fill_message :: proc(v: ^obj.View, at: Vref, m: ^Msg, msg: ^Message, allocator:
 }
 
 @(private)
-_seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at: ^Vref, allocator := context.temp_allocator) -> (last: i64, err: Error) {
+_seal_info :: proc(v: ^obj.View, at: Vref, seal: Vref, seal_known: bool, msg: ^Message, seal_at: ^Vref, allocator := context.temp_allocator) -> (last: i64, err: Error) {
 	s := at.seg
 	sum, _ := _tail(v, s) or_return
-	msg.id = obj.rid(v, at)
-	if pos.seal_known && !obj.rid_none(pos.seal) {
-		sv := obj.vref(v, pos.seal) or_return
+	if seal_known && !obj.vref_none(seal) {
+		sv := seal
 		if sv.seg == s && sv.off > at.off {
 			body, _ := obj.get(v, s, sv.off) or_return
 			_apply_seal(body, sv.off, at.off, msg, allocator) or_return
-			msg.seal = obj.rid(v, sv)
+			msg.seal = obj.rid_body(v, sv, body)
 			seal_at^ = sv
 			return msg.last_block, .None
 		}
@@ -1089,7 +1127,7 @@ _seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at
 			if mo == at.off {
 				_apply_seal(body, sum.last_seal, at.off, msg, allocator) or_return
 				seal_at^ = Vref{s, sum.last_seal}
-				msg.seal = obj.rid(v, seal_at^)
+				msg.seal = obj.rid_body(v, seal_at^, body)
 				return msg.last_block, .None
 			}
 		}
@@ -1102,7 +1140,7 @@ _seal_info :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, seal_at
 	body, _ := obj.get(v, s, so) or_return
 	_apply_seal(body, so, at.off, msg, allocator) or_return
 	seal_at^ = Vref{s, so}
-	msg.seal = obj.rid(v, seal_at^)
+	msg.seal = obj.rid_body(v, seal_at^, body)
 	return msg.last_block, .None
 }
 
@@ -1175,9 +1213,9 @@ _scan_seal :: proc(v: ^obj.View, s: int, m: i64) -> (seal: i64, last: i64, err: 
 }
 
 @(private)
-_resolve_body :: proc(v: ^obj.View, at: Vref, pos: Position, msg: ^Message, below: ^i64, allocator: runtime.Allocator) -> Error {
+_resolve_body :: proc(v: ^obj.View, at: Vref, seal: Vref, known: bool, msg: ^Message, below: ^i64, allocator: runtime.Allocator) -> Error {
 	seal_at := Vref{}
-	last := _seal_info(v, at, pos, msg, &seal_at, allocator) or_return
+	last := _seal_info(v, at, seal, known, msg, &seal_at, allocator) or_return
 	if !obj.vref_none(seal_at) {
 		below^ = min(below^, seal_at.off)
 	}
@@ -1422,10 +1460,10 @@ _page_siblings :: proc(v: ^obj.View, t: ^Tail, msgs: []Message, floor: prim.Hlc,
 	structure_load(v, t, floor, &st) or_return
 	set := make([]Kid_Set, len(msgs), v.scratch)
 	for m, i in msgs {
-		x := obj.vref(v, m.id) or_return
+		x := obj.vref_pos(v, m.id) or_return
 		par := Vref{}
 		if !obj.rid_none(m.parent) {
-			par = obj.vref(v, m.parent) or_return
+			par = obj.vref_pos(v, m.parent) or_return
 		}
 		set[i] = Kid_Set{at = x, parent = par, depth = m.depth, hlc = m.hlc}
 	}
@@ -1443,7 +1481,7 @@ _page_siblings :: proc(v: ^obj.View, t: ^Tail, msgs: []Message, floor: prim.Hlc,
 		if obj.rid_none(m.claim) {
 			continue
 		}
-		c := obj.vref(v, m.claim) or_return
+		c := obj.vref_pos(v, m.claim) or_return
 		m.landed, m.landed_as = is_landed(&st, c)
 		m.superseded = is_superseded(&st, c)
 		env, red := obj.envelope(v, c.seg, c.off) or_return

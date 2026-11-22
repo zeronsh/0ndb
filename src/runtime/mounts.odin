@@ -588,7 +588,7 @@ _turn_before :: proc(v: ^obj.View, reply: Rid, out: ^map[string][]u8) -> bool {
 			continue
 		}
 		target, rerr := obj.resolve(v, s, sc.msg)
-		if rerr != .None || obj.rid(v, target) != reply {
+		if rerr != .None || !obj.rid_is(v, target, reply) {
 			continue
 		}
 		_versions_parse(sc.before, out)
@@ -620,7 +620,7 @@ _landed_files :: proc(v: ^obj.View, claim: Rid, floor: prim.Hlc) -> []convo.File
 		}
 		l := rec.body.(convo.Landed)
 		target, rerr := obj.resolve(c.v, s, l.run)
-		if rerr != .None || obj.rid(c.v, target) != c.claim {
+		if rerr != .None || !obj.rid_is(c.v, target, c.claim) {
 			return false, .None
 		}
 		c.found = l.files

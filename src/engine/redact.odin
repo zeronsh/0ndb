@@ -142,8 +142,8 @@ _relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, device: p
 }
 
 @(private)
-_sealed_in :: proc(h: ^Handle, device: prim.Id, from, to: i64) -> []Rid {
-	out := make([dynamic]Rid, context.temp_allocator)
+_sealed_in :: proc(h: ^Handle, device: prim.Id, from, to: i64) -> []Msg_Pos {
+	out := make([dynamic]Msg_Pos, context.temp_allocator)
 	for s in h.segs {
 		if s.device != device || s.rep == nil {
 			continue
@@ -172,7 +172,7 @@ _sealed_in :: proc(h: ^Handle, device: prim.Id, from, to: i64) -> []Rid {
 					continue
 				}
 				if seal, ok := rec.body.(convo.Seal); ok && seal.last_block >= from && seal.last_block < to {
-					append(&out, Rid{device, seal.msg})
+					append(&out, Msg_Pos{device, seal.msg})
 				}
 			}
 		}
@@ -245,7 +245,7 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 	if len(oids) > 0 && e.db_open {
 		odb.redact(&e.db, oids[:], "refs/0ndb/", nil, true, context.temp_allocator)
 	}
-	_index_purge_message(e, h, msg)
+	_index_purge_message(e, h, Msg_Pos{msg.seg, msg.off})
 	_purge_message(e, h, msg, &m)
 	_handle_mark(h)
 	_object_changed(e, h.sp.id, h.id, .Redacted)
@@ -254,7 +254,25 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 
 @(private)
 _redact_intent :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64, target: i64 = -1) -> Error {
+	if device == e.self {
+		_own_commit(h) or_return
+	}
 	return _redact_intent_at(e, h.sp.id, h.id, h.kind, device, from, to, target)
+}
+
+@(private)
+_own_commit :: proc(h: ^Handle) -> Error {
+	#partial switch h.kind {
+	case .Conversation:
+		if h.w_open {
+			return _jerr(journal.journal_commit(&h.cw.core.j))
+		}
+	case .Map:
+		if h.w_open {
+			return _jerr(journal.journal_commit(&h.mw.core.j))
+		}
+	}
+	return .None
 }
 
 @(private)
@@ -649,8 +667,7 @@ _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, t
 				target = obj.Vref{w.seg, b.msg}
 			}
 		}
-		msg := Rid{e.self, target.off}
-		if !obj.vref_none(target) {
+		if msg, merr0 := obj.rid(&h.view, target); merr0 == .None && !obj.vref_none(target) {
 			if t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator); terr == .None {
 				if m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator); merr == .None {
 					_purge_message(e, h, msg, &m)
@@ -664,7 +681,7 @@ _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, t
 			return
 		}
 		if !obj.vref_none(target) {
-			_index_purge_message(e, h, msg)
+			_index_purge_message(e, h, Msg_Pos{e.self, target.off})
 		} else {
 			_derived_purge(e, h)
 		}
@@ -702,8 +719,9 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 		target = {}
 	}
 	if !obj.vref_none(target) && h.kind == .Conversation {
-		target_rid = obj.rid(&h.view, target)
-		if t, tt := convo.view_tail(&h.view, e.self, context.temp_allocator); tt == .None {
+		gerr: obj.Error
+		target_rid, gerr = obj.rid(&h.view, target)
+		if t, tt := convo.view_tail(&h.view, e.self, context.temp_allocator); tt == .None && gerr == .None {
 			if m, merr := convo.message(&h.view, &t, convo.Position{msg = target_rid}, context.temp_allocator); merr == .None {
 				_purge_message(e, h, target_rid, &m)
 			}
@@ -746,8 +764,8 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 		osync.replicator_zero_replica(&h.sp.repl, &h.scope, dev, h.name, 0, from.off, r.to)
 		h.view.segs[from.seg].tail_end = -1
 	}
-	if !obj.rid_none(target_rid) {
-		_index_purge_message(e, h, target_rid)
+	if !obj.vref_none(target) && h.kind == .Conversation {
+		_index_purge_message(e, h, Msg_Pos{obj.seg_id(&h.view, target), target.off})
 	}
 	if h.kind == .Map {
 		_derived_purge(e, h)
@@ -801,14 +819,14 @@ _purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid, m: ^convo.Message) {
 }
 
 @(private)
-_index_purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) {
+_index_purge_message :: proc(e: ^Engine, h: ^Handle, msg: Msg_Pos) {
 	if !e.cfg.search {
 		return
 	}
 	if _index_open(e) != .None {
 		return
 	}
-	ref := _rid_ref(msg)
+	ref := _pos_ref(msg.seg, msg.off)
 	src := _source_id(h.id, msg.seg)
 	pos, _ := search.position(&e.index, src)
 	search.redact(&e.index, src, pos, h.id, ref[:])
@@ -816,7 +834,13 @@ _index_purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) {
 }
 
 @(private)
-_index_purge_messages :: proc(e: ^Engine, h: ^Handle, msgs: []Rid) {
+Msg_Pos :: struct {
+	seg: prim.Id,
+	off: i64,
+}
+
+@(private)
+_index_purge_messages :: proc(e: ^Engine, h: ^Handle, msgs: []Msg_Pos) {
 	if len(msgs) == 0 || !e.cfg.search {
 		return
 	}
@@ -824,7 +848,7 @@ _index_purge_messages :: proc(e: ^Engine, h: ^Handle, msgs: []Rid) {
 		return
 	}
 	for msg in msgs {
-		ref := _rid_ref(msg)
+		ref := _pos_ref(msg.seg, msg.off)
 		src := _source_id(h.id, msg.seg)
 		pos, _ := search.position(&e.index, src)
 		search.delete_record(&e.index, src, pos, h.id, ref[:])

@@ -287,7 +287,7 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 }
 
 @(private)
-_map_observed :: proc(e: ^Engine, h: ^Handle, key: []u8, tag: u32, element: []u8) -> (observed: []Rid, err: Error) {
+_map_observed :: proc(e: ^Engine, h: ^Handle, key: []u8, tag: u32, element: []u8) -> (observed: []omap.Dot, err: Error) {
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
 		return nil, merr

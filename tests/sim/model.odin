@@ -116,6 +116,7 @@ Model :: struct {
 	accepted: [dynamic]Pending_Share,
 	grants:   [dynamic]Pending_Share,
 	mounts:   [dynamic]M_Mount,
+	probes:   [dynamic]int,
 }
 
 Pending_Share :: struct {
@@ -137,6 +138,7 @@ model_init :: proc(m: ^Model, w: ^World) {
 	m.accepted = make([dynamic]Pending_Share, a)
 	m.grants = make([dynamic]Pending_Share, a)
 	m.mounts = make([dynamic]M_Mount, a)
+	m.probes = make([dynamic]int, a)
 }
 
 model_destroy :: proc(m: ^Model) {
@@ -178,6 +180,7 @@ model_destroy :: proc(m: ^Model) {
 	delete(m.accepted)
 	delete(m.grants)
 	delete(m.mounts)
+	delete(m.probes)
 }
 
 new_token :: proc(m: ^Model, n: ^Node, tag: string) -> string {
@@ -257,7 +260,7 @@ op_done_cb :: proc(data: rawptr, e: ^eng.Engine, res: ^eng.Result, err: eng.Erro
 	if op.kind == .Send || op.kind == .Queue || op.kind == .Steer || op.kind == .Interrupt || op.kind == .Answer {
 		op.rid = res.item
 	} else if op.kind == .Map_Set && err == .None {
-		op.rid = eng.Rid{op.actor, res.off}
+		op.rid = eng.Rid{op.actor, res.off, 0}
 	}
 	op_done(op, res.tick, err)
 }
@@ -282,6 +285,17 @@ model_durable :: proc(m: ^Model, n: ^Node, t: u64) {
 }
 
 model_node_crashed :: proc(m: ^Model, n: ^Node, mode: Crash_Mode) {
+	if mode == .Power {
+		probe := -1
+		for op in m.ops {
+			if op.node == n.idx && op.kind == .Send && op.status == .Done && !obj.rid_none(op.rid) {
+				probe = op.idx
+			}
+		}
+		if probe >= 0 {
+			append(&m.probes, probe)
+		}
+	}
 	for op in m.ops {
 		if op.node != n.idx {
 			continue

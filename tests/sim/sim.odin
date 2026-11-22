@@ -154,7 +154,14 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 			if filter_keeps(&w.cfg.keep_ops, k) {
 				rng_init(&w.rng, w.cfg.seed, 1_000_000 + u64(k))
 				w.cur_op = k
+				w.probe_crash = -1
 				workload_step(w)
+				if w.probe_crash >= 0 {
+					if pn := w.nodes[w.probe_crash]; pn.alive {
+						node_crash_now(pn, .Power, u64(k))
+					}
+					w.probe_crash = -1
+				}
 			}
 			w.cfg.ops -= 1
 			if w.cfg.ops > 0 {
@@ -183,6 +190,7 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		if !n.alive {
 			if node_start(n) {
 				model_after_restart(&w.model, n)
+				probe_reuse(w, n)
 				requeue_shares(w, n)
 			}
 		}
@@ -283,6 +291,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	trace_events = env_u64("SIM_TRACE_EVENTS", 0) != 0
 	trace_bytes_at = env_u64("SIM_TRACE_BYTES_AT", 0)
 	cfg.share_access = {.Read} if env_u64("SIM_SHARE_READONLY", 0) != 0 else {}
+	cfg.rid_probe = env_u64("SIM_RID_PROBE", 0) != 0
 	cfg.io_rate = env_u64("SIM_IO", cfg.io_rate)
 	region_configure(env_u64("SIM_REGION_MB", 256), env_u64("SIM_TEMP_MB", 96))
 	cfg.mem_max = env_u64("SIM_MEM_MAX", 1500)
@@ -623,7 +632,14 @@ simulate :: proc(t: ^testing.T) {
 	count := env_u64("SIM_SEEDS", 0)
 	seeds := make([dynamic]u64, runtime.heap_allocator())
 	defer delete(seeds)
+	probe := ""
 	if count > 0 {
+		if _, set := os.lookup_env("SIM_RID_PROBE", context.temp_allocator); !set {
+			os.set_env("SIM_RID_PROBE", "1")
+		}
+		if env_u64("SIM_RID_PROBE", 0) != 0 {
+			probe = "SIM_RID_PROBE=1 "
+		}
 		base := env_u64("SIM_BASE", u64(time.now()._nsec))
 		fmt.eprintf("sim: %d random seeds from SIM_BASE=%d\n", count, base)
 		x := base
@@ -651,7 +667,7 @@ simulate :: proc(t: ^testing.T) {
 		replay := count == 0 || u64(i) % every == 0
 		st, ok, why := run_child(seed, replay)
 		if !ok {
-			fmt.eprintf("sim: seed %d FAILED (%s). Reproduce: SIM_SEED=%d odin test tests/sim -o:speed\n", seed, why, seed)
+			fmt.eprintf("sim: seed %d FAILED (%s). Reproduce: %sSIM_SEED=%d odin test tests/sim -o:speed\n", seed, why, probe, seed)
 			append(&failed, seed)
 			first := string(st.first[:st.first_len]) if st.first_len > 0 else why
 			append(&firsts, fmt.aprintf("%d -> %s", seed, first, allocator = runtime.heap_allocator()))
@@ -677,6 +693,8 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.live_closed += st.stats.live_closed
 		total.stats.live_dropped += st.stats.live_dropped
 		total.stats.live_wait_ms = max(total.stats.live_wait_ms, st.stats.live_wait_ms)
+		total.stats.rid_probes += st.stats.rid_probes
+		total.stats.rid_reused += st.stats.rid_reused
 		total.disk_ops += st.disk_ops
 		total.sim_ns += st.sim_ns
 	}
@@ -830,7 +848,7 @@ print_stats :: proc(r: ^Run_Result) {
 	secs := f64(r.wall_ns) / 1e9
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
 	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d expected_conflicts=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, r.stats.conflict_pairs, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
-	fmt.eprintf("sim: interactive_reads=%d waited=%d data=%d absent=%d quarantined=%d closed=%d dropped_by_crash=%d max_wait_ms=%d\n", r.stats.live_reads, r.stats.live_waited, r.stats.live_data, r.stats.live_absent, r.stats.live_quarantined, r.stats.live_closed, r.stats.live_dropped, r.stats.live_wait_ms)
+	fmt.eprintf("sim: interactive_reads=%d waited=%d data=%d absent=%d quarantined=%d closed=%d dropped_by_crash=%d max_wait_ms=%d rid_probes=%d rid_reused=%d\n", r.stats.live_reads, r.stats.live_waited, r.stats.live_data, r.stats.live_absent, r.stats.live_quarantined, r.stats.live_closed, r.stats.live_dropped, r.stats.live_wait_ms, r.stats.rid_probes, r.stats.rid_reused)
 }
 
 @(private = "file")

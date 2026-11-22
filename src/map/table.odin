@@ -586,7 +586,7 @@ _spill_entries :: proc(rb: ^Rebuild) -> Error {
 		for j < len(rb.items) && string(rb.items[j].key) == string(e.key) {
 			it := rb.items[j]
 			seg := rb.sources[it.src].seg
-			apply(&e, seg, Rid{seg, it.off}, it.body, sa)
+			apply(&e, seg, Dot{seg, it.off}, it.body, sa)
 			j += 1
 		}
 		clear(&buf)
@@ -666,7 +666,7 @@ _merge_entries :: proc(rb: ^Rebuild, b: ^Builder) -> Error {
 		for el in e.elements {
 			x := el
 			if len(el.dead) > 0 {
-				dead := make([dynamic]Rid, 0, len(el.dead), a)
+				dead := make([dynamic]Dot, 0, len(el.dead), a)
 				for r in el.dead {
 					if !_rebuilt(rb, r) {
 						append(&dead, r)
@@ -722,7 +722,7 @@ _merge_entries :: proc(rb: ^Rebuild, b: ^Builder) -> Error {
 }
 
 @(private)
-_rebuilt :: proc(rb: ^Rebuild, r: Rid) -> bool {
+_rebuilt :: proc(rb: ^Rebuild, r: Dot) -> bool {
 	for s, i in rb.sources {
 		if s.seg == r.seg {
 			return r.off < rb.ends[i]
@@ -980,7 +980,7 @@ _apply_record :: proc(t: ^Table, txn: ^Txn, seg: prim.Id, off: i64, body: []u8) 
 			olds[i], oldok[i] = _index_key(t, i, &e, key)
 		}
 	}
-	changed := apply(&e, seg, Rid{seg, off}, b)
+	changed := apply(&e, seg, Dot{seg, off}, b)
 	pruned := _prune(txn, &e, seg, off) or_return
 	if !changed && !pruned {
 		return .None
@@ -1023,7 +1023,7 @@ _prune :: proc(txn: ^Txn, e: ^Entry, seg: prim.Id, off: i64) -> (changed: bool, 
 		off: i64,
 	}
 	seen := make([dynamic]Seen, context.temp_allocator)
-	applied :: proc(txn: ^Txn, seen: ^[dynamic]Seen, cur: prim.Id, at: i64, r: Rid) -> (yes: bool, err: Error) {
+	applied :: proc(txn: ^Txn, seen: ^[dynamic]Seen, cur: prim.Id, at: i64, r: Dot) -> (yes: bool, err: Error) {
 		if r.seg == cur {
 			return r.off <= at, .None
 		}
@@ -1049,7 +1049,7 @@ _prune :: proc(txn: ^Txn, e: ^Entry, seg: prim.Id, off: i64) -> (changed: bool, 
 	for el in e.elements {
 		x := el
 		if len(el.dead) > 0 {
-			dead := make([dynamic]Rid, 0, len(el.dead), context.temp_allocator)
+			dead := make([dynamic]Dot, 0, len(el.dead), context.temp_allocator)
 			for r in el.dead {
 				if done := applied(txn, &seen, seg, off, r) or_return; !done {
 					append(&dead, r)

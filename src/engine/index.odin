@@ -41,6 +41,7 @@ search_query :: proc(e: ^Engine, query: string, req: search.Request, allocator :
 	}
 	_index_open(e) or_return
 	r, serr := search.search(&e.index, query, req, allocator)
+	r.hits = _hit_gens(e, r.hits, allocator)
 	return r, _xerr(serr)
 }
 
@@ -182,10 +183,74 @@ _source_id :: proc(object: prim.Id, device: prim.Id) -> (id: prim.Id) {
 
 @(private)
 _rid_ref :: proc(r: Rid) -> (out: [24]u8) {
+	return _pos_ref(r.seg, r.off)
+}
+
+@(private)
+_pos_ref :: proc(seg: prim.Id, off: i64) -> (out: [24]u8) {
+	s := seg
+	copy(out[:16], s[:])
+	prim.put_u64le(out[16:], u64(off))
+	return
+}
+
+ref_rid :: proc "contextless" (ref: []u8) -> (r: Rid, ok: bool) {
+	if len(ref) != 24 && len(ref) != 32 {
+		return {}, false
+	}
+	copy(r.seg[:], ref[:16])
+	r.off = i64(prim.get_u64le(ref[16:24]))
+	if len(ref) == 32 {
+		r.gen = prim.get_u64le(ref[24:32])
+	}
+	return r, r.off > 0
+}
+
+@(private)
+_gen_ref :: proc(r: Rid, allocator := context.allocator) -> []u8 {
+	out := make([]u8, 32, allocator)
 	s := r.seg
 	copy(out[:16], s[:])
-	prim.put_u64le(out[16:], u64(r.off))
-	return
+	prim.put_u64le(out[16:24], u64(r.off))
+	prim.put_u64le(out[24:32], r.gen)
+	return out
+}
+
+@(private)
+_hit_gens :: proc(e: ^Engine, hits: []search.Hit, allocator := context.allocator) -> []search.Hit {
+	n := 0
+	for h in hits {
+		x := h
+		if len(h.ref) == 24 && h.kind == u8(Kind.Conversation) {
+			pos, _ := ref_rid(h.ref)
+			r, ok := _rid_in(e, h.object, .Conversation, pos.seg, pos.off)
+			if !ok {
+				continue
+			}
+			x.ref = _gen_ref(r, allocator)
+		}
+		hits[n] = x
+		n += 1
+	}
+	return hits[:n]
+}
+
+@(private)
+_rid_in :: proc(e: ^Engine, id: prim.Id, kind: Kind, seg: prim.Id, off: i64) -> (r: Rid, ok: bool) {
+	rec, found, rerr := _rec_get(e, id)
+	if rerr != .None || !found {
+		return
+	}
+	h, herr := _handle_get(e, Object{rec.space, id}, kind)
+	if herr != .None {
+		return
+	}
+	vs := obj.view_find(&h.view, seg)
+	if vs < 0 {
+		return
+	}
+	got, gerr := obj.rid(&h.view, obj.Vref{vs, off})
+	return got, gerr == .None
 }
 
 @(private)
@@ -347,7 +412,7 @@ _index_scope :: proc(e: ^Engine, h: ^Handle, device: prim.Id, src: prim.Id, pos:
 	if rerr != .None {
 		return
 	}
-	ref := _rid_ref(Rid{h.view.segs[vr.seg].id, vr.off})
+	ref := _pos_ref(h.view.segs[vr.seg].id, vr.off)
 	search.add_scope(&e.index, src, pos, search.Scope{id = sc.actor, object = h.id, ref = ref[:], hlc = rec.stamp})
 	if sc.id != sc.actor {
 		search.add_scope(&e.index, src, pos, search.Scope{id = sc.id, object = h.id, ref = ref[:], hlc = rec.stamp})
@@ -414,7 +479,10 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 				t = tt
 				tail_ok = true
 			}
-			msg := Rid{device, seal.msg}
+			msg, rerr := obj.rid(&h.view, obj.Vref{obj.view_find(&h.view, device), seal.msg})
+			if rerr != .None {
+				continue
+			}
 			m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator)
 			if merr != .None {
 				continue
