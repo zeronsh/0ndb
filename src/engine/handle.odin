@@ -113,6 +113,7 @@ _group_follow :: proc(h: ^Handle, full: bool) {
 	}
 	if osync.replicator_follow_segments(&h.sp.repl, &h.scope, h.name, 0, full) == .None {
 		h.grouped = true
+		osync.replicator_live_segments(&h.sp.repl, &h.scope, h.name, 0, true)
 	}
 }
 
@@ -754,6 +755,9 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 	if h.view_init {
 		obj.view_destroy(&h.view)
 		h.view_init = false
+	}
+	if h.grouped && h.sp.repl_on {
+		osync.replicator_live_segments(&h.sp.repl, &h.scope, h.name, 0, false)
 	}
 	keep_follow := h.id == h.sp.catalog || _subscribed(e, h.id) || h.own
 	if !keep_follow && h.grouped && h.sp.repl_on {
