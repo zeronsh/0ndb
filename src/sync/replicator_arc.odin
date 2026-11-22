@@ -23,6 +23,7 @@ Arc_Read :: struct {
 	wants:   [dynamic]journal.Range,
 	seal_at: i64,
 	driving: bool,
+	fresh_need: u64,
 }
 
 @(private)
@@ -113,7 +114,7 @@ _arc_step :: proc(r: ^Replicator, l: ^Local) -> (more: bool) {
 		_arc_floor_save(r, l)
 	}
 	if l.floor - sealed >= r.cfg.archive_min {
-		group, gerr := _arc_build(r, l, &j, sealed, head)
+		group, gerr := _arc_build_keyed(r, l, &j, sealed, head)
 		if gerr == .None && group.end > group.first {
 			delta := make([dynamic]arc.Seal_Entry, context.temp_allocator)
 			if have_seal && !seal.full {
@@ -179,6 +180,7 @@ _arc_trim_send :: proc(r: ^Replicator, al: ^Local) {
 	}
 	if client_trim(&r.client, al.trim_for, al.trim_base) == .None {
 		al.trim_sent = al.trim_base
+		r.trims[al.trim_for] = al.trim_base
 	}
 }
 
@@ -254,7 +256,41 @@ _Built :: struct {
 }
 
 @(private)
-_arc_build :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, head: journal.Hash) -> (out: _Built, err: Error) {
+_Build_Ctx :: struct {
+	r:    ^Replicator,
+	l:    ^Local,
+	j:    ^journal.Journal,
+	from: i64,
+	head: journal.Hash,
+	out:  _Built,
+	err:  Error,
+	ran:  bool,
+}
+
+@(private)
+_arc_build_use :: proc(data: rawptr, keys: journal.Key_Provider, shift: u8) {
+	c := cast(^_Build_Ctx)data
+	c.out, c.err = _arc_build(c.r, c.l, c.j, c.from, c.head, keys, shift)
+	c.ran = true
+}
+
+@(private)
+_arc_build_keyed :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, head: journal.Hash) -> (out: _Built, err: Error) {
+	if l.plain {
+		return _arc_build(r, l, j, from, head, {}, 0)
+	}
+	if r.cfg.archive_keys == nil {
+		return _arc_build(r, l, j, from, head, static_provider(&l.key), 0)
+	}
+	c := _Build_Ctx{r = r, l = l, j = j, from = from, head = head}
+	if !r.cfg.archive_keys(r.cfg.user, l.name, l.id, _arc_build_use, &c) || !c.ran {
+		return {first = from, end = from}, .Busy
+	}
+	return c.out, c.err
+}
+
+@(private)
+_arc_build :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, head: journal.Hash, keys: journal.Key_Provider, shift: u8) -> (out: _Built, err: Error) {
 	rd: journal.Reader
 	if journal.reader_open(&rd, r.vfs, l.path, context.temp_allocator) != .None {
 		return {}, .Io
@@ -268,16 +304,6 @@ _arc_build :: proc(r: ^Replicator, l: ^Local, j: ^journal.Journal, from: i64, he
 	links := make([dynamic]journal.Link, context.temp_allocator)
 	group_raw := r.cfg.archive_group if r.cfg.archive_group > 0 else arc.GROUP_RAW
 	mode := arc.Mode.Plain if l.plain else arc.Mode.Sealed
-	keys: journal.Key_Provider
-	shift := u8(0)
-	if !l.plain {
-		if l.tree != nil {
-			keys = keytree_provider(l.tree)
-			shift = l.tree.shift
-		} else {
-			keys = static_provider(&l.key)
-		}
-	}
 	pos := from
 	span_start := from
 	for pos < limit && arc.builder_raw(&b) < group_raw {
@@ -394,6 +420,7 @@ _arc_want :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
 	}
 	for &w in a.wants {
 		if w.from <= from && w.to >= to {
+			_arc_drive(r, rm)
 			return
 		}
 		if w.from <= to && from <= w.to {
@@ -456,6 +483,14 @@ _arc_drive :: proc(r: ^Replicator, rm: ^Remote) {
 	a.driving = true
 	defer a.driving = false
 	arm := a.arm
+	if a.loaded && rm.base > a.base {
+		for w in a.wants {
+			if w.to > a.base {
+				a.loaded = false
+				break
+			}
+		}
+	}
 	if !a.loaded {
 		if !_arc_load(r, rm) {
 			return
@@ -493,8 +528,8 @@ _arc_drive :: proc(r: ^Replicator, rm: ^Remote) {
 			progressed = true
 			lo = e.end
 		}
-		if w.to > a.base {
-			_pull_range(r, rm, max(w.from, a.base), w.to)
+		if done && w.to > a.base {
+			_arc_broken(r, rm, max(w.from, a.base), w.to)
 		}
 		if done {
 			ordered_remove(&a.wants, i)
@@ -542,8 +577,10 @@ _arc_keys :: proc(r: ^Replicator, rm: ^Remote) -> (keys: journal.Key_Provider, s
 	sealing, tree := r.cfg.keys(r.cfg.user, rm.device, rm.name, rm.epoch, rm.id)
 	switch sealing {
 	case .Unknown:
-		rm.keys_wait = true
-		_emit(r, Repl_Event{kind = .Keys_Needed, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+		if !rm.keys_wait {
+			rm.keys_wait = true
+			_emit(r, Repl_Event{kind = .Keys_Needed, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+		}
 		return {}, false, false
 	case .Stream_Key:
 		return static_provider(&rm.skey), true, true
@@ -557,8 +594,11 @@ _arc_keys :: proc(r: ^Replicator, rm: ^Remote) -> (keys: journal.Key_Provider, s
 _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 	a := rm.arc
 	arm := a.arm
-	if arm.relay_len < 0 {
-		_remote_want_tail(r, arm, TAIL_DEFAULT)
+	if arm.relay_len < 0 || arm.fresh_gen < a.fresh_need {
+		if arm.tail == 0 && !arm.probing {
+			_remote_want_tail(r, arm, TAIL_DEFAULT)
+			a.fresh_need = arm.want_gen
+		}
 		return false
 	}
 	end := arm.relay_len
@@ -642,6 +682,7 @@ _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 	a.base = seal.base
 	a.head = seal.head
 	a.loaded = true
+	a.fresh_need = arm.want_gen + 1
 	return true
 }
 
@@ -735,4 +776,21 @@ _key_live :: proc(keys: journal.Key_Provider, off: i64) -> bool {
 	ok := keys.key != nil && keys.key(keys.data, off, &k)
 	crypto.zero_explicit(&k, size_of(k))
 	return ok
+}
+
+@(private)
+_arc_trim_reply :: proc(r: ^Replicator, id: Stream_Id, refused: bool) -> bool {
+	if _, ok := r.trims[id]; !ok {
+		return false
+	}
+	delete_key(&r.trims, id)
+	if !refused {
+		return true
+	}
+	for _, al in r.locals {
+		if al.arc_child && al.trim_for == id {
+			al.trim_sent = 0
+		}
+	}
+	return true
 }

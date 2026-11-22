@@ -443,6 +443,7 @@ finish :: proc(w: ^World) {
 	if len(w.failures) > 0 {
 		return
 	}
+	check_archive_cipher(w)
 	if !check_convergence(w, true) && w.cfg.verbose {
 		dump_replication(w)
 	}
