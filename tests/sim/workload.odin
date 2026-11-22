@@ -869,6 +869,8 @@ deliver_shares :: proc(w: ^World) {
 				append(&m.objs[ps.obj].shared, n.idx)
 				append(&m.accepted, ps)
 			}
+		} else if w.cfg.io_rate > 0 && (err == .Io || err == .No_Space) {
+			n.restart_pending = true
 		} else if n.alive {
 			world_fail(w, "%s accept_share failed: %v", n.name, err)
 		}
