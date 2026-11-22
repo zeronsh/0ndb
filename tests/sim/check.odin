@@ -874,7 +874,7 @@ check_idle :: proc(w: ^World) {
 			continue
 		}
 		if a := loop_armed(&n.inst.loop); a > 0 {
-			world_fail(w, "idle: %s has %d armed timers after settle (batches=%d dirty=%d durable_tick=%d tick=%d pack_pressure=%v): %s", n.name, a, len(n.e.batches), len(n.e.dirty), n.e.durable_tick, n.e.tick, eng.pressured(&n.e), armed_timers(&n.inst.loop))
+			world_fail(w, "idle: %s has %d armed timers after settle (batches=%d dirty=%d durable_seq=%d tick=%d pack_pressure=%v): %s", n.name, a, len(n.e.batches), len(n.e.dirty), n.e.durable_seq, n.e.tick, eng.pressured(&n.e), armed_timers(&n.inst.loop))
 		}
 		if loop_ready(&n.inst.loop) {
 			world_fail(w, "idle: %s has pending wakeups after settle", n.name)

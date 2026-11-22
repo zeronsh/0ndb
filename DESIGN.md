@@ -571,6 +571,14 @@ concurrent typing is never lost or reverted.
   commit job that runs at a scheduled later time. Compaction rewrites cold
   containers so each stream's extents stay contiguous, keeping page reads to
   one or two preads.
+- The unit of durability is the batch, not the tick: settle commits a batch
+  of its own under the tick of the one before it. Every enqueued batch takes
+  the next batch sequence; a command's result carries (as `tick`) the
+  sequence of the batch that will hold its writes, and a `Durable` event
+  carries the sequence of each completed batch, so a result is durable
+  exactly when a `Durable` event reaches its value. Key material an own
+  segment needs commits before the batch that uses it; a puncture commits
+  only after the batch holding its zero-fill.
 - Derived structures are never durable ahead of their source. A derived file
   past the promotion size lives in its own file, and its in-place writes and
   syncs can reach disk before the pack commit that holds its source, so

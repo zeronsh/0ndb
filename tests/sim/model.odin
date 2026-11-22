@@ -274,7 +274,7 @@ op_result :: proc(op: ^M_Op, n: ^Node, err: eng.Error) {
 	if err == .Pending {
 		return
 	}
-	op_done(op, eng.current_tick(&n.e), err)
+	op_done(op, eng.pending_seq(&n.e), err)
 }
 
 model_durable :: proc(m: ^Model, n: ^Node, t: u64) {
@@ -429,6 +429,16 @@ op_presence :: proc(m: ^Model, n: ^Node, op: ^M_Op) -> Presence {
 			}
 		}
 		return .Absent
+	case .Redact_Msg:
+		t := m.ops[op.target]
+		if obj.rid_none(t.rid) || t.node != op.node {
+			return .Unknown
+		}
+		msg, err := eng.convo_message(&n.e, o, convo.Position{msg = t.rid}, context.temp_allocator)
+		if err != .None {
+			return .Unknown
+		}
+		return .Present if msg.redacted else .Absent
 	case .Create:
 		c, found, err := eng.catalog_get(&n.e, o, context.temp_allocator)
 		_ = c
@@ -448,7 +458,7 @@ model_after_restart :: proc(m: ^Model, n: ^Node) {
 	}
 	last_present := make(map[Per]int, context.temp_allocator)
 	for op in m.ops {
-		if op.node != n.idx || !(op.kind == .Send || op.kind == .Stream || op.kind == .Map_Set || op.kind == .Create) {
+		if op.node != n.idx || !(op.kind == .Send || op.kind == .Stream || op.kind == .Map_Set || op.kind == .Create || op.kind == .Redact_Msg) {
 			continue
 		}
 		if op.status == .Lost || op.status == .Failed || op.status == .Issued {

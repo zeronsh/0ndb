@@ -44,7 +44,7 @@ op_promote :: proc(w: ^World, n: ^Node) {
 	err := eng.object_promote(&n.e, m.objs[oi].o)
 	world_note(w, "%s promote %v %s -> %v", n.name, m.objs[oi].kind, id_short(m.objs[oi].o.id), err)
 	if err == .None {
-		append(&w.promos, Promo_Rec{obj = oi, node = n.idx, inc = n.incarnation, tick = eng.current_tick(&n.e)})
+		append(&w.promos, Promo_Rec{obj = oi, node = n.idx, inc = n.incarnation, tick = eng.pending_seq(&n.e)})
 	}
 }
 
@@ -52,7 +52,7 @@ promos_crashed :: proc(w: ^World, n: ^Node) {
 	if !n.e_open {
 		return
 	}
-	durable := eng.durable_tick(&n.e)
+	durable := eng.durable_seq(&n.e)
 	for i := 0; i < len(w.promos); {
 		p := w.promos[i]
 		if p.node == n.idx && p.inc == n.incarnation && p.tick > durable {

@@ -132,7 +132,7 @@ node_start :: proc(n: ^Node) -> bool {
 		return false
 	}
 	n.identity = eng.identity(&n.e)
-	n.durable = eng.durable_tick(&n.e)
+	n.durable = eng.durable_seq(&n.e)
 	world_note(w, "%s up (incarnation %d, self %s)", n.name, n.incarnation, id_short(n.identity.id))
 	infos := eng.space_list(&n.e, context.temp_allocator)
 	sort_spaces(infos)
@@ -260,7 +260,7 @@ node_after :: proc(n: ^Node) {
 		schedule(n.w, Sim_Event{at = n.w.now + 1_000_000, kind = .Watch, node = n.idx})
 	}
 	if n.e_open {
-		t := eng.durable_tick(&n.e)
+		t := eng.durable_seq(&n.e)
 		if t > n.durable {
 			n.durable = t
 			model_durable(&n.w.model, n, t)
