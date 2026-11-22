@@ -31,6 +31,12 @@
   the first commit, and export `GIT_AUTHOR_NAME=wingleeio` and
   `GIT_COMMITTER_NAME=wingleeio`: the environment sets both to another name,
   which overrides git config.
+- The image has no `wasm-ld`, which the relay vectors' wasm run needs. Take
+  it from zig in a scratch dir: `pip install -q --target $S/zigpkg ziglang`,
+  `printf '#!/bin/sh\nexec %s/zigpkg/ziglang/zig wasm-ld "$@"\n' $S > $S/wbin/wasm-ld`
+  (after `mkdir -p $S/wbin`, then `chmod +x`), put `$S/wbin` on `PATH`, then
+  `odin build tools/relayvec -target:js_wasm32 -out:$S/relayvec.wasm` and,
+  from `docs/relay-vectors`, `node ../../tools/relayvec/run_wasm.mjs $S/relayvec.wasm`.
 - Odin on the test machines is not on the Zeron shell's `PATH`: on `WING-PC`
   use `C:\Users\wing_\dev-tools\odin\dist\odin.exe`, on `home-laptop`
   `~/.local/bin/odin`. Work only in `~/dev/0ndb-odin` and `~/dev/0ndb-scratch`
