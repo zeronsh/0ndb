@@ -128,7 +128,7 @@ pick_obj :: proc(w: ^World, n: ^Node, kind: M_Kind) -> int {
 
 node_use :: proc(n: ^Node, id: prim.Id) {
 	if n.used == nil {
-		n.used = make(map[prim.Id]bool)
+		n.used = make(map[prim.Id]bool, n.w.allocator)
 	}
 	n.used[id] = true
 }
