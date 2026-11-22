@@ -454,10 +454,20 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	}
 	pinned := !n.disk.dead && fs.scope_pinned(pa.scope, pa.name)
 	notes := _base_notes(w)
+	injected := pinned && !pa.hold && err == .None && rng_chance(&w.rng, 1, 3)
+	if injected {
+		n.disk.fail_sync = 1
+	}
 	serr := fs.Error.None
 	if !n.disk.dead {
 		serr = _agent_scope_close(w, n, pa.scope)
 		_forget_scope(w, n, pa.scope)
+	}
+	if injected {
+		n.disk.fail_sync = 0
+		if serr != .None {
+			stat_add(w, STAT_BASE_CLOSE_FAILED)
+		}
 	}
 	if pinned && err == .None && serr == .None && !n.disk.dead && _base_notes(w) == notes {
 		world_fail(w, "agent base: %s pinned write to %s/%s reported no outcome", n.name, id_short(m.objs[pa.oi].o.id), pa.name)
@@ -477,7 +487,7 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	op_done(op, eng.pending_seq(&n.e), .None)
-	if serr != .None && w.cfg.io_rate == 0 {
+	if serr != .None && w.cfg.io_rate == 0 && !injected {
 		world_fail(w, "%s scope_close failed: %v", n.name, serr)
 	}
 }
@@ -800,6 +810,7 @@ STAT_BASE_MERGED: Stat
 STAT_BASE_CURRENT: Stat
 STAT_BASE_MISMATCH: Stat
 STAT_BASE_OTHER: Stat
+STAT_BASE_CLOSE_FAILED: Stat
 
 @(init)
 _mounts_stats :: proc "contextless" () {
@@ -809,6 +820,7 @@ _mounts_stats :: proc "contextless" () {
 	STAT_BASE_CURRENT = register_stat(50, 1, "current")
 	STAT_BASE_MISMATCH = register_stat(50, 2, "mismatch")
 	STAT_BASE_OTHER = register_stat(50, 3, "other")
+	STAT_BASE_CLOSE_FAILED = register_stat(50, 4, "close_failed")
 	register_op(10, "agent_chain", proc(w: ^World) -> int {return 3}, op_agent_chain)
 }
 
