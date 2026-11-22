@@ -34,7 +34,7 @@ _incomplete :: proc(err: eng.Error) -> bool {
 	return err == .Missing || err == .Pending || err == .Busy
 }
 
-digest_object :: proc(w: ^World, n: ^Node, oi: int) -> Digest {
+digest_object :: proc(w: ^World, n: ^Node, oi: int, fresh := false) -> Digest {
 	m := &w.model
 	ob := &m.objs[oi]
 	if !n.alive {
@@ -43,7 +43,7 @@ digest_object :: proc(w: ^World, n: ^Node, oi: int) -> Digest {
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	b := strings.builder_make(context.temp_allocator)
-	ready := eng.Ready{data = nil, call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}}
+	ready := eng.Ready{data = nil, call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}, fresh = fresh}
 	si := space_index(m, ob.o.space)
 	guest := si >= 0 && !space_member(&m.spaces[si], n.idx)
 	if !guest {
@@ -1517,5 +1517,78 @@ check_uploaded :: proc(w: ^World) {
 			world_fail(w, "%s %s", n.name, x)
 		}
 		node_after(n)
+	}
+}
+
+
+FRESH_POLLS :: 32
+FRESH_STEP :: i64(2_000_000_000)
+
+check_fresh_poll :: proc(w: ^World) {
+	m := &w.model
+	count := len(m.objs)
+	for oi in 0 ..< count {
+		if !obj_exists(m, oi) || len(w.failures) > 0 {
+			continue
+		}
+		ref: Digest
+		refn := -1
+		readers := make([dynamic]int, w.allocator)
+		defer delete(readers)
+		append(&readers, ..readers_of(w, oi))
+		for idx in readers {
+			n := w.nodes[idx]
+			if !n.alive || !n.e_open {
+				continue
+			}
+			before := n.e.stats.probes
+			links := n.connects
+			d: Digest
+			why: string
+			defer delete(why, w.allocator)
+			polls := 0
+			for polls < FRESH_POLLS {
+				delete(d.text, w.allocator)
+				d = digest_object(w, n, oi, true)
+				polls += 1
+				delete(why, w.allocator)
+				why = strings.clone(d.why, w.allocator)
+				d.why = ""
+				if d.complete {
+					break
+				}
+				run_until(w, w.now + FRESH_STEP, false)
+				if !n.alive || !n.e_open || len(w.failures) > 0 {
+					break
+				}
+			}
+			if !n.alive || !n.e_open || len(w.failures) > 0 {
+				delete(d.text, w.allocator)
+				continue
+			}
+			probes := n.e.stats.probes - before
+			w.stats.fresh_polls += 1
+			if probes > 0 {
+				w.stats.fresh_probed += 1
+			}
+			if !d.complete {
+				world_fail(w, "fresh read: %s polled %d fresh reads of %v %s without completing (%d probes, %s)", n.name, polls, m.objs[oi].kind, id_short(m.objs[oi].o.id), probes, why)
+				delete(d.text, w.allocator)
+				continue
+			}
+			if probes > u64(len(w.nodes) * (1 + n.connects - links)) {
+				world_fail(w, "fresh read: %s needed %d probes for %v %s on an idle relay over %d new connections, more than one per segment per connection", n.name, probes, m.objs[oi].kind, id_short(m.objs[oi].o.id), n.connects - links)
+			}
+			if refn < 0 {
+				ref = d
+				refn = idx
+				continue
+			}
+			if _strip_catalog(d.text, d.guest || ref.guest) != _strip_catalog(ref.text, d.guest || ref.guest) {
+				world_fail(w, "fresh read: %v %s differs between %s and %s:\n--- %s\n%s--- %s\n%s", m.objs[oi].kind, id_short(m.objs[oi].o.id), w.nodes[refn].name, n.name, w.nodes[refn].name, ref.text, n.name, d.text)
+			}
+			delete(d.text, w.allocator)
+		}
+		delete(ref.text, w.allocator)
 	}
 }

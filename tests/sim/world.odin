@@ -62,6 +62,7 @@ Node :: struct {
 	disk:        Disk,
 	clock:       Node_Clock,
 	alive:       bool,
+	connects:    int,
 	incarnation: int,
 	inst:        Instance,
 	e:           eng.Engine,
@@ -155,6 +156,8 @@ World_Stats :: struct {
 	seg_delta_bytes: u64,
 	draft_checked:  u64,
 	draft_frames:   u64,
+	fresh_polls:    u64,
+	fresh_probed:   u64,
 	remote_draft_bytes: u64,
 }
 

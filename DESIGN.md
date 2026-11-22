@@ -1087,6 +1087,18 @@ checkpoint bundles, as before, plus:
   the open handle); on the relay, a 16-byte `Sub` and an 8-byte follower
   pointer per connection, plus one resident 120-byte `Stream_State` and its
   store stream (an open file on the file store) shared by all followers.
+- **A fresh read probes a segment once per connection.** The relay length a
+  fresh read needs is kept by the replicator, not the handle: each stream's
+  answer (a probe reply, or a feed entry for a followed stream) is cached for
+  the connection and cleared on the next `Welcome`, and a probed stream joins
+  the feed patterns, so every later relay-side change updates the cached
+  length. A fresh read of a stream with a cached answer takes that length
+  (raising the replica through the same path as a feed entry) and sends no
+  probe; one without an answer probes. So a reader that polls fresh reads in
+  a loop completes after at most one probe per segment per connection, even
+  though handles close at every settle. A follow alone is not an answer: a
+  conversation followed by length learns lengths only from later feed
+  entries, so its first fresh read still probes.
 - **Direct messages.** A participant can send an opaque frame to another
   participant of the same space by device id. The relay delivers it to one
   live connection of that device or answers `Undelivered` at once; it keeps

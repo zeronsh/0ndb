@@ -422,6 +422,7 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	case .Refused:
 		world_note(w, "%s refused by relay: %v", n.name, ev.err)
 	case .Connected:
+		n.connects += 1
 		world_note(w, "%s connected %s", n.name, id_short(ev.space))
 	case .Disconnected:
 		world_note(w, "%s disconnected %s", n.name, id_short(ev.space))

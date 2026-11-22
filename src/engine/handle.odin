@@ -517,12 +517,13 @@ _handle_probe :: proc(h: ^Handle) {
 			continue
 		}
 		s.probed = true
-		if osync.replicator_current(&sp.repl, &h.scope, s.device, h.name, 0) {
-			continue
-		}
 		s.probing = true
-		osync.replicator_want_tail(&sp.repl, &h.scope, s.device, h.name, 0)
-		h.e.stats.fetches += 1
+		if osync.replicator_fresh_tail(&sp.repl, &h.scope, s.device, h.name, 0) {
+			h.e.stats.fetches += 1
+			h.e.stats.probes += 1
+		} else {
+			s.probing = false
+		}
 	}
 }
 
