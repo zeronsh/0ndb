@@ -1074,6 +1074,7 @@ Pass :: struct {
 	young:      [dynamic]string,
 	scope_of:   map[string]^Scope,
 	cutoff:     i64,
+	now:        i64,
 	settle:     bool,
 	full:       bool,
 	git_wrote:  bool,
@@ -1276,7 +1277,8 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	p.young = make([dynamic]string, p.long)
 	p.scope_of = make(map[string]^Scope, p.long)
 	p.settle = settle && !p.git_wrote
-	p.cutoff = history_wall_ns(m.history) - m.opts.settle_ms * 1_000_000
+	p.now = history_wall_ns(m.history)
+	p.cutoff = p.now - m.opts.settle_ms * 1_000_000
 	p.full = full || m.rescan || p.git_wrote
 	m.hold_line = p.git_wrote
 	defer m.hold_line = false
@@ -1737,7 +1739,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		compare_dir(p, rel) or_return
 	case d.kind == .File:
 		if d.stat != e.stat {
-			if p.settle && d.stat.mtime_ns > p.cutoff {
+			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now {
 				append(&p.young, clone_string(rel, p.long) or_else "")
 				return .None
 			}
