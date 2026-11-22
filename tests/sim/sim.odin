@@ -283,9 +283,10 @@ inject_fault :: proc(w: ^World, r: ^Rng) {
 	}
 }
 
-run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label := "first") -> (res: Run_Result) {
+run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label := "first", quiet := false) -> (res: Run_Result) {
 	cfg := default_config(seed)
 	cfg.verbose = verbose
+	cfg.quiet = quiet
 	cfg.disabled = env_disabled()
 	leak_sites = env_u64("SIM_LEAK_SITES", 0) != 0
 	trace_events = env_u64("SIM_TRACE_EVENTS", 0) != 0
@@ -364,7 +365,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	if images != nil {
 		disk_images_take(w, images, label)
 	}
-	if verbose {
+	if verbose && !quiet {
 		for d in world_disks(w) {
 			files := make([dynamic]Disk_File, context.temp_allocator)
 			disk_walk(d, &files)
@@ -573,7 +574,7 @@ simulate :: proc(t: ^testing.T) {
 		a := run_seed(seed, verbose, &ia if replay else nil, "first")
 		ok1 := report(t, &a)
 		if replay {
-			b := run_seed(seed, false, &ib, "second")
+			b := run_seed(seed, verbose, &ib, "second", true)
 			diffs := make([dynamic]string, runtime.heap_allocator())
 			same := disk_images_compare(&ia, &ib, &diffs)
 			if a.trace != b.trace || !same {
