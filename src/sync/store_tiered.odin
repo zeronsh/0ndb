@@ -91,6 +91,7 @@ Tier_Space :: struct {
 	ns:        rawptr,
 	refs:      int,
 	holds:     int,
+	pin:       [16]u8,
 	usage:     i64,
 	man:       rawptr,
 	man_len:   i64,
@@ -283,6 +284,7 @@ _tier_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err
 	ns, u := t.inner.namespace_open(t.inner.data, id) or_return
 	sp := new(Tier_Space, t.allocator)
 	sp^ = {t = t, id = id, ns = ns, refs = 1, usage = u}
+	sp.pin = stream_id_suffix(members_stream(id, Device_Id{}))
 	sp.segs = make(map[Stream_Id]Tier_Seg, t.allocator)
 	sp.objs = make(map[Object_Key]bool, t.allocator)
 	sp.open = make(map[Stream_Id]rawptr, t.allocator)

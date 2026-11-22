@@ -9,6 +9,8 @@ Sim_Objects :: struct {
 	rng:     Rng,
 	slow_ms: i64,
 	fail:    u64,
+	inline:  bool,
+	queue:   [dynamic]^Sim_Obj_Req,
 	reads:   u64,
 	failed:  u64,
 	pending: int,
@@ -16,6 +18,7 @@ Sim_Objects :: struct {
 
 @(private = "file")
 Sim_Obj_Req :: struct {
+	timer: prim.Timer,
 	so:   ^Sim_Objects,
 	req:  ^osync.Object_Read,
 	err:  osync.Error,
@@ -46,17 +49,43 @@ _so_read :: proc(data: rawptr, req: ^osync.Object_Read) {
 		}
 	}}
 	so.inner.read(so.inner.data, &inner)
+	if so.inline {
+		osync.object_read_done(req, q.err, q.data)
+		delete(q.data)
+		free(q)
+		return
+	}
 	so.reads += 1
 	if q.err == .None && so.fail > 0 && rng_chance(&so.rng, so.fail, 100) {
 		q.err = .Io
 		so.failed += 1
 	}
 	so.pending += 1
-	prim.timer(so.loop, rng_range(&so.rng, 0, so.slow_ms), q, proc(l: ^prim.Loop, data: rawptr) {
-		q := (^Sim_Obj_Req)(data)
-		q.so.pending -= 1
-		osync.object_read_done(q.req, q.err, q.data)
-		delete(q.data)
-		free(q)
+	append(&so.queue, q)
+	q.timer = prim.timer(so.loop, rng_range(&so.rng, 0, so.slow_ms), q, proc(l: ^prim.Loop, data: rawptr) {
+		_so_finish((^Sim_Obj_Req)(data))
 	})
+}
+
+@(private = "file")
+_so_finish :: proc(q: ^Sim_Obj_Req) {
+	so := q.so
+	for x, i in so.queue {
+		if x == q {
+			ordered_remove(&so.queue, i)
+			break
+		}
+	}
+	so.pending -= 1
+	osync.object_read_done(q.req, q.err, q.data)
+	delete(q.data)
+	free(q)
+}
+
+sim_objects_flush :: proc(so: ^Sim_Objects) {
+	for len(so.queue) > 0 {
+		q := so.queue[0]
+		prim.timer_cancel(so.loop, q.timer)
+		_so_finish(q)
+	}
 }
