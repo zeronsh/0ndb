@@ -712,7 +712,9 @@ replicator_want_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, n
 _remote_want_tail :: proc(r: ^Replicator, rm: ^Remote, n: i64) -> Error {
 	rm.tail = max(rm.tail, max(n, 1))
 	rm.backward = true
-	rm.want_gen += 1
+	if !rm.probing && len(rm.inflight) == 0 {
+		rm.want_gen += 1
+	}
 	_remote_settle(r, rm)
 	_repl_flush(r)
 	return .None
@@ -773,13 +775,20 @@ replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 		_seen_stream(r, id, ans)
 	}
 	rm, ok := r.remotes[id]
-	if !ok || rm.relay_len <= 0 {
+	if !ok || rm.relay_len <= 0 || rm.keys_wait || rm.quarantined || rm.tamper_hold || rm.retry_hold {
 		_repl_flush(r)
 		return .Current
 	}
-	if _, missing := journal.replica_missing(&rm.rep, max(rm.relay_len - TAIL_DEFAULT, 0), rm.relay_len); !missing {
+	lo := max(rm.relay_len - TAIL_DEFAULT, 0)
+	if _, missing := journal.replica_missing(&rm.rep, lo, rm.relay_len); !missing {
 		_repl_flush(r)
 		return .Current
+	}
+	for w in rm.wants {
+		if w.from <= lo && w.to >= rm.relay_len {
+			_repl_flush(r)
+			return .Waiting
+		}
 	}
 	rm.tail = max(rm.tail, TAIL_DEFAULT)
 	rm.backward = true
@@ -1580,6 +1589,16 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 }
 
 @(private)
+_want_add :: proc(rm: ^Remote, g: journal.Range) {
+	for w in rm.wants {
+		if w.from <= g.from && w.to >= g.to {
+			return
+		}
+	}
+	append(&rm.wants, g)
+}
+
+@(private)
 _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || rm.retry_hold || _covered_inflight(rm, gap) {
 		return
@@ -1689,7 +1708,7 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 		_remote_probe(r, rm)
 	}
 	if rm.tail > 0 && fresh {
-		append(&rm.wants, journal.Range{max(rm.relay_len - rm.tail, 0), rm.relay_len})
+		_want_add(rm, journal.Range{max(rm.relay_len - rm.tail, 0), rm.relay_len})
 		rm.tail = 0
 	}
 	if fresh && rm.relay_len == 0 && journal.replica_length(&rm.rep) == 0 {
