@@ -266,7 +266,7 @@ Placement. `state` is one of `none` (the conversation never ran),
 `last_runner` stopped and the takeover policy keeps the work there),
 `waiting_runner` (a placement request: `msg` waits for `runner`, a pool
 runner the host may wake or a pool, or for any runner when `runner` is
-null) and `placing` (the scheduler has not answered yet). An
+null) and `placing` (the host's scheduler plug has not answered yet). An
 idle conversation continues on its last runner when that runner returns
 (the same runner revives its own cut-off turn after a restart) or wherever
 `assign(object, runner)` sends it.
@@ -352,6 +352,7 @@ Enabling. The daemon decides at start which plugs a host supplies:
 | `unlock` | unlock, register | the platform passkey (WebAuthn PRF) |
 | `credentials` | produce | relay credentials for the spaces the host lists |
 | `runner_pool` | verify, attest, renew | this daemon is a cloud pool host |
+| `scheduler` | place | run placement (the runtime's `Scheduler`) |
 | `pool_user` | joined (notification) | this device's account includes a cloud pool |
 
 (`runner_pool` and `pool_user` exclude each other.) Plugs not listed keep the
@@ -395,6 +396,7 @@ for replies that mean "no", use `not_found`, `conflict`, `permission` or
 | 15 | `runner_pool.renew` | sign: bytes, box: bytes | lease_ms: uvarint; `permission` when the machine is gone | 15 s |
 | 10 | `pool_user.joined` | space: id, name: str, relay: str, relay_key: bytes, proof: bytes | notification | – |
 | 12 | `credentials.produce` | space: id, binding: bytes | credential: bytes | 5 s |
+| 14 | `scheduler.place` | kind: enum{message, takeover, intent, revive, schedule, channel}, object: object, msg: rid, sender: id, agent: id, provider: str, policy: bytes, exclude: id, prefer: id | runner: id, reference: bool | 30 s |
 
 (Codes 6, 9 and 11 are retired: identities and credential spaces come with the
 registration.) `[bytes]` is `uvarint count` then each `bytes` in binary, an
@@ -421,6 +423,16 @@ calls `runner.renewal_request`, passes the request to the pool host's
 `pool.renew`, and applies the answer with `runner.renew`; `0ndb runner`
 does this through `ONDB_POOL_HOST_SOCK`. The renewal is a pool-signed
 lease per space that the relay checks at hello and never stores.
+
+`scheduler.place` asks where a run goes. Answer `runner` (any device or
+pool runner), a null `runner` to keep it waiting, or `reference: true` for
+the built-in policy. `prefer` is the runner the work last ran on (or the
+parent conversation's), and `exclude` a runner it must leave. The runtime
+caches the answer per placement and asks again when a runner's presence or
+advert changes; the conversation shows `placing` meanwhile. With no host
+registered, a failure or the deadline, the built-in policy decides. The
+request never blocks the daemon loop, and each device asks its own host, so
+a host serving several devices should answer consistently.
 
 Asynchronous end to end. A plug request suspends only the engine flow that
 made it (a sign-in, a passkey change, a pool enrollment, one relay

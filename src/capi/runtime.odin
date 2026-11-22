@@ -6,6 +6,7 @@ import "./api"
 import "../model"
 import "../prim"
 import rt "../runtime"
+import osync "../sync"
 
 RT_RUNNER :: u32(1 << 0)
 RT_OBSERVE :: u32(1 << 1)
@@ -71,21 +72,27 @@ C_Channels :: struct {
 }
 
 C_Placement :: struct {
-	kind:       u32,
-	space:      [16]u8,
-	object:     [16]u8,
-	msg_seg:    [16]u8,
-	msg_off:    i64,
-	sender:     [16]u8,
-	agent:      [16]u8,
-	policy:     [^]u8,
-	policy_len: uint,
+	kind:         u32,
+	space:        [16]u8,
+	object:       [16]u8,
+	msg_seg:      [16]u8,
+	msg_off:      i64,
+	sender:       [16]u8,
+	agent:        [16]u8,
+	policy:       [^]u8,
+	policy_len:   uint,
+	msg_gen:      u64,
+	exclude:      [16]u8,
+	prefer:       [16]u8,
+	provider:     cstring,
+	provider_len: uint,
 }
 
 C_Scheduler :: struct {
-	size:  u32,
-	ud:    rawptr,
-	place: proc "c" (ud: rawptr, p: ^C_Placement, runner: ^[16]u8) -> i32,
+	size:   u32,
+	ud:     rawptr,
+	place:  proc "c" (ud: rawptr, p: ^C_Placement, call: ^Plug_Call),
+	cancel: proc "c" (ud: rawptr, call: ^Plug_Call),
 }
 
 C_Secrets :: struct {
@@ -113,6 +120,7 @@ C_Runtime :: struct {
 	channels:         ^C_Channels,
 	scheduler:        ^C_Scheduler,
 	secrets:          ^C_Secrets,
+	name:             cstring,
 }
 
 Rt_Plugs :: struct {
@@ -161,6 +169,9 @@ runtime_config :: proc(h: ^Handle, c: ^C_Runtime) -> (opts: api.Stack_Options, s
 	rc.lease_ms = x.lease_ms
 	rc.mcp_port = int(x.mcp_port)
 	rc.default_runner = prim.Id(x.default_runner)
+	if c.size >= u32(offset_of(C_Runtime, name)) + size_of(cstring) {
+		rc.name = _str(x.name)
+	}
 	if x.model != nil {
 		if !_copy_table(&p.model, x.model) || p.model.resolve == nil {
 			return opts, .Invalid
@@ -183,7 +194,7 @@ runtime_config :: proc(h: ^Handle, c: ^C_Runtime) -> (opts: api.Stack_Options, s
 		if !_copy_table(&p.scheduler, x.scheduler) || p.scheduler.place == nil {
 			return opts, .Invalid
 		}
-		rc.scheduler = rt.Scheduler{data = h, place = _scheduler_place}
+		rc.scheduler = rt.Scheduler{data = h, place = _scheduler_reference, ask = _scheduler_ask, cancel = _scheduler_cancel}
 	}
 	if x.secrets != nil {
 		if !_copy_table(&p.secrets, x.secrets) || p.secrets.get == nil {
@@ -352,7 +363,18 @@ _channels_send :: proc(data: rawptr, r: ^rt.Runtime, channel: string, key: strin
 }
 
 @(private)
-_scheduler_place :: proc(data: rawptr, r: ^rt.Runtime, p: ^rt.Placement) -> prim.Id {
+Sched_Ctx :: struct {
+	h:     ^Handle,
+	token: u64,
+}
+
+@(private)
+_scheduler_reference :: proc(data: rawptr, r: ^rt.Runtime, p: ^rt.Placement) -> prim.Id {
+	return rt.default_scheduler().place(nil, r, p)
+}
+
+@(private)
+_scheduler_ask :: proc(data: rawptr, r: ^rt.Runtime, p: ^rt.Placement, token: u64) {
 	h := (^Handle)(data)
 	s := &h.rt.scheduler
 	cp := C_Placement {
@@ -365,12 +387,53 @@ _scheduler_place :: proc(data: rawptr, r: ^rt.Runtime, p: ^rt.Placement) -> prim
 		agent      = ([16]u8)(p.agent),
 		policy     = raw_data(p.policy),
 		policy_len = uint(len(p.policy)),
+		msg_gen    = p.msg.gen,
+		exclude    = ([16]u8)(p.exclude),
+		prefer     = ([16]u8)(p.prefer),
 	}
-	out: [16]u8
-	if s.place(s.ud, &cp, &out) != 0 {
-		return prim.Id(out)
+	cp.provider, cp.provider_len = _cstr(p.provider)
+	ctx := new(Sched_Ctx, runtime.heap_allocator())
+	ctx^ = Sched_Ctx{h, token}
+	ap := &h.plugs.account
+	pc := _pc_new(ap, .Scheduler, osync.Plug_Done{data = ctx, call = _scheduler_done})
+	s.place(s.ud, &cp, pc)
+	reply: osync.Plug_Reply
+	err := _pc_settle(ap, pc, &reply)
+	if err != .Pending {
+		_scheduler_done(ctx, err, &reply)
 	}
-	return rt.default_scheduler().place(nil, r, p)
+}
+
+@(private)
+_scheduler_done :: proc(data: rawptr, err: osync.Error, reply: ^osync.Plug_Reply) {
+	ctx := (^Sched_Ctx)(data)
+	h, token := ctx.h, ctx.token
+	free(ctx, runtime.heap_allocator())
+	if !h.s.r_on {
+		return
+	}
+	if err == .None {
+		rt.placed(&h.s.r, token, reply.runner, true)
+	} else {
+		rt.placed(&h.s.r, token, {}, false)
+	}
+}
+
+@(private)
+_scheduler_cancel :: proc(data: rawptr, r: ^rt.Runtime, token: u64) {
+	h := (^Handle)(data)
+	ap := &h.plugs.account
+	for pc in ap.calls {
+		if pc.kind != .Scheduler {
+			continue
+		}
+		ctx := (^Sched_Ctx)(pc.done.data)
+		if ctx.token == token {
+			_pc_cancel(ap, pc.done)
+			free(ctx, runtime.heap_allocator())
+			return
+		}
+	}
 }
 
 @(private)

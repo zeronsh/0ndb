@@ -121,6 +121,11 @@ impl<'a> Reader<'a> {
         (0..n).map(|_| self.bytes()).collect()
     }
 
+    pub fn ivarint(&mut self) -> i64 {
+        let u = self.uvarint();
+        ((u >> 1) as i64) ^ -((u & 1) as i64)
+    }
+
     pub fn id(&mut self) -> [u8; 16] {
         let mut out = [0u8; 16];
         let r = self.raw(16);

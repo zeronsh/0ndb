@@ -158,7 +158,7 @@ daemon_main :: proc(args: ^Args) -> int {
 		return report_error(.Io, "cannot open the account store")
 	}
 	if !host_plugs_setup(d, &ec, args) {
-		return usage_error("--host-plugs takes a comma-separated list of sealed_store, unlock, credentials and either runner_pool or pool_user")
+		return usage_error("--host-plugs takes a comma-separated list of sealed_store, unlock, credentials, scheduler and either runner_pool or pool_user")
 	}
 	opts := api.Stack_Options {
 		runtime = true,
@@ -199,6 +199,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	opts.rt_cfg.homes = rt.Homes{data = d, home = _home_of}
 	opts.rt_cfg.default_provider = flag_string(args, "provider")
 	opts.rt_cfg.default_model = flag_string(args, "model")
+	opts.rt_cfg.scheduler = host_scheduler(d)
 	opts.rt_cfg.name = flag_string(args, "name")
 	if len(opts.rt_cfg.name) == 0 {
 		opts.rt_cfg.name = sys_hostname(context.temp_allocator)
