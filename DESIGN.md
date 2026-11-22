@@ -406,6 +406,34 @@ equal in both directions.
   kind, actor, mount id) to the device's stream; every replica checks the
   actor against that stream's device and presents the actor's edits in blame
   and conflict regions as that device.
+- **Agent writes from a known base**: an agent that rewrites a file it
+  read earlier would otherwise revert everything that landed in between
+  (keystrokes in a buffer, other devices), because ingestion diffs the
+  shadow (which already holds them) against the agent's bytes. When the
+  driver reports the content a write was based on, the write is ingested
+  from that base instead. A scope pins one version per path: at a reported
+  read whose content equals the file at `synced` (`scope_read_base`), and
+  at a write tool's start (`scope_write_begin`), which also holds the path
+  until the tool finishes (`scope_write_end`, or the scope closing; never a
+  timer): a pass leaves the held path dirty, and materialization advances
+  only to the largest version whose batches since `synced` neither touch a
+  held file nor descend from one that does, so the disk under a write in
+  progress never moves. The write's reported original (`scope_write_base`)
+  must hash to the file at the write pin, and a read pin's hash is checked
+  again, so a pin is used only for the content it names. A scoped change to
+  a pinned path is then emitted as base→written text edits in a batch
+  parented on the pinned version, credited to the scope's actor, without
+  moving `synced`; the pass then materializes `synced` united with that
+  batch, which rewrites the file with both the agent's edit and everything
+  concurrent, and the CRDT reports overlapping edits as conflict regions.
+  Without a pin, or when the hash differs, ingestion is as above, and the
+  mount reports each outcome (merged, current, mismatch, not text) to the
+  registry's base hook. Each pin also appends a durable observation to the
+  tree's history in the scope actor's stream: an opaque op (tag 19:
+  version 1, kind read or write_begin, the file's inode, its path, the
+  observed frontier, and the blake2b-256 of the clean content), so a later
+  question such as which turns built on a version containing some ops is
+  answered from history alone (`history_observations`).
 - **Commit protocol**: each batch a mount commits carries one opaque
   mount-mark op (tag 18 plus a random per-mount nonce) and, unless the line
   is held, the mount's line record, in the same journal commit. Import

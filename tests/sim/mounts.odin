@@ -120,6 +120,7 @@ node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string) -> eng.Error {
 			return rerr
 		}
 		n.reg = reg
+		fs.registry_set_base_note(reg, _on_base, n)
 	}
 	if err := prim.mkdir_all(disk_vfs(&n.disk), root, 0o755); err != .None {
 		return .Io
@@ -248,7 +249,206 @@ _disk_write :: proc(vfs: prim.Vfs, path: string, data: []u8, atomic: bool) -> pr
 	return prim.sync_dir(vfs, prim.dir_name(path))
 }
 
+Agent_Pending :: struct {
+	inc:   int,
+	root:  string,
+	oi:    int,
+	name:  string,
+	scope: ^fs.Scope,
+	actor: prim.Id,
+	base:  []u8,
+	hold:  bool,
+}
+
+agent_pending_free :: proc(w: ^World, pa: Agent_Pending) {
+	delete(pa.root, w.allocator)
+	delete(pa.name, w.allocator)
+	delete(pa.base, w.allocator)
+}
+
+@(private = "file")
+_on_base :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, data: rawptr) {
+	n := (^Node)(data)
+	w := n.w
+	switch note {
+	case .Merged:
+		w.stats.base_merged += 1
+	case .Current:
+		w.stats.base_current += 1
+	case .Mismatch:
+		w.stats.base_mismatch += 1
+	case .Not_Text:
+		w.stats.base_other += 1
+	}
+	world_note(w, "%s agent base for %s: %v", n.name, rel, note)
+}
+
+@(private = "file")
+_agent_start :: proc(w: ^World, n: ^Node) -> bool {
+	m := &w.model
+	live := make([dynamic]int, context.temp_allocator)
+	for sm, i in n.mounts {
+		if sm.m != nil {
+			append(&live, i)
+		}
+	}
+	if len(live) == 0 {
+		return false
+	}
+	sm := n.mounts[live[rng_int(&w.rng, len(live))]]
+	paths := TREE_PATHS
+	name := paths[rng_int(&w.rng, len(paths))]
+	abs := strings.concatenate({sm.root, "/", name}, context.temp_allocator)
+	vfs := disk_vfs(&n.disk)
+	base, berr := prim.read_file(vfs, abs, context.temp_allocator)
+	if n.disk.dead {
+		node_crashed(n)
+		return true
+	}
+	if berr != .None || len(base) == 0 {
+		return false
+	}
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	o := m.objs[sm.oi].o
+	cur, rerr := eng.tree_read(&n.e, o, name, context.temp_allocator)
+	if rerr != .None {
+		return false
+	}
+	hold := rng_chance(&w.rng, 1, 2)
+	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	scope := fs.scope_open(n.reg, sm.m, sid, actor)
+	if hold {
+		fs.scope_write_begin(scope, name)
+		if !fs.scope_pinned(scope, name) {
+			world_note(w, "%s agent hold on %s/%s pinned nothing (not in the shadow)", n.name, id_short(o.id), name)
+		} else if hist, herr := eng.tree_history(&n.e, o); herr == .None {
+			obs := make([dynamic]fs.Observation, context.temp_allocator)
+			if oerr := fs.history_observations(hist, 0, &obs, context.temp_allocator); oerr != .None {
+				world_fail(w, "observe: %s cannot scan %s: %v", n.name, id_short(o.id), oerr)
+			}
+			found := false
+			for x in obs {
+				found ||= x.actor == actor && x.kind == .Write_Begin && x.path == name
+			}
+			eng.tree_release(&n.e, o)
+			if !found {
+				world_fail(w, "observe: %s has no write_begin record by %s for %s/%s", n.name, id_short(actor), id_short(o.id), name)
+			}
+		}
+	} else {
+		fs.scope_read_base(scope, name, base)
+	}
+	kop := new_op(m, .Tree_Write, n, sm.oi)
+	kop.path = strings.clone(name, w.allocator)
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_bytes(&b, cur)
+	if len(cur) > 0 && cur[len(cur) - 1] != '\n' {
+		strings.write_byte(&b, '\n')
+	}
+	tok := new_token(m, n, "k")
+	append(&kop.tokens, tok)
+	strings.write_string(&b, tok)
+	strings.write_byte(&b, '\n')
+	kerr := eng.tree_write(&n.e, o, name, transmute([]u8)strings.to_string(b))
+	op_result(kop, n, kerr)
+	if n.agent_pending == nil {
+		n.agent_pending = make([dynamic]Agent_Pending, w.allocator)
+	}
+	append(&n.agent_pending, Agent_Pending{inc = n.incarnation, root = strings.clone(sm.root, w.allocator), oi = sm.oi, name = strings.clone(name, w.allocator), scope = scope, actor = actor, base = slice.clone(base, w.allocator), hold = hold})
+	world_note(w, "%s agent(actor %s) %s %s/%s base %q; typed %s -> %v", n.name, id_short(actor), "holds" if hold else "reads", id_short(o.id), name, string(base), tok, kerr)
+	return true
+}
+
+agent_finish :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	pa := pop(&n.agent_pending)
+	defer agent_pending_free(w, pa)
+	if pa.inc != n.incarnation || n.reg == nil {
+		return
+	}
+	sm: ^Sim_Mount
+	for &x in n.mounts {
+		if x.root == pa.root && x.m != nil && x.m == pa.scope.mount {
+			sm = &x
+		}
+	}
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	if sm == nil {
+		fs.scope_close(n.reg, pa.scope)
+		return
+	}
+	abs := strings.concatenate({pa.root, "/", pa.name}, context.temp_allocator)
+	vfs := disk_vfs(&n.disk)
+	from := pa.base
+	if pa.hold {
+		cur, rerr := prim.read_file(vfs, abs, context.temp_allocator)
+		if n.disk.dead {
+			node_crashed(n)
+			return
+		}
+		if rerr == .None {
+			from = cur
+		}
+	}
+	op := new_op(m, .Disk_Agent, n, pa.oi)
+	op.path = strings.clone(pa.name, w.allocator)
+	op.actor = pa.actor
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_bytes(&b, from)
+	if len(from) > 0 && from[len(from) - 1] != '\n' {
+		strings.write_byte(&b, '\n')
+	}
+	for _ in 0 ..< 1 + rng_int(&w.rng, 2) {
+		tok := new_token(m, n, "a")
+		append(&op.tokens, tok)
+		strings.write_string(&b, tok)
+		strings.write_byte(&b, '\n')
+	}
+	_writer_set(w, n, abs, Writer_Info{scope = pa.scope, agent = true})
+	if oerr := fs.mount_observe_begin(sm.m, pa.name, pa.scope); oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
+		world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
+	}
+	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
+	if pa.hold && !n.disk.dead {
+		fs.scope_write_base(pa.scope, pa.name, from)
+		fs.scope_write_end(pa.scope, pa.name)
+	}
+	serr := fs.Error.None
+	if !n.disk.dead {
+		serr = fs.scope_close(n.reg, pa.scope)
+		_forget_scope(w, n, pa.scope)
+	}
+	world_note(w, "%s agent(actor %s) writes %s/%s from %s base, wrote %v -> %v %v", n.name, id_short(pa.actor), id_short(m.objs[pa.oi].o.id), pa.name, "current" if pa.hold else "read", op.tokens[:], err, serr)
+	if n.disk.dead {
+		return
+	}
+	if err != .None {
+		op.status = .Uncertain if err == .Io else .Failed
+		if w.cfg.io_rate > 0 {
+			op.status = .Uncertain
+			n.restart_pending = true
+		} else {
+			world_fail(w, "%s disk edit failed: %v", n.name, err)
+		}
+		return
+	}
+	op_done(op, eng.pending_seq(&n.e), .None)
+	if serr != .None && w.cfg.io_rate == 0 {
+		world_fail(w, "%s scope_close failed: %v", n.name, serr)
+	}
+}
+
 op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
+	if agent && len(n.agent_pending) > 0 {
+		agent_finish(w, n)
+		return
+	}
+	if agent && rng_chance(&w.rng, 1, 3) && _agent_start(w, n) {
+		return
+	}
 	m := &w.model
 	live := make([dynamic]int, context.temp_allocator)
 	for sm, i in n.mounts {
