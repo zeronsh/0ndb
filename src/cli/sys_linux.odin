@@ -93,49 +93,6 @@ foreign libc {
 
 idle_release :: proc() {
 	malloc_trim(0)
-	fd, oerr := linux.open("/proc/self/smaps", {})
-	if oerr != .NONE {
-		return
-	}
-	defer linux.close(fd)
-	buf := make([dynamic]u8, context.temp_allocator)
-	chunk: [16384]u8
-	for {
-		n, rerr := linux.read(fd, chunk[:])
-		if rerr == .EINTR {
-			continue
-		}
-		if rerr != .NONE || n <= 0 {
-			break
-		}
-		append(&buf, ..chunk[:n])
-	}
-	lo, hi: u64
-	text := string(buf[:])
-	for line in strings.split_lines_iterator(&text) {
-		if strings.has_prefix(line, "Anonymous:") {
-			if hi > lo && strings.trim_space(line[len("Anonymous:"):]) == "0 kB" {
-				linux.madvise(rawptr(uintptr(lo)), uint(hi - lo), .DONTNEED)
-			}
-			lo, hi = 0, 0
-			continue
-		}
-		sp := strings.index_byte(line, ' ')
-		dash := strings.index_byte(line, '-')
-		if dash <= 0 || sp <= dash || len(line) < sp + 5 || line[sp - 1] == ':' {
-			continue
-		}
-		lo, hi = 0, 0
-		perms := line[sp + 1:sp + 5]
-		if (perms != "r-xp" && perms != "r--p") || strings.index_byte(line, '/') < 0 {
-			continue
-		}
-		a, aok := strconv.parse_u64_of_base(line[:dash], 16)
-		b, bok := strconv.parse_u64_of_base(line[dash + 1:sp], 16)
-		if aok && bok {
-			lo, hi = a, b
-		}
-	}
 }
 
 sys_hostname :: proc(allocator := context.allocator) -> string {

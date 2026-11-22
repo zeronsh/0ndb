@@ -185,7 +185,6 @@ ondb_open :: proc "c" (cfg: ^Config, out: ^^Handle) -> i32 {
 	ec.padding = cfg.flags & CFG_PADDING != 0
 	ec.search = cfg.flags & CFG_NO_SEARCH == 0
 	ec.durability = .Deferred if cfg.flags & CFG_DEFERRED != 0 else .Async
-	ec.idle_pageout = cfg.flags & CFG_IDLE_PAGEOUT != 0
 	ec.search_full = cfg.flags & CFG_SEARCH_FULL != 0
 	if cfg.handle_cache > 0 {
 		ec.handle_cache = int(cfg.handle_cache)

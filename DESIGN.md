@@ -1043,9 +1043,11 @@ checkpoint bundles, as before, plus:
   host gets the same guarantees. The socket host arms no timer of its own:
   when its loop has nothing armed or pending and `relay_quiet` holds (no
   handshake, partial frame, queued output, storage job or yielded work), it
-  releases memory once (heap trim, and on Linux `MADV_DONTNEED` on clean
-  file mappings, so code comes back as minor faults from the page cache) and
-  sleeps until the next event. `docs/relay-protocol.md` is the normative
+  returns free heap to the OS once and sleeps until the next event. Idle
+  release (the relay host and the engine's settle) only ever trims the heap:
+  it never pages out code or empties the working set, which would refault
+  hot pages after every burst while the OS reclaims clean pages under
+  pressure by itself. `docs/relay-protocol.md` is the normative
   protocol, so a relay can be implemented anywhere (a Durable Object per
   space, a small TypeScript server), and `docs/relay-vectors/` holds
   byte-exact transcripts produced and checked by `tools/relayvec`, natively

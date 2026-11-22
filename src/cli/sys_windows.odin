@@ -129,7 +129,6 @@ rss_bytes :: proc() -> i64 {
 
 idle_release :: proc() {
 	_heap_compact()
-	win.SetProcessWorkingSetSizeEx(win.GetCurrentProcess(), ~uint(0), ~uint(0), 0)
 }
 
 sys_hostname :: proc(allocator := context.allocator) -> string {

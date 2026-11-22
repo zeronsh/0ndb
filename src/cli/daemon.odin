@@ -153,7 +153,6 @@ daemon_main :: proc(args: ^Args) -> int {
 	_state_load(d)
 	ec := eng.default_config(d.engine_dir)
 	ec.credentials = eng.Credentials_Source{data = d, produce = _cred_produce}
-	ec.idle_pageout = true
 	ec.search_full = !flag_bool(args, "no-full-index")
 	ec.events = eng.Event_Hook{data = d, event = _on_event}
 	if !acct_setup(d, &ec, args) {
