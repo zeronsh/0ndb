@@ -211,6 +211,8 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		remote_event(w, ev)
 	case .Sim_Http:
 		sim_http_event(w, ev)
+	case .Takeover_Answer:
+		takeover_answer(w, ev)
 	case .Quiesce_Step:
 		quiesce_event(w, ev)
 	case .Heal:

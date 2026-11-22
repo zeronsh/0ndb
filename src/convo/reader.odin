@@ -505,7 +505,7 @@ _page_older :: proc(v: ^obj.View, t: ^Tail, from: Position, limit: int, allocato
 		p.more = !obj.vref_none(cur)
 		return p, .None
 	}
-	out := make([dynamic]Message, 0, limit, allocator)
+	out := make([dynamic]Message, 0, min(limit, 64), allocator)
 	missing := false
 	prev_depth: i64 = -1
 	floor := max(prim.Hlc)

@@ -425,6 +425,11 @@ writer_assign :: proc(w: ^Writer, msg: Rid, runner: prim.Id) -> (off: i64, err: 
 	x := _msg_at(w.core.v, msg) or_return
 	n := _node(w.core.v, x) or_return
 	obj.observe(&w.core, n.hlc)
+	st: Structure
+	structure_load(w.core.v, nil, n.hlc, &st) or_return
+	if _, ahlc := assign_winner(&st, x, n.runner, n.hlc); ahlc > 0 {
+		obj.observe(&w.core, ahlc)
+	}
 	r := obj.local(&w.core, x) or_return
 	return _event(w, Assign{msg = r, runner = runner, hlc = obj.now(&w.core)})
 }

@@ -31,6 +31,7 @@ Ev_Kind :: enum u8 {
 	Git_Fetch,
 	Sim_Http,
 	Quiesce_Step,
+	Takeover_Answer,
 }
 
 Sim_Event :: struct {
@@ -218,6 +219,7 @@ World :: struct {
 	watches:   [dynamic]^Watch,
 	quiesce:   Quiesce_World,
 	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
+	rt_start:  proc(n: ^Node),
 	remote:    Sim_Remote,
 }
 

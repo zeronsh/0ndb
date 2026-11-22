@@ -82,6 +82,7 @@ _evaluate_sender :: proc(r: ^Runtime, o: Object) {
 			return
 		}
 		eng.touched(r.e, o)
+		eng.catalog_usage(r.e, o, {})
 		_claim_overdue(r, o, msg, x, provider)
 	}
 	_promote_for_run(r, o, msg, x)

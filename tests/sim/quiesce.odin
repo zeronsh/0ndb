@@ -248,6 +248,10 @@ quiesce_runtime_start :: proc(n: ^Node) {
 	}
 	clear(&n.http.reqs)
 	n.http.hold = false
+	if w.rt_start != nil {
+		w.rt_start(n)
+		return
+	}
 	member := false
 	for i in w.quiesce.members {
 		member ||= i == n.idx

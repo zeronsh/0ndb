@@ -453,16 +453,17 @@ run_interrupt :: proc(run: ^Run) {
 		return
 	}
 	run.interrupting = true
-	if run.proc_ != nil {
-		proc_interrupt(run.proc_)
-	} else if run.native != nil {
-		native_interrupt(run.native)
-	} else {
+	if run.proc_ == nil && run.native == nil {
 		run_finish(run, .Interrupted)
 		return
 	}
 	if run.kill_timer == 0 {
 		run.kill_timer = prim.timer(eng.loop(run.r.e), run.r.cfg.interrupt_ms, run, _on_kill_timer)
+	}
+	if run.proc_ != nil {
+		proc_interrupt(run.proc_)
+	} else {
+		native_interrupt(run.native)
 	}
 }
 

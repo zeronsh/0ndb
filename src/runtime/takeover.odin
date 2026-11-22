@@ -456,6 +456,7 @@ resume :: proc(r: ^Runtime, o: Object, runner: prim.Id, msg: Rid = {}) -> Error 
 		return .Not_Found if aerr == .Not_Found else .Engine
 	}
 	eng.touched(r.e, o)
+	eng.catalog_usage(r.e, o, {})
 	_sched_reown(r, o, runner)
 	_queue_eval(r, o)
 	return .None
