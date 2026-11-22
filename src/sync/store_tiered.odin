@@ -1645,6 +1645,8 @@ Dir_Object_Store :: struct {
 	bytes: u64,
 	gets:      u64,
 	get_bytes: u64,
+	rewrites:  u64,
+	rewrite_bytes: u64,
 }
 
 dir_object_store :: proc(d: ^Dir_Object_Store) -> Object_Store {
@@ -1685,9 +1687,14 @@ _dir_put :: proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx
 		done(ctx, _from_prim(err), 0)
 		return
 	}
+	existed := prim.exists(d.vfs, path)
 	if err := prim.replace_atomic(d.vfs, path, bytes); err != .None {
 		done(ctx, _from_prim(err), 0)
 		return
+	}
+	if existed {
+		d.rewrites += 1
+		d.rewrite_bytes += u64(len(bytes))
 	}
 	d.puts += 1
 	d.bytes += u64(len(bytes))

@@ -1110,6 +1110,7 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	if r.phase == .Ready {
 		_remote_pull(r, rm)
 		_remote_settle(r, rm)
+		_arc_drive(r, rm)
 		_repl_flush(r)
 	}
 }
