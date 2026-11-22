@@ -283,6 +283,7 @@ Replicator :: struct {
 	accounted:  bool,
 	pumping:    bool,
 	serves:     [dynamic]Serve_Req,
+	parked:     [dynamic]Serve_Req,
 	pull_tag:   u64,
 	rx_holder:  Device_Id,
 	rx_tag:     u64,
@@ -378,6 +379,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.presence = make(map[Device_Id]Presence_State, allocator)
 	r.reap_local = make([dynamic]^Local, allocator)
 	r.serves = make([dynamic]Serve_Req, allocator)
+	r.parked = make([dynamic]Serve_Req, allocator)
 	r.promos = make([dynamic]^Promotion, allocator)
 	r.tr.fd = prim.INVALID_FD
 	return .None
@@ -418,6 +420,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.reap_local)
 	delete(r.presence)
 	delete(r.serves)
+	delete(r.parked)
 	for pr in r.promos {
 		_promotion_free(r, pr)
 	}
@@ -2206,11 +2209,15 @@ _repl_reset_state :: proc(r: ^Replicator) {
 	for _, rm in r.remotes {
 		clear(&rm.inflight)
 		clear(&rm.pulls)
+		clear(&rm.refused)
+		rm.unavail = false
+		rm.base_checked = false
 		clear(&rm.carry)
 		rm.pulling = false
 		rm.probing = false
 	}
 	clear(&r.serves)
+	clear(&r.parked)
 	r.rx_holder = {}
 	r.rx_skip = false
 	_promotions_reset(r)
