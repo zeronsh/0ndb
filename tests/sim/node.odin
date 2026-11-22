@@ -261,6 +261,10 @@ node_after :: proc(n: ^Node) {
 			model_durable(&n.w.model, n, t)
 		}
 	}
+	if len(n.mounts) > 0 {
+		context = instance_context(&n.inst)
+		check_synced_disk(n.w, n)
+	}
 }
 
 node_drain :: proc(n: ^Node) -> bool {

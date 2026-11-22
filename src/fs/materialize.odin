@@ -129,19 +129,27 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		append(&items, it)
 	}
 	if m.mat_ingest && !merge {
-		stale := false
-		for it in items {
-			if it.has_old && it.entry.kind == .File && !disk_matches(m, it.old, it.entry) {
-				mount_mark(m, it.old)
-				stale = true
+		held := false
+		for &it in items {
+			if p, blocked := mat_blocker(m, &it); blocked {
+				mount_mark(m, p)
+				held = true
 			}
 		}
-		if stale {
-			m.mat_ingest = false
+		if held {
 			mount_pass(m, false) or_return
 			one := make([dynamic]crdt.Lv, context.temp_allocator)
 			if crdt.graph_version_lvs(&h.g, m.synced[:], &one) != .None {
 				return .Corrupt
+			}
+			if crdt.frontier_eq(one[:], sl[:]) {
+				for &it in items {
+					if p, blocked := mat_blocker(m, &it); blocked {
+						c, _ := clone_string(p, m.allocator)
+						append(&m.collided, c)
+					}
+				}
+				return .None
 			}
 			both := make([dynamic]crdt.Lv, context.temp_allocator)
 			crdt.version_union(&h.g, tl[:], one[:], &both)
@@ -181,6 +189,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		clear(&m.synced)
 		append(&m.synced, ..target)
 	}
+	m.passes += 1
 	history_trim(h)
 	return .None
 }
@@ -364,6 +373,19 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 		}
 	}
 	return .None
+}
+
+@(private)
+mat_blocker :: proc(m: ^Mount, it: ^Mat_Item) -> (path: string, blocked: bool) {
+	if it.has_old && it.entry.kind != .Dir && !disk_matches(m, it.old, it.entry) {
+		return it.old, true
+	}
+	if it.present && it.kind != .Dir && (!it.has_old || it.old != it.path) && probe(m, it.path).kind != .Missing {
+		if _, known, _ := shadow_get(&m.shadow, it.path); !known {
+			return it.path, true
+		}
+	}
+	return "", false
 }
 
 @(private)

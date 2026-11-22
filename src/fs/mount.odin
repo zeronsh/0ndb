@@ -306,6 +306,7 @@ Mount :: struct {
 	nonce:       prim.Id,
 	mat_wait:    bool,
 	mat_ingest:  bool,
+	passes:      u64,
 	jpos:        i64,
 	jpend:       i64,
 	imported:    bool,
@@ -447,6 +448,10 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		m.retained = true
 	}
 	fresh := load_mount_state(m) or_return
+	m.actor = fshist.ingestion_actor(h.self if h != nil else actor, id)
+	if h != nil {
+		history_register_actor(h, m.actor, id) or_return
+	}
 	attrib_log_open(m) or_return
 	image_take(m, &m.img)
 	if h != nil {

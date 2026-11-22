@@ -1,5 +1,6 @@
 package fshist
 
+import "core:crypto/blake2b"
 import "../crdt"
 import "../fstree"
 import "../prim"
@@ -22,6 +23,7 @@ REC_REPLACE :: u8(5)
 REC_SEAL :: u8(6)
 REC_ALIAS :: u8(7)
 REC_LINE :: u8(8)
+REC_ACTOR :: u8(9)
 
 TOP_CREATE :: u8(1)
 TOP_MOVE :: u8(2)
@@ -591,4 +593,48 @@ text_targets :: proc(b: ^crdt.Batch, allocator := context.temp_allocator) -> []c
 		}
 	}
 	return out[:]
+}
+
+ACTOR_INGEST :: u8(1)
+
+ingestion_actor :: proc(device, mount: prim.Id) -> (id: prim.Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb ingestion actor"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	d, m := device, mount
+	blake2b.update(&ctx, d[:])
+	blake2b.update(&ctx, m[:])
+	blake2b.final(&ctx, id[:])
+	return
+}
+
+encode_actor_record :: proc(buf: ^[dynamic]u8, actor, mount: prim.Id) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, REC_ACTOR)
+	prim.write_u8(&w, ACTOR_INGEST)
+	prim.write_id(&w, actor)
+	prim.write_id(&w, mount)
+}
+
+decode_actor_record :: proc(body: []u8, device: prim.Id) -> (actor: prim.Id, ok: bool) {
+	if len(body) == 0 || body[0] != REC_ACTOR {
+		return
+	}
+	r := prim.reader(body[1:])
+	kind := prim.read_u8(&r)
+	a := prim.read_id(&r)
+	m := prim.read_id(&r)
+	if !prim.reader_ok(&r) || kind != ACTOR_INGEST || a != ingestion_actor(device, m) {
+		return
+	}
+	return a, true
+}
+
+actor_key :: proc(actor: prim.Id, allocator := context.temp_allocator) -> []u8 {
+	k := make([]u8, 3 + len(actor), allocator)
+	copy(k, "ao:")
+	a := actor
+	copy(k[3:], a[:])
+	return k
 }

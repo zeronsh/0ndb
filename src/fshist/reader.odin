@@ -295,7 +295,29 @@ reader_text :: proc(r: ^Reader, inode: fstree.Inode_Id, allocator := context.all
 reader_spans :: proc(r: ^Reader, inode: fstree.Inode_Id, allocator := context.allocator) -> (spans: []crdt.Author_Span, err: Error) {
 	clear(&r.wants)
 	f := heads_text(r, inode) or_return
-	return crdt.text_spans(&f.text, &r.g, allocator), .None
+	spans = crdt.text_spans(&f.text, &r.g, allocator)
+	reader_present(r, spans)
+	return spans, .None
+}
+
+reader_owner :: proc(r: ^Reader, actor: prim.Id) -> (owner: prim.Id, ok: bool) {
+	v, has := r.kv[string(actor_key(actor))]
+	if !has || len(v) != len(owner) {
+		return
+	}
+	copy(owner[:], v)
+	return owner, true
+}
+
+reader_present :: proc(r: ^Reader, spans: []crdt.Author_Span) {
+	for &s in spans {
+		if o, ok := reader_owner(r, s.id.actor); ok {
+			s.id.actor = o
+		}
+		if o, ok := reader_owner(r, s.op.actor); ok {
+			s.op.actor = o
+		}
+	}
 }
 
 reader_text_at :: proc(r: ^Reader, inode: fstree.Inode_Id, version: []crdt.Op_Id, allocator := context.allocator) -> (text: []u8, spans: []crdt.Author_Span, err: Error) {
@@ -313,7 +335,9 @@ reader_text_at :: proc(r: ^Reader, inode: fstree.Inode_Id, version: []crdt.Op_Id
 		crdt.text_destroy(&tmp.text)
 		crdt.log_destroy(&tmp.log)
 	}
-	return crdt.text_bytes(&tmp.text, allocator), crdt.text_spans(&tmp.text, &r.g, allocator), .None
+	spans = crdt.text_spans(&tmp.text, &r.g, allocator)
+	reader_present(r, spans)
+	return crdt.text_bytes(&tmp.text, allocator), spans, .None
 }
 
 reader_wants :: proc(r: ^Reader) -> []Want {
@@ -538,6 +562,21 @@ apply_record :: proc(r: ^Reader, si: u32, off: u64, body: []u8) -> (n: int, err:
 			return 0, .Corrupt
 		}
 		texts_drop(r)
+		return 0, .None
+	case REC_ACTOR:
+		if int(si) < len(r.stream_ids) {
+			if a, ok := decode_actor_record(body, r.stream_ids[si]); ok {
+				d := r.stream_ids[si]
+				k := string(actor_key(a, r.allocator))
+				if k not_in r.kv {
+					v := make([]u8, len(d), r.allocator)
+					copy(v, d[:])
+					r.kv[k] = v
+				} else {
+					delete(k, r.allocator)
+				}
+			}
+		}
 		return 0, .None
 	case REC_BATCH, REC_IMPORT:
 		return apply_batch(r, si, off, body)

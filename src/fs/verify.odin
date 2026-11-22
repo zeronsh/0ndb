@@ -1,0 +1,115 @@
+package fs
+
+import "core:fmt"
+import "../crdt"
+import "../fstree"
+import "../prim"
+
+mount_synced_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+	h := m.history
+	if h == nil || !m.awake || m.rescan || len(m.fences) > 0 || m.restoring || m.adopting || len(m.unwatched) > 0 {
+		return .None
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &lvs) != .None {
+		return .Corrupt
+	}
+	snap := version_snapshot(h, lvs[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	seen := make(map[string]bool, context.temp_allocator)
+	verify_tree(m, &snap, fstree.ROOT, "", &seen, out, allocator) or_return
+	return verify_shadow(m, "", &seen, out, allocator)
+}
+
+@(private = "file")
+verify_skip :: proc(m: ^Mount, p: string) -> bool {
+	if path_internal(p) {
+		return true
+	}
+	for q := p; len(q) > 0; q = path_parent(q) {
+		if q in m.dirty {
+			return true
+		}
+	}
+	for c in m.collided {
+		if path_at_or_under(p, c) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private = "file")
+verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
+	if kerr != nil {
+		return .Corrupt
+	}
+	for c in kids {
+		p, _ := path_join(prefix, c.name, context.temp_allocator)
+		seen[p] = true
+		if verify_skip(m, p) {
+			continue
+		}
+		e, found := shadow_get(&m.shadow, p) or_return
+		if !found || e.inode != c.inode {
+			append(out, fmt.aprintf("%s: synced inode %v, shadow %v (found %v)", p, c.inode, e.inode, found, allocator = allocator))
+		}
+		d := probe(m, p)
+		switch c.kind {
+		case .Dir:
+			if d.kind != .Dir {
+				append(out, fmt.aprintf("%s: synced directory, disk %v", p, d.kind, allocator = allocator))
+				continue
+			}
+			verify_tree(m, snap, c.inode, p, seen, out, allocator) or_return
+		case .File:
+			if d.kind != .File {
+				append(out, fmt.aprintf("%s: synced file, disk %v", p, d.kind, allocator = allocator))
+				continue
+			}
+			info, ok, ierr := fstree.info(snap, c.inode, context.temp_allocator)
+			if ierr != nil || !ok || .Opaque in info.flags {
+				continue
+			}
+			abuf: prim.Path_Buf
+			raw, rerr := prim.read_file(m.vfs, abs_path(m, p, abuf[:]), context.temp_allocator)
+			if rerr != .None {
+				append(out, fmt.aprintf("%s: unreadable on disk: %v", p, rerr, allocator = allocator))
+				continue
+			}
+			disk, cok := eol_clean(m, p, raw, c.inode, true)
+			if !cok {
+				continue
+			}
+			want := history_text_at(m.history, c.inode, m.synced[:], context.temp_allocator) or_return
+			if string(disk) != string(want) {
+				append(out, fmt.aprintf("%s: disk %q, synced %q", p, disk, want, allocator = allocator))
+			}
+		case .Symlink:
+			if d.kind == .Missing {
+				append(out, fmt.aprintf("%s: synced symlink missing on disk", p, allocator = allocator))
+			}
+		}
+	}
+	return .None
+}
+
+@(private = "file")
+verify_shadow :: proc(m: ^Mount, dir: string, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+	kids := make([dynamic]Shadow_Child, context.temp_allocator)
+	shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
+	for k in kids {
+		p, _ := path_join(dir, k.name, context.temp_allocator)
+		if verify_skip(m, p) {
+			continue
+		}
+		if !seen[p] {
+			append(out, fmt.aprintf("%s: in the shadow as %v but not in the synced tree", p, k.entry.inode, allocator = allocator))
+		}
+		if k.entry.kind == .Dir {
+			verify_shadow(m, p, seen, out, allocator) or_return
+		}
+	}
+	return .None
+}
