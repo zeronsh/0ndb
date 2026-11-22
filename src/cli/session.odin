@@ -255,17 +255,16 @@ resolve_object :: proc(s: ^Session, text: string) -> api.Object {
 	}
 	match: api.Object
 	n := 0
-	for archived in ([]bool{false, true}) {
-		for row in catalog_rows(s, space, archived) {
-			id := jstr(row, "object")
-			if id_matches(id, text) || jstr(row, "title") == text {
-				x, _ := prim.id_parse(id)
-				if n == 0 || x != match.id {
-					n += 1
-				}
-				match = api.Object{space, x}
-			}
+	r := req_begin("catalog.find")
+	req_str(&r, "space", hex(space))
+	req_str(&r, "text", text)
+	v := must(s, req_end(&r), "cannot search the catalog")
+	for row in jarr(v, "rows") {
+		x, _ := prim.id_parse(jstr(row, "object"))
+		if n == 0 || x != match.id {
+			n += 1
 		}
+		match = api.Object{space, x}
 	}
 	if n == 0 {
 		os.exit(report_error(.Not_Found, "no object matches %q", text))

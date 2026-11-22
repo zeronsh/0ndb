@@ -589,6 +589,19 @@ op_catalog_list :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
+op_catalog_find :: proc(c: ^Call, o: ^Out) -> Status {
+	rows, err := eng.catalog_find(c.api.e, a_id(c, "space"), a_str(c, "text"), context.temp_allocator, ready(c))
+	if err != .None {
+		return pend(c, err)
+	}
+	o_arr(o, "rows", len(rows))
+	for &r in rows {
+		emit_catalog_row(o, &r)
+	}
+	o_end(o)
+	return .Ok
+}
+
 op_catalog_usage :: proc(c: ^Call, o: ^Out) -> Status {
 	u, err := eng.catalog_usage_get(c.api.e, a_object(c, "object"), ready(c))
 	if err != .None {

@@ -4,9 +4,11 @@ import "../prim"
 
 @(private)
 Space_Wait :: struct {
-	space: prim.Id,
-	ready: Ready,
-	cmd:   ^Pending_Cmd,
+	space:   prim.Id,
+	ready:   Ready,
+	cmd:     ^Pending_Cmd,
+	catalog: bool,
+	woke:    bool,
 }
 
 @(private)
@@ -43,13 +45,28 @@ _space_wait :: proc(e: ^Engine, sp: ^Space, ready: Ready, cmd: ^Pending_Cmd) -> 
 }
 
 @(private)
-_space_waits_wake :: proc(e: ^Engine, space: prim.Id) {
-	for w in e.space_waits {
-		if w.space == space {
+_space_wait_catalog :: proc(e: ^Engine, sp: ^Space, ready: Ready) -> Error {
+	if _, err := append(&e.space_waits, Space_Wait{space = sp.id, ready = ready, catalog = true}); err != nil {
+		return .No_Memory
+	}
+	return .Pending
+}
+
+@(private)
+_space_waits_wake :: proc(e: ^Engine, space: prim.Id, catalog := false) {
+	for &w in e.space_waits {
+		if w.space == space && w.catalog == catalog {
+			w.woke = true
 			e.space_woke = true
 			_touch(e)
-			return
 		}
+	}
+}
+
+@(private)
+_space_waits_catalog_changed :: proc(e: ^Engine, space: prim.Id, id: prim.Id) {
+	if len(e.space_waits) > 0 && id == _catalog_id(space) {
+		_space_waits_wake(e, space, true)
 	}
 }
 
@@ -62,7 +79,11 @@ _space_waits_run :: proc(e: ^Engine) {
 	fire := make([dynamic]Space_Wait, context.temp_allocator)
 	for i := 0; i < len(e.space_waits); {
 		w := e.space_waits[i]
-		if sp, ok := e.spaces[w.space]; ok && _space_settling(e, sp) {
+		if w.catalog && !w.woke {
+			i += 1
+			continue
+		}
+		if sp, ok := e.spaces[w.space]; ok && !w.catalog && _space_settling(e, sp) {
 			i += 1
 			continue
 		}
@@ -72,7 +93,7 @@ _space_waits_run :: proc(e: ^Engine) {
 	for w in fire {
 		err := Error.None
 		sp, ok := e.spaces[w.space]
-		if !ok || sp.mem.removed || sp.mem.revoked || !sp.mem.member {
+		if !ok || sp.mem.removed || sp.mem.revoked || (!w.catalog && !sp.mem.member) {
 			err = .Permission
 		}
 		_space_wait_finish(e, w, err)

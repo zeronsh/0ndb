@@ -864,6 +864,9 @@ _emit :: proc(e: ^Engine, ev: Event) {
 	if ev.kind == .Members_Changed || ev.kind == .Epoch_Changed || ev.kind == .Access_Revoked {
 		_space_waits_wake(e, ev.space)
 	}
+	if ev.kind == .Caught_Up || ev.kind == .Disconnected || ev.kind == .Access_Revoked {
+		_space_waits_wake(e, ev.space, true)
+	}
 	if e.cfg.events.event != nil {
 		x := ev
 		{

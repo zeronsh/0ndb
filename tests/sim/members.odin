@@ -484,6 +484,8 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_converged(w, spaces[0], {M_A, M_B}, "after approval")
 	_live_space(w, mw, M_A, {M_B}, "live-from-a")
 	_adoption_window(w, mw)
+	_short_id_wait(w, mw.owned[len(mw.owned) - 1])
+	_short_id_instant(w, mw.owned[len(mw.owned) - 1])
 
 	_down(w, M_A)
 	_down(w, M_B)
@@ -937,6 +939,176 @@ _adoption_window :: proc(w: ^World, mw: ^Mem_World) {
 	if r, ok := _send(w, M_B, bo, "created-in-window"); !ok || !_wait_read(w, M_A, bo, r, "created-in-window", 20_000) {
 		_fail(w, "window: n0 cannot read the conversation n1 created in the adoption window")
 	}
+}
+
+@(private = "file")
+_short_id_wait :: proc(w: ^World, sid: prim.Id) {
+	a := w.nodes[M_A]
+	_down(w, M_B)
+	context = instance_context(&a.inst)
+	o, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "short-id"})
+	node_after(a)
+	if oerr != .None {
+		_fail(w, "short id: n0 create: %v", oerr)
+		return
+	}
+	_settle(w, 1000)
+	hx := prim.id_hex(o.id)
+	short := string(hx[24:])
+	fp := new(Window_Probe, w.allocator)
+	ready := eng.Ready {
+		data = fp,
+		call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+			p := (^Window_Probe)(data)
+			p.fired += 1
+			p.err = err
+		},
+	}
+	b := _up(w, M_B)
+	context = instance_context(&b.inst)
+	eng.space_open(&b.e, sid)
+	rows0, e0 := eng.catalog_find(&b.e, sid, short, context.temp_allocator, ready)
+	n0 := len(rows0)
+	node_after(b)
+	if e0 != .None || n0 != 0 {
+		_fail(w, "short id: with no relay connection the lookup should answer at once with nothing: %v rows=%d", e0, n0)
+		return
+	}
+	connected := false
+	for _ in 0 ..< 30_000 {
+		context = instance_context(&b.inst)
+		info, _ := eng.space_info(&b.e, sid)
+		node_after(b)
+		if info.connected {
+			connected = true
+			break
+		}
+		run_until(w, w.now + 1_000_000, false)
+	}
+	if !connected {
+		_fail(w, "short id: n1 never reconnected")
+		return
+	}
+	context = instance_context(&b.inst)
+	rows1, e1 := eng.catalog_find(&b.e, sid, short, context.temp_allocator, ready)
+	node_after(b)
+	if e1 != .Pending {
+		_fail(w, "short id: right after connecting, before its feed caught up, n1 should wait instead of answering %v rows=%d", e1, len(rows1))
+		return
+	}
+	e2 := e1
+	n2 := 0
+	got: prim.Id
+	reruns := 0
+	for e2 == .Pending && reruns < 20 {
+		want := fp.fired + 1
+		for _ in 0 ..< 300 {
+			if fp.fired >= want {
+				break
+			}
+			_settle(w, 100)
+		}
+		if fp.fired < want || fp.err != .None {
+			_fail(w, "short id: wait %d finished %d/%v", reruns, fp.fired, fp.err)
+			return
+		}
+		reruns += 1
+		context = instance_context(&b.inst)
+		rows2: []eng.Catalog_Row
+		rows2, e2 = eng.catalog_find(&b.e, sid, short, context.temp_allocator, ready)
+		n2 = len(rows2)
+		got = rows2[0].object if n2 > 0 else prim.Id{}
+		node_after(b)
+	}
+	if e2 != .None || n2 != 1 || got != o.id {
+		_fail(w, "short id: after catching up %s should resolve to n0's conversation: %v rows=%d after %d reruns", short, e2, n2, reruns)
+		return
+	}
+	free(fp, w.allocator)
+	if r, ok := _send(w, M_B, eng.Object{sid, got}, "via-short-id"); !ok || !_wait_read(w, M_A, o, r, "via-short-id", 20_000) {
+		_fail(w, "short id: n0 cannot read what n1 sent through the resolved short id")
+	}
+}
+
+@(private = "file")
+_short_id_instant :: proc(w: ^World, sid: prim.Id) {
+	a := w.nodes[M_A]
+	b := _up(w, M_B)
+	_settle(w, 2000)
+	context = instance_context(&a.inst)
+	o, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "instant"})
+	node_after(a)
+	if oerr != .None {
+		_fail(w, "instant: n0 create: %v", oerr)
+		return
+	}
+	hx := prim.id_hex(o.id)
+	short := string(hx[24:])
+	fp := new(Window_Probe, w.allocator)
+	ready := eng.Ready {
+		data = fp,
+		call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+			p := (^Window_Probe)(data)
+			p.fired += 1
+			p.err = err
+		},
+	}
+	unknown := 0
+	waited := 0
+	resolved := false
+	for step in 0 ..< 20_000 {
+		context = instance_context(&b.inst)
+		rows, err := eng.catalog_find(&b.e, sid, short, context.temp_allocator, ready)
+		n := len(rows)
+		got := rows[0].object if n > 0 else prim.Id{}
+		node_after(b)
+		for err == .Pending {
+			waited += 1
+			want := fp.fired + 1
+			for _ in 0 ..< 300 {
+				if fp.fired >= want {
+					break
+				}
+				_settle(w, 100)
+			}
+			if fp.fired < want || fp.err != .None {
+				_fail(w, "instant: lookup at %d ms waited and finished %d/%v", step, fp.fired, fp.err)
+				return
+			}
+			context = instance_context(&b.inst)
+			rows, err = eng.catalog_find(&b.e, sid, short, context.temp_allocator, ready)
+			n = len(rows)
+			got = rows[0].object if n > 0 else prim.Id{}
+			node_after(b)
+			if err == .None && n == 0 {
+				_fail(w, "instant: lookup at %d ms started waiting and then answered not found", step)
+				return
+			}
+		}
+		if err != .None {
+			_fail(w, "instant: lookup at %d ms: %v", step, err)
+			return
+		}
+		if n > 0 {
+			if n != 1 || got != o.id {
+				_fail(w, "instant: %s resolved to %d rows", short, n)
+				return
+			}
+			resolved = true
+			break
+		}
+		unknown += 1
+		run_until(w, w.now + 1_000_000, false)
+	}
+	if !resolved {
+		_fail(w, "instant: %s never resolved on n1", short)
+		return
+	}
+	free(fp, w.allocator)
+	if r, ok := _send(w, M_B, eng.Object{sid, o.id}, "instant-via-short-id"); !ok || !_wait_read(w, M_A, o, r, "instant-via-short-id", 20_000) {
+		_fail(w, "instant: n0 cannot read what n1 sent through the short id")
+	}
+	world_note(w, "instant short id: %d lookups before n1 knew of it, %d waits", unknown, waited)
 }
 
 @(private = "file")
