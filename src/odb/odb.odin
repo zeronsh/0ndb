@@ -56,6 +56,7 @@ Odb :: struct {
 	store:          bool,
 	pending_files:  [dynamic]string,
 	pending_dirs:   [dynamic]string,
+	owed_files:     [dynamic]string,
 	cache:          [CACHE_SLOTS]Cache_Entry,
 	cache_bytes:    int,
 	tick:           u64,

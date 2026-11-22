@@ -51,45 +51,70 @@ barrier :: proc(db: ^Odb) -> Error {
 	sync.mutex_lock(&db.mutex)
 	files := db.pending_files
 	dirs := db.pending_dirs
+	owed := db.owed_files
 	db.pending_files = make([dynamic]string, db.allocator)
 	db.pending_dirs = make([dynamic]string, db.allocator)
+	db.owed_files = make([dynamic]string, db.allocator)
 	sync.mutex_unlock(&db.mutex)
-	if len(files) == 0 && len(dirs) == 0 {
+	defer {
+		for s in files {
+			delete(s, db.allocator)
+		}
+		for s in dirs {
+			delete(s, db.allocator)
+		}
+		for s in owed {
+			delete(s, db.allocator)
+		}
 		delete(files)
 		delete(dirs)
+		delete(owed)
+	}
+	if len(files) == 0 && len(dirs) == 0 && len(owed) == 0 {
 		return .None
 	}
 	slice.sort(files[:])
 	slice.sort(dirs[:])
+	slice.sort(owed[:])
 	uf := distinct_sorted(files[:], db.allocator)
 	ud := distinct_sorted(dirs[:], db.allocator)
+	uo := distinct_sorted(owed[:], db.allocator)
 	defer delete(uf, db.allocator)
 	defer delete(ud, db.allocator)
-	roots := [2]string{primary_dir(db), db.common_dir}
-	err := sync_paths(db, uf, ud, roots[:])
+	defer delete(uo, db.allocator)
+	err: Error
+	for f in uo {
+		if e := prim.resync_file(db.vfs, f, true); e != .None && e != .Not_Found {
+			err = perr(e)
+			break
+		}
+	}
+	if err == .None {
+		roots := [2]string{primary_dir(db), db.common_dir}
+		err = sync_paths(db, uf, ud, roots[:])
+	}
 	if err != .None {
 		sync.mutex_lock(&db.mutex)
+		for f in uo {
+			if s, cerr := strings.clone(f, db.allocator); cerr == nil {
+				append(&db.owed_files, s)
+			}
+		}
 		for f in uf {
 			if is_loose_object(db, f) {
 				prim.remove(db.vfs, f)
 				track_locked(db, "", parent_dir(f))
 				continue
 			}
-			track_locked(db, f)
+			if s, cerr := strings.clone(f, db.allocator); cerr == nil {
+				append(&db.owed_files, s)
+			}
 		}
 		for d in ud {
 			track_locked(db, "", d)
 		}
 		sync.mutex_unlock(&db.mutex)
 	}
-	for s in files {
-		delete(s, db.allocator)
-	}
-	for s in dirs {
-		delete(s, db.allocator)
-	}
-	delete(files)
-	delete(dirs)
 	return err
 }
 
@@ -132,7 +157,7 @@ distinct_sorted :: proc(list: []string, allocator: runtime.Allocator) -> []strin
 pending_count :: proc(db: ^Odb) -> int {
 	sync.mutex_lock(&db.mutex)
 	defer sync.mutex_unlock(&db.mutex)
-	return len(db.pending_files) + len(db.pending_dirs)
+	return len(db.pending_files) + len(db.pending_dirs) + len(db.owed_files)
 }
 
 @(private)
@@ -143,10 +168,15 @@ pending_clear :: proc(db: ^Odb) {
 	for s in db.pending_dirs {
 		delete(s, db.allocator)
 	}
+	for s in db.owed_files {
+		delete(s, db.allocator)
+	}
 	delete(db.pending_files)
 	delete(db.pending_dirs)
+	delete(db.owed_files)
 	db.pending_files = nil
 	db.pending_dirs = nil
+	db.owed_files = nil
 }
 
 @(private)
@@ -173,8 +203,10 @@ sync_one :: proc(db: ^Odb, path: string, dir: bool, data_only: bool) -> (fd: pri
 @(private)
 sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
 	when ODIN_OS == .Windows {
-		if vfs_is_os(db.vfs) && len(files) + len(dirs) > 1 && writeout_batch(db, files, dirs, roots) == .None {
-			return .None
+		if vfs_is_os(db.vfs) && len(files) + len(dirs) > 1 {
+			if werr, fallback := writeout_batch(db, files, dirs, roots); !fallback {
+				return werr
+			}
 		}
 	}
 	if HAS_SYNCFS && vfs_is_os(db.vfs) && len(files) + len(dirs) > SYNCFS_THRESHOLD {
@@ -237,7 +269,7 @@ sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
 }
 
 @(private)
-writeout_batch :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
+writeout_batch :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> (err: Error, fallback: bool) {
 	for list, li in ([][]string{files, dirs}) {
 		for p in list {
 			flags := prim.Open_Flags{.Directory} if li == 1 else prim.Open_Flags{}
@@ -246,12 +278,18 @@ writeout_batch :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Erro
 				continue
 			}
 			if e != .None {
-				return perr(e)
+				return perr(e), false
 			}
 			we := prim.writeout(db.vfs, fd)
 			prim.close_file(db.vfs, fd)
-			if we != .None && !(li == 1 && (we == .Invalid || we == .Unsupported)) {
-				return perr(we)
+			if we == .Invalid || we == .Unsupported {
+				if li == 1 {
+					continue
+				}
+				return .None, true
+			}
+			if we != .None {
+				return perr(we), false
 			}
 		}
 	}
@@ -263,12 +301,15 @@ writeout_batch :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Erro
 		}
 	}
 	if root == "" {
-		return .Invalid
+		return .None, true
 	}
 	buf: [PATH_MAX]u8
-	fd, path := create_temp(db, root, ".barrier_", buf[:]) or_return
-	err := perr(prim.fullsync(db.vfs, fd))
+	fd, path, terr := create_temp(db, root, ".barrier_", buf[:])
+	if terr != .None {
+		return terr, false
+	}
+	err = perr(prim.fullsync(db.vfs, fd))
 	prim.close_file(db.vfs, fd)
 	prim.remove(db.vfs, path)
-	return err
+	return err, false
 }
