@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import "../capi/api"
 import "../prim"
 import osync "../sync"
@@ -16,12 +17,21 @@ cmd_daemon :: proc(a: ^Args) -> int {
 			if !client_connect(&c, false) {
 				return report_error(.Closed, "no daemon is running")
 			}
+			st := client_call(&c, `{"op":"daemon.status"}`, 5000)
+			pid := u64(jint(st.value, "pid")) if st.status == .Ok else 0
 			r := client_call(&c, `{"op":"daemon.stop"}`)
 			client_close(&c)
 			if r.status != .Ok {
 				return report_error(r.status, "cannot stop the daemon")
 			}
-			fmt.println("stopping")
+			deadline := prim.now_ms() + i64(flag_int(a, "timeout", 60)) * 1000
+			for pid_running(pid) {
+				if prim.now_ms() > deadline {
+					return report_error(.Timeout, "the daemon (pid %d) has not exited yet", pid)
+				}
+				time.sleep(20 * time.Millisecond)
+			}
+			fmt.println("stopped")
 			return 0
 		case "start":
 			return _daemon_start(a)

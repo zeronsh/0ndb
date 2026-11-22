@@ -161,6 +161,16 @@ self_pid :: proc() -> u64 {
 	return u64(posix.getpid())
 }
 
+pid_running :: proc(pid: u64) -> bool {
+	if pid == 0 {
+		return false
+	}
+	if posix.kill(posix.pid_t(pid), posix.Signal(0)) == .OK {
+		return true
+	}
+	return posix.errno() == .EPERM
+}
+
 ignore_broken_pipes :: proc() {
 	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
 }

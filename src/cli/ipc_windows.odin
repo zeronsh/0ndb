@@ -235,6 +235,18 @@ self_pid :: proc() -> u64 {
 	return u64(win.GetCurrentProcessId())
 }
 
+pid_running :: proc(pid: u64) -> bool {
+	if pid == 0 {
+		return false
+	}
+	p := win.OpenProcess(win.SYNCHRONIZE | win.PROCESS_QUERY_LIMITED_INFORMATION, false, u32(pid))
+	if p == nil {
+		return false
+	}
+	defer win.CloseHandle(p)
+	return win.WaitForSingleObject(p, 0) == win.WAIT_TIMEOUT
+}
+
 ignore_broken_pipes :: proc() {
 }
 
