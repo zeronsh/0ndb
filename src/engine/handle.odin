@@ -333,7 +333,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 		h.created = created
 	}
 	if h.own_tree.dirty {
-		_own_tree_store(e, h.own_tree) or_return
+		_own_tree_stage(e, h.own_tree) or_return
 		h.own_tree.dirty = false
 	}
 	if !rec.own && !((h.kind == .Text || h.kind == .File_Tree) && _ckpt_waiting(h)) {
@@ -342,8 +342,8 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 			rec.created = h.created
 		}
 		_rec_put(e, h.id, &rec) or_return
-		_registry_flush(e) or_return
 	}
+	_registry_flush(e) or_return
 	switch h.kind {
 	case .Conversation:
 		path := _seg_path(e, h.id) or_return

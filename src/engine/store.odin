@@ -40,6 +40,7 @@ Registry :: struct {
 	open:    bool,
 	staged:  map[prim.Id][]u8,
 	sstaged: map[prim.Id][]u8,
+	kstaged: map[prim.Id][]u8,
 	meta:    bool,
 }
 
@@ -60,6 +61,7 @@ Dirty_Seg :: struct {
 Durable_Batch :: struct {
 	e:     ^Engine,
 	tick:  u64,
+	seq:   u64,
 	segs:  [dynamic]Dirty_Seg,
 	meta:  bool,
 	cards: [dynamic]Card_Pub,
@@ -86,6 +88,7 @@ _registry_open :: proc(e: ^Engine) -> Error {
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.sstaged = make(map[prim.Id][]u8, e.allocator)
+	e.reg.kstaged = make(map[prim.Id][]u8, e.allocator)
 	return .None
 }
 
@@ -102,15 +105,20 @@ _registry_close :: proc(e: ^Engine) {
 	for _, v in e.reg.sstaged {
 		delete(v, e.allocator)
 	}
+	for _, v in e.reg.kstaged {
+		crypto.zero_explicit(raw_data(v), len(v))
+		delete(v, e.allocator)
+	}
 	delete(e.reg.staged)
 	delete(e.reg.sstaged)
+	delete(e.reg.kstaged)
 	omap.db_close(&e.reg.db)
 	e.reg.open = false
 }
 
 @(private)
 _registry_flush :: proc(e: ^Engine) -> Error {
-	if !e.reg.open || (len(e.reg.staged) == 0 && len(e.reg.sstaged) == 0) {
+	if !e.reg.open || (len(e.reg.staged) == 0 && len(e.reg.sstaged) == 0 && len(e.reg.kstaged) == 0) {
 		return .None
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
@@ -121,6 +129,13 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 		v := e.reg.staged[k]
 		key := k
 		if err := omap.txn_put(t, ROOT_OBJECTS, key[:], v); err != .None {
+			omap.txn_abort(t)
+			return _oerr(err)
+		}
+	}
+	for k in _sorted_keys(e.reg.kstaged) {
+		key := _keys_key(k)
+		if err := omap.txn_put(t, ROOT_OBJECTS, key[:], e.reg.kstaged[k]); err != .None {
 			omap.txn_abort(t)
 			return _oerr(err)
 		}
@@ -143,8 +158,13 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 	for _, v in e.reg.sstaged {
 		delete(v, e.allocator)
 	}
+	for _, v in e.reg.kstaged {
+		crypto.zero_explicit(raw_data(v), len(v))
+		delete(v, e.allocator)
+	}
 	clear(&e.reg.staged)
 	clear(&e.reg.sstaged)
+	clear(&e.reg.kstaged)
 	return .None
 }
 
@@ -359,6 +379,7 @@ _durable_begin :: proc(e: ^Engine) {
 	if !e.pk_open {
 		return
 	}
+	_trees_persist(e)
 	if err := _registry_flush(e); err != .None {
 		if err == .Busy {
 			_touch(e)
@@ -367,7 +388,6 @@ _durable_begin :: proc(e: ^Engine) {
 		}
 		return
 	}
-	_trees_persist(e)
 	_rlog_settle(e, false)
 	_keys_stage(e)
 	b := new(Durable_Batch, e.allocator)
@@ -387,6 +407,8 @@ _durable_begin :: proc(e: ^Engine) {
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
 	b.drafts = e.draft_dirty
 	e.draft_dirty = make([dynamic]Draft_Pub, e.allocator)
+	e.batch_seq += 1
+	b.seq = e.batch_seq
 	append(&e.batches, b)
 	e.stats.commits += 1
 	err := pack.batch_end_async(&e.pk, _batch_cb, b)
@@ -396,6 +418,7 @@ _durable_begin :: proc(e: ^Engine) {
 	pack.batch_begin(&e.pk)
 	if err != .None {
 		if err == .Would_Block {
+			e.batch_seq -= 1
 			for i := len(e.batches) - 1; i >= 0; i -= 1 {
 				if e.batches[i] == b {
 					ordered_remove(&e.batches, i)
@@ -471,7 +494,11 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		_fatal(e, err)
 	} else {
 		e.durable_tick = max(e.durable_tick, b.tick)
+		e.durable_seq = max(e.durable_seq, b.seq)
 		e.stats.durable += 1
+		if _trees_waiting(e) {
+			_touch(e)
+		}
 		for p in b.drafts {
 			_draft_publish(e, p)
 		}

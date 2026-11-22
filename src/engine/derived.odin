@@ -1,5 +1,6 @@
 package engine
 
+import "core:crypto"
 import "core:fmt"
 import "core:strings"
 import "../crdt"
@@ -11,6 +12,7 @@ import omap "../map"
 import "../obj"
 import "../pack"
 import "../prim"
+import osync "../sync"
 
 @(private)
 _own_stream_path :: proc(e: ^Engine, id: prim.Id, kind: Kind) -> (path: string, err: Error) {
@@ -104,7 +106,13 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 		id: prim.Id
 		copy(id[:], f.key[:16])
 		rec, derr := _rec_decode(f.value, context.temp_allocator)
-		if derr != .None || !rec.own || !_owns_segment(rec.kind) {
+		if derr != .None || !rec.own {
+			continue
+		}
+		if notes != nil {
+			_own_keys_verify(e, id, rec.kind, notes) or_return
+		}
+		if !_owns_segment(rec.kind) {
 			continue
 		}
 		n := own_len(e, &lens, id, rec.kind) or_return
@@ -242,6 +250,26 @@ _registry_recover :: proc(e: ^Engine) -> Error {
 @(private)
 _oerr2_txn :: proc(t: ^omap.Txn, err: omap.Error) -> (^omap.Txn, Error) {
 	return t, _oerr(err)
+}
+
+@(private)
+_own_keys_verify :: proc(e: ^Engine, id: prim.Id, kind: Kind, out: ^[dynamic]string) -> Error {
+	data, found, legacy := _own_tree_bytes(e, id) or_return
+	if !found {
+		append(out, fmt.tprintf("keys: %v %s is marked own but has no own key tree", kind, prim.id_hex(id)))
+		return .None
+	}
+	t: osync.Key_Tree
+	derr := osync.keytree_decode(&t, data, context.temp_allocator)
+	if legacy {
+		crypto.zero_explicit(raw_data(data), len(data))
+	}
+	if derr != .None {
+		append(out, fmt.tprintf("keys: %v %s is marked own but its own key tree does not decode", kind, prim.id_hex(id)))
+		return .None
+	}
+	osync.keytree_destroy(&t)
+	return .None
 }
 
 verify_derived :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []string, err: Error) {

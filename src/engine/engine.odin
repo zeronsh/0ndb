@@ -312,6 +312,8 @@ Engine :: struct {
 	draft_dirty:  [dynamic]Draft_Pub,
 	batches:      [dynamic]^Durable_Batch,
 	durable_tick: u64,
+	batch_seq:    u64,
+	durable_seq:  u64,
 	changed:      map[prim.Id]Change,
 	catalog_q:    map[prim.Id]^Catalog_Update,
 	remote:       Remote_State,
@@ -893,13 +895,17 @@ _teardown :: proc(e: ^Engine) {
 	_plugs_close(e)
 	_handles_sweep(e, -1)
 	_index_close(e)
+	_trees_persist(e)
 	if e.reg.open {
 		_registry_flush(e)
 	}
-	_trees_persist(e)
 	if e.pk_open {
-		pack.batch_end(&e.pk)
-		_batches_done(e, .None)
+		if pack.batch_end(&e.pk) == .None {
+			_batches_done(e, .None)
+			e.durable_seq = e.batch_seq + 1
+		} else {
+			_batches_done(e, .None)
+		}
 	}
 	_dirty_drop(e)
 	_account_close(e)
