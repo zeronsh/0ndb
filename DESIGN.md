@@ -766,6 +766,12 @@ concurrent typing is never lost or reverted.
   bytes past it go straight to the file, and the first open after a crash
   truncates the file back to that size. Only staged syncs and truncation
   change the recorded size.
+- When the pack commits off the loop, a sync of a promoted external file
+  inside a batch does not fsync on the caller's thread: it marks the file
+  dirty and the batch's commit fsyncs it on the pack worker, so a store's
+  inline job (a tier evict's punch-and-sync) never blocks the loop, and
+  its acknowledgement, which follows the batch's completion, still follows
+  the fsync.
 - The unit of durability is the batch, not the tick: settle commits a batch
   of its own under the tick of the one before it. Every enqueued batch takes
   the next batch sequence; a command's result carries (as `tick`) the
@@ -840,7 +846,8 @@ concurrent typing is never lost or reverted.
 - `pack.durable_size(path)` (engine wrapper `durable_len`) is the one answer
   to "how much of this stream is on disk": the longest prefix guaranteed to
   survive a crash. A container stream's write counts once its commit group
-  is durable, a promoted stream's once its file is fsynced, a truncate
+  is durable, a promoted stream's once its file is fsynced (with the
+  batch that syncs it, when that is deferred to the commit), a truncate
   counts at once; bookkeeping exists only for streams written since the
   last durable group.
 - Nothing is published or announced beyond that length. The replicator
