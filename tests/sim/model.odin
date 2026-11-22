@@ -381,11 +381,11 @@ op_presence :: proc(m: ^Model, n: ^Node, op: ^M_Op) -> Presence {
 			return .Unknown
 		}
 		msg, err := eng.convo_message(&n.e, o, convo.Position{msg = op.rid}, context.temp_allocator)
-		if err == .Missing || err == .Pending || err == .Busy {
-			return .Unknown
+		if err == .Not_Found {
+			return .Absent
 		}
 		if err != .None {
-			return .Absent
+			return .Unknown
 		}
 		if msg.redacted {
 			return .Present
@@ -402,10 +402,13 @@ op_presence :: proc(m: ^Model, n: ^Node, op: ^M_Op) -> Presence {
 			return .Unknown
 		}
 		msg, err := eng.convo_message(&n.e, o, convo.Position{msg = op.rid}, context.temp_allocator)
-		if err == .Missing || err == .Pending || err == .Busy {
+		if err == .Not_Found {
+			return .Absent
+		}
+		if err != .None {
 			return .Unknown
 		}
-		if err != .None || msg.author != op.actor || msg.role != .Assistant {
+		if msg.author != op.actor || msg.role != .Assistant {
 			return .Absent
 		}
 		if msg.redacted || len(msg.blocks) == 0 {
