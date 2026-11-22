@@ -329,6 +329,11 @@ _submit :: proc(p: ^Pack) -> Error {
 	p.fl.nsync = 0
 	p.fl.root = p.root
 	p.fl.super_fd = p.super_fd
+	if p.opts.worker.submit != nil {
+		p.hook_ran = false
+		p.opts.worker.submit(p.opts.worker.data)
+		return .None
+	}
 	if p.opts.wake == nil {
 		return .None
 	}
@@ -358,6 +363,10 @@ _submit :: proc(p: ^Pack) -> Error {
 @(private)
 _worker_wait :: proc(p: ^Pack) -> Error {
 	if p.worker == nil {
+		if p.hook_ran {
+			p.hook_ran = false
+			return p.hook_err
+		}
 		return _job_exec(&p.fl)
 	}
 	for sync.atomic_exchange_explicit(&p.worker.finished, 0, .Acquire) != 1 {
@@ -369,12 +378,36 @@ _worker_wait :: proc(p: ^Pack) -> Error {
 @(private)
 _worker_try :: proc(p: ^Pack) -> (done: bool, err: Error) {
 	if p.worker == nil {
-		return true, _job_exec(&p.fl)
+		if p.opts.worker.submit == nil {
+			return true, _job_exec(&p.fl)
+		}
+		if !p.hook_ran {
+			return false, .None
+		}
+		p.hook_ran = false
+		return true, p.hook_err
 	}
 	if sync.atomic_exchange_explicit(&p.worker.finished, 0, .Acquire) != 1 {
 		return false, .None
 	}
 	return true, p.worker.err
+}
+
+worker_run :: proc(p: ^Pack) -> bool {
+	if p.opts.worker.submit == nil || !p.fl.on || p.hook_ran {
+		return false
+	}
+	p.hook_err = _job_exec(&p.fl)
+	p.hook_ran = true
+	if p.opts.wake != nil {
+		p.opts.wake(p.opts.wake_data)
+	}
+	return true
+}
+
+@(private)
+_polled :: proc "contextless" (p: ^Pack) -> bool {
+	return p.worker == nil && p.opts.worker.submit == nil
 }
 
 @(private)

@@ -385,7 +385,12 @@ equal in both directions.
   it reflects, and after a crash the mount finds its own committed batches
   by scanning its stream from there for its mark. The mount state alternates
   between two checksummed in-place slots carrying a sequence number. A pass
-  costs four flushes: journal, store, shadow and mount state.
+  costs four flushes: journal, store, shadow and mount state. The history
+  journal is durable only when the pack batch carrying it completes, so the
+  shadow, the mount state (synced frontier, journal position), staged blobs
+  and materialization wait for that batch in every durability mode: a pass
+  records an image under the history's mark and writes it when the mark is
+  acknowledged.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
   shadow is ingested first, never overwritten. Only durable history is
@@ -519,7 +524,11 @@ concurrent typing is never lost or reverted.
   threshold. Creating an object costs one record, not a file; ten million
   objects cost ten million small extents, not inodes.
 - Durability is batched across objects: every journal written in a loop
-  tick is committed with one container fdatasync. Compaction rewrites cold
+  tick is committed with one container fdatasync. `Async` (the C API
+  default) runs the commit on a worker thread and completes it on a later
+  loop wake; `Deferred` runs it on the loop. Nothing derived depends on the
+  mode, and the simulator picks the mode per seed, modelling the worker as a
+  commit job that runs at a scheduled later time. Compaction rewrites cold
   containers so each stream's extents stay contiguous, keeping page reads to
   one or two preads.
 - Redaction punches holes in extents; the simulator substitutes its own disk

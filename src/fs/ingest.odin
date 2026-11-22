@@ -913,9 +913,6 @@ import_flush :: proc(st: ^Import_State) -> Error {
 	}
 	builder_commit_import(m, &st.b) or_return
 	shadow_flush(m) or_return
-	if !mount_deferred(m) {
-		clear(&m.intents)
-	}
 	save_mount_state(m) or_return
 	history_trim(m.history)
 	st.files = 0

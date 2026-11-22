@@ -245,7 +245,7 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 	_release_lent(p)
 	poll(p) or_return
 	if p.fl.on {
-		return !_async(p) || p.worker == nil, .None
+		return !_async(p) || _polled(p), .None
 	}
 	if _mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 {
 		if _async(p) {
@@ -258,7 +258,7 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 	if p.nrec > 0 || len(p.dirty) > 0 {
 		if _async(p) {
 			_start_async(p) or_return
-			return p.worker == nil, .None
+			return _polled(p), .None
 		}
 		_sync_all(p) or_return
 	}

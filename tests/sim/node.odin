@@ -27,6 +27,7 @@ node_start :: proc(n: ^Node) -> bool {
 	}
 	rng_init(&n.rng, w.cfg.seed, 1000 + u64(n.idx) * 64 + u64(n.incarnation))
 	rng_init(&n.ids, w.cfg.seed, 9000 + u64(n.idx) * 64 + u64(n.incarnation))
+	rng_init(&n.pack_rng, w.cfg.seed, 13000 + u64(n.idx) * 64 + u64(n.incarnation))
 	if !instance_begin(&n.inst, n.idx) {
 		world_fail(w, "%s could not map its deterministic memory region (%d MiB at slot %d; lower SIM_REGION_MB / SIM_TEMP_MB or check the address-space limit)", n.name, region_stride() >> 20, n.idx)
 		return false
@@ -76,7 +77,7 @@ node_start :: proc(n: ^Node) -> bool {
 	}}
 	cfg.search_options.train_min = w.cfg.train_min
 	cfg.search_options.dict_sample_min = w.cfg.dict_sample_min
-	cfg.durability = .Deferred
+	cfg.durability = w.cfg.durability
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
 	cfg.search_full = n.idx % 2 == 0
@@ -86,6 +87,9 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.pack_options = pack.DEFAULT_OPTIONS
 	cfg.pack_options.clock = node_clock(&n.clock)
 	cfg.use_pack_options = true
+	if cfg.durability == .Async {
+		cfg.pack_options.worker = pack.Worker_Hook{data = n, submit = _pack_submit}
+	}
 	cfg.storage = w.cfg.storage
 	if w.node_cfg != nil {
 		w.node_cfg(n, &cfg)
@@ -470,4 +474,30 @@ relay_drain :: proc(rn: ^Relay_Node) -> bool {
 		prim.loop_step(&rn.inst.loop, false)
 		relay_after(rn)
 	}
+}
+
+@(private = "file")
+_pack_submit :: proc(data: rawptr) {
+	n := (^Node)(data)
+	w := n.w
+	delay := i64(0) if rng_chance(&n.pack_rng, 1, 4) else rng_range(&n.pack_rng, 0, 20_000_000)
+	schedule(w, Sim_Event{at = w.now + delay, kind = .Pack_Job, node = n.idx, gen = u64(n.incarnation)})
+}
+
+pack_job_event :: proc(w: ^World, n: ^Node, gen: u64) {
+	if !n.alive || !n.e_open || u64(n.incarnation) != gen {
+		return
+	}
+	context = instance_context(&n.inst)
+	pack.worker_run(&n.e.pk)
+}
+
+durability_of :: proc(s: string) -> (m: eng.Durability, ok: bool) {
+	switch s {
+	case "async":
+		return .Async, true
+	case "deferred":
+		return .Deferred, true
+	}
+	return
 }

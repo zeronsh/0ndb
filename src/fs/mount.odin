@@ -467,7 +467,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	}
 	m.slot = slot
 	mount_wake(m) or_return
-	m.shadow.hold = mount_deferred(m)
+	m.shadow.hold = true
 	m.clean = false
 	save_mount_state(m) or_return
 	mount_git_sources(m) or_return
@@ -1368,9 +1368,6 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 
 @(private)
 mount_durable_now :: proc(m: ^Mount) -> bool {
-	if !mount_deferred(m) {
-		return true
-	}
 	h := m.history
 	fp := history_fp(h)
 	if fp != h.mark_fp {
@@ -1385,11 +1382,6 @@ mount_durable_now :: proc(m: ^Mount) -> bool {
 		mount_schedule(m, 0)
 	}
 	return false
-}
-
-@(private)
-mount_deferred :: proc "contextless" (m: ^Mount) -> bool {
-	return m.history != nil && m.history.opts.deferred
 }
 
 @(private)
@@ -1435,13 +1427,6 @@ attrib_prune :: proc(m: ^Mount) {
 }
 
 mount_settle :: proc(m: ^Mount) -> Error {
-	if !mount_deferred(m) {
-		shadow_flush(m) or_return
-		clear(&m.intents)
-		m.jpos = m.jpend
-		attrib_prune(m)
-		return save_mount_state(m)
-	}
 	h := m.history
 	fp := history_fp(h)
 	if fp == h.mark_fp && h.mark <= h.durable && len(m.waits) == 0 {
@@ -1497,19 +1482,8 @@ mount_ack :: proc(m: ^Mount) -> Error {
 }
 
 save_mount_state :: proc(m: ^Mount) -> Error {
-	live := Mount_Image {
-		branch     = m.head.branch,
-		commit     = m.head.commit,
-		reflog_pos = m.reflog_pos,
-		stamp      = m.stamp,
-		imported   = m.imported,
-	}
-	synced := m.synced[:]
-	img := &live
-	if mount_deferred(m) {
-		img = &m.img
-		synced = m.img.synced[:]
-	}
+	img := &m.img
+	synced := m.img.synced[:]
 	buf := make([dynamic]u8, context.temp_allocator)
 	vb := make([dynamic]u8, context.temp_allocator)
 	encode_version(&vb, synced)
