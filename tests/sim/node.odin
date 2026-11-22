@@ -88,6 +88,9 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.pack_options = pack.DEFAULT_OPTIONS
 	cfg.pack_options.clock = node_clock(&n.clock)
 	cfg.use_pack_options = true
+	if w.cfg.promote > 0 {
+		cfg.pack_options.promote_size = w.cfg.promote
+	}
 	if cfg.durability == .Async {
 		cfg.pack_options.worker = pack.Worker_Hook{data = n, submit = _pack_submit}
 	}
@@ -115,6 +118,11 @@ node_start :: proc(n: ^Node) -> bool {
 		return false
 	}
 	n.e_open = true
+	check_derived(n, "open")
+	if n.disk.dead {
+		node_crashed(n)
+		return false
+	}
 	live_start(n)
 	if n.disk.dead {
 		node_crashed(n)
@@ -507,4 +515,19 @@ durability_of :: proc(s: string) -> (m: eng.Durability, ok: bool) {
 		return .Deferred, true
 	}
 	return
+}
+
+check_derived :: proc(n: ^Node, at: string) {
+	w := n.w
+	notes, err := eng.verify_derived(&n.e, context.temp_allocator)
+	if n.disk.dead {
+		return
+	}
+	if err != .None {
+		world_note(w, "%s derived check at %s skipped: %v", n.name, at, err)
+		return
+	}
+	for s in notes {
+		world_fail(w, "derived: %s at %s (incarnation %d): %s", n.name, at, n.incarnation, s)
+	}
 }

@@ -531,6 +531,35 @@ concurrent typing is never lost or reverted.
   commit job that runs at a scheduled later time. Compaction rewrites cold
   containers so each stream's extents stay contiguous, keeping page reads to
   one or two preads.
+- Derived structures are never durable ahead of their source. A derived file
+  past the promotion size lives in its own file, and its in-place writes and
+  syncs can reach disk before the pack commit that holds its source, so
+  ordering alone does not hold. Each derived structure therefore commits
+  atomically and records the source positions it reflects (its stamp), and
+  the stamp is checked eagerly at open, before the session's first append to
+  that own stream; a stamp past the recovered stream means rebuild or drop.
+  Positions into replicas need no check: replica offsets are global and
+  chain-verified, so bytes fetched again are identical. Keeping derived files
+  inside containers was measured and rejected (an omap table under random
+  puts wrote 1.7-2x the bytes with 2-2.4x the p99 batch latency, and inside
+  files cap near 16 MB).
+  - Registry: on an unclean open, before spaces load, `own` and the owned
+    entry of an object whose own segment is absent or empty are cleared (not
+    created yet), content and promotion marks are clamped to the recovered
+    own stream, and a checkpoint length past it is dropped. Legacy registry
+    rows migrated into the redaction log are deleted only after the batch
+    holding their replacement records is durable.
+  - Map tables: `ROOT_CONSUMED[self]` rides the same copy-on-write commit as
+    the entries; it is checked when the table opens (and the writer opens the
+    table before its first append) against the recovered own stream, and a
+    table ahead of it is reset.
+  - `.children` slots: before the first slot write after a sync the header is
+    rewritten as dirty and synced; a clean header means the slots reflect
+    exactly `covered`, a dirty one is rebuilt at open.
+  The simulator checks all of this after every engine open: registry facts
+  against the own streams, and every map table and `.children` file against a
+  rebuild of its sources cut at the positions it consumed. `SIM_PROMOTE`
+  shrinks the promotion size so derived files are promoted.
 - Redaction punches holes in extents; the simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
 - A small stream whose extent count passes 32 is defragmented by merging,

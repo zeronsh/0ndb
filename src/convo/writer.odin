@@ -1,7 +1,9 @@
 package convo
 
 import "base:runtime"
+import "core:fmt"
 import "core:hash/xxhash"
+import "core:strings"
 import "../journal"
 import "../obj"
 import "../prim"
@@ -874,8 +876,23 @@ _kids_rebuild :: proc(w: ^Writer) -> Error {
 }
 
 @(private)
+Kid_Put :: proc(data: rawptr, key: u64, child, seal: i64) -> Error
+
+@(private)
+_kids_put :: proc(data: rawptr, key: u64, child, seal: i64) -> Error {
+	return obj.slots_put((^obj.Slots)(data), key, child, seal)
+}
+
+@(private)
 _kids_catch_up :: proc(w: ^Writer, from: i64) -> Error {
 	end := obj.writer_durable(&w.core)
+	_kids_scan(w, from, end, &w.kids, _kids_put) or_return
+	w.kids.covered = end
+	return obj.slots_sync(&w.kids)
+}
+
+@(private)
+_kids_scan :: proc(w: ^Writer, from, end: i64, data: rawptr, put: Kid_Put) -> Error {
 	pos := from
 	for pos < end {
 		body, next, je := obj.jrec_at(&w.core.jr, pos)
@@ -901,13 +918,88 @@ _kids_catch_up :: proc(w: ^Writer, from: i64) -> Error {
 				key, child, seal = _record_key(r.source, r.external_id), i64(min(r.sequence, u64(max(i64)))), pos
 			}
 			if key != 0 {
-				obj.slots_put(&w.kids, key, child, seal) or_return
+				put(data, key, child, seal) or_return
 			}
 		}
 		pos = next
 	}
-	w.kids.covered = end
-	return obj.slots_sync(&w.kids)
+	return .None
+}
+
+writer_children_verify :: proc(w: ^Writer, allocator := context.allocator) -> (problem: string, err: Error) {
+	Want :: struct {
+		child: i64,
+		seal:  i64,
+		seen:  bool,
+	}
+	want := make(map[u64]Want, 64, context.temp_allocator)
+	put :: proc(data: rawptr, key: u64, child, seal: i64) -> Error {
+		m := (^map[u64]Want)(data)
+		cur := m[key]
+		m[key] = Want{max(cur.child, child, 0), seal if seal > 0 else cur.seal, false}
+		return .None
+	}
+	_kids_scan(w, 0, w.kids.covered, &want, put) or_return
+	v := w.core.v
+	Peers :: struct {
+		keys: map[u64]bool,
+		seg:  prim.Id,
+		w:    ^Writer,
+	}
+	peers := Peers{keys = make(map[u64]bool, 16, context.temp_allocator), w = w}
+	visit :: proc(data: rawptr, s: int, off: i64, env: ^obj.Envelope) -> (stop: bool, err: Error) {
+		p := (^Peers)(data)
+		if env.kind != u8(Kind.Recorded) {
+			return false, .None
+		}
+		rec := decode_env(env, p.w.core.v.scratch) or_return
+		r := rec.body.(Recorded)
+		p.keys[_peer_record_key(r.source, r.external_id, p.seg)] = true
+		return false, .None
+	}
+	for s in 0 ..< len(v.segs) {
+		if s == w.core.seg {
+			continue
+		}
+		peers.keys[_progress_key(v.segs[s].id)] = true
+		peers.seg = v.segs[s].id
+		obj.walk_events(v, s, 0, &peers, visit) or_return
+	}
+	Ctx :: struct {
+		want:    ^map[u64]Want,
+		peers:   ^map[u64]bool,
+		problem: string,
+	}
+	ctx := Ctx{&want, &peers.keys, ""}
+	each :: proc(data: rawptr, key: u64, child, seal: i64) -> bool {
+		c := (^Ctx)(data)
+		if x, ok := &c.want[key]; ok {
+			x.seen = true
+			if x.child != child || x.seal != seal {
+				c.problem = fmt.tprintf("children slot %x holds child %d seal %d, a rebuild from the journal gives child %d seal %d", key, child, seal, x.child, x.seal)
+				return false
+			}
+			return true
+		}
+		if !c.peers[key] {
+			c.problem = fmt.tprintf("children slot %x (child %d seal %d) comes from no journal record", key, child, seal)
+			return false
+		}
+		return true
+	}
+	obj.slots_each(&w.kids, &ctx, each) or_return
+	if len(ctx.problem) == 0 {
+		for k, x in want {
+			if !x.seen {
+				ctx.problem = fmt.tprintf("children slot %x (child %d seal %d) is missing", k, x.child, x.seal)
+				break
+			}
+		}
+	}
+	if len(ctx.problem) == 0 {
+		return "", .None
+	}
+	return strings.clone(ctx.problem, allocator), .None
 }
 
 @(private)

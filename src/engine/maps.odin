@@ -249,7 +249,16 @@ _map_table :: proc(e: ^Engine, h: ^Handle) -> Error {
 		_oerr(omap.table_open(&h.table, e.vfs, path, nil, e.allocator)) or_return
 	}
 	h.table_open = true
+	own := obj.writer_durable(&h.mw.core) if h.w_open else (_own_stream_len(e, h.id, .Map) or_return)
+	if cur, cerr := omap.table_consumed(&h.table, e.self); cerr != .None || cur > own {
+		return _oerr(omap.table_reset(&h.table))
+	}
 	return .None
+}
+
+@(private)
+_map_own_check :: proc(e: ^Engine, h: ^Handle) -> Error {
+	return _map_table(e, h)
 }
 
 @(private)

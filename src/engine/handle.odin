@@ -278,6 +278,7 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 		_, err := omap.writer_open(&h.mw, &h.view, e.vfs, path, h.id, e.self, gen, opts, e.allocator, _obj_clock(e))
 		_oerr(err) or_return
 		h.published = obj.writer_durable(&h.mw.core)
+		_map_own_check(e, h) or_return
 	case .Text, .File_Tree:
 		_hist_open(h) or_return
 		h.published = journal.journal_durable_len(&h.hist.journal)
@@ -337,6 +338,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 		opts := _journal_opts(h)
 		gen := _gen_take(e) or_return
 		_oerr(omap.writer_create(&h.mw, &h.view, e.vfs, path, h.id, e.self, gen, created, settings, opts, e.allocator, _obj_clock(e))) or_return
+		_map_own_check(e, h) or_return
 	case .Text, .File_Tree:
 		if _ckpt_waiting(h) {
 			return .Missing

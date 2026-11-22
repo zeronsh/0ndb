@@ -152,6 +152,11 @@ _rlog_migrate_pending :: proc(e: ^Engine) {
 	if journal.journal_commit(&e.rlog.j) != .None {
 		return
 	}
+	berr := pack.batch_end(&e.pk)
+	pack.batch_begin(&e.pk)
+	if berr != .None {
+		return
+	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
 		return
@@ -245,6 +250,11 @@ _rlog_migrate :: proc(e: ^Engine) {
 		e.rlog.live[o.key] = o.x
 	}
 	if journal.journal_commit(&e.rlog.j) != .None {
+		return
+	}
+	berr := pack.batch_end(&e.pk)
+	pack.batch_begin(&e.pk)
+	if berr != .None {
 		return
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
