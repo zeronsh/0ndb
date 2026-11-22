@@ -541,6 +541,24 @@ concurrent typing is never lost or reverted.
   commit job that runs at a scheduled later time. Compaction rewrites cold
   containers so each stream's extents stay contiguous, keeping page reads to
   one or two preads.
+- `pack.durable_size(path)` (engine wrapper `durable_len`) is the one answer
+  to "how much of this stream is on disk": the longest prefix guaranteed to
+  survive a crash. A container stream's write counts once its commit group
+  is durable, a promoted stream's once its file is fsynced, a truncate
+  counts at once; bookkeeping exists only for streams written since the
+  last durable group.
+- Nothing is published or announced beyond that length. The replicator
+  takes it from the store through `Replicator_Config.durable` on every
+  upload and every note, never from the writer, so no stream kind (own
+  segments, keys and keys-head, members, cards, checkpoint streams, promoted
+  objects) can put a non-durable byte on the wire, and a wire nonce (the
+  record offset) is never used for two different plaintexts after a crash.
+  The engine re-pumps waiting streams when a batch becomes durable, and
+  stages each tick's keys and keys-head records before the batch ends so
+  they are durable with the data they open and still reach the relay first.
+  The simulator checks it at every step (no byte handed to the relay beyond
+  the store's durable length) and after every restart (every stream recovers
+  at least what it sent).
 - Redaction punches holes in extents; the simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
 - A small stream whose extent count passes 32 is defragmented by merging,
