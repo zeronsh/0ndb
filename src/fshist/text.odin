@@ -14,6 +14,42 @@ Text_Source :: struct {
 	record:     proc(data: rawptr, stream: u32, off: u64, buf: ^[dynamic]u8) -> ([]u8, Error),
 	dict:       proc(data: rawptr, stream: u32) -> ^crdt.Actor_Dict,
 	checkpoint: proc(data: rawptr, oid: Raw_Oid, size: i64, allocator: runtime.Allocator) -> ([]u8, Error),
+	decoded:    proc(data: rawptr, stream: u32, off: u64) -> (^Decoded, Error),
+}
+
+Decoded :: struct {
+	batch:  crdt.Batch,
+	starts: []int,
+	runs:   map[crdt.Op_Id][dynamic]i32,
+}
+
+decoded_build :: proc(d: ^Decoded, body: []u8, dict: ^crdt.Actor_Dict, allocator: runtime.Allocator) -> Error {
+	payload, pok := batch_payload(body)
+	if !pok {
+		return .Corrupt
+	}
+	b, derr := crdt.batch_decode(payload, allocator, dict)
+	if derr != .None {
+		return .Corrupt
+	}
+	d.batch = b
+	d.starts = make([]int, len(b.ops), allocator)
+	d.runs = make(map[crdt.Op_Id][dynamic]i32, allocator)
+	o := 0
+	for op, i in b.ops {
+		d.starts[i] = o
+		if op.kind != .Opaque {
+			if list, ok := &d.runs[op.target]; ok {
+				append(list, i32(i))
+			} else {
+				l := make([dynamic]i32, 0, 4, allocator)
+				append(&l, i32(i))
+				d.runs[op.target] = l
+			}
+		}
+		o += op.len
+	}
+	return .None
 }
 
 Text_State :: struct {
@@ -122,6 +158,16 @@ text_replay_all :: proc(src: ^Text_Source, st: ^Text_State, inode: fstree.Inode_
 }
 
 text_replay :: proc(src: ^Text_Source, st: ^Text_State, target: crdt.Op_Id, ref: Op_Ref, buf: ^[dynamic]u8, base: []crdt.Lv) -> (descends: bool, err: Error) {
+	if src.decoded != nil {
+		d, derr := src.decoded(src.data, ref.stream, ref.off)
+		if derr == .Redacted {
+			return true, .None
+		}
+		if derr != .None {
+			return false, derr
+		}
+		return _replay_decoded(src, st, target, ref, d, base)
+	}
 	body, rerr := src.record(src.data, ref.stream, ref.off, buf)
 	if rerr == .Redacted {
 		return true, .None
@@ -156,5 +202,54 @@ text_replay :: proc(src: ^Text_Source, st: ^Text_State, target: crdt.Op_Id, ref:
 		return false, .Corrupt
 	}
 	crdt.log_add_batch(&st.log, src.g, use, target, first, 0)
+	return true, .None
+}
+
+@(private = "file")
+_replay_decoded :: proc(src: ^Text_Source, st: ^Text_State, target: crdt.Op_Id, ref: Op_Ref, d: ^Decoded, base: []crdt.Lv) -> (descends: bool, err: Error) {
+	b := &d.batch
+	if len(base) > 0 {
+		ps := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(src.g, b.parents, &ps) != .None || !crdt.graph_contains_all(src.g, ps[:], base) {
+			return false, .None
+		}
+	}
+	n := crdt.batch_len(b)
+	to := n
+	if int(ref.to) < n {
+		to = int(ref.to)
+		if to <= 0 {
+			return false, .Corrupt
+		}
+		lo, hi := 0, len(b.ops)
+		for lo + 1 < hi {
+			mid := (lo + hi) / 2
+			if d.starts[mid] < to {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		if b.ops[lo].kind == .Opaque && d.starts[lo] + b.ops[lo].len > to {
+			return false, .Corrupt
+		}
+	}
+	first, ok := crdt.graph_lv(src.g, crdt.Op_Id{b.actor, b.seq})
+	if !ok {
+		return false, .Corrupt
+	}
+	if list, found := d.runs[target]; found {
+		for idx in list {
+			at := d.starts[idx]
+			if at >= to {
+				break
+			}
+			op := b.ops[idx]
+			if at + op.len > to {
+				op = crdt.run_head(op, to - at)
+			}
+			crdt.log_push(&st.log, src.g, first + crdt.Lv(at), op)
+		}
+	}
 	return true, .None
 }

@@ -1,6 +1,7 @@
 package fs
 
 import "base:runtime"
+import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 import "../crdt"
@@ -123,6 +124,65 @@ History :: struct {
 	held:       [dynamic]Kv_Group,
 	markers:    [dynamic]Git_Marker,
 	views:      [dynamic]^Text_View,
+	scan:       Scan_Cache,
+}
+
+@(private)
+Scan_Cache :: struct {
+	depth:  int,
+	arena:  virtual.Arena,
+	valid:  bool,
+	stream: u32,
+	off:    u64,
+	dec:    fshist.Decoded,
+}
+
+history_scan_begin :: proc(h: ^History) {
+	h.scan.depth += 1
+}
+
+history_scan_end :: proc(h: ^History) {
+	h.scan.depth = max(h.scan.depth - 1, 0)
+	if h.scan.depth == 0 {
+		scan_drop(h)
+	}
+}
+
+@(private)
+scan_drop :: proc(h: ^History) {
+	h.scan.valid = false
+	h.scan.dec = {}
+	virtual.arena_destroy(&h.scan.arena)
+}
+
+@(private)
+scan_decoded :: proc(data: rawptr, stream: u32, off: u64) -> (^fshist.Decoded, fshist.Error) {
+	h := (^History)(data)
+	c := &h.scan
+	if c.valid && c.stream == stream && c.off == off {
+		return &c.dec, .None
+	}
+	c.valid = false
+	c.dec = {}
+	virtual.arena_free_all(&c.arena)
+	a := virtual.arena_allocator(&c.arena)
+	buf := make([dynamic]u8, a)
+	body, err := read_stream(h, stream, i64(off), &buf)
+	if err == .Redacted {
+		return nil, .Redacted
+	}
+	if err != .None {
+		h.src_err = err
+		return nil, .Corrupt
+	}
+	if derr := fshist.decoded_build(&c.dec, body, stream_dict(h, stream), a); derr != .None {
+		c.dec = {}
+		return nil, derr
+	}
+	c.stream = stream
+	c.off = off
+	c.valid = true
+	return &c.dec, .None
 }
 
 history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self: prim.Id, db: ^odb.Odb, streams := Stream_Source{}, allocator := context.allocator, opts := History_Options{}) -> Error {
@@ -650,6 +710,8 @@ history_wipe :: proc(h: ^History) -> Error {
 }
 
 history_sleep :: proc(h: ^History) {
+	scan_drop(h)
+	h.scan.depth = 0
 	if !h.awake {
 		return
 	}
@@ -2082,6 +2144,9 @@ load_text :: proc(h: ^History, f: ^File_State, v: []crdt.Lv, full := false) -> E
 			}
 			return d, .None
 		},
+	}
+	if h.scan.depth > 0 {
+		src.decoded = scan_decoded
 	}
 	h.src_err = .None
 	e := fshist.text_load(&src, &f.st, f.inode, inode_op(h, f.inode), &f.rec, f.new_refs[:], v, full)

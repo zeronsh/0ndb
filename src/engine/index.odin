@@ -657,6 +657,8 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 	defer virtual.arena_destroy(&scratch)
 	sa := virtual.arena_allocator(&scratch)
 	snap := fstree.current(&h.hist.tree)
+	fs.history_scan_begin(h.hist)
+	defer fs.history_scan_end(h.hist)
 	for id in ids {
 		defer virtual.arena_free_all(&scratch)
 		used += 1
