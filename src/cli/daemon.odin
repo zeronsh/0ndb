@@ -225,6 +225,7 @@ daemon_main :: proc(args: ^Args) -> int {
 		if prim.loop_step(&d.s.loop, true) != .None {
 			break
 		}
+		api.stack_attach_joined(&d.s)
 		_flush_pushed(d)
 		if len(d.mcp) > 0 {
 			_mcp_sweep(d)
@@ -673,6 +674,8 @@ _sub_free :: proc(s: ^Sub_Tag) {
 _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	d := (^Daemon)(data)
 	#partial switch ev.kind {
+	case .Space_Joined, .Members_Changed:
+		api.stack_space_joined(&d.s, ev.space)
 	case .Connected:
 		delete_key(&d.links, ev.space)
 		fmt.eprintfln("0ndb daemon: space %s connected", hex(ev.space))
@@ -691,6 +694,7 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	case .Access_Revoked:
 		fmt.eprintfln("0ndb daemon: access to space %s was revoked: this device was removed", hex(ev.space))
 	case .Epoch_Changed:
+		api.stack_space_joined(&d.s, ev.space)
 		fmt.eprintfln("0ndb daemon: space %s key epoch %d", hex(ev.space), ev.length)
 	case .Runner_Enrolled:
 		fmt.eprintfln("0ndb daemon: runner %s enrolled in space %s through the pool", hex(ev.device), hex(ev.space))
