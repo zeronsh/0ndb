@@ -85,7 +85,7 @@ digest_object :: proc(w: ^World, n: ^Node, oi: int) -> Digest {
 		}
 		rids := make([dynamic]eng.Rid, context.temp_allocator)
 		for op in m.ops {
-			if op.obj == oi && op.kind == .Send && op.status != .Lost && op.status != .Failed && !obj.rid_none(op.rid) {
+			if op.obj == oi && (op.kind == .Send || op.kind == .Stream) && op.status != .Lost && op.status != .Failed && !obj.rid_none(op.rid) {
 				append(&rids, op.rid)
 			}
 		}
@@ -715,7 +715,7 @@ check_redaction :: proc(w: ^World) {
 				append(&secrets, d)
 				append(&owners, op.obj)
 			}
-		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
+		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream:
 		}
 	}
 	for s, si in secrets {

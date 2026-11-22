@@ -296,6 +296,9 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	case .Direct, .Undelivered:
 		_remote_on_repl(e, sp, ev)
 		return
+	case .Draft, .Draft_Pulled:
+		_draft_on_repl(e, sp, ev)
+		return
 	}
 	name, _ := _clone(ev.name, e.allocator)
 	holders: []prim.Id
@@ -372,6 +375,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_pending_republish(e, sp)
 		_relay_redact_resend(e, sp)
 		_full_kick(e, sp)
+		_drafts_reconnected(e, sp)
 	case .Disconnected:
 		sp.connected = false
 		if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked {

@@ -212,6 +212,10 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 	if merr != .None {
 		return _oerr(merr)
 	}
+	_drafts_drop(h, msg.seg, msg.off)
+	if msg.seg == e.self {
+		_draft_redact_own(e, h, msg.off)
+	}
 	plan, perr := convo.writer_redact_plan(&h.cw, msg, context.temp_allocator)
 	if perr != .None {
 		return _oerr(perr)
@@ -668,6 +672,7 @@ _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, t
 			}
 		}
 		if msg, merr0 := obj.rid(&h.view, target); merr0 == .None && !obj.vref_none(target) {
+			_draft_redact_own(e, h, target.off)
 			if t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator); terr == .None {
 				if m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator); merr == .None {
 					_purge_message(e, h, msg, &m)
@@ -721,6 +726,12 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 	if !obj.vref_none(target) && h.kind == .Conversation {
 		gerr: obj.Error
 		target_rid, gerr = obj.rid(&h.view, target)
+		if gerr == .None {
+			_drafts_drop(h, target_rid.seg, target_rid.off)
+			if target_rid.seg == e.self && h.w_open {
+				_draft_redact_own(e, h, target_rid.off)
+			}
+		}
 		if t, tt := convo.view_tail(&h.view, e.self, context.temp_allocator); tt == .None && gerr == .None {
 			if m, merr := convo.message(&h.view, &t, convo.Position{msg = target_rid}, context.temp_allocator); merr == .None {
 				_purge_message(e, h, target_rid, &m)

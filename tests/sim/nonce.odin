@@ -1,6 +1,7 @@
 package sim
 
 import "base:intrinsics"
+import "core:crypto/blake2b"
 import "core:fmt"
 import "core:slice"
 import "../../src/journal"
@@ -13,6 +14,11 @@ KIND_FILL :: 0x12
 KIND_SERVE :: 0x14
 KIND_DATA :: 0x85
 KIND_SERVED :: 0x98
+KIND_PULL :: 0x13
+KIND_LIVE :: 0x17
+KIND_LIVED :: 0x9b
+LIVE_FIXED :: 32 + 8 + 8
+PULL_LEN :: 16 + 8 + 32 + 8 + 8
 APPEND_FIXED :: 32 + 8
 FILL_FIXED :: 32 + 8
 DATA_FIXED :: 32 + 8 + 8
@@ -40,6 +46,8 @@ Cipher_Source :: enum u8 {
 	Served,
 	Data,
 	Relay_Storage,
+	Live,
+	Lived,
 }
 
 Cipher_Inject :: enum u8 {
@@ -69,11 +77,43 @@ Cipher_Watch :: struct {
 	injected: bool,
 	want:     osync.Stream_Id,
 	want_at:  i64,
+	dpulls:   [dynamic]Draft_Pull_Tap,
+	drafts:   u64,
+}
+
+Draft_Pull_Tap :: struct {
+	requester: osync.Device_Id,
+	tag:       u64,
+	sid:       osync.Stream_Id,
+	msg:       u64,
+}
+
+draft_sid :: proc(sid: osync.Stream_Id, msg: u64) -> (out: osync.Stream_Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 32)
+	blake2b.update(&ctx, transmute([]u8)string("0ndb sim draft"))
+	s := sid
+	blake2b.update(&ctx, s[:])
+	m: [8]u8
+	prim.put_u64le(m[:], msg)
+	blake2b.update(&ctx, m[:])
+	blake2b.final(&ctx, out[:])
+	return
+}
+
+_draft_pull_find :: proc(w: ^World, requester: osync.Device_Id, tag: u64, sid: osync.Stream_Id) -> (msg: u64, ok: bool) {
+	for p in w.cipher.dpulls {
+		if p.requester == requester && p.tag == tag && p.sid == sid {
+			return p.msg, true
+		}
+	}
+	return
 }
 
 cipher_init :: proc(w: ^World) {
 	w.cipher.images = make(map[osync.Stream_Id]^Cipher_Image, w.allocator)
 	w.cipher.pending = make([dynamic]Cipher_Pending, w.allocator)
+	w.cipher.dpulls = make([dynamic]Draft_Pull_Tap, w.allocator)
 	w.cipher.inject = Cipher_Inject(env_u64("SIM_INJECT_REUSE", 0) % len(Cipher_Inject))
 }
 
@@ -91,6 +131,7 @@ cipher_destroy :: proc(w: ^World) {
 		delete(p.who, w.allocator)
 	}
 	delete(w.cipher.pending)
+	delete(w.cipher.dpulls)
 }
 
 tap_feed :: proc(w: ^World, c: ^Conn, t: ^Tap, bytes: []u8, down: bool) {
@@ -120,6 +161,33 @@ _frame :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8, down: bool) {
 	body: []u8
 	src: Cipher_Source
 	switch {
+	case !down && kind == KIND_PULL && len(payload) == PULL_LEN:
+		from := prim.get_u64le(payload[56:64])
+		copy(sid[:], payload[24:56])
+		req := osync.Device_Id(c.node.identity.id)
+		tag := prim.get_u64le(payload[16:24])
+		for i := 0; i < len(w.cipher.dpulls); {
+			p := w.cipher.dpulls[i]
+			if p.requester == req && p.tag == tag && p.sid == sid {
+				ordered_remove(&w.cipher.dpulls, i)
+				continue
+			}
+			i += 1
+		}
+		if from & osync.PULL_DRAFT != 0 {
+			append(&w.cipher.dpulls, Draft_Pull_Tap{requester = req, tag = tag, sid = sid, msg = from &~ osync.PULL_DRAFT})
+		}
+		return
+	case !down && kind == KIND_LIVE && len(payload) >= LIVE_FIXED:
+		copy(sid[:], payload[:32])
+		sid = draft_sid(sid, prim.get_u64le(payload[32:40]))
+		at, body, src = i64(prim.get_u64le(payload[40:48])), payload[LIVE_FIXED:], .Live
+		w.cipher.drafts += 1
+		w.stats.draft_frames += 1
+	case down && kind == KIND_LIVED && len(payload) >= LIVE_FIXED && !w.cfg.byzantine:
+		copy(sid[:], payload[:32])
+		sid = draft_sid(sid, prim.get_u64le(payload[32:40]))
+		at, body, src = i64(prim.get_u64le(payload[40:48])), payload[LIVE_FIXED:], .Lived
 	case !down && kind == KIND_APPEND && len(payload) >= APPEND_FIXED:
 		copy(sid[:], payload[:32])
 		at, body, src = i64(prim.get_u64le(payload[32:40])), payload[APPEND_FIXED:], .Append
@@ -129,9 +197,17 @@ _frame :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8, down: bool) {
 	case !down && kind == KIND_SERVE && len(payload) >= SERVE_FIXED:
 		copy(sid[:], payload[SERVE_STREAM:SERVE_STREAM + 32])
 		at, body, src = i64(prim.get_u64le(payload[SERVE_AT:SERVE_AT + 8])), payload[SERVE_FIXED:], .Serve
+		req: osync.Device_Id
+		copy(req[:], payload[:16])
+		if msg, ok := _draft_pull_find(w, req, prim.get_u64le(payload[16:24]), sid); ok {
+			sid = draft_sid(sid, msg)
+		}
 	case down && kind == KIND_SERVED && len(payload) >= SERVE_FIXED && !w.cfg.byzantine:
 		copy(sid[:], payload[SERVE_STREAM:SERVE_STREAM + 32])
 		at, body, src = i64(prim.get_u64le(payload[SERVE_AT:SERVE_AT + 8])), payload[SERVE_FIXED:], .Served
+		if msg, ok := _draft_pull_find(w, osync.Device_Id(c.node.identity.id), prim.get_u64le(payload[16:24]), sid); ok {
+			sid = draft_sid(sid, msg)
+		}
 	case down && kind == KIND_DATA && len(payload) >= DATA_FIXED && !w.cfg.byzantine:
 		copy(sid[:], payload[:32])
 		at, body, src = i64(prim.get_u64le(payload[32:40])), payload[DATA_FIXED:], .Data

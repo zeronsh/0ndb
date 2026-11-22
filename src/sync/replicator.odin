@@ -40,6 +40,8 @@ Repl_Event_Kind :: enum u8 {
 	Unavailable,
 	Peer_Misbehaving,
 	Promoted,
+	Draft,
+	Draft_Pulled,
 }
 
 Repl_Event :: struct {
@@ -291,6 +293,11 @@ Replicator :: struct {
 	served_bytes: i64,
 	peer_tampered: int,
 	promos:     [dynamic]^Promotion,
+	lives:      map[Stream_Id]Live_Sub,
+	dflights:   [dynamic]Draft_Flight,
+	live_rx:    Live_Rx,
+	live_sent:  i64,
+	live_recv:  i64,
 	allocator:  runtime.Allocator,
 }
 
@@ -421,6 +428,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.presence)
 	delete(r.serves)
 	delete(r.parked)
+	_lives_destroy(r)
 	for pr in r.promos {
 		_promotion_free(r, pr)
 	}
@@ -1979,6 +1987,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		}
 		_emit(r, Repl_Event{kind = .Connected, usage = ev.usage, quota = ev.quota})
 		_repl_on_ready(r)
+		_lives_resend(r)
 	case .Listing:
 		for i in 0 ..< listing_count(ev) {
 			l := listing_entry(ev, i)
@@ -2013,17 +2022,24 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Hollow:
 		_on_hollow(r, ev)
 	case .Pulled:
-		_on_pulled(r, ev)
+		if !_on_draft_pulled(r, ev) {
+			_on_pulled(r, ev)
+		}
 	case .Served:
-		_on_served(r, ev)
+		if !_on_draft_served(r, ev) {
+			_on_served(r, ev)
+		}
 	case .Accounted:
 		if st, ok := accounted_decode(ev.data); ok {
 			r.account = st
 			r.accounted = true
 		}
 	case .Unserved:
-		_on_unserved(r, ev)
+		if !_on_draft_unserved(r, ev) {
+			_on_unserved(r, ev)
+		}
 	case .Lived:
+		_on_lived(r, ev)
 	case .Probed:
 		if Stream_Id(ev.id) == reserved_id(FEED_TAG, 0) {
 			r.feed_target = ev.length
@@ -2193,6 +2209,7 @@ _repl_pump :: proc(r: ^Replicator) {
 
 @(private)
 _repl_reset_state :: proc(r: ^Replicator) {
+	_lives_reset(r)
 	if r.rx_remote != nil {
 		_stage_flush(r, true, -1)
 	}

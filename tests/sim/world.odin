@@ -26,6 +26,7 @@ Ev_Kind :: enum u8 {
 	Heal,
 	Watch,
 	Pack_Job,
+	Stream_Step,
 }
 
 Sim_Event :: struct {
@@ -133,6 +134,13 @@ World_Stats :: struct {
 	live_wait_ms:   u64,
 	rid_probes:     u64,
 	rid_reused:     u64,
+	stream_bytes:   u64,
+	draft_deltas:   u64,
+	draft_delta_bytes: u64,
+	seg_delta_bytes: u64,
+	draft_checked:  u64,
+	draft_frames:   u64,
+	remote_draft_bytes: u64,
 }
 
 Config :: struct {
@@ -198,6 +206,8 @@ World :: struct {
 	quarantines: [dynamic]Quarantine,
 	promos:    [dynamic]Promo_Rec,
 	live:      [dynamic]^Live_Read,
+	streams:   [dynamic]^M_Stream,
+	watches:   [dynamic]^Watch,
 	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
 }
 
@@ -360,6 +370,8 @@ world_init :: proc(w: ^World, cfg: Config) {
 	cipher_init(w)
 	w.promos = make([dynamic]Promo_Rec, w.allocator)
 	w.live = make([dynamic]^Live_Read, w.allocator)
+	w.streams = make([dynamic]^M_Stream, w.allocator)
+	w.watches = make([dynamic]^Watch, w.allocator)
 	rng_init(&w.rng, cfg.seed, 1)
 	rng_init(&w.net_rng, cfg.seed, 2)
 	rng_init(&w.fault_rng, cfg.seed, 3)
@@ -437,6 +449,7 @@ world_destroy :: proc(w: ^World) {
 		free(r, w.allocator)
 	}
 	delete(w.live)
+	streams_destroy(w)
 	model_destroy(&w.model)
 }
 

@@ -55,6 +55,7 @@ Seg :: struct {
 	probing: bool,
 	probed:  bool,
 	follow:  bool,
+	live:    bool,
 	check:   Seg_Check,
 	chain:   journal.Chain,
 }
@@ -91,6 +92,13 @@ Handle :: struct {
 	table_open: bool,
 	local:      bool,
 	grouped:    bool,
+	drafts:     [dynamic]^Draft_View,
+	dgen:       u64,
+	dview:      i64,
+	ddur:       i64,
+	dpub:       i64,
+	dclosed:    [DRAFT_CLOSED]Draft_Key,
+	dclosed_n:  int,
 }
 
 @(private)
@@ -540,6 +548,12 @@ _handle_rekey :: proc(h: ^Handle, device: prim.Id, rt: ^Remote_Tree) {
 				journal.reader_set_keys(&s.jr, osync.keytree_provider(&rt.tree))
 			}
 			_seg_enter(h, s)
+			for v in h.drafts {
+				if v.device == device && v.gap && !v.pulling {
+					_draft_pull(h.e, h, device, v)
+				}
+			}
+			_object_changed(h.e, h.sp.id, h.id, .Data)
 			return
 		}
 	}
@@ -603,6 +617,9 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 		_fatal(e, err)
 		return err
 	}
+	if h.kind == .Conversation {
+		_draft_own_feed(e, h)
+	}
 	n := _own_len(h)
 	if n > h.published {
 		path, perr := _own_path(e, h)
@@ -661,8 +678,12 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 	if !keep_follow && h.grouped && h.sp.repl_on {
 		osync.replicator_unfollow_segments(&h.sp.repl, &h.scope, h.name, 0)
 	}
+	_drafts_free(h)
 	for s in h.segs {
 		journal.reader_close(&s.jr)
+		if h.sp.repl_on && s.live && !_subscribed(e, h.id) {
+			osync.replicator_live_follow(&h.sp.repl, &h.scope, s.device, h.name, 0, false)
+		}
 		if h.sp.repl_on {
 			if s.follow && !keep_follow {
 				osync.replicator_unfollow(&h.sp.repl, &h.scope, s.device, h.name, 0)

@@ -11,7 +11,11 @@ _on_follow_live :: proc(c: ^Conn, rd: ^prim.Reader, count: int) {
 	sp := c.space
 	for _ in 0 ..< count {
 		id := Stream_Id(get_id32(rd))
-		_ = prim.read_u64le(rd)
+		off := prim.read_u64le(rd)
+		if off == FOLLOW_END {
+			_live_unfollow(c, id)
+			continue
+		}
 		if !_can(c, .Read, cast([32]u8)id) {
 			_reply_refused(c, .Not_Owner, cast([32]u8)id)
 			continue

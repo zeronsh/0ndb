@@ -42,7 +42,7 @@ scenarios :: proc() -> []Scenario {
 		{"compaction", "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base.", sc_compaction},
 		{"trim", "Trim drops stored content below a base an archive covers: owner only, acknowledged once durable, idempotent, never lowers base, refused at or past the length; readers, probes and follows get Trimmed; Fill below a trim stores nothing.", sc_trim},
 		{"limits", "Per-principal connection limit and per-connection follow limit.", sc_limits},
-		{"live", "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow, draft pulls through the peer pipe, malformed Live.", sc_live},
+		{"live", "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow leaving live interest, LIVE removal, draft pulls through the peer pipe, malformed Live.", sc_live},
 	}
 	return list[:]
 }
@@ -355,6 +355,10 @@ f_follow_live :: proc(streams: ..[32]u8) -> []u8 {
 		append(&parts, ids(s), le64(0))
 	}
 	return frame(.Follow, ..parts[:])
+}
+
+f_unfollow_live :: proc(id: [32]u8) -> []u8 {
+	return frame(.Follow, []u8{osync.FOLLOW_LIVE, 1, 0}, ids(id), le64(osync.FOLLOW_END))
 }
 
 f_unfollow1 :: proc(id: [32]u8) -> []u8 {
@@ -726,7 +730,9 @@ sc_live :: proc(v: ^Vector) {
 	send(v, "carol", f_follow_live(h, h), "carol follows live; a repeated id is registered once")
 	send(v, "alice", f_live(h, 96, u64(len(d1)), d2), "Lived to every live follower")
 	send(v, "bob", f_live(h, 96, 0, d1), "Live on another device's segment is refused")
-	send(v, "bob", f_unfollow1(h), "Unfollow ends live interest")
+	send(v, "bob", f_unfollow1(h), "Unfollow ends read follows only: live interest stays")
+	send(v, "alice", f_live(h, 96, 0, d1), "bob and carol still receive it")
+	send(v, "bob", f_unfollow_live(h), "a LIVE Follow entry with offset 2^64 - 1 ends live interest")
 	send(v, "alice", f_live(h, 96, 0, d1), "only carol still receives it")
 	durable(v, "Live writes nothing")
 	send(v, "carol", f_pull_draft(alice.dev, 3, h, 96, 0), "a draft pull: from = DRAFT | msg, to = first draft offset wanted")

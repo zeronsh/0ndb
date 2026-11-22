@@ -64,6 +64,7 @@ Durable_Batch :: struct {
 	meta:  bool,
 	cards: [dynamic]Card_Pub,
 	marks: [dynamic]Hist_Mark,
+	drafts: [dynamic]Draft_Pub,
 }
 
 @(private)
@@ -373,6 +374,8 @@ _durable_begin :: proc(e: ^Engine) {
 		}
 	}
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
+	b.drafts = e.draft_dirty
+	e.draft_dirty = make([dynamic]Draft_Pub, e.allocator)
 	append(&e.batches, b)
 	e.stats.commits += 1
 	err := pack.batch_end_async(&e.pk, _batch_cb, b)
@@ -393,6 +396,11 @@ _durable_begin :: proc(e: ^Engine) {
 			}
 			delete(e.dirty)
 			e.dirty = b.segs
+			for x in e.draft_dirty {
+				append(&b.drafts, x)
+			}
+			delete(e.draft_dirty)
+			e.draft_dirty = b.drafts
 			e.reg.meta ||= b.meta
 			for c in e.card_pubs {
 				append(&b.cards, c)
@@ -453,8 +461,14 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	} else {
 		e.durable_tick = max(e.durable_tick, b.tick)
 		e.stats.durable += 1
+		for p in b.drafts {
+			_draft_publish(e, p)
+		}
 		for &d in b.segs {
 			_publish(e, &d)
+			if d.kind == .Conversation && d.length > 0 {
+				_draft_settle(e, d.object, d.length)
+			}
 		}
 		for c in b.cards {
 			_card_pub_durable(e, c)
@@ -481,6 +495,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	delete(b.segs)
 	delete(b.cards)
 	delete(b.marks)
+	delete(b.drafts)
 	free(b, e.allocator)
 }
 

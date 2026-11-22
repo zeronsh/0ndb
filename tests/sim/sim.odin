@@ -192,6 +192,7 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 			if node_start(n) {
 				model_after_restart(&w.model, n)
 				probe_reuse(w, n)
+				stream_after_restart(w, n)
 				requeue_shares(w, n)
 			}
 		}
@@ -203,6 +204,8 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		watch_event(w, w.nodes[ev.node])
 	case .Pack_Job:
 		pack_job_event(w, w.nodes[ev.node], ev.gen)
+	case .Stream_Step:
+		stream_step(w, int(ev.arg))
 	case .Heal:
 		n := w.nodes[ev.node]
 		if n.partitioned {
@@ -415,6 +418,7 @@ finish :: proc(w: ^World) {
 		if !n.alive && len(w.failures) == 0 {
 			if node_start(n) {
 				model_after_restart(&w.model, n)
+				stream_after_restart(w, n)
 			}
 		}
 	}
@@ -441,6 +445,7 @@ finish :: proc(w: ^World) {
 	if !check_convergence(w, true) && w.cfg.verbose {
 		dump_replication(w, before)
 	}
+	check_streams(w)
 	check_map_reapply(w)
 	check_redaction(w)
 	cipher_scan_relay(w)
@@ -690,6 +695,13 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.live_wait_ms = max(total.stats.live_wait_ms, st.stats.live_wait_ms)
 		total.stats.rid_probes += st.stats.rid_probes
 		total.stats.rid_reused += st.stats.rid_reused
+		total.stats.stream_bytes += st.stats.stream_bytes
+		total.stats.draft_deltas += st.stats.draft_deltas
+		total.stats.draft_delta_bytes += st.stats.draft_delta_bytes
+		total.stats.seg_delta_bytes += st.stats.seg_delta_bytes
+		total.stats.draft_checked += st.stats.draft_checked
+		total.stats.draft_frames += st.stats.draft_frames
+		total.stats.remote_draft_bytes += st.stats.remote_draft_bytes
 		total.disk_ops += st.disk_ops
 		total.sim_ns += st.sim_ns
 	}
@@ -848,6 +860,7 @@ print_stats :: proc(r: ^Run_Result) {
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
 	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d expected_conflicts=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, r.stats.conflict_pairs, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
 	fmt.eprintf("sim: interactive_reads=%d waited=%d data=%d absent=%d quarantined=%d closed=%d dropped_by_crash=%d max_wait_ms=%d rid_probes=%d rid_reused=%d\n", r.stats.live_reads, r.stats.live_waited, r.stats.live_data, r.stats.live_absent, r.stats.live_quarantined, r.stats.live_closed, r.stats.live_dropped, r.stats.live_wait_ms, r.stats.rid_probes, r.stats.rid_reused)
+	fmt.eprintf("sim: streamed=%d draft_frames=%d draft_deltas=%d draft_delta_bytes=%d remote_draft_bytes=%d segment_delta_bytes=%d draft_blocks_checked=%d\n", r.stats.stream_bytes, r.stats.draft_frames, r.stats.draft_deltas, r.stats.draft_delta_bytes, r.stats.remote_draft_bytes, r.stats.seg_delta_bytes, r.stats.draft_checked)
 }
 
 @(private = "file")

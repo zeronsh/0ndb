@@ -240,6 +240,10 @@ Stats :: struct {
 	fetches:     u64,
 	indexed:     u64,
 	wakeups:     u64,
+	live_bytes:  u64,
+	draft_bytes: u64,
+	draft_pulls: u64,
+	draft_rejected: u64,
 }
 
 Engine :: struct {
@@ -290,6 +294,7 @@ Engine :: struct {
 	in_tick:      bool,
 	closing:      bool,
 	dirty:        [dynamic]Dirty_Seg,
+	draft_dirty:  [dynamic]Draft_Pub,
 	batches:      [dynamic]^Durable_Batch,
 	durable_tick: u64,
 	changed:      map[prim.Id]Change,
@@ -356,6 +361,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.post_swap = make([dynamic]Posted, e.allocator)
 	e.wake_hooks = make([dynamic]Posted, e.allocator)
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
+	e.draft_dirty = make([dynamic]Draft_Pub, e.allocator)
 	e.batches = make([dynamic]^Durable_Batch, e.allocator)
 	e.changed = make(map[prim.Id]Change, e.allocator)
 	_content_init(e)
@@ -908,6 +914,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.post_swap)
 	delete(e.wake_hooks)
 	delete(e.dirty)
+	delete(e.draft_dirty)
 	delete(e.batches)
 	delete(e.changed)
 	_content_destroy(e)

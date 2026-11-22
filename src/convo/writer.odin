@@ -19,6 +19,7 @@ Writer :: struct {
 	core:         obj.Writer,
 	sum:          Summary,
 	buf:          Block_Buf,
+	draft:        Draft,
 	kids:         obj.Slots,
 	updates:      [dynamic]Child_Update,
 	seen:         [dynamic]i64,
@@ -34,6 +35,8 @@ Block_Buf :: struct {
 	kind:   Block_Kind,
 	flags:  Block_Flags,
 	id_len: int,
+	pos:    i64,
+	drafted: int,
 	meta:   [dynamic]u8,
 	data:   [dynamic]u8,
 }
@@ -118,6 +121,10 @@ writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, obj
 	_zero(w, allocator)
 	obj.writer_create(&w.core, v, vfs, path, object, .Conversation, participant, gen, created, encode_settings(settings), opts, allocator, clock) or_return
 	_attach(w)
+	if err := _draft_set_path(w, path); err != .None {
+		_release(w)
+		return err
+	}
 	kp := _kids_path(path, context.temp_allocator) or_return
 	if err := obj.slots_create(&w.kids, vfs, kp, participant, allocator); err != .None {
 		_release(w)
@@ -139,6 +146,12 @@ writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, objec
 	if err == .None {
 		err = _recover(w, path)
 	}
+	if err == .None {
+		err = _draft_set_path(w, path)
+	}
+	if err == .None {
+		err = _draft_recover(w)
+	}
 	if err != .None {
 		_release(w)
 	}
@@ -155,13 +168,15 @@ writer_close :: proc(w: ^Writer) -> Error {
 	if e := obj.writer_close(&w.core); e != .None && err == .None {
 		err = e
 	}
+	_draft_close(w)
 	_release(w)
 	return err
 }
 
 writer_commit :: proc(w: ^Writer) -> Error {
-	_flush(w) or_return
+	_draft_write(w) or_return
 	obj.writer_commit(&w.core) or_return
+	_draft_commit(w) or_return
 	applied := 0
 	err: Error
 	for u in w.updates {
@@ -242,6 +257,8 @@ writer_block :: proc(w: ^Writer, msg: Rid, kind: Block_Kind, data: []u8 = nil, i
 	b.kind = kind
 	b.flags = {.Failed} if failed else {}
 	b.id_len = len(id)
+	b.pos = 0
+	b.drafted = 0
 	if len(b.data) >= CHUNK_MAX {
 		_flush_full(w, false) or_return
 	}
@@ -276,6 +293,7 @@ writer_chunk :: proc(w: ^Writer, msg: Rid, index: u32, data: []u8) -> Error {
 		if .Start in blk.flags && (.Ref in blk.flags || blk.kind == .Tool_Result || blk.kind == .Image || blk.kind == .File) {
 			return .Invalid
 		}
+		have := _seg_block_len(w, m, index) or_return
 		clear(&b.meta)
 		clear(&b.data)
 		b.active = true
@@ -284,6 +302,8 @@ writer_chunk :: proc(w: ^Writer, msg: Rid, index: u32, data: []u8) -> Error {
 		b.index = index
 		b.flags = {}
 		b.id_len = 0
+		b.pos = have
+		b.drafted = 0
 	}
 	if _, e := append(&b.data, ..data); e != nil {
 		return .No_Memory
@@ -816,6 +836,7 @@ _release :: proc(w: ^Writer) {
 		obj.writer_close(&w.core)
 	}
 	obj.slots_close(&w.kids)
+	_draft_close(w)
 	delete(w.buf.meta)
 	delete(w.buf.data)
 	delete(w.updates)
@@ -1842,6 +1863,8 @@ _flush_full :: proc(w: ^Writer, all: bool) -> Error {
 		}
 		b.start = false
 		remove_range(&b.data, 0, n)
+		b.pos += i64(n)
+		b.drafted = max(b.drafted - n, 0)
 		if len(b.data) == 0 {
 			b.active = false
 		}
