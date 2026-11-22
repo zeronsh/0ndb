@@ -17,7 +17,7 @@ Relay_Main :: struct {
 	relay:    osync.Relay,
 	al:       osync.Allow,
 	ma:       osync.Member_Authorizer,
-	ca:       eng.Cap_Authorizer,
+	ca:       osync.Cap_Authorizer,
 	objects:  osync.Dir_Object_Store,
 	sig:      Signals,
 	stopping: bool,
@@ -87,7 +87,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	if err := osync.member_authorizer_init(&m.ma, prim.os_vfs(), mdir, {}, flag_bool(a, "open"), quota, {}, &m.al); err != .None {
 		return report_error(.Io, "cannot open %s", mdir)
 	}
-	eng.cap_authorizer_init(&m.ca, osync.member_authorizer(&m.ma), quota)
+	osync.cap_authorizer_init(&m.ca, osync.member_authorizer(&m.ma), quota)
 	m.ca.issuer_data = &m.ma
 	m.ca.issuer_ok = proc(data: rawptr, space: prim.Id, issuer: osync.Public_Key) -> bool {
 		return osync.member_authorizer_active((^osync.Member_Authorizer)(data), osync.Space_Id(space), issuer)
@@ -97,7 +97,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	cfg.kernel_tls = ODIN_OS == .Linux
 	cfg.open = flag_bool(a, "open")
 	cfg.default_quota = quota
-	cfg.authorizer = eng.cap_authorizer(&m.ca)
+	cfg.authorizer = osync.cap_authorizer(&m.ca)
 	if odir, ok := flag_value(a, "objects"); ok {
 		if prim.mkdir_all(prim.os_vfs(), odir, 0o700) != .None {
 			return report_error(.Io, "cannot create %s", odir)
@@ -186,7 +186,7 @@ cmd_relay :: proc(a: ^Args) -> int {
 	}
 	st := osync.relay_stats(&m.relay)
 	osync.relay_destroy(&m.relay)
-	eng.cap_authorizer_destroy(&m.ca)
+	osync.cap_authorizer_destroy(&m.ca)
 	osync.member_authorizer_destroy(&m.ma)
 	osync.allow_destroy(&m.al)
 	signals_close(&m.sig)

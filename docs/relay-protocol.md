@@ -214,9 +214,9 @@ account := 6 | account[32] | cert[64] | sign[32] | sig[64]
 cert    = Ed25519(account, "0ndb device cert\0" ‖ sign)
 ```
 
-Any other type goes to the embedder authorizer (section 6.3). The reference
-consumer uses type 2 for third-party capability tokens. The device id of a
-principal is `BLAKE2b-512(sign)[:16]`.
+Types 2 and 3 are capability credentials (section 6.5). Any other type goes
+to the embedder authorizer (section 6.4). The device id of a principal is
+`BLAKE2b-512(sign)[:16]`.
 
 A relay answers a rejected Hello with `Error Auth`, a wrong version with
 `Error Version`, an empty or oversized Hello with `Error Protocol`, and a
@@ -330,6 +330,67 @@ know. It maps `(credential, binding, local)` to a principal or a code. The
 relay enforces whatever access the principal carries and nothing more. The
 vector `embedder.json` uses a stub type `0x7e | space | dev | flags` (bit 0
 read, bit 1 own appends, bit 2 objects) to pin down this contract.
+
+### 6.5 Capability credentials
+
+Credential types 2 and 3 carry capability tokens. A member device uses them
+to let a non-member (a guest) read, and optionally write, specific objects
+of its space. A relay that admits guests implements exactly this section;
+the reference implementation is `sync/cap_auth.odin`, which `0ndb relay`
+places in front of the member authorizer.
+
+```
+token   := 2 | space[16] | grantee[16] | object[16] | kind u8 | access u8
+           | expires u64le | name_key[32] | issuer[32] | sig[64]     (187 bytes)
+sig      = Ed25519(issuer, all preceding bytes of the token)
+kind    : 1 conversation, 2 map, 3 text, 4 file tree
+access  : bit 0 read, bit 1 write, bit 2 redact (other bits are ignored)
+expires : unix milliseconds, 0 never expires
+
+type 2  := 2 | token | sign[32] | sig[64]
+type 3  := 3 | n u8 | token × n | sign[32] | sig[64]      (2 <= n <= 16)
+sig      = the Hello signature by sign over the binding (section 4.2)
+```
+
+**Admission.** The relay answers `Error Auth` unless all of these hold:
+- the length is exact;
+- for type 3, `2 <= n <= 16`;
+- the Hello signature verifies;
+- every token has version 2 and a kind from 1 to 4;
+- every token's signature verifies against its issuer;
+- no token is expired at the relay's wall clock;
+- every token's grantee equals the device id of `sign`;
+- all tokens name the same space;
+- every issuer is an active member of that space in the relay's roster
+  (section 6.2) with role member or above and kind other than runner or
+  guest.
+
+The principal is namespace = space, participant = grantee, quota = the
+relay's default quota.
+
+**Admitted streams.** Let `seg = k ‖ hex(object)`, where `k` is `c`, `m`,
+`t` or `f` for kinds 1 to 4 and `hex` is the 32 lowercase hex digits of the
+object id. Let `suffix(name, e) = BLAKE2b-128(key = name_key, u64le(e) ‖
+name)`. A token admits every stream id whose last 16 bytes equal one of:
+- `suffix(seg, e)`, `suffix("card", e)` and `suffix("ckpt/" ‖ seg, e)` for
+  `e` in 0..8;
+- `suffix("keys/" ‖ seg, e)` for `e` in 0..263;
+- `suffix("keyshead/" ‖ seg, 0)`;
+- `suffix("grantkeys/" ‖ hex(object), 0)`.
+
+Each admitted suffix carries the access bits of the tokens that admit it
+(their union, if several do).
+
+**Access.**
+- `List` with the zero id and `Get` need read in any token.
+- `Put` and `Forget` need write in any token.
+- `Fill` is refused.
+- For an admitted stream id:
+  - `List` and `Read` need read on its suffix;
+  - `Append` and `Drop` need write on its suffix, and the id's first 16
+    bytes must equal the grantee;
+  - `Redact` needs redact or write on its suffix.
+- Every other stream id is refused `Not_Owner`.
 
 ## 7. Storage model and durability
 
@@ -883,6 +944,7 @@ storage completion as an input, which every sans-IO relay does.
 | account | request and account principals: requester reads refused, presence, direct messages both ways, 2-connection limit, broken cert |
 | account_streams | account principals: own appends acknowledged once durable, reads and follows of another device's stream, Not_Owner for appends and drops on another device's stream and for objects, Quota over the namespace quota, requester reads refused, a cert by another account refused, another account's device confined to its own namespace |
 | embedder | embedder authorizer principals with read-only and own-append access |
+| capability | type 2 admits one object's streams with its access; type 3 admits the union of its tokens with per-object access; Auth for type 3 with one token, more than 16 tokens, tokens of two spaces, an issuer who is not an active member, an expired token |
 | malformed | oversize control frame, unknown kind, relay kind from a client, short payload, count mismatches, inverted Redact, short bulk header, NONE with bytes, oversize Direct, second Hello, Note beyond 2^62; bytes after the Error ignored; Read with to < from |
 | compaction | feed folding with a redaction, followers jumping to the new end, a late reader starting at the new start, Listing after compaction |
 | limits | per-principal connection limit, per-connection follow limit |
@@ -907,6 +969,12 @@ writer's own stream, so a relay needs no archive tier and never holds plain
 or rearranged bytes. `Trimmed` only tells the reader where to look.
 
 ## 14. Changes in this revision
+
+- Capability credentials are specified (section 6.5). Type 2 was already the
+  reference consumer's single-token form. Type 3 is new: up to 16 tokens for
+  one space and grantee, admitting their union with per-object access. A
+  token also admits the object's `grantkeys/` stream. New vector
+  `capability`.
 
 - `account` principals may read every stream of their account namespace and
   append to and drop their own, within the namespace quota (section 6.3);

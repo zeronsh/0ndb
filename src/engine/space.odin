@@ -15,7 +15,7 @@ ROOT_CARDS :: 3
 @(private)
 SPACE_VERSION :: 2
 @(private)
-CARD_STREAM :: "card"
+CARD_STREAM :: osync.CARD_STREAM
 
 Space_Info :: struct {
 	id:           prim.Id,

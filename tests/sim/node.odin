@@ -453,7 +453,7 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 		instance_kill(&rn.inst)
 		return false
 	}
-	eng.cap_authorizer_init(&rn.cauth, osync.member_authorizer(&rn.mauth), quota, node_clock(&rn.clock))
+	osync.cap_authorizer_init(&rn.cauth, osync.member_authorizer(&rn.mauth), quota, node_clock(&rn.clock))
 	rn.cauth.issuer_data = &rn.mauth
 	rn.cauth.issuer_ok = proc(data: rawptr, space: prim.Id, issuer: osync.Public_Key) -> bool {
 		return osync.member_authorizer_active((^osync.Member_Authorizer)(data), osync.Space_Id(space), issuer)
@@ -516,7 +516,7 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	if err == .None {
 		cc := osync.relay_core_config()
 		cc.storage = store
-		cc.authorizer = eng.cap_authorizer(&rn.cauth)
+		cc.authorizer = osync.cap_authorizer(&rn.cauth)
 		cc.clock = node_clock(&rn.clock)
 		cc.wake = _relay_wake
 		cc.wake_data = rn

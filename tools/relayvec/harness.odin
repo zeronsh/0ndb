@@ -76,6 +76,7 @@ Harness :: struct {
 	cfg:     Vec_Config,
 	store:   osync.Mem_Store,
 	auth:    osync.Member_Authorizer,
+	caps:    osync.Cap_Authorizer,
 	core:    osync.Relay_Core,
 	wall_ns: i64,
 	mono_ns: i64,
@@ -95,7 +96,12 @@ harness_init :: proc(h: ^Harness, cfg: Vec_Config) -> osync.Error {
 	osync.member_authorizer_init(&h.auth, {}, "", stub, cfg.open, cfg.quota, clock) or_return
 	cc := osync.relay_core_config()
 	cc.storage = osync.mem_store(&h.store)
-	cc.authorizer = osync.member_authorizer(&h.auth)
+	osync.cap_authorizer_init(&h.caps, osync.member_authorizer(&h.auth), cfg.quota, clock)
+	h.caps.issuer_data = &h.auth
+	h.caps.issuer_ok = proc(data: rawptr, space: prim.Id, issuer: osync.Public_Key) -> bool {
+		return osync.member_authorizer_active((^osync.Member_Authorizer)(data), osync.Space_Id(space), issuer)
+	}
+	cc.authorizer = osync.cap_authorizer(&h.caps)
 	cc.clock = clock
 	cc.max_follows = cfg.max_follows
 	cc.principal_conns = cfg.principal_conns
@@ -108,6 +114,7 @@ harness_init :: proc(h: ^Harness, cfg: Vec_Config) -> osync.Error {
 
 harness_destroy :: proc(h: ^Harness) {
 	osync.relay_core_destroy(&h.core)
+	osync.cap_authorizer_destroy(&h.caps)
 	osync.member_authorizer_destroy(&h.auth)
 	osync.mem_store_destroy(&h.store)
 	for c in h.conns {
