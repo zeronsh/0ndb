@@ -359,6 +359,7 @@ _member_mount :: proc(ws: ^Worktree, mb: ^Wt_Member) -> Error {
 		state := concat(r.cfg.work_root, "/.state/", hex(derive_id("0ndb-fork-v1", id[:], transmute([]u8)clean)))
 		opts := fs.DEFAULT_MOUNT
 		opts.line = conv
+		opts.follow_branch = false
 		if ferr := fs.mount_fork(busy_src, m, derive_id("0ndb-fork-mount-v1", id[:], transmute([]u8)clean), mb.dir, state, cur, fs.Fork_Options{line = conv}, opts, r.allocator); ferr != .None {
 			free(m, r.allocator)
 			return .Io
@@ -370,6 +371,7 @@ _member_mount :: proc(ws: ^Worktree, mb: ^Wt_Member) -> Error {
 	}
 	opts := fs.DEFAULT_MOUNT
 	opts.line = conv
+	opts.follow_branch = false
 	prim.mkdir_all(r.e.base, mb.dir, 0o755)
 	m, merr := eng.tree_mount(r.e, tree, mb.dir, opts)
 	eng.tree_release(r.e, tree)

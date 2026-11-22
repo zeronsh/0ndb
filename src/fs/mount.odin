@@ -2,8 +2,10 @@ package fs
 
 import "base:runtime"
 import "core:hash/xxhash"
+import "core:crypto/blake2b"
 import "core:mem/virtual"
 import "core:strconv"
+import "core:strings"
 import "../crdt"
 import "../fshist"
 import "../fstree"
@@ -19,6 +21,7 @@ Mount_Options :: struct {
 	threads:      int,
 	import_chunk: int,
 	line:         string,
+	follow_branch: bool,
 }
 
 DEFAULT_MOUNT :: Mount_Options {
@@ -29,6 +32,7 @@ DEFAULT_MOUNT :: Mount_Options {
 	threads      = 8,
 	import_chunk = 8192,
 	line         = "main",
+	follow_branch = true,
 }
 
 Scope :: struct {
@@ -86,6 +90,25 @@ Registry :: struct {
 	on_base:   Base_Proc,
 	base_data: rawptr,
 	exec:      Sync_Exec,
+	on_line:   Line_Proc,
+	on_lock:   Git_Lock_Proc,
+	hook_data: rawptr,
+}
+
+Line_Proc :: #type proc(m: ^Mount, from, to: string, data: rawptr)
+Git_Lock_Proc :: #type proc(m: ^Mount, held: bool, data: rawptr)
+
+registry_set_line_hooks :: proc(reg: ^Registry, on_line: Line_Proc, on_lock: Git_Lock_Proc, data: rawptr) {
+	reg.on_line = on_line
+	reg.on_lock = on_lock
+	reg.hook_data = data
+}
+
+mount_line :: proc(m: ^Mount) -> string {
+	if len(m.branch) > 0 {
+		return m.branch
+	}
+	return m.line
 }
 
 Observe_Done :: proc(ctx: rawptr, err: Error)
@@ -244,6 +267,15 @@ registry_notify :: proc(reg: ^Registry, path: string, kind: Watch_Kind) {
 			if (parent == m.git.dir || parent == m.git.common) && (name == "HEAD" || name == "index" || name == "ORIG_HEAD" || name == "MERGE_HEAD") {
 				mount_mark_git(m)
 			}
+			if parent == m.git.dir && name == "index.lock" {
+				held := prim.exists(m.vfs, path)
+				if held != m.lock_held {
+					m.lock_held = held
+					if reg.on_lock != nil {
+						reg.on_lock(m, held, reg.hook_data)
+					}
+				}
+			}
 			return
 		}
 		if path == m.root {
@@ -380,6 +412,10 @@ Mount :: struct {
 	reload_ms:   i64,
 	reload_owed: bool,
 	reshow:      [dynamic]string,
+	branch:      string,
+	home:        string,
+	home_line:   string,
+	lock_held:   bool,
 	link_mode:   Link_Mode,
 	gitlinks:    []Gitlink,
 }
@@ -521,6 +557,20 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.actor = fshist.ingestion_actor(h.self if h != nil else actor, id)
 	if h != nil {
 		history_register_actor(h, m.actor, id) or_return
+	}
+	m.home_line, _ = clone_string(opts.line, allocator)
+	if m.has_git {
+		if len(m.home) == 0 && len(m.branch) == 0 {
+			m.home, _ = clone_string(m.head.branch, allocator)
+		}
+		if len(m.branch) == 0 {
+			m.branch, _ = clone_string(branch_key(m, m.head, context.temp_allocator), allocator)
+		}
+		if m.opts.follow_branch && m.line == m.home_line && m.branch != m.home_line {
+			delete(m.line, allocator)
+			m.line, _ = clone_string(m.branch, allocator)
+		}
+		mount_line_actor(m) or_return
 	}
 	attrib_log_open(m) or_return
 	image_take(m, &m.img)
@@ -760,6 +810,9 @@ mount_close :: proc(m: ^Mount) {
 	delete(m.root, m.allocator)
 	delete(m.dir, m.allocator)
 	delete(m.line, m.allocator)
+	delete(m.branch, m.allocator)
+	delete(m.home, m.allocator)
+	delete(m.home_line, m.allocator)
 	m^ = {}
 	history_release(held)
 }
@@ -1625,6 +1678,14 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			}
 		}
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		home_s := prim.read_str(&rd)
+		branch_s := prim.read_str(&rd)
+		if prim.reader_ok(&rd) {
+			m.home, _ = clone_string(home_s, m.allocator)
+			m.branch, _ = clone_string(branch_s, m.allocator)
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1894,6 +1955,8 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	for r in m.reshow {
 		prim.write_str(&w, r)
 	}
+	prim.write_str(&w, m.home)
+	prim.write_str(&w, m.branch)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None
@@ -2093,4 +2156,43 @@ state_read :: proc(m: ^Mount) -> (payload: []u8, found: bool, err: Error) {
 	from_prim(rerr) or_return
 	m.legacy = true
 	return data, true, .None
+}
+
+@(private)
+branch_key :: proc(m: ^Mount, head: Git_Head, allocator: runtime.Allocator) -> string {
+	if len(head.branch) > 0 {
+		if head.branch == m.home {
+			return m.home_line
+		}
+		out, _ := strings.concatenate({"git:", head.branch}, allocator)
+		return out
+	}
+	if len(head.commit) > 0 && len(m.home) > 0 {
+		out, _ := strings.concatenate({"git:detached:", head.commit}, allocator)
+		return out
+	}
+	return m.home_line
+}
+
+@(private)
+mount_line_actor :: proc(m: ^Mount) -> Error {
+	self := m.history.self if m.history != nil else m.actor
+	if m.line == m.home_line {
+		m.actor = fshist.ingestion_actor(self, m.id)
+		return .None
+	}
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb mount line"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	id := m.id
+	blake2b.update(&ctx, id[:])
+	blake2b.update(&ctx, transmute([]u8)m.line)
+	pseudo: prim.Id
+	blake2b.final(&ctx, pseudo[:])
+	m.actor = fshist.ingestion_actor(self, pseudo)
+	if m.history != nil {
+		history_register_actor(m.history, m.actor, pseudo) or_return
+	}
+	return .None
 }
