@@ -26,6 +26,7 @@ scenarios :: proc() -> []Scenario {
 		{"append", "Appends are acknowledged only once durable; conflicts, zero-length appends, ownership, reads, tails, reads past the end and frames split across deliveries.", sc_append},
 		{"quota", "Quota refusals for appends and objects count stored bytes plus in-flight reservations; Account reports the space's accounting.", sc_quota},
 		{"follow", "Follow, watch (Created), live Data pushes, FOLLOW_END, Unfollow and reserved stream ids.", sc_follow},
+		{"early", "Data pushes to caught-up followers run ahead of the commit with the durable length in the word; Appended, feed entries, Probed, Length and reads follow the commit; a follower ahead of the relay's length gets only the bytes past its offset.", sc_early},
 		{"feed", "The announce feed: snapshot from 0, live entries, resume at aligned and unaligned offsets, past-the-end, filters and additive filters.", sc_feed},
 		{"list", "Listing returns each stream once, newest first, with its current length.", sc_list},
 		{"probe", "Probe answers lengths for streams, unknown streams and the feed, preceded by Hollow for based segments.", sc_probe},
@@ -494,6 +495,41 @@ sc_follow :: proc(v: ^Vector) {
 	send(v, "alice", f_append(a1, l, rec("unseen", l)))
 	durable(v, "an unfollowed stream sends nothing")
 	send(v, "bob", f_follow(false, {cast([32]u8)osync.reserved_id(osync.FEED_TAG, 0), 0}), "Follow a reserved id")
+}
+
+sc_early :: proc(v: ^Vector) {
+	alice, bob, carol := key_make(1), key_make(2), key_make(3)
+	sp := space_make(v, alice, 0x1e)
+	add_b := space_add(sp, alice, bob, .Member)
+	add_c := space_add(sp, alice, carol, .Reader)
+	join(v, "alice", sp, alice, sp.genesis)
+	join(v, "bob", sp, bob, add_b)
+	join(v, "carol", sp, carol, add_c)
+	join(v, "feeder", sp, bob, add_b)
+	a1 := stream(alice, 1)
+	r0 := rec("zero", 0)
+	l0 := i64(len(r0))
+	send(v, "alice", f_append(a1, 0, r0))
+	durable(v)
+	send(v, "feeder", f_feed(1 << 40), "Feed from the end")
+	send(v, "bob", f_follow(false, {a1, u64(l0)}), "bob follows at the end")
+	r1 := rec("one", l0)
+	l1 := l0 + i64(len(r1))
+	send(v, "alice", f_append(a1, l0, r1), "bob gets the bytes before the commit; the word is the durable length")
+	send(v, "bob", f_idlist(.Probe, a1), "Probe answers the durable length")
+	send(v, "bob", f_read(a1, l0, l1), "a Read serves only durable bytes")
+	durable(v, "Appended, the feed entry and an empty Data announcing the new length")
+	r2 := rec("two", l1)
+	l2 := l1 + i64(len(r2))
+	send(v, "carol", f_follow(false, {a1, u64(l2)}), "carol already holds the next record")
+	send(v, "alice", f_append(a1, l1, r2), "the resent record goes early to bob only")
+	durable(v, "both learn the new length")
+	r3 := rec("three", l2)
+	l3 := l2 + i64(len(r3))
+	send(v, "carol", f_follow(false, {a1, u64(l2 + 5)}), "carol holds the first 5 bytes of the next record")
+	send(v, "alice", f_append(a1, l2, r3), "carol gets only the bytes past her offset")
+	durable(v)
+	send(v, "carol", f_read(a1, l2, l3), "the committed record reads back whole")
 }
 
 sc_feed :: proc(v: ^Vector) {

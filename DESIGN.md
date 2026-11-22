@@ -3184,6 +3184,15 @@ Relay cost tracks the reachable information, not the activity. Items marked
   segment and another for its feed entry. A `0ndb new` costs the relay 2
   fdatasyncs, one per client round trip (47 for five before staging, 30
   after it, 10 with coalescing).
+- **Early pushes**: the relay keeps an append of up to 256 KiB in memory
+  while the frame arrives when the segment has followers. When the frame
+  ends, it pushes the bytes to every follower whose offset falls inside the
+  append, before the commit. Acknowledgements, feed entries, `Created`,
+  `Length`/`Probed`, reads and the length word of each `Data` still wait for
+  the commit. After the commit, a follower that already has the bytes gets one
+  empty `Data` announcing the length. A follower may therefore hold bytes past
+  the relay's durable length. A crash loses them only on the relay, and the
+  writer's resend brings back identical bytes (relay-protocol.md 7.1.1).
 - **Relay writes** are host-chosen and never protocol-visible: an append is
   acknowledged once durable in the host's durable buffer (group-committed
   local files for the reference relay, Durable Object storage for a DO host).

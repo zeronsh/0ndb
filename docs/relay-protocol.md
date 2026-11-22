@@ -415,12 +415,38 @@ durable with one commit (one fsync, one storage transaction). What a client
 may rely on is only the acknowledgement: everything acknowledged survives,
 and a feed entry is never durable while the bytes it announces are not.
 
+### 7.1.1 Early pushes
+
+A relay may push the bytes of an append to its followers before the append is
+durable (section 8.1). Only the bytes run ahead. Everything a reader treats as
+the relay's truth comes after the commit:
+- `Appended`;
+- feed entries;
+- `Created`;
+- the `Length` and `Probed` lengths;
+- the length word of every `Data`;
+- `Read` and `Tail` answers.
+
+So a follower may hold bytes past the relay's durable length. If the relay
+crashes or the commit fails, those bytes are not lost to the follower but are
+gone from the relay. They come back unchanged: a writer appends only bytes it
+holds durably, and the offsets of a segment are the writer's, so the
+unacknowledged append is resent with identical bytes at the same offsets.
+
+A follower must therefore:
+- accept bytes past the length word it was told;
+- trust them only after the same verification as any other bytes;
+- follow again, after a reconnect, from the end of what it holds, even past
+  the relay's length.
+
 ### 7.2 Ordering
 
 - Per segment, appends are applied strictly at `length`; one write per
   segment is in flight at a time (another write meanwhile is `Busy` or a
   `Conflict`). Acknowledgements for one segment arrive in order.
-- Bytes of a segment reach followers in offset order, only once durable.
+- Bytes of a segment reach followers in offset order, each byte once per
+  follow. They may arrive before they are durable (section 7.1.1), but the
+  length word of a `Data` never exceeds the durable length.
 - On one connection, replies that need no storage (`Conflict`, `Refused`,
   `Data` for reads, `Length`, `Probed`, `Listing`, `Object`/`Missing`,
   `Undelivered`, `Noted` for no-op notes) are sent in request order.
@@ -460,10 +486,18 @@ Created  := id | length u64        (to watchers)
    relay also appends the feed entry `(id, length)` again, so a client that
    lost track re-learns the length through the feed.
 4. `n == 0` and `at == length`: `Appended(id, length)` at once.
-5. Otherwise the bytes are written; once durable and logged in the feed:
-   `Appended(id, new length)` to the writer, `Data` to every follower, and
-   `Created(id, length)` to every watcher with `Read` access if the segment was
-   empty.
+5. Otherwise the bytes are written. Then:
+   - When the frame ends, the relay may push the bytes as `Data` to followers
+     whose offset is within `[at, at + n)`. Each such follower gets the
+     bytes from its offset, and its offset moves to `at + n`. The length word
+     is the durable length when the frame is sent, which may be below
+     `at + n`. A relay may skip any follower, for example when its queue is
+     long; that follower then gets the bytes after the commit.
+   - Once the bytes are durable and logged in the feed, the writer gets
+     `Appended(id, new length)`, and every watcher with `Read` access gets
+     `Created(id, length)` if the segment was empty. Each follower gets the
+     bytes it does not have yet as `Data`. A follower that already has them
+     gets one empty `Data` at the new length, whose length word announces it.
 
 The bulk content is always consumed, even when the request is refused; the
 reply follows the end of the frame.
@@ -496,10 +530,15 @@ Unfollow := count u16 | id*
 
 Per entry: `Read` access (else `Refused Not_Owner`), follow limit (16384 per
 connection, else `Refused Limit`), `Hollow` (or `Trimmed`) if based. `offset = 2^64 - 1`
-means "from the current end". Following an already-followed segment moves its
-offset. The relay then sends one `Length` for the accepted entries and pushes
-`Data` (without `FINAL`) from each offset as bytes become durable, round
-robin across segments in chunks of at most 4 MiB. With the watch flag the
+means "from the current end". An offset past the segment's length is accepted.
+It is a follower that holds bytes the relay lost (section 7.1.1); nothing is
+pushed until the length passes it. Following an already-followed segment moves
+its offset. The relay then sends one `Length` for the accepted entries and
+pushes `Data` (without `FINAL`) from each offset as bytes become durable,
+round robin across segments in chunks of at most 4 MiB. Bytes may also arrive
+ahead of the commit (section 8.1). Whenever the length passes the last length
+word sent on a follow without new bytes for that follower, the relay sends one
+empty `Data` at the length. With the watch flag the
 connection also receives `Created` for every new segment it can read.
 `Unfollow` stops pushes; it has no reply and leaves live interest (section
 8.16) alone. A count that does not match the payload is `Error Protocol`.
@@ -968,6 +1007,7 @@ storage completion as an input, which every sans-IO relay does.
 | append | ack only after durable; Conflict and feed re-announce; zero-length append; Not_Owner; Read, Tail, read past the end, missing segment; frames split across deliveries; two requests in one delivery |
 | quota | Refused Quota counting in-flight reservations; Put within and over quota; Account and Accounted; Account with a payload |
 | follow | Follow with watch, Length, live Data, Created, FOLLOW_END, Unfollow, reserved ids |
+| early | Data ahead of the commit with the durable length in the word; Probed and Read still durable; Appended, Announce and an empty Data after the commit; a follow past the length; a follow inside an in-flight append gets only the bytes past its offset |
 | feed | Feed from 0, live Announce, aligned and unaligned resume, past the end, exact filter, additive prefix filter |
 | list | Listing newest first, once per segment, from 0 and from a later position |
 | probe | Probed for a segment, an unknown id, a hollow segment (with Hollow) and the feed |
