@@ -318,6 +318,9 @@ relay_destroy :: proc(r: ^Relay) {
 	relay_core_close_all(&r.core)
 	if r.own_tier != nil {
 		tier_store_flush_all(r.own_tier)
+		if r.own_tier.cfg.objects.drain != nil {
+			r.own_tier.cfg.objects.drain(r.own_tier.cfg.objects.data)
+		}
 	}
 	if r.own_pack != nil {
 		pack.sync(r.own_pack)

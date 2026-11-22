@@ -392,16 +392,7 @@ _auth_persist :: proc(a: ^Member_Authorizer, s: ^Auth_Space, raw: []u8) -> Error
 	if err := prim.write_at(a.vfs, fd, hdr[:], size); err != .None {
 		return _from_prim(err)
 	}
-	if err := prim.write_at(a.vfs, fd, raw, size + 4); err != .None {
-		return _from_prim(err)
-	}
-	if err := prim.datasync(a.vfs, fd); err != .None {
-		return _from_prim(err)
-	}
-	if size == 0 {
-		return _from_prim(prim.sync_dir(a.vfs, a.dir))
-	}
-	return .None
+	return _from_prim(prim.write_at(a.vfs, fd, raw, size + 4))
 }
 
 @(private)
@@ -454,7 +445,7 @@ _auth_space :: proc(a: ^Member_Authorizer, space: Space_Id) -> ^Auth_Space {
 
 @(private)
 _auth_reconcile :: proc(a: ^Member_Authorizer, s: ^Auth_Space) {
-	if a.store.namespace_open == nil || a.store.stream_open == nil || a.store.stream_read == nil {
+	if a.store.namespace_open == nil || a.store.list_begin == nil || a.store.stream_open == nil || a.store.stream_read == nil {
 		return
 	}
 	ns, _, nerr := a.store.namespace_open(a.store.data, s.id)
@@ -462,54 +453,56 @@ _auth_reconcile :: proc(a: ^Member_Authorizer, s: ^Auth_Space) {
 		return
 	}
 	defer a.store.namespace_close(a.store.data, ns)
-	done := make(map[Device_Id]bool, context.temp_allocator)
+	it, _, lerr := a.store.list_begin(a.store.data, ns, 0)
+	if lerr != .None {
+		return
+	}
+	suffix := members_suffix(s.id)
+	ids := make([dynamic]Stream_Id, context.temp_allocator)
 	for {
-		pending := make([dynamic]Device_Id, context.temp_allocator)
-		for &m in s.m.roster.members {
-			if !done[m.device] {
-				append(&pending, m.device)
-			}
+		id, ok := a.store.list_next(a.store.data, it)
+		if !ok {
+			break
 		}
-		if len(pending) == 0 {
-			return
+		if stream_id_suffix(id) == suffix {
+			append(&ids, id)
 		}
-		fresh := false
-		for d in pending {
-			done[d] = true
-			st, length, serr := a.store.stream_open(a.store.data, ns, members_stream(s.id, d), false)
-			if serr != .None || st == nil {
-				continue
-			}
-			if length > 0 && length <= RELAY_OBSERVE_MAX * 16 {
-				buf := make([]u8, int(length), context.temp_allocator)
-				got := 0
-				for got < len(buf) {
-					n, rerr := a.store.stream_read(a.store.data, st, i64(got), buf[got:])
-					if rerr != .None || n <= 0 {
-						break
-					}
-					got += n
+	}
+	a.store.list_end(a.store.data, it)
+	fresh := false
+	for id in ids {
+		st, length, serr := a.store.stream_open(a.store.data, ns, id, false)
+		if serr != .None || st == nil {
+			continue
+		}
+		if length > 0 && length <= RELAY_OBSERVE_MAX * 16 {
+			buf := make([]u8, int(length), context.temp_allocator)
+			got := 0
+			for got < len(buf) {
+				n, rerr := a.store.stream_read(a.store.data, st, i64(got), buf[got:])
+				if rerr != .None || n <= 0 {
+					break
 				}
-				pos := 0
-				for pos + journal.OVERHEAD <= got {
-					n := int(prim.get_u32le(buf[pos:]))
-					if n < 0 || pos + journal.OVERHEAD + n > got {
-						break
-					}
-					body := buf[pos + journal.HEADER:][:n]
-					if len(body) > 0 && body[0] == MEMBER_RECORD {
-						if ok, _ := _auth_ingest(a, s, body); ok {
-							fresh = true
-						}
-					}
-					pos += journal.OVERHEAD + n
-				}
+				got += n
 			}
-			a.store.stream_close(a.store.data, st)
+			pos := 0
+			for pos + journal.OVERHEAD <= got {
+				n := int(prim.get_u32le(buf[pos:]))
+				if n < 0 || pos + journal.OVERHEAD + n > got {
+					break
+				}
+				body := buf[pos + journal.HEADER:][:n]
+				if len(body) > 0 && body[0] == MEMBER_RECORD {
+					if ok, _ := _auth_ingest(a, s, body); ok {
+						fresh = true
+					}
+				}
+				pos += journal.OVERHEAD + n
+			}
 		}
-		if !fresh {
-			return
-		}
+		a.store.stream_close(a.store.data, st)
+	}
+	if fresh {
 		_auth_settle(a, s)
 	}
 }

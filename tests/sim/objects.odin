@@ -14,6 +14,18 @@ Sim_Objects :: struct {
 	reads:   u64,
 	failed:  u64,
 	pending: int,
+	puts:    u64,
+	cut:     u64,
+	writing: int,
+}
+
+@(private = "file")
+Sim_Obj_Put :: struct {
+	so:   ^Sim_Objects,
+	done: osync.Storage_Done,
+	ctx:  rawptr,
+	err:  osync.Error,
+	n:    i64,
 }
 
 @(private = "file")
@@ -32,7 +44,33 @@ sim_objects :: proc(so: ^Sim_Objects) -> osync.Object_Store {
 @(private = "file")
 _so_put :: proc(data: rawptr, key: string, bytes: []u8, done: osync.Storage_Done, ctx: rawptr) {
 	so := (^Sim_Objects)(data)
-	so.inner.put(so.inner.data, key, bytes, done, ctx)
+	q := new(Sim_Obj_Put)
+	q^ = {so = so, done = done, ctx = ctx}
+	so.puts += 1
+	so.writing += 1
+	so.inner.put(so.inner.data, key, bytes, proc(ctx: rawptr, err: osync.Error, n: i64) {
+		q := (^Sim_Obj_Put)(ctx)
+		q.err, q.n = err, n
+		if q.so.inline {
+			_so_put_finish(q)
+			return
+		}
+		prim.timer(q.so.loop, rng_range(&q.so.rng, 0, q.so.slow_ms), q, proc(l: ^prim.Loop, data: rawptr) {
+			_so_put_finish((^Sim_Obj_Put)(data))
+		})
+	}, q)
+}
+
+@(private = "file")
+_so_put_finish :: proc(q: ^Sim_Obj_Put) {
+	q.so.writing -= 1
+	done, ctx, err, n := q.done, q.ctx, q.err, q.n
+	free(q)
+	done(ctx, err, n)
+}
+
+sim_objects_cut :: proc(so: ^Sim_Objects) {
+	so.cut += u64(max(so.writing, 0))
 }
 
 @(private = "file")

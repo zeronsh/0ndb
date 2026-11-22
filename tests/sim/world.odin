@@ -131,6 +131,8 @@ World_Stats :: struct {
 	tier_thaws:   u64,
 	tier_slow_reads: u64,
 	tier_failed_reads: u64,
+	tier_puts:         u64,
+	tier_puts_cut:     u64,
 	resets:       u64,
 	partitions:   u64,
 	jumps:        u64,

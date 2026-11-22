@@ -11,6 +11,7 @@ Object_Store :: struct {
 	put:    proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx: rawptr),
 	read:   proc(data: rawptr, req: ^Object_Read),
 	cancel: proc(data: rawptr, req: ^Object_Read),
+	drain:  proc(data: rawptr),
 }
 
 Tier_Config :: struct {
@@ -1570,60 +1571,3 @@ _tier_objects :: proc(data: rawptr, ns: rawptr, out: ^[dynamic]Object_Key) -> Er
 	t := cast(^Tier_Store)data
 	return t.inner.objects(t.inner.data, (cast(^Tier_Space)ns).ns, out)
 }
-
-Dir_Object_Store :: struct {
-	vfs:   prim.Vfs,
-	root:  string,
-	puts:  u64,
-	bytes: u64,
-	gets:      u64,
-	get_bytes: u64,
-}
-
-dir_object_store :: proc(d: ^Dir_Object_Store) -> Object_Store {
-	return Object_Store{data = d, put = _dir_put, read = _dir_read}
-}
-
-@(private)
-_dir_read :: proc(data: rawptr, req: ^Object_Read) {
-	d := cast(^Dir_Object_Store)data
-	path, _ := prim.path_join(context.temp_allocator, d.root, req.key)
-	fd, oerr := prim.open_file(d.vfs, path)
-	if oerr != .None {
-		object_read_done(req, _from_prim(oerr), nil)
-		return
-	}
-	defer prim.close_file(d.vfs, fd)
-	n := req.n
-	if n < 0 {
-		size, serr := prim.file_size(d.vfs, fd)
-		if serr != .None {
-			object_read_done(req, _from_prim(serr), nil)
-			return
-		}
-		n = max(size - req.off, 0)
-	}
-	buf := make([]u8, int(n), context.temp_allocator)
-	got, rerr := prim.read_at(d.vfs, fd, buf, req.off)
-	d.gets += 1
-	d.get_bytes += u64(max(got, 0))
-	object_read_done(req, _from_prim(rerr), buf[:max(got, 0)])
-}
-
-@(private)
-_dir_put :: proc(data: rawptr, key: string, bytes: []u8, done: Storage_Done, ctx: rawptr) {
-	d := cast(^Dir_Object_Store)data
-	path, _ := prim.path_join(context.temp_allocator, d.root, key)
-	if err := prim.mkdir_all(d.vfs, prim.dir_name(path), 0o700); err != .None {
-		done(ctx, _from_prim(err), 0)
-		return
-	}
-	if err := prim.replace_atomic(d.vfs, path, bytes); err != .None {
-		done(ctx, _from_prim(err), 0)
-		return
-	}
-	d.puts += 1
-	d.bytes += u64(len(bytes))
-	done(ctx, .None, i64(len(bytes)))
-}
-
