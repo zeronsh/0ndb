@@ -24,10 +24,16 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		_evaluate_sender(r, o)
 		return
 	}
-	c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator)
+	cready := _wait_ready(r, o)
+	c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator, cready)
+	if cerr == .Pending {
+		return
+	}
+	_wait_drop(r, cready)
 	if cerr != .None || !found || c.kind != .Conversation {
 		return
 	}
+	_catchup_note(r, o)
 	v, verr := eng.convo_view(r.e, o)
 	if verr != .None {
 		return
@@ -41,6 +47,10 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	if _follow_stale(r, o, v, &c) {
+		return
+	}
+	if r.quiesce.on && run_find(r, o) == nil {
+		_quiesce_hold(r, o)
 		return
 	}
 	if _revive_pending(r, o, v) {
@@ -72,6 +82,15 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	busy := t.running && _running_live(r, o, v, &t)
 	waiting_msg: Rid
 	defer _claim_prune(r, o, waiting_msg)
+	if !busy && !cancelled && !obj.rid_none(head) {
+		if hm, herr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator); herr == .None && (hm.role == .User || hm.role == .System) && !hm.open && hm.status == .Done {
+			waiting_msg = head
+			if _placed_here(r, o, v, &t, &hm) {
+				start_run(r, o, head)
+			}
+			return
+		}
+	}
 	for &it in items {
 		#partial switch it.kind {
 		case .Queue, .Steer:
@@ -1233,7 +1252,7 @@ _recover :: proc(r: ^Runtime, space: prim.Id) {
 		}
 		convo.writer_interrupt_open(w, now)
 		eng.touched(r.e, ent.object)
-		if _replicated(r, ent.object.space) && _follow_start(r, ent.object) {
+		if r.quiesce.on || (_replicated(r, ent.object.space) && _follow_start(r, ent.object)) {
 			append(&r.revives, Revive_Wait{object = ent.object})
 			continue
 		}
@@ -1582,6 +1601,32 @@ _activity_author :: proc(r: ^Runtime, o: Object) -> prim.Id {
 	return {}
 }
 
+
+@(private)
+_catchup_note :: proc(r: ^Runtime, o: Object) {
+	info, err := eng.space_info(r.e, o.space)
+	if err != .None || info.connected || len(info.relay) == 0 {
+		return
+	}
+	for x in r.catchups {
+		if x == o {
+			return
+		}
+	}
+	append(&r.catchups, o)
+}
+
+@(private)
+_catchup_run :: proc(r: ^Runtime, space: prim.Id) {
+	for i := 0; i < len(r.catchups); {
+		if r.catchups[i].space == space {
+			_queue_eval(r, r.catchups[i])
+			unordered_remove(&r.catchups, i)
+			continue
+		}
+		i += 1
+	}
+}
 
 @(private)
 _replicated :: proc(r: ^Runtime, space: prim.Id) -> bool {

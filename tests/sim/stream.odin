@@ -22,6 +22,7 @@ M_Stream :: struct {
 	sealed:  bool,
 	failed:  bool,
 	written: int,
+	reseal:  bool,
 }
 
 Watch :: struct {
@@ -171,35 +172,50 @@ stream_step :: proc(w: ^World, si: int) {
 stream_after_restart :: proc(w: ^World, n: ^Node) {
 	m := &w.model
 	for st in w.streams {
-		if st.node != n.idx || st.done || st.inc >= n.incarnation {
+		if st.node != n.idx || st.inc >= n.incarnation {
 			continue
 		}
-		st.done = true
-		st.crashed = true
+		first := false
+		if !st.done {
+			st.done = true
+			st.crashed = true
+			first = true
+		} else if !st.crashed && !st.reseal {
+			if !st.sealed || m.ops[st.op].status == .Lost {
+				continue
+			}
+			st.reseal = true
+			first = true
+		}
+		if !st.crashed && !st.reseal {
+			continue
+		}
 		if !n.alive {
 			return
 		}
 		if m.ops[st.op].status == .Lost {
-			world_note(w, "%s stream %s lost in the crash: its message never became durable", n.name, m.ops[st.op].token)
+			if first {
+				world_note(w, "%s stream %s lost in the crash: its message never became durable", n.name, m.ops[st.op].token)
+			}
 			continue
 		}
-		o := m.objs[st.obj].o
 		context = instance_context(&n.inst)
-		wr, err := eng.convo_writer(&n.e, o)
+		wr, err := eng.convo_writer(&n.e, m.objs[st.obj].o)
 		if err != .None {
 			world_note(w, "%s stream %s recovery: writer %v", n.name, m.ops[st.op].token, err)
 			node_after(n)
 			continue
 		}
 		count, ierr := convo.writer_interrupt_open(wr, i64(1) << 62)
-		decline := rng_chance(&st.rng, 1, 2)
-		if decline {
+		if st.reseal || rng_chance(&st.rng, 1, 2) {
 			list, k := convo.writer_revivable(wr)
 			for r in list[:k] {
 				convo.writer_decline(wr, r)
 			}
 		}
-		world_note(w, "%s stream %s interrupted after crash: %d open, %v, declined=%v", n.name, m.ops[st.op].token, count, ierr, decline)
+		if first || count > 0 {
+			world_note(w, "%s stream %s interrupted after %s: %d open, %v", n.name, m.ops[st.op].token, "a crash" if first else "another crash", count, ierr)
+		}
 		node_after(n)
 	}
 	for x in w.watches {
@@ -343,6 +359,9 @@ check_streams :: proc(w: ^World) {
 		}
 		context = instance_context(&n.inst)
 		msg, merr := eng.convo_message(&n.e, m.objs[st.obj].o, convo.Position{msg = st.msg}, context.temp_allocator, ready)
+		if merr == .None && st.reseal && msg.status == .Interrupted {
+			st.crashed = true
+		}
 		if merr != .None {
 			if !st.crashed {
 				world_fail(w, "stream: %s lost stream %s (%v) without a crash", n.name, op.token, merr)

@@ -481,12 +481,14 @@ writer_edit_queued :: proc(w: ^Writer, item: Rid, text: string, attachments: []A
 	_check_atts(attachments) or_return
 	_prepare(w, false) or_return
 	r := _local_rid(w, item) or_return
+	_observe_item(w, item) or_return
 	return _event(w, Edit_Queued{item = r, text = text, attachments = attachments})
 }
 
 writer_cancel :: proc(w: ^Writer, item: Rid) -> (off: i64, err: Error) {
 	_prepare(w, false) or_return
 	r := _local_rid(w, item) or_return
+	_observe_item(w, item) or_return
 	sum := w.sum
 	for p, i in summary_pending(&sum) {
 		if p.item == r {
@@ -510,6 +512,7 @@ writer_unqueue :: proc(w: ^Writer, item: Rid, outcome: Outcome, msg: Rid = {}) -
 	_prepare(w, false) or_return
 	r := _local_rid(w, item) or_return
 	mr := _local_rid(w, msg) or_return
+	_observe_item(w, item) or_return
 	sum := w.sum
 	for p, i in summary_pending(&sum) {
 		if p.item == r {
@@ -1123,6 +1126,16 @@ _check_atts :: proc(attachments: []Attachment) -> Error {
 		if len(a.oid) != 0 && len(a.oid) != 20 && len(a.oid) != 32 {
 			return .Invalid
 		}
+	}
+	return .None
+}
+
+@(private)
+_observe_item :: proc(w: ^Writer, item: Rid) -> Error {
+	x := obj.vref(w.core.v, item) or_return
+	env, red := obj.envelope(w.core.v, x.seg, x.off) or_return
+	if !red {
+		obj.observe(&w.core, env.links.stamp)
 	}
 	return .None
 }
