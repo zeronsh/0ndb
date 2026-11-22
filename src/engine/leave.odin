@@ -1,5 +1,6 @@
 package engine
 
+import "core:crypto"
 import omap "../map"
 import "../journal"
 import "../prim"
@@ -296,6 +297,11 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 			delete(v, e.allocator)
 			delete_key(&e.reg.staged, oid)
 		}
+		if v, ok := e.reg.kstaged[oid]; ok {
+			crypto.zero_explicit(raw_data(v), len(v))
+			delete(v, e.allocator)
+			delete_key(&e.reg.kstaged, oid)
+		}
 	}
 	if v, ok := e.reg.sstaged[id]; ok {
 		delete(v, e.allocator)
@@ -367,6 +373,10 @@ _registry_drop_space :: proc(e: ^Engine, space: prim.Id, objs: map[prim.Id]bool)
 	for oid in objs {
 		k := oid
 		if _, derr := omap.txn_delete(t, ROOT_OBJECTS, k[:]); derr != .None {
+			ok = false
+		}
+		kk := _keys_key(oid)
+		if _, derr := omap.txn_delete(t, ROOT_OBJECTS, kk[:]); derr != .None {
 			ok = false
 		}
 	}
