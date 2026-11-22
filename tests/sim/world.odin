@@ -158,6 +158,8 @@ World_Stats :: struct {
 	draft_frames:   u64,
 	fresh_polls:    u64,
 	fresh_probed:   u64,
+	git_checkouts:  u64,
+	git_refused:    u64,
 	remote_draft_bytes: u64,
 }
 
@@ -200,6 +202,8 @@ World :: struct {
 	rng:       Rng,
 	net_rng:   Rng,
 	fault_rng: Rng,
+	git_rng:   Rng,
+	git_branches: int,
 	sched_rng: Rng,
 	op_index:  int,
 	probe_crash: int,
@@ -398,6 +402,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	rng_init(&w.net_rng, cfg.seed, 2)
 	rng_init(&w.fault_rng, cfg.seed, 3)
 	rng_init(&w.sched_rng, cfg.seed, 4)
+	rng_init(&w.git_rng, cfg.seed, 6)
 	model_init(&w.model, w)
 	remote_init(w)
 	w.relay.w = w

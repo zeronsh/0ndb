@@ -888,6 +888,7 @@ print_stats :: proc(r: ^Run_Result) {
 	fmt.eprintf("sim: buffers_opened=%d bursts=%d anchors_checked=%d\n", r.stats.buffers, r.stats.bursts, r.stats.anchors_checked)
 	fmt.eprintf("sim: relay_evictions=%d relay_cold_reads=%d relay_thaws=%d\n", r.stats.tier_evictions, r.stats.tier_cold_reads, r.stats.tier_thaws)
 	fmt.eprintf("sim: fresh_polls=%d fresh_probed=%d\n", r.stats.fresh_polls, r.stats.fresh_probed)
+	fmt.eprintf("sim: git_checkouts=%d git_refused=%d\n", r.stats.git_checkouts, r.stats.git_refused)
 	fmt.eprintf("sim: streamed=%d draft_frames=%d draft_deltas=%d draft_delta_bytes=%d remote_draft_bytes=%d segment_delta_bytes=%d draft_blocks_checked=%d\n", r.stats.stream_bytes, r.stats.draft_frames, r.stats.draft_deltas, r.stats.draft_delta_bytes, r.stats.remote_draft_bytes, r.stats.seg_delta_bytes, r.stats.draft_checked)
 }
 

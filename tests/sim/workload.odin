@@ -206,6 +206,9 @@ parse_tokens :: proc(data: []u8, allocator := context.temp_allocator) -> []Tok {
 }
 
 workload_step :: proc(w: ^World) {
+	if env_u64("SIM_GIT_SWITCH", 1) != 0 && rng_chance(&w.git_rng, 1, 40) {
+		op_git_switch(w)
+	}
 	alive := make([dynamic]^Node, context.temp_allocator)
 	for n in w.nodes {
 		if n.alive {
@@ -860,6 +863,8 @@ deliver_shares :: proc(w: ^World) {
 				append(&m.objs[ps.obj].shared, n.idx)
 				append(&m.accepted, ps)
 			}
+		} else if w.cfg.io_rate > 0 && (err == .Io || err == .No_Space) {
+			n.restart_pending = true
 		} else if n.alive {
 			world_fail(w, "%s accept_share failed: %v", n.name, err)
 		}
