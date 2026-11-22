@@ -191,7 +191,12 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	for &it in items {
 		materialize_one(m, &it, tl[:]) or_return
 	}
-	mat_barrier(m, &ms) or_return
+	mat_pay_owed(m, &ms) or_return
+	if berr := mat_barrier(m, &ms); berr != .None {
+		mat_owe(m, &ms)
+		return berr
+	}
+	mat_owed_clear(m)
 	if !m.restoring {
 		clear(&m.synced)
 		append(&m.synced, ..target)
@@ -204,6 +209,110 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 Mat_Sync :: struct {
 	files: [dynamic]string,
 	dirs:  map[string]bool,
+}
+
+@(private)
+mat_owe :: proc(m: ^Mount, ms: ^Mat_Sync) {
+	have := make(map[string]bool, context.temp_allocator)
+	for f in m.owed.files {
+		have[f] = true
+	}
+	for f in ms.files {
+		if !have[f] {
+			have[f] = true
+			append(&m.owed.files, clone_string(f, m.allocator) or_else "")
+		}
+	}
+	if m.owed.dirs == nil {
+		m.owed.dirs = make(map[string]bool, m.allocator)
+	}
+	for d in ms.dirs {
+		if d not_in m.owed.dirs {
+			m.owed.dirs[clone_string(d, m.allocator) or_else ""] = true
+		}
+	}
+	m.shadow.owed = true
+}
+
+@(private)
+mat_owed_clear :: proc(m: ^Mount) {
+	for f in m.owed.files {
+		delete(f, m.allocator)
+	}
+	clear(&m.owed.files)
+	for d in m.owed.dirs {
+		delete(d, m.allocator)
+	}
+	clear(&m.owed.dirs)
+	m.shadow.owed = false
+}
+
+@(private)
+mat_settle_owed :: proc(m: ^Mount) -> Error {
+	if len(m.owed.files) == 0 && len(m.owed.dirs) == 0 {
+		return .None
+	}
+	ms := Mat_Sync {
+		files = make([dynamic]string, context.temp_allocator),
+		dirs  = make(map[string]bool, context.temp_allocator),
+	}
+	mat_pay_owed(m, &ms) or_return
+	if berr := mat_barrier(m, &ms); berr != .None {
+		mat_owe(m, &ms)
+		return berr
+	}
+	mat_owed_clear(m)
+	return .None
+}
+
+@(private)
+mat_pay_owed :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
+	for f in m.owed.files {
+		mat_rewrite(m, f, ms) or_return
+	}
+	for d in m.owed.dirs {
+		ms.dirs[clone_string(d, context.temp_allocator) or_else ""] = true
+	}
+	return .None
+}
+
+@(private)
+mat_rewrite :: proc(m: ^Mount, abs: string, ms: ^Mat_Sync) -> Error {
+	if len(abs) <= len(m.root) + 1 || !strings.has_prefix(abs, m.root) {
+		return .None
+	}
+	rel := abs[len(m.root) + 1:]
+	e, known := shadow_get(&m.shadow, rel) or_return
+	if !known || e.kind != .File {
+		return .None
+	}
+	d := probe(m, rel) or_return
+	if d.kind != .File || d.stat != e.stat {
+		return .None
+	}
+	data, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+	if rerr == .Not_Found {
+		return .None
+	}
+	from_prim(rerr) or_return
+	mode := d.stat.mode & 0o7777
+	tmp := temp_name(m, abs, context.temp_allocator)
+	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
+	from_prim(oerr) or_return
+	werr := prim.write_at(m.vfs, fd, data, 0)
+	prim.fchmod(m.vfs, fd, mode)
+	prim.close_file(m.vfs, fd)
+	if werr != .None {
+		prim.remove(m.vfs, tmp)
+		return from_prim(werr)
+	}
+	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
+	nd := probe(m, rel) or_return
+	e.stat = nd.stat
+	shadow_put(&m.shadow, rel, e) or_return
+	append(&ms.files, clone_string(abs, context.temp_allocator) or_else "")
+	ms.dirs[clone_string(path_parent_abs(abs), context.temp_allocator) or_else ""] = true
+	return .None
 }
 
 @(private)
