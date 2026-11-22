@@ -141,6 +141,7 @@ Hooks :: struct {
 	event:     proc(data: rawptr, r: ^Runtime, name: string, o: Object),
 	placement: proc(data: rawptr, r: ^Runtime, o: Object, info: Placement_Info),
 	runners:   proc(data: rawptr, r: ^Runtime, space: prim.Id),
+	observed:  proc(data: rawptr, r: ^Runtime, o: Object),
 }
 
 Config :: struct {
@@ -755,6 +756,9 @@ _on_tick_hook :: proc(data: rawptr, e: ^eng.Engine) {
 	for o in list {
 		r.stats.evaluations += 1
 		evaluate(r, o)
+		if r.cfg.hooks.observed != nil {
+			r.cfg.hooks.observed(r.cfg.hooks.data, r, o)
+		}
 	}
 }
 

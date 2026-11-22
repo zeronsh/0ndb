@@ -24,6 +24,7 @@ Sub :: struct {
 	ready:  Sub_Ready,
 	runners: bool,
 	space:  prim.Id,
+	placed: bool,
 }
 
 subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, data: rawptr, payload: Sub_Proc = nil) -> (id: u64, catalog: bool, object: Object, status: Status) {
@@ -120,7 +121,72 @@ _subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_S
 	a.next_sub += 1
 	s.id = a.next_sub
 	append(&a.subs, s)
+	if !catalog && eng.Kind(a_u64(&c, "kind")) == .Conversation {
+		s.placed = true
+		placement_watch(a, s.object)
+	}
 	return s.id, .Ok, nil
+}
+
+placement_watch :: proc(a: ^Api, o: Object) {
+	if a.r == nil || prim.id_is_zero(o.id) {
+		return
+	}
+	if p, ok := &a.placed[o]; ok {
+		p.refs += 1
+		return
+	}
+	info, _ := rt.placement_status(a.r, o)
+	info.provider = ""
+	a.placed[o] = Placed{info = info, refs = 1}
+}
+
+placement_unwatch :: proc(a: ^Api, o: Object) {
+	p, ok := &a.placed[o]
+	if !ok {
+		return
+	}
+	p.refs -= 1
+	if p.refs <= 0 {
+		delete_key(&a.placed, o)
+	}
+}
+
+placement_changed :: proc(a: ^Api, o: Object) -> (info: rt.Placement_Info, changed: bool) {
+	p, ok := &a.placed[o]
+	if !ok || a.r == nil {
+		return
+	}
+	cur, err := rt.placement_status(a.r, o)
+	if err != .None {
+		return
+	}
+	if placement_same(cur, p.info) {
+		return
+	}
+	p.info = cur
+	p.info.provider = ""
+	return cur, true
+}
+
+placement_same :: proc(x, y: rt.Placement_Info) -> bool {
+	if x.state != y.state || x.runner != y.runner || x.last_runner != y.last_runner {
+		return false
+	}
+	return x.state == .Idle || x.msg == y.msg
+}
+
+placement_note :: proc(a: ^Api, o: Object, info: rt.Placement_Info) -> (changed: bool) {
+	p, ok := &a.placed[o]
+	if !ok {
+		return true
+	}
+	if placement_same(info, p.info) {
+		return false
+	}
+	p.info = info
+	p.info.provider = ""
+	return true
 }
 
 @(private)
@@ -146,6 +212,10 @@ _subscribe_runners :: proc(a: ^Api, c: ^Call, json_form: bool, cb: Sub_Proc, dat
 	a.next_sub += 1
 	s.id = a.next_sub
 	append(&a.subs, s)
+	if !prim.id_is_zero(ob.id) {
+		s.placed = true
+		placement_watch(a, ob)
+	}
 	return s.id, .Ok
 }
 
@@ -178,6 +248,9 @@ unsubscribe :: proc(a: ^Api, id: u64) {
 	for s, i in a.subs {
 		if s.id == id {
 			ordered_remove(&a.subs, i)
+			if s.placed {
+				placement_unwatch(a, s.object)
+			}
 			if s.buffer != 0 {
 				eng.buffer_close(a.e, s.buffer)
 			} else if s.engine != 0 {
