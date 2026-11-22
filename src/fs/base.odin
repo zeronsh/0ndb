@@ -93,18 +93,47 @@ _file_entry :: proc(m: ^Mount, rel: string) -> (e: Entry, ok: bool) {
 	return got, true
 }
 
+@(private)
+_file_inode :: proc(m: ^Mount, rel: string) -> (inode: fstree.Inode_Id, ok: bool) {
+	if e, found := _file_entry(m, rel); found {
+		return e.inode, true
+	}
+	h := m.history
+	if h == nil {
+		return
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &lvs) != .None {
+		return
+	}
+	snap, serr := version_snapshot(h, lvs[:])
+	if serr != .None {
+		return
+	}
+	defer fstree.snapshot_destroy(&snap)
+	id, found, lerr := fstree.lookup(&snap, rel)
+	if lerr != nil || !found {
+		return
+	}
+	info, iok, ierr := fstree.info(&snap, id, context.temp_allocator)
+	if ierr != nil || !iok || !info.present || info.kind != .File {
+		return
+	}
+	return id, true
+}
+
 scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 	m := s.mount
 	if m == nil || m.history == nil || path_internal(rel) {
 		return .None
 	}
-	e, ok := _file_entry(m, rel)
+	inode, ok := _file_inode(m, rel)
 	if !ok {
 		_pin_drop(s, rel)
 		return .None
 	}
-	clean, cok := eol_clean(m, rel, data, e.inode, true)
-	cur, terr := history_text_at(m.history, e.inode, m.synced[:], context.temp_allocator)
+	clean, cok := eol_clean(m, rel, data, inode, true)
+	cur, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
 	if !cok || terr != .None || string(cur) != string(clean) {
 		if p := _pin(s, rel, false); p != nil {
 			p.has_read = false
@@ -112,7 +141,7 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 		return .None
 	}
 	hash := _content_hash(clean)
-	observe_record(m, s, .Read, e.inode, rel, m.synced[:], hash) or_return
+	observe_record(m, s, .Read, inode, rel, m.synced[:], hash) or_return
 	p := _pin(s, rel, true)
 	clear(&p.read)
 	append(&p.read, ..m.synced[:])
@@ -185,12 +214,12 @@ scope_write_begin :: proc(s: ^Scope, rel: string) {
 		p.has_write = false
 		p.has_base = false
 	}
-	e, ok := _file_entry(m, rel)
+	inode, ok := _file_inode(m, rel)
 	if !ok {
 		return
 	}
-	cur, terr := history_text_at(m.history, e.inode, m.synced[:], context.temp_allocator)
-	if terr != .None || observe_record(m, s, .Write_Begin, e.inode, rel, m.synced[:], _content_hash(cur)) != .None {
+	cur, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
+	if terr != .None || observe_record(m, s, .Write_Begin, inode, rel, m.synced[:], _content_hash(cur)) != .None {
 		return
 	}
 	p := _pin(s, rel, true)
@@ -208,11 +237,7 @@ scope_write_base :: proc(s: ^Scope, rel: string, data: []u8) {
 	if p == nil || !p.has_write {
 		return
 	}
-	inode: fstree.Inode_Id
-	e, ok := _file_entry(m, rel)
-	if ok {
-		inode = e.inode
-	}
+	inode, ok := _file_inode(m, rel)
 	clean, cok := eol_clean(m, rel, data, inode, ok)
 	if !cok {
 		return
@@ -324,15 +349,41 @@ _base_version :: proc(m: ^Mount, c: ^Change) -> (v: []crdt.Op_Id, pinned: bool) 
 	defer _pin_drop(s, c.path)
 	if p.has_write && p.has_base {
 		if t, err := history_text_at(h, c.old.inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
-			return slice.clone(p.write[:], context.temp_allocator), true
+			return _base_parents(m, s.actor, c.old.inode, p.write[:], p.base_hash), true
 		}
 	}
 	if p.has_read {
 		if t, err := history_text_at(h, c.old.inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
-			return slice.clone(p.read[:], context.temp_allocator), true
+			return _base_parents(m, s.actor, c.old.inode, p.read[:], p.read_hash), true
 		}
 	}
 	return nil, p.has_read || p.has_base
+}
+
+@(private)
+_base_parents :: proc(m: ^Mount, actor: prim.Id, inode: fstree.Inode_Id, v: []crdt.Op_Id, hash: [32]u8) -> []crdt.Op_Id {
+	h := m.history
+	known := crdt.graph_known(&h.g, actor)
+	if known == 0 {
+		return slice.clone(v, context.temp_allocator)
+	}
+	own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+	vl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if !ok || crdt.graph_version_lvs(&h.g, v, &vl) != .None {
+		return nil
+	}
+	if crdt.graph_contains(&h.g, vl[:], own) {
+		return slice.clone(v, context.temp_allocator)
+	}
+	one := [1]crdt.Lv{own}
+	both := make([dynamic]crdt.Lv, context.temp_allocator)
+	crdt.version_union(&h.g, vl[:], one[:], &both)
+	ids := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
+	t, err := history_text_at(h, inode, ids, context.temp_allocator)
+	if err != .None || _content_hash(t) != hash {
+		return nil
+	}
+	return ids
 }
 
 @(private)
@@ -345,6 +396,10 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 	keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
 	for &c in p.changes {
 		if c.scope == nil || c.kind != .Modify || c.disk != .File || c.moved != "" || c.old.kind != .File {
+			if c.scope != nil && scope_pinned(c.scope, c.path) {
+				_pin_drop(c.scope, c.path)
+				_base_note(m, c.path, .Mismatch)
+			}
 			append(&keep, c)
 			continue
 		}
@@ -368,7 +423,12 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
-		done := rebase_commit(p, &c, v) or_return
+		done, rerr := rebase_commit(p, &c, v)
+		if rerr != .None {
+			_base_note(m, c.path, .Mismatch)
+			append(&keep, c)
+			continue
+		}
 		if !done {
 			_base_note(m, c.path, .Not_Text)
 			append(&keep, c)
@@ -464,8 +524,8 @@ hold_target :: proc(m: ^Mount, tl: []crdt.Lv, sl: []crdt.Lv) -> (out: []crdt.Lv,
 	h := m.history
 	held := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	for x in m.holds {
-		if e, ok := _file_entry(m, x.path); ok {
-			held[e.inode] = true
+		if ino, ok := _file_inode(m, x.path); ok {
+			held[ino] = true
 		}
 	}
 	if len(held) == 0 {
