@@ -187,6 +187,17 @@ _byzantine :: proc(c: ^Conn, bytes: []u8) {
 		pos += 5 + n
 		active := w.phase == .Workload && kind != 0x81
 		r := &w.net_rng
+		if active && (kind == 0x83 || kind == 0x84) && n == 40 && rng_chance(r, 1, 8) {
+			w.stats.tampered += 1
+			t := make([]u8, len(frame), context.temp_allocator)
+			copy(t, frame)
+			claimed := prim.get_u64le(t[37:]) + 1 + u64(rng_int(r, 4096))
+			prim.put_u64le(t[37:], claimed)
+			stat_add(w, STAT_LENGTH_LIES)
+			world_note(w, "byzantine relay claims length %d in a %x frame to %s", claimed, kind, c.node.name)
+			append(&out, ..t)
+			continue
+		}
 		if active && rng_chance(r, 1, 25) {
 			act := rng_int(r, 4)
 			w.stats.tampered += 1

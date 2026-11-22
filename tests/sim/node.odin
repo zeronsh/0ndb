@@ -427,6 +427,9 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		if w.cfg.byzantine {
 			w.stats.detected += 1
 		}
+		if ev.device == n.identity.id {
+			stat_add(w, STAT_OWN_TAMPER)
+		}
 		world_note(w, "%s caught the relay misbehaving on %s device %s: %v", n.name, id_short(ev.object), id_short(ev.device), ev.err)
 	case .Connected:
 		n.connects += 1
@@ -704,6 +707,9 @@ STAT_TIER_THAWS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
 
+STAT_OWN_TAMPER: Stat
+STAT_LENGTH_LIES: Stat
+
 @(init)
 _node_stats :: proc "contextless" () {
 	register_restarted(10, proc(w: ^World, n: ^Node) {
@@ -722,4 +728,7 @@ _node_stats :: proc "contextless" () {
 	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
 	STAT_TIER_SLOW_READS = register_stat(40, 3, "object_reads")
 	STAT_TIER_FAILED_READS = register_stat(40, 4, "object_read_faults")
+	register_stat_line(45)
+	STAT_OWN_TAMPER = register_stat(45, 0, "own_tamper_caught")
+	STAT_LENGTH_LIES = register_stat(45, 1, "length_lies")
 }
