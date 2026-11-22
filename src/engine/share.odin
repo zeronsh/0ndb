@@ -113,6 +113,7 @@ accept_share :: proc(e: ^Engine, share: Share) -> Error {
 	_oerr(omap.txn_commit(t)) or_return
 	_share_epochs_store(e, sp, &s) or_return
 	_space_unrefuse(e, sp)
+	reauth := sp.keyless && sp.open && sp.repl_on && len(sp.grants) > 0 && !(s.object in sp.grants)
 	if sp.open {
 		sp.grants[s.object] = key
 		sp.grant_access[s.object] = s.access
@@ -130,7 +131,11 @@ accept_share :: proc(e: ^Engine, share: Share) -> Error {
 		_card_store(e, sp, s.cards[i][:])
 	}
 	_rec_put(e, s.object, &rec) or_return
-	if sp.open {
+	if reauth {
+		_space_unload(e, sp)
+		_, oerr := _space_open(e, s.space)
+		return oerr
+	} else if sp.open {
 		_shared_follow(e, sp, s.object, s.kind)
 		_grantkeys_follow(e, sp, s.object)
 	}

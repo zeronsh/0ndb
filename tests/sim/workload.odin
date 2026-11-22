@@ -784,7 +784,7 @@ _op_share :: proc(w: ^World, n: ^Node) {
 	}
 	cands := make([dynamic]int, context.temp_allocator)
 	for x in w.nodes {
-		if !space_member(&m.spaces[si], x.idx) && !obj_reader(m, oi, x.idx) && x.identity.id != {} && !_has_grant(m, x.idx, ob.o.space) {
+		if !space_member(&m.spaces[si], x.idx) && !obj_reader(m, oi, x.idx) && x.identity.id != {} && !_has_grant(m, x.idx, oi) {
 			append(&cands, x.idx)
 		}
 	}
@@ -866,9 +866,9 @@ deliver_shares :: proc(w: ^World) {
 	}
 }
 
-_has_grant :: proc(m: ^Model, idx: int, space: prim.Id) -> bool {
+_has_grant :: proc(m: ^Model, idx: int, obj: int) -> bool {
 	for g in m.grants {
-		if g.to == idx && g.share.space == space {
+		if g.to == idx && g.obj == obj {
 			return true
 		}
 	}
@@ -878,18 +878,24 @@ _has_grant :: proc(m: ^Model, idx: int, space: prim.Id) -> bool {
 node_credentials :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool) {
 	n := (^Node)(data)
 	m := &n.w.model
+	slot := space_index(m, space)
+	if slot < 0 || slot >= len(n.caps) {
+		return {}, false
+	}
+	buf: [eng.CAP_MULTI_MAX * eng.CAPABILITY_LEN]u8
+	count := 0
 	for &g in m.grants {
-		if g.to != n.idx || g.share.space != space {
+		if g.to != n.idx || g.share.space != space || count >= eng.CAP_MULTI_MAX {
 			continue
 		}
-		slot := space_index(m, space)
-		if slot < 0 || slot >= len(n.caps) {
-			return {}, false
-		}
-		c, err := eng.capability_credentials(&n.caps[slot], osync.file_keyring(&n.keyring), g.token[:])
-		return c, err == .None
+		copy(buf[count * eng.CAPABILITY_LEN:], g.token[:])
+		count += 1
 	}
-	return {}, false
+	if count == 0 {
+		return {}, false
+	}
+	c, err := eng.capability_credentials(&n.caps[slot], osync.file_keyring(&n.keyring), buf[:count * eng.CAPABILITY_LEN])
+	return c, err == .None
 }
 
 BULK_WORDS :: [?]string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango"}

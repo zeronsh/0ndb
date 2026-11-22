@@ -1132,7 +1132,9 @@ Ops: `Genesis` (founder's `Add` body, no parents, space field is a nonce),
 `Add{sign, box, kind, role, method, person, expires, lease_ms, history,
 scope[], label, attestation, seal}`, `Remove{subject}`, `Commit` (below),
 `Update{box}` (own leaf key rotation), `Renew{expires}` (runner lease),
-`Seal{subject, epoch, wrap}` (epoch keys for a non-leaf runner), `Revoke{grant}`.
+`Seal{subject, epoch, wrap}` (epoch keys for a non-leaf runner), `Revoke{grant}`,
+`Scope{subject, add, object}` (add an object to, or remove one from, a guest's
+scope; authorized like adding, respectively removing, that guest).
 Kinds: device, account, recovery, custodian, pool, runner, guest, directory. Roles: owner,
 admin, member, reader. Methods: genesis, approval, recovery, account,
 custodian, pool, grant, directory. Records are carried by any member's stream (a device
@@ -1167,7 +1169,9 @@ relay) computes the same roster:
   grant, scope [object], role reader or member by access}` to the space's
   membership, so every member knows the grant. Scoped members are not tree
   leaves and don't count toward epoch eligibility, so a grant never forces a
-  rotation.
+  rotation. A guest's scope is a set: sharing another object of the same
+  space with the same guest appends `Scope{guest, add, object}`, and the
+  re-wrap covers every object in the scope.
 - **Re-wrap.** Whenever a member's membership pass sees a current epoch
   (after a local change or a remote resolve), the member elected as for
   rotation does the re-wrap (`_members_elected`: lowest present admin leaf
@@ -1191,7 +1195,9 @@ relay) computes the same roster:
   grant epochs and unlocks held key trees on any new grant epoch, not only
   on space epochs.
 - **Revocation must rotate.** `share_revoke(object, grantee)` removes the
-  guest, and the revoker commits a new space epoch at once. The guest still
+  object from the guest's scope (`Scope{guest, remove, object}`), or removes
+  the guest when it was the last object, and the revoker commits a new space
+  epoch at once. The guest still
   holds the current epoch's object key, so without the rotation it would
   keep opening new writes. Normal rotation ignores scoped members;
   revocation is the exception. Removing the guest is the only thing that
@@ -1200,6 +1206,14 @@ relay) computes the same roster:
   refuses the guest at once, but cryptographically the guest keeps the
   object keys it already holds until the next epoch advance. A guest member
   whose `expires` has passed gets no further wraps.
+- **Capabilities for several objects.** A guest holds one capability token
+  per granted object. Credential type 3 carries up to 16 tokens for one
+  space and grantee: `3 | n u8 | token × n | sign [32] | sig [64]` (type 2
+  stays the single-token form). The relay authorizer verifies every token
+  and grants the union, keeping per-stream access per object. The CLI
+  daemon keeps every token of a space in its credentials file.
+  `accept_share` reopens an already open guest space so the link
+  re-authenticates with the new token.
 - **Pre-release format.** Grants made before this design carry no `Add` and
   are not re-wrapped; there is no migration.
 

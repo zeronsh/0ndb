@@ -485,6 +485,12 @@ membership_remove :: proc(m: ^Membership, signer: Member_Signer, subject: Public
 	return membership_append(m, .Remove, signer, hlc, payload[:])
 }
 
+membership_scope :: proc(m: ^Membership, signer: Member_Signer, subject: Public_Key, object: prim.Id, add: bool, hlc: u64) -> (raw: []u8, err: Error) {
+	payload := make([dynamic]u8, context.temp_allocator)
+	scope_encode(Scope_Body{subject = subject, object = object, add = add}, &payload) or_return
+	return membership_append(m, .Scope, signer, hlc, payload[:])
+}
+
 membership_update :: proc(m: ^Membership, signer: Member_Signer, box: Public_Key, hlc: u64) -> (raw: []u8, err: Error) {
 	payload := make([dynamic]u8, context.temp_allocator)
 	key32_encode(box, &payload) or_return
