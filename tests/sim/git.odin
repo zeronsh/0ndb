@@ -29,13 +29,17 @@ _write_file :: proc(vfs: prim.Vfs, path: string, data: []u8) -> prim.Error {
 	return err
 }
 
-git_checkout_create :: proc(vfs: prim.Vfs, root: string, files: []Git_File, when_s: i64, clock: prim.Clock, random: prim.Random) -> prim.Error {
+git_checkout_create :: proc(vfs: prim.Vfs, root: string, files: []Git_File, when_s: i64, clock: prim.Clock, random: prim.Random, remote := "", pushed: ^[dynamic]odb.Oid = nil) -> prim.Error {
 	git := strings.concatenate({root, "/.git"}, context.temp_allocator)
-	for d in ([]string{"objects", "refs/heads", "refs/tags"}) {
+	for d in ([]string{"objects", "refs/heads", "refs/tags", "refs/remotes/origin"}) {
 		prim.mkdir_all(vfs, strings.concatenate({git, "/", d}, context.temp_allocator), 0o755) or_return
 	}
 	_write_file(vfs, strings.concatenate({git, "/HEAD"}, context.temp_allocator), transmute([]u8)string("ref: refs/heads/main\n")) or_return
-	_write_file(vfs, strings.concatenate({git, "/config"}, context.temp_allocator), transmute([]u8)string("[core]\n\trepositoryformatversion = 0\n\tbare = false\n")) or_return
+	config := "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+	if len(remote) > 0 {
+		config = strings.concatenate({config, "[remote \"origin\"]\n\turl = ", remote, "\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"}, context.temp_allocator)
+	}
+	_write_file(vfs, strings.concatenate({git, "/config"}, context.temp_allocator), transmute([]u8)config) or_return
 	db: odb.Odb
 	if err := odb.open(&db, vfs, root, nil, context.allocator, clock, random); err != .None {
 		return .Io
@@ -55,6 +59,9 @@ git_checkout_create :: proc(vfs: prim.Vfs, root: string, files: []Git_File, when
 		}
 		oids[i] = oid
 		entries[i] = odb.Tree_Entry{name = f.name, oid = oid, mode = 0o100644}
+		if pushed != nil {
+			append(pushed, oid)
+		}
 	}
 	tree, terr := odb.write_tree(&db, entries)
 	if terr != .None {
@@ -75,6 +82,13 @@ git_checkout_create :: proc(vfs: prim.Vfs, root: string, files: []Git_File, when
 	hb: [odb.MAX_HEX]u8
 	hexs := odb.oid_to_string(commit, .Sha1, &hb)
 	_write_file(vfs, strings.concatenate({git, "/refs/heads/main"}, context.temp_allocator), transmute([]u8)strings.concatenate({hexs, "\n"}, context.temp_allocator)) or_return
+	if len(remote) > 0 {
+		_write_file(vfs, strings.concatenate({git, "/refs/remotes/origin/main"}, context.temp_allocator), transmute([]u8)strings.concatenate({hexs, "\n"}, context.temp_allocator)) or_return
+		if pushed != nil {
+			append(pushed, tree, commit)
+		}
+		prim.sync_dir(vfs, strings.concatenate({git, "/refs/remotes/origin"}, context.temp_allocator)) or_return
+	}
 	idx := make([dynamic]u8, context.temp_allocator)
 	append(&idx, 'D', 'I', 'R', 'C')
 	_put32(&idx, 2)
