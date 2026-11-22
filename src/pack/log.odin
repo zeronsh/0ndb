@@ -34,7 +34,7 @@ _active_garbage :: proc "contextless" (p: ^Pack) -> bool {
 		return false
 	}
 	data := _log_tail(p) - CONT_HDR
-	if data < p.opts.container_size / 16 {
+	if data < (p.opts.roll_min if p.opts.roll_min > 0 else p.opts.container_size / 16) {
 		return false
 	}
 	live := max(p.conts[p.active].live, 0)

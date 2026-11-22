@@ -143,11 +143,20 @@ class Relay:
         return "127.0.0.1:%d" % self.port
 
     def stop(self):
+        wrote = 0
+        try:
+            for line in open("/proc/%d/io" % self.proc.pid):
+                if line.startswith("write_bytes:"):
+                    wrote = int(line.split()[1])
+        except OSError:
+            pass
         self.proc.send_signal(signal.SIGINT)
         self.proc.wait(timeout=60)
         log = open(os.path.join(self.dir, "relay.log")).read()
         m = re.search(r"relay stopped \((\d+) appends, ([^,]+) in, ([^,]+) out, (\d+) object-store writes, ([^)]+)\)", log)
         row = dict(appends=int(m.group(1)), bytes_in=m.group(2), bytes_out=m.group(3), puts=int(m.group(4)), put_bytes=m.group(5)) if m else {}
+        if wrote:
+            row["relay_write_bytes"] = wrote
         g = re.search(r"object-store reads (\d+) \(([^)]+)\)", log)
         if g:
             row.update(gets=int(g.group(1)), get_bytes=g.group(2))

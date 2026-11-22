@@ -2118,7 +2118,13 @@ Relay cost tracks the reachable information, not the activity. Items marked
 - **Relay write amplification.** The usage counter is written once per
   group commit, not per append; the feed is folded when it exceeds twice its
   last folded size (64 KiB floor); and the relay's pack rolls its active
-  container when half of it is garbage, so compaction reclaims it promptly.
+  container when half of it is garbage once it holds 256 KiB
+  (`Options.roll_min`; engines keep `container_size / 16`), and any pack
+  checkpoints as soon as a sealed container past the checkpoint is half
+  garbage, since compaction only takes containers the index covers. On
+  `tools/costbench` the relay's pack on disk drops from 3.70 to 1.11 MB (s1),
+  1.23 to 0.70 MB (s3) and 2.22 to 0.66 MB (s4); s1's container goes from
+  2.76 MB (25 KB live) to 30 KB.
   Pack-backed relay streams write appended and filled content through a
   staged pack handle, so a partial append can never become durable through
   another space's commit, and keep no length slot: a stream's length is its
