@@ -251,7 +251,7 @@ catalog_find :: proc(e: ^Engine, space: prim.Id, text: string, allocator := cont
 		}
 	}
 	if len(out) == 0 && ready.call != nil && sp.repl_on && sp.connected && (!osync.replicator_caught_up(&sp.repl) || _handle_waiting(h, ready.fresh)) {
-		return nil, _space_wait_catalog(e, sp, ready)
+		return nil, _space_wait_on(e, sp, ready, .Catalog)
 	}
 	return out[:], .None
 }

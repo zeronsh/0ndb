@@ -271,6 +271,15 @@ applied, or the feed not yet caught up since connecting); once caught up it
 answers with whatever matches, possibly nothing. Without a relay connection it
 answers at once.
 
+Waiting for the relay. Calls return once a write is durable on this device;
+the relay's acknowledgement arrives later as an `Uploaded` event. A client
+that must know other devices can see an object (the CLI's `new` does) calls
+`object.uploaded(object)`: it answers `uploaded` once the relay has
+acknowledged everything this device has committed to the object and to its
+space's catalog; while connected it waits for that, without a connection it
+answers at once with `uploaded` false, and if the connection drops while it
+waits it answers `uploaded` false with `dropped`.
+
 Open a conversation at the bottom. Subscribe to the conversation, read
 `convo.status` and take `position` (the reader's message; `head` when it is
 null), then `convo.window(object, anchor: position, before: N)`: the
@@ -650,6 +659,7 @@ up exist only over the socket.
 | 99 | `catalog.get` | object: object | found:bool entry:CatalogEntry |
 | 100 | `catalog.list` | space: id, archived: bool, after: bytes, limit: uvarint | rows:[CatalogRow] more:bool next:bytes |
 | 141 | `catalog.find` | space: id, text: str | rows:[CatalogRow] |
+| 142 | `object.uploaded` | object: object | uploaded:bool dropped:bool |
 | 101 | `catalog.usage` | object: object | Usage |
 | 102 | `catalog.set` | object: object, set: uvarint, title: str, archived: bool, pinned: bool, parent: object, parent_msg: rid, workspace: id, agent: id | Result |
 

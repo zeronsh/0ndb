@@ -602,6 +602,16 @@ op_catalog_find :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
+op_object_uploaded :: proc(c: ^Call, o: ^Out) -> Status {
+	up, err := eng.upload_wait(c.api.e, a_object(c, "object"), ready(c))
+	if err != .None {
+		return pend(c, err)
+	}
+	o_bool(o, "uploaded", up)
+	o_bool(o, "dropped", !up && c.tries > 0)
+	return .Ok
+}
+
 op_catalog_usage :: proc(c: ^Call, o: ^Out) -> Status {
 	u, err := eng.catalog_usage_get(c.api.e, a_object(c, "object"), ready(c))
 	if err != .None {
