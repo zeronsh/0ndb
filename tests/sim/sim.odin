@@ -211,6 +211,8 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		sim_http_event(w, ev)
 	case .Quiesce_Step:
 		quiesce_event(w, ev)
+	case .Takeover_Answer:
+		takeover_answer(w, ev)
 	case .Heal:
 		n := w.nodes[ev.node]
 		if n.partitioned {

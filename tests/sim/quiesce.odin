@@ -242,6 +242,10 @@ quiesce_runtime_start :: proc(n: ^Node) {
 	}
 	clear(&n.http.reqs)
 	n.http.hold = false
+	if w.rt_start != nil {
+		w.rt_start(n)
+		return
+	}
 	if !w.quiesce.on || n.idx != w.quiesce.runner || n.rt_on || !n.e_open {
 		return
 	}
