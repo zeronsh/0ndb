@@ -432,18 +432,6 @@ finish :: proc(w: ^World) {
 	if len(w.failures) > 0 {
 		return
 	}
-	if w.cfg.verbose {
-		for _, oi in w.model.objs {
-			if obj_exists(&w.model, oi) && w.model.objs[oi].kind != .Convo {
-				rs := readers_of(w, oi)
-				if len(rs) > 0 {
-					d := digest_object(w, w.nodes[rs[0]], oi)
-					world_note(w, "final %v %s on %s:\n%s", w.model.objs[oi].kind, id_short(w.model.objs[oi].o.id), w.nodes[rs[0]].name, d.text)
-					delete(d.text, w.allocator)
-				}
-			}
-		}
-	}
 	if !check_convergence(w, true) && w.cfg.verbose {
 		dump_replication(w)
 	}
@@ -996,6 +984,9 @@ sim_footprint :: proc(w: ^World) -> (total: int) {
 			total += int(n.inst.temp.peak - n.inst.temp.base)
 		}
 		total += int(disk_bytes(&n.disk)) + int(n.disk.pend_bytes)
+		if n.e_open {
+			total += int(n.e.temp.total_used)
+		}
 	}
 	total += w.relay.inst.main.bytes + int(disk_bytes(&w.relay.disk)) + int(w.relay.disk.pend_bytes)
 	return
@@ -1013,7 +1004,7 @@ memory_runaway :: proc(w: ^World) -> bool {
 	b := strings.builder_make(context.temp_allocator)
 	fmt.sbprintf(&b, "memory runaway: footprint %d MiB at t=%d ms; queue=%d events", mib, w.now / 1_000_000, len(w.queue))
 	for n in w.nodes {
-		fmt.sbprintf(&b, "; %s region %d MiB live (%d blocks) temp peak %d MiB disk %d MiB unsynced %d MiB", n.name, n.inst.main.bytes >> 20, n.inst.main.live, int(n.inst.temp.peak - n.inst.temp.base) >> 20 if n.inst.temp.peak > 0 else 0, disk_bytes(&n.disk) >> 20, n.disk.pend_bytes >> 20)
+		fmt.sbprintf(&b, "; %s region %d MiB live (%d blocks) temp peak %d MiB engine temp %d MiB disk %d MiB unsynced %d MiB", n.name, n.inst.main.bytes >> 20, n.inst.main.live, int(n.inst.temp.peak - n.inst.temp.base) >> 20 if n.inst.temp.peak > 0 else 0, int(n.e.temp.total_used) >> 20 if n.e_open else 0, disk_bytes(&n.disk) >> 20, n.disk.pend_bytes >> 20)
 	}
 	fmt.sbprintf(&b, "; relay region %d MiB disk %d MiB", w.relay.inst.main.bytes >> 20, disk_bytes(&w.relay.disk) >> 20)
 	world_fail(w, "%s", strings.to_string(b))
