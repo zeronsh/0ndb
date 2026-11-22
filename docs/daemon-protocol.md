@@ -175,6 +175,13 @@ plug is cancelled at once and the host receives `Plug_Cancel` for the request
   frame carries the whole `Runners` payload (the `runners` op's result), not
   deltas, and is pushed when a runner's advert or presence changes, or when
   `C`'s placement changes. Read the first state with `runners`.
+- `{"op":"subscribe.fork_diff","object":T[,"caller":C,"diff":bool,"max_chars":N]}`:
+  the live diff of task `T`'s forked lines against its parent's (or `C`'s)
+  lines. The fork side is the task's open run line while it runs, so edits
+  show as the agent makes them. Each frame carries the whole `task.changes`
+  payload (`changes`, and `diff` when asked). A frame is pushed once per
+  tick, and only when that payload changed. Read the first state with
+  `task.changes`.
 
 The daemon answers `Result(tag, ok)` (or an error with the usual payload),
 then sends `Deltas(tag, Deltas)` frames until `Unsubscribe(tag)`, which it
@@ -259,7 +266,7 @@ conversation's next run is; see "Placement" below), `presence`
 a space), `approval_requested`, `login_done` and `login_failed` (sign-in),
 `access_revoked`, `space_left` (a left space is erased). `durable` and `uploaded` fire once per committed tick and
 per upload; a UI should leave them out of its mask (the Rust client does).
-Conversation status (idle, running, queued, awaiting_permission, ...)
+Conversation status (idle, running, queued, awaiting_permission, ..., held)
 arrives as `status` deltas of the conversation subscription and as the row
 status in catalog deltas, not as events.
 
@@ -618,6 +625,7 @@ up exist only over the socket.
 | 4 | `subscribe` | object: object, kind: enum conversation|map|text|tree | Deltas |
 | 5 | `subscribe.catalog` | space: id | Deltas |
 | 163 | `subscribe.runners` | space: id, object: object | Runners (whole payload per frame) |
+| 143 | `subscribe.fork_diff` | object: object, caller: object, diff: bool, max_chars: uvarint | changes:[Change] diff:str (whole payload per frame) |
 
 ### Accounts, devices, members and runner pools
 

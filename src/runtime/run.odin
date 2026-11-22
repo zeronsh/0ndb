@@ -573,8 +573,18 @@ _run_finish_tail :: proc(run: ^Run) {
 		return
 	}
 	files: []convo.File_Delta
+	land_tried, land_ok := false, false
+	land_conflicts: []string
 	if run.ws != nil {
 		files = worktree_finish(run.ws, run, !run.superseded)
+		if !run.superseded && run.status == .Done {
+			if t, tok := task_get(r, run.o); tok && t.isolate == .Yes {
+				land_tried, land_ok, land_conflicts = task_land(r, run.o, run.ws)
+				if land_tried {
+					land_refresh_files(run.ws, files)
+				}
+			}
+		}
 	}
 	w := _writer(run)
 	if w != nil {
@@ -588,6 +598,9 @@ _run_finish_tail :: proc(run: ^Run) {
 			convo.writer_superseded(w, run.claim, run.by)
 		} else if run.ws != nil {
 			convo.writer_landed(w, run.claim, files, run.status)
+		}
+		if land_tried {
+			land_note(r, run.o, w, land_ok, land_conflicts)
 		}
 	}
 	if pe, ok := pending_get(r, run.o); ok && pe.msg == run.user && pe.runner == r.self {

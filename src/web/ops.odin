@@ -674,6 +674,9 @@ _delta_convo :: proc(s: ^Session, o: ^Object, vs: int, device: prim.Id, at: i64,
 		o_rid(out, "msg", target)
 	case convo.Await:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
+	case convo.Hold:
+		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
+		o_str(out, "text", b.reason)
 	case convo.Assign:
 		_delta_head(s, o, out, "run", rid, device, rec.env.kind, rec.stamp)
 		o_rid(out, "msg", target)
