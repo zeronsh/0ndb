@@ -896,6 +896,21 @@ check_redaction :: proc(w: ^World) {
 			world_fail(w, "redaction: %s still on relay disk in %s", s, p)
 		}
 	}
+	for op in m.ops {
+		if op.kind != .Redact_Msg || !op_happened(op) || len(op.keys_before) == 0 || op.target < 0 {
+			continue
+		}
+		t := m.ops[op.target]
+		after := own_key_row(w, t.node, m.objs[op.obj].o.id)
+		needle, ok := _absent_window(op.keys_before, after, 32)
+		if !ok {
+			continue
+		}
+		an := w.nodes[t.node]
+		if p, found := disk_contains(&an.disk, needle); found {
+			redaction_finding(w, an, op.obj, "redaction: %s's own key tree from before redacting %s, which holds the punctured seeds, is still on its disk in %s", an.name, t.token, p)
+		}
+	}
 	check_search_models(w, secrets[:], owners[:])
 	check_peer_redaction(w, secrets[:], owners[:])
 }
@@ -1501,4 +1516,52 @@ pair_resolver :: proc(w: ^World, oi: int, p: Pair) -> ^M_Op {
 		}
 	}
 	return nil
+}
+
+own_key_row :: proc(w: ^World, idx: int, object: prim.Id) -> []u8 {
+	n := w.nodes[idx]
+	if !n.alive || !n.e_open {
+		return nil
+	}
+	context = instance_context(&n.inst)
+	db: omap.Db
+	if omap.db_open(&db, eng.vfs(&n.e), fmt.tprintf("%s/registry", n.e.pack_root), context.temp_allocator, true) != .None {
+		return nil
+	}
+	defer omap.db_close(&db)
+	key: [17]u8
+	o := object
+	copy(key[:16], o[:])
+	key[16] = 'k'
+	v, found, err := omap.db_get(&db, 0, key[:], context.temp_allocator)
+	if err != .None || !found {
+		return nil
+	}
+	out := make([]u8, len(v), w.allocator)
+	copy(out, v)
+	return out
+}
+
+@(private = "file")
+_absent_window :: proc(before: []u8, after: []u8, size: int) -> ([]u8, bool) {
+	if len(before) < size {
+		return nil, false
+	}
+	for i := 0; i + size <= len(before); i += 1 {
+		win := before[i:][:size]
+		if !_has_window(after, win) {
+			return win, true
+		}
+	}
+	return nil, false
+}
+
+@(private = "file")
+_has_window :: proc(hay: []u8, win: []u8) -> bool {
+	for i := 0; i + len(win) <= len(hay); i += 1 {
+		if string(hay[i:][:len(win)]) == string(win) {
+			return true
+		}
+	}
+	return false
 }

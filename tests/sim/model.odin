@@ -111,6 +111,7 @@ M_Op :: struct {
 	overwrite: bool,
 	gens:    [dynamic]string,
 	power_crash: bool,
+	keys_before: []u8,
 }
 
 Model :: struct {
@@ -180,6 +181,7 @@ model_destroy :: proc(m: ^Model) {
 		delete(op.gens)
 		delete(op.key, a)
 		delete(op.path, a)
+		delete(op.keys_before, a)
 		free(op, a)
 	}
 	delete(m.ops)

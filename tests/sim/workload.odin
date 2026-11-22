@@ -522,6 +522,7 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		}
 		op := new_op(m, .Redact_Msg, n, oi)
 		op.target = t.idx
+		op.keys_before = own_key_row(w, t.node, o.id)
 		snapshot_search_models(w, n, op)
 		context = instance_context(&n.inst)
 		err := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))

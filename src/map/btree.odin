@@ -33,6 +33,10 @@ KIND_OVF :: 3
 META_LEN :: 176
 @(private)
 WRITE_CHUNK :: 64
+@(private)
+SCRUB_MAX :: 224
+@(private)
+SCRUB_AT :: 256
 
 Meta :: struct {
 	txn:    u64,
@@ -40,6 +44,8 @@ Meta :: struct {
 	live:   u64,
 	roots:  [ROOTS]u64,
 	counts: [ROOTS]u64,
+	nscrub: int,
+	scrub:  [SCRUB_MAX]Scrub,
 }
 
 Db :: struct {
@@ -51,7 +57,18 @@ Db :: struct {
 	cache:     []u8,
 	txn:       ^Txn,
 	poisoned:  bool,
+	secret:    Secret,
+	zeroed:    u64,
+	read_only: bool,
 	allocator: runtime.Allocator,
+}
+
+Secret :: #type proc(root: int, key: []u8) -> bool
+
+@(private)
+Scrub :: struct {
+	page:  u64,
+	count: u64,
 }
 
 Txn :: struct {
@@ -62,6 +79,8 @@ Txn :: struct {
 	dirty: [dynamic]^Node,
 	clean: map[u64]^Node,
 	freed: u64,
+	root:  int,
+	scrub: [dynamic]Scrub,
 }
 
 @(private)
@@ -83,7 +102,7 @@ Node :: struct {
 
 Visit :: #type proc(data: rawptr, key: []u8, value: []u8) -> bool
 
-db_open :: proc(db: ^Db, vfs: prim.Vfs, path: string, allocator := context.allocator) -> Error {
+db_open :: proc(db: ^Db, vfs: prim.Vfs, path: string, allocator := context.allocator, read_only := false) -> Error {
 	db^ = {
 		vfs       = vfs,
 		fd        = prim.INVALID_FD,
@@ -122,7 +141,7 @@ db_open :: proc(db: ^Db, vfs: prim.Vfs, path: string, allocator := context.alloc
 		return .No_Memory
 	}
 	db.cache = cache
-	if err := _db_load(db); err != .None {
+	if err := _db_load(db, read_only); err != .None {
 		db_close(db)
 		return err
 	}
@@ -134,7 +153,8 @@ db_close :: proc(db: ^Db) {
 		txn_abort(db.txn)
 	}
 	if db.fd >= 0 {
-		if !db.poisoned {
+		if !db.poisoned && !db.read_only {
+			db_scrub(db)
 			prim.datasync(db.vfs, db.fd)
 		}
 		prim.close_file(db.vfs, db.fd)
@@ -241,7 +261,7 @@ txn_begin :: proc(db: ^Db) -> (t: ^Txn, err: Error) {
 	if db.txn != nil {
 		return nil, .Busy
 	}
-	if db.poisoned {
+	if db.poisoned || db.read_only {
 		return nil, .Io
 	}
 	t = new(Txn, db.allocator)
@@ -257,6 +277,7 @@ txn_begin :: proc(db: ^Db) -> (t: ^Txn, err: Error) {
 	t.meta = db.meta
 	t.dirty = make([dynamic]^Node, t.alloc)
 	t.clean = make(map[u64]^Node, t.alloc)
+	t.scrub = make([dynamic]Scrub, t.alloc)
 	db.txn = t
 	return t, .None
 }
@@ -302,6 +323,7 @@ txn_put :: proc(t: ^Txn, root: int, key: []u8, value: []u8) -> Error {
 	}
 	k := _dup(t, key) or_return
 	v := _dup(t, value) or_return
+	t.root = root
 	ref := t.meta.roots[root]
 	if ref == 0 {
 		n := _new_node(t, true) or_return
@@ -327,6 +349,7 @@ txn_put :: proc(t: ^Txn, root: int, key: []u8, value: []u8) -> Error {
 }
 
 txn_delete :: proc(t: ^Txn, root: int, key: []u8) -> (found: bool, err: Error) {
+	t.root = root
 	ref := t.meta.roots[root]
 	if ref == 0 {
 		return false, .None
@@ -387,20 +410,109 @@ txn_commit :: proc(t: ^Txn) -> Error {
 			db.poisoned = true
 			return obj.perr(err)
 		}
+		if err := _scrub_zero(db); err != .None {
+			txn_abort(t)
+			db.poisoned = true
+			return err
+		}
 	}
 	m := t.meta
 	m.txn = db.meta.txn + 1
 	m.pages = next
 	m.live = db.meta.live + written - min(t.freed, db.meta.live + written)
+	m.nscrub = 0
+	if db.zeroed != db.meta.txn {
+		for s in db.meta.scrub[:db.meta.nscrub] {
+			m.scrub[m.nscrub] = s
+			m.nscrub += 1
+		}
+	}
+	over := false
+	for s in t.scrub {
+		if m.nscrub == SCRUB_MAX {
+			over = true
+			break
+		}
+		m.scrub[m.nscrub] = s
+		m.nscrub += 1
+	}
+	if over {
+		m.nscrub = 0
+	}
 	if err := _meta_write(db.vfs, db.fd, &m); err != .None {
 		txn_abort(t)
 		db.poisoned = true
 		return err
 	}
+	carried := db.zeroed != db.meta.txn ? db.meta : Meta{}
 	db.meta = m
+	if over {
+		err := obj.perr(prim.datasync(db.vfs, db.fd))
+		for s in carried.scrub[:carried.nscrub] {
+			if err == .None {
+				err = _zero_pages(db, s)
+			}
+		}
+		for s in t.scrub {
+			if err == .None {
+				err = _zero_pages(db, s)
+			}
+		}
+		if err == .None {
+			err = obj.perr(prim.datasync(db.vfs, db.fd))
+		}
+		if err != .None {
+			txn_abort(t)
+			db.poisoned = true
+			return err
+		}
+		db.zeroed = m.txn
+	}
 	txn_abort(t)
 	if db.meta.pages > 2 * db.meta.live + 2 + COMPACT_SLACK {
 		return db_compact(db)
+	}
+	return .None
+}
+
+@(private)
+_zero_pages :: proc(db: ^Db, s: Scrub) -> Error {
+	obj.perr(prim.zero_range(db.vfs, db.fd, i64(s.page) * PAGE, i64(s.count) * PAGE)) or_return
+	for i in 0 ..< CACHE_PAGES {
+		if db.cache_no[i] > s.page && db.cache_no[i] <= s.page + s.count {
+			db.cache_no[i] = 0
+		}
+	}
+	return .None
+}
+
+@(private)
+_scrub_zero :: proc(db: ^Db) -> Error {
+	if db.zeroed == db.meta.txn {
+		return .None
+	}
+	for s in db.meta.scrub[:db.meta.nscrub] {
+		_zero_pages(db, s) or_return
+	}
+	db.zeroed = db.meta.txn
+	return .None
+}
+
+db_scrub :: proc(db: ^Db) -> Error {
+	if db.meta.nscrub == 0 || db.zeroed == db.meta.txn || db.poisoned || db.txn != nil {
+		return .None
+	}
+	if err := obj.perr(prim.datasync(db.vfs, db.fd)); err != .None {
+		db.poisoned = true
+		return err
+	}
+	if err := _scrub_zero(db); err != .None {
+		db.poisoned = true
+		return err
+	}
+	if err := obj.perr(prim.datasync(db.vfs, db.fd)); err != .None {
+		db.poisoned = true
+		return err
 	}
 	return .None
 }
@@ -443,6 +555,7 @@ db_compact :: proc(db: ^Db) -> Error {
 	defer obj.arena_destroy(&c.arena)
 	c.buf = make([dynamic]u8, 0, WRITE_CHUNK * PAGE, obj.arena_allocator(&c.arena))
 	m := db.meta
+	m.nscrub = 0
 	for r in 0 ..< ROOTS {
 		if m.roots[r] != 0 {
 			m.roots[r] = _copy_tree(&c, m.roots[r]) or_return
@@ -465,6 +578,7 @@ db_compact :: proc(db: ^Db) -> Error {
 	db.fd = fd
 	db.meta = m
 	db.cache_no = {}
+	db.zeroed = m.txn
 	if err := prim.sync_dir(db.vfs, prim.dir_name(db.path)); err != .None {
 		db.poisoned = true
 		return obj.perr(err)
@@ -555,7 +669,7 @@ _ovf_pages :: proc "contextless" (size: u64) -> u64 {
 }
 
 @(private)
-_db_load :: proc(db: ^Db) -> Error {
+_db_load :: proc(db: ^Db, read_only: bool) -> Error {
 	size, serr := prim.file_size(db.vfs, db.fd)
 	if serr != .None {
 		return obj.perr(serr)
@@ -576,10 +690,18 @@ _db_load :: proc(db: ^Db) -> Error {
 		return .Corrupt
 	}
 	db.meta = best
+	if read_only {
+		db.read_only = true
+		return .None
+	}
 	if i64(best.pages) * PAGE < size {
 		if err := prim.truncate(db.vfs, db.fd, i64(best.pages) * PAGE); err != .None {
 			return obj.perr(err)
 		}
+	}
+	if best.nscrub > 0 {
+		_scrub_zero(db) or_return
+		obj.perr(prim.datasync(db.vfs, db.fd)) or_return
 	}
 	return .None
 }
@@ -596,6 +718,14 @@ _meta_encode :: proc(b: []u8, m: ^Meta) {
 		prim.put_u64le(b[104 + 8 * i:], m.counts[i])
 	}
 	prim.put_u64le(b[168:176], xxhash.XXH3_64_with_seed(b[0:168], DB_MAGIC))
+	n := clamp(m.nscrub, 0, SCRUB_MAX)
+	prim.put_u64le(b[SCRUB_AT:], u64(n))
+	for s, i in m.scrub[:n] {
+		prim.put_u64le(b[SCRUB_AT + 8 + 16 * i:], s.page)
+		prim.put_u64le(b[SCRUB_AT + 16 + 16 * i:], s.count)
+	}
+	end := SCRUB_AT + 8 + 16 * n
+	prim.put_u64le(b[end:], xxhash.XXH3_64_with_seed(b[SCRUB_AT:end], DB_MAGIC))
 }
 
 @(private)
@@ -612,9 +742,9 @@ _meta_write_slot :: proc(vfs: prim.Vfs, fd: prim.Fd, m: ^Meta, slot: int) -> Err
 
 @(private)
 _meta_read :: proc(vfs: prim.Vfs, fd: prim.Fd, slot: int) -> (m: Meta, ok: bool) {
-	b: [META_LEN]u8
+	b: [PAGE]u8
 	n, err := prim.read_at(vfs, fd, b[:], i64(slot) * PAGE)
-	if err != .None || n != META_LEN {
+	if err != .None || n < META_LEN {
 		return
 	}
 	if prim.get_u64le(b[0:8]) != DB_MAGIC || prim.get_u32le(b[8:12]) != DB_VERSION {
@@ -631,6 +761,21 @@ _meta_read :: proc(vfs: prim.Vfs, fd: prim.Fd, slot: int) -> (m: Meta, ok: bool)
 		m.counts[i] = prim.get_u64le(b[104 + 8 * i:])
 		if m.roots[i] != 0 && (m.roots[i] < 2 || m.roots[i] >= m.pages) {
 			return m, false
+		}
+	}
+	if n == PAGE {
+		c := int(prim.get_u64le(b[SCRUB_AT:]))
+		if c > 0 && c <= SCRUB_MAX {
+			end := SCRUB_AT + 8 + 16 * c
+			if xxhash.XXH3_64_with_seed(b[SCRUB_AT:end], DB_MAGIC) == prim.get_u64le(b[end:]) {
+				for i in 0 ..< c {
+					s := Scrub{page = prim.get_u64le(b[SCRUB_AT + 8 + 16 * i:]), count = prim.get_u64le(b[SCRUB_AT + 16 + 16 * i:])}
+					if s.page >= 2 && s.count > 0 && s.page + s.count <= m.pages {
+						m.scrub[m.nscrub] = s
+						m.nscrub += 1
+					}
+				}
+			}
 		}
 	}
 	return m, true
@@ -844,13 +989,30 @@ _mutable :: proc(t: ^Txn, ref: u64) -> (n: ^Node, err: Error) {
 		append(&n.kids, ..src.kids[:])
 	}
 	t.freed += 1
+	_scrub_leaf(t, src)
 	return n, .None
 }
 
 @(private)
-_free_val :: proc(t: ^Txn, v: Val) {
+_scrub_leaf :: proc(t: ^Txn, n: ^Node) {
+	if t.db.secret == nil || !n.leaf || n.ref & TEMP != 0 {
+		return
+	}
+	for k, i in n.keys {
+		if n.vals[i].ovf == 0 && t.db.secret(t.root, k) {
+			append(&t.scrub, Scrub{page = n.ref, count = 1})
+			return
+		}
+	}
+}
+
+@(private)
+_free_val :: proc(t: ^Txn, key: []u8, v: Val) {
 	if v.ovf != 0 {
 		t.freed += _ovf_pages(v.size)
+		if t.db.secret != nil && t.db.secret(t.root, key) {
+			append(&t.scrub, Scrub{page = v.ovf, count = _ovf_pages(v.size)})
+		}
 	}
 }
 
@@ -888,7 +1050,7 @@ _insert :: proc(t: ^Txn, ref: u64, key: []u8, value: []u8, added: ^bool) -> (nre
 			size = u64(len(value)),
 		}
 		if hit {
-			_free_val(t, n.vals[i])
+			_free_val(t, n.keys[i], n.vals[i])
 			n.vals[i] = v
 		} else {
 			inject_at(&n.keys, i, key)
@@ -952,7 +1114,7 @@ _remove :: proc(t: ^Txn, ref: u64, key: []u8, found: ^bool) -> (nref: u64, err: 
 		}
 		found^ = true
 		n := _mutable(t, ref) or_return
-		_free_val(t, n.vals[i])
+		_free_val(t, n.keys[i], n.vals[i])
 		ordered_remove(&n.keys, i)
 		ordered_remove(&n.vals, i)
 		if len(n.keys) == 0 {
@@ -998,6 +1160,7 @@ _remove :: proc(t: ^Txn, ref: u64, key: []u8, found: ^bool) -> (nref: u64, err: 
 			}
 			if rnode.ref & TEMP == 0 {
 				t.freed += 1
+				_scrub_leaf(t, rnode)
 			}
 			n.kids[a] = left.ref
 			ordered_remove(&n.kids, b)

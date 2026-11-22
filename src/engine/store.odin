@@ -84,6 +84,7 @@ Card_Pub :: struct {
 _registry_open :: proc(e: ^Engine) -> Error {
 	path := _join(context.temp_allocator, e.pack_root, "registry") or_return
 	_oerr(omap.db_open(&e.reg.db, e.vfs, path, e.allocator)) or_return
+	e.reg.db.secret = _registry_secret
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.sstaged = make(map[prim.Id][]u8, e.allocator)
@@ -847,4 +848,19 @@ _pack_before_commit :: proc(data: rawptr) -> pack.Error {
 		return .Io
 	}
 	return .None
+}
+
+@(private)
+_registry_secret :: proc(root: int, key: []u8) -> bool {
+	return root == ROOT_OBJECTS && len(key) == 17 && key[16] == 'k'
+}
+
+@(private)
+_registry_scrub :: proc(e: ^Engine) {
+	if !e.reg.open {
+		return
+	}
+	if err := omap.db_scrub(&e.reg.db); err != .None {
+		_fatal(e, _oerr(err))
+	}
 }
