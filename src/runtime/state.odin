@@ -614,7 +614,16 @@ _pending_clear :: proc(r: ^Runtime, o: Object) {
 
 @(private)
 _pending_scan :: proc(r: ^Runtime, space: prim.Id, runner: prim.Id = {}) {
-	for &row in map_rows(r, pending_object(space), nil) {
+	po := pending_object(space)
+	ready := _wait_ready(r, po)
+	cur: eng.Map_Cursor
+	_, _, err := eng.map_scan(r.e, po, nil, &cur, 1, context.temp_allocator, ready)
+	delete(cur.key)
+	if err == .Pending {
+		return
+	}
+	_wait_drop(r, ready)
+	for &row in map_rows(r, po, nil) {
 		if len(row.key) != 16 || obj.rid_none(entry_rid(&row.entry, 1)) {
 			continue
 		}
