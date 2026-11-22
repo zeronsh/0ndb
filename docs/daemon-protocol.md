@@ -25,6 +25,8 @@ The socket is `daemon.sock` in the runtime directory:
 The data directory (engine, logs, daemon state) is `$ONDB_HOME`, else the
 platform data directory above without `run`. Socket paths are limited to 107
 bytes (103 on macOS); set `ONDB_RUNTIME_DIR` when the data directory is deep.
+A longer path is refused with an error that names the path and the limit;
+`daemon start` exits with it, so an autostarting client reports it.
 
 Ownership. The directory is created `0700` and the socket is bound under a
 `077` umask. Every accepted connection is checked against the daemon's own

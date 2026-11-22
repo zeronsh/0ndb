@@ -24,6 +24,9 @@ socket_path :: proc(allocator := context.allocator) -> string {
 		fail(.Io, "cannot determine the runtime directory")
 	}
 	p, _ := prim.path_join(allocator, dir, "daemon.sock")
+	if len(p) > sock_path_max() {
+		fail(.Usage, "the daemon socket path %s is %d bytes, longer than the %d this platform allows for a socket; set ONDB_RUNTIME_DIR (or ONDB_HOME) to a shorter directory", p, len(p), sock_path_max())
+	}
 	return p
 }
 
