@@ -496,7 +496,7 @@ _quarantine :: proc(r: ^Replicator, rm: ^Remote, at: i64) {
 }
 
 @(private)
-_stage_write :: proc(rm: ^Remote, at: i64, data: []u8) -> journal.Error {
+_stage_write :: proc(r: ^Replicator, rm: ^Remote, at: i64, data: []u8) -> journal.Error {
 	end := at + i64(len(data))
 	pos := at
 	have := journal.replica_have(&rm.rep)
@@ -519,6 +519,7 @@ _stage_write :: proc(rm: ^Remote, at: i64, data: []u8) -> journal.Error {
 	}
 	for p in pieces {
 		journal.replica_write(&rm.rep, p.from, data[p.from - at:p.to - at]) or_return
+		r.fetched_bytes += u64(p.to - p.from)
 	}
 	return .None
 }

@@ -18,6 +18,8 @@ Catalog_Tag :: enum u32 {
 	Pinned       = 11,
 	Storage      = 12,
 	Takeover     = 13,
+	Provider     = 14,
+	Unanswered   = 15,
 }
 
 Catalog_Entry :: struct {
@@ -35,6 +37,8 @@ Catalog_Entry :: struct {
 	pinned:       bool,
 	storage:      u8,
 	takeover:     u8,
+	provider:     string,
+	unanswered:   bool,
 }
 
 CATALOG_BY_ACTIVITY :: 0
@@ -143,6 +147,11 @@ catalog_decode :: proc(e: ^Entry, allocator := context.allocator) -> (c: Catalog
 		case .Takeover:
 			x, _ := value_u64(r.value)
 			c.takeover = u8(min(x, 255))
+		case .Provider:
+			c.provider = obj.clone_str(string(r.value), allocator) or_return
+		case .Unanswered:
+			x, _ := value_u64(r.value)
+			c.unanswered = x != 0
 		}
 	}
 	c.kind = row.kind

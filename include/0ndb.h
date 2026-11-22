@@ -233,7 +233,9 @@
  *   Wrote      := scope: id, object: id, ref: bytes, hlc: uvarint,
  *                 lo: uvarint, hi: uvarint, known: bool
  *   Stats      := ticks, commits, durable, handles, opened, evicted, pending,
- *                 subs, fetches, indexed, wakeups, calls, mounts: uvarint
+ *                 subs, fetches, indexed, wakeups, calls, mounts,
+ *                 fetched_bytes: uvarint (bytes received into the
+ *                 replicas of the open spaces since each opened)
  *   Workspace  := name: str, agent: id, provider: str, model: str,
  *                 runner_policy: bytes, setup: str, access: bytes,
  *                 members: [ {object: id, kind: enum kind,
