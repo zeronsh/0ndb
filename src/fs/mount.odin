@@ -307,6 +307,7 @@ Mount :: struct {
 	mat_wait:    bool,
 	mat_ingest:  bool,
 	importing:   bool,
+	shadow_mark: Shadow_Mark,
 	passes:      u64,
 	jpos:        i64,
 	jpend:       i64,
@@ -475,6 +476,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	}
 	m.slot = slot
 	mount_wake(m) or_return
+	mount_shadow_reconcile(m) or_return
 	m.shadow.hold = true
 	m.clean = false
 	save_mount_state(m) or_return
@@ -1323,6 +1325,10 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			}
 		}
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		m.shadow_mark.gen = prim.read_uvarint(&rd)
+		m.shadow_mark.end = prim.read_uvarint(&rd)
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1352,6 +1358,20 @@ mount_jlen :: proc(m: ^Mount) -> i64 {
 		return journal.journal_durable_len(&m.history.journal)
 	}
 	return m.jpend
+}
+
+Shadow_Mark :: struct {
+	gen: u64,
+	end: u64,
+}
+
+@(private)
+mount_shadow_reconcile :: proc(m: ^Mount) -> Error {
+	g, e := shadow_end(&m.shadow)
+	if m.shadow_mark.end != 0 && g == m.shadow_mark.gen && e > m.shadow_mark.end {
+		shadow_rollback(&m.shadow, m.shadow_mark.end) or_return
+	}
+	return .None
 }
 
 Mount_Image :: struct {
@@ -1549,6 +1569,11 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	for a in m.absent {
 		prim.write_str(&w, a)
 	}
+	if shadow_attached(&m.shadow) {
+		m.shadow_mark.gen, m.shadow_mark.end = shadow_end(&m.shadow)
+	}
+	prim.write_uvarint(&w, m.shadow_mark.gen)
+	prim.write_uvarint(&w, m.shadow_mark.end)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		attrib_log_reset(m)
@@ -1559,6 +1584,10 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	m.saved = sum
 	m.log_gen = gen
 	attrib_log_reset(m)
+	if shadow_attached(&m.shadow) && !shadow_dirty(&m.shadow) && shadow_wants_compact(&m.shadow) {
+		shadow_compact(&m.shadow) or_return
+		return save_mount_state(m)
+	}
 	return .None
 }
 

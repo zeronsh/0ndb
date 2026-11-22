@@ -515,9 +515,6 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 	} else {
 		write_header(s, false)
 	}
-	if s.garbage > 4 << 20 && s.garbage > s.log_end / 2 {
-		return shadow_compact(s)
-	}
 	return .None
 }
 
@@ -1495,4 +1492,22 @@ clone_string :: proc(s: string, allocator: runtime.Allocator) -> (string, runtim
 	}
 	copy(buf, s)
 	return string(buf), nil
+}
+
+shadow_end :: proc "contextless" (s: ^Shadow) -> (gen, end: u64) {
+	return s.gen, s.log_end
+}
+
+shadow_rollback :: proc(s: ^Shadow, end: u64) -> Error {
+	if s.log_fd < 0 || end < SHADOW_LOG_HEADER || end >= s.log_end {
+		return .None
+	}
+	from_prim(prim.truncate(s.vfs, s.log_fd, i64(end))) or_return
+	from_prim(prim.datasync(s.vfs, s.log_fd)) or_return
+	s.log_end = end
+	return rebuild_index(s, s.cap)
+}
+
+shadow_wants_compact :: proc "contextless" (s: ^Shadow) -> bool {
+	return s.garbage > 4 << 20 && s.garbage > s.log_end / 2
 }

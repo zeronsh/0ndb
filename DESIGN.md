@@ -362,8 +362,8 @@ equal in both directions.
 - **Shadow** (per mount, under `$DATA/worktrees/<id>/`): for each path the
   inode, stat signature `(mtime_ns, ctime_ns, size, ino, mode)`, content oid
   and version it was last synced at. An on-disk table (append-only records
-  plus an open-addressing hash file), compacted when garbage exceeds half.
-  Only unpersisted changes live in memory.
+  plus an open-addressing hash file), compacted right after a mount state
+  save when garbage exceeds half. Only unpersisted changes live in memory.
 - **First mount** walks with parallel `getdents64`/`statx` workers that exist
   only for the scan. In a git checkout the index is read once: entries whose
   stat matches take the index oid (the file text is then referenced from
@@ -413,11 +413,16 @@ equal in both directions.
   shadow, the mount state (synced frontier, journal position), staged blobs
   and materialization wait for that batch in every durability mode: a pass
   records an image under the history's mark and writes it when the mark is
-  acknowledged.
+  acknowledged. The mount state also records the shadow's generation and
+  log end it was saved against; on open a longer shadow is truncated back
+  to that end, so shadow and synced frontier are always one saved state and
+  a crash between the shadow flush and the state save is undone.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,
   never overwritten, and the plan is rebuilt from the new synced version.
+  Untracked content that is exactly the inode at the target version (what a
+  truncated shadow forgot) is adopted: a shadow entry, no write, no ingest.
   If ingesting changes nothing (an ignored file in the way), nothing is
   written and the path is reported as a collision. The synced version never
   claims anything the disk does not hold. Only durable history is

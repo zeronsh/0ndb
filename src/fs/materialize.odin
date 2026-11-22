@@ -138,7 +138,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	if m.mat_ingest && !merge {
 		held := false
 		for &it in items {
-			if p, blocked := mat_blocker(m, &it); blocked {
+			if p, blocked := mat_blocker(m, &it, tl[:]); blocked {
 				mount_mark(m, p)
 				held = true
 			}
@@ -151,7 +151,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			}
 			if crdt.frontier_eq(one[:], sl[:]) {
 				for &it in items {
-					if p, blocked := mat_blocker(m, &it); blocked {
+					if p, blocked := mat_blocker(m, &it, tl[:]); blocked {
 						c, _ := clone_string(p, m.allocator)
 						append(&m.collided, c)
 					}
@@ -383,18 +383,71 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 }
 
 @(private)
-mat_blocker :: proc(m: ^Mount, it: ^Mat_Item) -> (path: string, blocked: bool) {
+mat_blocker :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> (path: string, blocked: bool) {
 	if it.has_old && it.entry.kind != .Dir && !disk_matches(m, it.old, it.entry) {
 		return it.old, true
 	}
 	if it.present && it.kind != .Dir && (!it.has_old || it.old != it.path) {
 		if d, _ := probe(m, it.path); d.kind != .Missing {
-			if _, known, _ := shadow_get(&m.shadow, it.path); !known {
+			if _, known, _ := shadow_get(&m.shadow, it.path); !known && !mat_is_item(m, it, tl) {
 				return it.path, true
 			}
 		}
 	}
 	return "", false
+}
+
+@(private)
+mat_is_item :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> bool {
+	d, perr := probe(m, it.path)
+	if perr != .None || disk_to_tree(d.kind) != it.kind {
+		return false
+	}
+	switch it.kind {
+	case .Dir:
+		return true
+	case .Symlink:
+		return d.target == it.target
+	case .File:
+		if .Opaque in it.flags {
+			return false
+		}
+		abuf: prim.Path_Buf
+		raw, rerr := prim.read_file(m.vfs, abs_path(m, it.path, abuf[:]), context.temp_allocator)
+		if rerr != .None {
+			return false
+		}
+		disk, cok := eol_clean(m, it.path, raw, it.inode, true)
+		if !cok {
+			return false
+		}
+		ids := crdt.graph_version_ids(&m.history.g, tl, context.temp_allocator)
+		want, werr := history_text_at(m.history, it.inode, ids, context.temp_allocator)
+		return werr == .None && string(disk) == string(want)
+	}
+	return false
+}
+
+@(private)
+mat_adopt :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> (adopted: bool, err: Error) {
+	if m.restoring || !it.present || !mat_is_item(m, it, tl) {
+		return false, .None
+	}
+	if it.has_old && it.old != it.path {
+		if od, _ := probe(m, it.old); od.kind != .Missing {
+			return false, .None
+		}
+		shadow_remove(&m.shadow, it.old) or_return
+	}
+	d, _ := probe(m, it.path)
+	e := Entry{inode = it.inode, kind = it.kind, stat = d.stat}
+	if it.kind == .File && m.db != nil {
+		ids := crdt.graph_version_ids(&m.history.g, tl, context.temp_allocator)
+		data := history_text_at(m.history, it.inode, ids, context.temp_allocator) or_return
+		e.oid, _ = odb.hash(m.db.format, .Blob, data)
+	}
+	shadow_put(&m.shadow, it.path, e) or_return
+	return true, .None
 }
 
 @(private)
@@ -559,6 +612,9 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	}
 	if it.has_old && it.old != it.path {
 		if d, _ := probe(m, it.path); !disk_matches(m, it.path, Entry{kind = it.kind}) && d.kind != .Missing {
+			if adopted := mat_adopt(m, it, tl) or_return; adopted {
+				return .None
+			}
 			mount_mark(m, it.path)
 			return .None
 		}
@@ -578,6 +634,9 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		}
 	} else if !it.has_old && it.kind != .Dir {
 		if d, _ := probe(m, it.path); d.kind != .Missing {
+			if adopted := mat_adopt(m, it, tl) or_return; adopted {
+				return .None
+			}
 			mount_mark(m, it.path)
 			return .None
 		}
