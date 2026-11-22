@@ -26,10 +26,7 @@ libproc_init :: proc(l: ^Libproc, allocator := context.allocator) {
 }
 
 libproc_destroy :: proc(l: ^Libproc) {
-	for len(l.susp.gates) > 0 {
-		_susp_ungate(&l.susp, l.susp.gates[0].id)
-	}
-	delete(l.susp.gates)
+	_susp_close(&l.susp)
 	router_destroy(&l.router)
 	delete(l.roots)
 	l^ = {}
@@ -63,7 +60,7 @@ _libproc_lock_procs :: proc(data: rawptr, lock: string, roots: []string, allocat
 }
 
 libproc_observer :: proc(l: ^Libproc) -> fs.Write_Observer {
-	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop, changed = _libproc_hook, fence = _libproc_fence, gate = _libproc_gate, ungate = _libproc_ungate, lock_procs = _libproc_lock_procs}
+	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop, changed = _libproc_hook, fence = _libproc_fence, gate = _libproc_gate, ungate = _libproc_ungate, gate_max_ms = SUSP_GATE_MAX_MS, lock_procs = _libproc_lock_procs}
 }
 
 @(private)

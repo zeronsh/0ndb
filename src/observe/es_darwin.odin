@@ -248,7 +248,7 @@ endpoint_stats :: proc(e: ^Endpoint) -> Stats {
 }
 
 endpoint_observer :: proc(e: ^Endpoint) -> fs.Write_Observer {
-	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop, changed = _es_changed, fence = _es_fence, gate = _es_gate, ungate = _es_ungate, lock_procs = _libproc_lock_procs}
+	return fs.Write_Observer{data = e, start = _es_start, stop = _es_stop, changed = _es_changed, fence = _es_fence, gate = _es_gate, ungate = _es_ungate, gate_max_ms = SUSP_GATE_MAX_MS, lock_procs = _libproc_lock_procs}
 }
 
 @(private)

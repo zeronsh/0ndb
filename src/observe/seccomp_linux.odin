@@ -73,6 +73,7 @@ Shared :: struct #align (64) {
 }
 
 PARK_MAX :: 64
+PARK_GATE_MAX_MS :: 30_000
 GATE_MAX :: 16
 GATE_EXEMPT :: 16
 LOCKS_SEEN :: 16
@@ -368,7 +369,7 @@ supervisor_trees :: proc(s: ^Supervisor) -> int {
 }
 
 write_observer :: proc(s: ^Supervisor) -> fs.Write_Observer {
-	return fs.Write_Observer{data = s, start = _observer_start, stop = _observer_stop, fence = _observer_fence, gate = _observer_gate, ungate = _observer_ungate, lock_creator = _observer_lock_creator}
+	return fs.Write_Observer{data = s, start = _observer_start, stop = _observer_stop, fence = _observer_fence, gate = _observer_gate, ungate = _observer_ungate, gate_max_ms = PARK_GATE_MAX_MS, lock_creator = _observer_lock_creator}
 }
 
 @(private)

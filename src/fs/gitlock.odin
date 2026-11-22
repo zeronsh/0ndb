@@ -4,6 +4,8 @@ import "core:os"
 import "core:strings"
 import "../prim"
 
+GATE_MAX_MS :: 5_000
+
 Git_Proc :: struct {
 	pid:    prim.Pid,
 	argv:   []string,
@@ -194,6 +196,7 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 	if obs.gate != nil {
 		if id, ok := obs.gate(obs.data, m.root, pids[:]); ok {
 			m.gate_id = id
+			m.gate_timer = prim.timer(m.reg.loop, obs.gate_max_ms if obs.gate_max_ms > 0 else GATE_MAX_MS, m, _gate_overrun)
 		}
 	}
 	mount_schedule(m, 0)
@@ -211,14 +214,37 @@ mount_gated :: proc "contextless" (m: ^Mount) -> bool {
 	return m.gate_id != 0
 }
 
-mount_unlock :: proc(m: ^Mount) {
-	if m.gate_id != 0 {
-		obs := m.reg.observer
-		if obs.ungate != nil {
-			obs.ungate(obs.data, m.gate_id)
-		}
-		m.gate_id = 0
+mount_gate_overruns :: proc "contextless" (m: ^Mount) -> u64 {
+	return m.gate_overruns
+}
+
+@(private)
+_gate_release :: proc(m: ^Mount) {
+	if m.gate_id == 0 {
+		return
 	}
+	if prim.timer_pending(m.reg.loop, m.gate_timer) {
+		prim.timer_cancel(m.reg.loop, m.gate_timer)
+	}
+	obs := m.reg.observer
+	if obs.ungate != nil {
+		obs.ungate(obs.data, m.gate_id)
+	}
+	m.gate_id = 0
+}
+
+@(private)
+_gate_overrun :: proc(l: ^prim.Loop, data: rawptr) {
+	m := (^Mount)(data)
+	if m.gate_id == 0 {
+		return
+	}
+	m.gate_overruns += 1
+	_gate_release(m)
+}
+
+mount_unlock :: proc(m: ^Mount) {
+	_gate_release(m)
 	for w in m.lock_watches {
 		prim.child_unwatch(m.reg.loop, w.cw)
 	}
