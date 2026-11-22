@@ -1377,7 +1377,7 @@ _grant_case :: proc(w: ^World, mw: ^Mem_World) {
 	mw.guest_space = sid
 	mw.guest_ok = true
 	context = instance_context(&g.inst)
-	jerr := eng.space_join_shared(&g.e, sid, "guest")
+	jerr := eng.space_join_shared(&g.e, sid, "guest", "relay", w.relay.public)
 	eng.space_open(&g.e, sid)
 	aerr := eng.accept_share(&g.e, share)
 	node_after(g)
