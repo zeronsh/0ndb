@@ -151,6 +151,7 @@ Local :: struct {
 	ahead:     i64,
 	plain:     bool,
 	tree:      ^Key_Tree,
+	keyed:     bool,
 	drop_id:   Stream_Id,
 	drop_path: string,
 	dropping:  bool,
@@ -580,6 +581,9 @@ replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u
 	if tree != nil {
 		l.tree = tree
 	}
+	when ODIN_DEBUG || ODIN_TEST {
+		assert(!_tree_missing(l), "an object segment is published without its key tree")
+	}
 	if !l.noting {
 		l.hollow = hollow
 	}
@@ -820,6 +824,7 @@ _local_open :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, id:
 	l.id = id
 	l.key = stream_key(scope, id)
 	l.plain = scope.mode == .Transparent
+	l.keyed = !l.plain && _tree_sealed(r, name, epoch, id)
 	l.verify = make([dynamic]u8, r.allocator)
 	n1, e1 := _clone_string(name, r.allocator)
 	p1, e2 := _clone_string(path, r.allocator)
@@ -882,7 +887,7 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 		_local_maybe_free(r, l)
 		return
 	}
-	if r.phase != .Ready || l.fatal || l.blocked || l.retry || l.inflight > 0 || l.verifying || l.ahead > 0 || l.cursor >= l.durable {
+	if r.phase != .Ready || l.fatal || l.blocked || l.retry || l.inflight > 0 || l.verifying || l.ahead > 0 || l.cursor >= l.durable || _tree_missing(l) {
 		_local_drop_prev(r, l)
 		_local_maybe_free(r, l)
 		return
@@ -966,7 +971,24 @@ _wire_form :: proc(l: ^Local, data: []u8, off: i64) -> Error {
 	if l.tree != nil {
 		return keytree_seal_range(l.tree, data, off)
 	}
+	if l.keyed {
+		return .Pending
+	}
 	return _from_journal(journal.seal_range(data, off, static_provider(&l.key)))
+}
+
+@(private)
+_tree_sealed :: proc(r: ^Replicator, name: string, epoch: u64, id: Stream_Id) -> bool {
+	if r.cfg.keys == nil {
+		return false
+	}
+	sealing, _ := r.cfg.keys(r.cfg.user, r.cfg.self, name, epoch, id)
+	return sealing != .Stream_Key
+}
+
+@(private)
+_tree_missing :: proc "contextless" (l: ^Local) -> bool {
+	return l.keyed && l.tree == nil
 }
 
 @(private)
@@ -1130,7 +1152,7 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	n := l.verify_to - l.verify_at
-	if i64(len(l.verify)) != n {
+	if i64(len(l.verify)) != n || _tree_missing(l) {
 		_local_retry(r, l)
 		clear(&l.verify)
 		return

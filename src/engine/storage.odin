@@ -1,8 +1,6 @@
 package engine
 
-import "core:crypto"
 import "../convo"
-import "../journal"
 import omap "../map"
 import "../obj"
 import "../prim"
@@ -356,16 +354,12 @@ _repl_seal :: proc(user: rawptr, name: string, id: osync.Stream_Id, data: []u8, 
 	if sc.mode == .Transparent {
 		return .None
 	}
-	if t, err := _own_tree_get(e, sp, obj_id, kind, &sc, false); err == .None {
-		defer _own_tree_unref(e, t)
-		return osync.keytree_seal_range(&t.tree, data, off)
+	t, err := _own_tree_get(e, sp, obj_id, kind, &sc, false)
+	if err != .None {
+		return .Not_Found if err == .Not_Found else .Io
 	}
-	k := osync.stream_key(&sc, id)
-	defer crypto.zero_explicit(&k, size_of(k))
-	if jerr := journal.seal_range(data, off, osync.static_provider(&k)); jerr != .None {
-		return .Corrupt
-	}
-	return .None
+	defer _own_tree_unref(e, t)
+	return osync.keytree_seal_range(&t.tree, data, off)
 }
 
 @(private)
