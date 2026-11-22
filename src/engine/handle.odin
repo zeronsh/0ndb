@@ -801,7 +801,7 @@ _replica_covers :: proc(rep: ^journal.Replica, n: i64) -> bool {
 
 @(private)
 _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tries := 0) -> Error {
-	fetched := _handle_want(h)
+	fetched := _handle_want(h) || _content_pending(e, h.id)
 	if !fetched && h.sp.repl_on {
 		for sg in h.segs {
 			if !sg.in_view {
