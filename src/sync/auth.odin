@@ -36,6 +36,7 @@ Principal :: struct {
 	check:       proc(data: rawptr, p: ^Principal, access: Access, id: [32]u8) -> bool,
 	data:        rawptr,
 	until:       u64,
+	lapsed:      proc(data: rawptr, p: ^Principal) -> bool,
 }
 
 Authorizer :: struct {

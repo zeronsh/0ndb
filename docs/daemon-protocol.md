@@ -463,7 +463,7 @@ credentials or not at all.
 `runner_pool.renew` readmits a runner whose lease lapsed while it slept:
 answer the lease to grant (the pool caps it at the runner's enrolled lease)
 when the machine is still valid, `permission` otherwise. The runner's side:
-on `lease_lapsed` (its lease lapsed, or its pool lease nears expiry) it
+on `lease_lapsed` (its lease nears expiry or has lapsed; a runner never renews by itself) it
 calls `runner.renewal_request`, passes the request to the pool host's
 `pool.renew`, and applies the answer with `runner.renew`; `0ndb runner`
 does this through `ONDB_POOL_HOST_SOCK`. The renewal is a pool-signed
