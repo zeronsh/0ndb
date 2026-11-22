@@ -40,7 +40,8 @@ Mem_World :: struct {
 	rng:        Rng,
 	owned:      [dynamic]prim.Id,
 	guest_space: prim.Id,
-	guest_token: [eng.CAPABILITY_LEN]u8,
+	guest_token: [2 * eng.CAPABILITY_LEN]u8,
+	guest_ntok:  int,
 	guest_cc:    eng.Cap_Credentials,
 	guest_ok:    bool,
 }
@@ -1388,7 +1389,7 @@ _guest_credentials :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, 
 		return {}, false
 	}
 	n := mw.w.nodes[p.idx]
-	c, err := eng.capability_credentials(&mw.guest_cc, osync.file_keyring(&n.keyring), mw.guest_token[:])
+	c, err := eng.capability_credentials(&mw.guest_cc, osync.file_keyring(&n.keyring), mw.guest_token[:mw.guest_ntok * eng.CAPABILITY_LEN])
 	return c, err == .None
 }
 
@@ -1398,77 +1399,136 @@ _guest_reads :: proc(w: ^World, o: eng.Object, r: eng.Rid, want: string, ms: i64
 }
 
 @(private = "file")
-_grant_case :: proc(w: ^World, mw: ^Mem_World) {
+_grant_share :: proc(w: ^World, mw: ^Mem_World, sid: prim.Id, o: eng.Object) -> bool {
 	a := w.nodes[M_A]
-	context = instance_context(&a.inst)
-	sid, cerr := eng.space_create(&a.e, "granted", "relay", w.relay.public)
-	o, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "granted"})
-	node_after(a)
-	if cerr != .None || oerr != .None {
-		_fail(w, "grant: create %v %v", cerr, oerr)
-		return
-	}
-	append(&mw.owned, sid)
-	r0, _ := _send(w, M_A, o, "grant-0")
-	g := _up(w, M_GUEST)
+	g := w.nodes[M_GUEST]
 	context = instance_context(&a.inst)
 	share, serr := eng.share_object(&a.e, o, g.identity, {.Read})
 	tok, terr := eng.capability_issue(&a.e, eng.Capability{space = sid, grantee = g.identity.id, object = o.id, kind = .Conversation, access = {.Read}}, context.temp_allocator)
 	if serr == .None && terr == .None {
-		copy(mw.guest_token[:], tok)
+		copy(mw.guest_token[mw.guest_ntok * eng.CAPABILITY_LEN:], tok)
+		mw.guest_ntok += 1
 	}
 	node_after(a)
 	if serr != .None || terr != .None {
 		_fail(w, "grant: share %v capability %v", serr, terr)
-		return
+		return false
 	}
 	mw.guest_space = sid
 	mw.guest_ok = true
 	context = instance_context(&g.inst)
-	jerr := eng.space_join_shared(&g.e, sid, "guest", "relay", w.relay.public)
-	eng.space_open(&g.e, sid)
+	jerr := eng.Error.None
+	if mw.guest_ntok == 1 {
+		jerr = eng.space_join_shared(&g.e, sid, "guest", "relay", w.relay.public)
+		eng.space_open(&g.e, sid)
+	}
 	aerr := eng.accept_share(&g.e, share)
 	node_after(g)
 	if jerr != .None || aerr != .None {
 		_fail(w, "grant: guest join %v accept %v", jerr, aerr)
+		return false
+	}
+	return true
+}
+
+@(private = "file")
+_grant_rotate :: proc(w: ^World, sid: prim.Id) -> bool {
+	a := w.nodes[M_A]
+	context = instance_context(&a.inst)
+	rerr := eng.space_rotate(&a.e, sid)
+	node_after(a)
+	if rerr != .None {
+		_fail(w, "grant: rotate: %v", rerr)
+		return false
+	}
+	_settle(w, 1000)
+	return true
+}
+
+@(private = "file")
+_grant_case :: proc(w: ^World, mw: ^Mem_World) {
+	a := w.nodes[M_A]
+	context = instance_context(&a.inst)
+	sid, cerr := eng.space_create(&a.e, "granted", "relay", w.relay.public)
+	o1, oerr1 := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "granted-1"})
+	o2, oerr2 := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "granted-2"})
+	node_after(a)
+	if cerr != .None || oerr1 != .None || oerr2 != .None {
+		_fail(w, "grant: create %v %v %v", cerr, oerr1, oerr2)
 		return
 	}
-	if !_guest_reads(w, o, r0, "grant-0", 20_000) {
-		_fail(w, "grant: the guest cannot read the shared conversation")
+	append(&mw.owned, sid)
+	r1, _ := _send(w, M_A, o1, "one-0")
+	r2, _ := _send(w, M_A, o2, "two-0")
+	_up(w, M_GUEST)
+	if !_grant_share(w, mw, sid, o1) {
 		return
 	}
-	for i in 1 ..= 3 {
-		context = instance_context(&a.inst)
-		rerr := eng.space_rotate(&a.e, sid)
-		node_after(a)
-		if rerr != .None {
-			_fail(w, "grant: rotate %d: %v", i, rerr)
+	if !_guest_reads(w, o1, r1, "one-0", 20_000) {
+		_fail(w, "grant: the guest cannot read the first shared conversation")
+		return
+	}
+	if !_grant_share(w, mw, sid, o2) {
+		return
+	}
+	if !_guest_reads(w, o2, r2, "two-0", 20_000) {
+		_fail(w, "grant: the guest cannot read a second conversation shared from the same space")
+		return
+	}
+	ones := [3]string{"one-1", "one-2", "one-3"}
+	twos := [4]string{"two-1", "two-2", "two-3", "two-4"}
+	for i in 0 ..< 2 {
+		if !_grant_rotate(w, sid) {
 			return
 		}
-		_settle(w, 1000)
-		texts := [4]string{"grant-0", "grant-1", "grant-2", "grant-3"}
-		text := texts[i]
-		ri, _ := _send(w, M_A, o, text)
-		if !_guest_reads(w, o, ri, text, 20_000) {
+		ri1, _ := _send(w, M_A, o1, ones[i])
+		ri2, _ := _send(w, M_A, o2, twos[i])
+		if !_guest_reads(w, o1, ri1, ones[i], 20_000) || !_guest_reads(w, o2, ri2, twos[i], 20_000) {
 			context = instance_context(&a.inst)
 			st, _ := eng.space_members_status(&a.e, sid)
 			node_after(a)
-			_fail(w, "grant: after epoch advance %d (epoch %d) the guest with an unrevoked grant cannot read %q", i, st.epoch, text)
+			_fail(w, "grant: after epoch advance %d (epoch %d) the guest cannot read both granted conversations", i + 1, st.epoch)
 			return
 		}
 	}
+	g := w.nodes[M_GUEST]
 	context = instance_context(&a.inst)
-	verr := eng.share_revoke(&a.e, o, g.identity.id)
+	verr := eng.share_revoke(&a.e, o1, g.identity.id)
 	node_after(a)
 	if verr != .None {
-		_fail(w, "grant: revoke: %v", verr)
+		_fail(w, "grant: revoke the first: %v", verr)
 		return
 	}
 	_settle(w, 2000)
-	rs, _ := _send(w, M_A, o, "after-revoke")
+	rs1, _ := _send(w, M_A, o1, ones[2])
+	rk2, _ := _send(w, M_A, o2, twos[2])
+	if !_guest_reads(w, o2, rk2, twos[2], 20_000) {
+		_fail(w, "grant: after revoking only the first conversation the guest lost the second")
+		return
+	}
+	if !_grant_rotate(w, sid) {
+		return
+	}
+	rk3, _ := _send(w, M_A, o2, twos[3])
+	if !_guest_reads(w, o2, rk3, twos[3], 20_000) {
+		_fail(w, "grant: the guest stopped reading the conversation still granted after another epoch advance")
+		return
+	}
+	if t, rerr := _read(w, M_GUEST, o1, rs1); rerr == .None && t == ones[2] {
+		_fail(w, "grant: the guest decrypted a record of the revoked conversation written after the revoke, although only its relay access was left")
+	}
+	context = instance_context(&a.inst)
+	lerr := eng.share_revoke(&a.e, o2, g.identity.id)
+	node_after(a)
+	if lerr != .None {
+		_fail(w, "grant: revoke the last: %v", lerr)
+		return
+	}
+	_settle(w, 2000)
+	rl, _ := _send(w, M_A, o2, "two-after-last-revoke")
 	_settle(w, 5000)
-	if t, rerr := _read(w, M_GUEST, o, rs); rerr == .None && t == "after-revoke" {
-		_fail(w, "grant: a revoked guest decrypted a record written after the revoke, although only its relay access was left")
+	if t, rerr := _read(w, M_GUEST, o2, rl); rerr == .None && t == "two-after-last-revoke" {
+		_fail(w, "grant: a guest whose last grant was revoked decrypted a later record")
 	}
 	mw.guest_ok = false
 	_down(w, M_GUEST)

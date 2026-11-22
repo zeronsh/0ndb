@@ -1089,7 +1089,7 @@ _state_load :: proc(d: ^Daemon) {
 			continue
 		}
 		tok, rerr := prim.read_file(prim.os_vfs(), fi.fullpath, context.allocator)
-		if rerr != .None || len(tok) != eng.CAPABILITY_LEN {
+		if rerr != .None || len(tok) == 0 || len(tok) % eng.CAPABILITY_LEN != 0 || len(tok) / eng.CAPABILITY_LEN > eng.CAP_MULTI_MAX {
 			delete(tok)
 			continue
 		}
@@ -1281,15 +1281,30 @@ op_credentials_add :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 		return .Io
 	}
 	path, _ := prim.path_join(context.temp_allocator, dir, hex(space))
+	for ce in d.caps {
+		if ce.space != space {
+			continue
+		}
+		next := make([dynamic]u8, context.temp_allocator)
+		for i := 0; i + eng.CAPABILITY_LEN <= len(ce.token); i += eng.CAPABILITY_LEN {
+			old := ce.token[i:][:eng.CAPABILITY_LEN]
+			if string(old[1:1 + 48]) != string(token[1:1 + 48]) {
+				append(&next, ..old)
+			}
+		}
+		append(&next, ..token)
+		if len(next) / eng.CAPABILITY_LEN > eng.CAP_MULTI_MAX {
+			return .Limit
+		}
+		if prim.replace_atomic(prim.os_vfs(), path, next[:]) != .None {
+			return .Io
+		}
+		delete(ce.token)
+		ce.token = clone_bytes(next[:])
+		return .Ok
+	}
 	if prim.replace_atomic(prim.os_vfs(), path, token) != .None {
 		return .Io
-	}
-	for ce in d.caps {
-		if ce.space == space {
-			delete(ce.token)
-			ce.token = clone_bytes(token)
-			return .Ok
-		}
 	}
 	ce := new(Cap_Entry)
 	ce.space = space

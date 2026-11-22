@@ -12,6 +12,24 @@ Grant_Add_Ctx :: struct {
 }
 
 @(private)
+Grant_Scope_Ctx :: struct {
+	subject: osync.Public_Key,
+	object:  prim.Id,
+	add:     bool,
+}
+
+@(private)
+_grant_scope_change :: proc(e: ^Engine, sp: ^Space, subject: osync.Public_Key, object: prim.Id, add: bool) -> Error {
+	sc := Grant_Scope_Ctx{subject = subject, object = object, add = add}
+	build :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, data: rawptr) -> ([]u8, Error) {
+		c := (^Grant_Scope_Ctx)(data)
+		raw, err := osync.membership_scope(m, osync.keyring_member_signer(&e.keyring), c.subject, c.object, c.add, _now_ms(e))
+		return raw, _serr(err)
+	}
+	return _members_change(e, sp, build, &sc, !add)
+}
+
+@(private)
 _grant_member_add :: proc(e: ^Engine, sp: ^Space, recipient: osync.Identity, object: prim.Id, access: Access_Set) {
 	if sp.keyless || !sp.open || !sp.mem.member || sp.mem.removed || sp.mem.revoked {
 		return
@@ -20,14 +38,21 @@ _grant_member_add :: proc(e: ^Engine, sp: ^Space, recipient: osync.Identity, obj
 	if _members_load(e, sp, &m) != .None {
 		return
 	}
-	present := false
+	present, guest, scoped := false, false, false
 	if osync.membership_resolve(&m) == .None {
 		if x := osync.roster_find(&m.roster, recipient.sign); x >= 0 && !m.roster.members[x].removed {
 			present = true
+			guest = m.roster.members[x].kind == .Guest
+			for o in m.roster.members[x].scope {
+				scoped ||= o == object
+			}
 		}
 	}
 	osync.membership_destroy(&m)
 	if present {
+		if guest && !scoped {
+			_grant_scope_change(e, sp, recipient.sign, object, true)
+		}
 		return
 	}
 	scope := make([]prim.Id, 1, context.temp_allocator)
@@ -54,7 +79,28 @@ _grant_member_add :: proc(e: ^Engine, sp: ^Space, recipient: osync.Identity, obj
 
 share_revoke :: proc(e: ^Engine, o: Object, grantee: prim.Id) -> Error {
 	context = context_for(e)
-	return member_remove(e, o.space, grantee)
+	sp := _space_open(e, o.space) or_return
+	m: osync.Membership
+	_members_load(e, sp, &m) or_return
+	subject: osync.Public_Key
+	scoped, last := false, false
+	if osync.membership_resolve(&m) == .None {
+		if x := osync.roster_find_device(&m.roster, grantee); x >= 0 && !m.roster.members[x].removed && m.roster.members[x].kind == .Guest {
+			subject = m.roster.members[x].sign
+			for obj in m.roster.members[x].scope {
+				scoped ||= obj == o.id
+			}
+			last = len(m.roster.members[x].scope) == 1
+		}
+	}
+	osync.membership_destroy(&m)
+	if !scoped {
+		return .Not_Found
+	}
+	if last {
+		return member_remove(e, o.space, grantee)
+	}
+	return _grant_scope_change(e, sp, subject, o.id, false)
 }
 
 @(private)

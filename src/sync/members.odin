@@ -22,6 +22,7 @@ Member_Op :: enum u8 {
 	Renew   = 6,
 	Seal    = 7,
 	Revoke  = 8,
+	Scope   = 9,
 }
 
 Member_Kind :: enum u8 {
@@ -102,6 +103,12 @@ Seal_Body :: struct {
 
 Revoke_Body :: struct {
 	grant: Record_Id,
+}
+
+Scope_Body :: struct {
+	subject: Public_Key,
+	object:  prim.Id,
+	add:     bool,
 }
 
 @(private)
@@ -388,6 +395,25 @@ revoke_decode :: proc(payload: []u8) -> (b: Revoke_Body, err: Error) {
 		return b, .Corrupt
 	}
 	copy(b.grant[:], payload)
+	return b, .None
+}
+
+scope_encode :: proc(b: Scope_Body, out: ^[dynamic]u8) -> Error {
+	w := prim.writer(out)
+	x := b
+	prim.write_raw(&w, x.subject[:])
+	prim.write_u8(&w, 1 if b.add else 0)
+	prim.write_id(&w, b.object)
+	return .No_Memory if w.err != .None else .None
+}
+
+scope_decode :: proc(payload: []u8) -> (b: Scope_Body, err: Error) {
+	if len(payload) != 32 + 1 + 16 || payload[32] > 1 {
+		return b, .Corrupt
+	}
+	copy(b.subject[:], payload[:32])
+	b.add = payload[32] == 1
+	copy(b.object[:], payload[33:])
 	return b, .None
 }
 

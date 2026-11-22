@@ -10,6 +10,9 @@ CAP_VERSION :: 2
 @(private)
 CAP_CREDENTIAL :: u8(2)
 @(private)
+CAP_CREDENTIALS :: u8(3)
+CAP_MULTI_MAX :: 16
+@(private)
 CAP_KEYS_EPOCHS :: 256
 @(private)
 CAP_PROBE_EPOCHS :: 8
@@ -109,15 +112,20 @@ _cap_body :: proc(c: Capability, out: []u8) -> int {
 
 Cap_Credentials :: struct {
 	keyring: osync.Keyring,
-	token:   [CAPABILITY_LEN]u8,
+	tokens:  [CAP_MULTI_MAX][CAPABILITY_LEN]u8,
+	count:   int,
 }
 
-capability_credentials :: proc(cc: ^Cap_Credentials, keyring: osync.Keyring, token: []u8) -> (osync.Credentials, Error) {
-	if len(token) != CAPABILITY_LEN {
+capability_credentials :: proc(cc: ^Cap_Credentials, keyring: osync.Keyring, tokens: []u8) -> (osync.Credentials, Error) {
+	n := len(tokens) / CAPABILITY_LEN
+	if n < 1 || n > CAP_MULTI_MAX || len(tokens) != n * CAPABILITY_LEN {
 		return {}, .Invalid
 	}
 	cc.keyring = keyring
-	copy(cc.token[:], token)
+	cc.count = n
+	for i in 0 ..< n {
+		copy(cc.tokens[i][:], tokens[i * CAPABILITY_LEN:][:CAPABILITY_LEN])
+	}
 	return osync.Credentials{data = cc, produce = _cap_produce}, .None
 }
 
@@ -132,8 +140,15 @@ _cap_produce :: proc(data: rawptr, binding: []u8, out: ^[dynamic]u8) -> osync.Er
 		return err
 	}
 	w := prim.writer(out)
-	prim.write_u8(&w, CAP_CREDENTIAL)
-	prim.write_raw(&w, cc.token[:])
+	if cc.count == 1 {
+		prim.write_u8(&w, CAP_CREDENTIAL)
+	} else {
+		prim.write_u8(&w, CAP_CREDENTIALS)
+		prim.write_u8(&w, u8(cc.count))
+	}
+	for i in 0 ..< cc.count {
+		prim.write_raw(&w, cc.tokens[i][:])
+	}
 	prim.write_raw(&w, id.sign[:])
 	prim.write_raw(&w, sig[:])
 	return .No_Memory if w.err != .None else .None
@@ -149,11 +164,18 @@ Cap_Class :: enum u8 {
 }
 
 @(private)
+Cap_Slot :: struct {
+	class:  Cap_Class,
+	access: Access_Set,
+}
+
+@(private)
 Cap_Grant :: struct {
 	auth:     ^Cap_Authorizer,
-	cap:      Capability,
+	grantee:  prim.Id,
+	access:   Access_Set,
 	key:      [32]u8,
-	suffixes: map[[16]u8]Cap_Class,
+	suffixes: map[[16]u8]Cap_Slot,
 	used:     u64,
 }
 
@@ -206,25 +228,42 @@ _cap_grant_free :: proc(a: ^Cap_Authorizer, g: ^Cap_Grant) {
 @(private)
 _cap_authorize :: proc(data: rawptr, credential: []u8, binding: []u8, local: bool, p: ^osync.Principal) -> osync.Code {
 	a := (^Cap_Authorizer)(data)
-	if len(credential) == 0 || credential[0] != CAP_CREDENTIAL {
+	if len(credential) == 0 || (credential[0] != CAP_CREDENTIAL && credential[0] != CAP_CREDENTIALS) {
 		if a.inner.authorize == nil {
 			return .Auth
 		}
 		return a.inner.authorize(a.inner.data, credential, binding, local, p)
 	}
-	if len(credential) != CAP_CREDENTIAL_LEN {
+	n := 1
+	at := 1
+	if credential[0] == CAP_CREDENTIALS {
+		if len(credential) < 2 {
+			return .Auth
+		}
+		n = int(credential[1])
+		at = 2
+		if n < 2 || n > CAP_MULTI_MAX {
+			return .Auth
+		}
+	}
+	if len(credential) != at + n * CAPABILITY_LEN + 32 + 64 {
 		return .Auth
 	}
-	token := credential[1:][:CAPABILITY_LEN]
+	tokens := credential[at:][:n * CAPABILITY_LEN]
 	pub: osync.Public_Key
-	copy(pub[:], credential[1 + CAPABILITY_LEN:][:32])
-	sig := credential[1 + CAPABILITY_LEN + 32:]
-	c, ok := capability_verify(token, prim.clock_wall_ms(a.clock))
-	if !ok || osync.device_id(pub) != c.grantee {
-		return .Auth
-	}
-	if a.issuer_ok == nil || !a.issuer_ok(a.issuer_data, c.space, c.issuer) {
-		return .Auth
+	copy(pub[:], credential[at + n * CAPABILITY_LEN:][:32])
+	sig := credential[at + n * CAPABILITY_LEN + 32:]
+	caps: [CAP_MULTI_MAX]Capability
+	now := prim.clock_wall_ms(a.clock)
+	for i in 0 ..< n {
+		c, ok := capability_verify(tokens[i * CAPABILITY_LEN:][:CAPABILITY_LEN], now)
+		if !ok || osync.device_id(pub) != c.grantee || (i > 0 && c.space != caps[0].space) {
+			return .Auth
+		}
+		if a.issuer_ok == nil || !a.issuer_ok(a.issuer_data, c.space, c.issuer) {
+			return .Auth
+		}
+		caps[i] = c
 	}
 	if !local && (len(binding) == 0 || !osync.hello_verify(pub, sig, binding)) {
 		return .Auth
@@ -232,11 +271,11 @@ _cap_authorize :: proc(data: rawptr, credential: []u8, binding: []u8, local: boo
 	key: [32]u8
 	ctx: blake2b.Context
 	blake2b.init(&ctx, 32)
-	blake2b.update(&ctx, token)
+	blake2b.update(&ctx, tokens)
 	blake2b.final(&ctx, key[:])
 	g, found := a.grants[key]
 	if !found {
-		g = _cap_grant_new(a, c, key)
+		g = _cap_grant_new(a, caps[:n], key)
 		if g == nil {
 			return .Auth
 		}
@@ -244,8 +283,8 @@ _cap_authorize :: proc(data: rawptr, credential: []u8, binding: []u8, local: boo
 	a.tick += 1
 	g.used = a.tick
 	p^ = osync.Principal {
-		namespace   = c.space,
-		participant = c.grantee,
+		namespace   = caps[0].space,
+		participant = caps[0].grantee,
 		quota       = a.default_quota,
 		check       = _cap_check,
 		data        = g,
@@ -254,7 +293,7 @@ _cap_authorize :: proc(data: rawptr, credential: []u8, binding: []u8, local: boo
 }
 
 @(private)
-_cap_grant_new :: proc(a: ^Cap_Authorizer, c: Capability, key: [32]u8) -> ^Cap_Grant {
+_cap_grant_new :: proc(a: ^Cap_Authorizer, caps: []Capability, key: [32]u8) -> ^Cap_Grant {
 	if len(a.grants) >= CAP_CACHE {
 		oldest: [32]u8
 		best := max(u64)
@@ -271,30 +310,39 @@ _cap_grant_new :: proc(a: ^Cap_Authorizer, c: Capability, key: [32]u8) -> ^Cap_G
 	}
 	g := new(Cap_Grant, a.allocator)
 	g.auth = a
-	g.cap = c
+	g.grantee = caps[0].grantee
 	g.key = key
-	g.suffixes = make(map[[16]u8]Cap_Class, a.allocator)
-	sc: osync.Scope
-	sc.name_key = c.name_key
-	name := _seg_name(c.kind, c.object)
-	cn, cerr := _concat2(osync.CHECKPOINT_STREAM, name)
-	for ep in 0 ..= CAP_PROBE_EPOCHS {
-		g.suffixes[osync.stream_suffix(&sc, name, u64(ep))] = .Segment
-		g.suffixes[osync.stream_suffix(&sc, CARD_STREAM, u64(ep))] = .Card
-		if cerr == .None {
-			g.suffixes[osync.stream_suffix(&sc, cn, u64(ep))] = .Checkpoint
+	g.suffixes = make(map[[16]u8]Cap_Slot, a.allocator)
+	for c in caps {
+		g.access += c.access
+		sc: osync.Scope
+		sc.name_key = c.name_key
+		put :: proc(g: ^Cap_Grant, suffix: [16]u8, class: Cap_Class, access: Access_Set) {
+			slot := g.suffixes[suffix]
+			slot.class = class
+			slot.access += access
+			g.suffixes[suffix] = slot
 		}
-	}
-	if kn, err := _concat2(osync.KEYS_STREAM, name); err == .None {
-		for ep in 0 ..< CAP_KEYS_EPOCHS + CAP_PROBE_EPOCHS {
-			g.suffixes[osync.stream_suffix(&sc, kn, u64(ep))] = .Keys
+		name := _seg_name(c.kind, c.object)
+		cn, cerr := _concat2(osync.CHECKPOINT_STREAM, name)
+		for ep in 0 ..= CAP_PROBE_EPOCHS {
+			put(g, osync.stream_suffix(&sc, name, u64(ep)), .Segment, c.access)
+			put(g, osync.stream_suffix(&sc, CARD_STREAM, u64(ep)), .Card, c.access)
+			if cerr == .None {
+				put(g, osync.stream_suffix(&sc, cn, u64(ep)), .Checkpoint, c.access)
+			}
 		}
+		if kn, err := _concat2(osync.KEYS_STREAM, name); err == .None {
+			for ep in 0 ..< CAP_KEYS_EPOCHS + CAP_PROBE_EPOCHS {
+				put(g, osync.stream_suffix(&sc, kn, u64(ep)), .Keys, c.access)
+			}
+		}
+		if hn, err := _concat2(osync.KEYS_HEAD_STREAM, name); err == .None {
+			put(g, osync.stream_suffix(&sc, hn, 0), .Keys, c.access)
+		}
+		put(g, osync.stream_suffix(&sc, osync.grant_keys_name(c.object), 0), .Grant_Keys, c.access)
+		osync.scope_clear(&sc)
 	}
-	if hn, err := _concat2(osync.KEYS_HEAD_STREAM, name); err == .None {
-		g.suffixes[osync.stream_suffix(&sc, hn, 0)] = .Keys
-	}
-	g.suffixes[osync.stream_suffix(&sc, osync.grant_keys_name(c.object), 0)] = .Grant_Keys
-	osync.scope_clear(&sc)
 	a.grants[key] = g
 	return g
 }
@@ -313,33 +361,33 @@ _concat2 :: proc(a, b: string) -> (string, Error) {
 @(private)
 _cap_check :: proc(data: rawptr, p: ^osync.Principal, access: osync.Access, id: [32]u8) -> bool {
 	g := (^Cap_Grant)(data)
-	c := g.cap
 	switch access {
 	case .Put, .Forget:
-		return .Write in c.access
+		return .Write in g.access
 	case .Get:
-		return .Read in c.access
+		return .Read in g.access
 	case .Fill:
 		return false
 	case .List, .Read, .Append, .Drop, .Redact:
 	}
 	if access == .List && id == {} {
-		return .Read in c.access
+		return .Read in g.access
 	}
 	x := id
 	suffix: [16]u8
 	copy(suffix[:], x[16:])
-	if _, ok := g.suffixes[suffix]; !ok {
+	slot, ok := g.suffixes[suffix]
+	if !ok {
 		return false
 	}
-	own := string(x[:16]) == string(c.grantee[:])
+	own := string(x[:16]) == string(g.grantee[:])
 	#partial switch access {
 	case .List, .Read:
-		return .Read in c.access
+		return .Read in slot.access
 	case .Append, .Drop:
-		return own && .Write in c.access
+		return own && .Write in slot.access
 	case .Redact:
-		return .Redact in c.access || .Write in c.access
+		return .Redact in slot.access || .Write in slot.access
 	}
 	return false
 }
