@@ -125,6 +125,8 @@ _Loop_Os :: struct {
 	writers:     [dynamic]^_Writer,
 	ready:       [dynamic]_Ready,
 	deferred:    [dynamic]win.OVERLAPPED_ENTRY,
+	ready_spare: [dynamic]_Ready,
+	def_spare:   [dynamic]win.OVERLAPPED_ENTRY,
 	ops:         [dynamic]^Overlapped_Op,
 	op_cache:    [dynamic]^Overlapped_Op,
 	stash_n:     int,
@@ -206,6 +208,10 @@ _os_destroy :: proc(l: ^Loop) {
 	delete(l.os.writers)
 	delete(l.os.ready)
 	delete(l.os.deferred)
+	delete(l.os.ready_spare)
+	delete(l.os.def_spare)
+	l.os.ready_spare = nil
+	l.os.def_spare = nil
 	l.os.deferred = nil
 	l.os.ios = nil
 	l.os.writers = nil
@@ -311,23 +317,43 @@ _disarm_timer :: proc(l: ^Loop) {
 _os_poll :: proc(l: ^Loop, timeout_ns: i64) -> Error {
 	ready := len(l.os.ready) > 0
 	if ready {
-		n := len(l.os.ready)
-		for i in 0 ..< n {
-			r := l.os.ready[i]
+		batch := l.os.ready
+		l.os.ready = l.os.ready_spare
+		l.os.ready_spare = nil
+		if l.os.ready == nil {
+			l.os.ready = make([dynamic]_Ready, l.allocator)
+		}
+		for r in batch {
 			if s := _slot_get(l, r.handle, .Fd); s != nil && s.os.kind == .Socket {
 				_dispatch(l, r.handle, r.events & s.events + (r.events & {.Hangup, .Error}))
 			} else {
 				_deliver(l, r.handle, r.events)
 			}
 		}
-		remove_range(&l.os.ready, 0, n)
+		clear(&batch)
+		if l.os.ready_spare == nil {
+			l.os.ready_spare = batch
+		} else {
+			delete(batch)
+		}
 	}
 	if len(l.os.deferred) > 0 {
 		ready = true
-		for i := 0; i < len(l.os.deferred); i += 1 {
-			_entry(l, l.os.deferred[i])
+		batch := l.os.deferred
+		l.os.deferred = l.os.def_spare
+		l.os.def_spare = nil
+		if l.os.deferred == nil {
+			l.os.deferred = make([dynamic]win.OVERLAPPED_ENTRY, l.allocator)
 		}
-		clear(&l.os.deferred)
+		for e in batch {
+			_entry(l, e)
+		}
+		clear(&batch)
+		if l.os.def_spare == nil {
+			l.os.def_spare = batch
+		} else {
+			delete(batch)
+		}
 	}
 	n: int
 	if l.os.stash_n > l.os.stash_pos {
