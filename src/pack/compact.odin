@@ -52,6 +52,22 @@ _compact_pick :: proc(p: ^Pack, all: bool) -> (id: u32, ok: bool) {
 }
 
 @(private)
+_compact_blocked :: proc "contextless" (p: ^Pack) -> bool {
+	if p.opts.compact_ratio <= 0 {
+		return false
+	}
+	for c, i in p.conts {
+		if i == p.active || c.id < p.ck_cont || c.size <= CONT_HDR {
+			continue
+		}
+		if 1.0 - f64(max(c.live, 0)) / f64(c.size - CONT_HDR) >= p.opts.compact_ratio {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
 _relocate :: proc(p: ^Pack, inum: u64, ino: ^Inode, src: Phys, src_bytes: []u8) -> Error {
 	if ino.kind != .File || ino.n == 0 {
 		return .None
@@ -247,7 +263,7 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 	if p.fl.on {
 		return !_async(p) || _polled(p), .None
 	}
-	if _mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 {
+	if _mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 || _compact_blocked(p) {
 		if _async(p) {
 			_flush_start(p) or_return
 		} else {

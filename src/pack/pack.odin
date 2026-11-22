@@ -16,6 +16,7 @@ Options :: struct {
 	merge_fanout:   int,
 	max_runs:       int,
 	compact_ratio:  f64,
+	roll_min:       i64,
 	filter_budget:  int,
 	clock:          prim.Clock,
 	wake:           proc(data: rawptr),
