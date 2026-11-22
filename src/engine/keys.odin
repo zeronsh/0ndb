@@ -29,6 +29,7 @@ Remote_Tree :: struct {
 	loaded:    bool,
 	requested: bool,
 	absent:    bool,
+	watching:  bool,
 	locked:    bool,
 	refs:      int,
 }
@@ -224,6 +225,7 @@ _remote_tree_get :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, device: pr
 	stream := osync.stream_id(scope, device, name, 0)
 	if x, ok := sp.remote_trees[stream]; ok {
 		if epoch > x.epoch {
+			_remote_tree_unwatch(sp, x)
 			x.epoch = epoch
 			if x.loaded {
 				osync.keytree_destroy(&x.tree)
@@ -267,6 +269,9 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if end == 0 {
 		if rt.requested && osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) <= 0 {
 			rt.absent = true
+			if !rt.watching && osync.replicator_follow(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch, false) == .None {
+				rt.watching = true
+			}
 		}
 		if !rt.requested {
 			rt.requested = true
@@ -317,8 +322,20 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	}
 	rt.loaded = true
 	rt.absent = false
+	_remote_tree_unwatch(sp, rt)
 	_held_release(e, sp, rt.device)
 	osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
+}
+
+@(private)
+_remote_tree_unwatch :: proc(sp: ^Space, rt: ^Remote_Tree) {
+	if !rt.watching {
+		return
+	}
+	rt.watching = false
+	if sp.repl_on {
+		osync.replicator_unfollow(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch)
+	}
 }
 
 @(private)

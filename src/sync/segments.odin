@@ -188,6 +188,24 @@ replicator_fetch_checkpoint :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tr
 	return .None
 }
 
+replicator_cancel_checkpoint :: proc(r: ^Replicator, tree: ^Key_Tree) {
+	_enter(r)
+	defer _leave(r)
+	for i := 0; i < len(r.fetches); {
+		f := r.fetches[i]
+		if f.tree != tree {
+			i += 1
+			continue
+		}
+		f.tree = nil
+		if f.state == .Getting {
+			i += 1
+			continue
+		}
+		_fetch_remove(r, f)
+	}
+}
+
 @(private)
 _group_free :: proc(r: ^Replicator, g: ^Group) {
 	delete(g.members)
