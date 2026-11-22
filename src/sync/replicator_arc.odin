@@ -50,6 +50,7 @@ _Src :: struct {
 	size: i64,
 	body: []u8,
 	own:  bool,
+	zeroed: bool,
 }
 
 @(private)
@@ -658,10 +659,17 @@ _arc_drive_once :: proc(r: ^Replicator, rm: ^Remote) {
 				lo = e.end
 				continue
 			case .None:
+				if src.zeroed {
+					done = false
+					lo = e.end
+					continue
+				}
 				_arc_broken(r, rm, e.first, e.end)
 			case .Found:
 				if !_arc_apply(r, rm, e, src.body, keys, sealed) {
 					_arc_broken(r, rm, e.first, e.end)
+				} else if src.id != rm.arc.arm.id {
+					r.restores_read += 1
 				}
 			}
 			progressed = true
@@ -957,6 +965,15 @@ _arc_reader :: proc(r: ^Replicator, rm: ^Remote) -> ^Arc_Read {
 }
 
 @(private)
+_arc_members_grew :: proc(r: ^Replicator, g: ^Group) {
+	for m in g.members {
+		if rm, ok := r.remotes[stream_id(&g.scope, m, g.name, g.epoch)]; ok && rm.arc != nil && rm.arc.rst_init && len(rm.arc.wants) > 0 {
+			_arc_drive(r, rm)
+		}
+	}
+}
+
+@(private)
 _arc_redact_remote :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) -> bool {
 	if to <= from || !_arc_on(r) || rm.arc_of != nil || arc.is_stream(rm.name) || _is_restore(rm.name) {
 		return false
@@ -1041,7 +1058,7 @@ _rst_name :: proc(rm: ^Remote) -> (string, bool) {
 }
 
 @(private)
-_arc_rst_init :: proc(r: ^Replicator, rm: ^Remote) {
+_arc_rst_refresh :: proc(r: ^Replicator, rm: ^Remote) {
 	a := rm.arc
 	a.rst_init = true
 	name, nok := _rst_name(rm)
@@ -1065,6 +1082,16 @@ _arc_rst_init :: proc(r: ^Replicator, rm: ^Remote) {
 		if d == r.cfg.self || d == rm.device || _reserved(full) {
 			continue
 		}
+		known := false
+		for rr in a.rsts {
+			if rr.device == d {
+				known = true
+				break
+			}
+		}
+		if known {
+			continue
+		}
 		rr, err := _remote_get(r, &rm.scope, d, name, rm.epoch)
 		if err != .None || (rr.arc_of != nil && rr.arc_of != rm) {
 			continue
@@ -1073,11 +1100,8 @@ _arc_rst_init :: proc(r: ^Replicator, rm: ^Remote) {
 		rr.plain = true
 		rr.arc_of = rm
 		append(&a.rsts, rr)
-		append(&a.rst_need, max(u64))
-	}
-	for rr, i in a.rsts {
 		_remote_want_tail(r, rr, TAIL_DEFAULT)
-		a.rst_need[i] = rr.want_gen
+		append(&a.rst_need, rr.want_gen)
 	}
 }
 
@@ -1156,9 +1180,7 @@ _rst_own :: proc(r: ^Replicator, rm: ^Remote, buf: ^prim.Path_Buf) -> (id: Strea
 @(private)
 _arc_rst_find :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, keys: journal.Key_Provider) -> (_Res, _Src) {
 	a := rm.arc
-	if !a.rst_init {
-		_arc_rst_init(r, rm)
-	}
+	_arc_rst_refresh(r, rm)
 	wait := false
 	best: _Src
 	best_n := -1
@@ -1197,7 +1219,7 @@ _arc_rst_find :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, keys: jour
 		return .Wait, {}
 	}
 	if best_n < 0 {
-		return .None, {}
+		return .None, _Src{zeroed = true}
 	}
 	return .Found, best
 }
@@ -1398,6 +1420,7 @@ _arc_restore_one :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, x: jour
 			}
 			broken = arc.builder_gone_copy(&b, en.off, en.len, en.head, en.kind == .Gone_Head) != .None
 		case .Redacted:
+			append(&exclude, journal.Range{en.off, hi})
 			broken = arc.builder_hole(&b, en.off, en.len, false, en.commit) != .None
 		case .Body, .Zipped:
 			cm, cerr2 := journal.commitment(&chain, en.body, en.off)
@@ -1420,6 +1443,9 @@ _arc_restore_one :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, x: jour
 	if broken || b.head != g.head_after || b.pos != g.end {
 		_arc_zero_src(r, rm, src)
 		return .None
+	}
+	for h in g.holes {
+		append(&exclude, journal.Range{max(h.from << g.shift, g.first), min(h.to << g.shift, g.end)})
 	}
 	salt: [arc.SALT]u8
 	prim.random_fill(r.cfg.random, salt[:])
@@ -1452,6 +1478,7 @@ _arc_restore_one :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, x: jour
 		return .Wait
 	}
 	end := journal.journal_durable_len(&j)
+	r.restores_written += 1
 	append(&a.pend, _Rst_Pend{arc_off = e.arc_off, local = rid, end = end, src = src.id, src_off = src.off, src_len = src.size})
 	name, _ := _rst_name(rm)
 	al, have := r.locals[rid]

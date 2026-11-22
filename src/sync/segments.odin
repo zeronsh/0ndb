@@ -305,6 +305,7 @@ _segments_seen :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 				_push_follow(r, rm)
 			}
 			_emit(r, Repl_Event{kind = .Segment_Seen, device = dev, name = g.name, epoch = g.epoch, stream = id, length = length})
+			_arc_members_grew(r, g)
 		}
 	}
 	for f in r.fetches {

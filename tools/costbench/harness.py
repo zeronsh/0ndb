@@ -157,6 +157,8 @@ class Relay:
         row = dict(appends=int(m.group(1)), bytes_in=m.group(2), bytes_out=m.group(3), puts=int(m.group(4)), put_bytes=m.group(5)) if m else {}
         if wrote:
             row["relay_write_bytes"] = wrote
+        w = re.search(r"object-store rewrites (\d+) \(([^)]+)\)", log)
+        row.update(rewrite_puts=int(w.group(1)) if w else 0, rewrite_bytes=w.group(2) if w else "0 B")
         g = re.search(r"object-store reads (\d+) \(([^)]+)\)", log)
         if g:
             row.update(gets=int(g.group(1)), get_bytes=g.group(2))
