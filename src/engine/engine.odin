@@ -209,6 +209,7 @@ Config :: struct {
 	git_credentials: Git_Credentials,
 	content_budget:  i64,
 	always_on:       bool,
+	holder_budget:   i64,
 	user:            rawptr,
 }
 

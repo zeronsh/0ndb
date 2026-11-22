@@ -861,6 +861,8 @@ _space_ready :: proc(e: ^Engine, sp: ^Space) {
 	_owned_follow(e, sp)
 	_content_resume(e, sp)
 	_catalog_follow(e, sp)
+	_held_follow(e, sp)
+	_held_scan(e, sp)
 	_pending_republish(e, sp)
 }
 
