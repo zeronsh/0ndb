@@ -315,6 +315,8 @@ Engine :: struct {
 	cursor_inbox: [dynamic]Cursor_Msg,
 	tick:         u64,
 	tick_timer:   prim.Timer,
+	tick_hook:    Tick_Hook,
+	tick_wanted:  bool,
 	settle_timer: prim.Timer,
 	settling:     bool,
 	in_tick:      bool,
@@ -727,6 +729,21 @@ _pack_poll :: proc(e: ^Engine) {
 	}
 }
 
+Tick_Hook :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, e: ^Engine),
+}
+
+set_tick_hook :: proc(e: ^Engine, hook: Tick_Hook) {
+	e.tick_hook = hook
+}
+
+request_tick :: proc(e: ^Engine) {
+	context = context_for(e)
+	e.tick_wanted = true
+	_touch(e)
+}
+
 @(private)
 _touch :: proc(e: ^Engine) {
 	if e.closing {
@@ -764,6 +781,7 @@ _tick_end :: proc(e: ^Engine) {
 	}
 	e.tick += 1
 	e.stats.ticks += 1
+	e.tick_wanted = false
 	_repl_events_process(e)
 	_approvals_step(e)
 	_space_waits_run(e)
@@ -777,6 +795,13 @@ _tick_end :: proc(e: ^Engine) {
 	_mounts_changed(e)
 	_buffers_tick(e)
 	_subs_deliver(e)
+	if e.tick_hook.call != nil {
+		hook := e.tick_hook
+		{
+			context = _outer(e)
+			hook.call(hook.data, e)
+		}
+	}
 	_full_step(e)
 	_index_step(e)
 	_handles_commit(e)
@@ -798,7 +823,7 @@ _tick_end :: proc(e: ^Engine) {
 
 @(private)
 _tick_pending :: proc(e: ^Engine) -> bool {
-	if len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || len(e.leave_ready) > 0 || len(e.refused_stop) > 0 || _remote_pending(e) {
+	if e.tick_wanted || len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || len(e.leave_ready) > 0 || len(e.refused_stop) > 0 || _remote_pending(e) {
 		return true
 	}
 	for _, sp in e.spaces {

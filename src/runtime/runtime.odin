@@ -250,7 +250,6 @@ Runtime :: struct {
 	closing:     bool,
 	spaces:      [dynamic]Space_Watch,
 	pending:     [dynamic]Object,
-	eval_timer:  prim.Timer,
 	waits:       [dynamic]^Eval_Wait,
 	runs:        [dynamic]^Run,
 	procs:       [dynamic]^Proc,
@@ -353,6 +352,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	e.cfg.events = eng.Event_Hook{data = r, event = _on_engine_event}
 	r.hooked = true
 	r.opened = true
+	eng.set_tick_hook(e, eng.Tick_Hook{data = r, call = _on_tick_hook})
 	return .None
 }
 
@@ -421,6 +421,7 @@ close :: proc(r: ^Runtime) {
 		return
 	}
 	r.closing = true
+	eng.set_tick_hook(r.e, {})
 	l := eng.loop(r.e)
 	if r.hooked && r.e.cfg.events.data == r {
 		r.e.cfg.events = r.prev_events
@@ -460,9 +461,6 @@ close :: proc(r: ^Runtime) {
 	for w in r.waits {
 		eng.cancel_waits(r.e, w)
 		free(w, r.allocator)
-	}
-	if r.eval_timer != 0 {
-		prim.timer_cancel(l, r.eval_timer)
 	}
 	if r.warm_timer != 0 {
 		prim.timer_cancel(l, r.warm_timer)
@@ -596,9 +594,6 @@ detach :: proc(r: ^Runtime, space: prim.Id) {
 stats :: proc(r: ^Runtime) -> Stats {
 	s := r.stats
 	n := 0
-	if r.eval_timer != 0 {
-		n += 1
-	}
 	if r.warm_timer != 0 {
 		n += 1
 	}
@@ -744,16 +739,16 @@ _queue_eval :: proc(r: ^Runtime, o: Object) {
 		}
 	}
 	append(&r.pending, o)
-	if r.eval_timer == 0 {
-		r.eval_timer = prim.timer(eng.loop(r.e), 0, r, _on_eval_timer)
-	}
+	eng.request_tick(r.e)
 }
 
 @(private)
-_on_eval_timer :: proc(l: ^prim.Loop, data: rawptr) {
+_on_tick_hook :: proc(data: rawptr, e: ^eng.Engine) {
 	context = eng.context_for((^Runtime)(data).e)
 	r := (^Runtime)(data)
-	r.eval_timer = 0
+	if r.closing || len(r.pending) == 0 {
+		return
+	}
 	list := make([]Object, len(r.pending), context.temp_allocator)
 	copy(list, r.pending[:])
 	clear(&r.pending)
