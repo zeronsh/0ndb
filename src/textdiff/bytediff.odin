@@ -17,6 +17,15 @@ Span :: struct {
 }
 
 byte_diff :: proc(old, new: []u8, allocator := context.allocator) -> (edits: []Byte_Edit, err: Error) {
+	return hunk_edits(old, new, true, allocator)
+}
+
+line_edits :: proc(old, new: []u8, allocator := context.allocator) -> (edits: []Byte_Edit, err: Error) {
+	return hunk_edits(old, new, false, allocator)
+}
+
+@(private)
+hunk_edits :: proc(old, new: []u8, refine: bool, allocator: runtime.Allocator) -> (edits: []Byte_Edit, err: Error) {
 	if len(old) > MAX_BYTES || len(new) > MAX_BYTES {
 		return nil, .Too_Large
 	}
@@ -49,7 +58,11 @@ byte_diff :: proc(old, new: []u8, allocator := context.allocator) -> (edits: []B
 			ls + int(rb.offs[h.b_start]),
 			ls + int(rb.offs[h.b_start + h.b_len]),
 		}
-		refine_hunk(&out, old, new, hunk, scratch_is_result) or_return
+		if refine {
+			refine_hunk(&out, old, new, hunk, scratch_is_result) or_return
+		} else {
+			append(&out, span_edit(hunk)) or_return
+		}
 	}
 	shrink(&out) or_return
 	return out[:], nil

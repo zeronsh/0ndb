@@ -252,6 +252,70 @@ check_integrity :: proc(w: ^World, n: ^Node, oi: int, d: ^Digest, known: ^map[st
 	}
 }
 
+check_whole_tokens :: proc(w: ^World, n: ^Node, oi: int, known: ^map[string]bool) {
+	ob := &w.model.objs[oi]
+	if ob.kind != .Tree && ob.kind != .Text {
+		return
+	}
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	if ob.kind == .Text {
+		if data, err := eng.text_read(&n.e, ob.o, context.temp_allocator); err == .None {
+			_whole_tokens(w, n, oi, "", data, known)
+		}
+		return
+	}
+	names, lerr := eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
+	if lerr != .None {
+		return
+	}
+	for name in names {
+		if data, err := eng.tree_read(&n.e, ob.o, name, context.temp_allocator); err == .None {
+			_whole_tokens(w, n, oi, name, data, known)
+		}
+	}
+}
+
+@(private = "file")
+_whole_tokens :: proc(w: ^World, n: ^Node, oi: int, path: string, data: []u8, known: ^map[string]bool) {
+	ob := &w.model.objs[oi]
+	words := BULK_WORDS
+	i := 0
+	for i < len(data) {
+		c := data[i]
+		if c == '\n' || c == ' ' || c == 0 {
+			i += 1
+			continue
+		}
+		if c == '<' {
+			j := i + 1
+			for j < len(data) && data[j] != '>' && data[j] != '<' && data[j] != '\n' {
+				j += 1
+			}
+			if j < len(data) && data[j] == '>' && string(data[i:j + 1]) in known {
+				i = j + 1
+				continue
+			}
+		}
+		k := i + 1
+		for k < len(data) && data[k] != '\n' && data[k] != ' ' && data[k] != 0 && data[k] != '<' {
+			k += 1
+		}
+		whole := false
+		for x in words {
+			if x == string(data[i:k]) {
+				whole = true
+				break
+			}
+		}
+		if !whole {
+			world_fail(w, "fragment: %s holds %q at %d of %v %s %s, which is not a whole token or word", n.name, string(data[i:k]), i, ob.kind, id_short(ob.o.id), path)
+			return
+		}
+		i = k
+	}
+}
+
 check_integrity_line :: proc(w: ^World, n: ^Node, oi: int, line: string, known: ^map[string]bool) {
 	for t in parse_tokens(transmute([]u8)line) {
 		if !(t.text in known) {
@@ -314,6 +378,7 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 			}
 			if final {
 				check_integrity(w, n, oi, &d, &known)
+				check_whole_tokens(w, n, oi, &known)
 			}
 			if refn < 0 {
 				ref = d
@@ -1244,6 +1309,45 @@ _side_has :: proc(spans: []crdt.Op_Span, op: ^M_Op) -> bool {
 }
 
 @(private = "file")
+_side_holds :: proc(m: ^Model, spans: []crdt.Op_Span, op: ^M_Op) -> bool {
+	cur := op
+	for _ in 0 ..< len(m.ops) {
+		if _side_has(spans, cur) {
+			return true
+		}
+		next: ^M_Op
+		for d in m.ops {
+			if d.idx > cur.idx && d.obj == cur.obj && d.node == cur.node && d.path == cur.path && op_maybe(d) && len(cur.tokens) > 0 && _has_all(d.deletes[:], cur.tokens[:]) {
+				next = d
+				break
+			}
+		}
+		if next == nil {
+			return false
+		}
+		cur = next
+	}
+	return false
+}
+
+@(private = "file")
+_has_all :: proc(set: []string, xs: []string) -> bool {
+	for b in xs {
+		found := false
+		for a in set {
+			if a == b {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+@(private = "file")
 _survived :: proc(m: ^Model, op: ^M_Op) -> bool {
 	if op_happened(op) {
 		return true
@@ -1296,7 +1400,7 @@ check_conflicts :: proc(w: ^World, oi: int) {
 				if file_base(c.path) != p.a.path {
 					continue
 				}
-				if (_side_has(c.ours, p.a) && _side_has(c.theirs, p.b)) || (_side_has(c.ours, p.b) && _side_has(c.theirs, p.a)) {
+				if (_side_holds(m, c.ours, p.a) && _side_holds(m, c.theirs, p.b)) || (_side_holds(m, c.ours, p.b) && _side_holds(m, c.theirs, p.a)) {
 					found = true
 					break
 				}
