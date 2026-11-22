@@ -35,6 +35,7 @@ Write :: struct {
 	dev:     u64,
 	args:    []u8,
 	window:  bool,
+	git:     bool,
 }
 
 Stats :: struct {
@@ -44,6 +45,8 @@ Stats :: struct {
 	failed:        u64,
 	inexact:       u64,
 	stale:         u64,
+	parked:        u64,
+	released:      u64,
 }
 
 Sink :: struct {

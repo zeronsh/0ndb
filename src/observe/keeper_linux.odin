@@ -185,6 +185,23 @@ _keeper_main :: proc "contextless" (ctl: i32, sh: [^]Shared) -> ! {
 				_sys_ioctl(fds[slot] - 1, NOTIF_SEND, &resp)
 			}
 		}
+		for slot in 0 ..< hi {
+			if fds[slot] <= 0 {
+				continue
+			}
+			pn := min(intrinsics.volatile_load(&sh[slot].parked_n), PARK_MAX)
+			for k in 0 ..< pn {
+				id := intrinsics.volatile_load(&sh[slot].parked[k])
+				if id == 0 {
+					continue
+				}
+				resp := Notif_Resp {
+					id    = id,
+					flags = NOTIF_FLAG_CONTINUE,
+				}
+				_sys_ioctl(fds[slot] - 1, NOTIF_SEND, &resp)
+			}
+		}
 	}
 	buf: [NOTIF_BUF]u8
 	for {
