@@ -935,6 +935,9 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 		}
 		node_after(nb)
 	}
+	quiet := attaches_snapshot(w)
+	_settle(w, 120_000)
+	check_reconnects(w, quiet, "the final quiet window")
 }
 
 @(private = "file")

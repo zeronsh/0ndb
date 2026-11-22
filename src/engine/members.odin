@@ -525,6 +525,7 @@ _members_ingest :: proc(e: ^Engine, sp: ^Space, raws: [][]u8) {
 		return
 	}
 	sp.mem.records = len(m.records)
+	_space_unrefuse(e, sp)
 	_members_settle(e, sp, &m)
 }
 

@@ -425,7 +425,7 @@ _notices_adopt :: proc(e: ^Engine, nt: ^osync.Notice) {
 	if space_left(e, sid) {
 		return
 	}
-	if sp, ok := e.spaces[sid]; ok && !sp.keyless {
+	if sp, ok := e.spaces[sid]; ok && !sp.keyless && !sp.refused {
 		return
 	}
 	j: osync.Notice_Join

@@ -66,6 +66,9 @@ Space :: struct {
 	card_relay:   map[prim.Id][dynamic]prim.Id,
 	reopen:       prim.Timer,
 	backoff:      i64,
+	refused:      bool,
+	refusals:     int,
+	admitted:     bool,
 }
 
 @(private)
@@ -180,6 +183,8 @@ space_set_relay :: proc(e: ^Engine, id: prim.Id, relay: string, relay_public: os
 	delete(sp.relay, e.allocator)
 	sp.relay = _clone(relay, e.allocator) or_return
 	sp.relay_public = relay_public
+	sp.refused = false
+	sp.backoff = 0
 	_space_store(e, sp) or_return
 	if was {
 		_, err := _space_open(e, id)
@@ -425,7 +430,7 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	sp.identities[e.self] = e.identity
 	sp.open = true
 	_cards_load(e, sp)
-	if len(sp.relay) > 0 || e.cfg.transport.open != nil {
+	if !sp.refused && (len(sp.relay) > 0 || e.cfg.transport.open != nil) {
 		if rerr := _repl_start(e, sp); rerr != .None {
 			_log(e, .Warn, "replicator start failed")
 		}

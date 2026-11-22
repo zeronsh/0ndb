@@ -465,7 +465,9 @@ finish :: proc(w: ^World) {
 	if w.aborted {
 		return
 	}
+	quiet := attaches_snapshot(w)
 	idle := run_until(w, w.now + 600_000_000_000, true)
+	check_reconnects(w, quiet, "the final idle window")
 	if !idle {
 		world_fail(w, "idle: world never became idle (timers keep firing)")
 	}

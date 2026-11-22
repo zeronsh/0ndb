@@ -118,7 +118,6 @@ link_up :: proc(e: ^Engine, link: Link, binding: []u8 = nil) -> Error {
 	if sp == nil {
 		return .Closed
 	}
-	sp.backoff = 0
 	err := _serr(osync.replicator_link_up(&sp.repl, binding))
 	_touch(e)
 	return err
@@ -153,13 +152,15 @@ link_down :: proc(e: ^Engine, link: Link) {
 }
 
 @(private)
+AUTH_LAG_RETRIES :: 6
+@(private)
 LINK_BACKOFF_MIN :: 250
 @(private)
 LINK_BACKOFF_MAX :: 30_000
 
 @(private)
 _link_schedule :: proc(e: ^Engine, sp: ^Space) {
-	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.reopen != 0 || sp.mem.revoked {
+	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.reopen != 0 || sp.mem.revoked || sp.refused {
 		return
 	}
 	if sp.mem.lapsed && sp.mem.creds.until <= _now_ms(e) {
@@ -179,7 +180,7 @@ _link_reopen :: proc(l: ^prim.Loop, data: rawptr) {
 	e := sp.e
 	context = context_for(e)
 	sp.reopen = 0
-	if e.closing || !sp.repl_on || sp.conn != nil {
+	if e.closing || !sp.repl_on || sp.conn != nil || sp.refused {
 		return
 	}
 	conn, err := _transport_open(e, sp)
@@ -417,6 +418,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 	#partial switch ev.kind {
 	case .Connected:
 		sp.connected = true
+		sp.backoff = 0
+		sp.refusals = 0
+		sp.admitted = true
 		sp.mem.creds.renewal = .None
 		_emit(e, Event{kind = .Connected, space = sp.id})
 		_pending_republish(e, sp)
@@ -429,14 +433,21 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		sp.connected = false
 		if ev.err == .Auth && _leave_refused(e, sp) {
 			sp.mem.revoked = true
+			_space_refuse(e, sp)
 		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.creds.renewal == .Attached {
 			_link_schedule(e, sp)
-		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.lapsed {
+		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.lapsed && sp.mem.creds.renewal != .Presented {
 			_lease_wanted(e, sp)
-		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked {
-			sp.mem.revoked = true
-			_emit(e, Event{kind = .Access_Revoked, space = sp.id, device = e.self, err = .Permission})
-			_waiters_fail_space(e, sp.id, .Permission)
+		} else if ev.err == .Auth && !sp.admitted && !sp.mem.removed && !sp.mem.revoked && sp.mem.creds.renewal != .Presented && sp.refusals < AUTH_LAG_RETRIES {
+			sp.refusals += 1
+			_link_schedule(e, sp)
+		} else if ev.err == .Auth {
+			if !sp.keyless && sp.mem.loaded && !sp.mem.revoked {
+				sp.mem.revoked = true
+				_emit(e, Event{kind = .Access_Revoked, space = sp.id, device = e.self, err = .Permission})
+				_waiters_fail_space(e, sp.id, .Permission)
+			}
+			_space_refuse(e, sp)
 		}
 		_probes_settle(e, sp)
 		_emit(e, Event{kind = .Disconnected, space = sp.id, err = _serr(ev.err)})
@@ -734,4 +745,55 @@ _transport_open :: proc(e: ^Engine, sp: ^Space) -> (rawptr, Error) {
 _transport_send :: proc(e: ^Engine, sp: ^Space, bytes: []u8) -> (int, Error) {
 	context = _outer(e)
 	return e.cfg.transport.send(e.cfg.transport.data, sp.conn, bytes)
+}
+
+@(private)
+_space_refuse :: proc(e: ^Engine, sp: ^Space) {
+	if sp.reopen != 0 {
+		prim.timer_cancel(e.loop, sp.reopen)
+		sp.reopen = 0
+	}
+	if sp.refused {
+		return
+	}
+	sp.refused = true
+	for x in e.refused_stop {
+		if x == sp.id {
+			return
+		}
+	}
+	append(&e.refused_stop, sp.id)
+	_touch(e)
+}
+
+@(private)
+_refused_step :: proc(e: ^Engine) {
+	if len(e.refused_stop) == 0 {
+		return
+	}
+	ids := make([]prim.Id, len(e.refused_stop), context.temp_allocator)
+	copy(ids, e.refused_stop[:])
+	clear(&e.refused_stop)
+	for id in ids {
+		if sp, ok := e.spaces[id]; ok && sp.refused && sp.repl_on {
+			_repl_stop(e, sp)
+		}
+	}
+}
+
+@(private)
+_space_unrefuse :: proc(e: ^Engine, sp: ^Space) {
+	if !sp.refused {
+		return
+	}
+	sp.refused = false
+	sp.mem.revoked = false
+	sp.backoff = 0
+	sp.refusals = 0
+	if sp.open && !sp.repl_on && (len(sp.relay) > 0 || e.cfg.transport.open != nil) {
+		if err := _repl_start(e, sp); err != .None {
+			_log(e, .Warn, "replicator start failed")
+		}
+	}
+	_touch(e)
 }

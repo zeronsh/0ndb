@@ -71,6 +71,7 @@ Node :: struct {
 	ids:         Rng,
 	pack_rng:    Rng,
 	conns:       [dynamic]^Conn,
+	attaches:    map[prim.Id]int,
 	partitioned: bool,
 	durable:     u64,
 	failures:    int,
@@ -399,6 +400,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.disk.wall = clock_wall
 		n.disk.wall_data = &n.clock
 		n.conns = make([dynamic]^Conn, w.allocator)
+		n.attaches = make(map[prim.Id]int, w.allocator)
 		n.mounts = make([dynamic]Sim_Mount, w.allocator)
 		n.writers = make(map[string]Writer_Info, w.allocator)
 		append(&w.nodes, n)
@@ -419,6 +421,7 @@ world_destroy :: proc(w: ^World) {
 		delete(n.sent)
 		disk_destroy(&n.disk)
 		delete(n.conns)
+		delete(n.attaches)
 		delete(n.name, w.allocator)
 		free(n, w.allocator)
 	}

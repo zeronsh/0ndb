@@ -493,6 +493,7 @@ runner_renew :: proc(e: ^Engine, renewal: []u8) -> (spaces: int, err: Error) {
 			sp.reopen = 0
 		}
 		sp.backoff = 0
+		_space_unrefuse(e, sp)
 		_link_schedule(e, sp)
 		spaces += 1
 	}

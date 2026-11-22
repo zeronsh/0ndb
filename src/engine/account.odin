@@ -277,6 +277,7 @@ _account_adopt_begin :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Re
 			continue
 		}
 		if sp, ok := e.spaces[prim.Id(me.space)]; ok && !sp.keyless {
+			_space_unrefuse(e, sp)
 			continue
 		}
 		b := osync.Add_Body{sign = e.identity.sign, box = e.identity.box, kind = .Device, role = .Admin, method = .Account, person = rec.sign, history = true}
