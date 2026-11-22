@@ -90,6 +90,9 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.durability = w.cfg.durability
 	cfg.kernel_tls = false
 	cfg.settle_ms = w.cfg.settle_ms
+	cfg.archive_min = w.cfg.archive_min
+	cfg.archive_group = w.cfg.archive_group
+	cfg.archive_level = 3
 	cfg.search_full = n.idx % 2 == 0
 	cfg.search_hedge_ms = 200
 	cfg.search_deadline_ms = 2000
@@ -598,6 +601,8 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	instance_kill(&rn.inst)
 	stat_add(rn.w, STAT_RELAY_REDACTED_IN, rn.r.stats.redacted_in)
 	stat_add(rn.w, STAT_RELAY_REFUSED_IN, rn.r.stats.refused_in)
+	stat_add(rn.w, STAT_TRIMS, rn.r.stats.trims)
+	stat_add(rn.w, STAT_TRIMMED, rn.r.stats.trimmed)
 	rn.r = {}
 	rn.fs = {}
 	rn.pk = {}

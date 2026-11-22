@@ -366,6 +366,7 @@ _mem_append_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: r
 _mem_fill_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawptr, err: Error) {
 	m := cast(^Mem_Store)data
 	st := cast(^Mem_Stream)s
+	assert(!st.trimmed, "fill below a trimmed base")
 	if at < 0 || total <= 0 || at + total != st.base {
 		return nil, .Conflict
 	}
