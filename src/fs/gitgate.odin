@@ -156,6 +156,11 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 		for p in git_lock_procs(lock, roots) {
 			append(&procs, p)
 		}
+		if len(procs) == 0 && obs.lock_procs != nil {
+			for p in obs.lock_procs(obs.data, lock, roots, context.temp_allocator) {
+				append(&procs, p)
+			}
+		}
 	}
 	if len(procs) == 0 {
 		m.lock_stale = true

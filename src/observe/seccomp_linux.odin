@@ -999,6 +999,7 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) -> bool {
 	w.exact = exact
 	w.dev = ctx.dev
 	w.args = _pcache_args(t, lineage)
+	w.git = _pcache_git(t, lineage)
 	if !_id_valid(t, n.id) {
 		_stat_add(&s.stats.stale)
 		intrinsics.volatile_store(&sh.state, 0)
@@ -1297,6 +1298,7 @@ _control :: proc(s: ^Supervisor, t: ^Tree, n: ^Notif, call: Call, tid: i32, tgid
 			}
 			pe.args = nil
 			pe.args_ok = false
+			pe.git = 0
 			pe.exec_tid = tid
 		}
 	case .Chdir, .Fchdir:

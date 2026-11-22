@@ -253,6 +253,7 @@ Write_Observer :: struct {
 	gate:         proc(data: rawptr, root: string, exempt: []prim.Pid) -> (u32, bool),
 	ungate:       proc(data: rawptr, id: u32),
 	lock_creator: proc(data: rawptr, path: string) -> (prim.Pid, bool),
+	lock_procs:   proc(data: rawptr, lock: string, roots: []string, allocator: runtime.Allocator) -> []Git_Proc,
 }
 
 Mount :: struct {

@@ -992,6 +992,9 @@ _observe_write :: proc(data: rawptr, w: ^observe.Write) {
 	}
 	scope: ^fs.Scope
 	for run in r.runs {
+		if w.git {
+			break
+		}
 		if run.ws == nil || run.proc_ == nil || run.proc_.child.pid <= 0 {
 			continue
 		}
@@ -1013,6 +1016,8 @@ _observe_write :: proc(data: rawptr, w: ^observe.Write) {
 	}
 	if scope != nil {
 		observe.route(&r.router, w, scope)
+	} else if w.git {
+		observe.route(&r.router, w, nil)
 	} else {
 		observe.route_write(&r.router, w)
 	}

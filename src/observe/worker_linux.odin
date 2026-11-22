@@ -326,7 +326,7 @@ _encode_write :: proc(buf: ^[dynamic]u8, w: ^Write) {
 	clear(buf)
 	pw := prim.writer(buf)
 	prim.write_u8(&pw, u8(w.op))
-	prim.write_u8(&pw, u8(w.exact))
+	prim.write_u8(&pw, u8(w.exact) | (2 if w.git else 0))
 	prim.write_u32le(&pw, w.flags)
 	prim.write_u32le(&pw, u32(w.tid))
 	prim.write_u32le(&pw, u32(w.pid))
@@ -346,7 +346,9 @@ _deliver_record :: proc(s: ^Supervisor, rec: []u8) {
 	rd := prim.reader(rec)
 	w: Write
 	w.op = Op(prim.read_u8(&rd))
-	w.exact = prim.read_u8(&rd) != 0
+	bits := prim.read_u8(&rd)
+	w.exact = bits & 1 != 0
+	w.git = bits & 2 != 0
 	w.flags = prim.read_u32le(&rd)
 	w.tid = prim.Pid(i32(prim.read_u32le(&rd)))
 	w.pid = prim.Pid(i32(prim.read_u32le(&rd)))

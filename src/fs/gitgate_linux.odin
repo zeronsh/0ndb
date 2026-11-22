@@ -1,5 +1,6 @@
 package fs
 
+import "base:runtime"
 import "core:strconv"
 import "core:strings"
 import "core:sys/linux"
@@ -15,8 +16,8 @@ git_pid_alive :: proc(pid: prim.Pid) -> bool {
 git_proc_argv :: proc(pid: prim.Pid, allocator := context.temp_allocator) -> []string {
 	buf: [64]u8
 	path := _proc_path(buf[:], pid, "cmdline")
-	data, err := prim.read_file(prim.os_vfs(), path, allocator)
-	if err != .None || len(data) == 0 {
+	data := _proc_read(path, allocator)
+	if len(data) == 0 {
 		return nil
 	}
 	s := string(data)
@@ -45,8 +46,8 @@ git_lock_procs :: proc(lock: string, roots: []string, allocator := context.temp_
 		}
 		pid := prim.Pid(n)
 		buf: [64]u8
-		comm, cerr := prim.read_file(vfs, _proc_path(buf[:], pid, "comm"), context.temp_allocator)
-		if cerr != .None || strings.trim_space(string(comm)) != "git" {
+		comm := _proc_read(_proc_path(buf[:], pid, "comm"), context.temp_allocator)
+		if strings.trim_space(string(comm)) != "git" {
 			continue
 		}
 		holder := _proc_holds(pid, lock)
@@ -87,6 +88,28 @@ _proc_holds :: proc(pid: prim.Pid, lock: string) -> bool {
 			return true
 		}
 	}
+}
+
+@(private)
+_proc_read :: proc(path: string, allocator: runtime.Allocator) -> []u8 {
+	vfs := prim.os_vfs()
+	fd, err := prim.open_file(vfs, path)
+	if err != .None {
+		return nil
+	}
+	defer prim.close_file(vfs, fd)
+	out := make([dynamic]u8, allocator)
+	chunk: [4096]u8
+	off: i64
+	for len(out) < 1 << 20 {
+		n, rerr := prim.read_at(vfs, fd, chunk[:], off)
+		if rerr != .None || n <= 0 {
+			break
+		}
+		append(&out, ..chunk[:n])
+		off += i64(n)
+	}
+	return out[:]
 }
 
 @(private)

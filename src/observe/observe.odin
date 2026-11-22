@@ -35,6 +35,7 @@ Write :: struct {
 	dev:     u64,
 	args:    []u8,
 	window:  bool,
+	git:     bool,
 }
 
 Stats :: struct {

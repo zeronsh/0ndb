@@ -26,6 +26,7 @@ Window :: struct {
 	roots:     [dynamic]Window_Root,
 	decider:   Decider,
 	stats:     Stats,
+	susp:      Win_Gates,
 }
 
 window_init :: proc(w: ^Window, allocator := context.allocator) {
@@ -37,6 +38,10 @@ window_init :: proc(w: ^Window, allocator := context.allocator) {
 }
 
 window_destroy :: proc(w: ^Window) {
+	for len(w.susp.gates) > 0 {
+		_win_ungate(&w.susp, w.susp.gates[0].id)
+	}
+	delete(w.susp.gates)
 	for r in w.roots {
 		win.CloseHandle(r.handle)
 	}
@@ -83,7 +88,7 @@ window_live :: proc(w: ^Window) -> int {
 }
 
 window_observer :: proc(w: ^Window) -> fs.Write_Observer {
-	return fs.Write_Observer{data = w, start = _window_start, stop = _window_stop, changed = _window_hook, fence = _window_fence}
+	return fs.Write_Observer{data = w, start = _window_start, stop = _window_stop, changed = _window_hook, fence = _window_fence, gate = _window_gate, ungate = _window_ungate, lock_procs = _window_lock_procs}
 }
 
 window_changed :: proc(w: ^Window, m: ^fs.Mount, rel: string) -> (scope: ^fs.Scope, found: bool) {
@@ -155,4 +160,25 @@ _window_hook :: proc(data: rawptr, m: ^fs.Mount, rel: string) -> (^fs.Scope, boo
 @(private)
 _window_fence :: proc(data: rawptr, reg: ^fs.Registry, done: proc(data: rawptr), done_data: rawptr) {
 	done(done_data)
+}
+
+@(private)
+_window_gate :: proc(data: rawptr, root: string, exempt: []prim.Pid) -> (u32, bool) {
+	w := (^Window)(data)
+	pids := make([dynamic]prim.Pid, context.temp_allocator)
+	for r in w.roots {
+		append(&pids, r.pid)
+	}
+	return _win_gate(&w.susp, pids[:], exempt, w.allocator)
+}
+
+@(private)
+_window_ungate :: proc(data: rawptr, id: u32) {
+	w := (^Window)(data)
+	_win_ungate(&w.susp, id)
+}
+
+@(private)
+_window_lock_procs :: proc(data: rawptr, lock: string, roots: []string, allocator: runtime.Allocator) -> []fs.Git_Proc {
+	return _win_lock_procs(lock, roots, allocator)
 }

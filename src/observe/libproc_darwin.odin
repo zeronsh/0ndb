@@ -14,6 +14,7 @@ Libproc :: struct {
 	decider:   Decider,
 	pids:      [MAX_LINEAGE]prim.Pid,
 	stats:     Stats,
+	susp:      Susp_Gates,
 }
 
 libproc_init :: proc(l: ^Libproc, allocator := context.allocator) {
@@ -25,6 +26,10 @@ libproc_init :: proc(l: ^Libproc, allocator := context.allocator) {
 }
 
 libproc_destroy :: proc(l: ^Libproc) {
+	for len(l.susp.gates) > 0 {
+		_susp_ungate(&l.susp, l.susp.gates[0].id)
+	}
+	delete(l.susp.gates)
 	router_destroy(&l.router)
 	delete(l.roots)
 	l^ = {}
@@ -53,7 +58,24 @@ libproc_remove_root :: proc(l: ^Libproc, pid: prim.Pid) {
 }
 
 libproc_observer :: proc(l: ^Libproc) -> fs.Write_Observer {
-	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop, changed = _libproc_hook, fence = _libproc_fence}
+	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop, changed = _libproc_hook, fence = _libproc_fence, gate = _libproc_gate, ungate = _libproc_ungate, lock_procs = _libproc_lock_procs}
+}
+
+@(private)
+_libproc_gate :: proc(data: rawptr, root: string, exempt: []prim.Pid) -> (u32, bool) {
+	l := (^Libproc)(data)
+	return _susp_gate(&l.susp, l.roots[:], root, exempt, l.allocator)
+}
+
+@(private)
+_libproc_ungate :: proc(data: rawptr, id: u32) {
+	l := (^Libproc)(data)
+	_susp_ungate(&l.susp, id)
+}
+
+@(private)
+_libproc_lock_procs :: proc(data: rawptr, lock: string, roots: []string, allocator: runtime.Allocator) -> []fs.Git_Proc {
+	return _darwin_lock_procs(lock, roots, allocator)
 }
 
 @(private)
