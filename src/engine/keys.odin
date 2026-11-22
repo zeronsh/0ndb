@@ -30,6 +30,8 @@ Remote_Tree :: struct {
 	tree:      osync.Key_Tree,
 	loaded:    bool,
 	requested: bool,
+	asked:     i64,
+	asked_end: i64,
 	absent:    bool,
 	locked:    bool,
 	refs:      int,
@@ -306,6 +308,19 @@ _remote_tree_get :: proc(e: ^Engine, sp: ^Space, scope: ^osync.Scope, device: pr
 }
 
 @(private)
+_remote_tree_stalled :: proc(sp: ^Space, rt: ^Remote_Tree) -> bool {
+	if !rt.requested || osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) > rt.asked {
+		return false
+	}
+	rep, aerr := osync.replicator_acquire(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch)
+	if aerr != .None {
+		return false
+	}
+	defer osync.replicator_release(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch)
+	return journal.replica_length(rep) <= rt.asked_end
+}
+
+@(private)
 _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if rt.loaded || !sp.repl_on {
 		return
@@ -322,6 +337,8 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 		}
 		if !rt.requested {
 			rt.requested = true
+			rt.asked = osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch)
+			rt.asked_end = 0
 			osync.replicator_want_tail(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch, 4096)
 			e.stats.fetches += 1
 		}
@@ -340,6 +357,8 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	if rerr == .Missing {
 		if !rt.requested {
 			rt.requested = true
+			rt.asked = osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch)
+			rt.asked_end = end
 			osync.replicator_want_tail(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch, 4096)
 		}
 		return
