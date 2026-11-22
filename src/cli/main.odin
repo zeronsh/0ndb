@@ -280,7 +280,10 @@ hex :: proc(id: prim.Id) -> string {
 
 trim_slash :: proc(s: string) -> string {
 	t := strings.trim_right(s, "/")
-	return t if len(t) > 0 else s
+	if len(t) == 0 || (len(t) == 2 && t[1] == ':') {
+		return s[:len(t) + 1] if len(s) > len(t) else s
+	}
+	return t
 }
 
 put :: proc(b: ^[dynamic]u8, parts: ..string) {

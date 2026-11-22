@@ -388,28 +388,53 @@ read_text :: proc(a: ^Args, pos: string) -> string {
 }
 
 abs_path :: proc(p: string) -> string {
-	if len(p) > 0 && p[0] == '/' {
-		return trim_slash(p)
+	q := slashes(p)
+	if !prim.is_abs(q) {
+		cwd, err := os.get_working_directory(context.temp_allocator)
+		if err != nil {
+			fail(.Io, "cannot read the working directory")
+		}
+		q = strings.concatenate({slashes(cwd), "/", q}, context.temp_allocator)
 	}
-	cwd, err := os.get_working_directory(context.temp_allocator)
-	if err != nil {
-		fail(.Io, "cannot read the working directory")
+	root := "/"
+	rest := q
+	keep := 0
+	when ODIN_OS == .Windows {
+		if len(q) >= 2 && q[1] == ':' {
+			d := q[0] - 32 if q[0] >= 'a' && q[0] <= 'z' else q[0]
+			root = strings.concatenate({string([]u8{d}), ":/"}, context.temp_allocator)
+			rest = q[2:]
+		} else if strings.has_prefix(q, "//") {
+			root = "//"
+			rest = q[2:]
+			keep = 2
+		}
 	}
-	j, _ := prim.path_join(context.temp_allocator, cwd, p)
-	parts := strings.split(j, "/", context.temp_allocator)
 	out := make([dynamic]string, context.temp_allocator)
-	for x in parts {
+	for x in strings.split(rest, "/", context.temp_allocator) {
 		switch x {
 		case "", ".":
 		case "..":
-			if len(out) > 0 {
+			if len(out) > keep {
 				pop(&out)
 			}
 		case:
 			append(&out, x)
 		}
 	}
-	return strings.concatenate({"/", strings.join(out[:], "/", context.temp_allocator)}, context.temp_allocator)
+	return strings.concatenate({root, strings.join(out[:], "/", context.temp_allocator)}, context.temp_allocator)
+}
+
+slashes :: proc(p: string) -> string {
+	when ODIN_OS == .Windows {
+		b := make([]u8, len(p), context.temp_allocator)
+		for c, i in transmute([]u8)p {
+			b[i] = '/' if c == '\\' else c
+		}
+		return string(b)
+	} else {
+		return p
+	}
 }
 
 placement :: proc(s: ^Session, ob: api.Object) -> (json.Value, bool) {
