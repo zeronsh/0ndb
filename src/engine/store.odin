@@ -369,12 +369,6 @@ _durable_begin :: proc(e: ^Engine) {
 	}
 	_trees_persist(e)
 	_rlog_settle(e, false)
-	if e.db_open {
-		if err := _derr(odb_barrier(e)); err != .None {
-			_fatal(e, err)
-			return
-		}
-	}
 	_keys_stage(e)
 	b := new(Durable_Batch, e.allocator)
 	b.e = e
@@ -816,4 +810,17 @@ durable_len :: proc(e: ^Engine, path: string) -> (size: i64, err: Error) {
 	}
 	n, perr := pack.durable_size(&e.pk, path)
 	return n, _perr(perr)
+}
+
+@(private)
+_pack_before_commit :: proc(data: rawptr) -> pack.Error {
+	e := (^Engine)(data)
+	context = context_for(e)
+	if !e.db_open {
+		return .None
+	}
+	if err := odb_barrier(e); err != .None {
+		return .Io
+	}
+	return .None
 }

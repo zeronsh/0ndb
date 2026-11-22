@@ -20,6 +20,8 @@ Options :: struct {
 	clock:          prim.Clock,
 	wake:           proc(data: rawptr),
 	wake_data:      rawptr,
+	before_commit:  proc(data: rawptr) -> Error,
+	before_data:    rawptr,
 	deferred_sync:  bool,
 	worker:         Worker_Hook,
 }
