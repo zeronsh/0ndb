@@ -191,3 +191,8 @@ _relay_probe :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> (length,
 	}
 	return l, b, ex
 }
+
+@(init)
+_storage_hooks :: proc "contextless" () {
+	register_final_check(100, check_relay_storage)
+}

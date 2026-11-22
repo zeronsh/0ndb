@@ -1581,9 +1581,9 @@ check_fresh_poll :: proc(w: ^World) {
 				continue
 			}
 			probes := n.e.stats.probes - before
-			w.stats.fresh_polls += 1
+			stat_add(w, STAT_FRESH_POLLS)
 			if probes > 0 {
-				w.stats.fresh_probed += 1
+				stat_add(w, STAT_FRESH_PROBED)
 			}
 			if !d.complete {
 				world_fail(w, "fresh read: %s polled %d fresh reads of %v %s without completing (%d probes, %s)", n.name, polls, m.objs[oi].kind, id_short(m.objs[oi].o.id), probes, why)
@@ -1605,4 +1605,20 @@ check_fresh_poll :: proc(w: ^World) {
 		}
 		delete(ref.text, w.allocator)
 	}
+}
+
+STAT_FRESH_POLLS: Stat
+STAT_FRESH_PROBED: Stat
+
+@(init)
+_check_stats :: proc "contextless" () {
+	register_final_check(10, check_fresh_poll)
+	register_final_check(30, check_map_reapply)
+	register_final_check(50, check_redaction)
+	register_final_check(80, check_relay_redaction)
+	register_final_check(90, check_relay_plaintext)
+	register_final_check(120, check_uploaded)
+	register_stat_line(60)
+	STAT_FRESH_POLLS = register_stat(60, 0, "fresh_polls")
+	STAT_FRESH_PROBED = register_stat(60, 1, "fresh_probed")
 }

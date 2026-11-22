@@ -207,7 +207,7 @@ _keep :: proc(w: ^World, b: ^Sim_Buffer, info: ^eng.Buffer_Info) {
 		w.bufs = make([dynamic]^Sim_Buffer, w.allocator)
 	}
 	append(&w.bufs, b)
-	w.stats.buffers += 1
+	stat_add(w, STAT_BUFFERS)
 }
 
 @(private = "file")
@@ -412,7 +412,7 @@ _burst :: proc(w: ^World, n: ^Node, a: ^Sim_Buffer) {
 	buffers_deliver(w, other, len(other.inbox))
 	_check_client(w, n, a)
 	_check_client(w, n, other)
-	w.stats.bursts += 1
+	stat_add(w, STAT_BURSTS)
 }
 
 @(private = "file")
@@ -496,10 +496,23 @@ check_buffers :: proc(w: ^World) {
 				}
 			}
 			append(&seen, Seen{n.name, text, p})
-			w.stats.anchors_checked += 1
+			stat_add(w, STAT_ANCHORS_CHECKED)
 		}
 		for x in seen {
 			delete(x.text, w.allocator)
 		}
 	}
+}
+
+STAT_BUFFERS: Stat
+STAT_BURSTS: Stat
+STAT_ANCHORS_CHECKED: Stat
+
+@(init)
+_buffers_stats :: proc "contextless" () {
+	register_final_check(40, check_buffers)
+	register_stat_line(30)
+	STAT_BUFFERS = register_stat(30, 0, "buffers_opened")
+	STAT_BURSTS = register_stat(30, 1, "bursts")
+	STAT_ANCHORS_CHECKED = register_stat(30, 2, "anchors_checked")
 }
