@@ -1201,11 +1201,15 @@ history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (ad
 			return 0, .Corrupt
 		}
 		d := stream_dict(h, si)
+		known := len(d.ids)
 		for _ in 0 ..< n {
 			crdt.dict_add(d, prim.read_id(&rd))
 		}
 		if !prim.reader_ok(&rd) {
 			return 0, .Corrupt
+		}
+		if len(d.ids) == known {
+			return 0, .None
 		}
 		return 0, history_persist(h)
 	}
