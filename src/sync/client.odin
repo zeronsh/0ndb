@@ -88,7 +88,7 @@ Client :: struct {
 	streaming: bool,
 	parser:    Parser,
 	bulk:      Event,
-	awaiting:  map[[32]u8]_Await,
+	awaiting:  map[_Await_Key]_Await,
 	await_n:   int,
 	epoch:     u64,
 	sent_mark: u64,
@@ -104,6 +104,19 @@ _Await :: struct {
 }
 
 @(private)
+Await_Family :: enum u8 {
+	Other,
+	Probe,
+	Follow,
+}
+
+@(private)
+_Await_Key :: struct {
+	id:     [32]u8,
+	family: Await_Family,
+}
+
+@(private)
 AWAIT_HELLO :: [32]u8{0 = 0xff, 1 = 0xfe}
 
 client_init :: proc(c: ^Client, allocator := context.allocator) {
@@ -112,7 +125,7 @@ client_init :: proc(c: ^Client, allocator := context.allocator) {
 	}
 	c.out = make([dynamic]u8, allocator)
 	c.held = make([dynamic]u8, allocator)
-	c.awaiting = make(map[[32]u8]_Await, allocator)
+	c.awaiting = make(map[_Await_Key]_Await, allocator)
 	parser_init(&c.parser, false, allocator)
 }
 
@@ -285,33 +298,52 @@ client_deadline_tick :: proc(c: ^Client) -> (stalled: bool) {
 }
 
 @(private)
-_await_add :: proc(c: ^Client, id: [32]u8, n := 1) {
-	a := c.awaiting[id]
+_await_add :: proc(c: ^Client, id: [32]u8, n := 1, family := Await_Family.Other) {
+	k := _Await_Key{id, family}
+	a := c.awaiting[k]
+	if a.count == 0 {
+		a.mark = c.epoch
+	}
 	a.count += n
-	a.mark = c.epoch
-	c.awaiting[id] = a
+	c.awaiting[k] = a
 	c.await_n += n
 }
 
 @(private)
-_await_done :: proc(c: ^Client, id: [32]u8) {
-	a, ok := c.awaiting[id]
+_await_done :: proc(c: ^Client, id: [32]u8, family := Await_Family.Other) {
+	k := _Await_Key{id, family}
+	a, ok := c.awaiting[k]
 	if !ok {
 		return
 	}
 	a.count -= 1
 	c.await_n -= 1
 	if a.count <= 0 {
-		delete_key(&c.awaiting, id)
+		delete_key(&c.awaiting, k)
 		return
 	}
 	a.mark = c.epoch
-	c.awaiting[id] = a
+	c.awaiting[k] = a
 }
 
 @(private)
-_await_progress :: proc(c: ^Client, id: [32]u8) {
-	if a, ok := &c.awaiting[id]; ok {
+_await_done_any :: proc(c: ^Client, id: [32]u8) {
+	best := Await_Family.Other
+	found := false
+	oldest: u64
+	for f in Await_Family {
+		if a, ok := c.awaiting[_Await_Key{id, f}]; ok && a.count > 0 && (!found || a.mark < oldest) {
+			best, oldest, found = f, a.mark, true
+		}
+	}
+	if found {
+		_await_done(c, id, best)
+	}
+}
+
+@(private)
+_await_progress :: proc(c: ^Client, id: [32]u8, family := Await_Family.Other) {
+	if a, ok := &c.awaiting[_Await_Key{id, family}]; ok {
 		a.mark = c.epoch
 	}
 }
@@ -442,7 +474,7 @@ client_probe :: proc(c: ^Client, ids: []Stream_Id) -> Error {
 		}
 		frame_end(b, start, &w) or_return
 		for id in rest[:n] {
-			_await_add(c, cast([32]u8)id)
+			_await_add(c, cast([32]u8)id, 1, .Probe)
 		}
 		rest = rest[n:]
 	}
@@ -464,7 +496,7 @@ client_follow :: proc(c: ^Client, entries: []Follow_Entry, watch: bool) -> Error
 		}
 		frame_end(b, start, &w) or_return
 		for e in rest[:n] {
-			_await_add(c, cast([32]u8)e.stream)
+			_await_add(c, cast([32]u8)e.stream, 1, .Follow)
 		}
 		rest = rest[n:]
 		if len(rest) == 0 {
@@ -827,7 +859,7 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.kind = .Refused
 		ev.code = Code(prim.read_u8(&r))
 		ev.id = get_id32(&r)
-		_await_done(c, ev.id)
+		_await_done_any(c, ev.id)
 	case .Error:
 		ev.kind = .Error
 		ev.code = Code(prim.read_u8(&r))
@@ -915,7 +947,7 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 			if !prim.reader_ok(&r) {
 				return .Protocol
 			}
-			_await_done(c, e.id)
+			_await_done(c, e.id, .Follow if it.frame == .Length else .Probe)
 			handler(user, &e) or_return
 		}
 		return .None

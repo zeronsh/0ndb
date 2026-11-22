@@ -1284,7 +1284,13 @@ checkpoint bundles, as before, plus:
     backoff and republishes unacknowledged appends from the durable journals.
     With nothing awaited the tick is cancelled, so this is a heartbeat only
     while requests are outstanding. A device that sends its first request
-    after a long idle is covered the same way.
+    after a long idle is covered the same way. Progress is tracked per
+    stream and reply family (probes, follows, everything else), never per
+    stream alone: a reply or a new request in one family never refreshes an
+    older unanswered request in another, so a stream with steady probe
+    traffic cannot hide a read the relay never answers. A new request never
+    refreshes older ones in its own family either; only a reply or partial
+    data does.
 
   Limitation, by design: an idle connection to a relay process that is
   frozen while its kernel still acknowledges packets (stopped, or wedged
