@@ -1,0 +1,8 @@
+[package]
+name = "rc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ondb = { path = "../../bindings/rust/ondb" }
+serde_json = "1"
