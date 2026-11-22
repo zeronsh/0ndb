@@ -13,7 +13,7 @@ import "../prim"
 import rt "../runtime"
 import osync "../sync"
 
-POOL_LEASE_MS :: u64(15 * 60 * 1000)
+POOL_LEASE_MS :: u64(#config(ONDB_POOL_LEASE_MS, 15 * 60 * 1000))
 POOL_TOKEN_TTL_MS :: i64(10 * 60 * 1000)
 
 Acct :: struct {
