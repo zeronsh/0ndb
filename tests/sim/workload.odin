@@ -126,6 +126,13 @@ pick_obj :: proc(w: ^World, n: ^Node, kind: M_Kind) -> int {
 	return _pick_obj(w, n, kind)
 }
 
+node_use :: proc(n: ^Node, id: prim.Id) {
+	if n.used == nil {
+		n.used = make(map[prim.Id]bool)
+	}
+	n.used[id] = true
+}
+
 @(private = "file")
 _pick_obj :: proc(w: ^World, n: ^Node, kind: M_Kind) -> int {
 	m := &w.model
@@ -142,6 +149,7 @@ _pick_obj :: proc(w: ^World, n: ^Node, kind: M_Kind) -> int {
 		k := rng_int(&w.rng, len(cands))
 		oi := cands[k]
 		if _visible(w, n, oi) {
+			node_use(n, m.objs[oi].o.id)
 			return oi
 		}
 		unordered_remove(&cands, k)
@@ -848,6 +856,7 @@ deliver_shares :: proc(w: ^World) {
 				append(&m.spaces[si].guests, n.idx)
 			}
 		}
+		node_use(n, ps.share.object)
 		err := eng.accept_share(&n.e, ps.share)
 		node_after(n)
 		world_note(w, "%s accept share %s -> %v", n.name, id_short(ps.share.object), err)

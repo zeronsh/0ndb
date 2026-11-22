@@ -197,6 +197,7 @@ op_mount :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	oi := cands[rng_int(&w.rng, len(cands))]
+	node_use(n, m.objs[oi].o.id)
 	{
 		context = instance_context(&n.inst)
 		_, found, err := eng.catalog_get(&n.e, m.objs[oi].o, context.temp_allocator)

@@ -1519,3 +1519,22 @@ check_uploaded :: proc(w: ^World) {
 		node_after(n)
 	}
 }
+
+check_held :: proc(w: ^World) {
+	m := &w.model
+	for n in w.nodes {
+		if !n.alive || n.e.cfg.search_full {
+			continue
+		}
+		context = instance_context(&n.inst)
+		for ob in m.objs {
+			if n.used[ob.o.id] || ob.creator == n.idx {
+				continue
+			}
+			if held := eng.object_held(&n.e, ob.o); held > 0 {
+				world_fail(w, "held: %s holds %d bytes of %v %s, which it never opened, searched, mounted or was assigned", n.name, held, ob.kind, id_short(ob.o.id))
+			}
+		}
+		node_after(n)
+	}
+}

@@ -207,6 +207,26 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 	return .None
 }
 
+object_held :: proc(e: ^Engine, o: Object) -> (bytes: i64) {
+	context = context_for(e)
+	rec, found, rerr := _rec_get(e, o.id)
+	if rerr != .None || !found || rec.space != o.space {
+		return 0
+	}
+	sp, ok := e.spaces[o.space]
+	if !ok {
+		return 0
+	}
+	scope := _object_scope(sp, o.id)
+	name := _seg_name(rec.kind, o.id)
+	for m in rec.members {
+		if m.device != e.self {
+			bytes += osync.replicator_held(&sp.repl, &scope, osync.Device_Id(m.device), name, m.keys_epoch)
+		}
+	}
+	return
+}
+
 @(private)
 _rec_get :: proc(e: ^Engine, id: prim.Id, allocator := context.temp_allocator) -> (rec: Obj_Rec, found: bool, err: Error) {
 	if v, ok := e.reg.staged[id]; ok {

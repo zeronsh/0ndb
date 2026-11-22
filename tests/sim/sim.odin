@@ -439,6 +439,9 @@ finish :: proc(w: ^World) {
 		if len(w.failures) > 0 {
 			return
 		}
+		if round == 0 {
+			check_held(w)
+		}
 		w.phase = .Check
 		if check_convergence(w, false) && idle {
 			break
