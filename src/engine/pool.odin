@@ -129,7 +129,7 @@ _pool_enroll_space :: proc(e: ^Engine, sp: ^Space, runner: osync.Identity, lease
 		return nil, .Permission
 	}
 	osync.membership_open(&m, osync.Opener{keyring = &e.keyring, self = e.identity})
-	if x := osync.roster_find(&m.roster, runner.sign); x >= 0 && osync.member_active(&m.roster.members[x], now) {
+	if x := osync.roster_find(&m.roster, runner.sign); x >= 0 && !m.roster.members[x].removed {
 		ri, ok := m.ids[m.roster.members[x].added]
 		if ok {
 			c := make([]u8, len(m.raws[ri]), context.temp_allocator)
@@ -198,7 +198,7 @@ _pool_reseal :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 	raws := make([dynamic][]u8, context.temp_allocator)
 	for i in 0 ..< len(m.roster.members) {
 		x := m.roster.members[i]
-		if x.kind != .Runner || x.added_by != e.identity.sign || !osync.member_active(&x, now) {
+		if x.kind != .Runner || x.added_by != e.identity.sign || x.removed || (!osync.member_active(&x, now) && sp.mem.issued[x.sign] <= now) {
 			continue
 		}
 		ai, ok := m.ids[x.added]
@@ -249,20 +249,10 @@ _lease_arm :: proc(e: ^Engine) {
 	now := i64(_now_ms(e))
 	next := i64(-1)
 	for _, sp in e.spaces {
-		if sp.keyless || sp.mem.me != .Runner || sp.mem.lease_ms == 0 || sp.mem.removed {
+		if sp.keyless || sp.mem.me != .Runner || sp.mem.lease_ms == 0 || sp.mem.removed || sp.mem.asked {
 			continue
 		}
-		if sp.mem.lapsed {
-			if sp.mem.asked {
-				continue
-			}
-			due := i64(sp.mem.creds.until) - i64(sp.mem.lease_ms) / 3
-			if next < 0 || due < next {
-				next = due
-			}
-			continue
-		}
-		due := i64(sp.mem.expires) - i64(sp.mem.lease_ms) / 3
+		due := i64(_lease_until(sp)) - i64(sp.mem.lease_ms) / 3
 		if next < 0 || due < next {
 			next = due
 		}
@@ -271,6 +261,19 @@ _lease_arm :: proc(e: ^Engine) {
 		return
 	}
 	e.approvals.lease_timer = prim.timer(e.loop, max(next - now, 1), e, _on_lease)
+}
+
+@(private)
+_lease_until :: proc(sp: ^Space) -> u64 {
+	if sp.mem.lapsed {
+		return sp.mem.creds.until
+	}
+	return max(sp.mem.expires, sp.mem.creds.until)
+}
+
+@(private)
+_lapsed_now :: proc(e: ^Engine, sp: ^Space) -> bool {
+	return sp.mem.lapsed || (sp.mem.me == .Runner && !sp.mem.removed && sp.mem.lease_ms > 0 && sp.mem.expires != 0 && _now_ms(e) > sp.mem.expires)
 }
 
 @(private)
@@ -287,25 +290,11 @@ lease_renew :: proc(e: ^Engine) -> int {
 	now := _now_ms(e)
 	for id in _sorted_keys(e.spaces) {
 		sp := e.spaces[id]
-		if sp.keyless || sp.mem.me != .Runner || sp.mem.lease_ms == 0 || sp.mem.removed {
+		if sp.keyless || sp.mem.me != .Runner || sp.mem.lease_ms == 0 || sp.mem.removed || sp.mem.asked {
 			continue
 		}
-		if sp.mem.lapsed {
-			if !sp.mem.asked && now + sp.mem.lease_ms / 3 >= sp.mem.creds.until {
-				_lease_wanted(e, sp)
-			}
-			continue
-		}
-		if now + sp.mem.lease_ms / 3 < sp.mem.expires {
-			continue
-		}
-		rc := Renew_Ctx{expires = now + sp.mem.lease_ms}
-		build :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, data: rawptr) -> ([]u8, Error) {
-			c := (^Renew_Ctx)(data)
-			raw, err := osync.membership_renew(m, osync.keyring_member_signer(&e.keyring), c.expires, _now_ms(e))
-			return raw, _serr(err)
-		}
-		if _members_change(e, sp, build, &rc, false) == .None {
+		if now + sp.mem.lease_ms / 3 >= _lease_until(sp) {
+			_lease_wanted(e, sp)
 			n += 1
 		}
 	}
@@ -313,10 +302,6 @@ lease_renew :: proc(e: ^Engine) -> int {
 	return n
 }
 
-@(private)
-Renew_Ctx :: struct {
-	expires: u64,
-}
 
 @(private)
 _lease_wanted :: proc(e: ^Engine, sp: ^Space) {
@@ -428,6 +413,7 @@ _pool_lease_space :: proc(e: ^Engine, sp: ^Space, runner: osync.Identity, lease:
 	_pool_reseal_one(e, sp, &m, r)
 	out := make([dynamic]u8, context.temp_allocator)
 	t := osync.Lease_Token{space = sp.id, subject = runner.sign, pool = e.identity.sign, issued = now, expires = now + min(lease, r.lease_ms)}
+	sp.mem.issued[runner.sign] = t.expires
 	_serr(osync.lease_token_make(&e.keyring, t, &out)) or_return
 	return out[:], .None
 }

@@ -621,11 +621,14 @@ _full_settle :: proc(e: ^Engine) {
 		}
 		r := _remote(e)
 		behind := r.behind[sid]
-		prev, said := r.advertised[sid]
-		if said && (prev == behind || (prev > 0 && behind > 0 && abs(prev - behind) < 64)) {
+		if _, said := r.advertised[sid]; said {
 			continue
 		}
-		if _indexer_advertise(e, sp, behind) == .None {
+		current, pending := _indexer_current(e, sp)
+		if pending {
+			continue
+		}
+		if current || _indexer_advertise(e, sp, behind) == .None {
 			r.advertised[sid] = behind
 		}
 	}
@@ -658,6 +661,23 @@ _indexer_advertise :: proc(e: ^Engine, sp: ^Space, behind: int) -> Error {
 		return .None
 	}
 	return err
+}
+
+@(private)
+_indexer_current :: proc(e: ^Engine, sp: ^Space) -> (current: bool, pending: bool) {
+	o := Object{sp.id, named_id(sp.id, INDEXERS_NAME)}
+	me := e.self
+	en, found, err := map_get(e, o, me[:], context.temp_allocator)
+	if err == .Pending {
+		return false, true
+	}
+	if err != .None || !found {
+		return false, false
+	}
+	flags, fok := _entry_u64(&en, INDEXER_TAG_FLAGS)
+	card, cok := omap.entry_register(&en, INDEXER_TAG_CARD)
+	mine, kerr := osync.keyring_card(&e.keyring)
+	return fok && flags & INDEXER_FULL != 0 && cok && kerr == .None && string(card) == string(mine[:]), false
 }
 
 @(private)

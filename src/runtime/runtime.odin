@@ -465,9 +465,6 @@ close :: proc(r: ^Runtime) {
 		if sw.runners != 0 {
 			eng.unsubscribe(r.e, sw.runners)
 		}
-		if r.cfg.runner {
-			_advertise(r, sw.space, 0)
-		}
 	}
 	for w in r.waits {
 		eng.cancel_waits(r.e, w)

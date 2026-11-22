@@ -1061,7 +1061,14 @@ _can :: proc(c: ^Conn, access: Access, id: [32]u8) -> bool {
 	if _reserved(id) {
 		return false
 	}
-	return principal_allows(&c.principal, access, id)
+	if principal_allows(&c.principal, access, id) {
+		return true
+	}
+	if c.principal.lapsed != nil && c.principal.lapsed(c.principal.data, &c.principal) {
+		_fail(c, .Auth)
+		_conn_kick(c)
+	}
+	return false
 }
 
 @(private)

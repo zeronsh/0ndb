@@ -1578,21 +1578,28 @@ signs and unwraps on request, so the backend never holds raw key bytes.
   records; the runner presents them as hello proofs (`runner_enroll`).
   Enrollment is idempotent (an active runner gets its existing `Add` back)
   and crash-safe (the proof is carried until the runner's own stream holds
-  it). The runner renews with `Renew` records on one timer (its only armed
-  timer); a lapsed lease is refused by the relay. A runner that slept past
-  its lease is readmitted only by its pool: it signs a renewal request with
-  its device key, the host's `Runner_Pool.renew` decides whether the machine
-  is still valid, and the pool answers with a `Lease{space, subject, issued,
-  expires}` token per space, signed by the pool and capped at issued +
-  lease_ms. The token is an ephemeral hello proof: the relay admits it when
+  it). A runner never writes a renewal record: its `Add` carries the first
+  lease, and every later lease comes from its pool as an ephemeral token.
+  On one timer (its only armed timer) a third of a lease before expiry, or
+  on waking past it, it asks (`lease_lapsed`): it signs a renewal request
+  with its device key, the host's `Runner_Pool.renew` decides whether the
+  machine is still valid, and the pool answers with a `Lease{space,
+  subject, issued, expires}` token per space, signed by the pool and capped
+  at issued + lease_ms. The token is a hello proof: the relay admits it when
   the signer is the pool that added the runner, the runner's `Add` stands
-  with no `Remove`, and it has not expired, and stores nothing. The runner
-  keeps the newest token, presents it on reconnects until it expires, and
-  asks again (`lease_lapsed`) when it nears expiry, so sleep and wake cost no
-  membership records. While lapsed it never writes a self-`Renew`, and a
-  refused hello waits for a renewal instead of revoking access. Runners are not leaves: no
-  epoch rotation per runner. On a rotation the host `Seal`s the new epoch to
-  its live runners.
+  with no `Remove`, and it has not expired, and stores nothing. A session
+  whose lease runs out is closed with `Auth`, and the runner reconnects with
+  its newest token (kept locally and presented until it expires); a refusal
+  waits for a renewal instead of revoking access. So neither uptime nor
+  sleep and wake cost membership records. The pool remembers the leases it
+  issued and seals each new epoch to the runners holding one; member
+  listings show a runner as removed only after a `Remove`. Runners are not
+  leaves: no epoch rotation per runner.
+- What a runner writes when it starts is latest-state-wins and only when it
+  changed: its advert in `0ndb:runners` and its indexer entry in
+  `0ndb:indexers` are written once the map has loaded and differs, and
+  stopping writes nothing (presence tells devices it is gone), so a runner
+  that wakes a hundred times costs the relay what one start costs.
 - Runners never authorize runners: devices and runners only write placement
   requests; the host launches and enrolls. Per-run scoped grants (capability
   tokens plus `Share`s carrying object epoch keys) remain only for

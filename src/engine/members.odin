@@ -57,6 +57,7 @@ Space_Members :: struct {
 	deferred:    bool,
 	elect_wait:  bool,
 	want:        map[prim.Id]i64,
+	issued:      map[osync.Public_Key]u64,
 }
 
 Member_Info :: struct {
@@ -111,6 +112,7 @@ _members_init :: proc(e: ^Engine, sp: ^Space) {
 	sp.mem.epochs = make([dynamic]Space_Epoch, e.allocator)
 	sp.mem.seen = make(map[prim.Id]i64, e.allocator)
 	sp.mem.want = make(map[prim.Id]i64, e.allocator)
+	sp.mem.issued = make(map[osync.Public_Key]u64, e.allocator)
 	sp.mem.creds.proofs = make([dynamic][]u8, e.allocator)
 	sp.mem.enrolls = make([dynamic]i64, e.allocator)
 	sp.mem.creds.space = sp.id
@@ -125,6 +127,7 @@ _members_free :: proc(e: ^Engine, sp: ^Space) {
 	delete(sp.mem.epochs)
 	delete(sp.mem.seen)
 	delete(sp.mem.want)
+	delete(sp.mem.issued)
 	for p in sp.mem.creds.proofs {
 		delete(p, e.allocator)
 	}
@@ -800,7 +803,7 @@ space_members :: proc(e: ^Engine, space: prim.Id, allocator := context.allocator
 			added_by = osync.device_id(x.added_by),
 			added_at = x.added_hlc,
 			expires  = x.expires,
-			removed  = !osync.member_active(&x, _now_ms(e)),
+			removed  = x.removed || (x.kind != .Runner && !osync.member_active(&x, _now_ms(e))),
 			self     = x.device == e.self,
 			label    = _clone_str_or_empty(string(x.label), allocator),
 		}
