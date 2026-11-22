@@ -8,16 +8,16 @@ import "core:time"
 import "core:sys/posix"
 import "../../src/prim"
 
-os_region_map :: proc(base: uintptr, size: uint) -> bool {
+os_region_map :: proc(base: uintptr, size: uint) -> (ok: bool, why: string) {
 	ptr := posix.mmap(rawptr(base), size, {.READ, .WRITE}, {.PRIVATE, .ANONYMOUS})
 	if ptr == posix.MAP_FAILED {
-		return false
+		return false, fmt.tprintf("mmap failed: %v", posix.errno())
 	}
 	if uintptr(ptr) != base {
 		posix.munmap(ptr, size)
-		return false
+		return false, fmt.tprintf("the range is in use; the kernel placed it at %p", ptr)
 	}
-	return true
+	return true, ""
 }
 
 os_region_unmap :: proc(base: uintptr, size: uint) {

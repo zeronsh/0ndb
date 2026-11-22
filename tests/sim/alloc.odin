@@ -5,7 +5,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 
-REGION_BASE :: uintptr(0x6000_0000_0000)
+REGION_BASE :: uintptr(0x2000_0000_0000)
 REGION_ALIGN :: uintptr(64 << 20)
 
 region_main_size := uint(256 << 20)
@@ -37,17 +37,17 @@ Region :: struct {
 	sites:  ^map[uintptr]runtime.Source_Code_Location,
 }
 
-region_map :: proc(r: ^Region, base: uintptr, size: uint, bump: bool) -> bool {
+region_map :: proc(r: ^Region, base: uintptr, size: uint, bump: bool) -> (ok: bool, why: string) {
 	r^ = {}
-	if !os_region_map(base, size) {
-		return false
+	if mok, mwhy := os_region_map(base, size); !mok {
+		return false, mwhy
 	}
 	r.base = base
 	r.size = size
 	r.top = base
 	r.bump = bump
 	r.mapped = true
-	return true
+	return true, ""
 }
 
 region_unmap :: proc(r: ^Region) {

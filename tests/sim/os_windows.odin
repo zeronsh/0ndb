@@ -5,16 +5,16 @@ import "core:strconv"
 import win "core:sys/windows"
 import "../../src/prim"
 
-os_region_map :: proc(base: uintptr, size: uint) -> bool {
+os_region_map :: proc(base: uintptr, size: uint) -> (ok: bool, why: string) {
 	ptr := win.VirtualAlloc(rawptr(base), size, win.MEM_RESERVE | win.MEM_COMMIT, win.PAGE_READWRITE)
 	if ptr == nil {
-		return false
+		return false, fmt.tprintf("VirtualAlloc failed: error %d", win.GetLastError())
 	}
 	if uintptr(ptr) != base {
 		win.VirtualFree(ptr, 0, win.MEM_RELEASE)
-		return false
+		return false, fmt.tprintf("the range is in use; VirtualAlloc placed it at %p", ptr)
 	}
-	return true
+	return true, ""
 }
 
 os_region_unmap :: proc(base: uintptr, size: uint) {
