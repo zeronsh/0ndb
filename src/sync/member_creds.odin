@@ -20,7 +20,7 @@ account_namespace :: proc(account: Public_Key) -> (id: Space_Id) {
 	return
 }
 
-member_credential :: proc(space: Space_Id, keyring: ^Keyring, binding: []u8, proofs: [][]u8, out: ^[dynamic]u8) -> Error {
+member_credential :: proc(space: Space_Id, keyring: ^Keyring, binding: []u8, proofs: [][]u8, out: ^[dynamic]u8, lease: []u8 = nil) -> Error {
 	id := keyring.identity(keyring.data)
 	buf: [16 + HASH_LEN]u8
 	msg := hello_message(binding, &buf)
@@ -36,6 +36,9 @@ member_credential :: proc(space: Space_Id, keyring: ^Keyring, binding: []u8, pro
 	prim.write_uvarint(&w, u64(n))
 	for p in proofs[:n] {
 		prim.write_bytes(&w, p)
+	}
+	if len(lease) > 0 {
+		prim.write_bytes(&w, lease)
 	}
 	if w.err != .None || len(out) > CREDENTIAL_MAX {
 		return .Too_Large

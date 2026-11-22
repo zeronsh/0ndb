@@ -282,6 +282,31 @@ _proof_stage :: proc(e: ^Engine, sp: ^Space, proof: []u8) {
 }
 
 @(private)
+_lease_load :: proc(e: ^Engine, sp: ^Space) {
+	path, perr := _members_file(e, sp.id, "lease")
+	if perr != .None {
+		return
+	}
+	data, err := prim.read_file(e.vfs, path, context.temp_allocator)
+	if err != .None || len(data) != osync.LEASE_TOKEN_LEN {
+		return
+	}
+	t, ok := osync.lease_token_parse(data)
+	if !ok || t.space != sp.id || t.expires <= _now_ms(e) {
+		return
+	}
+	copy(sp.mem.creds.lease[:], data)
+	sp.mem.creds.until = t.expires
+}
+
+@(private)
+_lease_store :: proc(e: ^Engine, sp: ^Space, token: []u8) {
+	if path, perr := _members_file(e, sp.id, "lease"); perr == .None {
+		prim.replace_atomic(e.vfs, path, token)
+	}
+}
+
+@(private)
 _proofs_load :: proc(e: ^Engine, sp: ^Space) {
 	path, perr := _members_file(e, sp.id, "proofs")
 	if perr != .None {
@@ -377,6 +402,7 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	}
 	_members_init(e, sp)
 	_proofs_load(e, sp)
+	_lease_load(e, sp)
 	if !sp.keyless {
 		_members_restore(e, sp)
 	}

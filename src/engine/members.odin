@@ -21,6 +21,15 @@ Member_Creds :: struct {
 	space:   prim.Id,
 	keyring: osync.Keyring,
 	proofs:  [dynamic][]u8,
+	lease:   [osync.LEASE_TOKEN_LEN]u8,
+	until:   u64,
+	renewal: Renewal,
+}
+
+Renewal :: enum u8 {
+	None,
+	Attached,
+	Presented,
 }
 
 Space_Members :: struct {
@@ -29,6 +38,8 @@ Space_Members :: struct {
 	epochs:      [dynamic]Space_Epoch,
 	current:     int,
 	removed:     bool,
+	lapsed:      bool,
+	asked:       bool,
 	revoked:     bool,
 	me:          osync.Member_Kind,
 	role:        osync.Role,
@@ -70,6 +81,8 @@ Members_Status :: struct {
 	records:  int,
 	removed:  bool,
 	revoked:  bool,
+	lapsed:   bool,
+	lease_until: u64,
 }
 
 @(private)
@@ -322,7 +335,12 @@ _members_adopt :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 		sp.mem.lease_ms = x.lease_ms
 		sp.mem.expires = x.expires
 		was := sp.mem.removed
-		sp.mem.removed = !osync.member_active(x, _now_ms(e))
+		active := osync.member_active(x, _now_ms(e))
+		sp.mem.lapsed = !active && !x.removed && x.kind == .Runner && x.lease_ms > 0
+		sp.mem.removed = !active && !sp.mem.lapsed
+		if !sp.mem.lapsed {
+			sp.mem.asked = false
+		}
 		if sp.mem.removed && !was {
 			_emit(e, Event{kind = .Access_Revoked, space = sp.id, device = e.self})
 			_waiters_fail_space(e, sp.id, .Permission)
@@ -639,7 +657,13 @@ _member_creds_produce :: proc(data: rawptr, binding: []u8, out: ^[dynamic]u8) ->
 	c := cast(^Member_Creds)data
 	ps := make([][]u8, len(c.proofs), context.temp_allocator)
 	copy(ps, c.proofs[:])
-	return osync.member_credential(osync.Space_Id(c.space), &c.keyring, binding, ps, out)
+	if c.until == 0 {
+		return osync.member_credential(osync.Space_Id(c.space), &c.keyring, binding, ps, out)
+	}
+	if c.renewal == .Attached {
+		c.renewal = .Presented
+	}
+	return osync.member_credential(osync.Space_Id(c.space), &c.keyring, binding, ps, out, c.lease[:])
 }
 
 @(private)
@@ -751,6 +775,8 @@ space_members_status :: proc(e: ^Engine, space: prim.Id) -> (s: Members_Status, 
 		}
 	}
 	s.removed = sp.mem.removed
+	s.lapsed = sp.mem.lapsed
+	s.lease_until = sp.mem.creds.until
 	s.revoked = sp.mem.revoked
 	return s, .None
 }

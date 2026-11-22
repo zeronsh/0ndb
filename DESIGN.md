@@ -1328,7 +1328,18 @@ signs and unwraps on request, so the backend never holds raw key bytes.
   Enrollment is idempotent (an active runner gets its existing `Add` back)
   and crash-safe (the proof is carried until the runner's own stream holds
   it). The runner renews with `Renew` records on one timer (its only armed
-  timer); a lapsed lease is refused by the relay. Runners are not leaves: no
+  timer); a lapsed lease is refused by the relay. A runner that slept past
+  its lease is readmitted only by its pool: it signs a renewal request with
+  its device key, the host's `Runner_Pool.renew` decides whether the machine
+  is still valid, and the pool answers with a `Lease{space, subject, issued,
+  expires}` token per space, signed by the pool and capped at issued +
+  lease_ms. The token is an ephemeral hello proof: the relay admits it when
+  the signer is the pool that added the runner, the runner's `Add` stands
+  with no `Remove`, and it has not expired, and stores nothing. The runner
+  keeps the newest token, presents it on reconnects until it expires, and
+  asks again (`lease_lapsed`) when it nears expiry, so sleep and wake cost no
+  membership records. While lapsed it never writes a self-`Renew`, and a
+  refused hello waits for a renewal instead of revoking access. Runners are not leaves: no
   epoch rotation per runner. On a rotation the host `Seal`s the new epoch to
   its live runners.
 - Runners never authorize runners: devices and runners only write placement
@@ -1343,7 +1354,9 @@ signs and unwraps on request, so the backend never holds raw key bytes.
   never reach them; the log they see is identities and roles). Compromise of
   the host plus the pool key reads what the pool can read (spaces with access
   Everything or its scope) and nothing else, and can enroll runners, which
-  every device sees. Nobody can forge device-signed history (segments are
+  every device sees. A runner key outlives its sandbox by at most one lease:
+  after a lapse only the pool readmits it, and a `Remove` refuses every
+  later token, including replays. Nobody can forge device-signed history (segments are
   hash-chained and signed by their writers; the pool key signs only pool
   records). The model provider sees what is sent to it.
 

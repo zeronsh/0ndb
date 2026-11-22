@@ -162,6 +162,9 @@ _link_schedule :: proc(e: ^Engine, sp: ^Space) {
 	if e.closing || !sp.repl_on || e.cfg.transport.open == nil || sp.reopen != 0 || sp.mem.revoked {
 		return
 	}
+	if sp.mem.lapsed && sp.mem.creds.until <= _now_ms(e) {
+		return
+	}
 	base := max(sp.backoff, LINK_BACKOFF_MIN)
 	sp.backoff = min(base * 2, LINK_BACKOFF_MAX)
 	j: [2]u8
@@ -410,6 +413,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 	#partial switch ev.kind {
 	case .Connected:
 		sp.connected = true
+		sp.mem.creds.renewal = .None
 		_emit(e, Event{kind = .Connected, space = sp.id})
 		_pending_republish(e, sp)
 		_relay_redact_resend(e, sp)
@@ -419,7 +423,11 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_held_scan(e, sp)
 	case .Disconnected:
 		sp.connected = false
-		if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked {
+		if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.creds.renewal == .Attached {
+			_link_schedule(e, sp)
+		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked && sp.mem.lapsed {
+			_lease_wanted(e, sp)
+		} else if ev.err == .Auth && !sp.keyless && sp.mem.loaded && !sp.mem.revoked {
 			sp.mem.revoked = true
 			_emit(e, Event{kind = .Access_Revoked, space = sp.id, device = e.self, err = .Permission})
 			_waiters_fail_space(e, sp.id, .Permission)

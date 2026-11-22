@@ -23,7 +23,7 @@ SEARCH_MODE_NAMES := [3]string{"default", "full", "local"}
 SEARCH_STATE_NAMES := [7]string{"ok", "partial", "offline", "timeout", "denied", "failed", "cancelled"}
 DIR_NAMES := [2]string{"older", "newer"}
 EVENT_PLACEMENT :: u64(10)
-EVENT_NAMES := [27]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed"}
+EVENT_NAMES := [28]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed", "lease_lapsed"}
 
 event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 	switch kind {
@@ -61,6 +61,8 @@ event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 		return 25
 	case .Login_Failed:
 		return 26
+	case .Lease_Lapsed:
+		return 27
 	}
 	return u64(len(EVENT_NAMES))
 }

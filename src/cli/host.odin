@@ -51,6 +51,7 @@ PLUG_POOL_VERIFY :: 7
 PLUG_POOL_ATTEST :: 8
 PLUG_USER_JOINED :: 10
 PLUG_CRED_PRODUCE :: 12
+PLUG_POOL_RENEW :: 15
 
 PLUG_FNS := []Plug_Fn {
 	{PLUG_STORE_GET, "sealed_store.get", .Sealed_Store, 15_000, true, {{"subject", .Bytes, nil}}, {{"record", .Bytes, nil}, {"entries", .Strs, nil}}},
@@ -60,6 +61,7 @@ PLUG_FNS := []Plug_Fn {
 	{PLUG_REGISTER, "unlock.register", .Unlock, 120_000, true, {{"rp_user", .Bytes, nil}, {"label", .Str, nil}, {"salt", .Bytes, nil}}, {{"credential", .Bytes, nil}, {"prf", .Bytes, nil}, {"ecosystem", .Enum, ECOSYSTEM_NAMES}}},
 	{PLUG_POOL_VERIFY, "runner_pool.verify", .Runner_Pool, 15_000, true, {{"token", .Bytes, nil}, {"sign", .Bytes, nil}, {"box", .Bytes, nil}}, {{"lease_ms", .U64, nil}}},
 	{PLUG_POOL_ATTEST, "runner_pool.attest", .Runner_Pool, 15_000, true, {{"evidence", .Bytes, nil}, {"sign", .Bytes, nil}, {"box", .Bytes, nil}}, {}},
+	{PLUG_POOL_RENEW, "runner_pool.renew", .Runner_Pool, 15_000, true, {{"sign", .Bytes, nil}, {"box", .Bytes, nil}}, {{"lease_ms", .U64, nil}}},
 	{PLUG_USER_JOINED, "pool_user.joined", .Pool_User, 0, false, {{"space", .Id, nil}, {"name", .Str, nil}, {"relay", .Str, nil}, {"relay_key", .Bytes, nil}, {"proof", .Bytes, nil}}, {}},
 	{PLUG_CRED_PRODUCE, "credentials.produce", .Credentials, 5_000, false, {{"space", .Id, nil}, {"binding", .Bytes, nil}}, {{"credential", .Bytes, nil}}},
 }
@@ -156,7 +158,7 @@ host_plugs_setup :: proc(d: ^Daemon, ec: ^eng.Config, args: ^Args) -> bool {
 		return false
 	}
 	if .Runner_Pool in hc.enabled {
-		ec.runner_pool = eng.Runner_Pool{data = d, identity = _hp_pool_identity, verify = _hp_pool_verify, attest = _hp_pool_attest, cancel = _hp_cancel}
+		ec.runner_pool = eng.Runner_Pool{data = d, identity = _hp_pool_identity, verify = _hp_pool_verify, attest = _hp_pool_attest, cancel = _hp_cancel, renew = _hp_pool_renew}
 	}
 	if .Pool_User in hc.enabled {
 		ec.runner_pool = eng.Runner_Pool{data = d, identity = _hp_user_identity, joined = _hp_user_joined, cancel = _hp_cancel}
@@ -563,7 +565,7 @@ _plug_reply :: proc(fn: ^Plug_Fn, out: ^api.Call, reply: ^osync.Plug_Reply) -> o
 			}
 			reply.ecosystem = osync.Ecosystem(eco)
 		}
-	case PLUG_POOL_VERIFY:
+	case PLUG_POOL_VERIFY, PLUG_POOL_RENEW:
 		reply.lease_ms = api.a_u64(out, "lease_ms")
 	case PLUG_CRED_PRODUCE:
 		cred := api.a_bytes(out, "credential")
@@ -705,6 +707,12 @@ _hp_user_identity :: proc(data: rawptr) -> osync.Identity {
 _hp_pool_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	r := runner
 	return _plug_issue((^Daemon)(data), PLUG_POOL_VERIFY, {{"token", token}, {"sign", r.sign[:]}, {"box", r.box[:]}}, done)
+}
+
+@(private)
+_hp_pool_renew :: proc(data: rawptr, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
+	r := runner
+	return _plug_issue((^Daemon)(data), PLUG_POOL_RENEW, {{"sign", r.sign[:]}, {"box", r.box[:]}}, done)
 }
 
 @(private)

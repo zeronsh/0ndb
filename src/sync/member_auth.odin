@@ -158,8 +158,20 @@ _authorize_member :: proc(a: ^Member_Authorizer, credential: []u8, binding: []u8
 		return .Auth
 	}
 	m := &s.m.roster.members[idx]
-	if m.sign != sign || !member_active(m, _now(a)) {
+	if m.sign != sign {
 		return .Auth
+	}
+	until: u64
+	if !member_active(m, _now(a)) {
+		if prim.reader_remaining(&r) == 0 {
+			return .Auth
+		}
+		lease := prim.read_bytes(&r)
+		u, ok := lease_admits(&s.m.roster, space, sign, lease, _now(a))
+		if !prim.reader_ok(&r) || !ok {
+			return .Auth
+		}
+		until = u
 	}
 	p^ = Principal {
 		namespace   = space,
@@ -167,6 +179,7 @@ _authorize_member :: proc(a: ^Member_Authorizer, credential: []u8, binding: []u8
 		quota       = quota,
 		check       = _member_check,
 		data        = a,
+		until       = until,
 	}
 	return .None
 }
@@ -253,7 +266,7 @@ _member_check :: proc(data: rawptr, p: ^Principal, access: Access, id: [32]u8) -
 		return false
 	}
 	m := &s.m.roster.members[idx]
-	if !member_active(m, _now(a)) {
+	if !member_active(m, _now(a)) && (m.removed || p.until <= _now(a)) {
 		return false
 	}
 	switch access {

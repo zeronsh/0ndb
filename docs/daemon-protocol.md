@@ -244,7 +244,7 @@ Event codes: 0 connected, 1 disconnected, 2 durable, 3 uploaded,
 14 indexer_wanted, 15 unavailable, 16 available, 17 promoted,
 18 peer_misbehaving, 19 members_changed, 20 epoch_changed,
 21 access_revoked, 22 runner_enrolled, 23 runner_anomaly,
-24 approval_requested, 25 login_done, 26 login_failed. The meaning of each
+24 approval_requested, 25 login_done, 26 login_failed, 27 lease_lapsed. The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
 conversation's next run is, or that it waits for a runner), `presence`
 (device up or down, `tick` 1 or 0), `connected`/`disconnected` (relay link of
@@ -325,7 +325,7 @@ Enabling. The daemon decides at start which plugs a host supplies:
 | `sealed_store` | get, put, add | the account server keyed by login subject |
 | `unlock` | unlock, register | the platform passkey (WebAuthn PRF) |
 | `credentials` | produce | relay credentials for the spaces the host lists |
-| `runner_pool` | verify, attest | this daemon is a cloud pool host |
+| `runner_pool` | verify, attest, renew | this daemon is a cloud pool host |
 | `pool_user` | joined (notification) | this device's account includes a cloud pool |
 
 (`runner_pool` and `pool_user` exclude each other.) Plugs not listed keep the
@@ -366,6 +366,7 @@ for replies that mean "no", use `not_found`, `conflict`, `permission` or
 | 5 | `unlock.register` | rp_user: bytes, label: str, salt: bytes (32) | credential: bytes, prf: bytes (32), ecosystem: enum | 120 s |
 | 7 | `runner_pool.verify` | token: bytes, sign: bytes, box: bytes | lease_ms: uvarint; `permission` for a bad token | 15 s |
 | 8 | `runner_pool.attest` | evidence: bytes, sign: bytes, box: bytes | {}; `permission` to refuse | 15 s |
+| 15 | `runner_pool.renew` | sign: bytes, box: bytes | lease_ms: uvarint; `permission` when the machine is gone | 15 s |
 | 10 | `pool_user.joined` | space: id, name: str, relay: str, relay_key: bytes, proof: bytes | notification | – |
 | 12 | `credentials.produce` | space: id, binding: bytes | credential: bytes | 5 s |
 
@@ -385,6 +386,15 @@ retried after a restart). `credentials.produce` returns the credential for
 one relay connection, bound to `binding` (the relay's challenge); it is never
 held for a host to register: with none, the space connects with member
 credentials or not at all.
+
+`runner_pool.renew` readmits a runner whose lease lapsed while it slept:
+answer the lease to grant (the pool caps it at the runner's enrolled lease)
+when the machine is still valid, `permission` otherwise. The runner's side:
+on `lease_lapsed` (its lease lapsed, or its pool lease nears expiry) it
+calls `runner.renewal_request`, passes the request to the pool host's
+`pool.renew`, and applies the answer with `runner.renew`; `0ndb runner`
+does this through `ONDB_POOL_HOST_SOCK`. The renewal is a pool-signed
+lease per space that the relay checks at hello and never stores.
 
 Asynchronous end to end. A plug request suspends only the engine flow that
 made it (a sign-in, a passkey change, a pool enrollment, one relay
@@ -551,6 +561,9 @@ up exist only over the socket.
 | 28 | `account.join_space` | space: id | {} |
 | 29 | `pool.enroll` | token: bytes, card: bytes, evidence: bytes | enrollment:bytes |
 | 30 | `runner.enroll` | enrollment: bytes | spaces:uvarint |
+| 145 | `runner.renewal_request` | – | request:bytes |
+| 146 | `pool.renew` | request: bytes | renewal:bytes |
+| 147 | `runner.renew` | renewal: bytes | spaces:uvarint |
 | 31 | `lease.renew` | – | renewed:uvarint |
 | 32 | `account.login_prf` | subject: str, credential: bytes, prf: bytes, label: str, relay: str, relay_key: bytes | path:enum login_path status:enum login_status code:str spaces:uvarint |
 | 33 | `account.passkey_add` | label: str, credential: bytes, prf: bytes | {} |

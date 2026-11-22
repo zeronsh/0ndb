@@ -25,6 +25,7 @@ Acct :: struct {
 	host_sock: string,
 	secret:    [32]u8,
 	d:         ^Daemon,
+	renew_timer: prim.Timer,
 }
 
 account_store_dir :: proc(home: string) -> string {
@@ -65,7 +66,7 @@ acct_setup :: proc(d: ^Daemon, ec: ^eng.Config, args: ^Args) -> bool {
 			prim.random_fill({}, a.secret[:])
 			prim.replace_atomic(prim.os_vfs(), sp, a.secret[:])
 		}
-		ec.runner_pool = eng.Runner_Pool{data = a, identity = _pool_host_identity, verify = _pool_host_verify}
+		ec.runner_pool = eng.Runner_Pool{data = a, identity = _pool_host_identity, verify = _pool_host_verify, renew = _pool_host_renew}
 	} else if card := os.get_env("ONDB_POOL_CARD", context.temp_allocator); len(card) > 0 {
 		raw, ok := hex_decode(card)
 		if ok && len(raw) == osync.CARD_LEN {
@@ -141,6 +142,46 @@ _pool_host_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity, rep
 	}
 	reply.lease_ms = POOL_LEASE_MS
 	return .None
+}
+
+@(private)
+_pool_host_renew :: proc(data: rawptr, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
+	reply.lease_ms = POOL_LEASE_MS
+	return .None
+}
+
+runner_lease_lapsed :: proc(d: ^Daemon) {
+	if len(d.acct.host_sock) == 0 || d.acct.renew_timer != 0 {
+		return
+	}
+	d.acct.renew_timer = prim.timer(&d.s.loop, 0, d, _runner_renew)
+}
+
+@(private)
+_runner_renew :: proc(l: ^prim.Loop, data: rawptr) {
+	d := (^Daemon)(data)
+	d.acct.renew_timer = 0
+	req, err := eng.runner_renewal_request(&d.s.e, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	r := req_begin("pool.renew")
+	req_str(&r, "request", hex_of(req))
+	rep, ok := call_at(d.acct.host_sock, req_end(&r), 10000)
+	if !ok || rep.status != .Ok {
+		fmt.eprintfln("0ndb runner: the pool did not renew the lease (%s)", api.STATUS_NAMES[int(rep.status)])
+		return
+	}
+	en, hok := hex_decode(jstr(rep.value, "renewal"))
+	if !hok {
+		return
+	}
+	n, rerr := eng.runner_renew(&d.s.e, en)
+	if rerr != .None {
+		fmt.eprintfln("0ndb runner: cannot apply the lease renewal (%v)", rerr)
+		return
+	}
+	fmt.eprintfln("0ndb runner: the pool renewed the lease in %d spaces", n)
 }
 
 @(private)

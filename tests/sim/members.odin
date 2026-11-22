@@ -174,6 +174,12 @@ _pool_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity, reply: ^
 }
 
 @(private = "file")
+_pool_renew :: proc(data: rawptr, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
+	reply.lease_ms = M_LEASE_MS
+	return .None
+}
+
+@(private = "file")
 _pool_joined :: proc(data: rawptr, space: prim.Id, name: string, relay: string, relay_public: osync.Public_Key, proof: []u8) {
 	mw := (^Mem_Plug)(data).mw
 	c := make([]u8, len(proof), mw.w.allocator)
@@ -192,7 +198,7 @@ _node_cfg :: proc(n: ^Node, cfg: ^eng.Config) {
 	cfg.approver = true
 	cfg.notices_rotate = 2048
 	if n.idx == M_POOL {
-		cfg.runner_pool = eng.Runner_Pool{data = p, identity = _pool_identity, verify = _pool_verify}
+		cfg.runner_pool = eng.Runner_Pool{data = p, identity = _pool_identity, verify = _pool_verify, renew = _pool_renew}
 	} else {
 		cfg.runner_pool = eng.Runner_Pool{data = p, identity = _pool_identity, joined = _pool_joined}
 	}
@@ -245,6 +251,90 @@ _read :: proc(w: ^World, idx: int, o: eng.Object, r: eng.Rid) -> (text: string, 
 	}
 	t := msg_text(msg)
 	return fmt.aprintf("%s", t, allocator = w.allocator), .None
+}
+
+@(private = "file")
+_advance :: proc(w: ^World, ms: i64) {
+	until := w.now + ms * 1_000_000
+	run_until(w, until, true)
+	w.now = max(w.now, until)
+}
+
+@(private = "file")
+_renewal :: proc(w: ^World) -> (renewal: []u8, ok: bool) {
+	rn := w.nodes[M_RUNNER]
+	pool := w.nodes[M_POOL]
+	if !rn.alive || !pool.alive {
+		return nil, false
+	}
+	context = instance_context(&rn.inst)
+	req, qerr := eng.runner_renewal_request(&rn.e, w.allocator)
+	node_after(rn)
+	if qerr != .None {
+		return nil, false
+	}
+	context = instance_context(&pool.inst)
+	en, perr := eng.pool_renew(&pool.e, req, w.allocator)
+	node_after(pool)
+	context = w.ctx
+	return en, perr == .None
+}
+
+@(private = "file")
+_renew :: proc(w: ^World) -> bool {
+	en, ok := _renewal(w)
+	if !ok {
+		return false
+	}
+	rn := w.nodes[M_RUNNER]
+	context = instance_context(&rn.inst)
+	n, err := eng.runner_renew(&rn.e, en)
+	node_after(rn)
+	context = w.ctx
+	return err == .None && n > 0
+}
+
+@(private = "file")
+_sleep_wake :: proc(w: ^World, space: prim.Id, o: eng.Object) {
+	before, berr := _status(w, M_A, space)
+	if berr != .None {
+		_fail(w, "membership status: %v", berr)
+		return
+	}
+	for i in 0 ..< 3 {
+		_down(w, M_RUNNER)
+		_advance(w, i64(M_LEASE_MS) + 60_000)
+		a_text := fmt.aprintf("while-asleep-%d", i, allocator = w.allocator)
+		b_text := fmt.aprintf("after-wake-%d", i, allocator = w.allocator)
+		defer delete(a_text, w.allocator)
+		defer delete(b_text, w.allocator)
+		asleep, _ := _send(w, M_A, o, a_text)
+		_settle(w, 2000)
+		_up(w, M_RUNNER)
+		_settle(w, 4000)
+		if st, serr := _status(w, M_RUNNER, space); serr != .None || st.removed || st.revoked || !st.lapsed {
+			_fail(w, "wake %d: a lapsed runner is not held as lapsed: %v %v", i, serr, st)
+		}
+		if t, rerr := _read(w, M_RUNNER, o, asleep); rerr == .None && t == a_text {
+			_fail(w, "wake %d: a lapsed runner read before its pool renewed it", i)
+		}
+		if !_renew(w) {
+			_fail(w, "wake %d: the pool did not renew the runner", i)
+			return
+		}
+		if !_wait_read(w, M_RUNNER, o, asleep, a_text, 20_000) {
+			_fail(w, "wake %d: access did not return after the pool renewed the lease", i)
+		}
+		woke, wok := _send(w, M_RUNNER, o, b_text)
+		if !wok || !_wait_read(w, M_A, o, woke, b_text, 20_000) {
+			_fail(w, "wake %d: a renewed runner's write did not reach n0", i)
+		}
+	}
+	_settle(w, 3000)
+	after, aerr := _status(w, M_A, space)
+	if aerr != .None || after.records != before.records {
+		_fail(w, "the membership log grew with sleep/wake cycles: %d -> %d records, %d -> %d members", before.records, after.records, before.members, after.members)
+	}
 }
 
 @(private = "file")
@@ -619,6 +709,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	if !_wait_read(w, M_A, convs[0], rs, "runner-while-users-offline", 20_000) {
 		_fail(w, "n0 cannot read what the runner wrote while it was offline")
 	}
+	_sleep_wake(w, spaces[0], convs[0])
 
 	_up(w, M_D)
 	{
@@ -752,13 +843,40 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	}
 
 	_down(w, M_RUNNER)
-	run_until(w, w.now + i64(M_LEASE_MS + 120_000) * 1_000_000, true)
+	_advance(w, i64(M_LEASE_MS) + 120_000)
 	l2, _ := _send(w, M_A, convs[1], "after-lease")
 	_settle(w, 3000)
 	_up(w, M_RUNNER)
 	_settle(w, 4000)
 	if t, rerr := _read(w, M_RUNNER, convs[1], l2); rerr == .None && t == "after-lease" {
 		_fail(w, "runner kept access after its lease lapsed")
+	}
+	stale, stale_ok := _renewal(w)
+	if !stale_ok {
+		_fail(w, "the pool did not renew a lapsed runner")
+	}
+	remove: {
+		context = instance_context(&pool.inst)
+		rerr := eng.member_remove(&pool.e, spaces[1], w.nodes[M_RUNNER].identity.id)
+		node_after(pool)
+		context = w.ctx
+		if rerr != .None {
+			_fail(w, "the pool could not remove its runner: %v", rerr)
+		}
+	}
+	_settle(w, 4000)
+	l3, _ := _send(w, M_A, convs[1], "after-removal")
+	_settle(w, 2000)
+	replay: {
+		rn := w.nodes[M_RUNNER]
+		context = instance_context(&rn.inst)
+		eng.runner_renew(&rn.e, stale)
+		node_after(rn)
+		context = w.ctx
+	}
+	_settle(w, 5000)
+	if t, rerr := _read(w, M_RUNNER, convs[1], l3); rerr == .None && t == "after-removal" {
+		_fail(w, "a removed runner was readmitted by a replayed lease")
 	}
 	if !_wait_read(w, M_D, convs[1], l2, "after-lease", 20_000) {
 		_fail(w, "n5 cannot read space1 after the runner's lease lapsed")

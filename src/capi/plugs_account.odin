@@ -51,6 +51,7 @@ C_Runner_Pool :: struct {
 	attest:   proc "c" (ud: rawptr, evidence: [^]u8, evidence_len: uint, runner: ^C_Identity, call: ^Plug_Call),
 	joined:   proc "c" (ud: rawptr, space: ^[16]u8, name: [^]u8, name_len: uint, relay: [^]u8, relay_len: uint, relay_key: ^[32]u8, proof: [^]u8, proof_len: uint),
 	cancel:   proc "c" (ud: rawptr, call: ^Plug_Call),
+	renew:    proc "c" (ud: rawptr, runner: ^C_Identity, call: ^Plug_Call),
 }
 
 Plug_Kind :: enum u8 {
@@ -359,6 +360,7 @@ account_plugs_setup :: proc(p: ^Account_Plugs, cfg: ^Config, ec: ^eng.Config) ->
 			attest   = _c_pool_attest if p.pool.attest != nil else nil,
 			joined   = _c_pool_joined if p.pool.joined != nil else nil,
 			cancel   = _c_plug_cancel,
+			renew    = _c_pool_renew if p.pool.renew != nil else nil,
 		}
 	}
 	if _has(cfg, offset_of(Config, approver)) {
@@ -433,6 +435,15 @@ _c_pool_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity, reply:
 	c := _id_to_c(runner)
 	pc := _pc_new(p, .Pool, done)
 	p.pool.verify(p.pool.ud, raw_data(token), uint(len(token)), &c, pc)
+	return _pc_settle(p, pc, reply)
+}
+
+@(private)
+_c_pool_renew :: proc(data: rawptr, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
+	p := (^Account_Plugs)(data)
+	c := _id_to_c(runner)
+	pc := _pc_new(p, .Pool, done)
+	p.pool.renew(p.pool.ud, &c, pc)
 	return _pc_settle(p, pc, reply)
 }
 

@@ -691,6 +691,9 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	#partial switch ev.kind {
 	case .Space_Joined, .Members_Changed:
 		api.stack_space_joined(&d.s, ev.space)
+	case .Lease_Lapsed:
+		fmt.eprintfln("0ndb daemon: the runner lease for space %s lapsed", hex(ev.space))
+		runner_lease_lapsed(d)
 	case .Connected:
 		delete_key(&d.links, ev.space)
 		fmt.eprintfln("0ndb daemon: space %s connected", hex(ev.space))
@@ -924,6 +927,10 @@ _shutdown :: proc(d: ^Daemon) {
 	}
 	signals_close(&d.sig)
 	_state_save(d)
+	if d.acct != nil && d.acct.renew_timer != 0 {
+		prim.timer_cancel(&d.s.loop, d.acct.renew_timer)
+		d.acct.renew_timer = 0
+	}
 	host_plugs_destroy(d)
 	for m in d.mcp {
 		_mcp_close_fds(m.fd, m.out)

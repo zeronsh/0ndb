@@ -14,6 +14,7 @@ Runner_Pool :: struct {
 	attest:   proc(data: rawptr, evidence: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error,
 	joined:   proc(data: rawptr, space: prim.Id, name: string, relay: string, relay_public: osync.Public_Key, proof: []u8),
 	cancel:   proc(data: rawptr, done: osync.Plug_Done),
+	renew:    proc(data: rawptr, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error,
 }
 
 @(private)
@@ -251,6 +252,16 @@ _lease_arm :: proc(e: ^Engine) {
 		if sp.keyless || sp.mem.me != .Runner || sp.mem.lease_ms == 0 || sp.mem.removed {
 			continue
 		}
+		if sp.mem.lapsed {
+			if sp.mem.asked {
+				continue
+			}
+			due := i64(sp.mem.creds.until) - i64(sp.mem.lease_ms) / 3
+			if next < 0 || due < next {
+				next = due
+			}
+			continue
+		}
 		due := i64(sp.mem.expires) - i64(sp.mem.lease_ms) / 3
 		if next < 0 || due < next {
 			next = due
@@ -279,6 +290,12 @@ lease_renew :: proc(e: ^Engine) -> int {
 		if sp.keyless || sp.mem.me != .Runner || sp.mem.lease_ms == 0 || sp.mem.removed {
 			continue
 		}
+		if sp.mem.lapsed {
+			if !sp.mem.asked && now + sp.mem.lease_ms / 3 >= sp.mem.creds.until {
+				_lease_wanted(e, sp)
+			}
+			continue
+		}
 		if now + sp.mem.lease_ms / 3 < sp.mem.expires {
 			continue
 		}
@@ -299,4 +316,186 @@ lease_renew :: proc(e: ^Engine) -> int {
 @(private)
 Renew_Ctx :: struct {
 	expires: u64,
+}
+
+@(private)
+_lease_wanted :: proc(e: ^Engine, sp: ^Space) {
+	if sp.mem.asked {
+		return
+	}
+	sp.mem.asked = true
+	_emit(e, Event{kind = .Lease_Lapsed, space = sp.id, device = e.self})
+}
+
+runner_renewal_request :: proc(e: ^Engine, allocator := context.allocator) -> (request: []u8, err: Error) {
+	context = context_for(e)
+	out := make([dynamic]u8, context.temp_allocator)
+	_serr(osync.renewal_request_make(&e.keyring, _now_ms(e), &out)) or_return
+	request = make([]u8, len(out), allocator)
+	copy(request, out[:])
+	return request, .None
+}
+
+pool_renew :: proc(e: ^Engine, request: []u8, allocator := context.allocator, done: Account_Done = {}) -> (renewal: []u8, err: Error) {
+	context = context_for(e)
+	if e.cfg.runner_pool.renew == nil {
+		return nil, .Unsupported
+	}
+	runner, ok := osync.renewal_request_verify(request, _now_ms(e))
+	if !ok {
+		return nil, .Permission
+	}
+	j := _job_new(e, .Renew, done)
+	if j == nil {
+		return nil, .No_Memory
+	}
+	j.runner = runner
+	err = _job_begin(j)
+	if err == .Pending {
+		return nil, .Pending
+	}
+	if err == .None {
+		renewal = make([]u8, len(j.res.enrollment), allocator)
+		copy(renewal, j.res.enrollment)
+	}
+	_job_free(j)
+	return
+}
+
+@(private)
+RENEWAL_VERSION :: u8(1)
+
+@(private)
+_pool_renewal :: proc(e: ^Engine, runner: osync.Identity, lease: u64, allocator: runtime.Allocator) -> (renewal: []u8, err: Error) {
+	out := make([dynamic]u8, context.temp_allocator)
+	w := prim.writer(&out)
+	prim.write_u8(&w, RENEWAL_VERSION)
+	items := make([dynamic][]u8, context.temp_allocator)
+	ids := make([dynamic]prim.Id, context.temp_allocator)
+	for id in _sorted_keys(e.spaces) {
+		sp := e.spaces[id]
+		if sp.keyless {
+			continue
+		}
+		if _, oerr := _space_open(e, id); oerr != .None {
+			continue
+		}
+		token, terr := _pool_lease_space(e, sp, runner, lease)
+		if terr != .None {
+			continue
+		}
+		append(&items, token)
+		append(&ids, sp.id)
+	}
+	if len(items) == 0 {
+		return nil, .Permission
+	}
+	prim.write_uvarint(&w, u64(len(items)))
+	for t, i in items {
+		prim.write_id(&w, ids[i])
+		prim.write_bytes(&w, t)
+	}
+	if w.err != .None {
+		return nil, .No_Memory
+	}
+	renewal = make([]u8, len(out), allocator)
+	copy(renewal, out[:])
+	return renewal, .None
+}
+
+@(private)
+_pool_lease_space :: proc(e: ^Engine, sp: ^Space, runner: osync.Identity, lease: u64) -> (token: []u8, err: Error) {
+	m: osync.Membership
+	_members_load(e, sp, &m) or_return
+	defer osync.membership_destroy(&m)
+	if osync.membership_resolve(&m) != .None {
+		return nil, .Not_Found
+	}
+	now := _now_ms(e)
+	me := osync.roster_find(&m.roster, e.identity.sign)
+	if me < 0 || m.roster.members[me].kind != .Pool || !osync.member_active(&m.roster.members[me], now) {
+		return nil, .Permission
+	}
+	x := osync.roster_find(&m.roster, runner.sign)
+	if x < 0 {
+		return nil, .Not_Found
+	}
+	r := m.roster.members[x]
+	if r.removed || r.kind != .Runner || r.added_by != e.identity.sign || r.lease_ms == 0 {
+		return nil, .Permission
+	}
+	osync.membership_open(&m, osync.Opener{keyring = &e.keyring, self = e.identity})
+	_pool_reseal_one(e, sp, &m, r)
+	out := make([dynamic]u8, context.temp_allocator)
+	t := osync.Lease_Token{space = sp.id, subject = runner.sign, pool = e.identity.sign, issued = now, expires = now + min(lease, r.lease_ms)}
+	_serr(osync.lease_token_make(&e.keyring, t, &out)) or_return
+	return out[:], .None
+}
+
+@(private)
+_pool_reseal_one :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership, x: osync.Member) {
+	now := _now_ms(e)
+	cur := osync.membership_current(m, now)
+	if cur == nil {
+		return
+	}
+	for s in m.roster.seals {
+		if s.subject == x.sign && s.epoch == cur.id {
+			return
+		}
+	}
+	if ai, ok := m.ids[x.added]; ok {
+		ei := osync.roster_epoch(&m.roster, cur.id)
+		if ei >= 0 && _order_pos(m, ai) > _order_pos(m, m.roster.epochs[ei].record) {
+			return
+		}
+	}
+	raw, err := osync.membership_seal(m, osync.keyring_member_signer(&e.keyring), osync.identity_of(x.sign, x.box), now, now, e.cfg.random)
+	if err != .None {
+		return
+	}
+	c := make([]u8, len(raw), context.temp_allocator)
+	copy(c, raw)
+	_members_emit(e, sp, m, [][]u8{c})
+}
+
+runner_renew :: proc(e: ^Engine, renewal: []u8) -> (spaces: int, err: Error) {
+	context = context_for(e)
+	r := prim.reader(renewal)
+	if prim.read_u8(&r) != RENEWAL_VERSION {
+		return 0, .Invalid
+	}
+	n := prim.read_uvarint(&r)
+	if !prim.reader_ok(&r) || n > 4096 {
+		return 0, .Invalid
+	}
+	for _ in 0 ..< int(n) {
+		id := prim.read_id(&r)
+		token := prim.read_bytes(&r)
+		if !prim.reader_ok(&r) {
+			return spaces, .Invalid
+		}
+		t, ok := osync.lease_token_parse(token)
+		if !ok || t.space != id || t.subject != e.identity.sign {
+			continue
+		}
+		sp, found := e.spaces[id]
+		if !found || len(token) != osync.LEASE_TOKEN_LEN {
+			continue
+		}
+		copy(sp.mem.creds.lease[:], token)
+		sp.mem.creds.until = t.expires
+		sp.mem.creds.renewal = .Attached
+		sp.mem.asked = false
+		_lease_store(e, sp, token)
+		if sp.reopen != 0 {
+			prim.timer_cancel(e.loop, sp.reopen)
+			sp.reopen = 0
+		}
+		sp.backoff = 0
+		_link_schedule(e, sp)
+		spaces += 1
+	}
+	_lease_arm(e)
+	return spaces, .None
 }
