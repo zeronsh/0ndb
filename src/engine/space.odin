@@ -900,7 +900,11 @@ _held_release :: proc(e: ^Engine, sp: ^Space, device: prim.Id) {
 	}
 	for hd in take {
 		if sp.repl_on {
-			if id, _, ok := _object_of_name(hd.name); ok {
+			seg := hd.name
+			if t, derived := osync.derived_target(hd.name); derived {
+				seg = t
+			}
+			if id, _, ok := _object_of_name(seg); ok {
 				sc := _object_scope(sp, id)
 				osync.replicator_want(&sp.repl, &sc, hd.device, hd.name, 0, nil)
 				osync.scope_clear(&sc)

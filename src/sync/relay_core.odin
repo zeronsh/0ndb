@@ -26,6 +26,8 @@ Relay_Stats :: struct {
 	lived_bytes: u64,
 	redacted_in: u64,
 	refused_in:  u64,
+	trims:      u64,
+	trimmed:    u64,
 }
 
 Relay_Space_Stats :: struct {
@@ -2259,6 +2261,9 @@ _out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
 		st := o.stream
 		for {
 			if o.hpos == o.hlen && o.left == 0 {
+				if st.trimmed && o.at < st.base {
+					o.at = min(st.base, max(o.to, o.at))
+				}
 				if o.started && o.at >= o.to {
 					return true, .None
 				}
