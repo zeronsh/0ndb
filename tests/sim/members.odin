@@ -1721,20 +1721,28 @@ _leave_case :: proc(w: ^World) {
 @(private = "file")
 _own_key_row :: proc(w: ^World, idx: int, object: prim.Id) -> []u8 {
 	n := w.nodes[idx]
-	context = instance_context(&n.inst)
-	defer node_after(n)
-	db: omap.Db
-	if omap.db_open(&db, eng.vfs(&n.e), fmt.tprintf("%s/registry", n.e.pack_root), context.temp_allocator) != .None {
+	if !n.alive || !n.e_open {
 		return nil
 	}
-	defer omap.db_close(&db)
+	disk_probe_begin(&n.disk)
+	defer disk_probe_end(&n.disk)
+	db: omap.Db
+	if omap.db_open(&db, disk_vfs(&n.disk), fmt.tprintf("%s/registry", n.e.dir), context.temp_allocator) != .None {
+		return nil
+	}
+	defer {
+		db.poisoned = true
+		omap.db_close(&db)
+	}
 	key: [17]u8
 	o := object
 	copy(key[:16], o[:])
 	key[16] = 'k'
-	v, found, err := omap.db_get(&db, 0, key[:], w.allocator)
+	v, found, err := omap.db_get(&db, 0, key[:], context.temp_allocator)
 	if err != .None || !found {
 		return nil
 	}
-	return v
+	out := make([]u8, len(v), w.allocator)
+	copy(out, v)
+	return out
 }
