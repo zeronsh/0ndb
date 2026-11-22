@@ -12,7 +12,8 @@ ROLE_NAMES := [5]string{"", "user", "assistant", "system", "tool"}
 BLOCK_NAMES := [12]string{"", "text", "reasoning", "tool_call", "tool_result", "image", "error", "notice", "permission", "permission_answer", "question", "file"}
 SEAL_NAMES := [5]string{"open", "done", "interrupted", "failed", "cancelled"}
 CONVO_STATUS_NAMES := [8]string{"idle", "running", "queued", "awaiting_permission", "failed", "interrupted", "waiting", "reviving"}
-OPEN_STATE_NAMES := [2]string{"running", "revive"}
+OPEN_STATE_NAMES := [3]string{"running", "revive", "held"}
+#assert(len(OPEN_STATE_NAMES) == len(convo.Open_State))
 DELTA_NAMES := [19]string{"message", "block", "chunk", "seal", "leaf", "intent", "run", "mount", "record", "status", "field", "element", "counter", "catalog", "text", "files", "redacted", "members", "quarantined"}
 HEX := "0123456789abcdef"
 
