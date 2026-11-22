@@ -51,6 +51,11 @@ record_rid :: proc(e: ^Engine, o: Object, kind: Kind, seg: prim.Id, off: i64, re
 	h := _handle_get(e, o, kind) or_return
 	vs := obj.view_find(&h.view, seg)
 	if vs < 0 {
+		for s in h.segs {
+			if s.device == seg {
+				return {}, _pending_result(e, h, .Missing, ready)
+			}
+		}
 		return {}, .Not_Found
 	}
 	got, gerr := obj.rid(&h.view, obj.Vref{vs, off})
