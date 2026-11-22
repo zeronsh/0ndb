@@ -1237,7 +1237,7 @@ _remote_free :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
-	if rm.follow || rm.refs > 0 || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm {
+	if rm.follow || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm {
 		return
 	}
 	if r.hold > 0 {
@@ -2134,13 +2134,17 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 	if _objs_on_refused(r, Object_Key(ev.id), ev.code) {
 		return
 	}
-	if rm, ok := r.remotes[id]; ok {
+	rm, ok := r.remotes[id]
+	if ok {
 		clear(&rm.inflight)
 		rm.probing = false
 		rm.pulling = false
 		rv.name, rv.epoch, rv.device = rm.name, rm.epoch, rm.device
 	}
 	_emit(r, rv)
+	if ok {
+		_remote_maybe_free(r, rm)
+	}
 }
 
 @(private)
