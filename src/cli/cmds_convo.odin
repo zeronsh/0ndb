@@ -1,5 +1,6 @@
 package main
 
+import "core:c/libc"
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
@@ -58,13 +59,6 @@ cmd_new :: proc(a: ^Args) -> int {
 		sv := must(s, req_end(&sr), "cannot send")
 		msg = jstr(sv, "item")
 	}
-	ur := req_begin("object.uploaded")
-	req_str(&ur, "object", object_str(ob))
-	if uv := call(s, req_end(&ur)); uv.status != .Ok {
-		fmt.eprintfln("0ndb: created locally, but the relay did not take the upload (%v)", uv.status)
-	} else if jbool(uv.value, "dropped") {
-		fmt.eprintln("0ndb: created locally; the relay connection dropped before it was uploaded, so other devices see it once it reconnects")
-	}
 	if a.json {
 		out := make([dynamic]u8, context.temp_allocator)
 		append(&out, `{"object":`)
@@ -78,10 +72,32 @@ cmd_new :: proc(a: ^Args) -> int {
 	} else {
 		fmt.printfln("conversation %s%s", short(hex(ob.id)), fmt.tprintf(" · sent %s", short_rid(msg)) if len(msg) > 0 else "")
 	}
+	_await_upload(s, ob)
 	if len(msg) > 0 && flag_bool(a, "wait") {
 		return follow(s, ob, true, msg)
 	}
 	return 0
+}
+
+@(private)
+_await_upload :: proc(s: ^Session, ob: api.Object) {
+	prev := libc.signal(libc.SIGINT, _upload_interrupted)
+	defer libc.signal(libc.SIGINT, prev)
+	r := req_begin("object.uploaded")
+	req_str(&r, "object", object_str(ob))
+	v := client_call(&s.c, req_end(&r), 0)
+	if v.status != .Ok {
+		fmt.eprintfln("0ndb: saved on this device, but the relay did not take the upload (%v)", v.status)
+	} else if jbool(v.value, "dropped") {
+		fmt.eprintln("0ndb: saved on this device; the relay connection dropped before the upload was confirmed, so other devices see it once it reconnects")
+	}
+}
+
+@(private)
+_upload_interrupted :: proc "c" (sig: libc.int) {
+	msg := "\n0ndb: interrupted before the relay confirmed the upload; it is saved on this device and uploads in the background\n"
+	libc.fwrite(raw_data(msg), 1, len(msg), libc.stderr)
+	libc._Exit(130)
 }
 
 @(private)

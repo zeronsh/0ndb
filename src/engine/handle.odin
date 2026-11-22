@@ -904,6 +904,15 @@ cancel_waits :: proc(e: ^Engine, data: rawptr) {
 		}
 		i += 1
 	}
+	i = 0
+	for i < len(e.space_waits) {
+		w := e.space_waits[i]
+		if w.ready.data == data && w.cmd == nil {
+			ordered_remove(&e.space_waits, i)
+			continue
+		}
+		i += 1
+	}
 }
 
 @(private)
