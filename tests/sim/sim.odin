@@ -433,8 +433,12 @@ finish :: proc(w: ^World) {
 	if len(w.failures) > 0 {
 		return
 	}
+	before: []string
+	if w.cfg.verbose {
+		before = loop_snapshot(w, "before the final check")
+	}
 	if !check_convergence(w, true) && w.cfg.verbose {
-		dump_replication(w)
+		dump_replication(w, before)
 	}
 	check_map_reapply(w)
 	check_redaction(w)

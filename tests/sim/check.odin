@@ -809,7 +809,30 @@ armed_timers :: proc(l: ^prim.Loop) -> string {
 	return strings.to_string(b)
 }
 
-dump_replication :: proc(w: ^World) {
+loop_snapshot :: proc(w: ^World, label: string) -> []string {
+	out := make([dynamic]string, context.temp_allocator)
+	for n in w.nodes {
+		if !n.alive {
+			continue
+		}
+		awaits := 0
+		for _, sp in n.e.spaces {
+			if sp.repl_on {
+				awaits += osync.client_awaiting(&sp.repl.client)
+			}
+		}
+		append(&out, fmt.tprintf("%s %s: %d relay requests awaiting a reply; armed timers: %s", n.name, label, awaits, armed_timers(&n.inst.loop)))
+	}
+	return out[:]
+}
+
+dump_replication :: proc(w: ^World, before: []string = nil) {
+	for s in before {
+		world_note(w, "  %s", s)
+	}
+	for s in loop_snapshot(w, "after the final check's reads") {
+		world_note(w, "  %s", s)
+	}
 	for c in w.relay.r.conns {
 		if c == nil {
 			continue
