@@ -139,6 +139,77 @@ _on_buffer :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Buffer_Event) {
 }
 
 @(private)
+Open_Wait :: struct {
+	a:  ^Api,
+	id: u64,
+}
+
+@(private)
+_on_open_wait :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+	w := (^Open_Wait)(data)
+	a := w.a
+	id := w.id
+	free(w, a.allocator)
+	s: ^Sub
+	for x in a.subs {
+		if x.id == id {
+			s = x
+			break
+		}
+	}
+	if s == nil || !s.opening {
+		return
+	}
+	if err != .None {
+		_open_finish(a, s, status_of(err))
+		return
+	}
+	c: Call
+	c.api = a
+	c.json = s.json
+	if st := _decode(a, &c, s.req, context.temp_allocator); st != .Ok {
+		_open_finish(a, s, st)
+		return
+	}
+	open, oerr := _buffer_open(a, &c, s)
+	if oerr == .Pending {
+		return
+	}
+	if oerr != .None {
+		_open_finish(a, s, status_of(oerr))
+		return
+	}
+	s.opening = false
+	delete(s.req, a.allocator)
+	s.req = nil
+	if s.opened != nil {
+		s.opened(s.data, s.id, .Ok, open)
+	} else {
+		s.cb(s.data, s.id, open)
+	}
+}
+
+@(private)
+_open_finish :: proc(a: ^Api, s: ^Sub, st: Status) {
+	id := s.id
+	data := s.data
+	opened := s.opened
+	cb := s.cb
+	json_form := s.json
+	unsubscribe(a, id)
+	if opened != nil {
+		opened(data, id, st, nil)
+		return
+	}
+	buf := make([dynamic]u8, context.temp_allocator)
+	o: Out
+	out_init(&o, &buf, json_form)
+	ev := eng.Buffer_Event{kind = .Closed, err = .Missing if st == .Missing else .Invalid}
+	emit_buffer_event(&o, u64(eng.Buffer_Event_Kind.Closed) + 1, &ev, nil)
+	cb(data, id, out_finish(&o))
+}
+
+@(private)
 _on_buffer_ready :: proc(data: rawptr) -> bool {
 	s := (^Sub)(data)
 	return s.ready == nil || s.ready(s.data)
@@ -160,7 +231,14 @@ _buffer_open :: proc(a: ^Api, c: ^Call, s: ^Sub) -> (open: []u8, err: eng.Error)
 		data  = s,
 		ready = _on_buffer_ready,
 	}
-	info := eng.buffer_open(a.e, a_object(c, "object"), opts, context.temp_allocator) or_return
+	w := new(Open_Wait, a.allocator)
+	w^ = Open_Wait{a, s.id}
+	opts.wait = eng.Ready{data = w, call = _on_open_wait}
+	info, oerr := eng.buffer_open(a.e, a_object(c, "object"), opts, context.temp_allocator)
+	if oerr != .Pending {
+		free(w, a.allocator)
+	}
+	oerr or_return
 	s.buffer = info.id
 	buf := make([dynamic]u8, context.temp_allocator)
 	o: Out
