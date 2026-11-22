@@ -231,7 +231,7 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 	res, h, err = _cmd_run(e, cmd, &st)
 	busy := err == .Busy && pack.pressure(&e.pk)
 	if !busy && (err != .Missing || h == nil) {
-		res.tick = current_tick(e)
+		res.tick = pending_seq(e)
 		return res, err
 	}
 	p := new(Pending_Cmd, e.allocator)
@@ -431,7 +431,7 @@ _cmd_retry :: proc(e: ^Engine, p: ^Pending_Cmd, tries: int) {
 		}
 		err = werr
 	}
-	res.tick = current_tick(e)
+	res.tick = pending_seq(e)
 	if p.done.call != nil {
 		{
 			context = _outer(e)

@@ -321,7 +321,6 @@ Engine :: struct {
 	dirty:        [dynamic]Dirty_Seg,
 	draft_dirty:  [dynamic]Draft_Pub,
 	batches:      [dynamic]^Durable_Batch,
-	durable_tick: u64,
 	batch_seq:    u64,
 	durable_seq:  u64,
 	changed:      map[prim.Id]Change,
@@ -617,12 +616,12 @@ flush :: proc(e: ^Engine) -> Error {
 	return e.fatal
 }
 
-durable_tick :: proc "contextless" (e: ^Engine) -> u64 {
-	return e.durable_tick
+durable_seq :: proc "contextless" (e: ^Engine) -> u64 {
+	return e.durable_seq
 }
 
-current_tick :: proc "contextless" (e: ^Engine) -> u64 {
-	return e.tick if e.in_tick else e.tick + 1
+pending_seq :: proc "contextless" (e: ^Engine) -> u64 {
+	return e.batch_seq + 1
 }
 
 hlc_now :: proc(e: ^Engine) -> prim.Hlc {

@@ -327,7 +327,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 		}
 	} else {
 		if agent {
-			op_done(op, eng.current_tick(&n.e), .None)
+			op_done(op, eng.pending_seq(&n.e), .None)
 		} else {
 			op_done(op, 0, .None)
 			op.status = .Acked

@@ -60,7 +60,6 @@ Dirty_Seg :: struct {
 @(private)
 Durable_Batch :: struct {
 	e:     ^Engine,
-	tick:  u64,
 	seq:   u64,
 	segs:  [dynamic]Dirty_Seg,
 	meta:  bool,
@@ -392,7 +391,6 @@ _durable_begin :: proc(e: ^Engine) {
 	_keys_stage(e)
 	b := new(Durable_Batch, e.allocator)
 	b.e = e
-	b.tick = e.tick
 	b.segs = e.dirty
 	b.meta = e.reg.meta
 	e.reg.meta = false
@@ -493,7 +491,6 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	if err != .None {
 		_fatal(e, err)
 	} else {
-		e.durable_tick = max(e.durable_tick, b.tick)
 		e.durable_seq = max(e.durable_seq, b.seq)
 		e.stats.durable += 1
 		if _trees_waiting(e) {
@@ -527,7 +524,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 			}
 		}
 		if len(b.segs) > 0 || b.meta {
-			_emit(e, Event{kind = .Durable, tick = b.tick})
+			_emit(e, Event{kind = .Durable, tick = b.seq})
 		}
 	}
 	for &d in b.segs {
