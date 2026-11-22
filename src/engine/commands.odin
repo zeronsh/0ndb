@@ -210,6 +210,20 @@ Pending_Cmd :: struct {
 
 exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Error) {
 	context = context_for(e)
+	if sp, settling := _space_settling_id(e, _cmd_object(cmd).space); settling {
+		p := new(Pending_Cmd, e.allocator)
+		if virtual.arena_init_growing(&p.arena) != nil {
+			free(p, e.allocator)
+			return res, .No_Memory
+		}
+		p.cmd = _cmd_clone(cmd, virtual.arena_allocator(&p.arena))
+		p.done = done
+		if werr := _space_wait(e, sp, {}, p); werr != .Pending {
+			_cmd_free(e, p)
+			return res, werr
+		}
+		return res, .Pending
+	}
 	st: Cmd_State
 	h: ^Handle
 	res, h, err = _cmd_run(e, cmd, &st)
@@ -350,6 +364,55 @@ catalog_set :: proc(e: ^Engine, c: Cmd_Catalog_Set, done: Done = {}) -> Error {
 	context = context_for(e)
 	_, x := exec(e, c, done)
 	return x
+}
+
+@(private)
+_cmd_object :: proc(cmd: Command) -> Object {
+	switch c in cmd {
+	case Cmd_Send:
+		return c.object
+	case Cmd_Queue:
+		return c.object
+	case Cmd_Steer:
+		return c.object
+	case Cmd_Edit:
+		return c.object
+	case Cmd_Cancel:
+		return c.object
+	case Cmd_Interrupt:
+		return c.object
+	case Cmd_Answer:
+		return c.object
+	case Cmd_Switch:
+		return c.object
+	case Cmd_Back:
+		return c.object
+	case Cmd_Follow:
+		return c.object
+	case Cmd_Mount:
+		return c.object
+	case Cmd_Unmount:
+		return c.object
+	case Cmd_Await:
+		return c.object
+	case Cmd_Assign:
+		return c.object
+	case Cmd_Redact:
+		return c.object
+	case Cmd_Map_Set:
+		return c.object
+	case Cmd_Map_Delete:
+		return c.object
+	case Cmd_Map_Add:
+		return c.object
+	case Cmd_Map_Remove:
+		return c.object
+	case Cmd_Text_Edit:
+		return c.object
+	case Cmd_Catalog_Set:
+		return c.object
+	}
+	return {}
 }
 
 @(private)

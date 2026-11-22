@@ -287,6 +287,8 @@ Engine :: struct {
 	lru:          [dynamic]^Handle,
 	own_trees:    map[osync.Stream_Id]^Own_Tree,
 	waiters:      [dynamic]^Waiter,
+	space_waits:  [dynamic]Space_Wait,
+	space_woke:   bool,
 	held:         [dynamic]^Pending_Cmd,
 	subs:         [dynamic]^Sub,
 	next_sub:     u64,
@@ -356,6 +358,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.lru = make([dynamic]^Handle, e.allocator)
 	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, e.allocator)
 	e.waiters = make([dynamic]^Waiter, e.allocator)
+	e.space_waits = make([dynamic]Space_Wait, e.allocator)
 	e.held = make([dynamic]^Pending_Cmd, e.allocator)
 	e.purged = make([dynamic]Rid, e.allocator)
 	e.subs = make([dynamic]^Sub, e.allocator)
@@ -724,6 +727,7 @@ _tick_end :: proc(e: ^Engine) {
 	e.stats.ticks += 1
 	_repl_events_process(e)
 	_approvals_step(e)
+	_space_waits_run(e)
 	_content_events_process(e)
 	_waiters_run(e)
 	_remote_step(e)
@@ -830,6 +834,9 @@ _emit :: proc(e: ^Engine, ev: Event) {
 	if ev.kind == .Space_Joined || ev.kind == .Members_Changed {
 		_notices_space_changed(e, ev.space)
 	}
+	if ev.kind == .Members_Changed || ev.kind == .Epoch_Changed || ev.kind == .Access_Revoked {
+		_space_waits_wake(e, ev.space)
+	}
 	if e.cfg.events.event != nil {
 		x := ev
 		{
@@ -854,6 +861,7 @@ _teardown :: proc(e: ^Engine) {
 	e.closing = true
 	_subs_free_all(e)
 	_waiters_fail_all(e, .Closed)
+	_space_waits_fail_all(e, .Closed)
 	_remote_close(e)
 	_plugs_close(e)
 	_handles_sweep(e, -1)
@@ -917,6 +925,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.held)
 	delete(e.purged)
 	delete(e.waiters)
+	delete(e.space_waits)
 	delete(e.subs)
 	delete(e.posted)
 	delete(e.post_swap)

@@ -40,6 +40,7 @@ Space_Members :: struct {
 	lease_ms:    u64,
 	expires:     u64,
 	loaded:      bool,
+	member:      bool,
 	caught:      bool,
 	deferred:    bool,
 	want:        map[prim.Id]i64,
@@ -313,6 +314,7 @@ _members_adopt :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 		}
 	}
 	me := osync.roster_find(&m.roster, e.identity.sign)
+	sp.mem.member = me >= 0
 	if me >= 0 {
 		x := &m.roster.members[me]
 		sp.mem.me = x.kind

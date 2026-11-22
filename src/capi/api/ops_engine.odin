@@ -166,9 +166,9 @@ op_convo_create :: proc(c: ^Call, o: ^Out) -> Status {
 		provider  = a_str(c, "provider"),
 		model     = a_str(c, "model"),
 	}
-	ob, err := eng.convo_create(c.api.e, a_id(c, "space"), s)
+	ob, err := eng.convo_create(c.api.e, a_id(c, "space"), s, ready(c))
 	if err != .None {
-		return status_of(err)
+		return pend(c, err)
 	}
 	o_object(o, "object", ob)
 	return .Ok
