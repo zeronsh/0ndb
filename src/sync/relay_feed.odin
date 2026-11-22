@@ -101,6 +101,28 @@ _feed_add :: proc(r: ^Relay_Core, sp: ^Space_State, id: [32]u8, length: u64) -> 
 }
 
 @(private)
+_feed_hold :: proc(r: ^Relay_Core, sp: ^Space_State, id: [32]u8, length: u64) -> i64 {
+	e: [FEED_ENTRY]u8
+	v := id
+	copy(e[:32], v[:])
+	prim.put_u64le(e[32:], length)
+	append(&sp.feed_q, ..e[:])
+	if !sp.held {
+		sp.held = true
+		append(&r.feed_held, sp.id)
+	}
+	return _feed_end(sp) + i64(len(sp.feed_flight) + len(sp.feed_q))
+}
+
+@(private)
+_feed_unhold :: proc(sp: ^Space_State, need: i64, length: i64) {
+	off := need - FEED_ENTRY - _feed_end(sp) - i64(len(sp.feed_flight))
+	if off >= 0 && off + FEED_ENTRY <= i64(len(sp.feed_q)) {
+		prim.put_u64le(sp.feed_q[off + 32:], u64(length))
+	}
+}
+
+@(private)
 _feed_add_redaction :: proc(r: ^Relay_Core, sp: ^Space_State, id: [32]u8, from, to: i64) -> i64 {
 	e: [2 * FEED_ENTRY]u8
 	v := id

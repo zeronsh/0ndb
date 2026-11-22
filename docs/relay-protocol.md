@@ -348,6 +348,12 @@ For appends, drops, notes and redactions the feed entry is part of the
 change: the acknowledgement is sent only after both the change and its feed
 entry are durable.
 
+Durability is per write, not per stream: nothing here requires a sync per
+segment, and a host may make many writes, across segments and spaces,
+durable with one commit (one fsync, one storage transaction). What a client
+may rely on is only the acknowledgement: everything acknowledged survives,
+and a feed entry is never durable while the bytes it announces are not.
+
 ### 7.2 Ordering
 
 - Per segment, appends are applied strictly at `length`; one write per
@@ -791,6 +797,20 @@ callback that may run later, and the core acknowledges only then. A Durable
 Object implements reads with its synchronous SQLite storage and completes
 writes when the storage transaction commits; `Mem_Store`
 (`src/sync/store_mem.odin`) is the in-memory reference.
+
+The core never treats a write as durable before its own completion and
+never needs one write durable before another unless it waited for the
+first. A storage may set `Relay_Storage.atomic` when it commits in groups:
+every write submitted before the host commits the group becomes durable in
+that one commit, all of them or none (a failed group fails each of its
+writes), and no write is ever durable before one submitted earlier. The
+reference pack store and a Durable Object that commits a request's writes
+in one transaction qualify. With `atomic` set, the core queues an append's
+feed entry when it submits the append, and the host calls
+`relay_core_prepare` just before committing a group so the queued entries
+join it; the append is then acknowledged after that single commit. Without
+it the feed entry is written only once the append is durable, so the
+acknowledgement waits for two commits.
 
 Hosts own: transports, the Noise handshake, WebSocket upgrade, the Hello
 timeout, per-source rate limits, the allow list, storage, and any object-store

@@ -334,7 +334,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		world_destroy(w)
 		free(w, runtime.heap_allocator())
 	}
-	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v storage=%v durability=%v promote=%d", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk, cfg.storage, cfg.durability, cfg.promote)
+	world_note(w, "seed %d nodes=%d spaces=%d ops=%d crash=%d fault=%d window=%d settle=%d io=%d byzantine=%v bulk=%v storage=%v durability=%v promote=%d relay_pack=%v", seed, cfg.nodes, cfg.spaces, cfg.ops, cfg.crash_rate, cfg.fault_rate, cfg.window, cfg.settle_ms, cfg.io_rate, cfg.byzantine, cfg.bulk, cfg.storage, cfg.durability, cfg.promote, seed % 2 == 0)
 	ok := relay_start(&w.relay)
 	for n in w.nodes {
 		ok = ok && node_start(n)

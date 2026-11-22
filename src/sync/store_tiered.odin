@@ -218,6 +218,7 @@ tier_store :: proc(t: ^Tier_Store) -> Relay_Storage {
 		object_remove = _tier_object_remove,
 		account = _tier_account,
 		objects = _tier_objects,
+		atomic = t.inner.atomic,
 	}
 }
 

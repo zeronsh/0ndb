@@ -460,7 +460,46 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	}
 	rn.alive = true
 	prim.random_fill(rng_random(&rn.rng), rn.public[:])
-	err := osync.file_store_init(&rn.fs, &rn.inst.loop, vfs, RELAY_DIR, 0, osync.LAYOUT_SECTOR, {}, rng_random(&rn.rng), node_clock(&rn.clock))
+	err: osync.Error
+	store_vfs := vfs
+	lay := osync.LAYOUT_SECTOR
+	group: osync.Group_Commit
+	if w.cfg.seed % 2 == 0 {
+		opts := pack.DEFAULT_OPTIONS
+		opts.clock = node_clock(&rn.clock)
+		if w.cfg.promote > 0 {
+			opts.promote_size = w.cfg.promote
+		}
+		if perr := prim.mkdir_all(vfs, RELAY_DIR + "/spaces", 0o700); perr != .None {
+			err = .Io
+		} else if perr = pack.open(&rn.pk, vfs, RELAY_DIR + "/spaces", opts); perr != .None {
+			err = .Io
+		} else {
+			rn.packed = true
+			store_vfs = pack.vfs(&rn.pk)
+			lay = osync.LAYOUT_COMPACT
+			lay.exact = true
+			group = osync.Group_Commit {
+				data = &rn.pk,
+				begin = proc(data: rawptr) {
+					pack.batch_begin((^pack.Pack)(data))
+				},
+				end = proc(data: rawptr) -> osync.Error {
+					return .None if pack.batch_end((^pack.Pack)(data)) == .None else .Io
+				},
+			}
+		}
+	}
+	if err == .None {
+		err = osync.file_store_init(&rn.fs, &rn.inst.loop, store_vfs, RELAY_DIR, 0, lay, group, rng_random(&rn.rng), node_clock(&rn.clock))
+	}
+	if err == .None && rn.packed {
+		rn.fs.pack = &rn.pk
+		rn.fs.worker.prepare = proc(data: rawptr) {
+			osync.relay_core_prepare(&(^Relay_Node)(data).r)
+		}
+		rn.fs.worker.prep_data = rn
+	}
 	if err == .None {
 		cc := osync.relay_core_config()
 		cc.storage = osync.file_store(&rn.fs)
@@ -496,6 +535,8 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	instance_kill(&rn.inst)
 	rn.r = {}
 	rn.fs = {}
+	rn.pk = {}
+	rn.packed = false
 	rn.wake = 0
 	rn.mauth = {}
 	rn.cauth = {}

@@ -2120,6 +2120,13 @@ Relay cost tracks the reachable information, not the activity. Items marked
   small streams the relay writes 14.23 MB instead of 14.48 MB (89 B less per
   append); into one promoted stream 5.57 MB instead of 5.61 MB (the 45-byte
   slot per append becomes a committed-size inode record).
+  The pack store is atomic (`Relay_Storage.atomic`): an append's feed entry
+  is queued when the append is submitted and flushed into the same group
+  commit (`relay_core_prepare`, called by the store's worker before it takes
+  a group), so an acknowledgement follows one fsync, not one for the
+  segment and another for its feed entry. A `0ndb new` costs the relay 2
+  fdatasyncs, one per client round trip (47 for five before staging, 30
+  after it, 10 with coalescing).
 - **Relay writes** are host-chosen and never protocol-visible: an append is
   acknowledged once durable in the host's durable buffer (group-committed
   local files for the reference relay, Durable Object storage for a DO host)
