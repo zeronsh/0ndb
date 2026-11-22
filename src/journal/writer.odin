@@ -434,7 +434,11 @@ _recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 			return _err(err)
 		}
 	}
-	if end != ck || end < size {
+	if end > ck {
+		if err := prim.resync_range(j.vfs, j.fd, ck, end); err != .None {
+			return _err(err)
+		}
+	} else if end < size {
 		if err := prim.datasync(j.vfs, j.fd); err != .None {
 			return _err(err)
 		}

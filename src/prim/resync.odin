@@ -14,9 +14,13 @@ resync_file :: proc(vfs: Vfs, path: string, full := false) -> Error {
 
 resync_fd :: proc(vfs: Vfs, fd: Fd, full := false) -> Error {
 	size := file_size(vfs, fd) or_return
+	return resync_range(vfs, fd, 0, size, full)
+}
+
+resync_range :: proc(vfs: Vfs, fd: Fd, from, to: i64, full := false) -> Error {
 	buf: [RESYNC_CHUNK]u8
-	for off: i64 = 0; off < size; {
-		want := min(i64(len(buf)), size - off)
+	for off := from; off < to; {
+		want := min(i64(len(buf)), to - off)
 		n := read_at(vfs, fd, buf[:want], off) or_return
 		if n <= 0 {
 			return .Io
