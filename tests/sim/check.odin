@@ -949,7 +949,7 @@ check_redaction :: proc(w: ^World) {
 				append(&secrets, d)
 				append(&owners, op.obj)
 			}
-		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst, .Run_Queue, .Quiesce:
 		}
 	}
 	for s, si in secrets {

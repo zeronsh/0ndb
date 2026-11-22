@@ -426,6 +426,13 @@ pub struct TakeoverPolicy {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
+pub struct Quiesced {
+    pub accepted: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct LoginResult {
     pub path: String,
     pub status: String,

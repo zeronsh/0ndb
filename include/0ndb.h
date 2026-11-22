@@ -1404,6 +1404,8 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_SUBSCRIBE_RUNNERS 163u
 /* subscribe.fork_diff(object: object, caller: object, diff: bool, max_chars: uvarint) -> changes:[Change] diff:str */
 #define ONDB_OP_SUBSCRIBE_FORK_DIFF 143u
+/* quiesce(off: bool, lift_ms: uvarint) -> accepted:bool reason:enum(accepted, run_active, queued, relay) */
+#define ONDB_OP_QUIESCE 175u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

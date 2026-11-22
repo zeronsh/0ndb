@@ -588,6 +588,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	delete(b.drafts)
 	delete(b.restores)
 	free(b, e.allocator)
+	_settle_check(e)
 }
 
 @(private)

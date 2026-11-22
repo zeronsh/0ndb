@@ -44,6 +44,7 @@ RUNTIME_OPS := []Op {
 	{172, "line.resume", {{"tree", .Object, nil}, {"line", .Str, nil}}, "resumed:uvarint", op_line_resume},
 	{173, "line.switch", {{"tree", .Object, nil}, {"line", .Str, nil}, {"root", .Str, nil}}, "line:str held:uvarint", op_line_switch},
 	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
+	{175, "quiesce", {{"off", .Bool, nil}, {"lift_ms", .U64, nil}}, "accepted:bool reason:enum", op_quiesce},
 }
 
 op_line_hold :: proc(c: ^Call, o: ^Out) -> Status {

@@ -2898,6 +2898,77 @@ edit on a device whose folder is on a feature branch lands on that branch.
 When the line is at the history's heads (the only case with one line), the
 loaded state is used directly, exactly as before.
 
+**Quiesce for sleep.** A host about to stop the machine (a cloud sandbox
+going to sleep) calls `rt.quiesce(r, true, lift_ms)` (daemon op `quiesce`,
+`0ndb quiesce`).
+- *Refusal.* It refuses, changing nothing, while a run is active
+  (`run_active`), or while work waits for this runner (`queued`): an
+  evaluation, a revival, or a pending placement naming it.
+- *Holding.* Otherwise the runtime starts no turn. `evaluate` holds every
+  conversation it would act on in a deferred list, right after the catalog
+  check and before it reads or waits on the conversation's view, and
+  recovery parks revivals. Each hold is recorded as a
+  `hold/<conversation>` row in the runner's own state map, which no other
+  device writes, and is announced with a pending-map note. Attach and lift
+  re-evaluate every held conversation, and a row is cleared only by an
+  evaluation that has loaded the conversation's intents with quiesce off,
+  so a machine stopped before the sender's records arrived still finds the
+  conversation when it wakes, and a member's concurrent pending-map clear
+  cannot erase the hold. A send made in the last moments before the stop,
+  too late to be held, is found by the wake scan: the quiesce writes a
+  `quiesce/seen` row with the newest catalog activity the runner has
+  evaluated, and attach re-evaluates every conversation the catalog lists
+  at or above it, paging newest first down to the mark, and clears the row
+  after the last page; a lift
+  clears it too. Sends
+  arriving now stay queued in their conversation, untouched, for the woken
+  machine. Intents already applied to a running turn do not exist here,
+  since no turn runs.
+- *Settling.* It then asks the engine to `settle`: every writer is marked
+  for commit; the answer waits until no durable batch, dirty segment, card
+  or content upload is outstanding and every relay-stored stream's
+  relay-acknowledged length (the replicator's `floor`) covers its durable
+  length with nothing in flight. Device-only (hollow) and superseded
+  streams need only be durable. Publishing goes only through the durable
+  batch path (`_publish`). A space without a live relay connection, a
+  stream the relay refused for good (permission, quota) or a fatal engine
+  answers `relay`, and the quiesce lifts at once: a machine whose disk is
+  then lost must not lose stored data.
+- *Lifting.* `quiesce(false)`, or `lift_ms` (default 180000) passing
+  without a stop, lifts it. The lift is the only timer quiesce arms. Lifting
+  re-evaluates everything held, every parked revival and every space's
+  pending map, so a send made while quiesced runs exactly once after the
+  lift or the wake.
+
+The simulator quiesces its runner (the last node, with a runtime on a
+dedicated space and a scripted HTTP model) and usually power-stops it. It
+checks three things: the relay holds every durable byte of its stored
+streams at the accept; no turn starts while quiesced, neither as a run nor
+as a model request; and every queued send has exactly one user message
+with exactly one direct reply.
+
+Writing the sim's turn workload found these runtime bugs, all fixed here.
+- *Clock skew.* `Unqueue`, `Cancel` and `Edit_Queued` now observe their
+  intent's stamp before they are written. A requester whose clock ran ahead
+  left the runner's `Unqueue` stamped before the intent, the pending walk
+  never saw it, and the intent became a new user message on every
+  evaluation.
+- *Kindless catalog row.* `catalog_get` with a ready waits while the row
+  has no kind and its map still has unread segments, and `evaluate` passes
+  one. In device storage a runner could hold a conversation's row from other
+  writers without the creator's segment, and nothing ever fetched it.
+- *Catalog ahead of the view.* When a conversation's catalog activity is
+  newer than anything in the runner's view, `evaluate` first reads its
+  status with a fresh ready, so the woken or reconnected runner waits for
+  the members' tails instead of deciding on a view that lacks a send made
+  while it slept. The stale-view follow covers only sends from runners.
+- *Disconnected evaluation.* A runner that evaluates a conversation while
+  its space is disconnected notes it and evaluates it again on `Caught_Up`,
+  as parked revivals already were. A send made meanwhile could otherwise be
+  missed: the catalog delta can arrive before the intent it announces, and
+  the pending row that would prompt a second look can lose to a concurrent
+  clear.
+
 ## capi
 
 ABI 2.0: ops are numbered contiguously from 1 in table order (the header op
@@ -2930,7 +3001,7 @@ The reference consumer, assembled from the default plug implementations:
 members | remove | rotate | recovery-key | pool | pair | join | status | ls |
 new | send | queue | steer | edit | switch | back | log | show | search |
 interrupt | models | agent | task | workspace | mount | schedule | blame |
-revert | land | share | redact | verify`.
+revert | land | share | redact | verify | quiesce`.
 
 `new` prints the created id once the create returns, then, while connected,
 waits for `object.uploaded` so the printed id resolves on other devices at

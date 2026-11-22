@@ -123,7 +123,7 @@ in the header; readers must ignore trailing bytes.
 
 The `describe` op returns the full table (codes, names, argument names and
 types, enum value names, result layouts) for mechanical binding generation;
-section 12 is that table.
+section 13 is that table.
 
 Timeouts. `timeout_ms` 0 means none. A read that waits for remote data
 (a page of a conversation that lives on another device) completes when the
@@ -588,7 +588,30 @@ answers `Result(0, ok)` with an empty payload, and from then on the bytes in
 both directions are MCP JSON-RPC lines, not frames. `0ndb mcp` bridges this
 to a harness's stdio.
 
-## 11. Versioning
+## 11. Quiescing before a stop
+
+`quiesce` (175) prepares a machine that a host is about to stop (a cloud
+sandbox going to sleep). `quiesce(off: false, lift_ms)`:
+
+- answers at once with `accepted: false, reason: run_active` when a turn is
+  in flight, or `reason: queued` when work is waiting for this runner (an
+  evaluation, a revival, a pending placement naming it). Nothing changes.
+- otherwise stops starting turns. A message that arrives from now on stays
+  queued in its conversation, untouched, for the woken machine. The engine
+  commits and fsyncs everything, then the call stays pending until the
+  relay has acknowledged every durable byte of every relay-stored stream
+  (device-only streams need only be durable), and answers `accepted: true,
+  reason: accepted`. Without a reachable relay it answers `accepted: false,
+  reason: relay` and lifts the quiesce: a stopped machine whose disk is lost
+  must not lose stored data.
+- `off: true`, or `lift_ms` (default 180000) passing without a stop, lifts
+  it and starts what was held. The lift is the only timer quiesce arms.
+
+If the call's deadline passes before the relay acknowledges, the quiesce is
+lifted and the answer is `reason: relay`. `0ndb quiesce [--off] [--lift MS]`
+exits 0 when accepted and 75 when declined, printing the reason.
+
+## 12. Versioning
 
 - Protocol version (the hello byte, `proto` in `daemon.status`): changes only
   when the framing changes incompatibly. New frame kinds are added only in
@@ -608,7 +631,7 @@ rss, runner, connections, local_relay, mcp_sessions, wakeups, timeout_ms
 (-1 when no timer is armed), host_plugs: [str] (enabled), host_pending, hosts: [str]
 (currently registered), links: [{space, error, reason}]`.
 
-## 12. Op reference
+## 13. Op reference
 
 Generated from `describe`. Argument types: `str`, `bytes`, `bool`, `uvarint`,
 `ivarint`, `f64`, `id`, `rid`, `object`, `enum` (accepted names listed),
@@ -847,6 +870,7 @@ message starts a new root, a sibling of the conversation's first message
 | 136 | `trigger.watch` | object: object | {} |
 | 139 | `placement` | object: object | Placement |
 | 162 | `runners` | space: id, object: object | runners:[Runner] |
+| 175 | `quiesce` | off: bool, lift_ms: uvarint | accepted:bool reason:enum (accepted, run_active, queued, relay) |
 
 ### Daemon host ops (only over the socket)
 
