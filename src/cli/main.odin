@@ -17,6 +17,7 @@ Exit :: enum int {
 	Offline   = 5,
 	Conflict  = 6,
 	Denied    = 7,
+	Declined  = 75,
 }
 
 Args :: struct {
@@ -25,7 +26,7 @@ Args :: struct {
 	json:  bool,
 }
 
-BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview", "local", "everywhere", "no-full-index", "replace", "always-on", "device-only"}
+BOOL_FLAGS :: []string{"json", "follow", "all", "archived", "dry", "semantic", "stdin", "no-runner", "open", "allow", "deny", "fresh", "diff", "help", "version", "recursive", "quiet", "wait", "newest", "write", "refresh", "preview", "local", "everywhere", "no-full-index", "replace", "always-on", "device-only", "off"}
 
 Command :: struct {
 	name:  string,
@@ -49,6 +50,7 @@ COMMANDS := []Command {
 	{"remove", cmd_remove, "remove DEVICE [--space S]", "remove a device from every space (or one space) and start a new key epoch"},
 	{"leave", cmd_leave, "leave SPACE [--device-only]", "leave a shared space: remove your devices from it and erase its local copies once the relay has the removal"},
 	{"rotate", cmd_rotate, "rotate [--space S]", "start a new key epoch now (after a suspected compromise)"},
+	{"quiesce", cmd_quiesce, "quiesce [--off] [--lift MS]", "stop starting turns before this machine is stopped: refused while a turn runs or a message waits, otherwise answers once everything is durable and every relay-stored byte is acknowledged (exit 75 when declined, with the reason); lifts itself after --lift MS (default 180000) or with --off"},
 	{"recovery-key", cmd_recovery_key, "recovery-key", "create the account recovery key (settings; login --recovery uses it with no other device online)"},
 	{"pool", cmd_pool, "pool token | on | off [--space S]", "print a runner launch token (pool host), or include or remove cloud runners for a space"},
 	{"pair", cmd_pair, "pair DEVICE-CODE [--space S] [--relay ADDR --relay-key HEX]", "fallback: add a device by the code its 0ndb join prints, and print a join ticket for it"},
@@ -186,7 +188,7 @@ print_help :: proc() {
 	for c in COMMANDS {
 		fmt.printfln("  %-10s %s", c.name, c.help)
 	}
-	fmt.println("\nexit codes: 0 ok, 1 error, 2 usage, 3 not found, 4 daemon unavailable, 5 offline or timed out, 6 conflict, 7 denied")
+	fmt.println("\nexit codes: 0 ok, 1 error, 2 usage, 3 not found, 4 daemon unavailable, 5 offline or timed out, 6 conflict, 7 denied, 75 declined (quiesce)")
 	fmt.println("environment: ONDB_HOME (data directory), ONDB_RUNTIME_DIR (socket directory)")
 }
 

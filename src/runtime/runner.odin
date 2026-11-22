@@ -21,10 +21,21 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		_evaluate_sender(r, o)
 		return
 	}
-	c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator)
+	cready := _wait_ready(r, o)
+	c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator, cready)
+	if cerr == .Pending {
+		return
+	}
+	_wait_drop(r, cready)
 	if cerr != .None || !found || c.kind != .Conversation {
 		return
 	}
+	fready := _wait_ready(r, o)
+	fready.fresh = true
+	if _, ferr := eng.convo_status(r.e, o, fready); ferr == .Pending {
+		return
+	}
+	_wait_drop(r, fready)
 	v, verr := eng.convo_view(r.e, o)
 	if verr != .None {
 		return
@@ -38,6 +49,10 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	if _follow_stale(r, o, v, &c) {
+		return
+	}
+	if r.quiesce.on && run_find(r, o) == nil {
+		_quiesce_hold(r, o)
 		return
 	}
 	if _revive_pending(r, o, v) {
@@ -69,6 +84,15 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	busy := t.running && _running_live(r, o, v, &t)
 	waiting_msg: Rid
 	defer _claim_prune(r, o, waiting_msg)
+	if !busy && !cancelled && !obj.rid_none(head) {
+		if hm, herr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator); herr == .None && (hm.role == .User || hm.role == .System) && !hm.open && hm.status == .Done {
+			waiting_msg = head
+			if _placed_here(r, o, v, &t, &hm) {
+				start_run(r, o, head)
+			}
+			return
+		}
+	}
 	for &it in items {
 		#partial switch it.kind {
 		case .Queue, .Steer:
@@ -1180,7 +1204,7 @@ _recover :: proc(r: ^Runtime, space: prim.Id) {
 		}
 		convo.writer_interrupt_open(w, now)
 		eng.touched(r.e, ent.object)
-		if _replicated(r, ent.object.space) && _follow_start(r, ent.object) {
+		if r.quiesce.on || (_replicated(r, ent.object.space) && _follow_start(r, ent.object)) {
 			append(&r.revives, Revive_Wait{object = ent.object})
 			continue
 		}

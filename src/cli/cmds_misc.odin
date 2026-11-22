@@ -1136,3 +1136,35 @@ cmd_task :: proc(a: ^Args) -> int {
 	}
 	return int(Exit.Error) if is_error else 0
 }
+
+cmd_quiesce :: proc(a: ^Args) -> int {
+	s := session(a)
+	if _, ok := flag_value(a, "timeout"); !ok {
+		s.timeout = 120_000
+	}
+	off := flag_bool(a, "off")
+	lift := parse_int_flag(a, "lift", 0)
+	if lift < 0 {
+		return usage_error("--lift takes milliseconds")
+	}
+	r := req_begin("quiesce")
+	req_bool(&r, "off", off)
+	if lift > 0 {
+		req_int(&r, "lift_ms", lift)
+	}
+	v := must(s, req_end(&r), "cannot quiesce")
+	reason := jstr(v, "reason")
+	if a.json {
+		print_json(v)
+	}
+	if jbool(v, "accepted") {
+		if !a.json {
+			fmt.println("lifted" if off else "quiesced: safe to stop")
+		}
+		return 0
+	}
+	if !a.json {
+		fmt.eprintfln("0ndb: quiesce declined (%s)", reason)
+	}
+	return int(Exit.Declined)
+}

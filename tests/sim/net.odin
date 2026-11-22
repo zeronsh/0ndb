@@ -452,7 +452,7 @@ net_event :: proc(w: ^World, ev: ^Sim_Event) {
 			return
 		}
 		_relay_writable(w, c)
-	case .Op, .Reset, .Fault, .Restart, .Relay_Restart, .Heal, .Watch, .Pack_Job, .Stream_Step, .Git_Fetch:
+	case .Op, .Reset, .Fault, .Restart, .Relay_Restart, .Heal, .Watch, .Pack_Job, .Stream_Step, .Git_Fetch, .Sim_Http, .Quiesce_Step:
 	}
 }
 

@@ -2089,6 +2089,54 @@ indexer. Live buffers (`buffer_open`, `buffer_read`, `buffer_edit`,
 through the subscription callback path at the end of each tick. Several engines can share a process to use several cores, each
 owning a shard of objects.
 
+**Quiesce for sleep.** A host about to stop the machine (a cloud sandbox
+going to sleep) calls `rt.quiesce(r, true, lift_ms)` (daemon op `quiesce`,
+`0ndb quiesce`).
+- *Refusal.* It refuses, changing nothing, while a run is active
+  (`run_active`), or while work waits for this runner (`queued`): an
+  evaluation, a revival, or a pending placement naming it.
+- *Holding.* Otherwise the runtime starts no turn. `evaluate` holds every
+  conversation it would act on in a deferred list, and recovery parks
+  revivals. Sends arriving now stay queued in their conversation, untouched,
+  for the woken machine. Intents already applied to a running turn do not
+  exist here, since no turn runs.
+- *Settling.* It then asks the engine to `settle`: every writer is marked
+  for commit; the answer waits until no durable batch, dirty segment, card
+  or content upload is outstanding and every relay-stored stream's
+  relay-acknowledged length (the replicator's `floor`) covers its durable
+  length with nothing in flight. Device-only (hollow) and superseded
+  streams need only be durable. Publishing goes only through the durable
+  batch path (`_publish`). A space without a live relay connection, a
+  stream the relay refused for good (permission, quota) or a fatal engine
+  answers `relay`, and the quiesce lifts at once: a machine whose disk is
+  then lost must not lose stored data.
+- *Lifting.* `quiesce(false)`, or `lift_ms` (default 180000) passing
+  without a stop, lifts it. The lift is the only timer quiesce arms. Lifting
+  re-evaluates everything held, every parked revival and every space's
+  pending map, so a send made while quiesced runs exactly once after the
+  lift or the wake.
+
+The simulator quiesces its runner (the last node, with a runtime on a
+dedicated space and a scripted HTTP model) and usually power-stops it. It
+checks three things: the relay holds every durable byte of its stored
+streams at the accept; no turn starts while quiesced, neither as a run nor
+as a model request; and every queued send has exactly one user message
+with exactly one direct reply.
+
+Writing the sim's turn workload found three runtime bugs, all fixed here.
+- *Clock skew.* `Unqueue`, `Cancel` and `Edit_Queued` now observe their
+  intent's stamp before they are written. A requester whose clock ran ahead
+  left the runner's `Unqueue` stamped before the intent, the pending walk
+  never saw it, and the intent became a new user message on every
+  evaluation.
+- *Lost advert.* A runner re-asserts its advert in the runners map on
+  `Connected` and `Caught_Up`. An advert written right after joining a
+  space could be missing, and the runner was then never placed.
+- *Kindless catalog row.* `catalog_get` with a ready waits while the row
+  has no kind and its map still has unread segments, and `evaluate` passes
+  one. In device storage a runner could hold a conversation's row from other
+  writers without the creator's segment, and nothing ever fetched it.
+
 ## capi
 
 ABI 2.0: ops are numbered contiguously from 1 in table order (the header op
@@ -2121,4 +2169,4 @@ The reference consumer, assembled from the default plug implementations:
 members | remove | rotate | recovery-key | pool | pair | join | status | ls |
 new | send | queue | steer | edit | switch | back | log | show | search |
 interrupt | models | agent | task | workspace | mount | schedule | blame |
-revert | land | share | redact | verify`.
+revert | land | share | redact | verify | quiesce`.
