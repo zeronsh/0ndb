@@ -139,6 +139,7 @@ Local :: struct {
 	floor_fd:  prim.Fd,
 	floor:     i64,
 	floor_seq: u64,
+	floor_owed: bool,
 	cursor:    i64,
 	durable:   i64,
 	inflight:  i64,
@@ -1050,10 +1051,11 @@ _tree_missing :: proc "contextless" (l: ^Local) -> bool {
 _local_advance :: proc(r: ^Replicator, l: ^Local, to: i64) -> Error {
 	l.cursor = to
 	if to > l.floor {
+		seq := l.floor_seq + 1
+		slot_write(r.vfs, l.floor_fd, Slot{seq = seq, value = to, start = 0}) or_return
+		_from_prim(prim.sync_owed(r.vfs, l.floor_fd, &l.floor_owed)) or_return
 		l.floor = to
-		l.floor_seq += 1
-		slot_write(r.vfs, l.floor_fd, Slot{seq = l.floor_seq, value = to, start = 0}) or_return
-		_from_prim(prim.datasync(r.vfs, l.floor_fd)) or_return
+		l.floor_seq = seq
 	}
 	_emit(r, Repl_Event{kind = .Uploaded, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, length = to})
 	return .None
