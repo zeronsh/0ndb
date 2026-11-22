@@ -326,7 +326,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 	context.temp_allocator = virtual.arena_allocator(&st.chunk)
 	empty := shadow_empty(&m.shadow) or_return
 	st.resume = !empty
-	if empty && m.history != nil {
+	if empty && m.history != nil && len(m.synced) == 0 {
 		if line, has := history_line(m.history, m.line, st.long) or_return; has && len(line) > 0 {
 			lvs := make([dynamic]crdt.Lv, st.long)
 			if crdt.graph_version_lvs(&m.history.g, line, &lvs) == .None {
@@ -337,7 +337,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 				append(&m.synced, ..line)
 			}
 		}
-	} else if !empty && m.history != nil && len(m.synced) > 0 {
+	} else if m.history != nil && len(m.synced) > 0 {
 		lvs := make([dynamic]crdt.Lv, st.long)
 		if crdt.graph_version_lvs(&m.history.g, m.synced[:], &lvs) == .None {
 			st.snap = version_snapshot(m.history, lvs[:]) or_return
@@ -673,6 +673,9 @@ import_tracked_under :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Fram
 				} else {
 					abuf: prim.Path_Buf
 					dst, derr := prim.lstat(m.vfs, abs_path(m, next, abuf[:]))
+					if derr != .None && !gone(derr) {
+						return from_prim(derr)
+					}
 					if derr != .None || dst.kind != .Dir {
 						break
 					}
@@ -744,25 +747,27 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 	kind := it.kind
 	if !it.statted {
 		s, serr := prim.lstat(m.vfs, abs)
-		if serr != .None {
+		if gone(serr) {
 			return .None
 		}
+		from_prim(serr) or_return
 		stat = disk_stat(s)
 		kind = disk_kind(s.kind)
 	}
 	link_text: string
 	link_file := kind == .File && tracked && e.mode & 0o170000 == 0o120000 && !mount_symlinks(m)
 	if link_file {
-		link_text, link_file = read_link_file(m, abs, stat)
+		link_text, link_file = read_link_file(m, abs, stat) or_return
 	}
 	if kind == .Symlink || link_file {
 		target := it.target if !link_file else link_text
 		if len(target) == 0 && !link_file {
 			tbuf: [prim.PATH_MAX]u8
 			n, lerr := prim.readlink(m.vfs, abs, tbuf[:])
-			if lerr != .None {
+			if gone(lerr) {
 				return .None
 			}
+			from_prim(lerr) or_return
 			target, _ = clone_string(string(tbuf[:n]), context.temp_allocator)
 		}
 		inode := builder_tree(&st.b, fstree.Op_Create{parent = parent.inode, name = it.name, kind = .Symlink, target = target})
@@ -771,7 +776,9 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 			oid = e.oid
 		} else if m.db != nil {
 			mark_dirty_dirs(st, it.path)
-			oid, _ = odb.write(m.db, .Blob, transmute([]u8)target)
+			o, werr := odb.write(m.db, .Blob, transmute([]u8)target)
+			from_odb(werr) or_return
+			oid = o
 		}
 		import_shadow(st, it.path, Entry{inode = inode, kind = .Symlink, stat = stat, oid = oid}) or_return
 		frame_add(st, it.name, oid, odb.MODE_LINK)
@@ -808,15 +815,14 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 		if it.has_data && st.use_pack {
 			binary = it.binary
 			o, perr := odb.pack_add(st.packp, .Blob, it.data)
-			if perr != .None {
-				return .None
-			}
+			from_odb(perr) or_return
 			oid = o
 		} else if m.has_git && m.db != nil && stat.size <= m.opts.large_limit && conv_needed(m, it.path) {
 			d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
-			if rerr != .None {
+			if gone(rerr) {
 				return .None
 			}
+			from_prim(rerr) or_return
 			cd, cok := eol_clean(m, it.path, d)
 			if !cok {
 				return .None
@@ -824,15 +830,17 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 			d = cd
 			binary = textdiff.is_binary(d)
 			o, werr := odb.write(m.db, .Blob, d)
-			if werr != .None {
-				return .None
-			}
+			from_odb(werr) or_return
 			oid = o
 			size = i64(len(d))
 		} else {
 			if stat.size > m.opts.large_limit {
 				binary = true
-				co, csize, cst := store_large_clean(m, it.path, abs)
+				co, csize, cst, cerr := store_large_clean(m, it.path, abs)
+				if cerr == .Not_Found || cerr == .Not_Dir {
+					return .None
+				}
+				cerr or_return
 				if cst == .Failed {
 					return .None
 				}
@@ -842,16 +850,18 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 				}
 			} else if stat.size > 0 {
 				b, serr := sniff_binary(m, abs)
-				if serr != .None {
+				if serr == .Not_Found || serr == .Not_Dir {
 					return .None
 				}
+				serr or_return
 				binary = b
 			}
 			if oid == {} {
 				o, werr := store_file(m, abs, st.packp if st.use_pack else nil, false)
-				if werr != .None {
+				if werr == .Not_Found || werr == .Not_Dir {
 					return .None
 				}
+				werr or_return
 				oid = o
 			}
 		}
@@ -875,20 +885,28 @@ import_file :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracke
 }
 
 @(private)
-read_link_file :: proc(m: ^Mount, abs: string, stat: Stat) -> (string, bool) {
+gone :: proc "contextless" (e: prim.Error) -> bool {
+	return e == .Not_Found || e == .Not_Dir
+}
+
+@(private)
+read_link_file :: proc(m: ^Mount, abs: string, stat: Stat) -> (string, bool, Error) {
 	if stat.size <= 0 || stat.size >= prim.PATH_MAX {
-		return "", false
+		return "", false, .None
 	}
 	d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+	if rerr != .None && !gone(rerr) {
+		return "", false, from_prim(rerr)
+	}
 	if rerr != .None || len(d) == 0 || len(d) >= prim.PATH_MAX {
-		return "", false
+		return "", false, .None
 	}
 	for c in d {
 		if c == 0 {
-			return "", false
+			return "", false, .None
 		}
 	}
-	return string(d), true
+	return string(d), true, .None
 }
 
 @(private)
@@ -1253,7 +1271,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 				append(&scoped, clone_string(u, p.long) or_else "")
 			}
 			for u in scoped {
-				d := probe(m, u)
+				d := probe(m, u) or_return
 				if d.kind != .Dir {
 					collect_path(&p, u) or_return
 					continue
@@ -1306,7 +1324,7 @@ pre_moves :: proc(p: ^Pass, keys: []string) -> Error {
 		if !found || e.kind != .Dir || e.stat.ino == 0 {
 			continue
 		}
-		d := probe(m, k)
+		d := probe(m, k) or_return
 		if d.kind == .Dir && d.stat.ino == e.stat.ino {
 			continue
 		}
@@ -1318,7 +1336,7 @@ pre_moves :: proc(p: ^Pass, keys: []string) -> Error {
 	}
 	moved := false
 	for k in keys {
-		d := probe(m, k)
+		d := probe(m, k) or_return
 		if d.kind != .Dir {
 			continue
 		}
@@ -1582,23 +1600,32 @@ Probe :: struct {
 }
 
 @(private)
-probe :: proc(m: ^Mount, rel: string, listed := false) -> Probe {
+probe :: proc(m: ^Mount, rel: string, listed := false) -> (out: Probe, err: Error) {
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
-	st, err := prim.lstat(m.vfs, abs)
-	if err != .None || (!listed && !disk_name_matches(m.vfs, abs)) {
-		return {kind = .Missing}
+	st, serr := prim.lstat(m.vfs, abs)
+	if gone(serr) {
+		return {kind = .Missing}, .None
 	}
-	out := Probe{kind = disk_kind(st.kind), stat = disk_stat(st)}
+	if serr != .None {
+		return {kind = .Other}, from_prim(serr)
+	}
+	if !listed && !disk_name_matches(m.vfs, abs) {
+		return {kind = .Missing}, .None
+	}
+	out = Probe{kind = disk_kind(st.kind), stat = disk_stat(st)}
 	if out.kind == .Symlink {
 		tbuf: [prim.PATH_MAX]u8
 		n, lerr := prim.readlink(m.vfs, abs, tbuf[:])
+		if gone(lerr) {
+			return {kind = .Missing}, .None
+		}
 		if lerr != .None {
-			return {kind = .Missing}
+			return {kind = .Other}, from_prim(lerr)
 		}
 		out.target, _ = clone_string(string(tbuf[:n]), context.temp_allocator)
 	}
-	return out
+	return out, .None
 }
 
 @(private)
@@ -1615,7 +1642,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 			}
 		}
 	}
-	d := probe(m, rel, listed)
+	d := probe(m, rel, listed) or_return
 	e, found := shadow_get(&m.shadow, rel) or_return
 	if !found {
 		if d.kind == .Missing || d.kind == .Other {
@@ -1645,7 +1672,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 			return .None
 		}
 		abuf: prim.Path_Buf
-		if t, ok := read_link_file(m, abs_path(m, rel, abuf[:]), d.stat); ok {
+		if t, ok := read_link_file(m, abs_path(m, rel, abuf[:]), d.stat) or_return; ok {
 			d.kind = .Symlink
 			d.target = t
 		}
@@ -1796,7 +1823,10 @@ compare_dir :: proc(p: ^Pass, rel: string) -> Error {
 	abs := abs_path(m, own, abuf[:])
 	d: prim.Dir
 	if err := prim.dir_open(m.vfs, &d, abs, heap); err != .None {
-		return .None
+		if gone(err) {
+			return .None
+		}
+		return from_prim(err)
 	}
 	names := make(map[string]bool, heap)
 	defer {
@@ -1807,7 +1837,11 @@ compare_dir :: proc(p: ^Pass, rel: string) -> Error {
 	}
 	for {
 		de, more, err := prim.dir_next(m.vfs, &d)
-		if err != .None || !more {
+		if err != .None {
+			prim.dir_close(m.vfs, &d)
+			return from_prim(err)
+		}
+		if !more {
 			break
 		}
 		if de.name == "." || de.name == ".." || name_internal(de.name) {
@@ -1961,7 +1995,10 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 	abs := abs_path(m, rel, abuf[:])
 	d: prim.Dir
 	if err := prim.dir_open(m.vfs, &d, abs, heap); err != .None {
-		return .None
+		if gone(err) {
+			return .None
+		}
+		return from_prim(err)
 	}
 	names := make(map[string]Listed, heap)
 	defer {
@@ -1972,7 +2009,11 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 	}
 	for {
 		de, more, err := prim.dir_next(m.vfs, &d)
-		if err != .None || !more {
+		if err != .None {
+			prim.dir_close(m.vfs, &d)
+			return from_prim(err)
+		}
+		if !more {
 			break
 		}
 		if de.name == "." || de.name == ".." || name_internal(de.name) {
@@ -1997,7 +2038,10 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		if ls.has_stat && ls.kind == .File && k.entry.kind == .File && ls.size == k.entry.stat.size && ls.mtime_ns == k.entry.stat.mtime_ns && ls.ctime_ns == k.entry.stat.ctime_ns && ls.ino == k.entry.stat.ino {
 			continue
 		}
-		dp := Probe{kind = .Dir} if ls.kind == .Dir && k.entry.kind == .Dir else probe(m, child, true)
+		dp := Probe{kind = .Dir}
+		if !(ls.kind == .Dir && k.entry.kind == .Dir) {
+			dp = probe(m, child, true) or_return
+		}
 		if k.entry.kind == .Dir && dp.kind == .Dir {
 			c, _ := clone_string(child, heap)
 			cwd, _ := watch_dir(m.reg, m, c, wd)
@@ -2291,15 +2335,24 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{}, has_old := false) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
 	if o, has := m.override[rel]; has && m.db != nil {
 		t, d, rerr := odb.read(m.db, o, context.temp_allocator)
-		if rerr != .None || t != .Blob {
-			return nil, {}, false, false, .None
+		if rerr != .None {
+			return nil, {}, false, false, from_odb(rerr)
+		}
+		if t != .Blob {
+			return nil, {}, false, false, .Corrupt
 		}
 		return d, o, textdiff.is_binary(d), true, .None
 	}
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
 	if stat.size > m.opts.large_limit {
-		co, _, cst := store_large_clean(m, rel, abs, old, has_old)
+		co, _, cst, cerr := store_large_clean(m, rel, abs, old, has_old)
+		if cerr == .Not_Found || cerr == .Not_Dir {
+			return nil, {}, true, false, .None
+		}
+		if cerr != .None {
+			return nil, {}, true, false, cerr
+		}
 		if cst == .Failed {
 			return nil, {}, true, false, .None
 		}
@@ -2307,14 +2360,20 @@ read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{
 			return nil, co, true, true, .None
 		}
 		o, werr := store_file(m, abs, nil)
-		if werr != .None {
+		if werr == .Not_Found || werr == .Not_Dir {
 			return nil, {}, true, false, .None
+		}
+		if werr != .None {
+			return nil, {}, true, false, werr
 		}
 		return nil, o, true, true, .None
 	}
 	d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
-	if rerr != .None {
+	if gone(rerr) {
 		return nil, {}, false, false, .None
+	}
+	if rerr != .None {
+		return nil, {}, false, false, from_prim(rerr)
 	}
 	cd, cok := eol_clean(m, rel, d, old, has_old)
 	if !cok {

@@ -113,19 +113,25 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 		}
 		sx: linux.Statx
 		if serr := linux.statx(dfd, ncp, {.SYMLINK_NOFOLLOW, .STATX_DONT_SYNC}, STATX_WANT, &sx); serr != .NONE {
-			if serr == .ENOENT {
+			if serr == .ENOENT || serr == .ENOTDIR {
 				r.kind = .Missing
-			} else {
-				r.kind = .Other
+				continue
 			}
-			continue
+			return from_errno(serr)
 		}
 		r.kind, r.stat = statx_to(&sx)
 		r.statted = true
 		if r.kind == .Symlink {
 			tbuf: [prim.PATH_MAX]u8
 			tn, lerr := linux.readlinkat(dfd, ncp, tbuf[:])
-			if lerr != .NONE || tn <= 0 || tn >= len(tbuf) {
+			if lerr == .ENOENT || lerr == .ENOTDIR {
+				r.kind = .Missing
+				continue
+			}
+			if lerr != .NONE {
+				return from_errno(lerr)
+			}
+			if tn <= 0 || tn >= len(tbuf) {
 				r.kind = .Other
 				continue
 			}
@@ -133,7 +139,7 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 			r.target_len = u32(tn)
 			append(&t.names, ..tbuf[:tn])
 		} else if r.kind == .File && name == ".gitignore" && gitignore^ == nil && r.stat.size < 8 << 20 {
-			gitignore^ = read_small_at(dfd, ncp, int(r.stat.size), sc.allocator)
+			gitignore^ = read_small_at(dfd, ncp, int(r.stat.size), sc.allocator) or_return
 		}
 	}
 	if sc.opts.read_limit > 0 {
@@ -189,10 +195,13 @@ _read_dir :: proc(sc: ^Scanner, t: ^Dir_Task, raw: ^[dynamic]Raw_Dirent, gitigno
 }
 
 @(private)
-read_small_at :: proc(dfd: linux.Fd, name: cstring, size: int, allocator := context.allocator) -> []u8 {
+read_small_at :: proc(dfd: linux.Fd, name: cstring, size: int, allocator := context.allocator) -> ([]u8, Error) {
 	fd, errno := linux.openat(dfd, name, {.NOFOLLOW, .CLOEXEC})
+	if errno == .ENOENT || errno == .ENOTDIR {
+		return nil, .None
+	}
 	if errno != .NONE {
-		return nil
+		return nil, from_errno(errno)
 	}
 	defer linux.close(fd)
 	buf := make([]u8, size + 1, allocator)
@@ -202,16 +211,20 @@ read_small_at :: proc(dfd: linux.Fd, name: cstring, size: int, allocator := cont
 		if rerr == .EINTR {
 			continue
 		}
-		if rerr != .NONE || r <= 0 {
+		if rerr != .NONE {
+			delete(buf, allocator)
+			return nil, from_errno(rerr)
+		}
+		if r <= 0 {
 			break
 		}
 		n += r
 	}
 	if n > size {
 		delete(buf, allocator)
-		return nil
+		return nil, .None
 	}
-	return buf[:n]
+	return buf[:n], .None
 }
 
 from_errno :: proc "contextless" (e: linux.Errno) -> Error {
