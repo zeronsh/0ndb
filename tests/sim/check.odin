@@ -307,6 +307,9 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 			delete(d.text, w.allocator)
 		}
 		if refn >= 0 {
+			if final && w.cfg.verbose && !w.cfg.quiet && m.objs[oi].kind != .Convo {
+				fmt.eprintf("[%9.3f] final %v %s on %s:\n%s\n", f64(w.now) / 1e6, m.objs[oi].kind, id_short(m.objs[oi].o.id), w.nodes[refn].name, ref.text)
+			}
 			if final && !w.cfg.byzantine {
 				check_object_model(w, oi, w.nodes[refn], ref.text)
 				check_conflicts(w, oi)
@@ -784,11 +787,7 @@ check_idle :: proc(w: ^World) {
 			continue
 		}
 		if a := loop_armed(&n.inst.loop); a > 0 {
-			world_fail(w, "idle: %s has %d armed timers after settle (batches=%d dirty=%d durable_tick=%d tick=%d pack_pressure=%v)", n.name, a, len(n.e.batches), len(n.e.dirty), n.e.durable_tick, n.e.tick, eng.pressured(&n.e))
-			for h in n.inst.loop.heap {
-				t := n.inst.loop.timers[h]
-				world_note(w, "  armed timer cb=%s due in %d ms", code_ref(rawptr(t.cb)), (t.deadline - prim.loop_now_ns(&n.inst.loop)) / 1_000_000)
-			}
+			world_fail(w, "idle: %s has %d armed timers after settle (batches=%d dirty=%d durable_tick=%d tick=%d pack_pressure=%v): %s", n.name, a, len(n.e.batches), len(n.e.dirty), n.e.durable_tick, n.e.tick, eng.pressured(&n.e), armed_timers(&n.inst.loop))
 		}
 		if loop_ready(&n.inst.loop) {
 			world_fail(w, "idle: %s has pending wakeups after settle", n.name)
@@ -796,9 +795,18 @@ check_idle :: proc(w: ^World) {
 	}
 	if w.relay.alive {
 		if a := loop_armed(&w.relay.inst.loop); a > 0 {
-			world_fail(w, "idle: relay has %d armed timers after settle", a)
+			world_fail(w, "idle: relay has %d armed timers after settle: %s", a, armed_timers(&w.relay.inst.loop))
 		}
 	}
+}
+
+armed_timers :: proc(l: ^prim.Loop) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	for h, i in l.heap {
+		t := l.timers[h]
+		fmt.sbprintf(&b, "%s%s armed at %s:%d due in %d ms", "" if i == 0 else "; ", t.owner.procedure, t.owner.file_path[strings.last_index_byte(t.owner.file_path, '/') + 1:], t.owner.line, (t.deadline - prim.loop_now_ns(l)) / 1_000_000)
+	}
+	return strings.to_string(b)
 }
 
 dump_replication :: proc(w: ^World) {
