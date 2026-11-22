@@ -28,8 +28,8 @@ node_start :: proc(n: ^Node) -> bool {
 	rng_init(&n.rng, w.cfg.seed, 1000 + u64(n.idx) * 64 + u64(n.incarnation))
 	rng_init(&n.ids, w.cfg.seed, 9000 + u64(n.idx) * 64 + u64(n.incarnation))
 	rng_init(&n.pack_rng, w.cfg.seed, 13000 + u64(n.idx) * 64 + u64(n.incarnation))
-	if !instance_begin(&n.inst, n.idx) {
-		world_fail(w, "%s could not map its deterministic memory region (%d MiB at slot %d; lower SIM_REGION_MB / SIM_TEMP_MB or check the address-space limit)", n.name, region_stride() >> 20, n.idx)
+	if iok, iwhy := instance_begin(&n.inst, n.idx); !iok {
+		world_fail(w, "%s could not map its deterministic memory region (%d MiB at slot %d): %s", n.name, region_stride() >> 20, n.idx, iwhy)
 		return false
 	}
 	context = instance_context(&n.inst)
@@ -368,8 +368,8 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 relay_start :: proc(rn: ^Relay_Node) -> bool {
 	w := rn.w
 	rng_init(&rn.rng, w.cfg.seed, 777 + u64(w.stats.relay_crash))
-	if !instance_begin(&rn.inst, 15) {
-		world_fail(w, "relay could not map its deterministic memory region (%d MiB; lower SIM_REGION_MB / SIM_TEMP_MB or check the address-space limit)", region_stride() >> 20)
+	if iok, iwhy := instance_begin(&rn.inst, 15); !iok {
+		world_fail(w, "relay could not map its deterministic memory region (%d MiB at slot 15): %s", region_stride() >> 20, iwhy)
 		return false
 	}
 	context = instance_context(&rn.inst)

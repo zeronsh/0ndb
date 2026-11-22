@@ -294,20 +294,21 @@ pop_event :: proc(w: ^World) -> Sim_Event {
 	return top
 }
 
-instance_begin :: proc(inst: ^Instance, slot: int) -> bool {
+instance_begin :: proc(inst: ^Instance, slot: int) -> (ok: bool, why: string) {
 	base := REGION_BASE + uintptr(slot) * region_stride()
-	if !region_map(&inst.main, base, region_main_size, false) {
-		return false
+	if mok, mwhy := region_map(&inst.main, base, region_main_size, false); !mok {
+		return false, fmt.tprintf("main region at %p: %s", rawptr(base), mwhy)
 	}
-	if !region_map(&inst.temp, base + uintptr(region_main_size), region_temp_size, true) {
+	tbase := base + uintptr(region_main_size)
+	if tok, twhy := region_map(&inst.temp, tbase, region_temp_size, true); !tok {
 		region_unmap(&inst.main)
-		return false
+		return false, fmt.tprintf("temp region at %p: %s", rawptr(tbase), twhy)
 	}
 	if leak_sites {
 		inst.main.sites = new(map[uintptr]runtime.Source_Code_Location, runtime.heap_allocator())
 		inst.main.sites^ = make(map[uintptr]runtime.Source_Code_Location, runtime.heap_allocator())
 	}
-	return true
+	return true, ""
 }
 
 instance_context :: proc(inst: ^Instance) -> runtime.Context {
