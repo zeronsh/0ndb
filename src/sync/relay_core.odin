@@ -82,6 +82,7 @@ Relay_Core :: struct {
 	yielded:    [dynamic]^Space_State,
 	rscratch:   []u8,
 	wscratch:   []u8,
+	early_held: i64,
 	stats:      Relay_Stats,
 	allocator:  runtime.Allocator,
 }
@@ -158,6 +159,14 @@ Stream_State :: struct {
 Sub :: struct {
 	stream: ^Stream_State,
 	offset: i64,
+	told:   i64,
+}
+
+@(private)
+Early :: struct {
+	refs:  int,
+	at:    i64,
+	bytes: []u8,
 }
 
 Op_Kind :: enum u8 {
@@ -208,6 +217,7 @@ Out :: struct {
 	key:     Object_Key,
 	obj:     rawptr,
 	piped:   bool,
+	early:   ^Early,
 }
 
 
@@ -245,6 +255,12 @@ Pending :: struct {
 
 @(private)
 MAX_INFLIGHT :: 32
+@(private)
+EARLY_MAX :: 256 * 1024
+@(private)
+EARLY_HELD_MAX :: 16 << 20
+@(private)
+EARLY_QUEUE :: 8
 @(private)
 MAX_OUT :: 256
 @(private)
@@ -1360,6 +1376,79 @@ _out_release :: proc(r: ^Relay_Core, o: ^Out, c: ^Conn = nil) {
 		r.store.object_close(r.store.data, o.obj)
 		o.obj = nil
 	}
+	if o.early != nil {
+		_early_unref(r, o.early)
+		o.early = nil
+	}
+}
+
+@(private)
+_early_unref :: proc(r: ^Relay_Core, e: ^Early) {
+	e.refs -= 1
+	if e.refs == 0 {
+		_early_free(r, e.bytes)
+		free(e, r.allocator)
+	}
+}
+
+@(private)
+_early_alloc :: proc(r: ^Relay_Core, n: i64) -> []u8 {
+	if n > EARLY_MAX || r.early_held + n > EARLY_HELD_MAX {
+		return nil
+	}
+	buf, err := make([]u8, int(n), r.allocator)
+	if err != nil {
+		return nil
+	}
+	r.early_held += n
+	return buf
+}
+
+@(private)
+_early_free :: proc(r: ^Relay_Core, buf: []u8) {
+	r.early_held -= i64(len(buf))
+	delete(buf, r.allocator)
+}
+
+@(private)
+_early_fan :: proc(c: ^Conn, st: ^Stream_State, at: i64, bytes: []u8) {
+	r := c.relay
+	e, aerr := new(Early, r.allocator)
+	if aerr != nil {
+		_early_free(r, bytes)
+		return
+	}
+	e^ = {refs = 1, at = at, bytes = bytes}
+	end := at + i64(len(bytes))
+	for f in st.followers {
+		if f.dead || f.state != .Ready || len(f.out) - f.out_head >= EARLY_QUEUE {
+			continue
+		}
+		for &s in f.subs {
+			if s.stream != st {
+				continue
+			}
+			if s.offset >= at && s.offset < end {
+				o: Out
+				o.kind = .Data
+				o.stream = st
+				o.at = s.offset
+				o.to = end
+				o.early = e
+				e.refs += 1
+				_stream_ref(st)
+				if _push(f, o) {
+					s.offset = end
+					_conn_kick(f)
+				} else {
+					e.refs -= 1
+					_stream_unref(r, st)
+				}
+			}
+			break
+		}
+	}
+	_early_unref(r, e)
 }
 
 
@@ -1525,6 +1614,7 @@ _on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
 		for &s in c.subs {
 			if s.stream == st {
 				s.offset = offset
+				s.told = length
 				found = true
 				break
 			}
@@ -1535,7 +1625,7 @@ _on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
 				_stream_maybe_release(r, st)
 				continue
 			}
-			if _, e := append(&c.subs, Sub{st, offset}); e != nil {
+			if _, e := append(&c.subs, Sub{st, offset, length}); e != nil {
 				_stream_maybe_release(r, st)
 				delete(buf, r.allocator)
 				_conn_close(c)
@@ -1793,6 +1883,9 @@ _on_append_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
 	c.op.kind = .Append
 	c.op.stream = st
 	c.op.w = w
+	if len(st.followers) > 0 {
+		c.op.buf = _early_alloc(r, total)
+	}
 }
 
 @(private)
@@ -1838,6 +1931,9 @@ _on_bulk_data :: proc(c: ^Conn, data: []u8) {
 		if op.failed == .None {
 			op.failed = r.store.append_write(r.store.data, op.w, data)
 		}
+		if op.buf != nil {
+			op.pos += copy(op.buf[op.pos:], data)
+		}
 	case .Put:
 		if op.failed == .None {
 			op.failed = r.store.put_write(r.store.data, op.w, data)
@@ -1877,6 +1973,9 @@ _on_bulk_end :: proc(c: ^Conn) {
 		p := _pending_new(c, .Append, st, op.total, op.id)
 		_stream_unref(r, st)
 		if p == nil {
+			if op.buf != nil {
+				_early_free(r, op.buf)
+			}
 			r.store.append_abort(r.store.data, op.w)
 			c.space.reserved -= op.total
 			st.busy = false
@@ -1890,7 +1989,19 @@ _on_bulk_end :: proc(c: ^Conn) {
 			p.early = true
 			p.need = _feed_hold(r, c.space, op.id, u64(st.length + op.total))
 		}
+		at := st.length
+		if op.buf != nil {
+			_stream_ref(st)
+		}
 		r.store.append_commit(r.store.data, op.w, _relay_done, p)
+		if op.buf != nil {
+			if op.failed == .None && op.pos == len(op.buf) && st.busy && !st.poisoned && st.length == at {
+				_early_fan(c, st, at, op.buf)
+			} else {
+				_early_free(r, op.buf)
+			}
+			_stream_unref(r, st)
+		}
 	case .Put:
 		p := _pending_new(c, .Put, nil, op.total, op.id)
 		if p == nil {
@@ -1916,6 +2027,9 @@ _op_abort :: proc(c: ^Conn) {
 	switch op.kind {
 	case .None, .Discard:
 	case .Append:
+		if op.buf != nil {
+			_early_free(r, op.buf)
+		}
 		r.store.append_abort(r.store.data, op.w)
 		c.space.reserved -= op.total
 		op.stream.busy = false
@@ -2232,15 +2346,21 @@ _produce :: proc(c: ^Conn) -> bool {
 			if s.offset < st.base {
 				s.offset = st.base
 			}
-			if st.length <= s.offset {
-				continue
-			}
 			o: Out
 			o.kind = .Data
 			o.stream = st
-			o.at = s.offset
-			o.to = min(st.length, s.offset + DATA_MAX)
-			s.offset = o.to
+			if st.length <= s.offset {
+				if st.length <= s.told {
+					continue
+				}
+				o.at = st.length
+				o.to = st.length
+			} else {
+				o.at = s.offset
+				o.to = min(st.length, s.offset + DATA_MAX)
+				s.offset = o.to
+			}
+			s.told = st.length
 			_stream_ref(st)
 			c.rr = (i + 1) % n
 			if !_push(c, o) {
@@ -2288,7 +2408,7 @@ _out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
 				copy(o.small[FRAME_HEADER:], v[:])
 				prim.put_u64le(o.small[FRAME_HEADER + 32:], u64(o.at))
 				length := u64(_live_len(st))
-				if n > 0 {
+				if n > 0 && o.early == nil {
 					length = max(length, u64(o.at + n))
 				}
 				if o.reply && o.at + n >= o.to {
@@ -2307,7 +2427,9 @@ _out_step :: proc(c: ^Conn, o: ^Out) -> (done: bool, err: Error) {
 			for o.left > 0 {
 				k := int(min(o.left, SENDFILE_CHUNK))
 				w: int
-				if fd, off, ext, ok := _stream_extent(r, st.h, o.at, i64(k)); ok && ext > 0 && _c_zero_copy(c) {
+				if o.early != nil {
+					w = _c_send(c, o.early.bytes[o.at - o.early.at:][:k], o.left > i64(k)) or_return
+				} else if fd, off, ext, ok := _stream_extent(r, st.h, o.at, i64(k)); ok && ext > 0 && _c_zero_copy(c) {
 					w = _c_sendfile(c, fd, off, int(min(ext, i64(k)))) or_return
 				} else {
 					w = _c_copy(c, r.store.stream_read, st.h, o.at, k) or_return
