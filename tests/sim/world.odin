@@ -90,6 +90,7 @@ Node :: struct {
 	watch_scheduled: bool,
 	api:         api.Api,
 	api_on:      bool,
+	used:        map[prim.Id]bool,
 }
 
 Relay_Node :: struct {
@@ -443,6 +444,7 @@ world_destroy :: proc(w: ^World) {
 		disk_destroy(&n.disk)
 		delete(n.conns)
 		delete(n.attaches)
+		delete(n.used)
 		delete(n.name, w.allocator)
 		free(n, w.allocator)
 	}

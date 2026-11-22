@@ -83,6 +83,7 @@ op_live_read :: proc(w: ^World, n: ^Node) {
 		oi = quarantined[rng_int(&w.rng, len(quarantined))]
 	}
 	ob := &m.objs[oi]
+	node_use(n, ob.o.id)
 	name: string
 	switch ob.kind {
 	case .Convo:

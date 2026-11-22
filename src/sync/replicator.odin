@@ -751,6 +751,20 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 	return -1
 }
 
+replicator_held :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> i64 {
+	id := stream_id(scope, device, name, epoch)
+	if rm, ok := r.remotes[id]; ok {
+		return journal.replica_length(&rm.rep)
+	}
+	pbuf: prim.Path_Buf = ---
+	path := _replica_path(r, &pbuf, id)
+	st, serr := prim.stat(r.vfs, path)
+	if serr != .None {
+		return 0
+	}
+	return st.size
+}
+
 Fresh_Tail :: enum u8 {
 	Current,
 	Waiting,

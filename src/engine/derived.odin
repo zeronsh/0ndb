@@ -294,6 +294,9 @@ verify_derived :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []
 		if _, serr := _space_open(e, rec.space); serr != .None {
 			continue
 		}
+		if !rec.own && object_held(e, Object{rec.space, id}) == 0 {
+			continue
+		}
 		#partial switch rec.kind {
 		case .Conversation:
 			if !rec.own {
