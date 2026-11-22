@@ -234,3 +234,15 @@ reap :: proc "contextless" (pid: Pid, block := false) -> (status: Exit_Status, d
 	}
 	return _decode_wait(st), true, .None
 }
+
+self_pid :: proc "contextless" () -> Pid {
+	return Pid(linux.getpid())
+}
+
+process_alive :: proc "contextless" (pid: Pid) -> bool {
+	if pid <= 0 {
+		return false
+	}
+	e := linux.kill(linux.Pid(pid), linux.Signal(0))
+	return e == .NONE || e == .EPERM
+}
