@@ -1227,21 +1227,33 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	defer delete(mine, context.temp_allocator)
-	ok := false
 	if l.fd < 0 {
 		l.fd, _ = prim.open_file(r.vfs, l.path)
 	}
 	redacted := make([dynamic]journal.Range, context.temp_allocator)
+	local: Error = .Corrupt
 	if got, err := prim.read_at(r.vfs, l.fd, mine, l.verify_at); err == .None && i64(got) == n && journal.record_bounds(mine) == int(n) {
-		if _wire_form(l, mine, l.verify_at) == .None {
-			ok = _records_match(mine, l.verify[:], l.verify_at, &redacted)
-		}
+		local = _wire_form(l, mine, l.verify_at)
 	}
-	clear(&l.verify)
-	if !ok {
-		_local_fatal(r, l, .Conflict, l.verify_to)
+	if local != .None || !_records_match(mine, l.verify[:], l.verify_at, &redacted) {
+		relay := _own_writes(l, l.verify[:], l.verify_at)
+		clear(&l.verify)
+		switch {
+		case !relay:
+			r.tamper_run += 1
+			r.tampered = true
+			_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, from = l.verify_at, to = l.verify_to})
+		case local == .Corrupt:
+			_local_fatal(r, l, .Corrupt, l.verify_to)
+		case local != .None:
+			_local_fatal(r, l, local, l.verify_to)
+		case:
+			_local_fatal(r, l, .Conflict, l.verify_to)
+		}
 		return
 	}
+	clear(&l.verify)
+	r.tamper_run = 0
 	for g in redacted {
 		_emit(r, Repl_Event{kind = .Local_Redacted, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, from = g.from, to = g.to})
 	}
@@ -1250,6 +1262,34 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 		return
 	}
 	_local_verify_next(r, l)
+}
+
+@(private)
+_own_writes :: proc(l: ^Local, theirs: []u8, base: i64) -> bool {
+	if journal.record_bounds(theirs) != len(theirs) {
+		return false
+	}
+	data, aerr := make([]u8, len(theirs), context.temp_allocator)
+	if aerr != nil {
+		return false
+	}
+	defer delete(data, context.temp_allocator)
+	copy(data, theirs)
+	if l.plain {
+		pos := 0
+		for pos < len(data) {
+			n := int(prim.get_u32le(data[pos:])) + journal.OVERHEAD
+			if e := journal.check_record(data[pos:][:n], base + i64(pos)); e != .None && e != .Redacted {
+				return false
+			}
+			pos += n
+		}
+		return true
+	}
+	if l.tree != nil {
+		return journal.open_range(data, base, keytree_provider(l.tree)) == .None
+	}
+	return !l.keyed && journal.open_range(data, base, static_provider(&l.key)) == .None
 }
 
 @(private)

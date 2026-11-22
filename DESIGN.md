@@ -861,7 +861,27 @@ concurrent typing is never lost or reverted.
   they are durable with the data they open and still reach the relay first.
   The simulator checks it at every step (no byte handed to the relay beyond
   the store's durable length) and after every restart (every stream recovers
-  at least what it sent).
+  at least what it sent, and the relay holds no more of a node's own object
+  streams than the node has durable). So on a correct device the relay is
+  never ahead of the local durable length of the device's own stream, in
+  every durability mode: there is no lost own tail to adopt after a power
+  cut, and a device never treats its own stream as a replica.
+- **The relay copy of an own stream is checked, never trusted.** When the
+  relay reports more of an own stream than the upload cursor, the replicator
+  reads that range back and compares it, record by record, with the local
+  bytes in wire form. A relay record that does not open as this device's own
+  sealed write (or, in a transparent space, fails its record check) is relay
+  tampering: `Relay_Misbehaving`, the connection drops and the check runs
+  again on the next connection under the normal connect backoff, which keeps
+  growing while the relay keeps tampering; it is never fatal and arms no
+  timer of its own. A local record that fails its own check is local
+  corruption: it is never sealed or uploaded and the stream stops with
+  `Corrupt`. Two different records that are both valid, or a relay length
+  past the local durable length, can only come from a second device writing
+  under this device id (a restored backup or a VM snapshot of the device):
+  the stream stops with `Conflict`, surfaced as a fatal event whose detail
+  says a clone is suspected. A relay-side redaction of an own record is
+  tolerated and applied locally (`Local_Redacted`).
 - Redaction punches holes in extents and erases every copy: stale extents of
   the file, copies a defragmentation made and superseded within one write
   (zeroed as garbage), and the garbage of deleted files, whose pending zeros a

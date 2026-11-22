@@ -405,6 +405,8 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		if w.cfg.io_rate > 0 && (ev.err == .Io || ev.err == .No_Space) {
 			world_note(w, "%s replication stopped by injected %v; supervisor restarts it", n.name, ev.err)
 			n.restart_pending = true
+		} else if ev.device == n.identity.id {
+			world_fail(w, "%s marked its own stream of %s fatal: %v %s", n.name, id_short(ev.object), ev.err, ev.detail)
 		} else if w.cfg.byzantine && (ev.err == .Forged || ev.err == .Corrupt || ev.err == .Quarantined) {
 			w.stats.detected += 1
 			world_note(w, "%s rejected tampered data on %s: %v", n.name, id_short(ev.object), ev.err)
@@ -421,6 +423,11 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		}
 	case .Refused:
 		world_note(w, "%s refused by relay: %v", n.name, ev.err)
+	case .Relay_Misbehaving:
+		if w.cfg.byzantine {
+			w.stats.detected += 1
+		}
+		world_note(w, "%s caught the relay misbehaving on %s device %s: %v", n.name, id_short(ev.object), id_short(ev.device), ev.err)
 	case .Connected:
 		n.connects += 1
 		world_note(w, "%s connected %s", n.name, id_short(ev.space))

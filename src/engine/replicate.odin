@@ -594,7 +594,8 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_emit(e, Event{kind = .Refused, space = sp.id, device = ev.device, err = _serr(ev.err)})
 	case .Fatal:
 		obj_id, _, _ := _object_of_name(ev.name)
-		_emit(e, Event{kind = .Fatal, space = sp.id, object = obj_id, err = _serr(ev.err), length = ev.length})
+		detail := "the relay holds a different valid copy of this device's own stream: another device is writing under this device id (clone suspected: a restored backup or VM snapshot)" if ev.err == .Conflict else ""
+		_emit(e, Event{kind = .Fatal, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err), length = ev.length, detail = detail})
 		_probes_settle(e, sp, obj_id)
 	case .Redacted:
 		_relay_redacted_event(e, sp, ev.stream, ev.from, ev.to)
