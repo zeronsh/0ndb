@@ -575,11 +575,11 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.fs = {}
 	rn.pk = {}
 	rn.packed = false
-	rn.w.stats.tier_evictions += rn.ts.evictions
-	rn.w.stats.tier_cold_reads += rn.ts.cold_reads
-	rn.w.stats.tier_thaws += rn.ts.thaws
-	rn.w.stats.tier_slow_reads += rn.slow.reads
-	rn.w.stats.tier_failed_reads += rn.slow.failed
+	stat_add(rn.w, STAT_TIER_EVICTIONS, rn.ts.evictions)
+	stat_add(rn.w, STAT_TIER_COLD_READS, rn.ts.cold_reads)
+	stat_add(rn.w, STAT_TIER_THAWS, rn.ts.thaws)
+	stat_add(rn.w, STAT_TIER_SLOW_READS, rn.slow.reads)
+	stat_add(rn.w, STAT_TIER_FAILED_READS, rn.slow.failed)
 	rn.ts = {}
 	rn.objs = {}
 	rn.slow = {}
@@ -689,4 +689,30 @@ check_derived :: proc(n: ^Node, at: string) {
 	for s in notes {
 		world_fail(w, "derived: %s at %s (incarnation %d): %s", n.name, at, n.incarnation, s)
 	}
+}
+
+STAT_TIER_EVICTIONS: Stat
+STAT_TIER_COLD_READS: Stat
+STAT_TIER_THAWS: Stat
+STAT_TIER_SLOW_READS: Stat
+STAT_TIER_FAILED_READS: Stat
+
+@(init)
+_node_stats :: proc "contextless" () {
+	register_restarted(10, proc(w: ^World, n: ^Node) {
+		check_sent(n)
+	})
+	register_collect(10, proc(w: ^World, res: ^Run_Result) {
+		res.stats.extra[int(STAT_TIER_EVICTIONS)] += w.relay.ts.evictions
+		res.stats.extra[int(STAT_TIER_COLD_READS)] += w.relay.ts.cold_reads
+		res.stats.extra[int(STAT_TIER_THAWS)] += w.relay.ts.thaws
+		res.stats.extra[int(STAT_TIER_SLOW_READS)] += w.relay.slow.reads
+		res.stats.extra[int(STAT_TIER_FAILED_READS)] += w.relay.slow.failed
+	})
+	register_stat_line(40)
+	STAT_TIER_EVICTIONS = register_stat(40, 0, "relay_evictions")
+	STAT_TIER_COLD_READS = register_stat(40, 1, "relay_cold_reads")
+	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
+	STAT_TIER_SLOW_READS = register_stat(40, 3, "object_reads")
+	STAT_TIER_FAILED_READS = register_stat(40, 4, "object_read_faults")
 }

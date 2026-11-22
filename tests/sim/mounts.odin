@@ -272,13 +272,13 @@ _on_base :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, data: rawptr) {
 	w := n.w
 	switch note {
 	case .Merged:
-		w.stats.base_merged += 1
+		stat_add(w, STAT_BASE_MERGED)
 	case .Current:
-		w.stats.base_current += 1
+		stat_add(w, STAT_BASE_CURRENT)
 	case .Mismatch:
-		w.stats.base_mismatch += 1
+		stat_add(w, STAT_BASE_MISMATCH)
 	case .Not_Text:
-		w.stats.base_other += 1
+		stat_add(w, STAT_BASE_OTHER)
 	}
 	world_note(w, "%s agent base for %s: %v", n.name, rel, note)
 }
@@ -751,4 +751,19 @@ check_synced_disk :: proc(w: ^World, n: ^Node) {
 			world_fail(w, "mount: %s %s synced version is not what is on disk: %s", n.name, sm.root, x)
 		}
 	}
+}
+
+STAT_BASE_MERGED: Stat
+STAT_BASE_CURRENT: Stat
+STAT_BASE_MISMATCH: Stat
+STAT_BASE_OTHER: Stat
+
+@(init)
+_mounts_stats :: proc "contextless" () {
+	register_final_check(110, check_mounts)
+	register_stat_line(50, "agent_bases")
+	STAT_BASE_MERGED = register_stat(50, 0, "merged")
+	STAT_BASE_CURRENT = register_stat(50, 1, "current")
+	STAT_BASE_MISMATCH = register_stat(50, 2, "mismatch")
+	STAT_BASE_OTHER = register_stat(50, 3, "other")
 }

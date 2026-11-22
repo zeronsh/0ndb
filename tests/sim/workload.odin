@@ -267,7 +267,16 @@ workload_step :: proc(w: ^World) {
 	for k in w.cfg.disabled {
 		weights[int(k)] = 0
 	}
-	k := Op_Kind(rng_pick(&w.rng, weights[:]))
+	all := make([dynamic]int, 0, len(weights), context.temp_allocator)
+	append(&all, ..weights[:])
+	ext_op_weights(w, &all)
+	pick := rng_pick(&w.rng, all[:])
+	if pick >= len(weights) {
+		ext_op_run(w, n, pick - len(weights))
+		node_after(n)
+		return
+	}
+	k := Op_Kind(pick)
 	switch k {
 	case .Create:
 		_op_create(w, n)
@@ -353,7 +362,7 @@ probe_reuse :: proc(w: ^World, n: ^Node) {
 		if !n.alive || !obj_exists(m, old.obj) {
 			continue
 		}
-		w.stats.rid_probes += 1
+		stat_add(w, STAT_RID_PROBES)
 		o := m.objs[old.obj].o
 		{
 			context = instance_context(&n.inst)
@@ -365,7 +374,7 @@ probe_reuse :: proc(w: ^World, n: ^Node) {
 			}
 			op_result(op, n, err)
 			if err == .None && rid.seg == old.rid.seg && rid.off == old.rid.off {
-				w.stats.rid_reused += 1
+				stat_add(w, STAT_RID_REUSED)
 				world_note(w, "%s reused offset %d of lost %s for %s", n.name, rid.off, old.token, op.token)
 			}
 			msg, merr := eng.convo_message(&n.e, o, convo.Position{msg = old.rid}, context.temp_allocator)
@@ -931,4 +940,14 @@ setup_bulk :: proc(w: ^World) {
 		node_after(n)
 		_ = t
 	}
+}
+
+STAT_RID_PROBES: Stat
+STAT_RID_REUSED: Stat
+
+@(init)
+_workload_stats :: proc "contextless" () {
+	register_restarted(30, probe_reuse, false)
+	STAT_RID_PROBES = register_stat(20, 8, "rid_probes")
+	STAT_RID_REUSED = register_stat(20, 9, "rid_reused")
 }

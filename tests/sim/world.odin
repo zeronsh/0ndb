@@ -126,24 +126,12 @@ Relay_Node :: struct {
 }
 
 World_Stats :: struct {
-	buffers:      u64,
-	bursts:       u64,
-	anchors_checked: u64,
-	base_merged:  u64,
-	base_current: u64,
-	base_mismatch: u64,
-	base_other:   u64,
 	events:       u64,
 	steps:        u64,
 	ops:          u64,
 	ops_failed:   u64,
 	crashes:      u64,
 	relay_crash:  u64,
-	tier_evictions: u64,
-	tier_cold_reads: u64,
-	tier_thaws:   u64,
-	tier_slow_reads: u64,
-	tier_failed_reads: u64,
 	resets:       u64,
 	partitions:   u64,
 	jumps:        u64,
@@ -158,25 +146,7 @@ World_Stats :: struct {
 	stalls:       u64,
 	conflict_pairs: u64,
 	search_models:  u64,
-	live_reads:     u64,
-	live_waited:    u64,
-	live_data:      u64,
-	live_absent:    u64,
-	live_quarantined: u64,
-	live_closed:    u64,
-	live_dropped:   u64,
-	live_wait_ms:   u64,
-	rid_probes:     u64,
-	rid_reused:     u64,
-	stream_bytes:   u64,
-	draft_deltas:   u64,
-	draft_delta_bytes: u64,
-	seg_delta_bytes: u64,
-	draft_checked:  u64,
-	draft_frames:   u64,
-	fresh_polls:    u64,
-	fresh_probed:   u64,
-	remote_draft_bytes: u64,
+	extra:          [STATS_MAX]u64,
 }
 
 Config :: struct {
@@ -441,9 +411,11 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.writers = make(map[string]Writer_Info, w.allocator)
 		append(&w.nodes, n)
 	}
+	run_world_init(w)
 }
 
 world_destroy :: proc(w: ^World) {
+	run_world_destroy(w)
 	for n in w.nodes {
 		if n.alive {
 			node_kill(n)

@@ -183,7 +183,7 @@ _frame :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8, down: bool) {
 		sid = draft_sid(sid, prim.get_u64le(payload[32:40]))
 		at, body, src = i64(prim.get_u64le(payload[40:48])), payload[LIVE_FIXED:], .Live
 		w.cipher.drafts += 1
-		w.stats.draft_frames += 1
+		stat_add(w, STAT_DRAFT_FRAMES)
 	case down && kind == KIND_LIVED && len(payload) >= LIVE_FIXED && !w.cfg.byzantine:
 		copy(sid[:], payload[:32])
 		sid = draft_sid(sid, prim.get_u64le(payload[32:40]))
@@ -508,4 +508,10 @@ reserved_stream :: proc(sid: osync.Stream_Id) -> bool {
 		}
 	}
 	return true
+}
+
+@(init)
+_nonce_hooks :: proc "contextless" () {
+	register_final_check(60, cipher_scan_relay)
+	register_final_check(70, cipher_resolve)
 }

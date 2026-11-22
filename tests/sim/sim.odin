@@ -190,11 +190,7 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 		n := w.nodes[ev.node]
 		if !n.alive {
 			if node_start(n) {
-				check_sent(n)
-				model_after_restart(&w.model, n)
-				probe_reuse(w, n)
-				stream_after_restart(w, n)
-				requeue_shares(w, n)
+				run_restarted(w, n, false)
 			}
 		}
 	case .Relay_Restart:
@@ -215,6 +211,8 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 			n.partitioned = false
 			world_note(w, "%s partition healed", n.name)
 		}
+	case:
+		run_event(w, ev)
 	}
 }
 
@@ -375,11 +373,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		res.trace = mix64(res.trace, n.disk.trace)
 	}
 	res.disk_ops += w.relay.disk.stats.ops
-	res.stats.tier_evictions += w.relay.ts.evictions
-	res.stats.tier_cold_reads += w.relay.ts.cold_reads
-	res.stats.tier_thaws += w.relay.ts.thaws
-	res.stats.tier_slow_reads += w.relay.slow.reads
-	res.stats.tier_failed_reads += w.relay.slow.failed
+	run_collect(w, &res)
 	res.trace = mix64(res.trace, disk_digest(&w.relay.disk))
 	if images != nil {
 		disk_images_take(w, images, label)
@@ -436,9 +430,7 @@ finish :: proc(w: ^World) {
 	for n in w.nodes {
 		if !n.alive && len(w.failures) == 0 {
 			if node_start(n) {
-				check_sent(n)
-				model_after_restart(&w.model, n)
-				stream_after_restart(w, n)
+				run_restarted(w, n, true)
 			}
 		}
 	}
@@ -465,18 +457,7 @@ finish :: proc(w: ^World) {
 	if !check_convergence(w, true) && w.cfg.verbose {
 		dump_replication(w, before)
 	}
-	check_fresh_poll(w)
-	check_streams(w)
-	check_map_reapply(w)
-	check_buffers(w)
-	check_redaction(w)
-	cipher_scan_relay(w)
-	cipher_resolve(w)
-	check_relay_redaction(w)
-	check_relay_plaintext(w)
-	check_relay_storage(w)
-	check_mounts(w)
-	check_uploaded(w)
+	run_final_checks(w)
 	if w.aborted {
 		return
 	}
@@ -707,11 +688,7 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.ops += st.stats.ops
 		total.stats.crashes += st.stats.crashes
 		total.stats.relay_crash += st.stats.relay_crash
-		total.stats.tier_evictions += st.stats.tier_evictions
-		total.stats.tier_cold_reads += st.stats.tier_cold_reads
-		total.stats.tier_thaws += st.stats.tier_thaws
-		total.stats.tier_slow_reads += st.stats.tier_slow_reads
-		total.stats.tier_failed_reads += st.stats.tier_failed_reads
+		stats_merge(&total.stats, &st.stats)
 		total.stats.resets += st.stats.resets
 		total.stats.partitions += st.stats.partitions
 		total.stats.engine_close += st.stats.engine_close
@@ -720,26 +697,6 @@ simulate :: proc(t: ^testing.T) {
 		total.stats.io_errors += st.stats.io_errors
 		total.stats.stalls += st.stats.stalls
 		total.stats.conflict_pairs += st.stats.conflict_pairs
-		total.stats.live_reads += st.stats.live_reads
-		total.stats.buffers += st.stats.buffers
-		total.stats.bursts += st.stats.bursts
-		total.stats.anchors_checked += st.stats.anchors_checked
-		total.stats.live_waited += st.stats.live_waited
-		total.stats.live_data += st.stats.live_data
-		total.stats.live_absent += st.stats.live_absent
-		total.stats.live_quarantined += st.stats.live_quarantined
-		total.stats.live_closed += st.stats.live_closed
-		total.stats.live_dropped += st.stats.live_dropped
-		total.stats.live_wait_ms = max(total.stats.live_wait_ms, st.stats.live_wait_ms)
-		total.stats.rid_probes += st.stats.rid_probes
-		total.stats.rid_reused += st.stats.rid_reused
-		total.stats.stream_bytes += st.stats.stream_bytes
-		total.stats.draft_deltas += st.stats.draft_deltas
-		total.stats.draft_delta_bytes += st.stats.draft_delta_bytes
-		total.stats.seg_delta_bytes += st.stats.seg_delta_bytes
-		total.stats.draft_checked += st.stats.draft_checked
-		total.stats.draft_frames += st.stats.draft_frames
-		total.stats.remote_draft_bytes += st.stats.remote_draft_bytes
 		total.disk_ops += st.disk_ops
 		total.sim_ns += st.sim_ns
 	}
@@ -900,12 +857,7 @@ print_stats :: proc(r: ^Run_Result) {
 	secs := f64(r.wall_ns) / 1e9
 	ev := f64(r.stats.events + r.stats.steps + r.disk_ops)
 	fmt.eprintf("sim: events=%d loop_steps=%d disk_ops=%d ops=%d crashes=%d relay_crashes=%d resets=%d partitions=%d engine_closes=%d tampered=%d detected=%d io_errors=%d byzantine_stalls=%d expected_conflicts=%d simulated=%.1fs wall=%.2fs throughput=%.0f events/s\n", r.stats.events, r.stats.steps, r.disk_ops, r.stats.ops, r.stats.crashes, r.stats.relay_crash, r.stats.resets, r.stats.partitions, r.stats.engine_close, r.stats.tampered, r.stats.detected, r.stats.io_errors, r.stats.stalls, r.stats.conflict_pairs, f64(r.sim_ns) / 1e9, secs, ev / max(secs, 1e-9))
-	fmt.eprintf("sim: interactive_reads=%d waited=%d data=%d absent=%d quarantined=%d closed=%d dropped_by_crash=%d max_wait_ms=%d rid_probes=%d rid_reused=%d\n", r.stats.live_reads, r.stats.live_waited, r.stats.live_data, r.stats.live_absent, r.stats.live_quarantined, r.stats.live_closed, r.stats.live_dropped, r.stats.live_wait_ms, r.stats.rid_probes, r.stats.rid_reused)
-	fmt.eprintf("sim: buffers_opened=%d bursts=%d anchors_checked=%d\n", r.stats.buffers, r.stats.bursts, r.stats.anchors_checked)
-	fmt.eprintf("sim: relay_evictions=%d relay_cold_reads=%d relay_thaws=%d object_reads=%d object_read_faults=%d\n", r.stats.tier_evictions, r.stats.tier_cold_reads, r.stats.tier_thaws, r.stats.tier_slow_reads, r.stats.tier_failed_reads)
-	fmt.eprintf("sim: agent_bases merged=%d current=%d mismatch=%d other=%d\n", r.stats.base_merged, r.stats.base_current, r.stats.base_mismatch, r.stats.base_other)
-	fmt.eprintf("sim: fresh_polls=%d fresh_probed=%d\n", r.stats.fresh_polls, r.stats.fresh_probed)
-	fmt.eprintf("sim: streamed=%d draft_frames=%d draft_deltas=%d draft_delta_bytes=%d remote_draft_bytes=%d segment_delta_bytes=%d draft_blocks_checked=%d\n", r.stats.stream_bytes, r.stats.draft_frames, r.stats.draft_deltas, r.stats.draft_delta_bytes, r.stats.remote_draft_bytes, r.stats.seg_delta_bytes, r.stats.draft_checked)
+	stats_print(&r.stats)
 }
 
 @(private = "file")
@@ -1078,4 +1030,9 @@ memory_runaway :: proc(w: ^World) -> bool {
 	world_fail(w, "%s", strings.to_string(b))
 	w.aborted = true
 	return true
+}
+
+@(init)
+_sim_hooks :: proc "contextless" () {
+	register_restarted(50, requeue_shares, false)
 }

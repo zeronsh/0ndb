@@ -36,7 +36,7 @@ live_kill :: proc(n: ^Node) {
 		if r.node == n.idx {
 			ordered_remove(&w.live, i)
 			free(r, w.allocator)
-			w.stats.live_dropped += 1
+			stat_add(w, STAT_LIVE_DROPPED)
 			continue
 		}
 		i += 1
@@ -107,7 +107,7 @@ op_live_read :: proc(w: ^World, n: ^Node) {
 	prim.write_id(&wr, ob.o.id)
 	r := new(Live_Read, w.allocator)
 	r^ = Live_Read{w = w, node = n.idx, obj = oi, op = name, start = w.now}
-	w.stats.live_reads += 1
+	stat_add(w, STAT_LIVE_READS)
 	id: u64
 	st: api.Status
 	{
@@ -116,7 +116,7 @@ op_live_read :: proc(w: ^World, n: ^Node) {
 	}
 	if st == .Pending {
 		r.id = id
-		w.stats.live_waited += 1
+		stat_add(w, STAT_LIVE_WAITED)
 		append(&w.live, r)
 		world_note(w, "%s interactive %s %s waits (call %d)", n.name, name, id_short(ob.o.id), id)
 		return
@@ -138,7 +138,7 @@ _live_done :: proc(data: rawptr, id: u64, status: api.Status, payload: []u8) {
 		}
 	}
 	world_note(w, "%s interactive %s %s settled %v after %d ms", w.nodes[r.node].name, r.op, id_short(w.model.objs[r.obj].o.id), status, (w.now - r.start) / 1_000_000)
-	w.stats.live_wait_ms = max(w.stats.live_wait_ms, u64((w.now - r.start) / 1_000_000))
+	stat_max(w, STAT_LIVE_WAIT_MS, u64((w.now - r.start) / 1_000_000))
 	_live_settled(w, r, status)
 	free(r, w.allocator)
 }
@@ -147,18 +147,18 @@ _live_done :: proc(data: rawptr, id: u64, status: api.Status, payload: []u8) {
 _live_settled :: proc(w: ^World, r: ^Live_Read, st: api.Status) {
 	#partial switch st {
 	case .Ok:
-		w.stats.live_data += 1
+		stat_add(w, STAT_LIVE_DATA)
 	case .Missing, .Not_Found, .Permission, .Offline:
-		w.stats.live_absent += 1
+		stat_add(w, STAT_LIVE_ABSENT)
 	case .Quarantined:
-		w.stats.live_quarantined += 1
+		stat_add(w, STAT_LIVE_QUARANTINED)
 	case .Closed:
-		w.stats.live_closed += 1
+		stat_add(w, STAT_LIVE_CLOSED)
 	case .Io, .No_Space, .Corrupt:
 		if w.cfg.io_rate == 0 && !w.nodes[r.node].disk.dead {
 			world_fail(w, "interactive read: %s %s on %s failed %v without injected I/O faults", r.op, id_short(w.model.objs[r.obj].o.id), w.nodes[r.node].name, st)
 		}
-		w.stats.live_absent += 1
+		stat_add(w, STAT_LIVE_ABSENT)
 	case:
 		world_fail(w, "interactive read: %s %s on %s settled %v after %d ms", r.op, id_short(w.model.objs[r.obj].o.id), w.nodes[r.node].name, st, (w.now - r.start) / 1_000_000)
 	}
@@ -182,4 +182,26 @@ check_live_reads :: proc(w: ^World) {
 		}
 		world_fail(w, "interactive read: %s %s on %s never settled (%d ms, tries=%d, engine waiters=%d)", r.op, id_short(w.model.objs[r.obj].o.id), n.name, (w.now - r.start) / 1_000_000, tries, pending)
 	}
+}
+
+STAT_LIVE_READS: Stat
+STAT_LIVE_WAITED: Stat
+STAT_LIVE_DATA: Stat
+STAT_LIVE_ABSENT: Stat
+STAT_LIVE_QUARANTINED: Stat
+STAT_LIVE_CLOSED: Stat
+STAT_LIVE_DROPPED: Stat
+STAT_LIVE_WAIT_MS: Stat
+
+@(init)
+_reads_stats :: proc "contextless" () {
+	register_stat_line(20)
+	STAT_LIVE_READS = register_stat(20, 0, "interactive_reads")
+	STAT_LIVE_WAITED = register_stat(20, 1, "waited")
+	STAT_LIVE_DATA = register_stat(20, 2, "data")
+	STAT_LIVE_ABSENT = register_stat(20, 3, "absent")
+	STAT_LIVE_QUARANTINED = register_stat(20, 4, "quarantined")
+	STAT_LIVE_CLOSED = register_stat(20, 5, "closed")
+	STAT_LIVE_DROPPED = register_stat(20, 6, "dropped_by_crash")
+	STAT_LIVE_WAIT_MS = register_stat(20, 7, "max_wait_ms", true)
 }

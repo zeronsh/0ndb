@@ -126,7 +126,7 @@ _stream_write :: proc(w: ^World, n: ^Node, st: ^M_Stream, wr: ^convo.Writer, fir
 		append(&st.blocks[len(st.blocks) - 1], text)
 	}
 	st.written += len(text)
-	w.stats.stream_bytes += u64(len(text))
+	stat_add(w, STAT_STREAM_BYTES, u64(len(text)))
 	return true
 }
 
@@ -277,13 +277,13 @@ _watch_cb :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.D
 		append(&a.text, ..d.text)
 		if d.draft {
 			a.drafted += len(d.text)
-			w.stats.draft_deltas += 1
-			w.stats.draft_delta_bytes += u64(len(d.text))
+			stat_add(w, STAT_DRAFT_DELTAS)
+			stat_add(w, STAT_DRAFT_DELTA_BYTES, u64(len(d.text)))
 			if !d.local {
-				w.stats.remote_draft_bytes += u64(len(d.text))
+				stat_add(w, STAT_REMOTE_DRAFT_BYTES, u64(len(d.text)))
 			}
 		} else {
-			w.stats.seg_delta_bytes += u64(len(d.text))
+			stat_add(w, STAT_SEG_DELTA_BYTES, u64(len(d.text)))
 		}
 	}
 }
@@ -328,7 +328,7 @@ check_streams :: proc(w: ^World) {
 			if !ok {
 				world_fail(w, "draft: %s saw %q (%d draft bytes, started=%v) for block %d of %s:%d but the block is %q (status %v)", n.name, _clip(a.text[:]), a.drafted, a.started, a.index, id_short(a.by), a.msg, _clip(final), msg.status)
 			}
-			w.stats.draft_checked += 1
+			stat_add(w, STAT_DRAFT_CHECKED)
 		}
 		node_after(n)
 	}
@@ -427,3 +427,24 @@ streams_destroy :: proc(w: ^World) {
 	delete(w.watches)
 }
 
+STAT_STREAM_BYTES: Stat
+STAT_DRAFT_FRAMES: Stat
+STAT_DRAFT_DELTAS: Stat
+STAT_DRAFT_DELTA_BYTES: Stat
+STAT_REMOTE_DRAFT_BYTES: Stat
+STAT_SEG_DELTA_BYTES: Stat
+STAT_DRAFT_CHECKED: Stat
+
+@(init)
+_stream_stats :: proc "contextless" () {
+	register_restarted(40, stream_after_restart)
+	register_final_check(20, check_streams)
+	register_stat_line(70)
+	STAT_STREAM_BYTES = register_stat(70, 0, "streamed")
+	STAT_DRAFT_FRAMES = register_stat(70, 1, "draft_frames")
+	STAT_DRAFT_DELTAS = register_stat(70, 2, "draft_deltas")
+	STAT_DRAFT_DELTA_BYTES = register_stat(70, 3, "draft_delta_bytes")
+	STAT_REMOTE_DRAFT_BYTES = register_stat(70, 4, "remote_draft_bytes")
+	STAT_SEG_DELTA_BYTES = register_stat(70, 5, "segment_delta_bytes")
+	STAT_DRAFT_CHECKED = register_stat(70, 6, "draft_blocks_checked")
+}

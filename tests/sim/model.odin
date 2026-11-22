@@ -520,3 +520,10 @@ redaction_maybe :: proc(m: ^Model, target: ^M_Op) -> bool {
 	}
 	return false
 }
+
+@(init)
+_model_hooks :: proc "contextless" () {
+	register_restarted(20, proc(w: ^World, n: ^Node) {
+		model_after_restart(&w.model, n)
+	})
+}
