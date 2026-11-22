@@ -439,6 +439,7 @@ history_close :: proc(h: ^History) {
 	for v in h.views {
 		fshist.text_drop(&v.st)
 		delete(v.cp)
+		delete(v.prev)
 		free(v, h.allocator)
 	}
 	delete(h.views)
