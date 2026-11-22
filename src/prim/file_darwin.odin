@@ -13,6 +13,8 @@ LOCK_NB :: 4
 @(private)
 F_FULLFSYNC :: 51
 @(private)
+F_BARRIERFSYNC :: 85
+@(private)
 F_PUNCHHOLE :: 99
 
 @(private)
@@ -40,6 +42,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	write_at   = _os_write_at,
 	datasync   = _os_datasync,
 	fullsync   = _os_fullsync,
+	barrier    = _os_barrier,
 	truncate   = _os_truncate,
 	punch_hole = _os_punch_hole,
 	lock       = _os_lock,
@@ -291,6 +294,14 @@ _os_datasync :: proc(data: rawptr, fd: Fd) -> Error {
 		return .None
 	}
 	return _os_fullsync(data, fd)
+}
+
+@(private)
+_os_barrier :: proc(data: rawptr, fd: Fd) -> Error {
+	if posix.fcntl(posix.FD(fd), posix.FCNTL_Cmd(F_BARRIERFSYNC)) != -1 {
+		return .None
+	}
+	return _os_datasync(data, fd)
 }
 
 @(private)

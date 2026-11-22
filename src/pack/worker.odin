@@ -247,15 +247,15 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 	base := fl.base
 	for j in fl.fds {
 		fl.nsync += 1
-		prim.datasync(base, j.fd) or_return
+		prim.barrier(base, j.fd) or_return
 	}
 	if fl.newc_fd >= 0 {
 		fl.nsync += 1
-		prim.datasync(base, fl.newc_fd) or_return
+		prim.barrier(base, fl.newc_fd) or_return
 	}
 	if fl.dirsync {
 		fl.nsync += 1
-		prim.sync_dir(base, fl.root) or_return
+		prim.barrier_dir(base, fl.root) or_return
 	}
 	if fl.wrote {
 		prim.write_at(base, fl.fd, fl.crec[:], fl.crec_off) or_return
@@ -289,8 +289,8 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 			run := _build_run(base, fl.run_fd, fl.imm, fl.drop) or_return
 			run.id = fl.run_id
 			fl.nsync += 2
-			prim.datasync(base, fl.run_fd) or_return
-			prim.sync_dir(base, fl.root) or_return
+			prim.barrier(base, fl.run_fd) or_return
+			prim.barrier_dir(base, fl.root) or_return
 			fl.run = run
 			fl.built = true
 			append(&fl.snap.runs, run)
@@ -298,8 +298,8 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 		return _snap_write(base, fl.super_fd, &fl.snap, &fl.nsync)
 	case .Merge:
 		fl.nsync += 2
-		prim.datasync(base, fl.merge.fd) or_return
-		prim.sync_dir(base, fl.root) or_return
+		prim.barrier(base, fl.merge.fd) or_return
+		prim.barrier_dir(base, fl.root) or_return
 		return _snap_write(base, fl.super_fd, &fl.snap, &fl.nsync)
 	}
 	return .None

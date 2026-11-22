@@ -383,7 +383,7 @@ txn_commit :: proc(t: ^Txn) -> Error {
 			db.poisoned = true
 			return obj.perr(err)
 		}
-		if err := prim.datasync(db.vfs, db.fd); err != .None {
+		if err := prim.barrier(db.vfs, db.fd); err != .None {
 			txn_abort(t)
 			db.poisoned = true
 			return obj.perr(err)
