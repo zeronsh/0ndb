@@ -6,6 +6,7 @@ import "core:strings"
 import "../../src/convo"
 import "../../src/crdt"
 import "../../src/fs"
+import "../../src/fstree"
 import "../../src/journal"
 import eng "../../src/engine"
 import omap "../../src/map"
@@ -260,24 +261,90 @@ check_whole_tokens :: proc(w: ^World, n: ^Node, oi: int, known: ^map[string]bool
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	if ob.kind == .Text {
-		if data, err := eng.text_read(&n.e, ob.o, context.temp_allocator); err == .None {
-			_whole_tokens(w, n, oi, "", data, known)
+		data, err := eng.text_read(&n.e, ob.o, context.temp_allocator)
+		if err != .None {
+			return
 		}
+		spans, _ := eng.text_spans(&n.e, ob.o, context.temp_allocator)
+		regions, _ := eng.text_conflicts(&n.e, ob.o, context.temp_allocator)
+		_whole_tokens(w, n, oi, "", data, spans, regions, known)
 		return
 	}
 	names, lerr := eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
 	if lerr != .None {
 		return
 	}
+	regions, _ := eng.tree_conflicts(&n.e, ob.o, context.temp_allocator)
 	for name in names {
-		if data, err := eng.tree_read(&n.e, ob.o, name, context.temp_allocator); err == .None {
-			_whole_tokens(w, n, oi, name, data, known)
+		data, err := eng.tree_read(&n.e, ob.o, name, context.temp_allocator)
+		if err != .None {
+			continue
 		}
+		_whole_tokens(w, n, oi, name, data, _tree_author_spans(n, ob.o, name), regions, known)
 	}
 }
 
 @(private = "file")
-_whole_tokens :: proc(w: ^World, n: ^Node, oi: int, path: string, data: []u8, known: ^map[string]bool) {
+_tree_author_spans :: proc(n: ^Node, o: eng.Object, path: string) -> []crdt.Author_Span {
+	hist, err := eng.tree_history(&n.e, o)
+	if err != .None {
+		return nil
+	}
+	defer eng.tree_release(&n.e, o)
+	snap := fstree.current(&hist.tree)
+	id, ok, lerr := fstree.lookup(&snap, path)
+	if lerr != nil || !ok {
+		return nil
+	}
+	f, ferr := fs.history_file(hist, id)
+	if ferr != .None {
+		return nil
+	}
+	raw := crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
+	fs.history_present_spans(hist, raw)
+	return raw
+}
+
+@(private = "file")
+_in_region :: proc(spans: []crdt.Author_Span, regions: []eng.Tree_Conflict, path: string, from, to: int) -> bool {
+	last: crdt.Op_Id
+	have := false
+	covered := 0
+	at := 0
+	for s in spans {
+		lo := max(at, from)
+		hi := min(at + s.len, to)
+		for i in lo ..< hi {
+			id := crdt.Op_Id{s.id.actor, s.id.seq + u64(i - at)}
+			if have && id.actor == last.actor && id.seq != last.seq + 1 {
+				return false
+			}
+			last, have = id, true
+			found := false
+			for r in regions {
+				if len(path) > 0 && file_base(r.path) != file_base(path) {
+					continue
+				}
+				for side in ([][]crdt.Op_Span{r.ours, r.theirs}) {
+					for x in side {
+						if x.id.actor == id.actor && id.seq >= x.id.seq && id.seq < x.id.seq + u64(x.len) {
+							found = true
+						}
+					}
+				}
+			}
+			if !found {
+				return false
+			}
+			covered += 1
+		}
+		at += s.len
+	}
+	return covered == to - from
+}
+
+@(private = "file")
+_whole_tokens :: proc(w: ^World, n: ^Node, oi: int, path: string, data: []u8, spans: []crdt.Author_Span, regions: []eng.Tree_Conflict, known: ^map[string]bool) {
 	ob := &w.model.objs[oi]
 	words := BULK_WORDS
 	i := 0
@@ -308,8 +375,8 @@ _whole_tokens :: proc(w: ^World, n: ^Node, oi: int, path: string, data: []u8, kn
 				break
 			}
 		}
-		if !whole {
-			world_fail(w, "fragment: %s holds %q at %d of %v %s %s, which is not a whole token or word", n.name, string(data[i:k]), i, ob.kind, id_short(ob.o.id), path)
+		if !whole && !_in_region(spans, regions, path, i, k) {
+			world_fail(w, "fragment: %s holds %q at %d of %v %s %s, which is neither a whole token or word nor inside a reported conflict region", n.name, string(data[i:k]), i, ob.kind, id_short(ob.o.id), path)
 			return
 		}
 		i = k
