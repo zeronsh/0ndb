@@ -44,6 +44,10 @@ op_stats :: proc(c: ^Call, o: ^Out) -> Status {
 	o_u64(o, "base_current", s.base_current)
 	o_u64(o, "base_mismatch", s.base_mismatch)
 	o_u64(o, "base_not_text", s.base_not_text)
+	o_u64(o, "buffer_live_sent", s.buffer_live_sent)
+	o_u64(o, "buffer_live_applied", s.buffer_live_applied)
+	o_u64(o, "buffer_live_confirmed", s.buffer_live_confirmed)
+	o_u64(o, "buffer_live_dropped", s.buffer_live_dropped)
 	return .Ok
 }
 

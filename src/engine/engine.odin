@@ -169,6 +169,7 @@ Config :: struct {
 	transport:       Transport,
 	clock:           Clock,
 	random:          prim.Random,
+	buffer_live_off: bool,
 	ids:             Id_Source,
 	log:             Log,
 	spawner:         Spawner,
@@ -265,6 +266,12 @@ Stats :: struct {
 	base_current: u64,
 	base_mismatch: u64,
 	base_not_text: u64,
+	buffer_live_sent: u64,
+	buffer_live_applied: u64,
+	buffer_live_confirmed: u64,
+	buffer_live_dropped: u64,
+	buffer_live_skipped: u64,
+	buffer_live_rejected: u64,
 }
 
 Engine :: struct {
@@ -318,6 +325,10 @@ Engine :: struct {
 	buffers:      [dynamic]^Buffer,
 	next_buffer:  u64,
 	cursor_inbox: [dynamic]Cursor_Msg,
+	live_boot:    [16]u8,
+	live_booted:  bool,
+	live_boots:   map[prim.Id][16]u8,
+	buffer_wakes: [dynamic]Ready,
 	tick:         u64,
 	tick_timer:   prim.Timer,
 	tick_hook:    Tick_Hook,

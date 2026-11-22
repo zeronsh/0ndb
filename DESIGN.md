@@ -740,6 +740,56 @@ concurrent typing is never lost or reverted.
   keeps as opaque large content cannot be opened as a buffer (`Too_Large`).
 - **Idle.** Open buffers arm nothing and wake nothing; they cost the view's
   memory and run only when their object changes.
+- **Live edits.** A buffer edit reaches other devices' buffers ahead of its
+  durability, on the live channel of the object's segment, the way drafts
+  do (relay fan-out to live followers only, never stored).
+  - *Writer.* After `buffer_edit` commits its batch at journal offset
+    `off`, it sends `Live(segment, msg = DRAFT_MSG_MAX - 1, at = off,
+    frame)`, where `frame = 1 ‖ boot ‖ off ‖ seal(file frontier ‖ file
+    length ‖ batch)`. The file frontier is the frontier of the last 32
+    ops on that file in the writer's view before the batch, the batch is
+    encoded self-contained (actor ids inline, no stream dictionary), and
+    `boot` is 16 random bytes drawn once per engine open. The seal is
+    ChaCha20-Poly1305 under `HKDF(K(off), "0ndb buffer live key" ‖ boot)`,
+    `K` the segment's key provider, with nonce = `off` and AAD = segment
+    stream id ‖ object id ‖ the clear header; a transparent space sends the
+    body in the clear. The key never equals a record key (HKDF with a
+    label no record key uses), and no (key, nonce) pair carries two
+    plaintexts: within one boot every frame has its own offset, and an
+    offset reused after a crash, whose batch never became durable, is
+    sealed under the new boot's key.
+  - *Receiver.* A device with a buffer open on the object live-follows every
+    other device's segment of it. A frame is shown only if it applies
+    linearly: its file frontier and length equal the buffer's display (the
+    durable view, or the last overlay batch). It then joins the buffer's
+    overlay, a list of positional byte deltas on the durable view; the
+    client sees `D = V ⊕ overlay` and gets the batch as one delta at once.
+    Every client position (edits after the transform, reads, lengths,
+    anchors, resolve, cursors) is in `D`; anchors inside overlay text name
+    the overlay op itself and resolve through the overlay. Nothing enters
+    the history graph, so a batch that never becomes durable leaves no
+    trace.
+  - *Durable catch-up.* When the view advances, the change `A` it made to
+    the file is compared with the overlay: if the view's file frontier is
+    the last op of an overlay prefix and `A` equals that prefix composed,
+    the prefix is confirmed by op id with no delta to the client and the
+    rest stays. Otherwise the client gets one correction, `inverse(overlay)
+    ∘ A`, and the overlay is cleared, so no op is ever shown twice and the
+    text always ends equal to the durable text.
+  - *Local edits while an overlay is shown.* An edit, undo or redo is
+    held (the call pends) until the overlay is gone, so a local insert is
+    never parented without the remote text it was typed next to; held calls
+    rerun in order. A caller without a way to wait drops the overlay first.
+  - *Withdrawal.* An overlay batch is dropped only on knowledge: its
+    durable record differs (the correction above), its writer's boot
+    changes (seen on its next frame), or its writer goes down in presence.
+    Nothing is armed while idle.
+  - *Measured* (Linux, two daemons on one relay, a 15 KB file, an edit every
+    3 ms on one device): edit to the other device's buffer delta p50
+    0.52–0.85 ms, p90 1.4–1.6 ms, against 1.7–1.9 ms and 2.4–2.8 ms through
+    durability. When both devices type into the same file at once, a remote
+    batch is concurrent with the receiver's latest edit and arrives
+    durably instead.
 
 ## Storage
 
