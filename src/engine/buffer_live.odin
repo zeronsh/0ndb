@@ -652,10 +652,15 @@ _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch
 		return
 	}
 	append(&body, ..bb[:])
-	if !e.live_booted {
+	if e.live_sent == nil {
+		e.live_sent = make(map[prim.Id]i64, e.allocator)
+	}
+	if last, sent := e.live_sent[h.id]; !e.live_booted || (sent && off <= last) {
 		random_fill(e, e.live_boot[:])
 		e.live_booted = true
+		clear(&e.live_sent)
 	}
+	e.live_sent[h.id] = off
 	hdr: [LIVE_HEADER]u8
 	hdr[0] = LIVE_FRAME_V1
 	boot := e.live_boot

@@ -460,6 +460,7 @@ check_buffers :: proc(w: ^World) {
 		}
 		node_after(n)
 	}
+	stat_add(w, STAT_BLIVE_SEALS, w.cipher.bufseals)
 	for n in w.nodes {
 		if n.alive && n.e_open {
 			stat_add(w, STAT_BLIVE_APPLIED, n.e.stats.buffer_live_applied)
@@ -526,6 +527,7 @@ STAT_BLIVE_APPLIED: Stat
 STAT_BLIVE_CONFIRMED: Stat
 STAT_BLIVE_DROPPED: Stat
 STAT_BLIVE_HELD: Stat
+STAT_BLIVE_SEALS: Stat
 
 @(init)
 _buffers_stats :: proc "contextless" () {
@@ -538,4 +540,5 @@ _buffers_stats :: proc "contextless" () {
 	STAT_BLIVE_CONFIRMED = register_stat(30, 4, "live_confirmed")
 	STAT_BLIVE_DROPPED = register_stat(30, 5, "live_dropped")
 	STAT_BLIVE_HELD = register_stat(30, 6, "live_held")
+	STAT_BLIVE_SEALS = register_stat(30, 7, "live_seals")
 }

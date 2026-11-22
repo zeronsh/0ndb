@@ -453,6 +453,8 @@ _buffers_free_all :: proc(e: ^Engine) {
 	e.buffers = nil
 	delete(e.live_boots)
 	e.live_boots = nil
+	delete(e.live_sent)
+	e.live_sent = nil
 	delete(e.buffer_wakes)
 	e.buffer_wakes = nil
 }

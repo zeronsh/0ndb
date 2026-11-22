@@ -328,6 +328,7 @@ Engine :: struct {
 	live_boot:    [16]u8,
 	live_booted:  bool,
 	live_boots:   map[prim.Id][16]u8,
+	live_sent:    map[prim.Id]i64,
 	buffer_wakes: [dynamic]Ready,
 	tick:         u64,
 	tick_timer:   prim.Timer,
