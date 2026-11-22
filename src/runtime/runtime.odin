@@ -193,6 +193,8 @@ Stats :: struct {
 	warmups:       u64,
 	takeovers:     u64,
 	inexact:       u64,
+	quiesces:      u64,
+	quiesce_held:  u64,
 	timers:        int,
 }
 
@@ -272,6 +274,8 @@ Runtime :: struct {
 	leases:      [dynamic]Lease_Watch,
 	follows:     [dynamic]Follow,
 	revives:     [dynamic]Revive_Wait,
+	catchups:    [dynamic]Object,
+	quiesce:     Quiesce_State,
 	lease_timer: prim.Timer,
 	lease_at:    i64,
 	prev_events: eng.Event_Hook,
@@ -347,6 +351,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	r.leases = make([dynamic]Lease_Watch, allocator)
 	r.follows = make([dynamic]Follow, allocator)
 	r.revives = make([dynamic]Revive_Wait, allocator)
+	r.catchups = make([dynamic]Object, allocator)
 	r.asks = make([dynamic]Ask, allocator)
 	agent.registry_init(&r.registry, allocator)
 	r.prev_events = e.cfg.events
@@ -377,8 +382,11 @@ _on_engine_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		case .Presence:
 			_presence_changed(r, ev.space, ev.device, ev.tick != 0)
 		case .Connected:
+			_readvertise(r, ev.space)
 			_pending_scan(r, ev.space)
 		case .Caught_Up:
+			_readvertise(r, ev.space)
+			_catchup_run(r, ev.space)
 			for w in r.revives {
 				if w.object.space == ev.space {
 					_queue_eval(r, w.object)
@@ -472,6 +480,7 @@ close :: proc(r: ^Runtime) {
 	if r.lease_timer != 0 {
 		prim.timer_cancel(l, r.lease_timer)
 	}
+	_quiesce_destroy(r)
 	for w in r.leases {
 		if w.sub != 0 {
 			eng.unsubscribe(r.e, w.sub)
@@ -487,6 +496,7 @@ close :: proc(r: ^Runtime) {
 	}
 	delete(r.follows)
 	delete(r.revives)
+	delete(r.catchups)
 	_asks_close(r)
 	if r.warmer_on {
 		model.warmer_destroy(&r.warmer)
@@ -602,6 +612,9 @@ stats :: proc(r: ^Runtime) -> Stats {
 		n += 1
 	}
 	if r.lease_timer != 0 {
+		n += 1
+	}
+	if r.quiesce.timer != 0 {
 		n += 1
 	}
 	s.timers = n
@@ -730,6 +743,19 @@ _on_catalog :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng
 }
 
 @(private)
+_readvertise :: proc(r: ^Runtime, space: prim.Id) {
+	if !r.cfg.runner {
+		return
+	}
+	for sw in r.spaces {
+		if sw.space == space {
+			_advertise(r, space, r.cfg.capacity)
+			return
+		}
+	}
+}
+
+@(private)
 _queue_eval :: proc(r: ^Runtime, o: Object) {
 	if r.closing {
 		return
@@ -804,9 +830,14 @@ _on_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
 		}
 	}
 	free(w, r.allocator)
-	if err == .None {
-		_queue_eval(r, o)
+	if err != .None {
+		return
 	}
+	if o == pending_object(o.space) {
+		_pending_scan(r, o.space)
+		return
+	}
+	_queue_eval(r, o)
 }
 
 @(private)
