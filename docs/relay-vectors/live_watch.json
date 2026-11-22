@@ -1,0 +1,104 @@
+{
+  "format": "0ndb relay vectors 1",
+  "name": "live_watch",
+  "summary": "Live watch (feature bit 4): writer interest answered with Watched, Watched on the first live follower and when the last one leaves or disconnects, owner check, interest removal.",
+  "config": {"wall_ms": 1767225600000, "mono_ms": 1000, "open": true, "quota": 0, "feed_compact": -1, "max_follows": 16384, "principal_conns": 1024, "max_space_conns": 4096},
+  "steps": [
+    {"step": "connect", "conn": "alice", "local": false, "binding": "b1fa710aa2a09775cd76b02f8eeafb272113b72286d0b923dbdc29c2892d9939f40f70a50b1b37825aad4f0b3a3e746214e6a000b103f023869da841b7d63535",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "6401000001030430efa1e2a1e78a6ccaae1fd218390fcf8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca6f60bc1e1e13de231d22bca579443bdad450a0b381d376355ce88c7e553eee70ea4aa0c8e5ebcc102f5cd29463a4d2169b021062a90a1dce5616c295efedc0701ef014d010122232425262728292a2b2c2d2e2f30318a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000a8da769b010000718a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000052935cc6221f8637893ba00dc0fe36f9e27f80ba64d4f4afc4d505dd5535b9052203432f9ad14209f7f90ee958e2b8fcbe856763ead5a7912cc9f21cdd72f40d", "comment": "Hello",
+     "out": {
+       "alice": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000001f00000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "bob", "local": false, "binding": "2ca338b55373211d8e822b62ef7e3e60dd75617ca279815ca1051ffa58bd3b8eab687570ab0aab51a75df1ba38dca13dbf46749df30826eb75cd0c68ce4abf83",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "8401000001030430efa1e2a1e78a6ccaae1fd218390fcf8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394e9bf63416c205cb0e4c7bb19a3f5f50201117f175e15a44f20a7bc67174e322ec275377872c7058c47e0e2132a23145c857c343e375425f7e281ca9f829cc503018f024d010230efa1e2a1e78a6ccaae1fd218390fcf8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0101ce5ba9bd2e60d45ebf878cbf76ae481a79b579827abe7bd2cb55b23ce82943be00a8da769b010000718139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39400020100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000368f2ac9589d561173cb9ebb7d4edad5db2ea5facd7f8b034fa20d6aa31d51b097b33e73b0566fdf780732118dfd20d2059dbe4db00ed50214a6d1ceba385d07", "comment": "Hello",
+     "out": {
+       "bob": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000001f00000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "connect", "conn": "carol", "local": false, "binding": "f9fc5805f985e5dc7b37c46392219583c487337587a8506bd11af92eeb7d2474454666e20c0df0732e396dbd3c6bd29e3ab05a51fbc898b188b4f6a08411909b",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "carol", "bytes": "8401000001030430efa1e2a1e78a6ccaae1fd218390fcfed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d199f98f0429dc7a7629399c955ec4a9473b09577786a7206fc45da359d6154cc1d4d6f49846de5b117ca8e70790658ffc885251ca1fbd14823c5c30e87cd85f0e018f024d010230efa1e2a1e78a6ccaae1fd218390fcf8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0201286b719129cfe3b503f3e64eeae2ca69f1691b0e922d661720182fd0ab58d21b00a8da769b01000071ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d100020100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000cb7f9086e6d0eff5032c1f7533b62a44cf07bcf7199f37c97d0377e28e20f344ade30c54172ffff8ef8bf44a3be4f324fa6fc1cf1f922066c0c75b9cd251cd05", "comment": "Hello",
+     "out": {
+       "carol": [
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618000000000000000000000000000000001f00000000000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404feffffffffffffff", "comment": "the writer registers interest: answered Watched(id, 0)",
+     "out": {
+       "alice": [
+         {"kind": "Watched", "frame": "210000009dccf77c94730e0988a300194c0f4235790404040404040404040404040404040400"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404feffffffffffffff", "comment": "a repeated registration is answered again",
+     "out": {
+       "alice": [
+         {"kind": "Watched", "frame": "210000009dccf77c94730e0988a300194c0f4235790404040404040404040404040404040400"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404feffffffffffffff", "comment": "interest in another device's segment is refused",
+     "out": {
+       "bob": [
+         {"kind": "Refused", "frame": "210000008c05ccf77c94730e0988a300194c0f42357904040404040404040404040404040404"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f423579040404040404040404040404040404040000000000000000", "comment": "the first live follower: the writer gets Watched(id, 1)",
+     "out": {
+       "alice": [
+         {"kind": "Watched", "frame": "210000009dccf77c94730e0988a300194c0f4235790404040404040404040404040404040401"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "5100000017ccf77c94730e0988a300194c0f4235790404040404040404040404040404040460000000000000000000000000000000090000007da218745d551aa1f7f9a2d068755abf6472616674206f6e6509000000", "comment": "Live reaches bob",
+     "out": {
+       "bob": [
+         {"kind": "Lived", "frame": "510000009bccf77c94730e0988a300194c0f4235790404040404040404040404040404040460000000000000000000000000000000090000007da218745d551aa1f7f9a2d068755abf6472616674206f6e6509000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "carol", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f423579040404040404040404040404040404040000000000000000", "comment": "a second follower changes nothing for the writer",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404ffffffffffffffff", "comment": "one follower leaves: still watched",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "close", "conn": "carol",
+     "out": {
+       "alice": [
+         {"kind": "Watched", "frame": "210000009dccf77c94730e0988a300194c0f4235790404040404040404040404040404040400"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f423579040404040404040404040404040404040000000000000000", "comment": "carol's disconnect ended the last interest; bob's return sends Watched(id, 1) again",
+     "out": {
+       "alice": [
+         {"kind": "Watched", "frame": "210000009dccf77c94730e0988a300194c0f4235790404040404040404040404040404040401"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404ffffffffffffffff", "comment": "the last follower leaves: Watched(id, 0)",
+     "out": {
+       "alice": [
+         {"kind": "Watched", "frame": "210000009dccf77c94730e0988a300194c0f4235790404040404040404040404040404040400"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f42357904040404040404040404040404040404fdffffffffffffff", "comment": "the writer ends its interest",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "bob", "bytes": "2b00000006020100ccf77c94730e0988a300194c0f423579040404040404040404040404040404040000000000000000", "comment": "no Watched once the writer has no interest",
+     "out": {},
+     "closed": [],
+     "store": []}
+  ],
+  "state": {
+  }
+}

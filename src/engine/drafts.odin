@@ -253,6 +253,33 @@ _draft_own_feed :: proc(e: ^Engine, h: ^Handle) {
 }
 
 @(private)
+_draft_timer_arm :: proc(e: ^Engine) {
+	if e.draft_timer != 0 || e.closing {
+		return
+	}
+	for h in e.lru {
+		if h.kind == .Conversation && h.w_open && convo.writer_draft_pending(&h.cw) {
+			e.draft_timer = prim.timer(e.loop, convo.DRAFT_COALESCE_MS, e, _on_draft_timer)
+			return
+		}
+	}
+}
+
+@(private)
+_on_draft_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	e := (^Engine)(data)
+	context = context_for(e)
+	e.draft_timer = 0
+	for h in e.lru {
+		if h.kind == .Conversation && h.w_open && convo.writer_draft_pending(&h.cw) {
+			convo.writer_draft_force(&h.cw)
+			h.local = true
+		}
+	}
+	_touch(e)
+}
+
+@(private)
 _draft_own_key :: proc(h: ^Handle, msg: i64) -> (key: journal.Key, plain: bool, ok: bool) {
 	if h.sp.mode == .Transparent {
 		return key, true, true
@@ -327,7 +354,7 @@ _draft_publish :: proc(e: ^Engine, p: Draft_Pub) {
 	}
 	h.ddur = p.end
 	sp := h.sp
-	if !sp.repl_on || !osync.replicator_live_on(&sp.repl) {
+	if !sp.repl_on || !osync.replicator_live_watched(&sp.repl, &h.scope, h.name, 0) {
 		return
 	}
 	runs := make([dynamic]osync.Live_Run, context.temp_allocator)

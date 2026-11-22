@@ -73,6 +73,7 @@ Kind :: enum u8 {
 	Accounted = 0x9a,
 	Lived     = 0x9b,
 	Trimmed   = 0x9c,
+	Watched   = 0x9d,
 }
 
 Code :: enum u8 {
@@ -130,9 +131,13 @@ ACCOUNTED_LEN :: 14 * 8
 FEATURE_ACCOUNT :: u64(1)
 FEATURE_TRIM :: u64(2)
 FEATURE_BELOW_BASE :: u64(4)
-RELAY_FEATURES :: FEATURE_ACCOUNT | FEATURE_TRIM | FEATURE_BELOW_BASE | FEATURE_LIVE
+RELAY_FEATURES :: FEATURE_ACCOUNT | FEATURE_TRIM | FEATURE_BELOW_BASE | FEATURE_LIVE | FEATURE_LIVE_WATCH
 TRIM_LEN :: 32 + 8
 FEATURE_LIVE :: u64(1) << 3
+FEATURE_LIVE_WATCH :: u64(1) << 4
+LIVE_INTEREST :: max(u64) - 1
+LIVE_INTEREST_END :: max(u64) - 2
+WATCHED_LEN :: 32 + 1
 FOLLOW_LIVE :: 2
 LIVE_FIXED :: 32 + 8 + 8
 LIVE_MAX :: SERVE_MAX
@@ -313,7 +318,7 @@ _parser_header :: proc(p: ^Parser) -> Error {
 		}
 	} else {
 		#partial switch k {
-		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Directed, .Undelivered, .Noted, .Hollow, .Pulled, .Unserved, .Accounted, .Trimmed:
+		case .Welcome, .Listing, .Appended, .Conflict, .Stored, .Missing, .Length, .Created, .Dropped, .Refused, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Directed, .Undelivered, .Noted, .Hollow, .Pulled, .Unserved, .Accounted, .Trimmed, .Watched:
 		case .Data:
 			bulk, fixed, limit = true, DATA_FIXED, OBJECT_MAX
 		case .Served:

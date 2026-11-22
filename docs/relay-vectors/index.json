@@ -20,5 +20,6 @@
   {"name": "compaction", "steps": 34, "summary": "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base."},
   {"name": "trim", "steps": 25, "summary": "Trim drops stored content below a base an archive covers: owner only, acknowledged once durable, idempotent, never lowers base, refused at or past the length; readers, probes and follows get Trimmed; Fill below a trim stores nothing."},
   {"name": "limits", "steps": 10, "summary": "Per-principal connection limit and per-connection follow limit."},
-  {"name": "live", "steps": 24, "summary": "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow leaving live interest, LIVE removal, draft pulls through the peer pipe, malformed Live."}
+  {"name": "live", "steps": 24, "summary": "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow leaving live interest, LIVE removal, draft pulls through the peer pipe, malformed Live."},
+  {"name": "live_watch", "steps": 18, "summary": "Live watch (feature bit 4): writer interest answered with Watched, Watched on the first live follower and when the last one leaves or disconnects, owner check, interest removal."}
 ]

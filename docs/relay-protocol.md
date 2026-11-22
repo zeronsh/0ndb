@@ -143,6 +143,7 @@ split across any number of transport reads.
 | | | | Unserved | 0x99 |
 | | | | Accounted | 0x9a |
 | | | | Lived | 0x9b |
+| | | | Watched | 0x9d |
 
 ### 3.2 Codes
 
@@ -198,6 +199,7 @@ relay is 25 bytes and has no `features`).
 | 1 | `Trim` (section 8.14) |
 | 2 | reads below a trimmed `base`: `Trimmed` (section 8.14) |
 | 3 | live drafts: `Live` / `Lived`, `Follow` flag LIVE, draft pulls (section 8.16) |
+| 4 | live watch: writer interest entries and `Watched` (section 8.17) |
 
 The signature in every built-in credential is Ed25519 over the **hello
 message** `"0ndb hello 1" ‖ 00 00 00 00 ‖ B`, where `B` is the 64-byte binding,
@@ -735,6 +737,37 @@ draft offset never carries two different ciphertexts. Readers detect a gap
 (`at` beyond what they hold) and fetch it with a draft pull (section 8.12)
 from the segment's writer, the device in the first 16 bytes of `id`.
 
+### 8.17 Live watch: Watched (0x9d), feature bit 4
+
+```
+Follow (LIVE) entry offset 2^64 - 2 := writer interest in id
+Follow (LIVE) entry offset 2^64 - 3 := end writer interest in id
+Watched       := id | on u8
+```
+
+A writer sends `Live` only while someone watches, so streaming into a
+conversation nobody has open uploads nothing.
+
+- A LIVE follow entry with offset `2^64 - 2` registers *writer interest* in
+  `id`: `Append` access, else `Refused Not_Owner`; it counts against the
+  follow limit, else `Refused Limit`. The relay answers at once with
+  `Watched(id, on)`, where `on` is 1 when at least one connection that is
+  not itself a writer-interest connection for `id` holds live interest in
+  `id`. A repeated registration is answered again and registered once.
+  Offset `2^64 - 3` removes the writer interest; so does closing the
+  connection.
+- Whenever live interest in `id` goes from none to some, or from some to
+  none, the relay sends `Watched(id, 1)` or `Watched(id, 0)` to every
+  connection with writer interest in `id`. Interest changes are events, so
+  neither side needs a timer.
+- A writer that sees bit 4 registers interest in each segment it streams
+  into and sends `Live` only after `Watched(id, 1)`; until then it keeps
+  writing its local draft. It re-registers after reconnecting and treats
+  every segment as unwatched until answered. A reader that starts watching
+  catches up with a draft pull (section 8.12) exactly as when it joins
+  mid-stream, so bytes the writer did not send are never lost. Without bit
+  4 a writer sends `Live` as before.
+
 ## 9. Flow control
 
 A relay stops reading a connection while it has 32 durable writes in flight,
@@ -901,6 +934,7 @@ trimmed). Assigned so far:
 | 1 | `Trim` 0x16 | | |
 | 2 | | `Trimmed` 0x9c | |
 | 3 (live drafts) | `Live` 0x17 | `Lived` 0x9b | Follow flag bit 1 `LIVE`, Pull `from` bit 63 `DRAFT` |
+| 4 (live watch) | | `Watched` 0x9d | LIVE follow offsets `2^64 - 2` / `2^64 - 3` |
 
 Reads below a trimmed base are not served by the relay: the archive is the
 writer's own stream, so a relay needs no archive tier and never holds plain
@@ -939,3 +973,7 @@ wasm, and fixed in the reference core:
   segments it stops reading while its live view stays open, which silently
   cut readers off, so removal is now an explicit LIVE entry with offset
   `2^64 - 1`.
+- Live watch (feature bit 4): writer interest entries and `Watched`, so a
+  writer streams drafts only while someone watches. Before, every draft
+  record went up even with no live follower, which cost about 130 bytes per
+  24-byte model delta. Welcome `features` is 31.

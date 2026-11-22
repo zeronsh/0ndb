@@ -44,6 +44,7 @@ scenarios :: proc() -> []Scenario {
 		{"trim", "Trim drops stored content below a base an archive covers: owner only, acknowledged once durable, idempotent, never lowers base, refused at or past the length; readers, probes and follows get Trimmed; Fill below a trim stores nothing.", sc_trim},
 		{"limits", "Per-principal connection limit and per-connection follow limit.", sc_limits},
 		{"live", "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow leaving live interest, LIVE removal, draft pulls through the peer pipe, malformed Live.", sc_live},
+		{"live_watch", "Live watch (feature bit 4): writer interest answered with Watched, Watched on the first live follower and when the last one leaves or disconnects, owner check, interest removal.", sc_live_watch},
 	}
 	return list[:]
 }
@@ -360,6 +361,10 @@ f_follow_live :: proc(streams: ..[32]u8) -> []u8 {
 
 f_unfollow_live :: proc(id: [32]u8) -> []u8 {
 	return frame(.Follow, []u8{osync.FOLLOW_LIVE, 1, 0}, ids(id), le64(osync.FOLLOW_END))
+}
+
+f_live_interest :: proc(id: [32]u8, on: bool) -> []u8 {
+	return frame(.Follow, []u8{osync.FOLLOW_LIVE, 1, 0}, ids(id), le64(osync.LIVE_INTEREST if on else osync.LIVE_INTEREST_END))
 }
 
 f_unfollow1 :: proc(id: [32]u8) -> []u8 {
@@ -744,6 +749,30 @@ sc_live :: proc(v: ^Vector) {
 	disconnect(v, "carol")
 	send(v, "alice", f_live(h, 96, 0, d1), "a closed connection's live interest is gone")
 	send(v, "bob", f_live(stream(bob, 4), osync.DRAFT_MSG_MAX, 0, d1), "msg at or past 2^62 is a protocol error")
+}
+
+sc_live_watch :: proc(v: ^Vector) {
+	alice, bob, carol := key_make(1), key_make(2), key_make(3)
+	sp := space_make(v, alice, 0x22)
+	addb := space_add(sp, alice, bob, .Member)
+	addc := space_add(sp, alice, carol, .Member)
+	join(v, "alice", sp, alice, sp.genesis)
+	join(v, "bob", sp, bob, addb)
+	join(v, "carol", sp, carol, addc)
+	h := stream(alice, 4)
+	d1 := rec("draft one", 0)
+	send(v, "alice", f_live_interest(h, true), "the writer registers interest: answered Watched(id, 0)")
+	send(v, "alice", f_live_interest(h, true), "a repeated registration is answered again")
+	send(v, "bob", f_live_interest(h, true), "interest in another device's segment is refused")
+	send(v, "bob", f_follow_live(h), "the first live follower: the writer gets Watched(id, 1)")
+	send(v, "alice", f_live(h, 96, 0, d1), "Live reaches bob")
+	send(v, "carol", f_follow_live(h), "a second follower changes nothing for the writer")
+	send(v, "bob", f_unfollow_live(h), "one follower leaves: still watched")
+	disconnect(v, "carol")
+	send(v, "bob", f_follow_live(h), "carol's disconnect ended the last interest; bob's return sends Watched(id, 1) again")
+	send(v, "bob", f_unfollow_live(h), "the last follower leaves: Watched(id, 0)")
+	send(v, "alice", f_live_interest(h, false), "the writer ends its interest")
+	send(v, "bob", f_follow_live(h), "no Watched once the writer has no interest")
 }
 
 sc_presence :: proc(v: ^Vector) {
