@@ -7,6 +7,8 @@ import "../prim"
 DRAFT_RECORD :: u8(0x44)
 DRAFT_MSG_MIN :: 32
 DRAFT_KEY_GAP :: 16
+DRAFT_COALESCE :: 512
+DRAFT_COALESCE_MS :: 50
 
 @(private)
 DRAFT_START :: u8(1)
@@ -44,6 +46,8 @@ Draft :: struct {
 	n:      int,
 	off:    [MAX_OPEN]i64,
 	off_n:  int,
+	wrote:  i64,
+	force:  bool,
 }
 
 Draft_Run :: struct {
@@ -112,6 +116,15 @@ writer_draft_durable :: proc "contextless" (w: ^Writer) -> i64 {
 		return 0
 	}
 	return journal.journal_durable_len(&w.draft.j)
+}
+
+writer_draft_pending :: proc(w: ^Writer) -> bool {
+	b := &w.buf
+	return b.active && len(b.data) > b.drafted && len(w.draft.path) > 0 && !_draft_disabled(w, b.msg)
+}
+
+writer_draft_force :: proc "contextless" (w: ^Writer) {
+	w.draft.force = true
 }
 
 writer_draft_live :: proc(w: ^Writer) -> []Draft_Msg {
@@ -265,7 +278,13 @@ _draft_entry :: proc(w: ^Writer, msg: i64) -> ^Draft_Msg {
 @(private)
 _draft_write :: proc(w: ^Writer) -> Error {
 	b := &w.buf
+	force := w.draft.force
+	w.draft.force = false
 	if !b.active || len(b.data) <= b.drafted {
+		return .None
+	}
+	now := obj.wall_ms(&w.core)
+	if !force && len(b.data) - b.drafted < DRAFT_COALESCE && w.draft.wrote > 0 && now - w.draft.wrote < DRAFT_COALESCE_MS {
 		return .None
 	}
 	e := _draft_entry(w, b.msg)
@@ -299,6 +318,7 @@ _draft_write :: proc(w: ^Writer) -> Error {
 	}
 	e.last = at
 	b.drafted = len(b.data)
+	w.draft.wrote = now
 	return .None
 }
 
