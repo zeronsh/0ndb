@@ -466,15 +466,49 @@ typedef struct ondb_keyring {
 	int (*verify)(void *ud, const ondb_identity *signer, const uint8_t *msg, size_t len, const uint8_t *sig, size_t sig_len);
 } ondb_keyring;
 
+/* Asynchronous plug calls. Every request-reply plug function (credentials
+   produce, unlock, enroll, sealed store get/put/add, runner pool
+   verify/attest) receives an ondb_plug_call handle and completes it with
+   exactly one ondb_plug_done, either before returning (a synchronous answer)
+   or later from any thread. status is an ondb_status: ONDB_OK, or
+   ONDB_NOT_FOUND, ONDB_CONFLICT, ONDB_PERMISSION, ONDB_UNSUPPORTED,
+   ONDB_TIMEOUT, ONDB_CANCELLED, ONDB_INVALID; anything else counts as an I/O
+   error. reply (NULL for errors) is copied before ondb_plug_done returns;
+   set size = sizeof(ondb_plug_reply) and only the fields the function
+   answers: record and entries (each entry a u32le length then the entry) for
+   get, credential and prf for unlock, credential, prf and ecosystem for
+   enroll, lease_ms for verify, credential for produce. The optional cancel
+   member of each table tells the embedder that the engine no longer waits
+   for that call (the user cancelled, a deadline passed, the engine closed);
+   ondb_plug_done must still be called once for it, and its answer is
+   ignored. The handle is valid until ondb_plug_done. */
+typedef struct ondb_plug_call ondb_plug_call;
+
+typedef struct ondb_plug_reply {
+	uint32_t size;
+	const uint8_t *record;
+	size_t record_len;
+	const uint8_t *entries;
+	size_t entries_len;
+	const uint8_t *credential;
+	size_t credential_len;
+	uint8_t prf[32];
+	int32_t ecosystem;
+	uint64_t lease_ms;
+} ondb_plug_reply;
+
+int ondb_plug_done(ondb_plug_call *call, int status, const ondb_plug_reply *reply);
+
 /* Relay credentials per space. available returns nonzero when the embedder
    supplies credentials for the space (otherwise the space key is used);
-   produce writes the credential for a connection binding into out and
-   returns 0. */
+   produce answers the credential for one connection binding (reply
+   credential, at most 8192 bytes). cancel may be NULL. */
 typedef struct ondb_credentials {
 	uint32_t size;
 	void *ud;
 	int (*available)(void *ud, const uint8_t space[16]);
-	int (*produce)(void *ud, const uint8_t space[16], const uint8_t *binding, size_t binding_len, uint8_t *out, size_t cap, size_t *len);
+	void (*produce)(void *ud, const uint8_t space[16], const uint8_t *binding, size_t binding_len, ondb_plug_call *call);
+	void (*cancel)(void *ud, ondb_plug_call *call);
 } ondb_credentials;
 
 typedef struct ondb_peer {
@@ -835,17 +869,18 @@ typedef struct ondb_runtime {
 } ondb_runtime;
 
 /* Any plug pointer may be NULL to use the reference implementation. */
-/* Account sign-in plugs. Return 0 on success, 1 not found, 2 conflict,
-   3 permission, 4 unsupported, anything else an I/O error.
+/* Account sign-in plugs, asynchronous (see ondb_plug_call); the engine keeps
+   serving everything else while a call is outstanding.
 
    unlock: the platform passkey (WebAuthn PRF / CTAP2 hmac-secret). unlock
-   evaluates PRF with the given per-credential salts and writes the chosen
-   credential id and the 32-byte output; mode 0 is this device, 1 is a
-   passkey on another device (hybrid/QR). enroll registers a new platform
-   passkey for rp_user and returns its credential id, PRF output for salt and
-   ecosystem (0 unknown, 1 apple, 2 google, 3 microsoft, 4 1password,
-   5 bitwarden, 6 security_key, 7 recovery, 8 test). User verification must
-   always be required. */
+   evaluates PRF with the given per-credential salts and answers the chosen
+   credential id and the 32-byte output (ONDB_NOT_FOUND when none of the
+   credentials is available); mode 0 is this device, 1 is a passkey on
+   another device (hybrid/QR). enroll registers a new platform passkey for
+   rp_user and answers its credential id, PRF output for salt and ecosystem
+   (0 unknown, 1 apple, 2 google, 3 microsoft, 4 1password, 5 bitwarden,
+   6 security_key, 7 recovery, 8 test). User verification must always be
+   required. */
 typedef struct ondb_unlock_option {
 	const uint8_t *credential;
 	size_t credential_len;
@@ -855,27 +890,32 @@ typedef struct ondb_unlock_option {
 typedef struct ondb_unlock {
 	uint32_t size;
 	void *ud;
-	int (*unlock)(void *ud, const uint8_t *rp_user, size_t rp_user_len, const ondb_unlock_option *options, size_t count, int mode, uint8_t *credential, size_t cap, size_t *len, uint8_t prf[32]);
-	int (*enroll)(void *ud, const uint8_t *rp_user, size_t rp_user_len, const char *label, size_t label_len, const uint8_t salt[32], uint8_t *credential, size_t cap, size_t *len, uint8_t prf[32], int *ecosystem);
+	void (*unlock)(void *ud, const uint8_t *rp_user, size_t rp_user_len, const ondb_unlock_option *options, size_t count, int mode, ondb_plug_call *call);
+	void (*enroll)(void *ud, const uint8_t *rp_user, size_t rp_user_len, const char *label, size_t label_len, const uint8_t salt[32], ondb_plug_call *call);
+	void (*cancel)(void *ud, ondb_plug_call *call);
 } ondb_unlock;
 
 /* The embedder's account server, keyed by its opaque login subject. get
-   writes the newest account record (at most 64 KiB) and the manifest
+   answers the newest account record (at most 64 KiB) and the manifest
    entries, each as a u32le length followed by the entry (at most 4 MiB in
-   all); put stores a record only if the stored one has seq prev_seq
-   (otherwise 2); add appends one manifest entry. */
+   all), or ONDB_NOT_FOUND; put stores a record only if the stored one has
+   seq prev_seq (otherwise ONDB_CONFLICT; a put repeating the stored record
+   exactly answers ONDB_OK); add appends one manifest entry (the engine keeps
+   unconfirmed entries and offers them again until one is stored). */
 typedef struct ondb_sealed_store {
 	uint32_t size;
 	void *ud;
-	int (*get)(void *ud, const uint8_t *subject, size_t subject_len, uint8_t *record, size_t record_cap, size_t *record_len, uint8_t *entries, size_t entries_cap, size_t *entries_len);
-	int (*put)(void *ud, const uint8_t *subject, size_t subject_len, const uint8_t *record, size_t record_len, uint64_t prev_seq);
-	int (*add)(void *ud, const uint8_t *subject, size_t subject_len, const uint8_t *entry, size_t entry_len);
+	void (*get)(void *ud, const uint8_t *subject, size_t subject_len, ondb_plug_call *call);
+	void (*put)(void *ud, const uint8_t *subject, size_t subject_len, const uint8_t *record, size_t record_len, uint64_t prev_seq, ondb_plug_call *call);
+	void (*add)(void *ud, const uint8_t *subject, size_t subject_len, const uint8_t *entry, size_t entry_len, ondb_plug_call *call);
+	void (*cancel)(void *ud, ondb_plug_call *call);
 } ondb_sealed_store;
 
 /* Runner pool host. identity returns the pool member's public identity
-   (its private key lives with the host, e.g. a KMS behind the keyring plug
-   of the host's engine). verify checks a launch token for a runner and
-   returns its lease; attest optionally checks evidence; joined tells the
+   synchronously (0 on success; its private key lives with the host, e.g. a
+   KMS behind the keyring plug of the host's engine). verify checks a launch
+   token for a runner and answers its lease_ms (ONDB_PERMISSION to refuse);
+   attest optionally checks evidence; both are asynchronous. joined tells the
    host that a user device added the pool to a space (proof is the pool's
    Add record, to pass to space.join_enrollment on the host). A host-held
    directory admin uses the same keyring and the directory.* ops. */
@@ -883,9 +923,10 @@ typedef struct ondb_runner_pool {
 	uint32_t size;
 	void *ud;
 	int (*identity)(void *ud, ondb_identity *out);
-	int (*verify)(void *ud, const uint8_t *token, size_t token_len, const ondb_identity *runner, uint64_t *lease_ms);
-	int (*attest)(void *ud, const uint8_t *evidence, size_t evidence_len, const ondb_identity *runner);
+	void (*verify)(void *ud, const uint8_t *token, size_t token_len, const ondb_identity *runner, ondb_plug_call *call);
+	void (*attest)(void *ud, const uint8_t *evidence, size_t evidence_len, const ondb_identity *runner, ondb_plug_call *call);
 	void (*joined)(void *ud, const uint8_t space[16], const char *name, size_t name_len, const char *relay, size_t relay_len, const uint8_t relay_key[32], const uint8_t *proof, size_t proof_len);
+	void (*cancel)(void *ud, ondb_plug_call *call);
 } ondb_runner_pool;
 
 typedef struct ondb_config {

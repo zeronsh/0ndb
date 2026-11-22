@@ -26,6 +26,7 @@ Error :: enum u8 {
 	Resolve,
 	Refused,
 	Io,
+	Pending,
 }
 
 code_error :: proc "contextless" (c: Code) -> Error {

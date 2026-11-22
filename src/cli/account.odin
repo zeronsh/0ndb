@@ -125,11 +125,11 @@ pool_token_make :: proc(a: ^Acct, ttl_ms: i64) -> string {
 }
 
 @(private)
-_pool_host_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity) -> (u64, osync.Error) {
+_pool_host_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	a := (^Acct)(data)
 	raw, ok := hex_decode(string(token))
 	if !ok || len(raw) != 56 {
-		return 0, .Auth
+		return .Auth
 	}
 	mac := _pool_token_mac(&a.secret, raw[:24])
 	diff: u8
@@ -137,9 +137,10 @@ _pool_host_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity) -> 
 		diff |= mac[i] ~ raw[24 + i]
 	}
 	if diff != 0 || i64(prim.get_u64le(raw[:8])) < prim.now_ms() {
-		return 0, .Auth
+		return .Auth
 	}
-	return POOL_LEASE_MS, .None
+	reply.lease_ms = POOL_LEASE_MS
+	return .None
 }
 
 @(private)

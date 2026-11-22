@@ -84,7 +84,8 @@ C_Credentials :: struct {
 	size:      u32,
 	ud:        rawptr,
 	available: proc "c" (ud: rawptr, space: ^[16]u8) -> i32,
-	produce:   proc "c" (ud: rawptr, space: ^[16]u8, binding: [^]u8, binding_len: uint, out: [^]u8, cap: uint, len: ^uint) -> i32,
+	produce:   proc "c" (ud: rawptr, space: ^[16]u8, binding: [^]u8, binding_len: uint, call: ^Plug_Call),
+	cancel:    proc "c" (ud: rawptr, call: ^Plug_Call),
 }
 
 C_Peer :: struct {
@@ -315,6 +316,7 @@ plugs_install :: proc(h: ^Handle, cfg: ^Config, ec: ^eng.Config) -> api.Status {
 		}
 		ec.embedder = search.Embedder{dim = int(p.embedder.dim), embed = _embed, data = &p.embedder}
 	}
+	p.account.h = h
 	if !account_plugs_setup(&p.account, cfg, ec) {
 		return .Invalid
 	}
@@ -347,6 +349,7 @@ plugs_detach :: proc(h: ^Handle) {
 
 plugs_destroy :: proc(h: ^Handle) {
 	p := &h.plugs
+	account_plugs_close(&p.account)
 	for c in p.cred_spaces {
 		free(c, h.allocator)
 	}
@@ -615,31 +618,31 @@ _cred_source :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool) 
 	}
 	for c in p.cred_spaces {
 		if c.space == sp {
-			return osync.Credentials{data = c, produce = _cred_produce}, true
+			return osync.Credentials{data = c, produce = _cred_produce, begin = _cred_begin, cancel = _cred_cancel}, true
 		}
 	}
 	c := new(Cred_Space, h.allocator)
 	c.h = h
 	c.space = sp
 	append(&p.cred_spaces, c)
-	return osync.Credentials{data = c, produce = _cred_produce}, true
+	return osync.Credentials{data = c, produce = _cred_produce, begin = _cred_begin, cancel = _cred_cancel}, true
 }
 
 @(private)
 _cred_produce :: proc(data: rawptr, binding: []u8, out: ^[dynamic]u8) -> osync.Error {
+	return .Unsupported
+}
+
+@(private)
+_cred_begin :: proc(data: rawptr, binding: []u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	c := (^Cred_Space)(data)
-	p := &c.h.plugs
-	buf: [osync.CREDENTIAL_MAX]u8
-	n: uint
-	if p.credentials.produce(p.credentials.ud, &c.space, raw_data(binding), uint(len(binding)), raw_data(buf[:]), uint(len(buf)), &n) != 0 {
-		return .Auth
-	}
-	if n > uint(len(buf)) {
-		return .Too_Large
-	}
-	append(out, ..buf[:n])
-	mem.zero_explicit(&buf, size_of(buf))
-	return .None
+	return credentials_begin(&c.h.plugs.account, c.space, binding, reply, done)
+}
+
+@(private)
+_cred_cancel :: proc(data: rawptr, done: osync.Plug_Done) {
+	c := (^Cred_Space)(data)
+	_pc_cancel(&c.h.plugs.account, done)
 }
 
 @(private)

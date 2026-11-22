@@ -154,9 +154,9 @@ cancel for a tag that already completed is ignored, so a client can always
 send one when it stops caring (the Rust client does so when a pending future
 is dropped). Cancellation does not roll back effects the op already made
 durable. Closing the connection cancels every outstanding call and drops
-every subscription of that connection. A call that is waiting on a host plug
-when its cancel arrives is cancelled at once and the host receives
-`Plug_Cancel` for the request (section 8).
+every subscription of that connection. A call whose flow is waiting on a host
+plug is cancelled at once and the host receives `Plug_Cancel` for the request
+(section 8).
 
 ## 5. Subscriptions
 
@@ -300,34 +300,41 @@ them and answers the daemon's plug requests.
 Enabling. The daemon decides at start which plugs a host supplies:
 `--host-plugs` takes a comma-separated subset of
 
-| plug | functions | role |
+| plug | requests | role |
 |---|---|---|
 | `sealed_store` | get, put, add | the account server keyed by login subject |
 | `unlock` | unlock, register | the platform passkey (WebAuthn PRF) |
-| `credentials` | available, produce | relay credentials per space |
-| `runner_pool` | identity, verify, attest | this daemon is a cloud pool host |
-| `pool_user` | identity, joined | this device's account includes a cloud pool |
+| `credentials` | produce | relay credentials for the spaces the host lists |
+| `runner_pool` | verify, attest | this daemon is a cloud pool host |
+| `pool_user` | joined (notification) | this device's account includes a cloud pool |
 
 (`runner_pool` and `pool_user` exclude each other.) Plugs not listed keep the
 daemon's built-in reference implementations. A listed plug is strictly
 host-backed: with no host registered its requests wait for one until their
-deadline and then fail `offline`; they never fall back to a local store.
+deadline and then fail; they never fall back to a local store.
 
 Registering. The host sends a normal call
-`host.register(plugs: [str], replace: bool)` and gets back the plugs it now
-serves. The form of that call (JSON or binary) is the form of every plug
-request and reply on the connection. Errors: `invalid` (unknown plug name),
-`unsupported` (the daemon was not started with that plug), `busy` (another
-live connection serves it; pass `replace: true` to take over). Registering
-again replaces the connection's set; closing the connection unregisters it.
-A host connection is otherwise an ordinary client: it can call any op.
+`host.register(plugs: [str], replace: bool, identity: bytes, spaces: ids)`
+and gets back the plugs it now serves. The form of that call (JSON or binary)
+is the form of every plug request and reply on the connection. `identity` is
+required with `runner_pool` or `pool_user`: the pool's public keys, 64 bytes
+(`sign` then `box`), which the daemon answers the engine's identity queries
+with. `spaces` lists the spaces the `credentials` host supplies relay
+credentials for; other spaces use the device's member credentials. Errors:
+`invalid` (unknown plug name, missing identity), `unsupported` (the daemon was
+not started with that plug), `busy` (another live connection serves it; pass
+`replace: true` to take over). Registering again replaces the connection's
+set; closing the connection unregisters it. A host connection is otherwise an
+ordinary client: it can call any op. Requests that were waiting for a host are
+sent right after the registration's Result.
 
 Requests. The daemon sends `Plug(tag, request)` and the host answers
-`Plug_Reply(tag, status, result)`. Binary request:
-`u8 version (=1), uvarint function code, fields in order`; JSON request:
-`{"plug":"<name>", fields...}`. The result has the reply fields (binary in
-order, or a JSON object). Status is a status code from section 3; for
-replies that mean "no", use `not_found`, `conflict`, `permission` or
+`Plug_Reply(tag, status, result)`, in any order: several requests can be
+outstanding at once and a host may answer them as they finish. Binary
+request: `u8 version (=1), uvarint function code, fields in order`; JSON
+request: `{"plug":"<name>", fields...}`. The result has the reply fields
+(binary in order, or a JSON object). Status is a status code from section 3;
+for replies that mean "no", use `not_found`, `conflict`, `permission` or
 `unsupported` as listed. A notification has tag 0 and takes no reply.
 
 | code | function | request fields | reply fields | deadline |
@@ -337,52 +344,58 @@ replies that mean "no", use `not_found`, `conflict`, `permission` or
 | 3 | `sealed_store.add` | subject: bytes, entry: bytes | {} | 15 s |
 | 4 | `unlock.unlock` | rp_user: bytes, credentials: [bytes], salts: [bytes], mode: enum{local, cross_device} | credential: bytes, prf: bytes (32); `not_found` when none of the credentials is available | 120 s |
 | 5 | `unlock.register` | rp_user: bytes, label: str, salt: bytes (32) | credential: bytes, prf: bytes (32), ecosystem: enum | 120 s |
-| 6 | `runner_pool.identity` | – | sign: bytes (32), box: bytes (32) | 15 s |
 | 7 | `runner_pool.verify` | token: bytes, sign: bytes, box: bytes | lease_ms: uvarint; `permission` for a bad token | 15 s |
 | 8 | `runner_pool.attest` | evidence: bytes, sign: bytes, box: bytes | {}; `permission` to refuse | 15 s |
-| 9 | `pool_user.identity` | – | sign: bytes (32), box: bytes (32) | 15 s |
 | 10 | `pool_user.joined` | space: id, name: str, relay: str, relay_key: bytes, proof: bytes | notification | – |
-| 11 | `credentials.available` | space: id | available: bool | 5 s |
 | 12 | `credentials.produce` | space: id, binding: bytes | credential: bytes | 5 s |
 
-`[bytes]` is `uvarint count` then each `bytes` in binary, an array of hex
-strings in JSON. `ecosystem`: unknown, apple, google, microsoft, 1password,
-bitwarden, security_key, recovery, test. In `unlock.unlock` the i-th salt
-belongs to the i-th credential; evaluate the PRF of the chosen credential
-with its salt (WebAuthn `prf.evalByCredential`), always with user
+(Codes 6, 9 and 11 are retired: identities and credential spaces come with the
+registration.) `[bytes]` is `uvarint count` then each `bytes` in binary, an
+array of hex strings in JSON. `ecosystem`: unknown, apple, google, microsoft,
+1password, bitwarden, security_key, recovery, test. In `unlock.unlock` the
+i-th salt belongs to the i-th credential; evaluate the PRF of the chosen
+credential with its salt (WebAuthn `prf.evalByCredential`), always with user
 verification. `register` creates a passkey for `rp_user`, evaluates its PRF
 with `salt` and reports the ecosystem it was saved in. The sealed record and
 entries are opaque ciphertext and signatures: the store keeps them, enforces
 the compare-and-swap on `seq`, and returns the newest record (at most
 64 KiB) and every entry (at most 4 MiB in all) in the order they were added.
-A put that repeats the stored record exactly must answer `ok` (the daemon
-resends a request to a host that reconnects). `credentials.produce` returns
-the credential for one relay connection, bound to `binding` (the relay's
-challenge); `available` says whether the host supplies credentials for the
-space at all (otherwise the device's member credentials are used). Requests
-for `credentials` never wait for a host to register: with none, `available`
-is false.
+A put that repeats the stored record exactly must answer `ok` (a flow may be
+retried after a restart). `credentials.produce` returns the credential for
+one relay connection, bound to `binding` (the relay's challenge); it is never
+held for a host to register: with none, the space connects with member
+credentials or not at all.
+
+Asynchronous end to end. A plug request suspends only the engine flow that
+made it (a sign-in, a passkey change, a pool enrollment, one relay
+connection's hello); the daemon keeps serving every other client, call,
+subscription and link while it is outstanding. Measured with a host that
+answers each request after 1.5 s: 300 calls plus a space, a conversation and a
+recorded message on another connection completed with p50 0.06 ms and
+p99 0.3 to 0.7 ms while the sign-in waited, and the sign-in finished after the
+host's three answers (get, register, put) at 4.5 s.
 
 Deadlines, cancellation and reconnect. Each request has the deadline in the
 table, counted from when the daemon issues it and covering both waiting for
 a host and waiting for its answer. When it passes the daemon sends
-`Plug_Cancel(tag)` and the engine sees the plug fail; the client call that
-caused it fails `timeout` (host registered but silent) or `offline` (no
-host). A client `Cancel` of that call, or the daemon stopping, also sends
-`Plug_Cancel`; a host should abort the work (dismiss the passkey sheet) and
-may drop its reply. If the host's connection closes while a request is
-outstanding and another host registers before the deadline, the daemon
-resends the request to it; `pool_user.joined` notifications made while no
-host is registered are queued (the newest 256) and delivered when one
-registers. A reply for a tag that is no longer outstanding is ignored.
+`Plug_Cancel(tag)` (if a host has the request) and the flow sees the plug fail:
+the client call fails `offline`. A client `Cancel` of the call (or the call's
+own timeout, or the daemon stopping) cancels the flow, and the host receives
+`Plug_Cancel` at once; a host should abort the work (dismiss the passkey
+sheet) and may drop its reply. If the host's connection closes while a request
+is outstanding and another host registers before the deadline, the daemon
+sends the request to it; `pool_user.joined` notifications made while no host
+is registered are queued (the newest 256) and delivered when one registers. A
+reply for a tag that is no longer outstanding is ignored. `daemon.status`
+reports `host_pending`, the number of outstanding requests.
 
-Waiting. In this version a plug request is synchronous inside the engine:
-while one is outstanding the daemon reads only host registrations, plug
-replies and Cancel frames (from every connection, so a host on its own
-connection, a reconnecting host and a cancelling client all work) and serves
-every other frame as soon as the plug returns. A host should answer store
-and credential requests promptly; a slow or hung host delays other clients
-until the deadline. Asynchronous plugs, which remove this, are in progress.
+Restarts. Sign-in flows are idempotent, so a flow cut by a daemon crash is
+retried by calling the op again: a record that was stored is found by `get`
+and unlocked, one that was not is created anew. Account manifest entries (one
+per space the account gains) are kept with the space's own records until the
+store confirms them and are offered again on every start and every
+`sealed_store` registration, so a space created while the account server is
+unreachable reaches the account once it is back, also across crashes.
 
 Identity-provider PRF path. A UI that runs WebAuthn itself (or whose identity
 provider evaluates the passkey PRF) does not need the `unlock` plug: it reads
@@ -416,7 +429,7 @@ to a harness's stdio.
 
 `daemon.status` result: `version, proto, api, pid, home, socket, uptime_ms,
 rss, runner, connections, local_relay, mcp_sessions, wakeups, timeout_ms
-(-1 when no timer is armed), host_plugs: [str] (enabled), hosts: [str]
+(-1 when no timer is armed), host_plugs: [str] (enabled), host_pending, hosts: [str]
 (currently registered), links: [{space, error, reason}]`.
 
 ## 11. Op reference
@@ -644,4 +657,4 @@ up exist only over the socket.
 | 1005 | `mount.remove` | root: str | {} |
 | 1006 | `credentials.add` | space: id, token: bytes | {} |
 | 1007 | `verify` | root: str | files:uvarint mismatches:[str] |
-| 1009 | `host.register` | plugs: strs, replace: bool | plugs:[str] |
+| 1009 | `host.register` | plugs: strs, replace: bool, identity: bytes, spaces: ids | plugs:[str] |

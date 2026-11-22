@@ -163,6 +163,10 @@ _repl_hello :: proc(r: ^Replicator) {
 	if !r.client.unix {
 		transport_init_secure(&r.tr, r.fd, client_keys(&r.client), r.cfg.kernel_tls, r.allocator)
 	}
+	if r.cfg.credentials.begin != nil && r.cfg.credentials.cancel != nil {
+		_repl_cred_begin(r)
+		return
+	}
 	if err := client_hello(&r.client, &r.cfg.credentials); err != .None {
 		_repl_fail(r, err)
 		return
@@ -172,13 +176,73 @@ _repl_hello :: proc(r: ^Replicator) {
 }
 
 @(private)
+_repl_cred_begin :: proc(r: ^Replicator) {
+	req := new(Cred_Req, r.allocator)
+	r.cred_gen += 1
+	req^ = Cred_Req{r = r, gen = r.cred_gen}
+	r.cred_req = req
+	reply: Plug_Reply
+	err := r.cfg.credentials.begin(r.cfg.credentials.data, client_binding(&r.client), &reply, Plug_Done{data = req, call = _repl_cred_done})
+	if err == .Pending {
+		r.phase = .Credential
+		return
+	}
+	r.cred_req = nil
+	free(req, r.allocator)
+	_repl_cred_finish(r, err, reply.credential)
+}
+
+@(private)
+_repl_cred_done :: proc(data: rawptr, err: Error, reply: ^Plug_Reply) {
+	req := (^Cred_Req)(data)
+	r := req.r
+	current := r.cred_req == req && req.gen == r.cred_gen && r.phase == .Credential
+	if r.cred_req == req {
+		r.cred_req = nil
+	}
+	free(req, r.allocator)
+	if !current {
+		return
+	}
+	_enter(r)
+	defer _leave(r)
+	_repl_cred_finish(r, err, reply.credential)
+}
+
+@(private)
+_repl_cred_finish :: proc(r: ^Replicator, err: Error, credential: []u8) {
+	if err != .None {
+		_repl_fail(r, .Auth if err == .Pending else err)
+		return
+	}
+	if e := client_hello_finish(&r.client, credential); e != .None {
+		_repl_fail(r, e)
+		return
+	}
+	r.phase = .Hello
+	_repl_flush(r)
+}
+
+@(private)
+_repl_cred_drop :: proc(r: ^Replicator) {
+	req := r.cred_req
+	if req == nil {
+		return
+	}
+	r.cred_req = nil
+	r.cred_gen += 1
+	r.cfg.credentials.cancel(r.cfg.credentials.data, Plug_Done{data = req, call = _repl_cred_done})
+	free(req, r.allocator)
+}
+
+@(private)
 _on_connect_timeout :: proc(l: ^prim.Loop, data: rawptr) {
 	r := cast(^Replicator)data
 	_enter(r)
 	defer _leave(r)
 	r.timer = 0
 	switch r.phase {
-	case .Resolving, .Connecting, .Handshake, .Hello:
+	case .Resolving, .Connecting, .Handshake, .Hello, .Credential:
 		_repl_fail(r, .Timeout)
 	case .Waiting:
 		_repl_connect(r)
@@ -356,6 +420,7 @@ replicator_link_down :: proc(r: ^Replicator, err: Error = .Closed) {
 
 @(private)
 _repl_close :: proc(r: ^Replicator) {
+	_repl_cred_drop(r)
 	r.present_ok = false
 	r.caught = false
 	r.feed_target = -1

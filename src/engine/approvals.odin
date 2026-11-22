@@ -159,7 +159,7 @@ login_waiting :: proc "contextless" (e: ^Engine) -> (waiting: bool, code: [osync
 	return e.approvals.waiting, e.approvals.code, e.approvals.failed
 }
 
-approval_respond :: proc(e: ^Engine, code: string, approve: bool) -> Error {
+approval_respond :: proc(e: ^Engine, code: string, approve: bool, done: Account_Done = {}) -> Error {
 	context = context_for(e)
 	idx := -1
 	for &p, i in e.approvals.pending {
@@ -172,25 +172,25 @@ approval_respond :: proc(e: ^Engine, code: string, approve: bool) -> Error {
 	}
 	p := e.approvals.pending[idx]
 	ordered_remove(&e.approvals.pending, idx)
-	defer delete(p.label, e.allocator)
 	sp := e.approvals.rv
 	if sp == nil || !sp.repl_on {
+		delete(p.label, e.allocator)
 		return .Offline
 	}
-	out := make([dynamic]u8, context.temp_allocator)
-	if !approve {
-		append(&out, osync.APPROVE_DENY)
-	} else {
-		rec: osync.Account_Record
-		entries := make([dynamic][]u8, context.temp_allocator)
-		_store_get(e, e.account.subject, &rec, &entries) or_return
-		a: osync.Account_Key
-		defer osync.account_key_clear(&a)
-		_unlock_local(e, &rec, .Local, &a) or_return
-		req := p.req
-		_serr(osync.approval_grant_encode(&req, &a, &out, e.cfg.random)) or_return
+	j := _job_new(e, .Respond, done)
+	if j == nil {
+		delete(p.label, e.allocator)
+		return .No_Memory
 	}
-	return _serr(osync.replicator_direct(&sp.repl, osync.Device_Id(p.from), osync.APPROVE_TAG, out[:]))
+	j.pending = p
+	j.pending.label = _job_str(j, p.label)
+	delete(p.label, e.allocator)
+	j.approve = approve
+	err := _job_begin(j)
+	if err != .Pending {
+		_job_free(j)
+	}
+	return err
 }
 
 @(private)
@@ -329,21 +329,27 @@ _approvals_direct :: proc(e: ^Engine, from: prim.Id, data: []u8) {
 		if !e.approvals.requester || !e.approvals.waiting {
 			return
 		}
+		if e.approvals.granting {
+			return
+		}
 		a: osync.Account_Key
 		defer osync.account_key_clear(&a)
 		if osync.approval_grant_open(data, e.approvals.nonce, &e.keyring, &a, e.cfg.random) != .None {
 			return
 		}
-		rec: osync.Account_Record
-		entries := make([dynamic][]u8, context.temp_allocator)
-		if _store_get(e, e.account.subject, &rec, &entries) != .None || rec.sign != a.device.public {
+		j := _job_new(e, .Grant, {})
+		if j == nil {
 			return
 		}
-		e.approvals.waiting = false
-		subject, _ := _clone(e.account.subject, context.temp_allocator)
-		_rv_close(e)
-		if _, err := _account_adopt(e, subject, &rec, entries[:], &a, .Approval); err != .None {
-			_emit(e, Event{kind = .Login_Failed, err = err})
+		j.subject = _job_str(j, e.account.subject)
+		if osync.account_key_from_seed(&j.key, a.seed, e.cfg.random) != .None {
+			_job_free(j)
+			return
+		}
+		j.have_key = true
+		e.approvals.granting = true
+		if _job_start(j) != .Pending {
+			_job_complete(j)
 		}
 	case osync.APPROVE_DENY:
 		if e.approvals.requester && e.approvals.waiting {

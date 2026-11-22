@@ -42,8 +42,14 @@ _fss_path :: proc(s: ^File_Sealed_Store, subject: []u8, suffix: string) -> strin
 }
 
 @(private)
-_fss_get :: proc(data: rawptr, subject: []u8, record: ^[dynamic]u8, entries: ^[dynamic][]u8) -> Error {
+_fss_get :: proc(data: rawptr, subject: []u8, reply: ^Plug_Reply, done: Plug_Done) -> Error {
 	s := cast(^File_Sealed_Store)data
+	record := make([dynamic]u8, context.temp_allocator)
+	entries := make([dynamic][]u8, context.temp_allocator)
+	defer {
+		reply.record = record[:]
+		reply.entries = entries[:]
+	}
 	rec, err := prim.read_file(s.vfs, _fss_path(s, subject, ".record"), context.temp_allocator)
 	if err == .Not_Found {
 		return .Not_Found
@@ -51,7 +57,7 @@ _fss_get :: proc(data: rawptr, subject: []u8, record: ^[dynamic]u8, entries: ^[d
 	if err != .None {
 		return _from_prim(err)
 	}
-	append(record, ..rec)
+	append(&record, ..rec)
 	ents, eerr := prim.read_file(s.vfs, _fss_path(s, subject, ".entries"), context.temp_allocator)
 	if eerr != .None && eerr != .Not_Found {
 		return _from_prim(eerr)
@@ -62,14 +68,14 @@ _fss_get :: proc(data: rawptr, subject: []u8, record: ^[dynamic]u8, entries: ^[d
 		if pos + 4 + n > len(ents) {
 			break
 		}
-		append(entries, ents[pos + 4:][:n])
+		append(&entries, ents[pos + 4:][:n])
 		pos += 4 + n
 	}
 	return .None
 }
 
 @(private)
-_fss_put :: proc(data: rawptr, subject: []u8, record: []u8, prev_seq: u64) -> Error {
+_fss_put :: proc(data: rawptr, subject: []u8, record: []u8, prev_seq: u64, reply: ^Plug_Reply, done: Plug_Done) -> Error {
 	s := cast(^File_Sealed_Store)data
 	path := _fss_path(s, subject, ".record")
 	lock_path, _ := _concat(context.temp_allocator, path, ".lock")
@@ -95,7 +101,7 @@ _fss_put :: proc(data: rawptr, subject: []u8, record: []u8, prev_seq: u64) -> Er
 }
 
 @(private)
-_fss_add :: proc(data: rawptr, subject: []u8, entry: []u8) -> Error {
+_fss_add :: proc(data: rawptr, subject: []u8, entry: []u8, reply: ^Plug_Reply, done: Plug_Done) -> Error {
 	s := cast(^File_Sealed_Store)data
 	path := _fss_path(s, subject, ".entries")
 	fd, oerr := prim.open_file(s.vfs, path, {.Write, .Create}, 0o600)
@@ -158,7 +164,7 @@ _soft_prf :: proc(seed: ^[32]u8, salt: [32]u8, out: ^[32]u8) {
 }
 
 @(private)
-_soft_unlock :: proc(data: rawptr, rp_user: []u8, options: []Unlock_Option, mode: Unlock_Mode, credential: ^[dynamic]u8, prf: ^[32]u8) -> Error {
+_soft_unlock :: proc(data: rawptr, rp_user: []u8, options: []Unlock_Option, mode: Unlock_Mode, reply: ^Plug_Reply, done: Plug_Done) -> Error {
 	k := cast(^Soft_Passkey)data
 	path := k.local if mode == .Local else k.remote
 	cred: [16]u8
@@ -167,8 +173,10 @@ _soft_unlock :: proc(data: rawptr, rp_user: []u8, options: []Unlock_Option, mode
 	_soft_load(k, path, &cred, &seed) or_return
 	for o in options {
 		if string(o.credential) == string(cred[:]) {
-			_soft_prf(&seed, o.salt, prf)
-			append(credential, ..cred[:])
+			_soft_prf(&seed, o.salt, &reply.prf)
+			c := make([]u8, len(cred), context.temp_allocator)
+			copy(c, cred[:])
+			reply.credential = c
 			return .None
 		}
 	}
@@ -176,7 +184,7 @@ _soft_unlock :: proc(data: rawptr, rp_user: []u8, options: []Unlock_Option, mode
 }
 
 @(private)
-_soft_register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, credential: ^[dynamic]u8, prf: ^[32]u8, ecosystem: ^Ecosystem) -> Error {
+_soft_register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, reply: ^Plug_Reply, done: Plug_Done) -> Error {
 	k := cast(^Soft_Passkey)data
 	if len(k.local) == 0 {
 		return .Unsupported
@@ -196,8 +204,10 @@ _soft_register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8,
 		}
 		_write_private(k.vfs, k.local, buf[:], false, k.random) or_return
 	}
-	_soft_prf(&seed, salt, prf)
-	append(credential, ..cred[:])
-	ecosystem^ = .Test
+	_soft_prf(&seed, salt, &reply.prf)
+	c := make([]u8, len(cred), context.temp_allocator)
+	copy(c, cred[:])
+	reply.credential = c
+	reply.ecosystem = .Test
 	return .None
 }

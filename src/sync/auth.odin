@@ -9,6 +9,8 @@ SPACE_CREDENTIAL_LEN :: 1 + 32 + 32 + 64 + 64
 Credentials :: struct {
 	data:    rawptr,
 	produce: proc(data: rawptr, binding: []u8, out: ^[dynamic]u8) -> Error,
+	begin:   proc(data: rawptr, binding: []u8, reply: ^Plug_Reply, done: Plug_Done) -> Error,
+	cancel:  proc(data: rawptr, done: Plug_Done),
 }
 
 Access :: enum u8 {

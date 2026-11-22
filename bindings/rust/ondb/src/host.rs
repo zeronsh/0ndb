@@ -150,7 +150,7 @@ pub trait PoolUser: Send + Sync + 'static {
 }
 
 pub trait Credentials: Send + Sync + 'static {
-    fn available(&self, space: &[u8; 16]) -> bool;
+    fn spaces(&self) -> Vec<[u8; 16]>;
     fn produce(&self, space: &[u8; 16], binding: &[u8], cancel: &CancelToken) -> PlugResult<Vec<u8>>;
 }
 
@@ -354,6 +354,27 @@ fn serve(mut sock: Sock, plugs: &Plugs, replace: bool, stop: &AtomicBool, curren
         req.str(n);
     }
     req.bool(replace);
+    let identity = match (&plugs.pool, &plugs.user) {
+        (Some(p), _) => Some(p.identity()),
+        (None, Some(u)) => Some(u.identity()),
+        _ => None,
+    };
+    match identity {
+        Some(Ok(id)) => {
+            let mut b = id.sign.to_vec();
+            b.extend_from_slice(&id.box_key);
+            req.bytes(&b);
+        }
+        Some(Err(e)) => return Some(e.0),
+        None => {
+            req.bytes(&[]);
+        }
+    }
+    let spaces = plugs.creds.as_ref().map(|c| c.spaces()).unwrap_or_default();
+    req.uvarint(spaces.len() as u64);
+    for sp in &spaces {
+        req.buf.extend_from_slice(sp);
+    }
     let mut first = frame::hello().to_vec();
     first.extend(frame::encode(frame::CALL, &[&1u64.to_le_bytes(), &[0], &0u64.to_le_bytes(), &req.buf]));
     sock.write_all(&first).ok()?;
@@ -482,14 +503,6 @@ fn run(p: &Plugs, body: &[u8], cancel: &CancelToken) -> PlugResult<Writer> {
             let out = u.register(&RegisterRequest { rp_user, label, salt }, cancel)?;
             w.bytes(&out.credential).bytes(&out.prf).uvarint(out.ecosystem as u64);
         }
-        6 | 9 => {
-            let id = if code == 6 {
-                p.pool.as_ref().ok_or(PlugError::UNSUPPORTED)?.identity()?
-            } else {
-                p.user.as_ref().ok_or(PlugError::UNSUPPORTED)?.identity()?
-            };
-            w.bytes(&id.sign).bytes(&id.box_key);
-        }
         7 | 8 => {
             let pool = p.pool.as_ref().ok_or(PlugError::UNSUPPORTED)?;
             let data = r.bytes();
@@ -518,22 +531,15 @@ fn run(p: &Plugs, body: &[u8], cancel: &CancelToken) -> PlugResult<Writer> {
             }
             user.joined(PoolJoined { space, name, relay, relay_key, proof });
         }
-        11 | 12 => {
+        12 => {
             let c = p.creds.as_ref().ok_or(PlugError::UNSUPPORTED)?;
             let space = r.id();
-            if code == 11 {
-                if !r.done() {
-                    return Err(bad);
-                }
-                w.bool(c.available(&space));
-            } else {
-                let binding = r.bytes();
-                if !r.done() {
-                    return Err(bad);
-                }
-                let cred = c.produce(&space, &binding, cancel)?;
-                w.bytes(&cred);
+            let binding = r.bytes();
+            if !r.done() {
+                return Err(bad);
             }
+            let cred = c.produce(&space, &binding, cancel)?;
+            w.bytes(&cred);
         }
         _ => return Err(PlugError::UNSUPPORTED),
     }

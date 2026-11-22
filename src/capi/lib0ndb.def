@@ -17,7 +17,9 @@ EXPORTS
 	ondb_link_writable
 	ondb_observed_write
 	ondb_open
+	ondb_plug_done
 	ondb_post
+	ondb_search_answer
 	ondb_sink_write
 	ondb_start
 	ondb_status_name

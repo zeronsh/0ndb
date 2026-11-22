@@ -1,5 +1,6 @@
 package engine
 
+import "base:runtime"
 import "../prim"
 import osync "../sync"
 
@@ -9,9 +10,10 @@ ENROLLMENT_VERSION :: 1
 Runner_Pool :: struct {
 	data:     rawptr,
 	identity: proc(data: rawptr) -> osync.Identity,
-	verify:   proc(data: rawptr, token: []u8, runner: osync.Identity) -> (lease_ms: u64, err: osync.Error),
-	attest:   proc(data: rawptr, evidence: []u8, runner: osync.Identity) -> osync.Error,
+	verify:   proc(data: rawptr, token: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error,
+	attest:   proc(data: rawptr, evidence: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error,
 	joined:   proc(data: rawptr, space: prim.Id, name: string, relay: string, relay_public: osync.Public_Key, proof: []u8),
+	cancel:   proc(data: rawptr, done: osync.Plug_Done),
 }
 
 @(private)
@@ -45,7 +47,7 @@ _pool_notify :: proc(e: ^Engine, sp: ^Space) {
 	e.cfg.runner_pool.joined(e.cfg.runner_pool.data, sp.id, sp.name, sp.relay, sp.relay_public, proof)
 }
 
-pool_enroll :: proc(e: ^Engine, token: []u8, card: []u8, evidence: []u8 = nil, allocator := context.allocator) -> (enrollment: []u8, err: Error) {
+pool_enroll :: proc(e: ^Engine, token: []u8, card: []u8, evidence: []u8 = nil, allocator := context.allocator, done: Account_Done = {}) -> (enrollment: []u8, err: Error) {
 	context = context_for(e)
 	if e.cfg.runner_pool.verify == nil {
 		return nil, .Unsupported
@@ -54,18 +56,27 @@ pool_enroll :: proc(e: ^Engine, token: []u8, card: []u8, evidence: []u8 = nil, a
 	if cerr != .None {
 		return nil, .Invalid
 	}
-	lease: u64
-	verr: osync.Error
-	{
-		context = _outer(e)
-		lease, verr = e.cfg.runner_pool.verify(e.cfg.runner_pool.data, token, runner)
-		if verr == .None && e.cfg.runner_pool.attest != nil {
-			verr = e.cfg.runner_pool.attest(e.cfg.runner_pool.data, evidence, runner)
-		}
+	j := _job_new(e, .Enroll, done)
+	if j == nil {
+		return nil, .No_Memory
 	}
-	if verr != .None || lease == 0 {
-		return nil, .Permission
+	j.token = _job_bytes(j, token)
+	j.evidence = _job_bytes(j, evidence)
+	j.runner = runner
+	err = _job_begin(j)
+	if err == .Pending {
+		return nil, .Pending
 	}
+	if err == .None {
+		enrollment = make([]u8, len(j.res.enrollment), allocator)
+		copy(enrollment, j.res.enrollment)
+	}
+	_job_free(j)
+	return
+}
+
+@(private)
+_pool_enrollment :: proc(e: ^Engine, runner: osync.Identity, lease: u64, allocator: runtime.Allocator) -> (enrollment: []u8, err: Error) {
 	out := make([dynamic]u8, context.temp_allocator)
 	w := prim.writer(&out)
 	prim.write_u8(&w, ENROLLMENT_VERSION)

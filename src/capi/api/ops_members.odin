@@ -1,5 +1,6 @@
 package api
 
+import "core:mem/virtual"
 import eng "../../engine"
 import "../../prim"
 import osync "../../sync"
@@ -29,37 +30,50 @@ _login_out :: proc(o: ^Out, r: eng.Login_Result) {
 }
 
 op_account_login :: proc(c: ^Call, o: ^Out) -> Status {
-	rk, ok := _relay_key(c)
-	if !ok {
-		return .Invalid
+	if c.stage == 0 {
+		rk, ok := _relay_key(c)
+		if !ok {
+			return .Invalid
+		}
+		r, err := eng.account_login(c.api.e, a_str(c, "subject"), a_str(c, "label"), a_str(c, "relay"), rk, account_done(c))
+		if st, ok2 := account_step(c, err); !ok2 {
+			return st
+		}
+		c.account.login = r
 	}
-	r, err := eng.account_login(c.api.e, a_str(c, "subject"), a_str(c, "label"), a_str(c, "relay"), rk)
-	if err != .None {
-		return status_of(err)
+	return _login_reply(c, o)
+}
+
+@(private)
+_login_reply :: proc(c: ^Call, o: ^Out) -> Status {
+	if c.err != .None {
+		return status_of(c.err)
 	}
 	_attach_all(c)
-	_login_out(o, r)
+	_login_out(o, c.account.login)
 	return .Ok
 }
 
 op_account_login_cross_device :: proc(c: ^Call, o: ^Out) -> Status {
-	r, err := eng.account_login_cross_device(c.api.e, a_str(c, "subject"))
-	if err != .None {
-		return status_of(err)
+	if c.stage == 0 {
+		r, err := eng.account_login_cross_device(c.api.e, a_str(c, "subject"), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+		c.account.login = r
 	}
-	_attach_all(c)
-	_login_out(o, r)
-	return .Ok
+	return _login_reply(c, o)
 }
 
 op_account_login_recovery :: proc(c: ^Call, o: ^Out) -> Status {
-	r, err := eng.account_login_recovery(c.api.e, a_str(c, "subject"), a_str(c, "key"))
-	if err != .None {
-		return status_of(err)
+	if c.stage == 0 {
+		r, err := eng.account_login_recovery(c.api.e, a_str(c, "subject"), a_str(c, "key"), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+		c.account.login = r
 	}
-	_attach_all(c)
-	_login_out(o, r)
-	return .Ok
+	return _login_reply(c, o)
 }
 
 op_account_state :: proc(c: ^Call, o: ^Out) -> Status {
@@ -97,14 +111,27 @@ op_approval_list :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_approval_respond :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.approval_respond(c.api.e, a_str(c, "code"), a_bool(c, "approve")))
+	if c.stage == 0 {
+		err := eng.approval_respond(c.api.e, a_str(c, "code"), a_bool(c, "approve"), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+	}
+	return status_of(c.err)
 }
 
 op_account_wrappers :: proc(c: ^Call, o: ^Out) -> Status {
-	list, err := eng.account_wrappers(c.api.e, context.temp_allocator)
-	if err != .None {
-		return status_of(err)
+	if c.stage == 0 {
+		list, err := eng.account_wrappers(c.api.e, virtual.arena_allocator(&c.arena), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+		c.account.wrappers = list
 	}
+	if c.err != .None {
+		return status_of(c.err)
+	}
+	list := c.account.wrappers
 	o_arr(o, "passkeys", len(list))
 	for &w in list {
 		o_obj(o, "")
@@ -120,15 +147,27 @@ op_account_wrappers :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_account_wrapper_remove :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.account_wrapper_remove(c.api.e, a_bytes(c, "credential")))
+	if c.stage == 0 {
+		err := eng.account_wrapper_remove(c.api.e, a_bytes(c, "credential"), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+	}
+	return status_of(c.err)
 }
 
 op_account_recovery_key :: proc(c: ^Call, o: ^Out) -> Status {
-	key, err := eng.account_recovery_key(c.api.e, context.temp_allocator)
-	if err != .None {
-		return status_of(err)
+	if c.stage == 0 {
+		key, err := eng.account_recovery_key(c.api.e, virtual.arena_allocator(&c.arena), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+		c.account.text = key
 	}
-	o_str(o, "key", key)
+	if c.err != .None {
+		return status_of(c.err)
+	}
+	o_str(o, "key", c.account.text)
 	return .Ok
 }
 
@@ -153,7 +192,13 @@ op_account_devices :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_account_pool :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.account_pool_set(c.api.e, osync.Pool_Access(min(a_u64(c, "access"), 3))))
+	if c.stage == 0 {
+		err := eng.account_pool_set(c.api.e, osync.Pool_Access(min(a_u64(c, "access"), 3)), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+	}
+	return status_of(c.err)
 }
 
 op_device_remove :: proc(c: ^Call, o: ^Out) -> Status {
@@ -228,7 +273,13 @@ op_space_rotate :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_space_pool :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.space_pool_set(c.api.e, a_id(c, "space"), a_bool(c, "on")))
+	if c.stage == 0 {
+		err := eng.space_pool_set(c.api.e, a_id(c, "space"), a_bool(c, "on"), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+	}
+	return status_of(c.err)
 }
 
 op_space_join_enrollment :: proc(c: ^Call, o: ^Out) -> Status {
@@ -250,11 +301,17 @@ op_account_join_space :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_pool_enroll :: proc(c: ^Call, o: ^Out) -> Status {
-	en, err := eng.pool_enroll(c.api.e, a_bytes(c, "token"), a_bytes(c, "card"), a_bytes(c, "evidence"), context.temp_allocator)
-	if err != .None {
-		return status_of(err)
+	if c.stage == 0 {
+		en, err := eng.pool_enroll(c.api.e, a_bytes(c, "token"), a_bytes(c, "card"), a_bytes(c, "evidence"), virtual.arena_allocator(&c.arena), account_done(c))
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
+		c.account.enrollment = en
 	}
-	o_bytes(o, "enrollment", en)
+	if c.err != .None {
+		return status_of(c.err)
+	}
+	o_bytes(o, "enrollment", c.account.enrollment)
 	return .Ok
 }
 
@@ -312,33 +369,41 @@ op_directory_remove :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_account_login_prf :: proc(c: ^Call, o: ^Out) -> Status {
-	rk, ok := _relay_key(c)
-	p := a_bytes(c, "prf")
-	if !ok || len(p) != 32 {
-		return .Invalid
+	if c.stage == 0 {
+		rk, ok := _relay_key(c)
+		p := a_bytes(c, "prf")
+		if !ok || len(p) != 32 {
+			return .Invalid
+		}
+		prf: [32]u8
+		copy(prf[:], p)
+		r, err := eng.account_login_prf(c.api.e, a_str(c, "subject"), a_bytes(c, "credential"), prf, a_str(c, "label"), a_str(c, "relay"), rk, account_done(c))
+		if st, ok2 := account_step(c, err); !ok2 {
+			return st
+		}
+		c.account.login = r
 	}
-	prf: [32]u8
-	copy(prf[:], p)
-	r, err := eng.account_login_prf(c.api.e, a_str(c, "subject"), a_bytes(c, "credential"), prf, a_str(c, "label"), a_str(c, "relay"), rk)
-	if err != .None {
-		return status_of(err)
-	}
-	_attach_all(c)
-	_login_out(o, r)
-	return .Ok
+	return _login_reply(c, o)
 }
 
 op_account_passkey_add :: proc(c: ^Call, o: ^Out) -> Status {
-	p := a_bytes(c, "prf")
-	if len(p) == 0 {
-		return status_of(eng.account_passkey_add(c.api.e, a_str(c, "label")))
+	if c.stage == 0 {
+		p := a_bytes(c, "prf")
+		err: eng.Error
+		if len(p) == 0 {
+			err = eng.account_passkey_add(c.api.e, a_str(c, "label"), account_done(c))
+		} else if len(p) != 32 {
+			return .Invalid
+		} else {
+			prf: [32]u8
+			copy(prf[:], p)
+			err = eng.account_passkey_add_prf(c.api.e, a_bytes(c, "credential"), prf, a_str(c, "label"), account_done(c))
+		}
+		if st, ok := account_step(c, err); !ok {
+			return st
+		}
 	}
-	if len(p) != 32 {
-		return .Invalid
-	}
-	prf: [32]u8
-	copy(prf[:], p)
-	return status_of(eng.account_passkey_add_prf(c.api.e, a_bytes(c, "credential"), prf, a_str(c, "label")))
+	return status_of(c.err)
 }
 
 op_account_idp_salt :: proc(c: ^Call, o: ^Out) -> Status {

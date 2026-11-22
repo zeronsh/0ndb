@@ -238,6 +238,32 @@ client_hello :: proc(c: ^Client, creds: ^Credentials) -> Error {
 	return .None
 }
 
+client_binding :: proc(c: ^Client) -> []u8 {
+	return c.binding[:c.bind_len]
+}
+
+client_hello_finish :: proc(c: ^Client, credential: []u8) -> Error {
+	if c.state != .Hello {
+		return .Protocol
+	}
+	if len(credential) > CREDENTIAL_MAX {
+		return .Too_Large
+	}
+	start := frame_begin(&c.out, .Hello) or_return
+	w := prim.writer(&c.out)
+	prim.write_u8(&w, PROTOCOL_VERSION)
+	prim.write_raw(&w, credential)
+	if w.err != .None {
+		resize(&c.out, start)
+		return .No_Memory
+	}
+	session_keys_clear(&c.keys)
+	frame_end(&c.out, start, &w) or_return
+	c.state = .Ready
+	_await_add(c, AWAIT_HELLO)
+	return .None
+}
+
 client_awaiting :: proc "contextless" (c: ^Client) -> int {
 	return c.await_n
 }

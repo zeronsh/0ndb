@@ -66,7 +66,7 @@ _prf :: proc(seed: []u8, salt: [32]u8, out: ^[32]u8) {
 }
 
 @(private = "file")
-_unlock :: proc(data: rawptr, rp_user: []u8, options: []osync.Unlock_Option, mode: osync.Unlock_Mode, credential: ^[dynamic]u8, prf: ^[32]u8) -> osync.Error {
+_unlock :: proc(data: rawptr, rp_user: []u8, options: []osync.Unlock_Option, mode: osync.Unlock_Mode, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	p := (^Mem_Plug)(data)
 	mw := p.mw
 	key: [48]u8
@@ -84,8 +84,10 @@ _unlock :: proc(data: rawptr, rp_user: []u8, options: []osync.Unlock_Option, mod
 	}
 	for o in options {
 		if string(o.credential) == string(key[:16]) {
-			_prf(key[16:], o.salt, prf)
-			append(credential, ..key[:16])
+			_prf(key[16:], o.salt, &reply.prf)
+			c := make([]u8, 16, context.temp_allocator)
+			copy(c, key[:16])
+			reply.credential = c
 			return .None
 		}
 	}
@@ -93,7 +95,7 @@ _unlock :: proc(data: rawptr, rp_user: []u8, options: []osync.Unlock_Option, mod
 }
 
 @(private = "file")
-_register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, credential: ^[dynamic]u8, prf: ^[32]u8, ecosystem: ^osync.Ecosystem) -> osync.Error {
+_register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	p := (^Mem_Plug)(data)
 	mw := p.mw
 	key: [48]u8
@@ -111,27 +113,27 @@ _register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, cred
 		}
 		key = k
 	}
-	_prf(key[16:], salt, prf)
-	append(credential, ..key[:16])
-	ecosystem^ = .Test
+	_prf(key[16:], salt, &reply.prf)
+	c := make([]u8, 16, context.temp_allocator)
+	copy(c, key[:16])
+	reply.credential = c
+	reply.ecosystem = .Test
 	return .None
 }
 
 @(private = "file")
-_store_get :: proc(data: rawptr, subject: []u8, record: ^[dynamic]u8, entries: ^[dynamic][]u8) -> osync.Error {
+_store_get :: proc(data: rawptr, subject: []u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	mw := (^Mem_Plug)(data).mw
 	if len(mw.record) == 0 {
 		return .Not_Found
 	}
-	append(record, ..mw.record[:])
-	for x in mw.entries {
-		append(entries, x)
-	}
+	reply.record = mw.record[:]
+	reply.entries = mw.entries[:]
 	return .None
 }
 
 @(private = "file")
-_store_put :: proc(data: rawptr, subject: []u8, record: []u8, prev: u64) -> osync.Error {
+_store_put :: proc(data: rawptr, subject: []u8, record: []u8, prev: u64, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	mw := (^Mem_Plug)(data).mw
 	if len(mw.record) > 0 {
 		cur: osync.Account_Record
@@ -145,7 +147,7 @@ _store_put :: proc(data: rawptr, subject: []u8, record: []u8, prev: u64) -> osyn
 }
 
 @(private = "file")
-_store_add :: proc(data: rawptr, subject: []u8, entry: []u8) -> osync.Error {
+_store_add :: proc(data: rawptr, subject: []u8, entry: []u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	mw := (^Mem_Plug)(data).mw
 	c := make([]u8, len(entry), mw.w.allocator)
 	copy(c, entry)
@@ -160,12 +162,13 @@ _pool_identity :: proc(data: rawptr) -> osync.Identity {
 }
 
 @(private = "file")
-_pool_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity) -> (u64, osync.Error) {
+_pool_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	mw := (^Mem_Plug)(data).mw
 	if string(token) != "launch" || mw.w.now > mw.token_ok {
-		return 0, .Auth
+		return .Auth
 	}
-	return M_LEASE_MS, .None
+	reply.lease_ms = M_LEASE_MS
+	return .None
 }
 
 @(private = "file")

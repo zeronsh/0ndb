@@ -170,6 +170,29 @@ _ref_session :: proc(h: ^Ref_Host, c: ^Client, replace: bool) -> int {
 	}
 	api.o_end(&o)
 	api.o_bool(&o, "replace", replace)
+	ident: [64]u8
+	if h.have_pool {
+		copy(ident[:32], h.pool_id.sign[:])
+		copy(ident[32:], h.pool_id.box[:])
+	} else if h.have_user {
+		copy(ident[:32], h.user_id.sign[:])
+		copy(ident[32:], h.user_id.box[:])
+	}
+	api.o_bytes(&o, "identity", ident[:] if h.have_pool || h.have_user else nil)
+	spaces := _ref_cred_spaces(h)
+	if h.json {
+		api.o_arr(&o, "spaces", len(spaces))
+		for sp in spaces {
+			api.o_id(&o, "", sp)
+		}
+		api.o_end(&o)
+	} else {
+		prim.write_uvarint(&o.w, u64(len(spaces)))
+		for sp in spaces {
+			x := sp
+			prim.write_raw(&o.w, x[:])
+		}
+	}
 	st, _, ok := _ref_call(c, api.out_finish(&o), h.json)
 	if !ok {
 		return -1
@@ -296,21 +319,22 @@ _ref_run :: proc(h: ^Ref_Host, fn: ^Plug_Fn, req: ^api.Call, o: ^api.Out) -> api
 	unlock := osync.soft_passkey(&h.passkey)
 	switch fn.code {
 	case PLUG_STORE_GET:
-		rec := make([dynamic]u8, context.temp_allocator)
-		entries := make([dynamic][]u8, context.temp_allocator)
-		if err := store.get(store.data, api.a_bytes(req, "subject"), &rec, &entries); err != .None {
+		reply: osync.Plug_Reply
+		if err := store.get(store.data, api.a_bytes(req, "subject"), &reply, {}); err != .None {
 			return _ref_err(err)
 		}
-		api.o_bytes(o, "record", rec[:])
-		api.o_arr(o, "entries", len(entries))
-		for e in entries {
+		api.o_bytes(o, "record", reply.record)
+		api.o_arr(o, "entries", len(reply.entries))
+		for e in reply.entries {
 			api.o_bytes(o, "", e)
 		}
 		api.o_end(o)
 	case PLUG_STORE_PUT:
-		return _ref_err(store.put(store.data, api.a_bytes(req, "subject"), api.a_bytes(req, "record"), api.a_u64(req, "prev_seq")))
+		reply: osync.Plug_Reply
+		return _ref_err(store.put(store.data, api.a_bytes(req, "subject"), api.a_bytes(req, "record"), api.a_u64(req, "prev_seq"), &reply, {}))
 	case PLUG_STORE_ADD:
-		return _ref_err(store.add(store.data, api.a_bytes(req, "subject"), api.a_bytes(req, "entry")))
+		reply: osync.Plug_Reply
+		return _ref_err(store.add(store.data, api.a_bytes(req, "subject"), api.a_bytes(req, "entry"), &reply, {}))
 	case PLUG_UNLOCK:
 		creds := api.a_strs(req, "credentials")
 		salts := api.a_strs(req, "salts")
@@ -326,13 +350,12 @@ _ref_run :: proc(h: ^Ref_Host, fn: ^Plug_Fn, req: ^api.Call, o: ^api.Out) -> api
 			}
 			copy(opts[i].salt[:], s)
 		}
-		cred := make([dynamic]u8, context.temp_allocator)
-		prf: [32]u8
-		if err := unlock.unlock(unlock.data, api.a_bytes(req, "rp_user"), opts, osync.Unlock_Mode(api.a_int(req, "mode")), &cred, &prf); err != .None {
+		reply: osync.Plug_Reply
+		if err := unlock.unlock(unlock.data, api.a_bytes(req, "rp_user"), opts, osync.Unlock_Mode(api.a_int(req, "mode")), &reply, {}); err != .None {
 			return _ref_err(err)
 		}
-		api.o_bytes(o, "credential", cred[:])
-		api.o_bytes(o, "prf", prf[:])
+		api.o_bytes(o, "credential", reply.credential)
+		api.o_bytes(o, "prf", reply.prf[:])
 	case PLUG_REGISTER:
 		s := api.a_bytes(req, "salt")
 		if len(s) != 32 {
@@ -340,21 +363,13 @@ _ref_run :: proc(h: ^Ref_Host, fn: ^Plug_Fn, req: ^api.Call, o: ^api.Out) -> api
 		}
 		salt: [32]u8
 		copy(salt[:], s)
-		cred := make([dynamic]u8, context.temp_allocator)
-		prf: [32]u8
-		eco: osync.Ecosystem
-		if err := unlock.register(unlock.data, api.a_bytes(req, "rp_user"), api.a_str(req, "label"), salt, &cred, &prf, &eco); err != .None {
+		reply: osync.Plug_Reply
+		if err := unlock.register(unlock.data, api.a_bytes(req, "rp_user"), api.a_str(req, "label"), salt, &reply, {}); err != .None {
 			return _ref_err(err)
 		}
-		api.o_bytes(o, "credential", cred[:])
-		api.o_bytes(o, "prf", prf[:])
-		api.o_enum(o, "ecosystem", u64(eco), ECOSYSTEM_NAMES)
-	case PLUG_POOL_IDENTITY:
-		if !h.have_pool {
-			return .Unsupported
-		}
-		api.o_bytes(o, "sign", h.pool_id.sign[:])
-		api.o_bytes(o, "box", h.pool_id.box[:])
+		api.o_bytes(o, "credential", reply.credential)
+		api.o_bytes(o, "prf", reply.prf[:])
+		api.o_enum(o, "ecosystem", u64(reply.ecosystem), ECOSYSTEM_NAMES)
 	case PLUG_POOL_VERIFY:
 		raw, ok := hex_decode(string(api.a_bytes(req, "token")))
 		if !ok || len(raw) != 56 {
@@ -370,12 +385,6 @@ _ref_run :: proc(h: ^Ref_Host, fn: ^Plug_Fn, req: ^api.Call, o: ^api.Out) -> api
 		}
 		api.o_u64(o, "lease_ms", POOL_LEASE_MS)
 	case PLUG_POOL_ATTEST:
-	case PLUG_USER_IDENTITY:
-		if !h.have_user {
-			return .Unsupported
-		}
-		api.o_bytes(o, "sign", h.user_id.sign[:])
-		api.o_bytes(o, "box", h.user_id.box[:])
 	case PLUG_USER_JOINED:
 		sp := api.a_id(req, "space")
 		fmt.eprintfln("0ndb host: the runner pool was added to space %s", hex(sp))
@@ -388,9 +397,6 @@ _ref_run :: proc(h: ^Ref_Host, fn: ^Plug_Fn, req: ^api.Call, o: ^api.Out) -> api
 			req_str(&r, "relay_key", hex_of(api.a_bytes(req, "relay_key")))
 			call_at(h.pool_sock, req_end(&r), 5000)
 		}
-	case PLUG_CRED_AVAILABLE:
-		_, ok := _ref_cred(h, api.a_id(req, "space"))
-		api.o_bool(o, "available", ok)
 	case PLUG_CRED_PRODUCE:
 		cred, ok := _ref_cred(h, api.a_id(req, "space"))
 		if !ok {
@@ -411,4 +417,24 @@ _ref_cred :: proc(h: ^Ref_Host, space: prim.Id) -> ([]u8, bool) {
 	p, _ := prim.path_join(context.temp_allocator, h.cred_dir, hex(space))
 	data, err := prim.read_file(prim.os_vfs(), p, context.temp_allocator)
 	return data, err == .None && len(data) > 0
+}
+
+@(private)
+_ref_cred_spaces :: proc(h: ^Ref_Host) -> []prim.Id {
+	out := make([dynamic]prim.Id, context.temp_allocator)
+	if len(h.cred_dir) == 0 {
+		return out[:]
+	}
+	fd, err := os.open(h.cred_dir)
+	if err != nil {
+		return out[:]
+	}
+	defer os.close(fd)
+	infos, _ := os.read_dir(fd, -1, context.temp_allocator)
+	for fi in infos {
+		if id, ok := prim.id_parse(fi.name); ok {
+			append(&out, id)
+		}
+	}
+	return out[:]
 }

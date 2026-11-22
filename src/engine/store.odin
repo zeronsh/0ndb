@@ -659,6 +659,8 @@ _serr :: proc "contextless" (e: osync.Error) -> Error {
 		return .Unsupported
 	case .Io:
 		return .Io
+	case .Pending:
+		return .Pending
 	}
 	return .Io
 }

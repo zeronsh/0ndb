@@ -140,6 +140,8 @@ Call :: struct {
 	err:      eng.Error,
 	in_exec:  bool,
 	orphan:   bool,
+	account:  eng.Account_Result,
+	job:      u64,
 }
 
 MAX_RETRIES :: 64
@@ -231,10 +233,60 @@ cancel :: proc(a: ^Api, id: u64) {
 	for c in a.calls {
 		if c.id == id {
 			c.done = nil
+			if c.job != 0 {
+				job := c.job
+				c.job = 0
+				eng.account_job_cancel(a.e, job)
+				return
+			}
 			_complete(c, .Cancelled, nil)
 			return
 		}
 	}
+}
+
+account_done :: proc(c: ^Call) -> eng.Account_Done {
+	return eng.Account_Done{data = c, call = _on_account_done, job = &c.job}
+}
+
+@(private)
+_on_account_done :: proc(data: rawptr, e: ^eng.Engine, res: ^eng.Account_Result, err: eng.Error) {
+	c := (^Call)(data)
+	c.in_exec = false
+	c.job = 0
+	if c.orphan {
+		_call_free(c)
+		return
+	}
+	arena := virtual.arena_allocator(&c.arena)
+	c.account = res^
+	c.account.text = _clone_str(res.text, arena)
+	c.account.wrappers = eng.wrappers_clone(res.wrappers, arena)
+	en := make([]u8, len(res.enrollment), arena)
+	copy(en, res.enrollment)
+	c.account.enrollment = en
+	c.err = err
+	c.stage += 1
+	_rerun(c)
+}
+
+@(private)
+_clone_str :: proc(s: string, allocator: runtime.Allocator) -> string {
+	b := make([]u8, len(s), allocator)
+	copy(b, s)
+	return string(b)
+}
+
+account_step :: proc(c: ^Call, err: eng.Error) -> (Status, bool) {
+	if err == .Pending {
+		c.in_exec = true
+		return .Pending, false
+	}
+	if err != .None {
+		return status_of(err), false
+	}
+	c.stage = 1
+	return .Ok, true
 }
 
 describe :: proc(a: ^Api, json_form: bool, allocator := context.allocator) -> []u8 {
@@ -479,6 +531,11 @@ _complete :: proc(c: ^Call, st: Status, payload: []u8) {
 	}
 	if c.in_exec {
 		c.orphan = true
+		if c.job != 0 {
+			job := c.job
+			c.job = 0
+			eng.account_job_cancel(a.e, job)
+		}
 		return
 	}
 	_call_free(c)

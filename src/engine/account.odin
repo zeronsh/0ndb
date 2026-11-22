@@ -1,6 +1,5 @@
 package engine
 
-import "core:crypto"
 import "../prim"
 import osync "../sync"
 
@@ -99,6 +98,9 @@ Approvals :: struct {
 	enrolling: int,
 	path:      Login_Path,
 	lease_timer: prim.Timer,
+	jobs:      [dynamic]^Acct_Job,
+	next_job:  u64,
+	granting:  bool,
 }
 
 @(private)
@@ -112,6 +114,7 @@ _account_load :: proc(e: ^Engine) {
 	e.approvals.present = make([dynamic]prim.Id, e.allocator)
 	e.approvals.inbox = make([dynamic]Inbound, e.allocator)
 	e.approvals.pending = make([dynamic]Approval_Pending, e.allocator)
+	e.approvals.jobs = make([dynamic]^Acct_Job, e.allocator)
 	path, perr := _account_path(e)
 	if perr != .None {
 		return
@@ -168,6 +171,7 @@ _account_store :: proc(e: ^Engine) -> Error {
 
 @(private)
 _account_close :: proc(e: ^Engine) {
+	_jobs_close(e)
 	_rv_close(e)
 	if e.approvals.lease_timer != 0 && e.loop != nil {
 		prim.timer_cancel(e.loop, e.approvals.lease_timer)
@@ -193,162 +197,53 @@ account_state :: proc "contextless" (e: ^Engine) -> Account_State {
 	return e.account
 }
 
-@(private)
-_store_get :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Record, entries: ^[dynamic][]u8) -> Error {
-	if e.cfg.sealed_store.get == nil {
-		return .Unsupported
-	}
-	raw := make([dynamic]u8, context.temp_allocator)
-	err: osync.Error
-	{
-		context = _outer(e)
-		err = e.cfg.sealed_store.get(e.cfg.sealed_store.data, transmute([]u8)subject, &raw, entries)
-	}
-	if err == .Not_Found {
-		return .Not_Found
-	}
-	_serr(err) or_return
-	return _serr(osync.account_record_decode(raw[:], rec, context.temp_allocator))
-}
-
-@(private)
-_store_put :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Record, a: ^osync.Account_Key, prev: u64) -> Error {
-	out := make([dynamic]u8, context.temp_allocator)
-	_serr(osync.account_record_encode(rec, a, &out)) or_return
-	context = _outer(e)
-	return _serr(e.cfg.sealed_store.put(e.cfg.sealed_store.data, transmute([]u8)subject, out[:], prev))
-}
-
-@(private)
-_unlock_local :: proc(e: ^Engine, rec: ^osync.Account_Record, mode: osync.Unlock_Mode, a: ^osync.Account_Key) -> Error {
-	if e.cfg.unlock.unlock == nil {
-		return .Unsupported
-	}
-	opts := osync.account_unlock_options(rec)
-	if len(opts) == 0 {
-		return .Not_Found
-	}
-	cred := make([dynamic]u8, context.temp_allocator)
-	prf: [32]u8
-	defer crypto.zero_explicit(&prf, size_of(prf))
-	err: osync.Error
-	{
-		context = _outer(e)
-		err = e.cfg.unlock.unlock(e.cfg.unlock.data, rec.sign[:], opts, mode, &cred, &prf)
-	}
-	_serr(err) or_return
-	return _serr(osync.account_open_with(rec, cred[:], prf[:], a, e.cfg.random))
-}
-
-@(private)
-_register_wrapper :: proc(e: ^Engine, rec: ^osync.Account_Record, a: ^osync.Account_Key, label: string) -> Error {
-	if e.cfg.unlock.register == nil {
-		return .Unsupported
-	}
-	salt: [32]u8
-	prim.random_fill(e.cfg.random, salt[:])
-	cred := make([dynamic]u8, context.temp_allocator)
-	prf: [32]u8
-	defer crypto.zero_explicit(&prf, size_of(prf))
-	eco: osync.Ecosystem
-	err: osync.Error
-	{
-		context = _outer(e)
-		err = e.cfg.unlock.register(e.cfg.unlock.data, rec.sign[:], label, salt, &cred, &prf, &eco)
-	}
-	_serr(err) or_return
-	return _serr(osync.account_add_wrapper(rec, a, cred[:], label, eco, salt, prf[:], e.identity.sign, _now_ms(e), context.temp_allocator))
-}
-
-account_login :: proc(e: ^Engine, subject: string, label: string, relay := "", relay_public: osync.Public_Key = {}) -> (res: Login_Result, err: Error) {
+account_login :: proc(e: ^Engine, subject: string, label: string, relay := "", relay_public: osync.Public_Key = {}, done: Account_Done = {}) -> (res: Login_Result, err: Error) {
 	context = context_for(e)
-	rec: osync.Account_Record
-	entries := make([dynamic][]u8, context.temp_allocator)
-	gerr := _store_get(e, subject, &rec, &entries)
-	if gerr == .Not_Found {
-		return _account_create(e, subject, label, relay, relay_public)
+	j := _job_new(e, .Login, done)
+	if j == nil {
+		return res, .No_Memory
 	}
-	gerr or_return
-	a: osync.Account_Key
-	defer osync.account_key_clear(&a)
-	if _unlock_local(e, &rec, .Local, &a) == .None {
-		res.path = .Passkey
-		res.spaces = _account_adopt(e, subject, &rec, entries[:], &a, .Passkey) or_return
-		res.status = .Done
-		return res, .None
-	}
-	_approval_request(e, subject, &rec, label) or_return
-	res.path = .Approval
-	res.status = .Waiting
-	res.code = e.approvals.code
-	return res, .None
-}
-
-account_login_cross_device :: proc(e: ^Engine, subject: string) -> (res: Login_Result, err: Error) {
-	context = context_for(e)
-	rec: osync.Account_Record
-	entries := make([dynamic][]u8, context.temp_allocator)
-	_store_get(e, subject, &rec, &entries) or_return
-	a: osync.Account_Key
-	defer osync.account_key_clear(&a)
-	_unlock_local(e, &rec, .Cross_Device, &a) or_return
-	_rv_close(e)
-	e.approvals.waiting = false
-	res.path = .Cross_Device
-	res.spaces = _account_adopt(e, subject, &rec, entries[:], &a, .Cross_Device) or_return
-	res.status = .Done
-	return res, .None
-}
-
-account_login_recovery :: proc(e: ^Engine, subject: string, recovery: string) -> (res: Login_Result, err: Error) {
-	context = context_for(e)
-	secret, derr := osync.recovery_decode(recovery)
-	if derr != .None {
-		return res, .Invalid
-	}
-	defer crypto.zero_explicit(&secret, size_of(secret))
-	rec: osync.Account_Record
-	entries := make([dynamic][]u8, context.temp_allocator)
-	_store_get(e, subject, &rec, &entries) or_return
-	a: osync.Account_Key
-	defer osync.account_key_clear(&a)
-	_serr(osync.account_open_recovery(&rec, secret, &a, e.cfg.random)) or_return
-	res.path = .Recovery
-	res.spaces = _account_adopt(e, subject, &rec, entries[:], &a, .Recovery) or_return
-	res.status = .Done
-	return res, .None
+	j.subject = _job_str(j, subject)
+	j.label = _job_str(j, label)
+	j.relay = _job_str(j, relay)
+	j.relay_public = relay_public
+	return _login_finish(j)
 }
 
 @(private)
-_account_create :: proc(e: ^Engine, subject: string, label: string, relay: string, relay_public: osync.Public_Key) -> (res: Login_Result, err: Error) {
-	if e.cfg.sealed_store.put == nil {
-		return res, .Unsupported
+_login_finish :: proc(j: ^Acct_Job) -> (res: Login_Result, err: Error) {
+	err = _job_begin(j)
+	if err == .Pending {
+		return res, .Pending
 	}
-	a: osync.Account_Key
-	defer osync.account_key_clear(&a)
-	_serr(osync.account_key_new(&a, e.cfg.random)) or_return
-	rec: osync.Account_Record
-	osync.account_record_new(&rec, &a, relay, relay_public, context.temp_allocator)
-	if e.cfg.runner_pool.identity != nil {
-		id: osync.Identity
-		{
-			context = _outer(e)
-			id = e.cfg.runner_pool.identity(e.cfg.runner_pool.data)
-		}
-		rec.pool = .Everything
-		rec.pool_sign = id.sign
-		rec.pool_box = id.box
+	res = j.res.login
+	_job_free(j)
+	return
+}
+
+account_login_cross_device :: proc(e: ^Engine, subject: string, done: Account_Done = {}) -> (res: Login_Result, err: Error) {
+	context = context_for(e)
+	j := _job_new(e, .Login_Cross, done)
+	if j == nil {
+		return res, .No_Memory
 	}
-	_register_wrapper(e, &rec, &a, label) or_return
-	_store_put(e, subject, &rec, &a, 0) or_return
-	res.path = .Created
-	res.spaces = _account_adopt(e, subject, &rec, nil, &a, .Created) or_return
-	res.status = .Done
-	return res, .None
+	j.subject = _job_str(j, subject)
+	return _login_finish(j)
+}
+
+account_login_recovery :: proc(e: ^Engine, subject: string, recovery: string, done: Account_Done = {}) -> (res: Login_Result, err: Error) {
+	context = context_for(e)
+	j := _job_new(e, .Login_Recovery, done)
+	if j == nil {
+		return res, .No_Memory
+	}
+	j.subject = _job_str(j, subject)
+	j.recovery = _job_str(j, recovery)
+	return _login_finish(j)
 }
 
 @(private)
-_account_adopt :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Record, entries: [][]u8, a: ^osync.Account_Key, path: Login_Path) -> (spaces: int, err: Error) {
+_account_adopt_begin :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Record, entries: [][]u8, a: ^osync.Account_Key, path: Login_Path) -> (spaces: int, err: Error) {
 	delete(e.account.relay, e.allocator)
 	delete(e.account.subject, e.allocator)
 	e.account = Account_State {
@@ -396,15 +291,11 @@ _account_adopt :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Record, 
 		spaces += 1
 		space_open(e, sp.id)
 	}
-	if path == .Approval || path == .Cross_Device || path == .Recovery {
-		prev := rec.seq
-		rec.seq += 1
-		if _register_wrapper(e, rec, a, "") == .None {
-			if _store_put(e, subject, rec, a, prev) != .None {
-				_log(e, .Warn, "passkey wrapper store failed")
-			}
-		}
-	}
+	return spaces, .None
+}
+
+@(private)
+_account_adopt_end :: proc(e: ^Engine, path: Login_Path, spaces: int) {
 	_account_adopt_local(e)
 	if spaces == 0 {
 		_emit(e, Event{kind = .Login_Done, length = i64(path)})
@@ -412,8 +303,8 @@ _account_adopt :: proc(e: ^Engine, subject: string, rec: ^osync.Account_Record, 
 	if e.cfg.approver && e.approvals.rv == nil {
 		_rv_open(e, e.account.sign, e.account.relay, e.account.relay_public, false)
 	}
+	account_resume(e)
 	_touch(e)
-	return spaces, .None
 }
 
 @(private)
@@ -461,8 +352,93 @@ _account_manifest_add :: proc(e: ^Engine, sp: ^Space) {
 	if osync.manifest_entry_encode(acc, &e.keyring, e.account.cert, me, &out, e.cfg.random) != .None {
 		return
 	}
-	context = _outer(e)
-	e.cfg.sealed_store.add(e.cfg.sealed_store.data, transmute([]u8)e.account.subject, out[:])
+	list := _manifest_pending_load(e)
+	append(&list, out[:])
+	_manifest_pending_store(e, list[:])
+	_manifest_issue(e, out[:])
+}
+
+@(private)
+MANIFEST_PENDING_FILE :: "account.pending"
+
+@(private)
+_manifest_pending_load :: proc(e: ^Engine) -> [dynamic][]u8 {
+	list := make([dynamic][]u8, context.temp_allocator)
+	path, perr := _join(context.temp_allocator, e.pack_root, MANIFEST_PENDING_FILE)
+	if perr != .None {
+		return list
+	}
+	data, err := prim.read_file(e.vfs, path, context.temp_allocator)
+	if err != .None {
+		return list
+	}
+	r := prim.reader(data)
+	for prim.reader_remaining(&r) > 0 {
+		b := prim.read_bytes(&r)
+		if !prim.reader_ok(&r) {
+			break
+		}
+		append(&list, b)
+	}
+	return list
+}
+
+@(private)
+_manifest_pending_store :: proc(e: ^Engine, list: [][]u8) {
+	path, perr := _join(context.temp_allocator, e.pack_root, MANIFEST_PENDING_FILE)
+	if perr != .None {
+		return
+	}
+	if len(list) == 0 {
+		prim.remove(e.vfs, path)
+		return
+	}
+	buf := make([dynamic]u8, context.temp_allocator)
+	w := prim.writer(&buf)
+	for b in list {
+		prim.write_bytes(&w, b)
+	}
+	prim.replace_atomic(e.vfs, path, buf[:])
+}
+
+@(private)
+_manifest_pending_remove :: proc(e: ^Engine, entry: []u8) {
+	list := _manifest_pending_load(e)
+	for b, i in list {
+		if string(b) == string(entry) {
+			ordered_remove(&list, i)
+			_manifest_pending_store(e, list[:])
+			return
+		}
+	}
+}
+
+@(private)
+_manifest_issue :: proc(e: ^Engine, entry: []u8) {
+	for j in e.approvals.jobs {
+		if j.kind == .Manifest && string(j.entry) == string(entry) {
+			return
+		}
+	}
+	j := _job_new(e, .Manifest, {})
+	if j == nil {
+		return
+	}
+	j.subject = _job_str(j, e.account.subject)
+	j.entry = _job_bytes(j, entry)
+	if _job_start(j) != .Pending {
+		_job_free(j)
+	}
+}
+
+account_resume :: proc(e: ^Engine) {
+	context = context_for(e)
+	if !e.account.have || e.cfg.sealed_store.add == nil {
+		return
+	}
+	for b in _manifest_pending_load(e) {
+		_manifest_issue(e, b)
+	}
 }
 
 account_join_space :: proc(e: ^Engine, space: prim.Id) -> Error {
@@ -490,106 +466,92 @@ account_join_space :: proc(e: ^Engine, space: prim.Id) -> Error {
 	return .None
 }
 
-account_wrappers :: proc(e: ^Engine, allocator := context.allocator) -> (out: []Wrapper_Info, err: Error) {
+account_wrappers :: proc(e: ^Engine, allocator := context.allocator, done: Account_Done = {}) -> (out: []Wrapper_Info, err: Error) {
 	context = context_for(e)
-	if !e.account.have {
-		return nil, .Permission
+	j := _job_new(e, .Wrappers, done)
+	if j == nil {
+		return nil, .No_Memory
 	}
-	rec: osync.Account_Record
-	entries := make([dynamic][]u8, context.temp_allocator)
-	_store_get(e, e.account.subject, &rec, &entries) or_return
-	list := make([dynamic]Wrapper_Info, 0, len(rec.wrappers), allocator)
-	for &w in rec.wrappers {
+	err = _job_begin(j)
+	if err == .Pending {
+		return nil, .Pending
+	}
+	if err == .None {
+		out = wrappers_clone(j.res.wrappers, allocator)
+	}
+	_job_free(j)
+	return
+}
+
+wrappers_clone :: proc(list: []Wrapper_Info, allocator := context.allocator) -> []Wrapper_Info {
+	out := make([]Wrapper_Info, len(list), allocator)
+	for w, i in list {
 		c := make([]u8, len(w.credential), allocator)
 		copy(c, w.credential)
 		l, _ := _clone(w.label, allocator)
-		append(&list, Wrapper_Info{credential = c, label = l, ecosystem = w.ecosystem, added_by = osync.device_id(w.added_by), added_at = w.added_at})
+		out[i] = Wrapper_Info{credential = c, label = l, ecosystem = w.ecosystem, added_by = w.added_by, added_at = w.added_at}
 	}
-	return list[:], .None
+	return out
 }
 
 @(private)
-_with_account :: proc(e: ^Engine, fn: proc(e: ^Engine, rec: ^osync.Account_Record, a: ^osync.Account_Key, data: rawptr) -> Error, data: rawptr) -> Error {
-	if !e.account.have {
-		return .Permission
+_with_finish :: proc(j: ^Acct_Job) -> Error {
+	err := _job_begin(j)
+	if err != .Pending {
+		_job_free(j)
 	}
-	rec: osync.Account_Record
-	entries := make([dynamic][]u8, context.temp_allocator)
-	_store_get(e, e.account.subject, &rec, &entries) or_return
-	a: osync.Account_Key
-	defer osync.account_key_clear(&a)
-	_unlock_local(e, &rec, .Local, &a) or_return
-	prev := rec.seq
-	fn(e, &rec, &a, data) or_return
-	rec.seq = prev + 1
-	return _store_put(e, e.account.subject, &rec, &a, prev)
+	return err
 }
 
-account_wrapper_remove :: proc(e: ^Engine, credential: []u8) -> Error {
+account_wrapper_remove :: proc(e: ^Engine, credential: []u8, done: Account_Done = {}) -> Error {
 	context = context_for(e)
-	fn :: proc(e: ^Engine, rec: ^osync.Account_Record, a: ^osync.Account_Key, data: rawptr) -> Error {
-		c := (^[]u8)(data)
-		left := 0
-		for &w in rec.wrappers {
-			if w.ecosystem != .Recovery && string(w.credential) != string(c^) {
-				left += 1
-			}
-		}
-		if left == 0 {
-			return .Permission
-		}
-		return .None if osync.account_remove_wrapper(rec, c^) else .Not_Found
+	j := _job_new(e, .With, done)
+	if j == nil {
+		return .No_Memory
 	}
-	c := credential
-	return _with_account(e, fn, &c)
+	j.with = .Wrapper_Remove
+	j.credential = _job_bytes(j, credential)
+	return _with_finish(j)
 }
 
-account_recovery_key :: proc(e: ^Engine, allocator := context.allocator) -> (text: string, err: Error) {
+account_recovery_key :: proc(e: ^Engine, allocator := context.allocator, done: Account_Done = {}) -> (text: string, err: Error) {
 	context = context_for(e)
-	secret := osync.recovery_secret_new(e.cfg.random)
-	defer crypto.zero_explicit(&secret, size_of(secret))
-	fn :: proc(e: ^Engine, rec: ^osync.Account_Record, a: ^osync.Account_Key, data: rawptr) -> Error {
-		s := (^[osync.RECOVERY_SECRET_LEN]u8)(data)
-		return _serr(osync.account_add_recovery(rec, a, s^, e.identity.sign, _now_ms(e), e.cfg.random, context.temp_allocator))
+	j := _job_new(e, .With, done)
+	if j == nil {
+		return "", .No_Memory
 	}
-	_with_account(e, fn, &secret) or_return
-	return osync.recovery_encode(secret, allocator), .None
+	j.with = .Recovery_Key
+	j.secret = osync.recovery_secret_new(e.cfg.random)
+	err = _job_begin(j)
+	if err == .Pending {
+		return "", .Pending
+	}
+	if err == .None {
+		text, _ = _clone(j.res.text, allocator)
+	}
+	_job_free(j)
+	return
 }
 
-account_pool_set :: proc(e: ^Engine, access: osync.Pool_Access) -> Error {
+account_pool_set :: proc(e: ^Engine, access: osync.Pool_Access, done: Account_Done = {}) -> Error {
 	context = context_for(e)
-	fn :: proc(e: ^Engine, rec: ^osync.Account_Record, a: ^osync.Account_Key, data: rawptr) -> Error {
-		rec.pool = (^osync.Pool_Access)(data)^
-		if e.cfg.runner_pool.identity != nil {
-			id: osync.Identity
-			{
-				context = _outer(e)
-				id = e.cfg.runner_pool.identity(e.cfg.runner_pool.data)
-			}
-			rec.pool_sign = id.sign
-			rec.pool_box = id.box
-		}
-		e.account.pool_sign = rec.pool_sign
-		e.account.pool_box = rec.pool_box
-		return .None
+	j := _job_new(e, .With, done)
+	if j == nil {
+		return .No_Memory
 	}
-	acc := access
-	_with_account(e, fn, &acc) or_return
-	e.account.pool = access
-	_account_store(e)
-	for id in _sorted_keys(e.spaces) {
-		if !e.spaces[id].keyless {
-			space_pool_set(e, id, access != .Off)
-		}
-	}
-	return .None
+	j.with = .Pool_Set
+	j.access = access
+	return _with_finish(j)
 }
 
-space_pool_set :: proc(e: ^Engine, space: prim.Id, on: bool) -> Error {
+space_pool_set :: proc(e: ^Engine, space: prim.Id, on: bool, done: Account_Done = {}) -> Error {
 	context = context_for(e)
 	zero: osync.Public_Key
 	if e.account.pool_sign == zero && on {
-		account_pool_set(e, .Everything) or_return
+		if e.cfg.runner_pool.identity == nil {
+			return .Not_Found
+		}
+		return account_pool_set(e, .Everything, done)
 	}
 	if e.account.pool_sign == zero {
 		return .Not_Found
@@ -679,79 +641,47 @@ device_remove :: proc(e: ^Engine, device: prim.Id) -> (removed: int, err: Error)
 	return removed, .None
 }
 
-account_passkey_add :: proc(e: ^Engine, label: string) -> Error {
+account_passkey_add :: proc(e: ^Engine, label: string, done: Account_Done = {}) -> Error {
 	context = context_for(e)
-	fn :: proc(e: ^Engine, rec: ^osync.Account_Record, a: ^osync.Account_Key, data: rawptr) -> Error {
-		return _register_wrapper(e, rec, a, (^string)(data)^)
+	j := _job_new(e, .With, done)
+	if j == nil {
+		return .No_Memory
 	}
-	l := label
-	return _with_account(e, fn, &l)
+	j.with = .Passkey_Add
+	j.label = _job_str(j, label)
+	return _with_finish(j)
 }
 
-account_login_prf :: proc(e: ^Engine, subject: string, credential: []u8, prf: [32]u8, label: string, relay := "", relay_public: osync.Public_Key = {}) -> (res: Login_Result, err: Error) {
+account_login_prf :: proc(e: ^Engine, subject: string, credential: []u8, prf: [32]u8, label: string, relay := "", relay_public: osync.Public_Key = {}, done: Account_Done = {}) -> (res: Login_Result, err: Error) {
 	context = context_for(e)
-	p := prf
-	defer crypto.zero_explicit(&p, size_of(p))
-	rec: osync.Account_Record
-	entries := make([dynamic][]u8, context.temp_allocator)
-	gerr := _store_get(e, subject, &rec, &entries)
-	if gerr == .Not_Found {
-		a: osync.Account_Key
-		defer osync.account_key_clear(&a)
-		_serr(osync.account_key_new(&a, e.cfg.random)) or_return
-		osync.account_record_new(&rec, &a, relay, relay_public, context.temp_allocator)
-		if e.cfg.runner_pool.identity != nil {
-			id: osync.Identity
-			{
-				context = _outer(e)
-				id = e.cfg.runner_pool.identity(e.cfg.runner_pool.data)
-			}
-			rec.pool = .Everything
-			rec.pool_sign = id.sign
-			rec.pool_box = id.box
-		}
-		salt := osync.idp_salt(transmute([]u8)subject)
-		_serr(osync.account_add_wrapper(&rec, &a, credential, label, .Unknown, salt, p[:], e.identity.sign, _now_ms(e), context.temp_allocator)) or_return
-		_store_put(e, subject, &rec, &a, 0) or_return
-		res.path = .Created
-		res.spaces = _account_adopt(e, subject, &rec, nil, &a, .Created) or_return
-		return res, .None
+	j := _job_new(e, .Login_Prf, done)
+	if j == nil {
+		return res, .No_Memory
 	}
-	gerr or_return
-	a: osync.Account_Key
-	defer osync.account_key_clear(&a)
-	if oerr := osync.account_open_with(&rec, credential, p[:], &a, e.cfg.random); oerr != .None {
-		_approval_request(e, subject, &rec, label) or_return
-		res.path = .Approval
-		res.status = .Waiting
-		res.code = e.approvals.code
-		return res, .None
-	}
-	res.path = .Passkey
-	res.spaces = _account_adopt(e, subject, &rec, entries[:], &a, .Passkey) or_return
-	return res, .None
+	j.subject = _job_str(j, subject)
+	j.credential = _job_bytes(j, credential)
+	j.prf = prf
+	j.label = _job_str(j, label)
+	j.relay = _job_str(j, relay)
+	j.relay_public = relay_public
+	return _login_finish(j)
 }
 
 account_idp_salt :: proc(subject: string) -> [32]u8 {
 	return osync.idp_salt(transmute([]u8)subject)
 }
 
-Idp_Wrapper :: struct {
-	credential: []u8,
-	prf:        [32]u8,
-	label:      string,
-}
-
-account_passkey_add_prf :: proc(e: ^Engine, credential: []u8, prf: [32]u8, label: string) -> Error {
+account_passkey_add_prf :: proc(e: ^Engine, credential: []u8, prf: [32]u8, label: string, done: Account_Done = {}) -> Error {
 	context = context_for(e)
-	w := Idp_Wrapper{credential = credential, prf = prf, label = label}
-	defer crypto.zero_explicit(&w.prf, size_of(w.prf))
-	fn :: proc(e: ^Engine, rec: ^osync.Account_Record, a: ^osync.Account_Key, data: rawptr) -> Error {
-		x := (^Idp_Wrapper)(data)
-		salt := osync.idp_salt(transmute([]u8)e.account.subject)
-		return _serr(osync.account_add_wrapper(rec, a, x.credential, x.label, .Unknown, salt, x.prf[:], e.identity.sign, _now_ms(e), context.temp_allocator))
+	j := _job_new(e, .With, done)
+	if j == nil {
+		return .No_Memory
 	}
-	return _with_account(e, fn, &w)
+	j.with = .Passkey_Add_Prf
+	j.credential = _job_bytes(j, credential)
+	j.prf = prf
+	j.label = _job_str(j, label)
+	return _with_finish(j)
 }
 
 directory_add :: proc(e: ^Engine, space: prim.Id, person: osync.Identity, role: osync.Role = .Member, devices: []osync.Identity = nil) -> Error {

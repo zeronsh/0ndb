@@ -34,6 +34,7 @@ pub struct DaemonStatus {
     pub wakeups: u64,
     pub timeout_ms: i64,
     pub host_plugs: Vec<String>,
+    pub host_pending: u64,
     pub hosts: Vec<String>,
     pub links: Vec<Link>,
 }

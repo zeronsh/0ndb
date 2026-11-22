@@ -193,6 +193,9 @@ account with their history.
   row with a version column) is enough; records are at most 64 KiB and
   entries at most 4 MiB in all.
 - Sealed_Store host: a local process maps plug requests to those calls.
+  Requests are asynchronous: the daemon keeps serving everything else while
+  one waits for the backend, and several may be outstanding at once (the
+  Rust host runs each on its own thread with a `CancelToken`).
 
 ```rust
 struct WorkosStore { http: MyHttp, token: TokenSource }
@@ -249,9 +252,11 @@ let r = client.account_login(&workos_user_id, "MacBook", Some(relay), Some(relay
 
 `0ndb relay` authenticates devices with the space's member credentials; no
 plug is needed. A hosted relay that wants its own bearer (a WorkOS token per
-connection, say) uses the `credentials` plug: `available(space)` tells the
-daemon the host supplies credentials for that space and `produce(space,
-binding)` returns one credential bound to the relay's challenge.
+connection, say) uses the `credentials` plug: the host lists the spaces it
+supplies credentials for when it registers (`Credentials::spaces` in Rust),
+and `produce(space, binding)` returns one credential bound to the relay's
+challenge; the relay connection waits for it without holding anything else
+up.
 
 ## 6. Cloud runners through a runner pool
 
@@ -371,10 +376,6 @@ the subscription. `0ndb models` lists the providers installed on the device.
 
 ## 10. Current limits
 
-- A host plug request is synchronous inside the engine: while one is
-  outstanding the daemon only reads host replies, registrations and cancels,
-  so a slow or hung host delays other clients until the request's deadline
-  (15 s, 120 s for passkeys). Asynchronous plugs are in progress.
 - The daemon socket is local only; remote UIs drive a device through sync.
 - The Rust crate uses std sockets on Linux and macOS and the `uds_windows`
   crate for AF_UNIX on Windows; it passes `cargo clippy` for

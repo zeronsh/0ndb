@@ -31,8 +31,6 @@ ECOSYSTEM_NAMES := []string{"unknown", "apple", "google", "microsoft", "1passwor
 
 PLUG_VERSION :: u8(1)
 PLUG_NOTES_MAX :: 256
-PLUG_RBUF_MAX :: FRAME_MAX + 4096
-HOST_CONN_WBUF_MAX :: 2 * FRAME_MAX
 
 Plug_Fn :: struct {
 	code:      u16,
@@ -49,12 +47,9 @@ PLUG_STORE_PUT :: 2
 PLUG_STORE_ADD :: 3
 PLUG_UNLOCK :: 4
 PLUG_REGISTER :: 5
-PLUG_POOL_IDENTITY :: 6
 PLUG_POOL_VERIFY :: 7
 PLUG_POOL_ATTEST :: 8
-PLUG_USER_IDENTITY :: 9
 PLUG_USER_JOINED :: 10
-PLUG_CRED_AVAILABLE :: 11
 PLUG_CRED_PRODUCE :: 12
 
 PLUG_FNS := []Plug_Fn {
@@ -63,12 +58,9 @@ PLUG_FNS := []Plug_Fn {
 	{PLUG_STORE_ADD, "sealed_store.add", .Sealed_Store, 15_000, true, {{"subject", .Bytes, nil}, {"entry", .Bytes, nil}}, {}},
 	{PLUG_UNLOCK, "unlock.unlock", .Unlock, 120_000, true, {{"rp_user", .Bytes, nil}, {"credentials", .Strs, nil}, {"salts", .Strs, nil}, {"mode", .Enum, UNLOCK_MODE_NAMES}}, {{"credential", .Bytes, nil}, {"prf", .Bytes, nil}}},
 	{PLUG_REGISTER, "unlock.register", .Unlock, 120_000, true, {{"rp_user", .Bytes, nil}, {"label", .Str, nil}, {"salt", .Bytes, nil}}, {{"credential", .Bytes, nil}, {"prf", .Bytes, nil}, {"ecosystem", .Enum, ECOSYSTEM_NAMES}}},
-	{PLUG_POOL_IDENTITY, "runner_pool.identity", .Runner_Pool, 15_000, true, {}, {{"sign", .Bytes, nil}, {"box", .Bytes, nil}}},
 	{PLUG_POOL_VERIFY, "runner_pool.verify", .Runner_Pool, 15_000, true, {{"token", .Bytes, nil}, {"sign", .Bytes, nil}, {"box", .Bytes, nil}}, {{"lease_ms", .U64, nil}}},
 	{PLUG_POOL_ATTEST, "runner_pool.attest", .Runner_Pool, 15_000, true, {{"evidence", .Bytes, nil}, {"sign", .Bytes, nil}, {"box", .Bytes, nil}}, {}},
-	{PLUG_USER_IDENTITY, "pool_user.identity", .Pool_User, 15_000, true, {}, {{"sign", .Bytes, nil}, {"box", .Bytes, nil}}},
 	{PLUG_USER_JOINED, "pool_user.joined", .Pool_User, 0, false, {{"space", .Id, nil}, {"name", .Str, nil}, {"relay", .Str, nil}, {"relay_key", .Bytes, nil}, {"proof", .Bytes, nil}}, {}},
-	{PLUG_CRED_AVAILABLE, "credentials.available", .Credentials, 5_000, false, {{"space", .Id, nil}}, {{"available", .Bool, nil}}},
 	{PLUG_CRED_PRODUCE, "credentials.produce", .Credentials, 5_000, false, {{"space", .Id, nil}, {"binding", .Bytes, nil}}, {{"credential", .Bytes, nil}}},
 }
 
@@ -97,36 +89,43 @@ Plug_Note :: struct {
 	bin:  []u8,
 }
 
+Plug_Req :: struct {
+	d:       ^Daemon,
+	tag:     u64,
+	fn:      ^Plug_Fn,
+	done:    osync.Plug_Done,
+	json:    []u8,
+	bin:     []u8,
+	sent_to: ^Conn,
+	serial:  u64,
+	timer:   prim.Timer,
+}
+
 Host_Cred :: struct {
 	d:     ^Daemon,
 	space: prim.Id,
 }
 
 Host_Chan :: struct {
-	enabled:   Host_Plugs,
-	owner:     [Host_Plug]^Conn,
-	next_tag:  u64,
-	req_tag:   u64,
-	req_from:  ^Conn,
-	req_done:  bool,
-	req_st:    api.Status,
-	req_body:  [dynamic]u8,
-	req_json:  bool,
-	waiting:   bool,
-	current:   ^Conn,
-	cur_tag:   u64,
-	cancelled: bool,
-	failure:   api.Status,
-	notes:     [dynamic]Plug_Note,
-	creds:     map[prim.Id]^Host_Cred,
-	sweep:     prim.Timer,
+	enabled:  Host_Plugs,
+	owner:    [Host_Plug]^Conn,
+	next_tag: u64,
+	reqs:     [dynamic]^Plug_Req,
+	notes:    [dynamic]Plug_Note,
+	creds:    map[prim.Id]^Host_Cred,
+	identity: [Host_Plug]osync.Identity,
+	spaces:   [dynamic]prim.Id,
+	sweep:    prim.Timer,
+	dispatch: bool,
+	resume:   bool,
 }
 
 host_plugs_setup :: proc(d: ^Daemon, ec: ^eng.Config, args: ^Args) -> bool {
 	hc := &d.hc
-	hc.req_body = make([dynamic]u8)
+	hc.reqs = make([dynamic]^Plug_Req)
 	hc.notes = make([dynamic]Plug_Note)
 	hc.creds = make(map[prim.Id]^Host_Cred)
+	hc.spaces = make([dynamic]prim.Id)
 	spec := flag_string(args, "host-plugs")
 	if len(spec) == 0 {
 		return true
@@ -148,19 +147,19 @@ host_plugs_setup :: proc(d: ^Daemon, ec: ^eng.Config, args: ^Args) -> bool {
 		}
 	}
 	if .Sealed_Store in hc.enabled {
-		ec.sealed_store = osync.Sealed_Store{data = d, get = _hp_store_get, put = _hp_store_put, add = _hp_store_add}
+		ec.sealed_store = osync.Sealed_Store{data = d, get = _hp_store_get, put = _hp_store_put, add = _hp_store_add, cancel = _hp_cancel}
 	}
 	if .Unlock in hc.enabled {
-		ec.unlock = osync.Unlock{data = d, unlock = _hp_unlock, register = _hp_register}
+		ec.unlock = osync.Unlock{data = d, unlock = _hp_unlock, register = _hp_register, cancel = _hp_cancel}
 	}
 	if .Runner_Pool in hc.enabled && .Pool_User in hc.enabled {
 		return false
 	}
 	if .Runner_Pool in hc.enabled {
-		ec.runner_pool = eng.Runner_Pool{data = d, identity = _hp_pool_identity, verify = _hp_pool_verify, attest = _hp_pool_attest}
+		ec.runner_pool = eng.Runner_Pool{data = d, identity = _hp_pool_identity, verify = _hp_pool_verify, attest = _hp_pool_attest, cancel = _hp_cancel}
 	}
 	if .Pool_User in hc.enabled {
-		ec.runner_pool = eng.Runner_Pool{data = d, identity = _hp_user_identity, joined = _hp_user_joined}
+		ec.runner_pool = eng.Runner_Pool{data = d, identity = _hp_user_identity, joined = _hp_user_joined, cancel = _hp_cancel}
 	}
 	if .Credentials in hc.enabled {
 		ec.credentials = eng.Credentials_Source{data = d, produce = _hp_cred_source}
@@ -174,6 +173,11 @@ host_plugs_destroy :: proc(d: ^Daemon) {
 		prim.timer_cancel(&d.s.loop, hc.sweep)
 		hc.sweep = 0
 	}
+	for len(hc.reqs) > 0 {
+		r := hc.reqs[len(hc.reqs) - 1]
+		_req_finish(r, .Closed, nil)
+	}
+	delete(hc.reqs)
 	for n in hc.notes {
 		delete(n.json)
 		delete(n.bin)
@@ -183,7 +187,7 @@ host_plugs_destroy :: proc(d: ^Daemon) {
 		free(c)
 	}
 	delete(hc.creds)
-	delete(hc.req_body)
+	delete(hc.spaces)
 }
 
 host_release :: proc(d: ^Daemon, c: ^Conn) {
@@ -195,11 +199,10 @@ host_release :: proc(d: ^Daemon, c: ^Conn) {
 		}
 	}
 	c.plugs = {}
-	if hc.current == c {
-		hc.current = nil
-	}
-	if hc.req_from == c {
-		hc.req_from = nil
+	for r in hc.reqs {
+		if r.sent_to == c {
+			r.sent_to = nil
+		}
 	}
 }
 
@@ -221,6 +224,10 @@ host_registered :: proc(d: ^Daemon) -> Host_Plugs {
 		}
 	}
 	return set
+}
+
+host_pending :: proc(d: ^Daemon) -> int {
+	return len(d.hc.reqs)
 }
 
 op_host_register :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
@@ -247,6 +254,10 @@ op_host_register :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	if want - hc.enabled != {} {
 		return .Unsupported
 	}
+	ident := api.a_bytes(c, "identity")
+	if (.Runner_Pool in want || .Pool_User in want) && len(ident) != 64 {
+		return .Invalid
+	}
 	replace := api.a_bool(c, "replace")
 	for p in want {
 		if hc.owner[p] != nil && hc.owner[p] != conn && !hc.owner[p].dead && !replace {
@@ -264,6 +275,16 @@ op_host_register :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 			prev.plugs -= {p}
 		}
 		hc.owner[p] = conn
+		if p == .Runner_Pool || p == .Pool_User {
+			s, b: osync.Public_Key
+			copy(s[:], ident[:32])
+			copy(b[:], ident[32:])
+			hc.identity[p] = osync.identity_of(s, b)
+		}
+	}
+	if .Credentials in want {
+		clear(&hc.spaces)
+		append(&hc.spaces, ..api.a_ids(c, "spaces"))
 	}
 	conn.plugs = want
 	conn.host_json = c.json
@@ -276,10 +297,28 @@ op_host_register :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 		api.o_str(o, "", n)
 	}
 	api.o_end(o)
-	if .Pool_User in want {
-		_host_flush_notes(d)
-	}
+	hc.dispatch = true
+	hc.resume ||= .Sealed_Store in want
+	_host_schedule_sweep(d)
 	return .Ok
+}
+
+@(private)
+_host_dispatch :: proc(d: ^Daemon) {
+	hc := &d.hc
+	hc.dispatch = false
+	for r in hc.reqs {
+		if r.sent_to == nil {
+			if h := _host_owner(d, r.fn.plug); h != nil {
+				_req_send(r, h)
+			}
+		}
+	}
+	_host_flush_notes(d)
+	if hc.resume {
+		hc.resume = false
+		eng.account_resume(&d.s.e)
+	}
 }
 
 @(private)
@@ -345,9 +384,125 @@ _host_owner :: proc(d: ^Daemon, p: Host_Plug) -> ^Conn {
 }
 
 @(private)
+_req_send :: proc(r: ^Plug_Req, c: ^Conn) {
+	r.sent_to = c
+	r.serial = c.serial
+	_plug_write(c, .Plug, r.tag, r.json if c.host_json else r.bin)
+}
+
+@(private)
+_req_remove :: proc(r: ^Plug_Req) {
+	hc := &r.d.hc
+	for x, i in hc.reqs {
+		if x == r {
+			ordered_remove(&hc.reqs, i)
+			break
+		}
+	}
+	if r.timer != 0 {
+		prim.timer_cancel(&r.d.s.loop, r.timer)
+		r.timer = 0
+	}
+	if r.sent_to != nil && !r.sent_to.dead {
+		_plug_write(r.sent_to, .Plug_Cancel, r.tag, nil)
+	}
+}
+
+@(private)
+_req_free :: proc(r: ^Plug_Req) {
+	delete(r.json)
+	delete(r.bin)
+	free(r)
+}
+
+@(private)
+_req_finish :: proc(r: ^Plug_Req, err: osync.Error, reply: ^osync.Plug_Reply) {
+	_req_remove(r)
+	done := r.done
+	_req_free(r)
+	empty: osync.Plug_Reply
+	done.call(done.data, err, reply if reply != nil else &empty)
+}
+
+@(private)
+_plug_issue :: proc(d: ^Daemon, code: u16, fields: []Plug_Field, done: osync.Plug_Done) -> osync.Error {
+	hc := &d.hc
+	fn := _plug_fn(code)
+	h := _host_owner(d, fn.plug)
+	if h == nil && !fn.wait_host {
+		return .Closed
+	}
+	r := new(Plug_Req)
+	r.d = d
+	hc.next_tag += 1
+	r.tag = hc.next_tag
+	r.fn = fn
+	r.done = done
+	r.json = clone_bytes(_plug_encode(fn, fields, true))
+	r.bin = clone_bytes(_plug_encode(fn, fields, false))
+	r.timer = prim.timer(&d.s.loop, fn.timeout, r, _req_deadline)
+	append(&hc.reqs, r)
+	if h != nil {
+		_req_send(r, h)
+	}
+	return .Pending
+}
+
+@(private)
+_req_deadline :: proc(l: ^prim.Loop, data: rawptr) {
+	r := (^Plug_Req)(data)
+	r.timer = 0
+	_req_finish(r, .Timeout if r.sent_to != nil else .Closed, nil)
+}
+
+@(private)
+_hp_cancel :: proc(data: rawptr, done: osync.Plug_Done) {
+	d := (^Daemon)(data)
+	for r in d.hc.reqs {
+		if r.done.data == done.data {
+			_req_remove(r)
+			_req_free(r)
+			return
+		}
+	}
+}
+
+host_plug_reply :: proc(d: ^Daemon, c: ^Conn, p: []u8) {
+	if len(p) < 9 {
+		c.dead = true
+		return
+	}
+	tag := prim.get_u64le(p[:8])
+	r: ^Plug_Req
+	for x in d.hc.reqs {
+		if x.tag == tag && x.sent_to == c && x.serial == c.serial {
+			r = x
+			break
+		}
+	}
+	if r == nil {
+		return
+	}
+	r.sent_to = nil
+	st := api.Status(p[8]) if p[8] <= u8(max(api.Status)) else .Io
+	if st != .Ok {
+		_req_finish(r, _plug_err(st), nil)
+		return
+	}
+	out: api.Call
+	if !_plug_decode(r.fn, p[9:], c.host_json, &out) {
+		_req_finish(r, .Invalid, nil)
+		return
+	}
+	reply: osync.Plug_Reply
+	err := _plug_reply(r.fn, &out, &reply)
+	_req_finish(r, err, &reply)
+}
+
+@(private)
 _plug_decode :: proc(fn: ^Plug_Fn, body: []u8, json_form: bool, out: ^api.Call) -> bool {
 	out.op = new_clone(api.Op{fn.code, fn.name, fn.reply, "", nil}, context.temp_allocator)
-	op := out.op
+	out.json = json_form
 	if json_form {
 		if len(body) == 0 {
 			out.args.values = make([]api.Value, len(fn.reply), context.temp_allocator)
@@ -361,249 +516,63 @@ _plug_decode :: proc(fn: ^Plug_Fn, body: []u8, json_form: bool, out: ^api.Call) 
 		if !ok {
 			return false
 		}
-		out.json = true
-		return api.decode_json(op, ob, &out.args, context.temp_allocator)
+		return api.decode_json(out.op, ob, &out.args, context.temp_allocator)
 	}
 	r := prim.reader(body)
-	return api.decode_binary(op, &r, &out.args, context.temp_allocator)
+	return api.decode_binary(out.op, &r, &out.args, context.temp_allocator)
 }
 
 @(private)
-_plug_call :: proc(d: ^Daemon, code: u16, fields: []Plug_Field, out: ^api.Call) -> api.Status {
-	hc := &d.hc
-	fn := _plug_fn(code)
-	if hc.waiting {
-		return .Busy
-	}
-	jreq := _plug_encode(fn, fields, true)
-	breq := _plug_encode(fn, fields, false)
-	hc.next_tag += 1
-	tag := hc.next_tag
-	hc.req_tag = tag
-	hc.req_done = false
-	hc.req_from = nil
-	clear(&hc.req_body)
-	hc.waiting = true
-	defer {
-		hc.waiting = false
-		hc.req_tag = 0
-		hc.req_from = nil
-		_host_schedule_sweep(d)
-	}
-	deadline := prim.now_ms() + fn.timeout
-	sent_to: ^Conn
-	st := api.Status.Ok
-	for {
-		if hc.req_done {
-			st = hc.req_st
-			break
+_plug_reply :: proc(fn: ^Plug_Fn, out: ^api.Call, reply: ^osync.Plug_Reply) -> osync.Error {
+	switch fn.code {
+	case PLUG_STORE_GET:
+		reply.record = api.a_bytes(out, "record")
+		if len(reply.record) > 64 * 1024 {
+			return .Too_Large
 		}
-		h := _host_owner(d, fn.plug)
-		if sent_to != nil && (sent_to != h || sent_to.dead) {
-			if !sent_to.dead && h != sent_to {
-				_plug_write(sent_to, .Plug_Cancel, tag, nil)
+		list := make([dynamic][]u8, context.temp_allocator)
+		total := 0
+		for e in api.a_strs(out, "entries") {
+			raw := transmute([]u8)e
+			if out.json {
+				v, ok := hex_decode(e)
+				if !ok {
+					return .Corrupt
+				}
+				raw = v
 			}
-			sent_to = nil
-		}
-		if hc.cancelled || d.stopping {
-			st = .Cancelled
-			break
-		}
-		if h != nil && sent_to == nil {
-			_plug_write(h, .Plug, tag, jreq if h.host_json else breq)
-			sent_to = h
-			hc.req_from = h
-		}
-		if h == nil && !fn.wait_host {
-			st = .Offline
-			break
-		}
-		now := prim.now_ms()
-		if now >= deadline {
-			st = .Timeout if h != nil else .Offline
-			break
-		}
-		_host_wait(d, deadline - now)
-	}
-	if st != .Ok && sent_to != nil && !sent_to.dead && !hc.req_done {
-		_plug_write(sent_to, .Plug_Cancel, tag, nil)
-	}
-	if st != .Ok {
-		if hc.failure == .Ok && !hc.req_done {
-			hc.failure = st
-		}
-		return st
-	}
-	if !_plug_decode(fn, hc.req_body[:], hc.req_json, out) {
-		if hc.failure == .Ok {
-			hc.failure = .Bad_Request
-		}
-		return .Bad_Request
-	}
-	return .Ok
-}
-
-@(private)
-_host_wait :: proc(d: ^Daemon, timeout_ms: i64) {
-	items := make([dynamic]Poll_Item, context.temp_allocator)
-	conns := make([dynamic]^Conn, context.temp_allocator)
-	lidx, sidx := -1, -1
-	if d.lfd != NO_SOCK {
-		lidx = len(items)
-		append(&items, Poll_Item{fd = d.lfd})
-	}
-	if sfd, sok := signals_sock(&d.sig); sok {
-		sidx = len(items)
-		append(&items, Poll_Item{fd = sfd})
-	}
-	nfixed := len(items)
-	for c in d.conns {
-		if c.dead || c.fd == NO_SOCK {
-			continue
-		}
-		append(&items, Poll_Item{fd = c.fd, write = len(c.wbuf) > 0})
-		append(&conns, c)
-	}
-	if !sock_poll(items[:], timeout_ms) {
-		return
-	}
-	if lidx >= 0 && items[lidx].ready {
-		_host_accept(d)
-	}
-	if sidx >= 0 && items[sidx].ready {
-		for {
-			sig, ok := signals_read(&d.sig)
-			if !ok {
-				break
+			total += len(raw)
+			if total > 4 * 1024 * 1024 {
+				return .Too_Large
 			}
-			fmt.eprintfln("0ndb daemon: signal %d, shutting down", sig)
-			d.stopping = true
+			append(&list, raw)
 		}
-	}
-	for c, i in conns {
-		if items[nfixed + i].ready && !c.dead {
-			_host_scan(d, c)
+		reply.entries = list[:]
+	case PLUG_UNLOCK, PLUG_REGISTER:
+		cred := api.a_bytes(out, "credential")
+		p := api.a_bytes(out, "prf")
+		if len(cred) == 0 || len(cred) > 1024 || len(p) != 32 {
+			return .Invalid
 		}
-	}
-}
-
-@(private)
-_host_accept :: proc(d: ^Daemon) {
-	for {
-		cfd, aok := sock_accept(d.lfd)
-		if !aok {
-			break
-		}
-		if !peer_is_self(watch_fd(cfd)) {
-			sock_close(cfd)
-			continue
-		}
-		_conn_new(d, cfd)
-	}
-}
-
-@(private)
-_host_scan :: proc(d: ^Daemon, c: ^Conn) {
-	if len(c.wbuf) > 0 {
-		_conn_flush(c)
-	}
-	buf: [65536]u8
-	for !c.dead && len(c.rbuf) < PLUG_RBUF_MAX {
-		n, st := sock_read(c.fd, buf[:])
-		if st == .Again {
-			break
-		}
-		if st != .Ok {
-			c.dead = true
-			break
-		}
-		append(&c.rbuf, ..buf[:n])
-	}
-	if !c.sniffed {
-		if len(c.rbuf) < 5 || string(c.rbuf[:4]) != MAGIC {
-			return
-		}
-		if c.rbuf[4] != PROTO_VERSION {
-			_conn_version_mismatch(c)
-			return
-		}
-		remove_range(&c.rbuf, 0, 5)
-		c.sniffed = true
-	}
-	pos := 0
-	for !c.dead {
-		k, p, used, have, bad := frame_next(c.rbuf[pos:])
-		if bad {
-			c.dead = true
-			return
-		}
-		if !have {
-			break
-		}
-		take := false
-		#partial switch k {
-		case .Plug_Reply:
-			take = true
-			host_plug_reply(d, c, p)
-		case .Cancel:
-			if len(p) >= 8 && c == d.hc.current && prim.get_u64le(p[:8]) == d.hc.cur_tag {
-				d.hc.cancelled = true
-				take = true
+		reply.credential = cred
+		copy(reply.prf[:], p)
+		if fn.code == PLUG_REGISTER {
+			eco := api.a_int(out, "ecosystem")
+			if eco < 0 || eco > int(max(osync.Ecosystem)) {
+				return .Invalid
 			}
-		case .Call:
-			if len(p) >= 17 && _is_register(d, p[8] & 1 != 0, p[17:]) {
-				payload := make([]u8, len(p), context.temp_allocator)
-				copy(payload, p)
-				remove_range(&c.rbuf, pos, pos + used)
-				_conn_call(c, payload)
-				continue
-			}
+			reply.ecosystem = osync.Ecosystem(eco)
 		}
-		if take {
-			remove_range(&c.rbuf, pos, pos + used)
-		} else {
-			pos += used
+	case PLUG_POOL_VERIFY:
+		reply.lease_ms = api.a_u64(out, "lease_ms")
+	case PLUG_CRED_PRODUCE:
+		cred := api.a_bytes(out, "credential")
+		if len(cred) == 0 || len(cred) > osync.CREDENTIAL_MAX {
+			return .Auth
 		}
+		reply.credential = cred
 	}
-}
-
-@(private)
-_is_register :: proc(d: ^Daemon, json_form: bool, req: []u8) -> bool {
-	if json_form {
-		root, err := json.parse(req, json.DEFAULT_SPECIFICATION, true, context.temp_allocator)
-		if err != .None {
-			return false
-		}
-		ob, ok := root.(json.Object)
-		if !ok {
-			return false
-		}
-		name, nok := ob["op"].(json.String)
-		return nok && string(name) == "host.register"
-	}
-	r := prim.reader(req)
-	if prim.read_u8(&r) != api.VERSION {
-		return false
-	}
-	code := prim.read_uvarint(&r)
-	return prim.reader_ok(&r) && code == HOST_REGISTER_CODE
-}
-
-host_plug_reply :: proc(d: ^Daemon, c: ^Conn, p: []u8) {
-	hc := &d.hc
-	if len(p) < 9 {
-		c.dead = true
-		return
-	}
-	tag := prim.get_u64le(p[:8])
-	if !hc.waiting || tag != hc.req_tag || c != hc.req_from || hc.req_done {
-		return
-	}
-	hc.req_st = api.Status(p[8]) if p[8] <= u8(max(api.Status)) else .Io
-	clear(&hc.req_body)
-	append(&hc.req_body, ..p[9:])
-	hc.req_json = c.host_json
-	hc.req_done = true
+	return .None
 }
 
 @(private)
@@ -631,17 +600,12 @@ _host_sweep :: proc(l: ^prim.Loop, data: rawptr) {
 				break
 			}
 		}
-		if !live {
-			continue
-		}
-		if !c.dead && len(c.rbuf) > 0 {
-			if !_conn_process(c) {
-				continue
-			}
-		}
-		if c.dead {
+		if live && c.dead {
 			_conn_drop(c, true)
 		}
+	}
+	if d.hc.dispatch {
+		_host_dispatch(d)
 	}
 }
 
@@ -689,73 +653,26 @@ _plug_err :: proc(st: api.Status) -> osync.Error {
 }
 
 @(private)
-_hp_store_get :: proc(data: rawptr, subject: []u8, record: ^[dynamic]u8, entries: ^[dynamic][]u8) -> osync.Error {
-	d := (^Daemon)(data)
-	out: api.Call
-	st := _plug_call(d, PLUG_STORE_GET, {{"subject", subject}}, &out)
-	if st != .Ok {
-		return _plug_err(st)
-	}
-	rec := api.a_bytes(&out, "record")
-	if len(rec) > 64 * 1024 {
-		return .Too_Large
-	}
-	append(record, ..rec)
-	total := 0
-	for e in api.a_strs(&out, "entries") {
-		raw := transmute([]u8)e
-		if out.json {
-			v, ok := hex_decode(e)
-			if !ok {
-				return .Corrupt
-			}
-			raw = v
-		}
-		total += len(raw)
-		if total > 4 * 1024 * 1024 {
-			return .Too_Large
-		}
-		b := make([]u8, len(raw), context.temp_allocator)
-		copy(b, raw)
-		append(entries, b)
-	}
-	return .None
+_hp_store_get :: proc(data: rawptr, subject: []u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
+	return _plug_issue((^Daemon)(data), PLUG_STORE_GET, {{"subject", subject}}, done)
 }
 
 @(private)
-_hp_store_put :: proc(data: rawptr, subject: []u8, record: []u8, prev_seq: u64) -> osync.Error {
-	d := (^Daemon)(data)
+_hp_store_put :: proc(data: rawptr, subject: []u8, record: []u8, prev_seq: u64, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	rec: osync.Account_Record
 	if err := osync.account_record_decode(record, &rec, context.temp_allocator); err != .None {
 		return err
 	}
-	out: api.Call
-	return _plug_err(_plug_call(d, PLUG_STORE_PUT, {{"subject", subject}, {"record", record}, {"prev_seq", prev_seq}, {"seq", rec.seq}}, &out))
+	return _plug_issue((^Daemon)(data), PLUG_STORE_PUT, {{"subject", subject}, {"record", record}, {"prev_seq", prev_seq}, {"seq", rec.seq}}, done)
 }
 
 @(private)
-_hp_store_add :: proc(data: rawptr, subject: []u8, entry: []u8) -> osync.Error {
-	d := (^Daemon)(data)
-	out: api.Call
-	return _plug_err(_plug_call(d, PLUG_STORE_ADD, {{"subject", subject}, {"entry", entry}}, &out))
+_hp_store_add :: proc(data: rawptr, subject: []u8, entry: []u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
+	return _plug_issue((^Daemon)(data), PLUG_STORE_ADD, {{"subject", subject}, {"entry", entry}}, done)
 }
 
 @(private)
-_hp_prf :: proc(out: ^api.Call, credential: ^[dynamic]u8, prf: ^[32]u8) -> osync.Error {
-	cred := api.a_bytes(out, "credential")
-	p := api.a_bytes(out, "prf")
-	if len(cred) == 0 || len(cred) > 1024 || len(p) != 32 {
-		return .Invalid
-	}
-	append(credential, ..cred)
-	copy(prf[:], p)
-	return .None
-}
-
-@(private)
-_hp_unlock :: proc(data: rawptr, rp_user: []u8, options: []osync.Unlock_Option, mode: osync.Unlock_Mode, credential: ^[dynamic]u8, prf: ^[32]u8) -> osync.Error {
-	d := (^Daemon)(data)
-	out: api.Call
+_hp_unlock :: proc(data: rawptr, rp_user: []u8, options: []osync.Unlock_Option, mode: osync.Unlock_Mode, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	creds := make([][]u8, len(options), context.temp_allocator)
 	salts := make([][]u8, len(options), context.temp_allocator)
 	for opt, i in options {
@@ -765,75 +682,35 @@ _hp_unlock :: proc(data: rawptr, rp_user: []u8, options: []osync.Unlock_Option, 
 		copy(salt, x[:])
 		salts[i] = salt
 	}
-	st := _plug_call(d, PLUG_UNLOCK, {{"rp_user", rp_user}, {"credentials", creds}, {"salts", salts}, {"mode", Plug_Enum{u64(mode), UNLOCK_MODE_NAMES}}}, &out)
-	if st != .Ok {
-		return _plug_err(st)
-	}
-	return _hp_prf(&out, credential, prf)
+	return _plug_issue((^Daemon)(data), PLUG_UNLOCK, {{"rp_user", rp_user}, {"credentials", creds}, {"salts", salts}, {"mode", Plug_Enum{u64(mode), UNLOCK_MODE_NAMES}}}, done)
 }
 
 @(private)
-_hp_register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, credential: ^[dynamic]u8, prf: ^[32]u8, ecosystem: ^osync.Ecosystem) -> osync.Error {
-	d := (^Daemon)(data)
-	out: api.Call
+_hp_register :: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	s := salt
-	st := _plug_call(d, PLUG_REGISTER, {{"rp_user", rp_user}, {"label", label}, {"salt", s[:]}}, &out)
-	if st != .Ok {
-		return _plug_err(st)
-	}
-	eco := api.a_int(&out, "ecosystem")
-	if eco < 0 || eco > int(max(osync.Ecosystem)) {
-		return .Invalid
-	}
-	ecosystem^ = osync.Ecosystem(eco)
-	return _hp_prf(&out, credential, prf)
-}
-
-@(private)
-_hp_identity :: proc(d: ^Daemon, code: u16) -> osync.Identity {
-	out: api.Call
-	if _plug_call(d, code, {}, &out) != .Ok {
-		return {}
-	}
-	sign := api.a_bytes(&out, "sign")
-	box := api.a_bytes(&out, "box")
-	if len(sign) != 32 || len(box) != 32 {
-		return {}
-	}
-	s, b: osync.Public_Key
-	copy(s[:], sign)
-	copy(b[:], box)
-	return osync.identity_of(s, b)
+	return _plug_issue((^Daemon)(data), PLUG_REGISTER, {{"rp_user", rp_user}, {"label", label}, {"salt", s[:]}}, done)
 }
 
 @(private)
 _hp_pool_identity :: proc(data: rawptr) -> osync.Identity {
-	return _hp_identity((^Daemon)(data), PLUG_POOL_IDENTITY)
+	return (^Daemon)(data).hc.identity[.Runner_Pool]
 }
 
 @(private)
 _hp_user_identity :: proc(data: rawptr) -> osync.Identity {
-	return _hp_identity((^Daemon)(data), PLUG_USER_IDENTITY)
+	return (^Daemon)(data).hc.identity[.Pool_User]
 }
 
 @(private)
-_hp_pool_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity) -> (u64, osync.Error) {
-	d := (^Daemon)(data)
-	out: api.Call
+_hp_pool_verify :: proc(data: rawptr, token: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	r := runner
-	st := _plug_call(d, PLUG_POOL_VERIFY, {{"token", token}, {"sign", r.sign[:]}, {"box", r.box[:]}}, &out)
-	if st != .Ok {
-		return 0, .Auth if st == .Permission else _plug_err(st)
-	}
-	return api.a_u64(&out, "lease_ms"), .None
+	return _plug_issue((^Daemon)(data), PLUG_POOL_VERIFY, {{"token", token}, {"sign", r.sign[:]}, {"box", r.box[:]}}, done)
 }
 
 @(private)
-_hp_pool_attest :: proc(data: rawptr, evidence: []u8, runner: osync.Identity) -> osync.Error {
-	d := (^Daemon)(data)
-	out: api.Call
+_hp_pool_attest :: proc(data: rawptr, evidence: []u8, runner: osync.Identity, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	r := runner
-	return _plug_err(_plug_call(d, PLUG_POOL_ATTEST, {{"evidence", evidence}, {"sign", r.sign[:]}, {"box", r.box[:]}}, &out))
+	return _plug_issue((^Daemon)(data), PLUG_POOL_ATTEST, {{"evidence", evidence}, {"sign", r.sign[:]}, {"box", r.box[:]}}, done)
 }
 
 @(private)
@@ -863,8 +740,14 @@ _hp_cred_source :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, boo
 	if c, ok := _cred_produce(d, space); ok {
 		return c, true
 	}
-	out: api.Call
-	if _plug_call(d, PLUG_CRED_AVAILABLE, {{"space", space}}, &out) != .Ok || !api.a_bool(&out, "available") {
+	if _host_owner(d, .Credentials) == nil {
+		return {}, false
+	}
+	listed := false
+	for x in d.hc.spaces {
+		listed ||= x == space
+	}
+	if !listed {
 		return {}, false
 	}
 	hcred, have := d.hc.creds[space]
@@ -874,21 +757,21 @@ _hp_cred_source :: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, boo
 		hcred.space = space
 		d.hc.creds[space] = hcred
 	}
-	return osync.Credentials{data = hcred, produce = _hp_cred_produce}, true
+	return osync.Credentials{data = hcred, produce = _hp_cred_sync, begin = _hp_cred_begin, cancel = _hp_cred_cancel}, true
 }
 
 @(private)
-_hp_cred_produce :: proc(data: rawptr, binding: []u8, out_buf: ^[dynamic]u8) -> osync.Error {
+_hp_cred_sync :: proc(data: rawptr, binding: []u8, out_buf: ^[dynamic]u8) -> osync.Error {
+	return .Unsupported
+}
+
+@(private)
+_hp_cred_begin :: proc(data: rawptr, binding: []u8, reply: ^osync.Plug_Reply, done: osync.Plug_Done) -> osync.Error {
 	hcred := (^Host_Cred)(data)
-	out: api.Call
-	st := _plug_call(hcred.d, PLUG_CRED_PRODUCE, {{"space", hcred.space}, {"binding", binding}}, &out)
-	if st != .Ok {
-		return .Auth
-	}
-	cred := api.a_bytes(&out, "credential")
-	if len(cred) == 0 || len(cred) > osync.CREDENTIAL_MAX {
-		return .Auth
-	}
-	append(out_buf, ..cred)
-	return .None
+	return _plug_issue(hcred.d, PLUG_CRED_PRODUCE, {{"space", hcred.space}, {"binding", binding}}, done)
+}
+
+@(private)
+_hp_cred_cancel :: proc(data: rawptr, done: osync.Plug_Done) {
+	_hp_cancel((^Host_Cred)(data).d, done)
 }

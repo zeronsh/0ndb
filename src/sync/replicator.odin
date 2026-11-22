@@ -115,6 +115,13 @@ Phase :: enum u8 {
 	Handshake,
 	Hello,
 	Ready,
+	Credential,
+}
+
+@(private)
+Cred_Req :: struct {
+	r:   ^Replicator,
+	gen: u64,
 }
 
 Local :: struct {
@@ -230,6 +237,8 @@ Replicator :: struct {
 	read_bytes: i64,
 	tamper_run: int,
 	phase:      Phase,
+	cred_gen:   u64,
+	cred_req:   ^Cred_Req,
 	fd:         prim.Fd,
 	watch:      prim.Watch,
 	timer:      prim.Timer,

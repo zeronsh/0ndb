@@ -127,7 +127,7 @@ HOST_OPS := []api.Op {
 	{1006, "credentials.add", {{"space", .Id, nil}, {"token", .Bytes, nil}}, "", op_credentials_add},
 	{1007, "verify", {{"root", .Str, nil}}, "files:uvarint mismatches:[str]", op_verify},
 	{1008, "pool.token", {}, "token:str", op_pool_token},
-	{HOST_REGISTER_CODE, "host.register", {{"plugs", .Strs, nil}, {"replace", .Bool, nil}}, "plugs:[str]", op_host_register},
+	{HOST_REGISTER_CODE, "host.register", {{"plugs", .Strs, nil}, {"replace", .Bool, nil}, {"identity", .Bytes, nil}, {"spaces", .Ids, nil}}, "plugs:[str]", op_host_register},
 }
 
 daemon_main :: proc(args: ^Args) -> int {
@@ -328,7 +328,6 @@ _conn_version_mismatch :: proc(c: ^Conn) {
 @(private)
 _conn_call :: proc(c: ^Conn, payload: []u8) {
 	d := c.d
-	hc := &d.hc
 	tag := prim.get_u64le(payload[:8])
 	json_form := payload[8] & 1 != 0
 	timeout := i64(prim.get_u64le(payload[9:17]))
@@ -336,27 +335,13 @@ _conn_call :: proc(c: ^Conn, payload: []u8) {
 	pc.conn = c
 	pc.tag = tag
 	pc.json = json_form
-	prev_c, prev_t, prev_x, prev_f := hc.current, hc.cur_tag, hc.cancelled, hc.failure
-	hc.current, hc.cur_tag, hc.cancelled, hc.failure = c, tag, false, .Ok
 	id, st, out := api.call(&d.s.a, payload[17:], json_form, _on_call_done, pc, timeout, context.temp_allocator)
-	cancelled, failure := hc.cancelled, hc.failure
-	hc.current, hc.cur_tag, hc.cancelled, hc.failure = prev_c, prev_t, prev_x, prev_f
 	if st == .Pending {
 		pc.id = id
 		append(&c.calls, pc)
-		if cancelled {
-			_call_cancel(c, tag)
-		}
 		return
 	}
 	free(pc)
-	if cancelled {
-		st = .Cancelled
-		out = nil
-	} else if st != .Ok && failure != .Ok {
-		st = failure
-		out = nil
-	}
 	if out == nil && st != .Ok {
 		out = _status_payload(st, json_form)
 	}
@@ -1050,6 +1035,7 @@ op_daemon_status :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 		api.o_str(o, "", n)
 	}
 	api.o_end(o)
+	api.o_int(o, "host_pending", host_pending(d))
 	registered := host_plug_names(host_registered(d))
 	api.o_arr(o, "hosts", len(registered))
 	for n in registered {

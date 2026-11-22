@@ -78,17 +78,33 @@ Unlock_Mode :: enum u8 {
 	Cross_Device,
 }
 
+Plug_Reply :: struct {
+	record:     []u8,
+	entries:    [][]u8,
+	credential: []u8,
+	prf:        [32]u8,
+	ecosystem:  Ecosystem,
+	lease_ms:   u64,
+}
+
+Plug_Done :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, err: Error, reply: ^Plug_Reply),
+}
+
 Unlock :: struct {
 	data:     rawptr,
-	unlock:   proc(data: rawptr, rp_user: []u8, options: []Unlock_Option, mode: Unlock_Mode, credential: ^[dynamic]u8, prf: ^[32]u8) -> Error,
-	register: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, credential: ^[dynamic]u8, prf: ^[32]u8, ecosystem: ^Ecosystem) -> Error,
+	unlock:   proc(data: rawptr, rp_user: []u8, options: []Unlock_Option, mode: Unlock_Mode, reply: ^Plug_Reply, done: Plug_Done) -> Error,
+	register: proc(data: rawptr, rp_user: []u8, label: string, salt: [32]u8, reply: ^Plug_Reply, done: Plug_Done) -> Error,
+	cancel:   proc(data: rawptr, done: Plug_Done),
 }
 
 Sealed_Store :: struct {
-	data: rawptr,
-	get:  proc(data: rawptr, subject: []u8, record: ^[dynamic]u8, entries: ^[dynamic][]u8) -> Error,
-	put:  proc(data: rawptr, subject: []u8, record: []u8, prev_seq: u64) -> Error,
-	add:  proc(data: rawptr, subject: []u8, entry: []u8) -> Error,
+	data:   rawptr,
+	get:    proc(data: rawptr, subject: []u8, reply: ^Plug_Reply, done: Plug_Done) -> Error,
+	put:    proc(data: rawptr, subject: []u8, record: []u8, prev_seq: u64, reply: ^Plug_Reply, done: Plug_Done) -> Error,
+	add:    proc(data: rawptr, subject: []u8, entry: []u8, reply: ^Plug_Reply, done: Plug_Done) -> Error,
+	cancel: proc(data: rawptr, done: Plug_Done),
 }
 
 Account_Key :: struct {
