@@ -14,6 +14,7 @@ Tail :: struct {
 	head_status: Seal_Status,
 	queued:      int,
 	waiting:     int,
+	held:        int,
 	intents:     int,
 	running:     bool,
 	awaiting:    bool,
@@ -93,6 +94,7 @@ Intent :: struct {
 	tasks:       []prim.Id,
 	condition:   Condition,
 	deadline:    prim.Hlc,
+	key:         string,
 	expr:        string,
 }
 
@@ -255,6 +257,8 @@ view_tail :: proc(v: ^obj.View, self: prim.Id = {}, allocator := context.allocat
 			t.queued += 1
 		case .Await:
 			t.waiting += 1
+		case .Hold:
+			t.held += 1
 		}
 	}
 	if e := _virtual(v, &t); e == .Missing {
@@ -298,6 +302,8 @@ derive_status :: proc "contextless" (t: ^Tail) -> Status {
 		return .Queued
 	case t.waiting > 0:
 		return .Waiting
+	case t.held > 0:
+		return .Held
 	case t.revive:
 		return .Reviving
 	case t.head_status == .Failed:
@@ -875,6 +881,9 @@ intents :: proc(v: ^obj.View, allocator := context.allocator) -> (items: []Inten
 			if t, e := obj.resolve(v, p.latest.seg, r.request); e == .None {
 				it.target = obj.rid(v, t) or_return
 			}
+		case Hold:
+			it.key = obj.clone_str(r.key, allocator) or_return
+			it.text = obj.clone_str(r.reason, allocator) or_return
 		case Await:
 			it.condition = r.condition
 			it.deadline = r.deadline

@@ -11,6 +11,12 @@ Spawn_Mount :: struct {
 	share: bool,
 }
 
+Isolate :: enum u8 {
+	Unset,
+	Yes,
+	No,
+}
+
 Spawn_Args :: struct {
 	goal:      string,
 	title:     string,
@@ -22,6 +28,7 @@ Spawn_Args :: struct {
 	mounts:    []Spawn_Mount,
 	budget:    Budget,
 	runner:    prim.Id,
+	isolate:   Isolate,
 }
 
 Send_Mode :: enum u8 {
@@ -106,6 +113,9 @@ task_spawn :: proc(r: ^Runtime, caller: Object, args: Spawn_Args, data: rawptr, 
 	}
 	if !prim.id_is_zero(args.runner) {
 		jw_kstr(&b, "runner", hex(args.runner))
+	}
+	if args.isolate != .Unset {
+		jw_kbool(&b, "isolate", args.isolate == .Yes)
 	}
 	append(&b, '}')
 	_api_call(r, caller, .Spawn, b[:], data, done)

@@ -560,9 +560,16 @@ equal in both directions.
   else copy); plain folders get a reflink clone. Only paths that can differ
   are rewritten. **Land**: sync both ways, CRDT merge; overlapping concurrent
   regions are stored as conflicts in the fork and shown with markers there
-  only; land refuses while any remain. (planned) A fork's live diff against its
-  parent line is a subscribable view (`subscribe.fork_diff`), pushed on
-  ingestion.
+  only; land refuses while any remain. A fork's live diff against its parent
+  line is a subscribable view (`subscribe.fork_diff`), pushed on ingestion.
+  Its fork side is the task's run line while a run is open, its conversation
+  line otherwise. A file is listed when its presence, path or text differs
+  between the two versions. Each push looks only at the files touched by the
+  ops that entered or left either side since the last push. Whole-tree
+  snapshots are built only when those ops change the tree's structure
+  (create, move, remove, flags, target) or a side lost ops. A frame goes out
+  only when the listed result changed, so an idle fork costs nothing.
+  `task.changes` reads the same view once.
 - **Blame** is a span lookup. **Revert** of a scope creates ops that undo
   exactly that scope's ops, transformed through everything since; (planned) a
   set revert does the same for a set of scopes (undo, conversation branch
@@ -919,6 +926,13 @@ running on it is a record in it.
   `Cancel`, `Interrupt`, `Answer` (permissions and questions), `Assign`.
   There is no command stream; another device's intent is a record in the
   conversation it targets.
+- Holds: `Hold{key, reason}` is an intent that stays pending until an
+  `Unqueue` with outcome `released`. A Hold replaces any pending Hold with
+  the same key, and releasing key `*` releases all of them. While one is
+  pending and nothing runs, is queued or waits, the conversation's status is
+  `held`, which the catalog carries like any other status. The key is
+  opaque: `land` for an isolated task's land conflicts, `line:<mount>` and
+  `undo` for held lines and rewinds.
 - Runs: `Claim{msg, runner, lease, lines}` when a runner starts, `Unqueue`
   for what it consumed, `Seal` when done, `Superseded` when a reassignment
   made a duplicate. Each run writes its own lines of every mounted tree and
@@ -1036,11 +1050,20 @@ report by sealing results that the captain's runs see.
 - **Shared by default** (planned). A task mounts its parent's lines in the
   same directory and writes on them live, attributed per scope, with
   concurrent overlaps as reported conflict regions (fs, Shared writers).
-  **Isolated** is opt-in per spawn or agent profile (`isolate: true`, planned;
-  today every task is isolated): mounts forked from the parent's lines, landed
-  on completion, conflicts kept in the fork and land refused while any remain;
-  its live diff against the parent is `subscribe.fork_diff` (planned). A
-  task's merge is an ordinary change on the parent's line.
+  **Isolated** is opt-in per spawn or agent profile (`isolate: true` on
+  `spawn`, or `options.isolate` on the agent; the spawn argument wins). Until
+  sharing lands, a task that sets neither works on forks that land only
+  through `merge`, and `isolate: false` works on the parent's lines. An
+  isolated task's mounts are forked from the parent's lines and run in the
+  task's own directory. Every turn that completes lands them into the
+  parent's lines: its open run line if it has one, else its conversation
+  line. Overlapping edits stay in the fork as diff3 markers, and nothing
+  lands while any remain. The task is then held: a `Hold{key: land}` intent
+  gives it catalog status `held`, and `task.status` and `result` list the
+  paths. `merge` refuses while it is held. The next completed turn lands once
+  the markers are gone, and releases the hold. Its live diff against the
+  parent is `subscribe.fork_diff`. A task's merge is an ordinary change on
+  the parent's line.
 - (planned) A second top-level conversation in a folder on the same line simply
   shares it. One bound to another line of that folder waits (`waiting:
   <folder> is on <branch>`) and starts when the folder returns to its line;

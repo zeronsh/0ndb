@@ -57,6 +57,7 @@ Kind :: enum u8 {
 	Spine       = 42,
 	Files       = 43,
 	Redact_Msg  = 44,
+	Hold        = 45,
 }
 
 Role :: enum u8 {
@@ -109,6 +110,7 @@ Outcome :: enum u8 {
 	Edited    = 5,
 	Applied   = 6,
 	Rejected  = 7,
+	Released  = 8,
 }
 
 Scope_Kind :: enum u8 {
@@ -130,6 +132,7 @@ Status :: enum u8 {
 	Interrupted         = 5,
 	Waiting             = 6,
 	Reviving            = 7,
+	Held                = 8,
 }
 
 Receipt :: enum u8 {

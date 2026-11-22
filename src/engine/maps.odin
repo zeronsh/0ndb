@@ -298,6 +298,13 @@ _catalog_behind :: proc(e: ^Engine, sp: ^Space, h: ^Handle, fresh: bool) -> bool
 	return false
 }
 
+catalog_status_changed :: proc(e: ^Engine, o: Object) {
+	context = context_for(e)
+	if u := _catalog_q(e, o.space, o.id, .Conversation); u != nil {
+		u.status = true
+	}
+}
+
 catalog_usage :: proc(e: ^Engine, o: Object, usage: convo.Usage) {
 	context = context_for(e)
 	u := _catalog_q(e, o.space, o.id, .Conversation)

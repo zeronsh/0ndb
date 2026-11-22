@@ -477,6 +477,36 @@ writer_await :: proc(w: ^Writer, tasks: []prim.Id, condition: Condition, deadlin
 	return _intent(w, Await{tasks = tasks, condition = condition, deadline = deadline, expr = expr})
 }
 
+writer_hold :: proc(w: ^Writer, v: ^obj.View, key: string, reason: string) -> (item: Rid, err: Error) {
+	if len(key) == 0 || key == HOLD_ALL {
+		return {}, .Invalid
+	}
+	writer_release(w, v, key) or_return
+	return _intent(w, Hold{key = key, reason = reason})
+}
+
+writer_release :: proc(w: ^Writer, v: ^obj.View, key: string) -> (released: int, err: Error) {
+	items := intents(v, context.temp_allocator) or_return
+	for it in items {
+		if it.kind == .Hold && (key == HOLD_ALL || it.key == key) {
+			writer_unqueue(w, it.item, .Released) or_return
+			released += 1
+		}
+	}
+	return released, .None
+}
+
+holds :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Intent, err: Error) {
+	items := intents(v, allocator) or_return
+	list := make([dynamic]Intent, 0, len(items), allocator)
+	for it in items {
+		if it.kind == .Hold {
+			append(&list, it)
+		}
+	}
+	return list[:], .None
+}
+
 writer_edit_queued :: proc(w: ^Writer, item: Rid, text: string, attachments: []Attachment = nil) -> (off: i64, err: Error) {
 	_check_atts(attachments) or_return
 	_prepare(w, false) or_return

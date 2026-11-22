@@ -39,6 +39,7 @@ RUNTIME_OPS := []Op {
 	{139, "placement", {OBJ}, "Placement", op_placement},
 	{162, "runners", {SPACE, OBJ}, "Runners", op_runners},
 	{163, "subscribe.runners", {SPACE, OBJ}, "Runners", nil},
+	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
 }
 
 @(private)
@@ -287,6 +288,12 @@ op_task_status :: proc(c: ^Call, o: ^Out) -> Status {
 	o_str(o, "reason", t.reason)
 	o_u64(o, "budget_tokens", t.budget.tokens)
 	o_f64(o, "budget_usd", t.budget.usd)
+	o_enum(o, "isolate", u64(t.isolate), ISOLATE_NAMES[:])
+	o_arr(o, "conflicts", len(t.conflicts))
+	for x in t.conflicts {
+		o_str(o, "", x)
+	}
+	o_end(o)
 	return .Ok
 }
 
@@ -333,6 +340,11 @@ op_task_changes :: proc(c: ^Call, o: ^Out) -> Status {
 		}
 	}
 	list, diff := rt.task_changes(r, caller, ob, a_bool(c, "diff"), a_int(c, "max_chars", 200_000))
+	emit_changes(o, list, diff)
+	return .Ok
+}
+
+emit_changes :: proc(o: ^Out, list: []rt.File_Change, diff: string) {
 	o_arr(o, "changes", len(list))
 	for ch in list {
 		o_obj(o, "")
@@ -343,7 +355,6 @@ op_task_changes :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	o_end(o)
 	o_str(o, "diff", diff)
-	return .Ok
 }
 
 op_schedule_create :: proc(c: ^Call, o: ^Out) -> Status {
