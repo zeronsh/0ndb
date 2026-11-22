@@ -40,6 +40,10 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	if _follow_stale(r, o, v, &c) {
 		return
 	}
+	if r.quiesce.on && run_find(r, o) == nil {
+		_quiesce_hold(r, o)
+		return
+	}
 	if _revive_pending(r, o, v) {
 		return
 	}
@@ -1019,7 +1023,7 @@ _recover :: proc(r: ^Runtime, space: prim.Id) {
 		}
 		convo.writer_interrupt_open(w, now)
 		eng.touched(r.e, ent.object)
-		if _replicated(r, ent.object.space) && _follow_start(r, ent.object) {
+		if r.quiesce.on || (_replicated(r, ent.object.space) && _follow_start(r, ent.object)) {
 			append(&r.revives, Revive_Wait{object = ent.object})
 			continue
 		}

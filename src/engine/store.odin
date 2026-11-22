@@ -516,6 +516,9 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	delete(b.marks)
 	delete(b.drafts)
 	free(b, e.allocator)
+	if len(e.settles) > 0 {
+		_touch(e)
+	}
 }
 
 @(private)

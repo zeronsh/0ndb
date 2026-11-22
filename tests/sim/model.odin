@@ -63,6 +63,8 @@ Op_Kind :: enum u8 {
 	Promote,
 	Read_Live,
 	Stream,
+	Run_Queue,
+	Quiesce,
 }
 
 M_Space :: struct {

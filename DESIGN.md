@@ -1851,4 +1851,4 @@ The reference consumer, assembled from the default plug implementations:
 members | remove | rotate | recovery-key | pool | pair | join | status | ls |
 new | send | queue | steer | edit | switch | back | log | show | search |
 interrupt | models | agent | task | workspace | mount | schedule | blame |
-revert | land | share | redact | verify`.
+revert | land | share | redact | verify | quiesce`.
