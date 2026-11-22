@@ -1111,11 +1111,17 @@ open_gen :: proc(s: ^Shadow) -> Error {
 	if err != .None {
 		return from_prim(err)
 	}
-	s.log_fd = fd
 	size, serr := prim.file_size(s.vfs, fd)
 	if serr != .None {
+		prim.close_file(s.vfs, fd)
 		return from_prim(serr)
 	}
+	if size < SHADOW_LOG_HEADER {
+		prim.close_file(s.vfs, fd)
+		prim.remove(s.vfs, idx_path)
+		return create_files(s, SHADOW_MIN_CAP, Entry{inode = fstree.ROOT, kind = .Dir})
+	}
+	s.log_fd = fd
 	hdr: [SHADOW_LOG_HEADER]u8
 	got, rerr := prim.read_at(s.vfs, fd, hdr[:], 0)
 	if rerr != .None {
@@ -1145,16 +1151,15 @@ create_files :: proc(s: ^Shadow, capacity: u64, root: Entry) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	log_path := gen_path(s.dir, s.gen, "log", context.temp_allocator)
 	idx_path := gen_path(s.dir, s.gen, "idx", context.temp_allocator)
-	fd, oerr := prim.open_file(s.vfs, log_path, {.Write, .Create, .Truncate}, 0o600)
+	hdr: [SHADOW_LOG_HEADER]u8
+	prim.put_u64le(hdr[0:8], SHADOW_MAGIC)
+	hdr[8] = u8(s.oid_size)
+	from_prim(prim.replace_atomic(s.vfs, log_path, hdr[:])) or_return
+	fd, oerr := prim.open_file(s.vfs, log_path, {.Write}, 0o600)
 	if oerr != .None {
 		return from_prim(oerr)
 	}
 	s.log_fd = fd
-	hdr: [SHADOW_LOG_HEADER]u8
-	prim.put_u64le(hdr[0:8], SHADOW_MAGIC)
-	hdr[8] = u8(s.oid_size)
-	from_prim(prim.write_at(s.vfs, fd, hdr[:], 0)) or_return
-	from_prim(prim.datasync(s.vfs, fd)) or_return
 	s.log_end = SHADOW_LOG_HEADER
 	ifd, ierr := prim.open_file(s.vfs, idx_path, {.Write, .Create, .Truncate}, 0o600)
 	if ierr != .None {
