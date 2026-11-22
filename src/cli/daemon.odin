@@ -807,6 +807,9 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		fmt.eprintfln("0ndb daemon: device %s served bytes of %s that failed verification", hex(ev.device), hex(ev.object))
 	case .Space_Left:
 		fmt.eprintfln("0ndb daemon: left space %s; its local copies are erased", hex(ev.space))
+	case .Line_Switched:
+		from, to := eng.line_switch_parts(ev)
+		fmt.eprintfln("0ndb daemon: tree %s moved from line %s to %s", hex(ev.object), from, to)
 	}
 	_broadcast_event(d, ev, {}, {})
 }

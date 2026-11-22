@@ -85,6 +85,7 @@ M_Obj :: struct {
 	op:       int,
 	removed:  map[string]bool,
 	shared:   [dynamic]int,
+	lines:    [dynamic]string,
 }
 
 M_Op :: struct {
@@ -111,6 +112,7 @@ M_Op :: struct {
 	overwrite: bool,
 	gens:    [dynamic]string,
 	power_crash: bool,
+	line:    string,
 }
 
 Model :: struct {
@@ -217,6 +219,9 @@ new_op :: proc(m: ^Model, kind: Op_Kind, n: ^Node, obj: int) -> ^M_Op {
 	op.tokens = make([dynamic]string, a)
 	op.deletes = make([dynamic]string, a)
 	op.gens = make([dynamic]string, a)
+	if obj >= 0 && obj < len(m.objs) && m.objs[obj].kind == .Tree && n.e_open {
+		op.line = strings.clone(line_norm(eng.tree_line(&n.e, m.objs[obj].o)), a)
+	}
 	append(&m.ops, op)
 	m.w.stats.ops += 1
 	return op
@@ -526,4 +531,37 @@ _model_hooks :: proc "contextless" () {
 	register_restarted(20, proc(w: ^World, n: ^Node) {
 		model_after_restart(&w.model, n)
 	})
+}
+
+line_norm :: proc(line: string) -> string {
+	return "" if line == "main" else line
+}
+
+line_eng :: proc(line: string) -> string {
+	return "main" if line == "" else line
+}
+
+obj_add_line :: proc(m: ^Model, oi: int, line: string) {
+	if line == "" {
+		return
+	}
+	ob := &m.objs[oi]
+	for l in ob.lines {
+		if l == line {
+			return
+		}
+	}
+	if ob.lines == nil {
+		ob.lines = make([dynamic]string, m.w.allocator)
+	}
+	append(&ob.lines, strings.clone(line, m.w.allocator))
+}
+
+obj_lines :: proc(m: ^Model, oi: int) -> []string {
+	out := make([dynamic]string, context.temp_allocator)
+	append(&out, "")
+	for l in m.objs[oi].lines {
+		append(&out, l)
+	}
+	return out[:]
 }

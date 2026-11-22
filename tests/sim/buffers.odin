@@ -34,6 +34,7 @@ Sim_Buffer :: struct {
 	inbox:   [dynamic]Buf_In,
 	groups:  [dynamic]string,
 	dead:    bool,
+	line:    string,
 }
 
 Sim_Anchor :: struct {
@@ -202,6 +203,7 @@ _new_buffer :: proc(w: ^World, n: ^Node, oi: int, path: string, utf16: bool) -> 
 _keep :: proc(w: ^World, b: ^Sim_Buffer, info: ^eng.Buffer_Info) {
 	b.id = info.id
 	b.actor = info.actor
+	b.line = strings.clone(line_norm(info.line), w.allocator)
 	append(&b.doc, ..info.page)
 	if w.bufs == nil {
 		w.bufs = make([dynamic]^Sim_Buffer, w.allocator)
@@ -279,6 +281,7 @@ _type :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer) {
 	}
 	op := new_op(m, .Buffer_Type, n, b.oi)
 	op.actor = b.actor
+	op.line = b.line
 	op.path = strings.clone(b.path, w.allocator)
 	tok := new_token(m, n, "b")
 	append(&op.tokens, tok)
@@ -303,6 +306,7 @@ _delete :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer) {
 	t := toks[rng_int(&w.rng, len(toks))]
 	op := new_op(m, .Buffer_Delete, n, b.oi)
 	op.actor = b.actor
+	op.line = b.line
 	op.path = strings.clone(b.path, w.allocator)
 	append(&op.deletes, strings.clone(t.text, w.allocator))
 	w.buf_group += 1
@@ -328,6 +332,7 @@ _undo :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer) {
 	tok := pop(&b.groups)
 	op := new_op(&w.model, .Buffer_Undo, n, b.oi)
 	op.actor = b.actor
+	op.line = b.line
 	op.path = strings.clone(b.path, w.allocator)
 	append(&op.deletes, strings.clone(tok, w.allocator))
 	context = instance_context(&n.inst)
