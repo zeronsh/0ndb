@@ -1037,6 +1037,9 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 	}
 	m.timer = prim.timer(m.reg.loop, delay_ms, m, proc(l: ^prim.Loop, data: rawptr) {
 		mm := (^Mount)(data)
+		if mm.gate_on {
+			return
+		}
 		if mm.reg.on_ready != nil {
 			mm.reg.on_ready(mm, mm.reg.ready_data)
 		} else {

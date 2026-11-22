@@ -130,8 +130,8 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 		return
 	}
 	if !held {
-		mount_ungate(m)
 		m.lock_stale = false
+		_gate_lift(m)
 		return
 	}
 	if m.gate_on {
@@ -193,8 +193,17 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 		}
 	}
 	if len(m.gate_watches) == 0 {
-		mount_ungate(m)
+		_gate_lift(m)
 	}
+}
+
+@(private)
+_gate_lift :: proc(m: ^Mount) {
+	if !m.gate_on {
+		return
+	}
+	mount_ungate(m)
+	mount_schedule(m, m.opts.settle_ms)
 }
 
 mount_ungate :: proc(m: ^Mount) {
@@ -227,6 +236,6 @@ _gate_creator_exit :: proc(l: ^prim.Loop, pid: prim.Pid, status: prim.Exit_Statu
 		}
 	}
 	if len(m.gate_watches) == 0 {
-		mount_ungate(m)
+		_gate_lift(m)
 	}
 }
