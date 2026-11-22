@@ -101,6 +101,7 @@ Disk_Stats :: struct {
 
 Disk :: struct {
 	quiet:     bool,
+	probe:     int,
 	name:      string,
 	inodes:    map[u64]^Inode,
 	next_ino:  u64,
@@ -261,11 +262,13 @@ _enter :: proc(d: ^Disk, op: u64) -> bool {
 	if d.dead {
 		return false
 	}
-	if d.quiet {
+	if d.quiet || d.probe > 0 {
 		return true
 	}
 	d.stats.ops += 1
-	d.trace = mix64(d.trace, op)
+	if d.probe == 0 {
+		d.trace = mix64(d.trace, op)
+	}
 	if d.crash_at != 0 && d.stats.ops >= d.crash_at {
 		d.dead = true
 		d.crash_at = 0
@@ -283,7 +286,7 @@ disk_events_clear :: proc(d: ^Disk) {
 
 @(private = "file")
 _event :: proc(d: ^Disk, path: string, closed := false) {
-	if !d.watching || len(d.watch_prefix) == 0 || !strings.has_prefix(path, d.watch_prefix) {
+	if d.probe > 0 || !d.watching || len(d.watch_prefix) == 0 || !strings.has_prefix(path, d.watch_prefix) {
 		return
 	}
 	if n := len(d.events); n > 0 && d.events[n - 1].path == path && d.events[n - 1].closed == closed {
@@ -294,7 +297,7 @@ _event :: proc(d: ^Disk, path: string, closed := false) {
 
 @(private = "file")
 _inject :: proc(d: ^Disk, space: bool) -> prim.Error {
-	if d.fail_rate == 0 || !d.failing {
+	if d.fail_rate == 0 || !d.failing || d.probe > 0 {
 		return .None
 	}
 	if rng_below(&d.fail_rng, 1_000_000) >= d.fail_rate {
@@ -504,8 +507,10 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 	if !_enter(d, 1) {
 		return prim.INVALID_FD, .Io
 	}
-	d.trace = mix_str(d.trace, trace_path(path))
-	if d.verbose {
+	if d.probe == 0 {
+		d.trace = mix_str(d.trace, trace_path(path))
+	}
+	if d.verbose && d.probe == 0 {
 		fmt.eprintf("dop %s open %s\n", d.name, path)
 	}
 	lk, err := _lookup(d, path, true)
@@ -582,7 +587,7 @@ _d_close :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		}
 		_maybe_orphan(d, of.ino)
 	}
-	if d.dead || d.quiet {
+	if d.dead || d.quiet || d.probe > 0 {
 		return .None
 	}
 	d.stats.ops += 1
@@ -642,8 +647,10 @@ _write :: proc(d: ^Disk, n: ^Inode, src: []u8, off: i64) -> prim.Error {
 		d.runaway_pend = true
 	}
 	n.mtime_ns = _now(d)
-	d.stats.writes += 1
-	d.stats.bytes += u64(len(src))
+	if d.probe == 0 {
+		d.stats.writes += 1
+		d.stats.bytes += u64(len(src))
+	}
 	return .None
 }
 
@@ -686,7 +693,9 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 		return .Invalid
 	}
 	at := i64(len(n.data)) if of.append else off
-	d.trace = mix64(d.trace, u64(at) ~ u64(len(src)) << 40)
+	if d.probe == 0 {
+		d.trace = mix64(d.trace, u64(at) ~ u64(len(src)) << 40)
+	}
 	if len(src) == 0 {
 		return .None
 	}
@@ -722,11 +731,15 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return .Io
 	}
 	if n.kind == .Dir {
-		d.stats.dirsyncs += 1
+		if d.probe == 0 {
+			d.stats.dirsyncs += 1
+		}
 		_commit_dir(d, n.ino)
 		return .None
 	}
-	d.stats.syncs += 1
+	if d.probe == 0 {
+		d.stats.syncs += 1
+	}
 	for p in n.pend {
 		switch p.kind {
 		case .Write:
@@ -832,7 +845,9 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	if !of.writable || n.kind != .File || size < 0 {
 		return .Invalid
 	}
-	d.trace = mix64(d.trace, u64(size))
+	if d.probe == 0 {
+		d.trace = mix64(d.trace, u64(size))
+	}
 	old := len(n.data)
 	if size > DISK_FILE_MAX || resize(&n.data, int(size)) != nil {
 		_runaway(d, n, size)
@@ -964,8 +979,10 @@ _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 	if ierr := _inject(d, true); ierr != .None {
 		return ierr
 	}
-	d.trace = mix_str(mix_str(d.trace, trace_path(old)), trace_path(new))
-	if d.verbose {
+	if d.probe == 0 {
+		d.trace = mix_str(mix_str(d.trace, trace_path(old)), trace_path(new))
+	}
+	if d.verbose && d.probe == 0 {
 		fmt.eprintf("dop %s rename %s %s\n", d.name, old, new)
 	}
 	a, aerr := _lookup(d, old, false)
@@ -1032,7 +1049,9 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	if ierr := _inject(d, false); ierr != .None {
 		return ierr
 	}
-	d.trace = mix_str(d.trace, trace_path(path))
+	if d.probe == 0 {
+		d.trace = mix_str(d.trace, trace_path(path))
+	}
 	lk, err := _lookup(d, path, false)
 	if err != .None {
 		return err
@@ -1091,7 +1110,9 @@ _d_mkdir :: proc(data: rawptr, path: string, mode: u32) -> prim.Error {
 	if ierr := _inject(d, true); ierr != .None {
 		return ierr
 	}
-	d.trace = mix_str(d.trace, trace_path(path))
+	if d.probe == 0 {
+		d.trace = mix_str(d.trace, trace_path(path))
+	}
 	lk, err := _lookup(d, path, false)
 	if err != .None {
 		return err
@@ -1746,4 +1767,55 @@ _pend_drop :: proc(d: ^Disk, n: ^Inode) {
 			d.pend_bytes -= i64(len(p.bytes))
 		}
 	}
+}
+
+disk_probe_begin :: proc(d: ^Disk) {
+	d.probe += 1
+}
+
+disk_probe_end :: proc(d: ^Disk) {
+	d.probe = max(d.probe - 1, 0)
+}
+
+disk_probe_read :: proc(d: ^Disk, path: string, allocator := context.temp_allocator) -> (data: []u8, durable: []u8, ok: bool) {
+	d.probe += 1
+	defer d.probe -= 1
+	lk, err := _lookup(d, path, true)
+	if err != .None || !lk.found {
+		return nil, nil, false
+	}
+	n, has := d.inodes[lk.ino]
+	if !has || n.kind != .File {
+		return nil, nil, false
+	}
+	data = make([]u8, len(n.data), allocator)
+	copy(data, n.data[:])
+	durable = make([]u8, len(n.durable), allocator)
+	copy(durable, n.durable[:])
+	return data, durable, true
+}
+
+disk_probe_write :: proc(d: ^Disk, path: string, off: i64, src: []u8, durable := false) -> bool {
+	d.probe += 1
+	defer d.probe -= 1
+	lk, err := _lookup(d, path, true)
+	if err != .None || !lk.found || off < 0 {
+		return false
+	}
+	n, has := d.inodes[lk.ino]
+	if !has || n.kind != .File {
+		return false
+	}
+	end := int(off) + len(src)
+	if len(n.data) < end {
+		resize(&n.data, end)
+	}
+	copy(n.data[off:], src)
+	if durable {
+		if len(n.durable) < end {
+			resize(&n.durable, end)
+		}
+		copy(n.durable[off:], src)
+	}
+	return true
 }
