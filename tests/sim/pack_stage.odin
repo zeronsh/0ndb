@@ -308,6 +308,8 @@ staged_append_crash :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		return
 	}
+	test_begin(t)
+	defer test_end(t)
 	cases, crashes := 0, 0
 	for base in ([]int{STAGE_REC, 300 * 1024}) {
 		for mode in Crash_Mode {

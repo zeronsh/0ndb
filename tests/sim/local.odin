@@ -2,7 +2,6 @@ package sim
 
 import "core:fmt"
 import "core:os"
-import "core:sync"
 import "core:testing"
 import eng "../../src/engine"
 import "../../src/prim"
@@ -196,7 +195,8 @@ local_first :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		return
 	}
-	sync.mutex_guard(&serial)
+	test_begin(t)
+	defer test_end(t)
 	for seed in u64(1) ..= 3 {
 		failures := local_first_run(seed)
 		for f in failures {

@@ -27,9 +27,6 @@ CARRY_MEM :: 1 << 20
 LARGE_CHUNK :: 1 << 20
 
 @(private)
-conv_seq: u64
-
-@(private)
 enc_is_utf8 :: proc "contextless" (name: string) -> bool {
 	return ascii_fold_eq(name, "utf-8") || ascii_fold_eq(name, "utf8")
 }
@@ -698,6 +695,7 @@ buffer_stage_proc :: proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i
 Carry :: struct {
 	vfs:  prim.Vfs,
 	dir:  string,
+	seq:  ^u64,
 	mem:  [dynamic]u8,
 	fd:   prim.Fd,
 	path: string,
@@ -709,14 +707,15 @@ carry_init :: proc(c: ^Carry, m: ^Mount) {
 	c^ = {
 		vfs = m.vfs,
 		dir = m.dir,
+		seq = &m.conv_seq,
 		mem = make([dynamic]u8, runtime.heap_allocator()),
 		fd  = prim.INVALID_FD,
 	}
 }
 
 @(private)
-conv_temp_path :: proc(dir: string) -> string {
-	seq := intrinsics.atomic_add(&conv_seq, 1)
+conv_temp_path :: proc(dir: string, counter: ^u64) -> string {
+	seq := intrinsics.atomic_add(counter, 1)
 	digits: [24]u8
 	num := strconv.write_uint(digits[:], seq, 10)
 	name := make([]u8, len(TEMP_PREFIX) + 5 + len(num), runtime.heap_allocator())
@@ -739,7 +738,7 @@ carry_add :: proc(c: ^Carry, p: []u8) -> bool {
 		return true
 	}
 	if c.fd == prim.INVALID_FD {
-		c.path = conv_temp_path(c.dir)
+		c.path = conv_temp_path(c.dir, c.seq)
 		fd, err := prim.open_file(c.vfs, c.path, {.Write, .Create, .Truncate}, 0o600)
 		if err != .None {
 			return false
@@ -1114,6 +1113,7 @@ ident_stage_proc :: proc(data: rawptr, mode: io.Stream_Mode, p: []u8, offset: i6
 Spool :: struct {
 	vfs:   prim.Vfs,
 	dir:   string,
+	seq:   ^u64,
 	mem:   [dynamic]u8,
 	limit: int,
 	fd:    prim.Fd,
@@ -1127,6 +1127,7 @@ spool_init :: proc(s: ^Spool, m: ^Mount, limit: int, allocator: runtime.Allocato
 	s^ = {
 		vfs   = m.vfs,
 		dir   = m.dir,
+		seq   = &m.conv_seq,
 		mem   = make([dynamic]u8, allocator),
 		limit = limit,
 		fd    = prim.INVALID_FD,
@@ -1144,7 +1145,7 @@ spool_write :: proc(s: ^Spool, p: []u8) -> bool {
 		return true
 	}
 	if s.fd == prim.INVALID_FD {
-		s.path = conv_temp_path(s.dir)
+		s.path = conv_temp_path(s.dir, s.seq)
 		fd, err := prim.open_file(s.vfs, s.path, {.Write, .Create, .Truncate}, 0o600)
 		if err != .None {
 			delete(s.path, runtime.heap_allocator())
