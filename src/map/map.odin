@@ -122,6 +122,7 @@ encode_fields :: proc(w: ^prim.Writer, body: Body) {
 }
 
 decode_body :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (body: Body, err: Error) {
+	obj.inflate(env, allocator) or_return
 	d := obj.dec_init(env.fields, env.off)
 	switch Kind(env.kind) {
 	case .Put:

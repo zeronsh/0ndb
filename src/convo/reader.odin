@@ -1143,6 +1143,15 @@ _scan_seal :: proc(v: ^obj.View, s: int, m: i64) -> (seal: i64, last: i64, err: 
 			return 0, 0, e
 		}
 		k := obj.record_kind(body)
+		if k == u8(Kind.Block) {
+			if bm, ok := block_msg(body, pos); ok {
+				if bm == m {
+					last = pos
+				}
+				pos = next
+				continue
+			}
+		}
 		if !obj.is_redacted(body) && (k == u8(Kind.Block) || k == u8(Kind.Seal) || k == u8(Kind.Interrupted)) {
 			rec := decode_record(body, pos, v.scratch) or_return
 			#partial switch r in rec.body {

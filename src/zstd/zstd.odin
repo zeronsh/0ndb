@@ -14,6 +14,8 @@ when ODIN_OS == .Windows && ODIN_ARCH == .amd64 {
 	foreign import lib "lib/libzstd_darwin_arm64.a"
 } else when ODIN_OS == .Linux && ODIN_ARCH == .amd64 {
 	foreign import lib "lib/libzstd_linux_amd64.a"
+} else when ODIN_ARCH == .wasm32 {
+	foreign import lib "lib/zstd_wasm32.o"
 } else {
 	#assert(false, "zstd: no vendored build for this target; run src/zstd/build.sh or build.bat on it")
 }

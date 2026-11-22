@@ -30,11 +30,14 @@ Writer :: struct {
 }
 
 Rec :: struct {
-	pw:    prim.Writer,
-	off:   i64,
-	kind:  u8,
-	links: Links,
-	open:  bool,
+	pw:        prim.Writer,
+	off:       i64,
+	kind:      u8,
+	links:     Links,
+	extra:     []u8,
+	links_at:  int,
+	fields_at: int,
+	open:      bool,
 }
 
 Redaction :: struct {
@@ -233,7 +236,10 @@ begin :: proc(w: ^Writer, kind: u8, cross: bool, event: bool) -> (rec: Rec, err:
 put_links :: proc(rec: ^Rec, extra: []u8) {
 	l := rec.links
 	l.extra = extra
+	rec.extra = extra
+	rec.links_at = len(rec.pw.buf)
 	encode_links(&rec.pw, rec.off, &l)
+	rec.fields_at = len(rec.pw.buf)
 }
 
 finish :: proc(w: ^Writer, rec: ^Rec) -> (off: i64, err: Error) {
@@ -241,6 +247,7 @@ finish :: proc(w: ^Writer, rec: ^Rec) -> (off: i64, err: Error) {
 		return 0, .Invalid
 	}
 	rec.open = false
+	_zip(rec)
 	got, eerr := journal.journal_end(&w.j, &rec.pw)
 	if eerr != .None {
 		return 0, jerr(eerr)
@@ -388,9 +395,6 @@ _recover :: proc(w: ^Writer) -> (head: Head, err: Error) {
 	}
 	henv := decode_envelope(hb, 0) or_return
 	head = decode_head(&henv) or_return
-	if head.format > FORMAT_VERSION {
-		return head, .Unsupported
-	}
 	if head.object != w.object || head.kind != w.kind || (!prim.id_is_zero(head.seg) && head.seg != w.id) {
 		return head, .Invalid
 	}

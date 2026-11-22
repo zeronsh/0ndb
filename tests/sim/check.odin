@@ -364,7 +364,7 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 				world_note(w, "model: message %s unknown on %s (Busy)", op.token, n.name)
 				continue
 			}
-			present := err == .None && msg.author == op.actor && (msg.redacted || msg_text(msg) == op.token)
+			present := err == .None && msg.author == op.actor && (msg.redacted || msg_text(msg) == msg_body(op.token))
 			if err == .None {
 				_settle_redaction(m, op, msg.redacted)
 			}
@@ -383,7 +383,7 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 					op.status = .Lost
 				}
 			case .Lost:
-				if present && msg_text(msg) == op.token {
+				if present && msg_text(msg) == msg_body(op.token) {
 					world_fail(w, "model: lost message %s resurrected on %s", op.token, n.name)
 				}
 			case .Issued, .Failed:

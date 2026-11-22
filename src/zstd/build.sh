@@ -7,7 +7,19 @@ flags="-std=c11 -O3 -fvisibility=hidden -ffunction-sections -fdata-sections -fno
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 roots=""
-case "$(uname -s)-$(uname -m)" in
+host="$(uname -s)-$(uname -m)"
+if [ "${1:-}" = wasm32 ]; then
+	host=wasm32
+fi
+case "$host" in
+wasm32)
+	mkdir "$tmp/include"
+	printf '#pragma once\n#include <stddef.h>\nvoid *memcpy(void *, const void *, size_t);\nvoid *memmove(void *, const void *, size_t);\nvoid *memset(void *, int, size_t);\nint memcmp(const void *, const void *, size_t);\n' > "$tmp/include/string.h"
+	printf '#pragma once\n#include <stddef.h>\nvoid *malloc(size_t);\nvoid free(void *);\n' > "$tmp/include/stdlib.h"
+	printf '#pragma once\n#include <stddef.h>\nvoid *ozstd_malloc(size_t);\nvoid *ozstd_calloc(size_t, size_t);\nvoid ozstd_free(void *);\n' > "$tmp/include/ozstd_deps.h"
+	sed '/start inlining dictBuilder/,$d' src/zstd.c > "$tmp/zstd.c"
+	clang $flags $defs --target=wasm32 -ffreestanding -nostdlib -isystem "$tmp/include" -Isrc -include ozstd_deps.h -DZSTD_DEPS_MALLOC -DZSTD_DEPS_ASSERT -DZSTD_DEPS_IO '-DZSTD_malloc(s)=ozstd_malloc(s)' '-DZSTD_calloc(n,s)=ozstd_calloc((n),(s))' '-DZSTD_free(p)=ozstd_free(p)' -c "$tmp/zstd.c" -o lib/zstd_wasm32.o
+	;;
 Linux-x86_64)
 	for f in $api; do roots="$roots -u $f"; done
 	clang $flags $defs -fPIC -c src/zstd.c -o "$tmp/full.o"

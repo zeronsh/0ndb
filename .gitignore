@@ -1,6 +1,7 @@
 /bin/
 *.bin
 *.o
+!/src/zstd/lib/*.o
 /sim
 *.log
 /bindings/rust/*/target/

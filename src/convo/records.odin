@@ -800,12 +800,28 @@ _get_line :: proc(d: ^obj.Dec, off: i64) -> (l: Line) {
 	return
 }
 
+block_msg :: proc "contextless" (body: []u8, off: i64) -> (msg: i64, ok: bool) {
+	env, err := obj.decode_envelope(body, off)
+	if err != .None || env.kind != u8(Kind.Block) {
+		return 0, false
+	}
+	d := obj.dec_init(obj.fields_head(&env), off)
+	for obj.dec_next(&d) {
+		if d.f.tag == 1 {
+			msg = obj.dec_own(&d)
+			return msg, obj.dec_ok(&d) && msg != 0
+		}
+	}
+	return 0, false
+}
+
 decode_record :: proc(body: []u8, off: i64, allocator := context.temp_allocator) -> (rec: Record, err: Error) {
 	rec.env = obj.decode_envelope(body, off) or_return
 	return decode_env(&rec.env, allocator)
 }
 
 decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (rec: Record, err: Error) {
+	obj.inflate(env, allocator) or_return
 	rec.env = env^
 	rec.stamp = env.links.stamp
 	off := env.off

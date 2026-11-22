@@ -562,7 +562,7 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 	nw.size = max(nw.size, off + i64(len(src)))
 	nw.mtime = _now(p)
 	if nw.n > MAX_EXTENTS {
-		if e := _defrag(p, oi, MAX_EXTENTS / 2); e != .None {
+		if e := _defrag(p, oi, MAX_EXTENTS * 3 / 4); e != .None {
 			oi.ino = old
 			return e
 		}
@@ -572,39 +572,41 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 }
 
 @(private)
-_defrag :: proc(p: ^Pack, oi: ^Open_Inode, window: int) -> Error {
+_defrag :: proc(p: ^Pack, oi: ^Open_Inode, keep: int) -> Error {
 	ino := &oi.ino
-	w := min(window, ino.n)
-	if w < 2 {
-		return .None
-	}
-	best := 0
-	best_cost := max(i64)
-	for i in 0 ..= ino.n - w {
-		last := ino.ext[i + w - 1]
-		cost := last.off + last.len - ino.ext[i].off
-		if cost < best_cost {
-			best_cost = cost
-			best = i
+	for ino.n > max(keep, 1) {
+		best, best_w := -1, 0
+		best_cost: i64
+		for i in 0 ..< ino.n - 1 {
+			for w in 2 ..= min(ino.n - i, MAX_EXTENTS) {
+				last := ino.ext[i + w - 1]
+				cost := last.off + last.len - ino.ext[i].off
+				if best < 0 || cost * i64(best_w - 1) < best_cost * i64(w - 1) {
+					best, best_w, best_cost = i, w, cost
+				}
+			}
 		}
-	}
-	from := ino.ext[best].off
-	to := from + best_cost
-	resize(&p.work, int(to - from))
-	buf := p.work[:]
-	pos := from
-	for e in ino.ext[best:best + w] {
-		if e.off > pos {
-			_zero(buf[pos - from:e.off - from])
+		if best < 0 {
+			return .None
 		}
-		_phys_read(p, Phys{cont = e.cont, off = e.coff, len = e.len}, buf[e.off - from:][:e.len]) or_return
-		pos = e.off + e.len
-	}
-	ph := _log_data(p, oi.inum, from, buf) or_return
-	scratch: Phys_List
-	_ext_remove(ino, from, to, &scratch)
-	if !_ext_insert(ino, Extent{off = from, len = to - from, cont = ph.cont, coff = ph.off}) {
-		return .Io
+		from := ino.ext[best].off
+		to := from + best_cost
+		resize(&p.work, int(to - from))
+		buf := p.work[:]
+		pos := from
+		for e in ino.ext[best:best + best_w] {
+			if e.off > pos {
+				_zero(buf[pos - from:e.off - from])
+			}
+			_phys_read(p, Phys{cont = e.cont, off = e.coff, len = e.len}, buf[e.off - from:][:e.len]) or_return
+			pos = e.off + e.len
+		}
+		ph := _log_data(p, oi.inum, from, buf) or_return
+		scratch: Phys_List
+		_ext_remove(ino, from, to, &scratch)
+		if !_ext_insert(ino, Extent{off = from, len = to - from, cont = ph.cont, coff = ph.off}) {
+			return .Io
+		}
 	}
 	return .None
 }

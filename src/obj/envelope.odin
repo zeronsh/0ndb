@@ -7,6 +7,8 @@ Links :: struct {
 	segs:  i64,
 	prev:  i64,
 	stamp: prim.Hlc,
+	zraw:  i64,
+	zhead: i64,
 	extra: []u8,
 }
 
@@ -50,6 +52,8 @@ encode_links :: proc(w: ^prim.Writer, off: i64, l: ^Links) {
 	tw_ref(&lw, 2, off, Ref{0, l.segs})
 	tw_ref(&lw, 3, off, Ref{0, l.prev})
 	tw_u64(&lw, 4, u64(l.stamp))
+	tw_uv(&lw, ZIP_TAG, u64(max(l.zraw, 0)))
+	tw_uv(&lw, ZIP_HEAD_TAG, u64(max(l.zhead, 0)))
 	prim.write_raw(&lw, l.extra)
 	if lw.err != .None {
 		w.err = lw.err
@@ -96,12 +100,27 @@ decode_envelope :: proc "contextless" (body: []u8, off: i64) -> (e: Envelope, er
 				return e, .Corrupt
 			}
 			e.links.stamp = prim.Hlc(f.uv)
+		case ZIP_TAG:
+			if f.ty != F_UV || f.uv == 0 || f.uv > ZIP_MAX || e.kind < RECORD_KIND_FIRST {
+				return e, .Corrupt
+			}
+			e.links.zraw = i64(f.uv)
+		case ZIP_HEAD_TAG:
+			if f.ty != F_UV || f.uv == 0 || f.uv > ZIP_MAX {
+				return e, .Corrupt
+			}
+			e.links.zhead = i64(f.uv)
+		case:
+			return e, .Unsupported
 		}
 	}
 	if lr.err != .None {
 		return e, .Corrupt
 	}
 	e.fields = prim.read_rest(&r)
+	if e.links.zraw == 0 ? e.links.zhead != 0 : e.links.zhead >= i64(len(e.fields)) {
+		return e, .Corrupt
+	}
 	return e, .None
 }
 
@@ -118,7 +137,7 @@ encode_head :: proc(w: ^prim.Writer, h: ^Head) {
 }
 
 decode_head :: proc(e: ^Envelope) -> (h: Head, err: Error) {
-	if e.kind != RECORD_HEAD || e.off != 0 {
+	if e.kind != RECORD_HEAD || e.off != 0 || e.links.zraw != 0 {
 		return h, .Corrupt
 	}
 	d := dec_init(e.fields, 0)
@@ -147,6 +166,9 @@ decode_head :: proc(e: ^Envelope) -> (h: Head, err: Error) {
 	if !dec_ok(&d) || h.format == 0 {
 		return h, .Corrupt
 	}
+	if h.format > FORMAT_VERSION {
+		return h, .Unsupported
+	}
 	return h, .None
 }
 
@@ -163,7 +185,7 @@ encode_seg :: proc(w: ^prim.Writer, off: i64, l: ^Links, entries: []Seg_Entry) {
 }
 
 decode_seg :: proc(e: ^Envelope, out: ^[dynamic]prim.Id) -> Error {
-	if e.kind != RECORD_SEG {
+	if e.kind != RECORD_SEG || e.links.zraw != 0 {
 		return .Corrupt
 	}
 	d := dec_init(e.fields, e.off)
@@ -198,7 +220,7 @@ encode_redact :: proc(w: ^prim.Writer, off: i64, l: ^Links, r: ^Redact) {
 }
 
 decode_redact :: proc(e: ^Envelope) -> (r: Redact, err: Error) {
-	if e.kind != RECORD_REDACT {
+	if e.kind != RECORD_REDACT || e.links.zraw != 0 {
 		return r, .Corrupt
 	}
 	d := dec_init(e.fields, e.off)

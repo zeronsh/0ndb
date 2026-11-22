@@ -321,6 +321,18 @@ obj_kind_of :: proc(k: eng.Kind) -> M_Kind {
 	return .Map
 }
 
+msg_body :: proc(tok: string) -> string {
+	if len(tok) < 2 || (tok[len(tok) - 2] - '0') % 3 != 0 {
+		return tok
+	}
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, tok)
+	for _ in 0 ..< 6 + int(tok[len(tok) - 2] - '0') {
+		strings.write_string(&b, " the quick brown fox jumps over the lazy dog")
+	}
+	return strings.to_string(b)
+}
+
 msg_text :: proc(m: convo.Message) -> string {
 	b := strings.builder_make(context.temp_allocator)
 	for blk in m.blocks {
@@ -362,7 +374,7 @@ op_presence :: proc(m: ^Model, n: ^Node, op: ^M_Op) -> Presence {
 		if msg.author != op.actor {
 			return .Absent
 		}
-		if msg_text(msg) != op.token {
+		if msg_text(msg) != msg_body(op.token) {
 			return .Absent
 		}
 		return .Present

@@ -531,7 +531,38 @@ concurrent typing is never lost or reverted.
   one per participant that ever wrote it. Segment records share one
   envelope: kind byte, links prefix (segment table refs, chain state,
   per-kind tail summary), fields with tagged encoding so records written
-  today decode forever.
+  today decode forever. The head record carries the format version
+  (`obj.FORMAT_VERSION`, 2 since records may carry compressed fields); a
+  head with a newer version, or a links tag below the kind range that the
+  reader does not know, is rejected as Unsupported rather than Corrupt, so
+  newer data is never mistaken for tampering.
+- Records compress one at a time. When a record's fields reach 128 bytes,
+  `obj.finish` keeps the leading fields raw while each encodes in under 64
+  bytes and replaces the rest with one zstd frame (the pinned static
+  zstd, level 3, no dictionary, content size in the frame header), kept only
+  if the record shrinks by at least 1/8 of the compressed part. Links tag 5
+  carries the raw length of the compressed tail, tag 6 the length of the raw
+  head. This happens before `journal_end`, so the compressed body is the
+  only form: the local journal, the wire (ChaCha20 over the same bytes), the
+  relay and every replica hold the same lengths at the same offsets, and
+  chain links, signatures, local tags, replica fetch and redaction work on
+  stored bytes and never inflate. Redaction zero-fills the whole stored body
+  as before. Decoders (`convo.decode_env`, `map.decode_body`) inflate into
+  the caller's arena: the frame's declared size must equal tag 5, head plus
+  tail must fit `journal.MAX_BODY`, and the output must be exactly that
+  size, or the record is Corrupt. The kind byte, links and raw head stay
+  readable without inflating, so scans that need only a block's message
+  ref skip decompression. Compression and decompression contexts are created
+  per record, so nothing stays in memory between records. Dictionaries and
+  cross-record grouping are not used: a trained dictionary holds verbatim
+  content that would outlive a redaction. The browser build links
+  `src/zstd/lib/zstd_wasm32.o` (zstd.c without the dictionary builder, built
+  by `build.sh wasm32`, allocating through Odin's default allocator).
+  Recording a 4.4 MB, 2769-message agent transcript: Block records
+  4.68 -> 2.59 MB, the conversation segment 6.53 -> 4.42 MB, relay bytes
+  8.28 -> 6.18 MB (-25%). Compression costs 7.6 ms per MB of fields on
+  append, inflation 2.6 ms per MB on read; level 1 is 1% larger, levels
+  5-9 are 2% smaller at 2-4x the compression time.
 - References: `Ref{seg, off}` within an object; `(object id, Ref)` across
   objects. Objects reference each other freely (a conversation names its
   agent, workspace, parent task and mounted file trees).

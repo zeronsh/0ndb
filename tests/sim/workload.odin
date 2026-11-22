@@ -346,7 +346,7 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 				parent = p.rid
 			}
 		}
-		rid, err := eng.convo_send(&n.e, o, op.token, parent, nil, op_done_handle(op))
+		rid, err := eng.convo_send(&n.e, o, msg_body(op.token), parent, nil, op_done_handle(op))
 		if err != .Pending {
 			op.rid = rid
 		}

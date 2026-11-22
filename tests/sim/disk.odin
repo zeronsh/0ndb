@@ -1,10 +1,13 @@
 package sim
 
 import "base:runtime"
+import "core:c"
 import "core:fmt"
 import "core:slice"
 import "core:strings"
+import "../../src/obj"
 import "../../src/prim"
+import "../../src/zstd"
 
 SECTOR :: 512
 
@@ -1556,8 +1559,45 @@ disk_contains :: proc(d: ^Disk, needle: []u8, allocator := context.temp_allocato
 	return "", false
 }
 
+ZSCAN_MAX :: 4 << 20
+
 @(private = "file")
 _index_of :: proc(hay: []u8, needle: []u8) -> int {
+	if at := _plain_index(hay, needle); at >= 0 {
+		return at
+	}
+	return _zstd_index(hay, needle)
+}
+
+@(private = "file")
+_zstd_index :: proc(hay: []u8, needle: []u8) -> int {
+	buf := make([dynamic]u8, context.temp_allocator)
+	defer delete(buf)
+	for i in 0 ..< max(len(hay) - 5, 0) {
+		if hay[i] != 0x28 || hay[i + 1] != 0xb5 || hay[i + 2] != 0x2f || hay[i + 3] != 0xfd {
+			continue
+		}
+		n, ok := obj.zip_frame_size(hay[i:])
+		if !ok || n > ZSCAN_MAX || int(n) < len(needle) {
+			continue
+		}
+		resize(&buf, int(n))
+		slice.zero(buf[:])
+		d := zstd.ZSTD_createDCtx()
+		if d == nil {
+			continue
+		}
+		zstd.ZSTD_decompressDCtx(d, raw_data(buf), c.size_t(n), raw_data(hay[i:]), c.size_t(len(hay[i:])))
+		zstd.ZSTD_freeDCtx(d)
+		if _plain_index(buf[:], needle) >= 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+@(private = "file")
+_plain_index :: proc(hay: []u8, needle: []u8) -> int {
 	if len(needle) > len(hay) {
 		return -1
 	}

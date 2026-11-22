@@ -3,7 +3,7 @@ package obj
 import "../journal"
 import "../prim"
 
-FORMAT_VERSION :: 1
+FORMAT_VERSION :: 2
 MAX_SEGS :: 1024
 TAIL_GUESS :: 256 * 1024
 MSG_GUESS :: 4096
