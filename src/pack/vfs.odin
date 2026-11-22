@@ -235,6 +235,17 @@ _oi_acquire :: proc(p: ^Pack, inum: u64) -> (oi: ^Open_Inode, err: Error) {
 			return nil, .Io
 		}
 		o.real_fd = fd
+		size, serr := prim.file_size(p.base, fd)
+		if serr == .None && o.ino.sized && size > o.ino.size {
+			serr = prim.truncate(p.base, fd, o.ino.size)
+			size = o.ino.size
+		}
+		if serr != .None {
+			prim.close_file(p.base, fd)
+			free(o, p.allocator)
+			return nil, .Io
+		}
+		o.ext_base = size
 	}
 	o.refs = 1
 	p.open_inodes[inum] = o
@@ -464,6 +475,9 @@ _v_close :: proc(data: rawptr, fd: prim.Fd) -> Error {
 	if oi != nil && oi.locked == idx + 1 {
 		oi.locked = 0
 	}
+	if h.stage != nil {
+		_stage_free(p, h.stage)
+	}
 	p.handles[idx] = {}
 	append(&p.free_handles, idx)
 	if oi != nil {
@@ -542,9 +556,16 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 	if len(src) == 0 {
 		return .None
 	}
-	oi := h.oi
+	if h.stage != nil {
+		return _stage_write(p, h, src, off)
+	}
+	return _write(p, h.oi, src, off)
+}
+
+@(private)
+_write :: proc(p: ^Pack, oi: ^Open_Inode, src: []u8, off: i64, sized := false) -> Error {
 	if oi.ino.kind == .File && off + i64(len(src)) > p.opts.promote_size {
-		_promote(p, oi) or_return
+		_promote(p, oi, sized) or_return
 	}
 	if oi.ino.kind == .External {
 		before := _ext_before(p, oi) or_return
@@ -631,7 +652,7 @@ _phys_within :: proc "contextless" (ino: ^Inode, x: Phys) -> bool {
 }
 
 @(private)
-_promote :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
+_promote :: proc(p: ^Pack, oi: ^Open_Inode, sized := false) -> Error {
 	pb: prim.Path_Buf
 	path := _phys_path(p, &pb, 'x', oi.inum)
 	fd := prim.open_file(p.base, path, {.Write, .Create, .Truncate}, 0o600) or_return
@@ -649,7 +670,9 @@ _promote :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
 	old := oi.ino
 	oi.ino.kind = .External
 	oi.ino.n = 0
-	oi.ino.size = 0
+	oi.ino.sized = sized
+	oi.ino.size = old.size if sized else 0
+	oi.ext_base = old.size
 	_inode_store(p, oi.inum, &old, &oi.ino) or_return
 	oi.real_fd = fd
 	oi.dirty = true
@@ -670,6 +693,11 @@ _truncate :: proc(p: ^Pack, h: ^Handle, size: i64) -> Error {
 		oi.dirty = true
 		prim.truncate(p.base, oi.real_fd, size) or_return
 		_pend_note(p, oi.inum, before, size)
+		if oi.ino.sized && oi.ino.size != size {
+			old := oi.ino
+			oi.ino.size = size
+			return _inode_store(p, oi.inum, &old, &oi.ino)
+		}
 		return .None
 	}
 	if size == oi.ino.size {
@@ -754,6 +782,9 @@ _v_sync :: proc(data: rawptr, fd: prim.Fd) -> Error {
 	if h == nil {
 		return .Invalid
 	}
+	if h.stage != nil {
+		return _stage_sync(p, h)
+	}
 	if p.batch > 0 && !h.dir && h.oi.ino.kind == .External && h.oi.real_fd >= 0 {
 		if p.poisoned {
 			return .Io
@@ -825,7 +856,7 @@ _stat_of :: proc(p: ^Pack, inum: u64, ino: ^Inode, real_fd: prim.Fd) -> (st: pri
 		if rerr != .None {
 			return st, rerr
 		}
-		st.size = rs.size
+		st.size = min(rs.size, ino.size) if ino.sized else rs.size
 		st.mtime_ns = rs.mtime_ns
 		st.ctime_ns = rs.ctime_ns
 	case .None:

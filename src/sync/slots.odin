@@ -9,10 +9,11 @@ SLOTS_SIZE :: 2 * SLOT_SPACING
 Layout :: struct {
 	spacing: i64,
 	base:    i64,
+	exact:   bool,
 }
 
-LAYOUT_SECTOR :: Layout{SLOT_SPACING, SLOTS_SIZE}
-LAYOUT_COMPACT :: Layout{64, 128}
+LAYOUT_SECTOR :: Layout{SLOT_SPACING, SLOTS_SIZE, false}
+LAYOUT_COMPACT :: Layout{64, 128, false}
 
 @(private)
 SLOT_MAGIC :: 0x746f_6c73_6264_6e30

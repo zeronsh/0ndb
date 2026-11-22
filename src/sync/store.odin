@@ -14,6 +14,7 @@ Stream_File :: struct {
 	seq:    u64,
 	fresh:  bool,
 	trimmed: bool,
+	slotted: bool,
 }
 
 stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u8, lay := LAYOUT_SECTOR) -> (f: Stream_File, err: Error) {
@@ -32,7 +33,7 @@ stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u
 	if f.fresh {
 		return f, .None
 	}
-	f.length, f.base, f.seq, f.trimmed, err = stream_file_recover(vfs, fd, scratch, lay)
+	f.length, f.base, f.seq, f.trimmed, f.slotted, err = stream_file_recover(vfs, fd, scratch, lay)
 	if err != .None {
 		prim.close_file(vfs, fd)
 		f.fd = prim.INVALID_FD
@@ -46,19 +47,28 @@ stream_file_open :: proc(vfs: prim.Vfs, path: string, create: bool, scratch: []u
 	return f, .None
 }
 
-stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, seq: u64, trimmed: bool, err: Error) {
+stream_file_recover :: proc(vfs: prim.Vfs, fd: prim.Fd, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, seq: u64, trimmed: bool, slotted: bool, err: Error) {
 	newest, older, count := slots_read(vfs, fd, lay.spacing) or_return
 	if count == 0 {
-		return 0, 0, 0, false, .None
+		if !lay.exact {
+			return 0, 0, 0, false, false, .None
+		}
+		size := _from_prim_size(prim.file_size(vfs, fd)) or_return
+		return max(size - lay.base, 0), 0, 0, false, false, .None
 	}
 	ok := _chunk_verify(vfs, fd, newest, scratch, lay.base) or_return
 	if ok {
-		return newest.value, newest.base, newest.seq, newest.trimmed, .None
+		return newest.value, newest.base, newest.seq, newest.trimmed, true, .None
 	}
 	if count == 2 && older.seq + 1 == newest.seq {
-		return older.value, older.base, older.seq, older.trimmed, .None
+		return older.value, older.base, older.seq, older.trimmed, true, .None
 	}
-	return 0, 0, 0, false, .None
+	return 0, 0, 0, false, true, .None
+}
+
+@(private)
+_from_prim_size :: proc(size: i64, err: prim.Error) -> (i64, Error) {
+	return size, _from_prim(err)
 }
 
 stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8, lay := LAYOUT_SECTOR) -> (length: i64, base: i64, exists: bool, err: Error) {
@@ -70,7 +80,7 @@ stream_file_size :: proc(vfs: prim.Vfs, path: string, scratch: []u8, lay := LAYO
 		return 0, 0, false, _from_prim(oerr)
 	}
 	defer prim.close_file(vfs, fd)
-	length, base, _, _, err = stream_file_recover(vfs, fd, scratch, lay)
+	length, base, _, _, _, err = stream_file_recover(vfs, fd, scratch, lay)
 	return length, base, err == .None, err
 }
 

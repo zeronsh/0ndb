@@ -3,6 +3,7 @@ package osync
 
 import "base:runtime"
 import "core:hash/xxhash"
+import "../pack"
 import "../prim"
 
 Extent_Resolver :: struct {
@@ -14,6 +15,7 @@ File_Store :: struct {
 	vfs:       prim.Vfs,
 	lay:       Layout,
 	resolver:  Extent_Resolver,
+	pack:      ^pack.Pack,
 	random:    prim.Random,
 	clock:     prim.Clock,
 	root:      string,
@@ -57,11 +59,13 @@ _Fstream :: struct {
 	seq:    u64,
 	fresh:  bool,
 	trimmed: bool,
+	slotted: bool,
 }
 
 @(private)
 _Fappend :: struct {
 	st:     ^_Fstream,
+	fd:     prim.Fd,
 	at:     i64,
 	pos:    i64,
 	total:  i64,
@@ -247,6 +251,7 @@ _fs_stream_open :: proc(data: rawptr, h: rawptr, id: Stream_Id, create: bool) ->
 		seq    = f.seq,
 		fresh  = f.fresh,
 		trimmed = f.trimmed,
+		slotted = f.slotted,
 	}
 	return st, f.length, .None
 }
@@ -368,6 +373,10 @@ _fs_stream_hint :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64,
 	}
 	defer prim.close_file(fs.vfs, fd)
 	newest, _, count, serr := slots_read(fs.vfs, fd, fs.lay.spacing)
+	if serr == .None && count == 0 && fs.lay.exact {
+		size, ferr := prim.file_size(fs.vfs, fd)
+		return max(size - fs.lay.base, 0) if ferr == .None else 0, 0, true
+	}
 	if serr != .None || count == 0 {
 		return 0, 0, true
 	}
@@ -382,12 +391,15 @@ _fs_append_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: ra
 	if at != st.length {
 		return nil, .Conflict
 	}
+	fd := _fs_stage(fs, st) or_return
 	a, aerr := new(_Fappend, fs.allocator)
 	if aerr != nil {
+		_fs_unstage(fs, st, fd)
 		return nil, .No_Memory
 	}
 	a^ = {
 		st    = st,
+		fd    = fd,
 		at    = at,
 		pos   = at,
 		total = total,
@@ -403,12 +415,15 @@ _fs_fill_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawp
 	if at < 0 || total <= 0 || at + total != st.base {
 		return nil, .Conflict
 	}
+	fd := _fs_stage(fs, st) or_return
 	a, aerr := new(_Fappend, fs.allocator)
 	if aerr != nil {
+		_fs_unstage(fs, st, fd)
 		return nil, .No_Memory
 	}
 	a^ = {
 		st    = st,
+		fd    = fd,
 		at    = at,
 		pos   = at,
 		total = total,
@@ -429,6 +444,7 @@ _fs_note :: proc(data: rawptr, s: rawptr, length: i64, done: Storage_Done, ctx: 
 	}
 	a^ = {
 		st    = st,
+		fd    = st.fd,
 		at    = length,
 		pos   = length,
 		note  = true,
@@ -441,7 +457,7 @@ _fs_append_write :: proc(data: rawptr, w: rawptr, bytes: []u8) -> Error {
 	fs := cast(^File_Store)data
 	a := cast(^_Fappend)w
 	if a.failed == .None {
-		if err := prim.write_at(fs.vfs, a.st.fd, bytes, fs.lay.base + a.pos); err != .None {
+		if err := prim.write_at(fs.vfs, a.fd, bytes, fs.lay.base + a.pos); err != .None {
 			a.failed = _from_prim(err)
 		} else {
 			xxhash.XXH64_update(&a.hash, bytes)
@@ -453,7 +469,24 @@ _fs_append_write :: proc(data: rawptr, w: rawptr, bytes: []u8) -> Error {
 
 @(private)
 _fs_append_free :: proc(fs: ^File_Store, a: ^_Fappend) {
+	_fs_unstage(fs, a.st, a.fd)
 	free(a, fs.allocator)
+}
+
+@(private)
+_fs_stage :: proc(fs: ^File_Store, st: ^_Fstream) -> (prim.Fd, Error) {
+	if fs.pack == nil {
+		return st.fd, .None
+	}
+	fd, err := pack.stage(fs.pack, st.fd)
+	return fd, _from_prim(err)
+}
+
+@(private)
+_fs_unstage :: proc(fs: ^File_Store, st: ^_Fstream, fd: prim.Fd) {
+	if fd != st.fd && fd >= 0 {
+		prim.close_file(fs.vfs, fd)
+	}
 }
 
 @(private)
@@ -505,25 +538,34 @@ _fs_append_commit :: proc(data: rawptr, w: rawptr, done: Storage_Done, ctx: rawp
 	if a.note {
 		new_len = a.at
 	}
-	if err == .None {
+	if err == .None && (!fs.lay.exact || st.slotted || a.note || a.fill || st.base != 0 || st.trimmed) {
 		err = slot_write(fs.vfs, st.fd, slot, fs.lay.spacing)
+		if err == .None {
+			st.slotted = true
+		}
 	}
-	_fs_append_free(fs, a)
+	job: ^Job
+	if err == .None {
+		jerr: runtime.Allocator_Error
+		job, jerr = new(Job, fs.allocator)
+		if jerr != nil {
+			err = .No_Memory
+		}
+	}
 	if err != .None {
+		_fs_append_free(fs, a)
 		done(ctx, err, 0)
 		return
 	}
-	job, jerr := new(Job, fs.allocator)
-	if jerr != nil {
-		done(ctx, .No_Memory, 0)
-		return
-	}
+	fd := a.fd
+	a.fd = st.fd
+	_fs_append_free(fs, a)
 	st.busy = true
 	job^ = {
 		vfs    = fs.vfs,
 		lay    = fs.lay,
 		kind   = .Stream_Sync,
-		fd     = st.fd,
+		fd     = fd,
 		value  = new_len,
 		base   = new_base,
 		delta  = delta,
@@ -612,6 +654,7 @@ _fs_redact :: proc(data: rawptr, s: rawptr, from, to: i64, done: Storage_Done, c
 		base   = st.base,
 		seq    = st.seq + 1,
 		trimmed = st.trimmed,
+		slot   = !fs.lay.exact || st.slotted,
 		from   = lo,
 		to     = hi,
 		target = st,
@@ -911,6 +954,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 	case .Stream_Sync:
 		st := cast(^_Fstream)job.target
 		st.busy = false
+		_fs_unstage(fs, st, job.fd)
 		if job.result == .None {
 			_usage_add(fs, st.ns, job.delta)
 			st.length = job.value
@@ -939,6 +983,7 @@ _fs_job_done :: proc(data: rawptr, job: ^Job) {
 			st.base = job.base
 			st.seq = job.seq
 			st.trimmed = true
+			st.slotted = true
 			value = -job.delta
 		}
 	case .Remove:
