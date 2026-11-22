@@ -399,6 +399,17 @@ op_await :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_assign :: proc(c: ^Call, o: ^Out) -> Status {
+	if obj.rid_none(a_rid(c, "msg")) && c.api.r != nil {
+		err := rt.resume(c.api.r, a_object(c, "object"), a_id(c, "runner"))
+		if err == .Pending {
+			eng.convo_status(c.api.e, a_object(c, "object"), ready(c))
+			if c.waiting {
+				return .Pending
+			}
+			return .Missing
+		}
+		return _rterr(err)
+	}
 	return exec(c, o, eng.Cmd_Assign{object = a_object(c, "object"), msg = a_rid(c, "msg"), runner = a_id(c, "runner")})
 }
 
@@ -632,6 +643,7 @@ CATALOG_SET_ARGS := [eng.Catalog_Field]string {
 	.Workspace = "workspace",
 	.Agent     = "agent",
 	.Storage   = "storage",
+	.Takeover  = "takeover",
 }
 
 op_catalog_set :: proc(c: ^Call, o: ^Out) -> Status {
@@ -653,6 +665,7 @@ op_catalog_set :: proc(c: ^Call, o: ^Out) -> Status {
 		workspace = a_id(c, "workspace"),
 		agent     = a_id(c, "agent"),
 		storage   = eng.Storage_Class(min(a_u64(c, "storage"), u64(max(eng.Storage_Class)))),
+		takeover  = eng.Takeover(min(a_u64(c, "takeover"), u64(max(eng.Takeover)))),
 	}
 	return exec(c, o, cmd)
 }
@@ -827,6 +840,7 @@ op_workspace_get :: proc(c: ^Call, o: ^Out) -> Status {
 		o_str(o, "", l)
 	}
 	o_end(o)
+	o_enum(o, "takeover", u64(def.takeover), TAKEOVER_NAMES[:])
 	return .Ok
 }
 
@@ -911,6 +925,7 @@ op_agent_get :: proc(c: ^Call, o: ^Out) -> Status {
 		o_bytes(o, "", t)
 	}
 	o_end(o)
+	o_enum(o, "takeover", u64(def.takeover), TAKEOVER_NAMES[:])
 	return .Ok
 }
 
@@ -958,4 +973,34 @@ op_storage_stats :: proc(c: ^Call, o: ^Out) -> Status {
 
 op_object_promote :: proc(c: ^Call, o: ^Out) -> Status {
 	return status_of(eng.object_promote(c.api.e, a_object(c, "object"), i64(min(a_u64(c, "from"), u64(max(i64))))))
+}
+
+op_takeover_get :: proc(c: ^Call, o: ^Out) -> Status {
+	ob := a_object(c, "object")
+	level := eng.Takeover_Level(min(a_u64(c, "level"), u64(max(eng.Takeover_Level))))
+	p, err := eng.takeover_get(c.api.e, ob, level, ready(c))
+	if err != .None {
+		return pend(c, err)
+	}
+	eff := p
+	if level == .Conversation && c.api.r != nil {
+		a, _ := rt.agent_resolve(c.api.r, ob, "", "", context.temp_allocator)
+		eff = a.takeover
+	}
+	o_enum(o, "policy", u64(p), TAKEOVER_NAMES[:])
+	o_enum(o, "effective", u64(eff), TAKEOVER_NAMES[:])
+	return .Ok
+}
+
+op_takeover_set :: proc(c: ^Call, o: ^Out) -> Status {
+	ob := a_object(c, "object")
+	level := eng.Takeover_Level(min(a_u64(c, "level"), u64(max(eng.Takeover_Level))))
+	err := eng.takeover_set(c.api.e, ob, level, eng.Takeover(min(a_u64(c, "policy"), u64(max(eng.Takeover)))))
+	if err != .None {
+		return status_of(err)
+	}
+	if c.api.r != nil && level == .Conversation {
+		rt.wake(c.api.r, ob)
+	}
+	return .Ok
 }

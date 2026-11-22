@@ -73,10 +73,11 @@ stack_open :: proc(s: ^Stack, ec: eng.Config, opts: Stack_Options, allocator := 
 	rp: ^rt.Runtime
 	if opts.runtime {
 		rc := opts.rt_cfg
-		if opts.placement.call != nil && rc.hooks.placement == nil {
+		if rc.hooks.data == nil && rc.hooks.placement == nil && rc.hooks.runners == nil {
 			s.placement = opts.placement
 			rc.hooks.data = s
 			rc.hooks.placement = _on_placement
+			rc.hooks.runners = _on_runners
 		}
 		if rc.secrets.get == nil {
 			rc.secrets = rt.Secrets{get = _env_secret}
@@ -208,6 +209,17 @@ _on_placement :: proc(data: rawptr, r: ^rt.Runtime, o: Object, info: rt.Placemen
 	s := (^Stack)(data)
 	if s.placement.call != nil {
 		s.placement.call(s.placement.data, o, info)
+	}
+	if s.a_on {
+		runners_notify(&s.a, o.space, o)
+	}
+}
+
+@(private)
+_on_runners :: proc(data: rawptr, r: ^rt.Runtime, space: prim.Id) {
+	s := (^Stack)(data)
+	if s.a_on {
+		runners_notify(&s.a, space)
 	}
 }
 

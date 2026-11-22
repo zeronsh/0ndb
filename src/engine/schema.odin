@@ -6,6 +6,18 @@ import "../prim"
 
 DEF_KEY :: "def"
 
+Takeover :: enum u8 {
+	Default = 0,
+	Auto    = 1,
+	Never   = 2,
+}
+
+Takeover_Level :: enum u8 {
+	Conversation = 0,
+	Agent        = 1,
+	Workspace    = 2,
+}
+
 Workspace_Tag :: enum u32 {
 	Name          = 1,
 	Agent         = 2,
@@ -14,6 +26,7 @@ Workspace_Tag :: enum u32 {
 	Runner_Policy = 5,
 	Setup         = 6,
 	Access        = 7,
+	Takeover      = 8,
 	Members       = 16,
 	Linked        = 17,
 }
@@ -40,6 +53,7 @@ Workspace_Def :: struct {
 	runner_policy: []u8,
 	setup:         string,
 	access:        []u8,
+	takeover:      Takeover,
 	members:       []Workspace_Member,
 	linked:        []string,
 }
@@ -54,6 +68,7 @@ Agent_Tag :: enum u32 {
 	Budget        = 7,
 	Workspace     = 8,
 	Runner_Policy = 9,
+	Takeover      = 10,
 	Tools         = 16,
 	Memory        = 17,
 	Triggers      = 18,
@@ -69,6 +84,7 @@ Agent_Def :: struct {
 	budget:        []u8,
 	workspace:     prim.Id,
 	runner_policy: []u8,
+	takeover:      Takeover,
 	tools:         [][]u8,
 	memory:        []prim.Id,
 	triggers:      [][]u8,
@@ -78,6 +94,9 @@ workspace_create :: proc(e: ^Engine, space: prim.Id, def: Workspace_Def) -> (o: 
 	context = context_for(e)
 	o = map_create(e, space, def.name) or_return
 	workspace_set(e, o, def) or_return
+	if def.takeover != .Default {
+		takeover_set(e, o, .Workspace, def.takeover) or_return
+	}
 	for m in def.members {
 		workspace_add_member(e, o, m) or_return
 	}
@@ -133,6 +152,7 @@ workspace_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, rea
 	def.runner_policy = _reg_bytes(&en, u32(Workspace_Tag.Runner_Policy), allocator) or_return
 	def.setup = _reg_str(&en, u32(Workspace_Tag.Setup), allocator) or_return
 	def.access = _reg_bytes(&en, u32(Workspace_Tag.Access), allocator) or_return
+	def.takeover = _reg_takeover(&en, u32(Workspace_Tag.Takeover))
 	members := make([dynamic]Workspace_Member, allocator)
 	for el in omap.entry_elements(&en, u32(Workspace_Tag.Members)) {
 		if m, ok := _member_decode(el, allocator); ok {
@@ -152,6 +172,9 @@ agent_create :: proc(e: ^Engine, space: prim.Id, def: Agent_Def) -> (o: Object, 
 	context = context_for(e)
 	o = map_create(e, space, def.name) or_return
 	agent_set(e, o, def) or_return
+	if def.takeover != .Default {
+		takeover_set(e, o, .Agent, def.takeover) or_return
+	}
 	for t in def.tools {
 		agent_add(e, o, .Tools, t) or_return
 	}
@@ -213,6 +236,7 @@ agent_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: 
 		def.workspace, _ = omap.value_id(v)
 	}
 	def.runner_policy = _reg_bytes(&en, u32(Agent_Tag.Runner_Policy), allocator) or_return
+	def.takeover = _reg_takeover(&en, u32(Agent_Tag.Takeover))
 	def.tools = _elements(&en, u32(Agent_Tag.Tools), allocator) or_return
 	def.triggers = _elements(&en, u32(Agent_Tag.Triggers), allocator) or_return
 	mem := make([dynamic]prim.Id, allocator)
@@ -223,6 +247,54 @@ agent_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: 
 	}
 	def.memory = mem[:]
 	return def, .None
+}
+
+takeover_set :: proc(e: ^Engine, o: Object, level: Takeover_Level, policy: Takeover) -> Error {
+	context = context_for(e)
+	switch level {
+	case .Conversation:
+		return aerr_ok(catalog_set(e, Cmd_Catalog_Set{object = o, set = {.Takeover}, takeover = policy}))
+	case .Agent:
+		_, err := map_set(e, o, transmute([]u8)string(DEF_KEY), []omap.Field{omap.field_u64(u32(Agent_Tag.Takeover), u64(policy))})
+		return aerr_ok(err)
+	case .Workspace:
+		_, err := map_set(e, o, transmute([]u8)string(DEF_KEY), []omap.Field{omap.field_u64(u32(Workspace_Tag.Takeover), u64(policy))})
+		return aerr_ok(err)
+	}
+	return .Invalid
+}
+
+takeover_get :: proc(e: ^Engine, o: Object, level: Takeover_Level, ready: Ready = {}) -> (policy: Takeover, err: Error) {
+	context = context_for(e)
+	switch level {
+	case .Conversation:
+		c, found := catalog_get(e, o, context.temp_allocator, ready) or_return
+		if !found {
+			return .Default, .Not_Found
+		}
+		return _takeover_of(u64(c.takeover)), .None
+	case .Agent:
+		def := agent_get(e, o, context.temp_allocator, ready) or_return
+		return def.takeover, .None
+	case .Workspace:
+		def := workspace_get(e, o, context.temp_allocator, ready) or_return
+		return def.takeover, .None
+	}
+	return .Default, .Invalid
+}
+
+@(private)
+_takeover_of :: proc "contextless" (v: u64) -> Takeover {
+	return Takeover(v) if v <= u64(max(Takeover)) else .Default
+}
+
+@(private)
+_reg_takeover :: proc(en: ^omap.Entry, tag: u32) -> Takeover {
+	if v, ok := omap.entry_register(en, tag); ok {
+		x, _ := omap.value_u64(v)
+		return _takeover_of(x)
+	}
+	return .Default
 }
 
 @(private)

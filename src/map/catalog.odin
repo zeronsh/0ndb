@@ -17,6 +17,7 @@ Catalog_Tag :: enum u32 {
 	Archived     = 10,
 	Pinned       = 11,
 	Storage      = 12,
+	Takeover     = 13,
 }
 
 Catalog_Entry :: struct {
@@ -33,6 +34,7 @@ Catalog_Entry :: struct {
 	archived:     bool,
 	pinned:       bool,
 	storage:      u8,
+	takeover:     u8,
 }
 
 CATALOG_BY_ACTIVITY :: 0
@@ -138,6 +140,9 @@ catalog_decode :: proc(e: ^Entry, allocator := context.allocator) -> (c: Catalog
 		case .Storage:
 			x, _ := value_u64(r.value)
 			c.storage = u8(min(x, 255))
+		case .Takeover:
+			x, _ := value_u64(r.value)
+			c.takeover = u8(min(x, 255))
 		}
 	}
 	c.kind = row.kind
