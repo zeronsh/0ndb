@@ -337,6 +337,7 @@ Engine :: struct {
 	damaged:      [dynamic]Damaged,
 	checks:       map[osync.Stream_Id]Check,
 	restores:     [dynamic]Restore,
+	draft_marks:  map[prim.Id]Draft_Mark,
 	batches:      [dynamic]^Durable_Batch,
 	batch_seq:    u64,
 	durable_seq:  u64,
@@ -415,6 +416,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.wake_hooks = make([dynamic]Posted, e.allocator)
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
 	e.draft_dirty = make([dynamic]Draft_Pub, e.allocator)
+	e.draft_marks = make(map[prim.Id]Draft_Mark, e.allocator)
 	e.batches = make([dynamic]^Durable_Batch, e.allocator)
 	e.changed = make(map[prim.Id]Change, e.allocator)
 	_content_init(e)
@@ -1062,6 +1064,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.damaged)
 	delete(e.checks)
 	delete(e.restores)
+	delete(e.draft_marks)
 	delete(e.batches)
 	delete(e.changed)
 	_git_destroy(e)

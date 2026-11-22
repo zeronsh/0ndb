@@ -52,6 +52,16 @@ Db :: struct {
 	txn:       ^Txn,
 	poisoned:  bool,
 	allocator: runtime.Allocator,
+	tag_of:    proc(data: rawptr) -> u64,
+	tag_data:  rawptr,
+	pend:      [2]Pend_Meta,
+	npend:     int,
+	publishing: bool,
+}
+
+Pend_Meta :: struct {
+	meta: Meta,
+	tag:  u64,
 }
 
 Txn :: struct {
@@ -84,6 +94,10 @@ Node :: struct {
 Visit :: #type proc(data: rawptr, key: []u8, value: []u8) -> bool
 
 db_open :: proc(db: ^Db, vfs: prim.Vfs, path: string, allocator := context.allocator) -> Error {
+	tag_of, tag_data := db.tag_of, db.tag_data
+	defer if db.tag_of == nil {
+		db.tag_of, db.tag_data = tag_of, tag_data
+	}
 	db^ = {
 		vfs       = vfs,
 		fd        = prim.INVALID_FD,
@@ -393,6 +407,12 @@ txn_commit :: proc(t: ^Txn) -> Error {
 	m.txn = db.meta.txn + 1
 	m.pages = next
 	m.live = db.meta.live + written - min(t.freed, db.meta.live + written)
+	if db.tag_of != nil {
+		_pend_add(db, m, db.tag_of(db.tag_data))
+		db.meta = m
+		txn_abort(t)
+		return .None
+	}
 	if err := _meta_write(db.vfs, db.fd, &m); err != .None {
 		txn_abort(t)
 		db.poisoned = true
@@ -406,12 +426,68 @@ txn_commit :: proc(t: ^Txn) -> Error {
 	return .None
 }
 
+@(private)
+_pend_add :: proc(db: ^Db, m: Meta, tag: u64) {
+	if db.npend > 0 && db.pend[db.npend - 1].tag == tag {
+		db.pend[db.npend - 1].meta = m
+		return
+	}
+	if db.npend < len(db.pend) {
+		db.pend[db.npend] = Pend_Meta{meta = m, tag = tag}
+		db.npend += 1
+		return
+	}
+	db.pend[len(db.pend) - 1] = Pend_Meta{meta = m, tag = tag}
+}
+
+db_pending :: proc "contextless" (db: ^Db) -> bool {
+	return db.npend > 0
+}
+
+db_publish :: proc(db: ^Db, durable: u64) -> Error {
+	if db.publishing || db.npend == 0 || db.poisoned || db.fd < 0 {
+		return .None
+	}
+	db.publishing = true
+	defer db.publishing = false
+	for {
+		idx := -1
+		for i in 0 ..< db.npend {
+			if db.pend[i].tag <= durable {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			break
+		}
+		m := db.pend[idx].meta
+		rest := db.npend - idx - 1
+		for i in 0 ..< rest {
+			db.pend[i] = db.pend[idx + 1 + i]
+		}
+		db.npend = rest
+		if err := _meta_write(db.vfs, db.fd, &m); err != .None {
+			db.poisoned = true
+			return err
+		}
+		if err := prim.datasync(db.vfs, db.fd); err != .None {
+			db.poisoned = true
+			return obj.perr(err)
+		}
+	}
+	if db.npend == 0 && db.meta.pages > 2 * db.meta.live + 2 + COMPACT_SLACK {
+		db.publishing = false
+		return db_compact(db)
+	}
+	return .None
+}
+
 db_sync :: proc(db: ^Db) -> Error {
 	return obj.perr(prim.datasync(db.vfs, db.fd))
 }
 
 db_compact :: proc(db: ^Db) -> Error {
-	if db.txn != nil {
+	if db.txn != nil || db.npend > 0 {
 		return .Busy
 	}
 	if db.poisoned {

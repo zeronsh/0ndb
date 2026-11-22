@@ -100,6 +100,8 @@ Handle :: struct {
 	dview:      i64,
 	ddur:       i64,
 	dpub:       i64,
+	drep:       i64,
+	dloaded:    bool,
 	dclosed:    [DRAFT_CLOSED]Draft_Key,
 	dclosed_n:  int,
 }
@@ -353,14 +355,22 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	switch h.kind {
 	case .Conversation:
 		path := _seg_path(e, h.id) or_return
-		opts := _journal_opts(h)
-		gen := _gen_take(e) or_return
-		_oerr(convo.writer_create(&h.cw, &h.view, e.vfs, path, h.id, e.self, gen, created, convo_settings, opts, e.allocator, _obj_clock(e))) or_return
+		if prim.exists(e.vfs, path) {
+			_handle_open_writer(h) or_return
+		} else {
+			opts := _journal_opts(h)
+			gen := _gen_take(e) or_return
+			_oerr(convo.writer_create(&h.cw, &h.view, e.vfs, path, h.id, e.self, gen, created, convo_settings, opts, e.allocator, _obj_clock(e))) or_return
+		}
 	case .Map:
 		path := _seg_path(e, h.id) or_return
-		opts := _journal_opts(h)
-		gen := _gen_take(e) or_return
-		_oerr(omap.writer_create(&h.mw, &h.view, e.vfs, path, h.id, e.self, gen, created, settings, opts, e.allocator, _obj_clock(e))) or_return
+		if prim.exists(e.vfs, path) {
+			_handle_open_writer(h) or_return
+		} else {
+			opts := _journal_opts(h)
+			gen := _gen_take(e) or_return
+			_oerr(omap.writer_create(&h.mw, &h.view, e.vfs, path, h.id, e.self, gen, created, settings, opts, e.allocator, _obj_clock(e))) or_return
+		}
 		_map_own_check(e, h) or_return
 	case .Text, .File_Tree:
 		if _ckpt_waiting(h) {
@@ -378,9 +388,12 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 		}
 		_hist_open(h) or_return
 	}
+	adopted := h.w_open
 	h.w_open = true
 	h.own = true
-	h.published = 0
+	if !adopted {
+		h.published = 0
+	}
 	rec.own = true
 	for &m in rec.members {
 		if h.sp.repl_on {
@@ -696,6 +709,9 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 	if err := _handle_commit(e, h); err == .Busy && !e.closing {
 		return err
 	}
+	if h.kind == .Conversation && h.dloaded {
+		e.draft_marks[h.id] = Draft_Mark{gen = h.dgen, view = max(h.dview, h.drep), dur = h.ddur, pub = h.dpub}
+	}
 	if h.w_open {
 		switch h.kind {
 		case .Conversation:
@@ -713,6 +729,7 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 		h.hist = nil
 	}
 	if h.table_open {
+		_table_publish(e, h)
 		omap.table_close(&h.table)
 		h.table_open = false
 	}

@@ -396,8 +396,26 @@ _map_table :: proc(e: ^Engine, h: ^Handle) -> Error {
 	} else {
 		_oerr(omap.table_open(&h.table, e.vfs, path, nil, e.allocator)) or_return
 	}
+	h.table.db.tag_of = _table_tag
+	h.table.db.tag_data = e
 	h.table_open = true
 	return .None
+}
+
+@(private)
+_table_tag :: proc(data: rawptr) -> u64 {
+	e := (^Engine)(data)
+	return e.batch_seq + 1
+}
+
+@(private)
+_table_publish :: proc(e: ^Engine, h: ^Handle) {
+	if !h.table_open || !omap.db_pending(&h.table.db) {
+		return
+	}
+	if err := omap.db_publish(&h.table.db, e.durable_seq); err != .None && err != .Busy {
+		_fatal(e, _oerr(err))
+	}
 }
 
 @(private)
@@ -698,10 +716,10 @@ _catalog_reconcile :: proc(e: ^Engine) {
 	}
 	for id in _sorted_keys(e.spaces) {
 		sp := e.spaces[id]
-		if sp.cat_checked || !sp.open || sp.keyless {
+		if e.reg.cat_done[id] || !sp.open || sp.keyless {
 			continue
 		}
-		sp.cat_checked = true
+		e.reg.cat_done[id] = true
 		_catalog_reconcile_space(e, sp)
 	}
 }
