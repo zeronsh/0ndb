@@ -25,7 +25,7 @@ WATCH_MASK :: linux.Inotify_Event_Mask {
 }
 
 @(private)
-GIT_MASK :: linux.Inotify_Event_Mask{.MODIFY, .CLOSE_WRITE, .MOVED_TO, .CREATE, .DELETE, .ONLYDIR}
+GIT_MASK :: linux.Inotify_Event_Mask{.MODIFY, .CLOSE_WRITE, .MOVED_TO, .MOVED_FROM, .CREATE, .DELETE, .ONLYDIR}
 
 _Registry_Os :: struct {
 	ifd:      linux.Fd,
@@ -328,6 +328,13 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 			}
 			m := reg.mounts[slot]
 			if git {
+				if name == "index.lock" {
+					if .CREATE in mask || .MOVED_TO in mask {
+						mount_git_lock(m, true)
+					} else if .DELETE in mask || .MOVED_FROM in mask {
+						mount_git_lock(m, false)
+					}
+				}
 				if name == "HEAD" || name == "index" || name == "ORIG_HEAD" || name == "MERGE_HEAD" {
 					mount_mark_git(m)
 				}

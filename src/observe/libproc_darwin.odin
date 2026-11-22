@@ -52,8 +52,13 @@ libproc_remove_root :: proc(l: ^Libproc, pid: prim.Pid) {
 	}
 }
 
+@(private)
+_libproc_lock_procs :: proc(data: rawptr, lock: string, roots: []string, allocator: runtime.Allocator) -> []fs.Git_Proc {
+	return _darwin_lock_procs(lock, roots, allocator)
+}
+
 libproc_observer :: proc(l: ^Libproc) -> fs.Write_Observer {
-	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop, changed = _libproc_hook, fence = _libproc_fence}
+	return fs.Write_Observer{data = l, start = _libproc_start, stop = _libproc_stop, changed = _libproc_hook, fence = _libproc_fence, lock_procs = _libproc_lock_procs}
 }
 
 @(private)
