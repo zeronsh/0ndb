@@ -123,14 +123,29 @@ models or child processes.
 
 The engine is designed so that none of these has an exception:
 
-- **Agents never silently merge each other's code.** Worktree histories have
-  *lines* (named frontiers). Every run writes on its own run line forked from
-  its message's version; when its claim wins, the thread's line fast-forwards
-  to it. Conversation branches are worktree lines, so sibling turns never
-  share files. Two lines only ever combine through an explicit land that
-  reports every overlapping concurrent region and never auto-resolves one.
-  Live editing by people on one line from several devices merges
-  character-wise, as collaborative editors do.
+- **No writer's change is ever lost or silently overridden.** Worktree
+  histories have *lines* (named frontiers); a git checkout's line is its
+  checked-out branch. Isolated work (forks, other branches) combines only
+  through an explicit land that reports every overlapping concurrent region
+  and refuses while any remain. Shared work on one line (people from several
+  devices, a chat and its tasks, two chats in one folder) merges live,
+  character-wise for positional edits and line-wise for disk edits; any
+  overlap between concurrent writers is a recorded, reported conflict region
+  that keeps both texts.
+- **No file is ever in a state nobody wrote.** Through any sequence of
+  sends, undos, branch switches and second chats, every line on disk is a
+  line some write produced (an agent, a person, git, an import), and no
+  line splices partial edits of two writers; non-overlapping concurrent
+  edits combine as in a collaborative editor.
+- **Undo is time travel for files and conversations, never for the world.**
+  Undoing a turn rewinds its whole task tree (files, the conversation, every
+  task's conversation and native session) and keeps the undone timeline as
+  a branch. Side effects outside files and conversations (deploys, network
+  calls, installs, messages sent, anything a tool did to the world) are
+  never undone.
+- **Nothing in the default flow asks a question.** Branch switches, undos and
+  second chats hold, resume and report on their own; choices exist in the
+  API for embedders and power users and are never prompted.
 - **Anything can be deleted, everywhere, without changing an id.** Record
   bodies and op contents are encrypted with per-message keys drawn from a
   puncturable key tree (a GGM tree of seeds per segment epoch). Deleting a
@@ -406,6 +421,21 @@ equal in both directions.
   kind, actor, mount id) to the device's stream; every replica checks the
   actor against that stream's device and presents the actor's edits in blame
   and conflict regions as that device.
+- **Shared writers**: several scopes writing one line in one directory (a
+  chat and its shared tasks, two chats) stay separate through base
+  frontiers. Drivers record an `Observe` op (opaque, tag `0ndb:observe` v1:
+  kind `read | write_begin`, inode, path, version frontier, content hash)
+  when a tool reads a file or begins a write, credited to the scope. A
+  scope's whole-file write is diffed against that scope's last observed
+  version of the file, not against the shadow, so a write based on a stale
+  read becomes ops concurrent with what it did not see instead of deleting
+  it; edit-style tool calls (old text → new text) are ingested as positional
+  replacements. Two scopes' edits conflict when neither's base frontier
+  contained the other's ops and they touch the same lines: both texts stay
+  in history as a conflict region with both authors, the disk keeps the
+  later write's lines (never markers in a shared directory), and both
+  conversations get a passive note with their next tool result naming the
+  region. A read with no known frontier records nothing.
 - **Commit protocol**: each batch a mount commits carries one opaque
   mount-mark op (tag 18 plus a random per-mount nonce) and, unless the line
   is held, the mount's line record, in the same journal commit. Import
@@ -456,9 +486,70 @@ equal in both directions.
   each scope boundary. Each scope boundary also writes a git tree/commit
   chain pinned at `refs/0ndb/<history>` (git checkouts) or in the device
   store, so content stays reachable and inspectable.
+- **Lines are git branches**: a git mount's line is keyed by the checked-out
+  ref, `git:refs/heads/<name>`, or `git:detached:<commit>` for a detached
+  HEAD (detaching at the same commit returns to that line); a plain folder
+  has one line. Each line keeps its own history, attribution and
+  uncommitted state. A line seen for the first time forks from the current
+  line's synced version and gets one line-granular git-op batch turning the
+  files into its commit's tree, so blame of unchanged files survives. Every
+  run is bound to the (mount, line) it started on (Conversations).
+- **Switch** (`line_switch(mount, target, runs = .Hold)`): hold the runs
+  bound to the old line (`Interrupted{reason = branch_changed}` at the next
+  tool boundary, native sessions kept), ingest everything onto the old line
+  without the settle delay, set a switch-pending flag in the mount state
+  (trusted and finished on open like adopt-pending), materialize the target
+  line's whole state including its uncommitted edits, then update git in
+  git's own order (index at the target commit, stat-refreshed so `git
+  status` shows the line's edits; then HEAD with reflog message `0ndb:
+  switch from <a> to <b>`), clear the flag, and resume the runs bound to the
+  target line. **A 0ndb switch keeps each line's uncommitted state with that
+  line (an automatic per-branch stash), while a raw git checkout carries
+  dirty files as git does**; the catalog shows on which line every
+  uncommitted change lives, so nothing seems to vanish. `carry = true` gives
+  a 0ndb switch git's semantics; `.Fork` moves held runs into an isolated
+  fork of the old line that lands on completion; `.Stop` cancels them. The
+  default is never asked.
+- **Raw checkouts** follow git's write order (`builtin/checkout.c`:
+  `merge_working_tree` takes `.git/index.lock`, `unpack_trees` unlinks then
+  writes working files, `write_locked_index` renames the lock; only then
+  `update_refs_for_switch` appends `checkout: moving from A to B` to
+  `logs/HEAD` and renames `HEAD.lock` onto `HEAD`): every working-tree write
+  precedes any HEAD or reflog signal, and a checkout without `-f` carries a
+  dirty tracked file or refuses, never overwrites it. So the mount gates on
+  the lock: when `index.lock` appears, the write observer stops answering
+  write-intent opens from the process trees of runs bound to the mount, and
+  every path dirtied before the lock event is ingested onto the current line
+  without the settle delay. The gate is bounded by events, never by time: it
+  lifts when the lock disappears or when the process that created it (known
+  to the write observer) exits, watched by child watch or pidfd; a stale
+  lock with no live holder behaves as ungated and shows a passive `stale
+  .git/index.lock` status. When the lock goes, HEAD, its target and the
+  reflog tail decide: a changed branch or detached commit with a
+  `checkout:`/`switch:` entry is a line switch A→B (git's writes are one
+  git-op batch on B, carried dirty files are ingested onto A and onto B as a
+  carry batch credited to their authors, A's runs are held, B's resume);
+  anything else (commit, reset, merge, pull, restore, stash) is a git-op
+  batch on the same line. While `rebase-merge/`, `rebase-apply/`,
+  `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `sequencer/` exist, a detached HEAD
+  belongs to the branch in `head-name` and that branch's runs stay held
+  until the operation ends; bisect steps are detached lines. A tool that
+  bypasses the lock is classified the same way on the next pass, without
+  the gate. A forced checkout destroys dirty content by the user's choice;
+  ingesting at gate time bounds the loss to what git overwrote within
+  milliseconds.
+- **Deleted branches**: runs and tasks bound to a line whose ref no longer
+  exists show `held: branch <x> deleted` (passive) and resume if the ref
+  comes back; the API can move them to the current line. Nothing is asked
+  and the line's history is kept.
 - **Going back** to a message produces new ops that turn the files into the
   message's version (history is never rewritten, every line keeps its
-  author), and restores git as described in Threads.
+  author). It never moves a git branch: if the branch moved past the
+  message's recorded commit, the restored files show in git as uncommitted
+  changes against the tip, and commits of the left timeline stay reachable
+  through `refs/0ndb/<history>`. Within a line, a conversation branch is an
+  owner-scoped selection (Conversations): only the owning task tree's ops
+  are reverted or restored, every other writer's stay.
 - **Fork**: same history id cut at the fork version. Git checkouts get a
   separate clone whose `objects/info/alternates` points at the source
   repository (no object copies, any number of forks on one branch, unlike
@@ -466,9 +557,13 @@ equal in both directions.
   else copy); plain folders get a reflink clone. Only paths that can differ
   are rewritten. **Land**: sync both ways, CRDT merge; overlapping concurrent
   regions are stored as conflicts in the fork and shown with markers there
-  only; land refuses while any remain.
+  only; land refuses while any remain. A fork's live diff against its
+  parent line is a subscribable view (`subscribe.fork_diff`), pushed on
+  ingestion.
 - **Blame** is a span lookup. **Revert** of a scope creates ops that undo
-  exactly that scope's ops, transformed through everything since.
+  exactly that scope's ops, transformed through everything since; a set
+  revert does the same for a set of scopes (undo, conversation branch
+  switches) and reverting a revert restores the ops.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
 - **Text views**: `history_view_open(inode, version)` gives a caller its own
@@ -823,13 +918,49 @@ running on it is a record in it.
   conversation it targets.
 - Runs: `Claim{msg, runner, lease, lines}` when a runner starts, `Unqueue`
   for what it consumed, `Seal` when done, `Superseded` when a reassignment
-  made a duplicate. Each run writes its own lines of every mounted tree and
-  fast-forwards the conversation's lines on success (`Landed{run}`), all
-  mounts together.
+  made a duplicate. A run is bound to the (mount, line) of each mounted tree
+  it started on and writes on that line live, and `Landed{run}` records its
+  result; only a duplicate claim's run writes on its own run line, dropped
+  when `Superseded`, and an isolated task's run writes on its fork's lines.
+  A run whose line is
+  not the one on disk is held (`Interrupted{reason = branch_changed |
+  branch_deleted | undo, line}`) and resumes with native session resume when
+  its line returns, with a note saying what changed meanwhile, if anything.
 - Mounts: `Mount{name, tree, line, path}` and `Unmount{name}` change which
   file trees a conversation works on; zero, one or many, from any
   workspace. Going back to a message restores every mounted tree (and each
   repository's git state) to that message's versions together.
+- Conversation branches are owner-scoped. The *task tree* of a conversation
+  is it plus every task its turns spawned, transitively; ownership is
+  derived (scope → task row → parent chain), never stored on ops. A branch of
+  conversation A selects which of A's tree's ops its lines carry: switching
+  branches set-reverts the A-tree ops only the old branch has and restores
+  those only the new one has, transformed through everything since; other
+  trees' ops on the line are never touched. Alone on a line this is exactly
+  a line switch. Going back and sending is such a switch.
+- **Undo** of turn T of A rewinds A's whole task tree to T's start. A send is
+  a fence (every mount of the line ingests before the `Msg` is recorded), so
+  T's `files` version `V_T` holds every write made before T. Heads at T's
+  start are derived, not recorded: each task's conversation head is its
+  newest record with `hlc < T.hlc` and its provider head the last raw
+  provider line recorded before T, so a task caught mid-turn rewinds at a
+  provider-line boundary; every replica derives the same answer. Undo holds
+  every run of A's tree (`reason = undo`), fences, set-reverts the ops after
+  `V_T` whose scope is in A's tree, moves A's leaf to T's parent and every
+  task's leaf to its derived head (a `Leaf` record plus a native session
+  rewind). Tasks spawned after T's start go with the undone timeline, hidden
+  and paused. The undone timeline is a branch (the old leaves plus the
+  reverted set); switching back restores files, leaves and sessions. After
+  an undo the tasks are paused; one resume action, or simply sending in A,
+  continues every task that was running at T's start from its rewound head.
+  An undo-pending flag in the mount state makes each step finish on open.
+- Other trees are owner-scoped out of an undo, with one rule for the
+  invariant: where another tree's edit lies inside text the undo removes (it
+  rewrote a line A had inserted or changed), that region reverts to its text
+  at `V_T` and the edit is kept as a conflict alternative offered back in
+  one action; every other edit survives byte for byte. Trees whose
+  `Observe` records show they read or began writes on versions containing
+  the reverted ops get a passive notice naming the files. Nothing blocks.
 - `Compact{from, to, summary}` records a context summary for long or
   infinite conversations; history is never dropped, the summary is what a
   model sees in place of the range. Harness-side compactions are recorded
@@ -893,14 +1024,30 @@ runner policy and takeover policy. Conversations name the agent that answers the
 ## Orchestration
 
 A task is a conversation with a parent. A captain agent creates tasks
-(child conversations with a goal, agent, mounts forked from its own lines,
-budget and runner policy), writes into them, and waits on them; children
-report by sealing results that the captain's runs see.
+(child conversations with a goal, agent, mounts, budget and runner policy),
+writes into them, and waits on them; children report by sealing results
+that the captain's runs see.
 
+- **Shared by default.** A task mounts its parent's lines in the same
+  directory and writes on them live, attributed per scope, with concurrent
+  overlaps as reported conflict regions (fs, Shared writers). **Isolated**
+  is opt-in per spawn or agent profile (`isolate: true`): mounts forked from
+  the parent's lines, landed on completion, conflicts kept in the fork and
+  land refused while any remain; its live diff against the parent is
+  `subscribe.fork_diff`. A task's merge is an ordinary change on the
+  parent's line.
+- A second top-level conversation in a folder on the same line simply
+  shares it. One bound to another line of that folder waits (`waiting:
+  <folder> is on <branch>`) and starts when the folder returns to its line;
+  embedders may set `busy_line = .Fork` to run it in an automatic fork.
+- Catalog rows of tasks and conversations carry their `(mount, line)` and
+  conversation branch. Views show the folder's current line; tasks bound to
+  other lines are listed under "on branch X" as held, undone-timeline tasks
+  under their branch. Switches and undos delete nothing.
 - Tools: `spawn`, `send`, `wait` (any/all/condition, with timeout), `list`,
-  `cancel`, `result`, `merge` (land a child's lines). The native loop has
-  them built in; harnesses get them through the 0ndb MCP server (`mcp`), so a
-  Claude Code captain orchestrates exactly like a native one.
+  `cancel`, `result`, `merge` (land an isolated child's lines). The native
+  loop has them built in; harnesses get them through the 0ndb MCP server
+  (`mcp`), so a Claude Code captain orchestrates exactly like a native one.
 - Waiting is a record (`Await{tasks, condition, deadline}`), so a captain
   resumes after a crash or on another runner without losing its place.
   Wake-ups come from object change events, never polling.
