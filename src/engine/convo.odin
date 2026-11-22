@@ -22,8 +22,13 @@ Convo_Status :: struct {
 	head_hlc:    prim.Hlc,
 }
 
-convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}) -> (o: Object, err: Error) {
+convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}, ready: Ready = {}) -> (o: Object, err: Error) {
 	context = context_for(e)
+	if ready.call != nil {
+		if sp, settling := _space_settling_id(e, space); settling {
+			return {}, _space_wait(e, sp, ready, nil)
+		}
+	}
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_create_writer(h, settings) or_return

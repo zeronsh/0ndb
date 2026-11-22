@@ -483,6 +483,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	}
 	_converged(w, spaces[0], {M_A, M_B}, "after approval")
 	_live_space(w, mw, M_A, {M_B}, "live-from-a")
+	_adoption_window(w, mw)
 
 	_down(w, M_A)
 	_down(w, M_B)
@@ -638,7 +639,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	_settle(w, 3000)
 	_live_space(w, mw, M_C, {M_A, M_B, M_D}, "live-from-c")
 	_down(w, M_D)
-	if _, o, r, ok := _live_space(w, mw, M_A, {M_B, M_C}, "live-while-d-down"); ok {
+	if _, o, r, live := _live_space(w, mw, M_A, {M_B, M_C}, "live-while-d-down"); live {
 		_up(w, M_D)
 		if !_wait_read(w, M_D, o, r, "live-while-d-down", 30_000) {
 			_fail(w, "n5 never opened the space created while it was offline")
@@ -801,16 +802,16 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 		}
 	}
 	_settle(w, 3000)
-	if id, _, _, ok := _live_space(w, mw, M_C, {M_A, M_D}, "after-device-remove"); ok {
+	if id, _, _, live := _live_space(w, mw, M_C, {M_A, M_D}, "after-device-remove"); live {
 		_settle(w, 3000)
-		b := w.nodes[M_B]
-		context = instance_context(&b.inst)
-		for x in eng.space_list(&b.e, context.temp_allocator) {
+		nb := w.nodes[M_B]
+		context = instance_context(&nb.inst)
+		for x in eng.space_list(&nb.e, context.temp_allocator) {
 			if x.id == id {
 				_fail(w, "the removed n1 was handed a space created after its removal")
 			}
 		}
-		node_after(b)
+		node_after(nb)
 	}
 }
 
@@ -842,6 +843,100 @@ _live_space :: proc(w: ^World, mw: ^Mem_World, from: int, readers: []int, name: 
 		}
 	}
 	return sid, obj, rid, true
+}
+
+@(private = "file")
+Window_Probe :: struct {
+	fired: int,
+	err:   eng.Error,
+	rid:   eng.Rid,
+}
+
+@(private = "file")
+_adoption_window :: proc(w: ^World, mw: ^Mem_World) {
+	a := w.nodes[M_A]
+	b := w.nodes[M_B]
+	context = instance_context(&a.inst)
+	sid, cerr := eng.space_create(&a.e, "window", "relay", w.relay.public)
+	ao, oerr := eng.convo_create(&a.e, sid, eng.Convo_Settings{title = "window"})
+	node_after(a)
+	if cerr != .None || oerr != .None {
+		_fail(w, "window: n0 create %v %v", cerr, oerr)
+		return
+	}
+	append(&mw.owned, sid)
+	found := false
+	for _ in 0 ..< 30_000 {
+		context = instance_context(&b.inst)
+		for x in eng.space_list(&b.e, context.temp_allocator) {
+			if x.id == sid {
+				found = true
+			}
+		}
+		node_after(b)
+		if found {
+			break
+		}
+		run_until(w, w.now + 1_000_000, false)
+	}
+	if !found {
+		_fail(w, "window: n1 never adopted the space")
+		return
+	}
+	cp := new(Window_Probe, w.allocator)
+	sp := new(Window_Probe, w.allocator)
+	ready := eng.Ready {
+		data = cp,
+		call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+			p := (^Window_Probe)(data)
+			p.fired += 1
+			p.err = err
+		},
+	}
+	done := eng.Done {
+		data = sp,
+		call = proc(data: rawptr, e: ^eng.Engine, res: ^eng.Result, err: eng.Error) {
+			p := (^Window_Probe)(data)
+			p.fired += 1
+			p.err = err
+			p.rid = res.item
+		},
+	}
+	context = instance_context(&b.inst)
+	st, _ := eng.space_members_status(&b.e, sid)
+	_, c1 := eng.convo_create(&b.e, sid, eng.Convo_Settings{title = "in-window"}, ready)
+	_, s1 := eng.convo_send(&b.e, ao, "sent-in-window", done = done)
+	node_after(b)
+	if c1 != .Pending || s1 != .Pending {
+		_fail(w, "window: create %v and send %v issued while n1 adopts (eligible=%v epoch=%d) should wait for its membership", c1, s1, st.eligible, st.epoch)
+		return
+	}
+	for _ in 0 ..< 300 {
+		if cp.fired > 0 && sp.fired > 0 {
+			break
+		}
+		_settle(w, 100)
+	}
+	if cp.fired != 1 || cp.err != .None || sp.fired != 1 || sp.err != .None {
+		_fail(w, "window: waits finished create=%d/%v send=%d/%v", cp.fired, cp.err, sp.fired, sp.err)
+		return
+	}
+	rid := sp.rid
+	free(sp, w.allocator)
+	context = instance_context(&b.inst)
+	bo, c2 := eng.convo_create(&b.e, sid, eng.Convo_Settings{title = "in-window"})
+	node_after(b)
+	free(cp, w.allocator)
+	if c2 != .None {
+		_fail(w, "window: create after the wait: %v", c2)
+		return
+	}
+	if !_wait_read(w, M_A, ao, rid, "sent-in-window", 20_000) {
+		_fail(w, "window: n0 cannot read what n1 sent in the adoption window")
+	}
+	if r, ok := _send(w, M_B, bo, "created-in-window"); !ok || !_wait_read(w, M_A, bo, r, "created-in-window", 20_000) {
+		_fail(w, "window: n0 cannot read the conversation n1 created in the adoption window")
+	}
 }
 
 @(private = "file")
