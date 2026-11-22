@@ -22,6 +22,8 @@ Relay_Stats :: struct {
 	pulls:      u64,
 	served:     u64,
 	piped_bytes: u64,
+	lived:      u64,
+	lived_bytes: u64,
 }
 
 Relay_Space_Stats :: struct {
@@ -125,6 +127,7 @@ Space_State :: struct {
 	present:  map[Device_Id]Presence_Entry,
 	pipes:    [dynamic]Pipe,
 	live:     [dynamic]^Conn,
+	livers:   map[Stream_Id][dynamic]^Conn,
 	count:    Relay_Space_Stats,
 }
 
@@ -160,6 +163,7 @@ Op_Kind :: enum u8 {
 	Discard,
 	Fill,
 	Serve,
+	Live,
 }
 
 Op :: struct {
@@ -264,6 +268,7 @@ Conn :: struct {
 	out:       [dynamic]Out,
 	out_head:  int,
 	subs:      [dynamic]Sub,
+	lives:     [dynamic]Stream_Id,
 	rr:        int,
 	scan:      bool,
 	listing:   ^Listing,
@@ -593,6 +598,7 @@ _conn_alloc :: proc(r: ^Relay_Core) -> (c: ^Conn, err: Error) {
 	parser_init(&c.parser, true, r.allocator)
 	c.out = make([dynamic]Out, r.allocator)
 	c.subs = make([dynamic]Sub, r.allocator)
+	c.lives = make([dynamic]Stream_Id, r.allocator)
 	c.stash = make([dynamic]u8, r.allocator)
 	r.stats.conns += 1
 	r.stats.pending += 1
@@ -606,6 +612,7 @@ _reap :: proc(r: ^Relay_Core) {
 		parser_destroy(&c.parser)
 		delete(c.out)
 		delete(c.subs)
+		delete(c.lives)
 		delete(c.stash)
 		free(c, r.allocator)
 	}
@@ -656,6 +663,7 @@ _conn_close :: proc(c: ^Conn) {
 	sp := c.space
 	if sp != nil {
 		_pipes_conn_closed(r, sp, c)
+		_lives_conn_closed(r, sp, c)
 		_remove_conn(&sp.live, c)
 		_presence_leave(r, sp, c)
 		if c.watching {
@@ -941,6 +949,8 @@ _handle :: proc(c: ^Conn, it: ^Item) {
 			_on_fill_begin(c, &rd, i64(it.total))
 		case .Serve:
 			_on_serve_begin(c, &rd, i64(it.total))
+		case .Live:
+			_on_live_begin(c, &rd, i64(it.total))
 		case:
 			_fail(c, .Protocol)
 		}
@@ -1061,6 +1071,7 @@ _space_get :: proc(r: ^Relay_Core, id: Space_Id) -> (sp: ^Space_State, err: Erro
 	sp.redlog_fp = make([dynamic]^Pending, r.allocator)
 	sp.present = make(map[Device_Id]Presence_Entry, r.allocator)
 	sp.pipes = make([dynamic]Pipe, r.allocator)
+	sp.livers = make(map[Stream_Id][dynamic]^Conn, r.allocator)
 	sp.live = make([dynamic]^Conn, r.allocator)
 	r.spaces[id] = sp
 	return sp, .None
@@ -1100,6 +1111,10 @@ _space_release :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	delete(sp.redlog_fp)
 	delete(sp.present)
 	delete(sp.pipes)
+	for _, l in sp.livers {
+		delete(l)
+	}
+	delete(sp.livers)
 	delete(sp.live)
 	r.store.namespace_close(r.store.data, sp.ns)
 	free(sp, r.allocator)
@@ -1412,6 +1427,10 @@ _on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
 		_fail(c, .Protocol)
 		return
 	}
+	if flags & FOLLOW_LIVE != 0 {
+		_on_follow_live(c, rd, count)
+		return
+	}
 	if flags & FOLLOW_WATCH != 0 && !c.watching {
 		if _, e := append(&c.space.watchers, c); e != nil {
 			_conn_close(c)
@@ -1452,7 +1471,7 @@ _on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
 			}
 		}
 		if !found {
-			if len(c.subs) >= r.cfg.max_follows {
+			if len(c.subs) + len(c.lives) >= r.cfg.max_follows {
 				_reply_refused(c, .Limit, cast([32]u8)id)
 				_stream_maybe_release(r, st)
 				continue
@@ -1495,6 +1514,7 @@ _on_unfollow :: proc(c: ^Conn, rd: ^prim.Reader) {
 	}
 	for _ in 0 ..< count {
 		id := Stream_Id(get_id32(rd))
+		_live_unfollow(c, id)
 		for i := 0; i < len(c.subs); i += 1 {
 			st := c.subs[i].stream
 			if st.id == id {
@@ -1742,7 +1762,7 @@ _on_bulk_data :: proc(c: ^Conn, data: []u8) {
 		if op.failed == .None {
 			op.failed = r.store.append_write(r.store.data, op.w, data)
 		}
-	case .Serve:
+	case .Serve, .Live:
 		if op.buf != nil {
 			op.pos += copy(op.buf[op.pos:], data)
 		}
@@ -1766,7 +1786,7 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_id(c, .Stored, op.id)
 		case .Noted:
 			_reply_hollow(c, .Noted, op.id, op.base, op.len)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered, .Note, .Fill, .Pull, .Serve, .Hollow, .Pulled, .Served, .Unserved, .Account, .Accounted, .Trim, .Trimmed:
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered, .Note, .Fill, .Pull, .Serve, .Hollow, .Pulled, .Served, .Unserved, .Account, .Accounted, .Trim, .Trimmed, .Live, .Lived:
 		}
 	case .Append:
 		st := op.stream
@@ -1796,6 +1816,8 @@ _on_bulk_end :: proc(c: ^Conn) {
 		_fill_end(c, &op)
 	case .Serve:
 		_serve_end(c, &op)
+	case .Live:
+		_live_end(c, &op)
 	}
 }
 
@@ -1820,7 +1842,7 @@ _op_abort :: proc(c: ^Conn) {
 		op.stream.busy = false
 		op.stream.poisoned = true
 		_stream_unref(r, op.stream)
-	case .Serve:
+	case .Serve, .Live:
 		if op.buf != nil {
 			delete(op.buf, r.allocator)
 		}

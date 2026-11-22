@@ -218,7 +218,8 @@ _on_pull :: proc(c: ^Conn, rd: ^prim.Reader) {
 	id := Stream_Id(get_id32(rd))
 	from := prim.read_u64le(rd)
 	to := prim.read_u64le(rd)
-	if !prim.reader_done(rd) || from > u64(max(i64)) || to > u64(max(i64)) || to < from {
+	draft := from & PULL_DRAFT != 0
+	if !prim.reader_done(rd) || (draft && (from &~ PULL_DRAFT >= DRAFT_MSG_MAX || to >= DRAFT_MSG_MAX)) || (!draft && (from > u64(max(i64)) || to > u64(max(i64)) || to < from)) {
 		_fail(c, .Protocol)
 		return
 	}

@@ -2023,6 +2023,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		}
 	case .Unserved:
 		_on_unserved(r, ev)
+	case .Lived:
 	case .Probed:
 		if Stream_Id(ev.id) == reserved_id(FEED_TAG, 0) {
 			r.feed_target = ev.length

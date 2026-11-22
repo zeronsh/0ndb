@@ -100,9 +100,11 @@ bytes (`CONTROL_MAX`). Bulk frames have a fixed part followed by content:
 | Fill (client) | 40 | `APPEND_MAX` |
 | Put (client) | 32 | `OBJECT_MAX` = 2^32 - 65 |
 | Serve (client) | 64 | `SERVE_MAX` = 256 KiB |
+| Live (client) | 48 | `LIVE_MAX` = 256 KiB |
 | Data (relay) | 48 | `OBJECT_MAX` (a relay sends at most `DATA_MAX` = 4 MiB) |
 | Object (relay) | 32 | `OBJECT_MAX` |
 | Served (relay) | 64 | `SERVE_MAX` |
+| Lived (relay) | 48 | `LIVE_MAX` |
 
 A relay rejects a client frame whose kind is not a client kind, whose `len`
 is smaller than its fixed part (`Protocol`) or whose content exceeds the
@@ -134,12 +136,13 @@ split across any number of transport reads.
 | Pull | 0x13 | | Presence | 0x92 |
 | Serve | 0x14 | | Directed | 0x93 |
 | Account | 0x15 | | Undelivered | 0x94 |
-| | | | Noted | 0x95 |
+| Live | 0x17 | | Noted | 0x95 |
 | | | | Hollow | 0x96 |
 | | | | Pulled | 0x97 |
 | | | | Served | 0x98 |
 | | | | Unserved | 0x99 |
 | | | | Accounted | 0x9a |
+| | | | Lived | 0x9b |
 
 ### 3.2 Codes
 
@@ -194,7 +197,7 @@ relay is 25 bytes and has no `features`).
 | 0 | `Account` / `Accounted` (section 8.13) |
 | 1 | `Trim` (section 8.14) |
 | 2 | reads below a trimmed `base`: `Trimmed` (section 8.14) |
-| 3 | reserved: live drafts (`Live` / `Lived`) |
+| 3 | live drafts: `Live` / `Lived`, `Follow` flag LIVE, draft pulls (section 8.16) |
 
 The signature in every built-in credential is Ed25519 over the **hello
 message** `"0ndb hello 1" ‖ 00 00 00 00 ‖ B`, where `B` is the 64-byte binding,
@@ -406,7 +409,7 @@ exist reads as empty with length 0.
 ### 8.3 Follow (0x06), Unfollow (0x07)
 
 ```
-Follow   := flags u8 | count u16 (<= 1024) | (id | offset u64)*     flags bit 0: watch
+Follow   := flags u8 | count u16 (<= 1024) | (id | offset u64)*     flags bit 0: watch, bit 1: LIVE
 Length   := count u16 | (id | length u64)*
 Unfollow := count u16 | id*
 ```
@@ -418,8 +421,10 @@ offset. The relay then sends one `Length` for the accepted entries and pushes
 `Data` (without `FINAL`) from each offset as bytes become durable, round
 robin across segments in chunks of at most 4 MiB. With the watch flag the
 connection also receives `Created` for every new segment it can read.
-`Unfollow` stops pushes; it has no reply. A count that does not match the
-payload is `Error Protocol`.
+`Unfollow` stops pushes and ends live interest (section 8.16) in each id; it
+has no reply. A count that does not match the payload is `Error Protocol`.
+A Follow with the LIVE flag (feature bit 3) is handled entirely by section
+8.16 and reads no storage.
 
 ### 8.4 Redact (0x0b)
 
@@ -595,6 +600,17 @@ disconnects its pipes close silently. The relay buffers at most one frame per
 pipe and stops reading a holder while its requester has more than 1 MiB of
 served bytes queued. The relay never stores piped bytes.
 
+With feature bit 3, a `Pull` whose `from` has bit 63 (`DRAFT`) set is a
+**draft pull**: `from = DRAFT | msg` with `msg < 2^62` names the live draft
+of the message record at offset `msg` of segment `id`, and `to < 2^62` is
+the first draft offset the requester lacks. The relay applies exactly the
+checks above (Read on `id`, holder, pipe limits, tags) and never interprets
+the range; the holder answers with `Serve` frames whose `at` is a draft
+offset (at or after `to`) and whose length word is the holder's draft
+length, or with NONE when it holds no draft for the message. Any other
+`from` above `2^63 - 1`, or a draft pull with `msg` or `to` at or past
+`2^62`, is `Error Protocol`.
+
 ### 8.13 Account (0x15, feature bit 0)
 
 ```
@@ -662,6 +678,40 @@ of `to` that follows the feed with PRESENCE, or answers `Undelivered` at once.
 It keeps no state and never reads the payload, which endpoints encrypt end to
 end (sign-in approvals and cross-device search use it).
 
+### 8.16 Live drafts: Live (0x17), Lived (0x9b), feature bit 3
+
+```
+Follow (LIVE) := 2 | count u16 (<= 1024) | (id | offset u64)*     offset ignored
+Live          := id | msg u64 | at u64 | bytes (<= 256 KiB)       (bulk)
+Lived         := id | msg u64 | at u64 | bytes                    (bulk)
+```
+
+A draft is the live preview of a message that a segment's writer is still
+streaming. It is never stored: the relay forwards it, keeps no copy, writes
+nothing, appends no feed entry and acknowledges nothing.
+
+- `Follow` with flag LIVE registers *live interest* in each id: `Read`
+  access, else `Refused Not_Owner`; the follow limit counts live interests
+  together with follows, else `Refused Limit`. A repeated id is registered
+  once. There is no `Length` reply and no storage read; the watch flag is
+  ignored. Live interest ends with `Unfollow` or when the connection closes.
+- `Live` needs `Append` access on `id` (the writer's own segment), else the
+  content is consumed and the answer is `Refused Not_Owner`. `msg` and `at`
+  must be below `2^62`, else `Error Protocol`. The relay sends `Lived` with
+  the identical payload, at once, to every other ready connection with live
+  interest in `id` that still has `Read` access, skipping any connection
+  with 128 or more queued outputs (a dropped `Lived` is recovered by the
+  reader with a draft pull). Nothing else happens: `Live` with no live
+  followers is a no-op.
+
+The bytes are journal records (section 8.4 framing) of the writer's draft
+for message `msg`, starting at draft offset `at`, sealed end to end exactly
+like segment records but under a per-message draft key, with nonce = draft
+offset. A writer sends only bytes that are durable in its local draft, so a
+draft offset never carries two different ciphertexts. Readers detect a gap
+(`at` beyond what they hold) and fetch it with a draft pull (section 8.12)
+from the segment's writer, the device in the first 16 bytes of `id`.
+
 ## 9. Flow control
 
 A relay stops reading a connection while it has 32 durable writes in flight,
@@ -687,6 +737,7 @@ so a slow reader slows only itself.
 | connections per space | 4096 (reference default) |
 | pipes per requester | 64 |
 | serve frame | 256 KiB; requester high water 1 MiB |
+| live frame | 256 KiB; skipped for a follower with 128 queued outputs |
 | direct payload | 65507 |
 | membership bytes inspected per append | 1 MiB |
 | Hello timeout | host-defined, reference 10 s |
@@ -792,6 +843,7 @@ storage completion as an input, which every sans-IO relay does.
 | malformed | oversize control frame, unknown kind, relay kind from a client, short payload, count mismatches, inverted Redact, short bulk header, NONE with bytes, oversize Direct, second Hello, Note beyond 2^62; bytes after the Error ignored; Read with to < from |
 | compaction | feed folding with a redaction, followers jumping to the new end, a late reader starting at the new start, Listing after compaction |
 | limits | per-principal connection limit, per-connection follow limit |
+| live | LIVE follows without Length or storage, Live forwarded unstored to live followers only, a repeated id registered once, Refused for a non-owner, Unfollow, draft pulls answered through the pipe and with NONE, live interest dropped on close, Error for `msg >= 2^62` |
 
 ## 13. Extensions
 
@@ -805,7 +857,7 @@ trimmed). Assigned so far:
 |---|---|---|---|
 | 1 | `Trim` 0x16 | | |
 | 2 | | `Trimmed` 0x9c | |
-| 3 (live drafts, reserved) | `Live` 0x17 | `Lived` 0x9b | Follow flag bit 1 `LIVE`, Pull `from` bit 63 `DRAFT` |
+| 3 (live drafts) | `Live` 0x17 | `Lived` 0x9b | Follow flag bit 1 `LIVE`, Pull `from` bit 63 `DRAFT` |
 
 Reads below a trimmed base are not served by the relay: the archive is the
 writer's own stream, so a relay needs no archive tier and never holds plain
@@ -831,3 +883,7 @@ wasm, and fixed in the reference core:
   record left earlier records zero-filled while answering `Refused Io`; it now
   validates the whole range first and changes nothing on failure.
 - Welcome gained `features`, and `Account`/`Accounted` were added behind it.
+- Live drafts (feature bit 3): `Live`/`Lived`, the LIVE follow flag and
+  draft pulls, so streaming text reaches other devices without the relay
+  storing a byte of it. `Pull` previously rejected any `from` above
+  `2^63 - 1`; with bit 3 it accepts draft pulls. Welcome `features` is 15.

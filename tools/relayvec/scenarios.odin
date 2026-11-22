@@ -42,6 +42,7 @@ scenarios :: proc() -> []Scenario {
 		{"compaction", "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base.", sc_compaction},
 		{"trim", "Trim drops stored content below a base an archive covers: owner only, acknowledged once durable, idempotent, never lowers base, refused at or past the length; readers, probes and follows get Trimmed; Fill below a trim stores nothing.", sc_trim},
 		{"limits", "Per-principal connection limit and per-connection follow limit.", sc_limits},
+		{"live", "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow, draft pulls through the peer pipe, malformed Live.", sc_live},
 	}
 	return list[:]
 }
@@ -337,6 +338,27 @@ f_pull :: proc(holder: osync.Device_Id, tag: u64, id: [32]u8, from, to: i64) -> 
 
 f_serve :: proc(requester: osync.Device_Id, tag: u64, id: [32]u8, at: i64, word: u64, data: []u8) -> []u8 {
 	return frame(.Serve, dev16(requester), le64(tag), ids(id), le64(u64(at)), le64(word), data)
+}
+
+f_pull_draft :: proc(holder: osync.Device_Id, tag: u64, id: [32]u8, msg, from: u64) -> []u8 {
+	return frame(.Pull, dev16(holder), le64(tag), ids(id), le64(osync.PULL_DRAFT | msg), le64(from))
+}
+
+f_live :: proc(id: [32]u8, msg, at: u64, data: []u8) -> []u8 {
+	return frame(.Live, ids(id), le64(msg), le64(at), data)
+}
+
+f_follow_live :: proc(streams: ..[32]u8) -> []u8 {
+	parts := make([dynamic][]u8, context.temp_allocator)
+	append(&parts, []u8{osync.FOLLOW_LIVE, u8(len(streams)), 0})
+	for s in streams {
+		append(&parts, ids(s), le64(0))
+	}
+	return frame(.Follow, ..parts[:])
+}
+
+f_unfollow1 :: proc(id: [32]u8) -> []u8 {
+	return frame(.Unfollow, []u8{1, 0}, ids(id))
 }
 
 f_direct :: proc(to: osync.Device_Id, tag: u64, payload: []u8) -> []u8 {
@@ -685,6 +707,36 @@ sc_pipe :: proc(v: ^Vector) {
 	send(v, "bob", f_pull(alice.dev, 11, h1, 0, 10), "Pull with a tag already open")
 	send(v, "alice", f_serve(carol.dev, 11, h1, 0, 1000, part[:4]), "Serve to the wrong requester is dropped")
 	disconnect(v, "alice")
+}
+
+sc_live :: proc(v: ^Vector) {
+	alice, bob, carol := key_make(1), key_make(2), key_make(3)
+	sp := space_make(v, alice, 0x21)
+	addb := space_add(sp, alice, bob, .Member)
+	addc := space_add(sp, alice, carol, .Member)
+	join(v, "alice", sp, alice, sp.genesis)
+	join(v, "bob", sp, bob, addb)
+	join(v, "carol", sp, carol, addc)
+	h := stream(alice, 4)
+	d1 := rec("draft one", 0)
+	d2 := rec("draft two", i64(len(d1)))
+	send(v, "alice", f_live(h, 96, 0, d1), "Live with no live followers goes nowhere")
+	send(v, "bob", f_follow_live(h), "bob follows alice's segment live: no Length, no storage read")
+	send(v, "alice", f_live(h, 96, 0, d1), "Live is forwarded at once as Lived, with no acknowledgement and nothing stored")
+	send(v, "carol", f_follow_live(h, h), "carol follows live; a repeated id is registered once")
+	send(v, "alice", f_live(h, 96, u64(len(d1)), d2), "Lived to every live follower")
+	send(v, "bob", f_live(h, 96, 0, d1), "Live on another device's segment is refused")
+	send(v, "bob", f_unfollow1(h), "Unfollow ends live interest")
+	send(v, "alice", f_live(h, 96, 0, d1), "only carol still receives it")
+	durable(v, "Live writes nothing")
+	send(v, "carol", f_pull_draft(alice.dev, 3, h, 96, 0), "a draft pull: from = DRAFT | msg, to = first draft offset wanted")
+	both := cat(d1, d2)
+	send(v, "alice", f_serve(carol.dev, 3, h, 0, osync.SERVE_FINAL | u64(len(both)), both), "the writer serves its draft through the pipe")
+	send(v, "carol", f_pull_draft(alice.dev, 4, h, 97, 0), "a draft pull for a message without a draft")
+	send(v, "alice", f_serve(carol.dev, 4, h, 0, osync.SERVE_NONE | osync.SERVE_FINAL, nil), "answered none")
+	disconnect(v, "carol")
+	send(v, "alice", f_live(h, 96, 0, d1), "a closed connection's live interest is gone")
+	send(v, "bob", f_live(stream(bob, 4), osync.DRAFT_MSG_MAX, 0, d1), "msg at or past 2^62 is a protocol error")
 }
 
 sc_presence :: proc(v: ^Vector) {
