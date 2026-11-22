@@ -297,7 +297,9 @@ any user device online. Pieces:
   gone to sleep, the request names that runner (`runner`): wake it (its disk
   keeps the checkout and caches; on wake it asks the pool host to renew its
   lapsed lease, `Runner_Pool.renew`, and takes the work) or launch another and `assign` it. `assign(object,
-  pool)` from a UI ("continue in Cloud") is the same request.
+  pool)` from a UI ("continue in Cloud") is the same request. The
+  `scheduler` host plug (`ondb::Scheduler` in Rust, `ondb_scheduler` in C)
+  answers every placement in the host's own code, asynchronously.
 
 ```rust
 struct Sandboxes { tokens: TokenVerifier, pool_identity: ondb::PublicIdentity }

@@ -85,6 +85,7 @@ Plug_Reply :: struct {
 	prf:        [32]u8,
 	ecosystem:  Ecosystem,
 	lease_ms:   u64,
+	runner:     prim.Id,
 }
 
 Plug_Done :: struct {

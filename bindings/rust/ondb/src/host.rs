@@ -152,6 +152,41 @@ pub trait PoolUser: Send + Sync + 'static {
     fn joined(&self, joined: PoolJoined);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementKind {
+    Message,
+    Takeover,
+    Intent,
+    Revive,
+    Schedule,
+    Channel,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlacementRequest {
+    pub kind: PlacementKind,
+    pub space: [u8; 16],
+    pub object: [u8; 16],
+    pub msg: Option<([u8; 16], i64, u64)>,
+    pub sender: Option<[u8; 16]>,
+    pub agent: Option<[u8; 16]>,
+    pub provider: String,
+    pub policy: Vec<u8>,
+    pub exclude: Option<[u8; 16]>,
+    pub prefer: Option<[u8; 16]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementDecision {
+    Runner([u8; 16]),
+    Wait,
+    Reference,
+}
+
+pub trait Scheduler: Send + Sync + 'static {
+    fn place(&self, req: &PlacementRequest, cancel: &CancelToken) -> PlugResult<PlacementDecision>;
+}
+
 pub trait Credentials: Send + Sync + 'static {
     fn spaces(&self) -> Vec<[u8; 16]>;
     fn produce(&self, space: &[u8; 16], binding: &[u8], cancel: &CancelToken) -> PlugResult<Vec<u8>>;
@@ -164,6 +199,7 @@ struct Plugs {
     pool: Option<Arc<dyn RunnerPool>>,
     user: Option<Arc<dyn PoolUser>>,
     creds: Option<Arc<dyn Credentials>>,
+    sched: Option<Arc<dyn Scheduler>>,
 }
 
 impl Plugs {
@@ -183,6 +219,9 @@ impl Plugs {
         }
         if self.creds.is_some() {
             v.push("credentials");
+        }
+        if self.sched.is_some() {
+            v.push("scheduler");
         }
         v
     }
@@ -241,6 +280,11 @@ impl HostBuilder {
 
     pub fn credentials(mut self, c: impl Credentials) -> Self {
         self.plugs.creds = Some(Arc::new(c));
+        self
+    }
+
+    pub fn scheduler(mut self, s: impl Scheduler) -> Self {
+        self.plugs.sched = Some(Arc::new(s));
         self
     }
 
@@ -554,7 +598,57 @@ fn run(p: &Plugs, body: &[u8], cancel: &CancelToken) -> PlugResult<Writer> {
             let cred = c.produce(&space, &binding, cancel)?;
             w.bytes(&cred);
         }
+        14 => {
+            let s = p.sched.as_ref().ok_or(PlugError::UNSUPPORTED)?;
+            let kind = match r.uvarint() {
+                0 => PlacementKind::Message,
+                1 => PlacementKind::Takeover,
+                2 => PlacementKind::Intent,
+                3 => PlacementKind::Revive,
+                4 => PlacementKind::Schedule,
+                5 => PlacementKind::Channel,
+                _ => return Err(bad),
+            };
+            let space = r.id();
+            let object = r.id();
+            let seg = r.id();
+            let off = r.ivarint();
+            let gen = r.uvarint();
+            let sender = some_id(r.id());
+            let agent = some_id(r.id());
+            let provider = r.str();
+            let policy = r.bytes();
+            let exclude = some_id(r.id());
+            let prefer = some_id(r.id());
+            if !r.done() {
+                return Err(bad);
+            }
+            let msg = some_id(seg).map(|s| (s, off, gen));
+            let req = PlacementRequest { kind, space, object, msg, sender, agent, provider, policy, exclude, prefer };
+            match s.place(&req, cancel)? {
+                PlacementDecision::Runner(id) => {
+                    w.buf.extend_from_slice(&id);
+                    w.bool(false);
+                }
+                PlacementDecision::Wait => {
+                    w.buf.extend_from_slice(&[0u8; 16]);
+                    w.bool(false);
+                }
+                PlacementDecision::Reference => {
+                    w.buf.extend_from_slice(&[0u8; 16]);
+                    w.bool(true);
+                }
+            }
+        }
         _ => return Err(PlugError::UNSUPPORTED),
     }
     Ok(w)
+}
+
+fn some_id(id: [u8; 16]) -> Option<[u8; 16]> {
+    if id == [0u8; 16] {
+        None
+    } else {
+        Some(id)
+    }
 }
