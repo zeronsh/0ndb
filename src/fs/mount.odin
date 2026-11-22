@@ -289,6 +289,8 @@ Mount :: struct {
 	mat:         ^Mat_Sync,
 	owed:        Mat_Sync,
 	merge_base:  Version,
+	mat_retries: int,
+	mat_bytes:   int,
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
 	log_len:     i64,
