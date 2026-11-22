@@ -2130,3 +2130,24 @@ members | remove | rotate | recovery-key | pool | pair | join | status | ls |
 new | send | queue | steer | edit | switch | back | log | show | search |
 interrupt | models | agent | task | workspace | mount | schedule | blame |
 revert | land | share | redact | verify`.
+
+`new` prints the created id once the create returns, then, while connected,
+waits for `object.uploaded` so the printed id resolves on other devices at
+once (offline it returns at local durability; a dropped connection or Ctrl-C
+ends the wait with a note). The daemon API stays local-first; only the CLI
+waits. Cost of that wait, measured with strace on Linux:
+- On the device, exactly one full sync precedes the upload: the pack batch
+  holding the create (on macOS one `F_FULLFSYNC`). Ack bookkeeping is synced
+  afterwards, on the durability worker, off the wait's path.
+- On the relay, one group commit per appended stream: five back-to-back
+  syncs for a new conversation, which dominate on macOS.
+- Separately, before the wait: the CLI's current-conversation pointer
+  (`daemon.state`), one file sync plus one directory sync.
+
+Measured `new` latency, median including process start:
+
+| Platform | Before the wait | With the wait |
+|---|---|---|
+| Linux | 4.9 ms | 10.2 ms |
+| Windows | – | 16 ms |
+| macOS (97%-full APFS) | 73 ms | 169 ms |
