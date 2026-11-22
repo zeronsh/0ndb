@@ -176,6 +176,9 @@ _run_free :: proc(run: ^Run) {
 	}
 	virtual.arena_destroy(&run.arena)
 	free(run, r.allocator)
+	if !r.closing {
+		_hold_waits_check(r)
+	}
 }
 
 @(private)

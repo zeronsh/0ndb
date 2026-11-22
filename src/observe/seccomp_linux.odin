@@ -79,6 +79,12 @@ GATE_EXEMPT :: 16
 LOCKS_SEEN :: 16
 
 @(private)
+Gate_Move :: struct {
+	from: u32,
+	to:   u32,
+}
+
+@(private)
 Gate :: struct {
 	id:       u32,
 	root:     [prim.PATH_MAX]u8,
@@ -189,6 +195,8 @@ Supervisor :: struct {
 	gates:      [GATE_MAX]Gate,
 	gate_n:     int,
 	gate_next:  u32,
+	moves:      [GATE_MAX]Gate_Move,
+	move_next:  int,
 	gate_count: u32,
 	locks:      [LOCKS_SEEN]Lock_Seen,
 	lock_next:  int,
@@ -419,11 +427,20 @@ supervisor_gate :: proc(s: ^Supervisor, root: string, exempt: []prim.Pid) -> (id
 supervisor_ungate :: proc(s: ^Supervisor, id: u32) {
 	sync.mutex_lock(&s.gate_mu)
 	for i in 0 ..< s.gate_n {
-		if s.gates[i].id == id {
-			s.gates[i] = s.gates[s.gate_n - 1]
-			s.gate_n -= 1
-			break
+		if s.gates[i].id != id {
+			continue
 		}
+		root := string(s.gates[i].root[:s.gates[i].root_len])
+		for j in 0 ..< s.gate_n {
+			if j != i && _under(root, string(s.gates[j].root[:s.gates[j].root_len])) {
+				s.moves[s.move_next] = Gate_Move{from = id, to = s.gates[j].id}
+				s.move_next = (s.move_next + 1) % GATE_MAX
+				break
+			}
+		}
+		s.gates[i] = s.gates[s.gate_n - 1]
+		s.gate_n -= 1
+		break
 	}
 	intrinsics.atomic_store(&s.gate_count, u32(s.gate_n))
 	sync.mutex_unlock(&s.gate_mu)
@@ -498,15 +515,25 @@ _gate_match :: proc(s: ^Supervisor, path, from: string, tgid: prim.Pid, lineage:
 }
 
 @(private)
-_gate_active :: proc(s: ^Supervisor, id: u32) -> bool {
+_gate_heir :: proc(s: ^Supervisor, id: u32) -> u32 {
 	sync.mutex_lock(&s.gate_mu)
 	defer sync.mutex_unlock(&s.gate_mu)
-	for i in 0 ..< s.gate_n {
-		if s.gates[i].id == id {
-			return true
+	cur := id
+	steps: for _ in 0 ..= GATE_MAX {
+		for i in 0 ..< s.gate_n {
+			if s.gates[i].id == cur {
+				return cur
+			}
 		}
+		for m in s.moves {
+			if m.from == cur && m.to != 0 {
+				cur = m.to
+				continue steps
+			}
+		}
+		return 0
 	}
-	return false
+	return 0
 }
 
 @(private)
@@ -542,9 +569,12 @@ _release_parked :: proc(s: ^Supervisor, t: ^Tree, all: bool) {
 	sh := &s.shared[t.slot]
 	i := 0
 	for i < t.parked_n {
-		if !all && _gate_active(s, t.parked[i].gate) {
-			i += 1
-			continue
+		if !all {
+			if g := _gate_heir(s, t.parked[i].gate); g != 0 {
+				t.parked[i].gate = g
+				i += 1
+				continue
+			}
 		}
 		_reply_id(t, t.parked[i].id)
 		last := t.parked_n - 1

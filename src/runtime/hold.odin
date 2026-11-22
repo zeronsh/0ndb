@@ -5,8 +5,18 @@ import eng "../engine"
 import "../fs"
 import "../prim"
 
-runtime_hold_line :: proc(r: ^Runtime, tree: prim.Id, line: string, reason: convo.Hold_Reason) -> (held: int) {
+Hold_Wait :: struct {
+	tree: prim.Id,
+	line: string,
+	done: proc(data: rawptr, ok: bool),
+	data: rawptr,
+}
+
+runtime_hold_line :: proc(r: ^Runtime, tree: prim.Id, line: string, reason: convo.Hold_Reason, done: proc(data: rawptr, ok: bool) = nil, data: rawptr = nil) -> (held: int) {
 	context = eng.context_for(r.e)
+	defer if done != nil {
+		_hold_wait_add(r, tree, line, done, data)
+	}
 	if reason == .None {
 		return 0
 	}
@@ -108,4 +118,55 @@ _line_moved :: proc(r: ^Runtime, ent: Run_Entry) -> bool {
 		}
 	}
 	return false
+}
+
+@(private)
+_hold_live :: proc(r: ^Runtime, tree: prim.Id, line: string) -> bool {
+	for run in r.runs {
+		if run_bound_to(run, tree, line) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_hold_wait_add :: proc(r: ^Runtime, tree: prim.Id, line: string, done: proc(data: rawptr, ok: bool), data: rawptr) {
+	if !_hold_live(r, tree, line) {
+		done(data, true)
+		return
+	}
+	w := new(Hold_Wait, r.allocator)
+	w^ = Hold_Wait{tree = tree, line = clone(line, r.allocator), done = done, data = data}
+	append(&r.hold_waits, w)
+}
+
+@(private)
+_hold_waits_check :: proc(r: ^Runtime) {
+	i := 0
+	for i < len(r.hold_waits) {
+		w := r.hold_waits[i]
+		if _hold_live(r, w.tree, w.line) {
+			i += 1
+			continue
+		}
+		ordered_remove(&r.hold_waits, i)
+		done, data := w.done, w.data
+		delete(w.line, r.allocator)
+		free(w, r.allocator)
+		done(data, true)
+		i = 0
+	}
+}
+
+@(private)
+_hold_waits_close :: proc(r: ^Runtime) {
+	for len(r.hold_waits) > 0 {
+		w := pop(&r.hold_waits)
+		done, data := w.done, w.data
+		delete(w.line, r.allocator)
+		free(w, r.allocator)
+		done(data, false)
+	}
+	delete(r.hold_waits)
 }

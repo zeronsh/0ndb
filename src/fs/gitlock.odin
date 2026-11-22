@@ -196,7 +196,7 @@ mount_git_lock :: proc(m: ^Mount, held: bool) {
 	if obs.gate != nil {
 		if id, ok := obs.gate(obs.data, m.root, pids[:]); ok {
 			m.gate_id = id
-			m.gate_timer = prim.timer(m.reg.loop, obs.gate_max_ms if obs.gate_max_ms > 0 else GATE_MAX_MS, m, _gate_overrun)
+			m.gate_timer = prim.timer(m.reg.loop, _gate_bound(obs), m, _gate_overrun)
 		}
 	}
 	mount_schedule(m, 0)
@@ -212,6 +212,52 @@ mount_lock_stale :: proc "contextless" (m: ^Mount) -> bool {
 
 mount_gated :: proc "contextless" (m: ^Mount) -> bool {
 	return m.gate_id != 0
+}
+
+mount_hold_writes :: proc(m: ^Mount) -> bool {
+	if m.hold_id != 0 {
+		return true
+	}
+	if m.reg == nil || m.reg.loop == nil || m.reg.observer.gate == nil {
+		return false
+	}
+	obs := m.reg.observer
+	id, ok := obs.gate(obs.data, m.root, nil)
+	if !ok {
+		return false
+	}
+	m.hold_id = id
+	m.hold_timer = prim.timer(m.reg.loop, _gate_bound(obs), m, _hold_overrun)
+	return true
+}
+
+mount_release_writes :: proc(m: ^Mount) {
+	if m.hold_id == 0 {
+		return
+	}
+	if prim.timer_pending(m.reg.loop, m.hold_timer) {
+		prim.timer_cancel(m.reg.loop, m.hold_timer)
+	}
+	obs := m.reg.observer
+	if obs.ungate != nil {
+		obs.ungate(obs.data, m.hold_id)
+	}
+	m.hold_id = 0
+}
+
+@(private)
+_hold_overrun :: proc(l: ^prim.Loop, data: rawptr) {
+	m := (^Mount)(data)
+	if m.hold_id == 0 {
+		return
+	}
+	m.gate_overruns += 1
+	mount_release_writes(m)
+}
+
+@(private)
+_gate_bound :: proc(obs: Write_Observer) -> i64 {
+	return obs.gate_max_ms if obs.gate_max_ms > 0 else GATE_MAX_MS
 }
 
 mount_gate_overruns :: proc "contextless" (m: ^Mount) -> u64 {

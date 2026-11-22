@@ -295,6 +295,8 @@ Mount :: struct {
 	lock_stale:  bool,
 	gate_id:     u32,
 	gate_timer:  prim.Timer,
+	hold_id:     u32,
+	hold_timer:  prim.Timer,
 	gate_overruns: u64,
 	lock_watches: [dynamic]Lock_Watch,
 	conv_seq:    u64,
@@ -599,6 +601,7 @@ drop_lost :: proc(m: ^Mount, dir: string, lost: []Lost_Range) -> Error {
 }
 
 mount_close :: proc(m: ^Mount) {
+	mount_release_writes(m)
 	mount_unlock(m)
 	delete(m.lock_watches)
 	m.lock_watches = nil
