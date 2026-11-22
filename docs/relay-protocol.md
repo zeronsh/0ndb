@@ -819,7 +819,9 @@ kqueue, kernel TLS where available, `sendfile` from the pack, group commit.
 With `--objects DIR` it puts the tiered store (`store_tiered.odin`) between the
 core and the pack: acknowledgements still mean durable in the local pack,
 and each space's changes go to the object store as one batch object per
-`--flush-ms` window (default 2000) or every `--flush-mb` MiB (default 8),
+space once it has been quiet for `--flush-ms` (default 30000), once its
+oldest unflushed change is `--flush-max-ms` old (default 600000), or every
+`--flush-mb` MiB (default 8),
 whichever comes first. A per-space manifest in the pack records a `DIRTY`
 mark in the same group commit as the first change of a window and what each
 batch flushed, so a crash never loses an acknowledged change from the object

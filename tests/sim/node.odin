@@ -504,7 +504,7 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	if err == .None && rn.packed && w.cfg.seed % 4 == 0 {
 		prim.mkdir_all(vfs, RELAY_DIR + "/objects", 0o700)
 		rn.objs = osync.Dir_Object_Store{vfs = vfs, root = RELAY_DIR + "/objects"}
-		tc := osync.Tier_Config{objects = osync.dir_object_store(&rn.objs), window_ms = 500, hot = 4096}
+		tc := osync.Tier_Config{objects = osync.dir_object_store(&rn.objs), window_ms = 500, max_ms = 5000, hot = 4096}
 		if terr := osync.tier_store_init(&rn.ts, &rn.inst.loop, store, tc, node_clock(&rn.clock)); terr != .None {
 			err = terr
 		} else {

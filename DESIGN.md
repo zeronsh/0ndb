@@ -2153,7 +2153,9 @@ Relay cost tracks the reachable information, not the activity. Items marked
   local files for the reference relay, Durable Object storage for a DO host)
   and any object-store flush is coalesced per space and asynchronous. With
   `--objects` the reference relay's tiered store writes one batch object per
-  space per window (`--flush-ms`, default 2000) or every `--flush-mb` MiB
+  space once the space has been quiet for `--flush-ms` (default 30000), its
+  oldest unflushed change is `--flush-max-ms` old (default 600000), or every
+  `--flush-mb` MiB
   (default 8); a per-space manifest in the pack, marked dirty in the same
   group commit as a window's first change, makes the tier crash-safe, and a
   redaction rewrites the batch objects that hold the range. The pack is a
