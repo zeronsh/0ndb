@@ -336,8 +336,13 @@ _durable_begin :: proc(e: ^Engine) {
 	if !e.pk_open {
 		return
 	}
-	if err := _registry_flush(e); err != .None && err != .Busy {
-		_fatal(e, err)
+	if err := _registry_flush(e); err != .None {
+		if err == .Busy {
+			_touch(e)
+		} else {
+			_fatal(e, err)
+		}
+		return
 	}
 	_trees_persist(e)
 	_rlog_settle(e, false)
