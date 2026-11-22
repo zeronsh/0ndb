@@ -551,14 +551,29 @@ equal in both directions.
   each scope boundary. Each scope boundary also writes a git tree/commit
   chain pinned at `refs/0ndb/<history>` (git checkouts) or in the device
   store, so content stays reachable and inspectable.
-- **Lines are git branches** (planned): a git mount's line is keyed by the
-  checked-out ref, `git:refs/heads/<name>`, or `git:detached:<commit>` for a
-  detached HEAD (detaching at the same commit returns to that line); a plain
-  folder has one line. Each line keeps its own history, attribution and
-  uncommitted state. A line seen for the first time forks from the current
-  line's synced version and gets one line-granular git-op batch turning the
-  files into its commit's tree, so blame of unchanged files survives. Every
-  run is bound to the (mount, line) it started on (Conversations).
+- **Lines are git branches**: a git mount follows its checked-out ref. The
+  branch HEAD named when the mount was first opened (persisted in the mount
+  state) keys the mount's own line (`main` for API mounts), so plain-folder
+  mounts of the tree on other devices keep sharing it; any other branch is
+  line `git:refs/heads/<name>` and a detached HEAD is `git:detached:<commit>`
+  (detaching at the same commit returns to that line). `mount_line(m)`
+  returns the key. Each line keeps its own history, attribution and
+  uncommitted state. When a pass sees HEAD name another key (and no rebase,
+  merge or cherry-pick is in progress), a new line forks from the synced
+  version and git's writes become its git-op batch; an existing line is
+  retargeted instead: the shadow entries of the inodes that differ between
+  the synced version and the line move to the line's paths with their stat
+  cleared, the synced version becomes the line's, and the full pass diffs
+  disk against the line, so git's writes (and anything git carried) land on
+  that line only. A materialization whose pass switched lines restarts at the
+  new line rather than writing the old one back. Ingestion on a line other
+  than the mount's own uses an actor derived from the mount and the line,
+  registered like the mount's ingestion actor, because an actor's ops stay on
+  one chain. The engine reports each switch as `Line_Switched` (object = the
+  tree, detail = from and to keys) and git's `index.lock` coming and going
+  through a registry hook. Mounts the runtime manages on conversation lines
+  keep their line until runs are bound to lines; only their key moves. Every
+  run is bound to the (mount, line) it started on (Conversations, planned).
 - **Switch** (planned, `line_switch(mount, target, runs = .Hold)`): hold the
   runs bound to the old line (`Interrupted{reason = branch_changed}` at the
   next tool boundary, native sessions kept), ingest everything onto the old
@@ -603,7 +618,7 @@ equal in both directions.
   Its final index rename is safe because no read holds the index. A lock
   with no live creator is stale: batches run as usual and the mount shows
   a passive `stale .git/index.lock` status.
-- **Raw checkouts** (planned) follow git's write order (`builtin/checkout.c`:
+- **Raw checkouts** follow git's write order (`builtin/checkout.c`:
   `merge_working_tree` takes `.git/index.lock`, `unpack_trees` unlinks then
   writes working files, `write_locked_index` renames the lock; only then
   `update_refs_for_switch` appends `checkout: moving from A to B` to
@@ -664,12 +679,11 @@ equal in both directions.
   anything else (commit, reset, merge, pull, restore, stash) is a git-op
   batch on the same line. While `rebase-merge/`, `rebase-apply/`,
   `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `sequencer/` exist, a detached HEAD
-  belongs to the branch in `head-name` and that branch's runs stay held
-  until the operation ends; bisect steps are detached lines. A tool that
-  bypasses the lock is classified the same way on the next pass, without
-  the gate. A forced checkout destroys dirty content by the user's choice;
-  ingesting at gate time bounds the loss to what git overwrote within
-  milliseconds.
+  belongs to the branch in `head-name` and that branch's runs stay held until
+  the operation ends; bisect steps are detached lines. A tool that bypasses
+  the lock is classified the same way on the next pass, without the gate. A
+  forced checkout destroys dirty content by the user's choice; ingesting at
+  gate time bounds the loss to what git overwrote within milliseconds.
 - **Deleted branches** (planned): runs and tasks bound to a line whose ref no
   longer exists show `held: branch <x> deleted` (passive) and resume if the
   ref comes back; the API can move them to the current line. Nothing is asked

@@ -1069,6 +1069,9 @@ Change :: struct {
 @(private)
 Pass :: struct {
 	m:          ^Mount,
+	switched:   bool,
+	line_from:  string,
+	line_to:    string,
 	changes:    [dynamic]Change,
 	seen:       map[string]bool,
 	young:      [dynamic]string,
@@ -1264,6 +1267,18 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		commits_only, _, rewritten := git_reflog_commits_only(m.vfs, m.git, m.reflog_pos)
 		p.operation = git_operation(m.vfs, m.git)
 		p.git_wrote = (p.head_moved && (!commits_only || rewritten)) || (p.operation != "" && stamp != m.stamp)
+		if key := branch_key(m, p.head, p.long); key != m.branch && p.operation == "" {
+			p.switched = true
+			p.line_from, _ = clone_string(m.branch, p.long)
+			p.line_to = key
+			follow := m.opts.follow_branch && m.line == m.branch
+			delete(m.branch, m.allocator)
+			m.branch, _ = clone_string(key, m.allocator)
+			if follow {
+				line_follow(m, key) or_return
+				p.git_wrote = true
+			}
+		}
 	}
 	if p.git_wrote {
 		collect_alias_sources(m, &p)
@@ -1372,7 +1387,71 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		mount_schedule(m, m.opts.settle_ms)
 	}
 	m.passes += 1
-	return mount_settle(m)
+	serr := mount_settle(m)
+	if p.switched && m.reg != nil && m.reg.on_line != nil {
+		m.reg.on_line(m, p.line_from, p.line_to, m.reg.hook_data)
+	}
+	return serr
+}
+
+@(private)
+line_follow :: proc(m: ^Mount, key: string) -> Error {
+	h := m.history
+	v, found := history_line(h, key, context.temp_allocator) or_return
+	if !found || len(v) == 0 {
+		history_set_line(h, key, m.synced[:]) or_return
+	} else {
+		line_retarget(m, v) or_return
+	}
+	delete(m.line, m.allocator)
+	m.line, _ = clone_string(key, m.allocator)
+	return mount_line_actor(m)
+}
+
+@(private)
+line_retarget :: proc(m: ^Mount, target: Version) -> Error {
+	h := m.history
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	tl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
+		return .Corrupt
+	}
+	if !crdt.frontier_eq(sl[:], tl[:]) {
+		only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+		only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+		crdt.graph_diff(&h.g, sl[:], tl[:], &only_a, &only_b)
+		touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+		spans_touched(h, only_a[:], &touched) or_return
+		spans_touched(h, only_b[:], &touched) or_return
+		snap := version_snapshot(h, tl[:]) or_return
+		defer fstree.snapshot_destroy(&snap)
+		order := sorted_inodes(touched)
+		for ino in order {
+			if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
+				shadow_remove(&m.shadow, old) or_return
+			}
+		}
+		for ino in order {
+			info, ok, ierr := fstree.info(&snap, ino, context.temp_allocator)
+			if ierr != nil {
+				return .Corrupt
+			}
+			if !ok || !info.present {
+				continue
+			}
+			p, pok, perr := fstree.path(&snap, ino, context.temp_allocator)
+			if perr != nil {
+				return .Corrupt
+			}
+			if pok {
+				shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
+			}
+		}
+	}
+	clear(&m.synced)
+	append(&m.synced, ..target)
+	m.rescan = true
+	return .None
 }
 
 @(private)
