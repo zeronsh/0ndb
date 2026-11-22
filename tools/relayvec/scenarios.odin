@@ -40,6 +40,7 @@ scenarios :: proc() -> []Scenario {
 		{"embedder", "An embedder authorizer maps unknown credential types to principals; the relay enforces the access it grants.", sc_embedder},
 		{"malformed", "Malformed input is fatal: oversize frames, unknown kinds, relay-only kinds, short payloads, count mismatches, inverted ranges, bad bulk headers, oversize direct payloads, a second Hello; bytes after the error are ignored.", sc_malformed},
 		{"compaction", "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base.", sc_compaction},
+		{"trim", "Trim drops stored content below a base an archive covers: owner only, acknowledged once durable, idempotent, never lowers base, refused at or past the length; readers, probes and follows get Trimmed; Fill below a trim stores nothing.", sc_trim},
 		{"limits", "Per-principal connection limit and per-connection follow limit.", sc_limits},
 	}
 	return list[:]
@@ -324,6 +325,10 @@ f_note :: proc(id: [32]u8, length: i64) -> []u8 {
 
 f_fill :: proc(id: [32]u8, at: i64, data: []u8) -> []u8 {
 	return frame(.Fill, ids(id), le64(u64(at)), data)
+}
+
+f_trim :: proc(id: [32]u8, base: i64) -> []u8 {
+	return frame(.Trim, ids(id), le64(u64(base)))
 }
 
 f_pull :: proc(holder: osync.Device_Id, tag: u64, id: [32]u8, from, to: i64) -> []u8 {
@@ -619,6 +624,40 @@ sc_hollow :: proc(v: ^Vector) {
 	durable(v)
 	send(v, "alice", f_note(h1, 4000), "Note on a segment with stored content")
 	send(v, "alice", f_fill(stream(alice, 8), 0, fill), "Fill a segment that does not exist")
+}
+
+sc_trim :: proc(v: ^Vector) {
+	alice, bob, carol := key_make(1), key_make(2), key_make(3)
+	sp := space_make(v, alice, 0x1f)
+	addb := space_add(sp, alice, bob, .Member)
+	addc := space_add(sp, alice, carol, .Reader)
+	join(v, "alice", sp, alice, sp.genesis)
+	join(v, "bob", sp, bob, addb)
+	join(v, "carol", sp, carol, addc)
+	s1 := stream(alice, 3)
+	first := recs(0, "archived one", "archived two", "kept three")
+	send(v, "alice", f_append(s1, 0, first), "Append three records")
+	durable(v)
+	b1 := i64(len(rec("archived one", 0)))
+	b2 := b1 + i64(len(rec("archived two", b1)))
+	length := i64(len(first))
+	send(v, "bob", f_follow(false, {s1, 0}), "Follow from 0")
+	send(v, "bob", f_trim(s1, b1), "Trim another member's segment")
+	send(v, "carol", f_trim(s1, b1), "Trim by a reader")
+	send(v, "alice", f_trim(s1, b2), "Trim below the second record boundary")
+	durable(v, "Noted once durable")
+	send(v, "alice", f_trim(s1, b2), "Trim again at the same base")
+	send(v, "alice", f_trim(s1, b1), "Trim below base never lowers it")
+	send(v, "alice", f_trim(s1, length), "Trim at the length")
+	send(v, "carol", f_read(s1, 0, length), "Read below a trimmed base")
+	send(v, "carol", f_idlist(.Probe, s1), "Probe a trimmed segment")
+	send(v, "carol", f_follow(false, {s1, 0}), "Follow a trimmed segment from 0")
+	send(v, "bob", f_fill(s1, 0, first[:b2]), "Fill below a trim stores nothing")
+	send(v, "alice", f_append(s1, length, rec("after trim", length)), "Append after a trim")
+	durable(v)
+	send(v, "alice", f_redact(s1, 0, length), "Redaction is clamped to the stored suffix")
+	durable(v)
+	send(v, "alice", f_trim(stream(alice, 9), 10), "Trim a segment that does not exist")
 }
 
 sc_pipe :: proc(v: ^Vector) {

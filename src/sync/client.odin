@@ -61,6 +61,7 @@ Event :: struct {
 	device:  Device_Id,
 	tag:     u64,
 	base:    i64,
+	trimmed: bool,
 }
 
 Client_Handler :: #type proc(user: rawptr, ev: ^Event) -> Error
@@ -833,8 +834,9 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.length = get_i64(&r)
 	case .Directed, .Undelivered:
 		return _client_direct_event(it, handler, user)
-	case .Noted, .Hollow:
+	case .Noted, .Hollow, .Trimmed:
 		ev.kind = .Noted if it.frame == .Noted else .Hollow
+		ev.trimmed = it.frame == .Trimmed
 		ev.id = get_id32(&r)
 		ev.base = get_i64(&r)
 		ev.length = get_i64(&r)

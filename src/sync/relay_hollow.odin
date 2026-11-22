@@ -100,7 +100,7 @@ _on_fill_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
 		_stream_maybe_release(r, st)
 		return
 	}
-	if total <= 0 || at + total != st.base {
+	if total <= 0 || at + total != st.base || st.trimmed {
 		c.op.reply, c.op.len = .Noted, _live_len(st)
 		c.op.base = st.base
 		_stream_maybe_release(r, st)
@@ -393,5 +393,87 @@ _pipes_conn_closed :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn) {
 			continue
 		}
 		i += 1
+	}
+}
+
+@(private)
+_store_trimmed :: proc(r: ^Relay_Core, h: rawptr) -> bool {
+	return h != nil && r.store.stream_trimmed != nil && r.store.stream_trimmed(r.store.data, h)
+}
+
+@(private)
+_base_kind :: proc "contextless" (st: ^Stream_State) -> Kind {
+	return .Trimmed if st.trimmed else .Hollow
+}
+
+@(private)
+_on_trim :: proc(c: ^Conn, rd: ^prim.Reader) {
+	r := c.relay
+	id := Stream_Id(get_id32(rd))
+	base := get_i64(rd)
+	if !prim.reader_done(rd) || base < 0 || base > REDACT_LIMIT {
+		_fail(c, .Protocol)
+		return
+	}
+	if !_can(c, .Append, cast([32]u8)id) {
+		_reply_refused(c, .Not_Owner, cast([32]u8)id)
+		return
+	}
+	if r.store.trim == nil {
+		_fail(c, .Protocol)
+		return
+	}
+	st, err := _stream_get(r, c.space, id, false)
+	if err != .None {
+		_reply_refused(c, .Io, cast([32]u8)id)
+		return
+	}
+	if st.h == nil || st.dropped {
+		_reply_refused(c, .Not_Found, cast([32]u8)id)
+		_stream_maybe_release(r, st)
+		return
+	}
+	if st.busy {
+		_reply_refused(c, .Busy, cast([32]u8)id)
+		_stream_maybe_release(r, st)
+		return
+	}
+	if base >= st.length && base > st.base {
+		_reply_refused(c, .Protocol, cast([32]u8)id)
+		_stream_maybe_release(r, st)
+		return
+	}
+	if base <= st.base {
+		_reply_hollow(c, .Noted, cast([32]u8)id, st.base, _live_len(st))
+		_stream_maybe_release(r, st)
+		return
+	}
+	p := _pending_new(c, .Trim, st, 0, cast([32]u8)id)
+	if p == nil {
+		_reply_refused(c, .Io, cast([32]u8)id)
+		_stream_maybe_release(r, st)
+		return
+	}
+	p.from = base
+	st.busy = true
+	r.store.trim(r.store.data, st.h, base, _relay_done, p)
+}
+
+@(private)
+_trim_done :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn, p: ^Pending, result: Error, value: i64) {
+	st := p.stream
+	st.busy = false
+	if result != .None {
+		st.poisoned = true
+		if c != nil {
+			_reply_refused(c, .Io, p.id)
+		}
+		return
+	}
+	sp.usage = max(sp.usage - value, 0)
+	st.base = r.store.stream_base(r.store.data, st.h)
+	st.trimmed = true
+	if c != nil {
+		_reply_hollow(c, .Noted, p.id, st.base, st.length)
 	}
 }

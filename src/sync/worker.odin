@@ -11,6 +11,7 @@ Job_Kind :: enum u8 {
 	Object_Commit,
 	Remove,
 	Redact,
+	Trim,
 }
 
 Job :: struct {
@@ -29,6 +30,7 @@ Job :: struct {
 	from:    i64,
 	to:      i64,
 	lay:     Layout,
+	trimmed: bool,
 	target:  rawptr,
 	ns:      rawptr,
 	done:    Storage_Done,
@@ -243,12 +245,23 @@ _job_run :: proc(job: ^Job) {
 			job.result = _from_prim(prim.sync_dir(job.vfs, prim.dir_name(final)))
 		}
 	case .Redact:
-		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value, base = job.base}, job.lay.spacing)
+		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value, base = job.base, trimmed = job.trimmed}, job.lay.spacing)
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
 		}
 		if job.result == .None {
 			job.result = _redact_records(job.vfs, job.fd, job.from, job.to, job.lay.base)
+		}
+		if job.result == .None {
+			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
+		}
+	case .Trim:
+		job.result = slot_write(job.vfs, job.fd, Slot{seq = job.seq, value = job.value, start = job.value, base = job.base, trimmed = true}, job.lay.spacing)
+		if job.result == .None {
+			job.result = _from_prim(prim.datasync(job.vfs, job.fd))
+		}
+		if job.result == .None && job.base > job.from {
+			job.result = _from_prim(prim.zero_range(job.vfs, job.fd, job.lay.base + job.from, job.base - job.from))
 		}
 		if job.result == .None {
 			job.result = _from_prim(prim.datasync(job.vfs, job.fd))

@@ -14,6 +14,7 @@ Mem_Effect_Kind :: enum u8 {
 	Drop,
 	Put,
 	Remove,
+	Trim,
 }
 
 Mem_Effect :: struct {
@@ -48,6 +49,7 @@ Mem_Stream :: struct {
 	base:   i64,
 	length: i64,
 	gone:   bool,
+	trimmed: bool,
 }
 
 @(private)
@@ -70,6 +72,7 @@ Mem_Job_Kind :: enum u8 {
 	Drop,
 	Put,
 	Remove,
+	Trim,
 }
 
 @(private)
@@ -163,6 +166,8 @@ mem_store :: proc(m: ^Mem_Store) -> Relay_Storage {
 		note = _mem_note,
 		drop = _mem_drop,
 		redact = _mem_redact,
+		trim = _mem_trim,
+		stream_trimmed = _mem_stream_trimmed,
 		list_begin = _mem_list_begin,
 		list_next = _mem_list_next,
 		list_end = _mem_list_end,
@@ -307,6 +312,18 @@ _mem_stream_hint :: proc(data: rawptr, h: rawptr, id: Stream_Id) -> (length: i64
 @(private)
 _mem_stream_base :: proc(data: rawptr, s: rawptr) -> i64 {
 	return (cast(^Mem_Stream)s).base
+}
+
+@(private)
+_mem_stream_trimmed :: proc(data: rawptr, s: rawptr) -> bool {
+	return (cast(^Mem_Stream)s).trimmed
+}
+
+@(private)
+_mem_trim :: proc(data: rawptr, s: rawptr, base: i64, done: Storage_Done, ctx: rawptr) {
+	m := cast(^Mem_Store)data
+	st := cast(^Mem_Stream)s
+	append(&m.queue, Mem_Job{kind = .Trim, stream = st, space = st.space, to = base, done = done, ctx = ctx})
 }
 
 @(private)
@@ -581,6 +598,18 @@ _mem_run :: proc(m: ^Mem_Store, j: Mem_Job) {
 			result = _mem_redact_records(st, lo, hi)
 		}
 		_mem_log(m, {kind = .Redact, space = st.space.id, id = cast([32]u8)st.id, at = lo, length = hi - lo, result = result})
+	case .Trim:
+		st := j.stream
+		if st.gone || j.to >= st.length {
+			result = .Conflict
+		} else if j.to > st.base {
+			value = j.to - st.base
+			remove_range(&st.data, 0, int(value))
+			st.base = j.to
+			st.trimmed = true
+			st.space.usage = max(st.space.usage - value, 0)
+		}
+		_mem_log(m, {kind = .Trim, space = st.space.id, id = cast([32]u8)st.id, at = j.to, length = value, result = result})
 	case .Drop:
 		sp := j.space
 		if st, ok := sp.streams[j.id]; ok && !st.gone {

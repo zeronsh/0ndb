@@ -32,6 +32,7 @@ Tier_Kind :: enum u8 {
 	Put    = 4,
 	Forget = 5,
 	Redact = 6,
+	Trim   = 7,
 	Dirty  = 0x10,
 	Clean  = 0x11,
 	Flushed = 0x12,
@@ -51,6 +52,7 @@ Tier_Store :: struct {
 Tier_Seg :: struct {
 	lo, hi:  i64,
 	note:    i64,
+	trim:    i64,
 	dropped: bool,
 	redacts: [dynamic][2]i64,
 }
@@ -198,6 +200,8 @@ tier_store :: proc(t: ^Tier_Store) -> Relay_Storage {
 		append_abort = _tier_append_abort,
 		fill_begin = _tier_fill_begin,
 		note = _tier_note,
+		trim = _tier_trim,
+		stream_trimmed = _tier_stream_trimmed,
 		drop = _tier_drop,
 		redact = _tier_redact,
 		list_begin = _tier_list_begin,
@@ -392,6 +396,10 @@ _tier_rescan :: proc(sp: ^Tier_Space, manifest: []u8) {
 			c = {max(c[0], at), max(c[1], at)}
 			covered[id] = c
 			gone[id] = false
+		case .Trim:
+			c := covered[id]
+			c = {max(c[0], at), max(c[1], at)}
+			covered[id] = c
 		case .Drop:
 			gone[id] = true
 		case .Put:
@@ -640,6 +648,12 @@ _tier_job_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			g.dropped = false
 			sp.segs[id] = g
 			_tier_dirty(sp, 0)
+		case .Trim:
+			sp.usage -= value
+			g := sp.segs[id]
+			g.trim = j.at
+			sp.segs[id] = g
+			_tier_dirty(sp, 0)
 		case .Drop:
 			sp.usage -= value
 			g := sp.segs[id]
@@ -757,6 +771,11 @@ _tier_flush :: proc(sp: ^Tier_Space) {
 		if g.note > 0 {
 			_tier_put_entry(&w, .Note, v, g.note, nil)
 			_tier_entry_f(f, .Note, v, g.note, 0, 0)
+			count += 1
+		}
+		if g.trim > 0 {
+			_tier_put_entry(&w, .Trim, v, g.trim, nil)
+			_tier_entry_f(f, .Trim, v, g.trim, 0, 0)
 			count += 1
 		}
 		for r in g.redacts {
@@ -1059,6 +1078,20 @@ _tier_note :: proc(data: rawptr, s: rawptr, length: i64, done: Storage_Done, ctx
 	ts := cast(^Tier_Stream)s
 	j := _tier_job(ts.sp, .Note, cast([32]u8)ts.id, length, 0, done, ctx)
 	t.inner.note(t.inner.data, ts.h, length, _tier_job_done, j)
+}
+
+@(private)
+_tier_trim :: proc(data: rawptr, s: rawptr, base: i64, done: Storage_Done, ctx: rawptr) {
+	t := cast(^Tier_Store)data
+	ts := cast(^Tier_Stream)s
+	j := _tier_job(ts.sp, .Trim, cast([32]u8)ts.id, base, 0, done, ctx)
+	t.inner.trim(t.inner.data, ts.h, base, _tier_job_done, j)
+}
+
+@(private)
+_tier_stream_trimmed :: proc(data: rawptr, s: rawptr) -> bool {
+	t := cast(^Tier_Store)data
+	return t.inner.stream_trimmed != nil && t.inner.stream_trimmed(t.inner.data, (cast(^Tier_Stream)s).h)
 }
 
 @(private)

@@ -1426,6 +1426,12 @@ Client to relay:
   it matches an open pipe from this holder; it closes the pipe on `final`
   or `none` (answering `Unserved` for `none`) and drops unmatched frames.
 
+- `Trim` (0x16, 40, feature bit 1): `segment, base:u64`. Owner only. Raises
+  `base` once an archive covers `[0, base)`, frees the stored prefix and
+  marks the base as a trim; `base` must stay below the length, a lower or
+  equal base changes nothing, and `Fill` below a trim stores nothing. Reply
+  `Noted` once durable; no feed entry.
+
 Relay to client:
 
 - `Noted` (0x95, 48): `segment, base:u64, length:u64`, the reply to `Note`
@@ -1438,6 +1444,9 @@ Relay to client:
   word:u64` and the holder's bytes, unchanged, to the requester. The relay
   buffers one frame at a time per pipe and stops reading a holder while its
   requester has more than 1 MiB of served bytes queued.
+- `Trimmed` (0x9c, 48, feature bit 2): `segment, base:u64, length:u64`,
+  sent instead of `Hollow` when the base is a trim, so the reader reads
+  `[0, base)` from the writer's archive stream instead of pulling from peers.
 - `Unserved` (0x99, 56): `holder:device, tag:u64, segment`: the pull ended
   without (complete) data because the holder lacks it, left, or was never
   connected. A requester that disconnects simply closes its pipes.

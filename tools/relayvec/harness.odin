@@ -284,6 +284,8 @@ effect_name :: proc(k: osync.Mem_Effect_Kind) -> string {
 		return "put"
 	case .Remove:
 		return "remove"
+	case .Trim:
+		return "trim"
 	}
 	return "?"
 }

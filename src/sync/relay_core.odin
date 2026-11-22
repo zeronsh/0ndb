@@ -145,6 +145,7 @@ Stream_State :: struct {
 	busy:      bool,
 	poisoned:  bool,
 	dropped:   bool,
+	trimmed:   bool,
 }
 
 Sub :: struct {
@@ -215,6 +216,7 @@ Pending_Kind :: enum u8 {
 	Redlog,
 	Note,
 	Fill,
+	Trim,
 }
 
 @(private)
@@ -908,6 +910,8 @@ _handle :: proc(c: ^Conn, it: ^Item) {
 			_on_pull(c, &rd)
 		case .Account:
 			_on_account(c, &rd)
+		case .Trim:
+			_on_trim(c, &rd)
 		case:
 			_fail(c, .Protocol)
 		}
@@ -1102,6 +1106,7 @@ _stream_get :: proc(r: ^Relay_Core, sp: ^Space_State, id: Stream_Id, create: boo
 			st.h = h if err == .None else nil
 			st.length = length if err == .None else 0
 			st.base = r.store.stream_base(r.store.data, h) if err == .None else 0
+			st.trimmed = err == .None && _store_trimmed(r, h)
 			st.poisoned = false
 		}
 		if create && st.h == nil {
@@ -1112,6 +1117,7 @@ _stream_get :: proc(r: ^Relay_Core, sp: ^Space_State, id: Stream_Id, create: boo
 			st.h = h
 			st.length = length
 			st.base = r.store.stream_base(r.store.data, h)
+			st.trimmed = _store_trimmed(r, h)
 		}
 		return st, .None
 	}
@@ -1132,6 +1138,7 @@ _stream_get :: proc(r: ^Relay_Core, sp: ^Space_State, id: Stream_Id, create: boo
 		nst.h = h
 		nst.length = length
 		nst.base = r.store.stream_base(r.store.data, h)
+		nst.trimmed = _store_trimmed(r, h)
 	}
 	nst.followers = make([dynamic]^Conn, r.allocator)
 	sp.streams[id] = nst
@@ -1304,7 +1311,7 @@ _on_read :: proc(c: ^Conn, rd: ^prim.Reader, tail: bool) {
 		}
 	}
 	if st.base > 0 && st.h != nil && !st.dropped {
-		_reply_hollow(c, .Hollow, cast([32]u8)id, st.base, length)
+		_reply_hollow(c, _base_kind(st), cast([32]u8)id, st.base, length)
 		if from < st.base {
 			from = min(st.base, length)
 			to = max(to, from)
@@ -1349,7 +1356,7 @@ _on_probe :: proc(c: ^Conn, rd: ^prim.Reader) {
 		} else if st, ok := sp.streams[id]; ok && st.h != nil && !st.poisoned {
 			length = _live_len(st)
 			if st.base > 0 && !st.dropped {
-				_reply_hollow(c, .Hollow, cast([32]u8)id, st.base, length)
+				_reply_hollow(c, _base_kind(st), cast([32]u8)id, st.base, length)
 			}
 		} else {
 			l, base, exists, err := r.store.stream_probe(r.store.data, sp.ns, id)
@@ -1359,7 +1366,14 @@ _on_probe :: proc(c: ^Conn, rd: ^prim.Reader) {
 			}
 			length = l if exists else 0
 			if exists && base > 0 {
-				_reply_hollow(c, .Hollow, cast([32]u8)id, base, length)
+				kind := Kind.Hollow
+				if base < length {
+					if ts, gerr := _stream_get(r, sp, id, false); gerr == .None {
+						kind = _base_kind(ts)
+						_stream_maybe_release(r, ts)
+					}
+				}
+				_reply_hollow(c, kind, cast([32]u8)id, base, length)
 			}
 		}
 		e := buf[FRAME_HEADER + 2 + n * 40:]
@@ -1411,7 +1425,7 @@ _on_follow :: proc(c: ^Conn, rd: ^prim.Reader) {
 		length := _live_len(st)
 		offset := length if off == FOLLOW_END else i64(min(off, u64(max(i64))))
 		if st.base > 0 && st.h != nil && !st.dropped {
-			_reply_hollow(c, .Hollow, cast([32]u8)id, st.base, length)
+			_reply_hollow(c, _base_kind(st), cast([32]u8)id, st.base, length)
 			offset = max(offset, st.base)
 		}
 		found := false
@@ -1737,7 +1751,7 @@ _on_bulk_end :: proc(c: ^Conn) {
 			_reply_id(c, .Stored, op.id)
 		case .Noted:
 			_reply_hollow(c, .Noted, op.id, op.base, op.len)
-		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered, .Note, .Fill, .Pull, .Serve, .Hollow, .Pulled, .Served, .Unserved, .Account, .Accounted:
+		case .None, .Hello, .List, .Append, .Read, .Tail, .Follow, .Unfollow, .Put, .Get, .Drop, .Redact, .Feed, .Forget, .Probe, .Welcome, .Listing, .Data, .Object, .Missing, .Length, .Created, .Dropped, .Error, .Redacted, .Announce, .Forgotten, .Probed, .Presence, .Direct, .Directed, .Undelivered, .Note, .Fill, .Pull, .Serve, .Hollow, .Pulled, .Served, .Unserved, .Account, .Accounted, .Trim, .Trimmed:
 		}
 	case .Append:
 		st := op.stream
@@ -1915,6 +1929,8 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 			_reap(r)
 			return
 		}
+	case .Trim:
+		_trim_done(r, sp, c, p, result, value)
 	}
 	if p.stream != nil {
 		_stream_unref(r, p.stream)
