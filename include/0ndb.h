@@ -1291,7 +1291,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 /* placement(object: object) -> Placement */
 #define ONDB_OP_PLACEMENT 139u
 /* quiesce(off: bool, lift_ms: uvarint) -> accepted:bool reason:enum(accepted, run_active, queued, relay) */
-#define ONDB_OP_QUIESCE 151u
+#define ONDB_OP_QUIESCE 175u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

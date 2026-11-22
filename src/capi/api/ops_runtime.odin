@@ -37,7 +37,7 @@ RUNTIME_OPS := []Op {
 	{137, "agent.actor", {{"agent", .Id, nil}}, "actor:id", op_agent_actor},
 	{138, "wake", {OBJ}, "", op_wake},
 	{139, "placement", {OBJ}, "Placement", op_placement},
-	{151, "quiesce", {{"off", .Bool, nil}, {"lift_ms", .U64, nil}}, "accepted:bool reason:enum", op_quiesce},
+	{175, "quiesce", {{"off", .Bool, nil}, {"lift_ms", .U64, nil}}, "accepted:bool reason:enum", op_quiesce},
 }
 
 @(private)

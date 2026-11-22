@@ -811,9 +811,14 @@ _on_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
 		}
 	}
 	free(w, r.allocator)
-	if err == .None {
-		_queue_eval(r, o)
+	if err != .None {
+		return
 	}
+	if o == pending_object(o.space) {
+		_pending_scan(r, o.space)
+		return
+	}
+	_queue_eval(r, o)
 }
 
 @(private)

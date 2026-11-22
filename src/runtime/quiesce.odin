@@ -1,5 +1,6 @@
 package rt
 
+import "../convo"
 import eng "../engine"
 import "../obj"
 import "../prim"
@@ -97,7 +98,44 @@ _quiesce_hold :: proc(r: ^Runtime, o: Object) -> bool {
 	}
 	append(&r.quiesce.deferred, o)
 	r.stats.quiesce_held += 1
+	_quiesce_note(r, o)
 	return true
+}
+
+@(private)
+_quiesce_note :: proc(r: ^Runtime, o: Object) {
+	v, verr := eng.convo_view(r.e, o)
+	if verr != .None {
+		return
+	}
+	t, terr := convo.view_tail(v, r.self, context.temp_allocator)
+	if terr != .None {
+		return
+	}
+	msg: Rid
+	if items, ierr := convo.intents(v, context.temp_allocator); ierr == .None {
+		for it in items {
+			if it.kind == .Queue || it.kind == .Steer {
+				msg = it.item
+				break
+			}
+		}
+	}
+	if obj.rid_none(msg) {
+		head, herr := convo.tail_head(v, &t)
+		if herr != .None || obj.rid_none(head) {
+			return
+		}
+		hm, merr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator)
+		if merr != .None || !(hm.role == .User || hm.role == .System) || hm.open {
+			return
+		}
+		msg = head
+	}
+	if p, ok := pending_get(r, o); ok && p.runner == r.self {
+		return
+	}
+	_pending_put(r, o, Pending_Entry{msg = msg, since_ms = wall_ms(r), runner = r.self})
 }
 
 @(private)

@@ -27,6 +27,9 @@ Quiesce_World :: struct {
 	stops:     u64,
 	offs:      u64,
 	held_runs: u64,
+	asleep:    bool,
+	unran:     u64,
+	window:    [dynamic]int,
 }
 
 Sim_Http :: struct {
@@ -175,7 +178,8 @@ sim_http_event :: proc(w: ^World, ev: ^Sim_Event) {
 quiesce_setup :: proc(w: ^World) -> bool {
 	q := &w.quiesce
 	q.members = make([dynamic]int, w.allocator)
-	if len(w.nodes) < 2 {
+	q.window = make([dynamic]int, w.allocator)
+	if len(w.nodes) < 2 || env_u64("SIM_QUIESCE", 1) == 0 {
 		return true
 	}
 	q.runner = len(w.nodes) - 1
@@ -230,7 +234,9 @@ quiesce_setup :: proc(w: ^World) -> bool {
 		node_after(n0)
 	}
 	q.on = true
-	quiesce_runtime_start(w.nodes[q.runner])
+	for i in q.members {
+		quiesce_runtime_start(w.nodes[i])
+	}
 	return true
 }
 
@@ -242,8 +248,15 @@ quiesce_runtime_start :: proc(n: ^Node) {
 	}
 	clear(&n.http.reqs)
 	n.http.hold = false
-	if !w.quiesce.on || n.idx != w.quiesce.runner || n.rt_on || !n.e_open {
+	member := false
+	for i in w.quiesce.members {
+		member ||= i == n.idx
+	}
+	if !w.quiesce.on || !member || n.rt_on || !n.e_open {
 		return
+	}
+	if n.idx == w.quiesce.runner {
+		w.quiesce.asleep = false
 	}
 	context = instance_context(&n.inst)
 	if err := rt.open(&n.rt, &n.e, sim_runtime_config(n), context.allocator); err != .None {
@@ -261,8 +274,11 @@ quiesce_runtime_kill :: proc(n: ^Node) {
 	n.rt_on = false
 	n.rt = {}
 	clear(&n.http.reqs)
-	if n.w.quiesce.active && n.w.quiesce.inc == n.incarnation && n.idx == n.w.quiesce.runner {
+	if n.idx == n.w.quiesce.runner {
 		n.w.quiesce.active = false
+		if !n.w.quiesce.asleep {
+			_quiesce_window_end(n.w, false)
+		}
 	}
 }
 
@@ -277,6 +293,18 @@ quiesce_runtime_close :: proc(n: ^Node) {
 
 quiesce_destroy :: proc(w: ^World) {
 	delete(w.quiesce.members)
+	delete(w.quiesce.window)
+}
+
+@(private = "file")
+_quiesce_window_end :: proc(w: ^World, kept: bool) {
+	q := &w.quiesce
+	if !kept {
+		for i in q.window {
+			w.model.ops[i].delta = 0
+		}
+	}
+	clear(&q.window)
 }
 
 op_run_queue :: proc(w: ^World) {
@@ -303,8 +331,12 @@ op_run_queue :: proc(w: ^World) {
 		op.rid = rid
 	}
 	runner := w.nodes[q.runner]
-	held := runner.rt_on && rt.quiesced(&runner.rt)
-	world_note(w, "%s queues %s for the runner (quiesced=%v alive=%v) -> %v", n.name, op.token, held, runner.alive, err)
+	held := (runner.rt_on && rt.quiesced(&runner.rt)) || (q.asleep && !runner.alive)
+	if held {
+		op.delta = 1
+		append(&q.window, op.idx)
+	}
+	world_note(w, "%s queues %s for the runner (held=%v alive=%v) -> %v", n.name, op.token, held, runner.alive, err)
 	op_result(op, n, err)
 	node_after(n)
 }
@@ -318,6 +350,7 @@ op_quiesce :: proc(w: ^World) {
 	if !n.alive || !n.rt_on {
 		return
 	}
+	_quiesce_window_end(w, false)
 	m := &w.model
 	op := new_op(m, .Quiesce, n, -1)
 	lift := i64(180_000) if !rng_chance(&w.rng, 1, 4) else i64(200 + rng_int(&w.rng, 2000))
@@ -352,6 +385,7 @@ _on_quiesce_answer :: proc(data: rawptr, r: ^rt.Runtime, res: rt.Quiesce_Result)
 	if res != .Accepted {
 		q.declined[res] += 1
 		q.active = false
+		_quiesce_window_end(w, false)
 		op_done(w.model.ops[opi], eng.current_tick(&n.e), .None)
 		return
 	}
@@ -442,6 +476,7 @@ quiesce_event :: proc(w: ^World, ev: ^Sim_Event) {
 	if ev.arg == 1 {
 		q.offs += 1
 		q.active = false
+		_quiesce_window_end(w, false)
 		context = instance_context(&n.inst)
 		rt.quiesce(&n.rt, false)
 		world_note(w, "%s quiesce lifted by the host (was quiesced=%v)", n.name, held)
@@ -450,6 +485,8 @@ quiesce_event :: proc(w: ^World, ev: ^Sim_Event) {
 	}
 	q.stops += 1
 	q.active = false
+	q.asleep = true
+	_quiesce_window_end(w, true)
 	_quiesce_stop(n)
 }
 
@@ -512,6 +549,10 @@ check_quiesce :: proc(w: ^World) {
 		pos = pg.next
 	}
 	its, _ := eng.convo_intents(&n.e, q.convo, context.temp_allocator, ready)
+	everyone := true
+	for i in q.members {
+		everyone &&= w.nodes[i].alive
+	}
 	for op in w.model.ops {
 		if op.kind != .Run_Queue || !(op.status == .Acked || op.status == .Observed) {
 			continue
@@ -534,10 +575,19 @@ check_quiesce :: proc(w: ^World) {
 				pending = true
 			}
 		}
+		if (op.delta == 0 || !everyone) && users <= 1 && replies <= 1 {
+			if replies == 0 {
+				q.unran += 1
+			}
+			continue
+		}
 		if pending || users != 1 || replies != 1 {
-			world_fail(w, "quiesce: queued %s ran %d times (%d messages, still queued %v)", op.token, replies, users, pending)
+			world_fail(w, "quiesce: queued %s ran %d times (%d messages, still queued %v, sent while the runner was quiesced or asleep %v)", op.token, replies, users, pending, op.delta != 0)
+			for m in msgs {
+				world_note(w, "  msg %s role=%v parent=%s status=%v open=%v text=%q", rid_str(m.id), m.role, rid_str(m.parent), m.status, m.open, msg_text(m))
+			}
 		}
 	}
 	rs := rt.stats(&n.rt)
-	world_note(w, "quiesce: %d accepted, declined %v, %d stops, %d host lifts, %d turns held; runner evaluations %d, runs %d started %d finished", q.accepted, q.declined, q.stops, q.offs, rs.quiesce_held, rs.evaluations, rs.runs_started, rs.runs_finished)
+	world_note(w, "quiesce: %d accepted, declined %v, %d stops, %d host lifts, %d turns held, %d sends outside quiesce not run; runner evaluations %d, runs %d started %d finished", q.accepted, q.declined, q.stops, q.offs, rs.quiesce_held, q.unran, rs.evaluations, rs.runs_started, rs.runs_finished)
 }

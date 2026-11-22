@@ -73,6 +73,15 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 	busy := t.running && _running_live(r, o, v, &t)
 	waiting_msg: Rid
 	defer _claim_prune(r, o, waiting_msg)
+	if !busy && !cancelled && !obj.rid_none(head) {
+		if hm, herr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator); herr == .None && (hm.role == .User || hm.role == .System) && !hm.open && hm.status == .Done {
+			waiting_msg = head
+			if _placed_here(r, o, v, &t, &hm) {
+				start_run(r, o, head)
+			}
+			return
+		}
+	}
 	for &it in items {
 		#partial switch it.kind {
 		case .Queue, .Steer:

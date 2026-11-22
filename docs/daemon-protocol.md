@@ -464,7 +464,7 @@ to a harness's stdio.
 
 ## 11. Quiescing before a stop
 
-`quiesce` (151) prepares a machine that a host is about to stop (a cloud
+`quiesce` (175) prepares a machine that a host is about to stop (a cloud
 sandbox going to sleep). `quiesce(off: false, lift_ms)`:
 
 - answers at once with `accepted: false, reason: run_active` when a turn is
@@ -717,7 +717,7 @@ up exist only over the socket.
 | 135 | `event.deliver` | space: id, agent: id, name: str, payload: str | {} |
 | 136 | `trigger.watch` | object: object | {} |
 | 139 | `placement` | object: object | Placement |
-| 151 | `quiesce` | off: bool, lift_ms: uvarint | accepted:bool reason:enum (accepted, run_active, queued, relay) |
+| 175 | `quiesce` | off: bool, lift_ms: uvarint | accepted:bool reason:enum (accepted, run_active, queued, relay) |
 
 ### Daemon host ops (only over the socket)
 
