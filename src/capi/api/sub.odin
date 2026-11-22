@@ -190,13 +190,46 @@ unsubscribe :: proc(a: ^Api, id: u64) {
 }
 
 @(private)
-_on_deltas :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+_on_deltas :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, in_deltas: []eng.Delta) {
 	s := (^Sub)(data)
+	deltas := catalog_rows(in_deltas) if s.catalog else in_deltas
 	if s.raw != nil {
 		s.raw(s.data, s.id, deltas)
 		return
 	}
 	s.cb(s.data, s.id, encode_deltas(deltas, s.json))
+}
+
+catalog_rows :: proc(deltas: []eng.Delta, allocator := context.temp_allocator) -> []eng.Delta {
+	out := make([dynamic]eng.Delta, 0, len(deltas), allocator)
+	for d in deltas {
+		if d.kind != .Catalog {
+			append(&out, d)
+			continue
+		}
+		if len(d.key) != 16 {
+			continue
+		}
+		row := d
+		copy(row.object.id[:], d.key)
+		row.key = nil
+		row.text = nil
+		row.tag = 0
+		row.length = 0
+		row.removed = false
+		dup := false
+		for &x in out {
+			if x.kind == .Catalog && x.object == row.object {
+				x = row
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			append(&out, row)
+		}
+	}
+	return out[:]
 }
 
 encode_deltas :: proc(deltas: []eng.Delta, json_form: bool, allocator := context.temp_allocator) -> []u8 {
@@ -305,6 +338,9 @@ encode_deltas_compact :: proc(deltas: []eng.Delta, sub_object: Object, allocator
 		}
 		if d.length != 0 {
 			o_i64(&o, "length", d.length)
+		}
+		if d.draft {
+			o_bool(&o, "draft", true)
 		}
 		o_end(&o)
 	}
