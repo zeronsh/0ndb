@@ -81,11 +81,11 @@ _floor_meta_read :: proc(r: ^Replicator, id: Stream_Id, allocator := context.tem
 }
 
 @(private)
-_local_note :: proc(r: ^Replicator, l: ^Local) {
-	if client_note(&r.client, l.id, l.durable) != .None {
+_local_note :: proc(r: ^Replicator, l: ^Local, limit: i64) {
+	if client_note(&r.client, l.id, limit) != .None {
 		return
 	}
-	l.inflight = l.durable - l.cursor
+	l.inflight = limit - l.cursor
 	l.noting = true
 	r.uploading += 1
 }

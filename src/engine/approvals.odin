@@ -45,6 +45,7 @@ _rv_open :: proc(e: ^Engine, account: osync.Public_Key, relay: string, relay_pub
 		kernel_tls   = e.cfg.kernel_tls,
 		on_event     = _rv_on_event,
 		user         = sp,
+		durable      = _repl_durable,
 		credentials  = osync.Credentials{data = &e.approvals.creds, produce = _rv_creds_produce},
 	}
 	if e.cfg.transport.open != nil {

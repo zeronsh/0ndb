@@ -161,6 +161,7 @@ Pack :: struct {
 	handles:       [dynamic]Handle,
 	free_handles:  [dynamic]int,
 	open_inodes:   map[u64]^Open_Inode,
+	pend:          map[u64]^Pend,
 	dcache:        [DCACHE]Dcache_Entry,
 	poisoned:      bool,
 	recovering:    bool,
