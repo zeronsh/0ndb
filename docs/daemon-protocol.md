@@ -561,9 +561,9 @@ up exist only over the socket.
 | 28 | `account.join_space` | space: id | {} |
 | 29 | `pool.enroll` | token: bytes, card: bytes, evidence: bytes | enrollment:bytes |
 | 30 | `runner.enroll` | enrollment: bytes | spaces:uvarint |
-| 145 | `runner.renewal_request` | – | request:bytes |
-| 146 | `pool.renew` | request: bytes | renewal:bytes |
-| 147 | `runner.renew` | renewal: bytes | spaces:uvarint |
+| 164 | `runner.renewal_request` | – | request:bytes |
+| 165 | `pool.renew` | request: bytes | renewal:bytes |
+| 166 | `runner.renew` | renewal: bytes | spaces:uvarint |
 | 31 | `lease.renew` | – | renewed:uvarint |
 | 32 | `account.login_prf` | subject: str, credential: bytes, prf: bytes, label: str, relay: str, relay_key: bytes | path:enum login_path status:enum login_status code:str spaces:uvarint |
 | 33 | `account.passkey_add` | label: str, credential: bytes, prf: bytes | {} |

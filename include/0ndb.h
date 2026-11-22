@@ -1101,11 +1101,11 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 /* runner.enroll(enrollment: bytes) -> spaces:uvarint */
 #define ONDB_OP_RUNNER_ENROLL 30u
 /* runner.renewal_request() -> request:bytes */
-#define ONDB_OP_RUNNER_RENEWAL_REQUEST 145u
+#define ONDB_OP_RUNNER_RENEWAL_REQUEST 164u
 /* pool.renew(request: bytes) -> renewal:bytes */
-#define ONDB_OP_POOL_RENEW 146u
+#define ONDB_OP_POOL_RENEW 165u
 /* runner.renew(renewal: bytes) -> spaces:uvarint */
-#define ONDB_OP_RUNNER_RENEW 147u
+#define ONDB_OP_RUNNER_RENEW 166u
 /* lease.renew() -> renewed:uvarint */
 #define ONDB_OP_LEASE_RENEW 31u
 /* account.login_prf(subject: str, credential: bytes, prf: bytes, label: str, relay: str, relay_key: bytes) -> path:enum login_path status:enum login_status code:str spaces:uvarint */
