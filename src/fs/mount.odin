@@ -306,6 +306,7 @@ Mount :: struct {
 	nonce:       prim.Id,
 	mat_wait:    bool,
 	mat_ingest:  bool,
+	importing:   bool,
 	passes:      u64,
 	jpos:        i64,
 	jpend:       i64,
