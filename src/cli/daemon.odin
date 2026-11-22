@@ -231,6 +231,9 @@ daemon_main :: proc(args: ^Args) -> int {
 		}
 	}
 	acct_started(d, args)
+	eng.set_deliver_hook(&d.s.e, eng.Tick_Hook{data = d, call = proc(data: rawptr, e: ^eng.Engine) {
+		_flush_pushed((^Daemon)(data))
+	}})
 	if !_listen(d) {
 		api.stack_close(&d.s)
 		return report_error(.Io, "cannot listen on %s", d.sock)
