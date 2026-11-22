@@ -9,8 +9,11 @@ Own_Length :: struct {
 	space:   prim.Id,
 	object:  prim.Id,
 	kind:    Kind,
-	stream:  osync.Stream_Id,
-	durable: i64,
+	stream:   osync.Stream_Id,
+	durable:  i64,
+	uploaded: i64,
+	device:   bool,
+	path:     string,
 }
 
 own_lengths :: proc(e: ^Engine, allocator := context.allocator) -> (out: []Own_Length, err: Error) {
@@ -40,9 +43,12 @@ own_lengths :: proc(e: ^Engine, allocator := context.allocator) -> (out: []Own_L
 			continue
 		}
 		sc := _object_scope(sp, id)
-		sid := osync.stream_id(&sc, e.self, _seg_name(rec.kind, id), 0)
+		name := _seg_name(rec.kind, id)
+		sid := osync.stream_id(&sc, e.self, name, 0)
+		floor, _ := osync.replicator_floor(&sp.repl, &sc, name, 0)
 		osync.scope_clear(&sc)
-		append(&res, Own_Length{sp.id, id, rec.kind, sid, durable})
+		p := _clone(path, allocator) or_return
+		append(&res, Own_Length{sp.id, id, rec.kind, sid, durable, floor, _storage_class(e, sp, id, rec.kind) == .Device, p})
 	}
 	return res[:], .None
 }
