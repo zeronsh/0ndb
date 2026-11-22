@@ -656,7 +656,12 @@ _proc_event :: proc(p: ^Proc, e: agent.Event) {
 			run_tool_input(run, ev.id, ev.input)
 		}
 	case agent.Tool_Finished:
+		run_file_tool_end(run, ev.id)
 		run_tool_finished(run, ev.id, ev.output, ev.is_error)
+	case agent.File_Write_Begin:
+		run_file_write_begin(run, ev.tool, ev.path)
+	case agent.File_Base:
+		run_file_base(run, ev.tool, ev.path, ev.base, ev.kind)
 	case agent.Permission_Request:
 		run_permission(run, ev.id, ev.tool, ev.title, ev.input, ev.answered)
 	case agent.Usage:

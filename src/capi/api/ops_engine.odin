@@ -40,6 +40,10 @@ op_stats :: proc(c: ^Call, o: ^Out) -> Status {
 	o_int(o, "calls", len(c.api.calls))
 	o_int(o, "mounts", len(c.api.mounts))
 	o_u64(o, "fetched_bytes", s.fetched_bytes)
+	o_u64(o, "base_merged", s.base_merged)
+	o_u64(o, "base_current", s.base_current)
+	o_u64(o, "base_mismatch", s.base_mismatch)
+	o_u64(o, "base_not_text", s.base_not_text)
 	return .Ok
 }
 
