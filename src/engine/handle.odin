@@ -254,6 +254,11 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 		return .None
 	}
 	e := h.e
+	if h.kind == .Conversation || h.kind == .Map {
+		if !prim.exists(e.vfs, _seg_path(e, h.id) or_return) {
+			return .None
+		}
+	}
 	if h.own_tree == nil {
 		h.own_tree = _own_tree_get(e, h.sp, h.id, h.kind, &h.scope, false) or_return
 	}
@@ -317,6 +322,10 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	created := hlc_now(e)
 	if h.created == 0 {
 		h.created = created
+	}
+	if h.own_tree.dirty {
+		_own_tree_store(e, h.own_tree) or_return
+		h.own_tree.dirty = false
 	}
 	if !rec.own && !((h.kind == .Text || h.kind == .File_Tree) && _ckpt_waiting(h)) {
 		rec.own = true
