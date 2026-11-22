@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use crate::chan::{Next, Queue, QueueState};
 use crate::error::{Error, Result, Status};
 use crate::frame::{self, Frame, FrameReader};
-use crate::types::{Delta, Deltas, Event, Runners};
+use crate::types::{Delta, Deltas, Event, ForkDiff, Runners};
 
 #[cfg(unix)]
 pub(crate) type Sock = std::os::unix::net::UnixStream;
@@ -157,6 +157,7 @@ pub enum SubItem {
     Deltas(Vec<Delta>),
     Gap(Gap),
     Runners(Runners),
+    ForkDiff(ForkDiff),
     Raw(Vec<u8>),
 }
 
@@ -165,6 +166,7 @@ pub enum SubKind {
     Object,
     Catalog,
     Runners,
+    ForkDiff,
     Raw,
 }
 
@@ -820,6 +822,11 @@ fn dispatch(inner: &Inner, link: &Link, f: Frame) {
                 push_runners(&e.queue, r);
                 return;
             }
+            if e.kind == SubKind::ForkDiff {
+                let Ok(d) = serde_json::from_slice::<ForkDiff>(&f.payload[8..]) else { return };
+                push_fork_diff(&e.queue, d);
+                return;
+            }
             let Ok(mut d) = serde_json::from_slice::<Deltas>(&f.payload[8..]) else { return };
             if let Some(o) = &e.object {
                 for x in d.deltas.iter_mut().filter(|x| x.object.is_none()) {
@@ -918,6 +925,13 @@ fn push_runners(q: &Queue<SubItem>, r: Runners) {
     let mut g = q.lock();
     g.items.retain(|i| !matches!(i, SubItem::Runners(_)));
     g.items.push_back(SubItem::Runners(r));
+    q.notify(g);
+}
+
+fn push_fork_diff(q: &Queue<SubItem>, d: ForkDiff) {
+    let mut g = q.lock();
+    g.items.retain(|i| !matches!(i, SubItem::ForkDiff(_)));
+    g.items.push_back(SubItem::ForkDiff(d));
     q.notify(g);
 }
 

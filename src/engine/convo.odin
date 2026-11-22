@@ -20,6 +20,7 @@ Convo_Status :: struct {
 	awaiting:    bool,
 	revive:      bool,
 	head_hlc:    prim.Hlc,
+	held:        int,
 }
 
 convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}, ready: Ready = {}) -> (o: Object, err: Error) {
@@ -112,6 +113,7 @@ _status_of :: proc(v: ^obj.View, t: ^convo.Tail) -> (st: Convo_Status, err: obj.
 		head_status = t.head_status,
 		queued = t.queued,
 		waiting = t.waiting,
+		held = t.held,
 		intents = t.intents,
 		running = t.running,
 		awaiting = t.awaiting,

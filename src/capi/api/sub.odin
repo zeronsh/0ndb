@@ -30,6 +30,8 @@ Sub :: struct {
 	opening: bool,
 	opened: Open_Proc,
 	req:    []u8,
+	fork:   ^rt.Fork_Diff,
+	fork_subs: [dynamic]eng.Sub_Id,
 }
 
 subscribe_raw :: proc(a: ^Api, req: []u8, json_form: bool, raw: Raw_Sub_Proc, data: rawptr, payload: Sub_Proc = nil) -> (id: u64, catalog: bool, object: Object, status: Status) {
@@ -86,6 +88,9 @@ _subscribe :: proc(a: ^Api, req: []u8, json_form: bool, cb: Sub_Proc, raw: Raw_S
 		buffer = true
 	case "subscribe.runners":
 		id, status = _subscribe_runners(a, &c, json_form, cb, data)
+		return id, status, nil
+	case "subscribe.fork_diff":
+		id, status = _subscribe_fork_diff(a, &c, json_form, cb, data)
 		return id, status, nil
 	case:
 		return 0, .Bad_Request, nil
@@ -235,6 +240,91 @@ _subscribe_runners :: proc(a: ^Api, c: ^Call, json_form: bool, cb: Sub_Proc, dat
 	return s.id, .Ok
 }
 
+@(private)
+_subscribe_fork_diff :: proc(a: ^Api, c: ^Call, json_form: bool, cb: Sub_Proc, data: rawptr) -> (id: u64, status: Status) {
+	if a.r == nil {
+		return 0, .Unsupported
+	}
+	if cb == nil {
+		return 0, .Bad_Request
+	}
+	task := a_object(c, "object")
+	if prim.id_is_zero(task.id) {
+		return 0, .Invalid
+	}
+	fd, ferr := rt.fork_diff_open(a.r, a_object(c, "caller"), task, a_bool(c, "diff"), a_int(c, "max_chars", 200_000))
+	if ferr != .None {
+		return 0, _rterr(ferr)
+	}
+	s := new(Sub, a.allocator)
+	s.api = a
+	s.json = json_form
+	s.cb = cb
+	s.data = data
+	s.object = task
+	s.fork = fd
+	s.fork_subs = make([dynamic]eng.Sub_Id, a.allocator)
+	sid, err := eng.subscribe(a.e, task, .Conversation, _on_fork_deltas, s)
+	if err != .None {
+		delete(s.fork_subs)
+		rt.fork_diff_close(fd)
+		free(s, a.allocator)
+		return 0, status_of(err)
+	}
+	append(&s.fork_subs, sid)
+	_fork_trees_follow(s)
+	a.next_sub += 1
+	s.id = a.next_sub
+	append(&a.subs, s)
+	return s.id, .Ok
+}
+
+@(private)
+_fork_trees_follow :: proc(s: ^Sub) {
+	a := s.api
+	for len(s.fork_subs) > 1 {
+		eng.unsubscribe(a.e, pop(&s.fork_subs))
+	}
+	for ob in rt.fork_diff_trees(s.fork) {
+		if sid, err := eng.subscribe(a.e, ob, .File_Tree, _on_fork_deltas, s); err == .None {
+			append(&s.fork_subs, sid)
+		}
+	}
+}
+
+@(private)
+_on_fork_deltas :: proc(data: rawptr, e: ^eng.Engine, sub: eng.Sub_Id, deltas: []eng.Delta) {
+	s := (^Sub)(data)
+	if s.fork == nil {
+		return
+	}
+	remount := false
+	if len(s.fork_subs) > 0 && sub == s.fork_subs[0] {
+		for d in deltas {
+			remount ||= d.kind == .Mount
+		}
+		if !remount {
+			return
+		}
+	}
+	changed: bool
+	if remount {
+		changed = rt.fork_diff_reset(s.fork)
+		_fork_trees_follow(s)
+	} else {
+		changed = rt.fork_diff_update(s.fork)
+	}
+	if !changed {
+		return
+	}
+	buf := make([dynamic]u8, context.temp_allocator)
+	o: Out
+	out_init(&o, &buf, s.json)
+	list, diff := rt.fork_diff_result(s.fork)
+	emit_changes(&o, list, diff)
+	s.cb(s.data, s.id, out_finish(&o))
+}
+
 runners_notify :: proc(a: ^Api, space: prim.Id, object: Object = {}) {
 	if a.r == nil {
 		return
@@ -270,7 +360,13 @@ unsubscribe :: proc(a: ^Api, id: u64) {
 			if s.req != nil {
 				delete(s.req, a.allocator)
 			}
-			if s.buffer != 0 {
+			if s.fork != nil {
+				for x in s.fork_subs {
+					eng.unsubscribe(a.e, x)
+				}
+				delete(s.fork_subs)
+				rt.fork_diff_close(s.fork)
+			} else if s.buffer != 0 {
 				eng.buffer_close(a.e, s.buffer)
 			} else if s.engine != 0 {
 				eng.unsubscribe(a.e, s.engine)

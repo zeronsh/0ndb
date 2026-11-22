@@ -12,7 +12,7 @@ KIND_NAMES := [5]string{"", "conversation", "map", "text", "tree"}
 ROLE_NAMES := [5]string{"", "user", "assistant", "system", "tool"}
 BLOCK_NAMES := [12]string{"", "text", "reasoning", "tool_call", "tool_result", "image", "error", "notice", "permission", "permission_answer", "question", "file"}
 SEAL_NAMES := [5]string{"open", "done", "interrupted", "failed", "cancelled"}
-CONVO_STATUS_NAMES := [8]string{"idle", "running", "queued", "awaiting_permission", "failed", "interrupted", "waiting", "reviving"}
+CONVO_STATUS_NAMES := [9]string{"idle", "running", "queued", "awaiting_permission", "failed", "interrupted", "waiting", "reviving", "held"}
 OPEN_STATE_NAMES := [3]string{"running", "revive", "held"}
 #assert(len(OPEN_STATE_NAMES) == len(convo.Open_State))
 CONDITION_NAMES := [3]string{"", "any", "all"}
@@ -27,6 +27,7 @@ EVENT_PLACEMENT :: u64(10)
 TAKEOVER_NAMES := [3]string{"default", "auto", "never"}
 TAKEOVER_LEVEL_NAMES := [3]string{"conversation", "agent", "workspace"}
 RUNNER_KIND_NAMES := [2]string{"device", "pool"}
+ISOLATE_NAMES := [3]string{"unset", "true", "false"}
 RUNNER_STATE_NAMES := [3]string{"offline", "online", "wakeable"}
 EVENT_NAMES := [29]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed", "lease_lapsed", "space_left"}
 
@@ -74,7 +75,7 @@ event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 	return u64(len(EVENT_NAMES))
 }
 DELTA_NAMES := [19]string{"message", "block", "chunk", "seal", "leaf", "intent", "run", "mount", "record", "status", "field", "element", "counter", "catalog", "text", "files", "redacted", "members", "quarantined"}
-INTENT_NAMES := [44]string {
+INTENT_NAMES := [46]string {
 	25 = "queue",
 	26 = "steer",
 	27 = "edit_queued",
@@ -83,6 +84,7 @@ INTENT_NAMES := [44]string {
 	30 = "answer",
 	23 = "assign",
 	37 = "await",
+	45 = "hold",
 }
 ACCESS_NAMES := [4]string{"read", "write", "redact", "share"}
 ROLE_MEMBER_NAMES := [4]string{"", "tree", "document", "memory"}
@@ -109,6 +111,7 @@ emit_status :: proc(o: ^Out, st: ^eng.Convo_Status) {
 	o_bool(o, "awaiting", st.awaiting)
 	o_bool(o, "revive", st.revive)
 	o_u64(o, "head_hlc", u64(st.head_hlc))
+	o_int(o, "held", st.held)
 }
 
 emit_file_delta :: proc(o: ^Out, f: ^convo.File_Delta) {
@@ -296,6 +299,7 @@ emit_intent :: proc(o: ^Out, it: ^convo.Intent) {
 		o_end(o)
 	}
 	o_end(o)
+	o_str(o, "key", it.key)
 	o_end(o)
 }
 

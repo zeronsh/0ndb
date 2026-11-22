@@ -1051,7 +1051,7 @@ cmd_task :: proc(a: ^Args) -> int {
 	switch tool {
 	case "spawn":
 		if len(a.pos) < 2 {
-			return usage_error("usage: 0ndb task spawn GOAL [--title T] [--agent A] [--provider P] [--model M]")
+			return usage_error("usage: 0ndb task spawn GOAL [--title T] [--agent A] [--provider P] [--model M] [--isolate true|false]")
 		}
 		append(&in_, `{"goal":`)
 		api.json_string(&in_, strings.join(a.pos[1:], " ", context.temp_allocator))
@@ -1062,6 +1062,12 @@ cmd_task :: proc(a: ^Args) -> int {
 				append(&in_, ':')
 				api.json_string(&in_, v)
 			}
+		}
+		if v, ok := flag_value(a, "isolate"); ok {
+			if v != "true" && v != "false" {
+				return usage_error("--isolate takes true or false")
+			}
+			put(&in_, `,"isolate":`, v)
 		}
 		append(&in_, '}')
 	case "send":

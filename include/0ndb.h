@@ -91,9 +91,10 @@
  *                 10 question, 11 file
  *   seal          0 open, 1 done, 2 interrupted, 3 failed, 4 cancelled
  *   convo_status  0 idle, 1 running, 2 queued, 3 awaiting_permission,
- *                 4 failed, 5 interrupted, 6 waiting, 7 reviving
+ *                 4 failed, 5 interrupted, 6 waiting, 7 reviving, 8 held
  *   open_state    0 running, 1 revive
  *   condition     1 any, 2 all
+ *   isolate       0 unset, 1 true, 2 false
  *   mode          0 end_to_end, 1 transparent
  *   unit          0 lines, 1 bytes
  *   sort          0 relevance, 1 newest
@@ -104,7 +105,7 @@
  *   dir           0 older, 1 newer
  *   member_role   1 tree, 2 document, 3 memory
  *   intent        23 assign, 25 queue, 26 steer, 27 edit_queued, 28 cancel,
- *                 29 interrupt, 30 answer, 37 await
+ *                 29 interrupt, 30 answer, 37 await, 45 hold
  *   delta         0 message, 1 block, 2 chunk, 3 seal, 4 leaf, 5 intent,
  *                 6 run, 7 mount, 8 record, 9 status, 10 field, 11 element,
  *                 12 counter, 13 catalog, 14 text, 15 files, 16 redacted,
@@ -141,7 +142,8 @@
  *   Status     := status: enum convo_status, head: rid, position: rid,
  *                 browsing: bool, head_status: enum seal, queued: uvarint,
  *                 waiting: uvarint, intents: uvarint, running: bool,
- *                 awaiting: bool, revive: bool, head_hlc: uvarint
+ *                 awaiting: bool, revive: bool, head_hlc: uvarint,
+ *                 held: uvarint
  *   Blob       := oid: bytes, size: uvarint, preview: str
  *   File       := mount: str, tree: id, line: id, version: bytes
  *   Line       := mount: str, line: id
@@ -175,7 +177,7 @@
  *   Intent     := item: rid, latest: rid, kind: enum intent, by: id,
  *                 stamp: uvarint, text: str, target: rid, allow: bool,
  *                 tasks: ids, condition: enum condition, deadline: uvarint,
- *                 expr: str, attachments: [Attachment]
+ *                 expr: str, attachments: [Attachment], key: str
  *   Mount      := name: str, tree: id, line: id, path: str, stamp: uvarint,
  *                 by: id, removed: bool
  *   Compaction := at: rid, from: rid, to: rid, summary: str, blob: Blob,
@@ -331,8 +333,9 @@
  *                 instructions: str, budget_tokens: uvarint, budget_usd: f64,
  *                 budget_turns: uvarint, budget_seconds: ivarint
  *   TaskStatus := status: str (queued, running, waiting, completed, failed,
- *                 cancelled), summary: str, cancelled: bool, reason: str,
- *                 budget_tokens: uvarint, budget_usd: f64
+ *                 cancelled, held), summary: str, cancelled: bool, reason: str,
+ *                 budget_tokens: uvarint, budget_usd: f64,
+ *                 isolate: enum isolate, conflicts: strs
  *   Change     := mount: str, path: str, change: str
  *   Schedule   := id: str, owner: object, prompt: str, cron: str, at: ivarint,
  *                 tz: str, conversation: id, fresh: bool, next: ivarint,
@@ -1393,6 +1396,8 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_RUNNERS 162u
 /* subscribe.runners(space: id, object: object) -> Runners */
 #define ONDB_OP_SUBSCRIBE_RUNNERS 163u
+/* subscribe.fork_diff(object: object, caller: object, diff: bool, max_chars: uvarint) -> changes:[Change] diff:str */
+#define ONDB_OP_SUBSCRIBE_FORK_DIFF 143u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus
