@@ -104,6 +104,14 @@ flows; otherwise leave it running.
   bounded queues (`Options::queue_limit`, default 1024 items).
 - Subscriptions use compact JSON deltas (zero fields omitted) and the events
   stream leaves out per-tick `durable` and `uploaded` notifications.
+- To check idle from the app, `daemon.status` reports `wakeups` (engine loop
+  iterations), `timeout_ms` (the next armed deadline, -1 when none) and
+  `timers` (each armed timer's arming site and `due_ms`). After an agent
+  turn the harness process stays warm for 5 minutes (at most 4 warm
+  processes) so the next turn starts at once; until it exits, one timer
+  (`_warm_arm`) is armed and the harness's own output can wake the daemon.
+  Measured with two signed-in daemons on a relay after a Claude Code turn:
+  once the warm harness exited, 0 engine wakeups and no armed timer.
 
 Measured on Linux x86-64 (8 cores, load 11 to 13 from other work), release
 builds, daemon and client on one machine:

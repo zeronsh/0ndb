@@ -1168,6 +1168,17 @@ op_daemon_status :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 		api.o_end(o)
 	}
 	api.o_end(o)
+	l := &d.s.loop
+	api.o_arr(o, "timers", len(l.heap))
+	for h in l.heap {
+		t := l.timers[h]
+		file := t.owner.file_path[strings.last_index_byte(t.owner.file_path, '/') + 1:]
+		api.o_obj(o, "")
+		api.o_str(o, "site", fmt.tprintf("%s %s:%d", t.owner.procedure, file, t.owner.line))
+		api.o_i64(o, "due_ms", (t.deadline - prim.loop_now_ns(l)) / 1_000_000)
+		api.o_end(o)
+	}
+	api.o_end(o)
 	return .Ok
 }
 
