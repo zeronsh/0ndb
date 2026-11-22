@@ -2352,7 +2352,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   first use and keeps it current while open; reads below the watermark are
   ranged GETs from the batch objects, `sendfile` is refused there, and a
   redaction reaching below it first restores the range into the pack from
-  the objects, lowers the watermark durably, then redacts as before. Slotted
+  the objects, lowers the watermark durably, then redacts as before. A
+  redaction is acknowledged only once a `Redacting` record naming its range
+  is durable in the manifest; the flush that rewrites the batch objects
+  holding the range writes the matching `Redact` entry, and a restart
+  re-queues every `Redacting` record without one, so a crash between the
+  acknowledgement and the rewrite cannot leave the old bytes in the object
+  store. A stream is never evicted while a redaction of it is in progress
+  or not yet rewritten into the objects. Slotted
   (based or trimmed) streams stay whole in the pack. Measured with
   `tools/costbench` s1 (1062 transcript messages): the relay's pack on disk
   drops from 4.71 MB to 3.60 MB, the 1.23 MB conversation segment holding
