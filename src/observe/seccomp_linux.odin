@@ -65,9 +65,38 @@ Notif_Sizes :: struct {
 }
 
 Shared :: struct #align (64) {
-	state: u32,
-	_pad:  [60]u8,
-	notif: [NOTIF_BUF]u8,
+	state:    u32,
+	parked_n: u32,
+	_pad:     [56]u8,
+	notif:    [NOTIF_BUF]u8,
+	parked:   [PARK_MAX]u64,
+}
+
+PARK_MAX :: 64
+GATE_MAX :: 16
+GATE_EXEMPT :: 16
+LOCKS_SEEN :: 16
+
+@(private)
+Gate :: struct {
+	id:       u32,
+	root:     [prim.PATH_MAX]u8,
+	root_len: int,
+	exempt:   [GATE_EXEMPT]prim.Pid,
+	exempt_n: int,
+}
+
+@(private)
+Lock_Seen :: struct {
+	path: [prim.PATH_MAX]u8,
+	len:  int,
+	pid:  prim.Pid,
+}
+
+@(private)
+Parked :: struct {
+	id:   u64,
+	gate: u32,
 }
 
 Subreaper :: enum u8 {
@@ -102,6 +131,9 @@ Tree :: struct {
 	ready_fd: i32,
 	sock:     i32,
 	flush_fd: i32,
+	gate_fd:  i32,
+	parked:   [PARK_MAX]Parked,
+	parked_n: int,
 	unsignaled: int,
 	recv:     u64,
 	handled:  u64,
@@ -152,6 +184,13 @@ Supervisor :: struct {
 	has_openat2: bool,
 	root_fd:    i32,
 	stats:      Stats,
+	gate_mu:    sync.Mutex,
+	gates:      [GATE_MAX]Gate,
+	gate_n:     int,
+	gate_next:  u32,
+	gate_count: u32,
+	locks:      [LOCKS_SEEN]Lock_Seen,
+	lock_next:  int,
 }
 
 supervisor_init :: proc(s: ^Supervisor, loop: ^prim.Loop, opts := DEFAULT_SUPERVISOR, allocator := context.allocator) -> prim.Error {
@@ -319,6 +358,8 @@ supervisor_stats :: proc(s: ^Supervisor) -> Stats {
 	st.failed = intrinsics.atomic_load(&s.stats.failed)
 	st.inexact = intrinsics.atomic_load(&s.stats.inexact)
 	st.stale = intrinsics.atomic_load(&s.stats.stale)
+	st.parked = intrinsics.atomic_load(&s.stats.parked)
+	st.released = intrinsics.atomic_load(&s.stats.released)
 	return st
 }
 
@@ -327,7 +368,191 @@ supervisor_trees :: proc(s: ^Supervisor) -> int {
 }
 
 write_observer :: proc(s: ^Supervisor) -> fs.Write_Observer {
-	return fs.Write_Observer{data = s, start = _observer_start, stop = _observer_stop, fence = _observer_fence}
+	return fs.Write_Observer{data = s, start = _observer_start, stop = _observer_stop, fence = _observer_fence, gate = _observer_gate, ungate = _observer_ungate, lock_creator = _observer_lock_creator}
+}
+
+@(private)
+_observer_gate :: proc(data: rawptr, root: string, exempt: []prim.Pid) -> (u32, bool) {
+	return supervisor_gate((^Supervisor)(data), root, exempt)
+}
+
+@(private)
+_observer_ungate :: proc(data: rawptr, id: u32) {
+	supervisor_ungate((^Supervisor)(data), id)
+}
+
+@(private)
+_observer_lock_creator :: proc(data: rawptr, path: string) -> (prim.Pid, bool) {
+	return supervisor_lock_creator((^Supervisor)(data), path)
+}
+
+supervisor_gate :: proc(s: ^Supervisor, root: string, exempt: []prim.Pid) -> (id: u32, ok: bool) {
+	if len(root) == 0 || len(root) >= prim.PATH_MAX {
+		return 0, false
+	}
+	sync.mutex_lock(&s.gate_mu)
+	defer sync.mutex_unlock(&s.gate_mu)
+	if s.gate_n == GATE_MAX {
+		return 0, false
+	}
+	s.gate_next += 1
+	if s.gate_next == 0 {
+		s.gate_next = 1
+	}
+	g := &s.gates[s.gate_n]
+	g^ = {}
+	g.id = s.gate_next
+	copy(g.root[:], root)
+	g.root_len = len(root)
+	for p in exempt {
+		if g.exempt_n < GATE_EXEMPT && p > 0 {
+			g.exempt[g.exempt_n] = p
+			g.exempt_n += 1
+		}
+	}
+	s.gate_n += 1
+	intrinsics.atomic_store(&s.gate_count, u32(s.gate_n))
+	return g.id, true
+}
+
+supervisor_ungate :: proc(s: ^Supervisor, id: u32) {
+	sync.mutex_lock(&s.gate_mu)
+	for i in 0 ..< s.gate_n {
+		if s.gates[i].id == id {
+			s.gates[i] = s.gates[s.gate_n - 1]
+			s.gate_n -= 1
+			break
+		}
+	}
+	intrinsics.atomic_store(&s.gate_count, u32(s.gate_n))
+	sync.mutex_unlock(&s.gate_mu)
+	for t in s.trees {
+		if t != nil && t.gate_fd >= 0 {
+			_efd_signal(t.gate_fd)
+		}
+	}
+}
+
+supervisor_lock_creator :: proc(s: ^Supervisor, path: string) -> (pid: prim.Pid, ok: bool) {
+	sync.mutex_lock(&s.gate_mu)
+	defer sync.mutex_unlock(&s.gate_mu)
+	for k in 0 ..< LOCKS_SEEN {
+		i := (s.lock_next - 1 - k + 2 * LOCKS_SEEN) % LOCKS_SEEN
+		l := &s.locks[i]
+		if l.len > 0 && string(l.path[:l.len]) == path {
+			return l.pid, true
+		}
+	}
+	return 0, false
+}
+
+@(private)
+_lock_record :: proc(s: ^Supervisor, path: string, pid: prim.Pid) {
+	if len(path) >= prim.PATH_MAX {
+		return
+	}
+	sync.mutex_lock(&s.gate_mu)
+	defer sync.mutex_unlock(&s.gate_mu)
+	l := &s.locks[s.lock_next]
+	copy(l.path[:], path)
+	l.len = len(path)
+	l.pid = pid
+	s.lock_next = (s.lock_next + 1) % LOCKS_SEEN
+}
+
+@(private)
+_under :: proc "contextless" (p, root: string) -> bool {
+	if len(p) < len(root) || p[:len(root)] != root {
+		return false
+	}
+	return len(p) == len(root) || p[len(root)] == '/' || root[len(root) - 1] == '/'
+}
+
+@(private)
+_gate_match :: proc(s: ^Supervisor, path, from: string, tgid: prim.Pid, lineage: []prim.Pid) -> (id: u32, gated: bool) {
+	if intrinsics.atomic_load(&s.gate_count) == 0 {
+		return 0, false
+	}
+	sync.mutex_lock(&s.gate_mu)
+	defer sync.mutex_unlock(&s.gate_mu)
+	outer: for i in 0 ..< s.gate_n {
+		g := &s.gates[i]
+		root := string(g.root[:g.root_len])
+		if !_under(path, root) && !(len(from) > 0 && _under(from, root)) {
+			continue
+		}
+		for e in g.exempt[:g.exempt_n] {
+			if e == tgid {
+				continue outer
+			}
+			for l in lineage {
+				if l == e {
+					continue outer
+				}
+			}
+		}
+		return g.id, true
+	}
+	return 0, false
+}
+
+@(private)
+_gate_active :: proc(s: ^Supervisor, id: u32) -> bool {
+	sync.mutex_lock(&s.gate_mu)
+	defer sync.mutex_unlock(&s.gate_mu)
+	for i in 0 ..< s.gate_n {
+		if s.gates[i].id == id {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_park :: proc(s: ^Supervisor, t: ^Tree, id: u64, gate: u32) -> bool {
+	if t.parked_n >= PARK_MAX {
+		return false
+	}
+	sh := &s.shared[t.slot]
+	i := t.parked_n
+	t.parked[i] = Parked{id, gate}
+	intrinsics.volatile_store(&sh.parked[i], id)
+	t.parked_n += 1
+	intrinsics.volatile_store(&sh.parked_n, u32(t.parked_n))
+	return true
+}
+
+@(private)
+_reply_id :: proc(t: ^Tree, id: u64) {
+	resp := Notif_Resp {
+		id    = id,
+		flags = NOTIF_FLAG_CONTINUE,
+	}
+	for {
+		e := _sys_ioctl(t.fd, NOTIF_SEND, &resp)
+		if e != EINTR {
+			break
+		}
+	}
+}
+
+@(private)
+_release_parked :: proc(s: ^Supervisor, t: ^Tree, all: bool) {
+	sh := &s.shared[t.slot]
+	i := 0
+	for i < t.parked_n {
+		if !all && _gate_active(s, t.parked[i].gate) {
+			i += 1
+			continue
+		}
+		_reply_id(t, t.parked[i].id)
+		last := t.parked_n - 1
+		t.parked[i] = t.parked[last]
+		intrinsics.volatile_store(&sh.parked[i], t.parked[i].id)
+		t.parked_n = last
+		intrinsics.volatile_store(&sh.parked_n, u32(t.parked_n))
+		_stat_add(&s.stats.released)
+	}
 }
 
 @(private)
@@ -438,6 +663,7 @@ spawn_with :: proc(s: ^Supervisor, argv: []string, opts: Spawn_Options) -> (chil
 		space_fd = -1,
 		ready_fd = -1,
 		flush_fd = -1,
+		gate_fd  = -1,
 	}
 	router_refresh(&s.router)
 	_roots_publish(s)
@@ -710,7 +936,7 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) -> bool {
 		_reply(s, t, n.id)
 		return true
 	}
-	if intrinsics.atomic_load_explicit(&s.consumers, .Relaxed) == 0 {
+	if intrinsics.atomic_load_explicit(&s.consumers, .Relaxed) == 0 && intrinsics.atomic_load(&s.gate_count) == 0 {
 		_reply(s, t, n.id)
 		return true
 	}
@@ -782,7 +1008,15 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) -> bool {
 	if !w.exact {
 		_stat_add(&s.stats.inexact)
 	}
+	if w.op == .Write && w.flags & u32(O_CREAT | O_EXCL) == u32(O_CREAT | O_EXCL) && len(w.path) > 11 && w.path[len(w.path) - 11:] == "/index.lock" {
+		_lock_record(s, w.path, tgid)
+	}
 	_encode_write(&t.wbuf, &w)
+	if gid, gated := _gate_match(s, w.path, w.from, tgid, w.lineage); gated && _park(s, t, n.id, gid) {
+		_stat_add(&s.stats.parked)
+		intrinsics.volatile_store(&sh.state, 0)
+		return _ring_push(t, t.wbuf[:])
+	}
 	_reply(s, t, n.id)
 	return _ring_push(t, t.wbuf[:])
 }
