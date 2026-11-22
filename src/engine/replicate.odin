@@ -757,9 +757,15 @@ _keys_needed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, seg: 
 	}
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
-	if rt, err := _remote_tree_get(e, sp, &sc, device, seg, epoch); err == .None && rt.loaded && !_tree_maybe_stale(sp, rt) {
-		osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
+	rt, err := _remote_tree_get(e, sp, &sc, device, seg, epoch)
+	if err != .None || !rt.loaded {
+		return
 	}
+	if _tree_maybe_stale(sp, rt) {
+		osync.replicator_keys_refresh(&sp.repl, &rt.scope, rt.device, rt.name, rt.epoch)
+		return
+	}
+	osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
 }
 
 @(private)
