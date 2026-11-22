@@ -369,19 +369,55 @@ while let Some(change) = buf.recv().await {
 ```
 
 `edit` applies locally at once, sends without waiting and returns the edit's
-sequence number; acknowledgements are absorbed as they arrive (`flush_blocking`
-waits for all of them, and an edit the daemon refuses surfaces as
-`Change::Closed` with its status on the next `recv`); incoming deltas are transformed
-over the unacknowledged edits, so the text never jumps. `read` and
-`load_all_blocking` fill a large file's unloaded ranges, `anchors`/`resolve`
-give positions that survive every edit, `set_cursors` publishes this editor's
-selections, `undo`/`redo` act on this actor's edit groups. `Reopen` means the
+sequence number. Acknowledgements are absorbed as they arrive: an edit
+result names the `ack` and the `rev` it reflects, and the edit is dropped
+from the pending list once the client has applied that rev, so a buffer
+nobody else edits keeps nothing pending (`flush_blocking` waits for all
+results; an edit the daemon refuses surfaces as `Change::Closed` with its
+status on the next `recv`). Incoming deltas are transformed over the
+unacknowledged edits, so the text never jumps. `read` and
+`load_all_blocking` fill a large file's unloaded ranges. `anchors(positions,
+after)` makes positions that survive every edit: `after = false` sticks to
+the character at the position, `after = true` to the one before it;
+`resolve` answers in this client's coordinates (the daemon un-transforms
+through the deltas the client has not applied yet, and the crate maps the
+reply through whatever the client applied while it was in flight).
+`set_cursors` publishes this editor's selections to the object's other
+online devices; theirs arrive as `Change::Cursors`. `undo`/`redo` act on
+this actor's edit groups and come back as deltas. `Reopen` means the
 connection or the client queue lost events and the buffer must be opened
 again; `Closed` carries the daemon's status (`conflict` also means reopen).
-Measured against the live-buffer daemon: two actors on one connection
-sending about 345 random edits each run (multi-byte and astral characters,
-UTF-16 units), with up to dozens in flight, converged byte-for-byte with the
-daemon's text, and anchors moved with a concurrent insert.
+
+An editor that keeps its own rope (gpui, Zed) opens with
+`OpenArgs { own_text: true, .. }`: the crate then keeps only the length and
+the protocol state, `take_page()` hands over the open snapshot, every
+`Change::Delta` is applied to the editor's rope in `recv` order and edits
+are computed from it. Without `own_text` the crate mirrors the text
+(`text()`, `slice()`, `unit()`), 4 bytes per unit.
+
+`examples/editor_e2e.rs` is the end-to-end proof: a daemon with a mounted
+tree, an agent editing the same file through `tree.write`, disk writes
+and a second buffer, and an editor sending 1,500 pipelined UTF-16 edits per
+file (emoji, ZWJ sequences, CRLF, a 5 MiB file) with undo/redo, anchors and
+cursors, ending with client == daemon == `tree.read` == disk.
+
+Measured on Linux against one daemon (agent writing every 25 ms, 1,500
+edits per file; a quarter of them paced like typing):
+
+| file | typing edit→ack p50 / p99 | pipelined (≤ 40 in flight) p50 / p99 |
+|---|---|---|
+| 24 KiB, emoji and ZWJ | 1.2 ms / 5.9 ms | 8.6 ms / 26 ms |
+| 24 KiB, CRLF | 1.8 ms / 9.8 ms | 17 ms / 26 ms |
+| 5 MiB | 2.7 ms / 64 ms | 24 ms / 100 ms |
+
+Each open buffer costs the daemon about 2 KB plus the file's text while it
+is open (+10 MB for the 5 MiB file); the crate's mirror is 4 bytes per unit
+(`own_text` drops it). With 104 buffers open and nothing changing, the
+daemon made no wakeups and no context switches in 10 s and armed no timer.
+The 5 MiB p99 is the mounted file being rewritten on the daemon's loop,
+coalesced to at most one write every ~40 ms while typing. Across two
+daemons on one relay, a remote cursor arrives in about 0.2 ms and an edit
+on one device reaches the other device's buffer in about 2 ms (p50).
 
 ## 9. Try it today
 

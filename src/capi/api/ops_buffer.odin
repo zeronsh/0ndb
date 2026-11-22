@@ -22,7 +22,7 @@ BUFFER_OPS := []Op {
 	{154, "buffer.undo", {BUF}, "done:bool", op_buffer_undo},
 	{155, "buffer.redo", {BUF}, "done:bool", op_buffer_redo},
 	{156, "buffer.anchors", {BUF, REV, {"positions", .U64s, nil}, {"bias", .Enum, BIAS_NAMES[:]}}, "anchors:strs", op_buffer_anchors},
-	{157, "buffer.resolve", {BUF, {"anchors", .Strs, nil}}, "positions:[ivarint] rev:uvarint ack:uvarint", op_buffer_resolve},
+	{157, "buffer.resolve", {BUF, {"anchors", .Strs, nil}, REV}, "positions:[ivarint] rev:uvarint ack:uvarint", op_buffer_resolve},
 	{158, "buffer.cursors", {BUF, REV, {"ranges", .U64s, nil}}, "", op_buffer_cursors},
 	{159, "buffer.text", {BUF}, "rev:uvarint text:str", op_buffer_text},
 }
@@ -352,7 +352,7 @@ op_buffer_resolve :: proc(c: ^Call, o: ^Out) -> Status {
 		}
 		list[i] = a
 	}
-	pos, rev, ack, err := eng.buffer_resolve(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")), list, context.temp_allocator)
+	pos, rev, ack, err := eng.buffer_resolve(c.api.e, eng.Buffer_Id(a_u64(c, "buffer")), a_u64(c, "rev"), list, context.temp_allocator)
 	if err != .None {
 		return status_of(err)
 	}

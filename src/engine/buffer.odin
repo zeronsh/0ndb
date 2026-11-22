@@ -1112,19 +1112,27 @@ _resolve_one :: proc(b: ^Buffer, a: Anchor) -> int {
 	return _to_units(b, p)
 }
 
-buffer_resolve :: proc(e: ^Engine, id: Buffer_Id, anchors: []Anchor, allocator := context.allocator) -> (out: []int, rev: u64, ack: u64, err: Error) {
+buffer_resolve :: proc(e: ^Engine, id: Buffer_Id, rev: u64, anchors: []Anchor, allocator := context.allocator) -> (out: []int, at: u64, ack: u64, err: Error) {
 	context = context_for(e)
 	b := _buffer_find(e, id)
 	if b == nil {
 		return nil, 0, 0, .Not_Found
 	}
 	h := _handle_get(e, b.object, b.kind) or_return
+	_buffer_base(e, b, rev) or_return
 	_buffer_view_ready(e, b, h) or_return
 	out = make([]int, len(anchors), allocator)
 	for a, i in anchors {
-		out[i] = _resolve_one(b, a)
+		p := _resolve_one(b, a)
+		if p >= 0 {
+			after := a.bias == .Before if a.id.actor != {} else a.offset != 0
+			#reverse for s in b.sent {
+				p = crdt.delta_untransform_pos(s.ops, p, after, _utf16(b))
+			}
+		}
+		out[i] = p
 	}
-	return out, b.rev, b.recv, .None
+	return out, rev, b.recv, .None
 }
 
 buffer_text :: proc(e: ^Engine, id: Buffer_Id, allocator := context.allocator) -> (text: []u8, rev: u64, err: Error) {

@@ -831,6 +831,9 @@ export class LiveBuffer {
     this.listeners = new Set();
     this.cursors = [];
     this.acks = [];
+    this.ver = 0;
+    this.log = [];
+    this.watch = new Map();
   }
 
   static async open(transport, { object, path = '', line = '', units = 'utf16', actor, page = 65536 } = {}) {
@@ -876,7 +879,7 @@ export class LiveBuffer {
         p.ops = p2;
         d = d2;
       }
-      this.doc.apply(d);
+      this._apply(d);
       this.rev = ev.rev;
       while (this.acks.length && this.acks[0].rev <= this.rev) this._acked(this.acks.shift().ack);
       this.cursors = this.cursors.map((c) => ({ ...c, ranges: c.ranges.map((r) => ({ anchor: transformPosition(d, r.anchor, true, this.utf16), head: transformPosition(d, r.head, true, this.utf16) })) }));
@@ -889,6 +892,27 @@ export class LiveBuffer {
     }
   }
 
+  _apply(ops) {
+    this.doc.apply(ops);
+    this.ver++;
+    if (this.watch.size) this.log.push({ ver: this.ver, ops });
+  }
+
+  _watchEnd(ver, positions, after) {
+    const out = positions.map((p, i) => {
+      if (p < 0) return p;
+      let q = p;
+      for (const e of this.log) if (e.ver > ver) q = transformPosition(e.ops, q, after[i], this.utf16);
+      return q;
+    });
+    const n = (this.watch.get(ver) || 1) - 1;
+    if (n) this.watch.set(ver, n);
+    else this.watch.delete(ver);
+    const low = this.watch.size ? Math.min(...this.watch.keys()) : Infinity;
+    this.log = this.log.filter((e) => e.ver > low);
+    return out;
+  }
+
   _local(pos, ack, after) {
     if (pos < 0) return pos;
     let p = pos;
@@ -899,7 +923,7 @@ export class LiveBuffer {
   edit(edits, group = 0) {
     const ops = editsToOps(edits, this.utf16);
     if (!ops.length) return Promise.resolve(this.seq);
-    this.doc.apply(ops);
+    this._apply(ops);
     this.seq++;
     const seq = this.seq;
     this.pending.push({ seq, ops });
@@ -933,8 +957,17 @@ export class LiveBuffer {
   }
 
   async resolve(anchors) {
-    const r = await this.t.call({ op: 'buffer.resolve', buffer: this.id, anchors });
-    return r.positions.map((p) => this._local(p, r.ack, false));
+    const ver = this.ver;
+    this.watch.set(ver, (this.watch.get(ver) || 0) + 1);
+    const after = anchors.map((a) => a === 'e' || a.endsWith('.b'));
+    let r;
+    try {
+      r = await this.t.call({ op: 'buffer.resolve', buffer: this.id, rev: this.rev, anchors });
+    } catch (e) {
+      this._watchEnd(ver, [], []);
+      throw e;
+    }
+    return this._watchEnd(ver, r.positions, after);
   }
 
   setCursors(ranges) {

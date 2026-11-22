@@ -503,6 +503,33 @@ delta_transform_pos :: proc(ops: []Delta_Op, pos: int, after: bool, utf16: bool)
 	return pos + shift
 }
 
+delta_untransform_pos :: proc(ops: []Delta_Op, pos: int, after: bool, utf16: bool) -> int {
+	old := 0
+	nw := 0
+	for o in ops {
+		n := op_units(o, utf16)
+		switch o.kind {
+		case .Retain:
+			if pos < nw + n {
+				return old + pos - nw
+			}
+			old += n
+			nw += n
+		case .Insert:
+			if pos < nw + n {
+				return old
+			}
+			nw += n
+		case .Delete:
+			if pos == nw && !after {
+				return old
+			}
+			old += n
+		}
+	}
+	return old + pos - nw
+}
+
 delta_apply :: proc(doc: []u8, ops: []Delta_Op, allocator := context.allocator) -> (out: []u8, ok: bool) {
 	res := make([dynamic]u8, 0, len(doc), allocator)
 	at := 0
