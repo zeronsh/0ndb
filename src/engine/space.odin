@@ -32,6 +32,7 @@ Space_Info :: struct {
 
 Space :: struct {
 	e:            ^Engine,
+	members_owed: bool,
 	id:           prim.Id,
 	cat_checked:  bool,
 	link:         Link,

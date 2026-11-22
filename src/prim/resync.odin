@@ -12,6 +12,17 @@ resync_file :: proc(vfs: Vfs, path: string, full := false) -> Error {
 	return resync_fd(vfs, fd, full)
 }
 
+sync_owed :: proc(vfs: Vfs, fd: Fd, owed: ^bool, full := false) -> Error {
+	err: Error
+	if owed^ {
+		err = resync_fd(vfs, fd, full)
+	} else {
+		err = fullsync(vfs, fd) if full else datasync(vfs, fd)
+	}
+	owed^ = err != .None
+	return err
+}
+
 resync_fd :: proc(vfs: Vfs, fd: Fd, full := false) -> Error {
 	size := file_size(vfs, fd) or_return
 	return resync_range(vfs, fd, 0, size, full)

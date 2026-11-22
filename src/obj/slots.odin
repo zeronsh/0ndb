@@ -31,6 +31,7 @@ Slots :: struct {
 	covered:   i64,
 	synced:    i64,
 	marked:    bool,
+	owed:      bool,
 	allocator: runtime.Allocator,
 }
 
@@ -177,13 +178,13 @@ slots_sync :: proc(c: ^Slots) -> Error {
 	if c.covered == c.synced && !c.marked {
 		return .None
 	}
-	if err := prim.datasync(c.vfs, c.fd); err != .None {
+	if err := prim.sync_owed(c.vfs, c.fd, &c.owed); err != .None {
 		return perr(err)
 	}
 	if err := _header_write(c.vfs, c.fd, c.owner, c.slots, c.used, c.covered); err != .None {
 		return err
 	}
-	if err := prim.datasync(c.vfs, c.fd); err != .None {
+	if err := prim.sync_owed(c.vfs, c.fd, &c.owed); err != .None {
 		return perr(err)
 	}
 	c.synced = c.covered

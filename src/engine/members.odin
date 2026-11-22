@@ -178,7 +178,7 @@ _members_log_append :: proc(e: ^Engine, sp: ^Space, raw: []u8) -> Error {
 	prim.put_u32le(hdr[:], u32(len(raw)))
 	_perr(prim.write_at(e.vfs, fd, hdr[:], size)) or_return
 	_perr(prim.write_at(e.vfs, fd, raw, size + 4)) or_return
-	return _perr(prim.datasync(e.vfs, fd))
+	return _perr(prim.sync_owed(e.vfs, fd, &sp.members_owed))
 }
 
 @(private)

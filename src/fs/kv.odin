@@ -29,6 +29,7 @@ Kv :: struct {
 	live_bytes: u64,
 	log_end:   u64,
 	covered:   u64,
+	idx_owed:  bool,
 	marked:    bool,
 	clean_disk: bool,
 	pending:   map[string]Kv_Pending,
@@ -891,7 +892,7 @@ kv_write_header :: proc(kv: ^Kv, clean: bool) {
 
 @(private = "file")
 kv_checkpoint :: proc(kv: ^Kv) -> Error {
-	from_prim(prim.datasync(kv.vfs, kv.idx_fd)) or_return
+	from_prim(prim.sync_owed(kv.vfs, kv.idx_fd, &kv.idx_owed)) or_return
 	kv.covered = kv.log_end
 	kv_write_header(kv, false)
 	return .None
