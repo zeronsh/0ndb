@@ -157,5 +157,5 @@ history_text_conflicts_clear :: proc(h: ^History) -> Error {
 		kv_del(&h.kv, inode_key("tc:", ino)) or_return
 	}
 	kv_del(&h.kv, transmute([]u8)string(CONFLICT_LIST)) or_return
-	return kv_commit(&h.kv)
+	return history_kv_commit(h)
 }

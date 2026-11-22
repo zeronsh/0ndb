@@ -88,7 +88,7 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 		res.zeroed += rec[1] - rec[0]
 	}
 	res.ranges = ranges[:]
-	h.applied[0] = journal.journal_durable_len(&h.journal)
+	history_own_applied(h)
 	history_persist(h) or_return
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
@@ -385,7 +385,7 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 		persist_file(h, ino, f) or_return
 		files += 1
 	}
-	kv_commit(&h.kv) or_return
+	history_kv_commit(h) or_return
 	return files, .None
 }
 

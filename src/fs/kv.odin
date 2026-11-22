@@ -13,6 +13,7 @@ KV_LOG_HEADER :: 16
 KV_SLOT :: 16
 KV_MIN_CAP :: u64(256)
 KV_MAX_RECORD :: 64 << 20
+KV_LOG_MARKED :: u32(1)
 
 Kv :: struct {
 	vfs:       prim.Vfs,
@@ -28,6 +29,7 @@ Kv :: struct {
 	live_bytes: u64,
 	log_end:   u64,
 	covered:   u64,
+	marked:    bool,
 	pending:   map[string]Kv_Pending,
 	order:     [dynamic]string,
 	buf:       [dynamic]u8,
@@ -45,11 +47,12 @@ Kv_Pending :: struct {
 
 @(private = "file")
 Kv_Rec :: struct {
-	off:   u64,
-	size:  u64,
-	del:   bool,
-	key:   []u8,
-	value: []u8,
+	off:    u64,
+	size:   u64,
+	del:    bool,
+	commit: bool,
+	key:    []u8,
+	value:  []u8,
 }
 
 kv_open :: proc(kv: ^Kv, vfs: prim.Vfs, dir: string, name: string, allocator := context.allocator) -> Error {
@@ -187,6 +190,9 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 			return .Too_Large
 		}
 	}
+	if kv.marked {
+		kv_encode_commit(&kv.out, start + u64(len(kv.out)))
+	}
 	if err := prim.write_at(kv.vfs, kv.log_fd, kv.out[:], i64(start)); err != .None {
 		prim.truncate(kv.vfs, kv.log_fd, i64(start))
 		return from_prim(err)
@@ -203,6 +209,10 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 		r := kv_decode(kv.out[pos + 8:][:n]) or_return
 		r.off = start + u64(pos)
 		r.size = u64(n + 8)
+		if r.commit {
+			pos += n + 8
+			continue
+		}
 		if err := kv_apply(kv, r); err != .None {
 			kv_unmap(kv)
 			return err
@@ -480,7 +490,20 @@ kv_encode :: proc(out: ^[dynamic]u8, off: u64, key: []u8, value: []u8, del: bool
 }
 
 @(private = "file")
+kv_encode_commit :: proc(out: ^[dynamic]u8, off: u64) {
+	start := len(out)
+	resize(out, start + 9)
+	out[start + 8] = 3
+	prim.put_u32le(out[start:start + 4], 1)
+	prim.put_u32le(out[start + 4:start + 8], u32(xxhash.XXH3_64_with_seed(out[start + 8:], off)))
+}
+
+@(private = "file")
 kv_decode :: proc(body: []u8) -> (r: Kv_Rec, err: Error) {
+	if len(body) == 1 && body[0] == 3 {
+		r.commit = true
+		return r, .None
+	}
 	rd := prim.reader(body)
 	kind := prim.read_u8(&rd)
 	r.key = prim.read_bytes(&rd)
@@ -610,6 +633,7 @@ kv_open_gen :: proc(kv: ^Kv) -> Error {
 	if got != KV_LOG_HEADER || prim.get_u64le(hdr[0:8]) != KV_MAGIC {
 		return .Corrupt
 	}
+	kv.marked = prim.get_u32le(hdr[8:12]) == KV_LOG_MARKED
 	kv.log_end = u64(size)
 	ifd, ierr := prim.open_file(kv.vfs, idx_path, {.Write}, 0o600)
 	if ierr == .None {
@@ -641,6 +665,8 @@ kv_create :: proc(kv: ^Kv, capacity: u64) -> Error {
 	kv.log_fd = fd
 	hdr: [KV_LOG_HEADER]u8
 	prim.put_u64le(hdr[0:8], KV_MAGIC)
+	prim.put_u32le(hdr[8:12], KV_LOG_MARKED)
+	kv.marked = true
 	from_prim(prim.write_at(kv.vfs, fd, hdr[:], 0)) or_return
 	from_prim(prim.datasync(kv.vfs, fd)) or_return
 	kv.log_end = KV_LOG_HEADER
@@ -776,6 +802,8 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 	kv_map(kv)
 	end := kv.log_end
 	off := u64(KV_LOG_HEADER)
+	good := off
+	held := make([dynamic]Kv_Rec, context.temp_allocator)
 	win := make([dynamic]u8, context.temp_allocator)
 	win_off := off
 	win_len := u64(0)
@@ -816,16 +844,31 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 		}
 		r.off = off
 		r.size = 8 + n
-		kv_apply(kv, r) or_return
 		off += r.size
+		if !kv.marked {
+			kv_apply(kv, r) or_return
+			good = off
+		} else if r.commit {
+			for x in held {
+				kv_apply(kv, x) or_return
+			}
+			clear(&held)
+			good = off
+		} else {
+			x := r
+			x.key = make([]u8, len(r.key), context.temp_allocator)
+			copy(x.key, r.key)
+			x.value = nil
+			append(&held, x)
+		}
 		if kv.used * 8 > kv.cap * 7 {
 			return true, .None
 		}
 	}
-	if off < end {
-		from_prim(prim.truncate(kv.vfs, kv.log_fd, i64(off))) or_return
+	if good < end {
+		from_prim(prim.truncate(kv.vfs, kv.log_fd, i64(good))) or_return
 		from_prim(prim.datasync(kv.vfs, kv.log_fd)) or_return
-		kv.log_end = off
+		kv.log_end = good
 	}
 	kv_unmap(kv)
 	from_prim(prim.datasync(kv.vfs, ifd)) or_return

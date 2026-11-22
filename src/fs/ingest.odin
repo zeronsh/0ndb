@@ -1411,7 +1411,7 @@ record_commit_version :: proc(m: ^Mount, commit: string, rewrite: bool, sources:
 	if rewrite && len(sources) > 0 {
 		history_alias(h, sources, commit, m.synced[:]) or_return
 	}
-	return kv_commit(&h.kv)
+	return history_kv_commit(h)
 }
 
 @(private)
