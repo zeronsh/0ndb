@@ -1,6 +1,7 @@
 package engine
 
 import "base:runtime"
+import "core:mem/virtual"
 import "../crdt"
 import "../fs"
 import "../fstree"
@@ -558,6 +559,8 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 		}
 		positions[s.device] = pos
 	}
+	rec: virtual.Arena
+	defer virtual.arena_destroy(&rec)
 	for {
 		progress := false
 		for s in h.segs {
@@ -567,6 +570,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 			}
 			end := journal.reader_end(&s.jr)
 			for pos < end {
+				virtual.arena_free_all(&rec)
 				body, next, rerr := journal.record_at(&s.jr, pos)
 				if rerr == .Redacted {
 					if _hist_admit_redacted(e, h, s, pos) == .Not_Found {
@@ -592,7 +596,7 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 					progress = true
 					continue
 				}
-				owned := make([]u8, len(body), context.temp_allocator)
+				owned := make([]u8, len(body), virtual.arena_allocator(&rec))
 				copy(owned, body)
 				if _content_missing(e, h, s.device, owned) {
 					blocked = true

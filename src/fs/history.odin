@@ -122,6 +122,8 @@ History :: struct {
 	own_wait:   bool,
 	replay_repl: map[i64]i64,
 	own_next:   map[prim.Id]u64,
+	own_paused: i64,
+	scratch:    virtual.Arena,
 	seals:      u64,
 	mark_taken: u64,
 	held:       [dynamic]Kv_Group,
@@ -743,6 +745,7 @@ history_sleep :: proc(h: ^History) {
 	h.lvidx = prim.INVALID_FD
 	delete(h.stream_ids)
 	delete(h.applied)
+	virtual.arena_destroy(&h.scratch)
 	delete(h.files)
 	delete(h.moves)
 	delete(h.io)
@@ -1205,6 +1208,13 @@ journal_batch :: proc(h: ^History, b: ^crdt.Batch, kind := REC_BATCH, commit := 
 }
 
 history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (admitted: int, err: Error) {
+	defer virtual.arena_free_all(&h.scratch)
+	context.temp_allocator = virtual.arena_allocator(&h.scratch)
+	return admit_record(h, stream, off, body)
+}
+
+@(private)
+admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (admitted: int, err: Error) {
 	if len(body) == 0 {
 		return 0, .None
 	}
@@ -2554,6 +2564,24 @@ history_resume :: proc(h: ^History) -> Error {
 }
 
 @(private)
+replay_blocked :: proc(h: ^History) -> bool {
+	r: journal.Reader
+	journal.journal_reader(&h.journal, &r, context.temp_allocator)
+	defer journal.reader_close(&r)
+	body, _, jerr := journal.record_at(&r, h.applied[0])
+	if jerr != .None || len(body) == 0 || body[0] != REC_BATCH {
+		return false
+	}
+	b, derr := crdt.batch_decode(body[1:], context.temp_allocator, &h.dict)
+	if derr != .None {
+		return false
+	}
+	parents := make([dynamic]crdt.Lv, context.temp_allocator)
+	_, gerr := crdt.graph_check(&h.g, &b, &parents)
+	return gerr == .Missing
+}
+
+@(private)
 replay_pause :: proc(h: ^History, off: i64) -> Error {
 	h.applied[0] = off
 	h.own_wait = true
@@ -2564,6 +2592,12 @@ replay_pause :: proc(h: ^History, off: i64) -> Error {
 	journal.journal_reader(&h.journal, &r, context.temp_allocator)
 	defer journal.reader_close(&r)
 	end := journal.journal_durable_len(&h.journal)
+	h.own_paused = end
+	step: virtual.Arena
+	if virtual.arena_init_growing(&step) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&step)
 	dict: crdt.Actor_Dict
 	crdt.dict_init(&dict, context.temp_allocator)
 	for id in h.dict.ids {
@@ -2586,7 +2620,9 @@ replay_pause :: proc(h: ^History, off: i64) -> Error {
 		} else if jerr == .None && len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT || body[0] == REC_REPLACE) {
 			payload, ok := batch_payload(body)
 			if ok {
-				if b, derr := crdt.batch_decode(payload, context.temp_allocator, &dict); derr == .None {
+				guard := virtual.arena_temp_begin(&step)
+				defer virtual.arena_temp_end(guard)
+				if b, derr := crdt.batch_decode(payload, virtual.arena_allocator(&step), &dict); derr == .None {
 					n := b.seq + u64(crdt.batch_len(&b))
 					if n > h.own_next[b.actor] {
 						h.own_next[b.actor] = n
@@ -2608,6 +2644,20 @@ replay_own :: proc(h: ^History) -> Error {
 		h.own_wait = false
 		return .None
 	}
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&scratch)
+	context.temp_allocator = virtual.arena_allocator(&scratch)
+	if h.own_wait && h.own_paused == end && replay_blocked(h) {
+		return .None
+	}
+	per: virtual.Arena
+	if virtual.arena_init_growing(&per) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&per)
 	r: journal.Reader
 	journal.journal_reader(&h.journal, &r, context.temp_allocator)
 	defer journal.reader_close(&r)
@@ -2652,7 +2702,17 @@ replay_own :: proc(h: ^History) -> Error {
 			return from_journal(jerr)
 		}
 		if len(body) > 0 {
-			if wait := replay_record(h, body, off) or_return; wait {
+			wait: bool
+			{
+				outer := context.temp_allocator
+				context.temp_allocator = virtual.arena_allocator(&per)
+				defer virtual.arena_free_all(&per)
+				w, rerr := replay_record(h, body, off)
+				context.temp_allocator = outer
+				rerr or_return
+				wait = w
+			}
+			if wait {
 				return replay_pause(h, off)
 			}
 		}
