@@ -244,13 +244,17 @@ common_prefix :: proc "contextless" (a, b: []u8) -> int {
 single_edit :: proc "contextless" (old, new: []u8) -> (at: int, del: int, ins: int, ok: bool) {
 	p := common_prefix(old, new)
 	s := common_suffix(old[p:], new[p:])
-	if p + s == len(old) {
-		return p, 0, len(new) - p - s, true
+	if p + s != len(old) && p + s != len(new) {
+		return 0, 0, 0, false
 	}
-	if p + s == len(new) {
-		return p, len(old) - p - s, 0, true
+	for p > 0 && (continuation(old, p) || continuation(new, p)) {
+		p -= 1
 	}
-	return 0, 0, 0, false
+	s = common_suffix(old[p:], new[p:])
+	for s > 0 && (continuation(old, len(old) - s) || continuation(new, len(new) - s)) {
+		s -= 1
+	}
+	return p, len(old) - p - s, len(new) - p - s, true
 }
 
 @(private)

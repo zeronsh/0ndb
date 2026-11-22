@@ -7,6 +7,7 @@ import "../fstree"
 import "../journal"
 import "../odb"
 import "../prim"
+import "../textdiff"
 import osync "../sync"
 
 @(private)
@@ -175,8 +176,28 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8) -> Error {
 		return .None
 	}
 	f := _hist_file(e, h, id) or_return
-	cur := crdt.text_len(&f.text)
-	_hist_text_edit(e, h, id, 0, cur, string(data)) or_return
+	old := crdt.text_bytes(&f.text, context.temp_allocator)
+	edits, derr := textdiff.line_edits(old, data, context.temp_allocator)
+	if derr != nil {
+		_hist_text_edit(e, h, id, 0, len(old), string(data)) or_return
+		_handle_mark(h)
+		return .None
+	}
+	if len(edits) == 0 {
+		return .None
+	}
+	target := fs.inode_op(h.hist, id)
+	ops := make([dynamic]crdt.Op_Run, 0, 2 * len(edits), context.temp_allocator)
+	for ed in edits {
+		at := int(ed.pos)
+		if ed.del > 0 {
+			append(&ops, crdt.Op_Run{target = target, kind = .Delete, pos = at, len = int(ed.del)})
+		}
+		if ed.ins > 0 {
+			append(&ops, crdt.Op_Run{target = target, kind = .Insert, pos = at, len = int(ed.ins), content = data[at:at + int(ed.ins)]})
+		}
+	}
+	_hist_batch(e, h, ops[:]) or_return
 	_handle_mark(h)
 	return .None
 }
