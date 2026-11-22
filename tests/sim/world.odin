@@ -102,6 +102,9 @@ Relay_Node :: struct {
 }
 
 World_Stats :: struct {
+	buffers:      u64,
+	bursts:       u64,
+	anchors_checked: u64,
 	events:       u64,
 	steps:        u64,
 	ops:          u64,
@@ -191,6 +194,9 @@ World :: struct {
 	quarantines: [dynamic]Quarantine,
 	promos:    [dynamic]Promo_Rec,
 	live:      [dynamic]^Live_Read,
+	bufs:      [dynamic]^Sim_Buffer,
+	anchors:   [dynamic]Sim_Anchor,
+	buf_group: u64,
 	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
 }
 

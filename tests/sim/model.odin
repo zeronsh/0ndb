@@ -62,6 +62,13 @@ Op_Kind :: enum u8 {
 	Search_Peer,
 	Promote,
 	Read_Live,
+	Buffer_Open,
+	Buffer_Type,
+	Buffer_Delete,
+	Buffer_Undo,
+	Buffer_Anchor,
+	Buffer_Sync,
+	Buffer_Burst,
 }
 
 M_Space :: struct {

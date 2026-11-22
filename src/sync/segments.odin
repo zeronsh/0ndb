@@ -1,6 +1,8 @@
 #+build linux, darwin, windows
 package osync
 
+import "core:fmt"
+
 import "core:crypto"
 import "../journal"
 import "../prim"
@@ -394,6 +396,7 @@ _fetch_check :: proc(r: ^Replicator) {
 			_fetch_remove(r, f)
 			continue
 		}
+		fmt.eprintln("DBG fetch_check get name", f.name, "state", f.state, "tree", rawptr(f.tree), "dest", f.dest, "nodes", len(f.tree.nodes) if f.tree != nil else -1, "version", f.tree.version if f.tree != nil else 0)
 		f.state = .Getting
 		f.key = object_index(&f.scope, f.oid[:f.oid_len])
 		if err := replicator_get_object(r, &f.scope, f.tree, f.oid[:f.oid_len], f.dest); err != .None {

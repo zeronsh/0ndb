@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "core:crypto"
 import "core:crypto/blake2b"
 import "../fs"
@@ -242,12 +244,14 @@ _ckpt_fetch_start :: proc(e: ^Engine, h: ^Handle) -> bool {
 		return false
 	}
 	append(&sp.ckpts, w)
+	fmt.eprintln("DBG ckpt_wait_new", w.name, "tree", rawptr(&w.tree), "self", e.self[0])
 	e.stats.fetches += 1
 	return true
 }
 
 @(private)
 _ckpt_wait_free :: proc(e: ^Engine, w: ^Ckpt_Wait) {
+	fmt.eprintln("DBG ckpt_wait_free", w.name, "tree", rawptr(&w.tree), "self", e.self[0])
 	osync.keytree_destroy(&w.tree)
 	osync.scope_clear(&w.scope)
 	delete(w.name, e.allocator)

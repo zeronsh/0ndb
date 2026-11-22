@@ -193,6 +193,7 @@ node_kill :: proc(n: ^Node) {
 	w := n.w
 	context = w.ctx
 	live_kill(n)
+	buffers_drop(w, n)
 	conns_drop_node(w, n)
 	node_mounts_drop(w, n)
 	n.alive = false

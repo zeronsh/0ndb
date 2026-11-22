@@ -593,7 +593,7 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		if merged != nil && op.path in merged {
 			continue
 		}
-		if !(op.kind == .Text_Insert || op.kind == .Tree_Write || op.kind == .Create || op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Git_Mount) {
+		if !(op.kind == .Text_Insert || op.kind == .Buffer_Type || op.kind == .Tree_Write || op.kind == .Create || op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Git_Mount) {
 			continue
 		}
 		for tok in op.tokens {
@@ -707,7 +707,7 @@ check_redaction :: proc(w: ^World) {
 				append(&secrets, d)
 				append(&owners, op.obj)
 			}
-		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live:
+		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
 		}
 	}
 	for s, si in secrets {
@@ -1076,7 +1076,7 @@ check_relay_redaction :: proc(w: ^World) {
 @(private = "file")
 _wrote_file :: proc(m: ^Model, oi: int, file: string, actor: prim.Id) -> bool {
 	for op in m.ops {
-		if op.obj == oi && op.actor == actor && (op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Tree_Write || op.kind == .Git_Mount) {
+		if op.obj == oi && op.actor == actor && (op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Tree_Write || op.kind == .Git_Mount || op.kind == .Buffer_Type || op.kind == .Buffer_Delete || op.kind == .Buffer_Undo) {
 			return true
 		}
 	}

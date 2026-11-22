@@ -438,6 +438,7 @@ finish :: proc(w: ^World) {
 		dump_replication(w)
 	}
 	check_map_reapply(w)
+	check_buffers(w)
 	check_redaction(w)
 	cipher_scan_relay(w)
 	cipher_resolve(w)
