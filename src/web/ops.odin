@@ -82,13 +82,13 @@ _request_bind :: proc(s: ^Session, r: ^Request) -> u8 {
 		need := 16
 		#partial switch r.op {
 		case .Page:
-			need = 16 + 24 + 24 + 1 + 4 + 1 + 24
+			need = 16 + RID_ARG + RID_ARG + 1 + 4 + 1 + RID_ARG
 		case .Window:
-			need = 16 + 24 + 4 + 4 + 24
+			need = 16 + RID_ARG + 4 + 4 + RID_ARG
 		case .Switch:
-			need = 16 + 24 + 4 + 4
+			need = 16 + RID_ARG + 4 + 4
 		case .Message, .Siblings:
-			need = 16 + 24
+			need = 16 + RID_ARG
 		}
 		if len(r.args) != need {
 			return STATUS_BAD_ARGS
@@ -276,9 +276,13 @@ _map_ready :: proc(s: ^Session, o: ^Object) -> bool {
 }
 
 @(private)
+RID_ARG :: 32
+
+@(private)
 _rid_arg :: proc(b: []u8) -> (r: obj.Rid) {
 	copy(r.seg[:], b[:16])
 	r.off = i64(prim.get_u64le(b[16:24]))
+	r.gen = prim.get_u64le(b[24:32])
 	return
 }
 
@@ -316,18 +320,18 @@ _exec :: proc(s: ^Session, r: ^Request, out: ^Out) -> obj.Error {
 		emit_catalog_entry(out, "entry", &e)
 	case .Status:
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
-		emit_tail(out, &o.view, &t)
+		emit_tail(out, &o.view, &t) or_return
 	case .Page:
 		from := convo.Position {
-			msg        = _rid_arg(a[16:40]),
-			seal       = _rid_arg(a[40:64]),
-			seal_known = a[64] != 0,
+			msg        = _rid_arg(a[16:48]),
+			seal       = _rid_arg(a[48:80]),
+			seal_known = a[80] != 0,
 		}
-		limit := int(prim.get_u32le(a[65:69]))
-		dir := convo.Direction.Newer if a[69] != 0 else .Older
+		limit := int(prim.get_u32le(a[81:85]))
+		dir := convo.Direction.Newer if a[85] != 0 else .Older
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
-		p := convo.page(&o.view, &t, from, max(limit, 1), context.temp_allocator, dir, _rid_arg(a[70:94])) or_return
-		emit_tail(out, &o.view, &t)
+		p := convo.page(&o.view, &t, from, max(limit, 1), context.temp_allocator, dir, _rid_arg(a[86:118])) or_return
+		emit_tail(out, &o.view, &t) or_return
 		o_arr(out, "messages")
 		for &m in p.messages {
 			emit_message(out, "", &m)
@@ -336,26 +340,26 @@ _exec :: proc(s: ^Session, r: ^Request, out: ^Out) -> obj.Error {
 		emit_position(out, "next", p.next)
 		o_bool(out, "more", p.more)
 	case .Window:
-		before := int(prim.get_u32le(a[40:44]))
-		after := int(prim.get_u32le(a[44:48]))
+		before := int(prim.get_u32le(a[48:52]))
+		after := int(prim.get_u32le(a[52:56]))
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
-		w := convo.page_around(&o.view, &t, _rid_arg(a[16:40]), before, after, _rid_arg(a[48:72]), context.temp_allocator) or_return
-		emit_tail(out, &o.view, &t)
+		w := convo.page_around(&o.view, &t, _rid_arg(a[16:48]), before, after, _rid_arg(a[56:88]), context.temp_allocator) or_return
+		emit_tail(out, &o.view, &t) or_return
 		emit_window(out, &w, w.leaf)
 	case .Switch:
-		before := int(prim.get_u32le(a[40:44]))
-		after := int(prim.get_u32le(a[44:48]))
+		before := int(prim.get_u32le(a[48:52]))
+		after := int(prim.get_u32le(a[52:56]))
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
-		leaf, w := convo.switch_window(&o.view, &t, _rid_arg(a[16:40]), before, after, context.temp_allocator) or_return
-		emit_tail(out, &o.view, &t)
+		leaf, w := convo.switch_window(&o.view, &t, _rid_arg(a[16:48]), before, after, context.temp_allocator) or_return
+		emit_tail(out, &o.view, &t) or_return
 		emit_window(out, &w, leaf)
 	case .Message:
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
-		m := convo.message(&o.view, &t, convo.Position{msg = _rid_arg(a[16:40])}, context.temp_allocator) or_return
+		m := convo.message(&o.view, &t, convo.Position{msg = _rid_arg(a[16:48])}, context.temp_allocator) or_return
 		emit_message(out, "message", &m)
 	case .Siblings:
 		t := convo.view_tail(&o.view, {}, context.temp_allocator) or_return
-		list, at := convo.siblings(&o.view, &t, _rid_arg(a[16:40]), context.temp_allocator) or_return
+		list, at := convo.siblings(&o.view, &t, _rid_arg(a[16:48]), context.temp_allocator) or_return
 		o_arr(out, "siblings")
 		for x in list {
 			o_rid(out, "", x)
@@ -468,7 +472,11 @@ _seg_deltas :: proc(s: ^Session, o: ^Object, sg: ^Seg, out: ^Out) -> (n: int) {
 			continue
 		}
 		k := obj.record_kind(body)
-		rid := obj.Rid{sg.device, at}
+		env0, eerr0 := obj.decode_envelope(body, at)
+		if eerr0 != .None {
+			continue
+		}
+		rid := obj.Rid{sg.device, at, env0.links.gen}
 		if k == obj.RECORD_REDACT {
 			_redact_seen(s, o, vs, body, at)
 			o_obj(out, "")
@@ -484,7 +492,12 @@ _seg_deltas :: proc(s: ^Session, o: ^Object, sg: ^Seg, out: ^Out) -> (n: int) {
 			continue
 		}
 		if o.kind == .Conversation {
-			n += _delta_convo(s, o, vs, sg.device, at, body, out)
+			got, missing := _delta_convo(s, o, vs, sg.device, at, body, out)
+			if missing {
+				sg.cursor = at
+				return
+			}
+			n += got
 		} else {
 			n += _delta_map(s, o, sg.device, at, body, out)
 		}
@@ -527,15 +540,69 @@ _redact_seen :: proc(s: ^Session, o: ^Object, vs: int, body: []u8, at: i64) {
 }
 
 @(private)
-_resolve :: proc(o: ^Object, vs: int, r: obj.Ref) -> obj.Rid {
+_resolve :: proc(o: ^Object, vs: int, r: obj.Ref) -> (obj.Rid, obj.Error) {
 	if obj.ref_none(r) || vs < 0 {
-		return {}
+		return {}, .None
 	}
 	v, err := obj.resolve(&o.view, vs, r)
-	if err != .None {
-		return {}
+	if err == .Missing {
+		return {}, .Missing
 	}
-	return obj.rid(&o.view, v)
+	if err != .None {
+		return {}, .None
+	}
+	return _rid_of(o, v)
+}
+
+@(private)
+_rid_of :: proc(o: ^Object, x: obj.Vref) -> (obj.Rid, obj.Error) {
+	r, err := obj.rid(&o.view, x)
+	if err == .Missing {
+		return {}, .Missing
+	}
+	if err != .None {
+		return {}, .None
+	}
+	return r, .None
+}
+
+@(private)
+_convo_target :: proc(o: ^Object, vs: int, rec: ^convo.Record) -> (target: obj.Rid, parent: obj.Rid, err: obj.Error) {
+	#partial switch b in rec.body {
+	case convo.Msg:
+		parent = _resolve(o, vs, b.parent) or_return
+	case convo.Block:
+		target = _rid_of(o, obj.Vref{vs, b.msg}) or_return
+	case convo.Seal:
+		target = _rid_of(o, obj.Vref{vs, b.msg}) or_return
+	case convo.Interrupted:
+		target = _rid_of(o, obj.Vref{vs, b.msg}) or_return
+	case convo.Revived:
+		target = _rid_of(o, obj.Vref{vs, b.msg}) or_return
+	case convo.Leaf:
+		target = _resolve(o, vs, b.msg) or_return
+	case convo.Steer:
+		target = _resolve(o, vs, b.msg) or_return
+	case convo.Edit_Queued:
+		target = _resolve(o, vs, b.item) or_return
+	case convo.Cancel:
+		target = _resolve(o, vs, b.item) or_return
+	case convo.Interrupt:
+		target = _resolve(o, vs, b.msg) or_return
+	case convo.Answer:
+		target = _resolve(o, vs, b.request) or_return
+	case convo.Assign:
+		target = _resolve(o, vs, b.msg) or_return
+	case convo.Claim:
+		target = _resolve(o, vs, b.msg) or_return
+	case convo.Unqueue:
+		target = _resolve(o, vs, b.item) or_return
+	case convo.Superseded:
+		target = _resolve(o, vs, b.run) or_return
+	case convo.Landed:
+		target = _resolve(o, vs, b.run) or_return
+	}
+	return
 }
 
 @(private)
@@ -550,77 +617,81 @@ _delta_head :: proc(s: ^Session, o: ^Object, out: ^Out, kind: string, rid: obj.R
 }
 
 @(private)
-_delta_convo :: proc(s: ^Session, o: ^Object, vs: int, device: prim.Id, at: i64, body: []u8, out: ^Out) -> int {
+_delta_convo :: proc(s: ^Session, o: ^Object, vs: int, device: prim.Id, at: i64, body: []u8, out: ^Out) -> (n: int, missing: bool) {
 	rec, err := convo.decode_record(body, at, context.temp_allocator)
 	if err != .None {
-		return 0
+		return 0, false
 	}
-	rid := obj.Rid{device, at}
+	rid := obj.Rid{device, at, rec.env.links.gen}
+	target, parent, terr := _convo_target(o, vs, &rec)
+	if terr == .Missing {
+		return 0, true
+	}
 	switch b in rec.body {
 	case convo.Msg:
 		_delta_head(s, o, out, "message", rid, device, rec.env.kind, b.hlc)
 		o_rid(out, "msg", rid)
 		o_enum(out, "role", u64(b.role), ROLE_NAMES[:])
-		o_rid(out, "parent", _resolve(o, vs, b.parent))
+		o_rid(out, "parent", parent)
 	case convo.Block:
 		_delta_head(s, o, out, "block" if .Start in b.flags else "chunk", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", obj.Rid{device, b.msg})
+		o_rid(out, "msg", target)
 		o_u64(out, "index", u64(b.index))
 		o_enum(out, "block", u64(b.kind), BLOCK_NAMES[:])
 		o_text(out, "text", b.data)
 	case convo.Seal:
 		_delta_head(s, o, out, "seal", rid, device, rec.env.kind, b.hlc)
-		o_rid(out, "msg", obj.Rid{device, b.msg})
+		o_rid(out, "msg", target)
 		o_enum(out, "seal", u64(b.status), SEAL_NAMES[:])
 		emit_usage(out, "usage", b.usage)
 	case convo.Interrupted:
 		_delta_head(s, o, out, "seal", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", obj.Rid{device, b.msg})
+		o_rid(out, "msg", target)
 		o_str(out, "seal", "interrupted")
 	case convo.Leaf:
 		_delta_head(s, o, out, "leaf", rid, device, rec.env.kind, b.hlc)
-		o_rid(out, "msg", _resolve(o, vs, b.msg))
+		o_rid(out, "msg", target)
 	case convo.Queue:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
 		o_str(out, "text", b.text)
 	case convo.Steer:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
 		o_str(out, "text", b.text)
-		o_rid(out, "msg", _resolve(o, vs, b.msg))
+		o_rid(out, "msg", target)
 	case convo.Edit_Queued:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
 		o_str(out, "text", b.text)
-		o_rid(out, "msg", _resolve(o, vs, b.item))
+		o_rid(out, "msg", target)
 	case convo.Cancel:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", _resolve(o, vs, b.item))
+		o_rid(out, "msg", target)
 	case convo.Interrupt:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", _resolve(o, vs, b.msg))
+		o_rid(out, "msg", target)
 	case convo.Answer:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
 		o_str(out, "text", b.text)
-		o_rid(out, "msg", _resolve(o, vs, b.request))
+		o_rid(out, "msg", target)
 	case convo.Await:
 		_delta_head(s, o, out, "intent", rid, device, rec.env.kind, rec.stamp)
 	case convo.Assign:
 		_delta_head(s, o, out, "run", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", _resolve(o, vs, b.msg))
+		o_rid(out, "msg", target)
 	case convo.Claim:
 		_delta_head(s, o, out, "run", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", _resolve(o, vs, b.msg))
+		o_rid(out, "msg", target)
 	case convo.Unqueue:
 		_delta_head(s, o, out, "run", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", _resolve(o, vs, b.item))
+		o_rid(out, "msg", target)
 	case convo.Superseded:
 		_delta_head(s, o, out, "run", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", _resolve(o, vs, b.run))
+		o_rid(out, "msg", target)
 	case convo.Landed:
 		_delta_head(s, o, out, "run", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", _resolve(o, vs, b.run))
+		o_rid(out, "msg", target)
 	case convo.Revived:
 		_delta_head(s, o, out, "run", rid, device, rec.env.kind, rec.stamp)
-		o_rid(out, "msg", obj.Rid{device, b.msg})
+		o_rid(out, "msg", target)
 	case convo.Mount:
 		_delta_head(s, o, out, "mount", rid, device, rec.env.kind, rec.stamp)
 		o_str(out, "text", b.name)
@@ -634,7 +705,7 @@ _delta_convo :: proc(s: ^Session, o: ^Object, vs: int, device: prim.Id, at: i64,
 		_delta_head(s, o, out, "record", rid, device, rec.env.kind, rec.stamp)
 	}
 	o_end(out)
-	return 1
+	return 1, false
 }
 
 @(private)
@@ -647,7 +718,7 @@ _delta_map :: proc(s: ^Session, o: ^Object, device: prim.Id, at: i64, body: []u8
 	if berr != .None {
 		return 0
 	}
-	rid := obj.Rid{device, at}
+	rid := obj.Rid{device, at, env.links.gen}
 	switch v in b {
 	case omap.Put:
 		if o.catalog {

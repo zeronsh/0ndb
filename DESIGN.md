@@ -550,7 +550,8 @@ concurrent typing is never lost or reverted.
   envelope: kind byte, links prefix (segment table refs, chain state,
   per-kind tail summary), fields with tagged encoding so records written
   today decode forever. The head record carries the format version
-  (`obj.FORMAT_VERSION`, 2 since records may carry compressed fields); a
+  (`obj.FORMAT_VERSION`, 2 since records may carry compressed fields, 3
+  since records carry their writer's generation); a
   head with a newer version, or a links tag below the kind range that the
   reader does not know, is rejected as Unsupported rather than Corrupt, so
   newer data is never mistaken for tampering.
@@ -581,9 +582,58 @@ concurrent typing is never lost or reverted.
   8.28 -> 6.18 MB (-25%). Compression costs 7.6 ms per MB of fields on
   append, inflation 2.6 ms per MB on read; level 1 is 1% larger, levels
   5-9 are 2% smaller at 2-4x the compression time.
-- References: `Ref{seg, off}` within an object; `(object id, Ref)` across
+- References: `Ref{seg, off}` within an object; `(object id, Rid)` across
   objects. Objects reference each other freely (a conversation names its
   agent, workspace, parent task and mounted file trees).
+- Generations. A crash discards a segment's non-durable suffix and the next
+  writer session appends new records at the same offsets, so an offset alone
+  can name different records over time. Every writer session takes a fresh
+  generation from the engine's counter (`<dir>/gen` on the base Vfs,
+  reserved in blocks: the block ceiling is written with `replace_atomic`
+  before any generation in it is used, so a generation is never handed out
+  twice and no append or writer open pays an fsync), and every record
+  carries its writer's generation in the links prefix (tag 7, absent means
+  0 for records written before generations). Being inside the record body,
+  it is identical locally, on the relay and on replicas.
+- A `Rid` handed to any caller is `{seg, off, gen}` with the target record's
+  generation, the same on every device; text form `<seg>:<off>:<gen>`, wire
+  form `id, ivarint, uvarint`. Producing one costs nothing for the writer's
+  current session and otherwise reads the target's links (a page reads only
+  its last message's parent; every other generation comes from bodies it
+  decodes anyway). Resolving one (`obj.vref`) checks that a record of
+  exactly that generation starts at that offset and answers `Not_Found`
+  otherwise, so a reference to a record that never became durable can never
+  name another record. Redaction zero-fills the generation with the body; a
+  redacted record matches only generation 0. Rids the engine produced from
+  a view and converts back within that view use `obj.vref_pos`.
+- Every stored reference is safe by one of these rules:
+  - *Same segment, backward* (links `event/segs/prev`; convo `Msg.parent,
+    jump, intent, parent_seal, files_prev, claim`, `Block.msg/prev`, `Seal`,
+    `Leaf`, `Fork`, `Remember`, `Spine`, `Files.next`, intent and run
+    targets, `Compact`, `Scope.msg`, `Interrupted`, `Revived`, `Recorded`;
+    `Redact.from/target` in the writer's own segment; map `Del` dots naming
+    own `Add`s): refs only point to earlier offsets and journals are
+    prefix-durable, so if the referencing record survives so does its target.
+  - *Other participants' segments* (seg table index ≠ 0, map dots naming
+    remote `Add`s, remote redaction intents): a device holds another
+    device's records only after the relay served them, and a writer uploads
+    only records that are durable, so those offsets are never reused.
+  - *Carries the generation* (every caller Rid; convo settings `parent`
+    (tag 24); catalog `Parent` (trailing uvarint); runtime state values
+    (32-byte rids; map keys keep 24-byte positions); run raw journal
+    `RAW_META`, `RAW_OWNER`, `RAW_LINK`): resolution checks it.
+  - *Ordered durability* (own-device redaction intents): the target's journal
+    is committed before the intent is appended; pack commit groups land in
+    `journal_commit` order and promoted streams fsync on commit, so an intent
+    never survives its target.
+  - *Derived from durable sources only* (search index positions, which hits
+    turn into Rids by reading the record at query time; the map table; fs
+    history KV and `lv.idx`; `.children` slots): a derived structure never
+    records a position past its source's durable end, and is rebuilt when it
+    is found ahead of it.
+  - *Op ids, not offsets* (crdt `(actor, seq)` and frontiers in convo
+    `Msg.files`, `Landed.files`, `Scope` versions and mount state): the
+    history they name is durable before the record that names it.
 - Every kind supports: paging from any tail with batched missing-range
   reporting, per-participant signed hash chains, per-record keys from the
   object's puncturable key tree, and redaction.

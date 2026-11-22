@@ -408,7 +408,11 @@ run_permission :: proc(run: ^Run, id, tool, title, input: string, answered: bool
 		run.cur = -1
 		return
 	}
-	append(&run.perms, Run_Perm{id = clone(id, run.alloc), block = Rid{run.reply.seg, off}})
+	block, berr := eng.record_rid(run.r.e, run.o, .Conversation, run.reply.seg, off)
+	if berr != .None {
+		return
+	}
+	append(&run.perms, Run_Perm{id = clone(id, run.alloc), block = block})
 }
 
 @(private)

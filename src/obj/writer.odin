@@ -18,6 +18,8 @@ Writer :: struct {
 	object:    prim.Id,
 	kind:      Kind,
 	id:        prim.Id,
+	gen:       u64,
+	gen_from:  i64,
 	created:   prim.Hlc,
 	ids:       [dynamic]prim.Id,
 	ids_dirty: bool,
@@ -46,12 +48,13 @@ Redaction :: struct {
 	to:   i64,
 }
 
-writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator, clock := Clock{}) -> Error {
+writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, gen: u64, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator, clock := Clock{}) -> Error {
 	_zero(w, vfs, allocator)
 	w.source = clock
-	if prim.id_is_zero(id) || prim.id_is_zero(object) {
+	if prim.id_is_zero(id) || prim.id_is_zero(object) || gen == 0 {
 		return .Invalid
 	}
+	w.gen = gen
 	lock, lerr := prim.lock_file(vfs, path)
 	if lerr != .None {
 		return perr(lerr)
@@ -84,7 +87,7 @@ writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object:
 		_release(w)
 		return jerr(berr)
 	}
-	encode_head(&pw, &h)
+	encode_head(&pw, &h, w.gen)
 	if _, eerr := journal.journal_end(&w.j, &pw); eerr != .None {
 		_release(w)
 		return jerr(eerr)
@@ -96,9 +99,13 @@ writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object:
 	return .None
 }
 
-writer_open :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, opts := journal.Options{}, allocator := context.allocator, clock := Clock{}) -> (head: Head, err: Error) {
+writer_open :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, gen: u64, opts := journal.Options{}, allocator := context.allocator, clock := Clock{}) -> (head: Head, err: Error) {
 	_zero(w, vfs, allocator)
 	w.source = clock
+	if gen == 0 {
+		return head, .Invalid
+	}
+	w.gen = gen
 	if !prim.exists(vfs, path) {
 		return head, .Not_Found
 	}
@@ -118,7 +125,9 @@ writer_open :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: p
 	head, err = _recover(w)
 	if err != .None {
 		_release(w)
+		return
 	}
+	w.gen_from = journal.journal_len(&w.j)
 	return
 }
 
@@ -193,6 +202,7 @@ seg_flush :: proc(w: ^Writer, cross: bool) -> Error {
 	l := Links{
 		event = w.event,
 		segs  = off,
+		gen   = w.gen,
 	}
 	pw, berr := journal.journal_begin(&w.j)
 	if berr != .None {
@@ -217,6 +227,7 @@ begin :: proc(w: ^Writer, kind: u8, cross: bool, event: bool) -> (rec: Rec, err:
 	rec.links = Links{
 		event = w.event,
 		segs  = w.segs,
+		gen   = w.gen,
 	}
 	if event {
 		rec.links.prev = w.event
@@ -280,6 +291,7 @@ writer_redact :: proc(w: ^Writer, from: Vref, to: i64, target: Vref, extra: []u8
 		segs  = w.segs,
 		prev  = w.event,
 		stamp = now(w),
+		gen   = w.gen,
 	}
 	pw, berr := journal.journal_begin(&w.j)
 	if berr != .None {

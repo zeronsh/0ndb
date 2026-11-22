@@ -81,18 +81,25 @@ convo_status :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (st: Convo_Sta
 	if terr != .None {
 		return st, _pending_result(e, h, _oerr(terr), ready)
 	}
-	if _handle_waiting(h, ready.fresh) && ready.call != nil {
-		return _status_of(&h.view, &t), _wait(e, h, ready)
+	serr: obj.Error
+	st, serr = _status_of(&h.view, &t)
+	if serr != .None {
+		return st, _pending_result(e, h, _oerr(serr), ready)
 	}
-	return _status_of(&h.view, &t), .None
+	if _handle_waiting(h, ready.fresh) && ready.call != nil {
+		return st, _wait(e, h, ready)
+	}
+	return st, .None
 }
 
 @(private)
-_status_of :: proc(v: ^obj.View, t: ^convo.Tail) -> Convo_Status {
+_status_of :: proc(v: ^obj.View, t: ^convo.Tail) -> (st: Convo_Status, err: obj.Error) {
+	head := convo.tail_head(v, t) or_return
+	position := convo.tail_position(v, t) or_return
 	return Convo_Status {
 		status = t.status,
-		head = convo.tail_head(v, t),
-		position = convo.tail_position(v, t),
+		head = head,
+		position = position,
 		browsing = t.browsing,
 		head_status = t.head_status,
 		queued = t.queued,
@@ -102,7 +109,7 @@ _status_of :: proc(v: ^obj.View, t: ^convo.Tail) -> Convo_Status {
 		awaiting = t.awaiting,
 		revive = t.revive,
 		head_hlc = t.head_hlc,
-	}
+	}, .None
 }
 
 convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32, allocator := context.allocator, ready: Ready = {}, dir := convo.Direction.Older, leaf := Rid{}) -> (p: convo.Page, err: Error) {

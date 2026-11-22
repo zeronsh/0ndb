@@ -181,7 +181,7 @@ emit_position :: proc(o: ^Out, name: string, p: convo.Position) {
 	o_end(o)
 }
 
-CURSOR_VERSION :: u8(1)
+CURSOR_VERSION :: u8(2)
 CURSOR_END :: u8(1 << 0)
 CURSOR_NEWER :: u8(1 << 1)
 CURSOR_KNOWN :: u8(1 << 2)
@@ -211,6 +211,7 @@ cursor_encode :: proc(c: Cursor) -> []u8 {
 	for r in ([3]Rid{c.pos.msg, c.pos.seal, c.leaf}) {
 		prim.write_id(&w, r.seg)
 		prim.write_ivarint(&w, r.off)
+		prim.write_uvarint(&w, r.gen)
 	}
 	return buf[:]
 }
@@ -225,6 +226,7 @@ cursor_decode :: proc(b: []u8) -> (c: Cursor, ok: bool) {
 	for &x in rids {
 		x.seg = prim.read_id(&r)
 		x.off = prim.read_ivarint(&r)
+		x.gen = prim.read_uvarint(&r)
 	}
 	if !prim.reader_done(&r) || f & ~(CURSOR_END | CURSOR_NEWER | CURSOR_KNOWN) != 0 {
 		return {}, false
@@ -443,10 +445,8 @@ emit_results :: proc(o: ^Out, r: ^search.Results) {
 		o_obj(o, "")
 		o_id(o, "object", h.object)
 		o_id(o, "participant", h.participant)
-		if len(h.ref) == 24 {
-			seg: prim.Id
-			copy(seg[:], h.ref[:16])
-			o_rid(o, "msg", Rid{seg, i64(prim.get_u64le(h.ref[16:]))})
+		if r, ok := eng.ref_rid(h.ref); ok && len(h.ref) == 32 {
+			o_rid(o, "msg", r)
 		} else {
 			o_rid(o, "msg", {})
 		}

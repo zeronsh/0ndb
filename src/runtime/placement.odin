@@ -91,8 +91,8 @@ _evaluate_sender :: proc(r: ^Runtime, o: Object) {
 
 @(private)
 _unanswered :: proc(r: ^Runtime, o: Object, v: ^obj.View, t: ^convo.Tail) -> (msg: Rid, um: convo.Message, dead: prim.Id, ok: bool) {
-	head := convo.tail_head(v, t)
-	if obj.rid_none(head) {
+	head, head_err := convo.tail_head(v, t)
+	if head_err != .None || obj.rid_none(head) {
 		return
 	}
 	hm, herr := convo.message(v, t, convo.Position{msg = head}, context.temp_allocator)

@@ -139,11 +139,64 @@ view_unknown :: proc(v: ^View) -> []prim.Id {
 	return v.unknown[:]
 }
 
-rid :: proc "contextless" (v: ^View, r: Vref) -> Rid {
+rid :: proc(v: ^View, r: Vref) -> (out: Rid, err: Error) {
+	if vref_none(r) || r.seg < 0 || r.seg >= len(v.segs) {
+		return {}, .None
+	}
+	out = Rid{v.segs[r.seg].id, r.off, 0}
+	if w := v.w; w != nil && r.seg == w.seg && r.off >= w.gen_from {
+		out.gen = w.gen
+		return out, .None
+	}
+	out.gen = gen_at(v, r.seg, r.off) or_return
+	return out, .None
+}
+
+rid_is :: proc "contextless" (v: ^View, r: Vref, m: Rid) -> bool {
+	if vref_none(r) || rid_none(m) || r.seg < 0 || r.seg >= len(v.segs) {
+		return vref_none(r) && rid_none(m)
+	}
+	return v.segs[r.seg].id == m.seg && r.off == m.off
+}
+
+rid_body :: proc "contextless" (v: ^View, r: Vref, body: []u8) -> Rid {
 	if vref_none(r) || r.seg < 0 || r.seg >= len(v.segs) {
 		return {}
 	}
-	return Rid{v.segs[r.seg].id, r.off}
+	out := Rid{v.segs[r.seg].id, r.off, 0}
+	if !is_redacted(body) && !is_sig(body) {
+		if env, err := decode_envelope(body, r.off); err == .None {
+			out.gen = env.links.gen
+		}
+	}
+	return out
+}
+
+gen_at :: proc(v: ^View, s: int, off: i64) -> (gen: u64, err: Error) {
+	body, _ := get(v, s, off, off - MSG_GUESS) or_return
+	if is_redacted(body) {
+		return 0, .None
+	}
+	if is_sig(body) {
+		return 0, .Not_Found
+	}
+	env, derr := decode_envelope(body, off)
+	if derr != .None {
+		return 0, .Not_Found
+	}
+	return env.links.gen, .None
+}
+
+vref_pos :: proc(v: ^View, m: Rid) -> (r: Vref, err: Error) {
+	if rid_none(m) {
+		return {}, .None
+	}
+	i := view_find(v, m.seg)
+	if i < 0 {
+		unknown(v, m.seg)
+		return {}, .Unknown_Segment
+	}
+	return Vref{i, m.off}, .None
 }
 
 vref :: proc(v: ^View, m: Rid) -> (r: Vref, err: Error) {
@@ -154,6 +207,18 @@ vref :: proc(v: ^View, m: Rid) -> (r: Vref, err: Error) {
 	if i < 0 {
 		unknown(v, m.seg)
 		return {}, .Unknown_Segment
+	}
+	if w := v.w; w != nil && i == w.seg && m.off >= w.gen_from && m.gen != w.gen {
+		return {}, .Not_Found
+	}
+	gen, gerr := gen_at(v, i, m.off)
+	switch {
+	case gerr == .Corrupt:
+		return {}, .Not_Found
+	case gerr != .None:
+		return {}, gerr
+	case gen != m.gen:
+		return {}, .Not_Found
 	}
 	return Vref{i, m.off}, .None
 }

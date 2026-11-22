@@ -103,20 +103,39 @@ key_of :: proc(prefix: string, parts: ..[]u8) -> []u8 {
 }
 
 rid_bytes :: proc(rid: Rid) -> []u8 {
-	out := make([]u8, 24, context.temp_allocator)
+	out := make([]u8, 32, context.temp_allocator)
 	s := rid.seg
 	copy(out, s[:])
-	prim.put_u64le(out[16:], u64(rid.off))
+	prim.put_u64le(out[16:24], u64(rid.off))
+	prim.put_u64le(out[24:32], rid.gen)
 	return out
 }
 
+rid_key :: proc(rid: Rid) -> []u8 {
+	return rid_bytes(rid)[:24]
+}
+
 rid_from_bytes :: proc(b: []u8) -> (rid: Rid, ok: bool) {
-	if len(b) != 24 {
+	if len(b) != 24 && len(b) != 32 {
 		return {}, false
 	}
 	copy(rid.seg[:], b[:16])
-	rid.off = i64(prim.get_u64le(b[16:]))
+	rid.off = i64(prim.get_u64le(b[16:24]))
+	if len(b) == 32 {
+		rid.gen = prim.get_u64le(b[24:32])
+	}
 	return rid, true
+}
+
+rid_bytes_match :: proc(stored: []u8, rid: Rid) -> bool {
+	full := rid_bytes(rid)
+	switch len(stored) {
+	case 24:
+		return string(stored) == string(full[:24])
+	case 32:
+		return string(stored) == string(full)
+	}
+	return false
 }
 
 field_rid :: proc(tag: u32, rid: Rid) -> omap.Field {
@@ -307,13 +326,13 @@ state_runs :: proc(r: ^Runtime, space: prim.Id) -> []Run_Entry {
 
 state_claimed :: proc(r: ^Runtime, o: Object, msg: Rid) -> bool {
 	id := o.id
-	_, ok := map_read(r, state_object(r, o.space), key_of(KEY_CLAIMED, id[:], rid_bytes(msg)))
+	_, ok := map_read(r, state_object(r, o.space), key_of(KEY_CLAIMED, id[:], rid_key(msg)))
 	return ok
 }
 
 state_mark_claimed :: proc(r: ^Runtime, o: Object, msg: Rid, claim: Rid) {
 	id := o.id
-	map_put(r, state_w(r, o.space), key_of(KEY_CLAIMED, id[:], rid_bytes(msg)), field_rid(1, claim))
+	map_put(r, state_w(r, o.space), key_of(KEY_CLAIMED, id[:], rid_key(msg)), field_rid(1, claim))
 }
 
 runner_known :: proc(r: ^Runtime, space: prim.Id, device: prim.Id) -> bool {

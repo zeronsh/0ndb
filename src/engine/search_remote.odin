@@ -781,6 +781,7 @@ search_everywhere :: proc(e: ^Engine, space: prim.Id, query: string, req: search
 		}
 		if serr == .None {
 			q.local = res
+			q.local.hits = _hit_gens(e, q.local.hits, q.alloc)
 			if q.local_skip > 0 {
 				n := min(q.local_skip, len(res.hits))
 				q.local.hits = res.hits[n:]
@@ -1330,12 +1331,15 @@ _q_verify :: proc(e: ^Engine, q: ^Remote_Q) {
 			p.state = 2
 			continue
 		}
-		rid: Rid
-		copy(rid.seg[:], r.ref[:16])
-		rid.off = i64(prim.get_u64le(r.ref[16:]))
+		pos, _ := ref_rid(r.ref)
 		ready := Ready{data = rawptr(uintptr(q.id)), call = _q_ready}
-		m, err := convo_message(e, Object{q.space, r.object}, convo.Position{msg = rid}, q.alloc, ready)
-		if err == .Pending {
+		rid, gerr := record_rid(e, Object{q.space, r.object}, .Conversation, pos.seg, pos.off, ready)
+		m: convo.Message
+		err := gerr
+		if err == .None {
+			m, err = convo_message(e, Object{q.space, r.object}, convo.Position{msg = rid}, q.alloc, ready)
+		}
+		if err == .Pending || err == .Missing {
 			p.tries += 1
 			if p.tries > VERIFY_TRIES {
 				p.state = 2
@@ -1370,7 +1374,7 @@ _q_verify :: proc(e: ^Engine, q: ^Remote_Q) {
 		append(&q.verified, search.Hit {
 			object = r.object,
 			participant = m.author,
-			ref = r.ref,
+			ref = _gen_ref(rid, q.alloc),
 			part = r.part,
 			kind = r.kind,
 			hlc = m.hlc,

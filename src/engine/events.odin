@@ -283,9 +283,11 @@ _sub_collect :: proc(e: ^Engine, s: ^Sub, kinds: Change_Kinds, out: ^[dynamic]De
 		if h.kind == .Conversation {
 			if t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator); terr == .None {
 				if !s.has_status || t.status != s.status {
-					s.status = t.status
-					s.has_status = true
-					append(out, Delta{kind = .Status, object = s.object, status = t.status, hlc = t.head_hlc, msg = convo.tail_head(&h.view, &t)})
+					if head, herr := convo.tail_head(&h.view, &t); herr == .None {
+						s.status = t.status
+						s.has_status = true
+						append(out, Delta{kind = .Status, object = s.object, status = t.status, hlc = t.head_hlc, msg = head})
+					}
 				}
 			}
 		}
@@ -338,48 +340,71 @@ _sub_scan :: proc(e: ^Engine, s: ^Sub, h: ^Handle, device: prim.Id, r: ^journal.
 		}
 		k := obj.record_kind(body)
 		if k == obj.RECORD_REDACT {
-			append(out, Delta{kind = .Redacted, object = s.object, rid = Rid{device, at}, by = device, local = local})
+			if env, eerr := obj.decode_envelope(body, at); eerr == .None {
+				append(out, Delta{kind = .Redacted, object = s.object, rid = Rid{device, at, env.links.gen}, by = device, local = local})
+			}
 			continue
 		}
 		if k < obj.RECORD_KIND_FIRST {
 			continue
 		}
+		derr: obj.Error
 		if h.kind == .Conversation {
-			_delta_convo(e, s, h, vs, device, at, body, local, out)
+			derr = _delta_convo(e, s, h, vs, device, at, body, local, out)
 		} else {
 			_delta_map(e, s, h, device, at, body, local, out)
+		}
+		if derr == .Missing {
+			pos = at
+			break
 		}
 	}
 	c.end = pos
 }
 
 @(private)
-_resolve_rid :: proc(h: ^Handle, vs: int, r: obj.Ref) -> Rid {
+_resolve_rid :: proc(h: ^Handle, vs: int, r: obj.Ref) -> (Rid, obj.Error) {
 	if obj.ref_none(r) || vs < 0 {
-		return {}
+		return {}, .None
 	}
 	v, err := obj.resolve(&h.view, vs, r)
-	if err != .None {
-		return {}
+	if err == .Missing {
+		return {}, .Missing
 	}
-	return obj.rid(&h.view, v)
+	if err != .None {
+		return {}, .None
+	}
+	return _rid_or_missing(&h.view, v)
 }
 
 @(private)
-_delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, at: i64, body: []u8, local: bool, out: ^[dynamic]Delta) {
+_rid_or_missing :: proc(v: ^obj.View, x: obj.Vref) -> (Rid, obj.Error) {
+	r, err := obj.rid(v, x)
+	if err == .Missing {
+		return {}, .Missing
+	}
+	if err != .None {
+		return {}, .None
+	}
+	return r, .None
+}
+
+@(private)
+_delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, at: i64, body: []u8, local: bool, out: ^[dynamic]Delta) -> obj.Error {
 	rec, err := convo.decode_record(body, at, context.temp_allocator)
 	if err != .None {
-		return
+		return .None
 	}
-	d := Delta{object = s.object, rid = Rid{device, at}, by = device, local = local, record = rec.env.kind, hlc = rec.stamp}
+	here := Rid{device, at, rec.env.links.gen}
+	d := Delta{object = s.object, rid = here, by = device, local = local, record = rec.env.kind, hlc = rec.stamp}
 	switch b in rec.body {
 	case convo.Msg:
 		d.kind = .Message
 		d.role = b.role
 		d.hlc = b.hlc
-		d.msg = Rid{device, at}
+		d.msg = here
 	case convo.Block:
-		d.msg = Rid{device, b.msg}
+		d.msg = _rid_or_missing(&h.view, obj.Vref{vs, b.msg}) or_return
 		d.index = b.index
 		d.block = b.kind
 		d.text = _tmp_bytes(b.data)
@@ -395,19 +420,19 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 					copy(buf[len(p.text):], d.text)
 					p.text = buf
 					p.rid = d.rid
-					return
+					return .None
 				}
 			}
 		}
 	case convo.Seal:
 		d.kind = .Seal
-		d.msg = Rid{device, b.msg}
+		d.msg = _rid_or_missing(&h.view, obj.Vref{vs, b.msg}) or_return
 		d.seal = b.status
 		d.usage = b.usage
 		d.hlc = b.hlc
 	case convo.Leaf:
 		d.kind = .Leaf
-		d.msg = _resolve_rid(h, vs, b.msg)
+		d.msg = _resolve_rid(h, vs, b.msg) or_return
 		d.hlc = b.hlc
 	case convo.Queue:
 		d.kind = .Intent
@@ -415,45 +440,45 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 	case convo.Steer:
 		d.kind = .Intent
 		d.text = _tmp_bytes(transmute([]u8)b.text)
-		d.msg = _resolve_rid(h, vs, b.msg)
+		d.msg = _resolve_rid(h, vs, b.msg) or_return
 	case convo.Edit_Queued:
 		d.kind = .Intent
 		d.text = _tmp_bytes(transmute([]u8)b.text)
-		d.msg = _resolve_rid(h, vs, b.item)
+		d.msg = _resolve_rid(h, vs, b.item) or_return
 	case convo.Cancel:
 		d.kind = .Intent
-		d.msg = _resolve_rid(h, vs, b.item)
+		d.msg = _resolve_rid(h, vs, b.item) or_return
 	case convo.Interrupt:
 		d.kind = .Intent
-		d.msg = _resolve_rid(h, vs, b.msg)
+		d.msg = _resolve_rid(h, vs, b.msg) or_return
 	case convo.Answer:
 		d.kind = .Intent
 		d.text = _tmp_bytes(transmute([]u8)b.text)
-		d.msg = _resolve_rid(h, vs, b.request)
+		d.msg = _resolve_rid(h, vs, b.request) or_return
 	case convo.Await:
 		d.kind = .Intent
 	case convo.Assign:
 		d.kind = .Run
-		d.msg = _resolve_rid(h, vs, b.msg)
+		d.msg = _resolve_rid(h, vs, b.msg) or_return
 	case convo.Claim:
 		d.kind = .Run
-		d.msg = _resolve_rid(h, vs, b.msg)
+		d.msg = _resolve_rid(h, vs, b.msg) or_return
 	case convo.Unqueue:
 		d.kind = .Run
-		d.msg = _resolve_rid(h, vs, b.item)
+		d.msg = _resolve_rid(h, vs, b.item) or_return
 	case convo.Superseded:
 		d.kind = .Run
-		d.msg = _resolve_rid(h, vs, b.run)
+		d.msg = _resolve_rid(h, vs, b.run) or_return
 	case convo.Landed:
 		d.kind = .Run
-		d.msg = _resolve_rid(h, vs, b.run)
+		d.msg = _resolve_rid(h, vs, b.run) or_return
 	case convo.Interrupted:
 		d.kind = .Seal
-		d.msg = Rid{device, b.msg}
+		d.msg = _rid_or_missing(&h.view, obj.Vref{vs, b.msg}) or_return
 		d.seal = .Interrupted
 	case convo.Revived:
 		d.kind = .Run
-		d.msg = Rid{device, b.msg}
+		d.msg = _rid_or_missing(&h.view, obj.Vref{vs, b.msg}) or_return
 	case convo.Mount:
 		d.kind = .Mount
 		d.text = _tmp_bytes(transmute([]u8)b.name)
@@ -467,6 +492,7 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 		d.kind = .Record
 	}
 	append(out, d)
+	return .None
 }
 
 @(private)
@@ -483,24 +509,24 @@ _delta_map :: proc(e: ^Engine, s: ^Sub, h: ^Handle, device: prim.Id, at: i64, bo
 	case omap.Put:
 		v_key := _tmp_bytes(v.key)
 		if s.catalog {
-			append(out, Delta{kind = .Catalog, object = s.object, rid = Rid{device, at}, by = device, local = local, key = v_key, record = env.kind})
+			append(out, Delta{kind = .Catalog, object = s.object, rid = Rid{device, at, env.links.gen}, by = device, local = local, key = v_key, record = env.kind})
 			return
 		}
 		for f in v.fields {
-			append(out, Delta{kind = .Field, object = s.object, rid = Rid{device, at}, by = device, local = local, key = v_key, tag = f.tag, text = _tmp_bytes(f.value), hlc = f.hlc, record = env.kind})
+			append(out, Delta{kind = .Field, object = s.object, rid = Rid{device, at, env.links.gen}, by = device, local = local, key = v_key, tag = f.tag, text = _tmp_bytes(f.value), hlc = f.hlc, record = env.kind})
 		}
 	case omap.Add:
 		k := Delta_Kind.Catalog if s.catalog else .Element
-		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, text = _tmp_bytes(v.element), record = env.kind})
+		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at, env.links.gen}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, text = _tmp_bytes(v.element), record = env.kind})
 		if s.catalog && v.tag == u32(omap.Catalog_Tag.Participants) && len(v.element) == 16 {
 			_catalog_participant_seen(e, h.sp, v.key, v.element)
 		}
 	case omap.Del:
 		k := Delta_Kind.Catalog if s.catalog else .Element
-		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, text = _tmp_bytes(v.element), removed = true, record = env.kind})
+		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at, env.links.gen}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, text = _tmp_bytes(v.element), removed = true, record = env.kind})
 	case omap.Count:
 		k := Delta_Kind.Catalog if s.catalog else .Counter
-		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, length = v.delta, record = env.kind})
+		append(out, Delta{kind = k, object = s.object, rid = Rid{device, at, env.links.gen}, by = device, local = local, key = _tmp_bytes(v.key), tag = v.tag, length = v.delta, record = env.kind})
 	}
 }
 

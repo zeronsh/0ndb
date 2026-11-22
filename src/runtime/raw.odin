@@ -62,8 +62,7 @@ raw_purge :: proc(r: ^Runtime, o: Object, msg: Rid, claim: Rid, bodies: []string
 		claim: bool,
 		typed: bool,
 	}
-	target := rid_bytes(msg)
-	start := rid_bytes(claim) if !obj.rid_none(claim) else nil
+	has_start := !obj.rid_none(claim)
 	recs := make([dynamic]Rec, context.temp_allocator)
 	segs := make([dynamic]Seg, context.temp_allocator)
 	linked := make(map[i64]bool, context.temp_allocator)
@@ -87,20 +86,21 @@ raw_purge :: proc(r: ^Runtime, o: Object, msg: Rid, claim: Rid, bodies: []string
 		switch body[0] {
 		case RAW_META:
 			if _raw_run_start(body) {
-				append(&segs, Seg{claim = start != nil && string(body[1:]) == string(start)})
+				append(&segs, Seg{claim = has_start && rid_bytes_match(body[1:], claim)})
 			}
 			continue
 		case RAW_OWNER:
-			if len(segs) > 0 && len(body) == 25 {
+			if len(segs) > 0 && (len(body) == 25 || len(body) == 33) {
 				segs[len(segs) - 1].typed = true
-				segs[len(segs) - 1].owner ||= string(body[1:]) == string(target)
+				segs[len(segs) - 1].owner ||= rid_bytes_match(body[1:], msg)
 			}
 			continue
 		case RAW_LINK:
-			if len(body) == 33 {
-				x := i64(prim.get_u64le(body[25:33]))
+			if len(body) == 33 || len(body) == 41 {
+				n := len(body) - 8
+				x := i64(prim.get_u64le(body[n:]))
 				linked[x] = true
-				if string(body[1:25]) == string(target) {
+				if rid_bytes_match(body[1:n], msg) {
 					mine[x] = true
 				}
 			}
@@ -135,7 +135,7 @@ run_raw_owner :: proc(run: ^Run) {
 	if !run.raw_open || obj.rid_none(run.reply) {
 		return
 	}
-	b: [25]u8
+	b: [33]u8
 	b[0] = RAW_OWNER
 	copy(b[1:], rid_bytes(run.reply))
 	journal.journal_append(&run.raw, b[:])
@@ -145,10 +145,10 @@ run_raw_link :: proc(run: ^Run, msg: Rid, off: i64) {
 	if !run.raw_open || obj.rid_none(msg) || off < 0 {
 		return
 	}
-	b: [33]u8
+	b: [41]u8
 	b[0] = RAW_LINK
-	copy(b[1:25], rid_bytes(msg))
-	prim.put_u64le(b[25:33], u64(off))
+	copy(b[1:33], rid_bytes(msg))
+	prim.put_u64le(b[33:41], u64(off))
 	journal.journal_append(&run.raw, b[:])
 }
 
@@ -172,7 +172,7 @@ run_prompt_rid :: proc(run: ^Run, id: string) -> (Rid, bool) {
 
 @(private)
 _raw_run_start :: proc(body: []u8) -> bool {
-	if len(body) != 25 {
+	if len(body) != 25 && len(body) != 33 {
 		return false
 	}
 	s := string(body[1:])

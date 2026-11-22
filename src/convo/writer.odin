@@ -76,6 +76,7 @@ encode_settings :: proc(s: Settings, allocator := context.temp_allocator) -> []u
 	obj.tw_id(&w, 19, s.parent.object)
 	obj.tw_id(&w, 20, s.parent.rid.seg)
 	obj.tw_uv(&w, 21, u64(max(s.parent.rid.off, 0)))
+	obj.tw_uv(&w, 24, s.parent.rid.gen)
 	obj.tw_str(&w, 22, s.provider)
 	obj.tw_str(&w, 23, s.model)
 	return buf[:]
@@ -97,6 +98,8 @@ decode_settings :: proc(b: []u8) -> (s: Settings, err: Error) {
 			s.parent.rid.seg = obj.dec_id(&d)
 		case 21:
 			s.parent.rid.off = obj.dec_int(&d)
+		case 24:
+			s.parent.rid.gen = obj.dec_uv(&d)
 		case 22:
 			s.provider = obj.dec_str(&d)
 		case 23:
@@ -109,9 +112,9 @@ decode_settings :: proc(b: []u8) -> (s: Settings, err: Error) {
 	return s, .None
 }
 
-writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, created: prim.Hlc, settings: Settings = {}, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> Error {
+writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, gen: u64, created: prim.Hlc, settings: Settings = {}, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> Error {
 	_zero(w, allocator)
-	obj.writer_create(&w.core, v, vfs, path, object, .Conversation, participant, created, encode_settings(settings), opts, allocator, clock) or_return
+	obj.writer_create(&w.core, v, vfs, path, object, .Conversation, participant, gen, created, encode_settings(settings), opts, allocator, clock) or_return
 	_attach(w)
 	kp := _kids_path(path, context.temp_allocator) or_return
 	if err := obj.slots_create(&w.kids, vfs, kp, participant, allocator); err != .None {
@@ -126,9 +129,9 @@ writer_create :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, obj
 	return .None
 }
 
-writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> (settings: Settings, err: Error) {
+writer_open :: proc(w: ^Writer, v: ^obj.View, vfs: prim.Vfs, path: string, object: prim.Id, participant: prim.Id, gen: u64, opts := journal.Options{}, allocator := context.allocator, clock := obj.Clock{}) -> (settings: Settings, err: Error) {
 	_zero(w, allocator)
-	head := obj.writer_open(&w.core, v, vfs, path, object, .Conversation, participant, opts, allocator, clock) or_return
+	head := obj.writer_open(&w.core, v, vfs, path, object, .Conversation, participant, gen, opts, allocator, clock) or_return
 	_attach(w)
 	settings, err = decode_settings(head.settings)
 	if err == .None {
@@ -348,7 +351,7 @@ writer_seal :: proc(w: ^Writer, msg: Rid, status: Seal_Status, usage: Usage = {}
 	}
 	_append(w, &sum, s) or_return
 	_update(w, {key = _ckey(Ref{0, m}), seal = off}) or_return
-	return Rid{w.core.id, off}, .None
+	return Rid{w.core.id, off, w.core.gen}, .None
 }
 
 writer_set_leaf :: proc(w: ^Writer, target: Rid) -> (off: i64, err: Error) {
@@ -418,7 +421,7 @@ writer_claim :: proc(w: ^Writer, msg: Rid, lease_ms: u64, lines: []Line = nil) -
 	}
 	r := obj.local(&w.core, x) or_return
 	off := _event(w, Claim{msg = r, runner = w.core.id, lease = lease_ms, assign_hlc = ahlc, lines = lines}) or_return
-	return Rid{w.core.id, off}, .None
+	return Rid{w.core.id, off, w.core.gen}, .None
 }
 
 writer_queue :: proc(w: ^Writer, text: string, attachments: []Attachment = nil) -> (item: Rid, err: Error) {
@@ -574,7 +577,11 @@ writer_interrupt_open :: proc(w: ^Writer, now_ms: i64) -> (count: int, err: Erro
 writer_revivable :: proc(w: ^Writer) -> (out: [MAX_OPEN]Rid, n: int) {
 	for o in summary_open(&w.sum) {
 		if o.state == .Revive {
-			out[n] = Rid{w.core.id, o.msg}
+			r, re := obj.rid(w.core.v, Vref{w.core.seg, o.msg})
+			if re != .None {
+				continue
+			}
+			out[n] = r
 			n += 1
 		}
 	}
@@ -645,7 +652,8 @@ writer_recorded :: proc(w: ^Writer, source, external_id: string) -> (sequence: u
 			continue
 		}
 		mv := obj.resolve(v, s, r.msg) or_return
-		sequence, msg, found = r.sequence, obj.rid(v, mv), true
+		mr := obj.rid(v, mv) or_return
+		sequence, msg, found = r.sequence, mr, true
 	}
 	return
 }
@@ -735,7 +743,7 @@ redact_ranges :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) ->
 	x := _msg_at(v, msg) or_return
 	m := Message{}
 	sa := Vref{}
-	last := _seal_info(v, x, Position{}, &m, &sa) or_return
+	last := _seal_info(v, x, {}, false, &m, &sa) or_return
 	list := make([dynamic]obj.Redaction, allocator)
 	off := last
 	for off != 0 {
@@ -762,7 +770,7 @@ writer_redact :: proc(w: ^Writer, msg: Rid) -> (ranges: []obj.Redaction, err: Er
 	_prepare(w, false) or_return
 	v := w.core.v
 	ranges = redact_ranges(v, msg, v.scratch) or_return
-	x := obj.vref(v, msg) or_return
+	x := obj.vref_pos(v, msg) or_return
 	for r in ranges {
 		from := Vref{obj.view_find(v, r.seg), r.from}
 		_redact_record(w, from, r.to, x) or_return
@@ -1086,7 +1094,7 @@ _intent :: proc(w: ^Writer, body: Body) -> (item: Rid, err: Error) {
 	if got != off {
 		return {}, .Io
 	}
-	return Rid{w.core.id, off}, .None
+	return Rid{w.core.id, off, w.core.gen}, .None
 }
 
 @(private)
@@ -1636,7 +1644,7 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 		} else {
 			m := Message{}
 			sa := Vref{}
-			if _, e := _seal_info(v, p, Position{}, &m, &sa); e == .None {
+			if _, e := _seal_info(v, p, {}, false, &m, &sa); e == .None {
 				pseal = sa
 			} else if e != .Missing {
 				return {}, e
@@ -1699,7 +1707,7 @@ _message :: proc(w: ^Writer, spec: Msg_Spec, retire: i64, attempt: u8) -> (msg: 
 	if other {
 		_event(w, Fork{parent = pr, child = Ref{0, off}, child_hlc = hlc}) or_return
 	}
-	return Rid{w.core.id, off}, .None
+	return Rid{w.core.id, off, w.core.gen}, .None
 }
 
 @(private)

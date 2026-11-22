@@ -381,10 +381,15 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 					op.status = .Observed
 				} else {
 					op.status = .Lost
+					if err == .None && !msg.redacted {
+						world_fail(w, "rid: id of lost message %s names %q on %s", op.token, msg_text(msg), n.name)
+					}
 				}
 			case .Lost:
 				if present && msg_text(msg) == msg_body(op.token) {
 					world_fail(w, "model: lost message %s resurrected on %s", op.token, n.name)
+				} else if err == .None && !msg.redacted {
+					world_fail(w, "rid: id of lost message %s names %q on %s", op.token, msg_text(msg), n.name)
 				}
 			case .Issued, .Failed:
 			}

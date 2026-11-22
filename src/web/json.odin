@@ -146,6 +146,8 @@ o_rid :: proc(o: ^Out, name: string, r: obj.Rid) {
 	append(o.buf, ':')
 	b: [32]u8
 	append(o.buf, strconv.write_int(b[:], r.off, 10))
+	append(o.buf, ':')
+	append(o.buf, strconv.write_uint(b[:], r.gen, 10))
 	append(o.buf, '"')
 }
 
@@ -309,10 +311,12 @@ emit_window :: proc(o: ^Out, w: ^convo.Window, leaf: obj.Rid) {
 	o_rid(o, "leaf", leaf)
 }
 
-emit_tail :: proc(o: ^Out, v: ^obj.View, t: ^convo.Tail) {
+emit_tail :: proc(o: ^Out, v: ^obj.View, t: ^convo.Tail) -> obj.Error {
+	head := convo.tail_head(v, t) or_return
+	position := convo.tail_position(v, t) or_return
 	o_enum(o, "status", u64(t.status), CONVO_STATUS_NAMES[:])
-	o_rid(o, "head", convo.tail_head(v, t))
-	o_rid(o, "position", convo.tail_position(v, t))
+	o_rid(o, "head", head)
+	o_rid(o, "position", position)
 	o_bool(o, "browsing", t.browsing)
 	o_enum(o, "head_status", u64(t.head_status), SEAL_NAMES[:])
 	o_int(o, "queued", t.queued)
@@ -322,6 +326,7 @@ emit_tail :: proc(o: ^Out, v: ^obj.View, t: ^convo.Tail) {
 	o_bool(o, "awaiting", t.awaiting)
 	o_bool(o, "revive", t.revive)
 	o_u64(o, "head_hlc", u64(t.head_hlc))
+	return .None
 }
 
 emit_entry :: proc(o: ^Out, name: string, en: ^omap.Entry) {

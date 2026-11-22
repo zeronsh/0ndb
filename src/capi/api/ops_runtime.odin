@@ -481,7 +481,7 @@ _turn_versions :: proc(c: ^Call, ob: Object, msg: Rid) -> (out: [dynamic]Turn_Ve
 				continue
 			}
 			target, rerr := obj.resolve(v, i, sc.msg)
-			if rerr != .None || obj.rid(v, target) != msg {
+			if rerr != .None || !obj.rid_is(v, target, msg) {
 				continue
 			}
 			br := prim.reader(sc.before)

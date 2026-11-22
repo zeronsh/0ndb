@@ -37,9 +37,10 @@ function hexToBytes(hex, out, at) {
 
 function putRid(view, bytes, at, rid) {
   if (rid == null) return;
-  const [seg, off] = String(rid).split(':');
+  const [seg, off, gen = '0'] = String(rid).split(':');
   hexToBytes(seg, bytes, at);
   view.setBigUint64(at + 16, BigInt(off), true);
+  view.setBigUint64(at + 24, BigInt(gen), true);
 }
 
 function toBytes(v) {
@@ -440,38 +441,38 @@ export class Space {
   }
 
   page(object, { from = null, limit = 32, dir = 'older', leaf = null } = {}) {
-    const a = new Uint8Array(94);
+    const a = new Uint8Array(118);
     const dv = new DataView(a.buffer);
     hexToBytes(object, a, 0);
     if (from) {
       putRid(dv, a, 16, from.msg);
-      putRid(dv, a, 40, from.seal);
-      a[64] = from.seal_known ? 1 : 0;
+      putRid(dv, a, 48, from.seal);
+      a[80] = from.seal_known ? 1 : 0;
     }
-    dv.setUint32(65, limit, true);
-    a[69] = dir === 'newer' ? 1 : 0;
-    putRid(dv, a, 70, leaf);
+    dv.setUint32(81, limit, true);
+    a[85] = dir === 'newer' ? 1 : 0;
+    putRid(dv, a, 86, leaf);
     return this._request(OP.page, a);
   }
 
   window(object, anchor, { before = 16, after = 16, leaf = null } = {}) {
-    const a = new Uint8Array(72);
+    const a = new Uint8Array(88);
     const dv = new DataView(a.buffer);
     hexToBytes(object, a, 0);
     putRid(dv, a, 16, anchor);
-    dv.setUint32(40, before, true);
-    dv.setUint32(44, after, true);
-    putRid(dv, a, 48, leaf);
+    dv.setUint32(48, before, true);
+    dv.setUint32(52, after, true);
+    putRid(dv, a, 56, leaf);
     return this._request(OP.window, a);
   }
 
   peekSwitch(object, sibling, { before = 16, after = 16 } = {}) {
-    const a = new Uint8Array(48);
+    const a = new Uint8Array(56);
     const dv = new DataView(a.buffer);
     hexToBytes(object, a, 0);
     putRid(dv, a, 16, sibling);
-    dv.setUint32(40, before, true);
-    dv.setUint32(44, after, true);
+    dv.setUint32(48, before, true);
+    dv.setUint32(52, after, true);
     return this._request(OP.switch, a);
   }
 
@@ -484,7 +485,7 @@ export class Space {
   }
 
   _rid(op, object, rid) {
-    const a = new Uint8Array(40);
+    const a = new Uint8Array(48);
     hexToBytes(object, a, 0);
     putRid(new DataView(a.buffer), a, 16, rid);
     return this._request(op, a);

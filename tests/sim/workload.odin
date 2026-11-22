@@ -322,6 +322,43 @@ _op_create :: proc(w: ^World, n: ^Node) {
 	op_result(op, n, err)
 }
 
+probe_reuse :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	i := 0
+	for i < len(m.probes) {
+		old := m.ops[m.probes[i]]
+		if old.node != n.idx {
+			i += 1
+			continue
+		}
+		ordered_remove(&m.probes, i)
+		if !n.alive || !obj_exists(m, old.obj) {
+			continue
+		}
+		w.stats.rid_probes += 1
+		o := m.objs[old.obj].o
+		{
+			context = instance_context(&n.inst)
+			op := new_op(m, .Send, n, old.obj)
+			op.token = new_token(m, n, "m")
+			rid, err := eng.convo_send(&n.e, o, msg_body(op.token), {}, nil, op_done_handle(op))
+			if err != .Pending {
+				op.rid = rid
+			}
+			op_result(op, n, err)
+			if err == .None && rid.seg == old.rid.seg && rid.off == old.rid.off {
+				w.stats.rid_reused += 1
+				world_note(w, "%s reused offset %d of lost %s for %s", n.name, rid.off, old.token, op.token)
+			}
+			msg, merr := eng.convo_message(&n.e, o, convo.Position{msg = old.rid}, context.temp_allocator)
+			if merr == .None && !msg.redacted && (msg.author != old.actor || msg_text(msg) != msg_body(old.token)) {
+				world_fail(w, "rid: id of unacknowledged message %s names %q on %s after a crash", old.token, msg_text(msg), n.name)
+			}
+		}
+		node_after(n)
+	}
+}
+
 @(private = "file")
 _known_msg :: proc(w: ^World, n: ^Node, oi: int) -> ^M_Op {
 	return _pick_op(&w.model, &w.rng, oi, {.Send}, true)
@@ -352,6 +389,10 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		}
 		world_note(w, "%s send %s on %s -> %v", n.name, op.token, id_short(o.id), err)
 		op_result(op, n, err)
+		if w.cfg.rid_probe && err == .None && op.status == .Done && !n.probed && op.nseq >= 3 && w.cfg.crash_rate > 0 {
+			n.probed = true
+			w.probe_crash = n.idx
+		}
 	case .Queue:
 		op := new_op(m, .Queue, n, oi)
 		op.token = new_token(m, n, "q")
@@ -489,7 +530,7 @@ _op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		f := [1]omap.Field{{tag = 1, value = transmute([]u8)op.token}}
 		off, err := eng.map_set(&n.e, o, transmute([]u8)op.key, f[:], op_done_handle(op))
 		if err == .None {
-			op.rid = eng.Rid{op.actor, off}
+			op.rid = eng.Rid{op.actor, off, 0}
 		}
 		op_result(op, n, err)
 	case .Map_Hot:

@@ -220,6 +220,23 @@ node_crashed :: proc(n: ^Node) {
 	schedule(w, Sim_Event{at = w.now + delay, kind = .Restart, node = n.idx})
 }
 
+node_crash_now :: proc(n: ^Node, mode: Crash_Mode, salt: u64) {
+	w := n.w
+	context = w.ctx
+	n.disk.dead = false
+	if mode == .Power {
+		n.boot += 1
+	}
+	world_note(w, "%s crashed right after returning a message id (%v)", n.name, mode)
+	w.stats.crashes += 1
+	node_kill(n)
+	r: Rng
+	rng_init(&r, w.cfg.seed, 4_000_000 + salt)
+	disk_crash(&n.disk, mode, &r)
+	model_node_crashed(&w.model, n, mode)
+	schedule(w, Sim_Event{at = w.now + 500_000_000, kind = .Restart, node = n.idx})
+}
+
 node_after :: proc(n: ^Node) {
 	if !n.alive {
 		return

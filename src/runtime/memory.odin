@@ -94,7 +94,9 @@ memory_write :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value,
 				reply_done(r, rep, "the fact could not be written", "", true)
 				return
 			}
-			record = rid_text(Rid{r.self, off})
+			if rr, rerr := eng.record_rid(r.e, mem, .Map, r.self, off); rerr == .None && off > 0 {
+				record = rid_text(rr)
+			}
 		}
 	case:
 		k := key_of(NOTE_PREFIX, transmute([]u8)key)

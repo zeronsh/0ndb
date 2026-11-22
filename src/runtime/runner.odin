@@ -61,7 +61,11 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	cancelled := task_cancelled(r, o)
-	head := convo.tail_head(v, &t)
+	head, head_err := convo.tail_head(v, &t)
+	if head_err != .None {
+		eng.convo_status(r.e, o, _wait_ready(r, o))
+		return
+	}
 	busy := t.running && _running_live(r, o, v, &t)
 	waiting_msg: Rid
 	defer _claim_prune(r, o, waiting_msg)
@@ -463,7 +467,7 @@ convo_runners :: proc(r: ^Runtime, o: Object, from: Rid) -> []prim.Id {
 	}
 	cur := from
 	if _, merr := convo.message(v, &t, convo.Position{msg = cur}, context.temp_allocator); obj.rid_none(cur) || merr != .None {
-		cur = convo.tail_head(v, &t)
+		cur, _ = convo.tail_head(v, &t)
 	}
 	for _ in 0 ..< 64 {
 		if obj.rid_none(cur) {

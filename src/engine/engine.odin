@@ -253,6 +253,8 @@ Engine :: struct {
 	pk:           pack.Pack,
 	pk_open:      bool,
 	lock_fd:      prim.Fd,
+	gen_next:     u64,
+	gen_ceil:     u64,
 	loop:         ^prim.Loop,
 	own_loop:     prim.Loop,
 	owns_loop:    bool,
@@ -370,6 +372,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 		return .Busy if lerr == .Busy || lerr == .Would_Block else _perr(lerr)
 	}
 	e.lock_fd = fd
+	_gen_load(e) or_return
 	if cfg.loop != nil {
 		e.loop = cfg.loop
 	} else {

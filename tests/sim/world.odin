@@ -76,6 +76,7 @@ Node :: struct {
 	identity:    osync.Identity,
 	caps:        [8]eng.Cap_Credentials,
 	restart_pending: bool,
+	probed:      bool,
 	boot:        u64,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
@@ -130,6 +131,8 @@ World_Stats :: struct {
 	live_closed:    u64,
 	live_dropped:   u64,
 	live_wait_ms:   u64,
+	rid_probes:     u64,
+	rid_reused:     u64,
 }
 
 Config :: struct {
@@ -148,6 +151,7 @@ Config :: struct {
 	trace_limit: int,
 	disabled:    bit_set[Op_Kind],
 	share_access: eng.Access_Set,
+	rid_probe:   bool,
 	io_rate:     u64,
 	byzantine:   bool,
 	train_min:   int,
@@ -170,6 +174,7 @@ World :: struct {
 	fault_rng: Rng,
 	sched_rng: Rng,
 	op_index:  int,
+	probe_crash: int,
 	fault_index: int,
 	cur_op:    int,
 	cur_fault: int,

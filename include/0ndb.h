@@ -66,7 +66,11 @@
  *   f64            u64le of the IEEE-754 bits
  *   str, bytes     uvarint length, then that many bytes (str is UTF-8)
  *   id             16 raw bytes; JSON: 32 lowercase hex chars, null when zero
- *   rid            id seg, ivarint off; JSON: "<seg hex>:<off>", null when zero
+ *   rid            id seg, ivarint off, uvarint gen; JSON: "<seg hex>:<off>:<gen>",
+ *                  null when zero. gen is the generation of the writer session
+ *                  that wrote the record; a rid resolves only to a record of
+ *                  exactly that generation at that offset, otherwise not_found
+ *                  (the two-part form means generation 0)
  *   object         id space, id id; JSON: "<space hex>/<id hex>"
  *   enum           uvarint; JSON: the value's name (numbers also accepted)
  *   [T]            uvarint count, then count T; JSON: array

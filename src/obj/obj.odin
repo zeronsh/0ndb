@@ -3,7 +3,7 @@ package obj
 import "../journal"
 import "../prim"
 
-FORMAT_VERSION :: 2
+FORMAT_VERSION :: 3
 MAX_SEGS :: 1024
 TAIL_GUESS :: 256 * 1024
 MSG_GUESS :: 4096
@@ -11,6 +11,7 @@ BACK_SCAN :: 16 * 1024
 CHAIN_MAX :: 64 * 1024 * 1024
 SEG_SPAN :: 64 * 1024
 LINKS_KIND_TAG :: 16
+GEN_TAG :: 7
 
 RECORD_HEAD :: 1
 RECORD_SEG :: 2
@@ -53,6 +54,7 @@ Ref :: struct {
 Rid :: struct {
 	seg: prim.Id,
 	off: i64,
+	gen: u64,
 }
 
 Xref :: struct {
