@@ -179,6 +179,10 @@ stream_after_restart :: proc(w: ^World, n: ^Node) {
 		if !n.alive {
 			return
 		}
+		if m.ops[st.op].status == .Lost {
+			world_note(w, "%s stream %s lost in the crash: its message never became durable", n.name, m.ops[st.op].token)
+			continue
+		}
 		o := m.objs[st.obj].o
 		context = instance_context(&n.inst)
 		wr, err := eng.convo_writer(&n.e, o)
@@ -334,7 +338,7 @@ check_streams :: proc(w: ^World) {
 			continue
 		}
 		op := m.ops[st.op]
-		if _stream_redacted(m, st.msg.seg, st.msg.off) {
+		if op.status == .Lost || _stream_redacted(m, st.msg.seg, st.msg.off) {
 			continue
 		}
 		context = instance_context(&n.inst)
@@ -370,6 +374,9 @@ check_streams :: proc(w: ^World) {
 		}
 		if st.sealed && !st.crashed && msg.status == .Done && len(msg.blocks) != len(st.blocks) {
 			world_fail(w, "stream: %s sealed stream %s has %d blocks, wrote %d", n.name, op.token, len(msg.blocks), len(st.blocks))
+		}
+		if st.crashed && (msg.status != .Interrupted || (msg.open && msg.open_state != .Revive)) {
+			world_fail(w, "stream: %s crashed stream %s ended %v (open=%v state=%v), not Interrupted", n.name, op.token, msg.status, msg.open, msg.open_state)
 		}
 		if msg.open && msg.open_state == .Running && (st.sealed || st.crashed) {
 			world_fail(w, "stream: %s stream %s still running after it ended (crashed=%v)", n.name, op.token, st.crashed)
