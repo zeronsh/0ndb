@@ -70,6 +70,8 @@ Op_Kind :: enum u8 {
 	Buffer_Anchor,
 	Buffer_Sync,
 	Buffer_Burst,
+	Run_Queue,
+	Quiesce,
 }
 
 M_Space :: struct {
