@@ -251,8 +251,57 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 	}
 	_index_purge_message(e, h, Msg_Pos{msg.seg, msg.off})
 	_purge_message(e, h, msg, &m)
+	if msg.seg == e.self {
+		sum := convo.writer_summary(&h.cw)
+		if convo.summary_find(&sum, msg.off) >= 0 {
+			if _, serr := convo.writer_seal(&h.cw, msg, .Cancelled); serr != .None {
+				_log(e, .Warn, "sealing a redacted open message failed")
+			}
+		}
+	} else if _, werr := convo.writer_redact_msg(&h.cw, msg); werr != .None {
+		return _oerr(werr)
+	}
 	_handle_mark(h)
 	_object_changed(e, h.sp.id, h.id, .Redacted)
+	return .None
+}
+
+@(private)
+_apply_remote_redact_msg :: proc(e: ^Engine, h: ^Handle, vs: int, body: []u8, at: i64) -> Error {
+	rec, derr := convo.decode_record(_tmp_bytes(body), at, context.temp_allocator)
+	if derr != .None {
+		return .None
+	}
+	r, ok := rec.body.(convo.Redact_Msg)
+	if !ok {
+		return .None
+	}
+	target, terr := obj.resolve(&h.view, vs, r.msg)
+	if terr == .Missing || terr == .Unknown_Segment {
+		return .Missing
+	}
+	if terr != .None {
+		return .None
+	}
+	rid, gerr := obj.rid(&h.view, target)
+	if gerr == .Missing {
+		return .Missing
+	}
+	if gerr != .None {
+		return .None
+	}
+	_drafts_drop(h, rid.seg, rid.off)
+	if rid.seg != e.self {
+		_index_purge_message(e, h, Msg_Pos{rid.seg, rid.off})
+		_object_changed(e, h.sp.id, h.id, .Redacted)
+		return .None
+	}
+	if err := _handle_create_writer(h); err != .None {
+		return .None
+	}
+	if err := _redact_message(e, h, rid); err != .None {
+		_log(e, .Warn, "applying a message redaction failed")
+	}
 	return .None
 }
 

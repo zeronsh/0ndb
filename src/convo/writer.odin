@@ -497,6 +497,12 @@ writer_cancel :: proc(w: ^Writer, item: Rid) -> (off: i64, err: Error) {
 	return _event_sum(w, &sum, Cancel{item = r})
 }
 
+writer_redact_msg :: proc(w: ^Writer, msg: Rid) -> (off: i64, err: Error) {
+	_prepare(w, false) or_return
+	r := _local_rid(w, msg) or_return
+	return _event(w, Redact_Msg{msg = r})
+}
+
 writer_unqueue :: proc(w: ^Writer, item: Rid, outcome: Outcome, msg: Rid = {}) -> (off: i64, err: Error) {
 	if u8(outcome) < 1 || outcome > max(Outcome) {
 		return 0, .Invalid

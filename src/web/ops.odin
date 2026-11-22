@@ -699,7 +699,7 @@ _delta_convo :: proc(s: ^Session, o: ^Object, vs: int, device: prim.Id, at: i64,
 		_delta_head(s, o, out, "mount", rid, device, rec.env.kind, rec.stamp)
 		o_str(out, "text", b.name)
 		o_bool(out, "removed", true)
-	case convo.Fork, convo.Remember, convo.Forks, convo.Compact, convo.Scope, convo.Recorded, convo.Spine, convo.Files:
+	case convo.Fork, convo.Remember, convo.Forks, convo.Compact, convo.Scope, convo.Recorded, convo.Spine, convo.Files, convo.Redact_Msg:
 		_delta_head(s, o, out, "record", rid, device, rec.env.kind, rec.stamp)
 	case:
 		_delta_head(s, o, out, "record", rid, device, rec.env.kind, rec.stamp)

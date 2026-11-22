@@ -342,6 +342,12 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 						pos = at
 						break
 					}
+				} else if h.kind == .Conversation && rk == u8(convo.Kind.Redact_Msg) {
+					if _apply_remote_redact_msg(e, h, vs, body, at) == .Missing {
+						_handle_want(h)
+						pos = at
+						break
+					}
 				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Put) {
 					_full_catalog_record(e, h.sp, body, at)
 				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Add) {
