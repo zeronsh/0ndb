@@ -287,6 +287,7 @@ Mount :: struct {
 	adopting:    bool,
 	img:         Mount_Image,
 	mat:         ^Mat_Sync,
+	owed:        Mat_Sync,
 	merge_base:  Version,
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
@@ -605,6 +606,9 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.fences)
 	delete(m.intents)
+	mat_owed_clear(m)
+	delete(m.owed.files)
+	delete(m.owed.dirs)
 	held := m.history if m.retained else nil
 	if m.history != nil {
 		for x, i in m.history.mounts {
@@ -1430,6 +1434,7 @@ mount_durable_now :: proc(m: ^Mount) -> bool {
 
 @(private)
 shadow_flush :: proc(m: ^Mount) -> Error {
+	mat_settle_owed(m) or_return
 	held := m.shadow.hold
 	m.shadow.hold = false
 	defer m.shadow.hold = held

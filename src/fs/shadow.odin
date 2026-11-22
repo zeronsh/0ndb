@@ -76,6 +76,7 @@ Rec :: struct {
 
 Shadow :: struct {
 	hold:       bool,
+	owed:       bool,
 	txn:        bool,
 	txn_len:    int,
 	undo:       [dynamic]Shadow_Undo,
@@ -410,7 +411,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
-	if len(s.pending) == 0 || s.hold || s.txn {
+	if len(s.pending) == 0 || s.hold || s.owed || s.txn {
 		return .None
 	}
 	if s.log_fd < 0 {
