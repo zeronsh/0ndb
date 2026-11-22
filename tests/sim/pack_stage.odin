@@ -24,6 +24,14 @@ Stage_Rig :: struct {
 	fs:    osync.File_Store,
 	store: osync.Relay_Storage,
 	on:    bool,
+	async: bool,
+	job:   bool,
+}
+
+@(private = "file")
+Stage_Group :: struct {
+	done: proc(ctx: rawptr, err: osync.Error),
+	ctx:  rawptr,
 }
 
 @(private = "file")
@@ -57,8 +65,9 @@ _stage_fill :: proc(seed: u8, at: i64, n: int) -> []u8 {
 }
 
 @(private = "file")
-_rig_open :: proc(d: ^Disk) -> (r: ^Stage_Rig, ok: bool) {
+_rig_open :: proc(d: ^Disk, async := false) -> (r: ^Stage_Rig, ok: bool) {
 	r = new(Stage_Rig, runtime.heap_allocator())
+	r.async = async
 	if virtual.arena_init_growing(&r.arena) != nil {
 		return r, false
 	}
@@ -70,7 +79,15 @@ _rig_open :: proc(d: ^Disk) -> (r: ^Stage_Rig, ok: bool) {
 	if prim.loop_init(&r.loop, a) != .None {
 		return r, false
 	}
-	if pack.open(&r.pk, vfs, STAGE_PACK, pack.DEFAULT_OPTIONS, a) != .None {
+	opts := pack.DEFAULT_OPTIONS
+	if async {
+		opts.worker = pack.Worker_Hook{data = r, submit = proc(data: rawptr) {
+			(^Stage_Rig)(data).job = true
+		}}
+		opts.wake = proc(data: rawptr) {}
+		opts.wake_data = r
+	}
+	if pack.open(&r.pk, vfs, STAGE_PACK, opts, a) != .None {
 		return r, false
 	}
 	lay := osync.LAYOUT_COMPACT
@@ -83,6 +100,21 @@ _rig_open :: proc(d: ^Disk) -> (r: ^Stage_Rig, ok: bool) {
 		end = proc(data: rawptr) -> osync.Error {
 			return .None if pack.batch_end((^pack.Pack)(data)) == .None else .Io
 		},
+	}
+	if async {
+		group.end_async = proc(data: rawptr, done: proc(ctx: rawptr, err: osync.Error), ctx: rawptr) {
+			g := new(Stage_Group)
+			g^ = {done = done, ctx = ctx}
+			if err := pack.batch_end_async((^pack.Pack)(data), proc(d: rawptr, err: prim.Error) {
+				g := (^Stage_Group)(d)
+				done, ctx := g.done, g.ctx
+				free(g)
+				done(ctx, .None if err == .None else .Io)
+			}, g); err != .None {
+				free(g)
+				done(ctx, .Io)
+			}
+		}
 	}
 	if osync.file_store_init(&r.fs, &r.loop, pack.vfs(&r.pk), STAGE_ROOT, 0, lay, group, {}, {}, a) != .None {
 		return r, false
@@ -139,9 +171,23 @@ _stage_drive :: proc(r: ^Stage_Rig, d: ^Disk, sd: ^Stage_Done) -> bool {
 		if sd.fired {
 			return sd.result == .None
 		}
-		prim.loop_step(&r.loop, false)
+		_stage_tick(r, d)
 	}
 	return false
+}
+
+@(private = "file")
+_stage_tick :: proc(r: ^Stage_Rig, d: ^Disk) {
+	if r.async && r.job && !d.dead {
+		r.job = false
+		pack.worker_run(&r.pk)
+		if !d.dead {
+			pack.poll(&r.pk)
+		}
+	}
+	if !d.dead {
+		prim.loop_step(&r.loop, false)
+	}
 }
 
 @(private = "file")
@@ -301,6 +347,171 @@ _stage_case :: proc(c: Stage_Case) -> (crashed: bool, msg: string) {
 		return true, m
 	}
 	return true, ""
+}
+
+@(private = "file")
+_stage_pipelined: int
+
+@(private = "file")
+_stage_async_case :: proc(c: Stage_Case) -> (crashed: bool, msg: string) {
+	d: Disk
+	disk_init(&d, "stage-async", runtime.heap_allocator())
+	defer disk_destroy(&d)
+	sa := Stage_Stream{space = osync.Space_Id{0 = 1}, id = osync.Stream_Id{0 = 0xa1}, seed = 3}
+	sb := Stage_Stream{space = osync.Space_Id{0 = 2}, id = osync.Stream_Id{0 = 0xb2}, seed = 9}
+	sc := Stage_Stream{space = osync.Space_Id{0 = 3}, id = osync.Stream_Id{0 = 0xc3}, seed = 17}
+	all := []^Stage_Stream{&sa, &sb, &sc}
+	r, ok := _rig_open(&d, true)
+	if !ok {
+		_rig_kill(r)
+		return false, "setup: the pack and store did not open"
+	}
+	for x in all {
+		_stage_open(r, x, true)
+		setup: Stage_Done
+		if !_stage_append(r, &d, x, 0, c.base_a if x == &sa else STAGE_REC, &setup) {
+			_rig_kill(r)
+			return false, "setup: a base append failed"
+		}
+	}
+	a0 := i64(c.base_a)
+	b0, c0 := i64(STAGE_REC), i64(STAGE_REC)
+	a_issued, b_issued, c_issued := false, false, false
+	a_acked, b_acked, c_acked := a0, b0, c0
+	sdb, sdc, sda: Stage_Done
+	d.crash_at = d.stats.ops + c.crash
+	run: {
+		wa, aerr := r.store.append_begin(r.store.data, sa.s, a0, STAGE_REC)
+		if aerr != .None || d.dead {
+			break run
+		}
+		half := STAGE_REC / 2
+		if r.store.append_write(r.store.data, wa, _stage_fill(sa.seed, a0, half)) != .None || d.dead {
+			r.store.append_abort(r.store.data, wa)
+			break run
+		}
+		for x, k in ([]^Stage_Stream{&sb, &sc}) {
+			at := b0 if k == 0 else c0
+			w, err := r.store.append_begin(r.store.data, x.s, at, STAGE_REC)
+			if err != .None || d.dead || r.store.append_write(r.store.data, w, _stage_fill(x.seed, at, STAGE_REC)) != .None || d.dead {
+				r.store.append_abort(r.store.data, wa)
+				break run
+			}
+			r.store.append_commit(r.store.data, w, _stage_on_done, &sdb if k == 0 else &sdc)
+			if k == 0 {
+				b_issued = true
+			} else {
+				c_issued = true
+			}
+			prim.loop_step(&r.loop, false)
+			if d.dead {
+				break run
+			}
+			if k == 1 && !sdb.fired && r.job {
+				_stage_pipelined += 1
+			}
+		}
+		for _ in 0 ..< 10_000 {
+			if d.dead || (sdb.fired && sdc.fired) {
+				break
+			}
+			_stage_tick(r, &d)
+		}
+		if sdb.fired && sdb.result == .None {
+			b_acked = b0 + STAGE_REC
+		}
+		if sdc.fired && sdc.result == .None {
+			c_acked = c0 + STAGE_REC
+		}
+		if d.dead {
+			r.store.append_abort(r.store.data, wa)
+			break run
+		}
+		if r.store.append_write(r.store.data, wa, _stage_fill(sa.seed, a0 + i64(half), STAGE_REC - half)) != .None || d.dead {
+			r.store.append_abort(r.store.data, wa)
+			break run
+		}
+		a_issued = true
+		r.store.append_commit(r.store.data, wa, _stage_on_done, &sda)
+		if _stage_drive(r, &d, &sda) {
+			a_acked = a0 + STAGE_REC
+		}
+	}
+	if sdb.fired && sdb.result == .None {
+		b_acked = b0 + STAGE_REC
+	}
+	if sdc.fired && sdc.result == .None {
+		c_acked = c0 + STAGE_REC
+	}
+	crashed = d.dead
+	d.crash_at = 0
+	if !crashed {
+		_rig_close(r, all)
+		return false, ""
+	}
+	_rig_kill(r)
+	rng: Rng
+	rng_init(&rng, c.seed, c.crash)
+	disk_crash(&d, c.mode, &rng)
+	for x in all {
+		x.ns, x.s = nil, nil
+	}
+	r2, ok2 := _rig_open(&d)
+	if !ok2 {
+		_rig_kill(r2)
+		return true, "recovery: the pack and store did not reopen"
+	}
+	defer _rig_close(r2, all)
+	allow :: proc(acked, base: i64, issued: bool) -> []i64 {
+		out := make([dynamic]i64, context.temp_allocator)
+		append(&out, acked)
+		if issued && acked == base {
+			append(&out, base + STAGE_REC)
+		}
+		return out[:]
+	}
+	if m := _stage_verify(r2, &sa, allow(a_acked, a0, a_issued)); len(m) > 0 {
+		return true, m
+	}
+	if m := _stage_verify(r2, &sb, allow(b_acked, b0, b_issued)); len(m) > 0 {
+		return true, m
+	}
+	if m := _stage_verify(r2, &sc, allow(c_acked, c0, c_issued)); len(m) > 0 {
+		return true, m
+	}
+	return true, ""
+}
+
+@(test)
+staged_async_commit_crash :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	cases, crashes := 0, 0
+	_stage_pipelined = 0
+	for base in ([]int{STAGE_REC, 300 * 1024}) {
+		for mode in Crash_Mode {
+			for seed in u64(1) ..= (u64(1) if mode == .Process else 3) {
+				for k := u64(1); ; k += 1 {
+					crashed, msg := _stage_async_case(Stage_Case{base_a = base, crash = k, mode = mode, seed = seed})
+					cases += 1
+					if len(msg) > 0 {
+						testing.expectf(t, false, "async group commit, A base %d, %v crash at op %d (seed %d): %s", base, mode, k, seed, msg)
+						return
+					}
+					free_all(context.temp_allocator)
+					if !crashed {
+						break
+					}
+					crashes += 1
+				}
+			}
+		}
+	}
+	testing.expect(t, _stage_pipelined > 0, "no run staged a second group while the first commit was in flight")
+	fmt.eprintfln("staged_async_commit_crash: %d runs, %d crash points (%d with a group staged behind a commit in flight), all recovered", cases, crashes, _stage_pipelined)
 }
 
 @(test)
