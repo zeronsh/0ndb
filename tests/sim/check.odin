@@ -173,18 +173,23 @@ digest_object :: proc(w: ^World, n: ^Node, oi: int, fresh := false) -> Digest {
 			fmt.sbprintf(&b, "span %s/%d len=%d red=%v\n", id_short(s.id.actor), s.id.seq, s.len, s.redacted)
 		}
 	case .Tree:
-		names, lerr := tree_walk(n, ob.o, ready)
-		if _incomplete(lerr) {
-			return Digest{why = fmt.tprintf("%s %v @%d", "lerr", lerr, #line)}
-		}
-		slice.sort(names)
-		fmt.sbprintf(&b, "tree err=%v %v\n", lerr, names)
-		for nm in names {
-			data, rerr := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator, ready)
-			if _incomplete(rerr) {
-				return Digest{why = fmt.tprintf("%s %v @%d", "rerr", rerr, #line)}
+		for line in obj_lines(m, oi) {
+			names, lerr := tree_walk(n, ob.o, ready, line_eng(line))
+			if _incomplete(lerr) {
+				return Digest{why = fmt.tprintf("%s %v @%d", "lerr", lerr, #line)}
 			}
-			fmt.sbprintf(&b, "file %s err=%v %q\n", nm, rerr, _printable(data))
+			slice.sort(names)
+			if len(line) > 0 {
+				fmt.sbprintf(&b, "line %s\n", line)
+			}
+			fmt.sbprintf(&b, "tree err=%v %v\n", lerr, names)
+			for nm in names {
+				data, rerr := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator, ready, line_eng(line))
+				if _incomplete(rerr) {
+					return Digest{why = fmt.tprintf("%s %v @%d", "rerr", rerr, #line)}
+				}
+				fmt.sbprintf(&b, "file %s err=%v %q\n", nm, rerr, _printable(data))
+			}
 		}
 	}
 	return Digest{text = strings.clone(strings.to_string(b), w.allocator), complete = true, guest = guest}
@@ -270,39 +275,20 @@ check_whole_tokens :: proc(w: ^World, n: ^Node, oi: int, known: ^map[string]bool
 		_whole_tokens(w, n, oi, "", data, spans, regions, known)
 		return
 	}
-	names, lerr := tree_walk(n, ob.o)
-	if lerr != .None {
-		return
-	}
 	regions, _ := eng.tree_conflicts(&n.e, ob.o, context.temp_allocator)
-	for name in names {
-		data, err := eng.tree_read(&n.e, ob.o, name, context.temp_allocator)
-		if err != .None {
+	for line in obj_lines(&w.model, oi) {
+		names, lerr := tree_walk(n, ob.o, {}, line_eng(line))
+		if lerr != .None {
 			continue
 		}
-		_whole_tokens(w, n, oi, name, data, _tree_author_spans(n, ob.o, name), regions, known)
+		for name in names {
+			data, spans, err := eng.tree_blame(&n.e, ob.o, name, context.temp_allocator, line_eng(line))
+			if err != .None {
+				continue
+			}
+			_whole_tokens(w, n, oi, name, data, spans, regions, known)
+		}
 	}
-}
-
-@(private = "file")
-_tree_author_spans :: proc(n: ^Node, o: eng.Object, path: string) -> []crdt.Author_Span {
-	hist, err := eng.tree_history(&n.e, o)
-	if err != .None {
-		return nil
-	}
-	defer eng.tree_release(&n.e, o)
-	snap := fstree.current(&hist.tree)
-	id, ok, lerr := fstree.lookup(&snap, path)
-	if lerr != nil || !ok {
-		return nil
-	}
-	f, ferr := fs.history_file(hist, id)
-	if ferr != .None {
-		return nil
-	}
-	raw := crdt.text_spans(&f.text, &hist.g, context.temp_allocator)
-	fs.history_present_spans(hist, raw)
-	return raw
 }
 
 @(private = "file")
@@ -682,6 +668,17 @@ _check_counters :: proc(w: ^World, oi: int, n: ^Node) {
 
 @(private = "file")
 _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
+	if w.model.objs[oi].kind == .Tree {
+		for line in obj_lines(&w.model, oi) {
+			_check_tokens_at(w, oi, n, line)
+		}
+		return
+	}
+	_check_tokens_at(w, oi, n, "")
+}
+
+@(private = "file")
+_check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 	m := &w.model
 	ob := &m.objs[oi]
 	Seen :: struct {
@@ -741,10 +738,14 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		}
 		collect(&present, &twice, data, spans[:], "")
 	} else {
-		names, _ := tree_walk(n, ob.o)
+		names, _ := tree_walk(n, ob.o, {}, line_eng(line))
 		for nm in names {
-			data, _ := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator)
-			spans := tree_file_spans(n, ob.o, nm)
+			data, _ := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator, {}, line_eng(line))
+			_, raw, _ := eng.tree_blame(&n.e, ob.o, nm, context.temp_allocator, line_eng(line))
+			spans := make([]crdt_span, len(raw), context.temp_allocator)
+			for x, i in raw {
+				spans[i] = crdt_span{actor = x.id.actor, len = x.len}
+			}
 			total := 0
 			for sp in spans {
 				total += sp.len
@@ -755,7 +756,7 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			collect(&present, &twice, data, spans, nm)
 		}
 	}
-	merged := merged_files(w, oi, true) if ob.kind == .Tree else nil
+	merged := merged_files(w, oi, line == "") if ob.kind == .Tree else nil
 	for op in m.ops {
 		if op.obj != oi {
 			continue
@@ -766,9 +767,10 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		if !(op.kind == .Text_Insert || op.kind == .Buffer_Type || op.kind == .Tree_Write || op.kind == .Create || op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Git_Mount) {
 			continue
 		}
+		strict := op.line == line
 		for tok in op.tokens {
 			s, is := present[tok]
-			if is {
+			if is && strict {
 				diffed := (op.kind == .Disk_Agent || op.kind == .Disk_Person) && len(op.deletes) > 0
 				own := false
 				for a in s.actors {
@@ -793,11 +795,11 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			deleted := false
 			maybe_deleted := false
 			for d in m.ops {
-				if d.obj != oi {
+				if d.obj != oi || d.line != line {
 					continue
 				}
 				for x in d.deletes {
-					if x == tok {
+					if x == tok && !_readded(m, oi, line, tok, d.idx) {
 						if op_happened(d) {
 							deleted = true
 						} else if d.status == .Uncertain {
@@ -809,20 +811,26 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			removed := false
 			if ob.kind == .Tree {
 				for d in m.ops {
-					if d.obj == oi && (d.kind == .Tree_Remove || d.kind == .Disk_Person || d.kind == .Disk_Agent || d.kind == .Tree_Write) && op_maybe(d) && same_file(m, oi, d.path, op.path) && d.kind == .Tree_Remove {
+					if d.obj == oi && d.line == line && (d.kind == .Tree_Remove || d.kind == .Disk_Person || d.kind == .Disk_Agent || d.kind == .Tree_Write) && op_maybe(d) && same_file(m, oi, d.path, op.path) && d.kind == .Tree_Remove {
 						removed = true
 					}
 				}
 			}
 			switch op.status {
 			case .Acked, .Observed, .Done:
+				if !strict {
+					if deleted && is {
+						world_fail(w, "model: token %s deleted on line %q but still present there on %s", tok, line, n.name)
+					}
+					break
+				}
 				if deleted && is {
 					world_fail(w, "model: token %s deleted but still present on %s", tok, n.name)
 				} else if !deleted && !maybe_deleted && !removed && !is {
 					world_fail(w, "model: token %s (op %d %v %v) missing on %s", tok, op.idx, op.kind, op.status, n.name)
 				}
 			case .Uncertain:
-				if is {
+				if is && strict {
 					op.status = .Observed
 				}
 			case .Lost:
@@ -857,6 +865,21 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			world_fail(w, "model: unknown token %s present in %s on %s", tok, id_short(ob.o.id), n.name)
 		}
 	}
+}
+
+@(private = "file")
+_readded :: proc(m: ^Model, oi: int, line: string, tok: string, after: int) -> bool {
+	for r in m.ops {
+		if r.idx <= after || r.obj != oi || r.line != line || !op_happened(r) {
+			continue
+		}
+		for t in r.tokens {
+			if t == tok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 crdt_span :: struct {
@@ -1364,7 +1387,7 @@ concurrent_pairs :: proc(w: ^World, oi: int) -> []Pair {
 	}
 	for a in ops {
 		for b in ops {
-			if (a.node == b.node && (a.kind == .Tree_Write) == (b.kind == .Tree_Write)) || !same_file(m, oi, a.path, b.path) || a.at > b.at || (a.at == b.at && a.idx >= b.idx) {
+			if (a.node == b.node && (a.kind == .Tree_Write) == (b.kind == .Tree_Write)) || !same_file(m, oi, a.path, b.path) || a.line != b.line || a.at > b.at || (a.at == b.at && a.idx >= b.idx) {
 				continue
 			}
 			live := true
