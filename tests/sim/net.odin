@@ -353,6 +353,8 @@ conns_drop_relay :: proc(w: ^World) {
 	}
 }
 
+CONNECT_TIMEOUT :: i64(3_000_000_000)
+
 net_event :: proc(w: ^World, ev: ^Sim_Event) {
 	c := ev.conn
 	switch ev.kind {
@@ -366,6 +368,18 @@ net_event :: proc(w: ^World, ev: ^Sim_Event) {
 			return
 		}
 		if n.partitioned || !w.relay.alive {
+			switch n.connect_fault {
+			case .None:
+			case .Refused:
+				_node_link(n, c, .Down)
+			case .Timeout:
+				schedule(w, Sim_Event{at = w.now + CONNECT_TIMEOUT, kind = .Connect_Fail, conn = c, gen = c.gen})
+				return
+			case .Close_Early:
+				_node_link(n, c, .Up)
+				schedule(w, Sim_Event{at = w.now + _delay(c), kind = .Connect_Fail, conn = c, gen = c.gen})
+				return
+			}
 			at := w.now + c.backoff / 2 + rng_range(&w.net_rng, 0, c.backoff / 2)
 			c.backoff = min(c.backoff * 2, 5_000_000_000)
 			schedule(w, Sim_Event{at = at, kind = .Connect, conn = c, gen = c.gen})
@@ -387,6 +401,17 @@ net_event :: proc(w: ^World, ev: ^Sim_Event) {
 		c.last_node = w.now
 		c.last_relay = w.now
 		_node_link(n, c, .Up)
+	case .Connect_Fail:
+		if c.state != .Down || ev.gen != c.gen || c.engine_closed {
+			return
+		}
+		n := c.node
+		if n.alive && c.inc == n.incarnation {
+			_node_link(n, c, .Down)
+		}
+		at := w.now + c.backoff / 2 + rng_range(&w.net_rng, 0, c.backoff / 2)
+		c.backoff = min(c.backoff * 2, 5_000_000_000)
+		schedule(w, Sim_Event{at = at, kind = .Connect, conn = c, gen = c.gen})
 	case .To_Relay:
 		if ev.gen != c.gen || !c.attached || !w.relay.alive {
 			return

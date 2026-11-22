@@ -170,7 +170,7 @@ handle_event :: proc(w: ^World, ev: ^Sim_Event) {
 				schedule(w, Sim_Event{at = w.now + gap, kind = .Op})
 			}
 		}
-	case .Connect, .To_Relay, .To_Node, .Fin_To_Node, .Writable_Node, .Writable_Relay:
+	case .Connect, .Connect_Fail, .To_Relay, .To_Node, .Fin_To_Node, .Writable_Node, .Writable_Relay:
 		net_event(w, ev)
 	case .Reset:
 	case .Fault:

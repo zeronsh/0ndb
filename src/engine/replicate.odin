@@ -147,8 +147,12 @@ link_writable :: proc(e: ^Engine, link: Link) {
 link_down :: proc(e: ^Engine, link: Link) {
 	context = context_for(e)
 	if sp := _link_space(e, link); sp != nil {
+		failed := !sp.connected
 		osync.replicator_link_down(&sp.repl)
 		sp.connected = false
+		if failed {
+			sp.attempt = true
+		}
 		_link_attempt_failed(e, sp)
 		_touch(e)
 	}
