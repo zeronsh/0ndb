@@ -240,6 +240,7 @@ Pending :: struct {
 	length: i64,
 	id:     [32]u8,
 	early:  bool,
+	seq:    u64,
 }
 
 @(private)
@@ -279,6 +280,8 @@ Conn :: struct {
 	listing:   ^Listing,
 	stash:     [dynamic]u8,
 	inflight:  int,
+	appends:   [dynamic]u64,
+	append_at: u64,
 	paused:    bool,
 	feeding:   bool,
 	pumping:   bool,
@@ -647,6 +650,7 @@ _conn_alloc :: proc(r: ^Relay_Core) -> (c: ^Conn, err: Error) {
 	c.subs = make([dynamic]Sub, r.allocator)
 	c.lives = make([dynamic]Stream_Id, r.allocator)
 	c.stash = make([dynamic]u8, r.allocator)
+	c.appends = make([dynamic]u64, r.allocator)
 	r.stats.conns += 1
 	r.stats.pending += 1
 	c.counted = true
@@ -661,6 +665,7 @@ _reap :: proc(r: ^Relay_Core) {
 		delete(c.subs)
 		delete(c.lives)
 		delete(c.stash)
+		delete(c.appends)
 		free(c, r.allocator)
 	}
 	clear(&r.graveyard)
@@ -1621,9 +1626,34 @@ _pending_new :: proc(c: ^Conn, kind: Pending_Kind, st: ^Stream_State, total: i64
 	if st != nil {
 		_stream_ref(st)
 	}
+	if kind == .Append {
+		c.append_at += 1
+		p.seq = c.append_at
+		if _, e := append(&c.appends, p.seq); e != nil {
+			p.seq = 0
+		}
+	}
 	c.space.jobs += 1
 	c.inflight += 1
 	return p
+}
+
+@(private)
+_append_turn :: proc(c: ^Conn, p: ^Pending) -> bool {
+	return c == nil || p.seq == 0 || len(c.appends) == 0 || c.appends[0] == p.seq
+}
+
+@(private)
+_append_settled :: proc(c: ^Conn, p: ^Pending) {
+	if c == nil || p.seq == 0 {
+		return
+	}
+	for x, i in c.appends {
+		if x == p.seq {
+			ordered_remove(&c.appends, i)
+			return
+		}
+	}
 }
 
 @(private)
@@ -2036,6 +2066,8 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	case .Trim:
 		_trim_done(r, sp, c, p, result, value)
 	}
+	settled := p.seq != 0 && c != nil
+	_append_settled(c, p)
 	if p.stream != nil {
 		_stream_unref(r, p.stream)
 	}
@@ -2044,6 +2076,9 @@ _relay_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	if c != nil {
 		c.inflight -= 1
 		_conn_kick(c)
+	}
+	if settled {
+		_feed_release(r, sp)
 	}
 	_space_release(r, sp)
 	_reap(r)
