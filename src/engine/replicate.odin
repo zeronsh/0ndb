@@ -334,6 +334,19 @@ _pending_settle :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
 }
 
 @(private)
+_names_catalog :: proc(sp: ^Space, name: string) -> bool {
+	if len(name) == 0 {
+		return false
+	}
+	seg := name
+	if t, ok := _keys_target(name); ok {
+		seg = t
+	}
+	id, _, ok := _object_of_name(seg)
+	return ok && id == sp.catalog
+}
+
+@(private)
 _keys_target :: proc(name: string) -> (seg: string, ok: bool) {
 	if len(name) > len(osync.KEYS_STREAM) && name[:len(osync.KEYS_STREAM)] == osync.KEYS_STREAM {
 		return name[len(osync.KEYS_STREAM):], true
@@ -474,6 +487,9 @@ _need_add :: proc(e: ^Engine, sp: ^Space, kind: Need_Kind, device: prim.Id, name
 
 @(private)
 _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
+	if len(e.waiters) > 0 && _names_catalog(sp, ev.name) {
+		_unknown_waiters_wake(e, sp)
+	}
 	#partial switch ev.kind {
 	case .Connected:
 		sp.connected = true

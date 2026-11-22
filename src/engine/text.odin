@@ -18,7 +18,10 @@ text_create :: proc(e: ^Engine, space: prim.Id, title := "", initial := "") -> (
 	context = context_for(e)
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .Text) or_return
-	_handle_create_writer(h) or_return
+	if err = _handle_create_writer(h); err != .None {
+		h.create_err = err
+		return
+	}
 	_hist_tree_op(e, h, fstree.Op_Create{parent = fstree.ROOT, name = TEXT_NAME, kind = .File}, initial) or_return
 	_handle_mark(h)
 	_catalog_created(e, h, title, {}, {}, {})
@@ -29,7 +32,10 @@ tree_create :: proc(e: ^Engine, space: prim.Id, title := "") -> (o: Object, err:
 	context = context_for(e)
 	o = Object{space, new_id(e)}
 	h := _handle_get(e, o, .File_Tree) or_return
-	_handle_create_writer(h) or_return
+	if err = _handle_create_writer(h); err != .None {
+		h.create_err = err
+		return
+	}
 	_handle_mark(h)
 	_catalog_created(e, h, title, {}, {}, {})
 	return o, .None
