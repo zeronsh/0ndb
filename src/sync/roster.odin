@@ -556,6 +556,61 @@ _roster_apply :: proc(r: ^Roster, i: int, rec: ^Member_Record, seniority: ^int) 
 		}
 		append(&r.seals, Runner_Seal{subject = b.subject, epoch = b.epoch, record = i})
 		return true
+	case .Scope:
+		b, err := scope_decode(rec.payload)
+		if err != .None {
+			return false
+		}
+		x := roster_find(r, b.subject)
+		if x < 0 || r.members[x].removed || r.members[x].kind != .Guest {
+			return false
+		}
+		target := &r.members[x]
+		if b.add {
+			ab := Add_Body{kind = .Guest, role = target.role}
+			if !_may_add(&author, &ab) {
+				return false
+			}
+		} else {
+			allowed := b.subject == rec.author
+			switch author.role {
+			case .Owner:
+				allowed = true
+			case .Admin:
+				allowed ||= target.role != .Owner
+			case .Member, .Reader:
+			}
+			if author.kind == .Pool && target.added_by == author.sign {
+				allowed = true
+			}
+			if !allowed {
+				return false
+			}
+		}
+		at := -1
+		for o, k in target.scope {
+			if o == b.object {
+				at = k
+			}
+		}
+		if b.add == (at >= 0) {
+			return true
+		}
+		n := len(target.scope) + 1 if b.add else len(target.scope) - 1
+		next := make([]prim.Id, n, r.allocator)
+		j := 0
+		for o, k in target.scope {
+			if k != at {
+				next[j] = o
+				j += 1
+			}
+		}
+		if b.add {
+			next[j] = b.object
+		}
+		delete(target.scope, r.allocator)
+		target.scope = next
+		return true
 	case .Revoke:
 		b, err := revoke_decode(rec.payload)
 		if err != .None || author.role > .Admin {
