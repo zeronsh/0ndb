@@ -318,6 +318,7 @@ Engine :: struct {
 	tick_hook:    Tick_Hook,
 	tick_wanted:  bool,
 	settle_timer: prim.Timer,
+	draft_timer:  prim.Timer,
 	settling:     bool,
 	in_tick:      bool,
 	closing:      bool,
@@ -812,6 +813,7 @@ _tick_end :: proc(e: ^Engine) {
 	_full_step(e)
 	_index_step(e)
 	_handles_commit(e)
+	_draft_timer_arm(e)
 	_index_durable_advanced(e)
 	_handles_sweep(e, e.cfg.handle_cache)
 	_git_flush(e)
@@ -985,6 +987,10 @@ _teardown :: proc(e: ^Engine) {
 		if e.tick_timer != 0 {
 			prim.timer_cancel(e.loop, e.tick_timer)
 			e.tick_timer = 0
+		}
+		if e.draft_timer != 0 {
+			prim.timer_cancel(e.loop, e.draft_timer)
+			e.draft_timer = 0
 		}
 		if e.settle_timer != 0 {
 			prim.timer_cancel(e.loop, e.settle_timer)

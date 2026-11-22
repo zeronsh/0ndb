@@ -16,6 +16,10 @@ _on_follow_live :: proc(c: ^Conn, rd: ^prim.Reader, count: int) {
 			_live_unfollow(c, id)
 			continue
 		}
+		if off == LIVE_INTEREST || off == LIVE_INTEREST_END {
+			_live_interest(c, id, off == LIVE_INTEREST)
+			continue
+		}
 		if !_can(c, .Read, cast([32]u8)id) {
 			_reply_refused(c, .Not_Owner, cast([32]u8)id)
 			continue
@@ -30,10 +34,11 @@ _on_follow_live :: proc(c: ^Conn, rd: ^prim.Reader, count: int) {
 		if found {
 			continue
 		}
-		if len(c.subs) + len(c.lives) >= r.cfg.max_follows {
+		if len(c.subs) + len(c.lives) + len(c.interests) >= r.cfg.max_follows {
 			_reply_refused(c, .Limit, cast([32]u8)id)
 			continue
 		}
+		was := _live_watched(sp, id)
 		if _, e := append(&c.lives, id); e != nil {
 			_conn_close(c)
 			return
@@ -53,6 +58,110 @@ _on_follow_live :: proc(c: ^Conn, rd: ^prim.Reader, count: int) {
 			return
 		}
 		sp.livers[id] = l
+		if !was && _live_watched(sp, id) {
+			_interest_notify(sp, id, true)
+		}
+	}
+}
+
+@(private)
+_live_watched :: proc(sp: ^Space_State, id: Stream_Id) -> bool {
+	l, ok := sp.livers[id]
+	if !ok {
+		return false
+	}
+	w := sp.interest[id]
+	outer: for f in l {
+		for x in w {
+			if x == f {
+				continue outer
+			}
+		}
+		return true
+	}
+	return false
+}
+
+@(private)
+_reply_watched :: proc(c: ^Conn, id: Stream_Id, on: bool) {
+	b: [FRAME_HEADER + WATCHED_LEN]u8
+	frame_header(b[:], .Watched, WATCHED_LEN)
+	v := id
+	copy(b[FRAME_HEADER:], v[:])
+	b[FRAME_HEADER + 32] = 1 if on else 0
+	_push_small(c, b[:])
+}
+
+@(private)
+_interest_notify :: proc(sp: ^Space_State, id: Stream_Id, on: bool) {
+	for f in sp.interest[id] {
+		if f.dead || f.closing {
+			continue
+		}
+		_reply_watched(f, id, on)
+		_conn_kick(f)
+	}
+}
+
+@(private)
+_live_interest :: proc(c: ^Conn, id: Stream_Id, on: bool) {
+	sp := c.space
+	if !on {
+		_interest_remove(sp, id, c)
+		for i := 0; i < len(c.interests); i += 1 {
+			if c.interests[i] == id {
+				unordered_remove(&c.interests, i)
+				break
+			}
+		}
+		return
+	}
+	if !_can(c, .Append, cast([32]u8)id) {
+		_reply_refused(c, .Not_Owner, cast([32]u8)id)
+		return
+	}
+	for x in c.interests {
+		if x == id {
+			_reply_watched(c, id, _live_watched(sp, id))
+			return
+		}
+	}
+	if len(c.subs) + len(c.lives) + len(c.interests) >= c.relay.cfg.max_follows {
+		_reply_refused(c, .Limit, cast([32]u8)id)
+		return
+	}
+	if _, e := append(&c.interests, id); e != nil {
+		_conn_close(c)
+		return
+	}
+	l, ok := sp.interest[id]
+	if !ok {
+		l = make([dynamic]^Conn, c.relay.allocator)
+	}
+	if _, e := append(&l, c); e != nil {
+		pop(&c.interests)
+		if len(l) == 0 {
+			delete(l)
+		} else {
+			sp.interest[id] = l
+		}
+		_conn_close(c)
+		return
+	}
+	sp.interest[id] = l
+	_reply_watched(c, id, _live_watched(sp, id))
+}
+
+@(private)
+_interest_remove :: proc(sp: ^Space_State, id: Stream_Id, c: ^Conn) {
+	l, ok := &sp.interest[id]
+	if !ok {
+		return
+	}
+	_remove_conn(l, c)
+	if len(l) == 0 {
+		delete(l^)
+		delete_key(&sp.interest, id)
 	}
 }
 
@@ -73,10 +182,14 @@ _liver_remove :: proc(sp: ^Space_State, id: Stream_Id, c: ^Conn) {
 	if !ok {
 		return
 	}
+	was := _live_watched(sp, id)
 	_remove_conn(l, c)
 	if len(l) == 0 {
 		delete(l^)
 		delete_key(&sp.livers, id)
+	}
+	if was && !_live_watched(sp, id) {
+		_interest_notify(sp, id, false)
 	}
 }
 
@@ -86,6 +199,10 @@ _lives_conn_closed :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn) {
 		_liver_remove(sp, id, c)
 	}
 	clear(&c.lives)
+	for id in c.interests {
+		_interest_remove(sp, id, c)
+	}
+	clear(&c.interests)
 }
 
 @(private)

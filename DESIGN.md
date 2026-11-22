@@ -1933,6 +1933,16 @@ Relay cost tracks the reachable information, not the activity. Items marked
     its message leaves the draft. When no live message remains, the draft
     journal is removed and its generation bumped (pack zero-fills a
     destroyed stream's extents).
+  - *Cost.* A draft record is written once 512 bytes of the open block are
+    undrafted, or once 50 ms have passed since the last one; a timer armed
+    only while a draft has undrafted bytes forces the rest out after 50 ms.
+    One batch publishes each conversation's new records in a single `Live`.
+    The writer registers interest in its segment and sends `Live` only
+    while the relay says someone watches (relay protocol 8.17); the local
+    draft is written regardless, so a reader that starts watching catches
+    up with a draft pull. In the sim with 24-byte deltas every 20 ms,
+    uploads fell from 15,580 to 2,258 bytes per KB of draft text, and to
+    zero for conversations nobody follows.
   - *Relay.* `Live` is forwarded at once as `Lived` to every connection
     with live interest in that segment (`Follow` with the LIVE flag), and
     nothing else happens: no storage, no feed entry, no acknowledgement, no
