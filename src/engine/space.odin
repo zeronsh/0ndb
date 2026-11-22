@@ -73,6 +73,8 @@ Space :: struct {
 	refused:      bool,
 	refusals:     int,
 	admitted:     bool,
+	attempt:      bool,
+	offline:      bool,
 }
 
 @(private)
