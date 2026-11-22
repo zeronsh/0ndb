@@ -489,7 +489,7 @@ _conn_process :: proc(c: ^Conn) -> bool {
 			open: []u8
 			if api.request_is(&d.s.a, payload[9:], st_.json, "buffer.open") {
 				st_.buffer = true
-				id, st, open = api.subscribe_open(&d.s.a, payload[9:], st_.json, _on_buffer_sub, st_, _sub_ready)
+				id, st, open = api.subscribe_open(&d.s.a, payload[9:], st_.json, _on_buffer_sub, st_, _sub_ready, _on_buffer_opened)
 			} else {
 				catalog: bool
 				object: api.Object
@@ -497,7 +497,10 @@ _conn_process :: proc(c: ^Conn) -> bool {
 				st_.catalog = catalog
 				st_.object = object
 			}
-			if st != .Ok {
+			if st == .Pending && st_.buffer {
+				st_.id = id
+				append(&c.subs, st_)
+			} else if st != .Ok {
 				free(st_)
 				_send_result(c, tag, st, _status_payload(st, payload[8] & 1 != 0))
 			} else {
@@ -693,6 +696,26 @@ _on_buffer_sub :: proc(data: rawptr, id: u64, payload: []u8) {
 	s := (^Sub_Tag)(data)
 	t := u64_bytes(s.tag)
 	_conn_push(s.conn, .Deltas, t[:], payload)
+}
+
+@(private)
+_on_buffer_opened :: proc(data: rawptr, id: u64, st: api.Status, open: []u8) {
+	s := (^Sub_Tag)(data)
+	c := s.conn
+	if st == .Ok {
+		_send_result(c, s.tag, .Ok, open)
+		return
+	}
+	for x, i in c.subs {
+		if x == s {
+			ordered_remove(&c.subs, i)
+			break
+		}
+	}
+	tag := s.tag
+	json_form := s.json
+	_sub_free(s)
+	_send_result(c, tag, st, _status_payload(st, json_form))
 }
 
 @(private)

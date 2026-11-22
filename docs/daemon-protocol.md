@@ -531,6 +531,12 @@ UTF-8 widened to whole code points, and an insert's `n` counts units. `open`
 returns the first `page` units of text, the full `length`, and `more` when
 the rest must be fetched with `buffer.read`.
 
+`buffer.open` waits like a read: when the object's history is not on this
+device yet, the Result is sent once it has been fetched, and while the
+space's catalog is still catching up it waits for the catalog, so an object
+another device just created opens instead of answering `missing`. It answers
+`missing` only once the catalog is caught up and nothing is being fetched.
+
 Client rule (Jupiter). Number your edits 1, 2, ... and keep the
 unacknowledged ones as deltas. Send each `buffer.edit` with the `rev` of the
 last delta you applied; its edits are sorted, non-overlapping, and refer to

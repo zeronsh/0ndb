@@ -7,6 +7,7 @@ import "../crdt"
 import "../fs"
 import "../fstree"
 import "../prim"
+import osync "../sync"
 
 Buffer_Id :: distinct u64
 
@@ -61,6 +62,7 @@ Buffer_Options :: struct {
 	cb:    Buffer_Proc,
 	data:  rawptr,
 	ready: Buffer_Ready,
+	wait:  Ready,
 }
 
 Buffer_Info :: struct {
@@ -208,18 +210,36 @@ _buffer_follow :: proc(e: ^Engine, h: ^Handle) {
 	}
 }
 
+@(private)
+_buffer_wait :: proc(e: ^Engine, h: ^Handle, err: Error, wait: Ready) -> Error {
+	r := _pending_result(e, h, err, wait)
+	if r != .Missing || wait.call == nil || !h.sp.repl_on || !h.sp.connected {
+		return r
+	}
+	ch, cerr := _catalog_handle(e, h.sp)
+	if cerr != .None {
+		return r
+	}
+	if !osync.replicator_caught_up(&h.sp.repl) || _handle_waiting(ch, false) {
+		return _space_wait_on(e, h.sp, wait, .Catalog)
+	}
+	return r
+}
+
 buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := context.allocator) -> (info: Buffer_Info, err: Error) {
 	context = context_for(e)
 	kind := Kind.Text if len(opts.path) == 0 else Kind.File_Tree
 	h := _handle_get(e, o, kind) or_return
-	_hist_ready(e, h) or_return
+	if herr := _hist_ready(e, h); herr != .None {
+		return {}, _buffer_wait(e, h, herr, opts.wait)
+	}
 	_buffer_follow(e, h)
 	_hist_catch_up(e, h)
 	inode: fstree.Inode_Id
 	if kind == .Text {
 		id, found := _text_inode(h) or_return
 		if !found {
-			return {}, .Missing
+			return {}, _buffer_wait(e, h, .Missing, opts.wait)
 		}
 		inode = id
 	} else {
