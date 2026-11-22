@@ -17,6 +17,7 @@ Own_Tree :: struct {
 	uploading:   i64,
 	dirty:       bool,
 	stored:      i64,
+	keys_ok:     u64,
 }
 
 Remote_Tree :: struct {
