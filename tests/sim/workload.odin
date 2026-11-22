@@ -14,7 +14,7 @@ setup_spaces :: proc(w: ^World) -> bool {
 	n0 := w.nodes[0]
 	for s in 0 ..< w.cfg.spaces {
 		context = instance_context(&n0.inst)
-		id, err := eng.space_create(&n0.e, fmt.tprintf("space%d", s))
+		id, err := eng.space_create(&n0.e, fmt.tprintf("space%d", s), "relay", w.relay.public)
 		if err != .None {
 			world_fail(w, "space_create failed: %v", err)
 			return false
@@ -48,7 +48,7 @@ setup_spaces :: proc(w: ^World) -> bool {
 				node_after(n0)
 			}
 			context = instance_context(&n.inst)
-			_, err := eng.space_join_enrollment(&n.e, sp.id, proof, fmt.tprintf("space%d", s))
+			_, err := eng.space_join_enrollment(&n.e, sp.id, proof, fmt.tprintf("space%d", s), "relay", w.relay.public)
 			if err != .None {
 				world_fail(w, "%s space_join_enrollment failed: %v", n.name, err)
 				return false
@@ -832,7 +832,7 @@ deliver_shares :: proc(w: ^World) {
 		si := space_index(m, ps.share.space)
 		context = instance_context(&n.inst)
 		if !space_member(&m.spaces[si], n.idx) {
-			err := eng.space_join_shared(&n.e, ps.share.space, fmt.tprintf("guest%d", si))
+			err := eng.space_join_shared(&n.e, ps.share.space, fmt.tprintf("guest%d", si), "relay", w.relay.public)
 			if err != .None && err != .Exists {
 				world_fail(w, "%s space_join_shared failed: %v", n.name, err)
 				node_after(n)

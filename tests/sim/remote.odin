@@ -193,7 +193,7 @@ check_move :: proc(w: ^World) {
 			proof = p
 		}
 		context = instance_context(&mv.inst)
-		if _, err := eng.space_join_enrollment(&mv.e, sp.id, proof, fmt.tprintf("space%d", s)); err != .None {
+		if _, err := eng.space_join_enrollment(&mv.e, sp.id, proof, fmt.tprintf("space%d", s), "relay", w.relay.public); err != .None {
 			world_fail(w, "move: %s space_join_enrollment failed: %v", mv.name, err)
 			return
 		}

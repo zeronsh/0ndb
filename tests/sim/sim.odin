@@ -463,6 +463,7 @@ finish :: proc(w: ^World) {
 	check_relay_plaintext(w)
 	check_relay_storage(w)
 	check_mounts(w)
+	check_uploaded(w)
 	if w.aborted {
 		return
 	}

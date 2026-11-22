@@ -185,6 +185,14 @@ Without any sign-in the daemon is fully local-only: every feature that needs
 no other device works, and a later sign-in brings the existing spaces into the
 account with their history.
 
+A space replicates only when it names a relay. A space with no relay is
+local-only whatever transport the embedder supplies: no replicator runs and
+nothing is announced. A host transport (`ondb_transport`) carries the bytes to
+the relay the space names (`ondb_peer.relay`); it does not make a relay-less
+space replicate. Everything written while local-only, including tree contents
+ingested from disk, is announced once the space gets a relay (sign-in or
+`space.set_relay`).
+
 ### Worked example: WorkOS
 
 - Subject: the WorkOS user id (`user_01...`) from AuthKit, after the app's

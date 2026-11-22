@@ -628,7 +628,6 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 		path, perr := _own_path(e, h)
 		if perr == .None {
 			_dirty_add(e, h, path, n)
-			_content_publish(e, h)
 			_pending_set(e, h.sp.id, h.id, n)
 			_index_item_add(e, h.sp.id, h.id, h.kind)
 			h.published = n

@@ -646,7 +646,7 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	pool := w.nodes[M_POOL]
 	for note in mw.pool_inbox {
 		context = instance_context(&pool.inst)
-		if _, jerr := eng.space_join_enrollment(&pool.e, note.space, note.proof); jerr != .None {
+		if _, jerr := eng.space_join_enrollment(&pool.e, note.space, note.proof, "", "relay", w.relay.public); jerr != .None {
 			_fail(w, "pool join: %v", jerr)
 		}
 		eng.space_open(&pool.e, note.space)
