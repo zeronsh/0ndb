@@ -161,8 +161,8 @@ The idle and streaming figures come from `bindings/rust/ondb/examples/bench.rs`
   another device before its start reaches this one arrives as `assigned`
   then `idle`, with `last_runner` naming the device that ran it. This
   happens whenever a turn is shorter than the trip between devices. Show
-  the runner from `runner` while `running` and
-  from `last_runner` once `idle`.
+  the runner from `runner` while `running` and from `last_runner` once
+  `idle`.
 - Folders and repositories: `mount.add(object, root)` keeps a folder synced as
   a tree; `mount` attaches a tree to a conversation so its runs edit it;
   `tree.find(path)` maps a path to its tree; `tree.write(path, text)` creates
