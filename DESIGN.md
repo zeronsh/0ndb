@@ -496,7 +496,18 @@ equal in both directions.
   generation and log end it was saved against; on open a longer shadow is
   truncated back to that end, so shadow and synced frontier are always one
   saved state and a crash between the shadow flush and the state save is
-  undone.
+  undone. Attributions follow the same checkpoint-plus-log rule: each
+  observed write is appended to `attrib.log` before the write proceeds, an
+  image carries a snapshot of the attribution map (which entries a pass
+  consumed or pruned) and the log offset it covers, and the mount state saves
+  that snapshot rather than the live map. The log is truncated, and its
+  generation bumped, only when the saved image covers every live entry (a
+  scope whose close fails syncs the log after appending its pending
+  attributions, so they survive a power loss); on
+  open the records past the image's offset are replayed over it. A crash
+  that loses a history commit therefore reopens with the attributions that
+  commit consumed still pending, and the re-detected change is credited to
+  its writer, not to the device.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,

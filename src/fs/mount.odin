@@ -308,6 +308,7 @@ Mount :: struct {
 	log_fd:      prim.Fd,
 	log_len:     i64,
 	log_gen:     u64,
+	log_at:      i64,
 	saved:       u64,
 	state_seq:   u64,
 	legacy:      bool,
@@ -943,11 +944,13 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		if !prim.reader_ok(&rd) {
 			break
 		}
-		attrib_set(m, path, actor, false, o)
+		if i64(pos) >= m.log_at {
+			attrib_set(m, path, actor, false, o)
+		}
 		pos += 8 + n
 	}
 	m.log_len = i64(pos)
-	m.window = pos > 0
+	m.window = i64(pos) > m.log_at
 	return .None
 }
 
@@ -975,6 +978,20 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 		from_prim(prim.datasync(m.vfs, m.log_fd)) or_return
 	}
 	return .None
+}
+
+@(private)
+attrib_covered :: proc(m: ^Mount, img: ^Mount_Image) -> bool {
+	if len(img.attrib) != len(m.attrib) {
+		return false
+	}
+	for k, a in m.attrib {
+		b, ok := img.attrib[k]
+		if !ok || b != a {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -1255,7 +1272,11 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 			for k, v in sm.dirty {
 				if v == s {
 					attrib_set(sm, k, s.actor)
+					attrib_log_append(sm, k, s.actor)
 				}
+			}
+			if sm.log_fd >= 0 && sm.log_len > 0 {
+				prim.datasync(sm.vfs, sm.log_fd)
 			}
 			save_mount_state(sm)
 		} else {
@@ -1405,6 +1426,9 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	if prim.reader_remaining(&rd) > 0 {
 		m.adopt_pending = prim.read_bool(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		m.log_at = prim.read_ivarint(&rd)
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1459,6 +1483,8 @@ Mount_Image :: struct {
 	stamp:      Index_Stamp,
 	imported:   bool,
 	adopt_pending: bool,
+	attrib:     map[string]Attrib,
+	log_at:     i64,
 }
 
 Mount_Wait :: struct {
@@ -1478,6 +1504,12 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	img.imported = m.imported
 	img.adopt_pending = m.adopt_pending
 	img.jpos = m.jpend
+	img.attrib = make(map[string]Attrib, m.allocator)
+	for k, a in m.attrib {
+		key, _ := clone_string(k, m.allocator)
+		img.attrib[key] = a
+	}
+	img.log_at = m.log_len
 }
 
 @(private)
@@ -1485,6 +1517,10 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 	delete(img.synced)
 	delete(img.branch, m.allocator)
 	delete(img.commit, m.allocator)
+	for k in img.attrib {
+		delete(k, m.allocator)
+	}
+	delete(img.attrib)
 	img^ = {}
 }
 
@@ -1627,9 +1663,12 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		prim.write_uvarint(&w, it.n)
 	}
 	prim.write_bool(&w, img.imported)
-	prim.write_uvarint(&w, u64(len(m.attrib)))
-	for k in sorted_strings(m.attrib) {
-		a := m.attrib[k]
+	live := m.log_fd < 0
+	attrib := m.attrib if live else img.attrib
+	covered := live || attrib_covered(m, img)
+	prim.write_uvarint(&w, u64(len(attrib)))
+	for k in sorted_strings(attrib) {
+		a := attrib[k]
 		prim.write_str(&w, k)
 		prim.write_id(&w, a.actor)
 		prim.write_bool(&w, a.used)
@@ -1642,7 +1681,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_bool(&w, m.lost)
 	prim.write_id(&w, m.nonce)
 	prim.write_ivarint(&w, m.jpos)
-	gen := m.log_gen + 1 if m.log_len > 0 else m.log_gen
+	gen := m.log_gen + 1 if covered && m.log_len > 0 else m.log_gen
 	prim.write_uvarint(&w, gen)
 	prim.write_uvarint(&w, u64(len(m.absent)))
 	for a in m.absent {
@@ -1654,16 +1693,19 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_uvarint(&w, m.shadow_mark.gen)
 	prim.write_uvarint(&w, m.shadow_mark.end)
 	prim.write_bool(&w, img.adopt_pending)
+	prim.write_ivarint(&w, 0 if covered else img.log_at)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
-		attrib_log_reset(m)
 		return .None
 	}
 	m.saved = 0
 	state_write(m, buf[:]) or_return
 	m.saved = sum
 	m.log_gen = gen
-	attrib_log_reset(m)
+	if covered {
+		attrib_log_reset(m)
+		img.log_at = 0
+	}
 	if shadow_attached(&m.shadow) && !shadow_dirty(&m.shadow) && shadow_wants_compact(&m.shadow) {
 		shadow_compact(&m.shadow) or_return
 		return save_mount_state(m)
