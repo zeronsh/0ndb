@@ -627,7 +627,11 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	b: Builder
 	builder_init(&b, h, actor)
 	shadow_txn_begin(&m.shadow)
-	err = emit_text_edits(m, &b, inode, c.path, old, data)
+	err = copy_begin(m, c, data)
+	if err == .None {
+		err = emit_text_edits(m, &b, inode, c.path, old, data)
+	}
+	m.copy = nil
 	ne := c.old if c.kind == .Modify && c.old.inode == inode else Entry{inode = inode, kind = .File}
 	ne.stat = c.stat
 	ne.oid = oid
