@@ -226,7 +226,11 @@ _reg_reopen :: proc(e: ^Engine) -> Error {
 @(private)
 _store_err :: proc(e: ^Engine, err: Error) -> bool {
 	if err == .Io || err == .No_Space {
-		_fatal(e, err)
+		if e.pk_open && e.pk.poisoned || e.reg.open && omap.db_poisoned(&e.reg.db) {
+			_fatal(e, err)
+		} else {
+			_storage_short(e, err, "a write could not be stored: the disk is full or failing; it is retried")
+		}
 		return true
 	}
 	return false
@@ -701,7 +705,10 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		_fatal(e, err)
 	} else {
 		e.durable_seq = max(e.durable_seq, b.seq)
-		e.storage_short = .None
+		if e.storage_short != .None {
+			e.storage_short = .None
+			_catalog_unpark(e)
+		}
 		if e.fatal == .None {
 			for _, h in e.handles {
 				_table_publish(e, h)
