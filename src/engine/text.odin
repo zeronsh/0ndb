@@ -576,6 +576,9 @@ _hist_want :: proc(h: ^Handle, s: ^Seg, off: i64) {
 			to = off + journal.record_size(int(min(prim.get_u32le(b[:]), journal.MAX_BODY)))
 		}
 	}
+	if journal.replica_covers(s.rep, off, to) {
+		return
+	}
 	r := [1]journal.Range{{off, to}}
 	if osync.replicator_want(&sp.repl, &h.scope, s.device, h.name, 0, r[:]) == .None {
 		h.e.stats.fetches += 1
