@@ -154,7 +154,7 @@ shadow_attach :: proc(s: ^Shadow) -> Error {
 }
 
 shadow_detach :: proc(s: ^Shadow) {
-	if s.idx_fd >= 0 && len(s.pending) == 0 && s.log_fd >= 0 {
+	if s.idx_fd >= 0 && !s.idx_lost && len(s.pending) == 0 && s.log_fd >= 0 {
 		if s.covered == s.log_end || checkpoint(s) == .None {
 			write_header(s, true)
 		}
@@ -1160,7 +1160,11 @@ open_gen :: proc(s: ^Shadow) -> Error {
 		s.idx_fd = ifd
 		clean, valid := load_header(s)
 		if valid {
-			return recover_tail(s, clean)
+			if rerr := recover_tail(s, clean); rerr != .None {
+				s.idx_lost = true
+				return rerr
+			}
+			return .None
 		}
 		prim.close_file(s.vfs, ifd)
 		s.idx_fd = prim.INVALID_FD
