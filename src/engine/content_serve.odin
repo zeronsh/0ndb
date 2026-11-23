@@ -353,6 +353,22 @@ _serve_scrubbed :: proc(data: rawptr, targets: []odb.Oid) {
 	_serve_drop_oids(e, targets)
 }
 
+serve_withdraw :: proc(e: ^Engine, oids: []odb.Oid) {
+	context = context_for(e)
+	_serve_drop_oids(e, oids)
+}
+
+serve_publish :: proc(e: ^Engine, o: Object, rows: []Serve_Row) -> Error {
+	context = context_for(e)
+	h := _handle_get(e, o, .File_Tree) or_return
+	refs := make([dynamic]fs.Content_Ref, context.temp_allocator)
+	for r in rows {
+		append(&refs, fs.Content_Ref{oid = r.oid, len = r.n})
+	}
+	_serve_register(e, h, refs[:])
+	return .None
+}
+
 Serve_Row :: struct {
 	space: prim.Id,
 	oid:   odb.Oid,
