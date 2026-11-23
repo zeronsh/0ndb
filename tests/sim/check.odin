@@ -1702,3 +1702,134 @@ _check_stats :: proc "contextless" () {
 	STAT_FRESH_POLLS = register_stat(60, 0, "fresh_polls")
 	STAT_FRESH_PROBED = register_stat(60, 1, "fresh_probed")
 }
+
+check_own_redactions :: proc(w: ^World, n: ^Node) {
+	rn := &w.relay
+	if !rn.alive || !rn.r_on || !n.alive || !n.e_open {
+		return
+	}
+	m := &w.model
+	for _, oi in m.objs {
+		if !obj_exists(m, oi) {
+			continue
+		}
+		ob := &m.objs[oi]
+		si := space_index(m, ob.o.space)
+		if si < 0 || !space_member(&m.spaces[si], n.idx) {
+			continue
+		}
+		scope: osync.Scope
+		{
+			context = instance_context(&n.inst)
+			key, kerr := eng.object_key(&n.e, ob.o)
+			info, _ := eng.space_info(&n.e, ob.o.space)
+			node_after(n)
+			if kerr != .None {
+				continue
+			}
+			scope = osync.scope_make(key, info.mode)
+		}
+		name := make([]u8, 1 + prim.ID_HEX_LEN, context.temp_allocator)
+		name[0] = _kind_prefix(ob.kind)
+		hx := prim.id_hex(ob.o.id)
+		copy(name[1:], hx[:])
+		sid := osync.stream_id(&scope, n.identity.id, string(name), 0)
+		ranges: [][2]i64
+		{
+			context = instance_context(&rn.inst)
+			ranges = slice.clone(osync.relay_core_redacted(&rn.r, osync.Space_Id(ob.o.space), sid), w.allocator)
+		}
+		defer delete(ranges, w.allocator)
+		if len(ranges) == 0 {
+			continue
+		}
+		recs := make(map[Rec_Key]Rec_State, context.temp_allocator)
+		_node_records(w, n, ob, &recs)
+		for k, st in recs {
+			if k.device != n.identity.id || st != .Live {
+				continue
+			}
+			for x in ranges {
+				if k.off >= x[0] && k.off < x[1] {
+					world_fail(w, "device redaction: %s holds live record %d of its own %v %s inside a redaction the relay recorded", n.name, k.off, ob.kind, id_short(ob.o.id))
+				}
+			}
+		}
+	}
+}
+
+check_learned_redactions :: proc(w: ^World, n: ^Node) {
+	if !n.alive || !n.e_open || len(n.learned) == 0 {
+		return
+	}
+	m := &w.model
+	for _, oi in m.objs {
+		if !obj_exists(m, oi) {
+			continue
+		}
+		ob := &m.objs[oi]
+		mine := false
+		for l in n.learned {
+			mine ||= l.object == ob.o.id
+		}
+		if !mine {
+			continue
+		}
+		recs := make(map[Rec_Key]Rec_State, context.temp_allocator)
+		_node_records(w, n, ob, &recs)
+		for k, st in recs {
+			if st != .Live {
+				continue
+			}
+			for l in n.learned {
+				if l.object == ob.o.id && l.device == k.device && k.off >= l.from && k.off < l.to {
+					world_fail(w, "device redaction: %s holds live record %s@%d of %v %s after learning of its redaction", n.name, id_short(k.device), k.off, ob.kind, id_short(ob.o.id))
+				}
+			}
+		}
+	}
+}
+
+check_learned_final :: proc(w: ^World) {
+	for n in w.nodes {
+		check_learned_redactions(w, n)
+	}
+}
+
+STAT_LEARNED: Stat
+
+@(init)
+_own_redaction_hooks :: proc "contextless" () {
+	register_stat_line(47)
+	STAT_LEARNED = register_stat(47, 0, "redactions_learned")
+	register_restarted(70, check_own_redactions, false)
+	register_restarted(71, check_learned_redactions, false)
+	register_final_check(51, check_learned_final)
+}
+
+learned_stream :: proc(w: ^World, n: ^Node, space: prim.Id, object: prim.Id, writer: prim.Id) -> (sid: osync.Stream_Id, ok: bool) {
+	m := &w.model
+	kind: M_Kind
+	found := false
+	for &ob in m.objs {
+		if ob.o.id == object {
+			kind = ob.kind
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	key, kerr := eng.object_key(&n.e, eng.Object{space, object})
+	if kerr != .None {
+		return
+	}
+	info, _ := eng.space_info(&n.e, space)
+	scope := osync.scope_make(key, info.mode)
+	name := make([]u8, 1 + prim.ID_HEX_LEN, context.temp_allocator)
+	name[0] = _kind_prefix(kind)
+	hx := prim.id_hex(object)
+	copy(name[1:], hx[:])
+	return osync.stream_id(&scope, osync.Device_Id(writer), string(name), 0), true
+}

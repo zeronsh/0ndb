@@ -73,6 +73,8 @@ Node :: struct {
 	connects:    int,
 	connect_fault: Connect_Fault,
 	persist_fail: int,
+	redact_faulted: bool,
+	learn_check:    bool,
 	unavailable: int,
 	incarnation: int,
 	inst:        Instance,
@@ -95,6 +97,8 @@ Node :: struct {
 	probed:      bool,
 	sent:        map[string]i64,
 	boot:        u64,
+	learned:     [dynamic]Learned_Redaction,
+	held:        [dynamic]Learned_Redaction,
 	observed:    int,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
@@ -106,6 +110,8 @@ Node :: struct {
 }
 
 Relay_Node :: struct {
+	fills_seen: u64,
+	red_check: bool,
 	w:      ^World,
 	disk:   Disk,
 	clock:  Node_Clock,
@@ -181,6 +187,7 @@ Config :: struct {
 	durability:  eng.Durability,
 	promote:     i64,
 	persist_fault: bool,
+	redact_fault:  bool,
 }
 
 World :: struct {
@@ -413,6 +420,8 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.attaches = make(map[prim.Id]int, w.allocator)
 		n.mounts = make([dynamic]Sim_Mount, w.allocator)
 		n.writers = make(map[string]Writer_Info, w.allocator)
+		n.learned = make([dynamic]Learned_Redaction, w.allocator)
+		n.held = make([dynamic]Learned_Redaction, w.allocator)
 		append(&w.nodes, n)
 	}
 	run_world_init(w)
@@ -427,6 +436,7 @@ world_destroy :: proc(w: ^World) {
 		node_mounts_drop(w, n)
 		delete(n.mounts)
 		delete(n.writers)
+		delete(n.learned)
 		for k in n.sent {
 			delete(k, w.allocator)
 		}
@@ -490,4 +500,14 @@ loop_deadline :: proc(l: ^prim.Loop) -> (at: i64, ok: bool) {
 
 loop_armed :: proc(l: ^prim.Loop) -> int {
 	return len(l.heap)
+}
+
+Learned_Redaction :: struct {
+	object: prim.Id,
+	device: prim.Id,
+	from:   i64,
+	to:     i64,
+	seq:    u64,
+	stream: osync.Stream_Id,
+	known:  bool,
 }

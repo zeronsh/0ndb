@@ -80,6 +80,7 @@ node_start :: proc(n: ^Node) -> bool {
 	}}
 	cfg.watcher = sim_watcher(n)
 	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail}
+	cfg.redact_fault = eng.Redact_Fault{data = n, withhold = _redact_withhold, learned = _redact_learned}
 	cfg.embedder = sim_embedder()
 	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
 		return {}
@@ -221,6 +222,7 @@ node_crashed :: proc(n: ^Node) {
 	if mode == .Power {
 		n.boot += 1
 	}
+	_learned_drop(n)
 	world_note(w, "%s crashed at disk op %d (%v)", n.name, n.disk.stats.ops, mode)
 	w.stats.crashes += 1
 	promos_crashed(w, n)
@@ -238,6 +240,7 @@ node_crash_now :: proc(n: ^Node, mode: Crash_Mode, salt: u64) {
 	if mode == .Power {
 		n.boot += 1
 	}
+	_learned_drop(n)
 	world_note(w, "%s crashed right after returning a message id (%v)", n.name, mode)
 	w.stats.crashes += 1
 	promos_crashed(w, n)
@@ -400,6 +403,15 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	}
 	#partial switch ev.kind {
 	case .Durable:
+	case .Replica_Redacted:
+		sid, known := learned_stream(w, n, ev.space, ev.object, ev.device)
+		append(&n.learned, Learned_Redaction{object = ev.object, device = ev.device, from = i64(ev.tick), to = ev.length, seq = eng.pending_seq(e), stream = sid, known = known})
+		stat_add(w, STAT_LEARNED)
+		if !n.learn_check {
+			n.learn_check = true
+			schedule(w, Sim_Event{at = w.now, kind = EV_LEARN_CHECK, node = n.idx})
+		}
+		world_note(w, "%s learned redaction of %s@[%d,%d) in %s", n.name, id_short(ev.device), i64(ev.tick), ev.length, id_short(ev.object))
 	case .Quarantined:
 		append(&w.quarantines, Quarantine{node = n.idx, object = ev.object})
 		if w.cfg.byzantine {
@@ -542,6 +554,8 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 		cc.clock = node_clock(&rn.clock)
 		cc.wake = _relay_wake
 		cc.wake_data = rn
+		cc.on_redacted_in = _relay_redacted_in
+		cc.redacted_in_data = rn
 		err = osync.relay_core_init(&rn.r, cc)
 	}
 	if err == .None {
@@ -559,6 +573,8 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	}
 	rn.r_on = true
 	world_note(w, "relay up")
+	rn.red_check = true
+	rn.fills_seen = 0
 	return true
 }
 
@@ -588,6 +604,8 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.alive = false
 	rn.r_on = false
 	instance_kill(&rn.inst)
+	stat_add(rn.w, STAT_RELAY_REDACTED_IN, rn.r.stats.redacted_in)
+	stat_add(rn.w, STAT_RELAY_REFUSED_IN, rn.r.stats.refused_in)
 	rn.r = {}
 	rn.fs = {}
 	rn.pk = {}
@@ -635,6 +653,17 @@ relay_crashed :: proc(rn: ^Relay_Node) {
 }
 
 relay_after :: proc(rn: ^Relay_Node) {
+	if rn.alive && rn.r_on && (rn.r.stats.fills != rn.fills_seen || rn.red_check) {
+		rn.fills_seen = rn.r.stats.fills
+		rn.red_check = false
+		context = instance_context(&rn.inst)
+		bad := make([dynamic]osync.Redaction_Violation, context.temp_allocator)
+		osync.relay_core_redactions_held(&rn.r, &bad)
+		for v in bad {
+			sid := v.stream
+			world_fail(rn.w, "relay redaction: relay stores record %x@%d inside a recorded redaction without its redacted form", sid[:4], v.off)
+		}
+	}
 	if rn.alive {
 		free_all(region_allocator(&rn.inst.temp))
 	}
@@ -712,10 +741,40 @@ check_derived :: proc(n: ^Node, at: string) {
 STAT_TIER_EVICTIONS: Stat
 STAT_TIER_COLD_READS: Stat
 STAT_TIER_THAWS: Stat
+STAT_RELAY_REDACTED_IN: Stat
+STAT_RELAY_REFUSED_IN: Stat
 STAT_TIER_PARKS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
 STAT_PERSIST_FAULTS: Stat
+STAT_REDACT_FAULTS: Stat
+EV_LEARN_CHECK: Ev_Kind
+
+_redact_learned :: proc(data: rawptr, space, object, device: prim.Id, from, to: i64, applied, pending: bool) {
+	n := (^Node)(data)
+	if applied && pending {
+		world_fail(n.w, "device redaction: %s reported a redaction learned while it is only queued, its bytes still live in the replica", n.name)
+	}
+	if !applied && pending {
+		sid, known := learned_stream(n.w, n, space, object, device)
+		append(&n.held, Learned_Redaction{object = object, device = device, from = from, to = to, stream = sid, known = known})
+	}
+}
+
+_redact_withhold :: proc(data: rawptr) -> bool {
+	n := (^Node)(data)
+	w := n.w
+	if !w.cfg.redact_fault || n.disk.dead || n.redact_faulted || !rng_chance(&w.fault_rng, 1, 2) {
+		return false
+	}
+	n.redact_faulted = true
+	if n.disk.crash_at == 0 {
+		n.disk.crash_at = n.disk.stats.ops + 1 + u64(rng_range(&w.fault_rng, 0, 200))
+	}
+	stat_add(w, STAT_REDACT_FAULTS)
+	world_note(w, "%s keys withheld while applying a learned redaction; crash armed at disk op %d", n.name, n.disk.crash_at)
+	return true
+}
 STAT_GHOST_TAILS: Stat
 
 _persist_fail :: proc(data: rawptr) -> bool {
@@ -741,6 +800,8 @@ _node_stats :: proc "contextless" () {
 		res.stats.extra[int(STAT_TIER_EVICTIONS)] += w.relay.ts.evictions
 		res.stats.extra[int(STAT_TIER_COLD_READS)] += w.relay.ts.cold_reads
 		res.stats.extra[int(STAT_TIER_THAWS)] += w.relay.ts.thaws
+		res.stats.extra[int(STAT_RELAY_REDACTED_IN)] += w.relay.r.stats.redacted_in
+		res.stats.extra[int(STAT_RELAY_REFUSED_IN)] += w.relay.r.stats.refused_in
 		res.stats.extra[int(STAT_TIER_PARKS)] += w.relay.ts.parks
 		res.stats.extra[int(STAT_TIER_SLOW_READS)] += w.relay.slow.reads
 		res.stats.extra[int(STAT_TIER_FAILED_READS)] += w.relay.slow.failed
@@ -751,9 +812,20 @@ _node_stats :: proc "contextless" () {
 	register_stat_line(40)
 	register_stat_line(45)
 	STAT_PERSIST_FAULTS = register_stat(45, 0, "history_persist_faults")
+	STAT_REDACT_FAULTS = register_stat(45, 2, "redact_key_faults")
+	EV_LEARN_CHECK = register_event(proc(w: ^World, ev: ^Sim_Event) {
+		n := w.nodes[ev.node]
+		n.learn_check = false
+		if n.alive && n.e_open && !n.disk.dead {
+			check_learned_redactions(w, n)
+		}
+	})
 	STAT_GHOST_TAILS = register_stat(45, 1, "ghost_tails")
 	STAT_TIER_EVICTIONS = register_stat(40, 0, "relay_evictions")
 	STAT_TIER_COLD_READS = register_stat(40, 1, "relay_cold_reads")
+	register_stat_line(48)
+	STAT_RELAY_REDACTED_IN = register_stat(48, 0, "relay_redacted_in")
+	STAT_RELAY_REFUSED_IN = register_stat(48, 1, "relay_refused_in")
 	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
 	STAT_TIER_SLOW_READS = register_stat(40, 3, "object_reads")
 	STAT_TIER_FAILED_READS = register_stat(40, 4, "object_read_faults")
@@ -761,4 +833,40 @@ _node_stats :: proc "contextless" () {
 	register_stat_line(45)
 	STAT_OWN_TAMPER = register_stat(45, 0, "own_tamper_caught")
 	STAT_LENGTH_LIES = register_stat(45, 1, "length_lies")
+}
+
+@(private = "file")
+_learned_drop :: proc(n: ^Node) {
+	k := 0
+	for l in n.learned {
+		if l.seq <= n.durable {
+			n.learned[k] = l
+			k += 1
+		}
+	}
+	resize(&n.learned, k)
+	clear(&n.held)
+}
+
+@(private = "file")
+_relay_redacted_in :: proc(data: rawptr, sender: osync.Device_Id, space: osync.Space_Id, id: osync.Stream_Id, from, to: i64) {
+	rn := (^Relay_Node)(data)
+	w := rn.w
+	for n in w.nodes {
+		if n.identity.id != prim.Id(sender) {
+			continue
+		}
+		for l in n.learned {
+			if l.known && l.stream == id && l.from < to && l.to > from {
+				sid := id
+				world_fail(w, "device redaction: %s sent bytes of %x [%d,%d) to the relay after learning of its redaction", n.name, sid[:4], from, to)
+			}
+		}
+		for l in n.held {
+			if l.known && l.stream == id && l.from < to && l.to > from {
+				sid := id
+				world_fail(w, "device redaction: %s sent bytes of %x [%d,%d) to the relay while their redaction was queued", n.name, sid[:4], from, to)
+			}
+		}
+	}
 }

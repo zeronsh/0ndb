@@ -143,6 +143,7 @@ Event_Kind :: enum u8 {
 	Lease_Lapsed,
 	Space_Left,
 	Line_Switched,
+	Replica_Redacted,
 }
 
 Event :: struct {
@@ -159,6 +160,12 @@ Event :: struct {
 Event_Hook :: struct {
 	data:  rawptr,
 	event: proc(data: rawptr, e: ^Engine, ev: ^Event),
+}
+
+Redact_Fault :: struct {
+	data:     rawptr,
+	withhold: proc(data: rawptr) -> bool,
+	learned:  proc(data: rawptr, space, object, device: prim.Id, from, to: i64, applied, pending: bool),
 }
 
 Config :: struct {
@@ -214,6 +221,7 @@ Config :: struct {
 	always_on:       bool,
 	holder_budget:   i64,
 	history_fault:   fs.Persist_Fault,
+	redact_fault:    Redact_Fault,
 	user:            rawptr,
 }
 
