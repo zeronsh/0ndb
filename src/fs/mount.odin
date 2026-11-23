@@ -90,6 +90,7 @@ Registry :: struct {
 	on_base:   Base_Proc,
 	base_data: rawptr,
 	exec:      Sync_Exec,
+	spawner:   Spawner,
 	on_line:   Line_Proc,
 	on_lock:   Git_Lock_Proc,
 	hook_data: rawptr,
@@ -106,7 +107,7 @@ registry_set_line_hooks :: proc(reg: ^Registry, on_line: Line_Proc, on_lock: Git
 
 mount_line :: proc(m: ^Mount) -> string {
 	if len(m.branch) > 0 {
-		return m.branch
+		return line_key_of(m, m.branch, context.temp_allocator)
 	}
 	return m.line
 }
@@ -137,6 +138,22 @@ Log_Sync :: struct {
 	waits:     [dynamic]Obs_Wait,
 	detached:  bool,
 	allocator: runtime.Allocator,
+}
+
+line_key_of :: proc(m: ^Mount, line: string, allocator := context.allocator) -> string {
+	if m.has_git && line == m.home_line && len(m.home) > 0 {
+		out, _ := strings.concatenate({"git:", m.home}, allocator)
+		return out
+	}
+	return line
+}
+
+@(private)
+line_name_of :: proc(m: ^Mount, key: string) -> string {
+	if m.has_git && len(m.home) > 0 && len(key) == 4 + len(m.home) && key[:4] == "git:" && key[4:] == m.home {
+		return m.home_line
+	}
+	return key
 }
 
 @(private)
@@ -416,6 +433,11 @@ Mount :: struct {
 	home:        string,
 	home_line:   string,
 	lock_held:   bool,
+	switch_to:   string,
+	switch_from: string,
+	switch_phase: u8,
+	switch_done: Switch_Done,
+	switch_data: rawptr,
 	link_mode:   Link_Mode,
 	gitlinks:    []Gitlink,
 }
@@ -566,7 +588,12 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		if len(m.branch) == 0 {
 			m.branch, _ = clone_string(branch_key(m, m.head, context.temp_allocator), allocator)
 		}
-		if m.opts.follow_branch && m.line == m.home_line && m.branch != m.home_line {
+		if len(m.switch_to) > 0 {
+			if m.switch_phase >= SWITCH_TARGET {
+				delete(m.line, allocator)
+				m.line, _ = clone_string(m.switch_to, allocator)
+			}
+		} else if m.opts.follow_branch && m.line == m.home_line && m.branch != m.home_line {
 			delete(m.line, allocator)
 			m.line, _ = clone_string(m.branch, allocator)
 		}
@@ -614,6 +641,9 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		mount_schedule(m, 0)
 	}
 	ok = true
+	if len(m.switch_to) > 0 {
+		mount_schedule(m, 0)
+	}
 	mount_touch(m)
 	return .None
 }
@@ -813,6 +843,8 @@ mount_close :: proc(m: ^Mount) {
 	delete(m.branch, m.allocator)
 	delete(m.home, m.allocator)
 	delete(m.home_line, m.allocator)
+	delete(m.switch_to, m.allocator)
+	delete(m.switch_from, m.allocator)
 	m^ = {}
 	history_release(held)
 }
@@ -1289,7 +1321,7 @@ RELOAD_RETRY_MAX_MS :: 30_000
 
 @(private)
 mount_reload_retry :: proc(m: ^Mount) {
-	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed {
+	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && len(m.switch_to) == 0 {
 		return
 	}
 	m.reload_ms = max(m.opts.settle_ms, 1) if m.reload_ms == 0 else min(m.reload_ms * 2, RELOAD_RETRY_MAX_MS)
@@ -1330,6 +1362,9 @@ mount_run :: proc(m: ^Mount) -> Error {
 	err := mount_pass(m, false, !fence)
 	if err == .None {
 		err = mount_materialize(m)
+	}
+	if err == .None && len(m.switch_to) > 0 {
+		mount_switch_step(m)
 	}
 	if err == .Reloading {
 		mount_reload_retry(m)
@@ -1686,6 +1721,17 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			m.branch, _ = clone_string(branch_s, m.allocator)
 		}
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		to_s := prim.read_str(&rd)
+		from_s := prim.read_str(&rd)
+		if prim.reader_ok(&rd) {
+			m.switch_to, _ = clone_string(to_s, m.allocator)
+			m.switch_from, _ = clone_string(from_s, m.allocator)
+		}
+		if prim.reader_remaining(&rd) > 0 {
+			m.switch_phase = prim.read_u8(&rd)
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -1957,6 +2003,9 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	}
 	prim.write_str(&w, m.home)
 	prim.write_str(&w, m.branch)
+	prim.write_str(&w, m.switch_to)
+	prim.write_str(&w, m.switch_from)
+	prim.write_u8(&w, m.switch_phase)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None

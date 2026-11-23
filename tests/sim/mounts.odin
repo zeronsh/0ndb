@@ -133,6 +133,7 @@ node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string) -> eng.Error {
 		}
 		n.reg = reg
 		fs.registry_set_base_note(reg, _on_base, n)
+		fs.registry_set_spawner(reg, sim_git_spawner(n))
 	}
 	if err := prim.mkdir_all(disk_vfs(&n.disk), root, 0o755); err != .None {
 		return .Io
@@ -517,7 +518,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	}
 	op := new_op(m, .Disk_Agent if agent else .Disk_Person, n, sm.oi)
 	op.path = strings.clone(name, w.allocator)
-	op.line = strings.clone(git_head_line(vfs, sm.root), w.allocator)
+	op.line = strings.clone(mount_model_line(sm.m, vfs, sm.root), w.allocator)
 	overwrite := len(old) == 0 || rng_chance(&w.rng, 1, 3)
 	op.overwrite = overwrite && len(old) > 0
 	b := strings.builder_make(context.temp_allocator)
@@ -886,6 +887,120 @@ _mounts_stats :: proc "contextless" () {
 	STAT_GIT_REFUSED = register_stat(65, 1, "refused")
 	register_stat_line(65, "git")
 	register_op(200, "git_switch", _git_switch_weight, op_git_switch)
+	register_op(210, "line_switch", _git_switch_weight, op_line_switch)
+	STAT_LINE_SWITCHES = register_stat(65, 2, "line_switches")
+}
+
+STAT_LINE_SWITCHES: Stat
+
+@(private = "file")
+_end_held_agents :: proc(w: ^World, n: ^Node, root: string) {
+	for i := len(n.agent_pending) - 1; i >= 0; i -= 1 {
+		pa := n.agent_pending[i]
+		if pa.root != root || pa.inc != n.incarnation {
+			continue
+		}
+		fs.scope_close(n.reg, pa.scope)
+		_forget_scope(w, n, pa.scope)
+		world_note(w, "%s agent(actor %s) on %s is held for the branch switch; its scope ends", n.name, id_short(pa.actor), root)
+		ordered_remove(&n.agent_pending, i)
+		agent_pending_free(w, pa)
+	}
+}
+
+op_line_switch :: proc(w: ^World, n: ^Node) {
+	if !n.alive || !n.e_open {
+		return
+	}
+	cands := make([dynamic]int, context.temp_allocator)
+	for sm, i in n.mounts {
+		if sm.m != nil && sm.m.has_git {
+			append(&cands, i)
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	sm := n.mounts[cands[rng_int(&w.rng, len(cands))]]
+	vfs := disk_vfs(&n.disk)
+	existing := git_branches_other(vfs, sm.root)
+	if n.disk.dead {
+		context = instance_context(&n.inst)
+		node_after(n)
+		return
+	}
+	if len(existing) == 0 {
+		return
+	}
+	branch := existing[rng_int(&w.rng, len(existing))]
+	key := "" if branch == "main" else strings.concatenate({"git:refs/heads/", branch}, context.temp_allocator)
+	known := key == ""
+	for l in w.model.objs[sm.oi].lines {
+		known ||= l == key
+	}
+	files: map[string][]u8
+	if !known {
+		fok: bool
+		n.disk.probe += 1
+		files, fok = git_branch_files(n, vfs, sm.root, branch)
+		n.disk.probe -= 1
+		if !fok {
+			return
+		}
+	}
+	context = instance_context(&n.inst)
+	_end_held_agents(w, n, sm.root)
+	from := mount_model_line(sm.m, vfs, sm.root)
+	base := make(map[string][]u8, context.temp_allocator)
+	if !known {
+		for p in TREE_PATHS {
+			if d, terr := eng.tree_read(&n.e, w.model.objs[sm.oi].o, p, context.temp_allocator, {}, line_eng(from)); terr == .None {
+				base[p] = d
+			}
+		}
+	}
+	err := fs.mount_line_switch(sm.m, line_eng(key))
+	world_note(w, "%s 0ndb switch %s to %s -> %v", n.name, sm.root, branch, err)
+	if err == .None {
+		if !known {
+			_line_import_ops(w, n, sm.oi, key, files, base)
+		}
+		obj_add_line(&w.model, sm.oi, key)
+		stat_add(w, STAT_LINE_SWITCHES)
+	} else if !n.disk.dead && !(w.cfg.io_rate > 0 && (err == .Io || err == .No_Space)) && err != .Busy {
+		world_fail(w, "%s 0ndb switch to %s failed: %v", n.name, branch, err)
+	} else if !n.disk.dead && w.cfg.io_rate > 0 {
+		n.restart_pending = true
+	}
+	node_after(n)
+}
+
+@(private = "file")
+_line_import_ops :: proc(w: ^World, n: ^Node, oi: int, key: string, files: map[string][]u8, base: map[string][]u8) {
+	m := &w.model
+	for p in TREE_PATHS {
+		data, has := files[p]
+		old, had := base[p]
+		if (!has && !had) || (has && had && string(data) == string(old)) {
+			continue
+		}
+		op := new_op(m, .Disk_Person if has else .Tree_Remove, n, oi)
+		op.line = strings.clone(key, w.allocator)
+		op.path = strings.clone(p, w.allocator)
+		op.overwrite = has && had
+		kept := make(map[string]bool, context.temp_allocator)
+		for t in parse_tokens(data) {
+			kept[t.text] = true
+			append(&op.tokens, strings.clone(t.text, w.allocator))
+		}
+		for t in parse_tokens(old) {
+			if !kept[t.text] {
+				kept[t.text] = true
+				append(&op.deletes, strings.clone(t.text, w.allocator))
+			}
+		}
+		op.status = .Uncertain
+	}
 }
 
 STAT_GIT_CHECKOUTS: Stat
@@ -911,6 +1026,9 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	sm := n.mounts[cands[rng_int(r, len(cands))]]
+	if _, pending := fs.mount_switch_pending(sm.m); pending {
+		return
+	}
 	m := &w.model
 	vfs := disk_vfs(&n.disk)
 	git := strings.concatenate({sm.root, "/.git"}, context.temp_allocator)
@@ -988,17 +1106,7 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 	base := make(map[string][]u8, context.temp_allocator)
 	{
 		context = instance_context(&n.inst)
-		for i := len(n.agent_pending) - 1; i >= 0; i -= 1 {
-			pa := n.agent_pending[i]
-			if pa.root != sm.root || pa.inc != n.incarnation {
-				continue
-			}
-			fs.scope_close(n.reg, pa.scope)
-			_forget_scope(w, n, pa.scope)
-			world_note(w, "%s agent(actor %s) on %s is held for the branch switch; its scope ends", n.name, id_short(pa.actor), sm.root)
-			ordered_remove(&n.agent_pending, i)
-			agent_pending_free(w, pa)
-		}
+		_end_held_agents(w, n, sm.root)
 		fs.mount_sync(sm.m)
 		for p in paths {
 			if d, derr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator); derr == .None {
@@ -1114,4 +1222,11 @@ STAT_ATTRIB_CRASH: Stat
 _attrib_crash_stat :: proc "contextless" () {
 	register_stat_line(46)
 	STAT_ATTRIB_CRASH = register_stat(46, 0, "attrib_crash")
+}
+
+mount_model_line :: proc(m: ^fs.Mount, vfs: prim.Vfs, root: string) -> string {
+	if _, pending := fs.mount_switch_pending(m); pending {
+		return line_norm(m.line)
+	}
+	return git_head_line(vfs, root)
 }
