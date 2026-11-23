@@ -1153,10 +1153,25 @@ concurrent typing is never lost or reverted.
     survive every transform. A correction or drop remembers the op ids of
     the overlay bytes it removes; when a later client edit is transformed
     over it, the part of its deletion that falls on those bytes is kept as
-    their op ids, and once those ops reach the view (the batch arrived
-    durably after all) the buffer deletes them as its own edit. A batch
-    that never becomes durable leaves nothing to delete. The sim checks
-    every accepted buffer edit against the final text.
+    their op ids. Every gone id names an op of the overlay being removed;
+    one that does not (a durable op, a zero actor) is dropped and counted,
+    and an edit hitting one is refused with `Invalid`. The kept ids are a
+    durable intent, never buffer state: before the edit commits, one record
+    `(space, object, kind, inode op, line, actor, spans)` is appended to the
+    engine's buffer delete log (`pack/buffer-deletes`, one journal, records
+    with their own checks, a torn tail cut on open) in the same pack batch
+    as the edit, so the edit and its intent become durable together. Open
+    replays the log and marks each object changed; the tick after a change
+    to the object applies every intent whose ops the graph knows, buffer
+    open or not: a transient view at the line's target (chained on the
+    actor's latest op, read from the graph then), the still-visible bytes of
+    those ops deleted as one batch by the intent's actor, then a `Done`
+    record. The file is removed when no intent is live; replaying a file
+    whose removal did not survive leaves nothing live. A batch that never
+    becomes durable leaves nothing to delete. The sim checks every accepted
+    buffer edit against the final text, deletes over a dropped overlay
+    whose buffer closes and node crashes once the delete is durable, and
+    the log at every crash point of add, commit, done and removal.
   - *Local edits while an overlay is shown.* An edit, undo or redo is
     held (the call pends) until the overlay is gone, so a local insert is
     never parented without the remote text it was typed next to; held calls
