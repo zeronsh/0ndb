@@ -271,6 +271,7 @@ node_after :: proc(n: ^Node) {
 			model_durable(&n.w.model, n, t)
 		}
 		note_sent(n)
+		run_step(n.w, n)
 	}
 	if len(n.mounts) > 0 {
 		context = instance_context(&n.inst)

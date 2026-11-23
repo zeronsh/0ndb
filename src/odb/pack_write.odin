@@ -317,6 +317,9 @@ install_pack :: proc(db: ^Odb, pack_tmp, idx_tmp: string, checksum: Oid) -> Erro
 	b1, b2: [PATH_MAX]u8
 	pack_path := concat_into(b1[:], db.dirs[0].path, "/pack/pack-", hex, ".pack") or_return
 	idx_path := concat_into(b2[:], db.dirs[0].path, "/pack/pack-", hex, ".idx") or_return
+	if db.deferred {
+		return stage_pack(db, pack_path[:len(pack_path) - len(".pack")], pack_tmp, pack_path, idx_tmp, idx_path)
+	}
 	perr(prim.rename(db.vfs, pack_tmp, pack_path)) or_return
 	perr(prim.rename(db.vfs, idx_tmp, idx_path)) or_return
 	if db.sync_writes {

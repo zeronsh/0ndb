@@ -9,6 +9,7 @@ import "../fshist"
 import "../fstree"
 import "../journal"
 import "../odb"
+import "../pack"
 import "../prim"
 import "../textdiff"
 import osync "../sync"
@@ -358,9 +359,35 @@ device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
 		if oerr := odb.open_store(&e.db, e.base, dir, nil, .Sha1, e.allocator, e.cfg.clock, e.cfg.random); oerr != .None {
 			return nil, _derr(oerr)
 		}
+		odb.sweep_temps(&e.db)
+		e.db.deferred = true
 		e.db_open = true
 	}
 	return &e.db, .None
+}
+
+@(private)
+_odb_queue_pending :: proc(e: ^Engine) -> bool {
+	b, terr := odb.install_take(&e.db)
+	if terr != .None {
+		return false
+	}
+	if b != nil {
+		pack.queue_install(&e.pk, pack.Install_Hook{run = _odb_install_run, done = _odb_install_done, data = b})
+	}
+	return true
+}
+
+@(private)
+_odb_install_run :: proc(data: rawptr) -> (nsync: u64, err: pack.Error) {
+	b := (^odb.Install)(data)
+	ierr := odb.install_run(b)
+	return b.nsync, .None if ierr == .None else .Io
+}
+
+@(private)
+_odb_install_done :: proc(data: rawptr, ok: bool) {
+	odb.install_done((^odb.Install)(data), ok)
 }
 
 @(private)
