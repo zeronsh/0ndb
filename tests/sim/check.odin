@@ -784,7 +784,7 @@ _check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 					if a == op.actor {
 						continue
 					}
-					if op.kind == .Disk_Agent && op.power_crash && fs.is_unattributed(a) {
+					if op.kind == .Disk_Agent && op.power_crash && (fs.is_unattributed(a) || a == op.w.nodes[op.node].identity.id) {
 						own = true
 						continue
 					}
@@ -1517,7 +1517,7 @@ _side_has :: proc(spans: []crdt.Op_Span, op: ^M_Op) -> bool {
 		if s.id.actor == op.actor {
 			return true
 		}
-		if op.kind == .Disk_Agent && op.power_crash && fs.is_unattributed(s.id.actor) {
+		if op.kind == .Disk_Agent && op.power_crash && (fs.is_unattributed(s.id.actor) || s.id.actor == op.w.nodes[op.node].identity.id) {
 			return true
 		}
 	}
