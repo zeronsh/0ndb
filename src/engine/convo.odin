@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "core:slice"
 import "../convo"
 import "../obj"
@@ -24,6 +26,7 @@ Convo_Status :: struct {
 }
 
 convo_create :: proc(e: ^Engine, space: prim.Id, settings: Convo_Settings = {}, ready: Ready = {}) -> (o: Object, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_create: %v", err) }
 	context = context_for(e)
 	if ready.call != nil {
 		if sp, settling := _space_settling_id(e, space); settling {
@@ -47,6 +50,7 @@ convo_open :: proc(e: ^Engine, o: Object) -> Error {
 }
 
 convo_writer :: proc(e: ^Engine, o: Object) -> (w: ^convo.Writer, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_writer: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_create_writer(h) or_return
@@ -58,6 +62,7 @@ convo_writer :: proc(e: ^Engine, o: Object) -> (w: ^convo.Writer, err: Error) {
 }
 
 convo_view :: proc(e: ^Engine, o: Object) -> (v: ^obj.View, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_view: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -86,6 +91,7 @@ unpin :: proc(e: ^Engine, o: Object) {
 }
 
 convo_status :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (st: Convo_Status, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_status: %v", err) }
 	context = context_for(e)
 	st, err = _convo_status(e, o, ready)
 	return st, _damage_read(e, o, err, ready)
@@ -93,11 +99,13 @@ convo_status :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (st: Convo_Sta
 
 @(private)
 _convo_status :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (st: Convo_Status, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _convo_status: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
 	if terr != .None {
+		fmt.eprintfln("DBGS status %x view_tail %v", o.id[0], terr)
 		return st, _pending_result(e, h, _oerr(terr), ready)
 	}
 	serr: obj.Error
@@ -133,6 +141,7 @@ _status_of :: proc(v: ^obj.View, t: ^convo.Tail) -> (st: Convo_Status, err: obj.
 }
 
 convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32, allocator := context.allocator, ready: Ready = {}, dir := convo.Direction.Older, leaf := Rid{}) -> (p: convo.Page, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_page: %v", err) }
 	context = context_for(e)
 	p, err = _convo_page(e, o, from, limit, allocator, ready, dir, leaf)
 	return p, _damage_read(e, o, err, ready)
@@ -140,6 +149,7 @@ convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32
 
 @(private)
 _convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 32, allocator := context.allocator, ready: Ready = {}, dir := convo.Direction.Older, leaf := Rid{}) -> (p: convo.Page, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _convo_page: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -164,6 +174,7 @@ _convo_page :: proc(e: ^Engine, o: Object, from: convo.Position = {}, limit := 3
 }
 
 convo_window :: proc(e: ^Engine, o: Object, anchor: Rid, before: int, after: int, leaf := Rid{}, allocator := context.allocator, ready: Ready = {}) -> (w: convo.Window, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_window: %v", err) }
 	context = context_for(e)
 	w, err = _convo_window(e, o, anchor, before, after, leaf, allocator, ready)
 	return w, _damage_read(e, o, err, ready)
@@ -171,6 +182,7 @@ convo_window :: proc(e: ^Engine, o: Object, anchor: Rid, before: int, after: int
 
 @(private)
 _convo_window :: proc(e: ^Engine, o: Object, anchor: Rid, before: int, after: int, leaf := Rid{}, allocator := context.allocator, ready: Ready = {}) -> (w: convo.Window, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _convo_window: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -189,6 +201,7 @@ _convo_window :: proc(e: ^Engine, o: Object, anchor: Rid, before: int, after: in
 }
 
 convo_peek_switch :: proc(e: ^Engine, o: Object, sibling: Rid, before: int, after: int, allocator := context.allocator, ready: Ready = {}) -> (leaf: Rid, w: convo.Window, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_peek_switch: %v", err) }
 	context = context_for(e)
 	leaf, w, err = _convo_peek_switch(e, o, sibling, before, after, allocator, ready)
 	return leaf, w, _damage_read(e, o, err, ready)
@@ -196,6 +209,7 @@ convo_peek_switch :: proc(e: ^Engine, o: Object, sibling: Rid, before: int, afte
 
 @(private)
 _convo_peek_switch :: proc(e: ^Engine, o: Object, sibling: Rid, before: int, after: int, allocator := context.allocator, ready: Ready = {}) -> (leaf: Rid, w: convo.Window, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _convo_peek_switch: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -211,6 +225,7 @@ _convo_peek_switch :: proc(e: ^Engine, o: Object, sibling: Rid, before: int, aft
 }
 
 convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := context.allocator, ready: Ready = {}) -> (m: convo.Message, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_message: %v", err) }
 	context = context_for(e)
 	m, err = _convo_message(e, o, pos, allocator, ready)
 	return m, _damage_read(e, o, err, ready)
@@ -218,6 +233,7 @@ convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := c
 
 @(private)
 _convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := context.allocator, ready: Ready = {}) -> (m: convo.Message, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _convo_message: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -238,6 +254,7 @@ _convo_message :: proc(e: ^Engine, o: Object, pos: convo.Position, allocator := 
 }
 
 convo_siblings :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.allocator, ready: Ready = {}) -> (list: []Rid, at: int, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_siblings: %v", err) }
 	context = context_for(e)
 	list, at, err = _convo_siblings(e, o, msg, allocator, ready)
 	return list, at, _damage_read(e, o, err, ready)
@@ -245,6 +262,7 @@ convo_siblings :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.all
 
 @(private)
 _convo_siblings :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.allocator, ready: Ready = {}) -> (list: []Rid, at: int, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _convo_siblings: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -260,6 +278,7 @@ _convo_siblings :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.al
 }
 
 convo_intents :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (items: []convo.Intent, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_intents: %v", err) }
 	context = context_for(e)
 	items, err = _convo_intents(e, o, allocator, ready)
 	return items, _damage_read(e, o, err, ready)
@@ -267,6 +286,7 @@ convo_intents :: proc(e: ^Engine, o: Object, allocator := context.allocator, rea
 
 @(private)
 _convo_intents :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (items: []convo.Intent, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _convo_intents: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -278,6 +298,7 @@ _convo_intents :: proc(e: ^Engine, o: Object, allocator := context.allocator, re
 }
 
 convo_mounts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.Mount_Entry, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_mounts: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -295,6 +316,7 @@ convo_mounts :: proc(e: ^Engine, o: Object, allocator := context.allocator, read
 }
 
 convo_files_at :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.File_Delta, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_files_at: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -306,6 +328,7 @@ convo_files_at :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.all
 }
 
 convo_compactions :: proc(e: ^Engine, o: Object, floor: prim.Hlc = 0, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.Compaction, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_compactions: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -317,6 +340,7 @@ convo_compactions :: proc(e: ^Engine, o: Object, floor: prim.Hlc = 0, allocator 
 }
 
 convo_unsealed :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.Unsealed, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_unsealed: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -328,6 +352,7 @@ convo_unsealed :: proc(e: ^Engine, o: Object, allocator := context.allocator, re
 }
 
 convo_settings :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (s: Convo_Settings, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_settings: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)

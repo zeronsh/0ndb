@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:slice"
 import "core:strings"
@@ -36,6 +38,7 @@ convo_line_key :: proc(id: prim.Id, allocator := context.temp_allocator) -> stri
 }
 
 convo_undo :: proc(e: ^Engine, o: Object, msg: Rid) -> (undo: prim.Id, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_undo: %v", err) }
 	context = context_for(e)
 	undo = new_id(e)
 	_cu_undo_write(e, o, undo, msg, .Staged, nil, {}) or_return
@@ -43,6 +46,7 @@ convo_undo :: proc(e: ^Engine, o: Object, msg: Rid) -> (undo: prim.Id, err: Erro
 }
 
 convo_redo :: proc(e: ^Engine, o: Object, of: prim.Id) -> (redo: prim.Id, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_redo: %v", err) }
 	context = context_for(e)
 	u := _cu_undone_of(e, o, of) or_return
 	redo = new_id(e)
@@ -51,6 +55,7 @@ convo_redo :: proc(e: ^Engine, o: Object, of: prim.Id) -> (redo: prim.Id, err: E
 }
 
 convo_undos :: proc(e: ^Engine, o: Object, allocator := context.allocator) -> (out: []convo.Undo_State, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU convo_undos: %v", err) }
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
@@ -75,6 +80,7 @@ convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 
 @(private)
 _cu_undo_state :: proc(e: ^Engine, o: Object, undo: prim.Id) -> (st: convo.Undo_State, found: bool, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _cu_undo_state: %v", err) }
 	list := convo_undos(e, o, context.temp_allocator) or_return
 	for u in list {
 		if u.id == undo {
@@ -86,6 +92,7 @@ _cu_undo_state :: proc(e: ^Engine, o: Object, undo: prim.Id) -> (st: convo.Undo_
 
 @(private)
 _cu_undone_of :: proc(e: ^Engine, o: Object, undo: prim.Id) -> (u: convo.Undone_State, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _cu_undone_of: %v", err) }
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	list, lerr := convo.undones(&h.view, context.temp_allocator)
@@ -178,6 +185,7 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State) -> Error {
 
 @(private)
 _cu_undo_tree :: proc(e: ^Engine, o: Object, msg: Rid) -> (out: []Undo_Conv, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _cu_undo_tree: %v", err) }
 	t := convo_message(e, o, {msg = msg}, context.temp_allocator) or_return
 	list := make([dynamic]Undo_Conv, context.temp_allocator)
 	append(&list, Undo_Conv{o = o})
@@ -246,6 +254,7 @@ _cu_undo_fence :: proc(e: ^Engine, convs: []Undo_Conv) {
 
 @(private)
 _cu_first_reply_after :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (reply: Rid, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _cu_first_reply_after: %v", err) }
 	st := convo_status(e, o) or_return
 	at := st.head
 	for !obj.rid_none(at) {
@@ -263,6 +272,7 @@ _cu_first_reply_after :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (reply: R
 
 @(private)
 _cu_head_before :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (head: Rid, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _cu_head_before: %v", err) }
 	st := convo_status(e, o) or_return
 	at := st.head
 	for !obj.rid_none(at) {
@@ -277,6 +287,7 @@ _cu_head_before :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (head: Rid, err
 
 @(private)
 _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (set: []convo.Undo_Line, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _cu_undo_set: %v", err) }
 	t := convo_message(e, o, {msg = msg}, context.temp_allocator) or_return
 	actors := make([dynamic]prim.Id, context.temp_allocator)
 	add :: proc(list: ^[dynamic]prim.Id, a: prim.Id) {
@@ -385,6 +396,7 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 
 @(private)
 _cu_redo_set :: proc(e: ^Engine, o: Object, of: prim.Id) -> (set: []convo.Undo_Line, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _cu_redo_set: %v", err) }
 	u := _cu_undone_of(e, o, of) or_return
 	lines := make([dynamic]convo.Undo_Line, context.temp_allocator)
 	for r in u.reverts {

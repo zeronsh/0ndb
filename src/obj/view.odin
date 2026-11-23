@@ -1,5 +1,7 @@
 package obj
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:slice"
 import "../journal"
@@ -385,6 +387,12 @@ tail :: proc(v: ^View, s: int) -> (sg: ^View_Seg, ok: bool, err: Error) {
 	for pos > 0 {
 		body, off, je := jrec_before(sg.jr, pos)
 		if je == .Missing {
+			_dbg_rep := sg.jr.replica
+			if _dbg_rep != nil {
+				fmt.eprintfln("DBGT seg %x e %d pos %d jrend %d jmiss %v rep.len %d rep.have %v rep.missing %v journal %v fd %v", sg.id[:4], e, pos, sg.jr.end, sg.jr.missing, _dbg_rep.length, _dbg_rep.have[:], _dbg_rep.missing, sg.jr.journal != nil, sg.jr.fd)
+			} else {
+				fmt.eprintfln("DBGT seg %x e %d pos %d jrend %d jmiss %v norep journal %v", sg.id[:4], e, pos, sg.jr.end, sg.jr.missing, sg.jr.journal != nil)
+			}
 			want(v, s, min(pos - suggested_tail(pos), sg.jr.missing.from), max(pos, sg.jr.missing.to))
 			return sg, false, .Missing
 		}

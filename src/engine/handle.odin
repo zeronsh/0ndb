@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "../convo"
 import "../fs"
 import "../journal"
@@ -133,6 +135,7 @@ _object_changed :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Change_Ki
 
 @(private)
 _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _handle_get: %v", err) }
 	if x, ok := e.handles[o.id]; ok {
 		if x.kind != kind || x.sp.id != o.space {
 			return nil, .Invalid
@@ -222,6 +225,7 @@ _lru_touch :: proc(e: ^Engine, h: ^Handle) {
 
 @(private)
 _own_path :: proc(e: ^Engine, h: ^Handle) -> (path: string, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _own_path: %v", err) }
 	if h.kind == .Text || h.kind == .File_Tree {
 		d := _obj_dir(e, h.id, context.temp_allocator) or_return
 		return _join(context.temp_allocator, d, "hist", "fs.journal")
@@ -633,6 +637,9 @@ _handle_rekey :: proc(h: ^Handle, device: prim.Id, rt: ^Remote_Tree) {
 
 @(private)
 _handle_refresh :: proc(h: ^Handle) {
+	if h.kind == .Conversation {
+		fmt.eprintfln("DBGH refresh %x own %v w_open %v segs %d", h.id[0], h.own, h.w_open, len(h.segs))
+	}
 	if h.own && !h.w_open && (h.kind == .Conversation || h.kind == .Map) {
 		if _damage_pending(h.e, h.id) {
 			h.damaged = true
@@ -1031,6 +1038,7 @@ _waiters_run :: proc(e: ^Engine) {
 
 @(private)
 _waiters_fail_all :: proc(e: ^Engine, err: Error) {
+	defer if err != .None && err != .Pending { fmt.eprintfln("DBGU _waiters_fail_all: %v", err) }
 	ws := e.waiters
 	e.waiters = make([dynamic]^Waiter, e.allocator)
 	for w in ws {
