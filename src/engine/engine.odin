@@ -300,6 +300,8 @@ Stats :: struct {
 	buffer_live_intents: u64,
 	buffer_live_intents_applied: u64,
 	buffer_live_bad_gone: u64,
+	seal_lookups: u64,
+	seal_scanned: u64,
 }
 
 Engine :: struct {
