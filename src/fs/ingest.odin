@@ -1358,7 +1358,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		if has && a.used && !m.lost && !chained {
 			continue
 		}
-		if has && !m.lost && !actor_on_line(m, a.actor) {
+		if has && !m.lost && !actor_on_line(m, a.actor) && a.scope == {} {
 			has = false
 		}
 		steps := make([dynamic]Attrib_Step, context.temp_allocator)
@@ -1372,7 +1372,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		if !m.lost {
 			kept := 0
 			for st in steps {
-				if actor_on_line(m, st.actor) {
+				if actor_on_line(m, st.actor) || st.scope != {} {
 					steps[kept] = st
 					kept += 1
 				}
@@ -1476,9 +1476,13 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	}
 	k, _ := clone_string(c.path, m.allocator)
 	m.override[k] = st.oid
+	actor := st.actor
+	if st.scope != {} && !actor_on_line(m, actor) {
+		actor = scope_line_actor(m, actor)
+	}
 	b: Builder
-	builder_init(&b, m.history, st.actor)
-	b.scope = scope_marker(st.actor, st.scope)
+	builder_init(&b, m.history, actor)
+	b.scope = scope_marker(actor, st.scope)
 	attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
 	shadow_txn_begin(&m.shadow)
 	eerr := emit_change(p, &b, &first)
@@ -2092,8 +2096,12 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				}
 			}
 			if actor != m.actor && !actor_on_line(m, actor) {
-				actor = m.actor
-				scope = {}
+				if scope != {} && !is_unattributed(actor) {
+					actor = scope_line_actor(m, actor)
+				} else {
+					actor = m.actor
+					scope = {}
+				}
 			}
 			key := actor
 			if scope != {} && scope != actor {
