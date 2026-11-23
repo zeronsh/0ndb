@@ -588,7 +588,36 @@ def _s5_runner():
     return measure(relay, 0, dict(wakes=wakes, mode=mode, lease_s=lease, renewals=renewed, seconds=round(dt, 1), base_pack=base_pack, base_object_bytes=base_obj, base_object_files=base_files), sm)
 
 
-SCENARIOS = {"s1": s1_transcript, "s2a": lambda: s2_rewrites(False), "s2b": lambda: s2_rewrites(True), "s3": s3_drafts, "s4": s4_catalog, "s5": s5_runner}
+def s6_cold_restore():
+    d = scenario_dir("s6_cold_restore")
+    msgs = transcript_messages(TRANSCRIPT, int(os.environ.get("COST_MSGS", "2769")))
+    relay = Relay(d)
+    a = Device(d, "a", relay)
+    a.cli("new", "transcript")
+    for i, (mid, role, text) in enumerate(msgs):
+        a.cli("record", "--source", "claude", "--id", mid, "--seq", str(i + 1), "--role", role, "--stdin", stdin=text)
+    settle(5)
+    convo = re.search(r'"object":"[0-9a-f]+/([0-9a-f]+)"', a.cli("ls", "--json")).group(1)
+    b = Device(d, "b", None)
+    card = b.cli("join").strip()
+    ticket = a.cli("pair", card).strip().split()[-1]
+    b.cli("join", ticket)
+    obj = convo
+    settle(10)
+    a.stop()
+    t0 = time.time()
+    log = b.cli("log", obj, "-n", str(len(msgs) + 10), "--json", timeout=1800)
+    cold = round(time.time() - t0, 1)
+    ids = re.findall(r'"msg":"([^"]+)"', log) or re.findall(r'"id":"([^"]+)"', log)
+    victim = ids[len(ids) // 10] if ids and os.environ.get("COST_REDACT", "1") != "0" else None
+    if victim:
+        b.cli("redact", obj, victim)
+    settle(10)
+    b.stop()
+    raw = "\n".join(t for _, _, t in msgs).encode()
+    return measure(relay, zstd_size(raw), dict(messages=len(msgs), cold_read_seconds=cold, cold_log_bytes=len(log), cold_ids=len(ids), redacted=victim))
+
+SCENARIOS = {"s1": s1_transcript, "s2a": lambda: s2_rewrites(False), "s2b": lambda: s2_rewrites(True), "s3": s3_drafts, "s4": s4_catalog, "s5": s5_runner, "s6": s6_cold_restore, "s6n": s6_cold_restore}
 
 if __name__ == "__main__":
     names = sys.argv[1:] or list(SCENARIOS)
