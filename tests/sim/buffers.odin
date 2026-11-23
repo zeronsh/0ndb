@@ -58,7 +58,6 @@ _ops_copy :: proc(w: ^World, ops: []crdt.Delta_Op) -> []crdt.Delta_Op {
 	return out
 }
 
-@(private = "file")
 _on_buffer :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Buffer_Event) {
 	b := (^Sim_Buffer)(data)
 	w := b.w
@@ -150,7 +149,6 @@ buffers_drop :: proc(w: ^World, n: ^Node) {
 	}
 }
 
-@(private = "file")
 _live :: proc(w: ^World, n: ^Node) -> []^Sim_Buffer {
 	out := make([dynamic]^Sim_Buffer, context.temp_allocator)
 	for b in w.bufs {
@@ -194,7 +192,6 @@ op_buffer :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 	}
 }
 
-@(private = "file")
 _new_buffer :: proc(w: ^World, n: ^Node, oi: int, path: string, utf16: bool) -> ^Sim_Buffer {
 	b := new(Sim_Buffer, w.allocator)
 	b^ = Sim_Buffer{w = w, node = n.idx, inc = n.incarnation, oi = oi, path = path, utf16 = utf16}
@@ -205,7 +202,6 @@ _new_buffer :: proc(w: ^World, n: ^Node, oi: int, path: string, utf16: bool) -> 
 	return b
 }
 
-@(private = "file")
 _keep :: proc(w: ^World, b: ^Sim_Buffer, info: ^eng.Buffer_Info) {
 	b.id = info.id
 	b.actor = info.actor
@@ -241,7 +237,6 @@ _open :: proc(w: ^World, n: ^Node) {
 	_keep(w, b, &info)
 }
 
-@(private = "file")
 _edit :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer, pos: int, del: int, ins: string, group: u64) -> eng.Error {
 	ops := make([dynamic]crdt.Delta_Op, w.allocator)
 	crdt.delta_push(&ops, crdt.Delta_Op{kind = .Retain, n = pos})
@@ -575,13 +570,11 @@ _buffers_stats :: proc "contextless" () {
 	register_final_check(1000, check_live_probe)
 }
 
-@(private = "file")
 _probe_ready :: proc(w: ^World, b: ^Sim_Buffer) -> bool {
 	n := w.nodes[b.node]
 	return !b.dead && n.alive && n.e_open && b.inc == n.incarnation && w.model.objs[b.oi].kind == .Text && obj_exists(&w.model, b.oi)
 }
 
-@(private = "file")
 _probe_settle :: proc(w: ^World, bs: []^Sim_Buffer) -> bool {
 	run_until(w, w.now + 30_000_000_000, true)
 	for b in bs {
@@ -593,7 +586,6 @@ _probe_settle :: proc(w: ^World, bs: []^Sim_Buffer) -> bool {
 	return true
 }
 
-@(private = "file")
 _probe_converge :: proc(w: ^World, oi: int) {
 	for _ in 0 ..< 8 {
 		run_until(w, w.now + 30_000_000_000, true)
