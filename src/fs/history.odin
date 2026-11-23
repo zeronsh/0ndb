@@ -1,5 +1,6 @@
 package fs
 
+
 import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
@@ -2136,6 +2137,9 @@ apply_opaque :: proc(h: ^History, b: ^crdt.Batch, at: u64, lv: crdt.Lv, op: crdt
 	if len(op.content) > 0 && op.content[0] == fshist.TOP_ACCEPT {
 		revert_accept_index(h, op.content) or_return
 	}
+	if len(op.content) > 0 && op.content[0] == fshist.TOP_SCOPE {
+		return scope_index(h, b, op.content)
+	}
 	decoded, ok := fshist.decode_opaque(op.content, h, proc(data: rawptr, id: crdt.Op_Id) -> fstree.Inode_Id {
 		return op_inode((^History)(data), id)
 	})
@@ -3218,4 +3222,65 @@ history_alias :: proc(h: ^History, sources: []string, commit: string, v: Version
 	}
 	history_own_applied(h)
 	return .None
+}
+
+SCOPE_ENTRY :: 32
+
+@(private)
+scope_key :: proc(actor: prim.Id) -> []u8 {
+	k := make([]u8, 3 + 16, context.temp_allocator)
+	copy(k, "ss:")
+	a := actor
+	copy(k[3:], a[:])
+	return k
+}
+
+@(private)
+scope_index :: proc(h: ^History, b: ^crdt.Batch, content: []u8) -> Error {
+	scope, ok := fshist.decode_scope(content)
+	if !ok {
+		return .None
+	}
+	key := scope_key(b.actor)
+	list, _ := kv_get(&h.kv, key, context.temp_allocator) or_return
+	if n := len(list); n >= SCOPE_ENTRY && prim.get_u64le(list[n - SCOPE_ENTRY:]) >= b.seq {
+		return .None
+	}
+	e: [SCOPE_ENTRY]u8
+	prim.put_u64le(e[0:8], b.seq)
+	prim.put_u64le(e[8:16], u64(crdt.batch_len(b)))
+	s := scope
+	copy(e[16:], s[:])
+	out := make([dynamic]u8, 0, len(list) + SCOPE_ENTRY, context.temp_allocator)
+	append(&out, ..list)
+	append(&out, ..e[:])
+	return kv_put(&h.kv, key, out[:])
+}
+
+history_scope_of :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, found: bool, err: Error) {
+	history_ready(h) or_return
+	list, ok := kv_get(&h.kv, scope_key(op.actor), context.temp_allocator) or_return
+	if !ok {
+		return {}, false, .None
+	}
+	n := len(list) / SCOPE_ENTRY
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if prim.get_u64le(list[mid * SCOPE_ENTRY:]) <= op.seq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return {}, false, .None
+	}
+	e := list[(lo - 1) * SCOPE_ENTRY:][:SCOPE_ENTRY]
+	first, count := prim.get_u64le(e[0:8]), prim.get_u64le(e[8:16])
+	if op.seq >= first + count {
+		return {}, false, .None
+	}
+	copy(scope[:], e[16:32])
+	return scope, true, .None
 }

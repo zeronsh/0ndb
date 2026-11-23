@@ -1,5 +1,6 @@
 package engine
 
+import "../crdt"
 import "../fs"
 import "../fshist"
 import "../prim"
@@ -59,7 +60,18 @@ tree_undo_revert :: proc(e: ^Engine, o: Object, undo: prim.Id, line := "") -> (r
 	return r, ok, .None
 }
 
-turn_actor :: proc(e: ^Engine, conversation: prim.Id) -> (actor: prim.Id, pseudo: prim.Id) {
-	pseudo = fs.turn_pseudo(conversation)
+scope_actor :: proc(e: ^Engine, conversation: prim.Id, mount: prim.Id, line: string) -> (actor: prim.Id, pseudo: prim.Id) {
+	pseudo = fs.scope_pseudo(conversation, mount, line)
 	return fshist.ingestion_actor(e.self, pseudo), pseudo
+}
+
+tree_scope_of :: proc(e: ^Engine, o: Object, op: crdt.Op_Id) -> (scope: prim.Id, found: bool, err: Error) {
+	context = context_for(e)
+	h := _handle_get(e, o, .File_Tree) or_return
+	_hist_ready(e, h) or_return
+	s, ok, ferr := fs.history_scope_of(h.hist, op)
+	if ferr != .None {
+		return {}, false, _ferr(ferr)
+	}
+	return s, ok, .None
 }
