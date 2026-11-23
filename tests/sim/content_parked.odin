@@ -14,6 +14,11 @@ check_content_parked :: proc(w: ^World) {
 		context = instance_context(&n.inst)
 		waits := eng.content_waits(&n.e, context.temp_allocator)
 		for x in waits {
+			if x.inflight {
+				hb: [odb.MAX_HEX]u8
+				world_fail(w, "content: %s's wait on blob %s of %s is still inflight at quiesce, after every holder it asked has answered", n.name, odb.oid_to_string(x.oid, .Sha1 if x.n == 20 else .Sha256, &hb), id_short(x.object))
+				continue
+			}
 			for o in w.nodes {
 				if o == n || !o.alive || !o.e_open || o.partitioned {
 					continue
