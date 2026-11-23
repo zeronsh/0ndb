@@ -969,10 +969,14 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	}
 	if !rm.keys_wait {
 		_pending_apply(r, rm)
+		_tamper_release(r, rm)
+		_repl_flush(r)
 		return
 	}
 	_pending_apply(r, rm)
 	rm.keys_wait = false
+	rm.tamper_hold = false
+	rm.tamper_retried = false
 	_kwait_release(r, rm)
 	_held_apply(r, rm)
 	if r.phase == .Ready {
