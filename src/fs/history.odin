@@ -1255,7 +1255,7 @@ journal_line :: proc(h: ^History, name: string, version: []u8) -> Error {
 @(private)
 journal_seal :: proc(h: ^History) -> Error {
 	if h.db != nil {
-		if e := odb.barrier(h.db); e != .None {
+		if e := odb.barrier_soft(h.db); e != .None {
 			journal.journal_abort(&h.journal)
 			return from_odb(e)
 		}
