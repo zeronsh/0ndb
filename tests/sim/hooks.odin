@@ -1,15 +1,18 @@
 package sim
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:slice"
 import "core:strings"
 import eng "../../src/engine"
+import "../../src/prim"
 
 Final_Check :: proc(w: ^World)
 Restart_Hook :: proc(w: ^World, n: ^Node)
 Event_Hook :: proc(w: ^World, ev: ^Sim_Event)
 Engine_Event_Hook :: proc(w: ^World, n: ^Node, ev: ^eng.Event)
+Frame_Filter :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8) -> (drop: bool)
 World_Hook :: proc(w: ^World)
 Collect_Hook :: proc(w: ^World, res: ^Run_Result)
 Op_Weight :: proc(w: ^World) -> int
@@ -76,6 +79,7 @@ Registry :: struct {
 	restarted:    Table(Restart_Entry, 64),
 	events:       Table(Event_Hook, 64),
 	engine_events: Table(Ordered(Engine_Event_Hook), 64),
+	filters:      Table(Ordered(Frame_Filter), 16),
 	inits:        Table(Ordered(World_Hook), 64),
 	destroys:     Table(Ordered(World_Hook), 64),
 	collects:     Table(Ordered(Collect_Hook), 64),
@@ -106,6 +110,7 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.collects.items[:reg.collects.n], by)
 	slice.stable_sort_by(reg.steps.items[:reg.steps.n], by)
 	slice.stable_sort_by(reg.engine_events.items[:reg.engine_events.n], by)
+	slice.stable_sort_by(reg.filters.items[:reg.filters.n], by)
 	slice.stable_sort_by(reg.restarted.items[:reg.restarted.n], proc(a, b: Restart_Entry) -> bool {
 		return a.order < b.order
 	})
@@ -158,6 +163,76 @@ register_event :: proc "contextless" (hook: Event_Hook) -> Ev_Kind {
 
 register_engine_event :: proc "contextless" (order: int, hook: Engine_Event_Hook) {
 	_add(&reg.engine_events, Ordered(Engine_Event_Hook){order, hook})
+}
+
+register_frame_filter :: proc "contextless" (order: int, filter: Frame_Filter) {
+	_add(&reg.filters, Ordered(Frame_Filter){order, filter})
+}
+
+@(private = "file")
+Filter_Buf :: struct {
+	gen: u64,
+	buf: [dynamic]u8,
+}
+
+@(private = "file")
+_filtering: bool
+
+@(private = "file")
+_filter_bufs: map[^Conn]Filter_Buf
+
+frame_filter_enable :: proc(on: bool) {
+	_filtering = on
+	if !on {
+		for _, fb in _filter_bufs {
+			delete(fb.buf)
+		}
+		delete(_filter_bufs)
+		_filter_bufs = nil
+	}
+}
+
+frame_filtering :: proc "contextless" () -> bool {
+	return _filtering && reg.filters.n > 0
+}
+
+run_frame_filters :: proc(w: ^World, c: ^Conn, bytes: []u8) -> []u8 {
+	_sorted()
+	if _filter_bufs == nil {
+		_filter_bufs = make(map[^Conn]Filter_Buf, runtime.heap_allocator())
+	}
+	fb, found := &_filter_bufs[c]
+	if !found {
+		_filter_bufs[c] = Filter_Buf{gen = c.gen, buf = make([dynamic]u8, runtime.heap_allocator())}
+		fb = &_filter_bufs[c]
+	}
+	if fb.gen != c.gen {
+		clear(&fb.buf)
+		fb.gen = c.gen
+	}
+	append(&fb.buf, ..bytes)
+	out := make([dynamic]u8, context.temp_allocator)
+	pos := 0
+	for len(fb.buf) - pos >= FRAME_HEADER {
+		n := int(prim.get_u32le(fb.buf[pos:pos + 4]))
+		if len(fb.buf) - pos < FRAME_HEADER + n {
+			break
+		}
+		frame := fb.buf[pos:pos + FRAME_HEADER + n]
+		pos += FRAME_HEADER + n
+		drop := false
+		for f in reg.filters.items[:reg.filters.n] {
+			if f.call(w, c, frame[4], frame[FRAME_HEADER:]) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			append(&out, ..frame)
+		}
+	}
+	remove_range(&fb.buf, 0, pos)
+	return out[:]
 }
 
 register_op :: proc "contextless" (order: int, name: string, weight: Op_Weight, run: Op_Run) {
