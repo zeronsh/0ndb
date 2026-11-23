@@ -772,6 +772,9 @@ _check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 		}
 		strict := op.line == line
 		for tok in op.tokens {
+			if _reclaimed(m, oi, line, tok, op.idx) {
+				continue
+			}
 			s, is := present[tok]
 			if is && strict {
 				diffed := (op.kind == .Disk_Agent || op.kind == .Disk_Person) && len(op.deletes) > 0
@@ -782,6 +785,10 @@ _check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 						continue
 					}
 					if op.kind == .Disk_Agent && op.power_crash && fs.is_unattributed(a) {
+						own = true
+						continue
+					}
+					if _maybe_reclaimed_by(m, oi, line, tok, op.idx, a) {
 						own = true
 						continue
 					}
@@ -868,6 +875,36 @@ _check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 			world_fail(w, "model: unknown token %s present in %s on %s", tok, id_short(ob.o.id), n.name)
 		}
 	}
+}
+
+@(private = "file")
+_reclaimed :: proc(m: ^Model, oi: int, line: string, tok: string, after: int) -> bool {
+	for r in m.ops {
+		if r.idx <= after || r.obj != oi || r.line != line || !op_happened(r) || r.kind == .Tree_Remove {
+			continue
+		}
+		for t in r.tokens {
+			if t == tok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+@(private = "file")
+_maybe_reclaimed_by :: proc(m: ^Model, oi: int, line: string, tok: string, after: int, actor: prim.Id) -> bool {
+	for r in m.ops {
+		if r.idx <= after || r.obj != oi || r.line != line || r.status != .Uncertain || r.actor != actor {
+			continue
+		}
+		for t in r.tokens {
+			if t == tok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 @(private = "file")
