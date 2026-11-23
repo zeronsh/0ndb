@@ -52,7 +52,7 @@ _di_pair :: proc(w: ^World) -> (oi: int, a, b: ^Node) {
 		k := 0
 		for idx in rs {
 			n := w.nodes[idx]
-			if n.alive && n.e_open && k < 2 {
+			if n.alive && n.e_open && k < 2 && _di_writer(m, i, idx) {
 				got[k] = n
 				k += 1
 			}
@@ -62,6 +62,20 @@ _di_pair :: proc(w: ^World) -> (oi: int, a, b: ^Node) {
 		}
 	}
 	return -1, nil, nil
+}
+
+@(private = "file")
+_di_writer :: proc(m: ^Model, oi: int, idx: int) -> bool {
+	si := space_index(m, m.objs[oi].o.space)
+	if si >= 0 && space_member(&m.spaces[si], idx) {
+		return true
+	}
+	for g in m.grants {
+		if g.to == idx && g.obj == oi && .Write in g.share.access {
+			return true
+		}
+	}
+	return false
 }
 
 @(private = "file")
