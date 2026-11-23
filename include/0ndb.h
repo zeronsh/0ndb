@@ -251,7 +251,9 @@
  *                 buffer_live_confirmed, buffer_live_dropped: uvarint
  *                 (buffer edits streamed ahead of durability; frames
  *                 shown to buffers, later confirmed by their durable
- *                 record, and overlays withdrawn)
+ *                 record, and overlays withdrawn),
+ *                 catalog_refused: uvarint (catalog updates dropped because
+ *                 this device may not write the space's catalog)
  *   Workspace  := name: str, agent: id, provider: str, model: str,
  *                 runner_policy: bytes, setup: str, access: bytes,
  *                 members: [ {object: id, kind: enum kind,
