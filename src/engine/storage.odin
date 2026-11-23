@@ -54,10 +54,8 @@ _storage_class :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind) -> S
 	switch e.cfg.storage {
 	case .Auto, .Stored:
 		return .Stored
-	case .Device_Until_Run:
+	case .Device_Until_Run, .Device:
 		return .Stored if recorded == .Stored || _promo_marked(e, sp.id, object) else .Device
-	case .Device:
-		return .Device
 	}
 	return .Stored
 }
