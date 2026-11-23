@@ -1,0 +1,156 @@
+package sim
+
+import eng "../../src/engine"
+import "../../src/obj"
+import "../../src/prim"
+
+STAT_BITROT_FLIPS: Stat
+STAT_BITROT_DAMAGED: Stat
+STAT_BITROT_RESTORED: Stat
+STAT_BITROT_SCRUBBED: Stat
+
+BITROT_SETTLE :: i64(120_000_000_000)
+
+bitrot_on :: proc(w: ^World) -> bool {
+	return env_u64("SIM_BITROT", 1 if mix64(w.cfg.seed, 0x62697472) % 3 == 0 else 0) != 0
+}
+
+bitrot_weight :: proc(w: ^World) -> int {
+	return 2 if bitrot_on(w) else 0
+}
+
+bitrot_flip :: proc(w: ^World, n: ^Node) {
+	if !n.alive || !n.e_open {
+		return
+	}
+	context = instance_context(&n.inst)
+	own, err := eng.own_lengths(&n.e, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	cands := make([dynamic]eng.Own_Length, context.temp_allocator)
+	for o in own {
+		if !o.device && o.uploaded > 0 && (o.kind == .Conversation || o.kind == .Map) {
+			append(&cands, o)
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	o := cands[rng_int(&w.rng, len(cands))]
+	at := i64(rng_int(&w.rng, int(o.uploaded)))
+	bit := u8(1) << u8(rng_int(&w.rng, 8))
+	node_after(n)
+	length, base, exists := relay_probe(w, o.space, o.stream)
+	context = instance_context(&n.inst)
+	if !exists || at < base || at >= length {
+		return
+	}
+	if _bitrot_write(w, n, o, at, bit) {
+		world_note(w, "%s bit rot: flipped a bit at %d of its own %v %s (uploaded %d)", n.name, at, o.kind, id_short(o.object), o.uploaded)
+	}
+}
+
+@(private = "file")
+_bitrot_write :: proc(w: ^World, n: ^Node, o: eng.Own_Length, at: i64, bit: u8) -> bool {
+	fd, oerr := prim.open_file(n.e.vfs, o.path, {.Write})
+	if oerr != .None {
+		return false
+	}
+	defer prim.close_file(n.e.vfs, fd)
+	b: [1]u8
+	if k, rerr := prim.read_at(n.e.vfs, fd, b[:], at); rerr != .None || k != 1 {
+		return false
+	}
+	b[0] ~= bit
+	if env_u64("SIM_BITROT_DRY", 0) != 0 {
+		return false
+	}
+	if werr := prim.write_at(n.e.vfs, fd, b[:], at); werr != .None {
+		return false
+	}
+	stat_add(w, STAT_BITROT_FLIPS)
+	return true
+}
+
+bitrot_redact_weight :: proc(w: ^World) -> int {
+	return 1 if bitrot_on(w) else 0
+}
+
+bitrot_redact :: proc(w: ^World, n: ^Node) {
+	if !n.alive || !n.e_open {
+		return
+	}
+	m := &w.model
+	cands := make([dynamic]^M_Op, context.temp_allocator)
+	for op in m.ops {
+		if op.kind != .Send || op.node != n.idx || op.status != .Acked || obj.rid_none(op.rid) || op.rid.seg != n.identity.id {
+			continue
+		}
+		taken := false
+		for x in m.ops {
+			if x.kind == .Redact_Msg && x.target == op.idx {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			append(&cands, op)
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	t := cands[rng_int(&w.rng, len(cands))]
+	at := t.rid.off + 4 + i64(rng_int(&w.rng, 16))
+	bit := u8(1) << u8(rng_int(&w.rng, 8))
+	first := rng_chance(&w.rng, 1, 2)
+	oi := t.obj
+	o := m.objs[oi].o
+	context = instance_context(&n.inst)
+	own, err := eng.own_lengths(&n.e, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	found := false
+	ol: eng.Own_Length
+	for x in own {
+		if x.object == o.id && x.kind == .Conversation && !x.device {
+			ol = x
+			found = true
+		}
+	}
+	if !found || at >= ol.uploaded {
+		return
+	}
+	node_after(n)
+	length, base, exists := relay_probe(w, ol.space, ol.stream)
+	context = instance_context(&n.inst)
+	if !exists || at < base || at >= length {
+		return
+	}
+	if first && !_bitrot_write(w, n, ol, at, bit) {
+		return
+	}
+	op := new_op(m, .Redact_Msg, n, oi)
+	op.target = t.idx
+	snapshot_search_models(w, n, op)
+	context = instance_context(&n.inst)
+	rerr := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
+	op_result(op, n, rerr)
+	if !first {
+		_bitrot_write(w, n, ol, at, bit)
+	}
+	world_note(w, "%s bit rot and redaction (%s first) of its own message %s at %d of %s -> %v", n.name, "flip" if first else "redaction", t.token, at, id_short(o.id), rerr)
+}
+
+@(init)
+_bitrot_hooks :: proc "contextless" () {
+	register_op(90, "bitrot", bitrot_weight, bitrot_flip)
+	register_op(91, "bitrot_redact", bitrot_redact_weight, bitrot_redact)
+	register_stat_line(47, "bitrot")
+	STAT_BITROT_FLIPS = register_stat(47, 0, "flips")
+	STAT_BITROT_DAMAGED = register_stat(47, 1, "damaged")
+	STAT_BITROT_RESTORED = register_stat(47, 2, "restored")
+	STAT_BITROT_SCRUBBED = register_stat(47, 3, "left_for_scrub")
+}
