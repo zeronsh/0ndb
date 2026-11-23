@@ -749,4 +749,6 @@ _draft_redact_own :: proc(e: ^Engine, h: ^Handle, msg: i64) {
 	}
 	_own_tree_punctured(e, t)
 	_dirty_keys(e, h.sp, h.id, h.kind, h.scope, t)
+	cell := ((msg >> 4) + 1) << 4
+	_own_rearchive(e, h, t, cell, cell + 1)
 }
