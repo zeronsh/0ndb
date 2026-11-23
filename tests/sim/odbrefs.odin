@@ -20,23 +20,22 @@ _odbrefs_init :: proc "contextless" () {
 }
 
 check_own_refs :: proc(w: ^World, n: ^Node) {
-	if !n.alive || n.disk.dead {
+	if !n.alive || n.disk.dead || !n.e_open || !n.e.db_open {
 		return
 	}
 	context = instance_context(&n.inst)
-	defer node_after(n)
-	db, derr := eng.device_odb(&n.e)
-	if derr != .None {
-		return
-	}
+	n.disk.probe += 1
+	defer n.disk.probe -= 1
+	db := &n.e.db
 	for ob in w.model.objs {
 		if ob.kind != .Tree {
 			continue
 		}
-		hist, herr := eng.tree_history(&n.e, ob.o)
-		if herr != .None || hist == nil {
+		h, held := n.e.handles[ob.o.id]
+		if !held || h.hist == nil {
 			continue
 		}
+		hist := h.hist
 		r: journal.Reader
 		journal.journal_reader(&hist.journal, &r, context.temp_allocator)
 		end := journal.journal_durable_len(&hist.journal)
@@ -65,7 +64,6 @@ check_own_refs :: proc(w: ^World, n: ^Node) {
 			pos = next
 		}
 		journal.reader_close(&r)
-		eng.tree_release(&n.e, ob.o)
 	}
 }
 
