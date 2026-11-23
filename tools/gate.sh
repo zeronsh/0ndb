@@ -29,6 +29,14 @@ VET=$( for p in $(ls src); do
 done )
 VET_WEB=$(timeout 600 odin check src/web -vet -strict-style -no-entry-point -target:js_wasm32 2>&1 | head -2 | tr '\n' ' ')
 if [ -n "$VET" ] || [ -n "$VET_WEB" ]; then FAIL=1; note "vet: FAIL $VET $VET_WEB"; else note "vet: ok"; fi
+SOURCES_PAT='prim\.(now_ns|now_ms|mono_ns|mono_ms|id_new)\(\)|time\.(now|tick_now)\(\)|crypto\.rand_bytes|runtime\.rand_bytes|rand\.(uint|int|float)[0-9]*\('
+SOURCES=$( for d in engine fs sync odb pack journal map crdt fstree fshist textdiff convo search obj; do
+	grep -rnE "$SOURCES_PAT" "src/$d" --include=*.odin
+done | grep -v "_windows.odin:\|_darwin.odin:" | while IFS=: read -r f l rest; do
+	from=$(( l > 3 ? l - 3 : 1 ))
+	sed -n "${from},$(( l - 1 ))p" "$f" | grep -q "prim.unrouted" || printf '%s:%s ' "$f" "$l"
+done )
+if [ -n "$SOURCES" ]; then FAIL=1; note "sources: FAIL clock or randomness not routed through the engine's Clock and Random: $SOURCES"; else note "sources: ok"; fi
 
 build() {
 	local name=$1; shift

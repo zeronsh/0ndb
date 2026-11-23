@@ -41,7 +41,7 @@ remote_destroy :: proc(w: ^World) {
 remote_push :: proc(w: ^World, n: ^Node, root: string, oids: []odb.Oid) {
 	db: odb.Odb
 	vfs := disk_vfs(&n.disk)
-	if odb.open(&db, vfs, root, nil, context.temp_allocator) != .None {
+	if odb.open(&db, vfs, root, nil, context.temp_allocator, node_clock(&n.clock)) != .None {
 		return
 	}
 	defer odb.close(&db)
@@ -108,7 +108,7 @@ remote_event :: proc(w: ^World, ev: ^Sim_Event) {
 		w.remote.refused += 1
 	} else {
 		db: odb.Odb
-		if odb.open_store(&db, disk_vfs(&n.disk), req.git_dir, nil, req.format, context.temp_allocator) == .None {
+		if odb.open_store(&db, disk_vfs(&n.disk), req.git_dir, nil, req.format, context.temp_allocator, node_clock(&n.clock)) == .None {
 			for oid in req.oids {
 				if body, ok := w.remote.objects[oid]; ok {
 					if _, werr := odb.write(&db, .Blob, body); werr == .None {

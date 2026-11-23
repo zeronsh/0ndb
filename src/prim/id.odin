@@ -10,7 +10,8 @@ ID_HEX_LEN :: 32
 @(private = "file")
 HEX_DIGITS :: "0123456789abcdef"
 
-id_new :: proc() -> Id {
+id_new :: proc(loc := #caller_location) -> Id {
+	unrouted("an id without a Clock and Random", loc)
 	ns := now_ns()
 	ms := u64(ns / 1_000_000)
 	sub := u64(ns % 1_000_000) * 4096 / 1_000_000

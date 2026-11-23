@@ -7,11 +7,20 @@ Random :: struct {
 	fill: proc(data: rawptr, out: []u8),
 }
 
-random_fill :: proc(r: Random, out: []u8) {
+strict_sources: bool
+
+unrouted :: proc(what: string, loc := #caller_location) {
+	if strict_sources {
+		panic(what, loc)
+	}
+}
+
+random_fill :: proc(r: Random, out: []u8, loc := #caller_location) {
 	if r.fill != nil {
 		r.fill(r.data, out)
 		return
 	}
+	unrouted("randomness without a Random source", loc)
 	crypto.rand_bytes(out)
 }
 

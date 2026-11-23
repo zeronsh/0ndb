@@ -156,6 +156,7 @@ wall_ms :: proc(w: ^Writer) -> i64 {
 	if w.source.wall_ms != nil {
 		return w.source.wall_ms(w.source.data)
 	}
+	prim.unrouted("a writer wall clock read without a source")
 	return prim.now_ms()
 }
 
