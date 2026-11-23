@@ -1045,7 +1045,10 @@ _pending_republish_one :: proc(e: ^Engine, sp: ^Space, id: prim.Id) {
 	if perr != .None {
 		return
 	}
-	length := _own_len(h)
+	length, lerr := _own_stream_len(e, id, rec.kind)
+	if lerr != .None {
+		return
+	}
 	if length > 0 {
 		_dirty_add(e, h, path, length)
 	}
