@@ -1390,11 +1390,15 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			continue
 		}
 		matched, broken, gone := false, false, false
+		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
 		for st in steps {
 			if disk_oid == st.oid {
 				c.actor = st.actor
 				matched = true
 				break
+			}
+			if st.oid == cur {
+				continue
 			}
 			if !odb.exists(m.db, st.oid) {
 				broken = true
@@ -1405,6 +1409,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 				gone = true
 				break
 			}
+			cur = st.oid
 		}
 		if matched || gone {
 			continue
