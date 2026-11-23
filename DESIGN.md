@@ -553,11 +553,21 @@ equal in both directions.
   open the records past the image's offset are replayed over it. A crash
   that loses a history commit therefore reopens with the attributions that
   commit consumed still pending, and the re-detected change is credited to
-  its writer, not to the device. Every observation record is durable before
-  the observed write proceeds: `mount_observe_begin` completes its `done`
-  only once the record is synced, observations arriving together share one
-  fdatasync run off the loop through the registry's `Sync_Exec`, and the
-  observer holds the write until then. The record of the content a pass
+  its writer, not to the device. An observation record is synced before the
+  observed write proceeds wherever the observer can hold the write:
+  `mount_observe_begin` completes its `done` only once the record is synced,
+  observations arriving together share one fdatasync run off the loop
+  through the registry's `Sync_Exec`, and `observe.route_held` records every
+  content-changing path of an observed write and runs the write's `Release`
+  (exactly once) only after; a supervisor that can hold a write (the Linux
+  seccomp supervisor, which parks the notification) sets the `Release` and
+  keeps the write blocked until it runs. A runtime tool-call pin records its path the same
+  way but cannot hold the provider's write. On macOS without Endpoint
+  Security (libproc sees a change only after it happened) and on Windows,
+  nothing holds a write: a write the runtime did not pin (an agent's shell
+  command writing a file directly) is recorded only after the fact, so after
+  a power loss inside that window it is credited to the device, not the
+  agent. The record of the content a pass
   consumed for an observed actor, and of the content an observed scope closed
   with, goes through the same group sync, so a person's later edit of that
   file is split from it after a crash. A change with no record is therefore
