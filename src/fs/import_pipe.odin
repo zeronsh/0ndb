@@ -437,6 +437,7 @@ pipe_stage_b :: proc(p: ^Pipe, c: ^Pipe_Chunk) -> Error {
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
 	m := p.m
+	names_durable(m.db) or_return
 	for s in c.shadow {
 		shadow_append(&m.shadow, s.path, s.entry) or_return
 	}

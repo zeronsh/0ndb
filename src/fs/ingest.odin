@@ -1040,9 +1040,11 @@ import_cache_tree :: proc(m: ^Mount, dirty: ^map[string]bool) -> Error {
 			shadow_put(&m.shadow, dir, e) or_return
 		}
 		if shadow_pending_count(&m.shadow) >= 65536 {
+			names_durable(m.db) or_return
 			shadow_persist(&m.shadow) or_return
 		}
 	}
+	names_durable(m.db) or_return
 	return shadow_persist(&m.shadow)
 }
 
