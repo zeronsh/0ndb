@@ -1653,6 +1653,8 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 				break
 			}
 		}
+		tracked := make(map[string]Commit_Entry, context.temp_allocator)
+		has_git_tree := departed_entries(m, &tracked)
 		order := sorted_inodes(touched)
 		for ino in order {
 			if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
@@ -1675,7 +1677,7 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 				continue
 			}
 			d := probe(m, p) or_return
-			if d.kind == .Missing {
+			if d.kind == .Missing && has_git_tree && p not_in tracked {
 				mount_absent_add(m, p)
 				continue
 			}
@@ -1686,6 +1688,15 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 	append(&m.synced, ..target)
 	m.rescan = true
 	return .None
+}
+
+@(private)
+departed_entries :: proc(m: ^Mount, out: ^map[string]Commit_Entry) -> bool {
+	if !m.has_git || m.db == nil || len(m.head.commit) == 0 {
+		return false
+	}
+	oid, _, ok := odb.oid_from_hex(m.head.commit)
+	return ok && commit_entries(m.db, oid, out) == .None
 }
 
 @(private)
