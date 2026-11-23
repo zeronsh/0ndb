@@ -515,6 +515,23 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 }
 
 @(private)
+_map_put :: proc(e: ^Engine, h: ^Handle, key: []u8, fields: []omap.Field) -> (off: i64, err: Error) {
+	merr := _map_sync(e, h)
+	if merr != .None && merr != .Missing {
+		return 0, merr
+	}
+	en, found, gerr := omap.table_get(&h.table, key, context.temp_allocator)
+	if gerr != .None {
+		return 0, _oerr(gerr)
+	}
+	if found {
+		omap.observe_entry(&h.mw, &en)
+	}
+	o, x := omap.put(&h.mw, key, fields)
+	return o, _oerr(x)
+}
+
+@(private)
 _map_observed :: proc(e: ^Engine, h: ^Handle, key: []u8, tag: u32, element: []u8) -> (observed: []omap.Dot, err: Error) {
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
@@ -867,7 +884,7 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 	kb: [16]u8
 	key := omap.catalog_key(id, &kb)
 	if len(fields) > 0 {
-		_oerr2b(omap.put(&h.mw, key, fields[:])) or_return
+		_map_put(e, h, key, fields[:]) or_return
 	}
 	if u.has_usage {
 		parts := [4]u64{u.usage.input, u.usage.output, u.usage.cache_read, u.usage.cache_write}
