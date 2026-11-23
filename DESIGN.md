@@ -624,7 +624,12 @@ equal in both directions.
   version 1, kind read or write_begin, the file's inode, its path, the
   observed frontier, and the blake2b-256 of the clean content), so a later
   question such as which turns built on a version containing some ops is
-  answered from history alone (`history_observations`).
+  answered from history alone (`history_observations`). A write whose
+  scope closed before it was ingested takes its base from the actor's
+  latest read observation of the path, but only while that observation is
+  unconsumed: once a later batch by the same actor has text ops on the
+  observed inode, the write it covered is in history, so a recovery that
+  re-detects the change never merges the actor's diff a second time.
 - **Mount registration**: `tree_mount` creates the mount's state directory
   under `worktrees/` with a directory fsync of its parent (and of the data
   directory when `worktrees/` is new), and the mount state is saved before
