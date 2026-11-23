@@ -775,6 +775,10 @@ history_sleep :: proc(h: ^History) {
 		return
 	}
 	views_stale(h)
+	for _, f in h.files {
+		file_free(h, f)
+	}
+	clear(&h.files)
 	history_unload_files(h)
 	fstree.destroy(&h.tree)
 	crdt.graph_destroy(&h.g)
@@ -1355,14 +1359,14 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		if len(d.ids) == known {
 			return 0, .None
 		}
-		return 0, history_persist(h)
+		return 0, history_persist_later(h)
 	}
 	if body[0] == REC_REPLACE {
 		apply_replace_record(h, si, body, u64(off)) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, history_persist_later(h)
 	}
 	if body[0] == REC_ALIAS {
 		rd := prim.reader(body[1:])
@@ -1385,35 +1389,35 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, history_persist_later(h)
 	}
 	if body[0] == REC_LINE {
 		apply_line_record(h, stream, body) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, history_persist_later(h)
 	}
 	if body[0] == REC_ACTOR {
 		apply_actor_record(h, stream, body) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, history_persist_later(h)
 	}
 	if body[0] == REC_SEAL {
 		apply_seal_record(h, si, body) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, history_persist_later(h)
 	}
 	if body[0] == REC_REDACT {
 		apply_redact_record(h, body, true) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, history_persist_later(h)
 	}
 	if body[0] != REC_BATCH && body[0] != REC_IMPORT {
 		return 0, .None
@@ -1464,10 +1468,10 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		h.applied[si] = off + 1
 	}
 	if h.own_wait && si != 0 {
-		history_persist(h) or_return
+		history_persist_later(h)
 		return valid, replay_own(h)
 	}
-	return valid, history_persist(h)
+	return valid, history_persist_later(h)
 }
 
 @(private)
@@ -1493,10 +1497,16 @@ admit_import :: proc(h: ^History, si: u32, off: i64, body: []u8, dict: ^crdt.Act
 		h.applied[si] = off + 1
 	}
 	if h.own_wait && si != 0 {
-		history_persist(h) or_return
+		history_persist_later(h)
 		return n, replay_own(h)
 	}
-	return n, history_persist(h)
+	return n, history_persist_later(h)
+}
+
+@(private)
+history_persist_later :: proc(h: ^History) -> Error {
+	history_persist(h)
+	return .None
 }
 
 history_persist :: proc(h: ^History) -> Error {
@@ -1639,10 +1649,16 @@ history_flush_staged :: proc(h: ^History, upto: u64) -> Error {
 }
 
 history_unload_files :: proc(h: ^History) {
-	for _, f in h.files {
-		file_free(h, f)
+	drop := make([dynamic]fstree.Inode_Id, 0, len(h.files), context.temp_allocator)
+	for ino, f in h.files {
+		if !f.dirty {
+			append(&drop, ino)
+		}
 	}
-	clear(&h.files)
+	for ino in drop {
+		file_free(h, h.files[ino])
+		delete_key(&h.files, ino)
+	}
 	if h.blob_data != nil {
 		delete(h.blob_data, h.allocator)
 		h.blob_data = nil
@@ -1674,7 +1690,10 @@ history_unload_unviewed :: proc(h: ^History) {
 		return
 	}
 	drop := make([dynamic]fstree.Inode_Id, 0, len(h.files), context.temp_allocator)
-	outer: for ino in h.files {
+	outer: for ino, f in h.files {
+		if f.dirty {
+			continue
+		}
 		for v in h.views {
 			if v.inode == ino {
 				continue outer
@@ -2690,7 +2709,7 @@ replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: b
 		return true, .None
 	}
 	aerr or_return
-	history_persist(h) or_return
+	history_persist_later(h)
 	history_unload_files(h)
 	crdt.graph_trim(&h.g)
 	fstree.trim(&h.tree, 64)
@@ -2773,9 +2792,9 @@ replay_pause :: proc(h: ^History, off: i64) -> Error {
 		}
 		at = next
 	}
-	err := history_persist(h)
+	history_persist_later(h)
 	history_unload_files(h)
-	return err
+	return .None
 }
 
 @(private)
@@ -2861,9 +2880,9 @@ replay_own :: proc(h: ^History) -> Error {
 	}
 	h.own_wait = false
 	h.applied[0] = end
-	err := history_persist(h)
+	history_persist_later(h)
 	history_unload_files(h)
-	return err
+	return .None
 }
 
 @(private)
@@ -3103,6 +3122,9 @@ history_register_actor :: proc(h: ^History, actor, mount: prim.Id) -> Error {
 	}
 	h.applied[0] = journal.journal_durable_len(&h.journal)
 	apply_actor_record(h, h.self, h.io[:]) or_return
+	if h.persist_due {
+		return history_persist_later(h)
+	}
 	return kv_commit(&h.kv)
 }
 
