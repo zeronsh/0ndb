@@ -292,6 +292,7 @@ shadow_live :: proc "contextless" (s: ^Shadow) -> u64 {
 }
 
 shadow_empty :: proc(s: ^Shadow) -> (empty: bool, err: Error) {
+	index_heal(s) or_return
 	for p in s.pending {
 		if !p.del && len(p.path) > 0 {
 			return false, .None
@@ -299,6 +300,17 @@ shadow_empty :: proc(s: ^Shadow) -> (empty: bool, err: Error) {
 	}
 	_, slot, found := find_path(s, "", path_hash("")) or_return
 	return !found || slot.head == 0, .None
+}
+
+@(private = "file")
+index_heal :: proc(s: ^Shadow) -> Error {
+	if !s.idx_lost || s.idx_fd < 0 {
+		return .None
+	}
+	idx_unmap(s)
+	rebuild_index(s, s.cap) or_return
+	s.idx_lost = false
+	return .None
 }
 
 shadow_reserve :: proc(s: ^Shadow, n: u64) -> Error {
@@ -316,6 +328,7 @@ shadow_get :: proc(s: ^Shadow, path: string) -> (e: Entry, found: bool, err: Err
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
+	index_heal(s) or_return
 	if i, ok := s.index[path]; ok {
 		p := s.pending[i]
 		return p.entry, !p.del, .None
@@ -338,6 +351,7 @@ shadow_by_inode :: proc(s: ^Shadow, inode: fstree.Inode_Id, allocator := context
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
+	index_heal(s) or_return
 	if i, ok := s.by_inode[inode]; ok {
 		p := s.pending[i]
 		if !p.del && p.entry.inode == inode {
@@ -391,6 +405,7 @@ shadow_put :: proc(s: ^Shadow, path: string, e: Entry) -> Error {
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
+	index_heal(s) or_return
 	return pending_set(s, path, false, racy_mark(s, e))
 }
 
@@ -419,6 +434,7 @@ shadow_remove :: proc(s: ^Shadow, path: string) -> Error {
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
+	index_heal(s) or_return
 	return pending_set(s, path, true, {})
 }
 
@@ -451,6 +467,7 @@ shadow_children :: proc(s: ^Shadow, dir: string, out: ^[dynamic]Shadow_Child, al
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
+	index_heal(s) or_return
 	_, slot, ok := find_path(s, dir, path_hash(dir)) or_return
 	off := slot.head if ok else 0
 	steps: u64
@@ -531,6 +548,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 	if s.log_fd < 0 {
 		return .Invalid
 	}
+	index_heal(s) or_return
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	want := cap_for(s.used + u64(len(s.pending)) + 1)
 	if want > s.cap {
