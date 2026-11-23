@@ -972,6 +972,24 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	return err
 }
 
+mount_holds :: proc(m: ^Mount, target: Version) -> bool {
+	h := m.history
+	if h == nil || history_ready(h) != .None {
+		return false
+	}
+	tl := make([dynamic]crdt.Lv, context.temp_allocator)
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+		return false
+	}
+	for lv in tl {
+		if !crdt.graph_contains(&h.g, sl[:], lv) {
+			return false
+		}
+	}
+	return true
+}
+
 mount_synced :: proc(m: ^Mount) -> Version {
 	return m.synced[:]
 }

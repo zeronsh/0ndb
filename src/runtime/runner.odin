@@ -133,6 +133,18 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			start_run(r, o, head)
 		}
 	case .Assistant, .Tool:
+		if !hm.open && !busy {
+			if u, rerr := eng.convo_regenerating(r.e, o); rerr == .None && !obj.rid_none(u) {
+				um, uerr := convo.message(v, &t, convo.Position{msg = u}, context.temp_allocator)
+				if uerr == .None && !um.open && um.status == .Done {
+					waiting_msg = u
+					if _placed_here(r, o, v, &t, &um) {
+						start_run(r, o, u)
+					}
+				}
+			}
+			return
+		}
 		if !hm.open || hm.runner == r.self || obj.rid_none(hm.parent) {
 			return
 		}
@@ -1029,6 +1041,31 @@ _begin_fenced :: proc(r: ^Runtime, o: Object, arg: int, err: Error) {
 		run.state = .Running
 		run_finish(run, .Failed)
 		return
+	}
+	_begin_materialized(run)
+}
+
+BEGIN_WAIT_MS :: 10
+BEGIN_WAIT_TRIES :: 200
+
+@(private)
+_begin_materialized :: proc(run: ^Run) {
+	r := run.r
+	if run.ws != nil && !worktree_materialized(run.ws) && run.begin_tries < BEGIN_WAIT_TRIES {
+		run.begin_tries += 1
+		run.begin_timer = prim.timer(eng.loop(r.e), BEGIN_WAIT_MS, run, proc(l: ^prim.Loop, data: rawptr) {
+			x := (^Run)(data)
+			context = eng.context_for(x.r.e)
+			x.begin_timer = 0
+			if x.state != .Preparing || x.ws == nil {
+				return
+			}
+			_begin_materialized(x)
+		})
+		return
+	}
+	if run.ws != nil {
+		worktree_started(run.ws)
 	}
 	if _ensure_reply(run, _start_files(run)) != .None {
 		run.state = .Running

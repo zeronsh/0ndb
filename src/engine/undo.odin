@@ -191,6 +191,101 @@ convo_move :: proc(e: ^Engine, o: Object, cause: convo.Move_Cause, to: Rid, of: 
 	return move, _cu_drive_new(e, o, move)
 }
 
+convo_regenerate :: proc(e: ^Engine, o: Object, msg: Rid) -> (move: prim.Id, err: Error) {
+	context = context_for(e)
+	m := convo_message(e, o, {msg = msg}, context.temp_allocator) or_return
+	user := msg
+	if m.role != .User {
+		user = m.parent
+	}
+	if obj.rid_none(user) {
+		return {}, .Invalid
+	}
+	um := convo_message(e, o, {msg = user}, context.temp_allocator) or_return
+	if um.role != .User {
+		return {}, .Invalid
+	}
+	from := _cu_position(e, o) or_return
+	if !(_cu_descends(e, o, from, user) or_return) {
+		if _, serr := convo_move(e, o, .Switch, user); serr != .None {
+			return {}, serr
+		}
+		from = _cu_position(e, o) or_return
+	}
+	child := from
+	if from != user {
+		for {
+			p := _cu_parent(e, o, child) or_return
+			if p == user || obj.rid_none(p) {
+				break
+			}
+			child = p
+		}
+	}
+	move = new_id(e)
+	_cu_undo_write(e, o, move, child, .Staged, nil, {}, {cause = .Regenerate, from = from, to = user}) or_return
+	return move, _cu_drive_new(e, o, move)
+}
+
+Left_Branch :: struct {
+	move:    prim.Id,
+	cause:   convo.Move_Cause,
+	msg:     Rid,
+	left:    Rid,
+	to:      Rid,
+	hlc:     prim.Hlc,
+	current: bool,
+}
+
+convo_left :: proc(e: ^Engine, o: Object, allocator := context.allocator) -> (out: []Left_Branch, err: Error) {
+	context = context_for(e)
+	list := convo_undos(e, o, context.temp_allocator) or_return
+	pos := _cu_position(e, o) or_return
+	res := make([dynamic]Left_Branch, allocator)
+	for u in list {
+		if u.phase != .Released || obj.rid_none(u.from) || u.from == u.to || u.cause == .Rebase {
+			continue
+		}
+		dup := false
+		for &x in res {
+			if x.left == u.from {
+				x = Left_Branch{move = u.id, cause = u.cause, msg = u.msg, left = u.from, to = u.to, hlc = u.stamp, current = u.from == pos}
+				dup = true
+			}
+		}
+		if !dup {
+			append(&res, Left_Branch{move = u.id, cause = u.cause, msg = u.msg, left = u.from, to = u.to, hlc = u.stamp, current = u.from == pos})
+		}
+	}
+	return res[:], .None
+}
+
+convo_regenerating :: proc(e: ^Engine, o: Object) -> (user: Rid, err: Error) {
+	context = context_for(e)
+	now := hlc_now(e)
+	floor := prim.hlc_make(max(prim.hlc_ms(now) - MOVE_SETTLE_WINDOW_MS, 0), 0)
+	list := convo_undos(e, o, context.temp_allocator, floor) or_return
+	if len(list) == 0 {
+		return {}, .None
+	}
+	w := list[len(list) - 1]
+	if w.cause != .Regenerate || w.phase != .Released || obj.rid_none(w.to) {
+		return {}, .None
+	}
+	st := convo_status(e, o) or_return
+	for at := st.head; !obj.rid_none(at); {
+		m := convo_message(e, o, {msg = at}, context.temp_allocator) or_return
+		if m.hlc <= w.stamp {
+			break
+		}
+		if m.parent == w.to {
+			return {}, .None
+		}
+		at = m.parent
+	}
+	return w.to, .None
+}
+
 @(private)
 _cu_edit :: proc(e: ^Engine, o: Object, parent: Rid, root: bool) -> (move: prim.Id, err: Error) {
 	from := _cu_position(e, o) or_return
@@ -251,8 +346,15 @@ convo_moves_settle :: proc(e: ^Engine, o: Object) -> Error {
 	}
 	if w.staged.seg != e.self {
 		target := w.to
-		if obj.rid_none(target) && w.cause == .Undo {
+		if obj.rid_none(target) && (w.cause == .Undo || w.cause == .Edit) {
 			target = _cu_parent(e, o, w.msg) or_return
+			if obj.rid_none(target) {
+				st := convo_status(e, o) or_return
+				if st.head_hlc <= w.stamp {
+					return _cu_set_root(e, o)
+				}
+				return .None
+			}
 		}
 		if obj.rid_none(target) {
 			return .None
@@ -396,7 +498,7 @@ _cu_durable :: proc(e: ^Engine, h: ^Handle) -> Error {
 
 @(private)
 _cu_switch_like :: proc(st: convo.Undo_State) -> bool {
-	return st.cause == .Switch || st.cause == .Rebase || (st.cause == .Redo && !obj.rid_none(st.to))
+	return st.cause == .Switch || st.cause == .Rebase || (st.cause == .Redo && !obj.rid_none(st.to)) || (st.cause == .Regenerate && st.from == st.to)
 }
 
 @(private)
@@ -691,9 +793,16 @@ _cu_switch_set :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Un
 			one[0] = st.to
 			cands = one
 		}
-		best := -1
+		best, exact := -1, false
 		for u, i in list {
 			if u.id == st.id || !u.fenced || obj.rid_none(u.from) {
+				continue
+			}
+			if u.from == st.to {
+				best, exact = i, true
+				continue
+			}
+			if exact {
 				continue
 			}
 			for c in cands {
@@ -966,11 +1075,27 @@ _cu_undo_leaves :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []U
 			target = _cu_head_before(e, c.o, t.hlc) or_return
 		}
 		if obj.rid_none(target) {
+			if i == 0 {
+				_cu_set_root(e, c.o) or_return
+			}
 			continue
 		}
 		_cu_set_leaf(e, c.o, target) or_return
 	}
 	return .None
+}
+
+@(private)
+_cu_set_root :: proc(e: ^Engine, o: Object) -> Error {
+	st := convo_status(e, o) or_return
+	if st.browsing && obj.rid_none(st.position) {
+		return .None
+	}
+	h := _convo_writable(e, o) or_return
+	if _, x := convo.writer_set_root(&h.cw); x != .None {
+		return _oerr(x)
+	}
+	return _cu_durable(e, h)
 }
 
 @(private)

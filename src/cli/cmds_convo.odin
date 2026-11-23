@@ -240,28 +240,6 @@ cmd_switch :: proc(a: ^Args) -> int {
 	return 0
 }
 
-cmd_back :: proc(a: ^Args) -> int {
-	s := session(a)
-	ob, rest := _convo_and_rest(s, a, 1)
-	if len(rest) < 1 {
-		return usage_error("usage: 0ndb back [CONVO] MSG")
-	}
-	msg := resolve_msg(s, ob, rest[0])
-	r := req_begin("back")
-	req_str(&r, "object", object_str(ob))
-	req_str(&r, "msg", rid_str(msg))
-	v := must(s, req_end(&r), "cannot go back")
-	g := req_begin("go_back")
-	req_str(&g, "object", object_str(ob))
-	req_str(&g, "msg", rid_str(msg))
-	gr := call(s, req_end(&g))
-	if gr.status != .Ok && gr.status != .Unsupported {
-		return report_error(gr.status, "went back, but restoring the mounted files failed")
-	}
-	_print_result(a, v, "back at", "leaf")
-	return 0
-}
-
 @(private)
 _print_list :: proc(a: ^Args, msgs: []json.Value, self: string, anchor := -1) {
 	for m, i in msgs {
@@ -706,30 +684,6 @@ cmd_redact :: proc(a: ^Args) -> int {
 	return 0
 }
 
-cmd_revert :: proc(a: ^Args) -> int {
-	s := session(a)
-	ob, rest := _convo_and_rest(s, a, 1)
-	if len(rest) < 1 {
-		return usage_error("usage: 0ndb revert [CONVO] MSG")
-	}
-	r := req_begin("revert")
-	req_str(&r, "object", object_str(ob))
-	req_str(&r, "msg", rid_str(resolve_msg(s, ob, rest[0])))
-	v := must(s, req_end(&r), "cannot revert")
-	if a.json {
-		print_json(v)
-		return 0
-	}
-	list := jarr(v, "reverted")
-	if len(list) == 0 {
-		fmt.println("nothing to revert (no mounted tree changed in that turn)")
-	}
-	for m in list {
-		fmt.printfln("reverted %s", jtext(m))
-	}
-	return 0
-}
-
 cmd_undo :: proc(a: ^Args) -> int {
 	s := session(a)
 	ob, rest := _convo_and_rest(s, a, 1)
@@ -741,6 +695,39 @@ cmd_undo :: proc(a: ^Args) -> int {
 	req_str(&r, "msg", rid_str(resolve_msg(s, ob, rest[0])))
 	v := must(s, req_end(&r), "cannot undo")
 	return _undo_print(a, v, "undo")
+}
+
+cmd_regenerate :: proc(a: ^Args) -> int {
+	s := session(a)
+	ob, rest := _convo_and_rest(s, a, 1)
+	if len(rest) < 1 {
+		return usage_error("usage: 0ndb regenerate [CONVO] MSG")
+	}
+	r := req_begin("regenerate")
+	req_str(&r, "object", object_str(ob))
+	req_str(&r, "msg", rid_str(resolve_msg(s, ob, rest[0])))
+	v := must(s, req_end(&r), "cannot regenerate")
+	return _undo_print(a, v, "regenerate")
+}
+
+cmd_branches :: proc(a: ^Args) -> int {
+	s := session(a)
+	ob, _ := _convo_and_rest(s, a, 0)
+	r := req_begin("convo.undone")
+	req_str(&r, "object", object_str(ob))
+	v := must(s, req_end(&r), "cannot list the left branches")
+	if a.json {
+		print_json(v)
+		return 0
+	}
+	list := jarr(v, "undone")
+	if len(list) == 0 {
+		fmt.println("no left branches")
+	}
+	for x in list {
+		fmt.printfln("%s %s left %s (msg %s)", jstr(x, "undo"), jstr(x, "cause"), short_rid(jstr(x, "left")), short_rid(jstr(x, "msg")))
+	}
+	return 0
 }
 
 cmd_redo :: proc(a: ^Args) -> int {

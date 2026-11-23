@@ -6,7 +6,6 @@ import "../../convo"
 import eng "../../engine"
 import "../../fs"
 import "../../model"
-import "../../obj"
 import "../../prim"
 import rt "../../runtime"
 
@@ -30,8 +29,6 @@ RUNTIME_OPS := []Op {
 	{129, "schedule.list", {SPACE}, "schedules:[Schedule]", op_schedule_list},
 	{130, "schedule.remove", {{"owner", .Object, nil}, {"id", .Str, nil}}, "found:bool", op_schedule_remove},
 	{131, "land", {{"tree", .Object, nil}, {"from", .Str, nil}, {"into", .Str, nil}, {"dry", .Bool, nil}}, "landed:bool files:uvarint conflicts:strs", op_land},
-	{132, "go_back", {OBJ, MSG}, "", op_go_back},
-	{133, "revert", {OBJ, MSG}, "reverted:[str]", op_revert},
 	{134, "channel.deliver", {SPACE, {"channel", .Str, nil}, {"key", .Str, nil}, TEXT, {"sender", .Str, nil}, {"title", .Str, nil}, {"agent", .Id, nil}, {"workspace", .Id, nil}}, "object:object", op_channel_deliver},
 	{135, "event.deliver", {SPACE, {"agent", .Id, nil}, {"name", .Str, nil}, {"payload", .Str, nil}}, "", op_event_deliver},
 	{136, "trigger.watch", {OBJ}, "", op_trigger_watch},
@@ -46,6 +43,7 @@ RUNTIME_OPS := []Op {
 	{174, "undo", {OBJ, MSG}, "undo:id done:bool", op_undo},
 	{175, "redo", {OBJ, {"undo", .Id, nil}}, "undo:id done:bool", op_redo},
 	{176, "undo.resume", {OBJ}, "resumed:uvarint", op_undo_resume},
+	{177, "regenerate", {OBJ, MSG}, "undo:id done:bool", op_regenerate},
 	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
 }
 
@@ -622,135 +620,6 @@ op_land :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
-op_go_back :: proc(c: ^Call, o: ^Out) -> Status {
-	r := _rt(c)
-	if r == nil {
-		return .Unsupported
-	}
-	err := rt.worktree_go_back(r, a_object(c, "object"), a_rid(c, "msg"))
-	if err == .Pending {
-		eng.convo_status(c.api.e, a_object(c, "object"), ready(c))
-		if c.waiting {
-			return .Pending
-		}
-		return .Missing
-	}
-	return _rterr(err)
-}
-
-Turn_Version :: struct {
-	name:   string,
-	before: []u8,
-	after:  []u8,
-}
-
-@(private)
-_turn_versions :: proc(c: ^Call, ob: Object, msg: Rid) -> (out: [dynamic]Turn_Version, st: Status) {
-	out = make([dynamic]Turn_Version, context.temp_allocator)
-	v, err := eng.convo_view(c.api.e, ob)
-	if err != .None {
-		return out, status_of(err)
-	}
-	for i in 0 ..< len(v.segs) {
-		end := obj.end(v, i)
-		pos: i64
-		for pos < end {
-			body, next, gerr := obj.get(v, i, pos)
-			if gerr != .None || next <= pos {
-				break
-			}
-			at := pos
-			pos = next
-			if obj.is_sig(body) || obj.is_redacted(body) || obj.record_kind(body) != u8(convo.Kind.Scope) {
-				continue
-			}
-			rec, derr := convo.decode_record(body, at)
-			if derr != .None {
-				continue
-			}
-			sc, ok := rec.body.(convo.Scope)
-			if !ok || sc.kind != .Turn {
-				continue
-			}
-			target, rerr := obj.resolve(v, i, sc.msg)
-			if rerr != .None || !obj.rid_is(v, target, msg) {
-				continue
-			}
-			br := prim.reader(sc.before)
-			ar := prim.reader(sc.after)
-			bn := prim.read_len(&br)
-			an := prim.read_len(&ar)
-			befores := make(map[string][]u8, context.temp_allocator)
-			for _ in 0 ..< bn {
-				name := prim.read_str(&br)
-				befores[name] = prim.read_bytes(&br)
-			}
-			for _ in 0 ..< an {
-				name := prim.read_str(&ar)
-				after := prim.read_bytes(&ar)
-				append(&out, Turn_Version{name = name, before = befores[name], after = after})
-			}
-			if !prim.reader_ok(&br) || !prim.reader_ok(&ar) {
-				return out, .Corrupt
-			}
-		}
-	}
-	return out, .Ok
-}
-
-op_revert :: proc(c: ^Call, o: ^Out) -> Status {
-	ob := a_object(c, "object")
-	msg := a_rid(c, "msg")
-	if _, merr := eng.convo_message(c.api.e, ob, {msg = msg}, context.temp_allocator, ready(c)); merr != .None {
-		return pend(c, merr)
-	}
-	turns, tst := _turn_versions(c, ob, msg)
-	if tst != .Ok {
-		return tst
-	}
-	mounts, mserr := eng.convo_mounts(c.api.e, ob, context.temp_allocator, ready(c))
-	if mserr != .None {
-		return pend(c, mserr)
-	}
-	done := make([dynamic]string, context.temp_allocator)
-	for t in turns {
-		if string(t.before) == string(t.after) {
-			continue
-		}
-		tree: prim.Id
-		for m in mounts {
-			if m.name == t.name && !m.removed {
-				tree = m.tree
-			}
-		}
-		tm := mount_find(c.api, Object{ob.space, tree}, "")
-		if tm == nil {
-			continue
-		}
-		av, _, _, aok := rt.version_decode(t.after)
-		pv, _, _, pok := rt.version_decode(t.before)
-		if !aok || !pok {
-			return .Corrupt
-		}
-		rerr: fs.Error
-		{
-			context = eng.context_for(c.api.e)
-			rerr = fs.mount_revert(tm.mount, fs.Version(pv), fs.Version(av), ob.id)
-		}
-		if rerr != .None {
-			return .Io
-		}
-		eng.touched(c.api.e, tm.object)
-		append(&done, t.name)
-	}
-	o_arr(o, "reverted", len(done))
-	for d in done {
-		o_str(o, "", d)
-	}
-	o_end(o)
-	return .Ok
-}
-
 op_channel_deliver :: proc(c: ^Call, o: ^Out) -> Status {
 	r := _rt(c)
 	if r == nil {
@@ -913,6 +782,20 @@ op_redo :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	ob := a_object(c, "object")
 	id, err := rt.runtime_redo(r, ob, a_id(c, "undo"))
+	if err != .None && err != .Pending {
+		return status_of(err)
+	}
+	o_id(o, "undo", id)
+	o_bool(o, "done", err == .None)
+	return .Ok
+}
+
+op_regenerate :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	id, err := rt.runtime_regenerate(r, a_object(c, "object"), a_rid(c, "msg"))
 	if err != .None && err != .Pending {
 		return status_of(err)
 	}

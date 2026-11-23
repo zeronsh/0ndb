@@ -93,6 +93,8 @@ Run :: struct {
 	holding:      bool,
 	revive_of:    Rid,
 	renew_timer:  prim.Timer,
+	begin_timer:  prim.Timer,
+	begin_tries:  int,
 }
 
 @(private)
@@ -154,6 +156,9 @@ _run_free :: proc(run: ^Run) {
 	}
 	if run.renew_timer != 0 {
 		prim.timer_cancel(l, run.renew_timer)
+	}
+	if run.begin_timer != 0 {
+		prim.timer_cancel(l, run.begin_timer)
 	}
 	for &t in run.tools {
 		if t.has_obs {

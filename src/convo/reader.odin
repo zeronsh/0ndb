@@ -171,6 +171,9 @@ _positions :: proc(v: ^obj.View, self: prim.Id) -> (pos: Pos, head: Pos, browsin
 		return pos, head, false, literal, .None
 	}
 	sum, ok := _tail(v, me) or_return
+	if ok && sum.leaf_root && sum.leaf_hlc > sum.tip_hlc {
+		return Pos{hlc = sum.leaf_hlc, by = v.segs[me].id}, head, true, Pos{hlc = sum.leaf_hlc, by = v.segs[me].id}, .None
+	}
 	if !ok || obj.ref_none(sum.leaf) || sum.leaf_hlc <= sum.tip_hlc {
 		return pos, head, false, literal, .None
 	}

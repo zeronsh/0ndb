@@ -236,6 +236,7 @@ Summary :: struct {
 	tip_hlc:     prim.Hlc,
 	leaf:        Ref,
 	leaf_hlc:    prim.Hlc,
+	leaf_root:   bool,
 	last_seal:   i64,
 	digest:      i64,
 	digest_hlc:  prim.Hlc,
@@ -301,6 +302,7 @@ encode_summary :: proc(off: i64, s: ^Summary, allocator := context.temp_allocato
 		obj.fx_u64(&f, u64(s.leaf_hlc))
 		obj.tw_fixed(&w, 17, &f)
 	}
+	obj.tw_bool(&w, 29, s.leaf_root)
 	obj.tw_ref(&w, 18, off, Ref{0, s.last_seal})
 	obj.tw_ref(&w, 19, off, Ref{0, s.digest})
 	obj.tw_uv(&w, 22, u64(s.since))
@@ -379,6 +381,11 @@ decode_summary :: proc "contextless" (extra: []u8, off: i64, s: ^Summary) -> boo
 			case:
 				s.base = v
 			}
+		case 29:
+			if f.ty != obj.F_UV || f.uv > 1 {
+				return false
+			}
+			s.leaf_root = f.uv == 1
 		case 27, 28:
 			if f.ty != obj.F_UV || f.uv > u64(max(i64)) {
 				return false

@@ -355,6 +355,27 @@ op_convo_unsealed :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
+op_convo_undone :: proc(c: ^Call, o: ^Out) -> Status {
+	list, err := eng.convo_left(c.api.e, a_object(c, "object"), context.temp_allocator)
+	if err != .None {
+		return pend(c, err)
+	}
+	o_arr(o, "undone", len(list))
+	for x in list {
+		o_obj(o, "")
+		o_id(o, "undo", x.move)
+		o_enum(o, "cause", u64(x.cause), MOVE_CAUSE_NAMES[:])
+		o_rid(o, "msg", x.msg)
+		o_rid(o, "left", x.left)
+		o_rid(o, "to", x.to)
+		o_u64(o, "hlc", u64(x.hlc))
+		o_bool(o, "current", x.current)
+		o_end(o)
+	}
+	o_end(o)
+	return .Ok
+}
+
 op_send :: proc(c: ^Call, o: ^Out) -> Status {
 	parent := a_rid(c, "parent")
 	root := a_bool(c, "root")
@@ -417,10 +438,6 @@ op_switch :: proc(c: ^Call, o: ^Out) -> Status {
 	o_u64(o, "tick", c.result.tick)
 	o_id(o, "move", c.result.move)
 	return .Ok
-}
-
-op_back :: proc(c: ^Call, o: ^Out) -> Status {
-	return exec(c, o, eng.Cmd_Back{object = a_object(c, "object"), msg = a_rid(c, "msg")})
 }
 
 op_follow :: proc(c: ^Call, o: ^Out) -> Status {

@@ -83,7 +83,7 @@ _back_path :: proc(w: ^World) {
 	{
 		context = instance_context(&a.inst)
 		defer node_after(a)
-		if berr := eng.convo_back(&a.e, o, m1); berr != .None && berr != .Pending {
+		if _, berr := eng.convo_move(&a.e, o, .Switch, m1); berr != .None && berr != .Pending {
 			world_fail(w, "back path: back to the first message: %v", berr)
 			return
 		}

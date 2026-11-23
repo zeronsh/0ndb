@@ -61,11 +61,6 @@ Cmd_Switch :: struct {
 	sibling: Rid,
 }
 
-Cmd_Back :: struct {
-	object: Object,
-	msg:    Rid,
-}
-
 Cmd_Follow :: struct {
 	object: Object,
 }
@@ -170,7 +165,6 @@ Command :: union {
 	Cmd_Interrupt,
 	Cmd_Answer,
 	Cmd_Switch,
-	Cmd_Back,
 	Cmd_Follow,
 	Cmd_Mount,
 	Cmd_Unmount,
@@ -329,12 +323,6 @@ convo_switch :: proc(e: ^Engine, o: Object, sibling: Rid, done: Done = {}) -> (l
 	return r.leaf, x
 }
 
-convo_back :: proc(e: ^Engine, o: Object, msg: Rid, done: Done = {}) -> Error {
-	context = context_for(e)
-	_, x := exec(e, Cmd_Back{object = o, msg = msg}, done)
-	return x
-}
-
 convo_follow :: proc(e: ^Engine, o: Object, done: Done = {}) -> Error {
 	context = context_for(e)
 	_, x := exec(e, Cmd_Follow{object = o}, done)
@@ -413,8 +401,6 @@ _cmd_object :: proc(cmd: Command) -> Object {
 	case Cmd_Answer:
 		return c.object
 	case Cmd_Switch:
-		return c.object
-	case Cmd_Back:
 		return c.object
 	case Cmd_Follow:
 		return c.object
@@ -586,13 +572,13 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 		err = .None if x == .Pending else x
 		res.leaf = leaf
 		res.move = move
-	case Cmd_Back:
-		h = _convo_writable(e, c.object) or_return
-		off, x := convo.writer_set_leaf(&h.cw, c.msg)
-		err = _oerr(x)
-		res.off = off
-		res.leaf = c.msg
 	case Cmd_Follow:
+		cs := convo_status(e, c.object) or_return
+		if cs.browsing && cs.position != cs.head && !obj.rid_none(cs.head) {
+			if _, merr := convo_move(e, c.object, .Switch, cs.head); merr != .None && merr != .Pending {
+				return res, h, merr
+			}
+		}
 		h = _convo_writable(e, c.object) or_return
 		off, x := convo.writer_follow(&h.cw)
 		err = _oerr(x)
@@ -759,7 +745,7 @@ _cmd_clone :: proc(cmd: Command, a: runtime.Allocator) -> Command {
 		x := c
 		x.title = s(c.title, a)
 		return x
-	case Cmd_Cancel, Cmd_Interrupt, Cmd_Switch, Cmd_Back, Cmd_Follow, Cmd_Assign, Cmd_Redact:
+	case Cmd_Cancel, Cmd_Interrupt, Cmd_Switch, Cmd_Follow, Cmd_Assign, Cmd_Redact:
 		return cmd
 	}
 	return cmd

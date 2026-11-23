@@ -1034,9 +1034,9 @@ equal in both directions.
   longer exists show `held: branch <x> deleted` (passive) and resume if the
   ref comes back; the API can move them to the current line. Nothing is asked
   and the line's history is kept.
-- **Going back** to a message produces new ops that turn the files into the
-  message's version (history is never rewritten, every line keeps its
-  author). (planned) It never moves a git branch: if the branch moved past the
+- **Going back** to a message is a move (Conversations): new ops turn the
+  files into the message's version (history is never rewritten, every line
+  keeps its author). (planned) It never moves a git branch: if the branch moved past the
   message's recorded commit, the restored files show in git as uncommitted
   changes against the tip, and commits of the left timeline stay reachable
   through `refs/0ndb/<history>`. Within a line, a conversation branch is an
@@ -1832,8 +1832,8 @@ running on it is a record in it.
   writes on its fork's lines.
 - Mounts: `Mount{name, tree, line, path}` and `Unmount{name}` change which
   file trees a conversation works on; zero, one or many, from any
-  workspace. Going back to a message restores every mounted tree (and each
-  repository's git state) to that message's versions together.
+  workspace. Moving to a message (a switch, an edit, a regenerate, an undo)
+  restores every mounted tree to that message's versions together.
 - Conversation branches are owner-scoped and carry their files. The *task
   tree* of a conversation is it plus every task its turns spawned,
   transitively; ownership is derived (scope → task row → parent chain), never
@@ -1880,6 +1880,23 @@ running on it is a record in it.
     `rebase` move to its own target with its own bases, so the line ends on
     exactly the winner's branch on every device. Only the winner rebases, so
     rebases never race each other.
+  - *The moves in the API.* `switch` (67) moves to a sibling's newest leaf. A
+    `send` (60) under a parent other than the position, or with `root`, is
+    an edit: a move to that parent, then the message. `edit` keeps editing
+    queued intents only. `regenerate` (177, a reply or its user message U)
+    moves to U with the reply's turn start as the base and then answers U
+    again as a new sibling reply: the runner answers a released regenerate
+    move whose U has no reply newer than the move, so it works on any runner
+    device and resends U as it was, attachments included. An undo of the
+    first turn, like an edit of the first message, moves to before the first
+    message: a `Leaf{root}` record puts the position at the root
+    (`Summary.leaf_root`), and the next send starts a new root sibling.
+    `convo.undone` (178) lists the left branches (the newest move per left
+    position, with its cause and target), each switchable back with `redo`
+    or `switch`. A park lookup takes the move that left exactly the target
+    leaf first, and only without one a move that left an ancestor on the
+    target's path. There is no leaf-only `back` and no per-turn `go_back` or
+    `revert`; `follow` from a browsed position is a move to the tip first.
 - **Undo** of turn T of A rewinds A's whole task tree to T's start, as a set
   revert (fs) per line plus leaf and session rewinds, driven by one staged
   record.
