@@ -133,6 +133,11 @@ check_archive_reread :: proc(w: ^World) {
 		}
 	}
 	rounds := 2 + int(wiped / (256 * 1024))
+	for oi in objs {
+		if si := space_index(m, m.objs[oi].o.space); si >= 0 && !space_member(&m.spaces[si], n.idx) {
+			stat_add(w, STAT_GUEST_REREADS)
+		}
+	}
 	for oi, i in objs {
 		d := digest_object(w, n, oi)
 		for r := 0; !d.complete && r < rounds; r += 1 {
@@ -355,6 +360,7 @@ STAT_TRIMS: Stat
 STAT_TAIL: Stat
 STAT_RESTORE_HOLDERS: Stat
 STAT_RESTORE_UNREAD: Stat
+STAT_GUEST_REREADS: Stat
 STAT_OVER_TAIL: Stat
 STAT_TRIMMED: Stat
 STAT_RESTORES_WRITTEN: Stat
@@ -420,6 +426,7 @@ _archive_hooks :: proc "contextless" () {
 	STAT_TAIL = register_stat(77, 11, "tail_window", true)
 	STAT_RESTORE_HOLDERS = register_stat(77, 13, "restore_holders_online")
 	STAT_RESTORE_UNREAD = register_stat(77, 14, "restore_prefix_unread")
+	STAT_GUEST_REREADS = register_stat(77, 17, "guest_rereads")
 	STAT_OVER_TAIL = register_stat(77, 12, "records_over_tail")
 }
 

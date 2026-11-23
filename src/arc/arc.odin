@@ -922,18 +922,13 @@ Restore :: struct {
 	group:   []u8,
 }
 
-restore_stream_name :: proc(target: [16]u8, segment: string, allocator := context.temp_allocator) -> (string, Error) {
-	hex: [32]u8
-	t := target
-	prim.hex_encode(hex[:], t[:])
-	out, err := make([]u8, len(RESTORE_PREFIX) + 33 + len(segment), allocator)
+restore_stream_name :: proc(segment: string, allocator := context.temp_allocator) -> (string, Error) {
+	out, err := make([]u8, len(RESTORE_PREFIX) + len(segment), allocator)
 	if err != nil {
 		return "", .No_Memory
 	}
 	n := copy(out, RESTORE_PREFIX)
-	n += copy(out[n:], hex[:])
-	out[n] = '/'
-	copy(out[n + 1:], segment)
+	copy(out[n:], segment)
 	return string(out), .None
 }
 

@@ -372,14 +372,20 @@ relay's default quota.
 `t` or `f` for kinds 1 to 4 and `hex` is the 32 lowercase hex digits of the
 object id. Let `suffix(name, e) = BLAKE2b-128(key = name_key, u64le(e) ‖
 name)`. A token admits every stream id whose last 16 bytes equal one of:
-- `suffix(seg, e)`, `suffix("card", e)` and `suffix("ckpt/" ‖ seg, e)` for
-  `e` in 0..8;
+- `suffix(seg, e)`, `suffix("card", e)`, `suffix("ckpt/" ‖ seg, e)` and
+  `suffix("arc/" ‖ seg, e)` for `e` in 0..8;
+- `suffix("rst/" ‖ seg, 0)`;
 - `suffix("keys/" ‖ seg, e)` for `e` in 0..263;
 - `suffix("keyshead/" ‖ seg, 0)`;
 - `suffix("grantkeys/" ‖ hex(object), 0)`.
 
 Each admitted suffix carries the access bits of the tokens that admit it
-(their union, if several do).
+(their union, if several do). A grant that admits a segment admits every
+stream its bytes can move to: its archive `arc/‖seg` and the Restores
+`rst/‖seg` that redactors write for it, so trimming a segment never
+revokes read access. Every admitted name derives from the token's own
+object, so a token for one object never admits another object's archive
+or Restores.
 
 **Access.**
 - `List` with the zero id and `Get` need read in any token.
