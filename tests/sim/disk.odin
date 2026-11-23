@@ -133,6 +133,7 @@ Disk :: struct {
 	force_ghost: bool,
 	ghost_root:  string,
 	full:        bool,
+	full_cow:    bool,
 	fail_unlink: string,
 	lose_shrinks: bool,
 	dead:      bool,
@@ -733,7 +734,7 @@ _full_refuses :: proc(d: ^Disk, n: ^Inode, end: i64) -> bool {
 	if !d.full || d.probe > 0 || d.quiet {
 		return false
 	}
-	if n != nil && end <= max(i64(len(n.data)), n.alloc) {
+	if !d.full_cow && n != nil && end <= max(i64(len(n.data)), n.alloc) {
 		return false
 	}
 	d.stats.injected += 1

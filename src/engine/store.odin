@@ -631,6 +631,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		_fatal(e, err)
 	} else {
 		e.durable_seq = max(e.durable_seq, b.seq)
+		e.storage_short = .None
 		if e.fatal == .None {
 			for _, h in e.handles {
 				_table_publish(e, h)
