@@ -1,6 +1,5 @@
 package fs
 
-
 import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
@@ -3225,14 +3224,34 @@ history_alias :: proc(h: ^History, sources: []string, commit: string, v: Version
 }
 
 SCOPE_ENTRY :: 32
+SCOPE_PAGE :: 256
 
 @(private)
-scope_key :: proc(actor: prim.Id) -> []u8 {
-	k := make([]u8, 3 + 16, context.temp_allocator)
-	copy(k, "ss:")
+scope_count_key :: proc(actor: prim.Id) -> []u8 {
+	k := make([]u8, 4 + 16, context.temp_allocator)
+	copy(k, "ssn:")
 	a := actor
-	copy(k[3:], a[:])
+	copy(k[4:], a[:])
 	return k
+}
+
+@(private)
+scope_page_key :: proc(actor: prim.Id, page: u64) -> []u8 {
+	k := make([]u8, 4 + 16 + 4, context.temp_allocator)
+	copy(k, "ssp:")
+	a := actor
+	copy(k[4:], a[:])
+	prim.put_u32le(k[20:24], u32(page))
+	return k
+}
+
+@(private)
+scope_count :: proc(h: ^History, actor: prim.Id) -> (n: u64, err: Error) {
+	v, found := kv_get(&h.kv, scope_count_key(actor), context.temp_allocator) or_return
+	if !found || len(v) != 8 {
+		return 0, .None
+	}
+	return prim.get_u64le(v), .None
 }
 
 @(private)
@@ -3241,33 +3260,44 @@ scope_index :: proc(h: ^History, b: ^crdt.Batch, content: []u8) -> Error {
 	if !ok {
 		return .None
 	}
-	key := scope_key(b.actor)
-	list, _ := kv_get(&h.kv, key, context.temp_allocator) or_return
-	if n := len(list); n >= SCOPE_ENTRY && prim.get_u64le(list[n - SCOPE_ENTRY:]) >= b.seq {
-		return .None
+	n := scope_count(h, b.actor) or_return
+	if n > 0 {
+		last, _ := kv_get(&h.kv, scope_page_key(b.actor, (n - 1) / SCOPE_PAGE), context.temp_allocator) or_return
+		if len(last) >= SCOPE_ENTRY && prim.get_u64le(last[len(last) - SCOPE_ENTRY:]) >= b.seq {
+			return .None
+		}
+	}
+	page := n / SCOPE_PAGE
+	cur: []u8
+	if n % SCOPE_PAGE != 0 {
+		cur, _ = kv_get(&h.kv, scope_page_key(b.actor, page), context.temp_allocator) or_return
 	}
 	e: [SCOPE_ENTRY]u8
 	prim.put_u64le(e[0:8], b.seq)
 	prim.put_u64le(e[8:16], u64(crdt.batch_len(b)))
-	s := scope
-	copy(e[16:], s[:])
-	out := make([dynamic]u8, 0, len(list) + SCOPE_ENTRY, context.temp_allocator)
-	append(&out, ..list)
+	sc := scope
+	copy(e[16:], sc[:])
+	out := make([dynamic]u8, 0, len(cur) + SCOPE_ENTRY, context.temp_allocator)
+	append(&out, ..cur)
 	append(&out, ..e[:])
-	return kv_put(&h.kv, key, out[:])
+	kv_put(&h.kv, scope_page_key(b.actor, page), out[:]) or_return
+	nb: [8]u8
+	prim.put_u64le(nb[:], n + 1)
+	return kv_put(&h.kv, scope_count_key(b.actor), nb[:])
 }
 
 history_scope_of :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, found: bool, err: Error) {
 	history_ready(h) or_return
-	list, ok := kv_get(&h.kv, scope_key(op.actor), context.temp_allocator) or_return
-	if !ok {
+	n := scope_count(h, op.actor) or_return
+	if n == 0 {
 		return {}, false, .None
 	}
-	n := len(list) / SCOPE_ENTRY
-	lo, hi := 0, n
+	pages := (n + SCOPE_PAGE - 1) / SCOPE_PAGE
+	lo, hi := u64(0), pages
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if prim.get_u64le(list[mid * SCOPE_ENTRY:]) <= op.seq {
+		pg, _ := kv_get(&h.kv, scope_page_key(op.actor, mid), context.temp_allocator) or_return
+		if len(pg) >= SCOPE_ENTRY && prim.get_u64le(pg[0:8]) <= op.seq {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -3276,7 +3306,21 @@ history_scope_of :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, found:
 	if lo == 0 {
 		return {}, false, .None
 	}
-	e := list[(lo - 1) * SCOPE_ENTRY:][:SCOPE_ENTRY]
+	list, _ := kv_get(&h.kv, scope_page_key(op.actor, lo - 1), context.temp_allocator) or_return
+	m := len(list) / SCOPE_ENTRY
+	a, z := 0, m
+	for a < z {
+		mid := (a + z) / 2
+		if prim.get_u64le(list[mid * SCOPE_ENTRY:]) <= op.seq {
+			a = mid + 1
+		} else {
+			z = mid
+		}
+	}
+	if a == 0 {
+		return {}, false, .None
+	}
+	e := list[(a - 1) * SCOPE_ENTRY:][:SCOPE_ENTRY]
 	first, count := prim.get_u64le(e[0:8]), prim.get_u64le(e[8:16])
 	if op.seq >= first + count {
 		return {}, false, .None

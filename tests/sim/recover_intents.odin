@@ -115,6 +115,7 @@ _ri_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 	base: []u8
 	scope: ^fs.Scope
 	actor: prim.Id
+	sid: prim.Id
 	{
 		context = instance_context(&a.inst)
 		defer node_after(a)
@@ -124,7 +125,7 @@ _ri_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 			return
 		}
 		base = b
-		sid := prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng))
+		sid = prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng))
 		actor = prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng))
 		scope = fs.scope_open(a.reg, m, sid, actor)
 		fs.scope_read_base(scope, "a.txt", base)
@@ -158,7 +159,7 @@ _ri_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 	crashed = w.stats.crashes > crashes
 	if !crashed {
 		run_until(w, w.now + 5_000_000_000, true)
-		if a.alive && (!_ri_check_synced(w, a, tree, m, actor, k) || notes.merged == 0) {
+		if a.alive && (!_ri_check_synced(w, a, tree, m, actor, sid, k) || notes.merged == 0) {
 			world_fail(w, "recover: the agent's write from its stale base was not merged (%d other base notes), so the pass never held two concurrent intents", notes.other)
 		}
 		return
@@ -174,14 +175,14 @@ _ri_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 		return
 	}
 	if m2, ok := _ri_remount(w, a, tree, k); ok {
-		_ri_check_synced(w, a, tree, m2, actor, k)
+		_ri_check_synced(w, a, tree, m2, actor, sid, k)
 		run_until(w, w.now + 5_000_000_000, true)
 	}
 	return
 }
 
 @(private = "file")
-_ri_check_synced :: proc(w: ^World, a: ^Node, tree: eng.Object, m: ^fs.Mount, actor: prim.Id, k: u64) -> (merged: bool) {
+_ri_check_synced :: proc(w: ^World, a: ^Node, tree: eng.Object, m: ^fs.Mount, actor: prim.Id, sid: prim.Id, k: u64) -> (merged: bool) {
 	context = instance_context(&a.inst)
 	defer node_after(a)
 	h, herr := eng.tree_history(&a.e, tree)
@@ -198,6 +199,9 @@ _ri_check_synced :: proc(w: ^World, a: ^Node, tree: eng.Object, m: ^fs.Mount, ac
 	have := make([dynamic]crdt.Lv, context.temp_allocator)
 	if !ok || crdt.graph_version_lvs(&h.g, m.synced[:], &have) != .None || !crdt.graph_contains(&h.g, have[:], lv) {
 		world_fail(w, "recover: after a crash at op %d the mount's synced version %v misses the agent's own merged base, op %s:%d, which its history holds", k, m.synced[:], id_short(actor), known - 1)
+	}
+	if sc, found, _ := fs.history_scope_of(h, crdt.Op_Id{actor, known - 1}); !found || sc != sid {
+		world_fail(w, "recover: after a crash at op %d the agent's merged write op %s:%d is attributed to scope %v (found %v), not its tool scope %v", k, id_short(actor), known - 1, sc, found, sid)
 	}
 	return true
 }
