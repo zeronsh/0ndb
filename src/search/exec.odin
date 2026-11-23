@@ -293,6 +293,9 @@ search :: proc(ix: ^Index, query: string, req: Request, allocator := context.all
 	e.emitted = make([dynamic]prim.Id, a)
 	e.k = clamp(r.limit if r.limit > 0 else DEFAULT_LIMIT, 1, MAX_LIMIT) + 1
 	e.half_life = r.half_life_ms if r.half_life_ms > 0 else DEFAULT_HALF_LIFE
+	if r.now == 0 {
+		prim.unrouted("a search clock read without a request time")
+	}
 	e.now_ms = i64(u64(r.now) >> 16) if r.now != 0 else prim.now_ms()
 	e.n_docs = max(f64(ix.man.next_doc + u64(len(ix.mem.docs))), 1)
 	e.heap = make([dynamic]Entry, 0, e.k, a)

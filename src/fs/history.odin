@@ -230,6 +230,7 @@ history_wall_ms :: proc(h: ^History) -> i64 {
 	if h.opts.clock.wall_ms != nil {
 		return h.opts.clock.wall_ms(h.opts.clock.data)
 	}
+	prim.unrouted("a history wall clock read without a clock")
 	return prim.now_ms()
 }
 
@@ -281,6 +282,7 @@ history_wall_ns :: proc(h: ^History) -> i64 {
 	if h.opts.clock.wall_ms != nil {
 		return h.opts.clock.wall_ms(h.opts.clock.data) * 1_000_000
 	}
+	prim.unrouted("a history wall clock read without a clock")
 	return prim.now_ns()
 }
 

@@ -80,9 +80,7 @@ init :: proc(db: ^Odb, vfs: prim.Vfs, clock: prim.Clock, random: prim.Random, al
 	db.vfs = vfs
 	db.clock = clock
 	db.random = random
-	seed: [8]u8
-	prim.random_fill(random, seed[:])
-	db.temp_seq = transmute(u64)seed
+	db.temp_seq = u64(prim.clock_wall_ns(clock))
 	db.dirs = make([dynamic]Object_Dir, allocator)
 	db.pending_files = make([dynamic]string, allocator)
 	db.pending_dirs = make([dynamic]string, allocator)
