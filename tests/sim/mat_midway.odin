@@ -199,7 +199,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 		if len(held) > 0 {
 			sid := prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng))
 			actor := prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng))
-			scope = fs.scope_open(a.reg, m, sid, actor)
+			scope = sim_scope_open(w, a.reg, m, sid, actor)
 			fs.scope_write_begin(scope, held)
 		}
 	}

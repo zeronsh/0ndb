@@ -314,3 +314,17 @@ history_applied_gap :: proc(h: ^History, stream: prim.Id, r: ^journal.Reader) ->
 	}
 	return 0, false, .None
 }
+
+history_unowned_actors :: proc(h: ^History, out: ^[dynamic]prim.Id) {
+	if h == nil || !h.awake {
+		return
+	}
+	for a in h.g.actors {
+		if a == {} {
+			continue
+		}
+		if _, ok := history_actor_owner(h, a); !ok {
+			append(out, a)
+		}
+	}
+}
