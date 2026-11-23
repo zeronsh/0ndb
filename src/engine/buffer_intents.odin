@@ -42,6 +42,8 @@ _dlog_close :: proc(e: ^Engine) {
 		return
 	}
 	dl.close(&e.dlog)
+	delete(e.dlog_due)
+	e.dlog_due = nil
 	delete(e.dlog_path, e.allocator)
 	e.dlog_path = ""
 	e.dlog_open = false
@@ -77,15 +79,24 @@ _dlog_record :: proc(e: ^Engine, b: ^Buffer, hits: []crdt.Op_Span) -> Error {
 }
 
 @(private)
+Dlog_Step :: enum u8 {
+	Done,
+	Wait,
+	Retry,
+}
+
+@(private)
 _dlog_tick :: proc(e: ^Engine) {
-	if !e.dlog_open || len(e.dlog.live) == 0 || len(e.changed) == 0 {
+	if !e.dlog_open || len(e.dlog.live) == 0 || (len(e.changed) == 0 && len(e.dlog_due) == 0) {
 		return
 	}
 	scratch := virtual.arena_temp_begin(&e.temp)
 	defer virtual.arena_temp_end(scratch)
 	due := make([dynamic]u64, context.temp_allocator)
 	for x in e.dlog.live {
-		if _, ok := e.changed[x.object]; ok {
+		_, changed := e.changed[x.object]
+		_, retry := e.dlog_due[x.id]
+		if changed || retry {
 			append(&due, x.id)
 		}
 	}
@@ -100,8 +111,22 @@ _dlog_tick :: proc(e: ^Engine) {
 				break
 			}
 		}
-		if at < 0 || !_dlog_apply(e, e.dlog.live[at]) {
+		if at < 0 {
+			delete_key(&e.dlog_due, id)
 			continue
+		}
+		switch _dlog_apply(e, e.dlog.live[at]) {
+		case .Retry:
+			if e.dlog_due == nil {
+				e.dlog_due = make(map[u64]bool, e.allocator)
+			}
+			e.dlog_due[id] = true
+			continue
+		case .Wait:
+			delete_key(&e.dlog_due, id)
+			continue
+		case .Done:
+			delete_key(&e.dlog_due, id)
 		}
 		if dl.done(&e.dlog, id) != .None {
 			_log(e, .Warn, "the buffer delete log did not record an applied delete")
@@ -112,27 +137,35 @@ _dlog_tick :: proc(e: ^Engine) {
 }
 
 @(private)
-_dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> bool {
+_dlog_busy :: proc(err: Error) -> Dlog_Step {
+	return .Retry if err == .Busy else .Wait
+}
+
+@(private)
+_dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> Dlog_Step {
 	kind := Kind(x.kind)
 	if kind != .Text && kind != .File_Tree {
-		return true
+		return .Done
 	}
 	o := Object{x.space, x.object}
 	h, err := _handle_get(e, o, kind)
-	if err != .None {
-		return err == .Not_Found
+	if err == .Not_Found {
+		return .Done
 	}
-	if _hist_ready(e, h) != .None {
-		return false
+	if err != .None {
+		return _dlog_busy(err)
+	}
+	if rerr := _hist_ready(e, h); rerr != .None {
+		return _dlog_busy(rerr)
 	}
 	_hist_catch_up(e, h)
 	hist := h.hist
-	if hist == nil || hist.own_wait {
-		return false
+	if hist == nil || !hist.awake || hist.own_wait {
+		return .Retry
 	}
 	for s in x.spans {
 		if _, ok := crdt.graph_lv(&hist.g, crdt.Op_Id{s.actor, s.seq + u64(s.len) - 1}); !ok {
-			return false
+			return .Wait
 		}
 	}
 	b := new(Buffer, e.allocator)
@@ -145,18 +178,18 @@ _dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> bool {
 	b.actor = x.actor
 	line, lerr := _clone(x.line, e.allocator)
 	if lerr != .None {
-		return false
+		return .Retry
 	}
 	b.line = line
 	b.version = make([dynamic]crdt.Op_Id, e.allocator)
 	target, terr := _buffer_target(b, h)
 	if terr != .None {
-		return false
+		return _dlog_busy(terr)
 	}
 	v := _dlog_chain(hist, target, x.actor)
 	view, verr := fs.history_view_open(hist, b.inode, v)
 	if verr != .None {
-		return false
+		return _dlog_busy(_ferr(verr))
 	}
 	b.view = view
 	append(&b.version, ..v)
@@ -168,10 +201,12 @@ _dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> bool {
 		append(&g.inserts, crdt.Op_Span{crdt.Op_Id{s.actor, s.seq}, s.len})
 	}
 	if _, aerr := _undo_apply(e, b, h, &g); aerr != .None {
-		_log(e, .Warn, "a recorded buffer delete did not apply")
-		return false
+		if aerr != .Busy {
+			_log(e, .Warn, "a recorded buffer delete did not apply")
+		}
+		return _dlog_busy(aerr)
 	}
-	return true
+	return .Done
 }
 
 @(private)
