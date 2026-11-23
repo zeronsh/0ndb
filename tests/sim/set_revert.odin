@@ -978,10 +978,17 @@ _sr_unmounted :: proc(w: ^World) -> (reverted: bool) {
 		eng.tree_write(&n.e, tree, nm, transmute([]u8)strings.concatenate({string(cur), fmt.tprintf("<u%d>\n", tok)}, context.temp_allocator))
 	}
 	after := snapshot(n, tree, names)
-	revert, rerr := eng.tree_revert_set(&n.e, tree, base, []prim.Id{n.e.self})
+	undo := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	if _, had, _ := eng.tree_undo_revert(&n.e, tree, undo); had {
+		world_fail(w, "unmounted revert: an undo id finds a revert before any was made")
+	}
+	revert, rerr := eng.tree_revert_set(&n.e, tree, base, []prim.Id{n.e.self}, "", undo)
 	if rerr != .None {
 		world_fail(w, "unmounted revert: tree_revert_set: %v", rerr)
 		return false
+	}
+	if got, had, _ := eng.tree_undo_revert(&n.e, tree, undo); revert != {} && (!had || got != revert) {
+		world_fail(w, "unmounted revert: the undo id finds %v (found=%v), not its revert %v", got, had, revert)
 	}
 	if got := snapshot(n, tree, names); !_sr_same(got, before) {
 		world_fail(w, "unmounted revert: the tree holds %v after the revert, not %v", got, before)
