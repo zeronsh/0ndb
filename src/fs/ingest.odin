@@ -2393,6 +2393,9 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 		parent, ok := parent_inode(p, c.path)
 		if !ok {
 			mount_mark(m, c.path)
+			if c.moved != "" {
+				mount_mark(m, c.moved)
+			}
 			return .None
 		}
 		if c.moved != "" {
