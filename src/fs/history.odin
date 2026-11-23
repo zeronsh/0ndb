@@ -2399,7 +2399,11 @@ read_stream :: proc(h: ^History, stream: u32, off: i64, buf: ^[dynamic]u8) -> (b
 		if jerr == .Redacted {
 			at, ok := h.replay_repl[off]
 			if !ok {
-				return nil, .Redacted
+				data, found, kerr := kv_get(&h.kv, replace_key(0, u64(off)), context.temp_allocator)
+				if kerr != .None || !found || len(data) != 8 {
+					return nil, .Redacted
+				}
+				at = i64(prim.get_u64le(data))
 			}
 			b, _, jerr = journal.record_at(&r, at)
 		}
@@ -2835,6 +2839,9 @@ replay_own :: proc(h: ^History) -> Error {
 				if rerr != .None {
 					return from_journal(rerr)
 				}
+				v: [8]u8
+				prim.put_u64le(v[:], u64(at))
+				kv_put(&h.kv, replace_key(0, u64(off)), v[:]) or_return
 				x, xok := replace_decode(rb)
 				if !xok {
 					return .Corrupt

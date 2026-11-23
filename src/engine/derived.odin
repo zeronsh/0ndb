@@ -552,8 +552,27 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 		return .None
 	}
 	src := hist.dir
+	have := strings.builder_make(context.temp_allocator)
+	_tree_digest(hist, &have) or_return
+	for shuffled in ([2]bool{false, true}) {
+		want, done := _hist_rebuild(e, h, hist, shuffled) or_return
+		if !done {
+			return .None
+		}
+		if strings.to_string(have) != want {
+			how := "a rebuild of its journal and streams" if !shuffled else "a rebuild that admits its streams in reverse order and reloads every file after each batch"
+			append(notes, fmt.tprintf("history %s differs from %s (applied %v streams %v journal %d heads %v dir %s):\n--- have\n%s--- rebuilt\n%s", prim.id_hex(o.id), how, hist.applied[:], len(hist.stream_ids), journal.journal_durable_len(&hist.journal), fs.history_heads(hist, context.temp_allocator), src, strings.to_string(have), want))
+			return .None
+		}
+	}
+	return .None
+}
+
+@(private)
+_hist_rebuild :: proc(e: ^Engine, h: ^Handle, hist: ^fs.History, shuffled: bool) -> (digest: string, done: bool, err: Error) {
+	src := hist.dir
 	vdir := _join(context.temp_allocator, e.pack_root, "verify") or_return
-	hx := prim.id_hex(o.id)
+	hx := prim.id_hex(h.id)
 	scratch := _join(context.temp_allocator, vdir, string(hx[:])) or_return
 	_perr(prim.mkdir_all(e.vfs, scratch, 0o700)) or_return
 	names := []string{"fs.journal", "fs.journal.redact"}
@@ -590,7 +609,7 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 	opts := _hist_options(h)
 	opts.keep_at_least = 0
 	opts.redacted = {}
-	re := _ferr2(fs.history_create(e.vfs, scratch, o.id, e.self, db, fs.Stream_Source{data = h, read = _hist_read}, e.allocator, opts)) or_return
+	re := _ferr2(fs.history_create(e.vfs, scratch, h.id, e.self, db, fs.Stream_Source{data = h, read = _hist_read}, e.allocator, opts)) or_return
 	defer fs.history_release(re)
 	limits := make(map[prim.Id]i64, 8, context.temp_allocator)
 	for id, i in hist.stream_ids {
@@ -598,19 +617,23 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 			limits[id] = hist.applied[i]
 		}
 	}
+	order := make([dynamic]^Seg, 0, len(h.segs), context.temp_allocator)
+	append(&order, ..h.segs[:])
+	if shuffled {
+		for k in 0 ..< len(order) / 2 {
+			order[k], order[len(order) - 1 - k] = order[len(order) - 1 - k], order[k]
+		}
+	}
 	positions := make(map[prim.Id]i64, 8, context.temp_allocator)
 	for {
 		progress := false
-		for s in h.segs {
+		for s in order {
 			limit := limits[s.device]
 			pos := positions[s.device]
 			for pos < limit {
 				body, next, rerr := journal.record_at(&s.jr, pos)
-				if rerr == .Redacted {
-					return .None
-				}
 				if rerr != .None {
-					return .None
+					return "", false, .None
 				}
 				if !journal.is_sig(body) {
 					owned := make([]u8, len(body), context.temp_allocator)
@@ -618,7 +641,13 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 					if _, aerr := fs.history_admit(re, s.device, pos, owned); aerr == .Not_Found {
 						break
 					} else if aerr != .None {
-						return .None
+						return "", false, .None
+					}
+					if shuffled {
+						if fs.history_persist(re) != .None {
+							return "", false, .None
+						}
+						fs.history_unload_files(re)
 					}
 				}
 				pos = next
@@ -632,17 +661,18 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 	}
 	for id, limit in limits {
 		if positions[id] < limit {
-			return .None
+			return "", false, .None
 		}
 	}
-	have := strings.builder_make(context.temp_allocator)
-	want := strings.builder_make(context.temp_allocator)
-	_tree_digest(hist, &have) or_return
-	_tree_digest(re, &want) or_return
-	if strings.to_string(have) != strings.to_string(want) {
-		append(notes, fmt.tprintf("history %s differs from a rebuild of its journal and streams (applied %v/%v streams %v/%v journal %d/%d heads %v/%v dir %s):\n--- have\n%s--- rebuilt\n%s", prim.id_hex(o.id), hist.applied[:], re.applied[:], len(hist.stream_ids), len(re.stream_ids), journal.journal_durable_len(&hist.journal), journal.journal_durable_len(&re.journal), fs.history_heads(hist, context.temp_allocator), fs.history_heads(re, context.temp_allocator), src, strings.to_string(have), strings.to_string(want)))
+	if shuffled {
+		if fs.history_persist(re) != .None {
+			return "", false, .None
+		}
+		fs.history_unload_files(re)
 	}
-	return .None
+	want := strings.builder_make(context.temp_allocator)
+	_tree_digest(re, &want) or_return
+	return strings.to_string(want), true, .None
 }
 
 @(private)
