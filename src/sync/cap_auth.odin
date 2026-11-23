@@ -130,7 +130,11 @@ cap_authorizer_init :: proc(a: ^Cap_Authorizer, inner: Authorizer, default_quota
 }
 
 cap_authorizer_destroy :: proc(a: ^Cap_Authorizer) {
-	for _, g in a.grants {
+	for mk1_ in prim.sorted_keys(a.grants) {
+		if mk1_ not_in a.grants {
+			continue
+		}
+		g := a.grants[mk1_]
 		_cap_grant_free(a, g)
 	}
 	delete(a.grants)

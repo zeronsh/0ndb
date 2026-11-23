@@ -248,7 +248,11 @@ _lease_arm :: proc(e: ^Engine) {
 	}
 	now := i64(_now_ms(e))
 	next := i64(-1)
-	for _, sp in e.spaces {
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if mk1_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk1_]
 		if sp.keyless || sp.mem.me != .Runner || sp.mem.lease_ms == 0 || sp.mem.removed || sp.mem.asked {
 			continue
 		}

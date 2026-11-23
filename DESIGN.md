@@ -197,6 +197,14 @@ The engine is designed so that none of these has an exception:
   processes, under seeded randomness, with crashes at any instruction
   boundary. It checks convergence, durability, attribution and deletion
   across thousands of runs. Any failure replays exactly from its seed.
+  Replay depends on nothing following memory layout: Odin seeds a map's hash
+  from its data address, so a map is never iterated in hash order where the
+  order can reach I/O, a commit, an emitted event or an ordered result. Such
+  loops walk `prim.sorted_keys`; a loop whose order cannot matter (a free, an
+  any-check, a unique lookup, a collection sorted afterwards) says so with
+  `prim.unordered`. The gate checks every map loop in `src` and `tests/sim`
+  for one or the other, and reruns seeds with the sim's allocation regions
+  shifted, requiring identical traces and disk images.
 - **Every platform claim is verified on that platform.** CI runs the
   simulator and real-process checks on Linux and macOS hardware.
 

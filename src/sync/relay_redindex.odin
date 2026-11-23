@@ -174,7 +174,11 @@ Redaction_Violation :: struct {
 }
 
 relay_core_redactions_held :: proc(r: ^Relay_Core, out: ^[dynamic]Redaction_Violation) {
-	for _, sp in r.spaces {
+	for mk1_ in prim.sorted_keys(r.spaces) {
+		if mk1_ not_in r.spaces {
+			continue
+		}
+		sp := r.spaces[mk1_]
 		_red_index_load(r, sp)
 		for id, ranges in sp.red_index {
 			h, length, err := r.store.stream_open(r.store.data, sp.ns, id, false)

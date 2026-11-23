@@ -131,10 +131,10 @@ init :: proc(t: ^Tree, source := Source{}, max_lamport: u64 = 0, fanout := DEFAU
 
 destroy :: proc(t: ^Tree) {
 	txn_abort(t)
-	for _, n in t.inodes {
+	for _, n in prim.unordered(t.inodes) {
 		inode_free(t, n)
 	}
-	for _, n in t.nodes {
+	for _, n in prim.unordered(t.nodes) {
 		node_free(t, n)
 	}
 	delete(t.inodes)
@@ -325,7 +325,7 @@ is_present :: proc "contextless" (n: ^Inode) -> bool {
 dirty :: proc(t: ^Tree, allocator := context.allocator) -> (inodes: []Inode_Id, nodes: []Node_State, err: runtime.Allocator_Error) {
 	inodes = make([]Inode_Id, len(t.dirty_inodes), allocator) or_return
 	i := 0
-	for id in t.dirty_inodes {
+	for id in prim.unordered(t.dirty_inodes) {
 		inodes[i] = id
 		i += 1
 	}
@@ -335,7 +335,7 @@ dirty :: proc(t: ^Tree, allocator := context.allocator) -> (inodes: []Inode_Id, 
 		return nil, nil, err
 	}
 	i = 0
-	for key, deleted in t.dirty_nodes {
+	for key, deleted in prim.unordered(t.dirty_nodes) {
 		nodes[i] = Node_State{key, deleted}
 		i += 1
 	}
@@ -370,7 +370,11 @@ trim :: proc(t: ^Tree, keep: int) -> runtime.Allocator_Error {
 		return nil
 	}
 	aged := make([dynamic]Aged, 0, max(len(t.inodes), len(t.nodes)), context.temp_allocator) or_return
-	for id, n in t.inodes {
+	for id in prim.sorted_keys(t.inodes) {
+		if id not_in t.inodes {
+			continue
+		}
+		n := t.inodes[id]
 		if id != ROOT && !(id in t.dirty_inodes) {
 			append(&aged, Aged{inode = id, used = n.used})
 		}
@@ -385,7 +389,11 @@ trim :: proc(t: ^Tree, keep: int) -> runtime.Allocator_Error {
 		}
 	}
 	clear(&aged)
-	for key, n in t.nodes {
+	for key in prim.sorted_keys(t.nodes) {
+		if key not_in t.nodes {
+			continue
+		}
+		n := t.nodes[key]
 		if !(key in t.dirty_nodes) {
 			append(&aged, Aged{key = key, used = n.used})
 		}

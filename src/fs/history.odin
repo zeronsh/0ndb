@@ -1648,7 +1648,7 @@ history_flush_staged :: proc(h: ^History, upto: u64) -> Error {
 }
 
 history_unload_files :: proc(h: ^History) {
-	for _, f in h.files {
+	for _, f in prim.unordered(h.files) {
 		file_free(h, f)
 	}
 	clear(&h.files)

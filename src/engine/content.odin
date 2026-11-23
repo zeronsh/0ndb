@@ -83,7 +83,11 @@ _content_init :: proc(e: ^Engine) {
 
 @(private)
 _content_destroy :: proc(e: ^Engine) {
-	for _, w in e.content.waits {
+	for mk2_ in prim.sorted_keys(e.content.waits) {
+		if mk2_ not_in e.content.waits {
+			continue
+		}
+		w := e.content.waits[mk2_]
 		if w.timer != 0 {
 			prim.timer_cancel(e.loop, w.timer)
 		}
@@ -515,7 +519,11 @@ _content_events_process :: proc(e: ^Engine) {
 
 @(private)
 _content_pending :: proc(e: ^Engine, object: prim.Id) -> bool {
-	for _, w in e.content.waits {
+	for mk1_ in prim.sorted_keys(e.content.waits) {
+		if mk1_ not_in e.content.waits {
+			continue
+		}
+		w := e.content.waits[mk1_]
 		if w.object == object && w.attempts < CONTENT_RETRIES {
 			return true
 		}

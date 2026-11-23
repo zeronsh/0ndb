@@ -203,7 +203,11 @@ redact_run :: proc(db: ^Odb, targets: []Oid, ref_prefix: string, protect: []Oid,
 			append(&updates, Update{ref.name, ref.oid, res.oid, false})
 		}
 	}
-	for old, res in r.commits {
+	for old in prim.sorted_keys(r.commits) {
+		if old not_in r.commits {
+			continue
+		}
+		res := r.commits[old]
 		if !res.dropped && res.oid != old {
 			append(&out, Rewrite{old, res.oid})
 		}
@@ -212,12 +216,20 @@ redact_run :: proc(db: ^Odb, targets: []Oid, ref_prefix: string, protect: []Oid,
 	defer delete(superseded)
 	append(&superseded, ..superseded_in)
 	if drop_superseded {
-		for old, res in r.commits {
+		for old in prim.sorted_keys(r.commits) {
+			if old not_in r.commits {
+				continue
+			}
+			res := r.commits[old]
 			if res.dropped || res.oid != old {
 				append(&superseded, old)
 			}
 		}
-		for old, res in r.trees {
+		for old in prim.sorted_keys(r.trees) {
+			if old not_in r.trees {
+				continue
+			}
+			res := r.trees[old]
 			if res.oid != old {
 				append(&superseded, old)
 			}
@@ -272,7 +284,7 @@ redact_run :: proc(db: ^Odb, targets: []Oid, ref_prefix: string, protect: []Oid,
 	}
 	unreached := make([dynamic]Unreached, allocator)
 	left := 0
-	for oid in drop {
+	for oid in prim.sorted_keys(drop) {
 		l, pinned := scrub_left(db, oid)
 		if l {
 			left += 1
@@ -314,7 +326,7 @@ redact_run :: proc(db: ^Odb, targets: []Oid, ref_prefix: string, protect: []Oid,
 			}
 		}
 		reach_named(db, named[:], &held, .Protected, "", &unreached, allocator)
-		for oid in held {
+		for oid in prim.sorted_keys(held) {
 			append(&unreached, Unreached{oid = oid, reason = .Shared})
 		}
 	}

@@ -1,5 +1,7 @@
 package sim
 
+import "../../src/prim"
+
 import osync "../../src/sync"
 
 check_pull_flights :: proc(w: ^World) {
@@ -18,12 +20,20 @@ check_pull_flights :: proc(w: ^World) {
 
 check_pull_flights_repl :: proc(w: ^World, n: ^Node, r: ^osync.Replicator) {
 	why := "was never answered after the settle" if r.phase == .Ready else "outlived its connection"
-	for _, rm in r.remotes {
+	for mk2_ in prim.sorted_keys(r.remotes) {
+		if mk2_ not_in r.remotes {
+			continue
+		}
+		rm := r.remotes[mk2_]
 		for p in rm.pulls {
 			world_fail(w, "pull flight: %s pull of %s device %s %d..%d from holder %s tag %d %s (phase %v)", n.name, rm.name, id_short(rm.device), p.from, p.to, id_short(p.holder), p.tag, why, r.phase)
 		}
 	}
-	for tag, j in r.objs.pulls {
+	for tag in prim.sorted_keys(r.objs.pulls) {
+		if tag not_in r.objs.pulls {
+			continue
+		}
+		j := r.objs.pulls[tag]
 		world_fail(w, "pull flight: %s object pipe pull tag %d from holder %s at %d %s (phase %v)", n.name, tag, id_short(j.p_holder), j.p_at, why, r.phase)
 	}
 }

@@ -56,7 +56,11 @@ _daemon_start :: proc(a: ^Args) -> int {
 		return 0
 	}
 	extra := make([dynamic]string, context.temp_allocator)
-	for name, value in a.flags {
+	for name in prim.sorted_keys(a.flags) {
+		if name not_in a.flags {
+			continue
+		}
+		value := a.flags[name]
 		if name == "json" || name == "timeout" {
 			continue
 		}

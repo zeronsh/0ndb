@@ -756,15 +756,19 @@ _span_save :: proc(r: ^Replicator, rm: ^Remote, durable := true) {
 @(private)
 _feed_subscribe :: proc(r: ^Replicator, from_start: bool) {
 	pats := make([dynamic]Feed_Pattern, context.temp_allocator)
-	for id, rm in r.remotes {
+	for id in prim.sorted_keys(r.remotes) {
+		if id not_in r.remotes {
+			continue
+		}
+		rm := r.remotes[id]
 		if _following(rm) && !rm.grouped && !(id in r.answers) {
 			append(&pats, Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
 		}
 	}
-	for id in r.answers {
+	for id in prim.sorted_keys(r.answers) {
 		append(&pats, Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
 	}
-	for suffix in r.groups {
+	for suffix in prim.sorted_keys(r.groups) {
 		p := Feed_Pattern{kind = .Suffix}
 		sfx := suffix
 		copy(p.bytes[:16], sfx[:])
@@ -1004,7 +1008,11 @@ _key_probe :: proc(r: ^Replicator, rm: ^Remote, k: ^_Checker) -> (holding: bool)
 @(private)
 _key_probe_answered :: proc(r: ^Replicator, head: ^Remote, epoch: u64, ok: bool) {
 	list := make([dynamic]^Remote, context.temp_allocator)
-	for _, rm in r.remotes {
+	for mk1_ in prim.sorted_keys(r.remotes) {
+		if mk1_ not_in r.remotes {
+			continue
+		}
+		rm := r.remotes[mk1_]
 		if rm.key_wait && rm.key_head == head.id && !(ok && epoch > rm.key_probe) {
 			append(&list, rm)
 		}

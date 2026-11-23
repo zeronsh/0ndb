@@ -49,7 +49,11 @@ check_epochs :: proc(w: ^World) {
 	}
 	context = w.ctx
 	current := make(map[prim.Id]osync.Epoch_Tag, context.temp_allocator)
-	for space, list in views {
+	for space in prim.sorted_keys(views) {
+		if space not_in views {
+			continue
+		}
+		list := views[space]
 		most := 0
 		for v in list {
 			most = max(most, v.records)

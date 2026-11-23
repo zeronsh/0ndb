@@ -91,7 +91,7 @@ curl_ca_file :: proc(h: ^Curl, path: string) {
 
 curl_destroy :: proc(h: ^Curl) {
 	ids := make([dynamic]Id, context.temp_allocator)
-	for id in h.live {
+	for id in prim.sorted_keys(h.live) {
 		append(&ids, id)
 	}
 	slice.sort(ids[:])

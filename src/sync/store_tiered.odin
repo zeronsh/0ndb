@@ -201,7 +201,11 @@ tier_store_destroy :: proc(t: ^Tier_Store) {
 		free(th, t.allocator)
 	}
 	delete(t.parked)
-	for _, sp in t.spaces {
+	for mk1_ in prim.sorted_keys(t.spaces) {
+		if mk1_ not_in t.spaces {
+			continue
+		}
+		sp := t.spaces[mk1_]
 		_tier_space_free(t, sp)
 	}
 	delete(t.spaces)
@@ -227,7 +231,11 @@ tier_store_sweep :: proc(t: ^Tier_Store, ids: []Space_Id) -> (dirty: int) {
 }
 
 tier_store_flush_all :: proc(t: ^Tier_Store) {
-	for _, sp in t.spaces {
+	for mk4_ in prim.sorted_keys(t.spaces) {
+		if mk4_ not_in t.spaces {
+			continue
+		}
+		sp := t.spaces[mk4_]
 		if sp.dirty && !sp.flushing {
 			_tier_flush(sp)
 		}
@@ -514,7 +522,11 @@ _tier_rescan :: proc(sp: ^Tier_Space, manifest: []u8) {
 			}
 		}
 	}
-	for k, c in pend {
+	for k in prim.sorted_keys(pend) {
+		if k not_in pend {
+			continue
+		}
+		c := pend[k]
 		for _ in 0 ..< c {
 			s := sp.segs[k.id]
 			if s.redacts == nil {
@@ -557,7 +569,11 @@ _tier_rescan :: proc(sp: ^Tier_Space, manifest: []u8) {
 			}
 		}
 		t.inner.list_end(t.inner.data, it)
-		for id, g in gone {
+		for id in prim.sorted_keys(gone) {
+			if id not_in gone {
+				continue
+			}
+			g := gone[id]
 			if !g && !seen[id] {
 				s := sp.segs[id]
 				s.dropped = true
@@ -619,7 +635,11 @@ _tier_arm :: proc(t: ^Tier_Store) {
 		return
 	}
 	due := max(i64)
-	for _, sp in t.spaces {
+	for mk1_ in prim.sorted_keys(t.spaces) {
+		if mk1_ not_in t.spaces {
+			continue
+		}
+		sp := t.spaces[mk1_]
 		if sp.dirty && !sp.flushing {
 			due = min(due, _tier_due(t, sp))
 		}
@@ -894,7 +914,7 @@ _tier_flush :: proc(sp: ^Tier_Space) {
 	prim.write_u32le(&w, 0)
 	count := 0
 	ids := make([dynamic]Stream_Id, 0, len(f.segs), context.temp_allocator)
-	for id in f.segs {
+	for id in prim.sorted_keys(f.segs) {
 		append(&ids, id)
 	}
 	slice.sort_by(ids[:], _mem_id_less)
@@ -940,7 +960,7 @@ _tier_flush :: proc(sp: ^Tier_Space) {
 		}
 	}
 	keys := make([dynamic]Object_Key, 0, len(f.objs), context.temp_allocator)
-	for k in f.objs {
+	for k in prim.sorted_keys(f.objs) {
 		append(&keys, k)
 	}
 	slice.sort_by(keys[:], proc(a, b: Object_Key) -> bool {

@@ -109,7 +109,7 @@ inode_less :: proc(a, b: fstree.Inode_Id) -> bool {
 sorted_inodes :: proc(set: map[fstree.Inode_Id]$V, allocator := context.temp_allocator) -> []fstree.Inode_Id {
 	out := make([]fstree.Inode_Id, len(set), allocator)
 	i := 0
-	for k in set {
+	for k in prim.unordered(set) {
 		out[i] = k
 		i += 1
 	}
@@ -120,7 +120,7 @@ sorted_inodes :: proc(set: map[fstree.Inode_Id]$V, allocator := context.temp_all
 sorted_strings :: proc(set: map[string]$V, allocator := context.temp_allocator) -> []string {
 	out := make([]string, len(set), allocator)
 	i := 0
-	for k in set {
+	for k in prim.unordered(set) {
 		out[i] = k
 		i += 1
 	}
