@@ -47,12 +47,16 @@ _di_pair :: proc(w: ^World) -> (oi: int, a, b: ^Node) {
 		if ob.kind != .Text || !obj_exists(m, i) {
 			continue
 		}
+		si := space_index(m, ob.o.space)
+		if si < 0 {
+			continue
+		}
 		rs := readers_of(w, i)
 		got: [2]^Node
 		k := 0
 		for idx in rs {
 			n := w.nodes[idx]
-			if n.alive && n.e_open && k < 2 {
+			if n.alive && n.e_open && !n.partitioned && space_member(&m.spaces[si], idx) && k < 2 {
 				got[k] = n
 				k += 1
 			}

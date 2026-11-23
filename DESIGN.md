@@ -1310,7 +1310,10 @@ concurrent typing is never lost or reverted.
     and drops rebase pend rather than clear it.
   - *Withdrawal.* An overlay batch is dropped only on knowledge: its
     durable record differs (the correction above), its writer's boot
-    changes (seen on its next frame), or its writer goes down in presence.
+    changes (seen on its next frame), its writer goes down in presence, or
+    the history knows its ops once the view has reached its target and
+    they were not confirmed (they landed on another line, or the view
+    already holds them), which drops the overlay with one correction.
     Nothing is armed while idle.
   - *Measured* (Linux, two daemons on one relay, a 15 KB file, an edit every
     3 ms on one device): edit to the other device's buffer delta p50
