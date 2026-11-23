@@ -377,6 +377,8 @@ Mount :: struct {
 	collided:    [dynamic]string,
 	absent:      [dynamic]string,
 	holds:       [dynamic]Path_Hold,
+	reload_ms:   i64,
+	reload_owed: bool,
 	link_mode:   Link_Mode,
 	gitlinks:    []Gitlink,
 }
@@ -763,7 +765,10 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		}
 		err := history_ready(m.history)
 		if err == .Reloading {
-			mount_schedule(m, m.opts.settle_ms)
+			mount_reload_retry(m)
+		} else if err == .None {
+			m.reload_ms = 0
+			m.reload_owed = false
 		}
 		return err
 	}
@@ -787,10 +792,12 @@ mount_wake :: proc(m: ^Mount) -> Error {
 			ignore_destroy(&m.ignore)
 			shadow_detach(&m.shadow)
 			if err == .Reloading {
-				mount_schedule(m, m.opts.settle_ms)
+				mount_reload_retry(m)
 			}
 			return err
 		}
+		m.reload_ms = 0
+		m.reload_owed = false
 	}
 	m.awake = true
 	if !m.watched {
@@ -1219,6 +1226,17 @@ mount_mark_git :: proc(m: ^Mount) {
 	mount_schedule(m, m.opts.settle_ms)
 }
 
+RELOAD_RETRY_MAX_MS :: 30_000
+
+@(private)
+mount_reload_retry :: proc(m: ^Mount) {
+	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed {
+		return
+	}
+	m.reload_ms = max(m.opts.settle_ms, 1) if m.reload_ms == 0 else min(m.reload_ms * 2, RELOAD_RETRY_MAX_MS)
+	mount_schedule(m, m.reload_ms)
+}
+
 mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 	if m.reg.loop == nil {
 		return
@@ -1255,7 +1273,7 @@ mount_run :: proc(m: ^Mount) -> Error {
 		err = mount_materialize(m)
 	}
 	if err == .Reloading {
-		mount_schedule(m, m.opts.settle_ms)
+		mount_reload_retry(m)
 	}
 	if fence {
 		i := 0

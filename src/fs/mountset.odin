@@ -243,6 +243,8 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 	if merr := mount_materialize(m); merr != .Reloading {
 		return merr
 	}
+	m.reload_owed = true
+	mount_reload_retry(m)
 	return .None
 }
 
