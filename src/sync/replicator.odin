@@ -3009,7 +3009,12 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		l.checking = false
 		l.ahead = 0
 		clear(&l.verify)
+		if l.arc_child {
+			l.trim_sent = 0
+			l.trim_wait = false
+		}
 	}
+	clear(&r.trims)
 	for _, rm in r.remotes {
 		rm.tamper_hold = false
 		rm.tamper_retried = false

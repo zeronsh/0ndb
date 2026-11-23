@@ -3508,7 +3508,9 @@ Relay cost tracks the reachable information, not the activity. Items marked
   even below the minimum backlog; that turn resends a Trim the previous
   session never landed (the relay answers Noted if the base is already
   there). An archive reader looking backward for the latest seal never
-  re-reads bytes its archive replica already holds.
+  re-reads bytes its archive replica already holds. A session that ends
+  forgets every Trim in flight: no reply can arrive on it, so the next
+  session resends each owed Trim.
   Readers: a `Trimmed` reply marks the remote; wants below its base become
   archive wants: the reader tails the writer's archive stream (an ordinary
   remote, chain-verified with the writer's identity and no keys), reads
