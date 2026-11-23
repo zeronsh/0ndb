@@ -39,6 +39,7 @@ Mm_Mode :: enum u8 {
 	Hold,
 	Dirs,
 	Midcrash,
+	Dirs_Power,
 }
 
 @(private = "file")
@@ -118,7 +119,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 				return
 			}
 		}
-		if c.mode == .Dirs {
+		if c.mode == .Dirs || c.mode == .Dirs_Power {
 			if prim.mkdir_all(vfs, MM_ROOT + "/d1", 0o755) != .None {
 				world_fail(w, "midway: mkdir d1")
 				return
@@ -144,7 +145,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 				return
 			}
 		}
-		if c.mode == .Dirs {
+		if c.mode == .Dirs || c.mode == .Dirs_Power {
 			for f in MM_NEW {
 				tok := fmt.aprintf("<t.%s>", f, allocator = w.allocator)
 				typed[f] = tok
@@ -197,7 +198,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			fs.scope_write_begin(scope, held)
 		}
 	}
-	if failed_pass && a.alive && c.mode != .Midcrash {
+	if failed_pass && a.alive && c.mode != .Midcrash && c.mode != .Dirs_Power {
 		context = instance_context(&a.inst)
 		defer node_after(a)
 		a.disk.quiet = true
@@ -215,7 +216,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 		}
 		a.disk.quiet = false
 	}
-	if failed_pass && a.alive && a.incarnation == inc && c.mode != .Midcrash && c.mode != .Hold {
+	if failed_pass && a.alive && a.incarnation == inc && c.mode != .Midcrash && c.mode != .Hold && c.mode != .Dirs_Power {
 		passes := m.passes
 		for _ in 0 ..< 400 {
 			if !a.alive || a.incarnation != inc {
@@ -240,8 +241,8 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			run_until(w, w.now + 1_000_000, false)
 		}
 	}
-	if failed_pass && a.alive && (c.mode == .Process || c.mode == .Power || c.mode == .Midcrash) {
-		node_crash_now(a, .Power if c.mode == .Power else .Process, c.k)
+	if failed_pass && a.alive && (c.mode == .Process || c.mode == .Power || c.mode == .Midcrash || c.mode == .Dirs_Power) {
+		node_crash_now(a, .Power if c.mode == .Power || c.mode == .Dirs_Power else .Process, c.k)
 		if c.mode == .Midcrash {
 			_mm_write(vfs, MM_ROOT + "/.0ndb-tmp-999", "left by a crashed pass\n")
 			_mm_write(vfs, MM_ROOT + "/.0ndb-tmp-9x", "a user's file\n")
@@ -310,7 +311,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			}
 		}
 	}
-	if c.mode == .Dirs {
+	if c.mode == .Dirs || c.mode == .Dirs_Power {
 		for f in MM_NEW {
 			data, err := eng.tree_read(&a.e, tree, f, context.temp_allocator)
 			if err != .None || strings.count(string(data), typed[f]) != 1 {

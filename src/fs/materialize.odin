@@ -129,6 +129,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		}
 		delete(a, m.allocator)
 	}
+	clear(&m.absent_set)
 	clear(&m.absent)
 	for r in m.reshow {
 		if ino, ok, lerr := fstree.lookup(&snap, r); lerr == nil && ok {
@@ -953,9 +954,11 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		}
 		abs := abs_path(m, it.old, abuf[:])
 		if it.entry.kind == .Dir {
-			prim.remove_dir(m.vfs, abs)
-		} else {
-			prim.remove(m.vfs, abs)
+			if e := prim.remove_dir(m.vfs, abs); e != .None && e != .Not_Found && e != .Not_Empty {
+				return from_prim(e)
+			}
+		} else if e := prim.remove(m.vfs, abs); e != .None && e != .Not_Found {
+			return from_prim(e)
 		}
 		mat_dir(m, path_parent_abs(abs))
 		return .None if m.restoring else shadow_remove(&m.shadow, it.old)
@@ -1554,13 +1557,12 @@ version_snapshot :: proc(h: ^History, lvs: []crdt.Lv) -> (snap: fstree.Snapshot,
 }
 
 mount_absent_add :: proc(m: ^Mount, path: string) {
-	for a in m.absent {
-		if a == path {
-			return
-		}
+	if path in m.absent_set {
+		return
 	}
 	p, _ := clone_string(path, m.allocator)
 	append(&m.absent, p)
+	m.absent_set[p] = true
 }
 
 mount_reshow_add :: proc(m: ^Mount, path: string) {
@@ -1573,18 +1575,8 @@ mount_reshow_add :: proc(m: ^Mount, path: string) {
 	append(&m.reshow, p)
 }
 
-@(private)
-string_in :: proc(list: []string, s: string) -> bool {
-	for x in list {
-		if x == s {
-			return true
-		}
-	}
-	return false
-}
-
 mount_absent_has :: proc(m: ^Mount, path: string) -> bool {
-	return string_in(m.absent[:], path)
+	return path in m.absent_set
 }
 
 mount_absent :: proc(m: ^Mount) -> []string {
