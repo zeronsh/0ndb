@@ -150,6 +150,7 @@ Pack :: struct {
 	zeros:         [dynamic]Zero,
 	unlinks:       [dynamic]Pending_Unlink,
 	ext_dirty:     [dynamic]u64,
+	queued:        Install_Hook,
 	graveyard:     [dynamic]prim.Fd,
 	fl:            Inflight,
 	waiters:       [dynamic]Waiter,
@@ -841,4 +842,9 @@ _filters_rebalance :: proc(p: ^Pack) -> Error {
 		}
 	}
 	return .None
+}
+
+queue_install :: proc(p: ^Pack, h: Install_Hook) {
+	assert(p.queued.run == nil)
+	p.queued = h
 }
