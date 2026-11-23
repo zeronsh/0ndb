@@ -1705,6 +1705,8 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 				break
 			}
 		}
+		tracked := make(map[string]Commit_Entry, context.temp_allocator)
+		has_git_tree := departed_entries(m, &tracked)
 		order := sorted_inodes(touched)
 		for ino in order {
 			if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
@@ -1723,15 +1725,30 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 			if perr != nil {
 				return .Corrupt
 			}
-			if pok {
-				shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
+			if !pok {
+				continue
 			}
+			d := probe(m, p) or_return
+			if d.kind == .Missing && has_git_tree && p not_in tracked {
+				mount_absent_add(m, p)
+				continue
+			}
+			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
 	}
 	clear(&m.synced)
 	append(&m.synced, ..target)
 	m.rescan = true
 	return .None
+}
+
+@(private)
+departed_entries :: proc(m: ^Mount, out: ^map[string]Commit_Entry) -> bool {
+	if !m.has_git || m.db == nil || len(m.head.commit) == 0 {
+		return false
+	}
+	oid, _, ok := odb.oid_from_hex(m.head.commit)
+	return ok && commit_entries(m.db, oid, out) == .None
 }
 
 @(private)
@@ -1865,16 +1882,30 @@ collect_alias_sources :: proc(m: ^Mount, p: ^Pass) {
 			}
 		}
 	}
-	for c in p.alias_commits {
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+		return
+	}
+	outer: for c in p.alias_commits {
 		key := strings.concatenate({"cv:", c}, context.temp_allocator)
 		data, found, err := kv_get(&h.kv, transmute([]u8)key, context.temp_allocator)
 		if err != .None || !found {
 			continue
 		}
 		v, derr := decode_version(data, p.long)
-		if derr == .None {
-			append(&m.alias, v)
+		if derr != .None {
+			continue
 		}
+		al := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, v, &al) != .None {
+			continue
+		}
+		for lv in al {
+			if !crdt.graph_contains(&h.g, sl[:], lv) {
+				continue outer
+			}
+		}
+		append(&m.alias, v)
 	}
 }
 

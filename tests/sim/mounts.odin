@@ -1345,6 +1345,12 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 	}
 	obj_add_line(m, sm.oi, key)
 	if cerr == .None && !n.disk.dead {
+		git_gone := make(map[string]bool, context.temp_allocator)
+		for ch in changes {
+			if ch.gone {
+				git_gone[ch.name] = true
+			}
+		}
 		for ch in changes {
 			got, gerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), context.temp_allocator)
 			if ch.gone != (gerr == .Not_Found) || (!ch.gone && string(got) != string(ch.new)) {
@@ -1355,7 +1361,7 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 			after, aerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator)
 			had_base := p in base
 			gone := aerr == .Not_Found
-			if (gone && !had_base) || (!gone && had_base && string(after) == string(base[p])) {
+			if (gone && !had_base) || (!gone && had_base && string(after) == string(base[p])) || (gone && !git_gone[p]) {
 				continue
 			}
 			op := new_op(m, .Tree_Remove if gone else .Disk_Person, n, sm.oi)

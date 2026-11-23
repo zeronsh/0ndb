@@ -778,7 +778,17 @@ equal in both directions.
   path) move
   to the line's paths with their stat cleared, the synced version becomes the line's, and the full pass diffs
   disk against the line, so git's writes (and anything git carried) land on
-  that line only. A materialization whose pass switched lines restarts at the
+  that line only. A path the line has that is missing on disk after the
+  switch and that the departing commit's git tree does not hold (a collision
+  copy or another file of that line git never tracked) is owed: it is
+  materialized like a pending path and never ingested as a removal; one the
+  departing commit holds is git's deletion and lands on the line. A path
+  deleted between git's checkout and the pass that sees the switch cannot be
+  told from one git did not create, and is rewritten. Text a git rewrite
+  carries (the departing commit, reflog entries, ORIG_HEAD and cherry-pick
+  sources) is copied with its authors only from versions the line's synced
+  version contains; anything else is a plain insert by the line's actor. A
+  materialization whose pass switched lines restarts at the
   new line rather than writing the old one back. Ingestion on a line other
   than the mount's own uses an actor derived from the mount and the line,
   registered like the mount's ingestion actor, because an actor's ops stay on

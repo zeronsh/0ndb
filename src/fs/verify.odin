@@ -91,6 +91,11 @@ verify_skip :: proc(m: ^Mount, p: string, disk: bool) -> bool {
 			return true
 		}
 	}
+	for a in m.absent {
+		if path_at_or_under(p, a) {
+			return true
+		}
+	}
 	return false
 }
 
