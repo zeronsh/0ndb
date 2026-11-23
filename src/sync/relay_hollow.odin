@@ -139,6 +139,7 @@ _fill_end :: proc(c: ^Conn, op: ^Op) {
 	r := c.relay
 	st := op.stream
 	if op.buf != nil {
+		_red_report(r, c.space, c.principal.participant, Stream_Id(op.id), op.at, op.buf)
 		ok := op.pos == len(op.buf) && _red_fill_apply(c.space, Stream_Id(op.id), op.at, op.buf)
 		r.stats.redacted_in += 1
 		if !ok {
@@ -371,6 +372,7 @@ _serve_end :: proc(c: ^Conn, op: ^Op) {
 	at := i64(prim.get_u64le(buf[FRAME_HEADER + 56:]))
 	if len(data) > 0 && _red_overlaps(r, sp, op.pipe.id, at, at + i64(len(data))) {
 		r.stats.redacted_in += 1
+		_red_report(r, sp, c.principal.participant, op.pipe.id, at, data)
 	}
 	if len(data) > 0 && _red_overlaps(r, sp, op.pipe.id, at, at + i64(len(data))) && !_red_fill_apply(sp, op.pipe.id, at, data) {
 		r.stats.refused_in += 1

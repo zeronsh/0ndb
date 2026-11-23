@@ -503,4 +503,6 @@ Learned_Redaction :: struct {
 	from:   i64,
 	to:     i64,
 	seq:    u64,
+	stream: osync.Stream_Id,
+	known:  bool,
 }
