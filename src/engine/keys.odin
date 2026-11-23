@@ -113,10 +113,8 @@ _own_tree_get :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind, scope
 			free(x, e.allocator)
 			return nil, _serr(kerr)
 		}
-		if tag, ok := space_epoch_tag(sp); ok {
+		if tag, ok := _epoch_current(sp, object); ok {
 			x.tree.epoch = tag
-		} else if g, gfound := sp.grant_epochs[object]; gfound && len(g) > 0 {
-			x.tree.epoch = g[len(g) - 1].tag
 		} else if sp.mode == .End_To_End {
 			osync.keytree_destroy(&x.tree)
 			free(x, e.allocator)
