@@ -196,7 +196,9 @@ _trees_persist :: proc(e: ^Engine) {
 			continue
 		}
 		if err := _own_tree_stage(e, t); err != .None {
-			_fatal(e, err)
+			if !_storage_soft(e, err, "a key tree could not be stored: the disk is full or failing; it is retried") {
+				_fatal(e, err)
+			}
 			continue
 		}
 		t.dirty = false
