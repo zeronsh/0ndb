@@ -20,5 +20,5 @@ check_own_marked :: proc(w: ^World) {
 
 @(init)
 _own_marked_hooks :: proc "contextless" () {
-	register_final_check(6, check_own_marked)
+	register_final_check(7, check_own_marked)
 }

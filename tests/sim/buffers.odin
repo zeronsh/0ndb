@@ -552,7 +552,7 @@ STAT_BLIVE_PROBES: Stat
 @(init)
 _buffers_stats :: proc "contextless" () {
 	register_final_check(40, check_buffers)
-	register_final_check(1000, check_settled_write)
+	register_final_check(999, check_settled_write)
 	register_stat_line(30)
 	STAT_BUFFERS = register_stat(30, 0, "buffers_opened")
 	STAT_BURSTS = register_stat(30, 1, "bursts")

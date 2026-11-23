@@ -362,7 +362,7 @@ _archive_hooks :: proc "contextless" () {
 	register_final_check(86, check_forget_device_held)
 	register_final_check(87, check_forget_third_reader)
 	register_final_check(88, check_forget_offline_writer)
-	register_final_check(90, check_restore_offline_writer)
+	register_final_check(91, check_restore_offline_writer)
 	register_final_check(95, check_archive_cipher)
 	register_final_check(97, check_archive_waits)
 	register_final_check(98, check_fetch_bound)
