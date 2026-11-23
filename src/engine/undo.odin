@@ -613,9 +613,17 @@ _cu_undo_fence :: proc(e: ^Engine, convs: []Undo_Conv) {
 
 @(private)
 _cu_first_reply_after :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (reply: Rid, err: Error) {
-	at := _cu_position(e, o) or_return
+	at, perr := _cu_position(e, o)
+	fmt.eprintfln("DBGMOVE walk from %v %v", at, perr)
+	if perr != .None {
+		return {}, perr
+	}
 	for !obj.rid_none(at) {
-		m := convo_message(e, o, {msg = at}, context.temp_allocator) or_return
+		m, merr := convo_message(e, o, {msg = at}, context.temp_allocator)
+		fmt.eprintfln("DBGMOVE walk %v -> %v %v", at, merr, m.parent)
+		if merr != .None {
+			return {}, merr
+		}
 		if m.hlc < hlc {
 			break
 		}
