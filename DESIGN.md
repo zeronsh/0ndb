@@ -2164,6 +2164,13 @@ with trained dictionaries, through one pinned zstd (`src/zstd`, 1.5.7)
 linked statically on every platform, so index bytes are identical across
 hosts.
 
+Indexing runs in slices on the engine tick and never holds the loop: each
+tick indexes until a time slice (8 ms on the engine clock) or a file cap
+(256 for a tree) runs out, and a tree's per-handle cursor keeps its place
+inside an lv range, so a batch that touched thousands of files (a mount's
+import) is indexed over several ticks without redoing the files it already
+indexed.
+
 **Cross-device search.** Partial replication means a device can only index
 what it holds, so search reaches across devices:
 

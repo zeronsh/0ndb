@@ -85,6 +85,7 @@ Handle :: struct {
 	mw:         omap.Writer,
 	hist:       ^fs.History,
 	hist_chain: bool,
+	tree_ix:    Tree_Index_Cursor,
 	own_tree:   ^Own_Tree,
 	chain:      journal.Chain,
 	published:  i64,
