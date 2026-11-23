@@ -1344,10 +1344,30 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if werr != .None || oid == a.oid {
 		return
 	}
+	if has_prev && prev.kind == .File && prev.oid != {} && prev.oid != oid && a.oid != prev.oid && attrib_base_stored(m, prev) {
+		attrib_log_append(m, rel, m.actor, prev.oid)
+	}
 	attrib_set(m, rel, a.actor, false, oid)
 	if attrib_log_append(m, rel, a.actor, oid) == .None {
 		attrib_log_durable(m, nil, nil)
 	}
+}
+
+@(private)
+attrib_base_stored :: proc(m: ^Mount, e: Entry) -> bool {
+	if odb.exists(m.db, e.oid) {
+		return true
+	}
+	h := m.history
+	if h == nil {
+		return false
+	}
+	text, terr := history_text_at(h, e.inode, m.synced[:], context.temp_allocator)
+	if terr != .None {
+		return false
+	}
+	got, werr := odb.write(m.db, .Blob, text)
+	return werr == .None && got == e.oid
 }
 
 observer_installed :: proc(reg: ^Registry) -> bool {

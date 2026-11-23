@@ -1391,13 +1391,13 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		}
 		matched, broken, gone := false, false, false
 		for st in steps {
-			if !odb.exists(m.db, st.oid) {
-				broken = true
-				break
-			}
 			if disk_oid == st.oid {
 				c.actor = st.actor
 				matched = true
+				break
+			}
+			if !odb.exists(m.db, st.oid) {
+				broken = true
 				break
 			}
 			committed := attribute_step(p, &c, st) or_return
