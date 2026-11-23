@@ -270,7 +270,17 @@ of `object` for a redaction it learned of; `tick` is the range start and
 `length` its end),
 31 rename_offered (edits made to a file after another device renamed it onto
 an existing name are offered on the destination: `object` is the tree,
-`detail` is `<source path>\n<destination path>`). The meaning of each
+`detail` is `<source path>\n<destination path>`),
+32 redact_unreached (a redaction of `object` could not remove one blob from
+every copy: `detail` is `<reason>\n<blob>\n<ref>\n<commit>\n<place>`.
+`protected`: a ref, `HEAD` or a reflog of the store reaches it (`ref` names
+it, `commit` is its tip), and 0ndb never rewrites that history. `repository`:
+the user's git repository at `place` holds it, reached from `ref` at
+`commit` (both empty when no ref reaches it); 0ndb never rewrites the user's
+history. `shared`: other live content still uses the same bytes. `pinned`:
+a pack git pinned with `.keep` or `.promisor` (`place`) holds it. `left`: its
+removal failed and the scrub stays pending; it resumes at the next redaction
+and the next open. `object` is zero for a scrub resumed at open). The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
 conversation's next run is; see "Placement" below), `presence`
 (device up or down, `tick` 1 or 0), `connected`/`disconnected` (relay link of

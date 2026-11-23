@@ -73,6 +73,12 @@ History_Options :: struct {
 	random:        prim.Random,
 	hold:          Hold,
 	fault:         Persist_Fault,
+	unreached:     Unreached_Report,
+}
+
+Unreached_Report :: struct {
+	data:   rawptr,
+	report: proc(data: rawptr, list: []odb.Unreached),
 }
 
 Persist_Fault :: struct {

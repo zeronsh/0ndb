@@ -17,6 +17,7 @@ Redact_Result :: struct {
 	rewrites:  int,
 	dropped:   int,
 	ranges:    []journal.Range,
+	unreached: []odb.Unreached,
 }
 
 Redact_Plan :: struct {
@@ -73,6 +74,9 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
 	res.files = apply_redaction(h, all[:], extra[:], &targets, &protect) or_return
+	if h.db != nil && len(targets) > 0 {
+		from_odb(odb.scrub_note(h.db, targets[:], protect[:])) or_return
+	}
 	history_persist(h) or_return
 	for rec in records {
 		replace_record(h, rec[0], all[:]) or_return
@@ -92,12 +96,13 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 	history_persist(h) or_return
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
-		rewrites, stats, rerr := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
+		rewrites, stats, rerr := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, allocator)
 		if rerr != .None {
 			return res, from_odb(rerr)
 		}
 		res.rewrites = len(rewrites)
 		res.dropped = stats.commits_rewritten
+		res.unreached = stats.unreached
 	}
 	history_unload_files(h)
 	return res, .None
@@ -450,7 +455,10 @@ apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Erro
 	apply_redaction(h, spans[:], nil, &targets, &protect) or_return
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
-		odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
+		_, st, _ := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
+		if r := h.opts.unreached; r.report != nil && len(st.unreached) > 0 {
+			r.report(r.data, st.unreached)
+		}
 	}
 	return .None
 }

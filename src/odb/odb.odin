@@ -53,6 +53,7 @@ Odb :: struct {
 	delta_limit:    i64,
 	two_pass_size:  i64,
 	sync_writes:    bool,
+	scrub_mutex:    sync.Mutex,
 	store:          bool,
 	pending_files:  [dynamic]string,
 	pending_dirs:   [dynamic]string,

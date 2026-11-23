@@ -1272,6 +1272,22 @@ concurrent typing is never lost or reverted.
   (zeroed as garbage), and the garbage of deleted files, whose pending zeros a
   redaction makes urgent. The simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
+- Redaction in the device object store is a durable scrub intent
+  (`objects/info/0ndb-scrub`: targets, protected blobs, superseded commits and
+  trees). It is written and synced before the first irreversible step (the
+  journal or stream zero-fill), so a crash or a failed removal anywhere after
+  it leaves a record. `odb.redact` rewrites the `refs/0ndb/` commits without
+  the targets, moves those refs, repacks the store without every target and
+  superseded object no other root reaches, then checks every one is gone from
+  each loose path and unpinned pack of the primary directory. Only a
+  verified scrub, after a barrier, clears its entries; anything left fails
+  the call and stays in the intent, which the next redaction and every
+  store open resume. What it can't reach: an object reachable from a ref
+  outside `refs/0ndb/`, `HEAD` or a reflog (the user's own or pushed history,
+  never rewritten; counted as protected), an object in a pack git pinned with
+  `.keep` or `.promisor` (counted as pinned), alternates and extra object
+  directories, and copies outside the store (other clones, remotes, the
+  user's working tree).
 - A small stream whose extent count passes 32 is defragmented by merging,
   repeatedly, the window of adjacent extents with the fewest bytes rewritten
   per extent freed, until 24 remain. Merging a fixed window of 16 instead
