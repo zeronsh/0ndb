@@ -366,6 +366,7 @@ _archive_hooks :: proc "contextless" () {
 	register_final_check(95, check_archive_cipher)
 	register_final_check(97, check_archive_waits)
 	register_final_check(98, check_fetch_bound)
+	register_final_check(99, check_restore_exercised)
 	register_world(50, nil, proc(w: ^World) {
 		for _, a in w.fetches {
 			delete(a.have)
@@ -1072,6 +1073,16 @@ check_fetch_bound :: proc(w: ^World) {
 		}
 	}
 	stat_max(w, STAT_FETCH_RATIO, u64(worst))
+}
+
+check_restore_exercised :: proc(w: ^World) {
+	if w.aborted || len(w.failures) > 0 {
+		return
+	}
+	set_up := stat_get(&w.stats, STAT_RESTORE_SCENARIOS)
+	if set_up > 0 && stat_get(&w.stats, STAT_RESTORES_READ) == 0 {
+		world_fail(w, "restore: %d Restore scenarios ran but no new device read a trimmed prefix through a Restore (%d never read the prefix)", set_up, stat_get(&w.stats, STAT_RESTORE_UNREAD))
+	}
 }
 
 check_archive_waits :: proc(w: ^World) {
