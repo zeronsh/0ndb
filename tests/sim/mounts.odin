@@ -1563,3 +1563,10 @@ _switching :: proc(m: ^fs.Mount) -> bool {
 	_, pending := fs.mount_switch_pending(m)
 	return pending
 }
+
+_line_heads :: proc(m: ^fs.Mount, allocator := context.temp_allocator) -> []crdt.Op_Id {
+	if v, found, err := fs.history_line(m.history, m.line, allocator); err == .None && found {
+		return v
+	}
+	return slice.clone(fs.mount_synced(m), allocator)
+}

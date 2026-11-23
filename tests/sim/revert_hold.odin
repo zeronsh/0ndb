@@ -2,7 +2,6 @@ package sim
 
 import "core:fmt"
 import "core:os"
-import "core:slice"
 import "core:strings"
 import "core:testing"
 import "../../src/crdt"
@@ -44,16 +43,6 @@ _revert_mount :: proc(n: ^Node) -> ^Sim_Mount {
 		}
 	}
 	return nil
-}
-
-@(private = "file")
-_revert_heads :: proc(n: ^Node, o: eng.Object) -> []crdt.Op_Id {
-	hist, err := eng.tree_history(&n.e, o)
-	if err != .None {
-		return nil
-	}
-	defer eng.tree_release(&n.e, o)
-	return slice.clone(crdt.graph_version_ids(&hist.g, hist.g.heads[:], context.temp_allocator))
 }
 
 @(private = "file")
@@ -138,7 +127,7 @@ _revert_hold :: proc(w: ^World) {
 			world_fail(w, "revert hold: mount missing")
 			return
 		}
-		before = _revert_heads(n, tree)
+		before = _line_heads(sm.m, w.allocator)
 		agent := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
 		if oerr := fs.mount_observe_begin(sm.m, "a.txt", agent); oerr != .None {
 			world_fail(w, "revert hold: observe: %v", oerr)
@@ -149,7 +138,7 @@ _revert_hold :: proc(w: ^World) {
 			world_fail(w, "revert hold: agent scope close: %v", serr)
 			return
 		}
-		after = _revert_heads(n, tree)
+		after = _line_heads(sm.m, w.allocator)
 		hold = fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
 		fs.scope_write_begin(hold, "a.txt")
 		if !fs.scope_pinned(hold, "a.txt") {
@@ -162,8 +151,8 @@ _revert_hold :: proc(w: ^World) {
 		}
 		node_after(n)
 	}
-	defer delete(before)
-	defer delete(after)
+	defer delete(before, w.allocator)
+	defer delete(after, w.allocator)
 	_revert_write(vfs, REVERT_ROOT + "/a.txt", "base a\nagent line\nperson a\n")
 	_revert_write(vfs, REVERT_ROOT + "/b.txt", "base b\nperson b\n")
 	{
