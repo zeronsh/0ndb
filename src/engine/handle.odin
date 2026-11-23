@@ -239,7 +239,7 @@ _own_len :: proc(h: ^Handle) -> i64 {
 		return obj.writer_durable(&h.mw.core)
 	case .Text, .File_Tree:
 		if h.hist != nil && !h.hist.awake && fs.history_wake(h.hist) != .None {
-			return 0
+			return fs.history_own_durable(h.hist)
 		}
 		if h.hist != nil {
 			return journal.journal_durable_len(&h.hist.journal)
