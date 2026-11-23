@@ -212,13 +212,17 @@ op_mount :: proc(w: ^World, n: ^Node) {
 	if len(cands) == 0 {
 		return
 	}
-	oi := cands[rng_int(&w.rng, len(cands))]
+	mount_obj(w, n, cands[rng_int(&w.rng, len(cands))])
+}
+
+mount_obj :: proc(w: ^World, n: ^Node, oi: int) -> bool {
+	m := &w.model
 	{
 		context = instance_context(&n.inst)
 		_, found, err := eng.catalog_get(&n.e, m.objs[oi].o, context.temp_allocator)
 		node_after(n)
 		if err != .None || !found {
-			return
+			return false
 		}
 	}
 	root := fmt.aprintf("%s%s-%s", WORK_PREFIX, id_short(m.objs[oi].o.id), n.name, allocator = w.allocator)
@@ -230,20 +234,21 @@ op_mount :: proc(w: ^World, n: ^Node) {
 		append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = root})
 		op_done(op, 0, .None)
 		op.status = .Acked
+		return true
 	} else if err == .Missing || err == .Pending {
 		op.status = .Failed
 	} else if n.alive {
 		if w.cfg.io_rate > 0 && (err == .Io || err == .No_Space) {
 			op.status = .Failed
 			n.restart_pending = true
-			return
+			return false
 		}
 		world_fail(w, "%s tree_mount failed: %v", n.name, err)
 		op.status = .Failed
 	}
+	return false
 }
 
-@(private = "file")
 _disk_write :: proc(vfs: prim.Vfs, path: string, data: []u8, atomic: bool) -> prim.Error {
 	target := path
 	if atomic {
@@ -841,7 +846,6 @@ check_mounts :: proc(w: ^World) {
 	}
 }
 
-@(private = "file")
 _writer_set :: proc(w: ^World, n: ^Node, path: string, info: Writer_Info) {
 	if _, has := n.writers[path]; has {
 		n.writers[path] = info
