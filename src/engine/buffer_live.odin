@@ -525,7 +525,7 @@ _ovl_drop :: proc(e: ^Engine, b: ^Buffer) {
 	for o in inv {
 		append(&saved, o)
 	}
-	gone := _gone_of(b, saved[:], _ovl_id_runs(b)[:])
+	gone := _gone_of(e, b, saved[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
 	e.stats.buffer_live_dropped += 1
 	ops := _bytes_to_units(b, saved[:], _view_units_at, true)
@@ -559,7 +559,7 @@ _ovl_advanced :: proc(e: ^Engine, b: ^Buffer, a: []crdt.Delta_Op) -> bool {
 		}
 	}
 	fix := _bcompose(_binverse(b.oc[:])[:], a)
-	gone := _gone_of(b, fix[:], _ovl_id_runs(b)[:])
+	gone := _gone_of(e, b, fix[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
 	e.stats.buffer_live_dropped += 1
 	ops := _bytes_to_units(b, fix[:], _view_units_at, true)
@@ -1050,7 +1050,20 @@ _ovl_id_runs :: proc(b: ^Buffer) -> [dynamic]Id_Run {
 }
 
 @(private)
-_gone_of :: proc(b: ^Buffer, d: []crdt.Delta_Op, runs: []Id_Run) -> [dynamic]Gone {
+_ovl_owns :: proc(b: ^Buffer, id: crdt.Op_Id, n: int) -> bool {
+	if prim.id_is_zero(id.actor) {
+		return false
+	}
+	for o in b.ovl {
+		if o.first.actor == id.actor && id.seq >= o.first.seq && id.seq + u64(n) <= o.first.seq + u64(o.n) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_gone_of :: proc(e: ^Engine, b: ^Buffer, d: []crdt.Delta_Op, runs: []Id_Run) -> [dynamic]Gone {
 	out := make([dynamic]Gone, context.temp_allocator)
 	utf16 := _utf16(b)
 	p, u, q := 0, 0, 0
@@ -1074,7 +1087,12 @@ _gone_of :: proc(b: ^Buffer, d: []crdt.Delta_Op, runs: []Id_Run) -> [dynamic]Gon
 				}
 				text := o.text[s - p:t - p]
 				pos := u + (crdt.units(o.text[:s - p]) if utf16 else s - p)
-				append(&out, Gone{pos, crdt.units(text) if utf16 else len(text), crdt.Op_Id{r.id.actor, r.id.seq + u64(s - r.pos)}, text})
+				id := crdt.Op_Id{r.id.actor, r.id.seq + u64(s - r.pos)}
+				if !_ovl_owns(b, id, t - s) {
+					e.stats.buffer_live_bad_gone += 1
+					continue
+				}
+				append(&out, Gone{pos, crdt.units(text) if utf16 else len(text), id, text})
 			}
 			p += o.n
 			u += crdt.units(o.text) if utf16 else o.n
@@ -1159,52 +1177,3 @@ _gone_free :: proc(e: ^Engine, gone: []Gone) {
 	delete(gone, e.allocator)
 }
 
-@(private)
-BUFFER_INTENTS_MAX :: 1024
-
-@(private)
-_intent_add :: proc(e: ^Engine, b: ^Buffer, sp: crdt.Op_Span) {
-	if sp.len <= 0 {
-		return
-	}
-	if b.intents == nil {
-		b.intents = make([dynamic]crdt.Op_Span, e.allocator)
-	}
-	if len(b.intents) >= BUFFER_INTENTS_MAX {
-		ordered_remove(&b.intents, 0)
-	}
-	append(&b.intents, sp)
-	e.stats.buffer_live_intents += 1
-}
-
-@(private)
-_buffer_intents :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) {
-	if _ovl_on(b) || len(b.held) > 0 || b.hist != h.hist || b.view == nil || b.view.stale {
-		return
-	}
-	scratch := virtual.arena_temp_begin(&e.temp)
-	defer virtual.arena_temp_end(scratch)
-	g := Undo_Group {
-		inserts = make([dynamic]crdt.Op_Span, context.temp_allocator),
-		deletes = make([dynamic]Undo_Del, context.temp_allocator),
-	}
-	keep := 0
-	for sp in b.intents {
-		if fs.history_contains(b.hist, b.version[:], sp.id) {
-			append(&g.inserts, sp)
-		} else {
-			b.intents[keep] = sp
-			keep += 1
-		}
-	}
-	resize(&b.intents, keep)
-	if len(g.inserts) == 0 {
-		return
-	}
-	if _, err := _undo_apply(e, b, h, &g); err != .None {
-		_log(e, .Warn, "buffer intent failed")
-		return
-	}
-	e.stats.buffer_live_intents_applied += 1
-	_touch(e)
-}

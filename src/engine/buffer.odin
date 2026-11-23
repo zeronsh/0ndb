@@ -136,7 +136,6 @@ Buffer :: struct {
 	ovl:        [dynamic]^Ovl,
 	oc:         [dynamic]crdt.Delta_Op,
 	held:       [dynamic]Ready,
-	intents:    [dynamic]crdt.Op_Span,
 }
 
 editor_actor :: proc(e: ^Engine, line := "") -> (id: prim.Id) {
@@ -384,7 +383,6 @@ _buffer_free :: proc(e: ^Engine, b: ^Buffer) {
 		_gone_free(e, s.gone)
 	}
 	delete(b.sent)
-	delete(b.intents)
 	for &g in b.undo {
 		_undo_free(&g)
 	}
@@ -656,6 +654,7 @@ _buffer_emit :: proc(e: ^Engine, b: ^Buffer, st: ^Sink_State) -> Error {
 @(private)
 _buffers_tick :: proc(e: ^Engine) {
 	_cursors_drain(e)
+	_dlog_tick(e)
 	if len(e.buffers) == 0 {
 		return
 	}
@@ -680,9 +679,6 @@ _buffers_tick :: proc(e: ^Engine) {
 		}
 		if aerr := _buffer_advance(e, b, h); aerr != .None && aerr != .Missing && !_store_err(e, aerr) {
 			_log(e, .Warn, "buffer advance failed")
-		}
-		if slice.contains(e.buffers[:], b) && len(b.intents) > 0 {
-			_buffer_intents(e, b, h)
 		}
 	}
 	for b in list {
@@ -953,14 +949,17 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	cur := ops[:]
 	moved := make([][]crdt.Delta_Op, len(b.sent), context.temp_allocator)
 	regone := make([][]Gone, len(b.sent), context.temp_allocator)
-	swallowed := false
+	hits := make([dynamic]crdt.Op_Span, context.temp_allocator)
 	for s, i in b.sent {
 		if len(s.gone) > 0 {
 			kept, hit := _gone_rebase(b, s.gone, cur)
 			regone[i] = kept[:]
 			for g in hit {
-				_intent_add(e, b, crdt.Op_Span{g.id, len(g.text)})
-				swallowed = true
+				if prim.id_is_zero(g.id.actor) {
+					e.stats.buffer_live_bad_gone += 1
+					return 0, 0, .Invalid
+				}
+				append(&hits, crdt.Op_Span{g.id, len(g.text)})
 			}
 		}
 		a2 := make([dynamic]crdt.Delta_Op, context.temp_allocator)
@@ -968,6 +967,9 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 		crdt.delta_transform(cur, s.ops, _utf16(b), &a2, &b2)
 		moved[i] = b2[:]
 		cur = a2[:]
+	}
+	if len(hits) > 0 {
+		_dlog_record(e, b, hits[:]) or_return
 	}
 	x: Built
 	_built_init(&x)
@@ -989,13 +991,10 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 		s.ops = nops
 		s.bytes = nbytes
 		if len(s.gone) > 0 {
+			ng := _gone_own(e, regone[i])
 			_gone_free(e, s.gone)
-			s.gone = _gone_own(e, regone[i])
+			s.gone = ng
 		}
-	}
-	if swallowed {
-		b.dirty = true
-		_touch(e)
 	}
 	b.recv += 1
 	if !committed {
