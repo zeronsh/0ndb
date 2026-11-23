@@ -1049,6 +1049,13 @@ _tree_maybe_stale :: proc(sp: ^Space, rt: ^Remote_Tree) -> bool {
 	if sp.mode != .End_To_End {
 		return false
 	}
+	tag := _epoch_newest(sp, rt)
+	zero: osync.Epoch_Tag
+	return rt.tree.epoch != zero && tag != zero && rt.tree.epoch != tag && rt.current != tag
+}
+
+@(private)
+_epoch_newest :: proc(sp: ^Space, rt: ^Remote_Tree) -> osync.Epoch_Tag {
 	newest: u32
 	tag: osync.Epoch_Tag
 	for x in sp.mem.epochs {
@@ -1067,8 +1074,7 @@ _tree_maybe_stale :: proc(sp: ^Space, rt: ^Remote_Tree) -> bool {
 			}
 		}
 	}
-	zero: osync.Epoch_Tag
-	return rt.tree.epoch != zero && tag != zero && rt.tree.epoch != tag
+	return tag
 }
 
 @(private)
