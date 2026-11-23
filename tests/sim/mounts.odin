@@ -366,6 +366,12 @@ _disk_write :: proc(vfs: prim.Vfs, path: string, data: []u8, atomic: bool) -> pr
 	return prim.sync_dir(vfs, prim.dir_name(path))
 }
 
+_truncated_by_failure :: proc(w: ^World, op: ^M_Op, old: []u8) {
+	for t in parse_tokens(old) {
+		append(&op.deletes, strings.clone(t.text, w.allocator))
+	}
+}
+
 Agent_Pending :: struct {
 	inc:   int,
 	root:  string,
@@ -796,9 +802,7 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 			model_temp_write(m, sm.oi, strings.concatenate({".", name, ".swp"}, context.temp_allocator), op.actor, transmute([]u8)strings.to_string(b))
 		}
 		if !atomic && !overwrite && (err != .None || n.disk.dead) {
-			for t in parse_tokens(old) {
-				append(&op.deletes, strings.clone(t.text, w.allocator))
-			}
+			_truncated_by_failure(w, op, old)
 		}
 	}
 	serr := fs.Error.None
@@ -1551,6 +1555,9 @@ op_agent_chain :: proc(w: ^World, n: ^Node) {
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = true})
 	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
+	if err != .None || n.disk.dead {
+		_truncated_by_failure(w, op, cur)
+	}
 	if n.disk.dead {
 		node_crashed(n)
 		return
