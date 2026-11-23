@@ -187,8 +187,10 @@ op_spans :: proc(spans: []crdt.Author_Span, allocator := context.allocator) -> (
 
 conflict_accept_ops :: proc(h: ^History, c: Text_Conflict, version: []crdt.Op_Id, ops: ^[dynamic]crdt.Op_Run) -> Error {
 	switch c.kind {
-	case .Concurrent, .Revert:
+	case .Concurrent:
 		return .Invalid
+	case .Revert:
+		return revert_accept_ops(h, c, version, ops)
 	case .Offered:
 		o, found := offer_get(h, c.source) or_return
 		if !found || o.dest != c.inode {

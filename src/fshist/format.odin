@@ -37,8 +37,34 @@ TOP_MOUNT :: u8(18)
 TOP_OBSERVE :: u8(19)
 TOP_RENAMED :: u8(21)
 TOP_ACCEPT :: u8(22)
+TOP_REVERT :: u8(20)
 
 OBSERVE_VERSION :: u8(1)
+REVERT_VERSION :: u8(1)
+
+Revert_Conflict_Kind :: enum u8 {
+	Region = 0,
+	File   = 1,
+	Blob   = 2,
+}
+
+Revert_Conflict :: struct {
+	kind:    Revert_Conflict_Kind,
+	inode:   crdt.Op_Id,
+	start:   int,
+	end:     int,
+	ours:    []crdt.Op_Span,
+	theirs:  []crdt.Op_Span,
+	oid:     Raw_Oid,
+	oid_len: u8,
+	size:    i64,
+}
+
+Revert_Op :: struct {
+	base:      []crdt.Op_Id,
+	actors:    []prim.Id,
+	conflicts: []Revert_Conflict,
+}
 
 Observe_Kind :: enum u8 {
 	Read        = 0,
@@ -793,5 +819,101 @@ decode_accept :: proc(content: []u8) -> (o: Accept_Op, ok: bool) {
 	o.source.seq = prim.read_uvarint(&r)
 	o.revert = prim.read_id(&r)
 	o.index = prim.read_uvarint(&r)
+	return o, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
+}
+
+encode_revert :: proc(buf: ^[dynamic]u8, o: Revert_Op) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, TOP_REVERT)
+	prim.write_u8(&w, REVERT_VERSION)
+	prim.write_uvarint(&w, u64(len(o.base)))
+	for v in o.base {
+		prim.write_id(&w, v.actor)
+		prim.write_uvarint(&w, v.seq)
+	}
+	prim.write_uvarint(&w, u64(len(o.actors)))
+	for a in o.actors {
+		prim.write_id(&w, a)
+	}
+	prim.write_uvarint(&w, u64(len(o.conflicts)))
+	for c in o.conflicts {
+		prim.write_u8(&w, u8(c.kind))
+		prim.write_id(&w, c.inode.actor)
+		prim.write_uvarint(&w, c.inode.seq)
+		prim.write_uvarint(&w, u64(c.start))
+		prim.write_uvarint(&w, u64(c.end))
+		for spans in ([2][]crdt.Op_Span{c.ours, c.theirs}) {
+			prim.write_uvarint(&w, u64(len(spans)))
+			for x in spans {
+				prim.write_id(&w, x.id.actor)
+				prim.write_uvarint(&w, x.id.seq)
+				prim.write_uvarint(&w, u64(x.len))
+			}
+		}
+		prim.write_u8(&w, c.oid_len)
+		x := c.oid
+		prim.write_raw(&w, x[:min(int(c.oid_len), len(x))])
+		prim.write_ivarint(&w, c.size)
+	}
+}
+
+decode_revert :: proc(content: []u8, allocator := context.temp_allocator) -> (o: Revert_Op, ok: bool) {
+	r := prim.reader(content)
+	if prim.read_u8(&r) != TOP_REVERT || prim.read_u8(&r) != REVERT_VERSION {
+		return o, false
+	}
+	count :: proc(r: ^prim.Reader) -> (int, bool) {
+		n := prim.read_uvarint(r)
+		if !prim.reader_ok(r) || n > u64(prim.reader_remaining(r)) {
+			return 0, false
+		}
+		return int(n), true
+	}
+	nb := count(&r) or_return
+	base := make([]crdt.Op_Id, nb, allocator)
+	for i in 0 ..< nb {
+		base[i].actor = prim.read_id(&r)
+		base[i].seq = prim.read_uvarint(&r)
+	}
+	na := count(&r) or_return
+	actors := make([]prim.Id, na, allocator)
+	for i in 0 ..< na {
+		actors[i] = prim.read_id(&r)
+	}
+	nc := count(&r) or_return
+	conflicts := make([]Revert_Conflict, nc, allocator)
+	for i in 0 ..< nc {
+		c := &conflicts[i]
+		k := prim.read_u8(&r)
+		if k > u8(max(Revert_Conflict_Kind)) {
+			return o, false
+		}
+		c.kind = Revert_Conflict_Kind(k)
+		c.inode.actor = prim.read_id(&r)
+		c.inode.seq = prim.read_uvarint(&r)
+		c.start = int(prim.read_uvarint(&r))
+		c.end = int(prim.read_uvarint(&r))
+		for side in 0 ..< 2 {
+			ns := count(&r) or_return
+			spans := make([]crdt.Op_Span, ns, allocator)
+			for j in 0 ..< ns {
+				spans[j].id.actor = prim.read_id(&r)
+				spans[j].id.seq = prim.read_uvarint(&r)
+				spans[j].len = int(prim.read_uvarint(&r))
+			}
+			if side == 0 {
+				c.ours = spans
+			} else {
+				c.theirs = spans
+			}
+		}
+		c.oid_len = prim.read_u8(&r)
+		if int(c.oid_len) > len(c.oid) {
+			return o, false
+		}
+		prim.read_fixed(&r, c.oid[:c.oid_len])
+		c.size = prim.read_ivarint(&r)
+	}
+	o = Revert_Op{base, actors, conflicts}
 	return o, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
 }
