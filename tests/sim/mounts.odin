@@ -452,6 +452,7 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	err := prim.Error.Io
 	if oerr == .None {
 		n.observed += 1
+		_agent_path(w, n, abs, pa.actor)
 		err = _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
 	}
 	if pa.hold && !n.disk.dead {
@@ -588,7 +589,6 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	if agent && rng_chance(&w.rng, 1, 3) && _agent_start(w, n) {
 		return
 	}
-	m := &w.model
 	live := make([dynamic]int, context.temp_allocator)
 	for sm, i in n.mounts {
 		if sm.m != nil {
@@ -598,9 +598,25 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	if len(live) == 0 {
 		return
 	}
-	sm := n.mounts[live[rng_int(&w.rng, len(live))]]
+	sm := &n.mounts[live[rng_int(&w.rng, len(live))]]
 	paths := TREE_PATHS
 	name := paths[rng_int(&w.rng, len(paths))]
+	if agent && !w.attrib_chained && env_u64("SIM_ATTRIB_CHAIN", 0) != 0 && rng_chance(&w.rng, 1, 4) {
+		world_note(w, "%s attribution chain on %s/%s: agent, agent, person (SIM_ATTRIB_CHAIN)", n.name, sm.root, name)
+		for writer in ([]bool{true, true, false}) {
+			if !n.alive || n.disk.dead || sm.m == nil {
+				return
+			}
+			_disk_edit_at(w, n, sm, name, writer, true)
+		}
+		return
+	}
+	_disk_edit_at(w, n, sm, name, agent, false)
+}
+
+@(private = "file")
+_disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: bool, append_only: bool) {
+	m := &w.model
 	abs := strings.concatenate({sm.root, "/", name}, context.temp_allocator)
 	vfs := disk_vfs(&n.disk)
 	old, _ := prim.read_file(vfs, abs, context.temp_allocator)
@@ -611,7 +627,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	op := new_op(m, .Disk_Agent if agent else .Disk_Person, n, sm.oi)
 	op.path = strings.clone(name, w.allocator)
 	op.line = strings.clone(mount_model_line(sm.m, vfs, sm.root), w.allocator)
-	overwrite := len(old) == 0 || rng_chance(&w.rng, 1, 3)
+	overwrite := len(old) == 0 || (!append_only && rng_chance(&w.rng, 1, 3))
 	op.overwrite = overwrite && len(old) > 0
 	b := strings.builder_make(context.temp_allocator)
 	if overwrite {
@@ -644,6 +660,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 			}
 		} else if oerr == .None {
 			n.observed += 1
+			_agent_path(w, n, abs, op.actor)
 		}
 	}
 	atomic := !agent && rng_chance(&w.rng, 1, 2)
@@ -667,6 +684,13 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 		node_after(n)
 		return
 	}
+	if !agent && err == .None && len(n.agent_paths[abs]) >= 2 && !w.attrib_chained && env_u64("SIM_ATTRIB_CHAIN", 0) != 0 {
+		w.attrib_chained = true
+		world_note(w, "%s power loss after a person's edit of %s, which %d agents wrote since the last crash (SIM_ATTRIB_CHAIN)", n.name, abs, len(n.agent_paths[abs]))
+		stat_add(w, STAT_ATTRIB_CHAIN)
+		node_crash_now(n, .Power, 78)
+		return
+	}
 	if !agent && err == .None && n.observed >= 2 && !w.attrib_crashed && env_u64("SIM_ATTRIB_CRASH", 0) != 0 {
 		w.attrib_crashed = true
 		world_note(w, "%s power loss after a person's edit with %d observations in the attribution log (SIM_ATTRIB_CRASH)", n.name, n.observed)
@@ -686,7 +710,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 		if agent {
 			op_done(op, eng.pending_seq(&n.e), .None)
 			if serr == .None {
-				_check_ingested(w, n, &sm, name, transmute([]u8)strings.to_string(b))
+				_check_ingested(w, n, sm, name, transmute([]u8)strings.to_string(b))
 			}
 		} else {
 			op_done(op, 0, .None)
@@ -696,7 +720,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 			world_fail(w, "%s scope_close failed: %v", n.name, serr)
 		}
 		if serr == .None && !n.disk.dead && rng_chance(&w.rng, 1, 3) {
-			_rewrite_same_size(w, n, &sm, name, agent)
+			_rewrite_same_size(w, n, sm, name, agent)
 		}
 	}
 	node_after(n)
@@ -1326,11 +1350,37 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 }
 
 STAT_ATTRIB_CRASH: Stat
+STAT_ATTRIB_CHAIN: Stat
+
+@(private = "file")
+_agent_path :: proc(w: ^World, n: ^Node, abs: string, actor: prim.Id) {
+	l, ok := &n.agent_paths[abs]
+	if !ok {
+		k := strings.clone(abs, w.allocator)
+		n.agent_paths[k] = make([dynamic]prim.Id, w.allocator)
+		l = &n.agent_paths[k]
+	}
+	for x in l {
+		if x == actor {
+			return
+		}
+	}
+	append(l, actor)
+}
+
+agent_paths_clear :: proc(w: ^World, n: ^Node) {
+	for k, l in n.agent_paths {
+		delete(l)
+		delete(k, w.allocator)
+	}
+	clear(&n.agent_paths)
+}
 
 @(init)
 _attrib_crash_stat :: proc "contextless" () {
 	register_stat_line(46)
 	STAT_ATTRIB_CRASH = register_stat(46, 0, "attrib_crash")
+	STAT_ATTRIB_CHAIN = register_stat(46, 1, "attrib_chain")
 }
 
 mount_model_line :: proc(m: ^fs.Mount, vfs: prim.Vfs, root: string) -> string {

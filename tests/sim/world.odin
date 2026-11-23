@@ -96,6 +96,7 @@ Node :: struct {
 	sent:        map[string]i64,
 	boot:        u64,
 	observed:    int,
+	agent_paths: map[string][dynamic]prim.Id,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
 	reg:         ^fs.Registry,
@@ -225,6 +226,7 @@ World :: struct {
 	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
 	remote:    Sim_Remote,
 	attrib_crashed: bool,
+	attrib_chained: bool,
 }
 
 Quarantine :: struct {
@@ -417,6 +419,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.attaches = make(map[prim.Id]int, w.allocator)
 		n.mounts = make([dynamic]Sim_Mount, w.allocator)
 		n.writers = make(map[string]Writer_Info, w.allocator)
+		n.agent_paths = make(map[string][dynamic]prim.Id, w.allocator)
 		append(&w.nodes, n)
 	}
 	run_world_init(w)
@@ -431,6 +434,8 @@ world_destroy :: proc(w: ^World) {
 		node_mounts_drop(w, n)
 		delete(n.mounts)
 		delete(n.writers)
+		agent_paths_clear(w, n)
+		delete(n.agent_paths)
 		for k in n.sent {
 			delete(k, w.allocator)
 		}
