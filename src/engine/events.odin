@@ -244,21 +244,21 @@ _sub_collect :: proc(e: ^Engine, s: ^Sub, kinds: Change_Kinds, out: ^[dynamic]De
 	}
 	_handle_refresh(h)
 	_group_follow(h, h.kind != .Conversation)
-	if .Members in kinds {
-		for sg in h.segs {
-			if _sub_cursor(s, sg.device) == nil {
-				_follow(e, h, sg, h.kind == .Map)
-				start: i64
-				if have := journal.replica_have(sg.rep); len(have) > 0 {
-					start = have[0].from
-				}
-				append(&s.cursors, Sub_Cursor{sg.device, start})
-				append(out, Delta{kind = .Members, object = s.object, by = sg.device})
+	joined := false
+	for sg in h.segs {
+		if _sub_cursor(s, sg.device) == nil && (.Members in kinds || sg.in_view) {
+			_follow(e, h, sg, h.kind == .Map)
+			start: i64
+			if have := journal.replica_have(sg.rep); len(have) > 0 {
+				start = have[0].from
 			}
+			append(&s.cursors, Sub_Cursor{sg.device, start})
+			append(out, Delta{kind = .Members, object = s.object, by = sg.device})
+			joined = true
 		}
-		if h.kind == .Conversation {
-			_draft_live(e, h, true)
-		}
+	}
+	if (.Members in kinds || joined) && h.kind == .Conversation {
+		_draft_live(e, h, true)
 	}
 	if .Quarantined in kinds {
 		append(out, Delta{kind = .Quarantined, object = s.object})
