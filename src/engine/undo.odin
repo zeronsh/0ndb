@@ -527,6 +527,7 @@ _cu_undo_tree :: proc(e: ^Engine, o: Object, msg: Rid, old: ^map[Rid]bool = nil)
 	rows := make([dynamic]Catalog_Row, context.temp_allocator)
 	for archived in ([2]bool{false, true}) {
 		cur: Map_Cursor
+		defer delete(cur.key)
 		for {
 			page, more := catalog_list(e, o.space, archived, &cur, 256, context.temp_allocator) or_return
 			append(&rows, ..page)
@@ -597,8 +598,7 @@ _cu_undo_fence :: proc(e: ^Engine, convs: []Undo_Conv) {
 
 @(private)
 _cu_first_reply_after :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (reply: Rid, err: Error) {
-	st := convo_status(e, o) or_return
-	at := st.head
+	at := _cu_position(e, o) or_return
 	for !obj.rid_none(at) {
 		m := convo_message(e, o, {msg = at}, context.temp_allocator) or_return
 		if m.hlc < hlc {
@@ -614,8 +614,7 @@ _cu_first_reply_after :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (reply: R
 
 @(private)
 _cu_head_before :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (head: Rid, err: Error) {
-	st := convo_status(e, o) or_return
-	at := st.head
+	at := _cu_position(e, o) or_return
 	for !obj.rid_none(at) {
 		m := convo_message(e, o, {msg = at}, context.temp_allocator) or_return
 		if m.hlc < hlc {

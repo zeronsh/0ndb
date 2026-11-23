@@ -260,6 +260,7 @@ _undo_tree_objects :: proc(r: ^Runtime, o: Object) -> []Object {
 	rows := make([dynamic]eng.Catalog_Row, context.temp_allocator)
 	for archived in ([2]bool{false, true}) {
 		cur: eng.Map_Cursor
+		defer delete(cur.key)
 		for {
 			page, more, err := eng.catalog_list(r.e, o.space, archived, &cur, 256, context.temp_allocator)
 			if err != .None {
