@@ -624,7 +624,7 @@ _check_ingested :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, wrote
 	}
 }
 
-_rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: bool) {
+_rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: bool, prior: []string) {
 	m := &w.model
 	abs := strings.concatenate({sm.root, "/", name}, context.temp_allocator)
 	vfs := disk_vfs(&n.disk)
@@ -648,12 +648,18 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	op.path = strings.clone(name, w.allocator)
 	append(&op.deletes, strings.clone(last.text, w.allocator))
 	append(&op.tokens, tok)
+	unseen := false
+	if !agent {
+		for t in prior {
+			unseen ||= t == last.text
+		}
+	}
 	line_start := last.pos
 	for line_start > 0 && old[line_start - 1] != '\n' {
 		line_start -= 1
 	}
 	for t in toks[:len(toks) - 1] {
-		if t.pos >= line_start {
+		if t.pos >= line_start && !unseen {
 			append(&op.tokens, strings.clone(t.text, w.allocator))
 		}
 	}
@@ -843,7 +849,7 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 			world_fail(w, "%s scope_close failed: %v", n.name, serr)
 		}
 		if serr == .None && !n.disk.dead && rng_chance(&w.rng, 1, 3) {
-			_rewrite_same_size(w, n, sm, name, agent)
+			_rewrite_same_size(w, n, sm, name, agent, op.tokens[:])
 		}
 	}
 	node_after(n)
