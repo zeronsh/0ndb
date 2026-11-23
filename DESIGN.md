@@ -971,7 +971,18 @@ equal in both directions.
   only when the listed result changed, so an idle fork costs nothing.
   `task.changes` reads the same view once.
 - **Blame** is a span lookup. **Revert** of a scope creates ops that undo
-  exactly that scope's ops, transformed through everything since.
+  exactly that scope's ops, transformed through everything since. Actors are
+  bounded (one per conversation, mount and line, plus the ingestion actors),
+  so a tool call is not an actor: a pass groups its changes by scope, and
+  every scoped batch carries a sealed opaque op after its own ops, before the
+  commit mark (tag 23, version 1: the scope id and nothing else, so
+  redaction never touches it; at the end, it shifts no op id the pass
+  already gave out, and a batch with nothing else is not committed); applying it appends
+  `(first seq, op count, scope)` to `ss:<actor>`, and `history_scope_of(op)`
+  (engine `tree_scope_of`) finds an op's scope by a binary search there. A
+  change attributed through the attribution log takes the scope still open on
+  its path; one ingested after its scope closed keeps its actor without a
+  scope.
 - **Set revert** (`mount_revert_set(mount, base, actors)`) undoes, as one
   batch on the mount's line, every op after `base` whose actor is in the set,
   transformed through everything since. Ops carry actors, not scopes: undo
@@ -1703,17 +1714,19 @@ running on it is a record in it.
     first undo's copies and deletions too, and the rewind actors of turn
     reverts), and the ingestion actors of its tasks' fork mounts (home and per
     line). Landed and merged ops keep their scope actors, so a land needs no
-    actor of its own. A scope actor belongs to one conversation: a turn's scope
-    writes as `ingestion_actor(device, turn_pseudo(conversation))`, registered
-    with the conversation as owner, never as an actor shared by every
-    conversation of an agent, so an undo of A never reverts another
-    conversation's turn writes. The set and each (tree, line) base are resolved
-    once, after the hold and the fence (a running turn writes its `Scope` only
-    when it ends), into the `Undo` record of the `Fenced` phase; every device
-    reverts exactly those actors from that base, whatever registrations or
-    records it has received since. Everything else is outside the set and
-    survives: a person's own disk and buffer edits made during T, other trees,
-    git and imports.
+    actor of its own. A scope actor belongs to one conversation: every scope a
+    run opens (the turn's and each tool call's) writes as
+    `ingestion_actor(device, scope_pseudo(conversation, mount, line))`,
+    registered with the conversation as owner, never as an actor shared by
+    every conversation of an agent, so an undo of A never reverts another
+    conversation's writes. The line is the run's own line, so a held or undone
+    turn never leaves the next turn's actor with a last op its line lacks. The
+    set and each (tree, line) base are resolved once, after the hold and the
+    fence (a running turn writes its `Scope` only when it ends), into the
+    `Undo` record of the `Fenced` phase; every device reverts exactly those
+    actors from that base, whatever registrations or records it has received
+    since. Everything else is outside the set and survives: a person's own disk
+    and buffer edits made during T, other trees, git and imports.
   - *Versions and lines.* A turn's reply records its mounts' versions as the
     turn starts, after the start fence, so the fold of `Msg.files` deltas along
     the ancestor chain of T's reply gives each mounted tree its version `V_T`

@@ -23,6 +23,7 @@ Builder :: struct {
 	imports: [dynamic]Import_File,
 	git:     bool,
 	local:   bool,
+	scope:   []u8,
 }
 
 @(private)
@@ -170,6 +171,9 @@ builder_commit :: proc(m: ^Mount, b: ^Builder) -> Error {
 		lamport = history_lamport_after(h, m.synced[:]),
 		parents = m.synced[:],
 		ops     = b.ops[:],
+	}
+	if b.scope != nil {
+		builder_opaque(b, b.scope)
 	}
 	builder_opaque(b, commit_mark(m))
 	batch.ops = b.ops[:]
@@ -1276,7 +1280,7 @@ catch_up :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-commit_bounded :: proc(p: ^Pass, actor: prim.Id, indices: []int, marker: []u8 = nil) -> Error {
+commit_bounded :: proc(p: ^Pass, actor: prim.Id, indices: []int, marker: []u8 = nil, scope: []u8 = nil) -> Error {
 	scratch: virtual.Arena
 	if virtual.arena_init_growing(&scratch, 1 << 20) != nil {
 		return .No_Memory
@@ -1288,6 +1292,7 @@ commit_bounded :: proc(p: ^Pass, actor: prim.Id, indices: []int, marker: []u8 = 
 	if marker != nil {
 		builder_opaque(&b, marker)
 	}
+	b.scope = scope
 	commit_group(p, &b, indices) or_return
 	history_trim(p.m.history)
 	return .None
@@ -2105,7 +2110,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				}
 			}
 			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
-				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))], marker) or_return
+				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))], nil, marker) or_return
 			}
 			if actor != m.actor {
 				attribute_consumed(p, actor, idx) or_return
