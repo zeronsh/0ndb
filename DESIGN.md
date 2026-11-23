@@ -2966,7 +2966,13 @@ Relay cost tracks the reachable information, not the activity. Items marked
   tree the device writes and publishes a checkpoint at its current length,
   fills its own segment from that length, and uploads the blobs referenced
   from there on that are not remote-backed; the checkpoint bundle carries
-  the rest. The base comes only from `Noted` answers to the promotion's own
+  the rest. Only a tree that was device-only before the promotion moves its
+  content mark to the checkpoint length (its earlier blobs were held, never
+  uploaded, and a reader starts from the bundle because the segment is
+  hollow below it). A tree that was already stored keeps its mark and its
+  pending uploads: its readers replay the stored segment and fetch each blob
+  as an object, so a blob whose upload was in flight at the promotion must
+  still be uploaded, including after a crash. The base comes only from `Noted` answers to the promotion's own
   `Fill` frames, starting with an empty one; `Not_Found` means there is
   nothing to fill. A lost or withheld frame therefore stalls a promotion
   until the reconnect re-asks, and never makes it report a hollow segment as
