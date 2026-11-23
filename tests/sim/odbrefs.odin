@@ -1,7 +1,6 @@
 package sim
 
 import "core:strings"
-import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/journal"
 import "../../src/odb"
