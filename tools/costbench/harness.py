@@ -586,7 +586,92 @@ def _s5_runner():
     return measure(relay, 0, dict(wakes=wakes, mode=mode, lease_s=lease, renewals=renewed, seconds=round(dt, 1), base_pack=base_pack, base_object_bytes=base_obj, base_object_files=base_files), sm)
 
 
-SCENARIOS = {"s1": s1_transcript, "s2a": lambda: s2_rewrites(False), "s2b": lambda: s2_rewrites(True), "s3": s3_drafts, "s4": s4_catalog, "s5": s5_runner}
+class FakeTools(BaseHTTPRequestHandler):
+    per_turn = 100
+    count = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(n) or b"{}")
+        msgs = body.get("messages", [])
+        done = 0
+        for m in reversed(msgs):
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                break
+            if m.get("role") == "user":
+                done += 1
+        FakeTools.count += 1
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+
+        def ev(name, obj):
+            self.wfile.write(("event: %s\ndata: %s\n\n" % (name, json.dumps(obj))).encode())
+
+        ev("message_start", {"type": "message_start", "message": {"id": "msg_%d" % self.count, "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [], "stop_reason": None, "usage": {"input_tokens": 10, "output_tokens": 1}}})
+        if done < self.per_turn:
+            path = "f%d.txt" % (FakeTools.count % 5)
+            inp = json.dumps({"path": path, "content": "line %d\n" % FakeTools.count * 4})
+            ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_%d" % self.count, "name": "write_file", "input": {}}})
+            ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": inp}})
+            ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+            ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}})
+        else:
+            ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+            ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "done"}})
+            ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+            ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}})
+        ev("message_stop", {"type": "message_stop"})
+        self.wfile.flush()
+
+
+def proc_writes(pid):
+    try:
+        for line in open("/proc/%d/io" % pid):
+            if line.startswith("write_bytes:"):
+                return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+def s6_tool_calls():
+    d = scenario_dir("s6_tool_calls")
+    FakeTools.count = 0
+    FakeTools.per_turn = int(os.environ.get("COST_TOOLS_PER_TURN", "100"))
+    total = int(os.environ.get("COST_TOOL_CALLS", "10000"))
+    turns = max(1, total // FakeTools.per_turn)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeTools)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    relay = Relay(d)
+    dev = Device(d, "a", relay, env_extra={"ANTHROPIC_BASE_URL": url, "ANTHROPIC_API_KEY": "x"})
+    conv = dev.cli("new", "tools", "--provider", "native", "--model", "claude-opus-5-5").strip().split()[-1]
+    work = os.path.join(d, "work")
+    os.makedirs(work)
+    dev.cli("mount", work, "--convo", conv, "--name", "work")
+    settle(1)
+    w0 = proc_writes(dev.daemon.pid)
+    samples = []
+    t0 = time.time()
+    for t in range(turns):
+        dev.cli("send", "turn %d" % t, "--wait", timeout=600)
+        if (t + 1) * 4 % turns == 0 or t + 1 == turns:
+            calls = (t + 1) * FakeTools.per_turn
+            w = proc_writes(dev.daemon.pid)
+            rss = json.loads(dev.cli("status", "--json")).get("daemon", {}).get("rss", 0)
+            pack, _ = du(os.path.join(d, "a", "engine", "pack"))
+            samples.append(dict(tool_calls=calls, device_write_bytes=w - w0, write_bytes_per_call=round((w - w0) / calls), daemon_rss=rss, device_pack_bytes=pack))
+    dt = time.time() - t0
+    dev.stop()
+    srv.shutdown()
+    return measure(relay, 0, dict(tool_calls=turns * FakeTools.per_turn, turns=turns, seconds=round(dt, 1), device=samples))
+
+
+SCENARIOS = {"s1": s1_transcript, "s2a": lambda: s2_rewrites(False), "s2b": lambda: s2_rewrites(True), "s3": s3_drafts, "s4": s4_catalog, "s5": s5_runner, "s6": s6_tool_calls}
 
 if __name__ == "__main__":
     names = sys.argv[1:] or list(SCENARIOS)
