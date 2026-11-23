@@ -31,5 +31,5 @@ check_serve_rows :: proc(w: ^World) {
 
 @(init)
 _serve_rows_hooks :: proc "contextless" () {
-	register_final_check(6, check_serve_rows)
+	register_final_check(8, check_serve_rows)
 }
