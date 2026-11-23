@@ -438,6 +438,9 @@ Mount :: struct {
 	holds:       [dynamic]Path_Hold,
 	reload_ms:   i64,
 	reload_owed: bool,
+	open_due:    bool,
+	open_fresh:  bool,
+	opening:     bool,
 	reshow:      [dynamic]string,
 	branch:      string,
 	home:        string,
@@ -590,9 +593,6 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	}
 	fresh := load_mount_state(m) or_return
 	m.actor = fshist.ingestion_actor(h.self if h != nil else actor, id)
-	if h != nil {
-		history_register_actor(h, m.actor, id) or_return
-	}
 	m.home_line, _ = clone_string(opts.line, allocator)
 	if m.has_git {
 		if len(m.home) == 0 && len(m.branch) == 0 {
@@ -631,8 +631,29 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		reg.mounts[slot] = m
 	}
 	m.slot = slot
+	m.open_due = true
+	m.open_fresh = fresh
+	if ferr := mount_open_finish(m); ferr != .None && ferr != .Reloading {
+		return ferr
+	}
+	ok = true
+	mount_touch(m)
+	return .None
+}
+
+@(private)
+mount_open_finish :: proc(m: ^Mount) -> (err: Error) {
+	m.opening = true
+	defer m.opening = false
+	defer if err == .Reloading {
+		mount_reload_retry(m)
+	}
+	if h := m.history; h != nil {
+		history_register_actor(h, fshist.ingestion_actor(h.self, m.id), m.id) or_return
+	}
 	mount_wake(m) or_return
 	mount_shadow_reconcile(m) or_return
+	reg := m.reg
 	if reg.observer.opened != nil {
 		reg.observer.opened(reg.observer.data, m)
 	}
@@ -647,19 +668,21 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	mount_git_sources(m) or_return
 	before := mount_jlen(m)
 	m.sweep_temps = true
-	rerr := mount_open_rest(m, fresh)
-	if err := rerr; err != .None {
+	rerr := mount_open_rest(m, m.open_fresh)
+	if rerr == .Reloading {
+		return rerr
+	}
+	m.open_due = false
+	if rerr != .None {
 		if mount_jlen(m) == before {
-			return err
+			return rerr
 		}
 		m.rescan = true
 		mount_schedule(m, 0)
 	}
-	ok = true
 	if len(m.switch_to) > 0 {
 		mount_schedule(m, 0)
 	}
-	mount_touch(m)
 	return .None
 }
 
@@ -883,6 +906,9 @@ mount_close :: proc(m: ^Mount) {
 }
 
 mount_wake :: proc(m: ^Mount) -> Error {
+	if m.open_due && !m.opening {
+		return mount_open_finish(m)
+	}
 	if m.awake {
 		if m.history == nil {
 			return .None
@@ -1512,7 +1538,7 @@ RELOAD_RETRY_MAX_MS :: 30_000
 
 @(private)
 mount_reload_retry :: proc(m: ^Mount) {
-	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && len(m.switch_to) == 0 && !mount_absent_ready(m) {
+	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && !m.open_due && len(m.switch_to) == 0 && !mount_absent_ready(m) {
 		return
 	}
 	m.reload_ms = max(m.opts.settle_ms, 1) if m.reload_ms == 0 else min(m.reload_ms * 2, RELOAD_RETRY_MAX_MS)
