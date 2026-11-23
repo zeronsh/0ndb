@@ -55,6 +55,7 @@ Cipher_Inject :: enum u8 {
 	Append,
 	Served,
 	Relay_Storage,
+	Buffer_Live,
 }
 
 Cipher_Pending :: struct {
@@ -79,6 +80,9 @@ Cipher_Watch :: struct {
 	want_at:  i64,
 	dpulls:   [dynamic]Draft_Pull_Tap,
 	drafts:   u64,
+	bufseal:  map[[56]u8][32]u8,
+	bufseals: u64,
+	bufrx:    u64,
 }
 
 Draft_Pull_Tap :: struct {
@@ -114,6 +118,7 @@ cipher_init :: proc(w: ^World) {
 	w.cipher.images = make(map[osync.Stream_Id]^Cipher_Image, w.allocator)
 	w.cipher.pending = make([dynamic]Cipher_Pending, w.allocator)
 	w.cipher.dpulls = make([dynamic]Draft_Pull_Tap, w.allocator)
+	w.cipher.bufseal = make(map[[56]u8][32]u8, w.allocator)
 	w.cipher.inject = Cipher_Inject(env_u64("SIM_INJECT_REUSE", 0) % len(Cipher_Inject))
 }
 
@@ -132,6 +137,43 @@ cipher_destroy :: proc(w: ^World) {
 	}
 	delete(w.cipher.pending)
 	delete(w.cipher.dpulls)
+	delete(w.cipher.bufseal)
+}
+
+@(private = "file")
+BUFFER_LIVE_MSG :: osync.DRAFT_MSG_MAX - 1
+
+@(private = "file")
+_buffer_seal_observe :: proc(w: ^World, sid: osync.Stream_Id, frame: []u8, who: string) {
+	if len(frame) < 25 || frame[0] != 1 {
+		return
+	}
+	k: [56]u8
+	x := sid
+	copy(k[:32], x[:])
+	copy(k[32:48], frame[1:17])
+	copy(k[48:56], frame[17:25])
+	h: [32]u8
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 32)
+	blake2b.update(&ctx, frame)
+	blake2b.final(&ctx, h[:])
+	w.cipher.bufseals += 1
+	if prev, seen := w.cipher.bufseal[k]; seen {
+		if prev != h {
+			w.cipher.reused += 1
+			world_fail(w, "crypto: nonce reuse: buffer live frames on stream %s with one boot sealed two different batches at offset %d (second from %s)", stream_short(sid), i64(prim.get_u64le(frame[17:25])), who)
+		}
+		return
+	}
+	w.cipher.bufseal[k] = h
+	if w.cipher.inject == .Buffer_Live && !w.cipher.injected && len(frame) > 26 {
+		w.cipher.injected = true
+		forged := slice.clone(frame, context.temp_allocator)
+		forged[len(forged) - 1] ~= 0x5a
+		world_note(w, "crypto: injected a second buffer live frame on stream %s at offset %d", stream_short(sid), i64(prim.get_u64le(frame[17:25])))
+		_buffer_seal_observe(w, sid, forged, "injected")
+	}
 }
 
 tap_feed :: proc(w: ^World, c: ^Conn, t: ^Tap, bytes: []u8, down: bool) {
@@ -177,6 +219,13 @@ _frame :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8, down: bool) {
 		if from & osync.PULL_DRAFT != 0 {
 			append(&w.cipher.dpulls, Draft_Pull_Tap{requester = req, tag = tag, sid = sid, msg = from &~ osync.PULL_DRAFT})
 		}
+		return
+	case !down && kind == KIND_LIVE && len(payload) >= LIVE_FIXED && prim.get_u64le(payload[32:40]) == BUFFER_LIVE_MSG:
+		copy(sid[:], payload[:32])
+		_buffer_seal_observe(w, sid, payload[LIVE_FIXED:], c.node.name)
+		return
+	case down && kind == KIND_LIVED && len(payload) >= LIVE_FIXED && prim.get_u64le(payload[32:40]) == BUFFER_LIVE_MSG:
+		w.cipher.bufrx += 1
 		return
 	case !down && kind == KIND_LIVE && len(payload) >= LIVE_FIXED:
 		copy(sid[:], payload[:32])
