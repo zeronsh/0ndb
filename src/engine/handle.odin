@@ -663,6 +663,9 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 		return true
 	}
 	for s in h.segs {
+		if s.waiting && _seg_empty(h, s) {
+			s.waiting = false
+		}
 		if s.waiting || (fresh && s.probing) {
 			return true
 		}
