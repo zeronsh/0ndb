@@ -1288,57 +1288,116 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			continue
 		}
 		a, has := m.attrib[c.path]
-		if !has {
+		chain, chained := m.attrib_chain[c.path]
+		if !has && !chained {
 			continue
 		}
-		if a.used && !m.lost {
+		if has && a.used && !m.lost && !chained {
 			continue
 		}
-		if !m.lost && !actor_on_line(m, a.actor) {
+		if has && !m.lost && !actor_on_line(m, a.actor) {
+			has = false
+		}
+		steps := make([dynamic]Attrib_Step, context.temp_allocator)
+		if chained {
+			append(&steps, ..chain[:])
+			attrib_chain_drop(m, c.path)
+		}
+		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid}) {
+			append(&steps, Attrib_Step{a.actor, a.oid})
+		}
+		if !m.lost {
+			kept := 0
+			for st in steps {
+				if actor_on_line(m, st.actor) {
+					steps[kept] = st
+					kept += 1
+				}
+			}
+			resize(&steps, kept)
+		}
+		if !has && len(steps) == 0 {
 			continue
 		}
 		file := (c.kind == .Modify || c.kind == .Create) && c.disk == .File && c.moved == ""
-		if !file || a.oid == {} || m.db == nil || !odb.exists(m.db, a.oid) {
-			c.actor = unattributed_actor(m.actor) if m.lost else a.actor
+		if !file || m.db == nil || len(steps) == 0 {
+			if has {
+				c.actor = unattributed_actor(m.actor) if m.lost else a.actor
+			}
 			continue
 		}
 		_, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
-		if !ok || disk_oid == a.oid {
-			c.actor = a.actor
+		if !ok {
+			if has {
+				c.actor = a.actor
+			}
 			continue
 		}
-		first := c
-		first.stat = {}
-		if m.override == nil {
-			m.override = make(map[string]odb.Oid, m.allocator)
+		matched, broken, gone := false, false, false
+		for st in steps {
+			if !odb.exists(m.db, st.oid) {
+				broken = true
+				break
+			}
+			if disk_oid == st.oid {
+				c.actor = st.actor
+				matched = true
+				break
+			}
+			committed := attribute_step(p, &c, st) or_return
+			if !committed {
+				gone = true
+				break
+			}
 		}
-		k, _ := clone_string(c.path, m.allocator)
-		m.override[k] = a.oid
-		b: Builder
-		builder_init(&b, m.history, a.actor)
-		attrib_set(m, c.path, a.actor, true, a.oid)
-		shadow_txn_begin(&m.shadow)
-		eerr := emit_change(p, &b, &first)
-		key, _ := delete_key(&m.override, k)
-		delete(key, m.allocator)
-		if eerr == .None {
-			eerr = builder_commit(m, &b)
-		}
-		if eerr != .None && eerr != .Reloading {
-			shadow_txn_rollback(&m.shadow)
-			return eerr
-		}
-		shadow_txn_end(&m.shadow)
-		eerr or_return
-		e, found := shadow_get(&m.shadow, c.path) or_return
-		if !found {
+		if matched || gone {
 			continue
 		}
-		c.kind = .Modify
-		c.old = e
-		c.actor = {}
+		if broken {
+			c.actor = unattributed_actor(m.actor)
+		} else if has && a.oid == {} {
+			c.actor = unattributed_actor(m.actor) if m.lost else a.actor
+		} else {
+			c.actor = {}
+		}
 	}
 	return .None
+}
+
+@(private)
+attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, err: Error) {
+	m := p.m
+	first := c^
+	first.stat = {}
+	if m.override == nil {
+		m.override = make(map[string]odb.Oid, m.allocator)
+	}
+	k, _ := clone_string(c.path, m.allocator)
+	m.override[k] = st.oid
+	b: Builder
+	builder_init(&b, m.history, st.actor)
+	attrib_set(m, c.path, st.actor, true, st.oid)
+	shadow_txn_begin(&m.shadow)
+	eerr := emit_change(p, &b, &first)
+	key, _ := delete_key(&m.override, k)
+	delete(key, m.allocator)
+	if eerr == .None {
+		eerr = builder_commit(m, &b)
+	}
+	if eerr != .None && eerr != .Reloading {
+		shadow_txn_rollback(&m.shadow)
+		return false, eerr
+	}
+	shadow_txn_end(&m.shadow)
+	eerr or_return
+	e, found := shadow_get(&m.shadow, c.path) or_return
+	if !found {
+		return false, .None
+	}
+	c.kind = .Modify
+	c.old = e
+	c.actor = {}
+	return true, .None
 }
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {

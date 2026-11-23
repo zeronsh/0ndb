@@ -1,5 +1,6 @@
 package sim
 
+import "../../src/prim"
 import "core:fmt"
 import "core:slice"
 import "core:strings"
@@ -165,6 +166,7 @@ check_move :: proc(w: ^World) {
 	mv.conns = make([dynamic]^Conn, w.allocator)
 	mv.mounts = make([dynamic]Sim_Mount, w.allocator)
 	mv.writers = make(map[string]Writer_Info, w.allocator)
+	mv.agent_paths = make(map[string][dynamic]prim.Id, w.allocator)
 	append(&w.nodes, mv)
 	if mv.idx >= RELAY_SLOT || !world_reserve(w) || !node_start(mv) {
 		world_fail(w, "move: %s could not start", mv.name)
