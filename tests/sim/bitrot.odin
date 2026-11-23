@@ -141,6 +141,25 @@ bitrot_redact :: proc(w: ^World, n: ^Node) {
 	world_note(w, "%s bit rot and redaction (%s first) of its own message %s at %d of %s -> %v", n.name, "flip" if first else "redaction", t.token, at, id_short(o.id), rerr)
 }
 
+bitrot_settle :: proc(w: ^World) {
+	if !bitrot_on(w) {
+		return
+	}
+	found := 0
+	for n in w.nodes {
+		if !n.alive || !n.e_open {
+			continue
+		}
+		context = instance_context(&n.inst)
+		k, _ := eng.scrub(&n.e)
+		node_after(n)
+		found += k
+	}
+	if found > 0 {
+		run_until(w, w.now + BITROT_SETTLE, true)
+	}
+}
+
 check_bitrot :: proc(w: ^World) {
 	if !bitrot_on(w) {
 		return
@@ -181,6 +200,7 @@ check_bitrot :: proc(w: ^World) {
 _bitrot_hooks :: proc "contextless" () {
 	register_op(90, "bitrot", bitrot_weight, bitrot_flip)
 	register_op(91, "bitrot_redact", bitrot_redact_weight, bitrot_redact)
+	register_final_check(2, bitrot_settle)
 	register_final_check(115, check_bitrot)
 	register_stat_line(47, "bitrot")
 	STAT_BITROT_FLIPS = register_stat(47, 0, "flips")
