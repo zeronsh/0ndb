@@ -170,24 +170,70 @@ node_remount :: proc(w: ^World, n: ^Node) {
 			i += 1
 			continue
 		}
-		if err := node_mount(w, n, mm.oi, mm.root); err != .None && n.alive {
-			if w.cfg.io_rate > 0 && (err == .Io || err == .No_Space) {
-				n.restart_pending = true
-				context = instance_context(&n.inst)
-				node_after(n)
-				return
-			}
-			cop := m.ops[m.objs[mm.oi].op]
-			if err == .Not_Found && cop.node == n.idx && !op_happened(cop) {
-				world_note(w, "%s drops mount %s: its tree's creation was not acknowledged and did not survive", n.name, mm.root)
-				delete(mm.root, w.allocator)
-				ordered_remove(&m.mounts, i)
-				continue
-			}
-			world_fail(w, "%s could not remount %s after restart: %v", n.name, mm.root, err)
+		removed, stop := _remount_one(w, n, i, 0)
+		if stop {
+			return
 		}
-		i += 1
+		if !removed {
+			i += 1
+		}
 	}
+}
+
+@(private = "file")
+EV_REMOUNT: Ev_Kind
+
+@(private = "file")
+REMOUNT_TRIES :: 60
+
+@(init)
+_remount_init :: proc "contextless" () {
+	EV_REMOUNT = register_event(_remount_retry)
+}
+
+@(private = "file")
+_remount_retry :: proc(w: ^World, ev: ^Sim_Event) {
+	n := w.nodes[ev.node]
+	if !n.alive || u64(n.incarnation) != ev.gen {
+		return
+	}
+	oi := int(ev.arg & 0xffff_ffff)
+	for mm, i in w.model.mounts {
+		if mm.node == n.idx && mm.oi == oi {
+			_remount_one(w, n, i, ev.arg >> 32)
+			return
+		}
+	}
+}
+
+@(private = "file")
+_remount_one :: proc(w: ^World, n: ^Node, i: int, tries: u64) -> (removed: bool, stop: bool) {
+	m := &w.model
+	mm := m.mounts[i]
+	err := node_mount(w, n, mm.oi, mm.root)
+	if err == .None || !n.alive {
+		return false, false
+	}
+	if w.cfg.io_rate > 0 && (err == .Io || err == .No_Space) {
+		n.restart_pending = true
+		context = instance_context(&n.inst)
+		node_after(n)
+		return false, true
+	}
+	cop := m.ops[m.objs[mm.oi].op]
+	if err == .Not_Found && cop.node == n.idx && !op_happened(cop) {
+		world_note(w, "%s drops mount %s: its tree's creation was not acknowledged and did not survive", n.name, mm.root)
+		delete(mm.root, w.allocator)
+		ordered_remove(&m.mounts, i)
+		return true, false
+	}
+	if err == .Missing && tries < REMOUNT_TRIES {
+		world_note(w, "%s remount of %s waits for its history (%v); retrying", n.name, mm.root, err)
+		schedule(w, Sim_Event{at = w.now + 500_000_000, kind = EV_REMOUNT, node = n.idx, gen = u64(n.incarnation), arg = u64(mm.oi) | (tries + 1) << 32})
+		return false, false
+	}
+	world_fail(w, "%s could not remount %s after restart: %v", n.name, mm.root, err)
+	return false, false
 }
 
 op_mount :: proc(w: ^World, n: ^Node) {

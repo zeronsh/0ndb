@@ -832,7 +832,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	}
 	if d.probe == 0 {
 		d.stats.syncs += 1
-		if of, _, ferr := _fd_get(d, fd); ferr == .None && d.crash_at == 0 && disk_blob_sync_crash(d, of.path) {
+		if d.crash_at == 0 && disk_blob_sync_crash(d, of.path) {
 			d.crash_at = d.stats.ops + 1
 			d.blob_crashes += 1
 		}
