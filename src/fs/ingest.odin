@@ -1204,6 +1204,9 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		if a.used && !m.lost {
 			continue
 		}
+		if !m.lost && !actor_on_line(m, a.actor) {
+			continue
+		}
 		file := (c.kind == .Modify || c.kind == .Create) && c.disk == .File && c.moved == ""
 		if !file || a.oid == {} || m.db == nil || !odb.exists(m.db, a.oid) {
 			c.actor = unattributed_actor(m.actor) if m.lost else a.actor
@@ -1724,6 +1727,9 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				actor = c.scope.actor
 			} else if c.actor != {} {
 				actor = c.actor
+			}
+			if actor != m.actor && !actor_on_line(m, actor) {
+				actor = m.actor
 			}
 			if _, ok := groups[actor]; !ok {
 				groups[actor] = make([dynamic]int, context.temp_allocator)

@@ -155,6 +155,9 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 
 @(private)
 observe_record :: proc(m: ^Mount, s: ^Scope, kind: fshist.Observe_Kind, inode: fstree.Inode_Id, rel: string, version: []crdt.Op_Id, hash: [32]u8) -> Error {
+	if !actor_on_line(m, s.actor) {
+		return .None
+	}
 	buf := make([dynamic]u8, context.temp_allocator)
 	fshist.encode_observe(&buf, fshist.Observe_Op{kind = kind, inode = inode_op(m.history, inode), path = rel, version = version, hash = hash})
 	b: Builder
@@ -383,6 +386,9 @@ _base_parents :: proc(m: ^Mount, actor: prim.Id, inode: fstree.Inode_Id, v: []cr
 	}
 	if crdt.graph_contains(&h.g, vl[:], own) {
 		return slice.clone(v, context.temp_allocator)
+	}
+	if !lv_in_line(m, own) {
+		return nil
 	}
 	one := [1]crdt.Lv{own}
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -615,4 +621,35 @@ hold_target :: proc(m: ^Mount, tl: []crdt.Lv, sl: []crdt.Lv) -> (out: []crdt.Lv,
 		return tl, false, .None
 	}
 	return keep[:], true, .None
+}
+
+@(private)
+actor_on_line :: proc(m: ^Mount, actor: prim.Id) -> bool {
+	h := m.history
+	known := crdt.graph_known(&h.g, actor)
+	if known == 0 {
+		return true
+	}
+	own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+	if !ok {
+		return true
+	}
+	return lv_in_line(m, own)
+}
+
+@(private)
+lv_in_line :: proc(m: ^Mount, lv: crdt.Lv) -> bool {
+	h := m.history
+	ll := make([dynamic]crdt.Lv, context.temp_allocator)
+	v, found, err := history_line(h, m.line, context.temp_allocator)
+	if err != .None {
+		return false
+	}
+	if !found {
+		v = m.synced[:]
+	}
+	if crdt.graph_version_lvs(&h.g, v, &ll) != .None {
+		return false
+	}
+	return crdt.graph_contains(&h.g, ll[:], lv)
 }
