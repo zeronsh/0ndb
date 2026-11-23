@@ -434,6 +434,7 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	case .Refused:
 		world_note(w, "%s refused by relay: %v", n.name, ev.err)
 	case .Relay_Misbehaving:
+		n.accused += 1
 		if w.cfg.byzantine {
 			w.stats.detected += 1
 		}
@@ -449,6 +450,9 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	case .Unavailable, .Available, .Promoted, .Peer_Misbehaving:
 		if ev.kind == .Unavailable {
 			n.unavailable += 1
+		}
+		if ev.kind == .Peer_Misbehaving {
+			n.accused += 1
 		}
 		world_note(w, "%s %v %s device %s length %d %v", n.name, ev.kind, id_short(ev.object), id_short(ev.device), ev.length, ev.err)
 	}

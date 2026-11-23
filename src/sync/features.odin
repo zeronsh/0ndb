@@ -889,6 +889,7 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 		}
 	}
 	held := false
+	probed := false
 	if _is_boundary(rm, at) {
 		claimed := !_proven_boundary(rm, at)
 		pos := 0
@@ -908,7 +909,11 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 			switch _record_check(&k, data[pos:][:size], at + i64(pos)) {
 			case .Ok:
 			case .Bad:
-				return 0, pos, 0, true
+				if !_key_probe(r, rm, &k) {
+					return 0, pos, 0, true
+				}
+				held = true
+				probed = true
 			case .Unknown:
 				held = true
 			}
@@ -918,7 +923,9 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 			pos += size
 		}
 		if held {
-			_keys_needed(r, rm)
+			if !probed {
+				_keys_needed(r, rm)
+			}
 			return 0, pos, 0, false
 		}
 		if !final {
@@ -949,7 +956,10 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 		switch _record_check(&k, data[start:pos], at + i64(start)) {
 		case .Ok:
 		case .Bad:
-			return pos, len(data), 0, true
+			if !_key_probe(r, rm, &k) {
+				return pos, len(data), 0, true
+			}
+			return pos, len(data), 0, false
 		case .Unknown:
 			_keys_needed(r, rm)
 			return pos, len(data), 0, false
@@ -957,6 +967,59 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 		pos = start
 	}
 	return pos, len(data), 0, false
+}
+
+@(private)
+_key_probe :: proc(r: ^Replicator, rm: ^Remote, k: ^_Checker) -> (holding: bool) {
+	if k.tree.data == nil || !k.known || rm.is_head {
+		return false
+	}
+	v := (^Key_Tree)(k.tree.data).version
+	if rm.key_done && rm.key_probe == v {
+		return false
+	}
+	if rm.key_wait && rm.key_probe == v {
+		rm.keys_wait = true
+		return true
+	}
+	kn, kerr := keys_stream_name(rm.name)
+	if kerr != .None {
+		return false
+	}
+	hname, herr := keys_head_name(kn)
+	if herr != .None {
+		return false
+	}
+	rm.key_head = stream_id(&rm.scope, rm.device, hname, 0)
+	rm.key_probe = v
+	rm.key_wait = true
+	rm.key_done = false
+	rm.keys_wait = true
+	_keys_head_start(r, &rm.scope, rm.device, kn, v + 1)
+	return true
+}
+
+@(private)
+_key_probe_answered :: proc(r: ^Replicator, head: ^Remote, epoch: u64, ok: bool) {
+	for _, rm in r.remotes {
+		if !rm.key_wait || rm.key_head != head.id {
+			continue
+		}
+		if ok && epoch > rm.key_probe {
+			continue
+		}
+		rm.key_wait = false
+		rm.key_done = true
+		if rm.keys_wait {
+			rm.keys_wait = false
+			_kwait_release(r, rm)
+			_held_apply(r, rm)
+			if r.phase == .Ready {
+				_remote_pull(r, rm)
+				_remote_settle(r, rm)
+			}
+		}
+	}
 }
 
 replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) {
@@ -967,6 +1030,7 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	if !ok {
 		return
 	}
+	rm.key_wait = false
 	if !rm.keys_wait {
 		_pending_apply(r, rm)
 		return
