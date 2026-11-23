@@ -25,21 +25,21 @@ def spawn(args, cwd, log, env):
     return p
 
 
-def stop_proc(p, sig):
+def stop_proc(p, hard):
     if p.poll() is not None:
         return
     try:
         if WINDOWS:
-            p.terminate() if sig == signal.SIGTERM else p.kill()
+            p.kill() if hard else p.terminate()
         else:
-            os.killpg(p.pid, sig)
+            os.killpg(p.pid, signal.SIGKILL if hard else signal.SIGTERM)
     except Exception:
         pass
 
 
 def kill_all():
     for p in PROCS:
-        stop_proc(p, signal.SIGKILL)
+        stop_proc(p, True)
 
 
 def unix_connect(path):
@@ -205,11 +205,11 @@ class Daemon:
 
     def stop(self):
         if self.proc.poll() is None:
-            stop_proc(self.proc, signal.SIGTERM)
+            stop_proc(self.proc, False)
             try:
                 self.proc.wait(timeout=30)
             except Exception:
-                stop_proc(self.proc, signal.SIGKILL)
+                stop_proc(self.proc, True)
         shutil.rmtree(self.rt, ignore_errors=True)
 
 
