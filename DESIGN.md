@@ -1349,6 +1349,12 @@ concurrent typing is never lost or reverted.
     spaces load and before anything reads `own`. Nothing leaves the device
     on the strength of the bit alone: what `own` drives (catalog rows, grant
     cards, publishing) rides batches at or after the first own record's.
+    The own mark means "this device writes this object", not "this device
+    holds data for it": an own Text or File_Tree with no local history yet
+    is a normal state (a git mount waiting for its history, a writer created
+    before its first record). Catalog participation is written when the
+    writer opens and holds data, never inferred from the mark; the unclean
+    reconcile lists only own objects whose own stream exists.
     Key trees and space rows commit at once, so an own key tree is durable
     before any own segment byte. A copy-on-write omap file inside the pack (map tables) writes
     and syncs its pages at commit but keeps the new meta page in memory,
@@ -1363,7 +1369,9 @@ concurrent typing is never lost or reverted.
   - Registry: on an unclean open, before spaces load, `own` and the owned
     entry of an object whose own segment is absent or empty are cleared (not
     created yet), content and promotion marks are clamped to the recovered
-    own stream, and a checkpoint length past it is dropped. Legacy registry
+    own stream, and a checkpoint length past it is dropped. This applies to
+    Conversation and Map segments only; a Text or File_Tree history may
+    legitimately be absent under an own mark (above). Legacy registry
     rows migrated into the redaction log are deleted only after the batch
     holding their replacement records is durable.
   - Map tables: `ROOT_CONSUMED[self]` rides the same copy-on-write commit as

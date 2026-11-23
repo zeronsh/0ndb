@@ -794,6 +794,9 @@ _catalog_reconcile_space :: proc(e: ^Engine, sp: ^Space) {
 		if _, queued := e.catalog_q[id]; queued {
 			continue
 		}
+		if n, lerr := _own_stream_len(e, id, rec.kind); lerr != .None || n == 0 {
+			continue
+		}
 		if h == nil {
 			hh, herr := _catalog_handle(e, sp)
 			if herr != .None {
