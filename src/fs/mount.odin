@@ -920,6 +920,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		}
 		err := history_ready(m.history)
 		if err == .Reloading {
+			m.reload_owed = true
 			mount_reload_retry(m)
 		} else if err == .None {
 			m.reload_ms = 0
@@ -950,6 +951,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 			ignore_destroy(&m.ignore)
 			shadow_detach(&m.shadow)
 			if err == .Reloading {
+				m.reload_owed = true
 				mount_reload_retry(m)
 			}
 			return err
