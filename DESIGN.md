@@ -3141,9 +3141,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   range it wanted and the handle asks the replicator for it; the text
   history asks for the exact record it failed to read; a follower whose
   segment turns out to be trimmed asks for the prefix it lacks, which the
-  replicator serves from the archive. The sim forgets every remote
+  replicator serves from the archive; a waiter whose view reported nothing
+  asks for the newest gap of the segment it waits on (at most 64 KiB, the
+  same on-demand read a view makes, so the storage mode still decides what
+  is kept). The sim forgets every remote
   segment of an object on a reader, restarts it with the writer offline,
-  and requires the same view afterwards (conversations, texts and maps).
+  and requires the same view afterwards (conversations, texts and maps),
+  and does the same for a segment held on devices below its base with the
+  writer online.
   Map groups collect: a Put whose every field is matched or beaten (by
   register order) by a later Put of the same key in the same group becomes
   a length-only `Gone` entry, a run of them ends with the chain head after
