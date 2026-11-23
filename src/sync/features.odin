@@ -986,18 +986,26 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 			n := int(prim.get_u32le(data[pos:]))
 			size := n + journal.OVERHEAD
 			if n > journal.MAX_BODY || (size <= len(data) - pos && int(prim.get_u32le(data[pos + size - 4:])) != n) {
-				if pos == 0 && claimed {
+				if claimed {
 					_unclaim(rm, at)
 					return
 				}
 				return 0, pos, 0, true
 			}
 			if size > len(data) - pos {
+				if final {
+					rm.need_at = at + i64(pos)
+					rm.need_to = rm.need_at + i64(size)
+				}
 				break
 			}
 			switch _record_check(&k, data[pos:][:size], at + i64(pos)) {
 			case .Ok:
 			case .Bad:
+				if claimed {
+					_unclaim(rm, at)
+					return
+				}
 				return 0, pos, 0, true
 			case .Unknown:
 				held = true
@@ -1023,10 +1031,15 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 	if end != stream_len && !_is_boundary(rm, end) {
 		return
 	}
+	eclaimed := end != stream_len && !_proven_boundary(rm, end)
 	pos := len(data)
 	for pos >= journal.OVERHEAD {
 		n := int(prim.get_u32le(data[pos - 4:]))
 		if n > journal.MAX_BODY {
+			if eclaimed {
+				_unclaim(rm, end)
+				return
+			}
 			return pos, len(data), 0, true
 		}
 		start := pos - n - journal.OVERHEAD
@@ -1035,12 +1048,17 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 			rm.need_set = true
 			break
 		}
-		if int(prim.get_u32le(data[start:])) != n {
-			return pos, len(data), 0, true
+		chk := _Check.Bad
+		if int(prim.get_u32le(data[start:])) == n {
+			chk = _record_check(&k, data[start:pos], at + i64(start))
 		}
-		switch _record_check(&k, data[start:pos], at + i64(start)) {
+		switch chk {
 		case .Ok:
 		case .Bad:
+			if eclaimed {
+				_unclaim(rm, end)
+				return
+			}
 			return pos, len(data), 0, true
 		case .Unknown:
 			_keys_needed(r, rm)
