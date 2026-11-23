@@ -1,6 +1,7 @@
 package engine
 
 import "base:runtime"
+import "core:slice"
 import "core:crypto/blake2b"
 import "core:mem/virtual"
 import "core:strings"
@@ -845,8 +846,13 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 		}
 		out[i].start = c.start
 		out[i].end = c.end
-		out[i].ours = c.ours
-		out[i].theirs = c.theirs
+		ours, oerr := slice.clone(c.ours, allocator)
+		theirs, terr := slice.clone(c.theirs, allocator)
+		if oerr != nil || terr != nil {
+			return nil, .No_Memory
+		}
+		out[i].ours = ours
+		out[i].theirs = theirs
 		out[i].kind = c.kind
 		out[i].raw = c
 		if c.kind == .Offered {
