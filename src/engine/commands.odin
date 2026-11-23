@@ -240,7 +240,9 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 		_queue_behind(e, p)
 		return res, .Pending
 	}
+	_reserve(e, _cmd_bytes(cmd)) or_return
 	res, h, err = _cmd_run(e, cmd, &st)
+	_unreserve(e)
 	busy := err == .Busy && pack.pressure(&e.pk)
 	if err == .Corrupt && _damage_pending(e, _cmd_object(cmd).id) {
 		p := new(Pending_Cmd, e.allocator)
@@ -499,6 +501,67 @@ _convo_writable :: proc(e: ^Engine, o: Object) -> (h: ^Handle, err: Error) {
 }
 
 @(private)
+CMD_OVERHEAD :: i64(4096)
+
+@(private)
+_cmd_bytes :: proc(cmd: Command) -> i64 {
+	n := CMD_OVERHEAD
+	switch c in cmd {
+	case Cmd_Send:
+		n += i64(len(c.text)) + i64(len(c.attachments)) * CMD_OVERHEAD
+	case Cmd_Queue:
+		n += i64(len(c.text)) + i64(len(c.attachments)) * CMD_OVERHEAD
+	case Cmd_Steer:
+		n += i64(len(c.text)) + i64(len(c.attachments)) * CMD_OVERHEAD
+	case Cmd_Edit:
+		n += i64(len(c.text)) + i64(len(c.attachments)) * CMD_OVERHEAD
+	case Cmd_Answer:
+		n += i64(len(c.text))
+	case Cmd_Map_Set:
+		n += i64(len(c.key))
+		for f in c.fields {
+			n += i64(len(f.value)) + 16
+		}
+	case Cmd_Map_Delete:
+		n += i64(len(c.key))
+	case Cmd_Map_Add:
+		n += i64(len(c.key) + len(c.element))
+	case Cmd_Map_Remove:
+		n += i64(len(c.key) + len(c.element))
+	case Cmd_Text_Edit:
+		n += i64(len(c.insert)) * 2
+	case Cmd_Cancel, Cmd_Interrupt, Cmd_Switch, Cmd_Back, Cmd_Follow, Cmd_Mount, Cmd_Unmount, Cmd_Await, Cmd_Assign, Cmd_Redact, Cmd_Catalog_Set:
+	}
+	return n * 2
+}
+
+@(private)
+_reserve :: proc(e: ^Engine, n: i64) -> Error {
+	if !e.pk_open {
+		return .None
+	}
+	if perr := pack.reserve(&e.pk, n); perr != .None {
+		err := _perr(perr)
+		_storage_short(e, err, "a write was refused: the disk is full")
+		return err
+	}
+	if e.reg.open {
+		if err := omap.db_reserve(&e.reg.db, REG_OP_MAX); err != .None {
+			pack.release(&e.pk)
+			_storage_short(e, _oerr(err), "a write was refused: the disk is full")
+			return _oerr(err)
+		}
+	}
+	return .None
+}
+
+@(private)
+_unreserve :: proc(e: ^Engine) {
+	if e.pk_open {
+		pack.release(&e.pk)
+	}
+}
+
 _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^Handle, err: Error) {
 	switch c in cmd {
 	case Cmd_Send:

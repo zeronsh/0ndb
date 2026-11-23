@@ -63,6 +63,10 @@ Db :: struct {
 	published: u64,
 	pub_slot:  int,
 	pub_wait:  int,
+	headroom:  i64,
+	floor:     i64,
+	alloc_end: i64,
+	no_prealloc: bool,
 }
 
 Pend_Meta :: struct {
@@ -395,6 +399,10 @@ txn_commit :: proc(t: ^Txn) -> Error {
 	}
 	written := next - start
 	if written > 0 {
+		if err := _db_room(db, i64(next) * PAGE, 0); err != .None {
+			txn_abort(t)
+			return err
+		}
 		buf, aerr := make([]u8, int(written) * PAGE, t.alloc)
 		if aerr != nil {
 			txn_abort(t)
@@ -1689,4 +1697,53 @@ _compact_recover :: proc(vfs: prim.Vfs, path: string) -> Error {
 		return obj.perr(err)
 	}
 	return .None
+}
+
+@(private)
+_db_prealloc :: proc(db: ^Db, to: i64) -> Error {
+	if db.no_prealloc || to <= db.alloc_end {
+		return .None
+	}
+	from := max(db.alloc_end, i64(db.meta.pages) * PAGE)
+	e := prim.preallocate(db.vfs, db.fd, from, to - from)
+	if e == .Unsupported || e == .Invalid {
+		db.no_prealloc = true
+		return .None
+	}
+	if e != .None {
+		return obj.perr(e)
+	}
+	db.alloc_end = to
+	return .None
+}
+
+@(private)
+_db_room :: proc(db: ^Db, end: i64, keep: i64) -> Error {
+	if db.headroom <= 0 || db.no_prealloc {
+		return .None
+	}
+	need := end + keep
+	if need <= db.alloc_end {
+		if db.alloc_end - end < db.headroom / 2 {
+			_db_prealloc(db, end + db.headroom)
+		}
+		return .None
+	}
+	if _db_prealloc(db, need + db.headroom) == .None {
+		return .None
+	}
+	return _db_prealloc(db, need)
+}
+
+db_set_headroom :: proc(db: ^Db, headroom: i64, floor: i64) {
+	db.headroom = headroom
+	db.floor = floor
+	db.alloc_end = 0
+}
+
+db_reserve :: proc(db: ^Db, bytes: i64) -> Error {
+	if db.poisoned {
+		return .Io
+	}
+	return _db_room(db, i64(db.meta.pages) * PAGE, bytes + db.floor)
 }
