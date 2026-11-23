@@ -1777,7 +1777,14 @@ mount_shadow_reconcile :: proc(m: ^Mount) -> Error {
 	if m.shadow_mark.end != 0 && g == m.shadow_mark.gen && e > m.shadow_mark.end {
 		shadow_rollback(&m.shadow, m.shadow_mark.end) or_return
 	}
+	m.img.shadow = _shadow_mark_of(&m.shadow)
 	return .None
+}
+
+@(private)
+_shadow_mark_of :: proc "contextless" (s: ^Shadow) -> (mk: Shadow_Mark) {
+	mk.gen, mk.end = shadow_end(s)
+	return
 }
 
 Mount_Image :: struct {
@@ -1791,6 +1798,7 @@ Mount_Image :: struct {
 	adopt_pending: bool,
 	attrib:     map[string]Attrib,
 	log_at:     i64,
+	shadow:     Shadow_Mark,
 }
 
 Mount_Wait :: struct {
@@ -1810,6 +1818,10 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	img.imported = m.imported
 	img.adopt_pending = m.adopt_pending
 	img.jpos = m.jpend
+	img.shadow = m.shadow_mark
+	if shadow_attached(&m.shadow) {
+		img.shadow.gen, img.shadow.end = shadow_end(&m.shadow)
+	}
 	img.attrib = make(map[string]Attrib, m.allocator)
 	for k, a in m.attrib {
 		key, _ := clone_string(k, m.allocator)
@@ -1895,8 +1907,8 @@ mount_settle :: proc(m: ^Mount) -> Error {
 	h := m.history
 	fp := history_fp(h)
 	if fp == h.mark_fp && h.mark <= h.settled && len(m.waits) == 0 {
-		image_take(m, &m.img)
 		shadow_flush(m) or_return
+		image_take(m, &m.img)
 		clear(&m.intents)
 		m.jpos = m.jpend
 		attrib_prune(m)
@@ -1906,6 +1918,7 @@ mount_settle :: proc(m: ^Mount) -> Error {
 		h.mark += 1
 		h.mark_fp = fp
 	}
+	shadow_flush(m) or_return
 	if n := len(m.waits); n > 0 && m.waits[n - 1].mark == h.mark {
 		image_take(m, &m.waits[n - 1].img)
 	} else {
@@ -1993,9 +2006,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	for a in m.absent {
 		prim.write_str(&w, a)
 	}
-	if shadow_attached(&m.shadow) {
-		m.shadow_mark.gen, m.shadow_mark.end = shadow_end(&m.shadow)
-	}
+	m.shadow_mark = img.shadow
 	prim.write_uvarint(&w, m.shadow_mark.gen)
 	prim.write_uvarint(&w, m.shadow_mark.end)
 	prim.write_bool(&w, img.adopt_pending)
@@ -2021,8 +2032,9 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		attrib_log_reset(m)
 		img.log_at = 0
 	}
-	if shadow_attached(&m.shadow) && !shadow_dirty(&m.shadow) && shadow_wants_compact(&m.shadow) {
+	if shadow_attached(&m.shadow) && !shadow_dirty(&m.shadow) && shadow_wants_compact(&m.shadow) && len(m.waits) == 0 && img.shadow == _shadow_mark_of(&m.shadow) {
 		shadow_compact(&m.shadow) or_return
+		img.shadow = _shadow_mark_of(&m.shadow)
 		return save_mount_state(m)
 	}
 	return .None
