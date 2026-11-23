@@ -130,6 +130,7 @@ History :: struct {
 	kv_upto:    u64,
 	mark:       u64,
 	mark_fp:    [3]u64,
+	own_len:    i64,
 	staged:     [dynamic]Staged_Blob,
 	mounts:     [dynamic]^Mount,
 	pins:       [dynamic]odb.Oid,
@@ -228,12 +229,19 @@ history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self:
 	h.dir = d
 	h.staged = make([dynamic]Staged_Blob, allocator)
 	h.mounts = make([dynamic]^Mount, allocator)
-	if err := history_wake(h); err != .None {
+	if err := history_wake(h); err != .None && err != .Reloading {
 		delete(h.dir, allocator)
 		h.dir = ""
 		return err
 	}
 	return .None
+}
+
+history_own_durable :: proc(h: ^History) -> i64 {
+	if h.awake {
+		return journal.journal_durable_len(&h.journal)
+	}
+	return h.own_len
 }
 
 history_wall_ms :: proc(h: ^History) -> i64 {
@@ -791,6 +799,7 @@ history_sleep :: proc(h: ^History) {
 		crdt.dict_destroy(&d)
 	}
 	delete(h.rdicts)
+	h.own_len = journal.journal_durable_len(&h.journal)
 	journal.journal_close(&h.journal)
 	kv_groups_free(&h.kv, &h.held, h.allocator)
 	h.held = kv_groups_take(&h.kv)
