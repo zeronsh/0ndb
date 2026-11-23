@@ -2521,11 +2521,17 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 				e := c.old
 				e.stat = c.stat
 				shadow_put(&m.shadow, c.path, e) or_return
+				if shadow_has_losers(m, c.moved) or_return {
+					mount_reshow_add(m, c.moved)
+				}
 				return .None
 			}
 			shadow_remove(&m.shadow, c.moved) or_return
 			e := c.old
 			shadow_put(&m.shadow, c.path, e) or_return
+			if shadow_has_losers(m, c.moved) or_return {
+				mount_reshow_add(m, c.moved)
+			}
 			if c.disk == .File && !stat_clean(c.stat, c.old) {
 				return emit_modify(p, b, c, e)
 			}
