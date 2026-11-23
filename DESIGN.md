@@ -708,6 +708,12 @@ equal in both directions.
   the reload dropped. Work that needs the history (content uploads, index
   scans, buffer advances) stays owed and is retried at the next settle,
   never re-queued where it keeps the engine ticking.
+  A mount whose history is reloading still opens: the history-dependent
+  rest of the open (actor registration, shadow reconcile, recovery, import)
+  is owed and finished by the next wake or pass, and every wake that finds
+  the history reloading marks the mount's work owed, so the backoff retry
+  carries it. A history whose first wake reloads is created asleep, and its
+  own durable length is the journal's, recorded at sleep.
   Recovery from the mount's own intents (at
   open, or when a pass retries an import that did not finish) goes through
   the same wait: the intents stay in the saved state until the image that
