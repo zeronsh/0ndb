@@ -348,7 +348,12 @@ op_convo_unsealed :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_send :: proc(c: ^Call, o: ^Out) -> Status {
-	return exec(c, o, eng.Cmd_Send{object = a_object(c, "object"), text = a_str(c, "text"), parent = a_rid(c, "parent"), role = convo.Role(a_u64(c, "role")), attachments = a_attachments(c, "attachments"), provider = a_str(c, "provider"), model = a_str(c, "model")})
+	parent := a_rid(c, "parent")
+	root := a_bool(c, "root")
+	if root && !obj.rid_none(parent) {
+		return .Bad_Request
+	}
+	return exec(c, o, eng.Cmd_Send{object = a_object(c, "object"), text = a_str(c, "text"), parent = parent, root = root, role = convo.Role(a_u64(c, "role")), attachments = a_attachments(c, "attachments"), provider = a_str(c, "provider"), model = a_str(c, "model")})
 }
 
 op_queue :: proc(c: ^Call, o: ^Out) -> Status {
@@ -547,7 +552,7 @@ op_tree_create :: proc(c: ^Call, o: ^Out) -> Status {
 op_tree_read :: proc(c: ^Call, o: ^Out) -> Status {
 	ob := a_object(c, "object")
 	line := a_str(c, "line")
-	data, err := eng.tree_read(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line)
+	data, err := eng.tree_read(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line, a_bytes(c, "version"))
 	if err != .None {
 		return pend(c, err)
 	}
@@ -559,16 +564,26 @@ op_tree_read :: proc(c: ^Call, o: ^Out) -> Status {
 op_tree_list :: proc(c: ^Call, o: ^Out) -> Status {
 	ob := a_object(c, "object")
 	line := a_str(c, "line")
-	names, err := eng.tree_list(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line)
+	entries, err := eng.tree_entries(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line, a_bytes(c, "version"))
 	if err != .None {
 		return pend(c, err)
 	}
-	o_arr(o, "names", len(names))
-	for n in names {
-		o_str(o, "", n)
+	o_arr(o, "names", len(entries))
+	for x in entries {
+		o_str(o, "", x.name)
 	}
 	o_end(o)
 	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
+	o_arr(o, "entries", len(entries))
+	for x in entries {
+		o_obj(o, "")
+		o_str(o, "name", x.name)
+		o_enum(o, "kind", u64(x.kind), TREE_KIND_NAMES[:])
+		o_u64(o, "size", u64(max(x.size, 0)))
+		o_u64(o, "mode", u64(x.mode))
+		o_end(o)
+	}
+	o_end(o)
 	return .Ok
 }
 

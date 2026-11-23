@@ -117,6 +117,14 @@ impl Client {
         self.call(&Value::Object(m))
     }
 
+    pub fn send_root(&self, object: &str, text: &str) -> Pending<WriteResult> {
+        self.call(&json!({"op": "send", "object": object, "text": text, "root": true}))
+    }
+
+    pub fn convo_files_at(&self, object: &str, msg: &str) -> Pending<FilesAt> {
+        self.call(&json!({"op": "convo.files_at", "object": object, "msg": msg}))
+    }
+
     pub fn queue(&self, object: &str, text: &str) -> Pending<WriteResult> {
         self.call(&json!({"op": "queue", "object": object, "text": text}))
     }
@@ -415,6 +423,14 @@ impl Client {
         m.insert("path".into(), path.into());
         put(&mut m, "line", line);
         self.call(&Value::Object(m))
+    }
+
+    pub fn tree_read_at(&self, object: &str, path: &str, version: &str) -> Pending<TreeText> {
+        self.call(&json!({"op": "tree.read", "object": object, "path": path, "version": version}))
+    }
+
+    pub fn tree_list_at(&self, object: &str, path: &str, version: &str) -> Pending<TreeList> {
+        self.call(&json!({"op": "tree.list", "object": object, "path": path, "version": version}))
     }
 
     pub fn tree_write(&self, object: &str, path: &str, text: &str, line: Option<&str>) -> Pending<TreeWritten> {

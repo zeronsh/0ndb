@@ -244,7 +244,7 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 		}
 		inode = id
 	} else {
-		tree_at = _tree_at(e, h, opts.line) or_return
+		tree_at = _tree_at(e, h, opts.line, nil) or_return
 		snap := tree_at.snap
 		id, ok, lerr := fstree.lookup(&snap, opts.path)
 		if lerr != nil {

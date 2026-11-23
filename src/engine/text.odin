@@ -88,14 +88,17 @@ text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 	return spans, .None
 }
 
-tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "") -> (data: []u8, err: Error) {
+tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (data: []u8, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
 	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
-	at := _tree_at(e, h, line) or_return
+	at, aerr := _tree_at(e, h, line, version)
+	if aerr != .None {
+		return nil, aerr
+	}
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
 		return nil, .Corrupt
@@ -105,6 +108,9 @@ tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 			return nil, _wait(e, h, ready)
 		}
 		return nil, .Not_Found
+	}
+	if info, iok, ierr := fstree.info(&at.snap, id, context.temp_allocator); ierr == nil && iok && info.kind == .Dir {
+		return nil, .Invalid
 	}
 	text, ferr := _tree_text(e, h, &at, id)
 	if ferr != .None {
@@ -117,18 +123,42 @@ tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 	return data, .None
 }
 
-tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "") -> (names: []string, err: Error) {
+Tree_Entry :: struct {
+	name: string,
+	kind: fstree.Kind,
+	size: i64,
+	mode: u32,
+}
+
+tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (names: []string, err: Error) {
 	context = context_for(e)
+	entries, lerr := _tree_entries(e, o, path, context.temp_allocator, ready, line, version, false)
+	out := make([]string, len(entries), allocator)
+	for x, i in entries {
+		out[i] = _clone(x.name, allocator) or_return
+	}
+	return out, lerr
+}
+
+tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (entries: []Tree_Entry, err: Error) {
+	context = context_for(e)
+	return _tree_entries(e, o, path, allocator, ready, line, version, true)
+}
+
+@(private)
+_tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Allocator, ready: Ready, line: string, version: []u8, sizes: bool) -> (entries: []Tree_Entry, err: Error) {
 	h := _handle_get(e, o, .File_Tree) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
 	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
-	at := _tree_at(e, h, line) or_return
-	snap := at.snap
+	at, aerr := _tree_at(e, h, line, version)
+	if aerr != .None {
+		return nil, aerr
+	}
 	dir := fstree.ROOT
 	if len(path) > 0 && path != "/" {
-		id, ok, lerr := fstree.lookup(&snap, path)
+		id, ok, lerr := fstree.lookup(&at.snap, path)
 		if lerr != nil {
 			return nil, .Corrupt
 		}
@@ -138,15 +168,42 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 			}
 			return nil, .Not_Found
 		}
+		if info, iok, ierr := fstree.info(&at.snap, id, context.temp_allocator); ierr == nil && iok && info.kind != .Dir {
+			return nil, .Invalid
+		}
 		dir = id
 	}
-	kids, cerr := fstree.children(&snap, dir, nil, 0, context.temp_allocator)
+	kids, cerr := fstree.children(&at.snap, dir, nil, 0, context.temp_allocator)
 	if cerr != nil {
 		return nil, .Corrupt
 	}
-	out := make([]string, len(kids), allocator)
+	out := make([]Tree_Entry, len(kids), allocator)
 	for k, i in kids {
-		out[i] = _clone(k.name, allocator) or_return
+		x := Tree_Entry{kind = k.kind}
+		x.name = _clone(k.name, allocator) or_return
+		info, iok, ierr := fstree.info(&at.snap, k.inode, context.temp_allocator)
+		if ierr != nil {
+			return nil, .Corrupt
+		}
+		switch k.kind {
+		case .Dir:
+			x.mode = 0o755
+		case .Symlink:
+			x.mode = 0o777
+			if iok {
+				x.size = i64(len(info.target))
+			}
+		case .File:
+			x.mode = 0o755 if iok && .Exec in info.flags else 0o644
+			if sizes {
+				text, terr := _tree_text(e, h, &at, k.inode)
+				if terr != .None {
+					return nil, _pending_result(e, h, terr, ready)
+				}
+				x.size = i64(len(text))
+			}
+		}
+		out[i] = x
 	}
 	if blocked && ready.call != nil {
 		return out, _wait(e, h, ready)
@@ -198,7 +255,7 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, line := "") 
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
-	at := _tree_at(e, h, line) or_return
+	at := _tree_at(e, h, line, nil) or_return
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
 		return .Corrupt
@@ -260,7 +317,7 @@ tree_remove :: proc(e: ^Engine, o: Object, path: string, line := "") -> Error {
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
-	at := _tree_at(e, h, line) or_return
+	at := _tree_at(e, h, line, nil) or_return
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
 		return .Corrupt
@@ -484,7 +541,7 @@ _hist_batch :: proc(e: ^Engine, h: ^Handle, ops: []crdt.Op_Run, at: ^Tree_At = n
 		_ferr(fs.history_set_line(hist, at.line if at != nil else fs.DEFAULT_MOUNT.line, head[:])) or_return
 		_mounts_wake(e, h.id)
 		if at != nil {
-			at^ = _tree_at(e, h, at.line) or_return
+			at^ = _tree_at(e, h, at.line, nil) or_return
 		}
 	}
 	return .None
@@ -789,9 +846,34 @@ _tree_line_id :: proc(e: ^Engine, id: prim.Id, line: string) -> string {
 }
 
 @(private)
-_tree_at :: proc(e: ^Engine, h: ^Handle, line: string) -> (at: Tree_At, err: Error) {
+_tree_at :: proc(e: ^Engine, h: ^Handle, line: string, version: []u8) -> (at: Tree_At, err: Error) {
 	hist := h.hist
 	at.line = _tree_line_id(e, h.id, line)
+	if len(version) > 0 {
+		rd := prim.reader(version)
+		vb := prim.read_bytes(&rd)
+		prim.read_str(&rd)
+		prim.read_str(&rd)
+		if !prim.reader_ok(&rd) {
+			return at, .Invalid
+		}
+		v, derr := fs.decode_version(vb, context.temp_allocator)
+		if derr != .None {
+			return at, .Invalid
+		}
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&hist.g, v, &lvs) != .None {
+			return at, .Missing
+		}
+		at.version = v
+		if crdt.frontier_eq(lvs[:], hist.g.heads[:]) {
+			at.head = true
+			at.snap = fstree.current(&hist.tree)
+			return at, .None
+		}
+		at.snap = _ferr2(fs.version_snapshot(hist, lvs[:])) or_return
+		return at, .None
+	}
 	v, found, lerr := fs.history_line(hist, at.line, context.temp_allocator)
 	if lerr != .None {
 		return at, _ferr(lerr)
@@ -826,7 +908,7 @@ tree_blame :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 	h := _handle_get(e, o, .File_Tree) or_return
 	_hist_ready(e, h) or_return
 	_hist_catch_up(e, h)
-	at := _tree_at(e, h, line) or_return
+	at := _tree_at(e, h, line, nil) or_return
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
 		return nil, nil, .Corrupt

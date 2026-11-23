@@ -147,6 +147,8 @@
  *                 held: uvarint
  *   Blob       := oid: bytes, size: uvarint, preview: str
  *   File       := mount: str, tree: id, line: id, version: bytes
+ *   TreeEntry  := name: str, kind: enum{file,dir,symlink}, size: uvarint,
+ *                 mode: uvarint
  *   Line       := mount: str, line: id
  *   Block      := index: uvarint, kind: enum block, failed: bool, id: str,
  *                 name: str, text: str, is_ref: bool, blob: Blob
@@ -1212,7 +1214,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_CONVO_WINDOW 58u
 /* convo.peek_switch(object: object, sibling: rid, before: uvarint, after: uvarint) -> Window */
 #define ONDB_OP_CONVO_PEEK_SWITCH 59u
-/* send(object: object, text: str, parent: rid, role: enum{user,assistant,system,tool}, provider: str, model: str, attachments: [Attachment]) -> Result */
+/* send(object: object, text: str, parent: rid, role: enum{user,assistant,system,tool}, provider: str, model: str, attachments: [Attachment], root: bool) -> Result */
 #define ONDB_OP_SEND 60u
 /* queue(object: object, text: str, attachments: [Attachment]) -> Result */
 #define ONDB_OP_QUEUE 61u
@@ -1270,9 +1272,9 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TEXT_REDACT 87u
 /* tree.create(space: id, title: str) -> object:object */
 #define ONDB_OP_TREE_CREATE 88u
-/* tree.read(object: object, path: str, line: str) -> text:str line:str */
+/* tree.read(object: object, path: str, line: str, version: bytes) -> text:str line:str */
 #define ONDB_OP_TREE_READ 89u
-/* tree.list(object: object, path: str, line: str) -> names:[str] line:str */
+/* tree.list(object: object, path: str, line: str, version: bytes) -> names:[str] line:str entries:[TreeEntry] */
 #define ONDB_OP_TREE_LIST 90u
 /* tree.write(object: object, path: str, text: str, line: str) -> line:str */
 #define ONDB_OP_TREE_WRITE 91u

@@ -18,6 +18,7 @@ OPEN_STATE_NAMES := [3]string{"running", "revive", "held"}
 CONDITION_NAMES := [3]string{"", "any", "all"}
 MODE_NAMES := [2]string{"end_to_end", "transparent"}
 UNIT_NAMES := [2]string{"lines", "bytes"}
+TREE_KIND_NAMES := [3]string{"file", "dir", "symlink"}
 SORT_NAMES := [2]string{"relevance", "newest"}
 SCOPE_NAMES := [3]string{"auto", "local", "everywhere"}
 SEARCH_MODE_NAMES := [3]string{"default", "full", "local"}
