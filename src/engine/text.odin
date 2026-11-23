@@ -283,6 +283,9 @@ _tree_dirs :: proc(e: ^Engine, h: ^Handle, at: ^Tree_At, dir: string) -> (id: fs
 
 tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, base: fs.Version, line := "") -> Error {
 	context = context_for(e)
+	_reserve_capped(e, i64(len(data)) * 2 + i64(len(path)) + CMD_OVERHEAD) or_return
+	_scope_begin(e)
+	defer _scope_end(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
@@ -356,6 +359,9 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, base: fs.Ver
 
 tree_remove :: proc(e: ^Engine, o: Object, path: string, line := "") -> Error {
 	context = context_for(e)
+	_reserve(e, i64(len(path)) + CMD_OVERHEAD) or_return
+	_scope_begin(e)
+	defer _scope_end(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
