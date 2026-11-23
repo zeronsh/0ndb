@@ -377,12 +377,14 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 
 @(private)
 _entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin, who: prim.Id, observed: bool) {
-	if m.history == nil || c.kind != .Modify || c.old.kind != .File || !c.old.has_at {
+	if m.history == nil || c.kind != .Modify || c.old.kind != .File || c.old.ver == 0 {
 		return nil, {}, false
 	}
 	h := m.history
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
-	append(&buf.read, inode_op(h, c.old.at))
+	for id in shadow_version(&m.shadow, c.old) {
+		append(&buf.read, inode_op(h, id))
+	}
 	t, terr := history_text_at(h, c.old.inode, buf.read[:], context.temp_allocator)
 	if terr != .None {
 		return nil, {}, false
@@ -487,7 +489,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 	h := m.history
 	keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
 	for &c in p.changes {
-		if c.moved != "" && c.old.has_at && c.disk == .File && c.stat != c.old.stat {
+		if c.moved != "" && c.old.ver != 0 && c.disk == .File && c.stat != c.old.stat {
 			c.stat = c.old.stat
 			k, _ := clone_string(c.path, p.long)
 			append(&p.young, k)
@@ -511,7 +513,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			}
 		}
 		fell := false
-		if v == nil && pinned && c.kind == .Modify && c.old.has_at {
+		if v == nil && pinned && c.kind == .Modify && c.old.ver != 0 {
 			ebuf: Pin
 			if ep, _, _ := _entry_pin(m, &c, &ebuf, actor); ep != nil {
 				v, inode, _ = _base_version(m, ep, actor)
@@ -619,16 +621,17 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	ne := c.old if c.kind == .Modify && c.old.inode == inode else Entry{inode = inode, kind = .File}
 	ne.stat = c.stat
 	ne.oid = oid
-	ne.at = {}
-	ne.has_at = false
+	ne.ver = 0
+	predicted: fstree.Op_Id
 	if err == .None {
 		if b.n == 0 {
 			buf := make([dynamic]u8, context.temp_allocator)
 			fshist.encode_observe(&buf, fshist.Observe_Op{kind = .Read, inode = inode_op(h, inode), path = c.path, version = v, hash = _content_hash(data)})
 			builder_opaque(&b, buf[:])
 		}
-		ne.at = op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)})
-		ne.has_at = true
+		predicted = op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)})
+		one := [1]fstree.Op_Id{predicted}
+		ne.ver, err = shadow_version_add(&m.shadow, one[:])
 	}
 	if err == .None {
 		err = shadow_put(&m.shadow, c.path, ne)
@@ -638,7 +641,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	if err == .None {
 		head, has, err = builder_commit_at(m, &b, v)
 	}
-	if (err == .None || err == .Reloading) && (!has || op_inode(h, head) != ne.at) {
+	if (err == .None || err == .Reloading) && (!has || op_inode(h, head) != predicted) {
 		err = .Corrupt
 	}
 	if err != .None && err != .Reloading {

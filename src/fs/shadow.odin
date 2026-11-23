@@ -33,8 +33,7 @@ Entry :: struct {
 	kind:   fstree.Kind,
 	stat:   Stat,
 	oid:    odb.Oid,
-	at:     fstree.Op_Id,
-	has_at: bool,
+	ver:    u32,
 }
 
 Shadow_Child :: struct {
@@ -73,6 +72,7 @@ Rec :: struct {
 	path:    string,
 	entry:   Entry,
 	sibling: u64,
+	ids:     u64,
 }
 
 Shadow :: struct {
@@ -106,6 +106,55 @@ Shadow :: struct {
 	mapped:     []u8,
 	map_lock:   ^sync.Mutex,
 	lock:       ^sync.Mutex,
+	versions:   [dynamic][]fstree.Op_Id,
+	ver_ids:    [dynamic]fstree.Op_Id,
+}
+
+SHADOW_VERSION_MAX :: 1024
+
+shadow_version :: proc(s: ^Shadow, e: Entry) -> []fstree.Op_Id {
+	if e.ver == 0 || int(e.ver) > len(s.versions) {
+		return nil
+	}
+	return s.versions[e.ver - 1]
+}
+
+shadow_version_add :: proc(s: ^Shadow, ids: []fstree.Op_Id) -> (ver: u32, err: Error) {
+	if len(ids) == 0 {
+		return 0, .None
+	}
+	if len(ids) > SHADOW_VERSION_MAX {
+		return 0, .Too_Large
+	}
+	outer: for v, i in s.versions {
+		if len(v) != len(ids) {
+			continue
+		}
+		for x, k in v {
+			if x != ids[k] {
+				continue outer
+			}
+		}
+		return u32(i + 1), .None
+	}
+	c, aerr := make([]fstree.Op_Id, len(ids), s.allocator)
+	if aerr != nil {
+		return 0, .No_Memory
+	}
+	copy(c, ids)
+	if _, e := append(&s.versions, c); e != nil {
+		delete(c, s.allocator)
+		return 0, .No_Memory
+	}
+	return u32(len(s.versions)), .None
+}
+
+@(private = "file")
+versions_clear :: proc(s: ^Shadow) {
+	for v in s.versions {
+		delete(v, s.allocator)
+	}
+	clear(&s.versions)
 }
 
 shadow_open :: proc(s: ^Shadow, vfs: prim.Vfs, dir: string, format: odb.Hash_Format, allocator := context.allocator) -> Error {
@@ -172,6 +221,11 @@ shadow_detach :: proc(s: ^Shadow) {
 	delete(s.scratch)
 	delete(s.probe)
 	delete(s.out)
+	versions_clear(s)
+	delete(s.versions)
+	delete(s.ver_ids)
+	s.versions = nil
+	s.ver_ids = nil
 	s.pending = nil
 	s.index = nil
 	s.by_inode = nil
@@ -476,7 +530,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 			}
 		}
 		live[p.path] = !p.del
-		if encode_rec(&s.out, off, p.path, p.del, p.entry, linked, sibling, s.oid_size) == 0 {
+		if encode_rec(&s.out, off, p.path, p.del, p.entry, shadow_version(s, p.entry), linked, sibling, s.oid_size) == 0 {
 			return .Too_Large
 		}
 	}
@@ -492,7 +546,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 	pos := 0
 	for _ in order {
 		n := int(prim.get_u32le(s.out[pos:pos + 4]))
-		r := decode_rec(s.out[pos + 8:][:n], s.oid_size) or_return
+		r := decode_rec(s.out[pos + 8:][:n], s.oid_size, &s.ver_ids) or_return
 		r.off = start + u64(pos)
 		r.size = u64(n + 8)
 		apply_rec(s, r, false) or_return
@@ -934,7 +988,7 @@ rec_check :: proc(body: []u8, off: u64) -> u32 {
 }
 
 @(private = "file")
-encode_rec :: proc(out: ^[dynamic]u8, off: u64, path: string, del: bool, e: Entry, linked: bool, sibling: u64, oid_size: int) -> int {
+encode_rec :: proc(out: ^[dynamic]u8, off: u64, path: string, del: bool, e: Entry, ids: []fstree.Op_Id, linked: bool, sibling: u64, oid_size: int) -> int {
 	start := len(out)
 	resize(out, start + 8)
 	w := prim.writer(out)
@@ -952,11 +1006,10 @@ encode_rec :: proc(out: ^[dynamic]u8, off: u64, path: string, del: bool, e: Entr
 		prim.write_uvarint(&w, u64(e.stat.mode))
 		oid := e.oid
 		prim.write_raw(&w, oid[:oid_size])
-		if e.has_at {
-			prim.write_uvarint(&w, u64(e.at.actor) + 1)
-			prim.write_uvarint(&w, e.at.seq)
-		} else {
-			prim.write_uvarint(&w, 0)
+		prim.write_uvarint(&w, u64(len(ids)))
+		for id in ids {
+			prim.write_uvarint(&w, u64(id.actor))
+			prim.write_uvarint(&w, id.seq)
 		}
 	}
 	if linked {
@@ -1008,14 +1061,17 @@ read_rec :: proc(s: ^Shadow, off: u64, buf: ^[dynamic]u8) -> (r: Rec, err: Error
 	if rec_check(body, off) != prim.get_u32le(buf[4:8]) {
 		return {}, .Corrupt
 	}
-	r = decode_rec(body, s.oid_size) or_return
+	r = decode_rec(body, s.oid_size, &s.ver_ids) or_return
+	if r.ids > 0 {
+		r.entry.ver = shadow_version_add(s, s.ver_ids[:]) or_return
+	}
 	r.off = off
 	r.size = 8 + n
 	return r, .None
 }
 
 @(private = "file")
-decode_rec :: proc(body: []u8, oid_size: int) -> (r: Rec, err: Error) {
+decode_rec :: proc(body: []u8, oid_size: int, ids: ^[dynamic]fstree.Op_Id) -> (r: Rec, err: Error) {
 	rd := prim.reader(body)
 	kind := prim.read_u8(&rd)
 	flags := prim.read_u8(&rd)
@@ -1050,14 +1106,21 @@ decode_rec :: proc(body: []u8, oid_size: int) -> (r: Rec, err: Error) {
 		}
 		r.entry.stat.mode = u32(mode)
 		prim.read_fixed(&rd, r.entry.oid[:oid_size])
-		if at := prim.read_uvarint(&rd); at != 0 {
-			if at - 1 > u64(max(u32)) {
+		n := prim.read_uvarint(&rd)
+		if n > SHADOW_VERSION_MAX {
+			return {}, .Corrupt
+		}
+		if ids != nil {
+			clear(ids)
+		}
+		for _ in 0 ..< n {
+			actor := prim.read_uvarint(&rd)
+			if actor > u64(max(u32)) || ids == nil {
 				return {}, .Corrupt
 			}
-			r.entry.has_at = true
-			r.entry.at.actor = u32(at - 1)
-			r.entry.at.seq = prim.read_uvarint(&rd)
+			append(ids, fstree.Op_Id{actor = u32(actor), seq = prim.read_uvarint(&rd)})
 		}
+		r.ids = n
 	}
 	if r.linked {
 		r.sibling = prim.read_u64le(&rd)
