@@ -436,12 +436,20 @@ replicator_destroy :: proc(r: ^Replicator) {
 		prim.timer_cancel(r.loop, r.retry)
 	}
 	_resolver_stop(r)
-	for _, l in r.locals {
+	for mk3_ in prim.sorted_keys(r.locals) {
+		if mk3_ not_in r.locals {
+			continue
+		}
+		l := r.locals[mk3_]
 		_local_free(r, l)
 	}
 	clear(&r.reap)
 	clear(&r.reap_local)
-	for _, rm in r.remotes {
+	for mk2_ in prim.sorted_keys(r.remotes) {
+		if mk2_ not_in r.remotes {
+			continue
+		}
+		rm := r.remotes[mk2_]
 		_remote_free(r, rm)
 	}
 	r.kwait_dirty = false
@@ -452,7 +460,11 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.answers)
 	delete(r.devices)
 	delete(r.stage)
-	for _, g in r.groups {
+	for mk1_ in prim.sorted_keys(r.groups) {
+		if mk1_ not_in r.groups {
+			continue
+		}
+		g := r.groups[mk1_]
 		_group_free(r, g)
 	}
 	delete(r.groups)
@@ -565,7 +577,11 @@ replicator_floor :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64
 
 replicator_durable :: proc(r: ^Replicator) {
 	list := make([dynamic]^Local, context.temp_allocator)
-	for _, l in r.locals {
+	for mk3_ in prim.sorted_keys(r.locals) {
+		if mk3_ not_in r.locals {
+			continue
+		}
+		l := r.locals[mk3_]
 		if l.cursor < l.durable && l.inflight == 0 && !l.fatal && !l.blocked && !l.retry && !l.verifying && l.ahead == 0 && !l.dropping {
 			append(&list, l)
 		}
@@ -1735,7 +1751,11 @@ _on_presence :: proc(r: ^Replicator, ev: ^Event) {
 		}
 		r.present_ok = true
 		gone := make([dynamic]Device_Id, context.temp_allocator)
-		for d, p in r.presence {
+		for d in prim.sorted_keys(r.presence) {
+			if d not_in r.presence {
+				continue
+			}
+			p := r.presence[d]
 			if !p.seen && p.up {
 				append(&gone, d)
 			}
@@ -2715,7 +2735,7 @@ _repl_on_ready :: proc(r: ^Replicator) {
 @(private)
 _sorted_ids :: proc(m: map[Stream_Id]$V) -> []Stream_Id {
 	ids := make([dynamic]Stream_Id, 0, len(m), context.temp_allocator)
-	for id in m {
+	for id in prim.sorted_keys(m) {
 		append(&ids, id)
 	}
 	slice.sort_by(ids[:], proc(a, b: Stream_Id) -> bool {

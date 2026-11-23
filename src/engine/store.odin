@@ -214,7 +214,7 @@ _registry_close :: proc(e: ^Engine) {
 	for _, v in e.reg.sstaged {
 		delete(v, e.allocator)
 	}
-	for _, v in e.reg.kstaged {
+	for _, v in prim.unordered(e.reg.kstaged) {
 		crypto.zero_explicit(raw_data(v), len(v))
 		delete(v, e.allocator)
 	}
@@ -285,7 +285,7 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 	for _, v in e.reg.sstaged {
 		delete(v, e.allocator)
 	}
-	for _, v in e.reg.kstaged {
+	for _, v in prim.unordered(e.reg.kstaged) {
 		crypto.zero_explicit(raw_data(v), len(v))
 		delete(v, e.allocator)
 	}
@@ -658,7 +658,11 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	} else {
 		e.durable_seq = max(e.durable_seq, b.seq)
 		if e.fatal == .None {
-			for _, h in e.handles {
+			for mk2_ in prim.sorted_keys(e.handles) {
+				if mk2_ not_in e.handles {
+					continue
+				}
+				h := e.handles[mk2_]
 				_table_publish(e, h)
 			}
 		}
@@ -684,7 +688,11 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 				_draft_settle(e, d.object, d.length)
 			}
 		}
-		for _, sp in e.spaces {
+		for mk1_ in prim.sorted_keys(e.spaces) {
+			if mk1_ not_in e.spaces {
+				continue
+			}
+			sp := e.spaces[mk1_]
 			if sp.repl_on {
 				osync.replicator_durable(&sp.repl)
 			}
@@ -1001,7 +1009,7 @@ _xerr :: proc "contextless" (e: search.Error) -> Error {
 _sorted_keys :: proc(m: map[$K]$V) -> []K {
 	keys := make([]K, len(m), context.temp_allocator)
 	i := 0
-	for k in m {
+	for k in prim.unordered(m) {
 		keys[i] = k
 		i += 1
 	}

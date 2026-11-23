@@ -1704,7 +1704,7 @@ tomb_load :: proc(s: ^Seg, out: ^[dynamic]u32) -> Error {
 
 vocab_lists :: proc(trigrams: map[u32][dynamic]u32, sw: ^Seg_Writer, lw: ^List_Writer) -> Error {
 	keys := make([dynamic]u32, 0, len(trigrams), context.temp_allocator)
-	for k in trigrams {
+	for k in prim.sorted_keys(trigrams) {
 		append(&keys, k)
 	}
 	slice.sort(keys[:])

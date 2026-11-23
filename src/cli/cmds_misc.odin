@@ -59,7 +59,11 @@ _daemon_start :: proc(a: ^Args) -> int {
 		return report_error(.Busy, "a daemon is running for %s but its socket %s is not reachable", home_dir(context.temp_allocator), socket_path(context.temp_allocator))
 	}
 	extra := make([dynamic]string, context.temp_allocator)
-	for name, value in a.flags {
+	for name in prim.sorted_keys(a.flags) {
+		if name not_in a.flags {
+			continue
+		}
+		value := a.flags[name]
 		if name == "json" || name == "timeout" {
 			continue
 		}

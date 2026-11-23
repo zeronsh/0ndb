@@ -109,7 +109,7 @@ _release :: proc(p: ^Pack) {
 		p.bcache = nil
 	}
 	inos := make([dynamic]u64, context.temp_allocator)
-	for k in p.open_inodes {
+	for k in prim.sorted_keys(p.open_inodes) {
 		append(&inos, k)
 	}
 	slice.sort(inos[:])

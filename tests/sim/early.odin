@@ -51,7 +51,11 @@ _relay_length :: proc(w: ^World, id: osync.Stream_Id) -> (i64, bool) {
 	if !w.relay.alive {
 		return 0, false
 	}
-	for _, sp in w.relay.r.spaces {
+	for mk1_ in prim.sorted_keys(w.relay.r.spaces) {
+		if mk1_ not_in w.relay.r.spaces {
+			continue
+		}
+		sp := w.relay.r.spaces[mk1_]
 		if st, ok := sp.streams[id]; ok && st.h != nil {
 			return st.length, true
 		}

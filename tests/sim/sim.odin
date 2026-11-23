@@ -587,7 +587,11 @@ simulate :: proc(t: ^testing.T) {
 		a := run_seed(seed, verbose, &ia if replay else nil, "first")
 		ok1 := report(t, &a)
 		if replay {
+			if env_u64("SIM_ADDR_JITTER", 0) != 0 {
+				region_jitter = 4096 + 48
+			}
 			b := run_seed(seed, verbose, &ib, "second", true)
+			region_jitter = 0
 			diffs := make([dynamic]string, runtime.heap_allocator())
 			same := disk_images_compare(&ia, &ib, &diffs)
 			if a.trace != b.trace || !same {

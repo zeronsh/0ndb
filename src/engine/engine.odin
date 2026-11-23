@@ -926,7 +926,11 @@ _tick_pending :: proc(e: ^Engine) -> bool {
 	if e.tick_wanted || e.space_woke || len(e.changed) > 0 || len(e.catalog_q) > 0 || len(e.dirty) > 0 || len(e.index_dirty) > 0 || len(e.content.events) > 0 || len(e.cursor_inbox) > 0 || len(e.leave_ready) > 0 || len(e.refused_stop) > 0 || _remote_pending(e) {
 		return true
 	}
-	for _, sp in e.spaces {
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if mk1_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk1_]
 		if len(sp.events) > 0 || len(sp.needs) > 0 {
 			return true
 		}
@@ -1135,11 +1139,11 @@ _teardown :: proc(e: ^Engine) {
 	_budget_destroy(e)
 	_content_destroy(e)
 	delete(e.card_pubs)
-	for _, u in e.catalog_q {
+	for _, u in prim.unordered(e.catalog_q) {
 		_catalog_update_free(e, u)
 	}
 	delete(e.catalog_q)
-	for _, u in e.catalog_parked {
+	for _, u in prim.unordered(e.catalog_parked) {
 		_catalog_update_free(e, u)
 	}
 	delete(e.catalog_parked)

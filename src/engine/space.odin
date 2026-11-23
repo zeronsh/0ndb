@@ -458,7 +458,11 @@ _space_unload :: proc(e: ^Engine, sp: ^Space, discard := false) {
 	if sp.repl_on {
 		_repl_stop(e, sp)
 	}
-	for _, rt in sp.remote_trees {
+	for mk3_ in prim.sorted_keys(sp.remote_trees) {
+		if mk3_ not_in sp.remote_trees {
+			continue
+		}
+		rt := sp.remote_trees[mk3_]
 		_remote_tree_free(e, rt)
 	}
 	delete(sp.remote_trees)
@@ -478,8 +482,12 @@ _space_unload :: proc(e: ^Engine, sp: ^Space, discard := false) {
 		_ckpt_wait_free(e, w)
 	}
 	delete(sp.ckpts)
-	for _, &sc in sp.card_scopes {
-		osync.scope_clear(&sc)
+	for mk2_ in prim.sorted_keys(sp.card_scopes) {
+		if mk2_ not_in sp.card_scopes {
+			continue
+		}
+		sc := &sp.card_scopes[mk2_]
+		osync.scope_clear(sc)
 	}
 	delete(sp.card_scopes)
 	delete(sp.card_len)
@@ -488,12 +496,12 @@ _space_unload :: proc(e: ^Engine, sp: ^Space, discard := false) {
 	}
 	delete(sp.card_relay)
 	delete(sp.identities)
-	for _, &g in sp.grants {
+	for _, &g in prim.unordered(sp.grants) {
 		crypto.zero_explicit(&g, size_of(g))
 	}
 	delete(sp.grants)
 	delete(sp.grant_access)
-	for _, g in sp.grant_epochs {
+	for _, g in prim.unordered(sp.grant_epochs) {
 		for &x in g {
 			crypto.zero_explicit(&x.secret, size_of(x.secret))
 		}
@@ -521,7 +529,11 @@ _space_free :: proc(e: ^Engine, sp: ^Space, discard := false) {
 
 @(private)
 _spaces_close_all :: proc(e: ^Engine) {
-	for _, sp in e.spaces {
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if mk1_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk1_]
 		_space_free(e, sp)
 	}
 	clear(&e.spaces)
@@ -530,7 +542,11 @@ _spaces_close_all :: proc(e: ^Engine) {
 
 @(private)
 _spaces_settle :: proc(e: ^Engine) {
-	for _, sp in e.spaces {
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if mk1_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk1_]
 		if !sp.open {
 			continue
 		}
@@ -1018,7 +1034,7 @@ _pending_republish :: proc(e: ^Engine, sp: ^Space) {
 		return
 	}
 	s := sp.id
-	for kk in e.rlog.pend {
+	for kk in prim.sorted_keys(e.rlog.pend) {
 		k := kk
 		if string(k[:16]) == string(s[:]) {
 			id: prim.Id

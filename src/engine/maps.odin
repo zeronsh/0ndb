@@ -734,7 +734,7 @@ _catalog_unpark :: proc(e: ^Engine) {
 	if len(e.catalog_parked) == 0 {
 		return
 	}
-	for id, u in e.catalog_parked {
+	for id, u in prim.unordered(e.catalog_parked) {
 		if _, dup := e.catalog_q[id]; dup {
 			_catalog_update_free(e, u)
 		} else {

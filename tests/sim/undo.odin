@@ -476,12 +476,20 @@ _ur_build :: proc(w: ^World, alloc: runtime.Allocator) -> (c: ^Ur_Ctx, p: Ur_Pla
 _ur_check_undo :: proc(c: ^Ur_Ctx, p: Ur_Plan, at: Ur_State, got: Ur_State, label: string) {
 	w := c.w
 	present := make(map[string]string, context.temp_allocator)
-	for name, data in got.disk {
+	for name in prim.sorted_keys(got.disk) {
+		if name not_in got.disk {
+			continue
+		}
+		data := got.disk[name]
 		for t in strings.split_lines(strings.trim_right(data, "\n"), context.temp_allocator) {
 			present[t] = name
 		}
 	}
-	for t, x in c.toks {
+	for t in prim.sorted_keys(c.toks) {
+		if t not_in c.toks {
+			continue
+		}
+		x := c.toks[t]
 		after := x.agent && x.turn >= p.at
 		want := !after && (!x.deleted || (x.by_agent && x.del_turn >= p.at))
 		name, has := present[t]
@@ -494,7 +502,11 @@ _ur_check_undo :: proc(c: ^Ur_Ctx, p: Ur_Plan, at: Ur_State, got: Ur_State, labe
 			world_fail(w, "undo %s: %s belongs in %s, found in %s", label, t, x.file, name)
 		}
 	}
-	for name, data in got.disk {
+	for name in prim.sorted_keys(got.disk) {
+		if name not_in got.disk {
+			continue
+		}
+		data := got.disk[name]
 		seen := make(map[string]bool, context.temp_allocator)
 		for t in strings.split_lines(strings.trim_right(data, "\n"), context.temp_allocator) {
 			if seen[t] {
@@ -777,7 +789,11 @@ _ur_side_turn :: proc(c: ^Ur_Ctx, side: ^Ur_Side) -> bool {
 	ok := _ur_turn(c, false, false)
 	side.parent = c.parent
 	append(&side.turns, ..c.turns[:])
-	for t, x in c.toks {
+	for t in prim.sorted_keys(c.toks) {
+		if t not_in c.toks {
+			continue
+		}
+		x := c.toks[t]
 		n := 0
 		for d in t[2:len(t) - 1] {
 			n = n * 10 + int(d - '0')

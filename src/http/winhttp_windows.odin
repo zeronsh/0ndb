@@ -672,7 +672,7 @@ winhttp_destroy :: proc(h: ^Winhttp) {
 		return
 	}
 	ids := make([dynamic]Id, context.temp_allocator)
-	for id in h.live {
+	for id in prim.sorted_keys(h.live) {
 		append(&ids, id)
 	}
 	slice.sort(ids[:])

@@ -231,7 +231,11 @@ _own_tree_punctured :: proc(e: ^Engine, t: ^Own_Tree) {
 
 @(private)
 _trees_waiting :: proc(e: ^Engine) -> bool {
-	for _, t in e.own_trees {
+	for mk2_ in prim.sorted_keys(e.own_trees) {
+		if mk2_ not_in e.own_trees {
+			continue
+		}
+		t := e.own_trees[mk2_]
 		if t.dirty && t.after > 0 {
 			return true
 		}
@@ -253,7 +257,7 @@ _own_tree_free :: proc(e: ^Engine, t: ^Own_Tree) {
 
 @(private)
 _trees_release :: proc(e: ^Engine) {
-	for k, t in e.own_trees {
+	for k, t in prim.unordered(e.own_trees) {
 		if t.refs == 0 && t.upload_refs == 0 && !t.dirty {
 			delete_key(&e.own_trees, k)
 			_own_tree_free(e, t)
@@ -264,7 +268,7 @@ _trees_release :: proc(e: ^Engine) {
 @(private)
 _trees_free_all :: proc(e: ^Engine) {
 	_trees_persist(e)
-	for _, t in e.own_trees {
+	for _, t in prim.unordered(e.own_trees) {
 		_own_tree_free(e, t)
 	}
 	clear(&e.own_trees)
@@ -385,7 +389,11 @@ _remote_tree_free :: proc(e: ^Engine, rt: ^Remote_Tree) {
 
 @(private)
 _remote_tree_by_keys :: proc(sp: ^Space, device: prim.Id, keys_name: string) -> ^Remote_Tree {
-	for _, rt in sp.remote_trees {
+	for mk1_ in prim.sorted_keys(sp.remote_trees) {
+		if mk1_ not_in sp.remote_trees {
+			continue
+		}
+		rt := sp.remote_trees[mk1_]
 		if rt.device == device && rt.keys_name == keys_name {
 			return rt
 		}

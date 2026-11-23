@@ -479,7 +479,7 @@ mat_owe :: proc(m: ^Mount, ms: ^Mat_Sync) {
 	if m.owed.dirs == nil {
 		m.owed.dirs = make(map[string]bool, m.allocator)
 	}
-	for d in ms.dirs {
+	for d in prim.unordered(ms.dirs) {
 		if d not_in m.owed.dirs {
 			m.owed.dirs[clone_string(d, m.allocator) or_else ""] = true
 		}
@@ -521,7 +521,7 @@ mat_settle_owed :: proc(m: ^Mount) -> Error {
 
 @(private)
 mat_pay_owed :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
-	for d in m.owed.dirs {
+	for d in prim.unordered(m.owed.dirs) {
 		ms.dirs[clone_string(d, context.temp_allocator) or_else ""] = true
 	}
 	return .None
@@ -722,7 +722,7 @@ moved_ancestors_touch :: proc(h: ^History, snap: ^fstree.Snapshot, sl: []crdt.Lv
 	ssnap := version_snapshot(h, sl) or_return
 	defer fstree.snapshot_destroy(&ssnap)
 	work := make([dynamic]fstree.Inode_Id, context.temp_allocator)
-	for ino in touched {
+	for ino in prim.sorted_keys(touched^) {
 		append(&work, ino)
 	}
 	up :: proc(s: ^fstree.Snapshot, from: fstree.Inode_Id, touched: ^map[fstree.Inode_Id]bool) -> Error {
@@ -765,7 +765,7 @@ moved_ancestors_touch :: proc(h: ^History, snap: ^fstree.Snapshot, sl: []crdt.Lv
 @(private)
 displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.Inode_Id]bool) -> Error {
 	work := make([dynamic]fstree.Inode_Id, context.temp_allocator)
-	for ino in touched {
+	for ino in prim.sorted_keys(touched^) {
 		append(&work, ino)
 	}
 	for len(work) > 0 {

@@ -1,6 +1,8 @@
 #+build linux, darwin, windows
 package osync
 
+import "../prim"
+
 import "../journal"
 
 Live_Sub :: struct {
@@ -184,7 +186,7 @@ _lives_resend :: proc(r: ^Replicator) {
 		return
 	}
 	ids := make([dynamic]Stream_Id, context.temp_allocator)
-	for id in r.lives {
+	for id in prim.sorted_keys(r.lives) {
 		append(&ids, id)
 	}
 	client_follow_live(&r.client, ids[:])

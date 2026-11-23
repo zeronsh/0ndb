@@ -994,7 +994,7 @@ mem_flush :: proc(ix: ^Index) -> Error {
 	sw_post_end(&sw)
 	vocab_write(ix, &sw, &vw)
 	src := make([dynamic]prim.Id, 0, len(m.sources), context.temp_allocator)
-	for k in m.sources {
+	for k in prim.sorted_keys(m.sources) {
 		append(&src, k)
 	}
 	slice.sort_by(src[:], proc(a, b: prim.Id) -> bool {

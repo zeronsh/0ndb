@@ -107,7 +107,11 @@ _pend_synced :: proc(p: ^Pack, inum: u64) {
 @(private)
 _pend_trim :: proc(p: ^Pack) {
 	done := make([dynamic]u64, context.temp_allocator)
-	for inum, pd in p.pend {
+	for inum in prim.sorted_keys(p.pend) {
+		if inum not_in p.pend {
+			continue
+		}
+		pd := p.pend[inum]
 		k := 0
 		for k < len(pd.steps) && pd.steps[k].seq <= p.durable_seq {
 			pd.base = pd.steps[k].size
@@ -133,7 +137,7 @@ _pend_free :: proc(p: ^Pack, pd: ^Pend) {
 
 @(private)
 _pend_release :: proc(p: ^Pack) {
-	for _, pd in p.pend {
+	for _, pd in prim.unordered(p.pend) {
 		_pend_free(p, pd)
 	}
 	delete(p.pend)
