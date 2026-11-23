@@ -39,6 +39,16 @@ runtime_redo :: proc(r: ^Runtime, o: Object, of: prim.Id) -> (redo: prim.Id, err
 	return
 }
 
+runtime_regenerate :: proc(r: ^Runtime, o: Object, msg: Rid) -> (move: prim.Id, err: eng.Error) {
+	context = eng.context_for(r.e)
+	move, err = eng.convo_regenerate(r.e, o, msg)
+	_undo_track(r, o, move, err)
+	if err == .None {
+		_queue_eval(r, o)
+	}
+	return
+}
+
 runtime_undo_resume :: proc(r: ^Runtime, o: Object) -> (resumed: int) {
 	context = eng.context_for(r.e)
 	id := o.id

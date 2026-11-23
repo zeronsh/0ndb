@@ -479,8 +479,8 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		}
 		op := new_op(m, .Back, n, oi)
 		op.target = t.idx
-		err := eng.convo_back(&n.e, o, t.rid, op_done_handle(op))
-		op_result(op, n, err)
+		_, err := eng.convo_move(&n.e, o, .Switch, t.rid)
+		op_result(op, n, .None if err == .Pending else err)
 	case .Follow:
 		op := new_op(m, .Follow, n, oi)
 		err := eng.convo_follow(&n.e, o, op_done_handle(op))

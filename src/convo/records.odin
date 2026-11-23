@@ -54,8 +54,9 @@ Seal :: struct {
 }
 
 Leaf :: struct {
-	msg: Ref,
-	hlc: prim.Hlc,
+	msg:  Ref,
+	hlc:  prim.Hlc,
+	root: bool,
 }
 
 Fork :: struct {
@@ -574,6 +575,7 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 	case Leaf:
 		obj.tw_ref(w, 1, off, v.msg)
 		obj.tw_u64(w, 2, u64(v.hlc))
+		obj.tw_bool(w, 3, v.root)
 	case Fork:
 		obj.tw_ref(w, 1, off, v.parent)
 		obj.tw_ref(w, 2, off, v.child)
@@ -1133,6 +1135,8 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				v.msg = obj.dec_ref(&d)
 			case 2:
 				v.hlc = obj.dec_hlc(&d)
+			case 3:
+				v.root = obj.dec_uv(&d) == 1
 			}
 		}
 		rec.body = v

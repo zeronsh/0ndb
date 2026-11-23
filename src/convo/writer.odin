@@ -404,8 +404,23 @@ writer_set_leaf :: proc(w: ^Writer, target: Rid) -> (off: i64, err: Error) {
 	sum := w.sum
 	sum.leaf = lr
 	sum.leaf_hlc = hlc
+	sum.leaf_root = false
 	sum.spine = spine
 	return _append(w, &sum, Leaf{msg = lr, hlc = hlc})
+}
+
+writer_set_root :: proc(w: ^Writer) -> (off: i64, err: Error) {
+	_prepare(w, false) or_return
+	v := w.core.v
+	_, _, _, lit := _positions(v, w.core.id) or_return
+	_leave(w, lit, {}) or_return
+	obj.seg_flush(&w.core, false) or_return
+	hlc := obj.now(&w.core)
+	sum := w.sum
+	sum.leaf = {}
+	sum.leaf_hlc = hlc
+	sum.leaf_root = true
+	return _append(w, &sum, Leaf{hlc = hlc, root = true})
 }
 
 writer_follow :: proc(w: ^Writer) -> (off: i64, err: Error) {

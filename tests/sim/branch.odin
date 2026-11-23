@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem/virtual"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 import "../../src/convo"
@@ -852,4 +853,310 @@ branch_concurrent :: proc(t: ^testing.T) {
 	}
 	fmt.eprintf("branch_concurrent: %d seeds, %d failed\n", count, bad)
 	testing.expect(t, bad == 0, fmt.tprintf("branch_concurrent: %d failures", bad))
+}
+
+@(private = "file")
+Bs_Ctx :: struct {
+	c:      ^Br_Ctx,
+	ends:   map[obj.Rid]map[string]string,
+	base:   map[string]string,
+	person: string,
+	tok:    int,
+	files:  [dynamic]string,
+}
+
+@(private = "file")
+_bs_agent_disk :: proc(b: ^Bs_Ctx) -> map[string]string {
+	out := make(map[string]string, b.c.alloc)
+	for k, v in _br_disk(b.c) {
+		if k != "p.txt" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+@(private = "file")
+_bs_msg :: proc(b: ^Bs_Ctx, at: obj.Rid) -> (m: convo.Message, ok: bool) {
+	n := b.c.n
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	x, err := eng.convo_message(&n.e, b.c.conv, {msg = at}, b.c.alloc)
+	return x, err == .None
+}
+
+@(private = "file")
+_bs_state_at :: proc(b: ^Bs_Ctx, at: obj.Rid) -> (st: map[string]string, ok: bool) {
+	for x := at; !obj.rid_none(x); {
+		if e, has := b.ends[x]; has {
+			return e, true
+		}
+		m := _bs_msg(b, x) or_return
+		x = m.parent
+	}
+	return b.base, true
+}
+
+@(private = "file")
+_bs_path :: proc(b: ^Bs_Ctx, at: obj.Rid) -> []obj.Rid {
+	out := make([dynamic]obj.Rid, b.c.alloc)
+	for x := at; !obj.rid_none(x); {
+		append(&out, x)
+		m, ok := _bs_msg(b, x)
+		if !ok {
+			break
+		}
+		x = m.parent
+	}
+	return out[:]
+}
+
+@(private = "file")
+_bs_turn :: proc(b: ^Bs_Ctx, user: bool) -> bool {
+	w := b.c.w
+	writes := make([dynamic]Br_Write, b.c.alloc)
+	for _ in 0 ..< 1 + rng_int(&w.rng, 3) {
+		b.tok += 1
+		switch k := rng_int(&w.rng, 3); {
+		case k == 0 || len(b.files) == 0:
+			name := fmt.aprintf("f%d.txt", b.tok, allocator = b.c.alloc)
+			append(&b.files, name)
+			append(&writes, Br_Write{name, fmt.aprintf("<c%d>\n", b.tok, allocator = b.c.alloc)})
+		case k == 1:
+			name := b.files[rng_int(&w.rng, len(b.files))]
+			append(&writes, Br_Write{name, fmt.aprintf("<m%d>\n", b.tok, allocator = b.c.alloc)})
+		case:
+			append(&writes, Br_Write{"a.txt", fmt.aprintf("<b1>\n<a%d>\n<b3>\n", b.tok, allocator = b.c.alloc)})
+		}
+	}
+	if rng_chance(&w.rng, 1, 4) {
+		disk := _br_disk(b.c)
+		for name in b.files {
+			if name in disk {
+				append(&writes, Br_Write{name, ""})
+				break
+			}
+		}
+	}
+	_, reply := _br_turn(b.c, user, writes[:]) or_return
+	b.ends[reply] = _bs_agent_disk(b)
+	return true
+}
+
+@(private = "file")
+_bs_check :: proc(b: ^Bs_Ctx, what: string, want_pos: obj.Rid, root: bool) {
+	w := b.c.w
+	pos, pok := _br_position(b.c, b.c.n)
+	if !pok {
+		world_fail(w, "branch seeds: %s: no position", what)
+		return
+	}
+	if root {
+		n := b.c.n
+		context = instance_context(&n.inst)
+		cs, _ := eng.convo_status(&n.e, b.c.conv)
+		node_after(n)
+		if !cs.browsing || !obj.rid_none(cs.position) {
+			world_fail(w, "branch seeds: %s: the position is %v (browsing %v), not before the first message", what, cs.position, cs.browsing)
+		}
+	} else if !obj.rid_none(want_pos) && pos != want_pos {
+		world_fail(w, "branch seeds: %s: the position is %v, not %v", what, pos, want_pos)
+	}
+	want, sok := _bs_state_at(b, {} if root else pos)
+	if !sok {
+		world_fail(w, "branch seeds: %s: no state for %v", what, pos)
+		return
+	}
+	got := _br_disk(b.c)
+	full := make(map[string]string, b.c.alloc)
+	for k, v in want {
+		full[k] = v
+	}
+	if len(b.person) > 0 {
+		full["p.txt"] = b.person
+	}
+	if !_br_same_disk(got, full) {
+		world_fail(w, "branch seeds: %s: at %v the tree holds %v, not %v", what, pos, got, full)
+	}
+}
+
+@(private = "file")
+_bs_run :: proc(w: ^World, arena: ^virtual.Arena) {
+	if virtual.arena_init_growing(arena, 1 << 20) != nil {
+		return
+	}
+	alloc := virtual.arena_allocator(arena)
+	c, ok := _br_setup(w, alloc)
+	if !ok {
+		return
+	}
+	b := new(Bs_Ctx, alloc)
+	b.c = c
+	b.ends = make(map[obj.Rid]map[string]string, alloc)
+	b.files = make([dynamic]string, alloc)
+	b.base = _bs_agent_disk(b)
+	n := c.n
+	if !_bs_turn(b, true) || !_bs_turn(b, true) {
+		world_fail(w, "branch seeds: the first turns failed")
+		return
+	}
+	_bs_check(b, "after two turns", {}, false)
+	for step in 0 ..< 14 {
+		pos, _ := _br_position(c, n)
+		path := _bs_path(b, pos)
+		k := rng_int(&w.rng, 6)
+		label := fmt.aprintf("step %d", step, allocator = alloc)
+		switch k {
+		case 0:
+			cur, mok := _bs_msg(b, pos)
+			user := mok && cur.role == .User
+			c.parent = pos
+			world_note(w, "branch seeds: %s turn (user %v)", label, !user)
+			if !_bs_turn(b, !user) {
+				world_fail(w, "branch seeds: %s: the turn failed", label)
+				return
+			}
+			_bs_check(b, fmt.aprintf("%s after a turn", label, allocator = alloc), {}, false)
+		case 1:
+			users := make([dynamic]obj.Rid, alloc)
+			for x in path {
+				if m, mok := _bs_msg(b, x); mok && m.role == .User {
+					append(&users, x)
+				}
+			}
+			if len(users) == 0 {
+				continue
+			}
+			u := users[rng_int(&w.rng, len(users))]
+			um, _ := _bs_msg(b, u)
+			world_note(w, "branch seeds: %s edit %v (root %v)", label, u, obj.rid_none(um.parent))
+			{
+				context = instance_context(&n.inst)
+				_, err := eng.exec(&n.e, eng.Cmd_Send{object = c.conv, text = "edited", parent = um.parent, root = obj.rid_none(um.parent)})
+				node_after(n)
+				if err != .None && err != .Pending {
+					world_fail(w, "branch seeds: %s: edit send: %v", label, err)
+					return
+				}
+			}
+			run_until(w, w.now + 5_000_000_000, true)
+			np, _ := _br_position(c, n)
+			nm, nok := _bs_msg(b, np)
+			if !nok || nm.role != .User || nm.parent != um.parent {
+				world_fail(w, "branch seeds: %s: after the edit the position %v is not a new user message under %v", label, np, um.parent)
+			}
+			_bs_check(b, fmt.aprintf("%s after an edit", label, allocator = alloc), np, false)
+		case 2:
+			replies := make([dynamic]obj.Rid, alloc)
+			for x in path {
+				if m, mok := _bs_msg(b, x); mok && m.role == .Assistant {
+					append(&replies, x)
+				}
+			}
+			if len(replies) == 0 {
+				continue
+			}
+			r := replies[rng_int(&w.rng, len(replies))]
+			rm, _ := _bs_msg(b, r)
+			world_note(w, "branch seeds: %s regenerate %v", label, r)
+			{
+				context = instance_context(&n.inst)
+				_, err := eng.convo_regenerate(&n.e, c.conv, r)
+				node_after(n)
+				if err != .None && err != .Pending {
+					world_fail(w, "branch seeds: %s: regenerate: %v", label, err)
+					return
+				}
+			}
+			run_until(w, w.now + 5_000_000_000, true)
+			_bs_check(b, fmt.aprintf("%s after a regenerate", label, allocator = alloc), rm.parent, false)
+			c.parent = rm.parent
+			if !_bs_turn(b, false) {
+				world_fail(w, "branch seeds: %s: the regenerated turn failed", label)
+				return
+			}
+			_bs_check(b, fmt.aprintf("%s after the regenerated turn", label, allocator = alloc), {}, false)
+		case 3:
+			if len(b.ends) == 0 {
+				continue
+			}
+			keys := make([dynamic]obj.Rid, alloc)
+			for x in b.ends {
+				append(&keys, x)
+			}
+			slice.sort_by(keys[:], proc(a, b: obj.Rid) -> bool {return a.off < b.off})
+			target := keys[rng_int(&w.rng, len(keys))]
+			world_note(w, "branch seeds: %s switch to %v", label, target)
+			leaf: obj.Rid
+			{
+				context = instance_context(&n.inst)
+				l, err := eng.convo_switch(&n.e, c.conv, target)
+				node_after(n)
+				if err != .None && err != .Pending {
+					world_fail(w, "branch seeds: %s: switch: %v", label, err)
+					return
+				}
+				leaf = l
+			}
+			run_until(w, w.now + 5_000_000_000, true)
+			_bs_check(b, fmt.aprintf("%s after a switch", label, allocator = alloc), leaf, false)
+		case 4:
+			if len(path) == 0 {
+				continue
+			}
+			t := path[rng_int(&w.rng, len(path))]
+			tm, _ := _bs_msg(b, t)
+			world_note(w, "branch seeds: %s undo %v", label, t)
+			{
+				context = instance_context(&n.inst)
+				_, err := eng.convo_undo(&n.e, c.conv, t)
+				node_after(n)
+				if err != .None && err != .Pending {
+					world_fail(w, "branch seeds: %s: undo: %v", label, err)
+					return
+				}
+			}
+			run_until(w, w.now + 5_000_000_000, true)
+			_bs_check(b, fmt.aprintf("%s after an undo", label, allocator = alloc), tm.parent, obj.rid_none(tm.parent))
+		case 5:
+			b.tok += 1
+			b.person = fmt.aprintf("%s<p%d>\n", b.person, b.tok, allocator = alloc)
+			world_note(w, "branch seeds: %s person edit", label)
+			if !_br_write(c, false, "p.txt", b.person) {
+				world_fail(w, "branch seeds: %s: the person's edit failed", label)
+				return
+			}
+			run_until(w, w.now + 2_000_000_000, true)
+			_bs_check(b, fmt.aprintf("%s after a person edit", label, allocator = alloc), {}, false)
+		}
+	}
+}
+
+@(test)
+branch_seeds :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	count := env_u64("BS_SEEDS", 40)
+	for seed in env_u64("BS_FROM", 1) ..= count {
+		w := _br_world(seed)
+		a: virtual.Arena
+		_bs_run(w, &a)
+		for f in w.failures {
+			if bad < 30 {
+				fmt.eprintf("branch_seeds seed %d: %s\n", seed, f)
+			}
+		}
+		if len(w.failures) > 0 {
+			bad += 1
+		}
+		world_destroy(w)
+		free(w)
+		virtual.arena_destroy(&a)
+	}
+	fmt.eprintf("branch_seeds: %d seeds, %d failed\n", count, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("branch_seeds: %d failures", bad))
 }

@@ -1,14 +1,9 @@
 package fs
 
 import "base:runtime"
-import "core:mem/virtual"
 import "core:strings"
 import "../crdt"
-import "../fshist"
-import "../fstree"
-import "../odb"
 import "../prim"
-import "../textdiff"
 
 Spawner :: struct {
 	data: rawptr,
@@ -130,134 +125,6 @@ mount_set_land :: proc(s: ^Mount_Set, targets: []^Mount, conflicts: ^[dynamic]La
 	for t in targets {
 		mount_materialize(t) or_return
 	}
-	return .None
-}
-
-mount_set_go_back :: proc(s: ^Mount_Set, versions: []Tree_Version, spawner: Spawner, thread: prim.Id) -> Error {
-	for tv in versions {
-		for mb in s.members {
-			if mb.name != tv.name {
-				continue
-			}
-			mount_restore(mb.mount, tv.version, thread) or_return
-			if mb.mount.has_git && len(tv.commit) > 0 {
-				git_restore(mb.mount, tv.branch, tv.commit, spawner, thread) or_return
-			}
-		}
-	}
-	return .None
-}
-
-mount_restore :: proc(m: ^Mount, target: Version, owner: prim.Id) -> Error {
-	arena: virtual.Arena
-	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
-		return .No_Memory
-	}
-	defer virtual.arena_destroy(&arena)
-	context.temp_allocator = virtual.arena_allocator(&arena)
-	mount_sync(m) or_return
-	h := m.history
-	cl := make([dynamic]crdt.Lv, context.temp_allocator)
-	tl := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&h.g, m.synced[:], &cl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
-		return .Not_Found
-	}
-	pseudo := mount_revert_pseudo(m.id, m.line, owner)
-	ractor := fshist.ingestion_actor(h.self, pseudo)
-	if known := crdt.graph_known(&h.g, ractor); known > 0 {
-		if prev, pok := crdt.graph_lv(&h.g, crdt.Op_Id{ractor, known - 1}); pok {
-			one := [1]crdt.Lv{prev}
-			both := make([dynamic]crdt.Lv, context.temp_allocator)
-			crdt.version_union(&h.g, cl[:], one[:], &both)
-			clear(&cl)
-			append(&cl, ..both[:])
-		}
-	}
-	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
-	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
-	crdt.graph_diff(&h.g, cl[:], tl[:], &only_a, &only_b)
-	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
-	spans_touched(h, only_a[:], &touched) or_return
-	spans_touched(h, only_b[:], &touched) or_return
-	if len(touched) == 0 {
-		return .None
-	}
-	snap_c := version_snapshot(h, cl[:]) or_return
-	defer fstree.snapshot_destroy(&snap_c)
-	snap_t := version_snapshot(h, tl[:]) or_return
-	defer fstree.snapshot_destroy(&snap_t)
-	order := sorted_inodes(touched)
-	b: Builder
-	builder_init(&b, h, ractor)
-	for ino in order {
-		it, okt, e1 := fstree.info(&snap_t, ino, context.temp_allocator)
-		ic, okc, e2 := fstree.info(&snap_c, ino, context.temp_allocator)
-		if e1 != nil || e2 != nil {
-			return .Corrupt
-		}
-		pt := okt && it.present
-		pc := okc && ic.present
-		if !pt {
-			if pc {
-				builder_tree(&b, fstree.Op_Remove{inode = ino})
-			}
-			continue
-		}
-		if !pc {
-			builder_tree(&b, fstree.Op_Restore{inode = ino})
-		}
-		if !pc || it.parent != ic.parent || it.name != ic.name {
-			builder_tree(&b, fstree.Op_Move{inode = ino, parent = it.parent, name = it.name})
-		}
-		if it.flags != ic.flags {
-			builder_tree(&b, fstree.Op_Set_Flags{inode = ino, mask = fstree.ALL_FLAGS, value = it.flags})
-		}
-		if it.kind == .Symlink && it.target != ic.target {
-			builder_tree(&b, fstree.Op_Set_Target{inode = ino, target = it.target})
-		}
-		if it.kind == .File && .Opaque in it.flags {
-			want_reg, has_want := history_blob_at(h, ino, tl[:]) or_return
-			cur_reg, has_cur := history_blob_at(h, ino, cl[:]) or_return
-			if has_want && (!has_cur || cur_reg.oid != want_reg.oid) {
-				builder_content(&b, ino, odb.Oid(want_reg.oid), want_reg.size)
-			}
-			continue
-		}
-		if it.kind != .File {
-			continue
-		}
-		cur, _, cerr := history_text_spans_at(h, ino, cl[:], context.temp_allocator)
-		cerr or_return
-		want, spans, werr := history_text_spans_at(h, ino, tl[:], context.temp_allocator)
-		werr or_return
-		edits, derr := textdiff.line_edits(cur, want, context.temp_allocator)
-		if derr != nil {
-			builder_delete(&b, ino, 0, len(cur))
-			builder_copy_spans(&b, ino, 0, spans, 0, len(want))
-			continue
-		}
-		for ed in edits {
-			builder_delete(&b, ino, int(ed.pos), int(ed.del))
-			builder_copy_spans(&b, ino, int(ed.pos), spans, int(ed.pos), int(ed.ins))
-		}
-		history_unload_files(h)
-	}
-	if b.n == 0 {
-		return .None
-	}
-	history_register_owned_actor(h, ractor, pseudo, owner) or_return
-	before := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
-	copy(before, m.synced[:])
-	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
-		return cerr
-	}
-	clear(&m.synced)
-	append(&m.synced, ..before)
-	if merr := mount_materialize(m); merr != .Reloading {
-		return merr
-	}
-	m.reload_owed = true
-	mount_reload_retry(m)
 	return .None
 }
 

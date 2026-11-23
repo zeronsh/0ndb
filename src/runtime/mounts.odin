@@ -465,7 +465,6 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 		if m.has_git && len(commit) > 0 && (m.head.commit != commit || m.head.branch != branch) {
 			fs.git_restore(m, branch, commit, fs_spawner(r), ws.o.id)
 		}
-		mb.start = clone_version(fs.mount_synced(m), ws.alloc)
 		mb.branch = clone(m.head.branch, ws.alloc)
 		mb.commit = clone(m.head.commit, ws.alloc)
 		pseudo: prim.Id
@@ -479,6 +478,31 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 		mb.turn = fs.scope_open(reg, m, ws.scope, mb.actor)
 	}
 	return .None
+}
+
+worktree_materialized :: proc(ws: ^Worktree) -> bool {
+	for &mb in ws.members {
+		m := mb.m
+		if m == nil || m.history == nil {
+			continue
+		}
+		head, found, herr := fs.history_line(m.history, line_name(mb.run_line), context.temp_allocator)
+		if herr != .None || !found {
+			continue
+		}
+		if !fs.mount_holds(m, head) {
+			return false
+		}
+	}
+	return true
+}
+
+worktree_started :: proc(ws: ^Worktree) {
+	for &mb in ws.members {
+		if mb.m != nil {
+			mb.start = clone_version(fs.mount_synced(mb.m), ws.alloc)
+		}
+	}
 }
 
 @(private)
@@ -934,74 +958,6 @@ worktree_close :: proc(ws: ^Worktree) {
 	}
 	virtual.arena_destroy(&ws.arena)
 	free(ws, r.allocator)
-}
-
-worktree_go_back :: proc(r: ^Runtime, o: Object, msg: Rid) -> Error {
-	context = eng.context_for(r.e)
-	v, verr := eng.convo_view(r.e, o)
-	if verr != .None {
-		return .Engine
-	}
-	t, terr := convo.view_tail(v, r.self, context.temp_allocator)
-	if terr != .None {
-		return .Pending
-	}
-	m, merr := convo.message(v, &t, convo.Position{msg = msg}, context.temp_allocator)
-	if merr != .None {
-		return .Not_Found
-	}
-	targets: map[string][]u8
-	if m.role == .User {
-		targets = make(map[string][]u8, context.temp_allocator)
-		pg, _ := convo.page(v, &t, {}, 1_000_000, context.temp_allocator)
-		for x, i in pg.messages {
-			if x.id == msg && i > 0 && pg.messages[i - 1].role == .Assistant {
-				_turn_before(v, pg.messages[i - 1].id, &targets)
-			}
-		}
-		if len(targets) == 0 {
-			fake: Run
-			fake.parent = m.parent
-			targets = _target_versions(r, o, &fake)
-		}
-	} else {
-		fake: Run
-		fake.parent = msg
-		targets = _target_versions(r, o, &fake)
-	}
-	if len(targets) == 0 {
-		return .None
-	}
-	if run_find(r, o) != nil {
-		return .Busy
-	}
-	ws, werr := worktree_attach(r, o, {}, nil)
-	if werr != .None {
-		return werr
-	}
-	defer worktree_close(ws)
-	set: fs.Mount_Set
-	fs.mount_set_init(&set, ws.root, context.temp_allocator)
-	versions := make([dynamic]fs.Tree_Version, context.temp_allocator)
-	for mb in ws.members {
-		tv, ok := targets[mb.name]
-		if !ok || mb.m == nil {
-			continue
-		}
-		ver, b, c, dok := version_decode(tv)
-		if !dok {
-			continue
-		}
-		fs.mount_set_add(&set, mb.name, mb.path if len(mb.path) > 0 else mb.name, mb.m)
-		append(&versions, fs.Tree_Version{name = mb.name, line = line_name(mb.conv_line), version = ver, branch = b, commit = c})
-	}
-	if len(versions) == 0 {
-		return .None
-	}
-	if fs.mount_set_go_back(&set, versions[:], fs_spawner(r), o.id) != .None {
-		return .Io
-	}
-	return .None
 }
 
 observe_sink :: proc(r: ^Runtime) -> observe.Sink {

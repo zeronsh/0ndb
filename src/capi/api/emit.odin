@@ -14,6 +14,8 @@ BLOCK_NAMES := [12]string{"", "text", "reasoning", "tool_call", "tool_result", "
 SEAL_NAMES := [5]string{"open", "done", "interrupted", "failed", "cancelled"}
 CONVO_STATUS_NAMES := [9]string{"idle", "running", "queued", "awaiting_permission", "failed", "interrupted", "waiting", "reviving", "held"}
 OPEN_STATE_NAMES := [3]string{"running", "revive", "held"}
+MOVE_CAUSE_NAMES := [6]string{"undo", "redo", "switch", "edit", "regenerate", "rebase"}
+#assert(len(MOVE_CAUSE_NAMES) == len(convo.Move_Cause))
 #assert(len(OPEN_STATE_NAMES) == len(convo.Open_State))
 CONDITION_NAMES := [3]string{"", "any", "all"}
 MODE_NAMES := [2]string{"end_to_end", "transparent"}
