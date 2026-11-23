@@ -3204,7 +3204,12 @@ Relay cost tracks the reachable information, not the activity. Items marked
   record runs past the fetched bytes asks again up to that record's end, a
   backward parse whose last record starts before them asks again from that
   record's start, and an archive read that ends inside a record doubles its
-  window. A requested offset the replicator cannot prove is a boundary
+  window. What to fetch is one rule everywhere: the first run of a range that
+  the replica neither holds nor has in flight (a read or a peer pull); a
+  want is fetched run by run, a want across a trimmed base sends its part
+  below the base to the archive and only such runs above it to the relay,
+  and a full follower resumes where the held suffix from the base ends.
+  A requested offset the replicator cannot prove is a boundary
   (a have edge, zero or the relay length) is only a claim: a parse from or
   to a claim that meets a malformed or unverifiable record drops the claim
   and keeps nothing, and is not counted as relay misbehaviour, so a view's
