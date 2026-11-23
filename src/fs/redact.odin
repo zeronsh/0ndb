@@ -92,8 +92,13 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 		res.zeroed += rec[1] - rec[0]
 	}
 	res.ranges = ranges[:]
+	if f := h.opts.fault; f.zeroed != nil {
+		f.zeroed(f.data)
+	}
 	history_own_applied(h)
-	history_persist(h) or_return
+	if history_persist(h) != .None {
+		history_reload(h)
+	}
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
 		rewrites, stats, rerr := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, allocator)
@@ -104,7 +109,9 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 		res.dropped = stats.commits_rewritten
 		res.unreached = stats.unreached
 	}
-	history_unload_files(h)
+	if h.awake {
+		history_unload_files(h)
+	}
 	return res, .None
 }
 
@@ -417,7 +424,10 @@ mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: 
 		}
 		at += s.len
 	}
-	res = history_redact(h, ids[:], allocator, plan) or_return
+	res, err = history_redact(h, ids[:], allocator, plan)
+	if err != .None {
+		return res, err
+	}
 	if mount_wake(m) == .None {
 		m.rescan = false
 	}

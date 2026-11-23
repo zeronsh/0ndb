@@ -601,7 +601,12 @@ equal in both directions.
   keeping its in-memory actor interning order, so the batch is applied once.
   Derived state that failed to persist is never sealed partially (a seal
   first finishes the persist), and the history does not settle while a
-  persist or a reload is outstanding. Recovery from the mount's own intents (at
+  persist or a reload is outstanding. A redaction follows the same rule from
+  its zero-fill on: a range that is zeroed is reported in the result even
+  when a later step fails, and the engine announces every reported range
+  (puncture and relay redaction) before it looks at the error; a failed
+  persist after the zero-fill reloads the history and the call succeeds.
+  Recovery from the mount's own intents (at
   open, or when a pass retries an import that did not finish) goes through
   the same wait: the intents stay in the saved state until the image that
   covers them is written. Recovery re-derives the shadow entries of the

@@ -82,8 +82,9 @@ Unreached_Report :: struct {
 }
 
 Persist_Fault :: struct {
-	data: rawptr,
-	fail: proc(data: rawptr) -> bool,
+	data:   rawptr,
+	fail:   proc(data: rawptr) -> bool,
+	zeroed: proc(data: rawptr),
 }
 
 @(private)
