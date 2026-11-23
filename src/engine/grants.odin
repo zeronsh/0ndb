@@ -217,6 +217,40 @@ _grantkeys_wrap :: proc(e: ^Engine, sp: ^Space, object: prim.Id, grantee: osync.
 	osync.replicator_publish(&sp.repl, &sc, osync.grant_keys_name(object), 0, path, journal.journal_durable_len(&j))
 }
 
+Grant_Wrap_Info :: struct {
+	grantee: osync.Public_Key,
+	tag:     osync.Epoch_Tag,
+	order:   u32,
+	view:    u32,
+}
+
+grant_wraps :: proc(e: ^Engine, space: prim.Id, object: prim.Id, allocator := context.allocator) -> []Grant_Wrap_Info {
+	context = context_for(e)
+	out := make([dynamic]Grant_Wrap_Info, allocator)
+	path, perr := _grantkeys_path(e, space, object)
+	if perr != .None {
+		return out[:]
+	}
+	rd: journal.Reader
+	if journal.reader_open(&rd, e.vfs, path, context.temp_allocator) != .None {
+		return out[:]
+	}
+	defer journal.reader_close(&rd)
+	pos := i64(0)
+	for {
+		body, next, err := journal.record_at(&rd, pos)
+		if err != .None {
+			break
+		}
+		pos = next
+		gw: osync.Grant_Wrap
+		if osync.grant_wrap_decode(body, &gw) == .None {
+			append(&out, Grant_Wrap_Info{gw.grantee, gw.tag, gw.order, gw.view})
+		}
+	}
+	return out[:]
+}
+
 @(private)
 _grantkeys_publish_all :: proc(e: ^Engine, sp: ^Space) {
 	if sp.keyless || !sp.repl_on {
