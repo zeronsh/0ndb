@@ -941,7 +941,7 @@ _wait_fetch :: proc(h: ^Handle, sg: ^Seg, n: i64) {
 	if !found {
 		return
 	}
-	want := [1]journal.Range{{max(gap.from, gap.to - WAIT_CHUNK), gap.to}}
+	want := [1]journal.Range{{gap.from, min(gap.to, gap.from + WAIT_CHUNK)}}
 	if osync.replicator_want(&h.sp.repl, &h.scope, sg.device, h.name, 0, want[:]) == .None {
 		h.e.stats.fetches += 1
 	}

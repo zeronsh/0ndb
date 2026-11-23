@@ -31,6 +31,8 @@ Arc_Read :: struct {
 	rst_init: bool,
 	pend:     [dynamic]_Rst_Pend,
 	again:    bool,
+	back_pos: i64,
+	back_win: i64,
 }
 
 @(private)
@@ -251,6 +253,10 @@ _arc_step :: proc(r: ^Replicator, l: ^Local) -> (more: bool) {
 @(private)
 _arc_trim_send :: proc(r: ^Replicator, al: ^Local) {
 	if al.trim_at <= 0 || al.trim_base <= 0 || al.trim_sent >= al.trim_base || r.phase != .Ready {
+		return
+	}
+	if _, inflight := r.trims[al.trim_for]; inflight {
+		al.trim_wait = true
 		return
 	}
 	if client_trim(&r.client, al.trim_for, al.trim_base) == .None {
@@ -764,15 +770,13 @@ _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 	seal: arc.Seal
 	seal.entries = make([dynamic]arc.Seal_Entry, context.temp_allocator)
 	for pos > 0 {
-		if !journal.replica_covers(&arm.rep, max(pos - TAIL_DEFAULT, 0), pos) || !_arm_verified(arm, max(pos - TAIL_DEFAULT, 0), pos) {
-			if !journal.replica_covers(&arm.rep, max(pos - journal.TRAILER, 0), pos) {
-				_arm_want(r, arm, max(pos - TAIL_DEFAULT, 0), pos)
-				return false
-			}
+		if !journal.replica_covers(&arm.rep, max(pos - journal.TRAILER, 0), pos) {
+			_arc_back_read(r, a, arm, pos)
+			return false
 		}
 		body, off, rerr := journal.record_before(&rd, pos)
 		if rerr == .Missing {
-			_arm_want(r, arm, max(rd.missing.from, pos - TAIL_DEFAULT, 0), pos)
+			_arc_back_read(r, a, arm, pos)
 			return false
 		}
 		if rerr == .Redacted {
@@ -811,7 +815,7 @@ _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 			} else if journal.replica_covers(&arm.rep, seal.full_at, seal.full_at + 4) {
 				hi = seal.full_at + journal.record_size(int(_arm_u32(r, arm, seal.full_at)))
 			}
-			_arm_want(r, arm, seal.full_at, hi)
+			_arm_want(r, arm, seal.full_at, _arm_span_end(arm, hi))
 			return false
 		}
 		fs: arc.Seal
@@ -830,6 +834,51 @@ _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 	a.loaded = true
 	a.fresh_need = arm.want_gen + 1
 	return true
+}
+
+@(private)
+_arm_span_end :: proc(arm: ^Remote, hi: i64) -> i64 {
+	end := hi + TAIL_DEFAULT
+	if arm.relay_len >= 0 {
+		end = min(end, arm.relay_len)
+	}
+	for h in journal.replica_have(&arm.rep) {
+		if h.from >= hi {
+			end = min(end, h.from)
+			break
+		}
+		if h.to > hi {
+			return hi
+		}
+	}
+	return max(end, hi)
+}
+
+@(private)
+_arc_back_read :: proc(r: ^Replicator, a: ^Arc_Read, arm: ^Remote, pos: i64) {
+	end := pos
+	for h in journal.replica_have(&arm.rep) {
+		if h.from < pos && h.to >= pos {
+			end = h.from
+		}
+	}
+	if end <= 0 || r.phase != .Ready {
+		return
+	}
+	if a.back_pos == end {
+		a.back_win = min(a.back_win * 2, end)
+	} else {
+		a.back_win = min(i64(TAIL_DEFAULT), end)
+	}
+	a.back_pos = end
+	gap := journal.Range{end - a.back_win, end}
+	if _covered_inflight(arm, gap) {
+		return
+	}
+	if client_read(&r.client, arm.id, gap.from, gap.to) == .None {
+		append(&arm.inflight, gap)
+		r.read_reqs += 1
+	}
 }
 
 @(private)
@@ -923,6 +972,7 @@ _arc_trim_reply :: proc(r: ^Replicator, id: Stream_Id, refused: bool) -> bool {
 	}
 	delete_key(&r.trims, id)
 	if !refused {
+		_arc_trim_resume(r, id)
 		return true
 	}
 	for _, al in r.locals {
@@ -1055,7 +1105,7 @@ _arc_resolve :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, keys: journ
 	arm := rm.arc.arm
 	hi := e.arc_off + e.arc_len
 	if !journal.replica_covers(&arm.rep, e.arc_off, hi) || !_arm_verified(arm, e.arc_off, hi) {
-		_arm_want(r, arm, e.arc_off, hi)
+		_arm_want(r, arm, e.arc_off, _arm_span_end(arm, hi))
 		return .Wait, {}
 	}
 	body, nxt, rerr := _rep_record(&arm.rep, e.arc_off)
