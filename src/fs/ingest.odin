@@ -1564,10 +1564,12 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	}
 	if p.git_wrote {
 		collect_alias_sources(m, &p)
+		trust_index(m)
 	}
 	defer {
 		delete(m.alias)
 		m.alias = nil
+		trust_drop(m)
 	}
 	p.changes = make([dynamic]Change, p.long)
 	p.held = make([dynamic]Change, p.long)
@@ -3027,7 +3029,52 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 }
 
 @(private)
+trust_index :: proc(m: ^Mount) {
+	if !m.has_git || !m.git_refs || m.db == nil {
+		return
+	}
+	r: Index_Reader
+	if index_open(&r, m.vfs, m.git.dir, m.git_format, context.temp_allocator) != .None {
+		return
+	}
+	defer index_close(&r)
+	m.trusted = make(map[string]Index_Entry, m.allocator)
+	for {
+		e, ok, err := index_next(&r)
+		if err != .None {
+			trust_drop(m)
+			return
+		}
+		if !ok {
+			break
+		}
+		if e.path in m.trusted {
+			continue
+		}
+		e.path = strings.clone(e.path, m.allocator) or_else ""
+		m.trusted[e.path] = e
+	}
+	m.trust_mtime = index_file_mtime_ns(&r)
+}
+
+@(private)
+trust_drop :: proc(m: ^Mount) {
+	for k in m.trusted {
+		delete(k, m.allocator)
+	}
+	delete(m.trusted)
+	m.trusted = nil
+}
+
+@(private)
 read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{}, has_old := false) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
+	if m.trusted != nil && m.db != nil && stat.size <= m.opts.large_limit {
+		if e, has := &m.trusted[rel]; has && index_clean(e, stat, .File, m.trust_mtime, mount_trust_exec(m), mount_symlinks(m)) {
+			if t, d, rerr := odb.read(m.db, e.oid, context.temp_allocator); rerr == .None && t == .Blob {
+				return d, e.oid, textdiff.is_binary(d), true, .None
+			}
+		}
+	}
 	if o, has := m.override[rel]; has && m.db != nil {
 		t, d, rerr := odb.read(m.db, o, context.temp_allocator)
 		if rerr != .None {
