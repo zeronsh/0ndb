@@ -241,7 +241,7 @@ _own_len :: proc(h: ^Handle) -> i64 {
 		return obj.writer_durable(&h.mw.core)
 	case .Text, .File_Tree:
 		if h.hist != nil && !h.hist.awake && fs.history_wake(h.hist) != .None {
-			return 0
+			return fs.history_own_durable(h.hist)
 		}
 		if h.hist != nil {
 			return journal.journal_durable_len(&h.hist.journal)
@@ -304,7 +304,7 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 		_map_own_check(e, h) or_return
 	case .Text, .File_Tree:
 		_hist_open(h) or_return
-		h.published = journal.journal_durable_len(&h.hist.journal)
+		h.published = fs.history_own_durable(h.hist)
 	}
 	h.w_open = true
 	_own_tree_epoch(e, h)

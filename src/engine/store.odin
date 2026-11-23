@@ -948,7 +948,7 @@ _ferr :: proc "contextless" (e: fs.Error) -> Error {
 		return .Exists
 	case .Permission:
 		return .Permission
-	case .Busy:
+	case .Busy, .Reloading:
 		return .Busy
 	case .Invalid, .Not_Dir, .Is_Dir, .Not_Empty, .Name_Too_Long, .Changed, .Not_Repository, .Conflicts:
 		return .Invalid
