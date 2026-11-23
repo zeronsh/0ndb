@@ -83,6 +83,7 @@ _release :: proc(p: ^Pack) {
 		_job_complete(p, _worker_wait(p))
 	}
 	_worker_stop(p)
+	_spare_drop(p)
 	delete(p.fl.fds)
 	delete(p.fl.data)
 	_hooks_done(&p.queued, false)
