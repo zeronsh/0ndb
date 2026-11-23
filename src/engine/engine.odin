@@ -374,6 +374,8 @@ Engine :: struct {
 	restores:     [dynamic]Restore,
 	draft_marks:  map[prim.Id]Draft_Mark,
 	batches:      [dynamic]^Durable_Batch,
+	batch_late:   [dynamic]Late_Batch,
+	batch_closing: bool,
 	batch_seq:    u64,
 	durable_seq:  u64,
 	changed:      map[prim.Id]Change,
@@ -1115,6 +1117,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.restores)
 	delete(e.draft_marks)
 	delete(e.batches)
+	delete(e.batch_late)
 	delete(e.changed)
 	_git_destroy(e)
 	_budget_destroy(e)

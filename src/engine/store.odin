@@ -482,11 +482,14 @@ _durable_begin :: proc(e: ^Engine) {
 	b.seq = e.batch_seq
 	append(&e.batches, b)
 	e.stats.commits += 1
+	e.batch_closing = true
 	err := pack.batch_end_async(&e.pk, _batch_cb, b)
 	if err == .None {
 		_pack_step(e)
 	}
+	e.batch_closing = false
 	pack.batch_begin(&e.pk)
+	_batches_late(e)
 	if err != .None {
 		if err == .Would_Block {
 			e.batch_seq -= 1
@@ -540,10 +543,33 @@ _pack_step :: proc(e: ^Engine) {
 }
 
 @(private)
+Late_Batch :: struct {
+	b:   ^Durable_Batch,
+	err: Error,
+}
+
+@(private)
 _batch_cb :: proc(data: rawptr, err: pack.Error) {
 	b := (^Durable_Batch)(data)
-	context = context_for(b.e)
-	_batch_complete(b.e, b, _perr(err))
+	e := b.e
+	context = context_for(e)
+	if e.batch_closing {
+		if e.batch_late == nil {
+			e.batch_late = make([dynamic]Late_Batch, e.allocator)
+		}
+		append(&e.batch_late, Late_Batch{b, _perr(err)})
+		return
+	}
+	_batch_complete(e, b, _perr(err))
+}
+
+@(private)
+_batches_late :: proc(e: ^Engine) {
+	for len(e.batch_late) > 0 {
+		x := e.batch_late[0]
+		ordered_remove(&e.batch_late, 0)
+		_batch_complete(e, x.b, x.err)
+	}
 }
 
 @(private)
