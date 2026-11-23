@@ -8,6 +8,9 @@ import "../prim"
 KEEPER_SLOTS :: 4096
 
 @(private)
+PR_SET_NAME :: uintptr(15)
+
+@(private)
 KEEPER_ADD :: u32(1)
 @(private)
 KEEPER_DEL :: u32(2)
@@ -131,6 +134,8 @@ _kmap :: proc "contextless" (size: uintptr) -> rawptr {
 @(private)
 _keeper_main :: proc "contextless" (ctl: i32, sh: [^]Shared) -> ! {
 	intrinsics.syscall(linux.SYS_setsid)
+	name := [16]u8{'0', 'n', 'd', 'b', '-', 'k', 'e', 'e', 'p', 'e', 'r', 0, 0, 0, 0, 0}
+	intrinsics.syscall(linux.SYS_prctl, PR_SET_NAME, uintptr(&name))
 	r := intrinsics.syscall(linux.SYS_close_range, 0, uintptr(ctl - 1), 0) if ctl > 0 else 0
 	r2 := intrinsics.syscall(linux.SYS_close_range, uintptr(ctl + 1), ~uintptr(0) >> 1, 0)
 	if _errno(r) != 0 || _errno(r2) != 0 {
