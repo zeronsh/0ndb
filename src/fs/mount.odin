@@ -2159,10 +2159,18 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			}
 		}
 	}
+	rec_head: Git_Head
+	rec_reflog: i64
+	if prim.reader_remaining(&rd) > 0 {
+		rec_head.branch = prim.read_str(&rd)
+		rec_head.commit = prim.read_str(&rd)
+		rec_reflog = prim.read_ivarint(&rd)
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
 	}
+	switch_record_load(m, rec_head, rec_reflog)
 	return false, .None
 }
 
@@ -2490,9 +2498,10 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	}
 	prim.write_str(&w, m.home)
 	prim.write_str(&w, img.line if len(img.line) > 0 else m.branch)
-	prim.write_str(&w, m.switch_to)
-	prim.write_str(&w, m.switch_from)
-	prim.write_u8(&w, m.switch_phase)
+	rec := switch_record(m, img)
+	prim.write_str(&w, rec.to)
+	prim.write_str(&w, rec.from)
+	prim.write_u8(&w, rec.phase)
 	scoped := make([dynamic]string, context.temp_allocator)
 	for k in sorted_strings(attrib) {
 		if attrib[k].scope != {} {
@@ -2504,6 +2513,9 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		prim.write_str(&w, k)
 		prim.write_id(&w, attrib[k].scope)
 	}
+	prim.write_str(&w, rec.head.branch)
+	prim.write_str(&w, rec.head.commit)
+	prim.write_ivarint(&w, rec.reflog_pos)
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None
