@@ -398,7 +398,10 @@ equal in both directions.
 - **Shadow** (per mount, under `$DATA/worktrees/<id>/`): for each path the
   inode, stat signature `(mtime_ns, ctime_ns, size, ino, mode)`, content oid
   and, when it is not `synced`, the version its content is at (a based
-  write's own batch, below). An on-disk table (append-only records
+  write's own batch, below, or the pre-pass version of a path a failed
+  materialization did not reach). A version is a list of op ids, recorded as
+  their count followed by the ids (a count of 0 is `synced`) and interned in
+  the shadow's memory while it is attached. An on-disk table (append-only records
   plus an open-addressing hash file), compacted right after a mount state
   save when garbage exceeds half. Only unpersisted changes live in memory.
 - **First mount** walks with parallel `getdents64`/`statx` workers that exist
@@ -591,10 +594,26 @@ equal in both directions.
   the adopt first, so a failure in between never leaves the synced version
   claiming files the disk lacks.
   If ingesting changes nothing (an ignored file in the way), nothing is
-  written and the path is reported as a collision. The synced version never
-  claims anything the disk does not hold. Only durable history is
-  materialized, so a crash never leaves disk content the history lacks.
-  Writes are temp + rename, with modes and symlinks.
+  written and the path is reported as a collision. The synced version, with
+  the versions shadow entries name, never claims anything the disk does not
+  hold. Only durable history is materialized, so a crash never leaves disk
+  content the history lacks.
+  Writes are temp + rename, with modes and symlinks. A pass writes every
+  file's temp first, syncs them as one group (fdatasync, or `syncfs` past a
+  threshold, on Linux; `F_BARRIERFSYNC` on macOS), renames them into place,
+  then syncs the directories ending in a full flush, so a file's data is
+  durable before its name points at it: after any crash a written path holds
+  its old content or its complete new content, and only directories are owed
+  until that barrier. A pass that fails partway rolls forward: `synced`
+  becomes its target in memory (persisted only by the image saved after the
+  owed barrier), and every item it left untouched keeps the version still on
+  disk in its shadow entry and is pending, re-materialized by a retry armed
+  while pending paths are ready, after any edit made to it meanwhile is
+  ingested from that version. A pass whose line version is ahead of `synced`
+  adopts a changed file whose content is its text at the line version (what
+  an interrupted materialization wrote before a crash): its entry names that
+  version and nothing is committed. Leftover temps are internal names and
+  never ingested.
 - **Large files** (over a size limit) are opaque content referenced by git
   oid, hashed and written by streaming, never read into memory.
 - **Ignore**: full `.gitignore` semantics (negation, anchoring, `**`,
