@@ -478,9 +478,17 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State) -> Error {
 		} else if st.redo != {} {
 			set = _cu_redo_set(e, o, st.redo) or_return
 		} else {
-			set = _cu_undo_set(e, o, st.msg, convs) or_return
+			x: Error
+			set, x = _cu_undo_set(e, o, st.msg, convs)
+			if x != .None {
+				fmt.eprintfln("DBGMOVE undo_set: %v", x)
+				return x
+			}
 		}
-		_cu_park(e, o.space, set) or_return
+		if x := _cu_park(e, o.space, set); x != .None {
+			fmt.eprintfln("DBGMOVE park: %v", x)
+			return x
+		}
 		return _cu_undo_write(e, o, st.id, st.msg, .Fenced, set, st.redo)
 	case .Fenced:
 		for l in st.set {
@@ -676,7 +684,11 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 			}
 		}
 	}
-	_cu_fill_actors(e, o, convs, lines[:]) or_return
+	fmt.eprintfln("DBGMOVE undo_set lines %d", len(lines))
+	if x := _cu_fill_actors(e, o, convs, lines[:]); x != .None {
+		fmt.eprintfln("DBGMOVE fill: %v", x)
+		return nil, x
+	}
 	return lines[:], .None
 }
 
@@ -753,6 +765,7 @@ _cu_reply_on :: proc(e: ^Engine, o: Object, path: []Rid) -> (reply: Rid, err: Er
 @(private)
 _cu_park :: proc(e: ^Engine, space: prim.Id, set: []convo.Undo_Line) -> Error {
 	for &l in set {
+		fmt.eprintfln("DBGMOVE park line %q", l.line)
 		v := tree_version(e, Object{space, l.tree}, l.line, context.temp_allocator) or_return
 		vb := make([dynamic]u8, context.temp_allocator)
 		fs.encode_version(&vb, v)
@@ -805,6 +818,7 @@ _cu_fill_actors :: proc(e: ^Engine, o: Object, convs: []Undo_Conv, lines: []conv
 		th := _handle_get(e, Object{o.space, l.tree}, .File_Tree) or_return
 		_hist_ready(e, th) or_return
 		oa, oerr := fs.history_owned_actors(th.hist, owners[:], context.temp_allocator)
+		fmt.eprintfln("DBGMOVE owned %v mids %d", oerr, len(mids))
 		if oerr != .None {
 			return _ferr(oerr)
 		}
@@ -819,6 +833,7 @@ _cu_fill_actors :: proc(e: ^Engine, o: Object, convs: []Undo_Conv, lines: []conv
 				}
 			}
 			ma, merr := fs.history_mount_actors(th.hist, mids[:], keys[:], context.temp_allocator)
+			fmt.eprintfln("DBGMOVE mount actors %v", merr)
 			if merr != .None {
 				return _ferr(merr)
 			}
