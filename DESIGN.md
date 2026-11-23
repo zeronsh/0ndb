@@ -3635,7 +3635,8 @@ Relay cost tracks the reachable information, not the activity. Items marked
   history asks for the exact record it failed to read; a follower whose
   segment turns out to be trimmed asks for the prefix it lacks, which the
   replicator serves from the archive; a waiter whose view reported nothing
-  asks for the newest gap of the segment it waits on (at most 64 KiB, the
+  asks for the newest gap of the segment it waits on, from the gap's start
+  (a record boundary) forward (at most 64 KiB, the
   same on-demand read a view makes, so the storage mode still decides what
   is kept). The sim forgets every remote
   segment of an object on a reader, restarts it with the writer offline,

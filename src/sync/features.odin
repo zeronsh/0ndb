@@ -1043,6 +1043,8 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 		}
 		start := pos - n - journal.OVERHEAD
 		if start < 0 {
+			rm.need_from = at + i64(start)
+			rm.need_set = true
 			break
 		}
 		if int(prim.get_u32le(data[start:])) != n {

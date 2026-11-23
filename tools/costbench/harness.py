@@ -692,7 +692,7 @@ def s7_cold_restore():
     settle(10)
     a.stop()
     t0 = time.time()
-    log = b.cli("log", obj, "-n", str(len(msgs) + 10), "--json", timeout=1800)
+    log = b.cli("log", obj, "-n", str(len(msgs) + 10), "--json", "--timeout", os.environ.get("COST_LOG_TIMEOUT", "600000"), timeout=1800)
     cold = round(time.time() - t0, 1)
     ids = re.findall(r'"msg":"([^"]+)"', log) or re.findall(r'"id":"([^"]+)"', log)
     victim = ids[len(ids) // 10] if ids and os.environ.get("COST_REDACT", "1") != "0" else None
