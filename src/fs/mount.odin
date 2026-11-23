@@ -312,6 +312,7 @@ Mount :: struct {
 	mat:         ^Mat_Sync,
 	owed:        Mat_Sync,
 	merge_base:  Version,
+	rebasing:    []crdt.Op_Id,
 	mat_retries: int,
 	mat_bytes:   int,
 	attrib:      map[string]Attrib,

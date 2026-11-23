@@ -462,6 +462,10 @@ equal in both directions.
   moving `synced`; the pass then materializes `synced` united with that
   batch, which rewrites the file with both the agent's edit and everything
   concurrent, and the CRDT reports overlapping edits as conflict regions.
+  That merge is part of ingesting the write, so it is materialized even on
+  a path another scope holds: the write already moved the disk there, and
+  `synced` must describe the disk; every other batch stays off the held
+  path.
   A pin names the inode it read, and the edits go to that inode whatever
   the path holds when the write is ingested. If the inode was removed after
   the pin (and perhaps a new file created at the path), the edits are

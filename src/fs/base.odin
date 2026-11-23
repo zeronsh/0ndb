@@ -599,6 +599,8 @@ rebase_materialize :: proc(m: ^Mount, heads: []crdt.Op_Id) -> Error {
 	}
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
 	crdt.version_union(&h.g, sl[:], hl[:], &both)
+	m.rebasing = heads
+	defer m.rebasing = nil
 	return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), false)
 }
 
@@ -613,6 +615,12 @@ hold_target :: proc(m: ^Mount, tl: []crdt.Lv, sl: []crdt.Lv) -> (out: []crdt.Lv,
 	}
 	if len(held) == 0 {
 		return tl, false, .None
+	}
+	own := make([dynamic]crdt.Lv, context.temp_allocator)
+	for id in m.rebasing {
+		if lv, ok := crdt.graph_lv(&h.g, id); ok {
+			append(&own, lv)
+		}
 	}
 	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
@@ -650,7 +658,11 @@ hold_target :: proc(m: ^Mount, tl: []crdt.Lv, sl: []crdt.Lv) -> (out: []crdt.Lv,
 			for par in crdt.graph_parents(&h.g, lv, &buf) {
 				bad ||= in_excluded(excluded[:], par)
 			}
-			if !bad {
+			rebased := false
+			for x in own {
+				rebased ||= x >= first && x < first + crdt.Lv(n)
+			}
+			if !bad && !rebased {
 				b, berr := history_read_batch(h, stream, off, context.temp_allocator)
 				if berr == .None {
 					touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
