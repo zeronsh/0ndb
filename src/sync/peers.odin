@@ -161,6 +161,13 @@ _local_verify_hollow :: proc(r: ^Replicator, l: ^Local, base: i64) {
 	if r.rx_local == l {
 		r.rx_local = nil
 	}
+	if l.checking {
+		l.checking = false
+		l.recheck = -1
+		_local_checked(r, l)
+		_local_pump(r, l)
+		return
+	}
 	to := min(base, l.ahead)
 	if to > l.cursor {
 		if err := _local_advance(r, l, to); err != .None {

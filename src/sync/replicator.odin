@@ -43,6 +43,8 @@ Repl_Event_Kind :: enum u8 {
 	Draft,
 	Draft_Pulled,
 	Listed,
+	Local_Corrupt,
+	Local_Checked,
 }
 
 Repl_Event :: struct {
@@ -148,6 +150,9 @@ Local :: struct {
 	retry:     bool,
 	verifying: bool,
 	beyond:    bool,
+	checking:  bool,
+	repairing: bool,
+	recheck:   i64,
 	verify_at: i64,
 	verify_to: i64,
 	ahead:     i64,
@@ -880,6 +885,7 @@ _local_open :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, id:
 	}
 	l.cursor = l.floor
 	l.durable = l.floor
+	l.recheck = -1
 	l.epoch = epoch
 	l.id = id
 	l.key = stream_key(scope, id)
@@ -922,7 +928,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
-	if l.fatal || l.inflight > 0 || l.verifying || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l {
+	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l {
 		return
 	}
 	if r.hold > 0 {
@@ -951,7 +957,11 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 		_local_maybe_free(r, l)
 		return
 	}
-	if r.phase != .Ready || l.fatal || l.blocked || l.retry || l.inflight > 0 || l.verifying || l.ahead > 0 || l.cursor >= l.durable || _tree_missing(l) {
+	if l.recheck >= 0 && r.phase == .Ready && !l.fatal && !l.repairing && l.inflight == 0 && !l.verifying && l.ahead == 0 && !_tree_missing(l) {
+		_local_recheck_start(r, l)
+		return
+	}
+	if r.phase != .Ready || l.fatal || l.blocked || l.retry || l.inflight > 0 || l.verifying || l.repairing || l.ahead > 0 || l.cursor >= l.durable || _tree_missing(l) {
 		_local_drop_prev(r, l)
 		_local_maybe_free(r, l)
 		return
@@ -1216,11 +1226,187 @@ _local_beyond :: proc(r: ^Replicator, l: ^Local, relay_len: i64) {
 	client_read(&r.client, l.id, l.verify_at, l.verify_to)
 }
 
+replicator_recheck :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, at: i64, tree: ^Key_Tree = nil) -> Error {
+	_enter(r)
+	defer _leave(r)
+	id := stream_id(scope, r.cfg.self, name, epoch)
+	l, ok := r.locals[id]
+	if !ok {
+		l = _local_open(r, scope, name, epoch, id, path) or_return
+	}
+	if tree != nil {
+		l.tree = tree
+	}
+	if at < 0 || at >= l.cursor || l.fatal {
+		_local_checked(r, l)
+		_local_maybe_free(r, l)
+		return .None
+	}
+	l.recheck = at if l.recheck < 0 else min(l.recheck, at)
+	_local_pump(r, l)
+	_repl_flush(r)
+	return .None
+}
+
+replicator_restored :: proc(r: ^Replicator, id: Stream_Id, err: Error) {
+	_enter(r)
+	defer _leave(r)
+	l, ok := r.locals[id]
+	if !ok || !l.repairing {
+		return
+	}
+	l.repairing = false
+	_local_checked(r, l)
+	if err != .None {
+		_local_fatal(r, l, .Corrupt, -1)
+		return
+	}
+	if l.ahead > 0 {
+		_local_verify_next(r, l)
+	} else {
+		_local_pump(r, l)
+	}
+	_repl_flush(r)
+}
+
+@(private)
+_local_recheck_start :: proc(r: ^Replicator, l: ^Local) {
+	l.verifying = true
+	l.checking = true
+	l.beyond = false
+	l.verify_at = l.recheck
+	l.verify_to = min(l.cursor, l.recheck + UPLOAD_CHUNK)
+	clear(&l.verify)
+	client_read(&r.client, l.id, l.verify_at, l.verify_to)
+}
+
+@(private)
+_local_recheck_done :: proc(r: ^Replicator, l: ^Local) {
+	l.checking = false
+	k := journal.record_bounds(l.verify[:])
+	if k == 0 || i64(len(l.verify)) != l.verify_to - l.verify_at {
+		_local_tampered(r, l)
+		return
+	}
+	theirs := l.verify[:k]
+	if !_open_own(l, theirs, l.verify_at) {
+		_local_tampered(r, l)
+		return
+	}
+	l.recheck = -1
+	r.tamper_run = 0
+	if !_local_repair(r, l, theirs, l.verify_at) {
+		clear(&l.verify)
+		_local_checked(r, l)
+		_local_pump(r, l)
+		return
+	}
+	clear(&l.verify)
+}
+
+@(private)
+_local_checked :: proc(r: ^Replicator, l: ^Local) {
+	_emit(r, Repl_Event{kind = .Local_Checked, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id})
+}
+
+@(private)
+_local_repair :: proc(r: ^Replicator, l: ^Local, theirs: []u8, base: i64) -> (held: bool) {
+	if l.fd < 0 {
+		l.fd, _ = prim.open_file(r.vfs, l.path)
+	}
+	raw, aerr := make([]u8, len(theirs), context.temp_allocator)
+	if aerr != nil {
+		return false
+	}
+	defer delete(raw, context.temp_allocator)
+	got := 0
+	if l.fd >= 0 {
+		got, _ = prim.read_at(r.vfs, l.fd, raw, base)
+	}
+	restore := make([dynamic]journal.Range, context.temp_allocator)
+	pos := 0
+	for pos < len(theirs) {
+		n := int(prim.get_u32le(theirs[pos:])) + journal.OVERHEAD
+		off := base + i64(pos)
+		valid := false
+		same := false
+		if got - pos >= journal.OVERHEAD {
+			ln := int(prim.get_u32le(raw[pos:])) + journal.OVERHEAD
+			if ln <= got - pos {
+				kind := journal.classify(raw[pos:][:ln], off)
+				valid = kind == .Plain || kind == .Redacted
+				same = ln == n && _ct_eq(raw[pos:][:n], theirs[pos:][:n])
+				if valid && !same && kind != .Redacted && journal.classify(theirs[pos:][:n], off) != .Redacted {
+					_local_fatal(r, l, .Conflict, off)
+					return true
+				}
+			}
+		}
+		if !valid {
+			append(&restore, journal.Range{i64(pos), i64(pos + n)})
+		}
+		pos += n
+	}
+	if len(restore) == 0 {
+		return false
+	}
+	l.repairing = true
+	for g in restore {
+		_emit(r, Repl_Event{kind = .Local_Corrupt, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, path = l.path, from = base + g.from, to = base + g.to, meta = theirs[g.from:g.to]})
+	}
+	return true
+}
+
+@(private)
+_open_own :: proc(l: ^Local, data: []u8, base: i64) -> bool {
+	if journal.record_bounds(data) != len(data) {
+		return false
+	}
+	if l.plain {
+		pos := 0
+		for pos < len(data) {
+			n := int(prim.get_u32le(data[pos:])) + journal.OVERHEAD
+			if e := journal.check_record(data[pos:][:n], base + i64(pos)); e != .None && e != .Redacted {
+				return false
+			}
+			pos += n
+		}
+		return true
+	}
+	keys: journal.Key_Provider
+	switch {
+	case l.tree != nil:
+		keys = keytree_provider(l.tree)
+	case !l.keyed:
+		keys = static_provider(&l.key)
+	case:
+		return false
+	}
+	pos := 0
+	for pos < len(data) {
+		n := int(prim.get_u32le(data[pos:])) + journal.OVERHEAD
+		rec := data[pos:][:n]
+		off := base + i64(pos)
+		switch journal.open_record(rec, off, keys) {
+		case .None:
+		case .No_Key:
+			if journal.redact_bytes(rec, off) != .None {
+				return false
+			}
+		case .Eof, .Corrupt, .Missing, .Redacted, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
+			return false
+		}
+		pos += n
+	}
+	return true
+}
+
 @(private)
 _local_tampered :: proc(r: ^Replicator, l: ^Local) {
 	clear(&l.verify)
 	l.verifying = false
 	l.beyond = false
+	l.checking = false
 	r.tamper_run += 1
 	r.tampered = true
 	_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, from = l.verify_at, to = l.verify_to})
@@ -1249,6 +1435,10 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 	}
 	if l.beyond {
 		_local_beyond_done(r, l)
+		return
+	}
+	if l.checking {
+		_local_recheck_done(r, l)
 		return
 	}
 	n := l.verify_to - l.verify_at
@@ -1280,10 +1470,18 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 			_local_tampered(r, l)
 			return
 		}
+		if local == .Corrupt {
+			r.tamper_run = 0
+			theirs := l.verify[:]
+			_open_own(l, theirs, l.verify_at)
+			if !_local_repair(r, l, theirs, l.verify_at) {
+				_local_fatal(r, l, .Corrupt, l.verify_to)
+			}
+			clear(&l.verify)
+			return
+		}
 		clear(&l.verify)
 		switch {
-		case local == .Corrupt:
-			_local_fatal(r, l, .Corrupt, l.verify_to)
 		case local != .None:
 			_local_fatal(r, l, local, l.verify_to)
 		case:
@@ -1305,30 +1503,13 @@ _local_verify_done :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _own_writes :: proc(l: ^Local, theirs: []u8, base: i64) -> bool {
-	if journal.record_bounds(theirs) != len(theirs) {
-		return false
-	}
 	data, aerr := make([]u8, len(theirs), context.temp_allocator)
 	if aerr != nil {
 		return false
 	}
 	defer delete(data, context.temp_allocator)
 	copy(data, theirs)
-	if l.plain {
-		pos := 0
-		for pos < len(data) {
-			n := int(prim.get_u32le(data[pos:])) + journal.OVERHEAD
-			if e := journal.check_record(data[pos:][:n], base + i64(pos)); e != .None && e != .Redacted {
-				return false
-			}
-			pos += n
-		}
-		return true
-	}
-	if l.tree != nil {
-		return journal.open_range(data, base, keytree_provider(l.tree)) == .None
-	}
-	return !l.keyed && journal.open_range(data, base, static_provider(&l.key)) == .None
+	return _open_own(l, data, base)
 }
 
 @(private)
@@ -2526,6 +2707,7 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		l.noting = false
 		l.verifying = false
 		l.beyond = false
+		l.checking = false
 		l.ahead = 0
 		clear(&l.verify)
 	}

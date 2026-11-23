@@ -9,8 +9,11 @@ Own_Length :: struct {
 	space:   prim.Id,
 	object:  prim.Id,
 	kind:    Kind,
-	stream:  osync.Stream_Id,
-	durable: i64,
+	stream:   osync.Stream_Id,
+	durable:  i64,
+	uploaded: i64,
+	device:   bool,
+	path:     string,
 }
 
 own_lengths :: proc(e: ^Engine, allocator := context.allocator) -> (out: []Own_Length, err: Error) {
@@ -40,9 +43,42 @@ own_lengths :: proc(e: ^Engine, allocator := context.allocator) -> (out: []Own_L
 			continue
 		}
 		sc := _object_scope(sp, id)
-		sid := osync.stream_id(&sc, e.self, _seg_name(rec.kind, id), 0)
+		name := _seg_name(rec.kind, id)
+		sid := osync.stream_id(&sc, e.self, name, 0)
+		floor, _ := osync.replicator_floor(&sp.repl, &sc, name, 0)
 		osync.scope_clear(&sc)
-		append(&res, Own_Length{sp.id, id, rec.kind, sid, durable})
+		p := _clone(path, allocator) or_return
+		append(&res, Own_Length{sp.id, id, rec.kind, sid, durable, floor, _storage_class(e, sp, id, rec.kind) == .Device, p})
+	}
+	for sid in _sorted_keys(e.spaces) {
+		sp := e.spaces[sid]
+		if !sp.open || !sp.repl_on || sp.keyless || prim.id_is_zero(sp.catalog) {
+			continue
+		}
+		dup := false
+		for o in res {
+			if o.object == sp.catalog {
+				dup = true
+			}
+		}
+		if dup {
+			continue
+		}
+		path := _own_stream_path(e, sp.catalog, .Map) or_return
+		if !prim.exists(e.vfs, path) {
+			continue
+		}
+		durable, perr := pack.durable_size(&e.pk, path)
+		if perr != .None {
+			continue
+		}
+		sc := _object_scope(sp, sp.catalog)
+		name := _seg_name(.Map, sp.catalog)
+		stream := osync.stream_id(&sc, e.self, name, 0)
+		floor, _ := osync.replicator_floor(&sp.repl, &sc, name, 0)
+		osync.scope_clear(&sc)
+		p := _clone(path, allocator) or_return
+		append(&res, Own_Length{sp.id, sp.catalog, .Map, stream, durable, floor, false, p})
 	}
 	return res[:], .None
 }

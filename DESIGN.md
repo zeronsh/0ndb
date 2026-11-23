@@ -252,11 +252,27 @@ record := len:u32le  tag:[16]u8  body:[len]u8  len:u32le
   their offsets; a sidecar `.have` file keeps the sorted list of present
   ranges. Reads of missing ranges return `.Missing` with the range, which the
   caller fetches and retries.
-- Redaction is the one in-place change: a `Redact` record names a range,
+- Redaction is one in-place change: a `Redact` record names a range,
   and every holder (writer, replicas, relay) zero-fills that body and marks
   the record redacted in its tag slot, keeping lengths and offsets. The
   record's plaintext key was already destroyed by puncturing the key tree,
   so zero-filling removes the only remaining ciphertext.
+- Restoring a damaged own record is the other. `journal_restore(off, rec)`
+  writes back exactly the bytes the writer appended at `off`, taken from the
+  relay copy after it opened as this device's own sealed write (or passed its
+  record check in a transparent space), and syncs. It refuses unless `off`
+  is below the durable length, the given record is valid at `off`, and the
+  record on disk there fails its own check by its own framing, so a valid
+  record is never overwritten; the replicator holds the stream's upload
+  until the batch holding the restore is durable. Lengths, offsets and the
+  chain are unchanged, and the restored bytes are the ones every replica
+  already holds. A restore never brings back what a redaction removed: a
+  record whose range the redaction log names is written in its zero-filled
+  redacted form, a relay copy that still holds ciphertext under a key this
+  device's tree has already punctured restores as redacted (it is never
+  taken for tampering), and a redaction that lands while a repair is pending
+  wins, because `journal_restore` accepts a record that is now validly
+  redacted on disk.
 - Epochs: a writer may start a new epoch of a stream (compaction) beginning
   with a snapshot record; the old epoch file is deleted after the new one is
   uploaded.
@@ -1003,8 +1019,28 @@ concurrent typing is never lost or reverted.
   again on the next connection under the normal connect backoff, which keeps
   growing while the relay keeps tampering; it is never fatal and arms no
   timer of its own. A local record that fails its own check is local
-  corruption: it is never sealed or uploaded and the stream stops with
-  `Corrupt`. A relay that reports more of the stream than is durable
+  corruption: it is never sealed or uploaded. It is caught when the upload
+  reads it, when the verify reads it, when any read of the writer's journal
+  hits it below the durable length (the journal's damage hook), or by
+  `scrub`, which walks every own object stream and catalog. `scrub` is an
+  explicit call for the embedder (at quiesce, say); nothing schedules it, so
+  detection otherwise stays event-driven: on read, on verify, and at open,
+  where chain recovery reads through the same hook. A hook offset is only a
+  hint: the engine finds the first damaged record by walking the local
+  stream before it rechecks that range against the relay. A damaged record
+  the relay already holds is restored from the relay copy (see journal), and
+  the stream resumes once the restore is durable; one the relay does not
+  hold (never uploaded, or below the relay's base, as for a promoted object
+  whose bytes live on peers), or one in a stream the relay keeps no bytes of
+  (device storage class), is lost. Every consumer of a damaged own record treats it as a
+  missing range, never as an I/O failure, so damage is never an engine
+  failure: a map table resets clean and its reads park until the restore is
+  durable, which wakes them; catalog updates that hit it park off the tick
+  and resume with the restore; a command that hits it parks on the object
+  until the check ends, then completes, or fails with `Corrupt` if the
+  record is lost; a synchronous call answers `Busy` while the repair is
+  pending; a record found lost reports `Corrupt` on that one object while
+  every other object and space runs on. A relay that reports more of the stream than is durable
   locally, which a correct device never causes, is read back from the local
   durable length: bytes that open as this device's own sealed writes, or two
   different records that are both valid, can only come from a second device

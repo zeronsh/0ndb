@@ -81,8 +81,11 @@
   whole, renamed into place and published with a directory fsync. Never
   trust a truncate's new size or a rename to survive a crash.
 - Streams are single-writer and append-only. A durable record is never
-  rewritten or truncated, except that redaction zero-fills it in place. Offsets are identical locally, on the relay and on
-  replicas.
+  rewritten or truncated, except that redaction zero-fills it in place and
+  a record that fails its own check is restored to the exact bytes its
+  writer appended, from the relay copy verified as this device's own sealed
+  write, and synced (`journal_restore`, DESIGN "journal"). Offsets are
+  identical locally, on the relay and on replicas.
 - Provider wire formats live only in their driver file under `src/agent/`.
 - Every provider line is recorded raw before it is interpreted.
 - Disk content that differs from the last snapshot is snapshotted before any
