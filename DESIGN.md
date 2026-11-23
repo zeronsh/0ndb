@@ -303,6 +303,25 @@ A git object database in git's formats.
   `write(type, bytes) -> oid`, `hash_file(path) -> oid`, `write_file(path)`.
 - Refs: `update_ref(name, new, old)` via lockfile + rename, used to pin
   scope commit chains so git's gc keeps them.
+- Durability follows git's invariant: an object's final name exists only
+  once its data is durable. The device store runs deferred: a new loose
+  object, or a new pack's data and `.idx`, stays at its temp name, and an
+  in-memory staged entry (oid → temp path for loose objects, a loaded pack
+  marked staged) serves `exists` and reads; a read from a temp path verifies
+  the oid. The loop never syncs them: the pack's commit job takes everything
+  staged before it writes its commit record and, on the worker, syncs the
+  temp files, renames them to their final names under the odb mutex, syncs
+  the directories, and only then writes the record, so every op naming an
+  oid becomes durable after the object it names. Staged entries live only
+  until that job completes. Everything else that names an oid durably goes
+  through the same commit (history journals, checkpoint bundles, mount
+  images, which wait for the batch carrying their history) or calls the
+  synchronous `barrier`, which installs every staged object first, including
+  those an in-flight job holds (pins, refs, scope commits, repack, redact).
+  At its first open the engine removes temps in its own name format (prefix
+  plus 16 hex digits); no durable record names one, and git's own temps
+  (6-character mkstemp names) and other handles' temps are never touched,
+  because no other handle sweeps.
 
 ## textdiff
 

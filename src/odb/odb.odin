@@ -54,10 +54,13 @@ Odb :: struct {
 	two_pass_size:  i64,
 	sync_writes:    bool,
 	scrub_mutex:    sync.Mutex,
+	deferred:       bool,
 	store:          bool,
 	pending_files:  [dynamic]string,
 	pending_dirs:   [dynamic]string,
 	owed_files:     [dynamic]string,
+	staged:         [dynamic]^Staged,
+	staged_at:      map[Oid]^Staged,
 	cache:          [CACHE_SLOTS]Cache_Entry,
 	cache_bytes:    int,
 	tick:           u64,
@@ -72,6 +75,7 @@ Location :: struct {
 	dir:    int,
 	loose:  bool,
 	found:  bool,
+	staged: ^Staged,
 }
 
 @(private)
@@ -140,6 +144,50 @@ open_store :: proc(db: ^Odb, vfs: prim.Vfs, dir: string, extra_dirs: []string = 
 		close(db)
 	}
 	return err
+}
+
+sweep_temps :: proc(db: ^Odb) {
+	base := primary_dir(db)
+	if len(base) == 0 {
+		return
+	}
+	for sub in ([]string{"", "/pack"}) {
+		dir := strings.concatenate({base, sub}, context.temp_allocator)
+		d: prim.Dir
+		if prim.dir_open(db.vfs, &d, dir, context.temp_allocator) != .None {
+			continue
+		}
+		stale := make([dynamic]string, context.temp_allocator)
+		for {
+			ent, more, derr := prim.dir_next(db.vfs, &d)
+			if derr != .None || !more {
+				break
+			}
+			for prefix in ([]string{"tmp_obj_", "tmp_pack_", "tmp_idx_", ".tmp_"}) {
+				if own_temp_name(ent.name, prefix) {
+					append(&stale, strings.concatenate({dir, "/", ent.name}, context.temp_allocator))
+					break
+				}
+			}
+		}
+		prim.dir_close(db.vfs, &d)
+		for p in stale {
+			prim.remove(db.vfs, p)
+		}
+	}
+}
+
+@(private)
+own_temp_name :: proc(name, prefix: string) -> bool {
+	if len(name) != len(prefix) + 16 || !strings.has_prefix(name, prefix) {
+		return false
+	}
+	for c in transmute([]u8)name[len(prefix):] {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -247,6 +295,7 @@ close :: proc(db: ^Odb) {
 	}
 	delete(db.dirs)
 	pending_clear(db)
+	staged_clear(db)
 	delete(db.git_dir, a)
 	delete(db.common_dir, a)
 	db.dirs = nil
@@ -259,10 +308,16 @@ trim :: proc(db: ^Odb) {
 	defer sync.mutex_unlock(&db.mutex)
 	cache_clear(db)
 	for &d in db.dirs {
+		j := 0
 		for p in d.packs {
+			if p.staged {
+				d.packs[j] = p
+				j += 1
+				continue
+			}
 			pack_free(db, p)
 		}
-		clear(&d.packs)
+		resize(&d.packs, j)
 		d.scanned = false
 		d.pack_mtime = 0
 	}
@@ -294,6 +349,7 @@ primary_dir :: proc(db: ^Odb) -> string {
 pack_free :: proc(db: ^Odb, p: ^Pack) {
 	pack_close(db, p)
 	delete(p.base, db.allocator)
+	delete(p.data_at, db.allocator)
 	free(p, db.allocator)
 }
 
@@ -627,7 +683,7 @@ scan_packs :: proc(db: ^Odb, d: ^Object_Dir) -> bool {
 	d.scanned = true
 	d.pack_mtime = mtime
 	for p in d.packs {
-		p.present = false
+		p.present = p.staged
 	}
 	dir: prim.Dir
 	if have && prim.dir_open(db.vfs, &dir, pack_dir, db.allocator) == .None {
@@ -670,9 +726,12 @@ scan_packs :: proc(db: ^Odb, d: ^Object_Dir) -> bool {
 }
 
 @(private)
-load_pack :: proc(db: ^Odb, d: ^Object_Dir, base: string) -> ^Pack {
+load_pack :: proc(db: ^Odb, d: ^Object_Dir, base: string, idx_at := "") -> ^Pack {
 	buf: [PATH_MAX]u8
-	idx_path := concat_into(buf[:], base, ".idx") or_else ""
+	idx_path := idx_at
+	if idx_path == "" {
+		idx_path = concat_into(buf[:], base, ".idx") or_else ""
+	}
 	if idx_path == "" {
 		return nil
 	}
@@ -682,7 +741,7 @@ load_pack :: proc(db: ^Odb, d: ^Object_Dir, base: string) -> ^Pack {
 	}
 	p.fd = prim.INVALID_FD
 	p.hsz = oid_size(db.format)
-	if db.use_mmap && vfs_is_os(db.vfs) {
+	if db.use_mmap && vfs_is_os(db.vfs) && idx_at == "" {
 		idx, merr := vfs_map_path(db.vfs, idx_path)
 		if merr != .None {
 			free(p, db.allocator)
@@ -737,6 +796,9 @@ find_packed :: proc(db: ^Odb, oid: Oid, primary_only: bool) -> (loc: Location) {
 
 @(private)
 locate :: proc(db: ^Odb, oid: Oid, primary_only := false) -> (loc: Location) {
+	if s := staged_lookup(db, oid); s != nil {
+		return {loose = true, found = true, staged = s}
+	}
 	loc = find_packed(db, oid, primary_only)
 	if loc.found {
 		return
@@ -780,6 +842,9 @@ exists_for_write :: proc(db: ^Odb, oid: Oid) -> bool {
 	if !loc.found {
 		return false
 	}
+	if loc.staged != nil {
+		return true
+	}
 	now := now_ns(db)
 	buf: [PATH_MAX]u8
 	if loc.loose {
@@ -817,6 +882,9 @@ read_locked :: proc(db: ^Odb, oid: Oid, allocator: runtime.Allocator) -> (type: 
 	if !loc.found {
 		return .None, nil, .Not_Found
 	}
+	if loc.staged != nil {
+		return read_staged(db, loc.staged, allocator)
+	}
 	if loc.loose {
 		buf: [PATH_MAX]u8
 		path := loose_path(buf[:], db.dirs[loc.dir].path, oid, db.format) or_return
@@ -831,6 +899,11 @@ read_header :: proc(db: ^Odb, oid: Oid) -> (type: Object_Type, size: i64, err: E
 	loc := locate(db, oid)
 	if !loc.found {
 		return .None, 0, .Not_Found
+	}
+	if loc.staged != nil {
+		t, data := read_staged(db, loc.staged, db.allocator) or_return
+		delete(data, db.allocator)
+		return t, i64(len(data)), .None
 	}
 	if loc.loose {
 		buf: [PATH_MAX]u8
@@ -950,6 +1023,11 @@ read_packed :: proc(db: ^Odb, pack: ^Pack, offset: i64, allocator: runtime.Alloc
 		if !loc.found {
 			return .None, nil, .Not_Found
 		}
+		if loc.staged != nil {
+			type, base = read_staged(db, loc.staged, db.allocator) or_return
+			base_owned = true
+			break
+		}
 		if loc.loose {
 			path := loose_path(buf[:], db.dirs[loc.dir].path, h.base_oid, db.format) or_return
 			type, base = read_loose(db, path, db.allocator) or_return
@@ -1047,6 +1125,11 @@ packed_header :: proc(db: ^Odb, pack: ^Pack, offset: i64) -> (type: Object_Type,
 		loc := locate(db, h.base_oid)
 		if !loc.found {
 			return .None, 0, .Not_Found
+		}
+		if loc.staged != nil {
+			t, data := read_staged(db, loc.staged, db.allocator) or_return
+			delete(data, db.allocator)
+			return t, size, .None
 		}
 		if loc.loose {
 			path := loose_path(buf[:], db.dirs[loc.dir].path, h.base_oid, db.format) or_return
@@ -1223,6 +1306,14 @@ stream :: proc(db: ^Odb, oid: Oid, w: io.Writer) -> (type: Object_Type, size: i6
 		return .None, 0, .Not_Found
 	}
 	buf: [PATH_MAX]u8
+	if loc.staged != nil {
+		t, data := read_staged(db, loc.staged, db.allocator) or_return
+		defer delete(data, db.allocator)
+		if _, werr := io.write_full(w, data); werr != nil {
+			return .None, 0, .Io
+		}
+		return t, i64(len(data)), .None
+	}
 	if loc.loose {
 		path := loose_path(buf[:], db.dirs[loc.dir].path, oid, db.format) or_return
 		fd, oerr := prim.open_file(db.vfs, path)
@@ -1331,6 +1422,13 @@ install_loose :: proc(db: ^Odb, tmp_path: string, oid: Oid) -> Error {
 	if merr != .None {
 		prim.remove(db.vfs, tmp_path)
 		return merr
+	}
+	if db.deferred {
+		stage_loose(db, oid, tmp_path, final, fan)
+		if created {
+			track(db, "", dir)
+		}
+		return .None
 	}
 	if prim.rename(db.vfs, tmp_path, final) != .None {
 		again, _ := vfs_mkdir(db, fan)
