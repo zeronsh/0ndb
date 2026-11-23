@@ -617,6 +617,9 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_emit(e, Event{kind = .Presence, space = sp.id, device = ev.device, tick = u64(ev.from), length = ev.length})
 		_remote_presence(e, sp, ev.device, ev.from != 0)
 		_members_presence(e, sp)
+		if ev.from == 0 {
+			_buffers_live_drop_device(e, sp, ev.device)
+		}
 	case .Caught_Up:
 		if !sp.keyless {
 			_members_caught_up(e, sp)

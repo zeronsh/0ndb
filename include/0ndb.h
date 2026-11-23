@@ -246,7 +246,12 @@
  *                 replicas of the open spaces since each opened),
  *                 base_merged, base_current, base_mismatch,
  *                 base_not_text: uvarint (agent writes with a reported
- *                 base: merged from it, base still current, fallbacks)
+ *                 base: merged from it, base still current, fallbacks),
+ *                 buffer_live_sent, buffer_live_applied,
+ *                 buffer_live_confirmed, buffer_live_dropped: uvarint
+ *                 (buffer edits streamed ahead of durability; frames
+ *                 shown to buffers, later confirmed by their durable
+ *                 record, and overlays withdrawn)
  *   Workspace  := name: str, agent: id, provider: str, model: str,
  *                 runner_policy: bytes, setup: str, access: bytes,
  *                 members: [ {object: id, kind: enum kind,
