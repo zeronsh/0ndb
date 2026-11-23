@@ -1656,6 +1656,16 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 		spans_touched(h, only_b[:], &touched) or_return
 		snap := version_snapshot(h, tl[:]) or_return
 		defer fstree.snapshot_destroy(&snap)
+		was := version_snapshot(h, sl[:]) or_return
+		defer fstree.snapshot_destroy(&was)
+		dirs := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
+		for ino in touched {
+			append(&dirs, ino)
+		}
+		for ino in dirs {
+			retarget_subtree(&was, ino, &touched) or_return
+			retarget_subtree(&snap, ino, &touched) or_return
+		}
 		order := sorted_inodes(touched)
 		for ino in order {
 			if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
@@ -1682,6 +1692,28 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 	clear(&m.synced)
 	append(&m.synced, ..target)
 	m.rescan = true
+	return .None
+}
+
+@(private)
+retarget_subtree :: proc(snap: ^fstree.Snapshot, dir: fstree.Inode_Id, touched: ^map[fstree.Inode_Id]bool) -> Error {
+	info, ok, ierr := fstree.info(snap, dir, context.temp_allocator)
+	if ierr != nil {
+		return .Corrupt
+	}
+	if !ok || !info.present || info.kind != .Dir {
+		return .None
+	}
+	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
+	if kerr != nil {
+		return .Corrupt
+	}
+	for c in kids {
+		touched[c.inode] = true
+		if c.kind == .Dir {
+			retarget_subtree(snap, c.inode, touched) or_return
+		}
+	}
 	return .None
 }
 
