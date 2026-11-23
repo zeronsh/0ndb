@@ -104,6 +104,7 @@ Handle :: struct {
 	dloaded:    bool,
 	dclosed:    [DRAFT_CLOSED]Draft_Key,
 	dclosed_n:  int,
+	live_devs:  [dynamic]prim.Id,
 }
 
 @(private)
@@ -777,6 +778,7 @@ _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
 		free(s, e.allocator)
 	}
 	delete(h.segs)
+	delete(h.live_devs)
 	if h.own_tree != nil {
 		_own_tree_unref(e, h.own_tree)
 		h.own_tree = nil
