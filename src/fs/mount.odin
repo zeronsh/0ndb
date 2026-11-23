@@ -2265,11 +2265,33 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	return .None
 }
 
+@(private)
+intents_dedupe :: proc(list: ^[dynamic]Intent) {
+	Key :: struct {
+		actor: prim.Id,
+		seq:   u64,
+	}
+	at := make(map[Key]int, context.temp_allocator)
+	kept := 0
+	for i in 0 ..< len(list) {
+		it := list[i]
+		if j, seen := at[Key{it.actor, it.seq}]; seen {
+			list[j].n = max(list[j].n, it.n)
+			continue
+		}
+		at[Key{it.actor, it.seq}] = kept
+		list[kept] = it
+		kept += 1
+	}
+	resize(list, kept)
+}
+
 mount_recover :: proc(m: ^Mount) -> Error {
 	h := m.history
 	if h != nil {
 		history_marked(h, m.jpos, commit_mark(m), &m.intents) or_return
 	}
+	intents_dedupe(&m.intents)
 	if len(m.intents) == 0 {
 		return .None
 	}
