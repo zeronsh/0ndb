@@ -21,6 +21,14 @@ SCAN_BUDGET :: 4096
 TEXT_INDEX_MAX :: 4 << 20
 @(private)
 TREE_LV_CHUNK :: 4096
+TREE_INDEX_FILES :: 256
+INDEX_SLICE_NS :: 8_000_000
+
+Tree_Index_Cursor :: struct {
+	pos:  i64,
+	to:   crdt.Lv,
+	next: int,
+}
 @(private)
 SEARCH_STEP_BUDGET :: i64(4 << 20)
 @(private)
@@ -301,8 +309,9 @@ _index_step :: proc(e: ^Engine) {
 	e.index_dirty = make([dynamic]Index_Item, e.allocator)
 	defer delete(items)
 	budget := SCAN_BUDGET
+	t0 := prim.clock_mono_ns(e.cfg.clock)
 	for it, i in items {
-		if budget <= 0 {
+		if budget <= 0 || (i > 0 && prim.clock_mono_ns(e.cfg.clock) - t0 >= INDEX_SLICE_NS) {
 			append(&e.index_dirty, ..items[i:])
 			_touch(e)
 			return
@@ -689,7 +698,17 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 	snap := fstree.current(&h.hist.tree)
 	fs.history_scan_begin(h.hist)
 	defer fs.history_scan_end(h.hist)
-	for id in ids {
+	start := 0
+	if c := h.tree_ix; c.next > 0 && c.pos == pos && c.to == to {
+		start = min(c.next, len(ids))
+	}
+	h.tree_ix = {}
+	t0 := prim.clock_mono_ns(e.cfg.clock)
+	for id, k in ids[start:] {
+		if k >= TREE_INDEX_FILES || (k > 0 && prim.clock_mono_ns(e.cfg.clock) - t0 >= INDEX_SLICE_NS) {
+			h.tree_ix = {pos, to, start + k}
+			return max(used, 1), true
+		}
 		defer virtual.arena_free_all(&scratch)
 		used += 1
 		path, ok, lerr := fstree.path(&snap, id, sa)
@@ -722,10 +741,12 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 			at = hi
 		}
 		if _ix_busy(e, search.set_spans(&e.index, src, pos, _file_key(h.id, path), out[:])) {
+			h.tree_ix = {pos, to, start + k}
 			return used, true
 		}
 	}
 	if _ix_busy(e, search.advance(&e.index, src, i64(to))) {
+		h.tree_ix = {pos, to, len(ids)}
 		return used, true
 	}
 	return max(used, 1), to < end
