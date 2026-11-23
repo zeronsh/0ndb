@@ -580,7 +580,10 @@ equal in both directions.
   each step as its actor, then the rest by the rule above. Each step is a
   content diff against the one before, so a writer whose bytes a later step
   overwrote is credited nothing; a step whose content is missing from the
-  object store stops the chain and the rest is unattributed.
+  object store stops the chain and the rest is unattributed. The steps live
+  only in the log, so while any path holds steps an image keeps the replay's
+  offset and no save truncates the log or moves to a new generation; a full
+  pass that finds a chained path unchanged drops its steps.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,

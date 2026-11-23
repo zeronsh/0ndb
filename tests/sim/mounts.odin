@@ -689,6 +689,7 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 		world_note(w, "%s power loss after a person's edit of %s, which %d agents wrote since the last crash (SIM_ATTRIB_CHAIN)", n.name, abs, len(n.agent_paths[abs]))
 		stat_add(w, STAT_ATTRIB_CHAIN)
 		node_crash_now(n, .Power, 78)
+		n.disk.crash_on_trunc = "attrib.log"
 		return
 	}
 	if !agent && err == .None && n.observed >= 2 && !w.attrib_crashed && env_u64("SIM_ATTRIB_CRASH", 0) != 0 {
