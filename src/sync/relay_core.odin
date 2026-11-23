@@ -67,6 +67,8 @@ Relay_Core_Config :: struct {
 	feed_compact:    i64,
 	wake:            proc(data: rawptr),
 	wake_data:       rawptr,
+	on_redacted_in:  proc(data: rawptr, sender: Device_Id, space: Space_Id, id: Stream_Id, from, to: i64),
+	redacted_in_data: rawptr,
 }
 
 Relay_Core :: struct {

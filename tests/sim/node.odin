@@ -401,7 +401,8 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	#partial switch ev.kind {
 	case .Durable:
 	case .Replica_Redacted:
-		append(&n.learned, Learned_Redaction{object = ev.object, device = ev.device, from = i64(ev.tick), to = ev.length, seq = eng.pending_seq(e)})
+		sid, known := learned_stream(w, n, ev.space, ev.object, ev.device)
+		append(&n.learned, Learned_Redaction{object = ev.object, device = ev.device, from = i64(ev.tick), to = ev.length, seq = eng.pending_seq(e), stream = sid, known = known})
 		stat_add(w, STAT_LEARNED)
 		world_note(w, "%s learned redaction of %s@[%d,%d) in %s", n.name, id_short(ev.device), i64(ev.tick), ev.length, id_short(ev.object))
 	case .Quarantined:
@@ -546,6 +547,8 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 		cc.clock = node_clock(&rn.clock)
 		cc.wake = _relay_wake
 		cc.wake_data = rn
+		cc.on_redacted_in = _relay_redacted_in
+		cc.redacted_in_data = rn
 		err = osync.relay_core_init(&rn.r, cc)
 	}
 	if err == .None {
@@ -799,4 +802,21 @@ _learned_drop :: proc(n: ^Node) {
 		}
 	}
 	resize(&n.learned, k)
+}
+
+@(private = "file")
+_relay_redacted_in :: proc(data: rawptr, sender: osync.Device_Id, space: osync.Space_Id, id: osync.Stream_Id, from, to: i64) {
+	rn := (^Relay_Node)(data)
+	w := rn.w
+	for n in w.nodes {
+		if n.identity.id != prim.Id(sender) {
+			continue
+		}
+		for l in n.learned {
+			if l.known && l.stream == id && l.from < to && l.to > from {
+				sid := id
+				world_fail(w, "device redaction: %s sent bytes of %x [%d,%d) to the relay after learning of its redaction", n.name, sid[:4], from, to)
+			}
+		}
+	}
 }
