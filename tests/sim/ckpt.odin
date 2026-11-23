@@ -12,7 +12,7 @@ Ck_Watch :: struct {
 	obj:  int,
 }
 
-@(private = "file")
+@(private = "file", thread_local)
 ck_watch: [dynamic]Ck_Watch
 
 STAT_CK_PUBLISHED: Stat
