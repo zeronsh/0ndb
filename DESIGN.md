@@ -1371,7 +1371,15 @@ concurrent typing is never lost or reverted.
     created yet), content and promotion marks are clamped to the recovered
     own stream, and a checkpoint length past it is dropped. This applies to
     Conversation and Map segments only; a Text or File_Tree history may
-    legitimately be absent under an own mark (above). Legacy registry
+    legitimately be absent under an own mark (above).
+  - Unclean-open work is marked durably, not read from the pack's in-memory
+    unclean bit: an unclean open first commits a registry mark (cleared in
+    the same transaction as the registry fixes above) and, once spaces load,
+    one mark per space (cleared when that space's catalog reconcile and
+    pending-republish scan have both run). The pack's superblock stays
+    unclean until those marks are durable. A close in between, including an
+    open that fails after the pack recovered, therefore never skips the
+    work, and a space first opened in a later incarnation still gets it. Legacy registry
     rows migrated into the redaction log are deleted only after the batch
     holding their replacement records is durable.
   - Map tables: `ROOT_CONSUMED[self]` rides the same copy-on-write commit as

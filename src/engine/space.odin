@@ -4,7 +4,6 @@ import "core:crypto"
 import "core:crypto/blake2b"
 import "../journal"
 import omap "../map"
-import "../pack"
 import "../prim"
 import osync "../sync"
 
@@ -930,10 +929,11 @@ _pending_clear :: proc(e: ^Engine, space: prim.Id, object: prim.Id, length: i64)
 
 @(private)
 _pending_recover :: proc(e: ^Engine, sp: ^Space) {
-	if !e.pk_open || !pack.unclean(&e.pk) || !sp.repl_on || !_rlog_ready(e) || e.rlog.scanned[sp.id] {
+	if !e.pk_open || !e.reg.unclean[sp.id] || !sp.repl_on || !_rlog_ready(e) || e.rlog.scanned[sp.id] {
 		return
 	}
 	e.rlog.scanned[sp.id] = true
+	defer _unclean_settle(e, sp)
 	Own :: struct {
 		id:   prim.Id,
 		kind: Kind,

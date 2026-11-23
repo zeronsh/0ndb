@@ -123,6 +123,10 @@ Disk :: struct {
 	blob_crashes: u64,
 	blob_ckpt: bool,
 	blob_ckpt_crashes: u64,
+	reopen_fail:   bool,
+	crashed:       bool,
+	fail_reg_open: u64,
+	reopen_fails:  u64,
 	tmp_fail:  u64,
 	tmp_fails: u64,
 	force_ghost: bool,
@@ -606,6 +610,11 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 	}
 	if d.verbose && d.probe == 0 {
 		fmt.eprintf("dop %s open %s\n", d.name, path)
+	}
+	if d.fail_reg_open > 0 && d.probe == 0 && strings.has_suffix(path, "/registry") {
+		d.fail_reg_open -= 1
+		d.reopen_fails += 1
+		return prim.INVALID_FD, .Io
 	}
 	lk, err := _lookup(d, path, true)
 	if err != .None {

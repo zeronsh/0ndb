@@ -812,6 +812,10 @@ unclean :: proc "contextless" (p: ^Pack) -> bool {
 	return p.unclean
 }
 
+hold_unclean :: proc "contextless" (p: ^Pack, on: bool) {
+	p.hold_unclean = on
+}
+
 pending :: proc(p: ^Pack) -> bool {
 	return p.nrec > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending || len(p.zeros) > 0
 }

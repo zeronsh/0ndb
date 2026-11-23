@@ -315,6 +315,7 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 	_registry_drop_space(e, id, objs) or_return
 	_oerr(omap.db_compact(&e.reg.db)) or_return
 	delete_key(&e.spaces, id)
+	delete_key(&e.reg.unclean, id)
 	_space_free(e, sp, true)
 	_waiters_fail_space(e, id, .Permission)
 	_leave_waits_fail(e, id)
@@ -397,6 +398,10 @@ _registry_drop_space :: proc(e: ^Engine, space: prim.Id, objs: map[prim.Id]bool)
 		}
 	}
 	if _, derr := omap.txn_delete(t, ROOT_SPACES, s[:]); derr != .None {
+		ok = false
+	}
+	uk := _unclean_key(s)
+	if _, derr := omap.txn_delete(t, ROOT_SPACES, uk[:]); derr != .None {
 		ok = false
 	}
 	if !ok {

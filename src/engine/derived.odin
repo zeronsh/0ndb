@@ -221,16 +221,96 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 }
 
 @(private)
-_registry_recover :: proc(e: ^Engine) -> Error {
+UNCLEAN_TAG :: u8('u')
+UNCLEAN_REGISTRY :: [1]u8{'U'}
+
+@(private)
+_unclean_key :: proc(id: prim.Id) -> (k: [17]u8) {
+	x := id
+	copy(k[:16], x[:])
+	k[16] = UNCLEAN_TAG
+	return
+}
+
+@(private)
+_unclean_mark_registry :: proc(e: ^Engine) -> Error {
 	if !pack.unclean(&e.pk) {
+		return .None
+	}
+	t := _oerr2_txn(omap.txn_begin(&e.reg.db)) or_return
+	g := UNCLEAN_REGISTRY
+	if err := omap.txn_put(t, ROOT_SPACES, g[:], g[:]); err != .None {
+		omap.txn_abort(t)
+		return _oerr(err)
+	}
+	return _reg_commit(e, t)
+}
+
+@(private)
+_unclean_mark_spaces :: proc(e: ^Engine) -> Error {
+	if pack.unclean(&e.pk) {
+		t := _oerr2_txn(omap.txn_begin(&e.reg.db)) or_return
+		for id in _sorted_keys(e.spaces) {
+			k := _unclean_key(id)
+			g := [1]u8{UNCLEAN_TAG}
+			if err := omap.txn_put(t, ROOT_SPACES, k[:], g[:]); err != .None {
+				omap.txn_abort(t)
+				return _oerr(err)
+			}
+		}
+		_reg_commit(e, t) or_return
+		pack.hold_unclean(&e.pk, false)
+	}
+	for id in e.spaces {
+		k := _unclean_key(id)
+		if _, found, err := omap.db_get(&e.reg.db, ROOT_SPACES, k[:], context.temp_allocator); err != .None {
+			return _oerr(err)
+		} else if found {
+			e.reg.unclean[id] = true
+		}
+	}
+	return .None
+}
+
+@(private)
+_unclean_settle :: proc(e: ^Engine, sp: ^Space) {
+	if !e.reg.unclean[sp.id] {
+		return
+	}
+	if (!sp.keyless && !e.reg.cat_done[sp.id]) || !e.rlog.scanned[sp.id] {
+		return
+	}
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		_reg_fail(e, _oerr(terr))
+		return
+	}
+	k := _unclean_key(sp.id)
+	if _, derr := omap.txn_delete(t, ROOT_SPACES, k[:]); derr != .None {
+		omap.txn_abort(t)
+		_reg_fail(e, _oerr(derr))
+		return
+	}
+	if _reg_commit(e, t) == .None {
+		delete_key(&e.reg.unclean, sp.id)
+	}
+}
+
+@(private)
+_registry_recover :: proc(e: ^Engine) -> Error {
+	g := UNCLEAN_REGISTRY
+	if _, marked, merr := omap.db_get(&e.reg.db, ROOT_SPACES, g[:], context.temp_allocator); merr != .None {
+		return _oerr(merr)
+	} else if !marked {
 		return .None
 	}
 	fixes := make([dynamic]Reg_Fix, context.temp_allocator)
 	_reg_audit(e, &fixes, nil) or_return
-	if len(fixes) == 0 {
-		return .None
-	}
 	t := _oerr2_txn(omap.txn_begin(&e.reg.db)) or_return
+	if _, derr := omap.txn_delete(t, ROOT_SPACES, g[:]); derr != .None {
+		omap.txn_abort(t)
+		return _oerr(derr)
+	}
 	for &f in fixes {
 		err: omap.Error
 		if f.del {
@@ -244,7 +324,9 @@ _registry_recover :: proc(e: ^Engine) -> Error {
 		}
 	}
 	_reg_commit(e, t) or_return
-	e.reg.meta = true
+	if len(fixes) > 0 {
+		e.reg.meta = true
+	}
 	return .None
 }
 
