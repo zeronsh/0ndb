@@ -115,6 +115,8 @@ Disk :: struct {
 	wall:      proc(data: rawptr) -> i64,
 	wall_data: rawptr,
 	crash_at:  u64,
+	crash_on_trunc: string,
+	force_process: bool,
 	force_ghost: bool,
 	dead:      bool,
 	fail_sync: u64,
@@ -880,6 +882,11 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	n.mtime_ns = _now(d)
 	of.wrote = true
 	_event(d, of.path)
+	if len(d.crash_on_trunc) > 0 && size == 0 && strings.has_suffix(of.path, d.crash_on_trunc) {
+		d.crash_on_trunc = ""
+		d.crash_at = d.stats.ops + 1
+		d.force_process = true
+	}
 	return .None
 }
 

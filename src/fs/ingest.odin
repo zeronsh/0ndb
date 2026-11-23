@@ -1255,7 +1255,37 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			c.actor = {}
 		}
 	}
+	if p.full && len(m.attrib_chain) > 0 {
+		attrib_chain_settle(p)
+	}
 	return .None
+}
+
+@(private)
+attrib_chain_settle :: proc(p: ^Pass) {
+	m := p.m
+	keep := make(map[string]bool, context.temp_allocator)
+	for c in p.changes {
+		keep[c.path] = true
+	}
+	for r in p.young {
+		keep[r] = true
+	}
+	for r in p.holding {
+		keep[r] = true
+	}
+	for h in p.held {
+		keep[h.path] = true
+	}
+	drop := make([dynamic]string, context.temp_allocator)
+	for k in m.attrib_chain {
+		if !keep[k] {
+			append(&drop, k)
+		}
+	}
+	for k in drop {
+		attrib_chain_drop(m, k)
+	}
 }
 
 @(private)

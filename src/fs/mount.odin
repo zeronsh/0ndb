@@ -1275,7 +1275,7 @@ attrib_chain_drop :: proc(m: ^Mount, path: string) {
 
 @(private)
 attrib_covered :: proc(m: ^Mount, img: ^Mount_Image) -> bool {
-	if len(img.attrib) != len(m.attrib) {
+	if img.chained || len(m.attrib_chain) > 0 || len(img.attrib) != len(m.attrib) {
 		return false
 	}
 	for k, a in m.attrib {
@@ -1828,6 +1828,7 @@ Mount_Image :: struct {
 	adopt_pending: bool,
 	attrib:     map[string]Attrib,
 	log_at:     i64,
+	chained:    bool,
 }
 
 Mount_Wait :: struct {
@@ -1852,7 +1853,8 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 		key, _ := clone_string(k, m.allocator)
 		img.attrib[key] = a
 	}
-	img.log_at = m.log_len
+	img.chained = len(m.attrib_chain) > 0
+	img.log_at = m.log_at if img.chained else m.log_len
 }
 
 @(private)
