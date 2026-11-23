@@ -509,11 +509,11 @@ _flush_begin :: proc(pr: ^Pass_Run, final: bool) -> Error {
 @(private)
 _flush_step :: proc(pr: ^Pass_Run) -> (done: bool, err: Error) {
 	p := &pr.p
-	step := PASS_CHUNK
+	cap := PASS_CHUNK
 	if p.budget > 0 {
-		step = SLICE_COMMIT
+		cap = SLICE_COMMIT
 		if p.m.reg != nil && p.m.reg.slice_commit > 0 {
-			step = p.m.reg.slice_commit
+			cap = p.m.reg.slice_commit
 		}
 	}
 	did := false
@@ -522,6 +522,11 @@ _flush_step :: proc(pr: ^Pass_Run) -> (done: bool, err: Error) {
 			return false, .None
 		}
 		did = true
+		step := cap
+		if p.budget > 0 {
+			left := max(p.budget - p.m.slice_spent, 0)
+			step = clamp(int(left / (SLICE_COST_OPEN + SLICE_COST_STAT)), 1, cap)
+		}
 		u := pr.units[pr.ui]
 		hi := min(pr.uo + step, len(u.idx))
 		marker := u.marker if pr.uo == 0 else nil
