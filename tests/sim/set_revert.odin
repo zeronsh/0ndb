@@ -655,7 +655,11 @@ _sr_crash_case :: proc(w: ^World, unrevert: bool, k: u64) -> (pre, post: map[str
 	}
 	{
 		context = instance_context(&n.inst)
-		if unrevert {
+		if env_u64("SR_TW", 0) != 0 {
+			cur, _ := eng.tree_read(&n.e, c.tree, "b.txt", context.temp_allocator, {})
+			nb := strings.concatenate({string(cur), "<tw1>\n<tw2>\n"}, context.temp_allocator)
+			eng.tree_write(&n.e, c.tree, "b.txt", transmute([]u8)nb)
+		} else if unrevert {
 			fs.mount_unrevert(c.sm.m, revert)
 		} else {
 			fs.mount_revert_set(c.sm.m, base, []prim.Id{c.actor[.In]})
@@ -686,6 +690,7 @@ _sr_crash_world :: proc(seed: u64) -> ^World {
 	cfg.byzantine = false
 	cfg.bulk = false
 	cfg.mem_max = 1500
+	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
 	return w
@@ -719,7 +724,11 @@ set_revert_crash :: proc(t: ^testing.T) {
 				bad += 1
 				continue
 			}
+			only := env_u64("SR_CRASH_K", 0)
 			for k in u64(1) ..= 4000 {
+				if only != 0 && k != only {
+					continue
+				}
 				w := _sr_crash_world(seed)
 				pre, got, crashed, cok := _sr_crash_case(w, unrevert, k)
 				if cok && !_sr_same(got, pre) && !_sr_same(got, ref) {
@@ -748,7 +757,7 @@ set_revert_crash :: proc(t: ^testing.T) {
 				}
 				world_destroy(w)
 				free(w)
-				if !crashed {
+				if !crashed || only != 0 {
 					break
 				}
 				points[1 if unrevert else 0] += 1
