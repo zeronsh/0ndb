@@ -282,17 +282,24 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 		p.dirsync_pending = false
 	}
 	next := -1
+	p.committing = true
+	defer p.committing = false
 	if _log_tail(p) + 64 >= p.opts.container_size || _active_garbage(p) {
-		idx, nerr := _new_container(p, true)
-		if nerr != .None {
-			return false, _poison(p, nerr)
+		if !p.has_spare {
+			_spare_ensure(p)
 		}
-		next = idx
-		p.fl.newc_fd = p.conts[idx].fd
-		p.fl.dirsync = true
-		nb: [4]u8
-		prim.put_u32le(nb[:], p.conts[idx].id)
-		_log_raw(p, R_NEXT, nb[:]) or_return
+		if p.has_spare {
+			append(&p.conts, p.spare)
+			p.has_spare = false
+			p.spare = {}
+			idx := len(p.conts) - 1
+			next = idx
+			p.fl.newc_fd = p.conts[idx].fd
+			p.fl.dirsync = true
+			nb: [4]u8
+			prim.put_u32le(nb[:], p.conts[idx].id)
+			_log_raw(p, R_NEXT, nb[:]) or_return
+		}
 	}
 	pos := _log_alloc(p, REC_HDR + COMMIT_BODY) or_return
 	_commit_record(p.buf[pos:], p.seq, p.nrec, p.hh, p.dh)
@@ -324,6 +331,7 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 	if next >= 0 {
 		p.active = next
 		p.buf_base = CONT_HDR
+		p.alloc_end = p.spare_alloc
 	}
 	p.group_start = p.buf_base
 	return true, .None
