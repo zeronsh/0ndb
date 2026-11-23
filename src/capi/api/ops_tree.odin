@@ -3,6 +3,7 @@ package api
 import "core:strings"
 import "../../crdt"
 import eng "../../engine"
+import rt "../../runtime"
 import "../../fs"
 import "../../prim"
 
@@ -49,6 +50,11 @@ mount_open :: proc(a: ^Api, ob: Object, root: string) -> (m: ^Mounted, st: Statu
 	}
 	if perr := prim.mkdir_all(prim.os_vfs(), clean, 0o755); perr != .None {
 		return nil, .Io
+	}
+	if a.r != nil {
+		if reg, rerr := eng.registry(a.e); rerr == .None {
+			fs.registry_set_spawner(reg, rt.fs_spawner(a.r))
+		}
 	}
 	fm, err := eng.tree_mount(a.e, ob, clean)
 	if err != .None {
