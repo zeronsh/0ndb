@@ -399,7 +399,12 @@ _cu_undo_write :: proc(e: ^Engine, o: Object, undo: prim.Id, msg: Rid, phase: co
 _cu_durable :: proc(e: ^Engine, h: ^Handle) -> Error {
 	_oerr(convo.writer_commit(&h.cw)) or_return
 	_handle_mark(h)
-	return .None
+	st, serr := _convo_status(e, Object{h.sp.id, h.id})
+	fmt.eprintfln("DBGMOVE status after commit %v %v", serr, st.head)
+	if e.in_tick {
+		return .None
+	}
+	return flush(e)
 }
 
 @(private)
