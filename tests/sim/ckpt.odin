@@ -134,7 +134,7 @@ _ck_step :: proc(w: ^World, n: ^Node) {
 			i += 1
 			continue
 		}
-		if loaded {
+		if loaded && w.cfg.crash_rate > 0 {
 			stat_add(w, STAT_CK_LOADS)
 			world_note(w, "%s loaded checkpoint of %s; next object sync crashes", n.name, id_short(w.model.objs[x.obj].o.id))
 			n.disk.blob_crash = 1
