@@ -14,6 +14,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	fullsync   = _os_fullsync,
 	truncate   = _os_truncate,
 	punch_hole = _os_punch_hole,
+	preallocate = _os_preallocate,
 	lock       = _os_lock,
 	fstat      = _os_fstat,
 	stat       = _os_stat,
@@ -273,6 +274,17 @@ _os_punch_hole :: proc(data: rawptr, fd: Fd, off: i64, size: i64) -> Error {
 			uintptr(off),
 			uintptr(size),
 		)
+		errno := linux.Errno(-int(ret)) if int(ret) < 0 else linux.Errno.NONE
+		if errno != .EINTR {
+			return _error(errno)
+		}
+	}
+}
+
+@(private)
+_os_preallocate :: proc(data: rawptr, fd: Fd, off: i64, size: i64) -> Error {
+	for {
+		ret := intrinsics.syscall(linux.SYS_fallocate, uintptr(fd), uintptr(FALLOC_FL_KEEP_SIZE), uintptr(off), uintptr(size))
 		errno := linux.Errno(-int(ret)) if int(ret) < 0 else linux.Errno.NONE
 		if errno != .EINTR {
 			return _error(errno)

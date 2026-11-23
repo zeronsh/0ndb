@@ -45,6 +45,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	barrier    = _os_barrier,
 	truncate   = _os_truncate,
 	punch_hole = _os_punch_hole,
+	preallocate = _os_preallocate,
 	lock       = _os_lock,
 	fstat      = _os_fstat,
 	stat       = _os_stat,
@@ -328,6 +329,50 @@ _os_truncate :: proc(data: rawptr, fd: Fd, size: i64) -> Error {
 			return _error(e)
 		}
 	}
+}
+
+@(private)
+F_PREALLOCATE :: 42
+@(private)
+F_ALLOCATECONTIG :: 0x2
+@(private)
+F_ALLOCATEALL :: 0x4
+@(private)
+F_PEOFPOSMODE :: 3
+
+@(private)
+Fstore :: struct {
+	fst_flags:      u32,
+	fst_posmode:    c.int,
+	fst_offset:     posix.off_t,
+	fst_length:     posix.off_t,
+	fst_bytesalloc: posix.off_t,
+}
+
+@(private)
+_os_preallocate :: proc(data: rawptr, fd: Fd, off: i64, size: i64) -> Error {
+	st: posix.stat_t
+	if posix.fstat(posix.FD(fd), &st) != .OK {
+		return _errno()
+	}
+	have := i64(st.st_blocks) * 512
+	need := off + size - have
+	if need <= 0 {
+		return .None
+	}
+	fs := Fstore {
+		fst_flags   = F_ALLOCATECONTIG | F_ALLOCATEALL,
+		fst_posmode = F_PEOFPOSMODE,
+		fst_length  = posix.off_t(need),
+	}
+	if posix.fcntl(posix.FD(fd), posix.FCNTL_Cmd(F_PREALLOCATE), &fs) != -1 {
+		return .None
+	}
+	fs.fst_flags = F_ALLOCATEALL
+	if posix.fcntl(posix.FD(fd), posix.FCNTL_Cmd(F_PREALLOCATE), &fs) == -1 {
+		return _errno()
+	}
+	return .None
 }
 
 @(private)

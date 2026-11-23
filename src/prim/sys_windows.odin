@@ -249,6 +249,10 @@ FileRenameInfo :: 3
 @(private)
 FileDispositionInfo :: 4
 @(private)
+FileStandardInfo :: 1
+@(private)
+FileAllocationInfo :: 5
+@(private)
 FileEndOfFileInfo :: 6
 @(private)
 FileAttributeTagInfo :: 9
@@ -431,6 +435,15 @@ File_Basic_Info :: struct {
 	last_write:  i64,
 	change:      i64,
 	attributes:  u32,
+}
+
+@(private)
+File_Standard_Info :: struct {
+	allocation_size: i64,
+	end_of_file:     i64,
+	number_of_links: u32,
+	delete_pending:  b8,
+	directory:       b8,
 }
 
 @(private)
