@@ -1374,7 +1374,10 @@ concurrent typing is never lost or reverted.
   draw on. Background and derived writes (compaction, index flushes, map
   tables, the registry log, registry marks) are refused before they change
   anything and retried on the next write or data change, never by a timer.
-  Only Corrupt or a broken invariant is fatal.
+  A create that fails undoes its own bit only while its segment does not
+  exist; once the writer is open the own bit stays, and registry entries
+  that could not be stored stay staged until the next flush. Only Corrupt
+  or a broken invariant is fatal.
 - Preallocation does not make a later flush safe. On APFS a write into a
   preallocated range on a full volume succeeds and its datasync then fails
   with No_Space (measured: a 64 MiB image, 4 MiB preallocated, the volume
@@ -1384,7 +1387,9 @@ concurrent typing is never lost or reverted.
   and is resubmitted unchanged ahead of any new commit, and every retry
   first resyncs each fd the job touches: a failed fsync may already have
   dropped those pages, and the next fsync would succeed with nothing
-  written. Reservation only refuses early; the resync-then-retry is what
+  written. A parked job is never reported durable: every synchronous wait
+  returns its error, the engine requeues the batch that waited on it, and
+  merge and compaction wait for it rather than replace it. Reservation only refuses early; the resync-then-retry is what
   guarantees nothing acknowledged is lost. A flush keeps its memtable and
   snapshot across retries, so a checkpoint never names entries it did not
   flush.

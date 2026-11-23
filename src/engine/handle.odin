@@ -416,6 +416,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	adopted := h.w_open
 	h.w_open = true
 	h.own = true
+	set_own = false
 	if !adopted {
 		h.published = 0
 	}
@@ -436,7 +437,9 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	if h.own_tree != nil {
 		_pending_set(e, h.sp.id, h.id, 0)
 	}
-	_registry_flush(e) or_return
+	if ferr := _registry_flush(e); ferr != .None && !_storage_soft(e, ferr, "an object's registry entry could not be stored: the disk is full or failing; it is retried on the next change") {
+		return ferr
+	}
 	_handle_mark(h)
 	if h.id != h.sp.catalog {
 		_catalog_participant(e, h.sp, h.id, h.kind)
