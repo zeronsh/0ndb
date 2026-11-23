@@ -496,7 +496,7 @@ _cont_deleted :: proc(p: ^Pack, id: u32) {
 @(private)
 _collect_externals :: proc(p: ^Pack) -> Error {
 	dirty := make([dynamic]^Open_Inode, context.temp_allocator)
-	for _, oi in p.open_inodes {
+	for _, oi in prim.unordered(p.open_inodes) {
 		if oi.dirty && oi.real_fd >= 0 {
 			append(&dirty, oi)
 		}
@@ -832,7 +832,7 @@ _advance :: proc(p: ^Pack) -> Error {
 
 @(private)
 _ext_open_dirty :: proc(p: ^Pack) -> bool {
-	for _, oi in p.open_inodes {
+	for _, oi in prim.unordered(p.open_inodes) {
 		if oi.dirty && oi.real_fd >= 0 {
 			return true
 		}
@@ -937,7 +937,7 @@ _fail_waiters :: proc(p: ^Pack, err: Error) {
 
 @(private)
 _unpin_real :: proc(p: ^Pack, fd: prim.Fd) {
-	for _, oi in p.open_inodes {
+	for _, oi in prim.unordered(p.open_inodes) {
 		if oi.real_fd == fd && oi.pinned > 0 {
 			oi.pinned -= 1
 			return

@@ -325,7 +325,11 @@ _obj_finish :: proc(r: ^Replicator, j: ^Obj_Job, kind: Repl_Event_Kind, err: Err
 @(private)
 _obj_unmap :: proc(m: ^map[Object_Key]Part_Ref, j: ^Obj_Job) {
 	gone := make([dynamic]Object_Key, context.temp_allocator)
-	for k, ref in m {
+	for k in prim.sorted_keys(m^) {
+		if k not_in m^ {
+			continue
+		}
+		ref := m^[k]
 		if ref.job == j {
 			append(&gone, k)
 		}

@@ -241,7 +241,11 @@ mem_ahead :: proc(ix: ^Index) -> bool {
 	if ix.opts.durable == nil {
 		return false
 	}
-	for src, p in ix.mem.sources {
+	for src in prim.sorted_keys(ix.mem.sources) {
+		if src not_in ix.mem.sources {
+			continue
+		}
+		p := ix.mem.sources[src]
 		if p > ix.opts.durable(ix.opts.durable_data, src) {
 			return true
 		}

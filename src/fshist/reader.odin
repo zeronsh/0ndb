@@ -90,7 +90,7 @@ reader_init :: proc(r: ^Reader, history: prim.Id, streams: Stream_Source, blobs:
 }
 
 reader_destroy :: proc(r: ^Reader) {
-	for _, f in r.files {
+	for _, f in prim.unordered(r.files) {
 		file_drop(r, f)
 	}
 	delete(r.files)
@@ -722,7 +722,7 @@ file_get :: proc(r: ^Reader, inode: fstree.Inode_Id) -> (f: ^File, err: Error) {
 
 @(private)
 texts_drop :: proc(r: ^Reader) {
-	for _, f in r.files {
+	for _, f in prim.unordered(r.files) {
 		text_drop(&f.st)
 	}
 }

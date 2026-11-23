@@ -1,5 +1,7 @@
 package sim
 
+import "../../src/prim"
+
 import "../../src/journal"
 import osync "../../src/sync"
 
@@ -18,12 +20,20 @@ check_kwait :: proc(w: ^World) {
 }
 
 check_kwait_repl :: proc(w: ^World, n: ^Node, r: ^osync.Replicator) {
-	for _, rm in r.remotes {
+	for mk3_ in prim.sorted_keys(r.remotes) {
+		if mk3_ not_in r.remotes {
+			continue
+		}
+		rm := r.remotes[mk3_]
 		if rm.keys_wait && !rm.quarantined && _keys_complete(r, rm) {
 			world_fail(w, "kwait: %s still waits on keys for %s of device %s although it holds that writer's whole keys stream and keys head", n.name, rm.name, id_short(rm.device))
 		}
 	}
-	for _, rm in r.remotes {
+	for mk2_ in prim.sorted_keys(r.remotes) {
+		if mk2_ not_in r.remotes {
+			continue
+		}
+		rm := r.remotes[mk2_]
 		if !rm.keys_wait || rm.kwait_head == {} || rm.quarantined {
 			continue
 		}
@@ -51,7 +61,11 @@ _keys_complete :: proc(r: ^osync.Replicator, rm: ^osync.Remote) -> bool {
 		return false
 	}
 	keys, head := false, false
-	for _, x in r.remotes {
+	for mk1_ in prim.sorted_keys(r.remotes) {
+		if mk1_ not_in r.remotes {
+			continue
+		}
+		x := r.remotes[mk1_]
 		if x.device != rm.device || x.relay_len <= 0 || journal.replica_length(&x.rep) != x.relay_len {
 			continue
 		}

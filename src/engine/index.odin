@@ -674,7 +674,7 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 		return 1, false
 	}
 	ids := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
-	for id in touched {
+	for id in prim.sorted_keys(touched) {
 		append(&ids, id)
 	}
 	slice.sort_by(ids[:], proc(a, b: fstree.Inode_Id) -> bool {

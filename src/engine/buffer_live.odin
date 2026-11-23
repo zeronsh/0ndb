@@ -794,7 +794,11 @@ _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 		return
 	}
 	h: ^Handle
-	for _, x in e.handles {
+	for mk1_ in prim.sorted_keys(e.handles) {
+		if mk1_ not_in e.handles {
+			continue
+		}
+		x := e.handles[mk1_]
 		if x.sp == sp && (x.kind == .Text || x.kind == .File_Tree) && osync.stream_id(&x.scope, dev, x.name, 0) == ev.stream {
 			h = x
 			break

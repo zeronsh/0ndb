@@ -371,7 +371,11 @@ _draft_settle :: proc(e: ^Engine, object: prim.Id, length: i64) {
 @(private)
 _draft_handle_by_stream :: proc(e: ^Engine, sp: ^Space, id: osync.Stream_Id) -> (h: ^Handle, device: prim.Id, own: bool) {
 	dev := osync.stream_device(id)
-	for _, x in e.handles {
+	for mk2_ in prim.sorted_keys(e.handles) {
+		if mk2_ not_in e.handles {
+			continue
+		}
+		x := e.handles[mk2_]
 		if x.sp != sp || x.kind != .Conversation {
 			continue
 		}
@@ -567,7 +571,11 @@ _draft_catch_up :: proc(e: ^Engine, h: ^Handle, device: prim.Id) {
 
 @(private)
 _drafts_reconnected :: proc(e: ^Engine, sp: ^Space) {
-	for _, h in e.handles {
+	for mk1_ in prim.sorted_keys(e.handles) {
+		if mk1_ not_in e.handles {
+			continue
+		}
+		h := e.handles[mk1_]
 		if h.sp != sp || h.kind != .Conversation {
 			continue
 		}

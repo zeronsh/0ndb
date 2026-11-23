@@ -22,7 +22,11 @@ _on_direct_event :: proc(r: ^Replicator, ev: ^Event) {
 }
 
 replicator_present :: proc(r: ^Replicator, out: ^[dynamic]Device_Id) {
-	for d, p in r.presence {
+	for d in prim.sorted_keys(r.presence) {
+		if d not_in r.presence {
+			continue
+		}
+		p := r.presence[d]
 		if p.up {
 			append(out, d)
 		}

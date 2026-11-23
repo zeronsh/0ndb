@@ -50,7 +50,11 @@ _pentry_free :: proc(t: ^Tree, e: ^Pentry) {
 
 @(private)
 _pcache_destroy :: proc(t: ^Tree) {
-	for _, e in t.pc.procs {
+	for mk2_ in prim.sorted_keys(t.pc.procs) {
+		if mk2_ not_in t.pc.procs {
+			continue
+		}
+		e := t.pc.procs[mk2_]
 		_pentry_free(t, e)
 	}
 	delete(t.pc.procs)
@@ -94,7 +98,7 @@ _pcache_trim :: proc(t: ^Tree) {
 	pfds := make([]Pollfd, len(t.pc.procs), context.temp_allocator)
 	keys := make([]prim.Pid, len(t.pc.procs), context.temp_allocator)
 	i := 0
-	for k, e in t.pc.procs {
+	for k, e in prim.unordered(t.pc.procs) {
 		pfds[i] = Pollfd{fd = e.pidfd, events = POLLIN}
 		keys[i] = k
 		i += 1
@@ -107,7 +111,11 @@ _pcache_trim :: proc(t: ^Tree) {
 		}
 	}
 	if len(t.pc.procs) >= PCACHE_MAX {
-		for _, e in t.pc.procs {
+		for mk1_ in prim.sorted_keys(t.pc.procs) {
+			if mk1_ not_in t.pc.procs {
+				continue
+			}
+			e := t.pc.procs[mk1_]
 			_pentry_free(t, e)
 		}
 		clear(&t.pc.procs)
@@ -178,7 +186,11 @@ _pcache_lineage :: proc(t: ^Tree, tgid: prim.Pid, root: prim.Pid) -> ([]prim.Pid
 
 @(private)
 _pcache_drop_cwds :: proc(t: ^Tree) {
-	for _, e in t.pc.procs {
+	for mk1_ in prim.sorted_keys(t.pc.procs) {
+		if mk1_ not_in t.pc.procs {
+			continue
+		}
+		e := t.pc.procs[mk1_]
 		_sys_close(e.cwd)
 		e.cwd = -1
 	}

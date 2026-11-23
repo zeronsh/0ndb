@@ -239,7 +239,11 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 			omap.cursor_destroy(&cur)
 		}
 	}
-	for k, v in e.reg.staged {
+	for k in prim.sorted_keys(e.reg.staged) {
+		if k not_in e.reg.staged {
+			continue
+		}
+		v := e.reg.staged[k]
 		if rec, rerr := _rec_decode(v, context.temp_allocator); rerr == .None && rec.space == id {
 			objs[k] = true
 		}
@@ -347,7 +351,7 @@ _index_purge_ids :: proc(e: ^Engine, objs: map[prim.Id]bool) {
 	if !e.cfg.search || _index_open(e) != .None {
 		return
 	}
-	for object in objs {
+	for object in prim.sorted_keys(objs) {
 		src := _source_id(object, e.self)
 		pos, _ := search.position(&e.index, src)
 		search.delete_object(&e.index, src, pos, object)

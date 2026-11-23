@@ -1297,7 +1297,7 @@ _orch_redact :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
 @(private)
 _sorted_inodes :: proc(set: map[fstree.Inode_Id]bool) -> []fstree.Inode_Id {
 	out := make([dynamic]fstree.Inode_Id, 0, len(set), context.temp_allocator)
-	for ino in set {
+	for ino in prim.sorted_keys(set) {
 		append(&out, ino)
 	}
 	for i in 1 ..< len(out) {

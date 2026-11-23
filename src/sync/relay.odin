@@ -896,7 +896,11 @@ _source_leave :: proc(r: ^Relay, src: [16]u8) {
 _source_sweep :: proc(r: ^Relay, now: i64) {
 	burst := i64(r.cfg.source_burst) * 1_000_000
 	gone := make([dynamic][16]u8, context.temp_allocator)
-	for k, s in r.sources {
+	for k in prim.sorted_keys(r.sources) {
+		if k not_in r.sources {
+			continue
+		}
+		s := r.sources[k]
 		refilled := min(burst, s.tokens + (now - s.last) / 1000 * i64(r.cfg.source_rate))
 		if s.conns == 0 && refilled >= burst {
 			append(&gone, k)

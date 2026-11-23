@@ -475,7 +475,7 @@ cipher_scan_relay :: proc(w: ^World) {
 	r := &rn.r
 	st := r.store
 	spaces := make([dynamic]prim.Id, context.temp_allocator)
-	for id in r.spaces {
+	for id in prim.sorted_keys(r.spaces) {
 		append(&spaces, id)
 	}
 	slice.sort_by(spaces[:], id_less)

@@ -162,7 +162,7 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 	events := make(map[fstree.Inode_Id]^Inode_Events, context.temp_allocator)
 	collect_revert_events(h, &ctx, &events) or_return
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
-	for ino, ev in events {
+	for ino, ev in prim.unordered(events) {
 		if ev.has_in != {} {
 			touched[ino] = true
 		}
