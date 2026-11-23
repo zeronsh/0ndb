@@ -932,6 +932,34 @@ _replica_covers :: proc(rep: ^journal.Replica, n: i64) -> bool {
 }
 
 @(private)
+WAIT_CHUNK :: i64(64 * 1024)
+
+@(private)
+_wait_fetch :: proc(h: ^Handle, sg: ^Seg, n: i64) {
+	gap: journal.Range
+	found := false
+	at: i64
+	for r in journal.replica_have(sg.rep) {
+		if r.from > at && r.from <= n {
+			gap = {at, r.from}
+			found = true
+		}
+		at = max(at, r.to)
+	}
+	if at < n {
+		gap = {at, n}
+		found = true
+	}
+	if !found {
+		return
+	}
+	want := [1]journal.Range{{max(gap.from, gap.to - WAIT_CHUNK), gap.to}}
+	if osync.replicator_want(&h.sp.repl, &h.scope, sg.device, h.name, 0, want[:]) == .None {
+		h.e.stats.fetches += 1
+	}
+}
+
+@(private)
 _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tries := 0) -> Error {
 	if ready.fresh && cmd == nil && _fresh_link(h) && (h.sp.offline || !_link_possible(e, h.sp)) {
 		for s in h.segs {
@@ -949,7 +977,12 @@ _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tri
 				break
 			}
 			n := osync.replicator_relay_length(&h.sp.repl, &h.scope, sg.device, h.name, 0)
-			if n < 0 || !_replica_covers(sg.rep, n) {
+			if n < 0 {
+				fetched = true
+				break
+			}
+			if !_replica_covers(sg.rep, n) {
+				_wait_fetch(h, sg, n)
 				fetched = true
 				break
 			}
