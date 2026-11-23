@@ -2049,7 +2049,7 @@ mount_ack :: proc(m: ^Mount) -> Error {
 save_mount_state :: proc(m: ^Mount) -> Error {
 	img := &m.img
 	synced := m.img.synced[:]
-	if shadow_attached(&m.shadow) && shadow_dirty(&m.shadow) && m.saved_synced != nil {
+	if shadow_attached(&m.shadow) && m.shadow.owed && shadow_dirty(&m.shadow) && m.saved_synced != nil {
 		synced = m.saved_synced[:]
 	}
 	buf := make([dynamic]u8, context.temp_allocator)
