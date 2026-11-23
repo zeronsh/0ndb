@@ -1832,7 +1832,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		return .None
 	}
 	if d.kind == .File && e.kind == .Symlink && !mount_symlinks(m) {
-		if d.stat == e.stat {
+		if stat_clean(d.stat, e) {
 			return .None
 		}
 		abuf: prim.Path_Buf
@@ -1854,7 +1854,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		mark_seen(p, rel)
 		compare_dir(p, rel) or_return
 	case d.kind == .File:
-		if d.stat != e.stat {
+		if !stat_clean(d.stat, e) {
 			if mount_held_by(m, rel, p.scope_of[rel]) {
 				append(&p.holding, clone_string(rel, p.long) or_else "")
 				return .None
@@ -2203,7 +2203,7 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 		}
 		dk, _ := delete_key(&names, k.name)
 		delete(dk, heap)
-		if ls.has_stat && ls.kind == .File && k.entry.kind == .File && ls.size == k.entry.stat.size && ls.mtime_ns == k.entry.stat.mtime_ns && ls.ctime_ns == k.entry.stat.ctime_ns && ls.ino == k.entry.stat.ino {
+		if ls.has_stat && ls.kind == .File && k.entry.kind == .File && !k.entry.racy && ls.size == k.entry.stat.size && ls.mtime_ns == k.entry.stat.mtime_ns && ls.ctime_ns == k.entry.stat.ctime_ns && ls.ino == k.entry.stat.ino {
 			continue
 		}
 		dp := Probe{kind = .Dir}
@@ -2216,7 +2216,7 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 			err := compare_dir_deep(p, c, cwd)
 			delete(c, heap)
 			err or_return
-		} else if dp.kind == .File && k.entry.kind == .File && dp.stat == k.entry.stat {
+		} else if dp.kind == .File && k.entry.kind == .File && stat_clean(dp.stat, k.entry) {
 			continue
 		} else {
 			collect_path(p, child, true) or_return
@@ -2408,7 +2408,7 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 			shadow_remove(&m.shadow, c.moved) or_return
 			e := c.old
 			shadow_put(&m.shadow, c.path, e) or_return
-			if c.disk == .File && c.stat != c.old.stat {
+			if c.disk == .File && !stat_clean(c.stat, c.old) {
 				return emit_modify(p, b, c, e)
 			}
 			if c.disk == .Symlink {
@@ -2424,7 +2424,7 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 				e.stat = c.stat
 				return shadow_put(&m.shadow, c.path, e)
 			}
-			if c.disk == .File && c.stat == c.old.stat {
+			if c.disk == .File && stat_clean(c.stat, c.old) {
 				return .None
 			}
 		}

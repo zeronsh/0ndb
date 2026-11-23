@@ -394,6 +394,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	remote_init(w)
 	w.relay.w = w
 	disk_init(&w.relay.disk, "relay", w.allocator)
+	w.relay.disk.ghost_root = RELAY_DIR
 	w.relay.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -5_000_000_000, 5_000_000_000)}
 	w.relay.disk.wall = clock_wall
 	w.relay.disk.wall_data = &w.relay.clock
@@ -403,6 +404,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.idx = i
 		n.name = fmt.aprintf("n%d", i, allocator = w.allocator)
 		disk_init(&n.disk, n.name, w.allocator)
+		n.disk.ghost_root = NODE_DIR
 		n.clock = Node_Clock{w = w, mono_off = rng_range(&w.rng, 0, 1 << 40), wall_off = rng_range(&w.rng, -30_000_000_000, 30_000_000_000)}
 		n.disk.verbose = cfg.verbose && !cfg.quiet
 		n.disk.fail_rate = cfg.io_rate

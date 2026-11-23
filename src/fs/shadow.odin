@@ -34,6 +34,7 @@ Entry :: struct {
 	stat:   Stat,
 	oid:    odb.Oid,
 	synced: u64,
+	racy:   bool,
 }
 
 Shadow_Child :: struct {
@@ -75,6 +76,7 @@ Rec :: struct {
 }
 
 Shadow :: struct {
+	clock:      Clock,
 	hold:       bool,
 	owed:       bool,
 	txn:        bool,
@@ -297,7 +299,25 @@ shadow_put :: proc(s: ^Shadow, path: string, e: Entry) -> Error {
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
-	return pending_set(s, path, false, e)
+	return pending_set(s, path, false, racy_mark(s, e))
+}
+
+@(private = "file")
+racy_mark :: proc(s: ^Shadow, e: Entry) -> Entry {
+	ne := e
+	if ne.kind == .File && s.clock.wall_ms != nil {
+		ne.racy = stat_racy(ne.stat, s.clock.wall_ms(s.clock.data) * 1_000_000)
+	}
+	return ne
+}
+
+stat_racy :: proc "contextless" (st: Stat, now_ns: i64) -> bool {
+	tick := i64(2_000_000_000) if st.mtime_ns % 1_000_000_000 == 0 else i64(100_000_000)
+	return st.mtime_ns + tick > now_ns || st.ctime_ns + tick > now_ns
+}
+
+stat_clean :: proc "contextless" (st: Stat, e: Entry) -> bool {
+	return st == e.stat && !e.racy
 }
 
 shadow_remove :: proc(s: ^Shadow, path: string) -> Error {
@@ -321,7 +341,7 @@ shadow_append :: proc(s: ^Shadow, path: string, e: Entry) -> Error {
 	if aerr != nil {
 		return .No_Memory
 	}
-	if _, err := append(&s.pending, Pending_Rec{path = p, fresh = true, entry = e}); err != nil {
+	if _, err := append(&s.pending, Pending_Rec{path = p, fresh = true, entry = racy_mark(s, e)}); err != nil {
 		delete(p, s.allocator)
 		return .No_Memory
 	}
@@ -938,7 +958,7 @@ encode_rec :: proc(out: ^[dynamic]u8, off: u64, path: string, del: bool, e: Entr
 	resize(out, start + 8)
 	w := prim.writer(out)
 	prim.write_u8(&w, 2 if del else 1)
-	prim.write_u8(&w, 1 if linked else 0)
+	prim.write_u8(&w, (1 if linked else 0) | (2 if !del && e.racy else 0))
 	prim.write_str(&w, path)
 	if !del {
 		prim.write_uvarint(&w, u64(e.inode.actor))
@@ -1022,6 +1042,7 @@ decode_rec :: proc(body: []u8, oid_size: int) -> (r: Rec, err: Error) {
 		return {}, .Corrupt
 	}
 	r.linked = flags & 1 != 0
+	r.entry.racy = !r.del && flags & 2 != 0
 	if !r.del {
 		actor := prim.read_uvarint(&rd)
 		if actor > u64(max(u32)) {
