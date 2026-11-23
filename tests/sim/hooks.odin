@@ -7,6 +7,7 @@ import "core:slice"
 import "core:strings"
 import eng "../../src/engine"
 import "../../src/prim"
+import osync "../../src/sync"
 
 Final_Check :: proc(w: ^World)
 Restart_Hook :: proc(w: ^World, n: ^Node)
@@ -20,6 +21,7 @@ Op_Weight :: proc(w: ^World) -> int
 Op_Run :: proc(w: ^World, n: ^Node)
 Step_Hook :: proc(w: ^World, n: ^Node)
 Wait_Hook :: proc(w: ^World, n: ^Node)
+Commit_Hold_Hook :: proc(w: ^World, id: osync.Stream_Id, at: i64) -> bool
 
 STATS_MAX :: 256
 EV_EXT_BASE :: 128
@@ -93,6 +95,7 @@ Registry :: struct {
 	collects:     Table(Ordered(Collect_Hook), 64),
 	steps:        Table(Ordered(Step_Hook), 64),
 	waits:        Table(Ordered(Wait_Hook), 8),
+	commit_holds: Table(Ordered(Commit_Hold_Hook), 16),
 	ops:          Table(Ext_Op, 64),
 	stats:        Table(Stat_Def, STATS_MAX),
 	lines:        Table(Stat_Line, 64),
@@ -119,6 +122,7 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.collects.items[:reg.collects.n], by)
 	slice.stable_sort_by(reg.steps.items[:reg.steps.n], by)
 	slice.stable_sort_by(reg.waits.items[:reg.waits.n], by)
+	slice.stable_sort_by(reg.commit_holds.items[:reg.commit_holds.n], by)
 	slice.stable_sort_by(reg.engine_events.items[:reg.engine_events.n], by)
 	slice.stable_sort_by(reg.disk_reads.items[:reg.disk_reads.n], by)
 	slice.stable_sort_by(reg.filters.items[:reg.filters.n], by)
@@ -136,6 +140,8 @@ _sorted :: proc() {
 	_unique("world destroy", reg.destroys.items[:reg.destroys.n])
 	_unique("collect", reg.collects.items[:reg.collects.n])
 	_unique("step", reg.steps.items[:reg.steps.n])
+	_unique("wait point", reg.waits.items[:reg.waits.n])
+	_unique("commit hold", reg.commit_holds.items[:reg.commit_holds.n])
 	_unique("engine event", reg.engine_events.items[:reg.engine_events.n])
 	_unique("frame filter", reg.filters.items[:reg.filters.n])
 	_unique("disk read", reg.disk_reads.items[:reg.disk_reads.n])
@@ -196,8 +202,8 @@ register_step :: proc "contextless" (order: int, hook: Step_Hook, loc := #caller
 	_add(&reg.steps, Ordered(Step_Hook){order = order, call = hook, at = loc})
 }
 
-register_wait_point :: proc "contextless" (order: int, hook: Wait_Hook) {
-	_add(&reg.waits, Ordered(Wait_Hook){order, hook})
+register_wait_point :: proc "contextless" (order: int, hook: Wait_Hook, loc := #caller_location) {
+	_add(&reg.waits, Ordered(Wait_Hook){order = order, call = hook, at = loc})
 }
 
 run_wait_points :: proc(w: ^World, n: ^Node) {
@@ -208,6 +214,20 @@ run_wait_points :: proc(w: ^World, n: ^Node) {
 	for h in reg.waits.items[:reg.waits.n] {
 		h.call(w, n)
 	}
+}
+
+register_relay_commit_hold :: proc "contextless" (order: int, hook: Commit_Hold_Hook, loc := #caller_location) {
+	_add(&reg.commit_holds, Ordered(Commit_Hold_Hook){order = order, call = hook, at = loc})
+}
+
+relay_commit_held :: proc(w: ^World, id: osync.Stream_Id, at: i64) -> bool {
+	_sorted()
+	for x in reg.commit_holds.items[:reg.commit_holds.n] {
+		if x.call(w, id, at) {
+			return true
+		}
+	}
+	return false
 }
 
 register_event :: proc "contextless" (hook: Event_Hook) -> Ev_Kind {
