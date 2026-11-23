@@ -1019,14 +1019,13 @@ equal in both directions.
   bounded (one per conversation, mount and line, plus the ingestion actors),
   so a tool call is not an actor: a pass groups its changes by scope, and
   every scoped batch carries a sealed opaque op after its own ops, before the
-  commit mark (tag 23, version 1: the scope id and nothing else, so
-  redaction never touches it; at the end, it shifts no op id the pass
-  already gave out, and a batch with nothing else is not committed); applying it appends
-  `(first seq, op count, scope)` to `ss:<actor>`, and `history_scope_of(op)`
-  (engine `tree_scope_of`) finds an op's scope by a binary search there. A
-  change attributed through the attribution log takes the scope still open on
-  its path; one ingested after its scope closed keeps its actor without a
-  scope.
+  commit mark (tag 23, version 1: the scope id and nothing else, so redaction
+  never touches it; at the end, it shifts no op id the pass already gave out,
+  and a batch with nothing else is not committed); applying it appends `(first
+  seq, op count, scope)` to `ss:<actor>`, and `history_scope_of(op)` (engine
+  `tree_scope_of`) finds an op's scope by a binary search there. A change
+  attributed through the attribution log takes the scope still open on its
+  path; one ingested after its scope closed keeps its actor without a scope.
 - **Set revert** (`mount_revert_set(mount, base, actors)`) undoes, as one
   batch on the mount's line, every op after `base` whose actor is in the set,
   transformed through everything since. Ops carry actors, not scopes: undo
