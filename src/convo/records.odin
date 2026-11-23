@@ -256,6 +256,50 @@ Recorded :: struct {
 	msg:         Ref,
 }
 
+Undo_Line :: struct {
+	tree:   prim.Id,
+	line:   string,
+	base:   []u8,
+	actors: []prim.Id,
+}
+
+Undo :: struct {
+	id:    prim.Id,
+	msg:   Ref,
+	redo:  prim.Id,
+	phase: Undo_Phase,
+	set:   []Undo_Line,
+}
+
+Undone_Leaf :: struct {
+	conv: prim.Id,
+	leaf: Rid,
+}
+
+Undone_Revert :: struct {
+	tree:   prim.Id,
+	line:   string,
+	revert: prim.Id,
+}
+
+Undone :: struct {
+	undo:    prim.Id,
+	msg:     Ref,
+	leaves:  []Undone_Leaf,
+	reverts: []Undone_Revert,
+	kept:    []Line_Bind,
+	hidden:  []prim.Id,
+}
+
+Notice :: struct {
+	undo:  prim.Id,
+	from:  prim.Id,
+	kind:  Notice_Kind,
+	tree:  prim.Id,
+	line:  string,
+	paths: []string,
+}
+
 Body :: union {
 	Msg,
 	Block,
@@ -287,6 +331,9 @@ Body :: union {
 	Files,
 	Redact_Msg,
 	Hold,
+	Undo,
+	Undone,
+	Notice,
 }
 
 Record :: struct {
@@ -358,13 +405,19 @@ body_kind :: proc "contextless" (b: Body) -> Kind {
 		return .Spine
 	case Files:
 		return .Files
+	case Undo:
+		return .Undo
+	case Undone:
+		return .Undone
+	case Notice:
+		return .Notice
 	}
 	return Kind(0)
 }
 
 is_event_kind :: proc "contextless" (k: Kind) -> bool {
 	#partial switch k {
-	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded, .Spine, .Redact_Msg, .Hold:
+	case .Fork, .Remember, .Forks, .Assign, .Claim, .Queue, .Steer, .Edit_Queued, .Cancel, .Interrupt, .Answer, .Unqueue, .Superseded, .Landed, .Mount, .Unmount, .Compact, .Await, .Recorded, .Spine, .Redact_Msg, .Hold, .Undo, .Undone, .Notice:
 		return true
 	}
 	return false
@@ -626,6 +679,55 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 	case Hold:
 		obj.tw_str(w, 1, v.key)
 		obj.tw_str(w, 2, v.reason)
+	case Undo:
+		obj.tw_id(w, 1, v.id)
+		obj.tw_ref(w, 2, off, v.msg)
+		obj.tw_id(w, 3, v.redo)
+		obj.tw_uv(w, 4, u64(v.phase))
+		for l in v.set {
+			lb := make([dynamic]u8, context.temp_allocator)
+			lw := prim.writer(&lb)
+			obj.tw_id(&lw, 1, l.tree)
+			obj.tw_str(&lw, 2, l.line)
+			obj.tw_bytes(&lw, 3, l.base)
+			for a in l.actors {
+				obj.tw_id(&lw, 4, a)
+			}
+			_nested(w, 5, lb[:])
+		}
+	case Undone:
+		obj.tw_id(w, 1, v.undo)
+		obj.tw_ref(w, 2, off, v.msg)
+		for l in v.leaves {
+			lb := make([dynamic]u8, context.temp_allocator)
+			lw := prim.writer(&lb)
+			obj.tw_id(&lw, 1, l.conv)
+			obj.tw_id(&lw, 2, l.leaf.seg)
+			obj.tw_uv(&lw, 3, u64(l.leaf.off))
+			obj.tw_uv(&lw, 4, l.leaf.gen)
+			_nested(w, 3, lb[:])
+		}
+		for r in v.reverts {
+			rb := make([dynamic]u8, context.temp_allocator)
+			rw := prim.writer(&rb)
+			obj.tw_id(&rw, 1, r.tree)
+			obj.tw_str(&rw, 2, r.line)
+			obj.tw_id(&rw, 3, r.revert)
+			_nested(w, 4, rb[:])
+		}
+		_put_binds(w, 5, v.kept)
+		for h in v.hidden {
+			obj.tw_id(w, 6, h)
+		}
+	case Notice:
+		obj.tw_id(w, 1, v.undo)
+		obj.tw_id(w, 2, v.from)
+		obj.tw_uv(w, 3, u64(v.kind))
+		obj.tw_id(w, 4, v.tree)
+		obj.tw_str(w, 5, v.line)
+		for p in v.paths {
+			obj.tw_str(w, 6, p)
+		}
 	case Interrupt:
 		obj.tw_ref(w, 1, off, v.msg)
 	case Answer:
@@ -1281,6 +1383,121 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				v.reason = obj.dec_str(&d)
 			}
 		}
+		rec.body = v
+	case .Undo:
+		v: Undo
+		set := make([dynamic]Undo_Line, allocator)
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				v.id = obj.dec_id(&d)
+			case 2:
+				v.msg = obj.dec_ref(&d)
+			case 3:
+				v.redo = obj.dec_id(&d)
+			case 4:
+				v.phase = Undo_Phase(obj.dec_enum(&d, 1, u8(max(Undo_Phase))))
+			case 5:
+				ld := obj.dec_init(obj.dec_bytes(&d), off)
+				l: Undo_Line
+				actors := make([dynamic]prim.Id, allocator)
+				for obj.dec_next(&ld) {
+					switch ld.f.tag {
+					case 1:
+						l.tree = obj.dec_id(&ld)
+					case 2:
+						l.line = obj.dec_str(&ld)
+					case 3:
+						l.base = obj.dec_bytes(&ld)
+					case 4:
+						append(&actors, obj.dec_id(&ld))
+					}
+				}
+				d.bad ||= !obj.dec_ok(&ld)
+				l.actors = actors[:]
+				append(&set, l)
+			}
+		}
+		v.set = set[:]
+		d.bad ||= v.id == {} || obj.ref_none(v.msg)
+		rec.body = v
+	case .Undone:
+		v: Undone
+		leaves := make([dynamic]Undone_Leaf, allocator)
+		reverts := make([dynamic]Undone_Revert, allocator)
+		kept := make([dynamic]Line_Bind, allocator)
+		hidden := make([dynamic]prim.Id, allocator)
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				v.undo = obj.dec_id(&d)
+			case 2:
+				v.msg = obj.dec_ref(&d)
+			case 3:
+				ld := obj.dec_init(obj.dec_bytes(&d), off)
+				l: Undone_Leaf
+				for obj.dec_next(&ld) {
+					switch ld.f.tag {
+					case 1:
+						l.conv = obj.dec_id(&ld)
+					case 2:
+						l.leaf.seg = obj.dec_id(&ld)
+					case 3:
+						l.leaf.off = i64(obj.dec_uv(&ld))
+					case 4:
+						l.leaf.gen = obj.dec_uv(&ld)
+					}
+				}
+				d.bad ||= !obj.dec_ok(&ld)
+				append(&leaves, l)
+			case 4:
+				rd := obj.dec_init(obj.dec_bytes(&d), off)
+				r: Undone_Revert
+				for obj.dec_next(&rd) {
+					switch rd.f.tag {
+					case 1:
+						r.tree = obj.dec_id(&rd)
+					case 2:
+						r.line = obj.dec_str(&rd)
+					case 3:
+						r.revert = obj.dec_id(&rd)
+					}
+				}
+				d.bad ||= !obj.dec_ok(&rd)
+				append(&reverts, r)
+			case 5:
+				append(&kept, _get_bind(&d, off))
+			case 6:
+				append(&hidden, obj.dec_id(&d))
+			}
+		}
+		v.leaves = leaves[:]
+		v.reverts = reverts[:]
+		v.kept = kept[:]
+		v.hidden = hidden[:]
+		d.bad ||= v.undo == {} || obj.ref_none(v.msg)
+		rec.body = v
+	case .Notice:
+		v: Notice
+		paths := make([dynamic]string, allocator)
+		for obj.dec_next(&d) {
+			switch d.f.tag {
+			case 1:
+				v.undo = obj.dec_id(&d)
+			case 2:
+				v.from = obj.dec_id(&d)
+			case 3:
+				v.kind = Notice_Kind(obj.dec_enum(&d, 1, u8(max(Notice_Kind))))
+			case 4:
+				v.tree = obj.dec_id(&d)
+			case 5:
+				v.line = obj.dec_str(&d)
+			case 6:
+				append(&paths, obj.dec_str(&d))
+			}
+		}
+		v.paths = paths[:]
+		d.bad ||= v.undo == {}
 		rec.body = v
 	case .Interrupt:
 		v: Interrupt

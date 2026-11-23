@@ -40,7 +40,7 @@ TOP_ACCEPT :: u8(22)
 TOP_REVERT :: u8(20)
 
 OBSERVE_VERSION :: u8(1)
-REVERT_VERSION :: u8(1)
+REVERT_VERSION :: u8(2)
 
 Revert_Conflict_Kind :: enum u8 {
 	Region = 0,
@@ -64,6 +64,7 @@ Revert_Op :: struct {
 	base:      []crdt.Op_Id,
 	actors:    []prim.Id,
 	conflicts: []Revert_Conflict,
+	undo:      prim.Id,
 }
 
 Observe_Kind :: enum u8 {
@@ -855,6 +856,7 @@ encode_revert :: proc(buf: ^[dynamic]u8, o: Revert_Op) {
 		prim.write_raw(&w, x[:min(int(c.oid_len), len(x))])
 		prim.write_ivarint(&w, c.size)
 	}
+	prim.write_id(&w, o.undo)
 }
 
 decode_revert :: proc(content: []u8, allocator := context.temp_allocator) -> (o: Revert_Op, ok: bool) {
@@ -914,6 +916,6 @@ decode_revert :: proc(content: []u8, allocator := context.temp_allocator) -> (o:
 		prim.read_fixed(&r, c.oid[:c.oid_len])
 		c.size = prim.read_ivarint(&r)
 	}
-	o = Revert_Op{base, actors, conflicts}
+	o = Revert_Op{base, actors, conflicts, prim.read_id(&r)}
 	return o, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
 }

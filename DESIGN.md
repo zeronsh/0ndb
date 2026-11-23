@@ -966,10 +966,12 @@ equal in both directions.
   (then the outside value stays and the set's blob is the alternative).
   Restored text is an `Insert_Copy` of the original ops, so blame keeps the
   original authors. The batch commits under a fresh revert actor and carries
-  an opaque marker (tag 20, version 1: the base version, the actors and the
-  revert conflicts), so the conflicts are durable with the batch; applying the
-  marker indexes them (`rv:`/`rvl`), and `tree_conflicts` lists them as kind
-  `Revert` (with the revert actor, and the blob for an opaque file) next to
+  an opaque marker (tag 20, version 2: the base version, the actors, the
+  revert conflicts and the undo id, zero outside an undo), so the conflicts
+  are durable with the batch; applying the marker indexes them (`rv:`/`rvl`)
+  and the revert under its undo id (`ru:`), so `tree_undo_revert(tree, undo,
+  line)` finds an undo's revert on a line, and `tree_conflicts` lists them as
+  kind `Revert` (with the revert actor, and the blob for an opaque file) next to
   concurrent and offered ones: `ours` is the text that stays and `theirs` the
   alternative. Accepting one (`tree_conflict_accept`) replaces `ours` with an
   `Insert_Copy` of `theirs`, restores a removed file or sets the blob, and
@@ -987,8 +989,11 @@ equal in both directions.
   their scope actors. `history_mount_actors(mounts, lines)` returns the
   ingestion actors of the given mounts (home and per line) from the actor
   registrations, which are replicated `REC_ACTOR` records in each device's
-  history stream. The cross-tree notice for a removed file another tree
-  edited comes with undo.
+  history stream. Mount ids are not device-unique (a fork mount's id derives
+  from its task and name), so every such actor is single-writer through the
+  device in its outer hash, `ingestion_actor(device, mount or pseudo)`, and a
+  device registers only actors derived from itself. The cross-tree notice for
+  a removed file another tree edited comes with undo.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
 - **Text views**: `history_view_open(inode, version)` gives a caller its own

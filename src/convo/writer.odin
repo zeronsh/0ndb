@@ -582,6 +582,35 @@ writer_unmount :: proc(w: ^Writer, name: string) -> (off: i64, err: Error) {
 	return _event(w, Unmount{name = name})
 }
 
+writer_undo :: proc(w: ^Writer, id: prim.Id, msg: Rid, phase: Undo_Phase, set: []Undo_Line = nil, redo: prim.Id = {}) -> (off: i64, err: Error) {
+	if id == {} || obj.rid_none(msg) || u8(phase) < 1 || phase > max(Undo_Phase) {
+		return 0, .Invalid
+	}
+	if phase != .Staged && len(set) > 0 {
+		return 0, .Invalid
+	}
+	_prepare(w, false) or_return
+	mr := _local_rid(w, msg) or_return
+	return _event(w, Undo{id = id, msg = mr, redo = redo, phase = phase, set = set})
+}
+
+writer_undone :: proc(w: ^Writer, undo: prim.Id, msg: Rid, leaves: []Undone_Leaf, reverts: []Undone_Revert, kept: []Line_Bind = nil, hidden: []prim.Id = nil) -> (off: i64, err: Error) {
+	if undo == {} || obj.rid_none(msg) {
+		return 0, .Invalid
+	}
+	_prepare(w, false) or_return
+	mr := _local_rid(w, msg) or_return
+	return _event(w, Undone{undo = undo, msg = mr, leaves = leaves, reverts = reverts, kept = kept, hidden = hidden})
+}
+
+writer_notice :: proc(w: ^Writer, n: Notice) -> (off: i64, err: Error) {
+	if n.undo == {} || u8(n.kind) < 1 || n.kind > max(Notice_Kind) {
+		return 0, .Invalid
+	}
+	_prepare(w, false) or_return
+	return _event(w, n)
+}
+
 writer_compact :: proc(w: ^Writer, from: Rid, to: Rid, summary: string, blob: Blob = {}) -> (off: i64, err: Error) {
 	if obj.rid_none(to) {
 		return 0, .Invalid
