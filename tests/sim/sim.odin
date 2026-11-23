@@ -422,6 +422,7 @@ finish :: proc(w: ^World) {
 		n.disk.crash_at = 0
 		n.disk.fail_sync = 0
 		n.partitioned = false
+		n.persist_outage = false
 	}
 	w.relay.disk.crash_at = 0
 	for n in w.nodes {
