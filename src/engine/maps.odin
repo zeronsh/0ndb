@@ -589,7 +589,7 @@ _catalog_table_close :: proc(sp: ^Space) {
 
 @(private)
 _catalog_q :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind) -> ^Catalog_Update {
-	if sp, ok := e.spaces[space]; ok && sp.catalog == id {
+	if sp, ok := e.spaces[space]; ok && (sp.catalog == id || !_catalog_writable(sp)) {
 		return nil
 	}
 	if u, ok := e.catalog_q[id]; ok {
@@ -640,6 +640,15 @@ _catalog_activity :: proc(e: ^Engine, h: ^Handle) {
 	}
 	u.activity = true
 	u.status = h.kind == .Conversation
+}
+
+@(private)
+_catalog_writable :: proc(sp: ^Space) -> bool {
+	if !sp.keyless {
+		return true
+	}
+	a, ok := sp.grant_access[sp.catalog]
+	return ok && .Write in a
 }
 
 @(private)
@@ -712,6 +721,8 @@ _catalog_flush :: proc(e: ^Engine) {
 				e.catalog_parked[id] = u
 				continue
 			}
+		} else if err == .Permission {
+			e.stats.catalog_refused += 1
 		} else if err != .None {
 			_fatal(e, err)
 		}
