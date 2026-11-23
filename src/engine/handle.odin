@@ -186,7 +186,7 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 		h.created = rec.created
 		if rec.own {
 			h.own = true
-			_handle_open_writer(h) or_return
+			_handle_open_own(h) or_return
 		}
 		for m in rec.members {
 			_handle_add_member(h, m.device, m.keys_epoch)
@@ -201,7 +201,7 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 			rec.own = true
 			_rec_put(e, o.id, &rec) or_return
 			h.own = true
-			_handle_open_writer(h) or_return
+			_handle_open_own(h) or_return
 		}
 	}
 	if o.id != sp.catalog {
@@ -322,6 +322,16 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 }
 
 @(private)
+_handle_open_own :: proc(h: ^Handle) -> Error {
+	err := _handle_open_writer(h)
+	if err == .Corrupt && (h.kind == .Conversation || h.kind == .Map) && _damage_pending(h.e, h.id) {
+		h.damaged = true
+		return .None
+	}
+	return err
+}
+
+@(private)
 _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, settings: []u8 = nil) -> Error {
 	if h.w_open {
 		return .None
@@ -335,7 +345,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	rec, found := _rec_get(e, h.id) or_return
 	if found && rec.own {
 		h.own = true
-		_handle_open_writer(h) or_return
+		_damage_busy(e, h.id, _handle_open_writer(h)) or_return
 		if h.w_open {
 			return .None
 		}
@@ -368,7 +378,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	case .Conversation:
 		path := _seg_path(e, h.id) or_return
 		if prim.exists(e.vfs, path) {
-			_handle_open_writer(h) or_return
+			_damage_busy(e, h.id, _handle_open_writer(h)) or_return
 		} else {
 			opts := _journal_opts(h)
 			gen := _gen_take(e) or_return
@@ -377,7 +387,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	case .Map:
 		path := _seg_path(e, h.id) or_return
 		if prim.exists(e.vfs, path) {
-			_handle_open_writer(h) or_return
+			_damage_busy(e, h.id, _handle_open_writer(h)) or_return
 		} else {
 			opts := _journal_opts(h)
 			gen := _gen_take(e) or_return
@@ -624,6 +634,13 @@ _handle_rekey :: proc(h: ^Handle, device: prim.Id, rt: ^Remote_Tree) {
 
 @(private)
 _handle_refresh :: proc(h: ^Handle) {
+	if h.own && !h.w_open && (h.kind == .Conversation || h.kind == .Map) {
+		if _damage_pending(h.e, h.id) {
+			h.damaged = true
+		} else if !_damage_lost(h.e, h) {
+			_handle_open_own(h)
+		}
+	}
 	for s in h.segs {
 		if !s.in_view {
 			if s.tree != nil && !s.tree.loaded {

@@ -452,6 +452,10 @@ _map_own_check :: proc(e: ^Engine, h: ^Handle) -> Error {
 _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 	_map_table(e, h) or_return
 	_handle_refresh(h)
+	if h.own && !h.w_open {
+		h.damaged = !_damage_lost(e, h)
+		return .Corrupt
+	}
 	if h.w_open {
 		if cerr := omap.writer_commit(&h.mw); cerr != .None && cerr != .Busy {
 			return _oerr(cerr)

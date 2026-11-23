@@ -418,6 +418,9 @@ _pairs_diff :: proc(a, b: []Kv_Pair) -> (key: []u8, differ: bool) {
 @(private)
 _map_verify :: proc(e: ^Engine, o: Object, notes: ^[dynamic]string) -> Error {
 	h := _handle_get(e, o, .Map) or_return
+	if h.own && !h.w_open {
+		return .None
+	}
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
 		return merr
