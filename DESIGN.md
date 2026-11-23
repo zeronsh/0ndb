@@ -584,21 +584,38 @@ equal in both directions.
   through a registry hook. Mounts the runtime manages on conversation lines
   keep their line until runs are bound to lines; only their key moves. Every
   run is bound to the (mount, line) it started on (Conversations, planned).
-- **Switch** (planned, `line_switch(mount, target, runs = .Hold)`): hold the
-  runs bound to the old line (`Interrupted{reason = branch_changed}` at the
-  next tool boundary, native sessions kept), ingest everything onto the old
-  line without the settle delay, set a switch-pending flag in the mount state
-  (trusted and finished on open like adopt-pending), materialize the target
-  line's whole state including its uncommitted edits, then update git in git's
-  own order (index at the target commit, stat-refreshed so `git status` shows
-  the line's edits; then HEAD with reflog message `0ndb: switch from <a> to
-  <b>`), clear the flag, and resume the runs bound to the target line. **A
+- **Switch** (`line.switch(tree, line)`, op 173): hold the runs bound to the
+  old line and wait until every one has sealed (`runtime_hold_line` with
+  `done`; `Interrupted{reason = branch_changed}` at the next tool boundary,
+  native sessions kept), hold their writes under the mount
+  (`mount_hold_writes`), then run a switch record (`switch_to`,
+  `switch_from`, `switch_phase`) kept in the mount state and advanced by the
+  mount's own passes, so nothing blocks the loop. Ingest: the record is saved
+  with the mount still on the old line, and it waits until a pass has
+  ingested everything onto the old line and that history is durable; a
+  branch with no line yet gets one from its commit tree as one git-op batch
+  (`line_from_commit`) forked from the synced version. Target: the mount
+  moves to the target line and materializes its whole state, including its
+  uncommitted edits, until the synced version is the line's. Git: update git
+  in git's own order (`git read-tree <commit>` and `update-index -q
+  --refresh`, so `git status` shows the line's edits; then `git symbolic-ref`
+  or `update-ref --no-deref` with reflog message `0ndb: switch from <a> to
+  <b>`), refresh the mount's view of HEAD so the next pass does not
+  re-classify, clear the record and report done; the op then releases the
+  writes and resumes the runs bound to the target line. Each phase is saved
+  before its effects and every step is idempotent, so a mount that reopens
+  with the record set resumes it: before the target phase it stays on the
+  old line, after it it rolls forward (recreating a target line whose import
+  was lost, and removing a stale `index.lock` the crash left). Lines are
+  named by their git key (`git:refs/heads/<name>`; the mount's own branch maps
+  to its line). Runtime-managed mounts are refused until run lines retire. **A
   0ndb switch keeps each line's uncommitted state with that line (an automatic
   per-branch stash), while a raw git checkout carries dirty files as git
-  does**; the catalog shows on which line every uncommitted change lives, so
-  nothing seems to vanish. `carry = true` gives a 0ndb switch git's semantics;
-  `.Fork` moves held runs into an isolated fork of the old line that lands on
-  completion; `.Stop` cancels them. The default is never asked.
+  does**; (planned) the catalog shows on which line every uncommitted change
+  lives, so nothing seems to vanish, `carry = true` gives a 0ndb switch git's
+  semantics, `.Fork` moves held runs into an isolated fork of the old line
+  that lands on completion and `.Stop` cancels them. The default is never
+  asked.
 - **Git's lock and our handles**: 0ndb never holds a handle on anything
   under `.git` or the work tree across a loop turn. Windows refuses to
   rename onto a file that another process has open, even with
@@ -684,8 +701,9 @@ equal in both directions.
   When the lock goes, HEAD, its target and the
   reflog tail decide: a changed branch or detached commit with a
   `checkout:`/`switch:` entry is a line switch A→B (git's writes are one
-  git-op batch on B, carried dirty files are ingested onto A and onto B as a
-  carry batch credited to their authors, A's runs are held, B's resume);
+  git-op batch on B, carried dirty files are ingested onto B; planned: also
+  onto A as a carry batch credited to their authors; A's runs are held, B's
+  resume);
   anything else (commit, reset, merge, pull, restore, stash) is a git-op
   batch on the same line. While `rebase-merge/`, `rebase-apply/`,
   `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `sequencer/` exist, a detached HEAD
