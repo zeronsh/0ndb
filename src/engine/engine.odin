@@ -946,6 +946,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 
 	e.settling = true
 	_redact_settle(e)
+	_content_settle(e)
 	_mounts_settle(e)
 	_full_settle(e)
 	_index_settle(e)
