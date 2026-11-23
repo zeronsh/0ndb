@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+import json, os, sys, uuid, time
+
+STATE = os.environ["FAKE_STATE"]
+CONTENTS = json.loads(os.environ.get("FAKE_CONTENTS", "{}"))
+os.makedirs(os.path.join(STATE, "threads"), exist_ok=True)
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def load(tid):
+    p = os.path.join(STATE, "threads", tid + ".json")
+    return json.load(open(p)) if os.path.exists(p) else []
+
+def save(tid, hist):
+    json.dump(hist, open(os.path.join(STATE, "threads", tid + ".json"), "w"))
+
+def note(method, params):
+    out({"method": method, "params": params})
+
+def opened(kind, tid, hist, params):
+    save(tid, hist)
+    with open(os.path.join(STATE, "launches.jsonl"), "a") as f:
+        f.write(json.dumps({"argv": [kind] + ([params.get("threadId", ""), params.get("lastTurnId", "")] if kind != "thread/start" else []), "session": tid, "history": [t["text"] for t in hist]}) + "\n")
+    return {"thread": {"id": tid, "path": os.path.join(STATE, "threads", tid + ".json")}}
+
+thread = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method, rid, p = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    with open(os.path.join(STATE, "rpc.jsonl"), "a") as f:
+        f.write(json.dumps({"pid": os.getpid(), "method": method, "params": p})[:800] + "\n")
+    if rid is None:
+        continue
+    if method == "initialize":
+        out({"id": rid, "result": {"userAgent": "fake-codex"}})
+    elif method == "thread/start":
+        thread = str(uuid.uuid4())
+        out({"id": rid, "result": opened(method, thread, [], p)})
+    elif method == "thread/resume":
+        thread = p["threadId"]
+        out({"id": rid, "result": opened(method, thread, load(thread), p)})
+    elif method == "thread/fork" and os.environ.get("FAKE_NO_FORK"):
+        out({"id": rid, "error": {"code": -32000, "message": "fork is not supported"}})
+    elif method == "thread/fork":
+        hist = load(p["threadId"])
+        cut = [i for i, t in enumerate(hist) if t["id"] == p.get("lastTurnId")]
+        if not cut:
+            out({"id": rid, "error": {"code": -32000, "message": "no such turn"}})
+            continue
+        thread = str(uuid.uuid4())
+        out({"id": rid, "result": opened(method, thread, hist[: cut[0] + 1], p)})
+    elif method == "model/list":
+        out({"id": rid, "result": {"data": []}})
+    elif method == "turn/interrupt":
+        out({"id": rid, "result": {}})
+    elif method == "turn/start":
+        text = " ".join(x.get("text", "") for x in p.get("input", []) if x.get("type") == "text")
+        with open(os.path.join(STATE, "turns.jsonl"), "a") as f:
+            f.write(json.dumps({"thread": thread, "text": text}) + "\n")
+        turn = "turn_" + uuid.uuid4().hex[:10]
+        out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
+        note("turn/started", {"threadId": thread, "turn": {"id": turn}})
+        note("item/started", {"threadId": thread, "turnId": turn, "item": {"type": "userMessage", "id": "u_" + turn, "clientId": p.get("clientUserMessageId", "")}})
+        note("item/completed", {"threadId": thread, "turnId": turn, "item": {"type": "userMessage", "id": "u_" + turn, "status": "completed"}})
+        k = None
+        for w in text.split():
+            if w.startswith("turn") and w[4:].isdigit():
+                k = w[4:]
+        if k in CONTENTS:
+            path = os.path.join(os.getcwd(), "notes.txt")
+            fc = "fc_" + turn
+            changes = [{"path": path, "kind": {"type": "update"}, "diff": ""}]
+            note("item/started", {"threadId": thread, "turnId": turn, "item": {"type": "fileChange", "id": fc, "status": "inProgress", "changes": changes}})
+            time.sleep(float(os.environ.get("FAKE_WRITE_DELAY_S", "0.05")))
+            with open(path, "w") as f:
+                f.write(CONTENTS[k])
+            note("item/completed", {"threadId": thread, "turnId": turn, "item": {"type": "fileChange", "id": fc, "status": "completed", "changes": changes}})
+        am = "am_" + turn
+        note("item/started", {"threadId": thread, "turnId": turn, "item": {"type": "agentMessage", "id": am, "text": ""}})
+        note("item/completed", {"threadId": thread, "turnId": turn, "item": {"type": "agentMessage", "id": am, "text": "done " + text}})
+        hist = load(thread)
+        hist.append({"id": turn, "text": text})
+        save(thread, hist)
+        note("turn/completed", {"threadId": thread, "turn": {"id": turn, "status": "completed"}})
+    else:
+        out({"id": rid, "result": {}})

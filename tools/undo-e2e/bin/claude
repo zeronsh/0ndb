@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+import json, os, sys, uuid, time
+
+STATE = os.environ["FAKE_STATE"]
+CONTENTS = json.loads(os.environ.get("FAKE_CONTENTS", "{}"))
+os.makedirs(os.path.join(STATE, "sessions"), exist_ok=True)
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def load(sid):
+    p = os.path.join(STATE, "sessions", sid + ".json")
+    return json.load(open(p)) if os.path.exists(p) else []
+
+def save(sid, hist):
+    json.dump(hist, open(os.path.join(STATE, "sessions", sid + ".json"), "w"))
+
+args = sys.argv[1:]
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+
+resume, at, fork = opt("--resume"), opt("--resume-session-at"), "--fork-session" in args
+if fork and os.environ.get("FAKE_NO_FORK"):
+    sys.stderr.write("Error: --resume-session-at is not supported\n")
+    sys.exit(1)
+if resume and fork:
+    hist = load(resume)
+    if at:
+        cut = [i for i, h in enumerate(hist) if h["uuid"] == at]
+        hist = hist[: cut[0] + 1] if cut else hist
+    sid = str(uuid.uuid4())
+elif resume:
+    hist = load(resume)
+    sid = resume
+else:
+    hist = []
+    sid = str(uuid.uuid4())
+save(sid, hist)
+with open(os.path.join(STATE, "launches.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": args, "session": sid, "history": [h["text"] for h in hist]}) + "\n")
+out({"type": "system", "subtype": "init", "session_id": sid, "cwd": os.getcwd(), "model": opt("--model") or ""})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    t = msg.get("type")
+    if t == "control_request":
+        out({"type": "control_response", "response": {"subtype": "success", "request_id": msg.get("request_id"), "response": {}}})
+        continue
+    if t != "user":
+        continue
+    c = msg["message"]["content"]
+    with open(os.path.join(STATE, "turns.jsonl"), "a") as f:
+        f.write(json.dumps({"thread": sid, "text": c if isinstance(c, str) else " ".join(b.get("text", "") for b in c if b.get("type") == "text")}) + "\n")
+    text = c if isinstance(c, str) else " ".join(b.get("text", "") for b in c if b.get("type") == "text")
+    u = msg.get("uuid") or str(uuid.uuid4())
+    out({"type": "user", "isReplay": True, "uuid": u, "session_id": sid, "parent_tool_use_id": None, "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+    hist.append({"uuid": u, "role": "user", "text": text})
+    turn = None
+    for w in text.split():
+        if w.startswith("turn") and w[4:].isdigit():
+            turn = w[4:]
+    if turn in CONTENTS:
+        tid = "toolu_" + uuid.uuid4().hex[:12]
+        path = os.path.join(os.getcwd(), "notes.txt")
+        a1 = str(uuid.uuid4())
+        out({"type": "assistant", "uuid": a1, "session_id": sid, "parent_tool_use_id": None, "message": {"role": "assistant", "content": [{"type": "tool_use", "id": tid, "name": "Write", "input": {"file_path": path, "content": CONTENTS[turn]}}]}})
+        time.sleep(float(os.environ.get("FAKE_WRITE_DELAY_S", "0.05")))
+        with open(path, "w") as f:
+            f.write(CONTENTS[turn])
+        u2 = str(uuid.uuid4())
+        out({"type": "user", "uuid": u2, "session_id": sid, "parent_tool_use_id": None, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": "wrote notes.txt"}]}})
+        hist.append({"uuid": a1, "role": "assistant", "text": "write " + CONTENTS[turn]})
+    a2 = str(uuid.uuid4())
+    out({"type": "assistant", "uuid": a2, "session_id": sid, "parent_tool_use_id": None, "message": {"role": "assistant", "content": [{"type": "text", "text": "done " + text}]}})
+    hist.append({"uuid": a2, "role": "assistant", "text": "done " + text})
+    save(sid, hist)
+    out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "result": "done", "usage": {"input_tokens": 1, "output_tokens": 1}})
