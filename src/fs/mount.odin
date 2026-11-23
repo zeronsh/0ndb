@@ -1808,10 +1808,14 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 		if err != .None || deferred {
 			sm := s.mount
 			for k, v in sm.dirty {
-				if v == s {
-					attrib_set(sm, k, s.actor, false, {}, s.id)
-					attrib_log_append(sm, k, s.actor, {}, s.id)
+				if v != s {
+					continue
 				}
+				if a, has := sm.attrib[k]; has && a.actor == s.actor && a.oid != {} {
+					continue
+				}
+				attrib_set(sm, k, s.actor, false, {}, s.id)
+				attrib_log_append(sm, k, s.actor, {}, s.id)
 			}
 			scope_retire_unwritten(sm, s)
 			if sm.log_fd >= 0 && sm.log_len > 0 {
