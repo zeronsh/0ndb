@@ -1087,7 +1087,10 @@ concurrent typing is never lost or reverted.
   merge itself: O(ops since the last delta), never O(file).
 - **Local edits.** `buffer_edit(buffer, rev, edits, group)` takes ordered
   `(pos, del, ins)` edits in the client's coordinates at `rev` plus its
-  earlier edits. The engine first advances the buffer to its target,
+  earlier edits. Every `pos` and `pos + del` falls on a code point boundary
+  in the buffer's units; an edit that would split a UTF-8 sequence or a
+  UTF-16 surrogate pair is refused with `Invalid` and changes nothing, so
+  the engine never widens an edit the client applied as sent. The engine first advances the buffer to its target,
   delivering any pending delta ahead of the edit's result, then transforms
   the edit over its unacknowledged deltas, converts units at the view, and
   commits one batch whose author is the buffer's actor (the person; default

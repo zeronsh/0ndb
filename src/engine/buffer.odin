@@ -181,6 +181,39 @@ _to_bytes :: proc(b: ^Buffer, u: int) -> int {
 }
 
 @(private)
+_unit_boundary :: proc(b: ^Buffer, u: int) -> bool {
+	p := _to_bytes(b, u)
+	if b.units == .Utf16 && _to_units(b, p) != u {
+		return false
+	}
+	if p <= 0 || p >= _disp_len(b) {
+		return true
+	}
+	c: [1]u8
+	_disp_read(b, p, c[:])
+	return c[0] & 0xc0 != 0x80
+}
+
+@(private)
+_edit_bounds_ok :: proc(b: ^Buffer, d: []crdt.Delta_Op) -> bool {
+	u := 0
+	for o in d {
+		switch o.kind {
+		case .Retain, .Delete:
+			if !_unit_boundary(b, u) {
+				return false
+			}
+			u += o.n
+			if !_unit_boundary(b, u) {
+				return false
+			}
+		case .Insert:
+		}
+	}
+	return true
+}
+
+@(private)
 _to_units :: proc(b: ^Buffer, pos: int) -> int {
 	if b.units == .Bytes {
 		return pos
@@ -979,6 +1012,9 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 		crdt.delta_transform(cur, s.ops, _utf16(b), &a2, &b2)
 		moved[i] = b2[:]
 		cur = a2[:]
+	}
+	if !_edit_bounds_ok(b, cur) {
+		return 0, 0, .Invalid
 	}
 	ed, dok := _disp_delta_bytes(b, cur)
 	if !dok {
