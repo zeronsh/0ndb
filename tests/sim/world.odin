@@ -96,6 +96,7 @@ Node :: struct {
 	probed:      bool,
 	sent:        map[string]i64,
 	boot:        u64,
+	learned:     [dynamic]Learned_Redaction,
 	observed:    int,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
@@ -459,6 +460,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.attaches = make(map[prim.Id]int, w.allocator)
 		n.mounts = make([dynamic]Sim_Mount, w.allocator)
 		n.writers = make(map[string]Writer_Info, w.allocator)
+		n.learned = make([dynamic]Learned_Redaction, w.allocator)
 		append(&w.nodes, n)
 	}
 	if !world_reserve(w) {
@@ -477,6 +479,7 @@ world_destroy :: proc(w: ^World) {
 		node_mounts_drop(w, n)
 		delete(n.mounts)
 		delete(n.writers)
+		delete(n.learned)
 		for k in n.sent {
 			delete(k, w.allocator)
 		}
@@ -541,4 +544,12 @@ loop_deadline :: proc(l: ^prim.Loop) -> (at: i64, ok: bool) {
 
 loop_armed :: proc(l: ^prim.Loop) -> int {
 	return len(l.heap)
+}
+
+Learned_Redaction :: struct {
+	object: prim.Id,
+	device: prim.Id,
+	from:   i64,
+	to:     i64,
+	seq:    u64,
 }

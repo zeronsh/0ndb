@@ -1799,7 +1799,51 @@ check_own_redactions :: proc(w: ^World, n: ^Node) {
 	}
 }
 
+check_learned_redactions :: proc(w: ^World, n: ^Node) {
+	if !n.alive || !n.e_open || len(n.learned) == 0 {
+		return
+	}
+	m := &w.model
+	for _, oi in m.objs {
+		if !obj_exists(m, oi) {
+			continue
+		}
+		ob := &m.objs[oi]
+		mine := false
+		for l in n.learned {
+			mine ||= l.object == ob.o.id
+		}
+		if !mine {
+			continue
+		}
+		recs := make(map[Rec_Key]Rec_State, context.temp_allocator)
+		_node_records(w, n, ob, &recs)
+		for k, st in recs {
+			if st != .Live {
+				continue
+			}
+			for l in n.learned {
+				if l.object == ob.o.id && l.device == k.device && k.off >= l.from && k.off < l.to {
+					world_fail(w, "device redaction: %s holds live record %s@%d of %v %s after learning of its redaction", n.name, id_short(k.device), k.off, ob.kind, id_short(ob.o.id))
+				}
+			}
+		}
+	}
+}
+
+check_learned_final :: proc(w: ^World) {
+	for n in w.nodes {
+		check_learned_redactions(w, n)
+	}
+}
+
+STAT_LEARNED: Stat
+
 @(init)
 _own_redaction_hooks :: proc "contextless" () {
+	register_stat_line(47)
+	STAT_LEARNED = register_stat(47, 0, "redactions_learned")
 	register_restarted(70, check_own_redactions, false)
+	register_restarted(71, check_learned_redactions, false)
+	register_final_check(51, check_learned_final)
 }
