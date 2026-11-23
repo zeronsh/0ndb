@@ -857,7 +857,7 @@ _on_tick :: proc(l: ^prim.Loop, data: rawptr) {
 	context = context_for(e)
 	e.tick_timer = 0
 	_tick_end(e)
-	if !e.in_tick {
+	if !e.in_tick && !prim.loop_nested(e.loop) {
 		virtual.arena_free_all(&e.temp)
 	}
 }

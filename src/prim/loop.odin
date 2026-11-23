@@ -40,6 +40,7 @@ Loop :: struct {
 	wake_data:  rawptr,
 	clock:      Clock,
 	stopped:    bool,
+	depth:      int,
 	allocator:  runtime.Allocator,
 }
 
@@ -202,6 +203,8 @@ loop_run :: proc(l: ^Loop) -> Error {
 }
 
 loop_step :: proc(l: ^Loop, block := true) -> Error {
+	l.depth += 1
+	defer l.depth -= 1
 	timeout: i64 = -1
 	if !block || len(l.pending) > 0 {
 		timeout = 0
@@ -214,8 +217,14 @@ loop_step :: proc(l: ^Loop, block := true) -> Error {
 	}
 	_run_pending(l)
 	_run_timers(l)
-	free_all(context.temp_allocator)
+	if l.depth == 1 {
+		free_all(context.temp_allocator)
+	}
 	return err
+}
+
+loop_nested :: proc "contextless" (l: ^Loop) -> bool {
+	return l.depth > 1
 }
 
 loop_idle :: proc "contextless" (l: ^Loop) -> bool {
