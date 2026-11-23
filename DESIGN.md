@@ -3314,7 +3314,12 @@ Relay cost tracks the reachable information, not the activity. Items marked
   seal the relay holds to have trimmed its segment by quiesce; a scenario
   holds a writer's segment commits at the relay while its archive trims,
   so the Trim is refused Busy and the writer goes idle before the held
-  Appended arrives.
+  Appended arrives. A seal survives a restart in the upload floor slot,
+  so a local whose slot records one runs one archive turn per session
+  even below the minimum backlog; that turn resends a Trim the previous
+  session never landed (the relay answers Noted if the base is already
+  there). An archive reader looking backward for the latest seal never
+  re-reads bytes its archive replica already holds.
   Readers: a `Trimmed` reply marks the remote; wants below its base become
   archive wants: the reader tails the writer's archive stream (an ordinary
   remote, chain-verified with the writer's identity and no keys), reads

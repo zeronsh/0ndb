@@ -178,6 +178,7 @@ Local :: struct {
 	scope:     Scope,
 	archive:   bool,
 	arc_sealed: i64,
+	arc_checked: bool,
 	arc_timer: prim.Timer,
 	arc_child: bool,
 	trim_for:  Stream_Id,
@@ -660,6 +661,7 @@ replicator_publish :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u
 	l.durable = max(l.durable, durable)
 	l.blocked = false
 	_local_pump(r, l)
+	_arc_maybe_run(r, l)
 	_repl_flush(r)
 	return .None
 }
@@ -2901,6 +2903,9 @@ _repl_on_ready :: proc(r: ^Replicator) {
 		if al.arc_child && al.floor >= al.trim_at {
 			_arc_trim_send(r, al)
 		}
+	}
+	for _, l in r.locals {
+		_arc_maybe_run(r, l)
 	}
 	if r.cfg.filtered {
 		_feed_subscribe(r, r.feed_cursor < 0 || r.group_new)
