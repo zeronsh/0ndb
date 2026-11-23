@@ -544,6 +544,9 @@ _hist_verify :: proc(e: ^Engine, o: Object, kind: Kind, notes: ^[dynamic]string)
 	_hist_ready(e, h) or_return
 	hist := h.hist
 	_ferr(fs.history_resume(hist)) or_return
+	if !hist.awake {
+		return .None
+	}
 	if kept := _ferr2(fs.history_interning_kept(hist)) or_return; !kept {
 		append(notes, fmt.tprintf("history %s: actor interning order differs from the order saved before its rebuild", prim.id_hex(o.id)))
 	}
@@ -609,6 +612,7 @@ _hist_rebuild :: proc(e: ^Engine, h: ^Handle, hist: ^fs.History, shuffled: bool)
 	opts := _hist_options(h)
 	opts.keep_at_least = 0
 	opts.redacted = {}
+	opts.fault = {}
 	re := _ferr2(fs.history_create(e.vfs, scratch, h.id, e.self, db, fs.Stream_Source{data = h, read = _hist_read}, e.allocator, opts)) or_return
 	defer fs.history_release(re)
 	limits := make(map[prim.Id]i64, 8, context.temp_allocator)
