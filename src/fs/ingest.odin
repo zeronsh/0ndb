@@ -1511,6 +1511,9 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	if !m.imported && !m.importing {
+		if m.history != nil {
+			history_ready(m.history) or_return
+		}
 		m.importing = true
 		ierr := mount_recover(m)
 		if ierr == .None {
