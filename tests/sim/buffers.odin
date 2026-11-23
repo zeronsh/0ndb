@@ -516,8 +516,66 @@ STAT_ANCHORS_CHECKED: Stat
 @(init)
 _buffers_stats :: proc "contextless" () {
 	register_final_check(40, check_buffers)
+	register_final_check(1000, check_settled_write)
 	register_stat_line(30)
 	STAT_BUFFERS = register_stat(30, 0, "buffers_opened")
 	STAT_BURSTS = register_stat(30, 1, "bursts")
 	STAT_ANCHORS_CHECKED = register_stat(30, 2, "anchors_checked")
+}
+
+@(private = "file")
+_wp_ready :: proc(w: ^World, b: ^Sim_Buffer) -> bool {
+	n := w.nodes[b.node]
+	return !b.dead && n.alive && n.e_open && b.inc == n.incarnation && w.model.objs[b.oi].kind == .Text && obj_exists(&w.model, b.oi)
+}
+
+check_settled_write :: proc(w: ^World) {
+	if len(w.failures) > 0 {
+		return
+	}
+	a, b: ^Sim_Buffer
+	outer: for x in w.bufs {
+		if !_wp_ready(w, x) {
+			continue
+		}
+		for y in w.bufs {
+			if y.node != x.node && y.oi == x.oi && _wp_ready(w, y) {
+				a, b = x, y
+				break outer
+			}
+		}
+	}
+	if a == nil {
+		return
+	}
+	pair := []^Sim_Buffer{a, b}
+	settle :: proc(w: ^World, bs: []^Sim_Buffer) -> bool {
+		run_until(w, w.now + 30_000_000_000, true)
+		for b in bs {
+			buffers_deliver(w, b, len(b.inbox))
+			if !_wp_ready(w, b) || len(b.pending) > 0 {
+				return false
+			}
+		}
+		return true
+	}
+	if !settle(w, pair) {
+		return
+	}
+	k0 := len(a.groups)
+	_type(w, w.nodes[a.node], a)
+	node_after(w.nodes[a.node])
+	if len(a.groups) == k0 {
+		return
+	}
+	warm := a.groups[len(a.groups) - 1]
+	for _ in 0 ..< 8 {
+		if !settle(w, pair) {
+			return
+		}
+		if strings.contains(string(b.doc[:]), warm) {
+			return
+		}
+	}
+	world_fail(w, "buffer: %s typed %s into a settled world but %s never got it", w.nodes[a.node].name, warm, w.nodes[b.node].name)
 }
