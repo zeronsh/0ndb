@@ -726,10 +726,17 @@ equal in both directions.
   version and git's writes become its git-op batch; an existing line is
   retargeted instead: the shadow entries of the inodes whose place differs
   between the synced version and the line (those an op between the two
-  touches, and everything under a touched directory in either version) move
-  to the line's paths with their stat cleared, the synced version becomes the line's, and the full pass diffs
+  touches, closed under everything below a touched directory in either
+  version and under any inode a collision displaces from a touched one's
+  path) move to the line's paths with
+  their stat cleared, the synced version becomes the line's, and the full pass diffs
   disk against the line, so git's writes (and anything git carried) land on
-  that line only. A materialization whose pass switched lines restarts at the
+  that line only. A path the line has that is not on disk after the switch
+  (a collision copy or uncommitted file of that line git did not check out)
+  is owed: it is materialized like a pending path and never ingested as a
+  removal. Only a path that leaves disk after the switch is the person's
+  deletion; one deleted between git's checkout and the pass that sees the
+  switch cannot be told from a path git did not create, and is rewritten. A materialization whose pass switched lines restarts at the
   new line rather than writing the old one back. Ingestion on a line other
   than the mount's own uses an actor derived from the mount and the line,
   registered like the mount's ingestion actor, because an actor's ops stay on
