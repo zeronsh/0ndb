@@ -534,6 +534,8 @@ Mount :: struct {
 	switch_to:   string,
 	switch_from: string,
 	switch_phase: u8,
+	switch_fence: u64,
+	switch_fence_ok: bool,
 	switch_done: Switch_Done,
 	switch_data: rawptr,
 	link_mode:   Link_Mode,

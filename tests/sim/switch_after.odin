@@ -409,26 +409,26 @@ _switch_ingest_race :: proc(w: ^World, kind: Switch_Race_Kind) -> (raced: bool) 
 	}
 	n.watch_scheduled = true
 	raced = true
-	flipped := false
-	for limit := w.now + 20_000_000_000; w.now < limit && !flipped; {
-		if !_sa_step(w) {
-			break
-		}
-		sm = _sa_mount(n)
-		if sm == nil {
-			world_fail(w, "switch ingest race: mount missing during the switch")
-			return
-		}
-		_, pending := fs.mount_switch_pending(sm.m)
-		flipped = !pending || sm.m.switch_phase >= fs.SWITCH_TARGET
-	}
-	if !flipped {
-		world_fail(w, "switch ingest race: the switch never left ingest")
+	run_until(w, w.now + 3_000_000_000, false)
+	sm = _sa_mount(n)
+	if sm == nil {
+		world_fail(w, "switch ingest race: mount missing during the switch")
 		return
+	}
+	if _, pending := fs.mount_switch_pending(sm.m); !pending || sm.m.switch_phase != fs.SWITCH_INGEST {
+		world_fail(w, "switch ingest race: the line flipped to %s while the watch events of a %v made during ingest were still undelivered", SA_FEATURE, kind)
 	}
 	n.watch_scheduled = false
 	node_after(n)
 	run_until(w, w.now + 20_000_000_000, true)
+	sm = _sa_mount(n)
+	if sm == nil {
+		world_fail(w, "switch ingest race: mount missing after the switch")
+		return
+	}
+	if to, pending := fs.mount_switch_pending(sm.m); pending || fs.mount_line(sm.m) != SA_FEATURE {
+		world_fail(w, "switch ingest race: after the events were delivered the mount is on %s with a switch to %s pending %v", fs.mount_line(sm.m), to, pending)
+	}
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	on_main, _ := eng.tree_read(&n.e, tree, rpath, context.temp_allocator, {}, "main")

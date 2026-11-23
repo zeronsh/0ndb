@@ -126,15 +126,30 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 	from, _ := clone_string(m.switch_from, context.temp_allocator)
 	if m.switch_phase <= SWITCH_INGEST {
 		if len(m.dirty) > 0 || m.rescan {
+			m.switch_fence_ok = false
 			mount_pass(m, false) or_return
 		}
 		if !mount_durable_now(m) {
 			return false, .None
 		}
-		mount_pass(m, true) or_return
-		if !mount_durable_now(m) {
-			return false, .None
+		if !m.switch_fence_ok {
+			if m.watched {
+				if m.switch_fence == 0 {
+					seq := m.fence_seq + 1
+					m.switch_fence = seq
+					if ferr := mount_fence(m, switch_fenced, rawptr(uintptr(seq))); ferr != .None {
+						m.switch_fence = 0
+						return false, ferr
+					}
+				}
+				return false, .None
+			}
+			mount_pass(m, true) or_return
+			if !mount_durable_now(m) {
+				return false, .None
+			}
 		}
+		m.switch_fence_ok = false
 		switch_line_ensure(m, to) or_return
 		delete(m.line, m.allocator)
 		m.line, _ = clone_string(to, m.allocator)
@@ -202,6 +217,16 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 }
 
 @(private)
+switch_fenced :: proc(m: ^Mount, data: rawptr, err: Error) {
+	if u64(uintptr(data)) != m.switch_fence {
+		return
+	}
+	m.switch_fence = 0
+	m.switch_fence_ok = err == .None && len(m.dirty) == 0 && !m.rescan && mount_durable_now(m)
+	mount_schedule(m, 0)
+}
+
+@(private)
 switch_report :: proc(m: ^Mount, err: Error) {
 	done, data := m.switch_done, m.switch_data
 	m.switch_done = nil
@@ -218,6 +243,8 @@ switch_clear :: proc(m: ^Mount) {
 	delete(m.switch_from, m.allocator)
 	m.switch_from = ""
 	m.switch_phase = 0
+	m.switch_fence = 0
+	m.switch_fence_ok = false
 	m.switch_done = nil
 	m.switch_data = nil
 }

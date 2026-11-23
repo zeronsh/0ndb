@@ -984,10 +984,14 @@ equal in both directions.
   holds when it is made: the source during ingest, the target from the moment
   its materialization starts. The mount's line flips in the step that enters
   the target phase, after ingest has passed every reported path onto the
-  source and that history is durable, then run one full pass (stat and listing
-  against the shadow, so an edit, create or delete whose watch event is still
-  in flight lands on the source too); if that pass ingested anything the step
-  waits for durability again instead of flipping. Lines are
+  source and that history is durable, then pass an event barrier: a fence file
+  in the mount root whose watch event, ordered after every earlier event of the
+  watcher, must arrive with nothing new ingested before the line flips, so an
+  edit, create or delete whose event was still in flight lands on the source.
+  If the pass that the barrier released ingested anything, the step waits for
+  durability and a new barrier. The cost is O(changes); a mount without a
+  watcher, or one whose watcher overflowed (rescan), runs one full pass
+  instead. Lines are
   named by their git key (`git:refs/heads/<name>`; the mount's own branch maps
   to its line). Runtime-managed mounts are refused until run lines retire. **A
   0ndb switch keeps each line's uncommitted state with that line (an automatic
