@@ -282,6 +282,8 @@ Runtime :: struct {
 	hooked:      bool,
 	asks:        [dynamic]Ask,
 	hold_waits:  [dynamic]^Hold_Wait,
+	undo_pending: [dynamic]Undo_Pending,
+	undo_timer:  prim.Timer,
 	stats:       Stats,
 }
 
@@ -358,6 +360,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	r.prev_events = e.cfg.events
 	e.cfg.events = eng.Event_Hook{data = r, event = _on_engine_event}
 	r.hooked = true
+	undo_hooks_install(r)
 	r.opened = true
 	eng.set_tick_hook(e, eng.Tick_Hook{data = r, call = _on_tick_hook})
 	return .None
@@ -440,6 +443,8 @@ close :: proc(r: ^Runtime) {
 		_run_abandon(run)
 	}
 	_hold_waits_close(r)
+	undo_close(r)
+	eng.undo_hooks_set(r.e, {})
 	for len(r.procs) > 0 {
 		_proc_free(r.procs[len(r.procs) - 1], true)
 	}
@@ -589,6 +594,7 @@ attach :: proc(r: ^Runtime, space: prim.Id) -> Error {
 		_attach_runner(r, space)
 	}
 	_pending_scan(r, space)
+	undo_attach(r, space)
 	if len(map_rows(r, state_object(r, space), transmute([]u8)string("trig/"), 1)) > 0 {
 		r.triggers = true
 	}

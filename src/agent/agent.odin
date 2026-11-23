@@ -777,6 +777,20 @@ close :: proc(d: ^Driver, allocator := context.temp_allocator) -> Output {
 
 process_exited :: proc(d: ^Driver, message: string, allocator := context.temp_allocator) -> Output {
 	o := output(allocator)
+	if d.desc.protocol == .Claude_Stream_Json && d.rewinding && !d.running && d.req.rewind.after != "" && d.fallback != "" {
+		for &p in d.prompts {
+			p.sent = false
+		}
+		clear_pending(d)
+		set(d, &d.seed_for, "")
+		d.ready = false
+		d.in_flight = 0
+		take_fallback(d)
+		drop_target(d, &d.req.rewind)
+		set(d, &d.req.resume, "")
+		o.restart = true
+		return o
+	}
 	if d.running {
 		msg := message != "" ? message : "the agent process exited"
 		fail_turn(d, &o, msg)
@@ -1112,6 +1126,13 @@ take_fallback :: proc(d: ^Driver) -> bool {
 	set(d, &d.seed, d.fallback)
 	set(d, &d.seed_for, "")
 	set(d, &d.fallback, "")
+	for &p in d.prompts {
+		if !p.sent && p.cmd == "" {
+			set(d, &p.text, strings.concatenate({d.seed, "\n\n", p.text}, context.temp_allocator))
+			set(d, &d.seed_for, p.id)
+			break
+		}
+	}
 	set(d, &d.checkpoint, "")
 	d.turns = 0
 	d.rewind_path = .Seeded

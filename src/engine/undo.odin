@@ -13,6 +13,7 @@ Undo_Hooks :: struct {
 	hold:    proc(data: rawptr, e: ^Engine, convs: []Object, undo: prim.Id) -> Error,
 	mounts:  proc(data: rawptr, e: ^Engine, conv: Object, allocator: runtime.Allocator) -> []prim.Id,
 	rewind:  proc(data: rawptr, e: ^Engine, conv: Object, head: Rid) -> Error,
+	checkouts: proc(data: rawptr, e: ^Engine, conv: Object, allocator: runtime.Allocator) -> []convo.Line_Bind,
 	release: proc(data: rawptr, e: ^Engine, convs: []Object, undo: prim.Id) -> Error,
 }
 
@@ -244,6 +245,23 @@ _cu_undo_fence :: proc(e: ^Engine, convs: []Undo_Conv) {
 }
 
 @(private)
+_cu_first_reply_after :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (reply: Rid, err: Error) {
+	st := convo_status(e, o) or_return
+	at := st.head
+	for !obj.rid_none(at) {
+		m := convo_message(e, o, {msg = at}, context.temp_allocator) or_return
+		if m.hlc < hlc {
+			break
+		}
+		if m.role == .Assistant {
+			reply = at
+		}
+		at = m.parent
+	}
+	return reply, .None
+}
+
+@(private)
 _cu_head_before :: proc(e: ^Engine, o: Object, hlc: prim.Hlc) -> (head: Rid, err: Error) {
 	st := convo_status(e, o) or_return
 	at := st.head
@@ -301,16 +319,16 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 		}
 		append(lines, convo.Undo_Line{tree = tree, line = line, base = base})
 	}
-	for c, i in convs {
+	for c in convs {
 		if c.hidden {
 			continue
 		}
-		at := msg
-		if i > 0 {
-			at = _cu_head_before(e, c.o, t.hlc) or_return
+		at := _cu_first_reply_after(e, c.o, t.hlc) or_return
+		if obj.rid_none(at) {
+			continue
 		}
 		named := make(map[string]bool, context.temp_allocator)
-		if !obj.rid_none(at) {
+		{
 			fd := convo_files_at(e, c.o, at, context.temp_allocator) or_return
 			for d in fd {
 				rd := prim.reader(d.version)
@@ -425,16 +443,34 @@ _cu_undo_undone :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []U
 			append(&reverts, convo.Undone_Revert{tree = l.tree, line = l.line, revert = r})
 		}
 	}
+	kept := make([dynamic]convo.Line_Bind, context.temp_allocator)
+	if e.undo_hooks.checkouts != nil {
+		for c in convs {
+			if !c.hidden {
+				append(&kept, ..e.undo_hooks.checkouts(e.undo_hooks.data, e, c.o, context.temp_allocator))
+			}
+		}
+	}
 	h := _convo_writable(e, o) or_return
-	if _, x := convo.writer_undone(&h.cw, st.id, st.msg, leaves[:], reverts[:], nil, hidden[:]); x != .None {
+	if _, x := convo.writer_undone(&h.cw, st.id, st.msg, leaves[:], reverts[:], kept[:], hidden[:]); x != .None {
 		return _oerr(x)
+	}
+	for k in kept {
+		if _, x := convo.writer_notice(&h.cw, convo.Notice{undo = st.id, from = o.id, kind = .Checkout, tree = k.tree, line = k.line, paths = []string{k.mount}}); x != .None {
+			return _oerr(x)
+		}
 	}
 	return _cu_durable(e, h)
 }
 
 @(private)
 _cu_undo_unmount :: proc(e: ^Engine, o: Object, msg: Rid) -> Error {
-	fd := convo_files_at(e, o, msg, context.temp_allocator) or_return
+	t := convo_message(e, o, {msg = msg}, context.temp_allocator) or_return
+	at := _cu_first_reply_after(e, o, t.hlc) or_return
+	if obj.rid_none(at) {
+		return .None
+	}
+	fd := convo_files_at(e, o, at, context.temp_allocator) or_return
 	ms := convo_mounts(e, o, context.temp_allocator) or_return
 	h := _convo_writable(e, o) or_return
 	for m in ms {
