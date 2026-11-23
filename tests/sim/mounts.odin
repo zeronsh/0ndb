@@ -523,6 +523,10 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 		return
 	}
 	last := toks[len(toks) - 1]
+	end := last.pos + len(last.text)
+	if (last.pos > 0 && old[last.pos - 1] != '\n') || (end < len(old) && old[end] != '\n') {
+		return
+	}
 	tok := new_token(m, n, "a" if agent else "p")
 	if len(tok) != len(last.text) {
 		return
