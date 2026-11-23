@@ -894,9 +894,31 @@ check_live_duet :: proc(w: ^World) {
 	if !_probe_settle(w, pair) || string(a.doc[:]) != string(b.doc[:]) {
 		return
 	}
-	shown0 := eng.buffer_live_shown(&na.e, a.id) + eng.buffer_live_shown(&nb.e, b.id)
+	wa, ea := _type_at(w, na, a, 0)
+	node_after(na)
+	wb, eb := _type_at(w, nb, b, len(b.doc))
+	node_after(nb)
+	if ea != .None || eb != .None {
+		return
+	}
+	warm := false
+	for _ in 0 ..< 8 {
+		if !_probe_settle(w, pair) {
+			return
+		}
+		if strings.contains(string(a.doc[:]), wb) && strings.contains(string(b.doc[:]), wa) {
+			warm = true
+			break
+		}
+	}
+	if !warm {
+		return
+	}
+	sa0, sb0 := eng.buffer_live_shown(&na.e, a.id), eng.buffer_live_shown(&nb.e, b.id)
+	shown0 := sa0 + sb0
 	rx0a, rx0b, sk0a, sk0b := na.e.stats.buffer_live_received, nb.e.stats.buffer_live_received, na.e.stats.buffer_live_skipped, nb.e.stats.buffer_live_skipped
 	tx0a, tx0b := na.e.stats.buffer_live_sent, nb.e.stats.buffer_live_sent
+	kl0 := na.e.stats.buffer_live_keyless + nb.e.stats.buffer_live_keyless
 	tr0 := na.e.stats.buffer_live_transformed + nb.e.stats.buffer_live_transformed
 	toks := make([dynamic]string, w.allocator)
 	defer delete(toks)
@@ -951,11 +973,13 @@ check_live_duet :: proc(w: ^World) {
 			world_fail(w, "buffer: duet: %s's client document differs from its buffer after settle", n.name)
 		}
 	}
-	sa, sb := eng.buffer_live_shown(&na.e, a.id), eng.buffer_live_shown(&nb.e, b.id)
-	shown := sa + sb - shown0
+	sa, sb := eng.buffer_live_shown(&na.e, a.id) - sa0, eng.buffer_live_shown(&nb.e, b.id) - sb0
+	shown := sa + sb
+	_ = shown0
 	tr := na.e.stats.buffer_live_transformed + nb.e.stats.buffer_live_transformed - tr0
 	stat_add(w, STAT_BLIVE_DUET_KEYS, u64(len(toks)))
 	stat_add(w, STAT_BLIVE_DUET_SHOWN, shown)
 	stat_add(w, STAT_BLIVE_DUET_TRANSFORMED, tr)
-	world_note(w, "duet: %d keystrokes, %d shown live (%s sent %d, shown %d of %d received, %d skipped; %s sent %d, shown %d of %d received, %d skipped), %d transformed", len(toks), shown, na.name, na.e.stats.buffer_live_sent - tx0a, sa, na.e.stats.buffer_live_received - rx0a, na.e.stats.buffer_live_skipped - sk0a, nb.name, nb.e.stats.buffer_live_sent - tx0b, sb, nb.e.stats.buffer_live_received - rx0b, nb.e.stats.buffer_live_skipped - sk0b, tr)
+	world_note(w, "duet: %d keystrokes, %d shown live (%s sent %d, shown %d of %d received, %d skipped; %s sent %d, shown %d of %d received, %d skipped), %d transformed, %d keyless", len(toks), shown, na.name, na.e.stats.buffer_live_sent - tx0a, sa, na.e.stats.buffer_live_received - rx0a, na.e.stats.buffer_live_skipped - sk0a, nb.name, nb.e.stats.buffer_live_sent - tx0b, sb, nb.e.stats.buffer_live_received - rx0b, nb.e.stats.buffer_live_skipped - sk0b, tr, na.e.stats.buffer_live_keyless + nb.e.stats.buffer_live_keyless - kl0)
+	_probe_converge(w, a.oi)
 }
