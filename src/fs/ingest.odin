@@ -1326,6 +1326,11 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int) -> Error {
 		if serr != .None || !found || e.oid == {} {
 			continue
 		}
+		if c.kind == .Modify && c.old.kind == .File && c.old.oid != {} && c.old.oid != e.oid {
+			if a, has := m.attrib[c.path]; (!has || a.oid != c.old.oid) && odb.exists(m.db, c.old.oid) {
+				attrib_log_append(m, c.path, m.actor, c.old.oid) or_return
+			}
+		}
 		attrib_set(m, c.path, actor, true, e.oid)
 		attrib_log_append(m, c.path, actor, e.oid) or_return
 		logged = true
@@ -1391,13 +1396,13 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		}
 		matched, broken, gone := false, false, false
 		for st in steps {
-			if !odb.exists(m.db, st.oid) {
-				broken = true
-				break
-			}
 			if disk_oid == st.oid {
 				c.actor = st.actor
 				matched = true
+				break
+			}
+			if !odb.exists(m.db, st.oid) {
+				broken = true
 				break
 			}
 			committed := attribute_step(p, &c, st) or_return
