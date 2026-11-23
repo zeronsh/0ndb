@@ -426,13 +426,7 @@ _own_tree_epoch :: proc(e: ^Engine, h: ^Handle) {
 	if t == nil || sp.mode != .End_To_End {
 		return
 	}
-	tag, ok := space_epoch_tag(sp)
-	if !ok {
-		if g, found := sp.grant_epochs[h.id]; found && len(g) > 0 {
-			tag = g[len(g) - 1].tag
-			ok = true
-		}
-	}
+	tag, ok := _epoch_current(sp, h.id)
 	if !ok || t.tree.epoch == tag {
 		return
 	}
@@ -1070,25 +1064,24 @@ _tree_maybe_stale :: proc(sp: ^Space, rt: ^Remote_Tree) -> bool {
 
 @(private)
 _epoch_newest :: proc(sp: ^Space, rt: ^Remote_Tree) -> osync.Epoch_Tag {
-	newest: u32
-	tag: osync.Epoch_Tag
-	for x in sp.mem.epochs {
-		if x.number >= newest {
-			newest = x.number
-			tag = x.tag
-		}
+	id, _, ok := _object_of_name(rt.name)
+	if !ok {
+		tag, _ := space_epoch_tag(sp)
+		return tag
 	}
-	if id, _, ok := _object_of_name(rt.name); ok {
-		if g, found := sp.grant_epochs[id]; found {
-			for x in g {
-				if x.number >= newest {
-					newest = x.number
-					tag = x.tag
-				}
-			}
-		}
-	}
+	tag, _ := _epoch_current(sp, id)
 	return tag
+}
+
+@(private)
+_epoch_current :: proc(sp: ^Space, object: prim.Id) -> (tag: osync.Epoch_Tag, ok: bool) {
+	if tag, ok = space_epoch_tag(sp); ok {
+		return
+	}
+	if g, found := sp.grant_epochs[object]; found && len(g) > 0 {
+		return g[len(g) - 1].tag, true
+	}
+	return
 }
 
 @(private)
