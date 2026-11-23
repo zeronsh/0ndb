@@ -593,9 +593,51 @@ _probe_settle :: proc(w: ^World, bs: []^Sim_Buffer) -> bool {
 	return true
 }
 
+@(private = "file")
+_probe_converge :: proc(w: ^World, oi: int) {
+	for _ in 0 ..< 8 {
+		run_until(w, w.now + 30_000_000_000, true)
+		ref: string
+		have, same := false, true
+		for idx in readers_of(w, oi) {
+			n := w.nodes[idx]
+			if !n.alive || !n.e_open {
+				continue
+			}
+			context = instance_context(&n.inst)
+			t, err := eng.text_read(&n.e, w.model.objs[oi].o, w.allocator)
+			if err != .None {
+				same = false
+				continue
+			}
+			if !have {
+				ref, have = string(t), true
+			} else {
+				if string(t) != ref {
+					same = false
+				}
+				delete(t, w.allocator)
+			}
+		}
+		if have {
+			delete(ref, w.allocator)
+		}
+		if same {
+			return
+		}
+	}
+}
+
 check_live_probe :: proc(w: ^World) {
+	if oi := _live_probe(w); oi >= 0 {
+		_probe_converge(w, oi)
+	}
+}
+
+@(private = "file")
+_live_probe :: proc(w: ^World) -> int {
 	if len(w.failures) > 0 {
-		return
+		return -1
 	}
 	a, b: ^Sim_Buffer
 	outer: for x in w.bufs {
@@ -610,23 +652,23 @@ check_live_probe :: proc(w: ^World) {
 		}
 	}
 	if a == nil {
-		return
+		return -1
 	}
 	na, nb := w.nodes[a.node], w.nodes[b.node]
 	pair := []^Sim_Buffer{a, b}
 	if !_probe_settle(w, pair) {
-		return
+		return -1
 	}
 	k0 := len(a.groups)
 	_type(w, na, a)
 	if len(a.groups) == k0 {
-		return
+		return a.oi
 	}
 	warm := a.groups[len(a.groups) - 1]
 	seen := false
 	for _ in 0 ..< 8 {
 		if !_probe_settle(w, pair) {
-			return
+			return a.oi
 		}
 		if strings.contains(string(b.doc[:]), warm) && strings.contains(string(a.doc[:]), warm) {
 			seen = true
@@ -634,7 +676,7 @@ check_live_probe :: proc(w: ^World) {
 		}
 	}
 	if !seen {
-		return
+		return a.oi
 	}
 	before := nb.e.stats.buffer_live_applied
 	sent := na.e.stats.buffer_live_sent
@@ -642,7 +684,7 @@ check_live_probe :: proc(w: ^World) {
 	k := len(a.groups)
 	_type(w, na, a)
 	if len(a.groups) == k {
-		return
+		return a.oi
 	}
 	tok := a.groups[len(a.groups) - 1]
 	stat_add(w, STAT_BLIVE_PROBES)
@@ -650,16 +692,17 @@ check_live_probe :: proc(w: ^World) {
 		run_until(w, w.now + 1_000_000, false)
 		if nb.e.stats.buffer_live_applied > before {
 			_probe_settle(w, pair)
-			return
+			return a.oi
 		}
 		context = instance_context(&nb.inst)
 		text, _, err := eng.buffer_text(&nb.e, b.id, context.temp_allocator)
 		if err == .None && strings.contains(string(text), tok) {
 			world_fail(w, "buffer: live probe: %s typed %s with %s's buffer %d open and both settled, but it reached %s durably, not live (frames sent %d, received %d, skipped %d, rejected %d)", na.name, tok, nb.name, b.id, nb.name, na.e.stats.buffer_live_sent - sent, nb.e.stats.buffer_live_received - rx0, nb.e.stats.buffer_live_skipped - skip0, nb.e.stats.buffer_live_rejected - rej0)
-			return
+			return a.oi
 		}
 	}
 	world_fail(w, "buffer: live probe: %s typed %s but %s's buffer %d never showed it (frames sent %d)", na.name, tok, nb.name, b.id, na.e.stats.buffer_live_sent - sent)
+	return a.oi
 }
 
 @(private = "file")
@@ -669,8 +712,15 @@ _wp_ready :: proc(w: ^World, b: ^Sim_Buffer) -> bool {
 }
 
 check_settled_write :: proc(w: ^World) {
+	if oi := _settled_write(w); oi >= 0 {
+		_probe_converge(w, oi)
+	}
+}
+
+@(private = "file")
+_settled_write :: proc(w: ^World) -> int {
 	if len(w.failures) > 0 {
-		return
+		return -1
 	}
 	a, b: ^Sim_Buffer
 	outer: for x in w.bufs {
@@ -685,7 +735,7 @@ check_settled_write :: proc(w: ^World) {
 		}
 	}
 	if a == nil {
-		return
+		return -1
 	}
 	pair := []^Sim_Buffer{a, b}
 	settle :: proc(w: ^World, bs: []^Sim_Buffer) -> bool {
@@ -699,22 +749,23 @@ check_settled_write :: proc(w: ^World) {
 		return true
 	}
 	if !settle(w, pair) {
-		return
+		return -1
 	}
 	k0 := len(a.groups)
 	_type(w, w.nodes[a.node], a)
 	node_after(w.nodes[a.node])
 	if len(a.groups) == k0 {
-		return
+		return a.oi
 	}
 	warm := a.groups[len(a.groups) - 1]
 	for _ in 0 ..< 8 {
 		if !settle(w, pair) {
-			return
+			return a.oi
 		}
 		if strings.contains(string(b.doc[:]), warm) {
-			return
+			return a.oi
 		}
 	}
 	world_fail(w, "buffer: %s typed %s into a settled world but %s never got it", w.nodes[a.node].name, warm, w.nodes[b.node].name)
+	return a.oi
 }
