@@ -22,6 +22,7 @@ Mount_Options :: struct {
 	import_chunk: int,
 	line:         string,
 	follow_branch: bool,
+	index_trust:  bool,
 }
 
 DEFAULT_MOUNT :: Mount_Options {
@@ -33,6 +34,7 @@ DEFAULT_MOUNT :: Mount_Options {
 	import_chunk = 8192,
 	line         = "main",
 	follow_branch = true,
+	index_trust  = ODIN_OS == .Windows,
 }
 
 Scope :: struct {

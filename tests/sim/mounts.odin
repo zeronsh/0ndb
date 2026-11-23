@@ -147,7 +147,9 @@ node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string, pending: ^bool = 
 	}
 	grains := [?]i64{0, 1_000_000_000, 2_000_000_000}
 	disk_set_grain(&n.disk, root, grains[mix_bytes(w.cfg.seed, transmute([]u8)root) % len(grains)])
-	m, err := eng.tree_mount(&n.e, w.model.objs[oi].o, root, fs.DEFAULT_MOUNT, eng.Mount_Done{data = n, call = _mount_durable})
+	mopts := fs.DEFAULT_MOUNT
+	mopts.index_trust = w.cfg.seed % 3 == 1
+	m, err := eng.tree_mount(&n.e, w.model.objs[oi].o, root, mopts, eng.Mount_Done{data = n, call = _mount_durable})
 	waiting := err == .Pending && m != nil
 	if err != .None && !waiting {
 		return err
