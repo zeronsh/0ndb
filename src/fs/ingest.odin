@@ -1516,7 +1516,6 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		m.importing = true
 		ierr := mount_recover(m)
 		if ierr == .None {
-			warm_import(m)
 			ierr = mount_import(m)
 		}
 		m.importing = false
