@@ -2025,6 +2025,21 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || rm.retry_hold || _covered_inflight(rm, gap) {
 		return
 	}
+	if !rm.trimmed || gap.from >= rm.base {
+		_fetch_run(r, rm, gap)
+		return
+	}
+	_arc_want(r, rm, gap.from, min(gap.to, rm.base))
+	for g, need := _unfetched(rm, rm.base, gap.to); need; g, need = _unfetched(rm, g.to, gap.to) {
+		_fetch_run(r, rm, g)
+	}
+}
+
+@(private)
+_fetch_run :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
+	if _covered_inflight(rm, gap) {
+		return
+	}
 	prev_end := i64(0)
 	next_start := rm.relay_len if rm.relay_len >= gap.to else gap.to
 	for h in journal.replica_have(&rm.rep) {
@@ -2035,7 +2050,7 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 			break
 		}
 	}
-	if rm.trimmed && gap.from >= rm.base {
+	if rm.trimmed {
 		prev_end = max(prev_end, rm.base)
 	}
 	fetch := gap
@@ -2071,15 +2086,8 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 			fetch.to = fetch.from + STAGE_MAX
 		}
 	}
-	if fetch.from < rm.base && rm.trimmed {
-		_arc_want(r, rm, max(gap.from, fetch.from), min(max(gap.to, fetch.from), rm.base))
-		if gap.to <= rm.base {
-			return
-		}
-		for g, need := _unfetched(rm, max(rm.base, gap.from), gap.to); need; g, need = _unfetched(rm, g.to, gap.to) {
-			_fetch_gap(r, rm, g)
-		}
-		return
+	if rm.trimmed {
+		fetch.from = max(fetch.from, rm.base)
 	}
 	if fetch.from < rm.base {
 		_pull_range(r, rm, fetch.from, min(fetch.to, rm.base))
