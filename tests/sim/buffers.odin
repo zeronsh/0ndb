@@ -35,6 +35,7 @@ Sim_Buffer :: struct {
 	groups:  [dynamic]string,
 	dead:    bool,
 	line:    string,
+	ovl:     int,
 }
 
 Sim_Anchor :: struct {
@@ -64,6 +65,11 @@ _on_buffer :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Buffer_Event) {
 	switch ev.kind {
 	case .Delta:
 		append(&b.inbox, Buf_In{ack = ev.ack, rev = ev.rev, ops = _ops_copy(w, ev.ops)})
+		k := eng.buffer_overlay(e, ev.buffer)
+		if k > b.ovl {
+			stat_add(w, STAT_BLIVE_SHOWN, u64(k - b.ovl))
+		}
+		b.ovl = k
 	case .Closed:
 		append(&b.inbox, Buf_In{closed = true})
 	case .Cursors:
@@ -245,7 +251,12 @@ _edit :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer, pos: int, del: int, ins: stri
 	}
 	crdt.delta_trim(&ops)
 	context = instance_context(&n.inst)
-	ack, applied, err := eng.buffer_edit(&n.e, b.id, b.rev, []eng.Buffer_Edit{{pos, del, transmute([]u8)ins}}, group)
+	held := eng.Ready{call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}}
+	ack, applied, err := eng.buffer_edit(&n.e, b.id, b.rev, []eng.Buffer_Edit{{pos, del, transmute([]u8)ins}}, group, held)
+	if err == .Pending {
+		stat_add(w, STAT_BLIVE_HELD)
+		return .Busy
+	}
 	if err != .None {
 		return err
 	}
@@ -260,6 +271,12 @@ _edit :: proc(w: ^World, n: ^Node, b: ^Sim_Buffer, pos: int, del: int, ins: stri
 	}
 	_doc_apply(b, ops[:])
 	b.seq += 1
+	for x in w.bufs {
+		if x.oi == b.oi && x.node != b.node && !x.dead && w.nodes[x.node].alive && x.inc == w.nodes[x.node].incarnation {
+			stat_add(w, STAT_BLIVE_PEER_EDITS)
+			break
+		}
+	}
 	if ack != b.seq {
 		world_fail(w, "buffer: %s buffer %d acked %d for edit %d", n.name, b.id, ack, b.seq)
 	}
@@ -447,6 +464,9 @@ check_buffers :: proc(w: ^World) {
 			continue
 		}
 		_check_client(w, n, b)
+		if k := eng.buffer_overlay(&n.e, b.id); k > 0 {
+			world_fail(w, "buffer: %s buffer %d still shows %d live batches after settle", n.name, b.id, k)
+		}
 		if m.objs[b.oi].kind == .Text && obj_exists(m, b.oi) {
 			context = instance_context(&n.inst)
 			view, _, verr := eng.buffer_text(&n.e, b.id, context.temp_allocator)
@@ -456,6 +476,16 @@ check_buffers :: proc(w: ^World) {
 			}
 		}
 		node_after(n)
+	}
+	stat_add(w, STAT_BLIVE_SEALS, w.cipher.bufseals)
+	stat_add(w, STAT_BLIVE_RX, w.cipher.bufrx)
+	for n in w.nodes {
+		if n.alive && n.e_open {
+			stat_add(w, STAT_BLIVE_APPLIED, n.e.stats.buffer_live_applied)
+			stat_add(w, STAT_BLIVE_CONFIRMED, n.e.stats.buffer_live_confirmed)
+			stat_add(w, STAT_BLIVE_DROPPED, n.e.stats.buffer_live_dropped)
+			stat_add(w, STAT_BLIVE_INTENTS, n.e.stats.buffer_live_intents)
+		}
 	}
 	Seen :: struct {
 		node: string,
@@ -512,6 +542,17 @@ check_buffers :: proc(w: ^World) {
 STAT_BUFFERS: Stat
 STAT_BURSTS: Stat
 STAT_ANCHORS_CHECKED: Stat
+STAT_BLIVE_APPLIED: Stat
+STAT_BLIVE_CONFIRMED: Stat
+STAT_BLIVE_DROPPED: Stat
+STAT_BLIVE_HELD: Stat
+STAT_BLIVE_SEALS: Stat
+STAT_BLIVE_RX: Stat
+STAT_BLIVE_SHOWN: Stat
+STAT_BLIVE_PEER_EDITS: Stat
+STAT_BLIVE_INTENTS: Stat
+
+STAT_BLIVE_PROBES: Stat
 
 @(init)
 _buffers_stats :: proc "contextless" () {
@@ -520,4 +561,102 @@ _buffers_stats :: proc "contextless" () {
 	STAT_BUFFERS = register_stat(30, 0, "buffers_opened")
 	STAT_BURSTS = register_stat(30, 1, "bursts")
 	STAT_ANCHORS_CHECKED = register_stat(30, 2, "anchors_checked")
+	STAT_BLIVE_APPLIED = register_stat(30, 3, "live_applied")
+	STAT_BLIVE_CONFIRMED = register_stat(30, 4, "live_confirmed")
+	STAT_BLIVE_DROPPED = register_stat(30, 5, "live_dropped")
+	STAT_BLIVE_HELD = register_stat(30, 6, "live_held")
+	STAT_BLIVE_SEALS = register_stat(30, 7, "live_seals")
+	STAT_BLIVE_RX = register_stat(30, 8, "live_delivered")
+	STAT_BLIVE_SHOWN = register_stat(30, 9, "live_shown")
+	STAT_BLIVE_PEER_EDITS = register_stat(30, 10, "peer_edits")
+	STAT_BLIVE_INTENTS = register_stat(30, 11, "live_intents")
+	STAT_BLIVE_PROBES = register_stat(30, 12, "live_probes")
+	register_final_check(1, check_live_probe)
+}
+
+@(private = "file")
+_probe_ready :: proc(w: ^World, b: ^Sim_Buffer) -> bool {
+	n := w.nodes[b.node]
+	return !b.dead && n.alive && n.e_open && b.inc == n.incarnation && w.model.objs[b.oi].kind == .Text && obj_exists(&w.model, b.oi)
+}
+
+@(private = "file")
+_probe_settle :: proc(w: ^World, bs: []^Sim_Buffer) -> bool {
+	run_until(w, w.now + 30_000_000_000, true)
+	for b in bs {
+		buffers_deliver(w, b, len(b.inbox))
+		if !_probe_ready(w, b) || len(b.pending) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+check_live_probe :: proc(w: ^World) {
+	if len(w.failures) > 0 {
+		return
+	}
+	a, b: ^Sim_Buffer
+	outer: for x in w.bufs {
+		if !_probe_ready(w, x) {
+			continue
+		}
+		for y in w.bufs {
+			if y.node != x.node && y.oi == x.oi && _probe_ready(w, y) {
+				a, b = x, y
+				break outer
+			}
+		}
+	}
+	if a == nil {
+		return
+	}
+	na, nb := w.nodes[a.node], w.nodes[b.node]
+	pair := []^Sim_Buffer{a, b}
+	if !_probe_settle(w, pair) {
+		return
+	}
+	k0 := len(a.groups)
+	_type(w, na, a)
+	if len(a.groups) == k0 {
+		return
+	}
+	warm := a.groups[len(a.groups) - 1]
+	seen := false
+	for _ in 0 ..< 8 {
+		if !_probe_settle(w, pair) {
+			return
+		}
+		if strings.contains(string(b.doc[:]), warm) && strings.contains(string(a.doc[:]), warm) {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		return
+	}
+	before := nb.e.stats.buffer_live_applied
+	sent := na.e.stats.buffer_live_sent
+	rx0, skip0, rej0 := nb.e.stats.buffer_live_received, nb.e.stats.buffer_live_skipped, nb.e.stats.buffer_live_rejected
+	k := len(a.groups)
+	_type(w, na, a)
+	if len(a.groups) == k {
+		return
+	}
+	tok := a.groups[len(a.groups) - 1]
+	stat_add(w, STAT_BLIVE_PROBES)
+	for _ in 0 ..< 4000 {
+		run_until(w, w.now + 1_000_000, false)
+		if nb.e.stats.buffer_live_applied > before {
+			_probe_settle(w, pair)
+			return
+		}
+		context = instance_context(&nb.inst)
+		text, _, err := eng.buffer_text(&nb.e, b.id, context.temp_allocator)
+		if err == .None && strings.contains(string(text), tok) {
+			world_fail(w, "buffer: live probe: %s typed %s with %s's buffer %d open and both settled, but it reached %s durably, not live (frames sent %d, received %d, skipped %d, rejected %d)", na.name, tok, nb.name, b.id, nb.name, na.e.stats.buffer_live_sent - sent, nb.e.stats.buffer_live_received - rx0, nb.e.stats.buffer_live_skipped - skip0, nb.e.stats.buffer_live_rejected - rej0)
+			return
+		}
+	}
+	world_fail(w, "buffer: live probe: %s typed %s but %s's buffer %d never showed it (frames sent %d)", na.name, tok, nb.name, b.id, na.e.stats.buffer_live_sent - sent)
 }

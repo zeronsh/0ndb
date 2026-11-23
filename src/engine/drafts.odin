@@ -378,6 +378,10 @@ _draft_remote_key :: proc(sp: ^Space, id: osync.Stream_Id, msg: i64) -> (key: jo
 
 @(private)
 _draft_on_repl :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
+	if ev.kind == .Draft && ev.to == LIVE_BUFFER_MSG {
+		_buffer_live_rx(e, sp, ev)
+		return
+	}
 	if ev.kind == .Draft_Pulled {
 		_draft_serve(e, sp, ev)
 		return
