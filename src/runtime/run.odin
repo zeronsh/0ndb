@@ -78,6 +78,8 @@ Run :: struct {
 	sub:          eng.Sub_Id,
 	raw:          journal.Journal,
 	raw_open:     bool,
+	line_at:      fs.Observe_Since,
+	line_prev:    fs.Observe_Since,
 	raw_link:     Rid,
 	started_ms:   i64,
 	token:        string,
@@ -220,6 +222,10 @@ run_raw :: proc(run: ^Run, kind: u8, data: []u8) -> (off: i64) {
 	at, err := journal.journal_append(&run.raw, body)
 	if err == .None {
 		off = at
+	}
+	if kind == RAW_STDOUT || kind == RAW_HTTP {
+		run.line_prev = run.line_at
+		run.line_at = fs.Observe_Since{mono = prim.clock_mono_ns(r.e.cfg.clock), wall = prim.clock_wall_ns(r.e.cfg.clock)}
 	}
 	r.stats.raw_lines += 1
 	return

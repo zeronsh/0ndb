@@ -673,7 +673,16 @@ equal in both directions.
   (exactly once) only after; a supervisor that can hold a write (the Linux
   seccomp supervisor, which parks the notification) sets the `Release` and
   keeps the write blocked until it runs. A runtime tool-call pin records its path the same
-  way but cannot hold the provider's write. On macOS without Endpoint
+  way but cannot hold the provider's write. A provider can write before the
+  runtime has interpreted the tool_use line that names the file, so the
+  watcher's change arrives first; it is still the tool's. Each unscoped dirty
+  path records when it was first seen (the engine's monotonic clock), and the
+  tool's scope open and observation carry the receive time of the run's
+  provider line before that tool_use: the scope's opening pass leaves changes
+  first seen at or after it pending, and the observation claims a pending
+  change on the path it names (a file the watcher has not reported yet counts
+  when its mtime is within a timestamp tick of that time). A change on any
+  other path stays the person's. On macOS without Endpoint
   Security (libproc sees a change only after it happened) and on Windows,
   nothing holds a write: a write the runtime did not pin (an agent's shell
   command writing a file directly) is recorded only after the fact, so after

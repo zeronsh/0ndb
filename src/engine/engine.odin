@@ -731,6 +731,11 @@ _wall_ms :: proc(e: ^Engine) -> i64 {
 }
 
 @(private)
+_mono_ns_data :: proc(data: rawptr) -> i64 {
+	return prim.clock_mono_ns((^Engine)(data).cfg.clock)
+}
+
+@(private)
 _wall_ns_data :: proc(data: rawptr) -> i64 {
 	return prim.clock_wall_ns((^Engine)(data).cfg.clock)
 }
@@ -747,7 +752,7 @@ _obj_clock :: proc(e: ^Engine) -> obj.Clock {
 
 @(private)
 _fs_clock :: proc(e: ^Engine) -> fs.Clock {
-	return fs.Clock{data = e, wall_ms = _wall_ms_data}
+	return fs.Clock{data = e, wall_ms = _wall_ms_data, mono_ns = _mono_ns_data}
 }
 
 @(private)
