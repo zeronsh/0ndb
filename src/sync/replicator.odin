@@ -192,6 +192,7 @@ Remote :: struct {
 	head_min:  u64,
 	is_head:   bool,
 	tamper_hold: bool,
+	tamper_retried: bool,
 	plain:     bool,
 	skey:      journal.Key,
 	reaping:   bool,
@@ -620,6 +621,7 @@ replicator_follow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name
 	_enter(r)
 	defer _leave(r)
 	rm := _remote_get(r, scope, device, name, epoch) or_return
+	_tamper_release(r, rm, true)
 	was := rm.follow
 	upgrade := full && !rm.full
 	rm.follow = true
@@ -676,6 +678,7 @@ replicator_want :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: 
 		}
 	}
 	rm := _remote_get(r, scope, device, name, epoch) or_return
+	_tamper_release(r, rm, true)
 	for g in ranges {
 		rm.backward = g.from < rm.last_from
 		rm.last_from = g.from
@@ -713,6 +716,7 @@ replicator_want_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, n
 
 @(private)
 _remote_want_tail :: proc(r: ^Replicator, rm: ^Remote, n: i64) -> Error {
+	_tamper_release(r, rm, true)
 	rm.tail = max(rm.tail, max(n, 1))
 	rm.backward = true
 	rm.want_gen += 1
@@ -780,6 +784,7 @@ replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 		_repl_flush(r)
 		return .Current
 	}
+	_tamper_release(r, rm, true)
 	lo := max(rm.relay_len - TAIL_DEFAULT, 0)
 	if _, missing := journal.replica_missing(&rm.rep, lo, rm.relay_len); !missing {
 		_repl_flush(r)
@@ -1961,6 +1966,7 @@ _stage_flush :: proc(r: ^Replicator, final: bool, stream_len: i64) {
 				_emit(r, Repl_Event{kind = .Refused, err = _from_journal(err), device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
 			} else if !bad {
 				r.tamper_run = 0
+				rm.tamper_retried = false
 			}
 		}
 		if bad {
@@ -2040,13 +2046,25 @@ _tamper :: proc(r: ^Replicator, rm: ^Remote) {
 	if r.tamper_run == TAMPER_REPORT {
 		_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
 	}
-	if len(r.endpoints) > 1 {
-		r.tampered = true
+	rm.tamper_hold = true
+	clear(&rm.inflight)
+}
+
+@(private)
+_tamper_release :: proc(r: ^Replicator, rm: ^Remote, request := false) {
+	if !request {
+		rm.tamper_retried = false
+	}
+	if !rm.tamper_hold || (request && rm.tamper_retried) {
 		return
 	}
-	rm.tamper_hold = true
-	if r.retry == 0 {
-		r.retry = prim.timer(r.loop, RETRY_MS, r, _on_retry)
+	if request {
+		rm.tamper_retried = true
+	}
+	rm.tamper_hold = false
+	if r.phase == .Ready {
+		_remote_pull(r, rm)
+		_remote_settle(r, rm)
 	}
 }
 
@@ -2219,6 +2237,7 @@ _seen_stream :: proc(r: ^Replicator, id: Stream_Id, length: i64) {
 			if length > journal.replica_length(&rm.rep) {
 				journal.replica_set_length(&rm.rep, length)
 			}
+			_tamper_release(r, rm)
 			if rm.is_head && rm.kfollow {
 				_kwait_head_want(r, rm)
 			}
@@ -2523,6 +2542,8 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		clear(&l.verify)
 	}
 	for _, rm in r.remotes {
+		rm.tamper_hold = false
+		rm.tamper_retried = false
 		clear(&rm.inflight)
 		clear(&rm.pulls)
 		clear(&rm.refused)
