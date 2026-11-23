@@ -283,7 +283,9 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 		return {}, _buffer_wait(e, h, herr, opts.wait)
 	}
 	_buffer_follow(e, h)
-	_hist_catch_up(e, h)
+	if cerr := _hist_caught_up(e, h); cerr != .None {
+		return {}, _buffer_wait(e, h, cerr, opts.wait)
+	}
 	inode: fstree.Inode_Id
 	tree_at: Tree_At
 	if kind == .Text {
@@ -628,7 +630,7 @@ _buffer_advance :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 		return .Closed
 	}
 	_buffer_follow(e, h)
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	_buffer_live_follow(e, h, true)
 	target := _buffer_target(b, h) or_return
 	st: Sink_State
@@ -723,7 +725,10 @@ _buffers_tick :: proc(e: ^Engine) {
 		if err != .None {
 			continue
 		}
-		if aerr := _buffer_advance(e, b, h); aerr != .None && aerr != .Missing && !_store_err(e, aerr) {
+		aerr := _buffer_advance(e, b, h)
+		if aerr == .Busy {
+			b.dirty = true
+		} else if aerr != .None && aerr != .Missing && !_store_err(e, aerr) {
 			_log(e, .Warn, "buffer advance failed")
 		}
 	}

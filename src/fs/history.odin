@@ -132,6 +132,7 @@ History :: struct {
 	mark:       u64,
 	mark_fp:    [3]u64,
 	content_mark: u64,
+	own_len:    i64,
 	staged:     [dynamic]Staged_Blob,
 	mounts:     [dynamic]^Mount,
 	pins:       [dynamic]odb.Oid,
@@ -236,6 +237,13 @@ history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self:
 		return err
 	}
 	return .None
+}
+
+history_own_durable :: proc(h: ^History) -> i64 {
+	if h.awake {
+		return journal.journal_durable_len(&h.journal)
+	}
+	return h.own_len
 }
 
 history_wall_ms :: proc(h: ^History) -> i64 {
@@ -802,6 +810,7 @@ history_sleep :: proc(h: ^History) {
 		crdt.dict_destroy(&d)
 	}
 	delete(h.rdicts)
+	h.own_len = journal.journal_durable_len(&h.journal)
 	journal.journal_close(&h.journal)
 	kv_groups_free(&h.kv, &h.held, h.allocator)
 	h.held = kv_groups_take(&h.kv)
@@ -1374,14 +1383,14 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		if len(d.ids) == known {
 			return 0, .None
 		}
-		return 0, history_persist(h)
+		return 0, admit_persist(h)
 	}
 	if body[0] == REC_REPLACE {
 		apply_replace_record(h, si, body, u64(off)) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, admit_persist(h)
 	}
 	if body[0] == REC_ALIAS {
 		rd := prim.reader(body[1:])
@@ -1404,35 +1413,35 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, admit_persist(h)
 	}
 	if body[0] == REC_LINE {
 		apply_line_record(h, stream, body) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, admit_persist(h)
 	}
 	if body[0] == REC_ACTOR {
 		apply_actor_record(h, stream, body) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, admit_persist(h)
 	}
 	if body[0] == REC_SEAL {
 		apply_seal_record(h, si, body) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, admit_persist(h)
 	}
 	if body[0] == REC_REDACT {
 		apply_redact_record(h, body, true) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
-		return 0, history_persist(h)
+		return 0, admit_persist(h)
 	}
 	if body[0] != REC_BATCH && body[0] != REC_IMPORT {
 		return 0, .None
@@ -1483,10 +1492,10 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		h.applied[si] = off + 1
 	}
 	if h.own_wait && si != 0 {
-		history_persist(h) or_return
-		return valid, replay_own(h)
+		admit_persist(h) or_return
+		return valid, history_resume(h)
 	}
-	return valid, history_persist(h)
+	return valid, admit_persist(h)
 }
 
 @(private)
@@ -1512,10 +1521,19 @@ admit_import :: proc(h: ^History, si: u32, off: i64, body: []u8, dict: ^crdt.Act
 		h.applied[si] = off + 1
 	}
 	if h.own_wait && si != 0 {
-		history_persist(h) or_return
-		return n, replay_own(h)
+		admit_persist(h) or_return
+		return n, history_resume(h)
 	}
-	return n, history_persist(h)
+	return n, admit_persist(h)
+}
+
+@(private)
+admit_persist :: proc(h: ^History) -> Error {
+	if history_persist(h) == .None {
+		return .None
+	}
+	history_reload(h)
+	return .Reloading
 }
 
 history_persist :: proc(h: ^History) -> Error {
@@ -2749,7 +2767,9 @@ replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: b
 		return true, .None
 	}
 	aerr or_return
-	history_persist(h) or_return
+	if history_persist(h) != .None {
+		return false, .Reloading
+	}
 	history_unload_files(h)
 	crdt.graph_trim(&h.g)
 	fstree.trim(&h.tree, 64)
@@ -2760,7 +2780,11 @@ history_resume :: proc(h: ^History) -> Error {
 	if !h.awake || !h.own_wait {
 		return .None
 	}
-	return replay_own(h)
+	err := replay_own(h)
+	if err == .Reloading {
+		history_reload(h)
+	}
+	return err
 }
 
 @(private)
@@ -2834,7 +2858,7 @@ replay_pause :: proc(h: ^History, off: i64) -> Error {
 	}
 	err := history_persist(h)
 	history_unload_files(h)
-	return err
+	return .Reloading if err != .None else .None
 }
 
 @(private)
@@ -2925,7 +2949,7 @@ replay_own :: proc(h: ^History) -> Error {
 	h.applied[0] = end
 	err := history_persist(h)
 	history_unload_files(h)
-	return err
+	return .Reloading if err != .None else .None
 }
 
 @(private)
@@ -3218,6 +3242,9 @@ history_register_owned_actor :: proc(h: ^History, actor, pseudo, owner: prim.Id)
 	}
 	h.applied[0] = journal.journal_durable_len(&h.journal)
 	apply_actor_record(h, h.self, h.io[:]) or_return
+	if h.persist_due {
+		return admit_persist(h)
+	}
 	return kv_commit(&h.kv)
 }
 
@@ -3239,6 +3266,7 @@ history_owned_actors :: proc(h: ^History, owners: []prim.Id, allocator := contex
 }
 
 history_register_actor :: proc(h: ^History, actor, mount: prim.Id) -> Error {
+	history_wake(h) or_return
 	if _, known := history_actor_owner(h, actor); known {
 		return .None
 	}
@@ -3255,6 +3283,9 @@ history_register_actor :: proc(h: ^History, actor, mount: prim.Id) -> Error {
 	}
 	h.applied[0] = journal.journal_durable_len(&h.journal)
 	apply_actor_record(h, h.self, h.io[:]) or_return
+	if h.persist_due {
+		return admit_persist(h)
+	}
 	return kv_commit(&h.kv)
 }
 
