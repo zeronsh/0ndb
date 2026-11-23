@@ -143,6 +143,13 @@ map_reapply :: proc(e: ^Engine, o: Object) -> Error {
 
 map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator, ready: Ready = {}) -> (entry: Map_Entry, found: bool, err: Error) {
 	context = context_for(e)
+	entry, found, err = _map_get(e, o, key, allocator, ready)
+	return entry, found, _damage_read(e, o, err, ready)
+}
+
+@(private)
+_map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator, ready: Ready = {}) -> (entry: Map_Entry, found: bool, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
@@ -161,6 +168,13 @@ map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator
 }
 
 map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Map_Row, more: bool, err: Error) {
+	context = context_for(e)
+	rows, more, err = _map_scan(e, o, prefix, after, limit, allocator, ready)
+	return rows, more, _damage_read(e, o, err, ready)
+}
+
+@(private)
+_map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Map_Row, more: bool, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
