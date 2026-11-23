@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:mem/virtual"
 import "core:strings"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../odb"
 import "../prim"
@@ -138,7 +139,7 @@ mount_set_go_back :: proc(s: ^Mount_Set, versions: []Tree_Version, spawner: Spaw
 			if mb.name != tv.name {
 				continue
 			}
-			mount_restore(mb.mount, tv.version) or_return
+			mount_restore(mb.mount, tv.version, thread) or_return
 			if mb.mount.has_git && len(tv.commit) > 0 {
 				git_restore(mb.mount, tv.branch, tv.commit, spawner, thread) or_return
 			}
@@ -147,7 +148,7 @@ mount_set_go_back :: proc(s: ^Mount_Set, versions: []Tree_Version, spawner: Spaw
 	return .None
 }
 
-mount_restore :: proc(m: ^Mount, target: Version) -> Error {
+mount_restore :: proc(m: ^Mount, target: Version, owner: prim.Id) -> Error {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
 		return .No_Memory
@@ -160,6 +161,17 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 	tl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &cl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
 		return .Not_Found
+	}
+	pseudo := mount_revert_pseudo(m.id, m.line, owner)
+	ractor := fshist.ingestion_actor(h.self, pseudo)
+	if known := crdt.graph_known(&h.g, ractor); known > 0 {
+		if prev, pok := crdt.graph_lv(&h.g, crdt.Op_Id{ractor, known - 1}); pok {
+			one := [1]crdt.Lv{prev}
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, cl[:], one[:], &both)
+			clear(&cl)
+			append(&cl, ..both[:])
+		}
 	}
 	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
@@ -176,7 +188,7 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 	defer fstree.snapshot_destroy(&snap_t)
 	order := sorted_inodes(touched)
 	b: Builder
-	builder_init(&b, h, m.actor)
+	builder_init(&b, h, ractor)
 	for ino in order {
 		it, okt, e1 := fstree.info(&snap_t, ino, context.temp_allocator)
 		ic, okc, e2 := fstree.info(&snap_c, ino, context.temp_allocator)
@@ -233,6 +245,7 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 	if b.n == 0 {
 		return .None
 	}
+	history_register_actor(h, ractor, pseudo) or_return
 	before := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
 	copy(before, m.synced[:])
 	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
