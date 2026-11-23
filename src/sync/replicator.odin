@@ -249,6 +249,8 @@ Remote :: struct {
 	arc:       ^Arc_Read,
 	arc_of:    ^Remote,
 	arc_broken: [dynamic]journal.Range,
+	need_from: i64,
+	need_set:  bool,
 }
 
 Group :: struct {
@@ -1940,6 +1942,11 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 		}
 	}
 	fetch := gap
+	if rm.need_set && rm.need_from < fetch.from && rm.need_from >= prev_end {
+		fetch.from = rm.need_from
+		_claim(rm, fetch.from)
+	}
+	rm.need_set = false
 	if fetch.to - fetch.from < MIN_FETCH {
 		if rm.backward {
 			fetch.from = max(fetch.to - MIN_FETCH, prev_end)
