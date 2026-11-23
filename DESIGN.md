@@ -441,7 +441,10 @@ equal in both directions.
   again instead of trusting an index that misses its records. A persist whose
   log write is durable but whose index update fails clears its pending
   changes (they are in the log) and rebuilds the hash file from the log;
-  only if that fails is the index marked lost. Compaction carries each
+  only if that fails is the index marked lost. A lost index is never read:
+  every later lookup, change or persist first rebuilds it from the log and,
+  while that fails, returns the error, so a pass fails (and stays dirty)
+  instead of missing an entry the torn index no longer finds. Compaction carries each
   entry's version into the new generation's own version table, since an
   entry's version index names a table that belongs to one shadow.
   A compaction writes and syncs the whole new generation before it
