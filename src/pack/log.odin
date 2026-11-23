@@ -262,6 +262,9 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 	if p.poisoned {
 		return false, .Io
 	}
+	if p.fl_retry {
+		return false, .None
+	}
 	_emit_dirty(p) or_return
 	_collect_externals(p) or_return
 	if len(p.fl.fds) > 0 || p.dirsync_pending {
@@ -340,6 +343,14 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 @(private)
 _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 	fl := &p.fl
+	if (err == .No_Space || err == .Io) && fl.kind == .Commit && !p.closing {
+		fl.on = false
+		p.fl_retry = true
+		p.fl_err = err
+		return .None
+	}
+	p.fl_retry = false
+	p.fl_err = .None
 	if err != .None && len(fl.fds) > 0 {
 		inums := make([dynamic]u64, context.temp_allocator)
 		for j in fl.fds {
@@ -427,6 +438,7 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 		return _poison(p, err)
 	}
 	if wrote {
+		p.space_wait = false
 		p.last_cont = fl.cont
 		p.last_start = fl.start
 		p.durable_seq = fl.seq
@@ -627,6 +639,13 @@ _drain :: proc(p: ^Pack) -> Error {
 @(private)
 _commit :: proc(p: ^Pack) -> Error {
 	_drain(p) or_return
+	if p.fl_retry {
+		_retry(p) or_return
+		_drain(p) or_return
+		if p.fl_retry {
+			return .None
+		}
+	}
 	wrote := _commit_write(p) or_return
 	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
 	_collect_scans(p) or_return
@@ -853,6 +872,9 @@ _start_async :: proc(p: ^Pack) -> Error {
 	if p.fl.on {
 		return .None
 	}
+	if p.fl_retry {
+		return _retry(p)
+	}
 	wrote := _commit_write(p) or_return
 	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
 	_collect_scans(p) or_return
@@ -994,6 +1016,9 @@ _flush_start :: proc(p: ^Pack) -> Error {
 	if p.poisoned {
 		return .Io
 	}
+	if p.fl_retry {
+		return _retry(p)
+	}
 	wrote := _commit_write(p) or_return
 	fl_seq := p.seq - 1 if wrote else p.durable_seq
 	p.want_flush = false
@@ -1057,21 +1082,37 @@ _flush_start :: proc(p: ^Pack) -> Error {
 	}
 	fl.run_fd = prim.INVALID_FD
 	if p.mem.count > 0 {
+		run_id := p.next_run
+		pb: prim.Path_Buf
+		path := _phys_path(p, &pb, 'r', u64(run_id))
+		fd, err := prim.open_file(p.base, path, {.Write, .Create, .Truncate}, 0o600)
+		if err == .None {
+			err = _prealloc(p, fd, 0, i64(_mem_bytes(&p.mem)) * 2 + RUN_SLACK)
+			if err != .None {
+				prim.close_file(p.base, fd)
+				prim.remove(p.base, path)
+			}
+		}
+		if err == .No_Space {
+			p.space_wait = true
+			fl.kind = .Commit
+			return _submit(p)
+		}
+		if err != .None {
+			return _poison(p, err)
+		}
 		imm := new(Mem, p.allocator)
 		if imm == nil {
+			prim.close_file(p.base, fd)
+			prim.remove(p.base, path)
 			return _poison(p, .No_Memory)
 		}
 		imm^ = p.mem
 		_mem_init(&p.mem, p.allocator)
 		fl.imm = imm
 		fl.drop = len(p.runs) == 0
-		fl.run_id = p.next_run
+		fl.run_id = run_id
 		p.next_run += 1
-		pb: prim.Path_Buf
-		fd, err := prim.open_file(p.base, _phys_path(p, &pb, 'r', u64(fl.run_id)), {.Write, .Create, .Truncate}, 0o600)
-		if err != .None {
-			return _poison(p, err)
-		}
 		fl.run_fd = fd
 	}
 	clear(&p.dirty)
