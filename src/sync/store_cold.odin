@@ -31,12 +31,13 @@ Tier_Ev :: struct {
 
 @(private)
 Tier_Thaw :: struct {
-	ts:   ^Tier_Stream,
-	from: i64,
-	to:   i64,
-	low:  i64,
-	high: i64,
-	job:  ^Tier_Job,
+	ts:    ^Tier_Stream,
+	from:  i64,
+	to:    i64,
+	low:   i64,
+	high:  i64,
+	job:   ^Tier_Job,
+	tries: int,
 }
 
 @(private)
@@ -303,6 +304,11 @@ _tier_thaw_fetched :: proc(ctx: rawptr, rg: ^Tier_Range, err: Error) {
 	}
 	_tier_range_end(rg)
 	if e != .None {
+		th.tries += 1
+		if c := th.ts.cold; c != nil && th.tries < TIER_TRIES {
+			_tier_cold_fetch(sp, c, th.low, th.high - th.low, _tier_thaw_fetched, th)
+			return
+		}
 		_tier_thaw_end(th, e if e != .Pending else .Io)
 		return
 	}
