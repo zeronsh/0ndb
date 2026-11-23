@@ -106,6 +106,12 @@ _on_fill_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
 		_stream_maybe_release(r, st)
 		return
 	}
+	redact := _red_overlaps(r, sp, id, at, at + total)
+	if redact && total > FILL_REDACT_MAX {
+		c.op.reply, c.op.code = .Refused, .Too_Large
+		_stream_maybe_release(r, st)
+		return
+	}
 	w, werr := r.store.fill_begin(r.store.data, st.h, at, total)
 	if werr != .None {
 		c.op.reply, c.op.len = .Noted, _live_len(st)
@@ -122,12 +128,33 @@ _on_fill_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
 	c.op.kind = .Fill
 	c.op.stream = st
 	c.op.w = w
+	c.op.at = at
+	if redact {
+		c.op.buf = make([]u8, int(total), r.allocator)
+	}
 }
 
 @(private)
 _fill_end :: proc(c: ^Conn, op: ^Op) {
 	r := c.relay
 	st := op.stream
+	if op.buf != nil {
+		ok := op.pos == len(op.buf) && _red_fill_apply(c.space, Stream_Id(op.id), op.at, op.buf)
+		if ok && op.failed == .None {
+			op.failed = r.store.append_write(r.store.data, op.w, op.buf)
+		}
+		delete(op.buf, r.allocator)
+		op.buf = nil
+		if !ok {
+			r.store.append_abort(r.store.data, op.w)
+			c.space.reserved -= op.total
+			st.busy = false
+			_stream_unref(r, st)
+			_reply_refused(c, .Protocol, op.id)
+			_stream_maybe_release(r, st)
+			return
+		}
+	}
 	p := _pending_new(c, .Fill, st, op.total, op.id)
 	_stream_unref(r, st)
 	if p == nil {

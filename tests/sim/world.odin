@@ -106,6 +106,8 @@ Node :: struct {
 }
 
 Relay_Node :: struct {
+	fills_seen: u64,
+	red_check: bool,
 	w:      ^World,
 	disk:   Disk,
 	clock:  Node_Clock,

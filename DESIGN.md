@@ -2692,7 +2692,20 @@ Client to relay:
   share grant). On success `base = at`; reply `Noted`. A mismatched `at`
   answers `Noted` with the current `base` and stores nothing (the uploader
   resumes from there); quota applies as for appends. An empty `Fill` is
-  always mismatched: it is how a promotion asks for the base.
+  always mismatched: it is how a promotion asks for the base. A `Fill` may
+  come from a replica that predates a redaction of the segment, so the relay
+  keeps a per-stream index of the ranges its redaction log records (built
+  from the log when the space's log opens, extended on each redaction) and
+  applies the overlapping redactions to the fill's bytes before they are
+  written, in the form a stored redaction takes (redacted tag, zero body);
+  a fill whose records don't frame inside a redacted range is refused
+  (`Protocol`). Ciphertext a writer redacted is therefore never on the
+  relay's disk, even transiently. As a second line, a stream opened from
+  storage re-applies any recorded redaction over stored bytes not yet in
+  redacted form. A device that zero-fills its replica of another device's
+  segment for a redaction it learned of emits `Replica_Redacted` (object,
+  writer, range in `tick`..`length`); from then on no replica on it holds
+  that range unredacted.
 - `Pull` (0x13, 72 bytes): `holder:device, tag:u64, segment, from:u64,
   to:u64`. `segment` may also be a content object's (part) key; the relay
   does not distinguish the two and the holder resolves it, so the object

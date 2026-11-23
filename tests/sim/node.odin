@@ -559,6 +559,8 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	}
 	rn.r_on = true
 	world_note(w, "relay up")
+	rn.red_check = true
+	rn.fills_seen = 0
 	return true
 }
 
@@ -635,6 +637,17 @@ relay_crashed :: proc(rn: ^Relay_Node) {
 }
 
 relay_after :: proc(rn: ^Relay_Node) {
+	if rn.alive && rn.r_on && (rn.r.stats.fills != rn.fills_seen || rn.red_check) {
+		rn.fills_seen = rn.r.stats.fills
+		rn.red_check = false
+		context = instance_context(&rn.inst)
+		bad := make([dynamic]osync.Redaction_Violation, context.temp_allocator)
+		osync.relay_core_redactions_held(&rn.r, &bad)
+		for v in bad {
+			sid := v.stream
+			world_fail(rn.w, "relay redaction: relay stores record %x@%d inside a recorded redaction without its redacted form", sid[:4], v.off)
+		}
+	}
 	if rn.alive {
 		free_all(region_allocator(&rn.inst.temp))
 	}
