@@ -2858,7 +2858,8 @@ Relay cost tracks the reachable information, not the activity. Items marked
   exact files can then be unavailable; everything else materializes.
 - **Git-backed trees.** A blob is *remote-backed* when it is reachable from
   a remote-tracking ref (`refs/remotes/<remote>/*`) of a remote configured
-  in the tree's repository; tree history records reference it (`Insert_Ref`,
+  in the tree's repository whose tip the device has verified that remote
+  serves (below); tree history records reference it (`Insert_Ref`,
   content ops) and its bytes are never uploaded, neither as a content object
   nor inside a checkpoint bundle (the bundle lists it in a `CKPT_REMOTE`
   frame instead). Anything else (uncommitted and unpushed content) is
@@ -2887,6 +2888,26 @@ Relay cost tracks the reachable information, not the activity. Items marked
     stores the URLs (`ROOT_OWNED`, key space ‖ tree ‖ `r`), and opening the
     space re-notes them into the catalog. A crash between the two can no
     longer leave a blob that is neither uploaded nor findable on a remote.
+  - *Verification.* A tracking ref only says what the remote held when it
+    was last fetched: a force-push followed by a gc, or a deleted and
+    collected branch, leaves a tip the remote no longer serves. So before a
+    device lets any tip count, it fetches that tip's commit by id through
+    the active `Git_Remote` plug, into a fresh scratch store
+    (`$DATA/probe/<hash>`, removed afterwards; the reference plug fetches
+    `--depth=1 --filter=tree:0` as a partial-clone remote, so only the
+    commit travels, or the depth-1 snapshot from a server without filter
+    support). A probe that completes with the commit in the scratch store
+    marks (URL, commit) served; any failure marks it refused. Results live
+    beside the reachability set (`probes`, the newest 256), so each (URL,
+    commit) is probed once. Only served tips anchor the set; a refused tip
+    is left out, which also counts as a rewrite and rebuilds the set from
+    the served anchors. While a probe is in flight the tree's content
+    publish waits (no timer; the probe's completion kicks it), so a tree is
+    never published against a set that includes an unverified tip. Content
+    reachable only from a refused or unverified tip uploads like any other
+    unpushed content. A remote that loses a commit after the device verified
+    it is not detected until that tracking ref moves; the probe guards the
+    common case, a stale ref at the moment the device first relies on it.
   - *Fetching.* A reader that admits a record whose blobs are missing asks
     the relay first (it answers `Missing` at once for remote-backed blobs);
     the blobs the relay lacks are queued, and once per tick the engine starts
