@@ -497,7 +497,8 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 		apply_rec(s, r, false) or_return
 		pos += n + 8
 	}
-	for parent, info in parents {
+	for parent in sorted_strings(parents) {
+		info := parents[parent]
 		if info.head == info.disk {
 			continue
 		}
