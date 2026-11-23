@@ -59,7 +59,11 @@ _text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
+	blocked, uerr := _hist_catch_up(e, h)
+	if uerr != .None {
+		return nil, _pending_result(e, h, uerr, ready)
+	}
+	blocked ||= _handle_waiting(h, ready.fresh)
 	inode, found := _text_inode(h) or_return
 	if !found {
 		return nil, _pending_result(e, h, .Missing, ready)
@@ -88,7 +92,11 @@ _text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
+	blocked, uerr := _hist_catch_up(e, h)
+	if uerr != .None {
+		return nil, _pending_result(e, h, uerr, ready)
+	}
+	blocked ||= _handle_waiting(h, ready.fresh)
 	inode, found := _text_inode(h) or_return
 	if !found {
 		return nil, _pending_result(e, h, .Missing, ready)
@@ -118,7 +126,11 @@ _tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
+	blocked, uerr := _hist_catch_up(e, h)
+	if uerr != .None {
+		return nil, _pending_result(e, h, uerr, ready)
+	}
+	blocked ||= _handle_waiting(h, ready.fresh)
 	at, aerr := _tree_at(e, h, line, version)
 	if aerr != .None {
 		return nil, aerr
@@ -179,7 +191,11 @@ _tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Al
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	blocked := _hist_catch_up(e, h) || _handle_waiting(h, ready.fresh)
+	blocked, uerr := _hist_catch_up(e, h)
+	if uerr != .None {
+		return nil, _pending_result(e, h, uerr, ready)
+	}
+	blocked ||= _handle_waiting(h, ready.fresh)
 	at, aerr := _tree_at(e, h, line, version)
 	if aerr != .None {
 		return nil, aerr
@@ -289,7 +305,7 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, base: fs.Ver
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	at := _tree_at(e, h, line, nil) or_return
 	hist := h.hist
 	bl := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -362,7 +378,7 @@ tree_remove :: proc(e: ^Engine, o: Object, path: string, line := "") -> Error {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	at := _tree_at(e, h, line, nil) or_return
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
@@ -711,7 +727,7 @@ _hist_text_edit :: proc(e: ^Engine, h: ^Handle, inode: fstree.Inode_Id, pos: int
 @(private)
 _text_edit :: proc(e: ^Engine, h: ^Handle, pos: int, remove: int, insert: string) -> Error {
 	_handle_create_writer(h) or_return
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	inode, found := _text_inode(h) or_return
 	if !found {
 		return .Missing
@@ -723,10 +739,25 @@ _text_edit :: proc(e: ^Engine, h: ^Handle, pos: int, remove: int, insert: string
 CATCH_UP_LAZY :: 32
 
 @(private)
-_hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
+_hist_caught_up :: proc(e: ^Engine, h: ^Handle) -> Error {
+	_, err := _hist_catch_up(e, h)
+	return err
+}
+
+@(private)
+_hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool, err: Error) {
 	if h.kind != .Text && h.kind != .File_Tree {
 		return
 	}
+	blocked = _hist_admit_all(e, h)
+	if h.hist != nil && !h.hist.awake {
+		err = _hist_ready(e, h)
+	}
+	return
+}
+
+@(private)
+_hist_admit_all :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 	if _hist_ready(e, h) != .None {
 		return
 	}
@@ -771,7 +802,11 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 				virtual.arena_free_all(&rec)
 				body, next, rerr := journal.record_at(&s.jr, pos)
 				if rerr == .Redacted {
-					if _hist_admit_redacted(e, h, s, pos) == .Not_Found {
+					rv := _hist_admit_redacted(e, h, s, pos)
+					if rv == .Reloading {
+						return
+					}
+					if rv == .Not_Found {
 						break
 					}
 					pos = next
@@ -817,6 +852,9 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 				if aerr == .Not_Found {
 					blocked = true
 					break
+				}
+				if aerr == .Reloading {
+					return
 				}
 				if aerr != .None {
 					if !_store_err(e, _ferr(aerr)) {
@@ -915,7 +953,7 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
 	}
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	list := make([dynamic]fs.Text_Conflict, context.temp_allocator)
 	_ferr(fs.history_text_conflicts(h.hist, &list, allocator)) or_return
 	if kind == .File_Tree {
@@ -960,7 +998,7 @@ tree_conflict_accept :: proc(e: ^Engine, o: Object, c: Tree_Conflict) -> Error {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	at := _tree_at(e, h, "", nil) or_return
 	ops := make([dynamic]crdt.Op_Run, context.temp_allocator)
 	version := at.version if !at.head else fs.history_heads(h.hist, context.temp_allocator)
@@ -1070,7 +1108,7 @@ tree_blame :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_hist_ready(e, h) or_return
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	at := _tree_at(e, h, line, nil) or_return
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
