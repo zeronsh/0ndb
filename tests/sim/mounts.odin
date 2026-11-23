@@ -594,6 +594,74 @@ _forget_scope :: proc(w: ^World, n: ^Node, scope: ^fs.Scope) {
 	}
 }
 
+path_hidden :: proc(p: string) -> bool {
+	rest := p
+	for part in strings.split_iterator(&rest, "/") {
+		if strings.has_prefix(part, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+tree_walk :: proc(n: ^Node, o: eng.Object, ready: eng.Ready = {}) -> (files: []string, err: eng.Error) {
+	out := make([dynamic]string, context.temp_allocator)
+	dirs := make([dynamic]string, context.temp_allocator)
+	append(&dirs, "")
+	for i := 0; i < len(dirs); i += 1 {
+		dir := dirs[i]
+		names, lerr := eng.tree_list(&n.e, o, dir, context.temp_allocator, ready)
+		if lerr != .None && err == .None {
+			err = lerr
+		}
+		for nm in names {
+			p := nm if len(dir) == 0 else strings.concatenate({dir, "/", nm}, context.temp_allocator)
+			if _tree_is_dir(n, o, p) {
+				append(&dirs, p)
+			} else {
+				append(&out, p)
+			}
+		}
+	}
+	return out[:], err
+}
+
+@(private = "file")
+_tree_is_dir :: proc(n: ^Node, o: eng.Object, path: string) -> bool {
+	h, ok := n.e.handles[o.id]
+	if !ok || h.hist == nil {
+		return false
+	}
+	hist := h.hist
+	snap := fstree.current(&hist.tree)
+	v, found, verr := fs.history_line(hist, eng.tree_line(&n.e, o), context.temp_allocator)
+	if verr != .None {
+		return false
+	}
+	if found {
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&hist.g, v, &lvs) == .None && !crdt.frontier_eq(lvs[:], hist.g.heads[:]) {
+			at, serr := fs.version_snapshot(hist, lvs[:])
+			if serr != .None {
+				return false
+			}
+			defer fstree.snapshot_destroy(&at)
+			return _snap_is_dir(&at, path)
+		}
+	}
+	return _snap_is_dir(&snap, path)
+}
+
+@(private = "file")
+_snap_is_dir :: proc(s: ^fstree.Snapshot, path: string) -> bool {
+	id, found, lerr := fstree.lookup(s, path)
+	if lerr != nil || !found {
+		return false
+	}
+	info, iok, ierr := fstree.info(s, id, context.temp_allocator)
+	return ierr == nil && iok && info.kind == .Dir
+}
+
 tree_file_spans :: proc(n: ^Node, o: eng.Object, path: string) -> []crdt_span {
 	hist, err := eng.tree_history(&n.e, o)
 	if err != .None {
@@ -629,34 +697,43 @@ check_mounts :: proc(w: ^World) {
 			}
 			ob := &w.model.objs[sm.oi]
 			context = instance_context(&n.inst)
-			names, lerr := eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
+			names, lerr := tree_walk(n, ob.o)
 			if lerr != .None {
 				world_fail(w, "mount: %s cannot list mounted tree %s: %v", n.name, id_short(ob.o.id), lerr)
 				node_after(n)
 				continue
 			}
-			slice.sort(names)
-			want := strings.builder_make(context.temp_allocator)
+			tl := make([dynamic]string, context.temp_allocator)
 			for nm in names {
-				if strings.has_prefix(nm, ".") {
+				if path_hidden(nm) {
 					continue
 				}
 				data, _ := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator)
-				fmt.sbprintf(&want, "%s=%q\n", nm, string(data))
+				append(&tl, fmt.tprintf("%s=%q\n", nm, string(data)))
+			}
+			slice.sort(tl[:])
+			want := strings.builder_make(context.temp_allocator)
+			for l in tl {
+				strings.write_string(&want, l)
 			}
 			have := strings.builder_make(context.temp_allocator)
 			files := make([dynamic]Disk_File, context.temp_allocator)
 			disk_walk(&n.disk, &files)
 			prefix := strings.concatenate({sm.root, "/"}, context.temp_allocator)
+			lines := make([dynamic]string, context.temp_allocator)
 			for f in files {
 				if !strings.has_prefix(f.path, prefix) {
 					continue
 				}
 				rel := f.path[len(prefix):]
-				if fs.path_internal(rel) || strings.has_prefix(rel, ".") {
+				if fs.path_internal(rel) || path_hidden(rel) {
 					continue
 				}
-				fmt.sbprintf(&have, "%s=%q\n", rel, string(f.data))
+				append(&lines, fmt.tprintf("%s=%q\n", rel, string(f.data)))
+			}
+			slice.sort(lines[:])
+			for l in lines {
+				strings.write_string(&have, l)
 			}
 			if strings.to_string(want) != strings.to_string(have) {
 				world_fail(w, "mount: %s disk at %s differs from tree %s:\n--- tree\n%s--- disk\n%s", n.name, sm.root, id_short(ob.o.id), strings.to_string(want), strings.to_string(have))

@@ -113,8 +113,19 @@ M_Op :: struct {
 	power_crash: bool,
 }
 
+M_Move :: struct {
+	idx:    int,
+	obj:    int,
+	node:   int,
+	from:   string,
+	to:     string,
+	at:     i64,
+	status: Op_Status,
+}
+
 Model :: struct {
 	w:      ^World,
+	moves:  [dynamic]^M_Move,
 	spaces: [dynamic]M_Space,
 	objs:   [dynamic]M_Obj,
 	ops:    [dynamic]^M_Op,
@@ -147,6 +158,7 @@ model_init :: proc(m: ^Model, w: ^World) {
 	m.grants = make([dynamic]Pending_Share, a)
 	m.mounts = make([dynamic]M_Mount, a)
 	m.probes = make([dynamic]int, a)
+	m.moves = make([dynamic]^M_Move, a)
 }
 
 model_destroy :: proc(m: ^Model) {
@@ -189,6 +201,77 @@ model_destroy :: proc(m: ^Model) {
 	delete(m.grants)
 	delete(m.mounts)
 	delete(m.probes)
+	for mv in m.moves {
+		delete(mv.from, a)
+		delete(mv.to, a)
+		free(mv, a)
+	}
+	delete(m.moves)
+}
+
+new_move :: proc(m: ^Model, n: ^Node, obj: int, from: string, to: string) -> ^M_Move {
+	a := m.w.allocator
+	mv := new(M_Move, a)
+	mv.idx = len(m.moves)
+	mv.obj = obj
+	mv.node = n.idx
+	mv.from = strings.clone(from, a)
+	mv.to = strings.clone(to, a)
+	mv.at = m.w.now
+	mv.status = .Issued
+	append(&m.moves, mv)
+	return mv
+}
+
+move_maybe :: proc(mv: ^M_Move) -> bool {
+	return mv.status == .Done || mv.status == .Acked || mv.status == .Observed || mv.status == .Uncertain
+}
+
+same_file :: proc(m: ^Model, obj: int, a: string, b: string) -> bool {
+	if a == b {
+		return true
+	}
+	any := false
+	for mv in m.moves {
+		any ||= mv.obj == obj && move_maybe(mv)
+	}
+	if !any {
+		return false
+	}
+	seen := make(map[string]bool, context.temp_allocator)
+	queue := make([dynamic]string, context.temp_allocator)
+	append(&queue, a)
+	seen[a] = true
+	for i := 0; i < len(queue) && len(queue) < 4096; i += 1 {
+		cur := queue[i]
+		for mv in m.moves {
+			if mv.obj != obj || !move_maybe(mv) {
+				continue
+			}
+			for dir in 0 ..< 2 {
+				from, to := mv.from, mv.to
+				if dir == 1 {
+					from, to = mv.to, mv.from
+				}
+				next := ""
+				if cur == from {
+					next = to
+				} else if strings.has_prefix(cur, from) && len(cur) > len(from) && cur[len(from)] == '/' {
+					next = strings.concatenate({to, cur[len(from):]}, context.temp_allocator)
+				} else {
+					continue
+				}
+				if next == b {
+					return true
+				}
+				if !seen[next] {
+					seen[next] = true
+					append(&queue, next)
+				}
+			}
+		}
+	}
+	return false
 }
 
 new_token :: proc(m: ^Model, n: ^Node, tag: string) -> string {
