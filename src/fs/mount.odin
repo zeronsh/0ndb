@@ -1927,7 +1927,14 @@ mount_recover :: proc(m: ^Mount) -> Error {
 		drop_lost(m, "", lost[:]) or_return
 	}
 	if recovered {
-		snap := fstree.current(&h.tree)
+		target := have[:]
+		if len(ends) > 0 {
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, have[:], ends[:], &both)
+			target = both[:]
+		}
+		snap := version_snapshot(h, target) or_return
+		defer fstree.snapshot_destroy(&snap)
 		for ino in sorted_inodes(touched) {
 			info, found, ierr := fstree.info(&snap, ino, context.temp_allocator)
 			if ierr != nil {
@@ -1950,9 +1957,7 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
 		if len(ends) > 0 {
-			both := make([dynamic]crdt.Lv, context.temp_allocator)
-			crdt.version_union(&h.g, have[:], ends[:], &both)
-			v := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
+			v := crdt.graph_version_ids(&h.g, target, context.temp_allocator)
 			clear(&m.synced)
 			append(&m.synced, ..v)
 		}
