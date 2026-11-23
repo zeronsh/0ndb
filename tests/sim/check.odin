@@ -1130,6 +1130,9 @@ _node_records :: proc(w: ^World, n: ^Node, ob: ^M_Obj, out: ^map[Rec_Key]Rec_Sta
 @(private = "file")
 _relay_records :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id, out: ^map[i64]Rec_State, zeros_bad: ^[dynamic]i64) -> bool {
 	rn := &w.relay
+	if !rn.alive {
+		return false
+	}
 	context = instance_context(&rn.inst)
 	defer relay_after(rn)
 	was := rn.slow.inline

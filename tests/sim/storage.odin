@@ -165,6 +165,9 @@ _storage_prefix :: proc(k: M_Kind) -> u8 {
 
 relay_probe :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> (length, base: i64, exists: bool) {
 	rn := &w.relay
+	if !rn.alive {
+		return
+	}
 	context = instance_context(&rn.inst)
 	defer relay_after(rn)
 	r := &rn.r
