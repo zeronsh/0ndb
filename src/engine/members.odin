@@ -1095,6 +1095,15 @@ _clone_str_or_empty :: proc(s: string, allocator: runtime.Allocator) -> string {
 	return out
 }
 
+space_epoch_current :: proc(e: ^Engine, space: prim.Id) -> (tag: osync.Epoch_Tag, ok: bool) {
+	context = context_for(e)
+	sp, found := e.spaces[space]
+	if !found || !sp.open {
+		return
+	}
+	return space_epoch_tag(sp)
+}
+
 verify_epochs :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []string, err: Error) {
 	context = context_for(e)
 	out := make([dynamic]string, context.temp_allocator)
