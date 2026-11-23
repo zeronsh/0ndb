@@ -980,6 +980,7 @@ import_flush :: proc(st: ^Import_State) -> Error {
 		append(&st.b.imports, Import_File{inode = fstree.ROOT, len = -1})
 	}
 	builder_commit_import(m, &st.b) or_return
+	names_durable(m.db) or_return
 	shadow_flush(m) or_return
 	save_mount_state(m) or_return
 	history_trim(m.history)

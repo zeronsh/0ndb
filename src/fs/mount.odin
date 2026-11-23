@@ -1942,7 +1942,6 @@ mount_durable_now :: proc(m: ^Mount) -> bool {
 
 @(private)
 shadow_flush :: proc(m: ^Mount) -> Error {
-	names_durable(m.db) or_return
 	mat_settle_owed(m) or_return
 	held := m.shadow.hold
 	m.shadow.hold = false
@@ -2041,7 +2040,6 @@ mount_ack :: proc(m: ^Mount) -> Error {
 }
 
 save_mount_state :: proc(m: ^Mount) -> Error {
-	names_durable(m.db) or_return
 	img := &m.img
 	synced := m.img.synced[:]
 	buf := make([dynamic]u8, context.temp_allocator)
