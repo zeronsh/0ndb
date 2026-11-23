@@ -584,6 +584,17 @@ _view_units_at :: proc(b: ^Buffer, pos: int) -> int {
 }
 
 @(private)
+_ovl_stray :: proc(b: ^Buffer) -> bool {
+	for o in b.ovl {
+		last := _ovl_last(o)
+		if fs.history_next_seq(b.hist, last.actor) > last.seq {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
 _ovl_drop :: proc(e: ^Engine, b: ^Buffer) {
 	if !_ovl_on(b) {
 		return

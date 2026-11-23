@@ -640,6 +640,10 @@ _buffer_advance :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	append(&b.version, ..target)
 	if _ovl_on(b) {
 		_ovl_advanced(e, b, _regions_bytes(crdt.delta_regions(&st.db, context.temp_allocator))[:])
+		if _ovl_stray(b) {
+			e.stats.buffer_live_stray += 1
+			_ovl_drop(e, b)
+		}
 		return .None
 	}
 	if st.db.steps == 0 {

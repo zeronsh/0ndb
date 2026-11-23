@@ -300,6 +300,7 @@ Stats :: struct {
 	buffer_live_intents: u64,
 	buffer_live_intents_applied: u64,
 	buffer_live_bad_gone: u64,
+	buffer_live_stray: u64,
 }
 
 Engine :: struct {
