@@ -381,7 +381,8 @@ equal in both directions.
 
 - **Shadow** (per mount, under `$DATA/worktrees/<id>/`): for each path the
   inode, stat signature `(mtime_ns, ctime_ns, size, ino, mode)`, content oid
-  and version it was last synced at. An on-disk table (append-only records
+  and, when it is not `synced`, the version its content is at (a based
+  write's own batch, below). An on-disk table (append-only records
   plus an open-addressing hash file), compacted right after a mount state
   save when garbage exceeds half. Only unpersisted changes live in memory.
 - **First mount** walks with parallel `getdents64`/`statx` workers that exist
@@ -462,6 +463,18 @@ equal in both directions.
   moving `synced`; the pass then materializes `synced` united with that
   batch, which rewrites the file with both the agent's edit and everything
   concurrent, and the CRDT reports overlapping edits as conflict regions.
+  The path's shadow entry names that batch as its own version until the
+  materializer writes the path at a version containing it and resets the
+  entry to `synced`, so the shadow always describes the disk: on a path
+  another scope holds, the merge waits for the hold like every other batch,
+  and meanwhile the disk is exactly the text at the entry's version. A
+  change to a path whose entry names a version is ingested from that
+  version (a based batch credited as any change there would be, so a third
+  writer during the hold is merged, not diffed against bytes `synced` never
+  had), a based batch's Lamport time follows both `synced` and its parents,
+  verification and the open-time names check compare such a path with its
+  own version, and a rewind computes the current text from `synced` united
+  with the versions its files' entries name.
   A pin names the inode it read, and the edits go to that inode whatever
   the path holds when the write is ingested. If the inode was removed after
   the pin (and perhaps a new file created at the path), the edits are
