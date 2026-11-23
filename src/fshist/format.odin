@@ -37,6 +37,7 @@ TOP_MOUNT :: u8(18)
 TOP_OBSERVE :: u8(19)
 TOP_RENAMED :: u8(21)
 TOP_ACCEPT :: u8(22)
+TOP_SCOPE :: u8(23)
 TOP_REVERT :: u8(20)
 
 OBSERVE_VERSION :: u8(1)
@@ -947,4 +948,20 @@ decode_revert :: proc(content: []u8, allocator := context.temp_allocator) -> (o:
 	}
 	o = Revert_Op{base, actors, conflicts, prim.read_id(&r)}
 	return o, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
+}
+
+encode_scope :: proc(buf: ^[dynamic]u8, scope: prim.Id) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, TOP_SCOPE)
+	prim.write_u8(&w, 1)
+	prim.write_id(&w, scope)
+}
+
+decode_scope :: proc(content: []u8) -> (scope: prim.Id, ok: bool) {
+	r := prim.reader(content)
+	if prim.read_u8(&r) != TOP_SCOPE || prim.read_u8(&r) != 1 {
+		return
+	}
+	scope = prim.read_id(&r)
+	return scope, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
 }

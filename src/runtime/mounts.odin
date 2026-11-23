@@ -23,6 +23,7 @@ Wt_Member :: struct {
 	engine:    bool,
 	borrowed:  bool,
 	turn:      ^fs.Scope,
+	actor:     prim.Id,
 	start:     []crdt.Op_Id,
 	branch:    string,
 	commit:    string,
@@ -78,7 +79,6 @@ Worktree :: struct {
 	members: [dynamic]Wt_Member,
 	tools:   [dynamic]Wt_Tool,
 	actor:   prim.Id,
-	pseudo:  prim.Id,
 	scope:   prim.Id,
 	setup:   bool,
 	busy:    bool,
@@ -246,7 +246,6 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 	ws.alloc = virtual.arena_allocator(&ws.arena)
 	ws.members = make([dynamic]Wt_Member, ws.alloc)
 	ws.tools = make([dynamic]Wt_Tool, ws.alloc)
-	ws.actor, ws.pseudo = eng.turn_actor(r.e, o.id)
 	ws.linked = linked
 	ws.busy = true
 	id := o.id
@@ -423,6 +422,7 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 	}
 	targets := _target_versions(r, ws.o, run)
 	ws.scope = turn_scope_id(run.claim)
+	ws.actor = {}
 	for &mb in ws.members {
 		m := mb.m
 		if m == nil {
@@ -466,10 +466,15 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 		mb.start = clone_version(fs.mount_synced(m), ws.alloc)
 		mb.branch = clone(m.head.branch, ws.alloc)
 		mb.commit = clone(m.head.commit, ws.alloc)
-		if fs.history_register_owned_actor(m.history, ws.actor, ws.pseudo, ws.o.id) != .None {
+		pseudo: prim.Id
+		mb.actor, pseudo = eng.scope_actor(r.e, ws.o.id, m.id, m.line)
+		if fs.history_register_owned_actor(m.history, mb.actor, pseudo, ws.o.id) != .None {
 			return .Io
 		}
-		mb.turn = fs.scope_open(reg, m, ws.scope, ws.actor)
+		if ws.actor == {} {
+			ws.actor = mb.actor
+		}
+		mb.turn = fs.scope_open(reg, m, ws.scope, mb.actor)
 	}
 	return .None
 }
@@ -734,7 +739,7 @@ worktree_tool_open :: proc(ws: ^Worktree, run: ^Run, id: string) -> int {
 	sid := _tool_scope_id(ws, id)
 	for mb, i in ws.members {
 		if mb.m != nil {
-			scopes[i] = fs.scope_open(reg, mb.m, sid, sid, nil, run.line_prev)
+			scopes[i] = fs.scope_open(reg, mb.m, sid, mb.actor if mb.actor != {} else sid, nil, run.line_prev)
 		}
 	}
 	append(&ws.tools, Wt_Tool{id = clone(id, ws.alloc), scopes = scopes, before = _versions_blob(ws, ws.alloc), open = true})
@@ -787,7 +792,8 @@ _tool_close_now :: proc(ws: ^Worktree, run: ^Run, idx: int) {
 	_ = reg
 	after := _versions_blob(ws, context.temp_allocator)
 	if w := _writer(run); w != nil {
-		convo.writer_scope(w, run.reply, .Tool, _tool_scope_id(ws, t.id), _tool_scope_id(ws, t.id), t.before, after)
+		sid := _tool_scope_id(ws, t.id)
+		convo.writer_scope(w, run.reply, .Tool, sid, ws.actor if ws.actor != {} else sid, t.before, after)
 	}
 }
 
