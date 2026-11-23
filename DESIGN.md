@@ -1362,6 +1362,32 @@ concurrent typing is never lost or reverted.
   extents) and promotes a stream to its own file once it grows past a
   threshold. Creating an object costs one record, not a file; ten million
   objects cost ten million small extents, not inodes.
+- A full disk is never engine-fatal. An API write reserves its worst case
+  before it applies anything: the pack keeps its active container
+  preallocated past the log tail (keep-size `prim.preallocate`: fallocate,
+  F_PREALLOCATE, FileAllocationInfo) by the outstanding reservations plus
+  the next commit's metas, keeps a pre-created, preallocated spare container
+  for the rollover, and the registry keeps a preallocated tail with a floor
+  only reserved writes may use. If the space cannot be extended the write
+  returns No_Space and nothing applied. A reservation lives until the tick's
+  handle commits write its records, inside a scope background writes cannot
+  draw on. Background and derived writes (compaction, index flushes, map
+  tables, the registry log, registry marks) are refused before they change
+  anything and retried on the next write or data change, never by a timer.
+  Only Corrupt or a broken invariant is fatal.
+- Preallocation does not make a later flush safe. On APFS a write into a
+  preallocated range on a full volume succeeds and its datasync then fails
+  with No_Space (measured: a 64 MiB image, 4 MiB preallocated, the volume
+  filled, then the write); btrfs and ZFS behave alike, and ZFS has no
+  fallocate at all. So a pack job that fails, for No_Space or Io, keeps its
+  whole Inflight (data, commit record, fds, zero jobs, syncs, install hooks)
+  and is resubmitted unchanged ahead of any new commit, and every retry
+  first resyncs each fd the job touches: a failed fsync may already have
+  dropped those pages, and the next fsync would succeed with nothing
+  written. Reservation only refuses early; the resync-then-retry is what
+  guarantees nothing acknowledged is lost. A flush keeps its memtable and
+  snapshot across retries, so a checkpoint never names entries it did not
+  flush.
 - Truncating or replacing in place is never trusted to be durable. A
   shrink's new size and a rename can be lost in a power failure even after
   an fsync (portably across ext4, APFS and NTFS), so the old bytes and an

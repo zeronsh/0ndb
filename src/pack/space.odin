@@ -147,7 +147,7 @@ _retry :: proc(p: ^Pack) -> Error {
 	if !p.fl_retry || p.fl.on {
 		return .None
 	}
-	if p.fl_err == .Io && _resync_job(p) != .None {
+	if _resync_job(p) != .None {
 		return .None
 	}
 	p.fl_retry = false
