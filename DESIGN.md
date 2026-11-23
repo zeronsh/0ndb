@@ -1125,9 +1125,13 @@ concurrent typing is never lost or reverted.
   do (relay fan-out to live followers only, never stored).
   - *Writer.* After `buffer_edit` commits its batch at journal offset
     `off`, it sends `Live(segment, msg = DRAFT_MSG_MAX - 1, at = off,
-    frame)`, where `frame = 1 ‖ boot ‖ off ‖ seal(file frontier ‖ file
-    length ‖ batch)`. The file frontier is the frontier of the last 32
-    ops on that file in the writer's view before the batch, the batch is
+    frame)`, where `frame = 2 ‖ boot ‖ off ‖ seal(file frontier ‖ file
+    length ‖ acks ‖ batch)`. The file frontier is the frontier of the last
+    32 ops on that file in the writer's view before the batch; `acks` lists
+    `(actor, next)`, the next seq the writer's view holds for each actor of
+    those 32 ops and of the buffer's last four live peers (found by binary
+    search over the actor's seqs, so a lagging view still names exactly
+    what it has seen); the batch is
     encoded self-contained (actor ids inline, no stream dictionary), and
     `boot` is 16 random bytes, drawn at the first send after the engine
     opens and again whenever a commit's offset does not exceed the last
@@ -1151,9 +1155,23 @@ concurrent typing is never lost or reverted.
     any of it, so a frame is refused only where the segment's own upload
     would be.
   - *Receiver.* A device with a buffer open on the object live-follows every
-    other device's segment of it. A frame is shown only if it applies
-    linearly: its file frontier and length equal the buffer's display (the
-    durable view, or the last overlay batch). It then joins the buffer's
+    other device's segment of it. A frame applies linearly when its file
+    frontier and length equal the buffer's display (the durable view, or
+    the last overlay batch) and the receiver has no unseen local edits.
+    Otherwise it may still apply over the receiver's recent local edits
+    (*pend*, each a display byte delta with its actor and seq range, at most
+    64): the frame's ack for the receiver's actor drops every pend item the
+    writer had seen; what is left must be exactly the unseen suffix (its
+    first seq is the ack, its last is the actor's latest), every overlay
+    batch must come from the same peer device and chain on that device's
+    previous seq (in the overlay or the view), and the frame's length must
+    equal the display length minus the net length of that suffix. Then the
+    batch is transformed over the suffix with the CRDT's tie (the lower op
+    id first, the order the merged text will have) and the suffix over the
+    batch, so both devices' concurrent keystrokes stay live and land where
+    the merge puts them. Anything else is skipped and arrives durably. A
+    frame whose seal cannot open yet (the writer's key tree is not loaded,
+    a first contact) loads the writer's tree and is counted keyless. It then joins the buffer's
     overlay, a list of positional byte deltas on the durable view; the
     client sees `D = V ⊕ overlay` and gets the batch as one delta at once.
     Every client position (edits after the transform, reads, lengths,
@@ -1194,10 +1212,17 @@ concurrent typing is never lost or reverted.
     buffer edit against the final text, deletes over a dropped overlay
     whose buffer closes and node crashes once the delete is durable, and
     the log at every crash point of add, commit, done and removal.
-  - *Local edits while an overlay is shown.* An edit, undo or redo is
-    held (the call pends) until the overlay is gone, so a local insert is
-    never parented without the remote text it was typed next to; held calls
-    rerun in order. A caller without a way to wait drops the overlay first.
+  - *Local edits while an overlay is shown.* An edit that does not touch
+    overlay text is mapped from `D` to the durable view, committed there,
+    and the overlay is rebased over it, so typing continues while a remote
+    batch is shown. An edit that touches overlay text (deletes some of it,
+    or inserts inside it, at its edge, or where it deleted text) and every
+    undo or redo is held (the call pends) until the overlay is gone, so a
+    local insert is never parented without the remote text it was typed
+    next to; held calls rerun in order. A caller without a
+    way to wait drops the overlay first. Every committed local edit is kept
+    in pend until a frame's ack or the durable view covers it; corrections
+    and drops rebase pend rather than clear it.
   - *Withdrawal.* An overlay batch is dropped only on knowledge: its
     durable record differs (the correction above), its writer's boot
     changes (seen on its next frame), or its writer goes down in presence.
@@ -1205,9 +1230,11 @@ concurrent typing is never lost or reverted.
   - *Measured* (Linux, two daemons on one relay, a 15 KB file, an edit every
     3 ms on one device): edit to the other device's buffer delta p50
     0.52–0.85 ms, p90 1.4–1.6 ms, against 1.7–1.9 ms and 2.4–2.8 ms through
-    durability. When both devices type into the same file at once, a remote
-    batch is concurrent with the receiver's latest edit and arrives
-    durably instead.
+    durability. When both devices type into the same file at once (the sim's
+    duet: two fresh buffers on two devices, 24 rounds of both typing within
+    3 ms of each other, every keystroke checked to land exactly once on both
+    buffers and both client documents), 2710 of 2736 keystrokes over 57
+    seeds are shown live before they are durable; the rest arrive durably.
 
 ## Storage
 
