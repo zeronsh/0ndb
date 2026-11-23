@@ -668,7 +668,7 @@ _pair_shape :: proc(w: ^World, shape: int, a: ^Node, asm_: Sim_Mount, b: ^Node, 
 		if !src_ok {
 			return
 		}
-		if src == target {
+		if src == target || len(_common(_tokens(a, _abs(asm_, target)), _tokens(b, _abs(bsm, target)))) == 0 {
 			return
 		}
 		toks := _tokens(a, _abs(asm_, src))
