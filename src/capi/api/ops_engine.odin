@@ -50,6 +50,7 @@ op_stats :: proc(c: ^Call, o: ^Out) -> Status {
 	o_u64(o, "buffer_live_dropped", s.buffer_live_dropped)
 	o_u64(o, "buffer_live_received", s.buffer_live_received)
 	o_u64(o, "buffer_live_skipped", s.buffer_live_skipped)
+	o_u64(o, "catalog_refused", s.catalog_refused)
 	return .Ok
 }
 

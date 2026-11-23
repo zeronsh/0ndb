@@ -2190,7 +2190,11 @@ relay) computes the same roster:
 - **The guest.** A guest follows the object's grantkeys group and opens the
   wraps addressed to its key. It adds each new epoch tag to its persisted
   grant epochs and unlocks held key trees on any new grant epoch, not only
-  on space epochs.
+  on space epochs. A guest writes the objects it holds a Write grant for and
+  not the space's catalog, unless it holds a Write grant on the catalog
+  itself, so it queues no catalog update (participant, activity, status)
+  for a catalog it cannot write; a catalog write refused with `Permission`
+  is dropped and counted (`catalog_refused`), never an engine failure.
 - **Revocation must rotate.** `share_revoke(object, grantee)` removes the
   object from the guest's scope (`Scope{guest, remove, object}`), or removes
   the guest when it was the last object, and the revoker commits a new space

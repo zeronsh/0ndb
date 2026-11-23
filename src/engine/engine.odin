@@ -285,6 +285,7 @@ Stats :: struct {
 	base_current: u64,
 	base_mismatch: u64,
 	base_not_text: u64,
+	catalog_refused: u64,
 	damaged:      u64,
 	restored:     u64,
 	buffer_live_sent: u64,
