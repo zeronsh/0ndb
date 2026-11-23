@@ -1804,8 +1804,21 @@ _contiguous :: proc(rm: ^Remote) -> i64 {
 }
 
 @(private)
+_suffix_contiguous :: proc(rm: ^Remote) -> i64 {
+	if rm.base <= 0 {
+		return _contiguous(rm)
+	}
+	for h in journal.replica_have(&rm.rep) {
+		if h.from <= rm.base && h.to > rm.base {
+			return h.to
+		}
+	}
+	return rm.base
+}
+
+@(private)
 _remote_follow_send :: proc(r: ^Replicator, rm: ^Remote) {
-	rm.pulled = _contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
+	rm.pulled = _suffix_contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
 	_remote_pull(r, rm)
 }
 
