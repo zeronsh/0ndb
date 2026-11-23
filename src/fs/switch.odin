@@ -1,5 +1,6 @@
 package fs
 
+import "base:runtime"
 import "core:strings"
 import "../crdt"
 import "../prim"
@@ -125,6 +126,8 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 	to, _ := clone_string(m.switch_to, context.temp_allocator)
 	from, _ := clone_string(m.switch_from, context.temp_allocator)
 	if m.switch_phase <= SWITCH_INGEST {
+		mount_wake(m) or_return
+		switch_unseen(m, "") or_return
 		if len(m.dirty) > 0 || m.rescan {
 			mount_pass(m, false) or_return
 		}
@@ -195,6 +198,33 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 		done(m, .None, data)
 	}
 	return true, .None
+}
+
+@(private)
+switch_unseen :: proc(m: ^Mount, dir: string) -> Error {
+	heap := runtime.heap_allocator()
+	kids := make([dynamic]Shadow_Child, heap)
+	defer {
+		shadow_children_free(kids[:], heap)
+		delete(kids)
+	}
+	shadow_children(&m.shadow, dir, &kids, heap) or_return
+	for k in kids {
+		child, _ := path_join(dir, k.name, heap)
+		defer delete(child, heap)
+		if k.entry.kind == .Dir {
+			switch_unseen(m, child) or_return
+			continue
+		}
+		if child in m.dirty {
+			continue
+		}
+		d, _ := probe(m, child)
+		if d.kind == .Missing || !disk_matches(m, child, k.entry) {
+			mount_mark(m, child)
+		}
+	}
+	return .None
 }
 
 @(private)

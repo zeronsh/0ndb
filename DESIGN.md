@@ -952,7 +952,17 @@ equal in both directions.
   position) until the image catches up: no saved state names a line other
   than the one the worktree holds. A reopen applies a done record as the
   mount's branch and head and never reruns git; HEAD moved since is a user
-  checkout from that head. Lines are
+  checkout from that head. A line learns a commit only from the worktree. A
+  commit its line never saw on disk (made and checked away from between
+  passes, or in a pass a crash lost) lands on that line as a git-op batch the
+  next time its branch is checked out; no reflog position needs to be durable
+  for it. A write made while a switch is pending belongs to the line the disk
+  holds when it is made: the source during ingest, the target from the moment
+  its materialization starts. The mount's line flips in the step that enters
+  the target phase, after ingest has passed every reported path onto the
+  source, compared every shadowed path's stat with the disk (so a write whose
+  watch event is still in flight is ingested onto the source too), and that
+  history is durable. Lines are
   named by their git key (`git:refs/heads/<name>`; the mount's own branch maps
   to its line). Runtime-managed mounts are refused until run lines retire. **A
   0ndb switch keeps each line's uncommitted state with that line (an automatic
