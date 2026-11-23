@@ -1703,9 +1703,13 @@ running on it is a record in it.
     first undo's copies and deletions too, and the rewind actors of turn
     reverts), and the ingestion actors of its tasks' fork mounts (home and per
     line). Landed and merged ops keep their scope actors, so a land needs no
-    actor of its own. The set and each (tree, line) base are resolved once,
-    after the hold and the fence (a running turn writes its `Scope` only when
-    it ends), into the `Undo` record of the `Fenced` phase; every device
+    actor of its own. A scope actor belongs to one conversation: a turn's scope
+    writes as `ingestion_actor(device, turn_pseudo(conversation))`, registered
+    with the conversation as owner, never as an actor shared by every
+    conversation of an agent, so an undo of A never reverts another
+    conversation's turn writes. The set and each (tree, line) base are resolved
+    once, after the hold and the fence (a running turn writes its `Scope` only
+    when it ends), into the `Undo` record of the `Fenced` phase; every device
     reverts exactly those actors from that base, whatever registrations or
     records it has received since. Everything else is outside the set and
     survives: a person's own disk and buffer edits made during T, other trees,

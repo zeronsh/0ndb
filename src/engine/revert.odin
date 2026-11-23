@@ -1,6 +1,7 @@
 package engine
 
 import "../fs"
+import "../fshist"
 import "../prim"
 
 tree_revert_set :: proc(e: ^Engine, o: Object, base: fs.Version, actors: []prim.Id, line := "", undo: prim.Id = {}, owner: prim.Id = {}) -> (revert: prim.Id, err: Error) {
@@ -56,4 +57,9 @@ tree_undo_revert :: proc(e: ^Engine, o: Object, undo: prim.Id, line := "") -> (r
 		return {}, false, _ferr(ferr)
 	}
 	return r, ok, .None
+}
+
+turn_actor :: proc(e: ^Engine, conversation: prim.Id) -> (actor: prim.Id, pseudo: prim.Id) {
+	pseudo = fs.turn_pseudo(conversation)
+	return fshist.ingestion_actor(e.self, pseudo), pseudo
 }

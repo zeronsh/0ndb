@@ -3121,6 +3121,7 @@ history_register_owned_actor :: proc(h: ^History, actor, pseudo, owner: prim.Id)
 	if owner == {} {
 		return history_register_actor(h, actor, pseudo)
 	}
+	history_ready(h) or_return
 	if _, known := history_actor_owner(h, actor); known {
 		return .None
 	}

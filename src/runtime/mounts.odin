@@ -78,6 +78,7 @@ Worktree :: struct {
 	members: [dynamic]Wt_Member,
 	tools:   [dynamic]Wt_Tool,
 	actor:   prim.Id,
+	pseudo:  prim.Id,
 	scope:   prim.Id,
 	setup:   bool,
 	busy:    bool,
@@ -245,7 +246,7 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 	ws.alloc = virtual.arena_allocator(&ws.arena)
 	ws.members = make([dynamic]Wt_Member, ws.alloc)
 	ws.tools = make([dynamic]Wt_Tool, ws.alloc)
-	ws.actor = agent_actor(r, agent_id)
+	ws.actor, ws.pseudo = eng.turn_actor(r.e, o.id)
 	ws.linked = linked
 	ws.busy = true
 	id := o.id
@@ -465,6 +466,9 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 		mb.start = clone_version(fs.mount_synced(m), ws.alloc)
 		mb.branch = clone(m.head.branch, ws.alloc)
 		mb.commit = clone(m.head.commit, ws.alloc)
+		if fs.history_register_owned_actor(m.history, ws.actor, ws.pseudo, ws.o.id) != .None {
+			return .Io
+		}
 		mb.turn = fs.scope_open(reg, m, ws.scope, ws.actor)
 	}
 	return .None

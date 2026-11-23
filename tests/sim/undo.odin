@@ -33,6 +33,7 @@ Ur_Ctx :: struct {
 	vend:   [dynamic]fs.Version,
 	alloc:  runtime.Allocator,
 	hooks:  Ur_Hooks,
+	append_only: bool,
 }
 
 @(private = "file")
@@ -96,7 +97,7 @@ _ur_write :: proc(c: ^Ur_Ctx, agent: bool, name: string) -> bool {
 	}
 	lines := &c.files[name]
 	c.toks[t] = Ur_Tok{file = name, agent = agent, turn = c.turn}
-	if agent && len(lines) > 0 && rng_chance(&c.w.rng, 1, 3) {
+	if agent && !c.append_only && len(lines) > 0 && rng_chance(&c.w.rng, 1, 3) {
 		at := rng_int(&c.w.rng, len(lines))
 		old := lines[at]
 		x := &c.toks[old]
@@ -755,4 +756,150 @@ undo_crash :: proc(t: ^testing.T) {
 	}
 	fmt.eprintf("undo_crash: %d crash points in undos, %d in redos, %d failed\n", points[0], points[1], bad)
 	testing.expect(t, bad == 0, fmt.tprintf("undo_crash: %d failures", bad))
+}
+
+@(private = "file")
+Ur_Side :: struct {
+	conv:   eng.Object,
+	agent:  prim.Id,
+	parent: obj.Rid,
+	turns:  [dynamic]obj.Rid,
+	toks:   [dynamic]string,
+	last:   [dynamic]string,
+}
+
+@(private = "file")
+_ur_side_turn :: proc(c: ^Ur_Ctx, side: ^Ur_Side) -> bool {
+	c.conv, c.agent, c.parent = side.conv, side.agent, side.parent
+	clear(&c.turns)
+	clear(&side.last)
+	before := c.tok
+	ok := _ur_turn(c, false, false)
+	side.parent = c.parent
+	append(&side.turns, ..c.turns[:])
+	for t, x in c.toks {
+		n := 0
+		for d in t[2:len(t) - 1] {
+			n = n * 10 + int(d - '0')
+		}
+		if x.agent && n > before {
+			append(&side.toks, t)
+			append(&side.last, t)
+		}
+	}
+	return ok
+}
+
+@(private = "file")
+_ur_two :: proc(w: ^World, alloc: runtime.Allocator) {
+	c, ok := _ur_setup(w, alloc)
+	if !ok {
+		return
+	}
+	c.append_only = true
+	n := c.n
+	sides: [2]Ur_Side
+	for &sd, i in sides {
+		sd.turns = make([dynamic]obj.Rid, alloc)
+		sd.toks = make([dynamic]string, alloc)
+		sd.last = make([dynamic]string, alloc)
+		context = instance_context(&n.inst)
+		if i == 0 {
+			sd.conv = c.conv
+		} else {
+			o, err := eng.convo_create(&n.e, c.tree.space, eng.Convo_Settings{title = "other"})
+			if err != .None {
+				world_fail(w, "undo two: convo_create: %v", err)
+				node_after(n)
+				return
+			}
+			sd.conv = o
+			eng.convo_mount(&n.e, o, "work", c.tree.id, {})
+		}
+		actor, pseudo := eng.turn_actor(&n.e, sd.conv.id)
+		sd.agent = actor
+		if m := _ur_mount(c); m != nil {
+			context = eng.context_for(&n.e)
+			fs.history_register_owned_actor(m.history, actor, pseudo, sd.conv.id)
+		}
+		node_after(n)
+	}
+	run_until(w, w.now + 1_000_000_000, true)
+	gone := make(map[string]bool, alloc)
+	for step in 0 ..< 4 {
+		if !_ur_side_turn(c, &sides[step % 2]) {
+			world_fail(w, "undo two: turn %d failed", step)
+			return
+		}
+		if step == 2 {
+			for t in sides[0].last {
+				gone[t] = true
+			}
+		}
+	}
+	a := &sides[0]
+	b := &sides[1]
+	{
+		context = instance_context(&n.inst)
+		_, err := eng.convo_undo(&n.e, a.conv, a.turns[1])
+		node_after(n)
+		if err != .None {
+			world_fail(w, "undo two: convo_undo: %v", err)
+			return
+		}
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	present := make(map[string]bool, alloc)
+	for _, data in _ur_disk(c) {
+		for t in strings.split_lines(strings.trim_right(data, "\n"), context.temp_allocator) {
+			present[t] = true
+		}
+	}
+	for t in a.toks {
+		if gone[t] && present[t] {
+			world_fail(w, "undo two: A's %s from the undone turn survives the undo", t)
+		}
+		if !gone[t] && !present[t] {
+			world_fail(w, "undo two: A's %s from before the undone turn is gone", t)
+		}
+	}
+	for t in b.toks {
+		if !present[t] {
+			world_fail(w, "undo two: the other conversation's %s is gone after undoing A's turn", t)
+		}
+	}
+	if len(b.toks) == 0 || len(gone) == 0 {
+		world_fail(w, "undo two: the case wrote nothing to check (A %d, B %d)", len(a.toks), len(b.toks))
+	}
+}
+
+@(test)
+undo_two_convos :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	count := env_u64("UR_TWO_SEEDS", 40)
+	for seed in u64(1) ..= count {
+		w := _ur_world(seed)
+		a: virtual.Arena
+		if virtual.arena_init_growing(&a, 1 << 20) == nil {
+			_ur_two(w, virtual.arena_allocator(&a))
+		}
+		for f in w.failures {
+			if bad < 30 {
+				fmt.eprintf("undo_two_convos seed %d: %s\n", seed, f)
+			}
+		}
+		if len(w.failures) > 0 {
+			bad += 1
+		}
+		world_destroy(w)
+		free(w)
+		virtual.arena_destroy(&a)
+	}
+	fmt.eprintf("undo_two_convos: %d seeds, %d failed\n", count, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("undo_two_convos: %d failures", bad))
 }
