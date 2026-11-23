@@ -394,6 +394,7 @@ Mount :: struct {
 	mat_bytes:   int,
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
+	attrib_chain: map[string][dynamic]Attrib_Step,
 	log_sync:    ^Log_Sync,
 	log_next:    [dynamic]Obs_Wait,
 	log_len:     i64,
@@ -759,6 +760,11 @@ mount_close :: proc(m: ^Mount) {
 		m.log_fd = prim.INVALID_FD
 	}
 	delete(m.log_next)
+	for k, l in m.attrib_chain {
+		delete(l)
+		delete(k, m.allocator)
+	}
+	delete(m.attrib_chain)
 	if m.shadow.dir != "" {
 		shadow_close(&m.shadow)
 	}
@@ -1217,6 +1223,9 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		}
 		if i64(pos) >= m.log_at {
 			attrib_set(m, path, actor, false, o)
+			if o != {} {
+				attrib_chain_add(m, path, Attrib_Step{actor, o})
+			}
 		}
 		pos += 8 + n
 	}
@@ -1244,6 +1253,37 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	from_prim(prim.write_at(m.vfs, m.log_fd, rec, m.log_len)) or_return
 	m.log_len += i64(len(rec))
 	return .None
+}
+
+Attrib_Step :: struct {
+	actor: prim.Id,
+	oid:   odb.Oid,
+}
+
+@(private)
+attrib_chain_add :: proc(m: ^Mount, path: string, st: Attrib_Step) {
+	if m.attrib_chain == nil {
+		m.attrib_chain = make(map[string][dynamic]Attrib_Step, m.allocator)
+	}
+	l, ok := &m.attrib_chain[path]
+	if !ok {
+		k, _ := clone_string(path, m.allocator)
+		m.attrib_chain[k] = make([dynamic]Attrib_Step, m.allocator)
+		l = &m.attrib_chain[k]
+	}
+	if len(l) > 0 && l[len(l) - 1] == st {
+		return
+	}
+	append(l, st)
+}
+
+@(private)
+attrib_chain_drop :: proc(m: ^Mount, path: string) {
+	if _, ok := m.attrib_chain[path]; ok {
+		k, l := delete_key(&m.attrib_chain, path)
+		delete(l)
+		delete(k, m.allocator)
+	}
 }
 
 @(private)
