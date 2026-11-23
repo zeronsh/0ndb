@@ -1407,8 +1407,19 @@ concurrent typing is never lost or reverted.
     crash at any point leaves the previous meta valid. At most two pending
     metas are kept per file (the oldest unpublished one and the newest), the
     newest eligible one is the one written, and compaction waits while any is
-    pending. Journals use sized external files (committed size in the
-    inode). Small sidecars (replica `.have`, floor slots) are inline or
+    pending. The registry is a copy-on-write omap file outside the pack.
+    A synchronous registry commit writes its pages, a barrier, the newest
+    meta and a sync; content marks commit lazily (pages only, the new meta
+    kept in memory, so every reader, compaction and synchronous commit
+    sees them). Each pack commit's job publishes, on the worker and before
+    its commit record, the newest meta taken when the commit started:
+    barrier, the meta into the slot not holding the last published one, a
+    sync, all under the Db mutex a synchronous commit and compaction also
+    hold; a meta older than one already published is skipped. Commit-job
+    hooks run in order before the commit record, and each hook's done runs
+    once on the loop when the job ends; the odb install is the first, the
+    registry publish the second. Journals use sized external files
+    (committed size in the inode). Small sidecars (replica `.have`, floor slots) are inline or
     replaced by rename, which is batch metadata.
   - Registry: on an unclean open, before spaces load, `own` and the owned
     entry of an object whose own segment is absent or empty are cleared (not
@@ -2805,7 +2816,7 @@ Relay cost tracks the reachable information, not the activity. Items marked
     admits any record and independent of record order. The catalog write
     goes through the catalog queue and lands with a later batch, while the
     tree's content mark (the own-stream offset up to which its blobs are
-    handled) commits at once in the registry; so the same registry
+    handled) commits in the registry; so the same registry
     transaction that advances the mark past a remote-skipped blob also
     stores the URLs (`ROOT_OWNED`, key space ‖ tree ‖ `r`), and opening the
     space re-notes them into the catalog. A crash between the two can no
@@ -2876,14 +2887,19 @@ Relay cost tracks the reachable information, not the activity. Items marked
   follows are clamped and preceded by a `Hollow` frame with `base` and
   `length`. Feed compaction keeps the hollow flag.
 - **Content uploads follow durability.** Each owned file tree keeps an upload
-  mark and a target in the registry (`ROOT_OWNED`). When the batch holding
-  tree records becomes durable the target rises to that length, whether or
-  not the space replicates yet; uploads always run from the mark to the
-  target and move the mark only when every blob in range is stored, and a
-  replication start resumes every tree whose target is past its mark. A tree
-  written while local-only is therefore uploaded in full on sign-in. Nothing
-  lowers a target: setting a mark keeps it, and the open-time audit clamps
-  both to the recovered stream.
+  mark and a target in the registry (`ROOT_OWNED`). The target rides the
+  pack commit that makes the tree's records durable: before each commit the
+  engine raises it, lazily, to every open own tree's journal length and to
+  each ending batch's tree lengths, and that commit's job publishes the
+  registry before its commit record, whether or not the space replicates
+  yet. A journal synced outside a commit (an External journal synced inside
+  an open batch) can be durable past its target across a crash; the
+  unclean-open audit raises such a target to the recovered journal. Uploads
+  always run from the mark to the target and move the mark only when every
+  blob in range is stored, and a replication start resumes every tree whose
+  target is past its mark. A tree written while local-only is therefore
+  uploaded in full on sign-in. Nothing lowers a target: setting a mark keeps
+  it, and the open-time audit clamps both to the recovered stream.
 - **Content budget.** Large content is content-op (opaque) blobs: binaries
   and files over the mount's large limit. A device uploads such a blob, when
   it is not remote-backed, only while the space's budget allows

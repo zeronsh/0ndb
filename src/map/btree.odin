@@ -2,6 +2,7 @@ package omap
 
 import "base:runtime"
 import "core:hash/xxhash"
+import "core:sync"
 import "../obj"
 import "../prim"
 
@@ -57,6 +58,11 @@ Db :: struct {
 	pend:      [2]Pend_Meta,
 	npend:     int,
 	publishing: bool,
+	lazy:      bool,
+	mu:        sync.Mutex,
+	published: u64,
+	pub_slot:  int,
+	pub_wait:  int,
 }
 
 Pend_Meta :: struct {
@@ -149,10 +155,18 @@ db_close :: proc(db: ^Db) {
 		txn_abort(db.txn)
 	}
 	if db.fd >= 0 {
+		sync.mutex_lock(&db.mu)
 		if !db.poisoned {
-			prim.datasync(db.vfs, db.fd)
+			if db.lazy {
+				m := db.meta
+				_publish_locked(db, &m)
+			} else {
+				prim.datasync(db.vfs, db.fd)
+			}
 		}
 		prim.close_file(db.vfs, db.fd)
+		db.fd = prim.INVALID_FD
+		sync.mutex_unlock(&db.mu)
 	}
 	delete(db.cache, db.allocator)
 	delete(db.path, db.allocator)
@@ -397,10 +411,12 @@ txn_commit :: proc(t: ^Txn) -> Error {
 			db.poisoned = true
 			return obj.perr(err)
 		}
-		if err := prim.barrier(db.vfs, db.fd); err != .None {
-			txn_abort(t)
-			db.poisoned = true
-			return obj.perr(err)
+		if !db.lazy {
+			if err := prim.barrier(db.vfs, db.fd); err != .None {
+				txn_abort(t)
+				db.poisoned = true
+				return obj.perr(err)
+			}
 		}
 	}
 	m := t.meta
@@ -409,6 +425,11 @@ txn_commit :: proc(t: ^Txn) -> Error {
 	m.live = db.meta.live + written - min(t.freed, db.meta.live + written)
 	if db.tag_of != nil {
 		_pend_add(db, m, db.tag_of(db.tag_data))
+		db.meta = m
+		txn_abort(t)
+		return .None
+	}
+	if db.lazy {
 		db.meta = m
 		txn_abort(t)
 		return .None
@@ -483,12 +504,93 @@ db_publish :: proc(db: ^Db, durable: u64) -> Error {
 }
 
 db_sync :: proc(db: ^Db) -> Error {
+	if db.lazy {
+		return db_flush(db)
+	}
 	return obj.perr(prim.datasync(db.vfs, db.fd))
+}
+
+db_flush :: proc(db: ^Db) -> Error {
+	if db.poisoned || db.fd < 0 {
+		return .Io
+	}
+	m := db.meta
+	sync.mutex_lock(&db.mu)
+	err := _publish_locked(db, &m)
+	sync.mutex_unlock(&db.mu)
+	if err != .None {
+		db.poisoned = true
+		return err
+	}
+	return db_compact_due(db)
+}
+
+db_compact_due :: proc(db: ^Db) -> Error {
+	if db.pub_wait > 0 || db.npend > 0 || db.txn != nil || db.meta.pages <= 2 * db.meta.live + 2 + COMPACT_SLACK {
+		return .None
+	}
+	return db_compact(db)
+}
+
+db_publish_take :: proc(db: ^Db) -> (m: Meta, ok: bool) {
+	if !db.lazy || db.poisoned || db.fd < 0 || db.txn != nil {
+		return {}, false
+	}
+	sync.mutex_lock(&db.mu)
+	ok = db.meta.txn > db.published
+	sync.mutex_unlock(&db.mu)
+	if ok {
+		db.pub_wait += 1
+	}
+	return db.meta, ok
+}
+
+db_publish_run :: proc(db: ^Db, m: ^Meta) -> Error {
+	sync.mutex_lock(&db.mu)
+	defer sync.mutex_unlock(&db.mu)
+	return _publish_locked(db, m)
+}
+
+db_publish_done :: proc(db: ^Db, ok: bool) {
+	if db.pub_wait > 0 {
+		db.pub_wait -= 1
+	}
+	if !ok {
+		db.poisoned = true
+	}
+}
+
+@(private)
+_publish_locked :: proc(db: ^Db, m: ^Meta) -> Error {
+	if db.fd < 0 {
+		return .Io
+	}
+	if m.txn <= db.published {
+		return .None
+	}
+	if err := prim.barrier(db.vfs, db.fd); err != .None {
+		return obj.perr(err)
+	}
+	slot := 1 - db.pub_slot
+	_meta_write_slot(db.vfs, db.fd, m, slot) or_return
+	if err := prim.datasync(db.vfs, db.fd); err != .None {
+		return obj.perr(err)
+	}
+	db.published = m.txn
+	db.pub_slot = slot
+	return .None
 }
 
 db_compact :: proc(db: ^Db) -> Error {
 	if db.txn != nil || db.npend > 0 {
 		return .Busy
+	}
+	locked := db.lazy
+	if locked {
+		sync.mutex_lock(&db.mu)
+	}
+	defer if locked {
+		sync.mutex_unlock(&db.mu)
 	}
 	if db.poisoned {
 		return .Io
@@ -551,6 +653,8 @@ db_compact :: proc(db: ^Db) -> Error {
 		db.poisoned = true
 		return obj.perr(err)
 	}
+	db.published = m.txn
+	db.pub_slot = 1
 	return .None
 }
 
@@ -643,6 +747,7 @@ _db_load :: proc(db: ^Db) -> Error {
 		return obj.perr(serr)
 	}
 	best: Meta
+	best_slot := 0
 	found := false
 	for slot in 0 ..< 2 {
 		m, ok := _meta_read(db.vfs, db.fd, slot)
@@ -651,6 +756,7 @@ _db_load :: proc(db: ^Db) -> Error {
 		}
 		if !found || m.txn > best.txn {
 			best = m
+			best_slot = slot
 			found = true
 		}
 	}
@@ -658,6 +764,8 @@ _db_load :: proc(db: ^Db) -> Error {
 		return .Corrupt
 	}
 	db.meta = best
+	db.published = best.txn
+	db.pub_slot = best_slot
 	if i64(best.pages) * PAGE < size {
 		if err := prim.truncate(db.vfs, db.fd, i64(best.pages) * PAGE); err != .None {
 			return obj.perr(err)

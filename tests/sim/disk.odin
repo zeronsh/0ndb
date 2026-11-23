@@ -129,6 +129,9 @@ Disk :: struct {
 	reopen_fails:  u64,
 	tmp_fail:  u64,
 	tmp_fails: u64,
+	reg_crash:   u64,
+	reg_crash_n: u64,
+	reg_crashes: u64,
 	force_ghost: bool,
 	ghost_root:  string,
 	fail_unlink: string,
@@ -810,6 +813,7 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 	return .None
 }
 
+
 @(private = "file")
 _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	d := (^Disk)(data)
@@ -843,6 +847,14 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	}
 	if d.probe == 0 {
 		d.stats.syncs += 1
+		if d.reg_crash > 0 && d.crash_at == 0 && strings.contains(of.path, "/pack/c") {
+			d.reg_crash_n += 1
+			if d.reg_crash_n >= d.reg_crash {
+				d.reg_crash = 0
+				d.crash_at = d.stats.ops + 1
+				d.reg_crashes += 1
+			}
+		}
 		if d.crash_at == 0 && disk_blob_sync_crash(d, of.path) {
 			d.crash_at = d.stats.ops + 1
 			d.blob_crashes += 1

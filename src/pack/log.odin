@@ -275,8 +275,7 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 			return false, _poison(p, berr)
 		}
 	}
-	p.fl.install = p.queued
-	p.queued = {}
+	p.fl.hooks, p.queued = p.queued, p.fl.hooks
 	p.force = false
 	if p.dirsync_pending {
 		p.fl.dirsync = true
@@ -347,10 +346,7 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 			_unpin_real(p, j.fd)
 		}
 	}
-	if h := fl.install; h.done != nil {
-		fl.install = {}
-		h.done(h.data, err == .None)
-	}
+	_hooks_done(&fl.hooks, err == .None)
 	for id in fl.busy {
 		ci := _cont_index(p, id)
 		if ci >= 0 {
@@ -1111,4 +1107,15 @@ _suspect_record :: proc(p: ^Pack, inums: []u64) {
 	}
 	prim.datasync(p.base, fd)
 	prim.sync_dir(p.base, p.root)
+}
+
+@(private)
+_hooks_done :: proc(hooks: ^[dynamic]Commit_Hook, ok: bool) {
+	for i := 0; i < len(hooks); i += 1 {
+		h := hooks[i]
+		if h.done != nil {
+			h.done(h.data, ok)
+		}
+	}
+	clear(hooks)
 }
