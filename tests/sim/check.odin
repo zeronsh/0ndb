@@ -733,7 +733,7 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		}
 		collect(&present, data, spans[:], "")
 	} else {
-		names, _ := eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
+		names, _ := tree_files_all(n, ob.o)
 		for nm in names {
 			data, _ := eng.tree_read(&n.e, ob.o, nm, context.temp_allocator)
 			spans := tree_file_spans(n, ob.o, nm)

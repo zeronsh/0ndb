@@ -36,6 +36,8 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	if m.history == nil {
 		return .None
 	}
+	mount_pass_finish(m) or_return
+	assert(m.pass == nil)
 	mount_wake(m) or_return
 	if m.adopt_pending {
 		if !m.imported {
@@ -71,6 +73,8 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 
 @(private)
 materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
+	mount_pass_finish(m) or_return
+	assert(m.pass == nil)
 	attr_begin(m)
 	defer attr_end(m)
 	h := m.history

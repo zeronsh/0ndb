@@ -1,5 +1,6 @@
 package sim
 
+import "base:runtime"
 import "core:fmt"
 import "core:slice"
 import "core:strings"
@@ -597,6 +598,27 @@ tree_file_spans :: proc(n: ^Node, o: eng.Object, path: string) -> []crdt_span {
 	return out
 }
 
+tree_files_all :: proc(n: ^Node, o: eng.Object, allocator := context.temp_allocator) -> (out: [dynamic]string, err: eng.Error) {
+	out = make([dynamic]string, allocator)
+	err = _tree_walk(n, o, "", &out, allocator)
+	return
+}
+
+@(private = "file")
+_tree_walk :: proc(n: ^Node, o: eng.Object, dir: string, out: ^[dynamic]string, allocator: runtime.Allocator) -> eng.Error {
+	names := eng.tree_list(&n.e, o, dir, context.temp_allocator) or_return
+	for nm in names {
+		full := nm if len(dir) == 0 else strings.concatenate({dir, "/", nm}, allocator)
+		kids, kerr := eng.tree_list(&n.e, o, full, context.temp_allocator)
+		if kerr == .None && len(kids) > 0 {
+			_tree_walk(n, o, full, out, allocator) or_return
+			continue
+		}
+		append(out, full)
+	}
+	return .None
+}
+
 check_mounts :: proc(w: ^World) {
 	for n in w.nodes {
 		if !n.alive {
@@ -608,13 +630,13 @@ check_mounts :: proc(w: ^World) {
 			}
 			ob := &w.model.objs[sm.oi]
 			context = instance_context(&n.inst)
-			names, lerr := eng.tree_list(&n.e, ob.o, "", context.temp_allocator)
+			names, lerr := tree_files_all(n, ob.o)
 			if lerr != .None {
 				world_fail(w, "mount: %s cannot list mounted tree %s: %v", n.name, id_short(ob.o.id), lerr)
 				node_after(n)
 				continue
 			}
-			slice.sort(names)
+			slice.sort(names[:])
 			want := strings.builder_make(context.temp_allocator)
 			for nm in names {
 				if strings.has_prefix(nm, ".") {

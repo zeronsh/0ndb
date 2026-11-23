@@ -85,6 +85,10 @@ Registry :: struct {
 	eol_data:  rawptr,
 	on_base:   Base_Proc,
 	base_data: rawptr,
+	slice_budget: i64,
+	slice_commit: int,
+	slice_hook: Slice_Hook,
+	slice_data: rawptr,
 }
 
 @(private)
@@ -290,6 +294,9 @@ Mount :: struct {
 	rescan:      bool,
 	git_moved:   bool,
 	fence_seq:   u64,
+	pass:        ^Pass_Run,
+	slice_spent: i64,
+	redeep:      map[string]bool,
 	git_locked:  bool,
 	lock_first:  bool,
 	lock_stale:  bool,
@@ -601,6 +608,7 @@ drop_lost :: proc(m: ^Mount, dir: string, lost: []Lost_Range) -> Error {
 }
 
 mount_close :: proc(m: ^Mount) {
+	mount_pass_finish(m)
 	mount_release_writes(m)
 	mount_unlock(m)
 	delete(m.lock_watches)
@@ -685,6 +693,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(k, m.allocator)
 	}
 	delete(m.dirty)
+	for k in m.redeep {
+		delete(k, m.allocator)
+	}
+	delete(m.redeep)
 	for k in m.open_scopes {
 		delete(k, m.allocator)
 	}
@@ -745,7 +757,7 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	if !m.awake {
 		return .None
 	}
-	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 {
+	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 || m.pass != nil {
 		return .Busy
 	}
 	err := shadow_flush(m)
@@ -1086,7 +1098,21 @@ mount_run :: proc(m: ^Mount) -> Error {
 			fence = true
 		}
 	}
-	err := mount_pass(m, false, !fence)
+	err: Error
+	if fence || m.reg == nil || m.reg.loop == nil {
+		err = mount_pass(m, false, !fence)
+	} else {
+		done: bool
+		done, err = mount_pass_slice(m, true)
+		if !done {
+			if m.reg.slice_hook != nil {
+				m.reg.slice_hook(m, m.reg.slice_data)
+			}
+			mount_schedule(m, 0)
+			mount_touch(m)
+			return err
+		}
+	}
 	if err == .None {
 		err = mount_materialize(m)
 	}

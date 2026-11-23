@@ -1090,6 +1090,10 @@ Pass :: struct {
 	alias_commits: [dynamic]string,
 	held_r:     map[string]bool,
 	held_c:     map[string]bool,
+	budget:     i64,
+	defer_flush: bool,
+	flush_due:  bool,
+	plan_err:   Error,
 }
 
 PASS_CHUNK :: 4096
@@ -1225,6 +1229,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 }
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
+	mount_pass_finish(m) or_return
 	if !m.imported && !m.importing {
 		m.importing = true
 		ierr := mount_recover(m)
@@ -1236,103 +1241,50 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		return mount_pass(m, true, false)
 	}
 	adopt_finish(m) or_return
-	attr_begin(m)
-	defer attr_end(m)
-	long: virtual.Arena
-	if virtual.arena_init_growing(&long, 256 << 10) != nil {
-		return .No_Memory
+	pr := pass_begin(m, full, settle, 0) or_return
+	_, err = pass_drive(m, pr)
+	_pass_free(pr)
+	return err
+}
+
+mount_pass_finish :: proc(m: ^Mount) -> Error {
+	pr := m.pass
+	if pr == nil {
+		return .None
 	}
-	defer virtual.arena_destroy(&long)
-	p: Pass
-	p.m = m
-	p.long = virtual.arena_allocator(&long)
-	if virtual.arena_init_growing(&p.chunk, 1 << 20) != nil {
-		return .No_Memory
-	}
-	defer virtual.arena_destroy(&p.chunk)
-	context.temp_allocator = virtual.arena_allocator(&p.chunk)
-	mount_wake(m) or_return
-	if m.history != nil {
-		defer history_trim(m.history)
-	}
-	catch_up(m) or_return
-	if m.has_git {
-		p.head, _ = git_head(m.vfs, m.git, p.long)
-		p.head_moved = !git_head_equal(p.head, m.head)
-		stamp := git_index_stamp(m.vfs, m.git)
-		commits_only, _, rewritten := git_reflog_commits_only(m.vfs, m.git, m.reflog_pos)
-		p.operation = git_operation(m.vfs, m.git)
-		p.git_wrote = (p.head_moved && (!commits_only || rewritten)) || (p.operation != "" && stamp != m.stamp)
-	}
-	if p.git_wrote {
-		collect_alias_sources(m, &p)
-	}
-	defer {
-		delete(m.alias)
-		m.alias = nil
-	}
-	p.changes = make([dynamic]Change, p.long)
-	p.held = make([dynamic]Change, p.long)
-	p.held_r = make(map[string]bool, p.long)
-	p.held_c = make(map[string]bool, p.long)
-	p.seen = make(map[string]bool, p.long)
-	p.young = make([dynamic]string, p.long)
-	p.holding = make([dynamic]string, p.long)
-	p.rebased = make([dynamic]crdt.Op_Id, p.long)
-	p.scope_of = make(map[string]^Scope, p.long)
-	p.settle = settle && !p.git_wrote
-	p.now = history_wall_ns(m.history)
-	p.cutoff = p.now - m.opts.settle_ms * 1_000_000
-	p.full = full || m.rescan || p.git_wrote
-	m.hold_line = p.git_wrote
-	defer m.hold_line = false
-	keys := make([dynamic]string, 0, len(m.dirty), p.long)
-	for k, v in m.dirty {
-		c, _ := clone_string(k, p.long)
-		p.scope_of[c] = v
-		append(&keys, c)
-	}
-	for k in m.dirty {
-		delete(k, m.allocator)
-	}
-	clear(&m.dirty)
-	rescan_was := m.rescan
-	m.rescan = false
-	m.git_moved = false
-	defer if err != .None {
-		for k, v in p.scope_of {
-			if k not_in m.dirty {
-				c, _ := clone_string(k, m.allocator)
-				m.dirty[c] = v
-			}
+	pr.p.budget = 0
+	pr.p.defer_flush = false
+	_, err := pass_drive(m, pr)
+	m.pass = nil
+	_pass_free(pr)
+	return err
+}
+
+@(private)
+mount_pass_slice :: proc(m: ^Mount, settle: bool) -> (done: bool, err: Error) {
+	if m.pass == nil {
+		if !m.imported && !m.importing {
+			return true, mount_pass(m, false, settle)
 		}
-		m.rescan ||= rescan_was || p.full
+		adopt_finish(m) or_return
+		m.pass = pass_begin(m, false, settle, _slice_budget(m)) or_return
 	}
-	if p.full {
-		collect_full(&p) or_return
-	} else {
-		slice.sort_by(keys[:], proc(a, b: string) -> bool {return git_path_cmp(a, false, b, false) < 0})
-		pre_moves(&p, keys[:]) or_return
-		for k in keys {
-			collect_path(&p, k) or_return
-			pass_maybe_flush(&p) or_return
-		}
-		if !settle {
-			scoped := make([dynamic]string, 0, len(m.unwatched), p.long)
-			for u in m.unwatched {
-				append(&scoped, clone_string(u, p.long) or_else "")
-			}
-			for u in scoped {
-				d := probe(m, u) or_return
-				if d.kind != .Dir {
-					collect_path(&p, u) or_return
-					continue
-				}
-				compare_dir_deep(&p, u, -1) or_return
-			}
-		}
+	pr := m.pass
+	done, err = pass_drive(m, pr)
+	if done {
+		m.pass = nil
+		_pass_free(pr)
 	}
-	pass_flush(&p) or_return
+	return
+}
+
+@(private)
+_pass_epilogue :: proc(pr: ^Pass_Run) -> Error {
+	p := &pr.p
+	m := p.m
+	if m.pass == pr {
+		m.pass = nil
+	}
 	if m.hold_line {
 		m.hold_line = false
 		set_line(m) or_return
@@ -1516,6 +1468,10 @@ pass_maybe_flush :: proc(p: ^Pass) -> Error {
 	if len(p.changes) < PASS_CHUNK {
 		return .None
 	}
+	if p.defer_flush {
+		p.flush_due = true
+		return .None
+	}
 	return pass_flush(p, false)
 }
 
@@ -1532,7 +1488,7 @@ held_under :: proc(set: map[string]bool, path: string) -> bool {
 }
 
 @(private)
-pass_flush :: proc(p: ^Pass, final := true) -> Error {
+pass_flush_plan :: proc(p: ^Pass, final: bool, units: ^[dynamic]Commit_Unit) -> bool {
 	m := p.m
 	if len(p.held) > 0 {
 		merged := make([dynamic]Change, 0, len(p.held) + len(p.changes), context.temp_allocator)
@@ -1545,7 +1501,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 	clear(&p.held_r)
 	clear(&p.held_c)
 	if len(p.changes) == 0 && !(p.git_wrote && !p.marked) {
-		return .None
+		return false
 	}
 	for &c in p.changes {
 		c.scope = p.scope_of[c.path]
@@ -1611,11 +1567,15 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				marker = buf[:]
 				p.marked = true
 			}
-			commit_bounded(p, m.actor, all[lo:min(lo + PASS_CHUNK, len(all))], marker) or_return
+			append(units, Commit_Unit{actor = m.actor, idx = all[lo:min(lo + PASS_CHUNK, len(all))], marker = marker})
 		}
 	} else {
-		rebase_changes(p) or_return
-		attribute_changes(p) or_return
+		if p.plan_err = rebase_changes(p); p.plan_err != .None {
+			return false
+		}
+		if p.plan_err = attribute_changes(p); p.plan_err != .None {
+			return false
+		}
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
 		order := make([dynamic]prim.Id, context.temp_allocator)
 		for c, i in p.changes {
@@ -1641,17 +1601,43 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 					attrib_set(m, p.changes[i].path, actor, true)
 				}
 			}
-			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
-				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))]) or_return
+			if len(idx) > 0 {
+				append(units, Commit_Unit{actor = actor, idx = idx})
 			}
 		}
 	}
+	return true
+}
+
+@(private)
+pass_flush_done :: proc(p: ^Pass) -> Error {
+	m := p.m
 	mount_settle(m) or_return
 	history_trim(m.history)
 	clear(&p.changes)
 	virtual.arena_free_all(&p.chunk)
 	return .None
 }
+
+@(private)
+pass_flush :: proc(p: ^Pass, final := true) -> Error {
+	units := make([dynamic]Commit_Unit, context.temp_allocator)
+	p.plan_err = .None
+	if !pass_flush_plan(p, final, &units) {
+		return p.plan_err
+	}
+	for u in units {
+		if len(u.idx) == 0 {
+			commit_bounded(p, u.actor, u.idx, u.marker) or_return
+			continue
+		}
+		for lo := 0; lo < len(u.idx); lo += PASS_CHUNK {
+			commit_bounded(p, u.actor, u.idx[lo:min(lo + PASS_CHUNK, len(u.idx))], u.marker if lo == 0 else nil) or_return
+		}
+	}
+	return pass_flush_done(p)
+}
+
 
 @(private)
 Probe :: struct {
@@ -1665,6 +1651,7 @@ probe :: proc(m: ^Mount, rel: string, listed := false) -> (out: Probe, err: Erro
 	abuf: prim.Path_Buf
 	abs := abs_path(m, rel, abuf[:])
 	st, serr := prim.lstat(m.vfs, abs)
+	slice_charge(m, SLICE_COST_STAT)
 	if gone(serr) {
 		return {kind = .Missing}, .None
 	}
@@ -2437,6 +2424,7 @@ read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{
 		return nil, o, true, true, .None
 	}
 	d, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+	slice_charge(m, SLICE_COST_OPEN + i64(len(d)) * SLICE_COST_MIB / (1 << 20))
 	if gone(rerr) {
 		return nil, {}, false, false, .None
 	}
