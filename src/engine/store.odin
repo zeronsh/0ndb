@@ -145,6 +145,15 @@ _storage_short :: proc(e: ^Engine, err: Error, what: string) {
 }
 
 @(private)
+_storage_soft :: proc(e: ^Engine, err: Error, what: string) -> bool {
+	if err == .No_Space || err == .Io {
+		_storage_short(e, err, what)
+		return true
+	}
+	return false
+}
+
+@(private)
 _reg_reopen :: proc(e: ^Engine) -> Error {
 	if !omap.db_poisoned(&e.reg.db) {
 		return .None

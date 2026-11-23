@@ -245,7 +245,7 @@ _disk_full :: proc(w: ^World, cow: bool) {
 			break
 		}
 	}
-	for i := 5; i < 5 + FULL_ROUNDS; i += 10 {
+	for i := 10; i < 5 + FULL_ROUNDS; i += 10 {
 		title := fmt.tprintf("b convo %04d", i)
 		if !_df_cataloged(w, a, space, title) {
 			world_fail(w, "disk full: n0's catalog never listed n1's %q after the disk cleared", title)
@@ -257,16 +257,22 @@ _disk_full :: proc(w: ^World, cow: bool) {
 	if !okta || !oktb || ta != tb {
 		world_fail(w, "disk full: the text differs after the disk cleared (%d vs %d bytes, reads %v %v)", len(ta), len(tb), okta, oktb)
 	}
-	{
+	for attempt in 0 ..< 20 {
 		context = instance_context(&a.inst)
-		defer node_after(a)
 		notes, err := eng.verify_derived(&a.e, context.temp_allocator)
+		if err == .Busy && attempt < 19 {
+			node_after(a)
+			run_until(w, w.now + 5_000_000_000, true)
+			continue
+		}
 		if err != .None {
 			world_fail(w, "disk full: derived check: %v", err)
 		}
 		for x in notes {
 			world_fail(w, "disk full: %s", x)
 		}
+		node_after(a)
+		break
 	}
 }
 

@@ -322,11 +322,22 @@ _handle_open_own :: proc(h: ^Handle) -> Error {
 }
 
 @(private)
-_handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, settings: []u8 = nil) -> Error {
+_handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, settings: []u8 = nil) -> (err: Error) {
 	if h.w_open {
 		return .None
 	}
 	e := h.e
+	_reserve(e, CMD_OVERHEAD * 4) or_return
+	_scope_begin(e)
+	defer _scope_end(e)
+	set_own := false
+	defer if err != .None && set_own {
+		if back, bfound, berr := _rec_get(e, h.id); berr == .None && bfound && back.own {
+			back.own = false
+			_rec_put(e, h.id, &back)
+			_registry_flush(e)
+		}
+	}
 	if h.sp.keyless {
 		if a, ok := h.sp.grant_access[h.id]; !ok || .Write not_in a {
 			return .Permission
@@ -362,6 +373,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 			rec.created = h.created
 		}
 		_rec_put(e, h.id, &rec) or_return
+		set_own = true
 	}
 	_registry_flush(e) or_return
 	switch h.kind {
