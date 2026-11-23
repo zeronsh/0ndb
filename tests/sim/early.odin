@@ -151,11 +151,11 @@ _early_check :: proc(w: ^World) {
 _early_hooks :: proc "contextless" () {
 	register_world(80, _early_init, _early_destroy)
 	EV_EARLY = register_event(_early_event)
-	register_final_check(120, _early_check)
-	register_stat_line(60, "early_pushes")
-	STAT_EARLY_AHEAD = register_stat(60, 0, "ahead")
-	STAT_EARLY_CRASH = register_stat(60, 1, "relay_crashes")
-	STAT_EARLY_BYTES = register_stat(60, 2, "replica_bytes_checked")
+	register_final_check(118, _early_check)
+	register_stat_line(61, "early_pushes")
+	STAT_EARLY_AHEAD = register_stat(61, 0, "ahead")
+	STAT_EARLY_CRASH = register_stat(61, 1, "relay_crashes")
+	STAT_EARLY_BYTES = register_stat(61, 2, "replica_bytes_checked")
 }
 
 @(test)

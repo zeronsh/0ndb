@@ -6,7 +6,7 @@ import osync "../../src/sync"
 
 @(init)
 _epochs_init :: proc "contextless" () {
-	register_final_check(121, check_epochs)
+	register_final_check(122, check_epochs)
 }
 
 @(private = "file")

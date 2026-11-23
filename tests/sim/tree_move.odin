@@ -59,7 +59,7 @@ _tree_move_init :: proc "contextless" () {
 	STAT_TM_EDIT = register_stat(53, 5, "vs_edit")
 	STAT_TM_REPLACE = register_stat(53, 6, "replace_edit")
 	STAT_TM_RECONCILE = register_stat(53, 7, "place_reconciles")
-	STAT_TM_ACCEPTED = register_stat(53, 7, "offers_accepted")
+	STAT_TM_ACCEPTED = register_stat(53, 8, "offers_accepted")
 }
 
 @(private = "file")
