@@ -447,7 +447,7 @@ history_commit_groups :: proc(h: ^History) -> (committed: bool, err: Error) {
 		return false, .None
 	}
 	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
-	if fd, oerr := prim.open_file(h.vfs, lp, {.Write}, 0o600); oerr == .None {
+	if fd, oerr := prim.open_file(h.vfs, lp, {.Write, .Group_Visible}, 0o600); oerr == .None {
 		serr := prim.datasync(h.vfs, fd)
 		prim.close_file(h.vfs, fd)
 		from_prim(serr) or_return
@@ -523,7 +523,7 @@ history_wake :: proc(h: ^History) -> Error {
 	h.pins = make([dynamic]odb.Oid, h.allocator)
 	h.markers = make([dynamic]Git_Marker, h.allocator)
 	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
-	lfd, lerr := prim.open_file(h.vfs, lp, {.Write, .Create}, 0o600)
+	lfd, lerr := prim.open_file(h.vfs, lp, {.Write, .Create, .Group_Visible}, 0o600)
 	if lerr != .None {
 		journal.journal_close(&h.journal)
 		kv_close(&h.kv)
@@ -757,7 +757,7 @@ history_wipe :: proc(h: ^History) -> Error {
 	}
 	kv_commit(&kv) or_return
 	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
-	fd, oerr := prim.open_file(h.vfs, lp, {.Write, .Create}, 0o600)
+	fd, oerr := prim.open_file(h.vfs, lp, {.Write, .Create, .Group_Visible}, 0o600)
 	from_prim(oerr) or_return
 	defer prim.close_file(h.vfs, fd)
 	from_prim(prim.truncate(h.vfs, fd, 0)) or_return

@@ -666,7 +666,8 @@ _phys_within :: proc "contextless" (ino: ^Inode, x: Phys) -> bool {
 _promote :: proc(p: ^Pack, oi: ^Open_Inode, sized := false) -> Error {
 	pb: prim.Path_Buf
 	path := _phys_path(p, &pb, 'x', oi.inum)
-	fd := prim.open_file(p.base, path, {.Write, .Create, .Truncate}, 0o600) or_return
+	prim.remove(p.base, path)
+	fd := prim.open_file(p.base, path, {.Write, .Create, .Exclusive}, 0o600) or_return
 	ok := false
 	defer if !ok {
 		prim.close_file(p.base, fd)

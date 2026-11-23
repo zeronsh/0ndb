@@ -35,6 +35,7 @@ Inode :: struct {
 	mode:     u32,
 	data:     [dynamic]u8,
 	durable:  [dynamic]u8,
+	ghost:    [dynamic]u8,
 	pend:     [dynamic]Pend,
 	entries:  map[string]u64,
 	dentries: map[string]u64,
@@ -95,6 +96,7 @@ Disk_Stats :: struct {
 	bytes:    u64,
 	crashes:  u64,
 	torn:     u64,
+	ghosts:   u64,
 	lost:     u64,
 	injected: u64,
 }
@@ -113,6 +115,7 @@ Disk :: struct {
 	wall:      proc(data: rawptr) -> i64,
 	wall_data: rawptr,
 	crash_at:  u64,
+	force_ghost: bool,
 	dead:      bool,
 	fail_sync: u64,
 	fail_rate: u64,
@@ -232,6 +235,7 @@ _inode_free :: proc(d: ^Disk, n: ^Inode) {
 	_pend_drop(d, n)
 	delete(n.data)
 	delete(n.durable)
+	delete(n.ghost)
 	for p in n.pend {
 		delete(p.bytes, d.allocator)
 	}
@@ -761,6 +765,15 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 			copy(n.durable[p.off:end], p.bytes)
 		case .Truncate:
 			old := len(n.durable)
+			if int(p.size) < old {
+				if n.ghost == nil {
+					n.ghost = make([dynamic]u8, d.allocator)
+				}
+				if len(n.ghost) < old {
+					resize(&n.ghost, old)
+				}
+				copy(n.ghost[p.size:old], n.durable[p.size:old])
+			}
 			resize(&n.durable, int(p.size))
 			for i in old ..< int(p.size) {
 				n.durable[i] = 0
@@ -1426,6 +1439,13 @@ _recover_file :: proc(d: ^Disk, n: ^Inode, keep: u64, r: ^Rng) {
 	}
 	_pend_drop(d, n)
 	clear(&n.pend)
+	if len(n.ghost) > len(content) && (d.force_ghost || rng_chance(r, 1, 2)) {
+		old := len(content)
+		resize(&content, len(n.ghost))
+		copy(content[old:], n.ghost[old:])
+		d.stats.ghosts += 1
+	}
+	clear(&n.ghost)
 	delete(n.data)
 	n.data = content
 	resize(&n.durable, len(content))

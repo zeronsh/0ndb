@@ -759,7 +759,7 @@ kv_open_gen :: proc(kv: ^Kv) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	log_path := kv_path(kv, kv.gen, "log", context.temp_allocator)
 	idx_path := kv_path(kv, kv.gen, "idx", context.temp_allocator)
-	fd, err := prim.open_file(kv.vfs, log_path, {.Write}, 0o600)
+	fd, err := prim.open_file(kv.vfs, log_path, {.Write, .Group_Visible}, 0o600)
 	if err == .Not_Found {
 		prim.remove(kv.vfs, idx_path)
 		return kv_create(kv, KV_MIN_CAP)
@@ -782,7 +782,7 @@ kv_open_gen :: proc(kv: ^Kv) -> Error {
 	}
 	kv.marked = prim.get_u32le(hdr[8:12]) == KV_LOG_MARKED
 	kv.log_end = u64(size)
-	ifd, ierr := prim.open_file(kv.vfs, idx_path, {.Write}, 0o600)
+	ifd, ierr := prim.open_file(kv.vfs, idx_path, {.Write, .Group_Visible}, 0o600)
 	if ierr == .None {
 		kv.idx_fd = ifd
 		if clean, valid := kv_load_header(kv); valid {
@@ -805,7 +805,7 @@ kv_create :: proc(kv: ^Kv, capacity: u64) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	log_path := kv_path(kv, kv.gen, "log", context.temp_allocator)
 	idx_path := kv_path(kv, kv.gen, "idx", context.temp_allocator)
-	fd, oerr := prim.open_file(kv.vfs, log_path, {.Write, .Create, .Truncate}, 0o600)
+	fd, oerr := prim.open_file(kv.vfs, log_path, {.Write, .Create, .Truncate, .Group_Visible}, 0o600)
 	if oerr != .None {
 		return from_prim(oerr)
 	}
@@ -817,7 +817,7 @@ kv_create :: proc(kv: ^Kv, capacity: u64) -> Error {
 	from_prim(prim.write_at(kv.vfs, fd, hdr[:], 0)) or_return
 	from_prim(prim.datasync(kv.vfs, fd)) or_return
 	kv.log_end = KV_LOG_HEADER
-	ifd, ierr := prim.open_file(kv.vfs, idx_path, {.Write, .Create, .Truncate}, 0o600)
+	ifd, ierr := prim.open_file(kv.vfs, idx_path, {.Write, .Create, .Truncate, .Group_Visible}, 0o600)
 	if ierr != .None {
 		return from_prim(ierr)
 	}
@@ -923,7 +923,7 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	idx_path := kv_path(kv, kv.gen, "idx", context.temp_allocator)
 	tmp_path := kv_path(kv, kv.gen, "idx.tmp", context.temp_allocator)
-	ifd, oerr := prim.open_file(kv.vfs, tmp_path, {.Write, .Create, .Truncate}, 0o600)
+	ifd, oerr := prim.open_file(kv.vfs, tmp_path, {.Write, .Create, .Truncate, .Group_Visible}, 0o600)
 	if oerr != .None {
 		return false, from_prim(oerr)
 	}

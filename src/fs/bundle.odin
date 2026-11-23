@@ -112,7 +112,7 @@ history_bundle_load :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id
 	kv_open(&kv, vfs, dir, "state", allocator) or_return
 	defer kv_close(&kv)
 	lp, _ := path_join(dir, "lv.idx", context.temp_allocator)
-	lfd, lerr := prim.open_file(vfs, lp, {.Write, .Create, .Truncate}, 0o600)
+	lfd, lerr := prim.open_file(vfs, lp, {.Write, .Create, .Truncate, .Group_Visible}, 0o600)
 	if lerr != .None {
 		return from_prim(lerr)
 	}

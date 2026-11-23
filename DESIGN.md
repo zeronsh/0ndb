@@ -818,6 +818,20 @@ concurrent typing is never lost or reverted.
   extents) and promotes a stream to its own file once it grows past a
   threshold. Creating an object costs one record, not a file; ten million
   objects cost ten million small extents, not inodes.
+- Truncating or replacing in place is never trusted to be durable. A
+  shrink's new size and a rename can be lost in a power failure even after
+  an fsync (portably across ext4, APFS and NTFS), so the old bytes and an
+  old index can come back. Every file that is truncated or replaced in place
+  therefore either binds its records to a generation that the authoritative
+  state makes durable first (the mount's attribution log, a pack inode's
+  recorded size), or is rewritten whole, renamed into place and published
+  with a directory fsync (shadow generations, mount state slots, compacted
+  containers). Inside the pack a file's size is an inode field, atomic with
+  its group commit. Once promoted to its own file, a file opened with
+  `Group_Visible` (journals, the history's state kv and `lv.idx`) keeps that
+  property: its recorded size is authoritative and the first open after a
+  crash cuts the file back to it. A promoted file is created fresh and
+  exclusive, never by truncating a leftover.
 - Durability is batched across objects: every journal written in a loop
   tick is committed with one container fdatasync. `Async` (the C API
   default) runs the commit on a worker thread and completes it on a later
