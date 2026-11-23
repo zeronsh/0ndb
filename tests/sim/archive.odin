@@ -661,7 +661,7 @@ _new_reader :: proc(w: ^World, sponsor: ^Node, space: prim.Id) -> ^Node {
 	nn.mounts = make([dynamic]Sim_Mount, w.allocator)
 	nn.writers = make(map[string]Writer_Info, w.allocator)
 	append(&w.nodes, nn)
-	if !node_start(nn) {
+	if nn.idx >= RELAY_SLOT || !world_reserve(w) || !node_start(nn) {
 		world_fail(w, "restore: %s could not start", nn.name)
 		return nil
 	}
