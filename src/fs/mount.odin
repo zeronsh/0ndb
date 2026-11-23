@@ -15,6 +15,7 @@ import "../prim"
 
 Mount_Options :: struct {
 	settle_ms:    i64,
+	quiet_ms:     i64,
 	idle_ms:      i64,
 	large_limit:  i64,
 	inline_limit: int,
@@ -26,6 +27,7 @@ Mount_Options :: struct {
 
 DEFAULT_MOUNT :: Mount_Options {
 	settle_ms    = 100,
+	quiet_ms     = 10,
 	idle_ms      = 30_000,
 	large_limit  = 16 << 20,
 	inline_limit = 4096,
@@ -368,6 +370,7 @@ Mount :: struct {
 	dirty:       map[string]^Scope,
 	dirty_at:    map[string]i64,
 	closed:      map[string]bool,
+	young_sig:   map[string][2]i64,
 	rescan:      bool,
 	git_moved:   bool,
 	fence_seq:   u64,
@@ -562,6 +565,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.dirty = make(map[string]^Scope, allocator)
 	m.dirty_at = make(map[string]i64, allocator)
 	m.closed = make(map[string]bool, allocator)
+	m.young_sig = make(map[string][2]i64, allocator)
 	m.open_scopes = make(map[string]^Scope, allocator)
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
@@ -863,6 +867,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(k, m.allocator)
 	}
 	delete(m.closed)
+	for k in m.young_sig {
+		delete(k, m.allocator)
+	}
+	delete(m.young_sig)
 	for k in m.open_scopes {
 		delete(k, m.allocator)
 	}
@@ -1044,7 +1052,7 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 			dirty_at_note(m, rel, mount_mono_ns(m))
 		}
 	}
-	mount_schedule(m, m.opts.settle_ms)
+	mount_schedule(m, 0)
 }
 
 Observe_Since :: struct {

@@ -1687,8 +1687,22 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		m.reflog_pos = git_reflog_len(m.vfs, m.git)
 		m.stamp = git_index_stamp(m.vfs, m.git)
 	}
-	if len(m.dirty) > len(p.holding) {
+	if len(p.young) > 0 {
+		mount_schedule(m, m.opts.quiet_ms)
+	} else if len(m.dirty) > len(p.holding) {
 		mount_schedule(m, m.opts.settle_ms)
+	}
+	if len(m.young_sig) > 0 {
+		done := make([dynamic]string, context.temp_allocator)
+		for k in m.young_sig {
+			if k not_in m.dirty {
+				append(&done, k)
+			}
+		}
+		for k in done {
+			key, _ := delete_key(&m.young_sig, k)
+			delete(key, m.allocator)
+		}
 	}
 	if len(m.closed) > 0 {
 		done := make([dynamic]string, context.temp_allocator)
@@ -2282,9 +2296,17 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 				return .None
 			}
 			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now && rel not_in m.closed {
-				append(&p.young, clone_string(rel, p.long) or_else "")
-				defer_ino(p, e)
-				return .None
+				sig := [2]i64{d.stat.size, d.stat.mtime_ns}
+				if prev, seen := m.young_sig[rel]; !seen || prev != sig {
+					if v, ok := &m.young_sig[rel]; ok {
+						v^ = sig
+					} else {
+						m.young_sig[clone_string(rel, m.allocator) or_else ""] = sig
+					}
+					append(&p.young, clone_string(rel, p.long) or_else "")
+					defer_ino(p, e)
+					return .None
+				}
 			}
 			add_modify(p, rel, d, e)
 		}
