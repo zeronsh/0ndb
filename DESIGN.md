@@ -747,7 +747,9 @@ equal in both directions.
   version and git's writes become its git-op batch; an existing line is
   retargeted instead: the shadow entries of the inodes whose place differs
   between the synced version and the line (those an op between the two
-  touches, and everything under a touched directory in either version) move
+  touches, closed under everything below a touched directory in either
+  version and under any inode a collision displaces from a touched one's
+  path) move
   to the line's paths with their stat cleared, the synced version becomes the line's, and the full pass diffs
   disk against the line, so git's writes (and anything git carried) land on
   that line only. A materialization whose pass switched lines restarts at the

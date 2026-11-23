@@ -1658,13 +1658,20 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 		defer fstree.snapshot_destroy(&snap)
 		was := version_snapshot(h, sl[:]) or_return
 		defer fstree.snapshot_destroy(&was)
-		dirs := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
-		for ino in touched {
-			append(&dirs, ino)
-		}
-		for ino in dirs {
-			retarget_subtree(&was, ino, &touched) or_return
-			retarget_subtree(&snap, ino, &touched) or_return
+		for {
+			before := len(touched)
+			dirs := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
+			for ino in touched {
+				append(&dirs, ino)
+			}
+			for ino in dirs {
+				retarget_subtree(&was, ino, &touched) or_return
+				retarget_subtree(&snap, ino, &touched) or_return
+			}
+			displaced_touch(m, &snap, &touched) or_return
+			if len(touched) == before {
+				break
+			}
 		}
 		order := sorted_inodes(touched)
 		for ino in order {
