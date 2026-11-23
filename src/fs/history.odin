@@ -578,6 +578,17 @@ HIST_STAMP :: "j"
 HIST_ACTORS :: "ga"
 @(private)
 HIST_EPOCH :: "ge"
+@(private)
+HIST_REDACTIONS :: "gx"
+
+history_redactions :: proc(h: ^History) -> (n: u64, err: Error) {
+	history_wake(h) or_return
+	v, found := kv_get(&h.kv, transmute([]u8)string(HIST_REDACTIONS), context.temp_allocator) or_return
+	if !found || len(v) != 8 {
+		return 0, .None
+	}
+	return prim.get_u64le(v), .None
+}
 
 history_epoch :: proc(h: ^History) -> u64 {
 	if !h.awake {

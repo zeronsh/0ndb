@@ -196,7 +196,7 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 	}
 	ckpts := _reg_collect(e, ROOT_CKPT) or_return
 	for &f in ckpts {
-		if f.klen != 16 || len(f.value) != 40 {
+		if f.klen != 16 || (len(f.value) != 40 && len(f.value) != 48) {
 			continue
 		}
 		id: prim.Id

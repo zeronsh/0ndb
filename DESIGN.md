@@ -2357,7 +2357,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   tree the device writes and publishes a checkpoint at its current length,
   fills its own segment from that length, and uploads the blobs referenced
   from there on that are not remote-backed; the checkpoint bundle carries
-  the rest. The base comes only from `Noted` answers to the promotion's own
+  the rest. A bundle is a copy of every stream it covers, so a redaction
+  reaches it too: the history counts the redactions it has applied (in the
+  same commit as each redaction), the registry records that count with the
+  bundle, and a bundle whose count is behind is retired before anything
+  writes or relies on a checkpoint (its relay object is shredded, its local
+  file erased) and is rewritten from the redacted history. Retired bundle
+  files, failed temporaries and fetched bundles are erased, never only
+  unlinked, because an unlinked pack file's bytes stay in its container. The base comes only from `Noted` answers to the promotion's own
   `Fill` frames, starting with an empty one; `Not_Found` means there is
   nothing to fill. A lost or withheld frame therefore stalls a promotion
   until the reconnect re-asks, and never makes it report a hollow segment as

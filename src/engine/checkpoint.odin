@@ -67,23 +67,27 @@ _ckpt_tree :: proc(scope: ^osync.Scope, id: prim.Id, t: ^osync.Key_Tree) -> Erro
 }
 
 @(private)
-_ckpt_get :: proc(e: ^Engine, id: prim.Id) -> (length: i64, oid: [32]u8, found: bool) {
+_ckpt_get :: proc(e: ^Engine, id: prim.Id) -> (length: i64, oid: [32]u8, found: bool, redactions: u64) {
 	k := id
 	v, hit, err := omap.db_get(&e.reg.db, ROOT_CKPT, k[:], context.temp_allocator)
-	if err != .None || !hit || len(v) != 40 {
+	if err != .None || !hit || (len(v) != 40 && len(v) != 48) {
 		return
 	}
-	copy(oid[:], v[8:])
-	return i64(prim.get_u64le(v[:8])), oid, true
+	copy(oid[:], v[8:40])
+	if len(v) == 48 {
+		redactions = prim.get_u64le(v[40:48])
+	}
+	return i64(prim.get_u64le(v[:8])), oid, true, redactions
 }
 
 @(private)
-_ckpt_put :: proc(e: ^Engine, id: prim.Id, length: i64, oid: [32]u8) {
+_ckpt_put :: proc(e: ^Engine, id: prim.Id, length: i64, oid: [32]u8, redactions: u64 = 0) {
 	k := id
-	v: [40]u8
+	v: [48]u8
 	prim.put_u64le(v[:8], u64(length))
 	o := oid
-	copy(v[8:], o[:])
+	copy(v[8:40], o[:])
+	prim.put_u64le(v[40:48], redactions)
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
 		_reg_fail(e, _oerr(terr))
@@ -99,13 +103,63 @@ _ckpt_put :: proc(e: ^Engine, id: prim.Id, length: i64, oid: [32]u8) {
 }
 
 @(private)
+_ckpt_erase :: proc(e: ^Engine, path: string) {
+	if fd, err := prim.open_file(e.vfs, path, {.Write}); err == .None {
+		if size, serr := prim.file_size(e.vfs, fd); serr == .None && size > 0 {
+			prim.punch_hole(e.vfs, fd, 0, size)
+			prim.datasync(e.vfs, fd)
+		}
+		prim.close_file(e.vfs, fd)
+	}
+	prim.remove(e.vfs, path)
+}
+
+@(private)
+_ckpt_fresh :: proc(e: ^Engine, h: ^Handle) {
+	if (h.kind != .Text && h.kind != .File_Tree) || h.hist == nil {
+		return
+	}
+	_, prev, had, count := _ckpt_get(e, h.id)
+	if !had || prev == {} {
+		return
+	}
+	now, err := fs.history_redactions(h.hist)
+	if err != .None || count >= now {
+		return
+	}
+	dir, derr := _obj_dir(e, h.id)
+	if derr == .None {
+		ph := _oid_name(prev)
+		if path, jerr := _join(context.temp_allocator, dir, string(ph[:])); jerr == .None {
+			_ckpt_erase(e, path)
+		}
+	}
+	if !h.sp.repl_on {
+		return
+	}
+	tree: osync.Key_Tree
+	if _ckpt_tree(&h.scope, h.id, &tree) != .None {
+		return
+	}
+	p := prev
+	serr := osync.replicator_shred_object(&h.sp.repl, &h.scope, &tree, p[:])
+	osync.keytree_destroy(&tree)
+	if serr == .None {
+		_ckpt_put(e, h.id, 0, {}, now)
+	}
+}
+
+@(private)
 _checkpoints_write :: proc(e: ^Engine) {
 	for h in e.lru {
+		if h.w_open && h.hist != nil && h.hist.awake {
+			_ckpt_fresh(e, h)
+		}
 		if (h.kind != .Text && h.kind != .File_Tree) || !h.w_open || h.hist == nil || !h.hist.awake || !h.sp.repl_on || !h.sp.connected {
 			continue
 		}
 		n := _own_len(h)
-		last, prev, had := _ckpt_get(e, h.id)
+		last, prev, had, _ := _ckpt_get(e, h.id)
 		if n - max(last, 0) < CKPT_MIN_BYTES {
 			continue
 		}
@@ -132,7 +186,11 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 		sink.tr = &tr
 	}
 	blake2b.init(&sink.hash, 32)
-	werr := fs.history_persist(h.hist)
+	redactions, rerr := fs.history_redactions(h.hist)
+	werr := rerr
+	if werr == .None {
+		werr = fs.history_persist(h.hist)
+	}
 	if werr == .None {
 		werr = fs.history_bundle_objects(h.hist, &sink, _ckpt_sink_object)
 	}
@@ -146,7 +204,7 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 	blake2b.final(&sink.hash, oid[:])
 	prim.close_file(e.vfs, fd)
 	if werr != .None {
-		prim.remove(e.vfs, tmp)
+		_ckpt_erase(e, tmp)
 		return _ferr(werr)
 	}
 	hx := _oid_name(oid)
@@ -159,7 +217,7 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 	prim.put_u64le(meta[:], u64(length))
 	perr := osync.replicator_publish_checkpoint(&h.sp.repl, &h.scope, &tree, h.name, u64(hlc_now(e)), oid[:], meta[:], nil, final)
 	if perr != .None {
-		prim.remove(e.vfs, final)
+		_ckpt_erase(e, final)
 		return _serr(perr)
 	}
 	if had_prev && prev != oid && prev != {} {
@@ -167,10 +225,10 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 		osync.replicator_shred_object(&h.sp.repl, &h.scope, &tree, p[:])
 		ph := _oid_name(p)
 		if old, jerr := _join(context.temp_allocator, dir, string(ph[:])); jerr == .None {
-			prim.remove(e.vfs, old)
+			_ckpt_erase(e, old)
 		}
 	}
-	_ckpt_put(e, h.id, length, oid)
+	_ckpt_put(e, h.id, length, oid, redactions)
 	return .None
 }
 
@@ -242,7 +300,7 @@ _ckpt_fetch_start :: proc(e: ^Engine, h: ^Handle) -> bool {
 			return true
 		}
 	}
-	if _, _, done := _ckpt_get(e, h.id); done {
+	if _, _, done, _ := _ckpt_get(e, h.id); done {
 		return false
 	}
 	w := new(Ckpt_Wait, e.allocator)
@@ -316,7 +374,7 @@ _ckpt_finish :: proc(e: ^Engine, sp: ^Space, w: ^Ckpt_Wait, ok: bool) {
 	if !loaded {
 		_ckpt_put(e, w.object, -1, {})
 	}
-	prim.remove(e.vfs, w.dest)
+	_ckpt_erase(e, w.dest)
 	if h, hok := e.handles[w.object]; hok {
 		_hist_catch_up(e, h)
 	}
@@ -497,6 +555,6 @@ _oid_name :: proc(oid: [32]u8) -> [prim.ID_HEX_LEN]u8 {
 
 checkpoint_info :: proc(e: ^Engine, o: Object) -> (length: i64, loaded: bool, found: bool) {
 	context = context_for(e)
-	n, oid, ok := _ckpt_get(e, o.id)
+	n, oid, ok, _ := _ckpt_get(e, o.id)
 	return n, ok && n == 0 && oid == {}, ok
 }
