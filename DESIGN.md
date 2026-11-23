@@ -735,8 +735,10 @@ equal in both directions.
   the removals, moves and directories it already applied. `absent` is
   persisted with the image's `synced` it qualifies, so no crash persists one
   without the other. While the shadow is owed (its writes wait on a failed
-  barrier), the saved state keeps the last `synced` it saved, so the image
-  never names a `synced` whose pinned entries the shadow has not persisted;
+  barrier), the saved state keeps the last `synced` it saved and the journal
+  position saved with it, so the image never names a `synced` whose pinned
+  entries the shadow has not persisted and recovery still replays every own
+  batch that `synced` does not contain;
   the first save after the owed shadow persists writes the current `synced`.
   A merge-mode materialization (catch-up of the mount's own batch) never
   writes over a file whose disk differs from the text at its base: it first

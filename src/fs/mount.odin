@@ -402,6 +402,7 @@ Mount :: struct {
 	log_at:      i64,
 	saved:       u64,
 	saved_synced: [dynamic]crdt.Op_Id,
+	saved_jpos:  i64,
 	state_seq:   u64,
 	legacy:      bool,
 	lost:        bool,
@@ -1758,6 +1759,7 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	if prim.reader_remaining(&rd) > 0 {
 		m.nonce = prim.read_id(&rd)
 		m.jpos = prim.read_ivarint(&rd)
+		m.saved_jpos = m.jpos
 	} else {
 		mount_new_nonce(m)
 	}
@@ -2067,8 +2069,10 @@ mount_ack :: proc(m: ^Mount) -> Error {
 save_mount_state :: proc(m: ^Mount) -> Error {
 	img := &m.img
 	synced := m.img.synced[:]
+	jpos := m.jpos
 	if shadow_attached(&m.shadow) && m.shadow.owed && shadow_dirty(&m.shadow) && m.saved_synced != nil {
 		synced = m.saved_synced[:]
+		jpos = min(jpos, m.saved_jpos)
 	}
 	buf := make([dynamic]u8, context.temp_allocator)
 	vb := make([dynamic]u8, context.temp_allocator)
@@ -2107,7 +2111,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_bool(&w, m.clean)
 	prim.write_bool(&w, m.lost)
 	prim.write_id(&w, m.nonce)
-	prim.write_ivarint(&w, m.jpos)
+	prim.write_ivarint(&w, jpos)
 	gen := m.log_gen + 1 if covered && m.log_len > 0 else m.log_gen
 	prim.write_uvarint(&w, gen)
 	owed := make([dynamic]string, context.temp_allocator)
@@ -2146,6 +2150,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	m.saved = 0
 	state_write(m, buf[:]) or_return
 	m.saved = sum
+	m.saved_jpos = jpos
 	if raw_data(synced) != raw_data(m.saved_synced[:]) {
 		if m.saved_synced == nil {
 			m.saved_synced = make([dynamic]crdt.Op_Id, m.allocator)
