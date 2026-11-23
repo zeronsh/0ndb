@@ -409,6 +409,8 @@ Mount :: struct {
 	lost:        bool,
 	retained:    bool,
 	override:    map[string]odb.Oid,
+	trusted:     map[string]Index_Entry,
+	trust_mtime: i64,
 	clean:       bool,
 	waits:       [dynamic]Mount_Wait,
 	open_scopes: map[string]^Scope,
