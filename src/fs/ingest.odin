@@ -1564,7 +1564,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	}
 	if p.git_wrote {
 		collect_alias_sources(m, &p)
-		if INDEX_TRUST_PASS {
+		if m.opts.index_trust {
 			trust_index(m)
 		}
 	}
@@ -3029,8 +3029,6 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 	}
 	return .None
 }
-
-INDEX_TRUST_PASS :: ODIN_OS == .Windows
 
 @(private)
 trust_index :: proc(m: ^Mount) {
