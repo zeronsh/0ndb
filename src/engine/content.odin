@@ -34,6 +34,8 @@ Content_Wait :: struct {
 	object:   prim.Id,
 	inflight: bool,
 	attempts: int,
+	rounds:   int,
+	reported: bool,
 	timer:    prim.Timer,
 	path:     string,
 	url:      int,
@@ -561,8 +563,13 @@ _content_forget :: proc(e: ^Engine, w: ^Content_Wait) {
 @(private)
 _content_retry :: proc(e: ^Engine, w: ^Content_Wait) {
 	w.attempts += 1
-	if w.attempts == CONTENT_RETRIES {
+	w.rounds += 1
+	if w.rounds >= CONTENT_RETRIES && !w.reported {
+		w.reported = true
 		_log(e, .Warn, "content fetch gave up: no relay copy, remote or holder had it")
+		ox: [64]u8
+		prim.hex_encode(ox[:], w.oid[:w.n])
+		_emit(e, Event{kind = .Unavailable, space = w.space, object = w.object, detail = string(ox[:2 * w.n])})
 	}
 	if w.attempts >= CONTENT_RETRIES || w.timer != 0 || e.closing {
 		return

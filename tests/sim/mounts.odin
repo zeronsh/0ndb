@@ -804,6 +804,14 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 	if rng_chance(&w.remote.rng, 3, 4) && env_u64("SIM_REMOTE", 1) != 0 {
 		remote = fmt.tprintf("%s%s", SIM_REMOTE_URL, id_short(o.id))
 	}
+	if len(remote) > 0 {
+		for f in files {
+			oid, _ := odb.hash(.Sha1, .Blob, f.data)
+			if _, has := w.remote.objects[oid]; !has {
+				w.remote.objects[oid] = slice.clone(f.data, w.allocator)
+			}
+		}
+	}
 	gerr := git_checkout_create(vfs, root, files[:], clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng), remote, &pushed if len(remote) > 0 else nil)
 	if gerr == .None && len(pushed) > 0 && !n.disk.dead {
 		remote_push(w, n, root, pushed[:])
