@@ -1854,6 +1854,7 @@ Mount_Image :: struct {
 	log_at:     i64,
 	shadow:     Shadow_Mark,
 	chained:    bool,
+	line:       string,
 }
 
 Mount_Wait :: struct {
@@ -1867,6 +1868,7 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	img.synced = make([dynamic]crdt.Op_Id, m.allocator)
 	append(&img.synced, ..m.synced[:])
 	img.branch, _ = clone_string(m.head.branch, m.allocator)
+	img.line, _ = clone_string(m.branch, m.allocator)
 	img.commit, _ = clone_string(m.head.commit, m.allocator)
 	img.reflog_pos = m.reflog_pos
 	img.stamp = m.stamp
@@ -1890,6 +1892,7 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 	delete(img.synced)
 	delete(img.branch, m.allocator)
+	delete(img.line, m.allocator)
 	delete(img.commit, m.allocator)
 	for k in img.attrib {
 		delete(k, m.allocator)
@@ -2072,7 +2075,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		prim.write_str(&w, r)
 	}
 	prim.write_str(&w, m.home)
-	prim.write_str(&w, m.branch)
+	prim.write_str(&w, img.line if len(img.line) > 0 else m.branch)
 	prim.write_str(&w, m.switch_to)
 	prim.write_str(&w, m.switch_from)
 	prim.write_u8(&w, m.switch_phase)
