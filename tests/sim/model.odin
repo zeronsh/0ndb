@@ -1,6 +1,7 @@
 package sim
 
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 import "../../src/convo"
 import eng "../../src/engine"
@@ -240,11 +241,15 @@ same_file :: proc(m: ^Model, obj: int, a: string, b: string) -> bool {
 	if !any {
 		return false
 	}
+	buf: [32 << 10]u8
+	arena: mem.Arena
+	mem.arena_init(&arena, buf[:])
+	context.temp_allocator = mem.arena_allocator(&arena)
 	seen := make(map[string]bool, context.temp_allocator)
 	queue := make([dynamic]string, context.temp_allocator)
 	append(&queue, a)
 	seen[a] = true
-	for i := 0; i < len(queue) && len(queue) < 4096; i += 1 {
+	for i := 0; i < len(queue) && len(queue) < 256; i += 1 {
 		cur := queue[i]
 		for mv in m.moves {
 			if mv.obj != obj || !move_maybe(mv) {
