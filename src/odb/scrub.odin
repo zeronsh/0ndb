@@ -8,6 +8,11 @@ import "../prim"
 @(private)
 SCRUB_FILE :: "/info/0ndb-scrub"
 
+Scrub_Hook :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, targets: []Oid),
+}
+
 @(private)
 Scrub_Intent :: struct {
 	targets:    map[Oid]struct{},
@@ -127,10 +132,48 @@ scrub_note :: proc(db: ^Odb, targets: []Oid, protect: []Oid = nil, superseded: [
 	for o in superseded {
 		it.superseded[o] = {}
 	}
-	if existed && len(it.targets) + len(it.protect) + len(it.superseded) == n {
-		return .None
+	if !existed || len(it.targets) + len(it.protect) + len(it.superseded) != n {
+		scrub_write(db, &it, existed) or_return
 	}
-	return scrub_write(db, &it, existed)
+	if db.scrub_hook.call != nil && len(targets) > 0 {
+		db.scrub_hook.call(db.scrub_hook.data, targets)
+	}
+	return .None
+}
+
+scrub_targets :: proc(db: ^Odb, allocator := context.allocator) -> (out: []Oid, err: Error) {
+	if len(db.dirs) == 0 {
+		return nil, .None
+	}
+	sync.mutex_lock(&db.scrub_mutex)
+	defer sync.mutex_unlock(&db.scrub_mutex)
+	it: Scrub_Intent
+	scrub_init(db, &it)
+	defer scrub_destroy(&it)
+	if _, rerr := scrub_read(db, &it); rerr != .None {
+		return nil, rerr
+	}
+	res := make([dynamic]Oid, 0, len(it.targets), allocator)
+	for o in it.targets {
+		append(&res, o)
+	}
+	return res[:], .None
+}
+
+scrub_targeted :: proc(db: ^Odb, oid: Oid) -> bool {
+	if !scrub_pending(db) {
+		return false
+	}
+	list, err := scrub_targets(db, context.temp_allocator)
+	if err != .None {
+		return true
+	}
+	for o in list {
+		if o == oid {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)

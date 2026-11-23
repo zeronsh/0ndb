@@ -2868,7 +2868,13 @@ Relay cost tracks the reachable information, not the activity. Items marked
   for every blob it published whether it uploaded it or not (uploaded,
   remote-backed, device-only, over budget; one entry per key and per part
   of a chunked object), so a writer whose upload is still in flight, or was
-  lost in a crash and redone, serves the bytes on its disk; seals exactly the sealed chunks of the requested aligned range as
+  lost in a crash and redone, serves the bytes on its disk. An entry lives
+  exactly as long as its blob is on the device for that space: the device
+  store is never collected, so entries go only when a redaction scrubs the
+  blob (the scrub intent reports its targets when it is noted, before any
+  irreversible step, and the entries are deleted then; a serve request for a
+  blob that is still a pending scrub target, or already gone, is refused
+  and deletes its entry) or when the device leaves the space; seals exactly the sealed chunks of the requested aligned range as
   a `Put` would (blobs of 8 MiB and more are streamed once into
   `$DATA/serve/` and read by range) and answers in at most 256 KiB frames
   without record framing, 127 sealed chunks per pull. The reader decrypts

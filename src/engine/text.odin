@@ -402,8 +402,12 @@ device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
 		}
 		odb.sweep_temps(&e.db)
 		e.db.deferred = true
+		e.db.scrub_hook = odb.Scrub_Hook{data = e, call = _serve_scrubbed}
 		e.db_open = true
 		if odb.scrub_pending(&e.db) {
+			if left, lerr := odb.scrub_targets(&e.db, context.temp_allocator); lerr == .None {
+				_serve_drop_oids(e, left)
+			}
 			rstats, serr := odb.scrub_resume(&e.db, context.temp_allocator)
 			_redact_report(e, {}, {}, rstats.unreached)
 			if serr != .None {
