@@ -3,6 +3,7 @@ package main
 import "core:encoding/json"
 import "core:os"
 import "core:strconv"
+import "core:time"
 import "../capi/api"
 import "../prim"
 
@@ -42,10 +43,17 @@ client_connect :: proc(c: ^Client, autostart := true) -> bool {
 	path := socket_path(context.temp_allocator)
 	fd, ok := sock_connect(path)
 	if !ok && autostart {
-		if !_spawn_daemon() {
-			return false
+		if daemon_running() {
+			fd, ok = _connect_wait(path)
+			if !ok {
+				fail(.Daemon, "a daemon is running for %s but its socket %s is not reachable from here", home_dir(context.temp_allocator), path)
+			}
+		} else {
+			if !_spawn_daemon() {
+				return false
+			}
+			fd, ok = sock_connect(path)
 		}
-		fd, ok = sock_connect(path)
 	}
 	if !ok {
 		return false
@@ -64,6 +72,38 @@ client_close :: proc(c: ^Client) {
 		c.fd = NO_SOCK
 	}
 	delete(c.rbuf)
+}
+
+daemon_lock :: proc(home: string) -> (prim.Fd, prim.Error) {
+	lp, _ := prim.path_join(context.temp_allocator, home, "daemon.lock")
+	return prim.lock_file(prim.os_vfs(), lp)
+}
+
+daemon_running :: proc() -> bool {
+	home := home_dir(context.temp_allocator)
+	if !prim.exists(prim.os_vfs(), home) {
+		return false
+	}
+	fd, err := daemon_lock(home)
+	if err == .None {
+		prim.close_file(prim.os_vfs(), fd)
+	}
+	return err == .Busy
+}
+
+@(private)
+_connect_wait :: proc(path: string) -> (Sock, bool) {
+	deadline := prim.now_ms() + 15_000
+	for prim.now_ms() < deadline {
+		if fd, ok := sock_connect(path); ok {
+			return fd, true
+		}
+		if !daemon_running() {
+			break
+		}
+		time.sleep(50 * time.Millisecond)
+	}
+	return sock_connect(path)
 }
 
 @(private)

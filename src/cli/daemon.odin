@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import "../capi/api"
 import eng "../engine"
 import "../mcp"
@@ -45,6 +46,7 @@ Daemon :: struct {
 	state_path: string,
 	state_durable: [dynamic]u8,
 	lfd:        Sock,
+	lock_fd:    prim.Fd,
 	lwatch:     prim.Watch,
 	sig:        Signals,
 	swatch:     prim.Watch,
@@ -149,6 +151,18 @@ daemon_main :: proc(args: ^Args) -> int {
 	if prim.mkdir_all(prim.os_vfs(), d.home, 0o700) != .None {
 		return report_error(.Io, "cannot create %s", d.home)
 	}
+	lfd, lerr := daemon_lock(d.home)
+	for t := prim.now_ms() + 500; lerr == .Busy && prim.now_ms() < t; {
+		time.sleep(20 * time.Millisecond)
+		lfd, lerr = daemon_lock(d.home)
+	}
+	if lerr == .Busy {
+		return report_error(.Busy, "another daemon is running for %s", d.home)
+	} else if lerr != .None {
+		return report_error(.Io, "cannot lock %s", d.home)
+	}
+	d.lock_fd = lfd
+	defer prim.close_file(prim.os_vfs(), d.lock_fd)
 	ignore_broken_pipes()
 	_state_load(d)
 	ec := eng.default_config(d.engine_dir)
