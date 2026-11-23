@@ -1672,6 +1672,7 @@ Undo_State :: struct {
 	redo:   prim.Id,
 	phase:  Undo_Phase,
 	staged: Rid,
+	fenced: bool,
 	set:    []Undo_Line,
 	stamp:  prim.Hlc,
 }
@@ -1721,11 +1722,14 @@ undos :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undo_Stat
 		}
 		st := &a.list[x]
 		st.stamp = min(st.stamp, rec.stamp)
-		if u.phase == .Staged {
+		if u.phase == .Staged && obj.rid_none(st.staged) {
 			m := obj.resolve(a.v, s, u.msg) or_return
 			st.msg = obj.rid(a.v, m) or_return
 			st.redo = u.redo
 			st.staged = at
+		}
+		if u.phase == .Fenced && !st.fenced {
+			st.fenced = true
 			set := make([]Undo_Line, len(u.set), a.allocator)
 			for l, i in u.set {
 				set[i].tree = l.tree
@@ -1843,4 +1847,27 @@ notices :: proc(v: ^obj.View, floor: prim.Hlc = 0, allocator := context.allocato
 		return a.stamp < b.stamp
 	})
 	return acc.list[:], .None
+}
+
+scope_actors :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []prim.Id, err: Error) {
+	list := make([dynamic]prim.Id, allocator)
+	for s in 0 ..< len(v.segs) {
+		end := obj.end(v, s)
+		pos := i64(0)
+		for pos < end {
+			body, next, e := obj.get(v, s, pos, -1, min(end, pos + obj.TAIL_GUESS))
+			if e != .None {
+				return nil, e
+			}
+			if !obj.is_redacted(body) && !obj.is_sig(body) && obj.record_kind(body) == u8(Kind.Scope) {
+				rec := decode_record(body, pos, v.scratch) or_return
+				a := rec.body.(Scope).actor
+				if a != {} && !slice.contains(list[:], a) {
+					append(&list, a)
+				}
+			}
+			pos = next
+		}
+	}
+	return list[:], .None
 }

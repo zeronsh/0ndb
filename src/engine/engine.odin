@@ -374,6 +374,7 @@ Engine :: struct {
 	redact_tick:  u64,
 	rlog:         Rlog,
 	plug:         Plug_State,
+	undo_hooks:   Undo_Hooks,
 	pages:        Page_Heap,
 	temp:         virtual.Arena,
 	outer:        runtime.Context,
