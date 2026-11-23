@@ -697,6 +697,11 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 		h.local = true
 		return .Busy
 	}
+	if err == .No_Space || err == .Io {
+		h.local = true
+		_storage_short(e, err, "an object's writes could not be stored: the disk is full or failing; they stay pending and are retried")
+		return err
+	}
 	if err != .None {
 		_fatal(e, err)
 		return err
@@ -720,14 +725,17 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 
 @(private)
 _handles_commit :: proc(e: ^Engine) {
+	_scope_begin(e)
 	for h in e.lru {
 		if h.local {
 			h.local = false
-			if _handle_commit(e, h) == .Busy {
+			if err := _handle_commit(e, h); err == .Busy || err == .No_Space || err == .Io {
 				h.local = true
 			}
 		}
 	}
+	_scope_end(e)
+	_reserve_clear(e)
 }
 
 @(private)

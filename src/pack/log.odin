@@ -343,7 +343,7 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 @(private)
 _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 	fl := &p.fl
-	if (err == .No_Space || err == .Io) && fl.kind == .Commit && !p.closing {
+	if (err == .No_Space || err == .Io) && !p.closing {
 		fl.on = false
 		p.fl_retry = true
 		p.fl_err = err
