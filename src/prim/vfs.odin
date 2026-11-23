@@ -81,6 +81,7 @@ Vfs_Procs :: struct {
 	caps:       proc(data: rawptr, fd: Fd) -> Vfs_Caps,
 	writeout:   proc(data: rawptr, fd: Fd) -> Error,
 	exchange:   proc(data: rawptr, a: string, b: string) -> Error,
+	preallocate: proc(data: rawptr, fd: Fd, off: i64, size: i64) -> Error,
 }
 
 open_file :: #force_inline proc(vfs: Vfs, path: string, flags: Open_Flags = {}, mode: u32 = 0o644) -> (Fd, Error) {
@@ -120,6 +121,19 @@ truncate :: #force_inline proc(vfs: Vfs, fd: Fd, size: i64) -> Error {
 
 punch_hole :: #force_inline proc(vfs: Vfs, fd: Fd, off: i64, size: i64) -> Error {
 	return vfs.procs.punch_hole(vfs.data, fd, off, size)
+}
+
+preallocate :: proc(vfs: Vfs, fd: Fd, off: i64, size: i64) -> Error {
+	if size <= 0 {
+		return .None
+	}
+	if off < 0 {
+		return .Invalid
+	}
+	if vfs.procs.preallocate == nil {
+		return .Unsupported
+	}
+	return vfs.procs.preallocate(vfs.data, fd, off, size)
 }
 
 fstat :: #force_inline proc(vfs: Vfs, fd: Fd) -> (Stat, Error) {
