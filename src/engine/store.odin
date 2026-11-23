@@ -95,6 +95,7 @@ _registry_open :: proc(e: ^Engine) -> Error {
 	path := _join(context.temp_allocator, e.dir, "registry") or_return
 	_registry_migrate(e, path) or_return
 	_oerr(omap.db_open(&e.reg.db, e.base, path, e.allocator)) or_return
+	e.reg.db.lazy = true
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.cat_done = make(map[prim.Id]bool, e.allocator)
@@ -128,6 +129,61 @@ _reg_commit :: proc(e: ^Engine, t: ^omap.Txn) -> Error {
 		_reg_fail(e, _oerr(err))
 	}
 	return _oerr(err)
+}
+
+@(private)
+_reg_commit_lazy :: proc(e: ^Engine, t: ^omap.Txn) -> Error {
+	err := omap.txn_commit(t)
+	if err != .None {
+		_reg_fail(e, _oerr(err))
+	}
+	return _oerr(err)
+}
+
+@(private)
+Reg_Publish :: struct {
+	e:      ^Engine,
+	db:     ^omap.Db,
+	meta:   omap.Meta,
+	failed: bool,
+}
+
+@(private)
+_reg_queue_publish :: proc(e: ^Engine) {
+	if !e.reg.open {
+		return
+	}
+	m, ok := omap.db_publish_take(&e.reg.db)
+	if !ok {
+		return
+	}
+	x := new(Reg_Publish, e.allocator)
+	x^ = Reg_Publish{e = e, db = &e.reg.db, meta = m}
+	pack.queue_hook(&e.pk, pack.Commit_Hook{run = _reg_publish_run, done = _reg_publish_done, data = x})
+}
+
+@(private)
+_reg_publish_run :: proc(data: rawptr) -> (nsync: u64, err: pack.Error) {
+	x := (^Reg_Publish)(data)
+	if omap.db_publish_run(x.db, &x.meta) != .None {
+		x.failed = true
+		return 2, .Io
+	}
+	return 2, .None
+}
+
+@(private)
+_reg_publish_done :: proc(data: rawptr, ok: bool) {
+	x := (^Reg_Publish)(data)
+	e := x.e
+	context = context_for(e)
+	omap.db_publish_done(x.db, !x.failed)
+	free(x, e.allocator)
+	if ok && e.reg.open {
+		if cerr := omap.db_compact_due(&e.reg.db); cerr != .None {
+			_reg_fail(e, _oerr(cerr))
+		}
+	}
 }
 
 @(private)
@@ -482,6 +538,11 @@ _durable_begin :: proc(e: ^Engine) {
 	b.seq = e.batch_seq
 	append(&e.batches, b)
 	e.stats.commits += 1
+	for &d in b.segs {
+		if d.kind == .File_Tree && d.length > 0 {
+			_content_target(e, d.space, d.object, d.length)
+		}
+	}
 	e.batch_closing = true
 	err := pack.batch_end_async(&e.pk, _batch_cb, b)
 	if err == .None {
@@ -967,8 +1028,23 @@ _pack_before_commit :: proc(data: rawptr) -> pack.Error {
 	if !e.db_open {
 		return .None
 	}
+	for &d in e.dirty {
+		if d.kind == .File_Tree && d.length > 0 {
+			_content_target(e, d.space, d.object, d.length)
+		}
+	}
+	for _, h in e.handles {
+		if h.kind != .File_Tree || !h.w_open || h.hist == nil || !h.hist.awake {
+			continue
+		}
+		if n := journal.journal_len(&h.hist.journal); n > h.ctarget {
+			_content_target(e, h.sp.id, h.id, n)
+			h.ctarget = n
+		}
+	}
 	if !_odb_queue_pending(e) {
 		return .Io
 	}
+	_reg_queue_publish(e)
 	return .None
 }

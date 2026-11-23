@@ -88,6 +88,7 @@ Handle :: struct {
 	own_tree:   ^Own_Tree,
 	chain:      journal.Chain,
 	published:  i64,
+	ctarget:    i64,
 	pins:       int,
 	used:       u64,
 	table:      omap.Table,

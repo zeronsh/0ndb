@@ -7,6 +7,7 @@ import "../fs"
 import "../journal"
 import omap "../map"
 import "../odb"
+import "../pack"
 import "../prim"
 import osync "../sync"
 
@@ -161,15 +162,20 @@ _content_mark_put :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Kind, m
 			return
 		}
 	}
-	_reg_commit(e, t)
+	_reg_commit_lazy(e, t)
 }
 
 @(private)
-_content_durable :: proc(e: ^Engine, space: prim.Id, id: prim.Id, length: i64) {
+_content_target :: proc(e: ^Engine, space: prim.Id, id: prim.Id, length: i64) {
 	mark, target := _content_marks(e, space, id)
 	if length > target {
 		_content_mark_put(e, space, id, .File_Tree, mark, length)
 	}
+}
+
+@(private)
+_content_durable :: proc(e: ^Engine, space: prim.Id, id: prim.Id, length: i64) {
+	_content_target(e, space, id, length)
 	sp, ok := e.spaces[space]
 	if ok && sp.repl_on {
 		_content_kick(e, sp, id)
@@ -297,15 +303,20 @@ _content_resume :: proc(e: ^Engine, sp: ^Space) {
 	}
 	Acc :: struct {
 		ids:     [dynamic]prim.Id,
+		trees:   [dynamic]prim.Id,
 		remotes: [dynamic]Remote,
 	}
-	acc := Acc{ids = make([dynamic]prim.Id, context.temp_allocator), remotes = make([dynamic]Remote, context.temp_allocator)}
+	acc := Acc{ids = make([dynamic]prim.Id, context.temp_allocator), trees = make([dynamic]prim.Id, context.temp_allocator), remotes = make([dynamic]Remote, context.temp_allocator)}
 	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
 		a := (^Acc)(data)
 		if len(key) == 32 && len(value) == 17 && value[0] == u8(Kind.File_Tree) && prim.get_u64le(value[9:]) > prim.get_u64le(value[1:]) {
 			id: prim.Id
 			copy(id[:], key[16:])
 			append(&a.ids, id)
+		} else if len(key) == 32 && (len(value) == 1 || len(value) == 9 || len(value) == 17) && value[0] == u8(Kind.File_Tree) {
+			id: prim.Id
+			copy(id[:], key[16:])
+			append(&a.trees, id)
 		} else if len(key) == 33 && key[32] == 'r' && len(value) > 0 {
 			x := Remote{}
 			copy(x.id[:], key[16:32])
@@ -319,9 +330,33 @@ _content_resume :: proc(e: ^Engine, sp: ^Space) {
 	for x in acc.remotes {
 		_tree_remote_note(e, sp, x.id, x.urls)
 	}
+	for id in acc.trees {
+		if _content_behind(e, sp, id) {
+			append(&acc.ids, id)
+		}
+	}
 	for id in acc.ids {
 		_content_kick(e, sp, id)
 	}
+}
+
+@(private)
+_content_behind :: proc(e: ^Engine, sp: ^Space, id: prim.Id) -> bool {
+	_, target := _content_marks(e, sp.id, id)
+	d, derr := _obj_dir(e, id, context.temp_allocator)
+	if derr != .None {
+		return false
+	}
+	path, perr := _join(context.temp_allocator, d, "hist", "fs.journal")
+	if perr != .None {
+		return false
+	}
+	st, serr := prim.stat(e.vfs, path)
+	if serr != .None || st.size <= target {
+		return false
+	}
+	_content_target(e, sp.id, id, st.size)
+	return true
 }
 
 @(private)
@@ -642,6 +677,44 @@ content_waits :: proc(e: ^Engine, allocator := context.allocator) -> []Content_W
 	for k in _sorted_keys(e.content.waits) {
 		w := e.content.waits[k]
 		append(&out, Content_Wait_Info{w.space, w.object, w.oid, w.n, w.inflight})
+	}
+	return out[:]
+}
+
+content_behind :: proc(e: ^Engine, allocator := context.temp_allocator) -> []prim.Id {
+	context = context_for(e)
+	out := make([dynamic]prim.Id, allocator)
+	if !e.reg.open {
+		return out[:]
+	}
+	Acc :: struct {
+		ids: [dynamic]prim.Id,
+	}
+	acc := Acc{ids = make([dynamic]prim.Id, context.temp_allocator)}
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		a := (^Acc)(data)
+		if len(key) == 32 && len(value) >= 1 && value[0] == u8(Kind.File_Tree) {
+			id: prim.Id
+			copy(id[:], key[16:])
+			append(&a.ids, id)
+		}
+		return true
+	}
+	omap.db_scan(&e.reg.db, ROOT_OWNED, nil, nil, &acc, visit)
+	for id in acc.ids {
+		rec, found, rerr := _rec_get(e, id)
+		if rerr != .None || !found || !rec.own {
+			continue
+		}
+		_, target := _content_marks(e, rec.space, id)
+		path, perr := _own_stream_path(e, id, .File_Tree)
+		if perr != .None {
+			continue
+		}
+		n, nerr := pack.durable_size(&e.pk, path)
+		if nerr == .None && n > target {
+			append(&out, id)
+		}
 	}
 	return out[:]
 }

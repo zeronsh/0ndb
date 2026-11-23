@@ -147,13 +147,26 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 				}
 				continue
 			}
-			if len(f.value) != 9 && len(f.value) != 17 {
+			if len(f.value) != 1 && len(f.value) != 9 && len(f.value) != 17 {
 				continue
 			}
-			mark := i64(min(prim.get_u64le(f.value[1:9]), u64(max(i64))))
-			target := i64(-1)
+			mark, target := i64(0), i64(-1)
+			if len(f.value) >= 9 {
+				mark = i64(min(prim.get_u64le(f.value[1:9]), u64(max(i64))))
+			}
 			if len(f.value) == 17 {
 				target = i64(min(prim.get_u64le(f.value[9:17]), u64(max(i64))))
+			}
+			if fixes != nil && kind == .File_Tree && max(mark, target) < n {
+				v := make([]u8, 17, context.temp_allocator)
+				v[0] = f.value[0]
+				prim.put_u64le(v[1:], u64(mark))
+				prim.put_u64le(v[9:], u64(n))
+				append(fixes, Reg_Fix{root = ROOT_OWNED, key = f.key, klen = 32, value = v})
+				continue
+			}
+			if len(f.value) == 1 {
+				continue
 			}
 			if mark <= n && target <= n {
 				continue
