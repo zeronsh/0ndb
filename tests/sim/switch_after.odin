@@ -34,8 +34,8 @@ Sa_Lines :: struct {
 	feature: map[string]string,
 }
 
-switch_after_run :: proc(seed: u64, kind: Switch_After_Kind, mode: Crash_Mode, crash_at: u64) -> (failures: [dynamic]string, crashed: bool) {
-	failures = make([dynamic]string)
+@(private = "file")
+_sa_world :: proc(seed: u64) -> ^World {
 	cfg := default_config(seed)
 	cfg.nodes = 1
 	cfg.spaces = 0
@@ -50,6 +50,12 @@ switch_after_run :: proc(seed: u64, kind: Switch_After_Kind, mode: Crash_Mode, c
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
+	return w
+}
+
+switch_after_run :: proc(seed: u64, kind: Switch_After_Kind, mode: Crash_Mode, crash_at: u64) -> (failures: [dynamic]string, crashed: bool) {
+	failures = make([dynamic]string)
+	w := _sa_world(seed)
 	crashed = _switch_after(w, kind, mode, crash_at)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
@@ -117,27 +123,26 @@ _sa_same :: proc(w: ^World, line: string, want, got: map[string]string, kind: Sw
 }
 
 @(private = "file")
-_switch_after :: proc(w: ^World, kind: Switch_After_Kind, mode: Crash_Mode, crash_at: u64) -> (crashed: bool) {
-	n := w.nodes[0]
+_sa_setup :: proc(w: ^World) -> (n: ^Node, tree: eng.Object, ok: bool) {
+	n = w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "switch after: node start")
-		return
+		return n, tree, false
 	}
 	m := &w.model
 	vfs := disk_vfs(&n.disk)
-	tree: eng.Object
 	{
 		context = instance_context(&n.inst)
 		space, err := eng.space_create(&n.e, "switch-after")
 		if err != .None {
 			world_fail(w, "switch after: space_create: %v", err)
-			return
+			return n, tree, false
 		}
 		eng.space_open(&n.e, space)
 		tree, err = eng.tree_create(&n.e, space, "work")
 		if err != .None {
 			world_fail(w, "switch after: tree_create: %v", err)
-			return
+			return n, tree, false
 		}
 		node_after(n)
 	}
@@ -152,19 +157,29 @@ _switch_after :: proc(w: ^World, kind: Switch_After_Kind, mode: Crash_Mode, cras
 	when_s := clock_wall(&n.clock) / 1_000_000_000
 	if err := git_checkout_create(vfs, SA_ROOT, files[:], when_s, node_clock(&n.clock), rng_random(&w.rng)); err != .None {
 		world_fail(w, "switch after: git checkout: %v", err)
-		return
+		return n, tree, false
 	}
 	branch_files := [?]Git_File{{name = "b.txt", data = transmute([]u8)string("feature b\n")}, {name = "c.txt", data = transmute([]u8)string("feature c\n")}}
 	if err := git_branch_commit(vfs, SA_ROOT, "feature", branch_files[:], nil, when_s, node_clock(&n.clock), rng_random(&w.rng)); err != .None {
 		world_fail(w, "switch after: branch commit: %v", err)
-		return
+		return n, tree, false
 	}
 	if err := node_mount(w, n, oi, SA_ROOT); err != .None {
 		world_fail(w, "switch after: mount: %v", err)
-		return
+		return n, tree, false
 	}
 	append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = strings.clone(SA_ROOT, w.allocator)})
 	run_until(w, w.now + 2_000_000_000, true)
+	return n, tree, true
+}
+
+@(private = "file")
+_switch_after :: proc(w: ^World, kind: Switch_After_Kind, mode: Crash_Mode, crash_at: u64) -> (crashed: bool) {
+	n, tree, sok := _sa_setup(w)
+	if !sok {
+		return
+	}
+	vfs := disk_vfs(&n.disk)
 	sm0 := _sa_mount(n)
 	if sm0 == nil {
 		world_fail(w, "switch after: mount missing")
@@ -291,6 +306,141 @@ line_switch_after_crash :: proc(t: ^testing.T) {
 			testing.expect(t, points > 0, fmt.tprintf("line_switch_after_crash %v %v: the reopen never crashed", kind, mode))
 		}
 	}
+}
+
+@(private = "file")
+SA_PRE :: "main a\npre\n"
+
+@(private = "file")
+SA_RACED :: "main a\npre\nraced\n"
+
+switch_ingest_race_run :: proc(seed: u64) -> (failures: [dynamic]string, raced: bool) {
+	failures = make([dynamic]string)
+	w := _sa_world(seed)
+	raced = _switch_ingest_race(w)
+	for f in w.failures {
+		append(&failures, fmt.aprintf("%s", f))
+	}
+	world_destroy(w)
+	free(w)
+	return
+}
+
+@(private = "file")
+_sa_step :: proc(w: ^World) -> bool {
+	t, ok := next_time(w)
+	if !ok {
+		return false
+	}
+	run_until(w, t, false)
+	return true
+}
+
+@(private = "file")
+_switch_ingest_race :: proc(w: ^World) -> (raced: bool) {
+	n, tree, ok := _sa_setup(w)
+	if !ok {
+		return
+	}
+	vfs := disk_vfs(&n.disk)
+	if err := _sa_write(vfs, SA_ROOT + "/a.txt", transmute([]u8)string(SA_PRE)); err != .None {
+		world_fail(w, "switch ingest race: pre write: %v", err)
+		return
+	}
+	node_after(n)
+	seen := false
+	for limit := w.now + 20_000_000_000; w.now < limit && !seen; {
+		if !_sa_step(w) {
+			break
+		}
+		got, _ := _sa_line(w, n, tree, "main")
+		seen = got["a.txt"] == SA_PRE
+	}
+	if !seen {
+		world_fail(w, "switch ingest race: the pre write was never ingested")
+		return
+	}
+	sm := _sa_mount(n)
+	if sm == nil {
+		world_fail(w, "switch ingest race: mount missing")
+		return
+	}
+	start: {
+		context = instance_context(&n.inst)
+		err := fs.mount_line_switch(sm.m, SA_FEATURE)
+		node_after(n)
+		if err != .None {
+			world_fail(w, "switch ingest race: line_switch: %v", err)
+			return
+		}
+	}
+	if _, pending := fs.mount_switch_pending(sm.m); !pending || sm.m.switch_phase != fs.SWITCH_INGEST {
+		return
+	}
+	if err := _sa_write(vfs, SA_ROOT + "/a.txt", transmute([]u8)string(SA_RACED)); err != .None {
+		world_fail(w, "switch ingest race: raced write: %v", err)
+		return
+	}
+	held := make([dynamic]Watch_Ev, context.temp_allocator)
+	for i := 0; i < len(n.disk.events); {
+		if strings.has_prefix(n.disk.events[i].path, SA_ROOT) {
+			append(&held, n.disk.events[i])
+			ordered_remove(&n.disk.events, i)
+			continue
+		}
+		i += 1
+	}
+	raced = true
+	flipped := false
+	for limit := w.now + 20_000_000_000; w.now < limit && !flipped; {
+		if !_sa_step(w) {
+			break
+		}
+		sm = _sa_mount(n)
+		if sm == nil {
+			world_fail(w, "switch ingest race: mount missing during the switch")
+			return
+		}
+		_, pending := fs.mount_switch_pending(sm.m)
+		flipped = !pending || sm.m.switch_phase >= fs.SWITCH_TARGET
+	}
+	if !flipped {
+		world_fail(w, "switch ingest race: the switch never left ingest")
+		return
+	}
+	append(&n.disk.events, ..held[:])
+	node_after(n)
+	run_until(w, w.now + 20_000_000_000, true)
+	main_l, _ := _sa_line(w, n, tree, "main")
+	feat_l, _ := _sa_line(w, n, tree, SA_FEATURE)
+	if main_l["a.txt"] != SA_RACED || strings.contains(feat_l["a.txt"], "raced") {
+		world_fail(w, "switch ingest race: a write made while the switch to %s was ingesting, its watch event delayed past the line flip, is %q on main and %q on the target", SA_FEATURE, main_l["a.txt"], feat_l["a.txt"])
+	}
+	return
+}
+
+@(test)
+line_switch_ingest_race :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	raced := 0
+	for seed in u64(1) ..= 20 {
+		failures, r := switch_ingest_race_run(seed)
+		for f in failures {
+			fmt.eprintf("line_switch_ingest_race seed %d: %s\n", seed, f)
+			delete(f)
+		}
+		testing.expect(t, len(failures) == 0, fmt.tprintf("line_switch_ingest_race seed %d failed", seed))
+		delete(failures)
+		if r {
+			raced += 1
+		}
+	}
+	fmt.eprintf("line_switch_ingest_race: %d of 20 seeds raced a write into the ingest window\n", raced)
+	testing.expect(t, raced > 0, "line_switch_ingest_race: no seed opened the ingest window")
 }
 
 @(private = "file")
