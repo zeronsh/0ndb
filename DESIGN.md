@@ -1281,16 +1281,20 @@ concurrent typing is never lost or reverted.
   puts wrote 1.7-2x the bytes with 2-2.4x the p99 batch latency, and inside
   files cap near 16 MB).
   - Add before use: nothing outside the inline batch becomes durable before
-    the batch state it names. A registry object row whose `own` bit turns on
-    is staged with the sequence of the batch open when it was written: until
-    that batch is durable the row commits with `own` still off (members, key
-    epochs and scan positions are derived from feeds and replicas whose
-    cursors live in the pack, so they must not wait), and the full row
-    commits once the batch is durable. Owned entries are queued the same
-    way. Key trees and space rows commit at once, so an own key tree is
-    durable before any own segment byte. A crash after the batch but before the row
-    leaves an own segment without `own`, and creating the writer adopts that
-    segment. A copy-on-write omap file inside the pack (map tables) writes
+    the batch state it names, with one deliberate exception: ownership. A
+    registry object row whose `own` bit turns on, and its owned entry,
+    commit (synced) when the writer is created, before the first own record
+    is appended, so `own` is durable no later than any own segment byte.
+    The reverse order left a window where a crash after the batch but
+    before the row kept an own segment the registry did not mark own; it
+    was adopted only if the device wrote the object again, so otherwise it
+    was never uploaded. The window this order leaves instead, `own` with no
+    segment, is closed by the unclean open below, which clears it before
+    spaces load and before anything reads `own`. Nothing leaves the device
+    on the strength of the bit alone: what `own` drives (catalog rows, grant
+    cards, publishing) rides batches at or after the first own record's.
+    Key trees and space rows commit at once, so an own key tree is durable
+    before any own segment byte. A copy-on-write omap file inside the pack (map tables) writes
     and syncs its pages at commit but keeps the new meta page in memory,
     tagged with the open batch; the meta is written and synced only once that
     batch is durable, after the registry rows that batch made eligible, so a
