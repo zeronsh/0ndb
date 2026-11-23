@@ -168,14 +168,36 @@ stream_step :: proc(w: ^World, si: int) {
 	schedule(w, Sim_Event{at = w.now + rng_range(&st.rng, 1, 40) * 1_000_000, kind = .Stream_Step, arg = u64(si)})
 }
 
+@(private = "file")
+_reopened :: proc(w: ^World, n: ^Node, st: ^M_Stream) -> bool {
+	if !n.alive {
+		return false
+	}
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	msg, err := eng.convo_message(&n.e, w.model.objs[st.obj].o, convo.Position{msg = st.msg}, context.temp_allocator)
+	return err == .None && msg.open && msg.open_state == .Running
+}
+
 stream_after_restart :: proc(w: ^World, n: ^Node) {
 	m := &w.model
 	for st in w.streams {
-		if st.node != n.idx || st.done || st.inc >= n.incarnation {
+		if st.node != n.idx || st.inc >= n.incarnation {
 			continue
 		}
-		st.done = true
-		st.crashed = true
+		if !n.alive {
+			return
+		}
+		if !st.done {
+			st.done = true
+			st.crashed = true
+		} else if !_reopened(w, n, st) {
+			continue
+		} else if !st.crashed {
+			world_note(w, "%s stream %s seal did not survive the crash: its message is open again", n.name, m.ops[st.op].token)
+			st.sealed = false
+			st.crashed = true
+		}
 		if !n.alive {
 			return
 		}
