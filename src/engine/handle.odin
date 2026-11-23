@@ -561,13 +561,21 @@ _fresh_link :: proc(h: ^Handle) -> bool {
 }
 
 @(private)
+_seg_empty :: proc(h: ^Handle, s: ^Seg) -> bool {
+	if s.tree != nil && s.tree.absent {
+		return true
+	}
+	return h.sp.repl_on && osync.replicator_confirmed_empty(&h.sp.repl, &h.scope, s.device, h.name, 0)
+}
+
+@(private)
 _handle_probe :: proc(h: ^Handle) {
 	sp := h.sp
 	if !sp.repl_on || !sp.connected {
 		return
 	}
 	for s in h.segs {
-		if s.probed || s.waiting || journal.replica_length(s.rep) == 0 {
+		if s.probed || s.waiting {
 			continue
 		}
 		s.probed = true
@@ -656,10 +664,10 @@ _handle_waiting :: proc(h: ^Handle, fresh := false) -> bool {
 		if s.waiting || (fresh && s.probing) {
 			return true
 		}
-		if !s.in_view && s.tree != nil && !s.tree.absent {
+		if !s.in_view && s.tree != nil && !_seg_empty(h, s) {
 			return true
 		}
-		unreadable := !s.in_view && s.tree != nil && s.tree.absent
+		unreadable := !s.in_view && s.tree != nil && _seg_empty(h, s)
 		if s.follow && !unreadable && h.kind != .Conversation && h.sp.repl_on && h.sp.connected && osync.replicator_catching_up(&h.sp.repl, &h.scope, s.device, h.name, 0) {
 			return true
 		}

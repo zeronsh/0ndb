@@ -316,7 +316,7 @@ _remote_tree_load :: proc(e: ^Engine, sp: ^Space, rt: ^Remote_Tree) {
 	defer osync.replicator_release(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch)
 	end := journal.replica_length(rep)
 	if end == 0 {
-		if rt.requested && osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) <= 0 {
+		if rt.requested && osync.replicator_relay_length(&sp.repl, &rt.scope, rt.device, rt.keys_name, rt.epoch) == 0 {
 			rt.absent = true
 		}
 		if !rt.requested {
