@@ -32,8 +32,8 @@ for c in "${POINTS[@]}"; do
 		echo "$(git log --format='%h %s' -1 "$c" | cut -c1-70): build failed"
 	else
 		o=$(env $ENVS timeout 900 "$OUT/sim$i.bin" 2>&1)
-		if echo "$o" | grep -qE "FAILED|panic|membership seed [0-9]+: |test failed" || ! echo "$o" | grep -q "Finished"; then
-			r="FAIL $(echo "$o" | grep -E 'trace: FAIL|membership seed [0-9]+: |panic' | head -1 | sed 's/^ *//' | cut -c1-120)"
+		if echo "$o" | grep -qE "membership seed [0-9]+: " || ! echo "$o" | grep -qE "All tests were successful|The test was successful"; then
+			r="FAIL $(echo "$o" | grep -E 'trace: FAIL|membership seed [0-9]+: |panic|FATAL' | head -1 | sed 's/^ *//' | cut -c1-120)"
 		else
 			r="pass"
 		fi
