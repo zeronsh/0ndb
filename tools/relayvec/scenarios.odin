@@ -44,6 +44,7 @@ scenarios :: proc() -> []Scenario {
 		{"malformed", "Malformed input is fatal: oversize frames, unknown kinds, relay-only kinds, short payloads, count mismatches, inverted ranges, bad bulk headers, oversize direct payloads, a second Hello; bytes after the error are ignored.", sc_malformed},
 		{"compaction", "Feed compaction folds the feed into a snapshot of current lengths plus the redaction log; followers and late readers resume from the new base.", sc_compaction},
 		{"trim", "Trim drops stored content below a base an archive covers: owner only, acknowledged once durable, idempotent, never lowers base, refused at or past the length; readers, probes and follows get Trimmed; Fill below a trim stores nothing.", sc_trim},
+		{"trim_hollow", "Trim at exactly a device-held base frees nothing but marks the base as a trim once durable, and a follower already past it gets Trimmed; repeating it changes nothing, probes answer Trimmed and Fill below it stores nothing.", sc_trim_hollow},
 		{"limits", "Per-principal connection limit and per-connection follow limit.", sc_limits},
 		{"live", "Live drafts (feature bit 3): live-only follows, Live forwarded unstored to live followers only, owner check, Unfollow leaving live interest, LIVE removal, draft pulls through the peer pipe, malformed Live.", sc_live},
 	}
@@ -722,6 +723,36 @@ sc_trim :: proc(v: ^Vector) {
 	send(v, "alice", f_redact(s1, 0, length), "Redaction is clamped to the stored suffix")
 	durable(v)
 	send(v, "alice", f_trim(stream(alice, 9), 10), "Trim a segment that does not exist")
+}
+
+sc_trim_hollow :: proc(v: ^Vector) {
+	alice, bob, carol := key_make(1), key_make(2), key_make(3)
+	sp := space_make(v, alice, 0x21)
+	addb := space_add(sp, alice, bob, .Member)
+	addc := space_add(sp, alice, carol, .Reader)
+	join(v, "alice", sp, alice, sp.genesis)
+	join(v, "bob", sp, bob, addb)
+	join(v, "carol", sp, carol, addc)
+	h1 := stream(alice, 3)
+	send(v, "alice", f_note(h1, 1000), "Note a device-held prefix")
+	durable(v)
+	kept := rec("stored", 1000)
+	length := 1000 + i64(len(kept))
+	send(v, "alice", f_append(h1, 1000, kept), "Append stored content after the hollow base")
+	durable(v)
+	send(v, "bob", f_follow(false, {h1, u64(length)}), "Follow past the base")
+	send(v, "carol", f_idlist(.Probe, h1), "Probe answers Hollow before the trim")
+	send(v, "alice", f_trim(h1, 1000), "Trim at exactly the hollow base")
+	durable(v, "Noted once durable; the follower past the base gets Trimmed")
+	send(v, "alice", f_trim(h1, 1000), "Trim again at the same base")
+	send(v, "carol", f_idlist(.Probe, h1), "Probe answers Trimmed")
+	fill := make([]u8, 100, context.temp_allocator)
+	for i in 0 ..< len(fill) {
+		fill[i] = u8(i)
+	}
+	send(v, "bob", f_fill(h1, 900, fill), "Fill below the trim stores nothing")
+	durable(v)
+	send(v, "carol", f_read(h1, 0, length), "Read below the trimmed base")
 }
 
 sc_pipe :: proc(v: ^Vector) {

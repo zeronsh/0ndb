@@ -766,9 +766,11 @@ changes nothing and answers `Noted` at once (trim never lowers `base`, and
 repeating one is harmless). Otherwise the relay raises `base`, marks the base
 as a trim, frees `[old base, base)` and, once durable, answers
 `Noted(id, base, length)`. A `base` equal to a device-held (`Hollow`) base
-frees nothing but still marks the base as a trim, durably, and sends
-`Trimmed` to every follower of the segment: the archive now covers the
-device-held prefix, so readers stop asking peers for it. Usage drops by the freed
+frees nothing but still marks the base as a trim, durably: the archive now
+covers the device-held prefix, so readers stop asking peers for it. Once a
+trim is durable the relay sends `Trimmed(id, base, length)` to every
+follower of the segment whose offset is below the new base and, on the
+segment's first trim, to every follower, including those already past it. Usage drops by the freed
 bytes. Trim appends no feed entry: no follower holds less afterwards, and a
 new feed word would be read as a length by version-3 clients.
 
@@ -1019,7 +1021,8 @@ storage completion as an input, which every sans-IO relay does.
 | drop | Busy while writing, Not_Owner, Dropped to the owner after the feed entry, once to a follower that also watches, FEED_DROPPED in the feed |
 | redact | reader refusal, misaligned range refused with no change, zero-fill with tag, redaction pair in the feed, missing segment |
 | hollow | Note, Noted, Hollow to followers and readers, Fill by a member, mismatched Fill, reader refusal, Append after the stored suffix, Note on stored content, Fill on a missing segment |
-| trim | Trim by the owner acknowledged once durable, member and reader refusals, repeated and lower bases, base at the length refused, Trimmed before Data, Probed and Length, Fill below a trim, appends after a trim, redaction clamped to the stored suffix, missing segment |
+| trim | Trim by the owner acknowledged once durable, followers told with Trimmed on the first trim, member and reader refusals, repeated and lower bases, base at the length refused, Trimmed before Data, Probed and Length, Fill below a trim, appends after a trim, redaction clamped to the stored suffix, missing segment |
+| trim_hollow | Trim at exactly a device-held base marks it as a trim once durable without freeing bytes, Trimmed to a follower already past it, repeated trim, Probed answers Trimmed, Fill below it, Read below it |
 | pipe | Pull, Pulled, Serve, Served, FINAL, NONE, closed pipe, absent and self holders, duplicate tag, wrong requester, holder disconnect |
 | presence | snapshot, up and down per device across connections, Direct, Undelivered |
 | membership | Add appended to a members segment admits; a non-member's proof is ignored; a Remove revokes the live connection and later Hellos |
