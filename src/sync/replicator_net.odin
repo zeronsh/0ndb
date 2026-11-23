@@ -444,6 +444,7 @@ _repl_close :: proc(r: ^Replicator) {
 	r.tr.fd = prim.INVALID_FD
 	_repl_reset_state(r)
 	client_reset(&r.client)
+	r.tampered = false
 }
 
 @(private)
