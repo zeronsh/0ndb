@@ -1336,9 +1336,16 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 			break
 		}
 		if i64(pos) >= m.log_at {
-			attrib_set(m, path, actor, false, o, sc)
-			if o != {} {
-				attrib_chain_add(m, path, Attrib_Step{actor, o, sc})
+			if actor == {} {
+				if path in m.attrib {
+					key, _ := delete_key(&m.attrib, path)
+					delete(key, m.allocator)
+				}
+			} else {
+				attrib_set(m, path, actor, false, o, sc)
+				if o != {} {
+					attrib_chain_add(m, path, Attrib_Step{actor, o, sc})
+				}
 			}
 		}
 		pos += 8 + n
@@ -1755,22 +1762,14 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 					attrib_log_append(sm, k, s.actor, {}, s.id)
 				}
 			}
+			scope_retire_unwritten(sm, s)
 			if sm.log_fd >= 0 && sm.log_len > 0 {
 				prim.datasync(sm.vfs, sm.log_fd)
 			}
 			save_mount_state(sm)
 		} else {
 			sm := s.mount
-			drop := make([dynamic]string, context.temp_allocator)
-			for k, a in sm.attrib {
-				if o := sm.open_scopes[k]; !a.used && a.actor == s.actor && k not_in sm.dirty && (o == nil || o == s) {
-					append(&drop, k)
-				}
-			}
-			for k in drop {
-				key, _ := delete_key(&sm.attrib, k)
-				delete(key, sm.allocator)
-			}
+			scope_retire_unwritten(sm, s)
 			if sm.db != nil {
 				_, err = mount_commit(sm, {message = "0ndb: scope"})
 			}
@@ -1801,6 +1800,30 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 	delete(s.pids)
 	free(s, reg.allocator)
 	return err
+}
+
+@(private)
+scope_retire_unwritten :: proc(m: ^Mount, s: ^Scope) {
+	keys := make([dynamic]string, context.temp_allocator)
+	for k, a in m.attrib {
+		if o := m.open_scopes[k]; !a.used && a.actor == s.actor && k not_in m.dirty && (o == nil || o == s) {
+			append(&keys, k)
+		}
+	}
+	logged := false
+	for k in keys {
+		if mount_disk_unseen(m, k) {
+			mount_closed(m, k)
+			continue
+		}
+		key, _ := delete_key(&m.attrib, k)
+		attrib_log_append(m, key, prim.Id{})
+		delete(key, m.allocator)
+		logged = true
+	}
+	if logged {
+		attrib_log_durable(m, nil, nil)
+	}
 }
 
 @(private)
