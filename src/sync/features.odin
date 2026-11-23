@@ -193,9 +193,97 @@ replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name
 	if r.phase != .Ready {
 		return .Closed
 	}
-	client_redact(&r.client, stream_id(scope, device, name, epoch), from, to) or_return
+	id := stream_id(scope, device, name, epoch)
+	if device == r.cfg.self {
+		client_redact(&r.client, id, from, to) or_return
+		l, ok := r.locals[id]
+		opened := false
+		if !ok {
+			l, opened = _arc_own_open(r, scope, name, epoch, id)
+		}
+		if l != nil {
+			_arc_redact_own(r, l, from, to)
+			if opened {
+				_local_maybe_free(r, l)
+			}
+		}
+	} else {
+		queued := false
+		if _arc_on(r) {
+			if rm, rerr := _remote_get(r, scope, device, name, epoch); rerr == .None {
+				queued = _arc_redact_remote(r, rm, from, to)
+				_remote_maybe_free(r, rm)
+			}
+		}
+		if !queued {
+			client_redact(&r.client, id, from, to) or_return
+		}
+	}
 	_repl_flush(r)
 	return .None
+}
+
+replicator_rearchive :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, from, to: i64) {
+	_enter(r)
+	defer _leave(r)
+	n, err := _clone_string(name, r.allocator)
+	if err != .None {
+		return
+	}
+	append(&r.rearchives, Rearchive_Req{scope = scope^, name = n, epoch = epoch, from = from, to = to})
+	if r.rearchive_timer == 0 {
+		r.rearchive_timer = prim.timer(r.loop, 0, r, _on_rearchive)
+	}
+}
+
+@(private)
+Rearchive_Req :: struct {
+	scope: Scope,
+	name:  string,
+	epoch: u64,
+	from:  i64,
+	to:    i64,
+}
+
+@(private)
+_on_rearchive :: proc(lp: ^prim.Loop, data: rawptr) {
+	r := cast(^Replicator)data
+	r.rearchive_timer = 0
+	_enter(r)
+	defer _leave(r)
+	reqs := r.rearchives
+	r.rearchives = make([dynamic]Rearchive_Req, r.allocator)
+	for &q in reqs {
+		id := stream_id(&q.scope, r.cfg.self, q.name, q.epoch)
+		l, ok := r.locals[id]
+		opened := false
+		if !ok {
+			l, opened = _arc_own_open(r, &q.scope, q.name, q.epoch, id)
+		}
+		if l != nil {
+			_arc_redact_own(r, l, q.from, q.to)
+			if opened {
+				_local_maybe_free(r, l)
+			}
+		}
+		scope_clear(&q.scope)
+		delete(q.name, r.allocator)
+	}
+	delete(reqs)
+	_repl_flush(r)
+}
+
+@(private)
+_rearchives_free :: proc(r: ^Replicator) {
+	if r.rearchive_timer != 0 {
+		prim.timer_cancel(r.loop, r.rearchive_timer)
+		r.rearchive_timer = 0
+	}
+	for &q in r.rearchives {
+		scope_clear(&q.scope)
+		delete(q.name, r.allocator)
+	}
+	delete(r.rearchives)
 }
 
 replicator_zero_replica :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
@@ -640,6 +728,8 @@ _replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
 		return
 	}
 	if rm, ok := r.remotes[id]; ok {
+		_arc_invalidate(r, rm)
+		_arc_wipe_remote(r, rm, from, to)
 		hi := min(to, journal.replica_length(&rm.rep))
 		if hi > from {
 			keys, known := _remote_keys(r, rm)
@@ -897,18 +987,26 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 			n := int(prim.get_u32le(data[pos:]))
 			size := n + journal.OVERHEAD
 			if n > journal.MAX_BODY || (size <= len(data) - pos && int(prim.get_u32le(data[pos + size - 4:])) != n) {
-				if pos == 0 && claimed {
+				if claimed {
 					_unclaim(rm, at)
 					return
 				}
 				return 0, pos, 0, true
 			}
 			if size > len(data) - pos {
+				if final {
+					rm.need_at = at + i64(pos)
+					rm.need_to = rm.need_at + i64(size)
+				}
 				break
 			}
 			switch _record_check(&k, data[pos:][:size], at + i64(pos)) {
 			case .Ok:
 			case .Bad:
+				if claimed {
+					_unclaim(rm, at)
+					return
+				}
 				if !_key_probe(r, rm, &k) {
 					return 0, pos, 0, true
 				}
@@ -940,22 +1038,34 @@ _stage_check :: proc(r: ^Replicator, rm: ^Remote, final: bool, stream_len: i64) 
 	if end != stream_len && !_is_boundary(rm, end) {
 		return
 	}
+	eclaimed := end != stream_len && !_proven_boundary(rm, end)
 	pos := len(data)
 	for pos >= journal.OVERHEAD {
 		n := int(prim.get_u32le(data[pos - 4:]))
 		if n > journal.MAX_BODY {
+			if eclaimed {
+				_unclaim(rm, end)
+				return
+			}
 			return pos, len(data), 0, true
 		}
 		start := pos - n - journal.OVERHEAD
 		if start < 0 {
+			rm.need_from = at + i64(start)
+			rm.need_set = true
 			break
 		}
-		if int(prim.get_u32le(data[start:])) != n {
-			return pos, len(data), 0, true
+		chk := _Check.Bad
+		if int(prim.get_u32le(data[start:])) == n {
+			chk = _record_check(&k, data[start:pos], at + i64(start))
 		}
-		switch _record_check(&k, data[start:pos], at + i64(start)) {
+		switch chk {
 		case .Ok:
 		case .Bad:
+			if eclaimed {
+				_unclaim(rm, end)
+				return
+			}
 			if !_key_probe(r, rm, &k) {
 				return pos, len(data), 0, true
 			}
@@ -1070,6 +1180,7 @@ replicator_keys_ready :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	if r.phase == .Ready {
 		_remote_pull(r, rm)
 		_remote_settle(r, rm)
+		_arc_drive(r, rm)
 		_repl_flush(r)
 	}
 }

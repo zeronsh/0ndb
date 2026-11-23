@@ -2642,7 +2642,13 @@ Relay cost tracks the reachable information, not the activity. Items marked
   relay's `base` and nothing is uploaded twice. Offsets are the writer's, so
   ids never change. The relay never reads below `base`: reads, tails and
   follows are clamped and preceded by a `Hollow` frame with `base` and
-  `length`. Feed compaction keeps the hollow flag.
+  `length`. Feed compaction keeps the hollow flag. A full follower of a
+  based segment resumes from the end of the stored suffix it holds, not
+  from its contiguous prefix (which stops at the base), so a reconnect
+  never re-reads the suffix. A base a reader knows only from the feed is
+  confirmed with one relay read of the range before it pulls that range
+  from peers: a device-held base can later become a trim, and the relay's
+  `Trimmed` answer sends the range to the archive instead.
 - **Content uploads follow durability.** Each owned file tree keeps an upload
   mark and a target in the registry (`ROOT_OWNED`). When the batch holding
   tree records becomes durable the target rises to that length, whether or
@@ -2975,14 +2981,32 @@ Relay cost tracks the reachable information, not the activity. Items marked
     writer-signed archive replaces their role. Groups close at 1 MiB of
     raw content.
   - *Group key*: BLAKE2b over the domain, `first`, `end` and the key of
-    every key-tree cell in `[first, end)`, then keyed BLAKE2b of the salt.
-    A redaction punctures a record's cell, so after any redaction inside a
-    group its key is underivable on every device and the relay never had
-    it; the salt makes every (key, nonce) pair unique even if a group is
-    re-archived with different compression. Readers need no layout before
-    decrypting. Correction of the earlier design: a key from the group's
-    record keys alone cannot be derived without knowing which records the
-    group holds; the cell grid needs nothing but the range.
+    every key-tree cell in `[first, end)` except the cells listed in the
+    header as already punctured when the group was built ("holes"), then
+    keyed BLAKE2b of the salt. Why redaction stays exact: (1) a redaction
+    of a record punctures every cell of its byte range in the writer's
+    tree (`keytree_puncture_except`, keeping only signature cells), and
+    puncturing is one-way: the punctured leaves and every GGM node above
+    them are deleted, so no state derived after the puncture can produce
+    them; (2) a group built before the redaction did not list those cells
+    as holes, so its key input includes their keys; (3) hence anyone who
+    only holds post-puncture state (every device once it follows the
+    writer's keys stream, and the relay, which never held keys) cannot
+    derive the group key, and the group's ciphertext is as dead as a
+    zero-filled record. Holes are public (the relay already sees which
+    ranges were redacted) and only let a group built after a redaction
+    skip cells that were gone before it existed; a record whose cell is a
+    hole is archived as a redacted entry (length and commitment), never
+    with content. Because a surviving group becomes unreadable to everyone
+    after any redaction inside it, the other records of that group would
+    be lost to readers that did not already hold them; that is exactly
+    what Restore (below) prevents, and until it runs readers fall back to
+    peers that hold those records. The salt makes every (key, nonce) pair
+    unique even if a range is re-archived with different compression.
+    Readers need no layout before decrypting. Correction of the earlier
+    design: a key from "the group's record keys" cannot be derived without
+    knowing which records the group holds; the cell grid needs nothing but
+    the range.
   - *Seal* record: kind 2, `B`, the segment chain head at `B`, and the group
     index (first, end, archive offset per group, delta coded). A seal holds
     every entry since the last full seal and is full again once its delta
@@ -3000,10 +3024,16 @@ Relay cost tracks the reachable information, not the activity. Items marked
     are equivocation.
   - *Materialization*: verified records are written into the reader's
     sparse replica in wire form (resealed per record with the segment key
-    at the same offset, which reproduces the writer's ciphertext exactly),
-    signature records as redacted-form placeholders; the replica records
-    the range as archive-verified so chain checks there use the archive.
-    Paging both ways is unchanged.
+    at the same offset, which reproduces the writer's ciphertext exactly;
+    the simulator compares every rebuilt record with the ciphertext the
+    writer uploaded). Elided signature records become inert signature
+    records of the same length (`0xff` and zeros, sealed with the
+    signature tag), which every reader already skips; redacted-form
+    placeholders were tried first and broke text history, which waits for
+    a replacement of any redacted record. The replica persists the range
+    as archive-verified (a trusted list in its `.have` sidecar) so chain
+    checks there use the archive, not the elided signatures. Paging both
+    ways is unchanged.
   - Measured on a 4.16 MB synthetic tool-heavy transcript (2,769 messages,
     sequential repository source and agent text; zstd -3 1.03 MB, -19
     0.77 MB) recorded through `0ndb record`: the conversation segment's
@@ -3012,13 +3042,43 @@ Relay cost tracks the reachable information, not the activity. Items marked
     catalog's 713 KB to 7.6 KB; every record round-trips byte for byte.
     Archiving costs 80 ms per MB of segment (most of it the
     recompression check), reading 30 ms per MB, both off the append path.
-  The rest is the planned integration. Runs start once enough acknowledged
-  bytes accumulate past the last seal; `B` is a commit boundary strictly
-  below the relay's length, so a trimmed segment always keeps one stored
-  commit and never looks device-only. `Trim{segment, B}` is sent only once
-  the seal is durable on the relay and is idempotent, so a crash anywhere
-  leaves the segment whole and the run is resumed or redone. Redaction: a
-  record inside a group cannot be zero-filled alone, so the redactor (any
+  Integration (built, `src/sync/replicator_arc.odin`). The replicator
+  archives every object segment it uploads (`replicator_publish` with
+  `archive`; members, keys, cards and the feed never), once the relay
+  advertises Trim and reads below base. A run starts when the
+  acknowledged length passes the last seal by `archive_min` (engine
+  `Config.archive_min`, default 512 KiB, negative disables). One loop
+  turn builds one group from the writer's own journal (plaintext bodies;
+  commitments taken from its signature records, so no keys are needed for
+  the chain), appends it and a seal to the local archive journal, commits,
+  records the sealed `B` in the upload floor slot, and publishes the
+  archive stream; a backlog continues on the next turn, so no turn
+  compresses more than one group. `B` is the end of a commit strictly
+  below the acknowledged length, so a trimmed segment always keeps one
+  stored commit and never looks device-only. `Trim{segment, B}` is sent
+  only once the archive stream's upload floor covers the seal, and it is
+  idempotent, so a crash anywhere leaves the segment whole: an unsealed
+  group is ignored (the next run redoes the range and the newer seal
+  supersedes it), and an unsent trim is resent after the next upload.
+  Readers: a `Trimmed` reply marks the remote; wants below its base become
+  archive wants: the reader tails the writer's archive stream (an ordinary
+  remote, chain-verified with the writer's identity and no keys), reads
+  the last seal and the last full seal, fetches each covering group by
+  its offset and length, verifies and materializes it. A group that
+  cannot be opened or verified (its key punctured, its record
+  zero-filled, a forged fold) marks the range broken and the reader pulls
+  it from peers. Measured end to end on the corpus above (2,769 `0ndb
+  record` calls against a pack-backed `0ndb relay --objects`, allocated
+  bytes): the relay grew 4.07 MB instead of 6.99 MB; segments alone (the
+  1.20 MB search snapshot object is in both) 2.86 MB instead of 5.78 MB:
+  the conversation's 1.13 MB archive and 0.29 MB stored tail instead of
+  3.92 MB, the catalog's 0.20 MB tail (and an 8 KB archive) instead of
+  0.71 MB, plus pack containers and index runs. The object-store tier
+  wrote 5.88 MB in 10 batch objects instead of 5.96 MB in 9: it flushes
+  appends before they are trimmed and has no delete, so trimmed batches
+  are garbage there (collecting them needs an object-store delete).
+  Redaction: a record inside a group cannot be zero-filled
+  alone, so the redactor (any
   member: it holds the keys) writes `Restore{group ref, the group without
   that record, the removed record's commitment}` into its own segment of
   the object, then the group is zero-filled and its key punctured
@@ -3029,6 +3089,82 @@ Relay cost tracks the reachable information, not the activity. Items marked
   reachable from a message is kept; superseded run lines and runs,
   deleted forks and redacted content are collected the same way.
   Cold-tier movement is a `Relay_Storage` hint.
+  As built: the writer's own records are re-archived by the writer (it
+  rebuilds every group overlapping the redaction from its journal, checks
+  the heads, seals, then zero-fills the old groups); a redaction notice
+  for its own segment reopens the local on demand, so this happens even
+  when the writer was offline at the time. Another writer's record: the
+  redactor resolves the group (the writer's, or the verifying Restore with
+  the most holes), rebuilds it with the record as a Redacted entry
+  (commitment kept) and the record's cells as holes, checks the fold
+  against the writer-signed `head_before`/`head_after` that every seal
+  entry carries, and appends `Restore{target writer, arc_off, group}` to
+  its own plain chained stream `rst/<writer>/<segment>`. Only once the
+  relay holds that Restore does it zero-fill the source (the writer's
+  group or the previous Restore) and send the segment redaction, so the
+  engine's persisted redaction intent drives the whole sequence again
+  after a crash. A reader that finds a zeroed group probes the `rst/`
+  streams of the object's segment-group members, verifies each candidate
+  (group key from its holes, chain fold equal to the seal entry heads,
+  the redactor's chain on the stream) and materializes the one with the
+  most holes; a Restore can hide records but cannot alter one. Readers that
+  get the redaction notice zero their own archived copies that still hold
+  the record. The sim has a new device read such an object with the writer
+  offline and must resolve a Restore; every other device goes offline too,
+  except, under device storage, those holding a device-held segment of the
+  object (the redactor's own segment included), since no archive covers it.
+  Any puncture of the writer's own key tree (a redaction or a draft key)
+  re-archives every group touching the punctured cells, aligned to the
+  cell size, so no group's key ever depends on a cell its writer has
+  deleted; the rebuilt groups list those cells as holes.
+  A replica may lose bytes underneath a persisted engine view: until-run
+  and evicting storage drop them, a user or the OS clears the cache, a
+  backup restores replicas from another moment than the engine state, a
+  disk-full cleanup removes files. The engine never waits on a fetch it
+  has not issued: a view read that finds a record missing reports the
+  range it wanted and the handle asks the replicator for it; the text
+  history asks for the exact record it failed to read when the replica
+  lacks its bytes (a record held back only until a later signature
+  arrives is the catch-up's to wait for, not a fetch); a follower whose
+  segment turns out to be trimmed asks for the prefix it lacks, which the
+  replicator serves from the archive; a waiter whose view reported nothing
+  asks for the newest gap of the segment it waits on, from the gap's start
+  (a record boundary) forward (at most 64 KiB, the
+  same on-demand read a view makes, so the storage mode still decides what
+  is kept). The sim forgets every remote
+  segment of an object on a reader, restarts it with the writer offline,
+  and requires the same view afterwards (conversations, texts and maps),
+  and does the same for a segment held on devices below its base with the
+  writer online.
+  A fetch never repeats the same short window: a forward parse whose first
+  record runs past the fetched bytes asks again up to that record's end, a
+  backward parse whose last record starts before them asks again from that
+  record's start, and an archive read that ends inside a record doubles its
+  window. What to fetch is one rule everywhere: the first run of a range that
+  the replica neither holds nor has in flight (a read or a peer pull); a
+  want is fetched run by run, a want across a trimmed base sends its part
+  below the base to the archive and only such runs above it to the relay,
+  and a full follower resumes where the held suffix from the base ends.
+  A requested offset the replicator cannot prove is a boundary
+  (a have edge, zero or the relay length) is only a claim: a parse from or
+  to a claim that meets a malformed or unverifiable record drops the claim
+  and keeps nothing, and is not counted as relay misbehaviour, so a view's
+  guessed window cannot turn a mid-record offset into a have edge. The sim
+  shrinks the tail and fetch window to 1 to 5 KiB on a third of its seeds,
+  so records and archive groups larger than the window take every path,
+  and fails a run in which a node receives more than four times the
+  distinct bytes it kept of a stream per connection plus 256 KiB.
+  Map groups collect: a Put whose every field is matched or beaten (by
+  register order) by a later Put of the same key in the same group becomes
+  a length-only `Gone` entry, a run of them ends with the chain head after
+  it (`Gone_Head`), and it materializes as a redacted placeholder. Sets and
+  counters stay whole. Collection is per group, so redacting the
+  superseding record rebuilds that group and the earlier value returns from
+  the writer's journal; a Restore copies `Gone` entries verbatim. The sim
+  rereads every trimmed prefix of every object through its archive and
+  requires identical views (maps of every kind included), and compares
+  every archive-materialized range on every node, internal maps included,
+  with the writer's ciphertext.
 - **Relay write amplification.** The usage counter is written once per
   group commit, not per append; the feed is folded when it exceeds twice its
   last folded size (64 KiB floor); and the relay's pack rolls its active
@@ -3164,9 +3300,10 @@ Client to relay:
 
 - `Trim` (0x16, 40, feature bit 1): `segment, base:u64`. Owner only. Raises
   `base` once an archive covers `[0, base)`, frees the stored prefix and
-  marks the base as a trim; `base` must stay below the length, a lower or
-  equal base changes nothing, and `Fill` below a trim stores nothing. Reply
-  `Noted` once durable; no feed entry.
+  marks the base as a trim; `base` must stay below the length, a lower base
+  or a repeated trim changes nothing, a base equal to a device-held base
+  only marks it as a trim (followers get `Trimmed`), and `Fill` below a trim
+  stores nothing. Reply `Noted` once durable; no feed entry.
 
 Relay to client:
 

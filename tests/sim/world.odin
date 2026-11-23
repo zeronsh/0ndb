@@ -186,6 +186,9 @@ Config :: struct {
 	durability:  eng.Durability,
 	promote:     i64,
 	persist_fault: bool,
+	archive_min: i64,
+	archive_group: int,
+	tail_window: i64,
 }
 
 World :: struct {
@@ -216,6 +219,7 @@ World :: struct {
 	ctx:       runtime.Context,
 	aborted:   bool,
 	cipher:    Cipher_Watch,
+	fetches:   map[Fetch_Key]^Fetch_Acct,
 	mem_checks: u64,
 	quarantines: [dynamic]Quarantine,
 	promos:    [dynamic]Promo_Rec,

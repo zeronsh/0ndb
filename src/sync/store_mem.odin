@@ -366,6 +366,7 @@ _mem_append_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: r
 _mem_fill_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawptr, err: Error) {
 	m := cast(^Mem_Store)data
 	st := cast(^Mem_Stream)s
+	assert(!st.trimmed, "fill below a trimmed base")
 	if at < 0 || total <= 0 || at + total != st.base {
 		return nil, .Conflict
 	}
@@ -608,6 +609,8 @@ _mem_run :: proc(m: ^Mem_Store, j: Mem_Job) {
 			st.base = j.to
 			st.trimmed = true
 			st.space.usage = max(st.space.usage - value, 0)
+		} else if j.to == st.base && j.to > 0 {
+			st.trimmed = true
 		}
 		_mem_log(m, {kind = .Trim, space = st.space.id, id = cast([32]u8)st.id, at = j.to, length = value, result = result})
 	case .Drop:

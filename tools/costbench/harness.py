@@ -9,6 +9,7 @@ BIN_LEASE = os.environ.get("ONDB_BIN_LEASE", os.path.join(REPO, "bin", "0ndb-lea
 PACKLIVE = os.environ.get("COST_PACKLIVE", os.path.join(REPO, "bin", "packlive"))
 OUT = os.environ.get("COST_OUT", os.path.join(tempfile.gettempdir(), "costbench"))
 TRANSCRIPT = os.environ.get("COST_TRANSCRIPT", "")
+SETTLE = float(os.environ.get("COST_SETTLE", "5"))
 LIMIT = ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
 
 
@@ -157,6 +158,8 @@ class Relay:
         row = dict(appends=int(m.group(1)), bytes_in=m.group(2), bytes_out=m.group(3), puts=int(m.group(4)), put_bytes=m.group(5)) if m else {}
         if wrote:
             row["relay_write_bytes"] = wrote
+        w = re.search(r"object-store rewrites (\d+) \(([^)]+)\)", log)
+        row.update(rewrite_puts=int(w.group(1)) if w else 0, rewrite_bytes=w.group(2) if w else "0 B")
         g = re.search(r"object-store reads (\d+) \(([^)]+)\)", log)
         if g:
             row.update(gets=int(g.group(1)), get_bytes=g.group(2))
@@ -319,7 +322,7 @@ def s1_transcript():
         dev.cli("record", "--source", "claude", "--id", mid, "--seq", str(i + 1), "--role", role, "--stdin", stdin=text)
         sm.tick(i + 1)
     dt = time.time() - t0
-    settle(5)
+    settle(SETTLE)
     dev.stop()
     raw = "\n".join(t for _, _, t in msgs).encode()
     per = sum(zstd3(t.encode()) for _, _, t in msgs)
@@ -380,7 +383,7 @@ def s2_rewrites(commit):
         time.sleep(0.25)
         sm.tick(i + 1)
     dt = time.time() - t0
-    settle(8)
+    settle(max(8, SETTLE))
     dev.stop()
     final = b"".join(("\n".join(l) + "\n").encode() for l in files.values())
     extra = dict(rewrites=rewrites, seconds=round(dt, 1), info_final=zstd_size(final), info_history=zstd_size(b"".join(versions)))
@@ -451,7 +454,7 @@ def s3_drafts():
         dev.cli("send", "write me a long answer %d" % i, "--wait", timeout=300)
         sm.tick(i + 1)
     dt = time.time() - t0
-    settle(5)
+    settle(SETTLE)
     dev.stop()
     srv.shutdown()
     content = "\n".join(FakeAnthropic.texts).encode()
@@ -495,7 +498,7 @@ def s4_catalog():
     dt = time.time() - t0
     final_rows = c.call("catalog.list", space=sp, limit=100).get("rows", [])
     c.close()
-    settle(5)
+    settle(SETTLE)
     dev.stop()
     final = (json.dumps(sorted(json.dumps(r, sort_keys=True) for r in final_rows)) + "\n".join(records)).encode()
     return measure(relay, zstd_size(final), dict(steps=steps, objects=len(objs), seconds=round(dt, 1)), sm)
@@ -586,7 +589,36 @@ def _s5_runner():
     return measure(relay, 0, dict(wakes=wakes, mode=mode, lease_s=lease, renewals=renewed, seconds=round(dt, 1), base_pack=base_pack, base_object_bytes=base_obj, base_object_files=base_files), sm)
 
 
-SCENARIOS = {"s1": s1_transcript, "s2a": lambda: s2_rewrites(False), "s2b": lambda: s2_rewrites(True), "s3": s3_drafts, "s4": s4_catalog, "s5": s5_runner}
+def s6_cold_restore():
+    d = scenario_dir("s6_cold_restore")
+    msgs = transcript_messages(TRANSCRIPT, int(os.environ.get("COST_MSGS", "2769")))
+    relay = Relay(d)
+    a = Device(d, "a", relay)
+    a.cli("new", "transcript")
+    for i, (mid, role, text) in enumerate(msgs):
+        a.cli("record", "--source", "claude", "--id", mid, "--seq", str(i + 1), "--role", role, "--stdin", stdin=text)
+    settle(SETTLE)
+    convo = re.search(r'"object":"[0-9a-f]+/([0-9a-f]+)"', a.cli("ls", "--json")).group(1)
+    b = Device(d, "b", None)
+    card = b.cli("join").strip()
+    ticket = a.cli("pair", card).strip().split()[-1]
+    b.cli("join", ticket)
+    obj = convo
+    settle(10)
+    a.stop()
+    t0 = time.time()
+    log = b.cli("log", obj, "-n", str(len(msgs) + 10), "--json", "--timeout", os.environ.get("COST_LOG_TIMEOUT", "600000"), timeout=1800)
+    cold = round(time.time() - t0, 1)
+    ids = re.findall(r'"msg":"([^"]+)"', log) or re.findall(r'"id":"([^"]+)"', log)
+    victim = ids[len(ids) // 10] if ids and os.environ.get("COST_REDACT", "1") != "0" else None
+    if victim:
+        b.cli("redact", obj, victim)
+    settle(max(10, SETTLE))
+    b.stop()
+    raw = "\n".join(t for _, _, t in msgs).encode()
+    return measure(relay, zstd_size(raw), dict(messages=len(msgs), cold_read_seconds=cold, cold_log_bytes=len(log), cold_ids=len(ids), redacted=victim))
+
+SCENARIOS = {"s1": s1_transcript, "s2a": lambda: s2_rewrites(False), "s2b": lambda: s2_rewrites(True), "s3": s3_drafts, "s4": s4_catalog, "s5": s5_runner, "s6": s6_cold_restore, "s6n": s6_cold_restore}
 
 if __name__ == "__main__":
     names = sys.argv[1:] or list(SCENARIOS)

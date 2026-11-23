@@ -218,6 +218,10 @@ Config :: struct {
 	always_on:       bool,
 	holder_budget:   i64,
 	history_fault:   fs.Persist_Fault,
+	archive_min:     i64,
+	archive_group:   int,
+	archive_level:   int,
+	tail_window:     i64,
 	user:            rawptr,
 }
 
@@ -262,6 +266,8 @@ Stats :: struct {
 	fetched_bytes:  u64,
 	remote_skipped:  u64,
 	remote_rewrites: u64,
+	restores_written: u64,
+	restores_read:    u64,
 	git_fetches:     u64,
 	git_objects:     u64,
 	over_budget:     u64,
@@ -324,6 +330,7 @@ Engine :: struct {
 	handles:      map[prim.Id]^Handle,
 	lru:          [dynamic]^Handle,
 	own_trees:    map[osync.Stream_Id]^Own_Tree,
+	own_live:     map[prim.Id]int,
 	leave_ready:  [dynamic]prim.Id,
 	refused_stop: [dynamic]prim.Id,
 	drain_wait:   [dynamic]prim.Id,
@@ -421,6 +428,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.handles = make(map[prim.Id]^Handle, e.allocator)
 	e.lru = make([dynamic]^Handle, e.allocator)
 	e.own_trees = make(map[osync.Stream_Id]^Own_Tree, e.allocator)
+	e.own_live = make(map[prim.Id]int, e.allocator)
 	e.leave_ready = make([dynamic]prim.Id, e.allocator)
 	e.refused_stop = make([dynamic]prim.Id, e.allocator)
 	e.drain_wait = make([dynamic]prim.Id, e.allocator)
@@ -548,6 +556,10 @@ stats :: proc(e: ^Engine) -> Stats {
 	s.subs = len(e.subs)
 	for _, sp in e.spaces {
 		s.fetched_bytes += sp.repl.fetched_bytes
+		if sp.repl_on {
+			s.restores_written += sp.repl.restores_written
+			s.restores_read += sp.repl.restores_read
+		}
 	}
 	return s
 }
@@ -1063,6 +1075,7 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.handles)
 	delete(e.lru)
 	delete(e.own_trees)
+	delete(e.own_live)
 	delete(e.leave_ready)
 	delete(e.refused_stop)
 	delete(e.drain_wait)

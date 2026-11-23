@@ -286,7 +286,7 @@ _fs_trim :: proc(data: rawptr, s: rawptr, base: i64, done: Storage_Done, ctx: ra
 		done(ctx, .Conflict, 0)
 		return
 	}
-	if base <= st.base {
+	if base < st.base || (base == st.base && (st.trimmed || base == 0)) {
 		done(ctx, .None, 0)
 		return
 	}
@@ -490,6 +490,7 @@ _fs_append_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: ra
 _fs_fill_begin :: proc(data: rawptr, s: rawptr, at: i64, total: i64) -> (w: rawptr, err: Error) {
 	fs := cast(^File_Store)data
 	st := cast(^_Fstream)s
+	assert(!st.trimmed, "fill below a trimmed base")
 	if at < 0 || total <= 0 || at + total != st.base {
 		return nil, .Conflict
 	}
