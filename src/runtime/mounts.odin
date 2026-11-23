@@ -440,12 +440,14 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 				commit = c
 			}
 		}
-		if target == nil {
-			cur, found, verr := fs.history_line(h, conv, context.temp_allocator)
-			if verr != .None {
-				return .Io
-			}
-			target = cur if found else fs.mount_synced(m)
+		cur, found, verr := fs.history_line(h, conv, context.temp_allocator)
+		if verr != .None {
+			return .Io
+		}
+		if found {
+			target = cur
+		} else if target == nil {
+			target = fs.mount_synced(m)
 		}
 		run_line := line_name(mb.run_line)
 		existing, has_run, _ := fs.history_line(h, run_line, context.temp_allocator)

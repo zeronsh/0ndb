@@ -17,7 +17,12 @@ Undo_Pending :: struct {
 }
 
 undo_hooks_install :: proc(r: ^Runtime) {
-	eng.undo_hooks_set(r.e, eng.Undo_Hooks{data = r, hold = _undo_hold, mounts = _undo_mounts, release = _undo_release, checkouts = _undo_checkouts})
+	eng.undo_hooks_set(r.e, eng.Undo_Hooks{data = r, hold = _undo_hold, mounts = _undo_mounts, release = _undo_release, checkouts = _undo_checkouts, pending = _undo_pending_hook})
+}
+
+@(private)
+_undo_pending_hook :: proc(data: rawptr, e: ^eng.Engine, conv: Object, undo: prim.Id) {
+	_undo_track((^Runtime)(data), conv, undo, .Pending)
 }
 
 runtime_undo :: proc(r: ^Runtime, o: Object, msg: Rid) -> (undo: prim.Id, err: eng.Error) {

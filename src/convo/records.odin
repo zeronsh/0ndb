@@ -261,6 +261,7 @@ Undo_Line :: struct {
 	line:   string,
 	base:   []u8,
 	actors: []prim.Id,
+	park:   []u8,
 }
 
 Undo :: struct {
@@ -269,6 +270,9 @@ Undo :: struct {
 	redo:  prim.Id,
 	phase: Undo_Phase,
 	set:   []Undo_Line,
+	cause: Move_Cause,
+	from:  Ref,
+	to:    Ref,
 }
 
 Undone_Leaf :: struct {
@@ -693,8 +697,12 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 			for a in l.actors {
 				obj.tw_id(&lw, 4, a)
 			}
+			obj.tw_bytes(&lw, 5, l.park)
 			_nested(w, 5, lb[:])
 		}
+		obj.tw_uv(w, 6, u64(v.cause))
+		obj.tw_ref(w, 7, off, v.from)
+		obj.tw_ref(w, 8, off, v.to)
 	case Undone:
 		obj.tw_id(w, 1, v.undo)
 		obj.tw_ref(w, 2, off, v.msg)
@@ -1411,11 +1419,19 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 						l.base = obj.dec_bytes(&ld)
 					case 4:
 						append(&actors, obj.dec_id(&ld))
+					case 5:
+						l.park = obj.dec_bytes(&ld)
 					}
 				}
 				d.bad ||= !obj.dec_ok(&ld)
 				l.actors = actors[:]
 				append(&set, l)
+			case 6:
+				v.cause = Move_Cause(obj.dec_enum(&d, 0, u8(max(Move_Cause))))
+			case 7:
+				v.from = obj.dec_ref(&d)
+			case 8:
+				v.to = obj.dec_ref(&d)
 			}
 		}
 		v.set = set[:]

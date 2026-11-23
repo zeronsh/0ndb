@@ -75,6 +75,15 @@ Undo_Phase :: enum u8 {
 	Released = 8,
 }
 
+Move_Cause :: enum u8 {
+	Undo       = 0,
+	Redo       = 1,
+	Switch     = 2,
+	Edit       = 3,
+	Regenerate = 4,
+	Rebase     = 5,
+}
+
 Notice_Kind :: enum u8 {
 	Rewrote  = 1,
 	Removed  = 2,

@@ -302,7 +302,7 @@ _mount_touched :: proc(e: ^Engine, mt: ^Mounted) {
 	if h.w_open && _own_len(h) > h.published {
 		_handle_mark(h)
 	}
-	if h.hist != nil && fs.history_durable_mark(h.hist) > h.hist.durable {
+	if h.hist != nil && fs.history_durable_mark(h.hist) > h.hist.durable || len(e.move_waits) > 0 {
 		_touch(e)
 	}
 }
@@ -378,6 +378,18 @@ _mounts_wake :: proc(e: ^Engine, object: prim.Id) {
 	for mt in e.plug.mounts {
 		if mt.object.id == object {
 			fs.mount_schedule(&mt.mount, fs.mount_coalesce_ms(&mt.mount))
+		}
+	}
+}
+
+@(private)
+_mounts_wake_now :: proc(e: ^Engine, object: prim.Id) {
+	if !e.plug.reg_on {
+		return
+	}
+	for mt in e.plug.mounts {
+		if mt.object.id == object {
+			fs.mount_schedule(&mt.mount, 0)
 		}
 	}
 }
