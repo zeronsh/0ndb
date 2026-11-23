@@ -3137,7 +3137,10 @@ Relay cost tracks the reachable information, not the activity. Items marked
   `length`. Feed compaction keeps the hollow flag. A full follower of a
   based segment resumes from the end of the stored suffix it holds, not
   from its contiguous prefix (which stops at the base), so a reconnect
-  never re-reads the suffix. A base a reader knows only from the feed is
+  never re-reads the suffix, and wants the prefix below the base it does
+  not hold (from the archive under a trim, from peers otherwise): no full
+  follower sits with a gap below its base that nothing asks for. A base a
+  reader knows only from the feed is
   confirmed with one relay read of the range before it pulls that range
   from peers: a device-held base can later become a trim, and the relay's
   `Trimmed` answer sends the range to the archive instead.
