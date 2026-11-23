@@ -428,6 +428,9 @@ _read_range :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
 		if !merged {
 			append(&rm.wants, journal.Range{lo, hi})
 		}
+		if gap, missing := journal.replica_missing(&rm.rep, lo, hi); missing {
+			_fetch_gap(r, rm, gap)
+		}
 	}
 	if to > rm.base {
 		client_read(&r.client, rm.id, max(from, rm.base), to)
