@@ -76,8 +76,10 @@ _fs_job_finish :: proc(e: ^Engine, fj: ^Fs_Job) {
 
 @(private)
 Mounted :: struct {
-	object: Object,
-	mount:  fs.Mount,
+	object:  Object,
+	mount:   fs.Mount,
+	pending: bool,
+	durable: Mount_Done,
 }
 
 Boot_Source :: struct {
@@ -193,18 +195,26 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 	return &e.plug.reg, .None
 }
 
-tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT) -> (m: ^fs.Mount, err: Error) {
+tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT, durable: Mount_Done = {}) -> (m: ^fs.Mount, err: Error) {
 	context = context_for(e)
 	reg := registry(e) or_return
 	hist := tree_history(e, o) or_return
-	defer if err != .None {
+	defer if m == nil {
 		tree_release(e, o)
 	}
 	db := device_odb(e) or_return
 	mid := _mount_id(o.id, root)
 	hx := prim.id_hex(mid)
-	state := _join(context.temp_allocator, e.dir, "worktrees", string(hx[:])) or_return
-	_perr(prim.mkdir_all(e.base, state, 0o700)) or_return
+	trees := _join(context.temp_allocator, e.dir, "worktrees") or_return
+	state := _join(context.temp_allocator, trees, string(hx[:])) or_return
+	if !prim.is_dir(e.base, state) {
+		new_trees := !prim.is_dir(e.base, trees)
+		_perr(prim.mkdir_all(e.base, state, 0o700)) or_return
+		if new_trees {
+			_perr(prim.sync_dir(e.base, e.dir)) or_return
+		}
+		_perr(prim.sync_dir(e.base, trees)) or_return
+	}
 	mt := new(Mounted, e.allocator)
 	mt.object = o
 	mo := opts
@@ -214,13 +224,40 @@ tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT
 		return nil, _ferr(merr)
 	}
 	append(&e.plug.mounts, mt)
+	if o.id in e.reg.staged {
+		mt.pending = true
+		mt.durable = durable
+		return &mt.mount, .Pending
+	}
 	return &mt.mount, .None
+}
+
+@(private)
+_mounts_durable :: proc(e: ^Engine) {
+	for mt in e.plug.mounts {
+		if mt.pending && mt.object.id not_in e.reg.staged {
+			_mount_settled(e, mt, .None)
+		}
+	}
+}
+
+@(private)
+_mount_settled :: proc(e: ^Engine, mt: ^Mounted, err: Error) {
+	mt.pending = false
+	d := mt.durable
+	mt.durable = {}
+	if d.call != nil {
+		d.call(d.data, e, &mt.mount, err)
+	}
 }
 
 tree_unmount :: proc(e: ^Engine, m: ^fs.Mount) {
 	context = context_for(e)
 	for mt, i in e.plug.mounts {
 		if &mt.mount == m {
+			if mt.pending {
+				_mount_settled(e, mt, .Closed)
+			}
 			fs.mount_close(&mt.mount)
 			tree_release(e, mt.object)
 			ordered_remove(&e.plug.mounts, i)
@@ -384,6 +421,9 @@ _plugs_close :: proc(e: ^Engine) {
 		}
 		delete(e.plug.jobs)
 		for mt in e.plug.mounts {
+			if mt.pending {
+				_mount_settled(e, mt, .Closed)
+			}
 			fs.mount_close(&mt.mount)
 			free(mt, e.allocator)
 		}
