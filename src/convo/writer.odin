@@ -586,7 +586,7 @@ writer_undo :: proc(w: ^Writer, id: prim.Id, msg: Rid, phase: Undo_Phase, set: [
 	if id == {} || obj.rid_none(msg) || u8(phase) < 1 || phase > max(Undo_Phase) {
 		return 0, .Invalid
 	}
-	if phase != .Staged && len(set) > 0 {
+	if phase != .Fenced && len(set) > 0 {
 		return 0, .Invalid
 	}
 	_prepare(w, false) or_return

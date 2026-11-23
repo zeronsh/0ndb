@@ -85,10 +85,7 @@ Worktree :: struct {
 }
 
 line_name :: proc(id: prim.Id, allocator := context.temp_allocator) -> string {
-	if prim.id_is_zero(id) {
-		return "main"
-	}
-	return concat("l/", hex(id, allocator))
+	return eng.convo_line_key(id, allocator)
 }
 
 version_encode :: proc(v: []crdt.Op_Id, branch: string, commit: string, allocator := context.temp_allocator) -> []u8 {
