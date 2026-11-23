@@ -205,6 +205,7 @@ Space_Watch :: struct {
 	catalog:   eng.Sub_Id,
 	schedules: eng.Sub_Id,
 	runners:   eng.Sub_Id,
+	deferred:  bool,
 }
 
 @(private)
@@ -580,10 +581,12 @@ attach :: proc(r: ^Runtime, space: prim.Id) -> Error {
 	if rerr == .None {
 		sw.runners = rid
 	}
+	if r.cfg.runner && !_catalog_readable(r, space) {
+		sw.deferred = true
+	}
 	append(&r.spaces, sw)
-	if r.cfg.runner {
-		_advertise(r, space, r.cfg.capacity)
-		_recover(r, space)
+	if r.cfg.runner && !sw.deferred {
+		_attach_runner(r, space)
 	}
 	_pending_scan(r, space)
 	if len(map_rows(r, state_object(r, space), transmute([]u8)string("trig/"), 1)) > 0 {
@@ -817,6 +820,47 @@ _wait_drop :: proc(r: ^Runtime, ready: eng.Ready) {
 }
 
 @(private)
+_attach_runner :: proc(r: ^Runtime, space: prim.Id) {
+	_advertise(r, space, r.cfg.capacity)
+	_recover(r, space)
+}
+
+@(private)
+_catalog_readable :: proc(r: ^Runtime, space: prim.Id) -> bool {
+	cur: eng.Map_Cursor
+	defer delete(cur.key)
+	_, _, err := eng.catalog_list(r.e, space, false, &cur, 1, context.temp_allocator)
+	if err != .Corrupt && err != .Busy {
+		return true
+	}
+	ready := _wait_ready(r, eng.space_catalog(r.e, space))
+	clear(&cur.key)
+	cur.valid = false
+	_, _, werr := eng.catalog_list(r.e, space, false, &cur, 1, context.temp_allocator, ready)
+	if werr == .Pending {
+		return false
+	}
+	_wait_drop(r, ready)
+	return true
+}
+
+@(private)
+_attach_resume :: proc(r: ^Runtime, space: prim.Id) -> bool {
+	for &sw in r.spaces {
+		if sw.space != space || !sw.deferred {
+			continue
+		}
+		if !_catalog_readable(r, space) {
+			return true
+		}
+		sw.deferred = false
+		_attach_runner(r, space)
+		return true
+	}
+	return false
+}
+
+@(private)
 _on_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
 	context = eng.context_for((^Eval_Wait)(data).r.e)
 	w := (^Eval_Wait)(data)
@@ -829,6 +873,9 @@ _on_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
 		}
 	}
 	free(w, r.allocator)
+	if o == eng.space_catalog(r.e, o.space) && _attach_resume(r, o.space) {
+		return
+	}
 	if err == .None {
 		_queue_eval(r, o)
 	}

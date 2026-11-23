@@ -501,6 +501,9 @@ _recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 		defer reader_close(&r)
 		end = _scan_end(&r, end) or_return
 		if end < size && end < keep_at_least {
+			if j.damage.call != nil {
+				j.damage.call(j.damage.data, end)
+			}
 			return .Corrupt
 		}
 	}
