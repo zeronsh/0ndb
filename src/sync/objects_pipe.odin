@@ -31,7 +31,7 @@ replicator_get_object_from :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tre
 			append(&j.holders, h)
 		}
 	}
-	if o, has := r.objs.owners[j.key]; has && o.op == .Get && o.piping && o.p_tag == 0 {
+	if o, has := r.objs.owners[j.key]; has && o.op == .Get && o.piping && o.p_tag == 0 && o.dest == j.dest {
 		_pipe_merge(o, j)
 		_obj_free(r, j)
 		clear(&o.refused)
