@@ -65,6 +65,10 @@ Tier_Store :: struct {
 	rewrites:   map[string]^Tier_Rewrite,
 	evictions:  u64,
 	thaws:      u64,
+	parked:     [dynamic]^Tier_Thaw,
+	park_timer: prim.Timer,
+	park_ms:    i64,
+	parks:      u64,
 	allocator: runtime.Allocator,
 }
 
@@ -181,6 +185,7 @@ tier_store_init :: proc(t: ^Tier_Store, l: ^prim.Loop, inner: Relay_Storage, cfg
 	t.spaces = make(map[Space_Id]^Tier_Space, allocator)
 	t.blocks = make(map[Tier_Block_Key]^Tier_Fetch, allocator)
 	t.rewrites = make(map[string]^Tier_Rewrite, allocator)
+	t.parked = make([dynamic]^Tier_Thaw, allocator)
 	return .None
 }
 
@@ -188,6 +193,14 @@ tier_store_destroy :: proc(t: ^Tier_Store) {
 	if t.timer != 0 {
 		prim.timer_cancel(t.loop, t.timer)
 	}
+	if t.park_timer != 0 {
+		prim.timer_cancel(t.loop, t.park_timer)
+	}
+	for th in t.parked {
+		free(th.job, t.allocator)
+		free(th, t.allocator)
+	}
+	delete(t.parked)
 	for _, sp in t.spaces {
 		_tier_space_free(t, sp)
 	}
@@ -1279,6 +1292,9 @@ _tier_put_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	_tier_arm(t)
 	if sp.bytes >= t.cfg.max_bytes {
 		_tier_flush(sp)
+	}
+	if result == .None {
+		_tier_unpark(t)
 	}
 }
 
