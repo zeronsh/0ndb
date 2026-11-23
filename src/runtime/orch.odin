@@ -253,10 +253,24 @@ _orch_spawn :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value, 
 		}
 	}
 	parent := obj.Xref{object = caller.id}
+	provider := jstr(v, "provider")
+	model := jstr(v, "model")
+	from := a
 	if run := run_find(r, caller); run != nil {
 		parent.rid = run.reply
+		from = &run.ai
 	}
-	child, cerr := eng.convo_create(r.e, caller.space, eng.Convo_Settings{title = title, agent = agent_id, workspace = ws, parent = parent, provider = jstr(v, "provider"), model = jstr(v, "model")})
+	if len(provider) == 0 && prim.id_is_zero(agent_id) && !_ws_runs(r, caller.space, ws) && len(r.cfg.default_provider) == 0 {
+		if from == nil || len(from.provider) == 0 {
+			reply_done(r, rep, "the task has nothing to run on: pass an agent or a provider (the calling conversation has neither)", "", true)
+			return
+		}
+		provider = from.provider
+		if len(model) == 0 {
+			model = from.model
+		}
+	}
+	child, cerr := eng.convo_create(r.e, caller.space, eng.Convo_Settings{title = title, agent = agent_id, workspace = ws, parent = parent, provider = provider, model = model})
 	if cerr != .None {
 		reply_done(r, rep, "the task could not be created", "", true)
 		return
@@ -345,6 +359,15 @@ _orch_spawn :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, v: json.Value, 
 	jw_kstr(&b, "status", "queued")
 	append(&b, '}')
 	reply_done(r, rep, concat("spawned task ", hex(child.id)), string(b[:]), false)
+}
+
+@(private)
+_ws_runs :: proc(r: ^Runtime, space, ws: prim.Id) -> bool {
+	if prim.id_is_zero(ws) {
+		return false
+	}
+	w, err := eng.workspace_get(r.e, Object{space, ws}, context.temp_allocator)
+	return err == .None && (len(w.provider) > 0 || !prim.id_is_zero(w.agent))
 }
 
 @(private)
