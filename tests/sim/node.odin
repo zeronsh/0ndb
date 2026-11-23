@@ -753,6 +753,10 @@ _on_checkpoint :: proc(data: rawptr, e: ^eng.Engine, object: eng.Object, stage: 
 
 _persist_fail :: proc(data: rawptr) -> bool {
 	n := (^Node)(data)
+	if n.persist_outage {
+		stat_add(n.w, STAT_PERSIST_FAULTS)
+		return true
+	}
 	if n.persist_fail <= 0 {
 		return false
 	}

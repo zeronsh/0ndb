@@ -81,6 +81,7 @@ Node :: struct {
 	connect_fault: Connect_Fault,
 	persist_fail: int,
 	ckpt_window: proc(n: ^Node, e: ^eng.Engine, object: eng.Object, stage: eng.Checkpoint_Stage),
+	persist_outage: bool,
 	unavailable: int,
 	incarnation: int,
 	inst:        Instance,
