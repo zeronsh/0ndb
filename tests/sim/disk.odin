@@ -134,6 +134,7 @@ Disk :: struct {
 	reg_crashes: u64,
 	force_ghost: bool,
 	ghost_root:  string,
+	full:        bool,
 	fail_unlink: string,
 	lose_shrinks: bool,
 	dead:      bool,
@@ -398,6 +399,10 @@ _inject_fd :: proc(d: ^Disk, fd: prim.Fd, space: bool) -> prim.Error {
 
 @(private = "file")
 _inject :: proc(d: ^Disk, space: bool) -> prim.Error {
+	if d.full && space && d.probe == 0 && !d.quiet {
+		d.stats.injected += 1
+		return .No_Space
+	}
 	if d.fail_rate == 0 || !d.failing || d.probe > 0 {
 		return .None
 	}
