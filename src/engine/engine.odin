@@ -393,6 +393,7 @@ Engine :: struct {
 	dlog:         dl.Log,
 	dlog_open:    bool,
 	dlog_path:    string,
+	dlog_due:     map[u64]bool,
 	plug:         Plug_State,
 	undo_hooks:   Undo_Hooks,
 	pages:        Page_Heap,
