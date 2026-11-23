@@ -1205,6 +1205,7 @@ _d_rmdir :: proc(data: rawptr, path: string) -> prim.Error {
 	ino := _unlink_entry(d, dir, lk.name)
 	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0, gone = ino})
 	_maybe_orphan(d, ino)
+	_event(d, path)
 	return .None
 }
 
