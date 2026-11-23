@@ -527,11 +527,18 @@ equal in both directions.
   close-after-write), a dirty file whose last event is that close is
   settled: it schedules a pass at once and is never deferred as young, so a
   saved file reaches the tree without waiting out the delay; any later event
-  on the path makes it unsettled again until its next close. This holds
-  only while the mount has no open scope: a run keeps its turn scope open,
-  and a tool scope may still claim a write made since the provider's
-  previous line, so while any scope is open a closed file waits out the
-  delay like any other. A rename onto an existing name (the target's inode
+  on the path makes it unsettled again until its next close. Without a close
+  event (macOS, Windows) a watch event runs a pass at once; a file the pass
+  finds younger than the delay is rechecked after a short quiet delay
+  (`quiet_ms`) and ingested as soon as its size and mtime are unchanged
+  between two checks, so it is deferred only while it is still being
+  written. Both hold only while the mount has no open scope: a run keeps
+  its turn scope open, and a tool scope may still claim a write made since
+  the provider's previous line, so while any scope is open a young file
+  waits out the delay whether or not it was closed. The cost is that while
+  a run is open, a person's saves in its mounts take the full settle delay
+  too, because a tool's write can only be claimed before it is ingested. A
+  rename onto an existing name (the target's inode
   number becomes the one a removed path had) is a content change of the
   replaced file plus a remove of the source, never a move: the runs of the
   new content that a line diff against the source's current text keeps
