@@ -1035,6 +1035,7 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 		}
 	}
 	_peer_note(e, b, batch.actor)
+	_pend_seen_by(e, b, ff)
 	if acked {
 		_pend_ack(e, b, seen)
 	} else if len(b.pend) > 0 {
@@ -1459,6 +1460,21 @@ _pend_add :: proc(e: ^Engine, b: ^Buffer, actor: prim.Id, lo, hi: u64, ops: []cr
 _pend_ack :: proc(e: ^Engine, b: ^Buffer, seen: u64) {
 	n := 0
 	for n < len(b.pend) && b.pend[n].hi < seen {
+		_ops_release(e, &b.pend[n].ops)
+		n += 1
+	}
+	if n > 0 {
+		remove_range(&b.pend, 0, n)
+	}
+}
+
+@(private)
+_pend_seen_by :: proc(e: ^Engine, b: ^Buffer, ff: []crdt.Op_Id) {
+	if len(ff) == 0 {
+		return
+	}
+	n := 0
+	for n < len(b.pend) && fs.history_contains(b.hist, ff, crdt.Op_Id{b.pend[n].actor, b.pend[n].hi}) {
 		_ops_release(e, &b.pend[n].ops)
 		n += 1
 	}
