@@ -78,7 +78,9 @@ client_pull :: proc(c: ^Client, holder: Device_Id, tag: u64, id: Stream_Id, from
 	put_id(&w, cast([32]u8)id)
 	prim.write_u64le(&w, u64(max(from, 0)))
 	prim.write_u64le(&w, u64(max(to, from, 0)))
-	return frame_end(b, start, &w)
+	frame_end(b, start, &w) or_return
+	_await_add(c, _pull_key(holder, tag), 1, .Pull)
+	return .None
 }
 
 client_serve_reserve :: proc(c: ^Client, requester: Device_Id, tag: u64, id: Stream_Id, at: i64, n: int) -> (dst: []u8, err: Error) {

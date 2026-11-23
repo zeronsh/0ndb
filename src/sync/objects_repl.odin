@@ -286,6 +286,7 @@ _obj_finish :: proc(r: ^Replicator, j: ^Obj_Job, kind: Repl_Event_Kind, err: Err
 	_obj_unmap(&r.objs.forgets, j)
 	r.objs.flying -= len(j.flying)
 	if j.p_tag != 0 {
+		client_pull_end(&r.client, j.p_holder, j.p_tag)
 		delete_key(&r.objs.pulls, j.p_tag)
 		j.p_tag = 0
 	}
