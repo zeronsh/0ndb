@@ -31,7 +31,42 @@ replicator_get_object_from :: proc(r: ^Replicator, scope: ^Scope, tree: ^Key_Tre
 			append(&j.holders, h)
 		}
 	}
+	if o, has := r.objs.owners[j.key]; has && o.op == .Get && o.piping && o.p_tag == 0 {
+		_pipe_merge(o, j)
+		_obj_free(r, j)
+		clear(&o.refused)
+		o.p_unavail = false
+		_pipe_pull(r, o)
+		_repl_flush(r)
+		return .None
+	}
 	return _obj_add(r, j)
+}
+
+@(private)
+_pipe_merge :: proc(o: ^Obj_Job, j: ^Obj_Job) {
+	outer: for h in j.holders {
+		for x in o.holders {
+			if x == h {
+				continue outer
+			}
+		}
+		append(&o.holders, h)
+	}
+}
+
+@(private)
+_pipe_absorb :: proc(r: ^Replicator, o: ^Obj_Job) {
+	for i := 0; i < len(r.objs.jobs); {
+		c := r.objs.jobs[i]
+		if c == o || c.key != o.key || c.op != .Get || c.sent || _obj_owns(r, c) {
+			i += 1
+			continue
+		}
+		_pipe_merge(o, c)
+		ordered_remove(&r.objs.jobs, i)
+		_obj_free(r, c)
+	}
 }
 
 replicator_object_holders :: proc(r: ^Replicator, scope: ^Scope, oid: []u8, holders: []Device_Id) {
@@ -121,6 +156,10 @@ _pipe_pull :: proc(r: ^Replicator, j: ^Obj_Job) {
 		return
 	}
 	holder, ok := _pipe_holder(r, j)
+	if !ok {
+		_pipe_absorb(r, j)
+		holder, ok = _pipe_holder(r, j)
+	}
 	if !ok {
 		if !j.p_unavail {
 			j.p_unavail = true
