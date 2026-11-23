@@ -297,8 +297,6 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 			delete(v, e.allocator)
 			delete_key(&e.reg.staged, oid)
 		}
-		delete_key(&e.reg.hold, oid)
-		delete_key(&e.reg.early, oid)
 		if v, ok := e.reg.kstaged[oid]; ok {
 			crypto.zero_explicit(raw_data(v), len(v))
 			delete(v, e.allocator)

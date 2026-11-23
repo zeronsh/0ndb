@@ -1092,7 +1092,7 @@ _owned_add :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
 			return
 		}
 	}
-	append(&e.reg.owned, Owned_Pend{key = k, kind = kind, seq = e.batch_seq + 1})
+	append(&e.reg.owned, Owned_Pend{key = k, kind = kind})
 	_touch(e)
 }
 

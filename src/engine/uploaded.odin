@@ -131,3 +131,49 @@ verify_uploaded :: proc(e: ^Engine, allocator := context.allocator) -> (notes: [
 	}
 	return res, .None
 }
+
+Unmarked_Own :: struct {
+	space:   prim.Id,
+	object:  prim.Id,
+	kind:    Kind,
+	durable: i64,
+}
+
+own_unmarked :: proc(e: ^Engine, allocator := context.allocator) -> (out: []Unmarked_Own, err: Error) {
+	context = context_for(e)
+	res := make([dynamic]Unmarked_Own, allocator)
+	objects := _reg_collect(e, ROOT_OBJECTS) or_return
+	for &f in objects {
+		if f.klen != 16 {
+			continue
+		}
+		rec, derr := _rec_decode(f.value, context.temp_allocator)
+		if derr != .None || rec.own {
+			continue
+		}
+		#partial switch rec.kind {
+		case .Conversation, .Map, .Text, .File_Tree:
+		case:
+			continue
+		}
+		sp, ok := e.spaces[rec.space]
+		if !ok || !sp.open || !sp.repl_on || sp.keyless {
+			continue
+		}
+		id: prim.Id
+		copy(id[:], f.key[:16])
+		if id == sp.catalog {
+			continue
+		}
+		path := _own_stream_path(e, id, rec.kind) or_return
+		if !prim.exists(e.vfs, path) {
+			continue
+		}
+		durable, perr := pack.durable_size(&e.pk, path)
+		if perr != .None || durable == 0 {
+			continue
+		}
+		append(&res, Unmarked_Own{sp.id, id, rec.kind, durable})
+	}
+	return res[:], .None
+}

@@ -192,18 +192,6 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 			_handle_add_member(h, m.device, m.keys_epoch)
 		}
 	}
-	if (!found || !rec.own) && (kind == .Conversation || kind == .Map) && !sp.keyless {
-		path := _seg_path(e, o.id) or_return
-		if prim.exists(e.vfs, path) {
-			if !found {
-				rec = Obj_Rec{space = o.space, kind = kind, members = make([dynamic]Member, context.temp_allocator)}
-			}
-			rec.own = true
-			_rec_put(e, o.id, &rec) or_return
-			h.own = true
-			_handle_open_own(h) or_return
-		}
-	}
 	if o.id != sp.catalog {
 		_catalog_members(e, h)
 	}
@@ -433,6 +421,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	if h.own_tree != nil {
 		_pending_set(e, h.sp.id, h.id, 0)
 	}
+	_registry_flush(e) or_return
 	_handle_mark(h)
 	if h.id != h.sp.catalog {
 		_catalog_participant(e, h.sp, h.id, h.kind)
