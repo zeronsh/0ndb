@@ -1,7 +1,6 @@
 package sim
 
 import "core:strings"
-import "../../src/crdt"
 import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/prim"
@@ -19,16 +18,6 @@ _agent_held_init :: proc "contextless" () {
 	STAT_HELD_THIRD = register_stat(52, 1, "third")
 	STAT_HELD_REVERT = register_stat(52, 2, "revert")
 	STAT_HELD_POWER = register_stat(52, 3, "power")
-}
-
-@(private = "file")
-_heads :: proc(n: ^Node, o: eng.Object) -> []crdt.Op_Id {
-	hist, err := eng.tree_history(&n.e, o)
-	if err != .None {
-		return nil
-	}
-	defer eng.tree_release(&n.e, o)
-	return crdt.graph_version_ids(&hist.g, hist.g.heads[:], context.temp_allocator)
 }
 
 @(private = "file")
@@ -141,7 +130,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	op_done(pop, eng.pending_seq(&n.e), .None)
-	before := _heads(n, o)
+	before := _line_heads(sm.m)
 	rop := new_op(m, .Disk_Agent, n, sm.oi)
 	rop.path = strings.clone(name, w.allocator)
 	rop.actor = ractor
@@ -181,7 +170,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 		stat_add(w, STAT_HELD_THIRD)
 		_still(w, n, abs, next, "a third writer's write")
 	case 1:
-		after := _heads(n, o)
+		after := _line_heads(sm.m)
 		rerr := fs.mount_revert(sm.m, fs.Version(before), fs.Version(after), ractor)
 		if n.disk.dead {
 			node_crashed(n)
