@@ -468,7 +468,12 @@ equal in both directions.
   only for the scan. In a git checkout the index is read once: entries whose
   stat matches take the index oid (the file text is then referenced from
   git's objects, never copied or hashed), and the cache-tree extension
-  supplies tree oids for clean directories.
+  supplies tree oids for clean directories. On Windows a pass after git
+  wrote the work tree trusts the index the same way: a changed file whose
+  stat matches its index entry (the same racy rule) is read from git's
+  objects, never opened. The first open of a file another process just wrote
+  pays the on-access scan, about 6 ms there, while a packed object store is
+  one open; elsewhere reading the file is cheaper than inflating the blob.
 - **Watching**: Linux shares one inotify instance across all mounts;
   fanotify (`FAN_REPORT_DFID_NAME`, `FAN_MODIFY`, with the writing pid) is
   used when permitted, which lets ingestion credit each write to the process
