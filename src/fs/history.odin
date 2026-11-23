@@ -3084,12 +3084,68 @@ REC_ACTOR :: fshist.REC_ACTOR
 
 @(private)
 apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
-	a, ok := fshist.decode_actor_record(body, device)
+	a, owner, ok := fshist.decode_actor_record(body, device)
 	if !ok {
 		return .None
 	}
 	d := device
-	return kv_put(&h.kv, fshist.actor_key(a), d[:])
+	kv_put(&h.kv, fshist.actor_key(a), d[:]) or_return
+	if owner == {} {
+		return .None
+	}
+	list, _ := kv_get(&h.kv, fshist.owned_key(owner), context.temp_allocator) or_return
+	for i := 0; i + 16 <= len(list); i += 16 {
+		id: prim.Id
+		copy(id[:], list[i:][:16])
+		if id == a {
+			return .None
+		}
+	}
+	lb := make([dynamic]u8, 0, len(list) + 16, context.temp_allocator)
+	append(&lb, ..list)
+	x := a
+	append(&lb, ..x[:])
+	return kv_put(&h.kv, fshist.owned_key(owner), lb[:])
+}
+
+history_register_owned_actor :: proc(h: ^History, actor, pseudo, owner: prim.Id) -> Error {
+	if owner == {} {
+		return history_register_actor(h, actor, pseudo)
+	}
+	if _, known := history_actor_owner(h, actor); known {
+		return .None
+	}
+	if fshist.ingestion_actor(h.self, pseudo) != actor {
+		return .Invalid
+	}
+	clear(&h.io)
+	fshist.encode_owned_actor_record(&h.io, actor, pseudo, owner, h.self)
+	if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
+		return .Io
+	}
+	if journal.journal_commit(&h.journal) != .None {
+		return .Io
+	}
+	h.applied[0] = journal.journal_durable_len(&h.journal)
+	apply_actor_record(h, h.self, h.io[:]) or_return
+	return kv_commit(&h.kv)
+}
+
+history_owned_actors :: proc(h: ^History, owners: []prim.Id, allocator := context.allocator) -> (out: []prim.Id, err: Error) {
+	history_ready(h) or_return
+	list := make([dynamic]prim.Id, allocator)
+	for o in owners {
+		v, found := kv_get(&h.kv, fshist.owned_key(o), context.temp_allocator) or_return
+		if !found {
+			continue
+		}
+		for i := 0; i + 16 <= len(v); i += 16 {
+			id: prim.Id
+			copy(id[:], v[i:][:16])
+			append(&list, id)
+		}
+	}
+	return list[:], .None
 }
 
 history_register_actor :: proc(h: ^History, actor, mount: prim.Id) -> Error {

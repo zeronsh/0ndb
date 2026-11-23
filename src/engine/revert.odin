@@ -3,14 +3,14 @@ package engine
 import "../fs"
 import "../prim"
 
-tree_revert_set :: proc(e: ^Engine, o: Object, base: fs.Version, actors: []prim.Id, line := "", undo: prim.Id = {}) -> (revert: prim.Id, err: Error) {
+tree_revert_set :: proc(e: ^Engine, o: Object, base: fs.Version, actors: []prim.Id, line := "", undo: prim.Id = {}, owner: prim.Id = {}) -> (revert: prim.Id, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
 	at := _tree_at(e, h, line, nil) or_return
 	cur := at.version if !at.head else fs.history_heads(h.hist, context.temp_allocator)
-	r, ferr := fs.history_revert_set(h.hist, at.line, base, cur, actors, undo)
+	r, ferr := fs.history_revert_set(h.hist, at.line, base, cur, actors, undo, owner)
 	if ferr != .None {
 		return {}, _ferr(ferr)
 	}

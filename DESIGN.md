@@ -517,10 +517,14 @@ equal in both directions.
   Changes no scope claims belong to the mount's ingestion
   actor, `blake2b-128("0ndb ingestion actor" || device || mount id)`, never
   to the device's own API writes, so disk changes concurrent with them stay
-  representable. Opening a mount appends one `REC_ACTOR` record (tag 9:
-  kind, actor, mount id) to the device's stream; every replica checks the
-  actor against that stream's device and presents the actor's edits in blame
-  and conflict regions as that device.
+  representable. Opening a mount appends one `REC_ACTOR` record (tag 9: kind
+  1, actor, mount id) to the device's stream; every replica checks the actor
+  against that stream's device and presents the actor's edits in blame and
+  conflict regions as that device. An actor that acts for a conversation (a
+  rewind's, a set revert's) is registered with kind 2: actor, pseudo, owner
+  conversation, device; replicas check the device against the stream and index
+  the actor under its owner (`aw:`), so `history_owned_actors(owners)` lists
+  every such actor of those conversations with no mount ids needed.
 - **Shared writers** (planned): several scopes writing one line in one
   directory (a chat and its shared tasks, two chats) stay separate through
   base frontiers. Drivers record an `Observe` op (opaque, tag `0ndb:observe`
@@ -578,8 +582,8 @@ equal in both directions.
   A rewind (`mount_revert(mount, before, after, owner)`, the primitive under
   rollback and undo) commits as its own actor, one per (mount, line, owner):
   `ingestion_actor(h.self, mount_revert_pseudo(mount, line, owner))`,
-  registered like a line actor the first time it has ops. A rewind on a held
-  path, or one not yet durable, sits in history until it is materialized,
+  registered with its owner (kind 2) the first time it has ops. A rewind on a
+  held path, or one not yet durable, sits in history until it is materialized,
   like a remote change, so the mount's ingestion actor never has an op that
   `synced` lacks and its next batch stays on one chain; the rewind actor's
   next batch includes that actor's last op, taken from the graph. The device
@@ -968,35 +972,38 @@ equal in both directions.
   blob, set by the set reverts unless an outside op set the same field later
   (then the outside value stays and the set's blob is the alternative).
   Restored text is an `Insert_Copy` of the original ops, so blame keeps the
-  original authors. The batch commits under a fresh revert actor and carries
-  an opaque marker (tag 20, version 2: the base version, the actors, the
-  revert conflicts and the undo id, zero outside an undo), so the conflicts
-  are durable with the batch; applying the marker indexes them (`rv:`/`rvl`)
-  and the revert under its undo id (`ru:`), so `tree_undo_revert(tree, undo,
+  original authors. The batch commits under a fresh revert actor,
+  `ingestion_actor(h.self, pseudo)` for a new pseudo id, registered with its
+  owner (kind 2, the undoing conversation, or plain kind 1 outside an undo) so
+  blame presents it as its device; it has exactly one batch. It carries an
+  opaque marker (tag 20, version 2: the base version, the actors, the revert
+  conflicts and the undo id, zero outside an undo), so the conflicts are
+  durable with the batch; applying the marker indexes them (`rv:`/`rvl`) and
+  the revert under its undo id (`ru:`), so `tree_undo_revert(tree, undo,
   line)` finds an undo's revert on a line, and `tree_conflicts` lists them as
-  kind `Revert` (with the revert actor, and the blob for an opaque file) next to
-  concurrent and offered ones: `ours` is the text that stays and `theirs` the
-  alternative. Accepting one (`tree_conflict_accept`) replaces `ours` with an
-  `Insert_Copy` of `theirs`, restores a removed file or sets the blob, and
+  kind `Revert` (with the revert actor, and the blob for an opaque file) next
+  to concurrent and offered ones: `ours` is the text that stays and `theirs`
+  the alternative. Accepting one (`tree_conflict_accept`) replaces `ours` with
+  an `Insert_Copy` of `theirs`, restores a removed file or sets the blob, and
   records `TOP_ACCEPT` naming the revert actor and the conflict's index, so it
   is no longer listed. The batch is committed like an API write and then
   materialized, never through the mount's ingest marks, so recovery never
   takes it for ingested disk content. **Reverting a revert**
-  (`mount_unrevert`) is a set revert of the revert actor from the version
-  just before its batch: with nothing in between it restores the files byte
-  for byte, and the reverted revert's marker is marked so its alternatives
-  are no longer listed. A tree no device mounts is set-reverted through its
-  history (`tree_revert_set(tree, base, actors, line)`, `tree_unrevert`),
-  committed like an API write; a mount is that plus materialization. A land
-  or merge of an isolated task is a line merge, so the ops it brings keep
-  their scope actors. `history_mount_actors(mounts, lines)` returns the
-  ingestion actors of the given mounts (home and per line) from the actor
-  registrations, which are replicated `REC_ACTOR` records in each device's
-  history stream. Mount ids are not device-unique (a fork mount's id derives
-  from its task and name), so every such actor is single-writer through the
-  device in its outer hash, `ingestion_actor(device, mount or pseudo)`, and a
-  device registers only actors derived from itself. The cross-tree notice for
-  a removed file another tree edited comes with undo.
+  (`mount_unrevert`) is a set revert of the revert actor from the version just
+  before its batch: with nothing in between it restores the files byte for
+  byte, and the reverted revert's marker is marked so its alternatives are no
+  longer listed. A tree no device mounts is set-reverted through its history
+  (`tree_revert_set(tree, base, actors, line)`, `tree_unrevert`), committed
+  like an API write; a mount is that plus materialization. A land or merge of
+  an isolated task is a line merge, so the ops it brings keep their scope
+  actors. `history_mount_actors(mounts, lines)` returns the ingestion actors
+  of the given mounts (home and per line) from the actor registrations, which
+  are replicated `REC_ACTOR` records in each device's history stream. Mount
+  ids are not device-unique (a fork mount's id derives from its task and
+  name), so every such actor is single-writer through the device in its outer
+  hash, `ingestion_actor(device, mount or pseudo)`, and a device registers
+  only actors derived from itself. The cross-tree notice for a removed file
+  another tree edited comes with undo.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
 - **Text views**: `history_view_open(inode, version)` gives a caller its own
@@ -1615,17 +1622,19 @@ running on it is a record in it.
   rewinds, driven by one staged record.
   - *The set.* A's task tree is A plus every task its turns spawned,
     transitively (scope → task row → parent chain). Its set is the scope actors
-    of the `Scope` records of every conversation in the tree, the revert actors
-    of earlier undos and redos of the tree (so undoing T' < T after undoing T
-    reverts the first undo's copies and deletions too), and the ingestion
-    actors of its tasks' fork mounts (home and per line). Landed and merged ops
-    keep their scope actors, so a land needs no actor of its own. The set and
-    each (tree, line) base are resolved once, after the hold and the fence (a
-    running turn writes its `Scope` only when it ends), into the `Undo` record
-    of the `Fenced` phase; every device reverts exactly those actors from that
-    base, whatever registrations or records it has received since. Everything
-    else is outside the set and survives: a person's own disk and buffer edits
-    made during T, other trees, git and imports.
+    of the `Scope` records of every conversation in the tree, every actor
+    registered with a conversation of the tree as owner (the revert actors of
+    earlier undos and redos, so undoing T' < T after undoing T reverts the
+    first undo's copies and deletions too, and the rewind actors of turn
+    reverts), and the ingestion actors of its tasks' fork mounts (home and per
+    line). Landed and merged ops keep their scope actors, so a land needs no
+    actor of its own. The set and each (tree, line) base are resolved once,
+    after the hold and the fence (a running turn writes its `Scope` only when
+    it ends), into the `Undo` record of the `Fenced` phase; every device
+    reverts exactly those actors from that base, whatever registrations or
+    records it has received since. Everything else is outside the set and
+    survives: a person's own disk and buffer edits made during T, other trees,
+    git and imports.
   - *Versions and lines.* A send is a fence (every mount of the line ingests
     before the `Msg` is recorded), so T's mount set (the fold of `Msg.files`
     deltas along T's ancestor chain) gives each mounted tree its version

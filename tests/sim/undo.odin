@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem/virtual"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 import "../../src/convo"
@@ -28,6 +29,8 @@ Ur_Ctx :: struct {
 	files:  map[string][dynamic]string,
 	toks:   map[string]Ur_Tok,
 	turn:   int,
+	vstart: [dynamic]fs.Version,
+	vend:   [dynamic]fs.Version,
 	alloc:  runtime.Allocator,
 	hooks:  Ur_Hooks,
 }
@@ -254,6 +257,13 @@ _ur_turn :: proc(c: ^Ur_Ctx, person: bool, create: bool) -> bool {
 		files[0] = convo.File_Delta{mount = "work", tree = c.tree.id, version = _ur_version(c)}
 		node_after(c.n)
 	}
+	{
+		context = instance_context(&c.n.inst)
+		if m := _ur_mount(c); m != nil {
+			append(&c.vstart, slice.clone(fs.mount_synced(m), c.alloc))
+		}
+		node_after(c.n)
+	}
 	user, uok := _ur_msg(c, .User, files)
 	if !uok {
 		return false
@@ -278,6 +288,10 @@ _ur_turn :: proc(c: ^Ur_Ctx, person: bool, create: bool) -> bool {
 	{
 		n := c.n
 		context = instance_context(&n.inst)
+		if m := _ur_mount(c); m != nil {
+			fs.mount_sync(m)
+			append(&c.vend, slice.clone(fs.mount_synced(m), c.alloc))
+		}
 		wr, werr := eng.convo_writer(&n.e, c.conv)
 		if werr == .None {
 			sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
@@ -324,6 +338,8 @@ _ur_setup :: proc(w: ^World, alloc: runtime.Allocator) -> (c: ^Ur_Ctx, ok: bool)
 	c.alloc = alloc
 	c.files = make(map[string][dynamic]string, alloc)
 	c.toks = make(map[string]Ur_Tok, alloc)
+	c.vstart = make([dynamic]fs.Version, alloc)
+	c.vend = make([dynamic]fs.Version, alloc)
 	c.turns = make([dynamic]obj.Rid, alloc)
 	m := &w.model
 	{
@@ -393,6 +409,7 @@ Ur_Plan :: struct {
 	at:     int,
 	person: []bool,
 	create: int,
+	revert: bool,
 }
 
 @(private = "file")
@@ -404,6 +421,7 @@ _ur_plan :: proc(w: ^World, alloc: runtime.Allocator) -> (p: Ur_Plan) {
 		p.person[i] = rng_chance(&w.rng, 1, 3)
 	}
 	p.create = rng_int(&w.rng, p.turns + 1)
+	p.revert = rng_chance(&w.rng, 1, 2)
 	return
 }
 
@@ -420,6 +438,27 @@ _ur_build :: proc(w: ^World, alloc: runtime.Allocator) -> (c: ^Ur_Ctx, p: Ur_Pla
 			world_fail(w, "undo: turn %d failed", i)
 			return
 		}
+	}
+	if p.revert {
+		last := p.turns - 1
+		if last >= len(c.vstart) || last >= len(c.vend) {
+			world_fail(w, "undo: no versions recorded for turn %d", last)
+			return
+		}
+		n := c.n
+		rerr: fs.Error
+		{
+			context = instance_context(&n.inst)
+			m := _ur_mount(c)
+			rerr = fs.mount_revert(m, c.vstart[last], c.vend[last], c.conv.id) if m != nil else .Not_Found
+			node_after(n)
+		}
+		if rerr != .None {
+			world_fail(w, "undo: the turn revert of turn %d failed: %v", last, rerr)
+			return
+		}
+		world_note(w, "undo: reverted turn %d before the undo", last)
+		run_until(w, w.now + 2_000_000_000, true)
 	}
 	return c, p, at_state, true
 }

@@ -145,7 +145,7 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State) -> Error {
 		return _cu_undo_write(e, o, st.id, st.msg, .Fenced, set, st.redo)
 	case .Fenced:
 		for l in st.set {
-			_cu_undo_line(e, o.space, st.id, l) or_return
+			_cu_undo_line(e, o.space, st.id, o.id, l) or_return
 		}
 		_cu_undo_undone(e, o, st, convs) or_return
 		return _cu_undo_write(e, o, st.id, st.msg, .Reverted, nil, st.redo)
@@ -329,12 +329,23 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 			}
 		}
 	}
+	owners := make([dynamic]prim.Id, context.temp_allocator)
+	for c in convs {
+		append(&owners, c.o.id)
+	}
 	for &l in lines {
 		own := make([dynamic]prim.Id, context.temp_allocator)
 		append(&own, ..actors[:])
+		th := _handle_get(e, Object{o.space, l.tree}, .File_Tree) or_return
+		_hist_ready(e, th) or_return
+		oa, oerr := fs.history_owned_actors(th.hist, owners[:], context.temp_allocator)
+		if oerr != .None {
+			return nil, _ferr(oerr)
+		}
+		for a in oa {
+			add(&own, a)
+		}
 		if len(mids) > 0 {
-			th := _handle_get(e, Object{o.space, l.tree}, .File_Tree) or_return
-			_hist_ready(e, th) or_return
 			keys := make([dynamic]string, context.temp_allocator)
 			for x in lines {
 				if x.tree == l.tree {
@@ -375,7 +386,7 @@ _cu_redo_set :: proc(e: ^Engine, o: Object, of: prim.Id) -> (set: []convo.Undo_L
 }
 
 @(private)
-_cu_undo_line :: proc(e: ^Engine, space: prim.Id, undo: prim.Id, l: convo.Undo_Line) -> Error {
+_cu_undo_line :: proc(e: ^Engine, space: prim.Id, undo: prim.Id, owner: prim.Id, l: convo.Undo_Line) -> Error {
 	if len(l.actors) == 0 {
 		return .None
 	}
@@ -387,7 +398,7 @@ _cu_undo_line :: proc(e: ^Engine, space: prim.Id, undo: prim.Id, l: convo.Undo_L
 	if derr != .None {
 		return .Corrupt
 	}
-	_ = tree_revert_set(e, tree, base, l.actors, l.line, undo) or_return
+	_ = tree_revert_set(e, tree, base, l.actors, l.line, undo, owner) or_return
 	return .None
 }
 
