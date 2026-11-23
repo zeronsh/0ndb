@@ -182,7 +182,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 		_still(w, n, abs, next, "a third writer's write")
 	case 1:
 		after := _heads(n, o)
-		rerr := fs.mount_revert(sm.m, fs.Version(before), fs.Version(after))
+		rerr := fs.mount_revert(sm.m, fs.Version(before), fs.Version(after), ractor)
 		if n.disk.dead {
 			node_crashed(n)
 			return
