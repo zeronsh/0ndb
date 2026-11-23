@@ -3,6 +3,7 @@ package engine
 import "base:runtime"
 import "core:crypto"
 import "core:fmt"
+import "../fs"
 import "../journal"
 import "../obj"
 import "../prim"
@@ -939,8 +940,11 @@ _own_write_end :: proc(h: ^Handle) -> i64 {
 	case .Map:
 		return obj.writer_len(&h.mw.core)
 	case .Text, .File_Tree:
-		if h.hist != nil {
+		if h.hist != nil && h.hist.awake {
 			return journal.journal_len(&h.hist.journal)
+		}
+		if h.hist != nil {
+			return fs.history_own_durable(h.hist)
 		}
 	}
 	return 0

@@ -38,7 +38,7 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	context = context_for(e)
 	h := _handle_get(e, o, .Text) or_return
 	_handle_create_writer(h) or_return
-	_hist_catch_up(e, h)
+	_hist_caught_up(e, h) or_return
 	inode, found := _text_inode(h) or_return
 	if !found {
 		return .Missing
@@ -1253,8 +1253,8 @@ _hist_admit_redacted :: proc(e: ^Engine, h: ^Handle, s: ^Seg, off: i64) -> fs.Er
 		return .None
 	case .Found:
 	}
-	if _, err := fs.history_admit(h.hist, s.device, off, synth); err == .Not_Found {
-		return .Not_Found
+	if _, err := fs.history_admit(h.hist, s.device, off, synth); err == .Not_Found || err == .Reloading {
+		return err
 	}
 	return .None
 }
