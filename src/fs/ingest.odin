@@ -2104,6 +2104,7 @@ compare_dir :: proc(p: ^Pass, rel: string) -> Error {
 			break
 		}
 		if de.name == "." || de.name == ".." || name_internal(de.name) {
+			mount_sweep_temp(m, abs, de.name)
 			continue
 		}
 		names[clone_string(de.name, heap) or_else ""] = true
@@ -2276,6 +2277,7 @@ compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
 			break
 		}
 		if de.name == "." || de.name == ".." || name_internal(de.name) {
+			mount_sweep_temp(m, abs, de.name)
 			continue
 		}
 		names[clone_string(de.name, heap) or_else ""] = Listed{kind = de.kind, has_stat = de.has_stat, size = de.size, mtime_ns = de.mtime_ns, ctime_ns = de.ctime_ns, ino = de.ino}

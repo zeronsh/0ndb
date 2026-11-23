@@ -119,6 +119,8 @@ Disk :: struct {
 	dead:      bool,
 	fail_sync: u64,
 	fail_nth:  u64,
+	fail_stick: bool,
+	fail_stuck: bool,
 	fail_root: string,
 	fail_rate: u64,
 	runaway_size: i64,
@@ -310,10 +312,15 @@ _event :: proc(d: ^Disk, path: string, closed := false) {
 
 @(private = "file")
 _inject_path :: proc(d: ^Disk, path: string, space: bool) -> prim.Error {
-	if d.fail_nth > 0 && d.probe == 0 && !d.quiet && len(d.fail_root) > 0 && strings.has_prefix(path, d.fail_root) && (len(path) == len(d.fail_root) || path[len(d.fail_root)] == '/') {
+	under := len(d.fail_root) > 0 && strings.has_prefix(path, d.fail_root) && (len(path) == len(d.fail_root) || path[len(d.fail_root)] == '/')
+	if d.fail_stuck && under && d.probe == 0 && !d.quiet {
+		return .Io
+	}
+	if d.fail_nth > 0 && d.probe == 0 && !d.quiet && under {
 		d.fail_nth -= 1
 		if d.fail_nth == 0 {
 			d.stats.injected += 1
+			d.fail_stuck = d.fail_stick
 			return .Io
 		}
 	}
@@ -1356,6 +1363,8 @@ disk_crash :: proc(d: ^Disk, mode: Crash_Mode, r: ^Rng) {
 	d.crash_at = 0
 	d.fail_sync = 0
 	d.fail_nth = 0
+	d.fail_stick = false
+	d.fail_stuck = false
 	for _, n in d.inodes {
 		n.lock_fd = prim.INVALID_FD
 		n.opens = 0

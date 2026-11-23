@@ -225,6 +225,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	}
 	m.mat = &ms
 	defer m.mat = nil
+	mat_stale_retry(m)
 	for &it in items {
 		if err := materialize_one(m, &it, tl[:]); err != .None {
 			mat_unstage(m, &ms, 0)
@@ -1038,9 +1039,36 @@ mat_sync_one :: proc(m: ^Mount, path: string) -> Error {
 @(private)
 mat_unstage :: proc(m: ^Mount, ms: ^Mat_Sync, from: int) {
 	for st in ms.staged[min(from, len(ms.staged)):] {
-		prim.remove(m.vfs, st.tmp)
+		if err := prim.remove(m.vfs, st.tmp); err != .None && err != .Not_Found {
+			if p, aerr := clone_string(st.tmp, m.allocator); aerr == nil {
+				append(&m.stale_temps, p)
+			}
+		}
 	}
 	clear(&ms.staged)
+}
+
+mount_sweep_temp :: proc(m: ^Mount, dir: string, name: string) {
+	if !m.sweep_temps || !name_our_temp(name) {
+		return
+	}
+	buf: prim.Path_Buf
+	if p, ok := path_join_buf(buf[:], dir, name); ok {
+		prim.remove(m.vfs, p)
+	}
+}
+
+@(private)
+mat_stale_retry :: proc(m: ^Mount) {
+	i := 0
+	for i < len(m.stale_temps) {
+		if err := prim.remove(m.vfs, m.stale_temps[i]); err == .None || err == .Not_Found {
+			delete(m.stale_temps[i], m.allocator)
+			unordered_remove(&m.stale_temps, i)
+			continue
+		}
+		i += 1
+	}
 }
 
 @(private)

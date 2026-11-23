@@ -91,6 +91,18 @@ name_internal :: proc "contextless" (name: string) -> bool {
 	return len(name) >= len(TEMP_PREFIX) && name[:len(TEMP_PREFIX)] == TEMP_PREFIX
 }
 
+name_our_temp :: proc "contextless" (name: string) -> bool {
+	if len(name) <= len(TEMP_PREFIX) || name[:len(TEMP_PREFIX)] != TEMP_PREFIX {
+		return false
+	}
+	for c in name[len(TEMP_PREFIX):] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 path_internal :: proc "contextless" (rel: string) -> bool {
 	start := 0
 	for i in 0 ..= len(rel) {

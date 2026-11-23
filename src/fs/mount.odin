@@ -425,6 +425,8 @@ Mount :: struct {
 	attrs:       ^Attr_Ctx,
 	collided:    [dynamic]string,
 	absent:      [dynamic]string,
+	sweep_temps: bool,
+	stale_temps: [dynamic]string,
 	holds:       [dynamic]Path_Hold,
 	reload_ms:   i64,
 	reload_owed: bool,
@@ -555,6 +557,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.unwatched = make([dynamic]string, allocator)
 	m.collided = make([dynamic]string, allocator)
 	m.absent = make([dynamic]string, allocator)
+	m.stale_temps = make([dynamic]string, allocator)
 	m.holds = make([dynamic]Path_Hold, allocator)
 	m.reshow = make([dynamic]string, allocator)
 	ok := false
@@ -633,7 +636,10 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	save_mount_state(m) or_return
 	mount_git_sources(m) or_return
 	before := mount_jlen(m)
-	if err := mount_open_rest(m, fresh); err != .None {
+	m.sweep_temps = true
+	rerr := mount_open_rest(m, fresh)
+	m.sweep_temps = false
+	if err := rerr; err != .None {
 		if mount_jlen(m) == before {
 			return err
 		}
@@ -813,6 +819,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(c, m.allocator)
 	}
 	delete(m.absent)
+	for t in m.stale_temps {
+		delete(t, m.allocator)
+	}
+	delete(m.stale_temps)
 	for x in m.holds {
 		delete(x.path, m.allocator)
 	}
