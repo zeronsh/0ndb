@@ -332,6 +332,24 @@ _own_journal :: proc(h: ^Handle) -> ^journal.Journal {
 }
 
 @(private)
+_restore_redrive :: proc(e: ^Engine, x: Restore) {
+	sp, ok := e.spaces[x.space]
+	if !ok || !sp.open {
+		return
+	}
+	if sp.repl_on {
+		_pending_republish_one(e, sp, x.object)
+	}
+	rec, found, err := _rec_get(e, x.object)
+	if err != .None || !found || (rec.kind != .Map && rec.kind != .Conversation) {
+		return
+	}
+	if h, herr := _handle_get(e, Object{sp.id, x.object}, rec.kind); herr == .None {
+		_derived_purge(e, h)
+	}
+}
+
+@(private)
 _restores_durable :: proc(e: ^Engine, list: []Restore) {
 	if len(list) > 0 {
 		_catalog_unpark(e)
@@ -343,6 +361,7 @@ _restores_durable :: proc(e: ^Engine, list: []Restore) {
 		if h, ok := e.handles[x.object]; ok {
 			h.damaged = false
 		}
+		_restore_redrive(e, x)
 		_object_changed(e, x.space, x.object, .Data)
 	}
 }

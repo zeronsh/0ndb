@@ -158,6 +158,16 @@ bitrot_settle :: proc(w: ^World) {
 	if found > 0 {
 		run_until(w, w.now + BITROT_SETTLE, true)
 	}
+	if stat_get(&w.stats, STAT_BITROT_FLIPS) == 0 {
+		return
+	}
+	for n in w.nodes {
+		if n.alive && n.e_open && !n.partitioned {
+			context = instance_context(&n.inst)
+			check_derived(n, "bit rot settle")
+			node_after(n)
+		}
+	}
 }
 
 check_bitrot :: proc(w: ^World) {
