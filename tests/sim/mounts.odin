@@ -611,7 +611,7 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 }
 
 _check_ingested :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, wrote: []u8) {
-	if sm.m == nil || n.disk.dead || name in sm.m.dirty {
+	if sm.m == nil || n.disk.dead || name in sm.m.dirty || fs.mount_absent_has(sm.m, name) {
 		return
 	}
 	abs := strings.concatenate({sm.root, "/", name}, context.temp_allocator)

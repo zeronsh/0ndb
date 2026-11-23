@@ -615,7 +615,16 @@ equal in both directions.
   history on the removed inode, credited to the actor, and the path is
   materialized to the merged version (absent, or the new file), so bytes
   the agent only carried over from its base are never recreated under its
-  name. A pinned inode that is live at another path is not used. A pin is
+  name. Only the write whose pin read that inode goes to it: a later change
+  at the path, made while the disk still shows the removed inode because
+  its materialization waits for durability, never falls back to the shadow
+  entry's version and is an edit of the removed inode like any edit
+  concurrent with the remove. It stays in history, credited to its writer,
+  and the path is owed a materialization, so the disk returns to `synced`
+  (absent, or the file recreated there) as soon as it may. Removed means
+  `synced` knows the inode and holds it nowhere; an inode it does not
+  know, holds at another name or holds as a collision loser is not
+  removed. A pinned inode that is live at another path is not used. A pin is
   taken at the version the file's shadow entry names (a held or based write
   that `synced` lacks, otherwise `synced`), and its observation is
   committed on that version, so a later base check finds the actor's own
