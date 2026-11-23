@@ -115,7 +115,7 @@ _sl_run :: proc(w: ^World) {
 			world_fail(w, "serve-leave: mkdir")
 			return
 		}
-		if _, err := eng.tree_mount(&b.e, tree, SL_ROOT); err != .None {
+		if sm, err := eng.tree_mount(&b.e, tree, SL_ROOT); err != .None && !(err == .Pending && sm != nil) {
 			world_fail(w, "serve-leave: n1 tree_mount: %v", err)
 			return
 		}

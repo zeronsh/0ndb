@@ -114,7 +114,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 			world_fail(w, "midway: mkdir")
 			return
 		}
-		if m, err = eng.tree_mount(&a.e, tree, MM_ROOT); err != .None {
+		if m, err = eng.tree_mount(&a.e, tree, MM_ROOT); err != .None && !(err == .Pending && m != nil) {
 			world_fail(w, "midway: tree_mount: %v", err)
 			return
 		}
@@ -306,7 +306,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 			a.reg = reg
 		}
 		err: eng.Error
-		if m, err = eng.tree_mount(&a.e, tree, MM_ROOT); err != .None {
+		if m, err = eng.tree_mount(&a.e, tree, MM_ROOT); err != .None && !(err == .Pending && m != nil) {
 			world_fail(w, "midway: remount after the failed pass at op %d: %v", c.k, err)
 			return
 		}

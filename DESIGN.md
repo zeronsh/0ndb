@@ -625,6 +625,15 @@ equal in both directions.
   observed frontier, and the blake2b-256 of the clean content), so a later
   question such as which turns built on a version containing some ops is
   answered from history alone (`history_observations`).
+- **Mount registration**: `tree_mount` creates the mount's state directory
+  under `worktrees/` with a directory fsync of its parent (and of the data
+  directory when `worktrees/` is new), and the mount state is saved before
+  it returns. It reports success only once the registration survives a power
+  cut: while the tree's own registry record is still staged (a tree created
+  in the same batch) it returns `Pending` with a usable mount, and its
+  `Mount_Done` completes with `None` when that record is flushed, or
+  `Closed` when the mount or the engine closes first. It never blocks the
+  loop for that wait.
 - **Commit protocol**: each batch a mount commits carries one opaque
   mount-mark op (tag 18 plus a random per-mount nonce) and, unless the line
   is held, the mount's line record, in the same journal commit. Import

@@ -232,6 +232,7 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 	}
 	clear(&e.reg.sstaged)
 	clear(&e.reg.kstaged)
+	_mounts_durable(e)
 	return .None
 }
 
