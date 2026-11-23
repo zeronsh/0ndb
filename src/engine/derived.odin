@@ -32,11 +32,8 @@ _own_stream_len :: proc(e: ^Engine, id: prim.Id, kind: Kind) -> (n: i64, err: Er
 	if !prim.exists(e.vfs, path) {
 		return 0, .None
 	}
-	j: journal.Journal
-	_jerr(journal.journal_open(&j, e.vfs, path, {}, e.allocator)) or_return
-	n = journal.journal_durable_len(&j)
-	journal.journal_close(&j)
-	return n, .None
+	pn, perr := journal.journal_peek_len(e.vfs, path)
+	return pn, _jerr(perr)
 }
 
 @(private)
