@@ -3,11 +3,7 @@ package sim
 import "core:fmt"
 import "core:strings"
 import eng "../../src/engine"
-import omap "../../src/map"
 import "../../src/odb"
-
-@(private = "file")
-CU_SERVE_ROOT :: 7
 
 @(private = "file")
 STAT_CU_RUNS: Stat
@@ -15,67 +11,6 @@ STAT_CU_RUNS: Stat
 STAT_CU_REFUSED: Stat
 @(private = "file")
 STAT_CU_DONE: Stat
-
-@(private = "file")
-Cu_Row :: struct {
-	key:   []u8,
-	value: []u8,
-}
-
-@(private = "file")
-_cu_rows :: proc(n: ^Node, oids: []odb.Oid) -> [dynamic]Cu_Row {
-	Acc :: struct {
-		oids: []odb.Oid,
-		rows: [dynamic]Cu_Row,
-	}
-	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
-		a := (^Acc)(data)
-		if len(value) < 50 || value[0] != 1 {
-			return true
-		}
-		k := int(value[49])
-		if (k != 20 && k != 32) || len(value) != 50 + k {
-			return true
-		}
-		oid: odb.Oid
-		copy(oid[:k], value[50:])
-		for o in a.oids {
-			if o == oid {
-				k2 := make([]u8, len(key), context.temp_allocator)
-				copy(k2, key)
-				v2 := make([]u8, len(value), context.temp_allocator)
-				copy(v2, value)
-				append(&a.rows, Cu_Row{k2, v2})
-				break
-			}
-		}
-		return true
-	}
-	a := Acc{oids = oids, rows = make([dynamic]Cu_Row, context.temp_allocator)}
-	prefix := [4]u8{0xff, 's', 'r', 'v'}
-	omap.db_scan(&n.e.reg.db, CU_SERVE_ROOT, prefix[:], prefix[:], &a, visit)
-	return a.rows
-}
-
-@(private = "file")
-_cu_apply :: proc(n: ^Node, rows: []Cu_Row, put: bool) -> bool {
-	t, err := omap.txn_begin(&n.e.reg.db)
-	if err != .None {
-		return false
-	}
-	for r in rows {
-		if put {
-			if omap.txn_put(t, CU_SERVE_ROOT, r.key, r.value) != .None {
-				omap.txn_abort(t)
-				return false
-			}
-		} else if _, derr := omap.txn_delete(t, CU_SERVE_ROOT, r.key); derr != .None {
-			omap.txn_abort(t)
-			return false
-		}
-	}
-	return omap.txn_commit(t) == .None && omap.db_sync(&n.e.reg.db) == .None
-}
 
 @(private = "file")
 _cu_served :: proc(n: ^Node, allocator := context.temp_allocator) -> map[odb.Oid]bool {
@@ -193,26 +128,30 @@ check_content_unserved :: proc(w: ^World) {
 	if len(fresh) == 0 {
 		return
 	}
-	rows: [dynamic]Cu_Row
+	rows := make([dynamic]eng.Serve_Row, w.allocator)
 	{
 		context = instance_context(&h.inst)
-		rows = _cu_rows(h, fresh[:])
-		kept := make([dynamic]Cu_Row, w.allocator)
-		for x in rows {
-			k2 := make([]u8, len(x.key), w.allocator)
-			copy(k2, x.key)
-			v2 := make([]u8, len(x.value), w.allocator)
-			copy(v2, x.value)
-			append(&kept, Cu_Row{k2, v2})
-		}
-		rows = kept
-		if len(rows) == 0 || !_cu_apply(h, rows[:], false) {
+		all, serr := eng.serve_rows(&h.e, context.temp_allocator)
+		if serr != .None {
 			return
 		}
+		for x in all {
+			for f in fresh {
+				if x.oid == f {
+					append(&rows, x)
+					break
+				}
+			}
+		}
+		if len(rows) == 0 {
+			return
+		}
+		eng.serve_withdraw(&h.e, fresh[:])
+		node_after(h)
 		left := _cu_served(h)
 		for f in fresh {
 			if f in left {
-				world_fail(w, "content unserved: removing %s's serve rows did not take (registry root %d moved?)", h.name, CU_SERVE_ROOT)
+				world_fail(w, "content unserved: withdrawing %s's serve rows did not take", h.name)
 				return
 			}
 		}
@@ -248,9 +187,10 @@ check_content_unserved :: proc(w: ^World) {
 	stat_add(w, STAT_CU_REFUSED)
 	{
 		context = instance_context(&h.inst)
-		if !_cu_apply(h, rows[:], true) {
+		if eng.serve_publish(&h.e, o, rows[:]) != .None {
 			return
 		}
+		node_after(h)
 	}
 	for c in h.conns {
 		conn_reset(c, true)
