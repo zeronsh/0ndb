@@ -31,6 +31,8 @@ Inode_Events :: struct {
 	has_in:   bit_set[Revert_Field;u8],
 	out_body: bool,
 	first_in_blob: u64,
+	created:  bool,
+	creator:  crdt.Revert_Class,
 }
 
 @(private)
@@ -131,13 +133,21 @@ mount_revert_set :: proc(m: ^Mount, base: Version, actors: []prim.Id) -> (revert
 	marker := make([dynamic]u8, context.temp_allocator)
 	fshist.encode_revert(&marker, fshist.Revert_Op{base = base, actors = actors, conflicts = conflicts[:]})
 	builder_opaque(&b, marker[:])
-	before := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
-	copy(before, m.synced[:])
-	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
+	batch := crdt.Batch {
+		actor   = b.actor,
+		seq     = b.seq0,
+		lamport = history_lamport_after(h, m.synced[:]),
+		parents = m.synced[:],
+		ops     = b.ops[:],
+	}
+	if _, cerr := history_commit_local(h, &batch, m.line); cerr != .None {
 		return {}, cerr
 	}
-	clear(&m.synced)
-	append(&m.synced, ..before)
+	if history_reloading(h) {
+		m.reload_owed = true
+		mount_reload_retry(m)
+		return revert, .None
+	}
 	if merr := mount_materialize(m); merr != .Reloading {
 		return revert, merr
 	}
@@ -215,7 +225,10 @@ collect_revert_events :: proc(h: ^History, ctx: ^Set_Ctx, events: ^map[fstree.In
 				}
 				if op.content[0] == fshist.TOP_CREATE {
 					_, seq := crdt.graph_op(&h.g, lo)
-					note(events, fstree.Inode_Id{crdt.graph_intern(&h.g, b.actor), seq}, .Exist, class, lamport)
+					ino := fstree.Inode_Id{crdt.graph_intern(&h.g, b.actor), seq}
+					note(events, ino, .Exist, class, lamport)
+					events[ino].created = true
+					events[ino].creator = class
 					continue
 				}
 				decoded, dok := fshist.decode_opaque(op.content, h, proc(data: rawptr, id: crdt.Op_Id) -> fstree.Inode_Id {
@@ -267,15 +280,14 @@ revert_inode :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, ev: ^Inode_
 		builder_tree(b, fstree.Op_Remove{inode = ino})
 		return .None
 	}
-	if pb && !pc {
-		if !last_in(ev, .Exist) {
-			return .None
-		}
+	if !pc && last_in(ev, .Exist) && (pb || (ev.created && ev.creator != .In)) {
 		builder_tree(b, fstree.Op_Restore{inode = ino})
-		if !okc || ic.parent != ib.parent || ic.name != ib.name {
-			builder_tree(b, fstree.Op_Move{inode = ino, parent = ib.parent, name = ib.name})
+		if pb {
+			if !okc || ic.parent != ib.parent || ic.name != ib.name {
+				builder_tree(b, fstree.Op_Move{inode = ino, parent = ib.parent, name = ib.name})
+			}
+			ic = ib
 		}
-		ic = ib
 		okc = true
 	} else if !pc {
 		return .None
@@ -441,25 +453,27 @@ revert_units :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Auth
 			append(units, u)
 			return
 		}
-		start := pos^
-		for k in start ..< start + n {
+		lo := pos^
+		hi := lo + n
+		start := lo
+		for k in lo ..< hi {
 			if k < len(cur) && cur[k] == '\n' {
 				x := u
 				x.pos = start
 				x.len = k + 1 - start
-				x.src = crdt.Op_Id{src.actor, src.seq + u64(start - pos^)}
+				x.src = crdt.Op_Id{src.actor, src.seq + u64(start - lo)}
 				append(units, x)
 				start = k + 1
 			}
 		}
-		if start < pos^ + n {
+		if start < hi {
 			x := u
 			x.pos = start
-			x.len = pos^ + n - start
-			x.src = crdt.Op_Id{src.actor, src.seq + u64(start - pos^)}
+			x.len = hi - start
+			x.src = crdt.Op_Id{src.actor, src.seq + u64(start - lo)}
 			append(units, x)
 		}
-		pos^ += n
+		pos^ = hi
 	}
 	for it in items {
 		if it.lv < 0 {
@@ -542,17 +556,17 @@ revert_regions :: proc(units: [dynamic]Revert_Unit, cur: []u8, ino: fstree.Inode
 		first, _, _, _, ok := history_batch_at(h, u.out_lv)
 		return first if ok else -1
 	}
-	for u, i in units {
-		if batch_of[i] < 0 || region[u.line] {
-			continue
-		}
-		for dir in ([2]int{-1, 1}) {
-			for j := i + dir; j >= 0 && j < len(units) && !units[j].visible; j += dir {
-				t := units[j]
-				if t.ins == .In && .Out in t.del && del_batch(h, t) == batch_of[i] {
-					region[u.line] = true
-				}
+	rewrote := make(map[crdt.Lv]bool, context.temp_allocator)
+	for t in units {
+		if !t.visible && t.ins == .In && .Out in t.del {
+			if b := del_batch(h, t); b >= 0 {
+				rewrote[b] = true
 			}
+		}
+	}
+	for u, i in units {
+		if batch_of[i] >= 0 && batch_of[i] in rewrote {
+			region[u.line] = true
 		}
 	}
 	rewrites := make(map[crdt.Lv]bool, context.temp_allocator)
@@ -608,6 +622,7 @@ revert_regions :: proc(units: [dynamic]Revert_Unit, cur: []u8, ino: fstree.Inode
 }
 
 history_revert_op :: proc(h: ^History, revert: prim.Id, allocator := context.allocator) -> (op: fshist.Revert_Op, err: Error) {
+	history_ready(h) or_return
 	lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{revert, 0})
 	if !ok {
 		return {}, .Not_Found

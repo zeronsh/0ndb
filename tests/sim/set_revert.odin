@@ -31,6 +31,8 @@ Sr_Model :: struct {
 	created:  map[string]Sr_Who,
 	out_body: map[string]bool,
 	removed:  map[string]Sr_Who,
+	tok_file: map[string]string,
+	in_file_at_remove: map[string]string,
 	tok:      int,
 	alloc:    runtime.Allocator,
 }
@@ -57,6 +59,8 @@ _sr_model_init :: proc(md: ^Sr_Model, alloc: runtime.Allocator) {
 	md.created = make(map[string]Sr_Who, alloc)
 	md.out_body = make(map[string]bool, alloc)
 	md.removed = make(map[string]Sr_Who, alloc)
+	md.tok_file = make(map[string]string, alloc)
+	md.in_file_at_remove = make(map[string]string, alloc)
 }
 
 @(private = "file")
@@ -70,6 +74,7 @@ _sr_rebase :: proc(c: ^Sr_Ctx) {
 		for t in lines {
 			append(&l, t)
 			c.model.class[t] = .Base
+			c.model.tok_file[t] = name
 		}
 		c.model.files[name] = l
 	}
@@ -108,6 +113,7 @@ _sr_names :: proc(c: ^Sr_Ctx) -> []string {
 @(private = "file")
 _sr_write :: proc(c: ^Sr_Ctx, who: Sr_Who, name: string, lines: []string, remove := false) -> bool {
 	n := c.n
+	world_note(c.w, "set revert edit by %v: %s %s -> %v", who, "remove" if remove else "write", name, lines)
 	abs := strings.concatenate({SR_ROOT, "/", name}, context.temp_allocator)
 	context = instance_context(&n.inst)
 	defer node_after(n)
@@ -188,13 +194,16 @@ _sr_edit :: proc(c: ^Sr_Ctx, inset: Sr_Who) -> bool {
 		}
 		md.files[name] = lines
 		md.created[name] = cls
+		for t in lines {
+			md.tok_file[t] = name
+		}
 		return _sr_write(c, who, name, lines[:])
 	}
 	name := names[rng_int(r, len(names))]
 	lines := &md.files[name]
 	if cr, ok := md.created[name]; kind == 8 && len(names) > 1 && !(ok && cr == .In && cls == .In) {
 		for t in lines {
-			md.deleted[t] += {cls}
+			md.in_file_at_remove[t] = name
 		}
 		if cls != .In {
 			if cr, ok := md.created[name]; ok && cr == .In {
@@ -229,6 +238,11 @@ _sr_edit :: proc(c: ^Sr_Ctx, inset: Sr_Who) -> bool {
 		at := rng_int(r, len(lines))
 		md.deleted[lines[at]] += {cls}
 		ordered_remove(lines, at)
+	}
+	for t in lines {
+		if _, has := md.tok_file[t]; !has {
+			md.tok_file[t] = name
+		}
 	}
 	return _sr_write(c, who, name, lines[:])
 }
@@ -295,6 +309,12 @@ _sr_check :: proc(c: ^Sr_Ctx, revert: prim.Id, phase: string) {
 	for t, cls in md.class {
 		_, now := present[t]
 		_, before := visible[t]
+		if f, ok := md.in_file_at_remove[t]; ok && !before {
+			if rm, rok := md.removed[f]; rok && rm == .In {
+				before = true
+				visible[t] = f
+			}
+		}
 		d := md.deleted[t]
 		in_file := visible[t] if before else ""
 		gone_file := false
@@ -303,11 +323,19 @@ _sr_check :: proc(c: ^Sr_Ctx, revert: prim.Id, phase: string) {
 				gone_file = true
 			}
 		}
+		file := md.tok_file[t]
+		_, alive := md.files[file]
+		if cr, ok := md.created[file]; ok && cr == .In {
+			alive = false
+		}
+		if rm, ok := md.removed[file]; ok && rm == .In {
+			alive = true
+		}
 		want: bool
 		switch {
 		case cls == .In:
 			want = false
-		case gone_file:
+		case gone_file || !alive:
 			want = false
 		case md.region[t] && before:
 			want = false
@@ -410,6 +438,9 @@ _sr_setup :: proc(w: ^World, alloc: runtime.Allocator) -> (c: Sr_Ctx, ok: bool) 
 			append(&lines, _sr_new_token(&c, .Base))
 		}
 		c.model.files[name] = lines
+		for t in lines {
+			c.model.tok_file[t] = name
+		}
 		_sr_disk_write(c.vfs, strings.concatenate({SR_ROOT, "/", name}, context.temp_allocator), _sr_content(lines[:]))
 	}
 	if err := node_mount(w, n, oi, SR_ROOT); err != .None {
@@ -583,4 +614,152 @@ set_revert_seeds :: proc(t: ^testing.T) {
 	}
 	fmt.eprintf("set_revert: %d seeds, %d failed\n", count, bad)
 	testing.expect(t, bad == 0, fmt.tprintf("set_revert: %d of %d seeds failed", bad, count))
+}
+
+@(private = "file")
+_sr_crash_case :: proc(w: ^World, unrevert: bool, k: u64) -> (pre, post: map[string]string, crashed: bool, ok: bool) {
+	arena := new(virtual.Arena, w.allocator)
+	if virtual.arena_init_growing(arena, 1 << 20) != nil {
+		return
+	}
+	c, sok := _sr_setup(w, virtual.arena_allocator(arena))
+	if !sok {
+		return
+	}
+	base := _sr_synced(&c)
+	steps := 6 + rng_int(&w.rng, 10)
+	for _ in 0 ..< steps {
+		if !_sr_edit(&c, .In) {
+			world_fail(w, "set revert crash: an edit failed")
+			return
+		}
+		run_until(w, w.now + 1_000_000_000, true)
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	_sr_synced(&c)
+	pre = _sr_disk(&c)
+	revert: prim.Id
+	if unrevert {
+		r, rerr := _sr_revert(&c, base, c.actor[.In])
+		if rerr != .None || r == {} {
+			return
+		}
+		revert = r
+		run_until(w, w.now + 2_000_000_000, true)
+		pre = _sr_disk(&c)
+	}
+	n := c.n
+	crashes := w.stats.crashes
+	if k > 0 {
+		n.disk.crash_at = n.disk.stats.ops + k
+	}
+	{
+		context = instance_context(&n.inst)
+		if unrevert {
+			fs.mount_unrevert(c.sm.m, revert)
+		} else {
+			fs.mount_revert_set(c.sm.m, base, []prim.Id{c.actor[.In]})
+		}
+		node_after(n)
+	}
+	run_until(w, w.now + 20_000_000_000, true)
+	n.disk.crash_at = 0
+	crashed = w.stats.crashes > crashes
+	run_until(w, w.now + 20_000_000_000, true)
+	if !n.alive {
+		world_fail(w, "set revert crash: node did not come back")
+		return
+	}
+	post = _sr_disk(&c)
+	return pre, post, crashed, true
+}
+
+@(private = "file")
+_sr_crash_world :: proc(seed: u64) -> ^World {
+	cfg := default_config(seed)
+	cfg.nodes = 1
+	cfg.spaces = 0
+	cfg.ops = 0
+	cfg.crash_rate = 0
+	cfg.fault_rate = 0
+	cfg.io_rate = 0
+	cfg.byzantine = false
+	cfg.bulk = false
+	cfg.mem_max = 1500
+	w := new(World)
+	world_init(w, cfg)
+	return w
+}
+
+@(test)
+set_revert_crash :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	seeds := env_u64("SR_CRASH_SEEDS", 3)
+	points := [2]int{}
+	bad := 0
+	for seed in u64(1) ..= seeds {
+		for unrevert in ([2]bool{false, true}) {
+			rw := _sr_crash_world(seed)
+			_, want, _, rok := _sr_crash_case(rw, unrevert, 0)
+			ref := make(map[string]string, context.allocator)
+			for name, data in want {
+				ref[strings.clone(name)] = strings.clone(data)
+			}
+			ref_failed := len(rw.failures) > 0
+			for f in rw.failures {
+				fmt.eprintf("set_revert_crash seed %d unrevert %v reference: %s\n", seed, unrevert, f)
+			}
+			world_destroy(rw)
+			free(rw)
+			if !rok || ref_failed {
+				bad += 1
+				continue
+			}
+			for k in u64(1) ..= 4000 {
+				w := _sr_crash_world(seed)
+				pre, got, crashed, cok := _sr_crash_case(w, unrevert, k)
+				if cok && !_sr_same(got, pre) && !_sr_same(got, ref) {
+					names := make(map[string]bool, context.temp_allocator)
+					for m in ([3]map[string]string{got, pre, ref}) {
+						for nm in m {
+							names[nm] = true
+						}
+					}
+					for nm in names {
+						g, gh := got[nm]
+						p0, ph := pre[nm]
+						r, rh := ref[nm]
+						if (gh != ph || g != p0) && (gh != rh || g != r) {
+							world_fail(w, "after a crash at disk op %d %s is %q (%v), before %q (%v), after %q (%v)", k, nm, g, gh, p0, ph, r, rh)
+						}
+					}
+				}
+				for f in w.failures {
+					if bad < 30 {
+						fmt.eprintf("set_revert_crash seed %d unrevert %v at disk op %d: %s\n", seed, unrevert, k, f)
+					}
+				}
+				if len(w.failures) > 0 {
+					bad += 1
+				}
+				world_destroy(w)
+				free(w)
+				if !crashed {
+					break
+				}
+				points[1 if unrevert else 0] += 1
+			}
+			for name, data in ref {
+				delete(name)
+				delete(data)
+			}
+			delete(ref)
+		}
+	}
+	fmt.eprintf("set_revert_crash: %d crash points in reverts, %d in reverts of reverts, %d failed\n", points[0], points[1], bad)
+	testing.expect(t, bad == 0, fmt.tprintf("set_revert_crash: %d failures", bad))
 }
