@@ -532,7 +532,14 @@ equal in both directions.
   file is split from it after a crash. A change with no record is therefore
   never an observed agent's, and after a power loss it is the device's
   (`attrib_default_actor` is the one rule for that); an observed entry whose
-  content can no longer be matched is unattributed.
+  content can no longer be matched is unattributed. Several writers can touch
+  one file before a lost history commit (two agents, then the person), so
+  replay keeps each path's ordered steps (actor, content oid) past the image's
+  offset, and the re-detected change is committed step by step: the content of
+  each step as its actor, then the rest by the rule above. Each step is a
+  content diff against the one before, so a writer whose bytes a later step
+  overwrote is credited nothing; a step whose content is missing from the
+  object store stops the chain and the rest is unattributed.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,

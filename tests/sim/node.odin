@@ -197,6 +197,7 @@ _free_partial :: proc(n: ^Node) {
 
 node_kill :: proc(n: ^Node) {
 	n.observed = 0
+	agent_paths_clear(n.w, n)
 	w := n.w
 	context = w.ctx
 	live_kill(n)
