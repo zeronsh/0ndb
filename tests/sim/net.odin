@@ -161,13 +161,20 @@ _r_send :: proc(data: rawptr, bytes: []u8, more: bool) -> (int, osync.Error) {
 		c.relay_blocked = true
 		w.stats.backpressure += 1
 	}
+	out := bytes[:k]
+	if frame_filtering() {
+		out = run_frame_filters(w, c, out)
+	}
 	if w.cfg.byzantine {
-		_byzantine(c, bytes[:k])
+		_byzantine(c, out)
 		return k, .None
 	}
-	c.to_node += k
 	tap_feed(w, c, &c.tap_down, bytes[:k], true)
-	_emit_chunks(c, bytes[:k], .To_Node)
+	if len(out) == 0 {
+		return k, .None
+	}
+	c.to_node += len(out)
+	_emit_chunks(c, out, .To_Node)
 	return k, .None
 }
 
