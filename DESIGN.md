@@ -706,10 +706,20 @@ equal in both directions.
   armed while pending paths are ready, after any edit made to it meanwhile
   is ingested from that version. A pass that fails with structural items
   still to do keeps `synced`, names the target in the entries of the files
-  it already wrote, and is redone from a rescan. A pass whose line version is ahead of `synced`
+  it already wrote, and is redone from a rescan. `synced` equals the disk
+  except for the paths in `absent`, the mount's owed paths: a rolled-forward
+  pass owes every path it left pending, and a pass that keeps `synced` owes
+  the removals, moves and directories it already applied. `absent` is
+  persisted with the image's `synced` it qualifies, so no crash persists one
+  without the other. Ingest never reads an owed path that is missing on disk
+  as a delete, and the next pass that completes drains `absent`. A removal
+  whose unlink fails fails its item, so its entry is never dropped while the
+  file is still on disk. A pass whose line version is ahead of `synced`
   adopts a changed file whose content is its text at the line version (what
   an interrupted materialization wrote before a crash): its entry names that
-  version and nothing is committed. A file whose content is still its
+  version and nothing is committed. A created directory that is a present
+  directory at the line version is adopted the same way, so a directory the
+  pass made before a crash is never ingested as a new one beside the line's. A file whose content is still its
   entry's (a racy entry reread) is not adopted: its entry already describes
   the disk. Leftover temps are internal names and
   never ingested.

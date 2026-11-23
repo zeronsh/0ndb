@@ -1097,6 +1097,18 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		shadow_remove(&m.shadow, c.path) or_return
 		return true, .None
 	}
+	if c.kind == .Create && c.disk == .Dir {
+		if !at_line {
+			return false, .None
+		}
+		info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
+		if ierr != nil || !ok || !info.present || info.kind != .Dir {
+			return false, .None
+		}
+		adopt_version(p, line, ver) or_return
+		shadow_put(&m.shadow, c.path, Entry{inode = ino, kind = .Dir, ver = ver^}) or_return
+		return true, .None
+	}
 	if c.disk != .File || !at_line || (c.kind == .Modify && (c.old.kind != .File || c.old.inode != ino)) {
 		return false, .None
 	}
@@ -1124,16 +1136,24 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 	if want != disk_oid {
 		return false, .None
 	}
-	if ver^ == 0 {
-		ids := make([dynamic]fstree.Op_Id, context.temp_allocator)
-		for id in line {
-			append(&ids, op_inode(h, id))
-		}
-		ver^ = shadow_version_add(&m.shadow, ids[:]) or_return
-	}
+	adopt_version(p, line, ver) or_return
 	e := Entry{inode = ino, kind = .File, stat = c.stat, oid = disk_oid, ver = ver^}
 	shadow_put(&m.shadow, c.path, e) or_return
 	return true, .None
+}
+
+@(private)
+adopt_version :: proc(p: ^Pass, line: Version, ver: ^u32) -> Error {
+	if ver^ != 0 {
+		return .None
+	}
+	m := p.m
+	ids := make([dynamic]fstree.Op_Id, context.temp_allocator)
+	for id in line {
+		append(&ids, op_inode(m.history, id))
+	}
+	ver^ = shadow_version_add(&m.shadow, ids[:]) or_return
+	return .None
 }
 
 @(private)

@@ -427,6 +427,7 @@ Mount :: struct {
 	attrs:       ^Attr_Ctx,
 	collided:    [dynamic]string,
 	absent:      [dynamic]string,
+	absent_set:  map[string]bool,
 	sweep_temps: bool,
 	stale_temps: [dynamic]string,
 	holds:       [dynamic]Path_Hold,
@@ -559,6 +560,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.unwatched = make([dynamic]string, allocator)
 	m.collided = make([dynamic]string, allocator)
 	m.absent = make([dynamic]string, allocator)
+	m.absent_set = make(map[string]bool, allocator)
 	m.stale_temps = make([dynamic]string, allocator)
 	m.holds = make([dynamic]Path_Hold, allocator)
 	m.reshow = make([dynamic]string, allocator)
@@ -822,6 +824,7 @@ mount_close :: proc(m: ^Mount) {
 		delete(c, m.allocator)
 	}
 	delete(m.collided)
+	delete(m.absent_set)
 	for c in m.absent {
 		delete(c, m.allocator)
 	}
@@ -2072,9 +2075,13 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	gen := m.log_gen + 1 if covered && m.log_len > 0 else m.log_gen
 	prim.write_uvarint(&w, gen)
 	owed := make([dynamic]string, context.temp_allocator)
-	append(&owed, ..img.absent[:])
-	for a in m.absent {
-		if !string_in(owed[:], a) {
+	owed_set := make(map[string]bool, context.temp_allocator)
+	for list in ([][]string{img.absent[:], m.absent[:]}) {
+		for a in list {
+			if a in owed_set {
+				continue
+			}
+			owed_set[a] = true
 			append(&owed, a)
 		}
 	}
