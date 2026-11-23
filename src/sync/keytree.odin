@@ -572,6 +572,20 @@ draft_key :: proc(keys: journal.Key_Provider, msg: i64) -> (key: journal.Key, ok
 	return key, true
 }
 
+buffer_live_key :: proc(keys: journal.Key_Provider, off: i64, boot: [16]u8) -> (key: journal.Key, ok: bool) {
+	if keys.key == nil || off < 0 {
+		return
+	}
+	base: journal.Key
+	if !keys.key(keys.data, off, &base) {
+		return
+	}
+	defer crypto.zero_explicit(&base, size_of(base))
+	b := boot
+	_derive(base[:], "0ndb buffer live key", b[:], key[:])
+	return key, true
+}
+
 draft_puncture :: proc(t: ^Key_Tree, msg: i64) -> Error {
 	if msg <= 0 {
 		return .Invalid
