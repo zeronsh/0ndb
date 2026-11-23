@@ -94,6 +94,7 @@ Handle :: struct {
 	table:      omap.Table,
 	table_open: bool,
 	damaged:    bool,
+	apply_failed: bool,
 	local:      bool,
 	grouped:    bool,
 	drafts:     [dynamic]^Draft_View,
@@ -322,11 +323,22 @@ _handle_open_own :: proc(h: ^Handle) -> Error {
 }
 
 @(private)
-_handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, settings: []u8 = nil) -> Error {
+_handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, settings: []u8 = nil) -> (err: Error) {
 	if h.w_open {
 		return .None
 	}
 	e := h.e
+	_reserve(e, CMD_OVERHEAD * 4) or_return
+	_scope_begin(e)
+	defer _scope_end(e)
+	set_own := false
+	defer if err != .None && set_own {
+		if back, bfound, berr := _rec_get(e, h.id); berr == .None && bfound && back.own {
+			back.own = false
+			_rec_put(e, h.id, &back)
+			_registry_flush(e)
+		}
+	}
 	if h.sp.keyless {
 		if a, ok := h.sp.grant_access[h.id]; !ok || .Write not_in a {
 			return .Permission
@@ -362,6 +374,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 			rec.created = h.created
 		}
 		_rec_put(e, h.id, &rec) or_return
+		set_own = true
 	}
 	_registry_flush(e) or_return
 	switch h.kind {
@@ -403,6 +416,7 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	adopted := h.w_open
 	h.w_open = true
 	h.own = true
+	set_own = false
 	if !adopted {
 		h.published = 0
 	}
@@ -423,7 +437,9 @@ _handle_create_writer :: proc(h: ^Handle, convo_settings: convo.Settings = {}, s
 	if h.own_tree != nil {
 		_pending_set(e, h.sp.id, h.id, 0)
 	}
-	_registry_flush(e) or_return
+	if ferr := _registry_flush(e); ferr != .None && !_storage_soft(e, ferr, "an object's registry entry could not be stored: the disk is full or failing; it is retried on the next change") {
+		return ferr
+	}
 	_handle_mark(h)
 	if h.id != h.sp.catalog {
 		_catalog_participant(e, h.sp, h.id, h.kind)
@@ -696,6 +712,11 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 		h.local = true
 		return .Busy
 	}
+	if err == .No_Space || err == .Io {
+		h.local = true
+		_storage_short(e, err, "an object's writes could not be stored: the disk is full or failing; they stay pending and are retried")
+		return err
+	}
 	if err != .None {
 		_fatal(e, err)
 		return err
@@ -719,14 +740,17 @@ _handle_commit :: proc(e: ^Engine, h: ^Handle) -> Error {
 
 @(private)
 _handles_commit :: proc(e: ^Engine) {
+	_scope_begin(e)
 	for h in e.lru {
 		if h.local {
 			h.local = false
-			if _handle_commit(e, h) == .Busy {
+			if err := _handle_commit(e, h); err == .Busy || err == .No_Space || err == .Io {
 				h.local = true
 			}
 		}
 	}
+	_scope_end(e)
+	_reserve_clear(e)
 }
 
 @(private)

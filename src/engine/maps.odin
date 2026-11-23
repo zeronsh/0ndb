@@ -427,7 +427,9 @@ _table_publish :: proc(e: ^Engine, h: ^Handle) {
 		return
 	}
 	if err := omap.db_publish(&h.table.db, e.durable_seq); err != .None && err != .Busy {
-		_fatal(e, _oerr(err))
+		if !_storage_soft(e, _oerr(err), "a map table could not be published: the disk is full or failing; it is rebuilt") {
+			_fatal(e, _oerr(err))
+		}
 	}
 }
 
@@ -471,6 +473,7 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 	for _ in 0 ..< 2 {
 		_oerr(omap.table_prepare(&h.table, sources[:])) or_return
 		missing := false
+		failed := Error.None
 		for s in h.segs {
 			if !s.in_view && !_seg_empty(h, s) {
 				missing = true
@@ -499,8 +502,8 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 				if h.w_open && i == 0 && !omap.table_poisoned(&h.table) {
 					return _oerr(err)
 				}
-				if !_store_err(e, _oerr(err)) {
-					_log(e, .Warn, "map apply failed")
+				if failed == .None {
+					failed = _oerr(err)
 				}
 			}
 		}
@@ -511,6 +514,14 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 		}
 		if !omap.table_poisoned(&h.table) {
 			h.damaged = false
+			if failed != .None {
+				if !h.apply_failed {
+					h.apply_failed = true
+					_log(e, .Warn, "a map's apply of a remote segment failed; the table keeps what it applied and resumes on the next read or change")
+				}
+				return failed
+			}
+			h.apply_failed = false
 			return .Missing if missing else .None
 		}
 	}
@@ -722,6 +733,12 @@ _catalog_flush :: proc(e: ^Engine) {
 			}
 		} else if err == .Permission {
 			e.stats.catalog_refused += 1
+		} else if err == .No_Space || err == .Io {
+			_storage_short(e, err, "a catalog update could not be stored: the disk is full or failing; it is retried")
+			if _, dup := e.catalog_parked[id]; !dup {
+				e.catalog_parked[id] = u
+				continue
+			}
 		} else if err != .None {
 			_fatal(e, err)
 		}

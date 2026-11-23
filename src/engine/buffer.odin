@@ -978,6 +978,15 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	if b == nil {
 		return 0, 0, .Not_Found
 	}
+	need := CMD_OVERHEAD
+	for x in edits {
+		need += i64(len(x.ins)) * 2 + 64
+	}
+	if rerr := _reserve_capped(e, need); rerr != .None {
+		return 0, 0, rerr
+	}
+	_scope_begin(e)
+	defer _scope_end(e)
 	h := _handle_get(e, b.object, b.kind) or_return
 	_buffer_base(e, b, rev) or_return
 	_buffer_view_ready(e, b, h) or_return

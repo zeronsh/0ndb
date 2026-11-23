@@ -13,6 +13,7 @@ OS_VFS_PROCS := Vfs_Procs {
 	fullsync   = _os_fullsync,
 	truncate   = _os_truncate,
 	punch_hole = _os_punch_hole,
+	preallocate = _os_preallocate,
 	lock       = _os_lock,
 	fstat      = _os_fstat,
 	stat       = _os_stat,
@@ -544,6 +545,24 @@ _os_truncate :: proc(data: rawptr, fd: Fd, size: i64) -> Error {
 	}
 	eof := size
 	if !win.SetFileInformationByHandle(_h(fd), win.FILE_INFO_BY_HANDLE_CLASS(FileEndOfFileInfo), &eof, size_of(eof)) {
+		return _last()
+	}
+	return .None
+}
+
+@(private)
+_os_preallocate :: proc(data: rawptr, fd: Fd, off: i64, size: i64) -> Error {
+	h := _h(fd)
+	si: File_Standard_Info
+	if !win.GetFileInformationByHandleEx(h, win.FILE_INFO_BY_HANDLE_CLASS(FileStandardInfo), &si, size_of(si)) {
+		return _last()
+	}
+	want := off + size
+	if si.allocation_size >= want {
+		return .None
+	}
+	alloc := want
+	if !win.SetFileInformationByHandle(h, win.FILE_INFO_BY_HANDLE_CLASS(FileAllocationInfo), &alloc, size_of(alloc)) {
 		return _last()
 	}
 	return .None

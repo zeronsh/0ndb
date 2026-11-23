@@ -97,10 +97,21 @@ table_poisoned :: proc "contextless" (t: ^Table) -> bool {
 
 @(private)
 _fault :: proc(t: ^Table, err: Error) -> Error {
-	if err == .Io || err == .Corrupt || err == .No_Space {
+	#partial switch err {
+	case .Corrupt:
 		t.poisoned = true
+	case .Io, .No_Space:
+		if db_poisoned(&t.db) && _table_reopen(t) != .None {
+			t.poisoned = true
+		}
 	}
 	return err
+}
+
+@(private)
+_table_reopen :: proc(t: ^Table) -> Error {
+	db_close(&t.db)
+	return db_open(&t.db, t.vfs, t.path, t.allocator)
 }
 
 table_reset :: proc(t: ^Table) -> Error {

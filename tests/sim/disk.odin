@@ -45,6 +45,7 @@ Inode :: struct {
 	nlink:    int,
 	lock_fd:  prim.Fd,
 	opens:    int,
+	alloc:    i64,
 }
 
 Meta_Kind :: enum u8 {
@@ -134,6 +135,8 @@ Disk :: struct {
 	reg_crashes: u64,
 	force_ghost: bool,
 	ghost_root:  string,
+	full:        bool,
+	full_cow:    bool,
 	fail_unlink: string,
 	lose_shrinks: bool,
 	dead:      bool,
@@ -170,6 +173,7 @@ DISK_PROCS := prim.Vfs_Procs {
 	fullsync   = _d_sync,
 	truncate   = _d_truncate,
 	punch_hole = _d_punch,
+	preallocate = _d_preallocate,
 	lock       = _d_lock,
 	fstat      = _d_fstat,
 	stat       = _d_stat,
@@ -638,6 +642,9 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 		if len(lk.name) == 0 {
 			return prim.INVALID_FD, .Invalid
 		}
+		if _full_refuses(d, nil, 0) {
+			return prim.INVALID_FD, .No_Space
+		}
 		if ierr := _inject_path(d, path, true); ierr != .None {
 			return prim.INVALID_FD, ierr
 		}
@@ -727,8 +734,50 @@ _d_read_at :: proc(data: rawptr, fd: prim.Fd, buf: []u8, off: i64) -> (int, prim
 DISK_FILE_MAX :: i64(512) << 20
 
 @(private = "file")
+_full_refuses :: proc(d: ^Disk, n: ^Inode, end: i64) -> bool {
+	if !d.full || d.probe > 0 || d.quiet {
+		return false
+	}
+	if !d.full_cow && n != nil && end <= max(i64(len(n.data)), n.alloc) {
+		return false
+	}
+	d.stats.injected += 1
+	return true
+}
+
+@(private = "file")
+_d_preallocate :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> prim.Error {
+	d := (^Disk)(data)
+	if !_enter(d, 7) {
+		return .Io
+	}
+	_, n, err := _fd_get(d, fd)
+	if err != .None {
+		return err
+	}
+	if n.kind != .File {
+		return .Invalid
+	}
+	end := off + size
+	if end <= n.alloc {
+		return .None
+	}
+	if end > DISK_FILE_MAX {
+		return .No_Space
+	}
+	if _full_refuses(d, n, end) {
+		return .No_Space
+	}
+	n.alloc = end
+	return .None
+}
+
+@(private = "file")
 _write :: proc(d: ^Disk, n: ^Inode, src: []u8, off: i64) -> prim.Error {
 	end := off + i64(len(src))
+	if _full_refuses(d, n, end) {
+		return .No_Space
+	}
 	if end > i64(len(n.data)) {
 		if end > DISK_FILE_MAX {
 			_runaway(d, n, end)
@@ -994,6 +1043,9 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	}
 	if d.probe == 0 {
 		d.trace = mix64(d.trace, u64(size))
+	}
+	if size > i64(len(n.data)) && _full_refuses(d, n, size) {
+		return .No_Space
 	}
 	old := len(n.data)
 	if size > DISK_FILE_MAX || resize(&n.data, int(size)) != nil {

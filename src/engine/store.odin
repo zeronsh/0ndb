@@ -96,6 +96,7 @@ _registry_open :: proc(e: ^Engine) -> Error {
 	_registry_migrate(e, path) or_return
 	_oerr(omap.db_open(&e.reg.db, e.base, path, e.allocator)) or_return
 	e.reg.db.lazy = true
+	omap.db_set_headroom(&e.reg.db, REG_HEADROOM, REG_FLOOR)
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.cat_done = make(map[prim.Id]bool, e.allocator)
@@ -187,9 +188,49 @@ _reg_publish_done :: proc(data: rawptr, ok: bool) {
 }
 
 @(private)
+REG_HEADROOM :: i64(4 << 20)
+@(private)
+REG_FLOOR :: i64(1 << 20)
+@(private)
+REG_OP_MAX :: i64(64 << 10)
+
+@(private)
+_storage_short :: proc(e: ^Engine, err: Error, what: string) {
+	if e.storage_short == .None {
+		e.storage_short = err
+		_log(e, .Warn, what)
+	}
+}
+
+@(private)
+_storage_soft :: proc(e: ^Engine, err: Error, what: string) -> bool {
+	if err == .No_Space || err == .Io {
+		_storage_short(e, err, what)
+		return true
+	}
+	return false
+}
+
+@(private)
+_reg_reopen :: proc(e: ^Engine) -> Error {
+	if !omap.db_poisoned(&e.reg.db) {
+		return .None
+	}
+	path := _join(context.temp_allocator, e.dir, "registry") or_return
+	omap.db_close(&e.reg.db)
+	_oerr(omap.db_open(&e.reg.db, e.base, path, e.allocator)) or_return
+	omap.db_set_headroom(&e.reg.db, REG_HEADROOM, REG_FLOOR)
+	return .None
+}
+
+@(private)
 _store_err :: proc(e: ^Engine, err: Error) -> bool {
 	if err == .Io || err == .No_Space {
-		_fatal(e, err)
+		if e.pk_open && e.pk.poisoned || e.reg.open && omap.db_poisoned(&e.reg.db) {
+			_fatal(e, err)
+		} else {
+			_storage_short(e, err, "a write could not be stored: the disk is full or failing; it is retried")
+		}
 		return true
 	}
 	return false
@@ -197,7 +238,14 @@ _store_err :: proc(e: ^Engine, err: Error) -> bool {
 
 @(private)
 _reg_fail :: proc(e: ^Engine, err: Error) {
-	_fatal(e, err if err != .None else .Io)
+	x := err if err != .None else .Io
+	if x == .No_Space || x == .Io {
+		if _reg_reopen(e) == .None {
+			_storage_short(e, x, "a registry write was refused: the disk is full or failing; it is retried on the next change")
+			return
+		}
+	}
+	_fatal(e, x)
 }
 
 @(private)
@@ -509,7 +557,7 @@ _durable_begin :: proc(e: ^Engine) {
 	if err := _registry_flush(e); err != .None {
 		if err == .Busy {
 			_touch(e)
-		} else {
+		} else if err != .No_Space && err != .Io {
 			_fatal(e, err)
 		}
 		return
@@ -553,36 +601,13 @@ _durable_begin :: proc(e: ^Engine) {
 	_batches_late(e)
 	if err != .None {
 		if err == .Would_Block {
-			e.batch_seq -= 1
 			for i := len(e.batches) - 1; i >= 0; i -= 1 {
 				if e.batches[i] == b {
 					ordered_remove(&e.batches, i)
 					break
 				}
 			}
-			for d in e.dirty {
-				append(&b.segs, d)
-			}
-			delete(e.dirty)
-			e.dirty = b.segs
-			for x in e.draft_dirty {
-				append(&b.drafts, x)
-			}
-			delete(e.draft_dirty)
-			e.draft_dirty = b.drafts
-			for x in e.restores {
-				append(&b.restores, x)
-			}
-			delete(e.restores)
-			e.restores = b.restores
-			e.reg.meta ||= b.meta
-			for c in e.card_pubs {
-				append(&b.cards, c)
-			}
-			delete(e.card_pubs)
-			e.card_pubs = b.cards
-			delete(b.marks)
-			free(b, e.allocator)
+			_batch_requeue(e, b)
 			return
 		}
 		_batch_complete(e, b, _perr(err))
@@ -597,10 +622,43 @@ _durable_begin :: proc(e: ^Engine) {
 _pack_step :: proc(e: ^Engine) {
 	more, err := pack.step(&e.pk)
 	if err != .None {
-		_fatal(e, _perr(err))
+		if !_store_err(e, _perr(err)) {
+			_fatal(e, _perr(err))
+		}
+		e.pack_more = false
 		return
 	}
 	e.pack_more = more
+}
+
+@(private)
+_batch_requeue :: proc(e: ^Engine, b: ^Durable_Batch) {
+	if b.seq == e.batch_seq {
+		e.batch_seq -= 1
+	}
+	for d in e.dirty {
+		append(&b.segs, d)
+	}
+	delete(e.dirty)
+	e.dirty = b.segs
+	for x in e.draft_dirty {
+		append(&b.drafts, x)
+	}
+	delete(e.draft_dirty)
+	e.draft_dirty = b.drafts
+	for x in e.restores {
+		append(&b.restores, x)
+	}
+	delete(e.restores)
+	e.restores = b.restores
+	e.reg.meta ||= b.meta
+	for c in e.card_pubs {
+		append(&b.cards, c)
+	}
+	delete(e.card_pubs)
+	e.card_pubs = b.cards
+	delete(b.marks)
+	free(b, e.allocator)
 }
 
 @(private)
@@ -653,10 +711,18 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		return
 	}
 	ordered_remove(&e.batches, idx)
+	if err != .None && _store_err(e, err) && e.fatal == .None {
+		_batch_requeue(e, b)
+		return
+	}
 	if err != .None {
 		_fatal(e, err)
 	} else {
 		e.durable_seq = max(e.durable_seq, b.seq)
+		if e.storage_short != .None {
+			e.storage_short = .None
+			_catalog_unpark(e)
+		}
 		if e.fatal == .None {
 			for _, h in e.handles {
 				_table_publish(e, h)

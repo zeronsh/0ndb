@@ -91,6 +91,7 @@ _relocate :: proc(p: ^Pack, inum: u64, ino: ^Inode, src: Phys, src_bytes: []u8) 
 		_phys_read(p, Phys{cont = e.cont, off = e.coff, len = e.len}, buf[e.off - from:][:e.len]) or_return
 		pos = e.off + e.len
 	}
+	_room(p, REC_HDR + 20 + len(buf)) or_return
 	old := ino^
 	ph := _log_data(p, inum, from, buf) or_return
 	ino.n = 1
@@ -103,6 +104,9 @@ _relocate :: proc(p: ^Pack, inum: u64, ino: ^Inode, src: Phys, src_bytes: []u8) 
 
 @(private)
 _compact_work :: proc(p: ^Pack, budget: i64, all: bool) -> (more: bool, err: Error) {
+	if p.fl_retry {
+		return false, p.fl_err
+	}
 	c := &p.compact
 	if !c.on {
 		id: u32
@@ -254,7 +258,11 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 	if p.fl.on {
 		return !_async(p) || _polled(p), .None
 	}
-	if _mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 || _compact_blocked(p) {
+	if p.fl_retry {
+		_retry(p) or_return
+		return p.fl.on && (!_async(p) || _polled(p)), .None
+	}
+	if !p.space_wait && (_mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 || _compact_blocked(p)) {
 		if _async(p) {
 			_flush_start(p) or_return
 		} else {
