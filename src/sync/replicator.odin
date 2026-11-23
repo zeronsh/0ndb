@@ -214,6 +214,7 @@ Remote :: struct {
 	denied:    bool,
 	want_gen:  u64,
 	probe_gen: u64,
+	probe_n:   int,
 	fresh_gen: u64,
 	held:      i64,
 	pulled:    i64,
@@ -284,6 +285,8 @@ Replicator :: struct {
 	remotes:    map[Stream_Id]^Remote,
 	probes:     map[Stream_Id]^Remote,
 	answers:    map[Stream_Id]i64,
+	marks:      map[Stream_Id]Probe_Mark,
+	mark_seq:   u64,
 	devices:    map[Device_Id]bool,
 	objs:       Objects,
 	uploading:  int,
@@ -408,6 +411,7 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.remotes = make(map[Stream_Id]^Remote, allocator)
 	r.probes = make(map[Stream_Id]^Remote, allocator)
 	r.answers = make(map[Stream_Id]i64, allocator)
+	r.marks = make(map[Stream_Id]Probe_Mark, allocator)
 	r.devices = make(map[Device_Id]bool, allocator)
 	_objs_init(r)
 	r.stage = make([dynamic]u8, allocator)
@@ -450,6 +454,7 @@ replicator_destroy :: proc(r: ^Replicator) {
 	delete(r.remotes)
 	delete(r.probes)
 	delete(r.answers)
+	delete(r.marks)
 	delete(r.devices)
 	delete(r.stage)
 	for _, g in r.groups {
@@ -2066,16 +2071,51 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 }
 
 @(private)
+PROBE_OUTSTANDING :: 4
+
+@(private)
+Probe_Mark :: struct {
+	remote: Stream_Id,
+	gen:    u64,
+}
+
+@(private)
+_probe_marked :: proc(r: ^Replicator, mark: Stream_Id) -> bool {
+	m, ok := r.marks[mark]
+	if !ok {
+		return false
+	}
+	delete_key(&r.marks, mark)
+	if rm, rok := r.remotes[m.remote]; rok && rm.probe_n > 0 {
+		rm.probe_n -= 1
+		rm.probing = rm.probe_n > 0
+		if m.gen > rm.fresh_gen {
+			rm.fresh_gen = m.gen
+		}
+		_remote_settle(r, rm)
+	}
+	return true
+}
+
+@(private)
 _remote_probe :: proc(r: ^Replicator, rm: ^Remote) {
-	if rm.probing || r.phase != .Ready || rm.quarantined {
+	if r.phase != .Ready || rm.quarantined {
 		return
 	}
-	ids: [1 + PROBES]Stream_Id
+	if rm.probing && (rm.probe_gen >= rm.want_gen || rm.probe_n >= PROBE_OUTSTANDING) {
+		return
+	}
+	r.mark_seq += 1
+	mark := reserved_id(PROBE_MARK_TAG, r.mark_seq)
+	ids: [2 + PROBES]Stream_Id
 	ids[0] = rm.id
 	copy(ids[1:], rm.probes[:])
+	ids[1 + PROBES] = mark
 	if client_probe(&r.client, ids[:]) == .None {
 		rm.probing = true
 		rm.probe_gen = rm.want_gen
+		rm.probe_n += 1
+		r.marks[mark] = Probe_Mark{remote = rm.id, gen = rm.want_gen}
 	}
 	_keys_head_watch(r, rm)
 }
@@ -2480,6 +2520,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	switch ev.kind {
 	case .Welcome:
 		clear(&r.answers)
+		clear(&r.marks)
 		r.phase = .Ready
 		if r.tamper_run == 0 {
 			r.backoff = BACKOFF_MIN
@@ -2557,11 +2598,9 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		if Stream_Id(ev.id) == reserved_id(FEED_TAG, 0) {
 			r.feed_target = ev.length
 			_caught_check(r)
+		} else if _probe_marked(r, Stream_Id(ev.id)) {
+			break
 		} else if rm, ok := r.remotes[Stream_Id(ev.id)]; ok {
-			if rm.probing {
-				rm.probing = false
-				rm.fresh_gen = rm.probe_gen
-			}
 			_answer(r, rm.id, ev.length)
 			rm.relay_len = ev.length
 			if ev.length > journal.replica_length(&rm.rep) {
@@ -2664,6 +2703,7 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 	if ok {
 		clear(&rm.inflight)
 		rm.probing = false
+		rm.probe_n = 0
 		rm.pulling = false
 		rm.pulled = _contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
 		if ev.code == .Not_Owner {
@@ -2778,6 +2818,7 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		clear(&rm.carry)
 		rm.pulling = false
 		rm.probing = false
+		rm.probe_n = 0
 		rm.retry_hold = false
 		rm.denied = false
 		rm.pushed = false
