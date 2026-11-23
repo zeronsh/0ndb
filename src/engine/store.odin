@@ -94,6 +94,7 @@ _registry_open :: proc(e: ^Engine) -> Error {
 	path := _join(context.temp_allocator, e.dir, "registry") or_return
 	_registry_migrate(e, path) or_return
 	_oerr(omap.db_open(&e.reg.db, e.base, path, e.allocator)) or_return
+	omap.db_set_headroom(&e.reg.db, REG_HEADROOM, REG_FLOOR)
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.cat_done = make(map[prim.Id]bool, e.allocator)
@@ -129,6 +130,33 @@ _reg_commit :: proc(e: ^Engine, t: ^omap.Txn) -> Error {
 }
 
 @(private)
+REG_HEADROOM :: i64(4 << 20)
+@(private)
+REG_FLOOR :: i64(1 << 20)
+@(private)
+REG_OP_MAX :: i64(64 << 10)
+
+@(private)
+_storage_short :: proc(e: ^Engine, err: Error, what: string) {
+	if e.storage_short == .None {
+		e.storage_short = err
+		_log(e, .Warn, what)
+	}
+}
+
+@(private)
+_reg_reopen :: proc(e: ^Engine) -> Error {
+	if !omap.db_poisoned(&e.reg.db) {
+		return .None
+	}
+	path := _join(context.temp_allocator, e.dir, "registry") or_return
+	omap.db_close(&e.reg.db)
+	_oerr(omap.db_open(&e.reg.db, e.base, path, e.allocator)) or_return
+	omap.db_set_headroom(&e.reg.db, REG_HEADROOM, REG_FLOOR)
+	return .None
+}
+
+@(private)
 _store_err :: proc(e: ^Engine, err: Error) -> bool {
 	if err == .Io || err == .No_Space {
 		_fatal(e, err)
@@ -139,7 +167,14 @@ _store_err :: proc(e: ^Engine, err: Error) -> bool {
 
 @(private)
 _reg_fail :: proc(e: ^Engine, err: Error) {
-	_fatal(e, err if err != .None else .Io)
+	x := err if err != .None else .Io
+	if x == .No_Space || x == .Io {
+		if _reg_reopen(e) == .None {
+			_storage_short(e, x, "a registry write was refused: the disk is full or failing; it is retried on the next change")
+			return
+		}
+	}
+	_fatal(e, x)
 }
 
 @(private)
@@ -449,7 +484,7 @@ _durable_begin :: proc(e: ^Engine) {
 	if err := _registry_flush(e); err != .None {
 		if err == .Busy {
 			_touch(e)
-		} else {
+		} else if err != .No_Space && err != .Io {
 			_fatal(e, err)
 		}
 		return

@@ -405,6 +405,7 @@ Engine :: struct {
 	card_pubs:    [dynamic]Card_Pub,
 	stats:        Stats,
 	fatal:        Error,
+	storage_short: Error,
 }
 
 open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: Error) {

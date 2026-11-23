@@ -264,7 +264,7 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 	if p.fl.on {
 		return !_async(p) || _polled(p), .None
 	}
-	if _mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 || _compact_blocked(p) {
+	if !p.space_wait && (_mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 || _compact_blocked(p)) {
 		if _async(p) {
 			_flush_start(p) or_return
 		} else {
