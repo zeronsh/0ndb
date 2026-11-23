@@ -1193,33 +1193,33 @@ PASS_CHUNK :: 4096
 MOVE_MIN :: 32
 
 @(private)
-catch_up :: proc(m: ^Mount) -> Error {
+catch_up :: proc(m: ^Mount) -> (blocked: bool, err: Error) {
 	h := m.history
 	if h == nil {
-		return .None
+		return false, .None
 	}
 	known := crdt.graph_known(&h.g, m.actor)
 	if known == 0 {
-		return .None
+		return false, .None
 	}
 	latest, ok := crdt.graph_lv(&h.g, crdt.Op_Id{m.actor, known - 1})
 	if !ok {
-		return .None
+		return false, .None
 	}
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
-		return .Corrupt
+		return false, .Corrupt
 	}
 	if crdt.graph_contains(&h.g, sl[:], latest) {
-		return .None
+		return false, .None
 	}
 	if !mount_durable_now(m) {
-		return .None
+		return true, .None
 	}
 	one := [1]crdt.Lv{latest}
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
 	crdt.version_union(&h.g, sl[:], one[:], &both)
-	return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), true)
+	return false, materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), true)
 }
 
 @(private)
@@ -1465,7 +1465,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	if m.history != nil {
 		defer history_trim(m.history)
 	}
-	catch_up(m) or_return
+	if blocked := catch_up(m) or_return; blocked {
+		return .None
+	}
 	if m.has_git {
 		p.head, _ = git_head(m.vfs, m.git, p.long)
 		p.head_moved = !git_head_equal(p.head, m.head)
