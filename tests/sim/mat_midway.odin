@@ -15,6 +15,12 @@ MM_ROOT :: "/work/midway-n0"
 MM_FILES :: [?]string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"}
 
 @(private = "file")
+MM_NEW :: [?]string{"d3/n1.txt", "d3/n2.txt", "d4/n3.txt"}
+
+@(private = "file")
+MM_GONE :: [?]string{"d1/x.txt", "d1/y.txt"}
+
+@(private = "file")
 _mm_write :: proc(vfs: prim.Vfs, path: string, data: string) -> prim.Error {
 	fd := prim.open_file(vfs, path, {.Write, .Create, .Truncate}, 0o644) or_return
 	err := prim.write_at(vfs, fd, transmute([]u8)data, 0)
@@ -31,6 +37,7 @@ Mm_Mode :: enum u8 {
 	Process,
 	Power,
 	Hold,
+	Dirs,
 }
 
 @(private = "file")
@@ -110,6 +117,18 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 				return
 			}
 		}
+		if c.mode == .Dirs {
+			if prim.mkdir_all(vfs, MM_ROOT + "/d1", 0o755) != .None {
+				world_fail(w, "midway: mkdir d1")
+				return
+			}
+			for f in MM_GONE {
+				if _mm_write(vfs, fmt.tprintf("%s/%s", MM_ROOT, f), fmt.tprintf("<o.%s>\n", f)) != .None {
+					world_fail(w, "midway: setup write %s", f)
+					return
+				}
+			}
+		}
 	}
 	run_until(w, w.now + 5_000_000_000, true)
 	typed := make(map[string]string, len(files), w.allocator)
@@ -122,6 +141,22 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			if err := eng.tree_write(&a.e, tree, f, transmute([]u8)fmt.tprintf("<o.%s>\n%s\n", f, tok)); err != .None {
 				world_fail(w, "midway: tree_write %s: %v", f, err)
 				return
+			}
+		}
+		if c.mode == .Dirs {
+			for f in MM_NEW {
+				tok := fmt.aprintf("<t.%s>", f, allocator = w.allocator)
+				typed[f] = tok
+				if err := eng.tree_write(&a.e, tree, f, transmute([]u8)fmt.tprintf("%s\n", tok)); err != .None {
+					world_fail(w, "midway: tree_write %s: %v", f, err)
+					return
+				}
+			}
+			for f in MM_GONE {
+				if err := eng.tree_remove(&a.e, tree, f); err != .None {
+					world_fail(w, "midway: tree_remove %s: %v", f, err)
+					return
+				}
 			}
 		}
 		a.disk.fail_root = MM_ROOT
@@ -239,6 +274,19 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			}
 			if n := strings.count(string(data), tok); n != 1 {
 				world_fail(w, "midway: %s holds %s %d times after a materialize failed at op %d (%v), want once: %q", f, tok, n, c.k, c.mode, string(data))
+			}
+		}
+	}
+	if c.mode == .Dirs {
+		for f in MM_NEW {
+			data, err := eng.tree_read(&a.e, tree, f, context.temp_allocator)
+			if err != .None || strings.count(string(data), typed[f]) != 1 {
+				world_fail(w, "midway: %s reads %q (%v) after a materialize that creates directories failed at op %d, want %s once", f, string(data), err, c.k, typed[f])
+			}
+		}
+		for f in MM_GONE {
+			if _, err := eng.tree_read(&a.e, tree, f, context.temp_allocator); err != .Not_Found {
+				world_fail(w, "midway: %s is still in the tree (%v) after a materialize that removes it failed at op %d", f, err, c.k)
 			}
 		}
 	}
