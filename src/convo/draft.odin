@@ -307,8 +307,8 @@ _draft_commit :: proc(w: ^Writer) -> Error {
 	if !w.draft.open {
 		return .None
 	}
-	if journal.journal_commit(&w.draft.j) != .None {
-		return .Io
+	if jerr := journal.journal_commit(&w.draft.j); jerr != .None {
+		return obj.jerr(jerr)
 	}
 	for &e in w.draft.msgs[:w.draft.n] {
 		if e.retired == 0 && summary_find(&w.sum, e.msg) < 0 {
