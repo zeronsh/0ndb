@@ -2228,8 +2228,11 @@ Relay cost tracks the reachable information, not the activity. Items marked
   selects the reference policy: `auto` (default: everything stored as above),
   `stored` (everything, no deduplication; pool runners), `until_run`
   (conversations, texts and trees device-only until a pool runner is
-  assigned, then promoted) and `device` (strict device-only, for privacy,
-  never promoted). A `Storage_Policy` plug overrides per space and object.
+  assigned, then promoted) and `device` (strict device-only, for privacy:
+  the policy never promotes on its own, but an explicit `object_promote`
+  records `stored`, and in every mode a recorded `stored`, or a pending
+  promotion mark, makes the device upload everything it writes afterwards
+  as stored content). A `Storage_Policy` plug overrides per space and object.
   Maps, keys streams, cards, the feed, presence, the redaction log and the
   membership log are always stored.
 - **Hollow segments.** On the relay a segment has a `base` and a `length`;
