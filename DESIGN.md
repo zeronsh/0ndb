@@ -1073,7 +1073,15 @@ concurrent typing is never lost or reverted.
   its group commit. Once promoted to its own file, a file opened with
   `Group_Visible` (journals, the history's state kv and `lv.idx`) keeps that
   property: its recorded size is authoritative and the first open after a
-  crash cuts the file back to it. A promoted file is created fresh and
+  crash cuts the file back to it. The pack reports this as the
+  `Durable_Size` capability (every byte below the size it reports is
+  committed), as it does for its inline streams, and a journal on such a
+  file never scans for a torn tail: its durable length is the size. Only a
+  journal without it (a plain file) scans forward from its checkpoint
+  sidecar, which is written unsynced and may lag. Scanning a pack journal
+  stopped at the first record that did not verify and truncated there, so a
+  flipped bit in an old record cut every later durable record (seen as an
+  own stream going fatal with no crash). A promoted file is created fresh and
   exclusive, never by truncating a leftover.
 - Durability is batched across objects: every journal written in a loop
   tick is committed with one container fdatasync. `Async` (the C API

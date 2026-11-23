@@ -45,10 +45,16 @@ _v_caps :: proc(data: rawptr, fd: prim.Fd) -> prim.Vfs_Caps {
 	if h == nil {
 		return {}
 	}
-	if h.dir || h.oi.ino.kind == .External {
+	if h.dir {
 		return {.Durable_Dir_Ops_With_Data}
 	}
-	return {.Durable_Dir_Ops_With_Data, .Atomic_Group_Commit}
+	if h.oi.ino.kind == .External {
+		if h.oi.ino.sized {
+			return {.Durable_Dir_Ops_With_Data, .Durable_Size}
+		}
+		return {.Durable_Dir_Ops_With_Data}
+	}
+	return {.Durable_Dir_Ops_With_Data, .Atomic_Group_Commit, .Durable_Size}
 }
 
 vfs :: proc(p: ^Pack) -> prim.Vfs {
