@@ -293,6 +293,16 @@ _rid_in :: proc(e: ^Engine, id: prim.Id, kind: Kind, seg: prim.Id, off: i64) -> 
 }
 
 @(private)
+_index_release :: proc(e: ^Engine) {
+	if len(e.index_held) == 0 {
+		return
+	}
+	append(&e.index_dirty, ..e.index_held[:])
+	clear(&e.index_held)
+	_touch(e)
+}
+
+@(private)
 _index_step :: proc(e: ^Engine) {
 	if len(e.index_dirty) == 0 {
 		return
@@ -314,7 +324,7 @@ _index_step :: proc(e: ^Engine) {
 		h, err := _handle_get(e, Object{it.space, it.object}, it.kind)
 		if err != .None {
 			if err == .Busy {
-				append(&e.index_dirty, it)
+				append(&e.index_held, it)
 			}
 			continue
 		}
@@ -322,7 +332,7 @@ _index_step :: proc(e: ^Engine) {
 		used, more := _scan_object(e, h, budget)
 		budget -= used
 		if (h.kind == .Text || h.kind == .File_Tree) && h.hist != nil && !h.hist.awake {
-			append(&e.index_dirty, it)
+			append(&e.index_held, it)
 			continue
 		}
 		if e.index_busy {
