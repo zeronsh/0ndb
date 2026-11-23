@@ -572,12 +572,15 @@ _ids_eq :: proc(a, b: []crdt.Op_Id) -> bool {
 	if len(a) != len(b) {
 		return false
 	}
-	x := slice.clone(a, context.temp_allocator)
-	y := slice.clone(b, context.temp_allocator)
-	slice.sort_by(x, crdt.op_id_less)
-	slice.sort_by(y, crdt.op_id_less)
-	for i in 0 ..< len(x) {
-		if x[i] != y[i] {
+	for x in a {
+		na, nb := 0, 0
+		for y in a {
+			na += 1 if y == x else 0
+		}
+		for y in b {
+			nb += 1 if y == x else 0
+		}
+		if na != nb {
 			return false
 		}
 	}
@@ -703,6 +706,8 @@ _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 	if e.cfg.buffer_live_off || len(ev.meta) < LIVE_HEADER || ev.meta[0] != LIVE_FRAME_V1 {
 		return
 	}
+	scratch := virtual.arena_temp_begin(&e.temp)
+	defer virtual.arena_temp_end(scratch)
 	dev := osync.stream_device(ev.stream)
 	if dev == e.self {
 		return
@@ -887,6 +892,8 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 
 @(private)
 _buffers_live_drop_device :: proc(e: ^Engine, sp: ^Space, device: prim.Id) {
+	scratch := virtual.arena_temp_begin(&e.temp)
+	defer virtual.arena_temp_end(scratch)
 	list := make([dynamic]^Buffer, context.temp_allocator)
 	for b in e.buffers {
 		if b.object.space != sp.id {
