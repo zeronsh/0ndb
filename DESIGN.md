@@ -812,9 +812,49 @@ equal in both directions.
   only when the listed result changed, so an idle fork costs nothing.
   `task.changes` reads the same view once.
 - **Blame** is a span lookup. **Revert** of a scope creates ops that undo
-  exactly that scope's ops, transformed through everything since; (planned) a
-  set revert does the same for a set of scopes (undo, conversation branch
-  switches) and reverting a revert restores the ops.
+  exactly that scope's ops, transformed through everything since.
+- **Set revert** (`mount_revert_set(mount, base, actors)`) undoes, as one
+  batch on the mount's line, every op after `base` whose actor is in the set,
+  transformed through everything since. Ops carry actors, not scopes: undo
+  resolves a task tree to its scope actors, and every other actor (a person's
+  disk edits, the unattributed and ingestion actors, git and imports, other
+  trees) is outside the set, so its edits survive. Per text file a tracker
+  walk over the ops from the common ancestor of `base` and the line to the
+  line's version yields every item in document order with its insert class
+  (base, in the set, outside it) and the classes of the ops that deleted it.
+  An item the set inserted is deleted; an item the set deleted comes back only
+  if neither an op outside the set nor the base also deleted it. Where an
+  outside edit lies inside text the revert removes (a line holding both an
+  outside insert and a set insert, or an outside batch that deleted text the
+  set inserted and inserted its own line, i.e. a rewrite), the line reverts to
+  its text at `base`: its outside inserts are removed, the base text that
+  rewrite deleted is restored, and the line's pre-revert text is kept as a
+  revert conflict alternative. An outside delete inside set-inserted text
+  disappears with the insert and conflicts with nothing. Tree fields follow
+  the last writer by lamport: a create by the set is removed (a file it
+  created that an outside writer edited is removed too, and its whole
+  pre-revert text, or blob, is the alternative on the removed inode), a remove
+  by the set is restored when the file existed at `base` or was created
+  outside the set, and a move, flags or target change, or an opaque file's
+  blob, set by the set reverts unless an outside op set the same field later
+  (then the outside value stays and the set's blob is the alternative).
+  Restored text is an `Insert_Copy` of the original ops, so blame keeps the
+  original authors. The batch commits under a fresh revert actor and carries
+  an opaque marker (tag 20, version 1: the base version, the actors and the
+  revert conflicts), so the conflicts are durable with the batch; applying the
+  marker indexes them (`rv:`/`rvl`), and `tree_conflicts` lists them with a
+  kind (`Revert_Region`, `Revert_File`, `Revert_Blob`) next to concurrent
+  ones, whose `ours` is the text that stays and `theirs` the alternative, kept
+  by copying `theirs` back. The batch is committed like an API write and then
+  materialized, never through the mount's ingest marks, so recovery never
+  takes it for ingested disk content. **Reverting a revert**
+  (`mount_unrevert`) is a set revert of the revert actor from the version
+  just before its batch: with nothing in between it restores the files byte
+  for byte, and the reverted revert's marker is marked so its alternatives
+  are no longer listed. (planned) Land and merge batches of isolated tasks
+  carry a marker naming their source task, so undo can count them in the
+  task's set; the cross-tree notice for a removed file another tree edited
+  comes with undo.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
 - **Text views**: `history_view_open(inode, version)` gives a caller its own
