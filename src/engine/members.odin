@@ -2,6 +2,7 @@ package engine
 
 import "base:runtime"
 import "core:crypto"
+import "core:fmt"
 import "../journal"
 import "../obj"
 import "../prim"
@@ -1099,4 +1100,31 @@ _members_change_all :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: 
 _clone_str_or_empty :: proc(s: string, allocator: runtime.Allocator) -> string {
 	out, _ := _clone(s, allocator)
 	return out
+}
+
+verify_epochs :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []string, err: Error) {
+	context = context_for(e)
+	out := make([dynamic]string, context.temp_allocator)
+	for _, sp in e.spaces {
+		if !sp.open || sp.mode != .End_To_End {
+			continue
+		}
+		cur, ok := space_epoch_tag(sp)
+		if !ok {
+			continue
+		}
+		for _, rt in sp.remote_trees {
+			tag := _epoch_newest(sp, rt)
+			if tag != cur {
+				sh := prim.id_hex(sp.id)
+				dh := prim.id_hex(rt.device)
+				append(&out, fmt.tprintf("epochs: space %s segment %s of device %s: staleness reads epoch %x as newest, the roster's current is %x", string(sh[24:32]), rt.name, string(dh[24:32]), tag, cur))
+			}
+		}
+	}
+	res := make([]string, len(out), allocator)
+	for x, i in out {
+		res[i] = _clone(x, allocator) or_return
+	}
+	return res, .None
 }
