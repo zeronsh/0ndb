@@ -76,6 +76,10 @@
   real provider CLIs, not committed tests.
 - Nothing per thread or per file stays in memory between events. Idle means
   no wakeups and no armed timers.
+- Every file truncated or replaced in place binds its records to a
+  generation the authoritative state makes durable first, or is rewritten
+  whole, renamed into place and published with a directory fsync. Never
+  trust a truncate's new size or a rename to survive a crash.
 - Streams are single-writer and append-only. A durable record is never
   rewritten or truncated, except that redaction zero-fills it in place. Offsets are identical locally, on the relay and on
   replicas.

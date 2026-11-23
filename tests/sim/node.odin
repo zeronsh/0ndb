@@ -706,6 +706,7 @@ STAT_TIER_THAWS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
 STAT_PERSIST_FAULTS: Stat
+STAT_GHOST_TAILS: Stat
 
 _persist_fail :: proc(data: rawptr) -> bool {
 	n := (^Node)(data)
@@ -729,10 +730,14 @@ _node_stats :: proc "contextless" () {
 		res.stats.extra[int(STAT_TIER_THAWS)] += w.relay.ts.thaws
 		res.stats.extra[int(STAT_TIER_SLOW_READS)] += w.relay.slow.reads
 		res.stats.extra[int(STAT_TIER_FAILED_READS)] += w.relay.slow.failed
+		for n in w.nodes {
+			res.stats.extra[int(STAT_GHOST_TAILS)] += n.disk.stats.ghosts
+		}
 	})
 	register_stat_line(40)
 	register_stat_line(45)
 	STAT_PERSIST_FAULTS = register_stat(45, 0, "history_persist_faults")
+	STAT_GHOST_TAILS = register_stat(45, 1, "ghost_tails")
 	STAT_TIER_EVICTIONS = register_stat(40, 0, "relay_evictions")
 	STAT_TIER_COLD_READS = register_stat(40, 1, "relay_cold_reads")
 	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
