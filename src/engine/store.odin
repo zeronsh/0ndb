@@ -1033,7 +1033,8 @@ _pack_before_commit :: proc(data: rawptr) -> pack.Error {
 			_content_target(e, d.space, d.object, d.length)
 		}
 	}
-	for _, h in e.handles {
+	for id in _sorted_keys(e.handles) {
+		h := e.handles[id]
 		if h.kind != .File_Tree || !h.w_open || h.hist == nil || !h.hist.awake {
 			continue
 		}
