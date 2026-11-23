@@ -49,6 +49,7 @@ run_file_write_begin :: proc(run: ^Run, tool, path: string) {
 		return
 	}
 	fs.scope_write_begin(s, rel)
+	fs.mount_observe_begin(m, rel, s)
 	if run.file_holds == nil {
 		run.file_holds = make([dynamic]File_Hold, run.alloc)
 	}

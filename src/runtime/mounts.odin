@@ -1006,6 +1006,7 @@ _observe_write :: proc(data: rawptr, w: ^observe.Write) {
 	r := (^Runtime)(data)
 	reg, rerr := eng.registry(r.e)
 	if rerr != .None {
+		observe.release(w)
 		return
 	}
 	if !r.router_on {
@@ -1040,9 +1041,9 @@ _observe_write :: proc(data: rawptr, w: ^observe.Write) {
 		break
 	}
 	if scope != nil {
-		observe.route(&r.router, w, scope)
+		observe.route_held(&r.router, w, scope)
 	} else if w.git {
-		observe.route(&r.router, w, nil)
+		observe.route_held(&r.router, w, nil)
 	} else {
 		observe.route_write(&r.router, w)
 	}

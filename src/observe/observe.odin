@@ -36,6 +36,21 @@ Write :: struct {
 	args:    []u8,
 	window:  bool,
 	git:     bool,
+	release: Release,
+}
+
+Release :: struct {
+	run:   proc(data: rawptr, token: u64),
+	data:  rawptr,
+	token: u64,
+}
+
+release :: proc(w: ^Write) {
+	rl := w.release
+	w.release = {}
+	if rl.run != nil {
+		rl.run(rl.data, rl.token)
+	}
 }
 
 Stats :: struct {
@@ -253,7 +268,69 @@ route :: proc(r: ^Router, w: ^Write, scope: ^fs.Scope) {
 }
 
 route_write :: proc(r: ^Router, w: ^Write) {
-	route(r, w, scope_of(r.reg, w.lineage))
+	route_held(r, w, scope_of(r.reg, w.lineage))
+}
+
+@(private)
+Held :: struct {
+	left:      int,
+	release:   Release,
+	allocator: runtime.Allocator,
+}
+
+route_held :: proc(r: ^Router, w: ^Write, scope: ^fs.Scope) {
+	if r.reg == nil || scope == nil || !_held_op(w.op) {
+		route(r, w, scope)
+		release(w)
+		return
+	}
+	h, aerr := new(Held, r.allocator)
+	if aerr != nil {
+		route(r, w, scope)
+		release(w)
+		return
+	}
+	h^ = {left = 1, release = w.release, allocator = r.allocator}
+	w.release = {}
+	_held_path(r, h, w.path, scope)
+	if w.op == .Rename || w.op == .Exchange {
+		_held_path(r, h, w.from, scope)
+	}
+	route(r, w, scope)
+	_held_done(h, .None)
+}
+
+@(private)
+_held_op :: proc "contextless" (op: Op) -> bool {
+	#partial switch op {
+	case .Write, .Truncate, .Remove, .Rename, .Exchange, .Link, .Symlink, .Mknod:
+		return true
+	}
+	return false
+}
+
+@(private)
+_held_path :: proc(r: ^Router, h: ^Held, path: string, scope: ^fs.Scope) {
+	m, rel, ok := router_locate(r, path)
+	if !ok || m != scope.mount || len(rel) == 0 || fs.path_internal(rel) {
+		return
+	}
+	h.left += 1
+	fs.mount_observe_begin(m, rel, scope, _held_done, h)
+}
+
+@(private)
+_held_done :: proc(ctx: rawptr, err: fs.Error) {
+	h := (^Held)(ctx)
+	h.left -= 1
+	if h.left > 0 {
+		return
+	}
+	rl := h.release
+	free(h, h.allocator)
+	if rl.run != nil {
+		rl.run(rl.data, rl.token)
+	}
 }
 
 @(private)
