@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "core:bytes"
+import "core:crypto/blake2b"
 import "core:strings"
 import "core:mem/virtual"
 import "core:slice"
@@ -2068,24 +2069,38 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		rebase_changes(p) or_return
 		attribute_changes(p) or_return
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
+		group_actor := make(map[prim.Id]prim.Id, context.temp_allocator)
+		group_scope := make(map[prim.Id]prim.Id, context.temp_allocator)
 		order := make([dynamic]prim.Id, context.temp_allocator)
 		for c, i in p.changes {
 			actor := m.actor
+			scope: prim.Id
 			if c.scope != nil {
 				actor = c.scope.actor
+				scope = c.scope.id
 			} else if c.actor != {} {
 				actor = c.actor
+				if os, open := m.open_scopes[c.path]; open && os != nil && os.actor == actor {
+					scope = os.id
+				}
 			}
 			if actor != m.actor && !actor_on_line(m, actor) {
 				actor = m.actor
+				scope = {}
 			}
-			if _, ok := groups[actor]; !ok {
-				groups[actor] = make([dynamic]int, context.temp_allocator)
-				append(&order, actor)
+			key := actor
+			if scope != {} && scope != actor {
+				key = scope_group_key(actor, scope)
 			}
-			l := groups[actor]
+			if _, ok := groups[key]; !ok {
+				groups[key] = make([dynamic]int, context.temp_allocator)
+				group_actor[key] = actor
+				group_scope[key] = scope
+				append(&order, key)
+			}
+			l := groups[key]
 			append(&l, i)
-			groups[actor] = l
+			groups[key] = l
 		}
 		moving := make([dynamic]prim.Id, 0, len(order), context.temp_allocator)
 		rest := make([dynamic]prim.Id, 0, len(order), context.temp_allocator)
@@ -2099,8 +2114,15 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		clear(&order)
 		append(&order, ..moving[:])
 		append(&order, ..rest[:])
-		for actor in order {
-			idx := groups[actor][:]
+		for key in order {
+			idx := groups[key][:]
+			actor := group_actor[key]
+			marker: []u8
+			if sc := group_scope[key]; sc != {} && sc != actor && actor != m.actor {
+				mb := make([dynamic]u8, context.temp_allocator)
+				fshist.encode_scope(&mb, sc)
+				marker = mb[:]
+			}
 			emit_order(p, idx)
 			if actor != m.actor {
 				for i in idx {
@@ -2108,7 +2130,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				}
 			}
 			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
-				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))]) or_return
+				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))], marker) or_return
 			}
 			if actor != m.actor {
 				attribute_consumed(p, actor, idx) or_return
@@ -3408,4 +3430,15 @@ shadow_has_losers :: proc(m: ^Mount, rel: string) -> (found: bool, err: Error) {
 		}
 	}
 	return false, .None
+}
+
+@(private)
+scope_group_key :: proc(actor, scope: prim.Id) -> (key: prim.Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	a, sc := actor, scope
+	blake2b.update(&ctx, a[:])
+	blake2b.update(&ctx, sc[:])
+	blake2b.final(&ctx, key[:])
+	return
 }

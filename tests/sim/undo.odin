@@ -816,9 +816,15 @@ _ur_two :: proc(w: ^World, alloc: runtime.Allocator) {
 			sd.conv = o
 			eng.convo_mount(&n.e, o, "work", c.tree.id, {})
 		}
-		actor, pseudo := eng.turn_actor(&n.e, sd.conv.id)
+		m0 := _ur_mount(c)
+		if m0 == nil {
+			world_fail(w, "undo two: mount missing")
+			node_after(n)
+			return
+		}
+		actor, pseudo := eng.scope_actor(&n.e, sd.conv.id, m0.id, m0.line)
 		sd.agent = actor
-		if m := _ur_mount(c); m != nil {
+		if m := m0; m != nil {
 			context = eng.context_for(&n.e)
 			fs.history_register_owned_actor(m.history, actor, pseudo, sd.conv.id)
 		}
