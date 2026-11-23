@@ -610,6 +610,9 @@ _handle_rekey :: proc(h: ^Handle, device: prim.Id, rt: ^Remote_Tree) {
 				journal.reader_set_keys(&s.jr, osync.keytree_provider(&rt.tree))
 			}
 			_seg_enter(h, s)
+			if h.kind == .Map && h.table_open {
+				_derived_purge(h.e, h)
+			}
 			for v in h.drafts {
 				if v.device == device && v.gap && !v.pulling {
 					_draft_pull(h.e, h, device, v)
