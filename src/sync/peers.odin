@@ -154,11 +154,6 @@ _on_hollow :: proc(r: ^Replicator, ev: ^Event) {
 		}
 		i += 1
 	}
-	if rm.full && rm.trimmed && _following(rm) {
-		if c := _contiguous(rm); c < rm.base {
-			_read_range(r, rm, c, rm.base)
-		}
-	}
 	_remote_pull(r, rm)
 	_remote_settle(r, rm)
 }

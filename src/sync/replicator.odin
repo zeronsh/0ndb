@@ -1962,6 +1962,9 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 		return
 	}
 	if rm.full {
+		if c := _contiguous(rm); c < rm.base {
+			_read_range(r, rm, c, rm.base)
+		}
 		from := max(_contiguous(rm), rm.pulled)
 		if rm.relay_len < 0 {
 			if !rm.pulling {
