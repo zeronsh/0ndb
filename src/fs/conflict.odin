@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../odb"
 import "../prim"
@@ -23,6 +24,118 @@ Text_Conflict :: struct {
 	revert: prim.Id,
 	oid:    odb.Oid,
 	size:   i64,
+}
+
+@(private)
+REVERT_LIST :: "rvl"
+
+@(private)
+revert_key :: proc(tag: string, id: prim.Id) -> []u8 {
+	out := make([]u8, len(tag) + 16, context.temp_allocator)
+	n := copy(out, tag)
+	x := id
+	copy(out[n:], x[:])
+	return out
+}
+
+@(private)
+revert_index :: proc(h: ^History, actor: prim.Id, content: []u8) -> Error {
+	o, ok := fshist.decode_revert(content, context.temp_allocator)
+	if !ok {
+		return .None
+	}
+	if _, had := kv_get(&h.kv, revert_key("rv:", actor), context.temp_allocator) or_return; !had {
+		list, _ := kv_get(&h.kv, transmute([]u8)string(REVERT_LIST), context.temp_allocator) or_return
+		lb := make([dynamic]u8, 0, len(list) + 16, context.temp_allocator)
+		append(&lb, ..list)
+		x := actor
+		append(&lb, ..x[:])
+		kv_put(&h.kv, transmute([]u8)string(REVERT_LIST), lb[:]) or_return
+	}
+	kv_put(&h.kv, revert_key("rv:", actor), content) or_return
+	for a in o.actors {
+		if _, known := kv_get(&h.kv, revert_key("rv:", a), context.temp_allocator) or_return; known {
+			kv_put(&h.kv, revert_key("rx:", a), []u8{1}) or_return
+		}
+	}
+	return .None
+}
+
+@(private)
+revert_conflicts :: proc(h: ^History, out: ^[dynamic]Text_Conflict, allocator: runtime.Allocator) -> Error {
+	list, found := kv_get(&h.kv, transmute([]u8)string(REVERT_LIST), context.temp_allocator) or_return
+	if !found {
+		return .None
+	}
+	for i := 0; i + 16 <= len(list); i += 16 {
+		id: prim.Id
+		copy(id[:], list[i:][:16])
+		if _, undone := kv_get(&h.kv, revert_key("rx:", id), context.temp_allocator) or_return; undone {
+			continue
+		}
+		data, ok := kv_get(&h.kv, revert_key("rv:", id), context.temp_allocator) or_return
+		if !ok {
+			continue
+		}
+		o, dok := fshist.decode_revert(data, context.temp_allocator)
+		if !dok {
+			return .Corrupt
+		}
+		for c, j in o.conflicts {
+			if _, done := kv_get(&h.kv, revert_accept_key(id, u64(j)), context.temp_allocator) or_return; done {
+				continue
+			}
+			ours := make([]crdt.Op_Span, len(c.ours), allocator)
+			copy(ours, c.ours)
+			theirs := make([]crdt.Op_Span, len(c.theirs), allocator)
+			copy(theirs, c.theirs)
+			x := Text_Conflict{inode = op_inode(h, c.inode), start = c.start, end = c.end, ours = ours, theirs = theirs, kind = .Revert, revert = id}
+			if c.kind == .Blob {
+				ro := c.oid
+				copy(x.oid[:], ro[:c.oid_len])
+				x.size = c.size
+			}
+			append(out, x)
+		}
+	}
+	return .None
+}
+
+@(private)
+revert_accept_key :: proc(id: prim.Id, index: u64) -> []u8 {
+	out := make([]u8, 3 + 16 + 8, context.temp_allocator)
+	n := copy(out, "ra:")
+	x := id
+	n += copy(out[n:], x[:])
+	prim.put_u64le(out[n:], index)
+	return out
+}
+
+@(private)
+revert_accept_index :: proc(h: ^History, content: []u8) -> Error {
+	a, ok := fshist.decode_accept(content)
+	if !ok || a.kind != u8(Conflict_Kind.Revert) {
+		return .None
+	}
+	return kv_put(&h.kv, revert_accept_key(a.revert, a.index), []u8{1})
+}
+
+@(private)
+revert_conflict_index :: proc(h: ^History, c: Text_Conflict) -> (index: u64, rc: fshist.Revert_Conflict, ok: bool, err: Error) {
+	data, found := kv_get(&h.kv, revert_key("rv:", c.revert), context.temp_allocator) or_return
+	if !found {
+		return
+	}
+	o, dok := fshist.decode_revert(data, context.temp_allocator)
+	if !dok {
+		return 0, {}, false, .Corrupt
+	}
+	for x, j in o.conflicts {
+		if op_inode(h, x.inode) == c.inode && x.start == c.start && x.end == c.end {
+			return u64(j), x, true, .None
+		}
+	}
+	return
 }
 
 @(private)
@@ -78,6 +191,7 @@ record_text_conflicts :: proc(h: ^History, ino: fstree.Inode_Id, found: []crdt.C
 }
 
 history_text_conflicts :: proc(h: ^History, out: ^[dynamic]Text_Conflict, allocator := context.allocator) -> Error {
+	revert_conflicts(h, out, allocator) or_return
 	list, found := kv_get(&h.kv, transmute([]u8)string(CONFLICT_LIST), context.temp_allocator) or_return
 	if found {
 		rd := prim.reader(list)
