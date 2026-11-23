@@ -401,6 +401,7 @@ Mount :: struct {
 	log_gen:     u64,
 	log_at:      i64,
 	saved:       u64,
+	saved_synced: [dynamic]crdt.Op_Id,
 	state_seq:   u64,
 	legacy:      bool,
 	lost:        bool,
@@ -850,6 +851,7 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.open_scopes)
 	delete(m.synced)
+	delete(m.saved_synced)
 	git_head_destroy(&m.head, m.allocator)
 	if m.has_git {
 		git_dirs_destroy(&m.git, m.allocator)
@@ -1685,6 +1687,11 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	m.actor = prim.read_id(&rd)
 	v := decode_version(prim.read_bytes(&rd), context.temp_allocator) or_return
 	append(&m.synced, ..v)
+	if m.saved_synced == nil {
+		m.saved_synced = make([dynamic]crdt.Op_Id, m.allocator)
+	}
+	clear(&m.saved_synced)
+	append(&m.saved_synced, ..v)
 	branch := prim.read_str(&rd)
 	commit := prim.read_str(&rd)
 	m.head.branch, _ = clone_string(branch, m.allocator)
@@ -2042,6 +2049,9 @@ mount_ack :: proc(m: ^Mount) -> Error {
 save_mount_state :: proc(m: ^Mount) -> Error {
 	img := &m.img
 	synced := m.img.synced[:]
+	if shadow_attached(&m.shadow) && m.shadow.owed && shadow_dirty(&m.shadow) && m.saved_synced != nil {
+		synced = m.saved_synced[:]
+	}
 	buf := make([dynamic]u8, context.temp_allocator)
 	vb := make([dynamic]u8, context.temp_allocator)
 	encode_version(&vb, synced)
@@ -2118,6 +2128,13 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	m.saved = 0
 	state_write(m, buf[:]) or_return
 	m.saved = sum
+	if raw_data(synced) != raw_data(m.saved_synced[:]) {
+		if m.saved_synced == nil {
+			m.saved_synced = make([dynamic]crdt.Op_Id, m.allocator)
+		}
+		clear(&m.saved_synced)
+		append(&m.saved_synced, ..synced)
+	}
 	m.log_gen = gen
 	if covered {
 		attrib_log_reset(m)

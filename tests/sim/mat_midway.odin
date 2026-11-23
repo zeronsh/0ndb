@@ -32,6 +32,9 @@ _mm_write :: proc(vfs: prim.Vfs, path: string, data: string) -> prim.Error {
 }
 
 @(private = "file")
+SNAP_CRASH_UNTIL_DEFERRAL :: u64(341)
+
+@(private = "file")
 Mm_Mode :: enum u8 {
 	None,
 	Process,
@@ -40,6 +43,7 @@ Mm_Mode :: enum u8 {
 	Dirs,
 	Midcrash,
 	Dirs_Power,
+	Snap_Crash,
 }
 
 @(private = "file")
@@ -47,10 +51,11 @@ Mm_Case :: struct {
 	seed: u64,
 	k:    u64,
 	mode: Mm_Mode,
+	j:    u64,
 }
 
 @(private = "file")
-_mm_case :: proc(c: Mm_Case) -> (failed_pass: bool, failures: [dynamic]string) {
+_mm_case :: proc(c: Mm_Case) -> (failed_pass: bool, failures: [dynamic]string, crashed: bool) {
 	failures = make([dynamic]string)
 	cfg := default_config(c.seed)
 	cfg.nodes = 1
@@ -65,7 +70,7 @@ _mm_case :: proc(c: Mm_Case) -> (failed_pass: bool, failures: [dynamic]string) {
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	failed_pass = _mm_run(w, c)
+	failed_pass, crashed = _mm_run(w, c)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -75,7 +80,7 @@ _mm_case :: proc(c: Mm_Case) -> (failed_pass: bool, failures: [dynamic]string) {
 }
 
 @(private = "file")
-_mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
+_mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 	a := w.nodes[0]
 	if !node_start(a) {
 		world_fail(w, "midway: node start")
@@ -161,6 +166,9 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 				}
 			}
 		}
+		if c.mode == .Snap_Crash {
+			eng.flush(&a.e)
+		}
 		a.disk.fail_root = MM_ROOT
 		a.disk.fail_nth = c.k
 		a.disk.fail_stick = c.mode == .Midcrash
@@ -215,6 +223,16 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			a.disk.quiet = true
 		}
 		a.disk.quiet = false
+		if c.mode == .Snap_Crash {
+			crashes := w.stats.crashes
+			a.disk.crash_at = a.disk.stats.ops + c.j
+			a.disk.force_process = true
+			node_after(a)
+			run_until(w, w.now + 5_000_000_000, true)
+			a.disk.crash_at = 0
+			a.disk.force_process = false
+			crashed = w.stats.crashes > crashes
+		}
 	}
 	if failed_pass && a.alive && a.incarnation == inc && c.mode != .Midcrash && c.mode != .Hold && c.mode != .Dirs_Power {
 		passes := m.passes
@@ -353,6 +371,21 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			world_fail(w, "midway: after a materialize failed at op %d (%v) the synced version is not what is on disk: %s", c.k, c.mode, x)
 		}
 	}
+	if c.mode == .Snap_Crash {
+		run_until(w, w.now + 10_000_000_000, true)
+		context = instance_context(&a.inst)
+		same := len(m.saved_synced) == len(m.synced)
+		for x in m.synced {
+			found := false
+			for y in m.saved_synced {
+				found ||= x == y
+			}
+			same &&= found
+		}
+		if !same {
+			world_fail(w, "midway: after a crash at op %d of the pass that followed a failed materialize, the saved synced version %v lags the live one %v once the mount settled", c.j, m.saved_synced[:], m.synced[:])
+		}
+	}
 	if owed := fs.mount_absent(m); len(owed) > 0 {
 		world_fail(w, "midway: after a materialize failed at op %d (%v) and a clean pass, %d paths are still owed: %v", c.k, c.mode, len(owed), owed)
 	}
@@ -367,8 +400,11 @@ materialize_midway :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for mode in Mm_Mode {
+		if mode == .Snap_Crash {
+			continue
+		}
 		for k := u64(1); k < 2000; k += 1 {
-			failed, failures := _mm_case(Mm_Case{seed = 1, k = k, mode = mode})
+			failed, failures, _ := _mm_case(Mm_Case{seed = 1, k = k, mode = mode})
 			for f in failures {
 				fmt.eprintf("materialize_midway %v op %d: %s\n", mode, k, f)
 				delete(f)
@@ -381,5 +417,26 @@ materialize_midway :: proc(t: ^testing.T) {
 			}
 		}
 	}
+	points := 0
+	ks: for k := u64(1); k < 2000; k += 1 {
+		for j := u64(1); j < SNAP_CRASH_UNTIL_DEFERRAL; j += 1 {
+			failed, failures, crashed := _mm_case(Mm_Case{seed = 1, k = k, mode = .Snap_Crash, j = j})
+			for f in failures {
+				fmt.eprintf("materialize_midway snapshot crash k %d op %d: %s\n", k, j, f)
+				delete(f)
+			}
+			testing.expectf(t, len(failures) == 0, "materialize_midway snapshot crash k %d op %d failed", k, j)
+			n := len(failures)
+			delete(failures)
+			if !failed || n > 0 {
+				break ks
+			}
+			if !crashed {
+				break
+			}
+			points += 1
+		}
+	}
+	fmt.eprintf("materialize_midway: %d snapshot crash points\n", points)
 	free_all(context.temp_allocator)
 }
