@@ -1423,10 +1423,11 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 	old_disk := make(map[string][]u8, context.temp_allocator)
 	base := make(map[string][]u8, context.temp_allocator)
 	untracked := make(map[string]bool, context.temp_allocator)
+	sync_err: fs.Error
 	{
 		context = instance_context(&n.inst)
 		_end_held_agents(w, n, sm.root)
-		fs.mount_sync(sm.m)
+		sync_err = fs.mount_sync(sm.m)
 		for p in paths {
 			if d, derr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator); derr == .None {
 				old_disk[p] = d
@@ -1472,6 +1473,9 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	obj_add_line(m, sm.oi, key)
+	if sync_err == .Reloading && n.persist_outage {
+		_unseen_writes_uncertain(w, n, sm.oi, changes[:])
+	}
 	if cerr == .None && !n.disk.dead {
 		git_gone := make(map[string]bool, context.temp_allocator)
 		for ch in changes {
