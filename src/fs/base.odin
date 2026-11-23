@@ -360,15 +360,15 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 		if x := _pin(c.scope, c.path, false); x != nil && (x.has_read || x.has_write) {
 			return x, c.scope.actor, false
 		}
-		return nil, {}, false
+		return _entry_pin(m, c, buf, c.scope.actor)
 	}
 	a, ok := m.attrib[c.path]
 	if !ok || a.used || m.history == nil {
-		return nil, {}, false
+		return _entry_pin(m, c, buf, attrib_default_actor(m, c.path))
 	}
 	o, found := _observed(m.history, a.actor, c.path)
 	if !found {
-		return nil, {}, false
+		return _entry_pin(m, c, buf, attrib_default_actor(m, c.path))
 	}
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
 	append(&buf.read, ..o.version)
@@ -376,6 +376,24 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 	buf.read_hash = o.hash
 	buf.has_read = true
 	return buf, a.actor, true
+}
+
+@(private)
+_entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin, who: prim.Id, observed: bool) {
+	if m.history == nil || c.kind != .Modify || c.old.kind != .File || !c.old.has_at {
+		return nil, {}, false
+	}
+	h := m.history
+	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
+	append(&buf.read, inode_op(h, c.old.at))
+	t, terr := history_text_at(h, c.old.inode, buf.read[:], context.temp_allocator)
+	if terr != .None {
+		return nil, {}, false
+	}
+	buf.read_inode = c.old.inode
+	buf.read_hash = _content_hash(t)
+	buf.has_read = true
+	return buf, actor, true
 }
 
 @(private)
@@ -475,6 +493,11 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 	h := m.history
 	keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
 	for &c in p.changes {
+		if c.moved != "" && c.old.has_at && c.disk == .File && c.stat != c.old.stat {
+			c.stat = c.old.stat
+			k, _ := clone_string(c.path, p.long)
+			append(&p.young, k)
+		}
 		pbuf: Pin
 		pin, actor, observed := _change_pin(m, &c, &pbuf)
 		if pin == nil {
@@ -491,6 +514,18 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		if v != nil && (c.kind != .Modify || inode != c.old.inode) {
 			if _, _, elsewhere, serr := shadow_by_inode(&m.shadow, inode, context.temp_allocator); serr != .None || elsewhere {
 				v = nil
+			}
+		}
+		fell := false
+		if v == nil && pinned && c.kind == .Modify && c.old.has_at {
+			ebuf: Pin
+			if ep, _, _ := _entry_pin(m, &c, &ebuf, actor); ep != nil {
+				v, inode, _ = _base_version(m, ep, actor)
+				fell = v != nil
+			}
+			if fell {
+				_change_pin_drop(m, &c, observed)
+				_base_note(m, c.path, .Mismatch)
 			}
 		}
 		if v == nil {
@@ -527,9 +562,19 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		case .Reloading, .Io, .No_Space:
 			return rerr
 		case:
+			if fell {
+				append(&keep, c)
+				continue
+			}
 			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
+			continue
+		}
+		if fell {
+			if !done {
+				append(&keep, c)
+			}
 			continue
 		}
 		_change_pin_drop(m, &c, observed)
@@ -580,6 +625,17 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	ne := c.old if c.kind == .Modify && c.old.inode == inode else Entry{inode = inode, kind = .File}
 	ne.stat = c.stat
 	ne.oid = oid
+	ne.at = {}
+	ne.has_at = false
+	if err == .None {
+		if b.n == 0 {
+			buf := make([dynamic]u8, context.temp_allocator)
+			fshist.encode_observe(&buf, fshist.Observe_Op{kind = .Read, inode = inode_op(h, inode), path = c.path, version = v, hash = _content_hash(data)})
+			builder_opaque(&b, buf[:])
+		}
+		ne.at = op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)})
+		ne.has_at = true
+	}
 	if err == .None {
 		err = shadow_put(&m.shadow, c.path, ne)
 	}
@@ -587,6 +643,9 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	has := false
 	if err == .None {
 		head, has, err = builder_commit_at(m, &b, v)
+	}
+	if (err == .None || err == .Reloading) && (!has || op_inode(h, head) != ne.at) {
+		err = .Corrupt
 	}
 	if err != .None && err != .Reloading {
 		shadow_txn_rollback(&m.shadow)
@@ -609,7 +668,7 @@ builder_commit_at :: proc(m: ^Mount, b: ^Builder, parents: []crdt.Op_Id) -> (hea
 	batch := crdt.Batch {
 		actor   = b.actor,
 		seq     = b.seq0,
-		lamport = history_lamport_after(h, m.synced[:]),
+		lamport = max(history_lamport_after(h, m.synced[:]), history_lamport_after(h, parents)),
 		parents = parents,
 		ops     = b.ops[:],
 	}
