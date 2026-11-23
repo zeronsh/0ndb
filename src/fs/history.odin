@@ -138,6 +138,8 @@ History :: struct {
 	seals:      u64,
 	mark_taken: u64,
 	held:       [dynamic]Kv_Group,
+	on_offered: proc(data: rawptr, h: ^History, dest: fstree.Inode_Id, source: fstree.Inode_Id),
+	offered_data: rawptr,
 	markers:    [dynamic]Git_Marker,
 	views:      [dynamic]^Text_View,
 	scan:       Scan_Cache,
@@ -1992,7 +1994,7 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 		}
 		record_text_conflicts(h, ino, found[:]) or_return
 	}
-	return .None
+	return offers_apply(h, b, spans)
 }
 
 @(private)

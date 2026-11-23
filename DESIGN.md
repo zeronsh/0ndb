@@ -368,6 +368,10 @@ Text (Eg-walker with Fugue):
 - Conflict detection: concurrent ops whose ranges overlap in the merged
   result are reported as regions (for review and land), while the merge
   itself still converges.
+  A region has a kind: `Concurrent` (overlapping concurrent edits),
+  `Revert` (an undo's alternative, planned) or `Offered` (edits to the
+  source of a rename onto an existing name); one accept action takes the
+  alternative as copies of its spans, authors kept.
 
 Tree:
 
@@ -460,14 +464,31 @@ equal in both directions.
   equal are copies of the source's spans, so they keep their authors
   exactly (nothing is matched by content across files), an editor's atomic
   save never cuts the file's blame, and an edit made concurrently to the
-  replaced file merges into it. The mirror case, a path whose recorded
+  replaced file merges into it. The source's text is copied as the renamer
+  saw it, so edits made concurrently to the source stay with the removed
+  source (remove wins), but none vanishes silently: the batch carries a
+  renamed marker (opaque tag 21: destination, source), and whenever the
+  source's text has moved past the version the renamer copied, the
+  destination lists an `Offered` conflict (the source's current spans with
+  their authors as the alternative) and the device that applies those
+  edits gets a `rename_offered` event ("a.txt was renamed onto c.txt;
+  your edits are offered there"). Accepting replaces the destination's text
+  with copies of the source's spans, authors kept, and records an accept
+  marker (tag 22) that moves the copied version forward, so the offer is
+  not listed again. An editor's atomic save has a temp-file source nobody
+  else edits, so it never offers anything. (planned) Copies that track
+  their source, so that a delete of a source character also deletes its
+  copies and an insert next to one lands beside them, make edits to the
+  source follow it like a move; that is the full answer, and offers then
+  remain only for edits the copy cannot place. The mirror case, a path whose recorded
   inode number now sits at a created path while the path itself holds a
   different file (moved away, then a new file saved in its place), is a
   move of the file to the created path plus a new file at the old path,
   never an edit that hands the old file's history to the new one. A pass
   that defers a file (young, or held by a scope) also defers any created
   path holding that file's recorded inode number, so both halves of a move
-  are always ingested in one pass. Changes no scope claims belong to the mount's ingestion
+  are always ingested in one pass.
+  Changes no scope claims belong to the mount's ingestion
   actor, `blake2b-128("0ndb ingestion actor" || device || mount id)`, never
   to the device's own API writes, so disk changes concurrent with them stay
   representable. Opening a mount appends one `REC_ACTOR` record (tag 9:

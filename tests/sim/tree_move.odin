@@ -2,6 +2,7 @@ package sim
 
 import "core:fmt"
 import "core:strings"
+import "../../src/crdt"
 import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/prim"
@@ -40,12 +41,14 @@ STAT_TM_CYCLE: Stat
 STAT_TM_REMOVE: Stat
 STAT_TM_EDIT: Stat
 STAT_TM_REPLACE: Stat
+STAT_TM_ACCEPTED: Stat
 
 @(init)
 _tree_move_init :: proc "contextless" () {
 	register_world(40, _tm_init, _tm_destroy)
 	register_op(13, "tree_move", proc(w: ^World) -> int {return 12 if env_u64("SIM_TREE_MOVE", 0) != 0 else 0}, op_tree_move)
 	register_final_check(120, check_tree_moves)
+	register_final_check(900, check_offer_accept)
 	register_stat_line(53, "tree_moves")
 	STAT_TM_RENAME = register_stat(53, 0, "renames")
 	STAT_TM_DIR = register_stat(53, 1, "dir_moves")
@@ -54,6 +57,7 @@ _tree_move_init :: proc "contextless" () {
 	STAT_TM_REMOVE = register_stat(53, 4, "vs_remove")
 	STAT_TM_EDIT = register_stat(53, 5, "vs_edit")
 	STAT_TM_REPLACE = register_stat(53, 6, "replace_edit")
+	STAT_TM_ACCEPTED = register_stat(53, 7, "offers_accepted")
 }
 
 @(private = "file")
@@ -214,8 +218,17 @@ _rename :: proc(w: ^World, n: ^Node, sm: Sim_Mount, from: string, to: string) ->
 		rop.path = strings.clone(to, w.allocator)
 		delete(rop.line, w.allocator)
 		rop.line = strings.clone(_line(n, sm), w.allocator)
+		kept := make(map[string]bool, context.temp_allocator)
+		for t in _tokens(n, src) {
+			kept[t] = true
+			if !(t in m.reasserted) {
+				m.reasserted[strings.clone(t, w.allocator)] = true
+			}
+		}
 		for t in _tokens(n, dst) {
-			append(&rop.deletes, strings.clone(t, w.allocator))
+			if !kept[t] {
+				append(&rop.deletes, strings.clone(t, w.allocator))
+			}
 		}
 		if !(to in m.objs[sm.oi].removed) {
 			m.objs[sm.oi].removed[strings.clone(to, w.allocator)] = true
@@ -788,7 +801,74 @@ _authors_kept :: proc(w: ^World, n: ^Node, oi: int, file: string, toks: []string
 	}
 }
 
+@(private = "file")
+_check_offers :: proc(w: ^World) {
+	m := &w.model
+	if len(m.reasserted) == 0 {
+		return
+	}
+	gone := make(map[int]map[string]bool, context.temp_allocator)
+	for op in m.ops {
+		if !op_happened(op) || op.kind == .Tree_Remove || op.line != "" {
+			continue
+		}
+		for d in op.deletes {
+			if !m.reasserted[d] {
+				continue
+			}
+			set, ok := gone[op.obj]
+			if !ok {
+				set = make(map[string]bool, context.temp_allocator)
+			}
+			set[d] = true
+			gone[op.obj] = set
+		}
+	}
+	if len(gone) == 0 {
+		return
+	}
+	for n in w.nodes {
+		if !n.alive {
+			continue
+		}
+		context = instance_context(&n.inst)
+		for oi, toks in gone {
+			o := m.objs[oi].o
+			if line_norm(eng.tree_line(&n.e, o)) != "" {
+				continue
+			}
+			files := _files(n, o, "")
+			conflicts, cerr := eng.tree_conflicts(&n.e, o, context.temp_allocator)
+			if cerr != .None {
+				continue
+			}
+			for f, have in files {
+				hit := ""
+				for t in have {
+					if toks[t] {
+						hit = t
+						break
+					}
+				}
+				if hit == "" {
+					continue
+				}
+				offered := false
+				for c in conflicts {
+					offered ||= c.kind == .Offered && c.path == f
+				}
+				if !offered {
+					world_fail(w, "tree move: %s holds %s, deleted on the source of a rename onto it after the renamer copied it, but %s/%s lists no offered edit on %s", f, hit, id_short(o.id), f, n.name)
+				}
+			}
+		}
+		node_after(n)
+		free_all(context.temp_allocator)
+	}
+}
+
 check_tree_moves :: proc(w: ^World) {
+	_check_offers(w)
 	if _tm == nil || len(_tm.records) == 0 {
 		return
 	}
@@ -833,5 +913,57 @@ check_tree_moves :: proc(w: ^World) {
 		}
 		node_after(n)
 		free_all(context.temp_allocator)
+	}
+}
+
+check_offer_accept :: proc(w: ^World) {
+	m := &w.model
+	for n in w.nodes {
+		if !n.alive {
+			continue
+		}
+		context = instance_context(&n.inst)
+		for ob in m.objs {
+			if ob.kind != .Tree {
+				continue
+			}
+			list, err := eng.tree_conflicts(&n.e, ob.o, context.temp_allocator)
+			if err != .None {
+				continue
+			}
+			for c in list {
+				if c.kind != .Offered {
+					continue
+				}
+				if aerr := eng.tree_conflict_accept(&n.e, ob.o, c); aerr != .None {
+					world_fail(w, "tree move: accepting the offer on %s/%s from %s failed on %s: %v", id_short(ob.o.id), c.path, c.source, n.name, aerr)
+					continue
+				}
+				stat_add(w, STAT_TM_ACCEPTED)
+				after, _ := eng.tree_read(&n.e, ob.o, c.path, context.temp_allocator)
+				hist, herr := eng.tree_history(&n.e, ob.o)
+				if herr != .None {
+					continue
+				}
+				ver := crdt.graph_version_ids(&hist.g, hist.g.heads[:], context.temp_allocator)
+				if lv, found, lerr := fs.history_line(hist, eng.tree_line(&n.e, ob.o), context.temp_allocator); lerr == .None && found {
+					ver = lv
+				}
+				src, serr := fs.history_text_at(hist, c.raw.source, ver, context.temp_allocator)
+				eng.tree_release(&n.e, ob.o)
+				if serr == .None && string(src) != string(after) {
+					world_fail(w, "tree move: after accepting the offer on %s/%s from %s on %s the file is %q, not the source's %q", id_short(ob.o.id), c.path, c.source, n.name, string(after), string(src))
+				}
+				again, _ := eng.tree_conflicts(&n.e, ob.o, context.temp_allocator)
+				for x in again {
+					if x.kind == .Offered && x.path == c.path && x.source == c.source {
+						world_fail(w, "tree move: the offer on %s/%s from %s is still listed after it was accepted on %s", id_short(ob.o.id), c.path, c.source, n.name)
+					}
+				}
+			}
+		}
+		node_after(n)
+		free_all(context.temp_allocator)
+		return
 	}
 }

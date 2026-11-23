@@ -3,7 +3,14 @@ package fs
 import "base:runtime"
 import "../crdt"
 import "../fstree"
+import "../odb"
 import "../prim"
+
+Conflict_Kind :: enum u8 {
+	Concurrent,
+	Revert,
+	Offered,
+}
 
 Text_Conflict :: struct {
 	inode:  fstree.Inode_Id,
@@ -11,6 +18,11 @@ Text_Conflict :: struct {
 	end:    int,
 	ours:   []crdt.Op_Span,
 	theirs: []crdt.Op_Span,
+	kind:   Conflict_Kind,
+	source: fstree.Inode_Id,
+	revert: prim.Id,
+	oid:    odb.Oid,
+	size:   i64,
 }
 
 @(private)
@@ -67,15 +79,14 @@ record_text_conflicts :: proc(h: ^History, ino: fstree.Inode_Id, found: []crdt.C
 
 history_text_conflicts :: proc(h: ^History, out: ^[dynamic]Text_Conflict, allocator := context.allocator) -> Error {
 	list, found := kv_get(&h.kv, transmute([]u8)string(CONFLICT_LIST), context.temp_allocator) or_return
-	if !found {
-		return .None
-	}
-	rd := prim.reader(list)
-	for prim.reader_remaining(&rd) >= 12 {
-		ino := fstree.Inode_Id{prim.read_u32le(&rd), prim.read_u64le(&rd)}
-		data, ok := kv_get(&h.kv, inode_key("tc:", ino), context.temp_allocator) or_return
-		if ok {
-			decode_text_conflicts(data, ino, out, allocator) or_return
+	if found {
+		rd := prim.reader(list)
+		for prim.reader_remaining(&rd) >= 12 {
+			ino := fstree.Inode_Id{prim.read_u32le(&rd), prim.read_u64le(&rd)}
+			data, ok := kv_get(&h.kv, inode_key("tc:", ino), context.temp_allocator) or_return
+			if ok {
+				decode_text_conflicts(data, ino, out, allocator) or_return
+			}
 		}
 	}
 	return .None

@@ -632,6 +632,9 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 		err = emit_text_edits(m, &b, inode, c.path, old, data)
 	}
 	m.copy = nil
+	if err == .None && c.has_copy {
+		renamed_marker(h, &b, inode, c.copy_src)
+	}
 	ne := c.old if c.kind == .Modify && c.old.inode == inode else Entry{inode = inode, kind = .File}
 	ne.stat = c.stat
 	ne.oid = oid

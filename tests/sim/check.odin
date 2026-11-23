@@ -822,12 +822,12 @@ _check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 			switch op.status {
 			case .Acked, .Observed, .Done:
 				if !strict {
-					if deleted && is {
+					if deleted && is && !m.reasserted[tok] {
 						world_fail(w, "model: token %s deleted on line %q but still present there on %s", tok, line, n.name)
 					}
 					break
 				}
-				if deleted && is {
+				if deleted && is && !m.reasserted[tok] {
 					world_fail(w, "model: token %s deleted but still present on %s", tok, n.name)
 				} else if !deleted && !maybe_deleted && !removed && !is {
 					world_fail(w, "model: token %s (op %d %v %v) missing on %s", tok, op.idx, op.kind, op.status, n.name)
