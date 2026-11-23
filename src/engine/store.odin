@@ -42,6 +42,7 @@ Registry :: struct {
 	sstaged: map[prim.Id][]u8,
 	kstaged: map[prim.Id][]u8,
 	cat_done: map[prim.Id]bool,
+	unclean:  map[prim.Id]bool,
 	owned:   [dynamic]Owned_Pend,
 	meta:    bool,
 }
@@ -97,6 +98,7 @@ _registry_open :: proc(e: ^Engine) -> Error {
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.cat_done = make(map[prim.Id]bool, e.allocator)
+	e.reg.unclean = make(map[prim.Id]bool, e.allocator)
 	e.reg.owned = make([dynamic]Owned_Pend, e.allocator)
 	e.reg.sstaged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.kstaged = make(map[prim.Id][]u8, e.allocator)
@@ -162,6 +164,7 @@ _registry_close :: proc(e: ^Engine) {
 	}
 	delete(e.reg.staged)
 	delete(e.reg.cat_done)
+	delete(e.reg.unclean)
 	delete(e.reg.owned)
 	delete(e.reg.sstaged)
 	delete(e.reg.kstaged)

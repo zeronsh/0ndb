@@ -108,6 +108,10 @@ node_start :: proc(n: ^Node) -> bool {
 		w.node_cfg(n, &cfg)
 	}
 	n.alive = true
+	if n.disk.reopen_fail && n.disk.crashed {
+		n.disk.reopen_fail = false
+		n.disk.fail_reg_open = 1
+	}
 	err := eng.open(&n.e, cfg, context.allocator)
 	if n.disk.dead {
 		node_crashed(n)
@@ -224,6 +228,7 @@ node_crashed :: proc(n: ^Node) {
 		mode = .Process
 	}
 	n.disk.dead = false
+	n.disk.crashed = true
 	if mode == .Power {
 		n.boot += 1
 	}

@@ -136,7 +136,7 @@ _snap_take :: proc(p: ^Pack, s: ^Snap) {
 		next_run   = p.next_run,
 		compacting = p.compacting,
 		cpos       = p.compact_resume,
-		clean      = p.closing,
+		clean      = p.closing && !p.hold_unclean,
 	}
 	s.runs = make([dynamic]Run, 0, len(p.runs) + 1, p.allocator)
 	for r in p.runs {

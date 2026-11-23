@@ -505,6 +505,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	_perr(prim.mkdir_all(e.base, e.pack_root, 0o700)) or_return
 	_perr(pack.open(&e.pk, e.base, e.pack_root, opts, e.allocator)) or_return
 	e.pk_open = true
+	pack.hold_unclean(&e.pk, pack.unclean(&e.pk))
 	e.vfs = pack.vfs(&e.pk)
 	pack.batch_begin(&e.pk)
 	if cfg.keyring.identity != nil {
@@ -519,9 +520,11 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.identity = osync.keyring_identity(&e.keyring)
 	e.self = e.identity.id
 	_registry_open(e) or_return
+	_unclean_mark_registry(e) or_return
 	_registry_recover(e) or_return
 	_dlog_open(e)
 	_spaces_load(e) or_return
+	_unclean_mark_spaces(e) or_return
 	_account_load(e)
 	_redact_recover(e)
 	_leave_resume(e)

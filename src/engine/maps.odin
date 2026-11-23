@@ -6,7 +6,6 @@ import "core:strings"
 import "../convo"
 import omap "../map"
 import "../obj"
-import "../pack"
 import "../prim"
 import osync "../sync"
 
@@ -757,16 +756,17 @@ _catalog_update_free :: proc(e: ^Engine, u: ^Catalog_Update) {
 
 @(private)
 _catalog_reconcile :: proc(e: ^Engine) {
-	if !e.pk_open || !pack.unclean(&e.pk) || !e.reg.open {
+	if !e.pk_open || !e.reg.open || len(e.reg.unclean) == 0 {
 		return
 	}
-	for id in _sorted_keys(e.spaces) {
-		sp := e.spaces[id]
-		if e.reg.cat_done[id] || !sp.open || sp.keyless {
+	for id in _sorted_keys(e.reg.unclean) {
+		sp, ok := e.spaces[id]
+		if !ok || e.reg.cat_done[id] || !sp.open || sp.keyless {
 			continue
 		}
 		e.reg.cat_done[id] = true
 		_catalog_reconcile_space(e, sp)
+		_unclean_settle(e, sp)
 	}
 }
 

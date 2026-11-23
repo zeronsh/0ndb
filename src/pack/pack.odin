@@ -173,6 +173,7 @@ Pack :: struct {
 	poisoned:      bool,
 	recovering:    bool,
 	unclean:       bool,
+	hold_unclean:  bool,
 	batch:         int,
 	stats:         Stats,
 	filters_cold:  bool,
