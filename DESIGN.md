@@ -3583,6 +3583,21 @@ Relay cost tracks the reachable information, not the activity. Items marked
   most holes; a Restore can hide records but cannot alter one. Readers that
   get the redaction notice zero their own archived copies that still hold
   the record.
+  Any puncture of the writer's own key tree (a redaction or a draft key)
+  re-archives every group touching the punctured cells, aligned to the
+  cell size, so no group's key ever depends on a cell its writer has
+  deleted; the rebuilt groups list those cells as holes.
+  A replica may lose bytes underneath a persisted engine view: until-run
+  and evicting storage drop them, a user or the OS clears the cache, a
+  backup restores replicas from another moment than the engine state, a
+  disk-full cleanup removes files. The engine never waits on a fetch it
+  has not issued: a view read that finds a record missing reports the
+  range it wanted and the handle asks the replicator for it; the text
+  history asks for the exact record it failed to read; a follower whose
+  segment turns out to be trimmed asks for the prefix it lacks, which the
+  replicator serves from the archive. The sim forgets every remote
+  segment of an object on a reader, restarts it with the writer offline,
+  and requires the same view afterwards (conversations, texts and maps).
   Map groups collect: a Put whose every field is matched or beaten (by
   register order) by a later Put of the same key in the same group becomes
   a length-only `Gone` entry, a run of them ends with the chain head after
