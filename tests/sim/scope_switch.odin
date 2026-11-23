@@ -104,7 +104,7 @@ _scope_switch :: proc(w: ^World) {
 		}
 		actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, sm.m, sid, actor)
+		scope = sim_scope_open(w, n.reg, sm.m, sid, actor)
 		base, _ := prim.read_file(vfs, abs, context.temp_allocator)
 		fs.scope_read_base(scope, "a.txt", base)
 	}
