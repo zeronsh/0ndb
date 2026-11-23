@@ -114,6 +114,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	defer attr_set_checkout(m, prev_snap, prev_version)
 	moved_ancestors_touch(h, &snap, sl[:], &touched) or_return
 	displaced_touch(m, &snap, &touched) or_return
+	indirect := len(m.collided) > 0 || len(m.reshow) > 0
 	for c in m.collided {
 		if ino, ok, lerr := fstree.lookup(&snap, c); lerr == nil && ok {
 			touched[ino] = true
@@ -138,6 +139,10 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		delete(r, m.allocator)
 	}
 	clear(&m.reshow)
+	if indirect || (dir_place_changed(m, &snap, touched) or_return) {
+		place_reconcile(m, &snap, fstree.ROOT, "", &touched) or_return
+		m.reconciles += 1
+	}
 	items := make([dynamic]Mat_Item, context.temp_allocator)
 	for ino in sorted_inodes(touched) {
 		it := Mat_Item {
@@ -653,6 +658,50 @@ from_prim_fd :: proc "contextless" (fd: prim.Fd, e: prim.Error) -> (prim.Fd, Err
 }
 
 @(private)
+dir_place_changed :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: map[fstree.Inode_Id]bool) -> (changed: bool, err: Error) {
+	for ino in touched {
+		old, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
+		info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
+		if ierr != nil {
+			return false, .Corrupt
+		}
+		dir := (had && e.kind == .Dir) || (ok && info.present && info.kind == .Dir)
+		if !dir {
+			continue
+		}
+		if !had || !ok || !info.present {
+			return true, .None
+		}
+		p, pok, perr := fstree.path(snap, ino, context.temp_allocator)
+		if perr != nil {
+			return false, .Corrupt
+		}
+		if !pok || p != old {
+			return true, .None
+		}
+	}
+	return false, .None
+}
+
+@(private)
+place_reconcile :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, touched: ^map[fstree.Inode_Id]bool) -> Error {
+	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
+	if kerr != nil {
+		return .Corrupt
+	}
+	for c in kids {
+		p, _ := path_join(prefix, c.name, context.temp_allocator)
+		if old, _, had := shadow_by_inode(&m.shadow, c.inode, context.temp_allocator) or_return; !had || old != p {
+			touched[c.inode] = true
+		}
+		if c.kind == .Dir {
+			place_reconcile(m, snap, c.inode, p, touched) or_return
+		}
+	}
+	return .None
+}
+
+@(private)
 moved_ancestors_touch :: proc(h: ^History, snap: ^fstree.Snapshot, sl: []crdt.Lv, touched: ^map[fstree.Inode_Id]bool) -> Error {
 	if len(touched) == 0 {
 		return .None
@@ -924,6 +973,13 @@ disk_content_matches :: proc(m: ^Mount, rel: string, st: Stat, e: Entry) -> bool
 
 @(private)
 materialize_one :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
+	if it.has_old {
+		old, e, had := shadow_by_inode(&m.shadow, it.inode, context.temp_allocator) or_return
+		if had {
+			it.old = old
+			it.entry = e
+		}
+	}
 	if it.present && it.kind == .File && .Opaque in it.flags && m.db != nil && !m.restoring {
 		reg, has, berr := history_blob_at(m.history, it.inode, tl)
 		if berr == .None && has && !odb.exists(m.db, odb.Oid(reg.oid)) {
