@@ -107,35 +107,57 @@ Shadow :: struct {
 	map_lock:   ^sync.Mutex,
 	lock:       ^sync.Mutex,
 	versions:   [dynamic][]fstree.Op_Id,
+	ver_index:  map[u64]u32,
+	ver_gen:    u32,
 	ver_ids:    [dynamic]fstree.Op_Id,
 }
 
 SHADOW_VERSION_MAX :: 1024
 
-shadow_version :: proc(s: ^Shadow, e: Entry) -> []fstree.Op_Id {
-	if e.ver == 0 || int(e.ver) > len(s.versions) {
-		return nil
+@(private = "file")
+SHADOW_VER_BITS :: 24
+
+shadow_version :: proc(s: ^Shadow, e: Entry) -> (ids: []fstree.Op_Id, ok: bool) {
+	if e.ver == 0 {
+		return nil, true
 	}
-	return s.versions[e.ver - 1]
+	ix := int(e.ver & (1 << SHADOW_VER_BITS - 1))
+	if e.ver >> SHADOW_VER_BITS != s.ver_gen || ix == 0 || ix > len(s.versions) {
+		return nil, false
+	}
+	return s.versions[ix - 1], true
+}
+
+@(private = "file")
+version_hash :: proc "contextless" (ids: []fstree.Op_Id) -> u64 {
+	h := u64(14695981039346656037)
+	for id in ids {
+		h = (h ~ u64(id.actor)) * 1099511628211
+		h = (h ~ id.seq) * 1099511628211
+	}
+	return h
 }
 
 shadow_version_add :: proc(s: ^Shadow, ids: []fstree.Op_Id) -> (ver: u32, err: Error) {
 	if len(ids) == 0 {
 		return 0, .None
 	}
-	if len(ids) > SHADOW_VERSION_MAX {
+	if len(ids) > SHADOW_VERSION_MAX || len(s.versions) >= 1 << SHADOW_VER_BITS - 1 {
 		return 0, .Too_Large
 	}
-	outer: for v, i in s.versions {
-		if len(v) != len(ids) {
-			continue
-		}
+	h := version_hash(ids)
+	if j, found := s.ver_index[h]; found {
+		v := s.versions[j - 1]
+		same := len(v) == len(ids)
 		for x, k in v {
-			if x != ids[k] {
-				continue outer
+			if !same {
+				break
 			}
+			same = x == ids[k]
 		}
-		return u32(i + 1), .None
+		if same {
+			return s.ver_gen << SHADOW_VER_BITS | j, .None
+		}
 	}
 	c, aerr := make([]fstree.Op_Id, len(ids), s.allocator)
 	if aerr != nil {
@@ -146,7 +168,12 @@ shadow_version_add :: proc(s: ^Shadow, ids: []fstree.Op_Id) -> (ver: u32, err: E
 		delete(c, s.allocator)
 		return 0, .No_Memory
 	}
-	return u32(len(s.versions)), .None
+	j := u32(len(s.versions))
+	if s.ver_index == nil {
+		s.ver_index = make(map[u64]u32, s.allocator)
+	}
+	s.ver_index[h] = j
+	return s.ver_gen << SHADOW_VER_BITS | j, .None
 }
 
 @(private = "file")
@@ -155,6 +182,8 @@ versions_clear :: proc(s: ^Shadow) {
 		delete(v, s.allocator)
 	}
 	clear(&s.versions)
+	clear(&s.ver_index)
+	s.ver_gen = (s.ver_gen + 1) & 0xff
 }
 
 shadow_open :: proc(s: ^Shadow, vfs: prim.Vfs, dir: string, format: odb.Hash_Format, allocator := context.allocator) -> Error {
@@ -223,6 +252,8 @@ shadow_detach :: proc(s: ^Shadow) {
 	delete(s.out)
 	versions_clear(s)
 	delete(s.versions)
+	delete(s.ver_index)
+	s.ver_index = nil
 	delete(s.ver_ids)
 	s.versions = nil
 	s.ver_ids = nil
@@ -530,7 +561,11 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 			}
 		}
 		live[p.path] = !p.del
-		if encode_rec(&s.out, off, p.path, p.del, p.entry, shadow_version(s, p.entry), linked, sibling, s.oid_size) == 0 {
+		ids, vok := shadow_version(s, p.entry)
+		if !vok {
+			return .Corrupt
+		}
+		if encode_rec(&s.out, off, p.path, p.del, p.entry, ids, linked, sibling, s.oid_size) == 0 {
 			return .Too_Large
 		}
 	}
@@ -668,6 +703,11 @@ find_path_rec :: proc(s: ^Shadow, path: string) -> (index: u64, slot: Path_Slot,
 
 @(private = "file")
 pending_set :: proc(s: ^Shadow, path: string, del: bool, e: Entry) -> Error {
+	if !del {
+		if _, ok := shadow_version(s, e); !ok {
+			return .Corrupt
+		}
+	}
 	if i, ok := s.index[path]; ok {
 		p := &s.pending[i]
 		if s.txn && i < s.txn_len {
@@ -752,6 +792,7 @@ pending_clear :: proc(s: ^Shadow) {
 		delete(p.path, s.allocator)
 	}
 	clear(&s.pending)
+	versions_clear(s)
 	clear(&s.index)
 	clear(&s.by_inode)
 	if cap(s.pending) > 4096 {

@@ -382,7 +382,11 @@ _entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin
 	}
 	h := m.history
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
-	for id in shadow_version(&m.shadow, c.old) {
+	ids, vok := shadow_version(&m.shadow, c.old)
+	if !vok {
+		return nil, {}, false
+	}
+	for id in ids {
 		append(&buf.read, inode_op(h, id))
 	}
 	t, terr := history_text_at(h, c.old.inode, buf.read[:], context.temp_allocator)

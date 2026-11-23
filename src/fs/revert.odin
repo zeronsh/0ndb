@@ -88,7 +88,11 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 		if !had || e.ver == 0 {
 			continue
 		}
-		for id in shadow_version(&m.shadow, e) {
+		ids, vok := shadow_version(&m.shadow, e)
+		if !vok {
+			return .Corrupt
+		}
+		for id in ids {
 			lv, ok := crdt.graph_lv(&h.g, inode_op(h, id))
 			if !ok {
 				return .Corrupt
