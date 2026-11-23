@@ -1220,6 +1220,7 @@ Change :: struct {
 
 @(private)
 Pass :: struct {
+	departed:   Version,
 	m:          ^Mount,
 	switched:   bool,
 	line_from:  string,
@@ -1559,6 +1560,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			delete(m.branch, m.allocator)
 			m.branch, _ = clone_string(key, m.allocator)
 			if follow {
+				p.departed = slice.clone(m.synced[:], p.long) or_else nil
 				line_follow(m, key) or_return
 				p.git_wrote = true
 			}
@@ -1938,6 +1940,9 @@ collect_alias_sources :: proc(m: ^Mount, p: ^Pass) {
 				}
 			}
 		}
+	}
+	if len(p.departed) > 0 {
+		append(&m.alias, p.departed)
 	}
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
@@ -3478,12 +3483,23 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, path: st
 			}
 		}
 	}
-	Alias_Text :: struct {
-		text:  []u8,
-		spans: []crdt.Author_Span,
-	}
 	alias_texts := make([dynamic]Alias_Text, context.temp_allocator)
 	alias_loaded := false
+	if len(m.alias) > 0 && len(rs) > 0 {
+		alias_load(h, m.alias[:], path, &alias_texts)
+		alias_loaded = true
+		for at, k in alias_texts {
+			if string(at.text) != string(full_data) {
+				continue
+			}
+			for r, i in rs {
+				if wins[i].q < 0 && r.b1 > r.b0 {
+					wins[i] = Win{pre + r.b0, r.b0, r.b1, k}
+				}
+			}
+			break
+		}
+	}
 	for r, i in rs {
 		if wins[i].q >= 0 || len(m.alias) == 0 || r.b1 - r.b0 < MOVE_MIN {
 			continue
@@ -3568,6 +3584,35 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, path: st
 		emit_insert(m, b, inode, pre + r.b0, data[r.b0:r.b1]) or_return
 	}
 	return .None
+}
+
+@(private)
+Alias_Text :: struct {
+	text:  []u8,
+	spans: []crdt.Author_Span,
+}
+
+@(private)
+alias_load :: proc(h: ^History, alias: []Version, path: string, out: ^[dynamic]Alias_Text) {
+	for av in alias {
+		al := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, av, &al) != .None {
+			continue
+		}
+		snap, serr := version_snapshot(h, al[:])
+		if serr != .None {
+			continue
+		}
+		ino, found, lerr := fstree.lookup(&snap, path)
+		fstree.snapshot_destroy(&snap)
+		if lerr != nil || !found {
+			continue
+		}
+		t, sp, terr := history_text_spans_at(h, ino, al[:], context.temp_allocator)
+		if terr == .None {
+			append(out, Alias_Text{t, sp})
+		}
+	}
 }
 
 @(private)

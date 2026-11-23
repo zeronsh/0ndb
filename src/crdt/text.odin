@@ -912,7 +912,7 @@ run_valid :: proc "contextless" (r: Op_Run, size: int) -> int {
 	return 0
 }
 
-text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id, skip: int, parents: []Lv) -> (valid: int, err: Error) {
+text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id, skip: int, parents: []Lv, missing: ^[dynamic]Op_Id = nil) -> (valid: int, err: Error) {
 	size: int
 	have := false
 	rest := skip
@@ -933,6 +933,12 @@ text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id
 		}
 		ok := run_valid(r, size)
 		if r.kind == .Insert_Copy && ok > 0 {
+			if need, absent := copy_source_absent(g, r, b.actor); absent {
+				if missing != nil {
+					append(missing, need)
+				}
+				return valid, .Missing_Source
+			}
 			ok = min(ok, copy_valid(t, g, log, r, b.actor, b.seq + u64(valid), parents))
 		}
 		valid += ok
@@ -945,6 +951,22 @@ text_check :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, b: ^Batch, target: Op_Id
 }
 
 @(private)
+copy_source_absent :: proc(g: ^Graph, r: Op_Run, actor: prim.Id) -> (need: Op_Id, absent: bool) {
+	if r.src.actor == actor {
+		return {}, false
+	}
+	last := r.src.seq + u64(r.len) - 1
+	ix, known := graph_actor(g, r.src.actor)
+	if !known {
+		return Op_Id{r.src.actor, last}, true
+	}
+	if _, found := graph_lv_ix(g, ix, last); !found {
+		return Op_Id{r.src.actor, last}, true
+	}
+	return {}, false
+}
+
+@(private)
 copy_valid :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, r: Op_Run, actor: prim.Id, seq: u64, parents: []Lv) -> int {
 	n := r.len
 	ext := n
@@ -953,28 +975,8 @@ copy_valid :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, r: Op_Run, actor: prim.I
 			return 0
 		}
 		ext = min(n, int(seq - r.src.seq))
-	} else {
-		ix, known := graph_actor(g, r.src.actor)
-		if !known {
-			return 0
-		}
-		inside :: proc(g: ^Graph, ix: u32, s: u64, parents: []Lv) -> bool {
-			lv, found := graph_lv_ix(g, ix, s)
-			return found && graph_contains(g, parents, lv)
-		}
-		if !inside(g, ix, r.src.seq + u64(n) - 1, parents) {
-			lo, hi := 0, n - 1
-			for lo < hi {
-				mid := (lo + hi + 1) / 2
-				if inside(g, ix, r.src.seq + u64(mid) - 1, parents) {
-					lo = mid
-				} else {
-					hi = mid - 1
-				}
-			}
-			n = lo
-			ext = lo
-		}
+	} else if _, known := graph_actor(g, r.src.actor); !known {
+		return 0
 	}
 	if ext == 0 || log.copies.read == nil {
 		return 0
