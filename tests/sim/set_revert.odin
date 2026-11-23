@@ -950,7 +950,8 @@ _sr_unmounted :: proc(w: ^World) -> (reverted: bool) {
 	tok := 0
 	for nm in names[:2] {
 		tok += 1
-		eng.tree_write(&n.e, tree, nm, transmute([]u8)fmt.tprintf("<u%d>\n", tok))
+		ubase, _ := eng.tree_version(&n.e, tree, "", context.temp_allocator)
+		eng.tree_write(&n.e, tree, nm, transmute([]u8)fmt.tprintf("<u%d>\n", tok), ubase)
 	}
 	snapshot :: proc(n: ^Node, tree: eng.Object, names: []string) -> map[string]string {
 		out := make(map[string]string, context.temp_allocator)
@@ -973,9 +974,10 @@ _sr_unmounted :: proc(w: ^World) -> (reverted: bool) {
 			eng.tree_remove(&n.e, tree, nm)
 			continue
 		}
-		cur, _ := eng.tree_read(&n.e, tree, nm, context.temp_allocator, {})
+		cbase: fs.Version
+		cur, _ := eng.tree_read(&n.e, tree, nm, context.temp_allocator, {}, "", nil, &cbase)
 		tok += 1
-		eng.tree_write(&n.e, tree, nm, transmute([]u8)strings.concatenate({string(cur), fmt.tprintf("<u%d>\n", tok)}, context.temp_allocator))
+		eng.tree_write(&n.e, tree, nm, transmute([]u8)strings.concatenate({string(cur), fmt.tprintf("<u%d>\n", tok)}, context.temp_allocator), cbase)
 	}
 	after := snapshot(n, tree, names)
 	undo := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))

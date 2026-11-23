@@ -100,7 +100,8 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 		fs.scope_close(n.reg, hold)
 		return
 	}
-	if cur, rerr := eng.tree_read(&n.e, o, name, context.temp_allocator); rerr == .None {
+	cbase: fs.Version
+	if cur, rerr := eng.tree_read(&n.e, o, name, context.temp_allocator, {}, "", nil, &cbase); rerr == .None {
 		kop := new_op(m, .Tree_Write, n, sm.oi)
 		kop.path = strings.clone(name, w.allocator)
 		tok := new_token(m, n, "k")
@@ -112,7 +113,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 		}
 		strings.write_string(&b, tok)
 		strings.write_byte(&b, '\n')
-		op_result(kop, n, eng.tree_write(&n.e, o, name, transmute([]u8)strings.to_string(b)))
+		op_result(kop, n, eng.tree_write(&n.e, o, name, transmute([]u8)strings.to_string(b), cbase))
 	}
 	pop := new_op(m, .Disk_Agent, n, sm.oi)
 	pop.path = strings.clone(name, w.allocator)

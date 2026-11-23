@@ -105,14 +105,14 @@ _text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready
 	return spans, .None
 }
 
-tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (data: []u8, err: Error) {
+tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil, base: ^fs.Version = nil) -> (data: []u8, err: Error) {
 	context = context_for(e)
-	data, err = _tree_read(e, o, path, allocator, ready, line, version)
+	data, err = _tree_read(e, o, path, allocator, ready, line, version, base)
 	return data, _damage_read(e, o, err, ready)
 }
 
 @(private)
-_tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (data: []u8, err: Error) {
+_tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil, base: ^fs.Version = nil) -> (data: []u8, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
@@ -122,6 +122,9 @@ _tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 	at, aerr := _tree_at(e, h, line, version)
 	if aerr != .None {
 		return nil, aerr
+	}
+	if base != nil {
+		base^ = slice.clone(at.version, allocator) or_else nil
 	}
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
@@ -164,14 +167,14 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 	return out, _damage_read(e, o, lerr, ready)
 }
 
-tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (entries: []Tree_Entry, err: Error) {
+tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil, base: ^fs.Version = nil) -> (entries: []Tree_Entry, err: Error) {
 	context = context_for(e)
-	entries, err = _tree_entries(e, o, path, allocator, ready, line, version, true)
+	entries, err = _tree_entries(e, o, path, allocator, ready, line, version, true, base)
 	return entries, _damage_read(e, o, err, ready)
 }
 
 @(private)
-_tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Allocator, ready: Ready, line: string, version: []u8, sizes: bool) -> (entries: []Tree_Entry, err: Error) {
+_tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Allocator, ready: Ready, line: string, version: []u8, sizes: bool, base: ^fs.Version = nil) -> (entries: []Tree_Entry, err: Error) {
 	h := _handle_get(e, o, .File_Tree) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
@@ -180,6 +183,9 @@ _tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Al
 	at, aerr := _tree_at(e, h, line, version)
 	if aerr != .None {
 		return nil, aerr
+	}
+	if base != nil {
+		base^ = slice.clone(at.version, allocator) or_else nil
 	}
 	dir := fstree.ROOT
 	if len(path) > 0 && path != "/" {
@@ -275,15 +281,26 @@ _tree_dirs :: proc(e: ^Engine, h: ^Handle, at: ^Tree_At, dir: string) -> (id: fs
 	return id, .None
 }
 
-tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, line := "") -> Error {
+tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, base: fs.Version, line := "") -> Error {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
 	at := _tree_at(e, h, line, nil) or_return
-	id, ok, lerr := fstree.lookup(&at.snap, path)
+	hist := h.hist
+	bl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&hist.g, base, &bl) != .None {
+		return .Invalid
+	}
+	bsnap := _ferr2(fs.version_snapshot(hist, bl[:])) or_return
+	bat := Tree_At{line = at.line, version = base, snap = bsnap}
+	defer fstree.snapshot_destroy(&bat.snap)
+	id, ok, lerr := fstree.lookup(&bat.snap, path)
 	if lerr != nil {
 		return .Corrupt
+	}
+	if info, iok, ierr := fstree.info(&bat.snap, id, context.temp_allocator); ok && ierr == nil && iok && info.kind != .File {
+		return .Invalid
 	}
 	if !ok {
 		parent := fstree.ROOT
@@ -302,8 +319,8 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, line := "") 
 		_handle_mark(h)
 		return .None
 	}
-	old := _tree_text(e, h, &at, id) or_return
-	target := fs.inode_op(h.hist, id)
+	old := _ferr2(fs.history_text_at(hist, id, base, context.temp_allocator)) or_return
+	target := fs.inode_op(hist, id)
 	edits, derr := textdiff.line_edits(old, data, context.temp_allocator)
 	if derr != nil {
 		ops := make([dynamic]crdt.Op_Run, context.temp_allocator)
@@ -314,7 +331,7 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, line := "") 
 			append(&ops, crdt.Op_Run{target = target, kind = .Insert, pos = 0, len = len(data), content = data})
 		}
 		if len(ops) > 0 {
-			_hist_batch(e, h, ops[:], &at) or_return
+			_hist_batch(e, h, ops[:], &bat) or_return
 		}
 		_handle_mark(h)
 		return .None
@@ -332,7 +349,7 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, line := "") 
 			append(&ops, crdt.Op_Run{target = target, kind = .Insert, pos = at, len = int(ed.ins), content = data[at:at + int(ed.ins)]})
 		}
 	}
-	_hist_batch(e, h, ops[:], &at) or_return
+	_hist_batch(e, h, ops[:], &bat) or_return
 	_handle_mark(h)
 	return .None
 }
@@ -614,8 +631,23 @@ _hist_batch :: proc(e: ^Engine, h: ^Handle, ops: []crdt.Op_Run, at: ^Tree_At = n
 	}
 	if h.kind == .File_Tree {
 		n := crdt.batch_len(&b)
+		lname := at.line if at != nil else fs.DEFAULT_MOUNT.line
 		head := [1]crdt.Op_Id{{actor, b.seq + u64(n) - 1}}
-		_ferr(fs.history_set_line(hist, at.line if at != nil else fs.DEFAULT_MOUNT.line, head[:])) or_return
+		next := head[:]
+		cur, found, lerr := fs.history_line(hist, lname, context.temp_allocator)
+		if lerr != .None {
+			return _ferr(lerr)
+		}
+		if found {
+			cl := make([dynamic]crdt.Lv, context.temp_allocator)
+			hl := make([dynamic]crdt.Lv, context.temp_allocator)
+			if crdt.graph_version_lvs(&hist.g, cur, &cl) == .None && crdt.graph_version_lvs(&hist.g, head[:], &hl) == .None {
+				both := make([dynamic]crdt.Lv, context.temp_allocator)
+				crdt.version_union(&hist.g, cl[:], hl[:], &both)
+				next = crdt.graph_version_ids(&hist.g, both[:], context.temp_allocator)
+			}
+		}
+		_ferr(fs.history_set_line(hist, lname, next)) or_return
 		_mounts_wake(e, h.id)
 		if at != nil {
 			at^ = _tree_at(e, h, at.line, nil) or_return

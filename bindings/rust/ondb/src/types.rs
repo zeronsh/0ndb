@@ -784,6 +784,7 @@ pub struct TreeList {
     pub names: Vec<String>,
     pub line: String,
     pub entries: Vec<TreeEntry>,
+    pub base: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -806,6 +807,7 @@ pub struct FilesAt {
 pub struct TreeText {
     pub text: String,
     pub line: String,
+    pub base: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -61,7 +61,7 @@ _ofc_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 			world_fail(w, "own-first: tree_create: %v", err)
 			return
 		}
-		if err = eng.tree_write(&a.e, tree, "a.txt", transmute([]u8)string("one\n")); err != .None {
+		if err = eng.tree_write(&a.e, tree, "a.txt", transmute([]u8)string("one\n"), tree_base(&a.e, tree)); err != .None {
 			world_fail(w, "own-first: n0 tree_write: %v", err)
 			return
 		}
@@ -87,7 +87,7 @@ _ofc_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 	{
 		context = instance_context(&b.inst)
 		b.disk.crash_at = b.disk.stats.ops + k
-		eng.tree_write(&b.e, tree, "a.txt", transmute([]u8)string("two\n"))
+		eng.tree_write(&b.e, tree, "a.txt", transmute([]u8)string("two\n"), tree_base(&b.e, tree))
 		node_after(b)
 	}
 	run_until(w, w.now + 5_000_000_000, true)

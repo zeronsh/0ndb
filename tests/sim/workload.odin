@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:strings"
 import "../../src/convo"
 import eng "../../src/engine"
+import "../../src/fs"
 import omap "../../src/map"
 import "../../src/obj"
 import "../../src/prim"
@@ -707,7 +708,8 @@ _op_tree :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 	paths := TREE_PATHS
 	path := paths[rng_int(&w.rng, len(paths))]
 	context = instance_context(&n.inst)
-	data, rerr := eng.tree_read(&n.e, o, path, context.temp_allocator)
+	tbase: fs.Version
+	data, rerr := eng.tree_read(&n.e, o, path, context.temp_allocator, {}, "", nil, &tbase)
 	if rerr != .None && rerr != .Not_Found {
 		return
 	}
@@ -725,7 +727,7 @@ _op_tree :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 			strings.write_string(&b, tok)
 			strings.write_byte(&b, '\n')
 		}
-		err := eng.tree_write(&n.e, o, path, transmute([]u8)strings.to_string(b))
+		err := eng.tree_write(&n.e, o, path, transmute([]u8)strings.to_string(b), tbase)
 		world_note(w, "%s tree_write %s/%s saw %v wrote %v -> %v", n.name, id_short(o.id), path, op.deletes[:], op.tokens[:], err)
 		op_result(op, n, err)
 	case .Tree_Remove:

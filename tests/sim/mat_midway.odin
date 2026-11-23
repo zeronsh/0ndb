@@ -145,7 +145,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 		for f in files {
 			tok := fmt.aprintf("<t.%s>", f, allocator = w.allocator)
 			typed[f] = tok
-			if err := eng.tree_write(&a.e, tree, f, transmute([]u8)fmt.tprintf("<o.%s>\n%s\n", f, tok)); err != .None {
+			if err := eng.tree_write(&a.e, tree, f, transmute([]u8)fmt.tprintf("<o.%s>\n%s\n", f, tok), tree_base(&a.e, tree)); err != .None {
 				world_fail(w, "midway: tree_write %s: %v", f, err)
 				return
 			}
@@ -154,7 +154,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 			for f in MM_NEW {
 				tok := fmt.aprintf("<t.%s>", f, allocator = w.allocator)
 				typed[f] = tok
-				if err := eng.tree_write(&a.e, tree, f, transmute([]u8)fmt.tprintf("%s\n", tok)); err != .None {
+				if err := eng.tree_write(&a.e, tree, f, transmute([]u8)fmt.tprintf("%s\n", tok), tree_base(&a.e, tree)); err != .None {
 					world_fail(w, "midway: tree_write %s: %v", f, err)
 					return
 				}

@@ -1288,11 +1288,11 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TEXT_REDACT 87u
 /* tree.create(space: id, title: str) -> object:object */
 #define ONDB_OP_TREE_CREATE 88u
-/* tree.read(object: object, path: str, line: str, version: bytes) -> text:str line:str */
+/* tree.read(object: object, path: str, line: str, version: bytes) -> text:str line:str base:bytes */
 #define ONDB_OP_TREE_READ 89u
-/* tree.list(object: object, path: str, line: str, version: bytes) -> names:[str] line:str entries:[TreeEntry] */
+/* tree.list(object: object, path: str, line: str, version: bytes) -> names:[str] line:str entries:[TreeEntry] base:bytes */
 #define ONDB_OP_TREE_LIST 90u
-/* tree.write(object: object, path: str, text: str, line: str) -> line:str */
+/* tree.write(object: object, path: str, text: str, line: str, base: bytes) -> line:str */
 #define ONDB_OP_TREE_WRITE 91u
 /* tree.remove(object: object, path: str, line: str) -> line:str */
 #define ONDB_OP_TREE_REMOVE 92u

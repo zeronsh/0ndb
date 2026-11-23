@@ -160,9 +160,10 @@ fn spawn_agent(sock: PathBuf, tree: String, path: String, disk: PathBuf, period:
                 b't' => {
                     let cur: serde_json::Value = c.call(&json!({"op": "tree.read", "object": tree, "path": path})).wait()?;
                     let text = cur["text"].as_str().unwrap_or("").to_string();
+                    let base = cur["base"].as_str().unwrap_or("").to_string();
                     let at = char_boundary(&text, r.n(text.len() as u64 + 1) as usize);
                     let new = format!("{}{}{}", &text[..at], tag, &text[at..]);
-                    let _: serde_json::Value = c.call(&json!({"op": "tree.write", "object": tree, "path": path, "text": new})).wait()?;
+                    let _: serde_json::Value = c.call(&json!({"op": "tree.write", "object": tree, "path": path, "text": new, "base": base})).wait()?;
                     tw.fetch_add(1, Ordering::Relaxed);
                 }
                 b'd' => {
