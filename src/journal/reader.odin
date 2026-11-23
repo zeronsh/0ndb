@@ -25,6 +25,7 @@ Reader :: struct {
 	out:        []u8,
 	scan:       []u8,
 	missing:    Range,
+	damage:     Damage,
 	allocator:  runtime.Allocator,
 }
 
@@ -138,11 +139,23 @@ record_at :: proc(r: ^Reader, off: i64) -> (body: []u8, next: i64, err: Error) {
 	head := _fetch(r, off, off + HEADER, true) or_return
 	n := i64(prim.get_u32le(head[0:4]))
 	if n > MAX_BODY || n + OVERHEAD > end - off {
+		_damaged(r, off)
 		return nil, off, .Corrupt
 	}
 	next = off + n + OVERHEAD
 	body, err = _read(r, off, next, true)
 	return body, next, err
+}
+
+@(private)
+_damaged :: proc(r: ^Reader, at: i64) {
+	if r.damage.call != nil {
+		r.damage.call(r.damage.data, at)
+		return
+	}
+	if j := r.journal; j != nil && j.damage.call != nil && at < j.durable {
+		j.damage.call(j.damage.data, at)
+	}
 }
 
 record_before :: proc(r: ^Reader, end_off: i64) -> (body: []u8, off: i64, err: Error) {
@@ -160,6 +173,7 @@ record_before :: proc(r: ^Reader, end_off: i64) -> (body: []u8, off: i64, err: E
 	tail := _fetch(r, end_off - TRAILER, end_off, false) or_return
 	n := i64(prim.get_u32le(tail))
 	if n > MAX_BODY || n + OVERHEAD > end_off {
+		_damaged(r, end_off - 1)
 		return nil, end_off, .Corrupt
 	}
 	off = end_off - n - OVERHEAD
@@ -223,7 +237,13 @@ prev :: proc(c: ^Cursor) -> (body: []u8, off: i64, ok: bool) {
 @(private)
 _read :: proc(r: ^Reader, off, end: i64, forward: bool) -> (body: []u8, err: Error) {
 	rec := _fetch(r, off, end, forward) or_return
-	b, kind := _decode(r, rec, off) or_return
+	b, kind, derr := _decode(r, rec, off)
+	if derr != .None {
+		if derr == .Corrupt {
+			_damaged(r, off)
+		}
+		return nil, derr
+	}
 	if r.chained {
 		if kind == .Plain && is_sig(b) {
 			return b, _check_sig_record(r, b, off)

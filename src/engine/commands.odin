@@ -241,6 +241,20 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 	}
 	res, h, err = _cmd_run(e, cmd, &st)
 	busy := err == .Busy && pack.pressure(&e.pk)
+	if err == .Corrupt && _damage_pending(e, _cmd_object(cmd).id) {
+		p := new(Pending_Cmd, e.allocator)
+		if virtual.arena_init_growing(&p.arena) != nil {
+			free(p, e.allocator)
+			return res, .No_Memory
+		}
+		p.cmd = _cmd_clone(cmd, virtual.arena_allocator(&p.arena))
+		p.state = st
+		p.done = done
+		if _damage_park(e, _cmd_object(cmd), p, 0) {
+			return res, .Pending
+		}
+		_cmd_free(e, p)
+	}
 	if !busy && (err != .Missing || h == nil) {
 		res.tick = pending_seq(e)
 		return res, err
@@ -441,6 +455,9 @@ _cmd_retry :: proc(e: ^Engine, p: ^Pending_Cmd, tries: int) {
 			return
 		}
 		err = werr
+	}
+	if err == .Corrupt && _damage_park(e, _cmd_object(p.cmd), p, tries) {
+		return
 	}
 	res.tick = pending_seq(e)
 	if p.done.call != nil {

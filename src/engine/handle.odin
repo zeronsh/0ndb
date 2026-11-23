@@ -92,6 +92,7 @@ Handle :: struct {
 	used:       u64,
 	table:      omap.Table,
 	table_open: bool,
+	damaged:    bool,
 	local:      bool,
 	grouped:    bool,
 	drafts:     [dynamic]^Draft_View,
@@ -258,7 +259,7 @@ _journal_opts :: proc(h: ^Handle) -> journal.Options {
 		keys   = osync.keytree_provider(&h.own_tree.tree),
 		signer = osync.keyring_signer(&e.keyring),
 	}
-	return journal.Options{keep_at_least = floor, chain = &h.chain}
+	return journal.Options{keep_at_least = floor, chain = &h.chain, damage = {h, _on_damage}}
 }
 
 @(private)
@@ -893,7 +894,7 @@ _wait :: proc(e: ^Engine, h: ^Handle, ready: Ready, cmd: ^Pending_Cmd = nil, tri
 		}
 		return .Offline
 	}
-	fetched := _handle_want(h) || _content_pending(e, h.id) || (ready.fresh && _fresh_link(h))
+	fetched := h.damaged || _handle_want(h) || _content_pending(e, h.id) || (ready.fresh && _fresh_link(h))
 	if !fetched && h.sp.repl_on {
 		for sg in h.segs {
 			if !sg.in_view {

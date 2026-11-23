@@ -85,6 +85,9 @@ catalog_role :: proc(e: ^Engine, o: Object, allocator := context.allocator, read
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
+		if merr == .Corrupt && h.damaged && ready.call != nil {
+			return "", _wait(e, h, ready)
+		}
 		return "", merr
 	}
 	kb: [16]u8
@@ -143,6 +146,9 @@ map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
+		if merr == .Corrupt && h.damaged && ready.call != nil {
+			return entry, false, _wait(e, h, ready)
+		}
 		return entry, false, merr
 	}
 	entry, found = _oerr2(omap.table_get(&h.table, key, allocator)) or_return
@@ -159,6 +165,9 @@ map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit:
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
+		if merr == .Corrupt && h.damaged && ready.call != nil {
+			return nil, false, _wait(e, h, ready)
+		}
 		return nil, false, merr
 	}
 	r, m, serr := omap.table_scan(&h.table, -1, prefix, after, limit, allocator)
@@ -183,6 +192,9 @@ catalog_get :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
+		if merr == .Corrupt && h.damaged && ready.call != nil {
+			return c, false, _wait(e, h, ready)
+		}
 		return c, false, merr
 	}
 	c, found = _oerr2(omap.catalog_get(&h.table, o.id, allocator)) or_return
@@ -204,6 +216,9 @@ catalog_list :: proc(e: ^Engine, space: prim.Id, archived: bool, after: ^Map_Cur
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
+		if merr == .Corrupt && h.damaged && ready.call != nil {
+			return nil, false, _wait(e, h, ready)
+		}
 		return nil, false, merr
 	}
 	r, m, lerr := omap.catalog_list(&h.table, archived, after, limit, allocator)
@@ -228,6 +243,9 @@ catalog_find :: proc(e: ^Engine, space: prim.Id, text: string, allocator := cont
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
+		if merr == .Corrupt && h.damaged && ready.call != nil {
+			return nil, _wait(e, h, ready)
+		}
 		return nil, merr
 	}
 	part := strings.to_lower(text, context.temp_allocator)
@@ -414,6 +432,7 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 			append(&sources, omap.Source{seg = s.device, reader = &s.jr})
 		}
 	}
+	own_bad := false
 	for _ in 0 ..< 2 {
 		_oerr(omap.table_prepare(&h.table, sources[:])) or_return
 		missing := false
@@ -426,7 +445,7 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 			if src.reader == nil {
 				continue
 			}
-			_, err := omap.table_apply(&h.table, src.seg, src.reader)
+			at, err := omap.table_apply(&h.table, src.seg, src.reader)
 			if err == .Missing {
 				missing = true
 				if h.sp.repl_on {
@@ -437,6 +456,11 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 					}
 				}
 			} else if err != .None {
+				if i == 0 && err == .Corrupt {
+					own_bad = true
+					_damage_note(e, h.sp.id, h.id, .Map, at)
+					break
+				}
 				if h.w_open && i == 0 && !omap.table_poisoned(&h.table) {
 					return _oerr(err)
 				}
@@ -445,7 +469,13 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 				}
 			}
 		}
+		if own_bad {
+			h.damaged = !_damage_lost(e, h)
+			_oerr(omap.table_reset(&h.table)) or_return
+			return .Corrupt
+		}
 		if !omap.table_poisoned(&h.table) {
+			h.damaged = false
 			return .Missing if missing else .None
 		}
 	}
@@ -624,15 +654,41 @@ _catalog_flush :: proc(e: ^Engine) {
 				e.catalog_q[id] = u
 				continue
 			}
+		} else if err == .Corrupt {
+			if _, dup := e.catalog_parked[id]; !dup {
+				e.catalog_parked[id] = u
+				continue
+			}
 		} else if err != .None {
 			_fatal(e, err)
 		}
-		delete(u.title, e.allocator)
-		delete(u.role, e.allocator)
-		delete(u.remote, e.allocator)
-		delete(u.lines, e.allocator)
-		free(u, e.allocator)
+		_catalog_update_free(e, u)
 	}
+}
+
+@(private)
+_catalog_unpark :: proc(e: ^Engine) {
+	if len(e.catalog_parked) == 0 {
+		return
+	}
+	for id, u in e.catalog_parked {
+		if _, dup := e.catalog_q[id]; dup {
+			_catalog_update_free(e, u)
+		} else {
+			e.catalog_q[id] = u
+		}
+	}
+	clear(&e.catalog_parked)
+	_touch(e)
+}
+
+@(private)
+_catalog_update_free :: proc(e: ^Engine, u: ^Catalog_Update) {
+	delete(u.title, e.allocator)
+	delete(u.role, e.allocator)
+	delete(u.remote, e.allocator)
+	delete(u.lines, e.allocator)
+	free(u, e.allocator)
 }
 
 @(private)
@@ -832,6 +888,9 @@ catalog_usage_get :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> (u: convo
 	h := _catalog_handle(e, sp) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
+		if merr == .Corrupt && h.damaged && ready.call != nil {
+			return u, _wait(e, h, ready)
+		}
 		return u, merr
 	}
 	kb: [16]u8

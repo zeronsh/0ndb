@@ -418,6 +418,12 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	case .Draft, .Draft_Pulled:
 		_draft_on_repl(e, sp, ev)
 		return
+	case .Local_Corrupt:
+		_local_restore(e, sp, ev)
+		return
+	case .Local_Checked:
+		_check_release(e, ev.stream)
+		return
 	}
 	if ev.kind == .Unavailable && len(ev.oid) > 0 {
 		_content_unavailable(e, sp, ev)

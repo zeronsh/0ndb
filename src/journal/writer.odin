@@ -4,9 +4,15 @@ import "base:runtime"
 import "core:hash/xxhash"
 import "../prim"
 
+Damage :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, at: i64),
+}
+
 Options :: struct {
 	keep_at_least: i64,
 	chain:         ^Chain,
+	damage:        Damage,
 }
 
 Journal :: struct {
@@ -25,6 +31,7 @@ Journal :: struct {
 	range_start: i64,
 	links:       [dynamic]Link,
 	redact_path: string,
+	damage:      Damage,
 	allocator:   runtime.Allocator,
 }
 
@@ -45,6 +52,7 @@ journal_open :: proc(j: ^Journal, vfs: prim.Vfs, path: string, opts := Options{}
 		return rerr
 	}
 	j.redact_path = redact_path
+	j.damage = opts.damage
 	fd, oerr := prim.open_file(vfs, path, {.Write, .Group_Visible}, 0o600)
 	if oerr == .Not_Found {
 		if opts.keep_at_least > 0 {
@@ -315,6 +323,59 @@ journal_redact_records :: proc(j: ^Journal, offs: []i64) -> Error {
 	return err
 }
 
+journal_restore :: proc(j: ^Journal, off: i64, rec: []u8) -> Error {
+	if j.fd < 0 || j.open_at >= 0 {
+		return .Invalid
+	}
+	if err := journal_commit(j); err != .None {
+		return err
+	}
+	if off < 0 || off + i64(len(rec)) > j.durable || len(rec) < OVERHEAD || int(prim.get_u32le(rec)) + OVERHEAD != len(rec) {
+		return .Bad_Offset
+	}
+	if kind := classify(rec, off); kind != .Plain && kind != .Redacted {
+		return .Corrupt
+	}
+	cur := make([]u8, len(rec), context.temp_allocator)
+	defer delete(cur, context.temp_allocator)
+	got, rerr := prim.read_at(j.vfs, j.fd, cur, off)
+	if rerr != .None {
+		return _err(rerr)
+	}
+	if got == len(rec) && _ct_same(cur, rec) {
+		return .None
+	}
+	if got >= OVERHEAD {
+		n := int(prim.get_u32le(cur)) + OVERHEAD
+		if n <= got {
+			switch classify(cur[:n], off) {
+			case .Redacted:
+				return .None
+			case .Plain:
+				return .Equivocation
+			case .Invalid, .Sealed:
+			}
+		}
+	}
+	if err := prim.write_at(j.vfs, j.fd, rec, off); err != .None {
+		return _err(err)
+	}
+	j.version += 1
+	return _err(prim.datasync(j.vfs, j.fd))
+}
+
+@(private)
+_ct_same :: proc "contextless" (a, b: []u8) -> bool {
+	if len(a) != len(b) {
+		return false
+	}
+	d: u8
+	for i in 0 ..< len(a) {
+		d |= a[i] ~ b[i]
+	}
+	return d == 0
+}
+
 journal_reader :: proc(j: ^Journal, r: ^Reader, allocator := context.allocator) {
 	reader_init(r, j.vfs, j.fd, 0, allocator)
 	r.journal = j
@@ -479,6 +540,7 @@ _recover_chain :: proc(j: ^Journal) -> Error {
 	clear(&j.links)
 	r: Reader
 	reader_init(&r, j.vfs, j.fd, j.durable, context.temp_allocator)
+	r.damage = j.damage
 	defer reader_close(&r)
 	links := make([dynamic]Link, context.temp_allocator)
 	pos := j.durable

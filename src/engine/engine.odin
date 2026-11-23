@@ -268,6 +268,8 @@ Stats :: struct {
 	base_current: u64,
 	base_mismatch: u64,
 	base_not_text: u64,
+	damaged:      u64,
+	restored:     u64,
 }
 
 Engine :: struct {
@@ -332,11 +334,15 @@ Engine :: struct {
 	closing:      bool,
 	dirty:        [dynamic]Dirty_Seg,
 	draft_dirty:  [dynamic]Draft_Pub,
+	damaged:      [dynamic]Damaged,
+	checks:       map[osync.Stream_Id]Check,
+	restores:     [dynamic]Restore,
 	batches:      [dynamic]^Durable_Batch,
 	batch_seq:    u64,
 	durable_seq:  u64,
 	changed:      map[prim.Id]Change,
 	catalog_q:    map[prim.Id]^Catalog_Update,
+	catalog_parked: map[prim.Id]^Catalog_Update,
 	remote:       Remote_State,
 	index:        search.Index,
 	index_open:   bool,
@@ -416,6 +422,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	_budget_init(e)
 	e.card_pubs = make([dynamic]Card_Pub, e.allocator)
 	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
+	e.catalog_parked = make(map[prim.Id]^Catalog_Update, e.allocator)
 	e.index_dirty = make([dynamic]Index_Item, e.allocator)
 	defer if err != .None {
 		_teardown(e)
@@ -837,6 +844,7 @@ _tick_end :: proc(e: ^Engine) {
 	}
 	_full_step(e)
 	_index_step(e)
+	_damage_step(e)
 	_handles_commit(e)
 	_index_durable_advanced(e)
 	_handles_sweep(e, e.cfg.handle_cache)
@@ -1051,6 +1059,9 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.wake_hooks)
 	delete(e.dirty)
 	delete(e.draft_dirty)
+	delete(e.damaged)
+	delete(e.checks)
+	delete(e.restores)
 	delete(e.batches)
 	delete(e.changed)
 	_git_destroy(e)
@@ -1058,13 +1069,13 @@ _teardown :: proc(e: ^Engine) {
 	_content_destroy(e)
 	delete(e.card_pubs)
 	for _, u in e.catalog_q {
-		delete(u.title, e.allocator)
-		delete(u.role, e.allocator)
-		delete(u.remote, e.allocator)
-		delete(u.lines, e.allocator)
-		free(u, e.allocator)
+		_catalog_update_free(e, u)
 	}
 	delete(e.catalog_q)
+	for _, u in e.catalog_parked {
+		_catalog_update_free(e, u)
+	}
+	delete(e.catalog_parked)
 	delete(e.index_dirty)
 	delete(e.pack_root, e.allocator)
 	delete(e.dir, e.allocator)

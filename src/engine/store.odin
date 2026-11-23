@@ -66,6 +66,7 @@ Durable_Batch :: struct {
 	cards: [dynamic]Card_Pub,
 	marks: [dynamic]Hist_Mark,
 	drafts: [dynamic]Draft_Pub,
+	restores: [dynamic]Restore,
 }
 
 @(private)
@@ -432,6 +433,8 @@ _durable_begin :: proc(e: ^Engine) {
 	e.dirty = make([dynamic]Dirty_Seg, e.allocator)
 	b.drafts = e.draft_dirty
 	e.draft_dirty = make([dynamic]Draft_Pub, e.allocator)
+	b.restores = e.restores
+	e.restores = make([dynamic]Restore, e.allocator)
 	e.batch_seq += 1
 	b.seq = e.batch_seq
 	append(&e.batches, b)
@@ -460,6 +463,11 @@ _durable_begin :: proc(e: ^Engine) {
 			}
 			delete(e.draft_dirty)
 			e.draft_dirty = b.drafts
+			for x in e.restores {
+				append(&b.restores, x)
+			}
+			delete(e.restores)
+			e.restores = b.restores
 			e.reg.meta ||= b.meta
 			for c in e.card_pubs {
 				append(&b.cards, c)
@@ -531,6 +539,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		for p in b.drafts {
 			_draft_publish(e, p)
 		}
+		_restores_durable(e, b.restores[:])
 		for &d in b.segs {
 			_publish(e, &d)
 			if d.kind == .File_Tree && d.length > 0 {
@@ -577,6 +586,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 	delete(b.cards)
 	delete(b.marks)
 	delete(b.drafts)
+	delete(b.restores)
 	free(b, e.allocator)
 }
 

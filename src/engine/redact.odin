@@ -55,6 +55,11 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 
 map_redact :: proc(e: ^Engine, o: Object, key: []u8) -> Error {
 	context = context_for(e)
+	return _damage_busy(e, o.id, _map_redact(e, o, key))
+}
+
+@(private)
+_map_redact :: proc(e: ^Engine, o: Object, key: []u8) -> Error {
 	h := _map_writable(e, o) or_return
 	w := &h.mw.core
 	jr := &w.jr
