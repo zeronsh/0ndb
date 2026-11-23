@@ -271,7 +271,7 @@ sync_one :: proc(db: ^Odb, path: string, dir: bool, data_only: bool) -> (fd: pri
 }
 
 @(private)
-sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
+sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string, order_only := false) -> Error {
 	when ODIN_OS == .Windows {
 		if vfs_is_os(db.vfs) && len(files) + len(dirs) > 1 {
 			if werr, fallback := writeout_batch(db, files, dirs, roots); !fallback {
@@ -332,7 +332,11 @@ sync_paths :: proc(db: ^Odb, files, dirs: []string, roots: []string) -> Error {
 			}
 		}
 		if last != prim.INVALID_FD {
-			perr(prim.datasync(db.vfs, last)) or_return
+			if order_only {
+				perr(prim.barrier(db.vfs, last)) or_return
+			} else {
+				perr(prim.datasync(db.vfs, last)) or_return
+			}
 		}
 	}
 	return .None
