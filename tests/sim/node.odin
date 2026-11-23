@@ -876,7 +876,7 @@ _node_stats :: proc "contextless" () {
 	STAT_TIER_SLOW_READS = register_stat(40, 3, "object_reads")
 	STAT_TIER_FAILED_READS = register_stat(40, 4, "object_read_faults")
 	STAT_TIER_PARKS = register_stat(40, 5, "relay_thaws_parked")
-	register_stat_line(45)
-	STAT_OWN_TAMPER = register_stat(45, 0, "own_tamper_caught")
-	STAT_LENGTH_LIES = register_stat(45, 1, "length_lies")
+	register_stat_line(49)
+	STAT_OWN_TAMPER = register_stat(49, 0, "own_tamper_caught")
+	STAT_LENGTH_LIES = register_stat(49, 1, "length_lies")
 }
