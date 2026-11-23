@@ -2368,21 +2368,25 @@ branch_key :: proc(m: ^Mount, head: Git_Head, allocator: runtime.Allocator) -> s
 }
 
 @(private)
+mount_line_pseudo :: proc(mount: prim.Id, line: string) -> (pseudo: prim.Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb mount line"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	id := mount
+	blake2b.update(&ctx, id[:])
+	blake2b.update(&ctx, transmute([]u8)line)
+	blake2b.final(&ctx, pseudo[:])
+	return
+}
+
 mount_line_actor :: proc(m: ^Mount) -> Error {
 	self := m.history.self if m.history != nil else m.actor
 	if m.line == m.home_line {
 		m.actor = fshist.ingestion_actor(self, m.id)
 		return .None
 	}
-	ctx: blake2b.Context
-	blake2b.init(&ctx, 16)
-	tag := "0ndb mount line"
-	blake2b.update(&ctx, transmute([]u8)tag)
-	id := m.id
-	blake2b.update(&ctx, id[:])
-	blake2b.update(&ctx, transmute([]u8)m.line)
-	pseudo: prim.Id
-	blake2b.final(&ctx, pseudo[:])
+	pseudo := mount_line_pseudo(m.id, m.line)
 	m.actor = fshist.ingestion_actor(self, pseudo)
 	if m.history != nil {
 		history_register_actor(m.history, m.actor, pseudo) or_return
