@@ -214,10 +214,18 @@ _shared_follow :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
 
 @(private)
 _share_epochs :: proc(e: ^Engine, sp: ^Space, object: prim.Id, recipient: ^osync.Identity, s: ^Share) -> Error {
-	for &ep in sp.mem.epochs {
-		if s.nepochs >= SHARE_EPOCHS {
+	cur := sp.mem.current
+	has_cur := cur >= 0 && cur < len(sp.mem.epochs)
+	room := SHARE_EPOCHS - 1 if has_cur else SHARE_EPOCHS
+	for i in 0 ..= len(sp.mem.epochs) {
+		last := i == len(sp.mem.epochs)
+		if last && !has_cur {
 			break
 		}
+		if !last && (i == cur || s.nepochs >= room) {
+			continue
+		}
+		ep := &sp.mem.epochs[cur if last else i]
 		o := object
 		ck := osync.Content_Key{key = osync.object_epoch_key(&ep.secret, ep.number, o[:]), epoch = ep.number}
 		err := e.keyring.wrap(e.keyring.data, recipient, &ck, &s.epochs[s.nepochs].wrapped)
