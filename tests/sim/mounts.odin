@@ -669,6 +669,7 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	copy(data[last.pos:], tok)
 	op := new_op(m, .Disk_Agent if agent else .Disk_Person, n, sm.oi)
 	op.path = strings.clone(name, w.allocator)
+	op.line = strings.clone(mount_model_line(sm.m, vfs, sm.root), w.allocator)
 	append(&op.deletes, strings.clone(last.text, w.allocator))
 	append(&op.tokens, tok)
 	unseen := false
