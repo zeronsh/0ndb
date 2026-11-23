@@ -79,5 +79,5 @@ _align_bounds :: proc(wn: ^Node, id: osync.Stream_Id) -> (bounds: map[i64]bool, 
 
 @(init)
 _replica_align_hooks :: proc "contextless" () {
-	register_final_check(6, check_replica_align)
+	register_final_check(7, check_replica_align)
 }

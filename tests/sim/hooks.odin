@@ -2,6 +2,7 @@ package sim
 
 import "core:fmt"
 import "core:os"
+import "base:runtime"
 import "core:slice"
 import "core:strings"
 import eng "../../src/engine"
@@ -26,17 +27,20 @@ Stat_Def :: struct {
 	order: int,
 	name:  string,
 	max:   bool,
+	at:    runtime.Source_Code_Location,
 }
 
 Stat_Line :: struct {
 	order:  int,
 	prefix: string,
+	at:     runtime.Source_Code_Location,
 }
 
 @(private = "file")
 Ordered :: struct($P: typeid) {
 	order: int,
 	call:  P,
+	at:    runtime.Source_Code_Location,
 }
 
 @(private = "file")
@@ -44,6 +48,7 @@ Restart_Entry :: struct {
 	order:    int,
 	call:     Restart_Hook,
 	quiesced: bool,
+	at:       runtime.Source_Code_Location,
 }
 
 @(private = "file")
@@ -52,6 +57,7 @@ Ext_Op :: struct {
 	name:   string,
 	weight: Op_Weight,
 	run:    Op_Run,
+	at:     runtime.Source_Code_Location,
 }
 
 @(private = "file")
@@ -115,6 +121,32 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.lines.items[:reg.lines.n], proc(a, b: Stat_Line) -> bool {
 		return a.order < b.order
 	})
+	_unique("final check", reg.final_checks.items[:reg.final_checks.n])
+	_unique("world init", reg.inits.items[:reg.inits.n])
+	_unique("world destroy", reg.destroys.items[:reg.destroys.n])
+	_unique("collect", reg.collects.items[:reg.collects.n])
+	_unique("step", reg.steps.items[:reg.steps.n])
+	_unique("engine event", reg.engine_events.items[:reg.engine_events.n])
+	_unique("restarted", reg.restarted.items[:reg.restarted.n])
+	_unique("op", reg.ops.items[:reg.ops.n])
+	_unique("stat line", reg.lines.items[:reg.lines.n])
+	stats := reg.stats.items[:reg.stats.n]
+	for a, i in stats {
+		for b in stats[i + 1:] {
+			if a.line == b.line && a.order == b.order {
+				fmt.panicf("sim hooks: stat line %d order %d is registered twice, at %s:%d and %s:%d", a.line, a.order, a.at.file_path, a.at.line, b.at.file_path, b.at.line)
+			}
+		}
+	}
+}
+
+@(private = "file")
+_unique :: proc(table: string, items: []$T) {
+	for i in 1 ..< len(items) {
+		if items[i].order == items[i - 1].order {
+			fmt.panicf("sim hooks: %s order %d is registered twice, at %s:%d and %s:%d", table, items[i].order, items[i - 1].at.file_path, items[i - 1].at.line, items[i].at.file_path, items[i].at.line)
+		}
+	}
 }
 
 @(private = "file")
@@ -127,49 +159,49 @@ _add :: proc "contextless" (t: ^Table($T, $N), x: T) -> int {
 	return i
 }
 
-register_final_check :: proc "contextless" (order: int, check: Final_Check) {
-	_add(&reg.final_checks, Ordered(Final_Check){order, check})
+register_final_check :: proc "contextless" (order: int, check: Final_Check, loc := #caller_location) {
+	_add(&reg.final_checks, Ordered(Final_Check){order = order, call = check, at = loc})
 }
 
-register_restarted :: proc "contextless" (order: int, hook: Restart_Hook, quiesced := true) {
-	_add(&reg.restarted, Restart_Entry{order, hook, quiesced})
+register_restarted :: proc "contextless" (order: int, hook: Restart_Hook, quiesced := true, loc := #caller_location) {
+	_add(&reg.restarted, Restart_Entry{order = order, call = hook, quiesced = quiesced, at = loc})
 }
 
-register_world :: proc "contextless" (order: int, init: World_Hook = nil, destroy: World_Hook = nil) {
+register_world :: proc "contextless" (order: int, init: World_Hook = nil, destroy: World_Hook = nil, loc := #caller_location) {
 	if init != nil {
-		_add(&reg.inits, Ordered(World_Hook){order, init})
+		_add(&reg.inits, Ordered(World_Hook){order = order, call = init, at = loc})
 	}
 	if destroy != nil {
-		_add(&reg.destroys, Ordered(World_Hook){order, destroy})
+		_add(&reg.destroys, Ordered(World_Hook){order = order, call = destroy, at = loc})
 	}
 }
 
-register_collect :: proc "contextless" (order: int, hook: Collect_Hook) {
-	_add(&reg.collects, Ordered(Collect_Hook){order, hook})
+register_collect :: proc "contextless" (order: int, hook: Collect_Hook, loc := #caller_location) {
+	_add(&reg.collects, Ordered(Collect_Hook){order = order, call = hook, at = loc})
 }
 
-register_step :: proc "contextless" (order: int, hook: Step_Hook) {
-	_add(&reg.steps, Ordered(Step_Hook){order, hook})
+register_step :: proc "contextless" (order: int, hook: Step_Hook, loc := #caller_location) {
+	_add(&reg.steps, Ordered(Step_Hook){order = order, call = hook, at = loc})
 }
 
 register_event :: proc "contextless" (hook: Event_Hook) -> Ev_Kind {
 	return Ev_Kind(EV_EXT_BASE + _add(&reg.events, hook))
 }
 
-register_engine_event :: proc "contextless" (order: int, hook: Engine_Event_Hook) {
-	_add(&reg.engine_events, Ordered(Engine_Event_Hook){order, hook})
+register_engine_event :: proc "contextless" (order: int, hook: Engine_Event_Hook, loc := #caller_location) {
+	_add(&reg.engine_events, Ordered(Engine_Event_Hook){order = order, call = hook, at = loc})
 }
 
-register_op :: proc "contextless" (order: int, name: string, weight: Op_Weight, run: Op_Run) {
-	_add(&reg.ops, Ext_Op{order, name, weight, run})
+register_op :: proc "contextless" (order: int, name: string, weight: Op_Weight, run: Op_Run, loc := #caller_location) {
+	_add(&reg.ops, Ext_Op{order = order, name = name, weight = weight, run = run, at = loc})
 }
 
-register_stat_line :: proc "contextless" (order: int, prefix := "") {
-	_add(&reg.lines, Stat_Line{order, prefix})
+register_stat_line :: proc "contextless" (order: int, prefix := "", loc := #caller_location) {
+	_add(&reg.lines, Stat_Line{order = order, prefix = prefix, at = loc})
 }
 
-register_stat :: proc "contextless" (line: int, order: int, name: string, max := false) -> Stat {
-	return Stat(_add(&reg.stats, Stat_Def{line, order, name, max}))
+register_stat :: proc "contextless" (line: int, order: int, name: string, max := false, loc := #caller_location) -> Stat {
+	return Stat(_add(&reg.stats, Stat_Def{line = line, order = order, name = name, max = max, at = loc}))
 }
 
 stat_add :: proc(w: ^World, s: Stat, v: u64 = 1) {

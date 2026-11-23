@@ -1776,7 +1776,7 @@ _check_stats :: proc "contextless" () {
 	register_final_check(50, check_redaction)
 	register_final_check(80, check_relay_redaction)
 	register_final_check(90, check_relay_plaintext)
-	register_final_check(120, check_uploaded)
+	register_final_check(116, check_uploaded)
 	register_final_check(121, check_own_tails)
 	register_restarted(5, check_own_tail)
 	register_stat_line(60)
