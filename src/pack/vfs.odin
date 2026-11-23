@@ -1371,6 +1371,12 @@ extent :: proc(p: ^Pack, fd: prim.Fd, off: i64, n: i64) -> (r: Phys_Range, ok: b
 			}
 			l = min(l, p.buf_base - ph)
 		}
+		if _staged(p, e.cont, ph, l) {
+			if ph >= p.fl.data_off {
+				return
+			}
+			l = p.fl.data_off - ph
+		}
 		cfd, err := _cont_fd(p, e.cont)
 		if err != .None {
 			return

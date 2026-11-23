@@ -70,6 +70,10 @@ Inflight :: struct {
 	dirsync:  bool,
 	crec:     [REC_HDR + COMMIT_BODY]u8,
 	crec_off: i64,
+	data:     [dynamic]u8,
+	data_off: i64,
+	data_fd:  prim.Fd,
+	data_cont: u32,
 	ccont:    u32,
 	cpos:     i64,
 	scans:    [dynamic]Scan,
@@ -256,6 +260,9 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 	if fl.dirsync {
 		fl.nsync += 1
 		prim.barrier_dir(base, fl.root) or_return
+	}
+	if len(fl.data) > 0 {
+		prim.write_at(base, fl.data_fd, fl.data[:], fl.data_off) or_return
 	}
 	if fl.wrote {
 		prim.write_at(base, fl.fd, fl.crec[:], fl.crec_off) or_return

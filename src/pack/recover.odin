@@ -36,6 +36,7 @@ open :: proc(p: ^Pack, base: prim.Vfs, root: string, opts := DEFAULT_OPTIONS, al
 	p.unlinks = make([dynamic]Pending_Unlink, allocator)
 	p.waiters = make([dynamic]Waiter, allocator)
 	p.fl.fds = make([dynamic]Job_Fd, allocator)
+	p.fl.data = make([dynamic]u8, allocator)
 	p.fl.zjobs = make([dynamic]Zero_Job, allocator)
 	p.fl.syncs = make([dynamic]Cont_Fd, allocator)
 	p.fl.newc_fd = prim.INVALID_FD
@@ -83,6 +84,7 @@ _release :: proc(p: ^Pack) {
 	}
 	_worker_stop(p)
 	delete(p.fl.fds)
+	delete(p.fl.data)
 	delete(p.fl.zjobs)
 	delete(p.fl.syncs)
 	delete(p.fl.busy)
