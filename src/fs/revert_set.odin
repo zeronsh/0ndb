@@ -76,17 +76,53 @@ set_classify :: proc(data: rawptr, lv: crdt.Lv) -> crdt.Revert_Class {
 }
 
 mount_revert_set :: proc(m: ^Mount, base: Version, actors: []prim.Id) -> (revert: prim.Id, err: Error) {
+	mount_sync(m) or_return
+	h := m.history
+	revert = history_revert_set(h, m.line, base, m.synced[:], actors) or_return
+	if revert == {} {
+		return
+	}
+	if history_reloading(h) {
+		m.reload_owed = true
+		mount_reload_retry(m)
+		return revert, .None
+	}
+	if merr := mount_materialize(m); merr != .Reloading {
+		return revert, merr
+	}
+	m.reload_owed = true
+	mount_reload_retry(m)
+	return revert, .None
+}
+
+mount_unrevert :: proc(m: ^Mount, revert: prim.Id) -> (again: prim.Id, err: Error) {
+	mount_wake(m) or_return
+	before := revert_parents(m.history, revert, context.temp_allocator) or_return
+	return mount_revert_set(m, before, []prim.Id{revert})
+}
+
+revert_parents :: proc(h: ^History, revert: prim.Id, allocator := context.allocator) -> (before: Version, err: Error) {
+	history_ready(h) or_return
+	lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{revert, 0})
+	if !ok {
+		return nil, .Not_Found
+	}
+	buf: [1]crdt.Lv
+	ps := crdt.graph_parents(&h.g, lv, &buf)
+	return crdt.graph_version_ids(&h.g, ps, allocator), .None
+}
+
+history_revert_set :: proc(h: ^History, line: string, base: Version, current: Version, actors: []prim.Id) -> (revert: prim.Id, err: Error) {
+	history_ready(h) or_return
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
 		return {}, .No_Memory
 	}
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
-	mount_sync(m) or_return
-	h := m.history
 	bl := make([dynamic]crdt.Lv, context.temp_allocator)
 	cl := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&h.g, base, &bl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &cl) != .None {
+	if crdt.graph_version_lvs(&h.g, base, &bl) != .None || crdt.graph_version_lvs(&h.g, current, &cl) != .None {
 		return {}, .Not_Found
 	}
 	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
@@ -136,37 +172,39 @@ mount_revert_set :: proc(m: ^Mount, base: Version, actors: []prim.Id) -> (revert
 	batch := crdt.Batch {
 		actor   = b.actor,
 		seq     = b.seq0,
-		lamport = history_lamport_after(h, m.synced[:]),
-		parents = m.synced[:],
+		lamport = history_lamport_after(h, current),
+		parents = current,
 		ops     = b.ops[:],
 	}
-	if _, cerr := history_commit_local(h, &batch, m.line); cerr != .None {
+	if _, cerr := history_commit_local(h, &batch, line); cerr != .None {
 		return {}, cerr
 	}
-	if history_reloading(h) {
-		m.reload_owed = true
-		mount_reload_retry(m)
-		return revert, .None
-	}
-	if merr := mount_materialize(m); merr != .Reloading {
-		return revert, merr
-	}
-	m.reload_owed = true
-	mount_reload_retry(m)
 	return revert, .None
 }
 
-mount_unrevert :: proc(m: ^Mount, revert: prim.Id) -> (again: prim.Id, err: Error) {
-	h := m.history
-	mount_wake(m) or_return
-	lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{revert, 0})
-	if !ok {
-		return {}, .Not_Found
+history_mount_actors :: proc(h: ^History, mounts: []prim.Id, lines: []string, allocator := context.allocator) -> (out: []prim.Id, err: Error) {
+	history_ready(h) or_return
+	ids := make([dynamic]prim.Id, context.temp_allocator)
+	for mid in mounts {
+		append(&ids, mid)
+		for l in lines {
+			append(&ids, mount_line_pseudo(mid, l))
+		}
 	}
-	buf: [1]crdt.Lv
-	ps := crdt.graph_parents(&h.g, lv, &buf)
-	before := crdt.graph_version_ids(&h.g, ps, context.temp_allocator)
-	return mount_revert_set(m, before, []prim.Id{revert})
+	list := make([dynamic]prim.Id, allocator)
+	for a in h.g.actors {
+		owner, ok := history_actor_owner(h, a)
+		if !ok {
+			continue
+		}
+		for id in ids {
+			if fshist.ingestion_actor(owner, id) == a {
+				append(&list, a)
+				break
+			}
+		}
+	}
+	return list[:], .None
 }
 
 @(private)

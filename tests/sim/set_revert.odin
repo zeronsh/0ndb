@@ -47,6 +47,7 @@ Sr_Ctx :: struct {
 	model: Sr_Model,
 	actor: [Sr_Who]prim.Id,
 	tag:   u8,
+	engine: bool,
 }
 
 @(private = "file")
@@ -561,13 +562,46 @@ _sr_synced :: proc(c: ^Sr_Ctx) -> fs.Version {
 _sr_revert :: proc(c: ^Sr_Ctx, base: fs.Version, actor: prim.Id) -> (revert: prim.Id, err: fs.Error) {
 	context = instance_context(&c.n.inst)
 	defer node_after(c.n)
+	if c.engine {
+		fs.mount_sync(c.sm.m)
+		r, eerr := eng.tree_revert_set(&c.n.e, c.tree, base, []prim.Id{actor})
+		return r, .None if eerr == .None else .Io
+	}
 	return fs.mount_revert_set(c.sm.m, base, []prim.Id{actor})
 }
 
 @(private = "file")
+_sr_mount_actors :: proc(c: ^Sr_Ctx) {
+	context = instance_context(&c.n.inst)
+	defer node_after(c.n)
+	m := c.sm.m
+	got, err := fs.history_mount_actors(m.history, []prim.Id{m.id}, []string{m.line, "elsewhere"}, context.temp_allocator)
+	if err != .None {
+		world_fail(c.w, "set revert: history_mount_actors failed: %v", err)
+		return
+	}
+	for a in got {
+		if a != m.actor {
+			world_fail(c.w, "set revert: history_mount_actors of the mount returned %v, not its ingestion actor %v", a, m.actor)
+		}
+	}
+	if _, owned := fs.history_actor_owner(m.history, m.actor); owned && len(got) != 1 {
+		world_fail(c.w, "set revert: history_mount_actors of the mount returned %d actors, not its ingestion actor", len(got))
+	}
+	other, _ := fs.history_mount_actors(m.history, []prim.Id{c.actor[.In]}, nil, context.temp_allocator)
+	if len(other) != 0 {
+		world_fail(c.w, "set revert: history_mount_actors of an unknown mount returned %v", other)
+	}
+}
+
 _sr_unrevert :: proc(c: ^Sr_Ctx, revert: prim.Id) -> (again: prim.Id, err: fs.Error) {
 	context = instance_context(&c.n.inst)
 	defer node_after(c.n)
+	if c.engine {
+		fs.mount_sync(c.sm.m)
+		r, eerr := eng.tree_unrevert(&c.n.e, c.tree, revert)
+		return r, .None if eerr == .None else .Io
+	}
 	return fs.mount_unrevert(c.sm.m, revert)
 }
 
@@ -619,6 +653,7 @@ _sr_scenario :: proc(w: ^World) {
 	if !ok {
 		return
 	}
+	c.engine = w.cfg.seed % 2 == 1
 	base := _sr_synced(&c)
 	steps := 6 + rng_int(&w.rng, 10)
 	for _ in 0 ..< steps {
@@ -630,6 +665,7 @@ _sr_scenario :: proc(w: ^World) {
 	}
 	run_until(w, w.now + 2_000_000_000, true)
 	_sr_synced(&c)
+	_sr_mount_actors(&c)
 	before := _sr_disk(&c)
 	revert, rerr := _sr_revert(&c, base, c.actor[.In])
 	if rerr != .None {
@@ -860,4 +896,106 @@ set_revert_crash :: proc(t: ^testing.T) {
 	}
 	fmt.eprintf("set_revert_crash: %d crash points in reverts, %d in reverts of reverts, %d failed\n", points[0], points[1], bad)
 	testing.expect(t, bad == 0, fmt.tprintf("set_revert_crash: %d failures", bad))
+}
+
+@(test)
+set_revert_unmounted :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	reverts := 0
+	count := env_u64("SR_UNMOUNTED_SEEDS", 40)
+	for seed in u64(1) ..= count {
+		w := _sr_crash_world(seed)
+		if _sr_unmounted(w) {
+			reverts += 1
+		}
+		for f in w.failures {
+			fmt.eprintf("set_revert_unmounted seed %d: %s\n", seed, f)
+		}
+		if len(w.failures) > 0 {
+			bad += 1
+		}
+		world_destroy(w)
+		free(w)
+	}
+	fmt.eprintf("set_revert_unmounted: %d seeds, %d reverted, %d failed\n", count, reverts, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("set_revert_unmounted: %d seeds failed", bad))
+}
+
+@(private = "file")
+_sr_unmounted :: proc(w: ^World) -> (reverted: bool) {
+	n := w.nodes[0]
+	if !node_start(n) {
+		world_fail(w, "unmounted revert: node start")
+		return false
+	}
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	space, serr := eng.space_create(&n.e, "unmounted")
+	if serr != .None {
+		world_fail(w, "unmounted revert: space_create: %v", serr)
+		return false
+	}
+	eng.space_open(&n.e, space)
+	tree, terr := eng.tree_create(&n.e, space, "work")
+	if terr != .None {
+		world_fail(w, "unmounted revert: tree_create: %v", terr)
+		return false
+	}
+	names := []string{"a.txt", "b.txt", "c.txt"}
+	tok := 0
+	for nm in names[:2] {
+		tok += 1
+		eng.tree_write(&n.e, tree, nm, transmute([]u8)fmt.tprintf("<u%d>\n", tok))
+	}
+	snapshot :: proc(n: ^Node, tree: eng.Object, names: []string) -> map[string]string {
+		out := make(map[string]string, context.temp_allocator)
+		for nm in names {
+			if data, err := eng.tree_read(&n.e, tree, nm, context.temp_allocator, {}); err == .None {
+				out[nm] = string(data)
+			}
+		}
+		return out
+	}
+	before := snapshot(n, tree, names)
+	base, verr := eng.tree_version(&n.e, tree, "", context.temp_allocator)
+	if verr != .None {
+		world_fail(w, "unmounted revert: tree_version: %v", verr)
+		return false
+	}
+	for _ in 0 ..< 3 + rng_int(&w.rng, 6) {
+		nm := names[rng_int(&w.rng, len(names))]
+		if rng_chance(&w.rng, 1, 5) {
+			eng.tree_remove(&n.e, tree, nm)
+			continue
+		}
+		cur, _ := eng.tree_read(&n.e, tree, nm, context.temp_allocator, {})
+		tok += 1
+		eng.tree_write(&n.e, tree, nm, transmute([]u8)strings.concatenate({string(cur), fmt.tprintf("<u%d>\n", tok)}, context.temp_allocator))
+	}
+	after := snapshot(n, tree, names)
+	revert, rerr := eng.tree_revert_set(&n.e, tree, base, []prim.Id{n.e.self})
+	if rerr != .None {
+		world_fail(w, "unmounted revert: tree_revert_set: %v", rerr)
+		return false
+	}
+	if got := snapshot(n, tree, names); !_sr_same(got, before) {
+		world_fail(w, "unmounted revert: the tree holds %v after the revert, not %v", got, before)
+	}
+	if revert == {} {
+		return false
+	}
+	reverted = true
+	if _, uerr := eng.tree_unrevert(&n.e, tree, revert); uerr != .None {
+		world_fail(w, "unmounted revert: tree_unrevert: %v", uerr)
+		return false
+	}
+	if got := snapshot(n, tree, names); !_sr_same(got, after) {
+		world_fail(w, "unmounted revert: the tree holds %v after the revert of the revert, not %v", got, after)
+	}
+	return
 }
