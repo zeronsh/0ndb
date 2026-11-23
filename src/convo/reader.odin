@@ -176,7 +176,7 @@ _positions :: proc(v: ^obj.View, self: prim.Id) -> (pos: Pos, head: Pos, browsin
 	l := obj.resolve(v, me, sum.leaf) or_return
 	literal = Pos{l, sum.leaf_hlc, v.segs[me].id}
 	if !obj.vref_none(head.at) {
-		if up := is_ancestor(v, l, head.at) or_return; up {
+		if up := is_ancestor(v, l, head.at) or_return; up && head.hlc > sum.leaf_hlc {
 			return head, head, false, literal, .None
 		}
 	}
