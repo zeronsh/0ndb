@@ -1266,6 +1266,7 @@ catch_up :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	if !mount_durable_now(m) {
+		m.mat_held = true
 		return .Deferred
 	}
 	one := [1]crdt.Lv{latest}

@@ -102,9 +102,11 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		}
 	}
 	if crdt.frontier_eq(tl[:], sl[:]) && len(m.absent) == 0 && len(m.reshow) == 0 {
+		m.mat_held = false
 		return .None
 	}
 	if !m.adopting && !mount_durable_now(m) {
+		m.mat_held = true
 		return .Deferred
 	}
 	m.merge_base = m.synced[:] if merge else nil
@@ -311,6 +313,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		clear(&m.synced)
 		append(&m.synced, ..target)
 	}
+	m.mat_held = false
 	m.passes += 1
 	history_trim(h)
 	return .None

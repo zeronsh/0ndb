@@ -124,6 +124,23 @@ _file_inode :: proc(m: ^Mount, rel: string) -> (inode: fstree.Inode_Id, ok: bool
 	return id, true
 }
 
+@(private)
+_file_version :: proc(m: ^Mount, rel: string) -> (v: []crdt.Op_Id, pinned: bool) {
+	e, ok := _file_entry(m, rel)
+	if !ok || e.ver == 0 {
+		return m.synced[:], false
+	}
+	ids, vok := shadow_version(&m.shadow, e)
+	if !vok {
+		return m.synced[:], false
+	}
+	v = make([]crdt.Op_Id, len(ids), context.temp_allocator)
+	for id, i in ids {
+		v[i] = inode_op(m.history, id)
+	}
+	return v, true
+}
+
 scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 	m := s.mount
 	if m == nil || m.history == nil || path_internal(rel) {
@@ -136,7 +153,8 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 		return .None
 	}
 	clean, cok := eol_clean(m, rel, data, inode, true)
-	cur, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
+	at, pinned := _file_version(m, rel)
+	cur, terr := history_text_at(m.history, inode, at, context.temp_allocator)
 	if !cok || terr != .None || string(cur) != string(clean) {
 		if p := _pin(s, rel, false); p != nil {
 			p.has_read = false
@@ -144,12 +162,15 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 		return .None
 	}
 	hash := _content_hash(clean)
-	if oerr := observe_record(m, s, .Read, inode, rel, m.synced[:], hash); oerr != .None && oerr != .Reloading {
+	if oerr := observe_record(m, s, .Read, inode, rel, at, hash, pinned); oerr != .None && oerr != .Reloading {
 		return oerr
+	}
+	if !pinned {
+		at = m.synced[:]
 	}
 	p := _pin(s, rel, true)
 	clear(&p.read)
-	append(&p.read, ..m.synced[:])
+	append(&p.read, ..at)
 	p.read_inode = inode
 	p.read_hash = hash
 	p.has_read = true
@@ -157,16 +178,37 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 }
 
 @(private)
-observe_record :: proc(m: ^Mount, s: ^Scope, kind: fshist.Observe_Kind, inode: fstree.Inode_Id, rel: string, version: []crdt.Op_Id, hash: [32]u8) -> Error {
+observe_record :: proc(m: ^Mount, s: ^Scope, kind: fshist.Observe_Kind, inode: fstree.Inode_Id, rel: string, version: []crdt.Op_Id, hash: [32]u8, pinned := false) -> Error {
 	if !actor_on_line(m, s.actor) {
 		return .None
 	}
+	h := m.history
 	buf := make([dynamic]u8, context.temp_allocator)
-	fshist.encode_observe(&buf, fshist.Observe_Op{kind = kind, inode = inode_op(m.history, inode), path = rel, version = version, hash = hash})
+	fshist.encode_observe(&buf, fshist.Observe_Op{kind = kind, inode = inode_op(h, inode), path = rel, version = version, hash = hash})
 	b: Builder
-	builder_init(&b, m.history, s.actor)
+	builder_init(&b, h, s.actor)
 	builder_opaque(&b, buf[:])
-	return builder_commit(m, &b)
+	if !pinned {
+		return builder_commit(m, &b)
+	}
+	parents := make([dynamic]crdt.Op_Id, context.temp_allocator)
+	append(&parents, ..version)
+	if known := crdt.graph_known(&h.g, s.actor); known > 0 {
+		vl := make([dynamic]crdt.Lv, context.temp_allocator)
+		last, ok := crdt.graph_lv(&h.g, crdt.Op_Id{s.actor, known - 1})
+		if !ok || crdt.graph_version_lvs(&h.g, version, &vl) != .None {
+			return .Corrupt
+		}
+		if !crdt.graph_contains(&h.g, vl[:], last) {
+			one := [1]crdt.Lv{last}
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, vl[:], one[:], &both)
+			clear(&parents)
+			append(&parents, ..crdt.graph_version_ids(&h.g, both[:], context.temp_allocator))
+		}
+	}
+	_, _, err := builder_commit_at(m, &b, parents[:])
+	return err
 }
 
 Observation :: struct {
@@ -230,16 +272,20 @@ scope_write_begin :: proc(s: ^Scope, rel: string) {
 	if !ok {
 		return
 	}
-	cur, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
+	at, pinned := _file_version(m, rel)
+	cur, terr := history_text_at(m.history, inode, at, context.temp_allocator)
 	if terr != .None {
 		return
 	}
-	if oerr := observe_record(m, s, .Write_Begin, inode, rel, m.synced[:], _content_hash(cur)); oerr != .None && oerr != .Reloading {
+	if oerr := observe_record(m, s, .Write_Begin, inode, rel, at, _content_hash(cur), pinned); oerr != .None && oerr != .Reloading {
 		return
+	}
+	if !pinned {
+		at = m.synced[:]
 	}
 	p := _pin(s, rel, true)
 	clear(&p.write)
-	append(&p.write, ..m.synced[:])
+	append(&p.write, ..at)
 	p.write_inode = inode
 	p.has_write = true
 }

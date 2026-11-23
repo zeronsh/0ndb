@@ -414,6 +414,7 @@ Mount :: struct {
 	intents:     [dynamic]Intent,
 	nonce:       prim.Id,
 	mat_wait:    bool,
+	mat_held:    bool,
 	mat_ingest:  bool,
 	copy:        ^Copy_Map,
 	importing:   bool,
@@ -1913,7 +1914,7 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	img.stamp = m.stamp
 	img.imported = m.imported
 	img.adopt_pending = m.adopt_pending
-	img.jpos = m.jpend
+	img.jpos = m.jpos if m.mat_held else m.jpend
 	img.shadow = m.shadow_mark
 	if shadow_attached(&m.shadow) {
 		img.shadow.gen, img.shadow.end = shadow_end(&m.shadow)
@@ -2017,7 +2018,9 @@ mount_settle :: proc(m: ^Mount) -> Error {
 		shadow_flush(m) or_return
 		image_take(m, &m.img)
 		clear(&m.intents)
-		m.jpos = m.jpend
+		if !m.mat_held {
+			m.jpos = m.jpend
+		}
 		attrib_prune(m)
 		return save_mount_state(m)
 	}

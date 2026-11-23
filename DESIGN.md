@@ -761,8 +761,13 @@ equal in both directions.
   `Deferred` stays where it is: a pass whose catch-up defers stops before it
   ingests, the switch stays in its phase, `mount_materialize` returns as it
   does when the line is not yet durable, and `mount_sync` reports `Deferred`
-  so a closing scope records its attribution for the pass that resumes. Disk
-  only ever holds content history can name after any crash. Ingest never reads an owed path that is missing on disk
+  so a closing scope records its attribution for the pass that resumes.
+  While a materialization is held, the image keeps its journal position, so
+  recovery replays an own batch the held `synced` does not contain, and a
+  pin or observation of a file whose entry names a version (a rebase whose
+  merge waits) is taken at that version, with the observation's parents that
+  version and the actor's last op. Disk only ever holds content history can
+  name after any crash. Ingest never reads an owed path that is missing on disk
   as a delete, and the next pass that completes drains `absent`. A removal
   whose unlink fails fails its item, so its entry is never dropped while the
   file is still on disk. A pass whose line version is ahead of `synced`
