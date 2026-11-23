@@ -2,11 +2,46 @@ package fs
 
 import "core:fmt"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../prim"
 
 mount_synced_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	return verify_mount(m, true, out, allocator)
+}
+
+history_file_mismatches :: proc(h: ^History, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+	if h == nil || !h.awake {
+		return .None
+	}
+	inos := make([dynamic]fstree.Inode_Id, context.temp_allocator)
+	for ino, f in h.files {
+		if f.loaded {
+			append(&inos, ino)
+		}
+	}
+	for ino in inos {
+		f, ok := h.files[ino]
+		if !ok || !f.loaded {
+			continue
+		}
+		served := crdt.text_bytes(&f.text, context.temp_allocator)
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		append(&lvs, ..f.text.version[:])
+		tmp: File_State
+		tmp.inode = ino
+		tmp.rec = f.rec
+		tmp.new_refs = f.new_refs
+		err := load_text(h, &tmp, lvs[:])
+		if err == .None {
+			rebuilt := crdt.text_bytes(&tmp.text, context.temp_allocator)
+			if string(served) != string(rebuilt) {
+				append(out, fmt.aprintf("inode %v: served %q, rebuilt from its records %q", ino, served, rebuilt, allocator = allocator))
+			}
+		}
+		fshist.text_drop(&tmp.st)
+	}
+	return .None
 }
 
 mount_shadow_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := context.allocator) -> Error {
