@@ -240,6 +240,7 @@ _content_unavailable :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 		append(&list, d)
 	}
 	e.unavailable[w.object] = list
+	w.inflight = false
 	for d in list {
 		_emit(e, Event{kind = .Unavailable, space = sp.id, object = w.object, device = d})
 	}
@@ -249,7 +250,7 @@ _content_unavailable :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 _content_holders_changed :: proc(e: ^Engine, sp: ^Space) {
 	for k in _sorted_keys(e.content.waits) {
 		w := e.content.waits[k]
-		if w.space != sp.id || w.stage != .Holders || !w.inflight {
+		if w.space != sp.id || w.stage != .Holders {
 			continue
 		}
 		oid := w.oid
@@ -258,5 +259,6 @@ _content_holders_changed :: proc(e: ^Engine, sp: ^Space) {
 			continue
 		}
 		osync.replicator_object_holders(&sp.repl, &h.scope, oid[:w.n], _content_holders(e, sp, w.object))
+		w.inflight = true
 	}
 }

@@ -2822,16 +2822,22 @@ Relay cost tracks the reachable information, not the activity. Items marked
   devices, filtered by presence. It uses the existing `Pull`/`Serve` frames
   with the object's (part) key in the `segment` field; the relay forwards
   them like a segment pull and reads nothing. The holder resolves the key
-  through its registry of objects it chose not to upload (remote-backed,
-  device-only, over budget; one entry per key and per part of a chunked
-  object), seals exactly the sealed chunks of the requested aligned range as
+  through its registry of the blobs its own tree records reference, kept
+  for every blob it published whether it uploaded it or not (uploaded,
+  remote-backed, device-only, over budget; one entry per key and per part
+  of a chunked object), so a writer whose upload is still in flight, or was
+  lost in a crash and redone, serves the bytes on its disk; seals exactly the sealed chunks of the requested aligned range as
   a `Put` would (blobs of 8 MiB and more are streamed once into
   `$DATA/serve/` and read by range) and answers in at most 256 KiB frames
   without record framing, 127 sealed chunks per pull. The reader decrypts
   and verifies each chunk with the object key exactly as a relay-served
   object; a bad holder is skipped and `Peer_Misbehaving` reported. With no
   holder online the engine emits `Unavailable{object, device}` per holder
-  and keeps the read pending; a presence `up` re-pulls. Device-only trees
+  and keeps the read pending; that answer completes the request. A
+  presence `up` re-drives every pending content wait in the space from the
+  relay stage with its rounds reset, so a blob uploaded meanwhile arrives
+  from the relay and one still held arrives from the holder; no wait is
+  left parked on a request that was already answered. Device-only trees
   upload neither blobs nor checkpoints.
 - **Peer serving.** A reader that needs a range below `base` pulls it from a
   holder: the segment's writer or another device with segments in the same

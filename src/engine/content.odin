@@ -275,6 +275,7 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 			continue
 		}
 		e.content.ups[ref.oid] = Content_Up{space = h.sp.id, object = h.id}
+		append(&held, ref)
 		mark.pending += 1
 	}
 	_serve_register(e, h, held[:])
@@ -589,6 +590,28 @@ _content_retry :: proc(e: ^Engine, w: ^Content_Wait) {
 }
 
 @(private)
+_content_rewait :: proc(e: ^Engine, sp: ^Space) {
+	for k in _sorted_keys(e.content.waits) {
+		w := e.content.waits[k]
+		if w.space != sp.id || w.inflight {
+			continue
+		}
+		if w.timer != 0 {
+			prim.timer_cancel(e.loop, w.timer)
+			w.timer = 0
+		}
+		w.attempts = 0
+		w.rounds = 0
+		w.reported = false
+		w.url = 0
+		w.stage = .Relay
+		if !_content_request(e, w) {
+			_content_retry(e, w)
+		}
+	}
+}
+
+@(private)
 _content_data_arrived :: proc(e: ^Engine, object: prim.Id) {
 	for sid in _sorted_keys(e.spaces) {
 		sp := e.spaces[sid]
@@ -604,4 +627,21 @@ _content_data_arrived :: proc(e: ^Engine, object: prim.Id) {
 			w.attempts = 0
 		}
 	}
+}
+
+Content_Wait_Info :: struct {
+	space:    prim.Id,
+	object:   prim.Id,
+	oid:      odb.Oid,
+	n:        int,
+	inflight: bool,
+}
+
+content_waits :: proc(e: ^Engine, allocator := context.allocator) -> []Content_Wait_Info {
+	out := make([dynamic]Content_Wait_Info, allocator)
+	for k in _sorted_keys(e.content.waits) {
+		w := e.content.waits[k]
+		append(&out, Content_Wait_Info{w.space, w.object, w.oid, w.n, w.inflight})
+	}
+	return out[:]
 }
