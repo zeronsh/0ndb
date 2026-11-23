@@ -42,6 +42,11 @@ _owns_segment :: proc "contextless" (kind: Kind) -> bool {
 }
 
 @(private)
+_owns_history :: proc "contextless" (kind: Kind) -> bool {
+	return kind == .Text || kind == .File_Tree
+}
+
+@(private)
 Reg_Fact :: struct {
 	key:   [33]u8,
 	klen:  int,
@@ -109,14 +114,14 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 		if notes != nil {
 			_own_keys_verify(e, id, rec.kind, notes) or_return
 		}
-		if !_owns_segment(rec.kind) {
+		if !_owns_segment(rec.kind) && (fixes == nil || !_owns_history(rec.kind)) {
 			continue
 		}
 		n := own_len(e, &lens, id, rec.kind) or_return
 		if n > 0 {
 			continue
 		}
-		if notes != nil {
+		if notes != nil && _owns_segment(rec.kind) {
 			append(notes, fmt.tprintf("registry: %v %s is marked own but its own segment is absent", rec.kind, prim.id_hex(id)))
 		}
 		if fixes != nil {
@@ -138,8 +143,8 @@ _reg_audit :: proc(e: ^Engine, fixes: ^[dynamic]Reg_Fix, notes: ^[dynamic]string
 			}
 			kind := Kind(f.value[0])
 			n := own_len(e, &lens, id, kind) or_return
-			if _owns_segment(kind) && n == 0 {
-				if notes != nil {
+			if n == 0 && (_owns_segment(kind) || fixes != nil && _owns_history(kind)) {
+				if notes != nil && _owns_segment(kind) {
 					append(notes, fmt.tprintf("registry: owned %v %s has no own segment", kind, prim.id_hex(id)))
 				}
 				if fixes != nil {
