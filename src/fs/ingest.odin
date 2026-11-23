@@ -1646,6 +1646,7 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 			retarget_subtree(&was, ino, &touched) or_return
 			retarget_subtree(&snap, ino, &touched) or_return
 		}
+		displaced_touch(m, &snap, &touched) or_return
 		order := sorted_inodes(touched)
 		for ino in order {
 			if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
@@ -1664,9 +1665,15 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 			if perr != nil {
 				return .Corrupt
 			}
-			if pok {
-				shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
+			if !pok {
+				continue
 			}
+			d := probe(m, p) or_return
+			if d.kind == .Missing {
+				mount_absent_add(m, p)
+				continue
+			}
+			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
 	}
 	clear(&m.synced)
