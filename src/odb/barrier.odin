@@ -170,22 +170,27 @@ barrier :: proc(db: ^Odb) -> Error {
 				append(&db.owed_files, s)
 			}
 		}
-		for f in uf {
-			if is_loose_object(db, f) {
-				prim.remove(db.vfs, f)
-				track_locked(db, "", parent_dir(f))
-				continue
-			}
-			if s, cerr := strings.clone(f, db.allocator); cerr == nil {
-				append(&db.owed_files, s)
-			}
-		}
+		owe_files_locked(db, uf)
 		for d in ud {
 			track_locked(db, "", d)
 		}
 		sync.mutex_unlock(&db.mutex)
 	}
 	return err
+}
+
+@(private)
+owe_files_locked :: proc(db: ^Odb, files: []string) {
+	for f in files {
+		if is_loose_object(db, f) {
+			prim.remove(db.vfs, f)
+			track_locked(db, "", parent_dir(f))
+			continue
+		}
+		if s, cerr := strings.clone(f, db.allocator); cerr == nil {
+			append(&db.owed_files, s)
+		}
+	}
 }
 
 @(private)
