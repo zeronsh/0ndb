@@ -302,13 +302,17 @@ def f_cli_first_token():
     out = []
     try:
         listed = dm.cli("models").get("providers", [])
+        dm.cli("new", "flows-runners")
+        signed = set()
+        for rn in dm.cli("runners").get("runners", []):
+            signed.update(rn.get("signed_in", []))
         print("cli flow: providers %s" % [(p.get("id"), p.get("available")) for p in listed], file=sys.stderr, flush=True)
         wanted = os.environ.get("FLOWS_CLI_PROVIDERS", "claude,codex").split(",")
         for pr in listed:
             if pr.get("id") not in wanted:
                 continue
-            if not pr.get("available"):
-                out.append(dict(flow="%s send → first token" % pr.get("id"), runs=0, notes="skipped: %s" % (pr.get("error") or "not available")))
+            if not pr.get("available") or pr.get("id") not in signed:
+                out.append(dict(flow="%s send → first token" % pr.get("id"), runs=0, notes="skipped: %s" % ("not signed in" if pr.get("available") else pr.get("error") or "not installed")))
                 continue
             pid = pr["id"]
             model = picks.get(pid) or next((m["id"] for m in pr.get("models", []) if m.get("default")), "")
