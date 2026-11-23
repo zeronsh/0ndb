@@ -83,6 +83,7 @@ Node :: struct {
 	persist_fail: int,
 	ckpt_window: proc(n: ^Node, e: ^eng.Engine, object: eng.Object, stage: eng.Checkpoint_Stage),
 	persist_outage: bool,
+	persist_outage_at: i64,
 	unavailable: int,
 	incarnation: int,
 	inst:        Instance,

@@ -5,6 +5,7 @@ import "../../src/prim"
 
 STAT_PERSIST_OUTAGES: Stat
 STAT_DEFERRED_CLOSES: Stat
+STAT_UNSEEN_WRITES: Stat
 EV_PERSIST_OUTAGE_END: Ev_Kind
 
 @(init)
@@ -16,6 +17,7 @@ _persist_outage_init :: proc "contextless" () {
 	register_stat_line(54, "persist_outage")
 	STAT_PERSIST_OUTAGES = register_stat(54, 0, "outages")
 	STAT_DEFERRED_CLOSES = register_stat(54, 1, "deferred_closes")
+	STAT_UNSEEN_WRITES = register_stat(54, 2, "writes_replaced_unseen")
 }
 
 op_persist_outage :: proc(w: ^World, n: ^Node) {
@@ -32,6 +34,7 @@ op_persist_outage :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	n.persist_outage = true
+	n.persist_outage_at = w.now
 	stat_add(w, STAT_PERSIST_OUTAGES)
 	ms := rng_range(&w.fault_rng, 5_000, 120_000)
 	world_note(w, "%s history persists fail for %d ms (injected)", n.name, ms)
@@ -111,4 +114,22 @@ sim_scope_open :: proc(w: ^World, reg: ^fs.Registry, m: ^fs.Mount, id: prim.Id, 
 	}
 	w.scope_actors[actor] = true
 	return fs.scope_open(reg, m, id, actor)
+}
+
+_unseen_writes_uncertain :: proc(w: ^World, n: ^Node, oi: int, changes: []Git_Change) {
+	m := &w.model
+	for ch in changes {
+		for op in m.ops {
+			if op.obj != oi || op.node != n.idx || (op.kind != .Disk_Person && op.kind != .Disk_Agent) || op.at < n.persist_outage_at {
+				continue
+			}
+			if !same_file(m, oi, op.path, ch.name) {
+				continue
+			}
+			if op.status == .Acked || op.status == .Done || op.status == .Observed {
+				op.status = .Uncertain
+				stat_add(w, STAT_UNSEEN_WRITES)
+			}
+		}
+	}
 }
