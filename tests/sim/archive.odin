@@ -343,6 +343,7 @@ _compare_trusted :: proc(w: ^World, n: ^Node, rm: ^osync.Remote, im: ^Cipher_Ima
 
 STAT_TRIMS: Stat
 STAT_TAIL: Stat
+STAT_RESTORE_HOLDERS: Stat
 STAT_OVER_TAIL: Stat
 STAT_TRIMMED: Stat
 STAT_RESTORES_WRITTEN: Stat
@@ -404,6 +405,7 @@ _archive_hooks :: proc "contextless" () {
 	STAT_RESTORE_COLD = register_stat(77, 9, "restore_cold_reads")
 	STAT_FETCH_RATIO = register_stat(77, 10, "max_fetch_ratio_pct", true)
 	STAT_TAIL = register_stat(77, 11, "tail_window", true)
+	STAT_RESTORE_HOLDERS = register_stat(77, 13, "restore_holders_online")
 	STAT_OVER_TAIL = register_stat(77, 12, "records_over_tail")
 }
 
@@ -568,8 +570,13 @@ check_restore_offline_writer :: proc(w: ^World) {
 	run_until(w, w.now + 60_000_000_000, true)
 	offline := make([dynamic]^Node, w.allocator)
 	defer delete(offline)
+	held := _held_devices(w, tn, ob)
 	for n in w.nodes {
 		if n == tn || n.partitioned || !n.alive {
+			continue
+		}
+		if n != p.wn && (w.cfg.storage == .Device || w.cfg.storage == .Device_Until_Run || slice.contains(held, n.identity.id)) {
+			stat_add(w, STAT_RESTORE_HOLDERS)
 			continue
 		}
 		n.partitioned = true
@@ -590,7 +597,7 @@ check_restore_offline_writer :: proc(w: ^World) {
 		}
 	}
 	if !got.complete {
-		world_fail(w, "restore: new device %s could not read %v %s through the Restore with every other device offline (%s)", tn.name, ob.kind, id_short(ob.o.id), got.why)
+		world_fail(w, "restore: new device %s could not read %v %s through the Restore with the writer and every device not holding a segment offline (%s)", tn.name, ob.kind, id_short(ob.o.id), got.why)
 		return
 	}
 	if _strip_catalog(got.text) != _strip_catalog(ref.text) {
@@ -696,11 +703,30 @@ _strip_catalog :: proc(text: string) -> string {
 }
 
 @(private = "file")
+_held_devices :: proc(w: ^World, n: ^Node, ob: ^M_Obj) -> []prim.Id {
+	out := make([dynamic]prim.Id, context.temp_allocator)
+	context = instance_context(&n.inst)
+	h := _archive_handle(n, ob)
+	node_after(n)
+	if h == nil {
+		return out[:]
+	}
+	for s in h.segs {
+		sid := osync.stream_id(&h.scope, s.device, h.name, 0)
+		_, base, trimmed, exists := relay_stream_state(w, ob.o.space, sid)
+		if exists && !trimmed && base > 0 {
+			append(&out, s.device)
+		}
+	}
+	return out[:]
+}
+
+@(private = "file")
 _forget_pick :: proc(w: ^World) -> (p: Restore_Pick, ok: bool) {
 	m := &w.model
 	for _, oi in m.objs {
 		ob := &m.objs[oi]
-		if !obj_exists(m, oi) {
+		if !obj_exists(m, oi) || (ob.kind == .Tree && (w.cfg.storage == .Device || w.cfg.storage == .Device_Until_Run)) {
 			continue
 		}
 		for ri in readers_of(w, oi) {

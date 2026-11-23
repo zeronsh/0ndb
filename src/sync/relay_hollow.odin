@@ -491,7 +491,7 @@ _on_trim :: proc(c: ^Conn, rd: ^prim.Reader) {
 		_stream_maybe_release(r, st)
 		return
 	}
-	if base <= st.base {
+	if base < st.base || (base == st.base && (st.trimmed || base == 0)) {
 		_reply_hollow(c, .Noted, cast([32]u8)id, st.base, _live_len(st))
 		_stream_maybe_release(r, st)
 		return
@@ -520,6 +520,7 @@ _trim_done :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn, p: ^Pending, resu
 	}
 	sp.usage = max(sp.usage - value, 0)
 	st.base = r.store.stream_base(r.store.data, st.h)
+	flipped := !st.trimmed
 	st.trimmed = true
 	r.stats.trims += 1
 	r.stats.trimmed += u64(max(value, 0))
@@ -528,8 +529,8 @@ _trim_done :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn, p: ^Pending, resu
 	}
 	for f in st.followers {
 		for &sub in f.subs {
-			if sub.stream == st && sub.offset < st.base {
-				sub.offset = st.base
+			if sub.stream == st && (sub.offset < st.base || flipped) {
+				sub.offset = max(sub.offset, st.base)
 				if f != c {
 					_reply_hollow(f, .Trimmed, p.id, st.base, st.length)
 				}
