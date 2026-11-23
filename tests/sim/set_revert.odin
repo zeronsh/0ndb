@@ -435,7 +435,7 @@ _sr_accept :: proc(c: ^Sr_Ctx, phase: string) {
 			if x.kind == .Revert {
 				pick = x
 				pick.path = strings.clone(x.path, c.model.alloc)
-				pick.theirs = slice.clone(x.raw.theirs, c.model.alloc)
+				pick.theirs = slice.clone(x.theirs, c.model.alloc)
 				ok = true
 				break
 			}
