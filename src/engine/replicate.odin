@@ -725,7 +725,11 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 				esc := _object_scope(sp, id)
 				defer osync.scope_clear(&esc)
 				x, xok := sp.remote_trees[osync.stream_id(&esc, device, seg, 0)]
-				if !xok || x.loaded || x.epoch != epoch {
+				if !xok || x.epoch != epoch {
+					return
+				}
+				if x.loaded {
+					_keys_head_current(e, sp, id, x)
 					return
 				}
 				x.requested = false
@@ -738,13 +742,38 @@ _keys_epoch_seen :: proc(e: ^Engine, sp: ^Space, id: prim.Id, device: prim.Id, s
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
 	stream := osync.stream_id(&sc, device, seg, 0)
-	_, had := sp.remote_trees[stream]
+	prev, had := sp.remote_trees[stream]
+	same := had && prev.loaded && prev.epoch == epoch
 	rt, terr := _remote_tree_get(e, sp, &sc, device, seg, epoch)
+	if terr == .None && same {
+		_keys_head_current(e, sp, id, rt)
+		return
+	}
 	if terr == .None && had {
 		if h, hok := e.handles[id]; hok {
 			_handle_rekey(h, device, rt)
 		}
 	}
+	if terr == .None && rt.loaded && rt.epoch == epoch {
+		rt.current = _epoch_newest(sp, rt)
+		osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
+	}
+	_object_changed(e, sp.id, id, .Keys)
+}
+
+@(private)
+_keys_head_current :: proc(e: ^Engine, sp: ^Space, id: prim.Id, rt: ^Remote_Tree) {
+	rt.current = _epoch_newest(sp, rt)
+	osync.keytree_destroy(&rt.tree)
+	rt.loaded = false
+	_remote_tree_load(e, sp, rt)
+	if !rt.loaded {
+		return
+	}
+	if h, ok := e.handles[id]; ok {
+		_handle_rekey(h, rt.device, rt)
+	}
+	osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
 	_object_changed(e, sp.id, id, .Keys)
 }
 

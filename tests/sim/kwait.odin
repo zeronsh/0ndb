@@ -19,6 +19,11 @@ check_kwait :: proc(w: ^World) {
 
 check_kwait_repl :: proc(w: ^World, n: ^Node, r: ^osync.Replicator) {
 	for _, rm in r.remotes {
+		if rm.keys_wait && !rm.quarantined && _keys_complete(r, rm) {
+			world_fail(w, "kwait: %s still waits on keys for %s of device %s although it holds that writer's whole keys stream and keys head", n.name, rm.name, id_short(rm.device))
+		}
+	}
+	for _, rm in r.remotes {
 		if !rm.keys_wait || rm.kwait_head == {} || rm.quarantined {
 			continue
 		}
@@ -34,6 +39,32 @@ check_kwait_repl :: proc(w: ^World, n: ^Node, r: ^osync.Replicator) {
 			world_fail(w, "kwait: %s holds the keys head %s of device %s (%d bytes) but no keys stream remote while %s waits on keys", n.name, head.name, id_short(head.device), journal.replica_length(&head.rep), rm.name)
 		}
 	}
+}
+
+_keys_complete :: proc(r: ^osync.Replicator, rm: ^osync.Remote) -> bool {
+	kn, kerr := osync.keys_stream_name(rm.name)
+	if kerr != .None {
+		return false
+	}
+	hn, herr := osync.keys_head_name(kn)
+	if herr != .None {
+		return false
+	}
+	keys, head := false, false
+	for _, x in r.remotes {
+		if x.device != rm.device || x.relay_len <= 0 || journal.replica_length(&x.rep) != x.relay_len {
+			continue
+		}
+		if _, missing := journal.replica_missing(&x.rep, 0, x.relay_len); missing {
+			continue
+		}
+		if x.name == kn {
+			keys = true
+		} else if x.name == hn {
+			head = true
+		}
+	}
+	return keys && head
 }
 
 @(init)

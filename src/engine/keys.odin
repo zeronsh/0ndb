@@ -32,6 +32,7 @@ Remote_Tree :: struct {
 	requested: bool,
 	absent:    bool,
 	locked:    bool,
+	current:   osync.Epoch_Tag,
 	refs:      int,
 }
 
