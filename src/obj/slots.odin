@@ -325,7 +325,10 @@ _slots_fresh :: proc(vfs: prim.Vfs, path: string, owner: prim.Id, slots: u64) ->
 
 @(private)
 _slots_blank :: proc(vfs: prim.Vfs, path: string, owner: prim.Id, slots: u64, covered: i64) -> (fd: prim.Fd, err: Error) {
-	f, oerr := prim.open_file(vfs, path, {.Write, .Create, .Truncate}, 0o600)
+	if e := prim.remove(vfs, path); e != .None && e != .Not_Found {
+		return prim.INVALID_FD, perr(e)
+	}
+	f, oerr := prim.open_file(vfs, path, {.Write, .Create, .Exclusive}, 0o600)
 	if oerr != .None {
 		return prim.INVALID_FD, perr(oerr)
 	}
