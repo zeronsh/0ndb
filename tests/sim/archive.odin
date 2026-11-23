@@ -3,6 +3,7 @@ package sim
 import "core:fmt"
 import "core:slice"
 
+import "../../src/arc"
 import eng "../../src/engine"
 import "../../src/journal"
 import "../../src/prim"
@@ -131,8 +132,17 @@ check_archive_reread :: proc(w: ^World) {
 			_compare_cipher(w, n, x)
 		}
 	}
+	rounds := 2 + int(wiped / (256 * 1024))
 	for oi, i in objs {
 		d := digest_object(w, n, oi)
+		for r := 0; !d.complete && r < rounds; r += 1 {
+			delete(d.text, w.allocator)
+			run_until(w, w.now + 60_000_000_000, true)
+			if len(w.failures) > 0 || w.aborted {
+				return
+			}
+			d = digest_object(w, n, oi)
+		}
 		if !d.complete {
 			world_fail(w, "archive: %s could not reread %v %s through its archive after forgetting the trimmed prefix (%s)", n.name, m.objs[oi].kind, id_short(m.objs[oi].o.id), d.why)
 			continue
@@ -363,6 +373,7 @@ _archive_hooks :: proc "contextless" () {
 	register_final_check(87, check_forget_third_reader)
 	register_final_check(88, check_forget_offline_writer)
 	register_final_check(91, check_restore_offline_writer)
+	register_final_check(94, check_archive_trimmed)
 	register_final_check(95, check_archive_cipher)
 	register_final_check(97, check_archive_waits)
 	register_final_check(98, check_fetch_bound)
@@ -591,7 +602,7 @@ check_restore_offline_writer :: proc(w: ^World) {
 		if n == tn || n.partitioned || !n.alive {
 			continue
 		}
-		if n != p.wn && (w.cfg.storage == .Device || w.cfg.storage == .Device_Until_Run || slice.contains(held, n.identity.id)) {
+		if n != p.wn && (w.cfg.storage == .Device || w.cfg.storage == .Device_Until_Run || slice.contains(held, eng.self(&n.e))) {
 			stat_add(w, STAT_RESTORE_HOLDERS)
 			continue
 		}
@@ -1073,6 +1084,97 @@ check_fetch_bound :: proc(w: ^World) {
 		}
 	}
 	stat_max(w, STAT_FETCH_RATIO, u64(worst))
+}
+
+check_archive_trimmed :: proc(w: ^World) {
+	if w.aborted || len(w.failures) > 0 || w.cfg.archive_min < 0 {
+		return
+	}
+	m := &w.model
+	objs := make([dynamic]int, 0, len(m.objs), w.allocator)
+	defer delete(objs)
+	for _, oi in m.objs {
+		append(&objs, oi)
+	}
+	for oi in objs {
+		if !obj_exists(m, oi) {
+			continue
+		}
+		ob := &m.objs[oi]
+		for n in w.nodes {
+			if !n.alive || !n.e_open {
+				continue
+			}
+			seg, aid: osync.Stream_Id
+			ok := false
+			ids: {
+				context = instance_context(&n.inst)
+				if h := _archive_handle(n, ob); h != nil {
+					if aname, nerr := arc.stream_name(h.name, context.temp_allocator); nerr == .None {
+						me := eng.self(&n.e)
+						seg = osync.stream_id(&h.scope, me, h.name, 0)
+						aid = osync.stream_id(&h.scope, me, aname, 0)
+						ok = true
+					}
+				}
+				node_after(n)
+			}
+			if !ok {
+				continue
+			}
+			sealed, sok := relay_last_seal(w, ob.o.space, aid)
+			if !sok || sealed <= 0 {
+				continue
+			}
+			length, base, _, exists := relay_stream_state(w, ob.o.space, seg)
+			if exists && base < sealed && sealed < length {
+				world_fail(w, "archive: %s's %v %s segment is sealed to %d on the relay but its relay base is still %d once the world is quiet (length %d)", n.name, ob.kind, id_short(ob.o.id), sealed, base, length)
+			}
+		}
+	}
+}
+
+relay_last_seal :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> (base: i64, ok: bool) {
+	rn := &w.relay
+	if !rn.alive {
+		return
+	}
+	context = instance_context(&rn.inst)
+	defer relay_after(rn)
+	st := rn.r.store
+	sp, sok := rn.r.spaces[space]
+	if !sok || sp.ns == nil {
+		return
+	}
+	sh, length, err := st.stream_open(st.data, sp.ns, id, false)
+	if err != .None {
+		return
+	}
+	defer st.stream_close(st.data, sh)
+	from := max(st.stream_base(st.data, sh), length - 64 * 1024)
+	buf := make([]u8, int(length - from), context.temp_allocator)
+	if got, rerr := st.stream_read(st.data, sh, from, buf); rerr != .None || got != len(buf) {
+		return
+	}
+	end := len(buf)
+	for end >= journal.OVERHEAD {
+		nb := int(prim.get_u32le(buf[end - 4:]))
+		start := end - nb - journal.OVERHEAD
+		if nb < 0 || start < 0 || int(prim.get_u32le(buf[start:])) != nb {
+			return
+		}
+		body := buf[start + journal.HEADER:][:nb]
+		if nb > 0 && body[0] == arc.SEAL_KIND {
+			s: arc.Seal
+			s.entries = make([dynamic]arc.Seal_Entry, context.temp_allocator)
+			if arc.seal_parse(body, &s) == .None {
+				return s.base, true
+			}
+			return
+		}
+		end = start
+	}
+	return
 }
 
 check_restore_exercised :: proc(w: ^World) {

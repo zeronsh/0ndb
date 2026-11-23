@@ -1025,7 +1025,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
-	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l || l.arc_timer != 0 {
+	if _local_owes(r, l) {
 		return
 	}
 	if r.hold > 0 {
@@ -1037,6 +1037,31 @@ _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
 	}
 	delete_key(&r.locals, l.id)
 	_local_free(r, l)
+}
+
+@(private)
+_local_owes :: proc(r: ^Replicator, l: ^Local) -> bool {
+	if l.fatal || r.rx_local == l {
+		return true
+	}
+	if l.inflight > 0 || l.noting || l.cursor < l.durable || l.ahead > 0 {
+		return true
+	}
+	if l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.dropping || l.floor_owed {
+		return true
+	}
+	if l.arc_timer != 0 {
+		return true
+	}
+	if l.arc_child {
+		if _, inflight := r.trims[l.trim_for]; inflight {
+			return true
+		}
+		if l.trim_wait || (l.trim_base > 0 && l.trim_sent < l.trim_base) {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
