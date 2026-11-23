@@ -10,6 +10,10 @@ PACKLIVE = os.environ.get("COST_PACKLIVE", os.path.join(REPO, "bin", "packlive")
 OUT = os.environ.get("COST_OUT", os.path.join(tempfile.gettempdir(), "costbench"))
 TRANSCRIPT = os.environ.get("COST_TRANSCRIPT", "")
 SETTLE = float(os.environ.get("COST_SETTLE", "5"))
+QUIET = float(os.environ.get("COST_QUIET", "45"))
+SETTLE_MAX = float(os.environ.get("COST_SETTLE_MAX", "1800"))
+WATCH = []
+SETTLES = []
 LIMIT = ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
 
 
@@ -130,6 +134,8 @@ class Client:
 class Relay:
     def __init__(self, d):
         self.dir = d
+        WATCH.append(os.path.join(d, "relay"))
+        WATCH.append(os.path.join(d, "objects"))
         self.port = free_port()
         self.proc = spawn([BIN, "relay", "--dir", "relay", "--objects", "objects", "--listen", "127.0.0.1:%d" % self.port, "--open"], d, "relay.log")
         for _ in range(100):
@@ -170,6 +176,7 @@ class Device:
     def __init__(self, d, name, relay, env_extra=None, daemon_args=()):
         self.dir = d
         self.home = name
+        WATCH.append(os.path.join(d, name))
         self.env = dict(os.environ)
         self.env.update(env_extra or {})
         self.daemon = spawn([BIN, "daemon", "--home", name, "--host-plugs", "sealed_store,unlock"] + list(daemon_args), d, name + ".daemon.log", self.env)
@@ -200,8 +207,54 @@ class Device:
         term(self.host)
 
 
+def fingerprint():
+    total = files = newest = 0
+    for top in WATCH:
+        for root, dirs, names in os.walk(top):
+            if os.path.basename(root) == "run":
+                dirs[:] = []
+                continue
+            for n in names:
+                try:
+                    st = os.stat(os.path.join(root, n))
+                except OSError:
+                    continue
+                total += st.st_size
+                files += 1
+                newest = max(newest, st.st_mtime_ns)
+    return total, files, newest
+
+
 def settle(seconds):
+    start = time.time()
     time.sleep(seconds)
+    last = fingerprint()
+    since = time.time()
+    quiet = False
+    while time.time() - start < SETTLE_MAX:
+        time.sleep(0.5)
+        fp = fingerprint()
+        if os.environ.get("COST_TRACE_FP") and fp != last:
+            best = ("", 0, 0)
+            for top in WATCH:
+                for root, dirs, names in os.walk(top):
+                    for n in names:
+                        try:
+                            st = os.stat(os.path.join(root, n))
+                        except OSError:
+                            continue
+                        if st.st_mtime_ns > best[1]:
+                            best = (os.path.join(root, n), st.st_mtime_ns, st.st_size)
+            print("fp %.1f %s newest %s size %d" % (time.time() - start, fp, best[0], best[2]), file=sys.stderr)
+        if fp != last:
+            last, since = fp, time.time()
+        elif time.time() - since >= QUIET:
+            quiet = True
+            break
+    waited = time.time() - start - (QUIET if quiet else 0)
+    SETTLES.append(dict(busy_s=round(waited, 1), quiesced=quiet))
+    if not quiet:
+        print("settle: no quiesce within %d s" % SETTLE_MAX, file=sys.stderr)
 
 
 class Sampler:
@@ -259,6 +312,8 @@ def measure(relay, info, extra=None, sampler=None):
     row = dict(pack_bytes=pack, pack_disk_bytes=disk, object_files=files, object_live_bytes=obj, info_bytes=info)
     row.update(st)
     row.update(extra or {})
+    row["settles"] = list(SETTLES)
+    SETTLES.clear()
     if sampler:
         row["samples"] = sampler.rows
     row["pack"] = pack_breakdown(os.path.join(relay.dir, "relay", "spaces"))
