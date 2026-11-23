@@ -49,6 +49,7 @@ Dir_Entry :: struct {
 Vfs_Cap :: enum u8 {
 	Durable_Dir_Ops_With_Data,
 	Atomic_Group_Commit,
+	Durable_Size,
 }
 
 Vfs_Caps :: bit_set[Vfs_Cap;u8]

@@ -20,6 +20,7 @@ Journal :: struct {
 	fd:          prim.Fd,
 	ck_fd:       prim.Fd,
 	atomic:      bool,
+	sized:       bool,
 	durable:     i64,
 	checkpoint:  i64,
 	version:     u64,
@@ -79,7 +80,9 @@ journal_open :: proc(j: ^Journal, vfs: prim.Vfs, path: string, opts := Options{}
 		return _err(oerr)
 	}
 	j.fd = fd
-	j.atomic = .Atomic_Group_Commit in prim.file_caps(vfs, fd)
+	caps := prim.file_caps(vfs, fd)
+	j.atomic = .Atomic_Group_Commit in caps
+	j.sized = j.atomic || .Durable_Size in caps
 	if !j.atomic {
 		ck_fd, kerr := prim.open_file(vfs, ck_path, {.Write, .Create}, 0o600)
 		if kerr != .None {
@@ -487,7 +490,7 @@ _recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 	if size < keep_at_least {
 		return .Corrupt
 	}
-	ck := size if j.atomic else _read_checkpoint(j.vfs, j.ck_fd)
+	ck := size if j.sized else _read_checkpoint(j.vfs, j.ck_fd)
 	if ck > size {
 		return .Corrupt
 	}
