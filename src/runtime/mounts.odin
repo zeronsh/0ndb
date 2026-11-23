@@ -731,7 +731,7 @@ worktree_tool_open :: proc(ws: ^Worktree, run: ^Run, id: string) -> int {
 	sid := _tool_scope_id(ws, id)
 	for mb, i in ws.members {
 		if mb.m != nil {
-			scopes[i] = fs.scope_open(reg, mb.m, sid, sid)
+			scopes[i] = fs.scope_open(reg, mb.m, sid, sid, nil, run.line_prev)
 		}
 	}
 	append(&ws.tools, Wt_Tool{id = clone(id, ws.alloc), scopes = scopes, before = _versions_blob(ws, ws.alloc), open = true})

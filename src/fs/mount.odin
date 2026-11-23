@@ -366,6 +366,7 @@ Mount :: struct {
 	awake:       bool,
 	synced:      [dynamic]crdt.Op_Id,
 	dirty:       map[string]^Scope,
+	dirty_at:    map[string]i64,
 	rescan:      bool,
 	git_moved:   bool,
 	fence_seq:   u64,
@@ -554,6 +555,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.line, _ = clone_string(opts.line, allocator)
 	m.synced = make([dynamic]crdt.Op_Id, allocator)
 	m.dirty = make(map[string]^Scope, allocator)
+	m.dirty_at = make(map[string]i64, allocator)
 	m.open_scopes = make(map[string]^Scope, allocator)
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
@@ -845,6 +847,8 @@ mount_close :: proc(m: ^Mount) {
 		delete(k, m.allocator)
 	}
 	delete(m.dirty)
+	dirty_at_clear(m)
+	delete(m.dirty_at)
 	for k in m.open_scopes {
 		delete(k, m.allocator)
 	}
@@ -1017,8 +1021,85 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 	} else {
 		k, _ := clone_string(rel, m.allocator)
 		m.dirty[k] = s
+		if s == nil {
+			dirty_at_note(m, rel, mount_mono_ns(m))
+		}
 	}
 	mount_schedule(m, m.opts.settle_ms)
+}
+
+Observe_Since :: struct {
+	mono: i64,
+	wall: i64,
+}
+
+@(private)
+mount_mono_ns :: proc(m: ^Mount) -> i64 {
+	if m.history != nil && m.history.opts.clock.mono_ns != nil {
+		return m.history.opts.clock.mono_ns(m.history.opts.clock.data)
+	}
+	return 0
+}
+
+@(private)
+dirty_at_note :: proc(m: ^Mount, rel: string, at: i64) {
+	if at == 0 || rel in m.dirty_at {
+		return
+	}
+	k, _ := clone_string(rel, m.allocator)
+	m.dirty_at[k] = at
+}
+
+@(private)
+dirty_at_drop :: proc(m: ^Mount, rel: string) {
+	if rel in m.dirty_at {
+		k, _ := delete_key(&m.dirty_at, rel)
+		delete(k, m.allocator)
+	}
+}
+
+@(private)
+_pass_before :: proc(m: ^Mount, since: Observe_Since) -> Error {
+	Kept :: struct {
+		key: string,
+		at:  i64,
+	}
+	kept := make([dynamic]Kept, context.temp_allocator)
+	if since.mono != 0 {
+		for k, v in m.dirty {
+			if at, ok := m.dirty_at[k]; ok && v == nil && at >= since.mono {
+				append(&kept, Kept{k, at})
+			}
+		}
+	}
+	for &x in kept {
+		x.key, _ = delete_key(&m.dirty, x.key)
+		dirty_at_drop(m, x.key)
+	}
+	err := Error.None
+	if len(m.dirty) > 0 {
+		err = mount_pass(m, false)
+	}
+	for x in kept {
+		if x.key in m.dirty {
+			delete(x.key, m.allocator)
+		} else {
+			m.dirty[x.key] = nil
+		}
+		dirty_at_note(m, x.key, x.at)
+	}
+	if len(kept) > 0 {
+		mount_schedule(m, m.opts.settle_ms)
+	}
+	return err
+}
+
+@(private)
+dirty_at_clear :: proc(m: ^Mount) {
+	for k in m.dirty_at {
+		delete(k, m.allocator)
+	}
+	clear(&m.dirty_at)
 }
 
 mount_mark_observed :: proc(m: ^Mount, rel: string, scope: ^Scope) {
@@ -1041,8 +1122,8 @@ mount_mark_observed :: proc(m: ^Mount, rel: string, scope: ^Scope) {
 	mount_schedule(m, m.opts.settle_ms)
 }
 
-mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, done: Observe_Done = nil, ctx: rawptr = nil) -> Error {
-	logged, err := _observe_begin(m, rel, scope)
+mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, done: Observe_Done = nil, ctx: rawptr = nil, since := Observe_Since{}) -> Error {
+	logged, err := _observe_begin(m, rel, scope, since)
 	if err != .None || !logged {
 		if done != nil {
 			done(ctx, err)
@@ -1053,7 +1134,7 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, done: Observe
 }
 
 @(private)
-_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> (logged: bool, err: Error) {
+_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Since) -> (logged: bool, err: Error) {
 	if scope == nil || path_internal(rel) {
 		return false, .None
 	}
@@ -1062,8 +1143,15 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> (logged: bool, 
 	pending, dirty := m.dirty[rel]
 	other := dirty && pending != scope
 	owned := attributed && !a.used && a.actor == scope.actor
+	if other && pending == nil && since.mono != 0 {
+		if at, marked := m.dirty_at[rel]; marked && at >= since.mono {
+			other = false
+			m.dirty[rel] = scope
+			dirty_at_drop(m, rel)
+		}
+	}
 	if !stale && !dirty && !owned && m.open_scopes[rel] != scope && mount_disk_unseen(m, rel) {
-		other = true
+		other = !_written_since(m, rel, since)
 		pending = nil
 	}
 	if stale || other {
@@ -1167,6 +1255,15 @@ _log_sync_done :: proc(arg: rawptr) {
 	if m != nil && len(m.log_next) > 0 && m.reg != nil && m.reg.exec.run != nil {
 		_log_sync_start(m, m.reg.exec, nil)
 	}
+}
+
+@(private)
+_written_since :: proc(m: ^Mount, rel: string, since: Observe_Since) -> bool {
+	if since.wall == 0 {
+		return false
+	}
+	d, perr := probe(m, rel)
+	return perr == .None && d.kind == .File && stat_racy(d.stat, since.wall)
 }
 
 @(private)
@@ -1574,9 +1671,9 @@ mount_sync :: proc(m: ^Mount) -> Error {
 	return result
 }
 
-scope_open :: proc(reg: ^Registry, m: ^Mount, id: prim.Id, actor: prim.Id, pids: []prim.Pid = nil) -> ^Scope {
+scope_open :: proc(reg: ^Registry, m: ^Mount, id: prim.Id, actor: prim.Id, pids: []prim.Pid = nil, since := Observe_Since{}) -> ^Scope {
 	if m != nil && len(m.dirty) > 0 {
-		mount_pass(m, false)
+		_pass_before(m, since)
 	}
 	s := new(Scope, reg.allocator)
 	s.id = id

@@ -1571,6 +1571,12 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		delete(k, m.allocator)
 	}
 	clear(&m.dirty)
+	dirty_at := make(map[string]i64, p.long)
+	for k, v in m.dirty_at {
+		c, _ := clone_string(k, p.long)
+		dirty_at[c] = v
+	}
+	dirty_at_clear(m)
 	rescan_was := m.rescan
 	m.rescan = false
 	m.git_moved = false
@@ -1579,6 +1585,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			if k not_in m.dirty {
 				c, _ := clone_string(k, m.allocator)
 				m.dirty[c] = v
+				if at, ok := dirty_at[k]; ok && v == nil {
+					dirty_at_note(m, k, at)
+				}
 			}
 		}
 		m.rescan ||= rescan_was || p.full
@@ -1619,6 +1628,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		}
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
+		if at, ok := dirty_at[y]; ok && p.scope_of[y] == nil {
+			dirty_at_note(m, y, at)
+		}
 	}
 	for y in p.holding {
 		if y in m.dirty {
@@ -1626,6 +1638,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		}
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
+		if at, ok := dirty_at[y]; ok && p.scope_of[y] == nil {
+			dirty_at_note(m, y, at)
+		}
 	}
 	rebase_materialize(m, p.rebased[:]) or_return
 	if p.head_moved && m.has_git && !p.git_wrote {
