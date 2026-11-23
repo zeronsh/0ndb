@@ -157,6 +157,7 @@ _redlog_add :: proc(r: ^Relay_Core, sp: ^Space_State, p: ^Pending) {
 	prim.put_u64le(rec[40:], u64(p.total))
 	append(&sp.redlog_q, ..rec[:])
 	append(&sp.redlog_qp, p)
+	_red_index_add(r, sp, Stream_Id(p.id), p.from, p.total)
 	_redlog_flush(r, sp)
 }
 
