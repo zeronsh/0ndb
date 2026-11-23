@@ -503,7 +503,7 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = pa.scope, agent = true})
 	oerr := fs.mount_observe_begin(sm.m, pa.name, pa.scope)
-	if oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
+	if oerr != .None && oerr != .Reloading && !n.disk.dead && w.cfg.io_rate == 0 {
 		world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 	}
 	err := prim.Error.Io
@@ -553,7 +553,9 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	op_done(op, eng.pending_seq(&n.e), .None)
-	if serr != .None && w.cfg.io_rate == 0 && !injected {
+	if serr == .Reloading {
+		stat_add(w, STAT_DEFERRED_CLOSES)
+	} else if serr != .None && w.cfg.io_rate == 0 && !injected {
 		world_fail(w, "%s scope_close failed: %v", n.name, serr)
 	}
 }
@@ -620,7 +622,7 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
 	if agent {
-		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
+		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && oerr != .Reloading && !n.disk.dead && w.cfg.io_rate == 0 {
 			world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 		}
 	}
@@ -652,7 +654,9 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 		op_done(op, 0, .None)
 		op.status = .Acked
 	}
-	if serr != .None && w.cfg.io_rate == 0 {
+	if serr == .Reloading {
+		stat_add(w, STAT_DEFERRED_CLOSES)
+	} else if serr != .None && w.cfg.io_rate == 0 {
 		world_fail(w, "%s scope_close failed: %v", n.name, serr)
 	}
 }
@@ -731,7 +735,7 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 	if agent {
 		oerr = fs.mount_observe_begin(sm.m, name, scope)
 		if oerr != .None && !n.disk.dead {
-			if w.cfg.io_rate == 0 {
+			if w.cfg.io_rate == 0 && oerr != .Reloading {
 				world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 			}
 		} else if oerr == .None {
@@ -793,7 +797,9 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 			op_done(op, 0, .None)
 			op.status = .Acked
 		}
-		if serr != .None && w.cfg.io_rate == 0 {
+		if serr == .Reloading {
+			stat_add(w, STAT_DEFERRED_CLOSES)
+		} else if serr != .None && w.cfg.io_rate == 0 {
 			world_fail(w, "%s scope_close failed: %v", n.name, serr)
 		}
 		if serr == .None && !n.disk.dead && rng_chance(&w.rng, 1, 3) {

@@ -615,8 +615,7 @@ _index_segment :: proc(e: ^Engine, h: ^Handle, device: prim.Id, r: ^journal.Read
 
 @(private)
 _index_text :: proc(e: ^Engine, h: ^Handle) {
-	_hist_catch_up(e, h)
-	if h.hist == nil {
+	if _hist_caught_up(e, h) != .None || h.hist == nil {
 		return
 	}
 	inode, found, ierr := _text_inode(h)
