@@ -591,7 +591,7 @@ _ovl_drop :: proc(e: ^Engine, b: ^Buffer) {
 	saved := _ops_temp(_binverse(b.oc[:])[:])
 	gone := _gone_of(e, b, saved[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
-	_pend_clear(e, b)
+	_pend_rebase(e, b, saved[:])
 	e.stats.buffer_live_dropped += 1
 	ops := _bytes_to_units(b, saved[:], _view_units_at, true)
 	_buffer_emit_ops(e, b, ops[:], gone[:])
@@ -624,7 +624,7 @@ _ovl_advanced :: proc(e: ^Engine, b: ^Buffer, a: []crdt.Delta_Op) -> bool {
 	fix := _ops_temp(_bcompose(_binverse(b.oc[:])[:], a)[:])
 	gone := _gone_of(e, b, fix[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
-	_pend_clear(e, b)
+	_pend_rebase(e, b, fix[:])
 	e.stats.buffer_live_dropped += 1
 	ops := _bytes_to_units(b, fix[:], _view_units_at, true)
 	_buffer_emit_ops(e, b, ops[:], gone[:])
@@ -924,12 +924,16 @@ _log_acks :: proc(b: ^Buffer) -> [dynamic]Ack {
 				continue peers
 			}
 		}
-		n := fs.history_next_seq(b.hist, actor)
-		if n == 0 {
-			append(&out, Ack{actor, 0})
-		} else if fs.history_contains(b.hist, b.version[:], crdt.Op_Id{actor, n - 1}) {
-			append(&out, Ack{actor, n})
+		lo, hi := u64(0), fs.history_next_seq(b.hist, actor)
+		for lo < hi {
+			mid := lo + (hi - lo + 1) / 2
+			if fs.history_contains(b.hist, b.version[:], crdt.Op_Id{actor, mid - 1}) {
+				lo = mid
+			} else {
+				hi = mid - 1
+			}
 		}
+		append(&out, Ack{actor, lo})
 	}
 	return out
 }
@@ -1057,6 +1061,7 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 			if len(r.content) != r.len {
 				return
 			}
+			_bpush(&d, crdt.Delta_Op{kind = .Retain, n = dpos - consumed})
 			_bpush(&d, crdt.Delta_Op{kind = .Insert, n = r.len, text = r.content, author = batch.actor})
 			append(&seqs, cur)
 			consumed = dpos
@@ -1074,8 +1079,9 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 		tie := _actor_less(batch.actor, b.actor)
 		for &p in b.pend {
 			c2, p2 := _btransform(moved, p.ops[:], tie)
+			np := _ops_own(e, p2[:])
 			_ops_release(e, &p.ops)
-			p.ops = _ops_own(e, p2[:])
+			p.ops = np
 			moved = c2[:]
 		}
 		e.stats.buffer_live_transformed += 1
@@ -1604,8 +1610,9 @@ _ovl_rebase :: proc(e: ^Engine, b: ^Buffer, ev: []crdt.Delta_Op) {
 	cur := ev
 	for o in b.ovl {
 		o2, c2 := _btransform(o.ops[:], cur, true)
+		no := _ops_own(e, o2[:])
 		_ops_release(e, &o.ops)
-		o.ops = _ops_own(e, o2[:])
+		o.ops = no
 		cur = c2[:]
 	}
 	_ovl_recompose(e, b)
@@ -1625,8 +1632,9 @@ _pend_rebase :: proc(e: ^Engine, b: ^Buffer, c: []crdt.Delta_Op) {
 	cur := cb[:]
 	for &p in b.pend {
 		p2, c2 := _btransform(p.ops[:], cur, true)
+		np := _ops_own(e, p2[:])
 		_ops_release(e, &p.ops)
-		p.ops = _ops_own(e, p2[:])
+		p.ops = np
 		cur = c2[:]
 	}
 }
