@@ -311,13 +311,29 @@ line_switch_after_crash :: proc(t: ^testing.T) {
 @(private = "file")
 SA_PRE :: "main a\npre\n"
 
-@(private = "file")
-SA_RACED :: "main a\npre\nraced\n"
+Switch_Race_Kind :: enum u8 {
+	Edit,
+	Create,
+	Create_Dir,
+}
 
-switch_ingest_race_run :: proc(seed: u64) -> (failures: [dynamic]string, raced: bool) {
+@(private = "file")
+_sa_raced :: proc(kind: Switch_Race_Kind) -> (path: string, data: string) {
+	switch kind {
+	case .Edit:
+		return "a.txt", "main a\npre\nraced\n"
+	case .Create:
+		return "c.txt", "raced c\n"
+	case .Create_Dir:
+		return "fresh/d.txt", "raced d\n"
+	}
+	return
+}
+
+switch_ingest_race_run :: proc(seed: u64, kind: Switch_Race_Kind) -> (failures: [dynamic]string, raced: bool) {
 	failures = make([dynamic]string)
 	w := _sa_world(seed)
-	raced = _switch_ingest_race(w)
+	raced = _switch_ingest_race(w, kind)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -337,7 +353,7 @@ _sa_step :: proc(w: ^World) -> bool {
 }
 
 @(private = "file")
-_switch_ingest_race :: proc(w: ^World) -> (raced: bool) {
+_switch_ingest_race :: proc(w: ^World, kind: Switch_Race_Kind) -> (raced: bool) {
 	n, tree, ok := _sa_setup(w)
 	if !ok {
 		return
@@ -374,22 +390,24 @@ _switch_ingest_race :: proc(w: ^World) -> (raced: bool) {
 			return
 		}
 	}
-	if _, pending := fs.mount_switch_pending(sm.m); !pending || sm.m.switch_phase != fs.SWITCH_INGEST {
+	if _, pending := fs.mount_switch_pending(sm.m); !pending || sm.m.switch_phase != fs.SWITCH_INGEST || n.watch_scheduled {
 		return
 	}
-	if err := _sa_write(vfs, SA_ROOT + "/a.txt", transmute([]u8)string(SA_RACED)); err != .None {
+	rpath, rdata := _sa_raced(kind)
+	if kind == .Create_Dir {
+		if err := prim.mkdir(vfs, SA_ROOT + "/fresh"); err != .None {
+			world_fail(w, "switch ingest race: mkdir: %v", err)
+			return
+		}
+	}
+	if err := _sa_write(vfs, fmt.tprintf("%s/%s", SA_ROOT, rpath), transmute([]u8)rdata); err != .None {
 		world_fail(w, "switch ingest race: raced write: %v", err)
 		return
 	}
-	held := make([dynamic]Watch_Ev, context.temp_allocator)
-	for i := 0; i < len(n.disk.events); {
-		if strings.has_prefix(n.disk.events[i].path, SA_ROOT) {
-			append(&held, n.disk.events[i])
-			ordered_remove(&n.disk.events, i)
-			continue
-		}
-		i += 1
+	if n.watch_scheduled || len(n.disk.events) == 0 {
+		return
 	}
+	n.watch_scheduled = true
 	raced = true
 	flipped := false
 	for limit := w.now + 20_000_000_000; w.now < limit && !flipped; {
@@ -408,13 +426,15 @@ _switch_ingest_race :: proc(w: ^World) -> (raced: bool) {
 		world_fail(w, "switch ingest race: the switch never left ingest")
 		return
 	}
-	append(&n.disk.events, ..held[:])
+	n.watch_scheduled = false
 	node_after(n)
 	run_until(w, w.now + 20_000_000_000, true)
-	main_l, _ := _sa_line(w, n, tree, "main")
-	feat_l, _ := _sa_line(w, n, tree, SA_FEATURE)
-	if main_l["a.txt"] != SA_RACED || strings.contains(feat_l["a.txt"], "raced") {
-		world_fail(w, "switch ingest race: a write made while the switch to %s was ingesting, its watch event delayed past the line flip, is %q on main and %q on the target", SA_FEATURE, main_l["a.txt"], feat_l["a.txt"])
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	on_main, _ := eng.tree_read(&n.e, tree, rpath, context.temp_allocator, {}, "main")
+	on_feat, _ := eng.tree_read(&n.e, tree, rpath, context.temp_allocator, {}, SA_FEATURE)
+	if string(on_main) != rdata || strings.contains(string(on_feat), "raced") {
+		world_fail(w, "switch ingest race: a %v of %s made while the switch to %s was ingesting, its watch event delayed past the line flip, is %q on main and %q on the target", kind, rpath, SA_FEATURE, string(on_main), string(on_feat))
 	}
 	return
 }
@@ -426,21 +446,23 @@ line_switch_ingest_race :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	raced := 0
-	for seed in u64(1) ..= 20 {
-		failures, r := switch_ingest_race_run(seed)
-		for f in failures {
-			fmt.eprintf("line_switch_ingest_race seed %d: %s\n", seed, f)
-			delete(f)
+	for kind in Switch_Race_Kind {
+		raced := 0
+		for seed in u64(1) ..= 20 {
+			failures, r := switch_ingest_race_run(seed, kind)
+			for f in failures {
+				fmt.eprintf("line_switch_ingest_race %v seed %d: %s\n", kind, seed, f)
+				delete(f)
+			}
+			testing.expect(t, len(failures) == 0, fmt.tprintf("line_switch_ingest_race %v seed %d failed", kind, seed))
+			delete(failures)
+			if r {
+				raced += 1
+			}
 		}
-		testing.expect(t, len(failures) == 0, fmt.tprintf("line_switch_ingest_race seed %d failed", seed))
-		delete(failures)
-		if r {
-			raced += 1
-		}
+		fmt.eprintf("line_switch_ingest_race: %v: %d of 20 seeds raced into the ingest window\n", kind, raced)
+		testing.expect(t, raced > 0, fmt.tprintf("line_switch_ingest_race %v: no seed opened the ingest window", kind))
 	}
-	fmt.eprintf("line_switch_ingest_race: %d of 20 seeds raced a write into the ingest window\n", raced)
-	testing.expect(t, raced > 0, "line_switch_ingest_race: no seed opened the ingest window")
 }
 
 @(private = "file")
