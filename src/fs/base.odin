@@ -136,7 +136,7 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 		return .None
 	}
 	clean, cok := eol_clean(m, rel, data, inode, true)
-	cur, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
+	at, cur, terr := _pin_at(m, rel, inode)
 	if !cok || terr != .None || string(cur) != string(clean) {
 		if p := _pin(s, rel, false); p != nil {
 			p.has_read = false
@@ -144,16 +144,33 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 		return .None
 	}
 	hash := _content_hash(clean)
-	if oerr := observe_record(m, s, .Read, inode, rel, m.synced[:], hash); oerr != .None && oerr != .Reloading {
+	if oerr := observe_record(m, s, .Read, inode, rel, at, hash); oerr != .None && oerr != .Reloading {
 		return oerr
 	}
 	p := _pin(s, rel, true)
 	clear(&p.read)
-	append(&p.read, ..m.synced[:])
+	append(&p.read, ..at)
 	p.read_inode = inode
 	p.read_hash = hash
 	p.has_read = true
 	return .None
+}
+
+@(private)
+_pin_at :: proc(m: ^Mount, rel: string, inode: fstree.Inode_Id) -> (at: []crdt.Op_Id, text: []u8, err: Error) {
+	h := m.history
+	at = m.synced[:]
+	if e, found := _file_entry(m, rel); found && e.inode == inode && e.ver != 0 {
+		if ids, vok := shadow_version(&m.shadow, e); vok && len(ids) > 0 {
+			own := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+			for id, i in ids {
+				own[i] = inode_op(h, id)
+			}
+			at = own
+		}
+	}
+	text, err = history_text_at(h, inode, at, context.temp_allocator)
+	return
 }
 
 @(private)
@@ -166,7 +183,11 @@ observe_record :: proc(m: ^Mount, s: ^Scope, kind: fshist.Observe_Kind, inode: f
 	b: Builder
 	builder_init(&b, m.history, s.actor)
 	builder_opaque(&b, buf[:])
-	return builder_commit(m, &b)
+	if slice.equal(version, m.synced[:]) {
+		return builder_commit(m, &b)
+	}
+	_, _, err := builder_commit_at(m, &b, version)
+	return err
 }
 
 Observation :: struct {
@@ -230,16 +251,16 @@ scope_write_begin :: proc(s: ^Scope, rel: string) {
 	if !ok {
 		return
 	}
-	cur, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
+	at, cur, terr := _pin_at(m, rel, inode)
 	if terr != .None {
 		return
 	}
-	if oerr := observe_record(m, s, .Write_Begin, inode, rel, m.synced[:], _content_hash(cur)); oerr != .None && oerr != .Reloading {
+	if oerr := observe_record(m, s, .Write_Begin, inode, rel, at, _content_hash(cur)); oerr != .None && oerr != .Reloading {
 		return
 	}
 	p := _pin(s, rel, true)
 	clear(&p.write)
-	append(&p.write, ..m.synced[:])
+	append(&p.write, ..at)
 	p.write_inode = inode
 	p.has_write = true
 }
