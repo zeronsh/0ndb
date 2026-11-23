@@ -764,6 +764,7 @@ Tree_Conflict :: struct {
 	end:    int,
 	ours:   []crdt.Op_Span,
 	theirs: []crdt.Op_Span,
+	kind:   fs.Conflict_Kind,
 }
 
 tree_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
@@ -794,6 +795,7 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 		}
 		out[i].start = c.start
 		out[i].end = c.end
+		out[i].kind = c.kind
 		out[i].ours = c.ours
 		out[i].theirs = c.theirs
 		for &x in out[i].ours {
