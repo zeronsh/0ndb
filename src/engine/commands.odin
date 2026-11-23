@@ -556,6 +556,14 @@ _reserve :: proc(e: ^Engine, n: i64) -> Error {
 }
 
 @(private)
+RESERVE_CAP :: i64(8 << 20)
+
+@(private)
+_reserve_capped :: proc(e: ^Engine, n: i64) -> Error {
+	return _reserve(e, min(n, RESERVE_CAP))
+}
+
+@(private)
 _scope_begin :: proc(e: ^Engine) {
 	if e.pk_open {
 		pack.scope_begin(&e.pk)
