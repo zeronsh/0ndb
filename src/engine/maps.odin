@@ -473,7 +473,7 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 		_oerr(omap.table_prepare(&h.table, sources[:])) or_return
 		missing := false
 		for s in h.segs {
-			if !s.in_view {
+			if !s.in_view && !_seg_empty(h, s) {
 				missing = true
 			}
 		}
