@@ -80,7 +80,7 @@ lane() {
 	lane byzantine SIM_BYZANTINE=1 1 16 > "$OUT/l12" &
 	lane until-run SIM_STORAGE=until-run 21 40 > "$OUT/l13" &
 	lane wide "" 41 60 > "$OUT/l14" &
-	lane byzantine SIM_BYZANTINE=1 17 24 > "$OUT/l15" &
+	lane byzantine SIM_BYZANTINE=1 17 32 > "$OUT/l15" &
 	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=6 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); ok_run "$r" || n=$((n+1)); echo "membership 1-6 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
 	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); echo "scenarios: $(ok_run "$r" && echo 0 || echo 1) failed $(echo "$r" | grep -E 'seed [0-9]+ FAILED|membership seed [0-9]+: |local_first.*FAIL|staged.*FAIL|FATAL' | head -3 | tr '\n' ' ')" ) > "$OUT/l8" &
 	( r=$(timeout 900 "$OUT/cvg.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "convergence: $r" ) > "$OUT/l9" &

@@ -1423,7 +1423,7 @@ _open_own :: proc(l: ^Local, data: []u8, base: i64) -> bool {
 			if journal.redact_bytes(rec, off) != .None {
 				return false
 			}
-		case .Eof, .Corrupt, .Missing, .Redacted, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
+		case .Eof, .Corrupt, .Missing, .Redacted, .Need_Keys, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
 			return false
 		}
 		pos += n

@@ -21,6 +21,7 @@ Error :: enum u8 {
 	Missing,
 	Redacted,
 	No_Key,
+	Need_Keys,
 	Forged,
 	Unverified,
 	Equivocation,
@@ -47,8 +48,9 @@ Tag :: [16]u8
 Hash :: [HASH_SIZE]u8
 
 Key_Provider :: struct {
-	data: rawptr,
-	key:  proc(data: rawptr, off: i64, out: ^Key) -> bool,
+	data:   rawptr,
+	key:    proc(data: rawptr, off: i64, out: ^Key) -> bool,
+	loaded: proc(data: rawptr) -> bool,
 }
 
 Signer :: struct {
