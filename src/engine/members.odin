@@ -972,6 +972,19 @@ _members_unlock_trees :: proc(e: ^Engine, sp: ^Space) {
 		if rt.locked && !rt.loaded {
 			rt.locked = false
 			_remote_tree_load(e, sp, rt)
+			if !rt.loaded {
+				continue
+			}
+			rt.current = _epoch_newest(sp, rt)
+			id, _, ok := _object_of_name(rt.name)
+			if !ok {
+				continue
+			}
+			if h, hok := e.handles[id]; hok {
+				_handle_rekey(h, rt.device, rt)
+			}
+			osync.replicator_keys_ready(&sp.repl, &rt.scope, rt.device, rt.name, 0)
+			_object_changed(e, sp.id, id, .Keys)
 		}
 	}
 }

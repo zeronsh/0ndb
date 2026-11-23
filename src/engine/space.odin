@@ -538,10 +538,16 @@ _spaces_settle :: proc(e: ^Engine) {
 		}
 		_catalog_table_close(sp)
 		for k, rt in sp.remote_trees {
-			if rt.refs == 0 {
+			if rt.refs > 0 {
+				continue
+			}
+			if rt.loaded || !(rt.locked || rt.requested) {
 				delete_key(&sp.remote_trees, k)
 				_remote_tree_free(e, rt)
+				continue
 			}
+			rt.requested = false
+			rt.absent = false
 		}
 	}
 }
