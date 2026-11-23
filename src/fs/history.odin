@@ -59,6 +59,7 @@ Git_Marker :: struct {
 Clock :: struct {
 	data:    rawptr,
 	wall_ms: proc(data: rawptr) -> i64,
+	mono_ns: proc(data: rawptr) -> i64,
 }
 
 Hold :: struct {
