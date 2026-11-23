@@ -350,6 +350,9 @@ Replicator :: struct {
 	live_recv:  i64,
 	trims:      map[Stream_Id]i64,
 	arc_dir:    bool,
+	rearchives: [dynamic]Rearchive_Req,
+	destroying: bool,
+	rearchive_timer: prim.Timer,
 	restores_written: u64,
 	restores_read:    u64,
 	allocator:  runtime.Allocator,
@@ -444,12 +447,15 @@ replicator_init :: proc(r: ^Replicator, l: ^prim.Loop, cfg: Replicator_Config, a
 	r.parked = make([dynamic]Serve_Req, allocator)
 	r.promos = make([dynamic]^Promotion, allocator)
 	r.trims = make(map[Stream_Id]i64, allocator)
+	r.rearchives = make([dynamic]Rearchive_Req, allocator)
 	r.tr.fd = prim.INVALID_FD
 	return .None
 }
 
 replicator_destroy :: proc(r: ^Replicator) {
+	r.destroying = true
 	_repl_close(r)
+	_rearchives_free(r)
 	if r.timer != 0 {
 		prim.timer_cancel(r.loop, r.timer)
 	}
@@ -1720,11 +1726,14 @@ _remote_maybe_free :: proc(r: ^Replicator, rm: ^Remote) {
 	if _following(rm) || rm.refs > 0 || rm.probing || rm.pulling || len(rm.wants) > 0 || len(rm.inflight) > 0 || len(rm.pulls) > 0 || rm.tail > 0 || r.rx_remote == rm || (rm.arc != nil && (len(rm.arc.wants) > 0 || len(rm.arc.redacts) > 0 || len(rm.arc.pend) > 0 || len(rm.arc.wipes) > 0)) {
 		return
 	}
-	if r.hold > 0 {
+	if r.hold > 0 || rm.reaping {
 		if !rm.reaping {
 			rm.reaping = true
 			append(&r.reap, rm)
 		}
+		return
+	}
+	if r.destroying {
 		return
 	}
 	delete_key(&r.remotes, rm.id)

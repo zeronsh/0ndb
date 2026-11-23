@@ -223,6 +223,69 @@ replicator_redact :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name
 	return .None
 }
 
+replicator_rearchive :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, from, to: i64) {
+	_enter(r)
+	defer _leave(r)
+	n, err := _clone_string(name, r.allocator)
+	if err != .None {
+		return
+	}
+	append(&r.rearchives, Rearchive_Req{scope = scope^, name = n, epoch = epoch, from = from, to = to})
+	if r.rearchive_timer == 0 {
+		r.rearchive_timer = prim.timer(r.loop, 0, r, _on_rearchive)
+	}
+}
+
+@(private)
+Rearchive_Req :: struct {
+	scope: Scope,
+	name:  string,
+	epoch: u64,
+	from:  i64,
+	to:    i64,
+}
+
+@(private)
+_on_rearchive :: proc(lp: ^prim.Loop, data: rawptr) {
+	r := cast(^Replicator)data
+	r.rearchive_timer = 0
+	_enter(r)
+	defer _leave(r)
+	reqs := r.rearchives
+	r.rearchives = make([dynamic]Rearchive_Req, r.allocator)
+	for &q in reqs {
+		id := stream_id(&q.scope, r.cfg.self, q.name, q.epoch)
+		l, ok := r.locals[id]
+		opened := false
+		if !ok {
+			l, opened = _arc_own_open(r, &q.scope, q.name, q.epoch, id)
+		}
+		if l != nil {
+			_arc_redact_own(r, l, q.from, q.to)
+			if opened {
+				_local_maybe_free(r, l)
+			}
+		}
+		scope_clear(&q.scope)
+		delete(q.name, r.allocator)
+	}
+	delete(reqs)
+	_repl_flush(r)
+}
+
+@(private)
+_rearchives_free :: proc(r: ^Replicator) {
+	if r.rearchive_timer != 0 {
+		prim.timer_cancel(r.loop, r.rearchive_timer)
+		r.rearchive_timer = 0
+	}
+	for &q in r.rearchives {
+		scope_clear(&q.scope)
+		delete(q.name, r.allocator)
+	}
+	delete(r.rearchives)
+}
+
 replicator_zero_replica :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> Error {
 	_enter(r)
 	defer _leave(r)

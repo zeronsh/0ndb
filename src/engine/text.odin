@@ -577,6 +577,9 @@ _hist_read :: proc(data: rawptr, stream: prim.Id, off: i64, out: ^[dynamic]u8) -
 			append(out, ..synth)
 			return true
 		}
+		if err == .Missing {
+			_hist_want(h, s, off)
+		}
 		if err != .None {
 			return false
 		}
@@ -585,6 +588,25 @@ _hist_read :: proc(data: rawptr, stream: prim.Id, off: i64, out: ^[dynamic]u8) -
 		return true
 	}
 	return false
+}
+
+@(private)
+_hist_want :: proc(h: ^Handle, s: ^Seg, off: i64) {
+	sp := h.sp
+	if !sp.repl_on || s.rep == nil {
+		return
+	}
+	to := off + journal.HEADER
+	if journal.replica_covers(s.rep, off, off + 4) {
+		b: [4]u8
+		if n, rerr := prim.read_at(h.e.vfs, s.rep.fd, b[:], off); rerr == .None && n == 4 {
+			to = off + journal.record_size(int(min(prim.get_u32le(b[:]), journal.MAX_BODY)))
+		}
+	}
+	r := [1]journal.Range{{off, to}}
+	if osync.replicator_want(&sp.repl, &h.scope, s.device, h.name, 0, r[:]) == .None {
+		h.e.stats.fetches += 1
+	}
 }
 
 @(private)
