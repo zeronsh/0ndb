@@ -2511,6 +2511,9 @@ store_blob :: proc(m: ^Mount, data: []u8) -> Error {
 
 @(private)
 emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
+	e := e
+	e.at = {}
+	e.has_at = false
 	m := p.m
 	h := m.history
 	path := c.path

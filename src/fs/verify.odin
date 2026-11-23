@@ -64,6 +64,10 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 			continue
 		}
 		e, found := shadow_get(&m.shadow, p) or_return
+		if found && e.has_at {
+			verify_at(m, p, e, disk, out, allocator) or_return
+			continue
+		}
 		if !found || e.inode != c.inode {
 			append(out, fmt.aprintf("%s: synced inode %v, shadow %v (found %v)", p, c.inode, e.inode, found, allocator = allocator))
 		}
@@ -114,12 +118,58 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 }
 
 @(private = "file")
+verify_at :: proc(m: ^Mount, p: string, e: Entry, disk: bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+	h := m.history
+	at := [1]crdt.Op_Id{inode_op(h, e.at)}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, at[:], &lvs) != .None {
+		append(out, fmt.aprintf("%s: shadow version %v is not in the history", p, at[0], allocator = allocator))
+		return .None
+	}
+	snap := version_snapshot(h, lvs[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	id, ok, lerr := fstree.lookup(&snap, p)
+	if lerr != nil {
+		return .Corrupt
+	}
+	if !ok || id != e.inode {
+		append(out, fmt.aprintf("%s: shadow inode %v at its own version, tree %v (found %v)", p, e.inode, id, ok, allocator = allocator))
+		return .None
+	}
+	if !disk || e.kind != .File {
+		return .None
+	}
+	abuf: prim.Path_Buf
+	raw, rerr := prim.read_file(m.vfs, abs_path(m, p, abuf[:]), context.temp_allocator)
+	if rerr != .None {
+		append(out, fmt.aprintf("%s: unreadable on disk: %v", p, rerr, allocator = allocator))
+		return .None
+	}
+	data, cok := eol_clean(m, p, raw, e.inode, true)
+	if !cok {
+		return .None
+	}
+	want := history_text_at(h, e.inode, at[:], context.temp_allocator) or_return
+	if string(data) != string(want) {
+		append(out, fmt.aprintf("%s: disk %q, at its own version %q", p, data, want, allocator = allocator))
+	}
+	return .None
+}
+
+@(private = "file")
 verify_shadow :: proc(m: ^Mount, dir: string, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	kids := make([dynamic]Shadow_Child, context.temp_allocator)
 	shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
 	for k in kids {
 		p, _ := path_join(dir, k.name, context.temp_allocator)
 		if verify_skip(m, p) {
+			continue
+		}
+		if k.entry.has_at {
+			if !seen[p] {
+				seen[p] = true
+				verify_at(m, p, k.entry, true, out, allocator) or_return
+			}
 			continue
 		}
 		if !seen[p] {

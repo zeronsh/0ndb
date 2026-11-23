@@ -806,6 +806,8 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	}
 	e := it.entry
 	e.inode = it.inode
+	e.at = {}
+	e.has_at = false
 	e.kind = it.kind
 	switch it.kind {
 	case .Dir:
