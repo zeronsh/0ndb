@@ -1311,9 +1311,11 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 			break
 		}
 	}
-	if err == .None {
-		err = builder_commit(m, b)
+	if err != .None {
+		shadow_txn_rollback(&m.shadow)
+		return err
 	}
+	err = builder_commit(m, b)
 	if err != .None && err != .Reloading {
 		shadow_txn_rollback(&m.shadow)
 		return err
@@ -1490,9 +1492,11 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	eerr := emit_change(p, &b, &first)
 	key, _ := delete_key(&m.override, k)
 	delete(key, m.allocator)
-	if eerr == .None {
-		eerr = builder_commit(m, &b)
+	if eerr != .None {
+		shadow_txn_rollback(&m.shadow)
+		return false, eerr
 	}
+	eerr = builder_commit(m, &b)
 	if eerr != .None && eerr != .Reloading {
 		shadow_txn_rollback(&m.shadow)
 		return false, eerr
