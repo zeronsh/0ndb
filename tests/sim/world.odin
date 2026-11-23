@@ -72,7 +72,6 @@ Node :: struct {
 	clock:       Node_Clock,
 	alive:       bool,
 	connects:    int,
-	accused:     int,
 	connect_fault: Connect_Fault,
 	persist_fail: int,
 	unavailable: int,
