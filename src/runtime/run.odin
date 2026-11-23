@@ -67,6 +67,7 @@ Run :: struct {
 	native_items: [dynamic]u8,
 	interrupting: bool,
 	kill_timer:   prim.Timer,
+	int_timer:    prim.Timer,
 	budget_timer: prim.Timer,
 	superseded:   bool,
 	by:           Rid,
@@ -142,6 +143,9 @@ _run_free :: proc(run: ^Run) {
 	l := eng.loop(r.e)
 	if run.kill_timer != 0 {
 		prim.timer_cancel(l, run.kill_timer)
+	}
+	if run.int_timer != 0 {
+		prim.timer_cancel(l, run.int_timer)
 	}
 	if run.budget_timer != 0 {
 		prim.timer_cancel(l, run.budget_timer)
@@ -503,17 +507,29 @@ run_interrupt :: proc(run: ^Run) {
 		return
 	}
 	run.interrupting = true
-	if run.proc_ != nil {
-		proc_interrupt(run.proc_)
-	} else if run.native != nil {
-		native_interrupt(run.native)
-	} else {
-		run_finish(run, .Interrupted)
-		return
-	}
 	if run.kill_timer == 0 {
 		run.kill_timer = prim.timer(eng.loop(run.r.e), run.r.cfg.interrupt_ms, run, _on_kill_timer)
 	}
+	if run.proc_ != nil {
+		proc_interrupt(run.proc_)
+	} else if run.int_timer == 0 {
+		run.int_timer = prim.timer(eng.loop(run.r.e), 0, run, _on_interrupt_timer)
+	}
+}
+
+@(private)
+_on_interrupt_timer :: proc(l: ^prim.Loop, data: rawptr) {
+	context = eng.context_for((^Run)(data).r.e)
+	run := (^Run)(data)
+	run.int_timer = 0
+	if run.state == .Finished {
+		return
+	}
+	if run.native != nil {
+		native_interrupt(run.native)
+		return
+	}
+	run_finish(run, .Interrupted)
 }
 
 @(private)
