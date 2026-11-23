@@ -828,14 +828,14 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 	}
 	ctx := Text_Plan{e = e, h = h}
 	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator, _text_plan(&ctx))
+	for r in res.ranges {
+		_own_redacted(e, h, r.from, r.to)
+	}
 	if err != .None {
 		if !_store_err(e, _ferr(err)) {
 			_log(e, .Warn, "own history redaction failed")
 		}
 		return
-	}
-	for r in res.ranges {
-		_own_redacted(e, h, r.from, r.to)
 	}
 	_handle_mark(h)
 	_index_purge_object(e, h)
