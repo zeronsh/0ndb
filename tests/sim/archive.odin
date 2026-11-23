@@ -345,11 +345,14 @@ STAT_TRIMMED: Stat
 STAT_RESTORES_WRITTEN: Stat
 STAT_RESTORES_READ: Stat
 STAT_RESTORE_SCENARIOS: Stat
+STAT_FORGET_SCENARIOS: Stat
 STAT_REREADS: Stat
 STAT_REREAD_BYTES: Stat
 
 @(init)
 _archive_hooks :: proc "contextless" () {
+	register_final_check(87, check_forget_third_reader)
+	register_final_check(88, check_forget_offline_writer)
 	register_final_check(90, check_restore_offline_writer)
 	register_final_check(95, check_archive_cipher)
 	register_final_check(96, check_archive_streams)
@@ -366,6 +369,7 @@ _archive_hooks :: proc "contextless" () {
 	STAT_RESTORE_SCENARIOS = register_stat(77, 4, "restore_scenarios")
 	STAT_RESTORES_WRITTEN = register_stat(77, 5, "restores_written")
 	STAT_RESTORES_READ = register_stat(77, 6, "restores_read")
+	STAT_FORGET_SCENARIOS = register_stat(77, 7, "forget_scenarios")
 }
 
 @(private = "file")
@@ -642,4 +646,132 @@ _strip_catalog :: proc(text: string) -> string {
 		}
 	}
 	return ""
+}
+
+@(private = "file")
+_forget_pick :: proc(w: ^World) -> (p: Restore_Pick, ok: bool) {
+	m := &w.model
+	for _, oi in m.objs {
+		ob := &m.objs[oi]
+		if !obj_exists(m, oi) {
+			continue
+		}
+		for ri in readers_of(w, oi) {
+			rn := w.nodes[ri]
+			if !_online(rn) {
+				continue
+			}
+			context = instance_context(&rn.inst)
+			h := _archive_handle(rn, ob)
+			node_after(rn)
+			if h == nil {
+				continue
+			}
+			for s in h.segs {
+				if s.device == eng.self(&rn.e) || s.rep == nil {
+					continue
+				}
+				sid := osync.stream_id(&h.scope, s.device, h.name, 0)
+				_, base, trimmed, exists := relay_stream_state(w, ob.o.space, sid)
+				if !exists || !trimmed || base <= 0 || !journal.replica_covers(s.rep, 0, base) {
+					continue
+				}
+				wn := _node_of(w, s.device)
+				if wn == nil || wn == rn || !_online(wn) {
+					continue
+				}
+				return Restore_Pick{oi = oi, wn = wn, rn = rn, base = base, dev = s.device}, true
+			}
+		}
+	}
+	return
+}
+
+check_forget_offline_writer :: proc(w: ^World) {
+	if w.aborted || len(w.failures) > 0 || w.cfg.archive_min < 0 {
+		return
+	}
+	p, ok := _forget_pick(w)
+	if !ok {
+		return
+	}
+	_forget_reread(w, p)
+}
+
+check_forget_third_reader :: proc(w: ^World) {
+	if w.aborted || len(w.failures) > 0 || w.cfg.archive_min < 0 {
+		return
+	}
+	p, ok := _restore_pick(w)
+	if !ok {
+		return
+	}
+	for xi in readers_of(w, p.oi) {
+		x := w.nodes[xi]
+		if x != p.rn && x != p.wn && _online(x) {
+			p.rn = x
+			_forget_reread(w, p)
+			return
+		}
+	}
+}
+
+@(private = "file")
+_forget_reread :: proc(w: ^World, p: Restore_Pick) {
+	m := &w.model
+	ob := &m.objs[p.oi]
+	ref := digest_object(w, p.rn, p.oi)
+	if !ref.complete {
+		return
+	}
+	defer delete(ref.text, w.allocator)
+	stat_add(w, STAT_FORGET_SCENARIOS)
+	p.wn.partitioned = true
+	for c in p.wn.conns {
+		conn_reset(c, true)
+	}
+	world_note(w, "forget: %s offline; %s forgets every remote segment of %v %s (%s's trimmed below %d) and restarts", p.wn.name, p.rn.name, ob.kind, id_short(ob.o.id), p.wn.name, p.base)
+	{
+		context = instance_context(&p.rn.inst)
+		if h := _archive_handle(p.rn, ob); h != nil {
+			for sg in h.segs {
+				if sg.device != eng.self(&p.rn.e) && sg.rep != nil {
+					journal.replica_forget(sg.rep, 0, journal.replica_length(sg.rep))
+				}
+			}
+		}
+		node_after(p.rn)
+	}
+	if !_restart_settle(w, p.rn) {
+		return
+	}
+	got: Digest
+	for _ in 0 ..< 6 {
+		got = digest_object(w, p.rn, p.oi)
+		if got.complete {
+			break
+		}
+		run_until(w, w.now + 120_000_000_000, true)
+		if len(w.failures) > 0 || w.aborted {
+			return
+		}
+	}
+	if !got.complete {
+		world_fail(w, "forget: %s could not reread %v %s after forgetting %s's trimmed prefix with %s offline (%s)", p.rn.name, ob.kind, id_short(ob.o.id), p.wn.name, p.wn.name, got.why)
+	} else if got.text != ref.text {
+		world_fail(w, "forget: %v %s on %s differs after rereading the forgotten prefix:\n--- before\n%s--- after\n%s", ob.kind, id_short(ob.o.id), p.rn.name, ref.text, got.text)
+	}
+	if got.complete {
+		delete(got.text, w.allocator)
+	}
+	p.wn.partitioned = false
+	for _ in 0 ..< 6 {
+		idle := run_until(w, w.now + 120_000_000_000, true)
+		if len(w.failures) > 0 || w.aborted {
+			return
+		}
+		if idle && check_convergence(w, false) {
+			break
+		}
+	}
 }
