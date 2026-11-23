@@ -1321,7 +1321,7 @@ RELOAD_RETRY_MAX_MS :: 30_000
 
 @(private)
 mount_reload_retry :: proc(m: ^Mount) {
-	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && len(m.switch_to) == 0 {
+	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && len(m.switch_to) == 0 && !mount_absent_ready(m) {
 		return
 	}
 	m.reload_ms = max(m.opts.settle_ms, 1) if m.reload_ms == 0 else min(m.reload_ms * 2, RELOAD_RETRY_MAX_MS)
@@ -1362,6 +1362,9 @@ mount_run :: proc(m: ^Mount) -> Error {
 	err := mount_pass(m, false, !fence)
 	if err == .None {
 		err = mount_materialize(m)
+		if err != .None && err != .Reloading {
+			mount_reload_retry(m)
+		}
 	}
 	if err == .None && len(m.switch_to) > 0 {
 		mount_switch_step(m)

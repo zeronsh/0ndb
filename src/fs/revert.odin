@@ -85,18 +85,20 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	copy(before_sync, m.synced[:])
 	for ino in sorted_inodes(touched) {
 		_, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
-		if !had || !e.has_at {
+		if !had || e.ver == 0 {
 			continue
 		}
-		lv, ok := crdt.graph_lv(&h.g, inode_op(h, e.at))
-		if !ok {
-			return .Corrupt
+		for id in shadow_version(&m.shadow, e) {
+			lv, ok := crdt.graph_lv(&h.g, inode_op(h, id))
+			if !ok {
+				return .Corrupt
+			}
+			one := [1]crdt.Lv{lv}
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, cl[:], one[:], &both)
+			clear(&cl)
+			append(&cl, ..both[:])
 		}
-		one := [1]crdt.Lv{lv}
-		both := make([dynamic]crdt.Lv, context.temp_allocator)
-		crdt.version_union(&h.g, cl[:], one[:], &both)
-		clear(&cl)
-		append(&cl, ..both[:])
 	}
 	clear(&m.synced)
 	append(&m.synced, ..crdt.graph_version_ids(&h.g, cl[:], context.temp_allocator))

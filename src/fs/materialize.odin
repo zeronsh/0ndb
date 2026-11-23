@@ -122,6 +122,8 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	for a in m.absent {
 		if ino, ok, lerr := fstree.lookup(&snap, a); lerr == nil && ok {
 			touched[ino] = true
+		} else if e, found := shadow_get(&m.shadow, a) or_return; found {
+			touched[e.inode] = true
 		}
 		delete(a, m.allocator)
 	}
@@ -217,23 +219,33 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		return am && !bm
 	})
 	ms := Mat_Sync {
-		files = make([dynamic]string, context.temp_allocator),
-		dirs  = make(map[string]bool, context.temp_allocator),
+		files  = make([dynamic]string, context.temp_allocator),
+		dirs   = make(map[string]bool, context.temp_allocator),
+		staged = make([dynamic]Mat_Stage, context.temp_allocator),
 	}
 	m.mat = &ms
 	defer m.mat = nil
 	for &it in items {
 		if err := materialize_one(m, &it, tl[:]); err != .None {
+			mat_unstage(m, &ms, 0)
 			mat_owe(m, &ms)
+			mat_roll_forward(m, items[:], sl[:], target)
 			return err
 		}
 	}
+	if err := mat_commit_staged(m, &ms); err != .None {
+		mat_owe(m, &ms)
+		mat_roll_forward(m, items[:], sl[:], target)
+		return err
+	}
 	if err := mat_pay_owed(m, &ms); err != .None {
 		mat_owe(m, &ms)
+		mat_roll_forward(m, items[:], sl[:], target)
 		return err
 	}
 	if berr := mat_barrier(m, &ms); berr != .None {
 		mat_owe(m, &ms)
+		mat_roll_forward(m, items[:], sl[:], target)
 		return berr
 	}
 	mat_owed_clear(m)
@@ -264,9 +276,83 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 }
 
 Mat_Sync :: struct {
-	files: [dynamic]string,
-	dirs:  map[string]bool,
-	raced: bool,
+	files:  [dynamic]string,
+	dirs:   map[string]bool,
+	raced:  bool,
+	staged: [dynamic]Mat_Stage,
+}
+
+@(private)
+Mat_Stage :: struct {
+	item:  Mat_Item,
+	tmp:   string,
+	abs:   string,
+	ours:  u64,
+	entry: Entry,
+}
+
+@(private)
+mat_roll_forward :: proc(m: ^Mount, items: []Mat_Item, sl: []crdt.Lv, target: Version) {
+	if m.restoring {
+		return
+	}
+	h := m.history
+	ids := make([dynamic]fstree.Op_Id, context.temp_allocator)
+	for id in crdt.graph_version_ids(&h.g, sl, context.temp_allocator) {
+		append(&ids, op_inode(h, id))
+	}
+	if len(ids) == 0 {
+		return
+	}
+	ver, verr := shadow_version_add(&m.shadow, ids[:])
+	if verr != .None {
+		return
+	}
+	pending := make([dynamic]string, context.temp_allocator)
+	shadow_txn_begin(&m.shadow)
+	for &it in items {
+		if !it.has_old {
+			if !it.present {
+				continue
+			}
+			_, found, gerr := shadow_get(&m.shadow, it.path)
+			if gerr != .None {
+				shadow_txn_rollback(&m.shadow)
+				return
+			}
+			if !found {
+				append(&pending, it.path)
+			}
+			continue
+		}
+		key := it.old
+		cur, found, gerr := shadow_get(&m.shadow, it.old)
+		if gerr == .None && !found && it.present && it.path != it.old {
+			key = it.path
+			cur, found, gerr = shadow_get(&m.shadow, it.path)
+		}
+		if gerr != .None {
+			shadow_txn_rollback(&m.shadow)
+			return
+		}
+		if !found || cur != it.entry {
+			continue
+		}
+		if cur.ver == 0 {
+			cur.ver = ver
+			if shadow_put(&m.shadow, key, cur) != .None {
+				shadow_txn_rollback(&m.shadow)
+				return
+			}
+		}
+		append(&pending, it.path if it.present else it.old)
+	}
+	shadow_txn_end(&m.shadow)
+	for p in pending {
+		mount_absent_add(m, p)
+	}
+	clear(&m.synced)
+	append(&m.synced, ..target)
 }
 
 @(private)
@@ -311,8 +397,9 @@ mat_settle_owed :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	ms := Mat_Sync {
-		files = make([dynamic]string, context.temp_allocator),
-		dirs  = make(map[string]bool, context.temp_allocator),
+		files  = make([dynamic]string, context.temp_allocator),
+		dirs   = make(map[string]bool, context.temp_allocator),
+		staged = make([dynamic]Mat_Stage, context.temp_allocator),
 	}
 	mat_pay_owed(m, &ms) or_return
 	if berr := mat_barrier(m, &ms); berr != .None {
@@ -325,51 +412,9 @@ mat_settle_owed :: proc(m: ^Mount) -> Error {
 
 @(private)
 mat_pay_owed :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
-	for f in m.owed.files {
-		mat_rewrite(m, f, ms) or_return
-	}
 	for d in m.owed.dirs {
 		ms.dirs[clone_string(d, context.temp_allocator) or_else ""] = true
 	}
-	return .None
-}
-
-@(private)
-mat_rewrite :: proc(m: ^Mount, abs: string, ms: ^Mat_Sync) -> Error {
-	if len(abs) <= len(m.root) + 1 || !strings.has_prefix(abs, m.root) {
-		return .None
-	}
-	rel := abs[len(m.root) + 1:]
-	e, known := shadow_get(&m.shadow, rel) or_return
-	if !known || e.kind != .File {
-		return .None
-	}
-	d := probe(m, rel) or_return
-	if d.kind != .File || d.stat != e.stat {
-		return .None
-	}
-	data, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
-	if rerr == .Not_Found {
-		return .None
-	}
-	from_prim(rerr) or_return
-	mode := d.stat.mode & 0o7777
-	tmp := temp_name(m, abs, context.temp_allocator)
-	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
-	from_prim(oerr) or_return
-	werr := prim.write_at(m.vfs, fd, data, 0)
-	prim.fchmod(m.vfs, fd, mode)
-	prim.close_file(m.vfs, fd)
-	if werr != .None {
-		prim.remove(m.vfs, tmp)
-		return from_prim(werr)
-	}
-	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
-	nd := probe(m, rel) or_return
-	e.stat = nd.stat
-	shadow_put(&m.shadow, rel, e) or_return
-	append(&ms.files, clone_string(abs, context.temp_allocator) or_else "")
-	ms.dirs[clone_string(path_parent_abs(abs), context.temp_allocator) or_else ""] = true
 	return .None
 }
 
@@ -388,16 +433,6 @@ mat_raced :: proc(m: ^Mount) {
 	if m.mat != nil {
 		m.mat.raced = true
 	}
-}
-
-@(private)
-mat_file :: proc(m: ^Mount, abs: string) {
-	if m.mat == nil {
-		return
-	}
-	p, _ := clone_string(abs, context.temp_allocator)
-	append(&m.mat.files, p)
-	mat_dir(m, path_parent_abs(abs))
 }
 
 @(private)
@@ -813,6 +848,9 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 			move_shadow_tree(m, it.old, it.path) or_return
 		} else {
 			shadow_remove(&m.shadow, it.old) or_return
+			if it.kind == .File && m.mat != nil && it.entry.kind == .File {
+				shadow_put(&m.shadow, it.path, it.entry) or_return
+			}
 		}
 	} else if !it.has_old && it.kind != .Dir {
 		if d, _ := probe(m, it.path); d.kind != .Missing {
@@ -825,8 +863,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	}
 	e := it.entry
 	e.inode = it.inode
-	e.at = {}
-	e.has_at = false
+	e.ver = 0
 	e.kind = it.kind
 	switch it.kind {
 	case .Dir:
@@ -862,7 +899,10 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 				prim.remove(m.vfs, tmp)
 				return from_prim(werr)
 			}
-			mat_file(m, abs)
+			if serr := mat_sync_one(m, tmp); serr != .None {
+				prim.remove(m.vfs, tmp)
+				return serr
+			}
 		}
 		from_prim(prim.rename(m.vfs, tmp, abs)) or_return
 		mat_ancestors(m, abs)
@@ -871,8 +911,11 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		}
 	case .File:
 		ensure_parent(m, abs) or_return
-		ours, raced := write_file_content(m, it, abs, tl, &e) or_return
+		ours, raced, staged := write_file_content(m, it, abs, tl, &e) or_return
 		attr_invalidate(m, it.path)
+		if staged {
+			return .None
+		}
 		if raced {
 			mat_raced(m)
 			mount_mark(m, it.path)
@@ -896,21 +939,21 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 }
 
 @(private)
-write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv, e: ^Entry) -> (ours: u64, raced: bool, err: Error) {
+write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv, e: ^Entry) -> (ours: u64, raced: bool, staged: bool, err: Error) {
 	h := m.history
 	mode: u32 = 0o755 if .Exec in it.flags else 0o644
 	tmp := temp_name(m, abs, context.temp_allocator)
 	if .Opaque in it.flags {
 		reg, has := history_blob_at(h, it.inode, tl) or_return
 		if !has || m.db == nil {
-			return 0, false, .None
+			return 0, false, false, .None
 		}
 		if e.oid == odb.Oid(reg.oid) && it.has_old && it.old == it.path {
-			return 0, false, set_mode(m, abs, mode)
+			return 0, false, false, set_mode(m, abs, mode)
 		}
 		fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
 		if oerr != .None {
-			return 0, false, from_prim(oerr)
+			return 0, false, false, from_prim(oerr)
 		}
 		sink := Fd_Sink{m.vfs, fd, 0, .None}
 		out := io.Stream{procedure = fd_sink_proc, data = &sink}
@@ -920,15 +963,10 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 		prim.close_file(m.vfs, fd)
 		if !sok || sink.err != .None {
 			prim.remove(m.vfs, tmp)
-			return 0, false, sink.err if sink.err != .None else .Io
+			return 0, false, false, sink.err if sink.err != .None else .Io
 		}
-		if mat_replace(m, it, tmp, abs, ours) or_return {
-			return 0, true, .None
-		}
-		mat_file(m, abs)
-		mat_ancestors(m, abs)
 		e.oid = odb.Oid(reg.oid)
-		return ours, false, .None
+		return mat_place(m, it, tmp, abs, ours, e)
 	}
 	ids := crdt.graph_version_ids(&h.g, tl, context.temp_allocator)
 	data := history_text_at(h, it.inode, ids, context.temp_allocator) or_return
@@ -937,12 +975,12 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 	if m.db != nil {
 		oid, _ = odb.hash(m.db.format, .Blob, data)
 		if oid == e.oid && it.has_old && it.old == it.path {
-			return 0, false, set_mode(m, abs, mode)
+			return 0, false, false, set_mode(m, abs, mode)
 		}
 	}
 	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
 	if oerr != .None {
-		return 0, false, from_prim(oerr)
+		return 0, false, false, from_prim(oerr)
 	}
 	sink := Fd_Sink{m.vfs, fd, 0, .None}
 	sok := eol_smudge_to(m, it.path, data, io.Stream{procedure = fd_sink_proc, data = &sink}, it.inode, true)
@@ -951,15 +989,116 @@ write_file_content :: proc(m: ^Mount, it: ^Mat_Item, abs: string, tl: []crdt.Lv,
 	prim.close_file(m.vfs, fd)
 	if !sok || sink.err != .None {
 		prim.remove(m.vfs, tmp)
-		return 0, false, sink.err if sink.err != .None else .Io
+		return 0, false, false, sink.err if sink.err != .None else .Io
 	}
-	if mat_replace(m, it, tmp, abs, ours) or_return {
-		return 0, true, .None
-	}
-	mat_file(m, abs)
-	mat_ancestors(m, abs)
 	e.oid = oid
-	return ours, false, .None
+	return mat_place(m, it, tmp, abs, ours, e)
+}
+
+@(private)
+mat_place :: proc(m: ^Mount, it: ^Mat_Item, tmp, abs: string, ours: u64, e: ^Entry) -> (u64, bool, bool, Error) {
+	if m.mat != nil && !m.restoring {
+		st := Mat_Stage{item = it^, ours = ours, entry = e^}
+		st.entry.inode = it.inode
+		st.entry.kind = it.kind
+		st.entry.ver = 0
+		t, terr := clone_string(tmp, context.temp_allocator)
+		a, aerr := clone_string(abs, context.temp_allocator)
+		if terr != nil || aerr != nil {
+			prim.remove(m.vfs, tmp)
+			return 0, false, false, .No_Memory
+		}
+		st.tmp, st.abs = t, a
+		append(&m.mat.staged, st)
+		return ours, false, true, .None
+	}
+	if serr := mat_sync_one(m, tmp); serr != .None {
+		prim.remove(m.vfs, tmp)
+		return 0, false, false, serr
+	}
+	raced, rerr := mat_replace(m, it, tmp, abs, ours)
+	if rerr != .None {
+		return 0, false, false, rerr
+	}
+	if raced {
+		return 0, true, false, .None
+	}
+	mat_ancestors(m, abs)
+	return ours, false, false, .None
+}
+
+@(private)
+mat_sync_one :: proc(m: ^Mount, path: string) -> Error {
+	fd, e := prim.open_file(m.vfs, path)
+	from_prim(e) or_return
+	defer prim.close_file(m.vfs, fd)
+	return from_prim(prim.barrier(m.vfs, fd) if ODIN_OS == .Darwin else prim.datasync(m.vfs, fd))
+}
+
+@(private)
+mat_unstage :: proc(m: ^Mount, ms: ^Mat_Sync, from: int) {
+	for st in ms.staged[min(from, len(ms.staged)):] {
+		prim.remove(m.vfs, st.tmp)
+	}
+	clear(&ms.staged)
+}
+
+@(private)
+mat_sync_temps :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
+	os := m.vfs.procs == prim.os_vfs().procs
+	if HAS_SYNCFS && os && len(ms.staged) > MAT_SYNCFS_THRESHOLD {
+		if fd, e := prim.open_file(m.vfs, m.root, {.Directory}); e == .None {
+			ok := os_syncfs(fd)
+			prim.close_file(m.vfs, fd)
+			if ok {
+				return .None
+			}
+		}
+	}
+	for st in ms.staged {
+		mat_sync_one(m, st.tmp) or_return
+	}
+	return .None
+}
+
+@(private)
+mat_commit_staged :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
+	if len(ms.staged) == 0 {
+		return .None
+	}
+	if err := mat_sync_temps(m, ms); err != .None {
+		mat_unstage(m, ms, 0)
+		return err
+	}
+	for &st, i in ms.staged {
+		raced, rerr := mat_replace(m, &st.item, st.tmp, st.abs, st.ours)
+		if rerr != .None {
+			prim.remove(m.vfs, st.tmp)
+			mat_unstage(m, ms, i + 1)
+			return rerr
+		}
+		if !raced && st.ours != 0 && st.item.has_old && st.item.entry.stat.ino != 0 {
+			if cur, serr := prim.lstat(m.vfs, st.abs); serr == .None && cur.ino != st.ours {
+				raced = true
+			}
+		}
+		if raced {
+			mat_raced(m)
+			mount_mark(m, st.item.path)
+			continue
+		}
+		mat_ancestors(m, st.abs)
+		e := st.entry
+		if cur, serr := prim.lstat(m.vfs, st.abs); serr == .None {
+			e.stat = disk_stat(cur)
+		}
+		if perr := shadow_put(&m.shadow, st.item.path, e); perr != .None {
+			mat_unstage(m, ms, i + 1)
+			return perr
+		}
+	}
+	clear(&ms.staged)
+	return .None
 }
 
 @(private)
@@ -1041,13 +1180,17 @@ merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		prim.remove(m.vfs, tmp)
 		return from_prim(werr)
 	}
+	if serr := mat_sync_one(m, tmp); serr != .None {
+		prim.remove(m.vfs, tmp)
+		return serr
+	}
 	now, nerr := prim.lstat(m.vfs, abs)
 	if nerr != .None || disk_stat(now) != disk_stat(before) {
 		prim.remove(m.vfs, tmp)
 		return .None
 	}
 	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
-	mat_file(m, abs)
+	mat_ancestors(m, abs)
 	return .None
 }
 
@@ -1253,8 +1396,11 @@ mount_absent :: proc(m: ^Mount) -> []string {
 
 @(private)
 mount_absent_ready :: proc(m: ^Mount) -> bool {
-	if len(m.absent) == 0 || m.db == nil || m.history == nil {
+	if len(m.absent) == 0 || m.history == nil {
 		return false
+	}
+	if m.db == nil {
+		return true
 	}
 	snap := fstree.current(&m.history.tree)
 	for a in m.absent {
