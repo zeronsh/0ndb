@@ -81,6 +81,30 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	if len(touched) == 0 {
 		return .None
 	}
+	before_sync := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
+	copy(before_sync, m.synced[:])
+	for ino in sorted_inodes(touched) {
+		_, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
+		if !had || !e.has_at {
+			continue
+		}
+		lv, ok := crdt.graph_lv(&h.g, inode_op(h, e.at))
+		if !ok {
+			return .Corrupt
+		}
+		one := [1]crdt.Lv{lv}
+		both := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.version_union(&h.g, cl[:], one[:], &both)
+		clear(&cl)
+		append(&cl, ..both[:])
+	}
+	clear(&m.synced)
+	append(&m.synced, ..crdt.graph_version_ids(&h.g, cl[:], context.temp_allocator))
+	swapped := true
+	defer if swapped {
+		clear(&m.synced)
+		append(&m.synced, ..before_sync)
+	}
 	bounds := make(map[prim.Id][2]u64, context.temp_allocator)
 	in_scope :: proc(h: ^History, bounds: ^map[prim.Id][2]u64, bl, al: []crdt.Lv, id: crdt.Op_Id) -> bool {
 		bd, ok := bounds[id.actor]
@@ -215,9 +239,8 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	if b.n == 0 {
 		return .None
 	}
-	before_sync := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
-	copy(before_sync, m.synced[:])
 	builder_commit(m, &b) or_return
+	swapped = false
 	clear(&m.synced)
 	append(&m.synced, ..before_sync)
 	return mount_materialize(m)
