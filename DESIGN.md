@@ -2712,7 +2712,10 @@ Relay cost tracks the reachable information, not the activity. Items marked
   `length`. Feed compaction keeps the hollow flag. A full follower of a
   based segment resumes from the end of the stored suffix it holds, not
   from its contiguous prefix (which stops at the base), so a reconnect
-  never re-reads the suffix.
+  never re-reads the suffix. A base a reader knows only from the feed is
+  confirmed with one relay read of the range before it pulls that range
+  from peers: a device-held base can later become a trim, and the relay's
+  `Trimmed` answer sends the range to the archive instead.
 - **Content uploads follow durability.** Each owned file tree keeps an upload
   mark and a target in the registry (`ROOT_OWNED`). When the batch holding
   tree records becomes durable the target rises to that length, whether or
