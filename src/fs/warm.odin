@@ -3,6 +3,7 @@ package fs
 import "core:os"
 import "core:sync"
 import "core:thread"
+import "../odb"
 import "../prim"
 
 WARM_FILES :: ODIN_OS == .Windows
@@ -76,6 +77,8 @@ warm_index_changed :: proc(m: ^Mount, out: ^[dynamic]string) {
 	for p in out {
 		seen[p] = true
 	}
+	base := m.git.common if len(m.git.common) > 0 else m.git.dir
+	objects, _ := path_join(base, "objects", context.temp_allocator)
 	for {
 		e, ok, err := index_next(&r)
 		if err != .None || !ok {
@@ -95,7 +98,49 @@ warm_index_changed :: proc(m: ^Mount, out: ^[dynamic]string) {
 		}
 		p, _ := clone_string(abs, m.allocator)
 		append(out, p)
+		hb: [odb.MAX_HEX]u8
+		hex := odb.oid_to_string(e.oid, m.git_format, &hb)
+		fan, _ := path_join(objects, hex[:2], context.temp_allocator)
+		lp, _ := path_join(fan, hex[2:], m.allocator)
+		append(out, lp)
 	}
+}
+
+@(private)
+warm_import :: proc(m: ^Mount) {
+	if !WARM_FILES || !m.has_git || m.vfs.procs != prim.os_vfs().procs {
+		return
+	}
+	paths := make([dynamic]string, m.allocator)
+	warm_loose_objects(m, &paths)
+	if len(paths) < WARM_MIN {
+		for p in paths {
+			delete(p, m.allocator)
+		}
+		delete(paths)
+		return
+	}
+	job := Warm_Job{vfs = m.vfs, paths = paths}
+	job.workers = make([dynamic]^thread.Thread, m.allocator)
+	n := min(max(m.opts.threads, 1), max(os.get_processor_core_count(), 1), len(paths))
+	sync.atomic_store(&job.left, n)
+	for _ in 0 ..< n {
+		w := thread.create_and_start_with_poly_data(&job, warm_worker)
+		if w == nil {
+			sync.atomic_sub(&job.left, 1)
+			continue
+		}
+		append(&job.workers, w)
+	}
+	for w in job.workers {
+		thread.join(w)
+		thread.destroy(w)
+	}
+	delete(job.workers)
+	for p in paths {
+		delete(p, m.allocator)
+	}
+	delete(paths)
 }
 
 @(private)
