@@ -22,6 +22,7 @@ Pack_Builder :: struct {
 	seen:     map[Oid]i32,
 	active:   bool,
 	local:    bool,
+	extent:   i64,
 }
 
 pack_begin :: proc(b: ^Pack_Builder, db: ^Odb) -> Error {
@@ -196,13 +197,48 @@ pack_add_file :: proc(b: ^Pack_Builder, path: string) -> (oid: Oid, err: Error) 
 
 @(private)
 pack_rewind :: proc(b: ^Pack_Builder, offset: i64) -> Error {
-	bw_flush(&b.w) or_return
-	if e := prim.truncate(b.db.vfs, b.fd, offset); e != .None {
-		b.w.err = perr(e)
+	if b.w.err != .None {
 		return b.w.err
 	}
+	if offset >= b.w.off {
+		b.w.n = int(offset - b.w.off)
+	} else {
+		b.extent = max(b.extent, b.w.off)
+		b.w.n = 0
+		b.w.off = offset
+	}
 	b.w.pos = offset
-	b.w.off = offset
+	return .None
+}
+
+@(private)
+pack_relocate :: proc(b: ^Pack_Builder, end: i64) -> Error {
+	db := b.db
+	dir_buf, path_buf: [PATH_MAX]u8
+	dir := concat_into(dir_buf[:], db.dirs[0].path, "/pack") or_return
+	fd, path := create_temp(db, dir, "tmp_pack_", path_buf[:]) or_return
+	pos: i64
+	err: Error
+	for pos < end && err == .None {
+		n, e := prim.read_at(db.vfs, b.fd, b.w.buf[:min(i64(len(b.w.buf)), end - pos)], pos)
+		if e != .None || n <= 0 {
+			err = .Io
+			break
+		}
+		err = perr(prim.write_at(db.vfs, fd, b.w.buf[:n], pos))
+		pos += i64(n)
+	}
+	if err != .None {
+		prim.close_file(db.vfs, fd)
+		prim.remove(db.vfs, path)
+		return err
+	}
+	prim.close_file(db.vfs, b.fd)
+	prim.remove(db.vfs, b.path)
+	b.fd = fd
+	b.w.fd = fd
+	b.path = string(b.path_buf[:copy(b.path_buf[:], path)])
+	b.extent = end
 	return .None
 }
 
@@ -222,9 +258,13 @@ pack_finish :: proc(b: ^Pack_Builder) -> (checksum: Oid, err: Error) {
 	count: [4]u8
 	endian.unchecked_put_u32be(count[:], u32(len(b.entries)))
 	perr(prim.write_at(db.vfs, b.fd, count[:], 8)) or_return
+	end := b.w.pos
+	hsz := oid_size(db.format)
+	if b.extent > end + i64(hsz) {
+		pack_relocate(b, end) or_return
+	}
 	h: Hasher
 	hasher_init(&h, db.format)
-	end := b.w.pos
 	pos: i64
 	for pos < end {
 		n, e := prim.read_at(db.vfs, b.fd, b.w.buf[:min(i64(len(b.w.buf)), end - pos)], pos)
@@ -235,7 +275,6 @@ pack_finish :: proc(b: ^Pack_Builder) -> (checksum: Oid, err: Error) {
 		pos += i64(n)
 	}
 	checksum = hasher_final(&h) or_return
-	hsz := oid_size(db.format)
 	perr(prim.write_at(db.vfs, b.fd, checksum[:hsz], end)) or_return
 	if db.sync_writes {
 		perr(prim.datasync(db.vfs, b.fd)) or_return

@@ -118,6 +118,7 @@ Disk :: struct {
 	grains:    [dynamic]Grain,
 	force_ghost: bool,
 	ghost_root:  string,
+	lose_shrinks: bool,
 	dead:      bool,
 	fail_sync: u64,
 	fail_nth:  u64,
@@ -831,6 +832,10 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 			copy(n.durable[p.off:end], p.bytes)
 		case .Truncate:
 			old := len(n.durable)
+			if d.lose_shrinks && int(p.size) < old {
+				d.stats.lost += 1
+				break
+			}
 			if int(p.size) < old && owned {
 				if n.ghost == nil {
 					n.ghost = make([dynamic]u8, d.allocator)
@@ -1461,7 +1466,9 @@ _recover_file :: proc(d: ^Disk, n: ^Inode, keep: u64, r: ^Rng) {
 	for p in n.pend {
 		switch p.kind {
 		case .Truncate:
-			if rng_below(r, 4) < keep {
+			if d.lose_shrinks && int(p.size) < len(content) {
+				d.stats.lost += 1
+			} else if rng_below(r, 4) < keep {
 				old := len(content)
 				resize(&content, int(p.size))
 				for i in old ..< int(p.size) {
