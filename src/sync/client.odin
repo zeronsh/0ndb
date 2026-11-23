@@ -88,6 +88,9 @@ Client :: struct {
 	streaming: bool,
 	parser:    Parser,
 	bulk:      Event,
+	bulk_from: i64,
+	reads:     [dynamic]Read_Pending,
+	misread:   bool,
 	awaiting:  map[_Await_Key]_Await,
 	await_n:   int,
 	epoch:     u64,
@@ -95,6 +98,14 @@ Client :: struct {
 	feed_on:   bool,
 	put_key:   [32]u8,
 	allocator: runtime.Allocator,
+}
+
+@(private)
+Read_Pending :: struct {
+	id:    [32]u8,
+	from:  i64,
+	start: i64,
+	chain: i64,
 }
 
 @(private)
@@ -127,6 +138,7 @@ client_init :: proc(c: ^Client, allocator := context.allocator) {
 	c.out = make([dynamic]u8, allocator)
 	c.held = make([dynamic]u8, allocator)
 	c.awaiting = make(map[_Await_Key]_Await, allocator)
+	c.reads = make([dynamic]Read_Pending, allocator)
 	parser_init(&c.parser, false, allocator)
 }
 
@@ -135,6 +147,7 @@ client_destroy :: proc(c: ^Client) {
 	delete(c.out)
 	delete(c.held)
 	delete(c.awaiting)
+	delete(c.reads)
 	parser_destroy(&c.parser)
 	c^ = {}
 }
@@ -158,6 +171,8 @@ client_reset :: proc(c: ^Client) {
 	c.state = .Idle
 	clear(&c.awaiting)
 	c.await_n = 0
+	clear(&c.reads)
+	c.misread = false
 	c.feed_on = false
 	c.bulk = {}
 	parser_reset(&c.parser)
@@ -451,6 +466,33 @@ client_list :: proc(c: ^Client, since: i64) -> Error {
 	return .None
 }
 
+@(private)
+_read_answered :: proc(c: ^Client, id: [32]u8, from, end: i64, final: bool) {
+	if len(c.reads) == 0 || c.reads[0].id != id {
+		if final {
+			c.misread = true
+		}
+		return
+	}
+	p := &c.reads[0]
+	if !final {
+		if p.start >= 0 && from == (p.chain if p.chain >= 0 else p.start) {
+			p.chain = end
+		}
+		return
+	}
+	if p.start >= 0 && from != p.start && from != p.chain {
+		c.misread = true
+	}
+	ordered_remove(&c.reads, 0)
+}
+
+client_misread :: proc "contextless" (c: ^Client) -> bool {
+	m := c.misread
+	c.misread = false
+	return m
+}
+
 client_read :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
 	b := _client_buf(c)
 	start := frame_begin(b, .Read) or_return
@@ -460,6 +502,7 @@ client_read :: proc(c: ^Client, id: Stream_Id, from, to: i64) -> Error {
 	prim.write_u64le(&w, u64(max(to, from, 0)))
 	frame_end(b, start, &w) or_return
 	_await_add(c, cast([32]u8)id)
+	append(&c.reads, Read_Pending{cast([32]u8)id, max(from, 0), max(from, 0), -1})
 	return .None
 }
 
@@ -471,6 +514,7 @@ client_tail :: proc(c: ^Client, id: Stream_Id, n: i64) -> Error {
 	prim.write_u64le(&w, u64(max(n, 0)))
 	frame_end(b, start, &w) or_return
 	_await_add(c, cast([32]u8)id)
+	append(&c.reads, Read_Pending{cast([32]u8)id, -1, -1, -1})
 	return .None
 }
 
@@ -801,6 +845,7 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		}
 		c.bulk = ev
 		c.bulk.first = false
+		c.bulk_from = ev.at
 		if ev.kind == .Served {
 			_await_progress(c, _pull_key(ev.device, ev.tag), .Pull)
 		} else {
@@ -830,6 +875,9 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 			_await_done(c, ev.id)
 		} else {
 			_await_progress(c, ev.id)
+		}
+		if ev.kind == .Data {
+			_read_answered(c, ev.id, c.bulk_from, ev.at, ev.final)
 		}
 		return handler(user, &ev)
 	case .Control:
@@ -882,6 +930,9 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.code = Code(prim.read_u8(&r))
 		ev.id = get_id32(&r)
 		_await_done_any(c, ev.id)
+		if ev.code == .Not_Owner && len(c.reads) > 0 && c.reads[0].id == ev.id {
+			ordered_remove(&c.reads, 0)
+		}
 	case .Error:
 		ev.kind = .Error
 		ev.code = Code(prim.read_u8(&r))
@@ -908,6 +959,12 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		ev.length = get_i64(&r)
 		if it.frame == .Noted {
 			_await_done(c, ev.id)
+		} else {
+			for &p in c.reads {
+				if p.id == ev.id && p.from >= 0 && p.chain < 0 {
+					p.start = max(p.from, ev.base)
+				}
+			}
 		}
 	case .Pulled:
 		ev.kind = .Pulled

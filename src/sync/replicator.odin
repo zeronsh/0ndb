@@ -2363,6 +2363,15 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_emit(r, Repl_Event{kind = .Refused, code = ev.code, err = err})
 		return err
 	}
+	if client_misread(&r.client) {
+		r.tamper_run += 1
+		r.tampered = true
+		mev := Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, stream = Stream_Id(ev.id)}
+		if rm, ok := r.remotes[Stream_Id(ev.id)]; ok {
+			mev.device, mev.name, mev.epoch = rm.device, rm.name, rm.epoch
+		}
+		_emit(r, mev)
+	}
 	if r.tampered {
 		r.tampered = false
 		return .Corrupt

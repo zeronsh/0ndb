@@ -978,6 +978,16 @@ concurrent typing is never lost or reverted.
   whose detail says a clone is suspected. A claimed length the relay cannot
   serve, or bytes that do not open, are tampering like any other. A relay-side redaction of an own record is
   tolerated and applied locally (`Local_Redacted`).
+- **Read answers are checked against the request.** The relay answers
+  reads in request order and announces a segment's base with `Hollow` or
+  `Trimmed` before the `Data` that starts there (relay-protocol.md 7.2 and
+  8.2). The client keeps its outstanding `Read`s and `Tail`s in request
+  order, and each `FINAL` answer must belong to the oldest one and start at
+  its `from`, at the base a preceding `Hollow`/`Trimmed` raised it to, or
+  where that read's earlier frames ended. A `Refused Not_Owner` answers it
+  too. Any other answer is `Relay_Misbehaving`: the connection drops and the
+  reads are issued again on the next one, so a withheld `Hollow` never
+  leaves a read's in-flight range waiting on an answer that already came.
 - Redaction punches holes in extents and erases every copy: stale extents of
   the file, copies a defragmentation made and superseded within one write
   (zeroed as garbage), and the garbage of deleted files, whose pending zeros a
