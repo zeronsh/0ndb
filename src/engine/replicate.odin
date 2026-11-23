@@ -672,6 +672,15 @@ _remote_changed :: proc(e: ^Engine, sp: ^Space, device: prim.Id, name: string, e
 			if rt.loaded {
 				_held_release(e, sp, device)
 			}
+		} else if rt == nil && length > 0 {
+			if id, _, ok2 := _object_of_name(seg); ok2 {
+				sc := _object_scope(sp, id)
+				waiting := osync.replicator_keys_waiting(&sp.repl, &sc, device, seg, 0)
+				osync.scope_clear(&sc)
+				if waiting {
+					_keys_needed(e, sp, id, device, seg)
+				}
+			}
 		}
 		if id, _, ok2 := _object_of_name(seg); ok2 {
 			if h, hok := e.handles[id]; hok {

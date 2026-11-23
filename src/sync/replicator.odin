@@ -767,6 +767,11 @@ replicator_relay_length :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 	return -1
 }
 
+replicator_keys_waiting :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64) -> bool {
+	rm, ok := r.remotes[stream_id(scope, device, name, epoch)]
+	return ok && rm.keys_wait && !rm.quarantined
+}
+
 Fresh_Tail :: enum u8 {
 	Current,
 	Waiting,
