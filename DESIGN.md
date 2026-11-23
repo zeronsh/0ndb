@@ -1564,7 +1564,16 @@ concurrent typing is never lost or reverted.
 - Redaction punches holes in extents and erases every copy: stale extents of
   the file, copies a defragmentation made and superseded within one write
   (zeroed as garbage), and the garbage of deleted files, whose pending zeros a
-  redaction makes urgent. The simulator substitutes its own disk
+  redaction makes urgent. A stale extent is recorded under
+  `S | inode | file offset | container | offset` with its length, split into
+  pieces of at most 1 MiB, so erasing a range reads only the stale pieces
+  that start within 1 MiB before it, not every stale extent the file ever
+  had. Compaction drops the stale records of every data record in the
+  container it reclaims, so the stale set is bounded by garbage still on
+  disk. Deletes are tombstones until a merge that includes the base run; one
+  is scheduled once the tombstones written since the last such merge exceed
+  a quarter of the base run's entries, so deleted keys do not pile up in the
+  ranges later scans read. The simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
 - Redaction in the device object store is a durable scrub intent
   (`objects/info/0ndb-scrub`: targets, protected blobs, superseded commits and

@@ -121,6 +121,7 @@ Pending_Unlink :: struct {
 
 Pack :: struct {
 	base:          prim.Vfs,
+	tombs:         u64,
 	root:          string,
 	opts:          Options,
 	allocator:     runtime.Allocator,
@@ -238,15 +239,80 @@ Erase :: struct {
 }
 
 @(private)
-_skey :: proc "contextless" (buf: []u8, inum: u64, cont: u32, off: i64) -> []u8 {
+STALE_KEY :: 29
+
+@(private)
+STALE_SPAN :: i64(1) << 20
+
+@(private)
+_skey :: proc "contextless" (buf: []u8, inum: u64, foff: i64, cont: u32, off: i64) -> []u8 {
 	buf[0] = K_STALE
 	_put_be64(buf[1:9], inum)
-	buf[9] = u8(cont >> 24)
-	buf[10] = u8(cont >> 16)
-	buf[11] = u8(cont >> 8)
-	buf[12] = u8(cont)
-	_put_be64(buf[13:21], u64(off))
-	return buf[:21]
+	_put_be64(buf[9:17], u64(foff))
+	buf[17] = u8(cont >> 24)
+	buf[18] = u8(cont >> 16)
+	buf[19] = u8(cont >> 8)
+	buf[20] = u8(cont)
+	_put_be64(buf[21:29], u64(off))
+	return buf[:STALE_KEY]
+}
+
+@(private)
+_skey_parse :: proc "contextless" (key: []u8) -> (foff: i64, cont: u32, off: i64) {
+	foff = i64(_get_be64(key[9:17]))
+	cont = u32(key[17]) << 24 | u32(key[18]) << 16 | u32(key[19]) << 8 | u32(key[20])
+	off = i64(_get_be64(key[21:29]))
+	return
+}
+
+@(private)
+_stale_put :: proc(p: ^Pack, inum: u64, ph: Phys) -> Error {
+	for at := i64(0); at < ph.len; at += STALE_SPAN {
+		n := min(STALE_SPAN, ph.len - at)
+		sb: [STALE_KEY]u8
+		vb: [10]u8
+		vn := prim.put_uvarint(vb[:], u64(n))
+		_put(p, _skey(sb[:], inum, ph.foff + at, ph.cont, ph.off + at), vb[:vn], false) or_return
+	}
+	return .None
+}
+
+@(private)
+_stale_prune :: proc(p: ^Pack, inum: u64, foff, ln: i64, cont: u32, off: i64) -> Error {
+	klo: [STALE_KEY]u8
+	khi: [STALE_KEY]u8
+	_skey(klo[:], inum, foff, 0, 0)
+	_skey(khi[:], inum, foff + ln, 0, 0)
+	it: Merge_Iter
+	if e := _miter_init(&it, p, klo[:17], khi[:17]); e != .None {
+		_miter_destroy(&it)
+		return e
+	}
+	dead := make([dynamic][STALE_KEY]u8, context.temp_allocator)
+	for {
+		key, _, ok := _miter_next(&it)
+		if !ok {
+			break
+		}
+		if len(key) != STALE_KEY {
+			continue
+		}
+		_, c, o := _skey_parse(key)
+		if c == cont && o >= off && o < off + ln {
+			k: [STALE_KEY]u8
+			copy(k[:], key)
+			append(&dead, k)
+		}
+	}
+	err := it.err
+	_miter_destroy(&it)
+	if err != .None {
+		return err
+	}
+	for &k in dead {
+		_put(p, k[:], nil, true) or_return
+	}
+	return .None
 }
 
 @(private)
@@ -445,6 +511,9 @@ _get :: proc(p: ^Pack, key: []u8, out: ^[dynamic]u8) -> (found: bool, err: Error
 @(private)
 _put :: proc(p: ^Pack, key: []u8, val: []u8, tomb: bool) -> Error {
 	flags := MEM_TOMB if tomb else 0
+	if tomb {
+		p.tombs += 1
+	}
 	if !p.recovering {
 		flags |= MEM_DIRTY
 	}
@@ -535,11 +604,7 @@ _inode_store :: proc(p: ^Pack, inum: u64, old: ^Inode, new: ^Inode, erase := Era
 		if p.compacting != 0 && ph.cont == p.compacting {
 			continue
 		}
-		sb: [32]u8
-		vb: [20]u8
-		vn := prim.put_uvarint(vb[:], u64(ph.foff))
-		vn += prim.put_uvarint(vb[vn:], u64(ph.len))
-		_put(p, _skey(sb[:], inum, ph.cont, ph.off), vb[:vn], false) or_return
+		_stale_put(p, inum, ph) or_return
 		stale = true
 	}
 	if erase.on && !destroy {
@@ -577,19 +642,23 @@ _inode_store :: proc(p: ^Pack, inum: u64, old: ^Inode, new: ^Inode, erase := Era
 
 @(private)
 _erase_stale :: proc(p: ^Pack, inum: u64, lo, hi: i64, urgent: bool) -> Error {
-	klo: [9]u8
-	khi: [9]u8
-	klo[0] = K_STALE
-	_put_be64(klo[1:9], inum)
-	khi[0] = K_STALE
-	_put_be64(khi[1:9], inum + 1)
+	klo: [STALE_KEY]u8
+	khi: [STALE_KEY]u8
+	_skey(klo[:], inum, max(lo - STALE_SPAN + 1, 0), 0, 0)
+	if hi < max(i64) {
+		_skey(khi[:], inum, hi, 0, 0)
+	} else {
+		_skey(khi[:], inum + 1, 0, 0, 0)
+	}
 	it: Merge_Iter
-	if e := _miter_init(&it, p, klo[:], khi[:]); e != .None {
+	if e := _miter_init(&it, p, klo[:17], khi[:17]); e != .None {
 		_miter_destroy(&it)
 		return e
 	}
 	Cut :: struct {
-		key:  [21]u8,
+		key:  [STALE_KEY]u8,
+		cont: u32,
+		off:  i64,
 		foff: i64,
 		end:  i64,
 		a:    i64,
@@ -601,23 +670,21 @@ _erase_stale :: proc(p: ^Pack, inum: u64, lo, hi: i64, urgent: bool) -> Error {
 		if !ok {
 			break
 		}
-		if len(key) != 21 {
+		if len(key) != STALE_KEY {
 			continue
 		}
-		foff, n1 := prim.get_uvarint(val)
-		ln, n2 := prim.get_uvarint(val[max(n1, 0):])
-		if n1 <= 0 || n2 <= 0 {
+		ln, n1 := prim.get_uvarint(val)
+		if n1 <= 0 {
 			continue
 		}
-		if i64(foff) >= hi || i64(foff + ln) <= lo {
+		foff, cont, off := _skey_parse(key)
+		if foff >= hi || foff + i64(ln) <= lo {
 			continue
 		}
-		c := Cut{foff = i64(foff), end = i64(foff + ln)}
+		c := Cut{cont = cont, off = off, foff = foff, end = foff + i64(ln)}
 		c.a = max(lo, c.foff)
 		c.b = min(hi, c.end)
 		copy(c.key[:], key)
-		cont := u32(key[9]) << 24 | u32(key[10]) << 16 | u32(key[11]) << 8 | u32(key[12])
-		off := i64(_get_be64(key[13:21]))
 		_defer_zero(p, Phys{cont = cont, off = off + (c.a - c.foff), len = c.b - c.a, foff = c.a}, urgent)
 		append(&cuts, c)
 	}
@@ -628,24 +695,22 @@ _erase_stale :: proc(p: ^Pack, inum: u64, lo, hi: i64, urgent: bool) -> Error {
 	}
 	for &c in cuts {
 		if c.a > c.foff {
-			_put(p, c.key[:], _stale_val(c.foff, c.a - c.foff), false) or_return
+			_put(p, c.key[:], _stale_val(c.a - c.foff), false) or_return
 		} else {
 			_put(p, c.key[:], nil, true) or_return
 		}
 		if c.b < c.end {
-			off := i64(_get_be64(c.key[13:21]))
-			_put_be64(c.key[13:21], u64(off + (c.b - c.foff)))
-			_put(p, c.key[:], _stale_val(c.b, c.end - c.b), false) or_return
+			sb: [STALE_KEY]u8
+			_put(p, _skey(sb[:], inum, c.b, c.cont, c.off + (c.b - c.foff)), _stale_val(c.end - c.b), false) or_return
 		}
 	}
 	return .None
 }
 
 @(private)
-_stale_val :: proc(foff, ln: i64) -> []u8 {
-	vb := make([]u8, 20, context.temp_allocator)
-	n := prim.put_uvarint(vb, u64(foff))
-	n += prim.put_uvarint(vb[n:], u64(ln))
+_stale_val :: proc(ln: i64) -> []u8 {
+	vb := make([]u8, 10, context.temp_allocator)
+	n := prim.put_uvarint(vb, u64(ln))
 	return vb[:n]
 }
 

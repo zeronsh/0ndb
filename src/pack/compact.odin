@@ -174,11 +174,11 @@ _compact_work :: proc(p: ^Pack, budget: i64, all: bool) -> (more: bool, err: Err
 		if kind == R_DATA {
 			body := rec[REC_HDR:]
 			inum, n1 := prim.get_uvarint(body)
-			_, n2 := prim.get_uvarint(body[n1:])
+			foff, n2 := prim.get_uvarint(body[n1:])
 			if n1 <= 0 || n2 <= 0 {
 				break
 			}
-			ph := Phys{cont = c.cont, off = c.pos + REC_HDR + i64(n1 + n2), len = i64(ln) - i64(n1 + n2)}
+			ph := Phys{cont = c.cont, off = c.pos + REC_HDR + i64(n1 + n2), len = i64(ln) - i64(n1 + n2), foff = i64(foff)}
 			ino: Inode
 			live, lerr := _phys_live(p, inum, ph, &ino)
 			if lerr != .None {
@@ -187,17 +187,8 @@ _compact_work :: proc(p: ^Pack, budget: i64, all: bool) -> (more: bool, err: Err
 			if live {
 				_relocate(p, inum, &ino, ph, rec[REC_HDR + n1 + n2:]) or_return
 				spent += ph.len
-			} else {
-				sb: [32]u8
-				skey := _skey(sb[:], inum, ph.cont, ph.off)
-				found, gerr := _get(p, skey, &p.vbuf)
-				if gerr != .None {
-					return false, gerr
-				}
-				if found {
-					_put(p, skey, nil, true) or_return
-				}
 			}
+			_stale_prune(p, inum, ph.foff, ph.len, ph.cont, ph.off) or_return
 		} else if kind != R_PUT && kind != R_DEL && kind != R_NEXT && kind != R_COMMIT {
 			break
 		}
