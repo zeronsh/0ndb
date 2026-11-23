@@ -672,7 +672,7 @@ from_prim_fd :: proc "contextless" (fd: prim.Fd, e: prim.Error) -> (prim.Fd, Err
 
 @(private)
 dir_place_changed :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: map[fstree.Inode_Id]bool) -> (changed: bool, err: Error) {
-	for ino in touched {
+	for ino in sorted_inodes(touched) {
 		old, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
 		info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
 		if ierr != nil {
