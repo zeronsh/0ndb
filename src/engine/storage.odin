@@ -214,14 +214,15 @@ object_promote_run :: proc(e: ^Engine, o: Object, msg: Rid = {}) -> Error {
 		}
 	case .File_Tree, .Text:
 		if h, ok := e.handles[o.id]; ok && h.w_open && h.hist != nil && h.sp.repl_on {
+			_ckpt_fresh(e, h)
 			n := _own_len(h)
-			last, prev, had := _ckpt_get(e, h.id)
+			last, prev, had, _ := _ckpt_get(e, h.id)
 			if !had || last < n {
 				if _checkpoint_write(e, h, n, prev, had) == .None {
 					last = n
 				}
 			}
-			if l2, _, ok2 := _ckpt_get(e, h.id); ok2 && l2 > 0 {
+			if l2, _, ok2, _ := _ckpt_get(e, h.id); ok2 && l2 > 0 {
 				froms[e.self] = l2
 				_content_mark_put(e, h.sp.id, h.id, h.kind, min(_content_mark_get(e, h.sp, h.id), l2))
 			}

@@ -349,6 +349,10 @@ redaction_touched :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Sp
 
 @(private)
 apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span, targets: ^[dynamic]odb.Oid, protect: ^[dynamic]odb.Oid) -> (files: int, err: Error) {
+	count := history_redactions(h) or_return
+	cb: [8]u8
+	prim.put_u64le(cb[:], count + 1)
+	kv_put(&h.kv, transmute([]u8)string(HIST_REDACTIONS), cb[:]) or_return
 	views_stale(h)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	redaction_touched(h, spans, also, &touched, targets, false) or_return
