@@ -405,6 +405,15 @@ _entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin
 		return nil, {}, false
 	}
 	h := m.history
+	snap, serr := synced_snapshot(m)
+	if serr != .None {
+		return nil, {}, false
+	}
+	removed, rerr := snapshot_removed(&snap, c.old.inode)
+	fstree.snapshot_destroy(&snap)
+	if rerr != .None || removed {
+		return nil, {}, false
+	}
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
 	ids, vok := shadow_version(&m.shadow, c.old)
 	if !vok {
@@ -748,8 +757,8 @@ builder_commit_at :: proc(m: ^Mount, b: ^Builder, parents: []crdt.Op_Id) -> (hea
 }
 
 @(private)
-rebase_materialize :: proc(m: ^Mount, heads: []crdt.Op_Id) -> Error {
-	if len(heads) == 0 {
+rebase_materialize :: proc(m: ^Mount, heads: []crdt.Op_Id, restored: bool) -> Error {
+	if len(heads) == 0 && !restored {
 		return .None
 	}
 	h := m.history

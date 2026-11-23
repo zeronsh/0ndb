@@ -1230,6 +1230,7 @@ Pass :: struct {
 	deferred:   map[u64]bool,
 	holding:    [dynamic]string,
 	rebased:    [dynamic]crdt.Op_Id,
+	restored:   bool,
 	scope_of:   map[string]^Scope,
 	cutoff:     i64,
 	now:        i64,
@@ -1666,7 +1667,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			dirty_at_note(m, y, at)
 		}
 	}
-	if rerr := rebase_materialize(m, p.rebased[:]); rerr != .None && rerr != .Deferred {
+	if rerr := rebase_materialize(m, p.rebased[:], p.restored); rerr != .None && rerr != .Deferred {
 		return rerr
 	}
 	if p.head_moved && m.has_git && !p.git_wrote {
@@ -2082,6 +2083,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		}
 	} else {
 		rebase_changes(p) or_return
+		restore_removed(p) or_return
 		attribute_changes(p) or_return
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
 		group_actor := make(map[prim.Id]prim.Id, context.temp_allocator)
@@ -2683,6 +2685,54 @@ last_change :: proc(p: ^Pass) -> ^Change {
 Dir_Move :: struct {
 	from: string,
 	to:   string,
+}
+
+@(private)
+synced_snapshot :: proc(m: ^Mount) -> (snap: fstree.Snapshot, err: Error) {
+	h := m.history
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &lvs) != .None {
+		return {}, .Corrupt
+	}
+	return version_snapshot(h, lvs[:])
+}
+
+@(private)
+snapshot_removed :: proc(snap: ^fstree.Snapshot, inode: fstree.Inode_Id) -> (removed: bool, err: Error) {
+	info, ok, ierr := fstree.info(snap, inode, context.temp_allocator)
+	if ierr != nil {
+		return false, .Corrupt
+	}
+	return ok && !info.present, .None
+}
+
+@(private)
+restore_removed :: proc(p: ^Pass) -> Error {
+	m := p.m
+	h := m.history
+	if h == nil {
+		return .None
+	}
+	any := false
+	for c in p.changes {
+		any ||= c.kind == .Modify && c.old.kind == .File && c.disk == .File
+	}
+	if !any {
+		return .None
+	}
+	snap := synced_snapshot(m) or_return
+	defer fstree.snapshot_destroy(&snap)
+	for &c in p.changes {
+		if c.kind != .Modify || c.old.kind != .File || c.disk != .File || c.moved != "" || c.carried {
+			continue
+		}
+		if !(snapshot_removed(&snap, c.old.inode) or_return) {
+			continue
+		}
+		mount_absent_add(m, c.path)
+		p.restored = true
+	}
+	return .None
 }
 
 @(private)
