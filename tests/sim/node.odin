@@ -220,6 +220,7 @@ node_crashed :: proc(n: ^Node) {
 	n.disk.dead = false
 	if mode == .Power {
 		n.boot += 1
+		_learned_drop(n)
 	}
 	world_note(w, "%s crashed at disk op %d (%v)", n.name, n.disk.stats.ops, mode)
 	w.stats.crashes += 1
@@ -237,6 +238,7 @@ node_crash_now :: proc(n: ^Node, mode: Crash_Mode, salt: u64) {
 	n.disk.dead = false
 	if mode == .Power {
 		n.boot += 1
+		_learned_drop(n)
 	}
 	world_note(w, "%s crashed right after returning a message id (%v)", n.name, mode)
 	w.stats.crashes += 1
@@ -400,6 +402,10 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 	}
 	#partial switch ev.kind {
 	case .Durable:
+	case .Replica_Redacted:
+		append(&n.learned, Learned_Redaction{object = ev.object, device = ev.device, from = i64(ev.tick), to = ev.length, seq = eng.pending_seq(e)})
+		stat_add(w, STAT_LEARNED)
+		world_note(w, "%s learned redaction of %s@[%d,%d) in %s", n.name, id_short(ev.device), i64(ev.tick), ev.length, id_short(ev.object))
 	case .Quarantined:
 		append(&w.quarantines, Quarantine{node = n.idx, object = ev.object})
 		if w.cfg.byzantine {
@@ -783,4 +789,16 @@ _node_stats :: proc "contextless" () {
 	register_stat_line(45)
 	STAT_OWN_TAMPER = register_stat(45, 0, "own_tamper_caught")
 	STAT_LENGTH_LIES = register_stat(45, 1, "length_lies")
+}
+
+@(private = "file")
+_learned_drop :: proc(n: ^Node) {
+	k := 0
+	for l in n.learned {
+		if l.seq <= n.durable {
+			n.learned[k] = l
+			k += 1
+		}
+	}
+	resize(&n.learned, k)
 }
