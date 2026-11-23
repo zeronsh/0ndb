@@ -2120,6 +2120,9 @@ apply_opaque :: proc(h: ^History, b: ^crdt.Batch, at: u64, lv: crdt.Lv, op: crdt
 	actor := crdt.graph_intern(&h.g, b.actor)
 	lamport := crdt.graph_lamport(&h.g, lv)
 	id := fstree.Op_Id{actor, seq}
+	if len(op.content) > 0 && op.content[0] == fshist.TOP_REVERT {
+		return revert_index(h, b.actor, op.content)
+	}
 	decoded, ok := fshist.decode_opaque(op.content, h, proc(data: rawptr, id: crdt.Op_Id) -> fstree.Inode_Id {
 		return op_inode((^History)(data), id)
 	})

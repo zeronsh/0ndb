@@ -2,8 +2,16 @@ package fs
 
 import "base:runtime"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../prim"
+
+Conflict_Kind :: enum u8 {
+	Concurrent,
+	Revert_Region,
+	Revert_File,
+	Revert_Blob,
+}
 
 Text_Conflict :: struct {
 	inode:  fstree.Inode_Id,
@@ -11,6 +19,83 @@ Text_Conflict :: struct {
 	end:    int,
 	ours:   []crdt.Op_Span,
 	theirs: []crdt.Op_Span,
+	kind:   Conflict_Kind,
+	revert: prim.Id,
+}
+
+@(private)
+REVERT_LIST :: "rvl"
+
+@(private)
+revert_key :: proc(tag: string, id: prim.Id) -> []u8 {
+	out := make([]u8, len(tag) + 16, context.temp_allocator)
+	n := copy(out, tag)
+	x := id
+	copy(out[n:], x[:])
+	return out
+}
+
+@(private)
+revert_index :: proc(h: ^History, actor: prim.Id, content: []u8) -> Error {
+	o, ok := fshist.decode_revert(content, context.temp_allocator)
+	if !ok {
+		return .None
+	}
+	if _, had := kv_get(&h.kv, revert_key("rv:", actor), context.temp_allocator) or_return; !had {
+		list, _ := kv_get(&h.kv, transmute([]u8)string(REVERT_LIST), context.temp_allocator) or_return
+		lb := make([dynamic]u8, 0, len(list) + 16, context.temp_allocator)
+		append(&lb, ..list)
+		x := actor
+		append(&lb, ..x[:])
+		kv_put(&h.kv, transmute([]u8)string(REVERT_LIST), lb[:]) or_return
+	}
+	kv_put(&h.kv, revert_key("rv:", actor), content) or_return
+	for a in o.actors {
+		if _, known := kv_get(&h.kv, revert_key("rv:", a), context.temp_allocator) or_return; known {
+			kv_put(&h.kv, revert_key("rx:", a), []u8{1}) or_return
+		}
+	}
+	return .None
+}
+
+@(private)
+revert_conflicts :: proc(h: ^History, out: ^[dynamic]Text_Conflict, allocator: runtime.Allocator) -> Error {
+	list, found := kv_get(&h.kv, transmute([]u8)string(REVERT_LIST), context.temp_allocator) or_return
+	if !found {
+		return .None
+	}
+	for i := 0; i + 16 <= len(list); i += 16 {
+		id: prim.Id
+		copy(id[:], list[i:][:16])
+		if _, undone := kv_get(&h.kv, revert_key("rx:", id), context.temp_allocator) or_return; undone {
+			continue
+		}
+		data, ok := kv_get(&h.kv, revert_key("rv:", id), context.temp_allocator) or_return
+		if !ok {
+			continue
+		}
+		o, dok := fshist.decode_revert(data, context.temp_allocator)
+		if !dok {
+			return .Corrupt
+		}
+		for c in o.conflicts {
+			k := Conflict_Kind.Revert_Region
+			switch c.kind {
+			case .Region:
+				k = .Revert_Region
+			case .File:
+				k = .Revert_File
+			case .Blob:
+				k = .Revert_Blob
+			}
+			ours := make([]crdt.Op_Span, len(c.ours), allocator)
+			copy(ours, c.ours)
+			theirs := make([]crdt.Op_Span, len(c.theirs), allocator)
+			copy(theirs, c.theirs)
+			append(out, Text_Conflict{inode = op_inode(h, c.inode), start = c.start, end = c.end, ours = ours, theirs = theirs, kind = k, revert = id})
+		}
+	}
+	return .None
 }
 
 @(private)
@@ -66,6 +151,7 @@ record_text_conflicts :: proc(h: ^History, ino: fstree.Inode_Id, found: []crdt.C
 }
 
 history_text_conflicts :: proc(h: ^History, out: ^[dynamic]Text_Conflict, allocator := context.allocator) -> Error {
+	revert_conflicts(h, out, allocator) or_return
 	list, found := kv_get(&h.kv, transmute([]u8)string(CONFLICT_LIST), context.temp_allocator) or_return
 	if !found {
 		return .None
