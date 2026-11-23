@@ -115,7 +115,9 @@ Disk :: struct {
 	wall:      proc(data: rawptr) -> i64,
 	wall_data: rawptr,
 	crash_at:  u64,
+	grains:    [dynamic]Grain,
 	force_ghost: bool,
+	ghost_root:  string,
 	dead:      bool,
 	fail_sync: u64,
 	fail_rate: u64,
@@ -163,6 +165,41 @@ DISK_PROCS := prim.Vfs_Procs {
 	caps       = _d_caps,
 }
 
+Grain :: struct {
+	prefix: string,
+	ns:     i64,
+}
+
+disk_set_grain :: proc(d: ^Disk, prefix: string, ns: i64) {
+	for &g in d.grains {
+		if g.prefix == prefix {
+			g.ns = ns
+			return
+		}
+	}
+	append(&d.grains, Grain{strings.clone(prefix, d.allocator), ns})
+}
+
+@(private = "file")
+_grain_of :: proc(d: ^Disk, path: string) -> i64 {
+	for g in d.grains {
+		if strings.has_prefix(path, g.prefix) && (len(path) == len(g.prefix) || path[len(g.prefix)] == '/') {
+			return g.ns
+		}
+	}
+	return 0
+}
+
+@(private = "file")
+_stat_at :: proc(d: ^Disk, n: ^Inode, path: string) -> prim.Stat {
+	st := _stat_of(n)
+	if g := _grain_of(d, path); g > 0 {
+		st.mtime_ns -= st.mtime_ns %% g
+		st.ctime_ns -= st.ctime_ns %% g
+	}
+	return st
+}
+
 disk_init :: proc(d: ^Disk, name: string, allocator: runtime.Allocator) {
 	d^ = {}
 	d.allocator = allocator
@@ -171,6 +208,7 @@ disk_init :: proc(d: ^Disk, name: string, allocator: runtime.Allocator) {
 	d.fds = make(map[prim.Fd]Open_File, allocator)
 	d.meta = make([dynamic]Meta_Op, allocator)
 	d.events = make([dynamic]Watch_Ev, allocator)
+	d.grains = make([dynamic]Grain, allocator)
 	d.next_ino = ROOT_INO
 	d.next_fd = 16
 	root := _inode_new(d, .Dir, 0o755)
@@ -188,6 +226,10 @@ disk_destroy :: proc(d: ^Disk) {
 	delete(d.fds)
 	disk_events_clear(d)
 	delete(d.events)
+	for g in d.grains {
+		delete(g.prefix, d.allocator)
+	}
+	delete(d.grains)
 	for m in d.meta {
 		_meta_free(d, m)
 	}
@@ -724,10 +766,11 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	if !_enter(d, 4) {
 		return .Io
 	}
-	_, n, err := _fd_get(d, fd)
+	of, n, err := _fd_get(d, fd)
 	if err != .None {
 		return err
 	}
+	owned := len(d.ghost_root) > 0 && strings.has_prefix(of.path, d.ghost_root) && (len(of.path) == len(d.ghost_root) || of.path[len(d.ghost_root)] == '/')
 	if d.fail_sync > 0 || _inject(d, false) != .None {
 		if d.fail_sync > 0 {
 			d.fail_sync -= 1
@@ -765,7 +808,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 			copy(n.durable[p.off:end], p.bytes)
 		case .Truncate:
 			old := len(n.durable)
-			if int(p.size) < old {
+			if int(p.size) < old && owned {
 				if n.ghost == nil {
 					n.ghost = make([dynamic]u8, d.allocator)
 				}
@@ -950,11 +993,11 @@ _d_fstat :: proc(data: rawptr, fd: prim.Fd) -> (prim.Stat, prim.Error) {
 	if !_enter(d, 8) {
 		return {}, .Io
 	}
-	_, n, err := _fd_get(d, fd)
+	of, n, err := _fd_get(d, fd)
 	if err != .None {
 		return {}, err
 	}
-	return _stat_of(n), .None
+	return _stat_at(d, n, of.path), .None
 }
 
 @(private = "file")
@@ -970,7 +1013,7 @@ _d_stat :: proc(data: rawptr, path: string, follow: bool) -> (prim.Stat, prim.Er
 	if !lk.found {
 		return {}, .Not_Found
 	}
-	return _stat_of(d.inodes[lk.ino]), .None
+	return _stat_at(d, d.inodes[lk.ino], path), .None
 }
 
 @(private = "file")

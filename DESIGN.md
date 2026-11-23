@@ -395,6 +395,16 @@ equal in both directions.
   tree that made it (a tool call's subprocess vs. an editor). Darwin uses
   FSEvents/kqueue. Events mark paths dirty; overflow triggers a
   shadow-guided rescan.
+- **Racily clean entries**: a stat signature proves a file unchanged only
+  if no write could have landed in the same timestamp tick after the shadow
+  recorded it. A file entry recorded while its mtime or ctime is within one
+  tick of the recording time (2 s when the mtime is a whole second, which
+  covers HFS+ and FAT, else 100 ms for coarse kernel clocks) is marked racy,
+  and every comparison that would skip it on an equal stat (an event's pass,
+  a rescan, a carried move, materialization's disk check) compares content
+  instead. The pass that rereads it records it again, clean once its mtime
+  is older than a tick. A watcher event is therefore never dropped by an
+  equal stat unless the entry was recorded a full tick after its last write.
 - **Ingestion**: for each dirty path compare the stat signature, read only
   changed files, diff against the shadow text by lines (histogram diff; a
   changed hunk is a whole-line delete and insert, unless its new text is the
