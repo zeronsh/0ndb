@@ -162,45 +162,265 @@ _relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, device: p
 		_derived_purge(e, h)
 		return
 	}
-	_index_purge_messages(e, h, _sealed_in(h, device, from, to))
+	_index_purge_messages(e, h, _sealed_in(e, h, device, from, to))
 }
 
 @(private)
-_sealed_in :: proc(h: ^Handle, device: prim.Id, from, to: i64) -> []Msg_Pos {
-	out := make([dynamic]Msg_Pos, context.temp_allocator)
+SEAL_KEY :: u8(0xf3)
+
+@(private)
+SEAL_COVER :: u8(0xf4)
+
+@(private)
+SEAL_KEY_LEN :: 49
+
+@(private)
+SEAL_BATCH :: i64(32 * 1024)
+
+@(private = "file")
+Seal_At :: struct {
+	last: i64,
+	at:   i64,
+	msg:  i64,
+}
+
+@(private = "file")
+Seal_Part :: struct {
+	seg:  ^Seg,
+	from: i64,
+	to:   i64,
+}
+
+@(private)
+_seal_prefix :: proc(tag: u8, object, device: prim.Id) -> (k: [33]u8) {
+	o, d := object, device
+	k[0] = tag
+	copy(k[1:17], o[:])
+	copy(k[17:33], d[:])
+	return
+}
+
+@(private)
+_seal_key :: proc(object, device: prim.Id, last, at: i64) -> (k: [SEAL_KEY_LEN]u8) {
+	p := _seal_prefix(SEAL_KEY, object, device)
+	copy(k[:33], p[:])
+	_put_be64_seal(k[33:41], u64(max(last, 0)))
+	_put_be64_seal(k[41:49], u64(max(at, 0)))
+	return
+}
+
+@(private)
+_put_be64_seal :: proc "contextless" (b: []u8, v: u64) {
+	for i in 0 ..< 8 {
+		b[i] = u8(v >> (56 - 8 * u64(i)))
+	}
+}
+
+@(private)
+_cover_add :: proc(rs: ^[dynamic]journal.Range, r: journal.Range) {
+	if r.to <= r.from {
+		return
+	}
+	m := r
+	out := make([dynamic]journal.Range, 0, len(rs) + 1, context.temp_allocator)
+	placed := false
+	for c in rs {
+		if c.to < m.from {
+			append(&out, c)
+		} else if c.from > m.to {
+			if !placed {
+				append(&out, m)
+				placed = true
+			}
+			append(&out, c)
+		} else {
+			m = {min(m.from, c.from), max(m.to, c.to)}
+		}
+	}
+	if !placed {
+		append(&out, m)
+	}
+	rs^ = out
+}
+
+@(private = "file")
+_seal_cover :: proc(e: ^Engine, h: ^Handle, device: prim.Id) -> (cover: [dynamic]journal.Range, err: Error) {
+	cover = make([dynamic]journal.Range, context.temp_allocator)
+	ck := _seal_prefix(SEAL_COVER, h.id, device)
+	v, hit, gerr := omap.db_get(&e.reg.db, ROOT_CKPT, ck[:], context.temp_allocator)
+	if gerr != .None {
+		return cover, _oerr(gerr)
+	}
+	if !hit {
+		return cover, .None
+	}
+	i := 0
+	for i < len(v) {
+		f, n1 := prim.get_uvarint(v[i:])
+		if n1 <= 0 {
+			break
+		}
+		l, n2 := prim.get_uvarint(v[i + n1:])
+		if n2 <= 0 {
+			break
+		}
+		i += n1 + n2
+		append(&cover, journal.Range{i64(f), i64(f + l)})
+	}
+	return cover, .None
+}
+
+@(private = "file")
+_seal_parts :: proc(h: ^Handle, device: prim.Id, cover: []journal.Range) -> (parts: [dynamic]Seal_Part, total: i64) {
+	parts = make([dynamic]Seal_Part, context.temp_allocator)
 	for s in h.segs {
 		if s.device != device || s.rep == nil {
 			continue
 		}
 		for g in journal.replica_have(s.rep) {
-			if g.to <= to {
-				continue
-			}
-			pos := max(g.from, to)
-			for pos < g.to {
-				body, next, je := journal.record_at(&s.jr, pos)
-				if je == .Redacted {
-					pos = next
-					continue
-				}
-				if je != .None {
+			a := g.from
+			for c in cover {
+				if a >= g.to {
 					break
 				}
-				at := pos
-				pos = next
-				if obj.is_sig(body) || obj.record_kind(body) != u8(convo.Kind.Seal) {
+				if c.to <= a || c.from >= g.to {
 					continue
 				}
-				rec, derr := convo.decode_record(body, at, context.temp_allocator)
-				if derr != .None {
-					continue
+				if c.from > a {
+					append(&parts, Seal_Part{s, a, c.from})
+					total += c.from - a
 				}
-				if seal, ok := rec.body.(convo.Seal); ok && seal.last_block >= from && seal.last_block < to {
-					append(&out, Msg_Pos{device, seal.msg})
-				}
+				a = max(a, c.to)
+			}
+			if a < g.to {
+				append(&parts, Seal_Part{s, a, g.to})
+				total += g.to - a
 			}
 		}
 	}
+	return
+}
+
+@(private = "file")
+_seals_scan :: proc(e: ^Engine, s: ^Seg, from, to: i64, found: ^[dynamic]Seal_At) -> journal.Range {
+	pos := from
+	for pos < to {
+		e.stats.seal_scanned += 1
+		body, next, je := journal.record_at(&s.jr, pos)
+		if je == .Redacted {
+			pos = next
+			continue
+		}
+		if je != .None {
+			break
+		}
+		at := pos
+		pos = next
+		if obj.is_sig(body) || obj.record_kind(body) != u8(convo.Kind.Seal) {
+			continue
+		}
+		rec, derr := convo.decode_record(body, at, context.temp_allocator)
+		if derr != .None {
+			continue
+		}
+		if seal, ok := rec.body.(convo.Seal); ok {
+			append(found, Seal_At{seal.last_block, at, i64(seal.msg)})
+		}
+	}
+	return {from, pos}
+}
+
+@(private = "file")
+_seals_commit :: proc(e: ^Engine, h: ^Handle, device: prim.Id, cover: ^[dynamic]journal.Range, scanned: []journal.Range, found: []Seal_At) -> Error {
+	for r in scanned {
+		_cover_add(cover, r)
+	}
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		return _oerr(terr)
+	}
+	for f in found {
+		k := _seal_key(h.id, device, f.last, f.at)
+		vb: [10]u8
+		vn := prim.put_uvarint(vb[:], u64(f.msg))
+		if err := omap.txn_put(t, ROOT_CKPT, k[:], vb[:vn]); err != .None {
+			omap.txn_abort(t)
+			return _oerr(err)
+		}
+	}
+	vb := make([dynamic]u8, context.temp_allocator)
+	for c in cover {
+		tmp: [20]u8
+		n := prim.put_uvarint(tmp[:], u64(c.from))
+		n += prim.put_uvarint(tmp[n:], u64(c.to - c.from))
+		append(&vb, ..tmp[:n])
+	}
+	ck := _seal_prefix(SEAL_COVER, h.id, device)
+	if err := omap.txn_put(t, ROOT_CKPT, ck[:], vb[:]); err != .None {
+		omap.txn_abort(t)
+		return _oerr(err)
+	}
+	return _reg_commit(e, t)
+}
+
+@(private)
+_sealed_in :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64) -> []Msg_Pos {
+	out := make([dynamic]Msg_Pos, context.temp_allocator)
+	e.stats.seal_lookups += 1
+	cover, cerr := _seal_cover(e, h, device)
+	if cerr != .None {
+		return out[:]
+	}
+	parts, total := _seal_parts(h, device, cover[:])
+	found := make([dynamic]Seal_At, context.temp_allocator)
+	committed := false
+	if total >= SEAL_BATCH {
+		scanned := make([dynamic]journal.Range, context.temp_allocator)
+		for p in parts {
+			append(&scanned, _seals_scan(e, p.seg, p.from, p.to, &found))
+		}
+		committed = _seals_commit(e, h, device, &cover, scanned[:], found[:]) == .None
+	} else {
+		for p in parts {
+			if p.to > to {
+				_seals_scan(e, p.seg, max(p.from, to), p.to, &found)
+			}
+		}
+	}
+	if !committed {
+		for f in found {
+			if f.last >= from && f.last < to {
+				append(&out, Msg_Pos{device, f.msg})
+			}
+		}
+	}
+	Scan :: struct {
+		out:    ^[dynamic]Msg_Pos,
+		device: prim.Id,
+		to:     i64,
+	}
+	sc := Scan{&out, device, to}
+	start := _seal_key(h.id, device, from, 0)
+	pfx := _seal_prefix(SEAL_KEY, h.id, device)
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		x := (^Scan)(data)
+		if len(key) != SEAL_KEY_LEN {
+			return true
+		}
+		last: u64
+		for i in 0 ..< 8 {
+			last = last << 8 | u64(key[33 + i])
+		}
+		if i64(last) >= x.to {
+			return false
+		}
+		msg, n := prim.get_uvarint(value)
+		if n > 0 {
+			append(x.out, Msg_Pos{x.device, i64(msg)})
+		}
+		return true
+	}
+	omap.db_scan(&e.reg.db, ROOT_CKPT, start[:], pfx[:], &sc, visit)
 	return out[:]
 }
 
