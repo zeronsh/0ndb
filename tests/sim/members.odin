@@ -22,6 +22,8 @@ M_X :: 7
 M_DIR :: 8
 M_GUEST :: 9
 M_NODES :: 10
+M_REGION_MB :: 192
+M_TEMP_MB :: 16
 M_SUBJECT :: "user@sim"
 M_LEASE_MS :: u64(10 * 60 * 1000)
 
@@ -540,6 +542,12 @@ membership_run :: proc(seed: u64) -> (res: Mem_Result) {
 	cfg.mem_max = 3072
 	cfg.storage = .Stored
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
+	prev_main, prev_temp := region_main_size, region_temp_size
+	region_configure(M_REGION_MB, M_TEMP_MB)
+	defer {
+		region_main_size = prev_main
+		region_temp_size = prev_temp
+	}
 	w := new(World)
 	world_init(w, cfg)
 	mw := new(Mem_World)
@@ -569,13 +577,19 @@ membership_run :: proc(seed: u64) -> (res: Mem_Result) {
 		world_destroy(w)
 		free(w)
 	}
-	if !relay_start(&w.relay) {
+	if w.aborted || !relay_start(&w.relay) {
 		append(&res.failures, "relay start")
+		for f in w.failures {
+			append(&res.failures, fmt.aprintf("%s", f))
+		}
 		return
 	}
 	for i in 0 ..< M_NODES {
 		if i != M_THIEF && i != M_X && i != M_DIR && i != M_GUEST && !node_start(w.nodes[i]) {
 			append(&res.failures, fmt.aprintf("n%d start", i))
+			for f in w.failures {
+				append(&res.failures, fmt.aprintf("%s", f))
+			}
 			return
 		}
 	}
@@ -844,7 +858,10 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	x_card: [osync.CARD_LEN]u8
 	{
 		x := w.nodes[M_X]
-		node_start(x)
+		if !node_start(x) {
+			_fail(w, "n%d did not start", M_X)
+			return
+		}
 		context = instance_context(&x.inst)
 		kr := eng.keyring(&x.e)
 		x_card, _ = osync.keyring_card(&kr)
@@ -884,7 +901,10 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 	}
 	step5: {
 		x := w.nodes[M_X]
-		node_start(x)
+		if !node_start(x) {
+			_fail(w, "n%d did not start", M_X)
+			return
+		}
 		context = instance_context(&x.inst)
 		eng.space_join_enrollment(&x.e, spaces[0], nil, "space0", "relay", w.relay.public)
 		eng.space_open(&x.e, spaces[0])
@@ -904,7 +924,10 @@ _scenario :: proc(w: ^World, mw: ^Mem_World) {
 			prim.mkdir_all(tv, NODE_DIR + "/device", 0o700)
 			prim.replace_atomic(tv, NODE_DIR + "/device/" + osync.DEVICE_KEY_FILE, key)
 			x := w.nodes[M_THIEF]
-			node_start(x)
+			if !node_start(x) {
+				_fail(w, "n%d did not start", M_THIEF)
+				return
+			}
 			if x.identity.id != b.identity.id {
 				_fail(w, "thief did not assume n1's identity")
 			}
