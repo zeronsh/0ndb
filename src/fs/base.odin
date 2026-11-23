@@ -127,6 +127,7 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 	if m == nil || m.history == nil || path_internal(rel) {
 		return .None
 	}
+	mount_wake(m) or_return
 	inode, ok := _file_inode(m, rel)
 	if !ok {
 		_pin_drop(s, rel)
@@ -204,6 +205,9 @@ scope_write_begin :: proc(s: ^Scope, rel: string) {
 	if m == nil || m.history == nil || path_internal(rel) {
 		return
 	}
+	if mount_wake(m) != .None {
+		return
+	}
 	held := false
 	for h in m.holds {
 		held ||= h.scope == s && h.path == rel
@@ -239,7 +243,7 @@ scope_write_base :: proc(s: ^Scope, rel: string, data: []u8) {
 		return
 	}
 	p := _pin(s, rel, false)
-	if p == nil || !p.has_write {
+	if p == nil || !p.has_write || mount_wake(m) != .None {
 		return
 	}
 	inode, ok := _file_inode(m, rel)
