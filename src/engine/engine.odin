@@ -217,6 +217,7 @@ Config :: struct {
 	archive_min:     i64,
 	archive_group:   int,
 	archive_level:   int,
+	tail_window:     i64,
 	user:            rawptr,
 }
 

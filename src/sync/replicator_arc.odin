@@ -750,7 +750,7 @@ _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 	arm := a.arm
 	if arm.relay_len < 0 || arm.fresh_gen < a.fresh_need {
 		if arm.tail == 0 && !arm.probing {
-			_remote_want_tail(r, arm, TAIL_DEFAULT)
+			_remote_want_tail(r, arm, _tail_window(r))
 			a.fresh_need = arm.want_gen
 		}
 		return false
@@ -815,7 +815,7 @@ _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 			} else if journal.replica_covers(&arm.rep, seal.full_at, seal.full_at + 4) {
 				hi = seal.full_at + journal.record_size(int(_arm_u32(r, arm, seal.full_at)))
 			}
-			_arm_want(r, arm, seal.full_at, _arm_span_end(arm, hi))
+			_arm_want(r, arm, seal.full_at, _arm_span_end(r, arm, hi))
 			return false
 		}
 		fs: arc.Seal
@@ -837,8 +837,8 @@ _arc_load :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 }
 
 @(private)
-_arm_span_end :: proc(arm: ^Remote, hi: i64) -> i64 {
-	end := hi + TAIL_DEFAULT
+_arm_span_end :: proc(r: ^Replicator, arm: ^Remote, hi: i64) -> i64 {
+	end := hi + _tail_window(r)
 	if arm.relay_len >= 0 {
 		end = min(end, arm.relay_len)
 	}
@@ -868,7 +868,7 @@ _arc_back_read :: proc(r: ^Replicator, a: ^Arc_Read, arm: ^Remote, pos: i64) {
 	if a.back_pos == end {
 		a.back_win = min(a.back_win * 2, end)
 	} else {
-		a.back_win = min(i64(TAIL_DEFAULT), end)
+		a.back_win = min(_tail_window(r), end)
 	}
 	a.back_pos = end
 	gap := journal.Range{end - a.back_win, end}
@@ -1105,7 +1105,7 @@ _arc_resolve :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, keys: journ
 	arm := rm.arc.arm
 	hi := e.arc_off + e.arc_len
 	if !journal.replica_covers(&arm.rep, e.arc_off, hi) || !_arm_verified(arm, e.arc_off, hi) {
-		_arm_want(r, arm, e.arc_off, _arm_span_end(arm, hi))
+		_arm_want(r, arm, e.arc_off, _arm_span_end(r, arm, hi))
 		return .Wait, {}
 	}
 	body, nxt, rerr := _rep_record(&arm.rep, e.arc_off)
@@ -1167,7 +1167,7 @@ _arc_rst_refresh :: proc(r: ^Replicator, rm: ^Remote) {
 		rr.plain = true
 		rr.arc_of = rm
 		append(&a.rsts, rr)
-		_remote_want_tail(r, rr, TAIL_DEFAULT)
+		_remote_want_tail(r, rr, _tail_window(r))
 		append(&a.rst_need, rr.want_gen)
 	}
 }
@@ -1254,7 +1254,7 @@ _arc_rst_find :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, keys: jour
 	for rr, i in a.rsts {
 		if rr.relay_len < 0 || rr.fresh_gen < a.rst_need[i] {
 			if rr.tail == 0 && !rr.probing {
-				_remote_want_tail(r, rr, TAIL_DEFAULT)
+				_remote_want_tail(r, rr, _tail_window(r))
 				a.rst_need[i] = rr.want_gen
 			}
 			wait = true
