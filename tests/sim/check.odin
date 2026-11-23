@@ -1847,3 +1847,30 @@ _own_redaction_hooks :: proc "contextless" () {
 	register_restarted(71, check_learned_redactions, false)
 	register_final_check(51, check_learned_final)
 }
+
+learned_stream :: proc(w: ^World, n: ^Node, space: prim.Id, object: prim.Id, writer: prim.Id) -> (sid: osync.Stream_Id, ok: bool) {
+	m := &w.model
+	kind: M_Kind
+	found := false
+	for &ob in m.objs {
+		if ob.o.id == object {
+			kind = ob.kind
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	key, kerr := eng.object_key(&n.e, eng.Object{space, object})
+	if kerr != .None {
+		return
+	}
+	info, _ := eng.space_info(&n.e, space)
+	scope := osync.scope_make(key, info.mode)
+	name := make([]u8, 1 + prim.ID_HEX_LEN, context.temp_allocator)
+	name[0] = _kind_prefix(kind)
+	hx := prim.id_hex(object)
+	copy(name[1:], hx[:])
+	return osync.stream_id(&scope, osync.Device_Id(writer), string(name), 0), true
+}
