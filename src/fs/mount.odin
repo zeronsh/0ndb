@@ -670,7 +670,11 @@ mount_open_rest :: proc(m: ^Mount, fresh: bool) -> Error {
 		mount_pass(m, true) or_return
 	} else {
 		mount_recover(m) or_return
-		mount_pass(m, true) or_return
+		if perr := mount_pass(m, true); perr == .Deferred {
+			return .None
+		} else if perr != .None {
+			return perr
+		}
 	}
 	mount_materialize(m) or_return
 	if m.lost {
@@ -1411,6 +1415,12 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 }
 
 mount_run :: proc(m: ^Mount) -> Error {
+	err := mount_step(m)
+	return .None if err == .Deferred else err
+}
+
+@(private)
+mount_step :: proc(m: ^Mount) -> Error {
 	m.lock_first = false
 	fence := false
 	for f in m.fences {
@@ -1419,6 +1429,10 @@ mount_run :: proc(m: ^Mount) -> Error {
 		}
 	}
 	err := mount_pass(m, false, !fence)
+	if err == .Deferred {
+		mount_touch(m)
+		return err
+	}
 	if err == .None {
 		err = mount_materialize(m)
 		if err != .None && err != .Reloading {
@@ -1560,17 +1574,17 @@ mount_sync :: proc(m: ^Mount) -> Error {
 			waiting ||= f.arrived && !f.observed
 		}
 		if arrived {
-			mount_run(m) or_return
+			mount_step(m) or_return
 		} else if waiting {
 			observer_wait(m.reg) or_return
 		} else if !m.watched {
-			mount_run(m) or_return
+			mount_step(m) or_return
 		} else if !m.reg.os_ready || m.reg.watcher.wait == nil || !m.reg.watcher.wait(m.reg.watcher.data, m.reg, 2000) {
 			m.rescan = true
 			for &f in m.fences {
 				f.arrived = true
 			}
-			mount_run(m) or_return
+			mount_step(m) or_return
 		}
 	}
 	return result
@@ -1601,7 +1615,11 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 	scope_unhold(s)
 	if s.mount != nil {
 		err = mount_sync(s.mount)
-		if err != .None {
+		deferred := err == .Deferred
+		if deferred {
+			err = .None
+		}
+		if err != .None || deferred {
 			sm := s.mount
 			for k, v in sm.dirty {
 				if v == s {

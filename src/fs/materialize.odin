@@ -59,7 +59,11 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	}
 	if len(m.dirty) > 0 || m.rescan {
 		line_was, _ := clone_string(m.line, context.temp_allocator)
-		mount_pass(m, false) or_return
+		if perr := mount_pass(m, false); perr == .Deferred {
+			return .None
+		} else if perr != .None {
+			return perr
+		}
 		if m.line != line_was {
 			return mount_materialize(m)
 		}
@@ -70,6 +74,9 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	m.mat_ingest = true
 	merr := materialize_to(m, target, false)
 	m.mat_ingest = false
+	if merr == .Deferred {
+		return .None
+	}
 	merr or_return
 	return mount_settle(m)
 }
@@ -96,6 +103,9 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	}
 	if crdt.frontier_eq(tl[:], sl[:]) && len(m.absent) == 0 && len(m.reshow) == 0 {
 		return .None
+	}
+	if !m.adopting && !mount_durable_now(m) {
+		return .Deferred
 	}
 	m.merge_base = m.synced[:] if merge else nil
 	defer m.merge_base = nil

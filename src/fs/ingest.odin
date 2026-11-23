@@ -1266,7 +1266,7 @@ catch_up :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	if !mount_durable_now(m) {
-		return .None
+		return .Deferred
 	}
 	one := [1]crdt.Lv{latest}
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -1627,7 +1627,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
 	}
-	rebase_materialize(m, p.rebased[:]) or_return
+	if rerr := rebase_materialize(m, p.rebased[:]); rerr != .None && rerr != .Deferred {
+		return rerr
+	}
 	if p.head_moved && m.has_git && !p.git_wrote {
 		b: Builder
 		builder_init(&b, m.history, m.actor)

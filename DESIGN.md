@@ -745,7 +745,17 @@ equal in both directions.
   for the device, parents the base and that actor's last op), points the
   file's entry at the snapshot version, and materializes the target with the
   snapshot, so the person's bytes are a durable op concurrent with the
-  target and the written text is the CRDT's merge. Ingest never reads an owed path that is missing on disk
+  target and the written text is the CRDT's merge. A materialization writes
+  nothing while history holds a batch that is not yet durable (a snapshot,
+  an ingest a pass committed mid-materialization for a race retry or a
+  blocker, a rebase): `materialize_to` returns `Deferred` before it touches
+  disk or the shadow, by the same rule catch-up gates on, and the history's
+  durable acknowledgement reschedules the mount. A caller that gets
+  `Deferred` stays where it is: a pass whose catch-up defers stops before it
+  ingests, the switch stays in its phase, `mount_materialize` returns as it
+  does when the line is not yet durable, and `mount_sync` reports `Deferred`
+  so a closing scope records its attribution for the pass that resumes. Disk
+  only ever holds content history can name after any crash. Ingest never reads an owed path that is missing on disk
   as a delete, and the next pass that completes drains `absent`. A removal
   whose unlink fails fails its item, so its entry is never dropped while the
   file is still on disk. A pass whose line version is ahead of `synced`
