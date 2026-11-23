@@ -2,6 +2,7 @@
 package osync
 
 import "core:crypto"
+import "core:slice"
 import "../arc"
 import "../journal"
 import "../prim"
@@ -80,8 +81,8 @@ _Span_Rec :: struct {
 }
 
 restore_target :: proc "contextless" (name: string) -> (segment: string, ok: bool) {
-	n := len(arc.RESTORE_PREFIX) + 33
-	if len(name) <= n || name[:len(arc.RESTORE_PREFIX)] != arc.RESTORE_PREFIX || name[n - 1] != '/' {
+	n := len(arc.RESTORE_PREFIX)
+	if len(name) <= n || name[:n] != arc.RESTORE_PREFIX {
 		return "", false
 	}
 	return name[n:], true
@@ -554,7 +555,9 @@ _arc_release :: proc(r: ^Replicator, rm: ^Remote) {
 		_remote_maybe_free(r, a.arm)
 	}
 	for rr in a.rsts {
-		rr.arc_of = nil
+		if rr.arc_of == rm {
+			rr.arc_of = _rst_owner(r, rr, rm)
+		}
 		rr.refs -= 1
 		_remote_maybe_free(r, rr)
 	}
@@ -950,9 +953,53 @@ _arc_apply :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, body: []u8, k
 
 @(private)
 _arc_arm_settled :: proc(r: ^Replicator, arm: ^Remote) {
-	if rm := arm.arc_of; rm != nil {
-		_arc_drive(r, rm)
+	rm := arm.arc_of
+	if rm == nil {
+		return
 	}
+	if rm.arc == nil || rm.arc.arm == arm {
+		_arc_drive(r, rm)
+		return
+	}
+	owners := make([dynamic]Stream_Id, context.temp_allocator)
+	for id, x in r.remotes {
+		if x.arc == nil {
+			continue
+		}
+		for rr in x.arc.rsts {
+			if rr == arm {
+				append(&owners, id)
+				break
+			}
+		}
+	}
+	slice.sort_by(owners[:], proc(a, b: Stream_Id) -> bool {
+		x, y := a, b
+		return string(x[:]) < string(y[:])
+	})
+	for id in owners {
+		if x, ok := r.remotes[id]; ok && x.arc != nil {
+			_arc_drive(r, x)
+		}
+	}
+}
+
+@(private)
+_rst_owner :: proc(r: ^Replicator, rr: ^Remote, gone: ^Remote) -> ^Remote {
+	if r.destroying {
+		return nil
+	}
+	for _, x in r.remotes {
+		if x == gone || x.arc == nil {
+			continue
+		}
+		for y in x.arc.rsts {
+			if y == rr {
+				return x
+			}
+		}
+	}
+	return nil
 }
 
 @(private)
@@ -1127,7 +1174,7 @@ _arc_resolve :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, keys: journ
 
 @(private)
 _rst_name :: proc(rm: ^Remote) -> (string, bool) {
-	name, err := arc.restore_stream_name(cast([16]u8)rm.device, rm.name)
+	name, err := arc.restore_stream_name(rm.name)
 	return name, err == .None
 }
 
@@ -1167,12 +1214,14 @@ _arc_rst_refresh :: proc(r: ^Replicator, rm: ^Remote) {
 			continue
 		}
 		rr, err := _remote_get(r, &rm.scope, d, name, rm.epoch)
-		if err != .None || (rr.arc_of != nil && rr.arc_of != rm) {
+		if err != .None || (rr.arc_of != nil && rr.arc_of.arc == nil) {
 			continue
 		}
 		rr.refs += 1
 		rr.plain = true
-		rr.arc_of = rm
+		if rr.arc_of == nil {
+			rr.arc_of = rm
+		}
 		append(&a.rsts, rr)
 		_remote_want_tail(r, rr, _tail_window(r))
 		append(&a.rst_need, rr.want_gen)

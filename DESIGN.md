@@ -3591,7 +3591,8 @@ Relay cost tracks the reachable information, not the activity. Items marked
   (commitment kept) and the record's cells as holes, checks the fold
   against the writer-signed `head_before`/`head_after` that every seal
   entry carries, and appends `Restore{target writer, arc_off, group}` to
-  its own plain chained stream `rst/<writer>/<segment>`. Only once the
+  its own plain chained stream `rst/<segment>`, one per redactor and object
+  (each Restore names its target writer). Only once the
   relay holds that Restore does it zero-fill the source (the writer's
   group or the previous Restore) and send the segment redaction, so the
   engine's persisted redaction intent drives the whole sequence again
