@@ -9,6 +9,8 @@ HEADROOM_CHUNK :: i64(1 << 20)
 INODE_META_MAX :: i64(4 * 1024 + 512)
 @(private)
 META_FIXED :: i64(4 * 1024)
+@(private)
+RUN_SLACK :: i64(64 * 1024)
 
 @(private)
 _meta_need :: proc "contextless" (p: ^Pack, extra_inodes: int) -> i64 {
@@ -98,6 +100,9 @@ reserve :: proc(p: ^Pack, n: i64) -> Error {
 	if p.poisoned {
 		return .Io
 	}
+	if p.fl_retry {
+		return p.fl_err
+	}
 	if n < 0 || n > p.opts.container_size - _meta_need(p, 8) {
 		return .Too_Large
 	}
@@ -129,4 +134,17 @@ _room :: proc(p: ^Pack, n: int) -> Error {
 		return _headroom(p, i64(n), 0)
 	}
 	return _headroom(p, i64(n), 1)
+}
+
+@(private)
+_retry :: proc(p: ^Pack) -> Error {
+	if !p.fl_retry || p.fl.on {
+		return .None
+	}
+	p.fl_retry = false
+	return _submit(p)
+}
+
+stalled :: proc "contextless" (p: ^Pack) -> Error {
+	return p.fl_err if p.fl_retry else .None
 }
