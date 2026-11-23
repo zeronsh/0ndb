@@ -48,7 +48,10 @@
   `tools/gate.sh <scratch dir>` in that checkout and paste its summary block,
   unedited, into the PR body. A PR whose summary is not `result: PASS` on a
   base at most a few commits old is not ready. The gate builds with private
-  `-out` paths and takes about 15 minutes on 8 cores.
+  `-out` paths and takes about 15 minutes on 8 cores. A PR gated on the
+  current `origin/odin-rewrite` head lands on its own gate when the
+  coordinator's cherry-pick reproduces the summary's `tree=` hash, so gate
+  on the newest head you can.
 - `tools/gate-bisect.sh '<env>' <base> <commit>...` builds every point in
   parallel and runs one failing seed on each, for finding which commit
   breaks a seed.
