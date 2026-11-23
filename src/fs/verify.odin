@@ -320,7 +320,7 @@ history_unowned_actors :: proc(h: ^History, out: ^[dynamic]prim.Id) {
 		return
 	}
 	for a in h.g.actors {
-		if a == {} {
+		if a == {} || crdt.graph_known(&h.g, a) == 0 {
 			continue
 		}
 		if _, ok := history_actor_owner(h, a); !ok {

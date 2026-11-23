@@ -3199,6 +3199,9 @@ history_register_owned_actor :: proc(h: ^History, actor, pseudo, owner: prim.Id)
 	}
 	h.applied[0] = journal.journal_durable_len(&h.journal)
 	apply_actor_record(h, h.self, h.io[:]) or_return
+	if h.persist_due {
+		return admit_persist(h)
+	}
 	return kv_commit(&h.kv)
 }
 
