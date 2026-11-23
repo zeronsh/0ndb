@@ -225,11 +225,19 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	}
 	m.mat = &ms
 	defer m.mat = nil
-	for &it in items {
-		if err := materialize_one(m, &it, tl[:]); err != .None {
+	for &it, i in items {
+		err := Error.None
+		if len(ms.staged) > 0 && mat_item_structural(&it) {
+			err = mat_commit_staged(m, &ms)
+		}
+		if err == .None {
+			err = materialize_one(m, &it, tl[:])
+		}
+		if err != .None {
 			mat_unstage(m, &ms, 0)
 			mat_owe(m, &ms)
-			if mat_structural(items[:]) {
+			if mat_structural(items[i:]) {
+				mat_pin_written(m, items[:i], target)
 				m.rescan = true
 			} else {
 				mat_roll_forward(m, items[:], sl[:], target)
@@ -296,9 +304,38 @@ Mat_Stage :: struct {
 }
 
 @(private)
+mat_pin_written :: proc(m: ^Mount, items: []Mat_Item, target: Version) {
+	h := m.history
+	ids := make([dynamic]fstree.Op_Id, context.temp_allocator)
+	for id in target {
+		append(&ids, op_inode(h, id))
+	}
+	ver, verr := shadow_version_add(&m.shadow, ids[:])
+	if verr != .None || ver == 0 {
+		return
+	}
+	for &it in items {
+		if !it.present || it.kind != .File {
+			continue
+		}
+		cur, found, gerr := shadow_get(&m.shadow, it.path)
+		if gerr != .None || !found || cur.kind != .File || cur.ver != 0 || (it.has_old && cur.oid == it.entry.oid) {
+			continue
+		}
+		cur.ver = ver
+		shadow_put(&m.shadow, it.path, cur)
+	}
+}
+
+@(private)
+mat_item_structural :: proc(it: ^Mat_Item) -> bool {
+	return it.kind == .Dir || (it.has_old && it.entry.kind == .Dir) || (it.has_old && it.old != it.path) || (it.has_old && !it.present)
+}
+
+@(private)
 mat_structural :: proc(items: []Mat_Item) -> bool {
-	for it in items {
-		if it.kind == .Dir || (it.has_old && it.entry.kind == .Dir) || (it.has_old && it.present && it.old != it.path) {
+	for &it in items {
+		if mat_item_structural(&it) {
 			return true
 		}
 	}
