@@ -952,7 +952,7 @@ _obs_stop :: proc(data: rawptr, reg: ^fs.Registry) {
 _scope_of :: proc(reg: ^fs.Registry, m: ^fs.Mount, pid: prim.Pid) -> ^fs.Scope {
 	for i := len(reg.scopes) - 1; i >= 0; i -= 1 {
 		s := reg.scopes[i]
-		if s.closed || (m != nil && s.mount != m) {
+		if s.closed || s.closing || (m != nil && s.mount != m) {
 			continue
 		}
 		for x in s.pids {

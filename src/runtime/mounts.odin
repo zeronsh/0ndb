@@ -64,9 +64,16 @@ _tool_scopes_close :: proc(ws: ^Worktree, t: ^Wt_Tool) {
 	}
 	for s in t.scopes {
 		if s != nil {
-			fs.scope_close(reg, s)
+			fs.scope_close(reg, s, SCOPE_CLOSE_LATER)
 		}
 	}
+}
+
+@(private)
+SCOPE_CLOSE_LATER :: fs.Scope_Done{call = _scope_closed}
+
+@(private)
+_scope_closed :: proc(data: rawptr, err: fs.Error) {
 }
 
 Worktree :: struct {
@@ -893,7 +900,7 @@ worktree_hold :: proc(ws: ^Worktree, run: ^Run) {
 	clear(&ws.tools)
 	for &mb in ws.members {
 		if mb.turn != nil && rerr == .None {
-			fs.scope_close(reg, mb.turn)
+			fs.scope_close(reg, mb.turn, SCOPE_CLOSE_LATER)
 			mb.turn = nil
 		}
 	}

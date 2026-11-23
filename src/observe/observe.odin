@@ -216,6 +216,9 @@ scope_of :: proc(reg: ^fs.Registry, lineage: []prim.Pid) -> ^fs.Scope {
 		}
 		for i := len(reg.scopes) - 1; i >= 0; i -= 1 {
 			s := reg.scopes[i]
+			if s.closing {
+				continue
+			}
 			for p in s.pids {
 				if p == pid {
 					return s

@@ -37,6 +37,7 @@ Scope :: struct {
 	pids:   [dynamic]prim.Pid,
 	mount:  ^Mount,
 	closed: bool,
+	closing: bool,
 	pins:   [dynamic]Pin,
 	allocator: runtime.Allocator,
 }
@@ -1327,11 +1328,58 @@ scope_add_pid :: proc(s: ^Scope, pid: prim.Pid) {
 	append(&s.pids, pid)
 }
 
-scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
-	err: Error
+Scope_Done :: struct {
+	call: proc(data: rawptr, err: Error),
+	data: rawptr,
+}
+
+@(private)
+Scope_Close :: struct {
+	reg:  ^Registry,
+	s:    ^Scope,
+	done: Scope_Done,
+}
+
+scope_close :: proc(reg: ^Registry, s: ^Scope, done := Scope_Done{}) -> Error {
 	scope_unhold(s)
+	if done.call != nil && s.mount != nil && s.mount.reg != nil && s.mount.reg.loop != nil {
+		s.closing = true
+		for k, v in s.mount.open_scopes {
+			if v == s {
+				s.mount.open_scopes[k] = nil
+			}
+		}
+		c := new(Scope_Close, reg.allocator)
+		c^ = Scope_Close{reg = reg, s = s, done = done}
+		if ferr := mount_fence(s.mount, _scope_fenced, c); ferr == .None {
+			return .None
+		}
+		free(c, reg.allocator)
+	}
+	err := Error.None
 	if s.mount != nil {
 		err = mount_sync(s.mount)
+	}
+	err = _scope_close_tail(reg, s, err)
+	if done.call != nil {
+		done.call(done.data, err)
+	}
+	return err
+}
+
+@(private)
+_scope_fenced :: proc(m: ^Mount, data: rawptr, err: Error) {
+	c := (^Scope_Close)(data)
+	reg, s, done := c.reg, c.s, c.done
+	free(c, reg.allocator)
+	e := _scope_close_tail(reg, s, err)
+	done.call(done.data, e)
+}
+
+@(private)
+_scope_close_tail :: proc(reg: ^Registry, s: ^Scope, synced: Error) -> Error {
+	err := synced
+	if s.mount != nil {
 		if err != .None {
 			sm := s.mount
 			for k, v in sm.dirty {
@@ -1392,7 +1440,7 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 active_scope :: proc(m: ^Mount) -> ^Scope {
 	for i := len(m.reg.scopes) - 1; i >= 0; i -= 1 {
 		s := m.reg.scopes[i]
-		if s.mount == m && !s.closed {
+		if s.mount == m && !s.closed && !s.closing {
 			return s
 		}
 	}
