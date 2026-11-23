@@ -368,6 +368,21 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 			world_fail(w, "midway: after a materialize failed at op %d (%v) the synced version is not what is on disk: %s", c.k, c.mode, x)
 		}
 	}
+	if c.mode == .Snap_Crash {
+		run_until(w, w.now + 10_000_000_000, true)
+		context = instance_context(&a.inst)
+		same := len(m.saved_synced) == len(m.synced)
+		for x in m.synced {
+			found := false
+			for y in m.saved_synced {
+				found ||= x == y
+			}
+			same &&= found
+		}
+		if !same {
+			world_fail(w, "midway: after a crash at op %d of the pass that followed a failed materialize, the saved synced version %v lags the live one %v once the mount settled", c.j, m.saved_synced[:], m.synced[:])
+		}
+	}
 	if owed := fs.mount_absent(m); len(owed) > 0 {
 		world_fail(w, "midway: after a materialize failed at op %d (%v) and a clean pass, %d paths are still owed: %v", c.k, c.mode, len(owed), owed)
 	}
