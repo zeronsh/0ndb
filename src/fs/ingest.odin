@@ -6,6 +6,7 @@ import "core:strings"
 import "core:mem/virtual"
 import "core:slice"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../odb"
 import "../prim"
@@ -2778,6 +2779,9 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	e.ver = 0
 	m := p.m
 	h := m.history
+	if c.has_copy {
+		renamed_marker(h, b, e.inode, c.copy_src)
+	}
 	path := c.path
 	if c.disk == .Symlink {
 		if m.db != nil {
@@ -2842,6 +2846,13 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	defer m.copy = nil
 	emit_text_edits(m, b, e.inode, path, old, data) or_return
 	return shadow_put(&m.shadow, path, ne)
+}
+
+@(private)
+renamed_marker :: proc(h: ^History, b: ^Builder, dest: fstree.Inode_Id, source: fstree.Inode_Id) {
+	buf := make([dynamic]u8, context.temp_allocator)
+	fshist.encode_renamed(&buf, fshist.Renamed_Op{dest = inode_op(h, dest), source = inode_op(h, source)})
+	builder_opaque(b, buf[:])
 }
 
 @(private)

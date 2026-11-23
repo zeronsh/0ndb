@@ -129,6 +129,7 @@ M_Move :: struct {
 Model :: struct {
 	w:      ^World,
 	moves:  [dynamic]^M_Move,
+	reasserted: map[string]bool,
 	spaces: [dynamic]M_Space,
 	objs:   [dynamic]M_Obj,
 	ops:    [dynamic]^M_Op,
@@ -171,6 +172,7 @@ model_init :: proc(m: ^Model, w: ^World) {
 	m.probes = make([dynamic]int, a)
 	m.moves = make([dynamic]^M_Move, a)
 	m.temps = make([dynamic]M_Temp, a)
+	m.reasserted = make(map[string]bool, a)
 }
 
 model_destroy :: proc(m: ^Model) {
@@ -227,6 +229,10 @@ model_destroy :: proc(m: ^Model) {
 		delete(t.tokens)
 	}
 	delete(m.temps)
+	for k in m.reasserted {
+		delete(k, a)
+	}
+	delete(m.reasserted)
 }
 
 model_temp_write :: proc(m: ^Model, obj: int, path: string, actor: prim.Id, data: []u8) {

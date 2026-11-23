@@ -267,7 +267,10 @@ Event codes: 0 connected, 1 disconnected, 2 durable, 3 uploaded,
 tree, `detail` is `<from line>\n<to line>`),
 30 replica_redacted (this device zero-filled its replica of `device`'s segment
 of `object` for a redaction it learned of; `tick` is the range start and
-`length` its end). The meaning of each
+`length` its end),
+31 rename_offered (edits made to a file after another device renamed it onto
+an existing name are offered on the destination: `object` is the tree,
+`detail` is `<source path>\n<destination path>`). The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
 conversation's next run is; see "Placement" below), `presence`
 (device up or down, `tick` 1 or 0), `connected`/`disconnected` (relay link of

@@ -35,6 +35,8 @@ TOP_CONTENT :: u8(16)
 TOP_GIT :: u8(17)
 TOP_MOUNT :: u8(18)
 TOP_OBSERVE :: u8(19)
+TOP_RENAMED :: u8(21)
+TOP_ACCEPT :: u8(22)
 
 OBSERVE_VERSION :: u8(1)
 
@@ -729,4 +731,67 @@ actor_key :: proc(actor: prim.Id, allocator := context.temp_allocator) -> []u8 {
 	a := actor
 	copy(k[3:], a[:])
 	return k
+}
+
+Renamed_Op :: struct {
+	dest:   crdt.Op_Id,
+	source: crdt.Op_Id,
+}
+
+encode_renamed :: proc(buf: ^[dynamic]u8, o: Renamed_Op) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, TOP_RENAMED)
+	prim.write_u8(&w, 1)
+	prim.write_id(&w, o.dest.actor)
+	prim.write_uvarint(&w, o.dest.seq)
+	prim.write_id(&w, o.source.actor)
+	prim.write_uvarint(&w, o.source.seq)
+}
+
+decode_renamed :: proc(content: []u8) -> (o: Renamed_Op, ok: bool) {
+	r := prim.reader(content)
+	if prim.read_u8(&r) != TOP_RENAMED || prim.read_u8(&r) != 1 {
+		return o, false
+	}
+	o.dest.actor = prim.read_id(&r)
+	o.dest.seq = prim.read_uvarint(&r)
+	o.source.actor = prim.read_id(&r)
+	o.source.seq = prim.read_uvarint(&r)
+	return o, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
+}
+
+Accept_Op :: struct {
+	kind:   u8,
+	dest:   crdt.Op_Id,
+	source: crdt.Op_Id,
+	revert: prim.Id,
+	index:  u64,
+}
+
+encode_accept :: proc(buf: ^[dynamic]u8, o: Accept_Op) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, TOP_ACCEPT)
+	prim.write_u8(&w, 1)
+	prim.write_u8(&w, o.kind)
+	prim.write_id(&w, o.dest.actor)
+	prim.write_uvarint(&w, o.dest.seq)
+	prim.write_id(&w, o.source.actor)
+	prim.write_uvarint(&w, o.source.seq)
+	prim.write_id(&w, o.revert)
+	prim.write_uvarint(&w, o.index)
+}
+
+decode_accept :: proc(content: []u8) -> (o: Accept_Op, ok: bool) {
+	r := prim.reader(content)
+	if prim.read_u8(&r) != TOP_ACCEPT || prim.read_u8(&r) != 1 {
+		return o, false
+	}
+	o.kind = prim.read_u8(&r)
+	o.dest.actor = prim.read_id(&r)
+	o.dest.seq = prim.read_uvarint(&r)
+	o.source.actor = prim.read_id(&r)
+	o.source.seq = prim.read_uvarint(&r)
+	o.revert = prim.read_id(&r)
+	o.index = prim.read_uvarint(&r)
+	return o, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
 }

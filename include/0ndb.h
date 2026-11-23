@@ -119,7 +119,7 @@
  *                 19 members_changed, 20 epoch_changed, 21 access_revoked,
  *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
  *                 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left,
- *                 29 line_switched
+ *                 29 line_switched, 30 replica_redacted, 31 rename_offered
  *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
  *                 5 runner, 6 guest, 7 directory
  *   member_role   0 owner, 1 admin, 2 member, 3 reader
@@ -297,7 +297,10 @@
  *                 device, tick 1 up or 0 down and length the relay's time;
  *                 line_switched carries the tree as object and detail
  *                 "<from line>\n<to line>" when a mount moved lines on a
- *                 branch switch;
+ *                 branch switch; rename_offered carries the tree as
+ *                 object and detail "<source path>\n<destination path>"
+ *                 when edits to a file another device renamed onto an
+ *                 existing name are offered on the destination;
  *                 caught_up carries space and length the relay feed
  *                 position the device has read up to; indexer_wanted
  *                 carries the space a search wanted a full indexer in

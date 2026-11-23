@@ -3,6 +3,7 @@ package engine
 import "base:runtime"
 import "core:crypto/blake2b"
 import "core:mem/virtual"
+import "core:strings"
 import "../crdt"
 import "../fs"
 import "../fshist"
@@ -438,6 +439,8 @@ _hist_open :: proc(h: ^Handle) -> Error {
 		}
 		fs.history_retain(hist)
 		h.hist = hist
+		hist.on_offered = _on_offered
+		hist.offered_data = h
 		h.hist_chain = h.own_tree != nil
 		for x in e.plug.mounts {
 			if x.object.id == h.id {
@@ -463,8 +466,24 @@ _hist_open :: proc(h: ^Handle) -> Error {
 		return _ferr(err)
 	}
 	h.hist = hist
+	hist.on_offered = _on_offered
+	hist.offered_data = h
 	h.hist_chain = h.own_tree != nil
 	return .None
+}
+
+@(private)
+_on_offered :: proc(data: rawptr, hist: ^fs.History, dest: fstree.Inode_Id, source: fstree.Inode_Id) {
+	h := (^Handle)(data)
+	e := h.e
+	if e == nil || h.sp == nil {
+		return
+	}
+	snap := fstree.current(&hist.tree)
+	from, _, _ := fstree.last_path(&snap, source, context.temp_allocator)
+	to, _, _ := fstree.last_path(&snap, dest, context.temp_allocator)
+	detail := strings.concatenate({from, "\n", to}, context.temp_allocator)
+	_emit(e, Event{kind = .Rename_Offered, space = h.sp.id, object = h.id, detail = detail})
 }
 
 @(private)
@@ -786,6 +805,9 @@ Tree_Conflict :: struct {
 	end:    int,
 	ours:   []crdt.Op_Span,
 	theirs: []crdt.Op_Span,
+	kind:   fs.Conflict_Kind,
+	source: string,
+	raw:    fs.Text_Conflict,
 }
 
 tree_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
@@ -809,6 +831,11 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 	_hist_catch_up(e, h)
 	list := make([dynamic]fs.Text_Conflict, context.temp_allocator)
 	_ferr(fs.history_text_conflicts(h.hist, &list, allocator)) or_return
+	if kind == .File_Tree {
+		view := _tree_at(e, h, "", nil) or_return
+		version := view.version if !view.head else fs.history_heads(h.hist, context.temp_allocator)
+		_ferr(fs.history_offers(h.hist, version, &view.snap, &list, allocator)) or_return
+	}
 	snap := fstree.current(&h.hist.tree)
 	out = make([]Tree_Conflict, len(list), allocator)
 	for c, i in list {
@@ -820,6 +847,13 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 		out[i].end = c.end
 		out[i].ours = c.ours
 		out[i].theirs = c.theirs
+		out[i].kind = c.kind
+		out[i].raw = c
+		if c.kind == .Offered {
+			if sp, sok, serr := fstree.last_path(&snap, c.source, context.temp_allocator); serr == nil && sok {
+				out[i].source = _clone(sp, allocator) or_return
+			}
+		}
 		for &x in out[i].ours {
 			if o, owned := fs.history_actor_owner(h.hist, x.id.actor); owned {
 				x.id.actor = o
@@ -832,6 +866,23 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 		}
 	}
 	return out, .None
+}
+
+tree_conflict_accept :: proc(e: ^Engine, o: Object, c: Tree_Conflict) -> Error {
+	context = context_for(e)
+	h := _handle_get(e, o, .File_Tree) or_return
+	_handle_create_writer(h) or_return
+	_hist_catch_up(e, h)
+	at := _tree_at(e, h, "", nil) or_return
+	ops := make([dynamic]crdt.Op_Run, context.temp_allocator)
+	version := at.version if !at.head else fs.history_heads(h.hist, context.temp_allocator)
+	_ferr(fs.conflict_accept_ops(h.hist, c.raw, version, &ops)) or_return
+	if len(ops) == 0 {
+		return .None
+	}
+	_hist_batch(e, h, ops[:], &at) or_return
+	_handle_mark(h)
+	return .None
 }
 
 conflicts_clear :: proc(e: ^Engine, o: Object, kind: Kind) -> Error {

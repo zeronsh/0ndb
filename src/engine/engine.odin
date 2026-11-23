@@ -144,6 +144,7 @@ Event_Kind :: enum u8 {
 	Space_Left,
 	Line_Switched,
 	Replica_Redacted,
+	Rename_Offered,
 }
 
 Event :: struct {
