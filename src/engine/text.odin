@@ -395,7 +395,7 @@ tree_history :: proc(e: ^Engine, o: Object) -> (hist: ^fs.History, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
-	_hist_caught_up(e, h) or_return
+	_hist_catch_up(e, h)
 	h.pins += 1
 	_handle_mark(h)
 	return h.hist, .None
