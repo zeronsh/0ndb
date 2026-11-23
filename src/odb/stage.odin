@@ -279,6 +279,10 @@ install_compact :: proc(db: ^Odb) {
 	resize(&db.staged, j)
 }
 
+install_staged :: proc(db: ^Odb) -> Error {
+	return install_now(db)
+}
+
 @(private)
 install_now :: proc(db: ^Odb) -> Error {
 	sync.mutex_lock(&db.mutex)

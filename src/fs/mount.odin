@@ -1867,6 +1867,14 @@ Mount_Wait :: struct {
 }
 
 @(private)
+names_durable :: proc(db: ^odb.Odb) -> Error {
+	if db == nil {
+		return .None
+	}
+	return from_odb(odb.install_staged(db))
+}
+
+@(private)
 image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	image_free(m, img)
 	img.synced = make([dynamic]crdt.Op_Id, m.allocator)
@@ -1934,6 +1942,7 @@ mount_durable_now :: proc(m: ^Mount) -> bool {
 
 @(private)
 shadow_flush :: proc(m: ^Mount) -> Error {
+	names_durable(m.db) or_return
 	mat_settle_owed(m) or_return
 	held := m.shadow.hold
 	m.shadow.hold = false
@@ -2032,6 +2041,7 @@ mount_ack :: proc(m: ^Mount) -> Error {
 }
 
 save_mount_state :: proc(m: ^Mount) -> Error {
+	names_durable(m.db) or_return
 	img := &m.img
 	synced := m.img.synced[:]
 	buf := make([dynamic]u8, context.temp_allocator)

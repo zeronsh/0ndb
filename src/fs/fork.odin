@@ -55,6 +55,9 @@ mount_fork :: proc(src: ^Mount, dst: ^Mount, id: prim.Id, root: string, state_di
 	shadow_open(&sh, vfs, sp, fmt_, runtime.heap_allocator()) or_return
 	err := clone_tree(src, &sh, root, "")
 	if err == .None {
+		err = names_durable(src.db)
+	}
+	if err == .None {
 		err = shadow_persist(&sh)
 	}
 	shadow_close(&sh)
@@ -137,6 +140,7 @@ clone_tree :: proc(src: ^Mount, sh: ^Shadow, root: string, rel: string) -> Error
 			clone_tree(src, sh, root, child) or_return
 		}
 		if shadow_pending_count(sh) >= 65536 {
+			names_durable(src.db) or_return
 			shadow_persist(sh) or_return
 		}
 	}
