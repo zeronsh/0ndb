@@ -123,7 +123,7 @@ _gb_icodes :: proc(m: ^Merge) -> Error {
 		}
 		gb.need[i] = true
 		enc += 1
-		_gb_read_vec(m, o, gb.chunk[i * gb.dim:][:gb.dim]) or_return
+		_gb_read_vec_seq(m, o, gb.chunk[i * gb.dim:][:gb.dim]) or_return
 	}
 	if enc > 0 {
 		gb.chunk_lo = gb.cursor
@@ -224,7 +224,7 @@ _gb_iwrite :: proc(ix: ^Index, m: ^Merge) -> Error {
 		slice.fill(rec, 0)
 		v := slice.reinterpret([]f32, rec[4:][:d * 4])
 		if o < gb.bstart || o >= gb.bstart + gb.blive {
-			_gb_read_vec(m, o, v) or_return
+			_gb_read_vec_seq(m, o, v) or_return
 			sw_write(&m.sw, rec)
 			continue
 		}
@@ -667,7 +667,7 @@ _cal_init :: proc(m: ^Merge) -> Error {
 		o := u32((k * gb.n) / q + gb.n / (2 * q))
 		gb.cal_ids[k] = o
 		v := gb.cal_vec[k * gb.dim:][:gb.dim]
-		_gb_read_vec(m, int(o), v) or_return
+		_gb_read_vec_seq(m, int(o), v) or_return
 		cb_lut(gb.cb, v, gb.cal_lut[k * gb.m * gb.cb.ksub:][:gb.m * gb.cb.ksub])
 	}
 	for &w in gb.workers {
@@ -745,7 +745,7 @@ _cal_brute :: proc(m: ^Merge) -> Error {
 				if id == NONE_U32 {
 					continue
 				}
-				_gb_read_vec(m, int(id), v) or_return
+				_gb_read_vec_seq(m, int(id), v) or_return
 				sim := dot(qv, v)
 				mi := 0
 				for k in 1 ..< CAL_K {
