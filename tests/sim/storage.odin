@@ -5,10 +5,9 @@ import "../../src/prim"
 import osync "../../src/sync"
 
 Promo_Rec :: struct {
-	obj:  int,
-	node: int,
-	inc:  int,
-	tick: u64,
+	obj:       int,
+	node:      int,
+	uncertain: bool,
 }
 
 storage_mode_of :: proc(s: string) -> (m: eng.Storage_Mode, ok: bool) {
@@ -43,24 +42,8 @@ op_promote :: proc(w: ^World, n: ^Node) {
 	context = instance_context(&n.inst)
 	err := eng.object_promote(&n.e, m.objs[oi].o)
 	world_note(w, "%s promote %v %s -> %v", n.name, m.objs[oi].kind, id_short(m.objs[oi].o.id), err)
-	if err == .None {
-		append(&w.promos, Promo_Rec{obj = oi, node = n.idx, inc = n.incarnation, tick = eng.pending_seq(&n.e)})
-	}
-}
-
-promos_crashed :: proc(w: ^World, n: ^Node) {
-	if !n.e_open {
-		return
-	}
-	durable := eng.durable_seq(&n.e)
-	for i := 0; i < len(w.promos); {
-		p := w.promos[i]
-		if p.node == n.idx && p.inc == n.incarnation && p.tick > durable {
-			world_note(w, "%s promotion of %s lost in crash (not yet durable)", n.name, id_short(w.model.objs[p.obj].o.id))
-			ordered_remove(&w.promos, i)
-			continue
-		}
-		i += 1
+	if err == .None || err == .Io || err == .No_Space {
+		append(&w.promos, Promo_Rec{obj = oi, node = n.idx, uncertain = err != .None})
 	}
 }
 
@@ -134,7 +117,7 @@ check_relay_storage :: proc(w: ^World) {
 			}
 		}
 		for p in w.promos {
-			if p.obj != oi {
+			if p.obj != oi || p.uncertain {
 				continue
 			}
 			pn := w.nodes[p.node]

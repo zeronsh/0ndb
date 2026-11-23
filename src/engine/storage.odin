@@ -120,12 +120,12 @@ _promo_key :: proc(space, object: prim.Id) -> (k: [33]u8) {
 }
 
 @(private)
-_promo_mark :: proc(e: ^Engine, space, object: prim.Id, from: i64, on: bool) {
+_promo_mark :: proc(e: ^Engine, space, object: prim.Id, from: i64, on: bool) -> Error {
 	k := _promo_key(space, object)
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
 		_reg_fail(e, _oerr(terr))
-		return
+		return _oerr(terr)
 	}
 	v: [8]u8
 	prim.put_u64le(v[:], u64(max(from, 0)))
@@ -138,9 +138,9 @@ _promo_mark :: proc(e: ^Engine, space, object: prim.Id, from: i64, on: bool) {
 	if err != .None {
 		omap.txn_abort(t)
 		_reg_fail(e, .Io)
-		return
+		return .Io
 	}
-	_reg_commit(e, t)
+	return _reg_commit(e, t)
 }
 
 @(private)
@@ -298,7 +298,7 @@ _promote :: proc(e: ^Engine, o: Object, from: i64, froms: map[prim.Id]i64) -> Er
 		u.set += {.Storage}
 		u.storage = .Stored
 	}
-	_promo_mark(e, o.space, o.id, from, true)
+	_promo_mark(e, o.space, o.id, from, true) or_return
 	if !sp.repl_on {
 		return .None
 	}
