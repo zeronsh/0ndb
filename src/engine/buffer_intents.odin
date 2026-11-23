@@ -122,10 +122,9 @@ _dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> bool {
 	if err != .None {
 		return err == .Not_Found
 	}
-	if _hist_ready(e, h) != .None {
+	if _hist_ready(e, h) != .None || _hist_caught_up(e, h) != .None {
 		return false
 	}
-	_hist_catch_up(e, h)
 	hist := h.hist
 	if hist == nil || hist.own_wait {
 		return false
