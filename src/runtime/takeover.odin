@@ -1,5 +1,6 @@
 package rt
 
+import "../agent"
 import "core:strings"
 import "../convo"
 import eng "../engine"
@@ -292,7 +293,6 @@ _env_set :: proc(r: ^Runtime, name: string) -> bool {
 @(private)
 _providers_signed_in :: proc(r: ^Runtime, installed: string) -> string {
 	out := make([dynamic]string, context.temp_allocator)
-	vfs := prim.os_vfs()
 	rest := installed
 	for len(rest) > 0 {
 		n := strings.index_byte(rest, '\n')
@@ -306,31 +306,41 @@ _providers_signed_in :: proc(r: ^Runtime, installed: string) -> string {
 			}
 			continue
 		}
-		d, ok := _descriptor(r, id)
-		if !ok {
-			continue
-		}
-		signed := len(d.auth_env) == 0 && len(d.auth_files) == 0
-		for e in d.auth_env {
-			signed ||= _env_set(r, e)
-		}
-		for f in d.auth_files {
-			if signed || len(r.cfg.home_dir) == 0 {
-				break
-			}
-			path := concat(r.cfg.home_dir, "/", f.path)
-			if len(f.contains) == 0 {
-				signed = prim.exists(vfs, path)
-				continue
-			}
-			data, rerr := prim.read_file(vfs, path, context.temp_allocator)
-			signed = rerr == .None && strings.contains(string(data), f.contains)
-		}
-		if signed {
+		if d, ok := _descriptor(r, id); ok && _descriptor_signed_in(r, d) {
 			append(&out, id)
 		}
 	}
 	return strings.join(out[:], "\n", context.temp_allocator)
+}
+
+@(private)
+_descriptor_signed_in :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> bool {
+	vfs := prim.os_vfs()
+	signed := len(d.auth_env) == 0 && len(d.auth_files) == 0
+	for e in d.auth_env {
+		signed ||= _env_set(r, e)
+	}
+	for f in d.auth_files {
+		if signed || len(r.cfg.home_dir) == 0 {
+			break
+		}
+		path := concat(r.cfg.home_dir, "/", f.path)
+		if len(f.contains) == 0 {
+			signed = prim.exists(vfs, path)
+			continue
+		}
+		data, rerr := prim.read_file(vfs, path, context.temp_allocator)
+		signed = rerr == .None && strings.contains(string(data), f.contains)
+	}
+	return signed
+}
+
+provider_signed_in :: proc(r: ^Runtime, id: string) -> bool {
+	if id == PROVIDER_NATIVE {
+		return strings.contains(_providers_signed_in(r, id), id)
+	}
+	d, ok := _descriptor(r, id)
+	return ok && _descriptor_signed_in(r, d)
 }
 
 runner_directory :: proc(r: ^Runtime, space: prim.Id, o: Object = {}, allocator := context.allocator) -> []Runner_Entry {

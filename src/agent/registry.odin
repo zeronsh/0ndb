@@ -51,6 +51,7 @@ Provider_Descriptor :: struct {
 	seed_budget:  int,
 	auth_env:     []string,
 	auth_files:   []Auth_Probe,
+	login:        string,
 }
 
 Auth_Probe :: struct {
@@ -139,6 +140,7 @@ builtin :: proc(p: Provider) -> Provider_Descriptor {
 			seed_budget = 120_000,
 			auth_env = AUTH_ENV_CLAUDE[:],
 			auth_files = AUTH_FILES_CLAUDE[:],
+			login = "run `claude` and sign in with /login",
 		}
 	case .Codex:
 		return {
@@ -151,6 +153,7 @@ builtin :: proc(p: Provider) -> Provider_Descriptor {
 			seed_budget = 120_000,
 			auth_env = AUTH_ENV_CODEX[:],
 			auth_files = AUTH_FILES_CODEX[:],
+			login = "run `codex login`",
 		}
 	case .Pi:
 		return {
@@ -315,6 +318,7 @@ clone_descriptor :: proc(desc: Provider_Descriptor, allocator: mem.Allocator) ->
 	out := desc
 	out.id = strings.clone(desc.id, allocator)
 	out.name = strings.clone(desc.name, allocator)
+	out.login = strings.clone(desc.login, allocator)
 	err: Error
 	if out.argv, err = clone_strings(desc.argv, allocator); err != .None {
 		return {}, err
@@ -346,6 +350,7 @@ clone_descriptor :: proc(desc: Provider_Descriptor, allocator: mem.Allocator) ->
 drop_descriptor :: proc(desc: ^Provider_Descriptor, allocator: mem.Allocator) {
 	delete(desc.id, allocator)
 	delete(desc.name, allocator)
+	delete(desc.login, allocator)
 	drop_strings(desc.argv, allocator)
 	drop_strings(desc.env, allocator)
 	drop_strings(desc.client_meta, allocator)

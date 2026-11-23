@@ -321,11 +321,11 @@ run_notice :: proc(run: ^Run, text: string) {
 	run.cur = -1
 }
 
-run_error :: proc(run: ^Run, text: string) {
+run_error :: proc(run: ^Run, text: string, code := "") {
 	if len(text) == 0 {
 		return
 	}
-	run_block(run, .Error, transmute([]u8)text)
+	run_block(run, .Error, transmute([]u8)text, name = code)
 	run.cur = -1
 	if len(run.error) == 0 {
 		run.error = clone(text, run.alloc)

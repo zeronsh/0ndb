@@ -348,6 +348,8 @@ op_models :: proc(c: ^Call, o: ^Out) -> Status {
 		o_str(o, "command", d.argv[0] if len(d.argv) > 0 else "")
 		o_enum(o, "protocol", u64(d.protocol), PROTOCOL_NAMES[:])
 		o_bool(o, "available", len(d.argv) > 0 && _on_path(d.argv[0]))
+		o_bool(o, "signed_in", rt.provider_signed_in(r, d.id))
+		o_str(o, "login", d.login)
 		lp: ^Live_Provider
 		for &x in a.models.providers {
 			if x.id == d.id {

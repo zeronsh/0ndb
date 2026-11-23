@@ -1,5 +1,6 @@
 package rt
 
+import "core:fmt"
 import "base:runtime"
 
 import "core:slice"
@@ -864,6 +865,16 @@ _run_begin :: proc(run: ^Run, lines: []convo.Line) -> Error {
 		runtime_undo_resume(r, o)
 	}
 	run.lines = lines
+	if run.ai.kind == .Harness && !provider_signed_in(r, run.ai.provider) {
+		if err := _ensure_reply(run, nil); err != .None {
+			_run_free(run)
+			return err
+		}
+		run_error(run, _not_signed_in_notice(r, run.ai.provider), NOT_SIGNED_IN)
+		run.state = .Running
+		run_finish(run, .Failed)
+		return .None
+	}
 	run.renew_timer = prim.timer(eng.loop(r.e), i64(r.cfg.lease_ms / 3), run, _on_renew)
 	if run.ai.budget.seconds > 0 {
 		run.budget_timer = prim.timer(eng.loop(r.e), run.ai.budget.seconds * 1000, run, _on_budget_timer)
@@ -886,6 +897,18 @@ _run_begin :: proc(run: ^Run, lines: []convo.Line) -> Error {
 		return err
 	}
 	return _run_setup(run)
+}
+
+NOT_SIGNED_IN :: "not_signed_in"
+
+@(private)
+_not_signed_in_notice :: proc(r: ^Runtime, id: string) -> string {
+	d, ok := _descriptor(r, id)
+	name := d.name if ok && len(d.name) > 0 else id
+	if ok && len(d.login) > 0 {
+		return fmt.tprintf("%s is not signed in on this device: %s, then send again.", name, d.login)
+	}
+	return fmt.tprintf("%s is not signed in on this device: sign in to it, then send again.", name)
 }
 
 @(private)
