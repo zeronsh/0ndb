@@ -13,6 +13,8 @@ INIT_DEGREE :: 24
 L_BUILD :: 96
 BUILD_RAM :: 48 * 1024 * 1024
 BUILD_THREADS :: 8
+VEC_WINDOW :: 64 * 1024
+VEC_NEAR :: 4096
 STEP_NODES :: 4096
 NLOCKS :: 4096
 PART_SAMPLE :: 8192
@@ -145,6 +147,12 @@ Graph_Build :: struct {
 	cal_lut:  []f32,
 	cal_truth: []u32,
 	cal_level: int,
+	vw_buf:   []u8,
+	vw_seg:   int,
+	vw_off:   i64,
+	vw_n:     int,
+	vw_last:  int,
+	vw_end:   i64,
 }
 
 @(private)
@@ -171,6 +179,58 @@ _gb_read_vec :: proc(m: ^Merge, o: int, out: []f32) -> Error {
 	return .None
 }
 
+@(private)
+_gb_read_vec_seq :: proc(m: ^Merge, o: int, out: []f32) -> Error {
+	gb := m.gb
+	si, p, ok := _gb_src(m, o)
+	if !ok {
+		return .Corrupt
+	}
+	s := &m.segs[si]
+	bytes := slice.to_bytes(out)
+	need := len(bytes)
+	off := rec_vec_off(s, u64(p))
+	defer {
+		gb.vw_last = si
+		gb.vw_end = off + i64(need)
+	}
+	if gb.vw_seg == si && gb.vw_n > 0 && off >= gb.vw_off && off + i64(need) <= gb.vw_off + i64(gb.vw_n) {
+		copy(bytes, gb.vw_buf[off - gb.vw_off:][:need])
+		return .None
+	}
+	if gb.vw_last != si || off < gb.vw_end || off - gb.vw_end > VEC_NEAR {
+		got, e := prim.read_at(s.vfs, s.fd, bytes, off)
+		if e != .None {
+			return _perr(e)
+		}
+		if got != need {
+			return .Corrupt
+		}
+		return .None
+	}
+	if gb.vw_buf == nil {
+		gb.vw_buf = make([]u8, VEC_WINDOW, gb.alloc)
+		if gb.vw_buf == nil {
+			return .No_Memory
+		}
+	}
+	vend := s.f.vdata_off + i64(s.f.vec_n) * s.f.vrec
+	want := int(clamp(vend - off, i64(need), i64(VEC_WINDOW)))
+	gb.vw_n = 0
+	got, e := prim.read_at(s.vfs, s.fd, gb.vw_buf[:want], off)
+	if e != .None {
+		return _perr(e)
+	}
+	if got < need {
+		return .Corrupt
+	}
+	gb.vw_seg = si
+	gb.vw_off = off
+	gb.vw_n = got
+	copy(bytes, gb.vw_buf[:need])
+	return .None
+}
+
 pq_m :: proc "contextless" (dim: int) -> int {
 	for m := 32; m >= 1; m -= 1 {
 		if dim % m == 0 {
@@ -185,6 +245,8 @@ vmerge_init :: proc(ix: ^Index, m: ^Merge) -> Error {
 	gb := new(Graph_Build, a)
 	m.gb = gb
 	gb.alloc = a
+	gb.vw_seg = -1
+	gb.vw_last = -1
 	gb.n = int(m.sw.f.vec_n)
 	gb.dim = int(ix.man.dim)
 	gb.tmp_fd = prim.INVALID_FD
@@ -327,7 +389,7 @@ _gb_partition :: proc(m: ^Merge) -> Error {
 	sn := min(gb.n, PART_SAMPLE)
 	sample := make([]f32, sn * gb.dim, a)
 	for i in 0 ..< sn {
-		_gb_read_vec(m, i * gb.n / sn, sample[i * gb.dim:][:gb.dim]) or_return
+		_gb_read_vec_seq(m, i * gb.n / sn, sample[i * gb.dim:][:gb.dim]) or_return
 	}
 	k := gb.k
 	d := gb.dim
@@ -633,7 +695,7 @@ vmerge_step :: proc(ix: ^Index, m: ^Merge) -> (done: bool, err: Error) {
 		}
 		c := min(2048, gb.n - gb.cursor)
 		for i in 0 ..< c {
-			_gb_read_vec(m, gb.cursor + i, gb.chunk[i * gb.dim:][:gb.dim]) or_return
+			_gb_read_vec_seq(m, gb.cursor + i, gb.chunk[i * gb.dim:][:gb.dim]) or_return
 		}
 		gb.chunk_lo = gb.cursor
 		_run_workers(gb, .Encode, c)
@@ -747,7 +809,7 @@ _gb_load_shard :: proc(m: ^Merge) -> Error {
 	v := gb.workers[0].vec
 	mean := make([]f32, d, context.temp_allocator)
 	for i in 0 ..< n {
-		_gb_read_vec(m, int(sh.ids[i]), v) or_return
+		_gb_read_vec_seq(m, int(sh.ids[i]), v) or_return
 		sh.sqs[i] = quantize(v, sh.sq[i * d:][:d])
 		for j in 0 ..< d {
 			mean[j] += v[j]
@@ -926,7 +988,7 @@ _gb_final :: proc(ix: ^Index, m: ^Merge) -> Error {
 			dg := _gb_neighbors(ix, gb, o, nb[:]) or_return
 			prim.put_u32le(rec, u32(dg))
 			v := slice.reinterpret([]f32, rec[4:][:gb.dim * 4])
-			_gb_read_vec(m, o, v) or_return
+			_gb_read_vec_seq(m, o, v) or_return
 			ids_at := 4 + gb.dim * 4
 			codes_at := ids_at + DEGREE * 4
 			for x in 0 ..< dg {
@@ -938,7 +1000,7 @@ _gb_final :: proc(ix: ^Index, m: ^Merge) -> Error {
 			}
 		} else {
 			v := slice.reinterpret([]f32, rec[:gb.dim * 4])
-			_gb_read_vec(m, o, v) or_return
+			_gb_read_vec_seq(m, o, v) or_return
 		}
 		sw_write(&m.sw, rec)
 	}
