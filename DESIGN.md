@@ -1575,6 +1575,14 @@ concurrent typing is never lost or reverted.
   a quarter of the base run's entries, so deleted keys do not pile up in the
   ranges later scans read. The simulator substitutes its own disk
   beneath `pack` exactly as beneath plain files.
+- A range of another device's conversation segment zeroed by the relay
+  purges the index for every message whose last block lies in the range.
+  The engine finds those messages in a seal map kept in the registry
+  (`ROOT_CKPT`: `0xf3 | object | device | last block | position` to the
+  message, and `0xf4 | object | device` to the replica ranges already
+  scanned). Before each lookup it scans only held ranges outside that
+  coverage, so the work tracks new records, not the length of the stream.
+  Leaving a space drops both.
 - Redaction in the device object store is a durable scrub intent
   (`objects/info/0ndb-scrub`: targets, protected blobs, superseded commits and
   trees). It is written and synced before the first irreversible step (the
