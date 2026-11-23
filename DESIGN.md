@@ -642,7 +642,9 @@ equal in both directions.
   it already wrote, and is redone from a rescan. A pass whose line version is ahead of `synced`
   adopts a changed file whose content is its text at the line version (what
   an interrupted materialization wrote before a crash): its entry names that
-  version and nothing is committed. Leftover temps are internal names and
+  version and nothing is committed. A file whose content is still its
+  entry's (a racy entry reread) is not adopted: its entry already describes
+  the disk. Leftover temps are internal names and
   never ingested.
 - **Large files** (over a size limit) are opaque content referenced by git
   oid, hashed and written by streaming, never read into memory.

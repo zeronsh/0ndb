@@ -1104,7 +1104,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		return false, .None
 	}
 	_, disk_oid, _, rok := read_content(m, c.path, c.stat, ino, true) or_return
-	if !rok {
+	if !rok || (c.kind == .Modify && c.old.oid == disk_oid) {
 		return false, .None
 	}
 	want: odb.Oid
