@@ -889,19 +889,20 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		} else {
 			shadow_remove(&m.shadow, it.old) or_return
 		}
-	} else if !it.has_old && it.kind != .Dir {
-		if d, _ := probe(m, it.path); d.kind != .Missing {
-			if adopted := mat_adopt(m, it, tl) or_return; adopted {
-				return .None
-			}
-			mount_mark(m, it.path)
-			return .None
-		}
 	} else if !it.has_old {
 		if occ, found := shadow_get(&m.shadow, it.path) or_return; found && occ.inode != it.inode {
 			mat_raced(m)
 			mount_reshow_add(m, it.path)
 			return .None
+		}
+		if it.kind != .Dir {
+			if d, _ := probe(m, it.path); d.kind != .Missing {
+				if adopted := mat_adopt(m, it, tl) or_return; adopted {
+					return .None
+				}
+				mount_mark(m, it.path)
+				return .None
+			}
 		}
 	}
 	e := it.entry
