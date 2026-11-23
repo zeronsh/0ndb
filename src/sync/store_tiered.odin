@@ -1073,9 +1073,9 @@ _tier_rewrite :: proc(sp: ^Tier_Space, id: Stream_Id, rng: [2]i64) -> int {
 			delete(fresh, t.allocator)
 			fresh = make([]u8, int(hi - lo), t.allocator)
 		}
-		_tier_rewrite_add(sp, prim.get_u64le(r[56:]), Tier_Patch{rd = rd, id = id, off = i64(prim.get_u32le(r[4:])) + (lo - at), data = fresh})
 		rd.left += 1
 		n += 1
+		_tier_rewrite_add(sp, prim.get_u64le(r[56:]), Tier_Patch{rd = rd, id = id, off = i64(prim.get_u32le(r[4:])) + (lo - at), data = fresh})
 	}
 	_tier_red_part(rd, .None)
 	return n
