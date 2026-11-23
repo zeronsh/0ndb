@@ -208,9 +208,15 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	m.mat = &ms
 	defer m.mat = nil
 	for &it in items {
-		materialize_one(m, &it, tl[:]) or_return
+		if err := materialize_one(m, &it, tl[:]); err != .None {
+			mat_owe(m, &ms)
+			return err
+		}
 	}
-	mat_pay_owed(m, &ms) or_return
+	if err := mat_pay_owed(m, &ms); err != .None {
+		mat_owe(m, &ms)
+		return err
+	}
 	if berr := mat_barrier(m, &ms); berr != .None {
 		mat_owe(m, &ms)
 		return berr
