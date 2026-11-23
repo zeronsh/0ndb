@@ -5,6 +5,7 @@ import "core:mem/virtual"
 import "core:sync"
 import "core:thread"
 import "../convo"
+import dl "../dlog"
 import "../fs"
 import "../http"
 import "../obj"
@@ -283,6 +284,7 @@ Stats :: struct {
 	buffer_live_received: u64,
 	buffer_live_intents: u64,
 	buffer_live_intents_applied: u64,
+	buffer_live_bad_gone: u64,
 }
 
 Engine :: struct {
@@ -373,6 +375,9 @@ Engine :: struct {
 	purged:       [dynamic]Rid,
 	redact_tick:  u64,
 	rlog:         Rlog,
+	dlog:         dl.Log,
+	dlog_open:    bool,
+	dlog_path:    string,
 	plug:         Plug_State,
 	pages:        Page_Heap,
 	temp:         virtual.Arena,
@@ -498,6 +503,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.self = e.identity.id
 	_registry_open(e) or_return
 	_registry_recover(e) or_return
+	_dlog_open(e)
 	_spaces_load(e) or_return
 	_account_load(e)
 	_redact_recover(e)

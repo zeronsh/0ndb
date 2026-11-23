@@ -164,6 +164,7 @@ _reg_fail :: proc(e: ^Engine, err: Error) {
 
 @(private)
 _registry_close :: proc(e: ^Engine) {
+	_dlog_close(e)
 	_rlog_close(e)
 	if !e.reg.open {
 		return
