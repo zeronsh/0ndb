@@ -471,6 +471,7 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 	for _ in 0 ..< 2 {
 		_oerr(omap.table_prepare(&h.table, sources[:])) or_return
 		missing := false
+		failed := Error.None
 		for s in h.segs {
 			if !s.in_view {
 				missing = true
@@ -499,8 +500,8 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 				if h.w_open && i == 0 && !omap.table_poisoned(&h.table) {
 					return _oerr(err)
 				}
-				if !_store_err(e, _oerr(err)) {
-					_log(e, .Warn, "map apply failed")
+				if failed == .None {
+					failed = _oerr(err)
 				}
 			}
 		}
@@ -511,6 +512,14 @@ _map_sync :: proc(e: ^Engine, h: ^Handle) -> Error {
 		}
 		if !omap.table_poisoned(&h.table) {
 			h.damaged = false
+			if failed != .None {
+				if !h.apply_failed {
+					h.apply_failed = true
+					_log(e, .Warn, "a map's apply of a remote segment failed; the table keeps what it applied and resumes on the next read or change")
+				}
+				return failed
+			}
+			h.apply_failed = false
 			return .Missing if missing else .None
 		}
 	}
