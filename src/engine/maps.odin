@@ -832,7 +832,9 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 			_handle_refresh(ch)
 			t, terr := convo.view_tail(&ch.view, e.self, context.temp_allocator)
 			if terr == .None {
-				append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Status), u64(t.status)))
+				if !found || cur.status != u64(t.status) {
+					append(&fields, omap.field_u64(u32(omap.Catalog_Tag.Status), u64(t.status)))
+				}
 				if prov, waiting, pok := _catalog_provider(e, Object{u.space, id}, ch, &t); pok {
 					if prov != cur.provider {
 						append(&fields, omap.field_str(u32(omap.Catalog_Tag.Provider), prov))

@@ -51,6 +51,9 @@ convo_writer :: proc(e: ^Engine, o: Object) -> (w: ^convo.Writer, err: Error) {
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_create_writer(h) or_return
 	_handle_mark(h)
+	if u := _catalog_q(e, h.sp.id, h.id, .Conversation); u != nil {
+		u.status = true
+	}
 	return &h.cw, .None
 }
 
