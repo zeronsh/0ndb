@@ -3307,6 +3307,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   idempotent, so a crash anywhere leaves the segment whole: an unsealed
   group is ignored (the next run redoes the range and the newer seal
   supersedes it), and an unsent trim is resent after the next upload.
+  A replicator frees a local only when it owes nothing: no upload, note,
+  verify, repair, drop, failed floor sync, archive turn or owed trim, so a
+  Trim refused Busy keeps its archive local open until the reply that ends
+  the Busy resends it. The sim's final checks require every archive whose
+  seal the relay holds to have trimmed its segment by quiesce; a scenario
+  holds a writer's segment commits at the relay while its archive trims,
+  so the Trim is refused Busy and the writer goes idle before the held
+  Appended arrives.
   Readers: a `Trimmed` reply marks the remote; wants below its base become
   archive wants: the reader tails the writer's archive stream (an ordinary
   remote, chain-verified with the writer's identity and no keys), reads

@@ -28,6 +28,7 @@ Relay_Stats :: struct {
 	refused_in:  u64,
 	trims:      u64,
 	trimmed:    u64,
+	trim_busy:  u64,
 }
 
 Relay_Space_Stats :: struct {
