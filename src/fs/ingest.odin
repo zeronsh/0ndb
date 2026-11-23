@@ -1046,6 +1046,96 @@ import_cache_tree :: proc(m: ^Mount, dirty: ^map[string]bool) -> Error {
 }
 
 @(private)
+adopt_changes :: proc(p: ^Pass) -> Error {
+	m := p.m
+	h := m.history
+	if h == nil || len(p.changes) == 0 {
+		return .None
+	}
+	line, found := history_line(h, m.line, context.temp_allocator) or_return
+	if !found {
+		return .None
+	}
+	ll := make([dynamic]crdt.Lv, context.temp_allocator)
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, line, &ll) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.frontier_eq(ll[:], sl[:]) {
+		return .None
+	}
+	snap := version_snapshot(h, ll[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	ver: u32
+	keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+	for c in p.changes {
+		adopted := false
+		if c.moved == "" && c.scope == nil && !path_internal(c.path) {
+			adopted = adopt_one(p, &snap, ll[:], line, c, &ver) or_return
+		}
+		if !adopted {
+			append(&keep, c)
+		}
+	}
+	if len(keep) != len(p.changes) {
+		clear(&p.changes)
+		append(&p.changes, ..keep[:])
+	}
+	return .None
+}
+
+@(private)
+adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version, c: Change, ver: ^u32) -> (adopted: bool, err: Error) {
+	m := p.m
+	h := m.history
+	ino, at_line, lerr := fstree.lookup(snap, c.path)
+	if lerr != nil {
+		return false, .Corrupt
+	}
+	if c.kind == .Remove {
+		if c.old.kind != .File || (at_line && ino == c.old.inode) {
+			return false, .None
+		}
+		shadow_remove(&m.shadow, c.path) or_return
+		return true, .None
+	}
+	if c.disk != .File || !at_line || (c.kind == .Modify && (c.old.kind != .File || c.old.inode != ino)) {
+		return false, .None
+	}
+	info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
+	if ierr != nil || !ok || !info.present || info.kind != .File || m.db == nil {
+		return false, .None
+	}
+	_, disk_oid, _, rok := read_content(m, c.path, c.stat, ino, true) or_return
+	if !rok {
+		return false, .None
+	}
+	want: odb.Oid
+	if .Opaque in info.flags {
+		reg, has := history_blob_at(h, ino, ll) or_return
+		if !has {
+			return false, .None
+		}
+		want = odb.Oid(reg.oid)
+	} else if oid, has := history_text_oid(h, ino, line) or_return; has {
+		want = oid
+	} else {
+		text := history_text_at(h, ino, line, context.temp_allocator) or_return
+		want, _ = odb.hash(m.db.format, .Blob, text)
+	}
+	if want != disk_oid {
+		return false, .None
+	}
+	if ver^ == 0 {
+		ids := make([dynamic]fstree.Op_Id, context.temp_allocator)
+		for id in line {
+			append(&ids, op_inode(h, id))
+		}
+		ver^ = shadow_version_add(&m.shadow, ids[:]) or_return
+	}
+	e := Entry{inode = ino, kind = .File, stat = c.stat, oid = disk_oid, ver = ver^}
+	shadow_put(&m.shadow, c.path, e) or_return
+	return true, .None
+}
+
+@(private)
 Change_Kind :: enum u8 {
 	Create,
 	Remove,
@@ -1659,6 +1749,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		}
 	}
 	detect_moves(p)
+	adopt_changes(p) or_return
 	if !final && p.full {
 		for c in p.changes {
 			if c.kind == .Remove && c.old.kind == .Dir && c.moved == "" && !c.carried && c.old.stat.ino != 0 {
@@ -2594,8 +2685,7 @@ store_blob :: proc(m: ^Mount, data: []u8) -> Error {
 @(private)
 emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	e := e
-	e.at = {}
-	e.has_at = false
+	e.ver = 0
 	m := p.m
 	h := m.history
 	path := c.path
