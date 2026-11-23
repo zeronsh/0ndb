@@ -3350,7 +3350,10 @@ Relay cost tracks the reachable information, not the activity. Items marked
   the redactor's chain on the stream) and materializes the one with the
   most holes; a Restore can hide records but cannot alter one. Readers that
   get the redaction notice zero their own archived copies that still hold
-  the record.
+  the record. The sim has a new device read such an object with the writer
+  offline and must resolve a Restore; every other device goes offline too,
+  except, under device storage, those holding a device-held segment of the
+  object (the redactor's own segment included), since no archive covers it.
   Any puncture of the writer's own key tree (a redaction or a draft key)
   re-archives every group touching the punctured cells, aligned to the
   cell size, so no group's key ever depends on a cell its writer has
@@ -3361,7 +3364,9 @@ Relay cost tracks the reachable information, not the activity. Items marked
   disk-full cleanup removes files. The engine never waits on a fetch it
   has not issued: a view read that finds a record missing reports the
   range it wanted and the handle asks the replicator for it; the text
-  history asks for the exact record it failed to read; a follower whose
+  history asks for the exact record it failed to read when the replica
+  lacks its bytes (a record held back only until a later signature
+  arrives is the catch-up's to wait for, not a fetch); a follower whose
   segment turns out to be trimmed asks for the prefix it lacks, which the
   replicator serves from the archive; a waiter whose view reported nothing
   asks for the newest gap of the segment it waits on, from the gap's start
@@ -3562,9 +3567,10 @@ Client to relay:
 
 - `Trim` (0x16, 40, feature bit 1): `segment, base:u64`. Owner only. Raises
   `base` once an archive covers `[0, base)`, frees the stored prefix and
-  marks the base as a trim; `base` must stay below the length, a lower or
-  equal base changes nothing, and `Fill` below a trim stores nothing. Reply
-  `Noted` once durable; no feed entry.
+  marks the base as a trim; `base` must stay below the length, a lower base
+  or a repeated trim changes nothing, a base equal to a device-held base
+  only marks it as a trim (followers get `Trimmed`), and `Fill` below a trim
+  stores nothing. Reply `Noted` once durable; no feed entry.
 
 Relay to client:
 
