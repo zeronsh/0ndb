@@ -260,6 +260,7 @@ _frame :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8, down: bool) {
 	case down && kind == KIND_DATA && len(payload) >= DATA_FIXED && !w.cfg.byzantine:
 		copy(sid[:], payload[:32])
 		at, body, src = i64(prim.get_u64le(payload[32:40])), payload[DATA_FIXED:], .Data
+		fetch_note(w, c, sid, at, i64(len(body)))
 	case:
 		return
 	}
