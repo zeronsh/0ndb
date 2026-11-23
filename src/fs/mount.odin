@@ -1975,14 +1975,14 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 		if err != .None || deferred {
 			sm := s.mount
 			for k in prim.sorted_keys(sm.dirty) {
-				if k not_in sm.dirty {
+				if k not_in sm.dirty || sm.dirty[k] != s {
 					continue
 				}
-				v := sm.dirty[k]
-				if v == s {
-					attrib_set(sm, k, s.actor, false, {}, s.id)
-					attrib_log_append(sm, k, s.actor, {}, s.id)
+				if a, has := sm.attrib[k]; has && a.actor == s.actor && a.oid != {} {
+					continue
 				}
+				attrib_set(sm, k, s.actor, false, {}, s.id)
+				attrib_log_append(sm, k, s.actor, {}, s.id)
 			}
 			scope_retire_unwritten(sm, s)
 			if sm.log_fd >= 0 && sm.log_len > 0 {
