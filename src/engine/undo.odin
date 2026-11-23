@@ -654,19 +654,29 @@ _cu_put_line :: proc(lines: ^[dynamic]convo.Undo_Line, tree: prim.Id, line: stri
 
 @(private)
 _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (set: []convo.Undo_Line, err: Error) {
+	fmt.eprintfln("DBGMOVE undo_set msg %v convs %d", msg, len(convs))
 	t := convo_message(e, o, {msg = msg}, context.temp_allocator) or_return
+	fmt.eprintfln("DBGMOVE undo_set t ok")
 	lines := make([dynamic]convo.Undo_Line, context.temp_allocator)
 	for c in convs {
 		if c.hidden {
 			continue
 		}
-		at := _cu_first_reply_after(e, c.o, t.hlc) or_return
+		at, aerr := _cu_first_reply_after(e, c.o, t.hlc)
+		fmt.eprintfln("DBGMOVE first reply %v %v", at, aerr)
+		if aerr != .None {
+			return nil, aerr
+		}
 		if obj.rid_none(at) {
 			continue
 		}
 		named := make(map[string]bool, context.temp_allocator)
 		{
-			fd := convo_files_at(e, c.o, at, context.temp_allocator) or_return
+			fd, ferr := convo_files_at(e, c.o, at, context.temp_allocator)
+			fmt.eprintfln("DBGMOVE files_at %v %d", ferr, len(fd))
+			if ferr != .None {
+				return nil, ferr
+			}
 			for d in fd {
 				rd := prim.reader(d.version)
 				vb := prim.read_bytes(&rd)
@@ -677,7 +687,11 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 				named[d.mount] = true
 			}
 		}
-		ms := convo_mounts(e, c.o, context.temp_allocator) or_return
+		ms, merr := convo_mounts(e, c.o, context.temp_allocator)
+		fmt.eprintfln("DBGMOVE mounts %v %d", merr, len(ms))
+		if merr != .None {
+			return nil, merr
+		}
 		for m in ms {
 			if !m.removed && !named[m.name] {
 				_cu_put_line(&lines, m.tree, convo_line_key(m.line), nil)
