@@ -1699,6 +1699,18 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	if len(m.dirty) > len(p.holding) {
 		mount_schedule(m, m.opts.settle_ms)
 	}
+	if len(m.closed) > 0 {
+		done := make([dynamic]string, context.temp_allocator)
+		for k in prim.unordered(m.closed) {
+			if k not_in m.dirty {
+				append(&done, k)
+			}
+		}
+		for k in done {
+			key, _ := delete_key(&m.closed, k)
+			delete(key, m.allocator)
+		}
+	}
 	m.passes += 1
 	serr := mount_settle(m)
 	if p.switched && m.reg != nil && m.reg.on_line != nil {
@@ -2279,7 +2291,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 				defer_ino(p, e)
 				return .None
 			}
-			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now {
+			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now && rel not_in m.closed {
 				append(&p.young, clone_string(rel, p.long) or_else "")
 				defer_ino(p, e)
 				return .None
