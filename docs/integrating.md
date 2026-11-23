@@ -158,8 +158,10 @@ The idle and streaming figures come from `bindings/rust/ondb/examples/bench.rs`
   runners: a placement request naming the runner), `auto` or `never`.
 - Folders and repositories: `mount.add(object, root)` keeps a folder synced as
   a tree; `mount` attaches a tree to a conversation so its runs edit it;
-  `tree.find(path)` maps a path to its tree; `tree.write(path, text)` creates
-  the file and any missing parent directories; `convo.files_at`, `go_back` and
+  `tree.find(path)` maps a path to its tree; `tree.write(path, text, base)`
+  writes from the `base` a `tree.read` or `tree.list` returned (merging with
+  everything since, so it never removes edits its reader did not see) and
+  creates a file and any missing parent directories; `convo.files_at`, `go_back` and
   `revert` rewind files with the conversation. A git checkout is an ordinary
   folder; worktrees are separate folders mounted separately (0ndb never moves
   or deletes a branch).

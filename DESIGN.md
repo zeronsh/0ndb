@@ -3370,6 +3370,15 @@ edit on a device whose folder is on a feature branch lands on that branch.
 When the line is at the history's heads (the only case with one line), the
 loaded state is used directly, exactly as before.
 
+A whole-file write never removes what its reader did not see. `tree_read`
+and `tree_list` return the version they read (`base`), and `tree_write`
+takes one and has no baseless form: the write is the line-granular diff from
+the file's text at `base` to the new text, committed as a batch parented on
+`base`, so the CRDT merges it with everything committed since, including
+disk edits a mount ingested after the read. The line then advances to the
+union of its version and the new batch. A path absent at `base` is created.
+A `base` the history does not hold is refused.
+
 ## capi
 
 ABI 2.0: ops are numbered contiguously from 1 in table order (the header op

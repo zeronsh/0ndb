@@ -73,7 +73,8 @@ op_agent_removed :: proc(w: ^World, n: ^Node) {
 		kop.path = strings.clone(name, w.allocator)
 		tok = new_token(m, n, "k")
 		append(&kop.tokens, tok)
-		werr = eng.tree_write(&n.e, o, name, transmute([]u8)strings.concatenate({tok, "\n"}, context.temp_allocator))
+		rbase, _ := eng.tree_version(&n.e, o, "", context.temp_allocator)
+		werr = eng.tree_write(&n.e, o, name, transmute([]u8)strings.concatenate({tok, "\n"}, context.temp_allocator), rbase)
 		op_result(kop, n, werr)
 		stat_add(w, STAT_REMOVED_REPLACED)
 	}

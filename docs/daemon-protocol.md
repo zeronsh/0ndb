@@ -779,9 +779,9 @@ up exist only over the socket.
 | 86 | `text.edit` | object: object, pos: uvarint, remove: uvarint, insert: str | Result |
 | 87 | `text.redact` | object: object, pos: uvarint, len: uvarint | {} |
 | 88 | `tree.create` | space: id, title: str | object:object |
-| 89 | `tree.read` | object: object, path: str, line: str, version: bytes | text:str line:str |
-| 90 | `tree.list` | object: object, path: str, line: str, version: bytes | names:[str] line:str entries:[TreeEntry] |
-| 91 | `tree.write` | object: object, path: str, text: str, line: str | line:str |
+| 89 | `tree.read` | object: object, path: str, line: str, version: bytes | text:str line:str base:bytes |
+| 90 | `tree.list` | object: object, path: str, line: str, version: bytes | names:[str] line:str entries:[TreeEntry] base:bytes |
+| 91 | `tree.write` | object: object, path: str, text: str, line: str, base: bytes | line:str |
 | 92 | `tree.remove` | object: object, path: str, line: str | line:str |
 | 93 | `tree.mount` | object: object, root: str | {} |
 | 94 | `tree.unmount` | object: object, root: str | {} |
@@ -794,6 +794,13 @@ up exist only over the socket.
 (the `version` of a `File` from `convo.files_at`) the tree at that version;
 a version this device's history does not hold answers `missing`, and bytes
 that are not a version answer `invalid`.
+`tree.read` and `tree.list` also return `base`, the version they read.
+`tree.write` requires a `base` from one of them: the write is the diff from
+the file's text at that version to `text`, merged with everything since, so
+it never removes what its reader did not see. A path absent at `base` is
+created, with any missing parent directories. `tree.write` without a `base`,
+or with bytes that are not a version, answers `invalid`; a version this
+device's history does not hold answers `invalid` too.
 `tree.list` names each child's kind (`file`, `dir`, `symlink`), size in
 bytes (a symlink's target length, 0 for a directory) and mode. Listing a
 file or reading a directory answers `invalid`.

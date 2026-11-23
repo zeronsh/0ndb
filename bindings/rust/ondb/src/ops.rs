@@ -433,12 +433,13 @@ impl Client {
         self.call(&json!({"op": "tree.list", "object": object, "path": path, "version": version}))
     }
 
-    pub fn tree_write(&self, object: &str, path: &str, text: &str, line: Option<&str>) -> Pending<TreeWritten> {
+    pub fn tree_write(&self, object: &str, path: &str, text: &str, base: &str, line: Option<&str>) -> Pending<TreeWritten> {
         let mut m = Map::new();
         m.insert("op".into(), "tree.write".into());
         m.insert("object".into(), object.into());
         m.insert("path".into(), path.into());
         m.insert("text".into(), text.into());
+        m.insert("base".into(), base.into());
         put(&mut m, "line", line);
         self.call(&Value::Object(m))
     }

@@ -2,6 +2,7 @@ package api
 
 import "../../convo"
 import eng "../../engine"
+import "../../fs"
 import omap "../../map"
 import "../../obj"
 import "../../prim"
@@ -559,19 +560,24 @@ op_tree_create :: proc(c: ^Call, o: ^Out) -> Status {
 op_tree_read :: proc(c: ^Call, o: ^Out) -> Status {
 	ob := a_object(c, "object")
 	line := a_str(c, "line")
-	data, err := eng.tree_read(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line, a_bytes(c, "version"))
+	base: fs.Version
+	data, err := eng.tree_read(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line, a_bytes(c, "version"), &base)
 	if err != .None {
 		return pend(c, err)
 	}
+	vb := make([dynamic]u8, context.temp_allocator)
+	fs.encode_version(&vb, base)
 	o_text(o, "text", data)
 	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
+	o_bytes(o, "base", vb[:])
 	return .Ok
 }
 
 op_tree_list :: proc(c: ^Call, o: ^Out) -> Status {
 	ob := a_object(c, "object")
 	line := a_str(c, "line")
-	entries, err := eng.tree_entries(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line, a_bytes(c, "version"))
+	base: fs.Version
+	entries, err := eng.tree_entries(c.api.e, ob, a_str(c, "path"), context.temp_allocator, ready(c), line, a_bytes(c, "version"), &base)
 	if err != .None {
 		return pend(c, err)
 	}
@@ -591,13 +597,24 @@ op_tree_list :: proc(c: ^Call, o: ^Out) -> Status {
 		o_end(o)
 	}
 	o_end(o)
+	vb := make([dynamic]u8, context.temp_allocator)
+	fs.encode_version(&vb, base)
+	o_bytes(o, "base", vb[:])
 	return .Ok
 }
 
 op_tree_write :: proc(c: ^Call, o: ^Out) -> Status {
 	ob := a_object(c, "object")
 	line := a_str(c, "line")
-	if err := eng.tree_write(c.api.e, ob, a_str(c, "path"), a_bytes(c, "text"), line); err != .None {
+	raw := a_bytes(c, "base")
+	if len(raw) == 0 {
+		return .Invalid
+	}
+	base, derr := fs.decode_version(raw, context.temp_allocator)
+	if derr != .None {
+		return .Invalid
+	}
+	if err := eng.tree_write(c.api.e, ob, a_str(c, "path"), a_bytes(c, "text"), base, line); err != .None {
 		return status_of(err)
 	}
 	o_str(o, "line", eng.tree_line(c.api.e, ob, line))

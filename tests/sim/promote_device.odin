@@ -68,7 +68,7 @@ _promote_device :: proc(w: ^World) {
 			world_fail(w, "promote device: tree_create: %v", err)
 			return
 		}
-		if werr := eng.tree_write(&a.e, text, "a.txt", transmute([]u8)string("written before the checkpoint\n")); werr != .None {
+		if werr := eng.tree_write(&a.e, text, "a.txt", transmute([]u8)string("written before the checkpoint\n"), tree_base(&a.e, text)); werr != .None {
 			world_fail(w, "promote device: tree_write: %v", werr)
 			return
 		}
@@ -82,7 +82,7 @@ _promote_device :: proc(w: ^World) {
 	run_until(w, w.now + 2_000_000_000, true)
 	for i in 0 ..< 3 {
 		context = instance_context(&a.inst)
-		if eerr := eng.tree_write(&a.e, text, fmt.tprintf("after-%d.txt", i), transmute([]u8)fmt.tprintf("written after the promotion %d\n", i)); eerr != .None {
+		if eerr := eng.tree_write(&a.e, text, fmt.tprintf("after-%d.txt", i), transmute([]u8)fmt.tprintf("written after the promotion %d\n", i), tree_base(&a.e, text)); eerr != .None {
 			world_fail(w, "promote device: tree_write after: %v", eerr)
 		}
 		node_after(a)

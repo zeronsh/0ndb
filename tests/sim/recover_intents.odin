@@ -128,7 +128,7 @@ _ri_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 		actor = prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng))
 		scope = fs.scope_open(a.reg, m, sid, actor)
 		fs.scope_read_base(scope, "a.txt", base)
-		if err := eng.tree_write(&a.e, tree, "a.txt", transmute([]u8)string("zero\none\ntwo\n")); err != .None {
+		if err := eng.tree_write(&a.e, tree, "a.txt", transmute([]u8)string("zero\none\ntwo\n"), tree_base(&a.e, tree)); err != .None {
 			world_fail(w, "recover: tree_write: %v", err)
 			return
 		}

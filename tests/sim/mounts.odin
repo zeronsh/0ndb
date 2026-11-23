@@ -123,6 +123,11 @@ watch_event :: proc(w: ^World, n: ^Node) {
 	node_after(n)
 }
 
+tree_base :: proc(e: ^eng.Engine, o: eng.Object) -> fs.Version {
+	v, _ := eng.tree_version(e, o, "", context.temp_allocator)
+	return v
+}
+
 node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string) -> eng.Error {
 	context = instance_context(&n.inst)
 	defer node_after(n)
@@ -377,7 +382,8 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	o := m.objs[sm.oi].o
-	cur, rerr := eng.tree_read(&n.e, o, name, context.temp_allocator)
+	cbase: fs.Version
+	cur, rerr := eng.tree_read(&n.e, o, name, context.temp_allocator, {}, "", nil, &cbase)
 	if rerr != .None {
 		return false
 	}
@@ -429,7 +435,7 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 		append(&kop.tokens, tok)
 		strings.write_string(&b, tok)
 		strings.write_byte(&b, '\n')
-		kerr = eng.tree_write(&n.e, o, name, transmute([]u8)strings.to_string(b))
+		kerr = eng.tree_write(&n.e, o, name, transmute([]u8)strings.to_string(b), cbase)
 		op_result(kop, n, kerr)
 	}
 	if n.agent_pending == nil {
