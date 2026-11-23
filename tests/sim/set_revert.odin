@@ -125,7 +125,7 @@ _sr_write :: proc(c: ^Sr_Ctx, who: Sr_Who, name: string, lines: []string, remove
 	scope: ^fs.Scope
 	if who != .P {
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&c.w.rng))
-		scope = fs.scope_open(n.reg, c.sm.m, sid, c.actor[who])
+		scope = sim_scope_open(c.w, n.reg, c.sm.m, sid, c.actor[who])
 		if abs in n.writers {
 			n.writers[abs] = Writer_Info{scope = scope, agent = true}
 		} else {

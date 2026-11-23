@@ -128,7 +128,7 @@ _revert_hold :: proc(w: ^World) {
 			return
 		}
 		before = _line_heads(sm.m, w.allocator)
-		agent := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
+		agent := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
 		if oerr := fs.mount_observe_begin(sm.m, "a.txt", agent); oerr != .None {
 			world_fail(w, "revert hold: observe: %v", oerr)
 			return
@@ -139,7 +139,7 @@ _revert_hold :: proc(w: ^World) {
 			return
 		}
 		after = _line_heads(sm.m, w.allocator)
-		hold = fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
+		hold = sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
 		fs.scope_write_begin(hold, "a.txt")
 		if !fs.scope_pinned(hold, "a.txt") {
 			world_fail(w, "revert hold: the hold pinned nothing")

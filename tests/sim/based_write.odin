@@ -121,7 +121,7 @@ _bw_run :: proc(w: ^World) {
 			world_fail(w, "based write: the person's rewrite of a.txt is not dirty in the mount before the hold")
 			return
 		}
-		scope := fs.scope_open(a.reg, m, prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng)))
+		scope := sim_scope_open(w, a.reg, m, prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng)))
 		fs.scope_write_begin(scope, "a.txt")
 		if !fs.scope_pinned(scope, "a.txt") {
 			world_fail(w, "based write: the hold pinned nothing")
