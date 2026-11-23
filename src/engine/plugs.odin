@@ -282,7 +282,7 @@ _mount_id :: proc(tree: prim.Id, root: string) -> (id: prim.Id) {
 _on_mount_ready :: proc(m: ^fs.Mount, data: rawptr) {
 	e := (^Engine)(data)
 	context = context_for(e)
-	if err := fs.mount_run(m); err != .None {
+	if err := fs.mount_run(m, true); err != .None {
 		_log(e, .Warn, "mount pass failed")
 	}
 	for mt in e.plug.mounts {
@@ -358,7 +358,7 @@ _mounts_settle :: proc(e: ^Engine) {
 		if len(mt.mount.dirty) == 0 && !mt.mount.rescan || fs.mount_lock_held(&mt.mount) {
 			continue
 		}
-		if err := fs.mount_run(&mt.mount); err != .None {
+		if err := fs.mount_run(&mt.mount, true); err != .None {
 			_log(e, .Warn, "mount pass failed")
 		}
 		_mount_touched(e, mt)
