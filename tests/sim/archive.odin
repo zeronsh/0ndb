@@ -344,6 +344,7 @@ _compare_trusted :: proc(w: ^World, n: ^Node, rm: ^osync.Remote, im: ^Cipher_Ima
 STAT_TRIMS: Stat
 STAT_TAIL: Stat
 STAT_RESTORE_HOLDERS: Stat
+STAT_RESTORE_UNREAD: Stat
 STAT_OVER_TAIL: Stat
 STAT_TRIMMED: Stat
 STAT_RESTORES_WRITTEN: Stat
@@ -406,6 +407,7 @@ _archive_hooks :: proc "contextless" () {
 	STAT_FETCH_RATIO = register_stat(77, 10, "max_fetch_ratio_pct", true)
 	STAT_TAIL = register_stat(77, 11, "tail_window", true)
 	STAT_RESTORE_HOLDERS = register_stat(77, 13, "restore_holders_online")
+	STAT_RESTORE_UNREAD = register_stat(77, 14, "restore_prefix_unread")
 	STAT_OVER_TAIL = register_stat(77, 12, "records_over_tail")
 }
 
@@ -548,6 +550,19 @@ check_restore_offline_writer :: proc(w: ^World) {
 	}
 	stat_add(w, STAT_RESTORES_WRITTEN, written)
 	run_until(w, w.now + 60_000_000_000, true)
+	for _ in 0 ..< 6 {
+		if !_zero_pending(p.rn) {
+			break
+		}
+		run_until(w, w.now + 60_000_000_000, true)
+		if len(w.failures) > 0 || w.aborted {
+			return
+		}
+	}
+	if _zero_pending(p.rn) {
+		world_fail(w, "restore: %s wrote a Restore but never zero-filled its source", p.rn.name)
+		return
+	}
 	ref := digest_object(w, p.rn, p.oi)
 	if !ref.complete {
 		world_fail(w, "restore: %s cannot read %v %s after its redaction (%s)", p.rn.name, ob.kind, id_short(ob.o.id), ref.why)
@@ -605,8 +620,10 @@ check_restore_offline_writer :: proc(w: ^World) {
 	}
 	delete(got.text, w.allocator)
 	_, read := _restore_counts(tn)
-	if read == 0 {
+	if read == 0 && _held_below(tn, ob, p.dev, p.base) {
 		world_fail(w, "restore: new device %s read %s's trimmed prefix with every other device offline without resolving a Restore", tn.name, p.wn.name)
+	} else if read == 0 {
+		stat_add(w, STAT_RESTORE_UNREAD)
 	}
 	stat_add(w, STAT_RESTORES_READ, read)
 	if w.relay.tiered && w.relay.ts.cold_reads > cold0 {
@@ -700,6 +717,38 @@ _strip_catalog :: proc(text: string) -> string {
 		}
 	}
 	return ""
+}
+
+@(private = "file")
+_held_below :: proc(n: ^Node, ob: ^M_Obj, dev: prim.Id, base: i64) -> bool {
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	h := _archive_handle(n, ob)
+	if h == nil {
+		return false
+	}
+	for s in h.segs {
+		if s.device == dev && s.rep != nil {
+			have := journal.replica_have(s.rep)
+			return len(have) > 0 && have[0].from < base
+		}
+	}
+	return false
+}
+
+@(private = "file")
+_zero_pending :: proc(n: ^Node) -> bool {
+	if !n.alive || !n.e_open {
+		return false
+	}
+	for _, sp in n.e.spaces {
+		for _, rm in sp.repl.remotes {
+			if rm.arc != nil && len(rm.arc.pend) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 @(private = "file")
