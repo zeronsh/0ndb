@@ -1068,13 +1068,42 @@ adopt_changes :: proc(p: ^Pass) -> Error {
 	snap := version_snapshot(h, ll[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
 	ver: u32
-	keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
-	for c in p.changes {
-		adopted := false
-		if c.moved == "" && c.scope == nil && !path_internal(c.path) {
-			adopted = adopt_one(p, &snap, ll[:], line, c, &ver) or_return
+	Adopt_Dir :: struct {
+		depth: int,
+		i:     int,
+	}
+	adopted := make([]bool, len(p.changes), context.temp_allocator)
+	dirs := make([dynamic]Adopt_Dir, context.temp_allocator)
+	for c, i in p.changes {
+		if c.moved != "" || c.scope != nil || path_internal(c.path) {
+			continue
 		}
-		if !adopted {
+		if c.kind == .Create && c.disk == .Dir {
+			append(&dirs, Adopt_Dir{strings.count(c.path, "/"), i})
+			continue
+		}
+		adopted[i] = adopt_one(p, &snap, ll[:], line, c, &ver) or_return
+	}
+	slice.sort_by(dirs[:], proc(a, b: Adopt_Dir) -> bool {
+		return a.depth > b.depth || (a.depth == b.depth && a.i < b.i)
+	})
+	for d in dirs {
+		i := d.i
+		c := p.changes[i]
+		owned := false
+		for k, j in p.changes {
+			if !adopted[j] && j != i && k.kind == .Create && path_at_or_under(k.path, c.path) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			adopted[i] = adopt_one(p, &snap, ll[:], line, c, &ver) or_return
+		}
+	}
+	keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+	for c, i in p.changes {
+		if !adopted[i] {
 			append(&keep, c)
 		}
 	}

@@ -738,7 +738,10 @@ equal in both directions.
   an interrupted materialization wrote before a crash): its entry names that
   version and nothing is committed. A created directory that is a present
   directory at the line version is adopted the same way, so a directory the
-  pass made before a crash is never ingested as a new one beside the line's. A file whose content is still its
+  pass made before a crash is never ingested as a new one beside the line's,
+  but only when everything the pass creates under it is adopted too: a user
+  file under it would otherwise commit as a child of an inode `synced` does
+  not contain. A file whose content is still its
   entry's (a racy entry reread) is not adopted: its entry already describes
   the disk. Leftover temps are internal names and
   never ingested.
