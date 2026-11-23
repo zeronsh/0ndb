@@ -609,6 +609,8 @@ _mem_run :: proc(m: ^Mem_Store, j: Mem_Job) {
 			st.base = j.to
 			st.trimmed = true
 			st.space.usage = max(st.space.usage - value, 0)
+		} else if j.to == st.base && j.to > 0 {
+			st.trimmed = true
 		}
 		_mem_log(m, {kind = .Trim, space = st.space.id, id = cast([32]u8)st.id, at = j.to, length = value, result = result})
 	case .Drop:
