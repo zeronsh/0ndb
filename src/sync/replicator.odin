@@ -93,6 +93,7 @@ Replicator_Config :: struct {
 	archive_group: int,
 	archive_level: int,
 	archive_keys: proc(user: rawptr, name: string, id: Stream_Id, use: proc(data: rawptr, keys: journal.Key_Provider, shift: u8), data: rawptr) -> bool,
+	tail_window:  i64,
 	archive_collect: proc(user: rawptr, name: string, offs: []i64, bodies: [][]u8, gone: []bool),
 }
 
@@ -258,6 +259,8 @@ Remote :: struct {
 	arc_of:    ^Remote,
 	arc_broken: [dynamic]journal.Range,
 	need_from: i64,
+	need_at:   i64,
+	need_to:   i64,
 	need_set:  bool,
 }
 
@@ -380,6 +383,11 @@ STAGE_MAX :: 1 << 20
 @(private)
 MIN_FETCH :: 64 * 1024
 TAIL_DEFAULT :: 64 * 1024
+
+@(private)
+_tail_window :: proc "contextless" (r: ^Replicator) -> i64 {
+	return r.cfg.tail_window if r.cfg.tail_window > 0 else TAIL_DEFAULT
+}
 @(private)
 BACKOFF_MIN :: 250
 @(private)
@@ -856,7 +864,7 @@ replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 	id := got.id
 	ans, answered := r.answers[id]
 	if !answered || r.phase != .Ready {
-		_remote_want_tail(r, got, TAIL_DEFAULT)
+		_remote_want_tail(r, got, _tail_window(r))
 		return .Probed
 	}
 	if rm, ok := r.remotes[id]; ok && ans > rm.relay_len {
@@ -868,7 +876,7 @@ replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 		return .Current
 	}
 	_tamper_release(r, rm, true)
-	lo := max(rm.relay_len - TAIL_DEFAULT, 0)
+	lo := max(rm.relay_len - _tail_window(r), 0)
 	if _, missing := journal.replica_missing(&rm.rep, lo, rm.relay_len); !missing {
 		_repl_flush(r)
 		return .Current
@@ -879,7 +887,7 @@ replicator_fresh_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, 
 			return .Waiting
 		}
 	}
-	rm.tail = max(rm.tail, TAIL_DEFAULT)
+	rm.tail = max(rm.tail, _tail_window(r))
 	rm.backward = true
 	rm.want_gen += 1
 	rm.fresh_gen = rm.want_gen
@@ -1948,7 +1956,7 @@ _remote_pull :: proc(r: ^Replicator, rm: ^Remote) {
 	if rm.pulled == 0 {
 		if rm.relay_len < 0 {
 			if rm.tail == 0 {
-				rm.tail = TAIL_DEFAULT
+				rm.tail = _tail_window(r)
 			}
 			if !_covered_inflight(rm, {-1, -1}) || len(rm.inflight) == 0 {
 				client_tail(&r.client, rm.id, rm.tail)
@@ -1996,13 +2004,17 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 		_claim(rm, fetch.from)
 	}
 	rm.need_set = false
-	if fetch.to - fetch.from < MIN_FETCH {
+	if fetch.from <= rm.need_at && rm.need_at < fetch.to && rm.need_to > fetch.to && rm.need_to <= next_start && rm.need_to - fetch.from <= STAGE_MAX {
+		fetch.to = rm.need_to
+	}
+	rm.need_to = 0
+	if fetch.to - fetch.from < _tail_window(r) {
 		if rm.backward {
-			fetch.from = max(fetch.to - MIN_FETCH, prev_end)
-			fetch.to = max(fetch.to, min(fetch.from + MIN_FETCH, next_start))
+			fetch.from = max(fetch.to - _tail_window(r), prev_end)
+			fetch.to = max(fetch.to, min(fetch.from + _tail_window(r), next_start))
 		} else {
-			fetch.to = max(fetch.to, min(fetch.from + MIN_FETCH, next_start))
-			fetch.from = min(fetch.from, max(fetch.to - MIN_FETCH, prev_end))
+			fetch.to = max(fetch.to, min(fetch.from + _tail_window(r), next_start))
+			fetch.from = min(fetch.from, max(fetch.to - _tail_window(r), prev_end))
 		}
 	}
 	if !_is_boundary(rm, fetch.from) && !_is_boundary(rm, fetch.to) {
