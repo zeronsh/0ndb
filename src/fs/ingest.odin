@@ -1512,7 +1512,13 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 }
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
+	if m.open_due && !m.opening {
+		mount_open_finish(m) or_return
+	}
 	if !m.imported && !m.importing {
+		if m.history != nil {
+			history_ready(m.history) or_return
+		}
 		m.importing = true
 		ierr := mount_recover(m)
 		if ierr == .None {
@@ -1541,6 +1547,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	mount_wake(m) or_return
 	if m.history != nil {
 		defer history_trim(m.history)
+	}
+	if m.has_git && m.history != nil {
+		mount_line_actor(m) or_return
 	}
 	catch_up(m) or_return
 	if m.has_git {
