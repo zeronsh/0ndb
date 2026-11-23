@@ -313,11 +313,18 @@ _index_step :: proc(e: ^Engine) {
 		}
 		h, err := _handle_get(e, Object{it.space, it.object}, it.kind)
 		if err != .None {
+			if err == .Busy {
+				append(&e.index_dirty, it)
+			}
 			continue
 		}
 		e.index_busy = false
 		used, more := _scan_object(e, h, budget)
 		budget -= used
+		if (h.kind == .Text || h.kind == .File_Tree) && h.hist != nil && !h.hist.awake {
+			append(&e.index_dirty, it)
+			continue
+		}
 		if e.index_busy {
 			append(&e.index_dirty, ..items[i:])
 			_touch(e)
