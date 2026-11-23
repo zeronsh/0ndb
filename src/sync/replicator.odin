@@ -183,8 +183,7 @@ Local :: struct {
 	trim_base: i64,
 	trim_at:   i64,
 	trim_sent: i64,
-	trim_timer: prim.Timer,
-	trim_tries: int,
+	trim_wait: bool,
 	rst_on:    bool,
 	rst_of:    Stream_Id,
 }
@@ -986,7 +985,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
-	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l || l.arc_timer != 0 || l.trim_timer != 0 {
+	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l || l.arc_timer != 0 {
 		return
 	}
 	if r.hold > 0 {
@@ -2578,6 +2577,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		if l, ok := r.locals[Stream_Id(ev.id)]; ok {
 			_local_ack(r, l, ev)
 		}
+		_arc_trim_resume(r, Stream_Id(ev.id))
 	case .Data:
 		_on_data(r, ev)
 	case .Object:
@@ -2595,6 +2595,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Noted:
 		if !_arc_trim_reply(r, Stream_Id(ev.id), false) {
 			_on_noted(r, ev)
+			_arc_trim_resume(r, Stream_Id(ev.id))
 		}
 	case .Hollow:
 		_on_hollow(r, ev)
@@ -2651,6 +2652,7 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 		_on_refused(r, ev)
 	case .Redacted:
 		_emit(r, Repl_Event{kind = .Redacted, stream = Stream_Id(ev.id), from = ev.at, to = ev.length})
+		_arc_trim_resume(r, Stream_Id(ev.id))
 	case .Announce:
 		_on_announce(r, ev)
 		_caught_check(r)
@@ -2701,6 +2703,7 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 	if _arc_trim_reply(r, id, true) {
 		return
 	}
+	defer _arc_trim_resume(r, id)
 	if l, ok := r.locals[id]; ok {
 		l.noting = false
 		if l.inflight > 0 {
