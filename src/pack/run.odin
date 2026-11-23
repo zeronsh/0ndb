@@ -778,6 +778,7 @@ Run_Iter :: struct {
 	rbuf:   []u8,
 	rbase:  u32,
 	rcount: u32,
+	ra:     u32,
 	next:   u32,
 	cur:    Block_Cursor,
 	in_blk: bool,
@@ -804,7 +805,7 @@ _run_iter_init :: proc(it: ^Run_Iter, p: ^Pack, r: ^Run, from: []u8) -> Error {
 		return .None
 	}
 	tmp: [BLOCK]u8
-	blk, _, ok, err := _run_seek_leaf(p, r, from, tmp[:])
+	blk, leaf, ok, err := _run_seek_leaf(p, r, from, tmp[:])
 	if err != .None {
 		return err
 	}
@@ -813,6 +814,11 @@ _run_iter_init :: proc(it: ^Run_Iter, p: ^Pack, r: ^Run, from: []u8) -> Error {
 		return .None
 	}
 	it.next = blk
+	if blk + 1 < r.nblocks {
+		copy(it.rbuf[:BLOCK], leaf)
+		it.rbase = blk
+		it.rcount = 1
+	}
 	for {
 		k, _, _, more := _run_iter_peek(it)
 		if !more || _key_cmp(k, from) >= 0 {
@@ -839,7 +845,8 @@ _run_iter_block :: proc(it: ^Run_Iter) -> bool {
 			return false
 		}
 		if it.next < it.rbase || it.next >= it.rbase + it.rcount {
-			want := min(u32(RUN_READAHEAD), it.r.nblocks - 1 - it.next)
+			it.ra = min(max(it.ra * 2, 1), u32(RUN_READAHEAD))
+			want := min(it.ra, it.r.nblocks - 1 - it.next)
 			n, err := prim.read_at(it.p.base, it.r.fd, it.rbuf[:int(want) * BLOCK], i64(it.next) * BLOCK)
 			if err != .None || n != int(want) * BLOCK {
 				it.err = _perr(err) if err != .None else .Io

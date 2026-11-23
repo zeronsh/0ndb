@@ -177,6 +177,9 @@ Merge :: struct {
 BASE_LEVEL :: u8(255)
 
 @(private)
+TOMB_MERGE_MIN :: u64(4096)
+
+@(private)
 _merge_pick :: proc(p: ^Pack) -> (lo: int, hi: int, ok: bool) {
 	n := len(p.runs)
 	if n < 2 {
@@ -187,7 +190,7 @@ _merge_pick :: proc(p: ^Pack) -> (lo: int, hi: int, ok: bool) {
 	for r in p.runs[1:] {
 		upper += r.nentries
 	}
-	if upper >= cap_keys {
+	if upper >= cap_keys || p.tombs > max(TOMB_MERGE_MIN, p.runs[0].nentries / 4) {
 		return 0, n, true
 	}
 	t := max(p.opts.merge_fanout, 2)
@@ -322,6 +325,9 @@ _merge_finish :: proc(p: ^Pack) -> Error {
 	run.fd = m.fd
 	m.out = run
 	p.merge = nil
+	if m.drop {
+		p.tombs = 0
+	}
 	_drain(p) or_return
 	fl := &p.fl
 	p.gen += 1
