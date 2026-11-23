@@ -10,6 +10,7 @@ REGION_ALIGN :: uintptr(64 << 20)
 RELAY_SLOT :: 15
 
 region_main_size := uint(256 << 20)
+region_jitter: uintptr
 region_temp_size := uint(96 << 20)
 
 region_stride :: proc() -> uintptr {
@@ -46,7 +47,7 @@ region_map :: proc(r: ^Region, base: uintptr, size: uint, bump: bool) -> (ok: bo
 	}
 	r.base = base
 	r.size = size
-	r.top = base
+	r.top = base + region_jitter
 	r.bump = bump
 	r.mapped = true
 	regions_mapped += 1
@@ -66,7 +67,7 @@ region_reset :: proc(r: ^Region) {
 		used := uint(r.top - r.base)
 		os_region_discard(r.base, used)
 	}
-	r.top = r.base
+	r.top = r.base + region_jitter
 	r.free = {}
 	r.live = 0
 	r.bytes = 0

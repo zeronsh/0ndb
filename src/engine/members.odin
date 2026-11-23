@@ -995,7 +995,11 @@ _members_ready :: proc(sp: ^Space) -> bool {
 	if !sp.mem.caught {
 		return false
 	}
-	for d, l in sp.mem.want {
+	for d in prim.sorted_keys(sp.mem.want) {
+		if d not_in sp.mem.want {
+			continue
+		}
+		l := sp.mem.want[d]
 		if sp.mem.seen[d] < l {
 			return false
 		}
@@ -1148,7 +1152,11 @@ Grant_Pick :: struct {
 grant_picks :: proc(e: ^Engine, allocator := context.allocator) -> []Grant_Pick {
 	context = context_for(e)
 	out := make([dynamic]Grant_Pick, allocator)
-	for _, sp in e.spaces {
+	for mk2_ in prim.sorted_keys(e.spaces) {
+		if mk2_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk2_]
 		if !sp.open {
 			continue
 		}
@@ -1182,7 +1190,11 @@ space_epoch_current :: proc(e: ^Engine, space: prim.Id) -> (tag: osync.Epoch_Tag
 verify_epochs :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []string, err: Error) {
 	context = context_for(e)
 	out := make([dynamic]string, context.temp_allocator)
-	for _, sp in e.spaces {
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if mk1_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk1_]
 		if !sp.open || sp.mode != .End_To_End {
 			continue
 		}

@@ -69,7 +69,11 @@ mem_vfs_init :: proc(m: ^Mem_Vfs, allocator := context.allocator) {
 }
 
 mem_vfs_destroy :: proc(m: ^Mem_Vfs) {
-	for k, n in m.files {
+	for k in prim.sorted_keys(m.files) {
+		if k not_in m.files {
+			continue
+		}
+		n := m.files[k]
 		delete(k, m.allocator)
 		n.linked = false
 		_node_release_unref(m, n)

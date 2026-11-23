@@ -595,7 +595,11 @@ _handle_probe :: proc(h: ^Handle) {
 
 @(private)
 _probes_settle :: proc(e: ^Engine, sp: ^Space, only := prim.Id{}) {
-	for _, h in e.handles {
+	for mk1_ in prim.sorted_keys(e.handles) {
+		if mk1_ not_in e.handles {
+			continue
+		}
+		h := e.handles[mk1_]
 		if h.sp != sp || (!prim.id_is_zero(only) && h.id != only) {
 			continue
 		}

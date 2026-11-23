@@ -128,7 +128,11 @@ _held_ready :: proc(data: rawptr, e: ^Engine, err: Error) {
 	if err != .None {
 		return
 	}
-	for _, sp in e.spaces {
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if mk1_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk1_]
 		if rawptr(sp) == data {
 			_held_scan(e, sp)
 			return

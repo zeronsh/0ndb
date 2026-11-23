@@ -154,7 +154,7 @@ scrub_targets :: proc(db: ^Odb, allocator := context.allocator) -> (out: []Oid, 
 		return nil, rerr
 	}
 	res := make([dynamic]Oid, 0, len(it.targets), allocator)
-	for o in it.targets {
+	for o in prim.sorted_keys(it.targets) {
 		append(&res, o)
 	}
 	return res[:], .None
@@ -228,13 +228,13 @@ scrub_resume :: proc(db: ^Odb, allocator := context.allocator) -> (stats: Redact
 	defer delete(targets)
 	defer delete(protect)
 	defer delete(superseded)
-	for o in it.targets {
+	for o in prim.sorted_keys(it.targets) {
 		append(&targets, o)
 	}
-	for o in it.protect {
+	for o in prim.sorted_keys(it.protect) {
 		append(&protect, o)
 	}
-	for o in it.superseded {
+	for o in prim.sorted_keys(it.superseded) {
 		append(&superseded, o)
 	}
 	if len(targets) == 0 && len(superseded) == 0 {
@@ -314,7 +314,7 @@ reach_named :: proc(db: ^Odb, roots: []Named_Root, pending: ^map[Oid]struct{}, r
 		}
 		hits := make([dynamic]Oid, db.allocator)
 		defer delete(hits)
-		for oid in pending {
+		for oid in prim.sorted_keys(pending^) {
 			if oid in seen {
 				append(&hits, oid)
 			}
@@ -374,7 +374,7 @@ reach_repository :: proc(db: ^Odb, dir: string, targets: []Oid, out: ^[dynamic]U
 	if rerr == .None {
 		refs_destroy(refs, db.allocator)
 	}
-	for oid in inside {
+	for oid in prim.sorted_keys(inside) {
 		append(out, Unreached{oid = oid, reason = .Repository, place = strings.clone(common, allocator)})
 	}
 }

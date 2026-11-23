@@ -863,7 +863,7 @@ _check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 		}
 	}
 	keys := make([dynamic]string, context.temp_allocator)
-	for tok in present {
+	for tok in prim.unordered(present) {
 		append(&keys, tok)
 	}
 	slice.sort(keys[:])
@@ -1490,7 +1490,7 @@ merged_has :: proc(m: ^Model, oi: int, merged: map[string]bool, path: string) ->
 	if path in merged {
 		return true
 	}
-	for k in merged {
+	for k in prim.sorted_keys(merged) {
 		if same_file(m, oi, k, path) {
 			return true
 		}
@@ -1826,7 +1826,11 @@ check_own_redactions :: proc(w: ^World, n: ^Node) {
 		}
 		recs := make(map[Rec_Key]Rec_State, context.temp_allocator)
 		_node_records(w, n, ob, &recs)
-		for k, st in recs {
+		for k in prim.sorted_keys(recs) {
+			if k not_in recs {
+				continue
+			}
+			st := recs[k]
 			if k.device != n.identity.id || st != .Live {
 				continue
 			}

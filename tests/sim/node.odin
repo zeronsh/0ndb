@@ -296,7 +296,11 @@ note_sent :: proc(n: ^Node) {
 		n.sent = make(map[string]i64, w.allocator)
 	}
 	note :: proc(n: ^Node, r: ^osync.Replicator) {
-		for _, l in r.locals {
+		for mk2_ in prim.sorted_keys(r.locals) {
+			if mk2_ not_in r.locals {
+				continue
+			}
+			l := r.locals[mk2_]
 			end := l.cursor + l.inflight
 			if end > n.sent[l.path] {
 				if d, derr := eng.durable_len(&n.e, l.path); derr == .None && end > d {
@@ -312,7 +316,11 @@ note_sent :: proc(n: ^Node) {
 			}
 		}
 	}
-	for _, sp in n.e.spaces {
+	for mk1_ in prim.sorted_keys(n.e.spaces) {
+		if mk1_ not_in n.e.spaces {
+			continue
+		}
+		sp := n.e.spaces[mk1_]
 		if sp.repl_on {
 			note(n, &sp.repl)
 		}
@@ -328,7 +336,7 @@ check_sent :: proc(n: ^Node) {
 		return
 	}
 	keys := make([dynamic]string, context.temp_allocator)
-	for k in n.sent {
+	for k in prim.sorted_keys(n.sent) {
 		append(&keys, k)
 	}
 	slice.sort(keys[:])

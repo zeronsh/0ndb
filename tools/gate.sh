@@ -40,6 +40,12 @@ done | grep -v "_windows.odin:\|_darwin.odin:" | while IFS=: read -r f l rest; d
 	sed -n "${from},$(( l - 1 ))p" "$f" | grep -q "prim.unrouted" || printf '%s:%s ' "$f" "$l"
 done )
 if [ -n "$SOURCES" ]; then FAIL=1; note "sources: FAIL clock or randomness not routed through the engine's Clock and Random: $SOURCES"; else note "sources: ok"; fi
+if command -v python3 > /dev/null; then
+	MAPORDER=$(python3 tools/maporder.py . src,tests/sim 2> /dev/null)
+	if [ -n "$MAPORDER" ]; then FAIL=1; note "map order: FAIL a map loop with effects iterates in hash order (use prim.sorted_keys, or prim.unordered when order cannot matter): $(echo "$MAPORDER" | head -5 | tr '\n' ' ')"; else note "map order: ok"; fi
+else
+	note "map order: skipped (no python3)"
+fi
 
 build() {
 	local name=$1; shift
@@ -70,6 +76,21 @@ lane() {
 	done
 	echo "$name $from-$to: $f failed$msg"
 }
+
+jitter_lane() {
+	local f=0 msg="" n=0
+	for run in "1" "2" "3" "4" "25 SIM_TREE_MOVE=1 SIM_STORAGE=until-run" "44 SIM_TREE_MOVE=1" "7 SIM_TREE_MOVE=1" "9 SIM_STORAGE=until-run"; do
+		local s=${run%% *} env=""
+		[ "$run" != "$s" ] && env=${run#* }
+		n=$((n+1))
+		local o
+		o=$(env $env SIM_ADDR_JITTER=1 SIM_SEED=$s timeout 1800 "$OUT/sim.bin" 2>&1)
+		if echo "$o" | grep -q "NOT deterministic"; then
+			f=$((f+1)); msg="$msg [$s $env]"
+		fi
+	done
+	echo "addr-jitter $n runs: $f failed$msg"
+}
 {
 	lane default "" 1 10 > "$OUT/l1" &
 	lane default "" 11 20 > "$OUT/l2" &
@@ -90,12 +111,13 @@ lane() {
 	( r=$(timeout 900 "$OUT/cvg.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "convergence: $r" ) > "$OUT/l9" &
 	( r=$(timeout 900 "$OUT/fst.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "fstree: $r" ) > "$OUT/l10" &
 	( r=$(cd docs/relay-vectors && timeout 300 "$OUT/relayvec" check . 2>&1 | tail -1); echo "relay vectors: $r" ) > "$OUT/l11" &
+	jitter_lane > "$OUT/l20" &
 	wait
 }
 if command -v cargo > /dev/null; then
 	( cd bindings/rust/ondb && timeout 900 cargo check -q --examples > "$OUT/cargo.log" 2>&1 ) && note "cargo: ok" || { FAIL=1; note "cargo: FAIL $(tail -3 "$OUT/cargo.log" | tr '\n' ' ')"; }
 fi
-for i in 1 2 3 4 5 13 17 18 19 6 14 12 15 16 7 8 9 10 11; do
+for i in 1 2 3 4 5 13 17 18 19 6 14 12 15 16 20 7 8 9 10 11; do
 	l=$(cat "$OUT/l$i")
 	note "$l"
 	case "$l" in

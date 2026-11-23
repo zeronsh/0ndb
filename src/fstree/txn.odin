@@ -1,5 +1,7 @@
 package fstree
 
+import "../prim"
+
 import "base:runtime"
 import "core:strings"
 
@@ -16,10 +18,10 @@ txn_begin :: proc(t: ^Tree) {
 
 @(private)
 txn_abort :: proc(t: ^Tree) {
-	for _, n in t.txn.inodes {
+	for _, n in prim.unordered(t.txn.inodes) {
 		inode_free(t, n)
 	}
-	for _, n in t.txn.nodes {
+	for _, n in prim.unordered(t.txn.nodes) {
 		node_free(t, n)
 	}
 	clear(&t.txn.inodes)
@@ -60,7 +62,11 @@ txn_commit :: proc(t: ^Tree) -> Error {
 		txn_abort(t)
 		return err
 	}
-	for id, n in t.txn.inodes {
+	for id in prim.sorted_keys(t.txn.inodes) {
+		if id not_in t.txn.inodes {
+			continue
+		}
+		n := t.txn.inodes[id]
 		if old, ok := t.inodes[id]; ok && old != n {
 			inode_free(t, old)
 		}
@@ -68,7 +74,11 @@ txn_commit :: proc(t: ^Tree) -> Error {
 		t.inodes[id] = n
 		t.dirty_inodes[id] = {}
 	}
-	for key, n in t.txn.nodes {
+	for key in prim.sorted_keys(t.txn.nodes) {
+		if key not_in t.txn.nodes {
+			continue
+		}
+		n := t.txn.nodes[key]
 		if old, ok := t.nodes[key]; ok && old != n {
 			node_free(t, old)
 		}

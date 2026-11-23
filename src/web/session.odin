@@ -171,10 +171,10 @@ session_init :: proc(s: ^Session, allocator := context.allocator) {
 }
 
 session_destroy :: proc(s: ^Session) {
-	for _, o in s.objects {
+	for _, o in prim.unordered(s.objects) {
 		_object_free(s, o)
 	}
-	for _, rm in s.remotes {
+	for _, rm in prim.unordered(s.remotes) {
 		_remote_free(s, rm)
 	}
 	for r in s.requests {
@@ -387,10 +387,18 @@ _mark :: proc(rm: ^Remote) {
 @(private)
 _on_ready :: proc(s: ^Session) {
 	_feed_subscribe(s, 0)
-	for _, rm in s.remotes {
+	for mk5_ in prim.sorted_keys(s.remotes) {
+		if mk5_ not_in s.remotes {
+			continue
+		}
+		rm := s.remotes[mk5_]
 		_remote_resume(s, rm)
 	}
-	for _, o in s.objects {
+	for mk4_ in prim.sorted_keys(s.objects) {
+		if mk4_ not_in s.objects {
+			continue
+		}
+		o := s.objects[mk4_]
 		o.changed = true
 		for sg in o.segs {
 			sg.probing = false
@@ -406,7 +414,7 @@ _feed_subscribe :: proc(s: ^Session, from: i64) {
 		return
 	}
 	pats := make([dynamic]osync.Feed_Pattern, context.temp_allocator)
-	for suffix in s.groups {
+	for suffix in prim.sorted_keys(s.groups) {
 		p := osync.Feed_Pattern{kind = .Suffix}
 		x := suffix
 		copy(p.bytes[:16], x[:])
@@ -418,13 +426,17 @@ _feed_subscribe :: proc(s: ^Session, from: i64) {
 	p := osync.Feed_Pattern{kind = .Suffix}
 	copy(p.bytes[:16], cs[:])
 	append(&pats, p)
-	for id in s.probes {
+	for id in prim.sorted_keys(s.probes) {
 		append(&pats, osync.Feed_Pattern{kind = .Exact, bytes = cast([32]u8)id})
 	}
 	if mp, ok := members_pattern(s); ok {
 		append(&pats, mp)
 	}
-	for _, o in s.objects {
+	for mk3_ in prim.sorted_keys(s.objects) {
+		if mk3_ not_in s.objects {
+			continue
+		}
+		o := s.objects[mk3_]
 		for sg in o.segs {
 			if sg.head != nil {
 				ph := osync.Feed_Pattern{kind = .Exact}
@@ -958,7 +970,11 @@ _object_close :: proc(s: ^Session, o: ^Object) {
 	}
 	stale := make([dynamic]osync.Stream_Id, context.temp_allocator)
 	for sg in o.segs {
-		for id, pr in s.probes {
+		for id in prim.sorted_keys(s.probes) {
+			if id not_in s.probes {
+				continue
+			}
+			pr := s.probes[id]
 			if pr.seg == sg {
 				append(&stale, id)
 			}
@@ -1116,7 +1132,11 @@ _keys_name :: proc(name: string) -> string {
 _seg_probe :: proc(s: ^Session, o: ^Object, sg: ^Seg, base: u64) {
 	kn := _keys_name(o.name)
 	stale := make([dynamic]osync.Stream_Id, context.temp_allocator)
-	for id, pr in s.probes {
+	for id in prim.sorted_keys(s.probes) {
+		if id not_in s.probes {
+			continue
+		}
+		pr := s.probes[id]
 		if pr.seg == sg {
 			append(&stale, id)
 		}
@@ -1275,7 +1295,11 @@ _card_landed :: proc(s: ^Session, rm: ^Remote) {
 		append(&learned, id.id)
 	}
 	for dev in learned {
-		for _, o in s.objects {
+		for mk3_ in prim.sorted_keys(s.objects) {
+			if mk3_ not_in s.objects {
+				continue
+			}
+			o := s.objects[mk3_]
 			for sg in o.segs {
 				if sg.device == dev {
 					_seg_enter(s, o, sg)
@@ -1367,7 +1391,11 @@ _object_wants :: proc(s: ^Session, o: ^Object) -> (issued: bool) {
 
 @(private)
 _settle :: proc(s: ^Session) {
-	for _, o in s.objects {
+	for mk2_ in prim.sorted_keys(s.objects) {
+		if mk2_ not_in s.objects {
+			continue
+		}
+		o := s.objects[mk2_]
 		if !o.changed {
 			continue
 		}
@@ -1385,7 +1413,11 @@ _settle :: proc(s: ^Session) {
 			}
 		}
 		if o.catalog {
-			for _, x in s.objects {
+			for mk1_ in prim.sorted_keys(s.objects) {
+				if mk1_ not_in s.objects {
+					continue
+				}
+				x := s.objects[mk1_]
 				if !x.catalog {
 					_catalog_members(s, x)
 				}

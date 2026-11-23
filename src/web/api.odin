@@ -277,7 +277,11 @@ ondb_info :: proc "c" (s: ^Session) -> u32 {
 	o_bool(&o, "connected", s.ready)
 	o_u64(&o, "objects", u64(len(s.objects)))
 	o_arr(&o, "views")
-	for _, x in s.objects {
+	for mk2_ in prim.sorted_keys(s.objects) {
+		if mk2_ not_in s.objects {
+			continue
+		}
+		x := s.objects[mk2_]
 		o_obj(&o, "")
 		o_id(&o, "object", x.id)
 		o_u64(&o, "segments", u64(len(x.segs)))
@@ -303,7 +307,11 @@ ondb_info :: proc "c" (s: ^Session) -> u32 {
 	o_end(&o)
 	o_u64(&o, "streams", u64(len(s.remotes)))
 	have: i64
-	for _, rm in s.remotes {
+	for mk1_ in prim.sorted_keys(s.remotes) {
+		if mk1_ not_in s.remotes {
+			continue
+		}
+		rm := s.remotes[mk1_]
 		for h in journal.replica_have(&rm.rep) {
 			have += h.to - h.from
 		}

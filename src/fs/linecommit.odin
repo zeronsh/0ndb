@@ -40,7 +40,7 @@ line_from_commit :: proc(m: ^Mount, line: string, base: Version, commit_hex: str
 	builder_opaque(&b, gbuf[:])
 	marked := b.n
 	paths := make([dynamic]string, 0, len(entries), context.temp_allocator)
-	for p in entries {
+	for p in prim.sorted_keys(entries) {
 		append(&paths, p)
 	}
 	slice.sort(paths[:])

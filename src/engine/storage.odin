@@ -96,7 +96,11 @@ availability :: proc(e: ^Engine, o: Object, allocator := context.allocator) -> (
 
 storage_stats :: proc(e: ^Engine) -> (st: Storage_Stats) {
 	context = context_for(e)
-	for _, sp in e.spaces {
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if mk1_ not_in e.spaces {
+			continue
+		}
+		sp := e.spaces[mk1_]
 		if !sp.repl_on {
 			continue
 		}

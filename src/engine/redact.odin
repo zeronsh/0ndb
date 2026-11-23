@@ -696,7 +696,11 @@ _redact_recover :: proc(e: ^Engine) {
 	if !_rlog_ready(e) {
 		return
 	}
-	for kk, x in e.rlog.live {
+	for kk in prim.sorted_keys(e.rlog.live) {
+		if kk not_in e.rlog.live {
+			continue
+		}
+		x := e.rlog.live[kk]
 		k := kk
 		if k[56] != 40 || x.done {
 			continue
@@ -830,7 +834,11 @@ _relay_redact_resend :: proc(e: ^Engine, sp: ^Space, object: prim.Id = {}) {
 	}
 	s := sp.id
 	o := object
-	for kk, x in e.rlog.live {
+	for kk in prim.sorted_keys(e.rlog.live) {
+		if kk not_in e.rlog.live {
+			continue
+		}
+		x := e.rlog.live[kk]
 		k := kk
 		n := int(k[56])
 		if (n != 40 && n != 56) || (n == 40 && !x.done) || string(k[:16]) != string(s[:]) {
@@ -867,7 +875,11 @@ _stream_object :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id) -> (id: 
 			return id, kind, rm.epoch, found
 		}
 	}
-	for x, h in e.handles {
+	for x in prim.sorted_keys(e.handles) {
+		if x not_in e.handles {
+			continue
+		}
+		h := e.handles[x]
 		if h.sp == sp && osync.stream_id(&h.scope, device, h.name, 0) == stream {
 			return x, h.kind, 0, true
 		}

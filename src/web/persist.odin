@@ -36,7 +36,11 @@ mem_vfs_snapshot :: proc(m: ^Mem_Vfs) {
 	m.logging = true
 	clear(&m.log)
 	_log(m, .Reset, "", 0, nil)
-	for path, n in m.files {
+	for path in prim.sorted_keys(m.files) {
+		if path not_in m.files {
+			continue
+		}
+		n := m.files[path]
 		for &e in n.ext {
 			_log(m, .Write, path, e.off, e.data[:])
 		}
@@ -66,7 +70,7 @@ mem_vfs_restore :: proc(m: ^Mem_Vfs, log: []u8) -> bool {
 		switch op {
 		case .Reset:
 			names := make([dynamic]string, context.temp_allocator)
-			for k in m.files {
+			for k in prim.sorted_keys(m.files) {
 				append(&names, k)
 			}
 			for k in names {
