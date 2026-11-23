@@ -464,6 +464,9 @@ Mount :: struct {
 	conv_seq:    u64,
 	fences:      [dynamic]Fence,
 	timer:       prim.Timer,
+	warm:        ^Warm_Job,
+	warm_timer:  prim.Timer,
+	warmed:      bool,
 	idle_timer:  prim.Timer,
 	root_wd:     i32,
 	watched:     bool,
@@ -839,6 +842,7 @@ drop_lost :: proc(m: ^Mount, dir: string, lost: []Lost_Range) -> Error {
 }
 
 mount_close :: proc(m: ^Mount) {
+	warm_stop(m)
 	mount_release_writes(m)
 	mount_unlock(m)
 	delete(m.lock_watches)
@@ -1717,12 +1721,15 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 		if mm.reg.on_ready != nil {
 			mm.reg.on_ready(mm, mm.reg.ready_data)
 		} else {
-			mount_run(mm)
+			mount_run(mm, true)
 		}
 	})
 }
 
-mount_run :: proc(m: ^Mount) -> Error {
+mount_run :: proc(m: ^Mount, may_park := false) -> Error {
+	if may_park && warm_park(m) {
+		return .None
+	}
 	err := mount_step(m)
 	return .None if err == .Deferred else err
 }
