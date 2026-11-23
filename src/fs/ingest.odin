@@ -1484,7 +1484,7 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	m.override[k] = st.oid
 	actor := st.actor
 	if st.scope != {} && !actor_on_line(m, actor) {
-		actor = scope_line_actor(m, actor)
+		actor = scope_line_actor(m, actor) or_return
 	}
 	b: Builder
 	builder_init(&b, m.history, actor)
@@ -2144,7 +2144,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			}
 			if actor != m.actor && !actor_on_line(m, actor) {
 				if scope != {} && !is_unattributed(actor) {
-					actor = scope_line_actor(m, actor)
+					actor = scope_line_actor(m, actor) or_return
 				} else {
 					actor = m.actor
 					scope = {}
