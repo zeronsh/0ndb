@@ -38,7 +38,7 @@ _own_stream_len :: proc(e: ^Engine, id: prim.Id, kind: Kind) -> (n: i64, err: Er
 
 @(private)
 _owns_segment :: proc "contextless" (kind: Kind) -> bool {
-	return kind == .Conversation || kind == .Map
+	return kind == .Conversation || kind == .Map || kind == .Text || kind == .File_Tree
 }
 
 @(private)
