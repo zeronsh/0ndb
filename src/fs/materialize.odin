@@ -24,6 +24,7 @@ Mat_Item :: struct {
 	has_old: bool,
 	entry:   Entry,
 	depth:   int,
+	parent:  fstree.Inode_Id,
 }
 
 mount_materialize :: proc(m: ^Mount) -> Error {
@@ -157,6 +158,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 				it.flags = info.flags
 				it.target = info.target
 				it.depth = count_depth(p)
+				it.parent = info.parent
 			}
 		}
 		old, e, has := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
@@ -937,6 +939,13 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		}
 		mat_dir(m, path_parent_abs(abs))
 		return .None if m.restoring else shadow_remove(&m.shadow, it.old)
+	}
+	if up := path_parent(it.path); len(up) > 0 && !m.restoring {
+		if pe, found := shadow_get(&m.shadow, up) or_return; !found || pe.kind != .Dir || pe.inode != it.parent {
+			mat_raced(m)
+			mount_reshow_add(m, it.path)
+			return .None
+		}
 	}
 	abs := abs_path(m, it.path, abuf[:])
 	if mat_collides(m, it, abs) {
