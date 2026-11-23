@@ -577,6 +577,7 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	}
 	if err == .None {
 		cc := osync.relay_core_config()
+		commit_hold_wrap(w, &store)
 		cc.storage = store
 		cc.authorizer = osync.cap_authorizer(&rn.cauth)
 		cc.clock = node_clock(&rn.clock)
@@ -751,6 +752,7 @@ relay_drain :: proc(rn: ^Relay_Node) -> bool {
 		if !rn.alive {
 			return did
 		}
+		commit_hold_flush(w)
 		if !loop_ready(&rn.inst.loop) && !loop_due(&rn.inst.loop) {
 			return did
 		}

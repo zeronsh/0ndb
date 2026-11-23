@@ -482,6 +482,7 @@ _on_trim :: proc(c: ^Conn, rd: ^prim.Reader) {
 		return
 	}
 	if st.busy {
+		r.stats.trim_busy += 1
 		_reply_refused(c, .Busy, cast([32]u8)id)
 		_stream_maybe_release(r, st)
 		return
