@@ -183,6 +183,8 @@ Local :: struct {
 	trim_base: i64,
 	trim_at:   i64,
 	trim_sent: i64,
+	trim_timer: prim.Timer,
+	trim_tries: int,
 	rst_on:    bool,
 	rst_of:    Stream_Id,
 }
@@ -998,7 +1000,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
-	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l || l.arc_timer != 0 {
+	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l || l.arc_timer != 0 || l.trim_timer != 0 {
 		return
 	}
 	if r.hold > 0 {
@@ -2771,6 +2773,11 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 
 @(private)
 _repl_on_ready :: proc(r: ^Replicator) {
+	for _, al in r.locals {
+		if al.arc_child && al.floor >= al.trim_at {
+			_arc_trim_send(r, al)
+		}
+	}
 	if r.cfg.filtered {
 		_feed_subscribe(r, r.feed_cursor < 0 || r.group_new)
 		r.group_new = false
