@@ -822,7 +822,11 @@ equal in both directions.
   file is still on disk. A pass whose line version is ahead of `synced`
   adopts a changed file whose content is its text at the line version (what
   an interrupted materialization wrote before a crash): its entry names that
-  version and nothing is committed. A created directory that is a present
+  version and nothing is committed. A removed file that the line version no
+  longer holds (an unlink applied before a crash, its shadow entry rolled
+  back to the image's mark) is adopted by dropping its entry and owing its
+  path in `absent`, so `synced` still equals the disk except what is owed
+  until the materialization that completes drains it. A created directory that is a present
   directory at the line version is adopted the same way, so a directory the
   pass made before a crash is never ingested as a new one beside the line's,
   but only when everything the pass creates under it is adopted too: a user

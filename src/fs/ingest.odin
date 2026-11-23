@@ -1127,6 +1127,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 			return false, .None
 		}
 		shadow_remove(&m.shadow, c.path) or_return
+		mount_absent_add(m, c.path)
 		return true, .None
 	}
 	if c.kind == .Create && c.disk == .Dir {
