@@ -756,6 +756,22 @@ pub struct Blame {
 pub struct TreeList {
     pub names: Vec<String>,
     pub line: String,
+    pub entries: Vec<TreeEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TreeEntry {
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+    pub mode: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FilesAt {
+    pub files: Vec<FileRef>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

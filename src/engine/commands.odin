@@ -12,6 +12,7 @@ Cmd_Send :: struct {
 	object:      Object,
 	text:        string,
 	parent:      Rid,
+	root:        bool,
 	role:        convo.Role,
 	attachments: []convo.Attachment,
 	provider:    string,
@@ -507,6 +508,7 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 				role     = c.role if c.role != convo.Role(0) else .User,
 				author   = e.self,
 				parent   = c.parent,
+				root     = c.root,
 				provider = c.provider,
 				model    = c.model,
 			}

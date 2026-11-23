@@ -714,7 +714,7 @@ up exist only over the socket.
 
 | code | op | arguments | result |
 |---|---|---|---|
-| 60 | `send` | object: object, text: str, parent: rid, role: enum user|assistant|system|tool, provider: str, model: str, attachments: attachments | Result |
+| 60 | `send` | object: object, text: str, parent: rid, role: enum user|assistant|system|tool, provider: str, model: str, attachments: attachments, root: bool | Result |
 | 61 | `queue` | object: object, text: str, attachments: attachments | Result |
 | 62 | `steer` | object: object, text: str, msg: rid, attachments: attachments | Result |
 | 63 | `edit` | object: object, item: rid, text: str, attachments: attachments | Result |
@@ -756,8 +756,8 @@ up exist only over the socket.
 | 86 | `text.edit` | object: object, pos: uvarint, remove: uvarint, insert: str | Result |
 | 87 | `text.redact` | object: object, pos: uvarint, len: uvarint | {} |
 | 88 | `tree.create` | space: id, title: str | object:object |
-| 89 | `tree.read` | object: object, path: str, line: str | text:str line:str |
-| 90 | `tree.list` | object: object, path: str, line: str | names:[str] line:str |
+| 89 | `tree.read` | object: object, path: str, line: str, version: bytes | text:str line:str |
+| 90 | `tree.list` | object: object, path: str, line: str, version: bytes | names:[str] line:str entries:[TreeEntry] |
 | 91 | `tree.write` | object: object, path: str, text: str, line: str | line:str |
 | 92 | `tree.remove` | object: object, path: str, line: str | line:str |
 | 93 | `tree.mount` | object: object, root: str | {} |
@@ -766,6 +766,19 @@ up exist only over the socket.
 | 96 | `tree.blame` | object: object, path: str, line: str | line:str text:str spans:[Span] |
 | 97 | `tree.sync` | object: object, root: str | {} |
 | 98 | `tree.find` | path: str | object:object root:str rel:str |
+
+`tree.read` and `tree.list` read the line's current tree, or with `version`
+(the `version` of a `File` from `convo.files_at`) the tree at that version;
+a version this device's history does not hold answers `missing`, and bytes
+that are not a version answer `invalid`.
+`tree.list` names each child's kind (`file`, `dir`, `symlink`), size in
+bytes (a symlink's target length, 0 for a directory) and mode. Listing a
+file or reading a directory answers `invalid`.
+
+`send` appends after the read position, or under `parent`; with `root` the
+message starts a new root, a sibling of the conversation's first message
+(so the first message can be branched). `root` with a `parent` is
+`bad_request`.
 
 ### Catalog (the session list)
 
