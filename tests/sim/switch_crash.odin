@@ -40,7 +40,7 @@ Switch_Probe :: struct {
 
 @(init, private = "file")
 _switch_probe_init :: proc "contextless" () {
-	register_restarted(60, _switch_probe, false)
+	register_restarted(65, _switch_probe, false)
 }
 
 @(private = "file")
