@@ -23,6 +23,7 @@ Content_State :: struct {
 	ups:    map[odb.Oid]Content_Up,
 	marks:  map[prim.Id]Content_Mark,
 	events: [dynamic]Content_Ev,
+	owed:   map[prim.Id]prim.Id,
 }
 
 @(private)
@@ -78,6 +79,7 @@ _content_init :: proc(e: ^Engine) {
 	e.content.ups = make(map[odb.Oid]Content_Up, e.allocator)
 	e.content.marks = make(map[prim.Id]Content_Mark, e.allocator)
 	e.content.events = make([dynamic]Content_Ev, e.allocator)
+	e.content.owed = make(map[prim.Id]prim.Id, e.allocator)
 }
 
 @(private)
@@ -92,6 +94,7 @@ _content_destroy :: proc(e: ^Engine) {
 	delete(e.content.waits)
 	delete(e.content.ups)
 	delete(e.content.marks)
+	delete(e.content.owed)
 	for ev in e.content.events {
 		delete(ev.path, e.allocator)
 	}
@@ -180,12 +183,38 @@ _content_durable :: proc(e: ^Engine, space: prim.Id, id: prim.Id, length: i64) {
 _content_kick :: proc(e: ^Engine, sp: ^Space, id: prim.Id) {
 	h, err := _handle_get(e, Object{sp.id, id}, .File_Tree)
 	if err != .None {
+		if err == .Busy {
+			e.content.owed[id] = sp.id
+		}
 		return
 	}
 	if _hist_ready(e, h) != .None || _handle_create_writer(h) != .None {
+		e.content.owed[id] = sp.id
 		return
 	}
+	delete_key(&e.content.owed, id)
 	_content_publish(e, h)
+}
+
+@(private)
+_content_settle :: proc(e: ^Engine) {
+	if len(e.content.owed) == 0 {
+		return
+	}
+	ids := make([dynamic]prim.Id, 0, len(e.content.owed), context.temp_allocator)
+	spaces := make([dynamic]prim.Id, 0, len(e.content.owed), context.temp_allocator)
+	for id, s in e.content.owed {
+		append(&ids, id)
+		append(&spaces, s)
+	}
+	for id, i in ids {
+		sp, ok := e.spaces[spaces[i]]
+		if !ok || !sp.repl_on {
+			delete_key(&e.content.owed, id)
+			continue
+		}
+		_content_kick(e, sp, id)
+	}
 }
 
 @(private)
