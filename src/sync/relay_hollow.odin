@@ -106,6 +106,12 @@ _on_fill_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
 		_stream_maybe_release(r, st)
 		return
 	}
+	redact := _red_overlaps(r, sp, id, at, at + total)
+	if redact && total > FILL_REDACT_MAX {
+		c.op.reply, c.op.code = .Refused, .Too_Large
+		_stream_maybe_release(r, st)
+		return
+	}
 	w, werr := r.store.fill_begin(r.store.data, st.h, at, total)
 	if werr != .None {
 		c.op.reply, c.op.len = .Noted, _live_len(st)
@@ -122,12 +128,37 @@ _on_fill_begin :: proc(c: ^Conn, rd: ^prim.Reader, total: i64) {
 	c.op.kind = .Fill
 	c.op.stream = st
 	c.op.w = w
+	c.op.at = at
+	if redact {
+		c.op.buf = make([]u8, int(total), r.allocator)
+	}
 }
 
 @(private)
 _fill_end :: proc(c: ^Conn, op: ^Op) {
 	r := c.relay
 	st := op.stream
+	if op.buf != nil {
+		ok := op.pos == len(op.buf) && _red_fill_apply(c.space, Stream_Id(op.id), op.at, op.buf)
+		r.stats.redacted_in += 1
+		if !ok {
+			r.stats.refused_in += 1
+		}
+		if ok && op.failed == .None {
+			op.failed = r.store.append_write(r.store.data, op.w, op.buf)
+		}
+		delete(op.buf, r.allocator)
+		op.buf = nil
+		if !ok {
+			r.store.append_abort(r.store.data, op.w)
+			c.space.reserved -= op.total
+			st.busy = false
+			_stream_unref(r, st)
+			_reply_refused(c, .Protocol, op.id)
+			_stream_maybe_release(r, st)
+			return
+		}
+	}
 	p := _pending_new(c, .Fill, st, op.total, op.id)
 	_stream_unref(r, st)
 	if p == nil {
@@ -333,6 +364,22 @@ _serve_end :: proc(c: ^Conn, op: ^Op) {
 	}
 	if word & SERVE_NONE != 0 {
 		delete(buf, r.allocator)
+		_reply_unserved(q, c.principal.participant, op.pipe.tag, op.pipe.id)
+		return
+	}
+	data := buf[FRAME_HEADER + SERVE_FIXED:]
+	at := i64(prim.get_u64le(buf[FRAME_HEADER + 56:]))
+	if len(data) > 0 && _red_overlaps(r, sp, op.pipe.id, at, at + i64(len(data))) {
+		r.stats.redacted_in += 1
+	}
+	if len(data) > 0 && _red_overlaps(r, sp, op.pipe.id, at, at + i64(len(data))) && !_red_fill_apply(sp, op.pipe.id, at, data) {
+		r.stats.refused_in += 1
+		delete(buf, r.allocator)
+		if word & SERVE_FINAL == 0 {
+			if j := _pipe_find(sp, c, op.pipe.from, op.pipe.tag, op.pipe.id); j >= 0 {
+				unordered_remove(&sp.pipes, j)
+			}
+		}
 		_reply_unserved(q, c.principal.participant, op.pipe.tag, op.pipe.id)
 		return
 	}

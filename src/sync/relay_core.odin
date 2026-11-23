@@ -24,6 +24,8 @@ Relay_Stats :: struct {
 	piped_bytes: u64,
 	lived:      u64,
 	lived_bytes: u64,
+	redacted_in: u64,
+	refused_in:  u64,
 }
 
 Relay_Space_Stats :: struct {
@@ -125,6 +127,8 @@ Space_State :: struct {
 	redlog_flight: [dynamic]u8,
 	redlog_fp: [dynamic]^Pending,
 	redlog_busy: bool,
+	red_index: map[Stream_Id][dynamic][2]i64,
+	red_loaded: bool,
 	compact_red: i64,
 	compact_red_end: i64,
 	present:  map[Device_Id]Presence_Entry,
@@ -182,6 +186,7 @@ Op :: struct {
 	id:     [32]u8,
 	len:    i64,
 	base:   i64,
+	at:     i64,
 	buf:    []u8,
 	pos:    int,
 	pipe:   Pipe,
@@ -1159,6 +1164,10 @@ _space_release :: proc(r: ^Relay_Core, sp: ^Space_State) {
 	delete(sp.feed_flight)
 	delete(sp.compact_buf)
 	delete(sp.feed_wait)
+	for _, l in sp.red_index {
+		delete(l)
+	}
+	delete(sp.red_index)
 	delete(sp.redlog_q)
 	delete(sp.redlog_qp)
 	delete(sp.redlog_flight)
@@ -1226,6 +1235,7 @@ _stream_get :: proc(r: ^Relay_Core, sp: ^Space_State, id: Stream_Id, create: boo
 	}
 	nst.followers = make([dynamic]^Conn, r.allocator)
 	sp.streams[id] = nst
+	_red_reapply(r, sp, nst)
 	r.stats.streams += 1
 	return nst, .None
 }
@@ -1813,7 +1823,9 @@ _on_bulk_data :: proc(c: ^Conn, data: []u8) {
 			op.failed = r.store.put_write(r.store.data, op.w, data)
 		}
 	case .Fill:
-		if op.failed == .None {
+		if op.buf != nil {
+			op.pos += copy(op.buf[op.pos:], data)
+		} else if op.failed == .None {
 			op.failed = r.store.append_write(r.store.data, op.w, data)
 		}
 	case .Serve, .Live:
@@ -1900,6 +1912,9 @@ _op_abort :: proc(c: ^Conn) {
 		op.stream.busy = false
 		op.stream.poisoned = true
 		_stream_unref(r, op.stream)
+		if op.buf != nil {
+			delete(op.buf, r.allocator)
+		}
 	case .Serve, .Live:
 		if op.buf != nil {
 			delete(op.buf, r.allocator)

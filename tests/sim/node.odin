@@ -557,6 +557,8 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	}
 	rn.r_on = true
 	world_note(w, "relay up")
+	rn.red_check = true
+	rn.fills_seen = 0
 	return true
 }
 
@@ -586,6 +588,8 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	rn.alive = false
 	rn.r_on = false
 	instance_kill(&rn.inst)
+	stat_add(rn.w, STAT_RELAY_REDACTED_IN, rn.r.stats.redacted_in)
+	stat_add(rn.w, STAT_RELAY_REFUSED_IN, rn.r.stats.refused_in)
 	rn.r = {}
 	rn.fs = {}
 	rn.pk = {}
@@ -633,6 +637,17 @@ relay_crashed :: proc(rn: ^Relay_Node) {
 }
 
 relay_after :: proc(rn: ^Relay_Node) {
+	if rn.alive && rn.r_on && (rn.r.stats.fills != rn.fills_seen || rn.red_check) {
+		rn.fills_seen = rn.r.stats.fills
+		rn.red_check = false
+		context = instance_context(&rn.inst)
+		bad := make([dynamic]osync.Redaction_Violation, context.temp_allocator)
+		osync.relay_core_redactions_held(&rn.r, &bad)
+		for v in bad {
+			sid := v.stream
+			world_fail(rn.w, "relay redaction: relay stores record %x@%d inside a recorded redaction without its redacted form", sid[:4], v.off)
+		}
+	}
 	if rn.alive {
 		free_all(region_allocator(&rn.inst.temp))
 	}
@@ -710,6 +725,8 @@ check_derived :: proc(n: ^Node, at: string) {
 STAT_TIER_EVICTIONS: Stat
 STAT_TIER_COLD_READS: Stat
 STAT_TIER_THAWS: Stat
+STAT_RELAY_REDACTED_IN: Stat
+STAT_RELAY_REFUSED_IN: Stat
 STAT_TIER_PARKS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
@@ -739,6 +756,8 @@ _node_stats :: proc "contextless" () {
 		res.stats.extra[int(STAT_TIER_EVICTIONS)] += w.relay.ts.evictions
 		res.stats.extra[int(STAT_TIER_COLD_READS)] += w.relay.ts.cold_reads
 		res.stats.extra[int(STAT_TIER_THAWS)] += w.relay.ts.thaws
+		res.stats.extra[int(STAT_RELAY_REDACTED_IN)] += w.relay.r.stats.redacted_in
+		res.stats.extra[int(STAT_RELAY_REFUSED_IN)] += w.relay.r.stats.refused_in
 		res.stats.extra[int(STAT_TIER_PARKS)] += w.relay.ts.parks
 		res.stats.extra[int(STAT_TIER_SLOW_READS)] += w.relay.slow.reads
 		res.stats.extra[int(STAT_TIER_FAILED_READS)] += w.relay.slow.failed
@@ -752,6 +771,9 @@ _node_stats :: proc "contextless" () {
 	STAT_GHOST_TAILS = register_stat(45, 1, "ghost_tails")
 	STAT_TIER_EVICTIONS = register_stat(40, 0, "relay_evictions")
 	STAT_TIER_COLD_READS = register_stat(40, 1, "relay_cold_reads")
+	register_stat_line(48)
+	STAT_RELAY_REDACTED_IN = register_stat(48, 0, "relay_redacted_in")
+	STAT_RELAY_REFUSED_IN = register_stat(48, 1, "relay_refused_in")
 	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
 	STAT_TIER_SLOW_READS = register_stat(40, 3, "object_reads")
 	STAT_TIER_FAILED_READS = register_stat(40, 4, "object_read_faults")

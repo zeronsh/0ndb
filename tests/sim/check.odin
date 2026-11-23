@@ -1744,3 +1744,63 @@ _check_stats :: proc "contextless" () {
 	STAT_FRESH_POLLS = register_stat(60, 0, "fresh_polls")
 	STAT_FRESH_PROBED = register_stat(60, 1, "fresh_probed")
 }
+
+check_own_redactions :: proc(w: ^World, n: ^Node) {
+	rn := &w.relay
+	if !rn.alive || !rn.r_on || !n.alive || !n.e_open {
+		return
+	}
+	m := &w.model
+	for _, oi in m.objs {
+		if !obj_exists(m, oi) {
+			continue
+		}
+		ob := &m.objs[oi]
+		si := space_index(m, ob.o.space)
+		if si < 0 || !space_member(&m.spaces[si], n.idx) {
+			continue
+		}
+		scope: osync.Scope
+		{
+			context = instance_context(&n.inst)
+			key, kerr := eng.object_key(&n.e, ob.o)
+			info, _ := eng.space_info(&n.e, ob.o.space)
+			node_after(n)
+			if kerr != .None {
+				continue
+			}
+			scope = osync.scope_make(key, info.mode)
+		}
+		name := make([]u8, 1 + prim.ID_HEX_LEN, context.temp_allocator)
+		name[0] = _kind_prefix(ob.kind)
+		hx := prim.id_hex(ob.o.id)
+		copy(name[1:], hx[:])
+		sid := osync.stream_id(&scope, n.identity.id, string(name), 0)
+		ranges: [][2]i64
+		{
+			context = instance_context(&rn.inst)
+			ranges = slice.clone(osync.relay_core_redacted(&rn.r, osync.Space_Id(ob.o.space), sid), w.allocator)
+		}
+		defer delete(ranges, w.allocator)
+		if len(ranges) == 0 {
+			continue
+		}
+		recs := make(map[Rec_Key]Rec_State, context.temp_allocator)
+		_node_records(w, n, ob, &recs)
+		for k, st in recs {
+			if k.device != n.identity.id || st != .Live {
+				continue
+			}
+			for x in ranges {
+				if k.off >= x[0] && k.off < x[1] {
+					world_fail(w, "device redaction: %s holds live record %d of its own %v %s inside a redaction the relay recorded", n.name, k.off, ob.kind, id_short(ob.o.id))
+				}
+			}
+		}
+	}
+}
+
+@(init)
+_own_redaction_hooks :: proc "contextless" () {
+	register_restarted(70, check_own_redactions, false)
+}

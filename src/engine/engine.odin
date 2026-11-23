@@ -143,6 +143,7 @@ Event_Kind :: enum u8 {
 	Lease_Lapsed,
 	Space_Left,
 	Line_Switched,
+	Replica_Redacted,
 }
 
 Event :: struct {
