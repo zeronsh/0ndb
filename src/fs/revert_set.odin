@@ -75,10 +75,10 @@ set_classify :: proc(data: rawptr, lv: crdt.Lv) -> crdt.Revert_Class {
 	return .In if actor in c.set else .Out
 }
 
-mount_revert_set :: proc(m: ^Mount, base: Version, actors: []prim.Id) -> (revert: prim.Id, err: Error) {
+mount_revert_set :: proc(m: ^Mount, base: Version, actors: []prim.Id, undo: prim.Id = {}) -> (revert: prim.Id, err: Error) {
 	mount_sync(m) or_return
 	h := m.history
-	revert = history_revert_set(h, m.line, base, m.synced[:], actors) or_return
+	revert = history_revert_set(h, m.line, base, m.synced[:], actors, undo) or_return
 	if revert == {} {
 		return
 	}
@@ -112,7 +112,27 @@ revert_parents :: proc(h: ^History, revert: prim.Id, allocator := context.alloca
 	return crdt.graph_version_ids(&h.g, ps, allocator), .None
 }
 
-history_revert_set :: proc(h: ^History, line: string, base: Version, current: Version, actors: []prim.Id) -> (revert: prim.Id, err: Error) {
+history_undo_revert :: proc(h: ^History, current: Version, undo: prim.Id) -> (revert: prim.Id, found: bool, err: Error) {
+	history_ready(h) or_return
+	list, ok := kv_get(&h.kv, revert_key("ru:", undo), context.temp_allocator) or_return
+	if !ok {
+		return {}, false, .None
+	}
+	cl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, current, &cl) != .None {
+		return {}, false, .Not_Found
+	}
+	for i := 0; i + 16 <= len(list); i += 16 {
+		id: prim.Id
+		copy(id[:], list[i:][:16])
+		if actor_bound(h, cl[:], id) > 0 {
+			return id, true, .None
+		}
+	}
+	return {}, false, .None
+}
+
+history_revert_set :: proc(h: ^History, line: string, base: Version, current: Version, actors: []prim.Id, undo: prim.Id = {}) -> (revert: prim.Id, err: Error) {
 	history_ready(h) or_return
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
@@ -167,7 +187,7 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 		return {}, .None
 	}
 	marker := make([dynamic]u8, context.temp_allocator)
-	fshist.encode_revert(&marker, fshist.Revert_Op{base = base, actors = actors, conflicts = conflicts[:]})
+	fshist.encode_revert(&marker, fshist.Revert_Op{base = base, actors = actors, conflicts = conflicts[:], undo = undo})
 	builder_opaque(&b, marker[:])
 	batch := crdt.Batch {
 		actor   = b.actor,

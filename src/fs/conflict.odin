@@ -53,6 +53,22 @@ revert_index :: proc(h: ^History, actor: prim.Id, content: []u8) -> Error {
 		kv_put(&h.kv, transmute([]u8)string(REVERT_LIST), lb[:]) or_return
 	}
 	kv_put(&h.kv, revert_key("rv:", actor), content) or_return
+	if o.undo != {} {
+		list, _ := kv_get(&h.kv, revert_key("ru:", o.undo), context.temp_allocator) or_return
+		seen := false
+		for i := 0; i + 16 <= len(list); i += 16 {
+			id: prim.Id
+			copy(id[:], list[i:][:16])
+			seen ||= id == actor
+		}
+		if !seen {
+			lb := make([dynamic]u8, 0, len(list) + 16, context.temp_allocator)
+			append(&lb, ..list)
+			x := actor
+			append(&lb, ..x[:])
+			kv_put(&h.kv, revert_key("ru:", o.undo), lb[:]) or_return
+		}
+	}
 	for a in o.actors {
 		if _, known := kv_get(&h.kv, revert_key("rv:", a), context.temp_allocator) or_return; known {
 			kv_put(&h.kv, revert_key("rx:", a), []u8{1}) or_return

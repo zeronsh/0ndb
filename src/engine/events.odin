@@ -507,7 +507,13 @@ _delta_convo :: proc(e: ^Engine, s: ^Sub, h: ^Handle, vs: int, device: prim.Id, 
 		d.kind = .Mount
 		d.text = _tmp_bytes(transmute([]u8)b.name)
 		d.removed = true
-	case convo.Fork, convo.Remember, convo.Forks, convo.Compact, convo.Scope, convo.Recorded, convo.Spine, convo.Files, convo.Redact_Msg:
+	case convo.Undo:
+		d.kind = .Run
+		d.msg = _resolve_rid(h, vs, b.msg) or_return
+	case convo.Undone:
+		d.kind = .Run
+		d.msg = _resolve_rid(h, vs, b.msg) or_return
+	case convo.Fork, convo.Remember, convo.Forks, convo.Compact, convo.Scope, convo.Recorded, convo.Spine, convo.Files, convo.Redact_Msg, convo.Notice:
 		d.kind = .Record
 	case:
 		d.kind = .Record

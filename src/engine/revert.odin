@@ -3,14 +3,14 @@ package engine
 import "../fs"
 import "../prim"
 
-tree_revert_set :: proc(e: ^Engine, o: Object, base: fs.Version, actors: []prim.Id, line := "") -> (revert: prim.Id, err: Error) {
+tree_revert_set :: proc(e: ^Engine, o: Object, base: fs.Version, actors: []prim.Id, line := "", undo: prim.Id = {}) -> (revert: prim.Id, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_handle_create_writer(h) or_return
 	_hist_catch_up(e, h)
 	at := _tree_at(e, h, line, nil) or_return
 	cur := at.version if !at.head else fs.history_heads(h.hist, context.temp_allocator)
-	r, ferr := fs.history_revert_set(h.hist, at.line, base, cur, actors)
+	r, ferr := fs.history_revert_set(h.hist, at.line, base, cur, actors, undo)
 	if ferr != .None {
 		return {}, _ferr(ferr)
 	}
@@ -42,4 +42,18 @@ tree_version :: proc(e: ^Engine, o: Object, line := "", allocator := context.all
 	out := make(fs.Version, len(cur), allocator)
 	copy(out, cur)
 	return out, .None
+}
+
+tree_undo_revert :: proc(e: ^Engine, o: Object, undo: prim.Id, line := "") -> (revert: prim.Id, found: bool, err: Error) {
+	context = context_for(e)
+	h := _handle_get(e, o, .File_Tree) or_return
+	_hist_ready(e, h) or_return
+	_hist_catch_up(e, h)
+	at := _tree_at(e, h, line, nil) or_return
+	cur := at.version if !at.head else fs.history_heads(h.hist, context.temp_allocator)
+	r, ok, ferr := fs.history_undo_revert(h.hist, cur, undo)
+	if ferr != .None {
+		return {}, false, _ferr(ferr)
+	}
+	return r, ok, .None
 }
