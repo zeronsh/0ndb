@@ -180,7 +180,9 @@ _rlog_pend_record :: proc(e: ^Engine, op: u8, k: [32]u8) {
 	kk := k
 	copy(b[1:], kk[:])
 	if _, err := journal.journal_append(&e.rlog.j, b[:]); err != .None {
-		_fatal(e, _jerr(err))
+		if !_storage_soft(e, _jerr(err), "the registry log could not be written: the disk is full or failing") {
+			_fatal(e, _jerr(err))
+		}
 		return
 	}
 	e.rlog.records += 1
@@ -189,7 +191,9 @@ _rlog_pend_record :: proc(e: ^Engine, op: u8, k: [32]u8) {
 @(private)
 _rlog_commit :: proc(e: ^Engine) {
 	if err := journal.journal_commit(&e.rlog.j); err != .None {
-		_fatal(e, _jerr(err))
+		if !_storage_soft(e, _jerr(err), "the registry log could not be written: the disk is full or failing; it is retried") {
+			_fatal(e, _jerr(err))
+		}
 	}
 }
 
@@ -379,7 +383,9 @@ _rlog_settle :: proc(e: ^Engine, closing: bool) {
 		b[1] = u8(len(key))
 		n := 2 + copy(b[2:], key)
 		if _, err := journal.journal_append(&l.j, b[:n]); err != .None {
-			_fatal(e, _jerr(err))
+			if !_storage_soft(e, _jerr(err), "the registry log could not be written: the disk is full or failing") {
+				_fatal(e, _jerr(err))
+			}
 			return
 		}
 		l.records += 1
