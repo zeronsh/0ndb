@@ -582,7 +582,7 @@ replicator_durable :: proc(r: ^Replicator) {
 			continue
 		}
 		l := r.locals[mk3_]
-		if l.cursor < l.durable && l.inflight == 0 && !l.fatal && !l.blocked && !l.retry && !l.verifying && l.ahead == 0 && !l.dropping {
+		if !l.fatal && (l.floor < l.cursor || (l.cursor < l.durable && l.inflight == 0 && !l.blocked && !l.retry && !l.verifying && l.ahead == 0 && !l.dropping)) {
 			append(&list, l)
 		}
 	}
@@ -974,7 +974,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 
 @(private)
 _local_maybe_free :: proc(r: ^Replicator, l: ^Local) {
-	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || r.rx_local == l {
+	if l.fatal || l.inflight > 0 || l.verifying || l.repairing || l.recheck >= 0 || l.retry || l.ahead > 0 || l.dropping || l.cursor < l.durable || l.floor < l.cursor || r.rx_local == l {
 		return
 	}
 	if r.hold > 0 {
@@ -1002,6 +1002,12 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 	if l.superseded {
 		_local_maybe_free(r, l)
 		return
+	}
+	if !l.fatal && l.floor < l.cursor {
+		if err := _local_floor(r, l); err != .None {
+			_local_fatal(r, l, err, -1)
+			return
+		}
 	}
 	if l.recheck >= 0 && r.phase == .Ready && !l.fatal && !l.repairing && l.inflight == 0 && !l.verifying && l.ahead == 0 && !_tree_missing(l) {
 		_local_recheck_start(r, l)
@@ -1114,13 +1120,30 @@ _tree_missing :: proc "contextless" (l: ^Local) -> bool {
 @(private)
 _local_advance :: proc(r: ^Replicator, l: ^Local, to: i64) -> Error {
 	l.cursor = to
-	if to > l.floor {
-		seq := l.floor_seq + 1
-		slot_write(r.vfs, l.floor_fd, Slot{seq = seq, value = to, start = 0}) or_return
-		_from_prim(prim.sync_owed(r.vfs, l.floor_fd, &l.floor_owed)) or_return
-		l.floor = to
-		l.floor_seq = seq
+	if to <= l.floor {
+		_emit(r, Repl_Event{kind = .Uploaded, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, length = to})
+		return .None
 	}
+	return _local_floor(r, l)
+}
+
+@(private)
+_local_floor :: proc(r: ^Replicator, l: ^Local) -> Error {
+	to := l.cursor
+	if to <= l.floor {
+		return .None
+	}
+	seq := l.floor_seq + 1
+	err := slot_write(r.vfs, l.floor_fd, Slot{seq = seq, value = to, start = 0})
+	if err == .None {
+		err = _from_prim(prim.sync_owed(r.vfs, l.floor_fd, &l.floor_owed))
+	}
+	if err == .Would_Block || err == .Busy {
+		return .None
+	}
+	err or_return
+	l.floor = to
+	l.floor_seq = seq
 	_emit(r, Repl_Event{kind = .Uploaded, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id, length = to})
 	return .None
 }
