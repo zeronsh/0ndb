@@ -711,7 +711,14 @@ mount_close :: proc(m: ^Mount) {
 
 mount_wake :: proc(m: ^Mount) -> Error {
 	if m.awake {
-		return .None
+		if m.history == nil {
+			return .None
+		}
+		err := history_ready(m.history)
+		if err == .Reloading {
+			mount_schedule(m, m.opts.settle_ms)
+		}
+		return err
 	}
 	sp, _ := path_join(m.dir, "shadow", context.temp_allocator)
 	format := m.db.format if m.db != nil else odb.Hash_Format.Sha1
@@ -729,9 +736,12 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		return err
 	}
 	if m.history != nil {
-		if err := history_wake(m.history); err != .None {
+		if err := history_ready(m.history); err != .None {
 			ignore_destroy(&m.ignore)
 			shadow_detach(&m.shadow)
+			if err == .Reloading {
+				mount_schedule(m, m.opts.settle_ms)
+			}
 			return err
 		}
 	}
@@ -1110,6 +1120,9 @@ mount_run :: proc(m: ^Mount) -> Error {
 	err := mount_pass(m, false, !fence)
 	if err == .None {
 		err = mount_materialize(m)
+	}
+	if err == .Reloading {
+		mount_schedule(m, m.opts.settle_ms)
 	}
 	if fence {
 		i := 0

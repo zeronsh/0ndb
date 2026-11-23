@@ -420,6 +420,9 @@ pipe_stage_a :: proc(p: ^Pipe, c: ^Pipe_Chunk) -> Error {
 		clear(&m.synced)
 		append(&m.synced, crdt.Op_Id{m.actor, c.seq0 + u64(c.n) - 1})
 		sync.mutex_unlock(&p.state)
+		if history_reloading(h) {
+			return .Reloading
+		}
 	}
 	history_trim(h)
 	return .None
