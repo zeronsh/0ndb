@@ -112,6 +112,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	prev_snap, prev_version := attr_set_checkout(m, new_clone(snap, context.temp_allocator), tl[:])
 	defer attr_set_checkout(m, prev_snap, prev_version)
 	displaced_touch(m, &snap, &touched) or_return
+	moved_ancestors_touch(h, &snap, sl[:], &touched) or_return
 	for c in m.collided {
 		if ino, ok, lerr := fstree.lookup(&snap, c); lerr == nil && ok {
 			touched[ino] = true
@@ -617,6 +618,54 @@ from_prim_fd :: proc "contextless" (fd: prim.Fd, e: prim.Error) -> (prim.Fd, Err
 }
 
 @(private)
+moved_ancestors_touch :: proc(h: ^History, snap: ^fstree.Snapshot, sl: []crdt.Lv, touched: ^map[fstree.Inode_Id]bool) -> Error {
+	if len(touched) == 0 {
+		return .None
+	}
+	ssnap := version_snapshot(h, sl) or_return
+	defer fstree.snapshot_destroy(&ssnap)
+	work := make([dynamic]fstree.Inode_Id, context.temp_allocator)
+	for ino in touched {
+		append(&work, ino)
+	}
+	up :: proc(s: ^fstree.Snapshot, from: fstree.Inode_Id, touched: ^map[fstree.Inode_Id]bool) -> Error {
+		cur := from
+		for _ in 0 ..< fstree.MAX_DEPTH {
+			if cur == fstree.ROOT {
+				return .None
+			}
+			touched[cur] = true
+			info, ok, ierr := fstree.info(s, cur, context.temp_allocator)
+			if ierr != nil {
+				return .Corrupt
+			}
+			if !ok {
+				return .None
+			}
+			cur = info.parent
+		}
+		return .None
+	}
+	for ino in work {
+		ti, tok, terr := fstree.info(snap, ino, context.temp_allocator)
+		si, sok, serr := fstree.info(&ssnap, ino, context.temp_allocator)
+		if terr != nil || serr != nil {
+			return .Corrupt
+		}
+		if tok && sok && ti.parent == si.parent && ti.name == si.name {
+			continue
+		}
+		if tok {
+			up(snap, ti.parent, touched) or_return
+		}
+		if sok {
+			up(&ssnap, si.parent, touched) or_return
+		}
+	}
+	return .None
+}
+
+@(private)
 displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.Inode_Id]bool) -> Error {
 	work := make([dynamic]fstree.Inode_Id, context.temp_allocator)
 	for ino in touched {
@@ -925,6 +974,11 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 				return .None
 			}
 			mount_mark(m, it.path)
+			return .None
+		}
+	} else if !it.has_old {
+		if occ, found := shadow_get(&m.shadow, it.path) or_return; found && occ.inode != it.inode {
+			mat_raced(m)
 			return .None
 		}
 	}
