@@ -245,7 +245,7 @@ mount_restore :: proc(m: ^Mount, target: Version, owner: prim.Id) -> Error {
 	if b.n == 0 {
 		return .None
 	}
-	history_register_actor(h, ractor, pseudo) or_return
+	history_register_owned_actor(h, ractor, pseudo, owner) or_return
 	before := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
 	copy(before, m.synced[:])
 	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
