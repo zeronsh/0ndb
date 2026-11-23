@@ -569,11 +569,12 @@ _serve_replica :: proc(r: ^Replicator, q: Serve_Req) -> bool {
 	rep: ^journal.Replica
 	tmp: journal.Replica
 	opened := false
+	pbuf: prim.Path_Buf = ---
+	path: string
 	if rm, ok := r.remotes[q.id]; ok {
 		rep = &rm.rep
 	} else {
-		pbuf: prim.Path_Buf = ---
-		path := _replica_path(r, &pbuf, q.id)
+		path = _replica_path(r, &pbuf, q.id)
 		if !prim.exists(r.vfs, path) {
 			return false
 		}
@@ -587,6 +588,9 @@ _serve_replica :: proc(r: ^Replicator, q: Serve_Req) -> bool {
 		journal.replica_close(&tmp)
 	}
 	if !journal.replica_covers(rep, q.from, q.to) {
+		return false
+	}
+	if journal.replica_held(rep, q.from, q.to) || (opened && _pending_overlaps(r, path, q.from, q.to)) {
 		return false
 	}
 	buf, aerr := make([]u8, int(q.to - q.from), context.temp_allocator)

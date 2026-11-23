@@ -2708,7 +2708,17 @@ Client to relay:
   redacted form. A device that zero-fills its replica of another device's
   segment for a redaction it learned of emits `Replica_Redacted` (object,
   writer, range in `tick`..`length`); from then on no replica on it holds
-  that range unredacted.
+  that range unredacted. The event means the bytes are gone, never that the
+  zero-fill is only queued. A redaction a device cannot apply yet (the
+  writer's keys are not known, so signature records cannot be told apart)
+  or whose zero-fill fails is queued durably next to the replica (the queue
+  write's errors are not swallowed) and the call reports `Pending`; the
+  queued range is held: the replica's reader returns it as `Redacted`, a
+  serve to a peer and a promotion fill of it are refused, and a queue that
+  cannot be read holds the whole replica. The queue is applied the moment
+  the keys arrive (`replicator_keys_ready`) and whenever the replica opens.
+  A feed announcement whose redaction is neither applied nor durably queued
+  does not advance the feed cursor, so it is delivered again.
 - `Pull` (0x13, 72 bytes): `holder:device, tag:u64, segment, from:u64,
   to:u64`. `segment` may also be a content object's (part) key; the relay
   does not distinguish the two and the holder resolves it, so the object

@@ -208,11 +208,51 @@ replicator_zero_replica :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id
 		return .None
 	}
 	keys, known := _remote_keys(r, rm)
-	if !known {
-		_pending_add(r, rm.path, from, hi)
-		return .None
+	return _replica_erase(r, &rm.rep, rm.path, keys, known, from, hi)
+}
+
+@(private)
+_replica_erase :: proc(r: ^Replicator, rep: ^journal.Replica, path: string, keys: journal.Key_Provider, known: bool, from, to: i64) -> Error {
+	if known {
+		if e := journal.replica_redact(rep, from, to, keys); e == .None || e == .Missing {
+			journal.replica_release(rep, from, to)
+			return .None
+		}
 	}
-	return _from_journal(journal.replica_redact(&rm.rep, from, hi, keys))
+	journal.replica_hold(rep, from, to)
+	_pending_add(r, path, from, to) or_return
+	return .Pending
+}
+
+replicator_redaction_pending :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, from, to: i64) -> bool {
+	_enter(r)
+	defer _leave(r)
+	id := stream_id(scope, device, name, epoch)
+	if rm, ok := r.remotes[id]; ok {
+		return journal.replica_held(&rm.rep, from, to)
+	}
+	pbuf: prim.Path_Buf = ---
+	return _pending_overlaps(r, _replica_path(r, &pbuf, id), from, to)
+}
+
+@(private)
+_pending_overlaps :: proc(r: ^Replicator, replica_path: string, from, to: i64) -> bool {
+	pbuf: prim.Path_Buf = ---
+	data, err := prim.read_file(r.vfs, _pending_path(&pbuf, replica_path), context.temp_allocator)
+	if err == .Not_Found {
+		return false
+	}
+	if err != .None {
+		return true
+	}
+	for i := 0; i + 16 <= len(data); i += 16 {
+		lo := i64(prim.get_u64le(data[i:]))
+		hi := i64(prim.get_u64le(data[i + 8:]))
+		if lo < to && hi > from {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -241,21 +281,25 @@ _pending_path :: proc(buf: ^prim.Path_Buf, replica_path: string) -> string {
 }
 
 @(private)
-_pending_add :: proc(r: ^Replicator, replica_path: string, from, to: i64) {
+_pending_add :: proc(r: ^Replicator, replica_path: string, from, to: i64) -> Error {
 	pbuf: prim.Path_Buf = ---
 	path := _pending_path(&pbuf, replica_path)
 	fd, err := prim.open_file(r.vfs, path, {.Write, .Create}, 0o600)
 	if err != .None {
-		return
+		return _from_prim(err)
 	}
 	defer prim.close_file(r.vfs, fd)
-	size, _ := prim.file_size(r.vfs, fd)
+	size, serr := prim.file_size(r.vfs, fd)
+	if serr != .None {
+		return _from_prim(serr)
+	}
 	rec: [16]u8
 	prim.put_u64le(rec[0:8], u64(from))
 	prim.put_u64le(rec[8:16], u64(to))
-	if prim.write_at(r.vfs, fd, rec[:], size - size % 16) == .None {
-		prim.datasync(r.vfs, fd)
+	if werr := prim.write_at(r.vfs, fd, rec[:], size - size % 16); werr != .None {
+		return _from_prim(werr)
 	}
+	return _from_prim(prim.datasync(r.vfs, fd))
 }
 
 @(private)
@@ -263,25 +307,35 @@ _pending_apply :: proc(r: ^Replicator, rm: ^Remote) {
 	pbuf: prim.Path_Buf = ---
 	path := _pending_path(&pbuf, rm.path)
 	data, err := prim.read_file(r.vfs, path, context.temp_allocator)
+	if err == .Not_Found {
+		return
+	}
 	if err != .None {
+		journal.replica_hold(&rm.rep, 0, max(i64))
 		return
 	}
+	journal.replica_release(&rm.rep, 0, max(i64))
 	keys, known := _remote_keys(r, rm)
-	if !known {
-		return
-	}
 	done := true
 	for i := 0; i + 16 <= len(data); i += 16 {
 		from := i64(prim.get_u64le(data[i:]))
-		to := min(i64(prim.get_u64le(data[i + 8:])), journal.replica_length(&rm.rep))
-		if to > from && from >= 0 {
-			if e := journal.replica_redact(&rm.rep, from, to, keys); e != .None && e != .Missing {
-				done = false
+		upto := i64(prim.get_u64le(data[i + 8:]))
+		to := min(upto, journal.replica_length(&rm.rep))
+		if from < 0 || upto <= from {
+			continue
+		}
+		if known && to > from {
+			if e := journal.replica_redact(&rm.rep, from, to, keys); e == .None || e == .Missing {
+				continue
 			}
 		}
+		if to > from {
+			journal.replica_hold(&rm.rep, from, upto)
+			done = false
+		}
 	}
-	if done {
-		prim.remove(r.vfs, path)
+	if done && prim.remove(r.vfs, path) != .None {
+		journal.replica_hold(&rm.rep, 0, max(i64))
 	}
 }
 
@@ -582,6 +636,7 @@ _relay_tag :: proc(r: ^Replicator) -> i64 {
 _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 	red_id: Stream_Id
 	red_from := i64(-1)
+	applied := true
 	for i in 0 ..< listing_count(ev) {
 		e := ev.entries[i * FEED_ENTRY:][:FEED_ENTRY]
 		id: Stream_Id
@@ -591,7 +646,9 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 			if !end {
 				red_id, red_from = id, at
 			} else if red_from >= 0 && red_id == id {
-				_replica_redacted(r, id, red_from, at)
+				if !_replica_redacted(r, id, red_from, at) {
+					applied = false
+				}
 				red_from = -1
 			}
 			continue
@@ -615,7 +672,7 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 			_remote_pull(r, rm)
 		}
 	}
-	if ev.length > r.feed_cursor {
+	if applied && ev.length > r.feed_cursor {
 		r.feed_cursor = ev.length
 		if r.feed_fd >= 0 {
 			r.feed_seq += 1
@@ -626,10 +683,10 @@ _on_announce :: proc(r: ^Replicator, ev: ^Event) {
 }
 
 @(private)
-_replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
+_replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) -> bool {
 	dev := stream_device(id)
 	if to <= from {
-		return
+		return true
 	}
 	if dev == r.cfg.self {
 		ev := Repl_Event{kind = .Local_Redacted, device = dev, stream = id, from = from, to = to}
@@ -637,38 +694,36 @@ _replica_redacted :: proc(r: ^Replicator, id: Stream_Id, from, to: i64) {
 			ev.name, ev.epoch = l.name, l.epoch
 		}
 		_emit(r, ev)
-		return
+		return true
 	}
 	if rm, ok := r.remotes[id]; ok {
 		hi := min(to, journal.replica_length(&rm.rep))
 		if hi > from {
 			keys, known := _remote_keys(r, rm)
-			if !known {
-				_pending_add(r, rm.path, from, hi)
-			} else if e := journal.replica_redact(&rm.rep, from, hi, keys); e != .None && e != .Missing {
-				_pending_add(r, rm.path, from, hi)
+			if e := _replica_erase(r, &rm.rep, rm.path, keys, known, from, hi); e != .None && e != .Pending {
+				return false
 			}
 		}
 		_emit(r, Repl_Event{kind = .Redacted, device = rm.device, name = rm.name, epoch = rm.epoch, stream = id, from = from, to = to})
-		return
+		return true
 	}
 	pbuf: prim.Path_Buf = ---
 	path := _replica_path(r, &pbuf, id)
 	if _, serr := prim.stat(r.vfs, path); serr != .None {
-		return
+		return serr == .Not_Found
 	}
 	rep: journal.Replica
 	if journal.replica_open(&rep, r.vfs, path, r.allocator) != .None {
-		return
+		return false
 	}
 	hi := min(to, journal.replica_length(&rep))
-	if hi > from {
-		if e := journal.replica_redact(&rep, from, hi, {}); e != .None && e != .Missing {
-			_pending_add(r, path, from, hi)
-		}
-	}
+	e := _replica_erase(r, &rep, path, {}, true, from, hi) if hi > from else Error.None
 	journal.replica_close(&rep)
+	if e != .None && e != .Pending {
+		return false
+	}
 	_emit(r, Repl_Event{kind = .Redacted, device = dev, stream = id, from = from, to = to})
+	return true
 }
 
 @(private)

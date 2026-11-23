@@ -80,6 +80,7 @@ node_start :: proc(n: ^Node) -> bool {
 	}}
 	cfg.watcher = sim_watcher(n)
 	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail}
+	cfg.redact_fault = eng.Redact_Fault{data = n, withhold = _redact_withhold, learned = _redact_learned}
 	cfg.embedder = sim_embedder()
 	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
 		return {}
@@ -220,8 +221,8 @@ node_crashed :: proc(n: ^Node) {
 	n.disk.dead = false
 	if mode == .Power {
 		n.boot += 1
-		_learned_drop(n)
 	}
+	_learned_drop(n)
 	world_note(w, "%s crashed at disk op %d (%v)", n.name, n.disk.stats.ops, mode)
 	w.stats.crashes += 1
 	promos_crashed(w, n)
@@ -238,8 +239,8 @@ node_crash_now :: proc(n: ^Node, mode: Crash_Mode, salt: u64) {
 	n.disk.dead = false
 	if mode == .Power {
 		n.boot += 1
-		_learned_drop(n)
 	}
+	_learned_drop(n)
 	world_note(w, "%s crashed right after returning a message id (%v)", n.name, mode)
 	w.stats.crashes += 1
 	promos_crashed(w, n)
@@ -406,6 +407,10 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 		sid, known := learned_stream(w, n, ev.space, ev.object, ev.device)
 		append(&n.learned, Learned_Redaction{object = ev.object, device = ev.device, from = i64(ev.tick), to = ev.length, seq = eng.pending_seq(e), stream = sid, known = known})
 		stat_add(w, STAT_LEARNED)
+		if !n.learn_check {
+			n.learn_check = true
+			schedule(w, Sim_Event{at = w.now, kind = EV_LEARN_CHECK, node = n.idx})
+		}
 		world_note(w, "%s learned redaction of %s@[%d,%d) in %s", n.name, id_short(ev.device), i64(ev.tick), ev.length, id_short(ev.object))
 	case .Quarantined:
 		append(&w.quarantines, Quarantine{node = n.idx, object = ev.object})
@@ -742,6 +747,34 @@ STAT_TIER_PARKS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
 STAT_PERSIST_FAULTS: Stat
+STAT_REDACT_FAULTS: Stat
+EV_LEARN_CHECK: Ev_Kind
+
+_redact_learned :: proc(data: rawptr, space, object, device: prim.Id, from, to: i64, applied, pending: bool) {
+	n := (^Node)(data)
+	if applied && pending {
+		world_fail(n.w, "device redaction: %s reported a redaction learned while it is only queued, its bytes still live in the replica", n.name)
+	}
+	if !applied && pending {
+		sid, known := learned_stream(n.w, n, space, object, device)
+		append(&n.held, Learned_Redaction{object = object, device = device, from = from, to = to, stream = sid, known = known})
+	}
+}
+
+_redact_withhold :: proc(data: rawptr) -> bool {
+	n := (^Node)(data)
+	w := n.w
+	if !w.cfg.redact_fault || n.disk.dead || n.redact_faulted || !rng_chance(&w.fault_rng, 1, 2) {
+		return false
+	}
+	n.redact_faulted = true
+	if n.disk.crash_at == 0 {
+		n.disk.crash_at = n.disk.stats.ops + 1 + u64(rng_range(&w.fault_rng, 0, 200))
+	}
+	stat_add(w, STAT_REDACT_FAULTS)
+	world_note(w, "%s keys withheld while applying a learned redaction; crash armed at disk op %d", n.name, n.disk.crash_at)
+	return true
+}
 STAT_GHOST_TAILS: Stat
 
 _persist_fail :: proc(data: rawptr) -> bool {
@@ -779,6 +812,14 @@ _node_stats :: proc "contextless" () {
 	register_stat_line(40)
 	register_stat_line(45)
 	STAT_PERSIST_FAULTS = register_stat(45, 0, "history_persist_faults")
+	STAT_REDACT_FAULTS = register_stat(45, 2, "redact_key_faults")
+	EV_LEARN_CHECK = register_event(proc(w: ^World, ev: ^Sim_Event) {
+		n := w.nodes[ev.node]
+		n.learn_check = false
+		if n.alive && n.e_open && !n.disk.dead {
+			check_learned_redactions(w, n)
+		}
+	})
 	STAT_GHOST_TAILS = register_stat(45, 1, "ghost_tails")
 	STAT_TIER_EVICTIONS = register_stat(40, 0, "relay_evictions")
 	STAT_TIER_COLD_READS = register_stat(40, 1, "relay_cold_reads")
@@ -804,6 +845,7 @@ _learned_drop :: proc(n: ^Node) {
 		}
 	}
 	resize(&n.learned, k)
+	clear(&n.held)
 }
 
 @(private = "file")
@@ -818,6 +860,12 @@ _relay_redacted_in :: proc(data: rawptr, sender: osync.Device_Id, space: osync.S
 			if l.known && l.stream == id && l.from < to && l.to > from {
 				sid := id
 				world_fail(w, "device redaction: %s sent bytes of %x [%d,%d) to the relay after learning of its redaction", n.name, sid[:4], from, to)
+			}
+		}
+		for l in n.held {
+			if l.known && l.stream == id && l.from < to && l.to > from {
+				sid := id
+				world_fail(w, "device redaction: %s sent bytes of %x [%d,%d) to the relay while their redaction was queued", n.name, sid[:4], from, to)
 			}
 		}
 	}

@@ -680,7 +680,13 @@ _relay_redacted_event :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, f
 	}
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
-	if osync.replicator_zero_replica(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to) == .None {
+	sp.redacting = true
+	zerr := osync.replicator_zero_replica(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to)
+	sp.redacting = false
+	if f := e.cfg.redact_fault; f.learned != nil && (zerr == .None || zerr == .Pending) {
+		f.learned(f.data, sp.id, id, device, from, to, zerr == .None, osync.replicator_redaction_pending(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to))
+	}
+	if zerr == .None {
 		_emit(e, Event{kind = .Replica_Redacted, space = sp.id, object = id, device = device, tick = u64(from), length = to})
 	}
 	_relay_zeroed(e, sp, id, kind, device, from, to)

@@ -804,6 +804,9 @@ _repl_keys :: proc(user: rawptr, device: prim.Id, name: string, epoch: u64, stre
 	if _, _, ok := _object_of_name(name); !ok {
 		return .Stream_Key, {}
 	}
+	if f := sp.e.cfg.redact_fault; sp.redacting && f.withhold != nil && f.withhold(f.data) {
+		return .Unknown, {}
+	}
 	rt, found := sp.remote_trees[stream]
 	if !found || !rt.loaded {
 		return .Unknown, {}
