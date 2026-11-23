@@ -51,12 +51,17 @@ BUILD=$( { build sim.bin tests/sim -build-mode:test &
 if [ -n "$BUILD" ]; then note "build: FAIL $BUILD"; cat "$OUT/summary"; exit 1; fi
 note "build: ok"
 
+ok_run() {
+	echo "$1" | grep -q "FATAL" && return 1
+	echo "$1" | grep -E "Finished [0-9]+ tests?" | tail -1 | grep -qE "All tests were successful|The test was successful"
+}
+
 lane() {
 	local name=$1 env=$2 from=$3 to=$4 f=0 msg=""
 	for s in $(seq "$from" "$to"); do
 		local o
 		o=$(env $env SIM_SEED=$s timeout 900 "$OUT/sim.bin" 2>&1)
-		if ! echo "$o" | grep -qE "All tests were successful|The test was successful"; then
+		if ! ok_run "$o"; then
 			f=$((f+1)); msg="$msg [$s: $(echo "$o" | grep -E 'trace: FAIL|panic|FATAL|Killed' | head -1 | sed 's/^ *//' | cut -c1-160)]"
 		fi
 	done
@@ -71,8 +76,8 @@ lane() {
 	lane wide "" 21 40 > "$OUT/l6" &
 	lane byzantine SIM_BYZANTINE=1 1 16 > "$OUT/l12" &
 	lane until-run SIM_STORAGE=until-run 21 40 > "$OUT/l13" &
-	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=6 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); echo "$r" | grep -qE "All tests were successful|The test was successful" || n=$((n+1)); echo "membership 1-6 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
-	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); echo "scenarios: $(echo "$r" | grep -E 'Finished [0-9]+ tests' | tail -1 | grep -q 'All tests were successful' && echo 0 || echo 1) failed $(echo "$r" | grep -E 'seed [0-9]+ FAILED|membership seed [0-9]+: |local_first.*FAIL|staged.*FAIL' | head -3 | tr '\n' ' ')" ) > "$OUT/l8" &
+	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=6 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); ok_run "$r" || n=$((n+1)); echo "membership 1-6 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
+	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); echo "scenarios: $(ok_run "$r" && echo 0 || echo 1) failed $(echo "$r" | grep -E 'seed [0-9]+ FAILED|membership seed [0-9]+: |local_first.*FAIL|staged.*FAIL|FATAL' | head -3 | tr '\n' ' ')" ) > "$OUT/l8" &
 	( r=$(timeout 900 "$OUT/cvg.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "convergence: $r" ) > "$OUT/l9" &
 	( r=$(timeout 900 "$OUT/fst.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "fstree: $r" ) > "$OUT/l10" &
 	( r=$(cd docs/relay-vectors && timeout 300 "$OUT/relayvec" check . 2>&1 | tail -1); echo "relay vectors: $r" ) > "$OUT/l11" &
