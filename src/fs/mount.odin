@@ -602,10 +602,8 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 			m.branch, _ = clone_string(branch_key(m, m.head, context.temp_allocator), allocator)
 		}
 		if len(m.switch_to) > 0 {
-			if m.switch_phase >= SWITCH_TARGET {
-				delete(m.line, allocator)
-				m.line, _ = clone_string(m.switch_to, allocator)
-			}
+			delete(m.line, allocator)
+			m.line, _ = clone_string(m.switch_to if m.switch_phase >= SWITCH_TARGET else m.switch_from, allocator)
 		} else if m.opts.follow_branch && m.line == m.home_line && m.branch != m.home_line {
 			delete(m.line, allocator)
 			m.line, _ = clone_string(m.branch, allocator)

@@ -84,7 +84,7 @@ _switch_probe :: proc(w: ^World, n: ^Node) {
 	}
 }
 
-switch_crash_run :: proc(seed: u64, crash_at: u64) -> (failures: [dynamic]string, outcome: Switch_Outcome, crashed: bool, probe: Switch_Probe) {
+switch_crash_run :: proc(seed: u64, crash_at: u64, back := false) -> (failures: [dynamic]string, outcome: Switch_Outcome, crashed: bool, probe: Switch_Probe) {
 	failures = make([dynamic]string)
 	_probe = &probe
 	defer _probe = nil
@@ -101,7 +101,7 @@ switch_crash_run :: proc(seed: u64, crash_at: u64) -> (failures: [dynamic]string
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	outcome, crashed = _switch_crash(w, crash_at)
+	outcome, crashed = _switch_crash(w, crash_at, back)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -111,7 +111,7 @@ switch_crash_run :: proc(seed: u64, crash_at: u64) -> (failures: [dynamic]string
 }
 
 @(private = "file")
-_switch_crash :: proc(w: ^World, crash_at: u64) -> (outcome: Switch_Outcome, crashed: bool) {
+_switch_crash :: proc(w: ^World, crash_at: u64, back: bool) -> (outcome: Switch_Outcome, crashed: bool) {
 	n := w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "switch: node start")
@@ -164,13 +164,40 @@ _switch_crash :: proc(w: ^World, crash_at: u64) -> (outcome: Switch_Outcome, cra
 		return
 	}
 	run_until(w, w.now + 2_000_000_000, true)
+	if back {
+		ferr: fs.Error
+		{
+			context = instance_context(&n.inst)
+			sm := n.mounts[len(n.mounts) - 1]
+			ferr = fs.mount_line_switch(sm.m, "git:refs/heads/feature")
+			node_after(n)
+		}
+		run_until(w, w.now + 20_000_000_000, true)
+		on: bool
+		{
+			context = instance_context(&n.inst)
+			sm := n.mounts[len(n.mounts) - 1]
+			_, pending := fs.mount_switch_pending(sm.m)
+			on = ferr == .None && !pending && fs.mount_line(sm.m) == "git:refs/heads/feature"
+			node_after(n)
+		}
+		if !on {
+			world_fail(w, "switch: the switch to feature before the one back did not complete: %v", ferr)
+			return
+		}
+		if err := _switch_write(vfs, SWITCH_ROOT + "/b.txt", transmute([]u8)string("feature b\nfeature dirty\n")); err != .None {
+			world_fail(w, "switch: dirty edit on feature: %v", err)
+			return
+		}
+		run_until(w, w.now + 2_000_000_000, true)
+	}
 	crashes := w.stats.crashes
 	n.disk.crash_at = n.disk.stats.ops + crash_at
 	serr: fs.Error
 	{
 		context = instance_context(&n.inst)
 		sm := n.mounts[len(n.mounts) - 1]
-		serr = fs.mount_line_switch(sm.m, "git:refs/heads/feature")
+		serr = fs.mount_line_switch(sm.m, "main" if back else "git:refs/heads/feature")
 		node_after(n)
 	}
 	if serr != .None && !n.disk.dead && w.stats.crashes == crashes {
@@ -230,13 +257,24 @@ _switch_crash :: proc(w: ^World, crash_at: u64) -> (outcome: Switch_Outcome, cra
 				world_fail(w, "switch: the index does not hold feature's %s", f.name)
 			}
 		}
-		outcome = .Switched
-	} else {
-		outcome = .Stayed
 	}
+	outcome = .Switched if on_feature != back else .Stayed
 	main_a, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
 	if !strings.contains(string(main_a), "main dirty") {
 		world_fail(w, "switch: main's uncommitted edit was rewound: a.txt on main is %q", string(main_a))
+	}
+	if back {
+		main_b, _ := eng.tree_read(&n.e, tree, "b.txt", context.temp_allocator, {}, "main")
+		if string(main_b) != "main b\n" {
+			world_fail(w, "switch: main's b.txt is %q after the switch back from feature, not main's own", string(main_b))
+		}
+		if _, cerr := eng.tree_read(&n.e, tree, "c.txt", context.temp_allocator, {}, "main"); cerr != .Not_Found {
+			world_fail(w, "switch: main holds feature's c.txt after the switch back (%v)", cerr)
+		}
+		feat_b, _ := eng.tree_read(&n.e, tree, "b.txt", context.temp_allocator, {}, "git:refs/heads/feature")
+		if string(feat_b) != "feature b\nfeature dirty\n" {
+			world_fail(w, "switch: feature's uncommitted edit is lost: b.txt on feature is %q", string(feat_b))
+		}
 	}
 	if !crashed {
 		outcome = .Completed
@@ -282,6 +320,36 @@ line_switch_crash :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, false, "line_switch_crash: the switch never completed without a crash")
+}
+
+@(test)
+line_switch_back_crash :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	stayed, switched := 0, 0
+	for k in u64(1) ..= 4000 {
+		failures, outcome, crashed, probe := switch_crash_run(1, k, true)
+		for f in failures {
+			fmt.eprintf("line_switch_back_crash at disk op %d: %s\n", k, f)
+			delete(f)
+		}
+		testing.expect(t, len(failures) == 0, fmt.tprintf("line_switch_back_crash at disk op %d failed", k))
+		delete(failures)
+		if !crashed {
+			fmt.eprintf("line_switch_back_crash: %d crash points, %d stayed on feature, %d rolled forward to main\n", k - 1, stayed, switched)
+			return
+		}
+		testing.expect(t, probe.seen, fmt.tprintf("line_switch_back_crash at disk op %d: the mount was not reopened", k))
+		if outcome == .Stayed {
+			stayed += 1
+		} else {
+			switched += 1
+		}
+	}
+	testing.expect(t, false, "line_switch_back_crash: the switch never completed without a crash")
 }
 
 @(private = "file")
