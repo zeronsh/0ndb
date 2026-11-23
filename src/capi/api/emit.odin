@@ -30,7 +30,7 @@ TAKEOVER_LEVEL_NAMES := [3]string{"conversation", "agent", "workspace"}
 RUNNER_KIND_NAMES := [2]string{"device", "pool"}
 ISOLATE_NAMES := [3]string{"unset", "true", "false"}
 RUNNER_STATE_NAMES := [3]string{"offline", "online", "wakeable"}
-EVENT_NAMES := [32]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed", "lease_lapsed", "space_left", "line_switched", "replica_redacted", "rename_offered"}
+EVENT_NAMES := [33]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed", "lease_lapsed", "space_left", "line_switched", "replica_redacted", "rename_offered", "redact_unreached"}
 
 event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 	switch kind {
@@ -78,6 +78,8 @@ event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 		return 30
 	case .Rename_Offered:
 		return 31
+	case .Redact_Unreached:
+		return 32
 	}
 	return u64(len(EVENT_NAMES))
 }

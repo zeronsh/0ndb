@@ -19,6 +19,9 @@ Redact_Stats :: struct {
 	commits_rewritten: int,
 	trees_rewritten:   int,
 	protected:         int,
+	pinned:            int,
+	left:              int,
+	unreached:         []Unreached,
 	repack:            Repack_Stats,
 }
 
@@ -147,9 +150,18 @@ Commit_Result :: struct {
 }
 
 redact :: proc(db: ^Odb, targets: []Oid, ref_prefix := "refs/0ndb/", protect: []Oid = nil, drop_superseded := true, allocator := context.allocator) -> (rewrites: []Rewrite, stats: Redact_Stats, err: Error) {
-	if len(targets) == 0 || len(db.dirs) == 0 || !strings.has_prefix(ref_prefix, "refs/") {
+	if len(targets) == 0 {
 		return nil, {}, .Invalid
 	}
+	return redact_run(db, targets, ref_prefix, protect, drop_superseded, nil, allocator)
+}
+
+@(private)
+redact_run :: proc(db: ^Odb, targets: []Oid, ref_prefix: string, protect: []Oid, drop_superseded: bool, superseded_in: []Oid, allocator: runtime.Allocator) -> (rewrites: []Rewrite, stats: Redact_Stats, err: Error) {
+	if len(db.dirs) == 0 || !strings.has_prefix(ref_prefix, "refs/") {
+		return nil, {}, .Invalid
+	}
+	scrub_note(db, targets, protect, superseded_in) or_return
 	a := db.allocator
 	target_set := make(map[Oid]struct{}, a)
 	defer delete(target_set)
@@ -196,6 +208,22 @@ redact :: proc(db: ^Odb, targets: []Oid, ref_prefix := "refs/0ndb/", protect: []
 			append(&out, Rewrite{old, res.oid})
 		}
 	}
+	superseded := make([dynamic]Oid, a)
+	defer delete(superseded)
+	append(&superseded, ..superseded_in)
+	if drop_superseded {
+		for old, res in r.commits {
+			if res.dropped || res.oid != old {
+				append(&superseded, old)
+			}
+		}
+		for old, res in r.trees {
+			if res.oid != old {
+				append(&superseded, old)
+			}
+		}
+	}
+	scrub_note(db, nil, nil, superseded[:]) or_return
 	barrier(db) or_return
 	for u in updates {
 		if u.remove {
@@ -233,13 +261,8 @@ redact :: proc(db: ^Odb, targets: []Oid, ref_prefix := "refs/0ndb/", protect: []
 			drop[t] = {}
 		}
 	}
-	for old, res in r.commits {
-		if drop_superseded && (res.dropped || res.oid != old) && old not_in reachable {
-			drop[old] = {}
-		}
-	}
-	for old, res in r.trees {
-		if drop_superseded && res.oid != old && old not_in reachable {
+	for old in superseded {
+		if old not_in reachable {
 			drop[old] = {}
 		}
 	}
@@ -247,6 +270,66 @@ redact :: proc(db: ^Odb, targets: []Oid, ref_prefix := "refs/0ndb/", protect: []
 		filter := Prune_Filter{drop = &drop}
 		stats.repack = repack_run(db, DEFAULT_REPACK, &filter) or_return
 	}
+	unreached := make([dynamic]Unreached, allocator)
+	left := 0
+	for oid in drop {
+		l, pinned := scrub_left(db, oid)
+		if l {
+			left += 1
+			if _, is_target := target_set[oid]; is_target {
+				append(&unreached, Unreached{oid = oid, reason = .Left})
+			}
+		} else if len(pinned) > 0 {
+			stats.pinned += 1
+			if _, is_target := target_set[oid]; is_target {
+				append(&unreached, Unreached{oid = oid, reason = .Pinned, place = strings.clone(pinned, allocator)})
+			}
+		}
+	}
+	held := make(map[Oid]struct{}, a)
+	defer delete(held)
+	for t in targets {
+		if t in reachable {
+			held[t] = {}
+		}
+	}
+	if len(held) > 0 {
+		named := make([dynamic]Named_Root, a)
+		defer delete(named)
+		for ref in refs {
+			if !strings.has_prefix(ref.name, ref_prefix) {
+				append(&named, Named_Root{ref.name, ref.oid})
+			}
+		}
+		if head, herr := read_ref(db, "HEAD"); herr == .None {
+			append(&named, Named_Root{"HEAD", head})
+		}
+		if !db.store {
+			logs := make([dynamic]Oid, a)
+			defer delete(logs)
+			if collect_reflog_roots(db, &logs) == .None {
+				for l in logs {
+					append(&named, Named_Root{"reflog", l})
+				}
+			}
+		}
+		reach_named(db, named[:], &held, .Protected, "", &unreached, allocator)
+		for oid in held {
+			append(&unreached, Unreached{oid = oid, reason = .Shared})
+		}
+	}
+	for d in db.dirs {
+		if d.extra {
+			reach_repository(db, d.path, targets, &unreached, allocator)
+		}
+	}
+	stats.unreached = unreached[:]
+	if left > 0 {
+		stats.left = left
+		return out[:], stats, .Io
+	}
+	barrier(db) or_return
+	scrub_done(db, targets, protect, superseded[:]) or_return
 	return out[:], stats, .None
 }
 

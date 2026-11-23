@@ -120,6 +120,7 @@ Disk :: struct {
 	force_process: bool,
 	force_ghost: bool,
 	ghost_root:  string,
+	fail_unlink: string,
 	lose_shrinks: bool,
 	dead:      bool,
 	fail_sync: u64,
@@ -1168,6 +1169,10 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	n := d.inodes[lk.ino]
 	if n.kind == .Dir {
 		return .Is_Dir
+	}
+	if len(d.fail_unlink) > 0 && strings.contains(path, d.fail_unlink) {
+		d.stats.injected += 1
+		return .Io
 	}
 	dir := d.inodes[lk.parent]
 	_freed_note(d, path, lk.ino)

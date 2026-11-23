@@ -1,6 +1,7 @@
 package engine
 
 import "core:crypto"
+import "core:fmt"
 import "../convo"
 import "../crdt"
 import "../fs"
@@ -14,6 +15,24 @@ import osync "../sync"
 
 @(private)
 ROOT_REDACT :: 4
+
+REDACT_REASON_NAMES := [odb.Unreached_Reason]string {
+	.Protected  = "protected",
+	.Shared     = "shared",
+	.Pinned     = "pinned",
+	.Repository = "repository",
+	.Left       = "left",
+}
+
+@(private)
+_redact_report :: proc(e: ^Engine, space, object: prim.Id, list: []odb.Unreached) {
+	for u in list {
+		hb, cb: [odb.MAX_HEX]u8
+		commit := odb.oid_to_string(u.commit, e.db.format, &cb) if u.commit != {} else ""
+		detail := fmt.tprintf("%s\n%s\n%s\n%s\n%s", REDACT_REASON_NAMES[u.reason], odb.oid_to_string(u.oid, e.db.format, &hb), u.ref, commit, u.place)
+		_emit(e, Event{kind = .Redact_Unreached, space = space, object = object, detail = detail})
+	}
+}
 
 text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	context = context_for(e)
@@ -224,6 +243,18 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 	if perr != .None {
 		return _oerr(perr)
 	}
+	oids := make([dynamic]odb.Oid, context.temp_allocator)
+	for b in m.blocks {
+		if b.is_ref && len(b.blob.oid) == 20 {
+			x: odb.Oid
+			copy(x[:], b.blob.oid)
+			append(&oids, x)
+		}
+	}
+	if len(oids) > 0 {
+		db := device_odb(e) or_return
+		_derr(odb.scrub_note(db, oids[:])) or_return
+	}
 	for r in plan {
 		_redact_intent(e, h, r.seg, r.from, r.to, msg.off) or_return
 	}
@@ -242,16 +273,12 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 			_relay_redact_add(e, h, r.seg, r.from, r.to)
 		}
 	}
-	oids := make([dynamic]odb.Oid, context.temp_allocator)
-	for b in m.blocks {
-		if b.is_ref && len(b.blob.oid) == 20 {
-			x: odb.Oid
-			copy(x[:], b.blob.oid)
-			append(&oids, x)
+	if len(oids) > 0 {
+		_, rstats, xerr := odb.redact(&e.db, oids[:], "refs/0ndb/", nil, true, context.temp_allocator)
+		_redact_report(e, h.sp.id, h.id, rstats.unreached)
+		if xerr != .None {
+			_log(e, .Warn, "a redacted blob is not yet gone from the object store; its scrub intent stays for the next open")
 		}
-	}
-	if len(oids) > 0 && e.db_open {
-		odb.redact(&e.db, oids[:], "refs/0ndb/", nil, true, context.temp_allocator)
 	}
 	_index_purge_message(e, h, Msg_Pos{msg.seg, msg.off})
 	_purge_message(e, h, msg, &m)
