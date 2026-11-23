@@ -2642,7 +2642,10 @@ Relay cost tracks the reachable information, not the activity. Items marked
   relay's `base` and nothing is uploaded twice. Offsets are the writer's, so
   ids never change. The relay never reads below `base`: reads, tails and
   follows are clamped and preceded by a `Hollow` frame with `base` and
-  `length`. Feed compaction keeps the hollow flag.
+  `length`. Feed compaction keeps the hollow flag. A full follower of a
+  based segment resumes from the end of the stored suffix it holds, not
+  from its contiguous prefix (which stops at the base), so a reconnect
+  never re-reads the suffix.
 - **Content uploads follow durability.** Each owned file tree keeps an upload
   mark and a target in the registry (`ROOT_OWNED`). When the batch holding
   tree records becomes durable the target rises to that length, whether or
