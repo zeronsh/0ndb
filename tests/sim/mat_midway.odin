@@ -32,9 +32,6 @@ _mm_write :: proc(vfs: prim.Vfs, path: string, data: string) -> prim.Error {
 }
 
 @(private = "file")
-SNAP_CRASH_UNTIL_DEFERRAL :: u64(341)
-
-@(private = "file")
 Mm_Mode :: enum u8 {
 	None,
 	Process,
@@ -419,7 +416,7 @@ materialize_midway :: proc(t: ^testing.T) {
 	}
 	points := 0
 	ks: for k := u64(1); k < 2000; k += 1 {
-		for j := u64(1); j < SNAP_CRASH_UNTIL_DEFERRAL; j += 1 {
+		for j := u64(1); j < 4000; j += 1 {
 			failed, failures, crashed := _mm_case(Mm_Case{seed = 1, k = k, mode = .Snap_Crash, j = j})
 			for f in failures {
 				fmt.eprintf("materialize_midway snapshot crash k %d op %d: %s\n", k, j, f)

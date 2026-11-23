@@ -402,6 +402,7 @@ Mount :: struct {
 	log_at:      i64,
 	saved:       u64,
 	saved_synced: [dynamic]crdt.Op_Id,
+	saved_jpos:  i64,
 	state_seq:   u64,
 	legacy:      bool,
 	lost:        bool,
@@ -643,7 +644,6 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	before := mount_jlen(m)
 	m.sweep_temps = true
 	rerr := mount_open_rest(m, fresh)
-	m.sweep_temps = false
 	if err := rerr; err != .None {
 		if mount_jlen(m) == before {
 			return err
@@ -670,7 +670,12 @@ mount_open_rest :: proc(m: ^Mount, fresh: bool) -> Error {
 		mount_pass(m, true) or_return
 	} else {
 		mount_recover(m) or_return
-		mount_pass(m, true) or_return
+		if perr := mount_pass(m, true); perr == .Deferred {
+			m.rescan = true
+			return .None
+		} else if perr != .None {
+			return perr
+		}
 	}
 	mount_materialize(m) or_return
 	if m.lost {
@@ -1411,6 +1416,12 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 }
 
 mount_run :: proc(m: ^Mount) -> Error {
+	err := mount_step(m)
+	return .None if err == .Deferred else err
+}
+
+@(private)
+mount_step :: proc(m: ^Mount) -> Error {
 	m.lock_first = false
 	fence := false
 	for f in m.fences {
@@ -1419,6 +1430,10 @@ mount_run :: proc(m: ^Mount) -> Error {
 		}
 	}
 	err := mount_pass(m, false, !fence)
+	if err == .Deferred {
+		mount_touch(m)
+		return err
+	}
 	if err == .None {
 		err = mount_materialize(m)
 		if err != .None && err != .Reloading {
@@ -1560,17 +1575,17 @@ mount_sync :: proc(m: ^Mount) -> Error {
 			waiting ||= f.arrived && !f.observed
 		}
 		if arrived {
-			mount_run(m) or_return
+			mount_step(m) or_return
 		} else if waiting {
 			observer_wait(m.reg) or_return
 		} else if !m.watched {
-			mount_run(m) or_return
+			mount_step(m) or_return
 		} else if !m.reg.os_ready || m.reg.watcher.wait == nil || !m.reg.watcher.wait(m.reg.watcher.data, m.reg, 2000) {
 			m.rescan = true
 			for &f in m.fences {
 				f.arrived = true
 			}
-			mount_run(m) or_return
+			mount_step(m) or_return
 		}
 	}
 	return result
@@ -1601,7 +1616,11 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 	scope_unhold(s)
 	if s.mount != nil {
 		err = mount_sync(s.mount)
-		if err != .None {
+		deferred := err == .Deferred
+		if deferred {
+			err = .None
+		}
+		if err != .None || deferred {
 			sm := s.mount
 			for k, v in sm.dirty {
 				if v == s {
@@ -1740,6 +1759,7 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 	if prim.reader_remaining(&rd) > 0 {
 		m.nonce = prim.read_id(&rd)
 		m.jpos = prim.read_ivarint(&rd)
+		m.saved_jpos = m.jpos
 	} else {
 		mount_new_nonce(m)
 	}
@@ -2049,8 +2069,10 @@ mount_ack :: proc(m: ^Mount) -> Error {
 save_mount_state :: proc(m: ^Mount) -> Error {
 	img := &m.img
 	synced := m.img.synced[:]
+	jpos := m.jpos
 	if shadow_attached(&m.shadow) && m.shadow.owed && shadow_dirty(&m.shadow) && m.saved_synced != nil {
 		synced = m.saved_synced[:]
+		jpos = min(jpos, m.saved_jpos)
 	}
 	buf := make([dynamic]u8, context.temp_allocator)
 	vb := make([dynamic]u8, context.temp_allocator)
@@ -2089,7 +2111,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_bool(&w, m.clean)
 	prim.write_bool(&w, m.lost)
 	prim.write_id(&w, m.nonce)
-	prim.write_ivarint(&w, m.jpos)
+	prim.write_ivarint(&w, jpos)
 	gen := m.log_gen + 1 if covered && m.log_len > 0 else m.log_gen
 	prim.write_uvarint(&w, gen)
 	owed := make([dynamic]string, context.temp_allocator)
@@ -2128,6 +2150,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	m.saved = 0
 	state_write(m, buf[:]) or_return
 	m.saved = sum
+	m.saved_jpos = jpos
 	if raw_data(synced) != raw_data(m.saved_synced[:]) {
 		if m.saved_synced == nil {
 			m.saved_synced = make([dynamic]crdt.Op_Id, m.allocator)
