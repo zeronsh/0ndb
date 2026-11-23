@@ -594,7 +594,11 @@ equal in both directions.
   history on the removed inode, credited to the actor, and the path is
   materialized to the merged version (absent, or the new file), so bytes
   the agent only carried over from its base are never recreated under its
-  name. A pinned inode that is live at another path is not used.
+  name. A pinned inode that is live at another path is not used. A pin is
+  taken at the version the file's shadow entry names (a held or based write
+  that `synced` lacks, otherwise `synced`), and its observation is
+  committed on that version, so a later base check finds the actor's own
+  last op on top of exactly the text it read.
   Without a pin, or when the hash differs, ingestion is as above, and the
   mount reports each outcome (merged, current, mismatch, not text) to the
   registry's base hook. Each pin also appends a durable observation to the
