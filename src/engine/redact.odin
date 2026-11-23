@@ -413,6 +413,18 @@ _own_puncture :: proc(e: ^Engine, h: ^Handle, from, to: i64) {
 	}
 	_own_tree_punctured(e, t)
 	_dirty_keys(e, h.sp, h.id, h.kind, h.scope, t)
+	_own_rearchive(e, h, t, from, to)
+}
+
+@(private)
+_own_rearchive :: proc(e: ^Engine, h: ^Handle, t: ^Own_Tree, from, to: i64) {
+	if !h.sp.repl_on || to <= from {
+		return
+	}
+	shift := t.tree.shift
+	lo := (from >> shift) << shift
+	hi := (((to - 1) >> shift) + 1) << shift
+	osync.replicator_rearchive(&h.sp.repl, &h.scope, h.name, 0, lo, hi)
 }
 
 @(private)
