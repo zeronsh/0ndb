@@ -295,6 +295,8 @@ Stats :: struct {
 	buffer_live_skipped: u64,
 	buffer_live_rejected: u64,
 	buffer_live_received: u64,
+	buffer_live_transformed: u64,
+	buffer_live_keyless: u64,
 	buffer_live_intents: u64,
 	buffer_live_intents_applied: u64,
 	buffer_live_bad_gone: u64,
