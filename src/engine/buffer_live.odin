@@ -55,6 +55,21 @@ _ops_own :: proc(e: ^Engine, src: []crdt.Delta_Op) -> [dynamic]crdt.Delta_Op {
 }
 
 @(private)
+_ops_temp :: proc(src: []crdt.Delta_Op) -> [dynamic]crdt.Delta_Op {
+	out := make([dynamic]crdt.Delta_Op, 0, len(src), context.temp_allocator)
+	for o in src {
+		x := o
+		if len(o.text) > 0 {
+			t := make([]u8, len(o.text), context.temp_allocator)
+			copy(t, o.text)
+			x.text = t
+		}
+		append(&out, x)
+	}
+	return out
+}
+
+@(private)
 _ops_release :: proc(e: ^Engine, ops: ^[dynamic]crdt.Delta_Op) {
 	for o in ops {
 		if len(o.text) > 0 {
@@ -520,11 +535,7 @@ _ovl_drop :: proc(e: ^Engine, b: ^Buffer) {
 	if !_ovl_on(b) {
 		return
 	}
-	inv := _binverse(b.oc[:])
-	saved := make([dynamic]crdt.Delta_Op, context.temp_allocator)
-	for o in inv {
-		append(&saved, o)
-	}
+	saved := _ops_temp(_binverse(b.oc[:])[:])
 	gone := _gone_of(e, b, saved[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
 	e.stats.buffer_live_dropped += 1
@@ -558,7 +569,7 @@ _ovl_advanced :: proc(e: ^Engine, b: ^Buffer, a: []crdt.Delta_Op) -> bool {
 			return true
 		}
 	}
-	fix := _bcompose(_binverse(b.oc[:])[:], a)
+	fix := _ops_temp(_bcompose(_binverse(b.oc[:])[:], a)[:])
 	gone := _gone_of(e, b, fix[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
 	e.stats.buffer_live_dropped += 1
