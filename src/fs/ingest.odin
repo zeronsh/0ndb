@@ -2082,6 +2082,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		}
 	} else {
 		rebase_changes(p) or_return
+		revive_removed(p) or_return
 		attribute_changes(p) or_return
 		groups := make(map[prim.Id][dynamic]int, context.temp_allocator)
 		group_actor := make(map[prim.Id]prim.Id, context.temp_allocator)
@@ -2683,6 +2684,47 @@ last_change :: proc(p: ^Pass) -> ^Change {
 Dir_Move :: struct {
 	from: string,
 	to:   string,
+}
+
+@(private)
+revive_removed :: proc(p: ^Pass) -> Error {
+	m := p.m
+	h := m.history
+	if h == nil {
+		return .None
+	}
+	any := false
+	for c in p.changes {
+		any ||= c.kind == .Modify && c.old.kind == .File && c.disk == .File
+	}
+	if !any {
+		return .None
+	}
+	at := m.synced[:]
+	if line, found := history_line(h, m.line, context.temp_allocator) or_return; found {
+		at = line
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, at, &lvs) != .None {
+		return .Corrupt
+	}
+	snap := version_snapshot(h, lvs[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	for &c in p.changes {
+		if c.kind != .Modify || c.old.kind != .File || c.disk != .File || c.moved != "" || c.carried {
+			continue
+		}
+		info, ok, ierr := fstree.info(&snap, c.old.inode, context.temp_allocator)
+		if ierr != nil {
+			return .Corrupt
+		}
+		if ok && info.present {
+			continue
+		}
+		c.kind = .Create
+		c.old = {}
+	}
+	return .None
 }
 
 @(private)

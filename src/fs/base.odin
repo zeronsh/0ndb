@@ -405,6 +405,10 @@ _entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin
 		return nil, {}, false
 	}
 	h := m.history
+	cur := fstree.current(&h.tree)
+	if info, ok, ierr := fstree.info(&cur, c.old.inode, context.temp_allocator); ierr != nil || !ok || !info.present {
+		return nil, {}, false
+	}
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
 	ids, vok := shadow_version(&m.shadow, c.old)
 	if !vok {
