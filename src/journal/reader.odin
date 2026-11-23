@@ -205,7 +205,7 @@ next :: proc(c: ^Cursor) -> (body: []u8, off: i64, ok: bool) {
 			continue
 		case .Eof:
 			return
-		case .Corrupt, .Missing, .No_Key, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
+		case .Corrupt, .Missing, .No_Key, .Need_Keys, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
 			c.err = err
 		}
 	}
@@ -227,7 +227,7 @@ prev :: proc(c: ^Cursor) -> (body: []u8, off: i64, ok: bool) {
 			continue
 		case .Eof:
 			return
-		case .Corrupt, .Missing, .No_Key, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
+		case .Corrupt, .Missing, .No_Key, .Need_Keys, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
 			c.err = err
 		}
 	}
@@ -288,6 +288,9 @@ _decode :: proc(r: ^Reader, rec: []u8, off: i64) -> (body: []u8, kind: Record_Ki
 	}
 	k: Key
 	if !r.keys.key(r.keys.data, off, &k) {
+		if r.keys.loaded != nil && !r.keys.loaded(r.keys.data) {
+			return nil, kind, .Need_Keys
+		}
 		return nil, .Redacted, .None
 	}
 	if len(r.out) < len(b) {
@@ -328,7 +331,7 @@ _check_chain :: proc(r: ^Reader, off, end: i64, body: []u8, redacted: bool) -> E
 			have_commit = true
 		case .No_Key:
 			return .Redacted
-		case .Eof, .Corrupt, .Missing, .Redacted, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
+		case .Eof, .Corrupt, .Missing, .Redacted, .Need_Keys, .Forged, .Unverified, .Equivocation, .Too_Large, .Bad_Offset, .Invalid, .Busy, .Not_Found, .Permission, .No_Space, .No_Memory, .Io:
 			return cerr
 		}
 	}

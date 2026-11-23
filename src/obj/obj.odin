@@ -104,7 +104,7 @@ jerr :: proc "contextless" (e: journal.Error) -> Error {
 		return .None
 	case .Eof, .Bad_Offset, .Corrupt, .Redacted:
 		return .Corrupt
-	case .Missing:
+	case .Missing, .Need_Keys:
 		return .Missing
 	case .No_Key:
 		return .Permission

@@ -433,7 +433,7 @@ keytree_open_record :: proc(t: ^Key_Tree, rec: []u8, off: i64) -> Error {
 }
 
 keytree_provider :: proc(t: ^Key_Tree) -> journal.Key_Provider {
-	return journal.Key_Provider{data = t, key = _keytree_provide}
+	return journal.Key_Provider{data = t, key = _keytree_provide, loaded = _keytree_loaded}
 }
 
 static_provider :: proc(key: ^journal.Key) -> journal.Key_Provider {
@@ -464,6 +464,11 @@ object_tree_shred :: proc(t: ^Key_Tree, sc: ^Scope, oid: []u8) -> Error {
 _static_provide :: proc(data: rawptr, off: i64, out: ^journal.Key) -> bool {
 	out^ = (cast(^journal.Key)data)^
 	return true
+}
+
+@(private)
+_keytree_loaded :: proc(data: rawptr) -> bool {
+	return (cast(^Key_Tree)data).depth > 0
 }
 
 @(private)
