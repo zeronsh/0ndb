@@ -942,6 +942,9 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	}
 	if _ovl_on(b) || len(b.held) > 0 {
 		_buffer_hold(e, b, ready) or_return
+		if _buffer_find(e, id) != b {
+			return 0, 0, .Closed
+		}
 	}
 	scratch := virtual.arena_temp_begin(&e.temp)
 	defer virtual.arena_temp_end(scratch)
@@ -1005,8 +1008,9 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	clear(&b.version)
 	append(&b.version, last)
 	if aerr != .None || reloaded {
+		lost_ack, lost_rev := b.recv, b.rev
 		_buffer_lost(e, b)
-		return b.recv, b.rev, .None
+		return lost_ack, lost_rev, .None
 	}
 	_group_keep(e, &b.undo, &x.group, group)
 	for &g in b.redo {
