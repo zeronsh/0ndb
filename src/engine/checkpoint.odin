@@ -184,6 +184,7 @@ _checkpoints_write :: proc(e: ^Engine) {
 
 @(private)
 _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had_prev: bool) -> Error {
+	_hist_ready(e, h) or_return
 	dir := _obj_dir(e, h.id) or_return
 	tmp := _join(context.temp_allocator, dir, "bundle.tmp") or_return
 	fd, oerr := prim.open_file(e.vfs, tmp, {.Write, .Create, .Truncate}, 0o600)

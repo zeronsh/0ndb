@@ -389,6 +389,7 @@ Engine :: struct {
 	index:        search.Index,
 	index_open:   bool,
 	index_dirty:  [dynamic]Index_Item,
+	index_held:   [dynamic]Index_Item,
 	index_busy:   bool,
 	db:           odb.Odb,
 	db_open:      bool,
@@ -472,6 +473,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.catalog_q = make(map[prim.Id]^Catalog_Update, e.allocator)
 	e.catalog_parked = make(map[prim.Id]^Catalog_Update, e.allocator)
 	e.index_dirty = make([dynamic]Index_Item, e.allocator)
+	e.index_held = make([dynamic]Index_Item, e.allocator)
 	defer if err != .None {
 		_teardown(e)
 	}
@@ -966,6 +968,8 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 
 	e.settling = true
 	_redact_settle(e)
+	_content_settle(e)
+	_index_release(e)
 	_mounts_settle(e)
 	_full_settle(e)
 	_index_settle(e)
@@ -1148,6 +1152,7 @@ _teardown :: proc(e: ^Engine) {
 	}
 	delete(e.catalog_parked)
 	delete(e.index_dirty)
+	delete(e.index_held)
 	delete(e.pack_root, e.allocator)
 	delete(e.dir, e.allocator)
 	e.pack_root = ""
