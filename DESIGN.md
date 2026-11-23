@@ -604,12 +604,17 @@ equal in both directions.
   then syncs the directories ending in a full flush, so a file's data is
   durable before its name points at it: after any crash a written path holds
   its old content or its complete new content, and only directories are owed
-  until that barrier. A pass that fails partway rolls forward: `synced`
+  until that barrier. A structural item (a directory, a move or a removal)
+  first commits the files staged before it, so the pass keeps its order. A
+  pass that fails partway after its structural items rolls forward: `synced`
   becomes its target in memory (persisted only by the image saved after the
-  owed barrier), and every item it left untouched keeps the version still on
-  disk in its shadow entry and is pending, re-materialized by a retry armed
-  while pending paths are ready, after any edit made to it meanwhile is
-  ingested from that version. A pass whose line version is ahead of `synced`
+  owed barrier), and every file whose entry the pass left untouched (same
+  inode, kind, content and version, whatever its stat) keeps the version
+  still on disk in its entry and is pending, re-materialized by a retry
+  armed while pending paths are ready, after any edit made to it meanwhile
+  is ingested from that version. A pass that fails with structural items
+  still to do keeps `synced`, names the target in the entries of the files
+  it already wrote, and is redone from a rescan. A pass whose line version is ahead of `synced`
   adopts a changed file whose content is its text at the line version (what
   an interrupted materialization wrote before a crash): its entry names that
   version and nothing is committed. Leftover temps are internal names and
