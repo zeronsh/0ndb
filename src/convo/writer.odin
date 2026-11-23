@@ -582,16 +582,27 @@ writer_unmount :: proc(w: ^Writer, name: string) -> (off: i64, err: Error) {
 	return _event(w, Unmount{name = name})
 }
 
-writer_undo :: proc(w: ^Writer, id: prim.Id, msg: Rid, phase: Undo_Phase, set: []Undo_Line = nil, redo: prim.Id = {}) -> (off: i64, err: Error) {
-	if id == {} || obj.rid_none(msg) || u8(phase) < 1 || phase > max(Undo_Phase) {
+Move_Spec :: struct {
+	cause: Move_Cause,
+	from:  Rid,
+	to:    Rid,
+}
+
+writer_undo :: proc(w: ^Writer, id: prim.Id, msg: Rid, phase: Undo_Phase, set: []Undo_Line = nil, redo: prim.Id = {}, move: Move_Spec = {}) -> (off: i64, err: Error) {
+	if id == {} || obj.rid_none(msg) || u8(phase) < 1 || phase > max(Undo_Phase) || move.cause > max(Move_Cause) {
 		return 0, .Invalid
 	}
 	if phase != .Fenced && len(set) > 0 {
 		return 0, .Invalid
 	}
+	if phase != .Staged && (move.cause != .Undo || !obj.rid_none(move.from) || !obj.rid_none(move.to)) {
+		return 0, .Invalid
+	}
 	_prepare(w, false) or_return
 	mr := _local_rid(w, msg) or_return
-	return _event(w, Undo{id = id, msg = mr, redo = redo, phase = phase, set = set})
+	fr := _local_rid(w, move.from) or_return
+	tr := _local_rid(w, move.to) or_return
+	return _event(w, Undo{id = id, msg = mr, redo = redo, phase = phase, set = set, cause = move.cause, from = fr, to = tr})
 }
 
 writer_undone :: proc(w: ^Writer, undo: prim.Id, msg: Rid, leaves: []Undone_Leaf, reverts: []Undone_Revert, kept: []Line_Bind = nil, hidden: []prim.Id = nil) -> (off: i64, err: Error) {

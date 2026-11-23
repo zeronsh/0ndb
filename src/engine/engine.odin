@@ -346,6 +346,7 @@ Engine :: struct {
 	refused_stop: [dynamic]prim.Id,
 	drain_wait:   [dynamic]prim.Id,
 	waiters:      [dynamic]^Waiter,
+	move_waits:   [dynamic]Move_Wait,
 	space_waits:  [dynamic]Space_Wait,
 	space_woke:   bool,
 	held:         [dynamic]^Pending_Cmd,
@@ -878,10 +879,12 @@ _tick_end :: proc(e: ^Engine) {
 	_space_waits_run(e)
 	_content_events_process(e)
 	_waiters_run(e)
+	_move_waits_run(e)
 	_remote_step(e)
 	_catalog_reconcile(e)
 	_catalog_flush(e)
 	_budget_flush(e)
+	_moves_settle_step(e)
 	_mounts_commit(e)
 	_handles_commit(e)
 	_mounts_changed(e)
@@ -1106,6 +1109,12 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.held)
 	delete(e.purged)
 	delete(e.waiters)
+	for mw in e.move_waits {
+		if mw.ready.call != nil {
+			mw.ready.call(mw.ready.data, e, .Closed)
+		}
+	}
+	delete(e.move_waits)
 	delete(e.space_waits)
 	delete(e.subs)
 	delete(e.posted)

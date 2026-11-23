@@ -1049,6 +1049,13 @@ _waiters_fail_all :: proc(e: ^Engine, err: Error) {
 
 cancel_waits :: proc(e: ^Engine, data: rawptr) {
 	context = context_for(e)
+	for j := 0; j < len(e.move_waits); {
+		if e.move_waits[j].ready.data == data {
+			ordered_remove(&e.move_waits, j)
+			continue
+		}
+		j += 1
+	}
 	i := 0
 	for i < len(e.waiters) {
 		w := e.waiters[i]

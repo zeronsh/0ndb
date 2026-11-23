@@ -389,7 +389,34 @@ op_answer :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_switch :: proc(c: ^Call, o: ^Out) -> Status {
-	return exec(c, o, eng.Cmd_Switch{object = a_object(c, "object"), sibling = a_rid(c, "sibling")})
+	ob := a_object(c, "object")
+	if c.stage == 0 {
+		res, err := eng.exec(c.api.e, eng.Cmd_Switch{object = ob, sibling = a_rid(c, "sibling")}, done(c))
+		if err == .Pending {
+			c.in_exec = true
+			return .Pending
+		}
+		c.result = res
+		c.err = err
+		c.stage = 1
+	}
+	if c.err != .None {
+		return status_of(c.err)
+	}
+	if c.result.move != {} {
+		if werr := eng.convo_move_on_disk(c.api.e, ob, c.result.move, ready(c)); werr == .Pending {
+			if c.waiting {
+				return .Pending
+			}
+			return .Missing
+		} else if werr != .None {
+			return status_of(werr)
+		}
+	}
+	o_rid(o, "leaf", c.result.leaf)
+	o_u64(o, "tick", c.result.tick)
+	o_id(o, "move", c.result.move)
+	return .Ok
 }
 
 op_back :: proc(c: ^Call, o: ^Out) -> Status {

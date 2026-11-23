@@ -1,6 +1,7 @@
 package convo
 
 import "base:runtime"
+import "core:mem"
 import "core:slice"
 import "../obj"
 import "../prim"
@@ -1675,6 +1676,9 @@ Undo_State :: struct {
 	fenced: bool,
 	set:    []Undo_Line,
 	stamp:  prim.Hlc,
+	cause:  Move_Cause,
+	from:   Rid,
+	to:     Rid,
 }
 
 Undone_State :: struct {
@@ -1694,7 +1698,15 @@ Notice_State :: struct {
 	stamp:  prim.Hlc,
 }
 
-undos :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undo_State, err: Error) {
+undo_before :: proc(a, b: Undo_State) -> bool {
+	if a.stamp != b.stamp {
+		return a.stamp < b.stamp
+	}
+	x, y := a.staged.seg, b.staged.seg
+	return mem.compare(x[:], y[:]) < 0
+}
+
+undos :: proc(v: ^obj.View, allocator := context.allocator, floor: prim.Hlc = 0) -> (out: []Undo_State, err: Error) {
 	Acc :: struct {
 		list:      [dynamic]Undo_State,
 		v:         ^obj.View,
@@ -1727,6 +1739,15 @@ undos :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undo_Stat
 			st.msg = obj.rid(a.v, m) or_return
 			st.redo = u.redo
 			st.staged = at
+			st.cause = u.cause
+			if !obj.ref_none(u.from) {
+				f := obj.resolve(a.v, s, u.from) or_return
+				st.from = obj.rid(a.v, f) or_return
+			}
+			if !obj.ref_none(u.to) {
+				t := obj.resolve(a.v, s, u.to) or_return
+				st.to = obj.rid(a.v, t) or_return
+			}
 		}
 		if u.phase == .Fenced && !st.fenced {
 			st.fenced = true
@@ -1737,6 +1758,7 @@ undos :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undo_Stat
 				set[i].base = obj.clone_bytes(l.base, a.allocator) or_return
 				set[i].actors = make([]prim.Id, len(l.actors), a.allocator)
 				copy(set[i].actors, l.actors)
+				set[i].park = obj.clone_bytes(l.park, a.allocator) or_return
 			}
 			st.set = set
 		}
@@ -1744,7 +1766,7 @@ undos :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undo_Stat
 		return false, .None
 	}
 	for s in 0 ..< len(v.segs) {
-		obj.walk_events(v, s, 0, &acc, visit) or_return
+		obj.walk_events(v, s, floor, &acc, visit) or_return
 	}
 	n := 0
 	for st in acc.list {
@@ -1755,7 +1777,7 @@ undos :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undo_Stat
 	}
 	resize(&acc.list, n)
 	slice.sort_by(acc.list[:], proc(a, b: Undo_State) -> bool {
-		return a.stamp < b.stamp
+		return undo_before(a, b)
 	})
 	return acc.list[:], .None
 }

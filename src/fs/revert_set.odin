@@ -112,6 +112,15 @@ revert_parents :: proc(h: ^History, revert: prim.Id, allocator := context.alloca
 	return crdt.graph_version_ids(&h.g, ps, allocator), .None
 }
 
+history_version_has :: proc(h: ^History, version: Version, actor: prim.Id) -> (has: bool, err: Error) {
+	history_ready(h) or_return
+	cl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, version, &cl) != .None {
+		return false, .Not_Found
+	}
+	return actor_bound(h, cl[:], actor) > 0, .None
+}
+
 history_undo_revert :: proc(h: ^History, current: Version, undo: prim.Id) -> (revert: prim.Id, found: bool, err: Error) {
 	history_ready(h) or_return
 	list, ok := kv_get(&h.kv, revert_key("ru:", undo), context.temp_allocator) or_return

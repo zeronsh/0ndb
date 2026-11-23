@@ -1819,14 +1819,52 @@ running on it is a record in it.
   file trees a conversation works on; zero, one or many, from any
   workspace. Going back to a message restores every mounted tree (and each
   repository's git state) to that message's versions together.
-- (planned) Conversation branches are owner-scoped. The *task tree* of a
-  conversation is it plus every task its turns spawned, transitively;
-  ownership is derived (scope → task row → parent chain), never stored on ops.
-  A branch of conversation A selects which of A's tree's ops its lines carry:
-  switching branches set-reverts the A-tree ops only the old branch has and
-  restores those only the new one has, transformed through everything since;
-  other trees' ops on the line are never touched. Alone on a line this is
-  exactly a line switch. Going back and sending is such a switch.
+- Conversation branches are owner-scoped and carry their files. The *task
+  tree* of a conversation is it plus every task its turns spawned,
+  transitively; ownership is derived (scope → task row → parent chain), never
+  stored on ops. A branch of conversation A selects which of A's tree's ops
+  its lines carry: switching branches set-reverts the A-tree ops only the old
+  branch has and restores those only the new one has, transformed through
+  everything since; other trees' ops on the line are never touched. Alone on a
+  line this is exactly a line switch.
+  - *The invariant.* A conversation's line always carries its current branch.
+    So every version recorded at a message (a turn's start, a landed end, a
+    park) is a valid base: a set revert of A's set to base W leaves A's content
+    as it was at W and keeps every other writer's ops. Every move is that one
+    operation per (tree, line), with A's set exactly as for an undo (below) and
+    the base by cause: a switch to leaf L takes the park version of the move
+    that last left L (or a message on L's path below the fork), else the
+    start version of L's first reply after the fork; an edit of user message U
+    (sending with a parent other than the current position) takes U's turn
+    start, moves the leaf to U's parent, and the new message follows; an undo
+    of T takes T's turn start; a redo is a switch to the undone position,
+    restoring the leaves the undo recorded. A turn starts from its
+    conversation line's head, so landing is a fast-forward unless another
+    writer moved the line meanwhile, and the union then only merges those
+    writers.
+  - *The move record.* A move is the staged `Undo` record below with `cause`
+    (undo, redo, switch, edit, regenerate, rebase), `from` (the position left,
+    also when following the tip) and `to`; every `Fenced` set line records
+    `park`, the line's version at the fence, before any revert, which a later
+    switch back to `from` takes as its base. Each move writes one `Undone`, so
+    every left branch stays switchable and nothing is deleted. For a switch
+    the tree's tasks split by A's paths: tasks spawned on the old-only path
+    are held, reverted and hidden; tasks on the new-only path and on the
+    shared prefix stay outside the set.
+  - *No loop syncs.* A move's records and reverts ride the pack's batch
+    commit, which is atomic across streams, and materialization waits for
+    that batch, so no phase fsyncs on the loop. The mounts of a reverted line
+    wake at once, and `switch` answers once every local mount of the reverted
+    lines holds the revert on disk.
+  - *Concurrent moves.* Positions are per device, the line is shared. Moves
+    order by their staged record (hlc, then device). A device whose newest
+    move (within ten minutes) was staged elsewhere moves its own leaf to that
+    move's target. The device of the newest move, once it is released, checks
+    every earlier move's reverts against its park versions; one it did not
+    see, or its own position having left its target, makes it write one
+    `rebase` move to its own target with its own bases, so the line ends on
+    exactly the winner's branch on every device. Only the winner rebases, so
+    rebases never race each other.
 - **Undo** of turn T of A rewinds A's whole task tree to T's start, as a set
   revert (fs) per line plus leaf and session rewinds, driven by one staged
   record.
@@ -1920,9 +1958,10 @@ running on it is a record in it.
     revert actor), checkouts left in place, hidden tasks}` (kind 47) records the
     undone timeline; nothing is deleted. Tasks spawned after T's start go with
     it, hidden and paused. Switching back is a redo, the same staged record: a
-    set revert of the undo's revert actors per line (transformed through
-    anything written since, with conflicts kept as alternatives), the old leaves
-    and sessions, and the hidden tasks reappearing paused. After an undo or a
+    switch to the undo's `from` (a set revert of A's set to the undo's park
+    versions, transformed through anything written since, with conflicts kept
+    as alternatives), the old leaves and sessions, and the hidden tasks
+    reappearing paused. After an undo or a
     redo the tasks are paused; one resume action, or simply sending in A,
     continues every task that was running from its head. Undoing again after new
     sends reverts only what came after the new turn's version.

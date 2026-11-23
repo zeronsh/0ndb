@@ -190,6 +190,7 @@ Result :: struct {
 	off:  i64,
 	leaf: Rid,
 	tick: u64,
+	move: prim.Id,
 }
 
 Done :: struct {
@@ -503,6 +504,15 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 	switch c in cmd {
 	case Cmd_Send:
 		h = _convo_writable(e, c.object) or_return
+		if st.stage == 0 && (c.root || !obj.rid_none(c.parent)) && (c.role == convo.Role(0) || c.role == .User) {
+			pos := _cu_position(e, c.object) or_return
+			if c.root || pos != c.parent {
+				if _, merr := _cu_edit(e, c.object, c.parent, c.root); merr != .None && merr != .Pending {
+					return res, h, merr
+				}
+				h = _convo_writable(e, c.object) or_return
+			}
+		}
 		if st.stage == 0 {
 			spec := convo.Msg_Spec {
 				role     = c.role if c.role != convo.Role(0) else .User,
@@ -572,10 +582,10 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 		res.item = item
 	case Cmd_Switch:
 		h = _convo_writable(e, c.object) or_return
-		leaf, off, x := convo.writer_switch(&h.cw, c.sibling)
-		err = _oerr(x)
+		move, leaf, x := _cu_switch(e, c.object, c.sibling)
+		err = .None if x == .Pending else x
 		res.leaf = leaf
-		res.off = off
+		res.move = move
 	case Cmd_Back:
 		h = _convo_writable(e, c.object) or_return
 		off, x := convo.writer_set_leaf(&h.cw, c.msg)
