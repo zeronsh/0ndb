@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, random, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time
+import json, os, platform, random, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -7,7 +7,8 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 BIN = os.environ.get("ONDB_BIN", os.path.join(REPO, "bin", "0ndb"))
 OUT = os.environ.get("FLOWS_OUT", os.path.join(tempfile.gettempdir(), "flows"))
 RUNS = int(os.environ.get("FLOWS_RUNS", "30"))
-LIMIT = ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
+WINDOWS = os.name == "nt"
+LIMIT = [] if WINDOWS else ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
 INSTANT_MS = 50.0
 TAIL = 60
 PROCS = []
@@ -18,24 +19,55 @@ def now():
 
 
 def spawn(args, cwd, log, env):
-    p = subprocess.Popen(LIMIT + args, cwd=cwd, env=env, stdout=open(os.path.join(cwd, log), "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    group = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS else dict(start_new_session=True)
+    p = subprocess.Popen(LIMIT + args, cwd=cwd, env=env, stdout=open(os.path.join(cwd, log), "w"), stderr=subprocess.STDOUT, **group)
     PROCS.append(p)
     return p
 
 
+def stop_proc(p, sig):
+    if p.poll() is not None:
+        return
+    try:
+        if WINDOWS:
+            p.terminate() if sig == signal.SIGTERM else p.kill()
+        else:
+            os.killpg(p.pid, sig)
+    except Exception:
+        pass
+
+
 def kill_all():
     for p in PROCS:
-        if p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except Exception:
-                pass
+        stop_proc(p, signal.SIGKILL)
+
+
+def unix_connect(path):
+    if hasattr(socket, "AF_UNIX"):
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(path)
+        return s
+    import ctypes
+    ws2 = ctypes.WinDLL("ws2_32")
+    ws2.socket.restype = ctypes.c_size_t
+    ws2.connect.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    data = ctypes.create_string_buffer(512)
+    ws2.WSAStartup(0x0202, data)
+
+    class Sun(ctypes.Structure):
+        _fields_ = [("family", ctypes.c_ushort), ("path", ctypes.c_char * 108)]
+
+    h = ws2.socket(1, 1, 0)
+    sa = Sun(1, path.replace("/", "\\").encode())
+    if ws2.connect(h, ctypes.byref(sa), ctypes.sizeof(sa)) != 0:
+        ws2.closesocket(ctypes.c_size_t(h))
+        raise OSError("connect %s failed: %d" % (path, ws2.WSAGetLastError()))
+    return socket.socket(fileno=h)
 
 
 class Client:
     def __init__(self, path):
-        self.s = socket.socket(socket.AF_UNIX)
-        self.s.connect(path)
+        self.s = unix_connect(path)
         self.s.sendall(b"0NDB\x01")
         self.tag = 0
         self.lock = threading.Condition()
@@ -173,11 +205,11 @@ class Daemon:
 
     def stop(self):
         if self.proc.poll() is None:
-            os.killpg(self.proc.pid, signal.SIGTERM)
+            stop_proc(self.proc, signal.SIGTERM)
             try:
                 self.proc.wait(timeout=30)
             except Exception:
-                os.killpg(self.proc.pid, signal.SIGKILL)
+                stop_proc(self.proc, signal.SIGKILL)
         shutil.rmtree(self.rt, ignore_errors=True)
 
 
@@ -552,7 +584,7 @@ def main():
     finally:
         kill_all()
     path = os.path.join(OUT, "results-%d.json" % int(time.time()))
-    json.dump(dict(host=os.uname().nodename, platform=sys.platform, rows=rows), open(path, "w"), indent=1)
+    json.dump(dict(host=platform.node(), platform=sys.platform, rows=rows), open(path, "w"), indent=1)
     print("\n%-70s %9s %9s  %s" % ("flow", "p50 ms", "p95 ms", ""))
     for r in rows:
         if "p50_ms" in r:
