@@ -572,7 +572,7 @@ _buffers_stats :: proc "contextless" () {
 	STAT_BLIVE_PEER_EDITS = register_stat(30, 10, "peer_edits")
 	STAT_BLIVE_INTENTS = register_stat(30, 11, "live_intents")
 	STAT_BLIVE_PROBES = register_stat(30, 12, "live_probes")
-	register_final_check(1, check_live_probe)
+	register_final_check(1000, check_live_probe)
 }
 
 @(private = "file")
