@@ -302,7 +302,11 @@ def f_cli_first_token():
     out = []
     try:
         listed = dm.cli("models").get("providers", [])
+        print("cli flow: providers %s" % [(p.get("id"), p.get("available")) for p in listed], file=sys.stderr, flush=True)
+        wanted = os.environ.get("FLOWS_CLI_PROVIDERS", "claude,codex").split(",")
         for pr in listed:
+            if pr.get("id") not in wanted:
+                continue
             if not pr.get("available"):
                 out.append(dict(flow="%s send → first token" % pr.get("id"), runs=0, notes="skipped: %s" % (pr.get("error") or "not available")))
                 continue
@@ -310,6 +314,7 @@ def f_cli_first_token():
             model = picks.get(pid) or next((m["id"] for m in pr.get("models", []) if m.get("default")), "")
             args = ["new", "flows-" + pid, "--provider", pid] + (["--model", model] if model else [])
             obj = dm.cli(*args)["object"]
+            print("cli flow: %s ready" % pid, file=sys.stderr, flush=True)
             c = dm.client()
             tag, _ = c.subscribe(op="subscribe", object=obj, kind="conversation")
             first, started = [], []
@@ -320,7 +325,7 @@ def f_cli_first_token():
                 t0 = now()
                 c.call_async("send", object=obj, text=prompt)
                 ts, _ = c.wait_delta(tag, lambda v: v and any(dl.get("kind") == "status" and dl.get("status") == "running" for dl in v.get("deltas", [])), timeout=20)
-                tf, _ = c.wait_delta(tag, lambda v: v and any(dl.get("kind") in ("block", "chunk") and dl.get("text") and dl.get("text") != prompt for dl in v.get("deltas", [])), timeout=60)
+                tf, _ = c.wait_delta(tag, lambda v: v and any(dl.get("kind") in ("block", "chunk") and dl.get("block") == "text" and dl.get("text") and dl.get("text") != prompt for dl in v.get("deltas", [])), timeout=60)
                 if ts:
                     started.append(ts - t0)
                 if not tf:
@@ -328,6 +333,7 @@ def f_cli_first_token():
                     break
                 first.append(tf - t0)
                 c.wait_delta(tag, is_idle, timeout=60)
+                print("cli flow: %s run %d first token %.2fs" % (pid, i, tf - t0), file=sys.stderr, flush=True)
             c.close()
             out.append(row("%s (%s) send → first token" % (pid, model or "default"), first, False, note, dict(run_started=started)))
         return out
