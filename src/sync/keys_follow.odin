@@ -235,6 +235,9 @@ _remote_hold_retry :: proc(r: ^Replicator, rm: ^Remote) {
 _remote_deny :: proc(r: ^Replicator, rm: ^Remote) {
 	rm.denied = true
 	rm.tail = 0
+	if rm.is_head {
+		_key_probe_answered(r, rm, 0, false)
+	}
 	for w in rm.wants {
 		if !rm.is_head {
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = w.from, length = max(rm.relay_len, 0)})

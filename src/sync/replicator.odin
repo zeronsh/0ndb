@@ -187,6 +187,11 @@ Remote :: struct {
 	grouped:   bool,
 	quarantined: bool,
 	keys_wait: bool,
+	key_head:  Stream_Id,
+	key_from:  Device_Id,
+	key_probe: u64,
+	key_wait:  bool,
+	key_seen:  bool,
 	kheld_at:  i64,
 	kheld:     [dynamic]u8,
 	claims:    [dynamic]i64,
@@ -1996,6 +2001,7 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 			}
 			ordered_remove(&rm.wants, i)
 			if rm.is_head {
+				_key_probe_answered(r, rm, 0, false)
 				continue
 			}
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = w.from, length = rm.relay_len})
@@ -2101,6 +2107,7 @@ _keys_head_seen :: proc(r: ^Replicator, head: ^Remote) {
 		return
 	}
 	epoch, ok := _keys_head_epoch(r, head)
+	_key_probe_answered(r, head, epoch, ok)
 	if ok && epoch >= head.head_min {
 		_emit(r, Repl_Event{kind = .Epoch_Seen, device = head.device, name = head.head_keys, epoch = epoch, stream = stream_id(&head.scope, head.device, head.head_keys, epoch)})
 	}
