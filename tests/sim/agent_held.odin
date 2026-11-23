@@ -86,14 +86,14 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	o := m.objs[sm.oi].o
-	hold := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
+	hold := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
 	fs.scope_write_begin(hold, name)
 	if !fs.scope_pinned(hold, name) {
 		fs.scope_close(n.reg, hold)
 		return
 	}
 	ractor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	reader := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), ractor)
+	reader := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), ractor)
 	fs.scope_read_base(reader, name, base)
 	if !fs.scope_pinned(reader, name) {
 		fs.scope_close(n.reg, reader)
@@ -118,7 +118,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 	pop := new_op(m, .Disk_Agent, n, sm.oi)
 	pop.path = strings.clone(name, w.allocator)
 	pop.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	other := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), pop.actor)
+	other := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), pop.actor)
 	moved := _append_tokens(w, n, pop, base, 1)
 	perr, pserr := _scoped_write(w, n, sm, name, abs, other, moved)
 	if n.disk.dead {
@@ -155,7 +155,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 		top := new_op(m, .Disk_Agent, n, sm.oi)
 		top.path = strings.clone(name, w.allocator)
 		top.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		third := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), top.actor)
+		third := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), top.actor)
 		next := _append_tokens(w, n, top, wrote, 1 + rng_int(&w.rng, 2))
 		terr, tserr := _scoped_write(w, n, sm, name, abs, third, next)
 		if n.disk.dead {

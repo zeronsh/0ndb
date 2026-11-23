@@ -50,7 +50,7 @@ op_agent_removed :: proc(w: ^World, n: ^Node) {
 	}
 	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	scope := fs.scope_open(n.reg, sm.m, sid, actor)
+	scope := sim_scope_open(w, n.reg, sm.m, sid, actor)
 	fs.scope_read_base(scope, name, base)
 	if !fs.scope_pinned(scope, name) {
 		fs.scope_close(n.reg, scope)
