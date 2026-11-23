@@ -937,10 +937,14 @@ equal in both directions.
   (`mount_unrevert`) is a set revert of the revert actor from the version
   just before its batch: with nothing in between it restores the files byte
   for byte, and the reverted revert's marker is marked so its alternatives
-  are no longer listed. (planned) Land and merge batches of isolated tasks
-  carry a marker naming their source task, so undo can count them in the
-  task's set; the cross-tree notice for a removed file another tree edited
-  comes with undo.
+  are no longer listed. A tree no device mounts is set-reverted through its
+  history (`tree_revert_set(tree, base, actors, line)`, `tree_unrevert`),
+  committed like an API write; a mount is that plus materialization. A land
+  or merge of an isolated task is a line merge, so the ops it brings keep
+  their scope actors and need no marker; the task's fork mounts ingest under
+  their ingestion actors, and `history_mount_actors(mounts, lines)` resolves
+  those (home and per-line) from the actor registrations. The cross-tree
+  notice for a removed file another tree edited comes with undo.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
 - **Text views**: `history_view_open(inode, version)` gives a caller its own
@@ -1449,10 +1453,11 @@ running on it is a record in it.
     transitively (scope → task row → parent chain). Its set is the scope actors
     of the `Scope` records of every conversation in the tree, the revert actors
     of earlier undos and redos of the tree (so undoing T' < T after undoing T
-    reverts the first undo's copies and deletions too), and the land and merge
-    batches of its isolated tasks, named by their land marker. Everything else
-    is outside the set and survives: a person's own disk and buffer edits made
-    during T, other trees, git and imports.
+    reverts the first undo's copies and deletions too), and the ingestion
+    actors of its tasks' fork mounts (`history_mount_actors`); landed and
+    merged ops keep their scope actors, so they are in the set already.
+    Everything else is outside the set and survives: a person's own disk and
+    buffer edits made during T, other trees, git and imports.
   - *Versions and lines.* A send is a fence (every mount of the line ingests
     before the `Msg` is recorded), so T's mount set (the fold of `Msg.files`
     deltas along T's ancestor chain) gives each mounted tree its version
