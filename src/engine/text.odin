@@ -176,6 +176,9 @@ _tree_dirs :: proc(e: ^Engine, h: ^Handle, at: ^Tree_At, dir: string) -> (id: fs
 		}
 		if !found {
 			_hist_tree_op(e, h, fstree.Op_Create{parent = id, name = part, kind = .Dir}, "", at) or_return
+			if fs.history_reloading(h.hist) {
+				return id, _ferr(.Reloading)
+			}
 			next, found, lerr = fstree.lookup_child(&at.snap, id, part)
 			if lerr != nil || !found {
 				return id, .Corrupt
@@ -475,15 +478,20 @@ _hist_batch :: proc(e: ^Engine, h: ^Handle, ops: []crdt.Op_Run, at: ^Tree_At = n
 		parents = heads,
 		ops     = ops,
 	}
-	if _, err := fs.history_commit_local(hist, &b); err != .None {
+	line: Maybe(string)
+	if h.kind == .File_Tree {
+		line = at.line if at != nil else fs.DEFAULT_MOUNT.line
+	}
+	if _, err := fs.history_commit_local(hist, &b, line); err != .None {
 		return _ferr(err)
 	}
 	if h.kind == .File_Tree {
-		n := crdt.batch_len(&b)
-		head := [1]crdt.Op_Id{{actor, b.seq + u64(n) - 1}}
-		_ferr(fs.history_set_line(hist, at.line if at != nil else fs.DEFAULT_MOUNT.line, head[:])) or_return
 		_mounts_wake(e, h.id)
 		if at != nil {
+			if fs.history_reloading(hist) {
+				at^ = Tree_At{line = at.line}
+				return .None
+			}
 			at^ = _tree_at(e, h, at.line) or_return
 		}
 	}
