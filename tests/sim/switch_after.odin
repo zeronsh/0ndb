@@ -22,7 +22,11 @@ SA_REMOTE :: "main a\nremote\n"
 Switch_After_Kind :: enum u8 {
 	Line_Switch,
 	Checkout,
+	Commit_Checkout,
 }
+
+@(private = "file")
+SA_COMMITTED :: "main b\ncommitted\n"
 
 @(private = "file")
 Sa_Lines :: struct {
@@ -196,6 +200,17 @@ _switch_after :: proc(w: ^World, kind: Switch_After_Kind, mode: Crash_Mode, cras
 		world_fail(w, "switch after: the write on main never reached the worktree")
 		return
 	}
+	if kind == .Commit_Checkout {
+		committed := [?]Git_File{{name = "b.txt", data = transmute([]u8)string(SA_COMMITTED)}}
+		if err := _sa_write(vfs, SA_ROOT + "/b.txt", committed[0].data); err != .None {
+			world_fail(w, "switch after: edit b.txt: %v", err)
+			return
+		}
+		if err := git_branch_commit(vfs, SA_ROOT, "main", committed[:], nil, clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng)); err != .None {
+			world_fail(w, "switch after: commit on main: %v", err)
+			return
+		}
+	}
 	if !_sa_switch(w, n, kind, SA_FEATURE, "feature") {
 		return
 	}
@@ -224,6 +239,9 @@ _switch_after :: proc(w: ^World, kind: Switch_After_Kind, mode: Crash_Mode, cras
 	if !aok {
 		world_fail(w, "switch after: cannot read the lines after recovery")
 		return
+	}
+	if kind == .Commit_Checkout && before.main["b.txt"] == SA_COMMITTED && after.main["b.txt"] != SA_COMMITTED {
+		world_fail(w, "switch after: main's committed b.txt is %q after recovery", after.main["b.txt"])
 	}
 	_sa_same(w, "main", before.main, after.main, kind, mode, crash_at)
 	_sa_same(w, SA_FEATURE, before.feature, after.feature, kind, mode, crash_at)
@@ -292,9 +310,9 @@ _sa_switch :: proc(w: ^World, n: ^Node, kind: Switch_After_Kind, to: string, bra
 			world_fail(w, "switch after: line_switch to %s: %v", to, err)
 			return false
 		}
-	case .Checkout:
+	case .Checkout, .Commit_Checkout:
 		changes := make([dynamic]Git_Change, context.temp_allocator)
-		res, err := git_checkout(vfs, SA_ROOT, branch, false, clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng), &changes)
+		res, err := git_checkout(vfs, SA_ROOT, branch, kind == .Commit_Checkout, clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng), &changes)
 		if err != .None || res != .Done {
 			world_fail(w, "switch after: git checkout %s: %v %v", to, res, err)
 			return false
@@ -322,4 +340,15 @@ _sa_switch :: proc(w: ^World, n: ^Node, kind: Switch_After_Kind, to: string, bra
 	}
 	world_fail(w, "switch after: %v never put the mount on %s (line %s)", kind, to, fs.mount_line(sm.m))
 	return false
+}
+
+@(private = "file")
+_sa_write :: proc(vfs: prim.Vfs, path: string, data: []u8) -> prim.Error {
+	fd := prim.open_file(vfs, path, {.Write, .Create, .Truncate}, 0o644) or_return
+	err := prim.write_at(vfs, fd, data, 0)
+	if err == .None {
+		err = prim.datasync(vfs, fd)
+	}
+	cerr := prim.close_file(vfs, fd)
+	return err if err != .None else cerr
 }

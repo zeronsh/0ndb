@@ -159,21 +159,25 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 	if !ok {
 		return false, .Not_Found
 	}
-	lock, _ := path_join(m.git.dir, "index.lock", context.temp_allocator)
-	if prim.exists(m.vfs, lock) {
-		mount_git_lock(m, true)
-		if !mount_lock_stale(m) {
-			return false, .None
+	ref, is_ref := line_ref(m, to)
+	cur, _ := git_head(m.vfs, m.git, context.temp_allocator)
+	if !git_head_equal(cur, Git_Head{branch = ref if is_ref else "", commit = commit}) {
+		lock, _ := path_join(m.git.dir, "index.lock", context.temp_allocator)
+		if prim.exists(m.vfs, lock) {
+			mount_git_lock(m, true)
+			if !mount_lock_stale(m) {
+				return false, .None
+			}
+			prim.remove(m.vfs, lock)
 		}
-		prim.remove(m.vfs, lock)
-	}
-	spawner.run(spawner.data, []string{"git", "read-tree", commit}, m.root) or_return
-	spawner.run(spawner.data, []string{"git", "update-index", "-q", "--refresh"}, m.root)
-	msg := strings.concatenate({"0ndb: switch from ", line_ref_name(m, from), " to ", line_ref_name(m, to)}, context.temp_allocator)
-	if ref, is_ref := line_ref(m, to); is_ref {
-		spawner.run(spawner.data, []string{"git", "symbolic-ref", "-m", msg, "HEAD", ref}, m.root) or_return
-	} else {
-		spawner.run(spawner.data, []string{"git", "update-ref", "--no-deref", "-m", msg, "HEAD", commit}, m.root) or_return
+		spawner.run(spawner.data, []string{"git", "read-tree", commit}, m.root) or_return
+		spawner.run(spawner.data, []string{"git", "update-index", "-q", "--refresh"}, m.root)
+		msg := strings.concatenate({"0ndb: switch from ", line_ref_name(m, from), " to ", line_ref_name(m, to)}, context.temp_allocator)
+		if is_ref {
+			spawner.run(spawner.data, []string{"git", "symbolic-ref", "-m", msg, "HEAD", ref}, m.root) or_return
+		} else {
+			spawner.run(spawner.data, []string{"git", "update-ref", "--no-deref", "-m", msg, "HEAD", commit}, m.root) or_return
+		}
 	}
 	git_head_destroy(&m.head, m.allocator)
 	m.head, _ = git_head(m.vfs, m.git, m.allocator)
