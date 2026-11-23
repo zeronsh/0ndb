@@ -795,6 +795,11 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 		if atomic && (err != .None || n.disk.dead) {
 			model_temp_write(m, sm.oi, strings.concatenate({".", name, ".swp"}, context.temp_allocator), op.actor, transmute([]u8)strings.to_string(b))
 		}
+		if !atomic && !overwrite && (err != .None || n.disk.dead) {
+			for t in parse_tokens(old) {
+				append(&op.deletes, strings.clone(t.text, w.allocator))
+			}
+		}
 	}
 	serr := fs.Error.None
 	if agent && !n.disk.dead {
