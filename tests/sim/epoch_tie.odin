@@ -10,6 +10,43 @@ import "../../src/prim"
 @(private = "file")
 TIE_ROUNDS :: 8
 
+@(private = "file")
+Tie_World :: struct {
+	accused: map[int]int,
+}
+
+@(private = "file")
+_tie: ^Tie_World
+
+@(init)
+_epoch_tie_init :: proc "contextless" () {
+	register_world(60, _tie_init, _tie_destroy)
+	register_engine_event(60, _tie_event)
+}
+
+@(private = "file")
+_tie_init :: proc(w: ^World) {
+	_tie = new(Tie_World, w.allocator)
+	_tie.accused = make(map[int]int, w.allocator)
+}
+
+@(private = "file")
+_tie_destroy :: proc(w: ^World) {
+	if _tie == nil {
+		return
+	}
+	delete(_tie.accused)
+	free(_tie, w.allocator)
+	_tie = nil
+}
+
+@(private = "file")
+_tie_event :: proc(w: ^World, n: ^Node, ev: ^eng.Event) {
+	if _tie != nil && (ev.kind == .Relay_Misbehaving || ev.kind == .Peer_Misbehaving) {
+		_tie.accused[n.idx] += 1
+	}
+}
+
 epoch_tie_run :: proc(seed: u64) -> (failures: [dynamic]string) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
@@ -185,8 +222,8 @@ _epoch_tie :: proc(w: ^World) {
 		world_fail(w, "epoch tie: no round produced two epochs with the same number, so the check proves nothing")
 	}
 	for n in ([]^Node{a, b, c}) {
-		if n.accused > 0 {
-			world_fail(w, "epoch tie: %s accused the relay or a peer of tampering %d times while every device was honest", n.name, n.accused)
+		if k := _tie.accused[n.idx]; k > 0 {
+			world_fail(w, "epoch tie: %s accused the relay or a peer of tampering %d times while every device was honest", n.name, k)
 		}
 	}
 }

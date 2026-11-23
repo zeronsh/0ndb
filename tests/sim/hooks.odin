@@ -4,10 +4,12 @@ import "core:fmt"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import eng "../../src/engine"
 
 Final_Check :: proc(w: ^World)
 Restart_Hook :: proc(w: ^World, n: ^Node)
 Event_Hook :: proc(w: ^World, ev: ^Sim_Event)
+Engine_Event_Hook :: proc(w: ^World, n: ^Node, ev: ^eng.Event)
 World_Hook :: proc(w: ^World)
 Collect_Hook :: proc(w: ^World, res: ^Run_Result)
 Op_Weight :: proc(w: ^World) -> int
@@ -72,6 +74,7 @@ Registry :: struct {
 	final_checks: Table(Ordered(Final_Check), 64),
 	restarted:    Table(Restart_Entry, 32),
 	events:       Table(Event_Hook, 32),
+	engine_events: Table(Ordered(Engine_Event_Hook), 32),
 	inits:        Table(Ordered(World_Hook), 32),
 	destroys:     Table(Ordered(World_Hook), 32),
 	collects:     Table(Ordered(Collect_Hook), 16),
@@ -99,6 +102,7 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.inits.items[:reg.inits.n], by)
 	slice.stable_sort_by(reg.destroys.items[:reg.destroys.n], by)
 	slice.stable_sort_by(reg.collects.items[:reg.collects.n], by)
+	slice.stable_sort_by(reg.engine_events.items[:reg.engine_events.n], by)
 	slice.stable_sort_by(reg.restarted.items[:reg.restarted.n], proc(a, b: Restart_Entry) -> bool {
 		return a.order < b.order
 	})
@@ -143,6 +147,10 @@ register_collect :: proc "contextless" (order: int, hook: Collect_Hook) {
 
 register_event :: proc "contextless" (hook: Event_Hook) -> Ev_Kind {
 	return Ev_Kind(EV_EXT_BASE + _add(&reg.events, hook))
+}
+
+register_engine_event :: proc "contextless" (order: int, hook: Engine_Event_Hook) {
+	_add(&reg.engine_events, Ordered(Engine_Event_Hook){order, hook})
 }
 
 register_op :: proc "contextless" (order: int, name: string, weight: Op_Weight, run: Op_Run) {
@@ -240,6 +248,13 @@ run_collect :: proc(w: ^World, res: ^Run_Result) {
 	_sorted()
 	for h in reg.collects.items[:reg.collects.n] {
 		h.call(w, res)
+	}
+}
+
+run_engine_event :: proc(w: ^World, n: ^Node, ev: ^eng.Event) {
+	_sorted()
+	for h in reg.engine_events.items[:reg.engine_events.n] {
+		h.call(w, n, ev)
 	}
 }
 
