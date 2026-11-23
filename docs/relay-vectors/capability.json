@@ -33,15 +33,33 @@
      "out": {},
      "closed": [],
      "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4500000003ccf77c94730e0988a300194c0f423579c9c647ea5314a00089436d990f687d9f0000000000000000050000003c55f3fffda05be24b695e0481267eba6172632d6105000000", "comment": "alice writes object A's archive",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4500000003ccf77c94730e0988a300194c0f4235797acd86d0fac70e6e6fd79389c42410a70000000000000000050000005e8dfbcd7aeea11c0d95dd04e015d1de6172632d6205000000", "comment": "alice writes object B's archive",
+     "out": {},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "alice", "bytes": "4500000003ccf77c94730e0988a300194c0f423579d23b5f93f10b384c32e63e794bd7663d0000000000000000050000006f1a7db5552f2aec4b8f347cc78f2ff67273742d6105000000", "comment": "alice writes a Restore for object A",
+     "out": {},
+     "closed": [],
+     "store": []},
     {"step": "durable",
      "out": {
        "alice": [
          {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579a8fcef2104428eaeff9da7dcbb2918291c00000000000000"},
-         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579bc2c23d7064ff589e20e749fc5fb1e281c00000000000000"}]},
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579bc2c23d7064ff589e20e749fc5fb1e281c00000000000000"},
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579c9c647ea5314a00089436d990f687d9f1d00000000000000"},
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f4235797acd86d0fac70e6e6fd79389c42410a71d00000000000000"},
+         {"kind": "Appended", "frame": "2800000083ccf77c94730e0988a300194c0f423579d23b5f93f10b384c32e63e794bd7663d1d00000000000000"}]},
      "closed": [],
      "store": [
        {"op": "append", "space": "e0343be6425b8277330205175d0cca36", "id": "ccf77c94730e0988a300194c0f423579a8fcef2104428eaeff9da7dcbb291829", "at": 0, "len": 28, "result": "None"},
-       {"op": "append", "space": "e0343be6425b8277330205175d0cca36", "id": "ccf77c94730e0988a300194c0f423579bc2c23d7064ff589e20e749fc5fb1e28", "at": 0, "len": 28, "result": "None"}]},
+       {"op": "append", "space": "e0343be6425b8277330205175d0cca36", "id": "ccf77c94730e0988a300194c0f423579bc2c23d7064ff589e20e749fc5fb1e28", "at": 0, "len": 28, "result": "None"},
+       {"op": "append", "space": "e0343be6425b8277330205175d0cca36", "id": "ccf77c94730e0988a300194c0f423579c9c647ea5314a00089436d990f687d9f", "at": 0, "len": 29, "result": "None"},
+       {"op": "append", "space": "e0343be6425b8277330205175d0cca36", "id": "ccf77c94730e0988a300194c0f4235797acd86d0fac70e6e6fd79389c42410a7", "at": 0, "len": 29, "result": "None"},
+       {"op": "append", "space": "e0343be6425b8277330205175d0cca36", "id": "ccf77c94730e0988a300194c0f423579d23b5f93f10b384c32e63e794bd7663d", "at": 0, "len": 29, "result": "None"}]},
     {"step": "connect", "conn": "one", "local": false, "binding": "b7a91a3434d80df5b88bb18e630dd821b18940ac246ae712f1df1da39c7fd255f1eb89faa2a807b526a967b5491d05b2db4de12716c7d61ac86113fff0de87e5",
      "out": {},
      "closed": [],
@@ -49,7 +67,7 @@
     {"step": "send", "conn": "one", "bytes": "1d01000001030202e0343be6425b8277330205175d0cca36dd751f174acd497a00f772101857412ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1010100000000000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca3ce45dad5708c5dfa7798867c28f6f9f1232c418d646305d1bc69c4ea5d881583cc5eab346b9630176bcf92d2e0a5dfae80dcfe16739b32d37675f423d6f90566be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473af12afc7f67bc9f602daa83f29aa8389b8089f70f68bdf56805cfb60fa9b1bb352f22149f98e538b4c1eccdad642521fa1da10f922f915ac5d55dc26c5f79320e", "comment": "type 2: one read-only token for object A",
      "out": {
        "one": [
-         {"kind": "Welcome", "frame": "2100000081030000faed517286183f0100000000000000000000000000000f00000000000000"}]},
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618960100000000000000000000000000000f00000000000000"}]},
      "closed": [],
      "store": []},
     {"step": "send", "conn": "one", "bytes": "3000000004ccf77c94730e0988a300194c0f423579a8fcef2104428eaeff9da7dcbb29182900000000000000004000000000000000", "comment": "A's segment is readable",
@@ -62,6 +80,24 @@
      "out": {
        "one": [
          {"kind": "Refused", "frame": "210000008c05ccf77c94730e0988a300194c0f423579bc2c23d7064ff589e20e749fc5fb1e28"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "one", "bytes": "3000000004ccf77c94730e0988a300194c0f423579c9c647ea5314a00089436d990f687d9f00000000000000004000000000000000", "comment": "A's archive is admitted with A's segment",
+     "out": {
+       "one": [
+         {"kind": "Data", "frame": "4d00000085ccf77c94730e0988a300194c0f423579c9c647ea5314a00089436d990f687d9f00000000000000001d00000000000080050000003c55f3fffda05be24b695e0481267eba6172632d6105000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "one", "bytes": "3000000004ccf77c94730e0988a300194c0f423579d23b5f93f10b384c32e63e794bd7663d00000000000000004000000000000000", "comment": "A's Restores are admitted with A's segment",
+     "out": {
+       "one": [
+         {"kind": "Data", "frame": "4d00000085ccf77c94730e0988a300194c0f423579d23b5f93f10b384c32e63e794bd7663d00000000000000001d00000000000080050000006f1a7db5552f2aec4b8f347cc78f2ff67273742d6105000000"}]},
+     "closed": [],
+     "store": []},
+    {"step": "send", "conn": "one", "bytes": "3000000004ccf77c94730e0988a300194c0f4235797acd86d0fac70e6e6fd79389c42410a700000000000000004000000000000000", "comment": "B's archive is not admitted by A's token: Not_Owner",
+     "out": {
+       "one": [
+         {"kind": "Refused", "frame": "210000008c05ccf77c94730e0988a300194c0f4235797acd86d0fac70e6e6fd79389c42410a7"}]},
      "closed": [],
      "store": []},
     {"step": "send", "conn": "one", "bytes": "4400000003dd751f174acd497a00f772101857412ca8fcef2104428eaeff9da7dcbb29182900000000000000000400000045092a7b3de7b26f8187fc85aafbb7756d696e6504000000", "comment": "a read-only token cannot append: Not_Owner",
@@ -77,7 +113,7 @@
     {"step": "send", "conn": "union", "bytes": "d90100000103030202e0343be6425b8277330205175d0cca36dd751f174acd497a00f772101857412ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1010100000000000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca3ce45dad5708c5dfa7798867c28f6f9f1232c418d646305d1bc69c4ea5d881583cc5eab346b9630176bcf92d2e0a5dfae80dcfe16739b32d37675f423d6f90502e0343be6425b8277330205175d0cca36dd751f174acd497a00f772101857412cb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2010300000000000000005b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ca27f0380d65a0638bc0982c2247dc9cc42fbf7c6351f3b3689930eccb37c9a1b74d4134336ea091aecca9d51aae6e3e7d0669c0754816cf7b6fdb526db6bcd0f66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a3bf0cf0ff92893bfe01945635c95c1681f3a9918b355e3ae93ee30782489fa75d946f8f2fbfd3aee88d1f51c634416f61c8f7a084c25bb0fc6cb4c9717e95205", "comment": "type 3: A read-only and B read-write",
      "out": {
        "union": [
-         {"kind": "Welcome", "frame": "2100000081030000faed517286183f0100000000000000000000000000000f00000000000000"}]},
+         {"kind": "Welcome", "frame": "2100000081030000faed51728618960100000000000000000000000000000f00000000000000"}]},
      "closed": [],
      "store": []},
     {"step": "send", "conn": "union", "bytes": "3000000004ccf77c94730e0988a300194c0f423579a8fcef2104428eaeff9da7dcbb29182900000000000000004000000000000000", "comment": "A is readable",

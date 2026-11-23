@@ -2,6 +2,7 @@ package relayvec
 
 import "core:crypto/blake2b"
 import "core:fmt"
+import "core:strings"
 import "../../src/journal"
 import "../../src/prim"
 import osync "../../src/sync"
@@ -1047,6 +1048,13 @@ cap_stream :: proc(k: ^Key, name_key: [32]u8, object: prim.Id) -> [32]u8 {
 	return cast([32]u8)osync.stream_id(&sc, k.dev, osync.object_segment_name(1, object), 0)
 }
 
+cap_derived :: proc(k: ^Key, name_key: [32]u8, object: prim.Id, prefix: string) -> [32]u8 {
+	sc: osync.Scope
+	sc.name_key = name_key
+	name := strings.concatenate({prefix, osync.object_segment_name(1, object)}, context.temp_allocator)
+	return cast([32]u8)osync.stream_id(&sc, k.dev, name, 0)
+}
+
 sc_capability :: proc(v: ^Vector) {
 	alice, guest, mallory := key_make(1), key_make(11), key_make(4)
 	sp := space_make(v, alice, 0x2c)
@@ -1068,6 +1076,11 @@ sc_capability :: proc(v: ^Vector) {
 	sa, sb := cap_stream(alice, nka, oa), cap_stream(alice, nkb, ob)
 	send(v, "alice", f_append(sa, 0, rec("in-a", 0)), "alice writes object A")
 	send(v, "alice", f_append(sb, 0, rec("in-b", 0)), "alice writes object B")
+	aa, ab := cap_derived(alice, nka, oa, "arc/"), cap_derived(alice, nkb, ob, "arc/")
+	ra := cap_derived(alice, nka, oa, "rst/")
+	send(v, "alice", f_append(aa, 0, rec("arc-a", 0)), "alice writes object A's archive")
+	send(v, "alice", f_append(ab, 0, rec("arc-b", 0)), "alice writes object B's archive")
+	send(v, "alice", f_append(ra, 0, rec("rst-a", 0)), "alice writes a Restore for object A")
 	durable(v)
 	ta := cap_token(alice, sp.id, guest, oa, osync.CAP_READ, nka)
 	tb := cap_token(alice, sp.id, guest, ob, osync.CAP_READ | osync.CAP_WRITE, nkb)
@@ -1075,6 +1088,9 @@ sc_capability :: proc(v: ^Vector) {
 	send(v, "one", hello(cap_cred(guest, binding("one"), ta)), "type 2: one read-only token for object A")
 	send(v, "one", f_read(sa, 0, 64), "A's segment is readable")
 	send(v, "one", f_read(sb, 0, 64), "B is not in the token: Not_Owner")
+	send(v, "one", f_read(aa, 0, 64), "A's archive is admitted with A's segment")
+	send(v, "one", f_read(ra, 0, 64), "A's Restores are admitted with A's segment")
+	send(v, "one", f_read(ab, 0, 64), "B's archive is not admitted by A's token: Not_Owner")
 	send(v, "one", f_append(cap_stream(guest, nka, oa), 0, rec("mine", 0)), "a read-only token cannot append: Not_Owner")
 	connect(v, "union")
 	send(v, "union", hello(cap_cred(guest, binding("union"), ta, tb)), "type 3: A read-only and B read-write")
