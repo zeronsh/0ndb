@@ -174,8 +174,8 @@ _ri_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 		return
 	}
 	if m2, ok := _ri_remount(w, a, tree, k); ok {
-		_ri_check_synced(w, a, tree, m2, actor, k)
 		run_until(w, w.now + 5_000_000_000, true)
+		_ri_check_synced(w, a, tree, m2, actor, k)
 	}
 	return
 }

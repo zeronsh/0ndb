@@ -784,8 +784,10 @@ equal in both directions.
   the removals, moves and directories it already applied. `absent` is
   persisted with the image's `synced` it qualifies, so no crash persists one
   without the other. While the shadow is owed (its writes wait on a failed
-  barrier), the saved state keeps the last `synced` it saved, so the image
-  never names a `synced` whose pinned entries the shadow has not persisted;
+  barrier), the saved state keeps the last `synced` it saved and the journal
+  position saved with it, so the image never names a `synced` whose pinned
+  entries the shadow has not persisted and recovery still replays every own
+  batch that `synced` does not contain;
   the first save after the owed shadow persists writes the current `synced`.
   A merge-mode materialization (catch-up of the mount's own batch) never
   writes over a file whose disk differs from the text at its base: it first
@@ -794,7 +796,19 @@ equal in both directions.
   for the device, parents the base and that actor's last op), points the
   file's entry at the snapshot version, and materializes the target with the
   snapshot, so the person's bytes are a durable op concurrent with the
-  target and the written text is the CRDT's merge. Ingest never reads an owed path that is missing on disk
+  target and the written text is the CRDT's merge. A materialization writes
+  nothing while history holds a batch that is not yet durable (a snapshot,
+  an ingest a pass committed mid-materialization for a race retry or a
+  blocker, a rebase): `materialize_to` returns `Deferred` before it touches
+  disk or the shadow, by the same rule catch-up gates on, and the history's
+  durable acknowledgement reschedules the mount. A caller that gets
+  `Deferred` stays where it is: a pass whose catch-up defers stops before it
+  ingests, the switch stays in its phase, `mount_materialize` returns as it
+  does when the line is not yet durable, and `mount_sync` reports `Deferred`
+  so a closing scope records its attribution for the pass that resumes.
+  While a materialization is held, the image keeps its journal position, so
+  recovery replays an own batch the held `synced` does not contain. Disk
+  only ever holds content history can name after any crash. Ingest never reads an owed path that is missing on disk
   as a delete, and the next pass that completes drains `absent`. A removal
   whose unlink fails fails its item, so its entry is never dropped while the
   file is still on disk. A pass whose line version is ahead of `synced`

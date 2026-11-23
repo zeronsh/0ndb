@@ -29,6 +29,7 @@ Error :: enum u8 {
 	Redacted,
 	Io,
 	Reloading,
+	Deferred,
 }
 
 STATE_NAME :: ".0ndb"
