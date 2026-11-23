@@ -18,6 +18,8 @@ Sim_Mount :: struct {
 	root:    string,
 	m:       ^fs.Mount,
 	checked: u64,
+	pending: bool,
+	op:      int,
 }
 
 M_Mount :: struct {
@@ -123,7 +125,7 @@ watch_event :: proc(w: ^World, n: ^Node) {
 	node_after(n)
 }
 
-node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string) -> eng.Error {
+node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string, pending: ^bool = nil, op := -1) -> eng.Error {
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	if n.reg == nil {
@@ -140,12 +142,52 @@ node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string) -> eng.Error {
 	}
 	grains := [?]i64{0, 1_000_000_000, 2_000_000_000}
 	disk_set_grain(&n.disk, root, grains[mix_bytes(w.cfg.seed, transmute([]u8)root) % len(grains)])
-	m, err := eng.tree_mount(&n.e, w.model.objs[oi].o, root)
-	if err != .None {
+	m, err := eng.tree_mount(&n.e, w.model.objs[oi].o, root, fs.DEFAULT_MOUNT, eng.Mount_Done{data = n, call = _mount_durable})
+	waiting := err == .Pending && m != nil
+	if err != .None && !waiting {
 		return err
 	}
-	append(&n.mounts, Sim_Mount{oi = oi, root = strings.clone(root, w.allocator), m = m})
+	append(&n.mounts, Sim_Mount{oi = oi, root = strings.clone(root, w.allocator), m = m, pending = waiting, op = op})
+	if pending != nil {
+		pending^ = waiting
+	}
 	return .None
+}
+
+@(private = "file")
+_mount_durable :: proc(data: rawptr, e: ^eng.Engine, fm: ^fs.Mount, err: eng.Error) {
+	n := (^Node)(data)
+	w := n.w
+	m := &w.model
+	for &sm in n.mounts {
+		if sm.m != fm || !sm.pending {
+			continue
+		}
+		sm.pending = false
+		world_note(w, "%s mount %s is durable -> %v", n.name, sm.root, err)
+		for op in m.ops {
+			if op.node != n.idx || op.inc != n.incarnation || op.status != .Issued {
+				continue
+			}
+			if (op.kind == .Git_Mount && op.obj == sm.oi) || op.idx == sm.op {
+				if err == .None {
+					op_done(op, 0, .None)
+					op.status = .Acked
+				} else {
+					op.status = .Uncertain
+				}
+			}
+		}
+		if err == .None {
+			for mm in m.mounts {
+				if mm.node == n.idx && mm.root == sm.root {
+					return
+				}
+			}
+			append(&m.mounts, M_Mount{node = n.idx, oi = sm.oi, root = strings.clone(sm.root, w.allocator)})
+		}
+		return
+	}
 }
 
 node_mounts_drop :: proc(w: ^World, n: ^Node) {
@@ -274,8 +316,12 @@ mount_obj :: proc(w: ^World, n: ^Node, oi: int) -> bool {
 	root := fmt.aprintf("%s%s-%s", WORK_PREFIX, id_short(m.objs[oi].o.id), n.name, allocator = w.allocator)
 	op := new_op(m, .Mount_Tree, n, oi)
 	op.path = root
-	err := node_mount(w, n, oi, root)
-	world_note(w, "%s mounts %s at %s -> %v", n.name, id_short(m.objs[oi].o.id), root, err)
+	waiting := false
+	err := node_mount(w, n, oi, root, &waiting, op.idx)
+	world_note(w, "%s mounts %s at %s -> %v (durable %v)", n.name, id_short(m.objs[oi].o.id), root, err, !waiting)
+	if err == .None && waiting {
+		return true
+	}
 	if err == .None {
 		append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = root})
 		op_done(op, 0, .None)
@@ -1025,8 +1071,12 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 		world_fail(w, "%s could not build git checkout %s: %v", n.name, root, gerr)
 		return
 	}
-	merr := node_mount(w, n, oi, root)
-	world_note(w, "%s git checkout %s mounted at %s -> %v", n.name, id_short(o.id), root, merr)
+	waiting := false
+	merr := node_mount(w, n, oi, root, &waiting)
+	world_note(w, "%s git checkout %s mounted at %s -> %v (durable %v)", n.name, id_short(o.id), root, merr, !waiting)
+	if merr == .None && waiting {
+		return
+	}
 	for op in m.ops[cop.idx + 1:] {
 		if op.kind == .Git_Mount && op.obj == oi {
 			if merr == .None {
