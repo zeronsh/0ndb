@@ -38,6 +38,7 @@ Mm_Mode :: enum u8 {
 	Power,
 	Hold,
 	Dirs,
+	Midcrash,
 }
 
 @(private = "file")
@@ -161,6 +162,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 		}
 		a.disk.fail_root = MM_ROOT
 		a.disk.fail_nth = c.k
+		a.disk.fail_stick = c.mode == .Midcrash
 	}
 	injected := a.disk.stats.injected
 	inc := a.incarnation
@@ -171,7 +173,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 		run_until(w, w.now + 1_000_000, false)
 	}
 	a.disk.fail_nth = 0
-	a.disk.fail_root = ""
+	a.disk.fail_stick = false
 	failed_pass = a.disk.stats.injected > injected
 	person := make(map[string]string, len(files), w.allocator)
 	scope: ^fs.Scope
@@ -195,7 +197,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 			fs.scope_write_begin(scope, held)
 		}
 	}
-	if failed_pass && a.alive {
+	if failed_pass && a.alive && c.mode != .Midcrash {
 		context = instance_context(&a.inst)
 		defer node_after(a)
 		a.disk.quiet = true
@@ -213,9 +215,15 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 		}
 		a.disk.quiet = false
 	}
-	if failed_pass && a.alive && (c.mode == .Process || c.mode == .Power) {
-		node_crash_now(a, .Process if c.mode == .Process else .Power, c.k)
+	if failed_pass && a.alive && (c.mode == .Process || c.mode == .Power || c.mode == .Midcrash) {
+		node_crash_now(a, .Power if c.mode == .Power else .Process, c.k)
+		if c.mode == .Midcrash {
+			_mm_write(vfs, MM_ROOT + "/.0ndb-tmp-999", "left by a crashed pass\n")
+			_mm_write(vfs, MM_ROOT + "/.0ndb-tmp-9x", "a user's file\n")
+		}
 	}
+	a.disk.fail_stuck = false
+	a.disk.fail_root = ""
 	run_until(w, w.now + 10_000_000_000, true)
 	if scope != nil && a.alive && a.incarnation == inc {
 		context = instance_context(&a.inst)
@@ -293,7 +301,27 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 	out := make([dynamic]string, context.temp_allocator)
 	a.disk.quiet = true
 	merr := fs.mount_synced_mismatches(m, &out, context.temp_allocator)
+	d: prim.Dir
+	lookalike := false
+	if prim.dir_open(vfs, &d, MM_ROOT, context.temp_allocator) == .None {
+		for {
+			de, more, derr := prim.dir_next(vfs, &d)
+			if derr != .None || !more {
+				break
+			}
+			if fs.name_our_temp(de.name) {
+				world_fail(w, "midway: %s/%s is left on disk after a materialize failed at op %d (%v)", MM_ROOT, de.name, c.k, c.mode)
+			}
+			if de.name == ".0ndb-tmp-9x" {
+				lookalike = true
+			}
+		}
+		prim.dir_close(vfs, &d)
+	}
 	a.disk.quiet = false
+	if c.mode == .Midcrash && failed_pass && !lookalike {
+		world_fail(w, "midway: the sweep after a crash at op %d removed %s/.0ndb-tmp-9x, which is not a temp of ours", c.k, MM_ROOT)
+	}
 	if merr == .None {
 		for x in out {
 			world_fail(w, "midway: after a materialize failed at op %d (%v) the synced version is not what is on disk: %s", c.k, c.mode, x)
