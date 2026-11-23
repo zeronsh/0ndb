@@ -137,6 +137,9 @@ Buffer :: struct {
 	oc:         [dynamic]crdt.Delta_Op,
 	held:       [dynamic]Ready,
 	intents:    [dynamic]crdt.Op_Span,
+	pend:       [dynamic]Pend,
+	peers:      [dynamic]prim.Id,
+	shown:      u64,
 }
 
 editor_actor :: proc(e: ^Engine, line := "") -> (id: prim.Id) {
@@ -385,6 +388,9 @@ _buffer_free :: proc(e: ^Engine, b: ^Buffer) {
 	}
 	delete(b.sent)
 	delete(b.intents)
+	_pend_clear(e, b)
+	delete(b.pend)
+	delete(b.peers)
 	for &g in b.undo {
 		_undo_free(&g)
 	}
@@ -627,6 +633,9 @@ _buffer_emit :: proc(e: ^Engine, b: ^Buffer, st: ^Sink_State) -> Error {
 		len = crdt.text_len(&b.view.text),
 	}
 	regions := crdt.delta_regions(&st.db, context.temp_allocator)
+	if len(b.pend) > 0 {
+		_pend_rebase(e, b, _regions_bytes(regions)[:])
+	}
 	wide := crdt.delta_widen(regions, &rd, context.temp_allocator)
 	ops := make([dynamic]crdt.Delta_Op, context.temp_allocator)
 	crdt.delta_emit(wide, _utf16(b), proc(data: rawptr, pos: int) -> int {
@@ -944,7 +953,7 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	if _buffer_find(e, id) != b {
 		return 0, 0, .Closed
 	}
-	if _ovl_on(b) || len(b.held) > 0 {
+	if len(b.held) > 0 {
 		_buffer_hold(e, b, ready) or_return
 	}
 	scratch := virtual.arena_temp_begin(&e.temp)
@@ -953,15 +962,13 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 	cur := ops[:]
 	moved := make([][]crdt.Delta_Op, len(b.sent), context.temp_allocator)
 	regone := make([][]Gone, len(b.sent), context.temp_allocator)
+	hits := make([dynamic]Gone, context.temp_allocator)
 	swallowed := false
 	for s, i in b.sent {
 		if len(s.gone) > 0 {
 			kept, hit := _gone_rebase(b, s.gone, cur)
 			regone[i] = kept[:]
-			for g in hit {
-				_intent_add(e, b, crdt.Op_Span{g.id, len(g.text)})
-				swallowed = true
-			}
+			append(&hits, ..hit[:])
 		}
 		a2 := make([dynamic]crdt.Delta_Op, context.temp_allocator)
 		b2 := make([dynamic]crdt.Delta_Op, context.temp_allocator)
@@ -969,14 +976,36 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 		moved[i] = b2[:]
 		cur = a2[:]
 	}
+	ed, dok := _disp_delta_bytes(b, cur)
+	if !dok {
+		return 0, 0, .Invalid
+	}
+	ev := ed[:]
+	ovl := _ovl_on(b)
+	if ovl {
+		m, mok := _ovl_unmap(b, ed[:])
+		if !mok {
+			if ready.call == nil {
+				_ovl_drop(e, b)
+				return buffer_edit(e, id, rev, edits, group, ready)
+			}
+			_buffer_hold(e, b, ready) or_return
+		}
+		ev = m
+	}
+	for g in hits {
+		_intent_add(e, b, crdt.Op_Span{g.id, len(g.text)})
+		swallowed = true
+	}
 	x: Built
 	_built_init(&x)
 	committed := false
 	last: crdt.Op_Id
-	if len(cur) > 0 {
+	seq0: u64
+	if len(ev) > 0 {
 		_handle_create_writer(h) or_return
-		seq0 := fs.history_next_seq(h.hist, b.actor)
-		_delta_runs(b, cur, seq0, &x) or_return
+		seq0 = fs.history_next_seq(h.hist, b.actor)
+		_delta_runs_view(b, ev, seq0, &x) or_return
 		if len(x.runs) > 0 {
 			last = _commit_runs(e, b, h, &x, seq0) or_return
 			committed = true
@@ -1009,6 +1038,10 @@ buffer_edit :: proc(e: ^Engine, id: Buffer_Id, rev: u64, edits: []Buffer_Edit, g
 		_buffer_lost(e, b)
 		return b.recv, b.rev, .None
 	}
+	if ovl && _ovl_on(b) {
+		_ovl_rebase(e, b, ev)
+	}
+	_pend_add(e, b, b.actor, seq0, last.seq, ed[:])
 	_group_keep(e, &b.undo, &x.group, group)
 	for &g in b.redo {
 		_undo_free(&g)
