@@ -519,7 +519,17 @@ equal in both directions.
   open the records past the image's offset are replayed over it. A crash
   that loses a history commit therefore reopens with the attributions that
   commit consumed still pending, and the re-detected change is credited to
-  its writer, not to the device.
+  its writer, not to the device. Every observation record is durable before
+  the observed write proceeds: `mount_observe_begin` completes its `done`
+  only once the record is synced, observations arriving together share one
+  fdatasync run off the loop through the registry's `Sync_Exec`, and the
+  observer holds the write until then. The record of the content a pass
+  consumed for an observed actor, and of the content an observed scope closed
+  with, goes through the same group sync, so a person's later edit of that
+  file is split from it after a crash. A change with no record is therefore
+  never an observed agent's, and after a power loss it is the device's
+  (`attrib_default_actor` is the one rule for that); an observed entry whose
+  content can no longer be matched is unattributed.
 - **Materialization**: remote or merged ops are written to disk only for
   inodes touched since the synced version; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,

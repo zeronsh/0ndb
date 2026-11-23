@@ -74,6 +74,10 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.purge = eng.Purge_Hook{data = n, purge = _on_purge}
 	cfg.credentials = eng.Credentials_Source{data = n, produce = node_credentials}
 	cfg.write_observer = sim_observer(n)
+	cfg.fs_exec = fs.Sync_Exec{run = proc(data: rawptr, job: proc(arg: rawptr), done: proc(arg: rawptr), arg: rawptr) {
+		job(arg)
+		done(arg)
+	}}
 	cfg.watcher = sim_watcher(n)
 	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail}
 	cfg.embedder = sim_embedder()
@@ -192,6 +196,7 @@ _free_partial :: proc(n: ^Node) {
 }
 
 node_kill :: proc(n: ^Node) {
+	n.observed = 0
 	w := n.w
 	context = w.ctx
 	live_kill(n)

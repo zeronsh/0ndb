@@ -95,6 +95,7 @@ Node :: struct {
 	probed:      bool,
 	sent:        map[string]i64,
 	boot:        u64,
+	observed:    int,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
 	reg:         ^fs.Registry,
@@ -221,6 +222,7 @@ World :: struct {
 	watches:   [dynamic]^Watch,
 	node_cfg:  proc(n: ^Node, cfg: ^eng.Config),
 	remote:    Sim_Remote,
+	attrib_crashed: bool,
 }
 
 Quarantine :: struct {

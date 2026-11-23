@@ -2,6 +2,7 @@ package engine
 
 import "core:crypto/blake2b"
 import "core:fmt"
+import "core:thread"
 import "../fs"
 import "../http"
 import "../prim"
@@ -13,6 +14,63 @@ Plug_State :: struct {
 	reg:       fs.Registry,
 	reg_on:    bool,
 	mounts:    [dynamic]^Mounted,
+	jobs:      [dynamic]^Fs_Job,
+}
+
+@(private)
+Fs_Job :: struct {
+	e:    ^Engine,
+	job:  proc(arg: rawptr),
+	done: proc(arg: rawptr),
+	arg:  rawptr,
+	th:   ^thread.Thread,
+	ran:  bool,
+}
+
+@(private)
+_fs_exec :: proc(data: rawptr, job: proc(arg: rawptr), done: proc(arg: rawptr), arg: rawptr) {
+	e := (^Engine)(data)
+	fj := new(Fs_Job, e.allocator)
+	fj^ = {e = e, job = job, done = done, arg = arg}
+	fj.th = thread.create_and_start_with_data(fj, _fs_job_main, init_context = context)
+	if fj.th == nil {
+		job(arg)
+		done(arg)
+		free(fj, e.allocator)
+		return
+	}
+	append(&e.plug.jobs, fj)
+}
+
+@(private)
+_fs_job_main :: proc(data: rawptr) {
+	fj := (^Fs_Job)(data)
+	fj.job(fj.arg)
+	post(fj.e, _fs_job_done, fj)
+}
+
+@(private)
+_fs_job_done :: proc(e: ^Engine, data: rawptr) {
+	fj := (^Fs_Job)(data)
+	if !fj.ran {
+		_fs_job_finish(e, fj)
+	}
+	free(fj, e.allocator)
+}
+
+@(private)
+_fs_job_finish :: proc(e: ^Engine, fj: ^Fs_Job) {
+	thread.join(fj.th)
+	thread.destroy(fj.th)
+	fj.th = nil
+	fj.ran = true
+	for x, i in e.plug.jobs {
+		if x == fj {
+			unordered_remove(&e.plug.jobs, i)
+			break
+		}
+	}
+	fj.done(fj.arg)
 }
 
 @(private)
@@ -113,6 +171,8 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 		run := _join(context.temp_allocator, e.dir, "run") or_return
 		_ferr(fs.registry_init(&e.plug.reg, e.base, run, e.allocator, e.cfg.random)) or_return
 		e.plug.reg_on = true
+		e.plug.jobs = make([dynamic]^Fs_Job, e.allocator)
+		fs.registry_set_exec(&e.plug.reg, e.cfg.fs_exec if e.cfg.fs_exec.run != nil else fs.Sync_Exec{data = e, run = _fs_exec})
 		fs.registry_set_base_note(&e.plug.reg, _on_base_note, e)
 		fs.registry_set_boot(&e.plug.reg, boot_id(e))
 		if e.cfg.watcher.start != nil {
@@ -317,6 +377,10 @@ _mounts_commit :: proc(e: ^Engine) {
 @(private)
 _plugs_close :: proc(e: ^Engine) {
 	if e.plug.reg_on {
+		for len(e.plug.jobs) > 0 {
+			_fs_job_finish(e, e.plug.jobs[len(e.plug.jobs) - 1])
+		}
+		delete(e.plug.jobs)
 		for mt in e.plug.mounts {
 			fs.mount_close(&mt.mount)
 			free(mt, e.allocator)
