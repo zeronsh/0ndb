@@ -442,10 +442,15 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 		strings.write_byte(&b, '\n')
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = pa.scope, agent = true})
-	if oerr := fs.mount_observe_begin(sm.m, pa.name, pa.scope); oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
+	oerr := fs.mount_observe_begin(sm.m, pa.name, pa.scope)
+	if oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
 		world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 	}
-	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
+	err := prim.Error.Io
+	if oerr == .None {
+		n.observed += 1
+		err = _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
+	}
 	if pa.hold && !n.disk.dead {
 		fs.scope_write_base(pa.scope, pa.name, from)
 		if rng_chance(&w.rng, 1, 2) {
@@ -536,18 +541,25 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 		scope = fs.scope_open(n.reg, sm.m, sid, op.actor)
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
+	oerr := fs.Error.None
 	if agent {
-		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && !n.disk.dead {
+		oerr = fs.mount_observe_begin(sm.m, name, scope)
+		if oerr != .None && !n.disk.dead {
 			if w.cfg.io_rate == 0 {
 				world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 			}
+		} else if oerr == .None {
+			n.observed += 1
 		}
 	}
 	atomic := !agent && rng_chance(&w.rng, 1, 2)
 	if atomic {
 		_writer_set(w, n, strings.concatenate({sm.root, "/.", name, ".swp"}, context.temp_allocator), Writer_Info{scope = scope, agent = agent})
 	}
-	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), atomic)
+	err := prim.Error.Io
+	if oerr == .None {
+		err = _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), atomic)
+	}
 	serr := fs.Error.None
 	if agent && !n.disk.dead {
 		serr = _agent_scope_close(w, n, scope)
@@ -556,6 +568,13 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	world_note(w, "%s %s(actor %s) %s %s/%s replaced %v wrote %v -> %v %v", n.name, "agent" if agent else "person", id_short(op.actor), "overwrite" if overwrite else "append", id_short(m.objs[sm.oi].o.id), name, op.deletes[:], op.tokens[:], err, serr)
 	if n.disk.dead {
 		node_after(n)
+		return
+	}
+	if !agent && err == .None && n.observed >= 2 && !w.attrib_crashed && env_u64("SIM_ATTRIB_CRASH", 0) != 0 {
+		w.attrib_crashed = true
+		world_note(w, "%s power loss after a person's edit with %d observations in the attribution log (SIM_ATTRIB_CRASH)", n.name, n.observed)
+		stat_add(w, STAT_ATTRIB_CRASH)
+		node_crash_now(n, .Power, 77)
 		return
 	}
 	if err != .None {
@@ -886,4 +905,12 @@ _mounts_stats :: proc "contextless" () {
 	STAT_BASE_CURRENT = register_stat(50, 1, "current")
 	STAT_BASE_MISMATCH = register_stat(50, 2, "mismatch")
 	STAT_BASE_OTHER = register_stat(50, 3, "other")
+}
+
+STAT_ATTRIB_CRASH: Stat
+
+@(init)
+_attrib_crash_stat :: proc "contextless" () {
+	register_stat_line(46)
+	STAT_ATTRIB_CRASH = register_stat(46, 0, "attrib_crash")
 }

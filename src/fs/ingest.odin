@@ -1165,6 +1165,29 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 }
 
 @(private)
+attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int) -> Error {
+	m := p.m
+	logged := false
+	for i in idx {
+		c := &p.changes[i]
+		if (c.kind != .Modify && c.kind != .Create) || c.disk != .File {
+			continue
+		}
+		e, found, serr := shadow_get(&m.shadow, c.path)
+		if serr != .None || !found || e.oid == {} {
+			continue
+		}
+		attrib_set(m, c.path, actor, true, e.oid)
+		attrib_log_append(m, c.path, actor, e.oid) or_return
+		logged = true
+	}
+	if logged {
+		attrib_log_durable(m, nil, nil)
+	}
+	return .None
+}
+
+@(private)
 attribute_changes :: proc(p: ^Pass) -> Error {
 	m := p.m
 	for &c in p.changes {
@@ -1173,9 +1196,6 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		}
 		a, has := m.attrib[c.path]
 		if !has {
-			if m.lost && m.window {
-				c.actor = unattributed_actor(m.actor)
-			}
 			continue
 		}
 		if a.used && !m.lost {
@@ -1643,6 +1663,9 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			}
 			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
 				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))]) or_return
+			}
+			if actor != m.actor {
+				attribute_consumed(p, actor, idx) or_return
 			}
 		}
 	}

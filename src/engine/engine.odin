@@ -177,6 +177,7 @@ Config :: struct {
 	events:          Event_Hook,
 	http:            http.Client,
 	write_observer:  fs.Write_Observer,
+	fs_exec:         fs.Sync_Exec,
 	watcher:         fs.Watcher,
 	boot_id:         Boot_Source,
 	search_options:  search.Options,

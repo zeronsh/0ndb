@@ -85,6 +85,35 @@ Registry :: struct {
 	eol_data:  rawptr,
 	on_base:   Base_Proc,
 	base_data: rawptr,
+	exec:      Sync_Exec,
+}
+
+Observe_Done :: proc(ctx: rawptr, err: Error)
+
+Sync_Exec :: struct {
+	data: rawptr,
+	run:  proc(data: rawptr, job: proc(arg: rawptr), done: proc(arg: rawptr), arg: rawptr),
+}
+
+registry_set_exec :: proc(reg: ^Registry, exec: Sync_Exec) {
+	reg.exec = exec
+}
+
+@(private)
+Obs_Wait :: struct {
+	done: Observe_Done,
+	ctx:  rawptr,
+}
+
+@(private)
+Log_Sync :: struct {
+	m:         ^Mount,
+	vfs:       prim.Vfs,
+	fd:        prim.Fd,
+	err:       Error,
+	waits:     [dynamic]Obs_Wait,
+	detached:  bool,
+	allocator: runtime.Allocator,
 }
 
 @(private)
@@ -316,6 +345,8 @@ Mount :: struct {
 	mat_bytes:   int,
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
+	log_sync:    ^Log_Sync,
+	log_next:    [dynamic]Obs_Wait,
 	log_len:     i64,
 	log_gen:     u64,
 	log_at:      i64,
@@ -324,7 +355,6 @@ Mount :: struct {
 	legacy:      bool,
 	lost:        bool,
 	retained:    bool,
-	window:      bool,
 	override:    map[string]odb.Oid,
 	clean:       bool,
 	waits:       [dynamic]Mount_Wait,
@@ -449,6 +479,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 		opts      = opts,
 		lock_fd   = prim.INVALID_FD,
 		log_fd    = prim.INVALID_FD,
+		log_next  = make([dynamic]Obs_Wait, allocator),
 		root_wd   = -1,
 		slot      = -1,
 	}
@@ -619,9 +650,25 @@ mount_close :: proc(m: ^Mount) {
 		save_mount_state(m)
 	}
 	if m.log_fd >= 0 {
-		prim.close_file(m.vfs, m.log_fd)
+		if len(m.log_next) > 0 {
+			err := from_prim(prim.datasync(m.vfs, m.log_fd))
+			for w in m.log_next {
+				if w.done != nil {
+					w.done(w.ctx, err)
+				}
+			}
+			clear(&m.log_next)
+		}
+		if ls := m.log_sync; ls != nil {
+			ls.detached = true
+			ls.m = nil
+			m.log_sync = nil
+		} else {
+			prim.close_file(m.vfs, m.log_fd)
+		}
 		m.log_fd = prim.INVALID_FD
 	}
+	delete(m.log_next)
 	if m.shadow.dir != "" {
 		shadow_close(&m.shadow)
 	}
@@ -863,9 +910,21 @@ mount_mark_observed :: proc(m: ^Mount, rel: string, scope: ^Scope) {
 	mount_schedule(m, m.opts.settle_ms)
 }
 
-mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
+mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, done: Observe_Done = nil, ctx: rawptr = nil) -> Error {
+	logged, err := _observe_begin(m, rel, scope)
+	if err != .None || !logged {
+		if done != nil {
+			done(ctx, err)
+		}
+		return err
+	}
+	return attrib_log_durable(m, done, ctx)
+}
+
+@(private)
+_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> (logged: bool, err: Error) {
 	if scope == nil || path_internal(rel) {
-		return .None
+		return false, .None
 	}
 	a, attributed := m.attrib[rel]
 	stale := attributed && !a.used && a.actor != scope.actor
@@ -881,7 +940,9 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 			m.open_scopes[rel] = nil
 		}
 		mount_mark_observed(m, rel, pending if other else nil)
-		mount_pass(m, false) or_return
+		if perr := mount_pass(m, false); perr != .None {
+			return false, perr
+		}
 	}
 	if stale {
 		if b, still := m.attrib[rel]; still && !b.used && b.actor == a.actor {
@@ -896,10 +957,85 @@ mount_observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Error {
 		m.open_scopes[k] = scope
 	}
 	if c, ok := m.attrib[rel]; ok && c.actor == scope.actor && !c.used {
-		return .None
+		return false, .None
 	}
 	attrib_set(m, rel, scope.actor)
-	return attrib_log_append(m, rel, scope.actor)
+	if aerr := attrib_log_append(m, rel, scope.actor); aerr != .None {
+		return false, aerr
+	}
+	return m.log_fd >= 0, .None
+}
+
+attrib_default_actor :: proc(m: ^Mount, path: string) -> prim.Id {
+	if a, has := m.attrib[path]; has && (!a.used || m.lost) {
+		return unattributed_actor(m.actor) if m.lost else a.actor
+	}
+	return m.actor
+}
+
+@(private)
+attrib_log_durable :: proc(m: ^Mount, done: Observe_Done, ctx: rawptr) -> Error {
+	if m.log_fd < 0 {
+		if done != nil {
+			done(ctx, .None)
+		}
+		return .None
+	}
+	exec := m.reg.exec if m.reg != nil else Sync_Exec{}
+	if exec.run == nil {
+		err := from_prim(prim.datasync(m.vfs, m.log_fd))
+		if done != nil {
+			done(ctx, err)
+		}
+		return err
+	}
+	if m.log_sync != nil {
+		append(&m.log_next, Obs_Wait{done, ctx})
+		return .None
+	}
+	_log_sync_start(m, exec, Obs_Wait{done, ctx})
+	return .None
+}
+
+@(private)
+_log_sync_start :: proc(m: ^Mount, exec: Sync_Exec, first: Maybe(Obs_Wait)) {
+	ls := new(Log_Sync, m.allocator)
+	ls^ = {m = m, vfs = m.vfs, fd = m.log_fd, allocator = m.allocator}
+	ls.waits = make([dynamic]Obs_Wait, m.allocator)
+	if w, ok := first.?; ok {
+		append(&ls.waits, w)
+	}
+	append(&ls.waits, ..m.log_next[:])
+	clear(&m.log_next)
+	m.log_sync = ls
+	exec.run(exec.data, _log_sync_job, _log_sync_done, ls)
+}
+
+@(private)
+_log_sync_job :: proc(arg: rawptr) {
+	ls := cast(^Log_Sync)arg
+	ls.err = from_prim(prim.datasync(ls.vfs, ls.fd))
+}
+
+@(private)
+_log_sync_done :: proc(arg: rawptr) {
+	ls := cast(^Log_Sync)arg
+	m := ls.m
+	if ls.detached {
+		prim.close_file(ls.vfs, ls.fd)
+	} else if m != nil {
+		m.log_sync = nil
+	}
+	for w in ls.waits {
+		if w.done != nil {
+			w.done(w.ctx, ls.err)
+		}
+	}
+	delete(ls.waits)
+	free(ls, ls.allocator)
+	if m != nil && len(m.log_next) > 0 && m.reg != nil && m.reg.exec.run != nil {
+		_log_sync_start(m, m.reg.exec, nil)
+	}
 }
 
 @(private)
@@ -964,7 +1100,6 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		pos += 8 + n
 	}
 	m.log_len = i64(pos)
-	m.window = i64(pos) > m.log_at
 	return .None
 }
 
@@ -985,12 +1120,8 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	prim.put_u32le(rec[0:4], u32(len(body)))
 	prim.put_u32le(rec[4:8], u32(xxhash.XXH3_64_with_seed(body[:], m.log_gen)))
 	copy(rec[8:], body[:])
-	first := m.log_len == 0
 	from_prim(prim.write_at(m.vfs, m.log_fd, rec, m.log_len)) or_return
 	m.log_len += i64(len(rec))
-	if first {
-		from_prim(prim.datasync(m.vfs, m.log_fd)) or_return
-	}
 	return .None
 }
 
@@ -1047,7 +1178,9 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 		return
 	}
 	attrib_set(m, rel, a.actor, false, oid)
-	attrib_log_append(m, rel, a.actor, oid)
+	if attrib_log_append(m, rel, a.actor, oid) == .None {
+		attrib_log_durable(m, nil, nil)
+	}
 }
 
 observer_installed :: proc(reg: ^Registry) -> bool {
