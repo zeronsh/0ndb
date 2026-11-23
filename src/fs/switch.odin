@@ -53,7 +53,9 @@ mount_switch_step :: proc(m: ^Mount) {
 	if len(m.switch_to) == 0 {
 		return
 	}
-	if _, err := switch_advance(m); err == .Reloading {
+	if _, err := switch_advance(m); err == .Deferred {
+		return
+	} else if err == .Reloading {
 		mount_reload_retry(m)
 	} else if err != .None {
 		switch_report(m, err)

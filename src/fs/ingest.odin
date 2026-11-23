@@ -1266,7 +1266,8 @@ catch_up :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	if !mount_durable_now(m) {
-		return .None
+		m.mat_held = true
+		return .Deferred
 	}
 	one := [1]crdt.Lv{latest}
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -1599,6 +1600,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	}
 	if p.full {
 		collect_full(&p) or_return
+		m.sweep_temps = false
 	} else {
 		slice.sort_by(keys[:], proc(a, b: string) -> bool {return git_path_cmp(a, false, b, false) < 0})
 		pre_moves(&p, keys[:]) or_return
@@ -1647,7 +1649,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			dirty_at_note(m, y, at)
 		}
 	}
-	rebase_materialize(m, p.rebased[:]) or_return
+	if rerr := rebase_materialize(m, p.rebased[:]); rerr != .None && rerr != .Deferred {
+		return rerr
+	}
 	if p.head_moved && m.has_git && !p.git_wrote {
 		b: Builder
 		builder_init(&b, m.history, m.actor)
