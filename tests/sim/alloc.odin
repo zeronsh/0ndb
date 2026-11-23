@@ -22,6 +22,7 @@ region_configure :: proc(main_mb, temp_mb: u64) {
 	region_temp_size = uint(max(temp_mb, 8)) << 20
 }
 HEADER :: 16
+POISON :: u8(0x2a)
 MIN_CLASS :: 5
 MAX_CLASS :: 40
 
@@ -151,6 +152,7 @@ _free :: proc(r: ^Region, ptr: rawptr) {
 	hdr := (^[2]u32)(p - HEADER)
 	k := int(hdr[0])
 	block := p - uintptr(hdr[1])
+	mem.set(ptr, POISON, _cap(ptr))
 	(^uintptr)(block)^ = r.free[k]
 	r.free[k] = block
 	r.live -= 1

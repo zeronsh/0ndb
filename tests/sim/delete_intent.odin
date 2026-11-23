@@ -299,7 +299,7 @@ check_delete_intent_first :: proc(w: ^World) {
 	_di_close(na, ia)
 	_di_close(nb, ib)
 	_di_settle(w, oi)
-	_di_absent(w, oi, tok, []string{base[:len(base) - 1], tok[len(base) - 1:]}, "first write")
+	_di_absent(w, oi, tok, []string{base[:len(base) - 1], "é", "€", "😀"}, "first write")
 }
 
 @(private = "file")
