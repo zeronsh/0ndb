@@ -658,6 +658,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 				_touch(e)
 			}
 		}
+		_mounts_durable(e)
 		if e.fatal == .None {
 			for _, h in e.handles {
 				_table_publish(e, h)
