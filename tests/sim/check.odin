@@ -752,6 +752,10 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 			if total != len(data) {
 				world_fail(w, "attribution: %s/%s on %s has %d bytes but spans cover %d", id_short(ob.o.id), nm, n.name, len(data), total)
 			}
+			if model_temp(m, oi, nm) {
+				_check_temp(w, oi, n, nm, data, spans)
+				continue
+			}
 			collect(&present, &twice, data, spans, nm)
 		}
 	}
@@ -855,6 +859,44 @@ _check_tokens :: proc(w: ^World, oi: int, n: ^Node) {
 		}
 		if _token_op(m, oi, tok) == nil {
 			world_fail(w, "model: unknown token %s present in %s on %s", tok, id_short(ob.o.id), n.name)
+		}
+	}
+}
+
+@(private = "file")
+_check_temp :: proc(w: ^World, oi: int, n: ^Node, file: string, data: []u8, spans: []crdt_span) {
+	m := &w.model
+	seen := make(map[string]bool, context.temp_allocator)
+	for t in parse_tokens(data) {
+		if t.text in seen {
+			world_fail(w, "exactly-once: token %s appears more than once in the temp file %s/%s on %s", t.text, id_short(m.objs[oi].o.id), file, n.name)
+		}
+		seen[t.text] = true
+		written := false
+		for x in m.temps {
+			if x.obj != oi || x.path != file {
+				continue
+			}
+			for tok in x.tokens {
+				written ||= tok == t.text
+			}
+		}
+		if !written {
+			world_fail(w, "model: token %s is in %s/%s on %s, but no failed atomic write left it in that temp file", t.text, id_short(m.objs[oi].o.id), file, n.name)
+			continue
+		}
+		at := 0
+		for sp in spans {
+			if max(at, t.pos) < min(at + sp.len, t.pos + len(t.text)) {
+				by := false
+				for x in m.temps {
+					by ||= x.obj == oi && x.path == file && x.actor == sp.actor
+				}
+				if !by {
+					world_fail(w, "attribution: token %s in the temp file %s/%s is credited to %s, which wrote no temp file there, on %s", t.text, id_short(m.objs[oi].o.id), file, id_short(sp.actor), n.name)
+				}
+			}
+			at += sp.len
 		}
 	}
 }

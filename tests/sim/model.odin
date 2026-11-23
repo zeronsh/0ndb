@@ -136,6 +136,14 @@ Model :: struct {
 	grants:   [dynamic]Pending_Share,
 	mounts:   [dynamic]M_Mount,
 	probes:   [dynamic]int,
+	temps:    [dynamic]M_Temp,
+}
+
+M_Temp :: struct {
+	obj:    int,
+	path:   string,
+	actor:  prim.Id,
+	tokens: [dynamic]string,
 }
 
 Pending_Share :: struct {
@@ -159,6 +167,7 @@ model_init :: proc(m: ^Model, w: ^World) {
 	m.mounts = make([dynamic]M_Mount, a)
 	m.probes = make([dynamic]int, a)
 	m.moves = make([dynamic]^M_Move, a)
+	m.temps = make([dynamic]M_Temp, a)
 }
 
 model_destroy :: proc(m: ^Model) {
@@ -207,6 +216,32 @@ model_destroy :: proc(m: ^Model) {
 		free(mv, a)
 	}
 	delete(m.moves)
+	for &t in m.temps {
+		delete(t.path, a)
+		for x in t.tokens {
+			delete(x, a)
+		}
+		delete(t.tokens)
+	}
+	delete(m.temps)
+}
+
+model_temp_write :: proc(m: ^Model, obj: int, path: string, actor: prim.Id, data: []u8) {
+	a := m.w.allocator
+	t := M_Temp{obj = obj, path = strings.clone(path, a), actor = actor, tokens = make([dynamic]string, a)}
+	for x in parse_tokens(data) {
+		append(&t.tokens, strings.clone(x.text, a))
+	}
+	append(&m.temps, t)
+}
+
+model_temp :: proc(m: ^Model, obj: int, path: string) -> bool {
+	for t in m.temps {
+		if t.obj == obj && t.path == path {
+			return true
+		}
+	}
+	return false
 }
 
 new_move :: proc(m: ^Model, n: ^Node, obj: int, from: string, to: string) -> ^M_Move {

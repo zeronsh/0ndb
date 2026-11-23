@@ -559,6 +559,9 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	err := prim.Error.Io
 	if oerr == .None {
 		err = _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), atomic)
+		if atomic && (err != .None || n.disk.dead) {
+			model_temp_write(m, sm.oi, strings.concatenate({".", name, ".swp"}, context.temp_allocator), op.actor, transmute([]u8)strings.to_string(b))
+		}
 	}
 	serr := fs.Error.None
 	if agent && !n.disk.dead {
