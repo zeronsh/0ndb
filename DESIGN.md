@@ -400,6 +400,11 @@ equal in both directions.
   and version it was last synced at. An on-disk table (append-only records
   plus an open-addressing hash file), compacted right after a mount state
   save when garbage exceeds half. Only unpersisted changes live in memory.
+  The hash file records how far into the log it is covered and whether it
+  was closed cleanly; it is trusted only up to that point and the log tail
+  is replayed. A replay that fails part way marks the hash file lost: it is
+  never checkpointed or marked clean, so a later open replays the tail
+  again instead of trusting an index that misses its records.
 - **First mount** walks with parallel `getdents64`/`statx` workers that exist
   only for the scan. In a git checkout the index is read once: entries whose
   stat matches take the index oid (the file text is then referenced from
