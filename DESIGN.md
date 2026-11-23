@@ -3128,6 +3128,19 @@ Relay cost tracks the reachable information, not the activity. Items marked
   and requires the same view afterwards (conversations, texts and maps),
   and does the same for a segment held on devices below its base with the
   writer online.
+  A fetch never repeats the same short window: a forward parse whose first
+  record runs past the fetched bytes asks again up to that record's end, a
+  backward parse whose last record starts before them asks again from that
+  record's start, and an archive read that ends inside a record doubles its
+  window. A requested offset the replicator cannot prove is a boundary
+  (a have edge, zero or the relay length) is only a claim: a parse from or
+  to a claim that meets a malformed or unverifiable record drops the claim
+  and keeps nothing, and is not counted as relay misbehaviour, so a view's
+  guessed window cannot turn a mid-record offset into a have edge. The sim
+  shrinks the tail and fetch window to 1 to 5 KiB on a third of its seeds,
+  so records and archive groups larger than the window take every path,
+  and fails a run in which a node receives more than four times the
+  distinct bytes it kept of a stream per connection plus 256 KiB.
   Map groups collect: a Put whose every field is matched or beaten (by
   register order) by a later Put of the same key in the same group becomes
   a length-only `Gone` entry, a run of them ends with the chain head after

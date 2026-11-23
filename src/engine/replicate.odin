@@ -27,6 +27,7 @@ _repl_start :: proc(e: ^Engine, sp: ^Space) -> Error {
 		archive_min  = e.cfg.archive_min if e.cfg.archive_min != 0 else osync.ARCHIVE_MIN_DEFAULT,
 		archive_group = e.cfg.archive_group,
 		archive_level = e.cfg.archive_level,
+		tail_window  = e.cfg.tail_window,
 		archive_keys = _repl_archive_keys,
 		archive_collect = _repl_archive_collect,
 	}
