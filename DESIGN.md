@@ -970,9 +970,10 @@ equal in both directions.
   re-classify, clear the record and report done; the op then releases the
   writes and resumes the runs bound to the target line. Each phase is saved
   before its effects and every step is idempotent, so a mount that reopens
-  with the record set resumes it: before the target phase it stays on the
-  old line, after it it rolls forward (recreating a target line whose import
-  was lost, and removing a stale `index.lock` the crash left). The git phase
+  with the record set resumes it: before the target phase it reopens on the
+  old line (`switch_from`, never the mount's home line, so the resumed ingest
+  lands the old branch's disk on that branch), after it it rolls forward
+  (recreating a target line whose import was lost, and removing a stale `index.lock` the crash left). The git phase
   saves the target head (ref and commit) with the record; a reopen that finds
   git HEAD already there adopts it before its first pass, with the reflog
   position just past the `0ndb: switch` entry and no trusted index stamp, so
