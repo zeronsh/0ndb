@@ -201,7 +201,7 @@ install_run :: proc(b: ^Install) -> Error {
 	defer delete(uf, db.allocator)
 	defer delete(ud, db.allocator)
 	b.nsync = u64(len(uf) + len(ud))
-	sync_paths(db, uf, nil, b.roots[:]) or_return
+	sync_paths(db, uf, nil, b.roots[:], true) or_return
 	install_rename(b) or_return
 	return sync_paths(db, nil, ud, b.roots[:])
 }
