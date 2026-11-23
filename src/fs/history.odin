@@ -3165,6 +3165,7 @@ history_owned_actors :: proc(h: ^History, owners: []prim.Id, allocator := contex
 }
 
 history_register_actor :: proc(h: ^History, actor, mount: prim.Id) -> Error {
+	history_wake(h) or_return
 	if _, known := history_actor_owner(h, actor); known {
 		return .None
 	}
