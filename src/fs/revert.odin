@@ -60,13 +60,15 @@ Revert_Edit :: struct {
 	ins:  int,
 }
 
-turn_pseudo :: proc(conversation: prim.Id) -> (pseudo: prim.Id) {
+scope_pseudo :: proc(conversation: prim.Id, mount: prim.Id, line: string) -> (pseudo: prim.Id) {
 	ctx: blake2b.Context
 	blake2b.init(&ctx, 16)
-	tag := "0ndb turn actor"
+	tag := "0ndb agent actor"
 	blake2b.update(&ctx, transmute([]u8)tag)
-	c := conversation
+	c, mid := conversation, mount
 	blake2b.update(&ctx, c[:])
+	blake2b.update(&ctx, mid[:])
+	blake2b.update(&ctx, transmute([]u8)line)
 	blake2b.final(&ctx, pseudo[:])
 	return
 }
