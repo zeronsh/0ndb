@@ -118,6 +118,11 @@ Disk :: struct {
 	grains:    [dynamic]Grain,
 	crash_on_trunc: string,
 	force_process: bool,
+	blob_crash: u64,
+	blob_crash_n: u64,
+	blob_crashes: u64,
+	blob_ckpt: bool,
+	blob_ckpt_crashes: u64,
 	force_ghost: bool,
 	ghost_root:  string,
 	lose_shrinks: bool,
@@ -826,6 +831,10 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	}
 	if d.probe == 0 {
 		d.stats.syncs += 1
+		if of, _, ferr := _fd_get(d, fd); ferr == .None && d.crash_at == 0 && disk_blob_sync_crash(d, of.path) {
+			d.crash_at = d.stats.ops + 1
+			d.blob_crashes += 1
+		}
 	}
 	for p in n.pend {
 		switch p.kind {

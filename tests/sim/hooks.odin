@@ -12,6 +12,7 @@ World_Hook :: proc(w: ^World)
 Collect_Hook :: proc(w: ^World, res: ^Run_Result)
 Op_Weight :: proc(w: ^World) -> int
 Op_Run :: proc(w: ^World, n: ^Node)
+Step_Hook :: proc(w: ^World, n: ^Node)
 
 STATS_MAX :: 96
 EV_EXT_BASE :: 128
@@ -75,6 +76,7 @@ Registry :: struct {
 	inits:        Table(Ordered(World_Hook), 32),
 	destroys:     Table(Ordered(World_Hook), 32),
 	collects:     Table(Ordered(Collect_Hook), 16),
+	steps:        Table(Ordered(Step_Hook), 16),
 	ops:          Table(Ext_Op, 32),
 	stats:        Table(Stat_Def, STATS_MAX),
 	lines:        Table(Stat_Line, 32),
@@ -99,6 +101,7 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.inits.items[:reg.inits.n], by)
 	slice.stable_sort_by(reg.destroys.items[:reg.destroys.n], by)
 	slice.stable_sort_by(reg.collects.items[:reg.collects.n], by)
+	slice.stable_sort_by(reg.steps.items[:reg.steps.n], by)
 	slice.stable_sort_by(reg.restarted.items[:reg.restarted.n], proc(a, b: Restart_Entry) -> bool {
 		return a.order < b.order
 	})
@@ -139,6 +142,10 @@ register_world :: proc "contextless" (order: int, init: World_Hook = nil, destro
 
 register_collect :: proc "contextless" (order: int, hook: Collect_Hook) {
 	_add(&reg.collects, Ordered(Collect_Hook){order, hook})
+}
+
+register_step :: proc "contextless" (order: int, hook: Step_Hook) {
+	_add(&reg.steps, Ordered(Step_Hook){order, hook})
 }
 
 register_event :: proc "contextless" (hook: Event_Hook) -> Ev_Kind {
@@ -240,6 +247,16 @@ run_collect :: proc(w: ^World, res: ^Run_Result) {
 	_sorted()
 	for h in reg.collects.items[:reg.collects.n] {
 		h.call(w, res)
+	}
+}
+
+run_step :: proc(w: ^World, n: ^Node) {
+	if reg.steps.n == 0 {
+		return
+	}
+	_sorted()
+	for h in reg.steps.items[:reg.steps.n] {
+		h.call(w, n)
 	}
 }
 

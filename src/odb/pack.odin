@@ -36,6 +36,9 @@ Pack :: struct {
 	failed:     bool,
 	present:    bool,
 	freshened:  bool,
+	staged:     bool,
+	data_tmp:   bool,
+	data_at:    string,
 }
 
 @(private)
@@ -155,7 +158,10 @@ pack_open_data :: proc(db: ^Odb, p: ^Pack) -> Error {
 		return .Corrupt
 	}
 	buf: [PATH_MAX]u8
-	path := concat_into(buf[:], p.base, ".pack") or_return
+	path := p.data_at
+	if !p.data_tmp {
+		path = concat_into(buf[:], p.base, ".pack") or_return
+	}
 	if db.use_mmap && vfs_is_os(db.vfs) {
 		data, merr := vfs_map_path(db.vfs, path)
 		if merr != .None {

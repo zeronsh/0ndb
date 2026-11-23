@@ -275,6 +275,8 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 			return false, _poison(p, berr)
 		}
 	}
+	p.fl.install = p.queued
+	p.queued = {}
 	p.force = false
 	if p.dirsync_pending {
 		p.fl.dirsync = true
@@ -344,6 +346,10 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 		} else {
 			_unpin_real(p, j.fd)
 		}
+	}
+	if h := fl.install; h.done != nil {
+		fl.install = {}
+		h.done(h.data, err == .None)
 	}
 	for id in fl.busy {
 		ci := _cont_index(p, id)
