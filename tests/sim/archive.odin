@@ -347,6 +347,8 @@ STAT_RESTORES_READ: Stat
 STAT_RESTORE_SCENARIOS: Stat
 STAT_FORGET_SCENARIOS: Stat
 STAT_FORGET_DEVICE: Stat
+STAT_RESTORE_COLD: Stat
+STAT_FETCH_RATIO: Stat
 STAT_REREADS: Stat
 STAT_REREAD_BYTES: Stat
 
@@ -357,6 +359,15 @@ _archive_hooks :: proc "contextless" () {
 	register_final_check(88, check_forget_offline_writer)
 	register_final_check(90, check_restore_offline_writer)
 	register_final_check(95, check_archive_cipher)
+	register_final_check(97, check_archive_waits)
+	register_final_check(98, check_fetch_bound)
+	register_world(50, nil, proc(w: ^World) {
+		for _, a in w.fetches {
+			delete(a.have)
+			free(a, w.allocator)
+		}
+		delete(w.fetches)
+	})
 	register_final_check(96, check_archive_streams)
 	register_final_check(200, check_archive_reread)
 	register_collect(20, proc(w: ^World, res: ^Run_Result) {
@@ -373,6 +384,8 @@ _archive_hooks :: proc "contextless" () {
 	STAT_RESTORES_READ = register_stat(77, 6, "restores_read")
 	STAT_FORGET_SCENARIOS = register_stat(77, 7, "forget_scenarios")
 	STAT_FORGET_DEVICE = register_stat(77, 8, "forget_device_scenarios")
+	STAT_RESTORE_COLD = register_stat(77, 9, "restore_cold_reads")
+	STAT_FETCH_RATIO = register_stat(77, 10, "max_fetch_ratio_pct", true)
 }
 
 @(private = "file")
@@ -520,6 +533,15 @@ check_restore_offline_writer :: proc(w: ^World) {
 		return
 	}
 	defer delete(ref.text, w.allocator)
+	cold0 := w.relay.ts.cold_reads
+	if w.relay.tiered {
+		{
+			context = instance_context(&w.relay.inst)
+			osync.tier_store_flush_all(&w.relay.ts)
+			relay_after(&w.relay)
+		}
+		run_until(w, w.now + 30_000_000_000, true)
+	}
 	tn := _new_reader(w, p.rn, space)
 	if tn == nil {
 		return
@@ -561,6 +583,9 @@ check_restore_offline_writer :: proc(w: ^World) {
 		world_fail(w, "restore: new device %s read %s's trimmed prefix with every other device offline without resolving a Restore", tn.name, p.wn.name)
 	}
 	stat_add(w, STAT_RESTORES_READ, read)
+	if w.relay.tiered && w.relay.ts.cold_reads > cold0 {
+		stat_add(w, STAT_RESTORE_COLD, w.relay.ts.cold_reads - cold0)
+	}
 	check_archive_streams(w)
 	live_close(tn)
 	{
@@ -864,4 +889,106 @@ _forget_device :: proc(w: ^World, oi: int, rn, wn: ^Node, base: i64) {
 		world_fail(w, "forget: device-held %v %s on %s differs after rereading:\n--- before\n%s--- after\n%s", ob.kind, id_short(ob.o.id), rn.name, ref.text, got.text)
 	}
 	delete(got.text, w.allocator)
+}
+
+Fetch_Key :: struct {
+	node: int,
+	sid:  osync.Stream_Id,
+}
+
+Fetch_Acct :: struct {
+	total: i64,
+	have:  [dynamic]journal.Range,
+	gen:   u64,
+	conns: i64,
+}
+
+FETCH_FACTOR :: 4
+FETCH_SLACK :: 256 * 1024
+
+fetch_note :: proc(w: ^World, c: ^Conn, sid: osync.Stream_Id, at: i64, n: i64) {
+	if n <= 0 || c.node == nil {
+		return
+	}
+	if w.fetches == nil {
+		w.fetches = make(map[Fetch_Key]^Fetch_Acct, w.allocator)
+	}
+	k := Fetch_Key{c.node.idx, sid}
+	a, ok := w.fetches[k]
+	if !ok {
+		a = new(Fetch_Acct, w.allocator)
+		a.have = make([dynamic]journal.Range, w.allocator)
+		w.fetches[k] = a
+	}
+	if a.conns == 0 || a.gen != c.gen {
+		a.gen = c.gen
+		a.conns += 1
+	}
+	a.total += n
+	_range_add(&a.have, journal.Range{at, at + n})
+}
+
+@(private = "file")
+_range_add :: proc(have: ^[dynamic]journal.Range, r: journal.Range) {
+	lo, hi := r.from, r.to
+	i := 0
+	for i < len(have) {
+		h := have[i]
+		if h.to < lo || h.from > hi {
+			i += 1
+			continue
+		}
+		lo = min(lo, h.from)
+		hi = max(hi, h.to)
+		ordered_remove(have, i)
+	}
+	j := 0
+	for j < len(have) && have[j].from < lo {
+		j += 1
+	}
+	inject_at(have, j, journal.Range{lo, hi})
+}
+
+check_fetch_bound :: proc(w: ^World) {
+	worst: i64
+	for k, a in w.fetches {
+		uniq: i64
+		for h in a.have {
+			uniq += h.to - h.from
+		}
+		allowed := FETCH_FACTOR * uniq * a.conns + FETCH_SLACK
+		if uniq > 0 {
+			worst = max(worst, a.total * 100 / (uniq * a.conns))
+		}
+		if a.total > allowed {
+			name := w.nodes[k.node].name if k.node < len(w.nodes) else "?"
+			world_fail(w, "fetch: %s received %d bytes of stream %s from the relay for %d uniq bytes over %d connections (bound %d)", name, a.total, stream_short(k.sid), uniq, a.conns, allowed)
+		}
+	}
+	stat_max(w, STAT_FETCH_RATIO, u64(worst))
+}
+
+check_archive_waits :: proc(w: ^World) {
+	for n in w.nodes {
+		if !n.alive || !n.e_open {
+			continue
+		}
+		for _, sp in n.e.spaces {
+			for _, rm in sp.repl.remotes {
+				a := rm.arc
+				if a == nil {
+					continue
+				}
+				if len(a.wants) > 0 || len(a.redacts) > 0 || len(a.pend) > 0 {
+					world_fail(w, "archive: %s still waits on %s's archive of %s after the world settled (wants %v, redactions %d, restores %d)", n.name, short_device(rm.device), rm.name, a.wants[:], len(a.redacts), len(a.pend))
+				}
+			}
+		}
+	}
+}
+
+@(private = "file")
+short_device :: proc(d: osync.Device_Id) -> string {
+	x := d
+	return fmt.tprintf("%x", x[:4])
 }

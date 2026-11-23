@@ -226,6 +226,7 @@ World :: struct {
 	ctx:       runtime.Context,
 	aborted:   bool,
 	cipher:    Cipher_Watch,
+	fetches:   map[Fetch_Key]^Fetch_Acct,
 	mem_checks: u64,
 	quarantines: [dynamic]Quarantine,
 	checkpoints: [dynamic]Sim_Checkpoint,
