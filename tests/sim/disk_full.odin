@@ -134,7 +134,7 @@ _disk_full :: proc(w: ^World, cow: bool) {
 			world_fail(w, "disk full: member_add: %v", perr)
 			return
 		}
-		{
+		join: {
 			context = instance_context(&b.inst)
 			defer node_after(b)
 			if _, jerr := eng.space_join_enrollment(&b.e, space, proof, "full", "relay", w.relay.public); jerr != .None {
