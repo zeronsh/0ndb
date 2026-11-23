@@ -72,7 +72,7 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 			}
 		}
 	}
-	if _reg_commit(e, t) == .None && added && !h.sp.keyless {
+	if _reg_commit(e, t) == .None && added && !h.sp.keyless && _storage_class(e, h.sp, h.id, h.kind) == .Device {
 		e.budget.served[h.sp.id] = true
 		_touch(e)
 	}
