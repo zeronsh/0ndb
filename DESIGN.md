@@ -414,7 +414,12 @@ equal in both directions.
   was closed cleanly; it is trusted only up to that point and the log tail
   is replayed. A replay that fails part way marks the hash file lost: it is
   never checkpointed or marked clean, so a later open replays the tail
-  again instead of trusting an index that misses its records.
+  again instead of trusting an index that misses its records. A persist whose
+  log write is durable but whose index update fails clears its pending
+  changes (they are in the log) and rebuilds the hash file from the log;
+  only if that fails is the index marked lost. Compaction carries each
+  entry's version into the new generation's own version table, since an
+  entry's version index names a table that belongs to one shadow.
 - **First mount** walks with parallel `getdents64`/`statx` workers that exist
   only for the scan. In a git checkout the index is read once: entries whose
   stat matches take the index oid (the file text is then referenced from

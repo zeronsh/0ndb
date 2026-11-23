@@ -598,27 +598,52 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 		return from_prim(err)
 	}
 	s.log_end = start + u64(len(s.out))
-	pos := 0
-	for _ in order {
-		n := int(prim.get_u32le(s.out[pos:pos + 4]))
-		r := decode_rec(s.out[pos + 8:][:n], s.oid_size, &s.ver_ids) or_return
-		r.off = start + u64(pos)
-		r.size = u64(n + 8)
-		apply_rec(s, r, false) or_return
-		pos += n + 8
-	}
-	for parent in sorted_strings(parents) {
-		info := parents[parent]
-		if info.head == info.disk {
-			continue
+	ierr: Error
+	index: {
+		pos := 0
+		for _ in order {
+			n := int(prim.get_u32le(s.out[pos:pos + 4]))
+			r, derr := decode_rec(s.out[pos + 8:][:n], s.oid_size, &s.ver_ids)
+			if derr != .None {
+				ierr = derr
+				break index
+			}
+			r.off = start + u64(pos)
+			r.size = u64(n + 8)
+			if aerr := apply_rec(s, r, false); aerr != .None {
+				ierr = aerr
+				break index
+			}
+			pos += n + 8
 		}
-		pi, pslot, pfound := find_path(s, parent, path_hash(parent)) or_return
-		if pfound && pslot.head < info.head {
-			pslot.head = info.head
-			write_path_slot(s, pi, pslot) or_return
+		for parent in sorted_strings(parents) {
+			info := parents[parent]
+			if info.head == info.disk {
+				continue
+			}
+			pi, pslot, pfound, ferr := find_path(s, parent, path_hash(parent))
+			if ferr != .None {
+				ierr = ferr
+				break index
+			}
+			if pfound && pslot.head < info.head {
+				pslot.head = info.head
+				if werr := write_path_slot(s, pi, pslot); werr != .None {
+					ierr = werr
+					break index
+				}
+			}
 		}
 	}
 	pending_clear(s)
+	if ierr != .None {
+		idx_unmap(s)
+		if rebuild_index(s, s.cap) != .None {
+			s.idx_lost = true
+			return ierr
+		}
+		return .None
+	}
 	if cap(s.out) > 1 << 20 {
 		delete(s.out)
 		s.out = make([dynamic]u8, s.allocator)
@@ -637,6 +662,17 @@ shadow_checkpoint :: proc(s: ^Shadow) -> Error {
 		return .None
 	}
 	return checkpoint(s)
+}
+
+@(private = "file")
+compact_entry :: proc(s, n: ^Shadow, e: Entry) -> (out: Entry, err: Error) {
+	out = e
+	ids, ok := shadow_version(s, e)
+	if !ok {
+		return out, .Corrupt
+	}
+	out.ver = shadow_version_add(n, ids) or_return
+	return out, .None
 }
 
 shadow_compact :: proc(s: ^Shadow) -> Error {
@@ -667,6 +703,7 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 	n.scratch = make([dynamic]u8, s.allocator)
 	n.probe = make([dynamic]u8, s.allocator)
 	n.out = make([dynamic]u8, s.allocator)
+	n.versions = make([dynamic][]fstree.Op_Id, s.allocator)
 	ok := false
 	defer if !ok {
 		shadow_detach(&n)
@@ -674,6 +711,7 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 		prim.remove(s.vfs, idx_path)
 	}
 	root, _ := shadow_get(s, "") or_return
+	root = compact_entry(s, &n, root) or_return
 	create_files(&n, cap_for(s.live + 1), root) or_return
 	stack := make([dynamic]string, context.temp_allocator)
 	append(&stack, "")
@@ -684,7 +722,7 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 		shadow_children(s, dir, &kids, context.temp_allocator) or_return
 		for c in kids {
 			p, _ := path_join(dir, c.name, context.temp_allocator)
-			shadow_append(&n, p, c.entry) or_return
+			shadow_append(&n, p, compact_entry(s, &n, c.entry) or_return) or_return
 			if c.entry.kind == .Dir {
 				append(&stack, p)
 			}
