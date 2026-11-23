@@ -41,6 +41,7 @@ STAT_TM_CYCLE: Stat
 STAT_TM_REMOVE: Stat
 STAT_TM_EDIT: Stat
 STAT_TM_REPLACE: Stat
+STAT_TM_RECONCILE: Stat
 STAT_TM_ACCEPTED: Stat
 
 @(init)
@@ -57,6 +58,7 @@ _tree_move_init :: proc "contextless" () {
 	STAT_TM_REMOVE = register_stat(53, 4, "vs_remove")
 	STAT_TM_EDIT = register_stat(53, 5, "vs_edit")
 	STAT_TM_REPLACE = register_stat(53, 6, "replace_edit")
+	STAT_TM_RECONCILE = register_stat(53, 7, "place_reconciles")
 	STAT_TM_ACCEPTED = register_stat(53, 7, "offers_accepted")
 }
 
@@ -868,6 +870,13 @@ _check_offers :: proc(w: ^World) {
 }
 
 check_tree_moves :: proc(w: ^World) {
+	for n in w.nodes {
+		for sm in n.mounts {
+			if sm.m != nil {
+				stat_add(w, STAT_TM_RECONCILE, sm.m.reconciles)
+			}
+		}
+	}
 	_check_offers(w)
 	if _tm == nil || len(_tm.records) == 0 {
 		return

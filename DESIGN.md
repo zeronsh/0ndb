@@ -743,8 +743,16 @@ equal in both directions.
   inodes touched since the synced version, plus every ancestor of a touched
   inode whose place differs between the two versions (a move that a later
   concurrent move turns into a cycle is skipped, which moves a directory no
-  new op touches); a directory created at a path whose tracked entry is
-  another inode waits for that inode to move away; content that differs from the
+  new op touches). A pass in which a directory is created, removed or placed
+  differently from its shadow entry, or in which collisions or reshows are
+  pending, also reconciles places in full: every inode whose path in the
+  target differs from its shadow path is touched, so a place that only a
+  cycle skip or a collision resolution changed is never left behind (the
+  sim counts these passes). Each item takes its old path from the shadow
+  when it is processed, so a directory an earlier item in the same pass
+  moved is followed. An item whose parent is not yet in place waits and
+  reshows the parent too; a directory created at a path whose tracked
+  entry is another inode waits for that inode to move away; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,
   never overwritten, and the plan is rebuilt from the new synced version.
   Untracked content that is exactly the inode at the target version (what a

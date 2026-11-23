@@ -419,6 +419,7 @@ Mount :: struct {
 	importing:   bool,
 	shadow_mark: Shadow_Mark,
 	passes:      u64,
+	reconciles:  u64,
 	jpos:        i64,
 	jpend:       i64,
 	imported:    bool,
