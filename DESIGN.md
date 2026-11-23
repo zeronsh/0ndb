@@ -162,7 +162,12 @@ The engine is designed so that none of these has an exception:
   stays valid), purges derived indexes, drops objects, rewrites the scope
   commit pins without the redacted blobs, and asks the provider driver to
   purge its native session state. Secrets are also redacted before anything
-  is recorded.
+  is recorded. A reader tells the two absences apart: a cell the loaded
+  tree has punctured reads as redacted, which is permanent and safe for a
+  derived reader to consume past, while a key the reader does not hold yet
+  (its tree for that writer is not loaded) reads as `Need_Keys`, surfaced as
+  `Missing`. Every derived reader (the map table, the conversation view and
+  index) stops there, keeps how far it got, and resumes on the rekey.
 - **Each participant has its own view.** The leaf is per participant (in its
   own segment); the thread's shared head is the newest sent message. Browsing
   an old branch on one device never moves anyone else.
