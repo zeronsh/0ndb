@@ -303,7 +303,7 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 	m := &w.model
 	live := make([dynamic]int, context.temp_allocator)
 	for sm, i in n.mounts {
-		if sm.m != nil {
+		if sm.m != nil && !_switching(sm.m) {
 			append(&live, i)
 		}
 	}
@@ -591,7 +591,7 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	m := &w.model
 	live := make([dynamic]int, context.temp_allocator)
 	for sm, i in n.mounts {
-		if sm.m != nil {
+		if sm.m != nil && !(agent && _switching(sm.m)) {
 			append(&live, i)
 		}
 	}
@@ -1338,4 +1338,10 @@ mount_model_line :: proc(m: ^fs.Mount, vfs: prim.Vfs, root: string) -> string {
 		return line_norm(m.line)
 	}
 	return git_head_line(vfs, root)
+}
+
+@(private = "file")
+_switching :: proc(m: ^fs.Mount) -> bool {
+	_, pending := fs.mount_switch_pending(m)
+	return pending
 }
