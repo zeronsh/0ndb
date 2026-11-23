@@ -277,6 +277,8 @@ Stats :: struct {
 	remote_rewrites: u64,
 	git_fetches:     u64,
 	git_objects:     u64,
+	git_probes:      u64,
+	git_probes_refused: u64,
 	over_budget:     u64,
 	buffers:     int,
 	buffer_deltas: u64,

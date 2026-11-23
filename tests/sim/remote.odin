@@ -16,8 +16,13 @@ Sim_Git_Req :: struct {
 	live: bool,
 }
 
+Sim_Object :: struct {
+	type: odb.Object_Type,
+	body: []u8,
+}
+
 Sim_Remote :: struct {
-	objects: map[odb.Oid][]u8,
+	objects: map[odb.Oid]Sim_Object,
 	reqs:    [dynamic]Sim_Git_Req,
 	rng:     Rng,
 	fetches: u64,
@@ -26,14 +31,14 @@ Sim_Remote :: struct {
 }
 
 remote_init :: proc(w: ^World) {
-	w.remote.objects = make(map[odb.Oid][]u8, w.allocator)
+	w.remote.objects = make(map[odb.Oid]Sim_Object, w.allocator)
 	w.remote.reqs = make([dynamic]Sim_Git_Req, w.allocator)
 	rng_init(&w.remote.rng, w.cfg.seed, 77)
 }
 
 remote_destroy :: proc(w: ^World) {
 	for _, v in w.remote.objects {
-		delete(v, w.allocator)
+		delete(v.body, w.allocator)
 	}
 	delete(w.remote.objects)
 	delete(w.remote.reqs)
@@ -51,13 +56,17 @@ remote_push :: proc(w: ^World, n: ^Node, root: string, oids: []odb.Oid) {
 			continue
 		}
 		t, data, err := odb.read(&db, oid, context.temp_allocator)
-		if err != .None || t != .Blob {
+		if err != .None {
 			continue
 		}
 		b := make([]u8, len(data), w.allocator)
 		copy(b, data)
-		w.remote.objects[oid] = b
+		w.remote.objects[oid] = Sim_Object{t, b}
 	}
+}
+
+remote_lost :: proc(w: ^World) -> bool {
+	return rng_chance(&w.remote.rng, 1, 5) && env_u64("SIM_REMOTE_LOST", 1) != 0
 }
 
 sim_git_remote :: proc(n: ^Node) -> eng.Git_Remote {
@@ -111,11 +120,21 @@ remote_event :: proc(w: ^World, ev: ^Sim_Event) {
 		db: odb.Odb
 		if odb.open_store(&db, disk_vfs(&n.disk), req.git_dir, nil, req.format, context.temp_allocator, node_clock(&n.clock)) == .None {
 			for oid in req.oids {
-				if body, ok := w.remote.objects[oid]; ok {
-					if _, werr := odb.write(&db, .Blob, body); werr == .None {
-						w.remote.served += 1
-					}
+				if _, ok := w.remote.objects[oid]; !ok {
+					err = .Io
 				}
+			}
+			for oid in req.oids {
+				if err != .None {
+					break
+				}
+				ob := w.remote.objects[oid]
+				if _, werr := odb.write(&db, ob.type, ob.body); werr == .None {
+					w.remote.served += 1
+				}
+			}
+			if err != .None {
+				w.remote.refused += 1
 			}
 			odb.barrier(&db)
 			odb.close(&db)

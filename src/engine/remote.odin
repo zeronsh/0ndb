@@ -16,6 +16,10 @@ GIT_JOBS_MAX :: 4
 GIT_OIDS_MAX :: 65536
 @(private)
 GIT_ERR_KEEP :: 4096
+@(private)
+PROBE_KEEP :: 256
+@(private)
+PROBE_VERSION :: u8(1)
 
 Git_Fetch :: struct {
 	url:     string,
@@ -23,6 +27,7 @@ Git_Fetch :: struct {
 	format:  odb.Hash_Format,
 	oids:    []odb.Oid,
 	env:     []string,
+	probe:   bool,
 	impl:    rawptr,
 }
 
@@ -61,15 +66,32 @@ Git_Split :: struct {
 
 @(private)
 Git_Req :: struct {
-	fetch:  Git_Fetch,
-	space:  prim.Id,
-	object: prim.Id,
-	url:    int,
-	oids:   [dynamic]odb.Oid,
-	env:    [dynamic]string,
-	done:   bool,
-	e:      ^Engine,
-	creds:  bool,
+	fetch:   Git_Fetch,
+	space:   prim.Id,
+	object:  prim.Id,
+	url:     int,
+	oids:    [dynamic]odb.Oid,
+	env:     [dynamic]string,
+	done:    bool,
+	e:       ^Engine,
+	creds:   bool,
+	reach:   string,
+	commit:  odb.Oid,
+	waiters: [dynamic]Object,
+}
+
+@(private)
+Probe_Status :: enum u8 {
+	Unknown,
+	Served,
+	Refused,
+}
+
+@(private)
+Probe :: struct {
+	url:    string,
+	commit: odb.Oid,
+	status: Probe_Status,
 }
 
 @(private)
@@ -105,6 +127,8 @@ _git_destroy :: proc(e: ^Engine) {
 _git_req_free :: proc(e: ^Engine, q: ^Git_Req) {
 	delete(q.fetch.url, e.allocator)
 	delete(q.fetch.git_dir, e.allocator)
+	delete(q.reach, e.allocator)
+	delete(q.waiters)
 	delete(q.oids)
 	for s in q.env {
 		delete(s, e.allocator)
@@ -181,9 +205,10 @@ _tree_remote_note :: proc(e: ^Engine, sp: ^Space, object: prim.Id, urls: string)
 
 @(private)
 Tree_Reach :: struct {
-	reach: fs.Remote_Reach,
-	urls:  string,
-	ok:    bool,
+	reach:   fs.Remote_Reach,
+	urls:    string,
+	ok:      bool,
+	pending: bool,
 }
 
 @(private)
@@ -216,7 +241,39 @@ _tree_reach :: proc(e: ^Engine, h: ^Handle) -> (t: Tree_Reach) {
 	if jerr != .None {
 		return
 	}
-	u, uerr := fs.remote_update(m.vfs, m.db, m.git, dir)
+	public := make(map[string]string, context.temp_allocator)
+	for r in fs.git_remote_urls(m.vfs, m.git, context.temp_allocator) {
+		if strings.index_byte(r.url, '\n') < 0 {
+			public[r.name] = fs.remote_url_public(r.url, context.temp_allocator)
+		}
+	}
+	probes := _probes_load(e, dir, m.db.format)
+	names := make(map[string]bool, context.temp_allocator)
+	tips := make([dynamic]fs.Remote_Tip, context.temp_allocator)
+	for tip in fs.git_remote_tips(m.vfs, m.git, context.temp_allocator) {
+		rest := tip.ref[len("refs/remotes/"):]
+		i := strings.index_byte(rest, '/')
+		if i <= 0 {
+			continue
+		}
+		url, known := public[rest[:i]]
+		if !known {
+			continue
+		}
+		switch _probe_status(probes[:], url, tip.commit) {
+		case .Served:
+			append(&tips, tip)
+			names[rest[:i]] = true
+		case .Refused:
+		case .Unknown:
+			_probe_start(e, h, dir, url, tip.commit, m.db.format)
+			t.pending = true
+		}
+	}
+	if t.pending {
+		return
+	}
+	u, uerr := fs.remote_update(m.vfs, m.db, m.git, dir, tips[:])
 	if uerr != .None {
 		return
 	}
@@ -227,17 +284,10 @@ _tree_reach :: proc(e: ^Engine, h: ^Handle) -> (t: Tree_Reach) {
 	if !ok {
 		return
 	}
-	names := make(map[string]bool, context.temp_allocator)
-	for tip in fs.git_remote_tips(m.vfs, m.git, context.temp_allocator) {
-		rest := tip.ref[len("refs/remotes/"):]
-		if i := strings.index_byte(rest, '/'); i > 0 {
-			names[rest[:i]] = true
-		}
-	}
 	urls := make([dynamic]string, context.temp_allocator)
 	for r in fs.git_remote_urls(m.vfs, m.git, context.temp_allocator) {
-		if names[r.name] && strings.index_byte(r.url, '\n') < 0 {
-			append(&urls, fs.remote_url_public(r.url, context.temp_allocator))
+		if names[r.name] {
+			append(&urls, public[r.name])
 		}
 	}
 	if len(urls) == 0 {
@@ -247,6 +297,209 @@ _tree_reach :: proc(e: ^Engine, h: ^Handle) -> (t: Tree_Reach) {
 	t.urls = strings.join(urls[:], "\n", context.temp_allocator)
 	t.ok = true
 	return
+}
+
+@(private)
+_probes_path :: proc(dir: string) -> string {
+	p, _ := _join(context.temp_allocator, dir, "probes")
+	return p
+}
+
+@(private)
+_probes_load :: proc(e: ^Engine, dir: string, format: odb.Hash_Format) -> [dynamic]Probe {
+	out := make([dynamic]Probe, context.temp_allocator)
+	data, err := prim.read_file(e.base, _probes_path(dir), context.temp_allocator)
+	if err != .None {
+		return out
+	}
+	rd := prim.reader(data)
+	if prim.read_u8(&rd) != PROBE_VERSION || prim.read_u8(&rd) != u8(format) {
+		return out
+	}
+	n := odb.oid_size(format)
+	count := prim.read_uvarint(&rd)
+	if count > u64(len(data)) {
+		return out
+	}
+	for _ in 0 ..< count {
+		p: Probe
+		p.url = prim.read_str(&rd)
+		prim.read_fixed(&rd, p.commit[:n])
+		st := prim.read_u8(&rd)
+		if st != u8(Probe_Status.Served) && st != u8(Probe_Status.Refused) {
+			clear(&out)
+			return out
+		}
+		p.status = Probe_Status(st)
+		append(&out, p)
+	}
+	if !prim.reader_ok(&rd) {
+		clear(&out)
+	}
+	return out
+}
+
+@(private)
+_probes_save :: proc(e: ^Engine, dir: string, format: odb.Hash_Format, list: []Probe) -> Error {
+	buf := make([dynamic]u8, context.temp_allocator)
+	w := prim.writer(&buf)
+	n := odb.oid_size(format)
+	from := max(len(list) - PROBE_KEEP, 0)
+	prim.write_u8(&w, PROBE_VERSION)
+	prim.write_u8(&w, u8(format))
+	prim.write_uvarint(&w, u64(len(list) - from))
+	for &p in list[from:] {
+		prim.write_str(&w, p.url)
+		prim.write_raw(&w, p.commit[:n])
+		prim.write_u8(&w, u8(p.status))
+	}
+	_perr(prim.mkdir_all(e.base, dir, 0o700)) or_return
+	return _perr(prim.replace_atomic(e.base, _probes_path(dir), buf[:]))
+}
+
+@(private)
+_probe_status :: proc(list: []Probe, url: string, commit: odb.Oid) -> Probe_Status {
+	for p in list {
+		if p.commit == commit && p.url == url {
+			return p.status
+		}
+	}
+	return .Unknown
+}
+
+@(private)
+_probe_start :: proc(e: ^Engine, h: ^Handle, dir, url: string, commit: odb.Oid, format: odb.Hash_Format) {
+	o := Object{h.sp.id, h.id}
+	for q in e.git.reqs {
+		if q.reach == dir && q.commit == commit && q.fetch.url == url {
+			for x in q.waiters {
+				if x == o {
+					return
+				}
+			}
+			append(&q.waiters, o)
+			return
+		}
+	}
+	if e.cfg.git_remote.fetch == nil {
+		return
+	}
+	sum: [16]u8
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	blake2b.update(&ctx, transmute([]u8)string("0ndb remote probe v1"))
+	blake2b.update(&ctx, transmute([]u8)dir)
+	blake2b.update(&ctx, transmute([]u8)url)
+	c := commit
+	blake2b.update(&ctx, c[:odb.oid_size(format)])
+	blake2b.final(&ctx, sum[:])
+	hx := prim.id_hex(prim.Id(sum))
+	pdir, jerr := _join(e.allocator, e.dir, "probe", string(hx[:]))
+	if jerr != .None {
+		return
+	}
+	_remove_all(e, pdir)
+	db: odb.Odb
+	if odb.open_store(&db, e.base, pdir, nil, format, context.temp_allocator, e.cfg.clock, e.cfg.random) != .None {
+		delete(pdir, e.allocator)
+		_probe_record(e, dir, url, commit, format, false)
+		return
+	}
+	odb.close(&db)
+	q := _git_req_new(e, h.sp.id, h.id, 0, url)
+	q.reach, _ = _clone(dir, e.allocator)
+	q.commit = commit
+	q.waiters = make([dynamic]Object, e.allocator)
+	append(&q.waiters, o)
+	append(&q.oids, commit)
+	q.fetch.git_dir = pdir
+	q.fetch.format = format
+	q.fetch.probe = true
+	q.fetch.oids = q.oids[:]
+	append(&e.git.reqs, q)
+	e.stats.git_probes += 1
+	_git_begin(e, q)
+}
+
+@(private)
+_probe_done :: proc(e: ^Engine, q: ^Git_Req, err: Error) {
+	served := false
+	if err == .None {
+		db: odb.Odb
+		if odb.open_store(&db, e.base, q.fetch.git_dir, nil, q.fetch.format, context.temp_allocator, e.cfg.clock, e.cfg.random) == .None {
+			served = odb.exists(&db, q.commit)
+			odb.close(&db)
+		}
+	}
+	_remove_all(e, q.fetch.git_dir)
+	_probe_record(e, q.reach, q.fetch.url, q.commit, q.fetch.format, served)
+	for w in q.waiters {
+		if sp, ok := e.spaces[w.space]; ok && sp.open {
+			_content_kick(e, sp, w.id)
+		}
+	}
+}
+
+@(private)
+_probe_record :: proc(e: ^Engine, dir, url: string, commit: odb.Oid, format: odb.Hash_Format, served: bool) {
+	list := _probes_load(e, dir, format)
+	found := false
+	for &p in list {
+		if p.commit == commit && p.url == url {
+			p.status = .Served if served else .Refused
+			found = true
+		}
+	}
+	if !found {
+		append(&list, Probe{url = url, commit = commit, status = .Served if served else .Refused})
+	}
+	if !served {
+		e.stats.git_probes_refused += 1
+		_log(e, .Info, "git remote does not serve a tracking tip; content reachable only from it is uploaded")
+	}
+	if _probes_save(e, dir, format, list[:]) != .None {
+		_log(e, .Warn, "recording a git remote probe failed")
+	}
+}
+
+@(private)
+_remove_all :: proc(e: ^Engine, path: string, depth := 0) {
+	if depth > 8 {
+		return
+	}
+	Item :: struct {
+		name: string,
+		dir:  bool,
+	}
+	items := make([dynamic]Item, context.temp_allocator)
+	d: prim.Dir
+	if prim.dir_open(e.base, &d, path, context.temp_allocator) != .None {
+		return
+	}
+	for {
+		ent, ok, derr := prim.dir_next(e.base, &d)
+		if !ok || derr != .None {
+			break
+		}
+		if ent.name == "." || ent.name == ".." {
+			continue
+		}
+		name, _ := strings.clone(ent.name, context.temp_allocator)
+		append(&items, Item{name, ent.kind == .Dir})
+	}
+	prim.dir_close(e.base, &d)
+	for it in items {
+		p, jerr := _join(context.temp_allocator, path, it.name)
+		if jerr != .None {
+			continue
+		}
+		if it.dir {
+			_remove_all(e, p, depth + 1)
+		} else {
+			prim.remove(e.base, p)
+		}
+	}
+	prim.remove_dir(e.base, path)
 }
 
 @(private)
@@ -370,6 +623,11 @@ _git_start :: proc(e: ^Engine, q: ^Git_Req, db: ^odb.Odb) {
 	q.fetch.oids = q.oids[:]
 	append(&e.git.reqs, q)
 	e.stats.git_fetches += 1
+	_git_begin(e, q)
+}
+
+@(private)
+_git_begin :: proc(e: ^Engine, q: ^Git_Req) {
 	if e.cfg.git_credentials.begin != nil {
 		q.creds = true
 		berr: Error
@@ -446,6 +704,17 @@ _git_complete :: proc(e: ^Engine, q: ^Git_Req, err: Error) {
 		return
 	}
 	q.done = true
+	if q.fetch.probe {
+		_probe_done(e, q, err)
+		for x, i in e.git.reqs {
+			if x == q {
+				ordered_remove(&e.git.reqs, i)
+				break
+			}
+		}
+		_git_req_free(e, q)
+		return
+	}
 	db, derr := device_odb(e)
 	got := 0
 	left := make([dynamic]odb.Oid, context.temp_allocator)
@@ -533,6 +802,17 @@ _git_spawn_fetch :: proc(data: rawptr, e: ^Engine, req: ^Git_Fetch) -> Error {
 		"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--stdin",
 		req.url,
 	}
+	if req.probe {
+		if _git_probe_config(e, req) != .None {
+			return .Io
+		}
+		argv[len(argv) - 1] = "--depth=1"
+		extra := []string{"--filter=tree:0", "origin"}
+		joined := make([dynamic]string, context.temp_allocator)
+		append(&joined, ..argv)
+		append(&joined, ..extra)
+		argv = joined[:]
+	}
 	env := make([dynamic]string, context.temp_allocator)
 	keys := []string{"GIT_OBJECT_DIRECTORY=", "GIT_TERMINAL_PROMPT=", "GIT_DIR=", "GIT_ALTERNATE_OBJECT_DIRECTORIES=", "GIT_WORK_TREE=", "GIT_INDEX_FILE=", "GIT_COMMON_DIR="}
 	outer: for s in prim.environ(context.temp_allocator) {
@@ -586,6 +866,17 @@ _git_spawn_fetch :: proc(data: rawptr, e: ^Engine, req: ^Git_Fetch) -> Error {
 	}
 	j.cw, _ = prim.child_watch(l, child.pid, j, _git_job_on_exit)
 	return .None
+}
+
+@(private)
+_git_probe_config :: proc(e: ^Engine, req: ^Git_Fetch) -> Error {
+	text := strings.concatenate({
+		"[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tpartialClone = origin\n",
+		"\tobjectformat = sha256\n" if req.format == .Sha256 else "",
+		"[remote \"origin\"]\n\turl = ", req.url, "\n\tpromisor = true\n",
+	}, context.temp_allocator)
+	p := _join(context.temp_allocator, req.git_dir, "config") or_return
+	return _perr(prim.replace_atomic(e.base, p, transmute([]u8)text))
 }
 
 @(private)
