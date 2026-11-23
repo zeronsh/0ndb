@@ -412,6 +412,7 @@ Mount :: struct {
 	nonce:       prim.Id,
 	mat_wait:    bool,
 	mat_ingest:  bool,
+	copy:        ^Copy_Map,
 	importing:   bool,
 	shadow_mark: Shadow_Mark,
 	passes:      u64,
