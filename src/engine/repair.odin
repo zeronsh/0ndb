@@ -324,7 +324,7 @@ _own_journal :: proc(h: ^Handle) -> ^journal.Journal {
 	case .Map:
 		return &h.mw.core.j
 	case .Text, .File_Tree:
-		if h.hist != nil {
+		if h.hist != nil && h.hist.awake {
 			return &h.hist.journal
 		}
 	}

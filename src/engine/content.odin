@@ -198,7 +198,7 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 	}
 	from, end := _content_marks(e, h.sp.id, h.id)
 	end = min(end, _own_len(h))
-	if from >= end {
+	if from >= end || h.hist == nil || !h.hist.awake {
 		return
 	}
 	db, derr := device_odb(e)
