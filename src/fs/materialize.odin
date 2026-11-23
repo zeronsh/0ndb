@@ -111,8 +111,8 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	defer fstree.snapshot_destroy(&snap)
 	prev_snap, prev_version := attr_set_checkout(m, new_clone(snap, context.temp_allocator), tl[:])
 	defer attr_set_checkout(m, prev_snap, prev_version)
-	displaced_touch(m, &snap, &touched) or_return
 	moved_ancestors_touch(h, &snap, sl[:], &touched) or_return
+	displaced_touch(m, &snap, &touched) or_return
 	for c in m.collided {
 		if ino, ok, lerr := fstree.lookup(&snap, c); lerr == nil && ok {
 			touched[ino] = true
