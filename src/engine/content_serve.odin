@@ -99,6 +99,14 @@ _repl_object_source :: proc(user: rawptr, key: osync.Object_Key, allocator: runt
 	if derr != .None {
 		return
 	}
+	if odb.scrub_targeted(db, oid) {
+		_serve_drop_oids(e, []odb.Oid{oid})
+		return
+	}
+	if !odb.exists(db, oid) {
+		_serve_drop_oids(e, []odb.Oid{oid})
+		return
+	}
 	src.part = part
 	src.size = size
 	if size < SERVE_CACHE_MIN {
@@ -261,4 +269,118 @@ _content_holders_changed :: proc(e: ^Engine, sp: ^Space) {
 		osync.replicator_object_holders(&sp.repl, &h.scope, oid[:w.n], _content_holders(e, sp, w.object))
 		w.inflight = true
 	}
+}
+
+@(private)
+Serve_Drop :: struct {
+	space:   prim.Id,
+	by_space: bool,
+	oids:    map[odb.Oid]bool,
+	keys:    [dynamic][36]u8,
+}
+
+@(private)
+_serve_drop :: proc(e: ^Engine, d: ^Serve_Drop) {
+	if !e.reg.open {
+		return
+	}
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		d := (^Serve_Drop)(data)
+		if len(key) != 36 || len(value) < 50 || value[0] != 1 {
+			return true
+		}
+		n := int(value[49])
+		if n != 20 && n != 32 || len(value) != 50 + n {
+			return true
+		}
+		hit := false
+		if d.by_space {
+			hit = string(value[1:17]) == string(d.space[:])
+		} else {
+			oid: odb.Oid
+			copy(oid[:n], value[50:])
+			hit = d.oids[oid]
+		}
+		if hit {
+			k: [36]u8
+			copy(k[:], key)
+			append(&d.keys, k)
+		}
+		return true
+	}
+	prefix := [4]u8{0xff, 's', 'r', 'v'}
+	d.keys = make([dynamic][36]u8, context.temp_allocator)
+	if omap.db_scan(&e.reg.db, ROOT_OWNED, prefix[:], prefix[:], d, visit) != .None || len(d.keys) == 0 {
+		return
+	}
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		_reg_fail(e, _oerr(terr))
+		return
+	}
+	for &k in d.keys {
+		if _, derr := omap.txn_delete(t, ROOT_OWNED, k[:]); derr != .None {
+			omap.txn_abort(t)
+			_reg_fail(e, .Io)
+			return
+		}
+	}
+	_reg_commit(e, t)
+}
+
+@(private)
+_serve_drop_oids :: proc(e: ^Engine, oids: []odb.Oid) {
+	if len(oids) == 0 {
+		return
+	}
+	d := Serve_Drop{oids = make(map[odb.Oid]bool, context.temp_allocator)}
+	for o in oids {
+		d.oids[o] = true
+	}
+	_serve_drop(e, &d)
+}
+
+@(private)
+_serve_drop_space :: proc(e: ^Engine, space: prim.Id) {
+	d := Serve_Drop{space = space, by_space = true}
+	_serve_drop(e, &d)
+}
+
+@(private)
+_serve_scrubbed :: proc(data: rawptr, targets: []odb.Oid) {
+	e := (^Engine)(data)
+	context = context_for(e)
+	_serve_drop_oids(e, targets)
+}
+
+Serve_Row :: struct {
+	space: prim.Id,
+	oid:   odb.Oid,
+	n:     int,
+}
+
+serve_rows :: proc(e: ^Engine, allocator := context.allocator) -> (out: []Serve_Row, err: Error) {
+	context = context_for(e)
+	Acc :: struct {
+		rows: [dynamic]Serve_Row,
+	}
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		a := (^Acc)(data)
+		if len(key) != 36 || len(value) < 50 || value[0] != 1 {
+			return true
+		}
+		n := int(value[49])
+		if n != 20 && n != 32 || len(value) != 50 + n {
+			return true
+		}
+		r := Serve_Row{n = n}
+		copy(r.space[:], value[1:17])
+		copy(r.oid[:n], value[50:])
+		append(&a.rows, r)
+		return true
+	}
+	a := Acc{rows = make([dynamic]Serve_Row, allocator)}
+	prefix := [4]u8{0xff, 's', 'r', 'v'}
+	_oerr(omap.db_scan(&e.reg.db, ROOT_OWNED, prefix[:], prefix[:], &a, visit)) or_return
+	return a.rows[:], .None
 }

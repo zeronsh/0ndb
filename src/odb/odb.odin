@@ -54,6 +54,7 @@ Odb :: struct {
 	two_pass_size:  i64,
 	sync_writes:    bool,
 	scrub_mutex:    sync.Mutex,
+	scrub_hook:     Scrub_Hook,
 	deferred:       bool,
 	store:          bool,
 	pending_files:  [dynamic]string,

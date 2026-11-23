@@ -366,6 +366,7 @@ _registry_drop_space :: proc(e: ^Engine, space: prim.Id, objs: map[prim.Id]bool)
 		append(&k.keys, c)
 		return true
 	}
+	_serve_drop_space(e, space)
 	owned := Keys{keys = make([dynamic][]u8, context.temp_allocator)}
 	grants := Keys{keys = make([dynamic][]u8, context.temp_allocator)}
 	s := space
