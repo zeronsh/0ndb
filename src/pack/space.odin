@@ -111,14 +111,20 @@ reserve :: proc(p: ^Pack, n: i64) -> Error {
 		_spare_ensure(p) or_return
 	}
 	p.reserved += n + INODE_META_MAX
-	p.op_depth += 1
 	return .None
 }
 
-release :: proc(p: ^Pack) {
+scope_begin :: proc(p: ^Pack) {
+	p.op_depth += 1
+}
+
+scope_end :: proc(p: ^Pack) {
 	if p.op_depth > 0 {
 		p.op_depth -= 1
 	}
+}
+
+reserve_clear :: proc(p: ^Pack) {
 	if p.op_depth == 0 {
 		p.reserved = 0
 	}
@@ -141,8 +147,50 @@ _retry :: proc(p: ^Pack) -> Error {
 	if !p.fl_retry || p.fl.on {
 		return .None
 	}
+	if p.fl_err == .Io && _resync_job(p) != .None {
+		return .None
+	}
 	p.fl_retry = false
 	return _submit(p)
+}
+
+@(private)
+_resync_job :: proc(p: ^Pack) -> Error {
+	fl := &p.fl
+	seen := make([dynamic]prim.Fd, context.temp_allocator)
+	visit :: proc(p: ^Pack, seen: ^[dynamic]prim.Fd, fd: prim.Fd) -> Error {
+		if fd < 0 {
+			return .None
+		}
+		for x in seen {
+			if x == fd {
+				return .None
+			}
+		}
+		append(seen, fd)
+		return prim.resync_fd(p.base, fd)
+	}
+	if len(fl.data) > 0 {
+		visit(p, &seen, fl.data_fd) or_return
+	}
+	if fl.wrote {
+		visit(p, &seen, fl.fd) or_return
+	}
+	visit(p, &seen, fl.newc_fd) or_return
+	for j in fl.fds {
+		visit(p, &seen, j.fd) or_return
+	}
+	for c in fl.syncs {
+		visit(p, &seen, c.fd) or_return
+	}
+	for z in fl.zjobs {
+		visit(p, &seen, z.fd) or_return
+	}
+	visit(p, &seen, fl.scan_fd) or_return
+	if fl.kind == .Flush {
+		visit(p, &seen, fl.run_fd) or_return
+	}
+	return .None
 }
 
 stalled :: proc "contextless" (p: ^Pack) -> Error {

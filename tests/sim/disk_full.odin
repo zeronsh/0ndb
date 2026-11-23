@@ -7,11 +7,12 @@ import "core:strings"
 import "core:testing"
 import eng "../../src/engine"
 import omap "../../src/map"
+import "../../src/prim"
 
 @(private = "file")
 FULL_ROUNDS :: 150
 
-disk_full_run :: proc(seed: u64) -> (failures: [dynamic]string) {
+disk_full_run :: proc(seed: u64, cow: bool) -> (failures: [dynamic]string) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 2
@@ -26,7 +27,7 @@ disk_full_run :: proc(seed: u64) -> (failures: [dynamic]string) {
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	_disk_full(w)
+	_disk_full(w, cow)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -59,6 +60,28 @@ _df_keys :: proc(w: ^World, n: ^Node, m: eng.Object) -> (keys: []string, ok: boo
 }
 
 @(private = "file")
+_df_cataloged :: proc(w: ^World, n: ^Node, space: prim.Id, title: string) -> bool {
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	cur: eng.Map_Cursor
+	defer omap.cursor_destroy(&cur)
+	for {
+		rows, more, err := eng.catalog_list(&n.e, space, false, &cur, 256, context.temp_allocator)
+		if err != .None {
+			return false
+		}
+		for r in rows {
+			if r.title == title {
+				return true
+			}
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+@(private = "file")
 _df_text :: proc(w: ^World, n: ^Node, t: eng.Object) -> (s: string, ok: bool) {
 	context = instance_context(&n.inst)
 	defer node_after(n)
@@ -81,7 +104,7 @@ _df_write :: proc(w: ^World, n: ^Node, m, t: eng.Object, tag: string, i: int) ->
 }
 
 @(private = "file")
-_disk_full :: proc(w: ^World) {
+_disk_full :: proc(w: ^World, cow: bool) {
 	if !relay_start(&w.relay) {
 		world_fail(w, "relay start")
 		return
@@ -91,11 +114,13 @@ _disk_full :: proc(w: ^World) {
 		world_fail(w, "node start")
 		return
 	}
-	m, t: eng.Object
+	m, t, cv: eng.Object
+	space: prim.Id
 	{
 		context = instance_context(&a.inst)
 		defer node_after(a)
-		space, err := eng.space_create(&a.e, "full", "relay", w.relay.public)
+		err: eng.Error
+		space, err = eng.space_create(&a.e, "full", "relay", w.relay.public)
 		if err != .None {
 			world_fail(w, "disk full: space_create: %v", err)
 			return
@@ -132,6 +157,11 @@ _disk_full :: proc(w: ^World) {
 			world_fail(w, "disk full: text_create: %v", err)
 			return
 		}
+		cv, err = eng.convo_create(&a.e, space, eng.Convo_Settings{title = "full convo"})
+		if err != .None {
+			world_fail(w, "disk full: convo_create: %v", err)
+			return
+		}
 	}
 	for i in 0 ..< 5 {
 		_df_write(w, a, m, t, "a", i)
@@ -141,6 +171,7 @@ _disk_full :: proc(w: ^World) {
 	run_until(w, w.now + 20_000_000_000, true)
 	inc := a.incarnation
 	peak := a.inst.main.peak
+	a.disk.full_cow = cow
 	a.disk.full = true
 	accepted := 0
 	refused := 0
@@ -157,6 +188,26 @@ _disk_full :: proc(w: ^World) {
 			world_fail(w, "disk full: n0 text_edit returned %v while the disk is full", terr)
 		}
 		_df_write(w, b, m, t, "b", i)
+		if i % 10 == 0 {
+			{
+				context = instance_context(&b.inst)
+				defer node_after(b)
+				if _, cerr := eng.convo_create(&b.e, space, eng.Convo_Settings{title = fmt.tprintf("b convo %04d", i)}); cerr != .None {
+					world_fail(w, "disk full: n1 convo_create: %v", cerr)
+				}
+				eng.convo_send(&b.e, cv, fmt.tprintf("n1 says %04d", i))
+			}
+			{
+				context = instance_context(&a.inst)
+				defer node_after(a)
+				if _, serr := eng.convo_send(&a.e, cv, fmt.tprintf("n0 says %04d", i)); serr != .None && serr != .No_Space && serr != .Io && serr != .Pending {
+					world_fail(w, "disk full: n0 convo_send returned %v while the disk is full", serr)
+				}
+				if _, cerr := eng.map_create(&a.e, space, fmt.tprintf("a map %04d", i)); cerr != .None && cerr != .No_Space && cerr != .Io {
+					world_fail(w, "disk full: n0 map_create returned %v while the disk is full", cerr)
+				}
+			}
+		}
 		run_until(w, w.now + 200_000_000, true)
 		if !a.alive || !a.e_open || a.incarnation != inc {
 			world_fail(w, "disk full: n0 went down or restarted after %d writes while its disk was full", i - 5)
@@ -171,6 +222,7 @@ _disk_full :: proc(w: ^World) {
 		world_fail(w, "disk full: no n0 write was refused while its disk was full (%d accepted)", accepted)
 	}
 	a.disk.full = false
+	a.disk.full_cow = false
 	_df_write(w, a, m, t, "a", 9999)
 	_df_write(w, b, m, t, "b", 9999)
 	run_until(w, w.now + 120_000_000_000, true)
@@ -190,6 +242,13 @@ _disk_full :: proc(w: ^World) {
 		k := fmt.tprintf("k/b/%04d", i)
 		if _, found := slice.binary_search(ka, k); !found {
 			world_fail(w, "disk full: n0 never applied n1's %s after the disk cleared", k)
+			break
+		}
+	}
+	for i := 5; i < 5 + FULL_ROUNDS; i += 10 {
+		title := fmt.tprintf("b convo %04d", i)
+		if !_df_cataloged(w, a, space, title) {
+			world_fail(w, "disk full: n0's catalog never listed n1's %q after the disk cleared", title)
 			break
 		}
 	}
@@ -218,11 +277,13 @@ disk_full :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	failures := disk_full_run(1)
-	for f in failures {
-		fmt.eprintf("disk_full: %s\n", f)
-		delete(f)
+	for cow in ([]bool{false, true}) {
+		failures := disk_full_run(1, cow)
+		for f in failures {
+			fmt.eprintf("disk_full %s: %s\n", "copy-on-write" if cow else "in place", f)
+			delete(f)
+		}
+		testing.expectf(t, len(failures) == 0, "disk_full %s failed", "copy-on-write" if cow else "in place")
+		delete(failures)
 	}
-	testing.expect(t, len(failures) == 0, "disk_full failed")
-	delete(failures)
 }

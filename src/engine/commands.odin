@@ -241,8 +241,9 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 		return res, .Pending
 	}
 	_reserve(e, _cmd_bytes(cmd)) or_return
+	_scope_begin(e)
 	res, h, err = _cmd_run(e, cmd, &st)
-	_unreserve(e)
+	_scope_end(e)
 	busy := err == .Busy && pack.pressure(&e.pk)
 	if err == .Corrupt && _damage_pending(e, _cmd_object(cmd).id) {
 		p := new(Pending_Cmd, e.allocator)
@@ -547,7 +548,6 @@ _reserve :: proc(e: ^Engine, n: i64) -> Error {
 	}
 	if e.reg.open {
 		if err := omap.db_reserve(&e.reg.db, REG_OP_MAX); err != .None {
-			pack.release(&e.pk)
 			_storage_short(e, _oerr(err), "a write was refused: the disk is full")
 			return _oerr(err)
 		}
@@ -556,9 +556,23 @@ _reserve :: proc(e: ^Engine, n: i64) -> Error {
 }
 
 @(private)
-_unreserve :: proc(e: ^Engine) {
+_scope_begin :: proc(e: ^Engine) {
 	if e.pk_open {
-		pack.release(&e.pk)
+		pack.scope_begin(&e.pk)
+	}
+}
+
+@(private)
+_reserve_clear :: proc(e: ^Engine) {
+	if e.pk_open {
+		pack.reserve_clear(&e.pk)
+	}
+}
+
+@(private)
+_scope_end :: proc(e: ^Engine) {
+	if e.pk_open {
+		pack.scope_end(&e.pk)
 	}
 }
 
