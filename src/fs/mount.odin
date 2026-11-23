@@ -868,6 +868,9 @@ mount_wake :: proc(m: ^Mount) -> Error {
 	if !shadow_attached(&m.shadow) {
 		if m.shadow.dir == "" {
 			shadow_open(&m.shadow, m.vfs, sp, format, m.allocator) or_return
+			if m.history != nil {
+				m.shadow.clock = m.history.opts.clock
+			}
 		} else {
 			shadow_attach(&m.shadow) or_return
 		}

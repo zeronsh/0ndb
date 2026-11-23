@@ -35,6 +35,7 @@ _shrink_open :: proc(d: ^Disk, pk: ^pack.Pack, a: runtime.Allocator) -> bool {
 _shrink_case :: proc(flags: prim.Open_Flags) -> string {
 	d: Disk
 	disk_init(&d, "shrink", runtime.heap_allocator())
+	d.ghost_root = SHRINK_PACK
 	defer disk_destroy(&d)
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena) != nil {

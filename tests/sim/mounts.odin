@@ -138,6 +138,8 @@ node_mount :: proc(w: ^World, n: ^Node, oi: int, root: string) -> eng.Error {
 	if err := prim.mkdir_all(disk_vfs(&n.disk), root, 0o755); err != .None {
 		return .Io
 	}
+	grains := [?]i64{0, 1_000_000_000, 2_000_000_000}
+	disk_set_grain(&n.disk, root, grains[mix_bytes(w.cfg.seed, transmute([]u8)root) % len(grains)])
 	m, err := eng.tree_mount(&n.e, w.model.objs[oi].o, root)
 	if err != .None {
 		return err
@@ -488,6 +490,96 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	}
 }
 
+_check_ingested :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, wrote: []u8) {
+	if sm.m == nil || n.disk.dead || name in sm.m.dirty {
+		return
+	}
+	abs := strings.concatenate({sm.root, "/", name}, context.temp_allocator)
+	n.disk.quiet = true
+	cur, rerr := prim.read_file(disk_vfs(&n.disk), abs, context.temp_allocator)
+	n.disk.quiet = false
+	if rerr != .None || string(cur) != string(wrote) {
+		return
+	}
+	got, found, err := fs.mount_synced_text(sm.m, name, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	if !found || string(got) != string(wrote) {
+		world_fail(w, "ingest: %s wrote %q to %s/%s, which is still on disk after its scope closed, but the synced version holds %q (found %v)", n.name, string(wrote), sm.root, name, string(got), found)
+	}
+}
+
+_rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: bool) {
+	m := &w.model
+	abs := strings.concatenate({sm.root, "/", name}, context.temp_allocator)
+	vfs := disk_vfs(&n.disk)
+	old, rerr := prim.read_file(vfs, abs, context.temp_allocator)
+	if rerr != .None || n.disk.dead {
+		return
+	}
+	toks := parse_tokens(old)
+	if len(toks) == 0 {
+		return
+	}
+	last := toks[len(toks) - 1]
+	tok := new_token(m, n, "a" if agent else "p")
+	if len(tok) != len(last.text) {
+		return
+	}
+	data := make([]u8, len(old), context.temp_allocator)
+	copy(data, old)
+	copy(data[last.pos:], tok)
+	op := new_op(m, .Disk_Agent if agent else .Disk_Person, n, sm.oi)
+	op.path = strings.clone(name, w.allocator)
+	append(&op.deletes, strings.clone(last.text, w.allocator))
+	append(&op.tokens, tok)
+	context = instance_context(&n.inst)
+	scope: ^fs.Scope
+	if agent {
+		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+		op.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+		scope = fs.scope_open(n.reg, sm.m, sid, op.actor)
+	}
+	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
+	if agent {
+		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
+			world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
+		}
+	}
+	err := _disk_write(vfs, abs, data, false)
+	serr := fs.Error.None
+	if agent && !n.disk.dead {
+		serr = _agent_scope_close(w, n, scope)
+		_forget_scope(w, n, scope)
+	}
+	world_note(w, "%s %s(actor %s) same-size rewrite %s/%s replaced %s with %s -> %v %v", n.name, "agent" if agent else "person", id_short(op.actor), id_short(m.objs[sm.oi].o.id), name, last.text, tok, err, serr)
+	if n.disk.dead {
+		return
+	}
+	if err != .None {
+		op.status = .Uncertain
+		if w.cfg.io_rate > 0 {
+			n.restart_pending = true
+		} else {
+			world_fail(w, "%s disk edit failed: %v", n.name, err)
+		}
+		return
+	}
+	if agent {
+		op_done(op, eng.pending_seq(&n.e), .None)
+		if serr == .None {
+			_check_ingested(w, n, sm, name, data)
+		}
+	} else {
+		op_done(op, 0, .None)
+		op.status = .Acked
+	}
+	if serr != .None && w.cfg.io_rate == 0 {
+		world_fail(w, "%s scope_close failed: %v", n.name, serr)
+	}
+}
+
 op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	if agent && len(n.agent_pending) > 0 {
 		agent_finish(w, n)
@@ -593,12 +685,18 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	} else {
 		if agent {
 			op_done(op, eng.pending_seq(&n.e), .None)
+			if serr == .None {
+				_check_ingested(w, n, &sm, name, transmute([]u8)strings.to_string(b))
+			}
 		} else {
 			op_done(op, 0, .None)
 			op.status = .Acked
 		}
 		if serr != .None && w.cfg.io_rate == 0 {
 			world_fail(w, "%s scope_close failed: %v", n.name, serr)
+		}
+		if serr == .None && !n.disk.dead && rng_chance(&w.rng, 1, 3) {
+			_rewrite_same_size(w, n, &sm, name, agent)
 		}
 	}
 	node_after(n)

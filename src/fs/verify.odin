@@ -136,3 +136,25 @@ verify_shadow :: proc(m: ^Mount, dir: string, seen: ^map[string]bool, out: ^[dyn
 	}
 	return .None
 }
+
+mount_synced_text :: proc(m: ^Mount, rel: string, allocator := context.allocator) -> (text: []u8, found: bool, err: Error) {
+	h := m.history
+	if h == nil || !h.awake {
+		return nil, false, .Busy
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &lvs) != .None {
+		return nil, false, .Corrupt
+	}
+	snap := version_snapshot(h, lvs[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	id, ok, lerr := fstree.lookup(&snap, rel)
+	if lerr != nil {
+		return nil, false, .Corrupt
+	}
+	if !ok {
+		return nil, false, .None
+	}
+	t := history_text_at(h, id, m.synced[:], allocator) or_return
+	return t, true, .None
+}

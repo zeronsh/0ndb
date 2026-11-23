@@ -345,7 +345,7 @@ mat_rewrite :: proc(m: ^Mount, abs: string, ms: ^Mat_Sync) -> Error {
 		return .None
 	}
 	d := probe(m, rel) or_return
-	if d.kind != .File || d.stat != e.stat {
+	if d.kind != .File || !stat_clean(d.stat, e) {
 		return .None
 	}
 	data, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
@@ -725,7 +725,7 @@ disk_matches :: proc(m: ^Mount, rel: string, e: Entry) -> bool {
 		return true
 	}
 	if d.kind == .File && e.kind == .Symlink && !mount_symlinks(m) {
-		return d.stat == e.stat
+		return stat_clean(d.stat, e)
 	}
 	if disk_to_tree(d.kind) != e.kind {
 		return false
@@ -733,7 +733,19 @@ disk_matches :: proc(m: ^Mount, rel: string, e: Entry) -> bool {
 	if e.kind == .Dir {
 		return true
 	}
-	return d.stat == e.stat
+	if d.stat != e.stat {
+		return false
+	}
+	return !e.racy || e.kind != .File || disk_content_matches(m, rel, d.stat, e)
+}
+
+@(private)
+disk_content_matches :: proc(m: ^Mount, rel: string, st: Stat, e: Entry) -> bool {
+	if m.db == nil || e.oid == {} || st.size > m.opts.large_limit {
+		return false
+	}
+	_, oid, _, ok, err := read_content(m, rel, st, e.inode, true)
+	return err == .None && ok && oid == e.oid
 }
 
 @(private)
