@@ -159,6 +159,37 @@ git_reflog_len :: proc(vfs: prim.Vfs, g: Git_Dirs) -> i64 {
 	return st.size
 }
 
+git_reflog_switch_end :: proc(vfs: prim.Vfs, g: Git_Dirs, from: i64, commit: string) -> i64 {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	size := git_reflog_len(vfs, g)
+	p, _ := path_join(g.dir, "logs/HEAD", context.temp_allocator)
+	if from < 0 || size <= from || size - from > 1 << 20 {
+		return size
+	}
+	fd, err := prim.open_file(vfs, p)
+	if err != .None {
+		return size
+	}
+	defer prim.close_file(vfs, fd)
+	buf := make([]u8, int(size - from), context.temp_allocator)
+	got, rerr := prim.read_at(vfs, fd, buf, from)
+	if rerr != .None {
+		return size
+	}
+	end := size
+	at := from
+	s := string(buf[:got])
+	for line in strings.split_lines_after_iterator(&s) {
+		at += i64(len(line))
+		tab := strings.index_byte(line, '\t')
+		fields := strings.fields(line[:tab] if tab >= 0 else line, context.temp_allocator)
+		if tab >= 0 && len(fields) >= 2 && fields[1] == commit && strings.has_prefix(line[tab + 1:], "0ndb: switch from ") {
+			end = at
+		}
+	}
+	return end
+}
+
 git_reflog_commits_only :: proc(vfs: prim.Vfs, g: Git_Dirs, from: i64) -> (commits_only: bool, any: bool, rewritten: bool) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	p, _ := path_join(g.dir, "logs/HEAD", context.temp_allocator)

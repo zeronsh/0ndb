@@ -921,7 +921,18 @@ equal in both directions.
   before its effects and every step is idempotent, so a mount that reopens
   with the record set resumes it: before the target phase it stays on the
   old line, after it it rolls forward (recreating a target line whose import
-  was lost, and removing a stale `index.lock` the crash left). Lines are
+  was lost, and removing a stale `index.lock` the crash left). The git phase
+  saves the target head (ref and commit) with the record; a reopen that finds
+  git HEAD already there adopts it before its first pass, with the reflog
+  position just past the `0ndb: switch` entry and no trusted index stamp, so
+  the pass does not read the switch as a user checkout. The saved head and line
+  come from the settled image, which lags the mount, so after any completed
+  line change (a 0ndb switch or a followed git checkout) the state carries a
+  done record (`SWITCH_DONE`: the line the worktree holds, its head and reflog
+  position) until the image catches up: no saved state names a line other
+  than the one the worktree holds. A reopen applies a done record as the
+  mount's branch and head and never reruns git; HEAD moved since is a user
+  checkout from that head. Lines are
   named by their git key (`git:refs/heads/<name>`; the mount's own branch maps
   to its line). Runtime-managed mounts are refused until run lines retire. **A
   0ndb switch keeps each line's uncommitted state with that line (an automatic
