@@ -222,3 +222,38 @@ relay_core_redacted :: proc(r: ^Relay_Core, space: Space_Id, id: Stream_Id) -> [
 	_red_index_load(r, sp)
 	return sp.red_index[id][:]
 }
+
+@(private)
+_red_report :: proc(r: ^Relay_Core, sp: ^Space_State, sender: Device_Id, id: Stream_Id, at: i64, buf: []u8) {
+	if r.cfg.on_redacted_in == nil {
+		return
+	}
+	hi := at + i64(len(buf))
+	for x in sp.red_index[id] {
+		lo, top := max(x[0], at), min(x[1], hi)
+		if lo < top && _red_live_in(buf, at, lo, top) {
+			r.cfg.on_redacted_in(r.cfg.redacted_in_data, sender, sp.id, id, x[0], x[1])
+		}
+	}
+}
+
+@(private)
+_red_live_in :: proc(buf: []u8, at, from, to: i64) -> bool {
+	pos := from
+	for pos < to {
+		o := int(pos - at)
+		if o + journal.OVERHEAD > len(buf) {
+			return false
+		}
+		body := int(prim.get_u32le(buf[o:]))
+		size := body + journal.OVERHEAD
+		if body > journal.MAX_BODY || o + size > len(buf) {
+			return false
+		}
+		if journal.classify(buf[o:][:size], pos) != .Redacted {
+			return true
+		}
+		pos += i64(size)
+	}
+	return false
+}

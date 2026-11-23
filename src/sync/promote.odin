@@ -240,6 +240,10 @@ _promote_step :: proc(r: ^Replicator, p: ^Promotion) {
 		_promotion_done(r, p, false)
 		return
 	}
+	if !p.own && _pending_overlaps(r, p.path, start, p.base) {
+		_promotion_done(r, p, false)
+		return
+	}
 	n := int(p.base - start)
 	dst, err := client_fill_reserve(&r.client, p.id, start, n)
 	if err != .None {

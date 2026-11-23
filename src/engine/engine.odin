@@ -162,6 +162,12 @@ Event_Hook :: struct {
 	event: proc(data: rawptr, e: ^Engine, ev: ^Event),
 }
 
+Redact_Fault :: struct {
+	data:     rawptr,
+	withhold: proc(data: rawptr) -> bool,
+	learned:  proc(data: rawptr, space, object, device: prim.Id, from, to: i64, applied, pending: bool),
+}
+
 Config :: struct {
 	dir:             string,
 	vfs:             prim.Vfs,
@@ -215,6 +221,7 @@ Config :: struct {
 	always_on:       bool,
 	holder_budget:   i64,
 	history_fault:   fs.Persist_Fault,
+	redact_fault:    Redact_Fault,
 	user:            rawptr,
 }
 
