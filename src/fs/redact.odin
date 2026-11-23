@@ -470,8 +470,10 @@ apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Erro
 	if preflight {
 		redact_preflight(h, spans[:]) or_return
 	}
-	for sp in spans {
-		crdt.graph_redact(&h.g, sp.id.actor, sp.id.seq, sp.len)
+	known := len(spans)
+	for k in 0 ..< known {
+		sp := spans[k]
+		crdt.graph_redact(&h.g, sp.id.actor, sp.id.seq, sp.len, &spans)
 	}
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)

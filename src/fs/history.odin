@@ -96,6 +96,7 @@ hold_drop :: proc(x: Hold) {
 }
 
 History :: struct {
+	need_sources: [dynamic]crdt.Op_Id,
 	opts:       History_Options,
 	redactions: u64,
 	vfs:        prim.Vfs,
@@ -527,6 +528,7 @@ history_wake :: proc(h: ^History) -> Error {
 	crdt.dict_init(&h.dict, h.allocator)
 	h.stream_ids = make([dynamic]prim.Id, h.allocator)
 	h.rdicts = make([dynamic]crdt.Actor_Dict, h.allocator)
+	h.need_sources = make([dynamic]crdt.Op_Id, h.allocator)
 	h.applied = make([dynamic]i64, h.allocator)
 	h.files = make(map[fstree.Inode_Id]^File_State, h.allocator)
 	h.moves = make([dynamic]fstree.Move_Ref, h.allocator)
@@ -799,6 +801,8 @@ history_sleep :: proc(h: ^History) {
 	prim.close_file(h.vfs, h.lvidx)
 	h.lvidx = prim.INVALID_FD
 	delete(h.stream_ids)
+	delete(h.need_sources)
+	h.need_sources = nil
 	delete(h.applied)
 	virtual.arena_destroy(&h.scratch)
 	delete(h.files)
@@ -1335,6 +1339,32 @@ journal_batch :: proc(h: ^History, b: ^crdt.Batch, kind := REC_BATCH, commit := 
 	return o, .None
 }
 
+@(private)
+need_sources_add :: proc(h: ^History, ids: []crdt.Op_Id) {
+	add: for id in ids {
+		for &x in h.need_sources {
+			if x.actor == id.actor {
+				x.seq = max(x.seq, id.seq)
+				continue add
+			}
+		}
+		append(&h.need_sources, id)
+	}
+}
+
+history_need_sources :: proc(h: ^History) -> []crdt.Op_Id {
+	return h.need_sources[:]
+}
+
+history_actor_stream :: proc(h: ^History, actor: prim.Id) -> (stream: prim.Id, ok: bool) {
+	for id, i in h.stream_ids {
+		if _, found := crdt.dict_find(stream_dict(h, u32(i)), actor); found {
+			return id, true
+		}
+	}
+	return {}, false
+}
+
 history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (admitted: int, err: Error) {
 	defer virtual.arena_free_all(&h.scratch)
 	context.temp_allocator = virtual.arena_allocator(&h.scratch)
@@ -1343,6 +1373,7 @@ history_admit :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (ad
 
 @(private)
 admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (admitted: int, err: Error) {
+	clear(&h.need_sources)
 	if len(body) == 0 {
 		return 0, .None
 	}
@@ -1448,16 +1479,25 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		return 0, .None
 	}
 	valid := n - skip
+	missing := make([dynamic]crdt.Op_Id, context.temp_allocator)
 	for sp in target_spans(&b, context.temp_allocator) {
 		f := batch_file(h, op_inode(h, sp.target), &b) or_return
 		view, vskip, lead := span_view(&b, sp, skip)
-		v, terr := crdt.text_check(&f.text, &h.g, &f.log, &view, sp.target, vskip, parents[:])
+		v, terr := crdt.text_check(&f.text, &h.g, &f.log, &view, sp.target, vskip, parents[:], &missing)
+		if terr == .Missing_Source {
+			need_sources_add(h, missing[:])
+			clear(&missing)
+			continue
+		}
 		if terr != .None {
 			return 0, .Corrupt
 		}
 		if v < crdt.batch_len(&view) - vskip {
 			valid = min(valid, lead + v)
 		}
+	}
+	if len(h.need_sources) > 0 {
+		return 0, .Need_Source
 	}
 	if valid == 0 {
 		return 0, .Invalid
