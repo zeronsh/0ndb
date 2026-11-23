@@ -442,7 +442,7 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 	hold := rng_chance(&w.rng, 1, 2)
 	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	scope := fs.scope_open(n.reg, sm.m, sid, actor)
+	scope := sim_scope_open(w, n.reg, sm.m, sid, actor)
 	if hold {
 		fs.scope_write_begin(scope, name)
 		for other in paths {
@@ -685,7 +685,7 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	if agent {
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 		op.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, sm.m, sid, op.actor)
+		scope = sim_scope_open(w, n.reg, sm.m, sid, op.actor)
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
 	if agent {
@@ -795,7 +795,7 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 	if agent {
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 		op.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, sm.m, sid, op.actor)
+		scope = sim_scope_open(w, n.reg, sm.m, sid, op.actor)
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
 	oerr := fs.Error.None
@@ -1609,7 +1609,7 @@ op_agent_chain :: proc(w: ^World, n: ^Node) {
 	defer node_after(n)
 	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	scope := fs.scope_open(n.reg, sm.m, sid, actor)
+	scope := sim_scope_open(w, n.reg, sm.m, sid, actor)
 	if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None || n.disk.dead {
 		fs.scope_close(n.reg, scope)
 		return

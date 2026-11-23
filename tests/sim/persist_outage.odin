@@ -1,6 +1,7 @@
 package sim
 
 import "../../src/fs"
+import "../../src/prim"
 
 STAT_PERSIST_OUTAGES: Stat
 STAT_DEFERRED_CLOSES: Stat
@@ -11,6 +12,7 @@ _persist_outage_init :: proc "contextless" () {
 	register_op(14, "persist_outage", proc(w: ^World) -> int {return 1 if w.cfg.persist_fault else 0}, op_persist_outage)
 	EV_PERSIST_OUTAGE_END = register_event(_persist_outage_end)
 	register_final_check(12, check_applied_cursors)
+	register_final_check(13, check_actor_owners)
 	register_stat_line(54, "persist_outage")
 	STAT_PERSIST_OUTAGES = register_stat(54, 0, "outages")
 	STAT_DEFERRED_CLOSES = register_stat(54, 1, "deferred_closes")
@@ -69,4 +71,44 @@ _check_node_cursors :: proc(w: ^World, n: ^Node) {
 		}
 	}
 	node_after(n)
+}
+
+check_actor_owners :: proc(w: ^World) {
+	known := make(map[prim.Id]bool, context.temp_allocator)
+	for n in w.nodes {
+		known[n.identity.id] = true
+	}
+	for op in w.model.ops {
+		known[op.actor] = true
+	}
+	for a in w.scope_actors {
+		known[a] = true
+	}
+	for n in w.nodes {
+		if !n.alive || n.disk.dead {
+			continue
+		}
+		context = instance_context(&n.inst)
+		for id, h in n.e.handles {
+			if h.hist == nil || !h.hist.awake {
+				continue
+			}
+			out := make([dynamic]prim.Id, context.temp_allocator)
+			fs.history_unowned_actors(h.hist, &out)
+			for a in out {
+				if !known[a] {
+					world_fail(w, "%s history of %s: actor %s committed batches but has no owner registration", n.name, id_short(id), id_short(a))
+				}
+			}
+		}
+		node_after(n)
+	}
+}
+
+sim_scope_open :: proc(w: ^World, reg: ^fs.Registry, m: ^fs.Mount, id: prim.Id, actor: prim.Id) -> ^fs.Scope {
+	if w.scope_actors == nil {
+		w.scope_actors = make(map[prim.Id]bool, w.allocator)
+	}
+	w.scope_actors[actor] = true
+	return fs.scope_open(reg, m, id, actor)
 }
