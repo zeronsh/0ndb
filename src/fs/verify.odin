@@ -65,12 +65,15 @@ verify_mount :: proc(m: ^Mount, disk: bool, out: ^[dynamic]string, allocator := 
 	defer fstree.snapshot_destroy(&snap)
 	seen := make(map[string]bool, context.temp_allocator)
 	verify_tree(m, &snap, fstree.ROOT, "", disk, &seen, out, allocator) or_return
-	return verify_shadow(m, "", &seen, out, allocator)
+	return verify_shadow(m, "", disk, &seen, out, allocator)
 }
 
 @(private = "file")
-verify_skip :: proc(m: ^Mount, p: string) -> bool {
+verify_skip :: proc(m: ^Mount, p: string, disk: bool) -> bool {
 	if path_internal(p) {
+		return true
+	}
+	if disk && mount_absent_has(m, p) {
 		return true
 	}
 	for q := p; len(q) > 0; q = path_parent(q) {
@@ -100,7 +103,7 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 	for c in kids {
 		p, _ := path_join(prefix, c.name, context.temp_allocator)
 		seen[p] = true
-		if verify_skip(m, p) {
+		if verify_skip(m, p, disk) {
 			continue
 		}
 		e, found := shadow_get(&m.shadow, p) or_return
@@ -205,12 +208,12 @@ verify_at :: proc(m: ^Mount, p: string, e: Entry, disk: bool, out: ^[dynamic]str
 }
 
 @(private = "file")
-verify_shadow :: proc(m: ^Mount, dir: string, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+verify_shadow :: proc(m: ^Mount, dir: string, disk: bool, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	kids := make([dynamic]Shadow_Child, context.temp_allocator)
 	shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
 	for k in kids {
 		p, _ := path_join(dir, k.name, context.temp_allocator)
-		if verify_skip(m, p) {
+		if verify_skip(m, p, disk) {
 			continue
 		}
 		if k.entry.ver != 0 {
@@ -224,7 +227,7 @@ verify_shadow :: proc(m: ^Mount, dir: string, seen: ^map[string]bool, out: ^[dyn
 			append(out, fmt.aprintf("%s: in the shadow as %v but not in the synced tree", p, k.entry.inode, allocator = allocator))
 		}
 		if k.entry.kind == .Dir {
-			verify_shadow(m, p, seen, out, allocator) or_return
+			verify_shadow(m, p, disk, seen, out, allocator) or_return
 		}
 	}
 	return .None

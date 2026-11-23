@@ -2060,6 +2060,9 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 			d.target = t
 		}
 	}
+	if (d.kind == .Missing || d.kind == .Other) && mount_absent_has(m, rel) {
+		return .None
+	}
 	switch {
 	case d.kind == .Missing || d.kind == .Other || disk_to_tree(d.kind) != e.kind:
 		add_remove_tree(p, rel, e) or_return

@@ -215,6 +215,31 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 		}
 		a.disk.quiet = false
 	}
+	if failed_pass && a.alive && a.incarnation == inc && c.mode != .Midcrash && c.mode != .Hold {
+		passes := m.passes
+		for _ in 0 ..< 400 {
+			if !a.alive || a.incarnation != inc {
+				break
+			}
+			if m.passes != passes {
+				passes = m.passes
+				context = instance_context(&a.inst)
+				out := make([dynamic]string, context.temp_allocator)
+				a.disk.quiet = true
+				merr := fs.mount_synced_mismatches(m, &out, context.temp_allocator)
+				a.disk.quiet = false
+				if merr == .None {
+					for x in out {
+						world_fail(w, "midway: at a pass after a materialize failed at op %d (%v) the synced version names what is neither on disk nor owed: %s", c.k, c.mode, x)
+					}
+				}
+				if len(fs.mount_absent(m)) == 0 {
+					break
+				}
+			}
+			run_until(w, w.now + 1_000_000, false)
+		}
+	}
 	if failed_pass && a.alive && (c.mode == .Process || c.mode == .Power || c.mode == .Midcrash) {
 		node_crash_now(a, .Power if c.mode == .Power else .Process, c.k)
 		if c.mode == .Midcrash {
@@ -326,6 +351,9 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool) {
 		for x in out {
 			world_fail(w, "midway: after a materialize failed at op %d (%v) the synced version is not what is on disk: %s", c.k, c.mode, x)
 		}
+	}
+	if owed := fs.mount_absent(m); len(owed) > 0 {
+		world_fail(w, "midway: after a materialize failed at op %d (%v) and a clean pass, %d paths are still owed: %v", c.k, c.mode, len(owed), owed)
 	}
 	return
 }

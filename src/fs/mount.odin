@@ -1855,6 +1855,7 @@ Mount_Image :: struct {
 	shadow:     Shadow_Mark,
 	chained:    bool,
 	line:       string,
+	absent:     [dynamic]string,
 }
 
 Mount_Wait :: struct {
@@ -1886,6 +1887,11 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	}
 	img.chained = len(m.attrib_chain) > 0
 	img.log_at = m.log_at if img.chained else m.log_len
+	img.absent = make([dynamic]string, m.allocator)
+	for a in m.absent {
+		c, _ := clone_string(a, m.allocator)
+		append(&img.absent, c)
+	}
 }
 
 @(private)
@@ -1898,6 +1904,10 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 		delete(k, m.allocator)
 	}
 	delete(img.attrib)
+	for a in img.absent {
+		delete(a, m.allocator)
+	}
+	delete(img.absent)
 	img^ = {}
 }
 
@@ -2061,8 +2071,15 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_ivarint(&w, m.jpos)
 	gen := m.log_gen + 1 if covered && m.log_len > 0 else m.log_gen
 	prim.write_uvarint(&w, gen)
-	prim.write_uvarint(&w, u64(len(m.absent)))
+	owed := make([dynamic]string, context.temp_allocator)
+	append(&owed, ..img.absent[:])
 	for a in m.absent {
+		if !string_in(owed[:], a) {
+			append(&owed, a)
+		}
+	}
+	prim.write_uvarint(&w, u64(len(owed)))
+	for a in owed {
 		prim.write_str(&w, a)
 	}
 	m.shadow_mark = img.shadow

@@ -242,6 +242,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			mat_owe(m, &ms)
 			if mat_structural(items[i:]) {
 				mat_pin_written(m, items[:i], target)
+				mat_owe_applied(m, items[:i])
 				m.rescan = true
 			} else {
 				mat_roll_forward(m, items[:], sl[:], target)
@@ -328,6 +329,24 @@ mat_pin_written :: proc(m: ^Mount, items: []Mat_Item, target: Version) {
 		}
 		cur.ver = ver
 		shadow_put(&m.shadow, it.path, cur)
+	}
+}
+
+@(private)
+mat_owe_applied :: proc(m: ^Mount, items: []Mat_Item) {
+	if m.restoring {
+		return
+	}
+	for &it in items {
+		if !mat_item_structural(&it) {
+			continue
+		}
+		if it.has_old && (it.old != it.path || !it.present) {
+			mount_absent_add(m, it.old)
+		}
+		if it.present && it.kind == .Dir {
+			mount_absent_add(m, it.path)
+		}
 	}
 }
 
@@ -1552,6 +1571,20 @@ mount_reshow_add :: proc(m: ^Mount, path: string) {
 	}
 	p, _ := clone_string(path, m.allocator)
 	append(&m.reshow, p)
+}
+
+@(private)
+string_in :: proc(list: []string, s: string) -> bool {
+	for x in list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+mount_absent_has :: proc(m: ^Mount, path: string) -> bool {
+	return string_in(m.absent[:], path)
 }
 
 mount_absent :: proc(m: ^Mount) -> []string {
