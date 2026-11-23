@@ -534,6 +534,15 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	op.path = strings.clone(name, w.allocator)
 	append(&op.deletes, strings.clone(last.text, w.allocator))
 	append(&op.tokens, tok)
+	line_start := last.pos
+	for line_start > 0 && old[line_start - 1] != '\n' {
+		line_start -= 1
+	}
+	for t in toks[:len(toks) - 1] {
+		if t.pos >= line_start {
+			append(&op.tokens, strings.clone(t.text, w.allocator))
+		}
+	}
 	context = instance_context(&n.inst)
 	scope: ^fs.Scope
 	if agent {
