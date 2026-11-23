@@ -61,10 +61,10 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	}
 	ctx := Text_Plan{e = e, h = h}
 	res, rerr := fs.history_redact(h.hist, ops[:], context.temp_allocator, _text_plan(&ctx))
-	_ferr(rerr) or_return
 	for r in res.ranges {
 		_own_redacted(e, h, r.from, r.to)
 	}
+	_ferr(rerr) or_return
 	_handle_mark(h)
 	_object_changed(e, o.space, o.id, .Redacted)
 	_index_purge_object(e, h)

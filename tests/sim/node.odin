@@ -79,7 +79,7 @@ node_start :: proc(n: ^Node) -> bool {
 		done(arg)
 	}}
 	cfg.watcher = sim_watcher(n)
-	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail}
+	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail, zeroed = _redact_zeroed}
 	cfg.checkpoint_hook = eng.Checkpoint_Hook{data = n, at = _on_checkpoint}
 	cfg.embedder = sim_embedder()
 	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
@@ -739,6 +739,7 @@ STAT_TIER_PARKS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
 STAT_PERSIST_FAULTS: Stat
+STAT_ZEROED_PERSIST_FAULTS: Stat
 STAT_GHOST_TAILS: Stat
 
 _on_checkpoint :: proc(data: rawptr, e: ^eng.Engine, object: eng.Object, stage: eng.Checkpoint_Stage, scope: ^osync.Scope, oid: [32]u8) {
@@ -749,6 +750,16 @@ _on_checkpoint :: proc(data: rawptr, e: ^eng.Engine, object: eng.Object, stage: 
 	if n.ckpt_window != nil {
 		n.ckpt_window(n, e, object, stage)
 	}
+}
+
+_redact_zeroed :: proc(data: rawptr) {
+	n := (^Node)(data)
+	if !n.w.cfg.persist_fault || !rng_chance(&n.w.fault_rng, 1, 2) {
+		return
+	}
+	n.persist_fail = 1
+	stat_add(n.w, STAT_ZEROED_PERSIST_FAULTS)
+	world_note(n.w, "%s history persist after a redaction zero-fill will fail (injected)", n.name)
 }
 
 _persist_fail :: proc(data: rawptr) -> bool {
@@ -787,6 +798,7 @@ _node_stats :: proc "contextless" () {
 	register_stat_line(45)
 	STAT_PERSIST_FAULTS = register_stat(45, 0, "history_persist_faults")
 	STAT_GHOST_TAILS = register_stat(45, 1, "ghost_tails")
+	STAT_ZEROED_PERSIST_FAULTS = register_stat(45, 2, "zeroed_persist_faults")
 	STAT_TIER_EVICTIONS = register_stat(40, 0, "relay_evictions")
 	STAT_TIER_COLD_READS = register_stat(40, 1, "relay_cold_reads")
 	register_stat_line(48)
