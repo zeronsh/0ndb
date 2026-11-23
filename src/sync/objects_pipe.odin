@@ -71,6 +71,7 @@ _pipe_start :: proc(r: ^Replicator, j: ^Obj_Job) -> bool {
 @(private)
 _pipe_reset :: proc(r: ^Replicator, j: ^Obj_Job) {
 	if j.p_tag != 0 {
+		client_pull_end(&r.client, j.p_holder, j.p_tag)
 		delete_key(&r.objs.pulls, j.p_tag)
 		j.p_tag = 0
 	}

@@ -326,6 +326,7 @@ _unavailable :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
 
 @(private)
 _pull_drop :: proc(r: ^Replicator, rm: ^Remote, i: int) {
+	client_pull_end(&r.client, rm.pulls[i].holder, rm.pulls[i].tag)
 	ordered_remove(&rm.pulls, i)
 }
 
@@ -487,7 +488,7 @@ _peer_tampered :: proc(r: ^Replicator, rm: ^Remote) -> bool {
 	}
 	for i := 0; i < len(rm.pulls); {
 		if rm.pulls[i].holder == h {
-			ordered_remove(&rm.pulls, i)
+			_pull_drop(r, rm, i)
 			continue
 		}
 		i += 1

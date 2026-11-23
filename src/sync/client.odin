@@ -108,6 +108,7 @@ Await_Family :: enum u8 {
 	Other,
 	Probe,
 	Follow,
+	Pull,
 }
 
 @(private)
@@ -339,6 +340,18 @@ _await_done_any :: proc(c: ^Client, id: [32]u8) {
 	if found {
 		_await_done(c, id, best)
 	}
+}
+
+@(private)
+_pull_key :: proc "contextless" (holder: Device_Id, tag: u64) -> (k: [32]u8) {
+	h := holder
+	copy(k[:16], h[:])
+	prim.put_u64le(k[16:24], tag)
+	return
+}
+
+client_pull_end :: proc(c: ^Client, holder: Device_Id, tag: u64) {
+	_await_done(c, _pull_key(holder, tag), .Pull)
 }
 
 @(private)
@@ -788,7 +801,9 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		}
 		c.bulk = ev
 		c.bulk.first = false
-		if ev.kind != .Served {
+		if ev.kind == .Served {
+			_await_progress(c, _pull_key(ev.device, ev.tag), .Pull)
+		} else {
 			_await_progress(c, ev.id)
 		}
 		return handler(user, &ev)
@@ -801,6 +816,13 @@ _client_item :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: rawpt
 		ev := c.bulk
 		ev.last = true
 		c.bulk = {}
+		if ev.kind == .Served {
+			if ev.final {
+				_await_done(c, _pull_key(ev.device, ev.tag), .Pull)
+			} else {
+				_await_progress(c, _pull_key(ev.device, ev.tag), .Pull)
+			}
+		}
 		if ev.kind == .Served || ev.kind == .Lived {
 			return handler(user, &ev)
 		}
@@ -910,6 +932,7 @@ _client_control :: proc(c: ^Client, it: ^Item, handler: Client_Handler, user: ra
 		prim.read_fixed(&r, ev.device[:])
 		ev.tag = prim.read_u64le(&r)
 		ev.id = get_id32(&r)
+		_await_done(c, _pull_key(ev.device, ev.tag), .Pull)
 	case .Presence:
 		flags := prim.read_u8(&r)
 		n := int(prim.read_u16le(&r))

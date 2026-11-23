@@ -2423,6 +2423,9 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 		rm.pulling = false
 		rm.pulled = _contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
 		if ev.code == .Not_Owner {
+			for len(rm.pulls) > 0 {
+				_pull_drop(r, rm, 0)
+			}
 			_remote_deny(r, rm)
 		} else {
 			_remote_hold_retry(r, rm)
