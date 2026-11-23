@@ -599,6 +599,7 @@ check_restore_offline_writer :: proc(w: ^World) {
 	}
 	tn := _new_reader(w, p.rn, space)
 	if tn == nil {
+		_heal_settle(w, p.wn)
 		return
 	}
 	run_until(w, w.now + 60_000_000_000, true)
@@ -659,17 +660,24 @@ check_restore_offline_writer :: proc(w: ^World) {
 	for n in offline {
 		n.partitioned = false
 	}
-	p.wn.partitioned = false
+	if _heal_settle(w, p.wn) {
+		check_convergence(w, true)
+	}
+}
+
+@(private = "file")
+_heal_settle :: proc(w: ^World, n: ^Node) -> bool {
+	n.partitioned = false
 	for _ in 0 ..< 6 {
 		idle := run_until(w, w.now + 120_000_000_000, true)
 		if len(w.failures) > 0 || w.aborted {
-			return
+			return false
 		}
 		if idle && check_convergence(w, false) {
 			break
 		}
 	}
-	check_convergence(w, true)
+	return true
 }
 
 @(private = "file")
@@ -884,6 +892,7 @@ _forget_reread :: proc(w: ^World, p: Restore_Pick) {
 		node_after(p.rn)
 	}
 	if !_restart_settle(w, p.rn) {
+		_heal_settle(w, p.wn)
 		return
 	}
 	got: Digest
@@ -905,16 +914,7 @@ _forget_reread :: proc(w: ^World, p: Restore_Pick) {
 	if got.complete {
 		delete(got.text, w.allocator)
 	}
-	p.wn.partitioned = false
-	for _ in 0 ..< 6 {
-		idle := run_until(w, w.now + 120_000_000_000, true)
-		if len(w.failures) > 0 || w.aborted {
-			return
-		}
-		if idle && check_convergence(w, false) {
-			break
-		}
-	}
+	_heal_settle(w, p.wn)
 }
 
 check_forget_device_held :: proc(w: ^World) {
