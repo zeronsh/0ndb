@@ -65,7 +65,7 @@ verify_mount :: proc(m: ^Mount, disk: bool, out: ^[dynamic]string, allocator := 
 	defer fstree.snapshot_destroy(&snap)
 	seen := make(map[string]bool, context.temp_allocator)
 	verify_tree(m, &snap, fstree.ROOT, "", disk, &seen, out, allocator) or_return
-	return verify_shadow(m, "", disk, &seen, out, allocator)
+	return verify_shadow(m, &snap, "", disk, &seen, out, allocator)
 }
 
 @(private = "file")
@@ -108,7 +108,7 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 		}
 		e, found := shadow_get(&m.shadow, p) or_return
 		if found && e.ver != 0 {
-			verify_at(m, p, e, disk, out, allocator) or_return
+			verify_at(m, snap, p, e, disk, out, allocator) or_return
 			continue
 		}
 		if !found || e.inode != c.inode {
@@ -161,7 +161,7 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 }
 
 @(private = "file")
-verify_at :: proc(m: ^Mount, p: string, e: Entry, disk: bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+verify_at :: proc(m: ^Mount, synced: ^fstree.Snapshot, p: string, e: Entry, disk: bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	h := m.history
 	at := make([dynamic]crdt.Op_Id, context.temp_allocator)
 	ids, vok := shadow_version(&m.shadow, e)
@@ -179,13 +179,27 @@ verify_at :: proc(m: ^Mount, p: string, e: Entry, disk: bool, out: ^[dynamic]str
 	}
 	snap := version_snapshot(h, lvs[:]) or_return
 	defer fstree.snapshot_destroy(&snap)
+	info, iok, ierr := fstree.info(&snap, e.inode, context.temp_allocator)
+	if ierr != nil {
+		return .Corrupt
+	}
+	if !iok || !info.present {
+		append(out, fmt.aprintf("%s: shadow inode %v is not in its own version", p, e.inode, allocator = allocator))
+		return .None
+	}
 	id, ok, lerr := fstree.lookup(&snap, p)
 	if lerr != nil {
 		return .Corrupt
 	}
 	if !ok || id != e.inode {
-		append(out, fmt.aprintf("%s: shadow inode %v at its own version, tree %v (found %v)", p, e.inode, id, ok, allocator = allocator))
-		return .None
+		sid, sok, serr := fstree.lookup(synced, p)
+		if serr != nil {
+			return .Corrupt
+		}
+		if !sok || sid != e.inode {
+			append(out, fmt.aprintf("%s: shadow inode %v is at this path neither at its own version (%v, found %v) nor in synced (%v, found %v)", p, e.inode, id, ok, sid, sok, allocator = allocator))
+			return .None
+		}
 	}
 	if !disk || e.kind != .File {
 		return .None
@@ -208,7 +222,7 @@ verify_at :: proc(m: ^Mount, p: string, e: Entry, disk: bool, out: ^[dynamic]str
 }
 
 @(private = "file")
-verify_shadow :: proc(m: ^Mount, dir: string, disk: bool, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
+verify_shadow :: proc(m: ^Mount, synced: ^fstree.Snapshot, dir: string, disk: bool, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	kids := make([dynamic]Shadow_Child, context.temp_allocator)
 	shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
 	for k in kids {
@@ -219,7 +233,7 @@ verify_shadow :: proc(m: ^Mount, dir: string, disk: bool, seen: ^map[string]bool
 		if k.entry.ver != 0 {
 			if !seen[p] {
 				seen[p] = true
-				verify_at(m, p, k.entry, true, out, allocator) or_return
+				verify_at(m, synced, p, k.entry, true, out, allocator) or_return
 			}
 			continue
 		}
@@ -227,7 +241,7 @@ verify_shadow :: proc(m: ^Mount, dir: string, disk: bool, seen: ^map[string]bool
 			append(out, fmt.aprintf("%s: in the shadow as %v but not in the synced tree", p, k.entry.inode, allocator = allocator))
 		}
 		if k.entry.kind == .Dir {
-			verify_shadow(m, p, disk, seen, out, allocator) or_return
+			verify_shadow(m, synced, p, disk, seen, out, allocator) or_return
 		}
 	}
 	return .None
