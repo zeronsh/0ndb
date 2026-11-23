@@ -1,6 +1,7 @@
 package engine
 
 import "core:crypto"
+import "core:slice"
 import omap "../map"
 import "../prim"
 import osync "../sync"
@@ -9,11 +10,27 @@ import osync "../sync"
 ROOT_GRANTS :: 5
 SHARE_CARDS :: 16
 SHARE_EPOCHS :: 32
-SHARE_VERSION :: 2
+SHARE_VERSION :: 3
 
 Share_Epoch :: struct {
 	tag:     osync.Epoch_Tag,
+	order:   u32,
+	view:    u32,
 	wrapped: [osync.WRAP_LEN]u8,
+}
+
+@(private)
+GRANT_ENTRY :: osync.EPOCH_TAG_LEN + 8 + osync.WRAP_LEN
+
+@(private)
+_grant_entry_put :: proc(buf: ^[dynamic]u8, tag: osync.Epoch_Tag, order, view: u32, wrapped: []u8) {
+	t := tag
+	append(buf, ..t[:])
+	n: [8]u8
+	prim.put_u32le(n[:4], order)
+	prim.put_u32le(n[4:], view)
+	append(buf, ..n[:])
+	append(buf, ..wrapped)
 }
 
 Share :: struct {
@@ -217,21 +234,34 @@ _share_epochs :: proc(e: ^Engine, sp: ^Space, object: prim.Id, recipient: ^osync
 	cur := sp.mem.current
 	has_cur := cur >= 0 && cur < len(sp.mem.epochs)
 	room := SHARE_EPOCHS - 1 if has_cur else SHARE_EPOCHS
-	for i in 0 ..= len(sp.mem.epochs) {
-		last := i == len(sp.mem.epochs)
-		if last && !has_cur {
-			break
+	pick := make([dynamic]int, context.temp_allocator)
+	for i in 0 ..< len(sp.mem.epochs) {
+		if i != cur {
+			append(&pick, i)
 		}
-		if !last && (i == cur || s.nepochs >= room) {
-			continue
+	}
+	for i in 1 ..< len(pick) {
+		for j := i; j > 0 && _epoch_after(sp.mem.epochs[pick[j]], sp.mem.epochs[pick[j - 1]]); j -= 1 {
+			pick[j], pick[j - 1] = pick[j - 1], pick[j]
 		}
-		ep := &sp.mem.epochs[cur if last else i]
+	}
+	if len(pick) > room {
+		resize(&pick, room)
+	}
+	slice.reverse(pick[:])
+	if has_cur {
+		append(&pick, cur)
+	}
+	for i in pick {
+		ep := &sp.mem.epochs[i]
 		o := object
 		ck := osync.Content_Key{key = osync.object_epoch_key(&ep.secret, ep.number, o[:]), epoch = ep.number}
 		err := e.keyring.wrap(e.keyring.data, recipient, &ck, &s.epochs[s.nepochs].wrapped)
 		crypto.zero_explicit(&ck, size_of(ck))
 		_serr(err) or_return
 		s.epochs[s.nepochs].tag = ep.tag
+		s.epochs[s.nepochs].order = ep.order
+		s.epochs[s.nepochs].view = ep.view
 		s.nepochs += 1
 	}
 	if g, ok := sp.grant_epochs[object]; ok {
@@ -244,6 +274,8 @@ _share_epochs :: proc(e: ^Engine, sp: ^Space, object: prim.Id, recipient: ^osync
 			crypto.zero_explicit(&ck, size_of(ck))
 			_serr(err) or_return
 			s.epochs[s.nepochs].tag = x.tag
+			s.epochs[s.nepochs].order = x.order
+			s.epochs[s.nepochs].view = x.view
 			s.nepochs += 1
 		}
 	}
@@ -266,8 +298,7 @@ _share_epochs_store :: proc(e: ^Engine, sp: ^Space, s: ^Share) -> Error {
 	_perr(prim.mkdir_all(e.vfs, prim.dir_name(path), 0o700)) or_return
 	buf := make([dynamic]u8, context.temp_allocator)
 	for i in 0 ..< min(s.nepochs, SHARE_EPOCHS) {
-		append(&buf, ..s.epochs[i].tag[:])
-		append(&buf, ..s.epochs[i].wrapped[:])
+		_grant_entry_put(&buf, s.epochs[i].tag, s.epochs[i].order, s.epochs[i].view, s.epochs[i].wrapped[:])
 	}
 	return _perr(prim.replace_atomic(e.vfs, path, buf[:]))
 }
@@ -282,17 +313,33 @@ _grant_epochs_load :: proc(e: ^Engine, sp: ^Space, object: prim.Id) {
 	if err != .None {
 		return
 	}
-	step := osync.EPOCH_TAG_LEN + osync.WRAP_LEN
 	list := make([dynamic]Space_Epoch, e.allocator)
-	for pos := 0; pos + step <= len(data); pos += step {
+	for pos := 0; pos + GRANT_ENTRY <= len(data); pos += GRANT_ENTRY {
 		ck: osync.Content_Key
-		if e.keyring.unwrap(e.keyring.data, data[pos + osync.EPOCH_TAG_LEN:][:osync.WRAP_LEN], &ck) != .None {
+		if e.keyring.unwrap(e.keyring.data, data[pos + osync.EPOCH_TAG_LEN + 8:][:osync.WRAP_LEN], &ck) != .None {
 			continue
 		}
 		x := Space_Epoch{number = ck.epoch, secret = ck.key}
 		copy(x.tag[:], data[pos:][:osync.EPOCH_TAG_LEN])
-		append(&list, x)
+		x.order = prim.get_u32le(data[pos + osync.EPOCH_TAG_LEN:])
+		x.view = prim.get_u32le(data[pos + osync.EPOCH_TAG_LEN + 4:])
 		crypto.zero_explicit(&ck, size_of(ck))
+		merged := false
+		for &y in list {
+			if y.tag == x.tag {
+				if x.view > y.view {
+					y.order = x.order
+					y.view = x.view
+				}
+				merged = true
+				break
+			}
+		}
+		if merged {
+			crypto.zero_explicit(&x.secret, size_of(x.secret))
+			continue
+		}
+		append(&list, x)
 	}
 	if old, ok := sp.grant_epochs[object]; ok {
 		for &x in old {
@@ -314,6 +361,8 @@ share_encode :: proc(s: ^Share, out: ^[dynamic]u8) -> Error {
 	prim.write_uvarint(&w, u64(s.nepochs))
 	for i in 0 ..< min(s.nepochs, SHARE_EPOCHS) {
 		prim.write_raw(&w, s.epochs[i].tag[:])
+		prim.write_u32le(&w, s.epochs[i].order)
+		prim.write_u32le(&w, s.epochs[i].view)
 		prim.write_raw(&w, s.epochs[i].wrapped[:])
 	}
 	return .No_Memory if w.err != .None else .None
@@ -337,6 +386,8 @@ share_decode :: proc(data: []u8, s: ^Share) -> Error {
 	s.nepochs = int(n)
 	for i in 0 ..< s.nepochs {
 		prim.read_fixed(&r, s.epochs[i].tag[:])
+		s.epochs[i].order = prim.read_u32le(&r)
+		s.epochs[i].view = prim.read_u32le(&r)
 		prim.read_fixed(&r, s.epochs[i].wrapped[:])
 	}
 	if !prim.reader_ok(&r) || !prim.reader_done(&r) {
