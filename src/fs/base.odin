@@ -427,6 +427,7 @@ _entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin
 _observed :: proc(h: ^History, actor: prim.Id, rel: string) -> (o: fshist.Observe_Op, found: bool) {
 	known := crdt.graph_known(&h.g, actor)
 	seq := known
+	written := make(map[crdt.Op_Id]bool, context.temp_allocator)
 	for seq > 0 {
 		lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, seq - 1})
 		if !ok {
@@ -447,7 +448,15 @@ _observed :: proc(h: ^History, actor: prim.Id, rel: string) -> (o: fshist.Observ
 				}
 			}
 			if found {
+				if written[o.inode] {
+					return {}, false
+				}
 				return
+			}
+			for op in b.ops {
+				if op.kind != .Opaque {
+					written[op.target] = true
+				}
 			}
 		}
 		back := u64(lv - first) + 1
