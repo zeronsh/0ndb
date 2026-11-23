@@ -8,6 +8,7 @@ Replica :: struct {
 	vfs:       prim.Vfs,
 	fd:        prim.Fd,
 	have:      [dynamic]Range,
+	held:      [dynamic]Range,
 	length:    i64,
 	version:   u64,
 	have_path: string,
@@ -54,6 +55,7 @@ replica_open :: proc(rep: ^Replica, vfs: prim.Vfs, path: string, allocator := co
 	}
 	rep.redact = redact
 	rep.have = make([dynamic]Range, allocator)
+	rep.held = make([dynamic]Range, allocator)
 	if err := _load_have(rep); err != .None {
 		replica_close(rep)
 		return err
@@ -149,6 +151,7 @@ replica_close :: proc(rep: ^Replica) {
 		prim.close_file(rep.vfs, rep.fd)
 	}
 	delete(rep.have)
+	delete(rep.held)
 	if len(rep.have_path) > 0 {
 		delete(rep.have_path, rep.allocator)
 	}
@@ -202,6 +205,33 @@ replica_set_length :: proc(rep: ^Replica, length: i64) -> Error {
 	rep.length = length
 	rep.version += 1
 	return _save_have(rep)
+}
+
+replica_hold :: proc(rep: ^Replica, from, to: i64) -> Error {
+	if to <= from {
+		return .None
+	}
+	if err := _add_range(&rep.held, {from, to}); err != .None {
+		return err
+	}
+	rep.version += 1
+	return .None
+}
+
+replica_release :: proc(rep: ^Replica, from, to: i64) -> Error {
+	if to <= from {
+		return .None
+	}
+	return _remove_range(&rep.held, {from, to})
+}
+
+replica_held :: proc "contextless" (rep: ^Replica, from, to: i64) -> bool {
+	for h in rep.held {
+		if h.from < to && h.to > from {
+			return true
+		}
+	}
+	return false
 }
 
 replica_covers :: proc "contextless" (rep: ^Replica, from, to: i64) -> bool {

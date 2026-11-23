@@ -74,6 +74,8 @@ Node :: struct {
 	connects:    int,
 	connect_fault: Connect_Fault,
 	persist_fail: int,
+	redact_faulted: bool,
+	learn_check:    bool,
 	unavailable: int,
 	incarnation: int,
 	inst:        Instance,
@@ -97,6 +99,7 @@ Node :: struct {
 	sent:        map[string]i64,
 	boot:        u64,
 	learned:     [dynamic]Learned_Redaction,
+	held:        [dynamic]Learned_Redaction,
 	observed:    int,
 	mounts:      [dynamic]Sim_Mount,
 	writers:     map[string]Writer_Info,
@@ -185,6 +188,7 @@ Config :: struct {
 	durability:  eng.Durability,
 	promote:     i64,
 	persist_fault: bool,
+	redact_fault:  bool,
 }
 
 World :: struct {
@@ -461,6 +465,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.mounts = make([dynamic]Sim_Mount, w.allocator)
 		n.writers = make(map[string]Writer_Info, w.allocator)
 		n.learned = make([dynamic]Learned_Redaction, w.allocator)
+		n.held = make([dynamic]Learned_Redaction, w.allocator)
 		append(&w.nodes, n)
 	}
 	if !world_reserve(w) {

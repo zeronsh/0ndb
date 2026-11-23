@@ -256,7 +256,7 @@ _read :: proc(r: ^Reader, off, end: i64, forward: bool) -> (body: []u8, err: Err
 			b, _ = record_body(rec)
 		}
 	}
-	if kind == .Redacted {
+	if kind == .Redacted || (r.replica != nil && replica_held(r.replica, off, end)) {
 		return nil, .Redacted
 	}
 	return b, .None

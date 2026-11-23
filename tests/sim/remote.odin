@@ -166,6 +166,7 @@ check_move :: proc(w: ^World) {
 	mv.mounts = make([dynamic]Sim_Mount, w.allocator)
 	mv.writers = make(map[string]Writer_Info, w.allocator)
 	mv.learned = make([dynamic]Learned_Redaction, w.allocator)
+	mv.held = make([dynamic]Learned_Redaction, w.allocator)
 	append(&w.nodes, mv)
 	if mv.idx >= RELAY_SLOT || !world_reserve(w) || !node_start(mv) {
 		world_fail(w, "move: %s could not start", mv.name)
