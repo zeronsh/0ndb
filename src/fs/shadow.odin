@@ -33,7 +33,8 @@ Entry :: struct {
 	kind:   fstree.Kind,
 	stat:   Stat,
 	oid:    odb.Oid,
-	synced: u64,
+	at:     fstree.Op_Id,
+	has_at: bool,
 	racy:   bool,
 }
 
@@ -971,7 +972,12 @@ encode_rec :: proc(out: ^[dynamic]u8, off: u64, path: string, del: bool, e: Entr
 		prim.write_uvarint(&w, u64(e.stat.mode))
 		oid := e.oid
 		prim.write_raw(&w, oid[:oid_size])
-		prim.write_uvarint(&w, e.synced)
+		if e.has_at {
+			prim.write_uvarint(&w, u64(e.at.actor) + 1)
+			prim.write_uvarint(&w, e.at.seq)
+		} else {
+			prim.write_uvarint(&w, 0)
+		}
 	}
 	if linked {
 		prim.write_u64le(&w, sibling)
@@ -1065,7 +1071,14 @@ decode_rec :: proc(body: []u8, oid_size: int) -> (r: Rec, err: Error) {
 		}
 		r.entry.stat.mode = u32(mode)
 		prim.read_fixed(&rd, r.entry.oid[:oid_size])
-		r.entry.synced = prim.read_uvarint(&rd)
+		if at := prim.read_uvarint(&rd); at != 0 {
+			if at - 1 > u64(max(u32)) {
+				return {}, .Corrupt
+			}
+			r.entry.has_at = true
+			r.entry.at.actor = u32(at - 1)
+			r.entry.at.seq = prim.read_uvarint(&rd)
+		}
 	}
 	if r.linked {
 		r.sibling = prim.read_u64le(&rd)
