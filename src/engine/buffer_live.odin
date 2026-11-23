@@ -814,10 +814,17 @@ _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 		}
 		rt, found := sp.remote_trees[ev.stream]
 		if !found || !rt.loaded {
+			e.stats.buffer_live_keyless += 1
+			if !found {
+				_remote_tree_get(e, sp, &h.scope, dev, h.name, 0)
+			} else {
+				_remote_tree_load(e, sp, rt)
+			}
 			return
 		}
 		key, ok := osync.buffer_live_key(osync.keytree_provider(&rt.tree), off, boot)
 		if !ok {
+			e.stats.buffer_live_keyless += 1
 			return
 		}
 		defer crypto.zero_explicit(&key, size_of(key))
