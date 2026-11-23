@@ -232,7 +232,7 @@ history_open :: proc(h: ^History, vfs: prim.Vfs, dir: string, id: prim.Id, self:
 	h.dir = d
 	h.staged = make([dynamic]Staged_Blob, allocator)
 	h.mounts = make([dynamic]^Mount, allocator)
-	if err := history_wake(h); err != .None {
+	if err := history_wake(h); err != .None && err != .Reloading {
 		delete(h.dir, allocator)
 		h.dir = ""
 		return err
