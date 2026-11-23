@@ -304,7 +304,7 @@ _handle_open_writer :: proc(h: ^Handle) -> Error {
 		_map_own_check(e, h) or_return
 	case .Text, .File_Tree:
 		_hist_open(h) or_return
-		h.published = journal.journal_durable_len(&h.hist.journal)
+		h.published = fs.history_own_durable(h.hist)
 	}
 	h.w_open = true
 	_own_tree_epoch(e, h)
