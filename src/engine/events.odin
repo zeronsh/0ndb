@@ -5,6 +5,7 @@ import "../journal"
 import omap "../map"
 import "../obj"
 import "../prim"
+import osync "../sync"
 
 Delta_Kind :: enum u8 {
 	Message,
@@ -332,6 +333,15 @@ _sub_scan :: proc(e: ^Engine, s: ^Sub, h: ^Handle, device: prim.Id, r: ^journal.
 		if je == .Redacted {
 			pos = next
 			continue
+		}
+		if je == .Missing && !local && h.sp.repl_on {
+			if gap := r.missing; gap.from < end {
+				want := [1]journal.Range{{max(gap.from, pos), min(max(gap.to, gap.from + 1), end)}}
+				osync.replicator_want(&h.sp.repl, &h.scope, device, h.name, 0, want[:])
+			}
+			if osync.replicator_relay_length(&h.sp.repl, &h.scope, device, h.name, 0) < 0 {
+				osync.replicator_want_tail(&h.sp.repl, &h.scope, device, h.name, 0, 1)
+			}
 		}
 		if je != .None {
 			break
