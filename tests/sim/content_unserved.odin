@@ -146,6 +146,10 @@ check_content_unserved :: proc(w: ^World) {
 		return
 	}
 	run_until(w, w.now + 30_000_000_000, true)
+	if len(h.mounts) == 0 {
+		return
+	}
+	line := line_eng(strings.clone(h.mounts[len(h.mounts) - 1].m.line, w.allocator))
 	before: map[odb.Oid]bool
 	{
 		context = instance_context(&h.inst)
@@ -176,7 +180,7 @@ check_content_unserved :: proc(w: ^World) {
 	fresh := make([dynamic]odb.Oid, w.allocator)
 	{
 		context = instance_context(&h.inst)
-		got, gerr := eng.tree_read(&h.e, o, name, context.temp_allocator)
+		got, gerr := eng.tree_read(&h.e, o, name, context.temp_allocator, {}, line)
 		if gerr != .None || string(got) != want {
 			return
 		}
@@ -222,7 +226,7 @@ check_content_unserved :: proc(w: ^World) {
 	for _ in 0 ..< 6 {
 		{
 			context = instance_context(&r.inst)
-			_, rerr := eng.tree_read(&r.e, o, name, context.temp_allocator)
+			_, rerr := eng.tree_read(&r.e, o, name, context.temp_allocator, {}, line)
 			if rerr == .None {
 				return
 			}
@@ -248,10 +252,14 @@ check_content_unserved :: proc(w: ^World) {
 			return
 		}
 	}
+	for c in h.conns {
+		conn_reset(c, true)
+	}
+	run_until(w, w.now + 30_000_000_000, true)
 	for _ in 0 ..< 6 {
 		{
 			context = instance_context(&r.inst)
-			got, rerr := eng.tree_read(&r.e, o, name, context.temp_allocator)
+			got, rerr := eng.tree_read(&r.e, o, name, context.temp_allocator, {}, line)
 			if rerr == .None {
 				if string(got) != want {
 					world_fail(w, "content unserved: %s read %d bytes of %s/%s, %d written", r.name, len(got), id_short(o.id), name, len(want))
