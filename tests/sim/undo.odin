@@ -222,7 +222,7 @@ _ur_same :: proc(a, b: Ur_State) -> bool {
 }
 
 @(private = "file")
-_ur_msg :: proc(c: ^Ur_Ctx, role: convo.Role, files: []convo.File_Delta) -> (msg: obj.Rid, ok: bool) {
+_ur_msg :: proc(c: ^Ur_Ctx, role: convo.Role, files: []convo.File_Delta, seal := true) -> (msg: obj.Rid, ok: bool) {
 	n := c.n
 	context = instance_context(&n.inst)
 	defer node_after(n)
@@ -236,7 +236,7 @@ _ur_msg :: proc(c: ^Ur_Ctx, role: convo.Role, files: []convo.File_Delta) -> (msg
 		world_fail(c.w, "undo: writer_message: %v", merr)
 		return
 	}
-	if role == .Assistant {
+	if role == .Assistant && seal {
 		if _, serr := convo.writer_seal(wr, m, .Done); serr != .None {
 			world_fail(c.w, "undo: writer_seal: %v", serr)
 			return
@@ -264,11 +264,15 @@ _ur_turn :: proc(c: ^Ur_Ctx, person: bool, create: bool) -> bool {
 		}
 		node_after(c.n)
 	}
-	user, uok := _ur_msg(c, .User, files)
+	user, uok := _ur_msg(c, .User, nil)
 	if !uok {
 		return false
 	}
 	append(&c.turns, user)
+	reply, pok := _ur_msg(c, .Assistant, files, false)
+	if !pok {
+		return false
+	}
 	names := []string{"a.txt", "b.txt"}
 	for _ in 0 ..< 1 + rng_int(&w.rng, 3) {
 		if !_ur_write(c, true, names[rng_int(&w.rng, len(names))]) {
@@ -295,14 +299,18 @@ _ur_turn :: proc(c: ^Ur_Ctx, person: bool, create: bool) -> bool {
 		wr, werr := eng.convo_writer(&n.e, c.conv)
 		if werr == .None {
 			sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-			convo.writer_scope(wr, user, .Turn, sid, c.agent, nil, nil)
+			convo.writer_scope(wr, reply, .Turn, sid, c.agent, nil, nil)
+			if _, serr := convo.writer_seal(wr, reply, .Done); serr != .None {
+				world_fail(w, "undo: writer_seal: %v", serr)
+				node_after(n)
+				return false
+			}
 			convo.writer_commit(wr)
 		}
 		node_after(n)
 	}
-	_, rok := _ur_msg(c, .Assistant, nil)
 	run_until(w, w.now + 1_000_000_000, true)
-	return rok
+	return true
 }
 
 @(private = "file")
