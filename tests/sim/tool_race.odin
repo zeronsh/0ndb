@@ -148,6 +148,17 @@ _race :: proc(w: ^World, rc: Race_Case) {
 	append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = strings.clone(RACE_ROOT, w.allocator)})
 	run_until(w, w.now + 2_000_000_000, true)
 	agent := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	turn: ^fs.Scope
+	run_open: {
+		context = instance_context(&n.inst)
+		sm := _race_mount(n)
+		if sm == nil {
+			world_fail(w, "race: mount missing")
+			return
+		}
+		turn = fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
+		node_after(n)
+	}
 	tool_line := "tool line\n"
 	person_line := "person line\n"
 	if rc == .Person_Before {
@@ -203,6 +214,12 @@ _race :: proc(w: ^World, rc: Race_Case) {
 		node_after(n)
 	}
 	run_until(w, w.now + 3_000_000_000, true)
+	run_close: {
+		context = instance_context(&n.inst)
+		fs.scope_close(n.reg, turn)
+		node_after(n)
+	}
+	run_until(w, w.now + 1_000_000_000, true)
 	_race_line_owner(w, n, tree, "a.txt", tool_line, agent, true, rc)
 	if rc == .Person_Before {
 		_race_line_owner(w, n, tree, "a.txt", person_line, agent, false, rc)

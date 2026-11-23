@@ -1236,6 +1236,7 @@ Pass :: struct {
 	cutoff:     i64,
 	now:        i64,
 	settle:     bool,
+	claimable:  bool,
 	full:       bool,
 	git_wrote:  bool,
 	head_moved: bool,
@@ -1589,6 +1590,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	p.settle = settle && !p.git_wrote
 	p.now = history_wall_ns(m.history)
 	p.cutoff = p.now - m.opts.settle_ms * 1_000_000
+	p.claimable = active_scope(m) != nil
 	p.full = full || m.rescan || p.git_wrote
 	m.hold_line = p.git_wrote
 	defer m.hold_line = false
@@ -1705,6 +1707,18 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	}
 	if len(m.dirty) > len(p.holding) {
 		mount_schedule(m, m.opts.settle_ms)
+	}
+	if len(m.closed) > 0 {
+		done := make([dynamic]string, context.temp_allocator)
+		for k in prim.unordered(m.closed) {
+			if k not_in m.dirty {
+				append(&done, k)
+			}
+		}
+		for k in done {
+			key, _ := delete_key(&m.closed, k)
+			delete(key, m.allocator)
+		}
 	}
 	m.passes += 1
 	serr := mount_settle(m)
@@ -2286,7 +2300,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 				defer_ino(p, e)
 				return .None
 			}
-			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now {
+			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now && (p.claimable || rel not_in m.closed) {
 				append(&p.young, clone_string(rel, p.long) or_else "")
 				defer_ino(p, e)
 				return .None

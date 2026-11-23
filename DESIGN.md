@@ -523,7 +523,15 @@ equal in both directions.
   moved inode, and a move onto a path whose entry belongs to an inode that
   also moves away in the pass first sets that entry and its subtree aside
   for that inode's own move, so a chain or a swap of moves never drops or
-  mixes entries. A rename onto an existing name (the target's inode
+  mixes entries. Where the watcher reports a writer's close (inotify's
+  close-after-write), a dirty file whose last event is that close is
+  settled: it schedules a pass at once and is never deferred as young, so a
+  saved file reaches the tree without waiting out the delay; any later event
+  on the path makes it unsettled again until its next close. This holds
+  only while the mount has no open scope: a run keeps its turn scope open,
+  and a tool scope may still claim a write made since the provider's
+  previous line, so while any scope is open a closed file waits out the
+  delay like any other. A rename onto an existing name (the target's inode
   number becomes the one a removed path had) is a content change of the
   replaced file plus a remove of the source, never a move: the runs of the
   new content that a line diff against the source's current text keeps

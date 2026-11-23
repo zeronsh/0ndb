@@ -58,6 +58,7 @@ _bw_run :: proc(w: ^World) {
 	vfs := disk_vfs(&a.disk)
 	tree: eng.Object
 	m: ^fs.Mount
+	turn: ^fs.Scope
 	{
 		context = instance_context(&a.inst)
 		defer node_after(a)
@@ -88,6 +89,7 @@ _bw_run :: proc(w: ^World) {
 			world_fail(w, "based write: tree_mount: %v", err)
 			return
 		}
+		turn = fs.scope_open(a.reg, m, prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&a.clock), rng_random(&w.rng)))
 		if _bw_write(vfs, BW_ROOT + "/a.txt", "<p68>\n") != .None {
 			world_fail(w, "based write: first person write")
 			return
@@ -138,6 +140,7 @@ _bw_run :: proc(w: ^World) {
 			return
 		}
 		fs.scope_close(a.reg, scope)
+		fs.scope_close(a.reg, turn)
 	}
 	run_until(w, w.now + 5_000_000_000, true)
 	context = instance_context(&a.inst)
