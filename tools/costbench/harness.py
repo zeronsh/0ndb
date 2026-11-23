@@ -9,6 +9,7 @@ BIN_LEASE = os.environ.get("ONDB_BIN_LEASE", os.path.join(REPO, "bin", "0ndb-lea
 PACKLIVE = os.environ.get("COST_PACKLIVE", os.path.join(REPO, "bin", "packlive"))
 OUT = os.environ.get("COST_OUT", os.path.join(tempfile.gettempdir(), "costbench"))
 TRANSCRIPT = os.environ.get("COST_TRANSCRIPT", "")
+SETTLE = float(os.environ.get("COST_SETTLE", "5"))
 LIMIT = ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
 
 
@@ -321,7 +322,7 @@ def s1_transcript():
         dev.cli("record", "--source", "claude", "--id", mid, "--seq", str(i + 1), "--role", role, "--stdin", stdin=text)
         sm.tick(i + 1)
     dt = time.time() - t0
-    settle(5)
+    settle(SETTLE)
     dev.stop()
     raw = "\n".join(t for _, _, t in msgs).encode()
     per = sum(zstd3(t.encode()) for _, _, t in msgs)
@@ -382,7 +383,7 @@ def s2_rewrites(commit):
         time.sleep(0.25)
         sm.tick(i + 1)
     dt = time.time() - t0
-    settle(8)
+    settle(max(8, SETTLE))
     dev.stop()
     final = b"".join(("\n".join(l) + "\n").encode() for l in files.values())
     extra = dict(rewrites=rewrites, seconds=round(dt, 1), info_final=zstd_size(final), info_history=zstd_size(b"".join(versions)))
@@ -453,7 +454,7 @@ def s3_drafts():
         dev.cli("send", "write me a long answer %d" % i, "--wait", timeout=300)
         sm.tick(i + 1)
     dt = time.time() - t0
-    settle(5)
+    settle(SETTLE)
     dev.stop()
     srv.shutdown()
     content = "\n".join(FakeAnthropic.texts).encode()
@@ -497,7 +498,7 @@ def s4_catalog():
     dt = time.time() - t0
     final_rows = c.call("catalog.list", space=sp, limit=100).get("rows", [])
     c.close()
-    settle(5)
+    settle(SETTLE)
     dev.stop()
     final = (json.dumps(sorted(json.dumps(r, sort_keys=True) for r in final_rows)) + "\n".join(records)).encode()
     return measure(relay, zstd_size(final), dict(steps=steps, objects=len(objs), seconds=round(dt, 1)), sm)
@@ -596,7 +597,7 @@ def s6_cold_restore():
     a.cli("new", "transcript")
     for i, (mid, role, text) in enumerate(msgs):
         a.cli("record", "--source", "claude", "--id", mid, "--seq", str(i + 1), "--role", role, "--stdin", stdin=text)
-    settle(5)
+    settle(SETTLE)
     convo = re.search(r'"object":"[0-9a-f]+/([0-9a-f]+)"', a.cli("ls", "--json")).group(1)
     b = Device(d, "b", None)
     card = b.cli("join").strip()
@@ -612,7 +613,7 @@ def s6_cold_restore():
     victim = ids[len(ids) // 10] if ids and os.environ.get("COST_REDACT", "1") != "0" else None
     if victim:
         b.cli("redact", obj, victim)
-    settle(10)
+    settle(max(10, SETTLE))
     b.stop()
     raw = "\n".join(t for _, _, t in msgs).encode()
     return measure(relay, zstd_size(raw), dict(messages=len(msgs), cold_read_seconds=cold, cold_log_bytes=len(log), cold_ids=len(ids), redacted=victim))
