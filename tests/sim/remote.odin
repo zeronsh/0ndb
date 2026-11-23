@@ -143,12 +143,22 @@ check_move :: proc(w: ^World) {
 			continue
 		}
 		for idx in readers_of(w, oi) {
-			d := digest_object(w, w.nodes[idx], oi)
+			n := w.nodes[idx]
+			d: Digest
+			for _ in 0 ..< FRESH_POLLS {
+				delete(d.text, w.allocator)
+				d = digest_object(w, n, oi, true)
+				if d.complete || !n.alive || !n.e_open || len(w.failures) > 0 {
+					break
+				}
+				run_until(w, w.now + FRESH_STEP, false)
+			}
 			if d.complete {
 				refs[oi] = strings.clone(_move_strip(d.text), w.allocator)
 				delete(d.text, w.allocator)
 				break
 			}
+			delete(d.text, w.allocator)
 		}
 	}
 	if len(refs) == 0 {
