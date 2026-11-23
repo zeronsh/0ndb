@@ -111,7 +111,7 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 			world_fail(w, "carry: the mount did not follow feature")
 			return
 		}
-		scope := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
+		scope := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
 		if oerr := fs.mount_observe_begin(sm.m, "a.txt", scope); oerr != .None {
 			world_fail(w, "carry: observe: %v", oerr)
 			return

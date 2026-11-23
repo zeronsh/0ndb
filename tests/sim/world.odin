@@ -213,6 +213,7 @@ World :: struct {
 	cur_op:    int,
 	cur_fault: int,
 	nodes:     [dynamic]^Node,
+	scope_actors: map[prim.Id]bool,
 	relay:     Relay_Node,
 	conn_ids:  u64,
 	conns:     [dynamic]^Conn,
