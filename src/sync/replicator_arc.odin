@@ -259,14 +259,6 @@ _arc_trim_send :: proc(r: ^Replicator, al: ^Local) {
 	}
 }
 
-@(private)
-_arc_trim_acked :: proc(r: ^Replicator, id: Stream_Id) {
-	for _, al in r.locals {
-		if al.arc_child && al.trim_for == id {
-			al.trim_tries = 0
-		}
-	}
-}
 
 @(private)
 _arc_advanced :: proc(r: ^Replicator, l: ^Local) {
@@ -913,10 +905,6 @@ _arc_free_local :: proc(r: ^Replicator, l: ^Local) {
 		prim.timer_cancel(r.loop, l.arc_timer)
 		l.arc_timer = 0
 	}
-	if l.trim_timer != 0 {
-		prim.timer_cancel(r.loop, l.trim_timer)
-		l.trim_timer = 0
-	}
 }
 
 
@@ -935,39 +923,30 @@ _arc_trim_reply :: proc(r: ^Replicator, id: Stream_Id, refused: bool) -> bool {
 	}
 	delete_key(&r.trims, id)
 	if !refused {
-		_arc_trim_acked(r, id)
 		return true
 	}
 	for _, al in r.locals {
 		if al.arc_child && al.trim_for == id {
 			al.trim_sent = 0
-			if al.trim_timer == 0 {
-				al.trim_tries = min(al.trim_tries + 1, 6)
-				al.trim_timer = prim.timer(r.loop, TRIM_RETRY_MS << uint(al.trim_tries - 1), al, _arc_trim_retry)
-			}
+			al.trim_wait = true
 		}
 	}
 	return true
 }
 
 @(private)
-TRIM_RETRY_MS :: 200
-
-@(private)
-_arc_trim_retry :: proc(lp: ^prim.Loop, data: rawptr) {
-	al := cast(^Local)data
-	al.trim_timer = 0
-	r := al.repl
-	if r == nil {
+_arc_trim_resume :: proc(r: ^Replicator, id: Stream_Id) {
+	if _, inflight := r.trims[id]; inflight {
 		return
 	}
-	_enter(r)
-	defer _leave(r)
-	if al.floor >= al.trim_at {
-		_arc_trim_send(r, al)
+	for _, al in r.locals {
+		if al.arc_child && al.trim_wait && al.trim_for == id {
+			al.trim_wait = false
+			if al.floor >= al.trim_at {
+				_arc_trim_send(r, al)
+			}
+		}
 	}
-	_local_maybe_free(r, al)
-	_repl_flush(r)
 }
 
 @(private)
