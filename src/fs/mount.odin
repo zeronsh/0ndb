@@ -1735,7 +1735,8 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	if len(m.intents) == 0 {
 		return .None
 	}
-	last: Maybe(crdt.Op_Id)
+	recovered := false
+	ends := make([dynamic]crdt.Lv, context.temp_allocator)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	lost := make([dynamic]Lost_Range, context.temp_allocator)
 	have := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -1753,12 +1754,15 @@ mount_recover :: proc(m: ^Mount) -> Error {
 		}
 		spans := []crdt.Lv_Span{{lv = lv, len = int(it.n)}}
 		spans_touched(h, spans, &touched) or_return
-		last = crdt.Op_Id{it.actor, it.seq + it.n - 1}
+		recovered = true
+		if end, known := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq + it.n - 1}); known {
+			append(&ends, end)
+		}
 	}
 	if len(lost) > 0 {
 		drop_lost(m, "", lost[:]) or_return
 	}
-	if l, ok := last.?; ok {
+	if recovered {
 		snap := fstree.current(&h.tree)
 		for ino in sorted_inodes(touched) {
 			info, found, ierr := fstree.info(&snap, ino, context.temp_allocator)
@@ -1781,11 +1785,9 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			}
 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
-		one := [1]crdt.Lv{}
-		if lv, known := crdt.graph_lv(&h.g, l); known {
-			one[0] = lv
+		if len(ends) > 0 {
 			both := make([dynamic]crdt.Lv, context.temp_allocator)
-			crdt.version_union(&h.g, have[:], one[:], &both)
+			crdt.version_union(&h.g, have[:], ends[:], &both)
 			v := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
 			clear(&m.synced)
 			append(&m.synced, ..v)
