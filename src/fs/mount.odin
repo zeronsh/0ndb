@@ -610,7 +610,9 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 			delete(m.line, allocator)
 			m.line, _ = clone_string(m.branch, allocator)
 		}
-		mount_line_actor(m) or_return
+		if lerr := mount_line_actor(m); lerr != .None && lerr != .Reloading {
+			return lerr
+		}
 	}
 	attrib_log_open(m) or_return
 	image_take(m, &m.img)
@@ -650,6 +652,9 @@ mount_open_finish :: proc(m: ^Mount) -> (err: Error) {
 	}
 	if h := m.history; h != nil {
 		history_register_actor(h, fshist.ingestion_actor(h.self, m.id), m.id) or_return
+		if m.has_git {
+			mount_line_actor(m) or_return
+		}
 	}
 	mount_wake(m) or_return
 	mount_shadow_reconcile(m) or_return
@@ -2644,9 +2649,10 @@ mount_line_actor :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	pseudo := mount_line_pseudo(m.id, m.line)
-	m.actor = fshist.ingestion_actor(self, pseudo)
+	actor := fshist.ingestion_actor(self, pseudo)
 	if m.history != nil {
-		history_register_actor(m.history, m.actor, pseudo) or_return
+		history_register_actor(m.history, actor, pseudo) or_return
 	}
+	m.actor = actor
 	return .None
 }

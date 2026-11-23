@@ -1546,6 +1546,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	if m.history != nil {
 		defer history_trim(m.history)
 	}
+	if m.has_git && m.history != nil {
+		mount_line_actor(m) or_return
+	}
 	catch_up(m) or_return
 	if m.has_git {
 		p.head, _ = git_head(m.vfs, m.git, p.long)
