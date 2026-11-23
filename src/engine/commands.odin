@@ -1,6 +1,7 @@
 package engine
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem/virtual"
 import "../convo"
 import "../pack"
@@ -505,7 +506,11 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 	case Cmd_Send:
 		h = _convo_writable(e, c.object) or_return
 		if st.stage == 0 && (c.root || !obj.rid_none(c.parent)) && (c.role == convo.Role(0) || c.role == .User) {
-			pos := _cu_position(e, c.object) or_return
+			pos, perr := _cu_position(e, c.object)
+			if perr != .None {
+				fmt.eprintfln("DBGMOVE position: %v", perr)
+				return res, h, perr
+			}
 			if c.root || pos != c.parent {
 				if _, merr := _cu_edit(e, c.object, c.parent, c.root); merr != .None && merr != .Pending {
 					return res, h, merr

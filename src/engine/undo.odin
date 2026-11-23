@@ -3,6 +3,7 @@ package engine
 import "base:runtime"
 import "core:slice"
 import "core:strings"
+import "core:fmt"
 import "../convo"
 import "../fs"
 import "../obj"
@@ -193,7 +194,11 @@ convo_move :: proc(e: ^Engine, o: Object, cause: convo.Move_Cause, to: Rid, of: 
 
 @(private)
 _cu_edit :: proc(e: ^Engine, o: Object, parent: Rid, root: bool) -> (move: prim.Id, err: Error) {
+	defer if err != .None && err != .Pending {
+		fmt.eprintfln("DBGMOVE edit: %v", err)
+	}
 	from := _cu_position(e, o) or_return
+	fmt.eprintfln("DBGMOVE edit from %v parent %v", from, parent)
 	if obj.rid_none(from) {
 		return {}, .None
 	}
@@ -346,7 +351,10 @@ convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 		if st.phase == .Released {
 			return .None
 		}
-		_cu_undo_step(e, o, &st) or_return
+		if serr := _cu_undo_step(e, o, &st); serr != .None {
+			fmt.eprintfln("DBGMOVE step %v cause %v: %v", st.phase, st.cause, serr)
+			return serr
+		}
 	}
 	return .None
 }
