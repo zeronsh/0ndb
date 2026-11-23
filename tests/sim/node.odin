@@ -218,6 +218,10 @@ node_crashed :: proc(n: ^Node) {
 	w := n.w
 	context = w.ctx
 	mode := Crash_Mode.Power if rng_chance(&w.fault_rng, 2, 3) else Crash_Mode.Process
+	if n.disk.force_process {
+		n.disk.force_process = false
+		mode = .Process
+	}
 	n.disk.dead = false
 	if mode == .Power {
 		n.boot += 1
