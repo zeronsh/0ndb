@@ -126,9 +126,10 @@ _arc_maybe_run :: proc(r: ^Replicator, l: ^Local) {
 	if !l.archive || l.hollow || l.fatal || l.superseded || !_arc_on(r) || r.phase != .Ready || l.arc_timer != 0 {
 		return
 	}
-	if l.floor - l.arc_sealed < r.cfg.archive_min {
+	if l.floor - l.arc_sealed < r.cfg.archive_min && (l.arc_checked || l.arc_sealed <= 0) {
 		return
 	}
+	l.arc_checked = true
 	l.arc_timer = prim.timer(r.loop, 0, l, _arc_tick)
 }
 
@@ -871,8 +872,14 @@ _arc_back_read :: proc(r: ^Replicator, a: ^Arc_Read, arm: ^Remote, pos: i64) {
 		a.back_win = min(_tail_window(r), end)
 	}
 	a.back_pos = end
-	gap := journal.Range{end - a.back_win, end}
-	if _covered_inflight(arm, gap) {
+	floor := i64(0)
+	for h in journal.replica_have(&arm.rep) {
+		if h.to <= end {
+			floor = max(floor, h.to)
+		}
+	}
+	gap := journal.Range{max(end - a.back_win, floor), end}
+	if gap.to <= gap.from || _covered_inflight(arm, gap) {
 		return
 	}
 	if client_read(&r.client, arm.id, gap.from, gap.to) == .None {
