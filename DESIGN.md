@@ -739,7 +739,18 @@ equal in both directions.
   pass owes every path it left pending, and a pass that keeps `synced` owes
   the removals, moves and directories it already applied. `absent` is
   persisted with the image's `synced` it qualifies, so no crash persists one
-  without the other. Ingest never reads an owed path that is missing on disk
+  without the other. While the shadow is owed (its writes wait on a failed
+  barrier), the saved state keeps the last `synced` it saved, so the image
+  never names a `synced` whose pinned entries the shadow has not persisted;
+  the first save after the owed shadow persists writes the current `synced`.
+  A merge-mode materialization (catch-up of the mount's own batch) never
+  writes over a file whose disk differs from the text at its base: it first
+  commits the disk's difference from that base as the mount's snapshot actor
+  (`ingestion_actor(h.self, mount_snapshot_pseudo(mount, line))`, registered
+  for the device, parents the base and that actor's last op), points the
+  file's entry at the snapshot version, and materializes the target with the
+  snapshot, so the person's bytes are a durable op concurrent with the
+  target and the written text is the CRDT's merge. Ingest never reads an owed path that is missing on disk
   as a delete, and the next pass that completes drains `absent`. A removal
   whose unlink fails fails its item, so its entry is never dropped while the
   file is still on disk. A pass whose line version is ahead of `synced`
