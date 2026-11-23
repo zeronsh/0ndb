@@ -3,6 +3,7 @@ package sim
 import "core:fmt"
 import "core:slice"
 
+import "../../src/arc"
 import eng "../../src/engine"
 import "../../src/journal"
 import "../../src/prim"
@@ -362,7 +363,8 @@ _archive_hooks :: proc "contextless" () {
 	register_final_check(86, check_forget_device_held)
 	register_final_check(87, check_forget_third_reader)
 	register_final_check(88, check_forget_offline_writer)
-	register_final_check(90, check_restore_offline_writer)
+	register_final_check(91, check_restore_offline_writer)
+	register_final_check(94, check_archive_trimmed)
 	register_final_check(95, check_archive_cipher)
 	register_final_check(97, check_archive_waits)
 	register_final_check(98, check_fetch_bound)
@@ -1073,6 +1075,93 @@ check_fetch_bound :: proc(w: ^World) {
 		}
 	}
 	stat_max(w, STAT_FETCH_RATIO, u64(worst))
+}
+
+check_archive_trimmed :: proc(w: ^World) {
+	if w.aborted || len(w.failures) > 0 || w.cfg.archive_min < 0 {
+		return
+	}
+	m := &w.model
+	for _, oi in m.objs {
+		ob := &m.objs[oi]
+		if !obj_exists(m, oi) {
+			continue
+		}
+		for n in w.nodes {
+			if !n.alive || !n.e_open {
+				continue
+			}
+			context = instance_context(&n.inst)
+			h := _archive_handle(n, ob)
+			node_after(n)
+			if h == nil {
+				continue
+			}
+			for sg in h.segs {
+				if sg.device != n.identity.id {
+					continue
+				}
+				aname, nerr := arc.stream_name(h.name, context.temp_allocator)
+				if nerr != .None {
+					continue
+				}
+				aid := osync.stream_id(&h.scope, sg.device, aname, 0)
+				sealed, ok := _relay_last_seal(w, ob.o.space, aid)
+				if !ok || sealed <= 0 {
+					continue
+				}
+				sid := osync.stream_id(&h.scope, sg.device, h.name, 0)
+				length, base, _, exists := relay_stream_state(w, ob.o.space, sid)
+				if exists && base < sealed && sealed < length {
+					world_fail(w, "archive: %s's %v %s segment is sealed to %d on the relay but its relay base is still %d once the world is quiet (length %d)", n.name, ob.kind, id_short(ob.o.id), sealed, base, length)
+				}
+			}
+		}
+	}
+}
+
+@(private = "file")
+_relay_last_seal :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id) -> (base: i64, ok: bool) {
+	rn := &w.relay
+	if !rn.alive {
+		return
+	}
+	context = instance_context(&rn.inst)
+	defer relay_after(rn)
+	st := rn.r.store
+	sp, sok := rn.r.spaces[space]
+	if !sok || sp.ns == nil {
+		return
+	}
+	sh, length, err := st.stream_open(st.data, sp.ns, id, false)
+	if err != .None {
+		return
+	}
+	defer st.stream_close(st.data, sh)
+	from := max(st.stream_base(st.data, sh), length - 64 * 1024)
+	buf := make([]u8, int(length - from), context.temp_allocator)
+	if got, rerr := st.stream_read(st.data, sh, from, buf); rerr != .None || got != len(buf) {
+		return
+	}
+	end := len(buf)
+	for end >= journal.OVERHEAD {
+		nb := int(prim.get_u32le(buf[end - 4:]))
+		start := end - nb - journal.OVERHEAD
+		if nb < 0 || start < 0 || int(prim.get_u32le(buf[start:])) != nb {
+			return
+		}
+		body := buf[start + journal.HEADER:][:nb]
+		if nb > 0 && body[0] == arc.SEAL_KIND {
+			s: arc.Seal
+			s.entries = make([dynamic]arc.Seal_Entry, context.temp_allocator)
+			if arc.seal_parse(body, &s) == .None {
+				return s.base, true
+			}
+			return
+		}
+		end = start
+	}
+	return
 }
 
 check_restore_exercised :: proc(w: ^World) {
