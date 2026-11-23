@@ -305,13 +305,18 @@ _tier_thaw_fetched :: proc(ctx: rawptr, rg: ^Tier_Range, err: Error) {
 	_tier_range_end(rg)
 	if e != .None {
 		th.tries += 1
-		if c := th.ts.cold; c != nil && th.tries < TIER_TRIES {
-			_tier_cold_fetch(sp, c, th.low, th.high - th.low, _tier_thaw_fetched, th)
+		if c := th.ts.cold; c != nil {
+			if th.tries < TIER_TRIES {
+				_tier_cold_fetch(sp, c, th.low, th.high - th.low, _tier_thaw_fetched, th)
+			} else {
+				_tier_thaw_park(t, th)
+			}
 			return
 		}
 		_tier_thaw_end(th, e if e != .Pending else .Io)
 		return
 	}
+	t.park_ms = 0
 	t.inner.restore(t.inner.data, th.ts.h, th.low, bytes, _tier_thaw_restored, th)
 }
 
@@ -372,5 +377,53 @@ _tier_cold_drop :: proc(sp: ^Tier_Space, id: Stream_Id) {
 	if c, ok := sp.cold[id]; ok {
 		clear(&c.recs)
 		c.upto = 0
+	}
+}
+
+TIER_PARK_MS :: 1000
+TIER_PARK_MAX_MS :: 60_000
+
+@(private)
+_tier_thaw_park :: proc(t: ^Tier_Store, th: ^Tier_Thaw) {
+	th.tries = 0
+	append(&t.parked, th)
+	t.parks += 1
+	if t.park_timer == 0 {
+		if t.park_ms <= 0 {
+			t.park_ms = TIER_PARK_MS
+		}
+		t.park_timer = prim.timer(t.loop, t.park_ms, t, _tier_park_fire)
+	}
+}
+
+@(private)
+_tier_park_fire :: proc(l: ^prim.Loop, data: rawptr) {
+	t := cast(^Tier_Store)data
+	t.park_timer = 0
+	t.park_ms = min(max(t.park_ms, TIER_PARK_MS) * 2, TIER_PARK_MAX_MS)
+	_tier_unpark(t)
+}
+
+@(private)
+_tier_unpark :: proc(t: ^Tier_Store) {
+	if len(t.parked) == 0 {
+		return
+	}
+	ths := make([]^Tier_Thaw, len(t.parked), context.temp_allocator)
+	copy(ths, t.parked[:])
+	clear(&t.parked)
+	if t.park_timer != 0 {
+		prim.timer_cancel(t.loop, t.park_timer)
+		t.park_timer = 0
+	}
+	for th in ths {
+		sp := th.ts.sp
+		_tier_hold(sp)
+		if c := th.ts.cold; c != nil {
+			_tier_cold_fetch(sp, c, th.low, th.high - th.low, _tier_thaw_fetched, th)
+		} else {
+			_tier_thaw_end(th, .Io)
+		}
+		_tier_unhold(sp)
 	}
 }

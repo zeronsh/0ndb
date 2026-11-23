@@ -159,6 +159,9 @@ _tier_fetch_done :: proc(req: ^Object_Read, err: Error, bytes: []u8) {
 	if t.ready_cb != nil {
 		t.ready_cb(t.ready_ctx)
 	}
+	if err == .None {
+		_tier_unpark(t)
+	}
 }
 
 @(private)

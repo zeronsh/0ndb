@@ -519,7 +519,7 @@ relay_start :: proc(rn: ^Relay_Node) -> bool {
 	if err == .None && rn.packed && w.cfg.seed % 4 == 0 {
 		prim.mkdir_all(vfs, RELAY_DIR + "/objects", 0o700)
 		rn.objs = osync.Dir_Object_Store{vfs = vfs, root = RELAY_DIR + "/objects"}
-		rn.slow = Sim_Objects{inner = osync.dir_object_store(&rn.objs), loop = &rn.inst.loop, slow_ms = 200, fail = 5}
+		rn.slow = Sim_Objects{inner = osync.dir_object_store(&rn.objs), loop = &rn.inst.loop, slow_ms = 200, fail = env_u64("SIM_OBJ_FAIL", 5)}
 		rng_init(&rn.slow.rng, w.cfg.seed, 991 + u64(w.stats.relay_crash))
 		tc := osync.Tier_Config{objects = sim_objects(&rn.slow), window_ms = 500, max_ms = 5000, hot = 4096}
 		if terr := osync.tier_store_init(&rn.ts, &rn.inst.loop, store, tc, node_clock(&rn.clock)); terr != .None {
@@ -590,6 +590,7 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	stat_add(rn.w, STAT_TIER_EVICTIONS, rn.ts.evictions)
 	stat_add(rn.w, STAT_TIER_COLD_READS, rn.ts.cold_reads)
 	stat_add(rn.w, STAT_TIER_THAWS, rn.ts.thaws)
+	stat_add(rn.w, STAT_TIER_PARKS, rn.ts.parks)
 	stat_add(rn.w, STAT_TIER_SLOW_READS, rn.slow.reads)
 	stat_add(rn.w, STAT_TIER_FAILED_READS, rn.slow.failed)
 	rn.ts = {}
@@ -706,6 +707,7 @@ check_derived :: proc(n: ^Node, at: string) {
 STAT_TIER_EVICTIONS: Stat
 STAT_TIER_COLD_READS: Stat
 STAT_TIER_THAWS: Stat
+STAT_TIER_PARKS: Stat
 STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
 STAT_PERSIST_FAULTS: Stat
@@ -733,6 +735,7 @@ _node_stats :: proc "contextless" () {
 		res.stats.extra[int(STAT_TIER_EVICTIONS)] += w.relay.ts.evictions
 		res.stats.extra[int(STAT_TIER_COLD_READS)] += w.relay.ts.cold_reads
 		res.stats.extra[int(STAT_TIER_THAWS)] += w.relay.ts.thaws
+		res.stats.extra[int(STAT_TIER_PARKS)] += w.relay.ts.parks
 		res.stats.extra[int(STAT_TIER_SLOW_READS)] += w.relay.slow.reads
 		res.stats.extra[int(STAT_TIER_FAILED_READS)] += w.relay.slow.failed
 	})
@@ -744,6 +747,7 @@ _node_stats :: proc "contextless" () {
 	STAT_TIER_THAWS = register_stat(40, 2, "relay_thaws")
 	STAT_TIER_SLOW_READS = register_stat(40, 3, "object_reads")
 	STAT_TIER_FAILED_READS = register_stat(40, 4, "object_read_faults")
+	STAT_TIER_PARKS = register_stat(40, 5, "relay_thaws_parked")
 	register_stat_line(45)
 	STAT_OWN_TAMPER = register_stat(45, 0, "own_tamper_caught")
 	STAT_LENGTH_LIES = register_stat(45, 1, "length_lies")
