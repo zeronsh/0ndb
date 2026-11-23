@@ -299,6 +299,133 @@ _sa_tools :: proc(w: ^World) {
 }
 
 @(private = "file")
+_sa_put :: proc(c: ^Sa_Ctx, name: string, data: string) {
+	n := c.n
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	abs := strings.concatenate({SA_ROOT, "/", name}, context.temp_allocator)
+	fd, err := prim.open_file(c.vfs, abs, {.Write, .Create, .Truncate}, 0o644)
+	if err != .None {
+		return
+	}
+	prim.write_at(c.vfs, fd, transmute([]u8)data, 0)
+	prim.datasync(c.vfs, fd)
+	prim.close_file(c.vfs, fd)
+	prim.sync_dir(c.vfs, SA_ROOT)
+}
+
+@(private = "file")
+_sa_check_last :: proc(c: ^Sa_Ctx, w: ^World, actor: prim.Id, want: prim.Id, label: string) {
+	last, have := _sa_last(c, actor)
+	if !have {
+		world_fail(w, "%s: nothing committed under the agent actor", label)
+		return
+	}
+	if sc, found := _sa_scope_of(c, last); !found || sc != want {
+		world_fail(w, "%s: the agent's write is attributed to scope %v (found %v), not %v", label, sc, found, want)
+	}
+}
+
+@(private = "file")
+_sa_based :: proc(w: ^World) {
+	c, ok := _sa_setup(w, false)
+	if !ok {
+		return
+	}
+	_sa_put(&c, "a.txt", "one\n")
+	run_until(w, w.now + 2_000_000_000, true)
+	a := _sa_actor(&c, _sa_mount(&c))
+	n := c.n
+	scope: ^fs.Scope
+	sid: prim.Id
+	{
+		context = instance_context(&n.inst)
+		sid = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+		scope = fs.scope_open(n.reg, _sa_mount(&c), sid, a)
+		fs.scope_read_base(scope, "a.txt", transmute([]u8)string("one\n"))
+		node_after(n)
+	}
+	{
+		context = instance_context(&n.inst)
+		if err := eng.tree_write(&n.e, c.tree, "a.txt", transmute([]u8)string("zero\none\n"), tree_base(&n.e, c.tree)); err != .None {
+			world_fail(w, "based write: tree_write: %v", err)
+		}
+		node_after(n)
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	{
+		context = instance_context(&n.inst)
+		abs := strings.concatenate({SA_ROOT, "/a.txt"}, context.temp_allocator)
+		n.writers[strings.clone(abs, w.allocator)] = Writer_Info{scope = scope, agent = true}
+		fs.mount_observe_begin(_sa_mount(&c), "a.txt", scope)
+		node_after(n)
+	}
+	_sa_put(&c, "a.txt", "one\nagent\n")
+	run_until(w, w.now + 2_000_000_000, true)
+	_sa_close(&c, scope, "a.txt")
+	run_until(w, w.now + 2_000_000_000, true)
+	k := 0
+	{
+		context = instance_context(&n.inst)
+		m := _sa_mount(&c)
+		fs.mount_sync(m)
+		k = int(crdt.graph_known(&m.history.g, a))
+		node_after(n)
+	}
+	if k == 0 {
+		world_fail(w, "based write: nothing committed under the agent actor")
+		return
+	}
+	for seq in 0 ..< k {
+		if sc, found := _sa_scope_of(&c, crdt.Op_Id{a, u64(seq)}); !found || sc != sid {
+			world_fail(w, "based write: op %d of the agent actor is attributed to scope %v (found %v), not %v", seq, sc, found, sid)
+			return
+		}
+	}
+}
+
+@(private = "file")
+_sa_replay :: proc(w: ^World) -> (credited: bool) {
+	c, ok := _sa_setup(w, false)
+	if !ok {
+		return false
+	}
+	if !_sa_switch(&c, "l/run1", true) {
+		world_fail(w, "replayed write: switch to the run line")
+		return false
+	}
+	run_until(w, w.now + 1_000_000_000, true)
+	a := _sa_actor(&c, _sa_mount(&c))
+	s := _sa_open(&c, a, "r.txt")
+	sid := s.id
+	_sa_write(&c, "r.txt", "agent line")
+	n := c.n
+	run_until(w, w.now + 1_000_000_000, true)
+	crashes := w.stats.crashes
+	n.disk.crash_at = n.disk.stats.ops + 1
+	_sa_close(&c, s, "r.txt")
+	run_until(w, w.now + 20_000_000_000, true)
+	n.disk.crash_at = 0
+	run_until(w, w.now + 20_000_000_000, true)
+	if w.stats.crashes == crashes {
+		world_fail(w, "replayed write: the node did not crash")
+		return false
+	}
+	if !n.alive || _sa_mount(&c) == nil {
+		world_fail(w, "replayed write: the node or its mount did not come back")
+		return false
+	}
+	last, have := _sa_last(&c, a)
+	if !have {
+		return false
+	}
+	if sc, found := _sa_scope_of(&c, last); !found || sc != sid {
+		world_fail(w, "replayed write: the agent's replayed write is attributed to scope %v (found %v), not %v", sc, found, sid)
+	}
+	return true
+}
+
+@(private = "file")
 _sa_world :: proc(seed: u64) -> ^World {
 	cfg := default_config(seed)
 	cfg.nodes = 1
@@ -325,18 +452,27 @@ scope_actors :: proc(t: ^testing.T) {
 	defer test_end(t)
 	shared := env_u64("SA_SHARED", 0) != 0
 	bad := 0
+	replayed := 0
 	count := env_u64("SA_SEEDS", 20)
 	for seed in u64(1) ..= count {
-		for which in 0 ..< 2 {
+		for which in 0 ..< 4 {
 			w := _sa_world(seed)
-			if which == 0 {
+			switch which {
+			case 0:
 				_sa_held(w, shared)
-			} else {
+			case 1:
 				_sa_tools(w)
+			case 2:
+				_sa_based(w)
+			case 3:
+				if _sa_replay(w) {
+					replayed += 1
+				}
 			}
 			for f in w.failures {
 				if bad < 20 {
-					fmt.eprintf("scope_actors seed %d %s: %s\n", seed, "held" if which == 0 else "tools", f)
+					names := [4]string{"held", "tools", "based", "replay"}
+					fmt.eprintf("scope_actors seed %d %s: %s\n", seed, names[which], f)
 				}
 			}
 			if len(w.failures) > 0 {
@@ -346,6 +482,7 @@ scope_actors :: proc(t: ^testing.T) {
 			free(w)
 		}
 	}
-	fmt.eprintf("scope_actors: %d seeds, %d failed\n", count, bad)
+	fmt.eprintf("scope_actors: %d seeds, %d replays credited to the agent, %d failed\n", count, replayed, bad)
 	testing.expect(t, bad == 0, fmt.tprintf("scope_actors: %d failures", bad))
+	testing.expect(t, replayed > 0, "scope_actors: no crash replay credited the agent, so the replay case proved nothing")
 }

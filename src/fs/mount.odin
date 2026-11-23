@@ -1187,8 +1187,8 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 	if c, ok := m.attrib[rel]; ok && c.actor == scope.actor && !c.used {
 		return false, .None
 	}
-	attrib_set(m, rel, scope.actor)
-	if aerr := attrib_log_append(m, rel, scope.actor); aerr != .None {
+	attrib_set(m, rel, scope.actor, false, {}, scope.id)
+	if aerr := attrib_log_append(m, rel, scope.actor, {}, scope.id); aerr != .None {
 		return false, aerr
 	}
 	return m.log_fd >= 0, .None
@@ -1328,13 +1328,17 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		if prim.reader_remaining(&rd) >= len(o) {
 			prim.read_fixed(&rd, o[:])
 		}
+		sc: prim.Id
+		if prim.reader_remaining(&rd) >= len(sc) {
+			sc = prim.read_id(&rd)
+		}
 		if !prim.reader_ok(&rd) {
 			break
 		}
 		if i64(pos) >= m.log_at {
-			attrib_set(m, path, actor, false, o)
+			attrib_set(m, path, actor, false, o, sc)
 			if o != {} {
-				attrib_chain_add(m, path, Attrib_Step{actor, o})
+				attrib_chain_add(m, path, Attrib_Step{actor, o, sc})
 			}
 		}
 		pos += 8 + n
@@ -1344,7 +1348,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}) -> Error {
+attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}) -> Error {
 	if m.log_fd < 0 {
 		return save_mount_state(m)
 	}
@@ -1352,9 +1356,12 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	w := prim.writer(&body)
 	prim.write_str(&w, rel)
 	prim.write_id(&w, actor)
-	if oid != {} {
+	if oid != {} || scope != {} {
 		o := oid
 		prim.write_raw(&w, o[:])
+	}
+	if scope != {} {
+		prim.write_id(&w, scope)
 	}
 	rec := make([]u8, 8 + len(body), context.temp_allocator)
 	prim.put_u32le(rec[0:4], u32(len(body)))
@@ -1368,6 +1375,7 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 Attrib_Step :: struct {
 	actor: prim.Id,
 	oid:   odb.Oid,
+	scope: prim.Id,
 }
 
 @(private)
@@ -1451,8 +1459,8 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if has_prev && prev.kind == .File && prev.oid != {} && prev.oid != oid && a.oid != prev.oid && attrib_base_stored(m, prev) {
 		attrib_log_append(m, rel, m.actor, prev.oid)
 	}
-	attrib_set(m, rel, a.actor, false, oid)
-	if attrib_log_append(m, rel, a.actor, oid) == .None {
+	attrib_set(m, rel, a.actor, false, oid, a.scope)
+	if attrib_log_append(m, rel, a.actor, oid, a.scope) == .None {
 		attrib_log_durable(m, nil, nil)
 	}
 }
@@ -1743,8 +1751,8 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 			sm := s.mount
 			for k, v in sm.dirty {
 				if v == s {
-					attrib_set(sm, k, s.actor)
-					attrib_log_append(sm, k, s.actor)
+					attrib_set(sm, k, s.actor, false, {}, s.id)
+					attrib_log_append(sm, k, s.actor, {}, s.id)
 				}
 			}
 			if sm.log_fd >= 0 && sm.log_len > 0 {
@@ -1937,6 +1945,19 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		if prim.reader_remaining(&rd) > 0 {
 			m.switch_phase = prim.read_u8(&rd)
 		}
+		if prim.reader_remaining(&rd) > 0 {
+			ns := prim.read_uvarint(&rd)
+			if ns > u64(prim.reader_remaining(&rd)) {
+				return false, .Corrupt
+			}
+			for _ in 0 ..< ns {
+				k := prim.read_str(&rd)
+				sc := prim.read_id(&rd)
+				if a, ok := &m.attrib[k]; ok && prim.reader_ok(&rd) {
+					a.scope = sc
+				}
+			}
+		}
 	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
@@ -2100,16 +2121,17 @@ Attrib :: struct {
 	actor: prim.Id,
 	used:  bool,
 	oid:   odb.Oid,
+	scope: prim.Id,
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}) {
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}) {
 	if p, ok := &m.attrib[path]; ok {
-		p^ = Attrib{actor, used, oid}
+		p^ = Attrib{actor, used, oid, scope}
 		return
 	}
 	k, _ := clone_string(path, m.allocator)
-	m.attrib[k] = Attrib{actor, used, oid}
+	m.attrib[k] = Attrib{actor, used, oid, scope}
 }
 
 @(private)
@@ -2264,6 +2286,17 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_str(&w, m.switch_to)
 	prim.write_str(&w, m.switch_from)
 	prim.write_u8(&w, m.switch_phase)
+	scoped := make([dynamic]string, context.temp_allocator)
+	for k in sorted_strings(attrib) {
+		if attrib[k].scope != {} {
+			append(&scoped, k)
+		}
+	}
+	prim.write_uvarint(&w, u64(len(scoped)))
+	for k in scoped {
+		prim.write_str(&w, k)
+		prim.write_id(&w, attrib[k].scope)
+	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None

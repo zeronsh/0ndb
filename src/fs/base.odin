@@ -540,6 +540,11 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
+		if c.scope == nil && c.scope_id == {} {
+			if a, ok := m.attrib[c.path]; ok && a.actor == actor {
+				c.scope_id = a.scope
+			}
+		}
 		if c.disk != .File || c.moved != "" || (c.kind != .Modify && c.kind != .Create) || (c.kind == .Modify && c.old.kind != .File) {
 			_change_pin_drop(m, &c, observed)
 			_base_note(m, c.path, .Mismatch)
@@ -656,6 +661,11 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	old := history_text_at(h, inode, v, context.temp_allocator) or_return
 	b: Builder
 	builder_init(&b, h, actor)
+	if c.scope != nil && c.scope.actor == actor {
+		b.scope = scope_marker(actor, c.scope.id)
+	} else if c.scope_id != {} {
+		b.scope = scope_marker(actor, c.scope_id)
+	}
 	shadow_txn_begin(&m.shadow)
 	err = copy_begin(m, c, data)
 	if err == .None {
@@ -675,6 +685,10 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 			buf := make([dynamic]u8, context.temp_allocator)
 			fshist.encode_observe(&buf, fshist.Observe_Op{kind = .Read, inode = inode_op(h, inode), path = c.path, version = v, hash = _content_hash(data)})
 			builder_opaque(&b, buf[:])
+		}
+		if b.scope != nil {
+			builder_opaque(&b, b.scope)
+			b.scope = nil
 		}
 		predicted = op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)})
 		one := [1]fstree.Op_Id{predicted}
@@ -696,7 +710,11 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 		return false, err
 	}
 	shadow_txn_end(&m.shadow)
-	attrib_set(m, c.path, actor, true)
+	based_scope := c.scope_id
+	if c.scope != nil && c.scope.actor == actor {
+		based_scope = c.scope.id
+	}
+	attrib_set(m, c.path, actor, true, {}, based_scope)
 	if has {
 		append(&p.rebased, head)
 	}
