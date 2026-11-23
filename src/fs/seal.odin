@@ -1,34 +1,10 @@
 package fs
 
-import "core:mem/virtual"
 import "../crdt"
 import "../fshist"
 import "../fstree"
-import "../journal"
 
 REC_SEAL :: fshist.REC_SEAL
-
-history_seal :: proc(h: ^History, v: Version) -> Error {
-	arena: virtual.Arena
-	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
-		return .No_Memory
-	}
-	defer virtual.arena_destroy(&arena)
-	context.temp_allocator = virtual.arena_allocator(&arena)
-	history_wake(h) or_return
-	clear(&h.io)
-	append(&h.io, REC_SEAL)
-	encode_version(&h.io, v)
-	if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
-		return .Io
-	}
-	if journal.journal_commit(&h.journal) != .None {
-		return .Io
-	}
-	apply_seal(h, 0, v) or_return
-	history_own_applied(h)
-	return history_persist(h)
-}
 
 history_effective_seal :: proc(h: ^History, allocator := context.allocator) -> (v: Version, found: bool, err: Error) {
 	data, ok := kv_get(&h.kv, transmute([]u8)string("seal"), context.temp_allocator) or_return
