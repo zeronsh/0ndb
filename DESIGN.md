@@ -960,9 +960,10 @@ equal in both directions.
   holds when it is made: the source during ingest, the target from the moment
   its materialization starts. The mount's line flips in the step that enters
   the target phase, after ingest has passed every reported path onto the
-  source, compared every shadowed path's stat with the disk (so a write whose
-  watch event is still in flight is ingested onto the source too), and that
-  history is durable. Lines are
+  source and that history is durable, then run one full pass (stat and listing
+  against the shadow, so an edit, create or delete whose watch event is still
+  in flight lands on the source too); if that pass ingested anything the step
+  waits for durability again instead of flipping. Lines are
   named by their git key (`git:refs/heads/<name>`; the mount's own branch maps
   to its line). Runtime-managed mounts are refused until run lines retire. **A
   0ndb switch keeps each line's uncommitted state with that line (an automatic
