@@ -7,27 +7,32 @@ import "../crdt"
 import "../prim"
 
 when ODIN_OS == .Windows {
-	SLICE_COST_STAT :: 40
-	SLICE_COST_OPEN :: 2500
-	SLICE_COST_MIB :: 1500
-	SLICE_COST_DIR :: 300
-	SLICE_COST_ENTRY :: 3
-	SLICE_COST_COMMIT :: 800
-} else when ODIN_OS == .Darwin {
-	SLICE_COST_STAT :: 8
-	SLICE_COST_OPEN :: 60
-	SLICE_COST_MIB :: 800
-	SLICE_COST_DIR :: 40
-	SLICE_COST_ENTRY :: 2
-	SLICE_COST_COMMIT :: 600
-} else {
-	SLICE_COST_STAT :: 4
+	SLICE_COST_STAT :: 15
 	SLICE_COST_OPEN :: 25
-	SLICE_COST_MIB :: 500
-	SLICE_COST_DIR :: 20
+	SLICE_COST_MIB :: 65000
+	SLICE_COST_DIR :: 50
 	SLICE_COST_ENTRY :: 1
-	SLICE_COST_COMMIT :: 300
+	SLICE_COST_CHANGE :: 50
+	SLICE_COST_COMMIT :: 15000
+} else when ODIN_OS == .Darwin {
+	SLICE_COST_STAT :: 2
+	SLICE_COST_OPEN :: 10
+	SLICE_COST_MIB :: 65000
+	SLICE_COST_DIR :: 10
+	SLICE_COST_ENTRY :: 1
+	SLICE_COST_CHANGE :: 30
+	SLICE_COST_COMMIT :: 500
+} else {
+	SLICE_COST_STAT :: 1
+	SLICE_COST_OPEN :: 10
+	SLICE_COST_MIB :: 90000
+	SLICE_COST_DIR :: 10
+	SLICE_COST_ENTRY :: 1
+	SLICE_COST_CHANGE :: 20
+	SLICE_COST_COMMIT :: 150
 }
+
+SLICE_COST_EST :: SLICE_COST_CHANGE + SLICE_COST_OPEN + SLICE_COST_STAT + SLICE_COST_MIB / 256
 
 SLICE_BUDGET :: 5000
 SLICE_COMMIT :: 64
@@ -418,7 +423,7 @@ _frame_list :: proc(p: ^Pass, f: ^Walk_Frame) -> Error {
 		f.names[clone_string(de.name, heap) or_else ""] = Listed{kind = de.kind, has_stat = de.has_stat, size = de.size, mtime_ns = de.mtime_ns, ctime_ns = de.ctime_ns, ino = de.ino}
 	}
 	prim.dir_close(m.vfs, &d)
-	slice_charge(m, SLICE_COST_DIR + i64(n) * SLICE_COST_ENTRY)
+	slice_charge(m, SLICE_COST_DIR + i64(n) * SLICE_COST_ENTRY / 8)
 	return .None
 }
 
@@ -525,13 +530,13 @@ _flush_step :: proc(pr: ^Pass_Run) -> (done: bool, err: Error) {
 		step := cap
 		if p.budget > 0 {
 			left := max(p.budget - p.m.slice_spent, 0)
-			step = clamp(int(left / (SLICE_COST_OPEN + SLICE_COST_STAT)), 1, cap)
+			step = clamp(int(left / SLICE_COST_EST), 1, cap)
 		}
 		u := pr.units[pr.ui]
 		hi := min(pr.uo + step, len(u.idx))
 		marker := u.marker if pr.uo == 0 else nil
 		commit_bounded(p, u.actor, u.idx[pr.uo:hi], marker) or_return
-		slice_charge(p.m, SLICE_COST_COMMIT)
+		slice_charge(p.m, SLICE_COST_COMMIT + i64(hi - pr.uo) * SLICE_COST_CHANGE)
 		pr.uo = hi
 		if pr.uo >= len(u.idx) {
 			pr.ui += 1
