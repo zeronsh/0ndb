@@ -145,7 +145,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 	rop := new_op(m, .Disk_Agent, n, sm.oi)
 	rop.path = strings.clone(name, w.allocator)
 	rop.actor = ractor
-	wrote := _append_tokens(w, n, rop, base, 2)
+	wrote := _append_tokens(w, n, rop, base, 1)
 	err, serr := _scoped_write(w, n, sm, name, abs, reader, wrote)
 	if n.disk.dead {
 		node_crashed(n)
