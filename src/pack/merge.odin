@@ -388,6 +388,9 @@ _merge_installed :: proc(p: ^Pack, m: ^Merge) -> Error {
 
 @(private)
 _merge_step :: proc(p: ^Pack, budget: i64) -> (more: bool, err: Error) {
+	if p.fl_retry {
+		return false, p.fl_err
+	}
 	if p.fl.on && (p.fl.kind == .Merge || _async(p)) {
 		return true, .None
 	}

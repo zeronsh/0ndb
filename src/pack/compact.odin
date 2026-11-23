@@ -104,6 +104,9 @@ _relocate :: proc(p: ^Pack, inum: u64, ino: ^Inode, src: Phys, src_bytes: []u8) 
 
 @(private)
 _compact_work :: proc(p: ^Pack, budget: i64, all: bool) -> (more: bool, err: Error) {
+	if p.fl_retry {
+		return false, p.fl_err
+	}
 	c := &p.compact
 	if !c.on {
 		id: u32
@@ -254,6 +257,10 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 	poll(p) or_return
 	if p.fl.on {
 		return !_async(p) || _polled(p), .None
+	}
+	if p.fl_retry {
+		_retry(p) or_return
+		return p.fl.on && (!_async(p) || _polled(p)), .None
 	}
 	if !p.space_wait && (_mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 || _compact_blocked(p)) {
 		if _async(p) {

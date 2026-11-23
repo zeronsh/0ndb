@@ -601,36 +601,13 @@ _durable_begin :: proc(e: ^Engine) {
 	_batches_late(e)
 	if err != .None {
 		if err == .Would_Block {
-			e.batch_seq -= 1
 			for i := len(e.batches) - 1; i >= 0; i -= 1 {
 				if e.batches[i] == b {
 					ordered_remove(&e.batches, i)
 					break
 				}
 			}
-			for d in e.dirty {
-				append(&b.segs, d)
-			}
-			delete(e.dirty)
-			e.dirty = b.segs
-			for x in e.draft_dirty {
-				append(&b.drafts, x)
-			}
-			delete(e.draft_dirty)
-			e.draft_dirty = b.drafts
-			for x in e.restores {
-				append(&b.restores, x)
-			}
-			delete(e.restores)
-			e.restores = b.restores
-			e.reg.meta ||= b.meta
-			for c in e.card_pubs {
-				append(&b.cards, c)
-			}
-			delete(e.card_pubs)
-			e.card_pubs = b.cards
-			delete(b.marks)
-			free(b, e.allocator)
+			_batch_requeue(e, b)
 			return
 		}
 		_batch_complete(e, b, _perr(err))
@@ -645,10 +622,43 @@ _durable_begin :: proc(e: ^Engine) {
 _pack_step :: proc(e: ^Engine) {
 	more, err := pack.step(&e.pk)
 	if err != .None {
-		_fatal(e, _perr(err))
+		if !_store_err(e, _perr(err)) {
+			_fatal(e, _perr(err))
+		}
+		e.pack_more = false
 		return
 	}
 	e.pack_more = more
+}
+
+@(private)
+_batch_requeue :: proc(e: ^Engine, b: ^Durable_Batch) {
+	if b.seq == e.batch_seq {
+		e.batch_seq -= 1
+	}
+	for d in e.dirty {
+		append(&b.segs, d)
+	}
+	delete(e.dirty)
+	e.dirty = b.segs
+	for x in e.draft_dirty {
+		append(&b.drafts, x)
+	}
+	delete(e.draft_dirty)
+	e.draft_dirty = b.drafts
+	for x in e.restores {
+		append(&b.restores, x)
+	}
+	delete(e.restores)
+	e.restores = b.restores
+	e.reg.meta ||= b.meta
+	for c in e.card_pubs {
+		append(&b.cards, c)
+	}
+	delete(e.card_pubs)
+	e.card_pubs = b.cards
+	delete(b.marks)
+	free(b, e.allocator)
 }
 
 @(private)
@@ -701,6 +711,10 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		return
 	}
 	ordered_remove(&e.batches, idx)
+	if err != .None && _store_err(e, err) && e.fatal == .None {
+		_batch_requeue(e, b)
+		return
+	}
 	if err != .None {
 		_fatal(e, err)
 	} else {

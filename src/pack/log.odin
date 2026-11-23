@@ -633,7 +633,8 @@ _drain :: proc(p: ^Pack) -> Error {
 		return .None
 	}
 	err := _worker_wait(p)
-	return _job_complete(p, err)
+	_job_complete(p, err) or_return
+	return stalled(p)
 }
 
 @(private)
@@ -643,7 +644,7 @@ _commit :: proc(p: ^Pack) -> Error {
 		_retry(p) or_return
 		_drain(p) or_return
 		if p.fl_retry {
-			return .None
+			return p.fl_err
 		}
 	}
 	wrote := _commit_write(p) or_return
