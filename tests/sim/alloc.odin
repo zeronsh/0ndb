@@ -7,6 +7,7 @@ import "core:mem"
 
 REGION_BASE :: uintptr(0x2000_0000_0000)
 REGION_ALIGN :: uintptr(64 << 20)
+RELAY_SLOT :: 15
 
 region_main_size := uint(256 << 20)
 region_temp_size := uint(96 << 20)

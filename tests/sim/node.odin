@@ -33,7 +33,7 @@ node_start :: proc(n: ^Node) -> bool {
 	rng_init(&n.ids, w.cfg.seed, 9000 + u64(n.idx) * 64 + u64(n.incarnation))
 	rng_init(&n.pack_rng, w.cfg.seed, 13000 + u64(n.idx) * 64 + u64(n.incarnation))
 	if iok, iwhy := instance_begin(&n.inst, n.idx); !iok {
-		world_fail(w, "%s could not map its deterministic memory region (%d MiB at slot %d): %s", n.name, region_stride() >> 20, n.idx, iwhy)
+		world_fail(w, "%s could not start in its memory region (%d MiB at slot %d): %s", n.name, region_stride() >> 20, n.idx, iwhy)
 		return false
 	}
 	context = instance_context(&n.inst)
@@ -452,8 +452,8 @@ _on_event :: proc(data: rawptr, e: ^eng.Engine, ev: ^eng.Event) {
 relay_start :: proc(rn: ^Relay_Node) -> bool {
 	w := rn.w
 	rng_init(&rn.rng, w.cfg.seed, 777 + u64(w.stats.relay_crash))
-	if iok, iwhy := instance_begin(&rn.inst, 15); !iok {
-		world_fail(w, "relay could not map its deterministic memory region (%d MiB at slot 15): %s", region_stride() >> 20, iwhy)
+	if iok, iwhy := instance_begin(&rn.inst, RELAY_SLOT); !iok {
+		world_fail(w, "relay could not start in its memory region (%d MiB at slot %d): %s", region_stride() >> 20, RELAY_SLOT, iwhy)
 		return false
 	}
 	context = instance_context(&rn.inst)

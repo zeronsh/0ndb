@@ -57,10 +57,11 @@ Node_Clock :: struct {
 }
 
 Instance :: struct {
-	main:    Region,
-	temp:    Region,
-	loop:    prim.Loop,
-	loop_on: bool,
+	main:     Region,
+	temp:     Region,
+	loop:     prim.Loop,
+	loop_on:  bool,
+	reserved: bool,
 }
 
 Node :: struct {
@@ -321,7 +322,7 @@ pop_event :: proc(w: ^World) -> Sim_Event {
 	return top
 }
 
-instance_begin :: proc(inst: ^Instance, slot: int) -> (ok: bool, why: string) {
+instance_reserve :: proc(inst: ^Instance, slot: int) -> (ok: bool, why: string) {
 	base := REGION_BASE + uintptr(slot) * region_stride()
 	if mok, mwhy := region_map(&inst.main, base, region_main_size, false); !mok {
 		return false, fmt.tprintf("main region at %p: %s", rawptr(base), mwhy)
@@ -331,6 +332,44 @@ instance_begin :: proc(inst: ^Instance, slot: int) -> (ok: bool, why: string) {
 		region_unmap(&inst.main)
 		return false, fmt.tprintf("temp region at %p: %s", rawptr(tbase), twhy)
 	}
+	inst.reserved = true
+	return true, ""
+}
+
+instance_release :: proc(inst: ^Instance) {
+	if inst.loop_on || inst.main.sites != nil {
+		instance_kill(inst)
+	}
+	region_unmap(&inst.main)
+	region_unmap(&inst.temp)
+	inst^ = {}
+}
+
+world_reserve :: proc(w: ^World) -> bool {
+	for n in w.nodes {
+		if n.inst.reserved {
+			continue
+		}
+		if ok, why := instance_reserve(&n.inst, n.idx); !ok {
+			world_fail(w, "%s could not reserve its deterministic memory region (%d MiB at slot %d): %s", n.name, region_stride() >> 20, n.idx, why)
+			return false
+		}
+	}
+	if !w.relay.inst.reserved {
+		if ok, why := instance_reserve(&w.relay.inst, RELAY_SLOT); !ok {
+			world_fail(w, "relay could not reserve its deterministic memory region (%d MiB at slot %d): %s", region_stride() >> 20, RELAY_SLOT, why)
+			return false
+		}
+	}
+	return true
+}
+
+instance_begin :: proc(inst: ^Instance, slot: int) -> (ok: bool, why: string) {
+	if !inst.reserved {
+		return false, fmt.tprintf("slot %d has no reserved region", slot)
+	}
+	region_reset(&inst.main)
+	region_reset(&inst.temp)
 	if leak_sites {
 		inst.main.sites = new(map[uintptr]runtime.Source_Code_Location, runtime.heap_allocator())
 		inst.main.sites^ = make(map[uintptr]runtime.Source_Code_Location, runtime.heap_allocator())
@@ -359,10 +398,13 @@ instance_kill :: proc(inst: ^Instance) {
 	if inst.main.sites != nil {
 		delete(inst.main.sites^)
 		free(inst.main.sites, runtime.heap_allocator())
+		inst.main.sites = nil
 	}
-	region_unmap(&inst.main)
-	region_unmap(&inst.temp)
+	region_reset(&inst.main)
+	region_reset(&inst.temp)
+	main, temp, reserved := inst.main, inst.temp, inst.reserved
 	inst^ = {}
+	inst.main, inst.temp, inst.reserved = main, temp, reserved
 }
 
 leak_sites := false
@@ -419,6 +461,9 @@ world_init :: proc(w: ^World, cfg: Config) {
 		n.writers = make(map[string]Writer_Info, w.allocator)
 		append(&w.nodes, n)
 	}
+	if !world_reserve(w) {
+		w.aborted = true
+	}
 	run_world_init(w)
 }
 
@@ -428,6 +473,7 @@ world_destroy :: proc(w: ^World) {
 		if n.alive {
 			node_kill(n)
 		}
+		instance_release(&n.inst)
 		node_mounts_drop(w, n)
 		delete(n.mounts)
 		delete(n.writers)
@@ -449,6 +495,7 @@ world_destroy :: proc(w: ^World) {
 	if w.relay.alive {
 		relay_kill(&w.relay)
 	}
+	instance_release(&w.relay.inst)
 	disk_destroy(&w.relay.disk)
 	for c in w.conns {
 		for b in c.held {
