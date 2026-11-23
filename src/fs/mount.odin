@@ -51,6 +51,7 @@ Fence :: struct {
 	token:    u64,
 	cb:       Fence_Proc,
 	data:     rawptr,
+	covered:  bool,
 }
 
 @(private)
@@ -85,6 +86,10 @@ Registry :: struct {
 	eol_data:  rawptr,
 	on_base:   Base_Proc,
 	base_data: rawptr,
+	slice_budget: i64,
+	slice_commit: int,
+	slice_hook: Slice_Hook,
+	slice_data: rawptr,
 }
 
 @(private)
@@ -291,6 +296,9 @@ Mount :: struct {
 	rescan:      bool,
 	git_moved:   bool,
 	fence_seq:   u64,
+	pass:        ^Pass_Run,
+	slice_spent: i64,
+	redeep:      map[string]bool,
 	git_locked:  bool,
 	lock_first:  bool,
 	lock_stale:  bool,
@@ -606,6 +614,7 @@ drop_lost :: proc(m: ^Mount, dir: string, lost: []Lost_Range) -> Error {
 }
 
 mount_close :: proc(m: ^Mount) {
+	mount_pass_finish(m)
 	mount_release_writes(m)
 	mount_unlock(m)
 	delete(m.lock_watches)
@@ -690,6 +699,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(k, m.allocator)
 	}
 	delete(m.dirty)
+	for k in m.redeep {
+		delete(k, m.allocator)
+	}
+	delete(m.redeep)
 	for k in m.open_scopes {
 		delete(k, m.allocator)
 	}
@@ -750,7 +763,7 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	if !m.awake {
 		return .None
 	}
-	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 {
+	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 || m.pass != nil {
 		return .Busy
 	}
 	err := shadow_flush(m)
@@ -1101,33 +1114,71 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 
 mount_run :: proc(m: ^Mount) -> Error {
 	m.lock_first = false
-	fence := false
-	for f in m.fences {
-		if fence_ready(f) {
-			fence = true
+	if m.reg == nil || m.reg.loop == nil {
+		for &f in m.fences {
+			f.covered = fence_ready(f)
+		}
+		err := mount_pass(m, false, !_fences_covered(m))
+		if err == .None {
+			err = mount_materialize(m)
+		}
+		_fences_fire(m, err)
+		mount_touch(m)
+		return err
+	}
+	if m.pass == nil {
+		for &f in m.fences {
+			f.covered = fence_ready(f)
 		}
 	}
-	err := mount_pass(m, false, !fence)
+	done, err := mount_pass_slice(m, !_fences_covered(m))
+	if !done {
+		if m.reg.slice_hook != nil {
+			m.reg.slice_hook(m, m.reg.slice_data)
+		}
+		mount_schedule(m, 0)
+		mount_touch(m)
+		return err
+	}
 	if err == .None {
 		err = mount_materialize(m)
 	}
-	if fence {
-		i := 0
-		for i < len(m.fences) {
-			f := m.fences[i]
-			if fence_ready(f) {
-				if f.cb != nil {
-					f.cb(m, f.data, err)
-				}
-				delete(f.name, m.allocator)
-				ordered_remove(&m.fences, i)
-				continue
-			}
-			i += 1
+	_fences_fire(m, err)
+	for f in m.fences {
+		if fence_ready(f) {
+			mount_schedule(m, 0)
+			break
 		}
 	}
 	mount_touch(m)
 	return err
+}
+
+@(private)
+_fences_covered :: proc(m: ^Mount) -> bool {
+	for f in m.fences {
+		if f.covered {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_fences_fire :: proc(m: ^Mount, err: Error) {
+	i := 0
+	for i < len(m.fences) {
+		f := m.fences[i]
+		if f.covered {
+			if f.cb != nil {
+				f.cb(m, f.data, err)
+			}
+			delete(f.name, m.allocator)
+			ordered_remove(&m.fences, i)
+			continue
+		}
+		i += 1
+	}
 }
 
 mount_fence :: proc(m: ^Mount, cb: Fence_Proc, data: rawptr) -> Error {

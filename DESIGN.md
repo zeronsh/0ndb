@@ -418,7 +418,39 @@ equal in both directions.
   it, is a display-time diff against the line's previous version that is
   never stored, so it cannot fabricate history. Background passes
   defer files younger than a settle delay; scope ends, fences and shutdown
-  ingest everything. Changes no scope claims belong to the mount's ingestion
+  ingest everything.
+
+  A background pass (the mount timer, the engine's settle, an asynchronous
+  fence) runs in slices: no loop turn spends more than a bounded budget on
+  tree I/O. The budget is about 5 ms of work counted in deterministic
+  units from a per-OS cost table (stat, open, MiB read and diffed,
+  directory, change, commit), never wall time, so the sim's trajectories
+  stay reproducible. Between slices the pass lives on the mount (`m.pass`):
+  its arenas, the dirty-key cursor or an explicit directory stack for full
+  walks, held renames, the git-op marker and HEAD. The prologue (HEAD,
+  reflog and index snapshot) and the epilogue (`set_line`, young and holding
+  paths re-dirtied, rebase, HEAD and reflog bookkeeping, `mount_settle`)
+  each run once, so a git-op batch keeps one marker. A flush commits in
+  sub-ranges sized to the remaining budget and can stop between them.
+  Watcher events between slices land in `m.dirty` for the next pass and
+  are never absorbed by the current one. A directory re-marked since the
+  pass began is skipped and walked deep by the next pass, so a directory
+  renamed or removed between slices is neither walked twice nor reported
+  as deleted. Fences ready when a pass starts fire when it completes. Every
+  synchronous caller first drives an in-progress pass to completion with no
+  budget: `scope_close`, materialization (which therefore never runs while
+  `m.pass` is set), fork, revert, redaction and close. The pass's memory is
+  bounded by its seen set, about 70 bytes per visited path, plus one
+  directory listing per level of the walk.
+
+  Measured with a 3000-file `git checkout` while an agent writes, slices
+  take a median 5.6 ms (max 9.7 ms) on Linux. macOS (11 ms median) and
+  Windows (one commit is about 15 ms) are bound by commit syncs on the loop
+  until commits are asynchronous. `scope_close` still waits synchronously.
+  The Windows peak working set fell from 270 MB to 42 MB, because the
+  ingest is no longer one 3000-change batch.
+
+  Changes no scope claims belong to the mount's ingestion
   actor, `blake2b-128("0ndb ingestion actor" || device || mount id)`, never
   to the device's own API writes, so disk changes concurrent with them stay
   representable. Opening a mount appends one `REC_ACTOR` record (tag 9:
