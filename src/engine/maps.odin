@@ -718,6 +718,7 @@ _catalog_write :: proc(e: ^Engine, id: prim.Id, u: ^Catalog_Update) -> Error {
 		prim.write_id(&w, u.parent.object)
 		prim.write_id(&w, u.parent.rid.seg)
 		prim.write_uvarint(&w, u64(max(u.parent.rid.off, 0)))
+		prim.write_uvarint(&w, u.parent.rid.gen)
 		append(&fields, omap.Field{tag = u32(omap.Catalog_Tag.Parent), value = b[:]})
 	}
 	if .Workspace in u.set {
