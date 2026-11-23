@@ -886,8 +886,16 @@ equal in both directions.
   new line rather than writing the old one back. Ingestion on a line other
   than the mount's own uses an actor derived from the mount and the line,
   registered like the mount's ingestion actor, because an actor's ops stay on
-  one chain. The engine reports each switch as `Line_Switched` (object = the
-  tree, detail = from and to keys) and git's `index.lock` coming and going
+  one chain. A scoped write whose scope actor's chain is not on the mount's
+  line (a scope held across a switch) is never credited to the mount: it
+  commits as that scope's line actor, `ingestion_actor(device,
+  blake2b-128("0ndb scope line" || scope actor || line))`, registered with
+  kind 3 (actor, pseudo, base scope actor, device). Blame presents a line
+  actor as its base actor, and a line actor whose base is owned joins the
+  base's owner, so the write undoes with its turn. An unscoped write that is
+  off the line still falls back to the mount's actor. The engine reports each
+  switch as `Line_Switched` (object = the tree, detail = from and to keys) and
+  git's `index.lock` coming and going
   through a registry hook. Mounts the runtime manages on conversation lines
   keep their line until runs are bound to lines; only their key moves. Every
   run is bound to the (mount, line) it started on (Conversations, planned).

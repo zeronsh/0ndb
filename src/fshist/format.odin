@@ -719,6 +719,7 @@ text_targets :: proc(b: ^crdt.Batch, allocator := context.temp_allocator) -> []c
 
 ACTOR_INGEST :: u8(1)
 ACTOR_OWNED :: u8(2)
+ACTOR_LINE :: u8(3)
 
 ingestion_actor :: proc(device, mount: prim.Id) -> (id: prim.Id) {
 	ctx: blake2b.Context
@@ -748,6 +749,30 @@ encode_owned_actor_record :: proc(buf: ^[dynamic]u8, actor, pseudo, owner, devic
 	prim.write_id(&w, pseudo)
 	prim.write_id(&w, owner)
 	prim.write_id(&w, device)
+}
+
+encode_line_actor_record :: proc(buf: ^[dynamic]u8, actor, pseudo, base, device: prim.Id) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, REC_ACTOR)
+	prim.write_u8(&w, ACTOR_LINE)
+	prim.write_id(&w, actor)
+	prim.write_id(&w, pseudo)
+	prim.write_id(&w, base)
+	prim.write_id(&w, device)
+}
+
+decode_line_actor_record :: proc(body: []u8, device: prim.Id) -> (actor: prim.Id, base: prim.Id, ok: bool) {
+	if len(body) < 2 || body[0] != REC_ACTOR || body[1] != ACTOR_LINE {
+		return
+	}
+	r := prim.reader(body[2:])
+	a := prim.read_id(&r)
+	pseudo := prim.read_id(&r)
+	base = prim.read_id(&r)
+	if prim.read_id(&r) != device || base == {} || !prim.reader_ok(&r) || prim.reader_remaining(&r) != 0 || a != ingestion_actor(device, pseudo) {
+		return {}, {}, false
+	}
+	return a, base, true
 }
 
 decode_actor_record :: proc(body: []u8, device: prim.Id) -> (actor: prim.Id, owner: prim.Id, ok: bool) {

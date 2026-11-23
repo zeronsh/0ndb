@@ -326,3 +326,20 @@ actor_bound :: proc(h: ^History, v: []crdt.Lv, actor: prim.Id) -> u64 {
 	}
 	return lo
 }
+
+scope_line_actor :: proc(m: ^Mount, actor: prim.Id) -> prim.Id {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb scope line"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	a := actor
+	blake2b.update(&ctx, a[:])
+	blake2b.update(&ctx, transmute([]u8)m.line)
+	pseudo: prim.Id
+	blake2b.final(&ctx, pseudo[:])
+	la := fshist.ingestion_actor(m.history.self, pseudo)
+	if _, known := history_actor_owner(m.history, la); !known {
+		history_register_line_actor(m.history, la, pseudo, actor)
+	}
+	return la
+}

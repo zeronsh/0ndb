@@ -939,14 +939,10 @@ _conflicts :: proc(e: ^Engine, o: Object, kind: Kind, allocator: runtime.Allocat
 			}
 		}
 		for &x in out[i].ours {
-			if o, owned := fs.history_actor_owner(h.hist, x.id.actor); owned {
-				x.id.actor = o
-			}
+			x.id.actor = fs.history_present_actor(h.hist, x.id.actor)
 		}
 		for &x in out[i].theirs {
-			if o, owned := fs.history_actor_owner(h.hist, x.id.actor); owned {
-				x.id.actor = o
-			}
+			x.id.actor = fs.history_present_actor(h.hist, x.id.actor)
 		}
 	}
 	return out, .None
