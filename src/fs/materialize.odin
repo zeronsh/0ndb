@@ -939,9 +939,6 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if it.has_old && !disk_matches(m, it.old, it.entry) {
 		removal := m.merge_base != nil && !it.present && it.entry.kind != .Dir
 		if !removal {
-			if m.merge_base != nil && it.present && it.kind == .File && it.old == it.path && .Opaque not_in it.flags && it.entry.kind == .File {
-				merge_dirty(m, it, tl) or_return
-			}
 			mat_raced(m)
 			mount_mark(m, it.old)
 			return .None
@@ -1323,62 +1320,6 @@ tmp_ino :: proc(m: ^Mount, fd: prim.Fd) -> u64 {
 	return st.ino
 }
 
-@(private)
-merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
-	h := m.history
-	abuf: prim.Path_Buf
-	abs := abs_path(m, it.path, abuf[:])
-	raw, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
-	if rerr != .None {
-		return .None
-	}
-	ours, cok := eol_clean(m, it.path, raw, it.inode, true)
-	if !cok || textdiff.is_binary(ours) {
-		return .None
-	}
-	base, berr := history_text_at(h, it.inode, m.merge_base, context.temp_allocator)
-	if berr != .None {
-		return .None
-	}
-	ids := crdt.graph_version_ids(&h.g, tl, context.temp_allocator)
-	theirs := history_text_at(h, it.inode, ids, context.temp_allocator) or_return
-	if string(base) == string(theirs) {
-		return .None
-	}
-	merged := merge_union(base, ours, theirs) or_return
-	if string(merged) == string(ours) {
-		return .None
-	}
-	before, serr := prim.lstat(m.vfs, abs)
-	if serr != .None {
-		return .None
-	}
-	mode: u32 = 0o755 if .Exec in it.flags else 0o644
-	tmp := temp_name(m, abs, context.temp_allocator)
-	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
-	if oerr != .None {
-		return from_prim(oerr)
-	}
-	werr := prim.write_at(m.vfs, fd, eol_smudge(m, it.path, merged, context.temp_allocator, it.inode, true), 0)
-	prim.fchmod(m.vfs, fd, mode)
-	prim.close_file(m.vfs, fd)
-	if werr != .None {
-		prim.remove(m.vfs, tmp)
-		return from_prim(werr)
-	}
-	if serr := mat_sync_one(m, tmp); serr != .None {
-		prim.remove(m.vfs, tmp)
-		return serr
-	}
-	now, nerr := prim.lstat(m.vfs, abs)
-	if nerr != .None || disk_stat(now) != disk_stat(before) {
-		prim.remove(m.vfs, tmp)
-		return .None
-	}
-	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
-	mat_ancestors(m, abs)
-	return .None
-}
 
 @(private)
 MERGE_OURS :: "0ndb-merge-ours-8f3a1c"
@@ -1387,84 +1328,6 @@ MERGE_BASE :: "0ndb-merge-base-8f3a1c"
 @(private)
 MERGE_THEIRS :: "0ndb-merge-theirs-8f3a1c"
 
-@(private)
-merge_union :: proc(base, ours, theirs: []u8) -> (out: []u8, err: Error) {
-	opts := textdiff.Merge_Options {
-		style        = .Diff3,
-		ours_label   = MERGE_OURS,
-		base_label   = MERGE_BASE,
-		theirs_label = MERGE_THEIRS,
-	}
-	res, merr := textdiff.merge3(base, ours, theirs, opts, context.temp_allocator)
-	if merr != nil {
-		return nil, .No_Memory
-	}
-	if res.conflicts == 0 {
-		return res.data, .None
-	}
-	buf := make([dynamic]u8, 0, len(res.data), context.temp_allocator)
-	o_lines := make([dynamic]string, context.temp_allocator)
-	b_lines := make([dynamic]string, context.temp_allocator)
-	t_lines := make([dynamic]string, context.temp_allocator)
-	Section :: enum {
-		Outside,
-		Ours,
-		Base,
-		Theirs,
-	}
-	sec := Section.Outside
-	rest := string(res.data)
-	for line in strings.split_lines_after_iterator(&rest) {
-		t := strings.trim_right(line, "\r\n")
-		switch sec {
-		case .Outside:
-			if t == "<<<<<<< " + MERGE_OURS {
-				sec = .Ours
-				clear(&o_lines)
-				clear(&b_lines)
-				clear(&t_lines)
-				continue
-			}
-			append(&buf, ..transmute([]u8)line)
-		case .Ours:
-			if t == "||||||| " + MERGE_BASE {
-				sec = .Base
-				continue
-			}
-			append(&o_lines, line)
-		case .Base:
-			if t == "=======" {
-				sec = .Theirs
-				continue
-			}
-			append(&b_lines, line)
-		case .Theirs:
-			if t == ">>>>>>> " + MERGE_THEIRS {
-				sec = .Outside
-				for l in t_lines {
-					append(&buf, ..transmute([]u8)l)
-				}
-				used := make([]bool, len(b_lines), context.temp_allocator)
-				for l in o_lines {
-					in_base := false
-					for bl, k in b_lines {
-						if !used[k] && bl == l {
-							used[k] = true
-							in_base = true
-							break
-						}
-					}
-					if !in_base {
-						append(&buf, ..transmute([]u8)l)
-					}
-				}
-				continue
-			}
-			append(&t_lines, line)
-		}
-	}
-	return buf[:], .None
-}
 
 @(private)
 Fd_Sink :: struct {
