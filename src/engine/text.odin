@@ -525,7 +525,7 @@ _on_offered :: proc(data: rawptr, hist: ^fs.History, dest: fstree.Inode_Id, sour
 _hist_options :: proc(h: ^Handle) -> fs.History_Options {
 	e := h.e
 	o := fs.History_Options{clock = _fs_clock(e), random = e.cfg.random, fault = e.cfg.history_fault}
-	o.unreached = fs.Unreached_Report{data = h, report = _hist_unreached}
+	o.redacted = fs.Redacted_Hook{data = h, call = _hist_redacted}
 	if h.sp.repl_on {
 		o.keep_at_least, _ = osync.replicator_floor(&h.sp.repl, &h.scope, h.name, 0)
 	}
@@ -796,8 +796,9 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 }
 
 @(private)
-_hist_unreached :: proc(data: rawptr, list: []odb.Unreached) {
+_hist_redacted :: proc(data: rawptr, list: []odb.Unreached) {
 	h := (^Handle)(data)
+	_ckpt_purge(h.e, h)
 	_redact_report(h.e, h.sp.id, h.id, list)
 }
 
@@ -836,7 +837,6 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 	for r in res.ranges {
 		_own_redacted(e, h, r.from, r.to)
 	}
-	_redact_report(e, h.sp.id, h.id, res.unreached)
 	_handle_mark(h)
 	_index_purge_object(e, h)
 	_index_item_add(e, h.sp.id, h.id, h.kind)

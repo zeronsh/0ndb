@@ -80,6 +80,7 @@ node_start :: proc(n: ^Node) -> bool {
 	}}
 	cfg.watcher = sim_watcher(n)
 	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail}
+	cfg.checkpoint_hook = eng.Checkpoint_Hook{data = n, at = _on_checkpoint}
 	cfg.embedder = sim_embedder()
 	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
 		return {}
@@ -739,6 +740,16 @@ STAT_TIER_SLOW_READS: Stat
 STAT_TIER_FAILED_READS: Stat
 STAT_PERSIST_FAULTS: Stat
 STAT_GHOST_TAILS: Stat
+
+_on_checkpoint :: proc(data: rawptr, e: ^eng.Engine, object: eng.Object, stage: eng.Checkpoint_Stage, scope: ^osync.Scope, oid: [32]u8) {
+	n := (^Node)(data)
+	if stage == .Published {
+		append(&n.w.checkpoints, Sim_Checkpoint{object = object, scope = scope^, oid = oid})
+	}
+	if n.ckpt_window != nil {
+		n.ckpt_window(n, e, object, stage)
+	}
+}
 
 _persist_fail :: proc(data: rawptr) -> bool {
 	n := (^Node)(data)

@@ -99,6 +99,70 @@ _ckpt_put :: proc(e: ^Engine, id: prim.Id, length: i64, oid: [32]u8) {
 }
 
 @(private)
+_ckpt_hook :: proc(e: ^Engine, h: ^Handle, stage: Checkpoint_Stage, oid: [32]u8) {
+	if hk := e.cfg.checkpoint_hook; hk.at != nil {
+		context = _outer(e)
+		hk.at(hk.data, e, Object{space = h.sp.id, id = h.id}, stage, &h.scope, oid)
+	}
+}
+
+checkpoint_tree :: proc(scope: ^osync.Scope, id: prim.Id, t: ^osync.Key_Tree) -> Error {
+	return _ckpt_tree(scope, id, t)
+}
+
+@(private)
+_ckpt_del :: proc(e: ^Engine, id: prim.Id) {
+	k := id
+	t, terr := omap.txn_begin(&e.reg.db)
+	if terr != .None {
+		_reg_fail(e, _oerr(terr))
+		return
+	}
+	if _, derr := omap.txn_delete(t, ROOT_CKPT, k[:]); derr != .None {
+		omap.txn_abort(t)
+		_reg_fail(e, .Io)
+		return
+	}
+	_reg_commit(e, t)
+	e.reg.meta = true
+}
+
+@(private)
+_ckpt_purge :: proc(e: ^Engine, h: ^Handle) {
+	dir, derr := _obj_dir(e, h.id)
+	if derr != .None {
+		return
+	}
+	if p, jerr := _join(context.temp_allocator, dir, "bundle.tmp"); jerr == .None {
+		prim.remove(e.vfs, p)
+	}
+	if !_ckpt_waiting(h) {
+		if p, jerr := _join(context.temp_allocator, dir, "bundle.in"); jerr == .None {
+			prim.remove(e.vfs, p)
+		}
+	}
+	_, oid, found := _ckpt_get(e, h.id)
+	if !found {
+		return
+	}
+	if oid != {} {
+		ph := _oid_name(oid)
+		if p, jerr := _join(context.temp_allocator, dir, string(ph[:])); jerr == .None {
+			prim.remove(e.vfs, p)
+		}
+		if h.sp.repl_on {
+			tree: osync.Key_Tree
+			if _ckpt_tree(&h.scope, h.id, &tree) == .None {
+				o := oid
+				osync.replicator_shred_object(&h.sp.repl, &h.scope, &tree, o[:])
+				osync.keytree_destroy(&tree)
+			}
+		}
+	}
+	_ckpt_del(e, h.id)
+}
+
+@(private)
 _checkpoints_write :: proc(e: ^Engine) {
 	for h in e.lru {
 		if (h.kind != .Text && h.kind != .File_Tree) || !h.w_open || h.hist == nil || !h.hist.awake || !h.sp.repl_on || !h.sp.connected {
@@ -126,6 +190,7 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 	if oerr != .None {
 		return _perr(oerr)
 	}
+	gen := fs.history_redactions(h.hist)
 	tr := _tree_reach(e, h)
 	sink := Ckpt_Sink{e = e, fd = fd, db = h.hist.db}
 	if tr.ok {
@@ -149,9 +214,19 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 		prim.remove(e.vfs, tmp)
 		return _ferr(werr)
 	}
+	_ckpt_hook(e, h, .Bundled, oid)
+	if fs.history_redactions(h.hist) != gen {
+		prim.remove(e.vfs, tmp)
+		return .None
+	}
 	hx := _oid_name(oid)
 	final := _join(context.temp_allocator, dir, string(hx[:])) or_return
 	_perr(prim.rename(e.vfs, tmp, final)) or_return
+	_ckpt_hook(e, h, .Installed, oid)
+	if fs.history_redactions(h.hist) != gen {
+		prim.remove(e.vfs, final)
+		return .None
+	}
 	tree: osync.Key_Tree
 	_ckpt_tree(&h.scope, h.id, &tree) or_return
 	defer osync.keytree_destroy(&tree)
@@ -162,6 +237,7 @@ _checkpoint_write :: proc(e: ^Engine, h: ^Handle, length: i64, prev: [32]u8, had
 		prim.remove(e.vfs, final)
 		return _serr(perr)
 	}
+	_ckpt_hook(e, h, .Published, oid)
 	if had_prev && prev != oid && prev != {} {
 		p := prev
 		osync.replicator_shred_object(&h.sp.repl, &h.scope, &tree, p[:])

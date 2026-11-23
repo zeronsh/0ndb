@@ -73,12 +73,12 @@ History_Options :: struct {
 	random:        prim.Random,
 	hold:          Hold,
 	fault:         Persist_Fault,
-	unreached:     Unreached_Report,
+	redacted:      Redacted_Hook,
 }
 
-Unreached_Report :: struct {
-	data:   rawptr,
-	report: proc(data: rawptr, list: []odb.Unreached),
+Redacted_Hook :: struct {
+	data: rawptr,
+	call: proc(data: rawptr, unreached: []odb.Unreached),
 }
 
 Persist_Fault :: struct {
@@ -95,6 +95,7 @@ hold_drop :: proc(x: Hold) {
 
 History :: struct {
 	opts:       History_Options,
+	redactions: u64,
 	vfs:        prim.Vfs,
 	allocator:  runtime.Allocator,
 	id:         prim.Id,

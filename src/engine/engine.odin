@@ -219,7 +219,19 @@ Config :: struct {
 	always_on:       bool,
 	holder_budget:   i64,
 	history_fault:   fs.Persist_Fault,
+	checkpoint_hook: Checkpoint_Hook,
 	user:            rawptr,
+}
+
+Checkpoint_Stage :: enum u8 {
+	Bundled,
+	Installed,
+	Published,
+}
+
+Checkpoint_Hook :: struct {
+	data: rawptr,
+	at:   proc(data: rawptr, e: ^Engine, object: Object, stage: Checkpoint_Stage, scope: ^osync.Scope, oid: [32]u8),
 }
 
 DEFAULT_HANDLE_CACHE :: 64
