@@ -43,6 +43,9 @@ RUNTIME_OPS := []Op {
 	{171, "line.hold", {{"tree", .Object, nil}, {"line", .Str, nil}, {"reason", .Enum, HOLD_REASON_NAMES[:]}, {"wait", .Bool, nil}}, "held:uvarint sealed:bool", op_line_hold},
 	{172, "line.resume", {{"tree", .Object, nil}, {"line", .Str, nil}}, "resumed:uvarint", op_line_resume},
 	{173, "line.switch", {{"tree", .Object, nil}, {"line", .Str, nil}, {"root", .Str, nil}}, "line:str held:uvarint", op_line_switch},
+	{174, "undo", {OBJ, MSG}, "undo:id done:bool", op_undo},
+	{175, "redo", {OBJ, {"undo", .Id, nil}}, "undo:id done:bool", op_redo},
+	{176, "undo.resume", {OBJ}, "resumed:uvarint", op_undo_resume},
 	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
 }
 
@@ -883,5 +886,44 @@ op_wake :: proc(c: ^Call, o: ^Out) -> Status {
 		return .Unsupported
 	}
 	rt.wake(r, a_object(c, "object"))
+	return .Ok
+}
+
+op_undo :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	ob := a_object(c, "object")
+	id, err := rt.runtime_undo(r, ob, a_rid(c, "msg"))
+	if err != .None && err != .Pending {
+		return status_of(err)
+	}
+	o_id(o, "undo", id)
+	o_bool(o, "done", err == .None)
+	return .Ok
+}
+
+op_redo :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	ob := a_object(c, "object")
+	id, err := rt.runtime_redo(r, ob, a_id(c, "undo"))
+	if err != .None && err != .Pending {
+		return status_of(err)
+	}
+	o_id(o, "undo", id)
+	o_bool(o, "done", err == .None)
+	return .Ok
+}
+
+op_undo_resume :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	o_int(o, "resumed", rt.runtime_undo_resume(r, a_object(c, "object")))
 	return .Ok
 }

@@ -754,6 +754,9 @@ up exist only over the socket.
 | 171 | `line.hold` | tree: object, line: str, reason: enum branch_changed|branch_deleted|undo | held:uvarint |
 | 172 | `line.resume` | tree: object, line: str | resumed:uvarint |
 | 173 | `line.switch` | tree: object, line: str, root: str | line:str held:uvarint |
+| 174 | `undo` | object: object, msg: rid | undo:id done:bool (undoes turn `msg` and every task its tree spawned; `done` false while runs are still being held, the runtime finishes it) |
+| 175 | `redo` | object: object, undo: id | undo:id done:bool (switches back to the timeline the undo left) |
+| 176 | `undo.resume` | object: object | resumed:uvarint (continues the tasks an undo or redo paused; sending in the conversation does the same) |
 | 132 | `go_back` | object: object, msg: rid | {} |
 | 133 | `revert` | object: object, msg: rid | reverted:[str] |
 | 138 | `wake` | object: object | {} |

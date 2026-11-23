@@ -1636,9 +1636,9 @@ running on it is a record in it.
   restores those only the new one has, transformed through everything since;
   other trees' ops on the line are never touched. Alone on a line this is
   exactly a line switch. Going back and sending is such a switch.
-- **Undo** (runtime hooks planned) of turn T of A rewinds A's whole task
-  tree to T's start, as a set revert (fs) per line plus leaf and session
-  rewinds, driven by one staged record.
+- **Undo** of turn T of A rewinds A's whole task tree to T's start, as a set
+  revert (fs) per line plus leaf and session rewinds, driven by one staged
+  record.
   - *The set.* A's task tree is A plus every task its turns spawned,
     transitively (scope → task row → parent chain). Its set is the scope actors
     of the `Scope` records of every conversation in the tree, every actor
@@ -1654,20 +1654,27 @@ running on it is a record in it.
     records it has received since. Everything else is outside the set and
     survives: a person's own disk and buffer edits made during T, other trees,
     git and imports.
-  - *Versions and lines.* A send is a fence (every mount of the line ingests
-    before the `Msg` is recorded), so T's mount set (the fold of `Msg.files`
-    deltas along T's ancestor chain) gives each mounted tree its version
-    `V_T`. Every (tree, line) the set wrote after T is set-reverted with base
-    `V_T` on that line (a tree first mounted after T has an empty base and A
-    gets an `Unmount` back to T's set). A tree no device mounts is reverted
-    through its history (`tree_revert_set`, committed like an API write);
-    mounted devices materialize what they see.
+  - *Versions and lines.* A turn's reply records its mounts' versions as the
+    turn starts, after the start fence, so the fold of `Msg.files` deltas along
+    the ancestor chain of T's reply gives each mounted tree its version `V_T`
+    (a task's base is the fold at its first reply at or after T; a conversation
+    with no reply after T wrote nothing to revert). The user message's own
+    deltas are not enough: on a runner they are empty and the fold would fall
+    back to the previous reply, the version at the previous turn's start. Every
+    (tree, line) the set wrote after T is set-reverted with base `V_T` on that
+    line (a tree first mounted after T has an empty base and A gets an
+    `Unmount` back to T's set). A tree no device mounts is reverted through its
+    history (`tree_revert_set`, committed like an API write); mounted devices
+    materialize what they see.
   - *Checkouts.* A folder whose checked-out branch changed during T moves back
     to its line at T (a `line.switch`, no carry) only if A's tree made that
     switch and no other conversation has runs bound to the folder's current
     line; otherwise the checkout stays, the Undone record says so and the
     owners get the passive notice. Undo never moves a git ref, and never pulls
-    a branch from under another chat.
+    a branch from under another chat. As built, who made a switch is not yet
+    recorded, so no checkout is moved: a home folder whose mount is on another
+    line than the conversation's (not a run line) is listed in `Undone.kept`
+    and gets a `Notice{kind = checkout}` in A (runtime `checkouts` hook).
   - *Heads.* Heads at T's start are derived, not recorded: each task's
     conversation head is its newest record with `hlc < T.hlc` and its provider
     head the last raw provider line recorded before T, so a task caught
@@ -1675,28 +1682,43 @@ running on it is a record in it.
     same answer. A native session rewinds through its driver (`rewind` to that
     head); where a provider cannot, the task gets a fresh native session seeded
     from its conversation up to the derived head, never the newer session kept
-    silently.
-  - *The record.* `Undo{id, msg = T, redo, phase, set}` (convo kind 46) in
-    A's conversation is durable and replicated, so any device that opens A
-    resumes or rolls it forward (`convo_undo`, `convo_redo`,
-    `convo_undo_drive`). Each phase appends one `Undo` record with the same id
-    (`Staged`, `Held`, `Fenced` carrying the set, `Reverted`, `Moved`,
-    `Leaves`, `Rewound`, `Released`); the fold (`undos`) takes the highest
-    phase, and a phase's record is flushed durable before the next phase's
-    effects start. Phases run in order: hold (`Hold{undo}` and
-    `Interrupted{reason = undo}` on every run of the tree, waiting until each
-    has sealed or is held), fence (every mount of the tree's lines syncs),
-    reverts per (tree, line) and the `Undone` record, `Unmount` and checkout
-    moves, `Leaf` records (A's leaf to T's parent, every task's to its derived
-    head), native session rewinds, release. The hold, the fork mounts of a
-    conversation, the rewinds and the release are runtime hooks
-    (`Undo_Hooks`). Each step is idempotent: every revert marker carries the
-    undo id, so a resumed step first looks for its revert on that line
-    (`tree_undo_revert`), a written `Undone` is never written again, and a
-    leaf already in place is not set again, so no crash leaves files rewound
-    while conversations are not, or the reverse. The task tree is the catalog's
-    parent chain from A; a task whose parent message is at or after T is
-    hidden. Undoing a turn that is still running holds it first.
+    silently. As built, the rewind is lazy: the undo moves the leaves, and the
+    next run of each conversation finds its parent is not the native head and
+    rewinds (claude `--resume-session-at` + `--fork-session`, codex
+    `thread/fork` at the parent's turn) or, when that fails, restarts with a
+    fresh session whose first prompt carries the seed (a queued prompt takes
+    the seed when the fallback is taken, and a claude process that exits on the
+    fork keeps its prompts for the relaunch).
+  - *The record.* `Undo{id, msg = T, redo, phase, set}` (convo kind 46) in A's
+    conversation is durable and replicated, so any device that opens A resumes
+    or rolls it forward (`convo_undo`, `convo_redo`, `convo_undo_drive`). Each
+    phase appends one `Undo` record with the same id (`Staged`, `Held`,
+    `Fenced` carrying the set, `Reverted`, `Moved`, `Leaves`, `Rewound`,
+    `Released`); the fold (`undos`) takes the highest phase, and a phase's
+    record is flushed durable before the next phase's effects start. Phases run
+    in order: hold (`Hold{undo}` and `Interrupted{reason = undo}` on every run
+    of the tree, waiting until each has sealed or is held), fence (every mount
+    of the tree's lines syncs), reverts per (tree, line) and the `Undone`
+    record, `Unmount` and checkout moves, `Leaf` records (A's leaf to T's
+    parent, every task's to its derived head), native session rewinds, release.
+    The hold, the fork mounts of a conversation, the rewinds and the release
+    are runtime hooks (`Undo_Hooks`). Each step is idempotent: every revert
+    marker carries the undo id, so a resumed step first looks for its revert on
+    that line (`tree_undo_revert`), a written `Undone` is never written again,
+    and a leaf already in place is not set again, so no crash leaves files
+    rewound while conversations are not, or the reverse. The task tree is the
+    catalog's parent chain from A; a task whose parent message is at or after T
+    is hidden. Undoing a turn that is still running holds it first. The runtime
+    implements the hooks: hold sets a `Hold{key = undo}` intent on every
+    visible conversation of the tree and `run_hold_request(.Undo)` on its local
+    runs, and answers pending until none is running; the driver is re-driven
+    when a run is freed and every 2 s while an undo is pending, and after a
+    restart from the runtime state map (`undo/run/`). Release declines the held
+    reply of every run the undo held, puts its mounts back from the run line on
+    the conversation's line (the held turn's writes stay on the run line, the
+    undone timeline) and releases A's hold; the other tasks stay held (paused)
+    until `undo.resume` (`0ndb continue`) or A's next run. Ops: `undo`, `redo`,
+    `undo.resume` (174–176); CLI `0ndb undo`, `redo`, `continue`.
   - *The undone branch.* `Undone{undo id, T, old leaves, reverts (tree, line,
     revert actor), checkouts left in place, hidden tasks}` (kind 47) records the
     undone timeline; nothing is deleted. Tasks spawned after T's start go with

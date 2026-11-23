@@ -730,6 +730,60 @@ cmd_revert :: proc(a: ^Args) -> int {
 	return 0
 }
 
+cmd_undo :: proc(a: ^Args) -> int {
+	s := session(a)
+	ob, rest := _convo_and_rest(s, a, 1)
+	if len(rest) < 1 {
+		return usage_error("usage: 0ndb undo [CONVO] MSG")
+	}
+	r := req_begin("undo")
+	req_str(&r, "object", object_str(ob))
+	req_str(&r, "msg", rid_str(resolve_msg(s, ob, rest[0])))
+	v := must(s, req_end(&r), "cannot undo")
+	return _undo_print(a, v, "undo")
+}
+
+cmd_redo :: proc(a: ^Args) -> int {
+	s := session(a)
+	ob, rest := _convo_and_rest(s, a, 1)
+	if len(rest) < 1 {
+		return usage_error("usage: 0ndb redo [CONVO] UNDO")
+	}
+	r := req_begin("redo")
+	req_str(&r, "object", object_str(ob))
+	req_str(&r, "undo", rest[0])
+	v := must(s, req_end(&r), "cannot redo")
+	return _undo_print(a, v, "redo")
+}
+
+cmd_undo_resume :: proc(a: ^Args) -> int {
+	s := session(a)
+	ob, _ := _convo_and_rest(s, a, 0)
+	r := req_begin("undo.resume")
+	req_str(&r, "object", object_str(ob))
+	v := must(s, req_end(&r), "cannot resume")
+	if a.json {
+		print_json(v)
+		return 0
+	}
+	fmt.printfln("resumed %d task(s)", jint(v, "resumed"))
+	return 0
+}
+
+@(private)
+_undo_print :: proc(a: ^Args, v: json.Value, what: string) -> int {
+	if a.json {
+		print_json(v)
+		return 0
+	}
+	if jbool(v, "done") {
+		fmt.printfln("%s %s done", what, jstr(v, "undo"))
+	} else {
+		fmt.printfln("%s %s started; it finishes once the tree's running turns are held", what, jstr(v, "undo"))
+	}
+	return 0
+}
+
 @(private)
 _show_uncataloged :: proc(s: ^Session, a: ^Args, ob: api.Object) -> int {
 	tr := req_begin("text.read")

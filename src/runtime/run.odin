@@ -182,6 +182,7 @@ _run_free :: proc(run: ^Run) {
 	free(run, r.allocator)
 	if !r.closing {
 		_hold_waits_check(r)
+		undo_kick(r)
 	}
 }
 

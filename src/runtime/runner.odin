@@ -860,6 +860,9 @@ _run_begin :: proc(run: ^Run, lines: []convo.Line) -> Error {
 		run.sub = sid
 	}
 	r.stats.runs_started += 1
+	if undo_paused(r, o) {
+		runtime_undo_resume(r, o)
+	}
 	run.lines = lines
 	run.renew_timer = prim.timer(eng.loop(r.e), i64(r.cfg.lease_ms / 3), run, _on_renew)
 	if run.ai.budget.seconds > 0 {

@@ -1418,6 +1418,12 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_SUBSCRIBE_RUNNERS 163u
 /* subscribe.fork_diff(object: object, caller: object, diff: bool, max_chars: uvarint) -> changes:[Change] diff:str */
 #define ONDB_OP_SUBSCRIBE_FORK_DIFF 143u
+/* undo(object: object, msg: rid) -> undo:id done:bool */
+#define ONDB_OP_UNDO 174u
+/* redo(object: object, undo: id) -> undo:id done:bool */
+#define ONDB_OP_REDO 175u
+/* undo.resume(object: object) -> resumed:uvarint */
+#define ONDB_OP_UNDO_RESUME 176u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

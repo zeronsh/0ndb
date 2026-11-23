@@ -280,8 +280,7 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 			mb.dir = clone(home, ws.alloc)
 			ws.root = clone(home, ws.alloc)
 		} else {
-			sub := m.path if len(m.path) > 0 else m.name
-			mb.dir = clone(base if single && len(m.path) == 0 else concat(base, "/", sub), ws.alloc)
+			mb.dir = clone(fork_dir(r, o, m, single), ws.alloc)
 		}
 		append(&ws.members, mb)
 	}
@@ -357,7 +356,7 @@ _member_mount :: proc(ws: ^Worktree, mb: ^Wt_Member) -> Error {
 		opts := fs.DEFAULT_MOUNT
 		opts.line = conv
 		opts.follow_branch = false
-		if ferr := fs.mount_fork(busy_src, m, derive_id("0ndb-fork-mount-v1", id[:], transmute([]u8)clean), mb.dir, state, cur, fs.Fork_Options{line = conv}, opts, r.allocator); ferr != .None {
+		if ferr := fs.mount_fork(busy_src, m, fork_mount_id(id, clean), mb.dir, state, cur, fs.Fork_Options{line = conv}, opts, r.allocator); ferr != .None {
 			free(m, r.allocator)
 			return .Io
 		}
