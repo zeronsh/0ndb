@@ -2089,6 +2089,16 @@ _fetch_run :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 	if rm.trimmed {
 		fetch.from = max(fetch.from, rm.base)
 	}
+	if fetch.from < rm.base && !rm.base_checked {
+		rm.base_checked = true
+		if client_read(&r.client, rm.id, fetch.from, fetch.to) == .None {
+			append(&rm.inflight, fetch)
+			r.read_reqs += 1
+		} else {
+			_remote_hold_retry(r, rm)
+		}
+		return
+	}
 	if fetch.from < rm.base {
 		_pull_range(r, rm, fetch.from, min(fetch.to, rm.base))
 		if fetch.to <= rm.base {
