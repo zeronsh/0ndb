@@ -878,7 +878,17 @@ equal in both directions.
   told from one git did not create, and is rewritten. Text a git rewrite
   carries (the departing commit, reflog entries, ORIG_HEAD and cherry-pick
   sources) is copied with its authors only from versions the line's synced
-  version contains; anything else is a plain insert by the line's actor. A
+  version contains; anything else is a plain insert by the line's actor.
+  Text a branch switch carries (a working-tree modification git keeps across
+  the checkout) is copied with its authors from the departing line's synced
+  version, whatever its length when the carried file is exactly that
+  version's text, so the writer keeps its credit on the new line. A copy may
+  cite any op of the same tree's history, on any line: lines are not access
+  units, so every reader of the object can reach every source. A copy's
+  sources are delivery dependencies, never version parents: admitting a
+  batch whose source is not yet in the graph answers `Need_Source` with the
+  missing ops (the batch is held, never cut), a redacted source redacts the
+  copied range, and a local commit whose source is missing is corruption. A
   materialization whose pass switched lines restarts at the
   new line rather than writing the old one back. Ingestion on a line other
   than the mount's own uses an actor derived from the mount and the line,

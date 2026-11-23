@@ -20,6 +20,7 @@ Error :: enum u8 {
 	Corrupt,
 	Too_Large,
 	Missing_Content,
+	Missing_Source,
 }
 
 Op_Kind :: enum u8 {
