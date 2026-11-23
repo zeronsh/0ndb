@@ -92,6 +92,7 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.settle_ms = w.cfg.settle_ms
 	cfg.archive_min = w.cfg.archive_min
 	cfg.archive_group = w.cfg.archive_group
+	cfg.tail_window = w.cfg.tail_window
 	cfg.archive_level = 3
 	cfg.search_full = n.idx % 2 == 0
 	cfg.search_hedge_ms = 200

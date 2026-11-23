@@ -194,6 +194,7 @@ Config :: struct {
 	persist_fault: bool,
 	archive_min: i64,
 	archive_group: int,
+	tail_window: i64,
 }
 
 World :: struct {
