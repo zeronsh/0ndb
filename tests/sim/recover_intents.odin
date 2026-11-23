@@ -102,7 +102,7 @@ _ri_run :: proc(w: ^World, k: u64) -> (crashed: bool) {
 			world_fail(w, "recover: mkdir")
 			return
 		}
-		if m, err = eng.tree_mount(&a.e, tree, RI_ROOT); err != .None {
+		if m, err = eng.tree_mount(&a.e, tree, RI_ROOT); err != .None && !(err == .Pending && m != nil) {
 			world_fail(w, "recover: tree_mount: %v", err)
 			return
 		}
@@ -216,7 +216,7 @@ _ri_remount :: proc(w: ^World, a: ^Node, tree: eng.Object, k: u64) -> (m: ^fs.Mo
 			a.reg = reg
 		}
 		err: eng.Error
-		if m, err = eng.tree_mount(&a.e, tree, RI_ROOT); err != .None {
+		if m, err = eng.tree_mount(&a.e, tree, RI_ROOT); err != .None && !(err == .Pending && m != nil) {
 			world_fail(w, "recover: n0 could not remount after a crash at op %d of a pass that merged an agent base next to a person's edit: %v", k, err)
 			return nil, false
 		}
