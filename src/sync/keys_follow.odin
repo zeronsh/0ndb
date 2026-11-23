@@ -159,6 +159,8 @@ _kfollow_on :: proc(r: ^Replicator, rm: ^Remote) {
 	rm.kfollow = true
 	if rm.is_head {
 		_kwait_head_landed(r, rm)
+	} else {
+		_kwait_keys_landed(r, rm)
 	}
 	if was {
 		return
