@@ -235,6 +235,9 @@ _content_publish :: proc(e: ^Engine, h: ^Handle) {
 	}
 	mark := Content_Mark{space = h.sp.id, target = pos}
 	tr := _tree_reach(e, h) if len(refs) > 0 else Tree_Reach{}
+	if tr.pending {
+		return
+	}
 	if tr.ok {
 		_tree_remote_note(e, h.sp, h.id, tr.urls)
 	}

@@ -1050,16 +1050,19 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 	if rng_chance(&w.remote.rng, 3, 4) && env_u64("SIM_REMOTE", 1) != 0 {
 		remote = fmt.tprintf("%s%s", SIM_REMOTE_URL, id_short(o.id))
 	}
-	if len(remote) > 0 {
+	lost := len(remote) > 0 && remote_lost(w)
+	if len(remote) > 0 && !lost {
 		for f in files {
 			oid, _ := odb.hash(.Sha1, .Blob, f.data)
 			if _, has := w.remote.objects[oid]; !has {
-				w.remote.objects[oid] = slice.clone(f.data, w.allocator)
+				w.remote.objects[oid] = Sim_Object{.Blob, slice.clone(f.data, w.allocator)}
 			}
 		}
 	}
 	gerr := git_checkout_create(vfs, root, files[:], clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng), remote, &pushed if len(remote) > 0 else nil)
-	if gerr == .None && len(pushed) > 0 && !n.disk.dead {
+	if lost {
+		world_note(w, "%s clones %s, whose remote was force-pushed and gc'd since the clone's tracking ref was fetched", n.name, root)
+	} else if gerr == .None && len(pushed) > 0 && !n.disk.dead {
 		remote_push(w, n, root, pushed[:])
 	}
 	if n.disk.dead {

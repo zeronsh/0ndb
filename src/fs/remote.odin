@@ -455,7 +455,7 @@ _cmp :: proc "contextless" (a, b: []u8) -> int {
 	return 0
 }
 
-remote_update :: proc(vfs: prim.Vfs, db: ^odb.Odb, g: Git_Dirs, dir: string) -> (u: Remote_Update, err: Error) {
+remote_update :: proc(vfs: prim.Vfs, db: ^odb.Odb, g: Git_Dirs, dir: string, tips: []Remote_Tip) -> (u: Remote_Update, err: Error) {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 1 << 20) != nil {
 		return u, .No_Memory
@@ -474,7 +474,6 @@ remote_update :: proc(vfs: prim.Vfs, db: ^odb.Odb, g: Git_Dirs, dir: string) -> 
 			head = oid
 		}
 	}
-	tips := git_remote_tips(vfs, g, context.temp_allocator)
 	u.tips = len(tips)
 	old, had := _state_read(vfs, dir)
 	if had && old.format == format && old.head == head && len(old.tips) == len(tips) {
