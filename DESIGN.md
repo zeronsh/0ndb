@@ -1073,7 +1073,13 @@ concurrent typing is never lost or reverted.
   committed), as it does for its inline streams, and a journal on such a
   file never scans for a torn tail: its durable length is the size. Only a
   journal without it (a plain file) scans forward from its checkpoint
-  sidecar, which is written unsynced and may lag. Scanning a pack journal
+  sidecar, which is written unsynced and may lag. That scan cuts only a torn
+  tail: if the record it stops at is followed by one that verifies, the
+  damage is inside durable bytes and the open answers `Corrupt` whatever
+  floor the caller passed, so the repair restores it from the relay copy;
+  nothing is ever truncated to get past it. A length query never recovers:
+  `journal_peek_len` reads the length (the size, or the scan end from the
+  checkpoint) without writing. Scanning a pack journal
   stopped at the first record that did not verify and truncated there, so a
   flipped bit in an old record cut every later durable record (seen as an
   own stream going fatal with no crash). A promoted file is created fresh and

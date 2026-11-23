@@ -499,17 +499,8 @@ _recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 		r: Reader
 		reader_init(&r, j.vfs, j.fd, size, context.temp_allocator)
 		defer reader_close(&r)
-		for {
-			_, nxt, err := record_at(&r, end)
-			if err == .Eof || err == .Corrupt || err == .Bad_Offset {
-				break
-			}
-			if err != .None && err != .Redacted {
-				return err
-			}
-			end = nxt
-		}
-		if end < size && end < keep_at_least {
+		end = _scan_end(&r, end) or_return
+		if end < size && (end < keep_at_least || _damage_within(&r, end, size)) {
 			return .Corrupt
 		}
 	}
@@ -534,6 +525,71 @@ _recover :: proc(j: ^Journal, size: i64, keep_at_least: i64) -> Error {
 		_write_checkpoint(j)
 	}
 	return .None
+}
+
+@(private)
+_scan_end :: proc(r: ^Reader, from: i64) -> (end: i64, err: Error) {
+	end = from
+	for {
+		_, nxt, rerr := record_at(r, end)
+		if rerr == .Eof || rerr == .Corrupt || rerr == .Bad_Offset {
+			return end, .None
+		}
+		if rerr != .None && rerr != .Redacted {
+			return end, rerr
+		}
+		end = nxt
+	}
+}
+
+@(private)
+_damage_within :: proc(r: ^Reader, at, size: i64) -> bool {
+	if size - at < OVERHEAD {
+		return false
+	}
+	head: [4]u8
+	if n, err := prim.read_at(r.vfs, r.fd, head[:], at); err != .None || n != 4 {
+		return false
+	}
+	n := i64(prim.get_u32le(head[:]))
+	if n > MAX_BODY {
+		return false
+	}
+	next := at + n + OVERHEAD
+	if next >= size {
+		return false
+	}
+	_, _, err := record_at(r, next)
+	return err == .None || err == .Redacted
+}
+
+journal_peek_len :: proc(vfs: prim.Vfs, path: string) -> (n: i64, err: Error) {
+	fd, oerr := prim.open_file(vfs, path, {})
+	if oerr != .None {
+		return 0, _err(oerr)
+	}
+	defer prim.close_file(vfs, fd)
+	size, serr := prim.file_size(vfs, fd)
+	if serr != .None {
+		return 0, _err(serr)
+	}
+	caps := prim.file_caps(vfs, fd)
+	if .Atomic_Group_Commit in caps || .Durable_Size in caps {
+		return size, .None
+	}
+	ck := i64(0)
+	ck_path, cerr := _sidecar(path, ".ck", context.temp_allocator)
+	if cerr != .None {
+		return 0, cerr
+	}
+	if ck_fd, kerr := prim.open_file(vfs, ck_path, {}); kerr == .None {
+		ck = min(_read_checkpoint(vfs, ck_fd), size)
+		prim.close_file(vfs, ck_fd)
+	}
+	r: Reader
+	reader_init(&r, vfs, fd, size, context.temp_allocator)
+	defer reader_close(&r)
+	return _scan_end(&r, ck)
 }
 
 @(private)
