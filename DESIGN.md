@@ -439,6 +439,12 @@ equal in both directions.
   only if that fails is the index marked lost. Compaction carries each
   entry's version into the new generation's own version table, since an
   entry's version index names a table that belongs to one shadow.
+  A compaction writes and syncs the whole new generation before it
+  publishes `shadow.gen`, and once written that generation is never
+  deleted by the failure path: a publish that fails after its rename may
+  still be durable, so the compaction reads `shadow.gen` back, finishes the
+  switch if it names the new generation, and otherwise stays on the old one
+  and never reuses that generation's number while it may still be named.
 - **First mount** walks with parallel `getdents64`/`statx` workers that exist
   only for the scan. In a git checkout the index is read once: entries whose
   stat matches take the index oid (the file text is then referenced from

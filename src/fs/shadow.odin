@@ -77,6 +77,7 @@ Rec :: struct {
 }
 
 Shadow :: struct {
+	burned:     u64,
 	clock:      Clock,
 	hold:       bool,
 	owed:       bool,
@@ -683,7 +684,7 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 		shadow_persist(s) or_return
 	}
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	ng := s.gen + 1
+	ng := max(s.gen, s.burned) + 1
 	log_path := gen_path(s.dir, ng, "log", context.temp_allocator)
 	idx_path := gen_path(s.dir, ng, "idx", context.temp_allocator)
 	prim.remove(s.vfs, log_path)
@@ -735,8 +736,12 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 	checkpoint(&n) or_return
 	write_header(&n, true)
 	from_prim(prim.datasync(s.vfs, n.idx_fd)) or_return
-	write_gen(s, s.dir, ng) or_return
 	ok = true
+	if werr := write_gen(s, s.dir, ng); werr != .None && read_gen(s, s.dir) != ng {
+		s.burned = max(s.burned, ng)
+		shadow_detach(&n)
+		return werr
+	}
 	shadow_detach(&n)
 	old_log := gen_path(s.dir, s.gen, "log", context.temp_allocator)
 	old_idx := gen_path(s.dir, s.gen, "idx", context.temp_allocator)
