@@ -375,7 +375,7 @@ _member_mount :: proc(ws: ^Worktree, mb: ^Wt_Member) -> Error {
 	prim.mkdir_all(r.e.base, mb.dir, 0o755)
 	m, merr := eng.tree_mount(r.e, tree, mb.dir, opts)
 	eng.tree_release(r.e, tree)
-	if merr != .None {
+	if merr != .None && merr != .Pending {
 		return .Io
 	}
 	mb.m = m

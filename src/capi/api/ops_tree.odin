@@ -57,7 +57,7 @@ mount_open :: proc(a: ^Api, ob: Object, root: string) -> (m: ^Mounted, st: Statu
 		}
 	}
 	fm, err := eng.tree_mount(a.e, ob, clean)
-	if err != .None {
+	if err != .None && err != .Pending {
 		return nil, status_of(err)
 	}
 	m = new(Mounted, a.allocator)
