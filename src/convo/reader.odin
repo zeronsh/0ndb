@@ -1665,3 +1665,182 @@ activity :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Activi
 	}
 	return list[:], .None
 }
+
+Undo_State :: struct {
+	id:     prim.Id,
+	msg:    Rid,
+	redo:   prim.Id,
+	phase:  Undo_Phase,
+	staged: Rid,
+	set:    []Undo_Line,
+	stamp:  prim.Hlc,
+}
+
+Undone_State :: struct {
+	at:      Rid,
+	undo:    prim.Id,
+	msg:     Rid,
+	leaves:  []Undone_Leaf,
+	reverts: []Undone_Revert,
+	kept:    []Line_Bind,
+	hidden:  []prim.Id,
+	stamp:   prim.Hlc,
+}
+
+Notice_State :: struct {
+	at:     Rid,
+	notice: Notice,
+	stamp:  prim.Hlc,
+}
+
+undos :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undo_State, err: Error) {
+	Acc :: struct {
+		list:      [dynamic]Undo_State,
+		v:         ^obj.View,
+		allocator: runtime.Allocator,
+	}
+	acc := Acc{make([dynamic]Undo_State, allocator), v, allocator}
+	visit :: proc(data: rawptr, s: int, off: i64, env: ^obj.Envelope) -> (stop: bool, err: Error) {
+		a := (^Acc)(data)
+		if env.kind != u8(Kind.Undo) {
+			return false, .None
+		}
+		rec := decode_env(env, a.v.scratch) or_return
+		u := rec.body.(Undo)
+		at := obj.rid(a.v, Vref{s, off}) or_return
+		x := -1
+		for st, i in a.list {
+			if st.id == u.id {
+				x = i
+				break
+			}
+		}
+		if x < 0 {
+			append(&a.list, Undo_State{id = u.id, stamp = rec.stamp})
+			x = len(a.list) - 1
+		}
+		st := &a.list[x]
+		st.stamp = min(st.stamp, rec.stamp)
+		if u.phase == .Staged {
+			m := obj.resolve(a.v, s, u.msg) or_return
+			st.msg = obj.rid(a.v, m) or_return
+			st.redo = u.redo
+			st.staged = at
+			set := make([]Undo_Line, len(u.set), a.allocator)
+			for l, i in u.set {
+				set[i].tree = l.tree
+				set[i].line = obj.clone_str(l.line, a.allocator) or_return
+				set[i].base = obj.clone_bytes(l.base, a.allocator) or_return
+				set[i].actors = make([]prim.Id, len(l.actors), a.allocator)
+				copy(set[i].actors, l.actors)
+			}
+			st.set = set
+		}
+		st.phase = max(st.phase, u.phase)
+		return false, .None
+	}
+	for s in 0 ..< len(v.segs) {
+		obj.walk_events(v, s, 0, &acc, visit) or_return
+	}
+	n := 0
+	for st in acc.list {
+		if !obj.rid_none(st.staged) {
+			acc.list[n] = st
+			n += 1
+		}
+	}
+	resize(&acc.list, n)
+	slice.sort_by(acc.list[:], proc(a, b: Undo_State) -> bool {
+		return a.stamp < b.stamp
+	})
+	return acc.list[:], .None
+}
+
+undones :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []Undone_State, err: Error) {
+	Acc :: struct {
+		list:      [dynamic]Undone_State,
+		v:         ^obj.View,
+		allocator: runtime.Allocator,
+	}
+	acc := Acc{make([dynamic]Undone_State, allocator), v, allocator}
+	visit :: proc(data: rawptr, s: int, off: i64, env: ^obj.Envelope) -> (stop: bool, err: Error) {
+		a := (^Acc)(data)
+		if env.kind != u8(Kind.Undone) {
+			return false, .None
+		}
+		rec := decode_env(env, a.v.scratch) or_return
+		u := rec.body.(Undone)
+		for st in a.list {
+			if st.undo == u.undo {
+				return false, .None
+			}
+		}
+		m := obj.resolve(a.v, s, u.msg) or_return
+		st := Undone_State {
+			at    = obj.rid(a.v, Vref{s, off}) or_return,
+			undo  = u.undo,
+			msg   = obj.rid(a.v, m) or_return,
+			stamp = rec.stamp,
+		}
+		st.leaves = make([]Undone_Leaf, len(u.leaves), a.allocator)
+		copy(st.leaves, u.leaves)
+		st.reverts = make([]Undone_Revert, len(u.reverts), a.allocator)
+		for r, i in u.reverts {
+			st.reverts[i] = r
+			st.reverts[i].line = obj.clone_str(r.line, a.allocator) or_return
+		}
+		st.kept = make([]Line_Bind, len(u.kept), a.allocator)
+		for k, i in u.kept {
+			st.kept[i] = k
+			st.kept[i].mount = obj.clone_str(k.mount, a.allocator) or_return
+			st.kept[i].line = obj.clone_str(k.line, a.allocator) or_return
+		}
+		st.hidden = make([]prim.Id, len(u.hidden), a.allocator)
+		copy(st.hidden, u.hidden)
+		append(&a.list, st)
+		return false, .None
+	}
+	for s in 0 ..< len(v.segs) {
+		obj.walk_events(v, s, 0, &acc, visit) or_return
+	}
+	slice.sort_by(acc.list[:], proc(a, b: Undone_State) -> bool {
+		return a.stamp < b.stamp
+	})
+	return acc.list[:], .None
+}
+
+notices :: proc(v: ^obj.View, floor: prim.Hlc = 0, allocator := context.allocator) -> (out: []Notice_State, err: Error) {
+	Acc :: struct {
+		list:      [dynamic]Notice_State,
+		v:         ^obj.View,
+		allocator: runtime.Allocator,
+	}
+	acc := Acc{make([dynamic]Notice_State, allocator), v, allocator}
+	visit :: proc(data: rawptr, s: int, off: i64, env: ^obj.Envelope) -> (stop: bool, err: Error) {
+		a := (^Acc)(data)
+		if env.kind != u8(Kind.Notice) {
+			return false, .None
+		}
+		rec := decode_env(env, a.v.scratch) or_return
+		n := rec.body.(Notice)
+		st := Notice_State {
+			at     = obj.rid(a.v, Vref{s, off}) or_return,
+			notice = n,
+			stamp  = rec.stamp,
+		}
+		st.notice.line = obj.clone_str(n.line, a.allocator) or_return
+		st.notice.paths = make([]string, len(n.paths), a.allocator)
+		for p, i in n.paths {
+			st.notice.paths[i] = obj.clone_str(p, a.allocator) or_return
+		}
+		append(&a.list, st)
+		return false, .None
+	}
+	for s in 0 ..< len(v.segs) {
+		obj.walk_events(v, s, floor, &acc, visit) or_return
+	}
+	slice.sort_by(acc.list[:], proc(a, b: Notice_State) -> bool {
+		return a.stamp < b.stamp
+	})
+	return acc.list[:], .None
+}

@@ -59,6 +59,27 @@ Kind :: enum u8 {
 	Files       = 43,
 	Redact_Msg  = 44,
 	Hold        = 45,
+	Undo        = 46,
+	Undone      = 47,
+	Notice      = 48,
+}
+
+Undo_Phase :: enum u8 {
+	Staged   = 1,
+	Held     = 2,
+	Fenced   = 3,
+	Reverted = 4,
+	Moved    = 5,
+	Leaves   = 6,
+	Rewound  = 7,
+	Released = 8,
+}
+
+Notice_Kind :: enum u8 {
+	Rewrote  = 1,
+	Removed  = 2,
+	Checkout = 3,
+	Read     = 4,
 }
 
 Role :: enum u8 {
