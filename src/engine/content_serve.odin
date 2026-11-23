@@ -37,6 +37,7 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 		_reg_fail(e, _oerr(terr))
 		return
 	}
+	added := false
 	for ref in refs {
 		_, size, herr := odb.read_header(db, ref.oid)
 		if herr != .None {
@@ -61,6 +62,9 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 			copy(buf[50:], oid[:ref.len])
 			w := 50 + ref.len
 			k := _serve_key(osync.object_part_index(key, p))
+			if prev, found, gerr := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator); gerr != .None || !found || string(prev) != string(buf[:w]) {
+				added = true
+			}
 			if omap.txn_put(t, ROOT_OWNED, k[:], buf[:w]) != .None {
 				omap.txn_abort(t)
 				_reg_fail(e, .Io)
@@ -68,7 +72,10 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 			}
 		}
 	}
-	_reg_commit(e, t)
+	if _reg_commit(e, t) == .None && added && !h.sp.keyless {
+		e.budget.served[h.sp.id] = true
+		_touch(e)
+	}
 }
 
 @(private)

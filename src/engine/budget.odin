@@ -14,6 +14,7 @@ DEFAULT_CONTENT_BUDGET :: i64(1) << 30
 Budget_State :: struct {
 	added:      map[prim.Id]i64,
 	advertised: map[prim.Id]bool,
+	served:     map[prim.Id]bool,
 	held:       [dynamic]Held_Note,
 }
 
@@ -21,6 +22,7 @@ Budget_State :: struct {
 _budget_init :: proc(e: ^Engine) {
 	e.budget.added = make(map[prim.Id]i64, e.allocator)
 	e.budget.advertised = make(map[prim.Id]bool, e.allocator)
+	e.budget.served = make(map[prim.Id]bool, e.allocator)
 	e.budget.held = make([dynamic]Held_Note, e.allocator)
 }
 
@@ -28,6 +30,7 @@ _budget_init :: proc(e: ^Engine) {
 _budget_destroy :: proc(e: ^Engine) {
 	delete(e.budget.added)
 	delete(e.budget.advertised)
+	delete(e.budget.served)
 	delete(e.budget.held)
 }
 
@@ -128,7 +131,8 @@ _budget_flush :: proc(e: ^Engine) {
 		}
 		add := e.budget.added[id]
 		want_ad := e.cfg.always_on && !e.budget.advertised[id]
-		if add == 0 && !want_ad {
+		served := e.budget.served[id]
+		if add == 0 && !want_ad && !served {
 			continue
 		}
 		_, own := _budget_used(e, sp)
@@ -141,6 +145,7 @@ _budget_flush :: proc(e: ^Engine) {
 		fields := [2]omap.Field{omap.field_u64(HOLDER_TAG_FLAGS, flags), omap.field_u64(HOLDER_TAG_BYTES, u64(max(own, 0)))}
 		if _, serr := map_set(e, o, me[:], fields[:]); serr == .None || serr == .Pending {
 			delete_key(&e.budget.added, id)
+			delete_key(&e.budget.served, id)
 			e.budget.advertised[id] = true
 		}
 	}
