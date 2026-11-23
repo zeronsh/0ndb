@@ -3097,6 +3097,14 @@ REC_ACTOR :: fshist.REC_ACTOR
 
 @(private)
 apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
+	if la, base, lok := fshist.decode_line_actor_record(body, device); lok {
+		b := base
+		kv_put(&h.kv, fshist.actor_key(la), b[:]) or_return
+		if owner, owned := history_owner_of(h, base); owned {
+			return owned_add(h, owner, la)
+		}
+		return .None
+	}
 	a, owner, ok := fshist.decode_actor_record(body, device)
 	if !ok {
 		return .None
@@ -3106,6 +3114,31 @@ apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
 	if owner == {} {
 		return .None
 	}
+	return owned_add(h, owner, a)
+}
+
+@(private)
+owner_back_key :: proc(actor: prim.Id) -> []u8 {
+	k := make([]u8, 3 + 16, context.temp_allocator)
+	copy(k, "aW:")
+	a := actor
+	copy(k[3:], a[:])
+	return k
+}
+
+history_owner_of :: proc(h: ^History, actor: prim.Id) -> (owner: prim.Id, ok: bool) {
+	v, found, err := kv_get(&h.kv, owner_back_key(actor), context.temp_allocator)
+	if err != .None || !found || len(v) != len(owner) {
+		return
+	}
+	copy(owner[:], v)
+	return owner, true
+}
+
+@(private)
+owned_add :: proc(h: ^History, owner, a: prim.Id) -> Error {
+	o := owner
+	kv_put(&h.kv, owner_back_key(a), o[:]) or_return
 	list, _ := kv_get(&h.kv, fshist.owned_key(owner), context.temp_allocator) or_return
 	for i := 0; i + 16 <= len(list); i += 16 {
 		id: prim.Id
@@ -3193,13 +3226,42 @@ history_actor_owner :: proc(h: ^History, actor: prim.Id) -> (owner: prim.Id, ok:
 
 history_present_spans :: proc(h: ^History, spans: []crdt.Author_Span) {
 	for &s in spans {
-		if o, ok := history_actor_owner(h, s.id.actor); ok {
-			s.id.actor = o
-		}
-		if o, ok := history_actor_owner(h, s.op.actor); ok {
-			s.op.actor = o
-		}
+		s.id.actor = history_present_actor(h, s.id.actor)
+		s.op.actor = history_present_actor(h, s.op.actor)
 	}
+}
+
+history_present_actor :: proc(h: ^History, actor: prim.Id) -> prim.Id {
+	a := actor
+	for _ in 0 ..< 3 {
+		o, ok := history_actor_owner(h, a)
+		if !ok {
+			break
+		}
+		a = o
+	}
+	return a
+}
+
+history_register_line_actor :: proc(h: ^History, actor, pseudo, base: prim.Id) -> Error {
+	history_ready(h) or_return
+	if _, known := history_actor_owner(h, actor); known {
+		return .None
+	}
+	if fshist.ingestion_actor(h.self, pseudo) != actor {
+		return .Invalid
+	}
+	clear(&h.io)
+	fshist.encode_line_actor_record(&h.io, actor, pseudo, base, h.self)
+	if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
+		return .Io
+	}
+	if journal.journal_commit(&h.journal) != .None {
+		return .Io
+	}
+	h.applied[0] = journal.journal_durable_len(&h.journal)
+	apply_actor_record(h, h.self, h.io[:]) or_return
+	return kv_commit(&h.kv)
 }
 
 history_alias :: proc(h: ^History, sources: []string, commit: string, v: Version) -> Error {
