@@ -699,8 +699,14 @@ equal in both directions.
   offset, and the re-detected change is committed step by step: the content of
   each step as its actor, then the rest by the rule above. Each step is a
   content diff against the one before, so a writer whose bytes a later step
-  overwrote is credited nothing; a step whose content is missing from the
-  object store stops the chain and the rest is unattributed. The steps live
+  overwrote is credited nothing. A scope that closes with
+  content no pass consumed yet logs a step for the content it was diffed
+  from (the device's, unless an earlier step already names it, with its
+  blob stored) before its own, so when the commit of that base is lost too,
+  its bytes are the device's and only the scope's own diff is the actor's. A
+  step whose content the disk holds exactly names its writer even when its
+  blob never reached the object store; any other step whose content is
+  missing stops the chain and the rest is unattributed. The steps live
   only in the log, so while any path holds steps an image keeps the replay's
   offset and no save truncates the log or moves to a new generation; a full
   pass that finds a chained path unchanged drops its steps.
