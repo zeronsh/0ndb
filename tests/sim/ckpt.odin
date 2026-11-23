@@ -49,7 +49,7 @@ _ck_collect :: proc(w: ^World, res: ^Run_Result) {
 
 @(private = "file")
 _ck_kind :: proc(k: M_Kind) -> bool {
-	return k == .Tree
+	return k == .Tree || k == .Text
 }
 
 @(private = "file")
