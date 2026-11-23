@@ -241,7 +241,6 @@ op_mount :: proc(w: ^World, n: ^Node) {
 	}
 }
 
-@(private = "file")
 _disk_write :: proc(vfs: prim.Vfs, path: string, data: []u8, atomic: bool) -> prim.Error {
 	target := path
 	if atomic {
@@ -614,7 +613,6 @@ op_disk_edit :: proc(w: ^World, n: ^Node, agent: bool) {
 	node_after(n)
 }
 
-@(private = "file")
 _forget_scope :: proc(w: ^World, n: ^Node, scope: ^fs.Scope) {
 	keys := make([dynamic]string, context.temp_allocator)
 	for k, v in n.writers {
@@ -753,7 +751,6 @@ check_mounts :: proc(w: ^World) {
 	}
 }
 
-@(private = "file")
 _writer_set :: proc(w: ^World, n: ^Node, path: string, info: Writer_Info) {
 	if _, has := n.writers[path]; has {
 		n.writers[path] = info
