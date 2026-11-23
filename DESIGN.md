@@ -734,7 +734,10 @@ equal in both directions.
   offset, and the re-detected change is committed step by step: the content of
   each step as its actor, then the rest by the rule above. Each step is a
   content diff against the one before, so a writer whose bytes a later step
-  overwrote is credited nothing. A scope that closes with
+  overwrote is credited nothing. A scope that closes having
+  observed a path it never wrote retires that observation in the log (a
+  record with no actor, which replay applies as a removal), so a later
+  change by anyone else is never credited to it. A scope that closes with
   content no pass consumed yet logs a step for the content it was diffed
   from (the device's, unless an earlier step already names it, with its
   blob stored) before its own, so when the commit of that base is lost too,
