@@ -1882,15 +1882,72 @@ _contiguous :: proc(rm: ^Remote) -> i64 {
 
 @(private)
 _suffix_contiguous :: proc(rm: ^Remote) -> i64 {
-	if rm.base <= 0 {
-		return _contiguous(rm)
+	g, _ := _unfetched(rm, max(rm.base, 0), max(i64), false)
+	return g.from
+}
+
+@(private)
+_unfetched :: proc(rm: ^Remote, from, to: i64, count_inflight := true) -> (gap: journal.Range, missing: bool) {
+	pos := from
+	outer: for pos < to {
+		next := to
+		for h in journal.replica_have(&rm.rep) {
+			if h.from <= pos && h.to > pos {
+				pos = h.to
+				continue outer
+			}
+			if h.from > pos {
+				next = min(h.from, to)
+				break
+			}
+		}
+		if count_inflight {
+			if end, busy := _inflight_at(rm, pos); busy {
+				if end < 0 {
+					return
+				}
+				pos = end
+				continue
+			}
+			next = min(next, _inflight_after(rm, pos))
+		}
+		return {pos, next}, true
 	}
-	for h in journal.replica_have(&rm.rep) {
-		if h.from <= rm.base && h.to > rm.base {
-			return h.to
+	return
+}
+
+@(private)
+_inflight_at :: proc(rm: ^Remote, pos: i64) -> (end: i64, busy: bool) {
+	for f in rm.inflight {
+		if f.from < 0 {
+			return -1, true
+		}
+		if f.from <= pos && f.to > pos {
+			end, busy = max(end, f.to), true
 		}
 	}
-	return rm.base
+	for p in rm.pulls {
+		if pos >= 0 && p.from <= pos && p.to > pos {
+			end, busy = max(end, p.to), true
+		}
+	}
+	return
+}
+
+@(private)
+_inflight_after :: proc(rm: ^Remote, pos: i64) -> i64 {
+	next := max(i64)
+	for f in rm.inflight {
+		if f.from > pos {
+			next = min(next, f.from)
+		}
+	}
+	for p in rm.pulls {
+		if p.from > pos {
+			next = min(next, p.from)
+		}
+	}
+	return next
 }
 
 @(private)
@@ -1964,6 +2021,9 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 			break
 		}
 	}
+	if rm.trimmed && gap.from >= rm.base {
+		prev_end = max(prev_end, rm.base)
+	}
 	fetch := gap
 	if rm.need_set && rm.need_from < fetch.from && rm.need_from >= prev_end {
 		fetch.from = rm.need_from
@@ -2002,7 +2062,10 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 		if gap.to <= rm.base {
 			return
 		}
-		fetch.from = max(rm.base, gap.from)
+		for g, need := _unfetched(rm, max(rm.base, gap.from), gap.to); need; g, need = _unfetched(rm, g.to, gap.to) {
+			_fetch_gap(r, rm, g)
+		}
+		return
 	}
 	if fetch.from < rm.base {
 		_pull_range(r, rm, fetch.from, min(fetch.to, rm.base))
@@ -2055,17 +2118,8 @@ _unclaim :: proc(rm: ^Remote, x: i64) {
 
 @(private)
 _covered_inflight :: proc(rm: ^Remote, g: journal.Range) -> bool {
-	for f in rm.inflight {
-		if f.from < 0 || (f.from <= g.from && f.to >= g.to) {
-			return true
-		}
-	}
-	for p in rm.pulls {
-		if g.from >= 0 && p.from <= g.from && p.to >= g.to {
-			return true
-		}
-	}
-	return false
+	end, busy := _inflight_at(rm, g.from)
+	return busy && (end < 0 || end >= g.to)
 }
 
 @(private)
@@ -2147,7 +2201,9 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 			_emit(r, Repl_Event{kind = .Present, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = w.from, to = to, length = rm.relay_len})
 			continue
 		}
-		_fetch_gap(r, rm, gap)
+		for g, need := _unfetched(rm, gap.from, gap.to); need; g, need = _unfetched(rm, g.to, gap.to) {
+			_fetch_gap(r, rm, g)
+		}
 		i += 1
 	}
 	_remote_maybe_free(r, rm)
