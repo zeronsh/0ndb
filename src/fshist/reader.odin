@@ -565,7 +565,7 @@ apply_record :: proc(r: ^Reader, si: u32, off: u64, body: []u8) -> (n: int, err:
 		return 0, .None
 	case REC_ACTOR:
 		if int(si) < len(r.stream_ids) {
-			if a, ok := decode_actor_record(body, r.stream_ids[si]); ok {
+			if a, _, ok := decode_actor_record(body, r.stream_ids[si]); ok {
 				d := r.stream_ids[si]
 				k := string(actor_key(a, r.allocator))
 				if k not_in r.kv {

@@ -272,7 +272,7 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version, owner: prim.Id)
 	if b.n == 0 {
 		return .None
 	}
-	history_register_actor(h, ractor, pseudo) or_return
+	history_register_owned_actor(h, ractor, pseudo, owner) or_return
 	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
 		return cerr
 	}

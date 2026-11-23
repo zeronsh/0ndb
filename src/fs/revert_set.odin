@@ -75,10 +75,10 @@ set_classify :: proc(data: rawptr, lv: crdt.Lv) -> crdt.Revert_Class {
 	return .In if actor in c.set else .Out
 }
 
-mount_revert_set :: proc(m: ^Mount, base: Version, actors: []prim.Id, undo: prim.Id = {}) -> (revert: prim.Id, err: Error) {
+mount_revert_set :: proc(m: ^Mount, base: Version, actors: []prim.Id, undo: prim.Id = {}, owner: prim.Id = {}) -> (revert: prim.Id, err: Error) {
 	mount_sync(m) or_return
 	h := m.history
-	revert = history_revert_set(h, m.line, base, m.synced[:], actors, undo) or_return
+	revert = history_revert_set(h, m.line, base, m.synced[:], actors, undo, owner) or_return
 	if revert == {} {
 		return
 	}
@@ -132,7 +132,7 @@ history_undo_revert :: proc(h: ^History, current: Version, undo: prim.Id) -> (re
 	return {}, false, .None
 }
 
-history_revert_set :: proc(h: ^History, line: string, base: Version, current: Version, actors: []prim.Id, undo: prim.Id = {}) -> (revert: prim.Id, err: Error) {
+history_revert_set :: proc(h: ^History, line: string, base: Version, current: Version, actors: []prim.Id, undo: prim.Id = {}, owner: prim.Id = {}) -> (revert: prim.Id, err: Error) {
 	history_ready(h) or_return
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
@@ -174,7 +174,8 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 	defer fstree.snapshot_destroy(&snap_b)
 	snap_c := version_snapshot(h, cl[:]) or_return
 	defer fstree.snapshot_destroy(&snap_c)
-	revert = history_id_new(h)
+	pseudo := history_id_new(h)
+	revert = fshist.ingestion_actor(h.self, pseudo)
 	b: Builder
 	builder_init(&b, h, revert)
 	conflicts := make([dynamic]fshist.Revert_Conflict, context.temp_allocator)
@@ -196,6 +197,7 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 		parents = current,
 		ops     = b.ops[:],
 	}
+	history_register_owned_actor(h, revert, pseudo, owner) or_return
 	if _, cerr := history_commit_local(h, &batch, line); cerr != .None {
 		return {}, cerr
 	}
