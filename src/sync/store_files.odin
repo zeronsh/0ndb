@@ -286,7 +286,7 @@ _fs_trim :: proc(data: rawptr, s: rawptr, base: i64, done: Storage_Done, ctx: ra
 		done(ctx, .Conflict, 0)
 		return
 	}
-	if base <= st.base {
+	if base < st.base || (base == st.base && (st.trimmed || base == 0)) {
 		done(ctx, .None, 0)
 		return
 	}

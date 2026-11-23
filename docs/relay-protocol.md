@@ -761,10 +761,14 @@ only), else `Refused Not_Owner`; a segment the relay does not have, or a
 dropped one, is `Refused Not_Found`; `Busy` while a write is in flight; a
 `base` at or past the length is `Refused Protocol` (a trim always leaves at
 least one byte stored, so a trimmed segment never looks device-only); a
-`base` at or below the current base changes nothing and answers `Noted` at
-once (trim never lowers `base`, and repeating one is harmless). Otherwise the
-relay raises `base`, marks the base as a trim, frees `[old base, base)` and,
-once durable, answers `Noted(id, base, length)`. Usage drops by the freed
+`base` below the current base, or equal to a base that is already a trim,
+changes nothing and answers `Noted` at once (trim never lowers `base`, and
+repeating one is harmless). Otherwise the relay raises `base`, marks the base
+as a trim, frees `[old base, base)` and, once durable, answers
+`Noted(id, base, length)`. A `base` equal to a device-held (`Hollow`) base
+frees nothing but still marks the base as a trim, durably, and sends
+`Trimmed` to every follower of the segment: the archive now covers the
+device-held prefix, so readers stop asking peers for it. Usage drops by the freed
 bytes. Trim appends no feed entry: no follower holds less afterwards, and a
 new feed word would be read as a length by version-3 clients.
 
