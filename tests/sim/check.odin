@@ -1012,6 +1012,9 @@ check_redaction :: proc(w: ^World) {
 		if p, found := disk_contains(&w.relay.disk, needle); found {
 			world_fail(w, "redaction: %s still on relay disk in %s", s, p)
 		}
+		if p, found := relay_checkpoint_contains(w, needle); found {
+			world_fail(w, "redaction: %s still in %s", s, p)
+		}
 	}
 	check_search_models(w, secrets[:], owners[:])
 	check_peer_redaction(w, secrets[:], owners[:])
@@ -1839,4 +1842,40 @@ check_own_redactions :: proc(w: ^World, n: ^Node) {
 @(init)
 _own_redaction_hooks :: proc "contextless" () {
 	register_restarted(70, check_own_redactions, false)
+}
+
+relay_checkpoint_contains :: proc(w: ^World, needle: []u8) -> (place: string, found: bool) {
+	if len(w.checkpoints) == 0 {
+		return "", false
+	}
+	files := make([dynamic]Disk_File, context.temp_allocator)
+	disk_walk(&w.relay.disk, &files)
+	for &c in w.checkpoints {
+		idx := osync.object_index(&c.scope, c.oid[:])
+		hb: [64]u8
+		head := prim.hex_encode(hb[:], idx[:1])
+		rest := prim.hex_encode(hb[head:], idx[1:])
+		suffix := fmt.tprintf("/o/%s/%s", string(hb[:head]), string(hb[head:][:rest]))
+		for f in files {
+			if !strings.has_suffix(f.path, suffix) {
+				continue
+			}
+			tree: osync.Key_Tree
+			if eng.checkpoint_tree(&c.scope, c.object.id, &tree) != .None {
+				continue
+			}
+			plain, info, err := osync.object_open(&tree, &c.scope, c.oid[:], f.data, context.temp_allocator)
+			osync.keytree_destroy(&tree)
+			if err != .None {
+				continue
+			}
+			if info.layout == .Chunked {
+				return fmt.tprintf("a chunked relay checkpoint of %s this check does not open (%s)", id_short(c.object.id), f.path), true
+			}
+			if disk_index_of(plain, needle) >= 0 {
+				return fmt.tprintf("the relay copy of %s's checkpoint (%s)", id_short(c.object.id), f.path), true
+			}
+		}
+	}
+	return "", false
 }

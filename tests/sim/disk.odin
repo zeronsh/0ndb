@@ -1720,6 +1720,10 @@ disk_contains :: proc(d: ^Disk, needle: []u8, allocator := context.temp_allocato
 
 ZSCAN_MAX :: 4 << 20
 
+disk_index_of :: proc(hay: []u8, needle: []u8) -> int {
+	return _index_of(hay, needle)
+}
+
 @(private = "file")
 _index_of :: proc(hay: []u8, needle: []u8) -> int {
 	if at := _plain_index(hay, needle); at >= 0 {

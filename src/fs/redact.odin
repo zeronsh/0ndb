@@ -25,7 +25,15 @@ Redact_Plan :: struct {
 	call: proc(data: rawptr, ranges: []journal.Range) -> Error,
 }
 
+history_redactions :: proc(h: ^History) -> u64 {
+	return h.redactions
+}
+
 history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.allocator, plan := Redact_Plan{}) -> (res: Redact_Result, err: Error) {
+	h.redactions += 1
+	defer if r := h.opts.redacted; r.call != nil {
+		r.call(r.data, res.unreached)
+	}
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
 		return {}, .No_Memory
@@ -426,6 +434,11 @@ mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: 
 
 @(private)
 apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Error {
+	h.redactions += 1
+	unreached: []odb.Unreached
+	defer if r := h.opts.redacted; r.call != nil {
+		r.call(r.data, unreached)
+	}
 	rd := prim.reader(body[1:])
 	n := prim.read_uvarint(&rd)
 	if n > u64(len(body)) {
@@ -456,9 +469,7 @@ apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Erro
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
 		_, st, _ := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
-		if r := h.opts.unreached; r.report != nil && len(st.unreached) > 0 {
-			r.report(r.data, st.unreached)
-		}
+		unreached = st.unreached
 	}
 	return .None
 }

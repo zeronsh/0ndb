@@ -64,6 +64,12 @@ Instance :: struct {
 	reserved: bool,
 }
 
+Sim_Checkpoint :: struct {
+	object: eng.Object,
+	scope:  osync.Scope,
+	oid:    [32]u8,
+}
+
 Node :: struct {
 	w:           ^World,
 	idx:         int,
@@ -74,6 +80,7 @@ Node :: struct {
 	connects:    int,
 	connect_fault: Connect_Fault,
 	persist_fail: int,
+	ckpt_window: proc(n: ^Node, e: ^eng.Engine, object: eng.Object, stage: eng.Checkpoint_Stage),
 	unavailable: int,
 	incarnation: int,
 	inst:        Instance,
@@ -217,6 +224,7 @@ World :: struct {
 	cipher:    Cipher_Watch,
 	mem_checks: u64,
 	quarantines: [dynamic]Quarantine,
+	checkpoints: [dynamic]Sim_Checkpoint,
 	promos:    [dynamic]Promo_Rec,
 	live:      [dynamic]^Live_Read,
 	bufs:      [dynamic]^Sim_Buffer,
@@ -427,6 +435,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 	w.failures = make([dynamic]string, w.allocator)
 	w.log = make([dynamic]string, w.allocator)
 	w.quarantines = make([dynamic]Quarantine, w.allocator)
+	w.checkpoints = make([dynamic]Sim_Checkpoint, w.allocator)
 	cipher_init(w)
 	w.promos = make([dynamic]Promo_Rec, w.allocator)
 	w.live = make([dynamic]^Live_Read, w.allocator)
@@ -527,6 +536,7 @@ world_destroy :: proc(w: ^World) {
 	}
 	delete(w.log)
 	delete(w.quarantines)
+	delete(w.checkpoints)
 	cipher_destroy(w)
 	for r in w.live {
 		free(r, w.allocator)
