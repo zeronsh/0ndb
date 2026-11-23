@@ -1,6 +1,7 @@
 package sim
 
 import "core:fmt"
+import "core:slice"
 
 import eng "../../src/engine"
 import "../../src/journal"
@@ -341,6 +342,8 @@ _compare_trusted :: proc(w: ^World, n: ^Node, rm: ^osync.Remote, im: ^Cipher_Ima
 }
 
 STAT_TRIMS: Stat
+STAT_TAIL: Stat
+STAT_OVER_TAIL: Stat
 STAT_TRIMMED: Stat
 STAT_RESTORES_WRITTEN: Stat
 STAT_RESTORES_READ: Stat
@@ -373,6 +376,20 @@ _archive_hooks :: proc "contextless" () {
 	register_collect(20, proc(w: ^World, res: ^Run_Result) {
 		res.stats.extra[int(STAT_TRIMS)] += w.relay.r.stats.trims
 		res.stats.extra[int(STAT_TRIMMED)] += w.relay.r.stats.trimmed
+		res.stats.extra[int(STAT_TAIL)] = u64(w.cfg.tail_window)
+		if w.cfg.tail_window <= 0 {
+			return
+		}
+		for _, im in w.cipher.images {
+			for at in im.starts {
+				if at < 0 || at + 4 > i64(len(im.data)) || !im.have[at] || !im.have[at + 3] {
+					continue
+				}
+				if i64(prim.get_u32le(im.data[at:])) + journal.OVERHEAD > w.cfg.tail_window {
+					res.stats.extra[int(STAT_OVER_TAIL)] += 1
+				}
+			}
+		}
 	})
 	register_stat_line(77)
 	STAT_TRIMS = register_stat(77, 0, "trims")
@@ -386,6 +403,8 @@ _archive_hooks :: proc "contextless" () {
 	STAT_FORGET_DEVICE = register_stat(77, 8, "forget_device_scenarios")
 	STAT_RESTORE_COLD = register_stat(77, 9, "restore_cold_reads")
 	STAT_FETCH_RATIO = register_stat(77, 10, "max_fetch_ratio_pct", true)
+	STAT_TAIL = register_stat(77, 11, "tail_window", true)
+	STAT_OVER_TAIL = register_stat(77, 12, "records_over_tail")
 }
 
 @(private = "file")
@@ -951,7 +970,19 @@ _range_add :: proc(have: ^[dynamic]journal.Range, r: journal.Range) {
 
 check_fetch_bound :: proc(w: ^World) {
 	worst: i64
-	for k, a in w.fetches {
+	keys := make([dynamic]Fetch_Key, 0, len(w.fetches), context.temp_allocator)
+	for k in w.fetches {
+		append(&keys, k)
+	}
+	slice.sort_by(keys[:], proc(a, b: Fetch_Key) -> bool {
+		if a.node != b.node {
+			return a.node < b.node
+		}
+		x, y := a.sid, b.sid
+		return string(x[:]) < string(y[:])
+	})
+	for k in keys {
+		a := w.fetches[k]
 		uniq: i64
 		for h in a.have {
 			uniq += h.to - h.from
