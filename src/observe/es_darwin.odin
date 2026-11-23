@@ -71,7 +71,7 @@ OFF_MSG_VERSION :: 0
 @(private)
 OFF_MSG_PROCESS :: 40
 @(private)
-OFF_MSG_EVENT_TYPE :: 100
+OFF_MSG_EVENT_TYPE :: 96
 @(private)
 OFF_MSG_EVENT :: 104
 @(private)
