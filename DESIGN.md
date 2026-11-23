@@ -556,6 +556,17 @@ equal in both directions.
   recovered file whose disk is not the text at that version the entry names
   the newest recovered batch whose own text the disk is, and the path is
   rematerialized; the reopen never ingests that gap as a disk change.
+  A rewind (`mount_revert(mount, before, after, owner)`, the primitive under
+  rollback and undo) commits as its own actor, one per (mount, line, owner):
+  `ingestion_actor(h.self, mount_revert_pseudo(mount, line, owner))`,
+  registered like a line actor the first time it has ops. A rewind on a held
+  path, or one not yet durable, sits in history until it is materialized,
+  like a remote change, so the mount's ingestion actor never has an op that
+  `synced` lacks and its next batch stays on one chain; the rewind actor's
+  next batch includes that actor's last op, taken from the graph. The device
+  in the outer hash is always `h.self`, never one taken from the mount or the
+  owner: a fork mount's id is the same on every device, so the device is what
+  makes the actor single-writer.
   A pin names the inode it read, and the edits go to that inode whatever
   the path holds when the write is ingested. If the inode was removed after
   the pin (and perhaps a new file created at the path), the edits are

@@ -1,8 +1,10 @@
 package fs
 
+import "core:crypto/blake2b"
 import "core:mem/virtual"
 import "core:slice"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../odb"
 import "../prim"
@@ -58,7 +60,21 @@ Revert_Edit :: struct {
 	ins:  int,
 }
 
-mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
+mount_revert_pseudo :: proc(mount: prim.Id, line: string, owner: prim.Id) -> (pseudo: prim.Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb mount revert"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	mid := mount
+	blake2b.update(&ctx, mid[:])
+	blake2b.update(&ctx, transmute([]u8)line)
+	oid := owner
+	blake2b.update(&ctx, oid[:])
+	blake2b.final(&ctx, pseudo[:])
+	return
+}
+
+mount_revert :: proc(m: ^Mount, before: Version, after: Version, owner: prim.Id) -> Error {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
 		return .No_Memory
@@ -72,6 +88,17 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	cl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, before, &bl) != .None || crdt.graph_version_lvs(&h.g, after, &al) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &cl) != .None {
 		return .Not_Found
+	}
+	pseudo := mount_revert_pseudo(m.id, m.line, owner)
+	ractor := fshist.ingestion_actor(h.self, pseudo)
+	if known := crdt.graph_known(&h.g, ractor); known > 0 {
+		if prev, pok := crdt.graph_lv(&h.g, crdt.Op_Id{ractor, known - 1}); pok {
+			one := [1]crdt.Lv{prev}
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, cl[:], one[:], &both)
+			clear(&cl)
+			append(&cl, ..both[:])
+		}
 	}
 	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
@@ -127,7 +154,7 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	snap_c := version_snapshot(h, cl[:]) or_return
 	defer fstree.snapshot_destroy(&snap_c)
 	b: Builder
-	builder_init(&b, h, m.actor)
+	builder_init(&b, h, ractor)
 	for ino in sorted_inodes(touched) {
 		ib, okb, e1 := fstree.info(&snap_b, ino, context.temp_allocator)
 		ia, oka, e2 := fstree.info(&snap_a, ino, context.temp_allocator)
@@ -245,6 +272,7 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	if b.n == 0 {
 		return .None
 	}
+	history_register_actor(h, ractor, pseudo) or_return
 	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
 		return cerr
 	}

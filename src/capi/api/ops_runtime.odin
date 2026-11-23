@@ -730,7 +730,7 @@ op_revert :: proc(c: ^Call, o: ^Out) -> Status {
 		rerr: fs.Error
 		{
 			context = eng.context_for(c.api.e)
-			rerr = fs.mount_revert(tm.mount, fs.Version(pv), fs.Version(av))
+			rerr = fs.mount_revert(tm.mount, fs.Version(pv), fs.Version(av), ob.id)
 		}
 		if rerr != .None {
 			return .Io
