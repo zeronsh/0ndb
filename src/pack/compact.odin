@@ -313,6 +313,10 @@ _shrink :: proc(p: ^Pack) {
 		delete(p.buf)
 		p.buf = make([dynamic]u8, p.allocator)
 	}
+	if !p.fl.on && len(p.fl.data) == 0 && cap(p.fl.data) > 0 {
+		delete(p.fl.data)
+		p.fl.data = make([dynamic]u8, p.allocator)
+	}
 	if cap(p.scratch) > 0 {
 		delete(p.scratch)
 		p.scratch = make([dynamic]u8, p.allocator)

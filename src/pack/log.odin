@@ -62,8 +62,40 @@ _log_spill :: proc(p: ^Pack) -> Error {
 }
 
 @(private)
+SPILL_HOLD :: 16
+
+@(private)
+_log_hand_off :: proc(p: ^Pack) -> Error {
+	if len(p.buf) == 0 {
+		return .None
+	}
+	fl := &p.fl
+	c := &p.conts[p.active]
+	if len(fl.data) == 0 {
+		fl.data, p.buf = p.buf, fl.data
+		fl.data_off = p.buf_base
+		fl.data_fd = c.fd
+		fl.data_cont = c.id
+	} else if fl.data_cont == c.id && fl.data_off + i64(len(fl.data)) == p.buf_base {
+		append(&fl.data, ..p.buf[:])
+	} else {
+		return _log_spill(p)
+	}
+	clear(&p.buf)
+	p.buf_base = fl.data_off + i64(len(fl.data))
+	c.size = p.buf_base
+	return .None
+}
+
+@(private)
+_staged :: #force_inline proc "contextless" (p: ^Pack, cont: u32, off: i64, n: i64) -> bool {
+	fl := &p.fl
+	return len(fl.data) > 0 && cont == fl.data_cont && off < fl.data_off + i64(len(fl.data)) && off + n > fl.data_off
+}
+
+@(private)
 _log_alloc :: proc(p: ^Pack, n: int) -> (pos: int, err: Error) {
-	if len(p.buf) > 0 && len(p.buf) + n > p.opts.spill {
+	if len(p.buf) > 0 && len(p.buf) + n > p.opts.spill && (!p.fl.on || len(p.buf) + n > p.opts.spill * SPILL_HOLD) {
 		_log_spill(p) or_return
 	}
 	pos = len(p.buf)
@@ -143,6 +175,19 @@ _phys_read :: proc(p: ^Pack, ph: Phys, dst: []u8) -> Error {
 			return .Io
 		}
 		copy(dst[head:], p.buf[ph.off + head - p.buf_base:][:n - head])
+		return .None
+	}
+	if _staged(p, ph.cont, ph.off, n) {
+		fl := &p.fl
+		lo := max(ph.off, fl.data_off)
+		hi := min(ph.off + n, fl.data_off + i64(len(fl.data)))
+		if lo > ph.off {
+			_phys_read(p, Phys{cont = ph.cont, off = ph.off, len = lo - ph.off}, dst[:lo - ph.off]) or_return
+		}
+		copy(dst[lo - ph.off:hi - ph.off], fl.data[lo - fl.data_off:hi - fl.data_off])
+		if hi < ph.off + n {
+			_phys_read(p, Phys{cont = ph.cont, off = hi, len = ph.off + n - hi}, dst[hi - ph.off:]) or_return
+		}
 		return .None
 	}
 	fd := _cont_fd(p, ph.cont) or_return
@@ -254,7 +299,7 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 	p.fl.crec_off = p.buf_base + i64(pos)
 	resize(&p.buf, pos)
 	start := p.group_start
-	_log_spill(p) or_return
+	_log_hand_off(p) or_return
 	p.buf_base = p.fl.crec_off + REC_HDR + COMMIT_BODY
 	p.conts[p.active].size = p.buf_base
 	c := &p.conts[p.active]
@@ -323,6 +368,7 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 			}
 		}
 	}
+	clear(&fl.data)
 	clear(&fl.fds)
 	clear(&fl.zjobs)
 	clear(&fl.syncs)
