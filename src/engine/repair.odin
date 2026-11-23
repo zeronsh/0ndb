@@ -206,6 +206,23 @@ _damage_busy :: proc(e: ^Engine, object: prim.Id, err: Error) -> Error {
 }
 
 @(private)
+_damage_read :: proc(e: ^Engine, o: Object, err: Error, ready: Ready) -> Error {
+	if (err != .Corrupt && err != .Not_Found) || !_damage_pending(e, o.id) {
+		return err
+	}
+	if ready.call == nil {
+		return .Busy
+	}
+	w := new(Waiter, e.allocator)
+	w.space = o.space
+	w.object = o.id
+	w.ready = ready
+	w.tick = e.tick
+	append(&e.waiters, w)
+	return .Pending
+}
+
+@(private)
 _damage_park :: proc(e: ^Engine, o: Object, p: ^Pending_Cmd, tries: int) -> bool {
 	if !_damage_pending(e, o.id) {
 		return false

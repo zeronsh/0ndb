@@ -1064,7 +1064,12 @@ concurrent typing is never lost or reverted.
   and resume with the restore; a command that hits it parks on the object
   until the check ends, then completes, or fails with `Corrupt` if the
   record is lost; a synchronous call answers `Busy` while the repair is
-  pending; a record found lost reports `Corrupt` on that one object while
+  pending, and so does every read (conversation status, page, window,
+  message, siblings and intents, map get and scan, text and tree reads,
+  listings and conflicts)
+  that reaches the damaged object, which waits instead when it was given a
+  ready callback, never `Not_Found` or `Corrupt` for a record the restore
+  will bring back; a record found lost reports `Corrupt` on that one object while
   every other object and space runs on. A relay that reports more of the stream than is durable
   locally, which a correct device never causes, is read back from the local
   durable length: bytes that open as this device's own sealed writes, or two

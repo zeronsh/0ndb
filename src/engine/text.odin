@@ -45,6 +45,13 @@ tree_create :: proc(e: ^Engine, space: prim.Id, title := "") -> (o: Object, err:
 
 text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
 	context = context_for(e)
+	data, err = _text_read(e, o, allocator, ready)
+	return data, _damage_read(e, o, err, ready)
+}
+
+@(private)
+_text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (data: []u8, err: Error) {
+	context = context_for(e)
 	h := _handle_get(e, o, .Text) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return nil, _pending_result(e, h, rerr, ready)
@@ -66,6 +73,13 @@ text_read :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: 
 }
 
 text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (spans: []crdt.Author_Span, err: Error) {
+	context = context_for(e)
+	spans, err = _text_spans(e, o, allocator, ready)
+	return spans, _damage_read(e, o, err, ready)
+}
+
+@(private)
+_text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (spans: []crdt.Author_Span, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .Text) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
@@ -89,6 +103,13 @@ text_spans :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready:
 }
 
 tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (data: []u8, err: Error) {
+	context = context_for(e)
+	data, err = _tree_read(e, o, path, allocator, ready, line, version)
+	return data, _damage_read(e, o, err, ready)
+}
+
+@(private)
+_tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (data: []u8, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	if rerr := _hist_ready(e, h); rerr != .None {
@@ -137,12 +158,13 @@ tree_list :: proc(e: ^Engine, o: Object, path: string, allocator := context.allo
 	for x, i in entries {
 		out[i] = _clone(x.name, allocator) or_return
 	}
-	return out, lerr
+	return out, _damage_read(e, o, lerr, ready)
 }
 
 tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, ready: Ready = {}, line := "", version: []u8 = nil) -> (entries: []Tree_Entry, err: Error) {
 	context = context_for(e)
-	return _tree_entries(e, o, path, allocator, ready, line, version, true)
+	entries, err = _tree_entries(e, o, path, allocator, ready, line, version, true)
+	return entries, _damage_read(e, o, err, ready)
 }
 
 @(private)
@@ -768,12 +790,14 @@ Tree_Conflict :: struct {
 
 tree_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
 	context = context_for(e)
-	return _conflicts(e, o, .File_Tree, allocator, ready)
+	out, err = _conflicts(e, o, .File_Tree, allocator, ready)
+	return out, _damage_read(e, o, err, ready)
 }
 
 text_conflicts :: proc(e: ^Engine, o: Object, allocator := context.allocator, ready: Ready = {}) -> (out: []Tree_Conflict, err: Error) {
 	context = context_for(e)
-	return _conflicts(e, o, .Text, allocator, ready)
+	out, err = _conflicts(e, o, .Text, allocator, ready)
+	return out, _damage_read(e, o, err, ready)
 }
 
 @(private)
