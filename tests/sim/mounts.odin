@@ -506,6 +506,15 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	if oerr != .None && oerr != .Reloading && !n.disk.dead && w.cfg.io_rate == 0 {
 		world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 	}
+	if oerr == .Reloading {
+		stat_add(w, STAT_DEFERRED_CLOSES)
+		op.status = .Failed
+		if !n.disk.dead {
+			_agent_scope_close(w, n, pa.scope)
+			_forget_scope(w, n, pa.scope)
+		}
+		return
+	}
 	err := prim.Error.Io
 	if oerr == .None {
 		n.observed += 1
@@ -781,7 +790,10 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 	}
 	if err != .None {
 		op.status = .Uncertain if err == .Io else .Failed
-		if w.cfg.io_rate > 0 {
+		if oerr == .Reloading {
+			op.status = .Failed
+			stat_add(w, STAT_DEFERRED_CLOSES)
+		} else if w.cfg.io_rate > 0 {
 			op.status = .Uncertain
 			n.restart_pending = true
 		} else {
@@ -1184,7 +1196,7 @@ op_line_switch :: proc(w: ^World, n: ^Node) {
 		}
 		obj_add_line(&w.model, sm.oi, key)
 		stat_add(w, STAT_LINE_SWITCHES)
-	} else if !n.disk.dead && !(w.cfg.io_rate > 0 && (err == .Io || err == .No_Space)) && err != .Busy {
+	} else if !n.disk.dead && !(w.cfg.io_rate > 0 && (err == .Io || err == .No_Space)) && err != .Busy && !(err == .Reloading && n.persist_outage) {
 		world_fail(w, "%s 0ndb switch to %s failed: %v", n.name, branch, err)
 	} else if !n.disk.dead && w.cfg.io_rate > 0 {
 		n.restart_pending = true
