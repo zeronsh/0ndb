@@ -78,15 +78,21 @@ _kwait_head_landed :: proc(r: ^Replicator, head: ^Remote) {
 
 @(private)
 _kwait_keys_landed :: proc(r: ^Replicator, ks: ^Remote) {
-	if !ks.kfollow || ks.is_head || journal.replica_length(&ks.rep) <= 0 {
+	if ks.is_head || journal.replica_length(&ks.rep) <= 0 {
 		return
 	}
 	for id in _sorted_ids(r.remotes) {
 		rm, ok := r.remotes[id]
-		if !ok || !rm.keys_wait || rm.kwait_head == {} {
+		if !ok || !rm.keys_wait || rm.device != ks.device || rm.is_head || _is_keys_name(rm.name) {
 			continue
 		}
+		waits := false
 		if head, hok := r.remotes[rm.kwait_head]; hok && head.kstream == ks.id {
+			waits = true
+		} else if kn, kerr := keys_stream_name(rm.name); kerr == .None && kn == ks.name {
+			waits = true
+		}
+		if waits {
 			_emit(r, Repl_Event{kind = .Keys_Needed, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
 		}
 	}

@@ -2164,7 +2164,7 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 	}
 	if rm.is_head && rm.kfollow {
 		_kwait_head_landed(r, rm)
-	} else if rm.kfollow {
+	} else if rm.kfollow || _is_keys_name(rm.name) {
 		_kwait_keys_landed(r, rm)
 	}
 	if _following(rm) && r.rx_at > r.rx_start && !rm.quarantined {
