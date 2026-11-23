@@ -235,10 +235,15 @@ mount_restore :: proc(m: ^Mount, target: Version) -> Error {
 	}
 	before := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
 	copy(before, m.synced[:])
-	builder_commit(m, &b) or_return
+	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
+		return cerr
+	}
 	clear(&m.synced)
 	append(&m.synced, ..before)
-	return mount_materialize(m)
+	if merr := mount_materialize(m); merr != .Reloading {
+		return merr
+	}
+	return .None
 }
 
 git_restore :: proc(m: ^Mount, branch: string, commit: string, spawner: Spawner, thread: prim.Id) -> Error {
