@@ -146,15 +146,13 @@ _ck_step :: proc(w: ^World, n: ^Node) {
 }
 
 check_odb_intact :: proc(w: ^World, n: ^Node) {
-	if !n.alive || n.disk.dead || !n.e_open {
+	if !n.alive || n.disk.dead || !n.e_open || !n.e.db_open {
 		return
 	}
 	context = instance_context(&n.inst)
-	defer node_after(n)
-	db, derr := eng.device_odb(&n.e)
-	if derr != .None {
-		return
-	}
+	n.disk.probe += 1
+	defer n.disk.probe -= 1
+	db := &n.e.db
 	root := odb.primary_dir(db)
 	if root == "" {
 		return
