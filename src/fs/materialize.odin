@@ -977,6 +977,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		if pe, found := shadow_get(&m.shadow, up) or_return; !found || pe.kind != .Dir || pe.inode != it.parent {
 			mat_raced(m)
 			mount_reshow_add(m, it.path)
+			mount_reshow_add(m, up)
 			return .None
 		}
 	}
