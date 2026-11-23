@@ -1,5 +1,6 @@
 package sim
 
+import "core:fmt"
 import "core:strings"
 import eng "../../src/engine"
 import "../../src/fs"
@@ -20,6 +21,7 @@ Tm_Record :: struct {
 	file:  [dynamic]string,
 	other: [dynamic]string,
 	what:  string,
+	line:  string,
 }
 
 Tm_World :: struct {
@@ -75,6 +77,7 @@ _tm_destroy :: proc(w: ^World) {
 		delete(r.file)
 		delete(r.other)
 		delete(r.what, w.allocator)
+		delete(r.line, w.allocator)
 	}
 	delete(_tm.records)
 	free(_tm, w.allocator)
@@ -208,6 +211,8 @@ _rename :: proc(w: ^World, n: ^Node, sm: Sim_Mount, from: string, to: string) ->
 	if _kind(n, dst) == .File {
 		rop = new_op(m, .Tree_Remove, n, sm.oi)
 		rop.path = strings.clone(to, w.allocator)
+		delete(rop.line, w.allocator)
+		rop.line = strings.clone(_line(n, sm), w.allocator)
 		for t in _tokens(n, dst) {
 			append(&rop.deletes, strings.clone(t, w.allocator))
 		}
@@ -261,6 +266,8 @@ _write :: proc(w: ^World, n: ^Node, sm: Sim_Mount, rel: string, append_to: bool,
 	}
 	op = new_op(m, .Disk_Person, n, sm.oi)
 	op.path = strings.clone(rel, w.allocator)
+	delete(op.line, w.allocator)
+	op.line = strings.clone(_line(n, sm), w.allocator)
 	for _ in 0 ..< count {
 		tok := new_token(m, n, "p")
 		append(&op.tokens, tok)
@@ -295,6 +302,8 @@ _rmtree :: proc(w: ^World, n: ^Node, sm: Sim_Mount, rel: string) {
 	for f in files {
 		op := new_op(m, .Tree_Remove, n, sm.oi)
 		op.path = strings.clone(f[len(sm.root) + 1:], w.allocator)
+		delete(op.line, w.allocator)
+		op.line = strings.clone(_line(n, sm), w.allocator)
 		for t in _tokens(n, f) {
 			append(&op.deletes, strings.clone(t, w.allocator))
 		}
@@ -405,11 +414,20 @@ _dir_file :: proc(w: ^World, n: ^Node, sm: Sim_Mount, dir: string, also: ^Node =
 }
 
 @(private = "file")
-_record :: proc(w: ^World, kind: Tm_Kind, oi: int, file: []string, other: []string, what: string) {
+_line :: proc(n: ^Node, sm: Sim_Mount) -> string {
+	return mount_model_line(sm.m, disk_vfs(&n.disk), sm.root)
+}
+
+@(private = "file")
+_record :: proc(w: ^World, kind: Tm_Kind, oi: int, file: []string, other: []string, what: string, a: ^Node, asm_: Sim_Mount, b: ^Node, bsm: Sim_Mount) {
 	if _tm == nil {
 		return
 	}
-	r := Tm_Record{kind = kind, obj = oi, file = make([dynamic]string, w.allocator), other = make([dynamic]string, w.allocator), what = strings.clone(what, w.allocator)}
+	line := _line(a, asm_)
+	if line != _line(b, bsm) {
+		return
+	}
+	r := Tm_Record{kind = kind, obj = oi, file = make([dynamic]string, w.allocator), other = make([dynamic]string, w.allocator), what = strings.clone(what, w.allocator), line = strings.clone(line, w.allocator)}
 	for t in file {
 		append(&r.file, strings.clone(t, w.allocator))
 	}
@@ -554,7 +572,7 @@ _pair_shape :: proc(w: ^World, shape: int, a: ^Node, asm_: Sim_Mount, b: ^Node, 
 		rb := ra && b.alive && _rename(w, b, bsm, from, y)
 		context = instance_context(&a.inst)
 		if ra && rb {
-			_record(w, .One_Name, asm_.oi, toks, nil, strings.concatenate({oid, "/", from, " -> ", x, " | ", y}, context.temp_allocator))
+			_record(w, .One_Name, asm_.oi, toks, nil, strings.concatenate({oid, "/", from, " -> ", x, " | ", y}, context.temp_allocator), a, asm_, b, bsm)
 			stat_add(w, STAT_TM_NAMES)
 		}
 	case 4:
@@ -624,7 +642,7 @@ _pair_shape :: proc(w: ^World, shape: int, a: ^Node, asm_: Sim_Mount, b: ^Node, 
 		}
 		context = instance_context(&a.inst)
 		if eok {
-			_record(w, .Edit_Follows, asm_.oi, toks, eop.tokens[:], strings.concatenate({oid, "/", from, " -> ", to}, context.temp_allocator))
+			_record(w, .Edit_Follows, asm_.oi, toks, eop.tokens[:], strings.concatenate({oid, "/", from, " -> ", to}, context.temp_allocator), a, asm_, b, bsm)
 			stat_add(w, STAT_TM_EDIT)
 		}
 	case 7:
@@ -651,7 +669,7 @@ _pair_shape :: proc(w: ^World, shape: int, a: ^Node, asm_: Sim_Mount, b: ^Node, 
 		}
 		context = instance_context(&a.inst)
 		if eok {
-			_record(w, .Replaced_Edit, asm_.oi, toks, eop.tokens[:], strings.concatenate({oid, "/", src, " onto ", target}, context.temp_allocator))
+			_record(w, .Replaced_Edit, asm_.oi, toks, eop.tokens[:], strings.concatenate({oid, "/", src, " onto ", target}, context.temp_allocator), a, asm_, b, bsm)
 			stat_add(w, STAT_TM_REPLACE)
 		}
 	}
@@ -692,11 +710,11 @@ _holders :: proc(files: map[string][]string, toks: []string) -> []string {
 }
 
 @(private = "file")
-_files :: proc(n: ^Node, o: eng.Object) -> map[string][]string {
+_files :: proc(n: ^Node, o: eng.Object, line: string) -> map[string][]string {
 	out := make(map[string][]string, context.temp_allocator)
-	files, _ := tree_walk(n, o)
+	files, _ := tree_walk(n, o, {}, line_eng(line))
 	for f in files {
-		data, err := eng.tree_read(&n.e, o, f, context.temp_allocator)
+		data, err := eng.tree_read(&n.e, o, f, context.temp_allocator, {}, line_eng(line))
 		if err != .None {
 			continue
 		}
@@ -710,14 +728,14 @@ _files :: proc(n: ^Node, o: eng.Object) -> map[string][]string {
 }
 
 @(private = "file")
-_authors_kept :: proc(w: ^World, n: ^Node, oi: int, file: string, toks: []string, what: string) {
+_authors_kept :: proc(w: ^World, n: ^Node, oi: int, file: string, toks: []string, what: string, line: string) {
 	m := &w.model
 	o := m.objs[oi].o
-	data, err := eng.tree_read(&n.e, o, file, context.temp_allocator)
+	data, err := eng.tree_read(&n.e, o, file, context.temp_allocator, {}, line_eng(line))
 	if err != .None {
 		return
 	}
-	_, raw, _ := eng.tree_blame(&n.e, o, file, context.temp_allocator)
+	_, raw, _ := eng.tree_blame(&n.e, o, file, context.temp_allocator, line_eng(line))
 	spans := make([]crdt_span, len(raw), context.temp_allocator)
 	for x, i in raw {
 		spans[i] = crdt_span{actor = x.id.actor, len = x.len}
@@ -757,15 +775,16 @@ check_tree_moves :: proc(w: ^World) {
 			continue
 		}
 		context = instance_context(&n.inst)
-		seen := make(map[int]map[string][]string, context.temp_allocator)
+		seen := make(map[string]map[string][]string, context.temp_allocator)
 		for r in _tm.records {
 			if _gone(m, r.obj, r.file[:]) || _gone(m, r.obj, r.other[:]) {
 				continue
 			}
-			files, ok := seen[r.obj]
+			key := fmt.tprintf("%d|%s", r.obj, r.line)
+			files, ok := seen[key]
 			if !ok {
-				files = _files(n, m.objs[r.obj].o)
-				seen[r.obj] = files
+				files = _files(n, m.objs[r.obj].o, r.line)
+				seen[key] = files
 			}
 			held := _holders(files, r.file[:])
 			switch r.kind {
@@ -784,7 +803,7 @@ check_tree_moves :: proc(w: ^World) {
 					world_fail(w, "tree move: an edit of a file replaced by a rename (%s) did not merge into the file that replaced it, %s, on %s (edit in %v)", r.what, held[0], n.name, edit)
 				}
 				if len(held) == 1 {
-					_authors_kept(w, n, r.obj, held[0], r.file[:], r.what)
+					_authors_kept(w, n, r.obj, held[0], r.file[:], r.what, r.line)
 				}
 			}
 		}
