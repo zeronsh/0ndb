@@ -150,18 +150,29 @@ _grants_rewrap :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 		return
 	}
 	tag := osync.epoch_tag(cur.number, cur.id)
+	at := Grant_At{order = u32(m.roster.epochs[ei].order), view = u32(len(m.roster.order))}
+	for ep, i in m.roster.epochs {
+		at.tie ||= i != ei && ep.number == cur.number
+	}
 	for &x in m.roster.members {
 		if x.kind != .Guest || len(x.scope) == 0 || !osync.member_active(&x, now) {
 			continue
 		}
 		for object in x.scope {
-			_grantkeys_wrap(e, sp, object, osync.identity_of(x.sign, x.box), tag, cur)
+			_grantkeys_wrap(e, sp, object, osync.identity_of(x.sign, x.box), tag, cur, at)
 		}
 	}
 }
 
 @(private)
-_grantkeys_wrap :: proc(e: ^Engine, sp: ^Space, object: prim.Id, grantee: osync.Identity, tag: osync.Epoch_Tag, cur: ^osync.Epoch_Keys) {
+Grant_At :: struct {
+	order: u32,
+	view:  u32,
+	tie:   bool,
+}
+
+@(private)
+_grantkeys_wrap :: proc(e: ^Engine, sp: ^Space, object: prim.Id, grantee: osync.Identity, tag: osync.Epoch_Tag, cur: ^osync.Epoch_Keys, at: Grant_At) {
 	path, perr := _grantkeys_path(e, sp.id, object)
 	if perr != .None || prim.mkdir_all(e.vfs, prim.dir_name(path), 0o700) != .None {
 		return
@@ -181,7 +192,7 @@ _grantkeys_wrap :: proc(e: ^Engine, sp: ^Space, object: prim.Id, grantee: osync.
 			}
 			pos = next
 			gw: osync.Grant_Wrap
-			if osync.grant_wrap_decode(body, &gw) == .None && gw.grantee == grantee.sign && gw.tag == tag {
+			if osync.grant_wrap_decode(body, &gw) == .None && gw.grantee == grantee.sign && gw.tag == tag && (!at.tie || gw.view >= at.view) {
 				journal.reader_close(&rd)
 				return
 			}
@@ -192,7 +203,7 @@ _grantkeys_wrap :: proc(e: ^Engine, sp: ^Space, object: prim.Id, grantee: osync.
 	key := osync.object_epoch_key(&cur.secret, cur.number, o[:])
 	defer crypto.zero_explicit(&key, size_of(key))
 	body := make([dynamic]u8, context.temp_allocator)
-	if osync.grant_wrap_encode(grantee, object, tag, cur.number, key, &body, e.cfg.random) != .None {
+	if osync.grant_wrap_encode(grantee, object, tag, cur.number, at.order, at.view, key, &body, e.cfg.random) != .None {
 		return
 	}
 	if _, aerr := journal.journal_append(&j, body[:]); aerr != .None {
@@ -324,7 +335,7 @@ _grantkeys_read :: proc(e: ^Engine, sp: ^Space, device: prim.Id, object: prim.Id
 		known := false
 		if g, ok := sp.grant_epochs[object]; ok {
 			for x in g {
-				if x.tag == gw.tag {
+				if x.tag == gw.tag && x.view >= gw.view {
 					known = true
 				}
 			}
@@ -336,7 +347,7 @@ _grantkeys_read :: proc(e: ^Engine, sp: ^Space, device: prim.Id, object: prim.Id
 		if oerr != .None {
 			continue
 		}
-		if _grant_epoch_append(e, sp, object, gw.tag, number, key) {
+		if _grant_epoch_append(e, sp, object, Space_Epoch{number = number, order = gw.order, view = gw.view, tag = gw.tag, secret = key}) {
 			gained = true
 		}
 		crypto.zero_explicit(&key, size_of(key))
@@ -349,13 +360,13 @@ _grantkeys_read :: proc(e: ^Engine, sp: ^Space, device: prim.Id, object: prim.Id
 }
 
 @(private)
-_grant_epoch_append :: proc(e: ^Engine, sp: ^Space, object: prim.Id, tag: osync.Epoch_Tag, number: u32, key: [32]u8) -> bool {
+_grant_epoch_append :: proc(e: ^Engine, sp: ^Space, object: prim.Id, x: Space_Epoch) -> bool {
 	path, perr := _grant_epochs_path(e, sp.id, object)
 	if perr != .None || prim.mkdir_all(e.vfs, prim.dir_name(path), 0o700) != .None {
 		return false
 	}
 	old, _ := prim.read_file(e.vfs, path, context.temp_allocator)
-	ck := osync.Content_Key{key = key, epoch = number}
+	ck := osync.Content_Key{key = x.secret, epoch = x.number}
 	defer crypto.zero_explicit(&ck, size_of(ck))
 	wrapped: [osync.WRAP_LEN]u8
 	self := e.identity
@@ -364,9 +375,7 @@ _grant_epoch_append :: proc(e: ^Engine, sp: ^Space, object: prim.Id, tag: osync.
 	}
 	buf := make([dynamic]u8, context.temp_allocator)
 	append(&buf, ..old)
-	t := tag
-	append(&buf, ..t[:])
-	append(&buf, ..wrapped[:])
+	_grant_entry_put(&buf, x.tag, x.order, x.view, wrapped[:])
 	return prim.replace_atomic(e.vfs, path, buf[:]) == .None
 }
 

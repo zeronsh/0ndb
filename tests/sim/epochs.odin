@@ -48,6 +48,7 @@ check_epochs :: proc(w: ^World) {
 		node_after(n)
 	}
 	context = w.ctx
+	current := make(map[prim.Id]osync.Epoch_Tag, context.temp_allocator)
 	for space, list in views {
 		most := 0
 		for v in list {
@@ -60,11 +61,32 @@ check_epochs :: proc(w: ^World) {
 			}
 			if first < 0 {
 				first = i
+				current[space] = v.tag
 				continue
 			}
 			if v.tag != list[first].tag {
 				world_fail(w, "epochs: space %s: %s and %s hold the same %d membership records but resolve different current epochs %x and %x", id_short(space), list[first].node.name, v.node.name, most, list[first].tag, v.tag)
 			}
 		}
+	}
+	for n in w.nodes {
+		if !n.alive || !n.e_open {
+			continue
+		}
+		context = instance_context(&n.inst)
+		for g in eng.grant_picks(&n.e, context.temp_allocator) {
+			cur, ok := current[g.space]
+			if !ok {
+				continue
+			}
+			held := false
+			for t in g.tags {
+				held ||= t == cur
+			}
+			if held && g.pick != cur {
+				world_fail(w, "epochs: %s picks epoch %x for its grant of %s in space %s, the roster's current is %x", n.name, g.pick, id_short(g.object), id_short(g.space), cur)
+			}
+		}
+		node_after(n)
 	}
 }
