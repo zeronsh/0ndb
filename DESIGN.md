@@ -2571,7 +2571,9 @@ Relay cost tracks the reachable information, not the activity. Items marked
   resumed through `Relay_Storage.on_ready`, concurrent reads of a 256 KiB
   block share one request), `sendfile` is refused there, and a
   redaction reaching below it first restores the range into the pack from
-  the objects, lowers the watermark durably, then redacts as before. A
+  the objects (a failed object read is retried, up to three fetches, before
+  the redaction is refused), lowers the watermark durably, then redacts as
+  before. A
   redaction is acknowledged only once a `Redacting` record naming its range
   is durable in the manifest; once every batch object holding the range is
   rewritten (the rewrite's GET and PUT are asynchronous, serialized per
