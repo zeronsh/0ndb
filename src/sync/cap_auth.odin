@@ -1,5 +1,6 @@
 package osync
 
+import "../arc"
 import "base:runtime"
 import "core:crypto/blake2b"
 import "../prim"
@@ -91,6 +92,8 @@ Cap_Class :: enum u8 {
 	Checkpoint,
 	Card,
 	Grant_Keys,
+	Archive,
+	Restore,
 }
 
 Cap_Slot :: struct {
@@ -268,11 +271,14 @@ _cap_grant_new :: proc(a: ^Cap_Authorizer, toks: []Cap_Token, key: [32]u8) -> ^C
 		sc.name_key = t.name_key
 		name := object_segment_name(t.kind, t.object)
 		cn := _cap_concat(CHECKPOINT_STREAM, name)
+		an := _cap_concat(arc.STREAM_PREFIX, name)
 		for ep in 0 ..= CAP_PROBE_EPOCHS {
 			_cap_put(g, stream_suffix(&sc, name, u64(ep)), .Segment, t.access)
 			_cap_put(g, stream_suffix(&sc, CARD_STREAM, u64(ep)), .Card, t.access)
 			_cap_put(g, stream_suffix(&sc, cn, u64(ep)), .Checkpoint, t.access)
+			_cap_put(g, stream_suffix(&sc, an, u64(ep)), .Archive, t.access)
 		}
+		_cap_put(g, stream_suffix(&sc, _cap_concat(arc.RESTORE_PREFIX, name), 0), .Restore, t.access)
 		kn := _cap_concat(KEYS_STREAM, name)
 		for ep in 0 ..< CAP_KEYS_EPOCHS + CAP_PROBE_EPOCHS {
 			_cap_put(g, stream_suffix(&sc, kn, u64(ep)), .Keys, t.access)
