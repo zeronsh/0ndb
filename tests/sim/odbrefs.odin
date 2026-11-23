@@ -87,7 +87,10 @@ disk_blob_sync_crash :: proc(d: ^Disk, path: string) -> bool {
 _odbrefs_world :: proc(w: ^World) {
 	for n in w.nodes {
 		if rng_chance(&w.rng, 1, 4) {
-			n.disk.blob_crash = u64(1 + rng_int(&w.rng, 4))
+			k := u64(1 + rng_int(&w.rng, 4))
+			if w.cfg.crash_rate > 0 {
+				n.disk.blob_crash = k
+			}
 		}
 	}
 }
