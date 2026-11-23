@@ -2051,6 +2051,7 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	recovered := false
 	ends := make([dynamic]crdt.Lv, context.temp_allocator)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	by_intent := make([dynamic]Recovered_Intent, context.temp_allocator)
 	lost := make([dynamic]Lost_Range, context.temp_allocator)
 	have := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &have) != .None {
@@ -2070,6 +2071,9 @@ mount_recover :: proc(m: ^Mount) -> Error {
 		recovered = true
 		if end, known := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq + it.n - 1}); known {
 			append(&ends, end)
+			own := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+			spans_touched(h, spans, &own) or_return
+			append(&by_intent, Recovered_Intent{end = crdt.Op_Id{it.actor, it.seq + it.n - 1}, touched = own})
 		}
 	}
 	if len(lost) > 0 {
@@ -2103,7 +2107,11 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			if had && old != p {
 				shadow_remove(&m.shadow, old) or_return
 			}
-			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
+			e := Entry{inode = ino, kind = info.kind}
+			if info.kind == .File {
+				recover_at(m, &e, p, ino, target, by_intent[:]) or_return
+			}
+			shadow_put(&m.shadow, p, e) or_return
 		}
 		if len(ends) > 0 {
 			v := crdt.graph_version_ids(&h.g, target, context.temp_allocator)
@@ -2114,6 +2122,46 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	m.jpend = mount_jlen(m)
 	history_trim(h)
 	return mount_settle(m)
+}
+
+@(private)
+Recovered_Intent :: struct {
+	end:     crdt.Op_Id,
+	touched: map[fstree.Inode_Id]bool,
+}
+
+@(private)
+recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target: []crdt.Lv, intents: []Recovered_Intent) -> Error {
+	h := m.history
+	d := probe(m, p) or_return
+	if d.kind != .File {
+		return .None
+	}
+	data, oid, binary, ok := read_content(m, p, d.stat, ino, true) or_return
+	if !ok || binary || .Opaque in tree_flags(h, ino) {
+		return .None
+	}
+	want := history_text_at(h, ino, crdt.graph_version_ids(&h.g, target, context.temp_allocator), context.temp_allocator) or_return
+	if string(want) == string(data) {
+		return .None
+	}
+	#reverse for it in intents {
+		if !it.touched[ino] {
+			continue
+		}
+		at := [1]crdt.Op_Id{it.end}
+		t, terr := history_text_at(h, ino, at[:], context.temp_allocator)
+		if terr != .None || string(t) != string(data) {
+			continue
+		}
+		e.stat = d.stat
+		e.oid = oid
+		e.at = op_inode(h, it.end)
+		e.has_at = true
+		mount_reshow_add(m, p)
+		return .None
+	}
+	return .None
 }
 
 note_unwatched :: proc(m: ^Mount, rel: string) {
