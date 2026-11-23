@@ -916,7 +916,7 @@ _tick_pending :: proc(e: ^Engine) -> bool {
 		}
 	}
 	for h in e.lru {
-		if h.local {
+		if h.local && e.storage_short == .None {
 			return true
 		}
 	}
