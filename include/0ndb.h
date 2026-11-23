@@ -291,7 +291,11 @@
  *                 sorted non-overlapping edits against the client's text at
  *                 rev plus its earlier edits, returns ack and rev, and
  *                 fails with conflict once rev is too old to transform
- *                 (reopen). Every delta the edit was transformed over is
+ *                 (reopen). Every pos and pos + del must fall on a code
+ *                 point boundary in the buffer's units (never inside a
+ *                 UTF-8 sequence, never between the two halves of a UTF-16
+ *                 surrogate pair); an edit that splits a code point fails
+ *                 with invalid and changes nothing. Every delta the edit was transformed over is
  *                 delivered before its result, so the result's rev never
  *                 exceeds the deltas a client has received and either ack
  *                 source may drop acknowledged edits.
