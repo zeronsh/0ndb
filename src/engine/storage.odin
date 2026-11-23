@@ -197,6 +197,7 @@ object_promote_run :: proc(e: ^Engine, o: Object, msg: Rid = {}) -> Error {
 		return .Not_Found
 	}
 	froms := make(map[prim.Id]i64, context.temp_allocator)
+	held := false
 	#partial switch rec.kind {
 	case .Conversation:
 		if !obj.rid_none(msg) && _convo_needed(e, o, msg, &froms) != .None {
@@ -212,6 +213,7 @@ object_promote_run :: proc(e: ^Engine, o: Object, msg: Rid = {}) -> Error {
 		}
 	case .File_Tree, .Text:
 		if h, ok := e.handles[o.id]; ok && h.w_open && h.hist != nil && h.sp.repl_on {
+			held = _storage_class(e, h.sp, h.id, h.kind) == .Device
 			n := _own_len(h)
 			last, prev, had := _ckpt_get(e, h.id)
 			if !had || last < n {
@@ -221,7 +223,9 @@ object_promote_run :: proc(e: ^Engine, o: Object, msg: Rid = {}) -> Error {
 			}
 			if l2, _, ok2 := _ckpt_get(e, h.id); ok2 && l2 > 0 {
 				froms[e.self] = l2
-				_content_mark_put(e, h.sp.id, h.id, h.kind, min(_content_mark_get(e, h.sp, h.id), l2))
+				if held {
+					_content_mark_put(e, h.sp.id, h.id, h.kind, min(_content_mark_get(e, h.sp, h.id), l2))
+				}
 			}
 		}
 	}
@@ -229,7 +233,7 @@ object_promote_run :: proc(e: ^Engine, o: Object, msg: Rid = {}) -> Error {
 	if err == .None && (rec.kind == .File_Tree || rec.kind == .Text) {
 		_catalog_flush(e)
 		if h, ok := e.handles[o.id]; ok && h.w_open {
-			if mark, has := froms[e.self]; has {
+			if mark, has := froms[e.self]; has && held {
 				_content_mark_put(e, h.sp.id, h.id, h.kind, mark)
 			}
 			_content_publish(e, h)
