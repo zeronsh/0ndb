@@ -19,6 +19,7 @@ Staged :: struct {
 	installed: bool,
 	taken:     bool,
 	retired:   bool,
+	owed:      bool,
 }
 
 Install :: struct {
@@ -28,6 +29,7 @@ Install :: struct {
 	dirs:  []string,
 	roots: [2]string,
 	nsync: u64,
+	owed:  bool,
 }
 
 @(private)
@@ -173,17 +175,20 @@ install_free :: proc(b: ^Install) {
 install_run :: proc(b: ^Install) -> Error {
 	db := b.db
 	files := make([dynamic]string, 0, len(b.items) * 2 + len(b.files), db.allocator)
+	owed := make([dynamic]string, 0, len(b.items) * 2, db.allocator)
 	dirs := make([dynamic]string, 0, len(b.items) + len(b.dirs) + 1, db.allocator)
 	defer delete(files)
+	defer delete(owed)
 	defer delete(dirs)
 	loose := false
 	sync.mutex_lock(&db.mutex)
 	for s in b.items {
 		if !s.installed {
+			list := &owed if s.owed else &files
 			if s.pack {
-				append(&files, s.data)
+				append(list, s.data)
 			}
-			append(&files, s.tmp)
+			append(list, s.tmp)
 		}
 		append(&dirs, s.fan)
 		loose = loose || !s.pack
@@ -200,10 +205,34 @@ install_run :: proc(b: ^Install) -> Error {
 	ud := distinct_sorted(dirs[:], db.allocator)
 	defer delete(uf, db.allocator)
 	defer delete(ud, db.allocator)
-	b.nsync = u64(len(uf) + len(ud))
-	sync_paths(db, uf, nil, b.roots[:], true) or_return
+	b.nsync = u64(len(uf) + len(ud) + len(owed))
+	if err := install_sync(b, owed[:], uf); err != .None {
+		install_owe(b)
+		return err
+	}
 	install_rename(b) or_return
 	return sync_paths(db, nil, ud, b.roots[:])
+}
+
+@(private)
+install_sync :: proc(b: ^Install, owed, files: []string) -> Error {
+	for f in owed {
+		perr(prim.resync_file(b.db.vfs, f, true)) or_return
+	}
+	return sync_paths(b.db, files, nil, b.roots[:], true)
+}
+
+@(private)
+install_owe :: proc(b: ^Install) {
+	db := b.db
+	sync.mutex_lock(&db.mutex)
+	defer sync.mutex_unlock(&db.mutex)
+	for s in b.items {
+		if !s.installed {
+			s.owed = true
+		}
+	}
+	b.owed = true
 }
 
 @(private)
@@ -244,8 +273,12 @@ install_done :: proc(b: ^Install, ok: bool) {
 	}
 	install_compact(db)
 	if !ok {
-		for f in b.files {
-			track_locked(db, f)
+		if b.owed {
+			owe_files_locked(db, b.files)
+		} else {
+			for f in b.files {
+				track_locked(db, f)
+			}
 		}
 		for d in b.dirs {
 			track_locked(db, "", d)

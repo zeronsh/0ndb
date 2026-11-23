@@ -7,6 +7,7 @@ import "../../src/odb"
 
 STAT_OWN_REFS: Stat
 STAT_BLOB_CRASHES: Stat
+STAT_TMP_SYNC_FAILS: Stat
 
 @(init)
 _odbrefs_init :: proc "contextless" () {
@@ -16,6 +17,7 @@ _odbrefs_init :: proc "contextless" () {
 	register_stat_line(62, "own_refs")
 	STAT_OWN_REFS = register_stat(62, 0, "checked")
 	STAT_BLOB_CRASHES = register_stat(62, 1, "crashes_after_blob_sync")
+	STAT_TMP_SYNC_FAILS = register_stat(62, 3, "failed_temp_syncs")
 }
 
 check_own_refs :: proc(w: ^World, n: ^Node) {
@@ -89,6 +91,9 @@ _odbrefs_world :: proc(w: ^World) {
 			k := u64(1 + rng_int(&w.rng, 4))
 			if w.cfg.crash_rate > 0 {
 				n.disk.blob_crash = k
+				if w.cfg.io_rate > 0 {
+					n.disk.tmp_fail = 1
+				}
 			}
 		}
 	}
@@ -98,5 +103,6 @@ _odbrefs_world :: proc(w: ^World) {
 _odbrefs_collect :: proc(w: ^World, res: ^Run_Result) {
 	for n in w.nodes {
 		res.stats.extra[int(STAT_BLOB_CRASHES)] += n.disk.blob_crashes
+		res.stats.extra[int(STAT_TMP_SYNC_FAILS)] += n.disk.tmp_fails
 	}
 }

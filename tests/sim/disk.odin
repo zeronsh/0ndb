@@ -123,6 +123,8 @@ Disk :: struct {
 	blob_crashes: u64,
 	blob_ckpt: bool,
 	blob_ckpt_crashes: u64,
+	tmp_fail:  u64,
+	tmp_fails: u64,
 	force_ghost: bool,
 	ghost_root:  string,
 	fail_unlink: string,
@@ -810,7 +812,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return err
 	}
 	owned := len(d.ghost_root) > 0 && strings.has_prefix(of.path, d.ghost_root) && (len(of.path) == len(d.ghost_root) || of.path[len(d.ghost_root)] == '/')
-	if d.fail_sync > 0 || _inject_fd(d, fd, false) != .None {
+	if d.fail_sync > 0 || _inject_fd(d, fd, false) != .None || _tmp_sync_fail(d, n, of.path) {
 		if d.fail_sync > 0 {
 			d.fail_sync -= 1
 		}
@@ -874,6 +876,19 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	_pend_drop(d, n)
 	clear(&n.pend)
 	return .None
+}
+
+@(private = "file")
+_tmp_sync_fail :: proc(d: ^Disk, n: ^Inode, path: string) -> bool {
+	if d.tmp_fail == 0 || d.probe > 0 || n.kind != .File || len(n.pend) == 0 {
+		return false
+	}
+	if !strings.contains(path, "/objects/objects/tmp_obj_") && !strings.contains(path, "/objects/pack/tmp_") {
+		return false
+	}
+	d.tmp_fail -= 1
+	d.tmp_fails += 1
+	return true
 }
 
 @(private = "file")
