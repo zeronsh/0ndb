@@ -214,7 +214,7 @@ _keys_late :: proc(w: ^World, head_late: bool) {
 	found := false
 	for i := 0; i < 60 && !found; i += 1 {
 		context = instance_context(&b.inst)
-		_, f, cerr := eng.catalog_get(&b.e, text, context.temp_allocator)
+		_, f, _ := eng.catalog_get(&b.e, text, context.temp_allocator)
 		node_after(b)
 		found = f
 		if !found {
