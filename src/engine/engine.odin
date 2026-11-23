@@ -1002,14 +1002,14 @@ _teardown :: proc(e: ^Engine) {
 	_account_close(e)
 	_spaces_close_all(e)
 	_trees_free_all(e)
-	if e.db_open {
-		odb.close(&e.db)
-		e.db_open = false
-	}
 	_registry_close(e)
 	if e.pk_open {
 		pack.close(&e.pk)
 		e.pk_open = false
+	}
+	if e.db_open {
+		odb.close(&e.db)
+		e.db_open = false
 	}
 	if e.owns_keyring {
 		osync.file_keyring_close(&e.file_keyring)

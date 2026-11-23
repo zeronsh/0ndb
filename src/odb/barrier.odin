@@ -47,7 +47,77 @@ track_tree :: proc(db: ^Odb, file: string, base: string, created: bool) {
 	}
 }
 
+barrier_soft :: proc(db: ^Odb) -> Error {
+	if db.deferred {
+		return .None
+	}
+	return barrier(db)
+}
+
+take_pending :: proc(db: ^Odb, allocator := context.temp_allocator) -> (files: []string, dirs: []string, err: Error) {
+	sync.mutex_lock(&db.mutex)
+	pf := db.pending_files
+	pd := db.pending_dirs
+	owed := db.owed_files
+	db.pending_files = make([dynamic]string, db.allocator)
+	db.pending_dirs = make([dynamic]string, db.allocator)
+	db.owed_files = make([dynamic]string, db.allocator)
+	sync.mutex_unlock(&db.mutex)
+	defer {
+		for s in pf {
+			delete(s, db.allocator)
+		}
+		for s in pd {
+			delete(s, db.allocator)
+		}
+		for s in owed {
+			delete(s, db.allocator)
+		}
+		delete(pf)
+		delete(pd)
+		delete(owed)
+	}
+	slice.sort(pf[:])
+	slice.sort(pd[:])
+	slice.sort(owed[:])
+	uo := distinct_sorted(owed[:], context.temp_allocator)
+	for f, i in uo {
+		if e := prim.resync_file(db.vfs, f, true); e != .None && e != .Not_Found {
+			sync.mutex_lock(&db.mutex)
+			for g in uo[i:] {
+				if c, cerr := strings.clone(g, db.allocator); cerr == nil {
+					append(&db.owed_files, c)
+				}
+			}
+			for g in pf {
+				if c, cerr := strings.clone(g, db.allocator); cerr == nil {
+					append(&db.pending_files, c)
+				}
+			}
+			for g in pd {
+				if c, cerr := strings.clone(g, db.allocator); cerr == nil {
+					append(&db.pending_dirs, c)
+				}
+			}
+			sync.mutex_unlock(&db.mutex)
+			return nil, nil, perr(e)
+		}
+	}
+	uf := distinct_sorted(pf[:], allocator)
+	ud := distinct_sorted(pd[:], allocator)
+	out_f := make([]string, len(uf), allocator)
+	for f, i in uf {
+		out_f[i] = strings.clone(f, allocator)
+	}
+	out_d := make([]string, len(ud), allocator)
+	for d, i in ud {
+		out_d[i] = strings.clone(d, allocator)
+	}
+	return out_f, out_d, .None
+}
+
 barrier :: proc(db: ^Odb) -> Error {
+	install_now(db) or_return
 	sync.mutex_lock(&db.mutex)
 	files := db.pending_files
 	dirs := db.pending_dirs

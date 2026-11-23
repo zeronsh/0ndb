@@ -893,7 +893,7 @@ _pack_before_commit :: proc(data: rawptr) -> pack.Error {
 	if !e.db_open {
 		return .None
 	}
-	if err := odb_barrier(e); err != .None {
+	if !_odb_queue_pending(e) {
 		return .Io
 	}
 	return .None

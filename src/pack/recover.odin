@@ -83,6 +83,13 @@ _release :: proc(p: ^Pack) {
 	}
 	_worker_stop(p)
 	delete(p.fl.fds)
+	for h in ([]Install_Hook{p.queued, p.fl.install}) {
+		if h.done != nil {
+			h.done(h.data, false)
+		}
+	}
+	p.queued = {}
+	p.fl.install = {}
 	delete(p.fl.zjobs)
 	delete(p.fl.syncs)
 	delete(p.fl.busy)

@@ -64,6 +64,7 @@ Inflight :: struct {
 	end:      i64,
 	fd:       prim.Fd,
 	fds:      [dynamic]Job_Fd,
+	install:  Install_Hook,
 	zjobs:    [dynamic]Zero_Job,
 	syncs:    [dynamic]Cont_Fd,
 	newc_fd:  prim.Fd,
@@ -91,6 +92,12 @@ Inflight :: struct {
 	merge:    ^Merge,
 	base:     prim.Vfs,
 	nsync:    u64,
+}
+
+Install_Hook :: struct {
+	run:  proc(data: rawptr) -> (nsync: u64, err: Error),
+	done: proc(data: rawptr, ok: bool),
+	data: rawptr,
 }
 
 @(private)
@@ -245,6 +252,13 @@ _build_run :: proc(base: prim.Vfs, fd: prim.Fd, imm: ^Mem, drop: bool) -> (run: 
 @(private)
 _job_exec :: proc(fl: ^Inflight) -> Error {
 	base := fl.base
+	if fl.install.run != nil {
+		n, ierr := fl.install.run(fl.install.data)
+		fl.nsync += n
+		if ierr != .None {
+			return ierr
+		}
+	}
 	for j in fl.fds {
 		fl.nsync += 1
 		prim.barrier(base, j.fd) or_return
