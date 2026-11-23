@@ -7,6 +7,64 @@ import "../prim"
 SWITCH_INGEST :: u8(1)
 SWITCH_TARGET :: u8(2)
 SWITCH_GIT :: u8(3)
+SWITCH_DONE :: u8(4)
+
+@(private)
+Switch_Record :: struct {
+	to:         string,
+	from:       string,
+	phase:      u8,
+	head:       Git_Head,
+	reflog_pos: i64,
+}
+
+@(private)
+switch_record :: proc(m: ^Mount, img: ^Mount_Image) -> (rec: Switch_Record) {
+	rec = Switch_Record{to = m.switch_to, from = m.switch_from, phase = m.switch_phase}
+	if len(m.switch_to) > 0 {
+		if m.switch_phase == SWITCH_GIT {
+			if ref, is_ref := line_ref(m, m.switch_to); is_ref {
+				rec.head.branch = ref
+			}
+			rec.head.commit, _ = line_commit(m, m.switch_to)
+			rec.reflog_pos = m.reflog_pos
+		}
+		return
+	}
+	if m.has_git && len(img.line) > 0 && len(m.branch) > 0 && img.line != m.branch {
+		rec = Switch_Record{to = m.branch, from = img.line, phase = SWITCH_DONE, head = m.head, reflog_pos = m.reflog_pos}
+	}
+	return
+}
+
+@(private)
+switch_record_load :: proc(m: ^Mount, head: Git_Head, reflog_pos: i64) {
+	if len(m.switch_to) == 0 || !m.has_git {
+		return
+	}
+	adopt := m.switch_phase == SWITCH_DONE
+	pos := reflog_pos
+	if m.switch_phase == SWITCH_GIT && len(head.commit) > 0 {
+		cur, ok := git_head(m.vfs, m.git, context.temp_allocator)
+		if ok && git_head_equal(cur, head) {
+			adopt = true
+			pos = git_reflog_switch_end(m.vfs, m.git, reflog_pos, head.commit)
+		}
+	}
+	if !adopt {
+		return
+	}
+	delete(m.branch, m.allocator)
+	m.branch, _ = clone_string(m.switch_to, m.allocator)
+	git_head_destroy(&m.head, m.allocator)
+	m.head.branch, _ = clone_string(head.branch, m.allocator)
+	m.head.commit, _ = clone_string(head.commit, m.allocator)
+	m.reflog_pos = pos
+	m.stamp = {}
+	if m.switch_phase == SWITCH_DONE {
+		switch_clear(m)
+	}
+}
 
 Switch_Done :: #type proc(m: ^Mount, err: Error, data: rawptr)
 
