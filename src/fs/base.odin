@@ -141,7 +141,9 @@ scope_read_base :: proc(s: ^Scope, rel: string, data: []u8) -> Error {
 		return .None
 	}
 	hash := _content_hash(clean)
-	observe_record(m, s, .Read, inode, rel, m.synced[:], hash) or_return
+	if oerr := observe_record(m, s, .Read, inode, rel, m.synced[:], hash); oerr != .None && oerr != .Reloading {
+		return oerr
+	}
 	p := _pin(s, rel, true)
 	clear(&p.read)
 	append(&p.read, ..m.synced[:])
@@ -219,7 +221,10 @@ scope_write_begin :: proc(s: ^Scope, rel: string) {
 		return
 	}
 	cur, terr := history_text_at(m.history, inode, m.synced[:], context.temp_allocator)
-	if terr != .None || observe_record(m, s, .Write_Begin, inode, rel, m.synced[:], _content_hash(cur)) != .None {
+	if terr != .None {
+		return
+	}
+	if oerr := observe_record(m, s, .Write_Begin, inode, rel, m.synced[:], _content_hash(cur)); oerr != .None && oerr != .Reloading {
 		return
 	}
 	p := _pin(s, rel, true)
@@ -424,6 +429,9 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			continue
 		}
 		done, rerr := rebase_commit(p, &c, v)
+		if rerr == .Reloading {
+			return rerr
+		}
 		if rerr != .None {
 			_base_note(m, c.path, .Mismatch)
 			append(&keep, c)
@@ -465,7 +473,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id) -> (done: bool, err
 	if err == .None {
 		head, has, err = builder_commit_at(m, &b, v)
 	}
-	if err != .None {
+	if err != .None && err != .Reloading {
 		shadow_txn_rollback(&m.shadow)
 		return false, err
 	}
@@ -474,7 +482,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id) -> (done: bool, err
 	if has {
 		append(&p.rebased, head)
 	}
-	return true, .None
+	return true, err
 }
 
 @(private)
@@ -500,7 +508,7 @@ builder_commit_at :: proc(m: ^Mount, b: ^Builder, parents: []crdt.Op_Id) -> (hea
 	m.jpend = mount_jlen(m)
 	head = crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1}
 	builder_reset(b)
-	return head, true, .None
+	return head, true, .Reloading if history_reloading(h) else .None
 }
 
 @(private)

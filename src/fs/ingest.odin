@@ -180,7 +180,7 @@ builder_commit :: proc(m: ^Mount, b: ^Builder) -> Error {
 	clear(&m.synced)
 	append(&m.synced, crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1})
 	builder_reset(b)
-	return .None
+	return .Reloading if history_reloading(h) else .None
 }
 
 @(private)
@@ -1015,7 +1015,7 @@ builder_commit_import :: proc(m: ^Mount, b: ^Builder) -> Error {
 	clear(&m.synced)
 	append(&m.synced, crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1})
 	builder_reset(b)
-	return .None
+	return .Reloading if history_reloading(h) else .None
 }
 
 @(private)
@@ -1156,12 +1156,12 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 	if err == .None {
 		err = builder_commit(m, b)
 	}
-	if err != .None {
+	if err != .None && err != .Reloading {
 		shadow_txn_rollback(&m.shadow)
 		return err
 	}
 	shadow_txn_end(&m.shadow)
-	return .None
+	return err
 }
 
 @(private)
@@ -1228,11 +1228,12 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		if eerr == .None {
 			eerr = builder_commit(m, &b)
 		}
-		if eerr != .None {
+		if eerr != .None && eerr != .Reloading {
 			shadow_txn_rollback(&m.shadow)
 			return eerr
 		}
 		shadow_txn_end(&m.shadow)
+		eerr or_return
 		e, found := shadow_get(&m.shadow, c.path) or_return
 		if !found {
 			continue

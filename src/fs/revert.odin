@@ -217,10 +217,15 @@ mount_revert :: proc(m: ^Mount, before: Version, after: Version) -> Error {
 	}
 	before_sync := make([]crdt.Op_Id, len(m.synced), context.temp_allocator)
 	copy(before_sync, m.synced[:])
-	builder_commit(m, &b) or_return
+	if cerr := builder_commit(m, &b); cerr != .None && cerr != .Reloading {
+		return cerr
+	}
 	clear(&m.synced)
 	append(&m.synced, ..before_sync)
-	return mount_materialize(m)
+	if merr := mount_materialize(m); merr != .Reloading {
+		return merr
+	}
+	return .None
 }
 
 @(private)

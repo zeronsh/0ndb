@@ -28,6 +28,7 @@ Error :: enum u8 {
 	Conflicts,
 	Redacted,
 	Io,
+	Reloading,
 }
 
 STATE_NAME :: ".0ndb"

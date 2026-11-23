@@ -861,6 +861,7 @@ remote_line :: proc(h: ^History, stream: prim.Id, name: string, lvs: ^[dynamic]c
 }
 
 history_set_line :: proc(h: ^History, name: string, v: Version) -> Error {
+	history_wake(h) or_return
 	key := line_key(name, context.temp_allocator)
 	sorted := slice.clone(v, context.temp_allocator)
 	slice.sort_by(sorted, crdt.op_id_less)
@@ -986,6 +987,7 @@ Import_File :: struct {
 }
 
 history_commit_import :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
+	history_wake(h) or_return
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, b, &parents)
 	if gerr != .None || skip != 0 {
@@ -1087,6 +1089,7 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 }
 
 history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
+	history_wake(h) or_return
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, b, &parents)
 	if gerr != .None || skip != 0 {
@@ -1150,6 +1153,21 @@ journal_unwind :: proc(h: ^History, jm: journal.Pending_Mark, dn: int) -> bool {
 		delete_key(&h.dict.index, pop(&h.dict.ids))
 	}
 	return true
+}
+
+history_reloading :: proc(h: ^History) -> bool {
+	return !h.awake && h.keep_actors != nil
+}
+
+history_ready :: proc(h: ^History) -> Error {
+	if h.awake {
+		return .None
+	}
+	err := history_wake(h)
+	if err != .None && h.keep_actors != nil {
+		return .Reloading
+	}
+	return err
 }
 
 @(private)
@@ -1629,6 +1647,9 @@ history_unload_files :: proc(h: ^History) {
 }
 
 history_trim :: proc(h: ^History) {
+	if !h.awake {
+		return
+	}
 	history_unload_unviewed(h)
 	crdt.graph_trim(&h.g)
 	fstree.trim(&h.tree, 64)
