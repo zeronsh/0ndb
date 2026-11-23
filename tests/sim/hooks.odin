@@ -16,7 +16,7 @@ Op_Weight :: proc(w: ^World) -> int
 Op_Run :: proc(w: ^World, n: ^Node)
 Step_Hook :: proc(w: ^World, n: ^Node)
 
-STATS_MAX :: 96
+STATS_MAX :: 256
 EV_EXT_BASE :: 128
 
 Stat :: distinct int
@@ -72,17 +72,17 @@ _push :: proc "contextless" (t: ^Table($T, $N), x: T) -> int {
 
 @(private = "file")
 Registry :: struct {
-	final_checks: Table(Ordered(Final_Check), 64),
-	restarted:    Table(Restart_Entry, 32),
-	events:       Table(Event_Hook, 32),
-	engine_events: Table(Ordered(Engine_Event_Hook), 32),
-	inits:        Table(Ordered(World_Hook), 32),
-	destroys:     Table(Ordered(World_Hook), 32),
-	collects:     Table(Ordered(Collect_Hook), 16),
-	steps:        Table(Ordered(Step_Hook), 16),
-	ops:          Table(Ext_Op, 32),
+	final_checks: Table(Ordered(Final_Check), 128),
+	restarted:    Table(Restart_Entry, 64),
+	events:       Table(Event_Hook, 64),
+	engine_events: Table(Ordered(Engine_Event_Hook), 64),
+	inits:        Table(Ordered(World_Hook), 64),
+	destroys:     Table(Ordered(World_Hook), 64),
+	collects:     Table(Ordered(Collect_Hook), 64),
+	steps:        Table(Ordered(Step_Hook), 64),
+	ops:          Table(Ext_Op, 64),
 	stats:        Table(Stat_Def, STATS_MAX),
-	lines:        Table(Stat_Line, 32),
+	lines:        Table(Stat_Line, 64),
 	sorted:       bool,
 	overflow:     bool,
 }
