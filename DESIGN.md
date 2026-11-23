@@ -1280,7 +1280,14 @@ concurrent typing is never lost or reverted.
   that reaches the damaged object, which waits instead when it was given a
   ready callback, never `Not_Found` or `Corrupt` for a record the restore
   will bring back; a record found lost reports `Corrupt` on that one object while
-  every other object and space runs on. A relay that reports more of the stream than is durable
+  every other object and space runs on. An own conversation or map whose
+  writer cannot open because recovery hit damage below the durable length
+  (a record the chain walk or a floor-bounded scan reports through the hook)
+  opens as a damaged handle with no writer: its reads take the damaged-read
+  path, its writes answer `Busy` or park, and the writer reopens on the first
+  refresh after the durable restore. The runtime's `attach` over a damaged
+  catalog defers its runner steps (advertise, recovery) on a catalog read
+  waiting for that restore, an event, never a timer and never an error. A relay that reports more of the stream than is durable
   locally, which a correct device never causes, is read back from the local
   durable length: bytes that open as this device's own sealed writes, or two
   different records that are both valid, can only come from a second device
