@@ -612,18 +612,14 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 		err = _redact_message(e, h, c.msg)
 	case Cmd_Map_Set:
 		h = _map_writable(e, c.object) or_return
-		off, x := omap.put(&h.mw, c.key, c.fields)
-		err = _oerr(x)
-		res.off = off
+		res.off, err = _map_put(e, h, c.key, c.fields)
 	case Cmd_Map_Delete:
 		h = _map_writable(e, c.object) or_return
 		fields := make([]omap.Field, len(c.tags), context.temp_allocator)
 		for t, i in c.tags {
 			fields[i] = omap.Field{tag = t}
 		}
-		off, x := omap.put(&h.mw, c.key, fields)
-		err = _oerr(x)
-		res.off = off
+		res.off, err = _map_put(e, h, c.key, fields)
 	case Cmd_Map_Add:
 		h = _map_writable(e, c.object) or_return
 		id, x := omap.add(&h.mw, c.key, c.tag, c.element)

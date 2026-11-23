@@ -619,6 +619,12 @@ writer_commit :: proc(w: ^Writer) -> Error {
 	return obj.writer_commit(&w.core)
 }
 
+observe_entry :: proc(w: ^Writer, e: ^Entry) {
+	for r in e.registers {
+		obj.observe(&w.core, r.hlc)
+	}
+}
+
 put :: proc(w: ^Writer, key: []u8, fields: []Field) -> (off: i64, err: Error) {
 	if len(key) == 0 || len(key) > MAX_KEY_LEN || len(fields) > MAX_FIELDS {
 		return 0, .Invalid
