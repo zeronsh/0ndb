@@ -474,7 +474,12 @@ equal in both directions.
   had), a based batch's Lamport time follows both `synced` and its parents,
   verification and the open-time names check compare such a path with its
   own version, and a rewind computes the current text from `synced` united
-  with the versions its files' entries name.
+  with the versions its files' entries name. Recovery after a crash adds
+  the mount's own committed batches to `synced`, but a based batch or a
+  rewind on a held path is on disk only once it is materialized, so for each
+  recovered file whose disk is not the text at that version the entry names
+  the newest recovered batch whose own text the disk is, and the path is
+  rematerialized; the reopen never ingests that gap as a disk change.
   A pin names the inode it read, and the edits go to that inode whatever
   the path holds when the write is ingested. If the inode was removed after
   the pin (and perhaps a new file created at the path), the edits are
