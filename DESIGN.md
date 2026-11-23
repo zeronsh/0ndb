@@ -449,7 +449,14 @@ equal in both directions.
   it, is a display-time diff against the line's previous version that is
   never stored, so it cannot fabricate history. Background passes
   defer files younger than a settle delay; scope ends, fences and shutdown
-  ingest everything. Changes no scope claims belong to the mount's ingestion
+  ingest everything. A rename onto an existing name (the target's inode
+  number becomes the one a removed path had) is a content change of the
+  replaced file plus a remove of the source, never a move: the runs of the
+  new content that a line diff against the source's current text keeps
+  equal are copies of the source's spans, so they keep their authors
+  exactly (nothing is matched by content across files), an editor's atomic
+  save never cuts the file's blame, and an edit made concurrently to the
+  replaced file merges into it. Changes no scope claims belong to the mount's ingestion
   actor, `blake2b-128("0ndb ingestion actor" || device || mount id)`, never
   to the device's own API writes, so disk changes concurrent with them stay
   representable. Opening a mount appends one `REC_ACTOR` record (tag 9:
