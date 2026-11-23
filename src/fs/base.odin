@@ -697,11 +697,13 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	if err == .None {
 		err = shadow_put(&m.shadow, c.path, ne)
 	}
+	if err != .None {
+		shadow_txn_rollback(&m.shadow)
+		return false, err
+	}
 	head: crdt.Op_Id
 	has := false
-	if err == .None {
-		head, has, err = builder_commit_at(m, &b, v)
-	}
+	head, has, err = builder_commit_at(m, &b, v)
 	if (err == .None || err == .Reloading) && (!has || op_inode(h, head) != predicted) {
 		err = .Corrupt
 	}

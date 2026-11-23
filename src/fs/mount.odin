@@ -1330,7 +1330,7 @@ _written_since :: proc(m: ^Mount, rel: string, since: Observe_Since) -> bool {
 mount_disk_unseen :: proc(m: ^Mount, rel: string) -> bool {
 	e, found, serr := shadow_get(&m.shadow, rel)
 	if serr != .None {
-		return false
+		return true
 	}
 	if found {
 		return !disk_matches(m, rel, e)
