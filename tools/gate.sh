@@ -62,6 +62,8 @@ lane() {
 	lane until-run SIM_STORAGE=until-run 1 20 > "$OUT/l5" &
 	lane wide "" 21 40 > "$OUT/l6" &
 	lane byzantine SIM_BYZANTINE=1 1 16 > "$OUT/l12" &
+	lane until-run SIM_STORAGE=until-run 21 40 > "$OUT/l13" &
+	lane byzantine SIM_BYZANTINE=1 17 32 > "$OUT/l14" &
 	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=6 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); echo "membership 1-6 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
 	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); echo "scenarios: $(echo "$r" | grep -E 'Finished [0-9]+ tests' | tail -1 | grep -q 'All tests were successful' && echo 0 || echo 1) failed $(echo "$r" | grep -E 'seed [0-9]+ FAILED|membership seed [0-9]+: |local_first.*FAIL|staged.*FAIL' | head -3 | tr '\n' ' ')" ) > "$OUT/l8" &
 	( r=$(timeout 900 "$OUT/cvg.bin" 2>&1 | grep -E "Finished|FAILED|panic" | tail -1); echo "convergence: $r" ) > "$OUT/l9" &
@@ -72,7 +74,7 @@ lane() {
 if command -v cargo > /dev/null; then
 	( cd bindings/rust/ondb && timeout 900 cargo check -q --examples > "$OUT/cargo.log" 2>&1 ) && note "cargo: ok" || { FAIL=1; note "cargo: FAIL $(tail -3 "$OUT/cargo.log" | tr '\n' ' ')"; }
 fi
-for i in 1 2 3 4 5 6 12 7 8 9 10 11; do
+for i in 1 2 3 4 5 13 6 12 14 7 8 9 10 11; do
 	l=$(cat "$OUT/l$i")
 	note "$l"
 	case "$l" in
