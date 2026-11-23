@@ -347,12 +347,14 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 				if !prim.reader_ok(&rd) {
 					return nil, .Corrupt
 				}
+				fmt.eprintfln("DBGU files_at tree %x mount %q line %q", d.tree, d.mount, d.line)
 				put(&lines, d.tree, convo_line_key(d.line), vb)
 				named[d.mount] = true
 			}
 		}
 		ms := convo_mounts(e, c.o, context.temp_allocator) or_return
 		for m in ms {
+			fmt.eprintfln("DBGU mount tree %x name %q line %q removed %v", m.tree, m.name, m.line, m.removed)
 			if !m.removed && !named[m.name] {
 				put(&lines, m.tree, convo_line_key(m.line), nil)
 			}
@@ -365,6 +367,7 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 	for &l in lines {
 		own := make([dynamic]prim.Id, context.temp_allocator)
 		append(&own, ..actors[:])
+		fmt.eprintfln("DBGU line tree %x line %q", l.tree, l.line)
 		th := _handle_get(e, Object{o.space, l.tree}, .File_Tree) or_return
 		_hist_ready(e, th) or_return
 		oa, oerr := fs.history_owned_actors(th.hist, owners[:], context.temp_allocator)
