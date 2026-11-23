@@ -1064,6 +1064,8 @@ Change :: struct {
 	actor:   prim.Id,
 	moved:   string,
 	carried: bool,
+	copy_src: fstree.Inode_Id,
+	has_copy: bool,
 }
 
 @(private)
@@ -2273,6 +2275,22 @@ detect_moves :: proc(p: ^Pass) {
 			by_ino[c.old.stat.ino] = i
 		}
 	}
+	for &c in p.changes {
+		if c.kind != .Modify || c.disk != .File || c.old.kind != .File || c.stat.ino == 0 || c.stat.ino == c.old.stat.ino {
+			continue
+		}
+		ri, ok := by_ino[c.stat.ino]
+		if !ok {
+			continue
+		}
+		r := &p.changes[ri]
+		if r.old.kind != .File || r.moved != "" || r.carried {
+			continue
+		}
+		c.copy_src = r.old.inode
+		c.has_copy = true
+		delete_key(&by_ino, c.stat.ino)
+	}
 	moves := make([dynamic]Dir_Move, context.temp_allocator)
 	for &c in p.changes {
 		if c.kind != .Create || c.stat.ino == 0 {
@@ -2658,8 +2676,66 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	if was_binary {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Opaque}, value = {}})
 	}
+	copy_begin(m, c, data) or_return
+	defer m.copy = nil
 	emit_text_edits(m, b, e.inode, path, old, data) or_return
 	return shadow_put(&m.shadow, path, ne)
+}
+
+@(private)
+Copy_Map :: struct {
+	data:  []u8,
+	src:   []int,
+	spans: []crdt.Author_Span,
+}
+
+@(private)
+copy_begin :: proc(m: ^Mount, c: ^Change, data: []u8) -> Error {
+	m.copy = nil
+	if !c.has_copy || len(data) == 0 {
+		return .None
+	}
+	h := m.history
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &lvs) != .None {
+		return .Corrupt
+	}
+	text, spans, terr := history_text_spans_at(h, c.copy_src, lvs[:], context.temp_allocator)
+	if terr != .None || len(text) == 0 {
+		return .None
+	}
+	la, aerr := textdiff.split_lines(text, context.temp_allocator)
+	lb, berr := textdiff.split_lines(data, context.temp_allocator)
+	if aerr != nil || berr != nil {
+		return .None
+	}
+	hunks, herr := textdiff.diff_lines(la, lb, textdiff.DEFAULT_DIFF, context.temp_allocator)
+	if herr != nil {
+		return .None
+	}
+	cm := new(Copy_Map, context.temp_allocator)
+	cm.data = data
+	cm.spans = spans
+	cm.src = make([]int, len(data), context.temp_allocator)
+	for &x in cm.src {
+		x = -1
+	}
+	same :: proc(cm: ^Copy_Map, la, lb: textdiff.Lines, a0, a1, b0: int) {
+		ao := int(la.offs[a0])
+		bo := int(lb.offs[b0])
+		for k in 0 ..< int(la.offs[a1]) - ao {
+			cm.src[bo + k] = ao + k
+		}
+	}
+	ai, bi := 0, 0
+	for hk in hunks {
+		same(cm, la, lb, ai, int(hk.a_start), bi)
+		ai = int(hk.a_start + hk.a_len)
+		bi = int(hk.b_start + hk.b_len)
+	}
+	same(cm, la, lb, ai, len(la.offs) - 1, bi)
+	m.copy = cm
+	return .None
 }
 
 @(private)
@@ -2858,6 +2934,32 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, path: st
 emit_insert :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, pos: int, ins: []u8) -> Error {
 	if len(ins) == 0 {
 		return .None
+	}
+	if cm := m.copy; cm != nil && len(cm.data) > 0 {
+		base := uintptr(raw_data(cm.data))
+		at := uintptr(raw_data(ins))
+		if at >= base && at + uintptr(len(ins)) <= base + uintptr(len(cm.data)) {
+			off := int(at - base)
+			m.copy = nil
+			defer m.copy = cm
+			i := 0
+			for i < len(ins) {
+				j := i + 1
+				if s := cm.src[off + i]; s >= 0 {
+					for j < len(ins) && cm.src[off + j] == s + (j - i) {
+						j += 1
+					}
+					builder_copy_spans(b, inode, pos + i, cm.spans, s, j - i)
+				} else {
+					for j < len(ins) && cm.src[off + j] < 0 {
+						j += 1
+					}
+					emit_insert(m, b, inode, pos + i, ins[i:j]) or_return
+				}
+				i = j
+			}
+			return .None
+		}
 	}
 	if len(ins) > m.opts.inline_limit && m.db != nil {
 		sub, werr := odb.write(m.db, .Blob, ins)
