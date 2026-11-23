@@ -1,16 +1,16 @@
 package fs
 
 import "base:runtime"
+import "core:crypto/blake2b"
 import "core:slice"
 import "core:io"
 import "core:mem/virtual"
 import "core:strconv"
-import "core:strings"
 import "../crdt"
+import "../fshist"
 import "../fstree"
 import "../odb"
 import "../prim"
-import "../textdiff"
 
 @(private)
 Mat_Item :: struct {
@@ -170,6 +170,19 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			continue
 		}
 		append(&items, it)
+	}
+	if merge {
+		if head, took := mat_snapshot_dirty(m, items[:]) or_return; took {
+			one := [1]crdt.Lv{}
+			lv, lok := crdt.graph_lv(&h.g, head)
+			if !lok {
+				return .Corrupt
+			}
+			one[0] = lv
+			both := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, tl[:], one[:], &both)
+			return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), true)
+		}
 	}
 	if m.mat_ingest && !merge {
 		held := false
@@ -939,9 +952,6 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if it.has_old && !disk_matches(m, it.old, it.entry) {
 		removal := m.merge_base != nil && !it.present && it.entry.kind != .Dir
 		if !removal {
-			if m.merge_base != nil && it.present && it.kind == .File && it.old == it.path && .Opaque not_in it.flags && it.entry.kind == .File {
-				merge_dirty(m, it, tl) or_return
-			}
 			mat_raced(m)
 			mount_mark(m, it.old)
 			return .None
@@ -1323,62 +1333,6 @@ tmp_ino :: proc(m: ^Mount, fd: prim.Fd) -> u64 {
 	return st.ino
 }
 
-@(private)
-merge_dirty :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
-	h := m.history
-	abuf: prim.Path_Buf
-	abs := abs_path(m, it.path, abuf[:])
-	raw, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
-	if rerr != .None {
-		return .None
-	}
-	ours, cok := eol_clean(m, it.path, raw, it.inode, true)
-	if !cok || textdiff.is_binary(ours) {
-		return .None
-	}
-	base, berr := history_text_at(h, it.inode, m.merge_base, context.temp_allocator)
-	if berr != .None {
-		return .None
-	}
-	ids := crdt.graph_version_ids(&h.g, tl, context.temp_allocator)
-	theirs := history_text_at(h, it.inode, ids, context.temp_allocator) or_return
-	if string(base) == string(theirs) {
-		return .None
-	}
-	merged := merge_union(base, ours, theirs) or_return
-	if string(merged) == string(ours) {
-		return .None
-	}
-	before, serr := prim.lstat(m.vfs, abs)
-	if serr != .None {
-		return .None
-	}
-	mode: u32 = 0o755 if .Exec in it.flags else 0o644
-	tmp := temp_name(m, abs, context.temp_allocator)
-	fd, oerr := prim.open_file(m.vfs, tmp, {.Write, .Create, .Truncate}, mode)
-	if oerr != .None {
-		return from_prim(oerr)
-	}
-	werr := prim.write_at(m.vfs, fd, eol_smudge(m, it.path, merged, context.temp_allocator, it.inode, true), 0)
-	prim.fchmod(m.vfs, fd, mode)
-	prim.close_file(m.vfs, fd)
-	if werr != .None {
-		prim.remove(m.vfs, tmp)
-		return from_prim(werr)
-	}
-	if serr := mat_sync_one(m, tmp); serr != .None {
-		prim.remove(m.vfs, tmp)
-		return serr
-	}
-	now, nerr := prim.lstat(m.vfs, abs)
-	if nerr != .None || disk_stat(now) != disk_stat(before) {
-		prim.remove(m.vfs, tmp)
-		return .None
-	}
-	from_prim(prim.rename(m.vfs, tmp, abs)) or_return
-	mat_ancestors(m, abs)
-	return .None
-}
 
 @(private)
 MERGE_OURS :: "0ndb-merge-ours-8f3a1c"
@@ -1387,84 +1341,6 @@ MERGE_BASE :: "0ndb-merge-base-8f3a1c"
 @(private)
 MERGE_THEIRS :: "0ndb-merge-theirs-8f3a1c"
 
-@(private)
-merge_union :: proc(base, ours, theirs: []u8) -> (out: []u8, err: Error) {
-	opts := textdiff.Merge_Options {
-		style        = .Diff3,
-		ours_label   = MERGE_OURS,
-		base_label   = MERGE_BASE,
-		theirs_label = MERGE_THEIRS,
-	}
-	res, merr := textdiff.merge3(base, ours, theirs, opts, context.temp_allocator)
-	if merr != nil {
-		return nil, .No_Memory
-	}
-	if res.conflicts == 0 {
-		return res.data, .None
-	}
-	buf := make([dynamic]u8, 0, len(res.data), context.temp_allocator)
-	o_lines := make([dynamic]string, context.temp_allocator)
-	b_lines := make([dynamic]string, context.temp_allocator)
-	t_lines := make([dynamic]string, context.temp_allocator)
-	Section :: enum {
-		Outside,
-		Ours,
-		Base,
-		Theirs,
-	}
-	sec := Section.Outside
-	rest := string(res.data)
-	for line in strings.split_lines_after_iterator(&rest) {
-		t := strings.trim_right(line, "\r\n")
-		switch sec {
-		case .Outside:
-			if t == "<<<<<<< " + MERGE_OURS {
-				sec = .Ours
-				clear(&o_lines)
-				clear(&b_lines)
-				clear(&t_lines)
-				continue
-			}
-			append(&buf, ..transmute([]u8)line)
-		case .Ours:
-			if t == "||||||| " + MERGE_BASE {
-				sec = .Base
-				continue
-			}
-			append(&o_lines, line)
-		case .Base:
-			if t == "=======" {
-				sec = .Theirs
-				continue
-			}
-			append(&b_lines, line)
-		case .Theirs:
-			if t == ">>>>>>> " + MERGE_THEIRS {
-				sec = .Outside
-				for l in t_lines {
-					append(&buf, ..transmute([]u8)l)
-				}
-				used := make([]bool, len(b_lines), context.temp_allocator)
-				for l in o_lines {
-					in_base := false
-					for bl, k in b_lines {
-						if !used[k] && bl == l {
-							used[k] = true
-							in_base = true
-							break
-						}
-					}
-					if !in_base {
-						append(&buf, ..transmute([]u8)l)
-					}
-				}
-				continue
-			}
-			append(&t_lines, line)
-		}
-	}
-	return buf[:], .None
-}
 
 @(private)
 Fd_Sink :: struct {
@@ -1603,4 +1479,89 @@ mount_absent_ready :: proc(m: ^Mount) -> bool {
 		}
 	}
 	return false
+}
+
+mount_snapshot_pseudo :: proc(mount: prim.Id, line: string) -> (pseudo: prim.Id) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb mount snapshot"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	mid := mount
+	blake2b.update(&ctx, mid[:])
+	blake2b.update(&ctx, transmute([]u8)line)
+	blake2b.final(&ctx, pseudo[:])
+	return
+}
+
+@(private)
+mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item) -> (head: crdt.Op_Id, took: bool, err: Error) {
+	h := m.history
+	pseudo := mount_snapshot_pseudo(m.id, m.line)
+	actor := fshist.ingestion_actor(h.self, pseudo)
+	parents := make([dynamic]crdt.Op_Id, context.temp_allocator)
+	append(&parents, ..m.merge_base)
+	if known := crdt.graph_known(&h.g, actor); known > 0 {
+		append(&parents, crdt.Op_Id{actor, known - 1})
+	}
+	b: Builder
+	builder_init(&b, h, actor)
+	snapped := make([dynamic]int, context.temp_allocator)
+	ours := make([dynamic]Stat, context.temp_allocator)
+	oids := make([dynamic]odb.Oid, context.temp_allocator)
+	for &it, i in items {
+		if !it.present || it.kind != .File || !it.has_old || it.old != it.path || .Opaque in it.flags || it.entry.kind != .File || disk_matches(m, it.old, it.entry) {
+			continue
+		}
+		d := probe(m, it.path) or_return
+		if d.kind != .File {
+			continue
+		}
+		data, oid, binary, ok := read_content(m, it.path, d.stat, it.inode, true) or_return
+		if !ok || binary {
+			continue
+		}
+		old := history_text_at(h, it.inode, parents[:], context.temp_allocator) or_return
+		if string(old) != string(data) {
+			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
+		}
+		append(&snapped, i)
+		append(&ours, d.stat)
+		append(&oids, oid)
+	}
+	if len(snapped) == 0 {
+		return {}, false, .None
+	}
+	if b.n > 0 {
+		history_register_actor(h, actor, pseudo) or_return
+		ch, has, cerr := builder_commit_at(m, &b, parents[:])
+		if cerr != .None && cerr != .Reloading {
+			return {}, false, cerr
+		}
+		if !has {
+			return {}, false, .None
+		}
+		head = ch
+	} else {
+		if len(parents) == 0 {
+			return {}, false, .None
+		}
+		head = parents[len(parents) - 1]
+	}
+	vids := make([dynamic]fstree.Op_Id, context.temp_allocator)
+	if b.n == 0 {
+		for p in parents {
+			append(&vids, op_inode(h, p))
+		}
+	} else {
+		append(&vids, op_inode(h, head))
+	}
+	ver := shadow_version_add(&m.shadow, vids[:]) or_return
+	for i, k in snapped {
+		e := items[i].entry
+		e.ver = ver
+		e.stat = ours[k]
+		e.oid = oids[k]
+		shadow_put(&m.shadow, items[i].path, e) or_return
+	}
+	return head, true, .None
 }
