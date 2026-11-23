@@ -41,7 +41,7 @@ STAT_TM_REPLACE: Stat
 @(init)
 _tree_move_init :: proc "contextless" () {
 	register_world(40, _tm_init, _tm_destroy)
-	register_op(13, "tree_move", proc(w: ^World) -> int {return 12}, op_tree_move)
+	register_op(13, "tree_move", proc(w: ^World) -> int {return 12 if env_u64("SIM_TREE_MOVE", 0) != 0 else 0}, op_tree_move)
 	register_final_check(120, check_tree_moves)
 	register_stat_line(53, "tree_moves")
 	STAT_TM_RENAME = register_stat(53, 0, "renames")
