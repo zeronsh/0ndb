@@ -278,6 +278,7 @@ Replicator :: struct {
 	external:   bool,
 	static:     ecdh.Private_Key,
 	groups:     map[[16]u8]^Group,
+	group_new:  bool,
 	feed_cursor: i64,
 	feed_target: i64,
 	caught:     bool,
@@ -2631,7 +2632,8 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 @(private)
 _repl_on_ready :: proc(r: ^Replicator) {
 	if r.cfg.filtered {
-		_feed_subscribe(r, r.feed_cursor < 0)
+		_feed_subscribe(r, r.feed_cursor < 0 || r.group_new)
+		r.group_new = false
 	} else {
 		_list_send(r, r.cursor if r.listed else 0)
 		if r.feed_cursor >= 0 {
