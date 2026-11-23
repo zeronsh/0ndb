@@ -703,7 +703,7 @@ _d_read_at :: proc(data: rawptr, fd: prim.Fd, buf: []u8, off: i64) -> (int, prim
 	if !_enter(d, 2) {
 		return 0, .Io
 	}
-	_, n, err := _fd_get(d, fd)
+	of, n, err := _fd_get(d, fd)
 	if err != .None {
 		return 0, err
 	}
@@ -717,6 +717,7 @@ _d_read_at :: proc(data: rawptr, fd: prim.Fd, buf: []u8, off: i64) -> (int, prim
 		return 0, .None
 	}
 	c := copy(buf, n.data[off:])
+	run_disk_read(d, of.path, off, c)
 	return c, .None
 }
 

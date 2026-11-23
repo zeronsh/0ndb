@@ -12,6 +12,7 @@ Final_Check :: proc(w: ^World)
 Restart_Hook :: proc(w: ^World, n: ^Node)
 Event_Hook :: proc(w: ^World, ev: ^Sim_Event)
 Engine_Event_Hook :: proc(w: ^World, n: ^Node, ev: ^eng.Event)
+Disk_Read_Hook :: proc(d: ^Disk, path: string, off: i64, n: int)
 Frame_Filter :: proc(w: ^World, c: ^Conn, kind: u8, payload: []u8) -> (drop: bool)
 World_Hook :: proc(w: ^World)
 Collect_Hook :: proc(w: ^World, res: ^Run_Result)
@@ -79,6 +80,7 @@ Registry :: struct {
 	restarted:    Table(Restart_Entry, 64),
 	events:       Table(Event_Hook, 64),
 	engine_events: Table(Ordered(Engine_Event_Hook), 64),
+	disk_reads:   Table(Ordered(Disk_Read_Hook), 8),
 	filters:      Table(Ordered(Frame_Filter), 16),
 	inits:        Table(Ordered(World_Hook), 64),
 	destroys:     Table(Ordered(World_Hook), 64),
@@ -110,6 +112,7 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.collects.items[:reg.collects.n], by)
 	slice.stable_sort_by(reg.steps.items[:reg.steps.n], by)
 	slice.stable_sort_by(reg.engine_events.items[:reg.engine_events.n], by)
+	slice.stable_sort_by(reg.disk_reads.items[:reg.disk_reads.n], by)
 	slice.stable_sort_by(reg.filters.items[:reg.filters.n], by)
 	slice.stable_sort_by(reg.restarted.items[:reg.restarted.n], proc(a, b: Restart_Entry) -> bool {
 		return a.order < b.order
@@ -233,6 +236,20 @@ run_frame_filters :: proc(w: ^World, c: ^Conn, bytes: []u8) -> []u8 {
 	}
 	remove_range(&fb.buf, 0, pos)
 	return out[:]
+}
+
+register_disk_read :: proc "contextless" (order: int, hook: Disk_Read_Hook) {
+	_add(&reg.disk_reads, Ordered(Disk_Read_Hook){order, hook})
+}
+
+run_disk_read :: proc(d: ^Disk, path: string, off: i64, n: int) {
+	if reg.disk_reads.n == 0 {
+		return
+	}
+	_sorted()
+	for h in reg.disk_reads.items[:reg.disk_reads.n] {
+		h.call(d, path, off, n)
+	}
 }
 
 register_op :: proc "contextless" (order: int, name: string, weight: Op_Weight, run: Op_Run) {
