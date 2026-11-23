@@ -428,7 +428,9 @@ _table_publish :: proc(e: ^Engine, h: ^Handle) {
 		return
 	}
 	if err := omap.db_publish(&h.table.db, e.durable_seq); err != .None && err != .Busy {
-		_fatal(e, _oerr(err))
+		if !_storage_soft(e, _oerr(err), "a map table could not be published: the disk is full or failing; it is rebuilt") {
+			_fatal(e, _oerr(err))
+		}
 	}
 }
 
@@ -732,6 +734,12 @@ _catalog_flush :: proc(e: ^Engine) {
 			}
 		} else if err == .Permission {
 			e.stats.catalog_refused += 1
+		} else if err == .No_Space || err == .Io {
+			_storage_short(e, err, "a catalog update could not be stored: the disk is full or failing; it is retried")
+			if _, dup := e.catalog_parked[id]; !dup {
+				e.catalog_parked[id] = u
+				continue
+			}
 		} else if err != .None {
 			_fatal(e, err)
 		}
