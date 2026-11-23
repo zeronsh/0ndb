@@ -22,6 +22,7 @@ Tm_Record :: struct {
 	other: [dynamic]string,
 	what:  string,
 	line:  string,
+	ops:   int,
 }
 
 Tm_World :: struct {
@@ -427,7 +428,7 @@ _record :: proc(w: ^World, kind: Tm_Kind, oi: int, file: []string, other: []stri
 	if line != _line(b, bsm) {
 		return
 	}
-	r := Tm_Record{kind = kind, obj = oi, file = make([dynamic]string, w.allocator), other = make([dynamic]string, w.allocator), what = strings.clone(what, w.allocator), line = strings.clone(line, w.allocator)}
+	r := Tm_Record{kind = kind, obj = oi, file = make([dynamic]string, w.allocator), other = make([dynamic]string, w.allocator), what = strings.clone(what, w.allocator), line = strings.clone(line, w.allocator), ops = len(w.model.ops)}
 	for t in file {
 		append(&r.file, strings.clone(t, w.allocator))
 	}
@@ -710,6 +711,28 @@ _holders :: proc(files: map[string][]string, toks: []string) -> []string {
 }
 
 @(private = "file")
+_uncarried :: proc(m: ^Model, r: Tm_Record, files: map[string][]string, held: []string) -> []string {
+	out := make([dynamic]string, context.temp_allocator)
+	for f in held {
+		carried := false
+		for op in m.ops[min(r.ops, len(m.ops)):] {
+			if op.kind != .Disk_Agent || op.obj != r.obj || op.path != f {
+				continue
+			}
+			for t in files[f] {
+				for x in op.tokens {
+					carried ||= t == x
+				}
+			}
+		}
+		if !carried {
+			append(&out, f)
+		}
+	}
+	return out[:]
+}
+
+@(private = "file")
 _files :: proc(n: ^Node, o: eng.Object, line: string) -> map[string][]string {
 	out := make(map[string][]string, context.temp_allocator)
 	files, _ := tree_walk(n, o, {}, line_eng(line))
@@ -789,6 +812,7 @@ check_tree_moves :: proc(w: ^World) {
 			held := _holders(files, r.file[:])
 			switch r.kind {
 			case .One_Name:
+				held = _uncarried(m, r, files, held)
 				if len(held) > 1 {
 					world_fail(w, "tree move: a file moved concurrently (%s) is in %d files on %s: %v", r.what, len(held), n.name, held)
 				}
