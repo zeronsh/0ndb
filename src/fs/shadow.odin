@@ -77,6 +77,8 @@ Rec :: struct {
 }
 
 Shadow :: struct {
+	burned:     u64,
+	republish:  bool,
 	clock:      Clock,
 	hold:       bool,
 	owed:       bool,
@@ -216,6 +218,10 @@ shadow_open :: proc(s: ^Shadow, vfs: prim.Vfs, dir: string, format: odb.Hash_For
 shadow_attach :: proc(s: ^Shadow) -> Error {
 	if s.log_fd >= 0 {
 		return .None
+	}
+	if s.republish {
+		write_gen(s, s.dir, s.gen) or_return
+		s.republish = false
 	}
 	s.pending = make([dynamic]Pending_Rec, s.allocator)
 	s.undo = make([dynamic]Shadow_Undo, s.allocator)
@@ -683,7 +689,7 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 		shadow_persist(s) or_return
 	}
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	ng := s.gen + 1
+	ng := max(s.gen, s.burned) + 1
 	log_path := gen_path(s.dir, ng, "log", context.temp_allocator)
 	idx_path := gen_path(s.dir, ng, "idx", context.temp_allocator)
 	prim.remove(s.vfs, log_path)
@@ -735,8 +741,16 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 	checkpoint(&n) or_return
 	write_header(&n, true)
 	from_prim(prim.datasync(s.vfs, n.idx_fd)) or_return
-	write_gen(s, s.dir, ng) or_return
 	ok = true
+	if werr := write_gen(s, s.dir, ng); werr != .None {
+		s.burned = max(s.burned, ng)
+		shadow_detach(&n)
+		if write_gen(s, s.dir, s.gen) != .None {
+			s.republish = true
+			shadow_detach(s)
+		}
+		return werr
+	}
 	shadow_detach(&n)
 	old_log := gen_path(s.dir, s.gen, "log", context.temp_allocator)
 	old_idx := gen_path(s.dir, s.gen, "idx", context.temp_allocator)
