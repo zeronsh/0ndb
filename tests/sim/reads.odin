@@ -154,6 +154,11 @@ _live_settled :: proc(w: ^World, r: ^Live_Read, st: api.Status) {
 		stat_add(w, STAT_LIVE_QUARANTINED)
 	case .Closed:
 		stat_add(w, STAT_LIVE_CLOSED)
+	case .Busy:
+		if !w.nodes[r.node].persist_outage {
+			world_fail(w, "interactive read: %s %s on %s settled Busy outside a persist outage", r.op, id_short(w.model.objs[r.obj].o.id), w.nodes[r.node].name)
+		}
+		stat_add(w, STAT_LIVE_ABSENT)
 	case .Io, .No_Space, .Corrupt:
 		if w.cfg.io_rate == 0 && !w.nodes[r.node].disk.dead {
 			world_fail(w, "interactive read: %s %s on %s failed %v without injected I/O faults", r.op, id_short(w.model.objs[r.obj].o.id), w.nodes[r.node].name, st)
