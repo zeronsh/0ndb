@@ -126,7 +126,12 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 verify_at :: proc(m: ^Mount, p: string, e: Entry, disk: bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	h := m.history
 	at := make([dynamic]crdt.Op_Id, context.temp_allocator)
-	for id in shadow_version(&m.shadow, e) {
+	ids, vok := shadow_version(&m.shadow, e)
+	if !vok || len(ids) == 0 {
+		append(out, fmt.aprintf("%s: shadow version index %d is invalid", p, e.ver, allocator = allocator))
+		return .None
+	}
+	for id in ids {
 		append(&at, inode_op(h, id))
 	}
 	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
