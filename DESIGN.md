@@ -2104,6 +2104,12 @@ live runner by default:
   runner), providers installed and signed in, and whether it is the
   conversation's current or last runner. Pushed on advert, presence and
   placement changes; nothing polls.
+- **Not signed in.** A runner checks a harness provider's sign-in (its auth
+  env or auth files) when a run begins: a provider that is not signed in on
+  this device fails the run at once with an error block named
+  `not_signed_in` whose text says how to sign in, and never spawns the CLI.
+  The model list reports `signed_in` and the provider's `login` hint, so a
+  client can grey a provider out before the user picks it.
 - **Sleep and wake.** A sleeping pool runner's lease lapses. On wake its
   pool readmits it with an ephemeral lease token on its existing `Add` (see
   Runner pools), without enrolling again and without a membership record;
