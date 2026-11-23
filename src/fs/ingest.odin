@@ -1376,6 +1376,10 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		set_line(m) or_return
 	}
 	for y in p.young {
+		if v, ok := &m.dirty[y]; ok {
+			v^ = p.scope_of[y]
+			continue
+		}
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
 	}
