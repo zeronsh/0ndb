@@ -1210,6 +1210,7 @@ Change :: struct {
 	old:    Entry,
 	scope:   ^Scope,
 	actor:   prim.Id,
+	scope_id: prim.Id,
 	moved:   string,
 	carried: bool,
 	copy_src: fstree.Inode_Id,
@@ -1320,7 +1321,7 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 }
 
 @(private)
-attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int) -> Error {
+attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.Id{}) -> Error {
 	m := p.m
 	logged := false
 	for i in idx {
@@ -1332,8 +1333,8 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int) -> Error {
 		if serr != .None || !found || e.oid == {} {
 			continue
 		}
-		attrib_set(m, c.path, actor, true, e.oid)
-		attrib_log_append(m, c.path, actor, e.oid) or_return
+		attrib_set(m, c.path, actor, true, e.oid, scope)
+		attrib_log_append(m, c.path, actor, e.oid, scope) or_return
 		logged = true
 	}
 	if logged {
@@ -1365,8 +1366,8 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			append(&steps, ..chain[:])
 			attrib_chain_drop(m, c.path)
 		}
-		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid}) {
-			append(&steps, Attrib_Step{a.actor, a.oid})
+		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope}) {
+			append(&steps, Attrib_Step{a.actor, a.oid, a.scope})
 		}
 		if !m.lost {
 			kept := 0
@@ -1385,6 +1386,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		if !file || m.db == nil || len(steps) == 0 {
 			if has {
 				c.actor = unattributed_actor(m.actor) if m.lost else a.actor
+				c.scope_id = a.scope
 			}
 			continue
 		}
@@ -1392,6 +1394,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		if !ok {
 			if has {
 				c.actor = a.actor
+				c.scope_id = a.scope
 			}
 			continue
 		}
@@ -1400,6 +1403,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		for st in steps {
 			if disk_oid == st.oid {
 				c.actor = st.actor
+				c.scope_id = st.scope
 				matched = true
 				break
 			}
@@ -1424,6 +1428,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			c.actor = unattributed_actor(m.actor)
 		} else if has && a.oid == {} {
 			c.actor = unattributed_actor(m.actor) if m.lost else a.actor
+			c.scope_id = a.scope
 		} else {
 			c.actor = {}
 		}
@@ -1473,7 +1478,8 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	m.override[k] = st.oid
 	b: Builder
 	builder_init(&b, m.history, st.actor)
-	attrib_set(m, c.path, st.actor, true, st.oid)
+	b.scope = scope_marker(st.actor, st.scope)
+	attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
 	shadow_txn_begin(&m.shadow)
 	eerr := emit_change(p, &b, &first)
 	key, _ := delete_key(&m.override, k)
@@ -2080,7 +2086,8 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				scope = c.scope.id
 			} else if c.actor != {} {
 				actor = c.actor
-				if os, open := m.open_scopes[c.path]; open && os != nil && os.actor == actor {
+				scope = c.scope_id
+				if os, open := m.open_scopes[c.path]; scope == {} && open && os != nil && os.actor == actor {
 					scope = os.id
 				}
 			}
@@ -2118,22 +2125,20 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			idx := groups[key][:]
 			actor := group_actor[key]
 			marker: []u8
-			if sc := group_scope[key]; sc != {} && sc != actor && actor != m.actor {
-				mb := make([dynamic]u8, context.temp_allocator)
-				fshist.encode_scope(&mb, sc)
-				marker = mb[:]
+			if actor != m.actor {
+				marker = scope_marker(actor, group_scope[key])
 			}
 			emit_order(p, idx)
 			if actor != m.actor {
 				for i in idx {
-					attrib_set(m, p.changes[i].path, actor, true)
+					attrib_set(m, p.changes[i].path, actor, true, {}, group_scope[key])
 				}
 			}
 			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
 				commit_bounded(p, actor, idx[lo:min(lo + PASS_CHUNK, len(idx))], nil, marker) or_return
 			}
 			if actor != m.actor {
-				attribute_consumed(p, actor, idx) or_return
+				attribute_consumed(p, actor, idx, group_scope[key]) or_return
 			}
 		}
 	}
@@ -3441,4 +3446,14 @@ scope_group_key :: proc(actor, scope: prim.Id) -> (key: prim.Id) {
 	blake2b.update(&ctx, sc[:])
 	blake2b.final(&ctx, key[:])
 	return
+}
+
+@(private)
+scope_marker :: proc(actor, scope: prim.Id) -> []u8 {
+	if scope == {} || scope == actor {
+		return nil
+	}
+	mb := make([dynamic]u8, context.temp_allocator)
+	fshist.encode_scope(&mb, scope)
+	return mb[:]
 }
