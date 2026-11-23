@@ -1272,6 +1272,29 @@ _git_switch_weight :: proc(w: ^World) -> int {
 	return 4 if env_u64("SIM_GIT_SWITCH", 1) != 0 else 0
 }
 
+@(private = "file")
+_carry_token :: proc(w: ^World, n: ^Node, oi: int, line: string, path: string, tok: string) {
+	m := &w.model
+	#reverse for o in m.ops {
+		if o.obj != oi {
+			continue
+		}
+		for t in o.tokens {
+			if t != tok {
+				continue
+			}
+			c := new_op(m, o.kind, n, oi)
+			c.actor = o.actor
+			c.line = strings.clone(line, w.allocator)
+			c.path = strings.clone(path, w.allocator)
+			append(&c.tokens, strings.clone(tok, w.allocator))
+			op_done(c, 0, .None)
+			c.status = .Acked
+			return
+		}
+	}
+}
+
 op_git_switch :: proc(w: ^World, n: ^Node) {
 	r := &w.rng
 	if !n.alive || !n.e_open {
@@ -1365,6 +1388,7 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 	}
 	old_disk := make(map[string][]u8, context.temp_allocator)
 	base := make(map[string][]u8, context.temp_allocator)
+	untracked := make(map[string]bool, context.temp_allocator)
 	{
 		context = instance_context(&n.inst)
 		_end_held_agents(w, n, sm.root)
@@ -1375,6 +1399,20 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 			}
 			if d, terr := eng.tree_read(&n.e, m.objs[sm.oi].o, p, context.temp_allocator, {}, line_eng(base_line)); terr == .None {
 				base[p] = d
+			}
+		}
+		if names, lerr := eng.tree_list(&n.e, m.objs[sm.oi].o, "", context.temp_allocator, {}, line_eng(base_line)); lerr == .None {
+			nl: for nm in names {
+				for tp in paths {
+					if nm == tp {
+						continue nl
+					}
+				}
+				if d, terr := eng.tree_read(&n.e, m.objs[sm.oi].o, nm, context.temp_allocator, {}, line_eng(base_line)); terr == .None {
+					for t in parse_tokens(d) {
+						untracked[t.text] = true
+					}
+				}
 			}
 		}
 		node_after(n)
@@ -1407,6 +1445,30 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 				git_gone[ch.name] = true
 			}
 		}
+		{
+			files := make([dynamic]Disk_File, context.temp_allocator)
+			disk_walk(&n.disk, &files)
+			prefix := strings.concatenate({sm.root, "/"}, context.temp_allocator)
+			tracked_names := TREE_PATHS
+			fl: for f in files {
+				if !strings.has_prefix(f.path, prefix) {
+					continue
+				}
+				rel := f.path[len(prefix):]
+				if strings.has_prefix(rel, ".git/") || fs.path_internal(rel) {
+					continue
+				}
+				for tp in tracked_names {
+					if rel == tp {
+						continue fl
+					}
+				}
+				for t in parse_tokens(f.data) {
+					untracked[t.text] = true
+					_carry_token(w, n, sm.oi, key, rel, t.text)
+				}
+			}
+		}
 		for ch in changes {
 			got, gerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), context.temp_allocator)
 			if ch.gone != (gerr == .Not_Found) || (!ch.gone && string(got) != string(ch.new)) {
@@ -1426,14 +1488,25 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 			op.overwrite = !gone && had_base
 			kept := make(map[string]bool, context.temp_allocator)
 			if !gone {
+				carried := make(map[string]bool, context.temp_allocator)
+				for t in parse_tokens(old_disk[p]) {
+					carried[t.text] = true
+				}
 				for t in parse_tokens(after) {
 					kept[t.text] = true
+					if untracked[t.text] {
+						continue
+					}
+					if carried[t.text] {
+						_carry_token(w, n, sm.oi, key, p, t.text)
+						continue
+					}
 					append(&op.tokens, strings.clone(t.text, w.allocator))
 				}
 			}
 			for src in ([2][]u8{base[p], old_disk[p]}) {
 				for t in parse_tokens(src) {
-					if !kept[t.text] {
+					if !kept[t.text] && !untracked[t.text] {
 						kept[t.text] = true
 						append(&op.deletes, strings.clone(t.text, w.allocator))
 					}
