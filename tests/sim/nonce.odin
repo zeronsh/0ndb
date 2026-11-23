@@ -145,7 +145,7 @@ BUFFER_LIVE_MSG :: osync.DRAFT_MSG_MAX - 1
 
 @(private = "file")
 _buffer_seal_observe :: proc(w: ^World, sid: osync.Stream_Id, frame: []u8, who: string) {
-	if len(frame) < 25 || frame[0] != 1 {
+	if len(frame) < 25 || frame[0] != 2 {
 		return
 	}
 	k: [56]u8

@@ -13,7 +13,7 @@ import osync "../sync"
 LIVE_BUFFER_MSG :: i64(osync.DRAFT_MSG_MAX - 1)
 
 @(private)
-LIVE_FRAME_V1 :: u8(1)
+LIVE_FRAME_V2 :: u8(2)
 
 @(private)
 LIVE_HEADER :: 1 + 16 + 8
@@ -239,6 +239,59 @@ _bcompose :: proc(a, b: []crdt.Delta_Op) -> [dynamic]crdt.Delta_Op {
 	}
 	_btrim(&out)
 	return out
+}
+
+@(private)
+_btransform :: proc(a, b: []crdt.Delta_Op, a_first: bool) -> (a2, b2: [dynamic]crdt.Delta_Op) {
+	a2 = make([dynamic]crdt.Delta_Op, context.temp_allocator)
+	b2 = make([dynamic]crdt.Delta_Op, context.temp_allocator)
+	sa := Bside{ops = a}
+	sb := Bside{ops = b}
+	for {
+		oa, ra, ha := _bpeek(&sa)
+		ob, rb, hb := _bpeek(&sb)
+		if !ha && !hb {
+			break
+		}
+		ia := ha && oa.kind == .Insert
+		ib := hb && ob.kind == .Insert
+		if ia && (a_first || !ib) {
+			x := _btake(&sa, ra)
+			_bpush(&a2, x)
+			_bpush(&b2, crdt.Delta_Op{kind = .Retain, n = x.n})
+			continue
+		}
+		if ib {
+			x := _btake(&sb, rb)
+			_bpush(&a2, crdt.Delta_Op{kind = .Retain, n = x.n})
+			_bpush(&b2, x)
+			continue
+		}
+		if !ha {
+			_bpush(&b2, _btake(&sb, rb))
+			continue
+		}
+		if !hb {
+			_bpush(&a2, _btake(&sa, ra))
+			continue
+		}
+		k := min(ra, rb)
+		pa := _btake(&sa, k)
+		pb := _btake(&sb, k)
+		switch {
+		case pa.kind == .Retain && pb.kind == .Retain:
+			_bpush(&a2, pa)
+			_bpush(&b2, pb)
+		case pa.kind == .Delete && pb.kind == .Retain:
+			_bpush(&a2, pa)
+		case pa.kind == .Retain && pb.kind == .Delete:
+			_bpush(&b2, pb)
+		case:
+		}
+	}
+	_btrim(&a2)
+	_btrim(&b2)
+	return
 }
 
 @(private)
@@ -527,6 +580,7 @@ _ovl_drop :: proc(e: ^Engine, b: ^Buffer) {
 	}
 	gone := _gone_of(b, saved[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
+	_pend_clear(e, b)
 	e.stats.buffer_live_dropped += 1
 	ops := _bytes_to_units(b, saved[:], _view_units_at, true)
 	_buffer_emit_ops(e, b, ops[:], gone[:])
@@ -540,12 +594,10 @@ _ovl_advanced :: proc(e: ^Engine, b: ^Buffer, a: []crdt.Delta_Op) -> bool {
 	if len(a) == 0 {
 		return true
 	}
-	ff := _log_frontier(b)
 	acc := make([dynamic]crdt.Delta_Op, context.temp_allocator)
 	for o, j in b.ovl {
 		acc = _bcompose(acc[:], o.ops[:])
-		last := [1]crdt.Op_Id{_ovl_last(o)}
-		if _ids_eq(ff, last[:]) && _bequal(acc[:], a) {
+		if fs.history_contains(b.hist, b.version[:], _ovl_last(o)) && _bequal(acc[:], a) {
 			for k in 0 ..= j {
 				_ovl_free(e, b.ovl[k])
 			}
@@ -561,6 +613,7 @@ _ovl_advanced :: proc(e: ^Engine, b: ^Buffer, a: []crdt.Delta_Op) -> bool {
 	fix := _bcompose(_binverse(b.oc[:])[:], a)
 	gone := _gone_of(b, fix[:], _ovl_id_runs(b)[:])
 	_ovl_clear(e, b)
+	_pend_clear(e, b)
 	e.stats.buffer_live_dropped += 1
 	ops := _bytes_to_units(b, fix[:], _view_units_at, true)
 	_buffer_emit_ops(e, b, ops[:], gone[:])
@@ -653,6 +706,12 @@ _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch
 		prim.write_uvarint(&w, id.seq)
 	}
 	prim.write_uvarint(&w, u64(flen))
+	acks := _log_acks(b)
+	prim.write_uvarint(&w, u64(len(acks)))
+	for a in acks {
+		prim.write_id(&w, a.actor)
+		prim.write_uvarint(&w, a.next)
+	}
 	bb := make([dynamic]u8, context.temp_allocator)
 	if crdt.batch_encode(batch, &bb, nil) != .None {
 		return
@@ -668,7 +727,7 @@ _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch
 	}
 	e.live_sent[h.id] = off
 	hdr: [LIVE_HEADER]u8
-	hdr[0] = LIVE_FRAME_V1
+	hdr[0] = LIVE_FRAME_V2
 	boot := e.live_boot
 	copy(hdr[1:17], boot[:])
 	prim.put_u64le(hdr[17:], u64(off))
@@ -703,7 +762,7 @@ _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch
 
 @(private)
 _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
-	if e.cfg.buffer_live_off || len(ev.meta) < LIVE_HEADER || ev.meta[0] != LIVE_FRAME_V1 {
+	if e.cfg.buffer_live_off || len(ev.meta) < LIVE_HEADER || ev.meta[0] != LIVE_FRAME_V2 {
 		return
 	}
 	scratch := virtual.arena_temp_begin(&e.temp)
@@ -788,6 +847,15 @@ _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 		ff[i].seq = prim.read_uvarint(&r)
 	}
 	flen := int(prim.read_uvarint(&r))
+	nacks := int(prim.read_uvarint(&r))
+	if nacks > LIVE_FF_WINDOW {
+		return
+	}
+	acks := make([]Ack, nacks, context.temp_allocator)
+	for i in 0 ..< nacks {
+		acks[i].actor = prim.read_id(&r)
+		acks[i].next = prim.read_uvarint(&r)
+	}
 	if !prim.reader_ok(&r) {
 		return
 	}
@@ -806,13 +874,116 @@ _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 	}
 	for b in list {
 		if slice.contains(e.buffers[:], b) {
-			_ovl_apply(e, b, h, &batch, ff, flen, dev, boot)
+			_ovl_apply(e, b, h, &batch, ff, flen, dev, boot, acks)
 		}
 	}
 }
 
 @(private)
-_ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: []crdt.Op_Id, flen: int, dev: prim.Id, boot: [16]u8) {
+Ack :: struct {
+	actor: prim.Id,
+	next:  u64,
+}
+
+@(private)
+PEERS_MAX :: 4
+
+@(private)
+_log_acks :: proc(b: ^Buffer) -> [dynamic]Ack {
+	out := make([dynamic]Ack, context.temp_allocator)
+	log := &b.view.log
+	g := &b.hist.g
+	for i := len(log.entries) - 1; i >= 0 && i >= len(log.entries) - LIVE_FF_WINDOW; i -= 1 {
+		x := log.entries[i]
+		id := crdt.graph_id(g, x.lv + crdt.Lv(x.len) - 1)
+		found := false
+		for &a in out {
+			if a.actor == id.actor {
+				a.next = max(a.next, id.seq + 1)
+				found = true
+			}
+		}
+		if !found {
+			append(&out, Ack{id.actor, id.seq + 1})
+		}
+	}
+	peers: for actor in b.peers {
+		for a in out {
+			if a.actor == actor {
+				continue peers
+			}
+		}
+		n := fs.history_next_seq(b.hist, actor)
+		if n == 0 {
+			append(&out, Ack{actor, 0})
+		} else if fs.history_contains(b.hist, b.version[:], crdt.Op_Id{actor, n - 1}) {
+			append(&out, Ack{actor, n})
+		}
+	}
+	return out
+}
+
+@(private)
+_peer_note :: proc(e: ^Engine, b: ^Buffer, actor: prim.Id) {
+	for x in b.peers {
+		if x == actor {
+			return
+		}
+	}
+	if b.peers == nil {
+		b.peers = make([dynamic]prim.Id, e.allocator)
+	}
+	if len(b.peers) >= PEERS_MAX {
+		ordered_remove(&b.peers, 0)
+	}
+	append(&b.peers, actor)
+}
+
+@(private)
+_actor_less :: proc(a, b: prim.Id) -> bool {
+	return crdt.op_id_less(crdt.Op_Id{a, 0}, crdt.Op_Id{b, 0})
+}
+
+@(private)
+_pend_fits :: proc(b: ^Buffer, batch: ^crdt.Batch, dev: prim.Id, flen: int, seen: u64, acked: bool) -> bool {
+	if !acked {
+		return false
+	}
+	for o in b.ovl {
+		if o.device != dev {
+			return false
+		}
+	}
+	if batch.seq > 0 {
+		prev := crdt.Op_Id{batch.actor, batch.seq - 1}
+		chained := false
+		#reverse for o in b.ovl {
+			if o.first.actor == batch.actor {
+				chained = _ovl_last(o) == prev
+				break
+			}
+		}
+		if !chained && !fs.history_contains(b.hist, b.version[:], prev) {
+			return false
+		}
+	}
+	next := fs.history_next_seq(b.hist, b.actor)
+	if len(b.pend) == 0 {
+		if next > seen {
+			return false
+		}
+	} else if b.pend[0].lo != seen || b.pend[len(b.pend) - 1].hi + 1 != next {
+		return false
+	}
+	net := 0
+	for p in b.pend {
+		net += _bnet(p.ops[:])
+	}
+	return flen == _disp_len(b) - net
+}
+
+@(private)
+_ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: []crdt.Op_Id, flen: int, dev: prim.Id, boot: [16]u8, acks: []Ack) {
 	if b.hist != h.hist || b.view == nil || b.view.stale || len(batch.ops) == 0 {
 		return
 	}
@@ -834,7 +1005,21 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 			return
 		}
 	}
-	if !_ids_eq(ff, _file_frontier(b)) || flen != _disp_len(b) {
+	seen: u64
+	acked := false
+	for a in acks {
+		if a.actor == b.actor {
+			seen, acked = a.next, true
+		}
+	}
+	_peer_note(e, b, batch.actor)
+	if acked {
+		_pend_ack(e, b, seen)
+	} else if len(b.pend) > 0 {
+		seen, acked = b.pend[0].lo, true
+	}
+	linear := _ids_eq(ff, _file_frontier(b)) && flen == _disp_len(b) && len(b.pend) == 0
+	if !linear && !_pend_fits(b, batch, dev, flen, seen, acked) {
 		e.stats.buffer_live_skipped += 1
 		return
 	}
@@ -842,21 +1027,18 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 	seqs := make([dynamic]u64, context.temp_allocator)
 	cur := batch.seq
 	shift, consumed := 0, 0
-	total := _disp_len(b)
 	for r in batch.ops {
 		dpos := r.pos - shift
-		if dpos < consumed || dpos > total {
+		if dpos < consumed || dpos > flen {
 			return
 		}
 		#partial switch r.kind {
 		case .Delete:
-			if dpos + r.len > total {
+			if dpos + r.len > flen {
 				return
 			}
 			_bpush(&d, crdt.Delta_Op{kind = .Retain, n = dpos - consumed})
-			c := make([]u8, r.len, context.temp_allocator)
-			_disp_read(b, dpos, c)
-			_bpush(&d, crdt.Delta_Op{kind = .Delete, n = r.len, text = c})
+			_bpush(&d, crdt.Delta_Op{kind = .Delete, n = r.len})
 			consumed = dpos + r.len
 			shift -= r.len
 			cur += u64(r.len)
@@ -864,7 +1046,6 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 			if len(r.content) != r.len {
 				return
 			}
-			_bpush(&d, crdt.Delta_Op{kind = .Retain, n = dpos - consumed})
 			_bpush(&d, crdt.Delta_Op{kind = .Insert, n = r.len, text = r.content, author = batch.actor})
 			append(&seqs, cur)
 			consumed = dpos
@@ -875,18 +1056,52 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 		}
 	}
 	_btrim(&d)
-	ops := _bytes_to_units(b, d[:], _disp_units_at, false)
+	moved := d[:]
+	if linear {
+		_pend_clear(e, b)
+	} else {
+		tie := _actor_less(batch.actor, b.actor)
+		for &p in b.pend {
+			c2, p2 := _btransform(moved, p.ops[:], tie)
+			_ops_release(e, &p.ops)
+			p.ops = _ops_own(e, p2[:])
+			moved = c2[:]
+		}
+		e.stats.buffer_live_transformed += 1
+	}
+	full := make([dynamic]crdt.Delta_Op, context.temp_allocator)
+	at := 0
+	total := _disp_len(b)
+	for o in moved {
+		x := o
+		switch o.kind {
+		case .Retain:
+			at += o.n
+		case .Delete:
+			if at + o.n > total {
+				return
+			}
+			t := make([]u8, o.n, context.temp_allocator)
+			_disp_read(b, at, t)
+			x.text = t
+			at += o.n
+		case .Insert:
+		}
+		_bpush(&full, x)
+	}
+	ops := _bytes_to_units(b, full[:], _disp_units_at, false)
 	o := new(Ovl, e.allocator)
 	o.device = dev
 	o.boot = boot
 	o.first = first
 	o.n = n
-	o.ops = _ops_own(e, d[:])
+	o.ops = _ops_own(e, full[:])
 	o.seqs = make([dynamic]u64, 0, len(seqs), e.allocator)
 	append(&o.seqs, ..seqs[:])
 	append(&b.ovl, o)
 	_ovl_recompose(e, b)
 	e.stats.buffer_live_applied += 1
+	b.shown += 1
 	_buffer_emit_ops(e, b, ops[:])
 }
 
@@ -925,7 +1140,44 @@ _buffer_live_follow :: proc(e: ^Engine, h: ^Handle, on: bool) {
 		sg.live = on
 		osync.replicator_live_follow(&h.sp.repl, &h.scope, sg.device, h.name, 0, on)
 	}
+	if !on {
+		for dev in h.live_devs {
+			osync.replicator_live_follow(&h.sp.repl, &h.scope, dev, h.name, 0, false)
+		}
+		clear(&h.live_devs)
+		return
+	}
+	devs := make([dynamic]prim.Id, context.temp_allocator)
+	for dev in h.sp.identities {
+		append(&devs, dev)
+	}
+	slice.sort_by(devs[:], proc(a, b: prim.Id) -> bool {
+		return _actor_less(a, b)
+	})
+	outer: for dev in devs {
+		if dev == e.self || len(h.live_devs) >= LIVE_DEVS_MAX {
+			continue
+		}
+		for sg in h.segs {
+			if sg.device == dev {
+				continue outer
+			}
+		}
+		for x in h.live_devs {
+			if x == dev {
+				continue outer
+			}
+		}
+		if h.live_devs == nil {
+			h.live_devs = make([dynamic]prim.Id, e.allocator)
+		}
+		append(&h.live_devs, dev)
+		osync.replicator_live_follow(&h.sp.repl, &h.scope, dev, h.name, 0, true)
+	}
 }
+
+@(private)
+LIVE_DEVS_MAX :: 32
 
 @(private)
 _buffers_wake :: proc(e: ^Engine) {
@@ -951,6 +1203,14 @@ _buffer_hold :: proc(e: ^Engine, b: ^Buffer, ready: Ready) -> Error {
 	}
 	append(&b.held, ready)
 	return .Pending
+}
+
+buffer_live_shown :: proc(e: ^Engine, id: Buffer_Id) -> u64 {
+	b := _buffer_find(e, id)
+	if b == nil {
+		return 0
+	}
+	return b.shown
 }
 
 buffer_overlay :: proc(e: ^Engine, id: Buffer_Id) -> int {
@@ -1207,4 +1467,219 @@ _buffer_intents :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) {
 	}
 	e.stats.buffer_live_intents_applied += 1
 	_touch(e)
+}
+
+@(private)
+Pend :: struct {
+	actor: prim.Id,
+	lo:    u64,
+	hi:    u64,
+	ops:   [dynamic]crdt.Delta_Op,
+}
+
+@(private)
+PEND_MAX :: 64
+
+@(private)
+_pend_clear :: proc(e: ^Engine, b: ^Buffer) {
+	for &p in b.pend {
+		_ops_release(e, &p.ops)
+	}
+	clear(&b.pend)
+}
+
+@(private)
+_pend_add :: proc(e: ^Engine, b: ^Buffer, actor: prim.Id, lo, hi: u64, ops: []crdt.Delta_Op) {
+	if b.pend == nil {
+		b.pend = make([dynamic]Pend, e.allocator)
+	}
+	if len(b.pend) >= PEND_MAX {
+		_ops_release(e, &b.pend[0].ops)
+		ordered_remove(&b.pend, 0)
+	}
+	append(&b.pend, Pend{actor = actor, lo = lo, hi = hi, ops = _ops_own(e, ops)})
+}
+
+@(private)
+_pend_ack :: proc(e: ^Engine, b: ^Buffer, seen: u64) {
+	n := 0
+	for n < len(b.pend) && b.pend[n].hi < seen {
+		_ops_release(e, &b.pend[n].ops)
+		n += 1
+	}
+	if n > 0 {
+		remove_range(&b.pend, 0, n)
+	}
+}
+
+@(private)
+_bnet :: proc(d: []crdt.Delta_Op) -> int {
+	n := 0
+	for o in d {
+		#partial switch o.kind {
+		case .Insert:
+			n += o.n
+		case .Delete:
+			n -= o.n
+		}
+	}
+	return n
+}
+
+@(private)
+_disp_delta_bytes :: proc(b: ^Buffer, d: []crdt.Delta_Op) -> (out: [dynamic]crdt.Delta_Op, ok: bool) {
+	out = make([dynamic]crdt.Delta_Op, context.temp_allocator)
+	total := _disp_len(b)
+	u, p := 0, 0
+	for o in d {
+		switch o.kind {
+		case .Retain:
+			u += o.n
+			np := _to_bytes(b, u)
+			_bpush(&out, crdt.Delta_Op{kind = .Retain, n = np - p})
+			p = np
+		case .Delete:
+			u += o.n
+			np := _to_bytes(b, u)
+			if np > total || np < p {
+				return out, false
+			}
+			t := make([]u8, np - p, context.temp_allocator)
+			_disp_read(b, p, t)
+			_bpush(&out, crdt.Delta_Op{kind = .Delete, n = np - p, text = t})
+			p = np
+		case .Insert:
+			_bpush(&out, crdt.Delta_Op{kind = .Insert, n = len(o.text), text = o.text, author = o.author})
+		}
+		if p > total {
+			return out, false
+		}
+	}
+	_btrim(&out)
+	return out, true
+}
+
+@(private)
+_btouch :: proc(e: []crdt.Delta_Op, o: []crdt.Delta_Op) -> bool {
+	Span :: struct {
+		lo, hi: int,
+	}
+	ins := make([dynamic]Span, context.temp_allocator)
+	gaps := make([dynamic]int, context.temp_allocator)
+	t := 0
+	for x in o {
+		switch x.kind {
+		case .Retain:
+			t += x.n
+		case .Insert:
+			append(&ins, Span{t, t + x.n})
+			t += x.n
+		case .Delete:
+			append(&gaps, t)
+		}
+	}
+	s := 0
+	for x in e {
+		switch x.kind {
+		case .Retain:
+			s += x.n
+		case .Delete:
+			for r in ins {
+				if s < r.hi && s + x.n > r.lo {
+					return true
+				}
+			}
+			s += x.n
+		case .Insert:
+			for r in ins {
+				if s >= r.lo && s <= r.hi {
+					return true
+				}
+			}
+			for g in gaps {
+				if s == g {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+@(private)
+_ovl_unmap :: proc(b: ^Buffer, ed: []crdt.Delta_Op) -> (ev: []crdt.Delta_Op, ok: bool) {
+	cur := ed
+	#reverse for o in b.ovl {
+		if _btouch(cur, o.ops[:]) {
+			return nil, false
+		}
+		inv := _binverse(o.ops[:])
+		x, _ := _btransform(cur, inv[:], true)
+		cur = x[:]
+	}
+	return cur, true
+}
+
+@(private)
+_ovl_rebase :: proc(e: ^Engine, b: ^Buffer, ev: []crdt.Delta_Op) {
+	cur := ev
+	for o in b.ovl {
+		o2, c2 := _btransform(o.ops[:], cur, true)
+		_ops_release(e, &o.ops)
+		o.ops = _ops_own(e, o2[:])
+		cur = c2[:]
+	}
+	_ovl_recompose(e, b)
+}
+
+@(private)
+_pend_rebase :: proc(e: ^Engine, b: ^Buffer, c: []crdt.Delta_Op) {
+	if len(b.pend) == 0 || len(c) == 0 {
+		return
+	}
+	all := make([dynamic]crdt.Delta_Op, context.temp_allocator)
+	for p in b.pend {
+		all = _bcompose(all[:], p.ops[:])
+	}
+	inv := _binverse(all[:])
+	cb, _ := _btransform(c, inv[:], true)
+	cur := cb[:]
+	for &p in b.pend {
+		p2, c2 := _btransform(p.ops[:], cur, true)
+		_ops_release(e, &p.ops)
+		p.ops = _ops_own(e, p2[:])
+		cur = c2[:]
+	}
+}
+
+@(private)
+_delta_runs_view :: proc(b: ^Buffer, ops: []crdt.Delta_Op, seq0: u64, x: ^Built) -> Error {
+	target := fs.inode_op(b.hist, b.inode)
+	total := crdt.text_len(&b.view.text)
+	ob, shift := 0, 0
+	for o in ops {
+		switch o.kind {
+		case .Retain:
+			ob += o.n
+			if ob > total {
+				return .Invalid
+			}
+		case .Delete:
+			start := ob
+			ob += o.n
+			if ob > total {
+				return .Invalid
+			}
+			if o.n > 0 {
+				_built_delete(b, x, target, start, start + shift, o.n)
+				shift -= o.n
+			}
+		case .Insert:
+			c := make([]u8, len(o.text), context.temp_allocator)
+			copy(c, o.text)
+			_built_insert(b, x, seq0, crdt.Op_Run{target = target, kind = .Insert, pos = ob + shift, len = len(c), content = c})
+			shift += len(c)
+		}
+	}
+	return .None
 }
