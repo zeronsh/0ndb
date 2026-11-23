@@ -1054,7 +1054,13 @@ concurrent typing is never lost or reverted.
   hint: the engine finds the first damaged record by walking the local
   stream before it rechecks that range against the relay. A damaged record
   the relay already holds is restored from the relay copy (see journal), and
-  the stream resumes once the restore is durable; one the relay does not
+  the stream resumes once the restore is durable. The durable restore also
+  re-drives what the damage made the engine skip, without a timer: the
+  object's pending republish (its handle could not open, so the stream's
+  unuploaded tail was never registered again) and its derived state (a map
+  table reset, a conversation reindexed), which a redaction of another
+  device's range could not purge while the handle was damaged; own
+  redaction intents are retried every tick anyway. One the relay does not
   hold (never uploaded, or below the relay's base, as for a promoted object
   whose bytes live on peers), or one in a stream the relay keeps no bytes of
   (device storage class), is lost. Every consumer of a damaged own record treats it as a

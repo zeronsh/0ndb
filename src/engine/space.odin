@@ -1022,24 +1022,32 @@ _pending_republish :: proc(e: ^Engine, sp: ^Space) {
 		}
 	}
 	for id in acc.list {
-		rec, found, err := _rec_get(e, id)
-		if err != .None || !found || !rec.own {
-			continue
-		}
-		h, herr := _handle_get(e, Object{sp.id, id}, rec.kind)
-		if herr != .None {
-			continue
-		}
-		path := _own_path(e, h) or_continue
-		length := _own_len(h)
-		if length > 0 {
-			_dirty_add(e, h, path, length)
-		}
-		if cur, ok := &e.rlog.pend[_pending_key(sp.id, id)]; ok && cur^ == RLOG_UNKNOWN {
-			cur^ = length
-		}
-		_dirty_keys(e, sp, id, rec.kind, h.scope, h.own_tree)
+		_pending_republish_one(e, sp, id)
 	}
+}
+
+@(private)
+_pending_republish_one :: proc(e: ^Engine, sp: ^Space, id: prim.Id) {
+	rec, found, err := _rec_get(e, id)
+	if err != .None || !found || !rec.own {
+		return
+	}
+	h, herr := _handle_get(e, Object{sp.id, id}, rec.kind)
+	if herr != .None {
+		return
+	}
+	path, perr := _own_path(e, h)
+	if perr != .None {
+		return
+	}
+	length := _own_len(h)
+	if length > 0 {
+		_dirty_add(e, h, path, length)
+	}
+	if cur, ok := &e.rlog.pend[_pending_key(sp.id, id)]; ok && cur^ == RLOG_UNKNOWN {
+		cur^ = length
+	}
+	_dirty_keys(e, sp, id, rec.kind, h.scope, h.own_tree)
 }
 
 @(private)
