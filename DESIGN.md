@@ -941,10 +941,11 @@ equal in both directions.
   history (`tree_revert_set(tree, base, actors, line)`, `tree_unrevert`),
   committed like an API write; a mount is that plus materialization. A land
   or merge of an isolated task is a line merge, so the ops it brings keep
-  their scope actors and need no marker; the task's fork mounts ingest under
-  their ingestion actors, and `history_mount_actors(mounts, lines)` resolves
-  those (home and per-line) from the actor registrations. The cross-tree
-  notice for a removed file another tree edited comes with undo.
+  their scope actors. `history_mount_actors(mounts, lines)` returns the
+  ingestion actors of the given mounts (home and per line) from the actor
+  registrations, which are replicated `REC_ACTOR` records in each device's
+  history stream. The cross-tree notice for a removed file another tree
+  edited comes with undo.
 - One live mount per (history, directory) via a lock file. Hibernation drops
   everything per file; any entry point wakes the mount first.
 - **Text views**: `history_view_open(inode, version)` gives a caller its own
@@ -1470,10 +1471,13 @@ running on it is a record in it.
     of the `Scope` records of every conversation in the tree, the revert actors
     of earlier undos and redos of the tree (so undoing T' < T after undoing T
     reverts the first undo's copies and deletions too), and the ingestion
-    actors of its tasks' fork mounts (`history_mount_actors`); landed and
-    merged ops keep their scope actors, so they are in the set already.
-    Everything else is outside the set and survives: a person's own disk and
-    buffer edits made during T, other trees, git and imports.
+    actors of its tasks' fork mounts (home and per line). Landed and merged
+    ops keep their scope actors, so a land needs no actor of its own. The set
+    and each (tree, line) base are resolved once, by the device that stages
+    the undo, into the `Undo` record; every device reverts exactly those
+    actors from that base, whatever registrations or records it has received
+    since. Everything else is outside the set and survives: a person's own
+    disk and buffer edits made during T, other trees, git and imports.
   - *Versions and lines.* A send is a fence (every mount of the line ingests
     before the `Msg` is recorded), so T's mount set (the fold of `Msg.files`
     deltas along T's ancestor chain) gives each mounted tree its version
@@ -1496,8 +1500,9 @@ running on it is a record in it.
     head); where a provider cannot, the task gets a fresh native session seeded
     from its conversation up to the derived head, never the newer session kept
     silently.
-  - *The record.* `Undo{id, msg = T, phase}` in A's conversation is durable and
-    replicated, so any device that opens A resumes or rolls it forward.
+  - *The record.* `Undo{id, msg = T, set, phase}` in A's conversation is
+    durable and replicated, so any device that opens A resumes or rolls it
+    forward.
     Phases run in order: hold (`Hold{undo}` and `Interrupted{reason = undo}` on
     every run of the tree, waiting until each has sealed or is held), fence,
     reverts per (tree, line), `Unmount` and checkout moves, `Leaf` records
