@@ -550,7 +550,11 @@ equal in both directions.
   (`attrib_default_actor` is the one rule for that); an observed entry whose
   content can no longer be matched is unattributed.
 - **Materialization**: remote or merged ops are written to disk only for
-  inodes touched since the synced version; content that differs from the
+  inodes touched since the synced version, plus every ancestor of a touched
+  inode whose place differs between the two versions (a move that a later
+  concurrent move turns into a cycle is skipped, which moves a directory no
+  new op touches); a directory created at a path whose tracked entry is
+  another inode waits for that inode to move away; content that differs from the
   shadow, or untracked content where an inode must land, is ingested first,
   never overwritten, and the plan is rebuilt from the new synced version.
   Untracked content that is exactly the inode at the target version (what a
