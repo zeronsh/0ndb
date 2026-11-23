@@ -1498,9 +1498,6 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item) -> (head: crdt.Op_Id, t
 	h := m.history
 	pseudo := mount_snapshot_pseudo(m.id, m.line)
 	actor := fshist.ingestion_actor(h.self, pseudo)
-	if rerr := history_register_actor(h, actor, pseudo); rerr != .None {
-		return {}, false, rerr
-	}
 	parents := make([dynamic]crdt.Op_Id, context.temp_allocator)
 	append(&parents, ..m.merge_base)
 	if known := crdt.graph_known(&h.g, actor); known > 0 {

@@ -1206,7 +1206,7 @@ _log_sync_done :: proc(arg: rawptr) {
 mount_disk_unseen :: proc(m: ^Mount, rel: string) -> bool {
 	e, found, serr := shadow_get(&m.shadow, rel)
 	if serr != .None {
-		return false
+		return true
 	}
 	if found {
 		return !disk_matches(m, rel, e)
