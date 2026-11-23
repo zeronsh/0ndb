@@ -57,14 +57,16 @@ replicator_follow_segments :: proc(r: ^Replicator, scope: ^Scope, name: string, 
 		return nerr
 	}
 	r.groups[suffix] = g
-	if r.phase == .Ready {
-		if r.cfg.filtered {
-			_feed_subscribe(r, true)
-		} else {
-			_list_all(r)
-		}
-		_repl_flush(r)
+	if r.phase != .Ready {
+		r.group_new = true
+		return .None
 	}
+	if r.cfg.filtered {
+		_feed_subscribe(r, true)
+	} else {
+		_list_all(r)
+	}
+	_repl_flush(r)
 	return .None
 }
 
