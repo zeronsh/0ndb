@@ -1167,6 +1167,7 @@ Pass :: struct {
 	changes:    [dynamic]Change,
 	seen:       map[string]bool,
 	young:      [dynamic]string,
+	deferred:   map[u64]bool,
 	holding:    [dynamic]string,
 	rebased:    [dynamic]crdt.Op_Id,
 	scope_of:   map[string]^Scope,
@@ -1408,6 +1409,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	p.held_c = make(map[string]bool, p.long)
 	p.seen = make(map[string]bool, p.long)
 	p.young = make([dynamic]string, p.long)
+	p.deferred = make(map[u64]bool, p.long)
 	p.holding = make([dynamic]string, p.long)
 	p.rebased = make([dynamic]crdt.Op_Id, p.long)
 	p.scope_of = make(map[string]^Scope, p.long)
@@ -1743,6 +1745,18 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 	}
 	clear(&p.held_r)
 	clear(&p.held_c)
+	if len(p.deferred) > 0 {
+		keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+		for c in p.changes {
+			if c.kind == .Create && c.stat.ino != 0 && p.deferred[c.stat.ino] {
+				append(&p.young, clone_string(c.path, p.long) or_else "")
+				continue
+			}
+			append(&keep, c)
+		}
+		clear(&p.changes)
+		append(&p.changes, ..keep[:])
+	}
 	if len(p.changes) == 0 && !(p.git_wrote && !p.marked) {
 		return .None
 	}
@@ -1836,6 +1850,18 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			append(&l, i)
 			groups[actor] = l
 		}
+		moving := make([dynamic]prim.Id, 0, len(order), context.temp_allocator)
+		rest := make([dynamic]prim.Id, 0, len(order), context.temp_allocator)
+		for actor in order {
+			mv := false
+			for i in groups[actor] {
+				mv ||= p.changes[i].kind == .Create && p.changes[i].moved != ""
+			}
+			append(&moving if mv else &rest, actor)
+		}
+		clear(&order)
+		append(&order, ..moving[:])
+		append(&order, ..rest[:])
 		for actor in order {
 			idx := groups[actor][:]
 			emit_order(p, idx)
@@ -1960,10 +1986,12 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		if !stat_clean(d.stat, e) {
 			if mount_held_by(m, rel, p.scope_of[rel]) {
 				append(&p.holding, clone_string(rel, p.long) or_else "")
+				defer_ino(p, e)
 				return .None
 			}
 			if p.settle && d.stat.mtime_ns > p.cutoff && d.stat.mtime_ns <= p.now {
 				append(&p.young, clone_string(rel, p.long) or_else "")
+				defer_ino(p, e)
 				return .None
 			}
 			add_modify(p, rel, d, e)
@@ -1972,6 +2000,13 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		add_modify(p, rel, d, e)
 	}
 	return .None
+}
+
+@(private)
+defer_ino :: proc(p: ^Pass, e: Entry) {
+	if e.stat.ino != 0 {
+		p.deferred[e.stat.ino] = true
+	}
 }
 
 @(private)
@@ -2370,6 +2405,24 @@ Dir_Move :: struct {
 
 @(private)
 detect_moves :: proc(p: ^Pass) {
+	held := make(map[u64]fstree.Kind, context.temp_allocator)
+	for c in p.changes {
+		if c.kind == .Create && c.stat.ino != 0 {
+			held[c.stat.ino] = disk_to_tree(c.disk)
+		}
+	}
+	for i in 0 ..< len(p.changes) {
+		c := p.changes[i]
+		if c.kind != .Modify || c.carried || c.old.stat.ino == 0 || c.stat.ino == c.old.stat.ino {
+			continue
+		}
+		if k, ok := held[c.old.stat.ino]; !ok || k != c.old.kind {
+			continue
+		}
+		p.changes[i].kind = .Create
+		p.changes[i].old = {}
+		append(&p.changes, Change{kind = .Remove, path = c.path, old = c.old})
+	}
 	by_ino := make(map[u64]int, context.temp_allocator)
 	for c, i in p.changes {
 		if c.kind == .Remove && c.old.stat.ino != 0 {

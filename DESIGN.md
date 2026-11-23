@@ -460,7 +460,14 @@ equal in both directions.
   equal are copies of the source's spans, so they keep their authors
   exactly (nothing is matched by content across files), an editor's atomic
   save never cuts the file's blame, and an edit made concurrently to the
-  replaced file merges into it. Changes no scope claims belong to the mount's ingestion
+  replaced file merges into it. The mirror case, a path whose recorded
+  inode number now sits at a created path while the path itself holds a
+  different file (moved away, then a new file saved in its place), is a
+  move of the file to the created path plus a new file at the old path,
+  never an edit that hands the old file's history to the new one. A pass
+  that defers a file (young, or held by a scope) also defers any created
+  path holding that file's recorded inode number, so both halves of a move
+  are always ingested in one pass. Changes no scope claims belong to the mount's ingestion
   actor, `blake2b-128("0ndb ingestion actor" || device || mount id)`, never
   to the device's own API writes, so disk changes concurrent with them stay
   representable. Opening a mount appends one `REC_ACTOR` record (tag 9:
