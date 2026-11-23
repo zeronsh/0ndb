@@ -346,11 +346,13 @@ STAT_RESTORES_WRITTEN: Stat
 STAT_RESTORES_READ: Stat
 STAT_RESTORE_SCENARIOS: Stat
 STAT_FORGET_SCENARIOS: Stat
+STAT_FORGET_DEVICE: Stat
 STAT_REREADS: Stat
 STAT_REREAD_BYTES: Stat
 
 @(init)
 _archive_hooks :: proc "contextless" () {
+	register_final_check(86, check_forget_device_held)
 	register_final_check(87, check_forget_third_reader)
 	register_final_check(88, check_forget_offline_writer)
 	register_final_check(90, check_restore_offline_writer)
@@ -370,6 +372,7 @@ _archive_hooks :: proc "contextless" () {
 	STAT_RESTORES_WRITTEN = register_stat(77, 5, "restores_written")
 	STAT_RESTORES_READ = register_stat(77, 6, "restores_read")
 	STAT_FORGET_SCENARIOS = register_stat(77, 7, "forget_scenarios")
+	STAT_FORGET_DEVICE = register_stat(77, 8, "forget_device_scenarios")
 }
 
 @(private = "file")
@@ -774,4 +777,91 @@ _forget_reread :: proc(w: ^World, p: Restore_Pick) {
 			break
 		}
 	}
+}
+
+check_forget_device_held :: proc(w: ^World) {
+	if w.aborted || len(w.failures) > 0 {
+		return
+	}
+	m := &w.model
+	for _, oi in m.objs {
+		ob := &m.objs[oi]
+		if !obj_exists(m, oi) {
+			continue
+		}
+		for ri in readers_of(w, oi) {
+			rn := w.nodes[ri]
+			if !_online(rn) {
+				continue
+			}
+			context = instance_context(&rn.inst)
+			h := _archive_handle(rn, ob)
+			node_after(rn)
+			if h == nil {
+				continue
+			}
+			for sg in h.segs {
+				if sg.device == eng.self(&rn.e) || sg.rep == nil {
+					continue
+				}
+				sid := osync.stream_id(&h.scope, sg.device, h.name, 0)
+				_, base, trimmed, exists := relay_stream_state(w, ob.o.space, sid)
+				if !exists || trimmed || base <= 0 || !journal.replica_covers(sg.rep, 0, base) {
+					continue
+				}
+				wn := _node_of(w, sg.device)
+				if wn == nil || wn == rn || !_online(wn) {
+					continue
+				}
+				_forget_device(w, oi, rn, wn, base)
+				return
+			}
+		}
+	}
+}
+
+@(private = "file")
+_forget_device :: proc(w: ^World, oi: int, rn, wn: ^Node, base: i64) {
+	m := &w.model
+	ob := &m.objs[oi]
+	ref := digest_object(w, rn, oi)
+	if !ref.complete {
+		return
+	}
+	defer delete(ref.text, w.allocator)
+	stat_add(w, STAT_FORGET_DEVICE)
+	world_note(w, "forget: %s forgets every remote segment of %v %s (%s's held on devices below %d) and restarts", rn.name, ob.kind, id_short(ob.o.id), wn.name, base)
+	{
+		context = instance_context(&rn.inst)
+		if h := _archive_handle(rn, ob); h != nil {
+			for sg in h.segs {
+				if sg.device != eng.self(&rn.e) && sg.rep != nil {
+					journal.replica_forget(sg.rep, 0, journal.replica_length(sg.rep))
+				}
+			}
+		}
+		node_after(rn)
+	}
+	if !_restart_settle(w, rn) {
+		return
+	}
+	got: Digest
+	for _ in 0 ..< 6 {
+		got = digest_object(w, rn, oi)
+		if got.complete {
+			break
+		}
+		run_until(w, w.now + 120_000_000_000, true)
+		if len(w.failures) > 0 || w.aborted {
+			return
+		}
+	}
+	if !got.complete {
+		world_fail(w, "forget: %s could not reread device-held %v %s after forgetting it (%s)", rn.name, ob.kind, id_short(ob.o.id), got.why)
+		return
+	}
+	if got.text != ref.text {
+		world_fail(w, "forget: device-held %v %s on %s differs after rereading:\n--- before\n%s--- after\n%s", ob.kind, id_short(ob.o.id), rn.name, ref.text, got.text)
+	}
+	delete(got.text, w.allocator)
 }
