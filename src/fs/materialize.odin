@@ -854,6 +854,11 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		return .None
 	}
 	if it.has_old && it.old != it.path {
+		if occ, found := shadow_get(&m.shadow, it.path) or_return; found && occ.inode != it.inode {
+			mat_raced(m)
+			mount_reshow_add(m, it.path)
+			return .None
+		}
 		if d, _ := probe(m, it.path); !disk_matches(m, it.path, Entry{kind = it.kind}) && d.kind != .Missing {
 			if adopted := mat_adopt(m, it, tl) or_return; adopted {
 				return .None
@@ -886,6 +891,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	} else if !it.has_old {
 		if occ, found := shadow_get(&m.shadow, it.path) or_return; found && occ.inode != it.inode {
 			mat_raced(m)
+			mount_reshow_add(m, it.path)
 			return .None
 		}
 	}
