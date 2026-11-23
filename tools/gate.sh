@@ -28,7 +28,10 @@ VET=$( for p in $(ls src); do
 	wait
 done )
 VET_WEB=$(timeout 600 odin check src/web -vet -strict-style -no-entry-point -target:js_wasm32 2>&1 | head -2 | tr '\n' ' ')
-if [ -n "$VET" ] || [ -n "$VET_WEB" ]; then FAIL=1; note "vet: FAIL $VET $VET_WEB"; else note "vet: ok"; fi
+VET_TESTS=$( for p in tests/sim tests/convergence tests/fstree tools/relayvec; do
+	( o=$(timeout 600 odin check "$p" -vet -strict-style -no-entry-point 2>&1 | head -2 | tr '\n' ' '); [ -n "$o" ] && echo "vet $p: $o" ) &
+done; wait )
+if [ -n "$VET" ] || [ -n "$VET_WEB" ] || [ -n "$VET_TESTS" ]; then FAIL=1; note "vet: FAIL $VET $VET_WEB $VET_TESTS"; else note "vet: ok"; fi
 SOURCES_PAT='prim\.(now_ns|now_ms|mono_ns|mono_ms|id_new)\(\)|time\.(now|tick_now)\(\)|crypto\.rand_bytes|runtime\.rand_bytes|rand\.(uint|int|float)[0-9]*\('
 SOURCES=$( for d in engine fs sync odb pack journal map crdt fstree fshist textdiff convo search obj; do
 	grep -rnE "$SOURCES_PAT" "src/$d" --include=*.odin

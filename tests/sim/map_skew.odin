@@ -135,7 +135,7 @@ _map_skew :: proc(w: ^World) {
 		world_fail(w, "map skew: the lagging node never saw the catalog row (%q, %v), so the check proves nothing", t, ok)
 		return
 	}
-	{
+	behind: {
 		context = instance_context(&b.inst)
 		if _, serr := eng.map_set(&b.e, mo, transmute([]u8)string(SKEW_KEY), []omap.Field{omap.field_str(SKEW_TAG, "behind")}); serr != .None && serr != .Pending {
 			world_fail(w, "map skew: map_set on the lagging clock: %v", serr)

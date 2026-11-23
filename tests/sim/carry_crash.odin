@@ -98,7 +98,7 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 		world_fail(w, "carry: checkout feature: %v %v", res, err)
 		return
 	}
-	{
+	after: {
 		context = instance_context(&n.inst)
 		node_after(n)
 	}
@@ -135,7 +135,7 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 		world_fail(w, "carry: checkout main: %v %v", res, cerr)
 		return
 	}
-	{
+	step: {
 		context = instance_context(&n.inst)
 		node_after(n)
 	}
