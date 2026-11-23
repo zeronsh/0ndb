@@ -59,7 +59,11 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	}
 	if len(m.dirty) > 0 || m.rescan {
 		line_was, _ := clone_string(m.line, context.temp_allocator)
-		mount_pass(m, false) or_return
+		if perr := mount_pass(m, false); perr == .Deferred {
+			return .None
+		} else if perr != .None {
+			return perr
+		}
 		if m.line != line_was {
 			return mount_materialize(m)
 		}
@@ -70,6 +74,9 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 	m.mat_ingest = true
 	merr := materialize_to(m, target, false)
 	m.mat_ingest = false
+	if merr == .Deferred {
+		return .None
+	}
 	merr or_return
 	return mount_settle(m)
 }
@@ -95,7 +102,12 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		}
 	}
 	if crdt.frontier_eq(tl[:], sl[:]) && len(m.absent) == 0 && len(m.reshow) == 0 {
+		m.mat_held = false
 		return .None
+	}
+	if !m.adopting && !mount_durable_now(m) {
+		m.mat_held = true
+		return .Deferred
 	}
 	m.merge_base = m.synced[:] if merge else nil
 	defer m.merge_base = nil
@@ -177,7 +189,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		append(&items, it)
 	}
 	if merge {
-		if head, took := mat_snapshot_dirty(m, items[:]) or_return; took {
+		if head, took := mat_snapshot_dirty(m, items[:], target) or_return; took {
 			one := [1]crdt.Lv{}
 			lv, lok := crdt.graph_lv(&h.g, head)
 			if !lok {
@@ -306,6 +318,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		clear(&m.synced)
 		append(&m.synced, ..target)
 	}
+	m.mat_held = false
 	m.passes += 1
 	history_trim(h)
 	return .None
@@ -1551,7 +1564,7 @@ mount_snapshot_pseudo :: proc(mount: prim.Id, line: string) -> (pseudo: prim.Id)
 }
 
 @(private)
-mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item) -> (head: crdt.Op_Id, took: bool, err: Error) {
+mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (head: crdt.Op_Id, took: bool, err: Error) {
 	h := m.history
 	pseudo := mount_snapshot_pseudo(m.id, m.line)
 	actor := fshist.ingestion_actor(h.self, pseudo)
@@ -1575,6 +1588,19 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item) -> (head: crdt.Op_Id, t
 		}
 		data, oid, binary, ok := read_content(m, it.path, d.stat, it.inode, true) or_return
 		if !ok || binary {
+			continue
+		}
+		if want := history_text_at(h, it.inode, target, context.temp_allocator) or_return; string(want) == string(data) {
+			at := make([dynamic]fstree.Op_Id, context.temp_allocator)
+			for id in target {
+				append(&at, op_inode(h, id))
+			}
+			e := it.entry
+			e.ver = shadow_version_add(&m.shadow, at[:]) or_return
+			e.stat = d.stat
+			e.oid = oid
+			shadow_put(&m.shadow, it.path, e) or_return
+			it.entry = e
 			continue
 		}
 		old := history_text_at(h, it.inode, parents[:], context.temp_allocator) or_return
