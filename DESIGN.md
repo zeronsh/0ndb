@@ -709,8 +709,10 @@ equal in both directions.
   blob stored) before its own, so when the commit of that base is lost too,
   its bytes are the device's and only the scope's own diff is the actor's. A
   step whose content the disk holds exactly names its writer even when its
-  blob never reached the object store; any other step whose content is
-  missing stops the chain and the rest is unattributed. The steps live
+  blob never reached the object store, a step whose content is the text the
+  replay already stands on changes nothing and is skipped, and any other
+  step whose content is missing stops the chain and the rest is
+  unattributed. The steps live
   only in the log, so while any path holds steps an image keeps the replay's
   offset and no save truncates the log or moves to a new generation; a full
   pass that finds a chained path unchanged drops its steps.
