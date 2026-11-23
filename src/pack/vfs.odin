@@ -591,6 +591,7 @@ _write :: proc(p: ^Pack, oi: ^Open_Inode, src: []u8, off: i64, sized := false) -
 		_pend_note(p, oi.inum, before, max(before, off + i64(len(src))))
 		return .None
 	}
+	_room(p, REC_HDR + 20 + len(src)) or_return
 	old := oi.ino
 	_pend_note(p, oi.inum, old.size, max(old.size, off + i64(len(src))))
 	ph := _log_data(p, oi.inum, off, src) or_return
@@ -643,6 +644,7 @@ _defrag :: proc(p: ^Pack, oi: ^Open_Inode, orig: ^Inode, keep: int) -> Error {
 			_phys_read(p, Phys{cont = e.cont, off = e.coff, len = e.len}, buf[e.off - from:][:e.len]) or_return
 			pos = e.off + e.len
 		}
+		_room(p, REC_HDR + 20 + len(buf)) or_return
 		ph := _log_data(p, oi.inum, from, buf) or_return
 		scratch: Phys_List
 		_ext_remove(ino, from, to, &scratch)

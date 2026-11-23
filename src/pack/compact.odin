@@ -91,6 +91,7 @@ _relocate :: proc(p: ^Pack, inum: u64, ino: ^Inode, src: Phys, src_bytes: []u8) 
 		_phys_read(p, Phys{cont = e.cont, off = e.coff, len = e.len}, buf[e.off - from:][:e.len]) or_return
 		pos = e.off + e.len
 	}
+	_room(p, REC_HDR + 20 + len(buf)) or_return
 	old := ino^
 	ph := _log_data(p, inum, from, buf) or_return
 	ino.n = 1
