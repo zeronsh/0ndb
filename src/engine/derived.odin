@@ -274,7 +274,7 @@ _unclean_mark_spaces :: proc(e: ^Engine) -> Error {
 		_reg_commit(e, t) or_return
 		pack.hold_unclean(&e.pk, false)
 	}
-	for id in e.spaces {
+	for id in prim.sorted_keys(e.spaces) {
 		k := _unclean_key(id)
 		if _, found, err := omap.db_get(&e.reg.db, ROOT_SPACES, k[:], context.temp_allocator); err != .None {
 			return _oerr(err)
@@ -754,7 +754,11 @@ _hist_rebuild :: proc(e: ^Engine, h: ^Handle, hist: ^fs.History, shuffled: bool)
 			break
 		}
 	}
-	for id, limit in limits {
+	for id in prim.sorted_keys(limits) {
+		if id not_in limits {
+			continue
+		}
+		limit := limits[id]
 		if positions[id] < limit {
 			return "", false, .None
 		}

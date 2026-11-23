@@ -406,11 +406,15 @@ _rlog_rewrite :: proc(e: ^Engine) {
 	l.records = 0
 	clear(&l.clears)
 	clear(&l.pdels)
-	for kk, x in l.live {
+	for kk in prim.sorted_keys(l.live) {
+		if kk not_in l.live {
+			continue
+		}
+		x := l.live[kk]
 		k := kk
 		_rlog_append_intent(e, &k, x)
 	}
-	for k in l.pend {
+	for k in prim.sorted_keys(l.pend) {
 		_rlog_pend_record(e, RLOG_PEND_ADD, k)
 	}
 	_rlog_commit(e)

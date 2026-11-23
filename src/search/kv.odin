@@ -114,7 +114,7 @@ kvw_end :: proc(kw: ^Kv_Writer) {
 kv_write_map_str :: proc(sw: ^Seg_Writer, m: ^map[string][]u8, which: Kv) {
 	keys := make([]string, len(m), context.temp_allocator)
 	i := 0
-	for k in m {
+	for k in prim.unordered(m^) {
 		keys[i] = k
 		i += 1
 	}
@@ -130,7 +130,7 @@ kv_write_map_str :: proc(sw: ^Seg_Writer, m: ^map[string][]u8, which: Kv) {
 kv_write_map_id :: proc(sw: ^Seg_Writer, m: ^map[prim.Id][]u8, which: Kv) {
 	keys := make([]prim.Id, len(m), context.temp_allocator)
 	i := 0
-	for k in m {
+	for k in prim.unordered(m^) {
 		keys[i] = k
 		i += 1
 	}

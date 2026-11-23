@@ -58,7 +58,11 @@ member_authorizer_init :: proc(a: ^Member_Authorizer, vfs: prim.Vfs, dir: string
 }
 
 member_authorizer_destroy :: proc(a: ^Member_Authorizer) {
-	for _, s in a.spaces {
+	for mk1_ in prim.sorted_keys(a.spaces) {
+		if mk1_ not_in a.spaces {
+			continue
+		}
+		s := a.spaces[mk1_]
 		_auth_space_free(a, s)
 	}
 	delete(a.spaces)

@@ -273,7 +273,7 @@ _fd_mount_update :: proc(fd: ^Fork_Diff, m: ^Fd_Mount) {
 	}
 	if !structural {
 		cur := fstree.current(&h.tree)
-		for ino in cand {
+		for ino in prim.sorted_keys(cand) {
 			if ino in m.files {
 				continue
 			}

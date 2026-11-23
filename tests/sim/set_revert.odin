@@ -70,7 +70,11 @@ _sr_rebase :: proc(c: ^Sr_Ctx) {
 	tok := c.model.tok
 	_sr_model_init(&c.model, c.model.alloc)
 	c.model.tok = tok
-	for name, lines in old {
+	for name in prim.sorted_keys(old) {
+		if name not_in old {
+			continue
+		}
+		lines := old[name]
 		l := make([dynamic]string, c.model.alloc)
 		for t in lines {
 			append(&l, t)
@@ -104,7 +108,7 @@ _sr_new_token :: proc(c: ^Sr_Ctx, who: Sr_Who) -> string {
 @(private = "file")
 _sr_names :: proc(c: ^Sr_Ctx) -> []string {
 	names := make([dynamic]string, context.temp_allocator)
-	for k in c.model.files {
+	for k in prim.sorted_keys(c.model.files) {
 		append(&names, k)
 	}
 	slice.sort(names[:])
@@ -298,12 +302,17 @@ _sr_check :: proc(c: ^Sr_Ctx, revert: prim.Id, phase: string) {
 		}
 	}
 	visible := make(map[string]string, context.temp_allocator)
-	for name, lines in md.files {
+	for name in prim.sorted_keys(md.files) {
+		lines := md.files[name]
 		for t in lines {
 			visible[t] = name
 		}
 	}
-	for t, cls in md.class {
+	for t in prim.sorted_keys(md.class) {
+		if t not_in md.class {
+			continue
+		}
+		cls := md.class[t]
 		_, now := present[t]
 		_, before := visible[t]
 		if f, ok := md.in_file_at_remove[t]; ok && !before {
@@ -862,7 +871,7 @@ set_revert_crash :: proc(t: ^testing.T) {
 							names[nm] = true
 						}
 					}
-					for nm in names {
+					for nm in prim.sorted_keys(names) {
 						g, gh := got[nm]
 						p0, ph := pre[nm]
 						r, rh := ref[nm]

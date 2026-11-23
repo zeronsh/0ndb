@@ -238,7 +238,7 @@ disk_init :: proc(d: ^Disk, name: string, allocator: runtime.Allocator) {
 }
 
 disk_destroy :: proc(d: ^Disk) {
-	for _, n in d.inodes {
+	for _, n in prim.unordered(d.inodes) {
 		_inode_free(d, n)
 	}
 	delete(d.inodes)
@@ -550,7 +550,11 @@ _maybe_orphan :: proc(d: ^Disk, ino: u64) {
 
 @(private = "file")
 _durably_linked :: proc(d: ^Disk, ino: u64) -> bool {
-	for _, n in d.inodes {
+	for mk2_ in prim.sorted_keys(d.inodes) {
+		if mk2_ not_in d.inodes {
+			continue
+		}
+		n := d.inodes[mk2_]
 		if n.kind != .Dir {
 			continue
 		}
@@ -1502,7 +1506,7 @@ disk_crash :: proc(d: ^Disk, mode: Crash_Mode, r: ^Rng) {
 	ladder := [?]u64{0, 1, 2, 3, 4}
 	keep := ladder[rng_int(r, len(ladder))]
 	ids := make([dynamic]u64, context.temp_allocator)
-	for k in d.inodes {
+	for k in prim.sorted_keys(d.inodes) {
 		append(&ids, k)
 	}
 	slice.sort(ids[:])
@@ -1598,7 +1602,7 @@ _recover_file :: proc(d: ^Disk, n: ^Inode, keep: u64, r: ^Rng) {
 _collect :: proc(d: ^Disk) {
 	live := _reachable(d)
 	dead := make([dynamic]u64, context.temp_allocator)
-	for k in d.inodes {
+	for k in prim.sorted_keys(d.inodes) {
 		if !(k in live) {
 			append(&dead, k)
 		}
@@ -1626,7 +1630,11 @@ _collect :: proc(d: ^Disk) {
 _reachable :: proc(d: ^Disk) -> map[u64]bool {
 	live := make(map[u64]bool, context.temp_allocator)
 	stack := make([dynamic]u64, context.temp_allocator)
-	for _, of in d.fds {
+	for mk3_ in prim.sorted_keys(d.fds) {
+		if mk3_ not_in d.fds {
+			continue
+		}
+		of := d.fds[mk3_]
 		if !(of.ino in live) {
 			live[of.ino] = true
 			append(&stack, of.ino)
@@ -1824,7 +1832,11 @@ _path_of :: proc(d: ^Disk, ino: u64, allocator: runtime.Allocator) -> string {
 }
 
 disk_bytes :: proc(d: ^Disk) -> (total: u64) {
-	for _, n in d.inodes {
+	for mk1_ in prim.sorted_keys(d.inodes) {
+		if mk1_ not_in d.inodes {
+			continue
+		}
+		n := d.inodes[mk1_]
 		total += u64(len(n.data))
 	}
 	return
@@ -1843,7 +1855,7 @@ disk_digest :: proc(d: ^Disk) -> u64 {
 
 disk_full_hash :: proc(d: ^Disk) -> u64 {
 	inos := make([dynamic]u64, context.temp_allocator)
-	for k in d.inodes {
+	for k in prim.sorted_keys(d.inodes) {
 		append(&inos, k)
 	}
 	slice.sort(inos[:])
@@ -1883,7 +1895,7 @@ disk_full_hash :: proc(d: ^Disk) -> u64 {
 @(private = "file")
 _mix_entries :: proc(h: u64, entries: map[string]u64) -> u64 {
 	names := make([dynamic]string, context.temp_allocator)
-	for k in entries {
+	for k in prim.sorted_keys(entries) {
 		append(&names, k)
 	}
 	slice.sort(names[:])

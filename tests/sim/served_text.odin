@@ -1,5 +1,7 @@
 package sim
 
+import "../../src/prim"
+
 import "../../src/fs"
 
 check_served_text :: proc(w: ^World) {
@@ -16,7 +18,11 @@ served_text_scan :: proc(w: ^World, n: ^Node, when_: string) {
 	defer node_after(n)
 	n.disk.quiet = true
 	defer n.disk.quiet = false
-	for id, h in n.e.handles {
+	for id in prim.sorted_keys(n.e.handles) {
+		if id not_in n.e.handles {
+			continue
+		}
+		h := n.e.handles[id]
 		if h.hist == nil {
 			continue
 		}

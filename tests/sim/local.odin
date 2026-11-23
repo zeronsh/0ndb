@@ -167,7 +167,11 @@ _local_first :: proc(w: ^World) {
 			break
 		}
 	}
-	for k, v in want {
+	for k in prim.sorted_keys(want) {
+		if k not_in want {
+			continue
+		}
+		v := want[k]
 		g, ok := got[k]
 		if !ok {
 			world_fail(w, "local: n1 never read %s that n0 wrote before it had a relay", k)

@@ -225,7 +225,7 @@ check_move :: proc(w: ^World) {
 		}
 		clear(&pending)
 		order := make([dynamic]int, context.temp_allocator)
-		for oi in refs {
+		for oi in prim.sorted_keys(refs) {
 			append(&order, oi)
 		}
 		slice.sort(order[:])
@@ -255,7 +255,7 @@ check_move :: proc(w: ^World) {
 		_ = round
 	}
 	left := make([dynamic]int, context.temp_allocator)
-	for oi in pending {
+	for oi in prim.sorted_keys(pending) {
 		append(&left, oi)
 	}
 	slice.sort(left[:])

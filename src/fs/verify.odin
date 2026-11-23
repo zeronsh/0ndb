@@ -15,7 +15,11 @@ history_file_mismatches :: proc(h: ^History, out: ^[dynamic]string, allocator :=
 		return .None
 	}
 	inos := make([dynamic]fstree.Inode_Id, context.temp_allocator)
-	for ino, f in h.files {
+	for ino in prim.sorted_keys(h.files) {
+		if ino not_in h.files {
+			continue
+		}
+		f := h.files[ino]
 		if f.loaded {
 			append(&inos, ino)
 		}

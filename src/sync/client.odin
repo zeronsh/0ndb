@@ -302,7 +302,11 @@ client_awaiting :: proc "contextless" (c: ^Client) -> int {
 client_deadline_tick :: proc(c: ^Client) -> (stalled: bool) {
 	moving := client_queued(c) > 0 && c.sent_mark + 1 >= c.epoch
 	if !moving {
-		for _, a in c.awaiting {
+		for mk1_ in prim.sorted_keys(c.awaiting) {
+			if mk1_ not_in c.awaiting {
+				continue
+			}
+			a := c.awaiting[mk1_]
 			if a.count > 0 && a.mark + 1 < c.epoch {
 				stalled = true
 				break

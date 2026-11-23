@@ -1093,7 +1093,11 @@ _pass_before :: proc(m: ^Mount, since: Observe_Since) -> Error {
 	}
 	kept := make([dynamic]Kept, context.temp_allocator)
 	if since.mono != 0 {
-		for k, v in m.dirty {
+		for k in prim.sorted_keys(m.dirty) {
+			if k not_in m.dirty {
+				continue
+			}
+			v := m.dirty[k]
 			if at, ok := m.dirty_at[k]; ok && v == nil && at >= since.mono {
 				append(&kept, Kept{k, at})
 			}
@@ -1434,7 +1438,11 @@ attrib_covered :: proc(m: ^Mount, img: ^Mount_Image) -> bool {
 	if img.chained || len(m.attrib_chain) > 0 || len(img.attrib) != len(m.attrib) {
 		return false
 	}
-	for k, a in m.attrib {
+	for k in prim.sorted_keys(m.attrib) {
+		if k not_in m.attrib {
+			continue
+		}
+		a := m.attrib[k]
 		b, ok := img.attrib[k]
 		if !ok || b != a {
 			return false
@@ -1774,7 +1782,11 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 		}
 		if err != .None || deferred {
 			sm := s.mount
-			for k, v in sm.dirty {
+			for k in prim.sorted_keys(sm.dirty) {
+				if k not_in sm.dirty {
+					continue
+				}
+				v := sm.dirty[k]
 				if v == s {
 					attrib_set(sm, k, s.actor, false, {}, s.id)
 					attrib_log_append(sm, k, s.actor, {}, s.id)
@@ -1823,7 +1835,8 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 @(private)
 scope_retire_unwritten :: proc(m: ^Mount, s: ^Scope) {
 	keys := make([dynamic]string, context.temp_allocator)
-	for k, a in m.attrib {
+	for k in prim.sorted_keys(m.attrib) {
+		a := m.attrib[k]
 		if o := m.open_scopes[k]; !a.used && a.actor == s.actor && k not_in m.dirty && (o == nil || o == s) {
 			append(&keys, k)
 		}
@@ -2100,7 +2113,7 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 		img.shadow.gen, img.shadow.end = shadow_end(&m.shadow)
 	}
 	img.attrib = make(map[string]Attrib, m.allocator)
-	for k, a in m.attrib {
+	for k, a in prim.unordered(m.attrib) {
 		key, _ := clone_string(k, m.allocator)
 		img.attrib[key] = a
 	}
@@ -2181,7 +2194,11 @@ attrib_prune :: proc(m: ^Mount) {
 		return
 	}
 	drop := make([dynamic]string, context.temp_allocator)
-	for k, a in m.attrib {
+	for k in prim.sorted_keys(m.attrib) {
+		if k not_in m.attrib {
+			continue
+		}
+		a := m.attrib[k]
 		if a.used && k not_in m.dirty && m.open_scopes[k] == nil {
 			append(&drop, k)
 		}

@@ -866,7 +866,11 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 
 _forget_scope :: proc(w: ^World, n: ^Node, scope: ^fs.Scope) {
 	keys := make([dynamic]string, context.temp_allocator)
-	for k, v in n.writers {
+	for k in prim.sorted_keys(n.writers) {
+		if k not_in n.writers {
+			continue
+		}
+		v := n.writers[k]
 		if v.scope == scope && scope != nil {
 			append(&keys, k)
 		}

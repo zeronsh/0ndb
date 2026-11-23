@@ -164,7 +164,7 @@ _tier_cold_note :: proc(sp: ^Tier_Space, entries: []u8, segs: map[Stream_Id]Tier
 		return
 	}
 	ids := make([dynamic]Stream_Id, 0, len(hi), context.temp_allocator)
-	for id in hi {
+	for id in prim.sorted_keys(hi) {
 		append(&ids, id)
 	}
 	slice.sort_by(ids[:], _mem_id_less)

@@ -1459,7 +1459,7 @@ attrib_chain_settle :: proc(p: ^Pass) {
 		keep[h.path] = true
 	}
 	drop := make([dynamic]string, context.temp_allocator)
-	for k in m.attrib_chain {
+	for k in prim.sorted_keys(m.attrib_chain) {
 		if !keep[k] {
 			append(&drop, k)
 		}
@@ -1586,7 +1586,11 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	m.hold_line = p.git_wrote
 	defer m.hold_line = false
 	keys := make([dynamic]string, 0, len(m.dirty), p.long)
-	for k, v in m.dirty {
+	for k in prim.sorted_keys(m.dirty) {
+		if k not_in m.dirty {
+			continue
+		}
+		v := m.dirty[k]
 		c, _ := clone_string(k, p.long)
 		p.scope_of[c] = v
 		append(&keys, c)
@@ -1596,7 +1600,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	}
 	clear(&m.dirty)
 	dirty_at := make(map[string]i64, p.long)
-	for k, v in m.dirty_at {
+	for k, v in prim.unordered(m.dirty_at) {
 		c, _ := clone_string(k, p.long)
 		dirty_at[c] = v
 	}
@@ -1605,7 +1609,11 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	m.rescan = false
 	m.git_moved = false
 	defer if err != .None {
-		for k, v in p.scope_of {
+		for k in prim.sorted_keys(p.scope_of) {
+			if k not_in p.scope_of {
+				continue
+			}
+			v := p.scope_of[k]
 			if k not_in m.dirty {
 				c, _ := clone_string(k, m.allocator)
 				m.dirty[c] = v
@@ -1735,7 +1743,7 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 		for {
 			before := len(touched)
 			dirs := make([dynamic]fstree.Inode_Id, 0, len(touched), context.temp_allocator)
-			for ino in touched {
+			for ino in prim.sorted_keys(touched) {
 				append(&dirs, ino)
 			}
 			for ino in dirs {

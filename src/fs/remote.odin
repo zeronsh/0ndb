@@ -144,7 +144,7 @@ git_remote_tips :: proc(vfs: prim.Vfs, g: Git_Dirs, allocator := context.allocat
 	base, _ := path_join(g.common, "refs/remotes", context.temp_allocator)
 	_tips_walk(vfs, base, "refs/remotes", &found, 0)
 	keys := make([dynamic]string, context.temp_allocator)
-	for k in found {
+	for k in prim.sorted_keys(found) {
 		append(&keys, k)
 	}
 	slice.sort(keys[:])
@@ -606,7 +606,7 @@ _reach_walk :: proc(db: ^odb.Odb, root: odb.Oid, have: ^Remote_Reach, added: ^ma
 _reach_write :: proc(vfs: prim.Vfs, dir: string, have: ^Remote_Reach, added: ^map[odb.Oid]bool) -> Error {
 	n := have.size
 	fresh := make([dynamic]odb.Oid, 0, len(added), context.temp_allocator)
-	for k in added {
+	for k in prim.sorted_keys(added^) {
 		append(&fresh, k)
 	}
 	slice.sort_by(fresh[:], proc(a, b: odb.Oid) -> bool {

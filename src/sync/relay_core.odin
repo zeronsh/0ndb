@@ -388,7 +388,11 @@ relay_core_destroy :: proc(r: ^Relay_Core) {
 		}
 	}
 	_reap(r)
-	for _, sp in r.spaces {
+	for mk1_ in prim.sorted_keys(r.spaces) {
+		if mk1_ not_in r.spaces {
+			continue
+		}
+		sp := r.spaces[mk1_]
 		if sp.compact_it != nil {
 			r.store.list_end(r.store.data, sp.compact_it)
 		}
@@ -832,7 +836,7 @@ _presence_snapshot :: proc(r: ^Relay_Core, sp: ^Space_State, c: ^Conn) {
 		return
 	}
 	ids := make([dynamic]Device_Id, 0, n, context.temp_allocator)
-	for d in sp.present {
+	for d in prim.sorted_keys(sp.present) {
 		append(&ids, d)
 	}
 	slice.sort_by(ids[:], proc(a, b: Device_Id) -> bool {

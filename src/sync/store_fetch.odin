@@ -1,6 +1,8 @@
 #+build linux, darwin, windows
 package osync
 
+import "../prim"
+
 import "base:runtime"
 
 TIER_BLOCK :: 256 << 10
@@ -179,7 +181,11 @@ _tier_block_free :: proc(t: ^Tier_Store, f: ^Tier_Fetch) {
 @(private)
 _tier_blocks_forget :: proc(t: ^Tier_Store, space: Space_Id, seq: u64) {
 	gone := make([dynamic]^Tier_Fetch, context.temp_allocator)
-	for bk, f in t.blocks {
+	for bk in prim.sorted_keys(t.blocks) {
+		if bk not_in t.blocks {
+			continue
+		}
+		f := t.blocks[bk]
 		if bk.space != space || bk.seq != seq {
 			continue
 		}
@@ -216,7 +222,11 @@ _tier_cache_trim :: proc(t: ^Tier_Store) {
 @(private)
 _tier_cache_drop :: proc(t: ^Tier_Store) {
 	ids := make([dynamic]^Tier_Fetch, 0, len(t.blocks), context.temp_allocator)
-	for _, f in t.blocks {
+	for mk1_ in prim.sorted_keys(t.blocks) {
+		if mk1_ not_in t.blocks {
+			continue
+		}
+		f := t.blocks[mk1_]
 		append(&ids, f)
 	}
 	for f in ids {
@@ -231,7 +241,11 @@ _tier_cache_drop :: proc(t: ^Tier_Store) {
 		}
 		_tier_block_free(t, f)
 	}
-	for _, rw in t.rewrites {
+	for mk1_ in prim.sorted_keys(t.rewrites) {
+		if mk1_ not_in t.rewrites {
+			continue
+		}
+		rw := t.rewrites[mk1_]
 		rw.t = nil
 		if rw.busy && t.cfg.objects.cancel != nil {
 			t.cfg.objects.cancel(t.cfg.objects.data, &rw.req)

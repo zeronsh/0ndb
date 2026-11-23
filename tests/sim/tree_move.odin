@@ -344,7 +344,7 @@ _rmtree :: proc(w: ^World, n: ^Node, sm: Sim_Mount, rel: string) {
 		}
 	}
 	order := make([dynamic]string, context.temp_allocator)
-	for d in dirs {
+	for d in prim.sorted_keys(dirs) {
 		append(&order, d)
 	}
 	for len(order) > 0 {
@@ -711,7 +711,11 @@ _gone :: proc(m: ^Model, oi: int, toks: []string) -> bool {
 @(private = "file")
 _holders :: proc(files: map[string][]string, toks: []string) -> []string {
 	out := make([dynamic]string, context.temp_allocator)
-	for f, have in files {
+	for f in prim.sorted_keys(files) {
+		if f not_in files {
+			continue
+		}
+		have := files[f]
 		hit := false
 		for t in have {
 			for x in toks {
@@ -834,7 +838,11 @@ _check_offers :: proc(w: ^World) {
 			continue
 		}
 		context = instance_context(&n.inst)
-		for oi, toks in gone {
+		for oi in prim.sorted_keys(gone) {
+			if oi not_in gone {
+				continue
+			}
+			toks := gone[oi]
 			o := m.objs[oi].o
 			if line_norm(eng.tree_line(&n.e, o)) != "" {
 				continue

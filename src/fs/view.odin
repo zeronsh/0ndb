@@ -257,7 +257,11 @@ id_index :: proc(spans: []crdt.Author_Span) -> map[prim.Id][dynamic]Id_Run {
 		append(&list, Id_Run{sp.op.seq, sp.len})
 		m[sp.op.actor] = list
 	}
-	for _, &list in m {
+	for mk1_ in prim.sorted_keys(m) {
+		if mk1_ not_in m {
+			continue
+		}
+		list := &m[mk1_]
 		slice.sort_by(list[:], proc(a, b: Id_Run) -> bool {
 			return a.seq < b.seq
 		})

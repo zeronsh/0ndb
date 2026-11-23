@@ -1,5 +1,7 @@
 package fstree
 
+import "../prim"
+
 import "base:runtime"
 import "core:slice"
 import "core:strings"
@@ -771,7 +773,7 @@ diff :: proc(t: ^Tree, a, b: View, touched: []Inode_Id, allocator := context.all
 		map_insert(&set, id, struct{}{}) or_return
 	}
 	base := make([dynamic]Inode_Id, 0, len(set), context.temp_allocator) or_return
-	for id in set {
+	for id in prim.sorted_keys(set) {
 		append(&base, id) or_return
 	}
 	for id in base {
@@ -779,7 +781,7 @@ diff :: proc(t: ^Tree, a, b: View, touched: []Inode_Id, allocator := context.all
 		collect_ancestors(&sb, id, &set) or_return
 	}
 	clear(&base)
-	for id in set {
+	for id in prim.sorted_keys(set) {
 		append(&base, id) or_return
 	}
 	for id in base {
@@ -787,7 +789,7 @@ diff :: proc(t: ^Tree, a, b: View, touched: []Inode_Id, allocator := context.all
 		collect_namesakes(&sb, id, &set) or_return
 	}
 	ids := make([dynamic]Inode_Id, 0, len(set), context.temp_allocator) or_return
-	for id in set {
+	for id in prim.sorted_keys(set) {
 		append(&ids, id) or_return
 	}
 	slice.sort_by(ids[:], proc(x, y: Inode_Id) -> bool {return id_cmp(x, y) < 0})

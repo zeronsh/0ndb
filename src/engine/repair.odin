@@ -174,7 +174,11 @@ _check_release :: proc(e: ^Engine, stream: osync.Stream_Id) {
 		return
 	}
 	c.done = true
-	for _, h in e.handles {
+	for mk3_ in prim.sorted_keys(e.handles) {
+		if mk3_ not_in e.handles {
+			continue
+		}
+		h := e.handles[mk3_]
 		if h.damaged && osync.stream_id(&h.scope, e.self, h.name, 0) == stream {
 			h.damaged = false
 		}
@@ -189,7 +193,11 @@ _damage_pending :: proc(e: ^Engine, object: prim.Id) -> bool {
 			return true
 		}
 	}
-	for _, c in e.checks {
+	for mk2_ in prim.sorted_keys(e.checks) {
+		if mk2_ not_in e.checks {
+			continue
+		}
+		c := e.checks[mk2_]
 		if c.object == object && !c.done {
 			return true
 		}
@@ -300,7 +308,11 @@ _redaction_known :: proc(e: ^Engine, space, object: prim.Id, off: i64) -> bool {
 		return false
 	}
 	s, o := space, object
-	for kk, x in e.rlog.live {
+	for kk in prim.sorted_keys(e.rlog.live) {
+		if kk not_in e.rlog.live {
+			continue
+		}
+		x := e.rlog.live[kk]
 		k := kk
 		if int(k[56]) != 40 || string(k[:16]) != string(s[:]) || string(k[16:32]) != string(o[:]) {
 			continue
