@@ -1610,7 +1610,7 @@ check_conflicts :: proc(w: ^World, oi: int) {
 			}
 			found := false
 			for c in list {
-				if file_base(c.path) != p.a.path {
+				if !same_file(m, oi, file_base(c.path), p.a.path) {
 					continue
 				}
 				if (_side_holds(m, c.ours, p.a) && _side_holds(m, c.theirs, p.b)) || (_side_holds(m, c.ours, p.b) && _side_holds(m, c.theirs, p.a)) {
