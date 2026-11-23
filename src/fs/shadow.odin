@@ -1114,11 +1114,11 @@ decode_rec :: proc(body: []u8, oid_size: int, ids: ^[dynamic]fstree.Op_Id) -> (r
 			clear(ids)
 		}
 		for _ in 0 ..< n {
-			actor := prim.read_uvarint(&rd)
-			if actor > u64(max(u32)) || ids == nil {
+			ix := prim.read_uvarint(&rd)
+			if ix > u64(max(u32)) || ids == nil {
 				return {}, .Corrupt
 			}
-			append(ids, fstree.Op_Id{actor = u32(actor), seq = prim.read_uvarint(&rd)})
+			append(ids, fstree.Op_Id{actor = u32(ix), seq = prim.read_uvarint(&rd)})
 		}
 		r.ids = n
 	}
