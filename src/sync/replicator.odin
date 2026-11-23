@@ -214,6 +214,8 @@ Remote :: struct {
 	denied:    bool,
 	want_gen:  u64,
 	probe_gen: u64,
+	probe_q:   [4]u64,
+	probe_n:   int,
 	fresh_gen: u64,
 	held:      i64,
 	pulled:    i64,
@@ -2067,7 +2069,10 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 
 @(private)
 _remote_probe :: proc(r: ^Replicator, rm: ^Remote) {
-	if rm.probing || r.phase != .Ready || rm.quarantined {
+	if r.phase != .Ready || rm.quarantined {
+		return
+	}
+	if rm.probing && (rm.probe_gen >= rm.want_gen || rm.probe_n >= len(rm.probe_q)) {
 		return
 	}
 	ids: [1 + PROBES]Stream_Id
@@ -2076,6 +2081,8 @@ _remote_probe :: proc(r: ^Replicator, rm: ^Remote) {
 	if client_probe(&r.client, ids[:]) == .None {
 		rm.probing = true
 		rm.probe_gen = rm.want_gen
+		rm.probe_q[rm.probe_n] = rm.want_gen
+		rm.probe_n += 1
 	}
 	_keys_head_watch(r, rm)
 }
@@ -2558,9 +2565,11 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 			r.feed_target = ev.length
 			_caught_check(r)
 		} else if rm, ok := r.remotes[Stream_Id(ev.id)]; ok {
-			if rm.probing {
-				rm.probing = false
-				rm.fresh_gen = rm.probe_gen
+			if rm.probe_n > 0 {
+				rm.fresh_gen = max(rm.fresh_gen, rm.probe_q[0])
+				copy(rm.probe_q[:], rm.probe_q[1:rm.probe_n])
+				rm.probe_n -= 1
+				rm.probing = rm.probe_n > 0
 			}
 			_answer(r, rm.id, ev.length)
 			rm.relay_len = ev.length
@@ -2664,6 +2673,7 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 	if ok {
 		clear(&rm.inflight)
 		rm.probing = false
+		rm.probe_n = 0
 		rm.pulling = false
 		rm.pulled = _contiguous(rm) if rm.full else journal.replica_length(&rm.rep)
 		if ev.code == .Not_Owner {
@@ -2778,6 +2788,7 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		clear(&rm.carry)
 		rm.pulling = false
 		rm.probing = false
+		rm.probe_n = 0
 		rm.retry_hold = false
 		rm.denied = false
 		rm.pushed = false
