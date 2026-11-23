@@ -501,7 +501,10 @@ equal in both directions.
   persist or a reload is outstanding. Recovery from the mount's own intents (at
   open, or when a pass retries an import that did not finish) goes through
   the same wait: the intents stay in the saved state until the image that
-  covers them is written. The mount state also records the shadow's
+  covers them is written. Recovery re-derives the shadow entries of the
+  inodes its intents touched from the tree at the synced version it saves
+  (the old synced frontier plus the intents), never from the history's
+  current tree, whose later local operations the disk does not reflect yet. The mount state also records the shadow's
   generation and log end it was saved against; on open a longer shadow is
   rolled back to that end, so shadow and synced frontier are always one
   saved state and a crash between the shadow flush and the state save is
