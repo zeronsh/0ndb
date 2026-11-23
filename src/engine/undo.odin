@@ -203,6 +203,9 @@ _cu_undo_tree :: proc(e: ^Engine, o: Object, msg: Rid) -> (out: []Undo_Conv, err
 	for grew := true; grew; {
 		grew = false
 		for r in rows {
+			if true {
+				fmt.eprintfln("DBGU row %x kind %v parent %x", r.object, r.kind, r.parent.object)
+			}
 			if r.kind != .Conversation {
 				continue
 			}
@@ -297,6 +300,7 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 	}
 	mids := make([dynamic]prim.Id, context.temp_allocator)
 	for c in convs {
+		fmt.eprintfln("DBGU conv %x hidden %v", c.o.id, c.hidden)
 		h := _handle_get(e, c.o, .Conversation) or_return
 		_handle_refresh(h)
 		sa, serr := convo.scope_actors(&h.view, context.temp_allocator)
