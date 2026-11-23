@@ -15,6 +15,8 @@ ANOMALY_WINDOW_MS :: 60_000
 
 Space_Epoch :: struct {
 	number: u32,
+	order:  u32,
+	view:   u32,
 	tag:    osync.Epoch_Tag,
 	secret: [32]u8,
 }
@@ -313,6 +315,7 @@ _members_adopt :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 			added_epochs = true
 		}
 	}
+	_epochs_order(sp, m)
 	if added_epochs {
 		_members_unlock_trees(e, sp)
 	}
@@ -1079,9 +1082,49 @@ _epoch_current :: proc(sp: ^Space, object: prim.Id) -> (tag: osync.Epoch_Tag, ok
 		return
 	}
 	if g, found := sp.grant_epochs[object]; found && len(g) > 0 {
-		return g[len(g) - 1].tag, true
+		return _grant_newest(g[:]), true
 	}
 	return
+}
+
+@(private)
+_epochs_order :: proc(sp: ^Space, m: ^osync.Membership) {
+	view := u32(len(m.roster.order))
+	for &x in sp.mem.epochs {
+		for ep in m.roster.epochs {
+			if osync.epoch_tag(ep.number, ep.id) == x.tag {
+				x.order = u32(ep.order)
+				x.view = view
+				break
+			}
+		}
+	}
+}
+
+@(private)
+_epoch_after :: proc(a, b: Space_Epoch) -> bool {
+	if a.number != b.number {
+		return a.number > b.number
+	}
+	if a.view != b.view {
+		return a.view > b.view
+	}
+	if a.order != b.order {
+		return a.order > b.order
+	}
+	x, y := a.tag, b.tag
+	return string(x[:]) > string(y[:])
+}
+
+@(private)
+_grant_newest :: proc(g: []Space_Epoch) -> osync.Epoch_Tag {
+	best := 0
+	for x, i in g {
+		if _epoch_after(x, g[best]) {
+			best = i
+		}
+	}
+	return g[best].tag
 }
 
 @(private)
@@ -1093,6 +1136,38 @@ _members_change_all :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: 
 _clone_str_or_empty :: proc(s: string, allocator: runtime.Allocator) -> string {
 	out, _ := _clone(s, allocator)
 	return out
+}
+
+Grant_Pick :: struct {
+	space:  prim.Id,
+	object: prim.Id,
+	pick:   osync.Epoch_Tag,
+	tags:   []osync.Epoch_Tag,
+}
+
+grant_picks :: proc(e: ^Engine, allocator := context.allocator) -> []Grant_Pick {
+	context = context_for(e)
+	out := make([dynamic]Grant_Pick, allocator)
+	for _, sp in e.spaces {
+		if !sp.open {
+			continue
+		}
+		if _, ok := space_epoch_tag(sp); ok {
+			continue
+		}
+		for object, g in sp.grant_epochs {
+			if len(g) == 0 {
+				continue
+			}
+			tags := make([]osync.Epoch_Tag, len(g), allocator)
+			for x, i in g {
+				tags[i] = x.tag
+			}
+			tag, _ := _epoch_current(sp, object)
+			append(&out, Grant_Pick{sp.id, object, tag, tags})
+		}
+	}
+	return out[:]
 }
 
 space_epoch_current :: proc(e: ^Engine, space: prim.Id) -> (tag: osync.Epoch_Tag, ok: bool) {

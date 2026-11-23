@@ -2193,7 +2193,12 @@ relay) computes the same roster:
 **Grants to guests** (`engine/grants.odin`, `sync/grants.odin`).
 - **The share.** `share_object` hands the recipient an out-of-band share: the
   object key and the object keys of the epochs known at share time, wrapped
-  to the recipient, plus a capability for the relay.
+  to the recipient, plus a capability for the relay. Each epoch entry is
+  `tag [12] | order u32 | view u32 | wrapped key`, where `order` is the
+  epoch's place in the sharer's resolved roster and `view` the number of
+  membership records that roster was resolved from. When the sharer knows
+  more epochs than a share holds, it keeps the newest below its current one,
+  and the current epoch goes last.
 - **The grant record.** The share also appends `Add{kind guest, method
   grant, scope [object], role reader or member by access}` to the space's
   membership, so every member knows the grant. Scoped members are not tree
@@ -2210,23 +2215,37 @@ relay) computes the same roster:
   (object scope, epoch 0, in the writer's namespace):
 
   ```
-  1 | grantee sign [32] | epoch tag [12]
-    | bytes(seal(grantee box, ctx "0ndb grant key" ‖ object,
+  1 | grantee sign [32] | epoch tag [12] | order u32 | view u32
+    | bytes(seal(grantee box,
+                 ctx "0ndb grant key" ‖ object ‖ order u32 ‖ view u32,
                  number u32 ‖ object_epoch_key [32]))
   ```
+
+  `order` and `view` are as in a share; the seal's context binds them, so
+  a changed value makes the wrap fail to open. When another epoch of the
+  roster has the current epoch's number (two admins made it concurrently),
+  the member also re-wraps an epoch it already wrapped whenever its view
+  has grown past that wrap's, so after a partition heals the merged
+  roster's choice reaches the guest with the largest view.
 
   There is one stream per (writing member, object), holding the wraps for
   every grantee and epoch of that object, so it grows with
   epochs × grantees. A guest's capability admits its object's grantkeys
   streams for reading.
 - **The guest.** A guest follows the object's grantkeys group and opens the
-  wraps addressed to its key. It adds each new epoch tag to its persisted
-  grant epochs and unlocks held key trees on any new grant epoch, not only
-  on space epochs. A guest writes the objects it holds a Write grant for and
-  not the space's catalog, unless it holds a Write grant on the catalog
-  itself, so it queues no catalog update (participant, activity, status)
-  for a catalog it cannot write; a catalog write refused with `Permission`
-  is dropped and counted (`catalog_refused`), never an engine failure.
+  wraps addressed to its key. It adds each new epoch tag, or a larger view
+  of a known one, to its persisted grant epochs and unlocks held key trees
+  on any new grant epoch, not only on space epochs. A keyless guest has no
+  roster of its own, so its current epoch for the object, which it seals new
+  writes under and judges a writer's key tree stale against, is the grant
+  epoch that is largest by (number, view, order, tag): the epoch the most
+  complete roster any member wrapped for it resolved as current. Members
+  take theirs from their own roster, the same order. A guest writes the
+  objects it holds a Write grant for and not the space's catalog, unless it
+  holds a Write grant on the catalog itself, so it queues no catalog update
+  (participant, activity, status) for a catalog it cannot write; a catalog
+  write refused with `Permission` is dropped and counted
+  (`catalog_refused`), never an engine failure.
 - **Revocation must rotate.** `share_revoke(object, grantee)` removes the
   object from the guest's scope (`Scope{guest, remove, object}`), or removes
   the guest when it was the last object, and the revoker commits a new space
