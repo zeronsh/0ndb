@@ -733,6 +733,7 @@ up exist only over the socket.
 | 131 | `land` | tree: object, from: str, into: str, dry: bool | landed:bool files:uvarint conflicts:strs |
 | 171 | `line.hold` | tree: object, line: str, reason: enum branch_changed|branch_deleted|undo | held:uvarint |
 | 172 | `line.resume` | tree: object, line: str | resumed:uvarint |
+| 173 | `line.switch` | tree: object, line: str, root: str | line:str held:uvarint |
 | 132 | `go_back` | object: object, msg: rid | {} |
 | 133 | `revert` | object: object, msg: rid | reverted:[str] |
 | 138 | `wake` | object: object | {} |

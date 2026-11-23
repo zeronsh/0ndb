@@ -3,6 +3,7 @@ package sim
 import "core:fmt"
 import "core:slice"
 import "core:strings"
+import "../../src/fs"
 import "../../src/odb"
 import "../../src/prim"
 
@@ -228,6 +229,32 @@ _git_tree_files :: proc(db: ^odb.Odb, commit: odb.Oid) -> (files: map[string]odb
 	}
 	for e in entries {
 		files[e.name] = e.oid
+	}
+	return files, true
+}
+
+git_branch_files :: proc(n: ^Node, vfs: prim.Vfs, root, branch: string) -> (files: map[string][]u8, ok: bool) {
+	git := strings.concatenate({root, "/.git"}, context.temp_allocator)
+	commit, cok := _git_ref_commit(vfs, git, strings.concatenate({"refs/heads/", branch}, context.temp_allocator))
+	if !cok {
+		return
+	}
+	db: odb.Odb
+	if odb.open(&db, vfs, root, nil, context.allocator, node_clock(&n.clock), rng_random(&n.rng)) != .None {
+		return
+	}
+	defer odb.close(&db)
+	oids, tok := _git_tree_files(&db, commit)
+	if !tok {
+		return
+	}
+	files = make(map[string][]u8, context.temp_allocator)
+	for name, oid in oids {
+		t, data, err := odb.read(&db, oid, context.temp_allocator)
+		if err != .None || t != .Blob {
+			return
+		}
+		files[name] = data
 	}
 	return files, true
 }
@@ -522,4 +549,156 @@ git_branches_other :: proc(vfs: prim.Vfs, root: string) -> []string {
 	}
 	slice.sort(out[:])
 	return out[:]
+}
+
+sim_git_spawner :: proc(n: ^Node) -> fs.Spawner {
+	return fs.Spawner{data = n, run = _sgs_run}
+}
+
+@(private = "file")
+_sgs_run :: proc(data: rawptr, argv: []string, cwd: string) -> fs.Error {
+	n := (^Node)(data)
+	if len(argv) < 2 || argv[0] != "git" {
+		return .Unsupported
+	}
+	vfs := disk_vfs(&n.disk)
+	git := strings.concatenate({cwd, "/.git"}, context.temp_allocator)
+	switch argv[1] {
+	case "read-tree":
+		if len(argv) != 3 {
+			return .Invalid
+		}
+		return .None if _sgs_read_tree(n, vfs, cwd, git, argv[2]) == .None else .Io
+	case "update-index":
+		return .None
+	case "symbolic-ref", "update-ref":
+		msg, target: string
+		for i := 2; i < len(argv); i += 1 {
+			if argv[i] == "-m" && i + 1 < len(argv) {
+				msg = argv[i + 1]
+				i += 1
+			} else if argv[i] != "--no-deref" && argv[i] != "HEAD" {
+				target = argv[i]
+			}
+		}
+		if len(target) == 0 {
+			return .Invalid
+		}
+		return .None if _sgs_set_head(n, vfs, git, target, argv[1] == "symbolic-ref", msg) == .None else .Io
+	}
+	return .Unsupported
+}
+
+@(private = "file")
+_sgs_read_tree :: proc(n: ^Node, vfs: prim.Vfs, root, git, hex: string) -> prim.Error {
+	commit, _, ok := odb.oid_from_hex(hex)
+	if !ok {
+		return .Invalid
+	}
+	db: odb.Odb
+	if odb.open(&db, vfs, root, nil, context.allocator, node_clock(&n.clock), rng_random(&n.rng)) != .None {
+		return .Io
+	}
+	defer odb.close(&db)
+	files, fok := _git_tree_files(&db, commit)
+	if !fok {
+		return .Io
+	}
+	lock := strings.concatenate({git, "/index.lock"}, context.temp_allocator)
+	lfd := prim.open_file(vfs, lock, {.Write, .Create, .Exclusive}, 0o644) or_return
+	prim.close_file(vfs, lfd) or_return
+	names := make([dynamic]string, context.temp_allocator)
+	for k in files {
+		append(&names, k)
+	}
+	slice.sort(names[:])
+	idx := make([dynamic]u8, context.temp_allocator)
+	append(&idx, 'D', 'I', 'R', 'C')
+	_put32(&idx, 2)
+	_put32(&idx, u32(len(names)))
+	for name in names {
+		path := strings.concatenate({root, "/", name}, context.temp_allocator)
+		oid := files[name]
+		data, derr := prim.read_file(vfs, path, context.temp_allocator)
+		clean := false
+		if derr == .None {
+			h, herr := odb.hash(.Sha1, .Blob, data)
+			clean = herr == .None && h == oid
+		}
+		if clean {
+			if err := _git_index_entry(&idx, vfs, path, name, oid); err != .None {
+				prim.remove(vfs, lock)
+				return err
+			}
+			continue
+		}
+		start := len(idx)
+		for _ in 0 ..< 6 {
+			_put32(&idx, 0)
+		}
+		_put32(&idx, 0o100644)
+		_put32(&idx, 0)
+		_put32(&idx, 0)
+		_put32(&idx, 0)
+		o := oid
+		append(&idx, ..o[:20])
+		nl := min(len(name), 0xfff)
+		append(&idx, u8(nl >> 8), u8(nl))
+		append(&idx, ..transmute([]u8)name)
+		entry := len(idx) - start
+		for _ in 0 ..< 8 - entry % 8 {
+			append(&idx, 0)
+		}
+	}
+	sum := odb.hash_bytes(.Sha1, idx[:])
+	append(&idx, ..sum[:20])
+	_write_file(vfs, lock, idx[:]) or_return
+	return prim.rename(vfs, lock, strings.concatenate({git, "/index"}, context.temp_allocator))
+}
+
+@(private = "file")
+_sgs_set_head :: proc(n: ^Node, vfs: prim.Vfs, git, target: string, symbolic: bool, msg: string) -> prim.Error {
+	old_hex := "0000000000000000000000000000000000000000"
+	if ref, ok := _git_head_ref(vfs, git); ok {
+		if c, cok := _git_ref_commit(vfs, git, ref); cok {
+			old_hex = _git_hex(c)
+		}
+	} else if data, err := prim.read_file(vfs, strings.concatenate({git, "/HEAD"}, context.temp_allocator), context.temp_allocator); err == .None {
+		old_hex = strings.trim_space(string(data))
+	}
+	new_hex := target
+	body := strings.concatenate({target, "\n"}, context.temp_allocator)
+	if symbolic {
+		c, ok := _git_ref_commit(vfs, git, target)
+		if !ok {
+			return .Not_Found
+		}
+		new_hex = _git_hex(c)
+		body = strings.concatenate({"ref: ", target, "\n"}, context.temp_allocator)
+	}
+	head_lock := strings.concatenate({git, "/HEAD.lock"}, context.temp_allocator)
+	_write_file(vfs, head_lock, transmute([]u8)body) or_return
+	prim.mkdir_all(vfs, strings.concatenate({git, "/logs"}, context.temp_allocator), 0o755) or_return
+	when_s := clock_wall(&n.clock) / 1_000_000_000
+	line := fmt.tprintf("%s %s sim <sim@0ndb.invalid> %d +0000\t%s\n", old_hex, new_hex, when_s, msg)
+	rfd := prim.open_file(vfs, strings.concatenate({git, "/logs/HEAD"}, context.temp_allocator), {.Write, .Create, .Append}, 0o644) or_return
+	werr := prim.write_at(vfs, rfd, transmute([]u8)line, 0)
+	if werr == .None {
+		werr = prim.datasync(vfs, rfd)
+	}
+	cerr := prim.close_file(vfs, rfd)
+	if werr != .None {
+		return werr
+	}
+	cerr or_return
+	prim.rename(vfs, head_lock, strings.concatenate({git, "/HEAD"}, context.temp_allocator)) or_return
+	return prim.sync_dir(vfs, git)
+}
+
+git_index_oids :: proc(vfs: prim.Vfs, root: string) -> map[string]odb.Oid {
+	out := make(map[string]odb.Oid, context.temp_allocator)
+	for k, v in _git_index_rows(vfs, strings.concatenate({root, "/.git"}, context.temp_allocator)) {
+		out[k] = v.oid
+	}
+	return out
 }

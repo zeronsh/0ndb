@@ -42,6 +42,7 @@ RUNTIME_OPS := []Op {
 	{163, "subscribe.runners", {SPACE, OBJ}, "Runners", nil},
 	{171, "line.hold", {{"tree", .Object, nil}, {"line", .Str, nil}, {"reason", .Enum, HOLD_REASON_NAMES[:]}, {"wait", .Bool, nil}}, "held:uvarint sealed:bool", op_line_hold},
 	{172, "line.resume", {{"tree", .Object, nil}, {"line", .Str, nil}}, "resumed:uvarint", op_line_resume},
+	{173, "line.switch", {{"tree", .Object, nil}, {"line", .Str, nil}, {"root", .Str, nil}}, "line:str held:uvarint", op_line_switch},
 	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
 }
 
@@ -94,6 +95,110 @@ _line_hold_done :: proc(data: rawptr, ok: bool) {
 		return
 	}
 	_rerun(c)
+}
+
+op_line_switch :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	ob := a_object(c, "tree")
+	to := a_str(c, "line")
+	if len(to) == 0 {
+		return .Invalid
+	}
+	m := mount_find(c.api, ob, strings.trim_right(a_str(c, "root"), "/"))
+	if m == nil {
+		if c.stage >= 2 {
+			c.in_exec = false
+		}
+		return .Not_Found
+	}
+	context = eng.context_for(c.api.e)
+	if c.stage == 0 {
+		from := fs.mount_line(m.mount)
+		c.scratch[3] = 0
+		if from == to {
+			o_str(o, "from", from)
+			o_str(o, "line", to)
+			o_int(o, "held", 0)
+			return .Ok
+		}
+		c.scratch[2] = 1
+		c.in_exec = true
+		c.scratch[0] = u64(rt.runtime_hold_line(r, ob.id, from, .Branch_Changed, _line_hold_done, c))
+		c.scratch[2] = 0
+		if c.stage != 1 {
+			return .Pending
+		}
+		c.in_exec = false
+	}
+	if c.stage == 1 {
+		if c.scratch[1] != 1 {
+			return .Closed
+		}
+		c.scratch[3] = 0x100 if fs.mount_hold_writes(m.mount) else 0
+		c.stage = 3
+		c.in_exec = true
+		c.scratch[2] = 1
+		serr := fs.mount_line_switch(m.mount, to, _line_switch_done, c)
+		c.scratch[2] = 0
+		if err := serr; err != .None {
+			c.in_exec = false
+			if c.scratch[3] & 0x100 != 0 {
+				fs.mount_release_writes(m.mount)
+			}
+			return _switch_status(err)
+		}
+		if c.stage != 2 {
+			return .Pending
+		}
+		c.in_exec = false
+	}
+	if c.scratch[3] & 0x100 != 0 {
+		fs.mount_release_writes(m.mount)
+		c.scratch[3] &~= 0x100
+	}
+	if err := fs.Error(c.scratch[3] & 0xff); err != .None {
+		return _switch_status(err)
+	}
+	rt.runtime_resume_line(r, ob.id, to)
+	eng.touched(c.api.e, m.object)
+	o_str(o, "line", to)
+	o_int(o, "held", int(c.scratch[0]))
+	return .Ok
+}
+
+@(private)
+_line_switch_done :: proc(m: ^fs.Mount, err: fs.Error, data: rawptr) {
+	c := (^Call)(data)
+	c.scratch[3] = (c.scratch[3] & 0x100) | u64(err)
+	was := c.stage
+	c.stage = 2
+	if was != 3 || !c.in_exec || c.scratch[2] == 1 {
+		return
+	}
+	c.in_exec = false
+	if c.orphan {
+		_call_free(c)
+		return
+	}
+	_rerun(c)
+}
+
+@(private)
+_switch_status :: proc(err: fs.Error) -> Status {
+	#partial switch err {
+	case .Not_Found:
+		return .Not_Found
+	case .Unsupported:
+		return .Unsupported
+	case .Busy:
+		return .Busy
+	case .Conflicts:
+		return .Conflict
+	}
+	return .Io
 }
 
 op_line_resume :: proc(c: ^Call, o: ^Out) -> Status {

@@ -1389,7 +1389,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	m.passes += 1
 	serr := mount_settle(m)
 	if p.switched && m.reg != nil && m.reg.on_line != nil {
-		m.reg.on_line(m, p.line_from, p.line_to, m.reg.hook_data)
+		m.reg.on_line(m, line_key_of(m, p.line_from, context.temp_allocator), line_key_of(m, p.line_to, context.temp_allocator), m.reg.hook_data)
 	}
 	return serr
 }
