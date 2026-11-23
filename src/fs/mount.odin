@@ -1324,7 +1324,7 @@ RELOAD_RETRY_MAX_MS :: 30_000
 
 @(private)
 mount_reload_retry :: proc(m: ^Mount) {
-	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && len(m.switch_to) == 0 {
+	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && len(m.switch_to) == 0 && !mount_absent_ready(m) {
 		return
 	}
 	m.reload_ms = max(m.opts.settle_ms, 1) if m.reload_ms == 0 else min(m.reload_ms * 2, RELOAD_RETRY_MAX_MS)
@@ -1365,6 +1365,9 @@ mount_run :: proc(m: ^Mount) -> Error {
 	err := mount_pass(m, false, !fence)
 	if err == .None {
 		err = mount_materialize(m)
+		if err != .None && err != .Reloading {
+			mount_reload_retry(m)
+		}
 	}
 	if err == .None && len(m.switch_to) > 0 {
 		mount_switch_step(m)
@@ -2154,10 +2157,10 @@ recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target
 		if terr != .None || string(t) != string(data) {
 			continue
 		}
+		one := [1]fstree.Op_Id{op_inode(h, it.end)}
+		e.ver = shadow_version_add(&m.shadow, one[:]) or_return
 		e.stat = d.stat
 		e.oid = oid
-		e.at = op_inode(h, it.end)
-		e.has_at = true
 		mount_reshow_add(m, p)
 		return .None
 	}

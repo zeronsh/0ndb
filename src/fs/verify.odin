@@ -69,7 +69,7 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 			continue
 		}
 		e, found := shadow_get(&m.shadow, p) or_return
-		if found && e.has_at {
+		if found && e.ver != 0 {
 			verify_at(m, p, e, disk, out, allocator) or_return
 			continue
 		}
@@ -125,7 +125,10 @@ verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, pre
 @(private = "file")
 verify_at :: proc(m: ^Mount, p: string, e: Entry, disk: bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	h := m.history
-	at := [1]crdt.Op_Id{inode_op(h, e.at)}
+	at := make([dynamic]crdt.Op_Id, context.temp_allocator)
+	for id in shadow_version(&m.shadow, e) {
+		append(&at, inode_op(h, id))
+	}
 	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, at[:], &lvs) != .None {
 		append(out, fmt.aprintf("%s: shadow version %v is not in the history", p, at[0], allocator = allocator))
@@ -170,7 +173,7 @@ verify_shadow :: proc(m: ^Mount, dir: string, seen: ^map[string]bool, out: ^[dyn
 		if verify_skip(m, p) {
 			continue
 		}
-		if k.entry.has_at {
+		if k.entry.ver != 0 {
 			if !seen[p] {
 				seen[p] = true
 				verify_at(m, p, k.entry, true, out, allocator) or_return

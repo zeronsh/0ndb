@@ -120,6 +120,8 @@ Disk :: struct {
 	ghost_root:  string,
 	dead:      bool,
 	fail_sync: u64,
+	fail_nth:  u64,
+	fail_root: string,
 	fail_rate: u64,
 	runaway_size: i64,
 	runaway_ino:  u64,
@@ -346,6 +348,27 @@ _event :: proc(d: ^Disk, path: string, closed := false) {
 		return
 	}
 	append(&d.events, Watch_Ev{path = strings.clone(path, d.allocator), closed = closed})
+}
+
+@(private = "file")
+_inject_path :: proc(d: ^Disk, path: string, space: bool) -> prim.Error {
+	if d.fail_nth > 0 && d.probe == 0 && !d.quiet && len(d.fail_root) > 0 && strings.has_prefix(path, d.fail_root) && (len(path) == len(d.fail_root) || path[len(d.fail_root)] == '/') {
+		d.fail_nth -= 1
+		if d.fail_nth == 0 {
+			d.stats.injected += 1
+			return .Io
+		}
+	}
+	return _inject(d, space)
+}
+
+@(private = "file")
+_inject_fd :: proc(d: ^Disk, fd: prim.Fd, space: bool) -> prim.Error {
+	path := ""
+	if of, ok := d.fds[fd]; ok {
+		path = of.path
+	}
+	return _inject_path(d, path, space)
 }
 
 @(private = "file")
@@ -585,7 +608,7 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 		if len(lk.name) == 0 {
 			return prim.INVALID_FD, .Invalid
 		}
-		if ierr := _inject(d, true); ierr != .None {
+		if ierr := _inject_path(d, path, true); ierr != .None {
 			return prim.INVALID_FD, ierr
 		}
 		n := _inode_new(d, .File, mode)
@@ -732,7 +755,7 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 	if !_enter(d, 3) {
 		return .Io
 	}
-	if ierr := _inject(d, true); ierr != .None {
+	if ierr := _inject_fd(d, fd, true); ierr != .None {
 		return ierr
 	}
 	of, n, err := _fd_get(d, fd)
@@ -771,7 +794,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return err
 	}
 	owned := len(d.ghost_root) > 0 && strings.has_prefix(of.path, d.ghost_root) && (len(of.path) == len(d.ghost_root) || of.path[len(d.ghost_root)] == '/')
-	if d.fail_sync > 0 || _inject(d, false) != .None {
+	if d.fail_sync > 0 || _inject_fd(d, fd, false) != .None {
 		if d.fail_sync > 0 {
 			d.fail_sync -= 1
 		}
@@ -898,7 +921,7 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	if !_enter(d, 5) {
 		return .Io
 	}
-	if ierr := _inject(d, true); ierr != .None {
+	if ierr := _inject_fd(d, fd, true); ierr != .None {
 		return ierr
 	}
 	of, n, err := _fd_get(d, fd)
@@ -932,7 +955,7 @@ _d_punch :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> prim.Error {
 	if !_enter(d, 6) {
 		return .Io
 	}
-	if ierr := _inject(d, false); ierr != .None {
+	if ierr := _inject_fd(d, fd, false); ierr != .None {
 		return ierr
 	}
 	of, n, err := _fd_get(d, fd)
@@ -1039,7 +1062,7 @@ _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 	if !_enter(d, 10) {
 		return .Io
 	}
-	if ierr := _inject(d, true); ierr != .None {
+	if ierr := _inject_path(d, new, true); ierr != .None {
 		return ierr
 	}
 	if d.probe == 0 {
@@ -1110,7 +1133,7 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	if !_enter(d, 11) {
 		return .Io
 	}
-	if ierr := _inject(d, false); ierr != .None {
+	if ierr := _inject_path(d, path, false); ierr != .None {
 		return ierr
 	}
 	if d.probe == 0 {
@@ -1172,7 +1195,7 @@ _d_mkdir :: proc(data: rawptr, path: string, mode: u32) -> prim.Error {
 	if !_enter(d, 13) {
 		return .Io
 	}
-	if ierr := _inject(d, true); ierr != .None {
+	if ierr := _inject_path(d, path, true); ierr != .None {
 		return ierr
 	}
 	if d.probe == 0 {
@@ -1375,6 +1398,7 @@ disk_crash :: proc(d: ^Disk, mode: Crash_Mode, r: ^Rng) {
 	d.dead = false
 	d.crash_at = 0
 	d.fail_sync = 0
+	d.fail_nth = 0
 	for _, n in d.inodes {
 		n.lock_fd = prim.INVALID_FD
 		n.opens = 0
