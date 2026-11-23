@@ -76,7 +76,7 @@ _local_first :: proc(w: ^World) {
 			world_fail(w, "local: mkdir: %v", merr)
 			return
 		}
-		if _, merr := eng.tree_mount(&a.e, tree, LOCAL_ROOT); merr != .None {
+		if lm, merr := eng.tree_mount(&a.e, tree, LOCAL_ROOT); merr != .None && !(merr == .Pending && lm != nil) {
 			world_fail(w, "local: tree_mount: %v", merr)
 			return
 		}
