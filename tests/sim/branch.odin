@@ -1098,7 +1098,7 @@ _bs_run :: proc(w: ^World, arena: ^virtual.Arena) {
 	for step in 0 ..< 14 {
 		pos, _ := _br_position(c, n)
 		path := _bs_path(b, pos)
-		k := rng_int(&w.rng, 6)
+		k := rng_int(&w.rng, 8)
 		label := fmt.aprintf("step %d", step, allocator = alloc)
 		switch k {
 		case 0:
@@ -1231,6 +1231,67 @@ _bs_run :: proc(w: ^World, arena: ^virtual.Arena) {
 			}
 			run_until(w, w.now + 2_000_000_000, true)
 			_bs_check(b, fmt.aprintf("%s after a person edit", label, allocator = alloc), {}, false)
+		case 6:
+			list: []convo.Undo_State
+			{
+				context = instance_context(&n.inst)
+				l, lerr := eng.convo_undos(&n.e, c.conv, alloc)
+				node_after(n)
+				if lerr != .None {
+					world_fail(w, "branch seeds: %s: convo_undos: %v", label, lerr)
+					return
+				}
+				list = l
+			}
+			left := make([dynamic]convo.Undo_State, alloc)
+			for u in list {
+				if u.phase == .Released && u.redo == {} && !obj.rid_none(u.from) && u.from != u.to {
+					append(&left, u)
+				}
+			}
+			if len(left) == 0 {
+				continue
+			}
+			u := left[rng_int(&w.rng, len(left))]
+			world_note(w, "branch seeds: %s redo of %v (%v) to %v", label, u.id, u.cause, u.from)
+			{
+				context = instance_context(&n.inst)
+				_, err := eng.convo_redo(&n.e, c.conv, u.id)
+				node_after(n)
+				if err != .None && err != .Pending {
+					world_fail(w, "branch seeds: %s: redo: %v", label, err)
+					return
+				}
+			}
+			run_until(w, w.now + 5_000_000_000, true)
+			_bs_check(b, fmt.aprintf("%s after a redo", label, allocator = alloc), u.from, false)
+		case 7:
+			if len(b.ends) == 0 {
+				continue
+			}
+			keys := make([dynamic]obj.Rid, alloc)
+			for x in prim.sorted_keys(b.ends) {
+				append(&keys, x)
+			}
+			slice.sort_by(keys[:], proc(a, b: obj.Rid) -> bool {return a.off < b.off})
+			parent := keys[rng_int(&w.rng, len(keys))]
+			world_note(w, "branch seeds: %s send under %v", label, parent)
+			{
+				context = instance_context(&n.inst)
+				_, err := eng.exec(&n.e, eng.Cmd_Send{object = c.conv, text = "elsewhere", parent = parent})
+				node_after(n)
+				if err != .None && err != .Pending {
+					world_fail(w, "branch seeds: %s: send elsewhere: %v", label, err)
+					return
+				}
+			}
+			run_until(w, w.now + 5_000_000_000, true)
+			np, _ := _br_position(c, n)
+			nm, nok := _bs_msg(b, np)
+			if !nok || nm.role != .User || nm.parent != parent {
+				world_fail(w, "branch seeds: %s: after a send under %v the position %v is not a new user message there", label, parent, np)
+			}
+			_bs_check(b, fmt.aprintf("%s after a send elsewhere", label, allocator = alloc), np, false)
 		}
 	}
 }

@@ -394,7 +394,10 @@ convo_regenerating :: proc(e: ^Engine, o: Object) -> (user: Rid, err: Error) {
 _cu_edit :: proc(e: ^Engine, o: Object, parent: Rid, root: bool) -> (move: prim.Id, err: Error) {
 	from := _cu_position(e, o) or_return
 	if obj.rid_none(from) {
-		return {}, .None
+		st := convo_status(e, o) or_return
+		if root || obj.rid_none(st.head) {
+			return {}, .None
+		}
 	}
 	if !root && !(_cu_descends(e, o, from, parent) or_return) {
 		return convo_move(e, o, .Switch, parent)
@@ -948,6 +951,75 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 }
 
 @(private)
+_cu_files_key :: proc(e: ^Engine, o: Object, at: Rid) -> (key: Rid, err: Error) {
+	for x := at; !obj.rid_none(x); {
+		m := convo_message(e, o, {msg = x}, context.temp_allocator) or_return
+		if m.role == .Assistant {
+			return x, .None
+		}
+		x = m.parent
+	}
+	return {}, .None
+}
+
+@(private)
+_cu_parked :: proc(u: convo.Undo_State) -> bool {
+	for l in u.set {
+		if len(l.park) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_cu_switch_source :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, list: []convo.Undo_State, p: Cu_Paths) -> (best: int, child: Rid, err: Error) {
+	usable :: proc(u: convo.Undo_State, st: ^convo.Undo_State) -> bool {
+		return u.id != st.id && u.fenced && !obj.rid_none(u.from) && _cu_parked(u)
+	}
+	#reverse for u, i in list {
+		if u.from == st.to && usable(u, st) {
+			return i, {}, .None
+		}
+	}
+	key := _cu_files_key(e, o, st.to) or_return
+	#reverse for u, i in list {
+		if usable(u, st) && (_cu_files_key(e, o, u.from) or_return) == key {
+			return i, {}, .None
+		}
+	}
+	best = -1
+	#reverse for u in list {
+		if u.id == st.id || obj.rid_none(u.from) {
+			continue
+		}
+		last: Rid
+		x := u.from
+		for !obj.rid_none(x) && x != key {
+			m := convo_message(e, o, {msg = x}, context.temp_allocator) or_return
+			if m.role == .Assistant {
+				last = x
+			}
+			x = m.parent
+		}
+		if x == key && !obj.rid_none(last) {
+			return -1, last, .None
+		}
+	}
+	for u, i in list {
+		if !usable(u, st) {
+			continue
+		}
+		for c in p.new_only {
+			if u.from == c {
+				best = i
+			}
+		}
+	}
+	return best, {}, .None
+}
+
+@(private)
 _cu_switch_set :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Undo_Conv) -> (set: []convo.Undo_Line, err: Error) {
 	lines := make([dynamic]convo.Undo_Line, context.temp_allocator)
 	list := convo_undos(e, o, context.temp_allocator) or_return
@@ -961,30 +1033,7 @@ _cu_switch_set :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Un
 		}
 	} else {
 		p := _cu_paths(e, o, st.from, st.to) or_return
-		cands := p.new_only
-		if len(cands) == 0 {
-			one := make([]Rid, 1, context.temp_allocator)
-			one[0] = st.to
-			cands = one
-		}
-		best, exact := -1, false
-		for u, i in list {
-			if u.id == st.id || !u.fenced || obj.rid_none(u.from) {
-				continue
-			}
-			if u.from == st.to {
-				best, exact = i, true
-				continue
-			}
-			if exact {
-				continue
-			}
-			for c in cands {
-				if u.from == c {
-					best = i
-				}
-			}
-		}
+		best, child := _cu_switch_source(e, o, st, list, p) or_return
 		if best >= 0 {
 			for l in list[best].set {
 				if len(l.park) > 0 {
@@ -992,7 +1041,10 @@ _cu_switch_set :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Un
 				}
 			}
 		} else {
-			at := _cu_reply_on(e, o, p.new_only) or_return
+			at := child
+			if obj.rid_none(at) {
+				at = _cu_reply_on(e, o, p.new_only) or_return
+			}
 			if obj.rid_none(at) {
 				at = _cu_reply_on(e, o, p.old_only) or_return
 			}
@@ -1159,7 +1211,7 @@ _cu_undo_undone :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []U
 			continue
 		}
 		cs := convo_status(e, c.o) or_return
-		append(&leaves, convo.Undone_Leaf{conv = c.o.id, leaf = cs.position if cs.browsing else {}})
+		append(&leaves, convo.Undone_Leaf{conv = c.o.id, leaf = cs.position if cs.browsing else cs.head})
 	}
 	reverts := make([dynamic]convo.Undone_Revert, context.temp_allocator)
 	for l in st.set {
@@ -1221,21 +1273,19 @@ _cu_undo_leaves :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []U
 	if _cu_switch_like(st^) {
 		if st.cause == .Redo {
 			u := _cu_undone_of(e, o, st.redo) or_return
-			own := false
 			for l in u.leaves {
-				_cu_set_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
-				own ||= l.conv == o.id
+				if l.conv != o.id {
+					_cu_restore_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
+				}
 			}
-			if own {
-				return .None
-			}
+			return _cu_restore_leaf(e, o, st.to)
 		}
 		return _cu_set_leaf(e, o, st.to)
 	}
 	if st.redo != {} {
 		u := _cu_undone_of(e, o, st.redo) or_return
 		for l in u.leaves {
-			_cu_set_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
+			_cu_restore_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
 		}
 		return .None
 	}
@@ -1273,9 +1323,18 @@ _cu_set_root :: proc(e: ^Engine, o: Object) -> Error {
 }
 
 @(private)
+_cu_restore_leaf :: proc(e: ^Engine, o: Object, leaf: Rid) -> Error {
+	st := convo_status(e, o) or_return
+	if leaf == st.head {
+		return _cu_set_leaf(e, o, {})
+	}
+	return _cu_set_leaf(e, o, leaf)
+}
+
+@(private)
 _cu_set_leaf :: proc(e: ^Engine, o: Object, leaf: Rid) -> Error {
 	st := convo_status(e, o) or_return
-	if (st.browsing && st.position == leaf) || (!st.browsing && obj.rid_none(leaf)) {
+	if !st.browsing if obj.rid_none(leaf) else st.browsing && st.position == leaf {
 		return .None
 	}
 	h := _convo_writable(e, o) or_return
