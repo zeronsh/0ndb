@@ -425,7 +425,7 @@ _space_open :: proc(e: ^Engine, id: prim.Id) -> (sp: ^Space, err: Error) {
 	sp.identities[e.self] = e.identity
 	sp.open = true
 	_cards_load(e, sp)
-	if len(sp.relay) > 0 || e.cfg.transport.open != nil {
+	if len(sp.relay) > 0 {
 		if rerr := _repl_start(e, sp); rerr != .None {
 			_log(e, .Warn, "replicator start failed")
 		}
