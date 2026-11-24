@@ -1,4 +1,5 @@
 package crdt
+import "core:fmt"
 
 import "base:runtime"
 import "core:slice"
@@ -132,7 +133,10 @@ graph_actor :: proc(g: ^Graph, actor: prim.Id) -> (u32, bool) {
 	return ix, ok
 }
 
-graph_intern :: proc(g: ^Graph, actor: prim.Id) -> u32 {
+graph_intern :: proc(g: ^Graph, actor: prim.Id, loc := #caller_location) -> u32 {
+	if g.page_size == 0 {
+		fmt.eprintf("DBGI intern on a dead graph from %v\n", loc)
+	}
 	if ix, ok := graph_actor(g, actor); ok {
 		return ix
 	}

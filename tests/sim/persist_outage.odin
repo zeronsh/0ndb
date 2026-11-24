@@ -1,7 +1,9 @@
 package sim
+import "core:fmt"
 
 import eng "../../src/engine"
 import "../../src/fs"
+import "../../src/crdt"
 import "../../src/prim"
 
 STAT_PERSIST_OUTAGES: Stat
@@ -126,6 +128,16 @@ check_actor_owners :: proc(w: ^World) {
 			fs.history_unowned_actors(h.hist, &out)
 			for a in out {
 				if !known[a] {
+					if lv, ok := crdt.graph_lv(&h.hist.g, crdt.Op_Id{a, 0}); ok {
+						_, cnt, stream, off, found := fs.history_batch_at(h.hist, lv)
+						fmt.eprintf("DBGO actor=%x known=%d cnt=%d stream=%v off=%d found=%v kind=%v path=%v\n", a, crdt.graph_known(&h.hist.g, a), cnt, h.hist.stream_ids[stream], off, found, h.kind, n.identity.id)
+						b, _ := fs.history_read_batch(h.hist, stream, off, context.temp_allocator)
+						for op in b.ops {
+							fmt.eprintf("DBGO   %v pos=%d len=%d target=%v content=%q\n", op.kind, op.pos, op.len, op.target, string(op.content[:min(len(op.content),60)]))
+						}
+						for y in n.e.buffers { fmt.eprintf("DBGO   buffer base=%x obj=%v\n", y.actor, id_short(y.object.id)) }
+						fmt.eprintf("DBGO   editor=%x\n", eng.editor_actor(&n.e))
+					}
 					world_fail(w, "%s history of %s: actor %s committed batches but has no owner registration", n.name, id_short(id), id_short(a))
 				}
 			}

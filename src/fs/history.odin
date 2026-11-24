@@ -988,8 +988,8 @@ history_lamport_after :: proc(h: ^History, parents: Version) -> u64 {
 	return l + 1
 }
 
-history_actor_ix :: proc(h: ^History, actor: prim.Id) -> u32 {
-	return crdt.graph_intern(&h.g, actor)
+history_actor_ix :: proc(h: ^History, actor: prim.Id, loc := #caller_location) -> u32 {
+	return crdt.graph_intern(&h.g, actor, loc)
 }
 
 history_actor :: proc(h: ^History, ix: u32) -> prim.Id {
@@ -1006,11 +1006,11 @@ inode_op :: proc(h: ^History, id: fstree.Inode_Id) -> crdt.Op_Id {
 	return crdt.Op_Id{history_actor(h, id.actor), id.seq}
 }
 
-op_inode :: proc(h: ^History, id: crdt.Op_Id) -> fstree.Inode_Id {
+op_inode :: proc(h: ^History, id: crdt.Op_Id, loc := #caller_location) -> fstree.Inode_Id {
 	if id == {} {
 		return fstree.ROOT
 	}
-	return fstree.Inode_Id{crdt.graph_intern(&h.g, id.actor), id.seq}
+	return fstree.Inode_Id{crdt.graph_intern(&h.g, id.actor, loc), id.seq}
 }
 
 Import_File :: struct {
