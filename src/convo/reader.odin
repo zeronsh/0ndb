@@ -196,7 +196,7 @@ view_tail :: proc(v: ^obj.View, self: prim.Id = {}, allocator := context.allocat
 	t.head = head.at
 	t.head_hlc = head.hlc
 	t.position = pos.at
-	t.browsing = browsing
+	t.browsing = browsing && pos.at != head.at
 	missing := false
 	for s in 0 ..< len(v.segs) {
 		sum, ok := _tail(v, s) or_return

@@ -1969,8 +1969,9 @@ running on it is a record in it.
     restoring the positions the undo recorded for the other conversations of
     the tree. The position and the files always move together: the undone
     record keeps concrete positions (never "following the tip"), a move ends on
-    its target whatever was sent meanwhile (following the tip again only when
-    the target is the tip), and a send under a message from the root position
+    its target whatever was sent meanwhile and records that position as a leaf
+    even at the tip, so a later switch back to the branch lands where the move
+    left it, and a send under a message from the root position
     is a switch to it first. A turn starts from its
     conversation line's head, so landing is a fast-forward unless another
     writer moved the line meanwhile, and the union then only merges those
