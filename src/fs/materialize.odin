@@ -29,15 +29,23 @@ Mat_Item :: struct {
 
 mount_materialize :: proc(m: ^Mount) -> Error {
 	done, err := _mount_materialize(m)
-	if (done || err != .None) && len(m.mat_waits) > 0 {
-		waits := m.mat_waits
-		m.mat_waits = make([dynamic]Mat_Wait, m.allocator)
-		for w in waits {
-			w.cb(m, w.data)
-		}
-		delete(waits)
+	if done || err != .None {
+		_mat_fire(m)
 	}
 	return err
+}
+
+@(private)
+_mat_fire :: proc(m: ^Mount) {
+	if len(m.mat_waits) == 0 {
+		return
+	}
+	waits := m.mat_waits
+	m.mat_waits = make([dynamic]Mat_Wait, m.allocator)
+	for w in waits {
+		w.cb(m, w.data)
+	}
+	delete(waits)
 }
 
 @(private)
@@ -94,6 +102,7 @@ _mount_materialize :: proc(m: ^Mount) -> (done: bool, err: Error) {
 	if merr != .None {
 		return false, merr
 	}
+	_mat_fire(m)
 	return true, mount_settle(m)
 }
 
