@@ -590,7 +590,21 @@ simulate :: proc(t: ^testing.T) {
 			if env_u64("SIM_ADDR_JITTER", 0) != 0 {
 				region_jitter = 4096 + 48
 			}
+			hold := make([dynamic]rawptr, runtime.heap_allocator())
+			if hj := env_u64("SIM_HEAP_JITTER", 0); hj != 0 {
+				x := hj
+				for _ in 0 ..< 4096 {
+					x = x * 6364136223846793005 + 1442695040888963407
+					sz := int(16 + (x >> 33) % 4096)
+					p, _ := runtime.mem_alloc(sz, 16, runtime.heap_allocator())
+					append(&hold, raw_data(p))
+				}
+			}
 			b := run_seed(seed, verbose, &ib, "second", true)
+			for p in hold {
+				runtime.mem_free(p, runtime.heap_allocator())
+			}
+			delete(hold)
 			region_jitter = 0
 			diffs := make([dynamic]string, runtime.heap_allocator())
 			same := disk_images_compare(&ia, &ib, &diffs)
