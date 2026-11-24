@@ -205,7 +205,8 @@ verify_at :: proc(m: ^Mount, synced: ^fstree.Snapshot, p: string, e: Entry, disk
 		if serr != nil {
 			return .Corrupt
 		}
-		if !sok || sid != e.inode {
+		at_line := (sok && sid == e.inode) || (verify_at_line(m, p, e.inode) or_return)
+		if !at_line {
 			append(out, fmt.aprintf("%s: shadow inode %v is at this path neither at its own version (%v, found %v) nor in synced (%v, found %v)", p, e.inode, id, ok, sid, sok, allocator = allocator))
 			return .None
 		}
@@ -228,6 +229,25 @@ verify_at :: proc(m: ^Mount, synced: ^fstree.Snapshot, p: string, e: Entry, disk
 		append(out, fmt.aprintf("%s: disk %q, at its own version %q", p, data, want, allocator = allocator))
 	}
 	return .None
+}
+
+@(private = "file")
+verify_at_line :: proc(m: ^Mount, p: string, inode: fstree.Inode_Id) -> (at: bool, err: Error) {
+	line, found := history_line(m.history, m.line, context.temp_allocator) or_return
+	if !found {
+		return false, .None
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&m.history.g, line, &lvs) != .None {
+		return false, .Corrupt
+	}
+	snap := version_snapshot(m.history, lvs[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	id, ok, lerr := fstree.lookup(&snap, p)
+	if lerr != nil {
+		return false, .Corrupt
+	}
+	return ok && id == inode, .None
 }
 
 @(private = "file")

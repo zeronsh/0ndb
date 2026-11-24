@@ -902,7 +902,15 @@ equal in both directions.
   pass made before a crash is never ingested as a new one beside the line's,
   but only when everything the pass creates under it is adopted too: a user
   file under it would otherwise commit as a child of an inode `synced` does
-  not contain. A file whose content is still its
+  not contain. A symlink the line holds at its path with the same target, and
+  one it no longer holds, are adopted like a file. A rename the line already
+  made is adopted as the move of its entry, and a directory's as the move of
+  its whole subtree, only when every entry is at its line path with either
+  its line content or its own entry's: otherwise nothing under it moves. An
+  entry whose content the pass had not rewritten names the version it is at
+  (`synced` before the crash) at the path the line gives it, so verification
+  accepts an entry's path at its own version, at `synced` or at the line,
+  and always compares its content at its own version. A file whose content is still its
   entry's (a racy entry reread) is not adopted: its entry already describes
   the disk. Leftover temps are internal names and
   never ingested.

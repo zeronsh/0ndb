@@ -33,10 +33,21 @@ recreate_other  | a.txt=x                 | rm a.txt; mkdir a.txt; write a.txt/i
 dir_to_file     | d/=  d/f.txt=x          | rmtree d; write d dfile                          | directory replaced by a file
 dir_to_link     | k.txt=y d/=  d/f.txt=x  | rmtree d; ln_s k.txt d                            | directory replaced by a symlink to a file
 dir_to_dir_link | k/=  k/g.txt=y d/=  d/f.txt=x | rmtree d; ln_s k d                          | directory replaced by a symlink to a directory
-link_to_dir     | k.txt=y d->k.txt        | rm d; mkdir d; write d/f.txt z                    | symlink replaced by a directory known:crash
+link_to_dir     | k.txt=y d->k.txt        | rm d; mkdir d; write d/f.txt z                    | symlink replaced by a directory
 dir_to_loop     | d/=  d/f.txt=x          | rmtree d; ln_s d d                                | directory replaced by a symlink to itself
 tree_to_loop    | d/f.txt=x d/g/h.txt=y   | rmtree d; ln_s d d                                | the removed subdirectory's path runs through the loop
 tree_to_link    | k/g/z.txt=y d/g/h.txt=x | rmtree d; ln_s k d                                | the removed subdirectory's path runs into another tree
+symlink_rename  | a.txt=x l->a.txt        | mv l m
+file_to_link    | a.txt=x b.txt=y         | rm b.txt; ln_s a.txt b.txt
+link_to_file    | a.txt=x l->a.txt        | rm l; write l z
+link_moved_in   | a.txt=x l->a.txt        | mkdir d; mv l d/l
+swap_link       | a.txt=x d/l->a.txt      | mv d/l l; rmdir d; write d dfile                  | a restored directory holding a moved symlink
+swap_subdir     | d/g/h.txt=x d/g/i.txt=y | mv d/g g; rmdir d; write d dfile                  | a restored directory holding a moved directory
+swap_tree       | d/f.txt=x d/g/h.txt=y   | mv d/f.txt f.txt; mv d/g/h.txt h.txt; rmtree d; write d dfile | moved files in two restored directories
+swap_subdir_edit| d/g/h.txt=x d/g/i.txt=y | mv d/g g; rmdir d; write d dfile; write g/h.txt z  | a restored directory holding a moved directory with an edited file
+swap_child_edit | d/f.txt=x               | mv d/f.txt f.txt; write f.txt z; rmdir d; write d dfile | a restored directory holding a moved, edited file
+move_edit       | a/x.txt=1 b/=           | mv a/x.txt b/x.txt; write b/x.txt z
+dir_rename_link | d/f.txt=1 d/l->f.txt d/g/h.txt=2 | mv d e
 rename          | a.txt=x                 | mv a.txt b.txt
 case_rename     | a.txt=x                 | mv a.txt A.txt                                    | case-only
 binary          | a.txt=x                 | write_bin b.bin 4096                              | bytes 0..255 incl. NUL
@@ -50,7 +61,7 @@ exec_clear      | s.sh=echo+x             | chmod_nx s.sh
 exec_new        | a.txt=x                 | write s.sh echo; chmod_x s.sh
 symlink_new     | a.txt=x                 | ln_s a.txt l
 symlink_retarget| a.txt=x b.txt=y l->a.txt| rm l; ln_s b.txt l
-symlink_delete  | a.txt=x l->a.txt        | rm l | known:crash
+symlink_delete  | a.txt=x l->a.txt        | rm l
 symlink_dangling| a.txt=x                 | ln_s missing.txt l
 person_between  | a.txt=x                 | write b.txt agent; person c.txt person; write b.txt agent2 | undo keeps c.txt
 person_same     | a.txt=x                 | write a.txt agent; person a.txt person-after      | undo:a.txt=person-after offer:a.txt known:revert
@@ -62,4 +73,4 @@ person_new_edit | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nP
 person_new_add  | k.txt=x               | write n.txt A\nB; person n.txt A\nP\nB                  | undo:n.txt=P known:revert
 person_new_del  | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nC                  | undo:n.txt=-
 move_deep_dir   | a.txt=x                 | mkdir b; mkdir b/c; mv a.txt b/c/a.txt
-dir_swap_child  | d/f.txt=x               | mv d/f.txt f.txt; rmdir d; write d dfile | the path of an emptied directory reused by a file known:crash
+dir_swap_child  | d/f.txt=x               | mv d/f.txt f.txt; rmdir d; write d dfile | the path of an emptied directory reused by a file
