@@ -2,6 +2,7 @@ package sim
 
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 import eng "../../src/engine"
@@ -18,6 +19,7 @@ Rf_Op :: enum u8 {
 	Ingest_Nudged,
 	Ingest_Then_Write,
 	Materialize,
+	Materialize_New,
 }
 
 @(private = "file")
@@ -140,7 +142,48 @@ _rf_check :: proc(w: ^World, n: ^Node, tree: eng.Object, want: map[string]string
 }
 
 @(private = "file")
-_rf_run :: proc(w: ^World, op: Rf_Op, prefix: string, nth: int) -> (fired: bool, errs: string) {
+_rf_print :: proc(w: ^World, n: ^Node, tree: eng.Object) -> string {
+	vfs := disk_vfs(&n.disk)
+	b := strings.builder_make(context.allocator)
+	cut :: proc(nm: string) -> string {
+		i := strings.index_byte(nm, '~')
+		return nm if i < 0 else nm[:i + 1]
+	}
+	lines := make([dynamic]string, context.temp_allocator)
+	context = instance_context(&n.inst)
+	names, lerr := eng.tree_list(&n.e, tree, "d17", context.temp_allocator)
+	append(&lines, fmt.tprintf("tree d17 %v %d", lerr, len(names)))
+	for nm in names {
+		data, rerr := eng.tree_read(&n.e, tree, fmt.tprintf("d17/%s", nm), context.temp_allocator)
+		append(&lines, fmt.tprintf("tree %s %v %q", cut(nm), rerr, string(data)))
+	}
+	node_after(n)
+	n.disk.probe += 1
+	d: prim.Dir
+	if prim.dir_open(vfs, &d, RF_ROOT + "/d17", context.temp_allocator) == .None {
+		for {
+			de, more, derr := prim.dir_next(vfs, &d)
+			if derr != .None || !more {
+				break
+			}
+			if de.name == "." || de.name == ".." {
+				continue
+			}
+			data, rerr := prim.read_file(vfs, fmt.tprintf("%s/d17/%s", RF_ROOT, de.name), context.temp_allocator)
+			append(&lines, fmt.tprintf("disk %s %v %q", cut(de.name), rerr, string(data)))
+		}
+		prim.dir_close(vfs, &d)
+	}
+	n.disk.probe -= 1
+	slice.sort(lines[:])
+	for l in lines {
+		fmt.sbprintln(&b, l)
+	}
+	return strings.to_string(b)
+}
+
+@(private = "file")
+_rf_run :: proc(w: ^World, op: Rf_Op, prefix: string, nth: int, print: ^string) -> (fired: bool, errs: string) {
 	n := w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "read fault: node start")
@@ -192,6 +235,11 @@ _rf_run :: proc(w: ^World, op: Rf_Op, prefix: string, nth: int) -> (fired: bool,
 	}
 	target := strings.clone(_rf_name(137), w.allocator)
 	b := strings.builder_make(w.allocator)
+	if op == .Materialize_New {
+		n.disk.probe += 1
+		_rf_write(vfs, RF_ROOT + "/d17/new.txt", "local\n")
+		n.disk.probe -= 1
+	}
 	read_fault_arm(&n.disk, prefix, nth)
 	switch op {
 	case .List:
@@ -217,6 +265,13 @@ _rf_run :: proc(w: ^World, op: Rf_Op, prefix: string, nth: int) -> (fired: bool,
 				fmt.sbprintf(&b, "sync %v ", serr)
 			}
 		}
+	case .Materialize_New:
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		base := tree_base(&n.e, tree)
+		if werr := eng.tree_write(&n.e, tree, "d17/new.txt", transmute([]u8)string("from the engine\n"), base); werr != .None {
+			fmt.sbprintf(&b, "tree_write %v ", werr)
+		}
 	case .Materialize:
 		context = instance_context(&n.inst)
 		defer node_after(n)
@@ -234,6 +289,10 @@ _rf_run :: proc(w: ^World, op: Rf_Op, prefix: string, nth: int) -> (fired: bool,
 	path: string
 	fired, path = read_fault_disarm(w.allocator)
 	run_until(w, w.now + 20_000_000_000, true)
+	if op == .Materialize_New {
+		print^ = _rf_print(w, n, tree)
+		return fired, strings.clone(strings.to_string(b), context.allocator)
+	}
 	#partial switch op {
 	case .Ingest_Nudged:
 		other := _rf_name(21)
@@ -300,8 +359,13 @@ read_fault :: proc(t: ^testing.T) {
 	defer test_end(t)
 	most := int(env_u64("RF_MAX", 400))
 	for op in Rf_Op {
+		if op == .Materialize_New && env_u64("RF_NEW", 0) == 0 {
+			continue
+		}
 		for prefix in ([]string{"/data", RF_ROOT}) {
 			points, bad := 0, 0
+			control := ""
+			defer delete(control)
 			only := int(env_u64("RF_ONLY", 0))
 			for nth in 0 ..= most {
 				if only != 0 && nth != 0 && nth != only {
@@ -319,7 +383,21 @@ read_fault :: proc(t: ^testing.T) {
 				cfg.mem_max = 1500
 				w := new(World)
 				world_init(w, cfg)
-				fired, errs := _rf_run(w, op, prefix, nth)
+				print := ""
+				fired, errs := _rf_run(w, op, prefix, nth, &print)
+				if op == .Materialize_New && len(w.failures) == 0 {
+					if nth == 0 {
+						control = strings.clone(print)
+						fmt.eprintf("read_fault: Materialize_New control: %d lines\n", strings.count(control, "\n"))
+					} else if strings.contains(errs, "tree_write") {
+						if !strings.contains(print, "disk new.txt None \"local\\n\"") || strings.contains(print, "~") {
+							world_fail(w, "Materialize_New, read %d under %s failed once [%s]: the write answered an error, yet:\n%s", nth, prefix, errs, print)
+						}
+					} else if print != control {
+						world_fail(w, "Materialize_New, read %d under %s failed once [%s]: DIFFERS from the control:\n%s--- control\n%s", nth, prefix, errs, print, control)
+					}
+				}
+				delete(print)
 				delete(errs)
 				if nth == 0 && len(w.failures) > 0 {
 					fmt.eprintf("read_fault: CONTROL %v under %s fails: %s\n", op, prefix, w.failures[0])
@@ -328,7 +406,7 @@ read_fault :: proc(t: ^testing.T) {
 					bad += 1
 					for f in w.failures {
 						if bad <= int(env_u64("RF_PRINT", 6)) {
-							fmt.eprintf("read_fault: %s\n", f)
+							fmt.eprintf("read_fault: %v, read %d: %s\n", op, nth, f)
 						}
 					}
 				}

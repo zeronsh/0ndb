@@ -28,6 +28,7 @@ Sd_Op :: enum u8 {
 	Moved_Edited,
 	Never_Shown,
 	Checkout,
+	Held,
 }
 
 Sd_Hurt :: enum u8 {
@@ -39,6 +40,7 @@ Sd_Hurt :: enum u8 {
 	No_Log,
 	Short_Log,
 	Header,
+	Newer,
 	Gen_Pointer,
 	Gen_Missing,
 	Mounted,
@@ -105,6 +107,18 @@ _sd_remove :: proc(n: ^Node, path: string) -> bool {
 	n.disk.probe += 1
 	defer n.disk.probe -= 1
 	return prim.remove(disk_vfs(&n.disk), path) == .None
+}
+
+@(private = "file")
+_sd_version :: proc(n: ^Node, v: u8) {
+	files := make([dynamic]Disk_File, context.temp_allocator)
+	disk_walk(&n.disk, &files)
+	for f in files {
+		if strings.contains(f.path, "/shadow") && strings.has_suffix(f.path, ".log") {
+			b := [1]u8{v}
+			disk_probe_write(&n.disk, f.path, 7, b[:], true)
+		}
+	}
 }
 
 @(private = "file")
@@ -191,6 +205,9 @@ _sd_damage :: proc(w: ^World, n: ^Node, name: string, hurt: Sd_Hurt) -> bool {
 			if hurt == .Tail_No_Index {
 				done &&= _sd_remove(n, idx)
 			}
+		case .Newer:
+			b := [1]u8{'9'}
+			done = disk_probe_write(&n.disk, f.path, 7, b[:], true)
 		case .Header:
 			b := [1]u8{0}
 			done = disk_probe_write(&n.disk, f.path, 2, b[:], true)
@@ -317,6 +334,23 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 		run_until(w, w.now + 5_000_000_000, true)
 	}
 	fresh := strings.clone("d0/new.txt", w.allocator)
+	if op == .Held {
+		context = instance_context(&n.inst)
+		n.disk.fail_root = SD_ROOT
+		n.disk.fail_nth = 1
+		n.disk.fail_stick = true
+		base: fs.Version
+		_, rerr := eng.tree_read(&n.e, tree, target, context.temp_allocator, {}, "", nil, &base)
+		werr := eng.tree_write(&n.e, tree, target, transmute([]u8)string("acked, not on disk\n"), base) if rerr == .None else rerr
+		node_after(n)
+		if werr != .None {
+			world_fail(w, "%s: CONTROL: the tree write answers %v", what, werr)
+			return
+		}
+	}
+	if op == .Held {
+		run_until(w, w.now + 3_000_000_000, false)
+	}
 	if op == .Never_Shown {
 		{
 			context = instance_context(&n.inst)
@@ -367,6 +401,7 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 		prim.remove(vfs, abs)
 		delete_key(&want, target)
 	case .Never_Shown:
+	case .Held:
 	case .Checkout:
 		changes := make([dynamic]Git_Change, context.temp_allocator)
 		res, gerr := git_checkout(vfs, SD_ROOT, "other", false, when_s + 60, node_clock(&n.clock), rng_random(&w.rng), &changes)
@@ -410,6 +445,13 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 	for _ in 0 ..< 3 {
 		if n.alive && _sd_mount(n) == nil {
 			err := node_mount(w, n, len(m.objs) - 1, SD_ROOT)
+			if hurt == .Newer && n.alive {
+				if err != .Newer {
+					world_fail(w, "%s: NEWER: the mount answers %v", what, err)
+				}
+				_sd_version(n, '1')
+				err = node_mount(w, n, len(m.objs) - 1, SD_ROOT)
+			}
 			if err != .None && n.alive && n.incarnation == inc {
 				world_fail(w, "%s: REMOUNT: %v", what, err)
 				return
@@ -431,6 +473,10 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 	}
 	if op == .Checkout {
 		print^ = _sd_print(w, n, tree)
+		return
+	}
+	if op == .Held {
+		_sd_held(w, n, tree, target, hurt, what)
 		return
 	}
 	_sd_check(w, n, tree, want, ids, what)
@@ -477,6 +523,64 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 	run_until(w, w.now + 30_000_000_000, true)
 	_sd_check(w, n, tree, want, ids, fmt.tprintf("%s, after one more write", what))
 	return
+}
+
+@(private = "file")
+_sd_held :: proc(w: ^World, n: ^Node, tree: eng.Object, fresh: string, hurt: Sd_Hurt, what: string) {
+	vfs := disk_vfs(&n.disk)
+	abs := fmt.aprintf("%s/%s", SD_ROOT, fresh, allocator = w.allocator)
+	look :: proc(w: ^World, n: ^Node, tree: eng.Object, fresh, abs: string) -> (held: bool, in_tree: string, entries: int, disk: string) {
+		vfs := disk_vfs(&n.disk)
+		n.disk.probe += 1
+		data, _ := prim.read_file(vfs, abs, w.allocator)
+		n.disk.probe -= 1
+		disk = string(data)
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		mt := _sd_mount(n)
+		for p in fs.mount_stuck(mt) {
+			held ||= p == fresh
+		}
+		text, _ := eng.tree_read(&n.e, tree, fresh, context.temp_allocator)
+		in_tree = strings.clone(string(text), w.allocator)
+		list, _ := eng.tree_list(&n.e, tree, "d1", context.temp_allocator)
+		for nm in list {
+			entries += int(strings.has_prefix(nm, "f13.txt"))
+		}
+		return
+	}
+	old := "file 13\nsecond line\n"
+	acked := "acked, not on disk\n"
+	held, in_tree, entries, disk := look(w, n, tree, fresh, abs)
+	fmt.eprintf("shadow_damage: %s: held %v, tree %q, %d entries, disk %q\n", what, held, in_tree, entries, disk)
+	if in_tree != acked || entries != 1 || (disk != acked && (!held || disk != old)) {
+		world_fail(w, "%s: HELD: held %v, tree %q, %d entries, disk %q: neither converged nor held", what, held, in_tree, entries, disk)
+	}
+	if hurt == .None && (held || disk != acked) {
+		world_fail(w, "%s: HELD: CONTROL: the undamaged mount does not converge", what)
+	}
+	if hurt == .No_Log && !held {
+		world_fail(w, "%s: HELD: a path with no row and an older file is not held", what)
+	}
+	if !held {
+		return
+	}
+	_sd_write(vfs, abs, acked)
+	{
+		context = instance_context(&n.inst)
+		node_after(n)
+	}
+	run_until(w, w.now + 60_000_000_000, true)
+	held, in_tree, entries, disk = look(w, n, tree, fresh, abs)
+	if held || in_tree != acked || entries != 1 || disk != acked {
+		world_fail(w, "%s: HELD: after the file matches: held %v, tree %q, %d entries, disk %q", what, held, in_tree, entries, disk)
+	}
+	context = instance_context(&n.inst)
+	ops := _sd_survives(n, tree, acked)
+	node_after(n)
+	if !strings.contains(ops, "1 history ops") {
+		world_fail(w, "%s: HELD: the text entered the history again: %s", what, ops)
+	}
 }
 
 @(private = "file")

@@ -481,7 +481,8 @@ equal in both directions.
   that version whose stats match nothing (so the ordinary pass decides what
   changed on disk), drops rows the synced tree does not hold, and publishes
   the result as a new generation. It ingests, removes and writes nothing
-  itself. A path that version may not have shown (absent, reshow, a name
+  itself. It runs on the engine's loop and holds the daemon while it walks the
+  tree (1.3 to 2.3 s for 50000 files). A path that version may not have shown (absent, reshow, a name
   that differs only in case), or whose row is at an older version and whose
   file matches neither, is held: neither side is touched until the file
   matches one of them. Held paths are saved and show in the mount's status.
