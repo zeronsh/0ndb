@@ -1,5 +1,7 @@
 package pack
 
+import "core:fmt"
+
 @(private)
 IMG_BLOCK :: 512
 
@@ -78,6 +80,8 @@ _img_drop :: proc(p: ^Pack, oi: ^Open_Inode) {
 @(private)
 _img_write :: proc(p: ^Pack, oi: ^Open_Inode, src: []u8, off: i64) {
 	img := oi.img
+	DBG_WRITES += 1
+	if DBG_WRITES % 1000000 == 0 { fmt.eprintln("DBGWRITE", DBG_WRITES, "inum", oi.inum, "off", off, "len", len(src)) }
 	copy(img.data[off:], src)
 	if !img.any {
 		img.any = true
@@ -115,12 +119,19 @@ _img_next :: proc(img: ^Image, from: int, size: int) -> (lo: int, hi: int, ok: b
 }
 
 @(private)
+DBG_SETTLE: int
+DBG_WRITES: int
+
 _img_settle :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
 	img := oi.img
 	if img == nil {
 		return .None
 	}
 	size := int(oi.ino.size)
+	DBG_SETTLE += 1
+	if DBG_SETTLE % 20000 == 0 {
+		fmt.eprintln("DBGSETTLE", DBG_SETTLE, "inum", oi.inum, "size", size, "any", img.any, "imgs", len(p.imgs), "n", oi.ino.n, "refs", oi.refs, "unlinked", oi.unlinked, "kind", oi.ino.kind)
+	}
 	if !img.any || size == 0 {
 		_img_drop(p, oi)
 		return .None
@@ -131,7 +142,12 @@ _img_settle :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
 	whole := false
 	scratch: Phys_List
 	from := 0
+	DBG_IT := 0
 	for {
+		DBG_IT += 1
+		if DBG_IT % 5000 == 0 {
+			fmt.eprintln("SPIN sim from", from, "size", size, "blocks", (size + IMG_BLOCK - 1) / IMG_BLOCK, "simn", sim.n, "len", len(img.data), "inum", oi.inum, "dirtywords", len(img.dirty))
+		}
 		lo, hi, ok := _img_next(img, from, size)
 		if !ok {
 			break
@@ -155,7 +171,12 @@ _img_settle :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
 		nw.ext[0] = Extent{off = 0, len = i64(size), cont = ph.cont, coff = ph.off}
 	} else {
 		at := 0
+		DBG_IT2 := 0
 		for {
+			DBG_IT2 += 1
+			if DBG_IT2 % 5000 == 0 {
+				fmt.eprintln("SPIN2 at", at, "size", size, "lo", 0)
+			}
 			lo, hi, ok := _img_next(img, at, size)
 			if !ok {
 				break
