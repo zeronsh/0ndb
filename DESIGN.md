@@ -596,7 +596,11 @@ equal in both directions.
   held file nor descend from one that does, so the disk under a write in
   progress never moves. The write's reported original (`scope_write_base`)
   must hash to the file at the write pin, and a read pin's hash is checked
-  again, so a pin is used only for the content it names. A scoped change to
+  again, so a pin is used only for the content it names. A change whose
+  content is still the entry's (an event on a file 0ndb itself wrote, or the
+  same bytes written again) never uses a read or write pin: what others
+  wrote since that read is not the scope's. It goes the ordinary way, so its
+  stat, inode, mode and moves are still taken. A scoped change to
   a pinned path is then emitted as base→written text edits in a batch
   parented on the pinned version, credited to the scope's actor, without
   moving `synced`; the pass then materializes `synced` united with that

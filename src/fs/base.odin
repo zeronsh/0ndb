@@ -376,9 +376,14 @@ _base_note :: proc(m: ^Mount, rel: string, note: Base_Note) {
 }
 
 @(private)
+_same_content :: proc(m: ^Mount, c: ^Change) -> bool {
+	return c.kind == .Modify && c.moved == "" && c.disk == .File && c.old.kind == .File && disk_content_matches(m, c.path, c.stat, c.old)
+}
+
+@(private)
 _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.Id, observed: bool) {
 	if c.scope != nil {
-		if x := _pin(c.scope, c.path, false); x != nil && (x.has_read || x.has_write) {
+		if x := _pin(c.scope, c.path, false); x != nil && (x.has_read || x.has_write) && !_same_content(m, c) {
 			return x, c.scope.actor, false
 		}
 		return _entry_pin(m, c, buf, c.scope.actor)
@@ -388,7 +393,7 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 		return _entry_pin(m, c, buf, attrib_default_actor(m, c.path))
 	}
 	o, found := _observed(m.history, a.actor, c.path)
-	if !found {
+	if !found || _same_content(m, c) {
 		return _entry_pin(m, c, buf, attrib_default_actor(m, c.path))
 	}
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
