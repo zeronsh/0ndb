@@ -10,7 +10,7 @@ import "../../src/prim"
 
 CUT_ROOT :: "/work/cut-n0"
 
-agent_cut_run :: proc(seed: u64, crash_at: u64, process: bool) -> (failures: [dynamic]string, crashed: bool) {
+agent_cut_run :: proc(seed: u64, crash_at: u64, process: bool, pass: bool) -> (failures: [dynamic]string, crashed: bool) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 1
@@ -25,7 +25,7 @@ agent_cut_run :: proc(seed: u64, crash_at: u64, process: bool) -> (failures: [dy
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	crashed = _cut_crash(w, crash_at, process)
+	crashed = _cut_crash(w, crash_at, process, pass)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -69,7 +69,7 @@ _cut_write :: proc(vfs: prim.Vfs, path: string, data: []u8) -> prim.Error {
 }
 
 @(private = "file")
-_cut_crash :: proc(w: ^World, crash_at: u64, process: bool) -> (crashed: bool) {
+_cut_crash :: proc(w: ^World, crash_at: u64, process: bool, pass: bool) -> (crashed: bool) {
 	n := w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "cut: node start")
@@ -125,6 +125,12 @@ _cut_crash :: proc(w: ^World, crash_at: u64, process: bool) -> (crashed: bool) {
 		if sm == nil {
 			world_fail(w, "cut: mount missing before the write")
 			return
+		}
+		if pass {
+			fs.mount_sync(sm.m)
+			if n.disk.dead {
+				break write
+			}
 		}
 		scope := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
 		obs := Cut_Observed{}
@@ -200,21 +206,23 @@ agent_cut_crash :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	for process in ([]bool{true, false}) {
-		points := 0
-		for k in u64(1) ..= 4000 {
-			failures, crashed := agent_cut_run(1, k, process)
-			for f in failures {
-				fmt.eprintf("agent_cut_crash at disk op %d (%s): %s\n", k, "process" if process else "power", f)
-				delete(f)
+	for pass in ([]bool{false, true}) {
+		for process in ([]bool{true, false}) {
+			points := 0
+			for k in u64(1) ..= 4000 {
+				failures, crashed := agent_cut_run(1, k, process, pass)
+				for f in failures {
+					fmt.eprintf("agent_cut_crash at disk op %d (%s%s): %s\n", k, "process" if process else "power", ", after a pass" if pass else "", f)
+					delete(f)
+				}
+				testing.expect(t, len(failures) == 0, fmt.tprintf("agent_cut_crash at disk op %d failed", k))
+				delete(failures)
+				if !crashed {
+					points = int(k) - 1
+					break
+				}
 			}
-			testing.expect(t, len(failures) == 0, fmt.tprintf("agent_cut_crash at disk op %d failed", k))
-			delete(failures)
-			if !crashed {
-				points = int(k) - 1
-				break
-			}
+			fmt.eprintf("agent_cut_crash: %d %s crash points%s\n", points, "process" if process else "power", " after a pass" if pass else "")
 		}
-		fmt.eprintf("agent_cut_crash: %d %s crash points\n", points, "process" if process else "power")
 	}
 }

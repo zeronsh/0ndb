@@ -1551,7 +1551,11 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 					delete(key, m.allocator)
 				}
 			} else {
-				attrib_set(m, path, actor, false, o, sc)
+				base_step := actor == m.actor && o != {} && sc == {}
+				b, pending := m.attrib[path]
+				if !base_step || !pending || b.used {
+					attrib_set(m, path, actor, false, o, sc)
+				}
 				if o != {} {
 					attrib_chain_add(m, path, Attrib_Step{actor, o, sc})
 				}
