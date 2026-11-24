@@ -118,6 +118,10 @@ Disk :: struct {
 	grains:    [dynamic]Grain,
 	crash_on_trunc: string,
 	force_process: bool,
+	blob_zero_crash: bool,
+	cut_unlink: string,
+	cut_after:  u64,
+	cuts:       u64,
 	blob_crash: u64,
 	blob_crash_n: u64,
 	blob_crashes: u64,
@@ -1235,6 +1239,11 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0, gone = ino})
 	_maybe_orphan(d, ino)
 	_event(d, path)
+	if d.cut_after > 0 && d.crash_at == 0 && strings.contains(path, d.cut_unlink) {
+		d.crash_at = d.stats.ops + d.cut_after
+		d.cut_after = 0
+		d.cuts += 1
+	}
 	return .None
 }
 
