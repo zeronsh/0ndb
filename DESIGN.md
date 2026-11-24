@@ -3184,12 +3184,12 @@ Relay cost tracks the reachable information, not the activity. Items marked
   live view reads every content range a merge needs before it merges: one it
   cannot read fails the advance with the view unchanged and nothing sent, so
   a client is never shown bytes the file does not have and no edit is ever
-  made against them. The buffer stays dirty and, when the blob is not in the
-  store, requests it; its arrival drives the buffer with no user action. A
-  blob that is present but failed to read is retried at the next engine tick
-  of any cause (a write, a remote change, a completion): with no timers, an
+  made against them. The buffer stays dirty and retries at the next engine
+  tick of any cause (a write, a remote change, a completion), so a blob that
+  reads again, or arrives, drives it with no user action; with no timers, an
   editor on an engine nothing else wakes keeps the last good text until
-  then.
+  then. A blob gone from the store is not requested again: its editor keeps
+  the last good text and refuses edits (Missing) until the blob returns.
 - **Checkout form.** A writer mounted in a git checkout records file
   contents in git's clean form (attributes, `core.autocrlf`, filters) and
   marks each such file with the fstree flag `Git_Clean` (bit 3), setting it

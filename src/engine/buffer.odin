@@ -5,7 +5,6 @@ import "core:mem/virtual"
 import "core:slice"
 import "../crdt"
 import "../fs"
-import "../odb"
 import "../fstree"
 import "../prim"
 import osync "../sync"
@@ -593,11 +592,8 @@ View_Reader :: struct {
 @(private)
 _buffer_unavailable :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	_hist_fetch_full(e, h)
-	if ref, lost := b.view.missing.?; lost {
+	if _, lost := b.view.missing.?; lost {
 		b.dirty = true
-		if db, derr := device_odb(e); derr == .None && h.sp.repl_on && !odb.exists(db, ref.oid) {
-			_content_fetch(e, h, ref)
-		}
 	}
 	return .Missing
 }

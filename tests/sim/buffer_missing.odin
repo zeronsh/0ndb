@@ -239,8 +239,8 @@ _bm :: proc(w: ^World, kind: Bm_Case) {
 				world_fail(w, "buffer missing: after a client sent back what it was shown, %s's file is %d bytes with %d zeros (%v)", n.name, len(got), strings.count(got, "\x00"), err)
 			}
 		}
-		if c.zeros > 0 || strings.contains(last, "\x00") || !strings.contains(last, string(big)) {
-			world_fail(w, "buffer missing: the client was shown %d zeros and its buffer ends at %d bytes", c.zeros, len(last))
+		if c.zeros > 0 || last != small {
+			world_fail(w, "buffer missing: the client was shown %d zeros and its buffer ends at %d bytes, want the last good %d", c.zeros, len(last), len(small))
 		}
 		return
 	}
@@ -264,6 +264,18 @@ _bm :: proc(w: ^World, kind: Bm_Case) {
 		world_note(w, "buffer missing: type %v; delete 16 at %d of %d %v; undo %v %v", e1, at, len(t2), e2, done, e3)
 	}
 	run_until(w, w.now + 60_000_000_000, true)
+	if kind == .Lost {
+		last, _, _ := _bm_text(w, b, id)
+		if c.zeros > 0 || last != small {
+			world_fail(w, "buffer missing: with its blob gone the buffer ends at %d bytes (%d zeros shown), want the last good %d", len(last), c.zeros, len(small))
+		}
+		for n in ([]^Node{a, b}) {
+			if got, err := _bm_file(w, n, tree); err != .None || got != full {
+				world_fail(w, "buffer missing: with the blob gone %s's file is %d bytes (%v), want %d unchanged", n.name, len(got), err, len(full))
+			}
+		}
+		return
+	}
 	typed := strings.concatenate({"typed ", full}, w.allocator)
 	last, _, lerr := _bm_text(w, b, id)
 	if lerr != .None || last != typed || c.zeros > 0 {
