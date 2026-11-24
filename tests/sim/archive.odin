@@ -430,7 +430,6 @@ _archive_hooks :: proc "contextless" () {
 	STAT_OVER_TAIL = register_stat(77, 12, "records_over_tail")
 }
 
-@(private = "file")
 Restore_Pick :: struct {
 	oi:   int,
 	wn:   ^Node,
@@ -450,7 +449,6 @@ _node_of :: proc(w: ^World, dev: prim.Id) -> ^Node {
 	return nil
 }
 
-@(private = "file")
 _msg_redacted :: proc(m: ^Model, idx: int) -> bool {
 	for op in m.ops {
 		if op.kind == .Redact_Msg && op.target == idx {
@@ -460,12 +458,10 @@ _msg_redacted :: proc(m: ^Model, idx: int) -> bool {
 	return false
 }
 
-@(private = "file")
 _online :: proc(n: ^Node) -> bool {
 	return n.alive && n.e_open && !n.partitioned
 }
 
-@(private = "file")
 _restore_pick :: proc(w: ^World) -> (p: Restore_Pick, ok: bool) {
 	m := &w.model
 	for _, oi in m.objs {
@@ -865,7 +861,6 @@ check_forget_third_reader :: proc(w: ^World) {
 	}
 }
 
-@(private = "file")
 _forget_reread :: proc(w: ^World, p: Restore_Pick) {
 	m := &w.model
 	ob := &m.objs[p.oi]
