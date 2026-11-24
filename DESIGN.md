@@ -1179,7 +1179,9 @@ equal in both directions.
   outside the set, and a move, flags or target change, or an opaque file's
   blob, set by the set reverts unless an outside op set the same field later
   (then the outside value stays and the set's blob is the alternative).
-  Restored text is an `Insert_Copy` of the original ops, so blame keeps the
+  Restored text is an `Insert_Copy` of the original ops (resolved through
+  earlier copies to the text's root author ops, so a chain of reverts never
+  deepens), so blame keeps the
   original authors. The batch commits under a fresh revert actor,
   `ingestion_actor(h.self, pseudo)` for a new pseudo id, registered with its
   owner (kind 2, the undoing conversation, or plain kind 1 outside an undo) so
@@ -1931,12 +1933,21 @@ running on it is a record in it.
     as it was at W and keeps every other writer's ops. Every move is that one
     operation per (tree, line), with A's set exactly as for an undo (below) and
     the base by cause: a switch to leaf L takes the park version of the move
-    that last left L (or a message on L's path below the fork), else the
-    start version of L's first reply after the fork; an edit of user message U
+    that last left L, else of the move that last left a position whose nearest
+    reply at or above is L's (positions under one reply hold the same files),
+    else, when a left position descends from that reply, the start version of
+    the next reply on the way to it, else the park of a move that left a
+    message on L's path below the fork, else the start version of L's first
+    reply after the fork. A move that parked no line is no source; an edit of user message U
     (sending with a parent other than the current position) takes U's turn
     start, moves the leaf to U's parent, and the new message follows; an undo
     of T takes T's turn start; a redo is a switch to the undone position,
-    restoring the leaves the undo recorded. A turn starts from its
+    restoring the positions the undo recorded for the other conversations of
+    the tree. The position and the files always move together: the undone
+    record keeps concrete positions (never "following the tip"), a move ends on
+    its target whatever was sent meanwhile (following the tip again only when
+    the target is the tip), and a send under a message from the root position
+    is a switch to it first. A turn starts from its
     conversation line's head, so landing is a fast-forward unless another
     writer moved the line meanwhile, and the union then only merges those
     writers.
@@ -1976,9 +1987,7 @@ running on it is a record in it.
     (`Summary.leaf_root`), and the next send starts a new root sibling.
     `convo.undone` (178) lists the left branches (the newest move per left
     position, with its cause and target), each switchable back with `redo`
-    or `switch`. A park lookup takes the move that left exactly the target
-    leaf first, and only without one a move that left an ancestor on the
-    target's path. There is no leaf-only `back` and no per-turn `go_back` or
+    or `switch`. There is no leaf-only `back` and no per-turn `go_back` or
     `revert`; `follow` from a browsed position is a move to the tip first.
 - **Undo** of turn T of A rewinds A's whole task tree to T's start, as a set
   revert (fs) per line plus leaf and session rewinds, driven by one staged

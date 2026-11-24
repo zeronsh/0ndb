@@ -310,7 +310,7 @@ _mount_revert :: proc(m: ^Mount, before: Version, after: Version, owner: prim.Id
 			if ed.del > 0 {
 				builder_delete(&b, ino, ed.pos, ed.del)
 			} else if ed.ins > 0 {
-				builder_copy(&b, ino, ed.pos, ed.src, ed.ins)
+				builder_copy_root(&b, ino, ed.pos, ed.src, ed.ins)
 			}
 		}
 		history_unload_files(h)

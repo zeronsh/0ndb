@@ -1120,7 +1120,8 @@ _teardown :: proc(e: ^Engine) {
 	delete(e.held)
 	delete(e.purged)
 	delete(e.waiters)
-	for mw in e.move_waits {
+	for &mw in e.move_waits {
+		_cu_free_reverts(e, &mw)
 		if mw.ready.call != nil {
 			mw.ready.call(mw.ready.data, e, .Closed)
 		}
