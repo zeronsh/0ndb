@@ -1419,6 +1419,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		}
 		matched, broken, gone := false, false, false
 		replayed := false
+		last: Attrib_Step
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
 		for st in steps_pending(m, steps[:], cur) or_return {
 			if st.step == {} && st.oid == cur {
@@ -1435,12 +1436,12 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			}
 			replayed = true
 			cur = st.oid
-			if disk_oid == st.oid {
-				c.actor = st.actor
-				c.scope_id = st.scope
-				matched = true
-				break
-			}
+			last = st
+		}
+		if replayed && !broken && !gone && cur == disk_oid {
+			c.actor = last.actor
+			c.scope_id = last.scope
+			matched = true
 		}
 		if matched && replayed {
 			k, _ := clone_string(c.path, p.long)
@@ -1503,7 +1504,7 @@ attrib_chain_settle :: proc(p: ^Pass) {
 steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid) -> (pending: []Attrib_Step, err: Error) {
 	#reverse for st, i in steps {
 		landed := history_step_landed(m.history, st.step) or_return
-		if landed || (st.step == {} && shown != {} && st.oid == shown) {
+		if landed || (st.step == {} && st.scope != {} && shown != {} && st.oid == shown) {
 			return steps[i + 1:], .None
 		}
 	}
