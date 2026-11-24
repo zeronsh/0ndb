@@ -124,7 +124,7 @@ commit_on_ref :: proc(db: ^odb.Odb, ref: string, tree: odb.Oid, info: Commit_Inf
 		message   = msg,
 	}
 	oid := from_odb_v(odb.write_commit(db, c)) or_return
-	from_odb(odb.barrier(db)) or_return
+	from_odb(odb.barrier(db, true)) or_return
 	expected: Maybe(odb.Oid)
 	if perr == .None {
 		expected = parent
@@ -132,7 +132,7 @@ commit_on_ref :: proc(db: ^odb.Odb, ref: string, tree: odb.Oid, info: Commit_Inf
 		expected = odb.ZERO_OID
 	}
 	from_odb(odb.update_ref(db, ref, oid, expected)) or_return
-	return from_odb(odb.barrier(db))
+	return from_odb(odb.barrier(db, true))
 }
 
 mount_commit :: proc(m: ^Mount, info: Commit_Info) -> (commit: odb.Oid, err: Error) {
