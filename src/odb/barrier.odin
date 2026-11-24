@@ -116,8 +116,8 @@ take_pending :: proc(db: ^Odb, allocator := context.temp_allocator) -> (files: [
 	return out_f, out_d, .None
 }
 
-barrier :: proc(db: ^Odb) -> Error {
-	install_now(db) or_return
+barrier :: proc(db: ^Odb, order_only := false) -> Error {
+	install_now(db, order_only) or_return
 	sync.mutex_lock(&db.mutex)
 	files := db.pending_files
 	dirs := db.pending_dirs
@@ -161,7 +161,7 @@ barrier :: proc(db: ^Odb) -> Error {
 	}
 	if err == .None {
 		roots := [2]string{primary_dir(db), db.common_dir}
-		err = sync_paths(db, uf, ud, roots[:])
+		err = sync_paths(db, uf, ud, roots[:], order_only)
 	}
 	if err != .None {
 		sync.mutex_lock(&db.mutex)

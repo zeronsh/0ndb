@@ -114,6 +114,7 @@ Disk :: struct {
 	fence_crash_n: u64,
 	fence_crashes: u64,
 	fence_cuts:    u64,
+	fence_site:    string,
 	quiet:     bool,
 	probe:     int,
 	freed_prefix: string,
@@ -880,7 +881,7 @@ _sync_fd :: proc(data: rawptr, fd: prim.Fd, barrier: bool) -> prim.Error {
 	if barrier {
 		if len(n.pend) > 0 {
 			append(&d.fences, Fence{seq = d.wseq, ino = n.ino})
-			if d.fence_crash > 0 && d.crash_at == 0 && d.probe == 0 {
+			if d.fence_crash > 0 && d.crash_at == 0 && d.probe == 0 && (len(d.fence_site) == 0 || strings.contains(of.path, d.fence_site)) {
 				d.fence_crash_n += 1
 				if d.fence_crash_n % d.fence_crash == 0 {
 					d.fence_crash = 0

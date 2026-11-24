@@ -318,13 +318,13 @@ install_staged :: proc(db: ^Odb) -> Error {
 }
 
 @(private)
-install_now :: proc(db: ^Odb) -> Error {
+install_now :: proc(db: ^Odb, order_only := false) -> Error {
 	sync.mutex_lock(&db.mutex)
 	if len(db.staged) == 0 {
 		sync.mutex_unlock(&db.mutex)
 		return .None
 	}
-	b := Install{db = db, roots = {primary_dir(db), db.common_dir}}
+	b := Install{db = db, roots = {primary_dir(db), db.common_dir}, order_only = order_only}
 	b.items = make([dynamic]^Staged, 0, len(db.staged), db.allocator)
 	append(&b.items, ..db.staged[:])
 	sync.mutex_unlock(&db.mutex)

@@ -1,5 +1,7 @@
 package sim
 
+import "core:os"
+
 STAT_FENCE_CRASHES: Stat
 STAT_FENCE_CUTS: Stat
 
@@ -17,9 +19,11 @@ _fences_world :: proc(w: ^World) {
 	if w.cfg.crash_rate == 0 || env_u64("SIM_FENCE_CRASH", 0) == 0 {
 		return
 	}
+	site, _ := os.lookup_env("SIM_FENCE_SITE", w.allocator)
 	for n in w.nodes {
 		if rng_chance(&w.rng, 1, 4) {
-			n.disk.fence_crash = u64(50 + rng_int(&w.rng, 400))
+			n.disk.fence_crash = u64(50 + rng_int(&w.rng, 400)) if len(site) == 0 else u64(1 + rng_int(&w.rng, 8))
+			n.disk.fence_site = site
 		}
 	}
 }

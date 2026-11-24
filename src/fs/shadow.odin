@@ -617,7 +617,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 		prim.truncate(s.vfs, s.log_fd, i64(start))
 		return from_prim(err)
 	}
-	if err := prim.datasync(s.vfs, s.log_fd); err != .None {
+	if err := prim.barrier(s.vfs, s.log_fd); err != .None {
 		prim.truncate(s.vfs, s.log_fd, i64(start))
 		return from_prim(err)
 	}
