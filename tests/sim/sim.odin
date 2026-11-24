@@ -62,7 +62,7 @@ drain_all :: proc(w: ^World) {
 		if relay_drain(&w.relay) {
 			any = true
 		}
-		if !any {
+		if !any || w.pause {
 			return
 		}
 		if round > 1_000_000 {
@@ -106,11 +106,19 @@ run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
 		if w.aborted {
 			return false
 		}
+		if w.pause {
+			w.pause = false
+			return false
+		}
 		if memory_runaway(w) {
 			return false
 		}
 		free_all(w.ctx.temp_allocator)
 		drain_all(w)
+		if w.pause {
+			w.pause = false
+			return false
+		}
 		t, ok := next_time(w)
 		if !ok {
 			return true

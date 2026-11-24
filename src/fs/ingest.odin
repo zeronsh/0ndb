@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:bytes"
 import "core:crypto/blake2b"
 import "core:strings"
+import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
 import "../crdt"
@@ -1242,12 +1243,37 @@ Pass :: struct {
 	operation:  string,
 	head:       Git_Head,
 	long:       runtime.Allocator,
-	chunk:      virtual.Arena,
+	chunk:      mem.Dynamic_Arena,
 	held:       [dynamic]Change,
 	alias_commits: [dynamic]string,
 	held_r:     map[string]bool,
 	held_c:     map[string]bool,
+	long_arena: mem.Dynamic_Arena,
+	walk:       [dynamic]Walk_Frame,
+	spent:      int,
+	keys:       [dynamic]string,
+	dirty_at:   map[string]i64,
+	rescan_was: bool,
+	stamp:      Index_Stamp,
+	reflog_pos: i64,
+	running:    bool,
+	side:       bool,
 }
+
+@(private)
+Walk_Frame :: struct {
+	rel:     string,
+	wd:      i32,
+	opened:  bool,
+	kids:    [dynamic]Shadow_Child,
+	names:   map[string]Listed,
+	pending: []string,
+	i:       int,
+	j:       int,
+}
+
+WALK_ENTRY :: 1
+WALK_READ :: 16
 
 PASS_CHUNK :: 4096
 MOVE_MIN :: 32
@@ -1510,7 +1536,61 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	return true, .None
 }
 
-mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
+mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> Error {
+	if m.pass != nil && !m.pass.running && !full && !m.rescan {
+		return pass_side(m, settle)
+	}
+	pass_drain(m) or_return
+	return pass_start(m, full, settle, -1)
+}
+
+@(private)
+pass_side :: proc(m: ^Mount, settle: bool) -> Error {
+	if len(m.dirty) == 0 {
+		return .None
+	}
+	p := pass_new(m) or_return
+	p.settle = settle
+	p.side = true
+	return pass_run(p, -1, true)
+}
+
+@(private)
+pass_new :: proc(m: ^Mount) -> (p: ^Pass, err: Error) {
+	p = new(Pass, m.allocator)
+	if p == nil {
+		return nil, .No_Memory
+	}
+	p.m = m
+	mem.dynamic_arena_init(&p.long_arena, m.allocator, m.allocator, 256 << 10, 64 << 10)
+	mem.dynamic_arena_init(&p.chunk, m.allocator, m.allocator, 1 << 20, 256 << 10)
+	p.long = mem.dynamic_arena_allocator(&p.long_arena)
+	p.walk = make([dynamic]Walk_Frame, m.allocator)
+	return p, .None
+}
+
+@(private)
+mount_pass_step :: proc(m: ^Mount, settle: bool) -> Error {
+	budget := m.opts.pass_budget if m.opts.pass_budget > 0 else -1
+	if m.pass != nil {
+		if m.pass.running {
+			return .None
+		}
+		return pass_run(m.pass, budget)
+	}
+	return pass_start(m, false, settle, budget)
+}
+
+@(private)
+pass_drain :: proc(m: ^Mount) -> Error {
+	if m.pass == nil || m.pass.running {
+		return .None
+	}
+	return pass_run(m.pass, -1)
+}
+
+@(private)
+pass_start :: proc(m: ^Mount, full: bool, settle: bool, budget: int) -> Error {
 	if !m.imported && !m.importing {
 		m.importing = true
 		ierr := mount_recover(m)
@@ -1519,36 +1599,71 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		}
 		m.importing = false
 		ierr or_return
-		return mount_pass(m, true, false)
+		return pass_start(m, true, false, budget)
 	}
 	adopt_finish(m) or_return
+	p := pass_new(m) or_return
+	p.settle = settle
+	p.full = full
+	if m.pass == nil {
+		m.pass = p
+		return pass_run(p, budget, true)
+	}
+	return pass_run(p, -1, true)
+}
+
+@(private)
+pass_run :: proc(p: ^Pass, budget: int, open := false) -> (err: Error) {
+	m := p.m
+	p.running = true
 	attr_begin(m)
 	defer attr_end(m)
-	long: virtual.Arena
-	if virtual.arena_init_growing(&long, 256 << 10) != nil {
-		return .No_Memory
+	context.temp_allocator = mem.dynamic_arena_allocator(&p.chunk)
+	defer if err != .None {
+		pass_abort(p)
 	}
-	defer virtual.arena_destroy(&long)
-	p: Pass
-	p.m = m
-	p.long = virtual.arena_allocator(&long)
-	if virtual.arena_init_growing(&p.chunk, 1 << 20) != nil {
-		return .No_Memory
-	}
-	defer virtual.arena_destroy(&p.chunk)
-	context.temp_allocator = virtual.arena_allocator(&p.chunk)
 	mount_wake(m) or_return
 	if m.history != nil {
 		defer history_trim(m.history)
 	}
-	catch_up(m) or_return
-	if m.has_git {
+	if open {
+		pass_open(p) or_return
+	}
+	p.spent = 0
+	more := pass_walk(p, budget if m.pass == p else -1) or_return
+	if m.pass == p && budget >= 0 {
+		m.pass_turns += 1
+		m.pass_turn_max = max(m.pass_turn_max, p.spent)
+	}
+	if more {
+		pass_flush(p, false) or_return
+		p.running = false
+		mount_schedule(m, 0)
+		if m.reg != nil && m.reg.on_park != nil {
+			m.reg.on_park(m, m.reg.park_data)
+		}
+		return .None
+	}
+	pass_finish(p) or_return
+	pass_free(p)
+	return .None
+}
+
+@(private)
+pass_open :: proc(p: ^Pass) -> Error {
+	m := p.m
+	settle := p.settle
+	if !p.side {
+		catch_up(m) or_return
+	}
+	if m.has_git && !p.side {
 		p.head, _ = git_head(m.vfs, m.git, p.long)
 		p.head_moved = !git_head_equal(p.head, m.head)
-		stamp := git_index_stamp(m.vfs, m.git)
+		p.stamp = git_index_stamp(m.vfs, m.git)
+		p.reflog_pos = git_reflog_len(m.vfs, m.git)
 		commits_only, _, rewritten := git_reflog_commits_only(m.vfs, m.git, m.reflog_pos)
 		p.operation = git_operation(m.vfs, m.git)
-		p.git_wrote = (p.head_moved && (!commits_only || rewritten)) || (p.operation != "" && stamp != m.stamp)
+		p.git_wrote = (p.head_moved && (!commits_only || rewritten)) || (p.operation != "" && p.stamp != m.stamp)
 		if key := branch_key(m, p.head, p.long); key != m.branch && p.operation == "" {
 			p.switched = true
 			p.line_from, _ = clone_string(m.branch, p.long)
@@ -1563,15 +1678,10 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		}
 	}
 	if p.git_wrote {
-		collect_alias_sources(m, &p)
+		collect_alias_sources(m, p)
 		if m.opts.index_trust {
 			trust_index(m)
 		}
-	}
-	defer {
-		delete(m.alias)
-		m.alias = nil
-		trust_drop(m)
 	}
 	p.changes = make([dynamic]Change, p.long)
 	p.held = make([dynamic]Change, p.long)
@@ -1586,10 +1696,11 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	p.settle = settle && !p.git_wrote
 	p.now = history_wall_ns(m.history)
 	p.cutoff = p.now - m.opts.settle_ms * 1_000_000
-	p.full = full || m.rescan || p.git_wrote
-	m.hold_line = p.git_wrote
-	defer m.hold_line = false
-	keys := make([dynamic]string, 0, len(m.dirty), p.long)
+	p.full = !p.side && (p.full || m.rescan || p.git_wrote)
+	if !p.side {
+		m.hold_line = p.git_wrote
+	}
+	p.keys = make([dynamic]string, 0, len(m.dirty), p.long)
 	for k in prim.sorted_keys(m.dirty) {
 		if k not_in m.dirty {
 			continue
@@ -1597,46 +1708,40 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		v := m.dirty[k]
 		c, _ := clone_string(k, p.long)
 		p.scope_of[c] = v
-		append(&keys, c)
+		append(&p.keys, c)
 	}
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
 	clear(&m.dirty)
-	dirty_at := make(map[string]i64, p.long)
+	p.dirty_at = make(map[string]i64, p.long)
 	for k, v in prim.unordered(m.dirty_at) {
 		c, _ := clone_string(k, p.long)
-		dirty_at[c] = v
+		p.dirty_at[c] = v
 	}
 	dirty_at_clear(m)
-	rescan_was := m.rescan
-	m.rescan = false
-	m.git_moved = false
-	defer if err != .None {
-		for k in prim.sorted_keys(p.scope_of) {
-			if k not_in p.scope_of {
-				continue
-			}
-			v := p.scope_of[k]
-			if k not_in m.dirty {
-				c, _ := clone_string(k, m.allocator)
-				m.dirty[c] = v
-				if at, ok := dirty_at[k]; ok && v == nil {
-					dirty_at_note(m, k, at)
-				}
-			}
-		}
-		m.rescan ||= rescan_was || p.full
+	if !p.side {
+		p.rescan_was = m.rescan
+		m.rescan = false
+		m.git_moved = false
 	}
 	if p.full {
-		collect_full(&p) or_return
+		walk_push(p, "", m.root_wd)
 		m.sweep_temps = false
-	} else {
-		slice.sort_by(keys[:], proc(a, b: string) -> bool {return git_path_cmp(a, false, b, false) < 0})
-		pre_moves(&p, keys[:]) or_return
-		for k in keys {
-			collect_path(&p, k) or_return
-			pass_maybe_flush(&p) or_return
+	}
+	return .None
+}
+
+@(private)
+pass_finish :: proc(p: ^Pass) -> Error {
+	m := p.m
+	settle := p.settle
+	if !p.full {
+		slice.sort_by(p.keys[:], proc(a, b: string) -> bool {return git_path_cmp(a, false, b, false) < 0})
+		pre_moves(p, p.keys[:]) or_return
+		for k in p.keys {
+			collect_path(p, k) or_return
+			pass_maybe_flush(p) or_return
 		}
 		if !settle {
 			scoped := make([dynamic]string, 0, len(m.unwatched), p.long)
@@ -1646,15 +1751,15 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			for u in scoped {
 				d := probe(m, u) or_return
 				if d.kind != .Dir {
-					collect_path(&p, u) or_return
+					collect_path(p, u) or_return
 					continue
 				}
-				compare_dir_deep(&p, u, -1) or_return
+				compare_dir_deep(p, u, -1) or_return
 			}
 		}
 	}
-	pass_flush(&p) or_return
-	if m.hold_line {
+	pass_flush(p) or_return
+	if m.hold_line && !p.side {
 		m.hold_line = false
 		set_line(m) or_return
 	}
@@ -1665,7 +1770,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		}
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
-		if at, ok := dirty_at[y]; ok && p.scope_of[y] == nil {
+		if at, ok := p.dirty_at[y]; ok && p.scope_of[y] == nil {
 			dirty_at_note(m, y, at)
 		}
 	}
@@ -1675,7 +1780,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		}
 		k, _ := clone_string(y, m.allocator)
 		m.dirty[k] = p.scope_of[y]
-		if at, ok := dirty_at[y]; ok && p.scope_of[y] == nil {
+		if at, ok := p.dirty_at[y]; ok && p.scope_of[y] == nil {
 			dirty_at_note(m, y, at)
 		}
 	}
@@ -1690,15 +1795,15 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		builder_opaque(&b, buf[:])
 		builder_commit(m, &b) or_return
 	}
-	if m.has_git && len(p.head.commit) > 0 {
+	if m.has_git && len(p.head.commit) > 0 && !p.side {
 		record_commit_version(m, p.head.commit, p.git_wrote, p.alias_commits[:]) or_return
 	}
-	if m.has_git {
+	if m.has_git && !p.side {
 		git_head_destroy(&m.head, m.allocator)
 		m.head.branch, _ = clone_string(p.head.branch, m.allocator)
 		m.head.commit, _ = clone_string(p.head.commit, m.allocator)
-		m.reflog_pos = git_reflog_len(m.vfs, m.git)
-		m.stamp = git_index_stamp(m.vfs, m.git)
+		m.reflog_pos = p.reflog_pos
+		m.stamp = p.stamp
 	}
 	if len(m.dirty) > len(p.holding) {
 		mount_schedule(m, m.opts.settle_ms)
@@ -1712,12 +1817,69 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 }
 
 @(private)
+pass_abort :: proc(p: ^Pass) {
+	m := p.m
+	for k in prim.sorted_keys(p.scope_of) {
+		if k not_in p.scope_of {
+			continue
+		}
+		v := p.scope_of[k]
+		if k not_in m.dirty {
+			c, _ := clone_string(k, m.allocator)
+			m.dirty[c] = v
+			if at, ok := p.dirty_at[k]; ok && v == nil {
+				dirty_at_note(m, k, at)
+			}
+		}
+	}
+	m.rescan ||= p.rescan_was || p.full
+	pass_free(p)
+}
+
+@(private)
+pass_free :: proc(p: ^Pass) {
+	m := p.m
+	for len(p.walk) > 0 {
+		walk_pop(p)
+	}
+	delete(p.walk)
+	if !p.side {
+		delete(m.alias)
+		m.alias = nil
+		trust_drop(m)
+		m.hold_line = false
+	}
+	mem.dynamic_arena_destroy(&p.chunk)
+	mem.dynamic_arena_destroy(&p.long_arena)
+	if m.pass == p {
+		m.pass = nil
+	}
+	free(p, m.allocator)
+}
+
+@(private)
+synced_holds :: proc(m: ^Mount, v: Version) -> bool {
+	h := m.history
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	vl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, v, &vl) != .None {
+		return false
+	}
+	for lv in vl {
+		if !crdt.graph_contains(&h.g, sl[:], lv) {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
 line_follow :: proc(m: ^Mount, key: string) -> Error {
 	h := m.history
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
 		history_set_line(h, key, m.synced[:]) or_return
-	} else {
+	} else if !synced_holds(m, v) {
 		line_retarget(m, v) or_return
 	}
 	delete(m.line, m.allocator)
@@ -2172,7 +2334,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 	mount_settle(m) or_return
 	history_trim(m.history)
 	clear(&p.changes)
-	virtual.arena_free_all(&p.chunk)
+	mem.dynamic_arena_free_all(&p.chunk)
 	return .None
 }
 
@@ -2577,99 +2739,141 @@ chain_free :: proc(nodes: [dynamic]^Ignore_Chain, allocator: runtime.Allocator) 
 }
 
 @(private)
-collect_full :: proc(p: ^Pass) -> Error {
-	m := p.m
-	return compare_dir_deep(p, "", m.root_wd)
+compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
+	base := len(p.walk)
+	walk_push(p, rel, wd)
+	for len(p.walk) > base {
+		walk_one(p) or_return
+	}
+	return .None
 }
 
 @(private)
-compare_dir_deep :: proc(p: ^Pass, rel: string, wd: i32) -> Error {
+walk_push :: proc(p: ^Pass, rel: string, wd: i32) {
+	heap := p.m.allocator
+	r, _ := clone_string(rel, heap)
+	append(&p.walk, Walk_Frame{rel = r, wd = wd})
+}
+
+@(private)
+walk_pop :: proc(p: ^Pass) {
+	heap := p.m.allocator
+	f := pop(&p.walk)
+	shadow_children_free(f.kids[:], heap)
+	delete(f.kids)
+	for k in prim.unordered(f.names) {
+		delete(k, heap)
+	}
+	delete(f.names)
+	delete(f.pending, heap)
+	delete(f.rel, heap)
+}
+
+@(private)
+pass_walk :: proc(p: ^Pass, budget: int) -> (more: bool, err: Error) {
+	for len(p.walk) > 0 {
+		if budget >= 0 && p.spent >= budget {
+			return true, .None
+		}
+		walk_one(p) or_return
+	}
+	return false, .None
+}
+
+@(private)
+walk_one :: proc(p: ^Pass) -> Error {
 	m := p.m
-	heap := runtime.heap_allocator()
-	kids := make([dynamic]Shadow_Child, heap)
-	defer {
-		shadow_children_free(kids[:], heap)
-		delete(kids)
-	}
-	shadow_children(&m.shadow, rel, &kids, heap) or_return
-	abuf: prim.Path_Buf
-	abs := abs_path(m, rel, abuf[:])
-	d: prim.Dir
-	if err := prim.dir_open(m.vfs, &d, abs, heap); err != .None {
-		if gone(err) {
-			return .None
-		}
-		return from_prim(err)
-	}
-	names := make(map[string]Listed, heap)
-	defer {
-		for k in names {
-			delete(k, heap)
-		}
-		delete(names)
-	}
-	for {
-		de, more, err := prim.dir_next(m.vfs, &d)
-		if err != .None {
-			prim.dir_close(m.vfs, &d)
+	heap := m.allocator
+	top := len(p.walk) - 1
+	f := &p.walk[top]
+	if !f.opened {
+		f.opened = true
+		f.kids = make([dynamic]Shadow_Child, heap)
+		f.names = make(map[string]Listed, heap)
+		shadow_children(&m.shadow, f.rel, &f.kids, heap) or_return
+		abuf: prim.Path_Buf
+		abs := abs_path(m, f.rel, abuf[:])
+		d: prim.Dir
+		if err := prim.dir_open(m.vfs, &d, abs, heap); err != .None {
+			if gone(err) {
+				walk_pop(p)
+				return .None
+			}
 			return from_prim(err)
 		}
-		if !more {
-			break
+		for {
+			de, more, err := prim.dir_next(m.vfs, &d)
+			if err != .None {
+				prim.dir_close(m.vfs, &d)
+				return from_prim(err)
+			}
+			if !more {
+				break
+			}
+			if de.name == "." || de.name == ".." || name_internal(de.name) {
+				mount_sweep_temp(m, abs, de.name)
+				continue
+			}
+			f.names[clone_string(de.name, heap) or_else ""] = Listed{kind = de.kind, has_stat = de.has_stat, size = de.size, mtime_ns = de.mtime_ns, ctime_ns = de.ctime_ns, ino = de.ino}
 		}
-		if de.name == "." || de.name == ".." || name_internal(de.name) {
-			mount_sweep_temp(m, abs, de.name)
-			continue
-		}
-		names[clone_string(de.name, heap) or_else ""] = Listed{kind = de.kind, has_stat = de.has_stat, size = de.size, mtime_ns = de.mtime_ns, ctime_ns = de.ctime_ns, ino = de.ino}
+		prim.dir_close(m.vfs, &d)
+		p.spent += WALK_ENTRY
+		return .None
 	}
-	prim.dir_close(m.vfs, &d)
 	cbuf: [prim.PATH_MAX]u8
-	for k in kids {
-		child, ok := path_join_buf(cbuf[:], rel, k.name)
+	if f.i < len(f.kids) {
+		k := f.kids[f.i]
+		f.i += 1
+		p.spent += WALK_ENTRY
+		child, ok := path_join_buf(cbuf[:], f.rel, k.name)
 		if !ok {
-			continue
+			return .None
 		}
-		ls, listed := names[k.name]
+		ls, listed := f.names[k.name]
 		if !listed {
 			add_remove_tree(p, child, k.entry) or_return
-			continue
+			return pass_maybe_flush(p)
 		}
-		dk, _ := delete_key(&names, k.name)
+		dk, _ := delete_key(&f.names, k.name)
 		delete(dk, heap)
 		if ls.has_stat && ls.kind == .File && k.entry.kind == .File && !k.entry.racy && ls.size == k.entry.stat.size && ls.mtime_ns == k.entry.stat.mtime_ns && ls.ctime_ns == k.entry.stat.ctime_ns && ls.ino == k.entry.stat.ino {
-			continue
+			return .None
 		}
 		dp := Probe{kind = .Dir}
 		if !(ls.kind == .Dir && k.entry.kind == .Dir) {
 			dp = probe(m, child, true) or_return
 		}
 		if k.entry.kind == .Dir && dp.kind == .Dir {
-			c, _ := clone_string(child, heap)
-			cwd, _ := watch_dir(m.reg, m, c, wd)
-			err := compare_dir_deep(p, c, cwd)
-			delete(c, heap)
-			err or_return
-		} else if dp.kind == .File && k.entry.kind == .File && stat_clean(dp.stat, k.entry) {
-			continue
-		} else {
-			collect_path(p, child, true) or_return
+			cwd, _ := watch_dir(m.reg, m, child, f.wd)
+			walk_push(p, child, cwd)
+			return .None
 		}
-		pass_maybe_flush(p) or_return
+		if dp.kind == .File && k.entry.kind == .File && stat_clean(dp.stat, k.entry) {
+			return .None
+		}
+		p.spent += WALK_READ
+		collect_path(p, child, true) or_return
+		return pass_maybe_flush(p)
 	}
-	pending := sorted_strings(names, heap)
-	defer delete(pending, heap)
-	for name in pending {
-		child, ok := path_join_buf(cbuf[:], rel, name)
+	if f.pending == nil {
+		f.pending = sorted_strings(f.names, heap)
+	}
+	if f.j < len(f.pending) {
+		name := f.pending[f.j]
+		f.j += 1
+		p.spent += WALK_READ
+		child, ok := path_join_buf(cbuf[:], f.rel, name)
 		if !ok {
-			continue
+			return .None
 		}
+		wd := f.wd
 		collect_path(p, child) or_return
 		if c := last_change(p); c != nil && c.path == child && c.kind == .Create && c.disk == .Dir {
 			watch_dir(m.reg, m, child, wd)
 		}
-		pass_maybe_flush(p) or_return
+		return pass_maybe_flush(p)
 	}
+	walk_pop(p)
 	return .None
 }
 
