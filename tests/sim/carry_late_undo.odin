@@ -30,6 +30,8 @@ Late_Turn_World :: struct {
 	drop: osync.Stream_Id,
 	on:   bool,
 	hits: int,
+	reader: int,
+	events: int,
 }
 
 @(private = "file")
@@ -38,6 +40,7 @@ _late_turn: ^Late_Turn_World
 @(init)
 _carry_late_undo_init :: proc "contextless" () {
 	register_world(68, _late_turn_init, _late_turn_destroy)
+	register_engine_event(68, _late_turn_event)
 	register_frame_filter(14, _late_turn_filter)
 }
 
@@ -55,6 +58,13 @@ _late_turn_destroy :: proc(w: ^World) {
 	frame_filter_enable(false)
 	free(_late_turn, w.allocator)
 	_late_turn = nil
+}
+
+@(private = "file")
+_late_turn_event :: proc(w: ^World, n: ^Node, ev: ^eng.Event) {
+	if _late_turn != nil && _late_turn.reader > 0 && n.idx == _late_turn.reader - 1 {
+		_late_turn.events += 1
+	}
 }
 
 @(private = "file")
@@ -426,6 +436,26 @@ _carry_late_undo :: proc(w: ^World) {
 	if raw != agent {
 		world_fail(w, "carry late undo: before the owner record the reader shows %s, not the raw turn actor %s", id_short(raw), id_short(agent))
 	}
+	ready := false
+	for _ in 0 ..< 40 {
+		context = instance_context(&b.inst)
+		st, serr := eng.convo_status(&b.e, conv)
+		h, herr := eng.convo_message(&b.e, conv, {msg = reply}, context.temp_allocator)
+		ready = serr == .None && herr == .None && h.parent == user && st.head == reply
+		node_after(b)
+		if ready {
+			break
+		}
+		run_until(w, w.now + 1_000_000_000, true)
+	}
+	if !ready {
+		world_fail(w, "carry late undo: the reader never loaded the turn's conversation, so its undo proves nothing")
+		return
+	}
+	if who, got := _late_turn_author(b, tree); !got || who != agent {
+		world_fail(w, "carry late undo: the owner record arrived with the conversation (%s), so the undo proves nothing", id_short(who))
+		return
+	}
 	undo_err := eng.Error.None
 	undo: {
 		context = instance_context(&b.inst)
@@ -439,6 +469,7 @@ _carry_late_undo :: proc(w: ^World) {
 	if undo_err == .None && strings.contains(mid, LATE_TURN_TEXT) {
 		world_fail(w, "carry late undo: the undo reported success before the owner record but left the carried line on the reader's main: %q", mid)
 	}
+	_late_turn.reader = b.idx + 1
 	_late_turn.on = false
 	for cn in b.conns {
 		conn_reset(cn, true)
@@ -450,6 +481,7 @@ _carry_late_undo :: proc(w: ^World) {
 			break
 		}
 	}
+	_late_turn.reader = 0
 	if undo_err != .None {
 		context = instance_context(&b.inst)
 		_, undo_err = eng.convo_undo(&b.e, conv, user)
