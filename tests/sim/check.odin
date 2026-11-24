@@ -1955,39 +1955,78 @@ check_acked_files :: proc(w: ^World, n: ^Node) {
 		if lerr != .None || !found {
 			continue
 		}
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
+			continue
+		}
+		snap, serr := fs.version_snapshot(h, lvs[:])
+		if serr != .None {
+			continue
+		}
+		defer fstree.snapshot_destroy(&snap)
+		texts := make([dynamic]string, context.temp_allocator)
+		if !_files_text(h, &snap, v, fstree.ROOT, &texts) {
+			continue
+		}
+		files := make([dynamic]Disk_File, context.temp_allocator)
+		disk_walk(&n.disk, &files)
+		prefix := strings.concatenate({sm.root, "/"}, context.temp_allocator)
+		for f in files {
+			if strings.has_prefix(f.path, prefix) && !strings.has_prefix(f.path[len(prefix):], ".git/") {
+				append(&texts, string(f.data))
+			}
+		}
 		merged := merged_files(w, sm.oi)
 		for op in m.ops {
 			if op.obj != sm.oi || op.node != n.idx || op.line != line || op.status != .Acked || !(op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Tree_Write) || merged_has(m, sm.oi, merged, op.path) {
 				continue
 			}
-			lvs := make([dynamic]crdt.Lv, context.temp_allocator)
-			if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
-				break
-			}
-			snap, serr := fs.version_snapshot(h, lvs[:])
-			if serr != .None {
-				break
-			}
-			id, ok, ferr := fstree.lookup(&snap, op.path)
-			text: []u8
-			terr := fs.Error.None
-			if ferr == nil && ok {
-				text, terr = fs.history_text_at(h, id, v, context.temp_allocator)
-			}
-			fstree.snapshot_destroy(&snap)
-			if ferr != nil || !ok || terr != .None {
-				continue
-			}
 			stat_add(w, STAT_ACKED_FILES)
-			disk, _, _ := disk_probe_read(&n.disk, strings.concatenate({sm.root, "/", op.path}, context.temp_allocator))
-			for tok in op.tokens {
-				if token_in(string(text), tok) || token_in(string(disk), tok) || _loss_explained(m, sm.oi, line, op, tok) {
+			tokens: for tok in op.tokens {
+				for t in texts {
+					if token_in(t, tok) {
+						continue tokens
+					}
+				}
+				if _loss_explained(m, sm.oi, line, op, tok) {
 					continue
 				}
-				world_fail(w, "durability: %s lost token %s (op %d, %v, tick %d, Acked) of %s/%s after a restart: neither its history at line %q nor the file on disk has it", n.name, tok, op.idx, op.kind, op.tick, id_short(m.objs[sm.oi].o.id), op.path, sm.m.line)
+				world_fail(w, "durability: %s lost token %s (op %d, %v, tick %d, Acked) of %s/%s after a restart: neither its history at line %q nor its disk has it in any file", n.name, tok, op.idx, op.kind, op.tick, id_short(m.objs[sm.oi].o.id), op.path, sm.m.line)
 			}
 		}
 	}
+}
+
+@(private = "file")
+_files_text :: proc(h: ^fs.History, snap: ^fstree.Snapshot, v: fs.Version, dir: fstree.Inode_Id, out: ^[dynamic]string) -> bool {
+	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
+	if kerr != nil {
+		return false
+	}
+	for k in kids {
+		info, ok, ierr := fstree.info(snap, k.inode, context.temp_allocator)
+		if ierr != nil {
+			return false
+		}
+		if !ok || !info.present {
+			continue
+		}
+		if info.kind == .Dir {
+			if !_files_text(h, snap, v, k.inode, out) {
+				return false
+			}
+			continue
+		}
+		if info.kind != .File {
+			continue
+		}
+		text, terr := fs.history_text_at(h, k.inode, v, context.temp_allocator)
+		if terr != .None {
+			return false
+		}
+		append(out, string(text))
+	}
+	return true
 }
 
 STAT_ACKED_FILES: Stat
