@@ -135,6 +135,7 @@ Disk :: struct {
 	force_ghost: bool,
 	ghost_root:  string,
 	fail_unlink: string,
+	fail_read:   string,
 	lose_shrinks: bool,
 	dead:      bool,
 	fail_sync: u64,
@@ -716,6 +717,10 @@ _d_read_at :: proc(data: rawptr, fd: prim.Fd, buf: []u8, off: i64) -> (int, prim
 	}
 	if n.kind == .Dir {
 		return 0, .Is_Dir
+	}
+	if len(d.fail_read) > 0 && d.probe == 0 && strings.contains(of.path, d.fail_read) {
+		d.stats.injected += 1
+		return 0, .Io
 	}
 	if off < 0 {
 		return 0, .Invalid
