@@ -1332,9 +1332,11 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 			break
 		}
 	}
-	if err == .None {
-		err = builder_commit(m, b)
+	if err != .None {
+		shadow_txn_rollback(&m.shadow)
+		return err
 	}
+	err = builder_commit(m, b)
 	if err != .None && err != .Reloading {
 		shadow_txn_rollback(&m.shadow)
 		return err
@@ -1501,7 +1503,7 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	m.override[k] = st.oid
 	actor := st.actor
 	if st.scope != {} && !actor_on_line(m, actor) {
-		actor = scope_line_actor(m, actor)
+		actor = scope_line_actor(m, actor) or_return
 	}
 	b: Builder
 	builder_init(&b, m.history, actor)
@@ -1511,9 +1513,11 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	eerr := emit_change(p, &b, &first)
 	key, _ := delete_key(&m.override, k)
 	delete(key, m.allocator)
-	if eerr == .None {
-		eerr = builder_commit(m, &b)
+	if eerr != .None {
+		shadow_txn_rollback(&m.shadow)
+		return false, eerr
 	}
+	eerr = builder_commit(m, &b)
 	if eerr != .None && eerr != .Reloading {
 		shadow_txn_rollback(&m.shadow)
 		return false, eerr
@@ -1531,7 +1535,13 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 }
 
 mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
+	if m.open_due && !m.opening {
+		mount_open_finish(m) or_return
+	}
 	if !m.imported && !m.importing {
+		if m.history != nil {
+			history_ready(m.history) or_return
+		}
 		m.importing = true
 		ierr := mount_recover(m)
 		if ierr == .None {
@@ -1560,6 +1570,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	mount_wake(m) or_return
 	if m.history != nil {
 		defer history_trim(m.history)
+	}
+	if m.has_git && m.history != nil {
+		mount_line_actor(m) or_return
 	}
 	catch_up(m) or_return
 	if m.has_git {
@@ -2150,7 +2163,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			}
 			if actor != m.actor && !actor_on_line(m, actor) {
 				if scope != {} && !is_unattributed(actor) {
-					actor = scope_line_actor(m, actor)
+					actor = scope_line_actor(m, actor) or_return
 				} else {
 					actor = m.actor
 					scope = {}

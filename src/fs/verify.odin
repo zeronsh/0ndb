@@ -1,9 +1,11 @@
 package fs
 
+import "base:runtime"
 import "core:fmt"
 import "../crdt"
 import "../fshist"
 import "../fstree"
+import "../journal"
 import "../prim"
 
 mount_synced_mismatches :: proc(m: ^Mount, out: ^[dynamic]string, allocator := context.allocator) -> Error {
@@ -277,4 +279,57 @@ mount_synced_text :: proc(m: ^Mount, rel: string, allocator := context.allocator
 	}
 	t := history_text_at(h, id, m.synced[:], allocator) or_return
 	return t, true, .None
+}
+
+history_applied_gap :: proc(h: ^History, stream: prim.Id, r: ^journal.Reader) -> (off: i64, gap: bool, err: Error) {
+	if h == nil || !h.awake {
+		return 0, false, .None
+	}
+	si := -1
+	for s, i in h.stream_ids {
+		if s == stream && i > 0 {
+			si = i
+		}
+	}
+	if si < 0 {
+		return 0, false, .None
+	}
+	dict := stream_dict(h, u32(si))
+	end := h.applied[si]
+	for at: i64 = 0; at < end; {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		body, next, jerr := journal.record_at(r, at)
+		if jerr != .None && jerr != .Redacted {
+			return at, false, from_journal(jerr)
+		}
+		if next <= at {
+			return at, false, .Corrupt
+		}
+		if jerr == .None && len(body) > 0 && (body[0] == REC_BATCH || body[0] == REC_IMPORT) {
+			b, derr := crdt.batch_decode(body[1:], context.temp_allocator, dict)
+			if derr == .None && crdt.batch_len(&b) > 0 {
+				parents := make([dynamic]crdt.Lv, context.temp_allocator)
+				skip, gerr := crdt.graph_check(&h.g, &b, &parents)
+				if gerr == .Missing || (gerr == .None && skip == 0) {
+					return at, true, .None
+				}
+			}
+		}
+		at = next
+	}
+	return 0, false, .None
+}
+
+history_unowned_actors :: proc(h: ^History, out: ^[dynamic]prim.Id) {
+	if h == nil || !h.awake {
+		return
+	}
+	for a in h.g.actors {
+		if a == {} || crdt.graph_known(&h.g, a) == 0 {
+			continue
+		}
+		if _, ok := history_actor_owner(h, a); !ok {
+			append(out, a)
+		}
+	}
 }

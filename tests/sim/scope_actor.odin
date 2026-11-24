@@ -77,7 +77,7 @@ _sa_open :: proc(c: ^Sa_Ctx, actor: prim.Id, name: string) -> (scope: ^fs.Scope)
 	defer node_after(n)
 	m := _sa_mount(c)
 	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&c.w.rng))
-	scope = fs.scope_open(n.reg, m, sid, actor)
+	scope = sim_scope_open(c.w, n.reg, m, sid, actor)
 	abs := strings.concatenate({SA_ROOT, "/", name}, context.temp_allocator)
 	n.writers[strings.clone(abs, c.w.allocator)] = Writer_Info{scope = scope, agent = true}
 	fs.mount_observe_begin(m, name, scope)
@@ -341,7 +341,7 @@ _sa_based :: proc(w: ^World) {
 	{
 		context = instance_context(&n.inst)
 		sid = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, _sa_mount(&c), sid, a)
+		scope = sim_scope_open(c.w, n.reg, _sa_mount(&c), sid, a)
 		fs.scope_read_base(scope, "a.txt", transmute([]u8)string("one\n"))
 		node_after(n)
 	}
