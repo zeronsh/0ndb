@@ -203,7 +203,7 @@ nothing changes; there is no heartbeat on local sockets.
 
 `Deltas := deltas: [Delta]` (the `Delta` structure of the header): `kind`
 (message, block, chunk, seal, leaf, intent, run, mount, record, status,
-field, element, counter, catalog, text, files, redacted, members,
+field, element, counter, catalog, text, files, reserved, members,
 quarantined), `object`, `rid` (the record), `msg`, `record`, `by`, `local`,
 `hlc`, `role`, `index`, `block`, `seal`, `status`, `usage`, `text`, `key`,
 `tag`, `removed`, `length`, and in JSON `draft: true` on `block` and `chunk`

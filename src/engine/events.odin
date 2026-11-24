@@ -24,7 +24,7 @@ Delta_Kind :: enum u8 {
 	Catalog,
 	Text,
 	Files,
-	Redacted,
+	Reserved,
 	Members,
 	Quarantined,
 }
@@ -263,9 +263,6 @@ _sub_collect :: proc(e: ^Engine, s: ^Sub, kinds: Change_Kinds, out: ^[dynamic]De
 	if .Quarantined in kinds {
 		append(out, Delta{kind = .Quarantined, object = s.object})
 	}
-	if .Redacted in kinds {
-		append(out, Delta{kind = .Redacted, object = s.object})
-	}
 	switch h.kind {
 	case .Conversation, .Map:
 		if h.kind == .Conversation {
@@ -353,9 +350,6 @@ _sub_scan :: proc(e: ^Engine, s: ^Sub, h: ^Handle, device: prim.Id, r: ^journal.
 		}
 		k := obj.record_kind(body)
 		if k == obj.RECORD_REDACT {
-			if env, eerr := obj.decode_envelope(body, at); eerr == .None {
-				append(out, Delta{kind = .Redacted, object = s.object, rid = Rid{device, at, env.links.gen}, by = device, local = local})
-			}
 			continue
 		}
 		if k < obj.RECORD_KIND_FIRST {

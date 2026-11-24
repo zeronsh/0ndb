@@ -17,7 +17,6 @@ Change_Kind :: enum u8 {
 	Keys,
 	Members,
 	Quarantined,
-	Redacted,
 }
 
 Change_Kinds :: bit_set[Change_Kind;u8]
@@ -991,7 +990,7 @@ _waiters_run :: proc(e: ^Engine) {
 	for i < len(e.waiters) {
 		w := e.waiters[i]
 		c, ok := e.changed[w.object]
-		woke := ok && c.kinds & {.Data, .Keys, .Members, .Redacted, .Quarantined} != {}
+		woke := ok && c.kinds & {.Data, .Keys, .Members, .Quarantined} != {}
 		if !woke {
 			h, hok := e.handles[w.object]
 			if !hok || (!h.cat_known && len(h.segs) == 0) {
@@ -1017,7 +1016,7 @@ _waiters_run :: proc(e: ^Engine) {
 		if h, ok := e.handles[w.object]; ok {
 			_handle_refresh(h)
 			c := e.changed[w.object]
-			if w.cmd == nil && _handle_waiting(h, w.ready.fresh) && c.kinds & {.Quarantined, .Redacted} == {} {
+			if w.cmd == nil && _handle_waiting(h, w.ready.fresh) && c.kinds & {.Quarantined} == {} {
 				append(&e.waiters, w)
 				continue
 			}

@@ -453,7 +453,7 @@ _mounts_changed :: proc(e: ^Engine) {
 	}
 	for mt in e.plug.mounts {
 		c, ok := e.changed[mt.object.id]
-		if !ok || c.kinds & {.Data, .Keys, .Members, .Redacted} == {} {
+		if !ok || c.kinds & {.Data, .Keys, .Members} == {} {
 			continue
 		}
 		h, err := _handle_get(e, mt.object, .File_Tree)

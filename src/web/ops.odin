@@ -5,7 +5,6 @@ import "../journal"
 import omap "../map"
 import "../obj"
 import "../prim"
-import osync "../sync"
 
 Op :: enum u8 {
 	None        = 0,
@@ -472,20 +471,10 @@ _seg_deltas :: proc(s: ^Session, o: ^Object, sg: ^Seg, out: ^Out) -> (n: int) {
 			continue
 		}
 		k := obj.record_kind(body)
-		env0, eerr0 := obj.decode_envelope(body, at)
-		if eerr0 != .None {
+		if _, eerr0 := obj.decode_envelope(body, at); eerr0 != .None {
 			continue
 		}
-		rid := obj.Rid{sg.device, at, env0.links.gen}
 		if k == obj.RECORD_REDACT {
-			_redact_seen(s, o, vs, body, at)
-			o_obj(out, "")
-			o_str(out, "kind", "redacted")
-			o_object(out, "object", s.space_id, o.id)
-			o_rid(out, "rid", rid)
-			o_id(out, "by", sg.device)
-			o_end(out)
-			n += 1
 			continue
 		}
 		if k < obj.RECORD_KIND_FIRST {
@@ -503,40 +492,6 @@ _seg_deltas :: proc(s: ^Session, o: ^Object, sg: ^Seg, out: ^Out) -> (n: int) {
 		}
 	}
 	return
-}
-
-@(private)
-_redact_seen :: proc(s: ^Session, o: ^Object, vs: int, body: []u8, at: i64) {
-	if vs < 0 {
-		return
-	}
-	env, err := obj.decode_envelope(body, at)
-	if err != .None {
-		return
-	}
-	r, rerr := obj.decode_redact(&env)
-	if rerr != .None {
-		return
-	}
-	from, ferr := obj.resolve(&o.view, vs, r.from)
-	if ferr != .None {
-		return
-	}
-	dev := obj.seg_id(&o.view, from)
-	tg := _seg_find(o, dev)
-	if tg == nil {
-		return
-	}
-	hi := min(r.to, journal.replica_length(&tg.data.rep))
-	if hi > from.off {
-		keys: journal.Key_Provider
-		if tg.tree_ok {
-			keys = osync.keytree_provider(&tg.tree)
-		}
-		journal.replica_redact(&tg.data.rep, from.off, hi, keys)
-	}
-	o.view.segs[from.seg].tail_end = -1
-	_seg_probe(s, o, tg, tg.next.epoch if tg.next != nil else tg.epoch)
 }
 
 @(private)
