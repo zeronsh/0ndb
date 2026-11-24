@@ -881,7 +881,9 @@ emit_turn :: proc(o: ^Out, t: rt.Turn) {
 			o_u64(o, "line_lo", u64(b.line_lo))
 			o_u64(o, "line_hi", u64(b.line_hi))
 			o_id(o, "actor", b.actor)
-			o_id(o, "owner", b.owner)
+			o_enum(o, "owner", u64(b.owner), OWNER_NAMES[:])
+			o_id(o, "conversation", b.conversation)
+			o_id(o, "scope", b.scope)
 			o_id(o, "device", b.device)
 			o_end(o)
 		}

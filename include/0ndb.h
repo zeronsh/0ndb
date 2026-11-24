@@ -120,7 +120,9 @@
  *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
  *                 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left,
  *                 29 line_switched, 30 replica_redacted, 31 rename_offered,
- *                 32 redact_unreached, 33 models_changed
+ *                 32 redact_unreached, 33 models_changed, 34 authors_resolved
+ *   owner         0 person, 1 agent, 2 unresolved (the author's record has
+ *                 not reached this device)
  *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
  *                 5 runner, 6 guest, 7 directory
  *   member_role   0 owner, 1 admin, 2 member, 3 reader
@@ -227,6 +229,10 @@
  *   Span       := lo: uvarint, hi: uvarint, line_lo: uvarint,
  *                 line_hi: uvarint, actor: id, seq: uvarint, op_actor: id,
  *                 op_seq: uvarint, redacted: bool
+ *   BlameSpan  := Span, owner: enum owner, conversation: id (the conversation
+ *                 whose turn wrote the bytes, zero for a person), scope: id
+ *                 (the turn or tool call scope, zero when unscoped), device: id
+ *                 (zero or a raw author when owner is unresolved)
  *   Mounted    := object: object, root: str, line: str
  *   Hit        := object: object, participant: id, msg: rid, ref: bytes,
  *                 part: uvarint, kind: enum kind, title: bool, hlc: uvarint,
@@ -369,9 +375,9 @@
  *                 status: str (added, removed, modified, moved),
  *                 binary: bool, added: uvarint, removed: uvarint,
  *                 patch: str, clipped: bool, blame: [ {line_lo: uvarint,
- *                 line_hi: uvarint, actor: id, owner: id (the
- *                 conversation whose turn wrote the lines, zero for a
- *                 person), device: id} ]} ]
+ *                 line_hi: uvarint, actor: id, owner: enum owner,
+ *                 conversation: id (the conversation whose turn wrote the
+ *                 lines, zero for a person), scope: id, device: id} ]} ]
  *   Schedule   := id: str, owner: object, prompt: str, cron: str, at: ivarint,
  *                 tz: str, conversation: id, fresh: bool, next: ivarint,
  *                 last: ivarint, creator: id, agent: id
@@ -1315,7 +1321,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TREE_UNMOUNT 94u
 /* tree.mounts() -> mounts:[Mounted] */
 #define ONDB_OP_TREE_MOUNTS 95u
-/* tree.blame(object: object, path: str, line: str) -> line:str text:str spans:[Span] */
+/* tree.blame(object: object, path: str, line: str) -> line:str text:str spans:[BlameSpan] */
 #define ONDB_OP_TREE_BLAME 96u
 /* tree.sync(object: object, root: str) -> {} */
 #define ONDB_OP_TREE_SYNC 97u

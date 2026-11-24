@@ -148,6 +148,7 @@ Event_Kind :: enum u8 {
 	Rename_Offered,
 	Redact_Unreached,
 	Models_Changed,
+	Authors_Resolved,
 }
 
 Event :: struct {
