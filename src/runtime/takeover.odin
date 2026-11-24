@@ -1,6 +1,7 @@
 package rt
 
 import "../agent"
+import "core:crypto/blake2b"
 import "core:strings"
 import "../convo"
 import eng "../engine"
@@ -344,60 +345,79 @@ provider_signed_in :: proc(r: ^Runtime, id: string) -> bool {
 }
 
 @(private)
-_auth_signature :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> string {
+_auth_identity :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> string {
+	vfs := prim.os_vfs()
 	b := strings.builder_make(context.temp_allocator)
 	for f in d.auth_files {
 		if len(r.cfg.home_dir) == 0 {
 			break
 		}
-		st, err := prim.stat(prim.os_vfs(), concat(r.cfg.home_dir, "/", f.path))
+		path := concat(r.cfg.home_dir, "/", f.path)
 		strings.write_string(&b, f.path)
-		if err == .None {
-			strings.write_byte(&b, ':')
-			strings.write_i64(&b, st.mtime_ns)
+		if st, err := prim.stat(vfs, path); err == .None {
 			strings.write_byte(&b, ':')
 			strings.write_i64(&b, st.size)
+			strings.write_byte(&b, ':')
+			strings.write_i64(&b, st.mtime_ns)
+			if data, rerr := prim.read_file(vfs, path, context.temp_allocator); rerr == .None {
+				sum: [16]u8
+				ctx: blake2b.Context
+				blake2b.init(&ctx, 16)
+				blake2b.update(&ctx, data)
+				blake2b.final(&ctx, sum[:])
+				strings.write_byte(&b, ':')
+				digits := "0123456789abcdef"
+				for x in sum {
+					strings.write_byte(&b, digits[x >> 4])
+					strings.write_byte(&b, digits[x & 15])
+				}
+			}
 		}
 		strings.write_byte(&b, '\n')
 	}
 	return strings.to_string(b)
 }
 
-AUTH_SETTLE_MS :: 10_000
-
 Auth_Mark :: struct {
-	sig: string,
-	at:  i64,
+	sig:     string,
+	pending: bool,
 }
 
 @(private)
 _auth_marked :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> bool {
-	mk, marked := &r.auth_marks[d.id]
+	mk, marked := r.auth_marks[d.id]
 	if !marked {
 		return false
 	}
-	sig := _auth_signature(r, d)
-	if mk.sig == sig {
-		return true
-	}
-	if prim.now_ms() - mk.at < AUTH_SETTLE_MS {
-		delete(mk.sig, r.allocator)
-		mk.sig = strings.clone(sig, r.allocator)
+	if mk.pending || mk.sig == _auth_identity(r, d) {
 		return true
 	}
 	provider_auth_ok(r, d.id)
 	return false
 }
 
-provider_auth_failed :: proc(r: ^Runtime, id: string) {
+provider_auth_settled :: proc(r: ^Runtime, id: string) {
+	mk, marked := &r.auth_marks[id]
+	if !marked || !mk.pending {
+		return
+	}
 	d, ok := _descriptor(r, id)
+	if !ok {
+		return
+	}
+	mk.sig = strings.clone(_auth_identity(r, d), r.allocator)
+	mk.pending = false
+}
+
+provider_auth_failed :: proc(r: ^Runtime, id: string) {
+	_, ok := _descriptor(r, id)
 	if !ok {
 		return
 	}
 	if r.auth_marks == nil {
 		r.auth_marks = make(map[string]Auth_Mark, r.allocator)
 	}
-	mk := Auth_Mark{sig = strings.clone(_auth_signature(r, d), r.allocator), at = prim.now_ms()}
+	mk := Auth_Mark{pending = true}
 	if old, had := &r.auth_marks[id]; had {
 		delete(old.sig, r.allocator)
 		old^ = mk
