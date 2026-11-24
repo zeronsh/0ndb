@@ -1351,6 +1351,30 @@ _bk_run :: proc(w: ^World, arena: ^virtual.Arena, k: Bk_Case, api, between: bool
 	}
 	run_until(w, w.now + 5_000_000_000, true)
 	check(c, k, api, "a switch back", now, reply)
+	edited: obj.Rid
+	{
+		context = instance_context(&n.inst)
+		res, err := eng.exec(&n.e, eng.Cmd_Send{object = c.conv, text = "edited", root = true})
+		node_after(n)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: an edit of the turn's message: %v", k.name, err)
+			return
+		}
+		edited = res.item
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	check(c, k, api, "an edit of the turn's message", want, edited)
+	{
+		context = instance_context(&n.inst)
+		_, err := eng.convo_move(&n.e, c.conv, .Switch, reply)
+		node_after(n)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: switch back after the edit: %v", k.name, err)
+			return
+		}
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	check(c, k, api, "a switch back after the edit", now, reply)
 }
 
 @(test)
