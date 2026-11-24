@@ -2200,44 +2200,64 @@ shown_path_add :: proc(shown: ^map[string][dynamic]Shown_Path, line: string, pat
 	append(&shown[line], Shown_Path{path = p, ids = slice.clone(ids, allocator)})
 }
 
-SHOWN_NAMED_MAX :: 4096
+@(private)
+named_prune :: proc(m: ^Mount) {
+	if len(m.named) == 0 || !shadow_attached(&m.shadow) {
+		return
+	}
+	for k in prim.sorted_keys(m.named) {
+		e, found, err := shadow_get(&m.shadow, k)
+		if err != .None || (found && e.kind == .File && e.ver != 0) {
+			continue
+		}
+		key, _ := delete_key(&m.named, k)
+		delete(key, m.allocator)
+	}
+}
 
 @(private)
-shown_named :: proc(m: ^Mount) -> Error {
-	shown_paths_reset(&m.shown_paths, m.line, m.allocator)
-	if len(m.shadow.ver_ids) == 0 {
-		return .None
-	}
+named_walk :: proc(m: ^Mount) -> Error {
 	stack := make([dynamic]string, context.temp_allocator)
 	append(&stack, "")
-	count := 0
-	for len(stack) > 0 && count < SHOWN_NAMED_MAX {
+	for len(stack) > 0 {
 		dir := pop(&stack)
 		kids := make([dynamic]Shadow_Child, context.temp_allocator)
 		shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
 		for k in kids {
-			path := k.name
-			if dir != "" {
-				path = strings.concatenate({dir, "/", k.name}, context.temp_allocator)
-			}
+			path := k.name if dir == "" else strings.concatenate({dir, "/", k.name}, context.temp_allocator)
 			if k.entry.kind == .Dir {
 				append(&stack, path)
-				continue
+			} else if k.entry.kind == .File && k.entry.ver != 0 && path not_in m.named {
+				c, _ := clone_string(path, m.allocator)
+				m.named[c] = true
 			}
-			if k.entry.kind != .File || k.entry.ver == 0 || !disk_matches(m, path, k.entry) {
-				continue
-			}
-			ids, ok := shadow_version(&m.shadow, k.entry)
-			if !ok || len(ids) == 0 {
-				continue
-			}
-			out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
-			for id, i in ids {
-				out[i] = inode_op(m.history, id)
-			}
-			shown_path_add(&m.shown_paths, m.line, path, out, m.allocator)
-			count += 1
 		}
+	}
+	m.named_known = true
+	return .None
+}
+
+@(private)
+shown_named :: proc(m: ^Mount) -> Error {
+	shown_paths_reset(&m.shown_paths, m.line, m.allocator)
+	if !m.named_known {
+		named_walk(m) or_return
+	}
+	named_prune(m)
+	for path in prim.sorted_keys(m.named) {
+		e, found := shadow_get(&m.shadow, path) or_return
+		if !found || e.kind != .File || e.ver == 0 || !disk_matches(m, path, e) {
+			continue
+		}
+		ids, ok := shadow_version(&m.shadow, e)
+		if !ok || len(ids) == 0 {
+			continue
+		}
+		out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+		for id, i in ids {
+			out[i] = inode_op(m.history, id)
+		}
+		shown_path_add(&m.shown_paths, m.line, path, out, m.allocator)
 	}
 	return .None
 }

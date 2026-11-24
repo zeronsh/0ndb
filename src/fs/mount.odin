@@ -444,6 +444,8 @@ Mount :: struct {
 	awake:       bool,
 	shown:       map[string][]crdt.Op_Id,
 	shown_paths: map[string][dynamic]Shown_Path,
+	named:       map[string]bool,
+	named_known: bool,
 	synced:      [dynamic]crdt.Op_Id,
 	placed:      [dynamic]crdt.Op_Id,
 	has_placed:  bool,
@@ -672,6 +674,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
 	m.landed = make(map[prim.Id]bool, allocator)
+	m.named = make(map[string]bool, allocator)
 	m.unwatched = make([dynamic]string, allocator)
 	m.collided = make([dynamic]string, allocator)
 	m.absent = make([dynamic]string, allocator)
@@ -773,6 +776,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 @(private)
 mount_open_rest :: proc(m: ^Mount, fresh: bool) -> Error {
 	if fresh {
+		m.named_known = shadow_empty(&m.shadow) or_return
 		save_mount_state(m) or_return
 		mount_import(m) or_return
 	} else if !m.imported {
@@ -887,6 +891,10 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.attrib_chain)
 	delete(m.landed)
+	for k in m.named {
+		delete(k, m.allocator)
+	}
+	delete(m.named)
 	if m.shadow.dir != "" {
 		shadow_close(&m.shadow)
 	}
@@ -1024,6 +1032,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 	if !shadow_attached(&m.shadow) {
 		if m.shadow.dir == "" {
 			shadow_open(&m.shadow, m.vfs, sp, format, m.allocator) or_return
+			m.shadow.named = &m.named
 			if m.history != nil {
 				m.shadow.clock = m.history.opts.clock
 			}
@@ -2319,6 +2328,20 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			}
 		}
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		m.named_known = prim.read_bool(&rd)
+		nn := prim.read_uvarint(&rd)
+		if nn > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< nn {
+			k := prim.read_str(&rd)
+			if k not_in m.named {
+				c, _ := clone_string(k, m.allocator)
+				m.named[c] = true
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2389,6 +2412,8 @@ Mount_Image :: struct {
 	absent:     [dynamic]string,
 	shown:      map[string][]crdt.Op_Id,
 	shown_paths: map[string][dynamic]Shown_Path,
+	named:       [dynamic]string,
+	named_known: bool,
 }
 
 Mount_Wait :: struct {
@@ -2441,6 +2466,13 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 			shown_path_add(&img.shown_paths, k, sp.path, sp.ids, m.allocator)
 		}
 	}
+	img.named_known = m.named_known
+	img.named = make([dynamic]string, m.allocator)
+	named_prune(m)
+	for k in prim.sorted_keys(m.named) {
+		c, _ := clone_string(k, m.allocator)
+		append(&img.named, c)
+	}
 }
 
 @(private)
@@ -2459,6 +2491,10 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 	delete(img.absent)
 	shown_free(&img.shown, m.allocator)
 	shown_paths_free(&img.shown_paths, m.allocator)
+	for c in img.named {
+		delete(c, m.allocator)
+	}
+	delete(img.named)
 	img^ = {}
 }
 
@@ -2544,7 +2580,13 @@ landed_read :: proc(m: ^Mount) -> Error {
 	if from == max(i64) {
 		return .None
 	}
-	return history_steps(m.history, min(from, m.jpos), &m.landed, &m.landed_gone)
+	history_steps(m.history, min(from, m.jpos), &m.landed, &m.landed_gone) or_return
+	for _, &a in m.attrib {
+		if a.step != {} && a.step in m.landed {
+			a.used = true
+		}
+	}
+	return .None
 }
 
 @(private)
@@ -2871,6 +2913,11 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 			encode_version(&pv, sp.ids)
 			prim.write_bytes(&w, pv[:])
 		}
+	}
+	prim.write_bool(&w, img.named_known)
+	prim.write_uvarint(&w, u64(len(img.named)))
+	for k in img.named {
+		prim.write_str(&w, k)
 	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
