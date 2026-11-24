@@ -83,7 +83,7 @@ _error :: proc "contextless" (e: posix.Errno) -> Error {
 		return .Busy
 	case .EINVAL, .EBADF, .ESPIPE:
 		return .Invalid
-	case .ENOTDIR:
+	case .ENOTDIR, .ELOOP:
 		return .Not_Dir
 	case .EISDIR:
 		return .Is_Dir

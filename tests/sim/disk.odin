@@ -452,7 +452,7 @@ Lookup :: struct {
 @(private = "file")
 _lookup :: proc(d: ^Disk, path: string, follow: bool, depth := 0) -> (lk: Lookup, err: prim.Error) {
 	if depth > 16 {
-		return lk, .Invalid
+		return lk, .Not_Dir
 	}
 	comps := make([dynamic]string, context.temp_allocator)
 	if !_split(path, &comps) {

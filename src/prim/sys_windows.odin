@@ -514,7 +514,7 @@ _werror :: proc "contextless" (code: u32) -> Error {
 		return .Busy
 	case ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_INVALID_NAME, ERROR_BAD_PATHNAME, ERROR_NEGATIVE_SEEK, ERROR_NOT_A_REPARSE_POINT, ERROR_INVALID_REPARSE_DATA, WSAENOTSOCK, WSAEINVAL, ERROR_NOACCESS:
 		return .Invalid
-	case ERROR_DIRECTORY:
+	case ERROR_DIRECTORY, ERROR_CANT_RESOLVE_FILENAME:
 		return .Not_Dir
 	case ERROR_DIR_NOT_EMPTY:
 		return .Not_Empty
@@ -522,7 +522,7 @@ _werror :: proc "contextless" (code: u32) -> Error {
 		return .No_Space
 	case ERROR_TOO_MANY_OPEN_FILES, WSAEMFILE:
 		return .Too_Many_Files
-	case ERROR_FILENAME_EXCED_RANGE, ERROR_CANT_RESOLVE_FILENAME:
+	case ERROR_FILENAME_EXCED_RANGE:
 		return .Name_Too_Long
 	case ERROR_MORE_DATA, ERROR_INSUFFICIENT_BUFFER, WSAEMSGSIZE:
 		return .Too_Large
