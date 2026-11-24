@@ -1,0 +1,16 @@
+tree None
+registry None
+mount None
+TOP 2580696976 LOG inum=20 o/01/01a20f9ad794717e86af9dfbd981705e/hist/state.0.idx.tmp
+TOP 63464592 LOG inum=1f o/01/01a20f9ad794717e86af9dfbd981705e/hist/state.0.idx.tmp
+TOP 7949232 LOG inum=1e o/01/01a20f9ad794717e86af9dfbd981705e/hist/state.0.idx.tmp
+TOP 3638287 EXT inum=10 o/01/01a20f9ad794717e86af9dfbd981705e/hist/state.0.log
+TOP 1031936 LOG inum=1d o/01/01a20f9ad794717e86af9dfbd981705e/hist/state.0.idx.tmp
+TOP 695930 LOG inum=13 o/01/01a20f9ad794717e86af9dfbd981705e/hist/fs.journal
+TOP 413763 LOG inum=10 o/01/01a20f9ad794717e86af9dfbd981705e/hist/state.0.log
+TOP 141728 LOG inum=11 o/01/01a20f9ad794717e86af9dfbd981705e/hist/state.0.idx
+TOP 36072 LOG inum=14 o/01/01a20f9ad794717e86af9dfbd981705e/hist/lv.idx
+TOP 26854 EXT inum=13 o/01/01a20f9ad794717e86af9dfbd981705e/hist/fs.journal
+TOP 16384 LOG inum=c o/56/56786d517f5185c3659b4a01f4b32502/table
+TOP 4730 LOG inum=19 search/seg-0000000000000001
+stepsize: edits=400 disk_delta=2872938943 per_edit=7182347.4 max_attrib_log=94128 elapsed=31.342434091s

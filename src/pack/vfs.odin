@@ -1,5 +1,8 @@
 package pack
 
+import "base:runtime"
+import "core:strings"
+
 import "../prim"
 
 VFD_BASE :: prim.Fd(0x4000_0000)
@@ -353,7 +356,16 @@ _v_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 			return prim.INVALID_FD, e
 		}
 	}
-	return _open_rel(p, path, rel, flags, mode, 0)
+	ofd, oerr := _open_rel(p, path, rel, flags, mode, 0)
+	if oerr == .None && ofd >= VFD_BASE {
+		if h := _handle(p, ofd); h != nil {
+			if DBG_PATH == nil {
+				DBG_PATH = make(map[u64]string, runtime.heap_allocator())
+			}
+			DBG_PATH[h.inum] = strings.clone(rel, runtime.heap_allocator())
+		}
+	}
+	return ofd, oerr
 }
 
 @(private)
@@ -587,6 +599,10 @@ _write :: proc(p: ^Pack, oi: ^Open_Inode, src: []u8, off: i64, sized := false) -
 	if oi.ino.kind == .External {
 		before := _ext_before(p, oi) or_return
 		oi.dirty = true
+		if DBG_LOGGED == nil {
+			DBG_LOGGED = make(map[u64]i64, runtime.heap_allocator())
+		}
+		DBG_LOGGED[oi.inum | (1 << 60)] += i64(len(src))
 		prim.write_at(p.base, oi.real_fd, src, off) or_return
 		_pend_note(p, oi.inum, before, max(before, off + i64(len(src))))
 		return .None

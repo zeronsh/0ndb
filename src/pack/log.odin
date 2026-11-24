@@ -1,5 +1,7 @@
 package pack
 
+import "base:runtime"
+
 import "core:hash/xxhash"
 import "core:slice"
 import "../prim"
@@ -107,6 +109,11 @@ _log_alloc :: proc(p: ^Pack, n: int) -> (pos: int, err: Error) {
 
 @(private)
 _log_data :: proc(p: ^Pack, inum: u64, off: i64, payload: []u8) -> (ph: Phys, err: Error) {
+	if DBG_LOGGED == nil {
+		DBG_LOGGED = make(map[u64]i64, runtime.heap_allocator())
+	}
+	DBG_LOGGED[inum] += i64(len(payload))
+	DBG_CALLS += 1
 	meta: [20]u8
 	m := prim.put_uvarint(meta[:], inum)
 	m += prim.put_uvarint(meta[m:], u64(off))
@@ -1119,3 +1126,7 @@ _hooks_done :: proc(hooks: ^[dynamic]Commit_Hook, ok: bool) {
 	}
 	clear(hooks)
 }
+
+DBG_LOGGED: map[u64]i64
+DBG_PATH: map[u64]string
+DBG_CALLS: int
