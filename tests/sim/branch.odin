@@ -1081,7 +1081,7 @@ _bs_run :: proc(w: ^World, arena: ^virtual.Arena) {
 				continue
 			}
 			keys := make([dynamic]obj.Rid, alloc)
-			for x in b.ends {
+			for x in prim.sorted_keys(b.ends) {
 				append(&keys, x)
 			}
 			slice.sort_by(keys[:], proc(a, b: obj.Rid) -> bool {return a.off < b.off})
