@@ -27,6 +27,7 @@ Sd_Op :: enum u8 {
 	Empty,
 	Moved_Edited,
 	Never_Shown,
+	Checkout,
 }
 
 Sd_Hurt :: enum u8 {
@@ -42,9 +43,12 @@ Sd_Hurt :: enum u8 {
 	Mounted,
 }
 
+@(private = "file", thread_local)
+_sd_flat: bool
+
 @(private = "file")
 _sd_name :: proc(i: int) -> string {
-	return fmt.tprintf("d%d/f%02d.txt", i % 4, i)
+	return fmt.tprintf("f%02d.txt", i) if _sd_flat else fmt.tprintf("d%d/f%02d.txt", i % 4, i)
 }
 
 @(private = "file")
@@ -204,7 +208,8 @@ _sd_damage :: proc(w: ^World, n: ^Node, name: string, hurt: Sd_Hurt) -> bool {
 }
 
 @(private = "file")
-_sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := false) -> (crashed: bool) {
+_sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := false, print: ^string = nil) -> (crashed: bool) {
+	_sd_flat = op == .Checkout
 	what := fmt.aprintf("%v, %v", op, hurt, allocator = w.allocator)
 	if k > 0 {
 		what = fmt.aprintf("%v, %v, crash at disk op %d of the remount (process %v)", op, hurt, k, process, allocator = w.allocator)
@@ -238,7 +243,7 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 	append(&m.objs, ob)
 	want := make(map[string]string, w.allocator)
 	for d in 0 ..< 4 {
-		prim.mkdir_all(vfs, fmt.tprintf("%s/d%d", SD_ROOT, d), 0o755)
+		prim.mkdir_all(vfs, SD_ROOT if _sd_flat else fmt.tprintf("%s/d%d", SD_ROOT, d), 0o755)
 	}
 	for i in 0 ..< SD_FILES {
 		name := strings.clone(_sd_name(i), w.allocator)
@@ -250,6 +255,23 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 			want[name] = ""
 		}
 		_sd_write(vfs, fmt.tprintf("%s/%s", SD_ROOT, name), want[name])
+	}
+	when_s := clock_wall(&n.clock) / 1_000_000_000
+	if op == .Checkout {
+		files := make([dynamic]Git_File, w.allocator)
+		for i in 0 ..< SD_FILES {
+			name := strings.clone(_sd_name(i), w.allocator)
+			append(&files, Git_File{name = name, data = transmute([]u8)want[name]})
+		}
+		gerr := git_checkout_create(vfs, SD_ROOT, files[:], when_s, node_clock(&n.clock), rng_random(&w.rng))
+		if gerr == .None {
+			other := []Git_File{{name = strings.clone(_sd_name(SD_TARGET), w.allocator), data = transmute([]u8)string("on the other branch\n")}, {name = "added.txt", data = transmute([]u8)string("added on the other branch\n")}}
+			gerr = git_branch_commit(vfs, SD_ROOT, "other", other, []string{strings.clone(_sd_name(SD_TWIN), w.allocator)}, when_s, node_clock(&n.clock), rng_random(&w.rng))
+		}
+		if gerr != .None {
+			world_fail(w, "%s: CONTROL: git setup: %v", what, gerr)
+			return
+		}
 	}
 	if err := node_mount(w, n, len(m.objs) - 1, SD_ROOT); err != .None {
 		world_fail(w, "%s: mount: %v", what, err)
@@ -341,6 +363,12 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 		prim.remove(vfs, abs)
 		delete_key(&want, target)
 	case .Never_Shown:
+	case .Checkout:
+		changes := make([dynamic]Git_Change, context.temp_allocator)
+		res, gerr := git_checkout(vfs, SD_ROOT, "other", false, when_s + 60, node_clock(&n.clock), rng_random(&w.rng), &changes)
+		if res != .Done || gerr != .None {
+			world_fail(w, "%s: CONTROL: the checkout answers %v %v", what, res, gerr)
+		}
 	case .Twin:
 		for i in ([]int{SD_TARGET, SD_TWIN}) {
 			from := strings.clone(_sd_name(i), w.allocator)
@@ -397,6 +425,10 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 		world_fail(w, "%s: DOWN: alive %v engine %v mounted %v", what, n.alive, n.e_open, _sd_mount(n) != nil)
 		return
 	}
+	if op == .Checkout {
+		print^ = _sd_print(w, n, tree)
+		return
+	}
 	_sd_check(w, n, tree, want, ids, what)
 	if op == .Edited {
 		context = instance_context(&n.inst)
@@ -441,6 +473,31 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := fals
 	run_until(w, w.now + 30_000_000_000, true)
 	_sd_check(w, n, tree, want, ids, fmt.tprintf("%s, after one more write", what))
 	return
+}
+
+@(private = "file")
+_sd_print :: proc(w: ^World, n: ^Node, tree: eng.Object) -> string {
+	vfs := disk_vfs(&n.disk)
+	b := strings.builder_make(context.allocator)
+	context = instance_context(&n.inst)
+	mt := _sd_mount(n)
+	fmt.sbprintf(&b, "mount line %s\n", mt.line)
+	for line in ([]string{"", "main", "git:refs/heads/main", "git:refs/heads/other"}) {
+		list, lerr := eng.tree_list(&n.e, tree, "", context.temp_allocator, {}, line)
+		fmt.sbprintf(&b, "line %q %v %d\n", line, lerr, len(list))
+		for nm in list {
+			data, rerr := eng.tree_read(&n.e, tree, nm, context.temp_allocator, {}, line)
+			fmt.sbprintf(&b, "%s %v %q\n", nm, rerr, string(data))
+		}
+	}
+	for i in 0 ..< SD_FILES {
+		n.disk.probe += 1
+		data, derr := prim.read_file(vfs, fmt.tprintf("%s/%s", SD_ROOT, _sd_name(i)), context.temp_allocator)
+		n.disk.probe -= 1
+		fmt.sbprintf(&b, "disk %s %v %q\n", _sd_name(i), derr, string(data))
+	}
+	node_after(n)
+	return strings.to_string(b)
 }
 
 @(private = "file")
@@ -514,10 +571,22 @@ shadow_damage :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for op in Sd_Op {
+		control := ""
 		for hurt in Sd_Hurt {
 			w := new(World)
 			world_init(w, _sd_config())
-			_sd_run(w, op, hurt)
+			print := ""
+			_sd_run(w, op, hurt, 0, false, &print)
+			if op == .Checkout && len(w.failures) == 0 {
+				if hurt == .None {
+					control = print
+					if !strings.contains(print, "mount line git:refs/heads/other") || !strings.contains(print, "added on the other branch") {
+						world_fail(w, "%v, %v: CONTROL: the checkout was not followed: %s", op, hurt, print)
+					}
+				} else if print != control {
+					world_fail(w, "%v, %v: DIFFERS from the undamaged control:\n--- damaged\n%s\n--- control\n%s", op, hurt, print, control)
+				}
+			}
 			for f, i in w.failures {
 				if i < int(env_u64("SD_MAX", 4)) {
 					fmt.eprintf("shadow_damage: %s\n", f)
