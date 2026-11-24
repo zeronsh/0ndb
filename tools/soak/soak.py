@@ -5,6 +5,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 WINDOWS = os.name == "nt"
+HOME_MAX = int(os.environ.get("SOAK_HOME_MAX_MB", "1500")) * 1000000
+FREE_MIN = 10 * 1000000000
 MARKER = b"ondb-soak-no-provider"
 DATA = os.environ.get("SOAK_DATA_KB", "4000000")
 LIMIT = [] if WINDOWS else ["bash", "--norc", "--noprofile", "-c", 'ulimit -d %s 2>/dev/null; exec "$@"' % DATA, "x"]
@@ -186,6 +188,20 @@ class Daemon:
             time.sleep(0.025)
         raise RuntimeError("the daemon socket never appeared")
 
+    def watch(self, home, on_trip):
+        def loop():
+            while True:
+                time.sleep(0.5)
+                used, free = du(home), shutil.disk_usage(home).free
+                if used > HOME_MAX or free < FREE_MIN:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+                    on_trip(used, free)
+                    return
+        threading.Thread(target=loop, daemon=True).start()
+
     def guard(self):
         if not sys.platform.startswith("linux"):
             return
@@ -359,6 +375,7 @@ class Soak:
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", "base")
         self.dm = Daemon(self.dir, self.srv.server_address[1], self.args.bin)
+        self.dm.watch(os.path.join(self.dir, "home"), self.tripped)
         self.c = Client(self.dm.sock)
         self.obj = self.dm.cli("new", "soak", "--provider", "native", "--model", MODEL)["object"]
         space = self.obj.split("/")[0]
@@ -454,6 +471,10 @@ class Soak:
         out["git"] = [subprocess.run(["git"] + a, cwd=self.root, capture_output=True, text=True).stdout.strip()[:300] for a in (["symbolic-ref", "HEAD"], ["status", "--short"])]
         out["locks"] = [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(self.root, ".git")) for f in fs if f.endswith(".lock")]
         print("PROBE " + json.dumps(out), flush=True)
+
+    def tripped(self, used, free):
+        self.fail("disk", "the daemon's home reached %.1f GB (%.0f GB free); the daemon was killed" % (used / 1e9, free / 1e9), "disk")
+        self.desync = True
 
     def plan(self, tag):
         k = self.rng.randint(1, 3)
