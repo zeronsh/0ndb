@@ -1447,6 +1447,13 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			consumed[k] = true
 			continue
 		}
+		if replayed && !gone {
+			if settled := replay_rest(p, &c) or_return; settled {
+				k, _ := clone_string(c.path, p.long)
+				consumed[k] = true
+				continue
+			}
+		}
 		if matched || gone {
 			continue
 		}
@@ -1562,6 +1569,40 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, replayed: ^map[fstr
 }
 
 @(private)
+replay_rest :: proc(p: ^Pass, c: ^Change) -> (settled: bool, err: Error) {
+	m := p.m
+	h := m.history
+	if c.kind != .Modify || c.old.kind != .File || c.old.ver == 0 {
+		return false, .None
+	}
+	ids, ok := shadow_version(&m.shadow, c.old)
+	if !ok || len(ids) == 0 {
+		return false, .None
+	}
+	v := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+	for id, i in ids {
+		v[i] = inode_op(h, id)
+	}
+	actor := m.actor
+	event := false
+	if known := crdt.graph_known(&h.g, actor); known > 0 {
+		vl := make([dynamic]crdt.Lv, context.temp_allocator)
+		own, known_ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+		event = !known_ok || crdt.graph_version_lvs(&h.g, v, &vl) != .None || !crdt.graph_contains(&h.g, vl[:], own)
+	}
+	rest := c^
+	rest.scope = nil
+	rest.scope_id = {}
+	rest.actor = actor
+	rest.step = {}
+	done, rerr := rebase_commit(p, &rest, v, c.old.inode, actor, event)
+	if rerr != .None && rerr != .Reloading {
+		return false, rerr
+	}
+	return done, rerr
+}
+
+@(private)
 replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, err: Error) {
 	m := p.m
 	h := m.history
@@ -1629,36 +1670,35 @@ replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, 
 step_base_resolve :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, inode: fstree.Inode_Id) -> (v: []crdt.Op_Id, err: Error) {
 	m := p.m
 	h := m.history
-	switch st.base.kind {
-	case STEP_BASE_VERSION:
-		sb := st.base
-		if ids := slice.clone(sb.ver[:sb.n], context.temp_allocator); version_reads(m, inode, ids, sb.oid) {
-			return ids, .None
-		}
-	case STEP_BASE_CHAIN:
-		if c.old.ver == 0 || c.old.inode != inode || (st.base.oid != {} && st.base.oid != c.old.oid) {
-			return nil, .None
-		}
-		ids, ok := shadow_version(&m.shadow, c.old)
-		if !ok || len(ids) == 0 {
-			return nil, .None
-		}
-		out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
-		for id, i in ids {
-			out[i] = inode_op(h, id)
-		}
-		if version_reads(m, inode, out, c.old.oid) {
-			return out, .None
-		}
+	want := st.base.oid
+	if st.base.kind == STEP_BASE_CHAIN && want == {} {
+		want = c.old.oid
+	}
+	if st.base.kind == STEP_BASE_NONE || want == {} {
 		return nil, .None
 	}
-	if st.base.kind == STEP_BASE_VERSION || st.base.kind == STEP_BASE_CONTENT {
-		if version_reads(m, inode, m.synced[:], st.base.oid) {
-			return slice.clone(m.synced[:], context.temp_allocator), .None
+	if st.base.kind == STEP_BASE_VERSION {
+		sb := st.base
+		if ids := slice.clone(sb.ver[:sb.n], context.temp_allocator); version_reads(m, inode, ids, want) {
+			return ids, .None
 		}
-		if head, found := history_line(h, m.line, context.temp_allocator) or_return; found && version_reads(m, inode, head, st.base.oid) {
-			return head, .None
+	}
+	if c.old.ver != 0 && c.old.inode == inode {
+		if ids, ok := shadow_version(&m.shadow, c.old); ok && len(ids) > 0 {
+			out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+			for id, i in ids {
+				out[i] = inode_op(h, id)
+			}
+			if version_reads(m, inode, out, want) {
+				return out, .None
+			}
 		}
+	}
+	if version_reads(m, inode, m.synced[:], want) {
+		return slice.clone(m.synced[:], context.temp_allocator), .None
+	}
+	if head, found := history_line(h, m.line, context.temp_allocator) or_return; found && version_reads(m, inode, head, want) {
+		return head, .None
 	}
 	return nil, .None
 }
