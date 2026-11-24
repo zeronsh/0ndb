@@ -1002,3 +1002,8 @@ _catalog_members :: proc(e: ^Engine, h: ^Handle) {
 		}
 	}
 }
+
+@(private)
+_oerr2b :: proc(a: $A, err: obj.Error) -> Error {
+	return _oerr(err)
+}
