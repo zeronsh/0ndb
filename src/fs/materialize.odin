@@ -1,5 +1,7 @@
 package fs
 
+import "core:strings"
+import "core:fmt"
 import "base:runtime"
 import "core:crypto/blake2b"
 import "core:slice"
@@ -172,6 +174,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		}
 		delete(a, m.allocator)
 	}
+	if dbg511(m) { fmt.eprintf("D511 materialize clears absent %v target=%v\n", m.absent[:], target) }
 	clear(&m.absent_set)
 	clear(&m.absent)
 	for r in m.reshow {
@@ -1022,6 +1025,7 @@ disk_content_matches :: proc(m: ^Mount, rel: string, st: Stat, e: Entry) -> bool
 
 @(private)
 materialize_one :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
+	if dbg511(m) { fmt.eprintf("D511 mat_one inode=%v path=%q present=%v has_old=%v old=%q\n", it.inode, it.path, it.present, it.has_old, it.old) }
 	if it.has_old {
 		old, e, had := shadow_by_inode(&m.shadow, it.inode, context.temp_allocator) or_return
 		if had {
@@ -1542,6 +1546,7 @@ mount_absent_add :: proc(m: ^Mount, path: string) {
 	if path in m.absent_set {
 		return
 	}
+	if dbg511(m) { fmt.eprintf("D511 absent_add %q\n", path) }
 	p, _ := clone_string(path, m.allocator)
 	append(&m.absent, p)
 	m.absent_set[p] = true
@@ -1683,4 +1688,8 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 		shadow_put(&m.shadow, items[i].path, e) or_return
 	}
 	return head, true, .None
+}
+
+dbg511 :: proc(m: ^Mount) -> bool {
+	return strings.contains(m.root, "e3d75f3d-n1")
 }

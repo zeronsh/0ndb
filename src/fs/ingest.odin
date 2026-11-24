@@ -1,5 +1,6 @@
 package fs
 
+import "core:fmt"
 import "base:runtime"
 import "core:bytes"
 import "core:crypto/blake2b"
@@ -1150,6 +1151,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		if c.old.kind != .File || (at_line && ino == c.old.inode) {
 			return false, .None
 		}
+		if dbg511(m) { fmt.eprintf("D511 adopt remove %q\n", c.path) }
 		shadow_remove(&m.shadow, c.path) or_return
 		mount_absent_add(m, c.path)
 		return true, .None
@@ -1575,6 +1577,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			p.line_from, _ = clone_string(m.branch, p.long)
 			p.line_to = key
 			follow := m.opts.follow_branch && m.line == m.branch
+			if dbg511(m) { fmt.eprintf("D511 branch %q -> %q line=%q follow=%v\n", m.branch, key, m.line, follow) }
 			delete(m.branch, m.allocator)
 			m.branch, _ = clone_string(key, m.allocator)
 			if follow {
@@ -1802,6 +1805,7 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 			}
 		}
 		for ino in order {
+			if dbg511(m) { pp, _, _ := fstree.path(&snap, ino, context.temp_allocator); fmt.eprintf("D511 retarget touched %v path=%q has_git=%v tracked=%v missing=%v\n", ino, pp, has_git_tree, pp in tracked, (probe(m, pp) or_else {}).kind) }
 			info, ok, ierr := fstree.info(&snap, ino, context.temp_allocator)
 			if ierr != nil {
 				return .Corrupt
@@ -2072,6 +2076,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		}
 	}
 	detect_moves(p)
+	if dbg511(p.m) { for c in p.changes { fmt.eprintf("D511 change %v path=%q moved=%q old=%v disk=%v\n", c.kind, c.path, c.moved, c.old.inode, c.disk) } }
 	adopt_changes(p) or_return
 	if !final && p.full {
 		for c in p.changes {
