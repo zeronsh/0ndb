@@ -569,6 +569,11 @@ FLOWS = dict(send=f_send_first_token, cli=f_cli_first_token, window=f_convo_wind
 
 
 def main():
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.reconfigure(encoding="utf-8", line_buffering=True)
+        except Exception:
+            pass
     names = sys.argv[1:] or [n for n in FLOWS if n != "cli" or os.environ.get("FLOWS_CLI")]
     os.makedirs(OUT, exist_ok=True)
     rows = []
