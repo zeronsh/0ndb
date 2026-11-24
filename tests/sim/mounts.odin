@@ -1505,12 +1505,21 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 		}
 		for ch in changes {
 			got, gerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), context.temp_allocator)
+			if n.disk.dead {
+				break
+			}
 			if ch.gone != (gerr == .Not_Found) || (!ch.gone && string(got) != string(ch.new)) {
 				world_fail(w, "%s git checkout %s left %s as %q (%v), not %q", n.name, branch, ch.name, string(got), gerr, string(ch.new))
 			}
 		}
 		for p in paths {
 			after, aerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator)
+			if n.disk.dead {
+				break
+			}
+			if aerr != .None && aerr != .Not_Found {
+				continue
+			}
 			had_base := p in base
 			gone := aerr == .Not_Found
 			if (gone && !had_base) || (!gone && had_base && string(after) == string(base[p])) || (gone && !git_gone[p]) {
