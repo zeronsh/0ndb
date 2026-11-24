@@ -1050,6 +1050,9 @@ _br_stale :: proc(w: ^World, arena: ^virtual.Arena, undo_first: bool, turn: bool
 	}
 	undo :: proc(c: ^Br_Ctx, at: obj.Rid) -> bool {
 		n := c.w.nodes[0]
+		if _, warm := _br_position(c, n); !warm {
+			run_until(c.w, c.w.now + 5_000_000_000, true)
+		}
 		context = instance_context(&n.inst)
 		defer node_after(n)
 		_, err := eng.convo_undo(&n.e, c.conv, at)
