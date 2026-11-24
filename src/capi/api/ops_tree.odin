@@ -128,6 +128,15 @@ op_tree_mounts :: proc(c: ^Call, o: ^Out) -> Status {
 		o_end(o)
 	}
 	o_end(o)
+	refused := eng.tree_refused(c.api.e)
+	o_arr(o, "refused", len(refused))
+	for r in refused {
+		o_obj(o, "")
+		o_object(o, "object", r.object)
+		o_str(o, "root", r.root)
+		o_end(o)
+	}
+	o_end(o)
 	return .Ok
 }
 

@@ -498,7 +498,9 @@ _ckpt_load :: proc(e: ^Engine, sp: ^Space, w: ^Ckpt_Wait) -> Error {
 	}
 	hist, lerr := fs.history_bundle_create(e.vfs, hdir, w.object, e.self, db, streams, fs.Bundle_Source{data = &src, read = _ckpt_source_read}, e.allocator, opts)
 	if lerr != .None {
-		_ckpt_discard(e, hdir)
+		if lerr != .Newer {
+			_ckpt_discard(e, hdir)
+		}
 		return _ferr(lerr)
 	}
 	if hok && h.hist == nil {

@@ -8,6 +8,11 @@ import "../fs"
 import "../http"
 import "../prim"
 
+Refused :: struct {
+	object: Object,
+	root:   string,
+}
+
 @(private)
 Plug_State :: struct {
 	curl:      http.Curl,
@@ -15,6 +20,7 @@ Plug_State :: struct {
 	reg:       fs.Registry,
 	reg_on:    bool,
 	mounts:    [dynamic]^Mounted,
+	refused:   [dynamic]Refused,
 	jobs:      [dynamic]^Fs_Job,
 }
 
@@ -191,6 +197,7 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 			return nil, _ferr(aerr)
 		}
 		e.plug.mounts = make([dynamic]^Mounted, e.allocator)
+		e.plug.refused = make([dynamic]Refused, e.allocator)
 	}
 	return &e.plug.reg, .None
 }
@@ -198,10 +205,22 @@ registry :: proc(e: ^Engine) -> (reg: ^fs.Registry, err: Error) {
 tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT, durable: Mount_Done = {}) -> (m: ^fs.Mount, err: Error) {
 	context = context_for(e)
 	reg := registry(e) or_return
-	hist := tree_history(e, o) or_return
+	for r in e.plug.refused {
+		if r.root == root && r.object != o {
+			return nil, .Newer
+		}
+	}
+	hist, herr := tree_history(e, o)
+	if herr == .Newer {
+		_refuse(e, o, root) or_return
+	}
+	if herr != .None {
+		return nil, herr
+	}
 	defer if m == nil {
 		tree_release(e, o)
 	}
+	tree_refused_clear(e, root)
 	db := device_odb(e) or_return
 	mid := _mount_id(o.id, root)
 	hx := prim.id_hex(mid)
@@ -230,6 +249,39 @@ tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT
 		return &mt.mount, .Pending
 	}
 	return &mt.mount, .None
+}
+
+@(private)
+_refuse :: proc(e: ^Engine, o: Object, root: string) -> Error {
+	for r in e.plug.refused {
+		if r.root == root {
+			return .None
+		}
+	}
+	c, aerr := strings.clone(root, e.allocator)
+	if aerr != nil {
+		return .No_Memory
+	}
+	if _, perr := append(&e.plug.refused, Refused{o, c}); perr != nil {
+		delete(c, e.allocator)
+		return .No_Memory
+	}
+	return .None
+}
+
+tree_refused :: proc(e: ^Engine) -> []Refused {
+	return e.plug.refused[:]
+}
+
+tree_refused_clear :: proc(e: ^Engine, root: string) -> bool {
+	for r, i in e.plug.refused {
+		if r.root == root {
+			delete(r.root, e.allocator)
+			ordered_remove(&e.plug.refused, i)
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -440,6 +492,10 @@ _plugs_close :: proc(e: ^Engine) {
 			free(mt, e.allocator)
 		}
 		delete(e.plug.mounts)
+		for r in e.plug.refused {
+			delete(r.root, e.allocator)
+		}
+		delete(e.plug.refused)
 		fs.registry_destroy(&e.plug.reg)
 		e.plug.reg_on = false
 	}
