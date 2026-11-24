@@ -421,6 +421,7 @@ Mount :: struct {
 	intents:     [dynamic]Intent,
 	nonce:       prim.Id,
 	mat_wait:    bool,
+	mat_waits:   [dynamic]Mat_Wait,
 	mat_held:    bool,
 	mat_ingest:  bool,
 	copy:        ^Copy_Map,
@@ -853,6 +854,7 @@ mount_close :: proc(m: ^Mount) {
 		delete(x.path, m.allocator)
 	}
 	delete(m.holds)
+	delete(m.mat_waits)
 	for c in m.reshow {
 		delete(c, m.allocator)
 	}
@@ -976,6 +978,29 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	}
 	_heap_release()
 	return err
+}
+
+Mat_Wait :: struct {
+	cb:   proc(m: ^Mount, data: rawptr),
+	data: rawptr,
+}
+
+mount_on_materialized :: proc(m: ^Mount, cb: proc(m: ^Mount, data: rawptr), data: rawptr) {
+	if m.mat_waits == nil {
+		m.mat_waits = make([dynamic]Mat_Wait, m.allocator)
+	}
+	append(&m.mat_waits, Mat_Wait{cb = cb, data = data})
+	mount_schedule(m, 0)
+}
+
+mount_materialized_cancel :: proc(m: ^Mount, data: rawptr) {
+	for i := 0; i < len(m.mat_waits); {
+		if m.mat_waits[i].data == data {
+			ordered_remove(&m.mat_waits, i)
+			continue
+		}
+		i += 1
+	}
 }
 
 mount_holds :: proc(m: ^Mount, target: Version) -> bool {
@@ -2158,8 +2183,9 @@ mount_durable_now :: proc(m: ^Mount) -> bool {
 	if fp != h.mark_fp {
 		h.mark += 1
 		h.mark_fp = fp
+		h.content_mark = h.mark
 	}
-	if h.mark <= h.durable {
+	if h.content_mark <= h.durable {
 		return true
 	}
 	if !m.mat_wait {
@@ -2233,6 +2259,7 @@ mount_settle :: proc(m: ^Mount) -> Error {
 	if fp != h.mark_fp {
 		h.mark += 1
 		h.mark_fp = fp
+		h.content_mark = h.mark
 	}
 	shadow_flush(m) or_return
 	if n := len(m.waits); n > 0 && m.waits[n - 1].mark == h.mark {
@@ -2249,7 +2276,7 @@ mount_settle :: proc(m: ^Mount) -> Error {
 @(private)
 mount_ack :: proc(m: ^Mount) -> Error {
 	h := m.history
-	if m.mat_wait && h.mark <= h.durable {
+	if m.mat_wait && h.content_mark <= h.durable {
 		m.mat_wait = false
 		mount_schedule(m, 0)
 	}

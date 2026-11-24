@@ -1045,25 +1045,25 @@ _begin_fenced :: proc(r: ^Runtime, o: Object, arg: int, err: Error) {
 	_begin_materialized(run)
 }
 
-BEGIN_WAIT_MS :: 10
-BEGIN_WAIT_TRIES :: 200
-
 @(private)
 _begin_materialized :: proc(run: ^Run) {
-	r := run.r
-	if run.ws != nil && !worktree_materialized(run.ws) && run.begin_tries < BEGIN_WAIT_TRIES {
-		run.begin_tries += 1
-		run.begin_timer = prim.timer(eng.loop(r.e), BEGIN_WAIT_MS, run, proc(l: ^prim.Loop, data: rawptr) {
-			x := (^Run)(data)
-			context = eng.context_for(x.r.e)
-			x.begin_timer = 0
-			if x.state != .Preparing || x.ws == nil {
-				return
-			}
-			_begin_materialized(x)
-		})
+	if run.ws != nil && worktree_await_materialized(run.ws, _begin_mount_done) > 0 {
 		return
 	}
+	_begin_go(run)
+}
+
+@(private)
+_begin_mount_done :: proc(ws: ^Worktree) {
+	run := run_find(ws.r, ws.o)
+	if run == nil || run.ws != ws || run.state != .Preparing {
+		return
+	}
+	_begin_go(run)
+}
+
+@(private)
+_begin_go :: proc(run: ^Run) {
 	if run.ws != nil {
 		worktree_started(run.ws)
 	}

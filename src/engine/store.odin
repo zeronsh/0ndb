@@ -525,6 +525,9 @@ _durable_begin :: proc(e: ^Engine) {
 	e.card_pubs = make([dynamic]Card_Pub, e.allocator)
 	b.marks = make([dynamic]Hist_Mark, e.allocator)
 	for h in e.lru {
+		if h.hist != nil {
+			fs.history_mark_refresh(h.hist)
+		}
 		if h.hist != nil && fs.history_durable_mark(h.hist) > h.hist.durable {
 			append(&b.marks, Hist_Mark{h.id, fs.history_mark_take(h.hist)})
 		}

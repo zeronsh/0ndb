@@ -28,57 +28,73 @@ Mat_Item :: struct {
 }
 
 mount_materialize :: proc(m: ^Mount) -> Error {
+	done, err := _mount_materialize(m)
+	if (done || err != .None) && len(m.mat_waits) > 0 {
+		waits := m.mat_waits
+		m.mat_waits = make([dynamic]Mat_Wait, m.allocator)
+		for w in waits {
+			w.cb(m, w.data)
+		}
+		delete(waits)
+	}
+	return err
+}
+
+@(private)
+_mount_materialize :: proc(m: ^Mount) -> (done: bool, err: Error) {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
-		return .No_Memory
+		return false, .No_Memory
 	}
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
 	if m.history == nil {
-		return .None
+		return true, .None
 	}
 	mount_wake(m) or_return
 	if m.adopt_pending {
 		if !m.imported {
-			return .None
+			return false, .None
 		}
-		return adopt_finish(m)
+		return false, adopt_finish(m)
 	}
 	h := m.history
 	target, found := history_line(h, m.line, context.temp_allocator) or_return
 	if !found {
-		return .None
+		return true, .None
 	}
 	tl := make([dynamic]crdt.Lv, context.temp_allocator)
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, target, &tl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
-		return .Corrupt
+		return false, .Corrupt
 	}
 	if crdt.frontier_eq(tl[:], sl[:]) && !mount_absent_ready(m) && len(m.reshow) == 0 {
-		return .None
+		return true, .None
 	}
 	if len(m.dirty) > 0 || m.rescan {
 		line_was, _ := clone_string(m.line, context.temp_allocator)
 		if perr := mount_pass(m, false); perr == .Deferred {
-			return .None
+			return false, .None
 		} else if perr != .None {
-			return perr
+			return false, perr
 		}
 		if m.line != line_was {
-			return mount_materialize(m)
+			return _mount_materialize(m)
 		}
 	}
 	if !mount_durable_now(m) {
-		return .None
+		return false, .None
 	}
 	m.mat_ingest = true
 	merr := materialize_to(m, target, false)
 	m.mat_ingest = false
 	if merr == .Deferred {
-		return .None
+		return false, .None
 	}
-	merr or_return
-	return mount_settle(m)
+	if merr != .None {
+		return false, merr
+	}
+	return true, mount_settle(m)
 }
 
 @(private)
