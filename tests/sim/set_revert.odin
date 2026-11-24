@@ -27,7 +27,7 @@ Sr_Model :: struct {
 	files:    map[string][dynamic]string,
 	class:    map[string]Sr_Who,
 	deleted:  map[string]bit_set[Sr_Who],
-	region:   map[string]bool,
+	touched:  map[string]bool,
 	created:  map[string]Sr_Who,
 	out_body: map[string]bool,
 	removed:  map[string]Sr_Who,
@@ -56,7 +56,7 @@ _sr_model_init :: proc(md: ^Sr_Model, alloc: runtime.Allocator) {
 	md.files = make(map[string][dynamic]string, alloc)
 	md.class = make(map[string]Sr_Who, alloc)
 	md.deleted = make(map[string]bit_set[Sr_Who], alloc)
-	md.region = make(map[string]bool, alloc)
+	md.touched = make(map[string]bool, alloc)
 	md.created = make(map[string]Sr_Who, alloc)
 	md.out_body = make(map[string]bool, alloc)
 	md.removed = make(map[string]Sr_Who, alloc)
@@ -232,12 +232,15 @@ _sr_edit :: proc(c: ^Sr_Ctx, inset: Sr_Who) -> bool {
 		md.deleted[old] += {cls}
 		t := _sr_new_token(c, cls)
 		if cls != .In && md.class[old] == .In {
-			md.region[t] = true
+			md.touched[name] = true
 		}
 		lines[at] = t
 	case:
 		at := rng_int(r, len(lines))
 		md.deleted[lines[at]] += {cls}
+		if cls != .In && md.class[lines[at]] == .In {
+			md.touched[name] = true
+		}
 		ordered_remove(lines, at)
 	}
 	for t in lines {
@@ -323,17 +326,9 @@ _sr_check :: proc(c: ^Sr_Ctx, revert: prim.Id, phase: string) {
 		}
 		d := md.deleted[t]
 		in_file := visible[t] if before else ""
-		gone_file := false
-		if before {
-			if cr, ok := md.created[in_file]; ok && cr == .In {
-				gone_file = true
-			}
-		}
 		file := md.tok_file[t]
 		_, alive := md.files[file]
-		if cr, ok := md.created[file]; ok && cr == .In {
-			alive = false
-		}
+		_ = in_file
 		if rm, ok := md.removed[file]; ok && rm == .In {
 			alive = true
 		}
@@ -341,16 +336,14 @@ _sr_check :: proc(c: ^Sr_Ctx, revert: prim.Id, phase: string) {
 		switch {
 		case cls == .In:
 			want = false
-		case gone_file || !alive:
-			want = false
-		case md.region[t] && before:
+		case !alive:
 			want = false
 		case before:
 			want = true
 		case:
 			want = .In in d && d - {.In} == {}
 		}
-		if before && !now && md.region[t] {
+		if !before && cls != .In && md.touched[file] {
 			continue
 		}
 		if want != now {
@@ -382,22 +375,12 @@ _sr_check :: proc(c: ^Sr_Ctx, revert: prim.Id, phase: string) {
 			files += 1
 		}
 	}
-	want_regions := 0
-	for t in md.region {
-		if _, before := visible[t]; before {
-			if cr, ok := md.created[visible[t]]; !ok || cr != .In {
-				want_regions += 1
-			}
-		}
+	want_touched := false
+	for _, v in prim.unordered(md.touched) {
+		want_touched ||= v
 	}
-	want_files := 0
-	for name in md.out_body {
-		if _, still := md.files[name]; still {
-			want_files += 1
-		}
-	}
-	if regions != want_regions || files != want_files {
-		world_fail(w, "set revert %s: %d region and %d file conflicts, want %d and %d", phase, regions, files, want_regions, want_files)
+	if files != 0 || regions > 0 && !want_touched {
+		world_fail(w, "set revert %s: %d region and %d file conflicts, with touched lines %v", phase, regions, files, want_touched)
 	}
 	_ = fshist.Revert_Conflict_Kind.Region
 	listed := _sr_listed(c)

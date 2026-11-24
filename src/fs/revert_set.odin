@@ -54,6 +54,10 @@ Kept_Piece :: struct {
 	in_t:   bool,
 	out:    bool,
 	outdel: bool,
+	in_set: bool,
+	undel:  bool,
+	local:  bool,
+	lv:     crdt.Lv,
 	out_lv: crdt.Lv,
 	b:      int,
 	t:      int,
@@ -209,7 +213,7 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 			touched[ino] = true
 		}
 	}
-	if len(touched) == 0 {
+	if len(touched) == 0 && !(revert_listed(h, actors) or_return) {
 		return {}, .None
 	}
 	snap_b := version_snapshot(h, bl[:]) or_return
@@ -228,7 +232,7 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 		revert_inode(h, &b, ino, ev, &snap_b, &snap_c, bl[:], cl[:], &ctx, &conflicts, drops) or_return
 		history_unload_files(h)
 	}
-	if b.n == 0 && len(conflicts) == 0 {
+	if b.n == 0 && len(conflicts) == 0 && !(revert_listed(h, actors) or_return) {
 		return {}, .None
 	}
 	marker := make([dynamic]u8, context.temp_allocator)
@@ -246,6 +250,23 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 		return {}, cerr
 	}
 	return revert, .None
+}
+
+@(private)
+revert_listed :: proc(h: ^History, actors: []prim.Id) -> (listed: bool, err: Error) {
+	for a in actors {
+		data, known := kv_get(&h.kv, revert_key("rv:", a), context.temp_allocator) or_return
+		if !known {
+			continue
+		}
+		if _, undone := kv_get(&h.kv, revert_key("rx:", a), context.temp_allocator) or_return; undone {
+			continue
+		}
+		if o, ok := fshist.decode_revert(data, context.temp_allocator); ok && len(o.conflicts) > 0 {
+			return true, .None
+		}
+	}
+	return false, .None
 }
 
 history_mount_actors :: proc(h: ^History, mounts: []prim.Id, lines: []string, allocator := context.allocator) -> (out: []prim.Id, err: Error) {
@@ -537,6 +558,7 @@ revert_text :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, bl, cl: []cr
 	}
 	cur, _ := history_text_spans_at(h, ino, cl, context.temp_allocator) or_return
 	ps := kept_pieces(h, items[:], cspans, cur)
+	kept_local(ps[:])
 	tl, blines, hunks := kept_lines(ps[:])
 	edits := make([dynamic]Kept_Edit, context.temp_allocator)
 	for round := 0; ; round += 1 {
@@ -583,10 +605,13 @@ kept_pieces :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Autho
 	push :: proc(h: ^History, out: ^[dynamic]Kept_Piece, it: crdt.Revert_Item, src: crdt.Op_Id, n: int, pos: ^int, cur: []u8) {
 		p := Kept_Piece {
 			vis    = it.visible,
-			in_b   = it.ins == .Base && .Base not_in it.del,
+			in_b   = it.ins == .Base && .Base not_in it.del || it.ins == .Out && .In in it.del && it.del & {.Base, .Out} == {},
 			in_t   = it.ins == .Base && it.del & {.Base, .In} == {} || it.ins == .In && .In not_in it.del,
 			out    = it.ins == .Out,
 			outdel = .Out in it.del,
+			in_set = it.ins == .In,
+			undel  = it.ins != .In && .In in it.del && it.del & {.Base, .Out} == {},
+			lv     = it.lv,
 			out_lv = it.out_lv,
 			b      = -1,
 			t      = -1,
@@ -594,7 +619,7 @@ kept_pieces :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Autho
 		text: []u8
 		if p.vis {
 			text = cur[min(pos^, len(cur)):min(pos^ + n, len(cur))]
-		} else if p.in_b || p.in_t {
+		} else if p.in_b || p.in_t || p.undel {
 			buf := make([]u8, n, context.temp_allocator)
 			authors := make([dynamic]crdt.Author_Span, context.temp_allocator)
 			got := copy_read_depth(h, src, buf, &authors, 0)
@@ -611,6 +636,7 @@ kept_pieces :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Autho
 			p.nl = e < n
 			e = min(e + 1, n)
 			p.src = crdt.Op_Id{src.actor, src.seq + u64(at)}
+			p.lv = it.lv + crdt.Lv(at) if it.lv >= 0 else -1
 			p.len = e - at
 			p.pos = pos^ + (at if p.vis else 0)
 			p.text = text[min(at, len(text)):min(e, len(text))]
@@ -650,11 +676,57 @@ kept_pieces :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Autho
 				}
 				j += 1
 			}
-			push(h, &out, it, id, j - k, &pos, cur)
+			part := it
+			part.lv += crdt.Lv(k)
+			push(h, &out, part, id, j - k, &pos, cur)
 			k = j
 		}
 	}
 	return out
+}
+
+@(private)
+kept_local :: proc(ps: []Kept_Piece) {
+	i := 0
+	for i < len(ps) {
+		first, last := -1, -1
+		ours, theirs := crdt.Lv(-1), crdt.Lv(-1)
+		mixed_in, mixed_out := false, false
+		j := i
+		for j < len(ps) {
+			p := ps[j]
+			if first >= 0 {
+				theirs = max(theirs, p.out_lv)
+			}
+			if p.vis {
+				if first < 0 {
+					first = j
+				}
+				last = j
+				if p.in_set {
+					mixed_in = true
+					ours = p.lv if ours < 0 else min(ours, p.lv)
+				}
+				if p.out {
+					mixed_out = true
+					theirs = max(theirs, p.lv)
+				}
+				if p.nl {
+					j += 1
+					break
+				}
+			}
+			j += 1
+		}
+		if first >= 0 && mixed_in && mixed_out && ours > theirs {
+			for k in first ..= last {
+				ps[k].local = true
+				ps[k].in_b = false
+				ps[k].in_t = false
+			}
+		}
+		i = j
+	}
 }
 
 @(private)
@@ -803,6 +875,16 @@ kept_end :: proc(p: Kept_Piece) -> int {
 
 @(private)
 kept_edits :: proc(ps: []Kept_Piece, tl, bl: []Kept_Line, hunks: []Kept_Hunk, out: ^[dynamic]Kept_Edit) {
+	for p, i in ps {
+		if !p.local {
+			continue
+		}
+		if p.vis && p.in_set {
+			append(out, Kept_Edit{p.pos, p.len, -1, -1})
+		} else if !p.vis && p.undel {
+			append(out, Kept_Edit{p.pos, 0, i, -1})
+		}
+	}
 	for hk, k in hunks {
 		if hk.frozen {
 			continue
@@ -994,7 +1076,9 @@ kept_conflicts :: proc(h: ^History, ps: []Kept_Piece, tl, bl: []Kept_Line, hunks
 			if l.pair >= 0 {
 				for i in bl[l.pair].first ..= bl[l.pair].last {
 					if ps[i].b == l.pair {
-						push_op_span(&theirs, ps[i].src, ps[i].len)
+						for a in copy_roots(h, ps[i].src, ps[i].len) {
+							push_op_span(&theirs, a.op, a.len)
+						}
 					}
 				}
 			}
