@@ -5,6 +5,7 @@ import "core:os"
 import "core:testing"
 import "../../src/fs"
 import "../../src/fstree"
+import "../../src/prim"
 
 @(private = "file")
 SP_DIR :: "/data/publish/shadow"
@@ -137,5 +138,141 @@ shadow_publish :: proc(t: ^testing.T) {
 			}
 		}
 	}
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+_sm_run :: proc(w: ^World, k: u64, no_index: bool, seed: u64) -> (hit: bool) {
+	a := w.nodes[0]
+	if !node_start(a) {
+		world_fail(w, "shadow mark: node start")
+		return
+	}
+	vfs := disk_vfs(&a.disk)
+	put :: proc(s: ^fs.Shadow, i: int) -> fs.Error {
+		e := fs.Entry{inode = fstree.Inode_Id{1, u64(i + 1)}, kind = .File}
+		e.oid[0] = u8(i + 1)
+		name := fmt.tprintf("f%d.txt", i)
+		fs.shadow_put(s, name, e) or_return
+		return fs.shadow_persist(s)
+	}
+	restart :: proc(w: ^World, a: ^Node, mode: Crash_Mode, salt: u64) -> bool {
+		if a.alive {
+			node_crash_now(a, mode, salt)
+		}
+		for _ in 0 ..< 40 {
+			if a.alive {
+				return true
+			}
+			run_until(w, w.now + 1_000_000_000, false)
+		}
+		return a.alive
+	}
+	{
+		context = instance_context(&a.inst)
+		s := new(fs.Shadow)
+		err := fs.shadow_open(s, vfs, SP_DIR, .Sha1)
+		if err == .None {
+			err = put(s, 0)
+		}
+		if err != .None {
+			world_fail(w, "shadow mark: setup: %v", err)
+			node_after(a)
+			return
+		}
+		a.disk.force_process = true
+		a.disk.crash_at = a.disk.stats.ops + k
+		put(s, 1)
+		hit = a.disk.dead
+		a.disk.crash_at = 0
+		node_after(a)
+	}
+	if !hit {
+		return
+	}
+	if !restart(w, a, .Process, k) {
+		world_fail(w, "shadow mark: no restart")
+		return
+	}
+	end: u64
+	{
+		context = instance_context(&a.inst)
+		if no_index {
+			prim.remove(vfs, SP_DIR + "/shadow.0.idx")
+		}
+		s := new(fs.Shadow)
+		if err := fs.shadow_open(s, vfs, SP_DIR, .Sha1); err != .None {
+			world_fail(w, "shadow mark: reopen: %v", err)
+			node_after(a)
+			return
+		}
+		_, end = fs.shadow_end(s)
+		node_after(a)
+	}
+	{
+		if !restart(w, a, .Power, k * 100 + seed) {
+			world_fail(w, "shadow mark: no restart after the power cut")
+			return
+		}
+		context = instance_context(&a.inst)
+		s: fs.Shadow
+		err := fs.shadow_open(&s, vfs, SP_DIR, .Sha1)
+		_, now := fs.shadow_end(&s)
+		if err == .None {
+			fs.shadow_close(&s)
+		}
+		node_after(a)
+		if err != .None || now < end {
+			world_fail(w, "shadow mark: op %d, index gone %v: a mark taken at %d is past the durable log, which ends at %d after a power cut (%v)", k, no_index, end, now, err)
+			return
+		}
+	}
+	return
+}
+
+@(test)
+shadow_mark :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	points, bad := 0, 0
+	for no_index in ([]bool{false, true}) {
+		for k := u64(1); k < 40; k += 1 {
+			over := false
+			for seed in u64(1) ..= 16 {
+				cfg := default_config(1)
+				cfg.nodes = 1
+				cfg.spaces = 0
+				cfg.ops = 0
+				cfg.crash_rate = 0
+				cfg.fault_rate = 0
+				cfg.io_rate = 0
+				cfg.byzantine = false
+				cfg.bulk = false
+				cfg.mem_max = 1500
+				w := new(World)
+				world_init(w, cfg)
+				hit := _sm_run(w, k, no_index, seed)
+				for f in w.failures {
+					fmt.eprintf("shadow_mark: %s\n", f)
+				}
+				bad += int(len(w.failures) > 0)
+				world_destroy(w)
+				free(w)
+				if !hit {
+					over = true
+					break
+				}
+				points += 1
+			}
+			if over {
+				break
+			}
+		}
+	}
+	fmt.eprintf("shadow_mark: %d crash points, %d failed\n", points, bad)
+	testing.expect(t, bad == 0 && points > 0, "shadow_mark failed")
 	free_all(context.temp_allocator)
 }
