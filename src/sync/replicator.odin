@@ -1425,10 +1425,6 @@ replicator_restored :: proc(r: ^Replicator, id: Stream_Id, err: Error) {
 
 @(private)
 _local_recheck_start :: proc(r: ^Replicator, l: ^Local) {
-	if l.recheck < l.arc_sealed {
-		_local_recheck_archive(r, l)
-		return
-	}
 	l.verifying = true
 	l.checking = true
 	l.beyond = false
@@ -1436,22 +1432,6 @@ _local_recheck_start :: proc(r: ^Replicator, l: ^Local) {
 	l.verify_to = min(l.cursor, l.recheck + UPLOAD_CHUNK)
 	clear(&l.verify)
 	client_read(&r.client, l.id, l.verify_at, l.verify_to)
-}
-
-@(private)
-_local_recheck_archive :: proc(r: ^Replicator, l: ^Local) {
-	at := l.recheck
-	l.recheck = -1
-	theirs, ok := _arc_own_records(r, l, at, min(l.cursor, at + UPLOAD_CHUNK))
-	if !ok {
-		_local_fatal(r, l, .Corrupt, -1)
-		_local_checked(r, l)
-		return
-	}
-	if !_local_repair(r, l, theirs, at, true) {
-		_local_checked(r, l)
-		_local_pump(r, l)
-	}
 }
 
 @(private)
