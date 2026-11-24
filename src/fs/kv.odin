@@ -954,13 +954,18 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 	win := make([dynamic]u8, context.temp_allocator)
 	win_off := off
 	win_len := u64(0)
+	rot: Kv_Rot
 	scan: for off < end {
 		if off + 8 > win_off + win_len || off + 8 + u64(prim.get_u32le(win[off - win_off:][:4])) > win_off + win_len {
 			want := min(u64(1 << 20), end - off)
 			if off + 8 <= win_off + win_len {
 				n := u64(prim.get_u32le(win[off - win_off:][:4]))
-				if n > KV_MAX_RECORD {
-					break scan
+				if n > KV_MAX_RECORD || 8 + n > end - off {
+					off = kv_rot_skip(kv, &rot, off, end) or_return
+					if off == 0 {
+						break scan
+					}
+					continue scan
 				}
 				want = min(max(want, 8 + n), end - off)
 			}
@@ -975,19 +980,36 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 				break scan
 			}
 			n := u64(prim.get_u32le(win[0:4]))
-			if n > KV_MAX_RECORD || 8 + n > win_len {
+			if n > KV_MAX_RECORD || 8 + n > end - off {
+				off = kv_rot_skip(kv, &rot, off, end) or_return
+				if off == 0 {
+					break scan
+				}
+				continue scan
+			}
+			if 8 + n > win_len {
+				if want == min(u64(1 << 20), end - off) && 8 + n > want {
+					continue scan
+				}
 				break scan
 			}
 		}
 		rec := win[off - win_off:]
 		n := u64(prim.get_u32le(rec[0:4]))
 		body := rec[8:][:n]
-		if u32(xxhash.XXH3_64_with_seed(body, off)) != prim.get_u32le(rec[4:8]) {
-			break scan
+		r: Kv_Rec
+		derr: Error
+		if n > 0 && u32(xxhash.XXH3_64_with_seed(body, off)) == prim.get_u32le(rec[4:8]) {
+			r, derr = kv_decode(body)
+		} else {
+			derr = .Corrupt
 		}
-		r, derr := kv_decode(body)
 		if derr != .None {
-			break scan
+			off = kv_rot_skip(kv, &rot, off, end) or_return
+			if off == 0 {
+				break scan
+			}
+			continue scan
 		}
 		r.off = off
 		r.size = 8 + n
@@ -1028,6 +1050,130 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 		prim.close_file(kv.vfs, saved.idx_fd)
 	}
 	return false, .None
+}
+
+@(private = "file")
+Kv_Rot :: struct {
+	scanned:     bool,
+	last:        u64,
+	before_last: u64,
+}
+
+@(private = "file")
+kv_valid_at :: proc(kv: ^Kv, off, end: u64, buf: ^[dynamic]u8) -> (size: u64, commit: bool, err: Error) {
+	if off + 8 > end {
+		return 0, false, .None
+	}
+	head: [8]u8
+	got, rerr := prim.read_at(kv.vfs, kv.log_fd, head[:], i64(off))
+	if rerr != .None {
+		return 0, false, from_prim(rerr)
+	}
+	n := u64(prim.get_u32le(head[0:4]))
+	if got != 8 || n == 0 || n > KV_MAX_RECORD || 8 + n > end - off {
+		return 0, false, .None
+	}
+	if resize(buf, int(n)) != nil {
+		return 0, false, .No_Memory
+	}
+	got, rerr = prim.read_at(kv.vfs, kv.log_fd, buf[:], i64(off) + 8)
+	if rerr != .None {
+		return 0, false, from_prim(rerr)
+	}
+	if u64(got) != n || u32(xxhash.XXH3_64_with_seed(buf[:], off)) != prim.get_u32le(head[4:8]) {
+		return 0, false, .None
+	}
+	r, derr := kv_decode(buf[:])
+	if derr != .None {
+		return 0, false, .None
+	}
+	return 8 + n, r.commit, .None
+}
+
+@(private = "file")
+kv_commits_after :: proc(kv: ^Kv, from, end: u64, rot: ^Kv_Rot) -> Error {
+	rot.scanned = true
+	buf := make([]u8, 1 << 16, context.temp_allocator)
+	pos := from
+	for pos + 9 <= end {
+		got, rerr := prim.read_at(kv.vfs, kv.log_fd, buf[:min(u64(len(buf)), end - pos)], i64(pos))
+		if rerr != .None {
+			return from_prim(rerr)
+		}
+		if got < 9 {
+			break
+		}
+		for k in 0 ..= got - 9 {
+			if buf[k] != 1 || buf[k + 8] != 3 || prim.get_u32le(buf[k:k + 4]) != 1 {
+				continue
+			}
+			at := pos + u64(k)
+			if u32(xxhash.XXH3_64_with_seed(buf[k + 8:k + 9], at)) == prim.get_u32le(buf[k + 4:k + 8]) {
+				rot.before_last = rot.last
+				rot.last = at
+			}
+		}
+		pos += u64(got - 8)
+	}
+	return .None
+}
+
+@(private = "file")
+kv_next_commit :: proc(kv: ^Kv, from, end: u64) -> (at: u64, err: Error) {
+	buf := make([]u8, 1 << 16, context.temp_allocator)
+	pos := from
+	for pos + 9 <= end {
+		got, rerr := prim.read_at(kv.vfs, kv.log_fd, buf[:min(u64(len(buf)), end - pos)], i64(pos))
+		if rerr != .None {
+			return 0, from_prim(rerr)
+		}
+		if got < 9 {
+			break
+		}
+		for k in 0 ..= got - 9 {
+			if buf[k] != 1 || buf[k + 8] != 3 || prim.get_u32le(buf[k:k + 4]) != 1 {
+				continue
+			}
+			c := pos + u64(k)
+			if u32(xxhash.XXH3_64_with_seed(buf[k + 8:k + 9], c)) == prim.get_u32le(buf[k + 4:k + 8]) {
+				return c, .None
+			}
+		}
+		pos += u64(got - 8)
+	}
+	return 0, .None
+}
+
+@(private = "file")
+kv_rot_skip :: proc(kv: ^Kv, rot: ^Kv_Rot, off, end: u64) -> (next: u64, err: Error) {
+	if !kv.marked {
+		return 0, .None
+	}
+	if !rot.scanned {
+		kv_commits_after(kv, off, end, rot) or_return
+	}
+	if rot.last <= off {
+		return 0, .None
+	}
+	buf := make([dynamic]u8, context.temp_allocator)
+	if size, _ := kv_valid_at(kv, off + 9, end, &buf) or_return; size > 0 {
+		return off + 9, .None
+	}
+	if rot.before_last <= off {
+		return 0, .None
+	}
+	head: [4]u8
+	got, rerr := prim.read_at(kv.vfs, kv.log_fd, head[:], i64(off))
+	if rerr != .None {
+		return 0, from_prim(rerr)
+	}
+	n := u64(prim.get_u32le(head[:]))
+	if got == 4 && n <= KV_MAX_RECORD && 8 + n < end - off {
+		if size, _ := kv_valid_at(kv, off + 8 + n, end, &buf) or_return; size > 0 {
+			return off + 8 + n, .None
+		}
+	}
+	return kv_next_commit(kv, off + 1, end)
 }
 
 @(private = "file")
