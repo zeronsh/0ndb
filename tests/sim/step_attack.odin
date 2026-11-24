@@ -29,6 +29,9 @@ Attack_Kind :: enum u8 {
 	Person,
 	Typed,
 	Undone,
+	Open,
+	Merge,
+	Chain,
 }
 
 Attack_Arm :: struct {
@@ -96,6 +99,36 @@ _sa_turn :: proc(w: ^World, n: ^Node, read, data: string) -> (who: prim.Id, ok: 
 	fs.scope_close(n.reg, s)
 	_forget_scope(w, n, s)
 	return who, true
+}
+
+@(private = "file")
+_sa_open_turn :: proc(w: ^World, n: ^Node, read, data: string) -> (who: prim.Id, fd: prim.Fd, ok: bool) {
+	sm := _sa_mount(n)
+	if sm == nil {
+		world_fail(w, "attack: mount missing")
+		return
+	}
+	who = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	s := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), who)
+	if read != "" {
+		fs.scope_read_base(s, "a.txt", transmute([]u8)read)
+	}
+	fs.mount_observe_begin(sm.m, "a.txt", s)
+	_writer_set(w, n, SA_ROOT + "/a.txt", Writer_Info{scope = s, agent = true})
+	vfs := disk_vfs(&n.disk)
+	err: prim.Error
+	fd, err = prim.open_file(vfs, SA_ROOT + "/a.txt", {.Write, .Create, .Truncate}, 0o644)
+	if err == .None {
+		err = prim.write_at(vfs, fd, transmute([]u8)data, 0)
+	}
+	if err == .None {
+		err = prim.datasync(vfs, fd)
+	}
+	if err != .None {
+		world_fail(w, "attack: open write: %v", err)
+		return
+	}
+	return who, fd, true
 }
 
 @(private = "file")
@@ -216,6 +249,27 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 		case .Undone:
 			turns[0], ok = _sa_turn(w, n, SA_BASE, SA_BASE + SA_X)
 			count = 1
+		case .Open:
+			fd: prim.Fd
+			turns[0], fd, ok = _sa_open_turn(w, n, SA_BASE, SA_BASE + SA_X)
+			if ok {
+				turns[1], ok = _sa_turn(w, n, SA_BASE, SA_BASE + SA_Y)
+			}
+			prim.close_file(vfs, fd)
+			count = 2
+		case .Merge:
+			turns[0], ok = _sa_turn(w, n, SA_BASE, SA_BASE + SA_X)
+			if ok {
+				turns[1], ok = _sa_turn(w, n, SA_BASE, SA_BASE + SA_Y)
+			}
+			count = 2
+		case .Chain:
+			turns[0], ok = _sa_turn(w, n, SA_BASE, SA_BASE + SA_X)
+			if ok {
+				_sa_write(vfs, SA_ROOT + "/a.txt", SA_BASE + SA_X + SA_Y)
+				turns[1], ok = _sa_turn(w, n, SA_BASE + SA_X + SA_Y, SA_BASE + SA_X + SA_Y + SA_X)
+			}
+			count = 2
 		}
 		if !ok {
 			return
@@ -239,6 +293,7 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 			node_after(n)
 		}
 		run_until(w, w.now + 2_000_000_000, true)
+		_sa_write(vfs, SA_ROOT + "/a.txt", SA_BASE + SA_Y)
 	}
 	if arm.kind == .Person {
 		_sa_write(vfs, SA_ROOT + "/a.txt", SA_BASE + SA_X + SA_Y)

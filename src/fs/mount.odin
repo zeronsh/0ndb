@@ -2503,7 +2503,7 @@ landed_read :: proc(m: ^Mount) -> Error {
 		}
 	}
 	for _, a in prim.unordered(m.attrib) {
-		if !a.used && a.step != {} {
+		if a.step != {} {
 			from = min(from, a.at)
 		}
 	}
