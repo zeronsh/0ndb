@@ -240,6 +240,9 @@ tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT
 	mo.idle_ms = 0
 	if merr := fs.mount_open(&mt.mount, reg, hist, db, mid, root, state, e.self, mo, e.allocator); merr != .None {
 		free(mt, e.allocator)
+		if merr == .Newer {
+			_refuse(e, o, root) or_return
+		}
 		return nil, _ferr(merr)
 	}
 	append(&e.plug.mounts, mt)

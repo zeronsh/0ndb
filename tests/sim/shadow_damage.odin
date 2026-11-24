@@ -38,6 +38,7 @@ Sd_Hurt :: enum u8 {
 	Tail_No_Index,
 	No_Log,
 	Short_Log,
+	Header,
 	Gen_Pointer,
 	Gen_Missing,
 	Mounted,
@@ -190,6 +191,9 @@ _sd_damage :: proc(w: ^World, n: ^Node, name: string, hurt: Sd_Hurt) -> bool {
 			if hurt == .Tail_No_Index {
 				done &&= _sd_remove(n, idx)
 			}
+		case .Header:
+			b := [1]u8{0}
+			done = disk_probe_write(&n.disk, f.path, 2, b[:], true)
 		case .No_Log:
 			done = _sd_remove(n, f.path)
 		case .Short_Log:
@@ -572,6 +576,7 @@ shadow_damage :: proc(t: ^testing.T) {
 	defer test_end(t)
 	for op in Sd_Op {
 		control := ""
+		defer delete(control)
 		for hurt in Sd_Hurt {
 			w := new(World)
 			world_init(w, _sd_config())
@@ -586,6 +591,9 @@ shadow_damage :: proc(t: ^testing.T) {
 				} else if print != control {
 					world_fail(w, "%v, %v: DIFFERS from the undamaged control:\n--- damaged\n%s\n--- control\n%s", op, hurt, print, control)
 				}
+			}
+			if raw_data(print) != raw_data(control) {
+				delete(print)
 			}
 			for f, i in w.failures {
 				if i < int(env_u64("SD_MAX", 4)) {

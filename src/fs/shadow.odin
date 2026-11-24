@@ -10,6 +10,7 @@ import "../prim"
 import "core:sync"
 
 SHADOW_MAGIC :: u64(0x3164_6873_6264_6e30)
+SHADOW_FAMILY :: u64(0x00ff_ffff_ffff_ffff)
 SHADOW_IDX_MAGIC :: u64(0x3178_6469_6264_6e30)
 SHADOW_HEADER :: 4096
 SHADOW_LOG_HEADER :: 16
@@ -1565,7 +1566,20 @@ open_gen :: proc(s: ^Shadow) -> Error {
 	if rerr != .None {
 		return from_prim(rerr)
 	}
-	if got != SHADOW_LOG_HEADER || prim.get_u64le(hdr[0:8]) != SHADOW_MAGIC || int(hdr[8]) != s.oid_size {
+	magic := prim.get_u64le(hdr[0:8])
+	if got == SHADOW_LOG_HEADER && magic & SHADOW_FAMILY == SHADOW_MAGIC & SHADOW_FAMILY && magic > SHADOW_MAGIC {
+		return .Newer
+	}
+	if got != SHADOW_LOG_HEADER || magic != SHADOW_MAGIC {
+		if s.mark.end == 0 {
+			return .Corrupt
+		}
+		prim.close_file(s.vfs, fd)
+		s.log_fd = prim.INVALID_FD
+		s.damaged = true
+		return .None
+	}
+	if int(hdr[8]) != s.oid_size {
 		return .Corrupt
 	}
 	s.log_end = u64(size)
