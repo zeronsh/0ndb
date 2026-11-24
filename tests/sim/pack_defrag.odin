@@ -228,11 +228,11 @@ pack_defrag :: proc(t: ^testing.T) {
 	points := 0
 	for k in u64(1) ..< 4000 {
 		m, crashed := _df_case(k, false)
-		free_all(context.temp_allocator)
 		if len(m) > 0 {
 			testing.expectf(t, false, "crash at disk op %d: %s", k, m)
 			return
 		}
+		free_all(context.temp_allocator)
 		if !crashed {
 			break
 		}
