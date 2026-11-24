@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, platform, random, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time
+import json, os, platform, random, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -257,9 +257,15 @@ def row(flow, samples, instant, notes=None, parts=None):
     return r
 
 
+def _writable(fn, path, _):
+    os.chmod(path, stat.S_IWRITE)
+    fn(path)
+
+
 def flow_dir(name):
     d = os.path.join(OUT, name)
-    shutil.rmtree(d, ignore_errors=True)
+    if os.path.exists(d):
+        shutil.rmtree(d, onerror=_writable)
     os.makedirs(d)
     return d
 
@@ -704,7 +710,10 @@ def f_branch_switch():
                 if disk() == "branch %s\n" % text and c.call("convo.status", object=obj).get("status") == "idle":
                     return
                 time.sleep(0.05)
-            raise RuntimeError("turn %s: branch.txt is %r after 60 s" % (text, disk()))
+            st = c.call("convo.status", object=obj)
+            tail = c.call("convo.window", object=obj, anchor=st.get("head"), before=4).get("messages", [])
+            last = [dict(role=m.get("role"), status=m.get("status"), seal=m.get("seal"), blocks=json.dumps(m.get("blocks"))[:300]) for m in tail[-3:]]
+            raise RuntimeError("turn %s: branch.txt is %r after 60 s; status %s; last messages %s" % (text, disk(), st.get("status"), json.dumps(last)))
 
         turn("A")
         head = c.call("convo.status", object=obj)["head"]
