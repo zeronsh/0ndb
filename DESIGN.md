@@ -2372,11 +2372,7 @@ what it holds, so search reaches across devices:
   search through peer queries; runners keep a persistent local index like
   any device. (Snapshots were measured at 1.75x the information of the
   conversations they indexed, plus merge rewrites and checkpoint
-  zero-fills, to save one download at restore.) A device upgraded from a
-  version that published snapshots retires them once per space: it shreds
-  its snapshot objects, zero-fills its `ckpt/0ndb:search` records and drops
-  their registry rows; an interrupted snapshot import found at open
-  rebuilds the index.
+  zero-fills, to save one download at restore.)
 - *Plug.* `Search_Remote` routes peer queries to an embedder's own hosted
   indexer instead of the relay path; its answers are verified the same way.
 
@@ -2711,7 +2707,7 @@ Commit := base epoch id [32] (zero for epoch 0) | number u32 | history bool
   of a tick with no durable batch in flight: it unmounts the space's trees,
   deletes every object of the space from the search index and scrubs it,
   zero-fills, syncs and removes every object directory, the members
-  directory, the card and any retired search snapshot files, drops the
+  directory and the card, drops the
   registry rows (objects, owned, grants, space), marks the entry `done` and emits
   `Space_Left`. Pack zero-fill makes the erase redaction-grade. A restart
   in the `leaving` state resumes the wait. The entry stays as a tombstone:

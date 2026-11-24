@@ -20,6 +20,8 @@ ROOT_SEARCH :: ROOT_CKPT
 SEARCH_KEY_QUEUE :: u8(0xf1)
 @(private)
 SEARCH_KEY_MODE :: u8(0xf2)
+@(private)
+SEARCH_KEY_ADVERTISED :: u8(0xf8)
 
 INDEXERS_NAME :: "0ndb:indexers"
 INDEXER_TAG_FLAGS :: u32(1)
@@ -149,7 +151,6 @@ Remote_State :: struct {
 	timer:      prim.Timer,
 	timer_at:   i64,
 	current:    ^Remote_Q,
-	retired:    map[prim.Id]bool,
 	stats:      Search_Stats,
 }
 
@@ -249,7 +250,6 @@ _remote :: proc(e: ^Engine) -> ^Remote_State {
 		r.skip = make(map[prim.Id]bool, e.allocator)
 		r.behind = make(map[prim.Id]int, e.allocator)
 		r.advertised = make(map[prim.Id]int, e.allocator)
-		r.retired = make(map[prim.Id]bool, e.allocator)
 	}
 	return r
 }
@@ -271,7 +271,6 @@ _remote_close :: proc(e: ^Engine) {
 	for m in r.inbox {
 		delete(m.payload, e.allocator)
 	}
-	delete(r.retired)
 	delete(r.queries)
 	delete(r.inbox)
 	delete(r.modes)
@@ -630,12 +629,6 @@ _full_settle :: proc(e: ^Engine) {
 		}
 		if current || _indexer_advertise(e, sp, behind) == .None {
 			r.advertised[sid] = behind
-		}
-	}
-	for sid in _sorted_keys(e.spaces) {
-		sp := e.spaces[sid]
-		if sp.open && sp.connected {
-			_search_retire(e, sp)
 		}
 	}
 }
@@ -1922,4 +1915,24 @@ _marks_behind :: proc(e: ^Engine, q: ^Remote_Q) -> int {
 		}
 	}
 	return len(behind)
+}
+
+@(private)
+_search_key :: proc(tag: u8, space: prim.Id) -> (k: [17]u8) {
+	s := space
+	k[0] = tag
+	copy(k[1:], s[:])
+	return
+}
+
+search_indexing :: proc(e: ^Engine) -> bool {
+	context = context_for(e)
+	if !e.index_open {
+		return false
+	}
+	if len(e.index_dirty) > 0 || search.pending(&e.index) > 0 {
+		return true
+	}
+	r := &e.remote
+	return r.init && len(r.active) > 0
 }

@@ -292,10 +292,6 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 	if c, cerr := _card_path(e, sp); cerr == .None {
 		_erase_path(e.vfs, c) or_return
 	}
-	hx := prim.id_hex(id)
-	if s, serr := _join(context.temp_allocator, e.pack_root, "search-snap", string(hx[:])); serr == .None {
-		_erase_path(e.vfs, s) or_return
-	}
 	for oid in objs {
 		if v, ok := e.reg.staged[oid]; ok {
 			delete(v, e.allocator)
