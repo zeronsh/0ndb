@@ -501,7 +501,6 @@ _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
 		}
 	}
 	_index_purge_message(e, h, Msg_Pos{msg.seg, msg.off})
-	_purge_message(e, h, msg, &m)
 	if msg.seg == e.self {
 		sum := convo.writer_summary(&h.cw)
 		if convo.summary_find(&sum, msg.off) >= 0 {
@@ -984,13 +983,8 @@ _local_redacted :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, from, t
 				target = obj.Vref{w.seg, b.msg}
 			}
 		}
-		if msg, merr0 := obj.rid(&h.view, target); merr0 == .None && !obj.vref_none(target) {
+		if _, merr0 := obj.rid(&h.view, target); merr0 == .None && !obj.vref_none(target) {
 			_draft_redact_own(e, h, target.off)
-			if t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator); terr == .None {
-				if m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator); merr == .None {
-					_purge_message(e, h, msg, &m)
-				}
-			}
 		}
 		if _redact_intent(e, h, e.self, from, to, target.off if !obj.vref_none(target) else -1) != .None {
 			return
@@ -1045,11 +1039,6 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 				_draft_redact_own(e, h, target_rid.off)
 			}
 		}
-		if t, tt := convo.view_tail(&h.view, e.self, context.temp_allocator); tt == .None && gerr == .None {
-			if m, merr := convo.message(&h.view, &t, convo.Position{msg = target_rid}, context.temp_allocator); merr == .None {
-				_purge_message(e, h, target_rid, &m)
-			}
-		}
 	}
 	if dev == e.self {
 		if _redact_intent(e, h, e.self, from.off, r.to, target.off if !obj.vref_none(target) && target.seg == from.seg else -1) != .None {
@@ -1096,50 +1085,6 @@ _apply_remote_redact :: proc(e: ^Engine, h: ^Handle, vs: int, env: ^obj.Envelope
 	}
 	_object_changed(e, h.sp.id, h.id, .Redacted)
 	return .None
-}
-
-@(private)
-PURGED_KEEP :: 1024
-
-@(private)
-_purge_message :: proc(e: ^Engine, h: ^Handle, msg: Rid, m: ^convo.Message) {
-	if e.cfg.purge.purge == nil {
-		return
-	}
-	for x in e.purged {
-		if x == msg {
-			return
-		}
-	}
-	if len(e.purged) >= PURGED_KEEP {
-		ordered_remove(&e.purged, 0)
-	}
-	append(&e.purged, msg)
-	ids := make([dynamic]string, context.temp_allocator)
-	for s in ([]string{m.native_msg, m.seal_native}) {
-		if len(s) > 0 {
-			append(&ids, s)
-		}
-	}
-	texts := make([dynamic]string, context.temp_allocator)
-	bodies := make([dynamic]string, context.temp_allocator)
-	for b in m.blocks {
-		if len(b.id) > 0 {
-			append(&ids, b.id)
-		}
-		if len(b.text) > 0 {
-			append(&texts, string(b.text))
-			append(&bodies, string(b.text))
-		}
-	}
-	if len(ids) == 0 && len(texts) == 0 && len(m.native) == 0 && obj.rid_none(m.claim) {
-		return
-	}
-	req := Purge_Request{object = Object{h.sp.id, h.id}, msg = msg, role = m.role, provider = m.provider, native = m.native, ids = ids[:], texts = texts[:], bodies = bodies[:], claim = m.claim}
-	{
-		context = _outer(e)
-		e.cfg.purge.purge(e.cfg.purge.data, e, &req)
-	}
 }
 
 @(private)
