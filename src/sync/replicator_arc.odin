@@ -942,7 +942,7 @@ _arc_arm_settled :: proc(r: ^Replicator, arm: ^Remote) {
 		return
 	}
 	owners := make([dynamic]Stream_Id, context.temp_allocator)
-	for id, x in r.remotes {
+	for id, x in prim.unordered(r.remotes) {
 		if x.arc == nil {
 			continue
 		}
@@ -969,7 +969,8 @@ _rst_owner :: proc(r: ^Replicator, rr: ^Remote, gone: ^Remote) -> ^Remote {
 	if r.destroying {
 		return nil
 	}
-	for _, x in r.remotes {
+	for id in prim.sorted_keys(r.remotes) {
+		x := r.remotes[id]
 		if x == gone || x.arc == nil {
 			continue
 		}
@@ -1023,12 +1024,14 @@ _arc_trim_resume :: proc(r: ^Replicator, id: Stream_Id) {
 	if _, inflight := r.trims[id]; inflight {
 		return
 	}
-	for _, al in r.locals {
-		if al.arc_child && al.trim_wait && al.trim_for == id {
-			al.trim_wait = false
-			if al.floor >= al.trim_at {
-				_arc_trim_send(r, al)
-			}
+	for lid in prim.sorted_keys(r.locals) {
+		al, ok := r.locals[lid]
+		if !ok || !al.arc_child || !al.trim_wait || al.trim_for != id {
+			continue
+		}
+		al.trim_wait = false
+		if al.floor >= al.trim_at {
+			_arc_trim_send(r, al)
 		}
 	}
 }
@@ -1172,7 +1175,7 @@ _arc_rst_refresh :: proc(r: ^Replicator, rm: ^Remote) {
 			append(&devs, d)
 		}
 	} else {
-		for d in r.devices {
+		for d in prim.sorted_keys(r.devices) {
 			append(&devs, d)
 		}
 	}
