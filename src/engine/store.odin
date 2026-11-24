@@ -1067,3 +1067,27 @@ _pack_before_commit :: proc(data: rawptr) -> pack.Error {
 	_reg_queue_publish(e)
 	return .None
 }
+
+@(private)
+_publish_later :: proc(e: ^Engine, d: ^Dirty_Seg) {
+	for &x in e.dirty {
+		if x.object == d.object {
+			x.keys ||= d.keys
+			x.length = max(x.length, d.length)
+			if len(x.path) == 0 && len(d.path) > 0 {
+				x.path = _clone(d.path, e.allocator) or_else ""
+			}
+			if x.tree == nil && d.tree != nil {
+				d.tree.refs += 1
+				x.tree = d.tree
+			}
+			_touch(e)
+			return
+		}
+	}
+	if d.tree != nil {
+		d.tree.refs += 1
+	}
+	append(&e.dirty, Dirty_Seg{space = d.space, object = d.object, kind = d.kind, scope = d.scope, name = _clone(d.name, e.allocator) or_else "", path = _clone(d.path, e.allocator) or_else "", length = d.length, tree = d.tree, keys = d.keys})
+	_touch(e)
+}
