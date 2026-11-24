@@ -219,15 +219,13 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		append(&items, it)
 	}
 	if merge {
-		if head, took := mat_snapshot_dirty(m, items[:], target) or_return; took {
-			one := [1]crdt.Lv{}
-			lv, lok := crdt.graph_lv(&h.g, head)
-			if !lok {
+		if heads, took := mat_snapshot_dirty(m, items[:], target) or_return; took {
+			tops := make([dynamic]crdt.Lv, context.temp_allocator)
+			if crdt.graph_version_lvs(&h.g, heads, &tops) != .None {
 				return .Corrupt
 			}
-			one[0] = lv
 			both := make([dynamic]crdt.Lv, context.temp_allocator)
-			crdt.version_union(&h.g, tl[:], one[:], &both)
+			crdt.version_union(&h.g, tl[:], tops[:], &both)
 			return materialize_to(m, crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), true)
 		}
 	}
@@ -1600,7 +1598,44 @@ mount_snapshot_pseudo :: proc(mount: prim.Id, line: string) -> (pseudo: prim.Id)
 }
 
 @(private)
-mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (head: crdt.Op_Id, took: bool, err: Error) {
+mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, pseudo: prim.Id, st: Stat, data: []u8, oid: odb.Oid) -> (head: crdt.Op_Id, err: Error) {
+	h := m.history
+	v := make([]crdt.Op_Id, len(at), context.temp_allocator)
+	for id, i in at {
+		v[i] = inode_op(h, id)
+	}
+	old := history_text_at(h, it.inode, v, context.temp_allocator) or_return
+	e := it.entry
+	e.stat = st
+	e.oid = oid
+	if string(old) != string(data) {
+		history_register_actor(h, base, pseudo) or_return
+		actor := event_actor(m, base, v, _event_digest(inode_op(h, it.inode), data)) or_return
+		if known := crdt.graph_known(&h.g, actor); known > 0 {
+			head = crdt.Op_Id{actor, known - 1}
+		} else {
+			b: Builder
+			builder_init(&b, h, actor)
+			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
+			ch, has, cerr := builder_commit_at(m, &b, v)
+			if cerr != .None && cerr != .Reloading {
+				return {}, cerr
+			}
+			if !has {
+				return {}, .None
+			}
+			head = ch
+		}
+		one := [1]fstree.Op_Id{op_inode(h, head)}
+		e.ver = shadow_version_add(&m.shadow, one[:]) or_return
+	}
+	shadow_put(&m.shadow, it.path, e) or_return
+	it.entry = e
+	return head, .None
+}
+
+@(private)
+mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (out: []crdt.Op_Id, took: bool, err: Error) {
 	h := m.history
 	pseudo := mount_snapshot_pseudo(m.id, m.line)
 	actor := fshist.ingestion_actor(h.self, pseudo)
@@ -1611,6 +1646,8 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 	}
 	b: Builder
 	builder_init(&b, h, actor)
+	head: crdt.Op_Id
+	heads := make([dynamic]crdt.Op_Id, context.temp_allocator)
 	snapped := make([dynamic]int, context.temp_allocator)
 	ours := make([dynamic]Stat, context.temp_allocator)
 	oids := make([dynamic]odb.Oid, context.temp_allocator)
@@ -1639,6 +1676,15 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 			it.entry = e
 			continue
 		}
+		if it.entry.ver != 0 && it.entry.inode == it.inode {
+			if at, vok := shadow_version(&m.shadow, it.entry); vok && len(at) > 0 {
+				ev := mat_snapshot_named(m, &it, at, actor, pseudo, d.stat, data, oid) or_return
+				if ev != {} {
+					append(&heads, ev)
+				}
+				continue
+			}
+		}
 		old := history_text_at(h, it.inode, parents[:], context.temp_allocator) or_return
 		if string(old) != string(data) {
 			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
@@ -1648,21 +1694,21 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 		append(&oids, oid)
 	}
 	if len(snapped) == 0 {
-		return {}, false, .None
+		return heads[:], len(heads) > 0, .None
 	}
 	if b.n > 0 {
 		history_register_actor(h, actor, pseudo) or_return
 		ch, has, cerr := builder_commit_at(m, &b, parents[:])
 		if cerr != .None && cerr != .Reloading {
-			return {}, false, cerr
+			return nil, false, cerr
 		}
 		if !has {
-			return {}, false, .None
+			return nil, false, .None
 		}
 		head = ch
 	} else {
 		if len(parents) == 0 {
-			return {}, false, .None
+			return nil, false, .None
 		}
 		head = parents[len(parents) - 1]
 	}
@@ -1682,5 +1728,6 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 		e.oid = oids[k]
 		shadow_put(&m.shadow, items[i].path, e) or_return
 	}
-	return head, true, .None
+	append(&heads, head)
+	return heads[:], true, .None
 }
