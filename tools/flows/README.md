@@ -6,6 +6,7 @@
 |---|---|
 | `send` | `send` to the first streamed token on the conversation subscription. It runs the native provider against an instant local SSE endpoint, so the time is 0ndb's own cost. |
 | `cli` | The same through each provider CLI in `FLOWS_CLI_PROVIDERS` (claude,codex) that the runner directory lists as signed in. This includes model latency, and `run_started` is 0ndb's spawn cost. It runs only with `FLOWS_CLI=1` or when named. |
+| `models` | A daemon start until its first `models` answer, on a fresh home and then over restarts (`FLOWS_MODELS_RUNS`, 8). When the answer says it is refreshing, the time until the background `models_changed` event is reported too. |
 | `window` | Opening a 10k-message conversation (`subscribe`, `convo.settings`, `convo.status`, `convo.window` tail). Also a `convo.page` of older messages and a ±30 `convo.window` jump. |
 | `tree` | An agent's `tree.write`, and a person's disk edit in the mount, each until the tree subscription event (and until the follow-up `tree.list`). |
 | `buffer` | A `buffer.edit` keystroke on one connection until a second `buffer.open` subscriber sees it. |

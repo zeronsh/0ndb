@@ -73,6 +73,7 @@ class Client:
         self.lock = threading.Condition()
         self.results = {}
         self.deltas = {}
+        self.events = []
         self.closed = False
         threading.Thread(target=self._reader, daemon=True).start()
 
@@ -101,6 +102,8 @@ class Client:
                         self.results[tag] = (t, body[8], body[9:])
                     elif kind == 4:
                         self.deltas.setdefault(tag, []).append((t, body[8:]))
+                    elif kind == 8:
+                        self.events.append((t, body))
                     self.lock.notify_all()
 
     def _send(self, kind, payload):
@@ -141,6 +144,27 @@ class Client:
         if st != 0:
             raise RuntimeError("subscribe %s -> status %d %s" % (req, st, res))
         return tag, res
+
+    def watch_events(self):
+        self._send(7, struct.pack("<BQ", 1, (1 << 64) - 1))
+
+    def wait_event(self, pred, timeout=30):
+        end = now() + timeout
+        with self.lock:
+            while True:
+                for i, (t, body) in enumerate(self.events):
+                    try:
+                        v = json.loads(body)
+                    except Exception:
+                        v = None
+                    if pred(v):
+                        self.events = self.events[i + 1 :]
+                        return t, v
+                self.events = []
+                left = end - now()
+                if left <= 0 or self.closed:
+                    return None, None
+                self.lock.wait(left)
 
     def take(self, tag):
         with self.lock:
@@ -453,6 +477,31 @@ def mount_tree(dm, c, root):
     return tree
 
 
+def f_models_start():
+    d = flow_dir("models_start")
+    runs = int(os.environ.get("FLOWS_MODELS_RUNS", "8"))
+    first, warm, refresh, listed = [], [], [], []
+    for i in range(runs):
+        dm = Daemon(d)
+        try:
+            t0 = now()
+            c = dm.client()
+            c.watch_events()
+            r = c.call("models")
+            t1 = now()
+            (first if i == 0 else warm).append(t1 - t0)
+            listed.append(sum(1 for p in r.get("providers", []) if p.get("models")))
+            if r.get("refreshing"):
+                te, _ = c.wait_event(lambda v: v and v.get("kind") == "models_changed", timeout=60)
+                if te:
+                    refresh.append(te - t0)
+            c.close()
+        finally:
+            dm.stop()
+    notes = "providers with a list in the first answer, per start: %s" % listed
+    return [row("daemon start → model list (first start, nothing persisted)", first, True, notes), row("daemon start → model list (restart)", warm, True, None, dict(refresh_event=refresh))]
+
+
 def f_tree_events():
     d = flow_dir("tree_events")
     dm = Daemon(d)
@@ -664,7 +713,7 @@ def f_branch_switch():
         srv.shutdown()
 
 
-FLOWS = dict(send=f_send_first_token, cli=f_cli_first_token, window=f_convo_window, tree=f_tree_events, buffer=f_buffer_keystroke, mount=f_mount_open, switch=f_branch_switch)
+FLOWS = dict(send=f_send_first_token, cli=f_cli_first_token, models=f_models_start, window=f_convo_window, tree=f_tree_events, buffer=f_buffer_keystroke, mount=f_mount_open, switch=f_branch_switch)
 
 
 def main():
