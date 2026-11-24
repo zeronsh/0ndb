@@ -51,6 +51,7 @@ Seal :: struct {
 	native_msg: string,
 	hlc:        prim.Hlc,
 	claim:      i64,
+	scope:      i64,
 }
 
 Leaf :: struct {
@@ -572,6 +573,7 @@ encode_fields :: proc(w: ^prim.Writer, off: i64, body: Body) {
 		obj.tw_str(w, 5, v.native_msg)
 		obj.tw_u64(w, 6, u64(v.hlc))
 		obj.tw_ref(w, 7, off, Ref{0, v.claim})
+		obj.tw_ref(w, 8, off, Ref{0, v.scope})
 	case Leaf:
 		obj.tw_ref(w, 1, off, v.msg)
 		obj.tw_u64(w, 2, u64(v.hlc))
@@ -1123,9 +1125,11 @@ decode_env :: proc(env: ^obj.Envelope, allocator := context.temp_allocator) -> (
 				v.hlc = obj.dec_hlc(&d)
 			case 7:
 				v.claim = obj.dec_own(&d)
+			case 8:
+				v.scope = obj.dec_own(&d)
 			}
 		}
-		d.bad ||= v.msg == 0 || v.status == .Open || (v.last_block != 0 && v.last_block <= v.msg)
+		d.bad ||= v.msg == 0 || v.status == .Open || (v.last_block != 0 && v.last_block <= v.msg) || (v.scope != 0 && v.scope <= v.msg)
 		rec.body = v
 	case .Leaf:
 		v: Leaf

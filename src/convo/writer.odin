@@ -23,6 +23,8 @@ Writer :: struct {
 	kids:         obj.Slots,
 	updates:      [dynamic]Child_Update,
 	seen:         [dynamic]i64,
+	turn_msg:     i64,
+	turn_scope:   i64,
 	allocator:    runtime.Allocator,
 }
 
@@ -370,6 +372,7 @@ writer_seal :: proc(w: ^Writer, msg: Rid, status: Seal_Status, usage: Usage = {}
 		native_msg = native_msg,
 		hlc        = obj.now(&w.core),
 		claim      = claim if claim > 0 && claim < off else 0,
+		scope      = w.turn_scope if w.turn_msg == m && w.turn_scope > m && w.turn_scope < off else 0,
 	}
 	_append(w, &sum, s) or_return
 	_update(w, {key = _ckey(Ref{0, m}), seal = off}) or_return
@@ -654,7 +657,12 @@ writer_scope :: proc(w: ^Writer, msg: Rid, kind: Scope_Kind, id: prim.Id, actor:
 	_flush(w) or_return
 	r := _local_rid(w, msg) or_return
 	sum := w.sum
-	return _append(w, &sum, Scope{msg = r, kind = kind, id = id, actor = actor, before = before, after = after})
+	off = _append(w, &sum, Scope{msg = r, kind = kind, id = id, actor = actor, before = before, after = after}) or_return
+	if kind == .Turn && r.seg == 0 {
+		w.turn_msg = r.off
+		w.turn_scope = off
+	}
+	return off, .None
 }
 
 writer_interrupt_open :: proc(w: ^Writer, now_ms: i64) -> (count: int, err: Error) {
