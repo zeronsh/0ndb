@@ -82,7 +82,6 @@ COMMANDS := []Command {
 	{"continue", cmd_undo_resume, "continue [CONVO]", "continue the tasks an undo or redo paused"},
 	{"land", cmd_land, "land TREE|DIR --from LINE [--into LINE] [--dry]", "land one line of a file tree into another"},
 	{"share", cmd_share, "share card | share OBJECT CARD [--write] | share accept CODE", "share an object with another device"},
-	{"redact", cmd_redact, "redact [CONVO] MSG | redact text OBJECT POS LEN | redact key MAP KEY", "delete content everywhere, keeping ids"},
 	{"verify", cmd_verify, "verify [DIR]", "check that mounted directories equal their history"},
 }
 
