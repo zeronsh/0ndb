@@ -48,6 +48,7 @@ Attack_Out :: struct {
 	turns:   int,
 	disk:    string,
 	moved:   bool,
+	undone:  bool,
 }
 
 @(private = "file")
@@ -276,8 +277,21 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 		}
 		node_after(n)
 	}
+	undo_id: prim.Id
 	if arm.kind == .Undone {
-		run_until(w, w.now + 2_000_000_000, true)
+		waited := false
+		for _ in 0 ..< 400 {
+			run_until(w, w.now + 5_000_000, true)
+			sm := _sa_mount(n)
+			if sm != nil && sm.m.log_len > 0 && fs.history_durable_mark(sm.m.history) <= sm.m.history.durable {
+				waited = true
+				break
+			}
+		}
+		if !waited {
+			world_fail(w, "attack: the turn never became durable with its step still in the log, so the arm proves nothing")
+			return
+		}
 		undone: {
 			context = instance_context(&n.inst)
 			owned := make([dynamic]prim.Id, context.temp_allocator)
@@ -286,13 +300,13 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 				o, _ := fs.history_owned_actors(sm.m.history, turns[:1], context.temp_allocator)
 				append(&owned, ..o)
 			}
-			if _, err := eng.tree_revert_set(&n.e, tree, base, owned[:], "main"); err != .None {
-				world_fail(w, "attack: undo before the crash: %v", err)
+			undo_id = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+			if _, undo := eng.tree_revert_set(&n.e, tree, base, owned[:], "main", undo_id); undo != .None {
+				world_fail(w, "attack: undo before the crash: %v", undo)
 				return
 			}
 			node_after(n)
 		}
-		run_until(w, w.now + 2_000_000_000, true)
 		_sa_write(vfs, SA_ROOT + "/a.txt", SA_BASE + SA_Y)
 	}
 	if arm.kind == .Person {
@@ -328,6 +342,10 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 	}
 	d, _ := prim.read_file(vfs, SA_ROOT + "/a.txt", context.temp_allocator)
 	out.disk = string(d)
+	if arm.kind == .Undone {
+		_, survived, _ := eng.tree_undo_revert(&n.e, tree, undo_id, "main")
+		out.undone = survived
+	}
 	hd, _ := prim.read_file(vfs, SA_ROOT + "/.git/HEAD", context.temp_allocator)
 	out.moved = strings.contains(string(hd), "feature")
 	out.turns = count
@@ -397,6 +415,16 @@ step_attack :: proc(t: ^testing.T) {
 					}
 					points += 1
 					want = away if got.moved == away.moved else home
+					if kind == .Undone {
+						if got.undone && strings.contains(got.lines[0], SA_X) {
+							wrong = true
+							fmt.eprintf("step_attack: %v k=%d: the undo survived and main reads %q\n", arm, k, got.lines[0])
+						}
+						if wrong {
+							bad += 1
+						}
+						continue
+					}
 					for j in 0 ..< 2 {
 						if got.lines[j] != want.lines[j] {
 							wrong = true
