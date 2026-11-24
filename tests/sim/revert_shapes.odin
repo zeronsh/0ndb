@@ -645,6 +645,23 @@ _rs_turn :: proc(c: ^Rs_Ctx, cs: Rs_Case) -> (r: Rs_Run, ok: bool) {
 }
 
 @(private = "file")
+_rs_strip :: proc(t: ^Rs_Tree) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	names := make([dynamic]string, context.temp_allocator)
+	for k in prim.sorted_keys(t^) {
+		base := k[strings.last_index_byte(k, '/') + 1:]
+		if strings.has_prefix(base, ".0ndb-") {
+			append(&names, k)
+		}
+	}
+	for k in names {
+		delete_key(t, k)
+		fmt.sbprintf(&b, "%s%s", "" if strings.builder_len(b) == 0 else ", ", k)
+	}
+	return strings.to_string(b)
+}
+
+@(private = "file")
 _rs_released :: proc(c: ^Rs_Ctx, cs: Rs_Case, undo: prim.Id) {
 	n := c.n
 	context = instance_context(&n.inst)
@@ -753,6 +770,125 @@ _rs_case :: proc(w: ^World, cs: Rs_Case, alloc: runtime.Allocator) {
 	}
 }
 
+@(private = "file")
+_rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, alloc: runtime.Allocator) -> (crashed: bool) {
+	c, cok := _rs_setup(w, cs, alloc)
+	if !cok {
+		return
+	}
+	r, tok := _rs_turn(c, cs)
+	if !tok {
+		return
+	}
+	n := c.n
+	crashes := w.stats.crashes
+	n.disk.crash_at = n.disk.stats.ops + k
+	undo: prim.Id
+	start: {
+		context = instance_context(&n.inst)
+		u, err := eng.convo_undo(&n.e, c.conv, r.user)
+		node_after(n)
+		if err == .None {
+			undo = u
+		}
+	}
+	run_until(w, w.now + 20_000_000_000, true)
+	n.disk.crash_at = 0
+	crashed = w.stats.crashes > crashes
+	run_until(w, w.now + 20_000_000_000, true)
+	if !n.alive {
+		world_fail(w, "shapes %s: after a crash at disk op %d the node did not come back", cs.name, k)
+		return
+	}
+	if !crashed {
+		if undo != {} {
+			_rs_expect(c, cs, "undo", r.undoneq)
+		}
+		return
+	}
+	got := _rs_read(c, c.alloc)
+	if left := _rs_strip(&got); len(left) > 0 {
+		world_fail(w, "shapes %s: LEFT after a crash at disk op %d: %s", cs.name, k, left)
+	}
+	if len(_rs_diff(r.undoneq, got)) > 0 && len(_rs_diff(r.post, got)) > 0 {
+		world_fail(w, "shapes %s: MIX after a crash at disk op %d: against undone:%s against post:%s", cs.name, k, _rs_diff(r.undoneq, got), _rs_diff(r.post, got))
+		return
+	}
+	resume: {
+		context = instance_context(&n.inst)
+		eng.undo_hooks_set(&n.e, eng.Undo_Hooks{})
+		list, err := eng.convo_undos(&n.e, c.conv, context.temp_allocator)
+		driven := err != .None
+		for u in list {
+			if u.phase != .Released {
+				derr := eng.convo_undo_drive(&n.e, c.conv, u.id)
+				if derr != .None {
+					world_fail(w, "shapes %s: resume after a crash at disk op %d: %v", cs.name, k, derr)
+				}
+				driven = true
+			}
+		}
+		if !driven {
+			if _, uerr := eng.convo_undo(&n.e, c.conv, r.user); uerr != .None {
+				world_fail(w, "shapes %s: undo again after a crash at disk op %d: %v", cs.name, k, uerr)
+			}
+		}
+		node_after(n)
+	}
+	run_until(w, w.now + 20_000_000_000, true)
+	fin := _rs_read(c, c.alloc)
+	_rs_strip(&fin)
+	if len(_rs_diff(r.undoneq, fin)) > 0 {
+		world_fail(w, "shapes %s: RESUME after a crash at disk op %d:%s", cs.name, k, _rs_diff(r.undoneq, fin))
+	}
+	return
+}
+
+revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64) -> (failures: [dynamic]string, points: int) {
+	failures = make([dynamic]string)
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena, 1 << 20) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	for cs in _rs_cases(virtual.arena_allocator(&arena)) {
+		if len(only) > 0 && cs.name != only {
+			continue
+		}
+		for k := u64(1); k <= limit; k += stride {
+			cfg := default_config(seed)
+			cfg.nodes = 1
+			cfg.spaces = 0
+			cfg.ops = 0
+			cfg.crash_rate = 0
+			cfg.fault_rate = 0
+			cfg.io_rate = 0
+			cfg.byzantine = false
+			cfg.bulk = false
+			cfg.mem_max = 1500
+			cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
+			w := new(World)
+			world_init(w, cfg)
+			ca: virtual.Arena
+			crashed := false
+			if virtual.arena_init_growing(&ca, 1 << 20) == nil {
+				crashed = _rs_crash_case(w, cs, k, virtual.arena_allocator(&ca))
+				virtual.arena_destroy(&ca)
+			}
+			for f in w.failures {
+				append(&failures, fmt.aprintf("%s", f))
+			}
+			world_destroy(w)
+			free(w)
+			if !crashed {
+				break
+			}
+			points += 1
+		}
+	}
+	return
+}
+
 revert_shapes_run :: proc(seed: u64, only: string = "") -> (failures: [dynamic]string, cases: int) {
 	failures = make([dynamic]string)
 	arena: virtual.Arena
@@ -809,5 +945,26 @@ revert_shapes :: proc(t: ^testing.T) {
 	fmt.eprintf("revert_shapes: %d cases, %d failures\n", cases, len(failures))
 	testing.expect(t, cases > 0, "revert_shapes: no case ran")
 	testing.expect(t, len(failures) == 0, "revert_shapes failed")
+	delete(failures)
+}
+
+@(test)
+revert_shapes_crash :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	only, _ := os.lookup_env("SHAPES_ONLY", context.temp_allocator)
+	failures, points := revert_shapes_crash_run(1, only, env_u64("SHAPES_STRIDE", 37), env_u64("SHAPES_LIMIT", 4000))
+	for f, i in failures {
+		if u64(i) < env_u64("SHAPES_PRINT", 40) {
+			fmt.eprintf("revert_shapes_crash: %s\n", f)
+		}
+		delete(f)
+	}
+	fmt.eprintf("revert_shapes_crash: %d crash points, %d failures\n", points, len(failures))
+	testing.expect(t, points > 0, "revert_shapes_crash: nothing crashed")
+	testing.expect(t, len(failures) == 0, "revert_shapes_crash failed")
 	delete(failures)
 }
